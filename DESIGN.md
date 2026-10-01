@@ -398,6 +398,23 @@ kernels show a gap); gradients stay MX-fp8 / fp16; fp4 in the backward is restri
   rejected by the coarse occupancy probe (14 ms each) on the sparse new sources. Two GPUs at the fp4 training
   ceiling (~20 ms per 128^3 step) need ~200 patches/s, so the sampler is no longer the limit on an idle box.
 
+### Depth and window yardstick (2026-10-01 evening)
+6000 steps, MANBp, det, Muon lr 0.01, down_norm, fp16; peak F1 over thresholds (band P/R):
+
+| arm | voxels/step | peak F1 |
+|---|---|---|
+| 4 levels, P64 B8 | 2.1M | **0.301** (0.47/0.63) |
+| 4 levels, P128 B1 | 2.1M | 0.175 |
+| 5 levels, P64 B8 | 2.1M | 0.226 |
+| 5 levels, P128 B1 | 2.1M | 0.274 |
+| 6 levels, P128 B1 | 2.1M | 0.263 |
+
+At equal voxels per step, eight 64^3 patches beat one 128^3 patch by a wide margin (the long runs r8-r10 used P128
+B1 per GPU, i.e. batch 2: probably the wrong trade). Depth helps when the window is large enough to use it (P128: 4 ->
+5 levels 0.175 -> 0.274) and hurts at P64. Batch is the confound; P128 B8 at 4 and 5 levels is queued to separate
+window from batch. Bug found: MX-fp8 GroupNorm statistics fail for 96/112 channels (12/14 channels per group do not
+divide the 32-channel MX block); scored with fp16 storage meanwhile.
+
 ### Largest training window, batch 1 per GPU (2026-10-01 evening)
 Measured with `ufsm train` (Muon, down_norm, fp16 storage, recompute 1), peak device memory: 256^3 5.3 GB,
 320^3 10.3 GB, 352^3 13.6 GB = 328 B per voxel, matching the per-voxel accounting (bench_mem overstates: it also
