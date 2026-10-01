@@ -270,8 +270,15 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   softness is NOT the limit. At the standard thresholds r6 is worse everywhere (precision up, recall collapsed: the
   sharper target shifts the calibration down); at each run's best threshold (`ufsm eval --thr 0.05,...`) it is a
   wash: F1 MANBp 0.183 vs 0.160, 0343P 0.159 vs 0.180, 1667 0.170 vs 0.166, 0500P2 0.059 vs 0.060 (r6 vs r5). The
-  plateau (~0.17 F1, ~0.4 band F1) stands with this model and these labels; the next candidates are the
-  architecture (GroupNorm after the down convs, agent yardstick in progress) and label quality. Its validation batches keep sigma 3 (they are materialised at start), so the validation
+  plateau (~0.17 F1, ~0.4 band F1) stands with this model and these labels.
+- r7 = r5's config with `--down-norm 1` (GroupNorm + SiLU after each stride-2 down conv, agent commit cf65220), on
+  both GPUs at effective batch 2 (30 min for 40k steps, 44 samples/s). Best validation loss 0.862 against r5's
+  0.881 on the same validation target, no overflow risk (enc3 a1 peaks ~30 instead of ~250..65000). Held-out F1 at
+  0.3 / 0.5 (r7 vs r5): MANBp 0.180 / 0.213 vs 0.160 / 0.192, 0343P 0.172 / 0.043 vs 0.180 / 0.037, 1667 0.160 /
+  0.040 vs 0.166 / 0.053, 0500P2 0.062 vs 0.060, PHerc0139 0.066 / 0.073 vs 0.071 / 0.076: a clear gain only on
+  MANBp (the agent's yardstick source), a wash elsewhere. down_norm is adopted for new runs on stability and
+  validation loss; it is not the accuracy breakthrough. r7's validation loss was still falling at 33k, so r8 = r7
+  with 120k steps tests whether the plateau is simply under-training. Its validation batches keep sigma 3 (they are materialised at start), so the validation
   loss drifts up as the training target sharpens and `best.ckpt` is an early checkpoint: score `last.ckpt`.
 
 ## Status (2026-09-30 night)
