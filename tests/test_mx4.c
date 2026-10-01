@@ -112,6 +112,11 @@ int main(void) {
             check(what, fabs(m - vals[i]) < 1e-3);
         }
         check("sr_e2m1 clamps at 6", fabs(lp_sr_e2m1_mean(9.f, 1000) - 6.0) < 1e-9);
+        for (int i = 0; i < 6; i++) {
+            double m = lp_sr_e2m1_nib_mean(vals[i], 4000000);
+            char what[64]; snprintf(what, sizeof what, "sr_e2m1_nib mean of 4e6 roundings of %.1f (%.4f)", vals[i], m);
+            check(what, fabs(m - vals[i]) < 1e-3);
+        }
     }
     {   /* NaN policy: cvt.rn.satfinite.e2m1x2 of NaN / inf (documented), and a NaN in a block makes the decoded block non-finite */
         const float hv[4] = {NAN, INFINITY, -INFINITY, 7.f}; unsigned char ho[4];
@@ -507,6 +512,8 @@ int main(void) {
         }
         nn_zero(gw, nw * 4); lp_bwd_w_f4(xg, 0, xs, gg, 0, ys, gw, nullptr, none, s0, 1);
         cmp("f4 wgrad Hadamard, grid inputs (RN)", gw, gwr, nw, 0.25);
+        nn_zero(gw, nw * 4); lp_bwd_w_f4(xg, 0, xs, gg, 0, ys, gw, nullptr, none, s0, 5);
+        cmp("f4 wgrad H16 variant, grid inputs (RN)", gw, gwr, nw, 0.25);
         {   /* odd sizes: W = 18 (scalar loads), Ci = 8 (NT 1), Co = 16 (MT 1), D odd */
             shape5 xo = {1, 8, 5, 9, 18}, yo = xo; yo.c = 16;
             size_t a = shape_numel(xo), b = shape_numel(yo);
@@ -516,6 +523,16 @@ int main(void) {
             lp_bwd_w_f4(x1, 0, xo, g1, 0, yo, o1, ob, none, s0, 0);
             cmp("f4 wgrad exact on grid (W 18, Ci 8, Co 16, D 5)", o1, r1, (size_t)16 * 8 * 27, 1e-5);
             cmp("f4 wgrad bias (W 18, Co 16)", ob, rb, 16, 1e-5);
+        }
+        {   /* W 16 (vector scale loads of the MX reads: 4 x scales, 8 gy scales per load), mx4 x / mx8 gy, grid values: exact */
+            shape5 xw = {2, 32, 4, 8, 16}, yw = xw;
+            size_t a = shape_numel(xw);
+            float *x1 = nn_malloc(a * 4), *g1 = nn_malloc(a * 4); nn_h2d(x1, hx, a * 4); nn_h2d(g1, hg, a * 4);
+            float *r1 = dev_zero((size_t)32 * 32 * 27), *o1 = dev_zero((size_t)32 * 32 * 27);
+            void *x1m = mx4_from(x1, xw), *g1m = mx8_from(g1, yw);
+            mode_ref(); nn_conv3d_bwd_weight(deq4(x1m, xw), xw, deq8(g1m, yw), yw, 3, 1, r1, nullptr);
+            lp_bwd_w_f4(x1m, 4, xw, g1m, 3, yw, o1, nullptr, none, s0, 0);
+            cmp("f4 wgrad exact on grid (W 16, mx4 x, mx8 gy)", o1, r1, (size_t)32 * 32 * 27, 1e-5);
         }
         {   /* 48 -> 16 (dec0.c1 shape: NT 3 under UFSM_F4W_LAYOUT=2), grid values: exact */
             shape5 yo = xs; yo.c = 16;
@@ -562,24 +579,24 @@ int main(void) {
         for (int heavy = 0; heavy < 2; heavy++) {
             if (heavy) { for (size_t i = 0; i < ny; i++) if (frand() > 0.98f) hg[i] *= 30.f; nn_h2d(gg, hg, ny * 4); }
             nn_zero(gwr, nw * 4); mode_ref(); nn_conv3d_bwd_weight(xg, xs, gg, ys, 3, 1, gwr, nullptr);
-            for (int had = 0; had < 2; had++) for (int srm = 0; srm < 2; srm++) {
+            for (int had = 0; had < 6; had += had == 1 ? 4 : 1) for (int srm = 0; srm < 2; srm++) {   /* had 0, 1 (H32), 5 (H16) */
                 split_t sr = {0}; sr.sr = srm ? 0x2545f491u : 0u;
                 nn_zero(gw, nw * 4); lp_bwd_w_f4(xg, 0, xs, gg, 0, ys, gw, nullptr, none, sr, had);
-                snprintf(nm, sizeof nm, "f4 wgrad %s gy, %s%s", heavy ? "heavy-tailed" : "N(0,1)", srm ? "SR" : "RN", had ? ", Had" : ""); cmp(nm, gw, gwr, nw, srm ? 0.3 : 0.25);   /* one SR draw on heavy-tailed gy without Hadamard: ~0.28 */
+                snprintf(nm, sizeof nm, "f4 wgrad %s gy, %s%s", heavy ? "heavy-tailed" : "N(0,1)", srm ? "SR" : "RN", had == 5 ? ", H16" : had ? ", Had" : ""); cmp(nm, gw, gwr, nw, srm ? 0.3 : 0.25);   /* one SR draw on heavy-tailed gy without Hadamard: ~0.28 */
             }
         }
         {   /* diagnostic x SR (had bit 1): both operands unbiased -> the 32-seed mean of random x / gy falls ~1/sqrt(32) */
             nn_zero(gwr, nw * 4); mode_ref(); nn_conv3d_bwd_weight(xg, xs, gg, ys, 3, 1, gwr, nullptr);
-            for (int had = 2; had < 4; had++) {
+            for (int had = 2; had < 8; had += had == 3 ? 4 : 1) {   /* 2: x SR, 3: + H32, 7: + H16 */
                 split_t sr = {0}; double e1 = 0, ea;
                 nn_zero(acc, nw * 4);
                 for (int k = 0; k < NS; k++) {
                     sr.sr = (0x7f4a7c15u * (unsigned)(k + 1)) | 1u;
-                    if (k == 0) { nn_zero(gw, nw * 4); lp_bwd_w_f4(xg, 0, xs, gg, 0, ys, gw, nullptr, none, sr, had); snprintf(nm, sizeof nm, "f4 wgrad SR x and gy, one seed%s", had & 1 ? ", Had" : ""); e1 = cmp(nm, gw, gwr, nw, 0.35); }
+                    if (k == 0) { nn_zero(gw, nw * 4); lp_bwd_w_f4(xg, 0, xs, gg, 0, ys, gw, nullptr, none, sr, had); snprintf(nm, sizeof nm, "f4 wgrad SR x and gy, one seed%s", had & 4 ? ", H16" : had & 1 ? ", Had" : ""); e1 = cmp(nm, gw, gwr, nw, 0.35); }
                     lp_bwd_w_f4(xg, 0, xs, gg, 0, ys, acc, nullptr, none, sr, had);
                 }
                 nn_scale(acc, 1.f / NS, nw);
-                snprintf(nm, sizeof nm, "f4 wgrad SR x and gy, mean of %d%s", NS, had & 1 ? ", Had" : ""); ea = cmp(nm, acc, gwr, nw, 0.25);
+                snprintf(nm, sizeof nm, "f4 wgrad SR x and gy, mean of %d%s", NS, had & 4 ? ", H16" : had & 1 ? ", Had" : ""); ea = cmp(nm, acc, gwr, nw, 0.25);
                 snprintf(nm, sizeof nm, "  SR x+gy mean < 0.35 x single (%.3g / %.3g)", ea, e1); check(nm, ea < 0.35 * e1);
             }
         }

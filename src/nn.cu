@@ -1648,9 +1648,10 @@ static void launch_bwd_w_tc_h(const void *x, int xbf, shape5 xs, const void *gy,
 /* fp4 weight gradient (lp_bwd_w_f4) for prec-3 weight-gradient passes: opt-in (UFSM_F4_WGRAD=1) until it passes the stairs;
    UFSM_F4_HAD_W=1 adds the fixed-sign H32 on both operands. Stride 2 stays fp8. */
 static int f4_wgrad(void) { static int v = -1; if (v < 0) v = getenv("UFSM_F4_WGRAD") ? atoi(getenv("UFSM_F4_WGRAD")) : 0; return v; }
-static int f4_had_w(void) {   /* bit 0: Hadamard (UFSM_F4_HAD_W), bit 1: diagnostic stochastic rounding of x as well (UFSM_F4_SRX) */
+static int f4_had_w(void) {   /* bit 0: Hadamard (UFSM_F4_HAD_W), bit 1: stochastic rounding of x as well (UFSM_F4_SRX), bit 2: H16 variant */
     static int v = -1;
-    if (v < 0) v = (getenv("UFSM_F4_HAD_W") && atoi(getenv("UFSM_F4_HAD_W")) ? 1 : 0) | (getenv("UFSM_F4_SRX") && atoi(getenv("UFSM_F4_SRX")) ? 2 : 0);
+    if (v < 0) { const int hw = getenv("UFSM_F4_HAD_W") ? atoi(getenv("UFSM_F4_HAD_W")) : 0;   /* 1: H32 per 32-position block, 2: H16 along x (faster) */
+                 v = (hw ? 1 : 0) | (hw == 2 ? 4 : 0) | (getenv("UFSM_F4_SRX") && atoi(getenv("UFSM_F4_SRX")) ? 2 : 0); }
     return v;
 }
 static void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {

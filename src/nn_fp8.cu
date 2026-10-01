@@ -2731,6 +2731,11 @@ extern "C" void lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, sha
          pairs, one scale per pair (36 positions incl. the halo): scale per (ci, 32 positions) as specified, ~10% slower.
      LY 0: every staged plane quantised into its 27 shifted blocks (each pair in the 3 kx windows, 16 B + one scale each,
          432 B / plane): exact per-32-position blocks, needed when the block is transformed (Hadamard) or SR'd.
+     LY 3 (UFSM_F4_HAD_W=2, the fast Hadamard): transform I2 x H16 diag(s16) (H16 along x inside each row, rows untouched)
+         on both operands, so each row's 3 kx windows are transformed once (30 windows per plane, not 27 x 32-blocks) and
+         stored pre-shifted [kx][row][8 B] with one scale per (ci, plane); epilogue 1/16.
+   MX inputs (mx4 / mx8 x, mx8 gy, the --fp4 training storage) are read 4 / 8 voxels at a time with the index math hoisted
+   and the scale bytes in one vector load. x SR (UFSM_F4_SRX) uses the same direct-nibble rounding, one hash + xorshift.
    Optional fixed-sign Hadamard (had): every 32-element block of both operands is multiplied by H32 diag(s) (s: the fixed
          sign vector F4W_SGN) before its scale / rounding; the element order inside a block (k = 16 * row + x) is the same
          for both, so H^T H = 32 I gives the exact product * 32, undone in the epilogue.
@@ -2745,16 +2750,17 @@ extern "C" void lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, sha
 #define X4_SCS 130   /* u16 per channel of the scale-pair table (4 planes x 32 + 2 pad) */
 #define G4_CS 144
 #define F4W_SGN 0x9c6d2a73u
+#define F4W_SGN16 0x2a73u   /* sign vector of the H16 variant (UFSM_F4_HAD_W=2), over the 16 x positions of a row window */
 /* stochastic rounding onto the e2m1 grid with a 16-bit uniform (two per hash): P(up) = ceil(frac * 65536) / 65536, so the
    bias is below 2^-16 of a grid step; branch-light (the grid step is 0.5 / 1 / 2 on [0, 2) / [2, 4) / [4, 6]). */
 /* the same rounding returning the e2m1 nibble directly: the grid magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6} are the codes 0..7 and
    t(a) = 2a / a + 2 / a/2 + 4 on [0, 2) / [2, 4) / [4, 6] is linear between consecutive grid points, so floor(t + u) is exact
    stochastic rounding (P(up) = frac to 2^-16) and needs no conversion instruction */
-__device__ __forceinline__ unsigned sr_e2m1_nib(float v, unsigned u16) {
-    const float a = fminf(fabsf(v), 6.f);
-    const float tt = a < 2.f ? 2.f * a : a < 4.f ? a + 2.f : fmaf(a, 0.5f, 4.f);
-    const unsigned q = min((unsigned)(tt + (float)u16 * (1.f / 65536.f)), 7u);
-    return q | (__float_as_uint(v) >> 28 & 8u);
+__device__ __forceinline__ unsigned sr_e2m1_nib(float v, unsigned u16) {   /* |v| <= 6 (block-scaled); t concave -> min of its 3 lines */
+    const float a = fabsf(v);
+    const float tt = fminf(fminf(a + a, a + 2.f), fmaf(a, 0.5f, 4.f));
+    const float u = __uint_as_float(0x3f800000u | (u16 << 7)) - 1.f;   /* u16 / 65536 exactly, no int -> float conversion */
+    return min((unsigned)(tt + u), 7u) | (__float_as_uint(v) >> 28 & 8u);
 }
 __device__ __forceinline__ float sr_e2m1_u16(float v, unsigned u16) {
     const float a = fminf(fabsf(v), 6.f);
@@ -2763,11 +2769,30 @@ __device__ __forceinline__ float sr_e2m1_u16(float v, unsigned u16) {
     return copysignf((fl + up) * __frcp_rn(inv), v);
 }   /* fixed random sign vector of the weight-gradient Hadamard (bit k set: element k negated) */
 __device__ __forceinline__ void had_lane(float &v, float p, bool hi) { v = hi ? p - v : v + p; }
+/* 4 consecutive voxels (off .. off + nv - 1, nv <= 4) of one channel of an MX tensor: the index math once, the 4 scale bytes in one
+   32-bit load when al4 (W % 4 == 0 and off % 4 == 0), element pairs decoded with one cvt */
+template <typename T> __device__ __forceinline__ float4 ldc4_mx(const chan_t &c, size_t off, int nv, bool al4) {
+    const uint8_t *p = (const uint8_t *)c.p + off * c.rb;
+    unsigned sw;
+    if (al4 && nv == 4) sw = __ldg((const unsigned *)(c.sp + off));
+    else { sw = 0u; for (int k = 0; k < nv; k++) sw |= (unsigned)c.sp[off + k] << (8 * k); }
+    unsigned b[4];
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        unsigned v = k < nv ? (unsigned)__ldg(p + (size_t)k * c.rb + (IS_MX4(T) ? (c.nib >> 1) : 0)) : 0u;
+        b[k] = IS_MX4(T) ? (v >> (4 * (c.nib & 1))) & 15u : v;
+    }
+    float2 lo, hi;
+    if constexpr (IS_MX4(T)) { lo = dec_e2m1x2(b[0] | b[1] << 4); hi = dec_e2m1x2(b[2] | b[3] << 4); }
+    else { lo = dec_e4m3x2((unsigned short)(b[0] | b[1] << 8)); hi = dec_e4m3x2((unsigned short)(b[2] | b[3] << 8)); }
+    return make_float4(nv > 0 ? lo.x * mx_scale(sw & 255u) : 0.f, nv > 1 ? lo.y * mx_scale(sw >> 8 & 255u) : 0.f,
+                       nv > 2 ? hi.x * mx_scale(sw >> 16 & 255u) : 0.f, nv > 3 ? hi.y * mx_scale(sw >> 24) : 0.f);
+}
 template <int MT, int NT, int LY, typename T, typename TG>   /* LY 0: 27 shifted blocks, 1: row pairs (2 pairings), 2: rows, one scale per (ci, plane) */
 __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
                                                        int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC, int had) {
     constexpr int CH = 8 * NT, BMo = 16 * MT;
-    constexpr int XPS = LY == 2 ? 240 : X4_PS, XCS = LY == 2 ? 976 : X4_CS;   /* x bytes per plane / per channel (LY 2: 10 rows x 24 B) */
+    constexpr int XPS = LY >= 2 ? 240 : X4_PS, XCS = LY >= 2 ? 976 : X4_CS;   /* x bytes per plane / per channel (LY 2: 10 rows x 24 B, LY 3: 3 kx x 10 rows x 8 B) */
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sxq = smem_raw;                                          /* [CH][XCS] */
     unsigned short *sxp = (unsigned short *)(sxq + CH * XCS);       /* [CH][X4_SCS] */
@@ -2802,7 +2827,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
         __syncthreads();
         /* X: warp per (channel, plane). Phase 1: the 10 x 18 positions (GN+SiLU applied) into the warp's fp32 plane,
            position p of a row = x ox0 - 1 + p. Phase 2: the 27 shifted 32-position blocks, 4 lanes x 8 values each. */
-        constexpr int U = LY ? 2 : 1;   /* x tasks in flight per warp: the loads of both are issued before either is quantised */
+        constexpr int U = LY == 1 || LY == 2 ? 2 : 1;   /* x tasks in flight per warp: the loads of both are issued before either is quantised */
         const int NXT = CH * np;
         for (int task0 = warp; task0 < NXT; task0 += 9 * U) {
             float4 V4[U][2]; float VS[U];
@@ -2822,21 +2847,19 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
                 float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
                 if (ok && f < 40 && gyy >= 0 && gyy < H) {
                     const T *src = xc + (size_t)gyy * W + gx;
-                    if (el) {
-                        if (gx < W) v.x = ldc<T>(c, cof(c, gz, gyy, gx, H, W)); if (gx + 1 < W) v.y = ldc<T>(c, cof(c, gz, gyy, gx + 1, H, W));
-                        if (gx + 2 < W) v.z = ldc<T>(c, cof(c, gz, gyy, gx + 2, H, W)); if (gx + 3 < W) v.w = ldc<T>(c, cof(c, gz, gyy, gx + 3, H, W));
-                    } else if (vec) { if (gx < W) v = ldx4(src); }
+                    if constexpr (IS_MX(T)) { if (gx < W) v = ldc4_mx<T>(c, cof(c, gz, gyy, gx, H, W), min(4, W - gx), vec); }
+                    else if (vec) { if (gx < W) v = ldx4(src); }
                     else { if (gx < W) v.x = ldx(src, 0); if (gx + 1 < W) v.y = ldx(src, 1); if (gx + 2 < W) v.z = ldx(src, 2); if (gx + 3 < W) v.w = ldx(src, 3); }
                     v.x = gx < W ? act_ab(v.x, c.a, c.b, G) : 0.f; v.y = gx + 1 < W ? act_ab(v.y, c.a, c.b, G) : 0.f;
                     v.z = gx + 2 < W ? act_ab(v.z, c.a, c.b, G) : 0.f; v.w = gx + 3 < W ? act_ab(v.w, c.a, c.b, G) : 0.f;
                 }
                 v4[i] = v;
-                if (LY == 0 && f < 40) { float *d = ws + row * 18 + 1 + 4 * (f & 3); d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w; }
+                if ((LY == 0 || LY == 3) && f < 40) { float *d = ws + row * 18 + 1 + 4 * (f & 3); d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w; }
             }
             {   /* halo: lane < 20 -> row lane >> 1, side lane & 1 (x = ox0 - 1 or ox0 + 16) */
                 int row = lane >> 1, gyy = oy0 - 1 + row, gx = (lane & 1) ? ox0 + 16 : ox0 - 1;
                 if (ok && lane < 20 && gyy >= 0 && gyy < H && gx >= 0 && gx < W) vs = act_ab(el ? ldc<T>(c, cof(c, gz, gyy, gx, H, W)) : ldx(xc, (size_t)gyy * W + gx), c.a, c.b, G);
-                if (LY == 0 && lane < 20) ws[row * 18 + ((lane & 1) ? 17 : 0)] = vs;
+                if ((LY == 0 || LY == 3) && lane < 20) ws[row * 18 + ((lane & 1) ? 17 : 0)] = vs;
             }
             }
 #pragma unroll
@@ -2847,6 +2870,41 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             const float4 *v4 = V4[u]; const float vs = VS[u];
             __syncwarp();
             uint8_t *dst = sxq + k * XCS + slot * XPS;
+            if constexpr (LY == 3) {   /* H16 variant: lane (kx = lane / 10, row = lane % 10) < 30 transforms its 16-position window
+                                      (x ox0 - 1 + kx ..) with H16 diag(s16), one scale per (ci, plane), stored pre-shifted [kx][row][8 B] */
+                const unsigned FM = 0xffffffffu;
+                const bool lok = lane < 30;
+                const int kx = lane / 10, r = lane % 10;
+                float v[16];
+                const float *src = ws + (lok ? r : 0) * 18 + (lok ? kx : 0);
+#pragma unroll
+                for (int j = 0; j < 16; j++) v[j] = lok ? ((F4W_SGN16 >> j) & 1u ? -src[j] : src[j]) : 0.f;
+#pragma unroll
+                for (int st = 1; st < 16; st <<= 1)
+#pragma unroll
+                    for (int j = 0; j < 16; j++) if (!(j & st)) { float a0 = v[j], a1 = v[j | st]; v[j] = a0 + a1; v[j | st] = a0 - a1; }
+                unsigned a = 0u;
+#pragma unroll
+                for (int j = 0; j < 16; j++) a = amax_u(a, v[j]);
+#pragma unroll
+                for (int o = 16; o; o >>= 1) a = max(a, __shfl_xor_sync(FM, a, o));
+                const int e = mx_exp(__uint_as_float(a), 1.f / 6.f);
+                const float m = exp2i(-e);
+                uint2 u;
+                if ((had & 2) && sp.sr) {   /* x SR: one hash + 7 xorshift steps per 16 values */
+                    const uint64_t vid = ((((uint64_t)n * Ci + ci) * D + gz) * gridDim.z + blockIdx.z) * 32 + lane;
+                    uint32_t h = sr_hash(sp.sr ^ 0x6a09e667u, vid);
+                    unsigned w2[2] = {0u, 0u};
+#pragma unroll
+                    for (int j = 0; j < 16; j += 2) {
+                        if (j) { h ^= h << 13; h ^= h >> 17; h ^= h << 5; }   /* xorshift32 after the hash (h != 0 w.p. 1 - 2^-32) */
+                        w2[j >> 3] |= (sr_e2m1_nib(v[j] * m, h & 0xffffu) | sr_e2m1_nib(v[j + 1] * m, h >> 16) << 4) << (4 * (j & 7));
+                    }
+                    u = make_uint2(w2[0], w2[1]);
+                } else u = make_uint2(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m));
+                if (lok) *(uint2 *)(dst + (kx * 10 + r) * 8) = u;
+                if (lane == 0) sxp[k * X4_SCS + slot * 32] = (unsigned short)((e + 127) * 0x101);
+            } else
             if constexpr (LY == 2) {   /* rows at 24 B (p at nibble 7 + p), one scale per (ci, plane): one rounding per value, as fp8 */
                 const unsigned FM = 0xffffffffu;
                 unsigned a = amax_u(0u, vs);
@@ -2948,13 +3006,18 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
                 for (int j = 0; j < 8; j++) amu = amax_u(amu, v[j]);
                 amu = max(amu, __shfl_xor_sync(0xffffffffu, amu, 1)); amu = max(amu, __shfl_xor_sync(0xffffffffu, amu, 2));
                 const int e = mx_exp(__uint_as_float(amu), 1.f / 6.f);
-                if ((had & 2) && sp.sr) {   /* diagnostic (UFSM_F4_SRX): stochastic rounding of x too, keyed by (ci, plane, tile, block, k) */
+                unsigned word;
+                if ((had & 2) && sp.sr) {   /* UFSM_F4_SRX: stochastic rounding of x too, keyed by (ci, plane, tile, block, k); one hash + 3 remixes */
                     const float mm = exp2i(-e);
                     const uint64_t vid = (((((uint64_t)n * Ci + ci) * D + gz) * gridDim.z + blockIdx.z) * 32 + b) * 32 + 8 * w;
+                    uint32_t hh[4];
+                    hh[0] = sr_hash(sp.sr ^ 0x6a09e667u, vid);
 #pragma unroll
-                    for (int j = 0; j < 8; j++) v[j] = sr_e2m1(v[j] * mm, sr_hash(sp.sr ^ 0x6a09e667u, vid + j)) / mm;
-                }
-                const unsigned word = cvt_e2m1x8(v, exp2i(-e));
+                    for (int i = 1; i < 4; i++) { uint32_t h1 = (hh[i - 1] ^ (hh[i - 1] >> 15)) * 0x2c1b3c6du; h1 ^= h1 >> 12; h1 *= 0x297a2d39u; hh[i] = h1 ^ (h1 >> 15); }
+                    word = 0u;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) word |= sr_e2m1_nib(v[j] * mm, (hh[j >> 1] >> (16 * (j & 1))) & 0xffffu) << (4 * j);
+                } else word = cvt_e2m1x8(v, exp2i(-e));
                 if (bok) { *(unsigned *)(dst + b * 16 + 4 * w) = word; if (w == 0) wscw[b] = (uint8_t)(e + 127); }
             }
             __syncwarp();
@@ -2974,8 +3037,19 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             if (co < Co && oz < D && oy < H) {
                 if constexpr (IS_MX8(TG)) {
                     const size_t vo = ((size_t)oz * H + oy) * W + ox, Sg = (size_t)D * H * W;
+                    const int bw = mx_bw(Co), nbk = mx_nb(Co);
+                    const size_t ri = ((size_t)n * nbk + co / bw) * Sg + vo;
+                    const uint8_t *qd = (const uint8_t *)gy + ri * bw + co % bw, *qs = (const uint8_t *)gy + (size_t)N * nbk * Sg * bw + ri;
+                    uint2 sw = make_uint2(0u, 0u);
+                    if ((W & 7) == 0) sw = __ldg((const uint2 *)qs);   /* the 8 scale bytes in one load (vo % 8 == 0) */
+                    else { for (int j = 0; j < 8; j++) if (ox + j < W) (j < 4 ? sw.x : sw.y) |= (unsigned)qs[j] << (8 * (j & 3)); }
 #pragma unroll
-                    for (int j = 0; j < 8; j++) if (ox + j < W) q[j] = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + j);
+                    for (int j = 0; j < 8; j += 2) {
+                        const unsigned b0 = ox + j < W ? __ldg(qd + (size_t)j * bw) : 0u, b1 = ox + j + 1 < W ? __ldg(qd + (size_t)(j + 1) * bw) : 0u;
+                        const float2 d = dec_e4m3x2((unsigned short)(b0 | b1 << 8));
+                        const unsigned s4 = j < 4 ? sw.x : sw.y;
+                        q[j] = d.x * mx_scale(s4 >> (8 * (j & 3)) & 255u); q[j + 1] = d.y * mx_scale(s4 >> (8 * ((j + 1) & 3)) & 255u);
+                    }
                 } else {
                     const TG *src = gy + (((size_t)n * Co + co) * D + oz) * H * W + (size_t)oy * W + ox;
                     if (vec) {
@@ -2989,7 +3063,16 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             }
             float sm = ((q[0] + q[1]) + (q[2] + q[3])) + ((q[4] + q[5]) + (q[6] + q[7]));
             sm += __shfl_xor_sync(0xffffffffu, sm, 1); sm += __shfl_xor_sync(0xffffffffu, sm, 2);
-            if (had & 1) {
+            if (had & 4) {   /* H16 variant: H16 diag(s16) along x within each row (x = 8 (f & 1) + j) */
+#pragma unroll
+                for (int j = 0; j < 8; j++) if ((F4W_SGN16 >> (8 * (f & 1) + j)) & 1u) q[j] = -q[j];
+#pragma unroll
+                for (int s = 1; s < 8; s <<= 1)
+#pragma unroll
+                    for (int j = 0; j < 8; j++) if (!(j & s)) { float a0 = q[j], a1 = q[j | s]; q[j] = a0 + a1; q[j | s] = a0 - a1; }
+#pragma unroll
+                for (int j = 0; j < 8; j++) had_lane(q[j], __shfl_xor_sync(0xffffffffu, q[j], 1), lane & 1);
+            } else if (had & 1) {
 #pragma unroll
                 for (int j = 0; j < 8; j++) if ((F4W_SGN >> (8 * f + j)) & 1u) q[j] = -q[j];
 #pragma unroll
@@ -3037,6 +3120,19 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
                     sa[m] = *(const unsigned short *)(sgs + (m * 16 + g + 8 * (t & 1)) * 8 + 2 * ks);
                 }
 #pragma unroll
+                if constexpr (LY == 3) {
+#pragma unroll
+                    for (int q = 0; q < NT; q++) {
+                        const uint8_t *xb = sxq + (q * 8 + g) * XCS + slot * XPS + (r0 + (t >> 1)) * 8 + 4 * (t & 1);
+                        const unsigned sb = sxp[(q * 8 + g) * X4_SCS + slot * 32];
+#pragma unroll
+                        for (int kx = 0; kx < 3; kx++) {
+                            unsigned b[2] = {*(const unsigned *)(xb + kx * 80), *(const unsigned *)(xb + kx * 80 + 16)};   /* rows + 2: +16 B */
+#pragma unroll
+                            for (int m = 0; m < MT; m++) mma_f4(acc[kx][m][q], af[m], b, sa[m], sb);
+                        }
+                    }
+                } else
                 if constexpr (LY >= 1) {
                     const int P = LY == 2 ? 0 : (ky & 1) ? 5 + ((r0 - 1) >> 1) : r0 >> 1;   /* LY 1: the K step's first row pair; the second is P + 1 */
                     const int ro = LY == 2 ? r0 * 24 : P * 48;
@@ -3069,7 +3165,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
         }
     }
     if (do_bias) { __syncthreads(); if (threadIdx.x < BMo && co0 + (int)threadIdx.x < Co) atomicAdd(&gb[co0 + threadIdx.x], sbias[threadIdx.x]); }
-    const float osc = (had & 1) ? 1.f / 32.f : 1.f;
+    const float osc = (had & 4) ? 1.f / 16.f : (had & 1) ? 1.f / 32.f : 1.f;
 #pragma unroll
     for (int kx = 0; kx < 3; kx++) {
         int tap = (kz * 3 + ky) * 3 + kx;
@@ -3090,8 +3186,9 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
 }
 template <int MT, int NT, typename T, typename TG> static void launch_bw4(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC, int had, int lay) {
     static int attr[8];
-    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 0, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 1, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 2, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    if (lay == 2) conv_bwd_w_f4_k<MT, NT, 2, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had);
+    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 0, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 1, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 2, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 3, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    if (lay == 3) conv_bwd_w_f4_k<MT, NT, 3, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had);
+    else if (lay == 2) conv_bwd_w_f4_k<MT, NT, 2, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had);
     else if (lay == 1) conv_bwd_w_f4_k<MT, NT, 1, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had);
     else conv_bwd_w_f4_k<MT, NT, 0, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had);
 }
@@ -3102,12 +3199,12 @@ template <typename T, typename TG> static void bwd_w_f4_t(const void *x, shape5 
     if (lay_env < 0) lay_env = getenv("UFSM_F4W_LAYOUT") ? atoi(getenv("UFSM_F4W_LAYOUT")) : 2;
     /* plain mode (no Hadamard / x SR): 1 = row pairs, scale per (ci, 32 positions); 2 = rows, scale per (ci, plane) (fp8's
        granularity, one rounding per value); 0 = the 27 shifted blocks (always used with the Hadamard or x SR) */
-    const int lay = (had & 3) ? 0 : lay_env;
+    const int lay = (had & 4) ? 3 : (had & 3) ? 0 : lay_env;   /* had bit 2: the H16 variant (UFSM_F4_HAD_W=2) -> LY 3 */
     int MT = ys.c >= 32 ? 2 : 1;
-    int NT = xs.c <= 8 ? 1 : lay == 2 && MT == 1 && xs.c % 24 == 0 ? 3 : 2;   /* NT 3 (as fp8 on dec0.c1) only fits 2 blocks / SM with the LY 2 tile */
+    int NT = xs.c <= 8 ? 1 : lay >= 2 && MT == 1 && xs.c % 24 == 0 ? 3 : 2;   /* NT 3 (as fp8 on dec0.c1) only fits 2 blocks / SM with the LY 2 tile */
     if (nt_env > 0) NT = nt_env;
     if (mt_env > 0) MT = mt_env;
-    size_t smem = (size_t)8 * NT * ((lay == 2 ? 976 : X4_CS) + 2 * X4_SCS) + 16 * MT * (G4_CS + 8 + 4) + 9 * 32 + (lay == 0 ? 9 * 180 * 4 : 0);
+    size_t smem = (size_t)8 * NT * ((lay >= 2 ? 976 : X4_CS) + 2 * X4_SCS) + 16 * MT * (G4_CS + 8 + 4) + 9 * 32 + (lay == 0 || lay == 3 ? 9 * 180 * 4 : 0);
     int nzt = nblk_(ys.d, 2), base = (int)(((xs.c + 8 * NT - 1) / (8 * NT)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * nblk_(ys.w, 16) * nblk_(ys.h, 8) * ys.n);
     int ZC = nzt < 12 ? nzt : 12;
     while (ZC > 1 && (size_t)base * nblk_(nzt, ZC) < 72) ZC--;
@@ -3141,4 +3238,16 @@ extern "C" int lp_bwd_w_f4(const void *x, int xbf, shape5 xs, const void *gy, in
     else bwd_w_f4_t<float, float>(x, xs, (const float *)gy, ys, gw, gb, gp, sp, had);
     LPCK();
     return 0;
+}
+/* test probe: mean of n direct-nibble stochastic roundings of v (grid units, |v| <= 6) */
+__global__ void sr_nib_probe_k(float v, size_t n, double *acc) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    atomicAdd(acc, (double)dec_e2m1n(sr_e2m1_nib(v, sr_hash(0x7654321u, i) & 0xffffu)));
+}
+extern "C" double lp_sr_e2m1_nib_mean(float v, size_t n) {
+    double *d; cudaMalloc(&d, sizeof(double)); cudaMemset(d, 0, sizeof(double));
+    sr_nib_probe_k<<<nblk_(n, 256), 256>>>(v, n, d);
+    double h = 0; cudaMemcpy(&h, d, sizeof(double), cudaMemcpyDeviceToHost); cudaFree(d); LPCK();
+    return h / (double)n;
 }
