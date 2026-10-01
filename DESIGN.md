@@ -246,7 +246,8 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   instead of 160 changes F1 by < 0.002, so the tiles are not the main loss; the softness is.
 - Hypothesis under test (run r6): the soft target (sigma 3 at level 0 on a label band that is already 3-5 voxels
   thick) teaches the blur. `--soft-end S` anneals sigma linearly to S over the run (`sampler_set_soft`); r6 = r5
-  with `--soft-end 1`.
+  with `--soft-end 1`. Its validation batches keep sigma 3 (they are materialised at start), so the validation
+  loss drifts up as the training target sharpens and `best.ckpt` is an early checkpoint: score `last.ckpt`.
 
 ## Status (2026-09-30 night)
 - M0 reader + CLI + sampler: done, tested (bit-exact zarr3 reads, sampler montages checked by eye).
