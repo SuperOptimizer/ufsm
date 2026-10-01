@@ -1,5 +1,7 @@
 # Low-precision round 2: mixed fp16 / fp8 / fp4 compute and narrow activation storage
 
+> **Status on master:** the last section, "Round 3", supersedes parts of this report. Recompute 1 is now the default. The upsample is fused into the decoder conv and B is chunked, so default fp16/bf16 training is 0.540 GB and inference 0.228 GB at 96^3 B2. The MX-gradient error of 64% below came from a bug fixed in 907cb33 (now 33.5%). On real data, MX storage loses F1 at 6000 steps, so the defaults stay 16-bit.
+
 Branch `lowprec-r2-live` in /home/forrest/ufsm-lp4. It is rebased on live HEAD 25d1322, conflicts are resolved, and `make test` passes.
 Branch `lowprec-r2` holds the same work on c0bafb5.
 
@@ -26,8 +28,8 @@ All numbers are for the (16,32,64,80) U-Net at 96^3 with batch 2 on GPU 0 (RTX 5
 | MX-fp8 activations | 0.603 | 28.9 | 0.234 | 6.4 | 30% |
 | MX-fp8 activations + recompute 1 | 0.458 | 30.6 | 0.205 | 7.4 | 30% |
 | MX-fp8 activations + recompute 2 | 0.410 | 34.2 | 0.205 | 7.4 | 30% |
-| MX-fp8 activations + gradients | 0.487 | 33.2 | 0.234 | 6.4 | 64% |
-| MX-fp8 activations + gradients + recompute 2 | **0.293** | 38.4 | 0.205 | 7.4 | 64% |
+| MX-fp8 activations + gradients | 0.487 | 33.2 | 0.234 | 6.4 | 64% (33.5% after the 907cb33 fix) |
+| MX-fp8 activations + gradients + recompute 2 | **0.293** | 38.4 | 0.205 | 7.4 | 64% (33.5% after the fix) |
 
 Notes on the table:
 
@@ -159,3 +161,77 @@ Commits on lowprec-r2-live:
 - a994072: MX-fp8 gradients
 - 05ac069: recompute 1
 - e3f32f9: inference sharing, recompute 2 and the simulation study
+
+## Round 3 (on master)
+
+Same model and measurement as above: 96^3, batch 2, GPU 0. Memory is activations plus gradients plus scratch. Error is the whole-network gradient error against the exact fp32 kernels.
+
+### Current numbers on master
+
+| setup | train GB | grads GB | train ms | inference GB | inference ms | grad err |
+|---|---|---|---|---|---|---|
+| live HEAD before round 2 (c0bafb5) | 1.22 | – | 37 | – | 11 | 1.96% / 0.25% |
+| default: fp16 or bf16, recompute 1, fused upsample, chunked B | **0.540** | 0.192 | 33.8 | **0.228** | 9.6 | 0.25% / 1.95% |
+| fp16, recompute 2 | 0.447 | 0.192 | 41.3 | 0.228 | 9.6 | 0.25% |
+| fp16, `all=fp16:fp16:fp8` | 0.540 | 0.192 | 32.1 | 0.228 | 9.1 | 2.9% |
+| bf16, `all=fp8` | 0.540 | 0.192 | 31.5 | 0.228 | 9.7 | 24% |
+| MX-fp8 activations (opt-in) | 0.458 | 0.248 | 30.6 | 0.205 | 7.4 | 30% |
+| MX-fp8 activations + gradients | 0.342 | 0.132 | 34.6 | 0.205 | 7.4 | 33.5% |
+
+### What changed
+
+1. **Recompute 1 is the default (77b776a).** `UFSM_RECOMPUTE=0` restores the stored block outputs.
+2. **Fused upsample in decoder conv1 (9b6f54a).**
+   - The 16-bit forward and weight-gradient staging read the coarse block output and form its trilinear 2× upsample on the fly. These are the `nn_up2_fwd_into` values.
+   - The coarse rows are loaded with vector loads (4 rows × 10 columns).
+   - No full-resolution upsampled tensor exists any more.
+   - Inference: 0.341 → 0.228 GB at the same speed (9.7 → 9.6 ms). Training: 34.9 → 33.9 ms, because the upsample kernel is gone.
+   - fp8 and MX convs keep a transient copy, allocated on demand. A first fp8 version of the fused read slowed every fp8 kernel by up to 1.7×, even without upsampling, so it was not kept.
+   - Env: `UFSM_FUSED_UP=0|1|2` means never, inference only, or always (default).
+3. **Chunked up-part gradient (53abc70).**
+   - Decoder conv1's backward-data produces the skip gradient first, then the up-part gradient in w[i]-channel chunks.
+   - Each chunk goes through B and is upsample-backwarded straight into its slice of gout[i+1]. The new calls are `nn_conv3d_bwd_data_range` and `nn_up2_bwd_into`.
+   - B shrinks from w[i+1] to w[i] channels. Training: 0.596 → 0.540 GB at the same step time.
+   - The fused-upsample decoder conv1 always runs the 16-bit kernels, even under an fp8 or fp4 policy. Otherwise it would need the 32-channel transient again (0.653 GB). As a side effect, `dec0.c1=fp8` error drops from 6.6% to 4.3%.
+   - `UFSM_CHUNK_UP=0` restores the old sizing.
+4. **MX split-output bug fixed (907cb33).**
+   - The fp8 weight prep wrote output rows at the real channel instead of the padded row. That broke split outputs whose first segment is not a multiple of 32 channels: dec2, 80 + 64. Padding rows also wrote one row before the buffer.
+   - Only MX gradient storage was affected.
+   - Error: 64% → 33.5%. A fake-quant simulation of the same storage gives 32%, and the per-tensor errors now match it.
+5. **fp16 overflow guards.**
+   - Fixes: dc08a7a saturates fp16 stores that feed a GroupNorm in the 16-bit conv epilogue, and d6395fa does the same in the fp8 epilogue.
+   - 720c5a2 (`sat_h16`) keeps NaN: `fminf`/`fmaxf` had turned NaN into ±65504 and hidden non-finite forwards from the trainer.
+   - Synthetic check: an r6 checkpoint with enc3 conv1 weights × 64, replayed on the r6 dump.
+     - Without the fp8 guard, all=fp8 gave about 1e5 non-finite enc3 a1 voxels, and the NaN reached the logits.
+     - With the guards, the logits matched fp16 and exact fp32.
+6. **down_norm (cf65220).**
+   - Optional GroupNorm + SiLU after each stride-2 down conv: `unet_cfg.down_norm`, `train --down-norm 1`, and a checkpoint header field.
+   - The down-conv output is stored pre-norm with its statistics, and the next conv1 applies the transform while staging.
+   - Cost: +0.4 ms per training step (+1.2%), +0.15 ms per inference, no extra activation memory.
+   - tc vs fp32 gradients agree to 0.30%.
+
+### Real-data yardstick
+
+The setup is MANBp, `--soft 3 --noaug 1 --P 64 --B 8 --f16 1`, then `tools/eval_holdouts.py` on last.ckpt. Values are F1 at thresholds 0.5 / 0.7.
+
+| run | 2000 steps | 6000 steps |
+|---|---|---|
+| fp16 | 0.215 / 0.221 and 0.218 / 0.225 (2 runs) | 0.269 / 0.282 |
+| MX-fp8 activations | 0.216 / 0.221 and 0.218 / 0.217 | 0.261 / 0.276 |
+| MX-fp8 activations + gradients (fixed) | 0.220 / 0.220 | 0.251 / 0.253 |
+| simulated NVFP4 / MXFP6 activations | 0.218 / 0.220 and 0.215 / 0.214 | – |
+| down_norm 0, seeds 0 and 1 | – | 0.253 / 0.257 and 0.225 / 0.228 |
+| down_norm 1, seeds 0 and 1 | – | 0.262 / 0.257 and 0.259 / 0.255 |
+
+- **The 2000-step runs cannot separate the modes.** All of them sit inside the fp16 noise.
+- **At 6000 steps, MX storage loses F1.** Activations alone cost −0.008, and activations plus gradients cost −0.018.
+- **down_norm:** mean F1 at 0.5 is 0.260 against 0.239 without it, and the seed spread is 0.003 against 0.028.
+- **Activation scale under down_norm:** enc3 a1 maxima on the r6 dump are 27–61 with down_norm against 153–255 without it. enc3 GroupNorm means are 2–4 against 9–24.
+
+### Recommendations (supersede "Recommended configurations" above)
+
+- **Training:** keep the default fp16 + recompute 1 (0.540 GB, about 34 ms). Use `UFSM_RECOMPUTE=2` for 0.447 GB at +7 ms.
+- **down_norm:** use `--down-norm 1` for new runs.
+- **MX-fp8 activations:** keep them opt-in, for memory-bound cases that can accept about 3% F1. Keep MX gradients off.
+- **Inference:** the default needs 0.228 GB at 9.6 ms. MX-fp8 activations need 0.205 GB at 7.4 ms.
+- **Narrower formats:** NVFP4 or MXFP6 storage is not worth building now. MXFP6 would save about 0.05 GB.
