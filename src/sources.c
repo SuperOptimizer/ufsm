@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 static const char *g_cache;   /* chunk cache dir for HTTPS stores; from the sources file or sources_set_cache */
 
@@ -178,12 +179,22 @@ z3 *pyramid_open_level(store *st, const char *group, int level, double um0, cons
     return z3_open(st, k, cache);
 }
 static z3 *open_level(store *st, const char *group, int level, double um0) { return pyramid_open_level(st, group, level, um0, g_cache); }
+/* the lazy opens below are called from every sampler worker: one lock (opens are rare, reads never take it).
+   Without it two workers racing on the same level both opened it, one handle leaked, and a failed open under the race
+   marked the level absent for the whole run (seen as workers spinning forever on draws with no usable level). */
+static pthread_mutex_t g_open_mu = PTHREAD_MUTEX_INITIALIZER;
+static void open_failed(const source *s, const char *what, int level) { if (getenv("UFSM_DEBUG")) fprintf(stderr, "source %s: %s level %d not available: %s\n", s->name, what, level, z3_error()); }
 
 z3 *source_ct(source *s, int level) {
     if (level < 0 || level >= MAXLEV || s->ct_present[level] == 0) return nullptr;
     if (!s->ct[level]) {
-        s->ct[level] = open_level(s->s, s->ct_key, level, s->um);
-        s->ct_present[level] = s->ct[level] != nullptr;
+        pthread_mutex_lock(&g_open_mu);
+        if (!s->ct[level] && s->ct_present[level]) {
+            s->ct[level] = open_level(s->s, s->ct_key, level, s->um);
+            s->ct_present[level] = s->ct[level] != nullptr;
+            if (!s->ct[level]) open_failed(s, "ct", level);
+        }
+        pthread_mutex_unlock(&g_open_mu);
     }
     return s->ct[level];
 }
@@ -191,8 +202,13 @@ z3 *source_ct(source *s, int level) {
 z3 *source_tgt(source *s, int ch, int level) {
     if (!s->tgt_key[ch] || level < 0 || level >= MAXLEV || s->tgt_present[ch][level] == 0) return nullptr;
     if (!s->tgt[ch][level]) {
-        s->tgt[ch][level] = open_level(s->tgt_store[ch] ? s->tgt_store[ch] : s->s, s->tgt_key[ch], level, s->um);
-        s->tgt_present[ch][level] = s->tgt[ch][level] != nullptr;
+        pthread_mutex_lock(&g_open_mu);
+        if (!s->tgt[ch][level] && s->tgt_present[ch][level]) {
+            s->tgt[ch][level] = open_level(s->tgt_store[ch] ? s->tgt_store[ch] : s->s, s->tgt_key[ch], level, s->um);
+            s->tgt_present[ch][level] = s->tgt[ch][level] != nullptr;
+            if (!s->tgt[ch][level]) open_failed(s, "target", level);
+        }
+        pthread_mutex_unlock(&g_open_mu);
     }
     return s->tgt[ch][level];
 }
@@ -204,14 +220,18 @@ z3 *source_region(source *s, int ch, int i) {
     if (!r || i < 0 || i >= r->n) return nullptr;
     store *st = s->tgt_store[ch] ? s->tgt_store[ch] : s->s;
     if (r->array) {
-        if (!s->reg_shared[ch]) s->reg_shared[ch] = open_level(st, r->array, 0, s->um);
+        if (!s->reg_shared[ch]) { pthread_mutex_lock(&g_open_mu); if (!s->reg_shared[ch]) { s->reg_shared[ch] = open_level(st, r->array, 0, s->um); if (!s->reg_shared[ch]) open_failed(s, "region array", 0); } pthread_mutex_unlock(&g_open_mu); }
         return s->reg_shared[ch];
     }
     if (!s->reg_z[ch][i]) {
+        pthread_mutex_lock(&g_open_mu);
+        if (s->reg_z[ch][i]) { pthread_mutex_unlock(&g_open_mu); return s->reg_z[ch][i]; }
         char k[1024];
         snprintf(k, sizeof k, "%s/region_%lld_%lld_%lld.zarr", r->dir, (long long)r->origin[i][0],
                  (long long)r->origin[i][1], (long long)r->origin[i][2]);
         s->reg_z[ch][i] = z3_open(st, k, g_cache);
+        if (!s->reg_z[ch][i]) open_failed(s, "region", i);
+        pthread_mutex_unlock(&g_open_mu);
     }
     return s->reg_z[ch][i];
 }
