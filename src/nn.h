@@ -135,6 +135,15 @@ void nn_silu_bwd_gn(const float *x, shape5 s, int G, const float *gamma, const f
 /* Conv whose epilogue also yields the GroupNorm statistics of its output (G_in > 0 applies gn+silu to the input). */
 int nn_conv3d_fwd_gn_stats(const float *x, shape5 xs, int G_in, const float *gamma, const float *beta, const float *mean, const float *rstd,
                            const float *w, const float *b, int cout, float *y, int G_out, float eps, float *omean, float *orstd);
+/* Input-side recompute. The conv input is silu(gn(x)) formed while staging from a stored pre-norm x (gx: GroupNorm
+   parameters and statistics; nullptr = x used as is). With x2 the input is the channel concat [x, x2] (c_split = channels
+   of x, gx2 the GroupNorm of x2; gx needs gx2, gx2 alone transforms x2 only). k=3 stride 1 (optionally with GN
+   statistics of the output for G_out groups), k=3 stride 2 and k=1 (no split). Tensor-core path only; -1 when unsupported. */
+typedef struct { const float *gamma, *beta, *mean, *rstd; int G; } nn_gn_t;
+int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, shape5 xs,
+                    const float *w, const float *b, int cout, int k, int stride, float *y, int G_out, float eps, float *omean, float *orstd);
+int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, shape5 xs,
+                           const float *gy, shape5 ys, int k, int stride, float *gw, float *gb);   /* gw / gb accumulated */
 int nn_conv3d_fwd_split(const float *x, const float *x2, int c_split, shape5 xs, int G_in, const float *gamma, const float *beta, const float *mean, const float *rstd,
                         const float *w, const float *b, int cout, float *y, int G_out, float eps, float *omean, float *orstd);
 int nn_conv3d_bwd_data_split(const float *gy, shape5 ys, const float *w, shape5 xs, float *gx, float *gx2, int o_split, float *scratch);
@@ -161,6 +170,7 @@ void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y);
 void nn_up2_fwd(const float *x, shape5 xs, float *y);
 /* Same, writing into channels [c0, c0 + xs.c) of a destination tensor with ctot channels (e.g. a concat buffer). */
 void nn_up2_fwd_into(const float *x, shape5 xs, float *y, int ctot, int c0);
+void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, float *y, int ctot, int c0);   /* upsample of silu(gn(x)) (g nullptr: of x) */
 void nn_up2_bwd(const float *gy, shape5 xs, float *gx);                  /* gx SET */
 
 /* ---- channel concat: y[:, :ca] = a, y[:, ca:] = b ---- */

@@ -311,6 +311,23 @@ __device__ __forceinline__ void gn_coef(const gnp_t &p, int n, int ci, int C, fl
     *a = sc; *b = p.beta[ci] - p.mean[ng] * sc;
 }
 __device__ __forceinline__ float silu_f(float v) { return v / (1.f + __expf(-v)); }
+/* GroupNorm + SiLU coefficients of input channel ci: sp.gp2 for the x2 segment when set (then gp covers x alone), else gp over
+   all channels; false when the channel is not transformed */
+__device__ __forceinline__ bool in_gn(const gnp_t &gp, const split_t &sp, int n, int ci, int Ci, float *a, float *b) {
+    if (sp.x2 && sp.gp2.G) {
+        if (ci >= sp.c_split) { gn_coef(sp.gp2, n, ci - sp.c_split, Ci - sp.c_split, a, b); return true; }
+        if (gp.G) { gn_coef(gp, n, ci, sp.c_split, a, b); return true; }
+        return false;
+    }
+    if (gp.G) { gn_coef(gp, n, ci, Ci, a, b); return true; }
+    return false;
+}
+/* silu(gn(.)) of an 18-element staged row starting at input column x0, zero outside [0, W) */
+__device__ __forceinline__ void row18_gn(float *v, float a, float b, int x0, int W) {
+#pragma unroll
+    for (int j = 0; j < 18; j++) v[j] = x0 + j >= 0 && x0 + j < W ? silu_f(v[j] * a + b) : 0.f;
+}
+static gnp_t to_gnp(const nn_gn_t *g) { gnp_t p = {}; if (g && g->G) { p.gamma = g->gamma; p.beta = g->beta; p.mean = g->mean; p.rstd = g->rstd; p.G = g->G; } return p; }
 __device__ __forceinline__ float gn_silu_at(float v, const gnp_t &p, int n, int ci, int C) {
     if (!p.G) return v;
     int cpg = C / p.G, ng = n * p.G + ci / cpg;
@@ -496,7 +513,7 @@ __global__ void __launch_bounds__(fw_nth(MT), fw_blocks(MT)) conv_fwd_tc_k(const
             const TI *xc = (sp.x2 && ci >= sp.c_split) ? (const TI *)sp.x2 + ((size_t)n * (Ci - sp.c_split) + (cok ? ci - sp.c_split : 0)) * plane
                                                        : x + ((size_t)n * (sp.x2 ? sp.c_split : Ci) + (cok ? ci : 0)) * plane;
             float ga = 1.f, gb = 0.f;
-            if (gp.G && cok) gn_coef(gp, n, ci, Ci, &ga, &gb);
+            const bool gtr = cok && in_gn(gp, sp, n, ci, Ci, &ga, &gb);
             for (int rr = threadIdx.x >> 4; rr < (FW_TZ + 2) * 10; rr += NTH / 16) {   /* (FW_TZ + 2) z-planes x 10 rows */
                 int iz = rr / 10, iy = rr - iz * 10;
                 int gz = oz0 - 1 + iz, gyy = oy0 - 1 + iy;
@@ -513,7 +530,7 @@ __global__ void __launch_bounds__(fw_nth(MT), fw_blocks(MT)) conv_fwd_tc_k(const
                         for (int j = 0; j < 16; j++) v[1 + j] = ox0 + j < W ? ldv(xr, j) : 0.f;
                     }
                     v[17] = ox0 + 16 < W ? ldv(xr, 16) : 0.f;
-                    if (gp.G) {   /* transform, then restore the zero padding outside the volume */
+                    if (gtr) {   /* transform, then restore the zero padding outside the volume */
 #pragma unroll
                         for (int j = 0; j < 18; j++) v[j] = silu_f(v[j] * ga + gb);
                         if (ox0 == 0) v[0] = 0.f;
@@ -811,7 +828,7 @@ __global__ void __launch_bounds__(128, 3) conv_bwd_s2_fused_k(const T *__restric
 #define S2_T 1080
 template <int MT, typename TI, typename TO, typename HT>
 __global__ void __launch_bounds__(256, 2) conv_fwd_tc_s2_k(const TI *__restrict__ x, const HT *__restrict__ wp, const float *__restrict__ b, TO *__restrict__ y,
-                              int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, int Do, int Ho, int Wo) {
+                              int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, int Do, int Ho, int Wo, gnp_t gp = {}) {
     constexpr int BM = MT * 16, TG = 9;
     extern __shared__ __align__(32) unsigned char smem_raw[];
     HT *sx = (HT *)smem_raw;                       /* [S2_T pos][TC_CI ci] */
@@ -833,6 +850,9 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_tc_s2_k(const TI *__restrict_
             const int k = threadIdx.x & 15, ci = ci0 + k;
             const bool cok = ci < Ci, xfull = 2 * ox0 + 16 <= W && !(W & 3);
             const TI *xc = x + ((size_t)n * Ci + (cok ? ci : 0)) * plane;
+            float ga = 1.f, gb = 0.f;
+            const bool gtr = cok && gp.G;
+            if (gtr) gn_coef(gp, n, ci, Ci, &ga, &gb);
             for (int rr = threadIdx.x >> 4; rr < 60; rr += 16) {
                 int iz = rr / 10, iy = rr - iz * 10;
                 int gz = oz0 * 2 - 1 + iz, gyy = oy0 * 2 - 1 + iy;
@@ -849,6 +869,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_tc_s2_k(const TI *__restrict_
                         for (int j = 0; j < 16; j++) v[1 + j] = 2 * ox0 + j < W ? ldv(xr, j) : 0.f;
                     }
                     v[17] = 2 * ox0 + 16 < W ? ldv(xr, 16) : 0.f;
+                    if (gtr) row18_gn(v, ga, gb, 2 * ox0 - 1, W);
 #pragma unroll
                     for (int j = 0; j < 18; j++) dst[j * TC_CI] = f2h<HT>(v[j]);
                 } else {
@@ -974,17 +995,17 @@ static int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const 
 }
 
 template <typename TI, typename TO, typename HT>
-static void conv_fwd_tc_s2_launch(int MT, dim3 grid, size_t smem, const TI *x, const HT *wp, const float *b, TO *y, shape5 xs, int cout, int Cop, int Cip, shape5 ys) {
+static void conv_fwd_tc_s2_launch(int MT, dim3 grid, size_t smem, const TI *x, const HT *wp, const float *b, TO *y, shape5 xs, int cout, int Cop, int Cip, shape5 ys, gnp_t gp) {
     static int attr_set[8][5];
     if (!attr_set[cur_dev()][MT]) { cudaFuncSetAttribute(MT == 1 ? (const void *)conv_fwd_tc_s2_k<1, TI, TO, HT> : MT == 2 ? (const void *)conv_fwd_tc_s2_k<2, TI, TO, HT> : (const void *)conv_fwd_tc_s2_k<4, TI, TO, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); attr_set[cur_dev()][MT] = 1; }
     switch (MT) {
-    case 1: conv_fwd_tc_s2_k<1, TI, TO, HT><<<grid, 256, smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w); break;
-    case 2: conv_fwd_tc_s2_k<2, TI, TO, HT><<<grid, 256, smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w); break;
-    default: conv_fwd_tc_s2_k<4, TI, TO, HT><<<grid, 256, smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w); break;
+    case 1: conv_fwd_tc_s2_k<1, TI, TO, HT><<<grid, 256, smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w, gp); break;
+    case 2: conv_fwd_tc_s2_k<2, TI, TO, HT><<<grid, 256, smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w, gp); break;
+    default: conv_fwd_tc_s2_k<4, TI, TO, HT><<<grid, 256, smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w, gp); break;
     }
 }
 template <typename HT>
-static int conv_fwd_tc_s2_h(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys) {
+static int conv_fwd_tc_s2_h(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp) {
     int Cop = (cout + 15) / 16 * 16, Cip = (xs.c + TC_CI - 1) / TC_CI * TC_CI;
     size_t nw = (size_t)27 * Cop * Cip;
     HT *wp = (HT *)tc_wbuf(nw);
@@ -993,28 +1014,28 @@ static int conv_fwd_tc_s2_h(const void *x, int xbf, shape5 xs, const float *w, c
     int nmt = Cop / (MT * 16);
     dim3 grid(nblk(ys.w, 8), nblk(ys.h, 4), (unsigned)(nblk(ys.d, 2) * nmt * xs.n));
     size_t smem = (size_t)(TC_CI * S2_T + 9 * MT * 16 * TC_CI) * 2;
-    if (xbf && ybf) conv_fwd_tc_s2_launch<HT, HT, HT>(MT, grid, smem, (const HT *)x, wp, b, (HT *)y, xs, cout, Cop, Cip, ys);
-    else if (xbf) conv_fwd_tc_s2_launch<HT, float, HT>(MT, grid, smem, (const HT *)x, wp, b, (float *)y, xs, cout, Cop, Cip, ys);
-    else if (ybf) conv_fwd_tc_s2_launch<float, HT, HT>(MT, grid, smem, (const float *)x, wp, b, (HT *)y, xs, cout, Cop, Cip, ys);
-    else conv_fwd_tc_s2_launch<float, float, HT>(MT, grid, smem, (const float *)x, wp, b, (float *)y, xs, cout, Cop, Cip, ys);
+    if (xbf && ybf) conv_fwd_tc_s2_launch<HT, HT, HT>(MT, grid, smem, (const HT *)x, wp, b, (HT *)y, xs, cout, Cop, Cip, ys, gp);
+    else if (xbf) conv_fwd_tc_s2_launch<HT, float, HT>(MT, grid, smem, (const HT *)x, wp, b, (float *)y, xs, cout, Cop, Cip, ys, gp);
+    else if (ybf) conv_fwd_tc_s2_launch<float, HT, HT>(MT, grid, smem, (const float *)x, wp, b, (HT *)y, xs, cout, Cop, Cip, ys, gp);
+    else conv_fwd_tc_s2_launch<float, float, HT>(MT, grid, smem, (const float *)x, wp, b, (float *)y, xs, cout, Cop, Cip, ys, gp);
     return 0;
 }
-static int conv_fwd_tc_s2(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys) {
-    if (ISMX(x) || ISMX(y)) { if (!ISMX(x) || !ISMX(y)) { fprintf(stderr, "conv s2: MX-fp8 storage needs MX input and output\n"); abort(); } return lp_conv_fwd_s2_f8(x, 3, xs, w, b, cout, y, 3, ys); }
-    if ((eff_prec() == 2 || eff_prec() == 3) && xbf == ybf) return lp_conv_fwd_s2_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), ys);
-    return g_h16 ? conv_fwd_tc_s2_h<f16>(x, xbf, xs, w, b, cout, y, ybf, ys) : conv_fwd_tc_s2_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, ys);
+static int conv_fwd_tc_s2(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp = {}) {
+    if (ISMX(x) || ISMX(y)) { if (!ISMX(x) || !ISMX(y)) { fprintf(stderr, "conv s2: MX-fp8 storage needs MX input and output\n"); abort(); } return lp_conv_fwd_s2_f8(x, 3, xs, w, b, cout, y, 3, ys, gp); }
+    if ((eff_prec() == 2 || eff_prec() == 3) && xbf == ybf) return lp_conv_fwd_s2_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), ys, gp);
+    return g_h16 ? conv_fwd_tc_s2_h<f16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp) : conv_fwd_tc_s2_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp);
 }
 
 /* 1^3 conv reading activations of type TI (head): y[co] = b[co] + sum_ci w[co][ci] x[ci] */
 template <typename TI, typename TO>
-__global__ void conv1_f_k(const TI *__restrict__ x, const float *__restrict__ w, const float *__restrict__ b, TO *__restrict__ y, int N, int Ci, int Co, size_t S) {
+__global__ void conv1_f_k(const TI *__restrict__ x, const float *__restrict__ w, const float *__restrict__ b, TO *__restrict__ y, int N, int Ci, int Co, size_t S, gnp_t gp = {}) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)N * S) return;
     int n = (int)(i / S); size_t v = i % S;
     const TI *xp = x + (size_t)n * Ci * S + v;
     for (int co = 0; co < Co; co++) {
         float a = b ? b[co] : 0.f;
-        for (int ci = 0; ci < Ci; ci++) a += w[co * Ci + ci] * ldv(xp, (size_t)ci * S);
+        for (int ci = 0; ci < Ci; ci++) a += w[co * Ci + ci] * gn_silu_at(ldv(xp, (size_t)ci * S), gp, n, ci, Ci);
         stv(y, ((size_t)n * Co + co) * S + v, a);
     }
 }
@@ -1025,7 +1046,7 @@ extern "C" shape5 nn_conv3d_out_shape(shape5 xs, int cout, int k, int stride) {
 }
 
 extern "C" void nn_conv3d_fwd(const float *x, shape5 xs, const float *w, const float *b, int cout, int k, int stride, float *y) {
-    if (k == 1 && g_tf32 && ISMX(x)) { lp_conv1_fwd_mx(x, xs, w, b, cout, y); KCHECK(); return; }   /* head reading an MX tensor (fp32 output) */
+    if (k == 1 && g_tf32 && ISMX(x)) { lp_conv1_fwd_mx(x, xs, w, b, cout, y, gnp_t{}); KCHECK(); return; }   /* head reading an MX tensor (fp32 output) */
     shape5 ys = nn_conv3d_out_shape(xs, cout, k, stride);
     if (k == 3 && stride == 1 && g_tf32) { gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0}; split_t ns = {nullptr, 0, nullptr, 0}; conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, none, nullptr, 0, ns); KCHECK(); return; }
     if (k == 3 && stride == 2 && g_tf32) { conv_fwd_tc_s2(x, ABF, xs, w, b, cout, y, ABF, ys); KCHECK(); return; }
@@ -1337,8 +1358,8 @@ __global__ void __launch_bounds__(W2_NTHR, 3) conv_bwd_w_tc2_k(const TI *__restr
                         for (int j = 0; j < 16; j++) v[1 + j] = ox0 + j < W ? ldv(xc, j) : 0.f;
                     }
                     v[17] = ox0 + 16 < W ? ldv(xc, 16) : 0.f;
-                    if (gp.G) {   /* transform, then restore the zero padding outside the volume */
-                        float ga, gb; gn_coef(gp, n, ci, Ci, &ga, &gb);
+                    float ga, gb;
+                    if (in_gn(gp, sp, n, ci, Ci, &ga, &gb)) {   /* transform, then restore the zero padding outside the volume */
 #pragma unroll
                         for (int j = 0; j < 18; j++) v[j] = silu_f(v[j] * ga + gb);
                         if (ox0 == 0) v[0] = 0.f;
@@ -1423,7 +1444,7 @@ static void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, i
 #define S2W_CI 8
 template <typename TI, typename TG, typename HT>
 __global__ void __launch_bounds__(256, 3) conv_bwd_w_tc_s2_k(const TI *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
-                                   int N, int Ci, int D, int H, int W, int Co, int Do, int Ho, int Wo) {
+                                   int N, int Ci, int D, int H, int W, int Co, int Do, int Ho, int Wo, gnp_t gp = {}) {
     extern __shared__ __align__(32) unsigned char smem_raw[];
     HT *sx = (HT *)smem_raw;                      /* [2 parity][S2W_CI ci][60 rows][10 half-pos]: row = z*10 + y of the 6 x 10 tile */
     HT *sg = sx + 2 * S2W_CI * 600;                 /* [16 co][64 vox]: vox = (z*4 + row)*8 + x */
@@ -1458,6 +1479,7 @@ __global__ void __launch_bounds__(256, 3) conv_bwd_w_tc_s2_k(const TI *__restric
                         for (int j = 0; j < 16; j++) v[1 + j] = 2 * ox0 + j < W ? ldv(xr, j) : 0.f;
                     }
                     v[17] = 2 * ox0 + 16 < W ? ldv(xr, 16) : 0.f;
+                    if (gp.G) { float ga, gb; gn_coef(gp, n, ci, Ci, &ga, &gb); row18_gn(v, ga, gb, 2 * ox0 - 1, W); }
                 } else {
 #pragma unroll
                     for (int j = 0; j < 18; j++) v[j] = 0.f;
@@ -1516,7 +1538,7 @@ __global__ void __launch_bounds__(256, 3) conv_bwd_w_tc_s2_k(const TI *__restric
 /* 1^3 weight gradient: a block owns a voxel slab and accumulates all Ci x Co products (Ci x Co <= 64 handled here), so
    x and gy are read exactly once; block partials are added with atomics */
 template <typename TI, typename TG, int CIO>
-__global__ void __launch_bounds__(256) conv_bwd_w1_k(const TI *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, int N, int Ci, int Co, size_t S) {
+__global__ void __launch_bounds__(256) conv_bwd_w1_k(const TI *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, int N, int Ci, int Co, size_t S, gnp_t xg = {}) {
     float acc[CIO] = {};
     size_t per = ((S + gridDim.x - 1) / gridDim.x + 3) & ~(size_t)3, lo = (size_t)blockIdx.x * per, hi = lo + per < S ? lo + per : S;
     for (int n = 0; n < N; n++) {
@@ -1527,6 +1549,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_k(const TI *__restrict__ x, c
                 for (int co = 0; co < Co; co++) ld4<TG>(gp + (size_t)co * S + v, gv[co]);
                 for (int ci = 0; ci < Ci; ci++) {
                     float xv[4]; ld4<TI>(xp + (size_t)ci * S + v, xv);
+                    if (xg.G) { float a, b; gn_coef(xg, n, ci, Ci, &a, &b); for (int j = 0; j < 4; j++) xv[j] = silu_f(xv[j] * a + b); }
                     for (int co = 0; co < Co; co++) acc[ci * Co + co] += xv[0] * gv[co][0] + xv[1] * gv[co][1] + xv[2] * gv[co][2] + xv[3] * gv[co][3];
                 }
             }
@@ -1535,7 +1558,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_k(const TI *__restrict__ x, c
                 float gv[8];
                 for (int co = 0; co < Co; co++) gv[co] = ldv(gp, (size_t)co * S + v);
                 for (int ci = 0; ci < Ci; ci++) {
-                    float xv = ldv(xp, (size_t)ci * S + v);
+                    float xv = gn_silu_at(ldv(xp, (size_t)ci * S + v), xg, n, ci, Ci);
                     for (int co = 0; co < Co; co++) acc[ci * Co + co] += xv * gv[co];
                 }
             }
@@ -1568,22 +1591,22 @@ __global__ void bias_grad_k(const TG *gy, float *gb, int N, int Co, size_t So) {
 }
 
 template <typename HT>
-static void bwd_w_s2_h(const float *x, shape5 xs, const float *gy, shape5 ys, float *gw, float *gb) {
+static void bwd_w_s2_h(const float *x, shape5 xs, const float *gy, shape5 ys, float *gw, float *gb, gnp_t gp = {}) {
     static int attr[8];
     if (!attr[cur_dev()]) { cudaFuncSetAttribute((const void *)conv_bwd_w_tc_s2_k<float, float, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_tc_s2_k<HT, float, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_tc_s2_k<HT, HT, HT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); attr[cur_dev()] = 1; }
     size_t smem = (size_t)(2 * S2W_CI * 600 + 16 * 64) * 2;
     int nzc = (nblk(ys.d, 2) + WG_ZC - 1) / WG_ZC;
     dim3 grid((xs.c + S2W_CI - 1) / S2W_CI, (ys.c + 15) / 16, (unsigned)(nblk(ys.w, 8) * nblk(ys.h, 4) * nzc * ys.n));
-    if (GBF) conv_bwd_w_tc_s2_k<HT, HT, HT><<<grid, 256, smem>>>((const HT *)x, (const HT *)gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w);
-    else if (ABF) conv_bwd_w_tc_s2_k<HT, float, HT><<<grid, 256, smem>>>((const HT *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w);
-    else conv_bwd_w_tc_s2_k<float, float, HT><<<grid, 256, smem>>>(x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w);
+    if (GBF) conv_bwd_w_tc_s2_k<HT, HT, HT><<<grid, 256, smem>>>((const HT *)x, (const HT *)gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, gp);
+    else if (ABF) conv_bwd_w_tc_s2_k<HT, float, HT><<<grid, 256, smem>>>((const HT *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, gp);
+    else conv_bwd_w_tc_s2_k<float, float, HT><<<grid, 256, smem>>>(x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, gp);
 }
 template <typename HT>
-static void bwd_w1_h(const float *x, shape5 xs, const float *gy, shape5 ys, float *gw, size_t So) {
+static void bwd_w1_h(const float *x, shape5 xs, const float *gy, shape5 ys, float *gw, size_t So, gnp_t xg = {}) {
     int nb = (int)((So + 2047) / 2048); if (nb > 4096) nb = 4096; if (nb < 1) nb = 1;
-    if (GBF) conv_bwd_w1_k<HT, HT, 64><<<nb, 256>>>((const HT *)x, (const HT *)gy, gw, xs.n, xs.c, ys.c, So);
-    else if (ABF) conv_bwd_w1_k<HT, float, 64><<<nb, 256>>>((const HT *)x, gy, gw, xs.n, xs.c, ys.c, So);
-    else conv_bwd_w1_k<float, float, 64><<<nb, 256>>>(x, gy, gw, xs.n, xs.c, ys.c, So);
+    if (GBF) conv_bwd_w1_k<HT, HT, 64><<<nb, 256>>>((const HT *)x, (const HT *)gy, gw, xs.n, xs.c, ys.c, So, xg);
+    else if (ABF) conv_bwd_w1_k<HT, float, 64><<<nb, 256>>>((const HT *)x, gy, gw, xs.n, xs.c, ys.c, So, xg);
+    else conv_bwd_w1_k<float, float, 64><<<nb, 256>>>(x, gy, gw, xs.n, xs.c, ys.c, So, xg);
 }
 extern "C" void nn_conv3d_bwd_weight(const float *x, shape5 xs, const float *gy, shape5 ys, int k, int stride, float *gw, float *gb) {
     size_t So = shape_spatial(ys);
@@ -1594,14 +1617,14 @@ extern "C" void nn_conv3d_bwd_weight(const float *x, shape5 xs, const float *gy,
         KCHECK();
         return;
     }
-    if (k == 3 && stride == 2 && g_tf32 && ISMX(x)) { lp_bwd_w_s2_f8(x, 3, xs, gy, ISMX(gy) ? 3 : LPDT(GBF), ys, gw, gb); KCHECK(); return; }
+    if (k == 3 && stride == 2 && g_tf32 && ISMX(x)) { lp_bwd_w_s2_f8(x, 3, xs, gy, ISMX(gy) ? 3 : LPDT(GBF), ys, gw, gb, gnp_t{}); KCHECK(); return; }
     if (k == 1 && stride == 1 && g_tf32 && ISMX(x)) {
-        lp_bwd_w1_mx(x, xs, gy, LPDT(GBF), ys, gw);
+        lp_bwd_w1_mx(x, xs, gy, LPDT(GBF), ys, gw, gnp_t{});
         size_t So1 = shape_spatial(ys);
         if (gb) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So1); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So1); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So1); }
         KCHECK(); return;
     }
-    if (k == 3 && stride == 2 && g_tf32 && (eff_prec_w() == 2 || eff_prec_w() == 3)) { lp_bwd_w_s2_f8(x, LPDT(ABF), xs, gy, LPDT(GBF), ys, gw, gb); KCHECK(); return; }
+    if (k == 3 && stride == 2 && g_tf32 && (eff_prec_w() == 2 || eff_prec_w() == 3)) { lp_bwd_w_s2_f8(x, LPDT(ABF), xs, gy, LPDT(GBF), ys, gw, gb, gnp_t{}); KCHECK(); return; }
     if (k == 3 && stride == 2 && g_tf32) {
         if (g_h16) bwd_w_s2_h<f16>(x, xs, gy, ys, gw, gb); else bwd_w_s2_h<bf16>(x, xs, gy, ys, gw, gb);
         KCHECK();
@@ -1709,6 +1732,73 @@ extern "C" int nn_conv3d_bwd_weight_split(const float *x, const float *x2, int c
     launch_bwd_w_tc(x, ABF, xs, gy, GBF, ys, gw, gb, gp, sp);
     KCHECK();
     return 0;
+}
+
+/* ---- input-side recompute: the conv input silu(gn(.)) of a stored pre-norm tensor (and, for the decoder, the nearest
+   upsample of the coarse block output) is formed while staging, so neither the normalized activation nor the
+   upsampled tensor is stored ---- */
+static int xsplit(const float *x2, const nn_gn_t *gx, const nn_gn_t *gx2, int c_split, split_t *sp) {
+    *sp = split_t{};
+    if (!x2) return 0;
+    if ((gx && gx->G) && !(gx2 && gx2->G)) { fprintf(stderr, "conv: a split input with a GroupNorm on x needs one on x2\n"); return -1; }
+    sp->x2 = x2; sp->c_split = c_split; sp->gp2 = to_gnp(gx2);
+    return 0;
+}
+extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, shape5 xs,
+                               const float *w, const float *b, int cout, int k, int stride, float *y, int G_out, float eps, float *omean, float *orstd) {
+    if (!g_tf32) return -1;
+    gnp_t gp = to_gnp(gx);
+    shape5 ys = nn_conv3d_out_shape(xs, cout, k, stride);
+    if (k == 3 && stride == 1) {
+        split_t sp; if (xsplit(x2, gx, gx2, c_split, &sp)) return -1;
+        double *sums = nullptr;
+        if (G_out) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
+        conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, sp);
+        if (G_out) gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, (size_t)(cout / G_out) * shape_spatial(ys), eps, omean, orstd);
+        KCHECK();
+        return 0;
+    }
+    if (x2 || G_out) return -1;
+    if (k == 3 && stride == 2) { conv_fwd_tc_s2(x, ABF, xs, w, b, cout, y, ABF, ys, gp); KCHECK(); return 0; }
+    if (k == 1 && stride == 1) {
+        if (ISMX(x)) lp_conv1_fwd_mx(x, xs, w, b, cout, y, gp);
+        else { size_t S = shape_spatial(xs); dim3 gr(nblk((size_t)xs.n * S, 256));
+            if (ABF && g_h16) conv1_f_k<f16, float><<<gr, 256>>>((const f16 *)x, w, b, y, xs.n, xs.c, cout, S, gp);
+            else if (ABF) conv1_f_k<bf16, float><<<gr, 256>>>((const bf16 *)x, w, b, y, xs.n, xs.c, cout, S, gp);
+            else conv1_f_k<float, float><<<gr, 256>>>(x, w, b, y, xs.n, xs.c, cout, S, gp); }
+        KCHECK();
+        return 0;
+    }
+    return -1;
+}
+extern "C" int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, shape5 xs,
+                                      const float *gy, shape5 ys, int k, int stride, float *gw, float *gb) {
+    if (!g_tf32) return -1;
+    gnp_t gp = to_gnp(gx);
+    if (k == 3 && stride == 1) {
+        split_t sp; if (xsplit(x2, gx, gx2, c_split, &sp)) return -1;
+        launch_bwd_w_tc(x, ABF, xs, gy, GBF, ys, gw, gb, gp, sp);
+        KCHECK();
+        return 0;
+    }
+    if (x2) return -1;
+    if (k == 3 && stride == 2) {
+        if (ISMX(x)) lp_bwd_w_s2_f8(x, 3, xs, gy, ISMX(gy) ? 3 : LPDT(GBF), ys, gw, gb, gp);
+        else if (eff_prec_w() == 2 || eff_prec_w() == 3) lp_bwd_w_s2_f8(x, LPDT(ABF), xs, gy, LPDT(GBF), ys, gw, gb, gp);
+        else if (g_h16) bwd_w_s2_h<f16>(x, xs, gy, ys, gw, gb, gp); else bwd_w_s2_h<bf16>(x, xs, gy, ys, gw, gb, gp);
+        KCHECK();
+        return 0;
+    }
+    if (k == 1 && stride == 1) {
+        size_t So = shape_spatial(ys);
+        if (ISMX(x)) lp_bwd_w1_mx(x, xs, gy, LPDT(GBF), ys, gw, gp);
+        else if (xs.c * ys.c <= 64 && ys.c <= 8) { if (g_h16) bwd_w1_h<f16>(x, xs, gy, ys, gw, So, gp); else bwd_w1_h<bf16>(x, xs, gy, ys, gw, So, gp); }
+        else return -1;
+        if (gb) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So); }
+        KCHECK();
+        return 0;
+    }
+    return -1;
 }
 
 /* gx = gy * silu'(g) with g = gn(x) recomputed from the saved statistics (no materialized g) */
@@ -2248,7 +2338,7 @@ template <> __device__ __forceinline__ void st2<f16>(f16 *p, float a, float b) {
 /* forward exact-2x trilinear upsample, separable: block = 4 x 8 x 32 outputs from a 4 x 6 x 18 input tile (staged with
    clamped source indices, which makes the edge clamping implicit); x-blend, y-blend, z-blend passes in shared memory */
 template <typename TI, typename TO>
-__global__ void __launch_bounds__(256) up2_f_k(const TI *x, TO *y, int N, int C, int D, int H, int W, int ctot, int c0) {
+__global__ void __launch_bounds__(256) up2_f_k(const TI *x, TO *y, int N, int C, int D, int H, int W, int ctot, int c0, gnp_t gp = {}) {
     __shared__ float sx[4 * 6 * 18], tx[4 * 6 * 32], ty[4 * 8 * 32];
     const int ox0 = blockIdx.x * 32, oy0 = blockIdx.y * 8;
     int bz = blockIdx.z;
@@ -2262,6 +2352,7 @@ __global__ void __launch_bounds__(256) up2_f_k(const TI *x, TO *y, int N, int C,
         int ix = i % 18, iy = (i / 18) % 6, iz = i / 108;
         int mz = min(max(mz0 + iz, 0), D - 1), my = min(max(my0 + iy, 0), H - 1), mx = min(max(mx0 + ix, 0), W - 1);
         sx[i] = ldv(p, ((size_t)mz * H + my) * W + mx);
+        if (gp.G) sx[i] = gn_silu_at(sx[i], gp, n, c, C);   /* upsample of silu(gn(x)) */
     }
     __syncthreads();
     for (int i = threadIdx.x; i < 4 * 6 * 32; i += 256) {   /* tx[iz][iy][oxl] */
@@ -2360,14 +2451,16 @@ __global__ void __launch_bounds__(256) up2_b_k(const TG *gy, TO *gx, int NC, int
     float acc = wq[0] * col[0] + wq[1] * col[64] + wq[2] * col[128] + wq[3] * col[192];
     stv(gx, ((size_t)nc * D + mz) * H * W + (size_t)my * W + mx, acc);
 }
-extern "C" void nn_up2_fwd_into(const float *x, shape5 xs, float *y, int ctot, int c0) {
-    if (ISMX(x)) { if (!ISMX(y) || ctot != xs.c || c0) { fprintf(stderr, "up2: MX input needs a whole MX output tensor\n"); abort(); } lp_up2_fwd_mx(x, xs, y); KCHECK(); return; }
+extern "C" void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, float *y, int ctot, int c0) {
+    const gnp_t gp = to_gnp(g);
+    if (ISMX(x)) { if (!ISMX(y) || ctot != xs.c || c0) { fprintf(stderr, "up2: MX input needs a whole MX output tensor\n"); abort(); } lp_up2_fwd_mx(x, xs, y, gp); KCHECK(); return; }
     dim3 grid(nblk(2 * xs.w, 32), nblk(2 * xs.h, 8), (unsigned)(nblk(2 * xs.d, 4) * xs.n * xs.c));
-    if (ABF && g_h16) up2_f_k<f16, f16><<<grid, 256>>>((const f16 *)x, (f16 *)y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0);
-    else if (ABF) up2_f_k<bf16, bf16><<<grid, 256>>>((const bf16 *)x, (bf16 *)y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0);
-    else up2_f_k<float, float><<<grid, 256>>>(x, y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0);
+    if (ABF && g_h16) up2_f_k<f16, f16><<<grid, 256>>>((const f16 *)x, (f16 *)y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0, gp);
+    else if (ABF) up2_f_k<bf16, bf16><<<grid, 256>>>((const bf16 *)x, (bf16 *)y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0, gp);
+    else up2_f_k<float, float><<<grid, 256>>>(x, y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0, gp);
     KCHECK();
 }
+extern "C" void nn_up2_fwd_into(const float *x, shape5 xs, float *y, int ctot, int c0) { nn_up2_fwd_gn_into(x, xs, nullptr, y, ctot, c0); }
 extern "C" void nn_up2_fwd(const float *x, shape5 xs, float *y) { nn_up2_fwd_into(x, xs, y, xs.c, 0); }
 extern "C" void nn_up2_bwd(const float *gy, shape5 xs, float *gx) {
     if (ISMX(gy)) { if (!ISMX(gx)) { fprintf(stderr, "up2_bwd: MX gy needs an MX gx\n"); abort(); } lp_up2_bwd_mx(gy, xs, gx); KCHECK(); return; }

@@ -70,3 +70,7 @@ void unet_prof_layers(double out[][3]);    /* [UNET_NSLOT][fwd, bwd_data, bwd_w]
    the convolutions that read them run in fp8; activation gradients keep their storage. Takes effect at the next build. */
 void unet_set_act_mx8(int on);
 void unet_set_grad_mx8(int on);   /* MX-fp8 activation gradients as well (env UFSM_GRAD_MX8=1; requires the MX activations) */
+/* recompute mode (env UFSM_RECOMPUTE=1): no stored block outputs silu(gn(a2)) and no stored upsampled decoder inputs; the
+   consumers apply GN + SiLU while staging and the upsample is rebuilt into a transient buffer */
+void unet_set_recompute(int on);
+size_t unet_grad_bytes(const unet *u);   /* the activation-gradient part of unet_activation_bytes */
