@@ -985,7 +985,7 @@ template <int MT, int TZ, typename T, typename TO> static void launch_f8p(dim3 g
 template <typename T, typename TO> static void p16_f8(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, int Cop, int Ox, int OxP, gnp_t gp, double *osum, int Go, split_t sp) {
     uint8_t *wq = lp_buf<uint8_t>(0, (size_t)P16_KS * Cop * 32), *ws = lp_buf<uint8_t>(1, (size_t)P16_KS * Cop);
     prep_w8p_k<<<nblk_((size_t)P16_KS * Cop, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, IS_MX(TO) && sp.y2 ? Ox : -1, OxP);
-    int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : 1;
+    int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : !IS_MX(TO) && Cop == 48 ? 3 : 1;   /* 48 plane-major outputs (dec0.c1 backward-data): one tile, the input staged once */
     const int nmt = Cop / (MT * 16);
     static int tz_env = -1;
     if (tz_env < 0) tz_env = getenv("UFSM_F8_TZ") ? atoi(getenv("UFSM_F8_TZ")) : 0;
@@ -997,6 +997,8 @@ template <typename T, typename TO> static void p16_f8(const void *x, shape5 xs, 
     case 14: launch_f8p<1, 4, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     case 22: launch_f8p<2, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     case 24: launch_f8p<2, 4, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    case 32: launch_f8p<3, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    case 34: launch_f8p<3, 4, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     default: launch_f8p<4, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     }
 }
@@ -1642,7 +1644,7 @@ template <typename T, typename TO> static void p16_f4(const void *x, shape5 xs, 
     const int pOx = IS_MX(TO) && sp.y2 ? Ox : -1;
     uint8_t *wq, *ws;
     if (!wmemo_get(sp.wkey, w, Cop, -16, -1, 0, pOx, OxP, nq, ns, &wq, &ws)) prep_w4p_k<<<nblk_(ns, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, pOx, OxP);   /* Cip -16: packed layout */
-    int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : 1;
+    int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : !IS_MX(TO) && Cop == 48 ? 3 : 1;   /* 48 plane-major outputs (dec0.c1 backward-data): one tile, the input staged once */
     const int nmt = Cop / (MT * 16);
     static int tz_env = -1;
     if (tz_env < 0) tz_env = getenv("UFSM_F4_TZ") ? atoi(getenv("UFSM_F4_TZ")) : 0;
@@ -1654,6 +1656,8 @@ template <typename T, typename TO> static void p16_f4(const void *x, shape5 xs, 
     case 14: launch_f4p<1, 4, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     case 22: launch_f4p<2, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     case 24: launch_f4p<2, 4, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    case 32: launch_f4p<3, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    case 34: launch_f4p<3, 4, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     default: launch_f4p<4, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     }
 }

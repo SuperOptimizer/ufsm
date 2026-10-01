@@ -618,6 +618,15 @@ int main(void) {
         check("fp4 backward-data = adjoint of the forward with 2D weight scales", rel[1] < 1e-5);
         free(h); free(hy); free(hg);
     }
+    {   /* dec0.c1 backward-data shape on the packed fp4 kernel: gy 16 ch -> 48 outputs split 32 + 16 (one 48-row tile, MT 3) */
+        shape5 o16 = {N, 16, 16, 12, 16}, cs = o16, c1 = o16, c2 = o16; cs.c = 48; c1.c = 32;
+        float *gy = dev_rand(shape_numel(o16), 1.f), *w = dev_rand((size_t)16 * 48 * 27, 0.1f), *scr = nn_malloc(nn_conv3d_scratch(cs, 16, 3) + 4096);
+        float *gxr = dev_zero(shape_numel(cs)), *ga = dev_zero(shape_numel(c1)), *gb_ = dev_zero(shape_numel(c2)), *g1 = dev_zero(shape_numel(c1)), *g2 = dev_zero(shape_numel(c2));
+        mode_ref(); nn_conv3d_bwd_data(gy, o16, w, cs, 3, 1, gxr, scr); nn_concat_bwd(gxr, 32, 16, cs, ga, gb_);
+        mode_mx(); nn_conv3d_bwd_data_split(gy, o16, w, cs, g1, g2, 32, scr);
+        cmp("fp4 bwd_data 16 -> 32 + 16 (packed, 48-row tile), part 1", g1, ga, shape_numel(c1), TOL4);
+        cmp("fp4 bwd_data 16 -> 32 + 16 (packed, 48-row tile), part 2", g2, gb_, shape_numel(c2), TOL4);
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
     printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);
