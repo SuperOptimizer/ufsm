@@ -151,7 +151,7 @@ def main():
                     lab = os.path.basename(os.path.normpath(s["targets"]["recto"]["root"])).replace(".zarr", "")
                     s["name"] = f"{name}-{lab}"
     for s in srcs:   # scans finer than 1.8 um: their level 0 is finer than the rest of the set (and enormous); train from level 1
-        if s.get("um", 2.4) < 1.8:
+        if s.get("um", 2.4) < 1.8 and "regions" not in json.dumps(s.get("targets", {})) and s["name"] != "kaggle":
             s["min_level"] = 1
     json.dump(cfg, open(out, "w"), indent=1)
     print(f"{len(srcs)} sources -> {out}", file=sys.stderr)
