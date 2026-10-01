@@ -1012,7 +1012,7 @@ template <int MT, int TZ, typename T, typename TO> static void launch_f8g(dim3 g
 }
 template <typename T, typename TO = T> static void fwd_f8_t(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp) {
     static int small = -1;
-    if (small < 0) small = getenv("UFSM_F8_NOSMALL") ? 0 : 1;
+    if (small < 0) small = ufsm_env_on("UFSM_F8_NOSMALL") ? 0 : 1;
     /* tap-packed small-channel kernel: fp32 input up to 16 channels; with bf16 input the general kernel is as fast at 16 */
     if (small && (std::is_same<T, TO>::value || (IS_MX(TO) && !IS_MX(T))) && xs.c <= (sizeof(T) == 2 || IS_MX(T) ? 8 : 16) && !sp.x2) {
         if (xs.c <= 4) small_f8<4, T, TO>(x, xs, w, b, cout, y, gp, osum, Go, sp);
@@ -2811,6 +2811,68 @@ extern "C" void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx) {
     size_t n = (size_t)xs.n * mx_nb(xs.c) * shape_spatial(xs);
     up2_bwd_mx_k<<<nblk_(n, 256), 256>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, xs.c, xs.d, xs.h, xs.w); LPCK();
 }
+/* channel slice [c0, c0 + nc) of an MX-fp8 gx with ctot channels from an MX-fp8 gy of nc channels (the chunked up-part gradient
+   of the decoder): thread = (n, gx block touched by the slice, coarse voxel). A slice that starts at its block's first channel
+   writes the block fresh (other channels zero); a later slice of the same block (16-channel chunks of a 32-channel block)
+   decodes the stored row, replaces its channels and requantises (one extra e4m3 rounding of the earlier chunk's channels when
+   the block scale grows). Chunks must be processed in increasing c0; a slice lies in one gy block (nc <= 16, or 32-aligned). */
+__global__ void up2_bwd_mx_slice_k(const uint8_t *gy, uint8_t *gx, int N, int nc, int ctot, int c0, int ob0, int nob, int D, int H, int W) {
+    const int bwy = mx_bw(nc), nby = mx_nb(nc), bwx = mx_bw(ctot), nbx = mx_nb(ctot), Do = 2 * D, Ho = 2 * H, Wo = 2 * W;
+    const size_t S = (size_t)D * H * W, So = (size_t)Do * Ho * Wo;
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * nob * S) return;
+    const size_t v = i % S; const int ob = ob0 + (int)((i / S) % nob), n = (int)(i / (S * nob));
+    const int lo = max(c0, ob * bwx), hi = min(c0 + nc, min(ob * bwx + bwx, ctot)), yb = (lo - c0) / bwy, ko = (lo - c0) - yb * bwy;
+    const int x = (int)(v % W), y = (int)((v / W) % H), z = (int)(v / ((size_t)W * H));
+    const uint8_t *scy = mx_sc<8>(gy, N, nc, So);
+    float acc[32] = {};
+#pragma unroll 1
+    for (int a = 0; a < 4; a++) {
+        int oz = 2 * z - 1 + a; float wz = upc(oz, z, D); if (wz == 0.f) continue;
+#pragma unroll 1
+        for (int bb = 0; bb < 4; bb++) {
+            int oy = 2 * y - 1 + bb; float wy = upc(oy, y, H); if (wy == 0.f) continue;
+#pragma unroll 1
+            for (int c = 0; c < 4; c++) {
+                int ox = 2 * x - 1 + c; float wx = upc(ox, x, W); if (wx == 0.f) continue;
+                float r[32], w3 = wz * wy * wx;
+                mx_load_row(gy, scy, ((size_t)n * nby + yb) * So + ((size_t)oz * Ho + oy) * Wo + ox, bwy, r);
+#pragma unroll
+                for (int k = 0; k < 32; k++) acc[k] += w3 * r[k];
+            }
+        }
+    }
+    const size_t ri = ((size_t)n * nbx + ob) * S + v;
+    uint8_t *scx = mx_sc<8>(gx, N, ctot, S);
+    float out[32];
+    if (lo == ob * bwx) {
+#pragma unroll
+        for (int k = 0; k < 32; k++) out[k] = 0.f;
+    } else mx_load_row(gx, scx, ri, bwx, out);
+#pragma unroll
+    for (int k = 0; k < 32; k++) { const int cch = ob * bwx + k; if (cch >= lo && cch < hi) { const int kk = cch - lo + ko; float val = 0.f;
+#pragma unroll
+        for (int q = 0; q < 32; q++) if (q == kk) val = acc[q];
+        out[k] = val; } }
+    mx_store_row(gx, scx, ri, bwx, out);
+}
+extern "C" void lp_up2_bwd_mx_slice(const void *gy, shape5 xs, void *gx, int ctot, int c0) {   /* xs: coarse shape with nc = xs.c channels */
+    const int nc = xs.c, bwx = mx_bw(ctot), bwy = mx_bw(nc);
+    if (c0 % 16 || (nc > 16 && (c0 % 32 || (nc % 32 && c0 + nc != ctot))) || (c0 % bwx + nc > bwx && nc <= 16)) { fprintf(stderr, "lp_up2_bwd_mx_slice: unaligned slice c0 %d nc %d of %d\n", c0, nc, ctot); abort(); }
+    (void)bwy;
+    const int ob0 = c0 / bwx, ob1 = (c0 + nc - 1) / bwx, nob = ob1 - ob0 + 1;
+    if (nob > 1 && nc <= 16) { fprintf(stderr, "lp_up2_bwd_mx_slice: slice spans blocks\n"); abort(); }
+    if (nob > 1) {   /* 32-aligned multi-block slice: one gy block per gx block, launch per block */
+        for (int ob = ob0; ob <= ob1; ob++) {
+            size_t n = (size_t)xs.n * shape_spatial(xs);
+            up2_bwd_mx_slice_k<<<nblk_(n, 256), 256>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, nc, ctot, c0, ob, 1, xs.d, xs.h, xs.w);
+        }
+    } else {
+        size_t n = (size_t)xs.n * shape_spatial(xs);
+        up2_bwd_mx_slice_k<<<nblk_(n, 256), 256>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, nc, ctot, c0, ob0, 1, xs.d, xs.h, xs.w);
+    }
+    LPCK();
+}
 /* ---- MX stride-2 backward-data (k = 3, pad 1): gx[ci][u] (+)= sum over the taps k with (u + 1 - k) even, o = (u + 1 - k) / 2
    in range, of sum_co w[co][ci][k] gy[co][o]. Thread = (n, ci block, gx voxel); weights from shared memory when they fit. */
 template <int WS>
@@ -2926,7 +2988,7 @@ __global__ void __launch_bounds__(128) bwd_data_s2_mx2_k(const uint8_t *gy, cons
 }
 extern "C" void lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum) {
     static int pm = -1;
-    if (pm < 0) pm = getenv("UFSM_S2B_MX_OLD") ? 0 : 1;
+    if (pm < 0) pm = ufsm_env_on("UFSM_S2B_MX_OLD") ? 0 : 1;
     if (pm) {
         const int bwx = mx_bw(xs.c), nbx = mx_nb(xs.c);
         const size_t smem = (size_t)8 * ys.c * bwx * sizeof(float);

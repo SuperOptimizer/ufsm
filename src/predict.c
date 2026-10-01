@@ -170,7 +170,7 @@ int cmd_predict(int argc, char **argv) {
     pthread_t wth; pthread_create(&wth, nullptr, writer_main, &WR);
     int sb = 0; uint8_t *sbuf = WR.buf[0];
     /* the window goes up as uint8; the input channels are built on the device in the network's storage type */
-    const int h16 = nn_get_tf32() && nn_get_act_bf16() && !getenv("UFSM_ACT_MX8");
+    const int h16 = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8");
     uint8_t *ctd = nn_malloc(w3), *pu = malloc(w3), *pud = nn_malloc(w3);
     float *dyo = malloc(2 * (size_t)W * sizeof(float)), *dxo = dyo + W, *dyd = nn_malloc(2 * (size_t)W * sizeof(float)), *dxd = dyd + W;
     void *xd = nn_malloc(4 * w3 * (h16 ? 2 : 4));

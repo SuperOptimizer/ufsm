@@ -9,7 +9,7 @@ static int g_prof = -1;
 static const char *g_names[8] = {"conv_fwd", "conv_bwd_data", "conv_bwd_w", "gn", "elementwise", "up/concat", "upload+loss+opt", ""};
 /* UFSM_PROF=1: per-category event timing; UFSM_PROF=layers (or unet_prof_layers_on): also per conv, event category
    k + 8 * (slot + 1) with slot = 2 * layer + conv (layer ids as in nn_set_layer, conv 0 = c1 / single, 1 = c2) */
-#define PROF_INIT() do { if (g_prof < 0) { const char *e_ = getenv("UFSM_PROF"); g_prof = !e_ ? 0 : !strcmp(e_, "layers") ? 2 : 1; } } while (0)
+#define PROF_INIT() do { if (g_prof < 0) { const char *e_ = getenv("UFSM_PROF"); g_prof = !e_ || !*e_ || !strcmp(e_, "0") ? 0 : !strcmp(e_, "layers") ? 2 : 1; } } while (0)
 #define PROF_SLOT() (nn_get_layer() < 0 ? -1 : 2 * nn_get_layer() + (nn_get_conv() > 0 ? 1 : 0))
 #define PROF(k, call) do { PROF_INIT(); if (g_prof) { nn_prof_begin((k) + (g_prof == 2 ? 8 * (PROF_SLOT() + 1) : 0)); call; nn_prof_end(); } else { call; } } while (0)
 #define PROF_NK (8 * (UNET_NSLOT + 1))
@@ -115,7 +115,7 @@ unet *unet_create(const unet_cfg *cfg) {
     off = add_conv(u, &u->head, w[0], cfg->cout, 1, 1, off);
     if (cfg->down_norm) for (int i = 0; i < L - 1; i++) off = add_gn(u, &u->dn[i], w[i], off);
     u->np = off;
-    if (getenv("UFSM_DEBUG")) {
+    if (ufsm_env_on("UFSM_DEBUG")) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d c1.w %zu c1.b %zu n1 %zu c2.w %zu c2.b %zu n2 %zu\n", i, u->enc[i].c1.w, u->enc[i].c1.b, u->enc[i].n1.gamma, u->enc[i].c2.w, u->enc[i].c2.b, u->enc[i].n2.gamma);
         for (int i = 0; i < L - 1; i++) fprintf(stderr, "down%d w %zu b %zu\n", i, u->down[i].w, u->down[i].b);
         for (int i = L - 2; i >= 0; i--) fprintf(stderr, "dec%d c1.w %zu c1.b %zu n1 %zu c2.w %zu c2.b %zu n2 %zu\n", i, u->dec[i].c1.w, u->dec[i].c1.b, u->dec[i].n1.gamma, u->dec[i].c2.w, u->dec[i].c2.b, u->dec[i].n2.gamma);
@@ -182,13 +182,13 @@ static float *dalloc_act(unet *u, size_t n) { size_t b = ABF ? n * 2 : n * 4; u-
 /* activation tensor of shape s: MX-fp8 (registered, channel-blocked bytes + scales) in act-MX8 mode, else as dalloc_act */
 static int g_act_mx8 = -1, g_act_mx4 = -1;
 /* MX activation storage: fp8 (registry 8) or packed fp4 (registry 4); mx4 wins when both are requested */
-static int act_mx4(void) { if (g_act_mx4 < 0) g_act_mx4 = getenv("UFSM_ACT_MX4") != nullptr; return g_act_mx4 && nn_get_tf32(); }
-static int act_mx8(void) { if (g_act_mx8 < 0) g_act_mx8 = getenv("UFSM_ACT_MX8") != nullptr; return (g_act_mx8 || act_mx4()) && nn_get_tf32(); }   /* any MX format */
+static int act_mx4(void) { if (g_act_mx4 < 0) g_act_mx4 = ufsm_env_on("UFSM_ACT_MX4"); return g_act_mx4 && nn_get_tf32(); }
+static int act_mx8(void) { if (g_act_mx8 < 0) g_act_mx8 = ufsm_env_on("UFSM_ACT_MX8"); return (g_act_mx8 || act_mx4()) && nn_get_tf32(); }   /* any MX format */
 static int act_dt(void) { return act_mx4() ? 4 : 8; }   /* registry dt of the MX activations */
 void unet_set_act_mx8(int on) { g_act_mx8 = on; }
 void unet_set_act_mx4(int on) { g_act_mx4 = on; }
 static int g_grad_mx8 = -1;   /* MX-fp8 activation gradients (env UFSM_GRAD_MX8=1; needs the MX activations) */
-static int grad_mx8(void) { if (g_grad_mx8 < 0) g_grad_mx8 = getenv("UFSM_GRAD_MX8") != nullptr; return g_grad_mx8 && act_mx8(); }
+static int grad_mx8(void) { if (g_grad_mx8 < 0) g_grad_mx8 = ufsm_env_on("UFSM_GRAD_MX8"); return g_grad_mx8 && act_mx8(); }
 void unet_set_grad_mx8(int on) { g_grad_mx8 = on; }
 static float *dalloc_grad_mx(unet *u, size_t bytes) { u->act_bytes += bytes; u->grad_bytes += bytes; float *p = dalloc_oom(dmalloc(bytes), bytes); dstorage(p, bytes, 8); return p; }
 static float *dalloc_act_s(unet *u, shape5 s) {
@@ -211,11 +211,13 @@ static int recompute(void) { if (g_recompute < 0) { const char *e = getenv("UFSM
    (the GN statistics of a1 are kept from the forward) */
 static int recompute_a1(void) { return recompute() >= 2; }
 void unet_set_recompute(int on) { g_recompute = on; }
-#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 64 * act_mx4() + 256 * chunk_up())
+#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 64 * act_mx4() + 256 * chunk_up() + 1024 * lean())
 /* chunk mode (recompute, 16-bit activations and gradients, fused upsample): the decoder's up-part input gradient is
    produced in w[i]-channel chunks, each upsample-backwarded straight into its slice of gout[i + 1], so the shared
    gradient buffer B only needs w[i] channels (env UFSM_CHUNK_UP=0 turns it off) */
-static int g_chunk = -1;
+static int g_chunk = -1, g_lean = -1;
+void unet_set_lean(int on) { g_lean = on; }
+static int lean(void) { if (g_lean < 0) g_lean = getenv("UFSM_LEAN") ? atoi(getenv("UFSM_LEAN")) : 0; return g_lean; }
 void unet_set_chunk_up(int on) { g_chunk = on; }
 static int chunk_up(void) {
     if (g_chunk < 0) { const char *e = getenv("UFSM_CHUNK_UP"); g_chunk = e ? atoi(e) : 1; }
@@ -223,7 +225,7 @@ static int chunk_up(void) {
     const char *fu = getenv("UFSM_FUSED_UP");
     /* MX activation storage: only with UFSM_CHUNK_UP=2 (halves the gradient buffer B: 32 B / level-0 voxel less, ~-15% training
        memory, for the largest windows; costs ~0.9 ms per 96^3 B2 step since dec0.c1's backward-data runs in three launches) */
-    return f && recompute() && (!act_mx8() || f >= 2) && !grad_mx8() && (!fu || atoi(fu) >= 2);
+    return f && recompute() && (!act_mx8() || f >= 2) && (!grad_mx8() || f >= 2) && (!fu || atoi(fu) >= 2);   /* MX-fp8 gradients: 16-channel chunks merged into the MX gout block (lp_up2_bwd_mx_slice) */
 }
 static float *dalloc_grad(unet *u, size_t n) { size_t b = GBF ? n * 2 : n * 4; u->act_bytes += b; u->grad_bytes += b; return dalloc_oom(dmalloc(b), b); }  /* activation-gradient storage */
 
@@ -320,7 +322,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
         build_block_acts(u, &u->dec[i], cin, train, i > 0, T1, T2);
     }
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
-    u->logits = dalloc(u, shape_numel(os));
+    u->logits = nullptr;
     if (train) {
         if (nn_get_tf32()) {
             /* tensor-core path: A only holds the level width and B the widest of {width, decoder up part, encoder block
@@ -342,6 +344,10 @@ static void build_acts(unet *u, shape5 xs, int train) {
             }
             float *A = gmx ? dalloc_grad_mx(u, na) : dalloc_grad(u, na), *B = gmx ? dalloc_grad_mx(u, nbb) : dalloc_grad(u, nbb);
             u->gB_bytes = gmx ? nbb : nbb * (GBF ? 2 : 4);
+            /* lean mode: the fp32 logits live in A (dead from the end of the forward until the first block backward, the loss
+               reads them before; A is unregistered for the plane-major fp32 writes of the head). Costs: logits are not
+               readable after the backward (the trainer's non-finite diagnosis then reports post-backward values) */
+            if (lean() && (gmx ? na : na * (GBF ? 2 : 4)) >= shape_numel(os) * 4) u->logits = A;
             for (int i = 0; i < L; i++) {
                 shape5 so = u->ls[i]; so.c = w[i];
                 u->gA[i] = A; u->gB[i] = B;
@@ -368,11 +374,20 @@ static void build_acts(unet *u, shape5 xs, int train) {
         }
         u->conv_scratch = dmalloc(cs); u->conv_scratch_n = cs; u->act_bytes += cs;
     }
+    if (!u->logits) u->logits = dalloc(u, shape_numel(os));
     u->xin = nullptr; u->glb = nullptr;   /* allocated on first use (fp32 input / fp32 logit gradient only) */
     u->xs = xs; u->built = 1; u->train = train; u->mode = UMODE();
 }
 
 size_t unet_activation_bytes(const unet *u) { return u->act_bytes; }
+/* build the activation / gradient buffers for xs now (as the first forward would) */
+void unet_build(unet *u, shape5 xs, int train) {
+    if (!u->built || memcmp(&u->xs, &xs, sizeof xs) || (train && !u->train) || u->mode != UMODE()) build_acts(u, xs, train);
+}
+int unet_input_converted(void) { return act_mx8() && grad_mx8(); }   /* the 16-bit network input is copied into MX storage at the forward's start */
+/* lean mode: the gradient buffer B as scratch for the trainer's 16-bit logit gradient (free from the end of the forward until
+   the head backward has read it); nullptr when not built for training, not lean, or too small */
+void *unet_grad_scratch(unet *u, size_t bytes) { return u->built && u->train && lean() && u->gB[0] && u->gB_bytes >= bytes ? (void *)u->gB[0] : nullptr; }
 /* device bytes of the training activations / gradients at input shape xs under the current storage modes, without allocating
    (dry build); the model is left unbuilt */
 size_t unet_train_bytes(unet *u, shape5 xs) {
@@ -418,7 +433,9 @@ static int fakeq_grad(void) {
 #define FQG(p, s) do { if (fakeq_grad()) nn_fake_quant((p), (s), fakeq_grad()); } while (0)
 static void rc_fail(const char *what) { fprintf(stderr, "unet: recompute mode: %s unsupported\n", what); abort(); }
 /* transient buffer for the upsampled decoder input at level i (shape s), typed as activation storage */
+static int g_in_bwd = 0;   /* inside unet_backward_x (lean mode: B holds the trainer's batch until then) */
 static float *rc_tmp(unet *u, int level, shape5 s, int *reg) {
+    if (u->train && lean() && !g_in_bwd) rc_fail("lean mode: a forward transient in the gradient buffer (it holds the batch)");
     if (u->train && act_bytes_of(s) > u->gB_bytes) {   /* chunk mode left B too small for this (fp8 / MX) transient */
         if (act_bytes_of(s) > u->rc_extra_bytes) {
             if (u->rc_extra) { nn_storage_forget(u->rc_extra); nn_free(u->rc_extra); u->act_bytes -= u->rc_extra_bytes; }
@@ -563,7 +580,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     nn_set_layer(10);
     if (recompute()) { nn_gn_t g = gn_out(u, &u->dec[0]); int r; PROF(0, r = nn_conv3d_fwd_x(u->dec[0].a2, &g, nullptr, nullptr, 0, 0, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, 1, 1, u->logits, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("head"); }
     else PROF(0, nn_conv3d_fwd(cur, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, 1, 1, u->logits));
-    if (getenv("UFSM_DEBUG") && !ABF && !recompute()) {
+    if (ufsm_env_on("UFSM_DEBUG") && !ABF && !recompute()) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d a1 %.4g a2 %.4g s2 %.4g%s\n", i, nn_sumsq(u->enc[i].a1, shape_numel(u->enc[i].ys), u->red_scratch), nn_sumsq(u->enc[i].a2, shape_numel(u->enc[i].ys), u->red_scratch), nn_sumsq(u->enc[i].s2, shape_numel(u->enc[i].ys), u->red_scratch), i < L - 1 ? "" : " (bottom)");
         for (int i = L - 2; i >= 0; i--) fprintf(stderr, "dec%d cat %.4g a1 %.4g a2 %.4g s2 %.4g\n", i, nn_sumsq(u->cat[i], shape_numel(u->dec[i].xs), u->red_scratch), nn_sumsq(u->dec[i].a1, shape_numel(u->dec[i].ys), u->red_scratch), nn_sumsq(u->dec[i].a2, shape_numel(u->dec[i].ys), u->red_scratch), nn_sumsq(u->dec[i].s2, shape_numel(u->dec[i].ys), u->red_scratch));
         fprintf(stderr, "logits %.4g\n", nn_sumsq(u->logits, shape_numel(u->ls[0]) / u->ls[0].c * u->cfg.cout, u->red_scratch));
@@ -613,6 +630,11 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
             const block *xb = (const block *)b->xb;
             const size_t per_c = shape_numel(b->ys) / b->ys.c * (GBF ? 2 : 4);
             int cs = (int)(u->gB_bytes / per_c); if (cs > b->c_split) cs = b->c_split;
+            if (grad_mx8()) {   /* MX-fp8 chunks: 16 channels or whole 32-channel blocks that fit B */
+                shape5 t = b->xs; cs = 16;
+                for (int c = 32; c <= b->c_split; c += 32) { t.c = c; if (nn_mx8_bytes(t) <= u->gB_bytes) cs = c; }
+                t.c = cs; if (nn_mx8_bytes(t) > u->gB_bytes) rc_fail("MX chunk does not fit the gradient buffer");
+            }
             int r; PROF(1, r = nn_conv3d_bwd_data_range(A, b->ys, P(u, b->c1.w), b->xs, b->c_split, b->xs.c - b->c_split, gx2, u->conv_scratch));
             if (r) rc_fail("skip backward-data");
             { shape5 s2 = b->xs; s2.c = b->xs.c - b->c_split; FQG(gx2, s2); }
@@ -661,18 +683,23 @@ void unet_backward(unet *u, const float *glogits) { unet_backward_x(u, glogits, 
 void unet_backward_x(unet *u, const void *gv, int g_h16) {
     const float *glogits = (const float *)gv;
     int L = u->cfg.nlev;
+    g_in_bwd = 1;
     const float gscale = GBF ? nn_get_grad_scale() : 1.f;
     if (g_h16 && !GBF) { fprintf(stderr, "unet_backward_x: a 16-bit logit gradient needs the 16-bit gradient storage\n"); abort(); }
     if (GBF && !g_h16) { shape5 os = u->ls[0]; os.c = u->cfg.cout; if (!u->glb) u->glb = dalloc_grad(u, shape_numel(os)); nn_f32_to_h16(glogits, shape_numel(os), u->glb, gscale); glogits = u->glb; }
     const int *w = u->cfg.widths;
     float *g = u->g;
-    /* head */
+    /* head; lean mode: the 16-bit logit gradient may sit in B (unet_grad_scratch), whose MX-fp8 registration must not make the
+       head ops read it as MX */
+    int ghide = 0;
+    if (u->gB[0] && (const char *)glogits >= (const char *)u->gB[0] && (const char *)glogits < (const char *)u->gB[0] + u->gB_bytes) { ghide = nn_storage(u->gB[0]); if (ghide) nn_storage_forget(u->gB[0]); }
     block *d0 = &u->dec[0];
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
     nn_set_layer(10);
     if (recompute()) { nn_gn_t gg = gn_out(u, d0); int r; PROF(2, r = nn_conv3d_bwd_weight_x(d0->a2, &gg, nullptr, nullptr, 0, 0, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b)); if (r) rc_fail("head weight gradient"); }
     else PROF(2, nn_conv3d_bwd_weight(d0->s2, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b));
     PROF(1, nn_conv3d_bwd_data(glogits, os, P(u, u->head.w), d0->ys, 1, 1, u->gout[0], u->conv_scratch));
+    if (ghide) dstorage(u->gB[0], u->gB_bytes, ghide);
     FQG(u->gout[0], d0->ys);
     /* decoder, bottom-up in the graph = i from 0 to L-2 */
     for (int i = 0; i < L - 1; i++) {
@@ -707,6 +734,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         }
     }
     if (gscale != 1.f) nn_scale(g, 1.f / gscale, u->np);   /* activation gradients were scaled for 16-bit storage */
+    g_in_bwd = 0;
 }
 
 void unet_zero_grad(unet *u) { nn_zero(u->g, u->np * 4); }
@@ -746,7 +774,7 @@ static void muon_zero_conv(unet *u, const convp *c, void *arg) { (void)arg; nn_z
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step) {
     if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd, step); return; }   /* packed weights: AdamW only */
     if (!u->muon_mom) { u->muon_mom = nn_malloc(u->np * 4); nn_zero(u->muon_mom, u->np * 4); }
-    if (getenv("UFSM_MUON_UNBATCHED")) {   /* reference path: one conv at a time */
+    if (ufsm_env_on("UFSM_MUON_UNBATCHED")) {   /* reference path: one conv at a time */
         muon_arg a = {lr_muon, beta, wd};
         for_each_conv3(u, muon_conv, &a);
     } else {

@@ -1,6 +1,10 @@
 /* CUDA ops with a C ABI. Tensors are fp32, NCDHW, on the device. Every op is synchronous on the
    default stream unless noted; nn_check() reports the last CUDA error. */
 #pragma once
+#include <stdlib.h>
+#include <string.h>
+/* boolean environment switch: set and not "0" (UFSM_X=0 means off) */
+static inline int ufsm_env_on(const char *n) { const char *e = getenv(n); return e && *e && strcmp(e, "0") != 0; }
 #include <stddef.h>
 #include <stdint.h>
 

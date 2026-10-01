@@ -51,6 +51,7 @@ void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G, const floa
                              const void *gy, void *gx, int gdt, const float *AB);
 void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y);
 void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx);
+void lp_up2_bwd_mx_slice(const void *gy, shape5 xs, void *gx, int ctot, int c0);   /* channels [c0, c0 + xs.c) of an MX-fp8 gx (ctot ch) */
 void lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum);
 const char *lp_check(void);
 void lp_f32_to_bf16(const float *x, size_t n, void *y);   /* test helpers */

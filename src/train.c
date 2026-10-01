@@ -30,6 +30,7 @@ typedef struct {
     float *x; uint8_t *t, *m, *w; /* the buffers of the batch being computed */
     void *ev_up[2], *ev_done;    /* upload of buffer i finished; compute of the previous step finished */
     batch *pending;              /* host batch whose upload into buffer (cur ^ 1) is in flight */
+    int lean;                    /* one batch buffer; logit gradient in the model's gradient buffer B */
     int cur;
 } gpu_state;
 
@@ -92,8 +93,13 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 xs = {B, 4, P, P, P};
     const float *lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
+    if (d->lean && train) {   /* the logit gradient lives in the model's gradient buffer B (built by the forward above) */
+        const size_t gb = (size_t)B * NCH * P * P * P * (g_g16 ? 2 : 4);
+        d->gl = unet_grad_scratch(d->u, gb);
+        if (!d->gl) { fprintf(stderr, "lean: gradient buffer too small for the logit gradient\n"); abort(); }
+    }
     shape5 os = unet_out_shape(d->u, xs);
-    int prof = getenv("UFSM_PROF") != nullptr;
+    int prof = ufsm_env_on("UFSM_PROF");
     if (prof) nn_prof_begin(6);
     nn_loss_async(lg, d->t, d->m, d->w, os, dice_w, train ? d->gl : nullptr, d->scratch);
     if (prof) nn_prof_end();
@@ -137,7 +143,7 @@ int cmd_train(int argc, char **argv) {
     float cooldown = (float)atof(opt(argc, argv, "--cooldown", "0.2"));
     int qat = atoi(opt(argc, argv, "--qat", "0"));
     /* the effective precision manifest is printed after all precision options are applied and saved next to the checkpoints */
-#define WRITE_MANIFEST(path) do { char mf_[4096]; int mn_ = nn_prec_manifest(mf_, sizeof mf_); snprintf(mf_ + mn_, sizeof mf_ - mn_, " act_mx4 %d act_mx8 %d grad_mx8 %d f16 %d opt %s\n", getenv("UFSM_ACT_MX4") ? 1 : 0, getenv("UFSM_ACT_MX8") ? 1 : 0, getenv("UFSM_GRAD_MX8") ? 1 : 0, f16, optname); FILE *mff_ = fopen(path, "w"); if (mff_) { fputs(mf_, mff_); fclose(mff_); } } while (0)         /* quantization-aware training: forward/backward-data at precision 2 (fp8) or 3 (fp4), weight gradients at 16-bit */
+#define WRITE_MANIFEST(path) do { char mf_[4096]; int mn_ = nn_prec_manifest(mf_, sizeof mf_); snprintf(mf_ + mn_, sizeof mf_ - mn_, " act_mx4 %d act_mx8 %d grad_mx8 %d f16 %d opt %s\n", ufsm_env_on("UFSM_ACT_MX4"), ufsm_env_on("UFSM_ACT_MX8"), ufsm_env_on("UFSM_GRAD_MX8"), f16, optname); FILE *mff_ = fopen(path, "w"); if (mff_) { fputs(mf_, mff_); fclose(mff_); } } while (0)         /* quantization-aware training: forward/backward-data at precision 2 (fp8) or 3 (fp4), weight gradients at 16-bit */
     if (qat) { nn_set_prec(qat); nn_set_prec_wgrad(1); }
     if (atoi(opt(argc, argv, "--sr", "0"))) nn_set_sr(1);                                   /* stochastic rounding of fp8 gradient operands */
     int wq = atoi(opt(argc, argv, "--wq", "0"));            /* 8 or 4: true fp8 / fp4 weights (stochastic rounding after each update) */
@@ -166,9 +172,9 @@ int cmd_train(int argc, char **argv) {
     int devs[8], ng = 0;
     { char *t = strdup(opt(argc, argv, "--gpus", opt(argc, argv, "--gpu", "0"))); for (char *q = strtok(t, ","); q && ng < 8; q = strtok(nullptr, ",")) devs[ng++] = atoi(q); free(t); }
     nn_init(devs[0]);   /* env precision knobs are read here; the storage modes decide the batch formats */
-    g_xfmt = nn_get_tf32() && nn_get_act_bf16() && !getenv("UFSM_ACT_MX8") ? (nn_get_f16() ? 1 : 2) : 0;
+    g_xfmt = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8") ? (nn_get_f16() ? 1 : 2) : 0;
     g_g16 = nn_get_tf32() && nn_get_act_bf16() && nn_get_grad_bf16();
-    if (getenv("UFSM_X32")) g_xfmt = g_g16 = 0;   /* diagnostic: fp32 batches and logit gradient, converted on the device (the old path) */
+    if (ufsm_env_on("UFSM_X32")) g_xfmt = g_g16 = 0;   /* diagnostic: fp32 batches and logit gradient, converted on the device (the old path) */
     nn_set_loss_grad_h16(g_g16);
     unet_cfg cfg = {4, {16, 32, 64, 80}, 4, NCH, 8};
     cfg.down_norm = atoi(opt(argc, argv, "--down-norm", "0"));
@@ -204,21 +210,25 @@ int cmd_train(int argc, char **argv) {
         if (resume && atoi(opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* weights from the checkpoint, fresh schedule (QAT / low-precision fine-tuning) */
         else unet_init(d->u, seed + 1);                   /* deterministic: every GPU starts identical */
         if (wq) unet_set_wq(d->u, wq);
-        for (int i = 0; i < 2; i++) { d->xb[i] = nn_malloc((size_t)B * 4 * p3 * xbytes()); d->tb[i] = nn_malloc((size_t)B * NCH * p3); d->mb[i] = nn_malloc((size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * NCH); d->ev_up[i] = nn_event_create(); }
-        d->ev_done = nn_event_create(); nn_event_record(d->ev_done, 0); d->pending = nullptr; select_buf(d, 0);
-        d->gl = nn_malloc((size_t)B * NCH * p3 * (g_g16 ? 2 : 4)); d->scratch = nn_malloc(nn_loss_scratch((shape5){B, NCH, P, P, P}) + 64);
         const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
     }
+    int lean = getenv("UFSM_LEAN") ? atoi(getenv("UFSM_LEAN")) : 0;   /* lean: one device batch buffer (no upload overlap), the logit
+                                                                     gradient in the model's gradient buffer, logits in A */
     if (resume) fprintf(stderr, "resumed %s at step %d\n", resume, step0);
     {   /* --mem auto (default): the cheapest storage mode whose training buffers fit next to what is already allocated on every
            GPU; an explicit UFSM_CHUNK_UP / UFSM_RECOMPUTE / UFSM_GRAD_MX8 or --mem default keeps the env / built-in modes */
         const char *mm = opt(argc, argv, "--mem", "auto");   /* MX-fp8 gradients passed their stair (3 seeds, mean 0.293 vs 0.294) */
         const int auto16 = !strcmp(mm, "auto16");   /* auto16: 16-bit gradients only */
         if ((!strcmp(mm, "auto") || auto16) && nn_get_tf32() && !getenv("UFSM_CHUNK_UP") && !getenv("UFSM_RECOMPUTE") && !getenv("UFSM_GRAD_MX8")) {
-            static const struct { int chunk, rc, gmx; const char *what; } cand[] = {
-                /* step cost / bytes per level-0 voxel at 96^3 B2 (--fp4 1): 26.4 / 219, 27.4 / 186, 26.2 / 164, 28.8 / 148, 29.8 / 171 */
-                {1, 1, 0, "default"}, {2, 1, 0, "chunked up-part gradient (UFSM_CHUNK_UP=2)"},
-                {1, 1, 1, "MX-fp8 gradients (UFSM_GRAD_MX8=1)"}, {1, 2, 1, "MX-fp8 gradients + recompute 2"}, {2, 2, 0, "chunked up-part gradient + recompute 2"}};
+            static const struct { int chunk, rc, gmx, lean; const char *what; } cand[] = {
+                /* accuracy first: every 16-bit-gradient mode before the MX-fp8 ones (their stair is borderline), then step cost.
+                   Model bytes per level-0 voxel / step at 96^3 B2 (--fp4 1): default 219 / 26.4 ms, chunked 186 / 27.4, + recompute 2
+                   171 / 29.8; MX-fp8 164 / 26.2, + chunked 148 / 27.2, + recompute 2 133 / 29.8. lean: one batch buffer (no upload
+                   overlap), logits in A, logit gradient / targets / mask (and the input if copied) in B */
+                {1, 1, 0, 0, "default"}, {2, 1, 0, 0, "chunked up-part gradient (UFSM_CHUNK_UP=2)"},
+                {2, 2, 0, 0, "chunked up-part gradient + recompute 2"}, {2, 2, 0, 1, "chunked up-part gradient + recompute 2, lean"},
+                {1, 1, 1, 0, "MX-fp8 gradients (UFSM_GRAD_MX8=1)"}, {2, 1, 1, 1, "MX-fp8 gradients, chunked, lean"},
+                {2, 2, 1, 1, "MX-fp8 gradients, chunked, recompute 2, lean"}};
             const int nc = (int)(sizeof cand / sizeof cand[0]);
             size_t fmin = (size_t)-1;
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); size_t f = nn_mem_free(); if (f < fmin) fmin = f; }
@@ -227,16 +237,49 @@ int cmd_train(int argc, char **argv) {
             int pick = -1; size_t need = 0;
             for (int c = 0; c < nc && pick < 0; c++) {
                 if (cand[c].gmx && auto16) continue;
-                unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx);
-                const size_t tb = unet_train_bytes(G[0].u, xs);
-                need = tb + tb / 14 + ((size_t)350 << 20);   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB */
+                unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean);
+                const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
+                size_t trainer = nbuf * ((size_t)B * 4 * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean ? 0 : (size_t)B * NCH * p3 * (g_g16 ? 2 : 4));
+                if (cand[c].lean) trainer = cand[c].gmx ? 0 : (size_t)B * 4 * p3 * xbytes();   /* batch buffers inside the gradient buffer B (estimate) */
+                need = tb + tb / 14 + trainer + ((size_t)350 << 20);   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB */
                 if (need <= fmin) pick = c;
             }
             if (pick < 0) { pick = nc - 1; fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
             else fprintf(stderr, "memory: %s, %.2f of %.2f GB free per GPU\n", cand[pick].what, need / 1e9, fmin / 1e9);
-            unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx);
+            unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean);
+            lean = cand[pick].lean;
         }
     }
+    for (int g = 0; g < ng; g++) {   /* per-GPU batch buffers (lean: one, shared by both slots, inside the model's gradient buffer B
+                                        when it is large enough: [logit gradient | targets | mask | input if the forward copies it]) */
+        gpu_state *d = &G[g];
+        nn_init(d->dev);
+        char *bs = nullptr;
+        const size_t a256 = 255, glb = ((size_t)B * NCH * p3 * (g_g16 ? 2 : 4) + a256) & ~a256, tbb = ((size_t)B * NCH * p3 + a256) & ~a256,
+                     mbb = ((size_t)B * p3 + a256) & ~a256, xbb = ((size_t)B * 4 * p3 * xbytes() + a256) & ~a256;
+        const int xin_b = lean && unet_input_converted() && g_xfmt;
+        if (lean) {
+            unet_build(d->u, (shape5){B, cfg.cin, P, P, P}, 1);
+            bs = unet_grad_scratch(d->u, glb + tbb + mbb + (xin_b ? xbb : 0));
+            if (!bs) bs = unet_grad_scratch(d->u, glb);   /* only the logit gradient fits */
+        }
+        for (int i = 0; i < 2; i++) {
+            if (i && lean) { d->xb[1] = d->xb[0]; d->tb[1] = d->tb[0]; d->mb[1] = d->mb[0]; d->wb[1] = d->wb[0]; }
+            else if (bs && unet_grad_scratch(d->u, glb + tbb + mbb)) {
+                d->tb[i] = (uint8_t *)(bs + glb); d->mb[i] = (uint8_t *)(bs + glb + tbb);
+                d->xb[i] = xin_b && unet_grad_scratch(d->u, glb + tbb + mbb + xbb) ? (void *)(bs + glb + tbb + mbb) : nn_malloc((size_t)B * 4 * p3 * xbytes());
+                d->wb[i] = nn_malloc((size_t)B * NCH);
+            }
+            else { d->xb[i] = nn_malloc((size_t)B * 4 * p3 * xbytes()); d->tb[i] = nn_malloc((size_t)B * NCH * p3); d->mb[i] = nn_malloc((size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * NCH); }
+            d->ev_up[i] = nn_event_create();
+        }
+        if (lean && g == 0) fprintf(stderr, "lean: batch buffers %s\n", bs && d->tb[0] == (void *)(bs + glb) ? (d->xb[0] == (void *)(bs + glb + tbb + mbb) ? "and input inside the gradient buffer" : "inside the gradient buffer, input separate") : "separate");
+        d->ev_done = nn_event_create(); nn_event_record(d->ev_done, 0); d->pending = nullptr; select_buf(d, 0);
+        d->gl = lean ? nullptr : nn_malloc((size_t)B * NCH * p3 * (g_g16 ? 2 : 4)); d->scratch = nn_malloc(nn_loss_scratch((shape5){B, NCH, P, P, P}) + 64);
+        d->lean = lean;
+        const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
+    }
+    nn_init(G[0].dev);
     size_t np = unet_nparams(G[0].u);
     fprintf(stderr, "model widths"); for (int i = 0; i < cfg.nlev; i++) fprintf(stderr, " %d", cfg.widths[i]);
     fprintf(stderr, ": %zu params; P=%d B=%d x %d GPU(s) [", np, P, B, ng); for (int g = 0; g < ng; g++) fprintf(stderr, "%s%d", g ? "," : "", devs[g]); fprintf(stderr, "] %s\n", nn_get_tf32() ? "bf16 tensor cores" : "fp32");
@@ -266,7 +309,7 @@ int cmd_train(int argc, char **argv) {
     FILE *log = fopen(logp, step0 ? "a" : "w");
     if (log && !step0) fprintf(log, "step,lr,loss,bce,dice,active,gnorm,val_loss,val_bce,val_dice,samples_per_s,wait_s\n");
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
-    int prof = getenv("UFSM_PROF") != nullptr;
+    int prof = ufsm_env_on("UFSM_PROF");
     double t0 = now(), tlog = t0, wait = 0, acc_loss = 0, acc_bce = 0, acc_dice = 0, acc_g = 0; int nacc = 0;
     double best_val = 1e30; int nskip = 0; (void)nskip;
     float parts[8][2 * NCH + 1];
@@ -295,7 +338,7 @@ int cmd_train(int argc, char **argv) {
                 unet_zero_grad(d->u); run_batch(d, B, P, dice_w, 1); unet_backward_x(d->u, d->gl, g_g16);
                 continue;
             }
-            if (getenv("UFSM_SYNC_UPLOAD")) {               /* diagnostic: plain synchronous upload, single buffer */
+            if (ufsm_env_on("UFSM_SYNC_UPLOAD")) {               /* diagnostic: plain synchronous upload, single buffer */
                 double tw = now(); batch *b = sampler_next(sp); wait += now() - tw;
                 if (!b) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; break; }
                 upload(d, b, B, P); sampler_release(sp, b);
@@ -399,6 +442,7 @@ int cmd_train(int argc, char **argv) {
                     int keep = G[0].cur; select_buf(&G[0], keep ^ 1);
                     for (int i = 0; i < nval; i++) { upload(&G[0], &val[i], B, P); float vp[2 * NCH + 1]; run_batch(&G[0], B, P, dice_w, 0); double l = fetch_loss(&G[0], B, P, dice_w, vp); vl = (vl < 0 ? 0 : vl) + l; vb += vp[0]; vd += vp[cfg.cout]; }
                     select_buf(&G[0], keep);
+                    if (G[0].lean && G[0].pending) upload(&G[0], G[0].pending, B, P);   /* one buffer: the prefetched batch was overwritten */
                 }
                 unet_use_ema(G[0].u, 0);
                 if (nval) { vl /= nval; vb /= nval; vd /= nval; }

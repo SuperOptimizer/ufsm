@@ -147,7 +147,7 @@ static cudaError_t g_err = cudaSuccess;
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess && g_err == cudaSuccess) g_err = e_; } while (0)
 #define KCHECK() CK(cudaGetLastError())
 
-extern "C" int nn_init(int device) { if (getenv("UFSM_ACTF32")) g_actbf = 0; if (getenv("UFSM_GRADF32")) g_gradbf = 0; if (getenv("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } return cudaSetDevice(device) == cudaSuccess ? 0 : -1; }
+extern "C" int nn_init(int device) { if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } return cudaSetDevice(device) == cudaSuccess ? 0 : -1; }
 extern "C" const char *nn_check(void) {
     cudaError_t e = g_err;
     g_err = cudaSuccess;
@@ -1368,7 +1368,7 @@ static void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs
     } else if (stride == 2 && k == 3 && g_tf32 && (ISMX(gy) || ISMX(gx))) {   /* MX gradients: direct voxel-major kernel, accumulate in MX */
         if (!ISMX(gy) || !ISMX(gx)) { fprintf(stderr, "bwd_data s2: MX gradient storage needs MX gy and gx\n"); abort(); }
         lp_bwd_data_s2_mx(gy, ys, w, xs, gx, accum);
-    } else if (stride == 2 && k == 3 && g_tf32 && !getenv("UFSM_S2DIL") && !(xs.d & 1) && !(xs.h & 1) && !(xs.w & 1)) {
+    } else if (stride == 2 && k == 3 && g_tf32 && !ufsm_env_on("UFSM_S2DIL") && !(xs.d & 1) && !(xs.h & 1) && !(xs.w & 1)) {
         /* parity decomposition: gx[2m + p] = sum over the taps compatible with parity p of w . gy[m + d]; each of the
            8 parity classes is a stride-1 conv on the gy grid with 1..8 taps (27 total: no wasted MACs) */
         size_t nw = (size_t)ys.c * xs.c * T;
@@ -1376,7 +1376,7 @@ static void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs
         gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0};
         split_t ns = {nullptr, 0, nullptr, 0, accum};
         static int nofuse = -1;
-        if (nofuse < 0) nofuse = getenv("UFSM_S2B_NOFUSE") != nullptr;
+        if (nofuse < 0) nofuse = ufsm_env_on("UFSM_S2B_NOFUSE");
         const int fprec = eff_prec();
         const bool fused = !nofuse && ys.c <= TC_CI;   /* one launch for the 8 classes (gy of <= 16 channels) */
         s2cls_t all = {};
@@ -2773,7 +2773,7 @@ extern "C" void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, 
 extern "C" void nn_up2_fwd_into(const float *x, shape5 xs, float *y, int ctot, int c0) { nn_up2_fwd_gn_into(x, xs, nullptr, y, ctot, c0); }
 extern "C" void nn_up2_fwd(const float *x, shape5 xs, float *y) { nn_up2_fwd_into(x, xs, y, xs.c, 0); }
 extern "C" void nn_up2_bwd_into(const float *gy, shape5 xs, float *gx, int ctot, int c0) {
-    if (ISMX(gy)) { if (!ISMX(gx) || ctot != xs.c || c0) { fprintf(stderr, "up2_bwd: MX gy needs a whole MX gx\n"); abort(); } lp_up2_bwd_mx(gy, xs, gx); KCHECK(); return; }
+    if (ISMX(gy)) { if (!ISMX(gx)) { fprintf(stderr, "up2_bwd: MX gy needs an MX gx\n"); abort(); } if (ctot == xs.c && !c0) lp_up2_bwd_mx(gy, xs, gx); else lp_up2_bwd_mx_slice(gy, xs, gx, ctot, c0); KCHECK(); return; }
     dim3 grid(nblk(xs.w, 8), nblk(xs.h, 8), (unsigned)(nblk(xs.d, 4) * xs.n * xs.c));
     if (GBF && g_h16) up2_b_k<f16, f16><<<grid, 256>>>((const f16 *)gy, (f16 *)gx, xs.n * xs.c, xs.d, xs.h, xs.w, xs.c, ctot, c0);
     else if (GBF) up2_b_k<bf16, bf16><<<grid, 256>>>((const bf16 *)gy, (bf16 *)gx, xs.n * xs.c, xs.d, xs.h, xs.w, xs.c, ctot, c0);

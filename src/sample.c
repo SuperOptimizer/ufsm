@@ -637,7 +637,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sp->S = S;
     sp->cfg = *cfg;
     { unsigned sb; memcpy(&sb, &cfg->soft, 4); atomic_store(&sp->soft_bits, sb); }
-    sp->prof = getenv("UFSM_SAMPLER_PROF") != nullptr;
+    sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF");
     sp->lvl_ok = calloc((size_t)S->n, sizeof *sp->lvl_ok);
     sources_open_all(S, 32);   /* every (source, level, channel) store opened up front in parallel: lazily they serialise on one lock (254 opens, 17 s) */
     sp->nslots = cfg->nbuf;
