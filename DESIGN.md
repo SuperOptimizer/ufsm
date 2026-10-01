@@ -208,15 +208,13 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   kernel writes the logit gradient as 16-bit scaled by the gradient scale (`nn_set_loss_grad_h16`,
   `unet_backward_x(.., g_h16 = 1)`). `UFSM_X32=1` restores the fp32 path; on a fixed batch both give the same losses
   to run-to-run noise. Per-process peak (fp16 mode, recompute 1, batch 1): 192^3 2.8 GB, 256^3 6.4 -> 5.9 GB,
-  320^3 12.3 GB before the trim. Memory is ~350 B/voxel: at level 0, a1+a2 of enc0 and dec0 128 B, the gradient
-  buffers A+B+gout 128 B, fp32 logits 16 B, input 8 B, logit gradient 8 B; the lower levels add ~70 B.
+  320^3 12.3 GB before the trim. Per-voxel accounting: see "Per-voxel memory" below.
 - Agent round 3 (merged 9b6f54a, 53abc70): decoder conv1 reads the upsampled part straight from the coarse block output
   (trilinear upsample fused into the 16-bit conv staging, `UFSM_FUSED_UP`), and in training the up-part input gradient
   goes through B in w[i]-channel chunks that are upsample-backwarded straight into the coarse gradient
   (`UFSM_CHUNK_UP`). 96^3 B2 fp16: training 0.596 -> 0.540 GB at 33.8 ms (recompute 2: 0.447 GB at 41 ms),
   inference 0.341 -> 0.228 GB, gradient error unchanged (0.25%). Decoder conv1 always runs the 16-bit kernels now, even
-  under an fp8 policy. Remaining level-0 bytes per voxel at fp16 recompute 1: enc0 + dec0 a1/a2 128, A + B + gout 96,
-  fp32 logits 16.
+  under an fp8 policy (per-voxel accounting below).
 - Intermittent sampler stall (1 run in ~10 on the kaggle source, two workers at 100% CPU, the trainer waiting
   forever): the lazy per-level opens in `sources.c` (`source_ct`, `source_tgt`, `source_region`) were called from every
   worker without a lock; two workers racing on the same level both opened it and a failed open under the race marked
@@ -231,6 +229,53 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
 - A patch must fit the sources: the sampler now warns after 4M consecutive impossible draws (region, holdout box
   or level too small for P) instead of spinning silently, and stops after 20 consecutive read failures (the
   failure counter was reset on every error before, so an I/O error retried forever).
+
+### Per-voxel memory (master b1862ff, 2026-10-01)
+Bytes per full-resolution input voxel per sample, model (16,32,64,80), 16-bit storage (fp16 or bf16), recompute 1,
+fused upsample, chunked B, NCH = 2 output channels. A level-l tensor of C channels costs 2C / 8^l B. down_norm only
+adds per-group statistics. Checked against `bench_mem` at 96^3 B2: training 0.540 GB = 305 B/voxel, inference
+0.228 GB = 129 B/voxel (bench_mem feeds fp32 input and NCH = 1, so it adds the unet's own 16-bit input copy, 8 B,
+and logit-gradient copy, 2 B, and has 4 B less logits).
+
+Training (unet + trainer):
+
+| level (C) | tensor | B/voxel | note |
+|---|---|---|---|
+| 0 (16) | enc0 a1, a2; dec0 a1, a2 | 4 x 32 = 128 | conv outputs before GN; kept for backward |
+| 0 | gradient A, B, gout[0] (= gskip[0]) | 3 x 32 = 96 | shared across levels, sized at level 0 |
+| 0 | logits (fp32, 2 ch) | 8 | |
+| 0 | trainer: input x16 (4 ch, double-buffered) | 16 | `gpu_state.xb[2]` |
+| 0 | trainer: targets (2 x uint8) + mask, double-buffered; logit gradient (16-bit, 2 ch) | 6 + 4 | |
+| 1 (32) | enc1, dec1 a1/a2 (4 x 8); dec1 s2 (upsample source) 8; down0 out (16 ch) 4; gout[1] 8 | 52 | |
+| 2 (64) | enc2, dec2 a1/a2 (4 x 2); dec2 s2 2; down1 out 1; gout[2] 2 | 13 | |
+| 3 (80) | enc3 a1/a2, s2, down2 out, gout[3] | 1.5 | |
+| | total | ~325 | plus fixed: CUDA context, params + EMA + Adam (5 x 4.7 MB), conv scratch |
+
+The lead's per-process peak at 256^3 B1 was 5874 MiB (6.16 GB). The table gives 5.45 GB, so the fixed part is about
+0.7 GB at that size.
+
+Inference (one shared-buffer build, same storage):
+
+| tensor | B/voxel | note |
+|---|---|---|
+| T1: every a1 | 32 | sized at level 0 |
+| T2: the a2 that are not kept (decoder) and the down-conv outputs | 32 | |
+| enc0 a2 (skip; GN applied in the decoder's staging) | 32 | |
+| enc1 / enc2 / enc3 a2 | 8 + 2 + 0.3 | |
+| kept upsample sources: dec1 s2, dec2 s2, enc3 s2 | 8 + 2 + 0.3 | |
+| input (16-bit, 4 ch) | 8 | |
+| logits fp32 | 4 x NCH | `predict` turns them into uint8 on the device |
+| total | ~127 + 4 NCH | |
+
+Where the rest would come from:
+- **Recompute 2:** saves 52 B/voxel in training (0.447 GB at 96^3 B2) for +7 ms per step. Every a1 shares one
+  32 B buffer, and the backward re-runs conv1.
+- **The level-0 gradient buffers (96 B):** A, B and gout[0] each hold 16 channels. They are live at the same time
+  during dec0's backward, so going lower needs a fused GN-backward + conv-backward-data or chunked channels.
+- **MX-fp8 storage:** about halves every activation term. That is 1.03 B per value for C >= 32 and 1.06 for C = 16,
+  against 2. It is opt-in: about −0.008 holdout F1 at 6000 steps; MX gradients cost −0.018.
+- **Logits:** 16-bit logits would save 4 B per output channel.
+- **Trainer input buffer:** going single-buffered saves 8 B/voxel, at the cost of upload/compute overlap.
 
 ### Low-precision storage on real data (agent round 2, 2026-10-01)
 - Yardstick: 2000 steps on MANBp (`--soft 3 --noaug 1 --P 64 --B 8`), holdout F1 at threshold 0.5. fp16 twice:
