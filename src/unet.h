@@ -100,3 +100,5 @@ size_t unet_grad_bytes(const unet *u);   /* the activation-gradient part of unet
    off. Parameter gradients are this half's share: sum them across the two GPUs. */
 typedef void (*unet_halo_fn)(const void *p, shape5 s, int esz, int h);
 void unet_set_split(unet *u, int side, int h0, unet_halo_fn fn);
+/* optional: the exchange in two parts (split_halo_begin / split_halo_end) so a weight gradient overlaps it */
+void unet_set_split_async(unet *u, unet_halo_fn begin, unet_halo_fn end);

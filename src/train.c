@@ -252,7 +252,7 @@ int cmd_train(int argc, char **argv) {
         if (resume && atoi(opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* weights from the checkpoint, fresh schedule (QAT / low-precision fine-tuning) */
         else unet_init(d->u, seed + 1);                   /* deterministic: every GPU starts identical */
         if (wq) unet_set_wq(d->u, wq);
-        if (split) unet_set_split(d->u, g, g_h0, split_halo);
+        if (split) { unet_set_split(d->u, g, g_h0, split_halo); if (!getenv("UFSM_SPLIT_SYNC")) unet_set_split_async(d->u, split_halo_begin, split_halo_end); }
         const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
     }
     int lean = getenv("UFSM_LEAN") ? atoi(getenv("UFSM_LEAN")) : 0;   /* lean: one device batch buffer (no upload overlap), the logit

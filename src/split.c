@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { int kind; const void *p; shape5 s; int esz, h; double *b; int n; } coll_t;   /* kind 1 halo, 2 reduce */
+typedef struct { int kind; const void *p; shape5 s; int esz, h; double *b; int n; int slot; } coll_t;   /* kind 1 halo, 2 reduce */
 
 struct split_ctx {
     int dev[2];
@@ -14,7 +14,7 @@ struct split_ctx {
     unsigned seq;                 /* collectives executed */
     coll_t slot[2];
     void (*job)(int, void *); void *arg;
-    void *sb[2], *rb[2]; size_t cap;     /* halo send / receive buffers per device */
+    void *sb[2][2], *rb[2][2]; size_t cap;   /* halo send / receive buffers per slot (0 asynchronous, 1 synchronous) and device */
     double *rd[2]; int rcap;             /* reduce receive buffers per device */
 };
 
@@ -30,7 +30,7 @@ split_ctx *split_create(int dev0, int dev1) {
 }
 void split_free(split_ctx *c) {
     if (!c) return;
-    for (int i = 0; i < 2; i++) { nn_init(c->dev[i]); nn_free(c->sb[i]); nn_free(c->rb[i]); nn_free(c->rd[i]); }
+    for (int i = 0; i < 2; i++) { nn_init(c->dev[i]); for (int k = 0; k < 2; k++) { nn_free(c->sb[k][i]); nn_free(c->rb[k][i]); } nn_free(c->rd[i]); }
     pthread_mutex_destroy(&c->mu); pthread_cond_destroy(&c->cv);
     free(c);
 }
@@ -45,7 +45,7 @@ static void pass_and_wait(split_ctx *c, int me) {
 static void grow(split_ctx *c, size_t bytes, int nd) {
     for (int i = 0; i < 2; i++) {
         nn_init(c->dev[i]);
-        if (bytes > c->cap) { nn_free(c->sb[i]); nn_free(c->rb[i]); c->sb[i] = nn_malloc(bytes); c->rb[i] = nn_malloc(bytes); }
+        if (bytes > c->cap) for (int k = 0; k < 2; k++) { nn_free(c->sb[k][i]); nn_free(c->rb[k][i]); c->sb[k][i] = nn_malloc(bytes); c->rb[k][i] = nn_malloc(bytes); }
         if (nd > c->rcap) { nn_free(c->rd[i]); c->rd[i] = nn_malloc((size_t)nd * sizeof(double)); }
     }
     if (bytes > c->cap) c->cap = bytes;
@@ -55,7 +55,7 @@ static void grow(split_ctx *c, size_t bytes, int nd) {
 
 static void execute(split_ctx *c) {
     coll_t *a = &c->slot[0], *b = &c->slot[1];
-    if (a->kind != b->kind || (a->kind == 1 && (memcmp(&a->s, &b->s, sizeof a->s) || a->esz != b->esz || a->h != b->h)) || (a->kind == 2 && a->n != b->n)) {
+    if (a->kind != b->kind || (a->kind == 1 && (memcmp(&a->s, &b->s, sizeof a->s) || a->esz != b->esz || a->h != b->h || a->slot != b->slot)) || (a->kind == 2 && a->n != b->n)) {
         fprintf(stderr, "split: the two halves diverged (collective %u: kind %d / %d)\n", c->seq, a->kind, b->kind);
         abort();
     }
@@ -63,7 +63,7 @@ static void execute(split_ctx *c) {
         size_t nb = nn_split_halo_bytes(a->s, a->esz);
         if (nb > c->cap) grow(c, nb, 0);
         void *t[2] = {(void *)a->p, (void *)b->p};
-        nn_split_halo(t, c->dev, a->s, a->esz, a->h, c->sb, c->rb);
+        nn_split_halo_begin(t, c->dev, a->s, a->esz, a->h, c->sb[a->slot], c->rb[a->slot], a->slot);
     } else {
         if (a->n > c->rcap) grow(c, 0, a->n);
         double *bb[2] = {a->b, b->b};
@@ -91,8 +91,11 @@ static void collective(const coll_t *x) {
     execute(c);   /* this thread holds the turn; the other side waits */
 }
 
-void split_halo(const void *p, shape5 s, int esz, int h) { coll_t x = {1, p, s, esz, h, nullptr, 0}; collective(&x); }
-void split_reduce(double *b, int n) { coll_t x = {2, nullptr, {0}, 0, 0, b, n}; collective(&x); }
+static void halo_begin(const void *p, shape5 s, int esz, int h, int slot) { coll_t x = {1, p, s, esz, h, nullptr, 0, slot}; collective(&x); }
+void split_halo_begin(const void *p, shape5 s, int esz, int h) { halo_begin(p, s, esz, h, 0); }
+void split_halo_end(const void *p, shape5 s, int esz, int h) { nn_split_halo_end((void *)p, t_side, s, esz, h, t_ctx->rb[0][t_side], 0); }
+void split_halo(const void *p, shape5 s, int esz, int h) { halo_begin(p, s, esz, h, 1); nn_split_halo_end((void *)p, t_side, s, esz, h, t_ctx->rb[1][t_side], 1); }
+void split_reduce(double *b, int n) { coll_t x = {2, nullptr, {0}, 0, 0, b, n, 0}; collective(&x); }
 
 typedef struct { split_ctx *c; int side; } warg_t;
 static void *worker(void *p) {

@@ -222,7 +222,10 @@ void nn_split_set_reduce(void (*fn)(double *, int));
 /* esz: bytes per element of a plane-major tensor, 0 = an MX-registered tensor */
 void nn_split_zero(const void *t, shape5 s, int esz, int lo, int hi);   /* zero the halo planes (current device) */
 size_t nn_split_halo_bytes(shape5 s, int esz);
-void nn_split_halo(void *const *t, const int *dev, shape5 s, int esz, int h, void *const *sb, void *const *rb);   /* both sides at once */
+/* halo exchange: begin for both sides at once (one thread), then end on each side's own thread; slot 0 / 1: two exchanges
+   may be in flight, each with its own buffers */
+void nn_split_halo_begin(void *const *t, const int *dev, shape5 s, int esz, int h, void *const *sb, void *const *rb, int slot);
+void nn_split_halo_end(void *t, int side, shape5 s, int esz, int h, void *rb, int slot);
 void nn_split_allreduce(double *const *b, const int *dev, int n, double *const *r);
 /* Device-to-device copy across GPUs (peer access when possible). */
 void nn_peer_copy(void *dst, int dst_dev, const void *src, int src_dev, size_t bytes);

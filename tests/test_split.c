@@ -69,7 +69,7 @@ static double single(const unet_cfg *cfg, unsigned sr_step, float *g) {
     return l;
 }
 static double split(split_ctx *c, const unet_cfg *cfg, unsigned sr_step, float *g, size_t np) {
-    for (int s = 0; s < 2; s++) { nn_init(s); nn_set_sr_step(sr_step); side_alloc(&S2[s], cfg, Dl); unet_set_split(S2[s].u, s, H0, split_halo); upload_side(&S2[s], s); }
+    for (int s = 0; s < 2; s++) { nn_init(s); nn_set_sr_step(sr_step); side_alloc(&S2[s], cfg, Dl); unet_set_split(S2[s].u, s, H0, split_halo); if (!getenv("UFSM_SPLIT_SYNC")) unet_set_split_async(S2[s].u, split_halo_begin, split_halo_end); upload_side(&S2[s], s); }
     split_run(c, job, nullptr);
     double l[2]; float *g1 = malloc(np * 4);
     for (int s = 0; s < 2; s++) { nn_init(s); l[s] = fetch(&S2[s], Dl); unet_grad_d2h(S2[s].u, s ? g1 : g); }
