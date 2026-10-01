@@ -447,6 +447,11 @@ not compute-bound (launches, sampler, small grids), and `--fp4 2` is 7% slower b
 is still slower than fp8. The fp4 speed shows at large windows / batches (prof_infer 96^3 B2) and in whole-box
 inference; the training default becomes `--fp4 1`, `--fp4 2` waits for the faster weight-gradient kernel.
 
+End-to-end training at P128 B4 x 2 GPUs (400 steps, all2_cached, sampler wait 0, master 8f30cde): fp16 51.9,
+`--fp4 1` 60.8 (+17%), `--fp4 2` 55.6 samples/s = 0.109 / 0.127 / 0.117 Gvoxel/s. At P64 B4 the presets tie
+(fixed per-step costs dominate). `ufsm train` now defaults to `--fp4 1`; `predict` defaults to `--fp4 1` when the
+checkpoint's precision.txt says act_mx4 1.
+
 ### Sampler on the 17-source set (2026-10-01 evening)
 - On configs/all2.json the sampler collapsed to 34 patches/s (16 workers) and got slower with 32: 331 lazy store
   opens (one remote metadata fetch each, 70-500 ms) serialised on the open mutex, paid by every worker's first draws
