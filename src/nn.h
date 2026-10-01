@@ -78,6 +78,7 @@ int nn_get_conv_prec(int id, int sub, int pass);
 int nn_cur_prec(void);
 int nn_prec_parse(const char *name);     /* "bf16" 1, "fp8" 2, "fp4" 3, "fp16" 4, or a digit; -1 if unknown */
 const char *nn_prec_name(int p);
+int nn_prec_manifest(char *buf, size_t n);   /* effective per-conv fwd:bwd_data:wgrad precisions under the current policy */
 void nn_conv3d_fwd_fp8(const float *x, shape5 xs, const float *w, const float *b, int cout, float *y);        /* k=3 stride 1, fp32 tensors */
 void nn_conv3d_fwd_fp4(const float *x, shape5 xs, const float *w, const float *b, int cout, float *y);
 void nn_conv3d_bwd_weight_fp8(const float *x, shape5 xs, const float *gy, shape5 ys, float *gw, float *gb);

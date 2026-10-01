@@ -135,7 +135,9 @@ int cmd_train(int argc, char **argv) {
     float anvil_lr = (float)atof(opt(argc, argv, "--anvil-lr", "0.023")), anvil_wd = (float)atof(opt(argc, argv, "--anvil-wd", "2.25"));
     const char *sched = opt(argc, argv, "--sched", "cos");   /* cos | wsd (warmup, constant, linear cooldown over the last --cooldown fraction; extendable runs) */
     float cooldown = (float)atof(opt(argc, argv, "--cooldown", "0.2"));
-    int qat = atoi(opt(argc, argv, "--qat", "0"));         /* quantization-aware training: forward/backward-data at precision 2 (fp8) or 3 (fp4), weight gradients at 16-bit */
+    int qat = atoi(opt(argc, argv, "--qat", "0"));
+    /* the effective precision manifest is printed after all precision options are applied and saved next to the checkpoints */
+#define WRITE_MANIFEST(path) do { char mf_[4096]; int mn_ = nn_prec_manifest(mf_, sizeof mf_); snprintf(mf_ + mn_, sizeof mf_ - mn_, " act_mx8 %d grad_mx8 %d f16 %d opt %s\n", getenv("UFSM_ACT_MX8") ? 1 : 0, getenv("UFSM_GRAD_MX8") ? 1 : 0, f16, optname); FILE *mff_ = fopen(path, "w"); if (mff_) { fputs(mf_, mff_); fclose(mff_); } } while (0)         /* quantization-aware training: forward/backward-data at precision 2 (fp8) or 3 (fp4), weight gradients at 16-bit */
     if (qat) { nn_set_prec(qat); nn_set_prec_wgrad(1); }
     if (atoi(opt(argc, argv, "--sr", "0"))) nn_set_sr(1);                                   /* stochastic rounding of fp8 gradient operands */
     int wq = atoi(opt(argc, argv, "--wq", "0"));            /* 8 or 4: true fp8 / fp4 weights (stochastic rounding after each update) */
@@ -144,7 +146,8 @@ int cmd_train(int argc, char **argv) {
     nn_set_pos_weight((float)atof(opt(argc, argv, "--pos-weight", "1")));   /* BCE weight of surface voxels */
     int overfit = atoi(opt(argc, argv, "--overfit", "0"));   /* diagnostic: train on the first batch forever */
     int noaug = atoi(opt(argc, argv, "--noaug", "0"));       /* diagnostic: no augmentation */
-    if (nn_set_prec_policy(opt(argc, argv, "--policy", ""))) return 2;   /* per-layer: "enc0=1,enc1=2,..." */
+    if (nn_set_prec_policy(opt(argc, argv, "--policy", ""))) return 2;
+    { char mf[4096]; nn_prec_manifest(mf, sizeof mf); fprintf(stderr, "%s\n", mf); char mp[1400]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp); }   /* per-layer: "enc0=1,enc1=2,..." */
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--fp32")) nn_set_tf32(0);
     int devs[8], ng = 0;
     { char *t = strdup(opt(argc, argv, "--gpus", opt(argc, argv, "--gpu", "0"))); for (char *q = strtok(t, ","); q && ng < 8; q = strtok(nullptr, ",")) devs[ng++] = atoi(q); free(t); }

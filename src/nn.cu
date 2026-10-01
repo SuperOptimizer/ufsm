@@ -64,6 +64,19 @@ static int eff_prec_pass(int pass) {
 static int eff_prec(void) { return eff_prec_pass(g_pass); }
 static int eff_prec_w(void) { return eff_prec_pass(2); }
 extern "C" int nn_cur_prec(void) { return eff_prec(); }
+/* effective precision manifest: what each conv's three passes actually resolve to under the current global prec, layer
+   policy and wgrad override (storage modes are appended by the caller). Written next to checkpoints. */
+extern "C" int nn_prec_manifest(char *buf, size_t n) {
+    static const char *names[] = {"enc0", "enc1", "enc2", "enc3", "down0", "down1", "down2", "dec2", "dec1", "dec0", "head"};
+    int sl = g_layer, ss = g_sub; size_t off = 0;
+    off += (size_t)snprintf(buf + off, n - off, "prec %s sr %d policy:", nn_prec_name(g_prec), sr_on());
+    for (int l = 0; l < 11 && off < n; l++) for (int s2 = 0; s2 < (l >= 4 && l <= 6 ? 1 : l == 10 ? 1 : 2); s2++) {
+        g_layer = l; g_sub = (l >= 4 && l <= 6) || l == 10 ? -1 : s2;
+        off += (size_t)snprintf(buf + off, n - off, " %s%s=%s:%s:%s", names[l], g_sub < 0 ? "" : s2 ? ".c2" : ".c1", nn_prec_name(eff_prec_pass(0)), nn_prec_name(eff_prec_pass(1)), nn_prec_name(eff_prec_pass(2)));
+    }
+    g_layer = sl; g_sub = ss;
+    return (int)off;
+}
 extern "C" int nn_prec_parse(const char *s) {
     static const char *nm[] = {"fp32", "bf16", "fp8", "fp4", "fp16"};
     for (int i = 0; i < 5; i++) if (!strcmp(s, nm[i])) return i;
