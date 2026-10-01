@@ -117,7 +117,7 @@
    "axis": "/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json"
   },
   {
-   "name": "PHerc0139-hf-20260102150214",
+   "name": "PHerc0139-hf-w023-w032",
    "root": "https://dl.ash2txt.org/community-uploads/forrest/volcomp",
    "ct": "PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
    "um": 2.399,
@@ -140,7 +140,7 @@
    "axis": "/vesuvius/usrm/umbilicus/PHerc0139/umbilicus-full-resolution.json"
   },
   {
-   "name": "PHerc0139-hf-20260102150214",
+   "name": "PHerc0139-hf-w037-w041",
    "root": "https://dl.ash2txt.org/community-uploads/forrest/volcomp",
    "ct": "PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
    "um": 2.399,
@@ -163,7 +163,7 @@
    "axis": "/vesuvius/usrm/umbilicus/PHerc0139/umbilicus-full-resolution.json"
   },
   {
-   "name": "PHerc0139-hf-20260102150214",
+   "name": "PHerc0139-hf-w047-w059",
    "root": "https://dl.ash2txt.org/community-uploads/forrest/volcomp",
    "ct": "PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
    "um": 2.399,

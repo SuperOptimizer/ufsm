@@ -145,6 +145,11 @@ def main():
             for s in group:
                 scan = os.path.basename(s["ct"]).split("-")[0]
                 s["name"] = f"{name}-{scan}"
+            names = [s["name"] for s in group]
+            if len(set(names)) < len(names):   # same scan, different label sets: use the label directory instead
+                for s in group:
+                    lab = os.path.basename(os.path.normpath(s["targets"]["recto"]["root"])).replace(".zarr", "")
+                    s["name"] = f"{name}-{lab}"
     json.dump(cfg, open(out, "w"), indent=1)
     print(f"{len(srcs)} sources -> {out}", file=sys.stderr)
     for s in srcs:
