@@ -2448,7 +2448,70 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx_k(const uint8_t *x, const 
     __syncthreads();
     if (threadIdx.x < Ci * Co && threadIdx.x < 64) { int ci = threadIdx.x / Co, co = threadIdx.x % Co; atomicAdd(&gw[(size_t)co * Ci + ci], red[threadIdx.x]); }
 }
+/* fast path: one MX block row (Ci <= 32) and CO <= 2 outputs (the head): static accumulator indices (the generic kernel's
+   acc[ci * Co + co] lived in local memory), per-sample GN coefficients in shared memory; grid (voxel chunks, sample) */
+template <int B, typename TG, int CO>
+__global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const TG *gy, float *gw, int N, int Ci, size_t S, gnp_t gp, int nper) {
+    const int bw = mx_bw(Ci), n = blockIdx.y;
+    __shared__ float ca[32], cb[32], red[32 * CO];
+    if (threadIdx.x < 32) {
+        const int k = threadIdx.x;
+        float a = 1.f, bb = 0.f;
+        if (gp.G && k < Ci) { const int ng = n * gp.G + k / (Ci / gp.G); a = gp.rstd[ng] * gp.gamma[k]; bb = gp.beta[k] - gp.mean[ng] * a; }
+        ca[k] = a; cb[k] = bb;
+    }
+    if (threadIdx.x < 32 * CO) red[threadIdx.x] = 0.f;
+    __syncthreads();
+    const uint8_t *sc = mx_sc<B>(x, N, Ci, S);
+    float acc[32][CO];
+#pragma unroll
+    for (int k = 0; k < 32; k++)
+#pragma unroll
+        for (int co = 0; co < CO; co++) acc[k][co] = 0.f;
+    const size_t v0 = (size_t)blockIdx.x * nper, v1 = min(S, v0 + nper);
+    for (size_t v = v0 + threadIdx.x; v < v1; v += 256) {
+        float r[32], g[CO];
+        mx_load_row_b<B>(x, sc, (size_t)n * S + v, bw, r);
+#pragma unroll
+        for (int co = 0; co < CO; co++) g[co] = ldx(gy, ((size_t)n * CO + co) * S + v);
+#pragma unroll
+        for (int k = 0; k < 32; k++) {
+            if (k < Ci) {
+                const float xv = gp.G ? act_ab(r[k], ca[k], cb[k], true) : r[k];
+#pragma unroll
+                for (int co = 0; co < CO; co++) acc[k][co] += xv * g[co];
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < 32; k++) {
+        if (k < Ci) {
+#pragma unroll
+            for (int co = 0; co < CO; co++) {
+                float a = acc[k][co];
+                for (int o = 16; o; o >>= 1) a += __shfl_xor_sync(0xffffffff, a, o);
+                if ((threadIdx.x & 31) == 0) atomicAdd(&red[k * CO + co], a);
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < Ci * CO) { const int k = threadIdx.x / CO, co = threadIdx.x % CO; atomicAdd(&gw[(size_t)co * Ci + k], red[threadIdx.x]); }
+}
 extern "C" void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp) {
+    if (xs.c <= 32 && ys.c <= 2) {
+        const size_t S = shape_spatial(xs);
+        const int nper = 8192, nbx = (int)((S + nper - 1) / nper);
+        const dim3 grid(nbx, xs.n);
+        const uint8_t *xq = (const uint8_t *)x;
+#define BW1F(B, CO) do { if (gydt == 2) conv_bwd_w1_mx1_k<B, __half, CO><<<grid, 256>>>(xq, (const __half *)gy, gw, xs.n, xs.c, S, gp, nper); \
+                         else if (gydt == 1) conv_bwd_w1_mx1_k<B, bf16, CO><<<grid, 256>>>(xq, (const bf16 *)gy, gw, xs.n, xs.c, S, gp, nper); \
+                         else conv_bwd_w1_mx1_k<B, float, CO><<<grid, 256>>>(xq, (const float *)gy, gw, xs.n, xs.c, S, gp, nper); } while (0)
+        if (xdt == 4) { if (ys.c == 2) BW1F(4, 2); else BW1F(4, 1); }
+        else { if (ys.c == 2) BW1F(8, 2); else BW1F(8, 1); }
+#undef BW1F
+        LPCK();
+        return;
+    }
     if (xs.c * ys.c > 64 || ys.c > 4) { fprintf(stderr, "lp_bwd_w1_mx: %d x %d channels unsupported\n", xs.c, ys.c); abort(); }
     size_t S = shape_spatial(xs);
     int nbk = (int)(((size_t)xs.n * S + 4095) / 4096); if (nbk > 1024) nbk = 1024;
