@@ -39,6 +39,7 @@ static int usage(void) {
         "  ufsm predict <ckpt> <root> <ct-group> <out-dir> --um U [--box ...]      sliding-window inference -> volcomp pyramid\n"
         "  ufsm eval <pred-root> <pred-group> <label-root> <label-group> --um U [--box ...]   precision/recall/dice\n"
         "  ufsm sample  <sources.json> [--P 128] [--B 2] [--n 4] [--seed S] [--workers W] [--out DIR] [--noaug]\n"
+        "  ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1]   warm the CT chunk cache for the labelled cells\n"
         "root: local dir or https://.../volcomp ; keys are paths under root\n");
     return 2;
 }
@@ -204,6 +205,11 @@ int main(int argc, char **argv) {
     if (argc < 3) return usage();
     const char *cmd = argv[1];
     if (!strcmp(cmd, "sample")) return cmd_sample(argc, argv);
+    if (!strcmp(cmd, "prefetch")) {   /* ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1.0] */
+        if (argc < 3) { fprintf(stderr, "usage: ufsm prefetch <sources.json> [--levels L] [--threads N] [--fraction F]\n"); return 2; }
+        sources *S = sources_load(argv[2]); if (!S) return 1;
+        return sources_prefetch(S, atoi(opt(argc, argv, "--levels", "1")), atoi(opt(argc, argv, "--threads", "32")), atof(opt(argc, argv, "--fraction", "1.0")));
+    }
     if (!strcmp(cmd, "ingest-labels")) return cmd_ingest_labels(argc, argv);
     if (!strcmp(cmd, "ingest-kaggle")) return cmd_ingest_kaggle(argc, argv);
     if (!strcmp(cmd, "ingest-mesh")) return cmd_ingest_mesh(argc, argv);

@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
+#include <unistd.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,6 +66,13 @@ static sym sym_of(int s) { /* s in [0, 48) */
     memcpy(y.perm, perms[s / 8], sizeof y.perm);
     for (int d = 0; d < 3; d++) y.flip[d] = (s >> d) & 1;
     return y;
+}
+/* proper rotation (det +1)? parity of the permutation times the number of flips must be even: reflections change the
+   handedness that distinguishes the recto from the verso face of a winding */
+static int sym_is_rotation(sym y) {
+    static const int odd[6] = {0, 1, 1, 0, 0, 1};   /* permutation parity in perms[] order */
+    int p = (y.perm[0] == 0 && y.perm[1] == 1) ? 0 : (y.perm[0] == 0) ? 1 : (y.perm[0] == 1 && y.perm[1] == 0) ? 2 : (y.perm[0] == 1) ? 3 : (y.perm[0] == 2 && y.perm[1] == 0) ? 4 : 5;
+    return ((odd[p] + y.flip[0] + y.flip[1] + y.flip[2]) & 1) == 0;
 }
 
 #define APPLY_SYM(T, name)                                                                        \
@@ -234,6 +242,52 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         if (w[ch]) for (size_t k = 0; k < p3; k++) if (dst[k] != 255 && dst[k] > tmax) tmax = dst[k];
     }
     if (tmax == 0 && runif(r) > c->empty_keep) { atomic_fetch_add(&sp->rejected, 1); return 1; }
+    /* curriculum: thicken the surface band by max-filtering the target (hard labels only, pyramid sources) */
+    if (c->dilate > 0 && region_ch < 0) {
+        int D = c->dilate >> l; if (D < 1) D = 1;
+        uint8_t *tmp2 = big + 2 * p3;
+        for (int ch = 0; ch < NCH; ch++) {
+            if (!w[ch]) continue;
+            uint8_t *dst = ttmp + (size_t)ch * p3;
+            for (int pass = 0; pass < 3; pass++) {
+                size_t str = pass == 0 ? 1 : pass == 1 ? (size_t)P : (size_t)P * P;
+                for (size_t k = 0; k < p3; k++) {
+                    int idx = pass == 0 ? (int)(k % P) : pass == 1 ? (int)((k / P) % P) : (int)(k / ((size_t)P * P));
+                    uint8_t v = dst[k];
+                    if (v != 255) { int a = idx - D < 0 ? -idx : -D, bnd = idx + D >= P ? P - 1 - idx : D; for (int d = a; d <= bnd; d++) { uint8_t u = dst[k + (ptrdiff_t)d * (ptrdiff_t)str]; if (u != 255 && u > v) v = u; } }
+                    tmp2[k] = v;
+                }
+                memcpy(dst, tmp2, p3);
+            }
+        }
+    }
+    /* soft ridge target: background voxels near the surface get 254 * exp(-(d / sigma)^2 / 2), d = 3-4-5 chamfer distance / 3 */
+    if (c->soft > 0 && region_ch < 0) {
+        float sigma = c->soft / (float)(1 << l); if (sigma < 0.75f) sigma = 0.75f;
+        uint16_t *dm = (uint16_t *)(big + 2 * p3);   /* distance map (needs 2 P^3 bytes: big has room) */
+        const uint16_t INF = 60000;
+        for (int ch = 0; ch < NCH; ch++) {
+            if (!w[ch]) continue;
+            uint8_t *dst = ttmp + (size_t)ch * p3;
+            for (size_t k = 0; k < p3; k++) dm[k] = (dst[k] != 255 && dst[k] > 0) ? 0 : INF;
+            /* two-pass chamfer 3-4-5 */
+            for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
+                size_t k = ((size_t)z * P + y) * P + x; uint16_t v = dm[k]; if (!v) continue;
+                if (x) v = dm[k - 1] + 3 < v ? dm[k - 1] + 3 : v;
+                if (y) { v = dm[k - P] + 3 < v ? dm[k - P] + 3 : v; if (x) v = dm[k - P - 1] + 4 < v ? dm[k - P - 1] + 4 : v; if (x + 1 < P) v = dm[k - P + 1] + 4 < v ? dm[k - P + 1] + 4 : v; }
+                if (z) { size_t kz = k - (size_t)P * P; v = dm[kz] + 3 < v ? dm[kz] + 3 : v; if (x) v = dm[kz - 1] + 4 < v ? dm[kz - 1] + 4 : v; if (x + 1 < P) v = dm[kz + 1] + 4 < v ? dm[kz + 1] + 4 : v; if (y) v = dm[kz - P] + 4 < v ? dm[kz - P] + 4 : v; if (y + 1 < P) v = dm[kz + P] + 4 < v ? dm[kz + P] + 4 : v; }
+                dm[k] = v;
+            }
+            for (int z = P - 1; z >= 0; z--) for (int y = P - 1; y >= 0; y--) for (int x = P - 1; x >= 0; x--) {
+                size_t k = ((size_t)z * P + y) * P + x; uint16_t v = dm[k]; if (!v) continue;
+                if (x + 1 < P) v = dm[k + 1] + 3 < v ? dm[k + 1] + 3 : v;
+                if (y + 1 < P) { v = dm[k + P] + 3 < v ? dm[k + P] + 3 : v; if (x) v = dm[k + P - 1] + 4 < v ? dm[k + P - 1] + 4 : v; if (x + 1 < P) v = dm[k + P + 1] + 4 < v ? dm[k + P + 1] + 4 : v; }
+                if (z + 1 < P) { size_t kz = k + (size_t)P * P; v = dm[kz] + 3 < v ? dm[kz] + 3 : v; if (x) v = dm[kz - 1] + 4 < v ? dm[kz - 1] + 4 : v; if (x + 1 < P) v = dm[kz + 1] + 4 < v ? dm[kz + 1] + 4 : v; if (y) v = dm[kz - P] + 4 < v ? dm[kz - P] + 4 : v; if (y + 1 < P) v = dm[kz + P] + 4 < v ? dm[kz + P] + 4 : v; }
+                dm[k] = v;
+            }
+            for (size_t k = 0; k < p3; k++) if (dst[k] == 0 && dm[k] < INF) { float d = dm[k] / 3.f; int t = (int)(254.f * expf(-0.5f * d * d / (sigma * sigma)) + 0.5f); if (t > 0) dst[k] = (uint8_t)t; }
+        }
+    }
     /* partial annotations: trust background only within R voxels of an annotated surface, ignore the rest */
     if (s->trust_band > 0) {
         int R = s->trust_band >> l; if (R < 1) R = 1;
@@ -292,6 +346,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     uint8_t *T = b->t + (size_t)i * NCH * p3, *M = b->m + (size_t)i * p3;
     if (c->augment) {
         sym y = sym_of((int)rint_below(r, 48));
+        if (c->augment == 2) while (!sym_is_rotation(y)) y = sym_of((int)rint_below(r, 48));   /* rotations only */
         sym_f32(xc, X, P, y);
         /* vector channels: output axis d takes input axis perm[d], negated when flipped */
         for (int d = 0; d < 3; d++) {
@@ -354,6 +409,66 @@ static void *worker(void *arg) {
     return nullptr;
 }
 
+/* coarsest recto level that fits in memory: the cells containing any surface fraction (fallback: any labelled cell) */
+occ_index source_occupancy(source *s) {
+    occ_index o = {nullptr, 0, -1, {0, 0, 0}};
+    if (s->reg[0] && s->reg[0]->n) return o;
+    int lc = -1; z3 *tz = nullptr;
+    for (int l = MAXLEV - 1; l >= 3; l--) { z3 *t = source_tgt(s, 0, l); if (t) { const z3_meta *m = z3_meta_of(t); if ((double)m->shape[0] * m->shape[1] * m->shape[2] <= 3e8) { lc = l; tz = t; break; } } }
+    if (!tz) return o;
+    const z3_meta *m = z3_meta_of(tz);
+    size_t tot = (size_t)m->shape[0] * m->shape[1] * m->shape[2];
+    uint8_t *buf = malloc(tot);
+    int64_t o0[3] = {0, 0, 0};
+    if (!buf || z3_read(tz, o0, m->shape, buf, 8)) { free(buf); return o; }
+    size_t n = 0; for (size_t k = 0; k < tot; k++) n += buf[k] != 255 && buf[k] > 0;
+    int surf = n > 0; if (!n) for (size_t k = 0; k < tot; k++) n += buf[k] != 255;
+    if (!n) { free(buf); return o; }
+    uint32_t *idx = malloc(n * sizeof *idx); size_t j = 0;
+    for (size_t k = 0; k < tot; k++) if (buf[k] != 255 && (surf ? buf[k] > 0 : 1)) idx[j++] = (uint32_t)k;
+    free(buf);
+    o.idx = idx; o.n = n; o.lev = lc; for (int d = 0; d < 3; d++) o.shape[d] = m->shape[d];
+    fprintf(stderr, "sampler: %s: %zu of %zu level-%d cells %s\n", s->name, n, tot, lc, surf ? "contain surface" : "are labelled");
+    return o;
+}
+/* Pull the CT of every occupied cell at levels 0..maxlev through the chunk cache (training then reads from local disk).
+   Cells are visited in a shuffled order so a partial prefetch is still useful; one thread per in-flight region. */
+typedef struct { source *s; occ_index *o; int level; size_t from, to; size_t *done, *fail; } pf_arg;
+static void *pf_worker(void *p) {
+    pf_arg *a = p; z3 *ct = source_ct(a->s, a->level); if (!ct) return nullptr;
+    const z3_meta *m = z3_meta_of(ct);
+    int dl = a->o->lev - a->level; int64_t f = dl >= 0 ? (int64_t)1 << dl : 1;
+    size_t cap = (size_t)f * f * f; uint8_t *buf = malloc(cap);
+    for (size_t k = a->from; k < a->to; k++) {
+        uint32_t id = a->o->idx[(k * 2654435761u) % a->o->n];
+        int64_t cz = id / (a->o->shape[1] * a->o->shape[2]), cy = (id / a->o->shape[2]) % a->o->shape[1], cx = id % a->o->shape[2];
+        int64_t cc[3] = {cz, cy, cx}, org[3], n[3];
+        for (int d = 0; d < 3; d++) { org[d] = cc[d] * f; n[d] = f; if (org[d] + n[d] > m->shape[d]) n[d] = m->shape[d] - org[d]; if (n[d] <= 0) n[d] = 0; }
+        if (n[0] > 0 && n[1] > 0 && n[2] > 0 && z3_read(ct, org, n, buf, 1)) __atomic_fetch_add(a->fail, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(a->done, 1, __ATOMIC_RELAXED);
+    }
+    free(buf); return nullptr;
+}
+int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction) {
+    for (int i = 0; i < S->n; i++) {
+        source *s = &S->src[i];
+        occ_index o = source_occupancy(s);
+        if (!o.n) { fprintf(stderr, "prefetch: %s: no occupancy index (regions source?), skipped\n", s->name); continue; }
+        for (int l = 0; l <= maxlev; l++) {
+            if (!source_ct(s, l)) continue;
+            size_t ncell = (size_t)(o.n * fraction); if (ncell < 1) ncell = 1; if (ncell > o.n) ncell = o.n;
+            size_t done = 0, fail = 0; pthread_t *th = malloc(nthreads * sizeof *th); pf_arg *args = malloc(nthreads * sizeof *args);
+            for (int t = 0; t < nthreads; t++) { args[t] = (pf_arg){s, &o, l, ncell * t / nthreads, ncell * (t + 1) / nthreads, &done, &fail}; pthread_create(&th[t], nullptr, pf_worker, &args[t]); }
+            size_t last = 0;
+            while (last < ncell) { usleep(2000000); last = __atomic_load_n(&done, __ATOMIC_RELAXED); fprintf(stderr, "prefetch: %s level %d: %zu / %zu cells\r", s->name, l, last, ncell); }
+            for (int t = 0; t < nthreads; t++) pthread_join(th[t], nullptr);
+            free(th); free(args);
+            fprintf(stderr, "\nprefetch: %s level %d done (%zu cells, %zu read failures)\n", s->name, l, ncell, fail);
+        }
+        free(o.idx);
+    }
+    return 0;
+}
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sampler *sp = calloc(1, sizeof *sp);
     sp->S = S;
@@ -366,25 +481,9 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     pthread_cond_init(&sp->cv_free, nullptr);
     pthread_cond_init(&sp->cv_ready, nullptr);
     sp->occ = calloc((size_t)S->n, sizeof *sp->occ);
-    for (int i = 0; i < S->n; i++) {   /* coarsest recto level that fits in memory: cells with any surface fraction */
-        source *s = &S->src[i];
-        if (s->reg[0] && s->reg[0]->n) continue;
-        int lc = -1; z3 *tz = nullptr;
-        for (int l = MAXLEV - 1; l >= 3; l--) { z3 *t = source_tgt(s, 0, l); if (t) { const z3_meta *m = z3_meta_of(t); if ((double)m->shape[0] * m->shape[1] * m->shape[2] <= 3e8) { lc = l; tz = t; break; } } }
-        if (!tz) continue;
-        const z3_meta *m = z3_meta_of(tz);
-        size_t tot = (size_t)m->shape[0] * m->shape[1] * m->shape[2];
-        uint8_t *buf = malloc(tot);
-        int64_t o0[3] = {0, 0, 0};
-        if (!buf || z3_read(tz, o0, m->shape, buf, 8)) { free(buf); continue; }
-        size_t n = 0; for (size_t k = 0; k < tot; k++) n += buf[k] != 255 && buf[k] > 0;
-        int surf = n > 0; if (!n) for (size_t k = 0; k < tot; k++) n += buf[k] != 255;
-        if (!n) { free(buf); continue; }
-        uint32_t *idx = malloc(n * sizeof *idx); size_t j = 0;
-        for (size_t k = 0; k < tot; k++) if (buf[k] != 255 && (surf ? buf[k] > 0 : 1)) idx[j++] = (uint32_t)k;
-        free(buf);
-        sp->occ[i].idx = idx; sp->occ[i].n = n; sp->occ[i].lev = lc; for (int d = 0; d < 3; d++) sp->occ[i].shape[d] = m->shape[d];
-        fprintf(stderr, "sampler: %s: %zu of %zu level-%d cells %s\n", s->name, n, tot, lc, surf ? "contain surface" : "are labelled");
+    for (int i = 0; i < S->n; i++) {
+        occ_index o = source_occupancy(&S->src[i]);
+        sp->occ[i].idx = o.idx; sp->occ[i].n = o.n; sp->occ[i].lev = o.lev; for (int d = 0; d < 3; d++) sp->occ[i].shape[d] = o.shape[d];
     }
     sp->cum = malloc((size_t)S->n * sizeof(double));
     double acc = 0;

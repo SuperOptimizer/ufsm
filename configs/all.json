@@ -13,6 +13,7 @@
     }
    },
    "weight": 1.0,
+   "trust_band": 8,
    "holdout": [
     11264,
     8192,
@@ -35,6 +36,7 @@
     }
    },
    "weight": 1.0,
+   "trust_band": 8,
    "holdout": [
     20480,
     8192,
@@ -42,7 +44,31 @@
     1024,
     1024,
     1024
-   ]
+   ],
+   "axis": "/vesuvius/ufsm/gt/axis/PHerc0500P2.json"
+  },
+  {
+   "name": "PHerc0343P-hf",
+   "root": "https://dl.ash2txt.org/community-uploads/forrest/volcomp",
+   "ct": "PHerc0343P/volumes/20260304131111-2.215um-0.4m-111keV-masked.zarr",
+   "um": 2.215,
+   "targets": {
+    "recto": {
+     "root": "/vesuvius/ufsm/gt/labels/2.215um_0.4m_111keV_PHerc0343P_surface.zarr",
+     "group": "."
+    }
+   },
+   "weight": 1.0,
+   "trust_band": 8,
+   "holdout": [
+    7168,
+    5120,
+    5120,
+    1024,
+    1024,
+    1024
+   ],
+   "axis": "/vesuvius/ufsm/gt/axis/PHerc0343P.json"
   },
   {
    "name": "PHerc0009B-seg",
@@ -63,7 +89,8 @@
     1024,
     1024,
     1024
-   ]
+   ],
+   "axis": "/vesuvius/ufsm/gt/axis/PHerc0009B.json"
   },
   {
    "name": "kaggle",

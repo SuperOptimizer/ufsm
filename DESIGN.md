@@ -155,9 +155,11 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   (the hardware 2:4 pattern) with SR-STE (`--srste`); the dense kernels run on the masked copy because the convs are
   staging-bound and a sparse MMA would not help today. Synthetic sheet task, 600 steps, two seeds (dense 0.156 / 0.165):
   QAT fp8 0.159 / 0.161, plain fp8 0.157 / 0.165, QAT fp4 0.169 / 0.166, 2:4 sparse 0.179 / 0.167, fp8 weights
-  (stochastic rounding) 0.153-0.163, fp8 weights + QAT fp8 0.156 / 0.158. Direct fp4 weights do NOT train: with one
-  mantissa bit the stochastic-rounding noise dominates the updates (0.47-0.64, NaN in fp16 mode); fp4 deployment has to
-  go through QAT (`--qat 3`, 0.167) with round-to-nearest at the end, or an error-feedback residual, not tried.
+  (stochastic rounding) 0.153-0.163, fp8 weights + QAT fp8 0.156 / 0.158. Direct fp4 weights with plain stochastic
+  rounding do not train (one mantissa bit: the rounding noise dominates the updates). With an fp8 error-feedback residual
+  per weight (`w = q4 s + r8 sr`, the kernels see only q4; residual and scales live on the optimizer side) they train to
+  0.221 / 0.223 (QAT fp4 on top: 0.226 / 0.232), i.e. fp4 weights cost ~0.06 held-out loss on this task where fp8 weights
+  cost nothing; fp4 nibbles are stored block-contiguously (16 bytes per block of 32) so one thread owns each byte.
 
 - First real run (2026-10-01): run r1 on the MANBp HF labels + Kaggle cubes plateaued at validation 0.76 because the
   sampler drew MANBp positions uniformly over a 17148 x 12577^2 masked volume and rejected 98% of them as air, so 98% of
@@ -176,7 +178,20 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   umbilicus: `ufsm axis` now provides a centroid axis under gt/axis/, picked up by make_sources) and is an edge task,
   not a sheet mask. New sampler option `trust_band` (R voxels: background counts only near an annotated surface) for
   partially annotated sources; new trainer diagnostics `--overfit N` (cycle N fixed batches), `--noaug`,
-  `UFSM_SYNC_UPLOAD`, `UFSM_DUMP_BATCH`, and `--pos-weight`.
+  `UFSM_SYNC_UPLOAD`, `UFSM_DUMP_BATCH`, `--pos-weight`, `--dilate D` (thicker target band as a curriculum).
+- Learnability: a logistic regression on hand-made local features (smoothed intensity, gradient along the radial
+  direction, gradient magnitude) trained on two raw cubes and tested on two others reaches only ~2x chance precision,
+  the same as the network after 4000 streaming steps, so the recto-face target is genuinely hard at the patch level and
+  needs the long schedule (nnU-Net-style); short runs cannot show progress. Run r3 (all five exported sources, computed
+  axes for every scan, trust band 8 on the HF labels, 128^3 batch 2) stayed at validation 0.83 for 10k steps.
+- What finally moved: a soft ridge target (`--soft 3`: background near the surface gets 254 exp(-(d/3)^2/2) with d the
+  chamfer distance, so every voxel of the valid band carries gradient) AND no symmetry augmentation. With both, a
+  2000-step MANBp run reaches training dice 0.63 (still falling) and holdout precision 0.14 at recall 0.27 (band
+  precision 0.34, 3x chance); with the 48-symmetry augmentation the same run stays at 0.10. Reflections flip the
+  handedness that distinguishes recto from verso, so `--rotonly` (the 24 proper rotations) is being tested as the
+  replacement. `ufsm prefetch` warms the CT chunk cache for every labelled cell (5.2 GB for the four pyramid sources at
+  levels 0-1, 32 connections, ~27 MB/s), after which training is decode-bound instead of network-bound. Run r4 = r3
+  settings + soft target + no augmentation.
 
 ## Status (2026-09-30 night)
 - M0 reader + CLI + sampler: done, tested (bit-exact zarr3 reads, sampler montages checked by eye).

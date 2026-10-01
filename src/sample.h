@@ -13,8 +13,10 @@ typedef struct {
     double level_p[MAXLEV];  /* relative probability of each CT level (rung offset); 0 = never */
     double min_fg;           /* reject a patch whose CT nonzero fraction is below this */
     double empty_keep;       /* probability of keeping a patch whose target is all zero */
-    int augment;             /* 0 = none, 1 = symmetries + intensity */
+    int augment;             /* 0 = none, 1 = all 48 cube symmetries + intensity, 2 = the 24 proper rotations + intensity */
     int holdout;             /* 0 = train: never draw patches touching a source's holdout box; 1 = validation: draw only inside holdout boxes */
+    int dilate;              /* > 0: dilate the surface band of pyramid targets by this many level-0 voxels (curriculum for thin targets) */
+    float soft;              /* > 0: soft ridge target exp(-(d/soft)^2/2) around the surface (d = chamfer distance in level-0 voxels) */
 } sample_cfg;
 
 typedef struct {
@@ -29,6 +31,10 @@ typedef struct {
 
 typedef struct sampler sampler;
 
+typedef struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } occ_index;   /* coarse label cells that contain surface */
+occ_index source_occupancy(source *s);
+/* warm the CT chunk cache for the labelled cells of every pyramid source (levels 0..maxlev, a fraction of the cells) */
+int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction);
 sampler *sampler_start(sources *S, const sample_cfg *cfg);
 /* Block until a batch is ready; the pointer stays valid until sampler_release. */
 batch *sampler_next(sampler *sp);

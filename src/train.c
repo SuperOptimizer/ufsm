@@ -115,6 +115,9 @@ int cmd_train(int argc, char **argv) {
     sample_cfg sc = sample_cfg_default();
     sc.P = P; sc.B = B; sc.nworkers = workers; sc.nbuf = 4 * ng + 2; sc.seed = seed;
     if (noaug) sc.augment = 0;
+    if (atoi(opt(argc, argv, "--rotonly", "0"))) sc.augment = 2;   /* proper rotations only (no reflections) */
+    sc.dilate = atoi(opt(argc, argv, "--dilate", "0"));   /* thicken surface targets by D level-0 voxels (curriculum) */
+    sc.soft = (float)atof(opt(argc, argv, "--soft", "0"));  /* soft ridge target with this sigma (level-0 voxels) */
     { const char *lv = opt(argc, argv, "--levels", nullptr); if (lv) { char *t = strdup(lv); int l = 0; memset(sc.level_p, 0, sizeof sc.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) sc.level_p[l++] = atof(q); free(t); } }
 
     size_t p3 = (size_t)P * P * P;
