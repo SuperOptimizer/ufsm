@@ -212,7 +212,7 @@ int cmd_train(int argc, char **argv) {
     if (resume) fprintf(stderr, "resumed %s at step %d\n", resume, step0);
     {   /* --mem auto (default): the cheapest storage mode whose training buffers fit next to what is already allocated on every
            GPU; an explicit UFSM_CHUNK_UP / UFSM_RECOMPUTE / UFSM_GRAD_MX8 or --mem default keeps the env / built-in modes */
-        const char *mm = opt(argc, argv, "--mem", "auto16");   /* auto16 (16-bit gradients only) until the MX-fp8 gradient stair passes */
+        const char *mm = opt(argc, argv, "--mem", "auto");   /* MX-fp8 gradients passed their stair (3 seeds, mean 0.293 vs 0.294) */
         const int auto16 = !strcmp(mm, "auto16");   /* auto16: 16-bit gradients only */
         if ((!strcmp(mm, "auto") || auto16) && nn_get_tf32() && !getenv("UFSM_CHUNK_UP") && !getenv("UFSM_RECOMPUTE") && !getenv("UFSM_GRAD_MX8")) {
             static const struct { int chunk, rc, gmx; const char *what; } cand[] = {

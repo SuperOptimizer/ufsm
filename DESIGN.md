@@ -460,6 +460,10 @@ calibration); layout 1 (per-32 x scales, ~10% slower than fp8) seed 1 0.310; `--
 Equal voxel budget window study (50.3 Gvox, MANBp, `--fp4 1`, seed 0, peak F1 / band F1): 64^3 x 32 0.316 / 0.554,
 128^3 x 4 0.343 / 0.586, 256^3 x 1 (3000 steps) 0.295 / 0.519.
 
+MX-fp8 gradient storage (UFSM_GRAD_MX8, 6000-step MANBp stair under `--fp4 1`, peak F1, seeds 0/1/2): 0.307 / 0.284 /
+0.288 (mean 0.293) vs `--fp4 1` 0.299 / 0.308 / 0.276 (mean 0.294): passes; `train --mem auto` (default) may pick it.
+Memory per level-0 voxel under `--fp4 1`: 16-bit gradients 212 B, MX-fp8 gradients 156 B (step time equal).
+
 ### Sampler on the 17-source set (2026-10-01 evening)
 - On configs/all2.json the sampler collapsed to 34 patches/s (16 workers) and got slower with 32: 331 lazy store
   opens (one remote metadata fetch each, 70-500 ms) serialised on the open mutex, paid by every worker's first draws
