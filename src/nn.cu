@@ -125,7 +125,26 @@ extern "C" const char *nn_check(void) {
     return e == cudaSuccess ? nullptr : cudaGetErrorString(e);
 }
 extern "C" void *nn_malloc(size_t n) { void *p = nullptr; CK(cudaMalloc(&p, n)); return p; }
-extern "C" void nn_free(void *p) { if (p) CK(cudaFree(p)); }
+/* ---- per-tensor storage registry: a tensor registered as MX-fp8 (dt 8) takes the MX paths of the ops that read or
+   write it (see nn_set_storage in nn.h); lookups match any address inside a registered range ---- */
+#define NN_MAXREG 1024
+static struct { const char *p; size_t n; int dt; } g_reg[NN_MAXREG];
+static int g_nreg;
+extern "C" void nn_storage_forget(const void *p) { for (int i = 0; i < g_nreg; i++) if (g_reg[i].p == (const char *)p) { g_reg[i] = g_reg[--g_nreg]; return; } }
+extern "C" void nn_set_storage(const void *p, size_t bytes, int dt) {
+    nn_storage_forget(p);
+    if (!p || !dt) return;
+    if (g_nreg >= NN_MAXREG) { fprintf(stderr, "nn_set_storage: registry full\n"); abort(); }
+    g_reg[g_nreg].p = (const char *)p; g_reg[g_nreg].n = bytes; g_reg[g_nreg].dt = dt; g_nreg++;
+}
+extern "C" int nn_storage(const void *p) {
+    const char *c = (const char *)p;
+    for (int i = 0; i < g_nreg; i++) if (c >= g_reg[i].p && c < g_reg[i].p + g_reg[i].n) return g_reg[i].dt;
+    return 0;
+}
+#define ISMX(p) (g_nreg && nn_storage(p) == 8)
+extern "C" size_t nn_mx8_bytes(shape5 s) { int bw = s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw + 1); }   /* = lp_mx8_bytes */
+extern "C" void nn_free(void *p) { if (p) { if (g_nreg) nn_storage_forget(p); CK(cudaFree(p)); } }
 extern "C" void nn_zero(void *p, size_t n) { CK(cudaMemset(p, 0, n)); }
 extern "C" void nn_h2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyHostToDevice)); }
 extern "C" void nn_d2h(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToHost)); }
@@ -943,6 +962,10 @@ static int conv_fwd_tc_h(const void *x, int xbf, shape5 xs, const float *w, cons
 /* xbf / ybf: input / output tensors are 16-bit (bf16, or fp16 with nn_set_f16) instead of float.
    ts != nullptr: parity-decomposed stride-2 backward-data (x = gy on its own grid, output scattered into gx) */
 static int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts = nullptr) {
+    if (!ts && (ISMX(x) || ISMX(y))) {   /* MX-fp8 activation storage: fp8 compute, staged by copy */
+        if (!ISMX(x) || !ISMX(y) || (sp.x2 && !ISMX(sp.x2))) { fprintf(stderr, "conv: MX-fp8 storage needs MX input and output\n"); abort(); }
+        return lp_conv_fwd_f8(x, 3, xs, w, b, cout, y, 3, gp, osum, Go, sp);
+    }
     const int pr = eff_prec();
     if (!ts && pr == 2) return lp_conv_fwd_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp);
     if (!ts && pr == 3) return lp_conv_fwd_f4(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp);
@@ -977,6 +1000,7 @@ static int conv_fwd_tc_s2_h(const void *x, int xbf, shape5 xs, const float *w, c
     return 0;
 }
 static int conv_fwd_tc_s2(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys) {
+    if (ISMX(x) || ISMX(y)) { if (!ISMX(x) || !ISMX(y)) { fprintf(stderr, "conv s2: MX-fp8 storage needs MX input and output\n"); abort(); } return lp_conv_fwd_s2_f8(x, 3, xs, w, b, cout, y, 3, ys); }
     if ((eff_prec() == 2 || eff_prec() == 3) && xbf == ybf) return lp_conv_fwd_s2_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), ys);
     return g_h16 ? conv_fwd_tc_s2_h<f16>(x, xbf, xs, w, b, cout, y, ybf, ys) : conv_fwd_tc_s2_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, ys);
 }
@@ -1001,6 +1025,7 @@ extern "C" shape5 nn_conv3d_out_shape(shape5 xs, int cout, int k, int stride) {
 }
 
 extern "C" void nn_conv3d_fwd(const float *x, shape5 xs, const float *w, const float *b, int cout, int k, int stride, float *y) {
+    if (k == 1 && g_tf32 && ISMX(x)) { lp_conv1_fwd_mx(x, xs, w, b, cout, y); KCHECK(); return; }   /* head reading an MX tensor (fp32 output) */
     shape5 ys = nn_conv3d_out_shape(xs, cout, k, stride);
     if (k == 3 && stride == 1 && g_tf32) { gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0}; split_t ns = {nullptr, 0, nullptr, 0}; conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, none, nullptr, 0, ns); KCHECK(); return; }
     if (k == 3 && stride == 2 && g_tf32) { conv_fwd_tc_s2(x, ABF, xs, w, b, cout, y, ABF, ys); KCHECK(); return; }
@@ -1382,6 +1407,7 @@ static void launch_bwd_w_tc_h(const void *x, int xbf, shape5 xs, const void *gy,
     else launch_bwd_w_tc_t<float, float, HT>((const float *)x, xs, (const float *)gy, ys, gw, gb, gp, sp);
 }
 static void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
+    if (ISMX(x)) { lp_bwd_w_f8(x, 3, xs, gy, LPDT(gybf), ys, gw, gb, gp, sp); return; }
     if (eff_prec_w() == 2 || eff_prec_w() == 3) { lp_bwd_w_f8(x, LPDT(xbf), xs, gy, LPDT(gybf), ys, gw, gb, gp, sp); return; }   /* prec 4 (fp16) keeps the 16-bit kernel for the weight gradient */
     if (g_h16) launch_bwd_w_tc_h<f16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
     else launch_bwd_w_tc_h<bf16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
@@ -1564,6 +1590,13 @@ extern "C" void nn_conv3d_bwd_weight(const float *x, shape5 xs, const float *gy,
         KCHECK();
         return;
     }
+    if (k == 3 && stride == 2 && g_tf32 && ISMX(x)) { lp_bwd_w_s2_f8(x, 3, xs, gy, LPDT(GBF), ys, gw, gb); KCHECK(); return; }
+    if (k == 1 && stride == 1 && g_tf32 && ISMX(x)) {
+        lp_bwd_w1_mx(x, xs, gy, LPDT(GBF), ys, gw);
+        size_t So1 = shape_spatial(ys);
+        if (gb) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So1); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So1); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So1); }
+        KCHECK(); return;
+    }
     if (k == 3 && stride == 2 && g_tf32 && (eff_prec_w() == 2 || eff_prec_w() == 3)) { lp_bwd_w_s2_f8(x, LPDT(ABF), xs, gy, LPDT(GBF), ys, gw, gb); KCHECK(); return; }
     if (k == 3 && stride == 2 && g_tf32) {
         if (g_h16) bwd_w_s2_h<f16>(x, xs, gy, ys, gw, gb); else bwd_w_s2_h<bf16>(x, xs, gy, ys, gw, gb);
@@ -1644,6 +1677,7 @@ extern "C" int nn_conv3d_bwd_data_split(const float *gy, shape5 ys, const float 
 /* y = silu(gn(x)) from precomputed statistics, one pass */
 extern "C" void nn_gn_silu_apply(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *y) {
     if (G > s.c) G = s.c;
+    if (ISMX(x)) { if (!ISMX(y)) { fprintf(stderr, "gn_silu_apply: MX input needs an MX output\n"); abort(); } lp_gn_silu_apply_mx(x, s, G, gamma, beta, mean, rstd, y); KCHECK(); return; }
     size_t n = shape_numel(s);
     if (ABF && g_h16) gn_apply_k<1, f16, f16><<<dim3(s.n * s.c, KSLAB), 256>>>((const f16 *)x, gamma, beta, mean, rstd, (f16 *)y, s.c, G, shape_spatial(s));
     else if (ABF) gn_apply_k<1, bf16, bf16><<<dim3(s.n * s.c, KSLAB), 256>>>((const bf16 *)x, gamma, beta, mean, rstd, (bf16 *)y, s.c, G, shape_spatial(s));
@@ -1780,6 +1814,18 @@ static void gn_silu_bwd_t(const TI *x, shape5 s, int G, const float *gamma, cons
 extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy,
                                float *gx, float *ggamma, float *gbeta, float *scratch) {
     if (G > s.c) G = s.c;
+    if (ISMX(x)) {   /* MX x: voxel-major passes; gradients keep their storage */
+        int NC = s.n * s.c;
+        double *ds = gn_dsums((size_t)2 * NC);
+        float *AB = scratch + 2 * NC;
+        lp_gn_silu_bwd_mx(x, s, G, gamma, beta, mean, rstd, gy, gx, LPDT(GBF), ds, scratch, AB);
+        d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
+        gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB);
+        lp_gn_silu_bwd_apply_mx(x, s, G, gamma, beta, mean, rstd, gy, gx, LPDT(GBF), AB);
+        gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
+        KCHECK();
+        return;
+    }
     if (GBF && g_h16) gn_silu_bwd_t<f16, f16, f16>((const f16 *)x, s, G, gamma, beta, mean, rstd, (const f16 *)gy, (f16 *)gx, ggamma, gbeta, scratch);
     else if (GBF) gn_silu_bwd_t<bf16, bf16, bf16>((const bf16 *)x, s, G, gamma, beta, mean, rstd, (const bf16 *)gy, (bf16 *)gx, ggamma, gbeta, scratch);
     else if (ABF && g_h16) gn_silu_bwd_t<f16, float, float>((const f16 *)x, s, G, gamma, beta, mean, rstd, gy, gx, ggamma, gbeta, scratch);
@@ -1959,6 +2005,11 @@ template <typename HT> __global__ void f2h_k(const float *x, HT *y, size_t n, fl
 /* fp32 -> the current 16-bit storage type (bf16, or fp16 with nn_set_f16), optionally scaled */
 extern "C" void nn_f32_to_h16(const float *x, size_t n, void *y, float scale) { if (g_h16) f2h_k<f16><<<nblk(n, 256), 256>>>(x, (f16 *)y, n, scale); else f2h_k<bf16><<<nblk(n, 256), 256>>>(x, (bf16 *)y, n, scale); KCHECK(); }
 extern "C" void nn_f32_to_bf16(const float *x, size_t n, void *y) { nn_f32_to_h16(x, n, y, 1.f); }
+/* network input -> activation storage (16-bit, or MX-fp8 when y is registered MX) */
+extern "C" void nn_f32_to_act(const float *x, shape5 s, void *y) {
+    if (ISMX(y)) { lp_f32_to_mx8(x, s.n, s.c, shape_spatial(s), y); KCHECK(); return; }
+    nn_f32_to_h16(x, shape_numel(s), y, 1.f);
+}
 /* 2:4 structured sparsity along the input channels of a [co][ci][taps] weight: in every group of 4 consecutive ci (same co, tap)
    only the two largest |w| survive. mask24: out = masked w (out may alias w). srste24: g = g (kept) + lambda * w (pruned):
    the sparse-refined straight-through estimator (pruned weights get a decaying pull so they can be revisited). */
@@ -2304,6 +2355,7 @@ __global__ void __launch_bounds__(256) up2_b_k(const TG *gy, TO *gx, int NC, int
     stv(gx, ((size_t)nc * D + mz) * H * W + (size_t)my * W + mx, acc);
 }
 extern "C" void nn_up2_fwd_into(const float *x, shape5 xs, float *y, int ctot, int c0) {
+    if (ISMX(x)) { if (!ISMX(y) || ctot != xs.c || c0) { fprintf(stderr, "up2: MX input needs a whole MX output tensor\n"); abort(); } lp_up2_fwd_mx(x, xs, y); KCHECK(); return; }
     dim3 grid(nblk(2 * xs.w, 32), nblk(2 * xs.h, 8), (unsigned)(nblk(2 * xs.d, 4) * xs.n * xs.c));
     if (ABF && g_h16) up2_f_k<f16, f16><<<grid, 256>>>((const f16 *)x, (f16 *)y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0);
     else if (ABF) up2_f_k<bf16, bf16><<<grid, 256>>>((const bf16 *)x, (bf16 *)y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0);

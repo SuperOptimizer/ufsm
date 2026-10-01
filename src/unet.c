@@ -161,9 +161,22 @@ static float *dalloc(unet *u, size_t n) { u->act_bytes += n * 4; return nn_mallo
 #define ABF (nn_get_tf32() && nn_get_act_bf16())
 #define GBF (ABF && nn_get_grad_bf16())
 static float *dalloc_act(unet *u, size_t n) { size_t b = ABF ? n * 2 : n * 4; u->act_bytes += b; return nn_malloc(b); }   /* activation storage (bf16 in act-bf16 mode) */
+/* activation tensor of shape s: MX-fp8 (registered, channel-blocked bytes + scales) in act-MX8 mode, else as dalloc_act */
+static int g_act_mx8 = -1;
+static int act_mx8(void) { if (g_act_mx8 < 0) g_act_mx8 = getenv("UFSM_ACT_MX8") != nullptr; return g_act_mx8 && nn_get_tf32(); }
+void unet_set_act_mx8(int on) { g_act_mx8 = on; }
+static float *dalloc_act_s(unet *u, shape5 s) {
+    if (!act_mx8()) return dalloc_act(u, shape_numel(s));
+    size_t b = nn_mx8_bytes(s);
+    u->act_bytes += b;
+    float *p = nn_malloc(b);
+    nn_set_storage(p, b, 8);
+    return p;
+}
 static float *dalloc_grad(unet *u, size_t n) { size_t b = GBF ? n * 2 : n * 4; u->act_bytes += b; return nn_malloc(b); }  /* activation-gradient storage */
 
 static void free_acts(unet *u) {
+    float *A0 = u->gA[0], *B0 = u->gB[0];   /* shared across levels in tensor-core mode */
     for (int i = 0; i < u->cfg.nlev; i++) {
         block *bs[2] = {&u->enc[i], &u->dec[i]};
         for (int k = 0; k < 2; k++) {
@@ -171,7 +184,11 @@ static void free_acts(unet *u) {
             nn_free(b->a1); nn_free(b->a2); nn_free(b->s2); nn_free(b->m1); nn_free(b->r1); nn_free(b->m2); nn_free(b->r2);
             b->a1 = b->a2 = b->s2 = b->m1 = b->r1 = b->m2 = b->r2 = nullptr;
         }
-        nn_free(u->downo[i]); nn_free(u->cat[i]); nn_free(u->gskip[i]); nn_free(u->gout[i]); nn_free(u->gA[i]); nn_free(u->gB[i]); nn_free(u->t1[i]); nn_free(u->t2[i]);
+        /* gradient buffers may be shared across levels (gA / gB) or aliased (gskip == gout): free each pointer once */
+        if (u->gskip[i] != u->gout[i]) nn_free(u->gskip[i]);
+        if (i == 0 || u->gA[i] != A0) nn_free(u->gA[i]);
+        if (i == 0 || u->gB[i] != B0) nn_free(u->gB[i]);
+        nn_free(u->downo[i]); nn_free(u->cat[i]); nn_free(u->gout[i]); nn_free(u->t1[i]); nn_free(u->t2[i]);
         u->downo[i] = u->cat[i] = u->gskip[i] = u->gout[i] = u->gA[i] = u->gB[i] = u->t1[i] = u->t2[i] = nullptr;
     }
     nn_free(u->logits); u->logits = nullptr;
@@ -184,7 +201,8 @@ static void build_block_acts(unet *u, block *b, shape5 xs, int train) {
     b->ys = xs; b->ys.c = b->c1.cout;
     size_t n = shape_numel(b->ys);
     int G = G_of(u, b->c1.cout);
-    b->a1 = dalloc_act(u, n); b->a2 = dalloc_act(u, n); b->s2 = dalloc_act(u, n);
+    b->a1 = dalloc_act_s(u, b->ys); b->a2 = dalloc_act_s(u, b->ys); b->s2 = dalloc_act_s(u, b->ys);
+    (void)n;
     b->m1 = dalloc(u, (size_t)xs.n * G); b->r1 = dalloc(u, (size_t)xs.n * G); b->m2 = dalloc(u, (size_t)xs.n * G); b->r2 = dalloc(u, (size_t)xs.n * G);
 }
 
@@ -199,20 +217,41 @@ static void build_acts(unet *u, shape5 xs, int train) {
         build_block_acts(u, &u->enc[i], bin, train);
         if (i < L - 1) {
             shape5 ds = nn_conv3d_out_shape(s, w[i], 3, 2);
-            u->downo[i] = dalloc_act(u, shape_numel(ds));
+            u->downo[i] = dalloc_act_s(u, ds);
             s = ds;
         }
     }
     for (int i = L - 2; i >= 0; i--) {
         shape5 li = u->ls[i];
         size_t S = shape_spatial(li);
-        u->cat[i] = dalloc_act(u, (size_t)li.n * (nn_get_tf32() ? w[i + 1] : w[i] + w[i + 1]) * S);
+        { shape5 cs_ = li; cs_.c = nn_get_tf32() ? w[i + 1] : w[i] + w[i + 1]; u->cat[i] = dalloc_act_s(u, cs_); (void)S; }
         shape5 cin = li; cin.c = w[i] + w[i + 1];
         build_block_acts(u, &u->dec[i], cin, train);
     }
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
     u->logits = dalloc(u, shape_numel(os));
     if (train) {
+        if (nn_get_tf32()) {
+            /* tensor-core path: A only holds the level width and B the widest of {width, decoder up part, encoder block
+               input}; both are block-local, so one pair sized for the largest level serves every level. gout[i] is dead
+               once dec[i]'s backward has read it, before that block writes gskip[i]: they share a buffer. */
+            size_t na = 0, nbb = 0;
+            for (int i = 0; i < L; i++) {
+                size_t S = shape_spatial(u->ls[i]);
+                int wb = w[i];
+                if (i < L - 1 && w[i + 1] > wb) wb = w[i + 1];
+                if ((i ? w[i - 1] : u->cfg.cin) > wb) wb = i ? w[i - 1] : u->cfg.cin;
+                if ((size_t)u->ls[i].n * w[i] * S > na) na = (size_t)u->ls[i].n * w[i] * S;
+                if ((size_t)u->ls[i].n * wb * S > nbb) nbb = (size_t)u->ls[i].n * wb * S;
+            }
+            float *A = dalloc_grad(u, na), *B = dalloc_grad(u, nbb);
+            for (int i = 0; i < L; i++) {
+                size_t nw = (size_t)u->ls[i].n * w[i] * shape_spatial(u->ls[i]);
+                u->gA[i] = A; u->gB[i] = B;
+                u->gout[i] = dalloc_grad(u, nw);
+                u->gskip[i] = i < L - 1 ? u->gout[i] : nullptr;
+            }
+        } else
         for (int i = 0; i < L; i++) {
             shape5 li = u->ls[i];
             size_t S = shape_spatial(li);
@@ -232,9 +271,9 @@ static void build_acts(unet *u, shape5 xs, int train) {
         }
         u->conv_scratch = nn_malloc(cs); u->conv_scratch_n = cs; u->act_bytes += cs;
     }
-    u->xin = ABF ? dalloc_act(u, shape_numel(xs)) : nullptr;
+    u->xin = ABF ? dalloc_act_s(u, xs) : nullptr;
     u->glb = (train && GBF) ? dalloc_grad(u, shape_numel(os)) : nullptr;
-    u->xs = xs; u->built = 1; u->train = train; u->mode = nn_get_tf32() * 4 + ABF * 2 + GBF;
+    u->xs = xs; u->built = 1; u->train = train; u->mode = nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8();
 }
 
 size_t unet_activation_bytes(const unet *u) { return u->act_bytes; }
@@ -267,12 +306,12 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
 const float *unet_forward(unet *u, const float *x, shape5 xs, int train) {
     int div = 1 << (u->cfg.nlev - 1);
     if (xs.d % div || xs.h % div || xs.w % div) { fprintf(stderr, "unet: spatial size %dx%dx%d must be divisible by %d\n", xs.d, xs.h, xs.w, div); abort(); }
-    if (!u->built || memcmp(&u->xs, &xs, sizeof xs) || (train && !u->train) || u->mode != nn_get_tf32() * 4 + ABF * 2 + GBF) build_acts(u, xs, train);
+    if (!u->built || memcmp(&u->xs, &xs, sizeof xs) || (train && !u->train) || u->mode != nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8()) build_acts(u, xs, train);
     unet_apply_sparse24(u);
     int L = u->cfg.nlev;
     const int *w = u->cfg.widths;
     const float *cur = x;
-    if (ABF) { nn_f32_to_bf16(x, shape_numel(xs), u->xin); cur = u->xin; }
+    if (ABF) { nn_f32_to_act(x, xs, u->xin); cur = u->xin; }
     for (int i = 0; i < L; i++) {
         nn_set_layer(i); block_fwd(u, &u->enc[i], i, cur);
         cur = u->enc[i].s2;
@@ -338,7 +377,8 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
         return B;
     }
     PROF(2, nn_conv3d_bwd_weight(b->in, b->xs, A, b->ys, 3, 1, g + b->c1.w, g + b->c1.b));
-    PROF(1, nn_conv3d_bwd_data(A, b->ys, P(u, b->c1.w), b->xs, 3, 1, B, u->conv_scratch));            /* B = d/d in */
+    if (b != &u->enc[0] || !nn_get_tf32())   /* the network-input gradient of enc0 is never used */
+        PROF(1, nn_conv3d_bwd_data(A, b->ys, P(u, b->c1.w), b->xs, 3, 1, B, u->conv_scratch));            /* B = d/d in */
     nn_set_conv(-1);
     return B;
 }
