@@ -414,10 +414,11 @@ gradient operands; peak F1 over cutoffs; fp16 references 0.291 (seed 0) / 0.312 
 | S1 fp4 forward | all=fp4:fp8:fp8 | 0.304 | 0.305 |
 | S1 + fp4 weight gradient (Hadamard + SR on x) | all=fp4:fp8:fp4 | 0.294 | |
 | S1 + fp4 weight gradient (plain) | all=fp4:fp8:fp4 | 0.287 | |
-| S2 fp4 backward-data | all=fp4:fp4:fp8 | 0.299 | |
-| all fp4 | all=fp4:fp4:fp4 | 0.281 | |
+| S2 fp4 backward-data | all=fp4:fp4:fp8 | 0.299 | 0.303 |
+| all fp4 | all=fp4:fp4:fp4 | 0.281 | 0.302 |
 
-(enc0.c1 stays 16-bit in every policy.) One-step gradient errors (0.7-0.9 whole-net with mx4 storage, 14% for the fp4
+(enc0.c1 stays 16-bit in every policy.) Presets: `train --fp4 1` = S2 (fastest that passed: mx4 storage, fp4 forward
+and backward-data, fp8 weight gradient, SR), `--fp4 2` = all fp4; `predict --fp4 1` = mx4 storage + fp4 compute. One-step gradient errors (0.7-0.9 whole-net with mx4 storage, 14% for the fp4
 weight gradient alone vs 3% fp8) do not predict the outcome: every stair so far trains within 0.02 of fp16. Step time
 at 96^3 B2 (agent, idle GPU): fp16 32.7, S1 29.8, S2 29.5 ms; the fp4 weight-gradient kernel is slower than fp8 (step
 32.0 / 33.3 ms with Hadamard) and is being sped up before it can be a default. One failed fp16 seed-1 reference
