@@ -346,7 +346,9 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     uint8_t *T = b->t + (size_t)i * NCH * p3, *M = b->m + (size_t)i * p3;
     if (c->augment) {
         sym y = sym_of((int)rint_below(r, 48));
+        if (c->augment == 4) y = sym_of(0);   /* intensity jitter only */
         if (c->augment == 2) while (!sym_is_rotation(y)) y = sym_of((int)rint_below(r, 48));   /* rotations only */
+        if (c->augment == 3) { y = sym_of((int)rint_below(r, 48)); while (y.perm[0] != 0 || y.flip[0]) y = sym_of((int)rint_below(r, 48)); }   /* z fixed: y/x swaps and flips only */
         sym_f32(xc, X, P, y);
         /* vector channels: output axis d takes input axis perm[d], negated when flipped */
         for (int d = 0; d < 3; d++) {

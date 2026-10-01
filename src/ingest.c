@@ -497,7 +497,8 @@ int cmd_ingest_zip(int argc, char **argv) {
     for (int d = 0; d < 3; d++) { shape[d] = (int64_t)json_num(json_at(json_get(j, "shape"), (size_t)d), 0); chunk[d] = (int)json_num(json_at(json_get(j, "chunks"), (size_t)d), 0); }
     const json *comp = json_get(j, "compressor");
     int cc = comp && comp->type != J_NULL ? z2_comp_of(json_str(json_get(comp, "id"), "")) : 0;
-    if (cc < 0 || strcmp(json_str(json_get(j, "dtype"), ""), "|u1")) { fprintf(stderr, "unsupported .zarray (compressor/dtype)\n"); return 1; }
+    const char *dt = json_str(json_get(j, "dtype"), "");
+    if (cc < 0 || (strcmp(dt, "|u1") && strcmp(dt, "<u1") && strcmp(dt, ">u1") && strcmp(dt, "u1"))) { fprintf(stderr, "unsupported .zarray (compressor %d / dtype %s)\n", cc, dt); return 1; }
     json_free(j);
     fprintf(stderr, "%s: %lld x %lld x %lld chunk %d comp %d\n", name, (long long)shape[0], (long long)shape[1], (long long)shape[2], chunk[0], cc);
     if (shard % chunk[0] || shard % chunk[1] || shard % chunk[2]) { fprintf(stderr, "shard must be a multiple of the chunk\n"); return 1; }

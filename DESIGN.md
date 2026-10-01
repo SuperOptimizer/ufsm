@@ -188,8 +188,9 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   chamfer distance, so every voxel of the valid band carries gradient) AND no symmetry augmentation. With both, a
   2000-step MANBp run reaches training dice 0.63 (still falling) and holdout precision 0.14 at recall 0.27 (band
   precision 0.34, 3x chance); with the 48-symmetry augmentation the same run stays at 0.10. Reflections flip the
-  handedness that distinguishes recto from verso, so `--rotonly` (the 24 proper rotations) is being tested as the
-  replacement. `ufsm prefetch` warms the CT chunk cache for every labelled cell (5.2 GB for the four pyramid sources at
+  handedness that distinguishes recto from verso, but the 24 proper rotations hurt just as much (0.08), so the
+  symmetry augmentation is off for now (`--noaug`; z-fixed and intensity-only variants under test). Without it, 4000
+  steps on MANBp reach holdout precision 0.17 at recall 0.34 (F1 0.23, band precision 0.39) and are still improving. `ufsm prefetch` warms the CT chunk cache for every labelled cell (5.2 GB for the four pyramid sources at
   levels 0-1, 32 connections, ~27 MB/s), after which training is decode-bound instead of network-bound. Run r4 = r3
   settings + soft target + no augmentation.
 
