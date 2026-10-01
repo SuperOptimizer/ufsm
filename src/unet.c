@@ -68,6 +68,7 @@ struct unet {
     float *downo[UNET_MAXLEV];    /* down conv outputs */
     float *cat[UNET_MAXLEV];                 /* decoder input: [upsampled w[i+1] | skip w[i]] */
     float *xin;                              /* bf16 copy of the network input (act-bf16 mode) */
+    float *muon_mom, *muon_work; size_t muon_work_n;   /* Muon momentum (np) and Newton-Schulz scratch */
     float *glb;                              /* bf16 copy of the logit gradient (grad-bf16 mode) */
     int mode;                                /* kernel/storage mode the activations were built for */
     float *logits;
@@ -675,6 +676,24 @@ void unet_clip_grad(unet *u, double max_norm) {
 static void wq_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step);
 static void wq_ema(unet *u, float decay);
 void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step) { if (u->wq) wq_adamw(u, lr, b1, b2, eps, wd, step); else nn_adamw(u->p, u->g, u->m, u->v, u->np, lr, b1, b2, eps, wd, step); }
+static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg);
+/* Muon for the 3^3 conv weights (viewed as [Co][Ci * 27]); biases, GroupNorm parameters and the head stay on AdamW.
+   The conv gradients are zeroed before the AdamW pass so it leaves those weights alone (their m and v stay 0). */
+typedef struct { float lr, beta, wd; } muon_arg;
+static void muon_conv(unet *u, const convp *c, void *arg) {
+    muon_arg *a = arg; int K = c->cin * c->k * c->k * c->k; size_t n = (size_t)c->cout * K;
+    size_t need = 2 * n + 2 * (size_t)c->cout * c->cout;
+    if (u->muon_work_n < need) { if (u->muon_work) nn_free(u->muon_work); u->muon_work = nn_malloc(need * 4); u->muon_work_n = need; }
+    nn_muon(u->p + c->w, u->g + c->w, u->muon_mom + c->w, c->cout, K, a->lr, a->beta, a->wd, u->muon_work);
+    nn_zero(u->g + c->w, n * 4);
+}
+void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step) {
+    if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd, step); return; }   /* packed weights: AdamW only */
+    if (!u->muon_mom) { u->muon_mom = nn_malloc(u->np * 4); nn_zero(u->muon_mom, u->np * 4); }
+    muon_arg a = {lr_muon, beta, wd};
+    for_each_conv3(u, muon_conv, &a);
+    nn_adamw(u->p, u->g, u->m, u->v, u->np, lr_adam, b1, b2, eps, wd, step);
+}
 void unet_ema(unet *u, float decay) { if (u->wq) wq_ema(u, decay); else nn_ema(u->ema, u->p, u->np, decay); }
 void unet_use_ema(unet *u, int on) { u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
 /* ---- 2:4 structured sparsity: the forward reads a masked copy of the live weights; SR-STE keeps the master weights dense ---- */

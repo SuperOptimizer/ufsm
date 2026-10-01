@@ -42,6 +42,7 @@ void unet_grad_d2h(unet *u, float *host);
 void unet_grad_h2d(unet *u, const float *host);
 double unet_grad_norm(unet *u);
 void unet_clip_grad(unet *u, double max_norm);          /* scales grads if their norm exceeds max_norm */
+void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step);   /* Muon on the 3^3 conv weights, AdamW elsewhere */
 void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step);
 void unet_ema(unet *u, float decay);
 /* Use the EMA weights (1) or the live weights (0) for forward. */

@@ -181,6 +181,9 @@ static void cache_path(const z3 *z, const char *skey, const char *item, char *bu
     snprintf(buf, n, "%s/%s.%s", z->cache, skey, item);
 }
 
+/* io statistics: chunk reads served from the cache vs fetched from the store (atomic, process-wide) */
+static atomic_uint_fast64_t g_z3_cache_hits, g_z3_store_reads;
+void z3_io_stats(uint64_t *cache_hits, uint64_t *store_reads) { *cache_hits = atomic_load(&g_z3_cache_hits); *store_reads = atomic_load(&g_z3_store_reads); }
 static uint8_t *cache_get(const z3 *z, const char *skey, const char *item, size_t *len) {
     if (!z->cache) return nullptr;
     char p[1400];
@@ -312,6 +315,33 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
     return 0;
 }
 
+/* fetch inner chunk (cz, cy, cx) into the cache without decoding: 1 fetched, 0 already cached or absent, -1 error */
+int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx) {
+    if (!z->cache) return 0;
+    int64_t sz = cz / z->cgrid[0], sy = cy / z->cgrid[1], sx = cx / z->cgrid[2];
+    int ci = (int)(((cz % z->cgrid[0]) * z->cgrid[1] + (cy % z->cgrid[1])) * z->cgrid[2] + (cx % z->cgrid[2]));
+    char skey[1200], item[16];
+    shard_key(z, sz, sy, sx, skey, sizeof skey);
+    if (z->nc <= 1) {   /* unsharded: the object is the chunk */
+        size_t n; uint8_t *b = cache_get(z, skey, "0", &n);
+        if (b) { free(b); return 0; }
+        b = store_read_all(z->s, skey, &n);
+        if (!b) return 0;
+        cache_put(z, skey, "0", b, n); free(b); return 1;
+    }
+    ientry *idx = malloc((size_t)z->nc * sizeof *idx);
+    int li = load_index(z, skey, idx);
+    if (li <= 0) { free(idx); return li; }
+    ientry e = idx[ci]; free(idx);
+    if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) return 0;   /* chunk absent (fill) */
+    snprintf(item, sizeof item, "%d", ci);
+    size_t n; uint8_t *b = cache_get(z, skey, item, &n);
+    if (b) { free(b); return 0; }
+    b = malloc(e.len);
+    if (store_read(z->s, skey, (int64_t)e.off, (int64_t)e.len, b) != (int64_t)e.len) { free(b); return FAIL("prefetch chunk %d of %s", ci, skey); }
+    cache_put(z, skey, item, b, e.len); free(b);
+    return 1;
+}
 static void *worker(void *arg) {
     job *jb = arg;
     z3 *z = jb->z;
@@ -329,6 +359,7 @@ static void *worker(void *arg) {
         snprintf(item, sizeof item, "%d", w->ci < 0 ? 0 : w->ci);
         size_t n;
         uint8_t *b = cache_get(z, skey, item, &n);
+        if (b) atomic_fetch_add(&g_z3_cache_hits, 1); else atomic_fetch_add(&g_z3_store_reads, 1);
         if (!b) {
             if (w->ci < 0) {
                 b = store_read_all(z->s, skey, &n);

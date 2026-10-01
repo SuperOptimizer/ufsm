@@ -42,6 +42,8 @@ build/prec_sweep: tests/prec_sweep.c build/unet.o build/nn.o build/nn_fp8.o
 
 build/test_rc: tests/test_rc.c build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+build/test_muon: tests/test_muon.c build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
 build/bench_mem: tests/bench_mem.c build/unet.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
@@ -51,6 +53,10 @@ build/test_mx: tests/test_mx.c build/nn.o build/nn_fp8.o
 
 build/test_unet: tests/test_unet.c build/unet.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+build/bench_sampler: tests/bench_sampler.c build/sample.o build/sources.o build/zarr3.o build/zarr2.o build/store.o build/json.o build/z3w.o build/tiff.o build/zipr.o build/hf.o build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz
+build/bench_read: tests/bench_read.c build/sample.o build/sources.o build/zarr3.o build/zarr2.o build/store.o build/json.o build/z3w.o build/tiff.o build/zipr.o build/hf.o build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz
 build/fwd_nan: tests/fwd_nan.c build/unet.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 build/test_fused: tests/test_fused.c build/nn.o build/nn_fp8.o

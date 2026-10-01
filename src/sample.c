@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ---- rng (xoshiro256**) ---- */
 typedef struct { uint64_t s[4]; } rng;
@@ -28,7 +29,7 @@ sample_cfg sample_cfg_default(void) {
     sample_cfg c = {0};
     c.P = 128; c.B = 2; c.nworkers = 8; c.nbuf = 6; c.seed = 0;
     c.level_p[0] = 0.5; c.level_p[1] = 0.25; c.level_p[2] = 0.15; c.level_p[3] = 0.1;
-    c.min_fg = 0.3; c.empty_keep = 0.2; c.augment = 1;
+    c.min_fg = 0.3; c.empty_keep = 0.2; c.augment = 1; c.snap = 1;
     return c;
 }
 
@@ -106,6 +107,8 @@ struct sampler {
     atomic_int stop;
     atomic_uint_fast64_t produced, rejected;
     atomic_uint soft_bits;   /* current soft-target sigma (float bits), set by sampler_set_soft */
+    atomic_uint_fast64_t prof_ns[12];   /* per-stage nanoseconds (env UFSM_SAMPLER_PROF): read, targets, dilate, soft, trust, encode, zscore, augment, x16, other */
+    int prof;
     double *cum;   /* cumulative source weights */
     struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } *occ;   /* per source: coarse label cells containing papyrus (guides the position draw) */
 };
@@ -152,7 +155,53 @@ static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
 }
 
 /* Fill patch i of batch b. Returns 0 on success, 1 if rejected (try again), -1 on I/O error. */
-static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big) {
+static double tnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+#define PROF_MARK(stage) do { if (sp->prof) { double t_ = tnow(); atomic_fetch_add(&sp->prof_ns[stage], (uint_fast64_t)((t_ - pt) * 1e9)); pt = t_; } } while (0)
+enum { PS_READ, PS_TARGETS, PS_DILATE, PS_SOFT, PS_TRUST, PS_ENCODE, PS_ZSCORE, PS_AUGMENT, PS_X16, PS_N };
+static const char *prof_names[PS_N] = {"read", "targets", "dilate", "soft", "trust", "encode", "zscore", "augment", "x16"};
+/* 3-4-5 chamfer distance (3 per voxel step) from the voxels of t that are annotated surface (0 < t < 255): two raster
+   passes. Returns 0 (dm all CH_INF) when the patch has no surface. */
+#define CH_INF 60000
+static int chamfer345(const uint8_t *t, uint16_t *dm, int P) {
+    size_t p3 = (size_t)P * P * P, P2 = (size_t)P * P; int any = 0;
+    for (size_t k = 0; k < p3; k++) { int s = t[k] != 255 && t[k] > 0; dm[k] = s ? 0 : CH_INF; any |= s; }
+    if (!any) return 0;
+#define MINU(v, e) do { uint16_t e_ = (uint16_t)(e); if (e_ < (v)) (v) = e_; } while (0)
+    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
+        uint16_t *row = dm + (size_t)z * P2 + (size_t)y * P;
+        const uint16_t *ry = y ? row - P : nullptr, *rz = z ? row - P2 : nullptr, *rzm = (z && y) ? row - P2 - P : nullptr, *rzp = (z && y + 1 < P) ? row - P2 + P : nullptr;
+        for (int x = 0; x < P; x++) {
+            uint16_t v = row[x]; if (!v) continue;
+            int xm = x > 0, xp = x + 1 < P;
+            if (xm) MINU(v, row[x - 1] + 3);
+            if (ry) { MINU(v, ry[x] + 3); if (xm) MINU(v, ry[x - 1] + 4); if (xp) MINU(v, ry[x + 1] + 4); }
+            if (rz) { MINU(v, rz[x] + 3); if (xm) MINU(v, rz[x - 1] + 4); if (xp) MINU(v, rz[x + 1] + 4);
+                      if (rzm) { MINU(v, rzm[x] + 4); if (xm) MINU(v, rzm[x - 1] + 5); if (xp) MINU(v, rzm[x + 1] + 5); }
+                      if (rzp) { MINU(v, rzp[x] + 4); if (xm) MINU(v, rzp[x - 1] + 5); if (xp) MINU(v, rzp[x + 1] + 5); } }
+            row[x] = v;
+        }
+    }
+    for (int z = P - 1; z >= 0; z--) for (int y = P - 1; y >= 0; y--) {
+        uint16_t *row = dm + (size_t)z * P2 + (size_t)y * P;
+        const uint16_t *ry = y + 1 < P ? row + P : nullptr, *rz = z + 1 < P ? row + P2 : nullptr, *rzm = (z + 1 < P && y) ? row + P2 - P : nullptr, *rzp = (z + 1 < P && y + 1 < P) ? row + P2 + P : nullptr;
+        for (int x = P - 1; x >= 0; x--) {
+            uint16_t v = row[x]; if (!v) continue;
+            int xm = x > 0, xp = x + 1 < P;
+            if (xp) MINU(v, row[x + 1] + 3);
+            if (ry) { MINU(v, ry[x] + 3); if (xm) MINU(v, ry[x - 1] + 4); if (xp) MINU(v, ry[x + 1] + 4); }
+            if (rz) { MINU(v, rz[x] + 3); if (xm) MINU(v, rz[x - 1] + 4); if (xp) MINU(v, rz[x + 1] + 4);
+                      if (rzm) { MINU(v, rzm[x] + 4); if (xm) MINU(v, rzm[x - 1] + 5); if (xp) MINU(v, rzm[x + 1] + 5); }
+                      if (rzp) { MINU(v, rzp[x] + 4); if (xm) MINU(v, rzp[x - 1] + 5); if (xp) MINU(v, rzp[x + 1] + 5); } }
+            row[x] = v;
+        }
+    }
+#undef MINU
+    return 1;
+}
+#define GTAB 4096
+static void gtab_fill(rng *r, float *tab) { for (int k = 0; k < GTAB; k++) tab[k] = (float)rnorm(r); }
+static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, const float *gtab) {
+    double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
     const int P = c->P;
     const size_t p3 = P3(sp);
@@ -195,6 +244,14 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     } else {
         for (int d = 0; d < 3; d++) { if (m->shape[d] < P) return 1; o[d] = rint_below(r, m->shape[d] - P + 1); }
     }
+    if (c->snap && region_ch < 0) {   /* align the window to the CT chunk grid: a 128^3 window then decodes 8 chunks of 64^3 instead of up to 27 */
+        for (int d = 0; d < 3; d++) {
+            int64_t cs = m->chunk[d]; if (cs <= 0) continue;
+            o[d] -= o[d] % cs;
+            if (o[d] > m->shape[d] - P) o[d] = m->shape[d] - P;   /* the last window of an axis may stay unaligned */
+            if (o[d] < 0) o[d] = 0;
+        }
+    }
     if (!c->holdout && s->hold_n[0]) {   /* training: reject patches touching the held-out box */
         int64_t span = (int64_t)P << l, hit = 1;
         for (int d = 0; d < 3; d++) { int64_t a = o[d] << l; if (a + span <= s->hold_o[d] || a >= s->hold_o[d] + s->hold_n[d]) hit = 0; }
@@ -218,6 +275,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     double sum = 0, sq = 0;
     for (size_t k = 0; k < p3; k++) { nz += ctu[k] != 0; sum += ctu[k]; sq += (double)ctu[k] * ctu[k]; }
     if ((double)nz / (double)p3 < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); return 1; }
+    PROF_MARK(PS_READ);
     /* targets */
     uint8_t w[NCH] = {0};
     int tmax = 0;
@@ -244,6 +302,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         if (w[ch]) for (size_t k = 0; k < p3; k++) if (dst[k] != 255 && dst[k] > tmax) tmax = dst[k];
     }
     if (tmax == 0 && runif(r) > c->empty_keep) { atomic_fetch_add(&sp->rejected, 1); return 1; }
+    PROF_MARK(PS_TARGETS);
     /* curriculum: thicken the surface band by max-filtering the target (hard labels only, pyramid sources) */
     if (c->dilate > 0 && region_ch < 0) {
         int D = c->dilate >> l; if (D < 1) D = 1;
@@ -263,58 +322,40 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             }
         }
     }
+    PROF_MARK(PS_DILATE);
     /* soft ridge target: background voxels near the surface get 254 * exp(-(d / sigma)^2 / 2), d = 3-4-5 chamfer distance / 3 */
     float soft0; { unsigned sb = atomic_load(&sp->soft_bits); memcpy(&soft0, &sb, 4); }
+    uint16_t *dm = (uint16_t *)(big + 2 * p3);   /* chamfer distance to the annotated surface, per channel (3 per voxel); big has room */
+    int dm_ch = -1, dm_any = 0;                   /* channel the map currently holds, and whether that channel had any surface */
+#define CHAMFER_FOR(ch_) do { if (dm_ch != (ch_)) { dm_ch = (ch_); dm_any = chamfer345(ttmp + (size_t)(ch_) * p3, dm, P); } } while (0)
     if (soft0 > 0 && region_ch < 0) {
         float sigma = soft0 / (float)(1 << l); if (sigma < 0.75f) sigma = 0.75f;
-        uint16_t *dm = (uint16_t *)(big + 2 * p3);   /* distance map (needs 2 P^3 bytes: big has room) */
-        const uint16_t INF = 60000;
+        /* exp(-(d/3)^2 / (2 sigma^2)) tabulated over the chamfer distance (3 per voxel); beyond dcut it rounds to 0 */
+        int dcut = (int)(3.f * sigma * 4.5f) + 1; if (dcut > 4000) dcut = 4000;
+        uint8_t *etab = big + 4 * p3;
+        for (int d = 0; d <= dcut; d++) { float df = d / 3.f; int t = (int)(254.f * expf(-0.5f * df * df / (sigma * sigma)) + 0.5f); etab[d] = (uint8_t)(t > 254 ? 254 : t); }
         for (int ch = 0; ch < NCH; ch++) {
             if (!w[ch]) continue;
             uint8_t *dst = ttmp + (size_t)ch * p3;
-            for (size_t k = 0; k < p3; k++) dm[k] = (dst[k] != 255 && dst[k] > 0) ? 0 : INF;
-            /* two-pass chamfer 3-4-5 */
-            for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
-                size_t k = ((size_t)z * P + y) * P + x; uint16_t v = dm[k]; if (!v) continue;
-                if (x) v = dm[k - 1] + 3 < v ? dm[k - 1] + 3 : v;
-                if (y) { v = dm[k - P] + 3 < v ? dm[k - P] + 3 : v; if (x) v = dm[k - P - 1] + 4 < v ? dm[k - P - 1] + 4 : v; if (x + 1 < P) v = dm[k - P + 1] + 4 < v ? dm[k - P + 1] + 4 : v; }
-                if (z) { size_t kz = k - (size_t)P * P; v = dm[kz] + 3 < v ? dm[kz] + 3 : v; if (x) v = dm[kz - 1] + 4 < v ? dm[kz - 1] + 4 : v; if (x + 1 < P) v = dm[kz + 1] + 4 < v ? dm[kz + 1] + 4 : v; if (y) v = dm[kz - P] + 4 < v ? dm[kz - P] + 4 : v; if (y + 1 < P) v = dm[kz + P] + 4 < v ? dm[kz + P] + 4 : v; }
-                dm[k] = v;
-            }
-            for (int z = P - 1; z >= 0; z--) for (int y = P - 1; y >= 0; y--) for (int x = P - 1; x >= 0; x--) {
-                size_t k = ((size_t)z * P + y) * P + x; uint16_t v = dm[k]; if (!v) continue;
-                if (x + 1 < P) v = dm[k + 1] + 3 < v ? dm[k + 1] + 3 : v;
-                if (y + 1 < P) { v = dm[k + P] + 3 < v ? dm[k + P] + 3 : v; if (x) v = dm[k + P - 1] + 4 < v ? dm[k + P - 1] + 4 : v; if (x + 1 < P) v = dm[k + P + 1] + 4 < v ? dm[k + P + 1] + 4 : v; }
-                if (z + 1 < P) { size_t kz = k + (size_t)P * P; v = dm[kz] + 3 < v ? dm[kz] + 3 : v; if (x) v = dm[kz - 1] + 4 < v ? dm[kz - 1] + 4 : v; if (x + 1 < P) v = dm[kz + 1] + 4 < v ? dm[kz + 1] + 4 : v; if (y) v = dm[kz - P] + 4 < v ? dm[kz - P] + 4 : v; if (y + 1 < P) v = dm[kz + P] + 4 < v ? dm[kz + P] + 4 : v; }
-                dm[k] = v;
-            }
-            for (size_t k = 0; k < p3; k++) if (dst[k] == 0 && dm[k] < INF) { float d = dm[k] / 3.f; int t = (int)(254.f * expf(-0.5f * d * d / (sigma * sigma)) + 0.5f); if (t > 0) dst[k] = (uint8_t)t; }
+            CHAMFER_FOR(ch);
+            if (!dm_any) continue;   /* no surface in the patch: nothing to soften */
+            for (size_t k = 0; k < p3; k++) if (dst[k] == 0 && dm[k] <= dcut) { uint8_t t = etab[dm[k]]; if (t) dst[k] = t; }
         }
     }
+    PROF_MARK(PS_SOFT);
     /* partial annotations: trust background only within R voxels of an annotated surface, ignore the rest */
     if (s->trust_band > 0) {
         int R = s->trust_band >> l; if (R < 1) R = 1;
-        uint8_t *near = big + p3, *tmp2 = big + 2 * p3;   /* scratch cubes (big holds room for 10 P^3) */
         for (int ch = 0; ch < NCH; ch++) {
             if (!w[ch]) continue;
             uint8_t *dst = ttmp + (size_t)ch * p3;
-            for (size_t k = 0; k < p3; k++) near[k] = dst[k] != 255 && dst[k] > 0;
-            /* separable max filter of radius R along x, y, z */
-            for (int pass = 0; pass < 3; pass++) {
-                size_t str = pass == 0 ? 1 : pass == 1 ? (size_t)P : (size_t)P * P;
-                for (size_t k = 0; k < p3; k++) {
-                    int idx = pass == 0 ? (int)(k % P) : pass == 1 ? (int)((k / P) % P) : (int)(k / ((size_t)P * P));
-                    uint8_t v = 0;
-                    int a = idx - R < 0 ? -idx : -R, bnd = idx + R >= P ? P - 1 - idx : R;
-                    for (int d = a; d <= bnd && !v; d++) v = near[k + (ptrdiff_t)d * (ptrdiff_t)str];
-                    tmp2[k] = v;
-                }
-                memcpy(near, tmp2, p3);
-            }
-            for (size_t k = 0; k < p3; k++) if (dst[k] == 0 && !near[k]) dst[k] = 255;
+            CHAMFER_FOR(ch);   /* measured from the hard surface (the soft values added above are not surface) */
+            if (!dm_any) { for (size_t k = 0; k < p3; k++) if (dst[k] == 0) dst[k] = 255; continue; }   /* nothing annotated: ignore all background */
+            for (size_t k = 0; k < p3; k++) if (dst[k] == 0 && dm[k] > 3 * R) dst[k] = 255;
         }
     }
     /* label encoding -> target probability * 255 and the ignore mask (255 = ignore) */
+    PROF_MARK(PS_TRUST);
     uint8_t *ign = big + 9 * p3;
     memset(ign, 0, p3);
     for (int ch = 0; ch < NCH; ch++) {
@@ -322,6 +363,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         uint8_t *dst = ttmp + (size_t)ch * p3;
         for (size_t k = 0; k < p3; k++) { uint8_t v = dst[k]; if (v == 255) { ign[k] = 1; dst[k] = 0; } else dst[k] = (uint8_t)((v * 255 + 127) / 254); }
     }
+    PROF_MARK(PS_ENCODE);
     /* z-score + radial into xtmp (4 channels) */
     double mean = sum / (double)p3, var = sq / (double)p3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
     float *xc = xtmp, *rz_ = xtmp + p3, *ry = xtmp + 2 * p3, *rx = xtmp + 3 * p3;
@@ -344,6 +386,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     }
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
     for (size_t k = 0; k < p3; k++) mask[k] = ctu[k] != 0 && !mask[k];
+    PROF_MARK(PS_ZSCORE);
     /* augment: symmetry (permute/flip cube, rotate the radial vector) + intensity */
     float *X = b->x + (size_t)i * 4 * p3;
     uint8_t *T = b->t + (size_t)i * NCH * p3, *M = b->m + (size_t)i * p3;
@@ -361,17 +404,25 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y);
         sym_u8(mask, M, P, y);
         double a = exp((runif(r) * 2 - 1) * 0.22), bb = (runif(r) * 2 - 1) * 0.2, sg = runif(r) * 0.1;
-        for (size_t k = 0; k < p3; k++) X[k] = (float)(a * X[k] + bb + sg * rnorm(r));
+        {   /* intensity jitter: gain, offset and Gaussian noise from a per-worker table (no log / cos per voxel) */
+            float af = (float)a, bf = (float)bb, sf = (float)sg; uint64_t st = 0;
+            for (size_t k = 0; k < p3; k++) {
+                if ((k & 3) == 0) st = rnext(r);
+                X[k] = af * X[k] + bf + sf * gtab[(st >> (16 * (k & 3))) & (GTAB - 1)];
+            }
+        }
     } else {
         memcpy(X, xtmp, 4 * p3 * sizeof(float));
         memcpy(T, ttmp, NCH * p3);
         memcpy(M, mask, p3);
     }
+    PROF_MARK(PS_AUGMENT);
     if (b->x16) {   /* 16-bit copy for the upload: fp16 (round to nearest, F16C) or bf16 (round to nearest even) */
         uint16_t *H = b->x16 + (size_t)i * 4 * p3;
         if (c->xfmt == 1) { for (size_t k = 0; k < 4 * p3; k++) { _Float16 h = (_Float16)X[k]; memcpy(&H[k], &h, 2); } }
         else for (size_t k = 0; k < 4 * p3; k++) { uint32_t u; memcpy(&u, &X[k], 4); u += 0x7fffu + ((u >> 16) & 1u); H[k] = (uint16_t)(u >> 16); }
     }
+    PROF_MARK(PS_X16);
     memcpy(b->w + (size_t)i * NCH, w, NCH);
     b->src[i] = (int16_t)si;
     b->level[i] = (int8_t)l;
@@ -392,6 +443,7 @@ static void *worker(void *arg) {
     float *xtmp = malloc(4 * p3 * sizeof(float));
     uint8_t *ttmp = malloc(NCH * p3);
     uint8_t *big = malloc(10 * p3);   /* [0,P^3) CT (also the coarse probe), [P^3, 9P^3) (2P)^3 region scratch, [9P^3, 10P^3) mask */
+    float *gtab = malloc(GTAB * sizeof(float)); gtab_fill(&r, gtab);
     while (!atomic_load(&sp->stop)) {
         pthread_mutex_lock(&sp->mu);
         int k = -1;
@@ -405,7 +457,7 @@ static void *worker(void *arg) {
         batch *b = &sp->slots[k];
         int fail = 0; unsigned spin = 0;
         for (int i = 0; i < sp->cfg.B && !atomic_load(&sp->stop);) {
-            int rc = draw(sp, b, i, &r, xtmp, ttmp, big);
+            int rc = draw(sp, b, i, &r, xtmp, ttmp, big, gtab);
             if (rc == 0) { i++; fail = 0; spin = 0; }
             else if (rc > 0 && ++spin == (1u << 22)) fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d too large for the sources' regions, holdout boxes or levels?)\n", spin, sp->cfg.P);
             else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->stop, 1); } }
@@ -444,37 +496,66 @@ occ_index source_occupancy(source *s) {
 }
 /* Pull the CT of every occupied cell at levels 0..maxlev through the chunk cache (training then reads from local disk).
    Cells are visited in a shuffled order so a partial prefetch is still useful; one thread per in-flight region. */
-typedef struct { source *s; occ_index *o; int level; size_t from, to; size_t *done, *fail; } pf_arg;
+/* Prefetch the CT chunks that training touches into the chunk cache: for every coarse cell that contains surface,
+   at every level the window around the cell (P wide, P/2 random offset, then snapped to the chunk grid) and the coarse
+   probe window at level + 3; chunks are collected in a bitmap per level so each is fetched once, without decoding. */
+typedef struct { z3 *ct; uint8_t *bits; int64_t ng[3]; size_t from, to; size_t *done, *fetched, *fail; } pf_arg;
 static void *pf_worker(void *p) {
-    pf_arg *a = p; z3 *ct = source_ct(a->s, a->level); if (!ct) return nullptr;
-    const z3_meta *m = z3_meta_of(ct);
-    int dl = a->o->lev - a->level; int64_t f = dl >= 0 ? (int64_t)1 << dl : 1;
-    size_t cap = (size_t)f * f * f; uint8_t *buf = malloc(cap);
-    for (size_t k = a->from; k < a->to; k++) {
-        uint32_t id = a->o->idx[(k * 2654435761u) % a->o->n];
-        int64_t cz = id / (a->o->shape[1] * a->o->shape[2]), cy = (id / a->o->shape[2]) % a->o->shape[1], cx = id % a->o->shape[2];
-        int64_t cc[3] = {cz, cy, cx}, org[3], n[3];
-        for (int d = 0; d < 3; d++) { org[d] = cc[d] * f; n[d] = f; if (org[d] + n[d] > m->shape[d]) n[d] = m->shape[d] - org[d]; if (n[d] <= 0) n[d] = 0; }
-        if (n[0] > 0 && n[1] > 0 && n[2] > 0 && z3_read(ct, org, n, buf, 1)) __atomic_fetch_add(a->fail, 1, __ATOMIC_RELAXED);
+    pf_arg *a = p;
+    size_t total = (size_t)a->ng[0] * a->ng[1] * a->ng[2];
+    for (size_t k = a->from; k < a->to && k < total; k++) {
+        if (!(a->bits[k >> 3] & (1u << (k & 7)))) continue;
+        int64_t cz = (int64_t)(k / ((size_t)a->ng[1] * a->ng[2])), cy = (int64_t)((k / (size_t)a->ng[2]) % (size_t)a->ng[1]), cx = (int64_t)(k % (size_t)a->ng[2]);
+        int rc = z3_prefetch_chunk(a->ct, cz, cy, cx);
+        if (rc < 0) __atomic_fetch_add(a->fail, 1, __ATOMIC_RELAXED); else if (rc > 0) __atomic_fetch_add(a->fetched, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(a->done, 1, __ATOMIC_RELAXED);
     }
-    free(buf); return nullptr;
+    return nullptr;
+}
+static void pf_mark(uint8_t *bits, const int64_t *ng, const int64_t *lo, const int64_t *hi) {   /* chunk index box, inclusive, clamped */
+    int64_t c0[3], c1[3];
+    for (int d = 0; d < 3; d++) { c0[d] = lo[d] < 0 ? 0 : lo[d]; c1[d] = hi[d] >= ng[d] ? ng[d] - 1 : hi[d]; if (c0[d] > c1[d]) return; }
+    for (int64_t z = c0[0]; z <= c1[0]; z++) for (int64_t y = c0[1]; y <= c1[1]; y++) for (int64_t x = c0[2]; x <= c1[2]; x++) {
+        size_t k = ((size_t)z * (size_t)ng[1] + (size_t)y) * (size_t)ng[2] + (size_t)x; bits[k >> 3] |= (uint8_t)(1u << (k & 7));
+    }
 }
 int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction) {
+    const int P = 128;   /* training window (level voxels); windows up to this size are covered */
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         occ_index o = source_occupancy(s);
         if (!o.n) { fprintf(stderr, "prefetch: %s: no occupancy index (regions source?), skipped\n", s->name); continue; }
-        for (int l = 0; l <= maxlev; l++) {
-            if (!source_ct(s, l)) continue;
-            size_t ncell = (size_t)(o.n * fraction); if (ncell < 1) ncell = 1; if (ncell > o.n) ncell = o.n;
-            size_t done = 0, fail = 0; pthread_t *th = malloc(nthreads * sizeof *th); pf_arg *args = malloc(nthreads * sizeof *args);
-            for (int t = 0; t < nthreads; t++) { args[t] = (pf_arg){s, &o, l, ncell * t / nthreads, ncell * (t + 1) / nthreads, &done, &fail}; pthread_create(&th[t], nullptr, pf_worker, &args[t]); }
+        size_t ncell = (size_t)(o.n * fraction); if (ncell < 1) ncell = 1; if (ncell > o.n) ncell = o.n;
+        for (int l = 0; l < MAXLEV; l++) {
+            z3 *ct = source_ct(s, l); if (!ct) continue;
+            const z3_meta *m = z3_meta_of(ct);
+            int want_window = l <= maxlev, want_probe = l >= 3 && l - 3 <= maxlev;   /* probe reads at level l serve training levels l-3 */
+            if (!want_window && !want_probe) continue;
+            int64_t ng[3]; for (int d = 0; d < 3; d++) ng[d] = (m->shape[d] + m->chunk[d] - 1) / m->chunk[d];
+            size_t total = (size_t)ng[0] * ng[1] * ng[2];
+            uint8_t *bits = calloc((total + 7) / 8, 1);
+            int dl = o.lev - l; int64_t f = dl >= 0 ? (int64_t)1 << dl : 1;
+            for (size_t k = 0; k < ncell; k++) {
+                uint32_t id = o.idx[k];
+                int64_t cc[3] = {(int64_t)(id / (o.shape[1] * o.shape[2])), (int64_t)((id / o.shape[2]) % o.shape[1]), (int64_t)(id % o.shape[2])};
+                int64_t lo[3], hi[3];
+                for (int d = 0; d < 3; d++) {
+                    int64_t v0 = dl >= 0 ? cc[d] * f : cc[d] >> (-dl), v1 = dl >= 0 ? (cc[d] + 1) * f - 1 : v0;   /* cell extent at this level */
+                    int64_t wlo = v0 - P / 2 - m->chunk[d], whi = v1 - P / 2 + P;                               /* window origin range, snapped down, plus the window */
+                    if (want_probe && !want_window) { wlo = v0 - (P >> 3) / 2; whi = v1 + (P >> 3); }           /* probe window (P/8 wide) */
+                    else if (want_probe) { int64_t plo = v0 - (P >> 3) / 2; if (plo < wlo) wlo = plo; }
+                    lo[d] = (wlo < 0 ? 0 : wlo) / m->chunk[d]; hi[d] = (whi >= m->shape[d] ? m->shape[d] - 1 : whi) / m->chunk[d];
+                }
+                pf_mark(bits, ng, lo, hi);
+            }
+            size_t nmark = 0; for (size_t k = 0; k < total; k++) nmark += (bits[k >> 3] >> (k & 7)) & 1;
+            size_t done = 0, fetched = 0, fail = 0; pthread_t *th = malloc(nthreads * sizeof *th); pf_arg *args = malloc(nthreads * sizeof *args);
+            for (int t = 0; t < nthreads; t++) { args[t] = (pf_arg){ct, bits, {ng[0], ng[1], ng[2]}, total * t / nthreads, total * (t + 1) / nthreads, &done, &fetched, &fail}; pthread_create(&th[t], nullptr, pf_worker, &args[t]); }
             size_t last = 0;
-            while (last < ncell) { usleep(2000000); last = __atomic_load_n(&done, __ATOMIC_RELAXED); fprintf(stderr, "prefetch: %s level %d: %zu / %zu cells\r", s->name, l, last, ncell); }
+            while (last < total) { usleep(2000000); last = __atomic_load_n(&done, __ATOMIC_RELAXED); fprintf(stderr, "prefetch: %s level %d: %zu / %zu chunks fetched\r", s->name, l, __atomic_load_n(&fetched, __ATOMIC_RELAXED), nmark); }
             for (int t = 0; t < nthreads; t++) pthread_join(th[t], nullptr);
-            free(th); free(args);
-            fprintf(stderr, "\nprefetch: %s level %d done (%zu cells, %zu read failures)\n", s->name, l, ncell, fail);
+            free(th); free(args); free(bits);
+            fprintf(stderr, "\nprefetch: %s level %d done (%zu chunks needed, %zu fetched now, %zu failures)\n", s->name, l, nmark, fetched, fail);
         }
         free(o.idx);
     }
@@ -485,6 +566,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sp->S = S;
     sp->cfg = *cfg;
     { unsigned sb; memcpy(&sb, &cfg->soft, 4); atomic_store(&sp->soft_bits, sb); }
+    sp->prof = getenv("UFSM_SAMPLER_PROF") != nullptr;
     sp->nslots = cfg->nbuf;
     sp->slots = calloc((size_t)sp->nslots, sizeof *sp->slots);
     sp->state = calloc((size_t)sp->nslots, sizeof *sp->state);
@@ -545,6 +627,14 @@ void sampler_stop(sampler *sp) {
 }
 
 void sampler_set_soft(sampler *sp, float sigma) { unsigned sb; memcpy(&sb, &sigma, 4); atomic_store(&sp->soft_bits, sb); }
+void sampler_prof_print(const sampler *sp) {
+    if (!sp->prof) return;
+    uint64_t n = atomic_load(&sp->produced); if (!n) n = 1;
+    fprintf(stderr, "sampler profile (ms per produced patch, cpu time summed over workers):");
+    for (int k = 0; k < PS_N; k++) fprintf(stderr, " %s %.1f", prof_names[k], atomic_load(&sp->prof_ns[k]) / 1e6 / (double)n);
+    { uint64_t h, r; z3_io_stats(&h, &r); fprintf(stderr, " | chunk reads: %llu cached, %llu from the store", (unsigned long long)h, (unsigned long long)r); }
+    fprintf(stderr, "\n");
+}
 void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected) {
     *produced = atomic_load(&sp->produced);
     *rejected = atomic_load(&sp->rejected);

@@ -39,3 +39,5 @@ typedef struct { char path[64]; double um; } z3_level;
 int z3_group_levels(store *s, const char *group_key, z3_level *out, int max);
 
 const char *z3_error(void);
+void z3_io_stats(uint64_t *cache_hits, uint64_t *store_reads);   /* chunk reads served from the cache vs fetched from the store */
+int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx);   /* fetch one inner chunk into the cache (no decode): 1 fetched, 0 cached/absent, -1 error */

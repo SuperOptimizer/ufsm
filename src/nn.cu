@@ -2720,6 +2720,60 @@ __global__ void adamw_k(float *p, const float *g, float *m, float *v, size_t n, 
     float mh = mi / c1, vh = vi / c2;
     p[i] -= lr * (mh / (sqrtf(vh) + eps) + wd * p[i]);
 }
+/* ---- Muon (modded-nanogpt): momentum, then Newton-Schulz orthogonalisation of the Co x K gradient matrix ---- */
+__global__ void mm_xxt_k(const float *X, int Co, int K, float *A) {   /* A = X X^T (Co x Co) */
+    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= Co) return;
+    const float *a = X + (size_t)i * K, *b = X + (size_t)j * K; float s = 0.f;
+    for (int k = 0; k < K; k++) s += a[k] * b[k];
+    A[(size_t)i * Co + j] = s;
+}
+__global__ void mm_sq_k(const float *A, int Co, float b, float c, float *B) {   /* B = b A + c A A (Co x Co) */
+    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= Co) return;
+    float s = 0.f;
+    for (int k = 0; k < Co; k++) s += A[(size_t)i * Co + k] * A[(size_t)k * Co + j];
+    B[(size_t)i * Co + j] = b * A[(size_t)i * Co + j] + c * s;
+}
+__global__ void mm_bx_k(const float *B, const float *X, int Co, int K, float a, float *Y) {   /* Y = a X + B X (Co x K) */
+    int i = blockIdx.y; size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (k >= (size_t)K) return;
+    float s = 0.f;
+    for (int j = 0; j < Co; j++) s += B[(size_t)i * Co + j] * X[(size_t)j * K + k];
+    Y[(size_t)i * K + k] = a * X[(size_t)i * K + k] + s;
+}
+__global__ void muon_mom_k(const float *g, float *mom, float *x, size_t n, float beta) {   /* nesterov momentum: mom = beta mom + g; x = g + beta mom */
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= n) return;
+    float m = beta * mom[i] + g[i]; mom[i] = m; x[i] = g[i] + beta * m;
+}
+__global__ void muon_sumsq_k(const float *x, size_t n, double *ss) {   /* block-reduced sum of squares into one double */
+    __shared__ float r[256]; float a = 0.f; for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) a += x[i] * x[i];
+    r[threadIdx.x] = a; __syncthreads(); for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) atomicAdd(ss, (double)r[0]);
+}
+__global__ void muon_scale_k(float *x, size_t n, const double *ss, float eps) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) x[i] *= (float)(1.0 / (sqrt(*ss) + eps)); }
+__global__ void muon_apply_k(float *p, const float *o, size_t n, float lr, float scale, float wd) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) p[i] = p[i] * (1.f - lr * wd) - lr * scale * o[i]; }
+/* work: >= 2 Co K + 2 Co Co floats; the gradient of a [Co][K] weight (row-major) is orthogonalised with 5 Newton-Schulz
+   iterations (coefficients from modded-nanogpt) and applied with lr * sqrt(max(1, Co / K)). mom is the momentum buffer. */
+extern "C" void nn_muon(float *p, const float *g, float *mom, int Co, int K, float lr, float beta, float wd, float *work) {
+    size_t n = (size_t)Co * K;
+    float *X = work, *Y = work + n, *A = work + 2 * n, *B = A + (size_t)Co * Co;
+    muon_mom_k<<<nblk(n, 256), 256>>>(g, mom, X, n, beta);
+    double *ss = gn_dsums(1); cudaMemsetAsync(ss, 0, sizeof(double));
+    muon_sumsq_k<<<nblk(n, 256) > 64 ? 64 : nblk(n, 256), 256>>>(X, n, ss);
+    muon_scale_k<<<nblk(n, 256), 256>>>(X, n, ss, 1e-7f);
+    const float a = 3.4445f, b = -4.7750f, c = 2.0315f;
+    dim3 gco(nblk(Co, 128), Co), gk(nblk(K, 256), Co);
+    for (int it = 0; it < 5; it++) {
+        mm_xxt_k<<<gco, 128>>>(X, Co, K, A);
+        mm_sq_k<<<gco, 128>>>(A, Co, b, c, B);
+        mm_bx_k<<<gk, 256>>>(B, X, Co, K, a, Y);
+        float *t = X; X = Y; Y = t;
+    }
+    float scale = sqrtf(fmaxf(1.f, (float)Co / (float)K));
+    muon_apply_k<<<nblk(n, 256), 256>>>(p, X, n, lr, scale, wd);
+    KCHECK();
+}
 extern "C" void nn_adamw(float *p, const float *g, float *m, float *v, size_t n, float lr, float b1, float b2, float eps, float wd, int step) {
     float c1 = 1.f - powf(b1, (float)step), c2 = 1.f - powf(b2, (float)step);
     adamw_k<<<nblk(n, 256), 256>>>(p, g, m, v, n, lr, b1, b2, eps, wd, c1, c2);
