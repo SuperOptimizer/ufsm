@@ -651,6 +651,26 @@ int main(void) {
         cmp("fp4 bwd_data 16 -> 32 + 16 (packed, 48-row tile), part 1", g1, ga, shape_numel(c1), TOL4);
         cmp("fp4 bwd_data 16 -> 32 + 16 (packed, 48-row tile), part 2", g2, gb_, shape_numel(c2), TOL4);
     }
+    {   /* fp4 weight gradient on MX x: the decoded-tile staging (raw decoded plane in bf16, exact; one row load per voxel) must equal
+           the per-element path (had bit 3) to atomic-order noise, per layout mode, gn + SR included */
+        const int Gn = 8;
+        shape5 xs = {2, 32, 6, 10, 16}, ys = xs;
+        size_t nx = shape_numel(xs), nw = (size_t)32 * 32 * 27, NG = (size_t)2 * Gn;
+        float *xr = dev_rand(nx, 2.f), *gr = dev_rand(nx, 1e-3f);
+        float *gam = dev_rand(32, 1.f), *bet = dev_rand(32, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t j = 0; j < NG; j++) h[j] = 0.8f + fabsf(h[j]); nn_h2d(rstd, h, NG * 4); }
+        void *xm = mx4_from(xr, xs), *gm = mx8_from(gr, ys);
+        gnp_t gp = {gam, bet, mean, rstd, Gn}; split_t sr = {0}; sr.sr = 0x1b873593u;
+        float *a = dev_zero(nw), *b = dev_zero(nw);
+        const int modes[] = {0, 1, 3, 5, 7}; const char *mn[] = {"plain", "H32", "H32 + x SR", "H16", "H16 + x SR"};
+        for (int i = 0; i < 5; i++) {
+            nn_zero(a, nw * 4); nn_zero(b, nw * 4);
+            lp_bwd_w_f4(xm, 4, xs, gm, 3, ys, a, nullptr, gp, sr, modes[i]);
+            lp_bwd_w_f4(xm, 4, xs, gm, 3, ys, b, nullptr, gp, sr, modes[i] | 8);
+            char nm[96]; snprintf(nm, sizeof nm, "f4 wgrad tile == per-element (mx4 x, gn, SR, %s)", mn[i]);
+            cmp(nm, a, b, nw, 1e-6);
+        }
+    }
     {   /* fp8 weight gradient on MX inputs: the cooperative staging (x row decoded once per voxel for all channels, gy per
            voxel for all outputs) must reproduce the per-element staging bit for bit, SR and gn+silu included */
         const int Gn = 8;

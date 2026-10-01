@@ -3076,7 +3076,11 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
     uint8_t *sg = (uint8_t *)(sxp + CH * X4_SCS);                     /* [BMo][G4_CS] */
     uint8_t *sgs = sg + BMo * G4_CS;                                  /* [BMo][8] */
     float *sbias = (float *)(sgs + BMo * 8);                          /* [BMo] */
-    uint8_t *wsc = (uint8_t *)(sbias + BMo);                          /* [9 warps][32] */
+    chan_t *ctab4 = (chan_t *)(((uintptr_t)(sbias + BMo) + 31) & ~(uintptr_t)31);   /* [CH] MX x only */
+    __nv_bfloat16 *xt = (__nv_bfloat16 *)(ctab4 + (IS_MX(T) ? CH : 0));             /* [CH][10 rows][24] MX x, LY 1-3: decoded plane, p at 3 + p */
+    unsigned *ram = (unsigned *)(xt + (IS_MX(T) && LY ? CH * 240 : 0));   /* [CH][10] MX x, LY 1: row amax (bits) */
+    uint8_t *tsc = (uint8_t *)(ram + (IS_MX(T) && LY == 1 ? CH * 10 : 0));   /* [CH][9] MX x, LY 1: pair scale bytes */
+    uint8_t *wsc = tsc + (IS_MX(T) && LY == 1 ? (CH * 9 + 15) / 16 * 16 : 0);   /* [9 warps][32] */
     float *scr = (float *)(wsc + 9 * 32);                             /* [9 warps][180], LY 0 only */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int ci0 = blockIdx.x * CH, co0 = blockIdx.y * BMo;
@@ -3098,6 +3102,15 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
     if (threadIdx.x < BMo) sbias[threadIdx.x] = 0.f;
     const bool vec = (W & 3) == 0;
     const int zt_begin = zc * ZC;
+    bool mxu = false;
+    if constexpr (IS_MX(T)) {
+        if (threadIdx.x < CH) { const int ci = ci0 + threadIdx.x; ctab4[threadIdx.x] = make_chan(ci < Ci ? ci : Ci, Ci, Cx, n, plane, x, sp, gp, N); }
+        __syncthreads();
+        mxu = LY != 0 && (had & 8) == 0 && ctab4[0].p != nullptr && (ctab4[0].nib & 7) == 0;   /* had bit 3: per-element path (test hook); LY 0
+                                                                                                 keeps the per-channel reads (its tile would cost an SM block) */
+#pragma unroll
+        for (int q = 1; q < CH; q++) if (ctab4[q].p && (ctab4[q].sp != ctab4[0].sp || ctab4[q].nib != ctab4[0].nib + q)) mxu = false;
+    }
     for (int zt = zt_begin; zt < nzt && zt < (zc + 1) * ZC; zt++) {
         const int oz0 = zt * 2;
         const int np = zt == zt_begin ? 4 : 2, gz_first = zt == zt_begin ? oz0 - 1 : oz0 + 1;
@@ -3105,13 +3118,87 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
         /* X: warp per (channel, plane). Phase 1: the 10 x 18 positions (GN+SiLU applied) into the warp's fp32 plane,
            position p of a row = x ox0 - 1 + p. Phase 2: the 27 shifted 32-position blocks, 4 lanes x 8 values each. */
         constexpr int U = LY == 1 || LY == 2 ? 2 : 1;   /* x tasks in flight per warp: the loads of both are issued before either is quantised */
-        const int NXT = CH * np;
+        /* MX x with the CH channels in one stored block row (mxu): plane by plane, the plane is first decoded thread-per-voxel into
+           the bf16 tile xt (one row load per voxel for all CH channels; e2m1 / e4m3 x 2^e is exact in bf16), then the per-channel
+           tasks read it and apply gn+silu as before (bit-identical to the per-element path) */
+        for (int pass = 0; pass < (mxu ? np : 1); pass++) {
+        if (mxu) {
+            __syncthreads();
+            const int tid = threadIdx.x, row = tid / 18, pp = tid % 18, gz = gz_first + pass, gyy = oy0 - 1 + row, gx = ox0 - 1 + pp;
+            if (tid < 180) {
+                float v[CH];
+#pragma unroll
+                for (int q = 0; q < CH; q++) v[q] = 0.f;
+                if (gz >= 0 && gz < D && gyy >= 0 && gyy < H && gx >= 0 && gx < W) {
+                    const chan_t c0 = ctab4[0];
+                    const size_t off = cof(c0, gz, gyy, gx, H, W);
+                    const float sc = mx_scale(c0.sp[off]);
+                    if constexpr (IS_MX4(T)) {
+                        const unsigned *rw = (const unsigned *)((const uint8_t *)c0.p + off * c0.rb + (c0.nib >> 1));
+#pragma unroll
+                        for (int w = 0; w < CH / 8; w++) {
+                            const unsigned u = __ldg(rw + w);
+#pragma unroll
+                            for (int q = 0; q < 4; q++) { const float2 d = dec_e2m1x2(u >> (8 * q)); v[8 * w + 2 * q] = d.x * sc; v[8 * w + 2 * q + 1] = d.y * sc; }
+                        }
+                    } else {
+                        const unsigned *rw = (const unsigned *)((const uint8_t *)c0.p + off * c0.rb);
+#pragma unroll
+                        for (int w = 0; w < CH / 4; w++) {
+                            const unsigned u = __ldg(rw + w);
+                            const float2 d0 = dec_e4m3x2((unsigned short)(u & 0xffffu)), d1 = dec_e4m3x2((unsigned short)(u >> 16));
+                            v[4 * w] = d0.x * sc; v[4 * w + 1] = d0.y * sc; v[4 * w + 2] = d1.x * sc; v[4 * w + 3] = d1.y * sc;
+                        }
+                    }
+                }
+#pragma unroll
+                for (int q = 0; q < CH; q++) xt[(q * 10 + row) * 24 + 3 + pp] = __float2bfloat16(v[q]);   /* raw decoded value: exact in bf16 */
+            }
+            __syncthreads();
+        }
+        if (LY == 1 && mxu) {   /* LY 1 from the tile: thread per (channel q, row r): 18 values, row amax locally, pair amax from smem */
+            const int tid = threadIdx.x, q = tid / 10, r = tid % 10, gz = gz_first + pass, slot = (gz + 1) & 3, gyy = oy0 - 1 + r;
+            const bool act = tid < CH * 10;
+            float v[18];
+            unsigned am = 0u;
+            if (act) {
+                const chan_t &cq = ctab4[q];
+                const bool rok = cq.p && gz >= 0 && gz < D && gyy >= 0 && gyy < H, G = (gp.G != 0 || sp.gp2.G != 0) && cq.g;
+                const __nv_bfloat16 *src = xt + (q * 10 + r) * 24 + 3;
+#pragma unroll
+                for (int j = 0; j < 18; j++) {
+                    const int gx = ox0 - 1 + j;
+                    v[j] = rok && gx >= 0 && gx < W ? act_ab(__bfloat162float(src[j]), cq.a, cq.b, G) : 0.f;
+                    am = amax_u(am, v[j]);
+                }
+                ram[q * 10 + r] = am;
+            }
+            __syncthreads();
+            if (act) {
+                uint8_t *dst = sxq + q * XCS + slot * XPS;
+#pragma unroll
+                for (int pz = 0; pz < 2; pz++) {
+                    if (pz && (r < 1 || r > 8)) continue;
+                    const int part = pz ? ((r & 1) ? r + 1 : r - 1) : (r ^ 1);
+                    const int e = mx_exp(__uint_as_float(max(am, ram[q * 10 + part])), 1.f / 6.f);
+                    const float m = exp2i(-e);
+                    const int pair = pz ? 5 + ((r - 1) >> 1) : r >> 1, rin = pz ? (r - 1) & 1 : r & 1;
+                    uint2 *o = (uint2 *)(dst + pair * 48 + rin * 24);
+                    o[0] = make_uint2(((unsigned)cvt_e2m1x2(v[0] * m, 0.f) & 15u) << 28, cvt_e2m1x8(v + 1, m));
+                    o[1] = make_uint2(cvt_e2m1x8(v + 9, m), (unsigned)cvt_e2m1x2(v[17] * m, 0.f) & 15u);
+                    if (rin == 0) tsc[q * 9 + pair] = (uint8_t)(e + 127);
+                }
+            }
+            __syncthreads();
+            if (tid < CH * 9) { const int qq = tid / 9, P = tid % 9; sxp[qq * X4_SCS + ((gz_first + pass + 1) & 3) * 32 + P] = (unsigned short)(tsc[qq * 9 + P] | (P != 4 && P < 8 ? (unsigned)tsc[qq * 9 + P + 1] << 8 : 0u)); }
+        } else {
+        const int NXT = mxu ? CH : CH * np;
         for (int task0 = warp; task0 < NXT; task0 += 9 * U) {
             float4 V4[U][2]; float VS[U];
 #pragma unroll
             for (int u = 0; u < U; u++) {
             const int task = task0 + 9 * u;
-            int k = task / np, gz = gz_first + task % np, ci = ci0 + k;
+            int k = mxu ? task : task / np, gz = gz_first + (mxu ? pass : task % np), ci = ci0 + k;
             const bool ok = task < NXT && ci < Ci && gz >= 0 && gz < D;
             chan_t c = make_chan(ok ? ci : Ci, Ci, Cx, n, plane, x, sp, gp, N);
             const T *xc = ok && !IS_MX(T) ? (const T *)c.p + (size_t)gz * H * W : x;
@@ -3122,7 +3209,14 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             for (int i = 0; i < 2; i++) {
                 int f = lane + 32 * i, row = f >> 2, gyy = oy0 - 1 + row, gx = ox0 + 4 * (f & 3);
                 float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (ok && f < 40 && gyy >= 0 && gyy < H) {
+                if (mxu) {   /* from the decoded tile (zeros outside, gn+silu applied): 4 bf16 at 4 + 4 (f & 3) */
+                    if (ok && f < 40 && gyy >= 0 && gyy < H) {
+                        const uint2 u2 = *(const uint2 *)(xt + (k * 10 + row) * 24 + 4 + 4 * (f & 3));
+                        const float2 a = __bfloat1622float2(*(const __nv_bfloat162 *)&u2.x), b = __bfloat1622float2(*(const __nv_bfloat162 *)&u2.y);
+                        v.x = gx < W ? act_ab(a.x, c.a, c.b, G) : 0.f; v.y = gx + 1 < W ? act_ab(a.y, c.a, c.b, G) : 0.f;
+                        v.z = gx + 2 < W ? act_ab(b.x, c.a, c.b, G) : 0.f; v.w = gx + 3 < W ? act_ab(b.y, c.a, c.b, G) : 0.f;
+                    }
+                } else if (ok && f < 40 && gyy >= 0 && gyy < H) {
                     const T *src = xc + (size_t)gyy * W + gx;
                     if constexpr (IS_MX(T)) { if (gx < W) v = ldc4_mx<T>(c, cof(c, gz, gyy, gx, H, W), min(4, W - gx), vec); }
                     else if (vec) { if (gx < W) v = ldx4(src); }
@@ -3135,7 +3229,8 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             }
             {   /* halo: lane < 20 -> row lane >> 1, side lane & 1 (x = ox0 - 1 or ox0 + 16) */
                 int row = lane >> 1, gyy = oy0 - 1 + row, gx = (lane & 1) ? ox0 + 16 : ox0 - 1;
-                if (ok && lane < 20 && gyy >= 0 && gyy < H && gx >= 0 && gx < W) vs = act_ab(el ? ldc<T>(c, cof(c, gz, gyy, gx, H, W)) : ldx(xc, (size_t)gyy * W + gx), c.a, c.b, G);
+                if (mxu) { if (ok && lane < 20 && gyy >= 0 && gyy < H && gx >= 0 && gx < W) vs = act_ab(__bfloat162float(xt[(k * 10 + row) * 24 + ((lane & 1) ? 20 : 3)]), c.a, c.b, G); }
+                else if (ok && lane < 20 && gyy >= 0 && gyy < H && gx >= 0 && gx < W) vs = act_ab(el ? ldc<T>(c, cof(c, gz, gyy, gx, H, W)) : ldx(xc, (size_t)gyy * W + gx), c.a, c.b, G);
                 if ((LY == 0 || LY == 3) && lane < 20) ws[row * 18 + ((lane & 1) ? 17 : 0)] = vs;
             }
             }
@@ -3143,7 +3238,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             for (int u = 0; u < U; u++) {
             const int task = task0 + 9 * u;
             if (task >= NXT) break;
-            const int k = task / np, gz = gz_first + task % np, slot = (gz + 1) & 3, ci = ci0 + k;
+            const int k = mxu ? task : task / np, gz = gz_first + (mxu ? pass : task % np), slot = (gz + 1) & 3, ci = ci0 + k;
             const float4 *v4 = V4[u]; const float vs = VS[u];
             __syncwarp();
             uint8_t *dst = sxq + k * XCS + slot * XPS;
@@ -3302,6 +3397,8 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             }
             }
         }
+        }   /* LY 1 from the tile / tasks */
+        }   /* pass */
         /* GY: block (co, pb) = row pair pb of the z-step (rows 2 pb, 2 pb + 1; vz = pb >> 2), 4 lanes x 8 values: lane f holds
            block elements 8 f .. 8 f + 7 (row f >> 1, x 8 (f & 1) ..) = one e2m1 word; a warp task covers 8 blocks */
         for (int task = warp; task < BMo; task += 9) {
@@ -3466,10 +3563,11 @@ template <typename T, typename TG> static void bwd_w_f4_t(const void *x, shape5 
        granularity, one rounding per value); 0 = the 27 shifted blocks (always used with the Hadamard or x SR) */
     const int lay = (had & 4) ? 3 : (had & 3) ? 0 : lay_env;   /* had bit 2: the H16 variant (UFSM_F4_HAD_W=2) -> LY 3 */
     int MT = ys.c >= 32 ? 2 : 1;
-    int NT = xs.c <= 8 ? 1 : lay >= 2 && MT == 1 && xs.c % 24 == 0 ? 3 : 2;   /* NT 3 (as fp8 on dec0.c1) only fits 2 blocks / SM with the LY 2 tile */
+    int NT = xs.c <= 8 ? 1 : (lay == 2 || (lay == 3 && !IS_MX(T))) && MT == 1 && xs.c % 24 == 0 ? 3 : 2;   /* NT 3 (as fp8 on dec0.c1) only fits 2 blocks / SM with the LY 2 tile */
     if (nt_env > 0) NT = nt_env;
     if (mt_env > 0) MT = mt_env;
     size_t smem = (size_t)8 * NT * ((lay >= 2 ? 976 : X4_CS) + 2 * X4_SCS) + 16 * MT * (G4_CS + 8 + 4) + 9 * 32 + (lay == 0 || lay == 3 ? 9 * 180 * 4 : 0);
+    if (IS_MX(T)) smem += 32 + (size_t)8 * NT * (sizeof(chan_t) + (lay ? 240 * 2 : 0)) + (lay == 1 ? (size_t)8 * NT * (40 + 9) + 16 : 0);   /* channel table + bf16 decoded plane (+ LY 1 row amax, pair scales) */
     int nzt = nblk_(ys.d, 2), base = (int)(((xs.c + 8 * NT - 1) / (8 * NT)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * nblk_(ys.w, 16) * nblk_(ys.h, 8) * ys.n);
     int ZC = nzt < 12 ? nzt : 12;
     while (ZC > 1 && (size_t)base * nblk_(nzt, ZC) < 72) ZC--;
