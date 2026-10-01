@@ -30,7 +30,7 @@ def main():
         pdir = os.path.join(out, name)
         box = ",".join(str(v >> int(level)) for v in h)
         cmd = [B, "predict", ckpt, s["root"], s["ct"], pdir, "--um", str(s["um"]), "--level", level, "--box", box,
-               "--window", "288", "--halo", "16", "--shard", "256", "--gpu", gpu, "--levels", "1"]
+               "--window", "272", "--halo", "8", "--shard", "256", "--gpu", gpu, "--levels", "1"]
         if cache:
             cmd += ["--cache", cache]
         if os.environ.get("UFSM_PREDICT_ARGS"):   # e.g. "--prec 3" for fp4 inference; overrides the defaults above (ufsm takes the first occurrence of a flag)

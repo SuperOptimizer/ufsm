@@ -367,8 +367,11 @@ GPU at 128^3, tiled Muon / ANVIL matmuls (lead); (6) wider level-0 channels once
 
 ### Receptive field vs window (2026-10-01 evening)
 - Per-voxel inference rate is flat with window size, so a larger window buys only the halo fraction (288: 70%,
-  544: 83%, 800: 88%); 544 is the practical maximum (memory ~65 B/voxel with MX-fp8 storage, ~40 with fp4). Halo 8
-  vs 16 (+20% useful voxels) being scored on the MANBp box.
+  544: 83%, 800: 88%); 544 is the practical maximum (memory ~65 B/voxel with MX-fp8 storage, ~40 with fp4). The window
+  is stride + 2 halo, so a 512 stride (one shard) needs 544 at halo 16 or 528 at halo 8. Halo on the r8 model, MANBp
+  box, F1 at 0.5 / 0.7: 16 -> 0.2858 / 0.2277, 8 -> 0.2852 / 0.2294, 4 -> 0.2844 / 0.2261: halo 8 is free (inside
+  noise), so it is the predict default (interior 89% at 528, 84% at 272 vs 70% at 288/16: +20% useful voxels at no
+  cost). eval_holdouts uses 272/8.
 - The 4-level net's theoretical field is ~150 voxels at level 0; the user wants the field to match the window, so
   depth is the lever (width bought nothing today): 5 levels ~300, 6 levels ~600 (fits the 544 window and 256^3
   training patches) for < 5% more FLOPs. Yardstick arms queued: P64 control, P128, 5 levels (P64 and P128),

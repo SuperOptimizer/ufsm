@@ -94,7 +94,7 @@ int cmd_predict(int argc, char **argv) {
     }
     const char *ckpt = argv[2], *root = argv[3], *key = argv[4], *out = argv[5];
     double um = atof(opt(argc, argv, "--um", "0"));
-    int level = atoi(opt(argc, argv, "--level", "0")), W = atoi(opt(argc, argv, "--window", "288")), halo = atoi(opt(argc, argv, "--halo", "16"));
+    int level = atoi(opt(argc, argv, "--level", "0")), W = atoi(opt(argc, argv, "--window", "288")), halo = atoi(opt(argc, argv, "--halo", "8"));
     int shard = atoi(opt(argc, argv, "--shard", "512")), gpu = atoi(opt(argc, argv, "--gpu", "0")), nlev = atoi(opt(argc, argv, "--levels", "4"));
     int nthreads = atoi(opt(argc, argv, "--threads", "16"));
     float q = (float)atof(opt(argc, argv, "--q", "8"));
