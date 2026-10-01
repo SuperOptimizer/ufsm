@@ -90,3 +90,4 @@ z3 *pyramid_open_level(store *st, const char *group, int level, double um0, cons
 
 /* Rung of a voxel size: 0.6 * 2^k um -> k, rounded. */
 int rung_of_um(double um);
+void sources_open_all(sources *S, int nthreads);   /* eager parallel open of every level / target store */

@@ -108,7 +108,8 @@ struct sampler {
     atomic_uint soft_bits;   /* current soft-target sigma (float bits), set by sampler_set_soft */
     int64_t *slot_j;         /* deterministic mode: batch index held by each slot */
     int64_t next_claim, next_take;   /* deterministic mode: next batch index to fill / to hand out (under mu) */
-    atomic_uint_fast64_t prof_ns[16];   /* per-stage nanoseconds (env UFSM_SAMPLER_PROF): read, targets, dilate, soft, trust, encode, zscore, augment, x16, other */
+    atomic_uint_fast64_t prof_ns[16];
+    unsigned char (*lvl_ok)[2][MAXLEV];   /* per source: cached level availability (0 unknown, 1 no, 2 yes) */   /* per-stage nanoseconds (env UFSM_SAMPLER_PROF): read, targets, dilate, soft, trust, encode, zscore, augment, x16, other */
     int prof;
     double *cum;   /* cumulative source weights */
     struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } *occ;   /* per source: coarse label cells containing papyrus (guides the position draw) */
@@ -134,20 +135,34 @@ static void free_batch(batch *b) { if (b->x) nn_host_free(b->x); if (b->x16) nn_
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
+/* which levels a source can serve (CT and at least one target open): computed once per (source, region channel) since
+   source_ct / source_tgt take the global open lock and may open remote stores; before this every draw re-checked every level */
+static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
+    int key = region_ch >= 0 ? 1 : 0;
+    unsigned char *cache = sp->lvl_ok[si][key];
+    if (cache[l] == 0) {   /* 0 unknown, 1 no, 2 yes */
+        int ok = source_ct(s, l) != nullptr;
+        if (ok) {
+            int any = 0;
+            for (int c = 0; c < NCH; c++) {
+                if (c == region_ch) { any = 1; continue; }
+                if (s->tgt_key[c] && source_tgt(s, c, l)) any = 1;
+            }
+            ok = any;
+        }
+        cache[l] = ok ? 2 : 1;
+    }
+    return cache[l] == 2;
+}
 static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
     double p[MAXLEV], tot = 0;
+    int si = (int)(s - sp->S->src);
     for (int l = 0; l < MAXLEV; l++) {
         p[l] = sp->cfg.level_p[l];
         if (p[l] <= 0) continue;
         if (region_ch >= 0 && l > 1) { p[l] = 0; continue; }
         if (l < s->min_level) { p[l] = 0; continue; }
-        if (!source_ct(s, l)) { p[l] = 0; continue; }
-        int any = 0;
-        for (int c = 0; c < NCH; c++) {
-            if (c == region_ch) { any = 1; continue; }
-            if (s->tgt_key[c] && source_tgt(s, c, l)) any = 1;
-        }
-        if (!any) p[l] = 0;
+        if (!level_ok(sp, s, si, l, region_ch)) { p[l] = 0; continue; }
         tot += p[l];
     }
     if (tot <= 0) return -1;
@@ -608,6 +623,8 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sp->cfg = *cfg;
     { unsigned sb; memcpy(&sb, &cfg->soft, 4); atomic_store(&sp->soft_bits, sb); }
     sp->prof = getenv("UFSM_SAMPLER_PROF") != nullptr;
+    sp->lvl_ok = calloc((size_t)S->n, sizeof *sp->lvl_ok);
+    sources_open_all(S, 32);   /* every (source, level, channel) store opened up front in parallel: lazily they serialise on one lock (254 opens, 17 s) */
     sp->nslots = cfg->nbuf;
     sp->slot_j = calloc((size_t)sp->nslots, sizeof *sp->slot_j);
     sp->slots = calloc((size_t)sp->nslots, sizeof *sp->slots);

@@ -2,6 +2,8 @@
 #include "json.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -179,23 +181,48 @@ z3 *pyramid_open_level(store *st, const char *group, int level, double um0, cons
     snprintf(k, sizeof k, "%s/%d", group, level);   /* plain integer level names */
     return z3_open(st, k, cache);
 }
-static z3 *open_level(store *st, const char *group, int level, double um0) { return pyramid_open_level(st, group, level, um0, g_cache); }
+static z3 *open_level(store *st, const char *group, int level, double um0) {
+    static atomic_uint n_open; unsigned k = atomic_fetch_add(&n_open, 1);
+    double t0 = 0; if (getenv("UFSM_OPEN_TRACE")) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); t0 = t.tv_sec + t.tv_nsec * 1e-9; }
+    z3 *z = pyramid_open_level(st, group, level, um0, g_cache);
+    if (t0) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); fprintf(stderr, "open #%u %s level %d: %s in %.0f ms\n", k, group, level, z ? "ok" : "FAILED", (t.tv_sec + t.tv_nsec * 1e-9 - t0) * 1e3); }
+    return z;
+}
 /* the lazy opens below are called from every sampler worker: one lock (opens are rare, reads never take it).
    Without it two workers racing on the same level both opened it, one handle leaked, and a failed open under the race
    marked the level absent for the whole run (seen as workers spinning forever on draws with no usable level). */
 static pthread_mutex_t g_open_mu = PTHREAD_MUTEX_INITIALIZER;
 static void open_failed(const source *s, const char *what, int level) { if (getenv("UFSM_DEBUG")) fprintf(stderr, "source %s: %s level %d not available: %s\n", s->name, what, level, z3_error()); }
 
+/* eager parallel open of every level and target of every source (each remote open is a metadata fetch of 70-500 ms; done
+   lazily from the sampler workers they serialise on g_open_mu). The lazy path stays as the fallback. */
+typedef struct { sources *S; int from, to; } oa_arg;
+static void *oa_worker(void *p) {
+    oa_arg *a = p;
+    for (int k = a->from; k < a->to; k++) {
+        int si = k / (MAXLEV * (NCH + 1)), rem = k % (MAXLEV * (NCH + 1)), l = rem / (NCH + 1), c = rem % (NCH + 1);
+        source *s = &a->S->src[si];
+        if (c == NCH) source_ct(s, l); else if (s->tgt_key[c]) source_tgt(s, c, l);
+    }
+    return nullptr;
+}
+void sources_open_all(sources *S, int nthreads) {
+    int total = S->n * MAXLEV * (NCH + 1); if (nthreads > total) nthreads = total; if (nthreads < 1) nthreads = 1;
+    pthread_t *th = malloc(nthreads * sizeof *th); oa_arg *args = malloc(nthreads * sizeof *args);
+    for (int t = 0; t < nthreads; t++) { args[t] = (oa_arg){S, total * t / nthreads, total * (t + 1) / nthreads}; pthread_create(&th[t], nullptr, oa_worker, &args[t]); }
+    for (int t = 0; t < nthreads; t++) pthread_join(th[t], nullptr);
+    free(th); free(args);
+}
+/* the open (a remote metadata fetch) runs outside the lock; the lock only publishes the pointer. A racing duplicate open is
+   closed. ct_present is cleared on failure so a missing level is not retried per draw. */
 z3 *source_ct(source *s, int level) {
     if (level < 0 || level >= MAXLEV || s->ct_present[level] == 0) return nullptr;
     if (!s->ct[level]) {
+        z3 *z = open_level(s->s, s->ct_key, level, s->um);
         pthread_mutex_lock(&g_open_mu);
-        if (!s->ct[level] && s->ct_present[level]) {
-            s->ct[level] = open_level(s->s, s->ct_key, level, s->um);
-            s->ct_present[level] = s->ct[level] != nullptr;
-            if (!s->ct[level]) open_failed(s, "ct", level);
-        }
+        if (!s->ct[level]) { s->ct[level] = z; z = nullptr; if (!s->ct[level]) { s->ct_present[level] = 0; open_failed(s, "ct", level); } }
         pthread_mutex_unlock(&g_open_mu);
+        if (z) z3_close(z);
     }
     return s->ct[level];
 }
@@ -203,13 +230,11 @@ z3 *source_ct(source *s, int level) {
 z3 *source_tgt(source *s, int ch, int level) {
     if (!s->tgt_key[ch] || level < 0 || level >= MAXLEV || s->tgt_present[ch][level] == 0) return nullptr;
     if (!s->tgt[ch][level]) {
+        z3 *z = open_level(s->tgt_store[ch] ? s->tgt_store[ch] : s->s, s->tgt_key[ch], level, s->um);
         pthread_mutex_lock(&g_open_mu);
-        if (!s->tgt[ch][level] && s->tgt_present[ch][level]) {
-            s->tgt[ch][level] = open_level(s->tgt_store[ch] ? s->tgt_store[ch] : s->s, s->tgt_key[ch], level, s->um);
-            s->tgt_present[ch][level] = s->tgt[ch][level] != nullptr;
-            if (!s->tgt[ch][level]) open_failed(s, "target", level);
-        }
+        if (!s->tgt[ch][level]) { s->tgt[ch][level] = z; z = nullptr; if (!s->tgt[ch][level]) { s->tgt_present[ch][level] = 0; open_failed(s, "target", level); } }
         pthread_mutex_unlock(&g_open_mu);
+        if (z) z3_close(z);
     }
     return s->tgt[ch][level];
 }
