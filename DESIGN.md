@@ -306,13 +306,21 @@ Where the rest would come from:
 ### Performance program toward the hardware ceiling (goal set 2026-10-01 afternoon)
 Roofline per level-0 voxel from the layer shapes: forward 139 kFLOP (enc0 3.5k + 13.8k, dec0 41.5k + 13.8k, head
 0.06k, down0 3.5k; level 1 /8: 43k; level 2 /64: 18k; level 3 /512: 0.6k), training ~417 kFLOP. 96^3 B2 = 1.77M
-voxels: training 738 GFLOP in 33.8 ms = 22 TFLOP/s, inference 246 GFLOP in 9.6 ms = 26 TFLOP/s, against ~95 TFLOP/s
-dense fp16 on the RTX 5060 Ti (fp8 ~190, fp4 ~380): 4.3x / 3.7x headroom. Memory traffic (~300 B per voxel per
-inference, ~530 MB) is 1.2 ms at 448 GB/s, so bandwidth is not the floor; the small-channel convs (16 / 32 outputs:
-2-4 MMA n-tiles per block) are issue-bound on staging and fragment loads. Target: 50% of peak, ~2x on both.
-Plan: (1) per-op profile at fp16 / fp8 / fp4 (agent); (2) conv kernels for small channel counts: larger output tiles
-per block, operands kept in registers across taps, fused conv1 + GroupNorm + conv2 per block with the intermediate
-in shared memory (agent); (3) fp8 activation storage with down_norm and as an inference-only mode (agent);
+voxels: training 738 GFLOP in 33.8 ms = 22 TFLOP/s, inference 246 GFLOP in 9.6 ms = 26 TFLOP/s. CORRECTION from
+the agent's per-conv profile (tests/prof_infer): on this GeForce card the fp16 MMA with fp32 accumulation peaks at
+54 TFLOP/s (108 measured with fp16 accumulation, prec 4; fp8 ~215), so the 16-bit convs with >= 32 channels already
+run at 80-95% of their ceiling and the level-0 16-channel ones at ~75%; the gap to "2x" is NOT in the 16-bit path.
+Floors for inference at 96^3 B2: MMA 4.3 ms (16-bit, fp32 acc), 1.1 ms fp8, 0.54 ms fp4; memory 1.9 ms (16-bit
+storage), 1.0 ms MX. Realistic ceilings: ~6 ms 16-bit (4.5 with prec 4), ~3 ms fp8 + MX (3.2x over today's 9.6).
+Measured today on an idle GPU: 9.6 ms fp16, 6.4 ms MX storage. Decision (user: "just as fast as possible"): MX
+activation storage is the inference default (`predict --act-mx8 1`, free in accuracy: r8 0.2670 vs 0.2669); training
+moves to all-fp8 compute + stochastic rounding (+0.011 F1 vs fp16 in paired 6000-step runs) with fp16 accumulation
+where anything stays 16-bit, behind a paired-run accuracy guard (within 0.005 F1) and the long paired run.
+Plan: (1) per-op profile (agent, done: fp8 on 16-channel convs is padding/staging-bound, Ci = 16 pads to the fp8
+K = 32; enc0.c1 pads Ci = 4 to 16; stride-2 convs latency-bound at 4-10 TFLOP/s; head and GN small); (2) agent's
+kernel changes in payoff order: dec0.c1 on the MX path without the transient (-14% at 96^3), K-packing of two taps
+per k for 16-channel fp8 / MX convs (-12%), stride-2 kernels (-0.4 ms), then the fused block kernel (~-0.5 ms);
+(3) fp8 activation storage with down_norm and inference-only mode (agent, done: 67dcaa4);
 (4) inference pipeline: writer-thread overlap, window-size sweep for L2 residency (lead); (5) training: batch 2 per
 GPU at 128^3, tiled Muon / ANVIL matmuls (lead); (6) wider level-0 channels once the kernels are efficient.
 

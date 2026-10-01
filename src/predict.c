@@ -98,7 +98,7 @@ int cmd_predict(int argc, char **argv) {
     const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
     nn_set_prec(atoi(opt(argc, argv, "--prec", "1")));
     if (nn_set_prec_policy(opt(argc, argv, "--policy", ""))) return 2;
-    if (atoi(opt(argc, argv, "--act-mx8", "0"))) unet_set_act_mx8(1);   /* MX-fp8 activation storage for this (inference-only) process */
+    if (atoi(opt(argc, argv, "--act-mx8", "1"))) unet_set_act_mx8(1);   /* default on: free in accuracy (r5 0.197 vs 0.192, r8 0.2670 vs 0.2669), 1.3-1.5x faster */   /* MX-fp8 activation storage for this (inference-only) process */
     if (um <= 0) { fprintf(stderr, "--um required\n"); return 2; }
     if (nn_init(gpu)) { fprintf(stderr, "cannot select GPU %d\n", gpu); return 1; }
     unet_cfg cfg; int step;
