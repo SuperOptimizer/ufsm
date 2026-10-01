@@ -36,7 +36,11 @@ static unsigned sr_seed(void) {
 }
 extern "C" void nn_set_sr(int on) { g_sr = on; }
 
-extern "C" void nn_set_sr_step(unsigned step) { g_sr_step = step; g_sr_ctr = 0; }
+extern "C" void lp_wmemo_step(unsigned step); extern "C" void lp_wmemo_clear(void);   /* nn_lp.h (included below) */
+extern "C" void nn_set_sr_step(unsigned step) { g_sr_step = step; g_sr_ctr = 0; lp_wmemo_step(step); }
+extern "C" void nn_wmemo_clear(void) { lp_wmemo_clear(); }
+/* id of the current conv call for the fp4 prepared-weight memo (0 outside a layer context) */
+static unsigned conv_wkey(void) { return g_layer >= 0 ? (unsigned)((g_layer * 2 + (g_sub > 0 ? g_sub : 0)) * 4 + g_pass + 1) : 0u; }
 static signed char g_lprec3[NN_MAXLAYER][2][3];
 extern "C" void nn_set_conv(int sub) { g_sub = sub; }
 extern "C" int nn_get_layer(void) { return g_layer; }
@@ -1184,14 +1188,19 @@ plain:
 /* xbf / ybf: input / output tensors are 16-bit (bf16, or fp16 with nn_set_f16) instead of float.
    ts != nullptr: parity-decomposed stride-2 backward-data (x = gy on its own grid, output scattered into gx) */
 static int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts = nullptr) {
-    if (!ts && (ISMX(x) || ISMX(y))) {   /* MX-fp8 activation storage: fp8 compute, staged by copy */
-        if (!ISMX(x) || !ISMX(y) || (sp.x2 && !ISMX(sp.x2)) || (sp.y2 && !ISMX(sp.y2))) { fprintf(stderr, "conv: MX-fp8 storage needs MX inputs and outputs\n"); abort(); }
-        return lp_conv_fwd_f8(x, 3, xs, w, b, cout, y, 3, gp, osum, Go, sp);
-    }
     const int pr = eff_prec();
+    if (!ts && (ISMX(x) || ISMX(y))) {   /* MX activation storage (fp8 or fp4): staged from the stored rows; fp4 storage or a
+                                            prec-3 policy runs the fp4 kernel, else fp8 compute (copy staging) */
+        const int mdt = MXDT(x);
+        if (mdt == 4 && !ISMX(y) && !sp.y2 && !ybf) { sp.wkey = conv_wkey(); return lp_conv_fwd_f4(x, 4, xs, w, b, cout, y, 0, gp, osum, Go, sp); }   /* mx4 in, fp32 out (tests) */
+        if (!mdt || MXDT(y) != mdt || (sp.x2 && MXDT(sp.x2) != mdt) || (sp.y2 && MXDT(sp.y2) != mdt)) { fprintf(stderr, "conv: MX storage needs MX inputs and outputs of one format\n"); abort(); }
+        sp.wkey = conv_wkey();
+        if (mdt == 4 || (pr == 3 && !sp.up)) return lp_conv_fwd_f4(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
+        return lp_conv_fwd_f8(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
+    }
     if (!ts && pr == 2 && !sp.up && g_pass == 1) { if (sr_on()) sp.sr = sr_seed(); }   /* backward-data: gy is the staged operand */
     if (!ts && pr == 2 && !sp.up) return lp_conv_fwd_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp);   /* sp.up: 16-bit kernels only */
-    if (!ts && pr == 3 && !sp.up) return lp_conv_fwd_f4(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp);
+    if (!ts && pr == 3 && !sp.up) { sp.wkey = conv_wkey(); return lp_conv_fwd_f4(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp); }
     if (pr == 4) return g_h16 ? conv_fwd_tc_f16acc<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : conv_fwd_tc_f16acc<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts);
     return g_h16 ? conv_fwd_tc_h<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : conv_fwd_tc_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts);
 }

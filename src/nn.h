@@ -44,6 +44,7 @@ void nn_set_tf32(int on);
 void nn_set_prec(int p);
 void nn_set_sr(int on);              /* stochastic rounding of the fp8 gradient operands: backward-data input, weight-gradient gy (env UFSM_SR=1) */
 void nn_set_sr_step(unsigned step);  /* reseed per training step (deterministic per step) */
+void nn_wmemo_clear(void);   /* the fp4 kernels memoise prepared weights per conv and step: call after a weight change outside a training step (checkpoint load, EMA swap) */
 int nn_get_prec(void);
 /* per-layer precision: the network tags each conv with a layer id (unet order: enc0..3 = 0..3, down0..2 = 4..6, dec2, dec1,
    dec0 = 7..9, head = 10); a layer precision >= 1 overrides the global one. Policy strings: "enc0=1,dec0=1" or positional. */

@@ -12,12 +12,15 @@ typedef struct { const float *gamma, *beta, *mean, *rstd; int G; } gnp_t;   /* G
    (align_corners = false, edge clamp: the same values as nn_up2_fwd_into), so the decoder input is never materialised */
 /* sr != 0: stochastic rounding (seed) of this conv's gradient operand when quantised to fp8 (the input of a backward-data
    conv, the gy of a weight gradient); 0 = round to nearest */
-typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; } split_t;
+/* wkey != 0: id of this conv (layer / conv / pass) for the prepared-weight memo of the fp4 kernel (see lp_wmemo_*) */
+typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; unsigned wkey; } split_t;
 /* k=3 stride 1 forward / weight gradient with the same semantics as the BF16 tensor-core paths in nn.cu
    (conv_fwd_tc / launch_bwd_w_tc): xbf / ybf = activation (and x2 / y2) storage type, 0 fp32, 1 bf16, 2 fp16; the
    forward needs xbf == ybf. Weights, biases and GroupNorm parameters are fp32; the weight gradient accepts fp32 or (with xbf) bf16 gy. */
 int lp_conv_fwd_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp);
 int lp_conv_fwd_f4(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp);
+void lp_wmemo_step(unsigned step);   /* fp4 prepared-weight memo: new training step (weights changed) */
+void lp_wmemo_clear(void);           /* weights changed outside a step (checkpoint load, EMA swap) */
 int lp_bwd_w_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp);   /* gybf: gy is bf16 (needs xbf) */
 int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp);   /* stride 2; gp: input gn+silu */
 int lp_bwd_w_s2_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp);   /* stride 2, gw / gb accumulated */

@@ -51,12 +51,24 @@ static void host_mx4(const float *x, shape5 s, float *y) {
         for (int k = 0; k < bw; k++) { int c = b * bw + k; if (c >= s.c) continue; size_t i = ((size_t)n * s.c + c) * S + v; float a = fabsf(x[i]) * ldexpf(1.f, -e); y[i] = copysignf(e2m1_rne(a) * ldexpf(1.f, e), x[i]); }
     }
 }
+/* host reference of prep_w4_k: w[co][ci][27] snapped to the e2m1 grid with one ue8m0 per (tap, co, 32 ci); a kernel that
+   requantises the snapped weights is lossless, so the fp4 kernel on exactly representable inputs must match fp32 */
+static void host_w4(float *w, int Co, int Ci) {
+    for (int t = 0; t < 27; t++) for (int co = 0; co < Co; co++) for (int c0 = 0; c0 < Ci; c0 += 32) {
+        float am = 0.f;
+        for (int ci = c0; ci < c0 + 32 && ci < Ci; ci++) am = fmaxf(am, fabsf(w[((size_t)co * Ci + ci) * 27 + t]));
+        int e; if (am == 0.f) e = -126; else { e = (int)ceilf(log2f(am / 6.f)); float tt = ldexpf(am, -e); if (tt > 6.f) e++; if (e < -126) e = -126; if (e > 126) e = 126; }
+        for (int ci = c0; ci < c0 + 32 && ci < Ci; ci++) { size_t i = ((size_t)co * Ci + ci) * 27 + t; w[i] = copysignf(e2m1_rne(fabsf(w[i]) * ldexpf(1.f, -e)) * ldexpf(1.f, e), w[i]); }
+    }
+}
 static void mode_ref(void) { nn_set_tf32(0); }
 static void mode_mx(void) { nn_set_prec(3); }
 int main(void) {
     nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0);
     nn_set_act_bf16(0); nn_set_grad_bf16(0);   /* non-MX operands are fp32 */
-    const double TOL4 = 0.2, TOL = 0.08;
+    /* TOL4: fp4 compute with mx4 storage = three e2m1 quantisations (input, weights, output; ~0.13 each on these inputs ->
+       ~0.2 combined); the exact tests below separate kernel correctness from this format error. */
+    const double TOL4 = 0.25, TOL = 0.08;
     const int N = 2, G = 8;
     {   /* e2m1 storage round trip of post-GN-SiLU-like data (|x| up to ~4): quantisation error of the format alone */
         shape5 s = {N, 32, 8, 8, 8}, s16 = {N, 16, 8, 8, 8};
@@ -111,6 +123,107 @@ int main(void) {
         check("NaN in a block: that voxel's block decodes non-finite", nonfin == 32 && !isfinite(hd[5 * 8]));
         check("NaN in a block: other voxels == host quantiser", other_ok);
         free(h); free(hd); free(ref);
+    }
+    {   /* fp4 conv forward on mx4 I/O: GN+SiLU input (32 ch, D = 16 -> TZ 4), output GN statistics from the unquantised accumulators */
+        shape5 xs = {N, 32, 16, 12, 16}, ys = xs;
+        size_t nx = shape_numel(xs), ny = shape_numel(ys), NG = (size_t)N * G;
+        float *x = dev_rand(nx, 2.f), *w = dev_rand((size_t)32 * 32 * 27, 0.1f), *b = dev_rand(32, 0.1f);
+        float *gam = dev_rand(32, 1.f), *bet = dev_rand(32, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+        void *xm = mx4_from(x, xs); float *xd = deq4(xm, xs);
+        float *yr = dev_zero(ny), *m1 = dev_zero(NG), *r1 = dev_zero(NG), *m2 = dev_zero(NG), *r2 = dev_zero(NG);
+        void *ym = mx4_new(ys);
+        mode_ref(); { float *t = dev_zero(nx); nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, t); nn_conv3d_fwd(t, xs, w, b, 32, 3, 1, yr); nn_gn_fwd(yr, ys, G, 1e-5f, nullptr, nullptr, nullptr, m1, r1); }
+        mode_mx(); nn_conv3d_fwd_gn_stats(xm, xs, G, gam, bet, mean, rstd, w, b, 32, (float *)ym, G, 1e-5f, m2, r2);
+        cmp("fp4 conv fwd gn+silu input (mx4 in/out, TZ 4)", deq4(ym, ys), yr, ny, TOL4);
+        cmp("fp4 conv fwd output GN mean", m2, m1, NG, TOL4);
+        cmp("fp4 conv fwd output GN rstd", r2, r1, NG, TOL4);
+        /* exact check: mx4 input (copy staging, no requantisation), weights on the e2m1 grid (host snap), fp32 output: the
+           kernel's only rounding is the fp32 accumulation order */
+        {
+            float *hw = malloc((size_t)32 * 32 * 27 * 4); nn_d2h(hw, w, (size_t)32 * 32 * 27 * 4); host_w4(hw, 32, 32);
+            float *wq = nn_malloc((size_t)32 * 32 * 27 * 4); nn_h2d(wq, hw, (size_t)32 * 32 * 27 * 4); free(hw);
+            float *yx = dev_zero(ny), *y4 = dev_zero(ny);
+            mode_ref(); nn_conv3d_fwd(xd, xs, wq, b, 32, 3, 1, yx);
+            mode_mx(); nn_conv3d_fwd(xm, xs, wq, b, 32, 3, 1, y4);
+            cmp("fp4 conv fwd exact (mx4 in, grid weights, fp32 out)", y4, yx, ny, 2e-3);
+            shape5 xo = {N, 32, 16, 12, 16}; shape5 yo = xo; yo.c = 64;   /* MT 4 / TZ 2 tile */
+            float *w64 = dev_rand((size_t)64 * 32 * 27, 0.1f); hw = malloc((size_t)64 * 32 * 27 * 4); nn_d2h(hw, w64, (size_t)64 * 32 * 27 * 4); host_w4(hw, 64, 32); nn_h2d(w64, hw, (size_t)64 * 32 * 27 * 4); free(hw);
+            float *yx2 = dev_zero(shape_numel(yo)), *y42 = dev_zero(shape_numel(yo));
+            mode_ref(); nn_conv3d_fwd(xd, xo, w64, nullptr, 64, 3, 1, yx2);
+            mode_mx(); nn_conv3d_fwd(xm, xo, w64, nullptr, 64, 3, 1, y42);
+            cmp("fp4 conv fwd exact, 64 out (MT 4)", y42, yx2, shape_numel(yo), 2e-3);
+        }
+        /* untransformed mx4 input (copy staging) */
+        float *yr2 = dev_zero(ny); void *ym2 = mx4_new(ys);
+        mode_ref(); nn_conv3d_fwd(xd, xs, w, b, 32, 3, 1, yr2);
+        mode_mx(); nn_conv3d_fwd(xm, xs, w, b, 32, 3, 1, ym2);
+        cmp("fp4 conv fwd plain mx4 input (copy staging)", deq4(ym2, ys), yr2, ny, TOL4);
+        /* the same on mx8 storage under prec 3 (the former dt-3 misroute): fp4 kernel with mx8 I/O */
+        void *x8 = mx8_from(x, xs); float *x8d = deq8(x8, xs); float *yr3 = dev_zero(ny); void *y8 = mx8_new(ys);
+        mode_ref(); { float *t = dev_zero(nx); nn_gn_silu_apply(x8d, xs, G, gam, bet, mean, rstd, t); nn_conv3d_fwd(t, xs, w, b, 32, 3, 1, yr3); }
+        nn_gn_t gx = {gam, bet, mean, rstd, G};
+        mode_mx(); nn_conv3d_fwd_x(x8, &gx, nullptr, nullptr, 0, 0, xs, w, b, 32, 3, 1, (float *)y8, 0, 1e-5f, nullptr, nullptr);
+        cmp("fp4 conv fwd gn+silu input (mx8 in/out, prec 3)", deq8(y8, ys), yr3, ny, TOL4);
+        /* memo: same conv id, weights changed in place without a step -> stale until nn_wmemo_clear */
+        float *w2 = dev_rand((size_t)32 * 32 * 27, 0.1f), *yr4 = dev_zero(ny); void *ym4 = mx4_new(ys);
+        nn_set_layer(1); nn_set_conv(0);
+        mode_mx(); nn_conv3d_fwd(xm, xs, w, b, 32, 3, 1, ym4);
+        nn_d2d(w, w2, (size_t)32 * 32 * 27 * 4);
+        nn_conv3d_fwd(xm, xs, w, b, 32, 3, 1, ym4);
+        double stale = cmp("fp4 weight memo: stale after in-place change (info)", deq4(ym4, ys), deq4(ym2, ys), ny, 1e9);
+        nn_wmemo_clear(); nn_conv3d_fwd(xm, xs, w, b, 32, 3, 1, ym4);
+        mode_ref(); nn_conv3d_fwd(xd, xs, w, b, 32, 3, 1, yr4);
+        check("fp4 weight memo: hit while unchanged", stale < 1e-6);
+        cmp("fp4 weight memo: refreshed by nn_wmemo_clear", deq4(ym4, ys), yr4, ny, TOL4);
+        nn_set_layer(-1);
+    }
+    {   /* 16-channel mx4 input: the fp8 kernel with nibble staging and an mx4 output (gn+silu input, bw 16 rows) */
+        shape5 xs = {N, 16, 12, 12, 16}, ys = xs; ys.c = 32;
+        size_t nx = shape_numel(xs), ny = shape_numel(ys), NG = (size_t)N * G;
+        float *x = dev_rand(nx, 2.f), *w = dev_rand((size_t)32 * 16 * 27, 0.1f), *b = dev_rand(32, 0.1f);
+        float *gam = dev_rand(16, 1.f), *bet = dev_rand(16, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+        void *xm = mx4_from(x, xs); float *xd = deq4(xm, xs);
+        float *yr = dev_zero(ny); void *ym = mx4_new(ys);
+        mode_ref(); { float *t = dev_zero(nx); nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, t); nn_conv3d_fwd(t, xs, w, b, 32, 3, 1, yr); }
+        nn_gn_t gx = {gam, bet, mean, rstd, G};
+        mode_mx(); nn_conv3d_fwd_x(xm, &gx, nullptr, nullptr, 0, 0, xs, w, b, 32, 3, 1, (float *)ym, 0, 1e-5f, nullptr, nullptr);
+        cmp("fp8 conv fwd 16-ch mx4 input, mx4 output", deq4(ym, ys), yr, ny, TOL4);   /* fp8 compute + one mx4 output quantisation */
+        /* split forward: x (32 ch) + x2 (16 ch) -> 16 ch, fp4 kernel */
+        shape5 cs = xs; cs.c = 48; shape5 c1 = xs; c1.c = 32; shape5 o16 = xs; o16.c = 16;
+        float *xa = dev_rand(shape_numel(c1), 1.f); void *xam = mx4_from(xa, c1); float *xad = deq4(xam, c1);
+        float *w48 = dev_rand((size_t)16 * 48 * 27, 0.1f), *cat = dev_zero(shape_numel(cs)), *ysr = dev_zero(shape_numel(o16));
+        void *ysm = mx4_new(o16);
+        mode_ref(); nn_concat_fwd(xad, 32, xd, 16, cs, cat); nn_conv3d_fwd(cat, cs, w48, nullptr, 16, 3, 1, ysr);
+        mode_mx(); nn_conv3d_fwd_split(xam, xm, 32, cs, 0, nullptr, nullptr, nullptr, nullptr, w48, nullptr, 16, (float *)ysm, 0, 1e-5f, nullptr, nullptr);
+        cmp("fp4 conv fwd split input (32 + 16, mx4)", deq4(ysm, o16), ysr, shape_numel(o16), TOL4);
+        /* split with gn+silu on both segments (the decoder's dec0.c1 without the fused upsample) */
+        float *gam2 = dev_rand(32, 1.f), *bet2 = dev_rand(32, 0.5f), *mean2 = dev_rand(NG, 0.2f), *rstd2 = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd2, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd2, h, NG * 4); }
+        float *ysr2 = dev_zero(shape_numel(o16)); void *ysm2 = mx4_new(o16);
+        mode_ref(); { float *ta = dev_zero(shape_numel(c1)), *tb = dev_zero(nx); nn_gn_silu_apply(xad, c1, G, gam2, bet2, mean2, rstd2, ta); nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, tb); nn_concat_fwd(ta, 32, tb, 16, cs, cat); nn_conv3d_fwd(cat, cs, w48, nullptr, 16, 3, 1, ysr2); }
+        nn_gn_t ga = {gam2, bet2, mean2, rstd2, G}, gb = {gam, bet, mean, rstd, G};
+        mode_mx(); nn_conv3d_fwd_x(xam, &ga, xm, &gb, 32, 0, cs, w48, nullptr, 16, 3, 1, (float *)ysm2, 0, 1e-5f, nullptr, nullptr);
+        cmp("fp4 conv fwd split input, gn+silu both (mx4)", deq4(ysm2, o16), ysr2, shape_numel(o16), TOL4);
+    }
+    {   /* split with a segment that is not a multiple of 32 channels (dec2: 80 + 64 -> 64), mx4 */
+        shape5 cs = {N, 144, 8, 8, 12}, c1 = cs, c2 = cs, ys = cs; c1.c = 80; c2.c = 64; ys.c = 64;
+        float *xa = dev_rand(shape_numel(c1), 1.f), *xb = dev_rand(shape_numel(c2), 1.f);
+        void *xam = mx4_from(xa, c1), *xbm = mx4_from(xb, c2); float *xad = deq4(xam, c1), *xbd = deq4(xbm, c2);
+        float *w = dev_rand((size_t)64 * 144 * 27, 0.05f), *cat = dev_zero(shape_numel(cs)), *yr = dev_zero(shape_numel(ys));
+        void *ym = mx4_new(ys);
+        mode_ref(); nn_concat_fwd(xad, 80, xbd, 64, cs, cat); nn_conv3d_fwd(cat, cs, w, NULL, 64, 3, 1, yr);
+        mode_mx(); nn_conv3d_fwd_split(xam, xbm, 80, cs, 0, NULL, NULL, NULL, NULL, w, NULL, 64, (float *)ym, 0, 1e-5f, NULL, NULL);
+        cmp("fp4 conv fwd split 80 + 64 (mx4)", deq4(ym, ys), yr, shape_numel(ys), TOL4);
+    }
+    {   /* fp32 I/O through the fp4 kernel (the direct entry), D = 16 -> TZ 4 */
+        shape5 xs = {N, 32, 16, 12, 16}, ys = xs; ys.c = 64;
+        size_t nx = shape_numel(xs), ny = shape_numel(ys);
+        float *x = dev_rand(nx, 1.f), *w = dev_rand((size_t)64 * 32 * 27, 0.1f), *b = dev_rand(64, 0.1f), *yr = dev_zero(ny), *y4 = dev_zero(ny);
+        mode_ref(); nn_conv3d_fwd(x, xs, w, b, 64, 3, 1, yr);
+        nn_conv3d_fwd_fp4(x, xs, w, b, 64, y4);
+        cmp("fp4 conv fwd fp32 I/O (TZ 4, MT 4 -> TZ 2)", y4, yr, ny, TOL4);
     }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
