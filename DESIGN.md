@@ -388,6 +388,14 @@ trained with mx4 do not need that). Speed at 96^3 B2 (agent, quiet GPU): inferen
 ms, memory 0.228 / 0.205 / 0.111 GB; training 32.8 / 33.3 / 33.6 ms (the 16-channel fp8-path convs and the MX GN
 backward are the regressions being fixed), memory 0.540 / 0.458 / 0.363 GB.
 
+### Whole-box scanning throughput (2026-10-01 evening, master 3a8ddc9, both GPUs idle)
+`predict --gpus 0,1 --halo 8`, MANBp level-1 box 2048^3 at (3000, 2000, 2000), r8 model: fp16 window 272 19.5 s
+(441 Mvoxel/s useful), mx8 272 13.5 s (637), mx8 528 14.3 s (599), mx4 528 13.7 s (626). The 528 window does not
+pay here: tiles are 8x larger, so fewer of them are pure air (40 of 64 run vs 244 of 512 at 272), which cancels the
+better interior fraction; on a compact mask like Paris 4 (27% vs 28% non-empty at 128 vs 512) it would. fp4 storage
+is not faster end to end yet (the 16-channel fp4 kernel is step 5b). At 637 Mvoxel/s Paris 4's ~15.3 Tvoxel of
+occupied tiles take ~6.7 h.
+
 ### GroupNorm backward (2026-10-01 evening)
 Timeline of a fp16 training step (nsys): conv forward/backward-data 47%, conv weight gradient 29%, GroupNorm backward
 17%, the rest 7%. tests/bench_gn vs a device copy of the same bytes: level 0 (96^3 x 16) and level 1 (48^3 x 32) run
