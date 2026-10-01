@@ -439,6 +439,11 @@ Scanning window (same trained model, only the inference window changes; MANBp bo
 model trained at 64^3: window 96 0.306, 160 0.306, 272 0.301; model trained at 128^3 (5 levels): 96 0.269, 160 0.273,
 272 0.274. The GroupNorm-over-the-tile mismatch costs at most 0.005 and leans toward the training size; the scanning
 window is a speed choice, not an accuracy choice. 528^3 needs MX storage (out of memory at fp16).
+With 528/544 working (3a8ddc9, the old abort was a silent out-of-memory on the dec0.c1 upsample transient), r8 model,
+standard scoring: peak F1 272/mx8 0.285 (best cutoff 0.6), 528/mx8 0.289 (0.5), 544/mx8 0.286 (0.5), 528/mx4 0.286
+(0.4). Peak detection is unchanged; the probabilities shift down with larger tiles (GroupNorm normalises over the
+tile) and again with fp4 storage, so a fixed 0.5 cutoff degrades while the best cutoff does not. Production output
+must carry the calibrated cutoff of its configuration (or the model must be trained in that configuration).
 
 ### Largest training window, batch 1 per GPU (2026-10-01 evening)
 Measured with `ufsm train` (Muon, down_norm, fp16 storage, recompute 1), peak device memory: 256^3 5.3 GB,
