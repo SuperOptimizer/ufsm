@@ -168,8 +168,14 @@ extern "C" int nn_storage(const void *p) {
     for (int i = 0; i < g_nreg; i++) if (c >= g_reg[i].p && c < g_reg[i].p + g_reg[i].n) return g_reg[i].dt;
     return 0;
 }
-#define ISMX(p) (g_nreg && nn_storage(p) == 8)
+/* registry dt 8 = MX-fp8, 4 = MX-fp4; MXDT(p) = the lp dtype of a registered tensor (3 fp8, 4 fp4), 0 = plane-major */
+static inline int mxdt_of(const void *p) { int d = g_nreg ? nn_storage(p) : 0; return d == 8 ? 3 : d == 4 ? 4 : 0; }
+#define MXDT(p) mxdt_of(p)
+#define ISMX(p) (mxdt_of(p) != 0)
+#define ISMX4(p) (mxdt_of(p) == 4)
 extern "C" size_t nn_mx8_bytes(shape5 s) { int bw = s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw + 1); }   /* = lp_mx8_bytes */
+extern "C" size_t nn_mx4_bytes(shape5 s) { int bw = s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw / 2 + 1); }   /* = lp_mx4_bytes */
+extern "C" size_t nn_mx_bytes(shape5 s, int dt) { return dt == 4 ? nn_mx4_bytes(s) : nn_mx8_bytes(s); }   /* registry dt */
 extern "C" void nn_free(void *p) { if (p) { if (g_nreg) nn_storage_forget(p); CK(cudaFree(p)); } }
 extern "C" void nn_zero(void *p, size_t n) { CK(cudaMemset(p, 0, n)); }
 extern "C" void nn_h2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyHostToDevice)); }
@@ -2346,8 +2352,12 @@ extern "C" void nn_f32_to_h16(const float *x, size_t n, void *y, float scale) { 
 extern "C" void nn_f32_to_bf16(const float *x, size_t n, void *y) { nn_f32_to_h16(x, n, y, 1.f); }
 /* network input -> activation storage (16-bit, or MX-fp8 when y is registered MX) */
 /* a 16-bit tensor (the storage type of nn_set_f16) into an MX-registered tensor */
-extern "C" void nn_h16_to_mx(const void *x, shape5 s, void *y) { lp_h16_to_mx8(x, g_h16 ? 2 : 1, s.n, s.c, shape_spatial(s), y); KCHECK(); }
+extern "C" void nn_h16_to_mx(const void *x, shape5 s, void *y) {
+    if (ISMX4(y)) lp_h16_to_mx4(x, g_h16 ? 2 : 1, s.n, s.c, shape_spatial(s), y); else lp_h16_to_mx8(x, g_h16 ? 2 : 1, s.n, s.c, shape_spatial(s), y);
+    KCHECK();
+}
 extern "C" void nn_f32_to_act(const float *x, shape5 s, void *y) {
+    if (ISMX4(y)) { lp_f32_to_mx4(x, s.n, s.c, shape_spatial(s), y); KCHECK(); return; }
     if (ISMX(y)) { lp_f32_to_mx8(x, s.n, s.c, shape_spatial(s), y); KCHECK(); return; }
     nn_f32_to_h16(x, shape_numel(s), y, 1.f);
 }

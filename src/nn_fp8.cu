@@ -35,6 +35,7 @@ static int cur_dev_(void) { int d = 0; cudaGetDevice(&d); return d & 7; }
 typedef __nv_bfloat16 bf16;
 /* activation element type T = float or bf16 (inputs and outputs of the forward; gradients are float) */
 struct mx8_t { unsigned char v; };   /* storage marker: MX-fp8 channel-blocked tensor (see below) */
+struct mx4_t { unsigned char v; };   /* storage marker: MX-fp4 (packed e2m1 nibbles, ue8m0 per block row) tensor */
 template <typename T> __device__ __forceinline__ float ldx(const T *p, size_t i);
 template <> __device__ __forceinline__ float ldx<float>(const float *p, size_t i) { return __ldg(p + i); }
 template <> __device__ __forceinline__ float ldx<bf16>(const bf16 *p, size_t i) { return __bfloat162float(__ldg(p + i)); }
@@ -76,40 +77,112 @@ template <> __device__ __forceinline__ float4 ldx4<bf16>(const bf16 *p) {
 /* ---- MX-fp8 activation storage (lp dtype 3): a tensor of C channels is stored channel-blocked, data[n][blk][voxel][bw] e4m3
    bytes followed by the scale plane sc[n][blk][voxel] (ue8m0), bw = 16 for C <= 16 else 32 (padding channels hold zeros).
    One 32-channel staging chunk of the fp8 kernels is then one stored block: a straight copy of the bytes and the scale. */
-/* plane-major accessors are never used on MX tensors (the kernels branch on IS_MX8); stubs keep the instantiations complete */
+/* MX-fp4 activation storage (lp dtype 4): the same channel blocking with two e2m1 nibbles per byte, data[n][blk][voxel][bw/2]
+   (channel k of a row = nibble k & 1 of byte k / 2, low nibble first) + the same ue8m0 scale plane; row = 16 B (bw 32) or 8 B
+   (bw 16) = one staged row of the fp4 kernel. A NaN block amax is stored as scale byte 0xFF (decoded as inf), so a non-finite
+   value never disappears into a finite nibble (0 * inf = NaN, else +-inf). */
+/* plane-major accessors are never used on MX tensors (the kernels branch on IS_MX8 / IS_MX4); stubs keep the instantiations complete */
 template <> __device__ __forceinline__ float ldx<mx8_t>(const mx8_t *, size_t) { return 0.f; }
 template <> __device__ __forceinline__ void stx<mx8_t>(mx8_t *, size_t, float) {}
 template <> __device__ __forceinline__ void stx2<mx8_t>(mx8_t *, size_t, float, float) {}
 template <> __device__ __forceinline__ float4 ldx4<mx8_t>(const mx8_t *) { return make_float4(0.f, 0.f, 0.f, 0.f); }
 template <> __device__ __forceinline__ void ld8x<mx8_t>(const mx8_t *, float *o) { for (int i = 0; i < 8; i++) o[i] = 0.f; }
+template <> __device__ __forceinline__ float ldx<mx4_t>(const mx4_t *, size_t) { return 0.f; }
+template <> __device__ __forceinline__ void stx<mx4_t>(mx4_t *, size_t, float) {}
+template <> __device__ __forceinline__ void stx2<mx4_t>(mx4_t *, size_t, float, float) {}
+template <> __device__ __forceinline__ float4 ldx4<mx4_t>(const mx4_t *) { return make_float4(0.f, 0.f, 0.f, 0.f); }
+template <> __device__ __forceinline__ void ld8x<mx4_t>(const mx4_t *, float *o) { for (int i = 0; i < 8; i++) o[i] = 0.f; }
 template <typename T> struct is_mx8_s { static constexpr bool v = false; };
 template <> struct is_mx8_s<mx8_t> { static constexpr bool v = true; };
+template <typename T> struct is_mx4_s { static constexpr bool v = false; };
+template <> struct is_mx4_s<mx4_t> { static constexpr bool v = true; };
 #define IS_MX8(T) (is_mx8_s<T>::v)
+#define IS_MX4(T) (is_mx4_s<T>::v)
+#define IS_MX(T) (is_mx8_s<T>::v || is_mx4_s<T>::v)
+template <typename T> struct mx_bits_s { static constexpr int v = 0; };   /* element bits of an MX storage type (0: plane-major) */
+template <> struct mx_bits_s<mx8_t> { static constexpr int v = 8; };
+template <> struct mx_bits_s<mx4_t> { static constexpr int v = 4; };
+#define MX_BITS(T) (mx_bits_s<T>::v)
+template <int B> struct mx_type_s;
+template <> struct mx_type_s<8> { typedef mx8_t t; };
+template <> struct mx_type_s<4> { typedef mx4_t t; };
 __host__ __device__ __forceinline__ int mx_bw(int C) { return C <= 16 ? 16 : 32; }
 __host__ __device__ __forceinline__ int mx_nb(int C) { int bw = mx_bw(C); return (C + bw - 1) / bw; }
+__host__ __device__ __forceinline__ int mx_rb(int bw, int bits) { return bw * bits / 8; }   /* row bytes */
 extern "C" size_t lp_mx8_bytes(int N, int C, size_t S) { return (size_t)N * mx_nb(C) * S * (mx_bw(C) + 1); }
+extern "C" size_t lp_mx4_bytes(int N, int C, size_t S) { return (size_t)N * mx_nb(C) * S * (mx_bw(C) / 2 + 1); }
 __device__ __forceinline__ float2 dec_e4m3x2(unsigned short v) {   /* low byte -> .x */
     unsigned r; asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(v));
     return __half22float2(*(__half2 *)&r);
 }
 __device__ __forceinline__ float dec_e4m3(unsigned b) { return dec_e4m3x2((unsigned short)(b & 0xff)).x; }
+__device__ __forceinline__ float2 dec_e2m1x2(unsigned b) {   /* low nibble -> .x */
+    unsigned r; asm("{ .reg .b8 t; cvt.u8.u32 t, %1; cvt.rn.f16x2.e2m1x2 %0, t; }" : "=r"(r) : "r"(b & 0xff));
+    return __half22float2(*(__half2 *)&r);
+}
+__device__ __forceinline__ float dec_e2m1n(unsigned n) { return dec_e2m1x2(n & 15).x; }   /* one nibble */
+__device__ __forceinline__ float mx_scale(unsigned sbyte) { return __uint_as_float(sbyte << 23); }   /* 0xFF -> inf */
+/* ---- format trait: row decode / encode of one block row of bw channels (bw 16: v[16..31] = 0 on decode, ignored on encode) ---- */
+template <int B> struct mxf;
+template <> struct mxf<8> {
+    static constexpr float inv_qmax = 1.f / 448.f;
+    static __device__ __forceinline__ void dec_row(const uint8_t *p, int bw, float s, float *v) {
+        const uint4 *src = (const uint4 *)p;
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            uint4 u = h == 0 || bw == 32 ? __ldg(src + h) : make_uint4(0u, 0u, 0u, 0u);
+            const unsigned *w = (const unsigned *)&u;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float2 a = dec_e4m3x2((unsigned short)(w[j] & 0xffff)), b = dec_e4m3x2((unsigned short)(w[j] >> 16));
+                v[16 * h + 4 * j] = a.x * s; v[16 * h + 4 * j + 1] = a.y * s; v[16 * h + 4 * j + 2] = b.x * s; v[16 * h + 4 * j + 3] = b.y * s;
+            }
+        }
+    }
+    static __device__ __forceinline__ unsigned enc8x(const float *v, float m);   /* defined after cvt_e4m3x4 */
+    static __device__ __forceinline__ void enc_row(uint8_t *p, int bw, const float *v, float m) {
+        uint4 *dst = (uint4 *)p;
+        dst[0] = make_uint4(enc8x(v, m), enc8x(v + 4, m), enc8x(v + 8, m), enc8x(v + 12, m));
+        if (bw == 32) dst[1] = make_uint4(enc8x(v + 16, m), enc8x(v + 20, m), enc8x(v + 24, m), enc8x(v + 28, m));
+    }
+    static __device__ __forceinline__ float dec1(const uint8_t *p, int c) { return dec_e4m3(p[c]); }
+};
+template <> struct mxf<4> {
+    static constexpr float inv_qmax = 1.f / 6.f;
+    static __device__ __forceinline__ void dec_row(const uint8_t *p, int bw, float s, float *v) {
+        uint2 lo = __ldg((const uint2 *)p), hi = bw == 32 ? __ldg((const uint2 *)p + 1) : make_uint2(0u, 0u);
+        const unsigned w[4] = {lo.x, lo.y, hi.x, hi.y};
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+#pragma unroll
+            for (int q = 0; q < 4; q++) { float2 a = dec_e2m1x2(w[j] >> (8 * q)); v[8 * j + 2 * q] = a.x * s; v[8 * j + 2 * q + 1] = a.y * s; }
+    }
+    static __device__ __forceinline__ unsigned enc8x(const float *v, float m);   /* defined after cvt_e2m1x8 */
+    static __device__ __forceinline__ void enc_row(uint8_t *p, int bw, const float *v, float m) {
+        *(uint2 *)p = make_uint2(enc8x(v, m), enc8x(v + 8, m));
+        if (bw == 32) *((uint2 *)p + 1) = make_uint2(enc8x(v + 16, m), enc8x(v + 24, m));
+    }
+    static __device__ __forceinline__ float dec1(const uint8_t *p, int c) { return dec_e2m1n((unsigned)p[c >> 1] >> (4 * (c & 1))); }
+};
 /* padded input-channel index -> real channel (-1 = zero padding). With MX-stored inputs the x and x2 segments are padded
    to 32 channels each (CxP = pad32(Cx)) so that a 32-channel chunk never straddles two tensors or two stored blocks. */
 __host__ __device__ __forceinline__ int seg_ci(int cp, int Ci, int Cx, int CxP) { if (cp < CxP) return cp < Cx ? cp : -1; int c = Cx + cp - CxP; return c < Ci ? c : -1; }
 /* per-channel staging descriptor: source plane pointer (nullptr = zero channel) and the GN+SiLU affine a*x + b;
    for MX tensors p points at this channel's byte in block row 0 (element at voxel v: p[v * bw]) and sp at the block's scale row */
-typedef struct { const void *p; const uint8_t *sp; float a, b; int bw, g; } chan_t;   /* g: gn+silu applies */
+/* MX: p = the channel's byte in block row 0 (fp8) or the row's first byte (fp4, nibble index in nib), bw = block width,
+   rb = row bytes (element at voxel v: row p + v * rb), sp = the block's scale row */
+typedef struct { const void *p; const uint8_t *sp; float a, b; int bw, g, rb, nib; } chan_t;   /* g: gn+silu applies */
 template <typename T>
 __device__ __forceinline__ chan_t make_chan(int ci, int Ci, int Cx, int n, size_t plane, const T *x, const split_t &sp, const gnp_t &gp, int N = 0) {
-    chan_t c; c.p = nullptr; c.sp = nullptr; c.a = 1.f; c.b = 0.f; c.bw = 1; c.g = 0;
+    chan_t c; c.p = nullptr; c.sp = nullptr; c.a = 1.f; c.b = 0.f; c.bw = 1; c.g = 0; c.rb = 1; c.nib = 0;
     if (ci >= 0 && ci < Ci) {
-        if constexpr (IS_MX8(T)) {
+        if constexpr (IS_MX(T)) {
             const bool sec = ci >= Cx;
             const uint8_t *base = sec ? (const uint8_t *)sp.x2 : (const uint8_t *)x;
-            const int C = sec ? Ci - Cx : Cx, cc = sec ? ci - Cx : ci, bw = mx_bw(C), nb = mx_nb(C);
-            c.p = base + (((size_t)n * nb + cc / bw) * plane) * bw + cc % bw;
-            c.sp = base + (size_t)N * nb * plane * bw + ((size_t)n * nb + cc / bw) * plane;
-            c.bw = bw;
+            const int C = sec ? Ci - Cx : Cx, cc = sec ? ci - Cx : ci, bw = mx_bw(C), nb = mx_nb(C), rb = mx_rb(bw, MX_BITS(T));
+            c.p = base + (((size_t)n * nb + cc / bw) * plane) * rb + (IS_MX4(T) ? 0 : cc % bw);
+            c.sp = base + (size_t)N * nb * plane * rb + ((size_t)n * nb + cc / bw) * plane;
+            c.bw = bw; c.rb = rb; c.nib = cc % bw;
         } else c.p = ci >= Cx ? (const T *)sp.x2 + ((size_t)n * (Ci - Cx) + ci - Cx) * plane : x + ((size_t)n * Cx + ci) * plane;
         const bool s2g = sp.x2 && sp.gp2.G;   /* per-segment GroupNorms */
         const gnp_t &q = s2g && ci >= Cx ? sp.gp2 : gp;
@@ -120,37 +193,28 @@ __device__ __forceinline__ chan_t make_chan(int ci, int Ci, int Cx, int n, size_
 }
 /* voxel offset of (z, y, x) */
 __device__ __forceinline__ size_t cof(const chan_t &, int z, int y, int x, int H, int W) { return ((size_t)z * H + y) * W + x; }
-/* element (n, c, v) of an MX tensor with N samples, C channels, S voxels */
-__device__ __forceinline__ float ldmx_e(const void *qv, int N, int C, size_t S, int n, int c, size_t v) {
+/* element (n, c, v) of an MX tensor (B bits) with N samples, C channels, S voxels */
+template <int B> __device__ __forceinline__ float ldmx_e(const void *qv, int N, int C, size_t S, int n, int c, size_t v) {
     const uint8_t *q = (const uint8_t *)qv;
-    const int bw = mx_bw(C), nb = mx_nb(C);
+    const int bw = mx_bw(C), nb = mx_nb(C), rb = mx_rb(bw, B);
     const size_t ri = ((size_t)n * nb + c / bw) * S + v;
-    return dec_e4m3(q[ri * bw + c % bw]) * __uint_as_float((unsigned)q[(size_t)N * nb * S * bw + ri] << 23);
+    return mxf<B>::dec1(q + ri * rb, c % bw) * mx_scale(q[(size_t)N * nb * S * rb + ri]);
 }
+__device__ __forceinline__ float ldmx4_e(const void *q, int N, int C, size_t S, int n, int c, size_t v) { return ldmx_e<4>(q, N, C, S, n, c, v); }
 /* element of a channel at voxel offset off: plane-major types, or MX (decode * 2^(scale - 127)) */
 template <typename T> __device__ __forceinline__ float ldc(const chan_t &c, size_t off) {
-    if constexpr (IS_MX8(T)) return dec_e4m3(((const uint8_t *)c.p)[off * c.bw]) * __uint_as_float((unsigned)c.sp[off] << 23);
+    if constexpr (IS_MX(T)) return mxf<MX_BITS(T)>::dec1((const uint8_t *)c.p + off * c.rb, IS_MX4(T) ? c.nib : 0) * mx_scale(c.sp[off]);
     else return ldx((const T *)c.p, off);
 }
 /* the 32 channels of one stored MX block row at voxel off (bw = 16: upper half zero), dequantized; ok == false: zeros */
-__device__ __forceinline__ void mx_row32(const chan_t &c0, size_t off, bool ok, float *v) {
-    uint4 h[2] = {make_uint4(0u, 0u, 0u, 0u), make_uint4(0u, 0u, 0u, 0u)};
-    float s = 0.f;
-    if (ok && c0.p) {
-        const uint4 *src = (const uint4 *)((const uint8_t *)c0.p + off * c0.bw);
-        h[0] = __ldg(src); if (c0.bw == 32) h[1] = __ldg(src + 1);
-        s = __uint_as_float((unsigned)c0.sp[off] << 23);
-    }
+template <int B> __device__ __forceinline__ void mx_row32(const chan_t &c0, size_t off, bool ok, float *v) {
+    if (ok && c0.p) mxf<B>::dec_row((const uint8_t *)c0.p + off * c0.rb, c0.bw, mx_scale(c0.sp[off]), v);
+    else {
 #pragma unroll
-    for (int q = 0; q < 2; q++) {
-        const unsigned *w = (const unsigned *)&h[q];
-#pragma unroll
-        for (int j = 0; j < 4; j++) {
-            float2 a = dec_e4m3x2((unsigned short)(w[j] & 0xffff)), b = dec_e4m3x2((unsigned short)(w[j] >> 16));
-            v[16 * q + 4 * j] = a.x * s; v[16 * q + 4 * j + 1] = a.y * s; v[16 * q + 4 * j + 2] = b.x * s; v[16 * q + 4 * j + 3] = b.y * s;
-        }
+        for (int k = 0; k < 32; k++) v[k] = 0.f;
     }
 }
+__device__ __forceinline__ void mx4_row32(const chan_t &c0, size_t off, bool ok, float *v) { mx_row32<4>(c0, off, ok, v); }
 /* clamp to the fp16 range for a store that must not become inf; NaN stays NaN (fminf / fmaxf would turn it into
    +-65504 and hide a non-finite forward from the trainer's detection) */
 __device__ __forceinline__ float sat_h16(float v) { return fabsf(v) > 65504.f ? copysignf(65504.f, v) : v; }
@@ -160,8 +224,12 @@ __device__ __forceinline__ float act_ab(float v, float a, float b, bool G) {
     return __fdividef(v, 1.f + __expf(-v));
 }
 /* exponent e (scale 2^e) such that amax * 2^-e <= qmax; returned as the ue8m0 byte e + 127 */
+/* NaN-propagating block amax: unsigned max over the magnitude bits (finite magnitudes order as their bits; NaN bits exceed inf),
+   where fmaxf would drop a NaN element and the e2m1 conversion would then store it as a finite 6 */
+__device__ __forceinline__ unsigned amax_u(unsigned a, float v) { return max(a, __float_as_uint(v) & 0x7fffffffu); }
 __device__ __forceinline__ int mx_exp(float amax, float inv_qmax) {
     unsigned u = __float_as_uint(amax * inv_qmax);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return 128;   /* NaN amax: scale byte 0xFF (decoded as inf) so the non-finite value survives storage */
     int e = (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0);
     return max(-126, min(126, e));
 }
@@ -195,6 +263,24 @@ __device__ __forceinline__ unsigned char cvt_e2m1x2(float lo, float hi) {   /* l
     unsigned short r;
     asm("{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %1, %2; cvt.u16.u8 %0, t; }" : "=h"(r) : "f"(hi), "f"(lo));
     return (unsigned char)r;
+}
+__device__ __forceinline__ unsigned cvt_e2m1x8(const float *v, float m) {   /* 8 values -> 8 nibbles, v[0] lowest */
+    return (unsigned)cvt_e2m1x2(v[0] * m, v[1] * m) | ((unsigned)cvt_e2m1x2(v[2] * m, v[3] * m) << 8) |
+           ((unsigned)cvt_e2m1x2(v[4] * m, v[5] * m) << 16) | ((unsigned)cvt_e2m1x2(v[6] * m, v[7] * m) << 24);
+}
+__device__ __forceinline__ unsigned mxf<8>::enc8x(const float *v, float m) { return cvt_e4m3x4(v[0] * m, v[1] * m, v[2] * m, v[3] * m); }   /* 4 values -> 4 bytes */
+__device__ __forceinline__ unsigned mxf<4>::enc8x(const float *v, float m) { return cvt_e2m1x8(v, m); }                                   /* 8 values -> 8 nibbles */
+/* exact stochastic rounding onto the e2m1 grid: v already scaled into the grid (|v| <= 6 after the block scale; larger
+   magnitudes are clamped), the two bracketing grid points are chosen with probability proportional to the distance to the
+   other one, so E[q] = v on the non-uniform grid (a dither-then-RN would be biased where the spacing changes). h: per-element
+   hash. Returns a value exactly on the grid, so the round-to-nearest conversion that follows is exact. */
+__device__ __forceinline__ float sr_e2m1(float v, uint32_t h) {
+    const float a = fminf(fabsf(v), 6.f);
+    const float lo = a < 1.f ? (a < 0.5f ? 0.f : 0.5f) : a < 2.f ? (a < 1.5f ? 1.f : 1.5f) : a < 4.f ? (a < 3.f ? 2.f : 3.f) : (a < 6.f ? 4.f : 6.f);
+    const float hi = lo < 1.f ? lo + 0.5f : lo < 2.f ? lo + 0.5f : lo < 4.f ? lo + 1.f : 6.f;
+    const float u = (float)(h >> 8) * (1.f / 16777216.f);
+    const float q = (hi > lo && u * (hi - lo) < a - lo) ? hi : lo;
+    return copysignf(q, v);
 }
 __device__ __forceinline__ unsigned smem_u32_(const void *p) { return (unsigned)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void ldsm_x4(unsigned *r, const void *row_ptr) {
@@ -392,7 +478,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8_k(const T *__restrict__ x,
                 unsigned sc = 1u;
                 if (inb) {
                     size_t off = ((size_t)gz * H + gy) * W + gx;
-                    const uint4 *src = (const uint4 *)((const uint8_t *)c0.p + off * c0.bw);
+                    const uint4 *src = (const uint4 *)((const uint8_t *)c0.p + off * c0.rb);
                     h0 = __ldg(src); if (c0.bw == 32) h1 = __ldg(src + 1);
                     sc = c0.sp[off];
                 }
@@ -408,7 +494,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8_k(const T *__restrict__ x,
                 int gz = oz0 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
                 bool inb = gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W;
                 float v[32];
-                mx_row32(c0, inb ? ((size_t)gz * H + gy) * W + gx : 0, inb, v);
+                mx_row32<8>(c0, inb ? ((size_t)gz * H + gy) * W + gx : 0, inb, v);
                 float amax = 0.f;
 #pragma unroll
                 for (int k = 0; k < 32; k++) { const chan_t &c = ctab[k]; v[k] = inb && c.p ? act_ab(v[k], c.a, c.b, c.g) : 0.f; amax = fmaxf(amax, fabsf(v[k])); }
@@ -804,8 +890,8 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
             if (co < Co && oz < D && oy < H) {
                 if constexpr (IS_MX8(TG)) {
                     const size_t vo = ((size_t)oz * H + oy) * W + ox, Sg = (size_t)D * H * W;
-                    if (ox < W) v.x = ldmx_e(gy, N, Co, Sg, n, co, vo); if (ox + 1 < W) v.y = ldmx_e(gy, N, Co, Sg, n, co, vo + 1);
-                    if (ox + 2 < W) v.z = ldmx_e(gy, N, Co, Sg, n, co, vo + 2); if (ox + 3 < W) v.w = ldmx_e(gy, N, Co, Sg, n, co, vo + 3);
+                    if (ox < W) v.x = ldmx_e<8>(gy, N, Co, Sg, n, co, vo); if (ox + 1 < W) v.y = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + 1);
+                    if (ox + 2 < W) v.z = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + 2); if (ox + 3 < W) v.w = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + 3);
                 } else {
                 const TG *src = gy + (((size_t)n * Co + co) * D + oz) * H * W + (size_t)oy * W + ox;
                 if (vec) { if (ox < W) v = ldx4<TG>(src); }
@@ -947,10 +1033,6 @@ extern "C" void nn_conv3d_bwd_weight_fp8(const float *x, shape5 xs, const float 
    x 4 bit), one scale per (position, 32 channels) -> B scale register bytes 0 / 1 = the two taps' positions.
    Weights wq4[tap][Cop][Cip/2] with one scale per (tap, co, 32-channel chunk). Inputs with Ci <= 16 use the FP8
    small-channel kernel. */
-__device__ __forceinline__ unsigned cvt_e2m1x8(const float *v, float m) {
-    return (unsigned)cvt_e2m1x2(v[0] * m, v[1] * m) | ((unsigned)cvt_e2m1x2(v[2] * m, v[3] * m) << 8) |
-           ((unsigned)cvt_e2m1x2(v[4] * m, v[5] * m) << 16) | ((unsigned)cvt_e2m1x2(v[6] * m, v[7] * m) << 24);
-}
 __global__ void prep_w4_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip) {
     const int nch = Cip / 32;
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -1142,7 +1224,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__
                 continue;
             }
             float v[32], amax = 0.f;
-            if (IS_MX8(T)) mx_row32(ctab[0], inb ? off : 0, inb, v);   /* (G here: the copy path took !G) */
+            if (IS_MX8(T)) mx_row32<8>(ctab[0], inb ? off : 0, inb, v);   /* (G here: the copy path took !G) */
 #pragma unroll
             for (int k = 0; k < 32; k++) {
                 int ci = ci0 + k;
@@ -1363,8 +1445,8 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
             if (co < Co && oz < Do && oy < Ho) {
                 if constexpr (IS_MX8(TG)) {
                     const size_t vo = ((size_t)oz * Ho + oy) * Wo + ox, Sg = (size_t)Do * Ho * Wo;
-                    if (ox < Wo) vv.x = ldmx_e(gy, N, Co, Sg, n, co, vo); if (ox + 1 < Wo) vv.y = ldmx_e(gy, N, Co, Sg, n, co, vo + 1);
-                    if (ox + 2 < Wo) vv.z = ldmx_e(gy, N, Co, Sg, n, co, vo + 2); if (ox + 3 < Wo) vv.w = ldmx_e(gy, N, Co, Sg, n, co, vo + 3);
+                    if (ox < Wo) vv.x = ldmx_e<8>(gy, N, Co, Sg, n, co, vo); if (ox + 1 < Wo) vv.y = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + 1);
+                    if (ox + 2 < Wo) vv.z = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + 2); if (ox + 3 < Wo) vv.w = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + 3);
                 } else {
                 const TG *src = gy + (((size_t)n * Co + co) * Do + oz) * Ho * Wo + (size_t)oy * Wo + ox;
                 if (vec) { if (ox < Wo) vv = ldx4<TG>(src); }
@@ -1466,36 +1548,32 @@ extern "C" int lp_bwd_w_s2_f8(const void *x, int xbf, shape5 xs, const void *gy,
 /* ======================= elementwise ops on MX-fp8 activation tensors =======================
    Voxel-major over channel blocks: a thread owns one (n, block, voxel) row of bw channels, so the per-voxel amax that
    defines the output scale is local. */
-__device__ __forceinline__ void mx_load_row(const uint8_t *q, const uint8_t *sc, size_t ri, int bw, float *v) {   /* ri = (n*nb + blk)*S + voxel */
-    const float s = __uint_as_float((unsigned)sc[ri] << 23);
-    const uint4 *src = (const uint4 *)(q + ri * bw);
-#pragma unroll
-    for (int h = 0; h < 2; h++) {
-        uint4 u = h == 0 || bw == 32 ? __ldg(src + h) : make_uint4(0u, 0u, 0u, 0u);
-        const unsigned *w = (const unsigned *)&u;
-#pragma unroll
-        for (int j = 0; j < 4; j++) {
-            float2 a = dec_e4m3x2((unsigned short)(w[j] & 0xffff)), b = dec_e4m3x2((unsigned short)(w[j] >> 16));
-            v[16 * h + 4 * j] = a.x * s; v[16 * h + 4 * j + 1] = a.y * s; v[16 * h + 4 * j + 2] = b.x * s; v[16 * h + 4 * j + 3] = b.y * s;
-        }
-    }
+/* row ri = (n*nb + blk)*S + voxel of a B-bit MX tensor; q = data, sc = scale plane */
+template <int B> __device__ __forceinline__ void mx_load_row_b(const uint8_t *q, const uint8_t *sc, size_t ri, int bw, float *v) {
+    mxf<B>::dec_row(q + ri * mx_rb(bw, B), bw, mx_scale(sc[ri]), v);
 }
-__device__ __forceinline__ void mx_store_row(uint8_t *q, uint8_t *sc, size_t ri, int bw, const float *v) {
-    float am = 0.f;
+/* sr != 0: exact stochastic rounding keyed by (sr, ri, channel) (fp4 only; fp8 keeps round-to-nearest here) */
+template <int B> __device__ __forceinline__ void mx_store_row_b(uint8_t *q, uint8_t *sc, size_t ri, int bw, float *v, uint32_t sr = 0) {
+    unsigned am = 0u;
 #pragma unroll
-    for (int k = 0; k < 32; k++) if (k < bw) am = fmaxf(am, fabsf(v[k]));
-    const int e = mx_exp(am, 1.f / 448.f);
+    for (int k = 0; k < 32; k++) if (k < bw) am = amax_u(am, v[k]);
+    const int e = mx_exp(__uint_as_float(am), mxf<B>::inv_qmax);
     const float m = exp2i(-e);
-    uint4 *dst = (uint4 *)(q + ri * bw);
-    dst[0] = make_uint4(cvt_e4m3x4(v[0] * m, v[1] * m, v[2] * m, v[3] * m), cvt_e4m3x4(v[4] * m, v[5] * m, v[6] * m, v[7] * m),
-                        cvt_e4m3x4(v[8] * m, v[9] * m, v[10] * m, v[11] * m), cvt_e4m3x4(v[12] * m, v[13] * m, v[14] * m, v[15] * m));
-    if (bw == 32) dst[1] = make_uint4(cvt_e4m3x4(v[16] * m, v[17] * m, v[18] * m, v[19] * m), cvt_e4m3x4(v[20] * m, v[21] * m, v[22] * m, v[23] * m),
-                                      cvt_e4m3x4(v[24] * m, v[25] * m, v[26] * m, v[27] * m), cvt_e4m3x4(v[28] * m, v[29] * m, v[30] * m, v[31] * m));
+    if (B == 4 && sr) {
+#pragma unroll
+        for (int k = 0; k < 32; k++) if (k < bw) v[k] = sr_e2m1(v[k] * m, sr_hash(sr, ri * 32 + k)) / m;
+    }
+    mxf<B>::enc_row(q + ri * mx_rb(bw, B), bw, v, m);
     sc[ri] = (uint8_t)(e + 127);
 }
-/* fp32 [n][C][S] -> MX */
-template <typename TI>
-__global__ void f32_to_mx8_k(const TI *x, uint8_t *y, int N, int C, size_t S) {
+__device__ __forceinline__ void mx_load_row(const uint8_t *q, const uint8_t *sc, size_t ri, int bw, float *v) { mx_load_row_b<8>(q, sc, ri, bw, v); }
+__device__ __forceinline__ void mx_store_row(uint8_t *q, uint8_t *sc, size_t ri, int bw, float *v) { mx_store_row_b<8>(q, sc, ri, bw, v); }
+/* scale plane of a B-bit MX tensor */
+template <int B> __device__ __forceinline__ uint8_t *mx_sc(uint8_t *q, int N, int C, size_t S) { return q + (size_t)N * mx_nb(C) * S * mx_rb(mx_bw(C), B); }
+template <int B> __device__ __forceinline__ const uint8_t *mx_sc(const uint8_t *q, int N, int C, size_t S) { return q + (size_t)N * mx_nb(C) * S * mx_rb(mx_bw(C), B); }
+/* fp32 / 16-bit [n][C][S] -> MX (B bits) */
+template <int B, typename TI>
+__global__ void f32_to_mx_k(const TI *x, uint8_t *y, int N, int C, size_t S) {
     const int bw = mx_bw(C), nb = mx_nb(C);
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)N * nb * S) return;
@@ -1503,33 +1581,67 @@ __global__ void f32_to_mx8_k(const TI *x, uint8_t *y, int N, int C, size_t S) {
     float r[32];
 #pragma unroll
     for (int k = 0; k < 32; k++) { int c = blk * bw + k; r[k] = k < bw && c < C ? ldx(x, ((size_t)n * C + c) * S + v) : 0.f; }
-    mx_store_row(y, y + (size_t)N * nb * S * bw, i, bw, r);
+    mx_store_row_b<B>(y, mx_sc<B>(y, N, C, S), i, bw, r);
 }
 extern "C" void lp_f32_to_mx8(const float *x, int N, int C, size_t S, void *y) {
     size_t n = (size_t)N * mx_nb(C) * S;
-    f32_to_mx8_k<float><<<nblk_(n, 256), 256>>>(x, (uint8_t *)y, N, C, S); LPCK();
+    f32_to_mx_k<8, float><<<nblk_(n, 256), 256>>>(x, (uint8_t *)y, N, C, S); LPCK();
+}
+extern "C" void lp_f32_to_mx4(const float *x, int N, int C, size_t S, void *y) {
+    size_t n = (size_t)N * mx_nb(C) * S;
+    f32_to_mx_k<4, float><<<nblk_(n, 256), 256>>>(x, (uint8_t *)y, N, C, S); LPCK();
 }
 /* 16-bit (dt 1 bf16, 2 fp16) [n][C][S] -> MX */
 extern "C" void lp_h16_to_mx8(const void *x, int dt, int N, int C, size_t S, void *y) {
     size_t n = (size_t)N * mx_nb(C) * S;
-    if (dt == 2) f32_to_mx8_k<__half><<<nblk_(n, 256), 256>>>((const __half *)x, (uint8_t *)y, N, C, S);
-    else f32_to_mx8_k<bf16><<<nblk_(n, 256), 256>>>((const bf16 *)x, (uint8_t *)y, N, C, S);
+    if (dt == 2) f32_to_mx_k<8, __half><<<nblk_(n, 256), 256>>>((const __half *)x, (uint8_t *)y, N, C, S);
+    else f32_to_mx_k<8, bf16><<<nblk_(n, 256), 256>>>((const bf16 *)x, (uint8_t *)y, N, C, S);
+    LPCK();
+}
+extern "C" void lp_h16_to_mx4(const void *x, int dt, int N, int C, size_t S, void *y) {
+    size_t n = (size_t)N * mx_nb(C) * S;
+    if (dt == 2) f32_to_mx_k<4, __half><<<nblk_(n, 256), 256>>>((const __half *)x, (uint8_t *)y, N, C, S);
+    else f32_to_mx_k<4, bf16><<<nblk_(n, 256), 256>>>((const bf16 *)x, (uint8_t *)y, N, C, S);
     LPCK();
 }
 /* MX -> fp32 [n][C][S] (tests) */
-__global__ void mx8_to_f32_k(const uint8_t *x, float *y, int N, int C, size_t S) {
+template <int B>
+__global__ void mx_to_f32_k(const uint8_t *x, float *y, int N, int C, size_t S) {
     const int bw = mx_bw(C), nb = mx_nb(C);
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)N * nb * S) return;
     size_t v = i % S; int blk = (int)((i / S) % nb), n = (int)(i / (S * nb));
     float r[32];
-    mx_load_row(x, x + (size_t)N * nb * S * bw, i, bw, r);
+    mx_load_row_b<B>(x, mx_sc<B>(x, N, C, S), i, bw, r);
 #pragma unroll
     for (int k = 0; k < 32; k++) { int c = blk * bw + k; if (k < bw && c < C) y[((size_t)n * C + c) * S + v] = r[k]; }
 }
 extern "C" void lp_mx8_to_f32(const void *x, int N, int C, size_t S, float *y) {
     size_t n = (size_t)N * mx_nb(C) * S;
-    mx8_to_f32_k<<<nblk_(n, 256), 256>>>((const uint8_t *)x, y, N, C, S); LPCK();
+    mx_to_f32_k<8><<<nblk_(n, 256), 256>>>((const uint8_t *)x, y, N, C, S); LPCK();
+}
+extern "C" void lp_mx4_to_f32(const void *x, int N, int C, size_t S, float *y) {
+    size_t n = (size_t)N * mx_nb(C) * S;
+    mx_to_f32_k<4><<<nblk_(n, 256), 256>>>((const uint8_t *)x, y, N, C, S); LPCK();
+}
+/* test probes: mean of n stochastic e2m1 roundings of v (seeded per element), and the raw cvt.rn.satfinite.e2m1x2 nibble of v */
+__global__ void sr_e2m1_probe_k(float v, size_t n, double *acc) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float q = sr_e2m1(v, sr_hash(0x1234567u, i));
+    atomicAdd(acc, (double)q);
+}
+extern "C" double lp_sr_e2m1_mean(float v, size_t n) {
+    double *d; cudaMalloc(&d, sizeof(double)); cudaMemset(d, 0, sizeof(double));
+    sr_e2m1_probe_k<<<nblk_(n, 256), 256>>>(v, n, d);
+    double h = 0; cudaMemcpy(&h, d, sizeof(double), cudaMemcpyDeviceToHost); cudaFree(d); LPCK();
+    return h / (double)n;
+}
+__global__ void cvt_e2m1_probe_k(const float *v, unsigned char *o, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) o[i] = cvt_e2m1x2(v[i], 0.f) & 15; }
+extern "C" void lp_cvt_e2m1_probe(const float *hv, unsigned char *ho, int n) {
+    float *d; unsigned char *o; cudaMalloc(&d, n * 4); cudaMalloc(&o, n); cudaMemcpy(d, hv, n * 4, cudaMemcpyHostToDevice);
+    cvt_e2m1_probe_k<<<nblk_(n, 128), 128>>>(d, o, n);
+    cudaMemcpy(ho, o, n, cudaMemcpyDeviceToHost); cudaFree(d); cudaFree(o); LPCK();
 }
 /* y = silu(gn(x)), both MX */
 __global__ void gn_silu_apply_mx_k(const uint8_t *x, uint8_t *y, int N, int C, int G, size_t S, const float *gamma, const float *beta, const float *mean, const float *rstd) {

@@ -97,13 +97,17 @@ int nn_get_grad_bf16(void);
 void nn_f32_to_bf16(const float *x, size_t n, void *y);   /* converts to the current 16-bit storage type */
 /* Per-tensor storage registry. A device buffer registered with dt 8 holds an MX-fp8 tensor: channel-blocked e4m3 bytes
    data[n][blk][voxel][bw] (bw = 16 if C <= 16 else 32) followed by ue8m0 scales sc[n][blk][voxel]; nn_mx8_bytes(shape) bytes.
-   Ops that read or write a registered tensor take their MX path (convs then run in fp8 and stage by copy). nn_free forgets. */
+   Ops that read or write a registered tensor take their MX path (convs then run in fp8 and stage by copy). nn_free forgets.
+   dt 4 holds an MX-fp4 tensor: the same blocking with packed e2m1 nibbles, data[n][blk][voxel][bw/2] + the ue8m0 plane
+   (nn_mx4_bytes); convs reading it run the fp4 kernel (Ci > 16) or the fp8 kernel with nibble staging. */
 void nn_set_storage(const void *p, size_t bytes, int dt);
-int nn_storage(const void *p);          /* 8 = MX-fp8, 0 = default */
+int nn_storage(const void *p);          /* 8 = MX-fp8, 4 = MX-fp4, 0 = default */
 void nn_storage_forget(const void *p);
 size_t nn_mx8_bytes(shape5 s);
+size_t nn_mx4_bytes(shape5 s);
+size_t nn_mx_bytes(shape5 s, int dt);   /* registry dt 8 / 4 */
 void nn_f32_to_act(const float *x, shape5 s, void *y);   /* network input -> activation storage (16-bit or MX) */
-void nn_h16_to_mx(const void *x, shape5 s, void *y);   /* 16-bit storage-type tensor -> MX-fp8 tensor */
+void nn_h16_to_mx(const void *x, shape5 s, void *y);   /* 16-bit storage-type tensor -> the registered MX (fp8 / fp4) tensor y */
 void nn_f32_to_h16(const float *x, size_t n, void *y, float scale);
 /* 16-bit type for activation/gradient storage and MMA operands: 0 bf16 (default), 1 fp16 (8x finer mantissa, same tensor-core rate;
    env UFSM_F16=1). With fp16 gradient storage the activation gradients are kept scaled by nn_get_grad_scale() (env UFSM_GSCALE,

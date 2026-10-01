@@ -53,6 +53,8 @@ build/bench_mem: tests/bench_mem.c build/unet.o build/nn.o build/nn_fp8.o
 
 build/test_mx: tests/test_mx.c build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+build/test_mx4: tests/test_mx4.c build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
 build/test_unet: tests/test_unet.c build/unet.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
@@ -82,9 +84,10 @@ build/test_json: tests/test_json.c build/json.o
 build:
 	mkdir -p build
 
-test: build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_rc
+test: build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc
 	./build/test_sample_ops
 	./build/test_mx
+	./build/test_mx4
 	./build/test_rc
 	UFSM_FUSED_UP=0 UFSM_F16=1 ./build/test_unet
 	UFSM_RECOMPUTE=2 UFSM_F16=1 ./build/test_unet

@@ -26,6 +26,13 @@ size_t lp_mx8_bytes(int N, int C, size_t S);
 void lp_f32_to_mx8(const float *x, int N, int C, size_t S, void *y);
 void lp_h16_to_mx8(const void *x, int dt, int N, int C, size_t S, void *y);   /* dt 1 bf16, 2 fp16 */
 void lp_mx8_to_f32(const void *x, int N, int C, size_t S, float *y);
+/* MX-fp4 activation storage (lp dtype 4): the same blocking with packed e2m1 nibbles (bw/2 bytes per row) + ue8m0 plane */
+size_t lp_mx4_bytes(int N, int C, size_t S);
+void lp_f32_to_mx4(const float *x, int N, int C, size_t S, void *y);
+void lp_h16_to_mx4(const void *x, int dt, int N, int C, size_t S, void *y);
+void lp_mx4_to_f32(const void *x, int N, int C, size_t S, float *y);
+double lp_sr_e2m1_mean(float v, size_t n);                        /* test probe: mean of n stochastic e2m1 roundings of v (v in grid units) */
+void lp_cvt_e2m1_probe(const float *hv, unsigned char *ho, int n);   /* test probe: raw cvt.rn.satfinite.e2m1x2 nibble of each host value */
 void lp_gn_silu_apply_mx(const void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, void *y);
 void lp_up2_fwd_mx(const void *x, shape5 xs, void *y, gnp_t gp);   /* gp: silu(gn(x)) upsampled */
 void lp_conv1_fwd_mx(const void *x, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp);
