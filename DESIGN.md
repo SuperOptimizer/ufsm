@@ -365,6 +365,13 @@ GPU at 128^3, tiled Muon / ANVIL matmuls (lead); (6) wider level-0 channels once
   guard (within 0.005 F1). Earlier fp4 numbers (QAT fine-tune 0.242 vs 0.297, simulated NVFP4 62-66% error) were
   without those ingredients.
 
+### Run lengths (2026-10-01 evening)
+- Under Muon the 6000-step yardstick reaches the F1 that AdamW needed 120k steps for, and r10's validation loss has
+  been flat (0.94-0.99) since step 50k of its constant-lr phase. Decisions therefore use the 6000-step paired
+  yardstick (6 min); long-run confirmations are 40k steps with `--sched wsd --cooldown 0.2` (~30 min on two GPUs,
+  the cooldown is where the accuracy lands), not 120k-200k. r10 (200k) runs to completion only because its cooldown
+  and 17-box scores are the baseline; r11 onwards are 40k.
+
 ### Sampler on the 17-source set (2026-10-01 evening)
 - On configs/all2.json the sampler collapsed to 34 patches/s (16 workers) and got slower with 32: 331 lazy store
   opens (one remote metadata fetch each, 70-500 ms) serialised on the open mutex, paid by every worker's first draws
