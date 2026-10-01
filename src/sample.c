@@ -97,6 +97,7 @@ struct sampler {
     atomic_int stop;
     atomic_uint_fast64_t produced, rejected;
     double *cum;   /* cumulative source weights */
+    struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } *occ;   /* per source: coarse label cells containing papyrus (guides the position draw) */
 };
 
 static size_t P3(const sampler *sp) { return (size_t)sp->cfg.P * sp->cfg.P * sp->cfg.P; }
@@ -168,6 +169,18 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     } else if (c->holdout) {
         int64_t span = (int64_t)P << l;
         for (int d = 0; d < 3; d++) { if (s->hold_n[d] < span) return 1; o[d] = (s->hold_o[d] + rint_below(r, s->hold_n[d] - span + 1)) >> l; }
+    } else if (sp->occ[si].n) {   /* draw around a random coarse cell that contains papyrus */
+        size_t k = (size_t)(runif(r) * (double)sp->occ[si].n); if (k >= sp->occ[si].n) k = sp->occ[si].n - 1;
+        uint32_t id = sp->occ[si].idx[k];
+        int64_t cz = id / (sp->occ[si].shape[1] * sp->occ[si].shape[2]), cy = (id / sp->occ[si].shape[2]) % sp->occ[si].shape[1], cx = id % sp->occ[si].shape[2];
+        int64_t cc[3] = {cz, cy, cx};
+        int dl = sp->occ[si].lev - l;    /* coarse cell -> level-l voxels */
+        for (int d = 0; d < 3; d++) {
+            if (m->shape[d] < P) return 1;
+            int64_t f = dl >= 0 ? (int64_t)1 << dl : 1;
+            int64_t v = dl >= 0 ? cc[d] * f + rint_below(r, f) : cc[d] >> (-dl);
+            o[d] = v - P / 2; if (o[d] < 0) o[d] = 0; if (o[d] > m->shape[d] - P) o[d] = m->shape[d] - P;
+        }
     } else {
         for (int d = 0; d < 3; d++) { if (m->shape[d] < P) return 1; o[d] = rint_below(r, m->shape[d] - P + 1); }
     }
@@ -328,6 +341,27 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     pthread_mutex_init(&sp->mu, nullptr);
     pthread_cond_init(&sp->cv_free, nullptr);
     pthread_cond_init(&sp->cv_ready, nullptr);
+    sp->occ = calloc((size_t)S->n, sizeof *sp->occ);
+    for (int i = 0; i < S->n; i++) {   /* coarsest recto level that fits in memory: cells with any surface fraction */
+        source *s = &S->src[i];
+        if (s->reg[0] && s->reg[0]->n) continue;
+        int lc = -1; z3 *tz = nullptr;
+        for (int l = MAXLEV - 1; l >= 3; l--) { z3 *t = source_tgt(s, 0, l); if (t) { const z3_meta *m = z3_meta_of(t); if ((double)m->shape[0] * m->shape[1] * m->shape[2] <= 3e8) { lc = l; tz = t; break; } } }
+        if (!tz) continue;
+        const z3_meta *m = z3_meta_of(tz);
+        size_t tot = (size_t)m->shape[0] * m->shape[1] * m->shape[2];
+        uint8_t *buf = malloc(tot);
+        int64_t o0[3] = {0, 0, 0};
+        if (!buf || z3_read(tz, o0, m->shape, buf, 8)) { free(buf); continue; }
+        size_t n = 0; for (size_t k = 0; k < tot; k++) n += buf[k] != 255 && buf[k] > 0;
+        int surf = n > 0; if (!n) for (size_t k = 0; k < tot; k++) n += buf[k] != 255;
+        if (!n) { free(buf); continue; }
+        uint32_t *idx = malloc(n * sizeof *idx); size_t j = 0;
+        for (size_t k = 0; k < tot; k++) if (buf[k] != 255 && (surf ? buf[k] > 0 : 1)) idx[j++] = (uint32_t)k;
+        free(buf);
+        sp->occ[i].idx = idx; sp->occ[i].n = n; sp->occ[i].lev = lc; for (int d = 0; d < 3; d++) sp->occ[i].shape[d] = m->shape[d];
+        fprintf(stderr, "sampler: %s: %zu of %zu level-%d cells %s\n", s->name, n, tot, lc, surf ? "contain surface" : "are labelled");
+    }
     sp->cum = malloc((size_t)S->n * sizeof(double));
     double acc = 0;
     for (int i = 0; i < S->n; i++) { acc += S->src[i].weight; sp->cum[i] = acc; }
@@ -370,7 +404,8 @@ void sampler_stop(sampler *sp) {
     pthread_mutex_unlock(&sp->mu);
     for (int i = 0; i < sp->cfg.nworkers; i++) pthread_join(sp->th[i], nullptr);
     for (int i = 0; i < sp->nslots; i++) free_batch(&sp->slots[i]);
-    free(sp->slots); free(sp->state); free(sp->th); free(sp->cum);
+    for (int i = 0; i < sp->S->n; i++) free(sp->occ[i].idx);
+    free(sp->occ); free(sp->slots); free(sp->state); free(sp->th); free(sp->cum);
     free(sp);
 }
 

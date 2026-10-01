@@ -155,7 +155,9 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   (the hardware 2:4 pattern) with SR-STE (`--srste`); the dense kernels run on the masked copy because the convs are
   staging-bound and a sparse MMA would not help today. Synthetic sheet task, 600 steps, two seeds (dense 0.156 / 0.165):
   QAT fp8 0.159 / 0.161, plain fp8 0.157 / 0.165, QAT fp4 0.169 / 0.166, 2:4 sparse 0.179 / 0.167, fp8 weights
-  (stochastic rounding) 0.153-0.162.
+  (stochastic rounding) 0.153-0.163, fp8 weights + QAT fp8 0.156 / 0.158. Direct fp4 weights do NOT train: with one
+  mantissa bit the stochastic-rounding noise dominates the updates (0.47-0.64, NaN in fp16 mode); fp4 deployment has to
+  go through QAT (`--qat 3`, 0.167) with round-to-nearest at the end, or an error-feedback residual, not tried.
 
 ## Status (2026-09-30 night)
 - M0 reader + CLI + sampler: done, tested (bit-exact zarr3 reads, sampler montages checked by eye).
