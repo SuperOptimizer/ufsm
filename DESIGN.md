@@ -303,6 +303,27 @@ Where the rest would come from:
   clamped voxels only lose a little precision. The replayed batch now matches the exact kernels. A GroupNorm after
   each down conv would remove the amplification altogether but changes the model (candidate for a later run).
 
+### Sampler throughput, fp4 inference, Muon (2026-10-01 afternoon)
+- The trainer had become data-loader bound (r9 fell to 8-14 samples/s with the sampler waiting 75-90%). Per-stage
+  profile (`UFSM_SAMPLER_PROF=1`, `tests/bench_sampler.c`), ms of worker time per 128^3 patch on the loaded box: CT read
+  337, intensity noise 105 (Box-Muller per voxel), soft-target chamfer 85, trust-band max filter 82, 16-bit convert 14,
+  z-score 13. Fixes: Gaussian noise from a 4096-entry per-worker table (105 -> 29), trust band derived from the same
+  3-4-5 chamfer distance as the soft target (82 -> 4, chamfer computed once per channel), windows snapped to the CT
+  chunk grid (`sample_cfg.snap`, on by default: the CT chunks are 128^3, so a 128^3 window decodes 1 chunk instead of up
+  to 8). 16 workers: 44 -> 87 samples/s under load. The remaining read cost was cache misses: 41% of chunk reads went
+  to the network (`z3_io_stats`), because the old prefetch only cached chunks containing surface at levels 0-1. New
+  prefetch (`z3_prefetch_chunk`, no decode): per level, the chunk set covering every window around every occupied cell
+  (P/2 offset, snapped, neighbours) plus the level+3 probe windows, deduplicated in a bitmap; `--levels 3` covers the
+  training levels. A cached, aligned 128^3 window decodes in 4.6 ms (`tests/bench_read.c`).
+- fp4 inference: the fp16 fine-tuned MANBp model scores F1 0.297 (0.5) / 0.277 (0.7) at fp16 inference and 0.295 /
+  0.271 with `predict --prec 3` (e2m1 activations and weights, block scales): fp4 inference of an fp16-trained model
+  costs 0.002 F1. Training with packed fp4 weights (`--qat 3 --wq 4`) costs 0.05 F1 (0.242) and is not needed for fp4
+  deployment, since prec 3 quantises the weights per block on the fly to the same values.
+- Muon (modded-nanogpt): `--opt muon` runs nesterov momentum + 5 Newton-Schulz iterations on each 3^3 conv weight
+  viewed as [Co][Ci*27] (`nn_muon`, `tests/test_muon.c`), AdamW on biases, GroupNorm and the head, lr 0.02 following
+  the AdamW schedule shape. Kaggle smoke run, 600 steps: train loss 0.41 vs 0.59, validation 0.54 vs 0.63 for AdamW,
+  at ~15% more step time (naive small-matrix kernels). Real-data yardstick pending.
+
 ### Accuracy diagnosis (2026-10-01 morning)
 - Held-out scores of r5 (8 sources, soft sigma 3, intensity-only augmentation, 17k of 40k steps) against r4: F1 at
   threshold 0.3 per source 0.18/0.06/0.17/0.17/0.065/0.045/0.78 vs 0.19/0.05/0.16/0.16/0.06/0.045/0.77 (level 1);
