@@ -8,12 +8,48 @@
 #include "z3w.h"
 #include "zarr3.h"
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+/* tile read-ahead: a reader thread fills a ring of CT windows (with their nonzero count and intensity sums) in tile
+   order while the main thread runs the network on the previous one */
+#define NSLOT 3
+typedef struct { int64_t tz, ty, tx; int64_t shard; } tile_t;
+typedef struct {
+    z3 *ct; const int64_t *bo; int W, nthreads;
+    tile_t *tiles; long ntiles;
+    uint8_t *buf[NSLOT]; size_t nz[NSLOT]; double sum[NSLOT], sq[NSLOT];
+    atomic_long filled;          /* tiles read so far (slot = i % NSLOT) */
+    atomic_long consumed;        /* tiles released by the main thread */
+    atomic_int failed;
+    pthread_mutex_t mu; pthread_cond_t cv;
+} reader_t;
+static void *reader_main(void *arg) {
+    reader_t *r = arg;
+    size_t w3 = (size_t)r->W * r->W * r->W;
+    for (long i = 0; i < r->ntiles && !atomic_load(&r->failed); i++) {
+        pthread_mutex_lock(&r->mu);
+        while (i - atomic_load(&r->consumed) >= NSLOT) pthread_cond_wait(&r->cv, &r->mu);
+        pthread_mutex_unlock(&r->mu);
+        int k = (int)(i % NSLOT);
+        tile_t *t = &r->tiles[i];
+        int64_t o[3] = {r->bo[0] + t->tz, r->bo[1] + t->ty, r->bo[2] + t->tx}, n[3] = {r->W, r->W, r->W};
+        if (z3_read(r->ct, o, n, r->buf[k], r->nthreads)) { atomic_store(&r->failed, 1); }
+        else {
+            const uint8_t *c = r->buf[k]; size_t nz = 0; double sum = 0, sq = 0;
+            for (size_t j = 0; j < w3; j++) { nz += c[j] != 0; sum += c[j]; sq += (double)c[j] * c[j]; }
+            r->nz[k] = nz; r->sum[k] = sum; r->sq[k] = sq;
+        }
+        pthread_mutex_lock(&r->mu); atomic_store(&r->filled, i + 1); pthread_cond_broadcast(&r->cv); pthread_mutex_unlock(&r->mu);
+    }
+    pthread_mutex_lock(&r->mu); pthread_cond_broadcast(&r->cv); pthread_mutex_unlock(&r->mu);
+    return nullptr;
+}
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
     return dflt;
@@ -62,7 +98,7 @@ int cmd_predict(int argc, char **argv) {
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     int stride = W - 2 * halo;
     size_t w3 = (size_t)W * W * W;
-    uint8_t *ctu = malloc(w3), *sbuf = malloc((size_t)shard * shard * shard);
+    uint8_t *sbuf = malloc((size_t)shard * shard * shard);
     /* the window goes up as uint8; the input channels are built on the device in the network's storage type */
     const int h16 = nn_get_tf32() && nn_get_act_bf16() && !getenv("UFSM_ACT_MX8");
     uint8_t *ctd = nn_malloc(w3), *pu = malloc(w3), *pud = nn_malloc(w3);
@@ -72,19 +108,47 @@ int cmd_predict(int argc, char **argv) {
     int64_t ns[3];
     for (int d = 0; d < 3; d++) ns[d] = (bn[d] + shard - 1) / shard;
     double t0 = now(); long ntiles = 0, nskip = 0;
+    /* enumerate the tiles in shard order, then let the reader run ahead */
+    reader_t rd = {0}; rd.ct = ct; rd.bo = bo; rd.W = W; rd.nthreads = nthreads;
+    long cap = 0;
     for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
         int64_t so[3] = {sz * shard, sy * shard, sx * shard}, se[3];
         for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
-        memset(sbuf, 0, (size_t)shard * shard * shard);
-        int any = 0;
         for (int64_t tz = so[0] - halo; tz + halo < se[0]; tz += stride)
         for (int64_t ty = so[1] - halo; ty + halo < se[1]; ty += stride)
         for (int64_t tx = so[2] - halo; tx + halo < se[2]; tx += stride) {
-            int64_t o[3] = {bo[0] + tz, bo[1] + ty, bo[2] + tx}, n[3] = {W, W, W};
-            if (z3_read(ct, o, n, ctu, nthreads)) { fprintf(stderr, "%s\n", z3_error()); return 1; }
-            size_t nz = 0; double sum = 0, sq = 0;
-            for (size_t k = 0; k < w3; k++) { nz += ctu[k] != 0; sum += ctu[k]; sq += (double)ctu[k] * ctu[k]; }
-            if (nz == 0) { nskip++; continue; }
+            if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
+            rd.tiles[rd.ntiles++] = (tile_t){tz, ty, tx, (sz * ns[1] + sy) * ns[2] + sx};
+        }
+    }
+    for (int k = 0; k < NSLOT; k++) rd.buf[k] = malloc(w3);
+    atomic_store(&rd.filled, 0); atomic_store(&rd.consumed, 0); atomic_store(&rd.failed, 0);
+    pthread_mutex_init(&rd.mu, nullptr); pthread_cond_init(&rd.cv, nullptr);
+    pthread_t rth; pthread_create(&rth, nullptr, reader_main, &rd);
+    int64_t cur_shard = -1, so[3] = {0, 0, 0}, se[3] = {0, 0, 0}, sz = 0, sy = 0, sx = 0;
+    int any = 0;
+    for (long i = 0; i < rd.ntiles; i++) {
+        pthread_mutex_lock(&rd.mu);
+        while (atomic_load(&rd.filled) <= i && !atomic_load(&rd.failed)) pthread_cond_wait(&rd.cv, &rd.mu);
+        pthread_mutex_unlock(&rd.mu);
+        if (atomic_load(&rd.failed)) { fprintf(stderr, "%s\n", z3_error()); return 1; }
+        const tile_t *t = &rd.tiles[i];
+        if (t->shard != cur_shard) {   /* new shard: flush the previous one */
+            if (cur_shard >= 0) {
+                if (any && z3w_write_shard(w, sz, sy, sx, sbuf, nthreads)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+                fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   ", (long long)(cur_shard + 1), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
+            }
+            cur_shard = t->shard; sz = cur_shard / (ns[1] * ns[2]); sy = (cur_shard / ns[2]) % ns[1]; sx = cur_shard % ns[2];
+            so[0] = sz * shard; so[1] = sy * shard; so[2] = sx * shard;
+            for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
+            memset(sbuf, 0, (size_t)shard * shard * shard); any = 0;
+        }
+        int k = (int)(i % NSLOT);
+        const uint8_t *ctu = rd.buf[k];
+        const int64_t tz = t->tz, ty = t->ty, tx = t->tx, o[3] = {bo[0] + tz, bo[1] + ty, bo[2] + tx};
+        {
+            size_t nz = rd.nz[k]; double sum = rd.sum[k], sq = rd.sq[k];
+            if (nz == 0) { nskip++; pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu); continue; }
             double mean = sum / (double)w3, var = sq / (double)w3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
             for (int z = 0; z < W; z++) {   /* window origin relative to the axis at this slice (double on the host, small in float) */
                 double cy, cx;
@@ -97,6 +161,7 @@ int cmd_predict(int argc, char **argv) {
             const float *lg = unet_forward_x(u, xd, xs, 0, h16);
             nn_pred_output(lg, ctd, w3, pud);      /* channel 0 = recto */
             nn_d2h(pu, pud, w3);
+            pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu);   /* slot free: the window is on the device */
             const char *e = nn_check();
             if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }
             /* interior into the shard buffer */
@@ -113,10 +178,12 @@ int cmd_predict(int argc, char **argv) {
             }
             any = 1; ntiles++;
         }
-        if (any && z3w_write_shard(w, sz, sy, sx, sbuf, nthreads)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
-        fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   ", (long long)((sz * ns[1] + sy) * ns[2] + sx + 1), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
     }
-    fprintf(stderr, "\n");
+    if (cur_shard >= 0 && any && z3w_write_shard(w, sz, sy, sx, sbuf, nthreads)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+    pthread_join(rth, nullptr);
+    for (int k = 0; k < NSLOT; k++) free(rd.buf[k]);
+    free(rd.tiles);
+    fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   \n", (long long)(ns[0] * ns[1] * ns[2]), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
     z3w_close(w);
     for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
     pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs);
