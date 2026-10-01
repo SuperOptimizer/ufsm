@@ -111,7 +111,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
 int cmd_train(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 96] [--B 2] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
-                        "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--resume CKPT] [--finetune 1] [--opt adamw|muon] [--muon-lr 0.02] [--muon-beta 0.95]\n"
+                        "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--resume CKPT] [--finetune 1] [--opt adamw|muon] [--muon-lr 0.02] [--muon-beta 0.95] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1]\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  env UFSM_PROF=1 prints per-op GPU time every log interval (category 'upload+loss+opt').\n");
@@ -132,6 +132,8 @@ int cmd_train(int argc, char **argv) {
     const char *optname = opt(argc, argv, "--opt", "adamw");   /* adamw | muon (3^3 conv weights: nesterov momentum + Newton-Schulz orthogonalisation; rest AdamW) */
     float muon_lr = (float)atof(opt(argc, argv, "--muon-lr", "0.02")), muon_beta = (float)atof(opt(argc, argv, "--muon-beta", "0.95"));
     int use_muon = !strcmp(optname, "muon");
+    const char *sched = opt(argc, argv, "--sched", "cos");   /* cos | wsd (warmup, constant, linear cooldown over the last --cooldown fraction; extendable runs) */
+    float cooldown = (float)atof(opt(argc, argv, "--cooldown", "0.2"));
     int qat = atoi(opt(argc, argv, "--qat", "0"));         /* quantization-aware training: forward/backward-data at precision 2 (fp8) or 3 (fp4), weight gradients at 16-bit */
     if (qat) { nn_set_prec(qat); nn_set_prec_wgrad(1); }
     int wq = atoi(opt(argc, argv, "--wq", "0"));            /* 8 or 4: true fp8 / fp4 weights (stochastic rounding after each update) */
@@ -307,7 +309,10 @@ int cmd_train(int argc, char **argv) {
         int fwd_nan = 0;   /* non-finite loss parts: the forward itself produced non-finite logits (not a gradient-scale overflow) */
         for (int g = 0; g < ng; g++) for (int c = 0; c < 2 * NCH; c++) if (!isfinite(parts[g][c])) fwd_nan = 1;
         if (fwd_nan && !overfit) diagnose_nan(&G[0], B, P, step, out);
-        float lr = step <= warmup ? lr0 * (float)step / warmup : lr0 * 0.5f * (1.f + cosf(3.14159265f * (float)(step - warmup) / (float)(steps - warmup)));
+        float lr;
+        if (step <= warmup) lr = lr0 * (float)step / warmup;
+        else if (!strcmp(sched, "wsd")) { int cd0 = (int)(steps * (1.f - cooldown)); lr = step < cd0 ? lr0 : lr0 * (float)(steps - step) / (float)(steps - cd0); }
+        else lr = lr0 * 0.5f * (1.f + cosf(3.14159265f * (float)(step - warmup) / (float)(steps - warmup)));
         if (soft_end != sc.soft) sampler_set_soft(sp, sc.soft + (soft_end - sc.soft) * (step < steps ? (float)step / (float)steps : 1.f));
         double gn = 0;
         for (int g = 0; g < ng; g++) {
