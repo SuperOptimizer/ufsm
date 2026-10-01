@@ -470,6 +470,10 @@ chunked modes only under `--mem auto16`). 448^3 picks MX-fp8 gradients (15.4 of 
 Gvoxel/s; 512^3 picks MX-fp8 + chunked + lean (15.8 GB, peak 15.85 measured), 0.81 samples/s = 0.109 Gvoxel/s (lean
 loses the upload overlap). 16-bit gradients top out at ~448^3.
 
+Lean 2 merged (no gradient buffer B): 2 GPUs data parallel, B1 per GPU, `--mem auto`, all2_cached, 20 steps:
+512^3 MX-fp8 chunked lean 0.94 samples/s = 0.126 Gvoxel/s; 544^3 + lean 2 0.81 = 0.130; 576^3 + recompute 2 + lean 2
+0.62 = 0.118. Per-voxel rate is flat up to 544^3 (single GPU: 66 Mvoxel/s at 448-544, 59 at 576).
+
 ### Sampler on the 17-source set (2026-10-01 evening)
 - On configs/all2.json the sampler collapsed to 34 patches/s (16 workers) and got slower with 32: 331 lazy store
   opens (one remote metadata fetch each, 70-500 ms) serialised on the open mutex, paid by every worker's first draws
