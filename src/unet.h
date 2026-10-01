@@ -94,3 +94,9 @@ int unet_act_mx(void);   /* 1: MX activation storage (MX-fp8 gradients need it) 
 void unet_set_chunk_up(int on);   /* chunked up-part gradient: 0 off, 1 (default) 16-bit storage only, 2 also under MX storage */
 size_t unet_train_bytes(unet *u, shape5 xs);   /* training activation + gradient bytes at xs for the current modes (dry build) */
 size_t unet_grad_bytes(const unet *u);   /* the activation-gradient part of unet_activation_bytes */
+/* spatial split of one window along z across two GPUs (src/split.h): side 0 holds the low z planes, side 1 the high ones, each
+   plus h0 = 2^(nlev-1) halo planes at level 0 on the side facing the other (the input it is given has that depth). fn exchanges
+   a tensor's innermost halo plane with the other GPU (split_halo). Loss masks must be 0 on the halo planes. side -1 / fn null:
+   off. Parameter gradients are this half's share: sum them across the two GPUs. */
+typedef void (*unet_halo_fn)(const void *p, shape5 s, int esz, int h);
+void unet_set_split(unet *u, int side, int h0, unet_halo_fn fn);

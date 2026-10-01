@@ -786,6 +786,7 @@ __global__ void __launch_bounds__(fw_nth_z(MT, FZ), fw_blocks_z(MT, FZ)) conv_fw
     /* epilogue straight from registers; optional GroupNorm statistics of the output (sum, sum of squares per
        (n, group)) reduced within the block in smem, one pair of double atomics per channel per block */
     float *cs = (float *)smem_raw;                     /* [2][BM] block partials */
+    const int zs0 = sp.zlo, zs1 = D - sp.zhi;          /* statistics over the z planes this GPU owns (spatial split) */
     if (osum) { __syncthreads(); for (int i = threadIdx.x; i < 2 * BM; i += NTH) cs[i] = 0.f; __syncthreads(); }
 #pragma unroll
     for (int m = 0; m < MT; m++)
@@ -798,6 +799,7 @@ __global__ void __launch_bounds__(fw_nth_z(MT, FZ), fw_blocks_z(MT, FZ)) conv_fw
                 int oz = oz0 + wz, oy = oy0 + wr + r;
                 if (oz >= D || oy >= H || co >= Co) continue;
                 float bias = b ? b[co] : 0.f;
+                const bool zst = oz >= zs0 && oz < zs1;
                 TO *yp = S2B ? y + (((size_t)n * Co + co) * ts.Dx + (2 * oz + ts.pz)) * ts.Hx * ts.Wx + (size_t)(2 * oy + ts.py) * ts.Wx + ts.px
                              : (sp.y2 && co >= sp.o_split) ? (TO *)sp.y2 + (((size_t)n * (Co - sp.o_split) + co - sp.o_split) * D + oz) * H * W + (size_t)oy * W
                                                            : y + (((size_t)n * (sp.y2 ? sp.o_split : Co) + co) * D + oz) * H * W + (size_t)oy * W;
@@ -808,9 +810,9 @@ __global__ void __launch_bounds__(fw_nth_z(MT, FZ), fw_blocks_z(MT, FZ)) conv_fw
                     if (osum && is_f16<TO>::v) {   /* activation feeding a GroupNorm, stored as fp16: saturate instead of inf (the statistics use the stored value) */
                         v0 = sat_h16(v0); v1 = sat_h16(v1);
                     }
-                    if (!S2B && !(W & 1) && ox + 1 < W) { stv2(yp, (size_t)ox, v0, v1); ps += v0 + v1; pss += v0 * v0 + v1 * v1; continue; }   /* paired store */
-                    if (ox < W) { stv(yp, (size_t)ox * (S2B ? 2 : 1), v0); ps += v0; pss += v0 * v0; }
-                    if (ox + 1 < W) { stv(yp, (size_t)(ox + 1) * (S2B ? 2 : 1), v1); ps += v1; pss += v1 * v1; }
+                    if (!S2B && !(W & 1) && ox + 1 < W) { stv2(yp, (size_t)ox, v0, v1); if (zst) { ps += v0 + v1; pss += v0 * v0 + v1 * v1; } continue; }   /* paired store */
+                    if (ox < W) { stv(yp, (size_t)ox * (S2B ? 2 : 1), v0); if (zst) { ps += v0; pss += v0 * v0; } }
+                    if (ox + 1 < W) { stv(yp, (size_t)(ox + 1) * (S2B ? 2 : 1), v1); if (zst) { ps += v1; pss += v1 * v1; } }
                 }
             }
             if (osum) {
@@ -1083,6 +1085,23 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_tc_s2_k(const TI *__restrict_
 }
 
 static int cur_dev(void) { int d = 0; cudaGetDevice(&d); return d & 7; }
+
+/* ---- spatial split of one window along z across two GPUs (nn_split_cfg, per device): every tensor of this GPU covers its own
+   z planes plus halo planes owned by the other GPU (lo0 at the low end and hi0 at the high end of the level-0 depth D0; a
+   level-l tensor of depth D has lo0 D / D0 and hi0 D / D0 of them). GroupNorm statistics skip the halo planes and are summed
+   across the two GPUs (the reduce callback), so mean / rstd are those of the whole window (Dg0 planes at level 0). */
+static struct { int on, lo0, hi0, D0, Dg0; } g_zs[8];
+static void (*g_split_reduce)(double *, int);
+extern "C" void nn_split_cfg(int lo0, int hi0, int D0, int Dg0) { g_zs[cur_dev()] = {D0 > 0, lo0, hi0, D0, Dg0}; }
+extern "C" void nn_split_set_reduce(void (*fn)(double *, int)) { g_split_reduce = fn; }
+static int zs_on(void) { return g_zs[cur_dev()].on; }
+static void zs_range(int D, int *lo, int *hi) {   /* halo planes at the low / high end of a tensor of depth D */
+    const auto &z = g_zs[cur_dev()];
+    *lo = z.on ? (int)((long)z.lo0 * D / z.D0) : 0; *hi = z.on ? (int)((long)z.hi0 * D / z.D0) : 0;
+}
+static size_t zs_len(size_t len, int D) { const auto &z = g_zs[cur_dev()]; return z.on ? len / D * (size_t)((long)z.Dg0 * D / z.D0) : len; }   /* element count of the whole window */
+static void zs_reduce(double *b, int n) { if (zs_on() && g_split_reduce) g_split_reduce(b, n); }   /* sum over both GPUs */
+static split_t zs_split(split_t sp, int D) { zs_range(D, &sp.zlo, &sp.zhi); return sp; }
 /* x-shift packed weights for XP: wp[kz * 3 + ky][co][kx * 4 + c] (kx = 3 and c >= Ci zero), Cop rows */
 template <typename HT>
 __global__ void prep_wxp_k(const float *w, HT *wp, int Co, int Ci, int Cop) {
@@ -1896,9 +1915,10 @@ extern "C" int nn_conv3d_fwd_gn_stats(const float *x, shape5 xs, int G_in, const
     int NG = xs.n * G_out;
     double *sums = gn_dsums((size_t)2 * NG);
     cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double));
-    split_t ns = {nullptr, 0, nullptr, 0};
+    split_t ns = zs_split(split_t{}, xs.d);
     conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, ns);
-    gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, (size_t)(cout / G_out) * shape_spatial(xs), eps, omean, orstd);
+    zs_reduce(sums, 2 * NG);
+    gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zs_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd);
     KCHECK();
     return 0;
 }
@@ -1910,10 +1930,11 @@ extern "C" int nn_conv3d_fwd_split(const float *x, const float *x2, int c_split,
     if (!g_tf32) return -1;
     gnp_t gp = {gamma, beta, mean, rstd, G_in};
     split_t sp = {x2, c_split, nullptr, 0};
+    sp = zs_split(sp, xs.d);
     double *sums = nullptr;
     if (G_out) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
     conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, sp);
-    if (G_out) gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, (size_t)(cout / G_out) * shape_spatial(xs), eps, omean, orstd);
+    if (G_out) { zs_reduce(sums, 2 * xs.n * G_out); gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, zs_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd); }
     KCHECK();
     return 0;
 }
@@ -2010,9 +2031,9 @@ extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x
         split_t sp; if (xsplit(x2, gx, gx2, c_split, up, xs, &sp)) return -1;
         if (up && !up_kernel_ok(x, x2, 0)) return -1;
         double *sums = nullptr;
-        if (G_out) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
+        if (G_out) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); sp = zs_split(sp, ys.d); }
         conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, sp);
-        if (G_out) gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, (size_t)(cout / G_out) * shape_spatial(ys), eps, omean, orstd);
+        if (G_out) { zs_reduce(sums, 2 * xs.n * G_out); gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, zs_len((size_t)(cout / G_out) * shape_spatial(ys), ys.d), eps, omean, orstd); }
         KCHECK();
         return 0;
     }
@@ -2112,13 +2133,24 @@ __global__ void gn_silu_bwd_stats_k(const TI *x, const TG *gy, const float *gamm
     for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) { r1[threadIdx.x] += r1[threadIdx.x + o]; r2[threadIdx.x] += r2[threadIdx.x + o]; } __syncthreads(); }
     if (threadIdx.x == 0) { atomicAdd(&ds[2 * nc], r1[0]); atomicAdd(&ds[2 * nc + 1], r2[0]); }
 }
-__global__ void gn_group_sums_k(const float *st, const float *gamma, int N, int C, int G, float *AB) {   /* AB[2*ng] = sum st*gamma, AB[2*ng+1] = sum st2*gamma */
+__global__ void gn_group_sums_k(const float *st, const float *gamma, int N, int C, int G, float *AB, float f = 1.f) {   /* AB[2*ng] = f sum st*gamma, AB[2*ng+1] = f sum st2*gamma */
     int ng = blockIdx.x * blockDim.x + threadIdx.x;
     if (ng >= N * G) return;
     int n = ng / G, g = ng % G, cpg = C / G;
     float A = 0.f, B = 0.f;
     for (int cc = g * cpg; cc < (g + 1) * cpg; cc++) { A += st[2 * (n * C + cc)] * gamma[cc]; B += st[2 * (n * C + cc) + 1] * gamma[cc]; }
-    AB[2 * ng] = A; AB[2 * ng + 1] = B;
+    AB[2 * ng] = A * f; AB[2 * ng + 1] = B * f;
+}
+/* spatial split: the per-(n, c) backward sums ds (2 NC doubles) of this GPU give its share of the GroupNorm parameter
+   gradients (summed across GPUs with the weight gradients), then are summed across the GPUs for the group sums AB, which the
+   apply kernels divide by their local element count: f rescales them to the whole window's count */
+__global__ void gn_param_grad_k2(const float *st, float *ggamma, float *gbeta, int N, int C);
+static float gn_bwd_reduce(double *ds, float *st, int NC, int D, float *ggamma, float *gbeta, int N, int C) {
+    if (!zs_on()) return 1.f;
+    gn_param_grad_k2<<<nblk(C, 128), 128>>>(st, ggamma, gbeta, N, C);
+    zs_reduce(ds, 2 * NC);
+    d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, st, 2 * NC);
+    return (float)D / (float)zs_len((size_t)D, D);
 }
 template <typename TI, typename TG, typename TO>
 __global__ void gn_silu_bwd_apply_k(const TI *x, const TG *gy, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *AB,
@@ -2160,9 +2192,11 @@ static void gn_silu_bwd_t(const TI *x, shape5 s, int G, const float *gamma, cons
     gn_silu_bwd_stats_k<<<dim3(NC, nsl), 256>>>(x, gy, gamma, beta, mean, rstd, s.c, G, S, ds);
     d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
     float *AB = scratch + 2 * NC;   /* scratch holds 2*NC stats followed by 2*N*G group sums (nn_gn_scratch sized accordingly) */
-    gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB);
+    const int zsp = zs_on();
+    const float f = gn_bwd_reduce(ds, scratch, NC, s.d, ggamma, gbeta, s.n, s.c);   /* spatial split: local param grads, global sums */
+    gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, f);
     gn_silu_bwd_apply_k<<<dim3(NC, nsl), 256>>>(x, gy, gamma, beta, mean, rstd, AB, gx, s.c, G, S);
-    gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
+    if (!zsp) gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
     KCHECK();
 }
 extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy,
@@ -2176,9 +2210,11 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
         if (gdt != (ISMX(gx) ? MXDT(gx) : LPDT(GBF)) || gdt == 4) { fprintf(stderr, "gn_silu_bwd: gy and gx must share the storage (MX-fp8 or 16-bit; never fp4)\n"); abort(); }
         lp_gn_silu_bwd_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, ds, scratch, AB);
         d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
-        gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB);
+        const int zsp = zs_on();
+        const float f = gn_bwd_reduce(ds, scratch, NC, s.d, ggamma, gbeta, s.n, s.c);
+        gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, f);
         lp_gn_silu_bwd_apply_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, AB);
-        gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
+        if (!zsp) gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
         KCHECK();
         return;
     }
@@ -2192,13 +2228,14 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
 /* ================= GroupNorm =================
    Statistics are reduced by (n*G) x KSLAB blocks accumulating into double sums with atomics, then finalized. */
 template <typename T = float>
-__global__ void gn_sums_k(const T *x, int C, int G, size_t S, double *sums) {
+__global__ void gn_sums_k(const T *x, int C, int G, size_t S, double *sums, size_t v0 = 0, size_t v1 = ~(size_t)0) {   /* voxels [v0, v1) only */
     int ng = blockIdx.x, slab = blockIdx.y;
     int n = ng / G, g = ng % G, cpg = C / G;
     const T *p = x + ((size_t)n * C + (size_t)g * cpg) * S;
     size_t len = (size_t)cpg * S, per = (len + KSLAB - 1) / KSLAB, lo = (size_t)slab * per, hi = lo + per < len ? lo + per : len;
     double s1 = 0, s2 = 0;
-    for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) { double v = ldv(p, i); s1 += v; s2 += v * v; }
+    const bool all = v0 == 0 && v1 >= S;
+    for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) { if (!all) { size_t v = i % S; if (v < v0 || v >= v1) continue; } double v = ldv(p, i); s1 += v; s2 += v * v; }
     __shared__ double r1[256], r2[256];
     r1[threadIdx.x] = s1; r2[threadIdx.x] = s2;
     __syncthreads();
@@ -2256,16 +2293,20 @@ extern "C" int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *me
     int NG = s.n * G;
     double *sums = gn_dsums((size_t)2 * NG);
     cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double));
+    int zlo, zhi; zs_range(s.d, &zlo, &zhi);
+    const size_t v0 = (size_t)zlo * s.h * s.w, v1 = (size_t)(s.d - zhi) * s.h * s.w;
     if (ISMX(x)) {   /* MX storage: statistics of the dequantised values */
-        if (lp_gn_sums_mx(x, MXDT(x), s.n, s.c, G, S, sums)) return -1;
-        gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, (size_t)(s.c / G) * S, eps, mean, rstd);
+        if (lp_gn_sums_mx(x, MXDT(x), s.n, s.c, G, S, sums, v0, v1)) return -1;
+        zs_reduce(sums, 2 * NG);
+        gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zs_len((size_t)(s.c / G) * S, s.d), eps, mean, rstd);
         KCHECK();
         return 0;
     }
-    if (ABF && g_h16) gn_sums_k<f16><<<dim3(NG, KSLAB), 256>>>((const f16 *)x, s.c, G, S, sums);
-    else if (ABF) gn_sums_k<bf16><<<dim3(NG, KSLAB), 256>>>((const bf16 *)x, s.c, G, S, sums);
-    else gn_sums_k<float><<<dim3(NG, KSLAB), 256>>>(x, s.c, G, S, sums);
-    gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, (size_t)(s.c / G) * S, eps, mean, rstd);
+    if (ABF && g_h16) gn_sums_k<f16><<<dim3(NG, KSLAB), 256>>>((const f16 *)x, s.c, G, S, sums, v0, v1);
+    else if (ABF) gn_sums_k<bf16><<<dim3(NG, KSLAB), 256>>>((const bf16 *)x, s.c, G, S, sums, v0, v1);
+    else gn_sums_k<float><<<dim3(NG, KSLAB), 256>>>(x, s.c, G, S, sums, v0, v1);
+    zs_reduce(sums, 2 * NG);
+    gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zs_len((size_t)(s.c / G) * S, s.d), eps, mean, rstd);
     KCHECK();
     return 0;
 }
@@ -2873,6 +2914,7 @@ extern "C" void nn_loss_async(const float *logits, const uint8_t *t, const uint8
     double *ds = gn_dsums((size_t)5 * NC);
     cudaMemsetAsync(ds, 0, (size_t)5 * NC * sizeof(double));
     loss_stats_k<<<dim3(NC, KSLAB), 256>>>(logits, t, m, w, s.c, S, ds, g_posw);
+    zs_reduce(ds, 5 * NC);   /* spatial split: statistics of the whole window (the halo planes are masked out by the caller) */
     loss_d2f_k<<<nblk(5 * NC, 128), 128>>>(ds, scratch, 5 * NC);
     loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, fin);
     if (gl) {
@@ -2902,6 +2944,90 @@ extern "C" void nn_peer_copy(void *dst, int dst_dev, const void *src, int src_de
         enabled[dst_dev & 7][src_dev & 7] = 1;
     }
     CK(cudaMemcpyPeer(dst, dst_dev, src, src_dev, bytes));
+}
+
+/* ---- spatial split: halo exchange and sums across the two GPUs (called by one host thread for both sides) ----
+   A tensor is one or two plane-major segments (rows of D planes): esz > 0 = [rows = n c][D][H][W] elements of esz bytes; esz 0 =
+   the MX tensor registered at p: data [n][blk][voxel][rb] (rows n nb of D planes of H W rb bytes) + the scale plane (rows of H W
+   bytes). Side 0 owns the low z planes (its halo is at the high end), side 1 the high ones. */
+typedef struct { size_t base, rows, pb, pitch; } zseg_t;
+static int zsegs(const void *p, shape5 s, int esz, zseg_t *sg) {
+    const size_t HW = (size_t)s.h * s.w, S = HW * s.d;
+    if (esz) { sg[0] = {0, (size_t)s.n * s.c, HW * esz, S * esz}; return 1; }
+    const int dt = nn_storage(p), bw = s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw, rb = dt == 4 ? bw / 2 : bw;
+    if (dt != 4 && dt != 8) { fprintf(stderr, "split: tensor %p has no MX registration\n", p); abort(); }
+    sg[0] = {0, (size_t)s.n * nb, HW * rb, S * rb};
+    sg[1] = {(size_t)s.n * nb * S * rb, (size_t)s.n * nb, HW, S};
+    return 2;
+}
+static size_t zsegs_plane_bytes(const zseg_t *sg, int ns) { size_t b = 0; for (int i = 0; i < ns; i++) b += sg[i].rows * sg[i].pb; return b; }
+/* planes [z0, z0 + nz) of every segment of t <-> contiguous buffer c (dir 0: gather into c, 1: scatter from c) */
+static void zsegs_copy(void *t, const zseg_t *sg, int ns, int z0, int nz, void *c, int dir) {
+    char *cb = (char *)c;
+    for (int i = 0; i < ns; i++) {
+        char *tp = (char *)t + sg[i].base + (size_t)z0 * sg[i].pb;
+        const size_t w = (size_t)nz * sg[i].pb;
+        if (dir) CK(cudaMemcpy2DAsync(tp, sg[i].pitch, cb, w, w, sg[i].rows, cudaMemcpyDeviceToDevice, 0));
+        else CK(cudaMemcpy2DAsync(cb, w, tp, sg[i].pitch, w, sg[i].rows, cudaMemcpyDeviceToDevice, 0));
+        cb += w * sg[i].rows;
+    }
+}
+static void zsegs_zero(void *t, const zseg_t *sg, int ns, int z0, int nz) {
+    if (nz <= 0) return;
+    for (int i = 0; i < ns; i++) CK(cudaMemset2DAsync((char *)t + sg[i].base + (size_t)z0 * sg[i].pb, sg[i].pitch, 0, (size_t)nz * sg[i].pb, sg[i].rows, 0));
+}
+/* zero the halo planes (lo at the low end, hi at the high end) of a tensor on the current device */
+extern "C" void nn_split_zero(const void *t, shape5 s, int esz, int lo, int hi) {
+    zseg_t sg[2]; int ns = zsegs(t, s, esz, sg);
+    zsegs_zero((void *)t, sg, ns, 0, lo); zsegs_zero((void *)t, sg, ns, s.d - hi, hi);
+    KCHECK();
+}
+static cudaEvent_t zs_ev(int dev, int k) {   /* per-device events for the cross-GPU ordering */
+    static cudaEvent_t ev[8][4]; static int init[8];
+    if (!init[dev]) { int cur; cudaGetDevice(&cur); cudaSetDevice(dev); for (int i = 0; i < 4; i++) cudaEventCreateWithFlags(&ev[dev][i], cudaEventDisableTiming); cudaSetDevice(cur); init[dev] = 1; }
+    return ev[dev][k];
+}
+/* both default streams wait for each other (event k) */
+static void zs_xbar(const int *dev, int k) {
+    int cur; cudaGetDevice(&cur);
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaEventRecord(zs_ev(dev[i], k), 0)); }
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaStreamWaitEvent(0, zs_ev(dev[1 - i], k), 0)); }
+    cudaSetDevice(cur);
+}
+extern "C" size_t nn_split_halo_bytes(shape5 s, int esz) {   /* bytes of one plane (send / receive buffer size) */
+    const size_t HW = (size_t)s.h * s.w;
+    if (esz) return (size_t)s.n * s.c * HW * esz;
+    const int bw = s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw;
+    return (size_t)s.n * nb * HW * (bw + 1);
+}
+/* halo exchange of tensor t[i] on device dev[i] (same shape on both, h halo planes): the innermost halo plane receives the
+   other side's boundary plane, the outer h - 1 halo planes are zeroed. sb / rb: per-side send / receive buffers of at least
+   nn_split_halo_bytes. Leaves both streams ordered after the exchange. */
+extern "C" void nn_split_halo(void *const *t, const int *dev, shape5 s, int esz, int h, void *const *sb, void *const *rb) {
+    int cur; cudaGetDevice(&cur);
+    zseg_t sg[2][2]; int ns = 0;
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); ns = zsegs(t[i], s, esz, sg[i]); }
+    const size_t nbytes = zsegs_plane_bytes(sg[0], ns);
+    const int D = s.d;
+    /* side 0 sends its last own plane D - h - 1 and receives into D - h; side 1 sends plane h and receives into h - 1 */
+    const int zsend[2] = {D - h - 1, h}, zrecv[2] = {D - h, h - 1}, zlo[2] = {D - h + 1, 0};
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); zsegs_copy(t[i], sg[i], ns, zsend[i], 1, sb[i], 0); zsegs_zero(t[i], sg[i], ns, zlo[i], h - 1); }
+    zs_xbar(dev, 0);
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaMemcpyPeerAsync(rb[i], dev[i], sb[1 - i], dev[1 - i], nbytes, 0)); zsegs_copy(t[i], sg[i], ns, zrecv[i], 1, rb[i], 1); }
+    zs_xbar(dev, 1);   /* the send buffers are free again */
+    cudaSetDevice(cur);
+    KCHECK();
+}
+__global__ void zs_add_k(double *a, const double *b, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] += b[i]; }
+/* b[i] (n doubles on dev[i]) = b[0] + b[1] on both devices; r[i]: n-double receive buffers */
+extern "C" void nn_split_allreduce(double *const *b, const int *dev, int n, double *const *r) {
+    int cur; cudaGetDevice(&cur);
+    zs_xbar(dev, 2);
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaMemcpyPeerAsync(r[i], dev[i], b[1 - i], dev[1 - i], (size_t)n * sizeof(double), 0)); }
+    zs_xbar(dev, 3);   /* both copies done before either sum overwrites its source */
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); zs_add_k<<<nblk(n, 128), 128>>>(b[i], r[i], n); }
+    cudaSetDevice(cur);
+    KCHECK();
 }
 
 /* ================= optimizer / reductions ================= */
