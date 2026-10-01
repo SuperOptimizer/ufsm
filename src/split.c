@@ -45,8 +45,8 @@ static void pass_and_wait(split_ctx *c, int me) {
 static void grow(split_ctx *c, size_t bytes, int nd) {
     for (int i = 0; i < 2; i++) {
         nn_init(c->dev[i]);
-        if (bytes > c->cap) for (int k = 0; k < 2; k++) { nn_free(c->sb[k][i]); nn_free(c->rb[k][i]); c->sb[k][i] = nn_malloc(bytes); c->rb[k][i] = nn_malloc(bytes); }
-        if (nd > c->rcap) { nn_free(c->rd[i]); c->rd[i] = nn_malloc((size_t)nd * sizeof(double)); }
+        if (bytes > c->cap) for (int k = 0; k < 2; k++) { nn_free(c->sb[k][i]); nn_free(c->rb[k][i]); c->sb[k][i] = nn_malloc(bytes); c->rb[k][i] = nn_malloc(bytes); if (!c->sb[k][i] || !c->rb[k][i]) { fprintf(stderr, "split: out of device memory for the %.1f MB halo buffers on GPU %d\n", bytes / 1e6, c->dev[i]); abort(); } }
+        if (nd > c->rcap) { nn_free(c->rd[i]); c->rd[i] = nn_malloc((size_t)nd * sizeof(double)); if (!c->rd[i]) { fprintf(stderr, "split: out of device memory on GPU %d\n", c->dev[i]); abort(); } }
     }
     if (bytes > c->cap) c->cap = bytes;
     if (nd > c->rcap) c->rcap = nd;

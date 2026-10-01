@@ -29,7 +29,7 @@ typedef struct {
     const float *lg;             /* logits of the last run_batch */
     uint8_t *tb[2], *mb[2], *wb[2];
     float *x; uint8_t *t, *m, *w; /* the buffers of the batch being computed */
-    void *ev_up[2], *ev_done;    /* upload of buffer i finished; compute of the previous step finished */
+    void *ev_up[2], *ev_done[2]; /* upload into buffer i finished; the compute that last used buffer i finished */
     batch *pending;              /* host batch whose upload into buffer (cur ^ 1) is in flight */
     int lean;                    /* one batch buffer; logit gradient in the model's gradient buffer B */
     int cur;
@@ -69,7 +69,8 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
 /* asynchronous upload of a pinned sampler batch into buffer i on the copy stream, after the compute that last used it */
 static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     size_t p3 = (size_t)P * P * P;
-    nn_stream_wait(1, d->ev_done);
+    nn_stream_wait(1, d->ev_done[i]);   /* the step two back: this upload overlaps the current step */
+    if (d->lean) nn_stream_wait(1, d->ev_done[i ^ 1]);   /* lean: one buffer (inside the gradient buffers), free after the current step */
     if (d->side >= 0) upload_slab(d, b, i, B, P, 1);
     else {
         nn_h2d_copy_stream(d->xb[i], bx(b), (size_t)B * 4 * p3 * xbytes());
@@ -290,7 +291,7 @@ int cmd_train(int argc, char **argv) {
                 const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
                 size_t trainer = nbuf * ((size_t)B * 4 * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean ? 0 : (size_t)B * NCH * p3 * (g_g16 ? 2 : 4));
                 if (cand[c].lean) trainer = cand[c].gmx ? 0 : (size_t)B * 4 * p3 * xbytes();   /* batch buffers inside the gradient buffer B (estimate) */
-                need = tb + tb / 14 + trainer + ((size_t)550 << 20);   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                need = tb + tb / 14 + trainer + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (need <= fmin) pick = c;
             }
             if (pick < 0) { pick = auto16 ? nc - 1 : 6; /* the smallest mode of the list */ fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
@@ -330,7 +331,8 @@ int cmd_train(int argc, char **argv) {
             d->ev_up[i] = nn_event_create();
         }
         if (lean && g == 0) fprintf(stderr, "lean %d: batch buffers %s, logit gradient %s\n", lean, !bs ? "separate" : xin_in ? "and input inside the gradient buffers" : "inside the gradient buffers, input separate", d->gl ? "inside" : "separate");
-        d->ev_done = nn_event_create(); nn_event_record(d->ev_done, 0); d->pending = nullptr; select_buf(d, 0);
+        for (int i = 0; i < 2; i++) { d->ev_done[i] = nn_event_create(); nn_event_record(d->ev_done[i], 0); }
+        d->pending = nullptr; select_buf(d, 0);
         if (!d->gl) d->gl = nn_malloc((size_t)B * NCH * p3 * (g_g16 ? 2 : 4));
         d->scratch = nn_malloc(nn_loss_scratch((shape5){B, NCH, P, P, P}) + 64);
         d->lean = lean;
@@ -391,7 +393,7 @@ int cmd_train(int argc, char **argv) {
             }
             split_arg sa = {G, B, P, 1, dice_w};
             split_run(sctx, split_job, &sa);
-            for (int g = 0; g < 2; g++) { nn_init(G[g].dev); nn_event_record(G[g].ev_done, 0); nn_event_sync(G[g].ev_up[G[g].cur]); }
+            for (int g = 0; g < 2; g++) { nn_init(G[g].dev); nn_event_record(G[g].ev_done[G[g].cur], 0); nn_event_sync(G[g].ev_up[G[g].cur]); }
             sampler_release(sp, G[0].pending);
             double tw = now(); batch *nb = sampler_next(sp); wait += now() - tw;
             if (!nb) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; G[0].pending = nullptr; break; }
@@ -455,7 +457,7 @@ int cmd_train(int argc, char **argv) {
             unet_zero_grad(d->u);
             run_batch(d, B, P, dice_w, 1);
             unet_backward_x(d->u, d->gl, g_g16);
-            nn_event_record(d->ev_done, 0);
+            nn_event_record(d->ev_done[d->cur], 0);
             nn_event_sync(d->ev_up[d->cur]);                 /* host buffer of this batch is free again */
             if (overfit) continue;                           /* keep computing on the same device buffer */
             sampler_release(sp, d->pending);
