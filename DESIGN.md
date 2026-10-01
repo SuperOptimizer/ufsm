@@ -322,6 +322,13 @@ are issue / staging / ldmatrix-bound at ~41 TFLOP/s, 2.4x above their memory flo
 family with M = output positions, N = output channels, K = input channels, the weights resident in registers across
 all 27 taps (one activation ldmatrix_x4 and two MMAs per tap per 16 positions, no weight loads), deeper z per block;
 16-bit first, then fp8 m16n8k32 with two taps per K block. Target ~2x on enc0.c2, dec0.c2, dec0.c1 (122 of 232 GF).
+First cut (d6c8438): 4 output planes per block for the 16-channel convs (halo restaging 2.8x -> 2.1x, weights loaded
+once per 512 outputs): enc0.c2 / dec0.c2 0.87 -> 0.75 ms, dec0.c1 2.86 -> 2.58, training step 66.4 -> 63.0 ms on the
+shared GPU, gradient error unchanged. Diagnosis with staging-only / MMA-only builds: the two halves (0.58 / 0.54 ms)
+each sit near their own limit and barely overlap (block stages the whole tile, syncs, then multiplies), so the next
+kernel is a persistent double-buffered producer / consumer (producer warps stage + GN + SiLU + convert tile i+1
+while consumer warps run the 27-tap MMAs on tile i, fp16 accumulation, weights resident per block); target
+~0.45-0.5 ms per 16-channel conv, the fused block kernel reuses the structure.
 Plan: (1) per-op profile (agent, done: fp8 on 16-channel convs is padding/staging-bound, Ci = 16 pads to the fp8
 K = 32; enc0.c1 pads Ci = 4 to 16; stride-2 convs latency-bound at 4-10 TFLOP/s; head and GN small); (2) agent's
 kernel changes in payoff order: dec0.c1 on the MX path without the transient (-14% at 96^3), K-packing of two taps
