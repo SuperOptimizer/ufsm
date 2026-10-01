@@ -2,6 +2,7 @@
 #include "json.h"
 #include <math.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdatomic.h>
 #include <time.h>
 #include <stdlib.h>
@@ -181,10 +182,26 @@ z3 *pyramid_open_level(store *st, const char *group, int level, double um0, cons
     snprintf(k, sizeof k, "%s/%d", group, level);   /* plain integer level names */
     return z3_open(st, k, cache);
 }
+/* does the group's multiscales metadata list a dataset for this level (by voxel size), or a plain integer level key exist?
+   Used only to decide whether an open failure is worth retrying. */
+static int level_listed(store *st, const char *group, int level, double um0) {
+    z3_level lv[16]; int nl = z3_group_levels(st, group, lv, 16);
+    if (nl <= 0 || um0 <= 0 || lv[0].um <= 0) return level < 8;
+    double want = um0 * (1 << level), rel = (double)(1 << level);
+    for (int i = 0; i < nl; i++) if (fabs(lv[i].um - want) < 0.02 * want || (lv[0].um == 1.0 && fabs(lv[i].um - rel) < 0.02 * rel)) return 1;
+    return 0;
+}
 static z3 *open_level(store *st, const char *group, int level, double um0) {
     static atomic_uint n_open; unsigned k = atomic_fetch_add(&n_open, 1);
     double t0 = 0; if (getenv("UFSM_OPEN_TRACE")) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); t0 = t.tv_sec + t.tv_nsec * 1e-9; }
     z3 *z = pyramid_open_level(st, group, level, um0, g_cache);
+    /* transient failures (remote metadata fetches, many opens in parallel at sampler start) must not silently disable a
+       level for the whole run: retry with backoff; a level that is genuinely absent fails all attempts (~3.5 s, once) */
+    for (int attempt = 0; !z && attempt < 3 && level_listed(st, group, level, um0); attempt++) {
+        usleep((useconds_t)(500000u << attempt));
+        z = pyramid_open_level(st, group, level, um0, g_cache);
+        if (z) fprintf(stderr, "open %s level %d: succeeded on retry %d\n", group, level, attempt + 1);
+    }
     if (t0) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); fprintf(stderr, "open #%u %s level %d: %s in %.0f ms\n", k, group, level, z ? "ok" : "FAILED", (t.tv_sec + t.tv_nsec * 1e-9 - t0) * 1e3); }
     return z;
 }
@@ -192,7 +209,7 @@ static z3 *open_level(store *st, const char *group, int level, double um0) {
    Without it two workers racing on the same level both opened it, one handle leaked, and a failed open under the race
    marked the level absent for the whole run (seen as workers spinning forever on draws with no usable level). */
 static pthread_mutex_t g_open_mu = PTHREAD_MUTEX_INITIALIZER;
-static void open_failed(const source *s, const char *what, int level) { if (getenv("UFSM_DEBUG")) fprintf(stderr, "source %s: %s level %d not available: %s\n", s->name, what, level, z3_error()); }
+static void open_failed(const source *s, const char *what, int level) { fprintf(stderr, "source %s: %s level %d not available: %s\n", s->name, what, level, z3_error()); }
 
 /* eager parallel open of every level and target of every source (each remote open is a metadata fetch of 70-500 ms; done
    lazily from the sampler workers they serialise on g_open_mu). The lazy path stays as the fallback. */
