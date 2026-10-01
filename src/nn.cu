@@ -1036,8 +1036,8 @@ static int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const 
         return lp_conv_fwd_f8(x, 3, xs, w, b, cout, y, 3, gp, osum, Go, sp);
     }
     const int pr = eff_prec();
-    if (!ts && pr == 2) return lp_conv_fwd_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp);
-    if (!ts && pr == 3) return lp_conv_fwd_f4(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp);
+    if (!ts && pr == 2 && !sp.up) return lp_conv_fwd_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp);   /* sp.up: 16-bit kernels only */
+    if (!ts && pr == 3 && !sp.up) return lp_conv_fwd_f4(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp);
     if (pr == 4) return g_h16 ? conv_fwd_tc_f16acc<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : conv_fwd_tc_f16acc<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts);
     return g_h16 ? conv_fwd_tc_h<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : conv_fwd_tc_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts);
 }
@@ -1483,7 +1483,7 @@ static void launch_bwd_w_tc_h(const void *x, int xbf, shape5 xs, const void *gy,
 }
 static void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
     if (ISMX(x)) { lp_bwd_w_f8(x, 3, xs, gy, ISMX(gy) ? 3 : LPDT(gybf), ys, gw, gb, gp, sp); return; }
-    if (eff_prec_w() == 2 || eff_prec_w() == 3) { lp_bwd_w_f8(x, LPDT(xbf), xs, gy, LPDT(gybf), ys, gw, gb, gp, sp); return; }   /* prec 4 (fp16) keeps the 16-bit kernel for the weight gradient */
+    if ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) { lp_bwd_w_f8(x, LPDT(xbf), xs, gy, LPDT(gybf), ys, gw, gb, gp, sp); return; }   /* prec 4 (fp16) keeps the 16-bit kernel for the weight gradient */
     if (g_h16) launch_bwd_w_tc_h<f16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
     else launch_bwd_w_tc_h<bf16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
 }
@@ -1751,6 +1751,22 @@ extern "C" int nn_conv3d_bwd_data_split(const float *gy, shape5 ys, const float 
     KCHECK();
     return 0;
 }
+/* Backward-data (k=3, stride 1) of input channels [c0, c0 + nc) only, into gx (nc channels). scratch as for
+   nn_conv3d_bwd_data. Lets a caller produce a wide input gradient in channel chunks. */
+extern "C" int nn_conv3d_bwd_data_range(const float *gy, shape5 ys, const float *w, shape5 xs, int c0, int nc, float *gx, float *scratch) {
+    if (!g_tf32 || c0 < 0 || nc <= 0 || c0 + nc > xs.c) return -1;
+    const int T = 27;
+    size_t nw = (size_t)ys.c * xs.c * T;
+    flip_w_k<<<nblk(nw, 256), 256>>>(w, scratch, ys.c, xs.c, T);   /* scratch[ci][co][t]: rows ci = output channels of this conv */
+    gnp_t none = {}; split_t ns = {};
+    shape5 gs = xs; gs.c = nc;
+    int save = g_pass; g_pass = 1;
+    conv_fwd_tc(gy, GBF, ys, scratch + (size_t)c0 * ys.c * T, nullptr, nc, gx, GBF, none, nullptr, 0, ns);
+    g_pass = save;
+    (void)gs;
+    KCHECK();
+    return 0;
+}
 /* y = silu(gn(x)) from precomputed statistics, one pass */
 extern "C" void nn_gn_silu_apply(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *y) {
     if (G > s.c) G = s.c;
@@ -1787,11 +1803,9 @@ extern "C" int nn_conv3d_bwd_weight_split(const float *x, const float *x2, int c
 /* ---- input-side recompute: the conv input silu(gn(.)) of a stored pre-norm tensor (and, for the decoder, the nearest
    upsample of the coarse block output) is formed while staging, so neither the normalized activation nor the
    upsampled tensor is stored ---- */
-static int up_kernel_ok(const float *x, const float *x2, int wgrad) {   /* 16-bit tensor-core kernels only (fp8 / MX: transient) */
-    if (ISMX(x) || ISMX(x2)) return 0;
-    const int pr = wgrad ? eff_prec_w() : eff_prec();
-    return pr != 2 && pr != 3;
-}
+/* fused upsample: 16-bit tensor-core kernels only. An fp8 / fp4 policy on that conv is served by the 16-bit kernels
+   (more precise; keeps the transient away); MX-stored inputs cannot be read by them -> -1 (caller uses the transient) */
+static int up_kernel_ok(const float *x, const float *x2, int wgrad) { (void)wgrad; return !ISMX(x) && !ISMX(x2); }
 static int xsplit(const float *x2, const nn_gn_t *gx, const nn_gn_t *gx2, int c_split, int up, shape5 xs, split_t *sp) {
     *sp = split_t{};
     if (up && (!x2 || (gx && gx->G) || ((xs.d | xs.h | xs.w) & 1))) return -1;   /* up: decoder split, x untransformed, even dims */
@@ -2477,7 +2491,7 @@ __device__ __forceinline__ void up_wts(int m, int n_in, float *wt) {   /* weight
     for (int k = 0; k < 4; k++) { int o = 2 * m - 1 + k; wt[k] = (o >= 0 && o < n_out) ? up_coef(o, m, n_in) : 0.f; }
 }
 template <typename TG, typename TO>
-__global__ void __launch_bounds__(256) up2_b_k(const TG *gy, TO *gx, int NC, int D, int H, int W) {
+__global__ void __launch_bounds__(256) up2_b_k(const TG *gy, TO *gx, int NC, int D, int H, int W, int C = 1, int ctot = 1, int c0 = 0) {   /* gx: channels c0.. of ctot */
     __shared__ float sg[10 * 18 * 18];                 /* gradient tile */
     __shared__ float hx[10 * 18 * 8], hy[10 * 8 * 8];  /* x-blended, then y-blended partials */
     const int tx = threadIdx.x & 7, ty = (threadIdx.x >> 3) & 7, tz = threadIdx.x >> 6;
@@ -2530,7 +2544,8 @@ __global__ void __launch_bounds__(256) up2_b_k(const TG *gy, TO *gx, int NC, int
     up_wts(mz, D, wq);
     const float *col = hy + (2 * tz * 8 + ty) * 8 + tx;
     float acc = wq[0] * col[0] + wq[1] * col[64] + wq[2] * col[128] + wq[3] * col[192];
-    stv(gx, ((size_t)nc * D + mz) * H * W + (size_t)my * W + mx, acc);
+    const int nco = (nc / C) * ctot + c0 + nc % C;
+    stv(gx, ((size_t)nco * D + mz) * H * W + (size_t)my * W + mx, acc);
 }
 extern "C" void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, float *y, int ctot, int c0) {
     const gnp_t gp = to_gnp(g);
@@ -2543,14 +2558,15 @@ extern "C" void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, 
 }
 extern "C" void nn_up2_fwd_into(const float *x, shape5 xs, float *y, int ctot, int c0) { nn_up2_fwd_gn_into(x, xs, nullptr, y, ctot, c0); }
 extern "C" void nn_up2_fwd(const float *x, shape5 xs, float *y) { nn_up2_fwd_into(x, xs, y, xs.c, 0); }
-extern "C" void nn_up2_bwd(const float *gy, shape5 xs, float *gx) {
-    if (ISMX(gy)) { if (!ISMX(gx)) { fprintf(stderr, "up2_bwd: MX gy needs an MX gx\n"); abort(); } lp_up2_bwd_mx(gy, xs, gx); KCHECK(); return; }
+extern "C" void nn_up2_bwd_into(const float *gy, shape5 xs, float *gx, int ctot, int c0) {
+    if (ISMX(gy)) { if (!ISMX(gx) || ctot != xs.c || c0) { fprintf(stderr, "up2_bwd: MX gy needs a whole MX gx\n"); abort(); } lp_up2_bwd_mx(gy, xs, gx); KCHECK(); return; }
     dim3 grid(nblk(xs.w, 8), nblk(xs.h, 8), (unsigned)(nblk(xs.d, 4) * xs.n * xs.c));
-    if (GBF && g_h16) up2_b_k<f16, f16><<<grid, 256>>>((const f16 *)gy, (f16 *)gx, xs.n * xs.c, xs.d, xs.h, xs.w);
-    else if (GBF) up2_b_k<bf16, bf16><<<grid, 256>>>((const bf16 *)gy, (bf16 *)gx, xs.n * xs.c, xs.d, xs.h, xs.w);
-    else up2_b_k<float, float><<<grid, 256>>>(gy, gx, xs.n * xs.c, xs.d, xs.h, xs.w);
+    if (GBF && g_h16) up2_b_k<f16, f16><<<grid, 256>>>((const f16 *)gy, (f16 *)gx, xs.n * xs.c, xs.d, xs.h, xs.w, xs.c, ctot, c0);
+    else if (GBF) up2_b_k<bf16, bf16><<<grid, 256>>>((const bf16 *)gy, (bf16 *)gx, xs.n * xs.c, xs.d, xs.h, xs.w, xs.c, ctot, c0);
+    else up2_b_k<float, float><<<grid, 256>>>(gy, gx, xs.n * xs.c, xs.d, xs.h, xs.w, xs.c, ctot, c0);
     KCHECK();
 }
+extern "C" void nn_up2_bwd(const float *gy, shape5 xs, float *gx) { nn_up2_bwd_into(gy, xs, gx, xs.c, 0); }
 
 /* ================= concat ================= */
 __global__ void concat_k(const float *a, int ca, const float *b, int cb, float *y, int N, size_t S, int fwd) {

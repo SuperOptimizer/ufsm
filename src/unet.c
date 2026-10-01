@@ -73,6 +73,8 @@ struct unet {
     float *gskip[UNET_MAXLEV], *gout[UNET_MAXLEV];
     float *gn_scratch, *conv_scratch, *red_scratch;
     size_t conv_scratch_n, act_bytes, grad_bytes;
+    size_t gB_bytes;                         /* capacity of the shared gradient buffer B */
+    float *rc_extra; size_t rc_extra_bytes;  /* training transient for the upsampled decoder input when B is too small */
 };
 
 static int G_of(const unet *u, int c) { return u->cfg.G < c ? u->cfg.G : c; }
@@ -191,6 +193,14 @@ static int recompute(void) { if (g_recompute < 0) { const char *e = getenv("UFSM
 static int recompute_a1(void) { return recompute() >= 2; }
 void unet_set_recompute(int on) { g_recompute = on; }
 #define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute())
+/* chunk mode (recompute, 16-bit activations and gradients, fused upsample): the decoder's up-part input gradient is
+   produced in w[i]-channel chunks, each upsample-backwarded straight into its slice of gout[i + 1], so the shared
+   gradient buffer B only needs w[i] channels (env UFSM_CHUNK_UP=0 turns it off) */
+static int chunk_up(void) {
+    static int f = -1; if (f < 0) { const char *e = getenv("UFSM_CHUNK_UP"); f = e ? atoi(e) : 1; }
+    const char *fu = getenv("UFSM_FUSED_UP");
+    return f && recompute() && !act_mx8() && !grad_mx8() && (!fu || atoi(fu) >= 2);
+}
 static float *dalloc_grad(unet *u, size_t n) { size_t b = GBF ? n * 2 : n * 4; u->act_bytes += b; u->grad_bytes += b; return nn_malloc(b); }  /* activation-gradient storage */
 
 /* buffers may be shared (gradient buffers across levels, gskip == gout, inference scratch): free each pointer once */
@@ -216,7 +226,9 @@ static void free_acts(unet *u) {
         for (int j = 0; j < 8; j++) pp[np++] = q[j];
         u->downo[i] = u->cat[i] = u->gskip[i] = u->gout[i] = u->gA[i] = u->gB[i] = u->t1[i] = u->t2[i] = nullptr;
     }
-    pp[np++] = u->logits; pp[np++] = u->conv_scratch; pp[np++] = u->xin; pp[np++] = u->glb;
+    pp[np++] = u->logits; pp[np++] = u->conv_scratch; pp[np++] = u->rc_extra;
+    if (u->rc_extra) nn_storage_forget(u->rc_extra);
+    u->rc_extra = nullptr; u->rc_extra_bytes = 0; u->gB_bytes = 0; pp[np++] = u->xin; pp[np++] = u->glb;
     free_once(pp, np);
     u->logits = nullptr; u->conv_scratch = nullptr; u->xin = nullptr; u->glb = nullptr; u->conv_scratch_n = 0;
     u->built = 0; u->act_bytes = 0; u->grad_bytes = 0;
@@ -280,10 +292,11 @@ static void build_acts(unet *u, shape5 xs, int train) {
             /* tensor-core path: A only holds the level width and B the widest of {width, decoder up part, encoder block
                input}; both are block-local, so one pair sized for the largest level serves every level. gout[i] is dead
                once dec[i]'s backward has read it, before that block writes gskip[i]: they share a buffer. */
-            const int gmx = grad_mx8();
+            const int gmx = grad_mx8(), chunk = chunk_up();
             size_t na = 0, nbb = 0;   /* elements (16-bit / fp32) or bytes (MX) */
             for (int i = 0; i < L; i++) {
-                int cb[3] = {w[i], i < L - 1 ? w[i + 1] : 0, i ? w[i - 1] : u->cfg.cin};
+                /* chunk mode: the up-part gradient goes through B in w[i]-channel chunks, so B needs no w[i+1] */
+                int cb[3] = {w[i], i < L - 1 && !chunk ? w[i + 1] : 0, i ? w[i - 1] : u->cfg.cin};
                 for (int k = 0; k < 3; k++) {   /* B holds each of these tensors at this level */
                     shape5 sb = u->ls[i]; sb.c = cb[k];
                     size_t e = !cb[k] ? 0 : gmx ? nn_mx8_bytes(sb) : shape_numel(sb);
@@ -294,6 +307,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 if (e > na) na = e;
             }
             float *A = gmx ? dalloc_grad_mx(u, na) : dalloc_grad(u, na), *B = gmx ? dalloc_grad_mx(u, nbb) : dalloc_grad(u, nbb);
+            u->gB_bytes = gmx ? nbb : nbb * (GBF ? 2 : 4);
             for (int i = 0; i < L; i++) {
                 shape5 so = u->ls[i]; so.c = w[i];
                 u->gA[i] = A; u->gB[i] = B;
@@ -355,6 +369,16 @@ static int fakeq_grad(void) {
 static void rc_fail(const char *what) { fprintf(stderr, "unet: recompute mode: %s unsupported\n", what); abort(); }
 /* transient buffer for the upsampled decoder input at level i (shape s), typed as activation storage */
 static float *rc_tmp(unet *u, int level, shape5 s, int *reg) {
+    if (u->train && act_bytes_of(s) > u->gB_bytes) {   /* chunk mode left B too small for this (fp8 / MX) transient */
+        if (act_bytes_of(s) > u->rc_extra_bytes) {
+            if (u->rc_extra) { nn_storage_forget(u->rc_extra); nn_free(u->rc_extra); u->act_bytes -= u->rc_extra_bytes; }
+            const int *w = u->cfg.widths; shape5 m = u->ls[0]; m.c = 0;
+            for (int i = 0; i < u->cfg.nlev - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > act_bytes_of(m)) m = c; }
+            u->rc_extra = dalloc_act_s(u, m); u->rc_extra_bytes = act_bytes_of(m);
+        }
+        *reg = 0;
+        return u->rc_extra;
+    }
     if (!u->train && !u->cat[0]) {   /* inference: the transient is only allocated if the fused path is unavailable */
         const int *w = u->cfg.widths; shape5 m = u->ls[0]; m.c = 0;
         for (int i = 0; i < u->cfg.nlev - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > act_bytes_of(m)) m = c; }
@@ -511,6 +535,23 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     nn_set_conv(0);
     if (b->xb) {   /* recompute: weight gradient with the upsampled part rebuilt into B (free until backward-data below) */
         if (dec_conv1(u, b, level, nullptr, 0, nullptr, nullptr, A, g + b->c1.w, g + b->c1.b)) rc_fail("decoder conv1 weight gradient");
+        if (chunk_up()) {   /* skip gradient, then the up-part gradient in chunks through B, upsample-backwarded into gout[level + 1] */
+            const block *xb = (const block *)b->xb;
+            const size_t per_c = shape_numel(b->ys) / b->ys.c * (GBF ? 2 : 4);
+            int cs = (int)(u->gB_bytes / per_c); if (cs > b->c_split) cs = b->c_split;
+            int r; PROF(1, r = nn_conv3d_bwd_data_range(A, b->ys, P(u, b->c1.w), b->xs, b->c_split, b->xs.c - b->c_split, gx2, u->conv_scratch));
+            if (r) rc_fail("skip backward-data");
+            { shape5 s2 = b->xs; s2.c = b->xs.c - b->c_split; FQG(gx2, s2); }
+            for (int c0 = 0; c0 < b->c_split; c0 += cs) {
+                const int nc = b->c_split - c0 < cs ? b->c_split - c0 : cs;
+                PROF(1, r = nn_conv3d_bwd_data_range(A, b->ys, P(u, b->c1.w), b->xs, c0, nc, B, u->conv_scratch));
+                if (r) rc_fail("up-part backward-data");
+                shape5 cs5 = xb->ys; cs5.c = nc;
+                PROF(5, nn_up2_bwd_into(B, cs5, u->gout[level + 1], b->c_split, c0));
+            }
+            nn_set_conv(-1);
+            return nullptr;   /* gout[level + 1] already written */
+        }
         PROF(1, nn_conv3d_bwd_data_split(A, b->ys, P(u, b->c1.w), b->xs, B, gx2, b->c_split, u->conv_scratch));   /* B = d/d up part, gx2 = d/d skip */
         { shape5 s1 = b->xs, s2 = b->xs; s1.c = b->c_split; s2.c = b->xs.c - b->c_split; FQG(B, s1); FQG(gx2, s2); }
         nn_set_conv(-1);
@@ -554,7 +595,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         shape5 src = u->ls[i + 1]; src.c = w[i + 1];
         if (nn_get_tf32()) {
             nn_set_layer(9 - i); float *gup = block_bwd(u, &u->dec[i], i, u->gout[i], u->gskip[i]);   /* gB[i]: grad wrt the upsampled part; skip grad written in place */
-            PROF(5, nn_up2_bwd(gup, src, u->gout[i + 1]));
+            if (gup) PROF(5, nn_up2_bwd(gup, src, u->gout[i + 1]));   /* nullptr: chunk mode wrote gout[i + 1] */
             FQG(u->gout[i + 1], src);
         } else {
             nn_set_layer(9 - i); float *gcat = block_bwd(u, &u->dec[i], i, u->gout[i], nullptr);       /* gB[i]: grad wrt concat */

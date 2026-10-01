@@ -54,17 +54,17 @@ int main(void) {
             float *upr = dev_zero(shape_numel(us)), *y5 = dev_zero(shape_numel(ys)), *y6 = dev_zero(shape_numel(ys));
             float *m5 = dev_zero(N * G), *r5 = dev_zero(N * G), *m6 = dev_zero(N * G), *r6 = dev_zero(N * G);
             nn_up2_fwd_into(xc, cs, upr, 32, 0);
+            const double ftol = precs[pi] == 2 ? tol : tol / 4;   /* the fused path always runs the 16-bit kernels; the reference at prec 2 is fp8 */
             nn_conv3d_fwd_x(upr, NULL, xk, &g2, 32, 0, fs, w, b, 16, 3, 1, y5, G, 1e-5f, m5, r5);
             if (nn_conv3d_fwd_x(xc, NULL, xk, &g2, 32, 1, fs, w, b, 16, 3, 1, y6, G, 1e-5f, m6, r6)) {
-                printf("  fused upsample: not supported at prec %d (fp8 kernels use the transient)%s\n", precs[pi], precs[pi] == 2 || precs[pi] == 3 ? "" : "  FAIL");
-                if (precs[pi] != 2 && precs[pi] != 3) bad++;
+                printf("  fused upsample unsupported  FAIL\n"); bad++;
             } else {
-            cmp("split fwd, fused upsample", y6, y5, shape_numel(ys), tol / 4);
-            cmp("  output GN rstd", r6, r5, N * G, tol / 4);
+            cmp("split fwd, fused upsample", y6, y5, shape_numel(ys), ftol);
+            cmp("  output GN rstd", r6, r5, N * G, ftol);
             float *w5 = dev_zero((size_t)16 * 48 * 27), *w6 = dev_zero((size_t)16 * 48 * 27), *b5 = dev_zero(16), *b6 = dev_zero(16);
             nn_conv3d_bwd_weight_x(upr, NULL, xk, &g2, 32, 0, fs, gy, ys, 3, 1, w5, b5);
             nn_conv3d_bwd_weight_x(xc, NULL, xk, &g2, 32, 1, fs, gy, ys, 3, 1, w6, b6);
-            cmp("split wgrad, fused upsample", w6, w5, (size_t)16 * 48 * 27, tol / 4);
+            cmp("split wgrad, fused upsample", w6, w5, (size_t)16 * 48 * 27, ftol);
             }
         }
         {   /* both segments transformed (x at full resolution) */

@@ -178,7 +178,9 @@ void nn_up2_fwd_into(const float *x, shape5 xs, float *y, int ctot, int c0);
    (ue8m0 per 32 channels). No-op for MX-stored tensors. */
 void nn_fake_quant(void *x, shape5 s, int fmt);
 void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, float *y, int ctot, int c0);   /* upsample of silu(gn(x)) (g nullptr: of x) */
-void nn_up2_bwd(const float *gy, shape5 xs, float *gx);                  /* gx SET */
+void nn_up2_bwd(const float *gy, shape5 xs, float *gx);
+void nn_up2_bwd_into(const float *gy, shape5 xs, float *gx, int ctot, int c0);   /* gy: xs.c channels at 2x; gx: channels c0.. of a ctot-channel tensor (SET) */
+int nn_conv3d_bwd_data_range(const float *gy, shape5 ys, const float *w, shape5 xs, int c0, int nc, float *gx, float *scratch);   /* input channels [c0, c0 + nc) only; -1 unsupported */                  /* gx SET */
 
 /* ---- channel concat: y[:, :ca] = a, y[:, ca:] = b ---- */
 void nn_concat_fwd(const float *a, int ca, const float *b, int cb, shape5 s, float *y);   /* s.c unused */
