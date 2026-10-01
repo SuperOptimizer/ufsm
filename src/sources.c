@@ -94,6 +94,7 @@ sources *sources_load(const char *path) {
         s->um = json_num(json_get(e, "um"), 0);
         s->weight = json_num(json_get(e, "weight"), 1.0);
         s->trust_band = (int)json_num(json_get(e, "trust_band"), 0);
+        s->min_level = (int)json_num(json_get(e, "min_level"), 0);
         for (int l = 0; l < MAXLEV; l++) s->ct_present[l] = -1; /* unknown until probed */
         const json *tg = json_get(e, "targets");
         for (int c = 0; c < NCH; c++) {

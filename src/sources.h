@@ -46,6 +46,7 @@ typedef struct {
     char *ct_key;
     double um;              /* level-0 voxel size */
     double weight;
+    int min_level;    /* training never draws levels below this (e.g. 1 for a 1.1 um scan whose level 0 is finer than the others) */
     int trust_band;   /* > 0: background labels are trusted only within this many level-0 voxels of an annotated surface (partial annotations) */
     z3 *ct[MAXLEV];         /* lazily opened per level */
     int ct_present[MAXLEV]; /* 1 if the level exists in the pyramid */

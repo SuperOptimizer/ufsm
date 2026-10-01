@@ -139,6 +139,7 @@ static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
         p[l] = sp->cfg.level_p[l];
         if (p[l] <= 0) continue;
         if (region_ch >= 0 && l > 1) { p[l] = 0; continue; }
+        if (l < s->min_level) { p[l] = 0; continue; }
         if (!source_ct(s, l)) { p[l] = 0; continue; }
         int any = 0;
         for (int c = 0; c < NCH; c++) {
@@ -534,7 +535,7 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction) {
         for (int l = 0; l < MAXLEV; l++) {
             z3 *ct = source_ct(s, l); if (!ct) continue;
             const z3_meta *m = z3_meta_of(ct);
-            int want_window = l <= maxlev, want_probe = l >= 3 && l - 3 <= maxlev;   /* probe reads at level l serve training levels l-3 */
+            int want_window = l <= maxlev && l >= s->min_level, want_probe = l >= 3 && l - 3 <= maxlev && l - 3 >= s->min_level;   /* probe reads at level l serve training levels l-3 */
             int whole = l >= 4;   /* the occupancy index reads the coarsest level in full at every start: cache it entirely */
             if (!want_window && !want_probe && !whole) continue;
             int64_t ng[3]; for (int d = 0; d < 3; d++) ng[d] = (m->shape[d] + m->chunk[d] - 1) / m->chunk[d];
