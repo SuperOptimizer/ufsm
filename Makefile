@@ -31,6 +31,9 @@ build/nn_fp8.o: src/nn_fp8.cu src/nn.h src/nn_lp.h | build
 build/unet.o: src/unet.c src/unet.h src/nn.h | build
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
+build/prof_infer: tests/prof_infer.c build/unet.o build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+
 build/test_nn: tests/test_nn.c build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 

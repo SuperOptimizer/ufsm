@@ -75,6 +75,7 @@ void unet_prof_report(void);   /* with UFSM_PROF=1: print and reset per-op timin
 #define UNET_NSLOT 22
 void unet_prof_layers_on(int on);          /* same as env UFSM_PROF=layers */
 void unet_prof_layers(double out[][3]);    /* [UNET_NSLOT][fwd, bwd_data, bwd_w] ms since the last call (resets) */
+void unet_prof_cats(double out[8]);       /* per-category ms (conv_fwd, conv_bwd_data, conv_bwd_w, gn, elementwise, up/concat, ...) of the last unet_prof_layers call */
 /* MX-fp8 activation storage (also env UFSM_ACT_MX8=1): every stored activation is channel-blocked e4m3 + ue8m0 scales and
    the convolutions that read them run in fp8; activation gradients keep their storage. Takes effect at the next build. */
 void unet_set_act_mx8(int on);
