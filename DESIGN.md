@@ -303,6 +303,19 @@ Where the rest would come from:
   clamped voxels only lose a little precision. The replayed batch now matches the exact kernels. A GroupNorm after
   each down conv would remove the amplification altogether but changes the model (candidate for a later run).
 
+### Performance program toward the hardware ceiling (goal set 2026-10-01 afternoon)
+Roofline per level-0 voxel from the layer shapes: forward 139 kFLOP (enc0 3.5k + 13.8k, dec0 41.5k + 13.8k, head
+0.06k, down0 3.5k; level 1 /8: 43k; level 2 /64: 18k; level 3 /512: 0.6k), training ~417 kFLOP. 96^3 B2 = 1.77M
+voxels: training 738 GFLOP in 33.8 ms = 22 TFLOP/s, inference 246 GFLOP in 9.6 ms = 26 TFLOP/s, against ~95 TFLOP/s
+dense fp16 on the RTX 5060 Ti (fp8 ~190, fp4 ~380): 4.3x / 3.7x headroom. Memory traffic (~300 B per voxel per
+inference, ~530 MB) is 1.2 ms at 448 GB/s, so bandwidth is not the floor; the small-channel convs (16 / 32 outputs:
+2-4 MMA n-tiles per block) are issue-bound on staging and fragment loads. Target: 50% of peak, ~2x on both.
+Plan: (1) per-op profile at fp16 / fp8 / fp4 (agent); (2) conv kernels for small channel counts: larger output tiles
+per block, operands kept in registers across taps, fused conv1 + GroupNorm + conv2 per block with the intermediate
+in shared memory (agent); (3) fp8 activation storage with down_norm and as an inference-only mode (agent);
+(4) inference pipeline: writer-thread overlap, window-size sweep for L2 residency (lead); (5) training: batch 2 per
+GPU at 128^3, tiled Muon / ANVIL matmuls (lead); (6) wider level-0 channels once the kernels are efficient.
+
 ### fp8 training on real data (agent, 2026-10-01 afternoon)
 - 6000-step MANBp yardstick (AdamW, down_norm 0, seed 0), F1 at 0.5 / 0.7: all-fp8 GEMMs (`--prec 2`) 0.247 / 0.257,
   fp8 weight gradient only 0.241 / 0.232, fp8 forward + backward-data (`--qat 2`) 0.248 / 0.236; fp16 0.269 / 0.282
