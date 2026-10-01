@@ -50,6 +50,32 @@ static void *reader_main(void *arg) {
     pthread_mutex_lock(&r->mu); pthread_cond_broadcast(&r->cv); pthread_mutex_unlock(&r->mu);
     return nullptr;
 }
+/* shard writer: the main thread hands a filled shard buffer to a writer thread and continues into the other buffer */
+typedef struct { z3w *w; int nthreads; size_t bytes; uint8_t *buf[2]; int64_t sz[2], sy[2], sx[2]; int pending[2]; int failed; pthread_mutex_t mu; pthread_cond_t cv; int stop; } writer_t;
+static void *writer_main(void *arg) {
+    writer_t *W = arg;
+    for (;;) {
+        pthread_mutex_lock(&W->mu);
+        int k = -1;
+        while (k < 0 && !W->stop) { for (int i = 0; i < 2; i++) if (W->pending[i]) { k = i; break; } if (k < 0) pthread_cond_wait(&W->cv, &W->mu); }
+        if (k < 0) { pthread_mutex_unlock(&W->mu); return nullptr; }
+        pthread_mutex_unlock(&W->mu);
+        if (z3w_write_shard(W->w, W->sz[k], W->sy[k], W->sx[k], W->buf[k], W->nthreads)) W->failed = 1;
+        pthread_mutex_lock(&W->mu); W->pending[k] = 0; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
+    }
+}
+/* queue buffer k for writing; returns when the OTHER buffer is free to fill */
+static int writer_submit(writer_t *W, int k, int64_t sz, int64_t sy, int64_t sx) {
+    pthread_mutex_lock(&W->mu);
+    W->sz[k] = sz; W->sy[k] = sy; W->sx[k] = sx; W->pending[k] = 1; pthread_cond_broadcast(&W->cv);
+    while (W->pending[k ^ 1]) pthread_cond_wait(&W->cv, &W->mu);
+    pthread_mutex_unlock(&W->mu);
+    return W->failed;
+}
+static int writer_finish(writer_t *W, pthread_t th) {
+    pthread_mutex_lock(&W->mu); while (W->pending[0] || W->pending[1]) pthread_cond_wait(&W->cv, &W->mu); W->stop = 1; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
+    pthread_join(th, nullptr); return W->failed;
+}
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
     return dflt;
@@ -101,7 +127,10 @@ int cmd_predict(int argc, char **argv) {
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     int stride = W - 2 * halo;
     size_t w3 = (size_t)W * W * W;
-    uint8_t *sbuf = malloc((size_t)shard * shard * shard);
+    writer_t WR = {0}; WR.w = w; WR.nthreads = nthreads; WR.bytes = (size_t)shard * shard * shard;
+    WR.buf[0] = malloc(WR.bytes); WR.buf[1] = malloc(WR.bytes); pthread_mutex_init(&WR.mu, nullptr); pthread_cond_init(&WR.cv, nullptr);
+    pthread_t wth; pthread_create(&wth, nullptr, writer_main, &WR);
+    int sb = 0; uint8_t *sbuf = WR.buf[0];
     /* the window goes up as uint8; the input channels are built on the device in the network's storage type */
     const int h16 = nn_get_tf32() && nn_get_act_bf16() && !getenv("UFSM_ACT_MX8");
     uint8_t *ctd = nn_malloc(w3), *pu = malloc(w3), *pud = nn_malloc(w3);
@@ -138,7 +167,7 @@ int cmd_predict(int argc, char **argv) {
         const tile_t *t = &rd.tiles[i];
         if (t->shard != cur_shard) {   /* new shard: flush the previous one */
             if (cur_shard >= 0) {
-                if (any && z3w_write_shard(w, sz, sy, sx, sbuf, nthreads)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+                if (any) { if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb ^= 1; sbuf = WR.buf[sb]; }
                 fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   ", (long long)(cur_shard + 1), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
             }
             cur_shard = t->shard; sz = cur_shard / (ns[1] * ns[2]); sy = (cur_shard / ns[2]) % ns[1]; sx = cur_shard % ns[2];
@@ -182,7 +211,9 @@ int cmd_predict(int argc, char **argv) {
             any = 1; ntiles++;
         }
     }
-    if (cur_shard >= 0 && any && z3w_write_shard(w, sz, sy, sx, sbuf, nthreads)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+    if (cur_shard >= 0 && any && writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+    if (writer_finish(&WR, wth)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+    free(WR.buf[0]); free(WR.buf[1]);
     pthread_join(rth, nullptr);
     for (int k = 0; k < NSLOT; k++) free(rd.buf[k]);
     free(rd.tiles);

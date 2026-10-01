@@ -316,6 +316,12 @@ in shared memory (agent); (3) fp8 activation storage with down_norm and as an in
 (4) inference pipeline: writer-thread overlap, window-size sweep for L2 residency (lead); (5) training: batch 2 per
 GPU at 128^3, tiled Muon / ANVIL matmuls (lead); (6) wider level-0 channels once the kernels are efficient.
 
+- Done so far on the lead's side: (4) predict shard writes on a writer thread with a double shard buffer (output
+  identical); window-size / batch sweep on the shared GPU shows flat per-voxel throughput from 96^3 to 288^3 and no
+  gain from batch 2 per GPU, so there is no cheap win in window or batch choice; (5) Muon / ANVIL cascades use
+  shared-memory tiled products (tile_xxt_k, tile_bx_k; identical losses, ~11% faster than the per-conv path on a
+  shared GPU). fp8 activation storage at inference is free on an fp16-trained model (r5: F1 0.197 vs 0.192).
+
 ### fp8 training on real data (agent, 2026-10-01 afternoon)
 - 6000-step MANBp yardstick (AdamW, down_norm 0, seed 0), F1 at 0.5 / 0.7: all-fp8 GEMMs (`--prec 2`) 0.247 / 0.257,
   fp8 weight gradient only 0.241 / 0.232, fp8 forward + backward-data (`--qat 2`) 0.248 / 0.236; fp16 0.269 / 0.282

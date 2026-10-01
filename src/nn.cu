@@ -2787,6 +2787,38 @@ extern "C" void nn_muon(float *p, const float *g, float *mom, int Co, int K, flo
     muon_apply_k<<<nblk(n, 256), 256>>>(p, X, n, lr, scale, wd);
     KCHECK();
 }
+/* tiled small-matrix products for the orthogonalisation cascades (Muon, ANVIL): blockIdx.z = conv.
+   xxt: A[i][j] = sum_k X[i][k] X[j][k]; 16x16 output tile per block, K staged in 32-wide smem slabs (both operands are rows of X).
+   bx:  Y[i][k] = a X[i][k] + sum_j B[i][j] X[j][k]; B (Co x Co, <= 128x128 floats) staged in smem once, 128 k-columns per block. */
+template <typename DT> __global__ void __launch_bounds__(256) tile_xxt_k(const DT *d, int swap) {
+    const DT D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; int Co = D.Co, K = D.K;
+    int i0 = blockIdx.y * 16, j0 = blockIdx.x * 16; if (i0 >= Co || j0 >= Co) return;
+    __shared__ float sa[16][33], sb[16][33];
+    int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;   /* 256 threads: 16 x 16 outputs */
+    float acc = 0.f;
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        for (int t = threadIdx.x; t < 16 * 32; t += 256) { int r = t >> 5, c = t & 31; int k = k0 + c;
+            sa[r][c] = (i0 + r < Co && k < K) ? X[(size_t)(i0 + r) * K + k] : 0.f;
+            sb[r][c] = (j0 + r < Co && k < K) ? X[(size_t)(j0 + r) * K + k] : 0.f; }
+        __syncthreads();
+#pragma unroll
+        for (int c = 0; c < 32; c++) acc += sa[ty][c] * sb[tx][c];
+        __syncthreads();
+    }
+    if (i0 + ty < Co && j0 + tx < Co) D.A[(size_t)(i0 + ty) * Co + j0 + tx] = acc;
+}
+template <typename DT> __global__ void __launch_bounds__(256) tile_bx_k(const DT *d, int swap, float a) {
+    const DT D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; float *Y = swap ? D.X : D.Y; int Co = D.Co, K = D.K;
+    __shared__ float sB[96 * 96];
+    for (int t = threadIdx.x; t < Co * Co; t += 256) sB[t] = D.B[t];
+    __syncthreads();
+    int k = blockIdx.x * 128 + (threadIdx.x & 127), ihalf = threadIdx.x >> 7;   /* two thread groups split the rows */
+    if (k >= K) return;
+    for (int i = ihalf; i < Co; i += 2) {
+        float s = 0.f; for (int j = 0; j < Co; j++) s += sB[i * Co + j] * X[(size_t)j * K + k];
+        Y[(size_t)i * K + k] = a * X[(size_t)i * K + k] + s;
+    }
+}
 /* batched Muon: one launch per stage for all convs (blockIdx.z = conv). descs live on the device. */
 typedef struct { float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K; } muon_desc_t;
 __global__ void bmuon_mom_k(const muon_desc_t *d, float beta, double *ss) {
@@ -2834,7 +2866,14 @@ extern "C" void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk,
     bmuon_scale_k<<<g1, 256>>>(d, ss);
     const float a = 3.4445f, b = -4.7750f, c = 2.0315f;
     int swap = 0;
-    for (int it = 0; it < 5; it++) { bmm_xxt_k<<<gco, 128>>>(d, swap); bmm_sq_k<<<gco, 128>>>(d, b, c); bmm_bx_k<<<gk, 256>>>(d, swap, a); swap ^= 1; }
+    dim3 gxx(nblk(maxco, 16), nblk(maxco, 16), nconv), gbx(nblk(maxk, 128), 1, nconv);
+    const int tiled = maxco <= 96;
+    for (int it = 0; it < 5; it++) {
+        if (tiled) tile_xxt_k<muon_desc_t><<<gxx, 256>>>(d, swap); else bmm_xxt_k<<<gco, 128>>>(d, swap);
+        bmm_sq_k<<<gco, 128>>>(d, b, c);
+        if (tiled) tile_bx_k<muon_desc_t><<<gbx, 256>>>(d, swap, a); else bmm_bx_k<<<gk, 256>>>(d, swap, a);
+        swap ^= 1;
+    }
     bmuon_apply_k<<<g1, 256>>>(d, swap, lr, wd);
     KCHECK();
 }
@@ -2910,7 +2949,15 @@ extern "C" void nn_anvil_batch(const void *descs, int nconv, int maxco, int maxk
     anvil_mom_k<<<g1, 256>>>(d, beta_fast, beta_slow, w_fast, mu, ss);
     anvil_scale_k<<<g1, 256>>>(d, ss);
     int swap = 0;
-    for (int it = 0; it < 6; it++) { anvil_xxt_k<<<gco, 128>>>(d, swap); anvil_sq_k<<<gco, 128>>>(d, it); anvil_bx_k<<<gk, 256>>>(d, swap, it); swap ^= 1; }
+    static const float maps_a[6] = {3.923798038567f, 3.278126713798f, 3.505298394150f, 2.815058591845f, 2.245503932403f, 2.256537145403f};
+    dim3 gxx(nblk(maxco, 16), nblk(maxco, 16), nconv), gbx(nblk(maxk, 128), 1, nconv);
+    const int tiled = maxco <= 96;
+    for (int it = 0; it < 6; it++) {
+        if (tiled) tile_xxt_k<anvil_desc_t><<<gxx, 256>>>(d, swap); else anvil_xxt_k<<<gco, 128>>>(d, swap);
+        anvil_sq_k<<<gco, 128>>>(d, it);
+        if (tiled) tile_bx_k<anvil_desc_t><<<gbx, 256>>>(d, swap, maps_a[it]); else anvil_bx_k<<<gk, 256>>>(d, swap, it);
+        swap ^= 1;
+    }
     anvil_rowpow_k<<<grow, 256>>>(d, swap);
     anvil_eq_k<<<nconv, 32>>>(d, beta2);
     anvil_apply_k<<<g1, 256>>>(d, swap, lr, wd);
