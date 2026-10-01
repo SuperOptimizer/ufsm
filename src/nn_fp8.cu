@@ -1494,19 +1494,27 @@ __device__ __forceinline__ void mx_store_row(uint8_t *q, uint8_t *sc, size_t ri,
     sc[ri] = (uint8_t)(e + 127);
 }
 /* fp32 [n][C][S] -> MX */
-__global__ void f32_to_mx8_k(const float *x, uint8_t *y, int N, int C, size_t S) {
+template <typename TI>
+__global__ void f32_to_mx8_k(const TI *x, uint8_t *y, int N, int C, size_t S) {
     const int bw = mx_bw(C), nb = mx_nb(C);
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)N * nb * S) return;
     size_t v = i % S; int blk = (int)((i / S) % nb), n = (int)(i / (S * nb));
     float r[32];
 #pragma unroll
-    for (int k = 0; k < 32; k++) { int c = blk * bw + k; r[k] = k < bw && c < C ? x[((size_t)n * C + c) * S + v] : 0.f; }
+    for (int k = 0; k < 32; k++) { int c = blk * bw + k; r[k] = k < bw && c < C ? ldx(x, ((size_t)n * C + c) * S + v) : 0.f; }
     mx_store_row(y, y + (size_t)N * nb * S * bw, i, bw, r);
 }
 extern "C" void lp_f32_to_mx8(const float *x, int N, int C, size_t S, void *y) {
     size_t n = (size_t)N * mx_nb(C) * S;
-    f32_to_mx8_k<<<nblk_(n, 256), 256>>>(x, (uint8_t *)y, N, C, S); LPCK();
+    f32_to_mx8_k<float><<<nblk_(n, 256), 256>>>(x, (uint8_t *)y, N, C, S); LPCK();
+}
+/* 16-bit (dt 1 bf16, 2 fp16) [n][C][S] -> MX */
+extern "C" void lp_h16_to_mx8(const void *x, int dt, int N, int C, size_t S, void *y) {
+    size_t n = (size_t)N * mx_nb(C) * S;
+    if (dt == 2) f32_to_mx8_k<__half><<<nblk_(n, 256), 256>>>((const __half *)x, (uint8_t *)y, N, C, S);
+    else f32_to_mx8_k<bf16><<<nblk_(n, 256), 256>>>((const bf16 *)x, (uint8_t *)y, N, C, S);
+    LPCK();
 }
 /* MX -> fp32 [n][C][S] (tests) */
 __global__ void mx8_to_f32_k(const uint8_t *x, float *y, int N, int C, size_t S) {
@@ -1644,6 +1652,38 @@ extern "C" void lp_bwd_w1_mx(const void *x, shape5 xs, const void *gy, int gydt,
 /* backward through silu(gn(x)) with an MX x (plane-major gy / gx of type TG / TO): a = gy * silu'(gn(x)).
    Pass 1 (stats): per (n, c) sums of a and a * xhat; block = 256 voxels of one sample, all channels (smem partials).
    Pass 2 (apply): gx = rstd (a gamma - A/len - xhat B/len) with the group sums A, B. */
+/* GroupNorm sums of an MX tensor: per (n, group) sum and sum of squares (double, accumulated); a block = 256 voxels of
+   one sample, all channel blocks; per-group partials in shared memory */
+__global__ void __launch_bounds__(256) gn_sums_mx_k(const uint8_t *x, int N, int C, int G, size_t S, double *sums) {
+    const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G;
+    const int nblk_per = (int)((S + 255) / 256);
+    const int n = blockIdx.x / nblk_per; const size_t v = (size_t)(blockIdx.x % nblk_per) * 256 + threadIdx.x;
+    __shared__ float g1[64], g2[64];
+    if (threadIdx.x < 64) { g1[threadIdx.x] = 0.f; g2[threadIdx.x] = 0.f; }
+    __syncthreads();
+    const uint8_t *sc = x + (size_t)N * nb * S * bw;
+    for (int blk = 0; blk < nb; blk++) {
+        float r[32];
+        if (v < S) mx_load_row(x, sc, ((size_t)n * nb + blk) * S + v, bw, r);
+        else for (int k = 0; k < 32; k++) r[k] = 0.f;
+        for (int k0 = 0; k0 < bw; k0 += cpg) {   /* one group at a time (groups never straddle a block: bw % cpg == 0 for the widths used) */
+            const int c0 = blk * bw + k0; if (c0 >= C) break;
+            float a = 0.f, q = 0.f;
+            for (int k = k0; k < k0 + cpg && k < bw; k++) { a += r[k]; q += r[k] * r[k]; }
+            for (int o = 16; o; o >>= 1) { a += __shfl_xor_sync(0xffffffff, a, o); q += __shfl_xor_sync(0xffffffff, q, o); }
+            if ((threadIdx.x & 31) == 0) { atomicAdd(&g1[c0 / cpg], a); atomicAdd(&g2[c0 / cpg], q); }
+        }
+    }
+    __syncthreads();
+    for (int g = threadIdx.x; g < G; g += 256) { atomicAdd(&sums[2 * ((size_t)n * G + g)], (double)g1[g]); atomicAdd(&sums[2 * ((size_t)n * G + g) + 1], (double)g2[g]); }
+}
+extern "C" int lp_gn_sums_mx(const void *x, int N, int C, int G, size_t S, double *sums) {
+    const int bw = mx_bw(C), cpg = C / G;
+    if (G > 64 || cpg < 1 || bw % cpg) return -1;
+    const int nblk_per = (int)((S + 255) / 256);
+    gn_sums_mx_k<<<N * nblk_per, 256>>>((const uint8_t *)x, N, C, G, S, sums); LPCK();
+    return 0;
+}
 template <typename TG>
 __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, const TG *gy, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                                            int N, int C, int G, size_t S, double *ds) {

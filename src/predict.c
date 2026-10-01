@@ -83,7 +83,7 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
 
 int cmd_predict(int argc, char **argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window 288]\n"
+        fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window 288] [--act-mx8 1]\n"
                         "       [--halo 16] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
                         "       [--prec 1|2|3|4] [--policy enc0=1,...]   inference precision (fp8 / fp4 compute)\n");
         fprintf(stderr, "  window - 2*halo should divide the shard size (288 - 32 = 256 divides 256 and 512): tiles then cover each shard exactly. 288^3 needs ~5.5 GB; 160 for small GPUs.\n");
@@ -98,6 +98,7 @@ int cmd_predict(int argc, char **argv) {
     const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
     nn_set_prec(atoi(opt(argc, argv, "--prec", "1")));
     if (nn_set_prec_policy(opt(argc, argv, "--policy", ""))) return 2;
+    if (atoi(opt(argc, argv, "--act-mx8", "0"))) unet_set_act_mx8(1);   /* MX-fp8 activation storage for this (inference-only) process */
     if (um <= 0) { fprintf(stderr, "--um required\n"); return 2; }
     if (nn_init(gpu)) { fprintf(stderr, "cannot select GPU %d\n", gpu); return 1; }
     unet_cfg cfg; int step;

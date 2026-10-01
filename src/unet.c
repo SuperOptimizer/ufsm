@@ -22,12 +22,13 @@ static void prof_collect(double *cat) {
 }
 void unet_prof_report(void) { if (g_prof > 0) { double ms[8]; prof_collect(ms); double tot = 0; for (int i = 0; i < 7; i++) tot += ms[i]; for (int i = 0; i < 7; i++) if (ms[i] > 0) fprintf(stderr, "  %-14s %8.1f ms  %4.1f%%\n", g_names[i], ms[i], 100 * ms[i] / tot); } }
 void unet_prof_layers_on(int on) { PROF_INIT(); g_prof = on ? 2 : 0; }
+static double g_prof_cat[8];
 void unet_prof_layers(double out[][3]) {
-    double cat[8];
     for (int i = 0; i < UNET_NSLOT; i++) for (int j = 0; j < 3; j++) g_prof_slot[i][j] = 0;
-    prof_collect(cat);
+    prof_collect(g_prof_cat);
     for (int i = 0; i < UNET_NSLOT; i++) for (int j = 0; j < 3; j++) out[i][j] = g_prof_slot[i][j];
 }
+void unet_prof_cats(double out[8]) { for (int i = 0; i < 8; i++) out[i] = g_prof_cat[i]; }   /* categories of the last unet_prof_layers call */
 
 typedef struct { int cin, cout, k, stride; size_t w, b; } convp;      /* offsets into the flat param array */
 typedef struct { int c; size_t gamma, beta; } gnp;
@@ -476,8 +477,9 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     int L = u->cfg.nlev;
     const int *w = u->cfg.widths;
     const float *cur = x;
-    if (x_h16 && (!ABF || act_mx8())) { fprintf(stderr, "unet_forward_x: a 16-bit input needs the 16-bit (non-MX) activation storage\n"); abort(); }
+    if (x_h16 && !ABF) { fprintf(stderr, "unet_forward_x: a 16-bit input needs the 16-bit activation storage\n"); abort(); }
     if (ABF && !x_h16) { if (!u->xin) u->xin = dalloc_act_s(u, xs); nn_f32_to_act(x, xs, u->xin); cur = u->xin; }
+    else if (x_h16 && act_mx8()) { if (!u->xin) u->xin = dalloc_act_s(u, xs); nn_h16_to_mx(x, xs, u->xin); cur = u->xin; }   /* MX storage: the 16-bit input is converted once */
     for (int i = 0; i < L; i++) {
         nn_set_layer(i); block_fwd(u, &u->enc[i], i, cur);
         cur = u->enc[i].s2;
@@ -490,7 +492,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
                 const int G = G_of(u, w[i]);
                 block *nb = &u->enc[i + 1];
                 nb->inx = u->downo[i]; nb->ing = &u->dn[i]; nb->inm = u->dm[i]; nb->inr = u->dr[i];
-                if (nn_get_tf32()) { if (nn_gn_stats(u->downo[i], ds, G, 1e-5f, u->dm[i], u->dr[i])) { fprintf(stderr, "unet: down_norm needs 16-bit / fp32 activation storage (not MX)\n"); abort(); } }
+                if (nn_get_tf32()) { if (nn_gn_stats(u->downo[i], ds, G, 1e-5f, u->dm[i], u->dr[i])) { fprintf(stderr, "unet: down_norm GroupNorm statistics unsupported for this storage\n"); abort(); } }
                 else { PROF(3, nn_gn_fwd_silu(u->downo[i], ds, G, 1e-5f, P(u, u->dn[i].gamma), P(u, u->dn[i].beta), u->downs[i], u->dm[i], u->dr[i])); cur = u->downs[i]; continue; }
             }
             { shape5 ds = u->ls[i + 1]; ds.c = w[i]; FQ(u->downo[i], ds); }
