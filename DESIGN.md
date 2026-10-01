@@ -316,6 +316,12 @@ Measured today on an idle GPU: 9.6 ms fp16, 6.4 ms MX storage. Decision (user: "
 activation storage is the inference default (`predict --act-mx8 1`, free in accuracy: r8 0.2670 vs 0.2669); training
 moves to all-fp8 compute + stochastic rounding (+0.011 F1 vs fp16 in paired 6000-step runs) with fp16 accumulation
 where anything stays 16-bit, behind a paired-run accuracy guard (within 0.005 F1) and the long paired run.
+Second correction (agent, prec 4 test): the 16-bit convs are NOT MMA-bound either. Doubling the MMA peak with fp16
+accumulation leaves the level-0 16-channel convs unchanged (0.87 ms) and gains only 15-30% at levels >= 1, so they
+are issue / staging / ldmatrix-bound at ~41 TFLOP/s, 2.4x above their memory floor. Fix in progress: a conv kernel
+family with M = output positions, N = output channels, K = input channels, the weights resident in registers across
+all 27 taps (one activation ldmatrix_x4 and two MMAs per tap per 16 positions, no weight loads), deeper z per block;
+16-bit first, then fp8 m16n8k32 with two taps per K block. Target ~2x on enc0.c2, dec0.c2, dec0.c1 (122 of 232 GF).
 Plan: (1) per-op profile (agent, done: fp8 on 16-channel convs is padding/staging-bound, Ci = 16 pads to the fp8
 K = 32; enc0.c1 pads Ci = 4 to 16; stride-2 convs latency-bound at 4-10 TFLOP/s; head and GN small); (2) agent's
 kernel changes in payoff order: dec0.c1 on the MX path without the transient (-14% at 96^3), K-packing of two taps
