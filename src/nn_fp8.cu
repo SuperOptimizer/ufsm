@@ -3251,7 +3251,7 @@ template <typename T, typename TG> static void bwd_w_f4_t(const void *x, shape5 
     static int nt_env = -2, mt_env = -2, zc_env = -2;
     if (nt_env == -2) { nt_env = getenv("UFSM_F4W_NT") ? atoi(getenv("UFSM_F4W_NT")) : -1; mt_env = getenv("UFSM_F4W_MT") ? atoi(getenv("UFSM_F4W_MT")) : -1; zc_env = getenv("UFSM_F4W_ZC") ? atoi(getenv("UFSM_F4W_ZC")) : -1; }
     static int lay_env = -1;
-    if (lay_env < 0) lay_env = getenv("UFSM_F4W_LAYOUT") ? atoi(getenv("UFSM_F4W_LAYOUT")) : 2;
+    if (lay_env < 0) lay_env = getenv("UFSM_F4W_LAYOUT") ? atoi(getenv("UFSM_F4W_LAYOUT")) : 1;   /* 1: per-32 x scales; 2 (one scale per (ci, plane), faster) failed the seed-1 stair: 0.201 vs 0.310 */
     /* plain mode (no Hadamard / x SR): 1 = row pairs, scale per (ci, 32 positions); 2 = rows, scale per (ci, plane) (fp8's
        granularity, one rounding per value); 0 = the 27 shifted blocks (always used with the Hadamard or x SR) */
     const int lay = (had & 3) ? 0 : lay_env;

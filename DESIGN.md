@@ -452,6 +452,14 @@ End-to-end training at P128 B4 x 2 GPUs (400 steps, all2_cached, sampler wait 0,
 (fixed per-step costs dominate). `ufsm train` now defaults to `--fp4 1`; `predict` defaults to `--fp4 1` when the
 checkpoint's precision.txt says act_mx4 1.
 
+fp4 weight-gradient layouts (6000-step MANBp stair, all fp4, peak F1; fp16 0.291 / 0.312): layout 2 (x scale per
+(ci, plane), 5-9% faster than fp8 per conv) 0.292 / 0.201 -- fails seed 1 (0.202 also under MX8 inference, so not
+calibration); layout 1 (per-32 x scales, ~10% slower than fp8) seed 1 0.310; `--fp4 1` on the same master seed 1
+0.308. Default layout is 1; `--fp4 2` stays opt-in (slower than `--fp4 1`).
+
+Equal voxel budget window study (50.3 Gvox, MANBp, `--fp4 1`, seed 0, peak F1 / band F1): 64^3 x 32 0.316 / 0.554,
+128^3 x 4 0.343 / 0.586, 256^3 x 1 (3000 steps) 0.295 / 0.519.
+
 ### Sampler on the 17-source set (2026-10-01 evening)
 - On configs/all2.json the sampler collapsed to 34 patches/s (16 workers) and got slower with 32: 331 lazy store
   opens (one remote metadata fetch each, 70-500 ms) serialised on the open mutex, paid by every worker's first draws
