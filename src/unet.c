@@ -414,10 +414,11 @@ static float *rc_tmp(unet *u, int level, shape5 s, int *reg) {
     }
     float *p = u->train ? u->gB[level] : u->cat[0];
     *reg = 0;
-    if (act_mx8() && nn_storage(p) != act_dt()) { nn_set_storage(p, nn_mx_bytes(s, act_dt()), act_dt()); *reg = 1; }   /* 16-bit gradient buffer used as MX for now */
+    if (act_mx8() && nn_storage(p) != act_dt()) { *reg = 1 + nn_storage(p); nn_set_storage(p, nn_mx_bytes(s, act_dt()), act_dt()); }   /* gradient buffer (16-bit or MX-fp8) used as activation storage for now */
     return p;
 }
-static void rc_done(float *p, int reg) { if (reg) nn_storage_forget(p); }
+/* reg: 0 nothing changed, 1 the buffer was unregistered, 1 + dt it was registered as dt (an MX-fp8 gradient buffer under mx4 activations) */
+static void rc_done(unet *u, float *p, int reg) { if (reg == 1) nn_storage_forget(p); else if (reg > 1) nn_set_storage(p, u->gB_bytes, reg - 1); }
 static float *rc_up(unet *u, block *b, int level, int *reg) {
     const block *xb = (const block *)b->xb;
     shape5 us = b->xs; us.c = b->c_split;
@@ -445,7 +446,7 @@ static int dec_conv1(unet *u, block *b, int level, float *y, int G, float *m, fl
     int reg; float *up = rc_up(u, b, level, &reg);
     if (gy) PROF(2, rv = nn_conv3d_bwd_weight_x(up, nullptr, x2b->a2, &g2, b->c_split, 0, b->xs, gy, b->ys, 3, 1, gw, gbias));
     else PROF(0, rv = nn_conv3d_fwd_x(up, nullptr, x2b->a2, &g2, b->c_split, 0, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, y, G, 1e-5f, m, r));
-    rc_done(up, reg);
+    rc_done(u, up, reg);
     return rv;
 }
 /* down_norm: GroupNorm (params + stats) of a block's input, G = 0 when there is none */

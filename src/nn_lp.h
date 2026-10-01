@@ -36,13 +36,15 @@ void lp_h16_to_mx4(const void *x, int dt, int N, int C, size_t S, void *y);
 void lp_mx4_to_f32(const void *x, int N, int C, size_t S, float *y);
 double lp_sr_e2m1_mean(float v, size_t n);                        /* test probe: mean of n stochastic e2m1 roundings of v (v in grid units) */
 void lp_cvt_e2m1_probe(const float *hv, unsigned char *ho, int n);   /* test probe: raw cvt.rn.satfinite.e2m1x2 nibble of each host value */
-void lp_gn_silu_apply_mx(const void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, void *y);
-void lp_up2_fwd_mx(const void *x, shape5 xs, void *y, gnp_t gp);   /* gp: silu(gn(x)) upsampled */
-void lp_conv1_fwd_mx(const void *x, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp);
-void lp_bwd_w1_mx(const void *x, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp);
-void lp_gn_silu_bwd_mx(const void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
+/* MX elementwise ops: xdt / ydt = lp dtype of the operand (3 mx8, 4 mx4; gn_silu_apply also takes a plane-major 0 / 1 / 2 input);
+   gradients (gy / gx, gdt) are never mx4 */
+void lp_gn_silu_apply_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, void *y, int ydt);
+void lp_up2_fwd_mx(const void *x, int xdt, shape5 xs, void *y, int ydt, gnp_t gp);   /* gp: silu(gn(x)) upsampled */
+void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp);
+void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp);
+void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                        const void *gy, void *gx, int gdt, double *ds, float *st, float *AB);
-void lp_gn_silu_bwd_apply_mx(const void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
+void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                              const void *gy, void *gx, int gdt, const float *AB);
 void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y);
 void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx);
@@ -50,7 +52,7 @@ void lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, voi
 const char *lp_check(void);
 void lp_f32_to_bf16(const float *x, size_t n, void *y);   /* test helpers */
 void lp_bf16_to_f32(const void *x, size_t n, float *y);
-int lp_gn_sums_mx(const void *x, int N, int C, int G, size_t S, double *sums);   /* GroupNorm (sum, sum sq) per (n, group) of an MX tensor, accumulated; -1 unsupported */
+int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t S, double *sums);   /* GroupNorm (sum, sum sq) per (n, group) of an MX tensor, accumulated; -1 unsupported */
 #ifdef __cplusplus
 }
 #endif

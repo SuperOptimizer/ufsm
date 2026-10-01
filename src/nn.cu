@@ -1232,7 +1232,7 @@ static int conv_fwd_tc_s2_h(const void *x, int xbf, shape5 xs, const float *w, c
     return 0;
 }
 static int conv_fwd_tc_s2(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp = {}) {
-    if (ISMX(x) || ISMX(y)) { if (!ISMX(x) || !ISMX(y)) { fprintf(stderr, "conv s2: MX-fp8 storage needs MX input and output\n"); abort(); } return lp_conv_fwd_s2_f8(x, 3, xs, w, b, cout, y, 3, ys, gp); }
+    if (ISMX(x) || ISMX(y)) { if (MXDT(x) != MXDT(y)) { fprintf(stderr, "conv s2: MX storage needs MX input and output of one format\n"); abort(); } return lp_conv_fwd_s2_f8(x, MXDT(x), xs, w, b, cout, y, MXDT(y), ys, gp); }
     if ((eff_prec() == 2 || eff_prec() == 3) && xbf == ybf) return lp_conv_fwd_s2_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), ys, gp);
     return g_h16 ? conv_fwd_tc_s2_h<f16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp) : conv_fwd_tc_s2_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp);
 }
@@ -1257,7 +1257,7 @@ extern "C" shape5 nn_conv3d_out_shape(shape5 xs, int cout, int k, int stride) {
 }
 
 extern "C" void nn_conv3d_fwd(const float *x, shape5 xs, const float *w, const float *b, int cout, int k, int stride, float *y) {
-    if (k == 1 && g_tf32 && ISMX(x)) { lp_conv1_fwd_mx(x, xs, w, b, cout, y, gnp_t{}); KCHECK(); return; }   /* head reading an MX tensor (fp32 output) */
+    if (k == 1 && g_tf32 && ISMX(x)) { lp_conv1_fwd_mx(x, MXDT(x), xs, w, b, cout, y, gnp_t{}); KCHECK(); return; }   /* head reading an MX tensor (fp32 output) */
     shape5 ys = nn_conv3d_out_shape(xs, cout, k, stride);
     if (k == 3 && stride == 1 && g_tf32) { gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0}; split_t ns = {nullptr, 0, nullptr, 0}; conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, none, nullptr, 0, ns); KCHECK(); return; }
     if (k == 3 && stride == 2 && g_tf32) { conv_fwd_tc_s2(x, ABF, xs, w, b, cout, y, ABF, ys); KCHECK(); return; }
@@ -1645,7 +1645,7 @@ static void launch_bwd_w_tc_h(const void *x, int xbf, shape5 xs, const void *gy,
     else launch_bwd_w_tc_t<float, float, HT>((const float *)x, xs, (const float *)gy, ys, gw, gb, gp, sp);
 }
 static void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
-    if (ISMX(x)) { lp_bwd_w_f8(x, 3, xs, gy, ISMX(gy) ? 3 : LPDT(gybf), ys, gw, gb, gp, sp); return; }
+    if (ISMX(x)) { lp_bwd_w_f8(x, MXDT(x), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(gybf), ys, gw, gb, gp, sp); return; }
     if ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) { if (sr_on()) sp.sr = sr_seed(); }
     if ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) { lp_bwd_w_f8(x, LPDT(xbf), xs, gy, LPDT(gybf), ys, gw, gb, gp, sp); return; }   /* prec 4 (fp16) keeps the 16-bit kernel for the weight gradient */
     if (g_h16) launch_bwd_w_tc_h<f16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
@@ -1831,9 +1831,9 @@ extern "C" void nn_conv3d_bwd_weight(const float *x, shape5 xs, const float *gy,
         KCHECK();
         return;
     }
-    if (k == 3 && stride == 2 && g_tf32 && ISMX(x)) { lp_bwd_w_s2_f8(x, 3, xs, gy, ISMX(gy) ? 3 : LPDT(GBF), ys, gw, gb, gnp_t{}); KCHECK(); return; }
+    if (k == 3 && stride == 2 && g_tf32 && ISMX(x)) { lp_bwd_w_s2_f8(x, MXDT(x), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(GBF), ys, gw, gb, gnp_t{}); KCHECK(); return; }
     if (k == 1 && stride == 1 && g_tf32 && ISMX(x)) {
-        lp_bwd_w1_mx(x, xs, gy, LPDT(GBF), ys, gw, gnp_t{});
+        lp_bwd_w1_mx(x, MXDT(x), xs, gy, LPDT(GBF), ys, gw, gnp_t{});
         size_t So1 = shape_spatial(ys);
         if (gb) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So1); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So1); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So1); }
         KCHECK(); return;
@@ -1934,7 +1934,7 @@ extern "C" int nn_conv3d_bwd_data_range(const float *gy, shape5 ys, const float 
 /* y = silu(gn(x)) from precomputed statistics, one pass */
 extern "C" void nn_gn_silu_apply(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *y) {
     if (G > s.c) G = s.c;
-    if (ISMX(x)) { if (!ISMX(y)) { fprintf(stderr, "gn_silu_apply: MX input needs an MX output\n"); abort(); } lp_gn_silu_apply_mx(x, s, G, gamma, beta, mean, rstd, y); KCHECK(); return; }
+    if (ISMX(x) || ISMX(y)) { if (!ISMX(y)) { fprintf(stderr, "gn_silu_apply: MX input needs an MX output\n"); abort(); } lp_gn_silu_apply_mx(x, ISMX(x) ? MXDT(x) : LPDT(ABF), s, G, gamma, beta, mean, rstd, y, MXDT(y)); KCHECK(); return; }   /* MX or 16-bit in, MX out */
     size_t n = shape_numel(s);
     if (ABF && g_h16) gn_apply_k<1, f16, f16><<<dim3(s.n * s.c, KSLAB), 256>>>((const f16 *)x, gamma, beta, mean, rstd, (f16 *)y, s.c, G, shape_spatial(s));
     else if (ABF) gn_apply_k<1, bf16, bf16><<<dim3(s.n * s.c, KSLAB), 256>>>((const bf16 *)x, gamma, beta, mean, rstd, (bf16 *)y, s.c, G, shape_spatial(s));
@@ -1997,7 +1997,7 @@ extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x
     if (x2 || up || G_out) return -1;
     if (k == 3 && stride == 2) { conv_fwd_tc_s2(x, ABF, xs, w, b, cout, y, ABF, ys, gp); KCHECK(); return 0; }
     if (k == 1 && stride == 1) {
-        if (ISMX(x)) lp_conv1_fwd_mx(x, xs, w, b, cout, y, gp);
+        if (ISMX(x)) lp_conv1_fwd_mx(x, MXDT(x), xs, w, b, cout, y, gp);
         else { size_t S = shape_spatial(xs); dim3 gr(nblk((size_t)xs.n * S, 256));
             if (ABF && g_h16) conv1_f_k<f16, float><<<gr, 256>>>((const f16 *)x, w, b, y, xs.n, xs.c, cout, S, gp);
             else if (ABF) conv1_f_k<bf16, float><<<gr, 256>>>((const bf16 *)x, w, b, y, xs.n, xs.c, cout, S, gp);
@@ -2020,7 +2020,7 @@ extern "C" int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const f
     }
     if (x2 || up) return -1;
     if (k == 3 && stride == 2) {
-        if (ISMX(x)) lp_bwd_w_s2_f8(x, 3, xs, gy, ISMX(gy) ? 3 : LPDT(GBF), ys, gw, gb, gp);
+        if (ISMX(x)) lp_bwd_w_s2_f8(x, MXDT(x), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(GBF), ys, gw, gb, gp);
         else if (eff_prec_w() == 2 || eff_prec_w() == 3) lp_bwd_w_s2_f8(x, LPDT(ABF), xs, gy, LPDT(GBF), ys, gw, gb, gp);
         else if (g_h16) bwd_w_s2_h<f16>(x, xs, gy, ys, gw, gb, gp); else bwd_w_s2_h<bf16>(x, xs, gy, ys, gw, gb, gp);
         KCHECK();
@@ -2028,7 +2028,7 @@ extern "C" int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const f
     }
     if (k == 1 && stride == 1) {
         size_t So = shape_spatial(ys);
-        if (ISMX(x)) lp_bwd_w1_mx(x, xs, gy, LPDT(GBF), ys, gw, gp);
+        if (ISMX(x)) lp_bwd_w1_mx(x, MXDT(x), xs, gy, LPDT(GBF), ys, gw, gp);
         else if (xs.c * ys.c <= 64 && ys.c <= 8) { if (g_h16) bwd_w1_h<f16>(x, xs, gy, ys, gw, So, gp); else bwd_w1_h<bf16>(x, xs, gy, ys, gw, So, gp); }
         else return -1;
         if (gb) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So); }
@@ -2149,12 +2149,12 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
         int NC = s.n * s.c;
         double *ds = gn_dsums((size_t)2 * NC);
         float *AB = scratch + 2 * NC;
-        const int gdt = ISMX(gy) ? 3 : LPDT(GBF);
-        if ((gdt == 3) != (ISMX(gx) != 0)) { fprintf(stderr, "gn_silu_bwd: gy and gx must share the MX storage\n"); abort(); }
-        lp_gn_silu_bwd_mx(x, s, G, gamma, beta, mean, rstd, gy, gx, gdt, ds, scratch, AB);
+        const int gdt = ISMX(gy) ? MXDT(gy) : LPDT(GBF), xdt = MXDT(x);
+        if (gdt != (ISMX(gx) ? MXDT(gx) : LPDT(GBF)) || gdt == 4) { fprintf(stderr, "gn_silu_bwd: gy and gx must share the storage (MX-fp8 or 16-bit; never fp4)\n"); abort(); }
+        lp_gn_silu_bwd_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, ds, scratch, AB);
         d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
         gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB);
-        lp_gn_silu_bwd_apply_mx(x, s, G, gamma, beta, mean, rstd, gy, gx, gdt, AB);
+        lp_gn_silu_bwd_apply_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, AB);
         gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
         KCHECK();
         return;
@@ -2234,7 +2234,7 @@ extern "C" int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *me
     double *sums = gn_dsums((size_t)2 * NG);
     cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double));
     if (ISMX(x)) {   /* MX storage: statistics of the dequantised values */
-        if (lp_gn_sums_mx(x, s.n, s.c, G, S, sums)) return -1;
+        if (lp_gn_sums_mx(x, MXDT(x), s.n, s.c, G, S, sums)) return -1;
         gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, (size_t)(s.c / G) * S, eps, mean, rstd);
         KCHECK();
         return 0;
@@ -2740,7 +2740,7 @@ __global__ void __launch_bounds__(256) up2_b_k(const TG *gy, TO *gx, int NC, int
 }
 extern "C" void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, float *y, int ctot, int c0) {
     const gnp_t gp = to_gnp(g);
-    if (ISMX(x)) { if (!ISMX(y) || ctot != xs.c || c0) { fprintf(stderr, "up2: MX input needs a whole MX output tensor\n"); abort(); } lp_up2_fwd_mx(x, xs, y, gp); KCHECK(); return; }
+    if (ISMX(x)) { if (!ISMX(y) || ctot != xs.c || c0) { fprintf(stderr, "up2: MX input needs a whole MX output tensor\n"); abort(); } lp_up2_fwd_mx(x, MXDT(x), xs, y, MXDT(y), gp); KCHECK(); return; }
     dim3 grid(nblk(2 * xs.w, 32), nblk(2 * xs.h, 8), (unsigned)(nblk(2 * xs.d, 4) * xs.n * xs.c));
     if (ABF && g_h16) up2_f_k<f16, f16><<<grid, 256>>>((const f16 *)x, (f16 *)y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0, gp);
     else if (ABF) up2_f_k<bf16, bf16><<<grid, 256>>>((const bf16 *)x, (bf16 *)y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0, gp);

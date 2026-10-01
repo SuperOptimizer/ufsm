@@ -225,6 +225,163 @@ int main(void) {
         nn_conv3d_fwd_fp4(x, xs, w, b, 64, y4);
         cmp("fp4 conv fwd fp32 I/O (TZ 4, MT 4 -> TZ 2)", y4, yr, ny, TOL4);
     }
+    /* ---- step 4: every consumer of an mx4 activation (training and inference). Inputs mx4 (dequantised for the fp32
+       reference); TOL4O: one e2m1 output quantisation of the op's result; TOL: fp32 / mx8 outputs ---- */
+    const double TOL4O = 0.16;
+    {   /* upsample forward (mx4 -> mx4, plain and with gn+silu of the coarse input) */
+        shape5 xs = {N, 32, 6, 6, 6}, ys = {N, 32, 12, 12, 12};
+        size_t NG = (size_t)N * G;
+        float *x = dev_rand(shape_numel(xs), 1.f); void *xm = mx4_from(x, xs); float *xd = deq4(xm, xs);
+        float *yr = dev_zero(shape_numel(ys)); void *ym = mx4_new(ys);
+        mode_ref(); nn_up2_fwd_into(xd, xs, yr, 32, 0);
+        mode_mx(); nn_up2_fwd_into(xm, xs, ym, 32, 0);
+        cmp("up2 fwd (mx4 -> mx4)", deq4(ym, ys), yr, shape_numel(ys), TOL4O);
+        float *gam = dev_rand(32, 1.f), *bet = dev_rand(32, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+        nn_gn_t g = {gam, bet, mean, rstd, G};
+        float *t = dev_zero(shape_numel(xs)), *yr2 = dev_zero(shape_numel(ys)); void *ym2 = mx4_new(ys);
+        mode_ref(); nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, t); nn_up2_fwd_into(t, xs, yr2, 32, 0);
+        mode_mx(); nn_up2_fwd_gn_into(xm, xs, &g, ym2, 32, 0);
+        cmp("up2 fwd gn+silu input (mx4 -> mx4)", deq4(ym2, ys), yr2, shape_numel(ys), TOL4O);
+        void *ym8 = mx8_new(ys);   /* mx4 coarse -> mx8 transient */
+        mode_mx(); nn_up2_fwd_into(xm, xs, ym8, 32, 0);
+        cmp("up2 fwd (mx4 -> mx8)", deq8(ym8, ys), yr, shape_numel(ys), TOL);
+    }
+    {   /* GroupNorm + SiLU apply (mx4 / mx8 / fp32 in -> mx4 out), GroupNorm statistics, backward (mx4 x; fp32 or mx8 gradients) */
+        shape5 s = {N, 16, 10, 10, 10}, s48 = {N, 64, 6, 6, 6};
+        for (int pass = 0; pass < 2; pass++) {
+            const shape5 ss = pass ? s48 : s;
+            const int C = ss.c;
+            size_t n = shape_numel(ss), NG = (size_t)N * G;
+            float *x = dev_rand(n, 2.f), *gam = dev_rand(C, 1.f), *bet = dev_rand(C, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+            { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+            void *xm = mx4_from(x, ss); float *xd = deq4(xm, ss);
+            float *yr = dev_zero(n); void *ym = mx4_new(ss);
+            char nm[96];
+            mode_ref(); nn_gn_silu_apply(xd, ss, G, gam, bet, mean, rstd, yr);
+            mode_mx(); nn_gn_silu_apply(xm, ss, G, gam, bet, mean, rstd, ym);
+            snprintf(nm, sizeof nm, "gn+silu apply mx4 -> mx4 (%d ch)", C); cmp(nm, deq4(ym, ss), yr, n, TOL4O);
+            void *x8 = mx8_from(x, ss); float *x8d = deq8(x8, ss), *yr8 = dev_zero(n); void *ym48 = mx4_new(ss);
+            mode_ref(); nn_gn_silu_apply(x8d, ss, G, gam, bet, mean, rstd, yr8);
+            mode_mx(); nn_gn_silu_apply(x8, ss, G, gam, bet, mean, rstd, ym48);
+            snprintf(nm, sizeof nm, "gn+silu apply mx8 -> mx4 (%d ch)", C); cmp(nm, deq4(ym48, ss), yr8, n, TOL4O);
+            float *yr32 = dev_zero(n); void *ymf = mx4_new(ss);
+            mode_ref(); nn_gn_silu_apply(x, ss, G, gam, bet, mean, rstd, yr32);
+            mode_mx(); nn_gn_silu_apply(x, ss, G, gam, bet, mean, rstd, ymf);
+            snprintf(nm, sizeof nm, "gn+silu apply fp32 -> mx4 (%d ch)", C); cmp(nm, deq4(ymf, ss), yr32, n, TOL4O);
+            float *m1 = dev_zero(NG), *r1 = dev_zero(NG), *m2 = dev_zero(NG), *r2 = dev_zero(NG);
+            mode_ref(); nn_gn_stats(xd, ss, G, 1e-5f, m1, r1);
+            mode_mx(); nn_gn_stats(xm, ss, G, 1e-5f, m2, r2);
+            snprintf(nm, sizeof nm, "gn stats mean (mx4 x, %d ch)", C); cmp(nm, m2, m1, NG, 1e-4);
+            snprintf(nm, sizeof nm, "gn stats rstd (mx4 x, %d ch)", C); cmp(nm, r2, r1, NG, 1e-4);
+            float *gy = dev_rand(n, 1e-3f), *gxr = dev_zero(n), *gx2 = dev_zero(n), *gg1 = dev_zero(C), *gb1 = dev_zero(C), *gg2 = dev_zero(C), *gb2 = dev_zero(C), *scr = nn_malloc(nn_gn_scratch(ss) + 4096);
+            mode_ref(); nn_gn_silu_bwd(xd, ss, G, gam, bet, mean, rstd, gy, gxr, gg1, gb1, scr);
+            mode_mx(); nn_gn_silu_bwd(xm, ss, G, gam, bet, mean, rstd, gy, gx2, gg2, gb2, scr);
+            snprintf(nm, sizeof nm, "gn+silu bwd gx (mx4 x, fp32 gy/gx, %d ch)", C); cmp(nm, gx2, gxr, n, 1e-4);
+            snprintf(nm, sizeof nm, "gn+silu bwd ggamma (mx4 x, %d ch)", C); cmp(nm, gg2, gg1, C, 1e-4);
+            snprintf(nm, sizeof nm, "gn+silu bwd gbeta (mx4 x, %d ch)", C); cmp(nm, gb2, gb1, C, 1e-4);
+            void *gym = mx8_from(gy, ss); float *gyd = deq8(gym, ss), *gxr8 = dev_zero(n); void *gxm = mx8_new(ss);
+            mode_ref(); nn_gn_silu_bwd(xd, ss, G, gam, bet, mean, rstd, gyd, gxr8, gg1, gb1, scr);
+            mode_mx(); nn_gn_silu_bwd(xm, ss, G, gam, bet, mean, rstd, gym, gxm, gg2, gb2, scr);
+            snprintf(nm, sizeof nm, "gn+silu bwd gx (mx4 x, mx8 gy/gx, %d ch)", C); cmp(nm, deq8(gxm, ss), gxr8, n, TOL);
+        }
+    }
+    {   /* stride-1 weight gradients with an mx4 x: gn input (fp32 / mx8 gy), split input (dec0.c1 shape, 32 + 16), plain 16 ch */
+        shape5 xs = {N, 16, 12, 12, 16}, ys = xs; ys.c = 32;
+        size_t nx = shape_numel(xs), ny = shape_numel(ys), NG = (size_t)N * G;
+        float *x = dev_rand(nx, 2.f), *gam = dev_rand(16, 1.f), *bet = dev_rand(16, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+        void *xm = mx4_from(x, xs); float *xd = deq4(xm, xs);
+        float *gy32 = dev_rand(ny, 1e-3f), *t = dev_zero(nx);
+        float *gw1 = dev_zero((size_t)32 * 16 * 27), *gw2 = dev_zero((size_t)32 * 16 * 27), *gb1 = dev_zero(32), *gb2 = dev_zero(32);
+        mode_ref(); nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, t); nn_conv3d_bwd_weight(t, xs, gy32, ys, 3, 1, gw1, gb1);
+        mode_mx(); nn_conv3d_bwd_weight_gn(xm, xs, G, gam, bet, mean, rstd, gy32, ys, gw2, gb2);
+        cmp("bwd_weight gn input (mx4 x, fp32 gy)", gw2, gw1, (size_t)32 * 16 * 27, TOL);
+        cmp("bwd_weight bias (mx4 x, fp32 gy)", gb2, gb1, 32, TOL);
+        void *gy32m = mx8_from(gy32, ys); float *gy32d = deq8(gy32m, ys);
+        nn_zero(gw1, (size_t)32 * 16 * 27 * 4); nn_zero(gw2, (size_t)32 * 16 * 27 * 4);
+        mode_ref(); nn_conv3d_bwd_weight(t, xs, gy32d, ys, 3, 1, gw1, nullptr);
+        mode_mx(); nn_conv3d_bwd_weight_gn(xm, xs, G, gam, bet, mean, rstd, gy32m, ys, gw2, nullptr);
+        cmp("bwd_weight gn input (mx4 x, mx8 gy)", gw2, gw1, (size_t)32 * 16 * 27, TOL);
+        float *w3 = dev_zero((size_t)32 * 16 * 27), *w4 = dev_zero((size_t)32 * 16 * 27);
+        mode_ref(); nn_conv3d_bwd_weight(xd, xs, gy32, ys, 3, 1, w3, nullptr);
+        mode_mx(); nn_conv3d_bwd_weight(xm, xs, gy32, ys, 3, 1, w4, nullptr);
+        cmp("bwd_weight plain (mx4 x, 16 ch)", w4, w3, (size_t)32 * 16 * 27, TOL);
+        shape5 cs = xs; cs.c = 48; shape5 c1 = xs; c1.c = 32; shape5 o16 = xs; o16.c = 16;
+        float *xa = dev_rand(shape_numel(c1), 1.f); void *xam = mx4_from(xa, c1); float *xad = deq4(xam, c1);
+        float *cat = dev_zero(shape_numel(cs)), *gy16 = dev_rand(shape_numel(o16), 1e-3f);
+        float *gw5 = dev_zero((size_t)16 * 48 * 27), *gw6 = dev_zero((size_t)16 * 48 * 27);
+        mode_ref(); nn_concat_fwd(xad, 32, xd, 16, cs, cat); nn_conv3d_bwd_weight(cat, cs, gy16, o16, 3, 1, gw5, nullptr);
+        mode_mx(); nn_conv3d_bwd_weight_split(xam, xm, 32, cs, 0, nullptr, nullptr, nullptr, nullptr, gy16, o16, gw6, nullptr);
+        cmp("bwd_weight split input (mx4, 32 + 16)", gw6, gw5, (size_t)16 * 48 * 27, TOL);
+    }
+    {   /* stride 2: forward mx4 -> mx4 (plain, and with the gn+silu input of recompute mode), weight gradient (mx4 x; fp32 / mx8 gy) */
+        shape5 xs = {N, 32, 16, 16, 16}, ys = {N, 32, 8, 8, 8}, x16 = {N, 16, 16, 16, 16}, y16 = {N, 16, 8, 8, 8};
+        size_t nx = shape_numel(xs), ny = shape_numel(ys), NG = (size_t)N * G;
+        float *x = dev_rand(nx, 1.f), *w = dev_rand((size_t)32 * 32 * 27, 0.1f), *b = dev_rand(32, 0.1f);
+        void *xm = mx4_from(x, xs); float *xd = deq4(xm, xs);
+        float *yr = dev_zero(ny); void *ym = mx4_new(ys);
+        mode_ref(); nn_conv3d_fwd(xd, xs, w, b, 32, 3, 2, yr);
+        mode_mx(); nn_conv3d_fwd(xm, xs, w, b, 32, 3, 2, ym);
+        cmp("s2 fwd (mx4 -> mx4, fp8 compute)", deq4(ym, ys), yr, ny, TOL4O);
+        float *gam = dev_rand(32, 1.f), *bet = dev_rand(32, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+        nn_gn_t g = {gam, bet, mean, rstd, G};
+        float *t = dev_zero(nx), *yr2 = dev_zero(ny); void *ym2 = mx4_new(ys);
+        mode_ref(); nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, t); nn_conv3d_fwd(t, xs, w, b, 32, 3, 2, yr2);
+        mode_mx(); nn_conv3d_fwd_x(xm, &g, nullptr, nullptr, 0, 0, xs, w, b, 32, 3, 2, (float *)ym2, 0, 0.f, nullptr, nullptr);
+        cmp("s2 fwd gn+silu input (mx4 -> mx4)", deq4(ym2, ys), yr2, ny, TOL4O);
+        float *x6 = dev_rand(shape_numel(x16), 1.f), *w6 = dev_rand((size_t)16 * 16 * 27, 0.1f); void *x6m = mx4_from(x6, x16); float *x6d = deq4(x6m, x16);
+        float *y6r = dev_zero(shape_numel(y16)); void *y6m = mx4_new(y16);
+        mode_ref(); nn_conv3d_fwd(x6d, x16, w6, nullptr, 16, 3, 2, y6r);
+        mode_mx(); nn_conv3d_fwd(x6m, x16, w6, nullptr, 16, 3, 2, y6m);
+        cmp("s2 fwd 16 ch (mx4 bw 16 -> mx4)", deq4(y6m, y16), y6r, shape_numel(y16), TOL4O);
+        float *gy = dev_rand(ny, 1e-3f), *gw1 = dev_zero((size_t)32 * 32 * 27), *gw2 = dev_zero((size_t)32 * 32 * 27), *gb1 = dev_zero(32), *gb2 = dev_zero(32);
+        mode_ref(); nn_conv3d_bwd_weight(xd, xs, gy, ys, 3, 2, gw1, gb1);
+        mode_mx(); nn_conv3d_bwd_weight(xm, xs, gy, ys, 3, 2, gw2, gb2);
+        cmp("s2 bwd_weight (mx4 x, fp32 gy)", gw2, gw1, (size_t)32 * 32 * 27, TOL);
+        cmp("s2 bias grad (mx4 x)", gb2, gb1, 32, TOL);
+        void *gym = mx8_from(gy, ys); float *gyd = deq8(gym, ys);
+        nn_zero(gw1, (size_t)32 * 32 * 27 * 4); nn_zero(gw2, (size_t)32 * 32 * 27 * 4);
+        mode_ref(); nn_conv3d_bwd_weight(t, xs, gyd, ys, 3, 2, gw1, nullptr);
+        mode_mx(); nn_conv3d_bwd_weight_x(xm, &g, nullptr, nullptr, 0, 0, xs, gym, ys, 3, 2, gw2, nullptr);
+        cmp("s2 bwd_weight gn+silu input (mx4 x, mx8 gy)", gw2, gw1, (size_t)32 * 32 * 27, TOL);
+    }
+    {   /* head: 1^3 forward (fp32 logits) and weight gradient from an mx4 x, plain and with gn+silu (recompute mode) */
+        shape5 xs = {N, 16, 10, 10, 10}, ys = xs; ys.c = 1;
+        size_t nx = shape_numel(xs), ny = shape_numel(ys), NG = (size_t)N * G;
+        float *x = dev_rand(nx, 1.f), *w = dev_rand(16, 0.3f), *b = dev_rand(1, 0.1f);
+        void *xm = mx4_from(x, xs); float *xd = deq4(xm, xs);
+        float *yr = dev_zero(ny), *ym = dev_zero(ny);
+        mode_ref(); nn_conv3d_fwd(xd, xs, w, b, 1, 1, 1, yr);
+        mode_mx(); nn_conv3d_fwd(xm, xs, w, b, 1, 1, 1, ym);
+        cmp("head fwd (mx4 x, fp32 logits)", ym, yr, ny, 1e-5);
+        float *gam = dev_rand(16, 1.f), *bet = dev_rand(16, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+        nn_gn_t g = {gam, bet, mean, rstd, G};
+        float *t = dev_zero(nx), *yr2 = dev_zero(ny), *ym2 = dev_zero(ny);
+        mode_ref(); nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, t); nn_conv3d_fwd(t, xs, w, b, 1, 1, 1, yr2);
+        mode_mx(); nn_conv3d_fwd_x(xm, &g, nullptr, nullptr, 0, 0, xs, w, b, 1, 1, 1, ym2, 0, 0.f, nullptr, nullptr);
+        cmp("head fwd gn+silu input (mx4 x)", ym2, yr2, ny, 1e-5);
+        float *gy = dev_rand(ny, 1e-3f), *gw1 = dev_zero(16), *gw2 = dev_zero(16), *gb1 = dev_zero(1), *gb2 = dev_zero(1);
+        mode_ref(); nn_conv3d_bwd_weight(xd, xs, gy, ys, 1, 1, gw1, gb1);
+        mode_mx(); nn_conv3d_bwd_weight(xm, xs, gy, ys, 1, 1, gw2, gb2);
+        cmp("head bwd_weight (mx4 x)", gw2, gw1, 16, 1e-4);
+        cmp("head bias grad (mx4 x)", gb2, gb1, 1, 1e-4);
+        nn_zero(gw1, 64); nn_zero(gw2, 64);
+        mode_ref(); nn_conv3d_bwd_weight(t, xs, gy, ys, 1, 1, gw1, nullptr);
+        mode_mx(); nn_conv3d_bwd_weight_x(xm, &g, nullptr, nullptr, 0, 0, xs, gy, ys, 1, 1, gw2, nullptr);
+        cmp("head bwd_weight gn+silu input (mx4 x)", gw2, gw1, 16, 1e-4);
+    }
+    {   /* network input: fp32 / fp16 -> mx4 through the registry entry points */
+        shape5 s = {N, 4, 16, 16, 16};
+        size_t n = shape_numel(s);
+        float *x = dev_rand(n, 1.f); void *a = mx4_new(s), *b = mx4_new(s);
+        nn_f32_to_act(x, s, a);
+        cmp("nn_f32_to_act -> mx4 == lp_f32_to_mx4", deq4(a, s), deq4(mx4_from(x, s), s), n, 1e-6);
+        nn_set_f16(1); void *hx = nn_malloc(n * 2); nn_f32_to_h16(x, n, hx, 1.f); nn_h16_to_mx(hx, s, b); nn_set_f16(0);
+        cmp("nn_h16_to_mx -> mx4 vs fp32 source", deq4(b, s), deq4(a, s), n, 0.03);
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
     printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);
