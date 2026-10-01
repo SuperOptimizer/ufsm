@@ -322,7 +322,13 @@ Where the rest would come from:
 - Muon (modded-nanogpt): `--opt muon` runs nesterov momentum + 5 Newton-Schulz iterations on each 3^3 conv weight
   viewed as [Co][Ci*27] (`nn_muon`, `tests/test_muon.c`), AdamW on biases, GroupNorm and the head, lr 0.02 following
   the AdamW schedule shape. Kaggle smoke run, 600 steps: train loss 0.41 vs 0.59, validation 0.54 vs 0.63 for AdamW,
-  at ~15% more step time (naive small-matrix kernels). Real-data yardstick pending.
+  at ~15% more step time (naive small-matrix kernels). Real-data yardstick (MANBp, P64 B8, 6000 steps, down_norm,
+  same seed): peak F1 0.296 at threshold 0.6 (band F1 0.476 / recall 0.584) for Muon against 0.199 at 0.6 for AdamW
+  (0.362 / 0.366); validation loss 0.872 vs 0.898. Adopted for new runs (`--opt muon`); lr sweep 0.01 / 0.02 / 0.05
+  in progress. Note the AdamW arm scored below the agent's earlier AdamW reference (0.262 at 0.5), so seed variance
+  is large at 6000 steps, but the Muon margin is far outside it.
+- Prefetch and training levels: scans finer than 1.8 um (PHerc0139 1.129 um) get `min_level` 1 from make_sources
+  (their level 0 alone would be 1.5M chunks); the sampler and the prefetch honour it.
 
 ### Accuracy diagnosis (2026-10-01 morning)
 - Held-out scores of r5 (8 sources, soft sigma 3, intensity-only augmentation, 17k of 40k steps) against r4: F1 at
