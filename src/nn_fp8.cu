@@ -475,6 +475,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                                              int D, int H, int W, int oz0, int oy0, int ox0, int wz, int wr, double *osum, int Go, const split_t &sp, int N = 0) {
     constexpr int BM = MT * 16, RZ = NR / 2;
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int zs0 = sp.zlo, zs1 = D - sp.zhi;   /* statistics over the z planes this GPU owns (spatial split) */
     float *cs = (float *)smem_raw;
     if (osum) { __syncthreads(); for (int i = threadIdx.x; i < 2 * BM; i += blockDim.x) cs[i] = 0.f; __syncthreads(); }
     if constexpr (IS_MX(T)) {   /* MX output: per voxel and 32- (16-) channel block, amax over the block's rows (lanes g, h, m);
@@ -549,6 +550,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                 int oz = oz0 + wz * RZ + (r >> 1), oy = oy0 + wr + (r & 1);
                 if (oz >= D || oy >= H || co >= Co) continue;
                 float bias = b ? b[co] : 0.f;
+                const bool zst = oz >= zs0 && oz < zs1;
                 T *yp = IS_MX(T) ? y : (sp.y2 && co >= sp.o_split) ? (T *)sp.y2 + (((size_t)n * (Co - sp.o_split) + co - sp.o_split) * D + oz) * H * W + (size_t)oy * W
                                                     : y + (((size_t)n * (sp.y2 ? sp.o_split : Co) + co) * D + oz) * H * W + (size_t)oy * W;
 #pragma unroll
@@ -556,18 +558,18 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                     int ox = ox0 + q * 8 + 2 * t;
                     float v0 = acc[m][r][q][2 * h] + bias, v1 = acc[m][r][q][2 * h + 1] + bias;
                     if constexpr (IS_MX(T)) {   /* stores done above; statistics from the unquantized values */
-                        if (ox < W) { ps += v0; pss += v0 * v0; }
-                        if (ox + 1 < W) { ps += v1; pss += v1 * v1; }
+                        if (ox < W && zst) { ps += v0; pss += v0 * v0; }
+                        if (ox + 1 < W && zst) { ps += v1; pss += v1 * v1; }
                     } else {
                         if (osum && std::is_same<T, __half>::value) {   /* fp16 activation feeding a GroupNorm: saturate instead of inf (as conv_fwd_tc_k) */
                             v0 = sat_h16(v0); v1 = sat_h16(v1);
                         }
                         if (!(W & 1) && ox + 1 < W) {   /* paired store */
                             if (sp.accum) { v0 += ldx(yp, (size_t)ox); v1 += ldx(yp, (size_t)ox + 1); }
-                            stx2(yp, (size_t)ox, v0, v1); ps += v0 + v1; pss += v0 * v0 + v1 * v1; continue;
+                            stx2(yp, (size_t)ox, v0, v1); if (zst) { ps += v0 + v1; pss += v0 * v0 + v1 * v1; } continue;
                         }
-                        if (ox < W) { if (sp.accum) v0 += ldx(yp, (size_t)ox); stx(yp, (size_t)ox, v0); ps += v0; pss += v0 * v0; }
-                        if (ox + 1 < W) { if (sp.accum) v1 += ldx(yp, (size_t)ox + 1); stx(yp, (size_t)ox + 1, v1); ps += v1; pss += v1 * v1; }
+                        if (ox < W) { if (sp.accum) v0 += ldx(yp, (size_t)ox); stx(yp, (size_t)ox, v0); if (zst) { ps += v0; pss += v0 * v0; } }
+                        if (ox + 1 < W) { if (sp.accum) v1 += ldx(yp, (size_t)ox + 1); stx(yp, (size_t)ox + 1, v1); if (zst) { ps += v1; pss += v1 * v1; } }
                     }
                 }
             }
@@ -2693,7 +2695,7 @@ extern "C" void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, 
 /* GroupNorm sums of an MX tensor (B bits): per (n, group) sum and sum of squares (double, accumulated); a block = 256 voxels of
    one sample, all channel blocks; per-group partials in shared memory */
 template <int B>
-__global__ void __launch_bounds__(256) gn_sums_mx_k(const uint8_t *x, int N, int C, int G, size_t S, double *sums) {
+__global__ void __launch_bounds__(256) gn_sums_mx_k(const uint8_t *x, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1) {
     const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G;
     const int nblk_per = (int)((S + 255) / 256);
     const int n = blockIdx.x / nblk_per; const size_t v = (size_t)(blockIdx.x % nblk_per) * 256 + threadIdx.x;
@@ -2703,7 +2705,7 @@ __global__ void __launch_bounds__(256) gn_sums_mx_k(const uint8_t *x, int N, int
     const uint8_t *sc = mx_sc<B>(x, N, C, S);
     for (int blk = 0; blk < nb; blk++) {
         float r[32];
-        if (v < S) mx_load_row_b<B>(x, sc, ((size_t)n * nb + blk) * S + v, bw, r);
+        if (v < S && v >= v0 && v < v1) mx_load_row_b<B>(x, sc, ((size_t)n * nb + blk) * S + v, bw, r);   /* [v0, v1): voxels this GPU owns (spatial split) */
         else for (int k = 0; k < 32; k++) r[k] = 0.f;
         /* the block row's channels in order, flushed to their group whenever the group changes (any C / G: a group may
            straddle two block rows; the group index is warp-uniform, so the reductions are) */
@@ -2728,12 +2730,12 @@ __global__ void __launch_bounds__(256) gn_sums_mx_k(const uint8_t *x, int N, int
     __syncthreads();
     for (int g = threadIdx.x; g < G; g += 256) { atomicAdd(&sums[2 * ((size_t)n * G + g)], (double)g1[g]); atomicAdd(&sums[2 * ((size_t)n * G + g) + 1], (double)g2[g]); }
 }
-extern "C" int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t S, double *sums) {
+extern "C" int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1) {
     const int cpg = C / G;
     if (G > 64 || cpg < 1 || C % G) return -1;
     const int nblk_per = (int)((S + 255) / 256);
-    if (xdt == 4) gn_sums_mx_k<4><<<N * nblk_per, 256>>>((const uint8_t *)x, N, C, G, S, sums);
-    else gn_sums_mx_k<8><<<N * nblk_per, 256>>>((const uint8_t *)x, N, C, G, S, sums);
+    if (xdt == 4) gn_sums_mx_k<4><<<N * nblk_per, 256>>>((const uint8_t *)x, N, C, G, S, sums, v0, v1);
+    else gn_sums_mx_k<8><<<N * nblk_per, 256>>>((const uint8_t *)x, N, C, G, S, sums, v0, v1);
     LPCK();
     return 0;
 }

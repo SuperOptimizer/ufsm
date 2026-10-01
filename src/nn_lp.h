@@ -13,7 +13,9 @@ typedef struct { const float *gamma, *beta, *mean, *rstd; int G; } gnp_t;   /* G
 /* sr != 0: stochastic rounding (seed) of this conv's gradient operand when quantised to fp8 (the input of a backward-data
    conv, the gy of a weight gradient); 0 = round to nearest */
 /* wkey != 0: id of this conv (layer / conv / pass) for the prepared-weight memo of the fp4 kernel (see lp_wmemo_*) */
-typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; unsigned wkey; } split_t;
+/* zlo / zhi (spatial split, nn_split_cfg): the GroupNorm statistics of the output (osum) skip the first zlo and the last zhi
+   z planes (halo planes owned by the other GPU); 0 / 0 = every plane */
+typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; unsigned wkey; int zlo, zhi; } split_t;
 /* k=3 stride 1 forward / weight gradient with the same semantics as the BF16 tensor-core paths in nn.cu
    (conv_fwd_tc / launch_bwd_w_tc): xbf / ybf = activation (and x2 / y2) storage type, 0 fp32, 1 bf16, 2 fp16; the
    forward needs xbf == ybf. Weights, biases and GroupNorm parameters are fp32; the weight gradient accepts fp32 or (with xbf) bf16 gy. */
@@ -57,7 +59,7 @@ void lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, voi
 const char *lp_check(void);
 void lp_f32_to_bf16(const float *x, size_t n, void *y);   /* test helpers */
 void lp_bf16_to_f32(const void *x, size_t n, float *y);
-int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t S, double *sums);   /* GroupNorm (sum, sum sq) per (n, group) of an MX tensor, accumulated; -1 unsupported */
+int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1);   /* GroupNorm (sum, sum sq) per (n, group) of an MX tensor over voxels [v0, v1), accumulated; -1 unsupported */
 #ifdef __cplusplus
 }
 #endif

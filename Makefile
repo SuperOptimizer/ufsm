@@ -8,7 +8,7 @@ CUDA    ?= /usr/local/cuda
 NVFLAGS ?= -O3 -arch=sm_120 -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
 CUDALIBS = -L$(CUDA)/lib64 -lcudart
 
-SRC  = src/json.c src/store.c src/zarr3.c src/sources.c src/sample.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/unet.c src/predict.c src/eval.c
+SRC  = src/json.c src/store.c src/zarr3.c src/sources.c src/sample.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/unet.c src/split.c src/predict.c src/eval.c
 OBJ  = $(patsubst src/%.c,build/%.o,$(SRC)) build/surfcomp.o
 
 all: build/ufsm
@@ -60,6 +60,8 @@ build/test_mx4: tests/test_mx4.c build/nn.o build/nn_fp8.o
 
 build/test_unet: tests/test_unet.c build/unet.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+build/test_split: tests/test_split.c build/unet.o build/split.o build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 SAMPLE_TEST_OBJ = build/json.o build/store.o build/zarr3.o build/sources.o build/zarr2.o build/tiff.o build/z3w.o build/hf.o build/zipr.o
 build/test_sample_ops: tests/test_sample_ops.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_sample_ops.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
@@ -86,7 +88,7 @@ build/test_json: tests/test_json.c build/json.o
 build:
 	mkdir -p build
 
-test: build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc
+test: build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
 	./build/test_sample_ops
 	./build/test_mx
 	./build/test_mx4
@@ -101,6 +103,7 @@ test: build/test_sample_ops build/test_json build/test_nn build/test_unet build/
 	UFSM_F16=1 ./build/test_unet
 	./build/test_fused
 	UFSM_F16=1 ./build/test_fused
+	./build/test_split
 	./tests/test_formats.sh
 	./tests/test_zarr.sh
 

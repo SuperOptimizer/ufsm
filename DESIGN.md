@@ -481,6 +481,33 @@ Re-scored with last.ckpt (end of the cosine schedule): fp4 wgrad layout 2 seed 1
 MX-fp8 gradients seeds 0-2 0.307 / 0.284 / 0.284 vs `--fp4 1` seed 2 0.285 (passes); windows at equal voxel budget
 64^3 0.300, 128^3 0.347, 256^3 0.292. Stairs and confirm_run.sh now score last.ckpt. `ufsm train` defaults to
 `--fp4 2` (fp4 weight gradients, per-32 x scales; 1-4% faster per step than `--fp4 1`).
+### Spatial split of one window across the two GPUs (`train --split z`, 2026-10-01 night)
+- Each GPU holds its z half of the window plus 2^(L-1-l) halo planes at level l on the side facing the other GPU (8 at
+  level 0 for 4 levels): the local depth P/2 + 8 keeps every stride-2 parity and the U-Net shapes, so the unchanged
+  kernels run on it (P must be a multiple of 2^L = 16). Every stencil consumer (3^3 conv, stride-2 conv, upsample, fused
+  upsample) only needs the innermost halo plane: each produced tensor (a1, a2, down outputs, upsample transients, the
+  gradients before a backward-data or upsample backward) gets it from the other GPU and has its outer halo planes zeroed;
+  a gradient that feeds a reduction (GroupNorm backward, weight / bias gradient) gets all its halo planes zeroed first.
+  GroupNorm statistics skip the halo planes inside the conv epilogues / sum kernels (split_t.zlo / zhi) and, like the
+  GroupNorm backward sums (the parameter gradients stay per-GPU, their sum is in the gradient allreduce) and the loss
+  statistics, are summed across the GPUs before use; the loss mask is zeroed on the halo planes. Parameter gradients are
+  summed (not averaged) across the two halves.
+- No P2P on these GeForce cards: exchanges are staged peer copies (14-17 GB/s, ~10 us small). Host side (src/split.c):
+  two threads, one per GPU, take turns (nn / unet keep global state); the second to reach a collective issues it for
+  both GPUs. Backward gradient halos are exchanged on a per-device communication stream while the weight gradient runs
+  (UFSM_SPLIT_SYNC=1 turns that off; +1% at 256^3). Remaining cost at 256^3: the 8 halo planes (+6% compute, +3% at
+  512^3) and ~35 halo exchanges / 35 GroupNorm sums per step (GPUs ~92% busy).
+- Equality (tests/test_split, in make test, skipped with one GPU): 96^3 (and 128^3 B2) split vs one GPU, recompute
+  0/1/2, down_norm 0/1, the --mem auto modes (chunked, MX-fp8 gradients, lean 1/2). fp16: loss within 3e-6, gradient
+  relative L2 1.5-2.5e-4 = the single-GPU rerun difference (atomics). --fp4 1 with round-to-nearest: loss within 1.5e-8,
+  gradient 3e-7..2.4e-2 against 0.10-0.13 for a 1e-6 input perturbation (flipped fp4 roundings amplify); --fp4 1 with
+  stochastic rounding: gradient 0.068-0.080 against 0.065-0.076 between two rounding seeds of one GPU.
+- Largest windows, B1, `--fp4 1 --mem auto` (P multiple of 16): 640^3 (MX-fp8 gradients, chunked, lean; 15.3 GB peak),
+  704^3 (+ recompute 2, lean 2; 14.9 GB peak); 720^3 runs out of memory. Data parallel tops out at 576^3.
+- Throughput (all2_cached, B1, idle GPUs, samples/s = windows/s; Gvoxel/s): 256^3 data parallel 8.88 (0.149), split 7.70
+  (0.129); 384^3 data parallel 2.67 (0.151), split 2.43 (0.138); split 512^3 1.05 (0.141; data parallel with lean 0.94),
+  576^3 0.715 (0.137), 640^3 0.51 (0.134), 704^3 0.35 (0.122). Per-buffer upload events (the next batch uploads during
+  the step) made data parallel 384^3 2.58 -> 2.67.
 
 ### Sampler on the 17-source set (2026-10-01 evening)
 - On configs/all2.json the sampler collapsed to 34 patches/s (16 workers) and got slower with 32: 331 lazy store

@@ -87,9 +87,34 @@ struct unet {
     int nob;                                 /* lean 2: no buffer B; a block's own gout / gskip is its B (in-place GroupNorm backward) */
     size_t logits_bytes;                     /* lean: logits at the start of A, the 16-bit logit gradient after them */
     float *rc_extra; size_t rc_extra_bytes;  /* training transient for the upsampled decoder input when B is too small */
+    int split_side, split_h0;                /* spatial split (unet_set_split): side 0 / 1, level-0 halo planes; h0 0 = off */
+    unet_halo_fn split_halo, split_begin, split_end;
 };
 
 static int G_of(const unet *u, int c) { return u->cfg.G < c ? u->cfg.G : c; }
+
+/* ---- spatial split along z (unet_set_split): this GPU's tensors are its z planes plus 2^(L-1-l) halo planes at level l on the
+   side facing the other GPU (h0 = 2^(L-1) at level 0, so every level keeps the stride-2 parity and the shapes the U-Net needs).
+   Every stencil consumer (3^3 conv, stride-2 conv, upsample) needs only the innermost halo plane: a produced tensor gets it
+   from the other GPU (sp_halo; the outer halo planes are zeroed), and a gradient that feeds a reduction (GroupNorm backward,
+   weight / bias gradient) gets its halo planes zeroed first (sp_zero) so only owned voxels contribute. GroupNorm statistics
+   and the loss sums are restricted and summed across the GPUs inside nn (nn_split_cfg). */
+void unet_set_split_async(unet *u, unet_halo_fn begin, unet_halo_fn end) { u->split_begin = end ? begin : nullptr; u->split_end = end; }
+void unet_set_split(unet *u, int side, int h0, unet_halo_fn fn) { u->split_side = side; u->split_h0 = fn ? h0 : 0; u->split_halo = fn; }
+static int sp_on(const unet *u) { return u->split_h0 > 0; }
+static int sp_h(const unet *u, shape5 s) { return (int)((long)u->split_h0 * s.d / u->xs.d); }
+static int sp_esz(const void *p, int grad);
+static void sp_halo(const unet *u, const void *p, shape5 s, int grad) { if (sp_on(u)) u->split_halo(p, s, sp_esz(p, grad), sp_h(u, s)); }
+/* a gradient whose halo is zeroed for a weight gradient and then needed by a backward-data: the exchange starts before the
+   weight gradient and completes after it (sp_halo semantics when no asynchronous hooks are set) */
+static void sp_begin(const unet *u, const void *p, shape5 s, int grad) { if (sp_on(u) && u->split_begin) u->split_begin(p, s, sp_esz(p, grad), sp_h(u, s)); }
+static void sp_end(const unet *u, const void *p, shape5 s, int grad) { if (sp_on(u)) { if (u->split_begin) u->split_end(p, s, sp_esz(p, grad), sp_h(u, s)); else sp_halo(u, p, s, grad); } }
+static void sp_zero(const unet *u, const void *p, shape5 s, int grad) { if (sp_on(u)) { int h = sp_h(u, s); nn_split_zero(p, s, sp_esz(p, grad), u->split_side ? h : 0, u->split_side ? 0 : h); } }
+static void sp_cfg(const unet *u) {   /* the device's nn split state follows the network that runs on it */
+    if (!sp_on(u)) { nn_split_cfg(0, 0, 0, 0); return; }
+    const int h = u->split_h0;
+    nn_split_cfg(u->split_side ? h : 0, u->split_side ? 0 : h, u->xs.d, 2 * (u->xs.d - h));
+}
 
 /* ---- parameter layout ---- */
 static size_t add_conv(unet *u, convp *c, int cin, int cout, int k, int stride, size_t off) {
@@ -232,6 +257,7 @@ static int chunk_up(void) {
        memory, for the largest windows; costs ~0.9 ms per 96^3 B2 step since dec0.c1's backward-data runs in three launches) */
     return f && recompute() && (!act_mx8() || f >= 2) && (!grad_mx8() || f >= 2) && (!fu || atoi(fu) >= 2);   /* MX-fp8 gradients: 16-channel chunks merged into the MX gout block (lp_up2_bwd_mx_slice) */
 }
+static int sp_esz(const void *p, int grad) { return nn_storage(p) ? 0 : (grad ? GBF : ABF) ? 2 : 4; }
 static float *dalloc_grad(unet *u, size_t n) { size_t b = GBF ? n * 2 : n * 4; u->act_bytes += b; u->grad_bytes += b; return dalloc_oom(dmalloc(b), b); }  /* activation-gradient storage */
 
 /* buffers may be shared (gradient buffers across levels, gskip == gout, inference scratch): free each pointer once */
@@ -495,6 +521,7 @@ static float *rc_up(unet *u, block *b, int level, int *reg) {
     nn_gn_t g = gn_out(u, xb);
     if (xb->s2) PROF(5, nn_up2_fwd_into(xb->s2, xb->ys, p, b->c_split, 0));
     else PROF(5, nn_up2_fwd_gn_into(xb->a2, xb->ys, &g, p, b->c_split, 0));
+    sp_halo(u, p, us, 0);
     return p;
 }
 /* decoder conv1 forward (y with GN stats when G) or weight gradient (gy != nullptr) in recompute mode. Fused: the
@@ -538,10 +565,12 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
         else if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1));
         else { nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1)); }   /* down_norm: gn + silu of the input in staging */
         FQ(b->a1, b->ys); FQ_AFF(b->a1, b->ys, b->pm1, b->pr1, G);
+        sp_halo(u, b->a1, b->ys, 0);
         nn_set_conv(1);
         PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, b->m2, b->r2));
         nn_set_conv(-1);
         FQ(b->a2, b->ys); FQ_AFF(b->a2, b->ys, b->pm2, b->pr2, G);
+        sp_halo(u, b->a2, b->ys, 0);
         if (b->s2) { PROF(3, nn_gn_silu_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2)); FQ(b->s2, b->ys); FQ_POST(b->s2, b->ys); }
         return;
     }
@@ -557,6 +586,8 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     int div = 1 << (u->cfg.nlev - 1);
     if (xs.d % div || xs.h % div || xs.w % div) { fprintf(stderr, "unet: spatial size %dx%dx%d must be divisible by %d\n", xs.d, xs.h, xs.w, div); abort(); }
     if (!u->built || memcmp(&u->xs, &xs, sizeof xs) || (train && !u->train) || u->mode != UMODE()) build_acts(u, xs, train);
+    if (sp_on(u) && (!nn_get_tf32() || !ABF)) { fprintf(stderr, "unet: the spatial split needs the tensor-core path with 16-bit or MX storage\n"); abort(); }
+    sp_cfg(u);
     unet_apply_sparse24(u);
     int L = u->cfg.nlev;
     const int *w = u->cfg.widths;
@@ -575,6 +606,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
             nn_set_layer(4 + i);
             if (recompute()) { nn_gn_t g = gn_out(u, &u->enc[i]); int r; PROF(0, r = nn_conv3d_fwd_x(u->enc[i].a2, &g, nullptr, nullptr, 0, 0, u->enc[i].ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i], 0, 0.f, nullptr, nullptr)); if (r) rc_fail("down conv"); }
             else PROF(0, nn_conv3d_fwd(cur, u->enc[i].ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i]));
+            { shape5 ds = u->ls[i + 1]; ds.c = w[i]; sp_halo(u, u->downo[i], ds, 0); }
             if (u->cfg.down_norm) {   /* GroupNorm + SiLU after the down conv: stats now, the transform in the next conv1's staging */
                 shape5 ds = u->ls[i + 1]; ds.c = w[i];
                 const int G = G_of(u, w[i]);
@@ -596,6 +628,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
             u->dec[i].x2b = &u->enc[i]; u->dec[i].in2 = nullptr; u->dec[i].c_split = w[i + 1];
         } else if (nn_get_tf32()) {   /* cat holds only the upsampled part; the skip is read in place by the split conv */
             PROF(5, nn_up2_fwd_into(cur, src, u->cat[i], w[i + 1], 0));
+            { shape5 us = li; us.c = w[i + 1]; sp_halo(u, u->cat[i], us, 0); }
             u->dec[i].in2 = u->enc[i].s2; u->dec[i].c_split = w[i + 1];
         } else {
             PROF(5, nn_up2_fwd_into(cur, src, u->cat[i], w[i + 1] + w[i], 0));
@@ -632,16 +665,24 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
         else { nn_gn_t gi = gn_in(u, b); PROF(0, r = nn_conv3d_fwd_x(b->in, gi.G ? &gi : nullptr, nullptr, nullptr, 0, 0, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1, 0, 0.f, nullptr, nullptr)); }
         if (r) rc_fail("conv1 recompute");
         FQ(b->a1, b->ys);
+        sp_halo(u, b->a1, b->ys, 0);
     }
     nn_set_conv(1);   /* precision-policy tag: c2 first, then c1 */
     if (nn_get_tf32()) {   /* fused: no materialised gn / silu activations */
+        sp_zero(u, gy, b->ys, 1);   /* split: only owned voxels enter the reductions below */
         PROF(3, nn_gn_silu_bwd(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* B = d/d a2 */
         FQG(B, b->ys);
+        sp_zero(u, B, b->ys, 1);
+        sp_begin(u, B, b->ys, 1);   /* split: the halo crosses during the weight gradient (which reads it as zero) */
         PROF(2, nn_conv3d_bwd_weight_gn(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, B, b->ys, g + b->c2.w, g + b->c2.b));
+        sp_end(u, B, b->ys, 1);
         PROF(1, nn_conv3d_bwd_data(B, b->ys, P(u, b->c2.w), b->ys, 3, 1, A, u->conv_scratch));                              /* A = d/d s1 */
         FQG(A, b->ys);
+        sp_zero(u, A, b->ys, 1);
         PROF(3, nn_gn_silu_bwd(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, A, A, g + b->n1.gamma, g + b->n1.beta, u->gn_scratch));    /* A = d/d a1 (in place) */
         FQG(A, b->ys);
+        sp_zero(u, A, b->ys, 1);
+        if (b != &u->enc[0]) sp_begin(u, A, b->ys, 1);   /* for conv1's backward-data (enc0 has none) */
     } else {
     PROF(3, nn_gn_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, t1));            /* t1 = g2 */
     PROF(4, nn_silu_bwd(t1, gy, n, A));                                                                        /* A = d/d g2 */
@@ -658,6 +699,7 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
         u->rc_ok = 1;   /* gy / B consumed: the level's gradient buffer is free until the skip gradient below */
         if (dec_conv1(u, b, level, nullptr, 0, nullptr, nullptr, A, g + b->c1.w, g + b->c1.b)) rc_fail("decoder conv1 weight gradient");
         u->rc_ok = 0;
+        sp_end(u, A, b->ys, 1);
         if (chunk_up()) {   /* skip gradient, then the up-part gradient in chunks through B, upsample-backwarded into gout[level + 1] */
             const block *xb = (const block *)b->xb;
             const size_t per_c = shape_numel(b->ys) / b->ys.c * (GBF ? 2 : 4);
@@ -679,6 +721,7 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
                 const int nc = b->c_split - c0 < cs ? b->c_split - c0 : cs;
                 PROF(1, r = nn_conv3d_bwd_data_range(A, b->ys, P(u, b->c1.w), b->xs, c0, nc, B, u->conv_scratch));
                 if (r) rc_fail("up-part backward-data");
+                { shape5 fs = b->xs; fs.c = nc; sp_halo(u, B, fs, 1); }
                 shape5 cs5 = xb->ys; cs5.c = nc;
                 PROF(5, nn_up2_bwd_into(B, cs5, u->gout[level + 1], b->c_split, c0));
             }
@@ -696,6 +739,7 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     }
     if (b->in2 && nn_get_tf32()) {
         PROF(2, nn_conv3d_bwd_weight_split(b->in, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, A, b->ys, g + b->c1.w, g + b->c1.b));
+        sp_end(u, A, b->ys, 1);
         PROF(1, nn_conv3d_bwd_data_split(A, b->ys, P(u, b->c1.w), b->xs, B, gx2, b->c_split, u->conv_scratch));   /* B = d/d up part, gx2 = d/d skip */
         { shape5 s1 = b->xs, s2 = b->xs; s1.c = b->c_split; s2.c = b->xs.c - b->c_split; FQG(B, s1); FQG(gx2, s2); }
         nn_set_conv(-1);
@@ -705,9 +749,11 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     if (gi.G && nn_get_tf32()) PROF(2, nn_conv3d_bwd_weight_gn(b->in, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, A, b->ys, g + b->c1.w, g + b->c1.b));
     else PROF(2, nn_conv3d_bwd_weight(b->in, b->xs, A, b->ys, 3, 1, g + b->c1.w, g + b->c1.b));
     if (b != &u->enc[0] || !nn_get_tf32())   /* the network-input gradient of enc0 is never used */
-    { PROF(1, nn_conv3d_bwd_data(A, b->ys, P(u, b->c1.w), b->xs, 3, 1, B, u->conv_scratch));            /* B = d/d in */
+    { sp_end(u, A, b->ys, 1);
+      PROF(1, nn_conv3d_bwd_data(A, b->ys, P(u, b->c1.w), b->xs, 3, 1, B, u->conv_scratch));            /* B = d/d in */
         FQG(B, b->xs); }
     if (gi.G) {   /* down_norm: back through silu(gn(.)) of the down-conv output -> B = d/d inx */
+        sp_zero(u, B, b->xs, 1);
         if (nn_get_tf32()) PROF(3, nn_gn_silu_bwd(b->inx, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, B, B, g + b->ing->gamma, g + b->ing->beta, u->gn_scratch));
         else {
             const size_t ni = shape_numel(b->xs);
@@ -726,6 +772,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     int L = u->cfg.nlev;
     g_in_bwd = 1;
     const float gscale = GBF ? nn_get_grad_scale() : 1.f;
+    sp_cfg(u);
     if (g_h16 && !GBF) { fprintf(stderr, "unet_backward_x: a 16-bit logit gradient needs the 16-bit gradient storage\n"); abort(); }
     if (GBF && !g_h16) { shape5 os = u->ls[0]; os.c = u->cfg.cout; if (!u->glb) u->glb = dalloc_grad(u, shape_numel(os)); nn_f32_to_h16(glogits, shape_numel(os), u->glb, gscale); glogits = u->glb; }
     const int *w = u->cfg.widths;
@@ -752,6 +799,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         shape5 src = u->ls[i + 1]; src.c = w[i + 1];
         if (nn_get_tf32()) {
             nn_set_layer(9 - i); float *gup = block_bwd(u, &u->dec[i], i, u->gout[i], u->gskip[i]);   /* gB[i]: grad wrt the upsampled part; skip grad written in place */
+            if (gup) { shape5 us = li; us.c = w[i + 1]; sp_halo(u, gup, us, 1); }
             if (gup) PROF(5, nn_up2_bwd(gup, src, u->gout[i + 1]));   /* nullptr: chunk mode wrote gout[i + 1] */
             FQG(u->gout[i + 1], src);
         } else {
@@ -768,8 +816,11 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
             /* enc[i] input = downo[i-1] = down[i-1](enc[i-1].s2): propagate to enc[i-1].s2, accumulate into gskip[i-1] */
             shape5 ds = u->enc[i].xs;                                     /* == down output shape */
             nn_set_layer(4 + i - 1);
+            sp_zero(u, gin, ds, 1);
+            sp_begin(u, gin, ds, 1);
             if (recompute()) { nn_gn_t gg = gn_out(u, &u->enc[i - 1]); int r; PROF(2, r = nn_conv3d_bwd_weight_x(u->enc[i - 1].a2, &gg, nullptr, nullptr, 0, 0, u->enc[i - 1].ys, gin, ds, 3, 2, g + u->down[i - 1].w, g + u->down[i - 1].b)); if (r) rc_fail("down weight gradient"); }
             else PROF(2, nn_conv3d_bwd_weight(u->enc[i - 1].s2, u->enc[i - 1].ys, gin, ds, 3, 2, g + u->down[i - 1].w, g + u->down[i - 1].b));
+            sp_end(u, gin, ds, 1);
             int acc; PROF(1, acc = nn_conv3d_bwd_data_acc(gin, ds, P(u, u->down[i - 1].w), u->enc[i - 1].ys, 3, 2, u->gskip[i - 1], u->conv_scratch));   /* gskip += */
             if (acc == 0) FQG(u->gskip[i - 1], u->enc[i - 1].ys);
             if (acc) {
