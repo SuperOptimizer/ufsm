@@ -360,7 +360,7 @@
     4096
    ],
    "axis": "/vesuvius/usrm/umbilicus/PHerc0139/umbilicus-full-resolution.json",
-   "min_level": 1
+   "min_level": 2
   },
   {
    "name": "kaggle",
