@@ -61,3 +61,8 @@ int unet_load(unet *u, const char *path);
 int unet_peek(const char *path, unet_cfg *cfg, int *step);
 size_t unet_activation_bytes(const unet *u);
 void unet_prof_report(void);   /* with UFSM_PROF=1: print and reset per-op timings */
+/* per-conv kernel timing: slot = 2 * layer + conv (layer ids of nn_set_layer: enc0..3 = 0..3, down0..2 = 4..6, dec2, dec1,
+   dec0 = 7..9, head = 10; conv 0 = c1 or the single conv, 1 = c2) */
+#define UNET_NSLOT 22
+void unet_prof_layers_on(int on);          /* same as env UFSM_PROF=layers */
+void unet_prof_layers(double out[][3]);    /* [UNET_NSLOT][fwd, bwd_data, bwd_w] ms since the last call (resets) */

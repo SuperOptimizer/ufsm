@@ -21,15 +21,16 @@ static double timeit(void (*f)(void *), void *a) { f(a); nn_sync(); int it = 0; 
 typedef struct { float *x, *w, *b, *y, *gy, *gx, *gw, *gb, *scr; shape5 xs, ys; int cout; void *xb, *yb; } L;
 static void f_fwd_b(void *p) { L *l = p; gnp_t none = {0}; split_t ns = {0}; lp_conv_fwd_f8(l->xb, 1, l->xs, l->w, l->b, l->cout, l->yb, 1, none, nullptr, 0, ns); }
 static void f_bwd_w_b(void *p) { L *l = p; gnp_t none = {0}; split_t ns = {0}; lp_bwd_w_f8(l->xb, 1, l->xs, l->gy, 0, l->ys, l->gw, l->gb, none, ns); }
-static void f_fwd(void *p) { L *l = p; nn_conv3d_fwd(l->x, l->xs, l->w, l->b, l->cout, 3, 1, l->y); }
-static void f_bwd_d(void *p) { L *l = p; nn_conv3d_bwd_data(l->gy, l->ys, l->w, l->xs, 3, 1, l->gx, l->scr); }
-static void f_bwd_w(void *p) { L *l = p; nn_conv3d_bwd_weight(l->x, l->xs, l->gy, l->ys, 3, 1, l->gw, l->gb); }
+static int S = 1;   /* stride (env UFSM_STRIDE) */
+static void f_fwd(void *p) { L *l = p; nn_conv3d_fwd(l->x, l->xs, l->w, l->b, l->cout, 3, S, l->y); }
+static void f_bwd_d(void *p) { L *l = p; nn_conv3d_bwd_data(l->gy, l->ys, l->w, l->xs, 3, S, l->gx, l->scr); }
+static void f_bwd_w(void *p) { L *l = p; nn_conv3d_bwd_weight(l->x, l->xs, l->gy, l->ys, 3, S, l->gw, l->gb); }
 static int NB = 2;
 static void run(int P, int cin, int cout, int nprec, const int *precs) {
-    L l; l.xs = (shape5){NB, cin, P, P, P}; l.ys = nn_conv3d_out_shape(l.xs, cout, 3, 1); l.cout = cout;
+    L l; l.xs = (shape5){NB, cin, P, P, P}; l.ys = nn_conv3d_out_shape(l.xs, cout, 3, S); l.cout = cout;
     size_t nx = shape_numel(l.xs), ny = shape_numel(l.ys), nw = (size_t)cout * cin * 27;
     l.x = nn_malloc(nx * 4); l.gx = nn_malloc(nx * 4); l.y = nn_malloc(ny * 4); l.gy = nn_malloc(ny * 4);
-    l.w = nn_malloc(nw * 4); l.gw = nn_malloc(nw * 4); l.b = nn_malloc(cout * 4); l.gb = nn_malloc(cout * 4); l.scr = nn_malloc(nn_conv3d_scratch(l.xs, cout, 3));
+    l.w = nn_malloc(nw * 4); l.gw = nn_malloc(nw * 4); l.b = nn_malloc(cout * 4); l.gb = nn_malloc(cout * 4); { int sp_ = nn_get_prec(); nn_set_prec(0); l.scr = nn_malloc(nn_conv3d_scratch(l.xs, cout, 3)); nn_set_prec(sp_ > 0 ? sp_ : 1); }   /* fp32 mode needs the larger (zero-insertion) scratch */
     float *hx = malloc(nx * 4), *hy = malloc(ny * 4), *hw = malloc(nw * 4), *hb = malloc(cout * 4);
     /* activations ~ silu(N(0,1)) (post GN+SiLU), weights kaiming, gradients tiny (1e-6 scale, as a mean-reduced loss gives) */
     for (size_t i = 0; i < nx; i++) { float v = nrand(); hx[i] = v / (1.f + expf(-v)); }
@@ -56,7 +57,7 @@ static void run(int P, int cin, int cout, int nprec, const int *precs) {
         printf(" p%d fwd %5.1f TF %.1e | bwd_d %5.1f TF %.1e | bwd_w %5.1f TF %.1e gb %.0e |", p, flop / tf / 1e12, e1, flop / td / 1e12, e2, flop / tw / 1e12, e3, e4);
         (void)m1; (void)m2; (void)m3; (void)m4;
     }
-    if (getenv("UFSM_LP_BF16")) {   /* bf16-activation instantiations and accumulate mode of the FP8 kernels */
+    if (getenv("UFSM_LP_BF16") && S == 1) {   /* bf16-activation instantiations and accumulate mode of the FP8 kernels */
         gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0};
         split_t ns = {nullptr, 0, nullptr, 0, 0}, acc1 = {nullptr, 0, nullptr, 0, 1};
         void *xb = nn_malloc(nx * 2), *yb = nn_malloc(ny * 2);
@@ -80,6 +81,7 @@ static void run(int P, int cin, int cout, int nprec, const int *precs) {
 }
 int main(int argc, char **argv) {
     nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0);
+    if (getenv("UFSM_STRIDE")) S = atoi(getenv("UFSM_STRIDE"));
     nn_set_act_bf16(0); nn_set_grad_bf16(0);   /* the harness feeds fp32 tensors through the public wrappers */
     if (getenv("UFSM_B")) NB = atoi(getenv("UFSM_B"));
     int precs[4] = {1, 2, 3}, np = 2;

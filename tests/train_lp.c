@@ -81,8 +81,19 @@ int main(int argc, char **argv) {
     float *hxh[NH]; uint8_t *hth[NH];
     for (int h = 0; h < NH; h++) { hxh[h] = malloc(B * 4 * S * 4); hth[h] = malloc(B * S); for (int b = 0; b < B; b++) make_sample(P, hxh[h] + (size_t)b * 4 * S, hth[h] + (size_t)b * S, 1000000 + h * B + b); }
     printf("synthetic sheet task, P %d, batch %d, %d steps, lr %g\n", P, B, steps, lr);
-    for (const char *pc = precs; *pc; pc++) {
-        int prec = *pc - '0';
+    /* runs: one per digit of UFSM_PRECS, then one per "label=policy" entry of UFSM_TRAIN_POLICIES ('|'-separated; bf16 base) */
+    int nrunv = 0, rprec[32]; const char *rpol[32], *rlab[32];
+    for (const char *pc = precs; *pc && nrunv < 32; pc++) { rprec[nrunv] = *pc - '0'; rpol[nrunv] = ""; rlab[nrunv] = nn_prec_name(rprec[nrunv]); nrunv++; }
+    if (getenv("UFSM_TRAIN_POLICIES")) {
+        char *tp = strdup(getenv("UFSM_TRAIN_POLICIES")), *sv = nullptr;
+        for (char *e = strtok_r(tp, "|", &sv); e && nrunv < 32; e = strtok_r(nullptr, "|", &sv)) {
+            char *eq = strchr(e, '='); if (!eq) continue;
+            *eq = 0; rlab[nrunv] = e; rpol[nrunv] = eq + 1; rprec[nrunv] = 1; nrunv++;
+        }
+    }
+    for (int ri = 0; ri < nrunv; ri++) {
+        int prec = rprec[ri];
+        if (nn_set_prec_policy(rpol[ri])) { printf("bad policy %s\n", rpol[ri]); continue; }
         unet_cfg cfg = {4, {16, 32, 64, 80}, 4, 1, 8};
         unet *u = unet_create(&cfg);
         if (!nseg) build_segs(cfg.widths, cfg.nlev, cfg.cin, cfg.cout);
@@ -91,7 +102,7 @@ int main(int argc, char **argv) {
            (the largest layout) so that switching to fp32 for the held-out evaluation is safe */
         nn_set_prec(0); unet_forward(u, dx, xs, 1);
         double t0 = now(), run = 0; int nrun = 0;
-        printf("prec %d:", prec); fflush(stdout);
+        printf("%s:", rlab[ri]); fflush(stdout);
         for (int it = 1; it <= steps; it++) {
             for (int b = 0; b < B; b++) make_sample(P, hx + (size_t)b * 4 * S, ht + (size_t)b * S, (uint64_t)it * B + b);
             nn_h2d(dx, hx, B * 4 * S * 4); nn_h2d(dt, ht, B * S);
@@ -141,7 +152,7 @@ int main(int argc, char **argv) {
             hb += out[0] / NH; hd += out[1] / NH; hl += (out[0] + out[1]) / NH;
         }
         const char *e = nn_check();
-        printf("\n  prec %d: held-out loss %.4f (bce %.4f, dice %.4f), %.1f s%s%s\n", prec, hl, hb, hd, dt_s, e ? " cuda: " : "", e ? e : "");
+        printf("\n  %s: held-out loss %.4f (bce %.4f, dice %.4f), %.1f s%s%s\n", rlab[ri], hl, hb, hd, dt_s, e ? " cuda: " : "", e ? e : "");
         unet_free(u);
     }
     return 0;

@@ -7,8 +7,27 @@
 
 static int g_prof = -1;
 static const char *g_names[8] = {"conv_fwd", "conv_bwd_data", "conv_bwd_w", "gn", "elementwise", "up/concat", "upload+loss+opt", ""};
-#define PROF(k, call) do { if (g_prof < 0) g_prof = getenv("UFSM_PROF") != nullptr; if (g_prof) { nn_prof_begin(k); call; nn_prof_end(); } else { call; } } while (0)
-void unet_prof_report(void) { if (g_prof > 0) { double ms[8]; nn_prof_collect(ms, 8); double tot = 0; for (int i = 0; i < 7; i++) tot += ms[i]; for (int i = 0; i < 7; i++) if (ms[i] > 0) fprintf(stderr, "  %-14s %8.1f ms  %4.1f%%\n", g_names[i], ms[i], 100 * ms[i] / tot); } }
+/* UFSM_PROF=1: per-category event timing; UFSM_PROF=layers (or unet_prof_layers_on): also per conv, event category
+   k + 8 * (slot + 1) with slot = 2 * layer + conv (layer ids as in nn_set_layer, conv 0 = c1 / single, 1 = c2) */
+#define PROF_INIT() do { if (g_prof < 0) { const char *e_ = getenv("UFSM_PROF"); g_prof = !e_ ? 0 : !strcmp(e_, "layers") ? 2 : 1; } } while (0)
+#define PROF_SLOT() (nn_get_layer() < 0 ? -1 : 2 * nn_get_layer() + (nn_get_conv() > 0 ? 1 : 0))
+#define PROF(k, call) do { PROF_INIT(); if (g_prof) { nn_prof_begin((k) + (g_prof == 2 ? 8 * (PROF_SLOT() + 1) : 0)); call; nn_prof_end(); } else { call; } } while (0)
+#define PROF_NK (8 * (UNET_NSLOT + 1))
+static double g_prof_slot[UNET_NSLOT][3];
+static void prof_collect(double *cat) {
+    double ms[PROF_NK];
+    nn_prof_collect(ms, PROF_NK);
+    for (int i = 0; i < 8; i++) cat[i] = 0;
+    for (int k = 0; k < PROF_NK; k++) { cat[k % 8] += ms[k]; if (k >= 8 && k % 8 < 3) g_prof_slot[k / 8 - 1][k % 8] += ms[k]; }
+}
+void unet_prof_report(void) { if (g_prof > 0) { double ms[8]; prof_collect(ms); double tot = 0; for (int i = 0; i < 7; i++) tot += ms[i]; for (int i = 0; i < 7; i++) if (ms[i] > 0) fprintf(stderr, "  %-14s %8.1f ms  %4.1f%%\n", g_names[i], ms[i], 100 * ms[i] / tot); } }
+void unet_prof_layers_on(int on) { PROF_INIT(); g_prof = on ? 2 : 0; }
+void unet_prof_layers(double out[][3]) {
+    double cat[8];
+    for (int i = 0; i < UNET_NSLOT; i++) for (int j = 0; j < 3; j++) g_prof_slot[i][j] = 0;
+    prof_collect(cat);
+    for (int i = 0; i < UNET_NSLOT; i++) for (int j = 0; j < 3; j++) out[i][j] = g_prof_slot[i][j];
+}
 
 typedef struct { int cin, cout, k, stride; size_t w, b; } convp;      /* offsets into the flat param array */
 typedef struct { int c; size_t gamma, beta; } gnp;
@@ -230,9 +249,12 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
     int G = G_of(u, b->c1.cout);
     float *t1 = u->t1[level] ? u->t1[level] : b->s2;    /* inference: no scratch, s2 doubles as temp */
     if (nn_get_tf32()) {   /* conv1 yields the stats of a1; conv2 applies gn + silu to a1 while staging and yields the stats of a2 */
+        nn_set_conv(0);
         if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1));
         else PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1));
+        nn_set_conv(1);
         PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, b->m2, b->r2));
+        nn_set_conv(-1);
         PROF(3, nn_gn_silu_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2));
         return;
     }
@@ -291,6 +313,7 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     size_t n = shape_numel(b->ys);
     float *A = u->gA[level], *B = u->gB[level], *t1 = u->t1[level], *t2 = u->t2[level];
     float *g = u->g;
+    nn_set_conv(1);   /* precision-policy tag: c2 first, then c1 */
     if (nn_get_tf32()) {   /* fused: no materialised gn / silu activations */
         PROF(3, nn_gn_silu_bwd(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* B = d/d a2 */
         PROF(2, nn_conv3d_bwd_weight_gn(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, B, b->ys, g + b->c2.w, g + b->c2.b));
@@ -307,13 +330,16 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     PROF(4, nn_silu_bwd(t1, A, n, B));                                                                         /* B = d/d g1 */
     PROF(3, nn_gn_bwd(b->a1, b->ys, G, P(u, b->n1.gamma), b->m1, b->r1, B, A, g + b->n1.gamma, g + b->n1.beta, u->gn_scratch));   /* A = d/d a1 */
     }
+    nn_set_conv(0);
     if (b->in2 && nn_get_tf32()) {
         PROF(2, nn_conv3d_bwd_weight_split(b->in, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, A, b->ys, g + b->c1.w, g + b->c1.b));
         PROF(1, nn_conv3d_bwd_data_split(A, b->ys, P(u, b->c1.w), b->xs, B, gx2, b->c_split, u->conv_scratch));   /* B = d/d up part, gx2 = d/d skip */
+        nn_set_conv(-1);
         return B;
     }
     PROF(2, nn_conv3d_bwd_weight(b->in, b->xs, A, b->ys, 3, 1, g + b->c1.w, g + b->c1.b));
     PROF(1, nn_conv3d_bwd_data(A, b->ys, P(u, b->c1.w), b->xs, 3, 1, B, u->conv_scratch));            /* B = d/d in */
+    nn_set_conv(-1);
     return B;
 }
 

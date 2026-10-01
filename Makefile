@@ -37,6 +37,9 @@ build/test_nn: tests/test_nn.c build/nn.o build/nn_fp8.o
 build/bench_conv: tests/bench_conv.c build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
+build/prec_sweep: tests/prec_sweep.c build/unet.o build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+
 build/test_unet: tests/test_unet.c build/unet.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 build/test_fused: tests/test_fused.c build/nn.o build/nn_fp8.o

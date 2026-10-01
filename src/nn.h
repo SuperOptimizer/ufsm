@@ -64,7 +64,18 @@ void nn_wq_ema(void *qe, void *sce, void *re, void *rsce, const void *qp, const 
 void nn_wq_residual(const float *w, const void *q, const void *sc, void *r, void *rsc, int co, int ci, int taps, int bits);
 void nn_srste24(float *g, const float *w, int co, int ci, int taps, float lambda);
 void nn_set_layer_prec(int id, int p);
-int nn_set_prec_policy(const char *policy);
+int nn_set_prec_policy(const char *policy);   /* see nn.cu: block names, enc1.c2-style single convs, "all", fwd:bwd_data:wgrad values */
+/* finer precision control (prec 4 = fp16 operands with fp16 group accumulation folded into fp32, needs bf16 storage):
+   nn_set_conv tags the conv within the current layer (0 = c1, 1 = c2, -1 = untagged); nn_set_conv_prec sets the
+   (forward, backward-data, weight-gradient) precisions of conv sub (-1 = both) of layer id (0 = follow the layer). */
+void nn_set_conv(int sub);
+int nn_get_layer(void);
+int nn_get_conv(void);
+void nn_set_conv_prec(int id, int sub, int p_fwd, int p_bwd_data, int p_wgrad);
+int nn_get_conv_prec(int id, int sub, int pass);
+int nn_cur_prec(void);
+int nn_prec_parse(const char *name);     /* "bf16" 1, "fp8" 2, "fp4" 3, "fp16" 4, or a digit; -1 if unknown */
+const char *nn_prec_name(int p);
 void nn_conv3d_fwd_fp8(const float *x, shape5 xs, const float *w, const float *b, int cout, float *y);        /* k=3 stride 1, fp32 tensors */
 void nn_conv3d_fwd_fp4(const float *x, shape5 xs, const float *w, const float *b, int cout, float *y);
 void nn_conv3d_bwd_weight_fp8(const float *x, shape5 xs, const float *gy, shape5 ys, float *gw, float *gb);
