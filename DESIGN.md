@@ -329,6 +329,12 @@ each sit near their own limit and barely overlap (block stages the whole tile, s
 kernel is a persistent double-buffered producer / consumer (producer warps stage + GN + SiLU + convert tile i+1
 while consumer warps run the 27-tap MMAs on tile i, fp16 accumulation, weights resident per block); target
 ~0.45-0.5 ms per 16-channel conv, the fused block kernel reuses the structure.
+Pipelined producer/consumer kernel tried and dropped (0.83 vs 0.75 ms: producer- and bandwidth-bound; a plain copy of
+the conv's I/O takes 0.32 ms, the conv 0.75, i.e. 2.4x from the 2.1x halo re-read at the largest tiles that fit
+smem). x-shift packing for enc0.c1 (K = 16 = 4 kx shifts x 4 channels, 9 tap rows instead of 27 padded): 0.62 ->
+0.46 ms (19f3eab). 16-bit conv time 9.65-10.2 -> 8.84-9.04 ms contended at 96^3 B2; the rest of the 16-bit items are
+3-6% each, so the effort moves to the MX/fp8 path (dec0.c1 fused upsample in MX staging, 16-channel MX convs with
+two taps per k) where 1.5-3x remains.
 Plan: (1) per-op profile (agent, done: fp8 on 16-channel convs is padding/staging-bound, Ci = 16 pads to the fp8
 K = 32; enc0.c1 pads Ci = 4 to 16; stride-2 convs latency-bound at 4-10 TFLOP/s; head and GN small); (2) agent's
 kernel changes in payoff order: dec0.c1 on the MX path without the transient (-14% at 96^3), K-packing of two taps
