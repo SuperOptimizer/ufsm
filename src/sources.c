@@ -92,6 +92,7 @@ sources *sources_load(const char *path) {
         s->ct_key = sdup(json_str(json_get(e, "ct"), ""));
         s->um = json_num(json_get(e, "um"), 0);
         s->weight = json_num(json_get(e, "weight"), 1.0);
+        s->trust_band = (int)json_num(json_get(e, "trust_band"), 0);
         for (int l = 0; l < MAXLEV; l++) s->ct_present[l] = -1; /* unknown until probed */
         const json *tg = json_get(e, "targets");
         for (int c = 0; c < NCH; c++) {

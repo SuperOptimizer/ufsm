@@ -20,6 +20,49 @@
     1024,
     1024,
     1024
+   ],
+   "axis": "/vesuvius/ufsm/gt/axis/PHercMANBp.json"
+  },
+  {
+   "name": "PHerc0500P2-hf",
+   "root": "https://dl.ash2txt.org/community-uploads/forrest/volcomp",
+   "ct": "PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr",
+   "um": 2.215,
+   "targets": {
+    "recto": {
+     "root": "/vesuvius/ufsm/gt/labels/0500p2_5217.zarr",
+     "group": "."
+    }
+   },
+   "weight": 1.0,
+   "holdout": [
+    20480,
+    8192,
+    13312,
+    1024,
+    1024,
+    1024
+   ]
+  },
+  {
+   "name": "PHerc0009B-seg",
+   "root": "https://dl.ash2txt.org/community-uploads/forrest/volcomp",
+   "ct": "PHerc0009B/volumes/20250521125136-8.640um-1.2m-116keV-masked.zarr",
+   "um": 8.64,
+   "targets": {
+    "recto": {
+     "root": "/vesuvius/ufsm/gt/raster/PHerc0009B/20250521125136",
+     "group": "."
+    }
+   },
+   "weight": 0.5,
+   "holdout": [
+    3072,
+    4096,
+    3072,
+    1024,
+    1024,
+    1024
    ]
   },
   {

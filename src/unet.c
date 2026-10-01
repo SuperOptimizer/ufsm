@@ -33,6 +33,7 @@ struct unet {
     float *fw, *wm;               /* weights the forward/backward read: live, or wm = 2:4-masked copy of live when sparse24 */
     int sparse24, wq;             /* wq: 0, 8 or 4 = the 3^3 conv weights live in packed fp8 / fp4 storage; p/ema hold dequantized shadows */
     unsigned char *wq_q, *wq_sc, *wq_qe, *wq_sce;   /* packed weights + block scales for live params and for the EMA (byte offsets below) */
+    unsigned char *wq_r, *wq_rsc, *wq_re, *wq_rsce;  /* fp4: fp8 error-feedback residuals (live, EMA) */
     size_t wq_qoff[64], wq_soff[64]; int wq_n; unsigned ema_step;   /* per 3^3 conv (for_each_conv3 order): offsets into the packed arrays */
     int using_ema;
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
@@ -91,7 +92,7 @@ unet *unet_create(const unet_cfg *cfg) {
     }
     u->p = nn_malloc(off * 4); u->g = nn_malloc(off * 4); u->m = nn_malloc(off * 4); u->v = nn_malloc(off * 4); u->ema = nn_malloc(off * 4);
     nn_zero(u->g, off * 4); nn_zero(u->m, off * 4); nn_zero(u->v, off * 4);
-    u->live = u->p; u->fw = u->p; u->wm = nullptr; u->sparse24 = 0; u->wq = 0; u->wq_q = u->wq_sc = u->wq_qe = u->wq_sce = nullptr; u->wq_n = 0;
+    u->live = u->p; u->fw = u->p; u->wm = nullptr; u->sparse24 = 0; u->wq = 0; u->wq_q = u->wq_sc = u->wq_qe = u->wq_sce = nullptr; u->wq_r = u->wq_rsc = u->wq_re = u->wq_rsce = nullptr; u->wq_n = 0;
     u->gn_scratch = nn_malloc(1 << 20);
     u->red_scratch = nn_malloc(4096 * 4);
     return u;
@@ -402,15 +403,20 @@ void unet_set_wq(unet *u, int bits) {
         int L = u->cfg.nlev; const convp *cs[64]; int n = 0;
         for (int i = 0; i < L; i++) { cs[n++] = &u->enc[i].c1; cs[n++] = &u->enc[i].c2; }
         for (int i = 0; i < L - 1; i++) { cs[n++] = &u->down[i]; cs[n++] = &u->dec[i].c1; cs[n++] = &u->dec[i].c2; }
-        size_t so = 0;
-        for (int i = 0; i < n; i++) { u->wq_qoff[i] = cs[i]->w; u->wq_soff[i] = so; so += nn_wq_nblocks(cs[i]->cout, cs[i]->cin, cs[i]->k * cs[i]->k * cs[i]->k); }
+        size_t so = 0, qo = 0;
+        for (int i = 0; i < n; i++) { int T = cs[i]->k * cs[i]->k * cs[i]->k; u->wq_qoff[i] = qo; qo += nn_wq_bytes(cs[i]->cout, cs[i]->cin, T, bits); u->wq_soff[i] = so; so += nn_wq_nblocks(cs[i]->cout, cs[i]->cin, T); }
         u->wq_n = n;
-        u->wq_q = nn_malloc(u->np); u->wq_sc = nn_malloc(so + 64); u->wq_qe = nn_malloc(u->np); u->wq_sce = nn_malloc(so + 64);
+        u->wq_q = nn_malloc(qo + 64); u->wq_sc = nn_malloc(so + 64); u->wq_qe = nn_malloc(qo + 64); u->wq_sce = nn_malloc(so + 64);
+        if (bits == 4) { u->wq_r = nn_malloc(u->np); u->wq_rsc = nn_malloc(so + 64); u->wq_re = nn_malloc(u->np); u->wq_rsce = nn_malloc(so + 64); }
         /* initial packing of the fp32 values (round to nearest), then the shadows take the grid values */
         for (int i = 0; i < n; i++) {
-            const convp *c = cs[i]; int T = c->k * c->k * c->k; size_t qo = bits == 8 ? c->w : c->w / 2;
+            const convp *c = cs[i]; int T = c->k * c->k * c->k; size_t qo = u->wq_qoff[i];
             nn_wq_pack(u->p + c->w, u->wq_q + qo, u->wq_sc + u->wq_soff[i], c->cout, c->cin, T, bits, 0);
             nn_wq_pack(u->ema + c->w, u->wq_qe + qo, u->wq_sce + u->wq_soff[i], c->cout, c->cin, T, bits, 0);
+            if (bits == 4) {   /* residual = what the fp4 grid dropped at initial packing */
+                nn_wq_residual(u->p + c->w, u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->wq_r + c->w, u->wq_rsc + u->wq_soff[i], c->cout, c->cin, T, bits);
+                nn_wq_residual(u->ema + c->w, u->wq_qe + qo, u->wq_sce + u->wq_soff[i], u->wq_re + c->w, u->wq_rsce + u->wq_soff[i], c->cout, c->cin, T, bits);
+            }
             nn_wq_unpack(u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->p + c->w, c->cout, c->cin, T, bits);
             nn_wq_unpack(u->wq_qe + qo, u->wq_sce + u->wq_soff[i], u->ema + c->w, c->cout, c->cin, T, bits);
         }
@@ -427,9 +433,9 @@ static const convp *wq_conv(unet *u, int i) {   /* i-th 3^3 conv in for_each_con
 static void wq_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step) {
     size_t pos = 0;
     for (int i = 0; i < u->wq_n; i++) {
-        const convp *c = wq_conv(u, i); int T = c->k * c->k * c->k; size_t n = (size_t)c->cout * c->cin * T, qo = u->wq == 8 ? c->w : c->w / 2;
+        const convp *c = wq_conv(u, i); int T = c->k * c->k * c->k; size_t n = (size_t)c->cout * c->cin * T, qo = u->wq_qoff[i];
         if (c->w > pos) nn_adamw(u->p + pos, u->g + pos, u->m + pos, u->v + pos, c->w - pos, lr, b1, b2, eps, wd, step);
-        nn_wq_adamw(u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->g + c->w, u->m + c->w, u->v + c->w, c->cout, c->cin, T, u->wq, lr, b1, b2, eps, wd, step, (unsigned)step * 7919u + (unsigned)i);
+        nn_wq_adamw(u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->wq_r ? u->wq_r + c->w : nullptr, u->wq_r ? u->wq_rsc + u->wq_soff[i] : nullptr, u->g + c->w, u->m + c->w, u->v + c->w, c->cout, c->cin, T, u->wq, lr, b1, b2, eps, wd, step, (unsigned)step * 7919u + (unsigned)i);
         nn_wq_unpack(u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->p + c->w, c->cout, c->cin, T, u->wq);
         pos = c->w + n;
     }
@@ -438,9 +444,9 @@ static void wq_adamw(unet *u, float lr, float b1, float b2, float eps, float wd,
 static void wq_ema(unet *u, float decay) {
     size_t pos = 0;
     for (int i = 0; i < u->wq_n; i++) {
-        const convp *c = wq_conv(u, i); int T = c->k * c->k * c->k; size_t n = (size_t)c->cout * c->cin * T, qo = u->wq == 8 ? c->w : c->w / 2;
+        const convp *c = wq_conv(u, i); int T = c->k * c->k * c->k; size_t n = (size_t)c->cout * c->cin * T, qo = u->wq_qoff[i];
         if (c->w > pos) nn_ema(u->ema + pos, u->p + pos, c->w - pos, decay);
-        nn_wq_ema(u->wq_qe + qo, u->wq_sce + u->wq_soff[i], u->wq_q + qo, u->wq_sc + u->wq_soff[i], c->cout, c->cin, T, u->wq, decay, (unsigned)(u->ema_step++) * 104729u + (unsigned)i);
+        nn_wq_ema(u->wq_qe + qo, u->wq_sce + u->wq_soff[i], u->wq_re ? u->wq_re + c->w : nullptr, u->wq_re ? u->wq_rsce + u->wq_soff[i] : nullptr, u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->wq_r ? u->wq_r + c->w : nullptr, u->wq_r ? u->wq_rsc + u->wq_soff[i] : nullptr, c->cout, c->cin, T, u->wq, decay, (unsigned)(u->ema_step++) * 104729u + (unsigned)i);
         nn_wq_unpack(u->wq_qe + qo, u->wq_sce + u->wq_soff[i], u->ema + c->w, c->cout, c->cin, T, u->wq);
         pos = c->w + n;
     }

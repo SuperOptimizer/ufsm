@@ -1,6 +1,7 @@
 #include "sample.h"
 #include "nn.h"
 #include <math.h>
+#include <stddef.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -233,6 +234,29 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         if (w[ch]) for (size_t k = 0; k < p3; k++) if (dst[k] != 255 && dst[k] > tmax) tmax = dst[k];
     }
     if (tmax == 0 && runif(r) > c->empty_keep) { atomic_fetch_add(&sp->rejected, 1); return 1; }
+    /* partial annotations: trust background only within R voxels of an annotated surface, ignore the rest */
+    if (s->trust_band > 0) {
+        int R = s->trust_band >> l; if (R < 1) R = 1;
+        uint8_t *near = big + p3, *tmp2 = big + 2 * p3;   /* scratch cubes (big holds room for 10 P^3) */
+        for (int ch = 0; ch < NCH; ch++) {
+            if (!w[ch]) continue;
+            uint8_t *dst = ttmp + (size_t)ch * p3;
+            for (size_t k = 0; k < p3; k++) near[k] = dst[k] != 255 && dst[k] > 0;
+            /* separable max filter of radius R along x, y, z */
+            for (int pass = 0; pass < 3; pass++) {
+                size_t str = pass == 0 ? 1 : pass == 1 ? (size_t)P : (size_t)P * P;
+                for (size_t k = 0; k < p3; k++) {
+                    int idx = pass == 0 ? (int)(k % P) : pass == 1 ? (int)((k / P) % P) : (int)(k / ((size_t)P * P));
+                    uint8_t v = 0;
+                    int a = idx - R < 0 ? -idx : -R, bnd = idx + R >= P ? P - 1 - idx : R;
+                    for (int d = a; d <= bnd && !v; d++) v = near[k + (ptrdiff_t)d * (ptrdiff_t)str];
+                    tmp2[k] = v;
+                }
+                memcpy(near, tmp2, p3);
+            }
+            for (size_t k = 0; k < p3; k++) if (dst[k] == 0 && !near[k]) dst[k] = 255;
+        }
+    }
     /* label encoding -> target probability * 255 and the ignore mask (255 = ignore) */
     uint8_t *ign = big + 9 * p3;
     memset(ign, 0, p3);

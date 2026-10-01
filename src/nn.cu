@@ -1673,15 +1673,27 @@ __device__ __forceinline__ unsigned char enc_e2m1(float q) {   /* q in {0, .5, 1
     return best;
 }
 __device__ __forceinline__ float dec_e2m1(unsigned char n) { static const float g[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f}; return (n & 8) ? -g[n & 7] : g[n & 7]; }
-__device__ __forceinline__ float wq_get(const unsigned char *q, size_t k, int bits) {
-    if (bits == 8) return dec_e4m3(q[k]);
-    unsigned char b = q[k >> 1]; return dec_e2m1((k & 1) ? (b >> 4) : (b & 15));
+/* storage index: fp8 = the element index k; fp4 = block-contiguous nibbles, (block index) * 32 + (ci - c0), so the 16 bytes
+   of a block are written by the one thread that owns the block (no read-modify-write races between threads) */
+__device__ __forceinline__ size_t wq_sidx(int bits, size_t k, size_t blk, int cc) { return bits == 8 ? k : blk * 32 + (size_t)cc; }
+__device__ __forceinline__ float wq_get(const unsigned char *q, size_t si, int bits) {
+    if (bits == 8) return dec_e4m3(q[si]);
+    unsigned char b = q[si >> 1]; return dec_e2m1((si & 1) ? (b >> 4) : (b & 15));
 }
-__device__ __forceinline__ void wq_put(unsigned char *q, size_t k, int bits, float v) {   /* v already on the grid */
-    if (bits == 8) { q[k] = enc_e4m3(v); return; }
+__device__ __forceinline__ void wq_put(unsigned char *q, size_t si, int bits, float v) {   /* v already on the grid */
+    if (bits == 8) { q[si] = enc_e4m3(v); return; }
     unsigned char n = enc_e2m1(fabsf(v)) | (v < 0 ? 8 : 0);
-    unsigned char b = q[k >> 1];
-    q[k >> 1] = (k & 1) ? (unsigned char)((b & 0x0f) | (n << 4)) : (unsigned char)((b & 0xf0) | n);
+    unsigned char b = q[si >> 1];
+    q[si >> 1] = (si & 1) ? (unsigned char)((b & 0x0f) | (n << 4)) : (unsigned char)((b & 0xf0) | n);
+}
+/* fp4 with error feedback: w = q4 * s + r8 * sr, r8 = e4m3 residual of the fp32 update that the fp4 grid cannot hold.
+   The kernels read only q4 (true fp4 weights); the residual lives on the optimizer side. */
+__device__ __forceinline__ void res_write(unsigned char *r, unsigned char *rsc, size_t blk, const float *res, int cn, const size_t *ks) {
+    float amax = 0.f; for (int j = 0; j < cn; j++) amax = fmaxf(amax, fabsf(res[j]));
+    int e = amax > 0.f ? (int)ceilf(log2f(amax / 448.f)) : -40; if (e < -40) e = -40; if (e > 60) e = 60;
+    rsc[blk] = (unsigned char)(e + 127);
+    float inv = ldexpf(1.f, -e);
+    for (int j = 0; j < cn; j++) r[ks[j]] = enc_e4m3(res[j] * inv);
 }
 /* block-wise kernels: one thread per (co, block of 32 ci, tap) */
 __global__ void wq_pack_k(const float *w, unsigned char *q, unsigned char *sc, int Co, int Ci, int T, int bits, unsigned seed) {
@@ -1691,14 +1703,14 @@ __global__ void wq_pack_k(const float *w, unsigned char *q, unsigned char *sc, i
     const float qmax = bits == 8 ? 448.f : 6.f;
     float amax = 0.f;
     for (int c = c0; c < c1; c++) amax = fmaxf(amax, fabsf(w[((size_t)co * Ci + c) * T + t]));
-    int e = amax > 0.f ? (int)ceilf(log2f(amax / qmax)) : -127; if (e < -127) e = -127; if (e > 127) e = 127;
+    int e = amax > 0.f ? (int)ceilf(log2f(amax / qmax)) : -40; if (e < -40) e = -40; if (e > 60) e = 60;   /* clamp: keeps 1/scale finite; values below 2^-40 flush to 0 */
     sc[i] = (unsigned char)(e + 127);
     float inv = ldexpf(1.f, -e);
     for (int c = c0; c < c1; c++) {
         size_t k = ((size_t)co * Ci + c) * T + t; float x = w[k];
         float qv = seed ? sr_quant(fabsf(x) * inv, bits, qmax, hash32((unsigned)k * 2654435761u ^ seed)) : fminf(fabsf(x) * inv, qmax);
         if (!seed) { float sp = grid_spacing(qv, bits); qv = rintf(qv / sp) * sp; }
-        wq_put(q, k, bits, copysignf(qv, x));
+        wq_put(q, wq_sidx(bits, k, i, c - c0), bits, copysignf(qv, x));
     }
 }
 __global__ void wq_unpack_k(const unsigned char *q, const unsigned char *sc, float *w, int Co, int Ci, int T, int bits) {
@@ -1706,56 +1718,82 @@ __global__ void wq_unpack_k(const unsigned char *q, const unsigned char *sc, flo
     if (k >= n) return;
     int t = (int)(k % T), ci = (int)((k / T) % Ci), co = (int)(k / ((size_t)T * Ci));
     size_t b = ((size_t)co * nblk + ci / 32) * T + t;
-    w[k] = wq_get(q, k, bits) * ldexpf(1.f, (int)sc[b] - 127);
+    w[k] = wq_get(q, wq_sidx(bits, k, b, ci % 32), bits) * ldexpf(1.f, (int)sc[b] - 127);
 }
 /* AdamW directly on the packed weights: dequantize the block, update in fp32 (m, v stay fp32), rescale, requantize stochastically */
-__global__ void wq_adamw_k(unsigned char *q, unsigned char *sc, const float *g, float *m, float *v, int Co, int Ci, int T, int bits,
+__global__ void wq_adamw_k(unsigned char *q, unsigned char *sc, unsigned char *r, unsigned char *rsc, const float *g, float *m, float *v, int Co, int Ci, int T, int bits,
                            float lr, float b1, float b2, float eps, float wd, float c1, float c2, unsigned seed) {
     int nblk = (Ci + 31) / 32; size_t nb = (size_t)Co * nblk * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= nb) return;
     int t = (int)(i % T), blk = (int)((i / T) % nblk), co = (int)(i / ((size_t)T * nblk)), c0 = blk * 32, cn = c0 + 32 < Ci ? c0 + 32 : Ci;
     const float qmax = bits == 8 ? 448.f : 6.f;
-    float scale = ldexpf(1.f, (int)sc[i] - 127), nw[32], amax = 0.f;
+    float scale = ldexpf(1.f, (int)sc[i] - 127), nw[32], amax = 0.f, rs = r ? ldexpf(1.f, (int)rsc[i] - 127) : 0.f;
     for (int c = c0; c < cn; c++) {
         size_t k = ((size_t)co * Ci + c) * T + t;
-        float x = wq_get(q, k, bits) * scale, gi = g[k];
+        float x = wq_get(q, wq_sidx(bits, k, i, c - c0), bits) * scale + (r ? dec_e4m3(r[k]) * rs : 0.f), gi = g[k];
         float mi = m[k] = b1 * m[k] + (1.f - b1) * gi, vi = v[k] = b2 * v[k] + (1.f - b2) * gi * gi;
         x -= lr * ((mi / c1) / (sqrtf(vi / c2) + eps) + wd * x);
         nw[c - c0] = x; amax = fmaxf(amax, fabsf(x));
     }
-    int e = amax > 0.f ? (int)ceilf(log2f(amax / qmax)) : -127; if (e < -127) e = -127; if (e > 127) e = 127;
+    int e = amax > 0.f ? (int)ceilf(log2f(amax / qmax)) : -40; if (e < -40) e = -40; if (e > 60) e = 60;   /* clamp: keeps 1/scale finite; values below 2^-40 flush to 0 */
     sc[i] = (unsigned char)(e + 127);
     float inv = ldexpf(1.f, -e);
-    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = nw[c - c0]; wq_put(q, k, bits, copysignf(sr_quant(fabsf(x) * inv, bits, qmax, hash32((unsigned)k * 2654435761u ^ seed)), x)); }
+    if (r) {   /* round to nearest on the fp4 grid, residual carries the rest */
+        float res[32]; size_t ks[32];
+        for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = nw[c - c0], a = fminf(fabsf(x) * inv, qmax), sp = grid_spacing(a, bits), qv = rintf(a / sp) * sp; if (qv > qmax) qv = qmax; wq_put(q, wq_sidx(bits, k, i, c - c0), bits, copysignf(qv, x)); res[c - c0] = x - copysignf(qv, x) * ldexpf(1.f, e); ks[c - c0] = k; }
+        res_write(r, rsc, i, res, cn - c0, ks);
+        return;
+    }
+    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = nw[c - c0]; wq_put(q, wq_sidx(bits, k, i, c - c0), bits, copysignf(sr_quant(fabsf(x) * inv, bits, qmax, hash32((unsigned)k * 2654435761u ^ seed)), x)); }
 }
 /* EMA directly on packed weights: e = d e + (1 - d) p, both packed; result requantized stochastically */
-__global__ void wq_ema_k(unsigned char *qe, unsigned char *sce, const unsigned char *qp, const unsigned char *scp, int Co, int Ci, int T, int bits, float d, unsigned seed) {
+__global__ void wq_ema_k(unsigned char *qe, unsigned char *sce, unsigned char *re, unsigned char *rsce, const unsigned char *qp, const unsigned char *scp, const unsigned char *rp, const unsigned char *rscp, int Co, int Ci, int T, int bits, float d, unsigned seed) {
     int nblk = (Ci + 31) / 32; size_t nb = (size_t)Co * nblk * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= nb) return;
     int t = (int)(i % T), blk = (int)((i / T) % nblk), co = (int)(i / ((size_t)T * nblk)), c0 = blk * 32, cn = c0 + 32 < Ci ? c0 + 32 : Ci;
     const float qmax = bits == 8 ? 448.f : 6.f;
     float se = ldexpf(1.f, (int)sce[i] - 127), sp = ldexpf(1.f, (int)scp[i] - 127), nw[32], amax = 0.f;
-    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = d * wq_get(qe, k, bits) * se + (1.f - d) * wq_get(qp, k, bits) * sp; nw[c - c0] = x; amax = fmaxf(amax, fabsf(x)); }
-    int e = amax > 0.f ? (int)ceilf(log2f(amax / qmax)) : -127; if (e < -127) e = -127; if (e > 127) e = 127;
+    float rse = re ? ldexpf(1.f, (int)rsce[i] - 127) : 0.f, rsp = rp ? ldexpf(1.f, (int)rscp[i] - 127) : 0.f;
+    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t, si = wq_sidx(bits, k, i, c - c0); float x = d * (wq_get(qe, si, bits) * se + (re ? dec_e4m3(re[k]) * rse : 0.f)) + (1.f - d) * (wq_get(qp, si, bits) * sp + (rp ? dec_e4m3(rp[k]) * rsp : 0.f)); nw[c - c0] = x; amax = fmaxf(amax, fabsf(x)); }
+    int e = amax > 0.f ? (int)ceilf(log2f(amax / qmax)) : -40; if (e < -40) e = -40; if (e > 60) e = 60;   /* clamp: keeps 1/scale finite; values below 2^-40 flush to 0 */
     sce[i] = (unsigned char)(e + 127);
     float inv = ldexpf(1.f, -e);
-    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = nw[c - c0]; wq_put(qe, k, bits, copysignf(sr_quant(fabsf(x) * inv, bits, qmax, hash32((unsigned)k * 2654435761u ^ seed)), x)); }
+    if (re) {
+        float res[32]; size_t ks[32];
+        for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = nw[c - c0], a = fminf(fabsf(x) * inv, qmax), spc = grid_spacing(a, bits), qv = rintf(a / spc) * spc; if (qv > qmax) qv = qmax; wq_put(qe, wq_sidx(bits, k, i, c - c0), bits, copysignf(qv, x)); res[c - c0] = x - copysignf(qv, x) * ldexpf(1.f, e); ks[c - c0] = k; }
+        res_write(re, rsce, i, res, cn - c0, ks);
+        return;
+    }
+    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = nw[c - c0]; wq_put(qe, wq_sidx(bits, k, i, c - c0), bits, copysignf(sr_quant(fabsf(x) * inv, bits, qmax, hash32((unsigned)k * 2654435761u ^ seed)), x)); }
 }
 extern "C" size_t nn_wq_nblocks(int co, int ci, int taps) { return (size_t)co * ((ci + 31) / 32) * taps; }
+extern "C" size_t nn_wq_bytes(int co, int ci, int taps, int bits) { return bits == 8 ? (size_t)co * ci * taps : nn_wq_nblocks(co, ci, taps) * 16; }
+__global__ void wq_residual_k(const float *w, const unsigned char *q, const unsigned char *sc, unsigned char *r, unsigned char *rsc, int Co, int Ci, int T, int bits) {
+    int nblk = (Ci + 31) / 32; size_t nb = (size_t)Co * nblk * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nb) return;
+    int t = (int)(i % T), blk = (int)((i / T) % nblk), co = (int)(i / ((size_t)T * nblk)), c0 = blk * 32, cn = c0 + 32 < Ci ? c0 + 32 : Ci;
+    float scale = ldexpf(1.f, (int)sc[i] - 127), res[32]; size_t ks[32];
+    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; res[c - c0] = w[k] - wq_get(q, wq_sidx(bits, k, i, c - c0), bits) * scale; ks[c - c0] = k; }
+    res_write(r, rsc, i, res, cn - c0, ks);
+}
 extern "C" void nn_wq_pack(const float *w, void *q, void *sc, int co, int ci, int taps, int bits, unsigned seed) {
     size_t nb = nn_wq_nblocks(co, ci, taps); wq_pack_k<<<nblk(nb, 128), 128>>>(w, (unsigned char *)q, (unsigned char *)sc, co, ci, taps, bits, seed); KCHECK();
+}
+extern "C" void nn_wq_residual(const float *w, const void *q, const void *sc, void *r, void *rsc, int co, int ci, int taps, int bits) {
+    size_t nb = nn_wq_nblocks(co, ci, taps); wq_residual_k<<<nblk(nb, 128), 128>>>(w, (const unsigned char *)q, (const unsigned char *)sc, (unsigned char *)r, (unsigned char *)rsc, co, ci, taps, bits); KCHECK();
 }
 extern "C" void nn_wq_unpack(const void *q, const void *sc, float *w, int co, int ci, int taps, int bits) {
     size_t n = (size_t)co * ci * taps; wq_unpack_k<<<nblk(n, 256), 256>>>((const unsigned char *)q, (const unsigned char *)sc, w, co, ci, taps, bits); KCHECK();
 }
-extern "C" void nn_wq_adamw(void *q, void *sc, const float *g, float *m, float *v, int co, int ci, int taps, int bits, float lr, float b1, float b2, float eps, float wd, int step, unsigned seed) {
+/* r / rsc: optional fp8 error-feedback residual (fp4 weights); nullptr = stochastic rounding without residual */
+extern "C" void nn_wq_adamw(void *q, void *sc, void *r, void *rsc, const float *g, float *m, float *v, int co, int ci, int taps, int bits, float lr, float b1, float b2, float eps, float wd, int step, unsigned seed) {
     float c1 = 1.f - powf(b1, (float)step), c2 = 1.f - powf(b2, (float)step);
     size_t nb = nn_wq_nblocks(co, ci, taps);
-    wq_adamw_k<<<nblk(nb, 128), 128>>>((unsigned char *)q, (unsigned char *)sc, g, m, v, co, ci, taps, bits, lr, b1, b2, eps, wd, c1, c2, seed); KCHECK();
+    wq_adamw_k<<<nblk(nb, 128), 128>>>((unsigned char *)q, (unsigned char *)sc, (unsigned char *)r, (unsigned char *)rsc, g, m, v, co, ci, taps, bits, lr, b1, b2, eps, wd, c1, c2, seed); KCHECK();
 }
-extern "C" void nn_wq_ema(void *qe, void *sce, const void *qp, const void *scp, int co, int ci, int taps, int bits, float decay, unsigned seed) {
+extern "C" void nn_wq_ema(void *qe, void *sce, void *re, void *rsce, const void *qp, const void *scp, const void *rp, const void *rscp, int co, int ci, int taps, int bits, float decay, unsigned seed) {
     size_t nb = nn_wq_nblocks(co, ci, taps);
-    wq_ema_k<<<nblk(nb, 128), 128>>>((unsigned char *)qe, (unsigned char *)sce, (const unsigned char *)qp, (const unsigned char *)scp, co, ci, taps, bits, decay, seed); KCHECK();
+    wq_ema_k<<<nblk(nb, 128), 128>>>((unsigned char *)qe, (unsigned char *)sce, (unsigned char *)re, (unsigned char *)rsce, (const unsigned char *)qp, (const unsigned char *)scp, (const unsigned char *)rp, (const unsigned char *)rscp, co, ci, taps, bits, decay, seed); KCHECK();
 }
 extern "C" void nn_wquant(float *w, int co, int ci, int taps, int bits, unsigned seed) {
     size_t nb = (size_t)co * ((ci + 31) / 32) * taps; wquant_k<<<nblk(nb, 128), 128>>>(w, co, ci, taps, bits, seed); KCHECK();
@@ -1936,7 +1974,9 @@ extern "C" void nn_concat_bwd(const float *gy, int ca, int cb, shape5 s, float *
 
 /* ================= loss =================
    scratch layout per (n,c): [nmask, bce_sum, sum_sig_p, sum_sig, sum_p] (5 floats). */
-__global__ void loss_stats_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds) {
+static float g_posw = 1.f;   /* BCE weight of the positive class */
+extern "C" void nn_set_pos_weight(float w) { g_posw = w; }
+__global__ void loss_stats_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw) {
     int nc = blockIdx.x, slab = blockIdx.y, n = nc / C;
     float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0;   /* per-thread fp32 partials, fp64 block reduction */
     if (w[nc]) {
@@ -1946,7 +1986,8 @@ __global__ void loss_stats_k(const float *lg, const uint8_t *t, const uint8_t *m
             if (!mp[i]) continue;
             float x = l[i], p = tp[i] * (1.f / 255.f);
             float sg = 1.f / (1.f + __expf(-x));
-            float bce = fmaxf(x, 0.f) - x * p + log1pf(__expf(-fabsf(x)));
+            float spp = fmaxf(x, 0.f) + log1pf(__expf(-fabsf(x)));   /* softplus(x) */
+            float bce = pw * p * (spp - x) + (1.f - p) * spp;           /* softplus(-x) = softplus(x) - x */
             a0 += 1; a1 += bce; a2 += sg * p; a3 += sg; a4 += p;
         }
     }
@@ -1976,14 +2017,14 @@ __global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, floa
     fin[2 * C + 1] = active ? 1.f / active : 0.f;
 }
 __global__ void loss_grad_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N, int C, size_t S, const float *st,
-                            float dice_w, const float *fin, float *gl) {
+                            float dice_w, const float *fin, float *gl, float pw) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)N * C * S) return;
     int nc = (int)(i / S), n = nc / C;
     if (!w[nc] || !m[(size_t)n * S + i % S]) { gl[i] = 0.f; return; }
     float nm = st[nc * 5], Ssp = st[nc * 5 + 2], Ss = st[nc * 5 + 3], Sp = st[nc * 5 + 4];
     float x = lg[i], p = t[i] * (1.f / 255.f), s = 1.f / (1.f + expf(-x));
-    float g = (s - p) / fmaxf(nm, 1.f);
+    float g = ((1.f - p) * s - pw * p * (1.f - s)) / fmaxf(nm, 1.f);
     float den = Ss + Sp + 1.f;
     float ddice_ds = -(2.f * p * den - (2.f * Ssp + 1.f)) / (den * den);
     g += dice_w * ddice_ds * s * (1.f - s);
@@ -1998,10 +2039,10 @@ extern "C" void nn_loss_async(const float *logits, const uint8_t *t, const uint8
     float *fin = scratch + (size_t)5 * NC;
     double *ds = gn_dsums((size_t)5 * NC);
     cudaMemsetAsync(ds, 0, (size_t)5 * NC * sizeof(double));
-    loss_stats_k<<<dim3(NC, KSLAB), 256>>>(logits, t, m, w, s.c, S, ds);
+    loss_stats_k<<<dim3(NC, KSLAB), 256>>>(logits, t, m, w, s.c, S, ds, g_posw);
     loss_d2f_k<<<nblk(5 * NC, 128), 128>>>(ds, scratch, 5 * NC);
     loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, fin);
-    if (gl) { size_t n = shape_numel(s); loss_grad_k<<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl); }
+    if (gl) { size_t n = shape_numel(s); loss_grad_k<<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw); }
     KCHECK();
 }
 /* Copies the finalized values (2C+1 floats: bce per channel, dice per channel, active) to the host (synchronous). */

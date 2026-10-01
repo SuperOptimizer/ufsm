@@ -98,7 +98,7 @@ def main():
             print("no CT for", scroll, vol, file=sys.stderr)
             continue
         src = {"name": f"{scroll}-hf", "root": root, "ct": ct, "um": um,
-               "targets": {"recto": {"root": d, "group": "."}}, "weight": 1.0}
+               "targets": {"recto": {"root": d, "group": "."}}, "weight": 1.0, "trust_band": 8}
         h = holdout_for(d, um)
         if h:
             src["holdout"] = h

@@ -76,7 +76,7 @@ int cmd_train(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 96] [--B 2] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--gpus 0,1] [--workers 12] [--seed 0] [--resume CKPT]\n"
-                        "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3] [--policy enc0=1,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4]\n"
+                        "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3] [--policy enc0=1,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1]\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  env UFSM_PROF=1 prints per-op GPU time every log interval (category 'upload+loss+opt').\n");
         return 2;
@@ -98,6 +98,9 @@ int cmd_train(int argc, char **argv) {
     int wq = atoi(opt(argc, argv, "--wq", "0"));            /* 8 or 4: true fp8 / fp4 weights (stochastic rounding after each update) */
     int sparse_at = atoi(opt(argc, argv, "--sparse24", "0"));   /* step from which the 3^3 conv weights are 2:4 sparse (0 = dense) */
     float srste = (float)atof(opt(argc, argv, "--srste", "2e-4"));
+    nn_set_pos_weight((float)atof(opt(argc, argv, "--pos-weight", "1")));   /* BCE weight of surface voxels */
+    int overfit = atoi(opt(argc, argv, "--overfit", "0"));   /* diagnostic: train on the first batch forever */
+    int noaug = atoi(opt(argc, argv, "--noaug", "0"));       /* diagnostic: no augmentation */
     if (nn_set_prec_policy(opt(argc, argv, "--policy", ""))) return 2;   /* per-layer: "enc0=1,enc1=2,..." */
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--fp32")) nn_set_tf32(0);
     int devs[8], ng = 0;
@@ -111,6 +114,7 @@ int cmd_train(int argc, char **argv) {
     if (!S) return 1;
     sample_cfg sc = sample_cfg_default();
     sc.P = P; sc.B = B; sc.nworkers = workers; sc.nbuf = 4 * ng + 2; sc.seed = seed;
+    if (noaug) sc.augment = 0;
     { const char *lv = opt(argc, argv, "--levels", nullptr); if (lv) { char *t = strdup(lv); int l = 0; memset(sc.level_p, 0, sizeof sc.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) sc.level_p[l++] = atof(q); free(t); } }
 
     size_t p3 = (size_t)P * P * P;
@@ -168,6 +172,41 @@ int cmd_train(int argc, char **argv) {
         for (int g = 0; g < ng; g++) {
             gpu_state *d = &G[g];
             nn_init(d->dev);
+            if (overfit > 1) {                              /* diagnostic: cycle through the first N batches (host copies, synchronous upload) */
+                static batch *fixed[256]; static int nfixed = 0;
+                int k = (step - step0 - 1) % overfit;
+                if (k >= nfixed) {
+                    double tw = now(); batch *b = sampler_next(sp); wait += now() - tw;
+                    if (!b) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; break; }
+                    batch *cp = calloc(1, sizeof *cp); size_t p3b = (size_t)P * P * P;
+                    cp->x = malloc((size_t)B * 4 * p3b * 4); memcpy(cp->x, b->x, (size_t)B * 4 * p3b * 4);
+                    cp->t = malloc((size_t)B * NCH * p3b); memcpy(cp->t, b->t, (size_t)B * NCH * p3b);
+                    cp->m = malloc((size_t)B * p3b); memcpy(cp->m, b->m, (size_t)B * p3b);
+                    cp->w = malloc((size_t)B * NCH); memcpy(cp->w, b->w, (size_t)B * NCH);
+                    sampler_release(sp, b); fixed[nfixed++] = cp;
+                }
+                upload(d, fixed[k], B, P);
+                unet_zero_grad(d->u); run_batch(d, B, P, dice_w, 1); unet_backward(d->u, d->gl);
+                continue;
+            }
+            if (getenv("UFSM_SYNC_UPLOAD")) {               /* diagnostic: plain synchronous upload, single buffer */
+                double tw = now(); batch *b = sampler_next(sp); wait += now() - tw;
+                if (!b) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; break; }
+                upload(d, b, B, P); sampler_release(sp, b);
+                if (getenv("UFSM_DUMP_BATCH") && step == step0 + 5) {   /* diagnostic: what the GPU sees (mid slice of patch 0: CT | target | mask) */
+                    size_t p3 = (size_t)P * P * P; float *hx = malloc(4 * p3 * 4); uint8_t *ht = malloc(NCH * p3), *hm = malloc(p3);
+                    nn_d2h(hx, d->x, 4 * p3 * 4); nn_d2h(ht, d->t, NCH * p3); nn_d2h(hm, d->m, p3);
+                    FILE *f = fopen(getenv("UFSM_DUMP_BATCH"), "wb"); fprintf(f, "P5\n%d %d\n255\n", 3 * P, P);
+                    for (int y = 0; y < P; y++) {
+                        for (int x = 0; x < P; x++) { float v = hx[((size_t)(P / 2) * P + y) * P + x]; int g = (int)(128 + 40 * v); fputc(g < 0 ? 0 : g > 255 ? 255 : g, f); }
+                        for (int x = 0; x < P; x++) fputc(ht[((size_t)(P / 2) * P + y) * P + x], f);
+                        for (int x = 0; x < P; x++) fputc(hm[((size_t)(P / 2) * P + y) * P + x] ? 255 : 0, f);
+                    }
+                    fclose(f); free(hx); free(ht); free(hm); fprintf(stderr, "dumped batch to %s\n", getenv("UFSM_DUMP_BATCH"));
+                }
+                unet_zero_grad(d->u); run_batch(d, B, P, dice_w, 1); unet_backward(d->u, d->gl);
+                continue;
+            }
             /* the batch for this step was uploaded during the previous step (first step: upload now) */
             if (!d->pending) {
                 double tw = now();
@@ -184,6 +223,7 @@ int cmd_train(int argc, char **argv) {
             unet_backward(d->u, d->gl);
             nn_event_record(d->ev_done, 0);
             nn_event_sync(d->ev_up[d->cur]);                 /* host buffer of this batch is free again */
+            if (overfit) continue;                           /* keep computing on the same device buffer */
             sampler_release(sp, d->pending);
             /* prefetch the next batch into the other buffer while this step computes */
             double tw = now();

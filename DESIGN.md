@@ -159,6 +159,25 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   mantissa bit the stochastic-rounding noise dominates the updates (0.47-0.64, NaN in fp16 mode); fp4 deployment has to
   go through QAT (`--qat 3`, 0.167) with round-to-nearest at the end, or an error-feedback residual, not tried.
 
+- First real run (2026-10-01): run r1 on the MANBp HF labels + Kaggle cubes plateaued at validation 0.76 because the
+  sampler drew MANBp positions uniformly over a 17148 x 12577^2 masked volume and rejected 98% of them as air, so 98% of
+  the patches were Kaggle cubes while validation came from the MANBp holdout. The sampler now reads the coarsest
+  recto level of every pyramid source once (MANBp: 0.3 M of 83 M level-5 cells contain surface) and draws positions
+  around random cells that contain surface; the mix is then ~50/50 and run r2 trains at bce 0.28 instead of 0.37 after
+  600 steps. Label/CT alignment was verified: CT is 30-40 gray levels brighter on labeled-surface voxels than average.
+  Sampling MANBp at level 0 over HTTPS is CPU/decode bound with the exports running (GPU waits ~50% with 24 workers).
+- Run r2 (fixed mix) still sat at the constant prior (bce 0.23 = entropy of the 5% positive rate). Diagnostics, in
+  order: a fixed batch is memorized in 100 steps (pipeline and gradients fine); 8 fixed batches are learned, 32 fixed
+  batches escape the plateau only after ~900 steps, streaming never does within 1200; precision, augmentation, the
+  asynchronous upload, learning rate, weight decay, positive weighting and level choice change nothing; 2-D and 3-D
+  cross-correlation of labels against CT shows no consistent global offset; zoomed overlays of raw cubes show the HF
+  "surface" label is the recto FACE of a sheet (the papyrus/air edge on the side facing the axis), aligned with the
+  CT, with the labels' own ignore region on the far side. So the task needs the scroll-axis channels (MANBp had no
+  umbilicus: `ufsm axis` now provides a centroid axis under gt/axis/, picked up by make_sources) and is an edge task,
+  not a sheet mask. New sampler option `trust_band` (R voxels: background counts only near an annotated surface) for
+  partially annotated sources; new trainer diagnostics `--overfit N` (cycle N fixed batches), `--noaug`,
+  `UFSM_SYNC_UPLOAD`, `UFSM_DUMP_BATCH`, and `--pos-weight`.
+
 ## Status (2026-09-30 night)
 - M0 reader + CLI + sampler: done, tested (bit-exact zarr3 reads, sampler montages checked by eye).
 - M1 ingest: done — `ingest-zip` (label archive), `ingest-kaggle`, `ingest-mesh`, `raster`, writer, zip and

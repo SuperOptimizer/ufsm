@@ -55,10 +55,13 @@ void nn_wquant(float *w, int co, int ci, int taps, int bits, unsigned seed);
    channels of a (co, tap). The optimizer and the EMA update the packed weights directly (stochastic rounding); unpack dequantizes
    into an fp32 shadow for the conv kernels. seed 0 in pack = round to nearest. */
 size_t nn_wq_nblocks(int co, int ci, int taps);
+size_t nn_wq_bytes(int co, int ci, int taps, int bits);   /* packed bytes: fp8 = elements, fp4 = 16 per block of 32 */
 void nn_wq_pack(const float *w, void *q, void *sc, int co, int ci, int taps, int bits, unsigned seed);
 void nn_wq_unpack(const void *q, const void *sc, float *w, int co, int ci, int taps, int bits);
-void nn_wq_adamw(void *q, void *sc, const float *g, float *m, float *v, int co, int ci, int taps, int bits, float lr, float b1, float b2, float eps, float wd, int step, unsigned seed);
-void nn_wq_ema(void *qe, void *sce, const void *qp, const void *scp, int co, int ci, int taps, int bits, float decay, unsigned seed);
+void nn_wq_adamw(void *q, void *sc, void *r, void *rsc, const float *g, float *m, float *v, int co, int ci, int taps, int bits, float lr, float b1, float b2, float eps, float wd, int step, unsigned seed);
+void nn_wq_ema(void *qe, void *sce, void *re, void *rsce, const void *qp, const void *scp, const void *rp, const void *rscp, int co, int ci, int taps, int bits, float decay, unsigned seed);
+/* optional fp8 error-feedback residual (r: e4m3 per weight, rsc: ue8m0 per block) used for fp4 weights: w = q4 s + r8 sr */
+void nn_wq_residual(const float *w, const void *q, const void *sc, void *r, void *rsc, int co, int ci, int taps, int bits);
 void nn_srste24(float *g, const float *w, int co, int ci, int taps, float lambda);
 void nn_set_layer_prec(int id, int p);
 int nn_set_prec_policy(const char *policy);
@@ -154,6 +157,7 @@ void nn_loss(const float *logits, const uint8_t *t, const uint8_t *m, const uint
 size_t nn_loss_scratch(shape5 s);
 /* Asynchronous loss: kernels only; fetch the host values later (bce per channel, dice per channel, active). */
 void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch);
+void nn_set_pos_weight(float w);   /* BCE weight of positive targets (class balance), default 1 */
 void nn_loss_fetch(const float *scratch, shape5 s, float *out);
 /* Device-to-device copy across GPUs (peer access when possible). */
 void nn_peer_copy(void *dst, int dst_dev, const void *src, int src_dev, size_t bytes);
