@@ -381,6 +381,13 @@ training outcome; the network adapts to the grid); fp4 gradient storage destroys
 (training a1/a2 and down outputs become packed fp4 as well, raw first, the delayed-stats affine only if the real
 kernels show a gap); gradients stay MX-fp8 / fp16; fp4 in the backward is restricted to the GEMM operands.
 
+Real kernels (c5f70d0, every activation stored as packed e2m1 + ue8m0, `UFSM_ACT_MX4=1`), same paired yardstick:
+F1 0.214 / 0.291 at 0.5 / 0.7, peak 0.293, val 0.909, 0 skips, against fp16 0.212 / 0.300, peak 0.301, val 0.907.
+Inference with mx4 storage on the fp16-trained r8 model: peak 0.277 vs 0.284 (calibration shifts down; models
+trained with mx4 do not need that). Speed at 96^3 B2 (agent, quiet GPU): inference 8.91 fp16 / 7.47 mx8 / 7.36 mx4
+ms, memory 0.228 / 0.205 / 0.111 GB; training 32.8 / 33.3 / 33.6 ms (the 16-channel fp8-path convs and the MX GN
+backward are the regressions being fixed), memory 0.540 / 0.458 / 0.363 GB.
+
 ### Run lengths (2026-10-01 evening)
 - Under Muon the 6000-step yardstick reaches the F1 that AdamW needed 120k steps for, and r10's validation loss has
   been flat (0.94-0.99) since step 50k of its constant-lr phase. Decisions therefore use the 6000-step paired
