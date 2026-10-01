@@ -170,11 +170,15 @@ void unet_init(unet *u, uint64_t seed) {
 }
 
 /* ---- activation buffers ---- */
-static float *dalloc(unet *u, size_t n) { u->act_bytes += n * 4; return nn_malloc(n * 4); }
+/* dry run (unet_train_bytes): the activation allocators only count bytes and hand out a dummy pointer */
+static int g_dry = 0;
+static float *dmalloc(size_t b) { return g_dry ? (float *)(uintptr_t)4096 : nn_malloc(b); }
+static void dstorage(const void *p, size_t b, int dt) { if (!g_dry) nn_set_storage(p, b, dt); }
+static float *dalloc(unet *u, size_t n) { u->act_bytes += n * 4; return dmalloc(n * 4); }
 #define ABF (nn_get_tf32() && nn_get_act_bf16())
 #define GBF (ABF && nn_get_grad_bf16())
 static float *dalloc_oom(float *p, size_t b) { if (!p && b) { fprintf(stderr, "unet: out of device memory for a %.2f GB activation buffer\n", b / 1e9); abort(); } return p; }
-static float *dalloc_act(unet *u, size_t n) { size_t b = ABF ? n * 2 : n * 4; u->act_bytes += b; return dalloc_oom(nn_malloc(b), b); }   /* activation storage (bf16 in act-bf16 mode) */
+static float *dalloc_act(unet *u, size_t n) { size_t b = ABF ? n * 2 : n * 4; u->act_bytes += b; return dalloc_oom(dmalloc(b), b); }   /* activation storage (bf16 in act-bf16 mode) */
 /* activation tensor of shape s: MX-fp8 (registered, channel-blocked bytes + scales) in act-MX8 mode, else as dalloc_act */
 static int g_act_mx8 = -1, g_act_mx4 = -1;
 /* MX activation storage: fp8 (registry 8) or packed fp4 (registry 4); mx4 wins when both are requested */
@@ -186,13 +190,13 @@ void unet_set_act_mx4(int on) { g_act_mx4 = on; }
 static int g_grad_mx8 = -1;   /* MX-fp8 activation gradients (env UFSM_GRAD_MX8=1; needs the MX activations) */
 static int grad_mx8(void) { if (g_grad_mx8 < 0) g_grad_mx8 = getenv("UFSM_GRAD_MX8") != nullptr; return g_grad_mx8 && act_mx8(); }
 void unet_set_grad_mx8(int on) { g_grad_mx8 = on; }
-static float *dalloc_grad_mx(unet *u, size_t bytes) { u->act_bytes += bytes; u->grad_bytes += bytes; float *p = nn_malloc(bytes); nn_set_storage(p, bytes, 8); return p; }
+static float *dalloc_grad_mx(unet *u, size_t bytes) { u->act_bytes += bytes; u->grad_bytes += bytes; float *p = dalloc_oom(dmalloc(bytes), bytes); dstorage(p, bytes, 8); return p; }
 static float *dalloc_act_s(unet *u, shape5 s) {
     if (!act_mx8()) return dalloc_act(u, shape_numel(s));
     size_t b = nn_mx_bytes(s, act_dt());
     u->act_bytes += b;
-    float *p = dalloc_oom(nn_malloc(b), b);
-    nn_set_storage(p, b, act_dt());
+    float *p = dalloc_oom(dmalloc(b), b);
+    dstorage(p, b, act_dt());
     return p;
 }
 /* recompute mode (env UFSM_RECOMPUTE=1, tensor-core path): no block outputs s2 and no upsampled decoder inputs are
@@ -207,21 +211,25 @@ static int recompute(void) { if (g_recompute < 0) { const char *e = getenv("UFSM
    (the GN statistics of a1 are kept from the forward) */
 static int recompute_a1(void) { return recompute() >= 2; }
 void unet_set_recompute(int on) { g_recompute = on; }
-#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 64 * act_mx4())
+#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 64 * act_mx4() + 256 * chunk_up())
 /* chunk mode (recompute, 16-bit activations and gradients, fused upsample): the decoder's up-part input gradient is
    produced in w[i]-channel chunks, each upsample-backwarded straight into its slice of gout[i + 1], so the shared
    gradient buffer B only needs w[i] channels (env UFSM_CHUNK_UP=0 turns it off) */
+static int g_chunk = -1;
+void unet_set_chunk_up(int on) { g_chunk = on; }
 static int chunk_up(void) {
-    static int f = -1; if (f < 0) { const char *e = getenv("UFSM_CHUNK_UP"); f = e ? atoi(e) : 1; }
+    if (g_chunk < 0) { const char *e = getenv("UFSM_CHUNK_UP"); g_chunk = e ? atoi(e) : 1; }
+    const int f = g_chunk;
     const char *fu = getenv("UFSM_FUSED_UP");
     /* MX activation storage: only with UFSM_CHUNK_UP=2 (halves the gradient buffer B: 32 B / level-0 voxel less, ~-15% training
        memory, for the largest windows; costs ~0.9 ms per 96^3 B2 step since dec0.c1's backward-data runs in three launches) */
     return f && recompute() && (!act_mx8() || f >= 2) && !grad_mx8() && (!fu || atoi(fu) >= 2);
 }
-static float *dalloc_grad(unet *u, size_t n) { size_t b = GBF ? n * 2 : n * 4; u->act_bytes += b; u->grad_bytes += b; return nn_malloc(b); }  /* activation-gradient storage */
+static float *dalloc_grad(unet *u, size_t n) { size_t b = GBF ? n * 2 : n * 4; u->act_bytes += b; u->grad_bytes += b; return dalloc_oom(dmalloc(b), b); }  /* activation-gradient storage */
 
 /* buffers may be shared (gradient buffers across levels, gskip == gout, inference scratch): free each pointer once */
 static void free_once(float **ptrs, int n) {
+    if (g_dry) return;
     for (int i = 0; i < n; i++) {
         if (!ptrs[i]) continue;
         int dup = 0;
@@ -245,7 +253,7 @@ static void free_acts(unet *u) {
         u->downo[i] = u->cat[i] = u->gskip[i] = u->gout[i] = u->gA[i] = u->gB[i] = u->t1[i] = u->t2[i] = nullptr;
     }
     pp[np++] = u->logits; pp[np++] = u->conv_scratch; pp[np++] = u->rc_extra;
-    if (u->rc_extra) nn_storage_forget(u->rc_extra);
+    if (u->rc_extra && !g_dry) nn_storage_forget(u->rc_extra);
     u->rc_extra = nullptr; u->rc_extra_bytes = 0; u->gB_bytes = 0; pp[np++] = u->xin; pp[np++] = u->glb;
     free_once(pp, np);
     u->logits = nullptr; u->conv_scratch = nullptr; u->xin = nullptr; u->glb = nullptr; u->conv_scratch_n = 0;
@@ -358,13 +366,24 @@ static void build_acts(unet *u, shape5 xs, int train) {
             if (b > cs) cs = b;
             if (i < L - 1) { size_t c = nn_conv3d_scratch(u->dec[i].xs, w[i], 3); if (c > cs) cs = c; }
         }
-        u->conv_scratch = nn_malloc(cs); u->conv_scratch_n = cs; u->act_bytes += cs;
+        u->conv_scratch = dmalloc(cs); u->conv_scratch_n = cs; u->act_bytes += cs;
     }
     u->xin = nullptr; u->glb = nullptr;   /* allocated on first use (fp32 input / fp32 logit gradient only) */
     u->xs = xs; u->built = 1; u->train = train; u->mode = UMODE();
 }
 
 size_t unet_activation_bytes(const unet *u) { return u->act_bytes; }
+/* device bytes of the training activations / gradients at input shape xs under the current storage modes, without allocating
+   (dry build); the model is left unbuilt */
+size_t unet_train_bytes(unet *u, shape5 xs) {
+    if (u->built) free_acts(u);
+    g_dry = 1;
+    build_acts(u, xs, 1);
+    const size_t b = u->act_bytes;
+    free_acts(u);
+    g_dry = 0;
+    return b;
+}
 size_t unet_grad_bytes(const unet *u) { return u->grad_bytes; }
 shape5 unet_out_shape(const unet *u, shape5 xs) { xs.c = u->cfg.cout; return xs; }
 
