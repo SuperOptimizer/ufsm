@@ -17,10 +17,12 @@ typedef struct {
     int holdout;             /* 0 = train: never draw patches touching a source's holdout box; 1 = validation: draw only inside holdout boxes */
     int dilate;              /* > 0: dilate the surface band of pyramid targets by this many level-0 voxels (curriculum for thin targets) */
     float soft;              /* > 0: soft ridge target exp(-(d/soft)^2/2) around the surface (d = chamfer distance in level-0 voxels) */
+    int xfmt;                /* also fill batch.x16: 0 = no (x only), 1 = fp16, 2 = bf16 (the trainer uploads x16 straight into the network input) */
 } sample_cfg;
 
 typedef struct {
     float *x;                /* B x 4 x P^3: z-scored CT, radial z (0), radial y, radial x */
+    uint16_t *x16;           /* the same in 16 bits (cfg.xfmt), else nullptr */
     uint8_t *t;              /* B x NCH x P^3: target probability * 255 (from the label encoding) */
     uint8_t *m;              /* B x P^3: 1 where CT > 0 and the label is not ignore (loss mask) */
     uint8_t *w;              /* B x NCH: 1 if channel has a teacher in this sample */

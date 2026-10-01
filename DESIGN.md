@@ -198,6 +198,22 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   about 4x chance; the curve was still descending when the cosine schedule ended. Run r5: eight sources (adds PHerc1667
   and the three PHerc0139 winding-range zarrs), intensity-only augmentation, 40k steps.
 
+### Memory for larger windows (2026-10-01)
+- Recompute level 1 is the default (`UFSM_RECOMPUTE=0` restores the stored block outputs): 0.87 -> 0.60 GB at
+  96^3 batch 2, same 0.25% gradient error, ~20% slower per step on a shared GPU (measurements contaminated by the
+  concurrent run; redo on an idle GPU). Level 2 (shared a1, conv1 re-run in the backward) 0.50 GB.
+- Trainer-side buffers were a fifth of the level-0 bytes: the sampler now emits the batch in the network's 16-bit
+  storage type (`sample_cfg.xfmt`, `batch.x16`, F16C on the host) and the trainer uploads it straight in as the
+  input (`unet_forward_x(.., x_h16 = 1)`: no fp32 double-buffered upload, no device-side conversion copy); the loss
+  kernel writes the logit gradient as 16-bit scaled by the gradient scale (`nn_set_loss_grad_h16`,
+  `unet_backward_x(.., g_h16 = 1)`). `UFSM_X32=1` restores the fp32 path; on a fixed batch both give the same losses
+  to run-to-run noise. Per-process peak (fp16 mode, recompute 1, batch 1): 192^3 2.8 GB, 256^3 6.4 -> 5.9 GB,
+  320^3 12.3 GB before the trim. Memory is ~350 B/voxel: at level 0, a1+a2 of enc0 and dec0 128 B, the gradient
+  buffers A+B+gout 128 B, fp32 logits 16 B, input 8 B, logit gradient 8 B; the lower levels add ~70 B.
+- A patch must fit the sources: the sampler now warns after 4M consecutive impossible draws (region, holdout box
+  or level too small for P) instead of spinning silently, and stops after 20 consecutive read failures (the
+  failure counter was reset on every error before, so an I/O error retried forever).
+
 ## Status (2026-09-30 night)
 - M0 reader + CLI + sampler: done, tested (bit-exact zarr3 reads, sampler montages checked by eye).
 - M1 ingest: done — `ingest-zip` (label archive), `ingest-kaggle`, `ingest-mesh`, `raster`, writer, zip and

@@ -284,6 +284,7 @@ typedef __half f16;
 template <typename HT> __device__ __forceinline__ HT f2h(float v);
 template <> __device__ __forceinline__ bf16 f2h<bf16>(float v) { return __float2bfloat16(v); }
 template <> __device__ __forceinline__ f16 f2h<f16>(float v) { return __float2half(v); }
+template <> __device__ __forceinline__ float f2h<float>(float v) { return v; }   /* identity: kernels templated on the output type */
 template <typename HT> __device__ __forceinline__ float h2f(HT v);
 template <> __device__ __forceinline__ float h2f<bf16>(bf16 v) { return __bfloat162float(v); }
 template <> __device__ __forceinline__ float h2f<f16>(f16 v) { return __half2float(v); }
@@ -2536,20 +2537,22 @@ __global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, floa
     fin[2 * C] = (float)active;
     fin[2 * C + 1] = active ? 1.f / active : 0.f;
 }
-__global__ void loss_grad_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N, int C, size_t S, const float *st,
-                            float dice_w, const float *fin, float *gl, float pw) {
+template <typename GT> __global__ void loss_grad_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N, int C, size_t S, const float *st,
+                            float dice_w, const float *fin, GT *gl, float pw, float gscale) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)N * C * S) return;
     int nc = (int)(i / S), n = nc / C;
-    if (!w[nc] || !m[(size_t)n * S + i % S]) { gl[i] = 0.f; return; }
+    if (!w[nc] || !m[(size_t)n * S + i % S]) { gl[i] = f2h<GT>(0.f); return; }
     float nm = st[nc * 5], Ssp = st[nc * 5 + 2], Ss = st[nc * 5 + 3], Sp = st[nc * 5 + 4];
     float x = lg[i], p = t[i] * (1.f / 255.f), s = 1.f / (1.f + expf(-x));
     float g = ((1.f - p) * s - pw * p * (1.f - s)) / fmaxf(nm, 1.f);
     float den = Ss + Sp + 1.f;
     float ddice_ds = -(2.f * p * den - (2.f * Ssp + 1.f)) / (den * den);
     g += dice_w * ddice_ds * s * (1.f - s);
-    gl[i] = g * fin[2 * C + 1];
+    gl[i] = f2h<GT>(g * fin[2 * C + 1] * gscale);
 }
+static int g_loss_g16 = 0;
+extern "C" void nn_set_loss_grad_h16(int on) { g_loss_g16 = on; }
 /* scratch: 5 floats per (n,c) statistics followed by 2C+2 finalized values */
 extern "C" size_t nn_loss_scratch(shape5 s) { return ((size_t)5 * s.n * s.c + 2 * s.c + 2) * sizeof(float); }
 /* Asynchronous: launches the statistics, finalize and gradient kernels; nothing is copied to the host. */
@@ -2562,7 +2565,12 @@ extern "C" void nn_loss_async(const float *logits, const uint8_t *t, const uint8
     loss_stats_k<<<dim3(NC, KSLAB), 256>>>(logits, t, m, w, s.c, S, ds, g_posw);
     loss_d2f_k<<<nblk(5 * NC, 128), 128>>>(ds, scratch, 5 * NC);
     loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, fin);
-    if (gl) { size_t n = shape_numel(s); loss_grad_k<<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw); }
+    if (gl) {
+        size_t n = shape_numel(s);
+        if (!g_loss_g16) loss_grad_k<float><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f);
+        else if (g_h16) loss_grad_k<f16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale);
+        else loss_grad_k<bf16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale);
+    }
     KCHECK();
 }
 /* Copies the finalized values (2C+1 floats: bce per channel, dice per channel, active) to the host (synchronous). */

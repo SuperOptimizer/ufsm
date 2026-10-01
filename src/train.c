@@ -32,11 +32,14 @@ typedef struct {
     int cur;
 } gpu_state;
 
+static int g_xfmt = 0, g_g16 = 0;   /* input batches uploaded as 16-bit (1 fp16, 2 bf16); loss gradient written as 16-bit */
+static size_t xbytes(void) { return g_xfmt ? 2 : 4; }
+static const void *bx(const batch *b) { return g_xfmt ? (const void *)b->x16 : (const void *)b->x; }
 static void select_buf(gpu_state *d, int i) { d->cur = i; d->x = d->xb[i]; d->t = d->tb[i]; d->m = d->mb[i]; d->w = d->wb[i]; }
 /* synchronous upload (pageable host memory: validation batches) */
 static void upload(gpu_state *d, const batch *b, int B, int P) {
     size_t p3 = (size_t)P * P * P;
-    nn_h2d(d->x, b->x, (size_t)B * 4 * p3 * 4);
+    nn_h2d(d->x, bx(b), (size_t)B * 4 * p3 * xbytes());
     nn_h2d(d->t, b->t, (size_t)B * NCH * p3);
     nn_h2d(d->m, b->m, (size_t)B * p3);
     nn_h2d(d->w, b->w, (size_t)B * NCH);
@@ -45,7 +48,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
 static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     size_t p3 = (size_t)P * P * P;
     nn_stream_wait(1, d->ev_done);
-    nn_h2d_copy_stream(d->xb[i], b->x, (size_t)B * 4 * p3 * 4);
+    nn_h2d_copy_stream(d->xb[i], bx(b), (size_t)B * 4 * p3 * xbytes());
     nn_h2d_copy_stream(d->tb[i], b->t, (size_t)B * NCH * p3);
     nn_h2d_copy_stream(d->mb[i], b->m, (size_t)B * p3);
     nn_h2d_copy_stream(d->wb[i], b->w, (size_t)B * NCH);
@@ -55,7 +58,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
 /* forward + loss kernels on the uploaded batch of this GPU (asynchronous); fills gl when train. */
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 xs = {B, 4, P, P, P};
-    const float *lg = unet_forward(d->u, d->x, xs, train);
+    const float *lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     shape5 os = unet_out_shape(d->u, xs);
     int prof = getenv("UFSM_PROF") != nullptr;
     if (prof) nn_prof_begin(6);
@@ -105,6 +108,11 @@ int cmd_train(int argc, char **argv) {
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--fp32")) nn_set_tf32(0);
     int devs[8], ng = 0;
     { char *t = strdup(opt(argc, argv, "--gpus", opt(argc, argv, "--gpu", "0"))); for (char *q = strtok(t, ","); q && ng < 8; q = strtok(nullptr, ",")) devs[ng++] = atoi(q); free(t); }
+    nn_init(devs[0]);   /* env precision knobs are read here; the storage modes decide the batch formats */
+    g_xfmt = nn_get_tf32() && nn_get_act_bf16() && !getenv("UFSM_ACT_MX8") ? (nn_get_f16() ? 1 : 2) : 0;
+    g_g16 = nn_get_tf32() && nn_get_act_bf16() && nn_get_grad_bf16();
+    if (getenv("UFSM_X32")) g_xfmt = g_g16 = 0;   /* diagnostic: fp32 batches and logit gradient, converted on the device (the old path) */
+    nn_set_loss_grad_h16(g_g16);
     unet_cfg cfg = {4, {16, 32, 64, 80}, 4, NCH, 8};
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,80")); cfg.nlev = 0; for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "P must be divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
@@ -113,7 +121,7 @@ int cmd_train(int argc, char **argv) {
     sources *S = sources_load(src);
     if (!S) return 1;
     sample_cfg sc = sample_cfg_default();
-    sc.P = P; sc.B = B; sc.nworkers = workers; sc.nbuf = 4 * ng + 2; sc.seed = seed;
+    sc.P = P; sc.B = B; sc.nworkers = workers; sc.nbuf = 4 * ng + 2; sc.seed = seed; sc.xfmt = g_xfmt;
     if (noaug) sc.augment = 0;
     if (atoi(opt(argc, argv, "--rotonly", "0"))) sc.augment = 2;   /* proper rotations only (no reflections) */
     if (atoi(opt(argc, argv, "--zfix", "0"))) sc.augment = 3;      /* diagnostic: symmetries that keep the z axis */
@@ -133,9 +141,9 @@ int cmd_train(int argc, char **argv) {
         if (resume) { step0 = unet_load(d->u, resume); if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; } }
         else unet_init(d->u, seed + 1);                   /* deterministic: every GPU starts identical */
         if (wq) unet_set_wq(d->u, wq);
-        for (int i = 0; i < 2; i++) { d->xb[i] = nn_malloc((size_t)B * 4 * p3 * 4); d->tb[i] = nn_malloc((size_t)B * NCH * p3); d->mb[i] = nn_malloc((size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * NCH); d->ev_up[i] = nn_event_create(); }
+        for (int i = 0; i < 2; i++) { d->xb[i] = nn_malloc((size_t)B * 4 * p3 * xbytes()); d->tb[i] = nn_malloc((size_t)B * NCH * p3); d->mb[i] = nn_malloc((size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * NCH); d->ev_up[i] = nn_event_create(); }
         d->ev_done = nn_event_create(); nn_event_record(d->ev_done, 0); d->pending = nullptr; select_buf(d, 0);
-        d->gl = nn_malloc((size_t)B * NCH * p3 * 4); d->scratch = nn_malloc(nn_loss_scratch((shape5){B, NCH, P, P, P}) + 64);
+        d->gl = nn_malloc((size_t)B * NCH * p3 * (g_g16 ? 2 : 4)); d->scratch = nn_malloc(nn_loss_scratch((shape5){B, NCH, P, P, P}) + 64);
         const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
     }
     if (resume) fprintf(stderr, "resumed %s at step %d\n", resume, step0);
@@ -153,7 +161,8 @@ int cmd_train(int argc, char **argv) {
     for (int i = 0; i < nval; i++) {
         batch *b = sampler_next(vs);
         if (!b) { nval = i; break; }
-        val[i].x = malloc((size_t)B * 4 * p3 * 4); memcpy(val[i].x, b->x, (size_t)B * 4 * p3 * 4);
+        if (g_xfmt) { val[i].x16 = malloc((size_t)B * 4 * p3 * 2); memcpy(val[i].x16, b->x16, (size_t)B * 4 * p3 * 2); }
+        else { val[i].x = malloc((size_t)B * 4 * p3 * 4); memcpy(val[i].x, b->x, (size_t)B * 4 * p3 * 4); }
         val[i].t = malloc((size_t)B * NCH * p3); memcpy(val[i].t, b->t, (size_t)B * NCH * p3);
         val[i].m = malloc((size_t)B * p3); memcpy(val[i].m, b->m, (size_t)B * p3);
         val[i].w = malloc((size_t)B * NCH); memcpy(val[i].w, b->w, (size_t)B * NCH);
@@ -184,14 +193,15 @@ int cmd_train(int argc, char **argv) {
                     double tw = now(); batch *b = sampler_next(sp); wait += now() - tw;
                     if (!b) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; break; }
                     batch *cp = calloc(1, sizeof *cp); size_t p3b = (size_t)P * P * P;
-                    cp->x = malloc((size_t)B * 4 * p3b * 4); memcpy(cp->x, b->x, (size_t)B * 4 * p3b * 4);
+                    if (g_xfmt) { cp->x16 = malloc((size_t)B * 4 * p3b * 2); memcpy(cp->x16, b->x16, (size_t)B * 4 * p3b * 2); }
+                    else { cp->x = malloc((size_t)B * 4 * p3b * 4); memcpy(cp->x, b->x, (size_t)B * 4 * p3b * 4); }
                     cp->t = malloc((size_t)B * NCH * p3b); memcpy(cp->t, b->t, (size_t)B * NCH * p3b);
                     cp->m = malloc((size_t)B * p3b); memcpy(cp->m, b->m, (size_t)B * p3b);
                     cp->w = malloc((size_t)B * NCH); memcpy(cp->w, b->w, (size_t)B * NCH);
                     sampler_release(sp, b); fixed[nfixed++] = cp;
                 }
                 upload(d, fixed[k], B, P);
-                unet_zero_grad(d->u); run_batch(d, B, P, dice_w, 1); unet_backward(d->u, d->gl);
+                unet_zero_grad(d->u); run_batch(d, B, P, dice_w, 1); unet_backward_x(d->u, d->gl, g_g16);
                 continue;
             }
             if (getenv("UFSM_SYNC_UPLOAD")) {               /* diagnostic: plain synchronous upload, single buffer */
@@ -200,7 +210,11 @@ int cmd_train(int argc, char **argv) {
                 upload(d, b, B, P); sampler_release(sp, b);
                 if (getenv("UFSM_DUMP_BATCH") && step == step0 + 5) {   /* diagnostic: what the GPU sees (mid slice of patch 0: CT | target | mask) */
                     size_t p3 = (size_t)P * P * P; float *hx = malloc(4 * p3 * 4); uint8_t *ht = malloc(NCH * p3), *hm = malloc(p3);
-                    nn_d2h(hx, d->x, 4 * p3 * 4); nn_d2h(ht, d->t, NCH * p3); nn_d2h(hm, d->m, p3);
+                    if (!g_xfmt) nn_d2h(hx, d->x, 4 * p3 * 4);
+                    else { uint16_t *h16 = malloc(4 * p3 * 2); nn_d2h(h16, d->x, 4 * p3 * 2);
+                        for (size_t k = 0; k < 4 * p3; k++) { if (g_xfmt == 1) { _Float16 h; memcpy(&h, &h16[k], 2); hx[k] = (float)h; } else { uint32_t u = (uint32_t)h16[k] << 16; memcpy(&hx[k], &u, 4); } }
+                        free(h16); }
+                    nn_d2h(ht, d->t, NCH * p3); nn_d2h(hm, d->m, p3);
                     FILE *f = fopen(getenv("UFSM_DUMP_BATCH"), "wb"); fprintf(f, "P5\n%d %d\n255\n", 3 * P, P);
                     for (int y = 0; y < P; y++) {
                         for (int x = 0; x < P; x++) { float v = hx[((size_t)(P / 2) * P + y) * P + x]; int g = (int)(128 + 40 * v); fputc(g < 0 ? 0 : g > 255 ? 255 : g, f); }
@@ -209,7 +223,7 @@ int cmd_train(int argc, char **argv) {
                     }
                     fclose(f); free(hx); free(ht); free(hm); fprintf(stderr, "dumped batch to %s\n", getenv("UFSM_DUMP_BATCH"));
                 }
-                unet_zero_grad(d->u); run_batch(d, B, P, dice_w, 1); unet_backward(d->u, d->gl);
+                unet_zero_grad(d->u); run_batch(d, B, P, dice_w, 1); unet_backward_x(d->u, d->gl, g_g16);
                 continue;
             }
             /* the batch for this step was uploaded during the previous step (first step: upload now) */
@@ -225,7 +239,7 @@ int cmd_train(int argc, char **argv) {
             if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
             unet_zero_grad(d->u);
             run_batch(d, B, P, dice_w, 1);
-            unet_backward(d->u, d->gl);
+            unet_backward_x(d->u, d->gl, g_g16);
             nn_event_record(d->ev_done, 0);
             nn_event_sync(d->ev_up[d->cur]);                 /* host buffer of this batch is free again */
             if (overfit) continue;                           /* keep computing on the same device buffer */

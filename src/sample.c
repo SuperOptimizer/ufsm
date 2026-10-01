@@ -115,6 +115,7 @@ static batch alloc_batch(const sample_cfg *c) {
     size_t p3 = (size_t)c->P * c->P * c->P;
     batch b;
     b.x = nn_host_alloc((size_t)c->B * 4 * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
+    b.x16 = c->xfmt ? nn_host_alloc((size_t)c->B * 4 * p3 * 2) : nullptr;
     b.t = nn_host_alloc((size_t)c->B * NCH * p3);
     b.m = nn_host_alloc((size_t)c->B * p3);
     b.w = nn_host_alloc((size_t)c->B * NCH);
@@ -124,7 +125,7 @@ static batch alloc_batch(const sample_cfg *c) {
     return b;
 }
 
-static void free_batch(batch *b) { nn_host_free(b->x); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->corner); }
+static void free_batch(batch *b) { nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->corner); }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -363,6 +364,11 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         memcpy(X, xtmp, 4 * p3 * sizeof(float));
         memcpy(T, ttmp, NCH * p3);
         memcpy(M, mask, p3);
+    }
+    if (b->x16) {   /* 16-bit copy for the upload: fp16 (round to nearest, F16C) or bf16 (round to nearest even) */
+        uint16_t *H = b->x16 + (size_t)i * 4 * p3;
+        if (c->xfmt == 1) { for (size_t k = 0; k < 4 * p3; k++) { _Float16 h = (_Float16)X[k]; memcpy(&H[k], &h, 2); } }
+        else for (size_t k = 0; k < 4 * p3; k++) { uint32_t u; memcpy(&u, &X[k], 4); u += 0x7fffu + ((u >> 16) & 1u); H[k] = (uint16_t)(u >> 16); }
     }
     memcpy(b->w + (size_t)i * NCH, w, NCH);
     b->src[i] = (int16_t)si;

@@ -216,9 +216,9 @@ static void free_acts(unet *u) {
         for (int j = 0; j < 8; j++) pp[np++] = q[j];
         u->downo[i] = u->cat[i] = u->gskip[i] = u->gout[i] = u->gA[i] = u->gB[i] = u->t1[i] = u->t2[i] = nullptr;
     }
-    pp[np++] = u->logits; pp[np++] = u->conv_scratch;
+    pp[np++] = u->logits; pp[np++] = u->conv_scratch; pp[np++] = u->xin; pp[np++] = u->glb;
     free_once(pp, np);
-    u->logits = nullptr; u->conv_scratch = nullptr; u->conv_scratch_n = 0;
+    u->logits = nullptr; u->conv_scratch = nullptr; u->xin = nullptr; u->glb = nullptr; u->conv_scratch_n = 0;
     u->built = 0; u->act_bytes = 0; u->grad_bytes = 0;
 }
 
@@ -320,8 +320,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
         }
         u->conv_scratch = nn_malloc(cs); u->conv_scratch_n = cs; u->act_bytes += cs;
     }
-    u->xin = ABF ? dalloc_act_s(u, xs) : nullptr;
-    u->glb = (train && GBF) ? dalloc_grad(u, shape_numel(os)) : nullptr;
+    u->xin = nullptr; u->glb = nullptr;   /* allocated on first use (fp32 input / fp32 logit gradient only) */
     u->xs = xs; u->built = 1; u->train = train; u->mode = UMODE();
 }
 
@@ -394,7 +393,9 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
     PROF(3, nn_gn_fwd_silu(b->a2, b->ys, G, 1e-5f, P(u, b->n2.gamma), P(u, b->n2.beta), b->s2, b->m2, b->r2));
 }
 
-const float *unet_forward(unet *u, const float *x, shape5 xs, int train) {
+const float *unet_forward(unet *u, const float *x, shape5 xs, int train) { return unet_forward_x(u, x, xs, train, 0); }
+const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x_h16) {
+    const float *x = (const float *)xv;
     int div = 1 << (u->cfg.nlev - 1);
     if (xs.d % div || xs.h % div || xs.w % div) { fprintf(stderr, "unet: spatial size %dx%dx%d must be divisible by %d\n", xs.d, xs.h, xs.w, div); abort(); }
     if (!u->built || memcmp(&u->xs, &xs, sizeof xs) || (train && !u->train) || u->mode != UMODE()) build_acts(u, xs, train);
@@ -402,7 +403,8 @@ const float *unet_forward(unet *u, const float *x, shape5 xs, int train) {
     int L = u->cfg.nlev;
     const int *w = u->cfg.widths;
     const float *cur = x;
-    if (ABF) { nn_f32_to_act(x, xs, u->xin); cur = u->xin; }
+    if (x_h16 && (!ABF || act_mx8())) { fprintf(stderr, "unet_forward_x: a 16-bit input needs the 16-bit (non-MX) activation storage\n"); abort(); }
+    if (ABF && !x_h16) { if (!u->xin) u->xin = dalloc_act_s(u, xs); nn_f32_to_act(x, xs, u->xin); cur = u->xin; }
     for (int i = 0; i < L; i++) {
         nn_set_layer(i); block_fwd(u, &u->enc[i], i, cur);
         cur = u->enc[i].s2;
@@ -507,10 +509,13 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     return B;
 }
 
-void unet_backward(unet *u, const float *glogits) {
+void unet_backward(unet *u, const float *glogits) { unet_backward_x(u, glogits, 0); }
+void unet_backward_x(unet *u, const void *gv, int g_h16) {
+    const float *glogits = (const float *)gv;
     int L = u->cfg.nlev;
     const float gscale = GBF ? nn_get_grad_scale() : 1.f;
-    if (GBF) { shape5 os = u->ls[0]; os.c = u->cfg.cout; nn_f32_to_h16(glogits, shape_numel(os), u->glb, gscale); glogits = u->glb; }
+    if (g_h16 && !GBF) { fprintf(stderr, "unet_backward_x: a 16-bit logit gradient needs the 16-bit gradient storage\n"); abort(); }
+    if (GBF && !g_h16) { shape5 os = u->ls[0]; os.c = u->cfg.cout; if (!u->glb) u->glb = dalloc_grad(u, shape_numel(os)); nn_f32_to_h16(glogits, shape_numel(os), u->glb, gscale); glogits = u->glb; }
     const int *w = u->cfg.widths;
     float *g = u->g;
     /* head */
