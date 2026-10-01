@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <math.h>
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 int main(void) {
     nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0);
@@ -17,13 +18,18 @@ int main(void) {
     shape5 xs = {B, 4, P, P, P};
     size_t nl = (size_t)B * P * P * P;
     float *x = nn_malloc(shape_numel(xs) * 4), *g = nn_malloc(nl * 4);
-    nn_zero(x, shape_numel(xs) * 4); nn_zero(g, nl * 4);
+    { float *h = malloc(shape_numel(xs) * 4); for (size_t i = 0; i < shape_numel(xs); i++) h[i] = (float)((i * 2654435761u) % 1000) / 500.f - 1.f; nn_h2d(x, h, shape_numel(xs) * 4); free(h); } nn_zero(g, nl * 4);
+    float *lt = malloc(nl * 4), *li = malloc(nl * 4);
     for (int mode = 0; mode < 2; mode++) {   /* 0 train, 1 inference */
         unet *u = unet_create(&cfg); unet_init(u, 1);
         nn_sync();
         size_t f0 = nn_mem_free();
-        if (!mode) { unet_forward(u, x, xs, 1); unet_zero_grad(u); unet_backward(u, g); unet_adamw(u, 1e-3f, 0.9f, 0.999f, 1e-8f, 0.f, 1); }
-        else unet_forward(u, x, xs, 0);
+        if (!mode) {
+            nn_d2h(li, unet_forward(u, x, xs, 1), nl * 4); nn_d2h(lt, unet_forward(u, x, xs, 1), nl * 4);
+            double md = 0; for (size_t i = 0; i < nl; i++) { double d = fabs((double)lt[i] - li[i]); if (d > md) md = d; }
+            printf("training-build forward run to run: max abs diff %.3g\n", md);
+            unet_zero_grad(u); unet_backward(u, g); unet_adamw(u, 1e-3f, 0.9f, 0.999f, 1e-8f, 0.f, 1); }
+        else nn_d2h(li, unet_forward(u, x, xs, 0), nl * 4);
         nn_sync();
         size_t f1 = nn_mem_free();
         double t0 = now();
@@ -38,6 +44,8 @@ int main(void) {
         unet_free(u);
         nn_sync();
     }
+    double md = 0; for (size_t i = 0; i < nl; i++) { double d = fabs((double)lt[i] - li[i]); if (d > md) md = d; }
+    printf("inference vs training-build logits: max abs diff %.3g\n", md);
     const char *e = nn_check();
     if (e) { printf("cuda error: %s\n", e); return 1; }
     return 0;

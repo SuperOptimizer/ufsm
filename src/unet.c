@@ -185,65 +185,93 @@ static float *dalloc_act_s(unet *u, shape5 s) {
    (forward: before any gradient; backward: between dec conv2's backward-data and dec conv1's), or in inference one
    buffer sized for the largest level. */
 static int g_recompute = -1;
-static int recompute(void) { if (g_recompute < 0) { const char *e = getenv("UFSM_RECOMPUTE"); g_recompute = e && atoi(e); } return g_recompute && nn_get_tf32(); }
+static int recompute(void) { if (g_recompute < 0) { const char *e = getenv("UFSM_RECOMPUTE"); g_recompute = e ? atoi(e) : 0; } return nn_get_tf32() ? g_recompute : 0; }
+/* level 2: also no stored a1 in training. Every block's a1 lives in one shared buffer; backward re-runs conv1 into it
+   (the GN statistics of a1 are kept from the forward) */
+static int recompute_a1(void) { return recompute() >= 2; }
 void unet_set_recompute(int on) { g_recompute = on; }
 #define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute())
 static float *dalloc_grad(unet *u, size_t n) { size_t b = GBF ? n * 2 : n * 4; u->act_bytes += b; u->grad_bytes += b; return nn_malloc(b); }  /* activation-gradient storage */
 
+/* buffers may be shared (gradient buffers across levels, gskip == gout, inference scratch): free each pointer once */
+static void free_once(float **ptrs, int n) {
+    for (int i = 0; i < n; i++) {
+        if (!ptrs[i]) continue;
+        int dup = 0;
+        for (int j = 0; j < i; j++) if (ptrs[j] == ptrs[i]) { dup = 1; break; }
+        if (!dup) nn_free(ptrs[i]);
+    }
+}
 static void free_acts(unet *u) {
-    float *A0 = u->gA[0], *B0 = u->gB[0];   /* shared across levels in tensor-core mode */
+    float *pp[UNET_MAXLEV * 30 + 8]; int np = 0;
     for (int i = 0; i < u->cfg.nlev; i++) {
         block *bs[2] = {&u->enc[i], &u->dec[i]};
         for (int k = 0; k < 2; k++) {
             block *b = bs[k];
-            nn_free(b->a1); nn_free(b->a2); nn_free(b->s2); nn_free(b->m1); nn_free(b->r1); nn_free(b->m2); nn_free(b->r2);
+            float *q[7] = {b->a1, b->a2, b->s2, b->m1, b->r1, b->m2, b->r2};
+            for (int j = 0; j < 7; j++) pp[np++] = q[j];
             b->a1 = b->a2 = b->s2 = b->m1 = b->r1 = b->m2 = b->r2 = nullptr;
         }
-        /* gradient buffers may be shared across levels (gA / gB) or aliased (gskip == gout): free each pointer once */
-        if (u->gskip[i] != u->gout[i]) nn_free(u->gskip[i]);
-        if (i == 0 || u->gA[i] != A0) nn_free(u->gA[i]);
-        if (i == 0 || u->gB[i] != B0) nn_free(u->gB[i]);
-        nn_free(u->downo[i]); nn_free(u->cat[i]); nn_free(u->gout[i]); nn_free(u->t1[i]); nn_free(u->t2[i]);
+        float *q[8] = {u->gskip[i], u->gA[i], u->gB[i], u->downo[i], u->cat[i], u->gout[i], u->t1[i], u->t2[i]};
+        for (int j = 0; j < 8; j++) pp[np++] = q[j];
         u->downo[i] = u->cat[i] = u->gskip[i] = u->gout[i] = u->gA[i] = u->gB[i] = u->t1[i] = u->t2[i] = nullptr;
     }
-    nn_free(u->logits); u->logits = nullptr;
-    nn_free(u->conv_scratch); u->conv_scratch = nullptr; u->conv_scratch_n = 0;
+    pp[np++] = u->logits; pp[np++] = u->conv_scratch;
+    free_once(pp, np);
+    u->logits = nullptr; u->conv_scratch = nullptr; u->conv_scratch_n = 0;
     u->built = 0; u->act_bytes = 0; u->grad_bytes = 0;
 }
 
-static void build_block_acts(unet *u, block *b, shape5 xs, int train, int keep_s2) {
+/* a1 / a2: nullptr = allocate, else a shared buffer (inference) */
+static void build_block_acts(unet *u, block *b, shape5 xs, int train, int keep_s2, float *a1, float *a2) {
     b->xs = xs;
     b->ys = xs; b->ys.c = b->c1.cout;
-    size_t n = shape_numel(b->ys);
     int G = G_of(u, b->c1.cout);
-    b->a1 = dalloc_act_s(u, b->ys); b->a2 = dalloc_act_s(u, b->ys); b->s2 = recompute() && !keep_s2 ? nullptr : dalloc_act_s(u, b->ys);
-    (void)n;
+    (void)train;
+    b->a1 = a1 ? a1 : dalloc_act_s(u, b->ys); b->a2 = a2 ? a2 : dalloc_act_s(u, b->ys);
+    b->s2 = recompute() && !keep_s2 ? nullptr : dalloc_act_s(u, b->ys);
     b->m1 = dalloc(u, (size_t)xs.n * G); b->r1 = dalloc(u, (size_t)xs.n * G); b->m2 = dalloc(u, (size_t)xs.n * G); b->r2 = dalloc(u, (size_t)xs.n * G);
 }
+static size_t act_bytes_of(shape5 s) { return act_mx8() ? nn_mx8_bytes(s) : shape_numel(s) * (ABF ? 2 : 4); }
 
 static void build_acts(unet *u, shape5 xs, int train) {
     free_acts(u);
     int L = u->cfg.nlev;
     const int *w = u->cfg.widths;
-    shape5 s = xs;
+    /* inference on the tensor-core path: conv outputs that die within the forward share two scratch buffers. T1 holds
+       every a1 (dead after conv2). T2 holds the down-conv outputs (dead after the next block's conv1) and the a2 that are
+       not kept (decoder; encoder too unless recompute mode, where the encoder a2 are the skips); the upsampled decoder
+       inputs share one buffer. Only the skips and the small upsample sources stay per tensor. */
+    const int share = !train && nn_get_tf32(), rc = recompute();
+    float *T1 = nullptr, *T2 = nullptr, *TC = nullptr;
+    {
+        shape5 s = xs; for (int i = 0; i < L; i++) { u->ls[i] = s; if (i < L - 1) s = nn_conv3d_out_shape(s, w[i], 3, 2); }
+    }
+    if (train && recompute_a1()) {
+        shape5 m1 = u->ls[0]; m1.c = 0;
+        for (int i = 0; i < L; i++) { shape5 y = u->ls[i]; y.c = w[i]; if (act_bytes_of(y) > act_bytes_of(m1)) m1 = y; }
+        T1 = dalloc_act_s(u, m1);
+    }
+    if (share) {
+        shape5 m1 = u->ls[0], m2, mc = u->ls[0]; m1.c = 0; mc.c = 0;
+        for (int i = 0; i < L; i++) { shape5 y = u->ls[i]; y.c = w[i]; if (act_bytes_of(y) > act_bytes_of(m1)) m1 = y; }
+        m2 = m1;
+        for (int i = 0; i < L - 1; i++) { shape5 d = u->ls[i + 1]; d.c = w[i]; if (act_bytes_of(d) > act_bytes_of(m2)) m2 = d; }
+        for (int i = 0; i < L - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > act_bytes_of(mc)) mc = c; }
+        T1 = dalloc_act_s(u, m1); T2 = dalloc_act_s(u, m2); TC = dalloc_act_s(u, mc);
+    }
     for (int i = 0; i < L; i++) {
-        u->ls[i] = s;
-        shape5 bin = s; bin.c = i == 0 ? u->cfg.cin : w[i - 1];
-        build_block_acts(u, &u->enc[i], bin, train, i == L - 1);   /* recompute mode keeps the (small) outputs that get upsampled */
-        if (i < L - 1) {
-            shape5 ds = nn_conv3d_out_shape(s, w[i], 3, 2);
-            u->downo[i] = dalloc_act_s(u, ds);
-            s = ds;
-        }
+        shape5 bin = u->ls[i]; bin.c = i == 0 ? u->cfg.cin : w[i - 1];
+        build_block_acts(u, &u->enc[i], bin, train, i == L - 1, T1, rc ? nullptr : T2);   /* recompute mode keeps the (small) outputs that get upsampled */
+        if (i < L - 1) { shape5 ds = u->ls[i + 1]; ds.c = w[i]; u->downo[i] = share ? T2 : dalloc_act_s(u, ds); }
     }
     for (int i = L - 2; i >= 0; i--) {
         shape5 li = u->ls[i];
-        size_t S = shape_spatial(li);
-        if (!recompute()) { shape5 cs_ = li; cs_.c = nn_get_tf32() ? w[i + 1] : w[i] + w[i + 1]; u->cat[i] = dalloc_act_s(u, cs_); }
-        else if (!train && i == 0) { shape5 cs_ = li; cs_.c = w[1]; u->cat[0] = dalloc_act_s(u, cs_); }   /* inference transient (level 0 is the largest) */
-        (void)S;
+        shape5 cs_ = li; cs_.c = nn_get_tf32() ? w[i + 1] : w[i] + w[i + 1];
+        if (share) u->cat[i] = TC;   /* also the recompute-mode inference transient (rc_tmp) */
+        else if (!rc) u->cat[i] = dalloc_act_s(u, cs_);
         shape5 cin = li; cin.c = w[i] + w[i + 1];
-        build_block_acts(u, &u->dec[i], cin, train, i > 0);
+        build_block_acts(u, &u->dec[i], cin, train, i > 0, T1, T2);
     }
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
     u->logits = dalloc(u, shape_numel(os));
@@ -310,6 +338,14 @@ static nn_gn_t gn_out(const unet *u, const block *b) {
     nn_gn_t g = {P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, G_of(u, b->c2.cout)};
     return g;
 }
+/* accuracy study (env UFSM_FAKEQ = nvfp4 | mxfp4 | mxfp6e2m3 | mxfp6e3m2 | mxfp8): stored activations (conv outputs a1,
+   a2, down-conv outputs, kept block outputs) are rounded in place to that format right after they are produced */
+static int fakeq(void) {
+    static int f = -1;
+    if (f < 0) { const char *e = getenv("UFSM_FAKEQ"); f = !e ? 0 : !strcmp(e, "nvfp4") ? 1 : !strcmp(e, "mxfp4") ? 2 : !strcmp(e, "mxfp6e2m3") ? 3 : !strcmp(e, "mxfp6e3m2") ? 4 : !strcmp(e, "mxfp8") ? 5 : 0; }
+    return nn_get_tf32() ? f : 0;
+}
+#define FQ(p, s) do { if (fakeq()) nn_fake_quant((p), (s), fakeq()); } while (0)
 static void rc_fail(const char *what) { fprintf(stderr, "unet: recompute mode: %s unsupported\n", what); abort(); }
 /* transient buffer for the upsampled decoder input at level i (shape s), typed as activation storage */
 static float *rc_tmp(unet *u, int level, shape5 s, int *reg) {
@@ -344,10 +380,12 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
         }
         else if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1));
         else PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1));
+        FQ(b->a1, b->ys);
         nn_set_conv(1);
         PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, b->m2, b->r2));
         nn_set_conv(-1);
-        if (b->s2) PROF(3, nn_gn_silu_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2));
+        FQ(b->a2, b->ys);
+        if (b->s2) { PROF(3, nn_gn_silu_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2)); FQ(b->s2, b->ys); }
         return;
     }
     PROF(0, nn_conv3d_fwd(x, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1));
@@ -372,6 +410,7 @@ const float *unet_forward(unet *u, const float *x, shape5 xs, int train) {
             nn_set_layer(4 + i);
             if (recompute()) { nn_gn_t g = gn_out(u, &u->enc[i]); int r; PROF(0, r = nn_conv3d_fwd_x(u->enc[i].a2, &g, nullptr, nullptr, 0, u->enc[i].ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i], 0, 0.f, nullptr, nullptr)); if (r) rc_fail("down conv"); }
             else PROF(0, nn_conv3d_fwd(cur, u->enc[i].ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i]));
+            { shape5 ds = u->ls[i + 1]; ds.c = w[i]; FQ(u->downo[i], ds); }
             cur = u->downo[i];
         }
     }
@@ -413,6 +452,19 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     size_t n = shape_numel(b->ys);
     float *A = u->gA[level], *B = u->gB[level], *t1 = u->t1[level], *t2 = u->t2[level];
     float *g = u->g;
+    if (recompute_a1()) {   /* a1 was overwritten by later blocks: re-run conv1 (same kernel and precision as the forward) */
+        nn_set_conv(0);
+        int r;
+        if (b->xb) {
+            const block *x2b = (const block *)b->x2b;
+            nn_gn_t g2 = gn_out(u, x2b);
+            int reg; float *up = rc_up(u, b, level, &reg);
+            PROF(0, r = nn_conv3d_fwd_x(up, nullptr, x2b->a2, &g2, b->c_split, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1, 0, 0.f, nullptr, nullptr));
+            rc_done(up, reg);
+        } else PROF(0, r = nn_conv3d_fwd_x(b->in, nullptr, nullptr, nullptr, 0, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1, 0, 0.f, nullptr, nullptr));
+        if (r) rc_fail("conv1 recompute");
+        FQ(b->a1, b->ys);
+    }
     nn_set_conv(1);   /* precision-policy tag: c2 first, then c1 */
     if (nn_get_tf32()) {   /* fused: no materialised gn / silu activations */
         PROF(3, nn_gn_silu_bwd(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* B = d/d a2 */

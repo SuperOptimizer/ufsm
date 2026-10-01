@@ -2624,3 +2624,63 @@ static double reduce(const float *x, size_t n, float *scratch, int sq) {
 }
 extern "C" double nn_sum(const float *x, size_t n, float *scratch) { return reduce(x, n, scratch, 0); }
 extern "C" double nn_sumsq(const float *x, size_t n, float *scratch) { return reduce(x, n, scratch, 1); }
+
+/* ---- fake quantization of stored activations (accuracy study of narrower storage formats) ----
+   The tensor (activation storage type) is rounded in place to the values a block-scaled format can hold; groups are
+   consecutive channels at one voxel. fmt: 1 NVFP4 (e2m1, e4m3 scale per 16, fp32 tensor scale), 2 MXFP4 (e2m1, ue8m0 per
+   32), 3 MXFP6 e2m3, 4 MXFP6 e3m2, 5 MXFP8 e4m3 (ue8m0 per 32). */
+__device__ __forceinline__ float fq_round(float x, int mbits, int emin, float maxv) {   /* round to nearest on the grid */
+    float a = fabsf(x);
+    if (a == 0.f) return 0.f;
+    int e; frexpf(a, &e); e -= 1;                       /* a = 1.m * 2^e */
+    if (e < emin) e = emin;
+    float step = ldexpf(1.f, e - mbits);
+    float r = rintf(a / step) * step;
+    return copysignf(fminf(r, maxv), x);
+}
+__device__ __forceinline__ float e4m3_round(float x) { return fq_round(x, 3, -6, 448.f); }
+template <typename T>
+__global__ void fq_amax_k(const T *x, size_t n, unsigned *am) {
+    float m = 0.f;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) m = fmaxf(m, fabsf(ldv(x, i)));
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    if ((threadIdx.x & 31) == 0) atomicMax(am, __float_as_uint(m));
+}
+template <typename T>
+__global__ void fq_k(T *x, int N, int C, size_t S, int fmt, const unsigned *am) {
+    const int gs = fmt == 1 ? 16 : 32, ng = (C + gs - 1) / gs;
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * ng * S) return;
+    size_t v = i % S; int gi = (int)((i / S) % ng), n = (int)(i / (S * ng));
+    T *p = x + ((size_t)n * C + gi * gs) * S + v;
+    const int cn = min(gs, C - gi * gs);
+    float amax = 0.f;
+    for (int k = 0; k < cn; k++) amax = fmaxf(amax, fabsf(ldv(p, (size_t)k * S)));
+    if (amax == 0.f) return;
+    const int mb = fmt <= 2 ? 1 : fmt == 3 ? 3 : fmt == 4 ? 2 : 3, emin = fmt <= 3 ? 0 : fmt == 4 ? -2 : -6;
+    const float qmax = fmt <= 2 ? 6.f : fmt == 3 ? 7.5f : fmt == 4 ? 28.f : 448.f;
+    float sc;
+    if (fmt == 1) {   /* NVFP4: e4m3 block scale relative to the fp32 tensor scale ts = amax_tensor / (6 * 448) */
+        float ts = __uint_as_float(*am) / (6.f * 448.f);
+        if (ts == 0.f) return;
+        sc = e4m3_round(amax / 6.f / ts) * ts;
+        if (sc == 0.f) sc = ldexpf(1.f, -9) * ts;
+    } else {          /* MX: power-of-two scale with amax / scale <= qmax */
+        int e; frexpf(amax / qmax, &e);
+        sc = ldexpf(1.f, (amax / qmax) == ldexpf(1.f, e - 1) ? e - 1 : e);
+    }
+    for (int k = 0; k < cn; k++) { float val = ldv(p, (size_t)k * S); stv(p, (size_t)k * S, fq_round(val / sc, mb, emin, qmax) * sc); }
+}
+extern "C" void nn_fake_quant(void *x, shape5 s, int fmt) {
+    if (fmt <= 0 || ISMX(x)) return;
+    size_t S = shape_spatial(s), n = shape_numel(s);
+    static unsigned *am[8];
+    if (!am[cur_dev()]) cudaMalloc(&am[cur_dev()], 4);
+    cudaMemsetAsync(am[cur_dev()], 0, 4);
+    const int gs = fmt == 1 ? 16 : 32;
+    size_t nt = (size_t)s.n * ((s.c + gs - 1) / gs) * S;
+    if (ABF && g_h16) { fq_amax_k<f16><<<512, 256>>>((const f16 *)x, n, am[cur_dev()]); fq_k<f16><<<nblk(nt, 256), 256>>>((f16 *)x, s.n, s.c, S, fmt, am[cur_dev()]); }
+    else if (ABF) { fq_amax_k<bf16><<<512, 256>>>((const bf16 *)x, n, am[cur_dev()]); fq_k<bf16><<<nblk(nt, 256), 256>>>((bf16 *)x, s.n, s.c, S, fmt, am[cur_dev()]); }
+    else { fq_amax_k<float><<<512, 256>>>((const float *)x, n, am[cur_dev()]); fq_k<float><<<nblk(nt, 256), 256>>>((float *)x, s.n, s.c, S, fmt, am[cur_dev()]); }
+    KCHECK();
+}
