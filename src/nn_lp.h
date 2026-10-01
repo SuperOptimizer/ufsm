@@ -27,6 +27,9 @@ void lp_gn_silu_bwd_mx(const void *x, shape5 s, int G, const float *gamma, const
                        const void *gy, void *gx, int gdt, double *ds, float *st, float *AB);
 void lp_gn_silu_bwd_apply_mx(const void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                              const void *gy, void *gx, int gdt, const float *AB);
+void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y);
+void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx);
+void lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum);
 const char *lp_check(void);
 void lp_f32_to_bf16(const float *x, size_t n, void *y);   /* test helpers */
 void lp_bf16_to_f32(const void *x, size_t n, float *y);

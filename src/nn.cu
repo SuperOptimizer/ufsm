@@ -963,7 +963,7 @@ static int conv_fwd_tc_h(const void *x, int xbf, shape5 xs, const float *w, cons
    ts != nullptr: parity-decomposed stride-2 backward-data (x = gy on its own grid, output scattered into gx) */
 static int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts = nullptr) {
     if (!ts && (ISMX(x) || ISMX(y))) {   /* MX-fp8 activation storage: fp8 compute, staged by copy */
-        if (!ISMX(x) || !ISMX(y) || (sp.x2 && !ISMX(sp.x2))) { fprintf(stderr, "conv: MX-fp8 storage needs MX input and output\n"); abort(); }
+        if (!ISMX(x) || !ISMX(y) || (sp.x2 && !ISMX(sp.x2)) || (sp.y2 && !ISMX(sp.y2))) { fprintf(stderr, "conv: MX-fp8 storage needs MX inputs and outputs\n"); abort(); }
         return lp_conv_fwd_f8(x, 3, xs, w, b, cout, y, 3, gp, osum, Go, sp);
     }
     const int pr = eff_prec();
@@ -1128,8 +1128,12 @@ static void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs
         flip_w_k<<<nblk(nw, 256), 256>>>(w, scratch, ys.c, xs.c, T);
         /* gy has shape ys; treat it as input with ys.c channels, "cout" = xs.c. Spatial sizes equal for stride 1 / pad k/2. */
         if (k == 3 && g_tf32) { gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0}; split_t ns = {nullptr, 0, nullptr, 0, accum}; conv_fwd_tc(gy, GBF, ys, scratch, nullptr, xs.c, gx, GBF, none, nullptr, 0, ns); }
+        else if (k == 1 && g_tf32 && ISMX(gx)) lp_conv1_to_mx(gy, ISMX(gy) ? 3 : LPDT(GBF), xs.n, ys.c, shape_spatial(xs), scratch, xs.c, gx);   /* head: logit gradient -> MX gout */
         else if (k == 1 && GBF) { size_t S = shape_spatial(xs); if (g_h16) conv1_f_k<f16, f16><<<nblk((size_t)xs.n * S, 256), 256>>>((const f16 *)gy, scratch, nullptr, (f16 *)gx, xs.n, ys.c, xs.c, S); else conv1_f_k<bf16, bf16><<<nblk((size_t)xs.n * S, 256), 256>>>((const bf16 *)gy, scratch, nullptr, (bf16 *)gx, xs.n, ys.c, xs.c, S); }
         else { int save = g_actbf; g_actbf = 0; nn_conv3d_fwd(gy, ys, scratch, nullptr, xs.c, k, 1, gx); g_actbf = save; }
+    } else if (stride == 2 && k == 3 && g_tf32 && (ISMX(gy) || ISMX(gx))) {   /* MX gradients: direct voxel-major kernel, accumulate in MX */
+        if (!ISMX(gy) || !ISMX(gx)) { fprintf(stderr, "bwd_data s2: MX gradient storage needs MX gy and gx\n"); abort(); }
+        lp_bwd_data_s2_mx(gy, ys, w, xs, gx, accum);
     } else if (stride == 2 && k == 3 && g_tf32 && !getenv("UFSM_S2DIL") && !(xs.d & 1) && !(xs.h & 1) && !(xs.w & 1)) {
         /* parity decomposition: gx[2m + p] = sum over the taps compatible with parity p of w . gy[m + d]; each of the
            8 parity classes is a stride-1 conv on the gy grid with 1..8 taps (27 total: no wasted MACs) */
@@ -1407,7 +1411,7 @@ static void launch_bwd_w_tc_h(const void *x, int xbf, shape5 xs, const void *gy,
     else launch_bwd_w_tc_t<float, float, HT>((const float *)x, xs, (const float *)gy, ys, gw, gb, gp, sp);
 }
 static void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
-    if (ISMX(x)) { lp_bwd_w_f8(x, 3, xs, gy, LPDT(gybf), ys, gw, gb, gp, sp); return; }
+    if (ISMX(x)) { lp_bwd_w_f8(x, 3, xs, gy, ISMX(gy) ? 3 : LPDT(gybf), ys, gw, gb, gp, sp); return; }
     if (eff_prec_w() == 2 || eff_prec_w() == 3) { lp_bwd_w_f8(x, LPDT(xbf), xs, gy, LPDT(gybf), ys, gw, gb, gp, sp); return; }   /* prec 4 (fp16) keeps the 16-bit kernel for the weight gradient */
     if (g_h16) launch_bwd_w_tc_h<f16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
     else launch_bwd_w_tc_h<bf16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
@@ -1590,7 +1594,7 @@ extern "C" void nn_conv3d_bwd_weight(const float *x, shape5 xs, const float *gy,
         KCHECK();
         return;
     }
-    if (k == 3 && stride == 2 && g_tf32 && ISMX(x)) { lp_bwd_w_s2_f8(x, 3, xs, gy, LPDT(GBF), ys, gw, gb); KCHECK(); return; }
+    if (k == 3 && stride == 2 && g_tf32 && ISMX(x)) { lp_bwd_w_s2_f8(x, 3, xs, gy, ISMX(gy) ? 3 : LPDT(GBF), ys, gw, gb); KCHECK(); return; }
     if (k == 1 && stride == 1 && g_tf32 && ISMX(x)) {
         lp_bwd_w1_mx(x, xs, gy, LPDT(GBF), ys, gw);
         size_t So1 = shape_spatial(ys);
@@ -1818,10 +1822,12 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
         int NC = s.n * s.c;
         double *ds = gn_dsums((size_t)2 * NC);
         float *AB = scratch + 2 * NC;
-        lp_gn_silu_bwd_mx(x, s, G, gamma, beta, mean, rstd, gy, gx, LPDT(GBF), ds, scratch, AB);
+        const int gdt = ISMX(gy) ? 3 : LPDT(GBF);
+        if ((gdt == 3) != (ISMX(gx) != 0)) { fprintf(stderr, "gn_silu_bwd: gy and gx must share the MX storage\n"); abort(); }
+        lp_gn_silu_bwd_mx(x, s, G, gamma, beta, mean, rstd, gy, gx, gdt, ds, scratch, AB);
         d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
         gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB);
-        lp_gn_silu_bwd_apply_mx(x, s, G, gamma, beta, mean, rstd, gy, gx, LPDT(GBF), AB);
+        lp_gn_silu_bwd_apply_mx(x, s, G, gamma, beta, mean, rstd, gy, gx, gdt, AB);
         gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
         KCHECK();
         return;
@@ -2364,6 +2370,7 @@ extern "C" void nn_up2_fwd_into(const float *x, shape5 xs, float *y, int ctot, i
 }
 extern "C" void nn_up2_fwd(const float *x, shape5 xs, float *y) { nn_up2_fwd_into(x, xs, y, xs.c, 0); }
 extern "C" void nn_up2_bwd(const float *gy, shape5 xs, float *gx) {
+    if (ISMX(gy)) { if (!ISMX(gx)) { fprintf(stderr, "up2_bwd: MX gy needs an MX gx\n"); abort(); } lp_up2_bwd_mx(gy, xs, gx); KCHECK(); return; }
     dim3 grid(nblk(xs.w, 8), nblk(xs.h, 8), (unsigned)(nblk(xs.d, 4) * xs.n * xs.c));
     if (GBF && g_h16) up2_b_k<f16, f16><<<grid, 256>>>((const f16 *)gy, (f16 *)gx, xs.n * xs.c, xs.d, xs.h, xs.w);
     else if (GBF) up2_b_k<bf16, bf16><<<grid, 256>>>((const bf16 *)gy, (bf16 *)gx, xs.n * xs.c, xs.d, xs.h, xs.w);

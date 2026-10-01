@@ -165,6 +165,10 @@ static float *dalloc_act(unet *u, size_t n) { size_t b = ABF ? n * 2 : n * 4; u-
 static int g_act_mx8 = -1;
 static int act_mx8(void) { if (g_act_mx8 < 0) g_act_mx8 = getenv("UFSM_ACT_MX8") != nullptr; return g_act_mx8 && nn_get_tf32(); }
 void unet_set_act_mx8(int on) { g_act_mx8 = on; }
+static int g_grad_mx8 = -1;   /* MX-fp8 activation gradients (env UFSM_GRAD_MX8=1; needs the MX activations) */
+static int grad_mx8(void) { if (g_grad_mx8 < 0) g_grad_mx8 = getenv("UFSM_GRAD_MX8") != nullptr; return g_grad_mx8 && act_mx8(); }
+void unet_set_grad_mx8(int on) { g_grad_mx8 = on; }
+static float *dalloc_grad_mx(unet *u, size_t bytes) { u->act_bytes += bytes; float *p = nn_malloc(bytes); nn_set_storage(p, bytes, 8); return p; }
 static float *dalloc_act_s(unet *u, shape5 s) {
     if (!act_mx8()) return dalloc_act(u, shape_numel(s));
     size_t b = nn_mx8_bytes(s);
@@ -235,20 +239,25 @@ static void build_acts(unet *u, shape5 xs, int train) {
             /* tensor-core path: A only holds the level width and B the widest of {width, decoder up part, encoder block
                input}; both are block-local, so one pair sized for the largest level serves every level. gout[i] is dead
                once dec[i]'s backward has read it, before that block writes gskip[i]: they share a buffer. */
-            size_t na = 0, nbb = 0;
+            const int gmx = grad_mx8();
+            size_t na = 0, nbb = 0;   /* elements (16-bit / fp32) or bytes (MX) */
             for (int i = 0; i < L; i++) {
                 size_t S = shape_spatial(u->ls[i]);
-                int wb = w[i];
-                if (i < L - 1 && w[i + 1] > wb) wb = w[i + 1];
-                if ((i ? w[i - 1] : u->cfg.cin) > wb) wb = i ? w[i - 1] : u->cfg.cin;
-                if ((size_t)u->ls[i].n * w[i] * S > na) na = (size_t)u->ls[i].n * w[i] * S;
-                if ((size_t)u->ls[i].n * wb * S > nbb) nbb = (size_t)u->ls[i].n * wb * S;
+                int cb[3] = {w[i], i < L - 1 ? w[i + 1] : 0, i ? w[i - 1] : u->cfg.cin};
+                for (int k = 0; k < 3; k++) {   /* B holds each of these tensors at this level */
+                    shape5 sb = u->ls[i]; sb.c = cb[k];
+                    size_t e = !cb[k] ? 0 : gmx ? nn_mx8_bytes(sb) : shape_numel(sb);
+                    if (e > nbb) nbb = e;
+                }
+                shape5 sa = u->ls[i]; sa.c = w[i];
+                size_t e = gmx ? nn_mx8_bytes(sa) : shape_numel(sa);
+                if (e > na) na = e;
             }
-            float *A = dalloc_grad(u, na), *B = dalloc_grad(u, nbb);
+            float *A = gmx ? dalloc_grad_mx(u, na) : dalloc_grad(u, na), *B = gmx ? dalloc_grad_mx(u, nbb) : dalloc_grad(u, nbb);
             for (int i = 0; i < L; i++) {
-                size_t nw = (size_t)u->ls[i].n * w[i] * shape_spatial(u->ls[i]);
+                shape5 so = u->ls[i]; so.c = w[i];
                 u->gA[i] = A; u->gB[i] = B;
-                u->gout[i] = dalloc_grad(u, nw);
+                u->gout[i] = gmx ? dalloc_grad_mx(u, nn_mx8_bytes(so)) : dalloc_grad(u, shape_numel(so));
                 u->gskip[i] = i < L - 1 ? u->gout[i] : nullptr;
             }
         } else
@@ -273,7 +282,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
     }
     u->xin = ABF ? dalloc_act_s(u, xs) : nullptr;
     u->glb = (train && GBF) ? dalloc_grad(u, shape_numel(os)) : nullptr;
-    u->xs = xs; u->built = 1; u->train = train; u->mode = nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8();
+    u->xs = xs; u->built = 1; u->train = train; u->mode = nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8();
 }
 
 size_t unet_activation_bytes(const unet *u) { return u->act_bytes; }
@@ -306,7 +315,7 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
 const float *unet_forward(unet *u, const float *x, shape5 xs, int train) {
     int div = 1 << (u->cfg.nlev - 1);
     if (xs.d % div || xs.h % div || xs.w % div) { fprintf(stderr, "unet: spatial size %dx%dx%d must be divisible by %d\n", xs.d, xs.h, xs.w, div); abort(); }
-    if (!u->built || memcmp(&u->xs, &xs, sizeof xs) || (train && !u->train) || u->mode != nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8()) build_acts(u, xs, train);
+    if (!u->built || memcmp(&u->xs, &xs, sizeof xs) || (train && !u->train) || u->mode != nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8()) build_acts(u, xs, train);
     unet_apply_sparse24(u);
     int L = u->cfg.nlev;
     const int *w = u->cfg.widths;

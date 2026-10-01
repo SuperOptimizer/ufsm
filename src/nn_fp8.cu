@@ -114,6 +114,13 @@ __device__ __forceinline__ chan_t make_chan(int ci, int Ci, int Cx, int n, size_
     }
     return c;
 }
+/* element (n, c, v) of an MX tensor with N samples, C channels, S voxels */
+__device__ __forceinline__ float ldmx_e(const void *qv, int N, int C, size_t S, int n, int c, size_t v) {
+    const uint8_t *q = (const uint8_t *)qv;
+    const int bw = mx_bw(C), nb = mx_nb(C);
+    const size_t ri = ((size_t)n * nb + c / bw) * S + v;
+    return dec_e4m3(q[ri * bw + c % bw]) * __uint_as_float((unsigned)q[(size_t)N * nb * S * bw + ri] << 23);
+}
 /* element of a channel at voxel offset off: plane-major types, or MX (decode * 2^(scale - 127)) */
 template <typename T> __device__ __forceinline__ float ldc(const chan_t &c, size_t off) {
     if constexpr (IS_MX8(T)) return dec_e4m3(((const uint8_t *)c.p)[off * c.bw]) * __uint_as_float((unsigned)c.sp[off] << 23);
@@ -167,14 +174,15 @@ __device__ __forceinline__ void mma_f4(float *c, const unsigned *a, const unsign
 }
 
 /* ======================= weights: wq[tap][Cop][Cip] e4m3, ws[tap][Cop][Cip/32] ue8m0 ======================= */
-__global__ void prep_w8_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx = -1, int CxP = 0) {
+__global__ void prep_w8_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx = -1, int CxP = 0, int Ox = -1, int OxP = 0) {
     const int nch = Cip / 32;
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)27 * Cop * nch) return;
-    int ch = (int)(i % nch), co = (int)((i / nch) % Cop), t = (int)(i / ((size_t)nch * Cop));
+    int ch = (int)(i % nch), cop = (int)((i / nch) % Cop), t = (int)(i / ((size_t)nch * Cop));
+    int co = Ox < 0 ? cop : seg_ci(cop, Co, Ox, OxP);   /* padded output row -> real output channel (-1 = padding) */
     float v[32], amax = 0.f;
 #pragma unroll
-    for (int k = 0; k < 32; k++) { int ci = Cx < 0 ? ch * 32 + k : seg_ci(ch * 32 + k, Ci, Cx, CxP); v[k] = (co < Co && ci >= 0 && ci < Ci) ? w[((size_t)co * Ci + ci) * 27 + t] : 0.f; amax = fmaxf(amax, fabsf(v[k])); }
+    for (int k = 0; k < 32; k++) { int ci = Cx < 0 ? ch * 32 + k : seg_ci(ch * 32 + k, Ci, Cx, CxP); v[k] = (co >= 0 && co < Co && ci >= 0 && ci < Ci) ? w[((size_t)co * Ci + ci) * 27 + t] : 0.f; amax = fmaxf(amax, fabsf(v[k])); }
     int e = mx_exp(amax, 1.f / 448.f);
     float m = exp2i(-e);
     uint4 *dst = (uint4 *)(wq + ((size_t)t * Cop + co) * Cip + ch * 32);
@@ -196,9 +204,9 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
     float *cs = (float *)smem_raw;
     if (osum) { __syncthreads(); for (int i = threadIdx.x; i < 2 * BM; i += blockDim.x) cs[i] = 0.f; __syncthreads(); }
     if constexpr (IS_MX8(T)) {   /* MX-fp8 output: per voxel and 32- (16-) channel block, amax over the block's rows (lanes g, h, m) */
-        const int bw = mx_bw(Co), nb = mx_nb(Co), MB = bw / 16;
         const size_t S = (size_t)D * H * W;
-        uint8_t *q = (uint8_t *)y, *scp = q + (size_t)N * nb * S * bw;
+        const int OxP = sp.y2 ? (sp.o_split + 31) / 32 * 32 : Co;
+        uint8_t *q = (uint8_t *)y;
 #pragma unroll
         for (int r = 0; r < NR; r++) {
             const int oz = oz0 + wz * RZ + (r >> 1), oy = oy0 + wr + (r & 1);
@@ -210,7 +218,11 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                     const bool ok = oz < D && oy < H && ox < W;
 #pragma unroll
                     for (int j = 0; j < MT; j++) {
-                        if (j * 16 % bw) continue;              /* j = first m-tile of a block */
+                        /* the tensor and block of this 16-row tile: split outputs are stored as two MX tensors whose padded
+                           channel segments (OxP = pad32(o_split)) start at row 0 and OxP */
+                        const int cp = co0 + j * 16, sec = sp.y2 && cp >= OxP, Ct = !sp.y2 ? Co : sec ? Co - sp.o_split : sp.o_split;
+                        const int cl = sec ? cp - OxP : cp, bwt = mx_bw(Ct), MBt = bwt / 16;
+                        if (cl % bwt || cl >= Ct) continue;    /* not the first tile of a block, or pure padding */
                         float val[2][2], am = 0.f;
 #pragma unroll
                         for (int mm = 0; mm < 2; mm++)
@@ -218,21 +230,22 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                             for (int h = 0; h < 2; h++) {
                                 const int m = j + mm, co = co0 + m * 16 + g + 8 * h;
                                 float v = 0.f;
-                                if (mm < MB && m < MT) v = acc[m < MT ? m : 0][r][q2][2 * h + vv] + (b && co < Co ? b[co] : 0.f);
+                                if (mm < MBt && m < MT) v = acc[m < MT ? m : 0][r][q2][2 * h + vv] + (b && !sp.y2 && co < Co ? b[co] : 0.f);
                                 val[mm][h] = v; am = fmaxf(am, fabsf(v));
                             }
                         am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 4)); am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 8)); am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 16));
                         const int e = mx_exp(am, 1.f / 448.f);
                         const float mult = exp2i(-e);
                         if (ok) {
-                            const int blk = (co0 + j * 16) / bw;
+                            const int blk = cl / bwt, nbt = mx_nb(Ct);
+                            uint8_t *qt = sec ? (uint8_t *)sp.y2 : q, *st = qt + (size_t)N * nbt * S * bwt;
                             const size_t v = ((size_t)oz * H + oy) * W + ox;
-                            uint8_t *dst = q + (((size_t)n * nb + blk) * S + v) * bw;
+                            uint8_t *dst = qt + (((size_t)n * nbt + blk) * S + v) * bwt;
 #pragma unroll
                             for (int mm = 0; mm < 2; mm++)
 #pragma unroll
-                                for (int h = 0; h < 2; h++) if (mm < MB) dst[mm * 16 + g + 8 * h] = cvt_e4m3(val[mm][h] * mult);
-                            if (g == 0) scp[((size_t)n * nb + blk) * S + v] = (uint8_t)(e + 127);
+                                for (int h = 0; h < 2; h++) if (mm < MBt) dst[mm * 16 + g + 8 * h] = cvt_e4m3(val[mm][h] * mult);
+                            if (g == 0) st[((size_t)n * nbt + blk) * S + v] = (uint8_t)(e + 127);
                         }
                     }
                 }
@@ -580,14 +593,17 @@ template <typename T> static void fwd_f8_t(const void *x, shape5 xs, const float
     }
     int Cop = (cout + 15) / 16 * 16, Cip = (xs.c + 31) / 32 * 32;
     int Cx = sp.x2 ? sp.c_split : xs.c, CxP = (Cx + 31) / 32 * 32;
-    if (IS_MX8(T)) {   /* MX output blocks of 32 channels need 32-row-aligned m-tiles; MX inputs: per-tensor 32-channel segments */
-        if (cout > 16) Cop = (cout + 31) / 32 * 32;
+    int Ox = sp.y2 ? sp.o_split : cout, OxP = (Ox + 31) / 32 * 32;
+    if (IS_MX8(T)) {   /* MX output blocks of 32 channels need 32-row-aligned m-tiles (split outputs: per-tensor segments);
+                          MX inputs: per-tensor 32-channel segments */
+        if (sp.y2) Cop = OxP + (cout - Ox + 31) / 32 * 32;
+        else if (cout > 16) Cop = (cout + 31) / 32 * 32;
         Cip = CxP + (xs.c - Cx + 31) / 32 * 32;
     }
     int nch = Cip / 32;
     uint8_t *wq = lp_buf<uint8_t>(0, (size_t)27 * Cop * Cip), *ws = lp_buf<uint8_t>(1, (size_t)27 * Cop * nch);
     size_t nt = (size_t)27 * Cop * nch;
-    if (IS_MX8(T)) prep_w8_k<<<nblk_(nt, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, Cip, Cx, CxP);
+    if (IS_MX8(T)) prep_w8_k<<<nblk_(nt, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, Cip, Cx, CxP, sp.y2 ? Ox : -1, OxP);
     else prep_w8_k<<<nblk_(nt, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, Cip);
     int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : 1;   /* BM = 16 MT must divide Cop (Cop = 48 -> MT = 1) */
     int nmt = Cop / (MT * 16);
@@ -610,7 +626,7 @@ static int lp_dtype_check(const char *fn, int xbf, int ybf) {
 }
 extern "C" int lp_conv_fwd_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp) {
     int dt = lp_dtype_check("lp_conv_fwd_f8", xbf, ybf);
-    if (dt == 3) { if (sp.y2 || sp.accum) { fprintf(stderr, "lp_conv_fwd_f8: MX-fp8 storage with split output / accumulate is not supported\n"); abort(); } fwd_f8_t<mx8_t>(x, xs, w, b, cout, y, gp, osum, Go, sp); }
+    if (dt == 3) { if (sp.accum) { fprintf(stderr, "lp_conv_fwd_f8: MX-fp8 storage with accumulate is not supported\n"); abort(); } fwd_f8_t<mx8_t>(x, xs, w, b, cout, y, gp, osum, Go, sp); }
     else if (dt == 2) fwd_f8_t<__half>(x, xs, w, b, cout, y, gp, osum, Go, sp);
     else if (dt) fwd_f8_t<bf16>(x, xs, w, b, cout, y, gp, osum, Go, sp);
     else fwd_f8_t<float>(x, xs, w, b, cout, y, gp, osum, Go, sp);
@@ -716,9 +732,15 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
             int co = co0 + c, oz = oz0 + vz, oy = oy0 + vy, ox = ox0 + vx;
             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
             if (co < Co && oz < D && oy < H) {
+                if constexpr (IS_MX8(TG)) {
+                    const size_t vo = ((size_t)oz * H + oy) * W + ox, Sg = (size_t)D * H * W;
+                    if (ox < W) v.x = ldmx_e(gy, N, Co, Sg, n, co, vo); if (ox + 1 < W) v.y = ldmx_e(gy, N, Co, Sg, n, co, vo + 1);
+                    if (ox + 2 < W) v.z = ldmx_e(gy, N, Co, Sg, n, co, vo + 2); if (ox + 3 < W) v.w = ldmx_e(gy, N, Co, Sg, n, co, vo + 3);
+                } else {
                 const TG *src = gy + (((size_t)n * Co + co) * D + oz) * H * W + (size_t)oy * W + ox;
                 if (vec) { if (ox < W) v = ldx4<TG>(src); }
                 else { if (ox < W) v.x = ldx(src, 0); if (ox + 1 < W) v.y = ldx(src, 1); if (ox + 2 < W) v.z = ldx(src, 2); if (ox + 3 < W) v.w = ldx(src, 3); }
+                }
             }
             float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))), sm = (v.x + v.y) + (v.z + v.w);
 #pragma unroll
@@ -809,7 +831,8 @@ template <typename T, typename TG> static void bwd_w_f8_t(const void *x, shape5 
     }
 }
 extern "C" int lp_bwd_w_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
-    if (xbf == 3 && gybf == 2) bwd_w_f8_t<mx8_t, __half>(x, xs, (const __half *)gy, ys, gw, gb, gp, sp);
+    if (xbf == 3 && gybf == 3) bwd_w_f8_t<mx8_t, mx8_t>(x, xs, (const mx8_t *)gy, ys, gw, gb, gp, sp);
+    else if (xbf == 3 && gybf == 2) bwd_w_f8_t<mx8_t, __half>(x, xs, (const __half *)gy, ys, gw, gb, gp, sp);
     else if (xbf == 3 && gybf == 1) bwd_w_f8_t<mx8_t, bf16>(x, xs, (const bf16 *)gy, ys, gw, gb, gp, sp);
     else if (xbf == 3) bwd_w_f8_t<mx8_t, float>(x, xs, (const float *)gy, ys, gw, gb, gp, sp);
     else if (xbf == 2 && gybf) bwd_w_f8_t<__half, __half>(x, xs, (const __half *)gy, ys, gw, gb, gp, sp);
@@ -1254,9 +1277,15 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
             int co = co0 + c, oz = oz0 + vz, oy = oy0 + vy, ox = ox0 + vx;
             float4 vv = make_float4(0.f, 0.f, 0.f, 0.f);
             if (co < Co && oz < Do && oy < Ho) {
+                if constexpr (IS_MX8(TG)) {
+                    const size_t vo = ((size_t)oz * Ho + oy) * Wo + ox, Sg = (size_t)Do * Ho * Wo;
+                    if (ox < Wo) vv.x = ldmx_e(gy, N, Co, Sg, n, co, vo); if (ox + 1 < Wo) vv.y = ldmx_e(gy, N, Co, Sg, n, co, vo + 1);
+                    if (ox + 2 < Wo) vv.z = ldmx_e(gy, N, Co, Sg, n, co, vo + 2); if (ox + 3 < Wo) vv.w = ldmx_e(gy, N, Co, Sg, n, co, vo + 3);
+                } else {
                 const TG *src = gy + (((size_t)n * Co + co) * Do + oz) * Ho * Wo + (size_t)oy * Wo + ox;
                 if (vec) { if (ox < Wo) vv = ldx4<TG>(src); }
                 else { if (ox < Wo) vv.x = ldx(src, 0); if (ox + 1 < Wo) vv.y = ldx(src, 1); if (ox + 2 < Wo) vv.z = ldx(src, 2); if (ox + 3 < Wo) vv.w = ldx(src, 3); }
+                }
             }
             float amax = fmaxf(fmaxf(fabsf(vv.x), fabsf(vv.y)), fmaxf(fabsf(vv.z), fabsf(vv.w))), sm = (vv.x + vv.y) + (vv.z + vv.w);
 #pragma unroll
@@ -1337,7 +1366,8 @@ template <typename T, typename TG> static void bwd_w_s2_f8_t(const void *x, shap
     }
 }
 extern "C" int lp_bwd_w_s2_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb) {
-    if (xbf == 3 && gybf == 2) bwd_w_s2_f8_t<mx8_t, __half>(x, xs, (const __half *)gy, ys, gw, gb);
+    if (xbf == 3 && gybf == 3) bwd_w_s2_f8_t<mx8_t, mx8_t>(x, xs, (const mx8_t *)gy, ys, gw, gb);
+    else if (xbf == 3 && gybf == 2) bwd_w_s2_f8_t<mx8_t, __half>(x, xs, (const __half *)gy, ys, gw, gb);
     else if (xbf == 3 && gybf == 1) bwd_w_s2_f8_t<mx8_t, bf16>(x, xs, (const bf16 *)gy, ys, gw, gb);
     else if (xbf == 3) bwd_w_s2_f8_t<mx8_t, float>(x, xs, (const float *)gy, ys, gw, gb);
     else if (xbf == 2 && gybf) bwd_w_s2_f8_t<__half, __half>(x, xs, (const __half *)gy, ys, gw, gb);
@@ -1527,8 +1557,11 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, 
     __syncthreads();
     const uint8_t *sc = x + (size_t)N * nb * S * bw;
     for (int blk = 0; blk < nb; blk++) {
-        float r[32];
-        if (v < S) mx_load_row(x, sc, ((size_t)n * nb + blk) * S + v, bw, r);
+        float r[32], gr[32];
+        if (v < S) {
+            mx_load_row(x, sc, ((size_t)n * nb + blk) * S + v, bw, r);
+            if constexpr (IS_MX8(TG)) mx_load_row((const uint8_t *)gy, (const uint8_t *)gy + (size_t)N * nb * S * bw, ((size_t)n * nb + blk) * S + v, bw, gr);
+        }
         for (int k = 0; k < bw; k++) {
             int c = blk * bw + k;
             if (c >= C) break;
@@ -1536,7 +1569,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, 
             if (v < S) {
                 int ng = n * G + c / cpg;
                 float xhat = (r[k] - mean[ng]) * rstd[ng], u = xhat * gamma[c] + beta[c], sg = 1.f / (1.f + __expf(-u));
-                a = ldx(gy, ((size_t)n * C + c) * S + v) * (sg * (1.f + u * (1.f - sg)));
+                a = (IS_MX8(TG) ? gr[k] : ldx(gy, ((size_t)n * C + c) * S + v)) * (sg * (1.f + u * (1.f - sg)));
                 axh = a * xhat;
             }
             for (int o = 16; o; o >>= 1) { a += __shfl_xor_sync(0xffffffff, a, o); axh += __shfl_xor_sync(0xffffffff, axh, o); }
@@ -1556,8 +1589,12 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx_k(const uint8_t *x, 
     const uint8_t *sc = x + (size_t)N * nb * S * bw;
     const float len = (float)cpg * (float)S;
     for (int blk = 0; blk < nb; blk++) {
-        float r[32];
-        mx_load_row(x, sc, ((size_t)n * nb + blk) * S + v, bw, r);
+        float r[32], gr[32], out[32];
+        const size_t ri = ((size_t)n * nb + blk) * S + v;
+        mx_load_row(x, sc, ri, bw, r);
+        if constexpr (IS_MX8(TG)) mx_load_row((const uint8_t *)gy, (const uint8_t *)gy + (size_t)N * nb * S * bw, ri, bw, gr);
+#pragma unroll
+        for (int k = 0; k < 32; k++) out[k] = 0.f;
         for (int k = 0; k < bw; k++) {
             int c = blk * bw + k;
             if (c >= C) break;
@@ -1565,9 +1602,11 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx_k(const uint8_t *x, 
             float m = mean[ng], rs = rstd[ng], ga = gamma[c];
             float xhat = (r[k] - m) * rs, u = xhat * ga + beta[c], sg = 1.f / (1.f + __expf(-u));
             size_t o = ((size_t)n * C + c) * S + v;
-            float a = ldx(gy, o) * (sg * (1.f + u * (1.f - sg)));
-            stx(gx, o, rs * (a * ga - AB[2 * ng] / len - xhat * AB[2 * ng + 1] / len));
+            float a = (IS_MX8(TG) ? gr[k] : ldx(gy, o)) * (sg * (1.f + u * (1.f - sg)));
+            float gv = rs * (a * ga - AB[2 * ng] / len - xhat * AB[2 * ng + 1] / len);
+            if constexpr (IS_MX8(TO)) out[k] = gv; else stx(gx, o, gv);
         }
+        if constexpr (IS_MX8(TO)) mx_store_row((uint8_t *)gx, (uint8_t *)gx + (size_t)N * nb * S * bw, ri, bw, out);
     }
 }
 extern "C" void lp_gn_silu_bwd_mx(const void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
@@ -1577,7 +1616,8 @@ extern "C" void lp_gn_silu_bwd_mx(const void *x, shape5 s, int G, const float *g
     int NC = s.n * s.c, nbp = (int)((S + 255) / 256);
     if (s.c > 160) { fprintf(stderr, "lp_gn_silu_bwd_mx: C %d > 160\n", s.c); abort(); }
     cudaMemsetAsync(ds, 0, (size_t)2 * NC * sizeof(double));
-    if (gdt == 2) gn_silu_bwd_stats_mx_k<__half><<<s.n * nbp, 256>>>((const uint8_t *)x, (const __half *)gy, gamma, beta, mean, rstd, s.n, s.c, G, S, ds);
+    if (gdt == 3) gn_silu_bwd_stats_mx_k<mx8_t><<<s.n * nbp, 256>>>((const uint8_t *)x, (const mx8_t *)gy, gamma, beta, mean, rstd, s.n, s.c, G, S, ds);
+    else if (gdt == 2) gn_silu_bwd_stats_mx_k<__half><<<s.n * nbp, 256>>>((const uint8_t *)x, (const __half *)gy, gamma, beta, mean, rstd, s.n, s.c, G, S, ds);
     else if (gdt == 1) gn_silu_bwd_stats_mx_k<bf16><<<s.n * nbp, 256>>>((const uint8_t *)x, (const bf16 *)gy, gamma, beta, mean, rstd, s.n, s.c, G, S, ds);
     else gn_silu_bwd_stats_mx_k<float><<<s.n * nbp, 256>>>((const uint8_t *)x, (const float *)gy, gamma, beta, mean, rstd, s.n, s.c, G, S, ds);
     (void)st; (void)AB;
@@ -1586,8 +1626,129 @@ extern "C" void lp_gn_silu_bwd_mx(const void *x, shape5 s, int G, const float *g
 extern "C" void lp_gn_silu_bwd_apply_mx(const void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                         const void *gy, void *gx, int gdt, const float *AB) {
     size_t S = shape_spatial(s), n = (size_t)s.n * S;
-    if (gdt == 2) gn_silu_bwd_apply_mx_k<__half, __half><<<nblk_(n, 256), 256>>>((const uint8_t *)x, (const __half *)gy, gamma, beta, mean, rstd, AB, (__half *)gx, s.n, s.c, G, S);
+    if (gdt == 3) gn_silu_bwd_apply_mx_k<mx8_t, mx8_t><<<nblk_(n, 256), 256>>>((const uint8_t *)x, (const mx8_t *)gy, gamma, beta, mean, rstd, AB, (mx8_t *)gx, s.n, s.c, G, S);
+    else if (gdt == 2) gn_silu_bwd_apply_mx_k<__half, __half><<<nblk_(n, 256), 256>>>((const uint8_t *)x, (const __half *)gy, gamma, beta, mean, rstd, AB, (__half *)gx, s.n, s.c, G, S);
     else if (gdt == 1) gn_silu_bwd_apply_mx_k<bf16, bf16><<<nblk_(n, 256), 256>>>((const uint8_t *)x, (const bf16 *)gy, gamma, beta, mean, rstd, AB, (bf16 *)gx, s.n, s.c, G, S);
     else gn_silu_bwd_apply_mx_k<float, float><<<nblk_(n, 256), 256>>>((const uint8_t *)x, (const float *)gy, gamma, beta, mean, rstd, AB, (float *)gx, s.n, s.c, G, S);
+    LPCK();
+}
+
+/* 1^3 conv with a plane-major input (dtype gdt) and an MX output (head backward-data: logit gradient -> gout) */
+template <typename TG>
+__global__ void conv1_to_mx_k(const TG *x, const float *w, uint8_t *y, int N, int Ci, int Co, size_t S) {
+    const int bw = mx_bw(Co), nb = mx_nb(Co);
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * nb * S) return;
+    size_t v = i % S; int blk = (int)((i / S) % nb), n = (int)(i / (S * nb));
+    float xi[8], r[32];
+    for (int ci = 0; ci < Ci && ci < 8; ci++) xi[ci] = ldx(x, ((size_t)n * Ci + ci) * S + v);
+#pragma unroll
+    for (int k = 0; k < 32; k++) {
+        int co = blk * bw + k; float a = 0.f;
+        if (k < bw && co < Co) for (int ci = 0; ci < Ci && ci < 8; ci++) a += w[co * Ci + ci] * xi[ci];
+        r[k] = a;
+    }
+    mx_store_row(y, y + (size_t)N * nb * S * bw, i, bw, r);
+}
+extern "C" void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y) {
+    if (Ci > 8) { fprintf(stderr, "lp_conv1_to_mx: Ci %d > 8\n", Ci); abort(); }
+    size_t n = (size_t)N * mx_nb(Co) * S;
+    if (gdt == 2) conv1_to_mx_k<__half><<<nblk_(n, 256), 256>>>((const __half *)x, w, (uint8_t *)y, N, Ci, Co, S);
+    else if (gdt == 1) conv1_to_mx_k<bf16><<<nblk_(n, 256), 256>>>((const bf16 *)x, w, (uint8_t *)y, N, Ci, Co, S);
+    else conv1_to_mx_k<float><<<nblk_(n, 256), 256>>>((const float *)x, w, (uint8_t *)y, N, Ci, Co, S);
+    LPCK();
+}
+
+/* ---- MX backward of the exact-2x trilinear upsample: gx[m] = sum over fine outputs o in [2m - 1, 2m + 2] (per axis) of
+   coef(o, m) gy[o], coef as in the forward (0.75 for in[o/2], 0.25 for the clamped neighbour) ---- */
+__device__ __forceinline__ float upc(int o, int m, int n_in) {
+    if (o < 0 || o >= 2 * n_in) return 0.f;
+    int m0 = o >> 1, m1 = (o & 1) ? min(m0 + 1, n_in - 1) : max(m0 - 1, 0);
+    return (m == m0 ? 0.75f : 0.f) + (m == m1 ? 0.25f : 0.f);
+}
+__global__ void up2_bwd_mx_k(const uint8_t *gy, uint8_t *gx, int N, int C, int D, int H, int W) {   /* D, H, W: coarse (gx) grid */
+    const int bw = mx_bw(C), nb = mx_nb(C), Do = 2 * D, Ho = 2 * H, Wo = 2 * W;
+    const size_t S = (size_t)D * H * W, So = (size_t)Do * Ho * Wo;
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * nb * S) return;
+    size_t v = i % S, nbk = i / S;
+    int x = (int)(v % W), y = (int)((v / W) % H), z = (int)(v / ((size_t)W * H));
+    const uint8_t *sc = gy + (size_t)N * nb * So * bw;
+    float acc[32] = {};
+#pragma unroll 1
+    for (int a = 0; a < 4; a++) {
+        int oz = 2 * z - 1 + a; float wz = upc(oz, z, D); if (wz == 0.f) continue;
+#pragma unroll 1
+        for (int bb = 0; bb < 4; bb++) {
+            int oy = 2 * y - 1 + bb; float wy = upc(oy, y, H); if (wy == 0.f) continue;
+#pragma unroll 1
+            for (int c = 0; c < 4; c++) {
+                int ox = 2 * x - 1 + c; float wx = upc(ox, x, W); if (wx == 0.f) continue;
+                float r[32], w3 = wz * wy * wx;
+                mx_load_row(gy, sc, nbk * So + ((size_t)oz * Ho + oy) * Wo + ox, bw, r);
+#pragma unroll
+                for (int k = 0; k < 32; k++) acc[k] += w3 * r[k];
+            }
+        }
+    }
+    mx_store_row(gx, gx + (size_t)N * nb * S * bw, i, bw, acc);
+}
+extern "C" void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx) {
+    size_t n = (size_t)xs.n * mx_nb(xs.c) * shape_spatial(xs);
+    up2_bwd_mx_k<<<nblk_(n, 256), 256>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, xs.c, xs.d, xs.h, xs.w); LPCK();
+}
+/* ---- MX stride-2 backward-data (k = 3, pad 1): gx[ci][u] (+)= sum over the taps k with (u + 1 - k) even, o = (u + 1 - k) / 2
+   in range, of sum_co w[co][ci][k] gy[co][o]. Thread = (n, ci block, gx voxel); weights from shared memory when they fit. */
+template <int WS>
+__global__ void __launch_bounds__(128) bwd_data_s2_mx_k(const uint8_t *gy, const float *w, uint8_t *gx, int N, int Ci, int Co,
+                                                       int D, int H, int W, int Do, int Ho, int Wo, int accum) {
+    extern __shared__ float sw[];
+    const int bwx = mx_bw(Ci), nbx = mx_nb(Ci), bwy = mx_bw(Co), nby = mx_nb(Co);
+    const size_t S = (size_t)D * H * W, So = (size_t)Do * Ho * Wo;
+    if (WS) { for (int i = threadIdx.x; i < Co * Ci * 27; i += blockDim.x) sw[i] = w[i]; __syncthreads(); }
+    const float *wt = WS ? sw : w;
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * nbx * S) return;
+    size_t v = i % S; int blk = (int)((i / S) % nbx), n = (int)(i / (S * nbx));
+    int ux = (int)(v % W), uy = (int)((v / W) % H), uz = (int)(v / ((size_t)W * H));
+    int kz[2], oz[2], nz = 0, ky[2], oy[2], ny = 0, kx[2], ox[2], nx = 0;
+    for (int k = 0; k < 3; k++) {
+        int t;
+        t = uz + 1 - k; if (!(t & 1) && t >= 0 && (t >> 1) < Do) { kz[nz] = k; oz[nz++] = t >> 1; }
+        t = uy + 1 - k; if (!(t & 1) && t >= 0 && (t >> 1) < Ho) { ky[ny] = k; oy[ny++] = t >> 1; }
+        t = ux + 1 - k; if (!(t & 1) && t >= 0 && (t >> 1) < Wo) { kx[nx] = k; ox[nx++] = t >> 1; }
+    }
+    float acc[32] = {};
+    const uint8_t *scy = gy + (size_t)N * nby * So * bwy;
+#pragma unroll 1
+    for (int a = 0; a < nz; a++) for (int bb = 0; bb < ny; bb++) for (int c = 0; c < nx; c++) {
+        const int tap = (kz[a] * 3 + ky[bb]) * 3 + kx[c];
+        const size_t vo = ((size_t)oz[a] * Ho + oy[bb]) * Wo + ox[c];
+        for (int yb = 0; yb < nby; yb++) {
+            float r[32];
+            mx_load_row(gy, scy, ((size_t)n * nby + yb) * So + vo, bwy, r);
+            for (int k = 0; k < bwy; k++) {
+                const int co = yb * bwy + k;
+                if (co >= Co) break;
+                const float g = r[k];
+                const float *wr = wt + ((size_t)co * Ci + blk * bwx) * 27 + tap;
+#pragma unroll
+                for (int cc = 0; cc < 32; cc++) if (cc < bwx && blk * bwx + cc < Ci) acc[cc] += wr[cc * 27] * g;
+            }
+        }
+    }
+    const uint8_t *scx = gx + (size_t)N * nbx * S * bwx;
+    if (accum) {
+        float r[32];
+        mx_load_row(gx, scx, i, bwx, r);
+#pragma unroll
+        for (int k = 0; k < 32; k++) acc[k] += r[k];
+    }
+    mx_store_row(gx, gx + (size_t)N * nbx * S * bwx, i, bwx, acc);
+}
+extern "C" void lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum) {
+    size_t n = (size_t)xs.n * mx_nb(xs.c) * shape_spatial(xs), wb = (size_t)ys.c * xs.c * 27 * sizeof(float);
+    if (wb <= 48 * 1024) bwd_data_s2_mx_k<1><<<nblk_(n, 128), 128, wb>>>((const uint8_t *)gy, w, (uint8_t *)gx, xs.n, xs.c, ys.c, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum);
+    else bwd_data_s2_mx_k<0><<<nblk_(n, 128), 128>>>((const uint8_t *)gy, w, (uint8_t *)gx, xs.n, xs.c, ys.c, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum);
     LPCK();
 }

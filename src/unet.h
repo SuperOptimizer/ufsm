@@ -69,3 +69,4 @@ void unet_prof_layers(double out[][3]);    /* [UNET_NSLOT][fwd, bwd_data, bwd_w]
 /* MX-fp8 activation storage (also env UFSM_ACT_MX8=1): every stored activation is channel-blocked e4m3 + ue8m0 scales and
    the convolutions that read them run in fp8; activation gradients keep their storage. Takes effect at the next build. */
 void unet_set_act_mx8(int on);
+void unet_set_grad_mx8(int on);   /* MX-fp8 activation gradients as well (env UFSM_GRAD_MX8=1; requires the MX activations) */
