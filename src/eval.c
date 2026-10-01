@@ -31,7 +31,7 @@ static void dilate(const uint8_t *in, uint8_t *out, const int64_t n[3], int tol)
 
 int cmd_eval(int argc, char **argv) {
     if (argc < 8) {
-        fprintf(stderr, "usage: ufsm eval <pred-root> <pred-group> <label-root> <label-group> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--tol 2] [--pred-origin z,y,x]\n"
+        fprintf(stderr, "usage: ufsm eval <pred-root> <pred-group> <label-root> <label-group> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--tol 2] [--pred-origin z,y,x] [--dump slice.pgm]\n"
                         "  the prediction's origin_zyx (attribute written by predict) is subtracted from label coordinates\n");
         return 2;
     }
@@ -52,6 +52,17 @@ int cmd_eval(int argc, char **argv) {
     uint8_t *p = malloc(nv), *l = malloc(nv);
     int64_t lo[3] = {o[0] + (po[0] >> level), o[1] + (po[1] >> level), o[2] + (po[2] >> level)};
     if (z3_read(pz, o, n, p, 0) || z3_read(lz, lo, n, l, 0)) { fprintf(stderr, "read: %s\n", z3_error()); return 1; }
+    { const char *dp = opt(argc, argv, "--dump", nullptr);   /* middle z slice as a PGM: [CT |] prediction | label (ignore = dark grey) */
+      if (dp) { FILE *f = fopen(dp, "wb"); if (f) {
+        uint8_t *ct = nullptr;   /* optional CT panel: --ct-root R --ct G [--cache DIR] (same level, label coordinates) */
+        const char *cr = opt(argc, argv, "--ct-root", nullptr), *cg = opt(argc, argv, "--ct", nullptr);
+        if (cr && cg) { store *cs = store_open(cr); z3 *cz = cs ? pyramid_open_level(cs, cg, level, um, opt(argc, argv, "--cache", nullptr)) : nullptr;
+            if (cz) { ct = malloc(nv); int64_t co[3] = {lo[0] + n[0] / 2, lo[1], lo[2]}, cn[3] = {1, n[1], n[2]}; if (z3_read(cz, co, cn, ct, 0)) { free(ct); ct = nullptr; } } }
+        fprintf(f, "P5\n%lld %lld\n255\n", (ct ? 3 : 2) * (long long)n[2], (long long)n[1]);
+        size_t z0 = (size_t)(n[0] / 2) * n[1] * n[2];
+        for (int64_t y = 0; y < n[1]; y++) { if (ct) fwrite(ct + (size_t)y * n[2], 1, (size_t)n[2], f); fwrite(p + z0 + (size_t)y * n[2], 1, (size_t)n[2], f);
+            for (int64_t x = 0; x < n[2]; x++) { uint8_t v = l[z0 + (size_t)y * n[2] + x]; fputc(v == 255 ? 48 : v >= 127 ? 255 : 0, f); } }
+        fclose(f); fprintf(stderr, "dumped z=%lld slice to %s\n", (long long)(n[0] / 2), dp); } } }
     /* valid voxels: label not ignore */
     size_t nvalid = 0, npos = 0;
     for (size_t i = 0; i < nv; i++) { if (l[i] != 255) { nvalid++; npos += l[i] >= 127; } }
