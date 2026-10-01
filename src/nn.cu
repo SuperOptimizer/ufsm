@@ -514,7 +514,10 @@ __host__ __device__ constexpr int fw_blocks_z(int MT, int FZ) { return FZ == FW_
    type (exact) while tracking the block amax, then converted in place to fp16 scaled by 2^-ex (amax < 16); weights are
    fp16 scaled per output channel (wsc, amax < 16), so a 144-term group sum stays below 36864 < 65504. Each group's fp16
    sum is folded into the fp32 accumulators times 2^ex * wsc[co]. */
-template <int MT, typename TI, typename TO, int S2B, typename HT, int OP = 0, int FZ = FW_TZ>
+/* XP = 1 (Ci <= 4, plain input): x-shift packing. Staged channel slot k holds input channel k % 4 shifted by k / 4 columns,
+   so one K = 16 MMA covers the taps kx = 0..2 of 4 channels (weights wp[kz * 3 + ky][co][kx * 4 + c], kx = 3 zero):
+   9 tap rows instead of 27 padded taps. */
+template <int MT, typename TI, typename TO, int S2B, typename HT, int OP = 0, int FZ = FW_TZ, int XP = 0>
 __global__ void __launch_bounds__(fw_nth_z(MT, FZ), fw_blocks_z(MT, FZ)) conv_fwd_tc_k(const TI *__restrict__ x, const HT *__restrict__ wp, const float *__restrict__ b, TO *__restrict__ y,
                               int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, gnp_t gp, double *__restrict__ osum, int Go, split_t sp, tapset_t ts,
                               const float *__restrict__ wsc = nullptr) {
@@ -566,6 +569,20 @@ __global__ void __launch_bounds__(fw_nth_z(MT, FZ), fw_blocks_z(MT, FZ)) conv_fw
     for (int ci0 = 0; ci0 < Cip; ci0 += TC_CI) {
         float amax = 0.f;
         if (OP && threadIdx.x == 0) s_amax = 0u;
+        if constexpr (XP) {   /* x-shift packing: slot k = (shift k / 4, channel k % 4) */
+            const int k = threadIdx.x & 15, c = k & 3, sh = k >> 2;
+            const bool cok = c < Ci && sh < 3;
+            const TI *xc = x + ((size_t)n * Ci + (cok ? c : 0)) * plane;
+            for (int rr = threadIdx.x >> 4; rr < (FZ + 2) * 10; rr += NTH / 16) {
+                int iz = rr / 10, iy = rr - iz * 10;
+                int gz = oz0 - 1 + iz, gyy = oy0 - 1 + iy;
+                HT *dst = sx + (size_t)rr * 18 * TC_CI + k;
+                const bool rok = cok && gz >= 0 && gz < D && gyy >= 0 && gyy < H;
+                const TI *xr = xc + ((size_t)(rok ? gz : 0) * H + (rok ? gyy : 0)) * W;
+#pragma unroll
+                for (int j = 0; j < 18; j++) { const int col = ox0 - 1 + j + sh; dst[j * TC_CI] = f2h<HT>(rok && col >= 0 && col < W ? ldv(xr, col) : 0.f); }
+            }
+        } else
         {   /* row-wise staging: lane k = ci, 16 lanes share a row; a thread converts a whole 18-element row (vector loads) */
             const int k = threadIdx.x & 15, ci = ci0 + k;
             const bool cok = ci < Ci;
@@ -625,7 +642,7 @@ __global__ void __launch_bounds__(fw_nth_z(MT, FZ), fw_blocks_z(MT, FZ)) conv_fw
             amax = ldexpf(1.f, ex);                            /* reuse: tile scale 2^ex for the fold */
         }
         __syncthreads();
-        const int NTAP = S2B ? ts.ntap : 27;
+        const int NTAP = XP ? 9 : S2B ? ts.ntap : 27;
         /* weights of a tap group: [TG tap][BM co][16 ci] 16-bit, loaded 4 ci at a time; for MT <= 2 the two weight
            buffers alternate so group g+1 streams in while group g is being multiplied (one barrier per group) */
         auto load_group = [&](int t0, HT *dst) {
@@ -648,6 +665,27 @@ __global__ void __launch_bounds__(fw_nth_z(MT, FZ), fw_blocks_z(MT, FZ)) conv_fw
 #pragma unroll
                 for (int m = 0; m < MT; m++) for (int r = 0; r < R; r++) for (int q = 0; q < 2; q++) hacc[OP ? m : 0][OP ? r : 0][q][0] = hacc[OP ? m : 0][OP ? r : 0][q][1] = 0u;
             }
+            if constexpr (XP) {   /* 9 tap rows (kz, ky); the K slots carry kx = 0..2 */
+#pragma unroll
+                for (int kz = 0; kz < 3; kz++) {
+                    unsigned bf[R + 2][4];
+#pragma unroll
+                    for (int rr = 0; rr < R + 2; rr++) {
+                        int mat = lane >> 3, q = mat >> 1, kh = mat & 1;
+                        int pos = ((wz + kz) * 10 + wr + rr) * 18 + q * 8 + (lane & 7);
+                        ldmatrix_x4(bf[rr], sx + pos * TC_CI + kh * 8);
+                    }
+#pragma unroll
+                    for (int ky = 0; ky < 3; ky++) {
+                        const int tt = kz * 3 + ky;
+                        unsigned af[4];
+                        int mat = lane >> 3;
+                        ldmatrix_x4(af, wg + (tt * BM + (mat & 1) * 8 + (lane & 7)) * TC_CI + (mat >> 1) * 8);
+#pragma unroll
+                        for (int r = 0; r < R; r++) { mma16816<HT>(acc[0][r][0], af, bf[r + ky]); mma16816<HT>(acc[0][r][1], af, bf[r + ky] + 2); }
+                    }
+                }
+            } else
             if constexpr (!S2B) {   /* one kz plane per group: a warp's R rows x 3 ky span R + 2 input rows per kx, loaded once */
                 const int kz = t0 / 9;
 #pragma unroll
@@ -1019,6 +1057,14 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_tc_s2_k(const TI *__restrict_
 }
 
 static int cur_dev(void) { int d = 0; cudaGetDevice(&d); return d & 7; }
+/* x-shift packed weights for XP: wp[kz * 3 + ky][co][kx * 4 + c] (kx = 3 and c >= Ci zero), Cop rows */
+template <typename HT>
+__global__ void prep_wxp_k(const float *w, HT *wp, int Co, int Ci, int Cop) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 9 * Cop * 16) return;
+    int k = i % 16, co = (i / 16) % Cop, t9 = i / (16 * Cop), kx = k >> 2, c = k & 3, kz = t9 / 3, ky = t9 % 3;
+    wp[i] = f2h<HT>(kx < 3 && c < Ci && co < Co ? w[((size_t)co * Ci + c) * 27 + kz * 9 + ky * 3 + kx] : 0.f);
+}
 static void *tc_wbuf(size_t n) { static void *buf[8]; static size_t cap[8]; int d = cur_dev(); if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); cudaMalloc(&buf[d], n * 2); cap[d] = n; } return buf[d]; }
 
 /* Tensor-core path for k=3, stride 1 (same spatial size). Returns 0 if handled. */
@@ -1083,6 +1129,20 @@ static int conv_fwd_tc_h(const void *x, int xbf, shape5 xs, const float *w, cons
     size_t nw = (size_t)27 * Cop * Cip;
     HT *wp = (HT *)tc_wbuf(nw);
     prep_w_k<HT><<<nblk(nw, 256), 256>>>(w, wp, cout, xs.c, Cop, Cip);
+    static int xpe = -1; if (xpe < 0) { const char *e = getenv("UFSM_XPACK"); xpe = e ? atoi(e) : 1; }
+    if (xpe && xs.c <= 4 && Cop == 16 && !ts && !sp.x2 && !sp.y2 && !sp.accum && !sp.up && !gp.G) {   /* tiny input (the network input): x-shift packing */
+        prep_wxp_k<HT><<<nblk(9 * 16 * 16, 256), 256>>>(w, wp, cout, xs.c, 16);
+        const int tz = 4;
+        dim3 grid(nblk(xs.w, 16), nblk(xs.h, TC_TY), (unsigned)(nblk(xs.d, tz) * xs.n));
+        size_t smem = fw_smem(1, tz);
+        static int at[8]; if (!at[cur_dev()]) { cudaFuncSetAttribute((const void *)conv_fwd_tc_k<1, HT, HT, 0, HT, 0, 4, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_fwd_tc_k<1, float, HT, 0, HT, 0, 4, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); at[cur_dev()] = 1; }
+        tapset_t nt = {};
+        if (xbf && ybf) conv_fwd_tc_k<1, HT, HT, 0, HT, 0, 4, 1><<<grid, fw_nth_z(1, 4), smem>>>((const HT *)x, wp, b, (HT *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, 16, 16, gp, osum, Go, sp, nt);
+        else if (!xbf && ybf) conv_fwd_tc_k<1, float, HT, 0, HT, 0, 4, 1><<<grid, fw_nth_z(1, 4), smem>>>((const float *)x, wp, b, (HT *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, 16, 16, gp, osum, Go, sp, nt);
+        else goto plain;
+        return 0;
+    }
+plain:
     int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : 1;   /* BM = 16 MT must divide Cop (e.g. Cop = 48 -> MT = 1) */
     int nmt = Cop / (MT * 16);
     const int tz = fw_tz(MT);
