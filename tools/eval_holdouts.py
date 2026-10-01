@@ -33,6 +33,8 @@ def main():
                "--window", "288", "--halo", "16", "--shard", "256", "--gpu", gpu, "--levels", "1"]
         if cache:
             cmd += ["--cache", cache]
+        if os.environ.get("UFSM_PREDICT_ARGS"):   # e.g. "--prec 3" for fp4 inference
+            cmd += os.environ["UFSM_PREDICT_ARGS"].split()
         if "axis" in s:
             cmd += ["--axis", s["axis"]]
         print("==", name, "box", box, flush=True)

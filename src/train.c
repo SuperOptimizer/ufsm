@@ -111,7 +111,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
 int cmd_train(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 96] [--B 2] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
-                        "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--resume CKPT]\n"
+                        "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--resume CKPT] [--finetune 1]\n"
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1]\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  env UFSM_PROF=1 prints per-op GPU time every log interval (category 'upload+loss+opt').\n");
@@ -176,6 +176,7 @@ int cmd_train(int argc, char **argv) {
         if (nn_init(d->dev)) { fprintf(stderr, "cannot select GPU %d\n", d->dev); return 1; }
         d->u = unet_create(&cfg);
         if (resume) { step0 = unet_load(d->u, resume); if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; } }
+        if (resume && atoi(opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* weights from the checkpoint, fresh schedule (QAT / low-precision fine-tuning) */
         else unet_init(d->u, seed + 1);                   /* deterministic: every GPU starts identical */
         if (wq) unet_set_wq(d->u, wq);
         for (int i = 0; i < 2; i++) { d->xb[i] = nn_malloc((size_t)B * 4 * p3 * xbytes()); d->tb[i] = nn_malloc((size_t)B * NCH * p3); d->mb[i] = nn_malloc((size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * NCH); d->ev_up[i] = nn_event_create(); }

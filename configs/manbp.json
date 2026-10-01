@@ -1,0 +1,28 @@
+{
+ "cache": "/vesuvius/ufsm/cache",
+ "sources": [
+  {
+   "name": "PHercMANBp-hf",
+   "root": "https://dl.ash2txt.org/community-uploads/forrest/volcomp",
+   "ct": "PHercMANBp/volumes/20251216152116-2.399um-0.2m-78keV-masked.zarr",
+   "um": 2.399,
+   "targets": {
+    "recto": {
+     "root": "/vesuvius/ufsm/gt/labels/PHercMANBp-ct-2um_surface.zarr",
+     "group": "."
+    }
+   },
+   "weight": 1.0,
+   "trust_band": 8,
+   "holdout": [
+    11264,
+    8192,
+    8192,
+    1024,
+    1024,
+    1024
+   ],
+   "axis": "/vesuvius/ufsm/gt/axis/PHercMANBp.json"
+  }
+ ]
+}
