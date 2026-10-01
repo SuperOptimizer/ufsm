@@ -136,6 +136,15 @@ def main():
         if ax:
             s["axis"] = ax
     cfg = {"cache": CACHE, "sources": srcs}
+    # unique names (eval_holdouts keys its output directories by name): suffix repeats with the CT scan id
+    seen = {}
+    for s in srcs:
+        seen.setdefault(s["name"], []).append(s)
+    for name, group in seen.items():
+        if len(group) > 1:
+            for s in group:
+                scan = os.path.basename(s["ct"]).split("-")[0]
+                s["name"] = f"{name}-{scan}"
     json.dump(cfg, open(out, "w"), indent=1)
     print(f"{len(srcs)} sources -> {out}", file=sys.stderr)
     for s in srcs:
