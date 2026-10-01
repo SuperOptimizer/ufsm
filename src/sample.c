@@ -23,7 +23,6 @@ static void rseed(rng *r, uint64_t seed) {
 }
 static double runif(rng *r) { return (double)(rnext(r) >> 11) * 0x1.0p-53; }
 static int64_t rint_below(rng *r, int64_t n) { return n <= 1 ? 0 : (int64_t)(runif(r) * (double)n); }
-static double rnorm(rng *r) { double u = runif(r) + 1e-300, v = runif(r); return sqrt(-2 * log(u)) * cos(6.283185307179586 * v); }
 
 sample_cfg sample_cfg_default(void) {
     sample_cfg c = {0};
@@ -78,6 +77,7 @@ static int sym_is_rotation(sym y) {
 
 #define APPLY_SYM(T, name)                                                                        \
     static void name(const T *in, T *out, int P, sym y) {                                         \
+        if (y.perm[0] == 0 && y.perm[1] == 1 && !y.flip[0] && !y.flip[1] && !y.flip[2]) { memcpy(out, in, (size_t)P * P * P * sizeof(T)); return; } \
         int64_t stride[3] = {(int64_t)P * P, P, 1};                                                \
         for (int z = 0; z < P; z++)                                                               \
             for (int yy = 0; yy < P; yy++)                                                        \
@@ -88,7 +88,6 @@ static int sym_is_rotation(sym y) {
                     out[((int64_t)z * P + yy) * P + x] = in[q];                                   \
                 }                                                                                 \
     }
-APPLY_SYM(float, sym_f32)
 APPLY_SYM(uint8_t, sym_u8)
 
 /* ---- sampler ---- */
@@ -118,7 +117,7 @@ static size_t P3(const sampler *sp) { return (size_t)sp->cfg.P * sp->cfg.P * sp-
 static batch alloc_batch(const sample_cfg *c) {
     size_t p3 = (size_t)c->P * c->P * c->P;
     batch b;
-    b.x = nn_host_alloc((size_t)c->B * 4 * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
+    b.x = c->xfmt ? nullptr : nn_host_alloc((size_t)c->B * 4 * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
     b.x16 = c->xfmt ? nn_host_alloc((size_t)c->B * 4 * p3 * 2) : nullptr;
     b.t = nn_host_alloc((size_t)c->B * NCH * p3);
     b.m = nn_host_alloc((size_t)c->B * p3);
@@ -129,7 +128,7 @@ static batch alloc_batch(const sample_cfg *c) {
     return b;
 }
 
-static void free_batch(batch *b) { nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->corner); }
+static void free_batch(batch *b) { if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->corner); }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -163,45 +162,101 @@ static const char *prof_names[PS_N] = {"src", "level", "pick", "probe", "ctread"
 /* 3-4-5 chamfer distance (3 per voxel step) from the voxels of t that are annotated surface (0 < t < 255): two raster
    passes. Returns 0 (dm all CH_INF) when the patch has no surface. */
 #define CH_INF 60000
+static inline uint16_t mn16(uint16_t a, uint16_t b) { return a < b ? a : b; }
+/* one raster pass (dir +1 forward, -1 backward). Per row, the neighbours in the previous row and the previous plane are
+   final for the pass, so they are folded in for the whole row at once (vectorisable); the in-row dependency is then a
+   scalar scan. Same result as visiting the voxels in raster order. */
+static void chamfer_pass(uint16_t *dm, int P, int dir) {
+    const size_t P2 = (size_t)P * P;
+    for (int zi = 0; zi < P; zi++) {
+        const int z = dir > 0 ? zi : P - 1 - zi, zp = z - dir;
+        for (int yi = 0; yi < P; yi++) {
+            const int y = dir > 0 ? yi : P - 1 - yi, yp = y - dir;
+            uint16_t *row = dm + (size_t)z * P2 + (size_t)y * P;
+            /* (row, weight face / edge) pairs: previous row of this plane (3, 4); previous plane rows y (3, 4), y-1 and y+1 (4, 5) */
+            const uint16_t *nb[4] = {nullptr, nullptr, nullptr, nullptr}; uint16_t wf[4] = {3, 3, 4, 4}, we[4] = {4, 4, 5, 5};
+            if (yp >= 0 && yp < P) nb[0] = dm + (size_t)z * P2 + (size_t)yp * P;
+            if (zp >= 0 && zp < P) {
+                nb[1] = dm + (size_t)zp * P2 + (size_t)y * P;
+                if (y > 0) nb[2] = nb[1] - P;
+                if (y + 1 < P) nb[3] = nb[1] + P;
+            }
+            for (int q = 0; q < 4; q++) {
+                const uint16_t *r = nb[q]; if (!r) continue;
+                const uint16_t f = wf[q], e = we[q];
+                row[0] = mn16(row[0], r[0] + f); if (P > 1) row[0] = mn16(row[0], r[1] + e);
+                for (int x = 1; x < P - 1; x++) { uint16_t v = row[x]; v = mn16(v, r[x] + f); v = mn16(v, r[x - 1] + e); v = mn16(v, r[x + 1] + e); row[x] = v; }
+                if (P > 1) { row[P - 1] = mn16(row[P - 1], r[P - 1] + f); row[P - 1] = mn16(row[P - 1], r[P - 2] + e); }
+            }
+            if (dir > 0) for (int x = 1; x < P; x++) row[x] = mn16(row[x], row[x - 1] + 3);
+            else for (int x = P - 2; x >= 0; x--) row[x] = mn16(row[x], row[x + 1] + 3);
+        }
+    }
+}
 static int chamfer345(const uint8_t *t, uint16_t *dm, int P) {
-    size_t p3 = (size_t)P * P * P, P2 = (size_t)P * P; int any = 0;
+    size_t p3 = (size_t)P * P * P; int any = 0;
     for (size_t k = 0; k < p3; k++) { int s = t[k] != 255 && t[k] > 0; dm[k] = s ? 0 : CH_INF; any |= s; }
     if (!any) return 0;
-#define MINU(v, e) do { uint16_t e_ = (uint16_t)(e); if (e_ < (v)) (v) = e_; } while (0)
-    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
-        uint16_t *row = dm + (size_t)z * P2 + (size_t)y * P;
-        const uint16_t *ry = y ? row - P : nullptr, *rz = z ? row - P2 : nullptr, *rzm = (z && y) ? row - P2 - P : nullptr, *rzp = (z && y + 1 < P) ? row - P2 + P : nullptr;
-        for (int x = 0; x < P; x++) {
-            uint16_t v = row[x]; if (!v) continue;
-            int xm = x > 0, xp = x + 1 < P;
-            if (xm) MINU(v, row[x - 1] + 3);
-            if (ry) { MINU(v, ry[x] + 3); if (xm) MINU(v, ry[x - 1] + 4); if (xp) MINU(v, ry[x + 1] + 4); }
-            if (rz) { MINU(v, rz[x] + 3); if (xm) MINU(v, rz[x - 1] + 4); if (xp) MINU(v, rz[x + 1] + 4);
-                      if (rzm) { MINU(v, rzm[x] + 4); if (xm) MINU(v, rzm[x - 1] + 5); if (xp) MINU(v, rzm[x + 1] + 5); }
-                      if (rzp) { MINU(v, rzp[x] + 4); if (xm) MINU(v, rzp[x - 1] + 5); if (xp) MINU(v, rzp[x + 1] + 5); } }
-            row[x] = v;
-        }
-    }
-    for (int z = P - 1; z >= 0; z--) for (int y = P - 1; y >= 0; y--) {
-        uint16_t *row = dm + (size_t)z * P2 + (size_t)y * P;
-        const uint16_t *ry = y + 1 < P ? row + P : nullptr, *rz = z + 1 < P ? row + P2 : nullptr, *rzm = (z + 1 < P && y) ? row + P2 - P : nullptr, *rzp = (z + 1 < P && y + 1 < P) ? row + P2 + P : nullptr;
-        for (int x = P - 1; x >= 0; x--) {
-            uint16_t v = row[x]; if (!v) continue;
-            int xm = x > 0, xp = x + 1 < P;
-            if (xp) MINU(v, row[x + 1] + 3);
-            if (ry) { MINU(v, ry[x] + 3); if (xm) MINU(v, ry[x - 1] + 4); if (xp) MINU(v, ry[x + 1] + 4); }
-            if (rz) { MINU(v, rz[x] + 3); if (xm) MINU(v, rz[x - 1] + 4); if (xp) MINU(v, rz[x + 1] + 4);
-                      if (rzm) { MINU(v, rzm[x] + 4); if (xm) MINU(v, rzm[x - 1] + 5); if (xp) MINU(v, rzm[x + 1] + 5); }
-                      if (rzp) { MINU(v, rzp[x] + 4); if (xm) MINU(v, rzp[x - 1] + 5); if (xp) MINU(v, rzp[x + 1] + 5); } }
-            row[x] = v;
-        }
-    }
-#undef MINU
+    chamfer_pass(dm, P, 1);
+    chamfer_pass(dm, P, -1);
     return 1;
 }
-#define GTAB 4096
-static void gtab_fill(rng *r, float *tab) { for (int k = 0; k < GTAB; k++) tab[k] = (float)rnorm(r); }
-static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, const float *gtab) {
+/* per-voxel Gaussian noise: 65536 N(0,1) quantiles (Acklam's inverse normal CDF), indexed by 16 random bits */
+static float g_ntab[65536];
+static pthread_once_t g_ntab_once = PTHREAD_ONCE_INIT;
+static double inv_ncdf(double p) {
+    static const double a[] = {-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00};
+    static const double b[] = {-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01};
+    static const double c[] = {-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00};
+    static const double d[] = {7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00};
+    if (p < 0.02425) { double q = sqrt(-2 * log(p)); return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1); }
+    if (p > 1 - 0.02425) { double q = sqrt(-2 * log(1 - p)); return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1); }
+    double q = p - 0.5, t = q * q;
+    return (((((a[0] * t + a[1]) * t + a[2]) * t + a[3]) * t + a[4]) * t + a[5]) * q / (((((b[0] * t + b[1]) * t + b[2]) * t + b[3]) * t + b[4]) * t + 1);
+}
+static void ntab_init(void) { for (int i = 0; i < 65536; i++) g_ntab[i] = (float)inv_ncdf((i + 0.5) / 65536.0); }
+static inline uint16_t bf16_rn(float f) { uint32_t u; memcpy(&u, &f, 4); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
+/* The network input of one patch in one pass: channel 0 = z-scored CT with the intensity jitter (gain ia, offset ib,
+   noise isg N(0,1)), channels 1..3 = the radial unit vector (source z component 0), all read through the cube
+   symmetry y (output axis d reads source axis perm[d], reversed when flipped; vector channel 1 + d = (-1)^flip[d] *
+   source component perm[d]). cyz / cxz: axis centre per source z. Output fp32 X (xfmt 0) or 16-bit H (1 fp16,
+   2 bf16). One rng draw per 4 voxels, as the old separate jitter pass. nrow: P floats of scratch. */
+static void write_x(const uint8_t *ctu, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
+                    sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H) {
+    pthread_once(&g_ntab_once, ntab_init);
+    const size_t p3 = (size_t)P * P * P;
+    const float sgn[3] = {y.flip[0] ? -1.f : 1.f, y.flip[1] ? -1.f : 1.f, y.flip[2] ? -1.f : 1.f};
+    for (int z = 0; z < P; z++)
+        for (int yy = 0; yy < P; yy++) {
+            const int io[3] = {z, yy, 0};
+            int s0[3], ds[3] = {0, 0, 0};
+            for (int d = 0; d < 3; d++) s0[y.perm[d]] = y.flip[d] ? P - 1 - io[d] : io[d];
+            ds[y.perm[2]] = y.flip[2] ? -1 : 1;   /* the source coordinate that moves with output x */
+            if (jitter) {
+                for (int x = 0; x + 4 <= P; x += 4) { uint64_t u = rnext(r); nrow[x] = g_ntab[u & 0xffff]; nrow[x + 1] = g_ntab[(u >> 16) & 0xffff]; nrow[x + 2] = g_ntab[(u >> 32) & 0xffff]; nrow[x + 3] = g_ntab[u >> 48]; }
+                for (int x = P & ~3; x < P; x++) nrow[x] = g_ntab[rnext(r) & 0xffff];
+            }
+            const size_t ko = ((size_t)z * P + yy) * P;
+            for (int x = 0; x < P; x++) {
+                const int sz_ = s0[0] + ds[0] * x, sy_ = s0[1] + ds[1] * x, sx_ = s0[2] + ds[2] * x;
+                const size_t q = ((size_t)sz_ * P + sy_) * P + sx_;
+                float v0 = ((float)ctu[q] - fmean) * fisd;
+                if (jitter) v0 = ia * v0 + ib + isg * nrow[x];
+                float comp[3] = {0.f, 0.f, 0.f};
+                if (hasax) {
+                    const float dyv = (float)(o[1] + sy_) - cyz[sz_], dxv = (float)(o[2] + sx_) - cxz[sz_];
+                    const float inv = 1.f / (sqrtf(dyv * dyv + dxv * dxv) + 1e-6f);
+                    comp[1] = dyv * inv; comp[2] = dxv * inv;
+                }
+                const float v1 = sgn[0] * comp[y.perm[0]], v2 = sgn[1] * comp[y.perm[1]], v3 = sgn[2] * comp[y.perm[2]];
+                const size_t k = ko + x;
+                if (xfmt == 1) { _Float16 h0 = (_Float16)v0, h1 = (_Float16)v1, h2 = (_Float16)v2, h3 = (_Float16)v3; memcpy(&H[k], &h0, 2); memcpy(&H[p3 + k], &h1, 2); memcpy(&H[2 * p3 + k], &h2, 2); memcpy(&H[3 * p3 + k], &h3, 2); }
+                else if (xfmt == 2) { H[k] = bf16_rn(v0); H[p3 + k] = bf16_rn(v1); H[2 * p3 + k] = bf16_rn(v2); H[3 * p3 + k] = bf16_rn(v3); }
+                else { X[k] = v0; X[p3 + k] = v1; X[2 * p3 + k] = v2; X[3 * p3 + k] = v3; }
+            }
+        }
+}
+static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big) {
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
     const int P = c->P;
@@ -370,64 +425,31 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         for (size_t k = 0; k < p3; k++) { uint8_t v = dst[k]; if (v == 255) { ign[k] = 1; dst[k] = 0; } else dst[k] = (uint8_t)((v * 255 + 127) / 254); }
     }
     PROF_MARK(PS_ENCODE);
-    /* z-score + radial into xtmp (4 channels) */
+    /* input channels (z-scored CT, radial unit vector) written in one pass straight into the batch with the symmetry
+       and the jitter applied on the way (16-bit when cfg.xfmt, else fp32): no fp32 intermediates */
     double mean = sum / (double)p3, var = sq / (double)p3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
-    float *xc = xtmp, *rz_ = xtmp + p3, *ry = xtmp + 2 * p3, *rx = xtmp + 3 * p3;
     double scale = (double)(1 << l);
-    for (int z = 0; z < P; z++) {
-        double cy, cx;
-        axis_at(&s->ax, (double)(o[0] + z) * scale, &cy, &cx);
-        cy /= scale; cx /= scale;
-        const float fm = (float)mean, isd = (float)(1.0 / sd), dx0 = (float)((double)o[2] - cx);   /* float per voxel: the offsets are small */
-        const int axis = s->ax.n > 0;
-        for (int y = 0; y < P; y++) {
-            float dy = (float)((double)(o[1] + y) - cy);
-            size_t row = ((size_t)z * P + y) * P;
-            float *xcr = xc + row, *ryr = ry + row, *rxr = rx + row; const uint8_t *cr = ctu + row;
-            for (int x = 0; x < P; x++) xcr[x] = ((float)cr[x] - fm) * isd;
-            memset(rz_ + row, 0, (size_t)P * sizeof(float));
-            if (axis) for (int x = 0; x < P; x++) { float dx = dx0 + (float)x, inv = 1.f / (sqrtf(dy * dy + dx * dx) + 1e-6f); ryr[x] = dy * inv; rxr[x] = dx * inv; }
-            else { memset(ryr, 0, (size_t)P * sizeof(float)); memset(rxr, 0, (size_t)P * sizeof(float)); }
-        }
-    }
+    float *cyz = xtmp, *cxz = xtmp + P, *nrow = xtmp + 2 * P;
+    for (int z = 0; z < P; z++) { double cy, cx; axis_at(&s->ax, (double)(o[0] + z) * scale, &cy, &cx); cyz[z] = (float)(cy / scale); cxz[z] = (float)(cx / scale); }
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
     for (size_t k = 0; k < p3; k++) mask[k] = ctu[k] != 0 && !mask[k];
     PROF_MARK(PS_ZSCORE);
-    /* augment: symmetry (permute/flip cube, rotate the radial vector) + intensity */
-    float *X = b->x + (size_t)i * 4 * p3;
     uint8_t *T = b->t + (size_t)i * NCH * p3, *M = b->m + (size_t)i * p3;
+    sym y = sym_of(0);
+    float ia = 1.f, ib = 0.f, isg = 0.f;
     if (c->augment) {
-        sym y = sym_of((int)rint_below(r, 48));
+        y = sym_of((int)rint_below(r, 48));
         if (c->augment == 4) y = sym_of(0);   /* intensity jitter only */
         if (c->augment == 2) while (!sym_is_rotation(y)) y = sym_of((int)rint_below(r, 48));   /* rotations only */
         if (c->augment == 3) { y = sym_of((int)rint_below(r, 48)); while (y.perm[0] != 0 || y.flip[0]) y = sym_of((int)rint_below(r, 48)); }   /* z fixed: y/x swaps and flips only */
-        sym_f32(xc, X, P, y);
-        /* vector channels: output axis d takes input axis perm[d], negated when flipped */
-        for (int d = 0; d < 3; d++) {
-            sym_f32(xtmp + (size_t)(1 + y.perm[d]) * p3, X + (size_t)(1 + d) * p3, P, y);
-            if (y.flip[d]) for (size_t k = 0; k < p3; k++) X[(size_t)(1 + d) * p3 + k] = -X[(size_t)(1 + d) * p3 + k];
-        }
-        for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y);
-        sym_u8(mask, M, P, y);
         double a = exp((runif(r) * 2 - 1) * 0.22), bb = (runif(r) * 2 - 1) * 0.2, sg = runif(r) * 0.1;
-        {   /* intensity jitter: gain, offset and Gaussian noise from a per-worker table (no log / cos per voxel) */
-            float af = (float)a, bf = (float)bb, sf = (float)sg; uint64_t st = 0;
-            for (size_t k = 0; k < p3; k++) {
-                if ((k & 3) == 0) st = rnext(r);
-                X[k] = af * X[k] + bf + sf * gtab[(st >> (16 * (k & 3))) & (GTAB - 1)];
-            }
-        }
-    } else {
-        memcpy(X, xtmp, 4 * p3 * sizeof(float));
-        memcpy(T, ttmp, NCH * p3);
-        memcpy(M, mask, p3);
+        ia = (float)a; ib = (float)bb; isg = (float)sg;
     }
+    for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y);
+    sym_u8(mask, M, P, y);
     PROF_MARK(PS_AUGMENT);
-    if (b->x16) {   /* 16-bit copy for the upload: fp16 (round to nearest, F16C) or bf16 (round to nearest even) */
-        uint16_t *H = b->x16 + (size_t)i * 4 * p3;
-        if (c->xfmt == 1) { for (size_t k = 0; k < 4 * p3; k++) { _Float16 h = (_Float16)X[k]; memcpy(&H[k], &h, 2); } }
-        else for (size_t k = 0; k < 4 * p3; k++) { uint32_t u; memcpy(&u, &X[k], 4); u += 0x7fffu + ((u >> 16) & 1u); H[k] = (uint16_t)(u >> 16); }
-    }
+    write_x(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
+            c->xfmt ? nullptr : b->x + (size_t)i * 4 * p3, c->xfmt ? b->x16 + (size_t)i * 4 * p3 : nullptr);
     PROF_MARK(PS_X16);
     memcpy(b->w + (size_t)i * NCH, w, NCH);
     b->src[i] = (int16_t)si;
@@ -446,10 +468,9 @@ static void *worker(void *arg) {
     rng r;
     rseed(&r, sp->cfg.seed * 1000003ull + (uint64_t)wa->id);
     size_t p3 = P3(sp);
-    float *xtmp = malloc(4 * p3 * sizeof(float));
+    float *xtmp = malloc(3 * (size_t)sp->cfg.P * sizeof(float));   /* per-z axis centres and a row of noise */
     uint8_t *ttmp = malloc(NCH * p3);
     uint8_t *big = malloc(10 * p3);   /* [0,P^3) CT (also the coarse probe), [P^3, 9P^3) (2P)^3 region scratch, [9P^3, 10P^3) mask */
-    float *gtab = malloc(GTAB * sizeof(float)); gtab_fill(&r, gtab);
     while (!atomic_load(&sp->stop)) {
         pthread_mutex_lock(&sp->mu);
         int k = -1;
@@ -463,7 +484,7 @@ static void *worker(void *arg) {
         batch *b = &sp->slots[k];
         int fail = 0; unsigned spin = 0;
         for (int i = 0; i < sp->cfg.B && !atomic_load(&sp->stop);) {
-            int rc = draw(sp, b, i, &r, xtmp, ttmp, big, gtab);
+            int rc = draw(sp, b, i, &r, xtmp, ttmp, big);
             if (rc == 0) { i++; fail = 0; spin = 0; }
             else if (rc > 0 && ++spin == (1u << 22)) fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d too large for the sources' regions, holdout boxes or levels?)\n", spin, sp->cfg.P);
             else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->stop, 1); } }

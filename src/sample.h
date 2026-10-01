@@ -22,8 +22,8 @@ typedef struct {
 } sample_cfg;
 
 typedef struct {
-    float *x;                /* B x 4 x P^3: z-scored CT, radial z (0), radial y, radial x */
-    uint16_t *x16;           /* the same in 16 bits (cfg.xfmt), else nullptr */
+    float *x;                /* B x 4 x P^3: z-scored CT, radial z (0), radial y, radial x; nullptr when cfg.xfmt */
+    uint16_t *x16;           /* the same in 16 bits when cfg.xfmt (then the only copy), else nullptr */
     uint8_t *t;              /* B x NCH x P^3: target probability * 255 (from the label encoding) */
     uint8_t *m;              /* B x P^3: 1 where CT > 0 and the label is not ignore (loss mask) */
     uint8_t *w;              /* B x NCH: 1 if channel has a teacher in this sample */

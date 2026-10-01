@@ -53,6 +53,10 @@ build/test_mx: tests/test_mx.c build/nn.o build/nn_fp8.o
 
 build/test_unet: tests/test_unet.c build/unet.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+SAMPLE_TEST_OBJ = build/json.o build/store.o build/zarr3.o build/sources.o build/zarr2.o build/tiff.o build/z3w.o build/hf.o build/zipr.o
+build/test_sample_ops: tests/test_sample_ops.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_sample_ops.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
+
 build/bench_sampler: tests/bench_sampler.c build/sample.o build/sources.o build/zarr3.o build/zarr2.o build/store.o build/json.o build/z3w.o build/tiff.o build/zipr.o build/hf.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz
 build/bench_read: tests/bench_read.c build/sample.o build/sources.o build/zarr3.o build/zarr2.o build/store.o build/json.o build/z3w.o build/tiff.o build/zipr.o build/hf.o build/nn.o build/nn_fp8.o
@@ -75,7 +79,8 @@ build/test_json: tests/test_json.c build/json.o
 build:
 	mkdir -p build
 
-test: build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_rc
+test: build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_rc
+	./build/test_sample_ops
 	./build/test_mx
 	./build/test_rc
 	UFSM_FUSED_UP=0 UFSM_F16=1 ./build/test_unet
