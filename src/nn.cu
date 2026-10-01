@@ -2825,6 +2825,84 @@ extern "C" void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk,
     bmuon_apply_k<<<g1, 256>>>(d, swap, lr, wd);
     KCHECK();
 }
+/* ---- ANVIL II (modded-nanogpt record #90, hyperstition.cc): twin-rail Nesterov velocity, 1.05 Frobenius normalisation,
+   six quintic spectral maps, per-row energy equalisation at constant norm (NorMuon), sign-aligned weight decay.
+   Descriptor layout as Muon plus: v1 (slow rail, uses the Muon mom field as v0), E (Co floats lane energy), R (Co floats scratch). */
+typedef struct { float *p; const float *g; float *v0, *X, *Y, *A, *B, *v1, *E, *R; int Co, K; } anvil_desc_t;
+__constant__ float c_anvil_maps[6][3] = {{3.923798038567f, -6.095026865488f, 3.905234618423f}, {3.278126713798f, -3.328923386476f, 0.989127286973f},
+    {3.505298394150f, -5.137358782410f, 1.968325560615f}, {2.815058591845f, -3.685181239622f, 1.417196497642f},
+    {2.245503932403f, -2.443826979899f, 0.963091710461f}, {2.256537145403f, -2.166840097229f, 0.929501253245f}};
+__global__ void anvil_mom_k(const anvil_desc_t *d, float bf, float bs, float w, float mu, double *ss) {
+    const anvil_desc_t D = d[blockIdx.z]; size_t n = (size_t)D.Co * D.K;
+    __shared__ float r[256]; float a = 0.f;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        float g = D.g[i], v0 = D.v0[i] + (1.f - bf) * (g - D.v0[i]), v1 = D.v1[i] + (1.f - bs) * (g - D.v1[i]);
+        D.v0[i] = v0; D.v1[i] = v1;
+        float m = w * v0 + (1.f - w) * v1, x = g + mu * (m - g);
+        D.X[i] = x; a += x * x;
+    }
+    r[threadIdx.x] = a; __syncthreads(); for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) atomicAdd(&ss[blockIdx.z], (double)r[0]);
+}
+__global__ void anvil_scale_k(const anvil_desc_t *d, const double *ss) {
+    const anvil_desc_t D = d[blockIdx.z]; size_t n = (size_t)D.Co * D.K; float inv = (float)(1.0 / (sqrt(ss[blockIdx.z]) * 1.05 + 1e-6));
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.X[i] *= inv;
+}
+__global__ void anvil_xxt_k(const anvil_desc_t *d, int swap) {
+    const anvil_desc_t D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; int Co = D.Co, K = D.K;
+    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x; if (i >= Co || j >= Co) return;
+    const float *a = X + (size_t)i * K, *b = X + (size_t)j * K; float s = 0.f; for (int k = 0; k < K; k++) s += a[k] * b[k];
+    D.A[(size_t)i * Co + j] = s;
+}
+__global__ void anvil_sq_k(const anvil_desc_t *d, int it) {
+    const anvil_desc_t D = d[blockIdx.z]; int Co = D.Co; float b = c_anvil_maps[it][1], c = c_anvil_maps[it][2];
+    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x; if (i >= Co || j >= Co) return;
+    float s = 0.f; for (int k = 0; k < Co; k++) s += D.A[(size_t)i * Co + k] * D.A[(size_t)k * Co + j];
+    D.B[(size_t)i * Co + j] = b * D.A[(size_t)i * Co + j] + c * s;
+}
+__global__ void anvil_bx_k(const anvil_desc_t *d, int swap, int it) {
+    const anvil_desc_t D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; float *Y = swap ? D.X : D.Y; int Co = D.Co, K = D.K; float a = c_anvil_maps[it][0];
+    int i = blockIdx.y; size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= Co || k >= (size_t)K) return;
+    float s = 0.f; for (int j = 0; j < Co; j++) s += D.B[(size_t)i * Co + j] * X[(size_t)j * K + k];
+    Y[(size_t)i * K + k] = a * X[(size_t)i * K + k] + s;
+}
+/* lane (row) power of the cascade output, one block per row */
+__global__ void anvil_rowpow_k(const anvil_desc_t *d, int swap) {
+    const anvil_desc_t D = d[blockIdx.z]; const float *O = swap ? D.Y : D.X; int i = blockIdx.x; if (i >= D.Co) return;
+    __shared__ float r[256]; float a = 0.f; for (int k = threadIdx.x; k < D.K; k += blockDim.x) { float v = O[(size_t)i * D.K + k]; a += v * v; }
+    r[threadIdx.x] = a; __syncthreads(); for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) D.R[i] = r[0] / (float)D.K;
+}
+/* per conv: lane energy EMA, gain = 1/sqrt(E), global rescale to the pre-equalisation Frobenius norm; R <- row scale */
+__global__ void anvil_eq_k(const anvil_desc_t *d, float b2) {
+    const anvil_desc_t D = d[blockIdx.x]; if (threadIdx.x) return;
+    float pre = 0.f, post = 0.f;
+    for (int i = 0; i < D.Co; i++) { float pw = D.R[i]; pre += pw; D.E[i] += (1.f - b2) * (pw - D.E[i]); float gn = rsqrtf(fmaxf(D.E[i], 1e-10f)); post += pw * gn * gn; }
+    float s = sqrtf(pre) / fmaxf(sqrtf(post), 1e-10f);
+    for (int i = 0; i < D.Co; i++) D.R[i] = rsqrtf(fmaxf(D.E[i], 1e-10f)) * s;
+}
+__global__ void anvil_apply_k(const anvil_desc_t *d, int swap, float lr, float wd) {   /* sign-aligned decay + update */
+    const anvil_desc_t D = d[blockIdx.z]; const float *O = swap ? D.Y : D.X; size_t n = (size_t)D.Co * D.K;
+    float scale = sqrtf(fmaxf(1.f, (float)D.Co / (float)D.K));
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        float u = O[i] * D.R[i / (size_t)D.K] * scale, p = D.p[i];
+        float dec = (u * p >= 0.f) ? lr * wd * p : 0.f;
+        D.p[i] = p - dec - lr * u;
+    }
+}
+extern "C" void nn_anvil_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta_fast, float beta_slow, float w_fast, float mu, float beta2, float wd) {
+    const anvil_desc_t *d = (const anvil_desc_t *)descs;
+    double *ss = gn_dsums((size_t)nconv); cudaMemsetAsync(ss, 0, (size_t)nconv * sizeof(double));
+    dim3 g1(32, 1, nconv), gco(nblk(maxco, 128), maxco, nconv), gk(nblk(maxk, 256), maxco, nconv), grow(maxco, 1, nconv);
+    anvil_mom_k<<<g1, 256>>>(d, beta_fast, beta_slow, w_fast, mu, ss);
+    anvil_scale_k<<<g1, 256>>>(d, ss);
+    int swap = 0;
+    for (int it = 0; it < 6; it++) { anvil_xxt_k<<<gco, 128>>>(d, swap); anvil_sq_k<<<gco, 128>>>(d, it); anvil_bx_k<<<gk, 256>>>(d, swap, it); swap ^= 1; }
+    anvil_rowpow_k<<<grow, 256>>>(d, swap);
+    anvil_eq_k<<<nconv, 32>>>(d, beta2);
+    anvil_apply_k<<<g1, 256>>>(d, swap, lr, wd);
+    KCHECK();
+}
 extern "C" void nn_adamw(float *p, const float *g, float *m, float *v, size_t n, float lr, float b1, float b2, float eps, float wd, int step) {
     float c1 = 1.f - powf(b1, (float)step), c2 = 1.f - powf(b2, (float)step);
     adamw_k<<<nblk(n, 256), 256>>>(p, g, m, v, n, lr, b1, b2, eps, wd, c1, c2);

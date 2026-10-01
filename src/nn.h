@@ -207,6 +207,8 @@ void nn_adamw(float *p, const float *g, float *m, float *v, size_t n, float lr, 
 void nn_muon(float *p, const float *g, float *mom, int Co, int K, float lr, float beta, float wd, float *work);
 /* batched Muon over nconv weights: descs is a device array of {float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K;} (X, Y: Co K floats; A, B: Co Co) */
 void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta, float wd);
+/* ANVIL II over nconv weights: descs {float *p; const float *g; float *v0, *X, *Y, *A, *B, *v1, *E, *R; int Co, K;} (E, R: Co floats) */
+void nn_anvil_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta_fast, float beta_slow, float w_fast, float mu, float beta2, float wd);
 void nn_ema(float *ema, const float *p, size_t n, float decay);
 double nn_sum(const float *x, size_t n, float *scratch);     /* scratch: >= 4096 floats */
 double nn_sumsq(const float *x, size_t n, float *scratch);

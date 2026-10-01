@@ -70,6 +70,7 @@ struct unet {
     float *xin;                              /* bf16 copy of the network input (act-bf16 mode) */
     float *muon_mom, *muon_work; size_t muon_work_n;   /* Muon momentum (np) and Newton-Schulz scratch */
     void *muon_descs; int muon_nconv, muon_maxco, muon_maxk;   /* batched Muon descriptor table (device) */
+    float *anvil_v1, *anvil_pool; void *anvil_descs; int anvil_nconv;   /* ANVIL slow rail, scratch pool, descriptors */
     float *glb;                              /* bf16 copy of the logit gradient (grad-bf16 mode) */
     int mode;                                /* kernel/storage mode the activations were built for */
     float *logits;
@@ -718,6 +719,41 @@ void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, floa
         for_each_conv3(u, muon_zero_conv, nullptr);
     }
     nn_adamw(u->p, u->g, u->m, u->v, u->np, lr_adam, b1, b2, eps, wd, step);
+}
+/* ANVIL II on the 3^3 conv weights (see nn.cu); AdamW elsewhere. step counts from 1; rail schedule as in the nanogpt record. */
+typedef struct { float *p; const float *g; float *v0, *X, *Y, *A, *B, *v1, *E, *R; int Co, K; } anvil_desc_t;
+typedef struct { anvil_desc_t h[64]; int n; size_t pool; int maxco, maxk; } anvil_build_t;
+static void anvil_collect(unet *u, const convp *c, void *arg) {
+    anvil_build_t *b = arg; int K = c->cin * c->k * c->k * c->k; size_t n = (size_t)c->cout * K;
+    anvil_desc_t *d = &b->h[b->n++]; d->p = u->p + c->w; d->g = u->g + c->w; d->v0 = u->muon_mom + c->w; d->v1 = u->anvil_v1 + c->w; d->Co = c->cout; d->K = K;
+    d->X = (float *)(uintptr_t)b->pool; b->pool += n; d->Y = (float *)(uintptr_t)b->pool; b->pool += n;
+    d->A = (float *)(uintptr_t)b->pool; b->pool += (size_t)c->cout * c->cout; d->B = (float *)(uintptr_t)b->pool; b->pool += (size_t)c->cout * c->cout;
+    d->E = (float *)(uintptr_t)b->pool; b->pool += (size_t)c->cout; d->R = (float *)(uintptr_t)b->pool; b->pool += (size_t)c->cout;
+    if (c->cout > b->maxco) b->maxco = c->cout;
+    if (K > b->maxk) b->maxk = K;
+}
+void unet_anvil(unet *u, float lr, float wd, int step, int steps, float lr_adam, float b1, float b2, float eps, float wd_adam) {
+    if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd_adam, step); return; }
+    if (!u->muon_mom) { u->muon_mom = nn_malloc(u->np * 4); nn_zero(u->muon_mom, u->np * 4); }
+    if (!u->anvil_v1) { u->anvil_v1 = nn_malloc(u->np * 4); nn_zero(u->anvil_v1, u->np * 4); }
+    if (!u->anvil_descs) {
+        anvil_build_t b = {0};
+        for_each_conv3(u, anvil_collect, &b);
+        float *pool = nn_malloc(b.pool * 4); nn_zero(pool, b.pool * 4);
+        for (int i = 0; i < b.n; i++) { anvil_desc_t *d = &b.h[i]; d->X = pool + (uintptr_t)d->X; d->Y = pool + (uintptr_t)d->Y; d->A = pool + (uintptr_t)d->A; d->B = pool + (uintptr_t)d->B; d->E = pool + (uintptr_t)d->E; d->R = pool + (uintptr_t)d->R; }
+        u->anvil_descs = nn_malloc(sizeof(anvil_desc_t) * (size_t)b.n); nn_h2d(u->anvil_descs, b.h, sizeof(anvil_desc_t) * (size_t)b.n);
+        u->anvil_nconv = b.n; u->muon_maxco = b.maxco; u->muon_maxk = b.maxk; u->anvil_pool = pool;
+        /* lane energy starts at 1 so the first equalisation is a no-op */
+        for (int i = 0; i < b.n; i++) { float *one = malloc((size_t)b.h[i].Co * 4); for (int k = 0; k < b.h[i].Co; k++) one[k] = 1.f; nn_h2d(b.h[i].E, one, (size_t)b.h[i].Co * 4); free(one); }
+    }
+    /* fast-rail beta: 0.85 -> 0.93 over the first 240 steps, 0.93 until the slow rail engages at step 514 (then 0.85, blend 0.4385) */
+    const int engage = 514, bwarm = 240; float bf, w;
+    if (step >= engage) { bf = 0.85f; w = 0.4385f; }
+    else { bf = step < bwarm ? 0.85f + (0.93f - 0.85f) * (float)step / bwarm : 0.93f; w = 1.f; }
+    (void)steps;
+    nn_anvil_batch(u->anvil_descs, u->anvil_nconv, u->muon_maxco, u->muon_maxk, lr, bf, 0.98f, w, 0.95f, 0.9f, wd);
+    for_each_conv3(u, muon_zero_conv, nullptr);
+    nn_adamw(u->p, u->g, u->m, u->v, u->np, lr_adam, b1, b2, eps, wd_adam, step);
 }
 void unet_ema(unet *u, float decay) { if (u->wq) wq_ema(u, decay); else nn_ema(u->ema, u->p, u->np, decay); }
 void unet_use_ema(unet *u, int on) { u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
