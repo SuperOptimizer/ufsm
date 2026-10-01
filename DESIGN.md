@@ -327,6 +327,11 @@ Where the rest would come from:
   prefetch (`z3_prefetch_chunk`, no decode): per level, the chunk set covering every window around every occupied cell
   (P/2 offset, snapped, neighbours) plus the level+3 probe windows, deduplicated in a bitmap; `--levels 3` covers the
   training levels. A cached, aligned 128^3 window decodes in 4.6 ms (`tests/bench_read.c`).
+- Merged with the agent's sampler work (7247eec: fused single-pass input write straight into the 16-bit batch, 65536-entry
+  noise table, row-wise chamfer 6.3 ms per pass pair; fe35893: `--det 1` deterministic batch order for paired runs,
+  170 vs 222 samples/s at 32 workers; tests/test_sample_ops in make test). MANBp, 16 workers under load:
+  164 samples/s (was 44 at the start of the day); per patch: probe 26 ms, CT read 11, soft 17, x16 22, augment 5.
+  The "store reads" on MANBp were the label pyramid (a local store without a cache layer), not misses.
 - fp4 inference: the fp16 fine-tuned MANBp model scores F1 0.297 (0.5) / 0.277 (0.7) at fp16 inference and 0.295 /
   0.271 with `predict --prec 3` (e2m1 activations and weights, block scales): fp4 inference of an fp16-trained model
   costs 0.002 F1. Training with packed fp4 weights (`--qat 3 --wq 4`) costs 0.05 F1 (0.242) and is not needed for fp4
