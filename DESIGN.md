@@ -365,6 +365,16 @@ GPU at 128^3, tiled Muon / ANVIL matmuls (lead); (6) wider level-0 channels once
   guard (within 0.005 F1). Earlier fp4 numbers (QAT fine-tune 0.242 vs 0.297, simulated NVFP4 62-66% error) were
   without those ingredients.
 
+### Sampler on the 17-source set (2026-10-01 evening)
+- On configs/all2.json the sampler collapsed to 34 patches/s (16 workers) and got slower with 32: 331 lazy store
+  opens (one remote metadata fetch each, 70-500 ms) serialised on the open mutex, paid by every worker's first draws
+  (a 6000-step yardstick spent its first minute there; r10 paid it once). Fix (a1f95fa): the open runs outside the
+  lock (the lock only publishes the pointer; a racing duplicate is closed; a failed level clears ct_present so it is
+  not retried per draw), and sampler_start opens every (source, level, target) store eagerly on 32 threads: 22 s
+  summed -> 3.7 s wall. Steady state under load: 143 patches/s at 16 workers, 188 at 32, with 53-58% of draws
+  rejected by the coarse occupancy probe (14 ms each) on the sparse new sources. Two GPUs at the fp4 training
+  ceiling (~20 ms per 128^3 step) need ~200 patches/s, so the sampler is no longer the limit on an idle box.
+
 ### Receptive field vs window (2026-10-01 evening)
 - Per-voxel inference rate is flat with window size, so a larger window buys only the halo fraction (288: 70%,
   544: 83%, 800: 88%); 544 is the practical maximum (memory ~65 B/voxel with MX-fp8 storage, ~40 with fp4). The window
