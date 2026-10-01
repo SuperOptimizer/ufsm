@@ -11,6 +11,7 @@ int main(int argc, char **argv) {
     nn_init(argc > 3 ? atoi(argv[3]) : 0);
     if (getenv("UFSM_F16")) { nn_set_f16(1); }
     if (getenv("UFSM_FP32")) nn_set_tf32(0);
+    if (getenv("UFSM_PREC_POLICY") && nn_set_prec_policy(getenv("UFSM_PREC_POLICY"))) return 2;
     FILE *f = fopen(argv[2], "rb"); if (!f) return 1;
     int hdr[4]; if (fread(hdr, 4, 4, f) != 4) return 1;
     int B = hdr[0], P = hdr[1], xf = hdr[2], NCH = hdr[3]; size_t p3 = (size_t)P * P * P, nx = (size_t)B * 4 * p3;
