@@ -124,19 +124,26 @@ int main(int argc, char **argv) {
                 size_t np = unet_nparams(u);
                 float *g0 = malloc(np * 4), *g1 = malloc(np * 4);
                 printf("\n    step %d grad vs fp32:", it);
-                for (int q = 0; q <= 2; q++) {
-                    nn_set_prec(q);
+                /* precisions 1..3 plus any policies in UFSM_GCHECK_POLICIES ("label=policy|label=policy", applied on top of prec 1) */
+                static char *gpol[16]; static int ngpol = -1;
+                if (ngpol < 0) { ngpol = 0; const char *e = getenv("UFSM_GCHECK_POLICIES"); if (e) { char *t = strdup(e); for (char *q2 = strtok(t, "|"); q2 && ngpol < 16; q2 = strtok(nullptr, "|")) gpol[ngpol++] = q2; } }
+                for (int q = 0; q <= 3 + ngpol; q++) {
+                    const char *label = nullptr;
+                    if (q <= 3) { nn_set_prec(q); nn_set_prec_policy(""); }
+                    else { nn_set_prec(1); char *eq = strchr(gpol[q - 4], '='); label = gpol[q - 4]; if (eq) { *eq = 0; nn_set_prec_policy(eq + 1); } }
                     float o2[3];
                     nn_loss(unet_forward(u, dx, xs, 1), dt, dm, dw, ls, getenv("UFSM_DICEW") ? (float)atof(getenv("UFSM_DICEW")) : 1.f, gl, o2, scr);
                     unet_zero_grad(u); unet_backward(u, gl); unet_grad_d2h(u, q ? g1 : g0);
                     if (q) {
                         double d2 = 0, r2 = 0, dot = 0, n1 = 0;
                         for (size_t i = 0; i < np; i++) { double d = (double)g1[i] - g0[i]; d2 += d * d; r2 += (double)g0[i] * g0[i]; dot += (double)g0[i] * g1[i]; n1 += (double)g1[i] * g1[i]; }
-                        printf("  prec %d rel %.3g cos %.5f loss %.5f\n", q, sqrt(d2 / r2), dot / sqrt(r2 * n1), o2[0] + o2[1]);
+                        if (label) printf("  %s rel %.3g cos %.5f loss %.5f\n", label, sqrt(d2 / r2), dot / sqrt(r2 * n1), o2[0] + o2[1]);
+                        else printf("  prec %d rel %.3g cos %.5f loss %.5f\n", q, sqrt(d2 / r2), dot / sqrt(r2 * n1), o2[0] + o2[1]);
                         seg_report(g0, g1);
                     } else printf(" loss %.5f", o2[0] + o2[1]);
                 }
                 printf("\n"); fflush(stdout);
+                nn_set_prec_policy(""); nn_set_prec(prec);   /* restore the run's precision */
                 free(g0); free(g1); unet_zero_grad(u);
             }
         }
