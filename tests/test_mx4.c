@@ -477,6 +477,121 @@ int main(void) {
             snprintf(nm, sizeof nm, "gn+silu bwd ggamma, %d ch / 8 groups (mx4 x)", Cs[k]); cmp(nm, gg2, gg1, Cs[k], 1e-4);
         }
     }
+    {   /* fp4 weight gradient (lp_bwd_w_f4): (i) inputs on the e2m1 grid with round to nearest -> requantisation is lossless and
+           the kernel must equal fp32 (layout / shift / scale-pairing check for every storage type), (ii) random inputs: format
+           error of one call, stochastic rounding of gy averaged over 32 seeds (unbiased: the gy part of the error falls ~1/sqrt(32)),
+           Hadamard on / off, heavy-tailed gy, gn+silu input, split input */
+        static const float g8[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+        const int NS = 32;
+        shape5 xs = {N, 48, 6, 12, 20}, ys = xs; ys.c = 32;   /* W = 20: partial x tile; Ci = 48: 3 channel tiles; Co = 32: MT 2 */
+        size_t nx = shape_numel(xs), ny = shape_numel(ys), nw = (size_t)32 * 48 * 27;
+        float *hx = malloc(nx * 4), *hg = malloc(ny * 4);
+        for (size_t i = 0; i < nx; i++) hx[i] = (frand() < 0 ? -1.f : 1.f) * g8[(int)((frand() * 0.5f + 0.5f) * 7.999f)];
+        for (size_t i = 0; i < ny; i++) hg[i] = (frand() < 0 ? -1.f : 1.f) * g8[(int)((frand() * 0.5f + 0.5f) * 7.999f)] * 0x1p-10f;
+        float *xg = nn_malloc(nx * 4), *gg = nn_malloc(ny * 4); nn_h2d(xg, hx, nx * 4); nn_h2d(gg, hg, ny * 4);
+        gnp_t none = {0}; split_t s0 = {0};
+        float *gwr = dev_zero(nw), *gbr = dev_zero(32), *gw = dev_zero(nw), *gb = dev_zero(32), *acc = dev_zero(nw);
+        mode_ref(); nn_conv3d_bwd_weight(xg, xs, gg, ys, 3, 1, gwr, gbr);
+        nn_set_f16(1); void *xh = nn_malloc(nx * 2), *gh = nn_malloc(ny * 2); nn_f32_to_h16(xg, nx, xh, 1.f); nn_f32_to_h16(gg, ny, gh, 1.f); nn_set_f16(0);
+        void *xb = nn_malloc(nx * 2), *gbf = nn_malloc(ny * 2); lp_f32_to_bf16(xg, nx, xb); lp_f32_to_bf16(gg, ny, gbf);
+        void *x8 = mx8_from(xg, xs), *g8m = mx8_from(gg, ys), *x4 = mx4_from(xg, xs);
+        struct { const char *nm; const void *x; int xt; const void *g; int gt; } ty[] = {
+            {"fp32 x, fp32 gy", xg, 0, gg, 0}, {"fp16 x, fp32 gy", xh, 2, gg, 0}, {"fp16 x, fp16 gy", xh, 2, gh, 2}, {"bf16 x, bf16 gy", xb, 1, gbf, 1},
+            {"mx8 x, mx8 gy", x8, 3, g8m, 3}, {"mx8 x, fp16 gy", x8, 3, gh, 2}, {"mx4 x, fp32 gy", x4, 4, gg, 0}, {"mx4 x, mx8 gy", x4, 4, g8m, 3}, {"mx4 x, bf16 gy", x4, 4, gbf, 1}};
+        char nm[96];
+        for (int i = 0; i < (int)(sizeof ty / sizeof ty[0]); i++) {
+            nn_zero(gw, nw * 4); nn_zero(gb, 32 * 4);
+            lp_bwd_w_f4(ty[i].x, ty[i].xt, xs, ty[i].g, ty[i].gt, ys, gw, gb, none, s0, 0);
+            snprintf(nm, sizeof nm, "f4 wgrad exact on grid (%s)", ty[i].nm); cmp(nm, gw, gwr, nw, 1e-5);
+            if (i == 0) cmp("f4 wgrad bias (fp32 gy)", gb, gbr, 32, 1e-5);
+        }
+        nn_zero(gw, nw * 4); lp_bwd_w_f4(xg, 0, xs, gg, 0, ys, gw, nullptr, none, s0, 1);
+        cmp("f4 wgrad Hadamard, grid inputs (RN)", gw, gwr, nw, 0.25);
+        {   /* odd sizes: W = 18 (scalar loads), Ci = 8 (NT 1), Co = 16 (MT 1), D odd */
+            shape5 xo = {1, 8, 5, 9, 18}, yo = xo; yo.c = 16;
+            size_t a = shape_numel(xo), b = shape_numel(yo);
+            float *x1 = nn_malloc(a * 4), *g1 = nn_malloc(b * 4); nn_h2d(x1, hx, a * 4); nn_h2d(g1, hg, b * 4);
+            float *r1 = dev_zero((size_t)16 * 8 * 27), *o1 = dev_zero((size_t)16 * 8 * 27), *rb = dev_zero(16), *ob = dev_zero(16);
+            mode_ref(); nn_conv3d_bwd_weight(x1, xo, g1, yo, 3, 1, r1, rb);
+            lp_bwd_w_f4(x1, 0, xo, g1, 0, yo, o1, ob, none, s0, 0);
+            cmp("f4 wgrad exact on grid (W 18, Ci 8, Co 16, D 5)", o1, r1, (size_t)16 * 8 * 27, 1e-5);
+            cmp("f4 wgrad bias (W 18, Co 16)", ob, rb, 16, 1e-5);
+        }
+        {   /* split input (x2 segment, dec0.c1-like 32 + 16), grid values: exact */
+            shape5 c1 = xs, c2 = xs; c1.c = 32; c2.c = 16;
+            float *xa = nn_malloc(shape_numel(c1) * 4), *xc = nn_malloc(shape_numel(c2) * 4);
+            nn_h2d(xa, hx, shape_numel(c1) * 4); nn_h2d(xc, hx + shape_numel(c1), shape_numel(c2) * 4);
+            float *cat = dev_zero(nx); nn_concat_fwd(xa, 32, xc, 16, xs, cat);
+            float *r = dev_zero(nw); mode_ref(); nn_conv3d_bwd_weight(cat, xs, gg, ys, 3, 1, r, nullptr);
+            split_t sx = {0}; sx.x2 = xc; sx.c_split = 32;
+            nn_zero(gw, nw * 4); lp_bwd_w_f4(xa, 0, xs, gg, 0, ys, gw, nullptr, none, sx, 0);
+            cmp("f4 wgrad exact on grid (split 32 + 16)", gw, r, nw, 1e-5);
+            void *xam = mx4_from(xa, c1), *xcm = mx4_from(xc, c2); sx.x2 = xcm;
+            nn_zero(gw, nw * 4); lp_bwd_w_f4(xam, 4, xs, gg, 0, ys, gw, nullptr, none, sx, 0);
+            cmp("f4 wgrad exact on grid (split, mx4 32 + 16)", gw, r, nw, 1e-5);
+        }
+        /* SR unbiasedness: grid x (lossless), random gy: single-seed error vs the 32-seed mean */
+        for (size_t i = 0; i < ny; i++) hg[i] = nrand() * 1e-3f;
+        nn_h2d(gg, hg, ny * 4); nn_zero(gwr, nw * 4); mode_ref(); nn_conv3d_bwd_weight(xg, xs, gg, ys, 3, 1, gwr, nullptr);
+        for (int had = 0; had < 2; had++) {
+            split_t sr = {0}; double e1 = 0, ea;
+            nn_zero(acc, nw * 4);
+            for (int k = 0; k < NS; k++) {
+                sr.sr = (0x9e3779b9u * (unsigned)(k + 1)) | 1u;
+                if (k == 0) { nn_zero(gw, nw * 4); lp_bwd_w_f4(xg, 0, xs, gg, 0, ys, gw, nullptr, none, sr, had); snprintf(nm, sizeof nm, "f4 wgrad SR one seed, grid x, N(0,1) gy%s", had ? ", Had" : ""); e1 = cmp(nm, gw, gwr, nw, 0.25); }
+                lp_bwd_w_f4(xg, 0, xs, gg, 0, ys, acc, nullptr, none, sr, had);
+            }
+            nn_scale(acc, 1.f / NS, nw);
+            snprintf(nm, sizeof nm, "f4 wgrad SR mean of %d seeds%s", NS, had ? ", Had" : ""); ea = cmp(nm, acc, gwr, nw, 0.25);
+            /* plain: x is lossless, so only the zero-mean gy rounding is left and the mean must fall ~1/sqrt(32); Hadamard:
+               the transformed x is rounded to nearest (a fixed error ~0.11 that no seed average removes), report only */
+            if (!had) { snprintf(nm, sizeof nm, "  SR mean error < 0.35 x single (%.3g / %.3g)", ea, e1); check(nm, ea < 0.35 * e1); }
+            split_t rn = {0}; nn_zero(gw, nw * 4); lp_bwd_w_f4(xg, 0, xs, gg, 0, ys, gw, nullptr, none, rn, had);
+            snprintf(nm, sizeof nm, "f4 wgrad RN, grid x, N(0,1) gy%s", had ? ", Had" : ""); cmp(nm, gw, gwr, nw, 0.25);
+        }
+        /* random silu(N(0,1)) x and N(0,1) gy, then heavy-tailed gy (1% of the voxels x 30): format error RN / SR, Hadamard on / off */
+        for (size_t i = 0; i < nx; i++) { float v = nrand(); hx[i] = v / (1.f + expf(-v)); }
+        nn_h2d(xg, hx, nx * 4);
+        for (int heavy = 0; heavy < 2; heavy++) {
+            if (heavy) { for (size_t i = 0; i < ny; i++) if (frand() > 0.98f) hg[i] *= 30.f; nn_h2d(gg, hg, ny * 4); }
+            nn_zero(gwr, nw * 4); mode_ref(); nn_conv3d_bwd_weight(xg, xs, gg, ys, 3, 1, gwr, nullptr);
+            for (int had = 0; had < 2; had++) for (int srm = 0; srm < 2; srm++) {
+                split_t sr = {0}; sr.sr = srm ? 0x2545f491u : 0u;
+                nn_zero(gw, nw * 4); lp_bwd_w_f4(xg, 0, xs, gg, 0, ys, gw, nullptr, none, sr, had);
+                snprintf(nm, sizeof nm, "f4 wgrad %s gy, %s%s", heavy ? "heavy-tailed" : "N(0,1)", srm ? "SR" : "RN", had ? ", Had" : ""); cmp(nm, gw, gwr, nw, srm ? 0.3 : 0.25);   /* one SR draw on heavy-tailed gy without Hadamard: ~0.28 */
+            }
+        }
+        {   /* diagnostic x SR (had bit 1): both operands unbiased -> the 32-seed mean of random x / gy falls ~1/sqrt(32) */
+            nn_zero(gwr, nw * 4); mode_ref(); nn_conv3d_bwd_weight(xg, xs, gg, ys, 3, 1, gwr, nullptr);
+            for (int had = 2; had < 4; had++) {
+                split_t sr = {0}; double e1 = 0, ea;
+                nn_zero(acc, nw * 4);
+                for (int k = 0; k < NS; k++) {
+                    sr.sr = (0x7f4a7c15u * (unsigned)(k + 1)) | 1u;
+                    if (k == 0) { nn_zero(gw, nw * 4); lp_bwd_w_f4(xg, 0, xs, gg, 0, ys, gw, nullptr, none, sr, had); snprintf(nm, sizeof nm, "f4 wgrad SR x and gy, one seed%s", had & 1 ? ", Had" : ""); e1 = cmp(nm, gw, gwr, nw, 0.35); }
+                    lp_bwd_w_f4(xg, 0, xs, gg, 0, ys, acc, nullptr, none, sr, had);
+                }
+                nn_scale(acc, 1.f / NS, nw);
+                snprintf(nm, sizeof nm, "f4 wgrad SR x and gy, mean of %d%s", NS, had & 1 ? ", Had" : ""); ea = cmp(nm, acc, gwr, nw, 0.25);
+                snprintf(nm, sizeof nm, "  SR x+gy mean < 0.35 x single (%.3g / %.3g)", ea, e1); check(nm, ea < 0.35 * e1);
+            }
+        }
+        {   /* gn+silu input (fused affine + SiLU while staging x), mx4 x */
+            const int Gn = 8; size_t NG = (size_t)N * Gn;
+            float *gam = dev_rand(48, 1.f), *bet = dev_rand(48, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+            { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+            float *xr = dev_rand(nx, 2.f); void *xm = mx4_from(xr, xs); float *xd = deq4(xm, xs), *t = dev_zero(nx);
+            mode_ref(); nn_gn_silu_apply(xd, xs, Gn, gam, bet, mean, rstd, t); nn_zero(gwr, nw * 4); nn_conv3d_bwd_weight(t, xs, gg, ys, 3, 1, gwr, nullptr);
+            gnp_t gp = {gam, bet, mean, rstd, Gn};
+            split_t sr = {0}; sr.sr = 0x51ed270bu;
+            nn_zero(gw, nw * 4); lp_bwd_w_f4(xm, 4, xs, gg, 0, ys, gw, nullptr, gp, sr, 0);
+            cmp("f4 wgrad gn+silu input (mx4 x, SR)", gw, gwr, nw, 0.3);
+            nn_zero(gw, nw * 4); lp_bwd_w_f4(xm, 4, xs, g8m, 3, ys, gw, nullptr, gp, sr, 1);
+            nn_zero(gwr, nw * 4); nn_conv3d_bwd_weight(t, xs, deq8(g8m, ys), ys, 3, 1, gwr, nullptr);
+            cmp("f4 wgrad gn+silu input (mx4 x, mx8 gy, SR, Had)", gw, gwr, nw, 0.25);
+        }
+        free(hx); free(hg);
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
     printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);
