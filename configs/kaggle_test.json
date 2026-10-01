@@ -1,0 +1,4 @@
+{"sources": [
+  {"name": "kaggle", "root": "/vesuvius/ufsm/test/kaggle", "ct": "images.zarr", "um": 1.0,
+   "targets": {"recto": {"array": "labels.zarr", "size": 320, "origins": [[0,0,0],[320,0,0],[640,0,0],[960,0,0]]}}, "weight": 1.0}
+]}

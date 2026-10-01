@@ -1,0 +1,218 @@
+#include "sources.h"
+#include "json.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static const char *g_cache;   /* chunk cache dir for HTTPS stores; from the sources file or sources_set_cache */
+
+int rung_of_um(double um) { return (int)lround(log2(um / 0.6)); }
+
+/* ---- axis ---- */
+
+static int cmp_z(const void *a, const void *b) {
+    const double *p = a, *q = b;
+    return (p[0] > q[0]) - (p[0] < q[0]);
+}
+
+int axis_load(axis *a, const char *path) {
+    memset(a, 0, sizeof *a);
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *txt = malloc((size_t)n + 1);
+    if (fread(txt, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(txt); return -1; }
+    fclose(f);
+    json *j = json_parse(txt, (size_t)n);
+    free(txt);
+    const json *cp = json_get(j, "control_points");
+    if (!cp) cp = j && j->type == J_ARR ? j : nullptr;
+    if (!cp || cp->n == 0) { json_free(j); return -1; }
+    double (*pts)[3] = malloc(cp->n * sizeof *pts);
+    for (size_t i = 0; i < cp->n; i++) {
+        const json *p = json_at(cp, i);
+        pts[i][0] = json_num(json_get(p, "z"), 0);
+        pts[i][1] = json_num(json_get(p, "y"), 0);
+        pts[i][2] = json_num(json_get(p, "x"), 0);
+    }
+    qsort(pts, cp->n, sizeof *pts, cmp_z);
+    a->n = (int)cp->n;
+    a->z = malloc(cp->n * sizeof(double));
+    a->y = malloc(cp->n * sizeof(double));
+    a->x = malloc(cp->n * sizeof(double));
+    for (size_t i = 0; i < cp->n; i++) { a->z[i] = pts[i][0]; a->y[i] = pts[i][1]; a->x[i] = pts[i][2]; }
+    free(pts);
+    json_free(j);
+    return 0;
+}
+
+void axis_at(const axis *a, double z, double *y, double *x) {
+    if (a->n == 0) { *y = *x = 0; return; }
+    if (z <= a->z[0]) { *y = a->y[0]; *x = a->x[0]; return; }
+    if (z >= a->z[a->n - 1]) { *y = a->y[a->n - 1]; *x = a->x[a->n - 1]; return; }
+    int lo = 0, hi = a->n - 1;
+    while (hi - lo > 1) { int m = (lo + hi) / 2; if (a->z[m] <= z) lo = m; else hi = m; }
+    double t = a->z[hi] > a->z[lo] ? (z - a->z[lo]) / (a->z[hi] - a->z[lo]) : 0;
+    *y = a->y[lo] + t * (a->y[hi] - a->y[lo]);
+    *x = a->x[lo] + t * (a->x[hi] - a->x[lo]);
+}
+
+/* ---- sources ---- */
+
+static const char *CHNAME[NCH] = {"recto", "sheet"};
+
+static char *sdup(const char *s) { return s ? strdup(s) : nullptr; }
+
+sources *sources_load(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "sources: cannot open %s\n", path); return nullptr; }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *txt = malloc((size_t)n + 1);
+    if (fread(txt, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(txt); return nullptr; }
+    fclose(f);
+    json *j = json_parse(txt, (size_t)n);
+    free(txt);
+    const json *arr = json_get(j, "sources");
+    if (!arr || arr->type != J_ARR) { fprintf(stderr, "sources: no \"sources\" array in %s\n", path); json_free(j); return nullptr; }
+    sources *S = calloc(1, sizeof *S);
+    S->cache = sdup(json_str(json_get(j, "cache"), nullptr));
+    if (S->cache) g_cache = S->cache;
+    S->n = (int)arr->n;
+    S->src = calloc(arr->n, sizeof *S->src);
+    for (size_t i = 0; i < arr->n; i++) {
+        const json *e = json_at(arr, i);
+        source *s = &S->src[i];
+        s->name = sdup(json_str(json_get(e, "name"), "?"));
+        s->s = store_open(json_str(json_get(e, "root"), "."));
+        s->ct_key = sdup(json_str(json_get(e, "ct"), ""));
+        s->um = json_num(json_get(e, "um"), 0);
+        s->weight = json_num(json_get(e, "weight"), 1.0);
+        for (int l = 0; l < MAXLEV; l++) s->ct_present[l] = -1; /* unknown until probed */
+        const json *tg = json_get(e, "targets");
+        for (int c = 0; c < NCH; c++) {
+            const json *t = json_get(tg, CHNAME[c]);
+            for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = -1;
+            if (!t) continue;
+            if (t->type == J_STR) { s->tgt_key[c] = strdup(t->str); continue; }
+            const char *troot = json_str(json_get(t, "root"), nullptr);
+            if (troot) s->tgt_store[c] = store_open(troot);
+            const char *grp = json_str(json_get(t, "group"), nullptr);
+            if (grp) { s->tgt_key[c] = strdup(grp); continue; }
+            const json *org = json_get(t, "origins");
+            if (!org) { fprintf(stderr, "sources: %s/%s: need a string, {root, group} or {regions|array, size, origins}\n", s->name, CHNAME[c]); continue; }
+            regions *r = calloc(1, sizeof *r);
+            r->dir = sdup(json_str(json_get(t, "regions"), ""));
+            r->array = sdup(json_str(json_get(t, "array"), nullptr));
+            r->size = (int)json_num(json_get(t, "size"), 1024);
+            r->n = (int)org->n;
+            r->origin = calloc(org->n, sizeof *r->origin);
+            r->rsize = calloc(org->n, sizeof *r->rsize);
+            for (size_t k = 0; k < org->n; k++) {
+                for (int d = 0; d < 3; d++) r->origin[k][d] = (int64_t)json_num(json_at(json_at(org, k), (size_t)d), 0);
+                r->rsize[k] = (int)json_num(json_at(json_at(org, k), 3), r->size);
+            }
+            s->reg[c] = r;
+            s->reg_z[c] = calloc(org->n, sizeof(z3 *));
+        }
+        const json *ho = json_get(e, "holdout");
+        if (ho && ho->type == J_ARR && ho->n == 6) for (int d = 0; d < 3; d++) { s->hold_o[d] = (int64_t)json_num(json_at(ho, (size_t)d), 0); s->hold_n[d] = (int64_t)json_num(json_at(ho, (size_t)(3 + d)), 0); }
+        const char *ap = json_str(json_get(e, "axis"), nullptr);
+        if (ap && axis_load(&s->ax, ap)) fprintf(stderr, "sources: %s: cannot load axis %s\n", s->name, ap);
+        if (s->um <= 0) {
+            z3 *z0 = source_ct(s, 0);
+            if (z0) s->um = z3_meta_of(z0)->scale_um;
+        }
+        if (s->um <= 0) fprintf(stderr, "sources: %s: unknown voxel size (set \"um\")\n", s->name);
+    }
+    json_free(j);
+    return S;
+}
+
+void sources_free(sources *S) {
+    if (!S) return;
+    for (int i = 0; i < S->n; i++) {
+        source *s = &S->src[i];
+        for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
+        for (int c = 0; c < NCH; c++) {
+            for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
+            if (s->reg[c]) {
+                for (int k = 0; k < s->reg[c]->n; k++) z3_close(s->reg_z[c][k]);
+                free(s->reg_z[c]);
+                z3_close(s->reg_shared[c]);
+                free(s->reg[c]->dir);
+                free(s->reg[c]->array);
+                free(s->reg[c]->origin);
+                free(s->reg[c]->rsize);
+                free(s->reg[c]);
+            }
+            free(s->tgt_key[c]);
+            store_close(s->tgt_store[c]);
+        }
+        free(s->ax.z); free(s->ax.y); free(s->ax.x);
+        free(s->name); free(s->ct_key);
+        store_close(s->s);
+    }
+    free(S->src);
+    free(S->cache);
+    free(S);
+}
+
+/* open level `level` of a pyramid group: try the integer name, then the OME level whose voxel size is um0 * 2^level */
+z3 *pyramid_open_level(store *st, const char *group, int level, double um0, const char *cache) {
+    char k[1024];
+    z3_level lv[16];
+    int nl = z3_group_levels(st, group, lv, 16);
+    if (nl > 0 && um0 > 0 && lv[0].um > 0) {        /* OME group: match by voxel size (absolute um, or relative 2^l factors) */
+        double want = um0 * (1 << level), rel = (double)(1 << level);
+        for (int i = 0; i < nl; i++)
+            if (fabs(lv[i].um - want) < 0.02 * want || (lv[0].um == 1.0 && fabs(lv[i].um - rel) < 0.02 * rel)) { snprintf(k, sizeof k, "%s/%s", group, lv[i].path); return z3_open(st, k, cache); }
+        return nullptr;
+    }
+    snprintf(k, sizeof k, "%s/%d", group, level);   /* plain integer level names */
+    return z3_open(st, k, cache);
+}
+static z3 *open_level(store *st, const char *group, int level, double um0) { return pyramid_open_level(st, group, level, um0, g_cache); }
+
+z3 *source_ct(source *s, int level) {
+    if (level < 0 || level >= MAXLEV || s->ct_present[level] == 0) return nullptr;
+    if (!s->ct[level]) {
+        s->ct[level] = open_level(s->s, s->ct_key, level, s->um);
+        s->ct_present[level] = s->ct[level] != nullptr;
+    }
+    return s->ct[level];
+}
+
+z3 *source_tgt(source *s, int ch, int level) {
+    if (!s->tgt_key[ch] || level < 0 || level >= MAXLEV || s->tgt_present[ch][level] == 0) return nullptr;
+    if (!s->tgt[ch][level]) {
+        s->tgt[ch][level] = open_level(s->tgt_store[ch] ? s->tgt_store[ch] : s->s, s->tgt_key[ch], level, s->um);
+        s->tgt_present[ch][level] = s->tgt[ch][level] != nullptr;
+    }
+    return s->tgt[ch][level];
+}
+
+int source_region_shared(const source *s, int ch) { return s->reg[ch] && s->reg[ch]->array != nullptr; }
+
+z3 *source_region(source *s, int ch, int i) {
+    regions *r = s->reg[ch];
+    if (!r || i < 0 || i >= r->n) return nullptr;
+    store *st = s->tgt_store[ch] ? s->tgt_store[ch] : s->s;
+    if (r->array) {
+        if (!s->reg_shared[ch]) s->reg_shared[ch] = open_level(st, r->array, 0, s->um);
+        return s->reg_shared[ch];
+    }
+    if (!s->reg_z[ch][i]) {
+        char k[1024];
+        snprintf(k, sizeof k, "%s/region_%lld_%lld_%lld.zarr", r->dir, (long long)r->origin[i][0],
+                 (long long)r->origin[i][1], (long long)r->origin[i][2]);
+        s->reg_z[ch][i] = z3_open(st, k, g_cache);
+    }
+    return s->reg_z[ch][i];
+}
+
+void sources_set_cache(const char *dir) { g_cache = dir; }
