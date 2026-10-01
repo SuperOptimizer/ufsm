@@ -9,7 +9,7 @@ mkdir -p runs/$name
 ./build/ufsm train ${CCFG:-configs/all2.json} --out runs/$name --gpus 0,1 --P ${CP:-64} --B ${CB:-4} --steps ${CSTEPS:-40000} --lr 1e-3 --warmup 500 --sched wsd --cooldown 0.2 \
   --soft 3 --intonly 1 --down-norm 1 --opt muon --muon-lr 0.01 --workers 32 --val-batches 8 --log-every 100 --val-every 2000 --ckpt-every 10000 "$@" > runs/$name.train.log 2>&1
 echo "$name: $(grep 'done in' runs/$name.train.log) skips $(grep -c non-finite runs/$name.train.log) best val $(grep -v '^step' runs/$name/log.csv | awk -F, '$8!=""{print $1,$8}' | sort -k2 -g | head -1)"
-python3 tools/eval_holdouts.py runs/$name/best.ckpt --sources ${CCFG:-configs/all2.json} --out /vesuvius/ufsm/eval/$name --gpu 1 --level 1 2>&1 | grep -E "^==|^0.50" | paste - - | awk '{print $2, $8}' > runs/$name.scores
+python3 tools/eval_holdouts.py runs/$name/last.ckpt --sources ${CCFG:-configs/all2.json} --out /vesuvius/ufsm/eval/$name --gpu 1 --level 1 2>&1 | grep -E "^==|^0.50" | paste - - | awk '{print $2, $8}' > runs/$name.scores
 # per-box comparison with the baseline (F1 at 0.5) and the mean difference
 python3 - "$name" "$base" <<'PY'
 import sys, os, glob, subprocess

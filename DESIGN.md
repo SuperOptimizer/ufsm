@@ -474,6 +474,14 @@ Lean 2 merged (no gradient buffer B): 2 GPUs data parallel, B1 per GPU, `--mem a
 512^3 MX-fp8 chunked lean 0.94 samples/s = 0.126 Gvoxel/s; 544^3 + lean 2 0.81 = 0.130; 576^3 + recompute 2 + lean 2
 0.62 = 0.118. Per-voxel rate is flat up to 544^3 (single GPU: 66 Mvoxel/s at 448-544, 59 at 576).
 
+Scoring correction (2026-10-01 night): the 6000-step stairs scored best.ckpt, chosen by an 8-batch validation loss;
+several runs picked a half-trained checkpoint (f2s0 step 2500: 0.234; its rerun with the same flags picked 6000: 0.308).
+Re-scored with last.ckpt (end of the cosine schedule): fp4 wgrad layout 2 seed 1 0.203 (still fails); `--fp4 2`
+(layout 1, MX-fp8 gradients) 0.299 / 0.284 vs `--fp4 1` 0.307 / 0.284 (passes; with 16-bit gradients seed 0 0.297);
+MX-fp8 gradients seeds 0-2 0.307 / 0.284 / 0.284 vs `--fp4 1` seed 2 0.285 (passes); windows at equal voxel budget
+64^3 0.300, 128^3 0.347, 256^3 0.292. Stairs and confirm_run.sh now score last.ckpt. `ufsm train` defaults to
+`--fp4 2` (fp4 weight gradients, per-32 x scales; 1-4% faster per step than `--fp4 1`).
+
 ### Sampler on the 17-source set (2026-10-01 evening)
 - On configs/all2.json the sampler collapsed to 34 patches/s (16 workers) and got slower with 32: 331 lazy store
   opens (one remote metadata fetch each, 70-500 ms) serialised on the open mutex, paid by every worker's first draws
