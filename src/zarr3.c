@@ -358,7 +358,7 @@ static void *worker(void *arg) {
         snprintf(item, sizeof item, "%d", w->ci < 0 ? 0 : w->ci);
         size_t n;
         uint8_t *b = cache_get(z, skey, item, &n);
-        if (b) atomic_fetch_add(&g_z3_cache_hits, 1); else atomic_fetch_add(&g_z3_store_reads, 1);
+        if (b) atomic_fetch_add(&g_z3_cache_hits, 1); else { atomic_fetch_add(&g_z3_store_reads, 1); if (getenv("UFSM_Z3_TRACE")) fprintf(stderr, "z3 store read: %s item %s (window %lld %lld %lld)\n", skey, item, (long long)jb->o[0], (long long)jb->o[1], (long long)jb->o[2]); }
         if (!b) {
             if (w->ci < 0) {
                 b = store_read_all(z->s, skey, &n);

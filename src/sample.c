@@ -107,7 +107,7 @@ struct sampler {
     atomic_int stop;
     atomic_uint_fast64_t produced, rejected;
     atomic_uint soft_bits;   /* current soft-target sigma (float bits), set by sampler_set_soft */
-    atomic_uint_fast64_t prof_ns[12];   /* per-stage nanoseconds (env UFSM_SAMPLER_PROF): read, targets, dilate, soft, trust, encode, zscore, augment, x16, other */
+    atomic_uint_fast64_t prof_ns[16];   /* per-stage nanoseconds (env UFSM_SAMPLER_PROF): read, targets, dilate, soft, trust, encode, zscore, augment, x16, other */
     int prof;
     double *cum;   /* cumulative source weights */
     struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } *occ;   /* per source: coarse label cells containing papyrus (guides the position draw) */
@@ -157,8 +157,8 @@ static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
 /* Fill patch i of batch b. Returns 0 on success, 1 if rejected (try again), -1 on I/O error. */
 static double tnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 #define PROF_MARK(stage) do { if (sp->prof) { double t_ = tnow(); atomic_fetch_add(&sp->prof_ns[stage], (uint_fast64_t)((t_ - pt) * 1e9)); pt = t_; } } while (0)
-enum { PS_READ, PS_TARGETS, PS_DILATE, PS_SOFT, PS_TRUST, PS_ENCODE, PS_ZSCORE, PS_AUGMENT, PS_X16, PS_N };
-static const char *prof_names[PS_N] = {"read", "targets", "dilate", "soft", "trust", "encode", "zscore", "augment", "x16"};
+enum { PS_SRC, PS_LEVEL, PS_PICK, PS_PROBE, PS_READ, PS_STATS, PS_TARGETS, PS_DILATE, PS_SOFT, PS_TRUST, PS_ENCODE, PS_ZSCORE, PS_AUGMENT, PS_X16, PS_N };
+static const char *prof_names[PS_N] = {"src", "level", "pick", "probe", "ctread", "ctstats", "targets", "dilate", "soft", "trust", "encode", "zscore", "augment", "x16"};
 /* 3-4-5 chamfer distance (3 per voxel step) from the voxels of t that are annotated surface (0 < t < 255): two raster
    passes. Returns 0 (dm all CH_INF) when the patch has no surface. */
 #define CH_INF 60000
@@ -214,8 +214,10 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     /* regions target? pick one region, then a level in {0,1} */
     int region_ch = -1, ri = -1;
     for (int ch = 0; ch < NCH; ch++) if (s->reg[ch] && s->reg[ch]->n) region_ch = ch;
+    PROF_MARK(PS_SRC);
     int l = pick_level(sp, s, r, region_ch);
     if (l < 0) return 1;
+    PROF_MARK(PS_LEVEL);
     z3 *ct = source_ct(s, l);
     const z3_meta *m = z3_meta_of(ct);
     int64_t o[3], n[3] = {P, P, P};
@@ -257,6 +259,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         for (int d = 0; d < 3; d++) { int64_t a = o[d] << l; if (a + span <= s->hold_o[d] || a >= s->hold_o[d] + s->hold_n[d]) hit = 0; }
         if (hit) return 1;
     }
+    PROF_MARK(PS_PICK);
     /* cheap occupancy test on a coarse level before fetching the fine cube */
     int lc = l + 3;
     z3 *cct = lc < MAXLEV ? source_ct(s, lc) : nullptr;
@@ -268,14 +271,16 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         for (size_t k = 0; k < tot; k++) nz += big[k] != 0;
         if ((double)nz / (double)tot < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); return 1; }
     }
+    PROF_MARK(PS_PROBE);
     /* CT */
     uint8_t *ctu = big;
     if (z3_read(ct, o, n, ctu, 1)) return -1;
+    PROF_MARK(PS_READ);
     size_t nz = 0;
     double sum = 0, sq = 0;
     for (size_t k = 0; k < p3; k++) { nz += ctu[k] != 0; sum += ctu[k]; sq += (double)ctu[k] * ctu[k]; }
     if ((double)nz / (double)p3 < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); return 1; }
-    PROF_MARK(PS_READ);
+    PROF_MARK(PS_STATS);
     /* targets */
     uint8_t w[NCH] = {0};
     int tmax = 0;
@@ -372,16 +377,16 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         double cy, cx;
         axis_at(&s->ax, (double)(o[0] + z) * scale, &cy, &cx);
         cy /= scale; cx /= scale;
+        const float fm = (float)mean, isd = (float)(1.0 / sd), dx0 = (float)((double)o[2] - cx);   /* float per voxel: the offsets are small */
+        const int axis = s->ax.n > 0;
         for (int y = 0; y < P; y++) {
-            double dy = (double)(o[1] + y) - cy;
-            for (int x = 0; x < P; x++) {
-                size_t k = ((size_t)z * P + y) * P + x;
-                double dx = (double)(o[2] + x) - cx, nn = sqrt(dy * dy + dx * dx) + 1e-6;
-                xc[k] = (float)((ctu[k] - mean) / sd);
-                rz_[k] = 0;
-                ry[k] = s->ax.n ? (float)(dy / nn) : 0;
-                rx[k] = s->ax.n ? (float)(dx / nn) : 0;
-            }
+            float dy = (float)((double)(o[1] + y) - cy);
+            size_t row = ((size_t)z * P + y) * P;
+            float *xcr = xc + row, *ryr = ry + row, *rxr = rx + row; const uint8_t *cr = ctu + row;
+            for (int x = 0; x < P; x++) xcr[x] = ((float)cr[x] - fm) * isd;
+            memset(rz_ + row, 0, (size_t)P * sizeof(float));
+            if (axis) for (int x = 0; x < P; x++) { float dx = dx0 + (float)x, inv = 1.f / (sqrtf(dy * dy + dx * dx) + 1e-6f); ryr[x] = dy * inv; rxr[x] = dx * inv; }
+            else { memset(ryr, 0, (size_t)P * sizeof(float)); memset(rxr, 0, (size_t)P * sizeof(float)); }
         }
     }
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
@@ -530,12 +535,14 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction) {
             z3 *ct = source_ct(s, l); if (!ct) continue;
             const z3_meta *m = z3_meta_of(ct);
             int want_window = l <= maxlev, want_probe = l >= 3 && l - 3 <= maxlev;   /* probe reads at level l serve training levels l-3 */
-            if (!want_window && !want_probe) continue;
+            int whole = l >= 4;   /* the occupancy index reads the coarsest level in full at every start: cache it entirely */
+            if (!want_window && !want_probe && !whole) continue;
             int64_t ng[3]; for (int d = 0; d < 3; d++) ng[d] = (m->shape[d] + m->chunk[d] - 1) / m->chunk[d];
             size_t total = (size_t)ng[0] * ng[1] * ng[2];
             uint8_t *bits = calloc((total + 7) / 8, 1);
             int dl = o.lev - l; int64_t f = dl >= 0 ? (int64_t)1 << dl : 1;
-            for (size_t k = 0; k < ncell; k++) {
+            if (whole) { int64_t lo[3] = {0, 0, 0}, hi[3] = {ng[0] - 1, ng[1] - 1, ng[2] - 1}; pf_mark(bits, ng, lo, hi); }
+            for (size_t k = 0; k < ncell && !whole; k++) {
                 uint32_t id = o.idx[k];
                 int64_t cc[3] = {(int64_t)(id / (o.shape[1] * o.shape[2])), (int64_t)((id / o.shape[2]) % o.shape[1]), (int64_t)(id % o.shape[2])};
                 int64_t lo[3], hi[3];
