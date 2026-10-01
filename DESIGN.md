@@ -388,6 +388,16 @@ trained with mx4 do not need that). Speed at 96^3 B2 (agent, quiet GPU): inferen
 ms, memory 0.228 / 0.205 / 0.111 GB; training 32.8 / 33.3 / 33.6 ms (the 16-channel fp8-path convs and the MX GN
 backward are the regressions being fixed), memory 0.540 / 0.458 / 0.363 GB.
 
+### GroupNorm backward (2026-10-01 evening)
+Timeline of a fp16 training step (nsys): conv forward/backward-data 47%, conv weight gradient 29%, GroupNorm backward
+17%, the rest 7%. tests/bench_gn vs a device copy of the same bytes: level 0 (96^3 x 16) and level 1 (48^3 x 32) run
+at the DRAM rate already; levels 2-3 and the down-conv norms were launch-bound (a fixed 32 slabs per channel gave
+blocks of ~50 elements). Slab count now adapts to >= 8k elements per block (b83f932): 24^3x64 0.127 -> 0.019 ms,
+12^3x80 0.154 -> 0.014 ms; whole step (prof_infer, same GPU, A/B builds): GN 4.20 -> 3.28 ms, step 33.16 -> 32.23 ms.
+A fused one-block-per-group kernel was slower except at 12^3 and was dropped; the same change to the conv bias
+reduction made no measurable difference. What remains of the GN backward is at the memory floor; the next step there
+is fusing its two passes into the conv epilogue / staging (kernel agent).
+
 ### Run lengths (2026-10-01 evening)
 - Under Muon the 6000-step yardstick reaches the F1 that AdamW needed 120k steps for, and r10's validation loss has
   been flat (0.94-0.99) since step 50k of its constant-lr phase. Decisions therefore use the 6000-step paired
