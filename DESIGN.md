@@ -406,6 +406,24 @@ A fused one-block-per-group kernel was slower except at 12^3 and was dropped; th
 reduction made no measurable difference. What remains of the GN backward is at the memory floor; the next step there
 is fusing its two passes into the conv epilogue / staging (kernel agent).
 
+### fp4 training stairs (2026-10-01 evening; 6000 steps, MANBp, det, Muon lr 0.01, down_norm, mx4 storage, SR on
+gradient operands; peak F1 over cutoffs; fp16 references 0.291 (seed 0) / 0.312 (seed 1))
+
+| stair | policy | seed 0 | seed 1 |
+|---|---|---|---|
+| S1 fp4 forward | all=fp4:fp8:fp8 | 0.304 | 0.305 |
+| S1 + fp4 weight gradient (Hadamard + SR on x) | all=fp4:fp8:fp4 | 0.294 | |
+| S1 + fp4 weight gradient (plain) | all=fp4:fp8:fp4 | 0.287 | |
+| S2 fp4 backward-data | all=fp4:fp4:fp8 | 0.299 | |
+| all fp4 | all=fp4:fp4:fp4 | 0.281 | |
+
+(enc0.c1 stays 16-bit in every policy.) One-step gradient errors (0.7-0.9 whole-net with mx4 storage, 14% for the fp4
+weight gradient alone vs 3% fp8) do not predict the outcome: every stair so far trains within 0.02 of fp16. Step time
+at 96^3 B2 (agent, idle GPU): fp16 32.7, S1 29.8, S2 29.5 ms; the fp4 weight-gradient kernel is slower than fp8 (step
+32.0 / 33.3 ms with Hadamard) and is being sped up before it can be a default. One failed fp16 seed-1 reference
+(peak 0.100, memorised a narrow set) traced to a transient remote open failure silently dropping a level under the
+parallel eager open (fixed in 970ce89 with retries); its rerun on the same build trained normally.
+
 ### Run lengths (2026-10-01 evening)
 - Under Muon the 6000-step yardstick reaches the F1 that AdamW needed 120k steps for, and r10's validation loss has
   been flat (0.94-0.99) since step 50k of its constant-lr phase. Decisions therefore use the 6000-step paired
