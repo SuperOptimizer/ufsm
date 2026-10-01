@@ -193,8 +193,10 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   intensity jitter alone is harmless or better (`--intonly`: 0.18 at recall 0.17, F1 0.175 at 2000 steps), so the next
   run uses intensity-only augmentation. Without it, 4000
   steps on MANBp reach holdout precision 0.17 at recall 0.34 (F1 0.23, band precision 0.39) and are still improving. `ufsm prefetch` warms the CT chunk cache for every labelled cell (5.2 GB for the four pyramid sources at
-  levels 0-1, 32 connections, ~27 MB/s), after which training is decode-bound instead of network-bound. Run r4 = r3
-  settings + soft target + no augmentation.
+  levels 0-1, 32 connections, ~27 MB/s), after which training is decode-bound instead of network-bound. Run r4 (r3 settings + soft target + no augmentation, 30k steps) reached
+  validation 0.827 (from 0.93) and holdout F1 0.19 (precision 0.17 at recall 0.20; band precision 0.39 at recall 0.29),
+  about 4x chance; the curve was still descending when the cosine schedule ended. Run r5: eight sources (adds PHerc1667
+  and the three PHerc0139 winding-range zarrs), intensity-only augmentation, 40k steps.
 
 ## Status (2026-09-30 night)
 - M0 reader + CLI + sampler: done, tested (bit-exact zarr3 reads, sampler montages checked by eye).

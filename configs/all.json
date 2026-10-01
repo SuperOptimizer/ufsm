@@ -71,6 +71,75 @@
    "axis": "/vesuvius/ufsm/gt/axis/PHerc0343P.json"
   },
   {
+   "name": "PHerc1667-hf",
+   "root": "/vesuvius/usrm/volcomp",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "um": 2.399,
+   "targets": {
+    "recto": {
+     "root": "/vesuvius/ufsm/gt/labels/SCROLLS_HEL_2.399um_78keV_0.22m_PHerc_1667_TA_0001_masked_surface.zarr",
+     "group": "."
+    }
+   },
+   "weight": 1.0,
+   "trust_band": 8,
+   "holdout": [
+    8192,
+    6144,
+    8192,
+    1024,
+    1024,
+    1024
+   ],
+   "axis": "/vesuvius/usrm/umbilicus/PHerc1667/umbilicus-full-resolution.json"
+  },
+  {
+   "name": "PHerc0139-hf",
+   "root": "https://dl.ash2txt.org/community-uploads/forrest/volcomp",
+   "ct": "PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "um": 2.399,
+   "targets": {
+    "recto": {
+     "root": "/vesuvius/ufsm/gt/labels/w023-w032.zarr",
+     "group": "."
+    }
+   },
+   "weight": 1.0,
+   "trust_band": 8,
+   "holdout": [
+    13312,
+    11264,
+    11264,
+    1024,
+    1024,
+    1024
+   ],
+   "axis": "/vesuvius/usrm/umbilicus/PHerc0139/umbilicus-full-resolution.json"
+  },
+  {
+   "name": "PHerc0139-hf",
+   "root": "https://dl.ash2txt.org/community-uploads/forrest/volcomp",
+   "ct": "PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "um": 2.399,
+   "targets": {
+    "recto": {
+     "root": "/vesuvius/ufsm/gt/labels/w037-w041.zarr",
+     "group": "."
+    }
+   },
+   "weight": 1.0,
+   "trust_band": 8,
+   "holdout": [
+    23552,
+    14336,
+    11264,
+    1024,
+    1024,
+    1024
+   ],
+   "axis": "/vesuvius/usrm/umbilicus/PHerc0139/umbilicus-full-resolution.json"
+  },
+  {
    "name": "PHerc0009B-seg",
    "root": "https://dl.ash2txt.org/community-uploads/forrest/volcomp",
    "ct": "PHerc0009B/volumes/20250521125136-8.640um-1.2m-116keV-masked.zarr",
