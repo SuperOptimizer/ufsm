@@ -695,6 +695,39 @@ int main(void) {
             }
         }
     }
+    {   /* decoder conv1 weight gradient with the fused upsample on MX storage (no full-resolution transient): the up part (32 ch)
+           is interpolated from the coarse mx4 tensor in the kernels' decode, the skip (16 ch) gets gn+silu. vs the fp32
+           reference, and vs the same kernel on an fp32 materialised upsample (same values up to summation order) */
+        shape5 fs = {N, 48, 12, 12, 16}, co = {N, 32, 6, 6, 8}, fu = fs, sk = fs, o16 = fs; fu.c = 32; sk.c = 16; o16.c = 16;
+        const size_t NG = (size_t)N * G, nw = (size_t)16 * 48 * 27;
+        float *xc = dev_rand(shape_numel(co), 1.f), *xs_ = dev_rand(shape_numel(sk), 2.f), *gy = dev_rand(shape_numel(o16), 1e-3f);
+        void *xcm = mx4_from(xc, co), *xsm = mx4_from(xs_, sk); float *xcd = deq4(xcm, co), *xsd = deq4(xsm, sk);
+        float *gam = dev_rand(16, 1.f), *bet = dev_rand(16, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+        float *up = dev_zero(shape_numel(fu)), *t = dev_zero(shape_numel(sk)), *cat = dev_zero(shape_numel(fs)), *gr = dev_zero(nw), *gw = dev_zero(nw), *gw2 = dev_zero(nw);
+        mode_ref(); nn_up2_fwd_into(xcd, co, up, 32, 0); nn_gn_silu_apply(xsd, sk, G, gam, bet, mean, rstd, t); nn_concat_fwd(up, 32, t, 16, fs, cat);
+        nn_conv3d_bwd_weight(cat, fs, gy, o16, 3, 1, gr, nullptr);
+        nn_gn_t g2 = {gam, bet, mean, rstd, G};
+        mode_mx(); int rv = nn_conv3d_bwd_weight_x(xcm, NULL, xsm, &g2, 32, 1, fs, gy, o16, 3, 1, gw, NULL);
+        if (rv) { printf("  dec conv1 wgrad fused up (MX): unsupported (rv %d)  FAIL\n", rv); bad++; }
+        else cmp("dec conv1 wgrad fused up from coarse mx4 (fp8)", gw, gr, nw, TOL);
+        gnp_t gpn = {0}, gq = {gam, bet, mean, rstd, G};
+        split_t su = {0}; su.x2 = xsm; su.c_split = 32; su.gp2 = gq; su.up = 1;
+        split_t sf = {0}; sf.x2 = xsd; sf.c_split = 32; sf.gp2 = gq;
+        nn_zero(gw, nw * 4); nn_zero(gw2, nw * 4);
+        lp_bwd_w_f8(xcm, 4, fs, gy, 0, o16, gw, nullptr, gpn, su);
+        lp_bwd_w_f8(up, 0, fs, gy, 0, o16, gw2, nullptr, gpn, sf);
+        cmp("dec conv1 wgrad fused up (fp8) vs materialised fp32 up", gw, gw2, nw, 5e-3);
+        for (int had = 0; had < 6; had += 5) {   /* fp4 plain (default layout), H16 (4|1 = 5) */
+            nn_zero(gw, nw * 4); nn_zero(gw2, nw * 4);
+            lp_bwd_w_f4(xcm, 4, fs, gy, 0, o16, gw, nullptr, gpn, su, had);
+            lp_bwd_w_f4(up, 0, fs, gy, 0, o16, gw2, nullptr, gpn, sf, had);
+            char nm[96]; snprintf(nm, sizeof nm, "dec conv1 wgrad fused up (fp4%s) vs fp32 reference", had ? ", H16" : "");
+            cmp(nm, gw, gr, nw, 0.25);
+            snprintf(nm, sizeof nm, "dec conv1 wgrad fused up (fp4%s) vs materialised fp32 up", had ? ", H16" : "");
+            cmp(nm, gw, gw2, nw, 0.03);   /* bf16 tile rounding of the interpolated values (rare e2m1 flips) */
+        }
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
     printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);

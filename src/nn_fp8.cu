@@ -269,6 +269,45 @@ __device__ __forceinline__ void ldmx8_8(const void *gyv, int N, int C, size_t S,
         q[j] = j < nv ? d.x * mx_scale(s4 >> (8 * (j & 3)) & 255u) : 0.f; q[j + 1] = j + 1 < nv ? d.y * mx_scale(s4 >> (8 * ((j + 1) & 3)) & 255u) : 0.f;
     }
 }
+/* v[q] += w * (entry nib + q of the stored block row of voxel off), q < CH: one row-word load per 8 (mx4) / 4 (mx8) channels */
+template <typename T, int CH> __device__ __forceinline__ void mx_rowch_add(const chan_t &c0, size_t off, float w, float *v) {
+    const float sc = mx_scale(c0.sp[off]);
+    if constexpr (IS_MX4(T)) {
+        const unsigned *rw = (const unsigned *)((const uint8_t *)c0.p + off * c0.rb + (c0.nib >> 1));
+#pragma unroll
+        for (int i = 0; i < CH / 8; i++) {
+            const unsigned u = __ldg(rw + i);
+#pragma unroll
+            for (int q = 0; q < 4; q++) { const float2 d = dec_e2m1x2(u >> (8 * q)); v[8 * i + 2 * q] = fmaf(w, d.x * sc, v[8 * i + 2 * q]); v[8 * i + 2 * q + 1] = fmaf(w, d.y * sc, v[8 * i + 2 * q + 1]); }
+        }
+    } else {
+        const unsigned *rw = (const unsigned *)((const uint8_t *)c0.p + off * c0.rb);   /* mx8: c.p already points at entry nib */
+#pragma unroll
+        for (int i = 0; i < CH / 4; i++) {
+            const unsigned u = __ldg(rw + i);
+            const float2 d0 = dec_e4m3x2((unsigned short)(u & 0xffffu)), d1 = dec_e4m3x2((unsigned short)(u >> 16));
+            v[4 * i] = fmaf(w, d0.x * sc, v[4 * i]); v[4 * i + 1] = fmaf(w, d0.y * sc, v[4 * i + 1]);
+            v[4 * i + 2] = fmaf(w, d1.x * sc, v[4 * i + 2]); v[4 * i + 3] = fmaf(w, d1.y * sc, v[4 * i + 3]);
+        }
+    }
+}
+/* the CH channels at fine voxel (gz, gy, gx) (dims D, H, W): stored directly, or (up) the exact 2x trilinear upsample of the
+   half-resolution tensor c0 describes (align_corners = false, edge clamp; the weights and order of stage_up32) */
+template <typename T, int CH> __device__ __forceinline__ void mx_rowch(const chan_t &c0, bool up, int gz, int gy, int gx, int D, int H, int W, float *v) {
+#pragma unroll
+    for (int q = 0; q < CH; q++) v[q] = 0.f;
+    if (!up) { mx_rowch_add<T, CH>(c0, ((size_t)gz * H + gy) * W + gx, 1.f, v); return; }
+    const int Dc = D >> 1, Hc = H >> 1, Wc = W >> 1;
+    const int mz[2] = {gz >> 1, min(max((gz >> 1) + ((gz & 1) ? 1 : -1), 0), Dc - 1)}, my[2] = {gy >> 1, min(max((gy >> 1) + ((gy & 1) ? 1 : -1), 0), Hc - 1)},
+              mx[2] = {gx >> 1, min(max((gx >> 1) + ((gx & 1) ? 1 : -1), 0), Wc - 1)};
+#pragma unroll
+    for (int a = 0; a < 2; a++)
+#pragma unroll
+        for (int b = 0; b < 2; b++)
+#pragma unroll
+            for (int c = 0; c < 2; c++)
+                mx_rowch_add<T, CH>(c0, ((size_t)mz[a] * Hc + my[b]) * Wc + mx[c], (a ? 0.25f : 0.75f) * (b ? 0.25f : 0.75f) * (c ? 0.25f : 0.75f), v);
+}
 __device__ __forceinline__ void mx4_row32(const chan_t &c0, size_t off, bool ok, float *v) { mx_row32<4>(c0, off, ok, v); }
 __device__ __forceinline__ float act_ab(float v, float a, float b, bool G);
 /* the 32 staged values of one position (voxel offset off, inb = inside the tensor) for the 32-channel chunk described by
@@ -1161,14 +1200,16 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
     /* MX x whose CH channels are consecutive entries of one stored block row (the common case): the voxel's row words are
        loaded and decoded once for all CH channels (thread per voxel), instead of one strided byte per (channel, voxel) */
     bool uni = false;
+    const bool upt = sp.up && ci0 < Cx;   /* fused decoder upsample: this tile reads the half-resolution x (host: Cx % CH == 0) */
     if constexpr (IS_MX(T)) {
-        if (threadIdx.x < CH) { const int ci = ci0 + threadIdx.x; ctab8[threadIdx.x] = make_chan(ci < Ci ? ci : Ci, Ci, Cx, n, plane, x, sp, gp, N); }
+        if (threadIdx.x < CH) { const int ci = ci0 + threadIdx.x; ctab8[threadIdx.x] = make_chan(ci < Ci ? ci : Ci, Ci, Cx, n, upt ? plane / 8 : plane, x, sp, gp, N); }
         if (threadIdx.x < 2 * CH) amx[threadIdx.x] = 0u;
         __syncthreads();
         uni = (coop & 1) && ctab8[0].p != nullptr && (ctab8[0].nib & 7) == 0;
 #pragma unroll
         for (int q = 1; q < CH; q++) if (ctab8[q].p && (ctab8[q].sp != ctab8[0].sp || ctab8[q].nib != ctab8[0].nib + q)) uni = false;
     }
+    if (upt && !uni) __trap();   /* the per-channel paths do not upsample: the host only fuses aligned 16-channel tiles */
     for (int zt = zt_begin; zt < nzt && zt < (zc + 1) * ZC; zt++) {
         const int oz0 = zt * 2;
         const int np = zt == zt_begin ? 4 : 2, gz_first = zt == zt_begin ? oz0 - 1 : oz0 + 1;
@@ -1186,25 +1227,7 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
 #pragma unroll
                 for (int q = 0; q < CH; q++) v[q] = 0.f;
                 if (inb) {
-                    const size_t off = cof(c0, gz, gyy, gx, H, W);
-                    const float sc = mx_scale(c0.sp[off]);
-                    if constexpr (IS_MX4(T)) {
-                        const unsigned *rw = (const unsigned *)((const uint8_t *)c0.p + off * c0.rb + (c0.nib >> 1));
-#pragma unroll
-                        for (int w = 0; w < CH / 8; w++) {
-                            const unsigned u = __ldg(rw + w);
-#pragma unroll
-                            for (int q = 0; q < 4; q++) { const float2 d = dec_e2m1x2(u >> (8 * q)); v[8 * w + 2 * q] = d.x * sc; v[8 * w + 2 * q + 1] = d.y * sc; }
-                        }
-                    } else {
-                        const unsigned *rw = (const unsigned *)((const uint8_t *)c0.p + off * c0.rb);   /* mx8: c.p already points at channel nib */
-#pragma unroll
-                        for (int w = 0; w < CH / 4; w++) {
-                            const unsigned u = __ldg(rw + w);
-                            const float2 d0 = dec_e4m3x2((unsigned short)(u & 0xffffu)), d1 = dec_e4m3x2((unsigned short)(u >> 16));
-                            v[4 * w] = d0.x * sc; v[4 * w + 1] = d0.y * sc; v[4 * w + 2] = d1.x * sc; v[4 * w + 3] = d1.y * sc;
-                        }
-                    }
+                    mx_rowch<T, CH>(c0, upt, gz, gyy, gx, D, H, W, v);   /* upt: the tile is the half-resolution x segment of a decoder conv */
 #pragma unroll
                     for (int q = 0; q < CH; q++) { const chan_t &cq = ctab8[q]; v[q] = cq.p ? act_ab(v[q], cq.a, cq.b, Gany && cq.g) : 0.f; }
                 }
@@ -1400,7 +1423,7 @@ template <int MT, int NT, typename T, typename TG> static void launch_bw8(dim3 g
 }
 template <typename T, typename TG> static void bwd_w_f8_t(const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
     int MT = ys.c >= 32 ? 2 : 1;
-    int NT = xs.c <= 8 ? 1 : MT == 1 && xs.c % 24 == 0 ? 3 : 2;   /* 24 input channels per block when cout = 16: gy restaged less (dec0.c1: -6%) */
+    int NT = xs.c <= 8 ? 1 : MT == 1 && xs.c % 24 == 0 && !sp.up ? 3 : 2;   /* 24 input channels per block when cout = 16: gy restaged less (dec0.c1: -6%); fused up: 16-channel tiles */
     if (getenv("UFSM_F8_NT")) NT = atoi(getenv("UFSM_F8_NT"));
     if (getenv("UFSM_F8_MT")) MT = atoi(getenv("UFSM_F8_MT"));
     size_t smem = (size_t)8 * NT * X8_CS + 16 * MT * (G8_CS + 8) + 8 * NT * 4 + 16 * MT * 4 + 16 + 32 + (size_t)8 * NT * (sizeof(chan_t) + 8);   /* + MX x channel table, amax */
@@ -3242,14 +3265,16 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
     const bool vec = (W & 3) == 0;
     const int zt_begin = zc * ZC;
     bool mxu = false;
+    const bool upt = sp.up && ci0 < Cx;   /* fused decoder upsample (see conv_bwd_w_f8_k) */
     if constexpr (IS_MX(T)) {
-        if (threadIdx.x < CH) { const int ci = ci0 + threadIdx.x; ctab4[threadIdx.x] = make_chan(ci < Ci ? ci : Ci, Ci, Cx, n, plane, x, sp, gp, N); }
+        if (threadIdx.x < CH) { const int ci = ci0 + threadIdx.x; ctab4[threadIdx.x] = make_chan(ci < Ci ? ci : Ci, Ci, Cx, n, upt ? plane / 8 : plane, x, sp, gp, N); }
         __syncthreads();
         mxu = LY != 0 && (had & 8) == 0 && ctab4[0].p != nullptr && (ctab4[0].nib & 7) == 0;   /* had bit 3: per-element path (test hook); LY 0
                                                                                                  keeps the per-channel reads (its tile would cost an SM block) */
 #pragma unroll
         for (int q = 1; q < CH; q++) if (ctab4[q].p && (ctab4[q].sp != ctab4[0].sp || ctab4[q].nib != ctab4[0].nib + q)) mxu = false;
     }
+    if (upt && !mxu) __trap();   /* only the tile path upsamples (host: LY 1-3, aligned 16-channel tiles) */
     for (int zt = zt_begin; zt < nzt && zt < (zc + 1) * ZC; zt++) {
         const int oz0 = zt * 2;
         const int np = zt == zt_begin ? 4 : 2, gz_first = zt == zt_begin ? oz0 - 1 : oz0 + 1;
@@ -3268,28 +3293,8 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
                 float v[CH];
 #pragma unroll
                 for (int q = 0; q < CH; q++) v[q] = 0.f;
-                if (gz >= 0 && gz < D && gyy >= 0 && gyy < H && gx >= 0 && gx < W) {
-                    const chan_t c0 = ctab4[0];
-                    const size_t off = cof(c0, gz, gyy, gx, H, W);
-                    const float sc = mx_scale(c0.sp[off]);
-                    if constexpr (IS_MX4(T)) {
-                        const unsigned *rw = (const unsigned *)((const uint8_t *)c0.p + off * c0.rb + (c0.nib >> 1));
-#pragma unroll
-                        for (int w = 0; w < CH / 8; w++) {
-                            const unsigned u = __ldg(rw + w);
-#pragma unroll
-                            for (int q = 0; q < 4; q++) { const float2 d = dec_e2m1x2(u >> (8 * q)); v[8 * w + 2 * q] = d.x * sc; v[8 * w + 2 * q + 1] = d.y * sc; }
-                        }
-                    } else {
-                        const unsigned *rw = (const unsigned *)((const uint8_t *)c0.p + off * c0.rb);
-#pragma unroll
-                        for (int w = 0; w < CH / 4; w++) {
-                            const unsigned u = __ldg(rw + w);
-                            const float2 d0 = dec_e4m3x2((unsigned short)(u & 0xffffu)), d1 = dec_e4m3x2((unsigned short)(u >> 16));
-                            v[4 * w] = d0.x * sc; v[4 * w + 1] = d0.y * sc; v[4 * w + 2] = d1.x * sc; v[4 * w + 3] = d1.y * sc;
-                        }
-                    }
-                }
+                if (gz >= 0 && gz < D && gyy >= 0 && gyy < H && gx >= 0 && gx < W) mx_rowch<T, CH>(ctab4[0], upt, gz, gyy, gx, D, H, W, v);   /* up: the
+                    interpolated value is rounded to bf16 here (raw stored values are exact) */
 #pragma unroll
                 for (int q = 0; q < CH; q++) xt[(q * 10 + row) * 24 + 3 + pp] = __float2bfloat16(v[q]);   /* raw decoded value: exact in bf16 */
             }
@@ -3702,7 +3707,7 @@ template <typename T, typename TG> static void bwd_w_f4_t(const void *x, shape5 
        granularity, one rounding per value); 0 = the 27 shifted blocks (always used with the Hadamard or x SR) */
     const int lay = (had & 4) ? 3 : (had & 3) ? 0 : lay_env;   /* had bit 2: the H16 variant (UFSM_F4_HAD_W=2) -> LY 3 */
     int MT = ys.c >= 32 ? 2 : 1;
-    int NT = xs.c <= 8 ? 1 : (lay == 2 || (lay == 3 && !IS_MX(T))) && MT == 1 && xs.c % 24 == 0 ? 3 : 2;   /* NT 3 (as fp8 on dec0.c1) only fits 2 blocks / SM with the LY 2 tile */
+    int NT = xs.c <= 8 ? 1 : (lay == 2 || (lay == 3 && !IS_MX(T))) && !sp.up && MT == 1 && xs.c % 24 == 0 ? 3 : 2;   /* NT 3 (as fp8 on dec0.c1) only fits 2 blocks / SM with the LY 2 tile */
     if (nt_env > 0) NT = nt_env;
     if (mt_env > 0) MT = mt_env;
     size_t smem = (size_t)8 * NT * ((lay >= 2 ? 976 : X4_CS) + 2 * X4_SCS) + 16 * MT * (G4_CS + 8 + 4) + 9 * 32 + (lay == 0 || lay == 3 ? 9 * 180 * 4 : 0);

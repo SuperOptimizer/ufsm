@@ -1656,7 +1656,7 @@ static int f4_had_w(void) {   /* bit 0: Hadamard (UFSM_F4_HAD_W), bit 1: stochas
     return v;
 }
 static void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
-    if (eff_prec_w() == 3 && f4_wgrad() && !sp.up) {
+    if (eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x))) {   /* sp.up: MX only (fused upsample in the tile decode) */
         if (sr_on()) sp.sr = sr_seed();
         lp_bwd_w_f4(x, ISMX(x) ? MXDT(x) : LPDT(xbf), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(gybf), ys, gw, gb, gp, sp, f4_had_w());
         return;
@@ -1987,6 +1987,24 @@ extern "C" int nn_conv3d_bwd_weight_split(const float *x, const float *x2, int c
    (more precise; keeps the transient away); MX-stored inputs cannot be read by them -> -1 (caller uses the transient) */
 /* MX inputs: the forward stages the coarse MX rows directly (fp8 / fp4 kernels, stage_up32); the MX weight gradient still
    takes the transient (UFSM_MX_UP=0: transient for the forward too) */
+/* fused decoder upsample in the MX weight gradient (UFSM_MX_UP_W, default 1): the fp8 / fp4 kernels' cooperative decode
+   interpolates the half-resolution x segment while staging (no full-resolution transient). Needs both segments MX of one
+   type, 16-channel-aligned segments (the tiles never straddle) and, for the fp4 kernel, a layout with the decoded tile
+   (not LY 0: the H32 / x-SR modes and UFSM_F4W_LAYOUT=0 keep the transient). */
+static int f4_had_w(void);
+static int f4_wgrad(void);
+static int eff_prec_w(void);
+static int mx_up_w_ok(const float *x, const float *x2, int c_split, shape5 xs) {
+    static int on = -1; if (on < 0) on = getenv("UFSM_MX_UP_W") ? atoi(getenv("UFSM_MX_UP_W")) : 1;
+    if (!on || !ISMX(x) || !ISMX(x2) || MXDT(x) != MXDT(x2) || c_split % 16 || (xs.c - c_split) % 16) return 0;
+    if (eff_prec_w() == 3 && f4_wgrad()) {
+        const int h = f4_had_w();
+        static int lay = -1; if (lay < 0) lay = getenv("UFSM_F4W_LAYOUT") ? atoi(getenv("UFSM_F4W_LAYOUT")) : 1;
+        if ((h & 3) && !(h & 4)) return 0;   /* LY 0 */
+        if (!(h & 7) && lay == 0) return 0;
+    }
+    return 1;
+}
 static int up_kernel_ok(const float *x, const float *x2, int wgrad) {
     static int mxup = -1; if (mxup < 0) mxup = getenv("UFSM_MX_UP") ? atoi(getenv("UFSM_MX_UP")) : 1;
     if (ISMX(x) || ISMX(x2)) return mxup && !wgrad && ISMX(x) && MXDT(x) == MXDT(x2);
@@ -2035,7 +2053,7 @@ extern "C" int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const f
     gnp_t gp = to_gnp(gx);
     if (k == 3 && stride == 1) {
         split_t sp; if (xsplit(x2, gx, gx2, c_split, up, xs, &sp)) return -1;
-        if (up && !up_kernel_ok(x, x2, 1)) return -1;
+        if (up && !up_kernel_ok(x, x2, 1) && !mx_up_w_ok(x, x2, c_split, xs)) return -1;
         launch_bwd_w_tc(x, ABF, xs, gy, GBF, ys, gw, gb, gp, sp);
         KCHECK();
         return 0;
