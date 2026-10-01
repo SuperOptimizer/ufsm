@@ -464,6 +464,12 @@ MX-fp8 gradient storage (UFSM_GRAD_MX8, 6000-step MANBp stair under `--fp4 1`, p
 0.288 (mean 0.293) vs `--fp4 1` 0.299 / 0.308 / 0.276 (mean 0.294): passes; `train --mem auto` (default) may pick it.
 Memory per level-0 voxel under `--fp4 1`: 16-bit gradients 212 B, MX-fp8 gradients 156 B (step time equal).
 
+Largest training windows (master after the 512^3 merge, `--fp4 1 --mem auto`, B1 per GPU, 2 GPUs data parallel,
+all2_cached): planner order is by step cost (default, MX-fp8 gradients, + chunked, + recompute 2, + lean; the 16-bit
+chunked modes only under `--mem auto16`). 448^3 picks MX-fp8 gradients (15.4 of 16.4 GB), 1.39 samples/s = 0.125
+Gvoxel/s; 512^3 picks MX-fp8 + chunked + lean (15.8 GB, peak 15.85 measured), 0.81 samples/s = 0.109 Gvoxel/s (lean
+loses the upload overlap). 16-bit gradients top out at ~448^3.
+
 ### Sampler on the 17-source set (2026-10-01 evening)
 - On configs/all2.json the sampler collapsed to 34 patches/s (16 workers) and got slower with 32: 331 lazy store
   opens (one remote metadata fetch each, 70-500 ms) serialised on the open mutex, paid by every worker's first draws

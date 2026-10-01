@@ -221,14 +221,16 @@ int cmd_train(int argc, char **argv) {
         const int auto16 = !strcmp(mm, "auto16");   /* auto16: 16-bit gradients only */
         if ((!strcmp(mm, "auto") || auto16) && nn_get_tf32() && !getenv("UFSM_CHUNK_UP") && !getenv("UFSM_RECOMPUTE") && !getenv("UFSM_GRAD_MX8")) {
             static const struct { int chunk, rc, gmx, lean; const char *what; } cand[] = {
-                /* accuracy first: every 16-bit-gradient mode before the MX-fp8 ones (their stair is borderline), then step cost.
-                   Model bytes per level-0 voxel / step at 96^3 B2 (--fp4 1): default 219 / 26.4 ms, chunked 186 / 27.4, + recompute 2
-                   171 / 29.8; MX-fp8 164 / 26.2, + chunked 148 / 27.2, + recompute 2 133 / 29.8. lean: one batch buffer (no upload
-                   overlap), logits in A, logit gradient / targets / mask (and the input if copied) in B */
-                {1, 1, 0, 0, "default"}, {2, 1, 0, 0, "chunked up-part gradient (UFSM_CHUNK_UP=2)"},
-                {2, 2, 0, 0, "chunked up-part gradient + recompute 2"}, {2, 2, 0, 1, "chunked up-part gradient + recompute 2, lean"},
-                {1, 1, 1, 0, "MX-fp8 gradients (UFSM_GRAD_MX8=1)"}, {2, 1, 1, 1, "MX-fp8 gradients, chunked, lean"},
-                {2, 2, 1, 1, "MX-fp8 gradients, chunked, recompute 2, lean"}};
+                /* by step cost (MX-fp8 gradients passed their stair: 3 seeds, 0.293 vs 0.294, same speed, 25% less memory, so the
+                   16-bit chunked / recompute modes are dominated); auto16 keeps the 16-bit modes only. Model bytes per level-0 voxel /
+                   step at 96^3 B2 (--fp4 1): default 219 / 26.4 ms, chunked 186 / 27.4, + recompute 2 171 / 29.8; MX-fp8 164 / 26.2,
+                   + chunked 148 / 27.2, + recompute 2 133 / 29.8. lean: one batch buffer (no upload overlap), logits in A, logit
+                   gradient / targets / mask (and the input if copied) in B */
+                {1, 1, 0, 0, "default"}, {1, 1, 1, 0, "MX-fp8 gradients (UFSM_GRAD_MX8=1)"},
+                {2, 1, 1, 0, "MX-fp8 gradients, chunked"}, {2, 2, 1, 0, "MX-fp8 gradients, chunked, recompute 2"},
+                {2, 1, 1, 1, "MX-fp8 gradients, chunked, lean"}, {2, 2, 1, 1, "MX-fp8 gradients, chunked, recompute 2, lean"},
+                {2, 1, 0, 0, "chunked up-part gradient (UFSM_CHUNK_UP=2)"}, {2, 2, 0, 0, "chunked up-part gradient + recompute 2"},
+                {2, 2, 0, 1, "chunked up-part gradient + recompute 2, lean"}};
             const int nc = (int)(sizeof cand / sizeof cand[0]);
             size_t fmin = (size_t)-1;
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); size_t f = nn_mem_free(); if (f < fmin) fmin = f; }
@@ -244,7 +246,7 @@ int cmd_train(int argc, char **argv) {
                 need = tb + tb / 14 + trainer + ((size_t)350 << 20);   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB */
                 if (need <= fmin) pick = c;
             }
-            if (pick < 0) { pick = nc - 1; fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
+            if (pick < 0) { pick = auto16 ? nc - 1 : 5; /* the smallest mode */ fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
             else fprintf(stderr, "memory: %s, %.2f of %.2f GB free per GPU\n", cand[pick].what, need / 1e9, fmin / 1e9);
             unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean);
             lean = cand[pick].lean;
