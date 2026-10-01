@@ -51,6 +51,8 @@ build/test_mx: tests/test_mx.c build/nn.o build/nn_fp8.o
 
 build/test_unet: tests/test_unet.c build/unet.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+build/fwd_nan: tests/fwd_nan.c build/unet.o build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 build/test_fused: tests/test_fused.c build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 build/bench_lp: tests/bench_lp.c build/nn.o build/nn_fp8.o

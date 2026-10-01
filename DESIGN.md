@@ -236,6 +236,21 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   worth ~3% F1; MX gradients (`UFSM_GRAD_MX8`, 0.29 GB) stay off. The agent no longer recommends MXFP6
   (saves ~0.05 GB; MX gradients save more and exist already); NVFP4 storage was clearly worse on the synthetic task.
 
+### fp16 activation overflow (2026-10-01, run r6)
+- r6 started skipping steps at 16k with "non-finite gradient norm" and halving the gradient scale down to 1, which was the
+  wrong reflex: the loss parts were NaN, i.e. the forward itself was non-finite. The trainer now tells the two apart
+  (`non-finite forward` keeps the scale, dumps the batch to `<out>/nan_step<N>.bin`); `tests/fwd_nan.c` replays such
+  a dump through a checkpoint and prints per-block GroupNorm statistics and stored-activation extremes
+  (`unet_debug_stats`, `unet_debug_acts`).
+- Cause: two un-normalised convs in series (stride-2 down conv, then the next block's conv1) amplify the O(1) block
+  output to O(10^3..10^4) before the GroupNorm; at the deepest level with r6's weights 14 voxels of one sample
+  exceeded 65504, the fp16 finite maximum, the stored activation became inf and the sample's statistics NaN. The
+  exact fp32 kernels were finite; r5's weights left 4x more headroom (a1 ~250 at enc3 against ~1000).
+- Fix: the tensor-core epilogue saturates fp16 activation stores that feed a GroupNorm (the statistics use the stored
+  value); gradient stores are untouched so the overflow detection keeps working. GroupNorm is scale-invariant, so the
+  clamped voxels only lose a little precision. The replayed batch now matches the exact kernels. A GroupNorm after
+  each down conv would remove the amplification altogether but changes the model (candidate for a later run).
+
 ### Accuracy diagnosis (2026-10-01 morning)
 - Held-out scores of r5 (8 sources, soft sigma 3, intensity-only augmentation, 17k of 40k steps) against r4: F1 at
   threshold 0.3 per source 0.18/0.06/0.17/0.17/0.065/0.045/0.78 vs 0.19/0.05/0.16/0.16/0.06/0.045/0.77 (level 1);

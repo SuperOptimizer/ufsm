@@ -288,6 +288,8 @@ template <> __device__ __forceinline__ float f2h<float>(float v) { return v; }  
 template <typename HT> __device__ __forceinline__ float h2f(HT v);
 template <> __device__ __forceinline__ float h2f<bf16>(bf16 v) { return __bfloat162float(v); }
 template <> __device__ __forceinline__ float h2f<f16>(f16 v) { return __half2float(v); }
+template <typename T> struct is_f16 { static const bool v = false; };
+template <> struct is_f16<f16> { static const bool v = true; };
 template <typename HT> __device__ __forceinline__ unsigned packh(float a, float b);
 template <> __device__ __forceinline__ unsigned packh<bf16>(float a, float b) { __nv_bfloat162 r = __floats2bfloat162_rn(a, b); return *(unsigned *)&r; }
 template <> __device__ __forceinline__ unsigned packh<f16>(float a, float b) { __half2 r = __floats2half2_rn(a, b); return *(unsigned *)&r; }
@@ -688,6 +690,9 @@ __global__ void __launch_bounds__(fw_nth(MT), fw_blocks(MT)) conv_fwd_tc_k(const
                 for (int q = 0; q < 2; q++) {
                     int ox = ox0 + q * 8 + 2 * t;
                     float v0 = acc[m][r][q][2 * h] + bias, v1 = acc[m][r][q][2 * h + 1] + bias;
+                    if (osum && is_f16<TO>::v) {   /* activation feeding a GroupNorm, stored as fp16: saturate instead of inf (the statistics use the stored value) */
+                        v0 = fminf(fmaxf(v0, -65504.f), 65504.f); v1 = fminf(fmaxf(v1, -65504.f), 65504.f);
+                    }
                     if (!S2B && !(W & 1) && ox + 1 < W) { stv2(yp, (size_t)ox, v0, v1); ps += v0 + v1; pss += v0 * v0 + v1 * v1; continue; }   /* paired store */
                     if (ox < W) { stv(yp, (size_t)ox * (S2B ? 2 : 1), v0); ps += v0; pss += v0 * v0; }
                     if (ox + 1 < W) { stv(yp, (size_t)(ox + 1) * (S2B ? 2 : 1), v1); ps += v1; pss += v1 * v1; }

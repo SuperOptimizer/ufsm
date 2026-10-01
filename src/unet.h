@@ -30,6 +30,8 @@ const float *unet_forward_x(unet *u, const void *x, shape5 xs, int train, int x_
 shape5 unet_out_shape(const unet *u, shape5 xs);
 /* Backward from d loss / d logits (device). Gradients ACCUMULATE into the flat grad array. */
 void unet_backward(unet *u, const float *glogits);
+void unet_debug_stats(const unet *u);
+void unet_debug_acts(const unet *u);    /* stderr: per-block stored activations, non-finite counts and extremes per sample */   /* stderr: per-block GroupNorm statistics of the last forward and largest |weight| */
 /* g_h16: glogits already holds the 16-bit storage type scaled by the gradient scale (nn_set_loss_grad_h16) */
 void unet_backward_x(unet *u, const void *glogits, int g_h16);
 void unet_zero_grad(unet *u);

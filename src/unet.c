@@ -680,6 +680,60 @@ void unet_wquant(unet *u, unsigned seed) { (void)u; (void)seed; }   /* kept for 
 
 /* ---- checkpoints ---- */
 static int g_loaded_sparse = 0, g_loaded_wq = 0;   /* set by the header parser, applied by unet_load */
+/* debug: per block, the GroupNorm statistics of the last forward (mean / rstd of a1 and a2 per sample and group:
+   non-finite counts and extremes) and the largest |weight| of each conv. Localises a non-finite forward. */
+void unet_debug_stats(const unet *u) {
+    int L = u->cfg.nlev;
+    for (int i = 0; i < 2 * L - 1; i++) {
+        const block *b = i < L ? &u->enc[i] : &u->dec[2 * L - 2 - i];
+        const char *nm = i < L ? "enc" : "dec"; int li = i < L ? i : 2 * L - 2 - i;
+        int G = G_of(u, b->c1.cout); size_t n = (size_t)b->xs.n * G;
+        const float *arr[4] = {b->m1, b->r1, b->m2, b->r2}; const char *an[4] = {"m1", "r1", "m2", "r2"};
+        fprintf(stderr, "%s%d:", nm, li);
+        for (int a = 0; a < 4; a++) {
+            if (!arr[a]) { fprintf(stderr, " %s -", an[a]); continue; }
+            float *h = malloc(n * 4); nn_d2h(h, arr[a], n * 4);
+            fprintf(stderr, " %s[", an[a]);
+            for (int s_ = 0; s_ < b->xs.n; s_++) { size_t nf = 0; double mx = 0; for (int g = 0; g < G; g++) { float v = h[(size_t)s_ * G + g]; if (!isfinite(v)) nf++; else if (fabs(v) > mx) mx = fabs(v); } fprintf(stderr, "%s%zu nf, max %.3g", s_ ? "; " : "", nf, mx); }
+            fprintf(stderr, "]"); free(h);
+        }
+        size_t nw1 = (size_t)b->c1.cout * b->c1.cin * 27, nw2 = (size_t)b->c2.cout * b->c2.cin * 27;
+        float *h = malloc((nw1 > nw2 ? nw1 : nw2) * 4); double w1 = 0, w2 = 0;
+        nn_d2h(h, P(u, b->c1.w), nw1 * 4); for (size_t k = 0; k < nw1; k++) if (fabs(h[k]) > w1) w1 = fabs(h[k]);
+        nn_d2h(h, P(u, b->c2.w), nw2 * 4); for (size_t k = 0; k < nw2; k++) if (fabs(h[k]) > w2) w2 = fabs(h[k]);
+        fprintf(stderr, " max|w| %.3g %.3g\n", w1, w2); free(h);
+    }
+}
+/* debug: per sample, non-finite count and largest |value| of a stored activation tensor (16-bit or fp32 storage; not MX) */
+static void dbg_tensor(const char *nm, const float *t, shape5 s) {
+    if (!t) { fprintf(stderr, " %s -", nm); return; }
+    size_t per = (size_t)s.c * shape_spatial(s), n = (size_t)s.n * per;
+    int h16 = ABF; void *h = malloc(n * (h16 ? 2 : 4)); nn_d2h(h, t, n * (h16 ? 2 : 4));
+    fprintf(stderr, " %s[", nm);
+    for (int b = 0; b < s.n; b++) {
+        size_t nf = 0; double mx = 0;
+        for (size_t k = (size_t)b * per; k < (size_t)(b + 1) * per; k++) {
+            float v;
+            if (!h16) v = ((float *)h)[k];
+            else if (nn_get_f16()) { _Float16 x; memcpy(&x, (uint16_t *)h + k, 2); v = (float)x; }
+            else { uint32_t u32 = (uint32_t)((uint16_t *)h)[k] << 16; memcpy(&v, &u32, 4); }
+            if (!isfinite(v)) nf++; else if (fabs(v) > mx) mx = fabs(v);
+        }
+        fprintf(stderr, "%s%zu nf, max %.3g", b ? "; " : "", nf, mx);
+    }
+    fprintf(stderr, "]"); free(h);
+}
+void unet_debug_acts(const unet *u) {
+    if (act_mx8()) { fprintf(stderr, "unet_debug_acts: MX storage not supported\n"); return; }
+    int L = u->cfg.nlev;
+    for (int i = 0; i < L; i++) {
+        const block *b = &u->enc[i];
+        fprintf(stderr, "enc%d:", i); dbg_tensor("a1", b->a1, b->ys); dbg_tensor("a2", b->a2, b->ys); dbg_tensor("s2", b->s2, b->ys);
+        if (i < L - 1) { shape5 ds = u->ls[i + 1]; ds.c = u->cfg.widths[i]; dbg_tensor("down", u->downo[i], ds); }
+        fprintf(stderr, "\n");
+    }
+    for (int i = L - 2; i >= 0; i--) { const block *b = &u->dec[i]; fprintf(stderr, "dec%d:", i); dbg_tensor("a1", b->a1, b->ys); dbg_tensor("a2", b->a2, b->ys); fprintf(stderr, "\n"); }
+}
 int unet_save(const unet *u, const char *path, int step, const char *extra) {
     char tmp[1400];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);

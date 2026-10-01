@@ -25,6 +25,7 @@ typedef struct {
     int dev;
     unet *u;
     float *xb[2], *gl, *scratch; /* device batch inputs (double-buffered), loss gradient, loss scratch */
+    const float *lg;             /* logits of the last run_batch */
     uint8_t *tb[2], *mb[2], *wb[2];
     float *x; uint8_t *t, *m, *w; /* the buffers of the batch being computed */
     void *ev_up[2], *ev_done;    /* upload of buffer i finished; compute of the previous step finished */
@@ -55,10 +56,42 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     nn_event_record(d->ev_up[i], 1);
 }
 
+/* a non-finite forward: statistics of the input, targets and logits of the batch just computed (device buffer cur^1,
+   since select_buf already moved on) and a raw dump <out>/nan_step<N>.bin (x16|x32, t, m, w, logits) */
+static void diagnose_nan(gpu_state *d, int B, int P, int step, const char *out) {
+    nn_init(d->dev); nn_sync();
+    size_t p3 = (size_t)P * P * P, nx = (size_t)B * 4 * p3, nl = (size_t)B * NCH * p3;
+    int cb = d->cur ^ 1;
+    size_t xbytes_ = nx * xbytes();
+    void *hx = malloc(xbytes_); nn_d2h(hx, d->xb[cb], xbytes_);
+    uint8_t *ht = malloc((size_t)B * NCH * p3), *hm = malloc((size_t)B * p3), *hw = malloc((size_t)B * NCH);
+    nn_d2h(ht, d->tb[cb], (size_t)B * NCH * p3); nn_d2h(hm, d->mb[cb], (size_t)B * p3); nn_d2h(hw, d->wb[cb], (size_t)B * NCH);
+    float *hl = malloc(nl * 4); nn_d2h(hl, d->lg, nl * 4);
+    double xmax = 0; size_t xnf = 0;
+    for (size_t k = 0; k < nx; k++) {
+        float v;
+        if (!g_xfmt) v = ((float *)hx)[k];
+        else if (g_xfmt == 1) { _Float16 h; memcpy(&h, (uint16_t *)hx + k, 2); v = (float)h; }
+        else { uint32_t u = (uint32_t)((uint16_t *)hx)[k] << 16; memcpy(&v, &u, 4); }
+        if (!isfinite(v)) xnf++; else if (fabs(v) > xmax) xmax = fabs(v);
+    }
+    double lmax = 0; size_t lnf = 0, mcount = 0, tpos = 0;
+    for (size_t k = 0; k < nl; k++) { if (!isfinite(hl[k])) lnf++; else if (fabs(hl[k]) > lmax) lmax = fabs(hl[k]); }
+    for (size_t k = 0; k < (size_t)B * p3; k++) mcount += hm[k] != 0;
+    for (size_t k = 0; k < (size_t)B * NCH * p3; k++) tpos += ht[k] != 0 && ht[k] != 255;
+    fprintf(stderr, "step %d: non-finite forward: input non-finite %zu max|x| %.3g; logits non-finite %zu max|logit| %.3g; mask %zu of %zu; target>0 %zu; w", step, xnf, xmax, lnf, lmax, mcount, (size_t)B * p3, tpos);
+    for (int i = 0; i < B * NCH; i++) fprintf(stderr, " %d", hw[i]);
+    fprintf(stderr, "\n");
+    char fn[1500]; snprintf(fn, sizeof fn, "%s/nan_step%d.bin", out, step);
+    FILE *f = fopen(fn, "wb");
+    if (f) { int hdr[4] = {B, P, g_xfmt, NCH}; fwrite(hdr, 4, 4, f); fwrite(hx, 1, xbytes_, f); fwrite(ht, 1, (size_t)B * NCH * p3, f); fwrite(hm, 1, (size_t)B * p3, f); fwrite(hw, 1, (size_t)B * NCH, f); fwrite(hl, 4, nl, f); fclose(f); fprintf(stderr, "  batch dumped to %s\n", fn); }
+    free(hx); free(ht); free(hm); free(hw); free(hl);
+}
 /* forward + loss kernels on the uploaded batch of this GPU (asynchronous); fills gl when train. */
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 xs = {B, 4, P, P, P};
     const float *lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
+    d->lg = lg;
     shape5 os = unet_out_shape(d->u, xs);
     int prof = getenv("UFSM_PROF") != nullptr;
     if (prof) nn_prof_begin(6);
@@ -265,6 +298,9 @@ int cmd_train(int argc, char **argv) {
             for (int g = 1; g < ng; g++) nn_peer_copy(unet_grad_ptr(G[g].u), G[g].dev, unet_grad_ptr(G[0].u), G[0].dev, np * 4);
         }
         for (int g = 0; g < ng; g++) { nn_init(G[g].dev); loss += fetch_loss(&G[g], B, P, dice_w, parts[g]); active += parts[g][2 * NCH]; }
+        int fwd_nan = 0;   /* non-finite loss parts: the forward itself produced non-finite logits (not a gradient-scale overflow) */
+        for (int g = 0; g < ng; g++) for (int c = 0; c < 2 * NCH; c++) if (!isfinite(parts[g][c])) fwd_nan = 1;
+        if (fwd_nan && !overfit) diagnose_nan(&G[0], B, P, step, out);
         float lr = step <= warmup ? lr0 * (float)step / warmup : lr0 * 0.5f * (1.f + cosf(3.14159265f * (float)(step - warmup) / (float)(steps - warmup)));
         if (soft_end != sc.soft) sampler_set_soft(sp, sc.soft + (soft_end - sc.soft) * (step < steps ? (float)step / (float)steps : 1.f));
         double gn = 0;
@@ -273,8 +309,12 @@ int cmd_train(int argc, char **argv) {
             nn_init(d->dev);
             if (prof) nn_prof_begin(6);
             if (g == 0) gn = unet_grad_norm(d->u);          /* identical on every GPU after averaging */
-            if (!isfinite(gn)) {                              /* 16-bit gradient overflow: skip the step, halve the gradient scale */
-                if (g == 0) { float sc = nn_get_grad_scale(); nn_set_grad_scale(sc > 1.f ? sc * 0.5f : 1.f); fprintf(stderr, "step %d: non-finite gradient norm, skipping; grad scale -> %g\n", step, nn_get_grad_scale()); nskip++; }
+            if (!isfinite(gn) || fwd_nan) {                   /* skip the step; a 16-bit gradient overflow also halves the gradient scale */
+                if (g == 0) {
+                    if (fwd_nan) fprintf(stderr, "step %d: non-finite forward, skipping (grad scale kept at %g)\n", step, nn_get_grad_scale());
+                    else { float sc = nn_get_grad_scale(); nn_set_grad_scale(sc > 1.f ? sc * 0.5f : 1.f); fprintf(stderr, "step %d: non-finite gradient norm, skipping; grad scale -> %g\n", step, nn_get_grad_scale()); }
+                    nskip++;
+                }
                 continue;
             }
             if (clip > 0 && gn > clip) unet_clip_grad(d->u, clip);
