@@ -520,7 +520,7 @@ template <> __device__ __forceinline__ void st4<bf16>(bf16 *p, const float *v) {
 template <> __device__ __forceinline__ void st4<f16>(f16 *p, const float *v) { *(uint2 *)p = make_uint2(packh<f16>(v[0], v[1]), packh<f16>(v[2], v[3])); }
 /* slab bounds for per-(n,c) plane kernels: block y = slab of 4-aligned extent */
 __device__ __forceinline__ void slab_range(size_t S, int slab, size_t *lo, size_t *hi) {
-    size_t per = ((S + KSLAB - 1) / KSLAB + 3) & ~(size_t)3;
+    size_t per = ((S + gridDim.y - 1) / gridDim.y + 3) & ~(size_t)3;   /* slabs = gridDim.y (KSLAB for large tensors) */
     *lo = (size_t)slab * per; *hi = *lo + per < S ? *lo + per : S;
 }
 /* forward tile: FW_TZ output planes x 8 rows x 16 columns per block, one warp per (plane, row pair) */
@@ -2134,11 +2134,12 @@ static void gn_silu_bwd_t(const TI *x, shape5 s, int G, const float *gamma, cons
     int NC = s.n * s.c;
     double *ds = gn_dsums((size_t)2 * NC);
     cudaMemsetAsync(ds, 0, (size_t)2 * NC * sizeof(double));
-    gn_silu_bwd_stats_k<<<dim3(NC, KSLAB), 256>>>(x, gy, gamma, beta, mean, rstd, s.c, G, S, ds);
+    const int nsl = (int)(S / 8192 < 1 ? 1 : S / 8192 > KSLAB ? KSLAB : S / 8192);   /* >= 8k elements per block: tiny slabs were launch-bound */
+    gn_silu_bwd_stats_k<<<dim3(NC, nsl), 256>>>(x, gy, gamma, beta, mean, rstd, s.c, G, S, ds);
     d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
     float *AB = scratch + 2 * NC;   /* scratch holds 2*NC stats followed by 2*N*G group sums (nn_gn_scratch sized accordingly) */
     gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB);
-    gn_silu_bwd_apply_k<<<dim3(NC, KSLAB), 256>>>(x, gy, gamma, beta, mean, rstd, AB, gx, s.c, G, S);
+    gn_silu_bwd_apply_k<<<dim3(NC, nsl), 256>>>(x, gy, gamma, beta, mean, rstd, AB, gx, s.c, G, S);
     gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
     KCHECK();
 }
