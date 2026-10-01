@@ -1195,10 +1195,11 @@ static int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const 
         if (mdt == 4 && !ISMX(y) && !sp.y2 && !ybf) { sp.wkey = conv_wkey(); return lp_conv_fwd_f4(x, 4, xs, w, b, cout, y, 0, gp, osum, Go, sp); }   /* mx4 in, fp32 out (tests) */
         if (!mdt || MXDT(y) != mdt || (sp.x2 && MXDT(sp.x2) != mdt) || (sp.y2 && MXDT(sp.y2) != mdt)) { fprintf(stderr, "conv: MX storage needs MX inputs and outputs of one format\n"); abort(); }
         sp.wkey = conv_wkey();
+        if ((mdt == 4 || pr == 3) && g_pass == 1 && sr_on()) sp.sr = sr_seed();   /* fp4 backward-data: stochastic rounding of the (MX-fp8) gy operand */
         if (mdt == 4 || pr == 3) return lp_conv_fwd_f4(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
         return lp_conv_fwd_f8(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
     }
-    if (!ts && pr == 2 && !sp.up && g_pass == 1) { if (sr_on()) sp.sr = sr_seed(); }   /* backward-data: gy is the staged operand */
+    if (!ts && (pr == 2 || pr == 3) && !sp.up && g_pass == 1) { if (sr_on()) sp.sr = sr_seed(); }   /* backward-data: gy is the staged operand (fp8 dither / exact e2m1 SR) */
     if (!ts && pr == 2 && !sp.up) return lp_conv_fwd_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp);   /* sp.up: 16-bit kernels only */
     if (!ts && pr == 3 && !sp.up) { sp.wkey = conv_wkey(); return lp_conv_fwd_f4(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp); }
     if (pr == 4) return g_h16 ? conv_fwd_tc_f16acc<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : conv_fwd_tc_f16acc<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts);

@@ -592,6 +592,32 @@ int main(void) {
         }
         free(hx); free(hg);
     }
+    {   /* step 6: fp4 backward-data is the adjoint of the fp4 forward when both quantise the weights alike (2D tile scales):
+           <conv_q(x), gy> == <x, conv_q^T(gy)> with x, gy on the e2m1 grid (a 6 in channel 0 of every voxel: lossless staging) */
+        shape5 xs = {N, 32, 8, 12, 16}, ys = xs;
+        size_t nx = shape_numel(xs), S = shape_spatial(xs);
+        static const float grid[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+        float *h = malloc(nx * 4), *x = nn_malloc(nx * 4), *gy = nn_malloc(nx * 4);
+        for (int pass = 0; pass < 2; pass++) {
+            for (size_t i = 0; i < nx; i++) { int c = (int)((i / S) % 32); h[i] = c == 0 ? 6.f : grid[(int)(fabsf(frand()) * 7.99f)] * (frand() < 0 ? -1.f : 1.f); }
+            nn_h2d(pass ? gy : x, h, nx * 4);
+        }
+        float *w = dev_rand((size_t)32 * 32 * 27, 0.1f), *y = dev_zero(nx), *gx = dev_zero(nx), *scr = nn_malloc(nn_conv3d_scratch(xs, 32, 3) + 4096);
+        float *hy = malloc(nx * 4), *hg = malloc(nx * 4);
+        double rel[2];
+        for (int d2 = 0; d2 < 2; d2++) {
+            lp_set_w4_2d(d2);
+            mode_mx(); nn_conv3d_fwd(x, xs, w, nullptr, 32, 3, 1, y); nn_conv3d_bwd_data(gy, ys, w, xs, 3, 1, gx, scr);
+            double a = 0, b = 0;
+            nn_d2h(hy, y, nx * 4); nn_d2h(h, gy, nx * 4); for (size_t i = 0; i < nx; i++) a += (double)hy[i] * h[i];
+            nn_d2h(hg, gx, nx * 4); nn_d2h(h, x, nx * 4); for (size_t i = 0; i < nx; i++) b += (double)hg[i] * h[i];
+            rel[d2] = fabs(a - b) / fabs(a);
+        }
+        lp_set_w4_2d(-1);
+        printf("  fp4 adjoint <Wx, gy> vs <x, W^T gy>: per-row scales %.3g (info), 2D tile scales %.3g\n", rel[0], rel[1]);
+        check("fp4 backward-data = adjoint of the forward with 2D weight scales", rel[1] < 1e-5);
+        free(h); free(hy); free(hg);
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
     printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);

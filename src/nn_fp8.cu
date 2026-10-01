@@ -341,14 +341,17 @@ __device__ __forceinline__ unsigned mxf<4>::enc8x(const float *v, float m) { ret
    magnitudes are clamped), the two bracketing grid points are chosen with probability proportional to the distance to the
    other one, so E[q] = v on the non-uniform grid (a dither-then-RN would be biased where the spacing changes). h: per-element
    hash. Returns a value exactly on the grid, so the round-to-nearest conversion that follows is exact. */
-__device__ __forceinline__ float sr_e2m1(float v, uint32_t h) {
+/* u: uniform in [0, 1). Inside a binade the e2m1 grid is uniform (spacing 0.5 below 2, 1 in [2, 4), 2 in [4, 6]) and every
+   bracket's lower point is a multiple of that spacing, so floor(a / ulp + u) * ulp rounds up with probability frac: exact SR in
+   a handful of instructions (no bracket search). */
+__device__ __forceinline__ float sr_e2m1_u(float v, float u) {
     const float a = fminf(fabsf(v), 6.f);
-    const float lo = a < 1.f ? (a < 0.5f ? 0.f : 0.5f) : a < 2.f ? (a < 1.5f ? 1.f : 1.5f) : a < 4.f ? (a < 3.f ? 2.f : 3.f) : (a < 6.f ? 4.f : 6.f);
-    const float hi = lo < 1.f ? lo + 0.5f : lo < 2.f ? lo + 0.5f : lo < 4.f ? lo + 1.f : 6.f;
-    const float u = (float)(h >> 8) * (1.f / 16777216.f);
-    const float q = (hi > lo && u * (hi - lo) < a - lo) ? hi : lo;
-    return copysignf(q, v);
+    const float inv = a < 2.f ? 2.f : a < 4.f ? 1.f : 0.5f;
+    return copysignf(fminf(floorf(fmaf(a, inv, u)) / inv, 6.f), v);
 }
+__device__ __forceinline__ float sr_e2m1(float v, uint32_t h) { return sr_e2m1_u(v, (float)(h >> 8) * (1.f / 16777216.f)); }
+/* two 16-bit uniforms from one hash (the SR loops of the fp4 staging: half the hashing) */
+__device__ __forceinline__ float sr_u16(uint32_t h, int hi) { return (float)(hi ? h >> 16 : h & 0xffffu) * (1.f / 65536.f); }
 __device__ __forceinline__ unsigned smem_u32_(const void *p) { return (unsigned)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void ldsm_x4(unsigned *r, const void *row_ptr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32_(row_ptr)));
@@ -1327,6 +1330,30 @@ __global__ void prep_w4_k(const float *__restrict__ w, uint8_t *__restrict__ wq,
     *(uint4 *)(wq + ((size_t)t * Cop + cop) * (Cip / 2) + ch * 16) = make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m));
     ws[i] = (uint8_t)(e + 127);
 }
+/* 2D weight scales (UFSM_W4_2D=1): one ue8m0 per (tap, 32 padded output rows, 32-channel input chunk) tile instead of per
+   (tap, row, chunk). The flipped weights of the backward-data conv tile the same 32 x 32 blocks with rows and chunks swapped,
+   so forward and backward-data multiply the same quantised weights (exactly when both sides use the same 32-channel
+   alignment: plane-major / 16-bit on both, or MX segments on both). Warp per tile, lane = row; same layout as prep_w4_k. */
+static int g_w2d = -1;
+extern "C" void lp_set_w4_2d(int on) { g_w2d = on; lp_wmemo_clear(); }   /* tests; default from UFSM_W4_2D */
+__global__ void prep_w4_2d_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx = -1, int CxP = 0, int Ox = -1, int OxP = 0) {
+    const int nch = Cip / 32, nrt = (Cop + 31) / 32, lane = threadIdx.x & 31;
+    const size_t tile = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) >> 5;
+    if (tile >= (size_t)28 * nrt * nch) return;
+    const int ch = (int)(tile % nch), rt = (int)((tile / nch) % nrt), t = (int)(tile / ((size_t)nch * nrt));
+    const int cop = rt * 32 + lane;
+    const int co = cop >= Cop ? -1 : Ox < 0 ? cop : seg_ci(cop, Co, Ox, OxP);
+    float v[32], amax = 0.f;
+#pragma unroll
+    for (int k = 0; k < 32; k++) { int ci = Cx < 0 ? ch * 32 + k : seg_ci(ch * 32 + k, Ci, Cx, CxP); v[k] = (t < 27 && co >= 0 && co < Co && ci >= 0 && ci < Ci) ? w[((size_t)co * Ci + ci) * 27 + t] : 0.f; amax = fmaxf(amax, fabsf(v[k])); }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    const int e = mx_exp(amax, 1.f / 6.f);
+    const float m = exp2i(-e);
+    if (cop >= Cop) return;
+    *(uint4 *)(wq + ((size_t)t * Cop + cop) * (Cip / 2) + ch * 16) = make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m));
+    ws[((size_t)t * Cop + cop) * nch + ch] = (uint8_t)(e + 127);
+}
 template <int MT, int TZ, typename T, typename TO>
 __global__ void __launch_bounds__(256, 2) conv_fwd_f4_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                      const float *__restrict__ b, TO *__restrict__ y,
@@ -1399,7 +1426,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4_k(const T *__restrict__ x,
             if (sp.sr) {   /* gradient operand: exact stochastic rounding keyed by the element (deterministic per call) */
                 const uint64_t vid = (((uint64_t)n * Cip + ci0) * D + gz) * (uint64_t)H * W + (uint64_t)gy * W + gx;
 #pragma unroll
-                for (int k = 0; k < 32; k++) v[k] = sr_e2m1(v[k] * m, sr_hash(sp.sr, vid * 32 + k)) / m;
+                for (int k = 0; k < 32; k += 2) { const uint32_t h = sr_hash(sp.sr, vid * 16 + k / 2); v[k] = sr_e2m1_u(v[k] * m, sr_u16(h, 0)) / m; v[k + 1] = sr_e2m1_u(v[k + 1] * m, sr_u16(h, 1)) / m; }
             }
             *(uint4 *)(sx + pos * 16) = make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m));
             sxs[pos] = (uint8_t)(e + 127);
@@ -1560,8 +1587,9 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
             if (sp.sr) {   /* gradient operand: exact stochastic rounding keyed by the element (each copy with its own scale) */
                 const int gz = oz0 - 1 + row / 10, gy = oy0 - 1 + row % 10, gx = ox0 - 1 + ix;
                 const uint64_t vid = (((uint64_t)n * D + gz) * H + gy) * (uint64_t)W + gx;
+                uint32_t h0 = 0u;
 #pragma unroll
-                for (int k = 0; k < 16; k++) { const uint32_t h = sr_hash(sp.sr, vid * 16 + k); wl[k] = sr_e2m1(w[k] * m, h) / m; wh[k] = sr_e2m1(w[k] * mp, h) / mp; }
+                for (int k = 0; k < 16; k++) { const uint32_t h = (k & 1) ? h0 : (h0 = sr_hash(sp.sr, vid * 8 + k / 2)); const float u = sr_u16(h, k & 1); wl[k] = sr_e2m1_u(w[k] * m, u) / m; wh[k] = sr_e2m1_u(w[k] * mp, u) / mp; }
             } else {
 #pragma unroll
                 for (int k = 0; k < 16; k++) { wl[k] = w[k]; wh[k] = w[k]; }
@@ -1640,7 +1668,12 @@ template <typename T, typename TO> static void fwd_f4_t(const void *x, shape5 xs
     const size_t nq = (size_t)28 * Cop * Cip / 2, ns = (size_t)28 * Cop * nch;
     const int pCx = IS_MX(T) ? Cx : -1, pOx = IS_MX(TO) && sp.y2 ? Ox : -1;
     uint8_t *wq, *ws;
-    if (!wmemo_get(sp.wkey, w, Cop, Cip, pCx, CxP, pOx, OxP, nq, ns, &wq, &ws)) prep_w4_k<<<nblk_(ns, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, Cip, pCx, CxP, pOx, OxP);
+    if (g_w2d < 0) g_w2d = getenv("UFSM_W4_2D") ? atoi(getenv("UFSM_W4_2D")) : 0;
+    const int w2d = g_w2d;
+    if (!wmemo_get(sp.wkey, w, Cop, Cip, pCx, CxP, pOx, OxP, nq, ns, &wq, &ws)) {
+        if (w2d) prep_w4_2d_k<<<nblk_((size_t)28 * ((Cop + 31) / 32) * nch * 32, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, Cip, pCx, CxP, pOx, OxP);
+        else prep_w4_k<<<nblk_(ns, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, Cip, pCx, CxP, pOx, OxP);
+    }
     int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : 1;   /* BM = 16 MT must divide Cop (Cop = 48 -> MT = 1) */
     int nmt = Cop / (MT * 16);
     static int tz_env = -1;

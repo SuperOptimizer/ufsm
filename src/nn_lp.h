@@ -20,7 +20,8 @@ typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; 
 int lp_conv_fwd_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp);
 int lp_conv_fwd_f4(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp);
 void lp_wmemo_step(unsigned step);   /* fp4 prepared-weight memo: new training step (weights changed) */
-void lp_wmemo_clear(void);           /* weights changed outside a step (checkpoint load, EMA swap) */
+void lp_wmemo_clear(void);
+void lp_set_w4_2d(int on);         /* 2D (32 x 32 tile) fp4 weight scales, shared by forward and backward-data (UFSM_W4_2D) */           /* weights changed outside a step (checkpoint load, EMA swap) */
 int lp_bwd_w_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp);   /* gybf: gy is bf16 (needs xbf) */
 int lp_bwd_w_f4(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had);   /* fp4 (e2m1, SR on gy when sp.sr); had: bit 0 fixed-sign H32 on both operands, bit 1 SR on x too (diagnostic) */
 int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp);   /* stride 2; gp: input gn+silu */
