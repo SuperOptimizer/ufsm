@@ -373,7 +373,9 @@ GPU at 128^3, tiled Muon / ANVIL matmuls (lead); (6) wider level-0 channels once
   coefficients, per-row energy equalisation at constant norm (lane EMA 0.9), sign-aligned weight decay (default
   2.25 x lr), the same sqrt(max(1, Co/K)) multiplier; AdamW on biases, norms and the head. The 600-step kaggle smoke
   run trails Muon (val 0.609 vs 0.548), expected before the slow rail engages; 6000-step yardsticks at (lr, wd) =
-  (0.023, 2.25), (0.01, 2.25), (0.01, 0.1) against Muon's 0.307 are running.
+  (0.023, 2.25), (0.01, 2.25), (0.01, 0.1) against Muon's 0.307: peak F1 0.204 / 0.231 / 0.329 (validation loss
+  0.914 / 0.924 / 0.887). The record's heavy decay is wrong for this network; with wd 0.1 ANVIL edges Muon
+  (0.329 vs 0.290-0.307 over three Muon arms). Confirmation arms (wd 0.01, wd 0.1 seed 1, Muon seed 1) queued.
 - Prefetch and training levels: scans finer than 1.8 um (PHerc0139 1.129 um) get `min_level` 1 from make_sources
   (their level 0 alone would be 1.5M chunks); the sampler and the prefetch honour it.
 
