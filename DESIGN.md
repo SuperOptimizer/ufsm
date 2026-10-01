@@ -365,6 +365,19 @@ GPU at 128^3, tiled Muon / ANVIL matmuls (lead); (6) wider level-0 channels once
   guard (within 0.005 F1). Earlier fp4 numbers (QAT fine-tune 0.242 vs 0.297, simulated NVFP4 62-66% error) were
   without those ingredients.
 
+### Receptive field vs window (2026-10-01 evening)
+- Per-voxel inference rate is flat with window size, so a larger window buys only the halo fraction (288: 70%,
+  544: 83%, 800: 88%); 544 is the practical maximum (memory ~65 B/voxel with MX-fp8 storage, ~40 with fp4). Halo 8
+  vs 16 (+20% useful voxels) being scored on the MANBp box.
+- The 4-level net's theoretical field is ~150 voxels at level 0; the user wants the field to match the window, so
+  depth is the lever (width bought nothing today): 5 levels ~300, 6 levels ~600 (fits the 544 window and 256^3
+  training patches) for < 5% more FLOPs. Yardstick arms queued: P64 control, P128, 5 levels (P64 and P128),
+  6 levels (widths 16/32/64/80/96/112, ~1.9M params, P128). The winner joins the fp4 forward in r11.
+- Paris 4 at 2.4 um (54 Tvoxel, ~25% occupied): inference of the occupied ~15 Tvoxel takes ~9 h on two GPUs
+  today (MX storage, window 544), ~4 h at the fp8/fp4 kernel ceiling, ~2 h at the hardware floor; skipping empty
+  and interior-of-sheet volume with a coarse pre-pass is worth another 2-3x. Training is step-bound, not
+  volume-bound: a full-quality Muon run is ~25-50k steps.
+
 ### fp8 training on real data (agent, 2026-10-01 afternoon)
 - 6000-step MANBp yardstick (AdamW, down_norm 0, seed 0), F1 at 0.5 / 0.7: all-fp8 GEMMs (`--prec 2`) 0.247 / 0.257,
   fp8 weight gradient only 0.241 / 0.232, fp8 forward + backward-data (`--qat 2`) 0.248 / 0.236; fp16 0.269 / 0.282
