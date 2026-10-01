@@ -30,6 +30,10 @@ struct unet {
     size_t np;
     float *p, *g, *m, *v, *ema;   /* device, flat */
     float *live;                  /* p while training; swapped with ema in unet_use_ema */
+    float *fw, *wm;               /* weights the forward/backward read: live, or wm = 2:4-masked copy of live when sparse24 */
+    int sparse24, wq;             /* wq: 0, 8 or 4 = the 3^3 conv weights live in packed fp8 / fp4 storage; p/ema hold dequantized shadows */
+    unsigned char *wq_q, *wq_sc, *wq_qe, *wq_sce;   /* packed weights + block scales for live params and for the EMA (byte offsets below) */
+    size_t wq_qoff[64], wq_soff[64]; int wq_n; unsigned ema_step;   /* per 3^3 conv (for_each_conv3 order): offsets into the packed arrays */
     int using_ema;
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
@@ -87,7 +91,7 @@ unet *unet_create(const unet_cfg *cfg) {
     }
     u->p = nn_malloc(off * 4); u->g = nn_malloc(off * 4); u->m = nn_malloc(off * 4); u->v = nn_malloc(off * 4); u->ema = nn_malloc(off * 4);
     nn_zero(u->g, off * 4); nn_zero(u->m, off * 4); nn_zero(u->v, off * 4);
-    u->live = u->p;
+    u->live = u->p; u->fw = u->p; u->wm = nullptr; u->sparse24 = 0; u->wq = 0; u->wq_q = u->wq_sc = u->wq_qe = u->wq_sce = nullptr; u->wq_n = 0;
     u->gn_scratch = nn_malloc(1 << 20);
     u->red_scratch = nn_malloc(4096 * 4);
     return u;
@@ -217,7 +221,8 @@ size_t unet_activation_bytes(const unet *u) { return u->act_bytes; }
 shape5 unet_out_shape(const unet *u, shape5 xs) { xs.c = u->cfg.cout; return xs; }
 
 /* ---- forward ---- */
-static const float *P(const unet *u, size_t off) { return u->live + off; }
+static const float *P(const unet *u, size_t off) { return u->fw + off; }
+void unet_apply_sparse24(unet *u);
 
 static void block_fwd(unet *u, block *b, int level, const float *x) {
     b->in = x;
@@ -240,6 +245,7 @@ const float *unet_forward(unet *u, const float *x, shape5 xs, int train) {
     int div = 1 << (u->cfg.nlev - 1);
     if (xs.d % div || xs.h % div || xs.w % div) { fprintf(stderr, "unet: spatial size %dx%dx%d must be divisible by %d\n", xs.d, xs.h, xs.w, div); abort(); }
     if (!u->built || memcmp(&u->xs, &xs, sizeof xs) || (train && !u->train) || u->mode != nn_get_tf32() * 4 + ABF * 2 + GBF) build_acts(u, xs, train);
+    unet_apply_sparse24(u);
     int L = u->cfg.nlev;
     const int *w = u->cfg.widths;
     const float *cur = x;
@@ -361,11 +367,89 @@ void unet_clip_grad(unet *u, double max_norm) {
     double n = unet_grad_norm(u);
     if (n > max_norm && n > 0) nn_scale(u->g, (float)(max_norm / n), u->np);
 }
-void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step) { nn_adamw(u->p, u->g, u->m, u->v, u->np, lr, b1, b2, eps, wd, step); }
-void unet_ema(unet *u, float decay) { nn_ema(u->ema, u->p, u->np, decay); }
-void unet_use_ema(unet *u, int on) { u->live = on ? u->ema : u->p; u->using_ema = on; }
+static void wq_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step);
+static void wq_ema(unet *u, float decay);
+void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step) { if (u->wq) wq_adamw(u, lr, b1, b2, eps, wd, step); else nn_adamw(u->p, u->g, u->m, u->v, u->np, lr, b1, b2, eps, wd, step); }
+void unet_ema(unet *u, float decay) { if (u->wq) wq_ema(u, decay); else nn_ema(u->ema, u->p, u->np, decay); }
+void unet_use_ema(unet *u, int on) { u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
+/* ---- 2:4 structured sparsity: the forward reads a masked copy of the live weights; SR-STE keeps the master weights dense ---- */
+static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg) {
+    int L = u->cfg.nlev;
+    for (int i = 0; i < L; i++) { fn(u, &u->enc[i].c1, arg); fn(u, &u->enc[i].c2, arg); }
+    for (int i = 0; i < L - 1; i++) { fn(u, &u->down[i], arg); fn(u, &u->dec[i].c1, arg); fn(u, &u->dec[i].c2, arg); }
+}
+static void mask_conv(unet *u, const convp *c, void *arg) { (void)arg; nn_mask24(u->wm + c->w, u->wm + c->w, c->cout, c->cin, c->k * c->k * c->k); }
+static void srste_conv(unet *u, const convp *c, void *arg) { nn_srste24(u->g + c->w, u->live + c->w, c->cout, c->cin, c->k * c->k * c->k, *(float *)arg); }
+void unet_set_sparse24(unet *u, int on) {
+    u->sparse24 = on;
+    if (on && !u->wm) u->wm = nn_malloc(u->np * 4);
+    u->fw = on ? u->wm : u->live;
+}
+int unet_get_sparse24(const unet *u) { return u->sparse24; }
+void unet_apply_sparse24(unet *u) {
+    if (!u->sparse24) { u->fw = u->live; return; }
+    nn_d2d(u->wm, u->live, u->np * 4);
+    for_each_conv3(u, mask_conv, nullptr);
+    u->fw = u->wm;
+}
+void unet_srste24(unet *u, float lambda) { if (u->sparse24) for_each_conv3(u, srste_conv, &lambda); }
+/* ---- true fp8 / fp4 weights: packed storage, optimizer and EMA act on the packed values ---- */
+void unet_set_wq(unet *u, int bits) {
+    u->wq = bits;
+    if (!bits) return;
+    if (!u->wq_q) {
+        /* offsets: packed weights use the element offset (fp8: bytes; fp4: element/2, offsets are even), scales are cumulative */
+        int L = u->cfg.nlev; const convp *cs[64]; int n = 0;
+        for (int i = 0; i < L; i++) { cs[n++] = &u->enc[i].c1; cs[n++] = &u->enc[i].c2; }
+        for (int i = 0; i < L - 1; i++) { cs[n++] = &u->down[i]; cs[n++] = &u->dec[i].c1; cs[n++] = &u->dec[i].c2; }
+        size_t so = 0;
+        for (int i = 0; i < n; i++) { u->wq_qoff[i] = cs[i]->w; u->wq_soff[i] = so; so += nn_wq_nblocks(cs[i]->cout, cs[i]->cin, cs[i]->k * cs[i]->k * cs[i]->k); }
+        u->wq_n = n;
+        u->wq_q = nn_malloc(u->np); u->wq_sc = nn_malloc(so + 64); u->wq_qe = nn_malloc(u->np); u->wq_sce = nn_malloc(so + 64);
+        /* initial packing of the fp32 values (round to nearest), then the shadows take the grid values */
+        for (int i = 0; i < n; i++) {
+            const convp *c = cs[i]; int T = c->k * c->k * c->k; size_t qo = bits == 8 ? c->w : c->w / 2;
+            nn_wq_pack(u->p + c->w, u->wq_q + qo, u->wq_sc + u->wq_soff[i], c->cout, c->cin, T, bits, 0);
+            nn_wq_pack(u->ema + c->w, u->wq_qe + qo, u->wq_sce + u->wq_soff[i], c->cout, c->cin, T, bits, 0);
+            nn_wq_unpack(u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->p + c->w, c->cout, c->cin, T, bits);
+            nn_wq_unpack(u->wq_qe + qo, u->wq_sce + u->wq_soff[i], u->ema + c->w, c->cout, c->cin, T, bits);
+        }
+    }
+}
+int unet_get_wq(const unet *u) { return u->wq; }
+static const convp *wq_conv(unet *u, int i) {   /* i-th 3^3 conv in for_each_conv3 order */
+    int L = u->cfg.nlev, n = 0;
+    for (int j = 0; j < L; j++) { if (n++ == i) return &u->enc[j].c1; if (n++ == i) return &u->enc[j].c2; }
+    for (int j = 0; j < L - 1; j++) { if (n++ == i) return &u->down[j]; if (n++ == i) return &u->dec[j].c1; if (n++ == i) return &u->dec[j].c2; }
+    return nullptr;
+}
+/* optimizer step with packed weights: AdamW on the packed conv weights, the plain fp32 AdamW on everything in between */
+static void wq_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step) {
+    size_t pos = 0;
+    for (int i = 0; i < u->wq_n; i++) {
+        const convp *c = wq_conv(u, i); int T = c->k * c->k * c->k; size_t n = (size_t)c->cout * c->cin * T, qo = u->wq == 8 ? c->w : c->w / 2;
+        if (c->w > pos) nn_adamw(u->p + pos, u->g + pos, u->m + pos, u->v + pos, c->w - pos, lr, b1, b2, eps, wd, step);
+        nn_wq_adamw(u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->g + c->w, u->m + c->w, u->v + c->w, c->cout, c->cin, T, u->wq, lr, b1, b2, eps, wd, step, (unsigned)step * 7919u + (unsigned)i);
+        nn_wq_unpack(u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->p + c->w, c->cout, c->cin, T, u->wq);
+        pos = c->w + n;
+    }
+    if (pos < u->np) nn_adamw(u->p + pos, u->g + pos, u->m + pos, u->v + pos, u->np - pos, lr, b1, b2, eps, wd, step);
+}
+static void wq_ema(unet *u, float decay) {
+    size_t pos = 0;
+    for (int i = 0; i < u->wq_n; i++) {
+        const convp *c = wq_conv(u, i); int T = c->k * c->k * c->k; size_t n = (size_t)c->cout * c->cin * T, qo = u->wq == 8 ? c->w : c->w / 2;
+        if (c->w > pos) nn_ema(u->ema + pos, u->p + pos, c->w - pos, decay);
+        nn_wq_ema(u->wq_qe + qo, u->wq_sce + u->wq_soff[i], u->wq_q + qo, u->wq_sc + u->wq_soff[i], c->cout, c->cin, T, u->wq, decay, (unsigned)(u->ema_step++) * 104729u + (unsigned)i);
+        nn_wq_unpack(u->wq_qe + qo, u->wq_sce + u->wq_soff[i], u->ema + c->w, c->cout, c->cin, T, u->wq);
+        pos = c->w + n;
+    }
+    if (pos < u->np) nn_ema(u->ema + pos, u->p + pos, u->np - pos, decay);
+}
+void unet_wquant(unet *u, unsigned seed) { (void)u; (void)seed; }   /* kept for API compatibility: packed storage makes it unnecessary */
 
 /* ---- checkpoints ---- */
+static int g_loaded_sparse = 0, g_loaded_wq = 0;   /* set by the header parser, applied by unet_load */
 int unet_save(const unet *u, const char *path, int step, const char *extra) {
     char tmp[1400];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
@@ -373,7 +457,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (!f) return -1;
     fprintf(f, "UFSM{\"nlev\":%d,\"widths\":[", u->cfg.nlev);
     for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.widths[i]);
-    fprintf(f, "],\"cin\":%d,\"cout\":%d,\"G\":%d,\"nparams\":%zu,\"step\":%d,\"extra\":%s}\n", u->cfg.cin, u->cfg.cout, u->cfg.G, u->np, step, extra ? extra : "{}");
+    fprintf(f, "],\"cin\":%d,\"cout\":%d,\"G\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"extra\":%s}\n", u->cfg.cin, u->cfg.cout, u->cfg.G, u->np, step, u->sparse24, u->wq, extra ? extra : "{}");
     float *h = malloc(u->np * 4);
     const float *arrs[4] = {u->p, u->ema, u->m, u->v};
     for (int a = 0; a < 4; a++) { nn_d2h(h, arrs[a], u->np * 4); if (fwrite(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; } }
@@ -396,6 +480,8 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"G\":"))) cfg->G = atoi(p + 4);
     if ((p = strstr(line, "\"nparams\":"))) *np = (size_t)atoll(p + 10);
     if ((p = strstr(line, "\"step\":"))) *step = atoi(p + 7);
+    if ((p = strstr(line, "\"sparse24\":"))) g_loaded_sparse = atoi(p + 11);
+    if ((p = strstr(line, "\"wq\":"))) g_loaded_wq = atoi(p + 5);
     return 0;
 }
 
@@ -412,6 +498,7 @@ int unet_load(unet *u, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     unet_cfg cfg; int step = 0; size_t np = 0;
+    g_loaded_sparse = 0; g_loaded_wq = 0;
     if (read_header(f, &cfg, &step, &np) || np != u->np) { fclose(f); return -1; }
     float *h = malloc(u->np * 4);
     float *arrs[4] = {u->p, u->ema, u->m, u->v};
@@ -421,5 +508,7 @@ int unet_load(unet *u, const char *path) {
     }
     free(h);
     fclose(f);
+    if (g_loaded_sparse) unet_set_sparse24(u, 1);
+    if (g_loaded_wq) unet_set_wq(u, g_loaded_wq);
     return step;
 }

@@ -76,7 +76,7 @@ int cmd_train(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 96] [--B 2] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--gpus 0,1] [--workers 12] [--seed 0] [--resume CKPT]\n"
-                        "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3] [--policy enc0=1,...]\n"
+                        "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3] [--policy enc0=1,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4]\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  env UFSM_PROF=1 prints per-op GPU time every log interval (category 'upload+loss+opt').\n");
         return 2;
@@ -93,6 +93,11 @@ int cmd_train(int argc, char **argv) {
     int f16 = atoi(opt(argc, argv, "--f16", "1"));       /* 16-bit storage/operands as fp16 (8x finer than bf16, same speed); 0 = bf16 */
     nn_set_prec(atoi(opt(argc, argv, "--prec", "1")));   /* 1 bf16, 2 fp8, 3 fp4 fwd + fp8 wgrad (2/3 force bf16 storage) */
     if (f16) { nn_set_f16(1); nn_set_grad_scale((float)atof(opt(argc, argv, "--gscale", "1024"))); }
+    int qat = atoi(opt(argc, argv, "--qat", "0"));         /* quantization-aware training: forward/backward-data at precision 2 (fp8) or 3 (fp4), weight gradients at 16-bit */
+    if (qat) { nn_set_prec(qat); nn_set_prec_wgrad(1); }
+    int wq = atoi(opt(argc, argv, "--wq", "0"));            /* 8 or 4: true fp8 / fp4 weights (stochastic rounding after each update) */
+    int sparse_at = atoi(opt(argc, argv, "--sparse24", "0"));   /* step from which the 3^3 conv weights are 2:4 sparse (0 = dense) */
+    float srste = (float)atof(opt(argc, argv, "--srste", "2e-4"));
     if (nn_set_prec_policy(opt(argc, argv, "--policy", ""))) return 2;   /* per-layer: "enc0=1,enc1=2,..." */
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--fp32")) nn_set_tf32(0);
     int devs[8], ng = 0;
@@ -118,6 +123,7 @@ int cmd_train(int argc, char **argv) {
         d->u = unet_create(&cfg);
         if (resume) { step0 = unet_load(d->u, resume); if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; } }
         else unet_init(d->u, seed + 1);                   /* deterministic: every GPU starts identical */
+        if (wq) unet_set_wq(d->u, wq);
         for (int i = 0; i < 2; i++) { d->xb[i] = nn_malloc((size_t)B * 4 * p3 * 4); d->tb[i] = nn_malloc((size_t)B * NCH * p3); d->mb[i] = nn_malloc((size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * NCH); d->ev_up[i] = nn_event_create(); }
         d->ev_done = nn_event_create(); nn_event_record(d->ev_done, 0); d->pending = nullptr; select_buf(d, 0);
         d->gl = nn_malloc((size_t)B * NCH * p3 * 4); d->scratch = nn_malloc(nn_loss_scratch((shape5){B, NCH, P, P, P}) + 64);
@@ -172,6 +178,7 @@ int cmd_train(int argc, char **argv) {
                 d->pending = b;
             }
             nn_stream_wait(0, d->ev_up[d->cur]);           /* compute waits for the upload */
+            if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
             unet_zero_grad(d->u);
             run_batch(d, B, P, dice_w, 1);
             unet_backward(d->u, d->gl);
@@ -209,8 +216,10 @@ int cmd_train(int argc, char **argv) {
                 continue;
             }
             if (clip > 0 && gn > clip) unet_clip_grad(d->u, clip);
+            unet_srste24(d->u, srste);                       /* no-op unless sparse */
             unet_adamw(d->u, lr, 0.9f, 0.999f, 1e-8f, wd, step);
             unet_ema(d->u, step < 100 ? 0.9f : ema);
+            unet_wquant(d->u, (unsigned)step);              /* no-op unless --wq */
             if (prof) nn_prof_end();
         }
         const char *e = nn_check();

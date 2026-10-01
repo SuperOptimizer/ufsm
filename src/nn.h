@@ -46,6 +46,20 @@ int nn_get_prec(void);
 /* per-layer precision: the network tags each conv with a layer id (unet order: enc0..3 = 0..3, down0..2 = 4..6, dec2, dec1,
    dec0 = 7..9, head = 10); a layer precision >= 1 overrides the global one. Policy strings: "enc0=1,dec0=1" or positional. */
 void nn_set_layer(int id);
+void nn_set_prec_wgrad(int p);   /* QAT: weight-gradient precision override (-1 = same as the layer); e.g. prec 2 forward with wgrad 1 */
+/* 2:4 structured weight sparsity (groups of 4 input channels keep their 2 largest weights) and its SR-STE gradient term */
+void nn_mask24(const float *w, float *out, int co, int ci, int taps);
+/* true fp8 (bits 8, e4m3) / fp4 (bits 4, e2m1) weights: snaps w onto the MX block-scaled grid with stochastic rounding */
+void nn_wquant(float *w, int co, int ci, int taps, int bits, unsigned seed);
+/* packed fp8 / fp4 weight storage: q = one byte (e4m3) or one nibble (e2m1) per weight, sc = one ue8m0 scale per block of 32 input
+   channels of a (co, tap). The optimizer and the EMA update the packed weights directly (stochastic rounding); unpack dequantizes
+   into an fp32 shadow for the conv kernels. seed 0 in pack = round to nearest. */
+size_t nn_wq_nblocks(int co, int ci, int taps);
+void nn_wq_pack(const float *w, void *q, void *sc, int co, int ci, int taps, int bits, unsigned seed);
+void nn_wq_unpack(const void *q, const void *sc, float *w, int co, int ci, int taps, int bits);
+void nn_wq_adamw(void *q, void *sc, const float *g, float *m, float *v, int co, int ci, int taps, int bits, float lr, float b1, float b2, float eps, float wd, int step, unsigned seed);
+void nn_wq_ema(void *qe, void *sce, const void *qp, const void *scp, int co, int ci, int taps, int bits, float decay, unsigned seed);
+void nn_srste24(float *g, const float *w, int co, int ci, int taps, float lambda);
 void nn_set_layer_prec(int id, int p);
 int nn_set_prec_policy(const char *policy);
 void nn_conv3d_fwd_fp8(const float *x, shape5 xs, const float *w, const float *b, int cout, float *y);        /* k=3 stride 1, fp32 tensors */

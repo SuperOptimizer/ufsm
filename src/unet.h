@@ -39,6 +39,19 @@ void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int 
 void unet_ema(unet *u, float decay);
 /* Use the EMA weights (1) or the live weights (0) for forward. */
 void unet_use_ema(unet *u, int on);
+/* 2:4 structured sparsity of the 3^3 conv weights (groups of 4 input channels keep 2): the forward reads a masked copy
+   of the weights (unet_apply_sparse24 runs inside unet_forward); unet_srste24 adds the SR-STE term lambda * w to the
+   gradient of the pruned weights so they keep decaying but can be revisited. The flag is saved in checkpoints. */
+void unet_set_sparse24(unet *u, int on);
+int unet_get_sparse24(const unet *u);
+void unet_apply_sparse24(unet *u);
+void unet_srste24(unet *u, float lambda);
+/* true fp8 / fp4 weights: the 3^3 conv weights live in packed e4m3 / e2m1 storage with MX block scales; AdamW and the EMA update
+   the packed values directly (stochastic rounding) and the fp32 arrays only hold dequantized shadows for the kernels. The head,
+   biases and GroupNorm parameters stay fp32. Checkpoints store the shadows (exact grid values) plus the flag. */
+void unet_set_wq(unet *u, int bits);
+int unet_get_wq(const unet *u);
+void unet_wquant(unet *u, unsigned seed);
 
 /* Checkpoint: "UFSM" magic, JSON header line, then float32 params, ema, adam m, adam v. */
 int unet_save(const unet *u, const char *path, int step, const char *extra_json);

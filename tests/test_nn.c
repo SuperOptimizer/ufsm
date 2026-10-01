@@ -282,6 +282,18 @@ int main(void) {
     test_adamw();
     const char *e = nn_check();
     CHECK(!e, "cuda error: %s", e ? e : "");
+    {   /* 2:4 mask: every group of 4 input channels keeps exactly its two largest magnitudes */
+        int co = 3, ci = 8, T = 27; size_t nw = (size_t)co * ci * T; float *h = malloc(nw * 4); for (size_t i = 0; i < nw; i++) h[i] = (float)rand() / RAND_MAX - 0.5f;
+        float *dw = nn_malloc(nw * 4), *dm = nn_malloc(nw * 4); nn_h2d(dw, h, nw * 4); nn_mask24(dw, dm, co, ci, T); float *m = malloc(nw * 4); nn_d2h(m, dm, nw * 4);
+        int bad = 0;
+        for (int c = 0; c < co; c++) for (int g4 = 0; g4 < ci / 4; g4++) for (int t = 0; t < T; t++) {
+            size_t base = ((size_t)c * ci + 4 * g4) * T + t; int kept = 0; float mn_kept = 1e9f, mx_drop = 0;
+            for (int j = 0; j < 4; j++) { float v = m[base + (size_t)j * T]; if (v != 0) { kept++; if (v != h[base + (size_t)j * T]) bad++; if (fabsf(v) < mn_kept) mn_kept = fabsf(v); } else if (fabsf(h[base + (size_t)j * T]) > mx_drop) mx_drop = fabsf(h[base + (size_t)j * T]); }
+            if (kept != 2 || mx_drop > mn_kept) bad++;
+        }
+        printf("mask24 %s\n", bad ? "FAIL" : "ok"); if (bad) fails++;
+        free(h); free(m); nn_free(dw); nn_free(dm);
+    }
     printf(fails ? "%d FAILURES\n" : "nn ok\n", fails);
     return fails != 0;
 }

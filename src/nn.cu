@@ -24,6 +24,11 @@ static void lprec_init(void) { if (!g_lprec_init) { for (int i = 0; i < NN_MAXLA
 extern "C" void nn_set_layer(int id) { g_layer = id; }
 extern "C" void nn_set_layer_prec(int id, int p) { lprec_init(); if (id >= 0 && id < NN_MAXLAYER) g_lprec[id] = p; }
 static int eff_prec(void) { lprec_init(); if (!g_tf32) return 0; int p = (g_layer >= 0 && g_layer < NN_MAXLAYER) ? g_lprec[g_layer] : -1; return p >= 1 ? p : g_prec; }
+/* quantization-aware training: the weight gradient may use its own (higher) precision while forward / backward-data run
+   at the deployment precision; -1 = same as the layer precision */
+static int g_prec_w = -1;
+extern "C" void nn_set_prec_wgrad(int p) { g_prec_w = p; }
+static int eff_prec_w(void) { return g_prec_w >= 1 && g_tf32 ? g_prec_w : eff_prec(); }
 /* policy string: "enc0=1,enc1=2,down0=2,dec2=3,head=1" or positional "1,1,2,2,2,2,2,2,2,1,1" (unet order: enc0..3, down0..2,
    dec2, dec1, dec0, head); values 1 bf16, 2 fp8, 3 fp4; a layer left out keeps the global precision */
 extern "C" int nn_set_prec_policy(const char *pol) {
@@ -1025,7 +1030,7 @@ static void launch_bwd_w_tc_h(const void *x, int xbf, shape5 xs, const void *gy,
     else launch_bwd_w_tc_t<float, float, HT>((const float *)x, xs, (const float *)gy, ys, gw, gb, gp, sp);
 }
 static void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
-    if (eff_prec() >= 2) { lp_bwd_w_f8(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp); return; }
+    if (eff_prec_w() >= 2) { lp_bwd_w_f8(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp); return; }
     if (g_h16) launch_bwd_w_tc_h<f16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
     else launch_bwd_w_tc_h<bf16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
 }
@@ -1586,6 +1591,183 @@ template <typename HT> __global__ void f2h_k(const float *x, HT *y, size_t n, fl
 /* fp32 -> the current 16-bit storage type (bf16, or fp16 with nn_set_f16), optionally scaled */
 extern "C" void nn_f32_to_h16(const float *x, size_t n, void *y, float scale) { if (g_h16) f2h_k<f16><<<nblk(n, 256), 256>>>(x, (f16 *)y, n, scale); else f2h_k<bf16><<<nblk(n, 256), 256>>>(x, (bf16 *)y, n, scale); KCHECK(); }
 extern "C" void nn_f32_to_bf16(const float *x, size_t n, void *y) { nn_f32_to_h16(x, n, y, 1.f); }
+/* 2:4 structured sparsity along the input channels of a [co][ci][taps] weight: in every group of 4 consecutive ci (same co, tap)
+   only the two largest |w| survive. mask24: out = masked w (out may alias w). srste24: g = g (kept) + lambda * w (pruned):
+   the sparse-refined straight-through estimator (pruned weights get a decaying pull so they can be revisited). */
+__global__ void mask24_k(const float *w, float *out, int Co, int Ci, int T) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x, ng = (size_t)Co * (Ci / 4) * T;
+    if (i >= ng) return;
+    int t = (int)(i % T), g4 = (int)((i / T) % (Ci / 4)), co = (int)(i / ((size_t)T * (Ci / 4)));
+    size_t base = ((size_t)co * Ci + 4 * g4) * T + t;
+    float v[4], a[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) { v[j] = w[base + (size_t)j * T]; a[j] = fabsf(v[j]); }
+    int i0 = 0; for (int j = 1; j < 4; j++) if (a[j] > a[i0]) i0 = j;
+    int i1 = -1; for (int j = 0; j < 4; j++) if (j != i0 && (i1 < 0 || a[j] > a[i1])) i1 = j;
+#pragma unroll
+    for (int j = 0; j < 4; j++) out[base + (size_t)j * T] = (j == i0 || j == i1) ? v[j] : 0.f;
+}
+__global__ void srste24_k(float *g, const float *w, int Co, int Ci, int T, float lambda) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x, ng = (size_t)Co * (Ci / 4) * T;
+    if (i >= ng) return;
+    int t = (int)(i % T), g4 = (int)((i / T) % (Ci / 4)), co = (int)(i / ((size_t)T * (Ci / 4)));
+    size_t base = ((size_t)co * Ci + 4 * g4) * T + t;
+    float a[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) a[j] = fabsf(w[base + (size_t)j * T]);
+    int i0 = 0; for (int j = 1; j < 4; j++) if (a[j] > a[i0]) i0 = j;
+    int i1 = -1; for (int j = 0; j < 4; j++) if (j != i0 && (i1 < 0 || a[j] > a[i1])) i1 = j;
+#pragma unroll
+    for (int j = 0; j < 4; j++) if (j != i0 && j != i1) g[base + (size_t)j * T] += lambda * w[base + (size_t)j * T];
+}
+/* Weights kept on an fp8 (e4m3) or fp4 (e2m1) grid with MX block scaling (one power-of-two scale per 32 input channels
+   of a (co, tap)): the master array holds the dequantized values, so the forward's quantization is exact and the model
+   is a true fp8/fp4 model. Stochastic rounding keeps the expected update unbiased (round-to-nearest would discard
+   optimizer steps far below the grid spacing). */
+__device__ __forceinline__ float grid_spacing(float a, int bits) {   /* a = |x| / scale in [0, qmax] */
+    if (bits == 8) { if (a < 0.015625f) return 0.001953125f; int e; frexpf(a, &e); return ldexpf(1.f, e - 1 - 3); }   /* e4m3: 3 mantissa bits, subnormal step 2^-9 */
+    else { if (a < 1.f) return 0.5f; int e; frexpf(a, &e); return ldexpf(1.f, e - 1 - 1); }                           /* e2m1: 1 mantissa bit, subnormal step 0.5 */
+}
+__device__ __forceinline__ unsigned hash32(unsigned x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
+__global__ void wquant_k(float *w, int Co, int Ci, int T, int bits, unsigned seed) {
+    size_t nb = (size_t)Co * ((Ci + 31) / 32) * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nb) return;
+    int t = (int)(i % T), blk = (int)((i / T) % ((Ci + 31) / 32)), co = (int)(i / ((size_t)T * ((Ci + 31) / 32)));
+    int c0 = blk * 32, c1 = c0 + 32 < Ci ? c0 + 32 : Ci;
+    const float qmax = bits == 8 ? 448.f : 6.f;
+    float amax = 0.f;
+    for (int c = c0; c < c1; c++) amax = fmaxf(amax, fabsf(w[((size_t)co * Ci + c) * T + t]));
+    if (amax == 0.f) return;
+    int e = (int)ceilf(log2f(amax / qmax));
+    float scale = ldexpf(1.f, e), inv = ldexpf(1.f, -e);
+    for (int c = c0; c < c1; c++) {
+        size_t k = ((size_t)co * Ci + c) * T + t;
+        float x = w[k], a = fabsf(x) * inv;
+        if (a > qmax) a = qmax;
+        float sp = grid_spacing(a, bits), lo = floorf(a / sp) * sp, hi = lo + sp;
+        if (hi > qmax) hi = qmax;
+        float u = (float)(hash32((unsigned)k * 2654435761u ^ seed) & 0xffffff) * (1.f / 16777216.f);
+        float q = (u < (a - lo) / sp) ? hi : lo;
+        w[k] = copysignf(q * scale, x);
+    }
+}
+/* ---- packed storage: one byte (e4m3) or one nibble (e2m1, low nibble first) per weight, plus one ue8m0 scale byte per block of
+   32 input channels of a (co, tap). Element k = (co * Ci + ci) * T + t has block index ((co * nblk + ci / 32) * T + t). ---- */
+__device__ __forceinline__ float sr_quant(float a, int bits, float qmax, unsigned rnd) {   /* a >= 0 on the unit grid, stochastic rounding */
+    if (a > qmax) a = qmax;
+    float sp = grid_spacing(a, bits), lo = floorf(a / sp) * sp, hi = lo + sp;
+    if (hi > qmax) hi = qmax;
+    float u = (float)(rnd & 0xffffff) * (1.f / 16777216.f);
+    return (u < (a - lo) / sp) ? hi : lo;
+}
+__device__ __forceinline__ unsigned char enc_e4m3(float q) { unsigned short r; asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(0.f), "f"(q)); return (unsigned char)r; }
+__device__ __forceinline__ float dec_e4m3(unsigned char b) {   /* e4m3: bias 7, 3 mantissa bits, no inf, 0x7f = nan (never produced) */
+    int sg = b >> 7, e = (b >> 3) & 15, m = b & 7;
+    float v = e ? ldexpf(1.f + m / 8.f, e - 7) : ldexpf(m / 8.f, -6);
+    return sg ? -v : v;
+}
+__device__ __forceinline__ unsigned char enc_e2m1(float q) {   /* q in {0, .5, 1, 1.5, 2, 3, 4, 6} (unsigned) */
+    static const float g[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    unsigned char best = 0; float bd = 1e9f;
+    for (int i = 0; i < 8; i++) { float d = fabsf(g[i] - q); if (d < bd) { bd = d; best = (unsigned char)i; } }
+    return best;
+}
+__device__ __forceinline__ float dec_e2m1(unsigned char n) { static const float g[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f}; return (n & 8) ? -g[n & 7] : g[n & 7]; }
+__device__ __forceinline__ float wq_get(const unsigned char *q, size_t k, int bits) {
+    if (bits == 8) return dec_e4m3(q[k]);
+    unsigned char b = q[k >> 1]; return dec_e2m1((k & 1) ? (b >> 4) : (b & 15));
+}
+__device__ __forceinline__ void wq_put(unsigned char *q, size_t k, int bits, float v) {   /* v already on the grid */
+    if (bits == 8) { q[k] = enc_e4m3(v); return; }
+    unsigned char n = enc_e2m1(fabsf(v)) | (v < 0 ? 8 : 0);
+    unsigned char b = q[k >> 1];
+    q[k >> 1] = (k & 1) ? (unsigned char)((b & 0x0f) | (n << 4)) : (unsigned char)((b & 0xf0) | n);
+}
+/* block-wise kernels: one thread per (co, block of 32 ci, tap) */
+__global__ void wq_pack_k(const float *w, unsigned char *q, unsigned char *sc, int Co, int Ci, int T, int bits, unsigned seed) {
+    int nblk = (Ci + 31) / 32; size_t nb = (size_t)Co * nblk * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nb) return;
+    int t = (int)(i % T), blk = (int)((i / T) % nblk), co = (int)(i / ((size_t)T * nblk)), c0 = blk * 32, c1 = c0 + 32 < Ci ? c0 + 32 : Ci;
+    const float qmax = bits == 8 ? 448.f : 6.f;
+    float amax = 0.f;
+    for (int c = c0; c < c1; c++) amax = fmaxf(amax, fabsf(w[((size_t)co * Ci + c) * T + t]));
+    int e = amax > 0.f ? (int)ceilf(log2f(amax / qmax)) : -127; if (e < -127) e = -127; if (e > 127) e = 127;
+    sc[i] = (unsigned char)(e + 127);
+    float inv = ldexpf(1.f, -e);
+    for (int c = c0; c < c1; c++) {
+        size_t k = ((size_t)co * Ci + c) * T + t; float x = w[k];
+        float qv = seed ? sr_quant(fabsf(x) * inv, bits, qmax, hash32((unsigned)k * 2654435761u ^ seed)) : fminf(fabsf(x) * inv, qmax);
+        if (!seed) { float sp = grid_spacing(qv, bits); qv = rintf(qv / sp) * sp; }
+        wq_put(q, k, bits, copysignf(qv, x));
+    }
+}
+__global__ void wq_unpack_k(const unsigned char *q, const unsigned char *sc, float *w, int Co, int Ci, int T, int bits) {
+    int nblk = (Ci + 31) / 32; size_t n = (size_t)Co * Ci * T, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    int t = (int)(k % T), ci = (int)((k / T) % Ci), co = (int)(k / ((size_t)T * Ci));
+    size_t b = ((size_t)co * nblk + ci / 32) * T + t;
+    w[k] = wq_get(q, k, bits) * ldexpf(1.f, (int)sc[b] - 127);
+}
+/* AdamW directly on the packed weights: dequantize the block, update in fp32 (m, v stay fp32), rescale, requantize stochastically */
+__global__ void wq_adamw_k(unsigned char *q, unsigned char *sc, const float *g, float *m, float *v, int Co, int Ci, int T, int bits,
+                           float lr, float b1, float b2, float eps, float wd, float c1, float c2, unsigned seed) {
+    int nblk = (Ci + 31) / 32; size_t nb = (size_t)Co * nblk * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nb) return;
+    int t = (int)(i % T), blk = (int)((i / T) % nblk), co = (int)(i / ((size_t)T * nblk)), c0 = blk * 32, cn = c0 + 32 < Ci ? c0 + 32 : Ci;
+    const float qmax = bits == 8 ? 448.f : 6.f;
+    float scale = ldexpf(1.f, (int)sc[i] - 127), nw[32], amax = 0.f;
+    for (int c = c0; c < cn; c++) {
+        size_t k = ((size_t)co * Ci + c) * T + t;
+        float x = wq_get(q, k, bits) * scale, gi = g[k];
+        float mi = m[k] = b1 * m[k] + (1.f - b1) * gi, vi = v[k] = b2 * v[k] + (1.f - b2) * gi * gi;
+        x -= lr * ((mi / c1) / (sqrtf(vi / c2) + eps) + wd * x);
+        nw[c - c0] = x; amax = fmaxf(amax, fabsf(x));
+    }
+    int e = amax > 0.f ? (int)ceilf(log2f(amax / qmax)) : -127; if (e < -127) e = -127; if (e > 127) e = 127;
+    sc[i] = (unsigned char)(e + 127);
+    float inv = ldexpf(1.f, -e);
+    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = nw[c - c0]; wq_put(q, k, bits, copysignf(sr_quant(fabsf(x) * inv, bits, qmax, hash32((unsigned)k * 2654435761u ^ seed)), x)); }
+}
+/* EMA directly on packed weights: e = d e + (1 - d) p, both packed; result requantized stochastically */
+__global__ void wq_ema_k(unsigned char *qe, unsigned char *sce, const unsigned char *qp, const unsigned char *scp, int Co, int Ci, int T, int bits, float d, unsigned seed) {
+    int nblk = (Ci + 31) / 32; size_t nb = (size_t)Co * nblk * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nb) return;
+    int t = (int)(i % T), blk = (int)((i / T) % nblk), co = (int)(i / ((size_t)T * nblk)), c0 = blk * 32, cn = c0 + 32 < Ci ? c0 + 32 : Ci;
+    const float qmax = bits == 8 ? 448.f : 6.f;
+    float se = ldexpf(1.f, (int)sce[i] - 127), sp = ldexpf(1.f, (int)scp[i] - 127), nw[32], amax = 0.f;
+    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = d * wq_get(qe, k, bits) * se + (1.f - d) * wq_get(qp, k, bits) * sp; nw[c - c0] = x; amax = fmaxf(amax, fabsf(x)); }
+    int e = amax > 0.f ? (int)ceilf(log2f(amax / qmax)) : -127; if (e < -127) e = -127; if (e > 127) e = 127;
+    sce[i] = (unsigned char)(e + 127);
+    float inv = ldexpf(1.f, -e);
+    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = nw[c - c0]; wq_put(qe, k, bits, copysignf(sr_quant(fabsf(x) * inv, bits, qmax, hash32((unsigned)k * 2654435761u ^ seed)), x)); }
+}
+extern "C" size_t nn_wq_nblocks(int co, int ci, int taps) { return (size_t)co * ((ci + 31) / 32) * taps; }
+extern "C" void nn_wq_pack(const float *w, void *q, void *sc, int co, int ci, int taps, int bits, unsigned seed) {
+    size_t nb = nn_wq_nblocks(co, ci, taps); wq_pack_k<<<nblk(nb, 128), 128>>>(w, (unsigned char *)q, (unsigned char *)sc, co, ci, taps, bits, seed); KCHECK();
+}
+extern "C" void nn_wq_unpack(const void *q, const void *sc, float *w, int co, int ci, int taps, int bits) {
+    size_t n = (size_t)co * ci * taps; wq_unpack_k<<<nblk(n, 256), 256>>>((const unsigned char *)q, (const unsigned char *)sc, w, co, ci, taps, bits); KCHECK();
+}
+extern "C" void nn_wq_adamw(void *q, void *sc, const float *g, float *m, float *v, int co, int ci, int taps, int bits, float lr, float b1, float b2, float eps, float wd, int step, unsigned seed) {
+    float c1 = 1.f - powf(b1, (float)step), c2 = 1.f - powf(b2, (float)step);
+    size_t nb = nn_wq_nblocks(co, ci, taps);
+    wq_adamw_k<<<nblk(nb, 128), 128>>>((unsigned char *)q, (unsigned char *)sc, g, m, v, co, ci, taps, bits, lr, b1, b2, eps, wd, c1, c2, seed); KCHECK();
+}
+extern "C" void nn_wq_ema(void *qe, void *sce, const void *qp, const void *scp, int co, int ci, int taps, int bits, float decay, unsigned seed) {
+    size_t nb = nn_wq_nblocks(co, ci, taps);
+    wq_ema_k<<<nblk(nb, 128), 128>>>((unsigned char *)qe, (unsigned char *)sce, (const unsigned char *)qp, (const unsigned char *)scp, co, ci, taps, bits, decay, seed); KCHECK();
+}
+extern "C" void nn_wquant(float *w, int co, int ci, int taps, int bits, unsigned seed) {
+    size_t nb = (size_t)co * ((ci + 31) / 32) * taps; wquant_k<<<nblk(nb, 128), 128>>>(w, co, ci, taps, bits, seed); KCHECK();
+}
+extern "C" void nn_mask24(const float *w, float *out, int co, int ci, int taps) {
+    if (ci % 4) { if (out != w) cudaMemcpyAsync(out, w, (size_t)co * ci * taps * 4, cudaMemcpyDeviceToDevice); return; }
+    size_t ng = (size_t)co * (ci / 4) * taps; mask24_k<<<nblk(ng, 256), 256>>>(w, out, co, ci, taps); KCHECK();
+}
+extern "C" void nn_srste24(float *g, const float *w, int co, int ci, int taps, float lambda) {
+    if (ci % 4) return;
+    size_t ng = (size_t)co * (ci / 4) * taps; srste24_k<<<nblk(ng, 256), 256>>>(g, w, co, ci, taps, lambda); KCHECK();
+}
 extern "C" void nn_sigmoid(const float *x, size_t n, float *y) { sigm_k<<<nblk(n, 256), 256>>>(x, y, n); KCHECK(); }
 
 /* ================= trilinear 2x (align_corners = false) =================

@@ -147,6 +147,16 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   0.158-0.159, i.e. indistinguishable within seed noise, so the gradient-error metric is a much stricter yardstick than
   this task; the real data will decide whether fp8's 21% gradient error matters.
 
+- Quantization-aware and low-precision-weight training (2026-10-01): `--qat 2|3` runs forward and backward-data at fp8
+  / fp4 with 16-bit weight gradients (`nn_set_prec_wgrad`); `--wq 8|4` keeps the 3^3 conv weights in packed e4m3 / e2m1
+  storage with one ue8m0 scale per 32 input channels, and AdamW and the EMA update the packed values directly with
+  stochastic rounding (`nn_wq_adamw`, `nn_wq_ema`); the fp32 arrays are dequantized shadows for the kernels, so the
+  checkpoint holds exact grid values. `--sparse24 STEP` prunes every group of 4 input channels to its 2 largest weights
+  (the hardware 2:4 pattern) with SR-STE (`--srste`); the dense kernels run on the masked copy because the convs are
+  staging-bound and a sparse MMA would not help today. Synthetic sheet task, 600 steps, two seeds (dense 0.156 / 0.165):
+  QAT fp8 0.159 / 0.161, plain fp8 0.157 / 0.165, QAT fp4 0.169 / 0.166, 2:4 sparse 0.179 / 0.167, fp8 weights
+  (stochastic rounding) 0.153-0.162.
+
 ## Status (2026-09-30 night)
 - M0 reader + CLI + sampler: done, tested (bit-exact zarr3 reads, sampler montages checked by eye).
 - M1 ingest: done — `ingest-zip` (label archive), `ingest-kaggle`, `ingest-mesh`, `raster`, writer, zip and

@@ -96,13 +96,17 @@ int main(int argc, char **argv) {
             for (int b = 0; b < B; b++) make_sample(P, hx + (size_t)b * 4 * S, ht + (size_t)b * S, (uint64_t)it * B + b);
             nn_h2d(dx, hx, B * 4 * S * 4); nn_h2d(dt, ht, B * S);
             nn_set_prec(prec);
+            if (getenv("UFSM_QAT")) nn_set_prec_wgrad(1);
+            if (getenv("UFSM_SPARSE24") && it >= atoi(getenv("UFSM_SPARSE24")) && !unet_get_sparse24(u)) { unet_set_sparse24(u, 1); printf("  step %d: 2:4 sparsity on\n", it); }
             const float *lg = unet_forward(u, dx, xs, 1);
             float out[3];
             nn_loss(lg, dt, dm, dw, ls, 1.f, gl, out, scr);
             unet_zero_grad(u); unet_backward(u, gl);
             unet_clip_grad(u, 1.0);
+            unet_srste24(u, 2e-4f);
             float lrt = it < 30 ? lr * it / 30 : lr * 0.5f * (1 + cosf(3.14159f * (it - 30) / (steps - 30)));
             unet_adamw(u, lrt, 0.9f, 0.999f, 1e-8f, 1e-4f, it);
+            if (getenv("UFSM_WQ")) { if (!unet_get_wq(u)) unet_set_wq(u, atoi(getenv("UFSM_WQ"))); unet_wquant(u, (unsigned)it); }
             run += out[0] + out[1]; nrun++;
             if (it % 50 == 0) { printf(" %d:%.4f", it, run / nrun); fflush(stdout); run = 0; nrun = 0; }
             if (getenv("UFSM_GCHECK") && (it % 100 == 0 || it == 1)) {   /* gradient agreement of bf16 / fp8 with fp32 at the current weights */
