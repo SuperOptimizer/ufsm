@@ -33,8 +33,14 @@ def main():
                "--window", "288", "--halo", "16", "--shard", "256", "--gpu", gpu, "--levels", "1"]
         if cache:
             cmd += ["--cache", cache]
-        if os.environ.get("UFSM_PREDICT_ARGS"):   # e.g. "--prec 3" for fp4 inference
-            cmd += os.environ["UFSM_PREDICT_ARGS"].split()
+        if os.environ.get("UFSM_PREDICT_ARGS"):   # e.g. "--prec 3" for fp4 inference; overrides the defaults above (ufsm takes the first occurrence of a flag)
+            extra = os.environ["UFSM_PREDICT_ARGS"].split()
+            keys = {a for a in extra if a.startswith("--")}
+            base, i = [], 0
+            while i < len(cmd):
+                if cmd[i] in keys and i + 1 < len(cmd) and not cmd[i + 1].startswith("--"): i += 2; continue
+                base.append(cmd[i]); i += 1
+            cmd = base + extra
         if "axis" in s:
             cmd += ["--axis", s["axis"]]
         print("==", name, "box", box, flush=True)
