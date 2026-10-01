@@ -69,6 +69,7 @@ struct unet {
     float *cat[UNET_MAXLEV];                 /* decoder input: [upsampled w[i+1] | skip w[i]] */
     float *xin;                              /* bf16 copy of the network input (act-bf16 mode) */
     float *muon_mom, *muon_work; size_t muon_work_n;   /* Muon momentum (np) and Newton-Schulz scratch */
+    void *muon_descs; int muon_nconv, muon_maxco, muon_maxk;   /* batched Muon descriptor table (device) */
     float *glb;                              /* bf16 copy of the logit gradient (grad-bf16 mode) */
     int mode;                                /* kernel/storage mode the activations were built for */
     float *logits;
@@ -687,11 +688,35 @@ static void muon_conv(unet *u, const convp *c, void *arg) {
     nn_muon(u->p + c->w, u->g + c->w, u->muon_mom + c->w, c->cout, K, a->lr, a->beta, a->wd, u->muon_work);
     nn_zero(u->g + c->w, n * 4);
 }
+typedef struct { float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K; } muon_desc_t;   /* mirrors nn.cu */
+typedef struct { muon_desc_t h[64]; int n; size_t pool; int maxco, maxk; } muon_build_t;
+static void muon_collect(unet *u, const convp *c, void *arg) {
+    muon_build_t *b = arg; int K = c->cin * c->k * c->k * c->k; size_t n = (size_t)c->cout * K;
+    muon_desc_t *d = &b->h[b->n++]; d->p = u->p + c->w; d->g = u->g + c->w; d->mom = u->muon_mom + c->w; d->Co = c->cout; d->K = K;
+    d->X = (float *)(uintptr_t)b->pool; b->pool += n; d->Y = (float *)(uintptr_t)b->pool; b->pool += n;
+    d->A = (float *)(uintptr_t)b->pool; b->pool += (size_t)c->cout * c->cout; d->B = (float *)(uintptr_t)b->pool; b->pool += (size_t)c->cout * c->cout;
+    if (c->cout > b->maxco) b->maxco = c->cout;
+    if (K > b->maxk) b->maxk = K;
+}
+static void muon_zero_conv(unet *u, const convp *c, void *arg) { (void)arg; nn_zero(u->g + c->w, (size_t)c->cout * c->cin * c->k * c->k * c->k * 4); }
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step) {
     if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd, step); return; }   /* packed weights: AdamW only */
     if (!u->muon_mom) { u->muon_mom = nn_malloc(u->np * 4); nn_zero(u->muon_mom, u->np * 4); }
-    muon_arg a = {lr_muon, beta, wd};
-    for_each_conv3(u, muon_conv, &a);
+    if (getenv("UFSM_MUON_UNBATCHED")) {   /* reference path: one conv at a time */
+        muon_arg a = {lr_muon, beta, wd};
+        for_each_conv3(u, muon_conv, &a);
+    } else {
+        if (!u->muon_descs) {   /* build the descriptor table and the scratch pool once (offsets first, then pointers) */
+            muon_build_t b = {0};
+            for_each_conv3(u, muon_collect, &b);
+            float *pool = nn_malloc(b.pool * 4);
+            for (int i = 0; i < b.n; i++) { muon_desc_t *d = &b.h[i]; d->X = pool + (uintptr_t)d->X; d->Y = pool + (uintptr_t)d->Y; d->A = pool + (uintptr_t)d->A; d->B = pool + (uintptr_t)d->B; }
+            u->muon_descs = nn_malloc(sizeof(muon_desc_t) * (size_t)b.n); nn_h2d(u->muon_descs, b.h, sizeof(muon_desc_t) * (size_t)b.n);
+            u->muon_nconv = b.n; u->muon_maxco = b.maxco; u->muon_maxk = b.maxk; u->muon_work = pool;
+        }
+        nn_muon_batch(u->muon_descs, u->muon_nconv, u->muon_maxco, u->muon_maxk, lr_muon, beta, wd);
+        for_each_conv3(u, muon_zero_conv, nullptr);
+    }
     nn_adamw(u->p, u->g, u->m, u->v, u->np, lr_adam, b1, b2, eps, wd, step);
 }
 void unet_ema(unet *u, float decay) { if (u->wq) wq_ema(u, decay); else nn_ema(u->ema, u->p, u->np, decay); }

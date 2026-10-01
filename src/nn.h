@@ -205,6 +205,8 @@ void nn_peer_copy(void *dst, int dst_dev, const void *src, int src_dev, size_t b
 void nn_adamw(float *p, const float *g, float *m, float *v, size_t n, float lr, float b1, float b2, float eps, float wd, int step);
 /* Muon step for one [Co][K] weight: nesterov momentum (mom), Newton-Schulz orthogonalisation, p = p (1 - lr wd) - lr sqrt(max(1, Co/K)) O; work >= 2 Co K + 2 Co^2 floats */
 void nn_muon(float *p, const float *g, float *mom, int Co, int K, float lr, float beta, float wd, float *work);
+/* batched Muon over nconv weights: descs is a device array of {float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K;} (X, Y: Co K floats; A, B: Co Co) */
+void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta, float wd);
 void nn_ema(float *ema, const float *p, size_t n, float decay);
 double nn_sum(const float *x, size_t n, float *scratch);     /* scratch: >= 4096 floats */
 double nn_sumsq(const float *x, size_t n, float *scratch);

@@ -2774,6 +2774,57 @@ extern "C" void nn_muon(float *p, const float *g, float *mom, int Co, int K, flo
     muon_apply_k<<<nblk(n, 256), 256>>>(p, X, n, lr, scale, wd);
     KCHECK();
 }
+/* batched Muon: one launch per stage for all convs (blockIdx.z = conv). descs live on the device. */
+typedef struct { float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K; } muon_desc_t;
+__global__ void bmuon_mom_k(const muon_desc_t *d, float beta, double *ss) {
+    const muon_desc_t D = d[blockIdx.z]; size_t n = (size_t)D.Co * D.K;
+    __shared__ float r[256]; float a = 0.f;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) { float m = beta * D.mom[i] + D.g[i]; D.mom[i] = m; float x = D.g[i] + beta * m; D.X[i] = x; a += x * x; }
+    r[threadIdx.x] = a; __syncthreads(); for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) atomicAdd(&ss[blockIdx.z], (double)r[0]);
+}
+__global__ void bmuon_scale_k(const muon_desc_t *d, const double *ss) {
+    const muon_desc_t D = d[blockIdx.z]; size_t n = (size_t)D.Co * D.K; float inv = (float)(1.0 / (sqrt(ss[blockIdx.z]) + 1e-7));
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.X[i] *= inv;
+}
+__global__ void bmm_xxt_k(const muon_desc_t *d, int swap) {   /* A = X X^T; swap: X and Y roles alternate per iteration */
+    const muon_desc_t D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; int Co = D.Co, K = D.K;
+    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x; if (i >= Co || j >= Co) return;
+    const float *a = X + (size_t)i * K, *b = X + (size_t)j * K; float s = 0.f;
+    for (int k = 0; k < K; k++) s += a[k] * b[k];
+    D.A[(size_t)i * Co + j] = s;
+}
+__global__ void bmm_sq_k(const muon_desc_t *d, float b, float c) {   /* B = b A + c A A */
+    const muon_desc_t D = d[blockIdx.z]; int Co = D.Co;
+    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x; if (i >= Co || j >= Co) return;
+    float s = 0.f; for (int k = 0; k < Co; k++) s += D.A[(size_t)i * Co + k] * D.A[(size_t)k * Co + j];
+    D.B[(size_t)i * Co + j] = b * D.A[(size_t)i * Co + j] + c * s;
+}
+__global__ void bmm_bx_k(const muon_desc_t *d, int swap, float a) {   /* Y = a X + B X (into the other buffer) */
+    const muon_desc_t D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; float *Y = swap ? D.X : D.Y; int Co = D.Co, K = D.K;
+    int i = blockIdx.y; size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= Co || k >= (size_t)K) return;
+    float s = 0.f; for (int j = 0; j < Co; j++) s += D.B[(size_t)i * Co + j] * X[(size_t)j * K + k];
+    Y[(size_t)i * K + k] = a * X[(size_t)i * K + k] + s;
+}
+__global__ void bmuon_apply_k(const muon_desc_t *d, int swap, float lr, float wd) {
+    const muon_desc_t D = d[blockIdx.z]; const float *O = swap ? D.Y : D.X; size_t n = (size_t)D.Co * D.K;
+    float scale = sqrtf(fmaxf(1.f, (float)D.Co / (float)D.K));
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.p[i] = D.p[i] * (1.f - lr * wd) - lr * scale * O[i];
+}
+/* descs: device array of nconv descriptors (p, g, mom, X, Y, A, B scratch of Co K, Co K, Co Co, Co Co floats, Co, K);
+   maxco / maxk: the largest Co and K among them. 18 launches for all convs. */
+extern "C" void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta, float wd) {
+    const muon_desc_t *d = (const muon_desc_t *)descs;
+    double *ss = gn_dsums((size_t)nconv); cudaMemsetAsync(ss, 0, (size_t)nconv * sizeof(double));
+    dim3 g1(32, 1, nconv), gco(nblk(maxco, 128), maxco, nconv), gk(nblk(maxk, 256), maxco, nconv);
+    bmuon_mom_k<<<g1, 256>>>(d, beta, ss);
+    bmuon_scale_k<<<g1, 256>>>(d, ss);
+    const float a = 3.4445f, b = -4.7750f, c = 2.0315f;
+    int swap = 0;
+    for (int it = 0; it < 5; it++) { bmm_xxt_k<<<gco, 128>>>(d, swap); bmm_sq_k<<<gco, 128>>>(d, b, c); bmm_bx_k<<<gk, 256>>>(d, swap, a); swap ^= 1; }
+    bmuon_apply_k<<<g1, 256>>>(d, swap, lr, wd);
+    KCHECK();
+}
 extern "C" void nn_adamw(float *p, const float *g, float *m, float *v, size_t n, float lr, float b1, float b2, float eps, float wd, int step) {
     float c1 = 1.f - powf(b1, (float)step), c2 = 1.f - powf(b2, (float)step);
     adamw_k<<<nblk(n, 256), 256>>>(p, g, m, v, n, lr, b1, b2, eps, wd, c1, c2);

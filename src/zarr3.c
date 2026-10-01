@@ -336,7 +336,7 @@ int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx) {
     if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) return 0;   /* chunk absent (fill) */
     snprintf(item, sizeof item, "%d", ci);
     if (cache_has(z, skey, item)) return 0;
-    size_t n; uint8_t *b = malloc(e.len);
+    uint8_t *b = malloc(e.len);
     if (store_read(z->s, skey, (int64_t)e.off, (int64_t)e.len, b) != (int64_t)e.len) { free(b); return FAIL("prefetch chunk %d of %s", ci, skey); }
     cache_put(z, skey, item, b, e.len); free(b);
     return 1;
