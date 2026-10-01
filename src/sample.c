@@ -552,7 +552,7 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction) {
             size_t done = 0, fetched = 0, fail = 0; pthread_t *th = malloc(nthreads * sizeof *th); pf_arg *args = malloc(nthreads * sizeof *args);
             for (int t = 0; t < nthreads; t++) { args[t] = (pf_arg){ct, bits, {ng[0], ng[1], ng[2]}, total * t / nthreads, total * (t + 1) / nthreads, &done, &fetched, &fail}; pthread_create(&th[t], nullptr, pf_worker, &args[t]); }
             size_t last = 0;
-            while (last < total) { usleep(2000000); last = __atomic_load_n(&done, __ATOMIC_RELAXED); fprintf(stderr, "prefetch: %s level %d: %zu / %zu chunks fetched\r", s->name, l, __atomic_load_n(&fetched, __ATOMIC_RELAXED), nmark); }
+            while (last < nmark) { usleep(1000000); last = __atomic_load_n(&done, __ATOMIC_RELAXED); fprintf(stderr, "prefetch: %s level %d: %zu / %zu chunks checked, %zu fetched\r", s->name, l, last, nmark, __atomic_load_n(&fetched, __ATOMIC_RELAXED)); }
             for (int t = 0; t < nthreads; t++) pthread_join(th[t], nullptr);
             free(th); free(args); free(bits);
             fprintf(stderr, "\nprefetch: %s level %d done (%zu chunks needed, %zu fetched now, %zu failures)\n", s->name, l, nmark, fetched, fail);

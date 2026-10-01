@@ -316,6 +316,7 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
 }
 
 /* fetch inner chunk (cz, cy, cx) into the cache without decoding: 1 fetched, 0 already cached or absent, -1 error */
+static int cache_has(const z3 *z, const char *skey, const char *item) { char p[1400]; cache_path(z, skey, item, p, sizeof p); struct stat st; return stat(p, &st) == 0; }
 int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx) {
     if (!z->cache) return 0;
     int64_t sz = cz / z->cgrid[0], sy = cy / z->cgrid[1], sx = cx / z->cgrid[2];
@@ -323,9 +324,8 @@ int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx) {
     char skey[1200], item[16];
     shard_key(z, sz, sy, sx, skey, sizeof skey);
     if (z->nc <= 1) {   /* unsharded: the object is the chunk */
-        size_t n; uint8_t *b = cache_get(z, skey, "0", &n);
-        if (b) { free(b); return 0; }
-        b = store_read_all(z->s, skey, &n);
+        if (cache_has(z, skey, "0")) return 0;
+        size_t n; uint8_t *b = store_read_all(z->s, skey, &n);
         if (!b) return 0;
         cache_put(z, skey, "0", b, n); free(b); return 1;
     }
@@ -335,9 +335,8 @@ int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx) {
     ientry e = idx[ci]; free(idx);
     if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) return 0;   /* chunk absent (fill) */
     snprintf(item, sizeof item, "%d", ci);
-    size_t n; uint8_t *b = cache_get(z, skey, item, &n);
-    if (b) { free(b); return 0; }
-    b = malloc(e.len);
+    if (cache_has(z, skey, item)) return 0;
+    size_t n; uint8_t *b = malloc(e.len);
     if (store_read(z->s, skey, (int64_t)e.off, (int64_t)e.len, b) != (int64_t)e.len) { free(b); return FAIL("prefetch chunk %d of %s", ci, skey); }
     cache_put(z, skey, item, b, e.len); free(b);
     return 1;
