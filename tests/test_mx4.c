@@ -26,6 +26,7 @@ static double cmp(const char *what, const float *a, const float *r, size_t n, do
     double d2 = 0, r2 = 0;
     for (size_t i = 0; i < n; i++) { double d = (double)ha[i] - hr[i]; d2 += d * d; r2 += (double)hr[i] * hr[i]; }
     double e = sqrt(d2 / (r2 > 0 ? r2 : 1e-300));
+    if (r2 == 0) e = 1e9;   /* an all-zero reference proves nothing */
     printf("  %-48s rel err %.3g%s\n", what, e, e < tol ? "" : "  FAIL");
     if (!(e < tol)) bad++;
     free(ha); free(hr);
@@ -59,6 +60,15 @@ static void host_w4(float *w, int Co, int Ci) {
         for (int ci = c0; ci < c0 + 32 && ci < Ci; ci++) am = fmaxf(am, fabsf(w[((size_t)co * Ci + ci) * 27 + t]));
         int e; if (am == 0.f) e = -126; else { e = (int)ceilf(log2f(am / 6.f)); float tt = ldexpf(am, -e); if (tt > 6.f) e++; if (e < -126) e = -126; if (e > 126) e = 126; }
         for (int ci = c0; ci < c0 + 32 && ci < Ci; ci++) { size_t i = ((size_t)co * Ci + ci) * 27 + t; w[i] = copysignf(e2m1_rne(fabsf(w[i]) * ldexpf(1.f, -e)) * ldexpf(1.f, e), w[i]); }
+    }
+}
+/* host snap of the packed 16-channel fp4 weights: one ue8m0 per (tap row, co, block), block 0 = [kx0 | kx1] x 16 ci, block 1 = kx2 */
+static void host_w4p(float *w, int Co, int Ci) {
+    for (int r = 0; r < 9; r++) for (int co = 0; co < Co; co++) for (int blk = 0; blk < 2; blk++) {
+        float am = 0.f;
+        for (int kx = 2 * blk; kx < 3 && kx < 2 * blk + 2; kx++) for (int ci = 0; ci < Ci; ci++) am = fmaxf(am, fabsf(w[((size_t)co * Ci + ci) * 27 + r * 3 + kx]));
+        int e; if (am == 0.f) e = -126; else { e = (int)ceilf(log2f(am / 6.f)); float tt = ldexpf(am, -e); if (tt > 6.f) e++; if (e < -126) e = -126; if (e > 126) e = 126; }
+        for (int kx = 2 * blk; kx < 3 && kx < 2 * blk + 2; kx++) for (int ci = 0; ci < Ci; ci++) { size_t i = ((size_t)co * Ci + ci) * 27 + r * 3 + kx; w[i] = copysignf(e2m1_rne(fabsf(w[i]) * ldexpf(1.f, -e)) * ldexpf(1.f, e), w[i]); }
     }
 }
 static void mode_ref(void) { nn_set_tf32(0); }
@@ -189,7 +199,7 @@ int main(void) {
         mode_ref(); { float *t = dev_zero(nx); nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, t); nn_conv3d_fwd(t, xs, w, b, 32, 3, 1, yr); }
         nn_gn_t gx = {gam, bet, mean, rstd, G};
         mode_mx(); nn_conv3d_fwd_x(xm, &gx, nullptr, nullptr, 0, 0, xs, w, b, 32, 3, 1, (float *)ym, 0, 1e-5f, nullptr, nullptr);
-        cmp("fp8 conv fwd 16-ch mx4 input, mx4 output", deq4(ym, ys), yr, ny, TOL4);   /* fp8 compute + one mx4 output quantisation */
+        cmp("16-ch mx4 input, mx4 output (fp4 packed kernel)", deq4(ym, ys), yr, ny, TOL4);   /* fp8 compute + one mx4 output quantisation */
         /* split forward: x (32 ch) + x2 (16 ch) -> 16 ch, fp4 kernel */
         shape5 cs = xs; cs.c = 48; shape5 c1 = xs; c1.c = 32; shape5 o16 = xs; o16.c = 16;
         float *xa = dev_rand(shape_numel(c1), 1.f); void *xam = mx4_from(xa, c1); float *xad = deq4(xam, c1);
@@ -398,6 +408,50 @@ int main(void) {
         mode_mx(); int rv = nn_conv3d_fwd_x(xcm, NULL, xsm, &g2, 32, 1, fs, w, b, 16, 3, 1, (float *)ym, 0, 1e-5f, NULL, NULL);
         if (rv) { printf("  dec conv1 with the up segment: unsupported (rv %d)  FAIL\n", rv); bad++; }
         else cmp("dec conv1 up segment from coarse mx4 (fp4)", deq4(ym, o16), yr, shape_numel(o16), TOL4);
+    }
+    {   /* step 5b: the packed 16-channel fp4 kernel (K = [kx0 | kx1 | kx2 | 0] x 16 ch, one scale per staged row) */
+        /* exact: inputs on the e2m1 grid with a 6 in channel 0 of every voxel (every voxel and row scale = 1), weights on the
+           packed grid, fp32 output -> the only rounding is the fp32 accumulation */
+        const int cos_[2] = {16, 32};
+        for (int k = 0; k < 2; k++) {
+            shape5 xs = {N, 16, 16, 12, 20}, ys = xs; ys.c = cos_[k];
+            size_t nx = shape_numel(xs), ny = shape_numel(ys), S = shape_spatial(xs);
+            static const float grid[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+            float *h = malloc(nx * 4);
+            for (size_t i = 0; i < nx; i++) { int c = (int)((i / S) % 16); h[i] = c == 0 ? 6.f : grid[(int)(fabsf(frand()) * 7.99f)] * (frand() < 0 ? -1.f : 1.f); }
+            float *xg = nn_malloc(nx * 4); nn_h2d(xg, h, nx * 4); free(h);
+            void *xm = mx4_from(xg, xs);
+            float *hw = malloc((size_t)cos_[k] * 16 * 27 * 4), *w = dev_rand((size_t)cos_[k] * 16 * 27, 0.1f);
+            nn_d2h(hw, w, (size_t)cos_[k] * 16 * 27 * 4); host_w4p(hw, cos_[k], 16); nn_h2d(w, hw, (size_t)cos_[k] * 16 * 27 * 4); free(hw);
+            float *b = dev_rand(cos_[k], 0.1f), *yr = dev_zero(ny), *y4 = dev_zero(ny);
+            mode_ref(); nn_conv3d_fwd(xg, xs, w, b, cos_[k], 3, 1, yr);
+            mode_mx(); nn_conv3d_fwd(xm, xs, w, b, cos_[k], 3, 1, y4);
+            char nm[96]; snprintf(nm, sizeof nm, "fp4 16-ch packed exact (mx4 in, grid w, fp32 out, 16 -> %d)", cos_[k]);
+            cmp(nm, y4, yr, ny, 2e-3);
+        }
+        /* gn+silu input, mx4 in / out (enc0.c2 / dec0.c2), and 16 -> 32 (enc1.c1) */
+        for (int k = 0; k < 2; k++) {
+            shape5 xs = {N, 16, 16, 12, 16}, ys = xs; ys.c = cos_[k];
+            size_t nx = shape_numel(xs), ny = shape_numel(ys), NG = (size_t)N * G;
+            float *x = dev_rand(nx, 2.f), *w = dev_rand((size_t)cos_[k] * 16 * 27, 0.1f), *b = dev_rand(cos_[k], 0.1f);
+            float *gam = dev_rand(16, 1.f), *bet = dev_rand(16, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+            { float hh[64]; nn_d2h(hh, rstd, NG * 4); for (size_t i = 0; i < NG; i++) hh[i] = 0.8f + fabsf(hh[i]); nn_h2d(rstd, hh, NG * 4); }
+            void *xm = mx4_from(x, xs); float *xd = deq4(xm, xs);
+            float *yr = dev_zero(ny), *t = dev_zero(nx), *m1 = dev_zero(NG), *r1 = dev_zero(NG), *m2 = dev_zero(NG), *r2 = dev_zero(NG); void *ym = mx4_new(ys);
+            mode_ref(); nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, t); nn_conv3d_fwd(t, xs, w, b, cos_[k], 3, 1, yr); nn_gn_fwd(yr, ys, G, 1e-5f, nullptr, nullptr, nullptr, m1, r1);
+            mode_mx(); nn_conv3d_fwd_gn_stats(xm, xs, G, gam, bet, mean, rstd, w, b, cos_[k], (float *)ym, G, 1e-5f, m2, r2);
+            char nm[96]; snprintf(nm, sizeof nm, "fp4 16-ch packed gn+silu input (mx4 in/out, 16 -> %d)", cos_[k]);
+            cmp(nm, deq4(ym, ys), yr, ny, TOL4);
+            snprintf(nm, sizeof nm, "fp4 16-ch packed output GN rstd (16 -> %d)", cos_[k]); cmp(nm, r2, r1, NG, TOL4);
+        }
+        {   /* fp32 I/O through the direct entry (12 channels: padding inside the 16-wide slots) */
+            shape5 xs = {N, 12, 8, 12, 16}, ys = xs; ys.c = 16;
+            size_t nx = shape_numel(xs), ny = shape_numel(ys);
+            float *x = dev_rand(nx, 1.f), *w = dev_rand((size_t)16 * 12 * 27, 0.1f), *yr = dev_zero(ny), *y4 = dev_zero(ny);
+            mode_ref(); nn_conv3d_fwd(x, xs, w, nullptr, 16, 3, 1, yr);
+            nn_conv3d_fwd_fp4(x, xs, w, nullptr, 16, y4);
+            cmp("fp4 16-ch packed fp32 I/O (12 -> 16)", y4, yr, ny, TOL4);
+        }
     }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
