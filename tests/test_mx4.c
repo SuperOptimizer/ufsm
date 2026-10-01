@@ -453,6 +453,30 @@ int main(void) {
             cmp("fp4 16-ch packed fp32 I/O (12 -> 16)", y4, yr, ny, TOL4);
         }
     }
+    {   /* GroupNorm with channels per group not dividing the block width (deeper nets: 96 / 112 channels, G = 8 -> 12 / 14) */
+        const int Cs[2] = {96, 112};
+        for (int k = 0; k < 2; k++) {
+            shape5 s = {N, Cs[k], 6, 6, 8};
+            size_t n = shape_numel(s), NG = (size_t)N * G;
+            float *x = dev_rand(n, 2.f), *gam = dev_rand(Cs[k], 1.f), *bet = dev_rand(Cs[k], 0.5f);
+            void *xm = mx4_from(x, s); float *xd = deq4(xm, s);
+            float *m1 = dev_zero(NG), *r1 = dev_zero(NG), *m2 = dev_zero(NG), *r2 = dev_zero(NG);
+            mode_ref(); nn_gn_stats(xd, s, G, 1e-5f, m1, r1);
+            mode_mx(); int rv = nn_gn_stats(xm, s, G, 1e-5f, m2, r2);
+            char nm[96];
+            snprintf(nm, sizeof nm, "gn stats mean, %d ch / 8 groups (mx4)", Cs[k]); if (rv) { printf("  %s unsupported  FAIL\n", nm); bad++; } else cmp(nm, m2, m1, NG, 1e-4);
+            snprintf(nm, sizeof nm, "gn stats rstd, %d ch / 8 groups (mx4)", Cs[k]); cmp(nm, r2, r1, NG, 1e-4);
+            float *yr = dev_zero(n); void *ym = mx4_new(s);
+            mode_ref(); nn_gn_silu_apply(xd, s, G, gam, bet, m1, r1, yr);
+            mode_mx(); nn_gn_silu_apply(xm, s, G, gam, bet, m1, r1, ym);
+            snprintf(nm, sizeof nm, "gn+silu apply, %d ch / 8 groups (mx4)", Cs[k]); cmp(nm, deq4(ym, s), yr, n, 0.16);
+            float *gy = dev_rand(n, 1e-3f), *gxr = dev_zero(n), *gx2 = dev_zero(n), *gg1 = dev_zero(Cs[k]), *gb1 = dev_zero(Cs[k]), *gg2 = dev_zero(Cs[k]), *gb2 = dev_zero(Cs[k]), *scr = nn_malloc(nn_gn_scratch(s) + 4096);
+            mode_ref(); nn_gn_silu_bwd(xd, s, G, gam, bet, m1, r1, gy, gxr, gg1, gb1, scr);
+            mode_mx(); nn_gn_silu_bwd(xm, s, G, gam, bet, m1, r1, gy, gx2, gg2, gb2, scr);
+            snprintf(nm, sizeof nm, "gn+silu bwd gx, %d ch / 8 groups (mx4 x)", Cs[k]); cmp(nm, gx2, gxr, n, 1e-4);
+            snprintf(nm, sizeof nm, "gn+silu bwd ggamma, %d ch / 8 groups (mx4 x)", Cs[k]); cmp(nm, gg2, gg1, Cs[k], 1e-4);
+        }
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
     printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);

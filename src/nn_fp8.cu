@@ -2349,20 +2349,32 @@ __global__ void __launch_bounds__(256) gn_sums_mx_k(const uint8_t *x, int N, int
         float r[32];
         if (v < S) mx_load_row_b<B>(x, sc, ((size_t)n * nb + blk) * S + v, bw, r);
         else for (int k = 0; k < 32; k++) r[k] = 0.f;
-        for (int k0 = 0; k0 < bw; k0 += cpg) {   /* one group at a time (groups never straddle a block: bw % cpg == 0 for the widths used) */
-            const int c0 = blk * bw + k0; if (c0 >= C) break;
-            float a = 0.f, q = 0.f;
-            for (int k = k0; k < k0 + cpg && k < bw; k++) { a += r[k]; q += r[k] * r[k]; }
+        /* the block row's channels in order, flushed to their group whenever the group changes (any C / G: a group may
+           straddle two block rows; the group index is warp-uniform, so the reductions are) */
+        int gcur = -1; float a = 0.f, q = 0.f;
+        for (int k = 0; k < bw; k++) {
+            const int c = blk * bw + k; if (c >= C) break;
+            const int gi = c / cpg;
+            if (gi != gcur) {
+                if (gcur >= 0) {
+                    for (int o = 16; o; o >>= 1) { a += __shfl_xor_sync(0xffffffff, a, o); q += __shfl_xor_sync(0xffffffff, q, o); }
+                    if ((threadIdx.x & 31) == 0) { atomicAdd(&g1[gcur], a); atomicAdd(&g2[gcur], q); }
+                }
+                gcur = gi; a = 0.f; q = 0.f;
+            }
+            a += r[k]; q += r[k] * r[k];
+        }
+        if (gcur >= 0) {
             for (int o = 16; o; o >>= 1) { a += __shfl_xor_sync(0xffffffff, a, o); q += __shfl_xor_sync(0xffffffff, q, o); }
-            if ((threadIdx.x & 31) == 0) { atomicAdd(&g1[c0 / cpg], a); atomicAdd(&g2[c0 / cpg], q); }
+            if ((threadIdx.x & 31) == 0) { atomicAdd(&g1[gcur], a); atomicAdd(&g2[gcur], q); }
         }
     }
     __syncthreads();
     for (int g = threadIdx.x; g < G; g += 256) { atomicAdd(&sums[2 * ((size_t)n * G + g)], (double)g1[g]); atomicAdd(&sums[2 * ((size_t)n * G + g) + 1], (double)g2[g]); }
 }
 extern "C" int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t S, double *sums) {
-    const int bw = mx_bw(C), cpg = C / G;
-    if (G > 64 || cpg < 1 || bw % cpg) return -1;
+    const int cpg = C / G;
+    if (G > 64 || cpg < 1 || C % G) return -1;
     const int nblk_per = (int)((S + 255) / 256);
     if (xdt == 4) gn_sums_mx_k<4><<<N * nblk_per, 256>>>((const uint8_t *)x, N, C, G, S, sums);
     else gn_sums_mx_k<8><<<N * nblk_per, 256>>>((const uint8_t *)x, N, C, G, S, sums);
