@@ -225,6 +225,15 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   or level too small for P) instead of spinning silently, and stops after 20 consecutive read failures (the
   failure counter was reset on every error before, so an I/O error retried forever).
 
+### Low-precision storage on real data (agent round 2, 2026-10-01)
+- Yardstick: 2000 steps on MANBp (`--soft 3 --noaug 1 --P 64 --B 8`), holdout F1 at threshold 0.5. fp16 twice:
+  0.215 / 0.218; MX-fp8 activations twice: 0.216 / 0.218; MX activations + gradients (after the split-output fix
+  907cb33): 0.220 (0.210 before the fix); fp8 compute with 16-bit storage 0.221; simulated NVFP4 0.218; simulated
+  MXFP6 0.215. Every correct mode sits inside the fp16 noise band, so 2000 steps cannot separate them; 6000-step
+  runs are in progress on GPU 0. Until they report, fp16 storage + recompute 1 stays the default and the MX modes
+  (`UFSM_ACT_MX8`, `UFSM_GRAD_MX8`: 0.46 / 0.29 GB at 96^3 B2) are opt-in. The agent no longer recommends MXFP6
+  (saves ~0.05 GB; MX gradients save more and exist already); NVFP4 storage was clearly worse on the synthetic task.
+
 ### Accuracy diagnosis (2026-10-01 morning)
 - Held-out scores of r5 (8 sources, soft sigma 3, intensity-only augmentation, 17k of 40k steps) against r4: F1 at
   threshold 0.3 per source 0.18/0.06/0.17/0.17/0.065/0.045/0.78 vs 0.19/0.05/0.16/0.16/0.06/0.045/0.77 (level 1);
