@@ -343,6 +343,22 @@ GPU at 128^3, tiled Muon / ANVIL matmuls (lead); (6) wider level-0 channels once
   shared-memory tiled products (tile_xxt_k, tile_bx_k; identical losses, ~11% faster than the per-conv path on a
   shared GPU). fp8 activation storage at inference is free on an fp16-trained model (r5: F1 0.197 vs 0.192).
 
+### Throughput in voxels per second (user's metric, 2026-10-01 evening)
+- Useful throughput = raw voxel rate x interior fraction of the window (halo 16): 160^3 51%, 288^3 70%, 416^3 78%,
+  544^3 83%. Raw per-voxel rate is flat with window size (sweep above), so bigger windows pay through the halo only;
+  inference memory (~133 B/voxel fp16, about half with MX) bounds the window: 544^3 needs MX. Per GPU: fp16 today
+  184 Mvoxel/s raw (129 useful at 288), MX storage 276 (193), the ~3 ms ceiling ~590 (413 at 288, 490 at 544);
+  two GPUs double it, i.e. ~1 Gvoxel/s useful at the ceiling (a 2.7-Tvoxel scroll at 2.4 um in ~45 min).
+- `predict --gpus 0,1`: one worker process per GPU over the shards of one output store (fork before CUDA init, the
+  writer has no global state), the parent builds the pyramid. 1024^3 box at level 1: 13.8 s -> 6.6 s on two shared
+  GPUs, output identical. Window 416 is slow (stride 384 does not divide the 512 shard); window 544 (stride 512,
+  shard 1024) aborts in the MX path ("MX-fp8 storage needs MX inputs and outputs", 544/8 = 68): reported to the agent.
+- fp4 everywhere (user): inference-only packed e2m1 activation storage first (the level-0 convs are bandwidth/halo
+  bound, so bytes are the lever), then fp4 forward in training with fp8 + SR backward, then the NVFP4 recipe for the
+  backward operands (random Hadamard, SR, 2D weight scales, wide first/last layers), each step behind the paired
+  guard (within 0.005 F1). Earlier fp4 numbers (QAT fine-tune 0.242 vs 0.297, simulated NVFP4 62-66% error) were
+  without those ingredients.
+
 ### fp8 training on real data (agent, 2026-10-01 afternoon)
 - 6000-step MANBp yardstick (AdamW, down_norm 0, seed 0), F1 at 0.5 / 0.7: all-fp8 GEMMs (`--prec 2`) 0.247 / 0.257,
   fp8 weight gradient only 0.241 / 0.232, fp8 forward + backward-data (`--qat 2`) 0.248 / 0.236; fp16 0.269 / 0.282

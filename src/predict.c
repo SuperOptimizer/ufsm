@@ -9,6 +9,8 @@
 #include "zarr3.h"
 #include <math.h>
 #include <pthread.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,7 +87,8 @@ int cmd_predict(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window 288] [--act-mx8 1]\n"
                         "       [--halo 16] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
-                        "       [--prec 1|2|3|4] [--policy enc0=1,...]   inference precision (fp8 / fp4 compute)\n");
+                        "       [--prec 1|2|3|4] [--policy enc0=1,...]   inference precision (fp8 / fp4 compute)\n"
+                        "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n");
         fprintf(stderr, "  window - 2*halo should divide the shard size (288 - 32 = 256 divides 256 and 512): tiles then cover each shard exactly. 288^3 needs ~5.5 GB; 160 for small GPUs.\n");
         return 2;
     }
@@ -100,6 +103,30 @@ int cmd_predict(int argc, char **argv) {
     if (nn_set_prec_policy(opt(argc, argv, "--policy", ""))) return 2;
     if (atoi(opt(argc, argv, "--act-mx8", "1"))) unet_set_act_mx8(1);   /* default on: free in accuracy (r5 0.197 vs 0.192, r8 0.2670 vs 0.2669), 1.3-1.5x faster */   /* MX-fp8 activation storage for this (inference-only) process */
     if (um <= 0) { fprintf(stderr, "--um required\n"); return 2; }
+    /* --gpus a,b,...: one worker process per GPU, each writes every n-th shard of the same store; the parent builds the pyramid */
+    int gpus[8], ngpu = 0, part = 0;
+    { const char *gl = opt(argc, argv, "--gpus", nullptr); if (gl) { char *t = strdup(gl); for (char *q = strtok(t, ","); q && ngpu < 8; q = strtok(nullptr, ",")) gpus[ngpu++] = atoi(q); free(t); } }
+    if (ngpu <= 1) { if (ngpu == 1) gpu = gpus[0]; ngpu = 1; }
+    pid_t kids[8] = {0}; int is_child = 0;
+    if (ngpu > 1) {
+        for (int i = 0; i < ngpu; i++) {
+            pid_t c = fork();
+            if (c < 0) { perror("fork"); return 1; }
+            if (c == 0) { is_child = 1; gpu = gpus[i]; part = i; break; }
+            kids[i] = c;
+        }
+        if (!is_child) {   /* parent: wait, then the pyramid and the group */
+            int bad = 0; for (int i = 0; i < ngpu; i++) { int st = 0; waitpid(kids[i], &st, 0); if (!WIFEXITED(st) || WEXITSTATUS(st)) bad = 1; }
+            if (bad) { fprintf(stderr, "a predict worker failed\n"); return 1; }
+            double um_l = um * (1 << level);
+            int64_t bn[3]; { long long v[6] = {0, 0, 0, 0, 0, 0}; const char *b = opt(argc, argv, "--box", nullptr); if (!b || sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) { fprintf(stderr, "--gpus needs --box\n"); return 1; } for (int d = 0; d < 3; d++) bn[d] = v[3 + d]; }
+            char attrs[2000]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"recto probability (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"gpus\":%d}}", ckpt, ngpu);
+            for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
+            pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs);
+            fprintf(stderr, "wrote %s (%d GPUs)\n", out, ngpu);
+            return 0;
+        }
+    }
     if (nn_init(gpu)) { fprintf(stderr, "cannot select GPU %d\n", gpu); return 1; }
     unet_cfg cfg; int step;
     if (unet_peek(ckpt, &cfg, &step)) { fprintf(stderr, "cannot read %s\n", ckpt); return 1; }
@@ -146,6 +173,7 @@ int cmd_predict(int argc, char **argv) {
     long cap = 0;
     for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
         int64_t so[3] = {sz * shard, sy * shard, sx * shard}, se[3];
+        if (ngpu > 1 && (((sz * ns[1] + sy) * ns[2] + sx) % ngpu) != part) continue;   /* another worker's shard */
         for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
         for (int64_t tz = so[0] - halo; tz + halo < se[0]; tz += stride)
         for (int64_t ty = so[1] - halo; ty + halo < se[1]; ty += stride)
@@ -220,6 +248,7 @@ int cmd_predict(int argc, char **argv) {
     free(rd.tiles);
     fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   \n", (long long)(ns[0] * ns[1] * ns[2]), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
     z3w_close(w);
+    if (ngpu > 1) { fprintf(stderr, "gpu %d: %ld tiles in %.0fs\n", gpu, ntiles, now() - t0); z3_close(ct); store_close(s); unet_free(u); return 0; }   /* worker: the parent builds the pyramid */
     for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
     pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs);
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs)\n", out, ntiles, now() - t0);
