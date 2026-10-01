@@ -20,6 +20,7 @@ int main(int argc, char **argv) {
     float *x32 = malloc(nx * 4);
     for (size_t k = 0; k < nx; k++) { if (!xf) x32[k] = ((float *)hx)[k]; else if (xf == 1) { _Float16 h; memcpy(&h, (uint16_t *)hx + k, 2); x32[k] = (float)h; } else { uint32_t u = (uint32_t)((uint16_t *)hx)[k] << 16; memcpy(&x32[k], &u, 4); } }
     unet_cfg cfg = {4, {16, 32, 64, 80}, 4, NCH, 8};
+    { int st; if (unet_peek(argv[1], &cfg, &st)) { fprintf(stderr, "cannot read %s\n", argv[1]); return 1; } }   /* widths / down_norm from the checkpoint */
     unet *u = unet_create(&cfg);
     if (unet_load(u, argv[1]) < 0) { fprintf(stderr, "cannot load %s\n", argv[1]); return 1; }
     float *xd = nn_malloc(nx * 4); nn_h2d(xd, x32, nx * 4);
