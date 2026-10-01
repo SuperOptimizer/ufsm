@@ -101,7 +101,15 @@ int cmd_predict(int argc, char **argv) {
     const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
     nn_set_prec(atoi(opt(argc, argv, "--prec", "1")));
     if (nn_set_prec_policy(opt(argc, argv, "--policy", ""))) return 2;
-    if (atoi(opt(argc, argv, "--fp4", "0"))) { unet_set_act_mx4(1); if (!*opt(argc, argv, "--prec", "")) nn_set_prec(3); }   /* fp4 storage + fp4 compute */
+    /* default --fp4 follows how the checkpoint was trained: models trained with fp4 storage (precision.txt next to the
+       checkpoint says act_mx4 1) are calibrated for it; 16-bit-trained models keep MX-fp8 storage (fp4 storage shifts
+       their best cutoff) */
+    int ckfp4 = 0;
+    { char mp[1400]; snprintf(mp, sizeof mp, "%s", ckpt); char *sl = strrchr(mp, '/'); if (sl) sl[1] = 0; else mp[0] = 0;
+      strncat(mp, "precision.txt", sizeof mp - strlen(mp) - 1); FILE *mf = fopen(mp, "r");
+      if (mf) { char ln[4096]; while (fgets(ln, sizeof ln, mf)) if (strstr(ln, "act_mx4 1")) ckfp4 = 1; fclose(mf); }
+      if (ckfp4 && !*opt(argc, argv, "--fp4", "")) fprintf(stderr, "checkpoint trained with fp4 storage (%s): --fp4 1\n", mp); }
+    if (atoi(opt(argc, argv, "--fp4", ckfp4 ? "1" : "0"))) { unet_set_act_mx4(1); if (!*opt(argc, argv, "--prec", "")) nn_set_prec(3); }   /* fp4 storage + fp4 compute */
     if (atoi(opt(argc, argv, "--act-mx4", "0"))) unet_set_act_mx4(1);   /* packed fp4 activation storage (default once yardstick A passes) */
     else if (atoi(opt(argc, argv, "--act-mx8", "1"))) unet_set_act_mx8(1);   /* default on: free in accuracy (r5 0.197 vs 0.192, r8 0.2670 vs 0.2669), 1.3-1.5x faster */   /* MX-fp8 activation storage for this (inference-only) process */
     if (um <= 0) { fprintf(stderr, "--um required\n"); return 2; }
