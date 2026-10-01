@@ -223,6 +223,28 @@ int main(void) {
             snprintf(nm, sizeof nm, "gn+silu bwd ggamma, %d ch / 8 groups (mx8 x)", Cs[k]); cmp(nm, gg2, gg1, Cs[k], 1e-4);
         }
     }
+    {   /* stride 2 with 16 input channels (down0): two taps per K block, plain and gn+silu input (mx8 in / out) */
+        shape5 xs = {N, 16, 16, 16, 24}, ys = {N, 16, 8, 8, 12};
+        size_t nx = shape_numel(xs), ny = shape_numel(ys), NG = (size_t)N * G;
+        float *x = dev_rand(nx, 1.f), *w = dev_rand((size_t)16 * 16 * 27, 0.1f), *b = dev_rand(16, 0.1f);
+        void *xm = mx_from(x, xs); float *xd = deq(xm, xs);
+        float *yr = dev_zero(ny); void *ym = mx_new(ys);
+        mode_ref(); nn_conv3d_fwd(xd, xs, w, b, 16, 3, 2, yr);
+        mode_mx(); nn_conv3d_fwd(xm, xs, w, b, 16, 3, 2, ym);
+        cmp("s2 fwd 16 ch, two taps per k (MX)", deq(ym, ys), yr, ny, TOL);
+        float *gam = dev_rand(16, 1.f), *bet = dev_rand(16, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+        nn_gn_t g = {gam, bet, mean, rstd, G};
+        float *t = dev_zero(nx), *yr2 = dev_zero(ny); void *ym2 = mx_new(ys);
+        mode_ref(); nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, t); nn_conv3d_fwd(t, xs, w, b, 16, 3, 2, yr2);
+        mode_mx(); nn_conv3d_fwd_x(xm, &g, NULL, NULL, 0, 0, xs, w, b, 16, 3, 2, (float *)ym2, 0, 0.f, NULL, NULL);
+        cmp("s2 fwd 16 ch, gn+silu input (MX)", deq(ym2, ys), yr2, ny, TOL);
+        float *y3 = dev_zero(ny), *x3 = dev_rand((size_t)N * 12 * 16 * 16 * 24, 1.f); shape5 x12 = xs; x12.c = 12;
+        float *w3 = dev_rand((size_t)16 * 12 * 27, 0.1f), *yr3 = dev_zero(ny);
+        mode_ref(); nn_conv3d_fwd(x3, x12, w3, NULL, 16, 3, 2, yr3);
+        mode_mx(); lp_conv_fwd_s2_f8(x3, 0, x12, w3, NULL, 16, y3, 0, ys, (gnp_t){0});
+        cmp("s2 fwd 12 ch fp32 I/O, two taps per k", y3, yr3, ny, TOL);
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     printf(bad ? "mx FAIL (%d)\n" : "mx ok\n", bad);
     return bad != 0;

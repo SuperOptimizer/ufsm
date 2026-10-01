@@ -669,9 +669,9 @@ __global__ void prep_w8s_k(const float *__restrict__ w, uint8_t *__restrict__ wq
                         cvt_e4m3x4(v[24] * m, v[25] * m, v[26] * m, v[27] * m), cvt_e4m3x4(v[28] * m, v[29] * m, v[30] * m, v[31] * m));
     ws[i] = (uint8_t)(e + 127);
 }
-template <int MT, int CP, typename T>
+template <int MT, int CP, typename T, typename TO = T>   /* TO: output type (an MX output from a 16-bit network input) */
 __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
-                                                      const float *__restrict__ b, T *__restrict__ y,
+                                                      const float *__restrict__ b, TO *__restrict__ y,
                                                       int N, int Ci, int D, int H, int W, int Co, int Cop, gnp_t gp, double *__restrict__ osum, int Go, split_t sp) {
     constexpr int BM = MT * 16, TPK = 32 / CP, NKB = (27 + TPK - 1) / TPK, NRX = 2;
     extern __shared__ __align__(128) unsigned char smem_raw[];
@@ -765,7 +765,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
             for (int r = 0; r < 2; r++) { mma_f8(acc[m][r][0], af, bfr[r][0], sa, sb); mma_f8(acc[m][r][1], af, bfr[r][1], sa, sb); }
         }
     }
-    fwd_epilogue<MT, NRX, T>(acc, smem_raw, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N);
+    fwd_epilogue<MT, NRX, TO>(acc, smem_raw, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N);
 }
 
 template <typename T> static T *lp_buf(int slot, size_t n) {
@@ -775,27 +775,27 @@ template <typename T> static T *lp_buf(int slot, size_t n) {
     return (T *)buf[d][slot];
 }
 
-template <int MT, int CP, typename T> static void launch_f8s(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, gnp_t gp, double *osum, int Go, split_t sp) {
+template <int MT, int CP, typename T, typename TO> static void launch_f8s(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, gnp_t gp, double *osum, int Go, split_t sp) {
     constexpr int TPK = 32 / CP, NKB = (27 + TPK - 1) / TPK;
     size_t smem = (size_t)F8_T * CP + NKB * MT * 16 * 32 + ((NKB * MT * 16 + 15) & ~15) + 16 + 16 * sizeof(chan_t);
     if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
     static int attr[8];
-    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f8s_k<MT, CP, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    conv_fwd_f8s_k<MT, CP, T><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (T *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp);
+    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f8s_k<MT, CP, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    conv_fwd_f8s_k<MT, CP, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp);
 }
-template <int CP, typename T> static void small_f8(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp) {
+template <int CP, typename T, typename TO = T> static void small_f8(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp) {
     constexpr int TPK = 32 / CP, NKB = (27 + TPK - 1) / TPK;
     int Cop = (cout + 15) / 16 * 16;
-    if (IS_MX8(T) && cout > 16) Cop = (cout + 31) / 32 * 32;
+    if (IS_MX(TO) && cout > 16) Cop = (cout + 31) / 32 * 32;
     uint8_t *wq = lp_buf<uint8_t>(0, (size_t)NKB * Cop * 32), *ws = lp_buf<uint8_t>(1, (size_t)NKB * Cop);
     prep_w8s_k<CP><<<nblk_((size_t)NKB * Cop, 128), 128>>>(w, wq, ws, cout, xs.c, Cop);
     int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : 1;   /* BM = 16 MT must divide Cop (Cop = 48 -> MT = 1) */
     int nmt = Cop / (MT * 16);
     dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(nblk_(xs.d, 2) * nmt * xs.n));
     switch (MT) {
-    case 1: launch_f8s<1, CP, T>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
-    case 2: launch_f8s<2, CP, T>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
-    default: launch_f8s<4, CP, T>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    case 1: launch_f8s<1, CP, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    case 2: launch_f8s<2, CP, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    default: launch_f8s<4, CP, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     }
 }
 /* ---- 16-channel inputs, two taps per K block (fp8): k-step 2 r = [kx0 | kx1] and 2 r + 1 = [kx2 | 0] of tap row r = (kz, ky),
@@ -1014,10 +1014,10 @@ template <typename T, typename TO = T> static void fwd_f8_t(const void *x, shape
     static int small = -1;
     if (small < 0) small = getenv("UFSM_F8_NOSMALL") ? 0 : 1;
     /* tap-packed small-channel kernel: fp32 input up to 16 channels; with bf16 input the general kernel is as fast at 16 */
-    if (small && std::is_same<T, TO>::value && xs.c <= (sizeof(T) == 2 || IS_MX(T) ? 8 : 16) && !sp.x2) {
-        if (xs.c <= 4) small_f8<4, T>(x, xs, w, b, cout, y, gp, osum, Go, sp);
-        else if (xs.c <= 8) small_f8<8, T>(x, xs, w, b, cout, y, gp, osum, Go, sp);
-        else small_f8<16, T>(x, xs, w, b, cout, y, gp, osum, Go, sp);
+    if (small && (std::is_same<T, TO>::value || (IS_MX(TO) && !IS_MX(T))) && xs.c <= (sizeof(T) == 2 || IS_MX(T) ? 8 : 16) && !sp.x2) {
+        if (xs.c <= 4) small_f8<4, T, TO>(x, xs, w, b, cout, y, gp, osum, Go, sp);
+        else if (xs.c <= 8) small_f8<8, T, TO>(x, xs, w, b, cout, y, gp, osum, Go, sp);
+        else small_f8<16, T, TO>(x, xs, w, b, cout, y, gp, osum, Go, sp);
         return;
     }
     int Cop = (cout + 15) / 16 * 16, Cip = (xs.c + 31) / 32 * 32;
@@ -1056,6 +1056,15 @@ static int lp_dtype_check(const char *fn, int xbf, int ybf) {
     return xbf;
 }
 extern "C" int lp_conv_fwd_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp) {
+    if ((xbf == 1 || xbf == 2) && ybf >= 3) {   /* 16-bit network input -> MX activation (tap-packed small kernel) */
+        if (xs.c > 8 || sp.x2 || sp.accum) { fprintf(stderr, "lp_conv_fwd_f8: 16-bit in / MX out only for the network input (Ci <= 8)\n"); abort(); }
+        if (xbf == 2 && ybf == 4) fwd_f8_t<__half, mx4_t>(x, xs, w, b, cout, y, gp, osum, Go, sp);
+        else if (xbf == 2) fwd_f8_t<__half, mx8_t>(x, xs, w, b, cout, y, gp, osum, Go, sp);
+        else if (ybf == 4) fwd_f8_t<bf16, mx4_t>(x, xs, w, b, cout, y, gp, osum, Go, sp);
+        else fwd_f8_t<bf16, mx8_t>(x, xs, w, b, cout, y, gp, osum, Go, sp);
+        LPCK();
+        return 0;
+    }
     int dt = lp_dtype_check("lp_conv_fwd_f8", xbf, ybf);
     if (dt >= 3 && sp.accum) { fprintf(stderr, "lp_conv_fwd_f8: MX storage with accumulate is not supported\n"); abort(); }
     if (dt == 4) fwd_f8_t<mx4_t>(x, xs, w, b, cout, y, gp, osum, Go, sp);
@@ -1727,7 +1736,7 @@ __device__ __forceinline__ uint2 nib8_e4m3(unsigned w) {
     return make_uint2(lo, hi);
 }
 __device__ __forceinline__ int s2pos(int row, int x) { return row * 17 + ((x & 1) ? 9 + (x >> 1) : (x >> 1)); }
-template <int MT, typename T>
+template <int MT, typename T, bool P16 = false>   /* P16: <= 16 input channels, two taps per K block ([kx0 | kx1], [kx2 | 0]) */
 __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                         const float *__restrict__ b, T *__restrict__ y,
                                                         int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, int Do, int Ho, int Wo, gnp_t gp) {
@@ -1753,6 +1762,72 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__
 #pragma unroll
     for (int m = 0; m < MT; m++) for (int k = 0; k < 4; k++) acc[m][k] = 0.f;
     const size_t plane = (size_t)D * H * W;
+    if constexpr (P16) {   /* staged [5 x 9 rows][17 parity-split positions][16 B], one e4m3 scale per row; weights as prep_w8p_k */
+        uint8_t *px = smem_raw;                        /* [S2F8_T][16] */
+        uint8_t *zrow = px + S2F8_T * 16;              /* [16] zeros */
+        uint8_t *rs = zrow + 16;                       /* [45] row scales (64) */
+        unsigned *ram = (unsigned *)(rs + 64);         /* [45] row amax (64) */
+        uint8_t *pa = (uint8_t *)(ram + 64);           /* [18][BM][32] swizzled */
+        uint8_t *pas = pa + 18 * BM * 32;              /* [18][BM] */
+        chan_t *pc = (chan_t *)(pas + ((18 * BM + 15) & ~15));   /* [16] */
+        for (int i = threadIdx.x; i < 18 * BM * 2; i += 256) {
+            const int ks = i / (BM * 2), r = i % (BM * 2), c = r >> 1, h = r & 1;
+            *(uint4 *)(pa + ks * BM * 32 + sw16(c, h)) = __ldg((const uint4 *)(wq + ((size_t)ks * Cop + co0 + c) * 32 + h * 16));
+        }
+        for (int i = threadIdx.x; i < 18 * BM; i += 256) pas[i] = wsc[(size_t)(i / BM) * Cop + co0 + i % BM];
+        if (threadIdx.x < 16) pc[threadIdx.x] = make_chan((int)threadIdx.x, Ci, Ci, n, plane, x, nsp, gp, N);
+        if (threadIdx.x < 4) ((unsigned *)zrow)[threadIdx.x] = 0u;
+        if (threadIdx.x < 64) ram[threadIdx.x] = 0u;
+        __syncthreads();
+        const chan_t c0 = pc[0];
+        float2 gab[16];
+#pragma unroll
+        for (int k = 0; k < 16; k++) gab[k] = make_float2(pc[k].a, pc[k].b);
+        float v[3][16];
+#pragma unroll
+        for (int it = 0; it < 3; it++) {
+            const int p = threadIdx.x + 256 * it, row = p / 17, c = p - row * 17, ix = c < 9 ? 2 * c : 2 * (c - 9) + 1;
+            const int iz = row / 9, iy = row - iz * 9, gz = 2 * oz0 - 1 + iz, gyy = 2 * oy0 - 1 + iy, gx = 2 * ox0 - 1 + ix;
+            const bool inb = p < S2F8_T && gz >= 0 && gz < D && gyy >= 0 && gyy < H && gx >= 0 && gx < W;
+            stage_row16<T>(c0, Ci, plane, inb ? ((size_t)gz * H + gyy) * W + gx : 0, inb, G, gab, v[it]);
+            unsigned am = 0u;
+#pragma unroll
+            for (int k = 0; k < 16; k++) { const unsigned u = __float_as_uint(fabsf(v[it][k])); am = u <= 0x7f800000u ? max(am, u) : am; }
+            if (p < S2F8_T && am) atomicMax(&ram[row], am);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int it = 0; it < 3; it++) {
+            const int p = threadIdx.x + 256 * it, row = p / 17, c = p - row * 17;
+            if (p >= S2F8_T) break;
+            const int e = mx_exp(__uint_as_float(ram[row]), 1.f / 448.f);
+            const float m = exp2i(-e);
+            const float *w = v[it];
+            *(uint4 *)(px + p * 16) = make_uint4(cvt_e4m3x4(w[0] * m, w[1] * m, w[2] * m, w[3] * m), cvt_e4m3x4(w[4] * m, w[5] * m, w[6] * m, w[7] * m),
+                                                 cvt_e4m3x4(w[8] * m, w[9] * m, w[10] * m, w[11] * m), cvt_e4m3x4(w[12] * m, w[13] * m, w[14] * m, w[15] * m));
+            if (c == 0) rs[row] = (uint8_t)(e + 127);
+        }
+        __syncthreads();
+        const int mat = lane >> 3, kh = mat & 1, vx = lane & 7;
+#pragma unroll 3
+        for (int tr = 0; tr < 9; tr++) {
+            const int kz = tr / 3, ky = tr % 3, row = (wz * 2 + kz) * 9 + wr * 2 + ky;
+            unsigned bA[4], bB[4];
+            ldsm_x4(bA, px + (row * 17 + (kh ? 9 : 0) + vx) * 16);          /* [x 2j | x 2j+1] = [E j | O j] */
+            ldsm_x4(bB, kh ? zrow : px + (row * 17 + vx + 1) * 16);         /* [x 2j+2 | 0] = [E j+1 | 0] */
+            const unsigned sb = rs[row];
+#pragma unroll
+            for (int m = 0; m < MT; m++) {
+                const int ar = m * 16 + (mat & 1) * 8 + (lane & 7);
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    unsigned af[4];
+                    ldsm_x4(af, pa + (2 * tr + h) * BM * 32 + sw16(ar, mat >> 1));
+                    mma_f8(acc[m], af, h ? bB : bA, pas[(2 * tr + h) * BM + m * 16 + g + 8 * (t & 1)], sb);
+                }
+            }
+        }
+    } else
     for (int ci0 = 0; ci0 < Cip; ci0 += 32) {
         __syncthreads();
         if (G) { if (threadIdx.x < 32) ctab[threadIdx.x] = make_chan(ci0 + threadIdx.x, Ci, Ci, n, plane, x, nsp, gp, N); __syncthreads(); }
@@ -1898,16 +1973,30 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__
         }
     }
 }
-template <int MT, typename T> static void launch_s2f8(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, int Cip, shape5 ys, gnp_t gp) {
+template <int MT, typename T, bool P16 = false> static void launch_s2f8(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, int Cip, shape5 ys, gnp_t gp) {
     size_t smem = (size_t)S2F8_T * 32 + 768 + 9 * MT * 16 * 32 + ((9 * MT * 16 + 15) & ~15) + 32 * sizeof(chan_t);
     static int attr[8];
-    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_s2_f8_k<MT, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    conv_fwd_s2_f8_k<MT, T><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (T *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w, gp);
+    if (P16) { const size_t sp16 = (size_t)S2F8_T * 16 + 16 + 64 + 256 + 18 * MT * 16 * 33 + 16 + 16 * sizeof(chan_t); if (sp16 > smem) smem = sp16; }
+    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_s2_f8_k<MT, T, P16>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    conv_fwd_s2_f8_k<MT, T, P16><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (T *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w, gp);
 }
 extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp) {
     lp_dtype_check("lp_conv_fwd_s2_f8", xbf, ybf);
     int Cop = (cout + 15) / 16 * 16, Cip = (xs.c + 31) / 32 * 32, nch = Cip / 32;
     if (xbf >= 3 && cout > 16) Cop = (cout + 31) / 32 * 32;   /* MX output: 32-row-aligned m-tiles */
+    static int p16 = -1;
+    if (p16 < 0) p16 = getenv("UFSM_S2_PACK16") ? atoi(getenv("UFSM_S2_PACK16")) : 1;
+    if (p16 && xs.c <= 16) {   /* down0: two taps per K block */
+        uint8_t *wq = lp_buf<uint8_t>(0, (size_t)P16_KS * Cop * 32), *ws = lp_buf<uint8_t>(1, (size_t)P16_KS * Cop);
+        prep_w8p_k<<<nblk_((size_t)P16_KS * Cop, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, -1, 0);
+        const int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : 1, nmt = Cop / (MT * 16);
+        dim3 grid(nblk_(ys.w, 8), nblk_(ys.h, 4), (unsigned)(nblk_(ys.d, 2) * nmt * xs.n));
+#define S2P(MT_) do { if (xbf == 4) launch_s2f8<MT_, mx4_t, true>(grid, x, xs, wq, ws, b, cout, y, Cop, 32, ys, gp); else if (xbf == 3) launch_s2f8<MT_, mx8_t, true>(grid, x, xs, wq, ws, b, cout, y, Cop, 32, ys, gp); else if (xbf == 2) launch_s2f8<MT_, __half, true>(grid, x, xs, wq, ws, b, cout, y, Cop, 32, ys, gp); else if (xbf) launch_s2f8<MT_, bf16, true>(grid, x, xs, wq, ws, b, cout, y, Cop, 32, ys, gp); else launch_s2f8<MT_, float, true>(grid, x, xs, wq, ws, b, cout, y, Cop, 32, ys, gp); } while (0)
+        switch (MT) { case 1: S2P(1); break; case 2: S2P(2); break; default: S2P(4); break; }
+#undef S2P
+        LPCK();
+        return 0;
+    }
     uint8_t *wq = lp_buf<uint8_t>(0, (size_t)27 * Cop * Cip), *ws = lp_buf<uint8_t>(1, (size_t)27 * Cop * nch);
     size_t nt = (size_t)27 * Cop * nch;
     prep_w8_k<<<nblk_(nt, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, Cip);

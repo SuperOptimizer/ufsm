@@ -494,8 +494,11 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     const int *w = u->cfg.widths;
     const float *cur = x;
     if (x_h16 && !ABF) { fprintf(stderr, "unet_forward_x: a 16-bit input needs the 16-bit activation storage\n"); abort(); }
-    if (ABF && !x_h16) { if (!u->xin) u->xin = dalloc_act_s(u, xs); nn_f32_to_act(x, xs, u->xin); cur = u->xin; }
-    else if (x_h16 && act_mx8()) { if (!u->xin) u->xin = dalloc_act_s(u, xs); nn_h16_to_mx(x, xs, u->xin); cur = u->xin; }   /* MX storage: the 16-bit input is converted once */
+    /* the network input stays 16-bit under MX storage too (4 channels: an MX block row would hold 16): enc0.c1 reads it with the
+       fp8 tap-packed kernel into an MX a1, its weight gradient with vector loads (UFSM_XIN_MX=1: the former MX copy) */
+    static int xin_mx = -1; if (xin_mx < 0) xin_mx = getenv("UFSM_XIN_MX") ? atoi(getenv("UFSM_XIN_MX")) : 0;
+    if (ABF && !x_h16) { if (!u->xin) u->xin = xin_mx ? dalloc_act_s(u, xs) : dalloc_act(u, shape_numel(xs)); nn_f32_to_act(x, xs, u->xin); cur = u->xin; }
+    else if (x_h16 && act_mx8() && xin_mx) { if (!u->xin) u->xin = dalloc_act_s(u, xs); nn_h16_to_mx(x, xs, u->xin); cur = u->xin; }
     for (int i = 0; i < L; i++) {
         nn_set_layer(i); block_fwd(u, &u->enc[i], i, cur);
         cur = u->enc[i].s2;
