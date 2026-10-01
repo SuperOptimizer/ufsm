@@ -432,6 +432,21 @@ parallel eager open (fixed in 970ce89 with retries); its rerun on the same build
   the cooldown is where the accuracy lands), not 120k-200k. r10 (200k) runs to completion only because its cooldown
   and 17-box scores are the baseline; r11 onwards are 40k.
 
+### 40k-step confirmations r11a/b/c (2026-10-01 afternoon, configs/all2_cached.json, 9 sources, P64 B4 x 2 GPUs,
+WSD cooldown 0.2; F1 at each box's best cutoff, 7 held-out boxes)
+
+| run | config | mean dF1 | worst box | vs | samp/s | best val |
+|---|---|---|---|---|---|---|
+| r11a | fp16 | +0.110 | -0.092 (MANBp) | r8 (120k AdamW) | 366 | 0.854 |
+| r11b | `--fp4 1` (S2) | +0.002 | -0.016 (Paris4) | r11a | 364 | 0.863 |
+| r11c | `--fp4 2` (all fp4) | +0.009 | -0.008 (0500P2) | r11a | 340 | 0.860 |
+
+Both fp4 presets pass the confirmation gate (mean within -0.02, no box below -0.05). The two seg boxes are degenerate
+(recall 1.0, same F1 for every model). End to end at P64 B4 the presets do not run faster than fp16: the 64^3 step is
+not compute-bound (launches, sampler, small grids), and `--fp4 2` is 7% slower because the fp4 weight-gradient kernel
+is still slower than fp8. The fp4 speed shows at large windows / batches (prof_infer 96^3 B2) and in whole-box
+inference; the training default becomes `--fp4 1`, `--fp4 2` waits for the faster weight-gradient kernel.
+
 ### Sampler on the 17-source set (2026-10-01 evening)
 - On configs/all2.json the sampler collapsed to 34 patches/s (16 workers) and got slower with 32: 331 lazy store
   opens (one remote metadata fetch each, 70-500 ms) serialised on the open mutex, paid by every worker's first draws
