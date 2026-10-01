@@ -4,7 +4,8 @@
    - the --fp4 1 preset with round-to-nearest gradient operands: bit-identical up to fp4 roundings flipped by last-bit
      differences, which fp4 amplifies; reference = the single-GPU run on a 1e-6-perturbed input;
    - the --fp4 1 preset as trained (stochastic rounding): reference = the single-GPU difference between two rounding seeds.
-   Skipped (exit 0) with fewer than two GPUs. env: UFSM_P (96), UFSM_B (1), UFSM_ONLY=mode,config (one case),
+   Also the memory modes of train --mem auto (chunked up-part gradient, MX-fp8 gradients, lean 1 / 2).
+   Skipped (exit 0) with fewer than two GPUs. env: UFSM_P (96), UFSM_B (1), UFSM_ONLY=case (one case),
    UFSM_SEGS=1 (per-tensor errors), UFSM_TEST_POLICY (precision policy of the fp4 modes). */
 #include "split.h"
 #include "unet.h"
@@ -132,11 +133,26 @@ int main(void) {
     float *g0 = malloc(np * 4), *g1 = malloc(np * 4), *g2 = malloc(np * 4);
     int fails = 0;
     printf("test_split: P %d B %d, level-0 halo %d planes, local depth %d\n", P, B, H0, Dl);
+    /* configurations: (precision, down_norm, recompute, chunk, MX-fp8 gradients, lean); the memory modes are those train --mem
+       auto picks from (chunked up-part gradient, MX-fp8 gradients, lean 1 / 2) */
+    typedef struct { int fp4, dn, rc, chunk, gmx, lean; } tcfg;
+    tcfg cases[64]; int ncase = 0;
     for (int fp4 = 0; fp4 < 3; fp4++) {   /* 0 fp16, 1 --fp4 1 with round-to-nearest gradient operands, 2 --fp4 1 (stochastic rounding) */
+        for (int dn = 0; dn < 2; dn++) for (int rc = 0; rc < 3; rc++) cases[ncase++] = (tcfg){fp4, dn, rc, 1, 0, 0};
+        cases[ncase++] = (tcfg){fp4, 1, 1, 2, 0, 0}; cases[ncase++] = (tcfg){fp4, 1, 2, 2, 0, 2};
+        if (fp4) { static const int mm[5][4] = {{1, 1, 1, 0}, {2, 1, 1, 0}, {2, 1, 1, 1}, {2, 1, 1, 2}, {2, 2, 1, 2}};
+                   for (int k = 0; k < 5; k++) cases[ncase++] = (tcfg){fp4, 1, mm[k][1], mm[k][0], mm[k][2], mm[k][3]}; }
+    }
+    for (int ci = 0; ci < ncase; ci++) {
+        const tcfg c = cases[ci];
+        if (getenv("UFSM_ONLY") && ci != atoi(getenv("UFSM_ONLY"))) continue;
+        const int fp4 = c.fp4, dn = c.dn, rc = c.rc;
         if (fp4) { unet_set_act_mx4(1); nn_set_sr(fp4 == 2); if (nn_set_prec_policy(getenv("UFSM_TEST_POLICY") ? getenv("UFSM_TEST_POLICY") : "all=fp4:fp4:fp8,enc0.c1=fp16")) return 2; }
-        for (int dn = 0; dn < 2; dn++)
-            for (int rc = 0; rc < 3; rc++) {
-                if (getenv("UFSM_ONLY") && (fp4 != atoi(getenv("UFSM_ONLY")) || dn * 3 + rc != atoi(strchr(getenv("UFSM_ONLY"), ',') + 1))) continue;
+        else { unet_set_act_mx4(0); nn_set_sr(0); nn_set_prec_policy(""); }
+        unet_set_chunk_up(c.chunk); unet_set_grad_mx8(c.gmx); unet_set_lean(c.lean);
+        char tag[96]; snprintf(tag, sizeof tag, "%2d %s down_norm %d recompute %d%s%s%s", ci, fp4 == 0 ? "fp16  " : fp4 == 1 ? "fp4 rn" : "fp4 sr", dn, rc,
+                                c.chunk == 2 ? " chunk 2" : "", c.gmx ? " grad-mx8" : "", c.lean == 2 ? " lean 2" : c.lean ? " lean 1" : "");
+        {
                 cfg.down_norm = dn; segs_build(&cfg);
                 { unet *pr = unet_create(&cfg); np = unet_nparams(pr); unet_free(pr); }
                 unet_set_recompute(rc);
@@ -154,8 +170,8 @@ int main(void) {
                     double lr_ = single(&cfg, 1, g2), rg = rel(g2, g0, 0, np);
                     if (fp4) { memcpy(hx, hx0, nx * 4); free(hx0); }
                     int ok = fp4 ? dl < 1e-3 && dg < 2 * rg + 1e-3 : dl < 1e-4 && dg < 2e-3 && wg < 1e-2;
-                    printf("  %s down_norm %d recompute %d: loss %.6f vs %.6f (rel %.1e; %s %.1e), grad rel %.2e (%s %.2e), worst %s %.2e  %s\n", fp4 ? "fp4 rn" : "fp16  ",
-                           dn, rc, lp, ls, dl, fp4 ? "perturbed" : "rerun", fabs(lr_ - ls) / fabs(ls), dg, fp4 ? "perturbed" : "rerun", rg, wn, wg, ok ? "ok" : "FAIL");
+                    printf("  %s: loss %.6f vs %.6f (rel %.1e; %s %.1e), grad rel %.2e (%s %.2e), worst %s %.2e  %s\n", tag,
+                           lp, ls, dl, fp4 ? "perturbed" : "rerun", fabs(lr_ - ls) / fabs(ls), dg, fp4 ? "perturbed" : "rerun", rg, wn, wg, ok ? "ok" : "FAIL");
                     fails += !ok;
                     if (getenv("UFSM_SEGS")) for (int i = 0; i < nseg; i++) printf("      %-10s %.2e\n", segs[i].name, rel(g1, g0, segs[i].off, segs[i].len));
                 } else {
@@ -163,12 +179,12 @@ int main(void) {
                     double ln = single(&cfg, 2, g2);
                     double nl = fabs(ln - ls) / fabs(ls), ng = rel(g2, g0, 0, np), nw = worst(g2, g0, &wn2);
                     int ok = dl < 3 * nl + 1e-3 && dg < 1.5 * ng && wg < 1.5 * nw + 0.05;
-                    printf("  fp4 sr down_norm %d recompute %d: loss %.6f vs %.6f (rel %.1e; seeds %.1e), grad rel %.3f (seeds %.3f), worst %s %.3f (seeds %s %.3f)  %s\n",
-                           dn, rc, lp, ls, dl, nl, dg, ng, wn, wg, wn2, nw, ok ? "ok" : "FAIL");
+                    printf("  %s: loss %.6f vs %.6f (rel %.1e; seeds %.1e), grad rel %.3f (seeds %.3f), worst %s %.3f (seeds %s %.3f)  %s\n",
+                           tag, lp, ls, dl, nl, dg, ng, wn, wg, wn2, nw, ok ? "ok" : "FAIL");
                     fails += !ok;
                 }
                 const char *e = nn_check(); if (e) { printf("cuda error: %s\n", e); return 1; }
-            }
+        }
     }
     split_free(ctx);
     printf("test_split: %s\n", fails ? "FAILED" : "passed");
