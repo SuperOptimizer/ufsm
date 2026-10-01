@@ -66,17 +66,6 @@ static int eff_prec_w(void) { return eff_prec_pass(2); }
 extern "C" int nn_cur_prec(void) { return eff_prec(); }
 /* effective precision manifest: what each conv's three passes actually resolve to under the current global prec, layer
    policy and wgrad override (storage modes are appended by the caller). Written next to checkpoints. */
-extern "C" int nn_prec_manifest(char *buf, size_t n) {
-    static const char *names[] = {"enc0", "enc1", "enc2", "enc3", "down0", "down1", "down2", "dec2", "dec1", "dec0", "head"};
-    int sl = g_layer, ss = g_sub; size_t off = 0;
-    off += (size_t)snprintf(buf + off, n - off, "prec %s sr %d policy:", nn_prec_name(g_prec), sr_on());
-    for (int l = 0; l < 11 && off < n; l++) for (int s2 = 0; s2 < (l >= 4 && l <= 6 ? 1 : l == 10 ? 1 : 2); s2++) {
-        g_layer = l; g_sub = (l >= 4 && l <= 6) || l == 10 ? -1 : s2;
-        off += (size_t)snprintf(buf + off, n - off, " %s%s=%s:%s:%s", names[l], g_sub < 0 ? "" : s2 ? ".c2" : ".c1", nn_prec_name(eff_prec_pass(0)), nn_prec_name(eff_prec_pass(1)), nn_prec_name(eff_prec_pass(2)));
-    }
-    g_layer = sl; g_sub = ss;
-    return (int)off;
-}
 extern "C" int nn_prec_parse(const char *s) {
     static const char *nm[] = {"fp32", "bf16", "fp8", "fp4", "fp16"};
     for (int i = 0; i < 5; i++) if (!strcmp(s, nm[i])) return i;
@@ -127,6 +116,19 @@ extern "C" int nn_get_act_bf16(void) { return g_actbf; }
 #define ABF (g_tf32 && g_actbf)
 static int g_h16 = 0;     /* 16-bit type for activation/gradient storage and the MMA operands: 0 bf16, 1 fp16 (8x finer mantissa, same rate) */
 extern "C" void nn_set_f16(int on) { g_h16 = on; }
+/* effective precision manifest (see nn.h) */
+static const char *pname16(int p) { return p == 1 && g_h16 ? "fp16" : nn_prec_name(p); }   /* prec 1 is the 16-bit storage type */
+extern "C" int nn_prec_manifest(char *buf, size_t n) {
+    static const char *names[] = {"enc0", "enc1", "enc2", "enc3", "down0", "down1", "down2", "dec2", "dec1", "dec0", "head"};
+    int sl = g_layer, ss = g_sub; size_t off = 0;
+    off += (size_t)snprintf(buf + off, n - off, "prec %s sr %d policy:", pname16(g_prec), sr_on());
+    for (int l = 0; l < 11 && off < n; l++) for (int s2 = 0; s2 < (l >= 4 && l <= 6 ? 1 : l == 10 ? 1 : 2); s2++) {
+        g_layer = l; g_sub = (l >= 4 && l <= 6) || l == 10 ? -1 : s2;
+        off += (size_t)snprintf(buf + off, n - off, " %s%s=%s:%s:%s", names[l], g_sub < 0 ? "" : s2 ? ".c2" : ".c1", pname16(eff_prec_pass(0)), pname16(eff_prec_pass(1)), pname16(eff_prec_pass(2)));
+    }
+    g_layer = sl; g_sub = ss;
+    return (int)off;
+}
 extern "C" int nn_get_f16(void) { return g_h16; }
 #define LPDT(flag) ((flag) ? (g_h16 ? 2 : 1) : 0)   /* storage code of the lp_* (nn_fp8.cu) entry points: 0 fp32, 1 bf16, 2 fp16 */
 static float g_gscale = 1.f;   /* activation gradients are stored scaled by this (fp16 storage range); parameter grads are unscaled by the network */
