@@ -398,6 +398,14 @@ kernels show a gap); gradients stay MX-fp8 / fp16; fp4 in the backward is restri
   rejected by the coarse occupancy probe (14 ms each) on the sparse new sources. Two GPUs at the fp4 training
   ceiling (~20 ms per 128^3 step) need ~200 patches/s, so the sampler is no longer the limit on an idle box.
 
+### Largest training window, batch 1 per GPU (2026-10-01 evening)
+Measured with `ufsm train` (Muon, down_norm, fp16 storage, recompute 1), peak device memory: 256^3 5.3 GB,
+320^3 10.3 GB, 352^3 13.6 GB = 328 B per voxel, matching the per-voxel accounting (bench_mem overstates: it also
+builds the inference network and an fp32 input). On the 16 GB cards the practical maximum is 352^3 at fp16 storage
+(384^3 would need 18.6 GB). With fp4 activation storage (~190 B/voxel with fp16 gradients, ~145 with MX-fp8
+gradients) it becomes 416^3 and 448^3 (both multiples of 32, so valid for a 6-level net). Two GPUs are data
+parallel (batch 1 each), so the per-GPU limit is the window limit.
+
 ### Receptive field vs window (2026-10-01 evening)
 - Per-voxel inference rate is flat with window size, so a larger window buys only the halo fraction (288: 70%,
   544: 83%, 800: 88%); 544 is the practical maximum (memory ~65 B/voxel with MX-fp8 storage, ~40 with fp4). The window
