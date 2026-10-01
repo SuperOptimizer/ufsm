@@ -530,20 +530,35 @@ static void *worker(void *arg) {
 occ_index source_occupancy(source *s) {
     occ_index o = {nullptr, 0, -1, {0, 0, 0}};
     if (s->reg[0] && s->reg[0]->n) return o;
+    /* the coarsest label level that exists (level >= 3); large scans (Paris 4: 2.5e9 cells at level 5) are read in z slabs,
+       so there is no size cap besides the 32-bit cell index (a 3e8 cap used to leave such sources without an index, i.e.
+       sampled uniformly over the whole volume) */
     int lc = -1; z3 *tz = nullptr;
-    for (int l = MAXLEV - 1; l >= 3; l--) { z3 *t = source_tgt(s, 0, l); if (t) { const z3_meta *m = z3_meta_of(t); if ((double)m->shape[0] * m->shape[1] * m->shape[2] <= 3e8) { lc = l; tz = t; break; } } }
+    for (int l = MAXLEV - 1; l >= 3; l--) { z3 *t = source_tgt(s, 0, l); if (t) { const z3_meta *m = z3_meta_of(t); if ((double)m->shape[0] * m->shape[1] * m->shape[2] < 4.29e9) { lc = l; tz = t; break; } } }
     if (!tz) return o;
     const z3_meta *m = z3_meta_of(tz);
-    size_t tot = (size_t)m->shape[0] * m->shape[1] * m->shape[2];
-    uint8_t *buf = malloc(tot);
-    int64_t o0[3] = {0, 0, 0};
-    if (!buf || z3_read(tz, o0, m->shape, buf, 8)) { free(buf); return o; }
-    size_t n = 0; for (size_t k = 0; k < tot; k++) n += buf[k] != 255 && buf[k] > 0;
-    int surf = n > 0; if (!n) for (size_t k = 0; k < tot; k++) n += buf[k] != 255;
-    if (!n) { free(buf); return o; }
-    uint32_t *idx = malloc(n * sizeof *idx); size_t j = 0;
-    for (size_t k = 0; k < tot; k++) if (buf[k] != 255 && (surf ? buf[k] > 0 : 1)) idx[j++] = (uint32_t)k;
+    const size_t plane = (size_t)m->shape[1] * m->shape[2], tot = plane * (size_t)m->shape[0];
+    const int64_t SZ = m->chunk[0] > 0 ? m->chunk[0] : 64;
+    uint8_t *buf = malloc(plane * (size_t)SZ);
+    if (!buf) return o;
+    size_t cap = 1 << 20, n = 0; uint32_t *idx = malloc(cap * sizeof *idx);
+    int surf = 1;
+    for (int pass = 0; pass < 2 && !n; pass++) {   /* pass 0: cells with surface; pass 1 (none found): every labelled cell */
+        surf = pass == 0;
+        for (int64_t z0 = 0; z0 < m->shape[0]; z0 += SZ) {
+            int64_t o0[3] = {z0, 0, 0}, nn[3] = {SZ < m->shape[0] - z0 ? SZ : m->shape[0] - z0, m->shape[1], m->shape[2]};
+            if (z3_read(tz, o0, nn, buf, 8)) { free(buf); free(idx); return o; }
+            const size_t cnt = (size_t)nn[0] * plane, base = (size_t)z0 * plane;
+            for (size_t k = 0; k < cnt; k++) {
+                const uint8_t v = buf[k];
+                if (v == 255 || (surf ? v == 0 : 0)) continue;
+                if (n == cap) { cap *= 2; uint32_t *t2 = realloc(idx, cap * sizeof *idx); if (!t2) { free(buf); free(idx); return o; } idx = t2; }
+                idx[n++] = (uint32_t)(base + k);
+            }
+        }
+    }
     free(buf);
+    if (!n) { free(idx); return o; }
     o.idx = idx; o.n = n; o.lev = lc; for (int d = 0; d < 3; d++) o.shape[d] = m->shape[d];
     fprintf(stderr, "sampler: %s: %zu of %zu level-%d cells %s\n", s->name, n, tot, lc, surf ? "contain surface" : "are labelled");
     return o;

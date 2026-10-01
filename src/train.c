@@ -378,6 +378,7 @@ int cmd_train(int argc, char **argv) {
     }
     uint64_t prod, rej; sampler_stats(sp, &prod, &rej);
     fprintf(stderr, "done in %.0fs; sampler produced %llu, rejected %llu\n", now() - t0, (unsigned long long)prod, (unsigned long long)rej);
+    sampler_prof_print(sp);   /* UFSM_SAMPLER_PROF=1: per-stage cpu ms per patch */
     sampler_stop(sp);
     if (log) fclose(log);
     return 0;

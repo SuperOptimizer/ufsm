@@ -310,7 +310,7 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
         if (st != VOLCOMP_OK) return FAIL("volcomp: %s", volcomp_status_string(st));
         return 0;
     }
-    if (n != cv) return FAIL("raw chunk size %zu != %zu", n, cv);
+    if (n != cv) return FAIL("raw chunk size %zu != %zu in %s (q %d, zstd %d)", n, cv, z->key, m->q, m->zstd);
     memcpy(dec, enc, cv);
     return 0;
 }
