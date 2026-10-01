@@ -651,6 +651,30 @@ int main(void) {
         cmp("fp4 bwd_data 16 -> 32 + 16 (packed, 48-row tile), part 1", g1, ga, shape_numel(c1), TOL4);
         cmp("fp4 bwd_data 16 -> 32 + 16 (packed, 48-row tile), part 2", g2, gb_, shape_numel(c2), TOL4);
     }
+    {   /* fp8 weight gradient on MX inputs: the cooperative staging (x row decoded once per voxel for all channels, gy per
+           voxel for all outputs) must reproduce the per-element staging bit for bit, SR and gn+silu included */
+        const int Gn = 8;
+        struct { int ci, co, w; const char *nm; } cs[] = {{32, 32, 16, "32 -> 32, W 16"}, {16, 16, 20, "16 -> 16, W 20"}, {48, 16, 16, "48 -> 16 (NT 3)"}, {80, 80, 12, "80 -> 80, W 12"}};
+        for (int i = 0; i < 4; i++) {
+            shape5 xs = {2, cs[i].ci, 6, 10, cs[i].w}, ys = xs; ys.c = cs[i].co;
+            size_t nx = shape_numel(xs), ny = shape_numel(ys), nw = (size_t)cs[i].co * cs[i].ci * 27, NG = (size_t)2 * Gn;
+            float *xr = dev_rand(nx, 2.f), *gr = dev_rand(ny, 1e-3f);
+            float *gam = dev_rand(cs[i].ci, 1.f), *bet = dev_rand(cs[i].ci, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+            { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t j = 0; j < NG; j++) h[j] = 0.8f + fabsf(h[j]); nn_h2d(rstd, h, NG * 4); }
+            void *xm = mx4_from(xr, xs), *x8 = mx8_from(xr, xs), *gm = mx8_from(gr, ys);
+            gnp_t gp = {gam, bet, mean, rstd, Gn}; split_t sr = {0}; sr.sr = 0x3c6ef372u;
+            float *a = dev_zero(nw), *b = dev_zero(nw), *ab = dev_zero(cs[i].co), *bb = dev_zero(cs[i].co);
+            for (int xt = 3; xt <= 4; xt++) {
+                nn_zero(a, nw * 4); nn_zero(b, nw * 4); nn_zero(ab, cs[i].co * 4); nn_zero(bb, cs[i].co * 4);
+                lp_set_f8w_coop(3); lp_bwd_w_f8(xt == 4 ? xm : x8, xt, xs, gm, 3, ys, a, ab, gp, sr);   /* both cooperative paths */
+                lp_set_f8w_coop(0); lp_bwd_w_f8(xt == 4 ? xm : x8, xt, xs, gm, 3, ys, b, bb, gp, sr);
+                lp_set_f8w_coop(1);
+                char nm[96]; snprintf(nm, sizeof nm, "f8 wgrad coop == per-element (%s, %s x, SR, gn)", cs[i].nm, xt == 4 ? "mx4" : "mx8");
+                cmp(nm, a, b, nw, 1e-6);
+                snprintf(nm, sizeof nm, "f8 wgrad coop bias (%s)", cs[i].nm); cmp(nm, ab, bb, cs[i].co, 1e-6);
+            }
+        }
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
     printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);
