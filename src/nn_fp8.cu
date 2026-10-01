@@ -206,6 +206,25 @@ template <typename T> __device__ __forceinline__ float ldc(const chan_t &c, size
     if constexpr (IS_MX(T)) return mxf<MX_BITS(T)>::dec1((const uint8_t *)c.p + off * c.rb, IS_MX4(T) ? c.nib : 0) * mx_scale(c.sp[off]);
     else return ldx((const T *)c.p, off);
 }
+/* 4 consecutive voxels (off .. off + nv - 1, nv <= 4) of one channel of an MX tensor: the index math once, the 4 scale bytes in one
+   32-bit load when al4 (W % 4 == 0 and off % 4 == 0), element pairs decoded with one cvt */
+template <typename T> __device__ __forceinline__ float4 ldc4_mx(const chan_t &c, size_t off, int nv, bool al4) {
+    const uint8_t *p = (const uint8_t *)c.p + off * c.rb;
+    unsigned sw;
+    if (al4 && nv == 4) sw = __ldg((const unsigned *)(c.sp + off));
+    else { sw = 0u; for (int k = 0; k < nv; k++) sw |= (unsigned)c.sp[off + k] << (8 * k); }
+    unsigned b[4];
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        unsigned v = k < nv ? (unsigned)__ldg(p + (size_t)k * c.rb + (IS_MX4(T) ? (c.nib >> 1) : 0)) : 0u;
+        b[k] = IS_MX4(T) ? (v >> (4 * (c.nib & 1))) & 15u : v;
+    }
+    float2 lo, hi;
+    if constexpr (IS_MX4(T)) { lo = dec_e2m1x2(b[0] | b[1] << 4); hi = dec_e2m1x2(b[2] | b[3] << 4); }
+    else { lo = dec_e4m3x2((unsigned short)(b[0] | b[1] << 8)); hi = dec_e4m3x2((unsigned short)(b[2] | b[3] << 8)); }
+    return make_float4(nv > 0 ? lo.x * mx_scale(sw & 255u) : 0.f, nv > 1 ? lo.y * mx_scale(sw >> 8 & 255u) : 0.f,
+                       nv > 2 ? hi.x * mx_scale(sw >> 16 & 255u) : 0.f, nv > 3 ? hi.y * mx_scale(sw >> 24) : 0.f);
+}
 /* the 32 channels of one stored MX block row at voxel off (bw = 16: upper half zero), dequantized; ok == false: zeros */
 template <int B> __device__ __forceinline__ void mx_row32(const chan_t &c0, size_t off, bool ok, float *v) {
     if (ok && c0.p) mxf<B>::dec_row((const uint8_t *)c0.p + off * c0.rb, c0.bw, mx_scale(c0.sp[off]), v);
@@ -230,6 +249,24 @@ template <> __device__ __forceinline__ void mx_row32<8>(const chan_t &c0, size_t
             float2 a = dec_e4m3x2((unsigned short)(w[j] & 0xffff)), b = dec_e4m3x2((unsigned short)(w[j] >> 16));
             v[16 * q + 4 * j] = a.x * s; v[16 * q + 4 * j + 1] = a.y * s; v[16 * q + 4 * j + 2] = b.x * s; v[16 * q + 4 * j + 3] = b.y * s;
         }
+    }
+}
+/* 8 consecutive voxels vo .. vo + 7 (those < nv) of channel co of an MX-fp8 tensor (N, C channels, S voxels): index math once,
+   the scale bytes in one 8 / 4-byte load when al (vo and S multiples of 8 for nv >= 8, of 4 for nv >= 4) */
+__device__ __forceinline__ void ldmx8_8(const void *gyv, int N, int C, size_t S, int n, int co, size_t vo, int nv, bool al8, float *q) {
+    const int bw = mx_bw(C), nbk = mx_nb(C);
+    const size_t ri = ((size_t)n * nbk + co / bw) * S + vo;
+    const uint8_t *qd = (const uint8_t *)gyv + ri * bw + co % bw, *qs = (const uint8_t *)gyv + (size_t)N * nbk * S * bw + ri;
+    uint2 sw = make_uint2(0u, 0u);
+    if (al8 && nv >= 8) sw = __ldg((const uint2 *)qs);
+    else if (al8 && nv >= 4) { sw.x = __ldg((const unsigned *)qs); for (int j = 4; j < 8; j++) if (j < nv) sw.y |= (unsigned)qs[j] << (8 * (j & 3)); }
+    else { for (int j = 0; j < 8; j++) if (j < nv) (j < 4 ? sw.x : sw.y) |= (unsigned)qs[j] << (8 * (j & 3)); }
+#pragma unroll
+    for (int j = 0; j < 8; j += 2) {
+        const unsigned b0 = j < nv ? __ldg(qd + (size_t)j * bw) : 0u, b1 = j + 1 < nv ? __ldg(qd + (size_t)(j + 1) * bw) : 0u;
+        const float2 d = dec_e4m3x2((unsigned short)(b0 | b1 << 8));
+        const unsigned s4 = j < 4 ? sw.x : sw.y;
+        q[j] = j < nv ? d.x * mx_scale(s4 >> (8 * (j & 3)) & 255u) : 0.f; q[j + 1] = j + 1 < nv ? d.y * mx_scale(s4 >> (8 * ((j + 1) & 3)) & 255u) : 0.f;
     }
 }
 __device__ __forceinline__ void mx4_row32(const chan_t &c0, size_t off, bool ok, float *v) { mx_row32<4>(c0, off, ok, v); }
@@ -1093,7 +1130,7 @@ extern "C" int lp_conv_fwd_f8(const void *x, int xbf, shape5 xs, const float *w,
 #endif
 template <int MT, int NT, typename T, typename TG>
 __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
-                                                       int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC) {
+                                                       int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC, int coop) {
     constexpr int CH = 8 * NT, BMo = 16 * MT;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sxq = smem_raw;                        /* [CH][X8_CS] */
@@ -1101,6 +1138,8 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
     uint8_t *sgs = sg + BMo * G8_CS;                /* [BMo][8 ksteps] */
     uint8_t *sxs = sgs + BMo * 8;                   /* [CH][4 slots] */
     float *sbias = (float *)(sxs + CH * 4);         /* [BMo] */
+    chan_t *ctab8 = (chan_t *)(((uintptr_t)(sbias + BMo) + 31) & ~(uintptr_t)31);   /* [CH] MX x: per-channel descriptors */
+    unsigned *amx = (unsigned *)(ctab8 + CH);      /* [2][CH] MX x: per-channel plane amax (bits), double-buffered by plane */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int ci0 = blockIdx.x * CH, co0 = blockIdx.y * BMo;
     int bz = blockIdx.z;
@@ -1119,10 +1158,67 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
     if (threadIdx.x < BMo) sbias[threadIdx.x] = 0.f;
     const bool vec = (W & 3) == 0;
     const int zt_begin = zc * ZC;
+    /* MX x whose CH channels are consecutive entries of one stored block row (the common case): the voxel's row words are
+       loaded and decoded once for all CH channels (thread per voxel), instead of one strided byte per (channel, voxel) */
+    bool uni = false;
+    if constexpr (IS_MX(T)) {
+        if (threadIdx.x < CH) { const int ci = ci0 + threadIdx.x; ctab8[threadIdx.x] = make_chan(ci < Ci ? ci : Ci, Ci, Cx, n, plane, x, sp, gp, N); }
+        if (threadIdx.x < 2 * CH) amx[threadIdx.x] = 0u;
+        __syncthreads();
+        uni = (coop & 1) && ctab8[0].p != nullptr && (ctab8[0].nib & 7) == 0;
+#pragma unroll
+        for (int q = 1; q < CH; q++) if (ctab8[q].p && (ctab8[q].sp != ctab8[0].sp || ctab8[q].nib != ctab8[0].nib + q)) uni = false;
+    }
     for (int zt = zt_begin; zt < nzt && zt < (zc + 1) * ZC; zt++) {
         const int oz0 = zt * 2;
         const int np = zt == zt_begin ? 4 : 2, gz_first = zt == zt_begin ? oz0 - 1 : oz0 + 1;
         __syncthreads();
+        if (IS_MX(T) && uni) {   /* thread per voxel (row tid / 18, p = tid % 18) of each new plane, all CH channels */
+            const chan_t c0 = ctab8[0];
+            const int tid = threadIdx.x, row = tid / 18, p = tid % 18;
+            const bool Gany = gp.G != 0 || sp.gp2.G != 0;
+            for (int pi = 0; pi < np; pi++) {
+                const int gz = gz_first + pi, slot = (gz + 1) & 3;
+                unsigned *am = amx + (pi & 1) * CH;
+                const int gyy = oy0 - 1 + row, gx = ox0 - 1 + p;
+                const bool inb = tid < 180 && gz >= 0 && gz < D && gyy >= 0 && gyy < H && gx >= 0 && gx < W;
+                float v[CH];
+#pragma unroll
+                for (int q = 0; q < CH; q++) v[q] = 0.f;
+                if (inb) {
+                    const size_t off = cof(c0, gz, gyy, gx, H, W);
+                    const float sc = mx_scale(c0.sp[off]);
+                    if constexpr (IS_MX4(T)) {
+                        const unsigned *rw = (const unsigned *)((const uint8_t *)c0.p + off * c0.rb + (c0.nib >> 1));
+#pragma unroll
+                        for (int w = 0; w < CH / 8; w++) {
+                            const unsigned u = __ldg(rw + w);
+#pragma unroll
+                            for (int q = 0; q < 4; q++) { const float2 d = dec_e2m1x2(u >> (8 * q)); v[8 * w + 2 * q] = d.x * sc; v[8 * w + 2 * q + 1] = d.y * sc; }
+                        }
+                    } else {
+                        const unsigned *rw = (const unsigned *)((const uint8_t *)c0.p + off * c0.rb);   /* mx8: c.p already points at channel nib */
+#pragma unroll
+                        for (int w = 0; w < CH / 4; w++) {
+                            const unsigned u = __ldg(rw + w);
+                            const float2 d0 = dec_e4m3x2((unsigned short)(u & 0xffffu)), d1 = dec_e4m3x2((unsigned short)(u >> 16));
+                            v[4 * w] = d0.x * sc; v[4 * w + 1] = d0.y * sc; v[4 * w + 2] = d1.x * sc; v[4 * w + 3] = d1.y * sc;
+                        }
+                    }
+#pragma unroll
+                    for (int q = 0; q < CH; q++) { const chan_t &cq = ctab8[q]; v[q] = cq.p ? act_ab(v[q], cq.a, cq.b, Gany && cq.g) : 0.f; }
+                }
+#pragma unroll
+                for (int q = 0; q < CH; q++) { const unsigned a = __reduce_max_sync(0xffffffffu, __float_as_uint(v[q]) & 0x7fffffffu); if (lane == 0 && a) atomicMax(&am[q], a); }
+                __syncthreads();
+                if (tid < 180) {
+                    uint8_t *dst = sxq + slot * X8_PS + row * 24 + 3 + p;
+#pragma unroll
+                    for (int q = 0; q < CH; q++) dst[q * X8_CS] = cvt_e4m3(v[q] * exp2i(-mx_exp(__uint_as_float(am[q]), 1.f / 448.f)));
+                }
+                if (tid < CH) { sxs[tid * 4 + slot] = (uint8_t)(mx_exp(__uint_as_float(am[tid]), 1.f / 448.f) + 127); amx[((pi + 1) & 1) * CH + tid] = 0u; }
+            }
+        } else
         /* X: warp per (channel, plane): 10 rows x (4 aligned float4 for x = ox0..ox0+15, plus the halo voxels
            ox0-1 and ox0+16); position p of a row is stored at byte 3 + p of its 24-byte slot */
         for (int task = warp; task < CH * np; task += 9) {
@@ -1138,10 +1234,8 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
                 float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
                 if (ok && f < 40 && gyy >= 0 && gyy < H) {
                     const T *src = xc + (size_t)gyy * W + gx;
-                    if (el) {
-                        if (gx < W) v.x = ldc<T>(c, cof(c, gz, gyy, gx, H, W)); if (gx + 1 < W) v.y = ldc<T>(c, cof(c, gz, gyy, gx + 1, H, W));
-                        if (gx + 2 < W) v.z = ldc<T>(c, cof(c, gz, gyy, gx + 2, H, W)); if (gx + 3 < W) v.w = ldc<T>(c, cof(c, gz, gyy, gx + 3, H, W));
-                    } else if (vec) { if (gx < W) v = ldx4(src); }
+                    if constexpr (IS_MX(T)) { if (gx < W) v = ldc4_mx<T>(c, cof(c, gz, gyy, gx, H, W), min(4, W - gx), vec); }   /* one call per 4 voxels */
+                    else if (vec) { if (gx < W) v = ldx4(src); }
                     else { if (gx < W) v.x = ldx(src, 0); if (gx + 1 < W) v.y = ldx(src, 1); if (gx + 2 < W) v.z = ldx(src, 2); if (gx + 3 < W) v.w = ldx(src, 3); }
                     v.x = gx < W ? act_ab(v.x, c.a, c.b, G) : 0.f; v.y = gx + 1 < W ? act_ab(v.y, c.a, c.b, G) : 0.f;
                     v.z = gx + 2 < W ? act_ab(v.z, c.a, c.b, G) : 0.f; v.w = gx + 3 < W ? act_ab(v.w, c.a, c.b, G) : 0.f;
@@ -1167,8 +1261,55 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
             if (lane < 20) dst[(lane >> 1) * 24 + ((lane & 1) ? 20 : 3)] = cvt_e4m3(vs * m);
             if (lane == 0) sxs[k * 4 + slot] = (uint8_t)(e + 127);
         }
+        /* GY stored MX-fp8 with the BMo output channels inside one block row: thread per output voxel of the z-step (256), the
+           voxel's row words decoded once for all BMo channels; a K block (2 rows x 16 x) is exactly one warp, so the block
+           amax is one redux per channel */
+        bool gdone = false;
+        if constexpr (IS_MX8(TG)) {
+            const int gbw = mx_bw(Co);
+            if ((coop & 2) && (co0 % gbw) + BMo <= gbw) {
+                gdone = true;
+                if (threadIdx.x < 256) {
+                    const int ks = threadIdx.x >> 5, row = ks * 2 + (lane >> 4), xx = lane & 15, vz = row >> 3, vy = row & 7;
+                    const int oz = oz0 + vz, oy = oy0 + vy, ox = ox0 + xx;
+                    const size_t Sg = (size_t)D * H * W, gri = ((size_t)n * mx_nb(Co) + co0 / gbw) * Sg;
+                    const uint8_t *gq = (const uint8_t *)gy;
+                    float v[BMo];
+#pragma unroll
+                    for (int c = 0; c < BMo; c++) v[c] = 0.f;
+                    if (oz < D && oy < H && ox < W) {
+                        const size_t vo = ((size_t)oz * H + oy) * W + ox;
+                        const unsigned *rw = (const unsigned *)(gq + (gri + vo) * gbw + co0 % gbw);
+                        const float sc = mx_scale(gq[(size_t)N * mx_nb(Co) * Sg * gbw + gri + vo]);
+#pragma unroll
+                        for (int w = 0; w < BMo / 4; w++) {
+                            const unsigned u = __ldg(rw + w);
+                            const float2 d0 = dec_e4m3x2((unsigned short)(u & 0xffffu)), d1 = dec_e4m3x2((unsigned short)(u >> 16));
+                            v[4 * w] = d0.x * sc; v[4 * w + 1] = d0.y * sc; v[4 * w + 2] = d1.x * sc; v[4 * w + 3] = d1.y * sc;
+                        }
+#pragma unroll
+                        for (int c = 0; c < BMo; c++) if (co0 + c >= Co) v[c] = 0.f;
+                    }
+                    const uint64_t vid0 = (((uint64_t)n * Co * D + oz) * H + oy) * (uint64_t)W + ox;   /* element id of channel 0; + c * D H W */
+#pragma unroll
+                    for (int c = 0; c < BMo; c++) {
+                        const int e = mx_exp(__uint_as_float(__reduce_max_sync(0xffffffffu, __float_as_uint(v[c]) & 0x7fffffffu)), 1.f / 448.f);
+                        float q = v[c] * exp2i(-e);
+                        if (sp.sr) q = sr_e4m3(q, sr_hash(sp.sr, vid0 + (uint64_t)(co0 + c) * Sg));   /* same key as the per-block path */
+                        sg[c * G8_CS + row * 16 + xx] = cvt_e4m3(q);
+                        if (lane == 0) sgs[c * 8 + ks] = (uint8_t)(e + 127);
+                        if (do_bias) {
+                            float sm = v[c];
+#pragma unroll
+                            for (int o = 16; o; o >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, o);
+                            if (lane == 0) atomicAdd(&sbias[c], sm);
+                        }
+                    }
+                }
+            }
+        }
         /* GY: K block (co, ks) = 2 rows x 16 voxels = 8 float4; warp covers 4 blocks, 8 lanes each */
-        for (int task = warp; task < BMo * 2; task += 9) {
+        if (!gdone) for (int task = warp; task < BMo * 2; task += 9) {
             int blk = task * 4 + (lane >> 3), c = blk >> 3, ks = blk & 7, f = lane & 7;
             int row = ks * 2 + (f >> 2), vx = 4 * (f & 3), vz = row >> 3, vy = row & 7;
             int co = co0 + c, oz = oz0 + vz, oy = oy0 + vy, ox = ox0 + vx;
@@ -1176,8 +1317,8 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
             if (co < Co && oz < D && oy < H) {
                 if constexpr (IS_MX8(TG)) {
                     const size_t vo = ((size_t)oz * H + oy) * W + ox, Sg = (size_t)D * H * W;
-                    if (ox < W) v.x = ldmx_e<8>(gy, N, Co, Sg, n, co, vo); if (ox + 1 < W) v.y = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + 1);
-                    if (ox + 2 < W) v.z = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + 2); if (ox + 3 < W) v.w = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + 3);
+                    float q8[8];
+                    if (ox < W) { ldmx8_8(gy, N, Co, Sg, n, co, vo, min(4, W - ox), vec, q8); v = make_float4(q8[0], q8[1], q8[2], q8[3]); }
                 } else {
                 const TG *src = gy + (((size_t)n * Co + co) * D + oz) * H * W + (size_t)oy * W + ox;
                 if (vec) { if (ox < W) v = ldx4<TG>(src); }
@@ -1249,17 +1390,20 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
     }
 }
 
+/* cooperative MX staging of the fp8 weight gradient (bit 0: x, bit 1: gy); 0 = the per-element paths (test hook) */
+static int g_f8w_coop = 1;   /* gy (bit 1) measured mixed: -7% at 96->32, +5..14% elsewhere (per-channel work per thread) */
+extern "C" void lp_set_f8w_coop(int c) { g_f8w_coop = c; }
 template <int MT, int NT, typename T, typename TG> static void launch_bw8(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC) {
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f8_k<MT, NT, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    conv_bwd_w_f8_k<MT, NT, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC);
+    conv_bwd_w_f8_k<MT, NT, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, g_f8w_coop);
 }
 template <typename T, typename TG> static void bwd_w_f8_t(const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
     int MT = ys.c >= 32 ? 2 : 1;
     int NT = xs.c <= 8 ? 1 : MT == 1 && xs.c % 24 == 0 ? 3 : 2;   /* 24 input channels per block when cout = 16: gy restaged less (dec0.c1: -6%) */
     if (getenv("UFSM_F8_NT")) NT = atoi(getenv("UFSM_F8_NT"));
     if (getenv("UFSM_F8_MT")) MT = atoi(getenv("UFSM_F8_MT"));
-    size_t smem = (size_t)8 * NT * X8_CS + 16 * MT * (G8_CS + 8) + 8 * NT * 4 + 16 * MT * 4 + 16;
+    size_t smem = (size_t)8 * NT * X8_CS + 16 * MT * (G8_CS + 8) + 8 * NT * 4 + 16 * MT * 4 + 16 + 32 + (size_t)8 * NT * (sizeof(chan_t) + 8);   /* + MX x channel table, amax */
     /* z-steps per block: as many as possible (less halo restaging, fewer atomics) while keeping one full wave of blocks */
     int nzt = nblk_(ys.d, 2), base = (int)(((xs.c + 8 * NT - 1) / (8 * NT)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * nblk_(ys.w, 16) * nblk_(ys.h, 8) * ys.n);
     int ZC = nzt < 12 ? nzt : 12;
@@ -3060,25 +3204,6 @@ __device__ __forceinline__ float sr_e2m1_u16(float v, unsigned u16) {
     return copysignf((fl + up) * __frcp_rn(inv), v);
 }   /* fixed random sign vector of the weight-gradient Hadamard (bit k set: element k negated) */
 __device__ __forceinline__ void had_lane(float &v, float p, bool hi) { v = hi ? p - v : v + p; }
-/* 4 consecutive voxels (off .. off + nv - 1, nv <= 4) of one channel of an MX tensor: the index math once, the 4 scale bytes in one
-   32-bit load when al4 (W % 4 == 0 and off % 4 == 0), element pairs decoded with one cvt */
-template <typename T> __device__ __forceinline__ float4 ldc4_mx(const chan_t &c, size_t off, int nv, bool al4) {
-    const uint8_t *p = (const uint8_t *)c.p + off * c.rb;
-    unsigned sw;
-    if (al4 && nv == 4) sw = __ldg((const unsigned *)(c.sp + off));
-    else { sw = 0u; for (int k = 0; k < nv; k++) sw |= (unsigned)c.sp[off + k] << (8 * k); }
-    unsigned b[4];
-#pragma unroll
-    for (int k = 0; k < 4; k++) {
-        unsigned v = k < nv ? (unsigned)__ldg(p + (size_t)k * c.rb + (IS_MX4(T) ? (c.nib >> 1) : 0)) : 0u;
-        b[k] = IS_MX4(T) ? (v >> (4 * (c.nib & 1))) & 15u : v;
-    }
-    float2 lo, hi;
-    if constexpr (IS_MX4(T)) { lo = dec_e2m1x2(b[0] | b[1] << 4); hi = dec_e2m1x2(b[2] | b[3] << 4); }
-    else { lo = dec_e4m3x2((unsigned short)(b[0] | b[1] << 8)); hi = dec_e4m3x2((unsigned short)(b[2] | b[3] << 8)); }
-    return make_float4(nv > 0 ? lo.x * mx_scale(sw & 255u) : 0.f, nv > 1 ? lo.y * mx_scale(sw >> 8 & 255u) : 0.f,
-                       nv > 2 ? hi.x * mx_scale(sw >> 16 & 255u) : 0.f, nv > 3 ? hi.y * mx_scale(sw >> 24) : 0.f);
-}
 template <int MT, int NT, int LY, typename T, typename TG>   /* LY 0: 27 shifted blocks, 1: row pairs (2 pairings), 2: rows, one scale per (ci, plane) */
 __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
                                                        int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC, int had) {
@@ -3328,19 +3453,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             if (co < Co && oz < D && oy < H) {
                 if constexpr (IS_MX8(TG)) {
                     const size_t vo = ((size_t)oz * H + oy) * W + ox, Sg = (size_t)D * H * W;
-                    const int bw = mx_bw(Co), nbk = mx_nb(Co);
-                    const size_t ri = ((size_t)n * nbk + co / bw) * Sg + vo;
-                    const uint8_t *qd = (const uint8_t *)gy + ri * bw + co % bw, *qs = (const uint8_t *)gy + (size_t)N * nbk * Sg * bw + ri;
-                    uint2 sw = make_uint2(0u, 0u);
-                    if ((W & 7) == 0) sw = __ldg((const uint2 *)qs);   /* the 8 scale bytes in one load (vo % 8 == 0) */
-                    else { for (int j = 0; j < 8; j++) if (ox + j < W) (j < 4 ? sw.x : sw.y) |= (unsigned)qs[j] << (8 * (j & 3)); }
-#pragma unroll
-                    for (int j = 0; j < 8; j += 2) {
-                        const unsigned b0 = ox + j < W ? __ldg(qd + (size_t)j * bw) : 0u, b1 = ox + j + 1 < W ? __ldg(qd + (size_t)(j + 1) * bw) : 0u;
-                        const float2 d = dec_e4m3x2((unsigned short)(b0 | b1 << 8));
-                        const unsigned s4 = j < 4 ? sw.x : sw.y;
-                        q[j] = d.x * mx_scale(s4 >> (8 * (j & 3)) & 255u); q[j + 1] = d.y * mx_scale(s4 >> (8 * ((j + 1) & 3)) & 255u);
-                    }
+                    ldmx8_8(gy, N, Co, Sg, n, co, vo, min(8, W - ox), (W & 7) == 0, q);
                 } else {
                     const TG *src = gy + (((size_t)n * Co + co) * D + oz) * H * W + (size_t)oy * W + ox;
                     if (vec) {
