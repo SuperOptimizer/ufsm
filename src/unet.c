@@ -345,6 +345,13 @@ static int fakeq(void) {
     return nn_get_tf32() ? f : 0;
 }
 #define FQ(p, s) do { if (fakeq()) nn_fake_quant((p), (s), fakeq()); } while (0)
+/* same study for the stored activation gradients (env UFSM_FAKEQ_GRAD, same format names; 16-bit gradient storage) */
+static int fakeq_grad(void) {
+    static int f = -1;
+    if (f < 0) { const char *e = getenv("UFSM_FAKEQ_GRAD"); f = !e ? 0 : !strcmp(e, "nvfp4") ? 1 : !strcmp(e, "mxfp4") ? 2 : !strcmp(e, "mxfp6e2m3") ? 3 : !strcmp(e, "mxfp6e3m2") ? 4 : !strcmp(e, "mxfp8") ? 5 : 0; }
+    return nn_get_tf32() && GBF ? f : 0;
+}
+#define FQG(p, s) do { if (fakeq_grad()) nn_fake_quant((p), (s), fakeq_grad()); } while (0)
 static void rc_fail(const char *what) { fprintf(stderr, "unet: recompute mode: %s unsupported\n", what); abort(); }
 /* transient buffer for the upsampled decoder input at level i (shape s), typed as activation storage */
 static float *rc_tmp(unet *u, int level, shape5 s, int *reg) {
@@ -470,9 +477,12 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     nn_set_conv(1);   /* precision-policy tag: c2 first, then c1 */
     if (nn_get_tf32()) {   /* fused: no materialised gn / silu activations */
         PROF(3, nn_gn_silu_bwd(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* B = d/d a2 */
+        FQG(B, b->ys);
         PROF(2, nn_conv3d_bwd_weight_gn(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, B, b->ys, g + b->c2.w, g + b->c2.b));
         PROF(1, nn_conv3d_bwd_data(B, b->ys, P(u, b->c2.w), b->ys, 3, 1, A, u->conv_scratch));                              /* A = d/d s1 */
+        FQG(A, b->ys);
         PROF(3, nn_gn_silu_bwd(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, A, A, g + b->n1.gamma, g + b->n1.beta, u->gn_scratch));    /* A = d/d a1 (in place) */
+        FQG(A, b->ys);
     } else {
     PROF(3, nn_gn_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, t1));            /* t1 = g2 */
     PROF(4, nn_silu_bwd(t1, gy, n, A));                                                                        /* A = d/d g2 */
@@ -493,18 +503,21 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
         rc_done(up, reg);
         if (r) rc_fail("decoder conv1 weight gradient");
         PROF(1, nn_conv3d_bwd_data_split(A, b->ys, P(u, b->c1.w), b->xs, B, gx2, b->c_split, u->conv_scratch));   /* B = d/d up part, gx2 = d/d skip */
+        { shape5 s1 = b->xs, s2 = b->xs; s1.c = b->c_split; s2.c = b->xs.c - b->c_split; FQG(B, s1); FQG(gx2, s2); }
         nn_set_conv(-1);
         return B;
     }
     if (b->in2 && nn_get_tf32()) {
         PROF(2, nn_conv3d_bwd_weight_split(b->in, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, A, b->ys, g + b->c1.w, g + b->c1.b));
         PROF(1, nn_conv3d_bwd_data_split(A, b->ys, P(u, b->c1.w), b->xs, B, gx2, b->c_split, u->conv_scratch));   /* B = d/d up part, gx2 = d/d skip */
+        { shape5 s1 = b->xs, s2 = b->xs; s1.c = b->c_split; s2.c = b->xs.c - b->c_split; FQG(B, s1); FQG(gx2, s2); }
         nn_set_conv(-1);
         return B;
     }
     PROF(2, nn_conv3d_bwd_weight(b->in, b->xs, A, b->ys, 3, 1, g + b->c1.w, g + b->c1.b));
     if (b != &u->enc[0] || !nn_get_tf32())   /* the network-input gradient of enc0 is never used */
-        PROF(1, nn_conv3d_bwd_data(A, b->ys, P(u, b->c1.w), b->xs, 3, 1, B, u->conv_scratch));            /* B = d/d in */
+    { PROF(1, nn_conv3d_bwd_data(A, b->ys, P(u, b->c1.w), b->xs, 3, 1, B, u->conv_scratch));            /* B = d/d in */
+        FQG(B, b->xs); }
     nn_set_conv(-1);
     return B;
 }
@@ -525,6 +538,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     if (recompute()) { nn_gn_t gg = gn_out(u, d0); int r; PROF(2, r = nn_conv3d_bwd_weight_x(d0->a2, &gg, nullptr, nullptr, 0, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b)); if (r) rc_fail("head weight gradient"); }
     else PROF(2, nn_conv3d_bwd_weight(d0->s2, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b));
     PROF(1, nn_conv3d_bwd_data(glogits, os, P(u, u->head.w), d0->ys, 1, 1, u->gout[0], u->conv_scratch));
+    FQG(u->gout[0], d0->ys);
     /* decoder, bottom-up in the graph = i from 0 to L-2 */
     for (int i = 0; i < L - 1; i++) {
         shape5 li = u->ls[i];
@@ -532,6 +546,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         if (nn_get_tf32()) {
             nn_set_layer(9 - i); float *gup = block_bwd(u, &u->dec[i], i, u->gout[i], u->gskip[i]);   /* gB[i]: grad wrt the upsampled part; skip grad written in place */
             PROF(5, nn_up2_bwd(gup, src, u->gout[i + 1]));
+            FQG(u->gout[i + 1], src);
         } else {
             nn_set_layer(9 - i); float *gcat = block_bwd(u, &u->dec[i], i, u->gout[i], nullptr);       /* gB[i]: grad wrt concat */
             PROF(5, nn_concat_bwd(gcat, w[i + 1], w[i], li, u->gA[i], u->gskip[i]));
@@ -549,6 +564,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
             if (recompute()) { nn_gn_t gg = gn_out(u, &u->enc[i - 1]); int r; PROF(2, r = nn_conv3d_bwd_weight_x(u->enc[i - 1].a2, &gg, nullptr, nullptr, 0, u->enc[i - 1].ys, gin, ds, 3, 2, g + u->down[i - 1].w, g + u->down[i - 1].b)); if (r) rc_fail("down weight gradient"); }
             else PROF(2, nn_conv3d_bwd_weight(u->enc[i - 1].s2, u->enc[i - 1].ys, gin, ds, 3, 2, g + u->down[i - 1].w, g + u->down[i - 1].b));
             int acc; PROF(1, acc = nn_conv3d_bwd_data_acc(gin, ds, P(u, u->down[i - 1].w), u->enc[i - 1].ys, 3, 2, u->gskip[i - 1], u->conv_scratch));   /* gskip += */
+            if (acc == 0) FQG(u->gskip[i - 1], u->enc[i - 1].ys);
             if (acc) {
                 PROF(1, nn_conv3d_bwd_data(gin, ds, P(u, u->down[i - 1].w), u->enc[i - 1].ys, 3, 2, u->gA[i - 1], u->conv_scratch));
                 PROF(4, nn_axpy(u->gskip[i - 1], 1.f, u->gA[i - 1], shape_numel(u->enc[i - 1].ys)));

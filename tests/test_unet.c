@@ -23,6 +23,29 @@ static double loss_of(unet *u, const float *dx, shape5 xs, const float *dgy, siz
 }
 
 static char ckpt_path[64];
+/* per-tensor gradient error report (env UFSM_SEGS=1): parameter segments in unet.c order */
+typedef struct { char name[24]; size_t off, len; } seg_t;
+static int nseg; static seg_t segs[128];
+static size_t addseg(const char *nm, size_t off, size_t len) { seg_t *g = &segs[nseg++]; snprintf(g->name, sizeof g->name, "%s", nm); g->off = off; g->len = len; return off + len; }
+static size_t addconv(const char *nm, int ci, int co, int k, size_t off) { char b[24]; snprintf(b, 24, "%s.w", nm); off = addseg(b, off, (size_t)co * ci * k * k * k); snprintf(b, 24, "%s.b", nm); return addseg(b, off, co); }
+static size_t addgn(const char *nm, int c, size_t off) { char b[24]; snprintf(b, 24, "%s.g", nm); off = addseg(b, off, c); snprintf(b, 24, "%s.be", nm); return addseg(b, off, c); }
+static size_t addblock(const char *nm, int ci, int co, size_t off) {
+    char b[24];
+    snprintf(b, 24, "%s.c1", nm); off = addconv(b, ci, co, 3, off); snprintf(b, 24, "%s.n1", nm); off = addgn(b, co, off);
+    snprintf(b, 24, "%s.c2", nm); off = addconv(b, co, co, 3, off); snprintf(b, 24, "%s.n2", nm); return addgn(b, co, off);
+}
+static void seg_report(const int *w, int L, int cin, int cout, const float *g0, const float *g1) {
+    size_t off = 0; char b[24]; nseg = 0;
+    for (int i = 0; i < L; i++) { snprintf(b, 24, "enc%d", i); off = addblock(b, i ? w[i - 1] : cin, w[i], off); }
+    for (int i = 0; i < L - 1; i++) { snprintf(b, 24, "down%d", i); off = addconv(b, w[i], w[i], 3, off); }
+    for (int i = L - 2; i >= 0; i--) { snprintf(b, 24, "dec%d", i); off = addblock(b, w[i] + w[i + 1], w[i], off); }
+    addconv("head", w[0], cout, 1, off);
+    for (int i = 0; i < nseg; i++) {
+        double d2 = 0, r2 = 0;
+        for (size_t j = segs[i].off; j < segs[i].off + segs[i].len; j++) { double d = (double)g1[j] - g0[j]; d2 += d * d; r2 += (double)g0[j] * g0[j]; }
+        printf("  %-10s %.3g\n", segs[i].name, sqrt(d2 / (r2 + 1e-300)));
+    }
+}
 int main(void) {
     snprintf(ckpt_path, sizeof ckpt_path, "/tmp/ufsm_test_unet_%d.ckpt", (int)getpid());
     if (nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0)) { printf("no cuda\n"); return 1; }
@@ -132,6 +155,7 @@ int main(void) {
             double d2 = 0, n2 = 0; for (size_t i = 0; i < np; i++) { d2 += (double)(g1[i] - g2[i]) * (g1[i] - g2[i]); n2 += (double)g1[i] * g1[i]; }
             double rel = sqrt(d2 / (n2 > 0 ? n2 : 1));
             printf("grads tensor-core vs fp32: rel L2 diff %.3g%s\n", rel, rel < 0.05 ? "" : "  FAIL");
+            if (getenv("UFSM_SEGS")) seg_report(big.widths, big.nlev, big.cin, big.cout, g1, g2);
             if (rel >= 0.05) bad++;
             free(g1); free(g2);
             nn_zero(bg, bl * 4);

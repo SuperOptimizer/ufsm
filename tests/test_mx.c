@@ -105,6 +105,27 @@ int main(void) {
         mode_mx(); nn_conv3d_bwd_weight_split(xam, xm, 32, cs, 0, nullptr, nullptr, nullptr, nullptr, gym, o16, gw4, nullptr);
         cmp("bwd_weight split input (MX)", gw4, gw3, (size_t)16 * 48 * 27, TOL);
     }
+    {   /* split with a segment that is not a multiple of 32 channels (the network's dec2: 80 + 64 -> 64) */
+        shape5 cs = {N, 144, 8, 8, 12}, c1 = cs, c2 = cs, ys = cs; c1.c = 80; c2.c = 64; ys.c = 64;
+        float *xa = dev_rand(shape_numel(c1), 1.f), *xb = dev_rand(shape_numel(c2), 1.f);
+        void *xam = mx_from(xa, c1), *xbm = mx_from(xb, c2); float *xad = deq(xam, c1), *xbd = deq(xbm, c2);
+        float *w = dev_rand((size_t)64 * 144 * 27, 0.05f), *cat = dev_zero(shape_numel(cs)), *yr = dev_zero(shape_numel(ys));
+        void *ym = mx_new(ys);
+        mode_ref(); nn_concat_fwd(xad, 80, xbd, 64, cs, cat); nn_conv3d_fwd(cat, cs, w, NULL, 64, 3, 1, yr);
+        mode_mx(); nn_conv3d_fwd_split(xam, xbm, 80, cs, 0, NULL, NULL, NULL, NULL, w, NULL, 64, (float *)ym, 0, 1e-5f, NULL, NULL);
+        cmp("conv fwd split 80 + 64 (MX)", deq(ym, ys), yr, shape_numel(ys), TOL);
+        float *gy = dev_rand(shape_numel(ys), 1e-3f); void *gym = mx_from(gy, ys); float *gyd = deq(gym, ys);
+        float *gxr = dev_zero(shape_numel(cs)), *scr = nn_malloc(nn_conv3d_scratch(cs, 64, 3) + 4096), *ga = dev_zero(shape_numel(c1)), *gb_ = dev_zero(shape_numel(c2));
+        void *g1m = mx_new(c1), *g2m = mx_new(c2);
+        mode_ref(); nn_conv3d_bwd_data(gyd, ys, w, cs, 3, 1, gxr, scr); nn_concat_bwd(gxr, 80, 64, cs, ga, gb_);
+        mode_mx(); nn_conv3d_bwd_data_split(gym, ys, w, cs, (float *)g1m, (float *)g2m, 80, scr);
+        cmp("bwd_data split 80 + 64, part 1 (MX)", deq(g1m, c1), ga, shape_numel(c1), TOL);
+        cmp("bwd_data split 80 + 64, part 2 (MX)", deq(g2m, c2), gb_, shape_numel(c2), TOL);
+        float *gw3 = dev_zero((size_t)64 * 144 * 27), *gw4 = dev_zero((size_t)64 * 144 * 27);
+        mode_ref(); nn_conv3d_bwd_weight(cat, cs, gyd, ys, 3, 1, gw3, NULL);
+        mode_mx(); nn_conv3d_bwd_weight_split(xam, xbm, 80, cs, 0, NULL, NULL, NULL, NULL, gym, ys, gw4, NULL);
+        cmp("bwd_weight split 80 + 64 (MX)", gw4, gw3, (size_t)64 * 144 * 27, TOL);
+    }
     {   /* stride 2: forward, backward-data (set and accumulate), weight gradient */
         shape5 xs = {N, 32, 16, 16, 16}, ys = {N, 32, 8, 8, 8};
         size_t nx = shape_numel(xs), ny = shape_numel(ys);
