@@ -172,6 +172,20 @@ __device__ __forceinline__ unsigned cvt_e4m3x4(float a, float b, float c, float 
     asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(d), "f"(c));
     return (unsigned)lo | ((unsigned)hi << 16);
 }
+/* stochastic rounding to e4m3 by dithering: v (already scaled into the e4m3 range) plus a uniform offset in
+   [-1/2, 1/2) ulp, then round to nearest. The ulp is that of v's binade (3 mantissa bits; subnormal below 2^-6). h: a
+   per-element hash. */
+__device__ __forceinline__ uint32_t sr_hash(uint32_t seed, uint64_t id) {
+    uint32_t h = seed ^ (uint32_t)id * 0x9e3779b1u ^ (uint32_t)(id >> 32) * 0x85ebca77u;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    return h;
+}
+__device__ __forceinline__ float sr_e4m3(float v, uint32_t h) {
+    int ex = (int)((__float_as_uint(v) >> 23) & 0xff) - 127;
+    if (ex < -6) ex = -6;
+    const float ulp = __uint_as_float((unsigned)(127 + ex - 3) << 23);
+    return fmaf((float)(h >> 8) * (1.f / 16777216.f) - 0.5f, ulp, v);
+}
 __device__ __forceinline__ unsigned char cvt_e4m3(float a) {
     unsigned short r;
     asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(0.f), "f"(a));
@@ -423,6 +437,11 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8_k(const T *__restrict__ x,
             }
             int e = mx_exp(amax, 1.f / 448.f);
             float m = exp2i(-e);
+            if (sp.sr) {   /* gradient operand: stochastic rounding, dither keyed by the element (deterministic per call) */
+                const uint64_t vid = (((uint64_t)n * Cip + ci0) * D + gz) * (uint64_t)H * W + (uint64_t)gy * W + gx;
+#pragma unroll
+                for (int k = 0; k < 32; k++) v[k] = sr_e4m3(v[k] * m, sr_hash(sp.sr, vid * 32 + k)) / m;
+            }
             uint4 h0 = make_uint4(cvt_e4m3x4(v[0] * m, v[1] * m, v[2] * m, v[3] * m), cvt_e4m3x4(v[4] * m, v[5] * m, v[6] * m, v[7] * m),
                                   cvt_e4m3x4(v[8] * m, v[9] * m, v[10] * m, v[11] * m), cvt_e4m3x4(v[12] * m, v[13] * m, v[14] * m, v[15] * m));
             uint4 h1 = make_uint4(cvt_e4m3x4(v[16] * m, v[17] * m, v[18] * m, v[19] * m), cvt_e4m3x4(v[20] * m, v[21] * m, v[22] * m, v[23] * m),
@@ -798,7 +817,13 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
             for (int o = 4; o; o >>= 1) { amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o)); sm += __shfl_xor_sync(0xffffffff, sm, o); }
             int e = mx_exp(amax, 1.f / 448.f);
             float m = exp2i(-e);
-            *(unsigned *)(sg + c * G8_CS + row * 16 + vx) = cvt_e4m3x4(v.x * m, v.y * m, v.z * m, v.w * m);
+            float4 q = make_float4(v.x * m, v.y * m, v.z * m, v.w * m);
+            if (sp.sr) {   /* stochastic rounding of the gradient operand, keyed by the element */
+                const uint64_t vid = ((((uint64_t)n * Co + co) * D + oz) * H + oy) * (uint64_t)W + ox;
+                q.x = sr_e4m3(q.x, sr_hash(sp.sr, vid)); q.y = sr_e4m3(q.y, sr_hash(sp.sr, vid + 1));
+                q.z = sr_e4m3(q.z, sr_hash(sp.sr, vid + 2)); q.w = sr_e4m3(q.w, sr_hash(sp.sr, vid + 3));
+            }
+            *(unsigned *)(sg + c * G8_CS + row * 16 + vx) = cvt_e4m3x4(q.x, q.y, q.z, q.w);
             if (f == 0) { sgs[c * 8 + ks] = (uint8_t)(e + 127); if (do_bias) atomicAdd(&sbias[c], sm); }
         }
         __syncthreads();

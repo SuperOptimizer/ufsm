@@ -42,6 +42,8 @@ void nn_set_tf32(int on);
 /* precision of the tensor-core path: 1 bf16 (default), 2 fp8 (e4m3 with MX block scales, fp32 accumulate), 3 fp4 forward +
    backward-data with fp8 weight gradient. nn_set_tf32(0) selects exact fp32; nn_set_tf32(1) restores the last precision. */
 void nn_set_prec(int p);
+void nn_set_sr(int on);              /* stochastic rounding of the fp8 gradient operands: backward-data input, weight-gradient gy (env UFSM_SR=1) */
+void nn_set_sr_step(unsigned step);  /* reseed per training step (deterministic per step) */
 int nn_get_prec(void);
 /* per-layer precision: the network tags each conv with a layer id (unet order: enc0..3 = 0..3, down0..2 = 4..6, dec2, dec1,
    dec0 = 7..9, head = 10); a layer precision >= 1 overrides the global one. Policy strings: "enc0=1,dec0=1" or positional. */

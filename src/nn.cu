@@ -26,6 +26,17 @@ extern "C" void nn_set_layer_prec(int id, int p) { lprec_init(); if (id >= 0 && 
 /* finer policy: per conv of a layer (sub 0 = c1, 1 = c2; down / head use sub 0) and per pass (0 forward, 1 backward-data,
    2 weight gradient); 0 = not set (falls back to the layer precision, then the global one) */
 static int g_sub = -1, g_pass = 0;
+/* stochastic rounding of fp8 gradient operands: one seed per conv call, derived from the step (deterministic per step) */
+static int g_sr = -1; static unsigned g_sr_step = 0, g_sr_ctr = 0;
+static int sr_on(void) { if (g_sr < 0) { const char *e = getenv("UFSM_SR"); g_sr = e ? atoi(e) : 0; } return g_sr; }
+static unsigned sr_seed(void) {
+    unsigned h = g_sr_step * 0x9e3779b9u ^ (++g_sr_ctr) * 0x85ebca6bu;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    return h | 1u;
+}
+extern "C" void nn_set_sr(int on) { g_sr = on; }
+
+extern "C" void nn_set_sr_step(unsigned step) { g_sr_step = step; g_sr_ctr = 0; }
 static signed char g_lprec3[NN_MAXLAYER][2][3];
 extern "C" void nn_set_conv(int sub) { g_sub = sub; }
 extern "C" int nn_get_layer(void) { return g_layer; }
@@ -1040,6 +1051,7 @@ static int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const 
         return lp_conv_fwd_f8(x, 3, xs, w, b, cout, y, 3, gp, osum, Go, sp);
     }
     const int pr = eff_prec();
+    if (!ts && pr == 2 && !sp.up && g_pass == 1) { if (sr_on()) sp.sr = sr_seed(); }   /* backward-data: gy is the staged operand */
     if (!ts && pr == 2 && !sp.up) return lp_conv_fwd_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp);   /* sp.up: 16-bit kernels only */
     if (!ts && pr == 3 && !sp.up) return lp_conv_fwd_f4(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp);
     if (pr == 4) return g_h16 ? conv_fwd_tc_f16acc<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : conv_fwd_tc_f16acc<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts);
@@ -1487,6 +1499,7 @@ static void launch_bwd_w_tc_h(const void *x, int xbf, shape5 xs, const void *gy,
 }
 static void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
     if (ISMX(x)) { lp_bwd_w_f8(x, 3, xs, gy, ISMX(gy) ? 3 : LPDT(gybf), ys, gw, gb, gp, sp); return; }
+    if ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) { if (sr_on()) sp.sr = sr_seed(); }
     if ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) { lp_bwd_w_f8(x, LPDT(xbf), xs, gy, LPDT(gybf), ys, gw, gb, gp, sp); return; }   /* prec 4 (fp16) keeps the 16-bit kernel for the weight gradient */
     if (g_h16) launch_bwd_w_tc_h<f16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
     else launch_bwd_w_tc_h<bf16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);

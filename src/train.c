@@ -112,7 +112,7 @@ int cmd_train(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 96] [--B 2] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
-                        "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1]\n"
+                        "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--opt adamw|muon] [--sr 1]\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  env UFSM_PROF=1 prints per-op GPU time every log interval (category 'upload+loss+opt').\n");
         return 2;
@@ -137,6 +137,7 @@ int cmd_train(int argc, char **argv) {
     float cooldown = (float)atof(opt(argc, argv, "--cooldown", "0.2"));
     int qat = atoi(opt(argc, argv, "--qat", "0"));         /* quantization-aware training: forward/backward-data at precision 2 (fp8) or 3 (fp4), weight gradients at 16-bit */
     if (qat) { nn_set_prec(qat); nn_set_prec_wgrad(1); }
+    if (atoi(opt(argc, argv, "--sr", "0"))) nn_set_sr(1);                                   /* stochastic rounding of fp8 gradient operands */
     int wq = atoi(opt(argc, argv, "--wq", "0"));            /* 8 or 4: true fp8 / fp4 weights (stochastic rounding after each update) */
     int sparse_at = atoi(opt(argc, argv, "--sparse24", "0"));   /* step from which the 3^3 conv weights are 2:4 sparse (0 = dense) */
     float srste = (float)atof(opt(argc, argv, "--srste", "2e-4"));
@@ -226,6 +227,7 @@ int cmd_train(int argc, char **argv) {
     double best_val = 1e30; int nskip = 0; (void)nskip;
     float parts[8][2 * NCH + 1];
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
+        nn_set_sr_step((unsigned)step);
         double loss = 0, active = 0;
         /* forward + backward on every GPU; kernel launches are asynchronous so the GPUs overlap */
         for (int g = 0; g < ng; g++) {

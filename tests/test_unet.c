@@ -155,6 +155,20 @@ int main(void) {
             size_t np = unet_nparams(b); float *g1 = malloc(np * 4), *g2 = malloc(np * 4);
             nn_set_tf32(0); unet_forward(b, bx, bs, 1); unet_zero_grad(b); unet_backward(b, bg); unet_grad_d2h(b, g1);
             nn_set_tf32(1); unet_forward(b, bx, bs, 1); unet_zero_grad(b); unet_backward(b, bg); unet_grad_d2h(b, g2);
+            {   /* UFSM_SR_AVG=K: average K backward passes with different stochastic-rounding seeds (bias of the quantisation) */
+                int K = getenv("UFSM_SR_AVG") ? atoi(getenv("UFSM_SR_AVG")) : 1;
+                if (K > 1) {
+                    float *g3 = malloc(np * 4);
+                    for (int k = 1; k < K; k++) {
+                        nn_set_sr_step((unsigned)k);
+                        unet_zero_grad(b); unet_backward(b, bg); unet_grad_d2h(b, g3);
+                        for (size_t i = 0; i < np; i++) g2[i] += g3[i];
+                    }
+                    for (size_t i = 0; i < np; i++) g2[i] /= K;
+                    free(g3);
+                    nn_set_sr_step(0);
+                }
+            }
             double d2 = 0, n2 = 0; for (size_t i = 0; i < np; i++) { d2 += (double)(g1[i] - g2[i]) * (g1[i] - g2[i]); n2 += (double)g1[i] * g1[i]; }
             double rel = sqrt(d2 / (n2 > 0 ? n2 : 1));
             printf("grads tensor-core vs fp32: rel L2 diff %.3g%s\n", rel, rel < 0.05 ? "" : "  FAIL");

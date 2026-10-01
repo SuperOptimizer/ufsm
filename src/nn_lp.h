@@ -10,7 +10,9 @@ typedef struct { const float *gamma, *beta, *mean, *rstd; int G; } gnp_t;   /* G
    the main gnp_t then applies to the x segment alone. gp2.G == 0 keeps the legacy meaning (gnp_t over all channels). */
 /* up (with x2): the x segment is stored at half resolution (D/2 x H/2 x W/2) and read as its trilinear 2x upsample
    (align_corners = false, edge clamp: the same values as nn_up2_fwd_into), so the decoder input is never materialised */
-typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; } split_t;
+/* sr != 0: stochastic rounding (seed) of this conv's gradient operand when quantised to fp8 (the input of a backward-data
+   conv, the gy of a weight gradient); 0 = round to nearest */
+typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; } split_t;
 /* k=3 stride 1 forward / weight gradient with the same semantics as the BF16 tensor-core paths in nn.cu
    (conv_fwd_tc / launch_bwd_w_tc): xbf / ybf = activation (and x2 / y2) storage type, 0 fp32, 1 bf16, 2 fp16; the
    forward needs xbf == ybf. Weights, biases and GroupNorm parameters are fp32; the weight gradient accepts fp32 or (with xbf) bf16 gy. */
