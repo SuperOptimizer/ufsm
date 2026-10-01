@@ -337,8 +337,12 @@ Where the rest would come from:
   at ~15% more step time (naive small-matrix kernels). Real-data yardstick (MANBp, P64 B8, 6000 steps, down_norm,
   same seed): peak F1 0.296 at threshold 0.6 (band F1 0.476 / recall 0.584) for Muon against 0.199 at 0.6 for AdamW
   (0.362 / 0.366); validation loss 0.872 vs 0.898. Adopted for new runs (`--opt muon`); lr sweep 0.01 / 0.02 / 0.05
-  in progress. Note the AdamW arm scored below the agent's earlier AdamW reference (0.262 at 0.5), so seed variance
-  is large at 6000 steps, but the Muon margin is far outside it.
+  done: peak F1 0.307 (lr 0.01), 0.296 (0.02), 0.290 (0.05); validation loss 0.870 / 0.872 / 0.866. Note the AdamW
+  arm scored below the agent's earlier AdamW reference (0.262 at 0.5), so seed variance is large at 6000 steps, but
+  the Muon margin is far outside it. Step cost: +11-15% at 64^3-96^3 (255 small launches per step), ~5% at 128^3.
+- r10 (2026-10-01 13:10): configs/all2.json (17 sources, full chunk prefetch, 1.1 um scan from level 2), down_norm,
+  Muon lr 0.01, `--sched wsd --cooldown 0.2`, 200k steps at 128^3, effective batch 2 on both GPUs. Scored against
+  the r8 baseline on all 17 held-out boxes when done.
 - Prefetch and training levels: scans finer than 1.8 um (PHerc0139 1.129 um) get `min_level` 1 from make_sources
   (their level 0 alone would be 1.5M chunks); the sampler and the prefetch honour it.
 
