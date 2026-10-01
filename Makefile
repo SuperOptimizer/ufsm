@@ -70,6 +70,7 @@ build:
 test: build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_rc
 	./build/test_mx
 	./build/test_rc
+	UFSM_FUSED_UP=0 UFSM_F16=1 ./build/test_unet
 	UFSM_RECOMPUTE=2 UFSM_F16=1 ./build/test_unet
 	./build/test_json
 	./build/test_nn

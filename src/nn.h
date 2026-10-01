@@ -139,11 +139,13 @@ int nn_conv3d_fwd_gn_stats(const float *x, shape5 xs, int G_in, const float *gam
 /* Input-side recompute. The conv input is silu(gn(x)) formed while staging from a stored pre-norm x (gx: GroupNorm
    parameters and statistics; nullptr = x used as is). With x2 the input is the channel concat [x, x2] (c_split = channels
    of x, gx2 the GroupNorm of x2; gx needs gx2, gx2 alone transforms x2 only). k=3 stride 1 (optionally with GN
-   statistics of the output for G_out groups), k=3 stride 2 and k=1 (no split). Tensor-core path only; -1 when unsupported. */
+   statistics of the output for G_out groups), k=3 stride 2 and k=1 (no split). up = 1 (split only, gx nullptr): x is
+   stored at half resolution and read as its trilinear 2x upsample (nn_up2_fwd_into values) while staging. Tensor-core
+   path only; -1 when unsupported. */
 typedef struct { const float *gamma, *beta, *mean, *rstd; int G; } nn_gn_t;
-int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, shape5 xs,
+int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, int up, shape5 xs,
                     const float *w, const float *b, int cout, int k, int stride, float *y, int G_out, float eps, float *omean, float *orstd);
-int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, shape5 xs,
+int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, int up, shape5 xs,
                            const float *gy, shape5 ys, int k, int stride, float *gw, float *gb);   /* gw / gb accumulated */
 int nn_conv3d_fwd_split(const float *x, const float *x2, int c_split, shape5 xs, int G_in, const float *gamma, const float *beta, const float *mean, const float *rstd,
                         const float *w, const float *b, int cout, float *y, int G_out, float eps, float *omean, float *orstd);

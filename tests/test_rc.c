@@ -43,21 +43,38 @@ int main(void) {
         float *upx = dev_zero(shape_numel(us));
         nn_up2_fwd_gn_into(xc, cs, &g1, upx, 32, 0);
         cmp("up2 of silu(gn(x))", upx, up, shape_numel(us), 1e-5);
-        if (nn_conv3d_fwd_x(upx, NULL, xk, &g2, 32, fs, w, b, 16, 3, 1, yx, G, 1e-5f, m2, r2)) { printf("fwd_x unsupported\n"); return 1; }
+        if (nn_conv3d_fwd_x(upx, NULL, xk, &g2, 32, 0, fs, w, b, 16, 3, 1, yx, G, 1e-5f, m2, r2)) { printf("fwd_x unsupported\n"); return 1; }
         cmp("split fwd, gn on x2", yx, yr, shape_numel(ys), tol);
         cmp("  output GN mean", m2, m1, N * G, tol);
         float *gy = dev_rand(shape_numel(ys), 1.f, 0.f), *gwr = dev_zero((size_t)16 * 48 * 27), *gwx = dev_zero((size_t)16 * 48 * 27), *gbr = dev_zero(16), *gbx = dev_zero(16);
         nn_conv3d_bwd_weight_split(up, t2, 32, fs, 0, NULL, NULL, NULL, NULL, gy, ys, gwr, gbr);
-        nn_conv3d_bwd_weight_x(upx, NULL, xk, &g2, 32, fs, gy, ys, 3, 1, gwx, gbx);
+        nn_conv3d_bwd_weight_x(upx, NULL, xk, &g2, 32, 0, fs, gy, ys, 3, 1, gwx, gbx);
         cmp("split wgrad, gn on x2", gwx, gwr, (size_t)16 * 48 * 27, tol);
+        {   /* fused upsample: x = coarse tensor read as its trilinear upsample, x2 with gn */
+            float *upr = dev_zero(shape_numel(us)), *y5 = dev_zero(shape_numel(ys)), *y6 = dev_zero(shape_numel(ys));
+            float *m5 = dev_zero(N * G), *r5 = dev_zero(N * G), *m6 = dev_zero(N * G), *r6 = dev_zero(N * G);
+            nn_up2_fwd_into(xc, cs, upr, 32, 0);
+            nn_conv3d_fwd_x(upr, NULL, xk, &g2, 32, 0, fs, w, b, 16, 3, 1, y5, G, 1e-5f, m5, r5);
+            if (nn_conv3d_fwd_x(xc, NULL, xk, &g2, 32, 1, fs, w, b, 16, 3, 1, y6, G, 1e-5f, m6, r6)) {
+                printf("  fused upsample: not supported at prec %d (fp8 kernels use the transient)%s\n", precs[pi], precs[pi] == 2 || precs[pi] == 3 ? "" : "  FAIL");
+                if (precs[pi] != 2 && precs[pi] != 3) bad++;
+            } else {
+            cmp("split fwd, fused upsample", y6, y5, shape_numel(ys), tol / 4);
+            cmp("  output GN rstd", r6, r5, N * G, tol / 4);
+            float *w5 = dev_zero((size_t)16 * 48 * 27), *w6 = dev_zero((size_t)16 * 48 * 27), *b5 = dev_zero(16), *b6 = dev_zero(16);
+            nn_conv3d_bwd_weight_x(upr, NULL, xk, &g2, 32, 0, fs, gy, ys, 3, 1, w5, b5);
+            nn_conv3d_bwd_weight_x(xc, NULL, xk, &g2, 32, 1, fs, gy, ys, 3, 1, w6, b6);
+            cmp("split wgrad, fused upsample", w6, w5, (size_t)16 * 48 * 27, tol / 4);
+            }
+        }
         {   /* both segments transformed (x at full resolution) */
             float *xf = dev_rand(shape_numel(us), 2.f, 0.f), *tf = mat(xf, us, &g1), *y3 = dev_zero(shape_numel(ys)), *y4 = dev_zero(shape_numel(ys));
             nn_conv3d_fwd_split(tf, t2, 32, fs, 0, NULL, NULL, NULL, NULL, w, b, 16, y3, 0, 0.f, NULL, NULL);
-            nn_conv3d_fwd_x(xf, &g1, xk, &g2, 32, fs, w, b, 16, 3, 1, y4, 0, 0.f, NULL, NULL);
+            nn_conv3d_fwd_x(xf, &g1, xk, &g2, 32, 0, fs, w, b, 16, 3, 1, y4, 0, 0.f, NULL, NULL);
             cmp("split fwd, gn both", y4, y3, shape_numel(ys), tol);
             float *w3 = dev_zero((size_t)16 * 48 * 27), *w4 = dev_zero((size_t)16 * 48 * 27);
             nn_conv3d_bwd_weight_split(tf, t2, 32, fs, 0, NULL, NULL, NULL, NULL, gy, ys, w3, NULL);
-            nn_conv3d_bwd_weight_x(xf, &g1, xk, &g2, 32, fs, gy, ys, 3, 1, w4, NULL);
+            nn_conv3d_bwd_weight_x(xf, &g1, xk, &g2, 32, 0, fs, gy, ys, 3, 1, w4, NULL);
             cmp("split wgrad, gn both", w4, w3, (size_t)16 * 48 * 27, tol);
         }
         cmp("  bias", gbx, gbr, 16, 1e-4);
@@ -68,22 +85,22 @@ int main(void) {
         shape5 ds = nn_conv3d_out_shape(xs, 32, 3, 2);
         float *dr = dev_zero(shape_numel(ds)), *dx = dev_zero(shape_numel(ds));
         nn_conv3d_fwd(t3, xs, w2, b2, 32, 3, 2, dr);
-        nn_conv3d_fwd_x(x, &g3, NULL, NULL, 0, xs, w2, b2, 32, 3, 2, dx, 0, 0.f, NULL, NULL);
+        nn_conv3d_fwd_x(x, &g3, NULL, NULL, 0, 0, xs, w2, b2, 32, 3, 2, dx, 0, 0.f, NULL, NULL);
         cmp("s2 fwd, gn", dx, dr, shape_numel(ds), tol);
         float *gd = dev_rand(shape_numel(ds), 1.f, 0.f), *gw2r = dev_zero((size_t)32 * 32 * 27), *gw2x = dev_zero((size_t)32 * 32 * 27);
         nn_conv3d_bwd_weight(t3, xs, gd, ds, 3, 2, gw2r, NULL);
-        nn_conv3d_bwd_weight_x(x, &g3, NULL, NULL, 0, xs, gd, ds, 3, 2, gw2x, NULL);
+        nn_conv3d_bwd_weight_x(x, &g3, NULL, NULL, 0, 0, xs, gd, ds, 3, 2, gw2x, NULL);
         cmp("s2 wgrad, gn", gw2x, gw2r, (size_t)32 * 32 * 27, tol);
         /* head */
         shape5 hs = {N, 16, 16, 12, 20}, os = hs; os.c = 1;
         float *xh = dev_rand(shape_numel(hs), 2.f, 0.f); nn_gn_t g4 = mkgn(N, 16, G); float *t4 = mat(xh, hs, &g4);
         float *wh = dev_rand(16, 0.3f, 0.f), *bh = dev_rand(1, 0.1f, 0.f), *hr = dev_zero(shape_numel(os)), *hx = dev_zero(shape_numel(os));
         nn_conv3d_fwd(t4, hs, wh, bh, 1, 1, 1, hr);
-        nn_conv3d_fwd_x(xh, &g4, NULL, NULL, 0, hs, wh, bh, 1, 1, 1, hx, 0, 0.f, NULL, NULL);
+        nn_conv3d_fwd_x(xh, &g4, NULL, NULL, 0, 0, hs, wh, bh, 1, 1, 1, hx, 0, 0.f, NULL, NULL);
         cmp("head fwd, gn", hx, hr, shape_numel(os), 1e-4);
         float *go = dev_rand(shape_numel(os), 1.f, 0.f), *ghr = dev_zero(16), *ghx = dev_zero(16);
         nn_conv3d_bwd_weight(t4, hs, go, os, 1, 1, ghr, NULL);
-        nn_conv3d_bwd_weight_x(xh, &g4, NULL, NULL, 0, hs, go, os, 1, 1, ghx, NULL);
+        nn_conv3d_bwd_weight_x(xh, &g4, NULL, NULL, 0, 0, hs, go, os, 1, 1, ghx, NULL);
         cmp("head wgrad, gn", ghx, ghr, 16, 1e-4);
     }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }

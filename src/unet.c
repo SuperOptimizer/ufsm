@@ -258,7 +258,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
         m2 = m1;
         for (int i = 0; i < L - 1; i++) { shape5 d = u->ls[i + 1]; d.c = w[i]; if (act_bytes_of(d) > act_bytes_of(m2)) m2 = d; }
         for (int i = 0; i < L - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > act_bytes_of(mc)) mc = c; }
-        T1 = dalloc_act_s(u, m1); T2 = dalloc_act_s(u, m2); TC = dalloc_act_s(u, mc);
+        T1 = dalloc_act_s(u, m1); T2 = dalloc_act_s(u, m2); TC = rc ? nullptr : dalloc_act_s(u, mc);   /* recompute: rc_tmp allocates on demand */
     }
     for (int i = 0; i < L; i++) {
         shape5 bin = u->ls[i]; bin.c = i == 0 ? u->cfg.cin : w[i - 1];
@@ -268,7 +268,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
     for (int i = L - 2; i >= 0; i--) {
         shape5 li = u->ls[i];
         shape5 cs_ = li; cs_.c = nn_get_tf32() ? w[i + 1] : w[i] + w[i + 1];
-        if (share) u->cat[i] = TC;   /* also the recompute-mode inference transient (rc_tmp) */
+        if (share && !rc) u->cat[i] = TC;
         else if (!rc) u->cat[i] = dalloc_act_s(u, cs_);
         shape5 cin = li; cin.c = w[i] + w[i + 1];
         build_block_acts(u, &u->dec[i], cin, train, i > 0, T1, T2);
@@ -355,6 +355,11 @@ static int fakeq_grad(void) {
 static void rc_fail(const char *what) { fprintf(stderr, "unet: recompute mode: %s unsupported\n", what); abort(); }
 /* transient buffer for the upsampled decoder input at level i (shape s), typed as activation storage */
 static float *rc_tmp(unet *u, int level, shape5 s, int *reg) {
+    if (!u->train && !u->cat[0]) {   /* inference: the transient is only allocated if the fused path is unavailable */
+        const int *w = u->cfg.widths; shape5 m = u->ls[0]; m.c = 0;
+        for (int i = 0; i < u->cfg.nlev - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > act_bytes_of(m)) m = c; }
+        u->cat[0] = dalloc_act_s(u, m);
+    }
     float *p = u->train ? u->gB[level] : u->cat[0];
     *reg = 0;
     if (act_mx8() && nn_storage(p) != 8) { nn_set_storage(p, nn_mx8_bytes(s), 8); *reg = 1; }   /* 16-bit gradient buffer used as MX for now */
@@ -370,20 +375,34 @@ static float *rc_up(unet *u, block *b, int level, int *reg) {
     else PROF(5, nn_up2_fwd_gn_into(xb->a2, xb->ys, &g, p, b->c_split, 0));
     return p;
 }
+/* decoder conv1 forward (y with GN stats when G) or weight gradient (gy != nullptr) in recompute mode. Fused: the
+   upsampled part is read from the coarse block output inside the conv staging (16-bit kernels), so inference needs no
+   full-resolution transient at all (-33% inference memory at the same speed) and training skips the upsample kernel
+   (~1 ms per step at 96^3 B2; the gradient buffer B is still sized for the up-part gradient). The fp8 / MX kernels
+   take the transient. env UFSM_FUSED_UP: 0 never, 1 inference only, 2 always (default). */
+static int fused_up(const unet *u) { static int f = -1; if (f < 0) { const char *e = getenv("UFSM_FUSED_UP"); f = e ? atoi(e) : 2; } return f >= 2 || (f == 1 && !u->train); }
+static int dec_conv1(unet *u, block *b, int level, float *y, int G, float *m, float *r, const float *gy, float *gw, float *gbias) {
+    const block *xb = (const block *)b->xb, *x2b = (const block *)b->x2b;
+    nn_gn_t g2 = gn_out(u, x2b);
+    int rv = -1;
+    if (fused_up(u) && xb->s2) {
+        if (gy) PROF(2, rv = nn_conv3d_bwd_weight_x(xb->s2, nullptr, x2b->a2, &g2, b->c_split, 1, b->xs, gy, b->ys, 3, 1, gw, gbias));
+        else PROF(0, rv = nn_conv3d_fwd_x(xb->s2, nullptr, x2b->a2, &g2, b->c_split, 1, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, y, G, 1e-5f, m, r));
+        if (!rv) return 0;
+    }
+    int reg; float *up = rc_up(u, b, level, &reg);
+    if (gy) PROF(2, rv = nn_conv3d_bwd_weight_x(up, nullptr, x2b->a2, &g2, b->c_split, 0, b->xs, gy, b->ys, 3, 1, gw, gbias));
+    else PROF(0, rv = nn_conv3d_fwd_x(up, nullptr, x2b->a2, &g2, b->c_split, 0, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, y, G, 1e-5f, m, r));
+    rc_done(up, reg);
+    return rv;
+}
 static void block_fwd(unet *u, block *b, int level, const float *x) {
     b->in = x;
     int G = G_of(u, b->c1.cout);
     float *t1 = u->t1[level] ? u->t1[level] : b->s2;    /* inference: no scratch, s2 doubles as temp */
     if (nn_get_tf32()) {   /* conv1 yields the stats of a1; conv2 applies gn + silu to a1 while staging and yields the stats of a2 */
         nn_set_conv(0);
-        if (b->xb) {   /* recompute: [transient upsample | silu(gn(skip a2)) in staging] */
-            const block *x2b = (const block *)b->x2b;
-            nn_gn_t g2 = gn_out(u, x2b);
-            int reg; float *up = rc_up(u, b, level, &reg);
-            int r; PROF(0, r = nn_conv3d_fwd_x(up, nullptr, x2b->a2, &g2, b->c_split, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1, G, 1e-5f, b->m1, b->r1));
-            rc_done(up, reg);
-            if (r) rc_fail("decoder conv1");
-        }
+        if (b->xb) { if (dec_conv1(u, b, level, b->a1, G, b->m1, b->r1, nullptr, nullptr, nullptr)) rc_fail("decoder conv1"); }   /* [up2(coarse) | silu(gn(skip a2))] */
         else if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1));
         else PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1));
         FQ(b->a1, b->ys);
@@ -417,7 +436,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         cur = u->enc[i].s2;
         if (i < L - 1) {
             nn_set_layer(4 + i);
-            if (recompute()) { nn_gn_t g = gn_out(u, &u->enc[i]); int r; PROF(0, r = nn_conv3d_fwd_x(u->enc[i].a2, &g, nullptr, nullptr, 0, u->enc[i].ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i], 0, 0.f, nullptr, nullptr)); if (r) rc_fail("down conv"); }
+            if (recompute()) { nn_gn_t g = gn_out(u, &u->enc[i]); int r; PROF(0, r = nn_conv3d_fwd_x(u->enc[i].a2, &g, nullptr, nullptr, 0, 0, u->enc[i].ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i], 0, 0.f, nullptr, nullptr)); if (r) rc_fail("down conv"); }
             else PROF(0, nn_conv3d_fwd(cur, u->enc[i].ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i]));
             { shape5 ds = u->ls[i + 1]; ds.c = w[i]; FQ(u->downo[i], ds); }
             cur = u->downo[i];
@@ -444,7 +463,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         cur = u->dec[i].s2;
     }
     nn_set_layer(10);
-    if (recompute()) { nn_gn_t g = gn_out(u, &u->dec[0]); int r; PROF(0, r = nn_conv3d_fwd_x(u->dec[0].a2, &g, nullptr, nullptr, 0, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, 1, 1, u->logits, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("head"); }
+    if (recompute()) { nn_gn_t g = gn_out(u, &u->dec[0]); int r; PROF(0, r = nn_conv3d_fwd_x(u->dec[0].a2, &g, nullptr, nullptr, 0, 0, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, 1, 1, u->logits, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("head"); }
     else PROF(0, nn_conv3d_fwd(cur, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, 1, 1, u->logits));
     if (getenv("UFSM_DEBUG") && !ABF && !recompute()) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d a1 %.4g a2 %.4g s2 %.4g%s\n", i, nn_sumsq(u->enc[i].a1, shape_numel(u->enc[i].ys), u->red_scratch), nn_sumsq(u->enc[i].a2, shape_numel(u->enc[i].ys), u->red_scratch), nn_sumsq(u->enc[i].s2, shape_numel(u->enc[i].ys), u->red_scratch), i < L - 1 ? "" : " (bottom)");
@@ -464,13 +483,8 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     if (recompute_a1()) {   /* a1 was overwritten by later blocks: re-run conv1 (same kernel and precision as the forward) */
         nn_set_conv(0);
         int r;
-        if (b->xb) {
-            const block *x2b = (const block *)b->x2b;
-            nn_gn_t g2 = gn_out(u, x2b);
-            int reg; float *up = rc_up(u, b, level, &reg);
-            PROF(0, r = nn_conv3d_fwd_x(up, nullptr, x2b->a2, &g2, b->c_split, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1, 0, 0.f, nullptr, nullptr));
-            rc_done(up, reg);
-        } else PROF(0, r = nn_conv3d_fwd_x(b->in, nullptr, nullptr, nullptr, 0, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1, 0, 0.f, nullptr, nullptr));
+        if (b->xb) r = dec_conv1(u, b, level, b->a1, 0, nullptr, nullptr, nullptr, nullptr, nullptr);
+        else PROF(0, r = nn_conv3d_fwd_x(b->in, nullptr, nullptr, nullptr, 0, 0, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1, 0, 0.f, nullptr, nullptr));
         if (r) rc_fail("conv1 recompute");
         FQ(b->a1, b->ys);
     }
@@ -496,12 +510,7 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     }
     nn_set_conv(0);
     if (b->xb) {   /* recompute: weight gradient with the upsampled part rebuilt into B (free until backward-data below) */
-        const block *x2b = (const block *)b->x2b;
-        nn_gn_t g2 = gn_out(u, x2b);
-        int reg; float *up = rc_up(u, b, level, &reg);
-        int r; PROF(2, r = nn_conv3d_bwd_weight_x(up, nullptr, x2b->a2, &g2, b->c_split, b->xs, A, b->ys, 3, 1, g + b->c1.w, g + b->c1.b));
-        rc_done(up, reg);
-        if (r) rc_fail("decoder conv1 weight gradient");
+        if (dec_conv1(u, b, level, nullptr, 0, nullptr, nullptr, A, g + b->c1.w, g + b->c1.b)) rc_fail("decoder conv1 weight gradient");
         PROF(1, nn_conv3d_bwd_data_split(A, b->ys, P(u, b->c1.w), b->xs, B, gx2, b->c_split, u->conv_scratch));   /* B = d/d up part, gx2 = d/d skip */
         { shape5 s1 = b->xs, s2 = b->xs; s1.c = b->c_split; s2.c = b->xs.c - b->c_split; FQG(B, s1); FQG(gx2, s2); }
         nn_set_conv(-1);
@@ -535,7 +544,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     block *d0 = &u->dec[0];
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
     nn_set_layer(10);
-    if (recompute()) { nn_gn_t gg = gn_out(u, d0); int r; PROF(2, r = nn_conv3d_bwd_weight_x(d0->a2, &gg, nullptr, nullptr, 0, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b)); if (r) rc_fail("head weight gradient"); }
+    if (recompute()) { nn_gn_t gg = gn_out(u, d0); int r; PROF(2, r = nn_conv3d_bwd_weight_x(d0->a2, &gg, nullptr, nullptr, 0, 0, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b)); if (r) rc_fail("head weight gradient"); }
     else PROF(2, nn_conv3d_bwd_weight(d0->s2, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b));
     PROF(1, nn_conv3d_bwd_data(glogits, os, P(u, u->head.w), d0->ys, 1, 1, u->gout[0], u->conv_scratch));
     FQG(u->gout[0], d0->ys);
@@ -561,7 +570,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
             /* enc[i] input = downo[i-1] = down[i-1](enc[i-1].s2): propagate to enc[i-1].s2, accumulate into gskip[i-1] */
             shape5 ds = u->enc[i].xs;                                     /* == down output shape */
             nn_set_layer(4 + i - 1);
-            if (recompute()) { nn_gn_t gg = gn_out(u, &u->enc[i - 1]); int r; PROF(2, r = nn_conv3d_bwd_weight_x(u->enc[i - 1].a2, &gg, nullptr, nullptr, 0, u->enc[i - 1].ys, gin, ds, 3, 2, g + u->down[i - 1].w, g + u->down[i - 1].b)); if (r) rc_fail("down weight gradient"); }
+            if (recompute()) { nn_gn_t gg = gn_out(u, &u->enc[i - 1]); int r; PROF(2, r = nn_conv3d_bwd_weight_x(u->enc[i - 1].a2, &gg, nullptr, nullptr, 0, 0, u->enc[i - 1].ys, gin, ds, 3, 2, g + u->down[i - 1].w, g + u->down[i - 1].b)); if (r) rc_fail("down weight gradient"); }
             else PROF(2, nn_conv3d_bwd_weight(u->enc[i - 1].s2, u->enc[i - 1].ys, gin, ds, 3, 2, g + u->down[i - 1].w, g + u->down[i - 1].b));
             int acc; PROF(1, acc = nn_conv3d_bwd_data_acc(gin, ds, P(u, u->down[i - 1].w), u->enc[i - 1].ys, 3, 2, u->gskip[i - 1], u->conv_scratch));   /* gskip += */
             if (acc == 0) FQG(u->gskip[i - 1], u->enc[i - 1].ys);

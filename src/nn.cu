@@ -323,6 +323,43 @@ __device__ __forceinline__ bool in_gn(const gnp_t &gp, const split_t &sp, int n,
     if (gp.G) { gn_coef(gp, n, ci, Ci, a, b); return true; }
     return false;
 }
+/* 18-element staged row (fine columns ox0 - 1 .. ox0 + 16, ox0 even; D, H, W even) of the trilinear 2x upsample of
+   a half-resolution channel xc: weights 3/4 and 1/4 per axis with the partner index clamped at the edges; zero outside
+   [0, W) (conv padding). 4 coarse rows x 10 columns. */
+template <typename T> __device__ __forceinline__ void ld4(const T *p, float *o);
+template <typename TI> __device__ __forceinline__ void row18_up2(const TI *xc, int gz, int gyy, int ox0, int D, int H, int W, float *v) {
+    const int Dh = D >> 1, Hh = H >> 1, Wh = W >> 1, c0 = (ox0 >> 1) - 1;
+    const int mz = gz >> 1, my = gyy >> 1;
+    const int mz1 = min(max(mz + ((gz & 1) ? 1 : -1), 0), Dh - 1), my1 = min(max(my + ((gyy & 1) ? 1 : -1), 0), Hh - 1);
+    const TI *r00 = xc + ((size_t)mz * Hh + my) * Wh, *r01 = xc + ((size_t)mz * Hh + my1) * Wh;
+    const TI *r10 = xc + ((size_t)mz1 * Hh + my) * Wh, *r11 = xc + ((size_t)mz1 * Hh + my1) * Wh;
+    float t[10];
+    const bool vfull = ox0 + 16 <= W && !(Wh & 3);   /* coarse columns c0 + 1 .. c0 + 8 in range, 8 / 16-byte aligned */
+    const TI *rr[4] = {r00, r01, r10, r11};
+    const float wr[4] = {0.5625f, 0.1875f, 0.1875f, 0.0625f};
+#pragma unroll
+    for (int j = 0; j < 10; j++) t[j] = 0.f;
+#pragma unroll
+    for (int q = 0; q < 4; q++) {
+        float a[10];
+        if (vfull) { ld4<TI>(rr[q] + c0 + 1, a + 1); ld4<TI>(rr[q] + c0 + 5, a + 5); }
+        else {
+#pragma unroll
+            for (int j = 1; j < 9; j++) a[j] = ldv(rr[q], min(max(c0 + j, 0), Wh - 1));
+        }
+        a[0] = ldv(rr[q], max(c0, 0)); a[9] = ldv(rr[q], min(c0 + 9, Wh - 1));
+#pragma unroll
+        for (int j = 0; j < 10; j++) t[j] = fmaf(wr[q], a[j], t[j]);
+    }
+#pragma unroll
+    for (int k = 0; k < 9; k++) {
+        v[2 * k] = 0.75f * t[k] + 0.25f * t[k + 1];          /* fine column ox0 - 1 + 2k (odd) */
+        v[2 * k + 1] = 0.75f * t[k + 1] + 0.25f * t[k];      /* fine column ox0 + 2k (even) */
+    }
+    if (ox0 == 0) v[0] = 0.f;
+#pragma unroll
+    for (int j = 1; j < 18; j++) if (ox0 - 1 + j >= W) v[j] = 0.f;
+}
 /* silu(gn(.)) of an 18-element staged row starting at input column x0, zero outside [0, W) */
 __device__ __forceinline__ void row18_gn(float *v, float a, float b, int x0, int W) {
 #pragma unroll
@@ -511,8 +548,9 @@ __global__ void __launch_bounds__(fw_nth(MT), fw_blocks(MT)) conv_fwd_tc_k(const
             const int k = threadIdx.x & 15, ci = ci0 + k;
             const bool cok = ci < Ci;
             const bool xfull = ox0 + 16 <= W && !(W & 3);   /* vector path: interior in range and 8/16-byte row alignment */
+            const bool upc = sp.up && !(sp.x2 && ci >= sp.c_split);   /* half-resolution x segment, upsampled while staging */
             const TI *xc = (sp.x2 && ci >= sp.c_split) ? (const TI *)sp.x2 + ((size_t)n * (Ci - sp.c_split) + (cok ? ci - sp.c_split : 0)) * plane
-                                                       : x + ((size_t)n * (sp.x2 ? sp.c_split : Ci) + (cok ? ci : 0)) * plane;
+                                                       : x + ((size_t)n * (sp.x2 ? sp.c_split : Ci) + (cok ? ci : 0)) * (upc ? plane >> 3 : plane);
             float ga = 1.f, gb = 0.f;
             const bool gtr = cok && in_gn(gp, sp, n, ci, Ci, &ga, &gb);
             for (int rr = threadIdx.x >> 4; rr < (FW_TZ + 2) * 10; rr += NTH / 16) {   /* (FW_TZ + 2) z-planes x 10 rows */
@@ -520,7 +558,11 @@ __global__ void __launch_bounds__(fw_nth(MT), fw_blocks(MT)) conv_fwd_tc_k(const
                 int gz = oz0 - 1 + iz, gyy = oy0 - 1 + iy;
                 float v[18];
                 HT *dst = sx + (size_t)rr * 18 * TC_CI + k;
-                if (cok && gz >= 0 && gz < D && gyy >= 0 && gyy < H) {
+                if (cok && upc && gz >= 0 && gz < D && gyy >= 0 && gyy < H) {
+                    row18_up2(xc, gz, gyy, ox0, D, H, W, v);
+#pragma unroll
+                    for (int j = 0; j < 18; j++) { HT hv = f2h<HT>(v[j]); dst[j * TC_CI] = hv; if (OP) amax = fmaxf(amax, fabsf(h2f<HT>(hv))); }
+                } else if (cok && gz >= 0 && gz < D && gyy >= 0 && gyy < H) {
                     const TI *xr = xc + ((size_t)gz * H + gyy) * W + ox0;
                     v[0] = ox0 > 0 ? ldv(xr - 1, 0) : 0.f;
                     if (xfull) {
@@ -1346,7 +1388,9 @@ __global__ void __launch_bounds__(W2_NTHR, 3) conv_bwd_w_tc2_k(const TI *__restr
                 int gz = oz0 - 1 + iz, gyy = oy0 - 1 + iy;
                 float v[18];
                 bool rok = ci < Ci && gz >= 0 && gz < D && gyy >= 0 && gyy < H;
-                if (rok) {
+                const bool upc = sp.up && !(sp.x2 && ci >= sp.c_split);
+                if (rok && upc) row18_up2(x + ((size_t)n * sp.c_split + ci) * (plane >> 3), gz, gyy, ox0, D, H, W, v);
+                else if (rok) {
                     const TI *xc = (sp.x2 && ci >= sp.c_split) ? (const TI *)sp.x2 + ((size_t)n * (Ci - sp.c_split) + ci - sp.c_split) * plane
                                                                : x + ((size_t)n * (sp.x2 ? sp.c_split : Ci) + ci) * plane;
                     xc += ((size_t)gz * H + gyy) * W + ox0;   /* column ox0 = element ix 1 */
@@ -1738,20 +1782,28 @@ extern "C" int nn_conv3d_bwd_weight_split(const float *x, const float *x2, int c
 /* ---- input-side recompute: the conv input silu(gn(.)) of a stored pre-norm tensor (and, for the decoder, the nearest
    upsample of the coarse block output) is formed while staging, so neither the normalized activation nor the
    upsampled tensor is stored ---- */
-static int xsplit(const float *x2, const nn_gn_t *gx, const nn_gn_t *gx2, int c_split, split_t *sp) {
+static int up_kernel_ok(const float *x, const float *x2, int wgrad) {   /* 16-bit tensor-core kernels only (fp8 / MX: transient) */
+    if (ISMX(x) || ISMX(x2)) return 0;
+    const int pr = wgrad ? eff_prec_w() : eff_prec();
+    return pr != 2 && pr != 3;
+}
+static int xsplit(const float *x2, const nn_gn_t *gx, const nn_gn_t *gx2, int c_split, int up, shape5 xs, split_t *sp) {
     *sp = split_t{};
+    if (up && (!x2 || (gx && gx->G) || ((xs.d | xs.h | xs.w) & 1))) return -1;   /* up: decoder split, x untransformed, even dims */
     if (!x2) return 0;
+    sp->up = up;
     if ((gx && gx->G) && !(gx2 && gx2->G)) { fprintf(stderr, "conv: a split input with a GroupNorm on x needs one on x2\n"); return -1; }
     sp->x2 = x2; sp->c_split = c_split; sp->gp2 = to_gnp(gx2);
     return 0;
 }
-extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, shape5 xs,
+extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, int up, shape5 xs,
                                const float *w, const float *b, int cout, int k, int stride, float *y, int G_out, float eps, float *omean, float *orstd) {
     if (!g_tf32) return -1;
     gnp_t gp = to_gnp(gx);
     shape5 ys = nn_conv3d_out_shape(xs, cout, k, stride);
     if (k == 3 && stride == 1) {
-        split_t sp; if (xsplit(x2, gx, gx2, c_split, &sp)) return -1;
+        split_t sp; if (xsplit(x2, gx, gx2, c_split, up, xs, &sp)) return -1;
+        if (up && !up_kernel_ok(x, x2, 0)) return -1;
         double *sums = nullptr;
         if (G_out) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
         conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, sp);
@@ -1759,7 +1811,7 @@ extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x
         KCHECK();
         return 0;
     }
-    if (x2 || G_out) return -1;
+    if (x2 || up || G_out) return -1;
     if (k == 3 && stride == 2) { conv_fwd_tc_s2(x, ABF, xs, w, b, cout, y, ABF, ys, gp); KCHECK(); return 0; }
     if (k == 1 && stride == 1) {
         if (ISMX(x)) lp_conv1_fwd_mx(x, xs, w, b, cout, y, gp);
@@ -1772,17 +1824,18 @@ extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x
     }
     return -1;
 }
-extern "C" int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, shape5 xs,
+extern "C" int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, int up, shape5 xs,
                                       const float *gy, shape5 ys, int k, int stride, float *gw, float *gb) {
     if (!g_tf32) return -1;
     gnp_t gp = to_gnp(gx);
     if (k == 3 && stride == 1) {
-        split_t sp; if (xsplit(x2, gx, gx2, c_split, &sp)) return -1;
+        split_t sp; if (xsplit(x2, gx, gx2, c_split, up, xs, &sp)) return -1;
+        if (up && !up_kernel_ok(x, x2, 1)) return -1;
         launch_bwd_w_tc(x, ABF, xs, gy, GBF, ys, gw, gb, gp, sp);
         KCHECK();
         return 0;
     }
-    if (x2) return -1;
+    if (x2 || up) return -1;
     if (k == 3 && stride == 2) {
         if (ISMX(x)) lp_bwd_w_s2_f8(x, 3, xs, gy, ISMX(gy) ? 3 : LPDT(GBF), ys, gw, gb, gp);
         else if (eff_prec_w() == 2 || eff_prec_w() == 3) lp_bwd_w_s2_f8(x, LPDT(ABF), xs, gy, LPDT(GBF), ys, gw, gb, gp);

@@ -32,6 +32,7 @@ int main(void) {
         else nn_d2h(li, unet_forward(u, x, xs, 0), nl * 4);
         nn_sync();
         size_t f1 = nn_mem_free();
+        unet_prof_report();   /* UFSM_PROF=1: reset, then report the timed iterations only */
         double t0 = now();
         for (int i = 0; i < it; i++) {
             if (!mode) { unet_forward(u, x, xs, 1); unet_zero_grad(u); unet_backward(u, g); unet_adamw(u, 1e-3f, 0.9f, 0.999f, 1e-8f, 0.f, i + 2); }
@@ -39,6 +40,7 @@ int main(void) {
         }
         nn_sync();
         double dt = (now() - t0) / it * 1e3;
+        if (getenv("UFSM_PROF")) { fprintf(stderr, "%s GPU time over %d iterations:\n", mode ? "inference" : "train", it); unet_prof_report(); }
         printf("%s: tracked %.3f GB (gradients %.3f GB), device growth %.3f GB, %.2f ms\n", mode ? "inference" : "train    ",
                unet_activation_bytes(u) / 1e9, unet_grad_bytes(u) / 1e9, (double)(f0 - f1) / 1e9, dt);
         unet_free(u);
