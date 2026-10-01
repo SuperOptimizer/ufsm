@@ -382,6 +382,23 @@ int main(void) {
         nn_set_f16(1); void *hx = nn_malloc(n * 2); nn_f32_to_h16(x, n, hx, 1.f); nn_h16_to_mx(hx, s, b); nn_set_f16(0);
         cmp("nn_h16_to_mx -> mx4 vs fp32 source", deq4(b, s), deq4(a, s), n, 0.03);
     }
+    {   /* decoder conv1 on mx4 storage without the full-resolution transient: the up part (32 ch) is read from the coarse
+           tensor and upsampled while staging, the skip (16 ch) gets gn+silu (dec conv1 up segment from coarse mx4 (fp4)) */
+        shape5 fs = {N, 48, 12, 12, 16}, co = {N, 32, 6, 6, 8}, fu = fs, sk = fs, o16 = fs; fu.c = 32; sk.c = 16; o16.c = 16;
+        size_t NG = (size_t)N * G;
+        float *xc = dev_rand(shape_numel(co), 1.f), *xs_ = dev_rand(shape_numel(sk), 2.f);
+        void *xcm = mx4_from(xc, co), *xsm = mx4_from(xs_, sk); float *xcd = deq4(xcm, co), *xsd = deq4(xsm, sk);
+        float *gam = dev_rand(16, 1.f), *bet = dev_rand(16, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+        float *w = dev_rand((size_t)16 * 48 * 27, 0.1f), *b = dev_rand(16, 0.1f);
+        float *up = dev_zero(shape_numel(fu)), *t = dev_zero(shape_numel(sk)), *cat = dev_zero(shape_numel(fs)), *yr = dev_zero(shape_numel(o16));
+        mode_ref(); nn_up2_fwd_into(xcd, co, up, 32, 0); nn_gn_silu_apply(xsd, sk, G, gam, bet, mean, rstd, t); nn_concat_fwd(up, 32, t, 16, fs, cat); nn_conv3d_fwd(cat, fs, w, b, 16, 3, 1, yr);
+        nn_gn_t g2 = {gam, bet, mean, rstd, G};
+        void *ym = mx4_new(o16);
+        mode_mx(); int rv = nn_conv3d_fwd_x(xcm, NULL, xsm, &g2, 32, 1, fs, w, b, 16, 3, 1, (float *)ym, 0, 1e-5f, NULL, NULL);
+        if (rv) { printf("  dec conv1 with the up segment: unsupported (rv %d)  FAIL\n", rv); bad++; }
+        else cmp("dec conv1 up segment from coarse mx4 (fp4)", deq4(ym, o16), yr, shape_numel(o16), TOL4);
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
     printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);

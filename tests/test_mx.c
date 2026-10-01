@@ -31,6 +31,19 @@ int main(void) {
     nn_set_act_bf16(0); nn_set_grad_bf16(0);   /* non-MX operands are fp32 */
     const double TOL = 0.08;
     const int N = 2, G = 8;
+    {   /* the two-taps-per-k 16-channel fp8 kernel on fp32 I/O (the fp32 tap-packed small kernel is switched off for it) */
+        setenv("UFSM_F8_NOSMALL", "1", 1);
+        const int cis[3] = {16, 12, 16}, cos_[3] = {16, 16, 64}, ds[3] = {16, 12, 8};
+        for (int k = 0; k < 3; k++) {
+            shape5 xs = {N, cis[k], ds[k], 12, 20}, ys = xs; ys.c = cos_[k];
+            size_t nx = shape_numel(xs), ny = shape_numel(ys);
+            float *x = dev_rand(nx, 1.f), *w = dev_rand((size_t)cos_[k] * cis[k] * 27, 0.1f), *b = dev_rand(cos_[k], 0.1f), *yr = dev_zero(ny), *y8 = dev_zero(ny);
+            mode_ref(); nn_conv3d_fwd(x, xs, w, b, cos_[k], 3, 1, yr);
+            nn_conv3d_fwd_fp8(x, xs, w, b, cos_[k], y8);
+            char nm[80]; snprintf(nm, sizeof nm, "fp8 conv fwd %d -> %d ch, two taps per k, D %d", cis[k], cos_[k], ds[k]);
+            cmp(nm, y8, yr, ny, 0.06);
+        }
+    }
     {   /* upsample forward / backward */
         shape5 xs = {N, 32, 6, 6, 6}, ys = {N, 32, 12, 12, 12};
         float *x = dev_rand(shape_numel(xs), 1.f); void *xm = mx_from(x, xs); float *xd = deq(xm, xs);
@@ -168,6 +181,23 @@ int main(void) {
         mode_ref(); nn_conv3d_bwd_data(gy, ys, w, xs, 1, 1, gxr, scr);
         mode_mx(); nn_conv3d_bwd_data(gy, ys, w, xs, 1, 1, (float *)gxm, scr);
         cmp("head bwd_data (fp32 gy -> MX gx)", deq(gxm, xs), gxr, nx, TOL);
+    }
+    {   /* decoder conv1 on MX-fp8 storage without the full-resolution transient: the up part (32 ch) is read from the coarse
+           tensor and upsampled while staging, the skip (16 ch) gets gn+silu (dec conv1 up segment from coarse MX (no transient)) */
+        shape5 fs = {N, 48, 12, 12, 16}, co = {N, 32, 6, 6, 8}, fu = fs, sk = fs, o16 = fs; fu.c = 32; sk.c = 16; o16.c = 16;
+        size_t NG = (size_t)N * G;
+        float *xc = dev_rand(shape_numel(co), 1.f), *xs_ = dev_rand(shape_numel(sk), 2.f);
+        void *xcm = mx_from(xc, co), *xsm = mx_from(xs_, sk); float *xcd = deq(xcm, co), *xsd = deq(xsm, sk);
+        float *gam = dev_rand(16, 1.f), *bet = dev_rand(16, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+        float *w = dev_rand((size_t)16 * 48 * 27, 0.1f), *b = dev_rand(16, 0.1f);
+        float *up = dev_zero(shape_numel(fu)), *t = dev_zero(shape_numel(sk)), *cat = dev_zero(shape_numel(fs)), *yr = dev_zero(shape_numel(o16));
+        mode_ref(); nn_up2_fwd_into(xcd, co, up, 32, 0); nn_gn_silu_apply(xsd, sk, G, gam, bet, mean, rstd, t); nn_concat_fwd(up, 32, t, 16, fs, cat); nn_conv3d_fwd(cat, fs, w, b, 16, 3, 1, yr);
+        nn_gn_t g2 = {gam, bet, mean, rstd, G};
+        void *ym = mx_new(o16);
+        mode_mx(); int rv = nn_conv3d_fwd_x(xcm, NULL, xsm, &g2, 32, 1, fs, w, b, 16, 3, 1, (float *)ym, 0, 1e-5f, NULL, NULL);
+        if (rv) { printf("  dec conv1 with the up segment: unsupported (rv %d)  FAIL\n", rv); bad++; }
+        else cmp("dec conv1 up segment from coarse MX (no transient)", deq(ym, o16), yr, shape_numel(o16), TOL);
     }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     printf(bad ? "mx FAIL (%d)\n" : "mx ok\n", bad);

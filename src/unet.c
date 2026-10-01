@@ -173,7 +173,8 @@ void unet_init(unet *u, uint64_t seed) {
 static float *dalloc(unet *u, size_t n) { u->act_bytes += n * 4; return nn_malloc(n * 4); }
 #define ABF (nn_get_tf32() && nn_get_act_bf16())
 #define GBF (ABF && nn_get_grad_bf16())
-static float *dalloc_act(unet *u, size_t n) { size_t b = ABF ? n * 2 : n * 4; u->act_bytes += b; return nn_malloc(b); }   /* activation storage (bf16 in act-bf16 mode) */
+static float *dalloc_oom(float *p, size_t b) { if (!p && b) { fprintf(stderr, "unet: out of device memory for a %.2f GB activation buffer\n", b / 1e9); abort(); } return p; }
+static float *dalloc_act(unet *u, size_t n) { size_t b = ABF ? n * 2 : n * 4; u->act_bytes += b; return dalloc_oom(nn_malloc(b), b); }   /* activation storage (bf16 in act-bf16 mode) */
 /* activation tensor of shape s: MX-fp8 (registered, channel-blocked bytes + scales) in act-MX8 mode, else as dalloc_act */
 static int g_act_mx8 = -1, g_act_mx4 = -1;
 /* MX activation storage: fp8 (registry 8) or packed fp4 (registry 4); mx4 wins when both are requested */
@@ -190,7 +191,7 @@ static float *dalloc_act_s(unet *u, shape5 s) {
     if (!act_mx8()) return dalloc_act(u, shape_numel(s));
     size_t b = nn_mx_bytes(s, act_dt());
     u->act_bytes += b;
-    float *p = nn_malloc(b);
+    float *p = dalloc_oom(nn_malloc(b), b);
     nn_set_storage(p, b, act_dt());
     return p;
 }

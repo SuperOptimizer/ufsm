@@ -1195,7 +1195,7 @@ static int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const 
         if (mdt == 4 && !ISMX(y) && !sp.y2 && !ybf) { sp.wkey = conv_wkey(); return lp_conv_fwd_f4(x, 4, xs, w, b, cout, y, 0, gp, osum, Go, sp); }   /* mx4 in, fp32 out (tests) */
         if (!mdt || MXDT(y) != mdt || (sp.x2 && MXDT(sp.x2) != mdt) || (sp.y2 && MXDT(sp.y2) != mdt)) { fprintf(stderr, "conv: MX storage needs MX inputs and outputs of one format\n"); abort(); }
         sp.wkey = conv_wkey();
-        if (mdt == 4 || (pr == 3 && !sp.up)) return lp_conv_fwd_f4(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
+        if (mdt == 4 || pr == 3) return lp_conv_fwd_f4(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
         return lp_conv_fwd_f8(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
     }
     if (!ts && pr == 2 && !sp.up && g_pass == 1) { if (sr_on()) sp.sr = sr_seed(); }   /* backward-data: gy is the staged operand */
@@ -1969,7 +1969,13 @@ extern "C" int nn_conv3d_bwd_weight_split(const float *x, const float *x2, int c
    upsampled tensor is stored ---- */
 /* fused upsample: 16-bit tensor-core kernels only. An fp8 / fp4 policy on that conv is served by the 16-bit kernels
    (more precise; keeps the transient away); MX-stored inputs cannot be read by them -> -1 (caller uses the transient) */
-static int up_kernel_ok(const float *x, const float *x2, int wgrad) { (void)wgrad; return !ISMX(x) && !ISMX(x2); }
+/* MX inputs: the forward stages the coarse MX rows directly (fp8 / fp4 kernels, stage_up32); the MX weight gradient still
+   takes the transient (UFSM_MX_UP=0: transient for the forward too) */
+static int up_kernel_ok(const float *x, const float *x2, int wgrad) {
+    static int mxup = -1; if (mxup < 0) mxup = getenv("UFSM_MX_UP") ? atoi(getenv("UFSM_MX_UP")) : 1;
+    if (ISMX(x) || ISMX(x2)) return mxup && !wgrad && ISMX(x) && MXDT(x) == MXDT(x2);
+    return 1;
+}
 static int xsplit(const float *x2, const nn_gn_t *gx, const nn_gn_t *gx2, int c_split, int up, shape5 xs, split_t *sp) {
     *sp = split_t{};
     if (up && (!x2 || (gx && gx->G) || ((xs.d | xs.h | xs.w) & 1))) return -1;   /* up: decoder split, x untransformed, even dims */
@@ -2741,7 +2747,7 @@ __global__ void __launch_bounds__(256) up2_b_k(const TG *gy, TO *gx, int NC, int
 }
 extern "C" void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, float *y, int ctot, int c0) {
     const gnp_t gp = to_gnp(g);
-    if (ISMX(x)) { if (!ISMX(y) || ctot != xs.c || c0) { fprintf(stderr, "up2: MX input needs a whole MX output tensor\n"); abort(); } lp_up2_fwd_mx(x, MXDT(x), xs, y, MXDT(y), gp); KCHECK(); return; }
+    if (ISMX(x)) { if (!ISMX(y) || ctot != xs.c || c0) { fprintf(stderr, "up2: MX input needs a whole MX output tensor (y MX %d, ctot %d, c %d, c0 %d)\n", MXDT(y), ctot, xs.c, c0); abort(); } lp_up2_fwd_mx(x, MXDT(x), xs, y, MXDT(y), gp); KCHECK(); return; }
     dim3 grid(nblk(2 * xs.w, 32), nblk(2 * xs.h, 8), (unsigned)(nblk(2 * xs.d, 4) * xs.n * xs.c));
     if (ABF && g_h16) up2_f_k<f16, f16><<<grid, 256>>>((const f16 *)x, (f16 *)y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0, gp);
     else if (ABF) up2_f_k<bf16, bf16><<<grid, 256>>>((const bf16 *)x, (bf16 *)y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0, gp);
