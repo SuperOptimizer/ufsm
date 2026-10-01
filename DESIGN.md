@@ -415,6 +415,11 @@ B1 per GPU, i.e. batch 2: probably the wrong trade). Depth helps when the window
 window from batch. Bug found: MX-fp8 GroupNorm statistics fail for 96/112 channels (12/14 channels per group do not
 divide the 32-channel MX block); scored with fp16 storage meanwhile.
 
+Scanning window (same trained model, only the inference window changes; MANBp box, halo 8, fp16 storage), peak F1:
+model trained at 64^3: window 96 0.306, 160 0.306, 272 0.301; model trained at 128^3 (5 levels): 96 0.269, 160 0.273,
+272 0.274. The GroupNorm-over-the-tile mismatch costs at most 0.005 and leans toward the training size; the scanning
+window is a speed choice, not an accuracy choice. 528^3 needs MX storage (out of memory at fp16).
+
 ### Largest training window, batch 1 per GPU (2026-10-01 evening)
 Measured with `ufsm train` (Muon, down_norm, fp16 storage, recompute 1), peak device memory: 256^3 5.3 GB,
 320^3 10.3 GB, 352^3 13.6 GB = 328 B per voxel, matching the per-voxel accounting (bench_mem overstates: it also
