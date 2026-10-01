@@ -266,9 +266,12 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   within 2) but as a wide, faint ridge (mean probability 0.33 on label voxels, ridge ~4 voxels wide against a
   1-voxel label line at level 1), plus a visible tile grid from the per-window GroupNorm statistics. Window 288
   instead of 160 changes F1 by < 0.002, so the tiles are not the main loss; the softness is.
-- Hypothesis under test (run r6): the soft target (sigma 3 at level 0 on a label band that is already 3-5 voxels
-  thick) teaches the blur. `--soft-end S` anneals sigma linearly to S over the run (`sampler_set_soft`); r6 = r5
-  with `--soft-end 1`. Its validation batches keep sigma 3 (they are materialised at start), so the validation
+- Hypothesis tested (run r6, 40k steps, sigma annealed 3 -> 1, resumed at 16.6k after the fp16 overflow fix): the
+  softness is NOT the limit. At the standard thresholds r6 is worse everywhere (precision up, recall collapsed: the
+  sharper target shifts the calibration down); at each run's best threshold (`ufsm eval --thr 0.05,...`) it is a
+  wash: F1 MANBp 0.183 vs 0.160, 0343P 0.159 vs 0.180, 1667 0.170 vs 0.166, 0500P2 0.059 vs 0.060 (r6 vs r5). The
+  plateau (~0.17 F1, ~0.4 band F1) stands with this model and these labels; the next candidates are the
+  architecture (GroupNorm after the down convs, agent yardstick in progress) and label quality. Its validation batches keep sigma 3 (they are materialised at start), so the validation
   loss drifts up as the training target sharpens and `best.ckpt` is an early checkpoint: score `last.ckpt`.
 
 ## Status (2026-09-30 night)

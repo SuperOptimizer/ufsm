@@ -31,7 +31,7 @@ static void dilate(const uint8_t *in, uint8_t *out, const int64_t n[3], int tol)
 
 int cmd_eval(int argc, char **argv) {
     if (argc < 8) {
-        fprintf(stderr, "usage: ufsm eval <pred-root> <pred-group> <label-root> <label-group> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--tol 2] [--pred-origin z,y,x] [--dump slice.pgm]\n"
+        fprintf(stderr, "usage: ufsm eval <pred-root> <pred-group> <label-root> <label-group> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--tol 2] [--pred-origin z,y,x] [--dump slice.pgm] [--thr 0.3,0.5,0.7]\n"
                         "  the prediction's origin_zyx (attribute written by predict) is subtracted from label coordinates\n");
         return 2;
     }
@@ -72,8 +72,9 @@ int cmd_eval(int argc, char **argv) {
     uint8_t *gt = malloc(nv), *gtd = malloc(nv), *pr = malloc(nv), *prd = malloc(nv);
     for (size_t i = 0; i < nv; i++) gt[i] = l[i] != 255 && l[i] >= 127;
     dilate(gt, gtd, n, tol);
-    const double thrs[] = {0.3, 0.5, 0.7};
-    for (int t = 0; t < 3; t++) {
+    double thrs[16] = {0.3, 0.5, 0.7}; int nthr = 3;   /* --thr 0.1,0.2,0.3 overrides */
+    { const char *ts = opt(argc, argv, "--thr", nullptr); if (ts) { nthr = 0; char *t = strdup(ts); for (char *q = strtok(t, ","); q && nthr < 16; q = strtok(nullptr, ",")) thrs[nthr++] = atof(q); free(t); } }
+    for (int t = 0; t < nthr; t++) {
         uint8_t th = (uint8_t)(thrs[t] * 255);
         size_t tp = 0, fp = 0, fn = 0, bp_hit = 0, bp_tot = 0;
         for (size_t i = 0; i < nv; i++) {
