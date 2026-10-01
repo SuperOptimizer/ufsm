@@ -151,6 +151,9 @@ __device__ __forceinline__ void mx_row32(const chan_t &c0, size_t off, bool ok, 
         }
     }
 }
+/* clamp to the fp16 range for a store that must not become inf; NaN stays NaN (fminf / fmaxf would turn it into
+   +-65504 and hide a non-finite forward from the trainer's detection) */
+__device__ __forceinline__ float sat_h16(float v) { return fabsf(v) > 65504.f ? copysignf(65504.f, v) : v; }
 __device__ __forceinline__ float act_ab(float v, float a, float b, bool G) {
     if (!G) return v;
     v = fmaf(v, a, b);
@@ -298,7 +301,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                         if (ox + 1 < W) { ps += v1; pss += v1 * v1; }
                     } else {
                         if (osum && std::is_same<T, __half>::value) {   /* fp16 activation feeding a GroupNorm: saturate instead of inf (as conv_fwd_tc_k) */
-                            v0 = fminf(fmaxf(v0, -65504.f), 65504.f); v1 = fminf(fmaxf(v1, -65504.f), 65504.f);
+                            v0 = sat_h16(v0); v1 = sat_h16(v1);
                         }
                         if (!(W & 1) && ox + 1 < W) {   /* paired store */
                             if (sp.accum) { v0 += ldx(yp, (size_t)ox); v1 += ldx(yp, (size_t)ox + 1); }
