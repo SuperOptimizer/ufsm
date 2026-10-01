@@ -111,7 +111,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
 int cmd_train(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 96] [--B 2] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
-                        "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
+                        "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 1|2] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--sr 1]\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  env UFSM_PROF=1 prints per-op GPU time every log interval (category 'upload+loss+opt').\n");
@@ -137,7 +137,7 @@ int cmd_train(int argc, char **argv) {
     float cooldown = (float)atof(opt(argc, argv, "--cooldown", "0.2"));
     int qat = atoi(opt(argc, argv, "--qat", "0"));
     /* the effective precision manifest is printed after all precision options are applied and saved next to the checkpoints */
-#define WRITE_MANIFEST(path) do { char mf_[4096]; int mn_ = nn_prec_manifest(mf_, sizeof mf_); snprintf(mf_ + mn_, sizeof mf_ - mn_, " act_mx8 %d grad_mx8 %d f16 %d opt %s\n", getenv("UFSM_ACT_MX8") ? 1 : 0, getenv("UFSM_GRAD_MX8") ? 1 : 0, f16, optname); FILE *mff_ = fopen(path, "w"); if (mff_) { fputs(mf_, mff_); fclose(mff_); } } while (0)         /* quantization-aware training: forward/backward-data at precision 2 (fp8) or 3 (fp4), weight gradients at 16-bit */
+#define WRITE_MANIFEST(path) do { char mf_[4096]; int mn_ = nn_prec_manifest(mf_, sizeof mf_); snprintf(mf_ + mn_, sizeof mf_ - mn_, " act_mx4 %d act_mx8 %d grad_mx8 %d f16 %d opt %s\n", getenv("UFSM_ACT_MX4") ? 1 : 0, getenv("UFSM_ACT_MX8") ? 1 : 0, getenv("UFSM_GRAD_MX8") ? 1 : 0, f16, optname); FILE *mff_ = fopen(path, "w"); if (mff_) { fputs(mf_, mff_); fclose(mff_); } } while (0)         /* quantization-aware training: forward/backward-data at precision 2 (fp8) or 3 (fp4), weight gradients at 16-bit */
     if (qat) { nn_set_prec(qat); nn_set_prec_wgrad(1); }
     if (atoi(opt(argc, argv, "--sr", "0"))) nn_set_sr(1);                                   /* stochastic rounding of fp8 gradient operands */
     int wq = atoi(opt(argc, argv, "--wq", "0"));            /* 8 or 4: true fp8 / fp4 weights (stochastic rounding after each update) */
@@ -146,7 +146,17 @@ int cmd_train(int argc, char **argv) {
     nn_set_pos_weight((float)atof(opt(argc, argv, "--pos-weight", "1")));   /* BCE weight of surface voxels */
     int overfit = atoi(opt(argc, argv, "--overfit", "0"));   /* diagnostic: train on the first batch forever */
     int noaug = atoi(opt(argc, argv, "--noaug", "0"));       /* diagnostic: no augmentation */
-    if (nn_set_prec_policy(opt(argc, argv, "--policy", ""))) return 2;
+    /* --fp4 1: the fastest configuration that passed the paired stairs on two seeds: packed fp4 activation storage, fp4 forward
+       and backward-data, fp8 weight gradients, stochastic rounding of gradient operands, first conv 16-bit.
+       --fp4 2: fp4 weight gradients as well (also passed; slower than fp8 until its kernel is optimised). An explicit --policy
+       still overrides the precisions. */
+    const int fp4 = atoi(opt(argc, argv, "--fp4", "0"));
+    if (fp4) {
+        unet_set_act_mx4(1); setenv("UFSM_ACT_MX4", "1", 0); nn_set_sr(1);
+        if (nn_set_prec_policy(fp4 >= 2 ? "all=fp4:fp4:fp4,enc0.c1=fp16" : "all=fp4:fp4:fp8,enc0.c1=fp16")) return 2;
+        if (fp4 >= 2) setenv("UFSM_F4_WGRAD", "1", 0);
+    }
+    if (*opt(argc, argv, "--policy", "") && nn_set_prec_policy(opt(argc, argv, "--policy", ""))) return 2;
     { char mf[4096]; nn_prec_manifest(mf, sizeof mf); fprintf(stderr, "%s\n", mf); char mp[1400]; snprintf(mp, sizeof mp, "mkdir -p '%s'", out); if (system(mp)) {} snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp); }   /* per-layer: "enc0=1,enc1=2,..." */
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--fp32")) nn_set_tf32(0);
     int devs[8], ng = 0;
