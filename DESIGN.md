@@ -229,9 +229,11 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
 - Yardstick: 2000 steps on MANBp (`--soft 3 --noaug 1 --P 64 --B 8`), holdout F1 at threshold 0.5. fp16 twice:
   0.215 / 0.218; MX-fp8 activations twice: 0.216 / 0.218; MX activations + gradients (after the split-output fix
   907cb33): 0.220 (0.210 before the fix); fp8 compute with 16-bit storage 0.221; simulated NVFP4 0.218; simulated
-  MXFP6 0.215. Every correct mode sits inside the fp16 noise band, so 2000 steps cannot separate them; 6000-step
-  runs are in progress on GPU 0. Until they report, fp16 storage + recompute 1 stays the default and the MX modes
-  (`UFSM_ACT_MX8`, `UFSM_GRAD_MX8`: 0.46 / 0.29 GB at 96^3 B2) are opt-in. The agent no longer recommends MXFP6
+  MXFP6 0.215. Every correct mode sits inside the fp16 noise band, so 2000 steps cannot separate them. At 6000
+  steps (one run each) a gap opens: fp16 F1 0.269, MX activations 0.261, MX activations + gradients 0.251
+  (band-tolerant 0.393 / 0.381 / 0.363; recall at 0.7 down 0.05 with MX gradients). Decision: fp16 storage +
+  recompute 1 stays the default; MX activations (`UFSM_ACT_MX8`, 0.46 GB at 96^3 B2) are an opt-in memory trade
+  worth ~3% F1; MX gradients (`UFSM_GRAD_MX8`, 0.29 GB) stay off. The agent no longer recommends MXFP6
   (saves ~0.05 GB; MX gradients save more and exist already); NVFP4 storage was clearly worse on the synthetic task.
 
 ### Accuracy diagnosis (2026-10-01 morning)
