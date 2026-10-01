@@ -993,6 +993,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_tc_s2_k(const TI *__restrict_
             if (gtr) gn_coef(gp, n, ci, Ci, &ga, &gb);
             for (int rr = threadIdx.x >> 4; rr < 60; rr += 16) {
                 int iz = rr / 10, iy = rr - iz * 10;
+                if (iz == 5 || iy == 9) continue;   /* plane 5 / row 9 of the 6 x 10 layout are never read (taps reach 2o + 1) */
                 int gz = oz0 * 2 - 1 + iz, gyy = oy0 * 2 - 1 + iy;
                 float v[18];
                 HT *dst = sx + (size_t)rr * 18 * TC_CI + k;
@@ -1018,9 +1019,9 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_tc_s2_k(const TI *__restrict_
         }
         __syncthreads();
         for (int t0 = 0; t0 < 27; t0 += TG) {
-            for (int i = threadIdx.x; i < TG * BM * TC_CI; i += 256) {
+            for (int i = threadIdx.x * 4; i < TG * BM * TC_CI; i += 256 * 4) {   /* 4 ci per load (rows of 16 ci) */
                 int tt = i / (BM * TC_CI), r = i % (BM * TC_CI), c = r / TC_CI, k = r % TC_CI;
-                wa[i] = wp[((size_t)(t0 + tt) * Cop + co0 + c) * Cip + ci0 + k];
+                *(uint2 *)(wa + i) = *(const uint2 *)(wp + ((size_t)(t0 + tt) * Cop + co0 + c) * Cip + ci0 + k);
             }
             __syncthreads();
 #pragma unroll
@@ -3135,6 +3136,35 @@ __global__ void fq_amax_k(const T *x, size_t n, unsigned *am) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) m = fmaxf(m, fabsf(ldv(x, i)));
     for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
     if ((threadIdx.x & 31) == 0) atomicMax(am, __float_as_uint(m));
+}
+/* affine variant: quantise (x - mean) * rstd (per n, group of G channels), then restore. mean/rstd: [N][G]. */
+template <typename T>
+__global__ void fq_aff_k(T *x, int N, int C, size_t S, int fmt, const float *mean, const float *rstd, int G) {
+    const int gs = fmt == 1 ? 16 : 32, ng = (C + gs - 1) / gs, cpg = C / G;
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * ng * S) return;
+    size_t v = i % S; int gi = (int)((i / S) % ng), n = (int)(i / (S * ng));
+    T *p = x + ((size_t)n * C + gi * gs) * S + v;
+    const int cn = min(gs, C - gi * gs);
+    float z[32], amax = 0.f;
+    for (int k = 0; k < cn; k++) { int g = (gi * gs + k) / cpg; z[k] = (ldv(p, (size_t)k * S) - mean[n * G + g]) * rstd[n * G + g]; amax = fmaxf(amax, fabsf(z[k])); }
+    if (amax == 0.f) return;
+    const int mb = fmt <= 2 ? 1 : fmt == 3 ? 3 : fmt == 4 ? 2 : 3, emin = fmt <= 3 ? 0 : fmt == 4 ? -2 : -6;
+    const float qmax = fmt <= 2 ? 6.f : fmt == 3 ? 7.5f : fmt == 4 ? 28.f : 448.f;
+    int e; frexpf(amax / qmax, &e);
+    float sc = ldexpf(1.f, (amax / qmax) == ldexpf(1.f, e - 1) ? e - 1 : e);
+    for (int k = 0; k < cn; k++) { int g = (gi * gs + k) / cpg; float q = fq_round(z[k] / sc, mb, emin, qmax) * sc; stv(p, (size_t)k * S, q / rstd[n * G + g] + mean[n * G + g]); }
+}
+template <typename T>
+__global__ void fq_k(T *x, int N, int C, size_t S, int fmt, const unsigned *am);
+extern "C" void nn_fake_quant_affine(void *x, shape5 s, int fmt, const float *mean, const float *rstd, int G) {
+    if (fmt <= 0 || ISMX(x) || fmt == 1) return;   /* MX formats only (the tensor scale of NVFP4 is not meaningful after the affine) */
+    size_t S = shape_spatial(s); int C = s.c, N = s.n; const int gs = 32, ng = (C + gs - 1) / gs;
+    size_t tot = (size_t)N * ng * S;
+    if (ABF && g_h16) fq_aff_k<f16><<<nblk(tot, 256), 256>>>((f16 *)x, N, C, S, fmt, mean, rstd, G);
+    else if (ABF) fq_aff_k<bf16><<<nblk(tot, 256), 256>>>((bf16 *)x, N, C, S, fmt, mean, rstd, G);
+    else fq_aff_k<float><<<nblk(tot, 256), 256>>>((float *)x, N, C, S, fmt, mean, rstd, G);
+    KCHECK();
 }
 template <typename T>
 __global__ void fq_k(T *x, int N, int C, size_t S, int fmt, const unsigned *am) {

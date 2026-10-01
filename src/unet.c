@@ -44,6 +44,7 @@ typedef struct {
     const void *xb, *x2b;       /* recompute mode, decoder: input [up2(silu(gn(xb.a2))) (transient) | silu(gn(x2b.a2)) (in staging)] */
     float *a1, *a2, *s2;
     float *m1, *r1, *m2, *r2;
+    float *pm1, *pr1, *pm2, *pr2;   /* previous-step stats (UFSM_FAKEQ_WHERE=2 study) */
     shape5 xs, ys;
 } block;
 
@@ -376,7 +377,12 @@ static int fakeq(void) {
     if (f < 0) { const char *e = getenv("UFSM_FAKEQ"); f = !e ? 0 : !strcmp(e, "nvfp4") ? 1 : !strcmp(e, "mxfp4") ? 2 : !strcmp(e, "mxfp6e2m3") ? 3 : !strcmp(e, "mxfp6e3m2") ? 4 : !strcmp(e, "mxfp8") ? 5 : 0; }
     return nn_get_tf32() ? f : 0;
 }
-#define FQ(p, s) do { if (fakeq()) nn_fake_quant((p), (s), fakeq()); } while (0)
+#define FQ(p, s) do { if (fakeq() && fakeq_where() == 0) nn_fake_quant((p), (s), fakeq()); } while (0)
+/* UFSM_FAKEQ_WHERE: 0 raw pre-GN a1/a2 (default, the earlier study), 1 post-GN+SiLU operand s2 only, 2 pre-GN a1/a2 after the
+   affine (x - mean) * rstd with the PREVIOUS step's GN stats (the "delayed-stats affine" storage design) */
+static int fakeq_where(void) { static int w = -1; if (w < 0) { const char *e = getenv("UFSM_FAKEQ_WHERE"); w = e ? atoi(e) : 0; } return w; }
+#define FQ_POST(p, s) do { if (fakeq() && fakeq_where() == 1) nn_fake_quant((p), (s), fakeq()); } while (0)
+#define FQ_AFF(p, s, m, r, G) do { if (fakeq() && fakeq_where() == 2) nn_fake_quant_affine((p), (s), fakeq(), (m), (r), (G)); } while (0)
 /* same study for the stored activation gradients (env UFSM_FAKEQ_GRAD, same format names; 16-bit gradient storage) */
 static int fakeq_grad(void) {
     static int f = -1;
@@ -450,15 +456,19 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
     float *t1 = u->t1[level] ? u->t1[level] : b->s2;    /* inference: no scratch, s2 doubles as temp */
     if (nn_get_tf32()) {   /* conv1 yields the stats of a1; conv2 applies gn + silu to a1 while staging and yields the stats of a2 */
         nn_set_conv(0);
+        if (fakeq() && fakeq_where() == 2) {   /* keep the previous step's stats for the affine study */
+            if (!b->pm1) { b->pm1 = nn_malloc((size_t)b->ys.n * G * 4 * 4); b->pr1 = b->pm1 + (size_t)b->ys.n * G; b->pm2 = b->pr1 + (size_t)b->ys.n * G; b->pr2 = b->pm2 + (size_t)b->ys.n * G; { size_t m = (size_t)b->ys.n * G; float *one = malloc(m * 4); for (size_t k = 0; k < m; k++) one[k] = 1.f; nn_zero(b->pm1, m * 4 * 4); nn_h2d(b->pr1, one, m * 4); nn_h2d(b->pr2, one, m * 4); free(one); } }
+            nn_d2d(b->pm1, b->m1, (size_t)b->ys.n * G * 4); nn_d2d(b->pr1, b->r1, (size_t)b->ys.n * G * 4); nn_d2d(b->pm2, b->m2, (size_t)b->ys.n * G * 4); nn_d2d(b->pr2, b->r2, (size_t)b->ys.n * G * 4);
+        }
         if (b->xb) { if (dec_conv1(u, b, level, b->a1, G, b->m1, b->r1, nullptr, nullptr, nullptr)) rc_fail("decoder conv1"); }   /* [up2(coarse) | silu(gn(skip a2))] */
         else if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1));
         else { nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1)); }   /* down_norm: gn + silu of the input in staging */
-        FQ(b->a1, b->ys);
+        FQ(b->a1, b->ys); FQ_AFF(b->a1, b->ys, b->pm1, b->pr1, G);
         nn_set_conv(1);
         PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, b->m2, b->r2));
         nn_set_conv(-1);
-        FQ(b->a2, b->ys);
-        if (b->s2) { PROF(3, nn_gn_silu_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2)); FQ(b->s2, b->ys); }
+        FQ(b->a2, b->ys); FQ_AFF(b->a2, b->ys, b->pm2, b->pr2, G);
+        if (b->s2) { PROF(3, nn_gn_silu_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2)); FQ(b->s2, b->ys); FQ_POST(b->s2, b->ys); }
         return;
     }
     PROF(0, nn_conv3d_fwd(x, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1));

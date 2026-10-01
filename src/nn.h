@@ -181,6 +181,7 @@ void nn_up2_fwd_into(const float *x, shape5 xs, float *y, int ctot, int c0);
    1 NVFP4 (e2m1, e4m3 scale per 16 channels, fp32 tensor scale), 2 MXFP4, 3 MXFP6 e2m3, 4 MXFP6 e3m2, 5 MXFP8 e4m3
    (ue8m0 per 32 channels). No-op for MX-stored tensors. */
 void nn_fake_quant(void *x, shape5 s, int fmt);
+void nn_fake_quant_affine(void *x, shape5 s, int fmt, const float *mean, const float *rstd, int G);   /* quantise (x - mean) * rstd per (n, group), restore; MX formats */
 void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, float *y, int ctot, int c0);   /* upsample of silu(gn(x)) (g nullptr: of x) */
 void nn_up2_bwd(const float *gy, shape5 xs, float *gx);
 void nn_up2_bwd_into(const float *gy, shape5 xs, float *gx, int ctot, int c0);   /* gy: xs.c channels at 2x; gx: channels c0.. of a ctot-channel tensor (SET) */
