@@ -303,6 +303,18 @@ Where the rest would come from:
   clamped voxels only lose a little precision. The replayed batch now matches the exact kernels. A GroupNorm after
   each down conv would remove the amplification altogether but changes the model (candidate for a later run).
 
+### fp8 training on real data (agent, 2026-10-01 afternoon)
+- 6000-step MANBp yardstick (AdamW, down_norm 0, seed 0), F1 at 0.5 / 0.7: all-fp8 GEMMs (`--prec 2`) 0.247 / 0.257,
+  fp8 weight gradient only 0.241 / 0.232, fp8 forward + backward-data (`--qat 2`) 0.248 / 0.236; fp16 0.269 / 0.282
+  on an earlier binary and 0.253 / 0.225 for two seeds on the current one; validation loss 0.845 for every fp8 mode
+  and for fp16. The fp8 modes sit inside the fp16 seed band (+-0.02), so single runs cannot resolve a 0.005 target.
+- Kernel work (branch fp8train): stochastic rounding for every fp8 quantisation of a gradient operand (per-element
+  hash, per-step seed; `UFSM_SR=1`), e5m2 gradient operands (`UFSM_GFMT=e5m2`). One-step error: e5m2 is WORSE than
+  e4m3 under the per-32 block scale (the scale already covers the range, e5m2 only loses a mantissa bit): fp8 weight
+  gradient 2.92% e4m3 vs 4.29% e5m2; SR removes part of the bias (2.47% averaged over 8 seeds). The forward pass
+  dominates the all-fp8 error (23% vs 9% with a 16-bit forward). Decision: e4m3 + SR; next a long paired run
+  (identical batch order, fp16 vs all-fp8+SR, Muon) after r10.
+
 ### Sampler throughput, fp4 inference, Muon (2026-10-01 afternoon)
 - The trainer had become data-loader bound (r9 fell to 8-14 samples/s with the sampler waiting 75-90%). Per-stage
   profile (`UFSM_SAMPLER_PROF=1`, `tests/bench_sampler.c`), ms of worker time per 128^3 patch on the loaded box: CT read
