@@ -222,6 +222,18 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   or level too small for P) instead of spinning silently, and stops after 20 consecutive read failures (the
   failure counter was reset on every error before, so an I/O error retried forever).
 
+### Accuracy diagnosis (2026-10-01 morning)
+- Held-out scores of r5 (8 sources, soft sigma 3, intensity-only augmentation, 17k of 40k steps) against r4: F1 at
+  threshold 0.3 per source 0.18/0.06/0.17/0.17/0.065/0.045/0.78 vs 0.19/0.05/0.16/0.16/0.06/0.045/0.77 (level 1);
+  level 0 gives the same picture (MANBp 0.20 at 0.5). `ufsm eval --dump` (CT | prediction | label slice) shows why:
+  the prediction sits on the labelled sheets (86% of the voxels above 0.5 are within 5 voxels of a label line, 62%
+  within 2) but as a wide, faint ridge (mean probability 0.33 on label voxels, ridge ~4 voxels wide against a
+  1-voxel label line at level 1), plus a visible tile grid from the per-window GroupNorm statistics. Window 288
+  instead of 160 changes F1 by < 0.002, so the tiles are not the main loss; the softness is.
+- Hypothesis under test (run r6): the soft target (sigma 3 at level 0 on a label band that is already 3-5 voxels
+  thick) teaches the blur. `--soft-end S` anneals sigma linearly to S over the run (`sampler_set_soft`); r6 = r5
+  with `--soft-end 1`.
+
 ## Status (2026-09-30 night)
 - M0 reader + CLI + sampler: done, tested (bit-exact zarr3 reads, sampler montages checked by eye).
 - M1 ingest: done — `ingest-zip` (label archive), `ingest-kaggle`, `ingest-mesh`, `raster`, writer, zip and

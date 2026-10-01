@@ -105,6 +105,7 @@ struct sampler {
     pthread_t *th;
     atomic_int stop;
     atomic_uint_fast64_t produced, rejected;
+    atomic_uint soft_bits;   /* current soft-target sigma (float bits), set by sampler_set_soft */
     double *cum;   /* cumulative source weights */
     struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } *occ;   /* per source: coarse label cells containing papyrus (guides the position draw) */
 };
@@ -263,8 +264,9 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         }
     }
     /* soft ridge target: background voxels near the surface get 254 * exp(-(d / sigma)^2 / 2), d = 3-4-5 chamfer distance / 3 */
-    if (c->soft > 0 && region_ch < 0) {
-        float sigma = c->soft / (float)(1 << l); if (sigma < 0.75f) sigma = 0.75f;
+    float soft0; { unsigned sb = atomic_load(&sp->soft_bits); memcpy(&soft0, &sb, 4); }
+    if (soft0 > 0 && region_ch < 0) {
+        float sigma = soft0 / (float)(1 << l); if (sigma < 0.75f) sigma = 0.75f;
         uint16_t *dm = (uint16_t *)(big + 2 * p3);   /* distance map (needs 2 P^3 bytes: big has room) */
         const uint16_t INF = 60000;
         for (int ch = 0; ch < NCH; ch++) {
@@ -482,6 +484,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sampler *sp = calloc(1, sizeof *sp);
     sp->S = S;
     sp->cfg = *cfg;
+    { unsigned sb; memcpy(&sb, &cfg->soft, 4); atomic_store(&sp->soft_bits, sb); }
     sp->nslots = cfg->nbuf;
     sp->slots = calloc((size_t)sp->nslots, sizeof *sp->slots);
     sp->state = calloc((size_t)sp->nslots, sizeof *sp->state);
@@ -541,6 +544,7 @@ void sampler_stop(sampler *sp) {
     free(sp);
 }
 
+void sampler_set_soft(sampler *sp, float sigma) { unsigned sb; memcpy(&sb, &sigma, 4); atomic_store(&sp->soft_bits, sb); }
 void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected) {
     *produced = atomic_load(&sp->produced);
     *rejected = atomic_load(&sp->rejected);
