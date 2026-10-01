@@ -429,7 +429,10 @@ is fusing its two passes into the conv epilogue / staging (kernel agent).
 At equal voxels per step, eight 64^3 patches beat one 128^3 patch by a wide margin (the long runs r8-r10 used P128
 B1 per GPU, i.e. batch 2: probably the wrong trade). Depth helps when the window is large enough to use it (P128: 4 ->
 5 levels 0.175 -> 0.274) and hurts at P64. Batch is the confound; P128 B8 at 4 and 5 levels is queued to separate
-window from batch. Bug found: MX-fp8 GroupNorm statistics fail for 96/112 channels (12/14 channels per group do not
+window from batch. Batch held at 8: 4 levels at P128 B8 peaks at 0.393 (band 0.66 / 0.63) against 0.301 at P64 B8,
+so larger windows do help detection once the batch is not starved, at 8x the voxels and ~3.3x the wall time per
+step (1868 s vs 570 s for 6000 steps on a shared GPU); a compute-matched comparison (P64 B8 for ~8x the steps) is
+the open question. Bug found: MX-fp8 GroupNorm statistics fail for 96/112 channels (12/14 channels per group do not
 divide the 32-channel MX block); scored with fp16 storage meanwhile.
 
 Scanning window (same trained model, only the inference window changes; MANBp box, halo 8, fp16 storage), peak F1:
