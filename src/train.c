@@ -111,7 +111,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
 int cmd_train(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 96] [--B 2] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
-                        "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 1)] [--mem auto|default] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
+                        "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 1)] [--mem auto|auto16|default] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--sr 1]\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  env UFSM_PROF=1 prints per-op GPU time every log interval (category 'upload+loss+opt').\n");
@@ -213,10 +213,12 @@ int cmd_train(int argc, char **argv) {
     {   /* --mem auto (default): the cheapest storage mode whose training buffers fit next to what is already allocated on every
            GPU; an explicit UFSM_CHUNK_UP / UFSM_RECOMPUTE / UFSM_GRAD_MX8 or --mem default keeps the env / built-in modes */
         const char *mm = opt(argc, argv, "--mem", "auto");
-        if (!strcmp(mm, "auto") && nn_get_tf32() && !getenv("UFSM_CHUNK_UP") && !getenv("UFSM_RECOMPUTE") && !getenv("UFSM_GRAD_MX8")) {
+        const int auto16 = !strcmp(mm, "auto16");   /* auto16: 16-bit gradients only */
+        if ((!strcmp(mm, "auto") || auto16) && nn_get_tf32() && !getenv("UFSM_CHUNK_UP") && !getenv("UFSM_RECOMPUTE") && !getenv("UFSM_GRAD_MX8")) {
             static const struct { int chunk, rc, gmx; const char *what; } cand[] = {
-                {1, 1, 0, "default"}, {2, 1, 0, "chunked up-part gradient (UFSM_CHUNK_UP=2)"}, {2, 2, 0, "chunked up-part gradient + recompute 2"},
-                {1, 1, 1, "MX-fp8 gradients (UFSM_GRAD_MX8=1)"}, {1, 2, 1, "MX-fp8 gradients + recompute 2"}};
+                /* step cost / bytes per level-0 voxel at 96^3 B2 (--fp4 1): 26.4 / 219, 27.4 / 186, 26.2 / 164, 28.8 / 148, 29.8 / 171 */
+                {1, 1, 0, "default"}, {2, 1, 0, "chunked up-part gradient (UFSM_CHUNK_UP=2)"},
+                {1, 1, 1, "MX-fp8 gradients (UFSM_GRAD_MX8=1)"}, {1, 2, 1, "MX-fp8 gradients + recompute 2"}, {2, 2, 0, "chunked up-part gradient + recompute 2"}};
             const int nc = (int)(sizeof cand / sizeof cand[0]);
             size_t fmin = (size_t)-1;
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); size_t f = nn_mem_free(); if (f < fmin) fmin = f; }
@@ -224,6 +226,7 @@ int cmd_train(int argc, char **argv) {
             const shape5 xs = {B, cfg.cin, P, P, P};
             int pick = -1; size_t need = 0;
             for (int c = 0; c < nc && pick < 0; c++) {
+                if (cand[c].gmx && auto16) continue;
                 unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx);
                 const size_t tb = unet_train_bytes(G[0].u, xs);
                 need = tb + tb / 14 + ((size_t)350 << 20);   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB */

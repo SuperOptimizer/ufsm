@@ -245,6 +245,20 @@ int main(void) {
         mode_mx(); lp_conv_fwd_s2_f8(x3, 0, x12, w3, NULL, 16, y3, 0, ys, (gnp_t){0});
         cmp("s2 fwd 12 ch fp32 I/O, two taps per k", y3, yr3, ny, TOL);
     }
+    {   /* stride-2 backward-data on MX-fp8 gradients, other widths (down0 16 -> 16, odd sizes; down2-like 64 -> 64, accumulate) */
+        const int cis[2] = {16, 64}, cos_[2] = {16, 64}, Ds[2] = {14, 8};
+        for (int k = 0; k < 2; k++) {
+            shape5 xs = {N, cis[k], Ds[k], 10, 18}, ys = nn_conv3d_out_shape(xs, cos_[k], 3, 2);
+            size_t nx = shape_numel(xs), ny = shape_numel(ys);
+            float *w = dev_rand((size_t)cos_[k] * cis[k] * 27, 0.1f), *gy = dev_rand(ny, 1e-3f); void *gym = mx_from(gy, ys); float *gyd = deq(gym, ys);
+            float *scr = nn_malloc(nn_conv3d_scratch(xs, cos_[k], 3) * 2 + (size_t)xs.n * cos_[k] * shape_spatial(xs) * 4), *gxr = dev_zero(nx);
+            float *gx0 = dev_rand(nx, 1e-3f); void *gxm = mx_from(gx0, xs); float *gx0d = deq(gxm, xs);
+            mode_ref(); nn_conv3d_bwd_data(gyd, ys, w, xs, 3, 2, gxr, scr); if (k) nn_axpy(gxr, 1.f, gx0d, nx);
+            mode_mx(); if (k) nn_conv3d_bwd_data_acc(gym, ys, w, xs, 3, 2, (float *)gxm, scr); else nn_conv3d_bwd_data(gym, ys, w, xs, 3, 2, (float *)gxm, scr);
+            char nm[80]; snprintf(nm, sizeof nm, "s2 bwd_data MX %d -> %d%s", cos_[k], cis[k], k ? " (accumulate)" : " (odd D)");
+            cmp(nm, deq(gxm, xs), gxr, nx, TOL);
+        }
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     printf(bad ? "mx FAIL (%d)\n" : "mx ok\n", bad);
     return bad != 0;
