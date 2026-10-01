@@ -106,6 +106,8 @@ struct sampler {
     atomic_int stop;
     atomic_uint_fast64_t produced, rejected;
     atomic_uint soft_bits;   /* current soft-target sigma (float bits), set by sampler_set_soft */
+    int64_t *slot_j;         /* deterministic mode: batch index held by each slot */
+    int64_t next_claim, next_take;   /* deterministic mode: next batch index to fill / to hand out (under mu) */
     atomic_uint_fast64_t prof_ns[16];   /* per-stage nanoseconds (env UFSM_SAMPLER_PROF): read, targets, dilate, soft, trust, encode, zscore, augment, x16, other */
     int prof;
     double *cum;   /* cumulative source weights */
@@ -471,9 +473,18 @@ static void *worker(void *arg) {
     float *xtmp = malloc(3 * (size_t)sp->cfg.P * sizeof(float));   /* per-z axis centres and a row of noise */
     uint8_t *ttmp = malloc(NCH * p3);
     uint8_t *big = malloc(10 * p3);   /* [0,P^3) CT (also the coarse probe), [P^3, 9P^3) (2P)^3 region scratch, [9P^3, 10P^3) mask */
+    const int det = sp->cfg.deterministic;
     while (!atomic_load(&sp->stop)) {
         pthread_mutex_lock(&sp->mu);
         int k = -1;
+        int64_t jb = -1;
+        if (det) {   /* claim the next batch index; its slot is fixed (jb % nslots) and must be free */
+            jb = sp->next_claim++;
+            k = (int)(jb % sp->nslots);
+            while ((sp->state[k] != FREE || jb - sp->next_take >= sp->nslots) && !atomic_load(&sp->stop)) pthread_cond_wait(&sp->cv_free, &sp->mu);
+            if (atomic_load(&sp->stop)) k = -1;
+            else sp->slot_j[k] = jb;
+        } else
         while (k < 0 && !atomic_load(&sp->stop)) {
             for (int j = 0; j < sp->nslots; j++) if (sp->state[j] == FREE) { k = j; break; }
             if (k < 0) pthread_cond_wait(&sp->cv_free, &sp->mu);
@@ -484,6 +495,7 @@ static void *worker(void *arg) {
         batch *b = &sp->slots[k];
         int fail = 0; unsigned spin = 0;
         for (int i = 0; i < sp->cfg.B && !atomic_load(&sp->stop);) {
+            if (det && spin == 0 && fail == 0) rseed(&r, sp->cfg.seed * 0x9e3779b97f4a7c15ull + (uint64_t)(jb * sp->cfg.B + i) * 1000003ull + 1);   /* per-sample stream */
             int rc = draw(sp, b, i, &r, xtmp, ttmp, big);
             if (rc == 0) { i++; fail = 0; spin = 0; }
             else if (rc > 0 && ++spin == (1u << 22)) fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d too large for the sources' regions, holdout boxes or levels?)\n", spin, sp->cfg.P);
@@ -597,6 +609,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     { unsigned sb; memcpy(&sb, &cfg->soft, 4); atomic_store(&sp->soft_bits, sb); }
     sp->prof = getenv("UFSM_SAMPLER_PROF") != nullptr;
     sp->nslots = cfg->nbuf;
+    sp->slot_j = calloc((size_t)sp->nslots, sizeof *sp->slot_j);
     sp->slots = calloc((size_t)sp->nslots, sizeof *sp->slots);
     sp->state = calloc((size_t)sp->nslots, sizeof *sp->state);
     for (int i = 0; i < sp->nslots; i++) sp->slots[i] = alloc_batch(cfg);
@@ -624,6 +637,10 @@ batch *sampler_next(sampler *sp) {
     pthread_mutex_lock(&sp->mu);
     int k = -1;
     while (k < 0) {
+        if (sp->cfg.deterministic) {   /* in batch order */
+            int s = (int)(sp->next_take % sp->nslots);
+            if (sp->state[s] == READY && sp->slot_j[s] == sp->next_take) { k = s; sp->next_take++; pthread_cond_broadcast(&sp->cv_free); }
+        } else
         for (int j = 0; j < sp->nslots; j++) if (sp->state[j] == READY) { k = j; break; }
         if (k < 0) {
             if (atomic_load(&sp->stop)) { pthread_mutex_unlock(&sp->mu); return nullptr; }
@@ -638,7 +655,7 @@ batch *sampler_next(sampler *sp) {
 void sampler_release(sampler *sp, batch *b) {
     pthread_mutex_lock(&sp->mu);
     sp->state[b - sp->slots] = FREE;
-    pthread_cond_signal(&sp->cv_free);
+    if (sp->cfg.deterministic) pthread_cond_broadcast(&sp->cv_free); else pthread_cond_signal(&sp->cv_free);
     pthread_mutex_unlock(&sp->mu);
 }
 
@@ -651,7 +668,7 @@ void sampler_stop(sampler *sp) {
     for (int i = 0; i < sp->cfg.nworkers; i++) pthread_join(sp->th[i], nullptr);
     for (int i = 0; i < sp->nslots; i++) free_batch(&sp->slots[i]);
     for (int i = 0; i < sp->S->n; i++) free(sp->occ[i].idx);
-    free(sp->occ); free(sp->slots); free(sp->state); free(sp->th); free(sp->cum);
+    free(sp->occ); free(sp->slot_j); free(sp->slots); free(sp->state); free(sp->th); free(sp->cum);
     free(sp);
 }
 

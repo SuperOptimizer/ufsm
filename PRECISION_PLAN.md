@@ -1,8 +1,10 @@
 # Handwritten mixed precision Conv3d training and inference plan
 
-Date: 2026-09-30. Target: UFSM on RTX 5060 Ti 16 GB. This document analyzes and replaces the supplied plan. It describes future implementation and validation work; this review executed no project code, compiler probes, tests, training, inference, or benchmarks and changed no implementation files.
+Updated: 2026-10-01. Target: UFSM on RTX 5060 Ti 16 GB. This document replaces the supplied plan and now reconciles it with the implemented engine, including the latest sampler, Muon, and schedule changes. The source review covers commit `6b0390a963043c3eef345766ba52b2a0f32325a6`, an intermediate sampler/storage cut, the detailed final cut `51125cd5e32f598c4ab5dcf967585db19b89fb1d`, and the small closing delta through `c64dab9fb14d2cd0444480d83a2aeadf41a2dde3`. See [FINDINGS.md](FINDINGS.md) for source cuts and individual proofs. No project code, compiler probes, tests, training, inference, benchmarks, or reproducer scripts were executed during this re-review, and no implementation files were changed.
 
-Build one model graph with explicit precision policies for each operation and tensor. Establish FP32 correctness, implement BF16/FP32 training, add FP8, then add NVFP4 forward computation and quantization-aware training. Keep reductions, optimizer state, and sensitive operations in FP32. Promote individual operations when the lower precision exceeds the accuracy budget. FP4 backward computation is a separate research phase.
+The final captured uncommitted delta based on `6fd40ac0f71e2374fecaeebc15ad072e92808ff8` adds batched Muon. Its fingerprints and separate review boundary are recorded in the findings document. Changes after that captured boundary are outside this analysis.
+
+Build one model graph with explicit precision policies for each operation and tensor. Establish FP32 correctness, qualify BF16/FP16 mixed training, then validate the implemented FP8/MXFP8 and MXFP4 paths with quantization-aware training. Add native NVFP4 as a separate comparison. Keep reductions, optimizer state, and sensitive operations in FP32. Promote individual operations when the lower precision exceeds the accuracy budget. FP4 backward computation is a separate research phase.
 
 The objective is the fastest complete training and inference pipeline that preserves surface quality on held-out scrolls. Parameter count, packed tensor size, and advertised tensor throughput are inputs to that decision, not acceptance criteria by themselves. No evidence in the supplied conversation establishes a minimum useful parameter count or predicts FP4 accuracy for this task.
 
@@ -45,17 +47,58 @@ The production engine remains handwritten C/CUDA with a C ABI. Use nvcc, its CUD
 
 There are two meanings of “from scratch” here: all numerical kernels are ours, and the model can train from random initialization using released labels. Later QAT may continue from our own BF16 checkpoint. A separate teacher is unnecessary.
 
-The current source exposes FP32 NCDHW buffers, while its accelerated convolution path converts staged operands to BF16 and accumulates in FP32. The public `nn_set_tf32` name does not describe that BF16 arithmetic. The proposed engine must distinguish FP32 storage, BF16 multiplication, true TF32 multiplication, and accumulation explicitly. This is a source observation, not a fresh validation of the current kernels. See [nn.h](src/nn.h), [nn.cu](src/nn.cu), and [DESIGN.md](DESIGN.md).
+The source now has FP32, BF16/FP16, FP8/MXFP8, and MXFP4 compute paths, with mixed storage, recomputation, and per-convolution/per-pass policies. The public boundary still uses `float*` for several buffers whose actual storage can be 16-bit or registered MX bytes; ordinary logical indexing remains NCDHW, while MX storage uses channel-blocked payload/scale rows. This is not a typed NDHWC engine. The CLI trainer defaults to FP16 storage via `--f16 1`; the low-level initial mode is BF16 unless settings/environment change it. Compute policy, storage type, accumulator, and effective fallback must be reported independently. See [nn.h](src/nn.h), [nn.cu](src/nn.cu), [nn_fp8.cu](src/nn_fp8.cu), and [unet.c](src/unet.c).
 
-Use a separate engine/backend boundary rather than silently changing existing operator semantics. Preserve the current model, masks, coordinates, interpolation convention, and checkpoint interpretation during the initial comparison. Audit entries in [FINDINGS.md](FINDINGS.md) are prerequisites to trustworthy evaluation where still applicable; they refer to a captured revision and must be rechecked against subsequent edits. They are not evidence that the current live revision has already failed a runtime test.
+Evolve the handwritten backend through an explicit execution/context boundary. Preserve a versioned model, mask, coordinate, interpolation, and checkpoint contract while correcting the identified defects. Audit entries in [FINDINGS.md](FINDINGS.md) distinguish fixed historical findings from current source defects and conditional API cases. They are source evidence, not claims that this review ran a failing program.
+
+## Implemented work and remaining acceptance gates
+
+The project is no longer starting with only a BF16 staging path. Reuse the existing work where its contract is correct; do not write another complete backend merely to satisfy the old phase names. The immediate objective is a trustworthy mixed model whose actual arithmetic/storage are explicit, followed by additional native formats where complete quality and performance evidence warrants them.
+
+| Area | Present in reviewed source | Still required before acceptance |
+| --- | --- | --- |
+| Baselines | Direct FP32 kernels; 16-bit tensor kernels with FP32 accumulators; FP16 partial/group accumulation policy 4 | Independent full-graph numerical checks, finite-value assertions, shape/storage capability validation |
+| FP8 | Block-scaled E4M3 convolution/dgrad/wgrad; MX activation and gradient storage; higher-precision pass overrides | Consistent normalization contract, small split-output correction, complete backward and deployment-policy quality |
+| FP4 | Native MXFP4 forward/selected dgrad; FP8 fallback paths; fake-format experiments | Explicit fallback map, consistent grids and QAT reference, corrected packed updates/resume; native NVFP4 remains separate |
+| Memory | Default recompute 1; optional recompute 2; shared inference temporaries; fused upsampling and chunked gradients | Identical replay conversions, complete allocation ownership/accounting, capability limits and peak-memory evidence |
+| Model | Four-input surface graph; optional GroupNorm/SiLU after downsampling | Treat down_norm as a separate architecture and guard every FP16 normalization input |
+| Optimizers | AdamW; packed grid/error-feedback updates; latest Muon plus AdamW partition | Disjoint update intervals, one decay/update owner per parameter, correct counters and complete optimizer checkpoints |
+| Pipeline | Occupancy sampling, soft/trust targets, pinned batch copies, prediction read-ahead/device preprocessing; latest chunk snapping/prefetch | Holdout-safe sampling, complete-batch publication, immutable hard seeds, failure propagation, actual transfer overlap |
+| Policy | Per-layer/conv/pass host selection and setters | Transactional parsing/transitions, context-owned state, immutable effective execution manifest and safe weight-cache rebuilds |
+| Evidence | Primitive harnesses and author-reported synthetic/real-data runs | Assertions covering failing contracts, fresh identity-bound holdouts, sheet topology, complete latency/memory and failure handling |
+
+Current source blockers are ordinary resume resetting loaded state; nonmonotonic packed optimizer/EMA intervals; statistics computed from a different tensor than stored normalization inputs; saturation lost during recompute 2; hidden low-precision launch errors; and sampler holdout/partial-batch defects. Latest Muon adds parameter-partition, optimizer-state, and test gaps. The intermediate prefetch bitmap hang was corrected in the final cut; other prefetch status/budget issues remain. Use the individual statuses in [FINDINGS.md](FINDINGS.md), not the earlier blanket “done/tested” project milestones.
+
+The effective precision manifest must be generated from the selected kernels and storage, not just the requested name. In current source, `all=fp4` can execute FP8 for small-Ci/stride-2/wgrad, 16-bit fused decoder upsampling, and a float-accumulating head; registered MX inputs can force FP8 despite another requested policy. Some exceptions are intentional and useful. Each must appear in the plan and benchmark attribution. No all-FP4 network is established by that policy label.
+
+Packed weights retain FP32 live/EMA shadows plus packed payloads/scales and, for FP4, FP8 residual state. They are a different optimizer recipe from FP32-master QAT, not proof of lower total memory. Convolution prepares execution weights again from shadows. Masked 2:4 weights still use dense MMA; this is a pruning experiment without native sparse instruction throughput. MX stride-2 dgrad currently uses scalar gathers. Measure these actual operations before assigning peak-format FLOPs to them.
+
+Keep FP32-master AdamW with BF16/FP16 compute as the initial comparison recipe. Evaluate packed weights, Muon, down_norm, soft-target curricula, changed augmentation, and WSD scheduling as distinct experiments. Changing several simultaneously prevents attributing quality to precision. Muon and packed-weight modes are currently incompatible in the dispatcher: requesting Muon with packed weights falls back to AdamW. A supported fallback must be explicit in run provenance.
+
+The closing source delta adds per-source `min_level` and makes the generator select level 2 or coarser for applicable fine-resolution pyramid sources. It changes physical sampling resolution and removes some possible levels; record that recipe and confirm at least one eligible level/window remains. Validation/policy comparisons must hold this setting fixed. Storage I/O counters now count only cache-backed handles, so they do not represent all process I/O.
+
+## Source contract before further optimization
+
+Resolve the following contracts before accepting more precision combinations:
+
+1. **Parameters and state:** fresh initialization, exact resume, and fine-tuning are separate operations. Optimizer parameter intervals are disjoint; each weight receives one intended update and decay. An exact resume restores packed residuals, Muon momentum where used, moments, EMA/stochastic counters, policy, loss scale, and successful-update count.
+2. **Normalization:** define whether GN statistics describe the stored rounded tensor or a deliberately different operator. For the baseline, use the stored tensor. Backward and replay consume that same value and saved statistics. Constant groups must normalize to the affine offset. Clamping, rounding, scale selection, and fake quantization occur at the same boundaries in original forward and replay.
+3. **Typed execution:** every edge and scratch region has a format, shape, allocation size, lifetime, and context. No float-only fallback receives 16-bit/MX buffers. Validate all selected forward/backward/head/norm capabilities before allocating a graph.
+4. **Failure:** launch, allocation, completion, I/O, cache publication, checkpoint close, and thread-start failures reach the caller. An error cannot become an unwritten output, an incomplete READY batch, an empty successful volume, or a passing diagnostic.
+5. **Data/evaluation identity:** holdouts are enforced after all origin transforms; physical CT identity and per-channel validity are explicit; prediction caches include checkpoint, architecture, source, crop, level, axis, precision and completion identity. Quantization quality uses new predictions under the effective deployment policy.
+6. **Counters and contexts:** gradient accumulation is consistently scaled until one unscale boundary; Adam bias correction follows successful moment updates. Device selection cannot reset adaptive state. Configurations, scratch, storage metadata and events have one explicit owner per model/device context.
+
+These are implementation/validation requirements for later authorized work. This review changes documents only.
 
 ## Hardware and toolchain contract
 
 NVIDIA lists the RTX 5060 Ti with compute capability 12.0, 16 GB or 8 GB GDDR7, 448 GB/s bandwidth, and 759 AI TOPS. The product page alone does not specify the performance of every MMA variant. [NVIDIA RTX 5060 family specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5060-family/)
 
-The documentation checked for this rewrite identifies CUDA 13.4 Update 1 and PTX ISA 9.4. Use that release as a candidate pinned toolchain, with an archived documentation set, a supported host compiler, and a compatible driver. This does not assert that this toolkit or driver is installed locally. Future upgrades require rerunning the capability and numerical checks. [CUDA release notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/)
+The documentation checked for the original 2026-09-30 rewrite identified CUDA 13.4 Update 1 and PTX ISA 9.4. Those are candidate pinned versions, with an archived documentation set, a supported host compiler, and a compatible driver. The source-only re-review did not query installed tools/drivers or reverify release availability. Future upgrades require the capability and numerical checks. [CUDA release notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/)
 
 Initially build the specialized low-precision backend for `sm_120a` and retain an ordinary `sm_120` baseline. Architecture and family suffixes have different compatibility scopes; keep target-specific code separate and dispatch according to the device and the compiled capability manifest. Do not assume an architecture-specific binary is portable to a later GPU. [CUDA compiler target compatibility](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html#feature-availability)
+
+Record actual object-specific build flags and fast-math settings in that manifest. The current Makefile has distinct CUDA objects and target settings; its presence is not a compiler acceptance result from this review. Separate a deterministic correctness configuration from tuned arithmetic/reduction behavior.
 
 Plan against the documented 99 KiB per-block shared-memory ceiling. Allocations above 48 KiB require dynamic shared memory and explicit opt-in. The current tuning guide and programming guide describe the SM/cache capacities differently, so the eventual implementation must query its actual device limits and occupancy rather than relying on one quoted per-SM number. [Blackwell tuning guide](https://docs.nvidia.com/cuda/blackwell-tuning-guide/), [CUDA compute-capability specifications](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html)
 
@@ -99,7 +142,7 @@ Do not assign the unscaled FP8 rate to MXFP8, or claim that all E2M1 instruction
 
 ## Model size and architecture choices
 
-First retain UFSM's four-level graph: widths `(16, 32, 64, 80)`, two 3×3×3 convolution–GroupNorm–SiLU stages per encoder/decoder block, 3×3×3 stride-2 convolutions between encoder levels, trilinear 2× upsampling, channel concatenation, and a 1×1×1 head. The source uses four input channels, comprising CT and radial direction. The head supports two output slots. [Model construction](src/unet.c), [model configuration](src/unet.h)
+Retain a named version of UFSM's four-level graph: widths `(16, 32, 64, 80)`, two 3×3×3 convolution–GroupNorm–SiLU stages per encoder/decoder block, 3×3×3 stride-2 convolutions between encoder levels, trilinear 2× upsampling, logical skip concatenation, and a 1×1×1 head. The source uses four input channels, comprising CT and radial direction, and two training output slots. The new `down_norm` adds GroupNorm/SiLU after each down convolution; compare it as a separate model version rather than folding it into a precision experiment. [Model construction](src/unet.c), [model configuration](src/unet.h)
 
 The parameter count is architecture-specific. For the construction in `src/unet.c`, a block mapping `Ci` to `Co` contributes `27*Ci*Co + 27*Co*Co + 6*Co` parameters, including biases and two affine GroupNorms. Each downsampling convolution contributes `27*C*C + C`; the head contributes `C0*Cout + Cout`.
 
@@ -117,6 +160,8 @@ For four levels with widths `(b, 2b, 4b, 8b)`, four input channels and two outpu
 | 16, 32, 64, 80 | 1,171,826 | Current graph with two output slots |
 
 These counts are algebraic source analysis, not results from running the model. Change the input count, head count, downsampling, normalization, or decoder and the counts change. Tiny widths also require valid normalization group counts. No row carries a predicted quality guarantee.
+
+For `down_norm`, add `2*sum(widths[0:nlev-1])` affine parameters. The `(16,32,64,80)` two-output graph therefore has **1,172,050** parameters with down_norm, versus 1,171,826 without it. The geometric `(b,2b,4b,8b)` formula becomes `6264*b*b + 265*b + 2`. These are source-derived counts. Actual accepted widths must also satisfy group divisibility, head/recompute capacity, MX normalization limits, and storage/layout constraints; parameter count alone does not establish a runnable architecture.
 
 A two-parameter intensity threshold is a useful control experiment, but its ability to represent complex sheet separation is an empirical question. There is no defensible “one parameter is enough” conclusion from the supplied material.
 
@@ -142,7 +187,7 @@ Physical padding is an implementation choice. Padded channels are zeroed and exc
 
 ### Storage costs
 
-NVFP4 uses E2M1 values, an E4M3-compatible nonnegative byte scale for each 16-value block, and a tensor-level FP32 multiplier. MXFP4 uses a power-of-two scale per 32 values. Their different scales are a reason to try NVFP4 first, not proof of Vesuvius accuracy. [NVIDIA NVFP4 format explanation](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/)
+NVFP4 uses E2M1 values, an E4M3-compatible nonnegative byte scale for each 16-value block, and a tensor-level FP32 multiplier. MXFP4 uses a power-of-two scale per 32 values. NVFP4's different granularity/scales motivate a later native comparison against the implemented MXFP4 path; they do not prove Vesuvius accuracy or justify discarding existing work. [NVIDIA NVFP4 format explanation](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/)
 
 Ignoring alignment, padded dimensions, scale-layout swizzles, and global scalars:
 
@@ -323,15 +368,27 @@ Give forward activations, backward activations, weights, and output gradients in
 
 ### FP4 QAT
 
-The first FP4 training mode uses NVFP4 forward operands with BF16/FP32 backward and optimizer state. It is mixed-precision QAT with native FP4 forward, not a claim of fully FP4 training.
+First validate native MXFP4 forward with higher-precision backward and FP32 optimizer state, using the existing kernels and their actual fallback map. Then implement native NVFP4 forward as a separate format comparison using the contract below. These are mixed-precision QAT recipes, not fully FP4 training. An FP16 fake-NVFP4 experiment does not establish native NVFP4 arithmetic or packed storage behavior.
 
 Specify the straight-through estimator: initially stop gradients through scale selection and use an identity derivative through finite quantize/dequantize values. This chosen derivative is biased and does not equal the derivative of rounding. A clipped or learned-scale surrogate is a separately named experiment. Apply the chosen rule to both activation and master-weight quantizers.
 
 The backward convolution consumes the dequantized forward operands according to the saved/recomputed forward contract. Save or reproducibly regenerate everything required for GroupNorm, SiLU, interpolation, and quantization boundaries. If a value was rounded before normalization, reconstruct that same rounded value rather than substituting an unrounded master value during backward.
 
-Support a slow fake-quant path built from our converters and higher-precision convolution. Use it to check quantization placement and surrogate gradients. Then use native FP4 forward kernels with the same scales, codes, and policy. Native tensor accumulation may differ numerically from the reference, so require the declared tolerance rather than universal byte-identical convolution outputs.
+Support a slow fake-quant path built from our converters and higher-precision convolution. Use it to check quantization placement and surrogate gradients. Compare native FP4 forward kernels with the same scales, codes, policy, and block ownership. Small-channel tap grouping and backward orientation can create additional requantization; represent it in the reference instead of assuming a stored grid makes every forward conversion exact. Native tensor accumulation may differ numerically from the reference, so require the declared tolerance rather than universal byte-identical convolution outputs.
 
 QAT can either start from an internally trained BF16 checkpoint or run from random initialization with a specified precision schedule. Compare these as separate training recipes. Quantization warmup, scaling-history warmup, and promotion rules must be reproducible and checkpointed. No teacher/distillation dependency is introduced.
+
+Keep packed-grid optimization separate from FP32-master QAT. The current packed-grid recipe uses stochastic rounding and FP4 error-feedback residuals; residuals are optimizer state, not disposable packing scratch. Correct parameter interval ownership, shadow/cache coherence, residual persistence, and mode transitions before comparing it to the baseline. A combined Muon/packed recipe requires its own implementation; silently executing AdamW after requesting Muon is not that recipe.
+
+### Optimizer and schedule experiments
+
+The latest Muon implementation views each 3³ convolution as `[Cout, Cin*27]`, applies Nesterov momentum and five Newton–Schulz iterations, and intends AdamW for biases, GN affine parameters and the head. Give those two optimizers disjoint parameter lists. Zero gradients do not exclude a parameter from AdamW decay or from updates driven by existing moments. Save optimizer identity, momentum and settings; rebuilding numerical scratch is sufficient, but rebuilding zero momentum is not exact continuation.
+
+The present Muon matrix products are scalar CUDA dot products, not tensor-core GEMMs. Include their work and scratch in full-step comparisons before claiming a faster optimizer. Its standalone test uses zero parameters/momentum, beta zero and decay zero, and does not exercise model partitioning or checkpoint lifecycle. Validate multi-step updates, nonzero decay/momentum, optimizer transitions, finite-value rejection, and shape/rank edge cases separately.
+
+The latest captured batched variant groups the stage launches across convolutions, reducing numerical-kernel launches to 18 for the graph plus a memset. Its scalar product count is unchanged, and it retains all matrices' scratch simultaneously. Validate batched versus unbatched updates and own their workspaces independently: toggling the current per-call batching setting can free the pool still referenced by cached descriptors. Fixed-mode speed measurements cannot establish transition safety.
+
+Keep cosine and WSD (warmup, stable, cooldown) as named, checkpointed schedules with validated endpoints. Define warmup/stable/cooldown durations and behavior when extending a run. `cooldown=0` needs an explicit no-cooldown rule rather than a zero denominator at the final step. A zero base learning rate must not become a `0/0` multiplier for the Muon rate. Record schedule attempts and successful optimizer updates independently.
 
 ### Optional FP4 backward research
 
@@ -446,30 +503,30 @@ Inference uses a separate memory plan without backward tensors. Calibrate using 
 
 ## Implementation phases and exit criteria
 
-These are future phases. None of their executable checks was performed during this document review.
+These phases are **acceptance gates for the existing and extended implementation**. Presence in source does not satisfy an exit criterion. Preserve correct existing kernels, repair their contracts, and implement missing formats only after the earlier gate. None of these executable checks was performed during this review.
 
 | Phase | Deliverable | Exit criterion |
 | --- | --- | --- |
-| P0 Source contract | Freeze model geometry, tensor semantics, valid masks, loss, precision terminology, checkpoint schema, and applicable audit prerequisites | Requirements and unsupported cases are explicit; source review finds no ambiguity in dimensions, buffer ownership, or numerical mode |
-| P1 Toolchain and formats | Pin compiler/driver/PTX, define capability manifest, CPU references, exact format converters, tiny instruction probes, and scratch budgets | Each selected tuple compiles for the intended target and later passes primitive validation; no fabricated throughput entries |
-| P2 FP32 forward | Direct CPU/GPU convolution, GroupNorm, SiLU, interpolation, concat, head, loss-only evaluation, typed context | Model geometry and numerical references agree; borders/tails and asynchronous lifetimes are checked |
-| P3 FP32 backward | dgrad, wgrad, norm/activation/interpolation gradients, masked loss gradients, AdamW, EMA, checkpoints | Smooth gradient checks, accumulation semantics, resume, and small-network optimization pass |
-| P4 BF16 and FP16 | Tensor-MMA forward/dgrad/wgrad, BF16 storage experiments, FP16 loss scaling, complete baseline training | BF16 training from random initialization is stable; held-out baseline and complete latency/memory are recorded |
-| P5 FP8 forward | Ordinary FP8 first, optional MXFP8, separate scale state, conversion nodes, higher-precision fallback | Numerical checks and complete model comparisons pass within the recorded quality budget |
-| P6 NVFP4 forward and QAT | NVFP4 layout/load/MMA/epilogue, exact quantizer contract, fake-quant reference, native-forward QAT with BF16 backward | Conversion/packing tests pass; native forward meets tolerances; complete QAT models satisfy quality and latency/memory gates |
-| P7 Mixed and runtime policies | Small set of layer policies, cache invalidation, sensitivity search, export, boundary-level switching | All policies preserve required semantics; switching/resume is reproducible; at least one useful Pareto improvement is demonstrated |
-| P8 FP8 backward | Independent FP8 dgrad/wgrad experiments and scale orientation | Training quality and update behavior stay within the recorded budget and full step time improves |
-| P9 Targeted optimization | Tiles, asynchronous loads, TMA where useful, local fusion, graph reuse, pipeline overlap | Each optimization has a reproducible benefit without reopening numerical failures |
-| P10 Optional research | MXFP4 comparison, W4A8, FP4 backward, tile arithmetic switching, instruction-specific sparsity | Each extension has its own correctness, training, topology, and complete-performance evidence |
+| P0 Contracts and source blockers | Freeze reviewed revision, architecture/data identity, effective per-pass precision, parameter ownership, failure and checkpoint semantics | Current resume/packed/norm/replay/error/sampler blockers are corrected and reviewed; rejected configurations fail before work starts |
+| P1 Reproducible references | Pin toolchain/driver/flags; independent CPU geometry and conversion references; format/capability/scratch manifests | Legal tuples later compile and pass finite, tail, border, split and failure checks; artifacts identify their exact source/toolchain |
+| P2 FP32 graph and training | Audit existing forward/backward, loss-only evaluation, per-channel masks, optimizer/EMA, typed contexts and checkpoints | Smooth derivative checks, branch/microbatch accumulation, exact continuation and invalid-input rejection pass |
+| P3 BF16/FP16 baseline | Audit tensor passes/storage, GN/replay rounding, FP16 scale lifecycle, head/down-norm capabilities, fresh inference memory | Whole-graph and multi-step checks pass for the chosen architecture; held-out baseline and full-step/forward memory/latency are recorded |
+| P4 FP8/MXFP8 graph | Audit existing scale/packing, split and 1×1 paths; independently select activation/gradient storage and pass arithmetic | Full backward and actual deployment precision meet the recorded quality budget; all effective fallback/conversion costs are reported |
+| P5 MXFP4 and QAT | Validate implemented native MXFP4, fake-quant contract, higher-precision backward; correct optional packed optimizer state | Packing/reference checks and multi-step/continuation tests pass; complete policies satisfy quality and useful latency/memory gates |
+| P6 Mixed runtime policies | Transactional policy parsing, validated graph-boundary switches, cache generations, export/provenance, sensitivity search | Every allowed switch preserves shapes/ownership/state; effective manifests match dispatch; complete combinations show a useful Pareto improvement |
+| P7 Native NVFP4 | Implement 16-value UE4M3 blocks, tensor multipliers, native load/MMA/output conversion and matching QAT | Native/reference and deployment comparisons pass; benefit over accepted MXFP4/FP8 is demonstrated at the same model and quality budget |
+| P8 Optimizer/data experiments | Independently qualify Muon, packed updates, down_norm, soft/trust recipes, augmentation and WSD | One-owner updates/decay, complete state persistence, heldout invariants and controlled quality comparisons pass |
+| P9 Targeted optimization | Fix buffer-specific transfer dependencies; tune tiles/staging/conversions/scalar dgrad and Muon; consider graph/TMA/local fusion | Timelines and complete requests demonstrate improvement including initialization/decoding/persistence; numerics and failure contracts remain satisfied |
+| P10 Optional research | W4A8, FP4 backward, tile arithmetic/storage policies and instruction-specific sparsity | Each extension has its own capability, correctness, training/topology and complete-performance evidence |
 
-P5–P7 may provide a useful FP4 inference engine and FP4 QAT without waiting for FP8 backward. P8 is required before calling the project an FP8 training engine; it is not silently considered complete because FP8 forward works. P10 is not a prerequisite for the primary mixed-precision model.
+An accepted P5 mixed MXFP4 forward with higher-precision backward can be useful without fully FP4 backward. To call a specific recipe FP8 training, its actual backward-data and backward-weight choices must pass P4's complete training gate; forward alone does not establish that. P7 and P10 are optional extensions, not prerequisites to a trustworthy mixed FP32/16/8/4 model using existing supported formats.
 
 For a future sparse branch, the selected native FP4 warp path uses paired 4:8 sparsity and ordered metadata rather than unconstrained scalar 2:4 pruning. Choose operand orientation and pruning rules together. [PTX sparse FP4 definition](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-sparse-mma)
 
 ## Concrete design decisions
 
-Use BF16/FP32 as the first practical training mode; keep full FP32 as a correctness/debug mode. Use ordinary FP8 before adding microscaled variants. Try NVFP4 forward before MXFP4, and keep BF16 backward for the first FP4 training recipe. Preserve GroupNorm and interpolation semantics during precision experiments. Make storage, accumulation, scale orientation, and fallback explicit in every execution plan.
+Keep full FP32 as the correctness/debug model, and qualify the existing BF16/FP16 compute with FP32 accumulated parameter/optimizer state as the practical baseline. Validate existing FP8/MXFP8 and MXFP4 before adding native NVFP4. Begin accepted FP4 recipes with higher-precision backward. Preserve named GroupNorm/interpolation and data-target semantics during precision comparisons. Make storage, accumulator/folding, scale orientation, effective fallback, optimizer identity and checkpoint state explicit in every execution plan.
 
 Evaluate compact model widths independently of hardware-friendly widening. Prefer fewer real FLOPs and smaller physical tensors when they win complete latency. Promote sensitive or poorly tiled layers instead of padding every layer to 64 channels. Deliver a trustworthy mixed model before pursuing whole-network persistence, arbitrary tile storage, or sparse peak throughput.
 
-The unresolved questions are measured rates for the chosen instructions, best tile/packing layouts for the actual channel counts, FP4 sensitivity of surface boundaries, training stability under each surrogate policy, and the acceptable task-quality budget. The phases resolve these through explicit evidence rather than embedding guesses as requirements.
+The immediate unresolved work is correctness and state coherence identified by the source audit. Then resolve real instruction/kernel rates, best layouts at actual narrow channels, FP4 boundary sensitivity, multi-step training stability, and the task-quality budget. Author-reported timings and F1 results are useful experiment leads; they do not replace these acceptance gates or establish that all documented modes are correct.

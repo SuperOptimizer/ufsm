@@ -18,6 +18,8 @@ typedef struct {
     int dilate;              /* > 0: dilate the surface band of pyramid targets by this many level-0 voxels (curriculum for thin targets) */
     float soft;              /* > 0: soft ridge target exp(-(d/soft)^2/2) around the surface (d = chamfer distance in level-0 voxels) */
     int snap;                /* align training windows to the CT chunk grid (3x fewer chunks decoded per window) */
+    int deterministic;       /* 1: batch j holds samples j*B .. j*B+B-1, each drawn with its own rng seeded by (seed, index), and
+                                batches come out in order: runs with the same seed see the same data regardless of thread timing */
     int xfmt;                /* also fill batch.x16: 0 = no (x only), 1 = fp16, 2 = bf16 (the trainer uploads x16 straight into the network input) */
 } sample_cfg;
 
