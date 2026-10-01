@@ -6,7 +6,8 @@ Prints one table per source; the per-source band-tolerant F1 at threshold 0.5 is
 """
 import json, os, subprocess, sys
 
-B = "/home/forrest/ufsm/build/ufsm"
+# the ufsm binary of this checkout (env UFSM_BIN overrides), so checkpoints with newer config fields load
+B = os.environ.get("UFSM_BIN", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "ufsm"))
 
 
 def arg(name, dflt):
