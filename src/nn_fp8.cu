@@ -2721,36 +2721,61 @@ extern "C" void lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, sha
    and all three kx, M = 16 MT output channels (GY), N = 8 NT input channels, a block walks ZC z-steps of 2 output planes
    (8 y x 16 x each) and atomically adds into gw. K = 64 voxels = 4 output rows of 16 x of one z plane; each 32-voxel
    scale block is a PAIR of output rows (vy, vy + 1).
-   A = GY: one ue8m0 per (co, row pair), exact stochastic rounding onto the e2m1 grid (sr_e2m1) keyed by the element.
-   B = X: one ue8m0 per (ci, 32 positions). A K block of X is the row pair (vy + ky, vy + ky + 1) seen through the kx
-         shift, so a scale over a fixed staged region would not match the 32-position block; instead every staged plane
-         is quantised into its 27 shifted blocks: 5 even-aligned row pairs (0-1 .. 8-9) and 4 odd-aligned ones (1-2 .. 7-8,
-         used by ky = 1), each in the 3 kx windows, 16 B + one scale each (432 B / plane), round to nearest.
+   A = GY: one ue8m0 per (co, row pair), exact stochastic rounding onto the e2m1 grid (sr_e2m1_nib: the nibble straight
+         from floor(t(a) + u), one hash per 8 elements) keyed by the element; staged 8 values (one e2m1 word) per lane.
+   B = X, round to nearest, in one of three layouts (template LY; host: UFSM_F4W_LAYOUT, the Hadamard / x-SR modes always
+         use LY 0). A K block of X is the row pair (vy + ky, vy + ky + 1) seen through the kx shift.
+     LY 2 (default): rows of 18 nibbles at 24 B (p at nibble 7 + p), one scale per (ci, plane) as the fp8 kernel; the tap
+         shifts are funnel shifts and row offsets. One rounding per value: the only layout that is not slower than fp8.
+     LY 1: the same rows stored twice, as 5 even-aligned (0-1 .. 8-9) and 4 odd-aligned (1-2 .. 7-8, used by ky = 1) row
+         pairs, one scale per pair (36 positions incl. the halo): scale per (ci, 32 positions) as specified, ~10% slower.
+     LY 0: every staged plane quantised into its 27 shifted blocks (each pair in the 3 kx windows, 16 B + one scale each,
+         432 B / plane): exact per-32-position blocks, needed when the block is transformed (Hadamard) or SR'd.
    Optional fixed-sign Hadamard (had): every 32-element block of both operands is multiplied by H32 diag(s) (s: the fixed
          sign vector F4W_SGN) before its scale / rounding; the element order inside a block (k = 16 * row + x) is the same
          for both, so H^T H = 32 I gives the exact product * 32, undone in the epilogue.
    Smem: X ring e2m1 [ci][4 planes][27 blocks][16 B] (ci stride 1744 B = 436 words == 20 mod 32: the 8 channels x 4 words
    of a fragment load hit 32 banks), scale pairs [ci][4][32] u16 (byte 0 = block P, byte 1 = block P + 3 = the next pair of
    the same alignment; ci stride 260 B), GY e2m1 [co][8 pair blocks][16 B] (co stride 144 B, ldmatrix conflict-free) +
-   scales [co][8], and per warp a [10 rows][18] fp32 staging plane. */
+   scales [co][8], and per warp a [10 rows][18] fp32 staging plane (LY 0). LY 1 uses the same strides with 9 pairs x 2 rows x
+   24 B per plane (pair P at 48 P, scale-pair byte 1 = pair P + 1); LY 2 10 rows x 24 B per plane, ci stride 976 B (also
+   20 mod 32 words), which leaves room for NT 3 at 2 blocks / SM. */
 #define X4_PS 432
 #define X4_CS 1744
 #define X4_SCS 130   /* u16 per channel of the scale-pair table (4 planes x 32 + 2 pad) */
 #define G4_CS 144
-#define F4W_SGN 0x9c6d2a73u   /* fixed random sign vector of the weight-gradient Hadamard (bit k set: element k negated) */
+#define F4W_SGN 0x9c6d2a73u
+/* stochastic rounding onto the e2m1 grid with a 16-bit uniform (two per hash): P(up) = ceil(frac * 65536) / 65536, so the
+   bias is below 2^-16 of a grid step; branch-light (the grid step is 0.5 / 1 / 2 on [0, 2) / [2, 4) / [4, 6]). */
+/* the same rounding returning the e2m1 nibble directly: the grid magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6} are the codes 0..7 and
+   t(a) = 2a / a + 2 / a/2 + 4 on [0, 2) / [2, 4) / [4, 6] is linear between consecutive grid points, so floor(t + u) is exact
+   stochastic rounding (P(up) = frac to 2^-16) and needs no conversion instruction */
+__device__ __forceinline__ unsigned sr_e2m1_nib(float v, unsigned u16) {
+    const float a = fminf(fabsf(v), 6.f);
+    const float tt = a < 2.f ? 2.f * a : a < 4.f ? a + 2.f : fmaf(a, 0.5f, 4.f);
+    const unsigned q = min((unsigned)(tt + (float)u16 * (1.f / 65536.f)), 7u);
+    return q | (__float_as_uint(v) >> 28 & 8u);
+}
+__device__ __forceinline__ float sr_e2m1_u16(float v, unsigned u16) {
+    const float a = fminf(fabsf(v), 6.f);
+    const float inv = a < 2.f ? 2.f : a < 4.f ? 1.f : 0.5f, fl = floorf(a * inv);
+    const float up = (float)u16 < (a * inv - fl) * 65536.f ? 1.f : 0.f;
+    return copysignf((fl + up) * __frcp_rn(inv), v);
+}   /* fixed random sign vector of the weight-gradient Hadamard (bit k set: element k negated) */
 __device__ __forceinline__ void had_lane(float &v, float p, bool hi) { v = hi ? p - v : v + p; }
-template <int MT, int NT, typename T, typename TG>
+template <int MT, int NT, int LY, typename T, typename TG>   /* LY 0: 27 shifted blocks, 1: row pairs (2 pairings), 2: rows, one scale per (ci, plane) */
 __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
                                                        int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC, int had) {
     constexpr int CH = 8 * NT, BMo = 16 * MT;
+    constexpr int XPS = LY == 2 ? 240 : X4_PS, XCS = LY == 2 ? 976 : X4_CS;   /* x bytes per plane / per channel (LY 2: 10 rows x 24 B) */
     extern __shared__ __align__(128) unsigned char smem_raw[];
-    uint8_t *sxq = smem_raw;                                          /* [CH][X4_CS] */
-    unsigned short *sxp = (unsigned short *)(sxq + CH * X4_CS);       /* [CH][X4_SCS] */
+    uint8_t *sxq = smem_raw;                                          /* [CH][XCS] */
+    unsigned short *sxp = (unsigned short *)(sxq + CH * XCS);       /* [CH][X4_SCS] */
     uint8_t *sg = (uint8_t *)(sxp + CH * X4_SCS);                     /* [BMo][G4_CS] */
     uint8_t *sgs = sg + BMo * G4_CS;                                  /* [BMo][8] */
     float *sbias = (float *)(sgs + BMo * 8);                          /* [BMo] */
-    float *scr = sbias + BMo;                                         /* [9 warps][180] */
-    uint8_t *wsc = (uint8_t *)(scr + 9 * 180);                        /* [9 warps][32] */
+    uint8_t *wsc = (uint8_t *)(sbias + BMo);                          /* [9 warps][32] */
+    float *scr = (float *)(wsc + 9 * 32);                             /* [9 warps][180], LY 0 only */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int ci0 = blockIdx.x * CH, co0 = blockIdx.y * BMo;
     int bz = blockIdx.z;
@@ -2777,13 +2802,20 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
         __syncthreads();
         /* X: warp per (channel, plane). Phase 1: the 10 x 18 positions (GN+SiLU applied) into the warp's fp32 plane,
            position p of a row = x ox0 - 1 + p. Phase 2: the 27 shifted 32-position blocks, 4 lanes x 8 values each. */
-        for (int task = warp; task < CH * np; task += 9) {
-            int k = task / np, gz = gz_first + task % np, slot = (gz + 1) & 3, ci = ci0 + k;
-            const bool ok = ci < Ci && gz >= 0 && gz < D;
+        constexpr int U = LY ? 2 : 1;   /* x tasks in flight per warp: the loads of both are issued before either is quantised */
+        const int NXT = CH * np;
+        for (int task0 = warp; task0 < NXT; task0 += 9 * U) {
+            float4 V4[U][2]; float VS[U];
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+            const int task = task0 + 9 * u;
+            int k = task / np, gz = gz_first + task % np, ci = ci0 + k;
+            const bool ok = task < NXT && ci < Ci && gz >= 0 && gz < D;
             chan_t c = make_chan(ok ? ci : Ci, Ci, Cx, n, plane, x, sp, gp, N);
             const T *xc = ok && !IS_MX(T) ? (const T *)c.p + (size_t)gz * H * W : x;
             const bool G = (gp.G != 0 || sp.gp2.G != 0) && c.g, el = IS_MX(T);
             __syncwarp();
+            float4 *v4 = V4[u]; float &vs = VS[u]; vs = 0.f;
 #pragma unroll
             for (int i = 0; i < 2; i++) {
                 int f = lane + 32 * i, row = f >> 2, gyy = oy0 - 1 + row, gx = ox0 + 4 * (f & 3);
@@ -2798,16 +2830,98 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
                     v.x = gx < W ? act_ab(v.x, c.a, c.b, G) : 0.f; v.y = gx + 1 < W ? act_ab(v.y, c.a, c.b, G) : 0.f;
                     v.z = gx + 2 < W ? act_ab(v.z, c.a, c.b, G) : 0.f; v.w = gx + 3 < W ? act_ab(v.w, c.a, c.b, G) : 0.f;
                 }
-                if (f < 40) { float *d = ws + row * 18 + 1 + 4 * (f & 3); d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w; }
+                v4[i] = v;
+                if (LY == 0 && f < 40) { float *d = ws + row * 18 + 1 + 4 * (f & 3); d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w; }
             }
             {   /* halo: lane < 20 -> row lane >> 1, side lane & 1 (x = ox0 - 1 or ox0 + 16) */
                 int row = lane >> 1, gyy = oy0 - 1 + row, gx = (lane & 1) ? ox0 + 16 : ox0 - 1;
-                float vs = 0.f;
                 if (ok && lane < 20 && gyy >= 0 && gyy < H && gx >= 0 && gx < W) vs = act_ab(el ? ldc<T>(c, cof(c, gz, gyy, gx, H, W)) : ldx(xc, (size_t)gyy * W + gx), c.a, c.b, G);
-                if (lane < 20) ws[row * 18 + ((lane & 1) ? 17 : 0)] = vs;
+                if (LY == 0 && lane < 20) ws[row * 18 + ((lane & 1) ? 17 : 0)] = vs;
             }
+            }
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+            const int task = task0 + 9 * u;
+            if (task >= NXT) break;
+            const int k = task / np, gz = gz_first + task % np, slot = (gz + 1) & 3, ci = ci0 + k;
+            const float4 *v4 = V4[u]; const float vs = VS[u];
             __syncwarp();
-            uint8_t *dst = sxq + k * X4_CS + slot * X4_PS;
+            uint8_t *dst = sxq + k * XCS + slot * XPS;
+            if constexpr (LY == 2) {   /* rows at 24 B (p at nibble 7 + p), one scale per (ci, plane): one rounding per value, as fp8 */
+                const unsigned FM = 0xffffffffu;
+                unsigned a = amax_u(0u, vs);
+#pragma unroll
+                for (int i = 0; i < 2; i++) a = amax_u(amax_u(amax_u(amax_u(a, v4[i].x), v4[i].y), v4[i].z), v4[i].w);
+#pragma unroll
+                for (int o = 16; o; o >>= 1) a = max(a, __shfl_xor_sync(FM, a, o));
+                const int e = mx_exp(__uint_as_float(a), 1.f / 6.f);
+                const float m = exp2i(-e);
+#pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    const int f = lane + 32 * i, r = f >> 2, cq = f & 3;
+                    const unsigned h16 = (unsigned)cvt_e2m1x2(v4[i].x * m, v4[i].y * m) | ((unsigned)cvt_e2m1x2(v4[i].z * m, v4[i].w * m) << 8);
+                    const unsigned hn = __shfl_down_sync(FM, h16, 1);
+                    if (f < 40 && !(cq & 1)) *(unsigned *)(dst + r * 24 + 4 * (1 + (cq >> 1))) = h16 | (hn << 16);
+                }
+                if (lane < 20) { const unsigned nib = (unsigned)cvt_e2m1x2(vs * m, 0.f) & 15u; *(unsigned *)(dst + (lane >> 1) * 24 + ((lane & 1) ? 12 : 0)) = (lane & 1) ? nib : nib << 28; }
+                if (lane == 0) sxp[k * X4_SCS + slot * 32] = (unsigned short)((e + 127) * 0x101);
+            } else
+            if constexpr (LY == 1) {   /* paired layout, from registers: lane (i, f = lane + 32 i < 40) holds row f >> 2, positions
+                                     p = 1 + 4 (f & 3) .. 4 + 4 (f & 3) (= nibbles 8 + 4 c .., word 1 + c / 2); lane < 20 the halo
+                                     of row lane >> 1 (p = 0: nibble 7 of word 0, p = 17: nibble 0 of word 3). Row amax -> the
+                                     even-pair (rows 2e, 2e + 1) and odd-pair (2o + 1, 2o + 2) amax by shuffles; each value is
+                                     rounded once per pairing. */
+                const unsigned FM = 0xffffffffu;
+                unsigned ra[2];
+#pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    unsigned a = amax_u(amax_u(amax_u(amax_u(0u, v4[i].x), v4[i].y), v4[i].z), v4[i].w);
+                    a = max(a, __shfl_xor_sync(FM, a, 1)); ra[i] = max(a, __shfl_xor_sync(FM, a, 2));
+                }
+                unsigned hm = amax_u(0u, vs); hm = max(hm, __shfl_xor_sync(FM, hm, 1));   /* halo amax of row lane >> 1 */
+                ra[0] = max(ra[0], __shfl_sync(FM, hm, (lane >> 2) * 2));
+                ra[1] = max(ra[1], __shfl_sync(FM, hm, min(16 + (lane >> 2) * 2, 31)));
+                unsigned amE[2], amO[2];
+#pragma unroll
+                for (int i = 0; i < 2; i++) amE[i] = max(ra[i], __shfl_xor_sync(FM, ra[i], 4));
+                {
+                    const int r = lane >> 2;   /* i = 0 row */
+                    const unsigned n0 = __shfl_sync(FM, ra[0], (r & 1) ? min(lane + 4, 31) : max(lane - 4, 0));
+                    const unsigned x01 = __shfl_sync(FM, ra[1], lane & 3), x10 = __shfl_sync(FM, ra[0], 28 + (lane & 3));
+                    amO[0] = max(ra[0], lane >= 28 ? x01 : n0);   /* row 7 pairs with row 8 (i = 1) */
+                    amO[1] = max(ra[1], x10);                     /* row 8 (lanes 0..3) pairs with row 7; row 9 unused */
+                }
+                /* halo lanes: the pair amaxes of their row (row hr from lane 4 hr of i = 0, or 4 (hr - 8) of i = 1) */
+                const int hr = min(lane >> 1, 9);
+                const unsigned hE0 = __shfl_sync(FM, amE[0], (hr & 7) * 4), hE1 = __shfl_sync(FM, amE[1], (hr & 7) * 4);
+                const unsigned hO0 = __shfl_sync(FM, amO[0], (hr & 7) * 4), hO1 = __shfl_sync(FM, amO[1], (hr & 7) * 4);
+                const unsigned hamE = hr < 8 ? hE0 : hE1, hamO = hr < 8 ? hO0 : hO1;
+#pragma unroll
+                for (int pz = 0; pz < 2; pz++) {
+#pragma unroll
+                    for (int i = 0; i < 2; i++) {
+                        const int f = lane + 32 * i, r = f >> 2, cq = f & 3;
+                        const int e = mx_exp(__uint_as_float(pz ? amO[i] : amE[i]), 1.f / 6.f);
+                        const float m = exp2i(-e);
+                        const unsigned h16 = (unsigned)cvt_e2m1x2(v4[i].x * m, v4[i].y * m) | ((unsigned)cvt_e2m1x2(v4[i].z * m, v4[i].w * m) << 8);
+                        const unsigned hn = __shfl_down_sync(FM, h16, 1);
+                        const bool wr = f < 40 && (!pz || (r >= 1 && r <= 8));
+                        const int pair = pz ? 5 + ((r - 1) >> 1) : r >> 1, rin = pz ? (r - 1) & 1 : r & 1;
+                        if (wr && !(cq & 1)) *(unsigned *)(dst + pair * 48 + rin * 24 + 4 * (1 + (cq >> 1))) = h16 | (hn << 16);
+                        if (wr && cq == 0 && rin == 0) wscw[pair] = (uint8_t)(e + 127);
+                    }
+                    {   /* halo */
+                        const int r = hr, sd = lane & 1;
+                        const int e = mx_exp(__uint_as_float(pz ? hamO : hamE), 1.f / 6.f);
+                        const unsigned nib = (unsigned)cvt_e2m1x2(vs * exp2i(-e), 0.f) & 15u;
+                        const bool wr = lane < 20 && (!pz || (r >= 1 && r <= 8));
+                        const int pair = pz ? 5 + ((r - 1) >> 1) : r >> 1, rin = pz ? (r - 1) & 1 : r & 1;
+                        if (wr) *(unsigned *)(dst + pair * 48 + rin * 24 + (sd ? 12 : 0)) = sd ? nib : nib << 28;
+                    }
+                }
+                __syncwarp();
+                if (lane < 9) sxp[k * X4_SCS + slot * 32 + lane] = (unsigned short)(wscw[lane] | (lane != 4 && lane < 8 ? (unsigned)wscw[lane + 1] << 8 : 0u));
+            } else {
 #pragma unroll
             for (int r4 = 0; r4 < 4; r4++) {
                 const int task4 = r4 * 32 + lane, b = task4 >> 2, w = task4 & 3;
@@ -2845,56 +2959,66 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             }
             __syncwarp();
             if (lane < 27) sxp[k * X4_SCS + slot * 32 + lane] = (unsigned short)(wscw[lane] | (lane + 3 < 27 ? (unsigned)wscw[lane + 3] << 8 : 0u));
+            }
+            }
         }
-        /* GY: block (co, pb) = row pair pb of the z-step (rows 2 pb, 2 pb + 1; vz = pb >> 2) = 8 float4; warp covers 4 blocks,
-           8 lanes each, lane f holds block elements 4 f .. 4 f + 3 */
-        for (int task = warp; task < BMo * 2; task += 9) {
-            int blk = task * 4 + (lane >> 3), c = blk >> 3, pb = blk & 7, f = lane & 7;
-            int row = pb * 2 + (f >> 2), vx = 4 * (f & 3), vz = row >> 3, vy = row & 7;
+        /* GY: block (co, pb) = row pair pb of the z-step (rows 2 pb, 2 pb + 1; vz = pb >> 2), 4 lanes x 8 values: lane f holds
+           block elements 8 f .. 8 f + 7 (row f >> 1, x 8 (f & 1) ..) = one e2m1 word; a warp task covers 8 blocks */
+        for (int task = warp; task < BMo; task += 9) {
+            int blk = task * 8 + (lane >> 2), c = blk >> 3, pb = blk & 7, f = lane & 3;
+            int row = pb * 2 + (f >> 1), vx = 8 * (f & 1), vz = row >> 3, vy = row & 7;
             int co = co0 + c, oz = oz0 + vz, oy = oy0 + vy, ox = ox0 + vx;
-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            float q[8];
+#pragma unroll
+            for (int j = 0; j < 8; j++) q[j] = 0.f;
             if (co < Co && oz < D && oy < H) {
                 if constexpr (IS_MX8(TG)) {
                     const size_t vo = ((size_t)oz * H + oy) * W + ox, Sg = (size_t)D * H * W;
-                    if (ox < W) v.x = ldmx_e<8>(gy, N, Co, Sg, n, co, vo); if (ox + 1 < W) v.y = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + 1);
-                    if (ox + 2 < W) v.z = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + 2); if (ox + 3 < W) v.w = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + 3);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) if (ox + j < W) q[j] = ldmx_e<8>(gy, N, Co, Sg, n, co, vo + j);
                 } else {
                     const TG *src = gy + (((size_t)n * Co + co) * D + oz) * H * W + (size_t)oy * W + ox;
-                    if (vec) { if (ox < W) v = ldx4<TG>(src); }
-                    else { if (ox < W) v.x = ldx(src, 0); if (ox + 1 < W) v.y = ldx(src, 1); if (ox + 2 < W) v.z = ldx(src, 2); if (ox + 3 < W) v.w = ldx(src, 3); }
+                    if (vec) {
+#pragma unroll
+                        for (int h = 0; h < 2; h++) if (ox + 4 * h < W) { float4 v = ldx4<TG>(src + 4 * h); q[4 * h] = v.x; q[4 * h + 1] = v.y; q[4 * h + 2] = v.z; q[4 * h + 3] = v.w; }
+                    } else {
+#pragma unroll
+                        for (int j = 0; j < 8; j++) if (ox + j < W) q[j] = ldx(src, j);
+                    }
                 }
             }
-            float sm = (v.x + v.y) + (v.z + v.w);
-#pragma unroll
-            for (int o = 4; o; o >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, o);
-            float q[4] = {v.x, v.y, v.z, v.w};
+            float sm = ((q[0] + q[1]) + (q[2] + q[3])) + ((q[4] + q[5]) + (q[6] + q[7]));
+            sm += __shfl_xor_sync(0xffffffffu, sm, 1); sm += __shfl_xor_sync(0xffffffffu, sm, 2);
             if (had & 1) {
 #pragma unroll
-                for (int i = 0; i < 4; i++) if ((F4W_SGN >> (4 * f + i)) & 1u) q[i] = -q[i];
-                { float a0 = q[0], a1 = q[1], a2 = q[2], a3 = q[3]; q[0] = a0 + a1; q[1] = a0 - a1; q[2] = a2 + a3; q[3] = a2 - a3;
-                  a0 = q[0]; a1 = q[1]; a2 = q[2]; a3 = q[3]; q[0] = a0 + a2; q[1] = a1 + a3; q[2] = a0 - a2; q[3] = a1 - a3; }
+                for (int j = 0; j < 8; j++) if ((F4W_SGN >> (8 * f + j)) & 1u) q[j] = -q[j];
 #pragma unroll
                 for (int s = 1; s < 8; s <<= 1)
 #pragma unroll
-                    for (int i = 0; i < 4; i++) had_lane(q[i], __shfl_xor_sync(0xffffffffu, q[i], s), lane & s);
+                    for (int j = 0; j < 8; j++) if (!(j & s)) { float a0 = q[j], a1 = q[j | s]; q[j] = a0 + a1; q[j | s] = a0 - a1; }
+#pragma unroll
+                for (int s = 1; s < 4; s <<= 1)
+#pragma unroll
+                    for (int j = 0; j < 8; j++) had_lane(q[j], __shfl_xor_sync(0xffffffffu, q[j], s), lane & s);
             }
             unsigned amu = 0u;
 #pragma unroll
-            for (int i = 0; i < 4; i++) amu = amax_u(amu, q[i]);
-#pragma unroll
-            for (int o = 4; o; o >>= 1) amu = max(amu, __shfl_xor_sync(0xffffffffu, amu, o));
+            for (int j = 0; j < 8; j++) amu = amax_u(amu, q[j]);
+            amu = max(amu, __shfl_xor_sync(0xffffffffu, amu, 1)); amu = max(amu, __shfl_xor_sync(0xffffffffu, amu, 2));
             const int e = mx_exp(__uint_as_float(amu), 1.f / 6.f);
             const float m = exp2i(-e);
-#pragma unroll
-            for (int i = 0; i < 4; i++) q[i] *= m;
-            if (sp.sr) {   /* exact stochastic rounding of the gradient operand, keyed by the element (block slot) */
+            unsigned word;
+            if (sp.sr) {   /* exact stochastic rounding of the gradient operand, keyed by the element (block slot): one hash + 3 remixes */
                 const uint64_t vid = ((((uint64_t)n * Co + co) * D + oz) * H + oy) * (uint64_t)W + ox;
+                uint32_t hh[4];
+                hh[0] = sr_hash(sp.sr, vid);
 #pragma unroll
-                for (int i = 0; i < 4; i++) q[i] = sr_e2m1(q[i], sr_hash(sp.sr, vid + i));
-            }
-            const unsigned h16 = (unsigned)cvt_e2m1x2(q[0], q[1]) | ((unsigned)cvt_e2m1x2(q[2], q[3]) << 8);
-            const unsigned hn = __shfl_down_sync(0xffffffffu, h16, 1);
-            if (!(f & 1)) *(unsigned *)(sg + c * G4_CS + pb * 16 + 2 * f) = h16 | (hn << 16);
+                for (int i = 1; i < 4; i++) { uint32_t h1 = (hh[i - 1] ^ (hh[i - 1] >> 15)) * 0x2c1b3c6du; h1 ^= h1 >> 12; h1 *= 0x297a2d39u; hh[i] = h1 ^ (h1 >> 15); }
+                word = 0u;
+#pragma unroll
+                for (int j = 0; j < 8; j++) word |= sr_e2m1_nib(q[j] * m, (hh[j >> 1] >> (16 * (j & 1))) & 0xffffu) << (4 * j);
+            } else word = cvt_e2m1x8(q, m);
+            *(unsigned *)(sg + c * G4_CS + pb * 16 + 4 * f) = word;
             if (f == 0) { sgs[c * 8 + pb] = (uint8_t)(e + 127); if (do_bias) atomicAdd(&sbias[c], sm); }
         }
         __syncthreads();
@@ -2913,8 +3037,24 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
                     sa[m] = *(const unsigned short *)(sgs + (m * 16 + g + 8 * (t & 1)) * 8 + 2 * ks);
                 }
 #pragma unroll
+                if constexpr (LY >= 1) {
+                    const int P = LY == 2 ? 0 : (ky & 1) ? 5 + ((r0 - 1) >> 1) : r0 >> 1;   /* LY 1: the K step's first row pair; the second is P + 1 */
+                    const int ro = LY == 2 ? r0 * 24 : P * 48;
+#pragma unroll
+                    for (int q = 0; q < NT; q++) {
+                        const unsigned *xr = (const unsigned *)(sxq + (q * 8 + g) * XCS + slot * XPS + ro + (t >> 1) * 24) + (t & 1);
+                        const unsigned w0 = xr[0], w1 = xr[1], w2 = xr[2], c0 = xr[12], c1 = xr[13], c2 = xr[14];   /* next pair: +48 B */
+                        const unsigned sb = sxp[(q * 8 + g) * X4_SCS + slot * 32 + P];
+                        unsigned b[3][2] = {{__funnelshift_r(w0, w1, 28), __funnelshift_r(c0, c1, 28)}, {w1, c1}, {__funnelshift_r(w1, w2, 4), __funnelshift_r(c1, c2, 4)}};
+#pragma unroll
+                        for (int kx = 0; kx < 3; kx++)
+#pragma unroll
+                            for (int m = 0; m < MT; m++) mma_f4(acc[kx][m][q], af[m], b[kx], sa[m], sb);
+                    }
+                } else
+#pragma unroll
                 for (int q = 0; q < NT; q++) {
-                    const uint8_t *xb = sxq + (q * 8 + g) * X4_CS + slot * X4_PS + 4 * t;
+                    const uint8_t *xb = sxq + (q * 8 + g) * XCS + slot * XPS + 4 * t;
                     const unsigned short *xs2 = sxp + (q * 8 + g) * X4_SCS + slot * 32;
 #pragma unroll
                     for (int kx = 0; kx < 3; kx++) {
@@ -2948,19 +3088,26 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             }
     }
 }
-template <int MT, int NT, typename T, typename TG> static void launch_bw4(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC, int had) {
+template <int MT, int NT, typename T, typename TG> static void launch_bw4(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC, int had, int lay) {
     static int attr[8];
-    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    conv_bwd_w_f4_k<MT, NT, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had);
+    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 0, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 1, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 2, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    if (lay == 2) conv_bwd_w_f4_k<MT, NT, 2, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had);
+    else if (lay == 1) conv_bwd_w_f4_k<MT, NT, 1, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had);
+    else conv_bwd_w_f4_k<MT, NT, 0, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had);
 }
 template <typename T, typename TG> static void bwd_w_f4_t(const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had) {
     static int nt_env = -2, mt_env = -2, zc_env = -2;
     if (nt_env == -2) { nt_env = getenv("UFSM_F4W_NT") ? atoi(getenv("UFSM_F4W_NT")) : -1; mt_env = getenv("UFSM_F4W_MT") ? atoi(getenv("UFSM_F4W_MT")) : -1; zc_env = getenv("UFSM_F4W_ZC") ? atoi(getenv("UFSM_F4W_ZC")) : -1; }
+    static int lay_env = -1;
+    if (lay_env < 0) lay_env = getenv("UFSM_F4W_LAYOUT") ? atoi(getenv("UFSM_F4W_LAYOUT")) : 2;
+    /* plain mode (no Hadamard / x SR): 1 = row pairs, scale per (ci, 32 positions); 2 = rows, scale per (ci, plane) (fp8's
+       granularity, one rounding per value); 0 = the 27 shifted blocks (always used with the Hadamard or x SR) */
+    const int lay = (had & 3) ? 0 : lay_env;
     int MT = ys.c >= 32 ? 2 : 1;
-    int NT = xs.c <= 8 ? 1 : 2;
+    int NT = xs.c <= 8 ? 1 : lay == 2 && MT == 1 && xs.c % 24 == 0 ? 3 : 2;   /* NT 3 (as fp8 on dec0.c1) only fits 2 blocks / SM with the LY 2 tile */
     if (nt_env > 0) NT = nt_env;
     if (mt_env > 0) MT = mt_env;
-    size_t smem = (size_t)8 * NT * (X4_CS + 2 * X4_SCS) + 16 * MT * (G4_CS + 8 + 4) + 9 * (180 * 4 + 32);
+    size_t smem = (size_t)8 * NT * ((lay == 2 ? 976 : X4_CS) + 2 * X4_SCS) + 16 * MT * (G4_CS + 8 + 4) + 9 * 32 + (lay == 0 ? 9 * 180 * 4 : 0);
     int nzt = nblk_(ys.d, 2), base = (int)(((xs.c + 8 * NT - 1) / (8 * NT)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * nblk_(ys.w, 16) * nblk_(ys.h, 8) * ys.n);
     int ZC = nzt < 12 ? nzt : 12;
     while (ZC > 1 && (size_t)base * nblk_(nzt, ZC) < 72) ZC--;
@@ -2968,11 +3115,11 @@ template <typename T, typename TG> static void bwd_w_f4_t(const void *x, shape5 
     int nzc = (nzt + ZC - 1) / ZC;
     dim3 grid((xs.c + 8 * NT - 1) / (8 * NT), (ys.c + 16 * MT - 1) / (16 * MT), (unsigned)(nblk_(ys.w, 16) * nblk_(ys.h, 8) * nzc * ys.n));
     switch (MT * 10 + NT) {
-    case 11: launch_bw4<1, 1, T, TG>(grid, smem, x, xs, gy, ys, gw, gb, gp, sp, ZC, had); break;
-    case 12: launch_bw4<1, 2, T, TG>(grid, smem, x, xs, gy, ys, gw, gb, gp, sp, ZC, had); break;
-    case 13: launch_bw4<1, 3, T, TG>(grid, smem, x, xs, gy, ys, gw, gb, gp, sp, ZC, had); break;
-    case 21: launch_bw4<2, 1, T, TG>(grid, smem, x, xs, gy, ys, gw, gb, gp, sp, ZC, had); break;
-    case 22: launch_bw4<2, 2, T, TG>(grid, smem, x, xs, gy, ys, gw, gb, gp, sp, ZC, had); break;
+    case 11: launch_bw4<1, 1, T, TG>(grid, smem, x, xs, gy, ys, gw, gb, gp, sp, ZC, had, lay); break;
+    case 12: launch_bw4<1, 2, T, TG>(grid, smem, x, xs, gy, ys, gw, gb, gp, sp, ZC, had, lay); break;
+    case 13: launch_bw4<1, 3, T, TG>(grid, smem, x, xs, gy, ys, gw, gb, gp, sp, ZC, had, lay); break;
+    case 21: launch_bw4<2, 1, T, TG>(grid, smem, x, xs, gy, ys, gw, gb, gp, sp, ZC, had, lay); break;
+    case 22: launch_bw4<2, 2, T, TG>(grid, smem, x, xs, gy, ys, gw, gb, gp, sp, ZC, had, lay); break;
     default: fprintf(stderr, "lp_bwd_w_f4: bad MT/NT %d/%d\n", MT, NT); abort();
     }
 }

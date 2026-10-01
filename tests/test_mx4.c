@@ -517,6 +517,13 @@ int main(void) {
             cmp("f4 wgrad exact on grid (W 18, Ci 8, Co 16, D 5)", o1, r1, (size_t)16 * 8 * 27, 1e-5);
             cmp("f4 wgrad bias (W 18, Co 16)", ob, rb, 16, 1e-5);
         }
+        {   /* 48 -> 16 (dec0.c1 shape: NT 3 under UFSM_F4W_LAYOUT=2), grid values: exact */
+            shape5 yo = xs; yo.c = 16;
+            float *r1 = dev_zero((size_t)16 * 48 * 27), *o1 = dev_zero((size_t)16 * 48 * 27);
+            mode_ref(); nn_conv3d_bwd_weight(xg, xs, gg, yo, 3, 1, r1, nullptr);
+            lp_bwd_w_f4(xg, 0, xs, gg, 0, yo, o1, nullptr, none, s0, 0);
+            cmp("f4 wgrad exact on grid (48 -> 16)", o1, r1, (size_t)16 * 48 * 27, 1e-5);
+        }
         {   /* split input (x2 segment, dec0.c1-like 32 + 16), grid values: exact */
             shape5 c1 = xs, c2 = xs; c1.c = 32; c2.c = 16;
             float *xa = nn_malloc(shape_numel(c1) * 4), *xc = nn_malloc(shape_numel(c2) * 4);

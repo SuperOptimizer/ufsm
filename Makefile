@@ -90,6 +90,7 @@ test: build/test_sample_ops build/test_json build/test_nn build/test_unet build/
 	./build/test_sample_ops
 	./build/test_mx
 	./build/test_mx4
+	UFSM_F4W_LAYOUT=1 ./build/test_mx4
 	./build/test_rc
 	UFSM_FUSED_UP=0 UFSM_F16=1 ./build/test_unet
 	UFSM_RECOMPUTE=2 UFSM_F16=1 ./build/test_unet
@@ -107,3 +108,6 @@ clean:
 	rm -rf build
 
 .PHONY: all test clean
+
+build/bench_wgrad4: tests/bench_wgrad4.c build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
