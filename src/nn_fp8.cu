@@ -1,3 +1,4 @@
+#include <type_traits>
 /* FP8 (e4m3) / FP4 (e2m1) tensor-core 3^3 stride-1 convolutions with MX block scaling, fp32 accumulate.
    Built for sm_120a: `mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X` runs at
    4x the BF16 rate on GeForce Blackwell with fp32 accumulation (plain `.e4m3.e4m3.f32` without block scale runs
@@ -296,6 +297,9 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                         if (ox < W) { ps += v0; pss += v0 * v0; }
                         if (ox + 1 < W) { ps += v1; pss += v1 * v1; }
                     } else {
+                        if (osum && std::is_same<T, __half>::value) {   /* fp16 activation feeding a GroupNorm: saturate instead of inf (as conv_fwd_tc_k) */
+                            v0 = fminf(fmaxf(v0, -65504.f), 65504.f); v1 = fminf(fmaxf(v1, -65504.f), 65504.f);
+                        }
                         if (!(W & 1) && ox + 1 < W) {   /* paired store */
                             if (sp.accum) { v0 += ldx(yp, (size_t)ox); v1 += ldx(yp, (size_t)ox + 1); }
                             stx2(yp, (size_t)ox, v0, v1); ps += v0 + v1; pss += v0 * v0 + v1 * v1; continue;
