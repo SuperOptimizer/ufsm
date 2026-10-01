@@ -175,19 +175,23 @@ static float *dalloc(unet *u, size_t n) { u->act_bytes += n * 4; return nn_mallo
 #define GBF (ABF && nn_get_grad_bf16())
 static float *dalloc_act(unet *u, size_t n) { size_t b = ABF ? n * 2 : n * 4; u->act_bytes += b; return nn_malloc(b); }   /* activation storage (bf16 in act-bf16 mode) */
 /* activation tensor of shape s: MX-fp8 (registered, channel-blocked bytes + scales) in act-MX8 mode, else as dalloc_act */
-static int g_act_mx8 = -1;
-static int act_mx8(void) { if (g_act_mx8 < 0) g_act_mx8 = getenv("UFSM_ACT_MX8") != nullptr; return g_act_mx8 && nn_get_tf32(); }
+static int g_act_mx8 = -1, g_act_mx4 = -1;
+/* MX activation storage: fp8 (registry 8) or packed fp4 (registry 4); mx4 wins when both are requested */
+static int act_mx4(void) { if (g_act_mx4 < 0) g_act_mx4 = getenv("UFSM_ACT_MX4") != nullptr; return g_act_mx4 && nn_get_tf32(); }
+static int act_mx8(void) { if (g_act_mx8 < 0) g_act_mx8 = getenv("UFSM_ACT_MX8") != nullptr; return (g_act_mx8 || act_mx4()) && nn_get_tf32(); }   /* any MX format */
+static int act_dt(void) { return act_mx4() ? 4 : 8; }   /* registry dt of the MX activations */
 void unet_set_act_mx8(int on) { g_act_mx8 = on; }
+void unet_set_act_mx4(int on) { g_act_mx4 = on; }
 static int g_grad_mx8 = -1;   /* MX-fp8 activation gradients (env UFSM_GRAD_MX8=1; needs the MX activations) */
 static int grad_mx8(void) { if (g_grad_mx8 < 0) g_grad_mx8 = getenv("UFSM_GRAD_MX8") != nullptr; return g_grad_mx8 && act_mx8(); }
 void unet_set_grad_mx8(int on) { g_grad_mx8 = on; }
 static float *dalloc_grad_mx(unet *u, size_t bytes) { u->act_bytes += bytes; u->grad_bytes += bytes; float *p = nn_malloc(bytes); nn_set_storage(p, bytes, 8); return p; }
 static float *dalloc_act_s(unet *u, shape5 s) {
     if (!act_mx8()) return dalloc_act(u, shape_numel(s));
-    size_t b = nn_mx8_bytes(s);
+    size_t b = nn_mx_bytes(s, act_dt());
     u->act_bytes += b;
     float *p = nn_malloc(b);
-    nn_set_storage(p, b, 8);
+    nn_set_storage(p, b, act_dt());
     return p;
 }
 /* recompute mode (env UFSM_RECOMPUTE=1, tensor-core path): no block outputs s2 and no upsampled decoder inputs are
@@ -202,7 +206,7 @@ static int recompute(void) { if (g_recompute < 0) { const char *e = getenv("UFSM
    (the GN statistics of a1 are kept from the forward) */
 static int recompute_a1(void) { return recompute() >= 2; }
 void unet_set_recompute(int on) { g_recompute = on; }
-#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute())
+#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 64 * act_mx4())
 /* chunk mode (recompute, 16-bit activations and gradients, fused upsample): the decoder's up-part input gradient is
    produced in w[i]-channel chunks, each upsample-backwarded straight into its slice of gout[i + 1], so the shared
    gradient buffer B only needs w[i] channels (env UFSM_CHUNK_UP=0 turns it off) */
@@ -255,7 +259,7 @@ static void build_block_acts(unet *u, block *b, shape5 xs, int train, int keep_s
     b->s2 = recompute() && !keep_s2 ? nullptr : dalloc_act_s(u, b->ys);
     b->m1 = dalloc(u, (size_t)xs.n * G); b->r1 = dalloc(u, (size_t)xs.n * G); b->m2 = dalloc(u, (size_t)xs.n * G); b->r2 = dalloc(u, (size_t)xs.n * G);
 }
-static size_t act_bytes_of(shape5 s) { return act_mx8() ? nn_mx8_bytes(s) : shape_numel(s) * (ABF ? 2 : 4); }
+static size_t act_bytes_of(shape5 s) { return act_mx8() ? nn_mx_bytes(s, act_dt()) : shape_numel(s) * (ABF ? 2 : 4); }
 
 static void build_acts(unet *u, shape5 xs, int train) {
     free_acts(u);
@@ -410,7 +414,7 @@ static float *rc_tmp(unet *u, int level, shape5 s, int *reg) {
     }
     float *p = u->train ? u->gB[level] : u->cat[0];
     *reg = 0;
-    if (act_mx8() && nn_storage(p) != 8) { nn_set_storage(p, nn_mx8_bytes(s), 8); *reg = 1; }   /* 16-bit gradient buffer used as MX for now */
+    if (act_mx8() && nn_storage(p) != act_dt()) { nn_set_storage(p, nn_mx_bytes(s, act_dt()), act_dt()); *reg = 1; }   /* 16-bit gradient buffer used as MX for now */
     return p;
 }
 static void rc_done(float *p, int reg) { if (reg) nn_storage_forget(p); }
@@ -896,7 +900,7 @@ static void dbg_tensor(const char *nm, const float *t, shape5 s) {
     fprintf(stderr, "]"); free(h);
 }
 void unet_debug_acts(const unet *u) {
-    if (act_mx8()) { fprintf(stderr, "unet_debug_acts: MX storage not supported\n"); return; }
+    if (act_mx8()) { fprintf(stderr, "unet_debug_acts: MX storage not supported\n"); return; }   /* TODO dequantise via lp_mx*_to_f32 */
     int L = u->cfg.nlev;
     for (int i = 0; i < L; i++) {
         const block *b = &u->enc[i];
