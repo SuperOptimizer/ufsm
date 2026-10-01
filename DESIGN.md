@@ -418,7 +418,9 @@ GPU at 128^3, tiled Muon / ANVIL matmuls (lead); (6) wider level-0 channels once
   run trails Muon (val 0.609 vs 0.548), expected before the slow rail engages; 6000-step yardsticks at (lr, wd) =
   (0.023, 2.25), (0.01, 2.25), (0.01, 0.1) against Muon's 0.307: peak F1 0.204 / 0.231 / 0.329 (validation loss
   0.914 / 0.924 / 0.887). The record's heavy decay is wrong for this network; with wd 0.1 ANVIL edges Muon
-  (0.329 vs 0.290-0.307 over three Muon arms). Confirmation: wd 0.01 -> 0.310; wd 0.1 seed 1 and Muon seed 1 running.
+  (0.329 vs 0.290-0.307 over three Muon arms). Confirmation: wd 0.01 -> 0.310; seed 1: ANVIL wd 0.1 0.302 vs
+  Muon 0.303. The one-seed ANVIL lead was noise; the two are equal within it and Muon stays the default (simpler,
+  one fewer state buffer).
 - Width: widths 32/64/128/160 (4.68M params, 4x the FLOPs) with Muon lr 0.01 scores 0.301 at 6000 steps against
   0.307 for 16/32/64/80: no accuracy per step from width at this length, so the 1.17M network stays.
 - Prefetch and training levels: scans finer than 1.8 um (PHerc0139 1.129 um) get `min_level` 1 from make_sources
