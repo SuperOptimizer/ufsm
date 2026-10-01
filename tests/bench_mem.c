@@ -15,6 +15,7 @@ int main(void) {
     nn_set_tf32(1);
     const int P = getenv("UFSM_P") ? atoi(getenv("UFSM_P")) : 96, B = getenv("UFSM_B") ? atoi(getenv("UFSM_B")) : 2, it = 20;
     unet_cfg cfg = {4, {16, 32, 64, 80}, 4, 1, 8};
+    cfg.down_norm = getenv("UFSM_DOWN_NORM") ? atoi(getenv("UFSM_DOWN_NORM")) : 0;
     shape5 xs = {B, 4, P, P, P};
     size_t nl = (size_t)B * P * P * P;
     float *x = nn_malloc(shape_numel(xs) * 4), *g = nn_malloc(nl * 4);

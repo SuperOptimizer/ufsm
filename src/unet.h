@@ -12,6 +12,7 @@ typedef struct {
     int widths[UNET_MAXLEV];
     int cin, cout;
     int G;                 /* GroupNorm groups (min(G, C) is used) */
+    int down_norm;         /* 1: GroupNorm + SiLU after each stride-2 down conv (params appended after the head; 0 keeps the old layout) */
 } unet_cfg;
 
 typedef struct unet unet;

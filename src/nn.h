@@ -157,6 +157,7 @@ void nn_gn_silu_apply(const float *x, shape5 s, int G, const float *gamma, const
 void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy,
                     float *gx, float *ggamma, float *gbeta, float *scratch);
 /* GroupNorm forward fused with SiLU (y = silu(gn(x))), and recompute of both g = gn(x) and silu(g). */
+int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *mean, float *rstd);   /* stats of an activation-storage tensor; -1 for MX */
 void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd);
 void nn_gn_apply_silu(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *g, float *sil);
 /* Recompute y = gn(x) from saved mean/rstd (no statistics pass). */

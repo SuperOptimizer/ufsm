@@ -39,6 +39,7 @@ typedef struct {
        gn(a) and silu(gn(a1)) are recomputed in backward. */
     const float *in, *in2;      /* in2: second input tensor for channels >= c_split (decoder skip), tensor-core path only */
     int c_split;
+    const float *inx; const gnp *ing; const float *inm, *inr;   /* down_norm: conv1 input = silu(gn(inx)) (pre-norm down-conv output) */
     const void *xb, *x2b;       /* recompute mode, decoder: input [up2(silu(gn(xb.a2))) (transient) | silu(gn(x2b.a2)) (in staging)] */
     float *a1, *a2, *s2;
     float *m1, *r1, *m2, *r2;
@@ -58,6 +59,8 @@ struct unet {
     int using_ema;
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
+    gnp dn[UNET_MAXLEV];          /* down_norm: GroupNorm after down[i] */
+    float *dm[UNET_MAXLEV], *dr[UNET_MAXLEV], *downs[UNET_MAXLEV];   /* its statistics; fp32 path: the normalised output */
     /* activations */
     shape5 xs;                    /* shape the buffers were built for */
     int built, train;
@@ -105,6 +108,7 @@ unet *unet_create(const unet_cfg *cfg) {
     for (int i = 0; i < L - 1; i++) off = add_conv(u, &u->down[i], w[i], w[i], 3, 2, off);
     for (int i = L - 2; i >= 0; i--) off = add_block(u, &u->dec[i], w[i] + w[i + 1], w[i], off);
     off = add_conv(u, &u->head, w[0], cfg->cout, 1, 1, off);
+    if (cfg->down_norm) for (int i = 0; i < L - 1; i++) off = add_gn(u, &u->dn[i], w[i], off);
     u->np = off;
     if (getenv("UFSM_DEBUG")) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d c1.w %zu c1.b %zu n1 %zu c2.w %zu c2.b %zu n2 %zu\n", i, u->enc[i].c1.w, u->enc[i].c1.b, u->enc[i].n1.gamma, u->enc[i].c2.w, u->enc[i].c2.b, u->enc[i].n2.gamma);
@@ -151,6 +155,7 @@ void unet_init(unet *u, uint64_t seed) {
     int L = u->cfg.nlev;
     for (int i = 0; i < L; i++) { init_conv(h, &u->enc[i].c1, &seed, 0); init_gn(h, &u->enc[i].n1); init_conv(h, &u->enc[i].c2, &seed, 0); init_gn(h, &u->enc[i].n2); }
     for (int i = 0; i < L - 1; i++) init_conv(h, &u->down[i], &seed, 0);
+    if (u->cfg.down_norm) for (int i = 0; i < L - 1; i++) init_gn(h, &u->dn[i]);
     for (int i = 0; i < L - 1; i++) { init_conv(h, &u->dec[i].c1, &seed, 0); init_gn(h, &u->dec[i].n1); init_conv(h, &u->dec[i].c2, &seed, 0); init_gn(h, &u->dec[i].n2); }
     init_conv(h, &u->head, &seed, -2.0);
     nn_h2d(u->p, h, u->np * 4);
@@ -222,8 +227,9 @@ static void free_acts(unet *u) {
             for (int j = 0; j < 7; j++) pp[np++] = q[j];
             b->a1 = b->a2 = b->s2 = b->m1 = b->r1 = b->m2 = b->r2 = nullptr;
         }
-        float *q[8] = {u->gskip[i], u->gA[i], u->gB[i], u->downo[i], u->cat[i], u->gout[i], u->t1[i], u->t2[i]};
-        for (int j = 0; j < 8; j++) pp[np++] = q[j];
+        float *q[11] = {u->gskip[i], u->gA[i], u->gB[i], u->downo[i], u->cat[i], u->gout[i], u->t1[i], u->t2[i], u->dm[i], u->dr[i], u->downs[i]};
+        for (int j = 0; j < 11; j++) pp[np++] = q[j];
+        u->dm[i] = u->dr[i] = u->downs[i] = nullptr;
         u->downo[i] = u->cat[i] = u->gskip[i] = u->gout[i] = u->gA[i] = u->gB[i] = u->t1[i] = u->t2[i] = nullptr;
     }
     pp[np++] = u->logits; pp[np++] = u->conv_scratch; pp[np++] = u->rc_extra;
@@ -275,7 +281,15 @@ static void build_acts(unet *u, shape5 xs, int train) {
     for (int i = 0; i < L; i++) {
         shape5 bin = u->ls[i]; bin.c = i == 0 ? u->cfg.cin : w[i - 1];
         build_block_acts(u, &u->enc[i], bin, train, i == L - 1, T1, rc ? nullptr : T2);   /* recompute mode keeps the (small) outputs that get upsampled */
-        if (i < L - 1) { shape5 ds = u->ls[i + 1]; ds.c = w[i]; u->downo[i] = share ? T2 : dalloc_act_s(u, ds); }
+        if (i < L - 1) {
+            shape5 ds = u->ls[i + 1]; ds.c = w[i];
+            u->downo[i] = share ? T2 : dalloc_act_s(u, ds);
+            if (u->cfg.down_norm) {
+                int G = G_of(u, w[i]);
+                u->dm[i] = dalloc(u, (size_t)ds.n * G); u->dr[i] = dalloc(u, (size_t)ds.n * G);
+                if (!nn_get_tf32()) u->downs[i] = dalloc(u, shape_numel(ds));   /* fp32 path: materialised silu(gn(.)) */
+            }
+        }
     }
     for (int i = L - 2; i >= 0; i--) {
         shape5 li = u->ls[i];
@@ -420,6 +434,12 @@ static int dec_conv1(unet *u, block *b, int level, float *y, int G, float *m, fl
     rc_done(up, reg);
     return rv;
 }
+/* down_norm: GroupNorm (params + stats) of a block's input, G = 0 when there is none */
+static nn_gn_t gn_in(const unet *u, const block *b) {
+    nn_gn_t g = {nullptr, nullptr, nullptr, nullptr, 0};
+    if (b->ing) { g.gamma = P(u, b->ing->gamma); g.beta = P(u, b->ing->beta); g.mean = b->inm; g.rstd = b->inr; g.G = G_of(u, b->ing->c); }
+    return g;
+}
 static void block_fwd(unet *u, block *b, int level, const float *x) {
     b->in = x;
     int G = G_of(u, b->c1.cout);
@@ -428,7 +448,7 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
         nn_set_conv(0);
         if (b->xb) { if (dec_conv1(u, b, level, b->a1, G, b->m1, b->r1, nullptr, nullptr, nullptr)) rc_fail("decoder conv1"); }   /* [up2(coarse) | silu(gn(skip a2))] */
         else if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1));
-        else PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1));
+        else { nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1)); }   /* down_norm: gn + silu of the input in staging */
         FQ(b->a1, b->ys);
         nn_set_conv(1);
         PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, b->m2, b->r2));
@@ -462,6 +482,14 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
             nn_set_layer(4 + i);
             if (recompute()) { nn_gn_t g = gn_out(u, &u->enc[i]); int r; PROF(0, r = nn_conv3d_fwd_x(u->enc[i].a2, &g, nullptr, nullptr, 0, 0, u->enc[i].ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i], 0, 0.f, nullptr, nullptr)); if (r) rc_fail("down conv"); }
             else PROF(0, nn_conv3d_fwd(cur, u->enc[i].ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i]));
+            if (u->cfg.down_norm) {   /* GroupNorm + SiLU after the down conv: stats now, the transform in the next conv1's staging */
+                shape5 ds = u->ls[i + 1]; ds.c = w[i];
+                const int G = G_of(u, w[i]);
+                block *nb = &u->enc[i + 1];
+                nb->inx = u->downo[i]; nb->ing = &u->dn[i]; nb->inm = u->dm[i]; nb->inr = u->dr[i];
+                if (nn_get_tf32()) { if (nn_gn_stats(u->downo[i], ds, G, 1e-5f, u->dm[i], u->dr[i])) { fprintf(stderr, "unet: down_norm needs 16-bit / fp32 activation storage (not MX)\n"); abort(); } }
+                else { PROF(3, nn_gn_fwd_silu(u->downo[i], ds, G, 1e-5f, P(u, u->dn[i].gamma), P(u, u->dn[i].beta), u->downs[i], u->dm[i], u->dr[i])); cur = u->downs[i]; continue; }
+            }
             { shape5 ds = u->ls[i + 1]; ds.c = w[i]; FQ(u->downo[i], ds); }
             cur = u->downo[i];
         }
@@ -508,7 +536,7 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
         nn_set_conv(0);
         int r;
         if (b->xb) r = dec_conv1(u, b, level, b->a1, 0, nullptr, nullptr, nullptr, nullptr, nullptr);
-        else PROF(0, r = nn_conv3d_fwd_x(b->in, nullptr, nullptr, nullptr, 0, 0, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1, 0, 0.f, nullptr, nullptr));
+        else { nn_gn_t gi = gn_in(u, b); PROF(0, r = nn_conv3d_fwd_x(b->in, gi.G ? &gi : nullptr, nullptr, nullptr, 0, 0, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1, 0, 0.f, nullptr, nullptr)); }
         if (r) rc_fail("conv1 recompute");
         FQ(b->a1, b->ys);
     }
@@ -564,10 +592,21 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
         nn_set_conv(-1);
         return B;
     }
-    PROF(2, nn_conv3d_bwd_weight(b->in, b->xs, A, b->ys, 3, 1, g + b->c1.w, g + b->c1.b));
+    const nn_gn_t gi = gn_in(u, b);
+    if (gi.G && nn_get_tf32()) PROF(2, nn_conv3d_bwd_weight_gn(b->in, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, A, b->ys, g + b->c1.w, g + b->c1.b));
+    else PROF(2, nn_conv3d_bwd_weight(b->in, b->xs, A, b->ys, 3, 1, g + b->c1.w, g + b->c1.b));
     if (b != &u->enc[0] || !nn_get_tf32())   /* the network-input gradient of enc0 is never used */
     { PROF(1, nn_conv3d_bwd_data(A, b->ys, P(u, b->c1.w), b->xs, 3, 1, B, u->conv_scratch));            /* B = d/d in */
         FQG(B, b->xs); }
+    if (gi.G) {   /* down_norm: back through silu(gn(.)) of the down-conv output -> B = d/d inx */
+        if (nn_get_tf32()) PROF(3, nn_gn_silu_bwd(b->inx, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, B, B, g + b->ing->gamma, g + b->ing->beta, u->gn_scratch));
+        else {
+            const size_t ni = shape_numel(b->xs);
+            PROF(3, nn_gn_apply(b->inx, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, t1));   /* t1 = g */
+            PROF(4, nn_silu_bwd(t1, B, ni, A));                                                     /* A = d/d g */
+            PROF(3, nn_gn_bwd(b->inx, b->xs, gi.G, gi.gamma, gi.mean, gi.rstd, A, B, g + b->ing->gamma, g + b->ing->beta, u->gn_scratch));   /* B = d/d inx */
+        }
+    }
     nn_set_conv(-1);
     return B;
 }
@@ -782,7 +821,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (!f) return -1;
     fprintf(f, "UFSM{\"nlev\":%d,\"widths\":[", u->cfg.nlev);
     for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.widths[i]);
-    fprintf(f, "],\"cin\":%d,\"cout\":%d,\"G\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"extra\":%s}\n", u->cfg.cin, u->cfg.cout, u->cfg.G, u->np, step, u->sparse24, u->wq, extra ? extra : "{}");
+    fprintf(f, "],\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"extra\":%s}\n", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->np, step, u->sparse24, u->wq, extra ? extra : "{}");
     float *h = malloc(u->np * 4);
     const float *arrs[4] = {u->p, u->ema, u->m, u->v};
     for (int a = 0; a < 4; a++) { nn_d2h(h, arrs[a], u->np * 4); if (fwrite(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; } }
@@ -803,6 +842,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"cin\":"))) cfg->cin = atoi(p + 6);
     if ((p = strstr(line, "\"cout\":"))) cfg->cout = atoi(p + 7);
     if ((p = strstr(line, "\"G\":"))) cfg->G = atoi(p + 4);
+    if ((p = strstr(line, "\"down_norm\":"))) cfg->down_norm = atoi(p + 12);
     if ((p = strstr(line, "\"nparams\":"))) *np = (size_t)atoll(p + 10);
     if ((p = strstr(line, "\"step\":"))) *step = atoi(p + 7);
     if ((p = strstr(line, "\"sparse24\":"))) g_loaded_sparse = atoi(p + 11);

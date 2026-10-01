@@ -111,7 +111,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
 int cmd_train(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 96] [--B 2] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
-                        "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--gpus 0,1] [--workers 12] [--seed 0] [--resume CKPT]\n"
+                        "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--resume CKPT]\n"
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1]\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  env UFSM_PROF=1 prints per-op GPU time every log interval (category 'upload+loss+opt').\n");
@@ -147,6 +147,8 @@ int cmd_train(int argc, char **argv) {
     if (getenv("UFSM_X32")) g_xfmt = g_g16 = 0;   /* diagnostic: fp32 batches and logit gradient, converted on the device (the old path) */
     nn_set_loss_grad_h16(g_g16);
     unet_cfg cfg = {4, {16, 32, 64, 80}, 4, NCH, 8};
+    cfg.down_norm = atoi(opt(argc, argv, "--down-norm", "0"));
+    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) cfg.down_norm = pc.down_norm; }   /* the checkpoint decides */
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,80")); cfg.nlev = 0; for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "P must be divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
     char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", out); if (system(cmd)) return 1;

@@ -2008,13 +2008,14 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
 
 /* ================= GroupNorm =================
    Statistics are reduced by (n*G) x KSLAB blocks accumulating into double sums with atomics, then finalized. */
-__global__ void gn_sums_k(const float *x, int C, int G, size_t S, double *sums) {
+template <typename T = float>
+__global__ void gn_sums_k(const T *x, int C, int G, size_t S, double *sums) {
     int ng = blockIdx.x, slab = blockIdx.y;
     int n = ng / G, g = ng % G, cpg = C / G;
-    const float *p = x + ((size_t)n * C + (size_t)g * cpg) * S;
+    const T *p = x + ((size_t)n * C + (size_t)g * cpg) * S;
     size_t len = (size_t)cpg * S, per = (len + KSLAB - 1) / KSLAB, lo = (size_t)slab * per, hi = lo + per < len ? lo + per : len;
     double s1 = 0, s2 = 0;
-    for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) { double v = p[i]; s1 += v; s2 += v * v; }
+    for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) { double v = ldv(p, i); s1 += v; s2 += v * v; }
     __shared__ double r1[256], r2[256];
     r1[threadIdx.x] = s1; r2[threadIdx.x] = s2;
     __syncthreads();
@@ -2064,6 +2065,21 @@ extern "C" void nn_gn_fwd(const float *x, shape5 s, int G, float eps, const floa
     size_t n = shape_numel(s);
     if (y) gn_apply_k<0, float, float><<<dim3(s.n * s.c, KSLAB), 256>>>(x, gamma, beta, mean, rstd, y, s.c, G, S);   /* y == nullptr: statistics only */
     KCHECK();
+}
+/* GroupNorm statistics of a tensor in activation storage (16-bit on the tensor-core path); -1 for MX storage */
+extern "C" int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *mean, float *rstd) {
+    if (ISMX(x)) return -1;
+    if (G > s.c) G = s.c;
+    size_t S = shape_spatial(s);
+    int NG = s.n * G;
+    double *sums = gn_dsums((size_t)2 * NG);
+    cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double));
+    if (ABF && g_h16) gn_sums_k<f16><<<dim3(NG, KSLAB), 256>>>((const f16 *)x, s.c, G, S, sums);
+    else if (ABF) gn_sums_k<bf16><<<dim3(NG, KSLAB), 256>>>((const bf16 *)x, s.c, G, S, sums);
+    else gn_sums_k<float><<<dim3(NG, KSLAB), 256>>>(x, s.c, G, S, sums);
+    gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, (size_t)(s.c / G) * S, eps, mean, rstd);
+    KCHECK();
+    return 0;
 }
 extern "C" void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd) {
     if (G > s.c) G = s.c;

@@ -39,7 +39,8 @@ static void seg_report(const int *w, int L, int cin, int cout, const float *g0, 
     for (int i = 0; i < L; i++) { snprintf(b, 24, "enc%d", i); off = addblock(b, i ? w[i - 1] : cin, w[i], off); }
     for (int i = 0; i < L - 1; i++) { snprintf(b, 24, "down%d", i); off = addconv(b, w[i], w[i], 3, off); }
     for (int i = L - 2; i >= 0; i--) { snprintf(b, 24, "dec%d", i); off = addblock(b, w[i] + w[i + 1], w[i], off); }
-    addconv("head", w[0], cout, 1, off);
+    off = addconv("head", w[0], cout, 1, off);
+    if (getenv("UFSM_DOWN_NORM") && atoi(getenv("UFSM_DOWN_NORM"))) for (int i = 0; i < L - 1; i++) { snprintf(b, 24, "dn%d", i); off = addgn(b, w[i], off); }
     for (int i = 0; i < nseg; i++) {
         double d2 = 0, r2 = 0;
         for (size_t j = segs[i].off; j < segs[i].off + segs[i].len; j++) { double d = (double)g1[j] - g0[j]; d2 += d * d; r2 += (double)g0[j] * g0[j]; }
@@ -52,6 +53,7 @@ int main(void) {
     nn_set_tf32(0);   /* finite-difference checks need the exact fp32 kernels; the benchmark re-enables tensor cores */
     srand(3);
     unet_cfg cfg = {3, {4, 6, 8}, 4, 2, 2};
+    cfg.down_norm = getenv("UFSM_DOWN_NORM") ? atoi(getenv("UFSM_DOWN_NORM")) : 0;
     if (getenv("UFSM_TINY")) { cfg.nlev = 0; char *t = strdup(getenv("UFSM_TINY")); for (char *q = strtok(t, ","); q; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); }
     unet *u = unet_create(&cfg);
     unet_init(u, 1);
@@ -129,6 +131,7 @@ int main(void) {
     if (getenv("UFSM_PREC_POLICY") && nn_set_prec_policy(getenv("UFSM_PREC_POLICY"))) return 1;
     nn_set_tf32(getenv("UFSM_FP32") ? 0 : 1);
     unet_cfg big = {4, {16, 32, 64, 80}, 4, 1, 8};
+    big.down_norm = cfg.down_norm;
     unet *b = unet_create(&big);
     unet_init(b, 2);
     printf("model (16,32,64,80): %zu params\n", unet_nparams(b));
