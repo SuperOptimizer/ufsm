@@ -365,6 +365,22 @@ GPU at 128^3, tiled Muon / ANVIL matmuls (lead); (6) wider level-0 channels once
   guard (within 0.005 F1). Earlier fp4 numbers (QAT fine-tune 0.242 vs 0.297, simulated NVFP4 62-66% error) were
   without those ingredients.
 
+### fp4 storage study (step 0 of the fp4 plan, 2026-10-01 evening)
+Paired 6000-step yardstick (MANBp, det, Muon, down_norm), fake MXFP4 (e2m1, ue8m0/32, RN) applied in training:
+
+| arm | F1 0.5 | F1 0.7 | val |
+|---|---|---|---|
+| fp16 reference | 0.212 | 0.300 | 0.907 |
+| raw pre-GN a1/a2 in fp4 (`UFSM_FAKEQ_WHERE=0`) | 0.227 | 0.287 | 0.918 |
+| post-GN+SiLU operand s2 in fp4 (1) | 0.247 | 0.294 | 0.913 |
+| pre-GN a1/a2 after the previous-step affine (2) | 0.217 | 0.314 | 0.917 |
+| activation GRADIENTS in fp4 (`UFSM_FAKEQ_GRAD`) | 0.089 | 0.082 | 1.119 |
+
+Every activation-storage variant is inside the 0.02 band (the earlier "62-66%" was a one-step gradient error, not a
+training outcome; the network adapts to the grid); fp4 gradient storage destroys training. Decisions: phase 2 ON
+(training a1/a2 and down outputs become packed fp4 as well, raw first, the delayed-stats affine only if the real
+kernels show a gap); gradients stay MX-fp8 / fp16; fp4 in the backward is restricted to the GEMM operands.
+
 ### Run lengths (2026-10-01 evening)
 - Under Muon the 6000-step yardstick reaches the F1 that AdamW needed 120k steps for, and r10's validation loss has
   been flat (0.94-0.99) since step 50k of its constant-lr phase. Decisions therefore use the 6000-step paired
