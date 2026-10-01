@@ -29,7 +29,7 @@ def main():
         pdir = os.path.join(out, name)
         box = ",".join(str(v >> int(level)) for v in h)
         cmd = [B, "predict", ckpt, s["root"], s["ct"], pdir, "--um", str(s["um"]), "--level", level, "--box", box,
-               "--window", "160", "--halo", "16", "--shard", "256", "--gpu", gpu, "--levels", "1"]
+               "--window", "288", "--halo", "16", "--shard", "256", "--gpu", gpu, "--levels", "1"]
         if cache:
             cmd += ["--cache", cache]
         if "axis" in s:

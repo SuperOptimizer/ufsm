@@ -21,14 +21,14 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
 
 int cmd_predict(int argc, char **argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window 160]\n"
+        fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window 288]\n"
                         "       [--halo 16] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n");
-        fprintf(stderr, "  window - 2*halo should divide the shard size (160 - 32 = 128 divides 256 and 512): tiles then cover each shard exactly.\n");
+        fprintf(stderr, "  window - 2*halo should divide the shard size (288 - 32 = 256 divides 256 and 512): tiles then cover each shard exactly. 288^3 needs ~5.5 GB; 160 for small GPUs.\n");
         return 2;
     }
     const char *ckpt = argv[2], *root = argv[3], *key = argv[4], *out = argv[5];
     double um = atof(opt(argc, argv, "--um", "0"));
-    int level = atoi(opt(argc, argv, "--level", "0")), W = atoi(opt(argc, argv, "--window", "160")), halo = atoi(opt(argc, argv, "--halo", "16"));
+    int level = atoi(opt(argc, argv, "--level", "0")), W = atoi(opt(argc, argv, "--window", "288")), halo = atoi(opt(argc, argv, "--halo", "16"));
     int shard = atoi(opt(argc, argv, "--shard", "512")), gpu = atoi(opt(argc, argv, "--gpu", "0")), nlev = atoi(opt(argc, argv, "--levels", "4"));
     int nthreads = atoi(opt(argc, argv, "--threads", "16"));
     float q = (float)atof(opt(argc, argv, "--q", "8"));
@@ -63,8 +63,11 @@ int cmd_predict(int argc, char **argv) {
     int stride = W - 2 * halo;
     size_t w3 = (size_t)W * W * W;
     uint8_t *ctu = malloc(w3), *sbuf = malloc((size_t)shard * shard * shard);
-    float *xh = malloc(4 * w3 * sizeof(float)), *ph = malloc(w3 * sizeof(float));
-    float *xd = nn_malloc(4 * w3 * 4), *pd = nn_malloc(w3 * 4);
+    /* the window goes up as uint8; the input channels are built on the device in the network's storage type */
+    const int h16 = nn_get_tf32() && nn_get_act_bf16() && !getenv("UFSM_ACT_MX8");
+    uint8_t *ctd = nn_malloc(w3), *pu = malloc(w3), *pud = nn_malloc(w3);
+    float *dyo = malloc(2 * (size_t)W * sizeof(float)), *dxo = dyo + W, *dyd = nn_malloc(2 * (size_t)W * sizeof(float)), *dxd = dyd + W;
+    void *xd = nn_malloc(4 * w3 * (h16 ? 2 : 4));
     shape5 xs = {1, 4, W, W, W};
     int64_t ns[3];
     for (int d = 0; d < 3; d++) ns[d] = (bn[d] + shard - 1) / shard;
@@ -83,26 +86,17 @@ int cmd_predict(int argc, char **argv) {
             for (size_t k = 0; k < w3; k++) { nz += ctu[k] != 0; sum += ctu[k]; sq += (double)ctu[k] * ctu[k]; }
             if (nz == 0) { nskip++; continue; }
             double mean = sum / (double)w3, var = sq / (double)w3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
-            for (int z = 0; z < W; z++) {
+            for (int z = 0; z < W; z++) {   /* window origin relative to the axis at this slice (double on the host, small in float) */
                 double cy, cx;
                 axis_at(&ax, (double)(o[0] + z) * scale, &cy, &cx);
                 cy /= scale; cx /= scale;
-                for (int y = 0; y < W; y++) {
-                    double dy = (double)(o[1] + y) - cy;
-                    for (int x = 0; x < W; x++) {
-                        size_t k = ((size_t)z * W + y) * W + x;
-                        double dx = (double)(o[2] + x) - cx, nn_ = sqrt(dy * dy + dx * dx) + 1e-6;
-                        xh[k] = (float)((ctu[k] - mean) / sd);
-                        xh[w3 + k] = 0;
-                        xh[2 * w3 + k] = ax.n ? (float)(dy / nn_) : 0;
-                        xh[3 * w3 + k] = ax.n ? (float)(dx / nn_) : 0;
-                    }
-                }
+                dyo[z] = (float)((double)o[1] - cy); dxo[z] = (float)((double)o[2] - cx);
             }
-            nn_h2d(xd, xh, 4 * w3 * 4);
-            const float *lg = unet_forward(u, xd, xs, 0);
-            nn_sigmoid(lg, w3, pd);      /* channel 0 = recto */
-            nn_d2h(ph, pd, w3 * 4);
+            nn_h2d(ctd, ctu, w3); nn_h2d(dyd, dyo, 2 * (size_t)W * sizeof(float));
+            nn_pred_input(ctd, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0, xd, h16);
+            const float *lg = unet_forward_x(u, xd, xs, 0, h16);
+            nn_pred_output(lg, ctd, w3, pud);      /* channel 0 = recto */
+            nn_d2h(pu, pud, w3);
             const char *e = nn_check();
             if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }
             /* interior into the shard buffer */
@@ -113,7 +107,7 @@ int cmd_predict(int argc, char **argv) {
                     for (int x = halo; x < W - halo; x++) {
                         int64_t gx = tx + x - so[2]; if (gx < 0 || gx >= se[2] - so[2]) continue;
                         size_t k = ((size_t)z * W + y) * W + x;
-                        sbuf[((size_t)gz * shard + gy) * shard + gx] = ctu[k] ? (uint8_t)(ph[k] * 255.f + 0.5f) : 0;
+                        sbuf[((size_t)gz * shard + gy) * shard + gx] = pu[k];
                     }
                 }
             }

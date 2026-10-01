@@ -2323,6 +2323,28 @@ extern "C" void nn_srste24(float *g, const float *w, int co, int ci, int taps, f
     size_t ng = (size_t)co * (ci / 4) * taps; srste24_k<<<nblk(ng, 256), 256>>>(g, w, co, ci, taps, lambda); KCHECK();
 }
 extern "C" void nn_sigmoid(const float *x, size_t n, float *y) { sigm_k<<<nblk(n, 256), 256>>>(x, y, n); KCHECK(); }
+/* inference input straight from the uint8 CT window: channel 0 = (ct - mean) * isd, 1 = 0, 2/3 = unit radial (y, x) vector
+   from the scroll axis (dyo[z] = window y origin - axis y at slice z, likewise dxo); written as the 16-bit storage type
+   (h16: fp16 with nn_set_f16, else bf16) or fp32. Output: recto probability * 255 where the CT is nonzero, else 0. */
+template <typename HT> __global__ void pred_in_k(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, HT *x) {
+    size_t w3 = (size_t)W * W * W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= w3) return;
+    int xx = (int)(i % W), y = (int)((i / W) % W), z = (int)(i / ((size_t)W * W));
+    float dy = dyo[z] + (float)y, dx = dxo[z] + (float)xx, inv = axis ? 1.f / (sqrtf(dy * dy + dx * dx) + 1e-6f) : 0.f;
+    x[i] = f2h<HT>(((float)ct[i] - mean) * isd); x[w3 + i] = f2h<HT>(0.f); x[2 * w3 + i] = f2h<HT>(dy * inv); x[3 * w3 + i] = f2h<HT>(dx * inv);
+}
+extern "C" void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16) {
+    size_t n = (size_t)W * W * W;
+    if (!h16) pred_in_k<float><<<nblk(n, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, (float *)x);
+    else if (g_h16) pred_in_k<f16><<<nblk(n, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, (f16 *)x);
+    else pred_in_k<bf16><<<nblk(n, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, (bf16 *)x);
+    KCHECK();
+}
+__global__ void pred_out_k(const float *lg, const uint8_t *ct, size_t n, uint8_t *out) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) out[i] = ct[i] ? (uint8_t)(255.f / (1.f + __expf(-lg[i])) + 0.5f) : 0;
+}
+extern "C" void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out) { pred_out_k<<<nblk(n, 256), 256>>>(lg, ct, n, out); KCHECK(); }
 
 /* ================= trilinear 2x (align_corners = false) =================
    out[2m] = 0.75 in[m] + 0.25 in[m-1], out[2m+1] = 0.75 in[m] + 0.25 in[m+1], neighbours clamped. */

@@ -210,6 +210,14 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   to run-to-run noise. Per-process peak (fp16 mode, recompute 1, batch 1): 192^3 2.8 GB, 256^3 6.4 -> 5.9 GB,
   320^3 12.3 GB before the trim. Memory is ~350 B/voxel: at level 0, a1+a2 of enc0 and dec0 128 B, the gradient
   buffers A+B+gout 128 B, fp32 logits 16 B, input 8 B, logit gradient 8 B; the lower levels add ~70 B.
+- Intermittent sampler stall (1 run in ~10 on the kaggle source, two workers at 100% CPU, the trainer waiting
+  forever): the lazy per-level opens in `sources.c` (`source_ct`, `source_tgt`, `source_region`) were called from every
+  worker without a lock; two workers racing on the same level both opened it and a failed open under the race marked
+  the level absent for the run, after which every draw was impossible. One mutex around the opens: 0 stalls in 40 runs.
+- Inference: the CT window goes up as uint8 and the input channels (z-score, radial unit vector) are built on the
+  device in the 16-bit storage type (`nn_pred_input`, read in place by `unet_forward_x`); the recto probability comes
+  back as uint8 (`nn_pred_output`). Output identical to the host path. Default window 288 (halo 16: 70% of the voxels
+  are interior against 51% at 160; 512^3 box at level 1: 5.4 -> 3.8 s on the shared GPU; metrics equal within noise).
 - A patch must fit the sources: the sampler now warns after 4M consecutive impossible draws (region, holdout box
   or level too small for P) instead of spinning silently, and stops after 20 consecutive read failures (the
   failure counter was reset on every error before, so an I/O error retried forever).

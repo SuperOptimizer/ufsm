@@ -202,6 +202,10 @@ void nn_ema(float *ema, const float *p, size_t n, float decay);
 double nn_sum(const float *x, size_t n, float *scratch);     /* scratch: >= 4096 floats */
 double nn_sumsq(const float *x, size_t n, float *scratch);
 void nn_sigmoid(const float *x, size_t n, float *y);
+/* inference: network input from the uint8 CT window on the device (z-score + radial channels; 16-bit storage when h16),
+   and recto probability * 255 (0 where the CT is 0) from the logits */
+void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16);
+void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out);
 
 #ifdef __cplusplus
 }
