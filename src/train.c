@@ -95,8 +95,8 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     d->lg = lg;
     if (d->lean && train) {   /* the logit gradient lives in the model's gradient buffer B (built by the forward above) */
         const size_t gb = (size_t)B * NCH * P * P * P * (g_g16 ? 2 : 4);
-        d->gl = unet_grad_scratch(d->u, gb);
-        if (!d->gl) { fprintf(stderr, "lean: gradient buffer too small for the logit gradient\n"); abort(); }
+        void *pg = unet_logit_grad_scratch(d->u, gb);
+        if (pg) d->gl = pg;   /* (re)built model: its scratch moved; otherwise the separate buffer allocated at setup */
     }
     shape5 os = unet_out_shape(d->u, xs);
     int prof = ufsm_env_on("UFSM_PROF");
@@ -228,9 +228,10 @@ int cmd_train(int argc, char **argv) {
                    gradient / targets / mask (and the input if copied) in B */
                 {1, 1, 0, 0, "default"}, {1, 1, 1, 0, "MX-fp8 gradients (UFSM_GRAD_MX8=1)"},
                 {2, 1, 1, 0, "MX-fp8 gradients, chunked"}, {2, 2, 1, 0, "MX-fp8 gradients, chunked, recompute 2"},
-                {2, 1, 1, 1, "MX-fp8 gradients, chunked, lean"}, {2, 2, 1, 1, "MX-fp8 gradients, chunked, recompute 2, lean"},
+                {2, 1, 1, 1, "MX-fp8 gradients, chunked, lean"}, {2, 1, 1, 2, "MX-fp8 gradients, chunked, lean 2 (no gradient buffer B)"},
+                {2, 2, 1, 1, "MX-fp8 gradients, chunked, recompute 2, lean"}, {2, 2, 1, 2, "MX-fp8 gradients, chunked, recompute 2, lean 2"},
                 {2, 1, 0, 0, "chunked up-part gradient (UFSM_CHUNK_UP=2)"}, {2, 2, 0, 0, "chunked up-part gradient + recompute 2"},
-                {2, 2, 0, 1, "chunked up-part gradient + recompute 2, lean"}};
+                {2, 2, 0, 1, "chunked up-part gradient + recompute 2, lean"}, {2, 2, 0, 2, "chunked up-part gradient + recompute 2, lean 2"}};
             const int nc = (int)(sizeof cand / sizeof cand[0]);
             size_t fmin = (size_t)-1;
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); size_t f = nn_mem_free(); if (f < fmin) fmin = f; }
@@ -252,32 +253,39 @@ int cmd_train(int argc, char **argv) {
             lean = cand[pick].lean;
         }
     }
-    for (int g = 0; g < ng; g++) {   /* per-GPU batch buffers (lean: one, shared by both slots, inside the model's gradient buffer B
-                                        when it is large enough: [logit gradient | targets | mask | input if the forward copies it]) */
+    for (int g = 0; g < ng; g++) {   /* per-GPU batch buffers. lean: one, shared by both slots, inside the model's gradient buffers when
+                                        they are large enough: [targets | mask | input if the forward copies it] in B (lean 1: after the
+                                        logit gradient) or in gout[0] (lean 2); the logit gradient in B (lean 1) or after the logits in A */
         gpu_state *d = &G[g];
         nn_init(d->dev);
         char *bs = nullptr;
         const size_t a256 = 255, glb = ((size_t)B * NCH * p3 * (g_g16 ? 2 : 4) + a256) & ~a256, tbb = ((size_t)B * NCH * p3 + a256) & ~a256,
                      mbb = ((size_t)B * p3 + a256) & ~a256, xbb = ((size_t)B * 4 * p3 * xbytes() + a256) & ~a256;
         const int xin_b = lean && unet_input_converted() && g_xfmt;
+        size_t goff = 0;
+        int xin_in = 0;
+        d->gl = nullptr;
         if (lean) {
             unet_build(d->u, (shape5){B, cfg.cin, P, P, P}, 1);
-            bs = unet_grad_scratch(d->u, glb + tbb + mbb + (xin_b ? xbb : 0));
-            if (!bs) bs = unet_grad_scratch(d->u, glb);   /* only the logit gradient fits */
+            goff = unet_lean_nob(d->u) ? 0 : glb;
+            if (xin_b && (bs = unet_grad_scratch(d->u, goff + tbb + mbb + xbb))) xin_in = 1;
+            else bs = unet_grad_scratch(d->u, goff + tbb + mbb);
+            d->gl = unet_logit_grad_scratch(d->u, glb);
         }
         for (int i = 0; i < 2; i++) {
             if (i && lean) { d->xb[1] = d->xb[0]; d->tb[1] = d->tb[0]; d->mb[1] = d->mb[0]; d->wb[1] = d->wb[0]; }
-            else if (bs && unet_grad_scratch(d->u, glb + tbb + mbb)) {
-                d->tb[i] = (uint8_t *)(bs + glb); d->mb[i] = (uint8_t *)(bs + glb + tbb);
-                d->xb[i] = xin_b && unet_grad_scratch(d->u, glb + tbb + mbb + xbb) ? (void *)(bs + glb + tbb + mbb) : nn_malloc((size_t)B * 4 * p3 * xbytes());
+            else if (bs) {
+                d->tb[i] = (uint8_t *)(bs + goff); d->mb[i] = (uint8_t *)(bs + goff + tbb);
+                d->xb[i] = xin_in ? (void *)(bs + goff + tbb + mbb) : nn_malloc((size_t)B * 4 * p3 * xbytes());
                 d->wb[i] = nn_malloc((size_t)B * NCH);
             }
             else { d->xb[i] = nn_malloc((size_t)B * 4 * p3 * xbytes()); d->tb[i] = nn_malloc((size_t)B * NCH * p3); d->mb[i] = nn_malloc((size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * NCH); }
             d->ev_up[i] = nn_event_create();
         }
-        if (lean && g == 0) fprintf(stderr, "lean: batch buffers %s\n", bs && d->tb[0] == (void *)(bs + glb) ? (d->xb[0] == (void *)(bs + glb + tbb + mbb) ? "and input inside the gradient buffer" : "inside the gradient buffer, input separate") : "separate");
+        if (lean && g == 0) fprintf(stderr, "lean %d: batch buffers %s, logit gradient %s\n", lean, !bs ? "separate" : xin_in ? "and input inside the gradient buffers" : "inside the gradient buffers, input separate", d->gl ? "inside" : "separate");
         d->ev_done = nn_event_create(); nn_event_record(d->ev_done, 0); d->pending = nullptr; select_buf(d, 0);
-        d->gl = lean ? nullptr : nn_malloc((size_t)B * NCH * p3 * (g_g16 ? 2 : 4)); d->scratch = nn_malloc(nn_loss_scratch((shape5){B, NCH, P, P, P}) + 64);
+        if (!d->gl) d->gl = nn_malloc((size_t)B * NCH * p3 * (g_g16 ? 2 : 4));
+        d->scratch = nn_malloc(nn_loss_scratch((shape5){B, NCH, P, P, P}) + 64);
         d->lean = lean;
         const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
     }

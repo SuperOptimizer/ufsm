@@ -81,7 +81,11 @@ struct unet {
     float *gskip[UNET_MAXLEV], *gout[UNET_MAXLEV];
     float *gn_scratch, *conv_scratch, *red_scratch;
     size_t conv_scratch_n, act_bytes, grad_bytes;
-    size_t gB_bytes;                         /* capacity of the shared gradient buffer B */
+    size_t gB_bytes, gA_bytes;               /* capacity of the shared gradient buffers B and A */
+    size_t gB_cap[UNET_MAXLEV];              /* capacity of gB[i] (noB: gout[i]) */
+    int rc_ok; size_t rc_cap;                /* lean 2: a transient in gB[level] is allowed now; capacity of the transient's buffer */
+    int nob;                                 /* lean 2: no buffer B; a block's own gout / gskip is its B (in-place GroupNorm backward) */
+    size_t logits_bytes;                     /* lean: logits at the start of A, the 16-bit logit gradient after them */
     float *rc_extra; size_t rc_extra_bytes;  /* training transient for the upsampled decoder input when B is too small */
 };
 
@@ -342,17 +346,31 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 size_t e = gmx ? nn_mx8_bytes(sa) : shape_numel(sa);
                 if (e > na) na = e;
             }
-            float *A = gmx ? dalloc_grad_mx(u, na) : dalloc_grad(u, na), *B = gmx ? dalloc_grad_mx(u, nbb) : dalloc_grad(u, nbb);
-            u->gB_bytes = gmx ? nbb : nbb * (GBF ? 2 : 4);
+            u->nob = lean() >= 2 && chunk;   /* lean 2: no B (needs the chunked up-part gradient: the up part goes through gout[i]) */
+            float *A = gmx ? dalloc_grad_mx(u, na) : dalloc_grad(u, na), *B = u->nob ? nullptr : gmx ? dalloc_grad_mx(u, nbb) : dalloc_grad(u, nbb);
+            u->gB_bytes = u->nob ? 0 : gmx ? nbb : nbb * (GBF ? 2 : 4);
+            u->gA_bytes = gmx ? na : na * (GBF ? 2 : 4);
             /* lean mode: the fp32 logits live in A (dead from the end of the forward until the first block backward, the loss
                reads them before; A is unregistered for the plane-major fp32 writes of the head). Costs: logits are not
                readable after the backward (the trainer's non-finite diagnosis then reports post-backward values) */
             if (lean() && (gmx ? na : na * (GBF ? 2 : 4)) >= shape_numel(os) * 4) u->logits = A;
+            u->logits_bytes = shape_numel(os) * 4;
             for (int i = 0; i < L; i++) {
                 shape5 so = u->ls[i]; so.c = w[i];
-                u->gA[i] = A; u->gB[i] = B;
-                u->gout[i] = gmx ? dalloc_grad_mx(u, nn_mx8_bytes(so)) : dalloc_grad(u, shape_numel(so));
+                size_t gob = gmx ? nn_mx8_bytes(so) : shape_numel(so) * (GBF ? 2 : 4);
+                if (u->nob && i < L - 1) { shape5 up = u->ls[i]; up.c = w[i + 1]; if (act_bytes_of(up) > gob) gob = act_bytes_of(up); }   /* also holds the MX up transient (level 1: 34 vs 33 B) */
+                u->gA[i] = A;
+                u->gout[i] = gmx ? dalloc_grad_mx(u, gob) : dalloc_grad(u, gob / (GBF ? 2 : 4) + 1);
                 u->gskip[i] = i < L - 1 ? u->gout[i] : nullptr;
+                if (u->nob) { u->gB[i] = u->gout[i]; u->gB_cap[i] = gob; }   /* no B: the level's own gradient buffer serves as B */
+                else { u->gB[i] = B; u->gB_cap[i] = u->gB_bytes; }
+            }
+            if (u->nob) u->gB_bytes = u->gB_cap[0];
+            if (act_mx8() && recompute()) {   /* the MX weight-gradient transient of the decoder up part where it does not fit its level's
+                                                 buffer: allocated now so the dry build (memory planner) counts it */
+                shape5 m = u->ls[0]; m.c = 0;
+                for (int i = 0; i < L - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > u->gB_cap[i] && act_bytes_of(c) > act_bytes_of(m)) m = c; }
+                if (m.c) { u->rc_extra = dalloc_act_s(u, m); u->rc_extra_bytes = act_bytes_of(m); }
             }
         } else
         for (int i = 0; i < L; i++) {
@@ -387,6 +405,14 @@ void unet_build(unet *u, shape5 xs, int train) {
 int unet_input_converted(void) { return act_mx8() && grad_mx8(); }   /* the 16-bit network input is copied into MX storage at the forward's start */
 /* lean mode: the gradient buffer B as scratch for the trainer's 16-bit logit gradient (free from the end of the forward until
    the head backward has read it); nullptr when not built for training, not lean, or too small */
+/* lean: where the trainer's 16-bit logit gradient goes: lean 2 after the logits in A (B is gout[0], which the head backward
+   writes while reading the logit gradient), lean 1 at the start of B; nullptr if it does not fit */
+void *unet_logit_grad_scratch(unet *u, size_t bytes) {
+    if (!(u->built && u->train && lean())) return nullptr;
+    if (u->nob) { const size_t off = (u->logits_bytes + 255) & ~(size_t)255; return u->logits == u->gA[0] && u->gA_bytes >= off + bytes ? (void *)((char *)u->gA[0] + off) : nullptr; }
+    return u->gB[0] && u->gB_bytes >= bytes ? (void *)u->gB[0] : nullptr;
+}
+int unet_lean_nob(const unet *u) { return u->nob; }
 void *unet_grad_scratch(unet *u, size_t bytes) { return u->built && u->train && lean() && u->gB[0] && u->gB_bytes >= bytes ? (void *)u->gB[0] : nullptr; }
 /* device bytes of the training activations / gradients at input shape xs under the current storage modes, without allocating
    (dry build); the model is left unbuilt */
@@ -436,11 +462,12 @@ static void rc_fail(const char *what) { fprintf(stderr, "unet: recompute mode: %
 static int g_in_bwd = 0;   /* inside unet_backward_x (lean mode: B holds the trainer's batch until then) */
 static float *rc_tmp(unet *u, int level, shape5 s, int *reg) {
     if (u->train && lean() && !g_in_bwd) rc_fail("lean mode: a forward transient in the gradient buffer (it holds the batch)");
-    if (u->train && act_bytes_of(s) > u->gB_bytes) {   /* chunk mode left B too small for this (fp8 / MX) transient */
+    if (u->train && u->nob && !u->rc_ok) rc_fail("lean 2: a transient while the level's gradient buffer is live");
+    if (u->train && act_bytes_of(s) > u->gB_cap[level]) {   /* chunk mode left B too small for this (fp8 / MX) transient */
         if (act_bytes_of(s) > u->rc_extra_bytes) {
             if (u->rc_extra) { nn_storage_forget(u->rc_extra); nn_free(u->rc_extra); u->act_bytes -= u->rc_extra_bytes; }
-            const int *w = u->cfg.widths; shape5 m = u->ls[0]; m.c = 0;
-            for (int i = 0; i < u->cfg.nlev - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > act_bytes_of(m)) m = c; }
+            const int *w = u->cfg.widths; shape5 m = u->ls[0]; m.c = 0;   /* the largest transient that does not fit its level's buffer */
+            for (int i = 0; i < u->cfg.nlev - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > u->gB_cap[i] && act_bytes_of(c) > act_bytes_of(m)) m = c; }
             u->rc_extra = dalloc_act_s(u, m); u->rc_extra_bytes = act_bytes_of(m);
         }
         *reg = 0;
@@ -453,11 +480,12 @@ static float *rc_tmp(unet *u, int level, shape5 s, int *reg) {
     }
     float *p = u->train ? u->gB[level] : u->cat[0];
     *reg = 0;
+    u->rc_cap = u->train ? u->gB_cap[level] : 0;
     if (act_mx8() && nn_storage(p) != act_dt()) { *reg = 1 + nn_storage(p); nn_set_storage(p, nn_mx_bytes(s, act_dt()), act_dt()); }   /* gradient buffer (16-bit or MX-fp8) used as activation storage for now */
     return p;
 }
 /* reg: 0 nothing changed, 1 the buffer was unregistered, 1 + dt it was registered as dt (an MX-fp8 gradient buffer under mx4 activations) */
-static void rc_done(unet *u, float *p, int reg) { if (reg == 1) nn_storage_forget(p); else if (reg > 1) nn_set_storage(p, u->gB_bytes, reg - 1); }
+static void rc_done(unet *u, float *p, int reg) { if (reg == 1) nn_storage_forget(p); else if (reg > 1) nn_set_storage(p, u->rc_cap, reg - 1); }
 static float *rc_up(unet *u, block *b, int level, int *reg) {
     const block *xb = (const block *)b->xb;
     shape5 us = b->xs; us.c = b->c_split;
@@ -593,7 +621,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
 static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx2) {
     int G = G_of(u, b->c1.cout);
     size_t n = shape_numel(b->ys);
-    float *A = u->gA[level], *B = u->gB[level], *t1 = u->t1[level], *t2 = u->t2[level];
+    float *A = u->gA[level], *B = u->nob ? (float *)gy : u->gB[level], *t1 = u->t1[level], *t2 = u->t2[level];   /* no B: in place on gy */
     float *g = u->g;
     if (recompute_a1()) {   /* a1 was overwritten by later blocks: re-run conv1 (same kernel and precision as the forward) */
         nn_set_conv(0);
@@ -625,25 +653,36 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     }
     nn_set_conv(0);
     if (b->xb) {   /* recompute: weight gradient with the upsampled part rebuilt into B (free until backward-data below) */
+        u->rc_ok = 1;   /* gy / B consumed: the level's gradient buffer is free until the skip gradient below */
         if (dec_conv1(u, b, level, nullptr, 0, nullptr, nullptr, A, g + b->c1.w, g + b->c1.b)) rc_fail("decoder conv1 weight gradient");
+        u->rc_ok = 0;
         if (chunk_up()) {   /* skip gradient, then the up-part gradient in chunks through B, upsample-backwarded into gout[level + 1] */
             const block *xb = (const block *)b->xb;
             const size_t per_c = shape_numel(b->ys) / b->ys.c * (GBF ? 2 : 4);
-            int cs = (int)(u->gB_bytes / per_c); if (cs > b->c_split) cs = b->c_split;
+            const size_t cap = u->gB_cap[level];
+            int cs = (int)(cap / per_c); if (cs > b->c_split) cs = b->c_split;
             if (grad_mx8()) {   /* MX-fp8 chunks: 16 channels or whole 32-channel blocks that fit B */
                 shape5 t = b->xs; cs = 16;
-                for (int c = 32; c <= b->c_split; c += 32) { t.c = c; if (nn_mx8_bytes(t) <= u->gB_bytes) cs = c; }
-                t.c = cs; if (nn_mx8_bytes(t) > u->gB_bytes) rc_fail("MX chunk does not fit the gradient buffer");
+                for (int c = 32; c <= b->c_split; c += 32) { t.c = c; if (nn_mx8_bytes(t) <= cap) cs = c; }
+                t.c = cs; if (nn_mx8_bytes(t) > cap) rc_fail("MX chunk does not fit the gradient buffer");
             }
-            int r; PROF(1, r = nn_conv3d_bwd_data_range(A, b->ys, P(u, b->c1.w), b->xs, b->c_split, b->xs.c - b->c_split, gx2, u->conv_scratch));
-            if (r) rc_fail("skip backward-data");
-            { shape5 s2 = b->xs; s2.c = b->xs.c - b->c_split; FQG(gx2, s2); }
+            if (cs < 1) rc_fail("chunk does not fit the gradient buffer");
+            int r;
+            if (!u->nob) {   /* skip gradient first (no B: last, it lands in the buffer the chunks pass through) */
+                PROF(1, r = nn_conv3d_bwd_data_range(A, b->ys, P(u, b->c1.w), b->xs, b->c_split, b->xs.c - b->c_split, gx2, u->conv_scratch));
+                if (r) rc_fail("skip backward-data");
+                { shape5 s2 = b->xs; s2.c = b->xs.c - b->c_split; FQG(gx2, s2); }
+            }
             for (int c0 = 0; c0 < b->c_split; c0 += cs) {
                 const int nc = b->c_split - c0 < cs ? b->c_split - c0 : cs;
                 PROF(1, r = nn_conv3d_bwd_data_range(A, b->ys, P(u, b->c1.w), b->xs, c0, nc, B, u->conv_scratch));
                 if (r) rc_fail("up-part backward-data");
                 shape5 cs5 = xb->ys; cs5.c = nc;
                 PROF(5, nn_up2_bwd_into(B, cs5, u->gout[level + 1], b->c_split, c0));
+            }
+            if (u->nob) {
+                PROF(1, r = nn_conv3d_bwd_data_range(A, b->ys, P(u, b->c1.w), b->xs, b->c_split, b->xs.c - b->c_split, gx2, u->conv_scratch));
+                if (r) rc_fail("skip backward-data");
             }
             nn_set_conv(-1);
             return nullptr;   /* gout[level + 1] already written */
@@ -691,15 +730,19 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     float *g = u->g;
     /* head; lean mode: the 16-bit logit gradient may sit in B (unet_grad_scratch), whose MX-fp8 registration must not make the
        head ops read it as MX */
-    int ghide = 0;
-    if (u->gB[0] && (const char *)glogits >= (const char *)u->gB[0] && (const char *)glogits < (const char *)u->gB[0] + u->gB_bytes) { ghide = nn_storage(u->gB[0]); if (ghide) nn_storage_forget(u->gB[0]); }
+    int ghide = 0; float *gbuf = nullptr; size_t gcap = 0;
+    {   /* lean: the logit gradient sits in B (lean 1) or after the logits in A (lean 2) */
+        float *cand[2] = {u->gB[0], u->gA[0]}; size_t caps[2] = {u->gB_bytes, u->gA_bytes};
+        for (int k = 0; k < 2 && !gbuf; k++) if (cand[k] && (const char *)glogits >= (const char *)cand[k] && (const char *)glogits < (const char *)cand[k] + caps[k]) { gbuf = cand[k]; gcap = caps[k]; }
+        if (gbuf) { ghide = nn_storage(gbuf); if (ghide) nn_storage_forget(gbuf); }
+    }
     block *d0 = &u->dec[0];
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
     nn_set_layer(10);
     if (recompute()) { nn_gn_t gg = gn_out(u, d0); int r; PROF(2, r = nn_conv3d_bwd_weight_x(d0->a2, &gg, nullptr, nullptr, 0, 0, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b)); if (r) rc_fail("head weight gradient"); }
     else PROF(2, nn_conv3d_bwd_weight(d0->s2, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b));
     PROF(1, nn_conv3d_bwd_data(glogits, os, P(u, u->head.w), d0->ys, 1, 1, u->gout[0], u->conv_scratch));
-    if (ghide) dstorage(u->gB[0], u->gB_bytes, ghide);
+    if (ghide) dstorage(gbuf, gcap, ghide);
     FQG(u->gout[0], d0->ys);
     /* decoder, bottom-up in the graph = i from 0 to L-2 */
     for (int i = 0; i < L - 1; i++) {
