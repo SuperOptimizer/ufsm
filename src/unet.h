@@ -87,7 +87,8 @@ void unet_set_recompute(int on);
 void unet_set_lean(int on);
 void *unet_grad_scratch(unet *u, size_t bytes);
 void unet_build(unet *u, shape5 xs, int train);   /* build the buffers for xs now (the first forward would) */
-int unet_input_converted(void);   /* 1: the forward copies the 16-bit input into MX storage first (it may then live in scratch) */   /* lean training build: B as scratch for the 16-bit logit gradient (else nullptr) */       /* training: the fp32 logits share the gradient buffer A (env UFSM_LEAN=1; set by train --mem auto for the large-window modes) */
+int unet_input_converted(void);
+int unet_act_mx(void);   /* 1: MX activation storage (MX-fp8 gradients need it) */   /* 1: the forward copies the 16-bit input into MX storage first (it may then live in scratch) */   /* lean training build: B as scratch for the 16-bit logit gradient (else nullptr) */       /* training: the fp32 logits share the gradient buffer A (env UFSM_LEAN=1; set by train --mem auto for the large-window modes) */
 void unet_set_chunk_up(int on);   /* chunked up-part gradient: 0 off, 1 (default) 16-bit storage only, 2 also under MX storage */
 size_t unet_train_bytes(unet *u, shape5 xs);   /* training activation + gradient bytes at xs for the current modes (dry build) */
 size_t unet_grad_bytes(const unet *u);   /* the activation-gradient part of unet_activation_bytes */

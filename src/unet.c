@@ -384,6 +384,7 @@ size_t unet_activation_bytes(const unet *u) { return u->act_bytes; }
 void unet_build(unet *u, shape5 xs, int train) {
     if (!u->built || memcmp(&u->xs, &xs, sizeof xs) || (train && !u->train) || u->mode != UMODE()) build_acts(u, xs, train);
 }
+int unet_act_mx(void) { return act_mx8(); }   /* MX activation storage (fp8 or fp4) */
 int unet_input_converted(void) { return act_mx8() && grad_mx8(); }   /* the 16-bit network input is copied into MX storage at the forward's start */
 /* lean mode: the gradient buffer B as scratch for the trainer's 16-bit logit gradient (free from the end of the forward until
    the head backward has read it); nullptr when not built for training, not lean, or too small */
