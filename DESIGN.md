@@ -343,6 +343,13 @@ Where the rest would come from:
 - r10 (2026-10-01 13:10): configs/all2.json (17 sources, full chunk prefetch, 1.1 um scan from level 2), down_norm,
   Muon lr 0.01, `--sched wsd --cooldown 0.2`, 200k steps at 128^3, effective batch 2 on both GPUs. Scored against
   the r8 baseline on all 17 held-out boxes when done.
+- ANVIL II (modded-nanogpt record #90 / hyperstition.cc; `--opt anvil`, nn_anvil_batch): twin-rail velocity (fast
+  rail beta 0.85 -> 0.93 over 240 steps, then 0.85 with the slow 0.98 rail blended 0.4385 / 0.5615 from step 514),
+  Nesterov lookahead 0.95, normalisation by 1.05 x Frobenius, six quintic spectral maps with the record's
+  coefficients, per-row energy equalisation at constant norm (lane EMA 0.9), sign-aligned weight decay (default
+  2.25 x lr), the same sqrt(max(1, Co/K)) multiplier; AdamW on biases, norms and the head. The 600-step kaggle smoke
+  run trails Muon (val 0.609 vs 0.548), expected before the slow rail engages; 6000-step yardsticks at (lr, wd) =
+  (0.023, 2.25), (0.01, 2.25), (0.01, 0.1) against Muon's 0.307 are running.
 - Prefetch and training levels: scans finer than 1.8 um (PHerc0139 1.129 um) get `min_level` 1 from make_sources
   (their level 0 alone would be 1.5M chunks); the sampler and the prefetch honour it.
 
