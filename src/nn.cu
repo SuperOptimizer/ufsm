@@ -500,31 +500,36 @@ __device__ __forceinline__ void slab_range(size_t S, int slab, size_t *lo, size_
 }
 /* forward tile: FW_TZ output planes x 8 rows x 16 columns per block, one warp per (plane, row pair) */
 #define FW_TZ 2   /* 4 (512 threads) was tried: MT=4 spills, net slower */
+#define FW_TZ_MT1 4   /* default z tile for MT = 1 (fw_tz): -14% on the level-0 16-channel convs against 2; 6 is slower (occupancy) */
 #define FW_NT (FW_TZ * 128)
 #define FW_T ((FW_TZ + 2) * 10 * 18)
 #define FW_R 4   /* output rows per warp (MT = 4 keeps 2: accumulator registers) */
 __host__ __device__ constexpr int fw_rows(int MT) { return MT == 4 ? 2 : FW_R; }
 __host__ __device__ constexpr int fw_nth(int MT) { return 32 * FW_TZ * 8 / fw_rows(MT); }
 __host__ __device__ constexpr int fw_blocks(int MT) { return fw_nth(MT) <= 128 ? 3 : (MT == 1 ? 3 : 2); }
+/* deeper z tiles (TZ output planes per block): less halo restaging and fewer weight loads per output; used for MT = 1 */
+__host__ __device__ constexpr int fw_nth_z(int MT, int FZ) { return 32 * FZ * 8 / fw_rows(MT); }
+__host__ __device__ constexpr int fw_blocks_z(int MT, int FZ) { return FZ == FW_TZ ? fw_blocks(MT) : (fw_nth_z(MT, FZ) <= 256 ? 2 : 1); }
 /* OP = 1 (prec 4, HT = bf16 or f16 storage): fp16 operands with fp16 accumulation per tap group. The tile is staged in the storage
    type (exact) while tracking the block amax, then converted in place to fp16 scaled by 2^-ex (amax < 16); weights are
    fp16 scaled per output channel (wsc, amax < 16), so a 144-term group sum stays below 36864 < 65504. Each group's fp16
    sum is folded into the fp32 accumulators times 2^ex * wsc[co]. */
-template <int MT, typename TI, typename TO, int S2B, typename HT, int OP = 0>
-__global__ void __launch_bounds__(fw_nth(MT), fw_blocks(MT)) conv_fwd_tc_k(const TI *__restrict__ x, const HT *__restrict__ wp, const float *__restrict__ b, TO *__restrict__ y,
+template <int MT, typename TI, typename TO, int S2B, typename HT, int OP = 0, int FZ = FW_TZ>
+__global__ void __launch_bounds__(fw_nth_z(MT, FZ), fw_blocks_z(MT, FZ)) conv_fwd_tc_k(const TI *__restrict__ x, const HT *__restrict__ wp, const float *__restrict__ b, TO *__restrict__ y,
                               int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, gnp_t gp, double *__restrict__ osum, int Go, split_t sp, tapset_t ts,
                               const float *__restrict__ wsc = nullptr) {
     constexpr int BM = MT * 16, TG = 9, WDB = MT <= 2;  /* WDB: double-buffered weight groups */
-    constexpr int R = fw_rows(MT), NTH = fw_nth(MT);    /* output rows per warp, threads per block */
+    constexpr int R = fw_rows(MT), NTH = fw_nth_z(MT, FZ);    /* output rows per warp, threads per block */
+    constexpr int TT_ = (FZ + 2) * 10 * 18;                     /* staged positions */
     extern __shared__ __align__(32) unsigned char smem_raw[];
-    HT *sx = (HT *)smem_raw;                       /* [FW_T pos][TC_CI ci] */
-    HT *wa = sx + TC_CI * FW_T;                      /* [2 if WDB][TG tap][BM co][TC_CI ci] */
+    HT *sx = (HT *)smem_raw;                       /* [TT_ pos][TC_CI ci] */
+    HT *wa = sx + TC_CI * TT_;                      /* [2 if WDB][TG tap][BM co][TC_CI ci] */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int wz = warp / (8 / R), wr = (warp % (8 / R)) * R;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * TC_TY;
     int bz = blockIdx.z;
-    const int nzt = (D + FW_TZ - 1) / FW_TZ;
-    const int oz0 = (bz % nzt) * FW_TZ; bz /= nzt;
+    const int nzt = (D + FZ - 1) / FZ;
+    const int oz0 = (bz % nzt) * FZ; bz /= nzt;
     const int nmt = Cop / BM;
     const int co0 = (bz % nmt) * BM; const int n = bz / nmt;
     float acc[MT][R][2][4];     /* [m-tile][row][n-tile][c0..c3] */
@@ -570,7 +575,7 @@ __global__ void __launch_bounds__(fw_nth(MT), fw_blocks(MT)) conv_fwd_tc_k(const
                                                        : x + ((size_t)n * (sp.x2 ? sp.c_split : Ci) + (cok ? ci : 0)) * (upc ? plane >> 3 : plane);
             float ga = 1.f, gb = 0.f;
             const bool gtr = cok && in_gn(gp, sp, n, ci, Ci, &ga, &gb);
-            for (int rr = threadIdx.x >> 4; rr < (FW_TZ + 2) * 10; rr += NTH / 16) {   /* (FW_TZ + 2) z-planes x 10 rows */
+            for (int rr = threadIdx.x >> 4; rr < (FZ + 2) * 10; rr += NTH / 16) {   /* (FZ + 2) z-planes x 10 rows */
                 int iz = rr / 10, iy = rr - iz * 10;
                 int gz = oz0 - 1 + iz, gyy = oy0 - 1 + iy;
                 float v[18];
@@ -579,7 +584,11 @@ __global__ void __launch_bounds__(fw_nth(MT), fw_blocks(MT)) conv_fwd_tc_k(const
                     row18_up2(xc, gz, gyy, ox0, D, H, W, v);
 #pragma unroll
                     for (int j = 0; j < 18; j++) { HT hv = f2h<HT>(v[j]); dst[j * TC_CI] = hv; if (OP) amax = fmaxf(amax, fabsf(h2f<HT>(hv))); }
-                } else if (cok && gz >= 0 && gz < D && gyy >= 0 && gyy < H) {
+                }
+#ifdef TC_NOSTAGE
+                else if (cok) { for (int j = 0; j < 18; j++) dst[j * TC_CI] = f2h<HT>(0.25f); }   /* diagnostic: no global loads */
+#endif
+                else if (cok && gz >= 0 && gz < D && gyy >= 0 && gyy < H) {
                     const TI *xr = xc + ((size_t)gz * H + gyy) * W + ox0;
                     v[0] = ox0 > 0 ? ldv(xr - 1, 0) : 0.f;
                     if (xfull) {
@@ -612,7 +621,7 @@ __global__ void __launch_bounds__(fw_nth(MT), fw_blocks(MT)) conv_fwd_tc_k(const
             float am = __uint_as_float(s_amax);
             int ex = 0;
             if (am > 0.f) frexpf(am / 16.f, &ex);
-            tile_to_f16<HT>(sx, FW_T * TC_CI, ldexpf(1.f, -ex), NTH);
+            tile_to_f16<HT>(sx, TT_ * TC_CI, ldexpf(1.f, -ex), NTH);
             amax = ldexpf(1.f, ex);                            /* reuse: tile scale 2^ex for the fold */
         }
         __syncthreads();
@@ -639,6 +648,34 @@ __global__ void __launch_bounds__(fw_nth(MT), fw_blocks(MT)) conv_fwd_tc_k(const
 #pragma unroll
                 for (int m = 0; m < MT; m++) for (int r = 0; r < R; r++) for (int q = 0; q < 2; q++) hacc[OP ? m : 0][OP ? r : 0][q][0] = hacc[OP ? m : 0][OP ? r : 0][q][1] = 0u;
             }
+            if constexpr (!S2B) {   /* one kz plane per group: a warp's R rows x 3 ky span R + 2 input rows per kx, loaded once */
+                const int kz = t0 / 9;
+#pragma unroll
+                for (int kx = 0; kx < 3; kx++) {
+                    unsigned bf[R + 2][4];
+#pragma unroll
+                    for (int rr = 0; rr < R + 2; rr++) {
+                        int mat = lane >> 3, q = mat >> 1, kh = mat & 1;
+                        int pos = ((wz + kz) * 10 + wr + rr) * 18 + kx + q * 8 + (lane & 7);
+                        ldmatrix_x4(bf[rr], sx + pos * TC_CI + kh * 8);
+                    }
+#pragma unroll
+                    for (int ky = 0; ky < 3; ky++) {
+                        const int tt = ky * 3 + kx;
+#pragma unroll
+                        for (int m = 0; m < MT; m++) {
+                            unsigned af[4];
+                            int mat = lane >> 3;
+                            ldmatrix_x4(af, wg + (tt * BM + m * 16 + (mat & 1) * 8 + (lane & 7)) * TC_CI + (mat >> 1) * 8);
+#pragma unroll
+                            for (int r = 0; r < R; r++) {
+                                if (OP) { mma16816_h(hacc[OP ? m : 0][OP ? r : 0][0], af, bf[r + ky]); mma16816_h(hacc[OP ? m : 0][OP ? r : 0][1], af, bf[r + ky] + 2); }
+                                else { mma16816<HT>(acc[m][r][0], af, bf[r + ky]); mma16816<HT>(acc[m][r][1], af, bf[r + ky] + 2); }
+                            }
+                        }
+                    }
+                }
+            } else
 #pragma unroll
             for (int tt = 0; tt < TG; tt++) {
                 int tap = t0 + tt;
@@ -985,15 +1022,32 @@ static int cur_dev(void) { int d = 0; cudaGetDevice(&d); return d & 7; }
 static void *tc_wbuf(size_t n) { static void *buf[8]; static size_t cap[8]; int d = cur_dev(); if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); cudaMalloc(&buf[d], n * 2); cap[d] = n; } return buf[d]; }
 
 /* Tensor-core path for k=3, stride 1 (same spatial size). Returns 0 if handled. */
+/* output z planes per block: deeper tiles for MT = 1 (Cop = 16: the level-0 convs) amortise the halo and the weight loads
+   over more outputs (env UFSM_FW_TZ = 2 / 4 / 6 overrides) */
+static int fw_tz(int MT) {
+    static int e = -2;
+    if (e == -2) { const char *v = getenv("UFSM_FW_TZ"); e = v ? atoi(v) : -1; }
+    if (MT != 1) return FW_TZ;
+    if (e == 2 || e == 4 || e == 6) return e;
+    return FW_TZ_MT1;
+}
+static size_t fw_smem(int MT, int tz) { return (size_t)(TC_CI * (tz + 2) * 180 + (MT <= 2 ? 2 : 1) * 9 * MT * 16 * TC_CI) * 2; }
 template <typename TI, typename TO, int S2B, typename HT, int OP = 0>
 static void conv_fwd_tc_launch(int MT, dim3 grid, size_t smem, const TI *x, const HT *wp, const float *b, TO *y, shape5 xs, int cout, int Cop, int Cip, gnp_t gp, double *osum, int Go, split_t sp, tapset_t ts, const float *wsc = nullptr) {
-    static int attr_set[8][5];
-    if (!attr_set[cur_dev()][MT]) {
-        cudaFuncSetAttribute(MT == 1 ? (const void *)conv_fwd_tc_k<1, TI, TO, S2B, HT, OP> : MT == 2 ? (const void *)conv_fwd_tc_k<2, TI, TO, S2B, HT, OP> : (const void *)conv_fwd_tc_k<4, TI, TO, S2B, HT, OP>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
-        attr_set[cur_dev()][MT] = 1;
+    static int attr_set[8][8];
+    const int tz = fw_tz(MT);
+    const int ai = MT == 1 ? (tz == 4 ? 5 : tz == 6 ? 6 : 1) : MT;
+    if (!attr_set[cur_dev()][ai]) {
+        cudaFuncSetAttribute(MT == 1 ? (tz == 4 ? (const void *)conv_fwd_tc_k<1, TI, TO, S2B, HT, OP, 4> : tz == 6 ? (const void *)conv_fwd_tc_k<1, TI, TO, S2B, HT, OP, 6> : (const void *)conv_fwd_tc_k<1, TI, TO, S2B, HT, OP>)
+                             : MT == 2 ? (const void *)conv_fwd_tc_k<2, TI, TO, S2B, HT, OP> : (const void *)conv_fwd_tc_k<4, TI, TO, S2B, HT, OP>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+        attr_set[cur_dev()][ai] = 1;
     }
     switch (MT) {
-    case 1: conv_fwd_tc_k<1, TI, TO, S2B, HT, OP><<<grid, fw_nth(1), smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, ts, wsc); break;
+    case 1:
+        if (tz == 4) conv_fwd_tc_k<1, TI, TO, S2B, HT, OP, 4><<<grid, fw_nth_z(1, 4), smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, ts, wsc);
+        else if (tz == 6) conv_fwd_tc_k<1, TI, TO, S2B, HT, OP, 6><<<grid, fw_nth_z(1, 6), smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, ts, wsc);
+        else conv_fwd_tc_k<1, TI, TO, S2B, HT, OP><<<grid, fw_nth(1), smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, ts, wsc);
+        break;
     case 2: conv_fwd_tc_k<2, TI, TO, S2B, HT, OP><<<grid, fw_nth(2), smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, ts, wsc); break;
     default: conv_fwd_tc_k<4, TI, TO, S2B, HT, OP><<<grid, fw_nth(4), smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, ts, wsc); break;
     }
@@ -1008,8 +1062,9 @@ static int conv_fwd_tc_f16acc(const void *x, int xbf, shape5 xs, const float *w,
     prep_w16_k<<<Cop, 256>>>(w, (__half *)wp, wsc, cout, xs.c, Cop, Cip);
     int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : 1;
     int nmt = Cop / (MT * 16);
-    dim3 grid(nblk(xs.w, 16), nblk(xs.h, TC_TY), (unsigned)(nblk(xs.d, FW_TZ) * nmt * xs.n));
-    size_t smem = (size_t)(TC_CI * FW_T + (MT <= 2 ? 2 : 1) * 9 * MT * 16 * TC_CI) * 2;
+    const int tz = fw_tz(MT);
+    dim3 grid(nblk(xs.w, 16), nblk(xs.h, TC_TY), (unsigned)(nblk(xs.d, tz) * nmt * xs.n));
+    size_t smem = fw_smem(MT, tz);
     tapset_t none = {};
     const tapset_t &tt = ts ? *ts : none;
     if (ts) {
@@ -1030,8 +1085,9 @@ static int conv_fwd_tc_h(const void *x, int xbf, shape5 xs, const float *w, cons
     prep_w_k<HT><<<nblk(nw, 256), 256>>>(w, wp, cout, xs.c, Cop, Cip);
     int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : 1;   /* BM = 16 MT must divide Cop (e.g. Cop = 48 -> MT = 1) */
     int nmt = Cop / (MT * 16);
-    dim3 grid(nblk(xs.w, 16), nblk(xs.h, TC_TY), (unsigned)(nblk(xs.d, FW_TZ) * nmt * xs.n));
-    size_t smem = (size_t)(TC_CI * FW_T + (MT <= 2 ? 2 : 1) * 9 * MT * 16 * TC_CI) * 2;
+    const int tz = fw_tz(MT);
+    dim3 grid(nblk(xs.w, 16), nblk(xs.h, TC_TY), (unsigned)(nblk(xs.d, tz) * nmt * xs.n));
+    size_t smem = fw_smem(MT, tz);
     tapset_t none = {};
     if (ts) {
         if (xbf && ybf) conv_fwd_tc_launch<HT, HT, 1, HT>(MT, grid, smem, (const HT *)x, wp, b, (HT *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, *ts);
