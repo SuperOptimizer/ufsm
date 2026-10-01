@@ -395,11 +395,12 @@ static void *worker(void *arg) {
         pthread_mutex_unlock(&sp->mu);
         if (k < 0) break;
         batch *b = &sp->slots[k];
-        int fail = 0;
-        for (int i = 0; i < sp->cfg.B && !fail;) {
+        int fail = 0; unsigned spin = 0;
+        for (int i = 0; i < sp->cfg.B && !atomic_load(&sp->stop);) {
             int rc = draw(sp, b, i, &r, xtmp, ttmp, big);
-            if (rc == 0) i++;
-            else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); fail++; if (fail > 20) { atomic_store(&sp->stop, 1); } fail = 0; }
+            if (rc == 0) { i++; fail = 0; spin = 0; }
+            else if (rc > 0 && ++spin == (1u << 22)) fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d too large for the sources' regions, holdout boxes or levels?)\n", spin, sp->cfg.P);
+            else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->stop, 1); } }
         }
         pthread_mutex_lock(&sp->mu);
         sp->state[k] = READY;

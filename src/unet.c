@@ -185,7 +185,7 @@ static float *dalloc_act_s(unet *u, shape5 s) {
    (forward: before any gradient; backward: between dec conv2's backward-data and dec conv1's), or in inference one
    buffer sized for the largest level. */
 static int g_recompute = -1;
-static int recompute(void) { if (g_recompute < 0) { const char *e = getenv("UFSM_RECOMPUTE"); g_recompute = e ? atoi(e) : 0; } return nn_get_tf32() ? g_recompute : 0; }
+static int recompute(void) { if (g_recompute < 0) { const char *e = getenv("UFSM_RECOMPUTE"); g_recompute = e ? atoi(e) : 1; }   /* default: recompute 1 (a third less memory, same error) */ return nn_get_tf32() ? g_recompute : 0; }
 /* level 2: also no stored a1 in training. Every block's a1 lives in one shared buffer; backward re-runs conv1 into it
    (the GN statistics of a1 are kept from the forward) */
 static int recompute_a1(void) { return recompute() >= 2; }
