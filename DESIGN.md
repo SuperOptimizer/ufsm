@@ -265,7 +265,7 @@ Inference (one shared-buffer build, same storage):
 | kept upsample sources: dec1 s2, dec2 s2, enc3 s2 | 8 + 2 + 0.3 | |
 | input (16-bit, 4 ch) | 8 | |
 | logits fp32 | 4 x NCH | `predict` turns them into uint8 on the device |
-| total | ~127 + 4 NCH | |
+| total | ~125 + 4 NCH | |
 
 Where the rest would come from:
 - **Recompute 2:** saves 52 B/voxel in training (0.447 GB at 96^3 B2) for +7 ms per step. Every a1 shares one
