@@ -3,6 +3,7 @@
 #include "nn.h"
 #include "sample.h"
 #include "sources.h"
+#include "split.h"
 #include "unet.h"
 #include <math.h>
 #include <signal.h>
@@ -32,14 +33,33 @@ typedef struct {
     batch *pending;              /* host batch whose upload into buffer (cur ^ 1) is in flight */
     int lean;                    /* one batch buffer; logit gradient in the model's gradient buffer B */
     int cur;
+    int side;                    /* --split z: 0 = low z half, 1 = high z half of every window; -1 = whole windows */
 } gpu_state;
+/* --split z: both GPUs work on the same window, each on its z half plus g_h0 halo planes (depth g_Dl); the mask is zeroed on
+   the halo planes (from a pinned zero buffer) so each voxel counts once */
+static int g_Dl, g_h0; static uint8_t *g_zeros;
 
 static int g_xfmt = 0, g_g16 = 0;   /* input batches uploaded as 16-bit (1 fp16, 2 bf16); loss gradient written as 16-bit */
 static size_t xbytes(void) { return g_xfmt ? 2 : 4; }
 static const void *bx(const batch *b) { return g_xfmt ? (const void *)b->x16 : (const void *)b->x; }
 static void select_buf(gpu_state *d, int i) { d->cur = i; d->x = d->xb[i]; d->t = d->tb[i]; d->m = d->mb[i]; d->w = d->wb[i]; }
+/* this GPU's z slab of a batch: rows of the [rows][P][P][P] arrays, planes [z0, z0 + g_Dl); mask halo planes from zeros */
+static void upload_slab(gpu_state *d, const batch *b, int i, int B, int P, int async) {
+    void (*cp)(void *, const void *, size_t) = async ? nn_h2d_copy_stream : nn_h2d;
+    const size_t p2 = (size_t)P * P, p3 = p2 * P, l3 = p2 * g_Dl, own = l3 - g_h0 * p2;
+    const size_t z0 = d->side ? (size_t)(P / 2 - g_h0) : 0, xb = xbytes();
+    for (int r = 0; r < B * 4; r++) cp((char *)d->xb[i] + r * l3 * xb, (const char *)bx(b) + (r * p3 + z0 * p2) * xb, l3 * xb);
+    for (int r = 0; r < B * NCH; r++) cp(d->tb[i] + r * l3, b->t + r * p3 + z0 * p2, l3);
+    for (int n = 0; n < B; n++) {
+        uint8_t *m = d->mb[i] + n * l3;
+        if (d->side) { cp(m, g_zeros, g_h0 * p2); cp(m + g_h0 * p2, b->m + n * p3 + (z0 + g_h0) * p2, own); }
+        else { cp(m, b->m + n * p3, own); cp(m + own, g_zeros, g_h0 * p2); }
+    }
+    cp(d->wb[i], b->w, (size_t)B * NCH);
+}
 /* synchronous upload (pageable host memory: validation batches) */
 static void upload(gpu_state *d, const batch *b, int B, int P) {
+    if (d->side >= 0) { upload_slab(d, b, d->cur, B, P, 0); return; }
     size_t p3 = (size_t)P * P * P;
     nn_h2d(d->x, bx(b), (size_t)B * 4 * p3 * xbytes());
     nn_h2d(d->t, b->t, (size_t)B * NCH * p3);
@@ -50,10 +70,13 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
 static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     size_t p3 = (size_t)P * P * P;
     nn_stream_wait(1, d->ev_done);
-    nn_h2d_copy_stream(d->xb[i], bx(b), (size_t)B * 4 * p3 * xbytes());
-    nn_h2d_copy_stream(d->tb[i], b->t, (size_t)B * NCH * p3);
-    nn_h2d_copy_stream(d->mb[i], b->m, (size_t)B * p3);
-    nn_h2d_copy_stream(d->wb[i], b->w, (size_t)B * NCH);
+    if (d->side >= 0) upload_slab(d, b, i, B, P, 1);
+    else {
+        nn_h2d_copy_stream(d->xb[i], bx(b), (size_t)B * 4 * p3 * xbytes());
+        nn_h2d_copy_stream(d->tb[i], b->t, (size_t)B * NCH * p3);
+        nn_h2d_copy_stream(d->mb[i], b->m, (size_t)B * p3);
+        nn_h2d_copy_stream(d->wb[i], b->w, (size_t)B * NCH);
+    }
     nn_event_record(d->ev_up[i], 1);
 }
 
@@ -90,11 +113,11 @@ static void diagnose_nan(gpu_state *d, int B, int P, int step, const char *out) 
 }
 /* forward + loss kernels on the uploaded batch of this GPU (asynchronous); fills gl when train. */
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
-    shape5 xs = {B, 4, P, P, P};
+    shape5 xs = {B, 4, d->side >= 0 ? g_Dl : P, P, P};
     const float *lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
     if (d->lean && train) {   /* the logit gradient lives in the model's gradient buffer B (built by the forward above) */
-        const size_t gb = (size_t)B * NCH * P * P * P * (g_g16 ? 2 : 4);
+        const size_t gb = (size_t)B * NCH * xs.d * P * P * (g_g16 ? 2 : 4);
         void *pg = unet_logit_grad_scratch(d->u, gb);
         if (pg) d->gl = pg;   /* (re)built model: its scratch moved; otherwise the separate buffer allocated at setup */
     }
@@ -106,12 +129,21 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
 }
 /* fetch the loss parts of the last run_batch on this GPU (synchronous); returns the scalar loss */
 static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
-    shape5 os = unet_out_shape(d->u, (shape5){B, 4, P, P, P});
+    shape5 os = unet_out_shape(d->u, (shape5){B, 4, d->side >= 0 ? g_Dl : P, P, P});
     nn_loss_fetch(d->scratch, os, out);
     int cout = unet_cfg_of(d->u)->cout;
     double loss = 0; int active = 0;
     for (int c = 0; c < cout; c++) if (out[c] > 0 || out[cout + c] > 0) { loss += out[c] + dice_w * out[cout + c]; active++; }
     return active ? loss / active : 0;
+}
+
+/* --split z: forward, loss and backward of one window on both GPUs (src/split.h) */
+typedef struct { gpu_state *G; int B, P, train; float dice_w; } split_arg;
+static void split_job(int side, void *a) {
+    split_arg *s = a;
+    gpu_state *d = &s->G[side];
+    run_batch(d, s->B, s->P, s->dice_w, s->train);
+    if (s->train) unet_backward_x(d->u, d->gl, g_g16);
 }
 
 int cmd_train(int argc, char **argv) {
@@ -120,6 +152,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 1)] [--mem auto|auto16|default] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--sr 1]\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
+                        "  --split z --gpus 0,1: every window is split along z across the two GPUs instead (batch B; P a multiple of 2^nlev).\n"
                         "  env UFSM_PROF=1 prints per-op GPU time every log interval (category 'upload+loss+opt').\n");
         return 2;
     }
@@ -181,6 +214,15 @@ int cmd_train(int argc, char **argv) {
     if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) cfg.down_norm = pc.down_norm; }   /* the checkpoint decides */
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,80")); cfg.nlev = 0; for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "P must be divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
+    const int split = !strcmp(opt(argc, argv, "--split", "0"), "z");
+    if (split) {
+        g_h0 = 1 << (cfg.nlev - 1); g_Dl = P / 2 + g_h0;
+        if (ng != 2) { fprintf(stderr, "--split z needs --gpus with two devices\n"); return 2; }
+        if (P % (2 * g_h0)) { fprintf(stderr, "--split z: P must be divisible by %d\n", 2 * g_h0); return 2; }
+        if (overfit || getenv("UFSM_SYNC_UPLOAD") || !nn_get_tf32()) { fprintf(stderr, "--split z: not with --overfit, UFSM_SYNC_UPLOAD or --fp32\n"); return 2; }
+        g_zeros = nn_host_alloc((size_t)g_h0 * P * P); memset(g_zeros, 0, (size_t)g_h0 * P * P);
+    }
+    const int nl = split ? 1 : ng;   /* windows per step (loss averaging, samples / s) */
     char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", out); if (system(cmd)) return 1;
 
     sources *S = sources_load(src);
@@ -198,18 +240,19 @@ int cmd_train(int argc, char **argv) {
     if (soft_end != sc.soft) fprintf(stderr, "soft target sigma annealed %g -> %g; the fixed validation batches keep sigma %g, so the validation loss (and best.ckpt) is not comparable across the run: score last.ckpt\n", sc.soft, soft_end, sc.soft);
     { const char *lv = opt(argc, argv, "--levels", nullptr); if (lv) { char *t = strdup(lv); int l = 0; memset(sc.level_p, 0, sizeof sc.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) sc.level_p[l++] = atof(q); free(t); } }
 
-    size_t p3 = (size_t)P * P * P;
+    size_t p3 = (size_t)P * P * P, p3l = split ? (size_t)P * P * g_Dl : p3;   /* per-GPU voxels of a window */
     gpu_state G[8];
     int step0 = 0;
     for (int g = 0; g < ng; g++) {
         gpu_state *d = &G[g];
-        d->dev = devs[g];
+        d->dev = devs[g]; d->side = split ? g : -1;
         if (nn_init(d->dev)) { fprintf(stderr, "cannot select GPU %d\n", d->dev); return 1; }
         d->u = unet_create(&cfg);
         if (resume) { step0 = unet_load(d->u, resume); if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; } }
         if (resume && atoi(opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* weights from the checkpoint, fresh schedule (QAT / low-precision fine-tuning) */
         else unet_init(d->u, seed + 1);                   /* deterministic: every GPU starts identical */
         if (wq) unet_set_wq(d->u, wq);
+        if (split) unet_set_split(d->u, g, g_h0, split_halo);
         const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
     }
     int lean = getenv("UFSM_LEAN") ? atoi(getenv("UFSM_LEAN")) : 0;   /* lean: one device batch buffer (no upload overlap), the logit
@@ -238,7 +281,8 @@ int cmd_train(int argc, char **argv) {
             size_t fmin = (size_t)-1;
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); size_t f = nn_mem_free(); if (f < fmin) fmin = f; }
             nn_init(G[0].dev);
-            const shape5 xs = {B, cfg.cin, P, P, P};
+            const shape5 xs = {B, cfg.cin, split ? g_Dl : P, P, P};   /* split: this GPU's slab of the window */
+            const size_t p3 = p3l;
             int pick = -1; size_t need = 0;
             for (int c = 0; c < nc && pick < 0; c++) {
                 if (cand[c].gmx == auto16) continue;   /* auto: MX-fp8 gradient modes; auto16: the 16-bit ones */
@@ -261,6 +305,7 @@ int cmd_train(int argc, char **argv) {
         gpu_state *d = &G[g];
         nn_init(d->dev);
         char *bs = nullptr;
+        const size_t p3 = p3l;   /* this GPU's voxels of a window */
         const size_t a256 = 255, glb = ((size_t)B * NCH * p3 * (g_g16 ? 2 : 4) + a256) & ~a256, tbb = ((size_t)B * NCH * p3 + a256) & ~a256,
                      mbb = ((size_t)B * p3 + a256) & ~a256, xbb = ((size_t)B * 4 * p3 * xbytes() + a256) & ~a256;
         const int xin_b = lean && unet_input_converted() && g_xfmt;
@@ -268,7 +313,7 @@ int cmd_train(int argc, char **argv) {
         int xin_in = 0;
         d->gl = nullptr;
         if (lean) {
-            unet_build(d->u, (shape5){B, cfg.cin, P, P, P}, 1);
+            unet_build(d->u, (shape5){B, cfg.cin, split ? g_Dl : P, P, P}, 1);
             goff = unet_lean_nob(d->u) ? 0 : glb;
             if (xin_b && (bs = unet_grad_scratch(d->u, goff + tbb + mbb + xbb))) xin_in = 1;
             else bs = unet_grad_scratch(d->u, goff + tbb + mbb);
@@ -294,7 +339,8 @@ int cmd_train(int argc, char **argv) {
     nn_init(G[0].dev);
     size_t np = unet_nparams(G[0].u);
     fprintf(stderr, "model widths"); for (int i = 0; i < cfg.nlev; i++) fprintf(stderr, " %d", cfg.widths[i]);
-    fprintf(stderr, ": %zu params; P=%d B=%d x %d GPU(s) [", np, P, B, ng); for (int g = 0; g < ng; g++) fprintf(stderr, "%s%d", g ? "," : "", devs[g]); fprintf(stderr, "] %s\n", nn_get_tf32() ? "bf16 tensor cores" : "fp32");
+    fprintf(stderr, ": %zu params; P=%d B=%d x %d GPU(s) [", np, P, B, ng); for (int g = 0; g < ng; g++) fprintf(stderr, "%s%d", g ? "," : "", devs[g]); fprintf(stderr, "] %s%s\n", nn_get_tf32() ? "bf16 tensor cores" : "fp32", split ? ", each window split along z" : "");
+    split_ctx *sctx = split ? split_create(devs[0], devs[1]) : nullptr;
     nn_init(G[0].dev);
     float *gpeer = ng > 1 ? nn_malloc(np * 4) : nullptr;   /* on GPU 0: incoming gradients of the other GPUs */
 
@@ -329,6 +375,29 @@ int cmd_train(int argc, char **argv) {
         nn_set_sr_step((unsigned)step);
         double loss = 0, active = 0;
         /* forward + backward on every GPU; kernel launches are asynchronous so the GPUs overlap */
+        if (split) {   /* one window on both GPUs: upload both slabs of a batch, then one job with the halo exchanges */
+            if (!G[0].pending) {
+                double tw = now(); batch *b = sampler_next(sp); wait += now() - tw;
+                if (!b) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; break; }
+                for (int g = 0; g < 2; g++) { nn_init(G[g].dev); upload_async(&G[g], b, G[g].cur, B, P); }
+                G[0].pending = b;
+            }
+            for (int g = 0; g < 2; g++) {
+                gpu_state *d = &G[g];
+                nn_init(d->dev);
+                nn_stream_wait(0, d->ev_up[d->cur]);
+                if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
+                unet_zero_grad(d->u);
+            }
+            split_arg sa = {G, B, P, 1, dice_w};
+            split_run(sctx, split_job, &sa);
+            for (int g = 0; g < 2; g++) { nn_init(G[g].dev); nn_event_record(G[g].ev_done, 0); nn_event_sync(G[g].ev_up[G[g].cur]); }
+            sampler_release(sp, G[0].pending);
+            double tw = now(); batch *nb = sampler_next(sp); wait += now() - tw;
+            if (!nb) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; G[0].pending = nullptr; break; }
+            for (int g = 0; g < 2; g++) { nn_init(G[g].dev); int nxt = G[g].cur ^ 1; upload_async(&G[g], nb, nxt, B, P); select_buf(&G[g], nxt); }
+            G[0].pending = nb;
+        } else
         for (int g = 0; g < ng; g++) {
             gpu_state *d = &G[g];
             nn_init(d->dev);
@@ -405,13 +474,13 @@ int cmd_train(int argc, char **argv) {
         if (ng > 1) {
             nn_init(G[0].dev);
             for (int g = 1; g < ng; g++) { nn_peer_copy(gpeer, G[0].dev, unet_grad_ptr(G[g].u), G[g].dev, np * 4); nn_axpy(unet_grad_ptr(G[0].u), 1.f, gpeer, np); }
-            nn_scale(unet_grad_ptr(G[0].u), 1.f / ng, np);
+            if (!split) nn_scale(unet_grad_ptr(G[0].u), 1.f / ng, np);   /* split: the halves' gradients add up to the window's */
             for (int g = 1; g < ng; g++) nn_peer_copy(unet_grad_ptr(G[g].u), G[g].dev, unet_grad_ptr(G[0].u), G[0].dev, np * 4);
         }
-        for (int g = 0; g < ng; g++) { nn_init(G[g].dev); loss += fetch_loss(&G[g], B, P, dice_w, parts[g]); active += parts[g][2 * NCH]; }
+        for (int g = 0; g < nl; g++) { nn_init(G[g].dev); loss += fetch_loss(&G[g], B, P, dice_w, parts[g]); active += parts[g][2 * NCH]; }   /* split: both sides hold the window's loss */
         int fwd_nan = 0;   /* non-finite loss parts: the forward itself produced non-finite logits (not a gradient-scale overflow) */
-        for (int g = 0; g < ng; g++) for (int c = 0; c < 2 * NCH; c++) if (!isfinite(parts[g][c])) fwd_nan = 1;
-        if (fwd_nan && !overfit) diagnose_nan(&G[0], B, P, step, out);
+        for (int g = 0; g < nl; g++) for (int c = 0; c < 2 * NCH; c++) if (!isfinite(parts[g][c])) fwd_nan = 1;
+        if (fwd_nan && !overfit && !split) diagnose_nan(&G[0], B, P, step, out);
         float lr;
         if (step <= warmup) lr = lr0 * (float)step / warmup;
         else if (!strcmp(sched, "wsd")) { int cd0 = (int)(steps * (1.f - cooldown)); lr = step < cd0 ? lr0 : lr0 * (float)(steps - step) / (float)(steps - cd0); }
@@ -442,28 +511,39 @@ int cmd_train(int argc, char **argv) {
         }
         const char *e = nn_check();
         if (e) { fprintf(stderr, "cuda error at step %d: %s\n", step, e); return 1; }
-        acc_loss += loss / ng; acc_bce += parts[0][0]; acc_dice += parts[0][cfg.cout]; acc_g += gn; nacc++;
+        acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][cfg.cout]; acc_g += gn; nacc++;
         if (step % log_every == 0 || step == steps) {
             double dt = now() - tlog;
             double vl = -1, vb = 0, vd = 0;
             char vstr[128] = ",,,";
             if (step % val_every == 0 || step == steps) {
-                nn_init(G[0].dev);
-                unet_use_ema(G[0].u, 1);
+                const int nv = split ? 2 : 1;   /* split: validation windows are split too */
+                for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, 1); }
                 {   /* validation on the buffer not holding the prefetched batch (its upload has completed: ev_up synced above) */
-                    int keep = G[0].cur; select_buf(&G[0], keep ^ 1);
-                    for (int i = 0; i < nval; i++) { upload(&G[0], &val[i], B, P); float vp[2 * NCH + 1]; run_batch(&G[0], B, P, dice_w, 0); double l = fetch_loss(&G[0], B, P, dice_w, vp); vl = (vl < 0 ? 0 : vl) + l; vb += vp[0]; vd += vp[cfg.cout]; }
-                    select_buf(&G[0], keep);
-                    if (G[0].lean && G[0].pending) upload(&G[0], G[0].pending, B, P);   /* one buffer: the prefetched batch was overwritten */
+                    int keep = G[0].cur;
+                    for (int g = 0; g < nv; g++) { if (G[g].lean) { nn_init(G[g].dev); nn_event_sync(G[g].ev_up[keep]); } select_buf(&G[g], keep ^ 1); }   /* lean: one buffer, the prefetch must have landed */
+                    for (int i = 0; i < nval; i++) {
+                        float vp[2 * NCH + 1];
+                        for (int g = 0; g < nv; g++) { nn_init(G[g].dev); upload(&G[g], &val[i], B, P); }
+                        if (split) { split_arg sa = {G, B, P, 0, dice_w}; split_run(sctx, split_job, &sa); nn_init(G[0].dev); }
+                        else run_batch(&G[0], B, P, dice_w, 0);
+                        double l = fetch_loss(&G[0], B, P, dice_w, vp); vl = (vl < 0 ? 0 : vl) + l; vb += vp[0]; vd += vp[cfg.cout];
+                    }
+                    for (int g = 0; g < nv; g++) {
+                        select_buf(&G[g], keep);
+                        batch *pb = split ? G[0].pending : G[g].pending;
+                        if (G[g].lean && pb) { nn_init(G[g].dev); upload(&G[g], pb, B, P); }   /* one buffer: the prefetched batch was overwritten */
+                    }
                 }
-                unet_use_ema(G[0].u, 0);
+                for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, 0); }
+                nn_init(G[0].dev);
                 if (nval) { vl /= nval; vb /= nval; vd /= nval; }
                 snprintf(vstr, sizeof vstr, "%.5f,%.5f,%.5f", vl, vb, vd);
                 if (nval && vl < best_val) { best_val = vl; char bp[1400]; snprintf(bp, sizeof bp, "%s/best.ckpt", out); unet_save(G[0].u, bp, step, nullptr); }
             }
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f gn %.2f %s %.2f samp/s (wait %.0f%%)%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, acc_g / nacc,
-                    vl >= 0 ? "val" : "", (double)nacc * B * ng / dt, 100 * wait / dt, vl >= 0 ? vstr : "");
-            if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, active, acc_g / nacc, vstr, (double)nacc * B * ng / dt, wait); fflush(log); }
+                    vl >= 0 ? "val" : "", (double)nacc * B * nl / dt, 100 * wait / dt, vl >= 0 ? vstr : "");
+            if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, active, acc_g / nacc, vstr, (double)nacc * B * nl / dt, wait); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
             acc_loss = acc_bce = acc_dice = acc_g = 0; nacc = 0; tlog = now(); wait = 0;
         }

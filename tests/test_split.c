@@ -1,8 +1,11 @@
-/* Spatial split (one window across two GPUs along z) against the same window on one GPU: loss and every parameter gradient.
-   Modes: fp16 storage (exact up to summation order) and the --fp4 1 training preset (mx4 storage, fp4 forward / backward-data,
-   fp8 weight gradient, stochastic rounding), whose split-vs-single difference is compared with the single-GPU run-to-run
-   difference under two rounding seeds. Recompute 0 / 1 / 2, down_norm 0 / 1. Skipped (exit 0) with fewer than two GPUs.
-   env: UFSM_P (96), UFSM_B (1). */
+/* Spatial split (one window across two GPUs along z) against the same window on one GPU: loss and every parameter gradient,
+   recompute 0 / 1 / 2, down_norm 0 / 1, three precision modes:
+   - fp16 storage: the same math up to summation order; reference = the single-GPU run repeated (atomics);
+   - the --fp4 1 preset with round-to-nearest gradient operands: bit-identical up to fp4 roundings flipped by last-bit
+     differences, which fp4 amplifies; reference = the single-GPU run on a 1e-6-perturbed input;
+   - the --fp4 1 preset as trained (stochastic rounding): reference = the single-GPU difference between two rounding seeds.
+   Skipped (exit 0) with fewer than two GPUs. env: UFSM_P (96), UFSM_B (1), UFSM_ONLY=mode,config (one case),
+   UFSM_SEGS=1 (per-tensor errors), UFSM_TEST_POLICY (precision policy of the fp4 modes). */
 #include "split.h"
 #include "unet.h"
 #include <math.h>
@@ -129,27 +132,38 @@ int main(void) {
     float *g0 = malloc(np * 4), *g1 = malloc(np * 4), *g2 = malloc(np * 4);
     int fails = 0;
     printf("test_split: P %d B %d, level-0 halo %d planes, local depth %d\n", P, B, H0, Dl);
-    for (int fp4 = 0; fp4 < 2; fp4++) {
-        if (fp4) { unet_set_act_mx4(1); nn_set_sr(1); if (nn_set_prec_policy("all=fp4:fp4:fp8,enc0.c1=fp16")) return 2; }
+    for (int fp4 = 0; fp4 < 3; fp4++) {   /* 0 fp16, 1 --fp4 1 with round-to-nearest gradient operands, 2 --fp4 1 (stochastic rounding) */
+        if (fp4) { unet_set_act_mx4(1); nn_set_sr(fp4 == 2); if (nn_set_prec_policy(getenv("UFSM_TEST_POLICY") ? getenv("UFSM_TEST_POLICY") : "all=fp4:fp4:fp8,enc0.c1=fp16")) return 2; }
         for (int dn = 0; dn < 2; dn++)
             for (int rc = 0; rc < 3; rc++) {
+                if (getenv("UFSM_ONLY") && (fp4 != atoi(getenv("UFSM_ONLY")) || dn * 3 + rc != atoi(strchr(getenv("UFSM_ONLY"), ',') + 1))) continue;
                 cfg.down_norm = dn; segs_build(&cfg);
                 { unet *pr = unet_create(&cfg); np = unet_nparams(pr); unet_free(pr); }
                 unet_set_recompute(rc);
                 double ls = single(&cfg, 1, g0), lp = split(ctx, &cfg, 1, g1, np);
                 const char *wn = "", *wn2 = "";
                 double dl = fabs(lp - ls) / fabs(ls), dg = rel(g1, g0, 0, np), wg = worst(g1, g0, &wn);
-                if (!fp4) {
-                    /* fp16 storage: identical math up to summation order (GroupNorm and loss sums over two halves) */
-                    int ok = dl < 1e-4 && dg < 2e-3 && wg < 1e-2;
-                    printf("  fp16 down_norm %d recompute %d: loss %.6f vs %.6f (rel %.1e), grad rel %.2e, worst %s %.2e  %s\n", dn, rc, lp, ls, dl, dg, wn, wg, ok ? "ok" : "FAIL");
+                if (fp4 < 2) {
+                    /* fp16 storage: identical math up to summation order (GroupNorm and loss sums over two halves); fp4 with
+                       round-to-nearest: the same up to roundings flipped by those last-bit differences. Reference: the single-GPU
+                       run repeated (atomics make it nondeterministic in the last bits). */
+                    /* fp4 reference: the single-GPU run on an input perturbed by ~1e-6 (relative), the size of the
+                       summation-order differences: a flipped fp4 rounding is amplified downstream */
+                    float *hx0 = nullptr; const size_t nx = (size_t)B * 4 * P * P * P;
+                    if (fp4) { hx0 = malloc(nx * 4); memcpy(hx0, hx, nx * 4); for (size_t i = 0; i < nx; i++) hx[i] *= 1.f + 1e-6f * (float)((int)(i * 2654435761u >> 16 & 1023) - 512) / 512.f; }
+                    double lr_ = single(&cfg, 1, g2), rg = rel(g2, g0, 0, np);
+                    if (fp4) { memcpy(hx, hx0, nx * 4); free(hx0); }
+                    int ok = fp4 ? dl < 1e-3 && dg < 2 * rg + 1e-3 : dl < 1e-4 && dg < 2e-3 && wg < 1e-2;
+                    printf("  %s down_norm %d recompute %d: loss %.6f vs %.6f (rel %.1e; %s %.1e), grad rel %.2e (%s %.2e), worst %s %.2e  %s\n", fp4 ? "fp4 rn" : "fp16  ",
+                           dn, rc, lp, ls, dl, fp4 ? "perturbed" : "rerun", fabs(lr_ - ls) / fabs(ls), dg, fp4 ? "perturbed" : "rerun", rg, wn, wg, ok ? "ok" : "FAIL");
                     fails += !ok;
+                    if (getenv("UFSM_SEGS")) for (int i = 0; i < nseg; i++) printf("      %-10s %.2e\n", segs[i].name, rel(g1, g0, segs[i].off, segs[i].len));
                 } else {
                     /* fp4: compare with the single-GPU difference between two rounding seeds */
                     double ln = single(&cfg, 2, g2);
                     double nl = fabs(ln - ls) / fabs(ls), ng = rel(g2, g0, 0, np), nw = worst(g2, g0, &wn2);
                     int ok = dl < 3 * nl + 1e-3 && dg < 1.5 * ng && wg < 1.5 * nw + 0.05;
-                    printf("  fp4  down_norm %d recompute %d: loss %.6f vs %.6f (rel %.1e; seeds %.1e), grad rel %.3f (seeds %.3f), worst %s %.3f (seeds %s %.3f)  %s\n",
+                    printf("  fp4 sr down_norm %d recompute %d: loss %.6f vs %.6f (rel %.1e; seeds %.1e), grad rel %.3f (seeds %.3f), worst %s %.3f (seeds %s %.3f)  %s\n",
                            dn, rc, lp, ls, dl, nl, dg, ng, wn, wg, wn2, nw, ok ? "ok" : "FAIL");
                     fails += !ok;
                 }
