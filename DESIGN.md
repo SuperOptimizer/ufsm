@@ -323,7 +323,13 @@ Where the rest would come from:
   0.040 vs 0.166 / 0.053, 0500P2 0.062 vs 0.060, PHerc0139 0.066 / 0.073 vs 0.071 / 0.076: a clear gain only on
   MANBp (the agent's yardstick source), a wash elsewhere. down_norm is adopted for new runs on stability and
   validation loss; it is not the accuracy breakthrough. r7's validation loss was still falling at 33k, so r8 = r7
-  with 120k steps tests whether the plateau is simply under-training. Its validation batches keep sigma 3 (they are materialised at start), so the validation
+  with 120k steps tests whether the plateau is simply under-training.
+- r8 (120k steps, 1.7 h on both GPUs, data-loader bound at ~38 samples/s): IT WAS under-training. Best validation
+  loss 0.805 (r7 0.862, r5 0.881). Held-out F1 at 0.3 / 0.5, r8 vs r7: MANBp 0.226 / 0.286 vs 0.180 / 0.213
+  (band F1 at 0.5 ~0.50), 0343P 0.201 / 0.121 vs 0.172 / 0.043, 1667 0.189 / 0.055 vs 0.160 / 0.040, 0500P2 0.071
+  vs 0.062, PHerc0139 0.075 / 0.084 vs 0.066 / 0.073 and 0.043 vs 0.044, PHerc0009B unchanged. Every HF source
+  improves; precision and recall both rise. Next: r9 = r8 with 300k steps (same cosine schedule stretched), and the
+  sampler must get faster (the trainer waits ~50% of the time at 2 GPUs). Its validation batches keep sigma 3 (they are materialised at start), so the validation
   loss drifts up as the training target sharpens and `best.ckpt` is an early checkpoint: score `last.ckpt`.
 
 ## Status (2026-09-30 night)
