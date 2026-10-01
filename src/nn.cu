@@ -1235,6 +1235,7 @@ __global__ void silu_f_k(const float *x, float *y, size_t n);
 /* y = conv3d(silu(gn(x))) for k=3 stride 1 on the tensor-core path; returns -1 when that path is unavailable */
 extern "C" int nn_conv3d_fwd_gn(const float *x, shape5 xs, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                 const float *w, const float *b, int cout, float *y) {
+    if (G > xs.c) G = xs.c;   /* GroupNorm uses min(G, C) groups */
     if (!g_tf32) return -1;
     gnp_t gp = {gamma, beta, mean, rstd, G};
     split_t ns = {nullptr, 0, nullptr, 0};
@@ -1246,6 +1247,7 @@ extern "C" int nn_conv3d_fwd_gn(const float *x, shape5 xs, int G, const float *g
    statistics of its OUTPUT for G_out groups: mean/rstd of y. Tensor-core path only; -1 when unavailable. */
 extern "C" int nn_conv3d_fwd_gn_stats(const float *x, shape5 xs, int G_in, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                       const float *w, const float *b, int cout, float *y, int G_out, float eps, float *omean, float *orstd) {
+    if (G_in > xs.c) G_in = xs.c; if (G_out > cout) G_out = cout;
     if (!g_tf32) return -1;
     gnp_t gp = {gamma, beta, mean, rstd, G_in};
     int NG = xs.n * G_out;
@@ -1261,6 +1263,7 @@ extern "C" int nn_conv3d_fwd_gn_stats(const float *x, shape5 xs, int G_in, const
    from x2; otherwise like nn_conv3d_fwd_gn_stats (G_in applies gn+silu to BOTH inputs with the same params). */
 extern "C" int nn_conv3d_fwd_split(const float *x, const float *x2, int c_split, shape5 xs, int G_in, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                    const float *w, const float *b, int cout, float *y, int G_out, float eps, float *omean, float *orstd) {
+    if (G_in > xs.c) G_in = xs.c; if (G_out > cout) G_out = cout;
     if (!g_tf32) return -1;
     gnp_t gp = {gamma, beta, mean, rstd, G_in};
     split_t sp = {x2, c_split, nullptr, 0};
@@ -1285,6 +1288,7 @@ extern "C" int nn_conv3d_bwd_data_split(const float *gy, shape5 ys, const float 
 }
 /* y = silu(gn(x)) from precomputed statistics, one pass */
 extern "C" void nn_gn_silu_apply(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *y) {
+    if (G > s.c) G = s.c;
     size_t n = shape_numel(s);
     if (ABF && g_h16) gn_apply_k<1, f16, f16><<<dim3(s.n * s.c, KSLAB), 256>>>((const f16 *)x, gamma, beta, mean, rstd, (f16 *)y, s.c, G, shape_spatial(s));
     else if (ABF) gn_apply_k<1, bf16, bf16><<<dim3(s.n * s.c, KSLAB), 256>>>((const bf16 *)x, gamma, beta, mean, rstd, (bf16 *)y, s.c, G, shape_spatial(s));
@@ -1294,6 +1298,7 @@ extern "C" void nn_gn_silu_apply(const float *x, shape5 s, int G, const float *g
 /* gw += dconv/dw with the conv input silu(gn(x)) recomputed at staging; -1 when unavailable */
 extern "C" int nn_conv3d_bwd_weight_gn(const float *x, shape5 xs, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                        const float *gy, shape5 ys, float *gw, float *gb) {
+    if (G > xs.c) G = xs.c;
     if (!g_tf32) return -1;
     gnp_t gp = {gamma, beta, mean, rstd, G};
     split_t ns = {nullptr, 0, nullptr, 0};
@@ -1304,6 +1309,7 @@ extern "C" int nn_conv3d_bwd_weight_gn(const float *x, shape5 xs, int G, const f
 /* Weight gradient with a channel-split input (see nn_conv3d_fwd_split); G > 0 applies gn+silu to both inputs. */
 extern "C" int nn_conv3d_bwd_weight_split(const float *x, const float *x2, int c_split, shape5 xs, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                           const float *gy, shape5 ys, float *gw, float *gb) {
+    if (G > xs.c) G = xs.c;
     if (!g_tf32) return -1;
     gnp_t gp = {gamma, beta, mean, rstd, G};
     split_t sp = {x2, c_split, nullptr, 0};
@@ -1323,6 +1329,7 @@ __global__ void silu_bwd_gn_k(const TI *x, const float *gamma, const float *beta
     gx[i] = gy[i] * (s * (1.f + v * (1.f - s)));
 }
 extern "C" void nn_silu_bwd_gn(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy, float *gx) {
+    if (G > s.c) G = s.c;
     size_t n = shape_numel(s);
     if (ABF && g_h16) silu_bwd_gn_k<f16><<<nblk(n, 256), 256>>>((const f16 *)x, gamma, beta, mean, rstd, gy, gx, s.n, s.c, G, shape_spatial(s));
     else if (ABF) silu_bwd_gn_k<bf16><<<nblk(n, 256), 256>>>((const bf16 *)x, gamma, beta, mean, rstd, gy, gx, s.n, s.c, G, shape_spatial(s));
@@ -1417,6 +1424,7 @@ static void gn_silu_bwd_t(const TI *x, shape5 s, int G, const float *gamma, cons
 }
 extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy,
                                float *gx, float *ggamma, float *gbeta, float *scratch) {
+    if (G > s.c) G = s.c;
     if (GBF && g_h16) gn_silu_bwd_t<f16, f16, f16>((const f16 *)x, s, G, gamma, beta, mean, rstd, (const f16 *)gy, (f16 *)gx, ggamma, gbeta, scratch);
     else if (GBF) gn_silu_bwd_t<bf16, bf16, bf16>((const bf16 *)x, s, G, gamma, beta, mean, rstd, (const bf16 *)gy, (bf16 *)gx, ggamma, gbeta, scratch);
     else if (ABF && g_h16) gn_silu_bwd_t<f16, float, float>((const f16 *)x, s, G, gamma, beta, mean, rstd, gy, gx, ggamma, gbeta, scratch);
@@ -1472,6 +1480,7 @@ __global__ void gn_apply_k(const TI *x, const float *gamma, const float *beta, c
 }
 
 extern "C" void nn_gn_fwd(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd) {
+    if (G > s.c) G = s.c;
     size_t S = shape_spatial(s);
     int NG = s.n * G;
     double *sums = gn_dsums((size_t)2 * NG);
@@ -1483,6 +1492,7 @@ extern "C" void nn_gn_fwd(const float *x, shape5 s, int G, float eps, const floa
     KCHECK();
 }
 extern "C" void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd) {
+    if (G > s.c) G = s.c;
     size_t S = shape_spatial(s);
     int NG = s.n * G;
     double *sums = gn_dsums((size_t)2 * NG);
@@ -1494,6 +1504,7 @@ extern "C" void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const
     KCHECK();
 }
 extern "C" void nn_gn_apply_silu(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *g, float *sil) {
+    if (G > s.c) G = s.c;
     size_t n = shape_numel(s), S = shape_spatial(s);
     gn_apply_k<0, float, float><<<dim3(s.n * s.c, KSLAB), 256>>>(x, gamma, beta, mean, rstd, g, s.c, G, S);
     silu_f_k<<<nblk(n, 256), 256>>>(g, sil, n);
@@ -1549,6 +1560,7 @@ __global__ void gn_param_grad_k(const float *st, float *ggamma, float *gbeta, in
 
 extern "C" size_t nn_gn_scratch(shape5 s) { return (size_t)4 * s.n * s.c * sizeof(float); }
 extern "C" void nn_gn_apply(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *y) {
+    if (G > s.c) G = s.c;
     size_t n = shape_numel(s);
     gn_apply_k<0, float, float><<<dim3(s.n * s.c, KSLAB), 256>>>(x, gamma, beta, mean, rstd, y, s.c, G, shape_spatial(s));
     KCHECK();
@@ -1556,6 +1568,7 @@ extern "C" void nn_gn_apply(const float *x, shape5 s, int G, const float *gamma,
 
 extern "C" void nn_gn_bwd(const float *x, shape5 s, int G, const float *gamma, const float *mean, const float *rstd, const float *gy,
                           float *gx, float *ggamma, float *gbeta, float *scratch) {
+    if (G > s.c) G = s.c;
     size_t S = shape_spatial(s);
     int NC = s.n * s.c;
     double *ds = gn_dsums((size_t)2 * NC);
