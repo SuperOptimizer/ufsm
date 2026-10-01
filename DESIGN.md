@@ -210,6 +210,13 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   to run-to-run noise. Per-process peak (fp16 mode, recompute 1, batch 1): 192^3 2.8 GB, 256^3 6.4 -> 5.9 GB,
   320^3 12.3 GB before the trim. Memory is ~350 B/voxel: at level 0, a1+a2 of enc0 and dec0 128 B, the gradient
   buffers A+B+gout 128 B, fp32 logits 16 B, input 8 B, logit gradient 8 B; the lower levels add ~70 B.
+- Agent round 3 (merged 9b6f54a, 53abc70): decoder conv1 reads the upsampled part straight from the coarse block output
+  (trilinear upsample fused into the 16-bit conv staging, `UFSM_FUSED_UP`), and in training the up-part input gradient
+  goes through B in w[i]-channel chunks that are upsample-backwarded straight into the coarse gradient
+  (`UFSM_CHUNK_UP`). 96^3 B2 fp16: training 0.596 -> 0.540 GB at 33.8 ms (recompute 2: 0.447 GB at 41 ms),
+  inference 0.341 -> 0.228 GB, gradient error unchanged (0.25%). Decoder conv1 always runs the 16-bit kernels now, even
+  under an fp8 policy. Remaining level-0 bytes per voxel at fp16 recompute 1: enc0 + dec0 a1/a2 128, A + B + gout 96,
+  fp32 logits 16.
 - Intermittent sampler stall (1 run in ~10 on the kaggle source, two workers at 100% CPU, the trainer waiting
   forever): the lazy per-level opens in `sources.c` (`source_ct`, `source_tgt`, `source_region`) were called from every
   worker without a lock; two workers racing on the same level both opened it and a failed open under the race marked
