@@ -214,7 +214,9 @@ void unet_set_recompute(int on) { g_recompute = on; }
 static int chunk_up(void) {
     static int f = -1; if (f < 0) { const char *e = getenv("UFSM_CHUNK_UP"); f = e ? atoi(e) : 1; }
     const char *fu = getenv("UFSM_FUSED_UP");
-    return f && recompute() && !act_mx8() && !grad_mx8() && (!fu || atoi(fu) >= 2);
+    /* MX activation storage: only with UFSM_CHUNK_UP=2 (halves the gradient buffer B: 32 B / level-0 voxel less, ~-15% training
+       memory, for the largest windows; costs ~0.9 ms per 96^3 B2 step since dec0.c1's backward-data runs in three launches) */
+    return f && recompute() && (!act_mx8() || f >= 2) && !grad_mx8() && (!fu || atoi(fu) >= 2);
 }
 static float *dalloc_grad(unet *u, size_t n) { size_t b = GBF ? n * 2 : n * 4; u->act_bytes += b; u->grad_bytes += b; return nn_malloc(b); }  /* activation-gradient storage */
 
