@@ -413,6 +413,11 @@ kernels show a gap); gradients stay MX-fp8 / fp16; fp4 in the backward is restri
   today (MX storage, window 544), ~4 h at the fp8/fp4 kernel ceiling, ~2 h at the hardware floor; skipping empty
   and interior-of-sheet volume with a coarse pre-pass is worth another 2-3x. Training is step-bound, not
   volume-bound: a full-quality Muon run is ~25-50k steps.
+- Measured on Paris 4 (level 5, whole volume read in 0.9 s): 25.8% of voxels are inside the scroll mask, and the
+  non-empty fraction of level-0 tiles is 27.3% at 128^3, 28.2% at 512^3, 31.7% at 1024^3. The mask is compact, so
+  predict's existing per-tile air skip at stride 512 already removes 72% of the volume (15.3 Tvoxel left); smaller
+  tiles buy almost nothing. Further reduction needs a papyrus-vs-air criterion inside the mask (sheet gaps), not
+  better tiling.
 
 ### fp8 training on real data (agent, 2026-10-01 afternoon)
 - 6000-step MANBp yardstick (AdamW, down_norm 0, seed 0), F1 at 0.5 / 0.7: all-fp8 GEMMs (`--prec 2`) 0.247 / 0.257,
