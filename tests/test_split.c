@@ -1,7 +1,7 @@
 /* Spatial split (one window across two GPUs along z) against the same window on one GPU: loss and every parameter gradient,
    recompute 0 / 1 / 2, down_norm 0 / 1, three precision modes:
    - fp16 storage: the same math up to summation order; reference = the single-GPU run repeated (atomics);
-   - the --fp4 1 preset with round-to-nearest gradient operands: bit-identical up to fp4 roundings flipped by last-bit
+   - the --fp4 2 (train default; make test also runs --fp4 1 via UFSM_TEST_POLICY) preset with round-to-nearest gradient operands: bit-identical up to fp4 roundings flipped by last-bit
      differences, which fp4 amplifies; reference = the single-GPU run on a 1e-6-perturbed input;
    - the --fp4 1 preset as trained (stochastic rounding): reference = the single-GPU difference between two rounding seeds.
    Also the memory modes of train --mem auto (chunked up-part gradient, MX-fp8 gradients, lean 1 / 2).
@@ -128,6 +128,7 @@ int main(void) {
     for (int i = 0; i < B * NCH; i++) hw[i] = 1;
 
     nn_set_f16(1); nn_set_grad_scale(1024.f); nn_set_loss_grad_h16(1);
+    setenv("UFSM_F4_WGRAD", "1", 0);   /* as train --fp4 2: fp4 weight gradients where the policy asks for them */
     split_ctx *ctx = split_create(0, 1);
     unet *probe = unet_create(&cfg); size_t np = unet_nparams(probe); unet_free(probe);
     float *g0 = malloc(np * 4), *g1 = malloc(np * 4), *g2 = malloc(np * 4);
@@ -147,7 +148,7 @@ int main(void) {
         const tcfg c = cases[ci];
         if (getenv("UFSM_ONLY") && ci != atoi(getenv("UFSM_ONLY"))) continue;
         const int fp4 = c.fp4, dn = c.dn, rc = c.rc;
-        if (fp4) { unet_set_act_mx4(1); nn_set_sr(fp4 == 2); if (nn_set_prec_policy(getenv("UFSM_TEST_POLICY") ? getenv("UFSM_TEST_POLICY") : "all=fp4:fp4:fp8,enc0.c1=fp16")) return 2; }
+        if (fp4) { unet_set_act_mx4(1); nn_set_sr(fp4 == 2); if (nn_set_prec_policy(getenv("UFSM_TEST_POLICY") ? getenv("UFSM_TEST_POLICY") : "all=fp4:fp4:fp4,enc0.c1=fp16")) return 2; }
         else { unet_set_act_mx4(0); nn_set_sr(0); nn_set_prec_policy(""); }
         unet_set_chunk_up(c.chunk); unet_set_grad_mx8(c.gmx); unet_set_lean(c.lean);
         char tag[96]; snprintf(tag, sizeof tag, "%2d %s down_norm %d recompute %d%s%s%s", ci, fp4 == 0 ? "fp16  " : fp4 == 1 ? "fp4 rn" : "fp4 sr", dn, rc,
@@ -178,8 +179,8 @@ int main(void) {
                     /* fp4: compare with the single-GPU difference between two rounding seeds */
                     double ln = single(&cfg, 2, g2);
                     double nl = fabs(ln - ls) / fabs(ls), ng = rel(g2, g0, 0, np), nw = worst(g2, g0, &wn2);
-                    int ok = dl < 3 * nl + 1e-3 && dg < 1.5 * ng && wg < 1.5 * nw + 0.05;
-                    printf("  %s: loss %.6f vs %.6f (rel %.1e; seeds %.1e), grad rel %.3f (seeds %.3f), worst %s %.3f (seeds %s %.3f)  %s\n",
+                    int ok = dl < 3 * nl + 1e-3 && dg < 1.5 * ng + 1e-3 && wg < 1.5 * nw + 0.05;   /* + floor: some modes do not round stochastically (seeds identical) */
+                    printf("  %s: loss %.6f vs %.6f (rel %.1e; seeds %.1e), grad rel %.3g (seeds %.3g), worst %s %.3g (seeds %s %.3g)  %s\n",
                            tag, lp, ls, dl, nl, dg, ng, wn, wg, wn2, nw, ok ? "ok" : "FAIL");
                     fails += !ok;
                 }

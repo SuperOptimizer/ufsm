@@ -104,6 +104,7 @@ test: build/test_sample_ops build/test_json build/test_nn build/test_unet build/
 	./build/test_fused
 	UFSM_F16=1 ./build/test_fused
 	./build/test_split
+	UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./build/test_split
 	./tests/test_formats.sh
 	./tests/test_zarr.sh
 
