@@ -218,6 +218,9 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
   device in the 16-bit storage type (`nn_pred_input`, read in place by `unet_forward_x`); the recto probability comes
   back as uint8 (`nn_pred_output`). Output identical to the host path. Default window 288 (halo 16: 70% of the voxels
   are interior against 51% at 160; 512^3 box at level 1: 5.4 -> 3.8 s on the shared GPU; metrics equal within noise).
+- Inference tile reads run on a reader thread (3-window ring) overlapping the network: a 1024^3 box at level 0
+  (58 tiles of 288^3) takes 19 s on the shared GPU against 21 s, i.e. close to the ~16 s of pure network time at
+  ~88 Mvoxel/s; a 512^3 box at level 1 is dominated by start-up and writes (3.7 s).
 - A patch must fit the sources: the sampler now warns after 4M consecutive impossible draws (region, holdout box
   or level too small for P) instead of spinning silently, and stops after 20 consecutive read failures (the
   failure counter was reset on every error before, so an I/O error retried forever).
