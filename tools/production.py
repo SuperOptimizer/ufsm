@@ -86,6 +86,8 @@ def evaluation_plan(e, expected):
         raise ValueError('source evaluation levels must name held-out sources and use integers 0..20')
     calibration = e.get('calibration')
     if calibration:
+        if calibration.get('aggregation', 'arithmetic') not in ('arithmetic', 'geometric'):
+            raise ValueError('calibration aggregation must be arithmetic or geometric')
         names = calibration.get('sources', [])
         acceptance = e.get('acceptance_sources', [])
         group = groups.get(calibration.get('group'), [])
@@ -114,9 +116,20 @@ def summarize_scores(data, e):
     if e.get('calibration'):
         names = e['calibration']['sources']
         curve = [dict(threshold=t, mean_f1=sum(by_threshold[n][t]['f1'] for n in names)/len(names)) for t in grid]
+        geometric = e['calibration'].get('aggregation', 'arithmetic') == 'geometric'
+        if geometric:
+            # Relative gains across sources have equal weight. A collapsed source
+            # cannot be offset by an absolute gain on an easier source. Preserve
+            # exact zeros rather than introducing a score floor or pseudocount.
+            for row in curve:
+                values = [by_threshold[n][row['threshold']]['f1'] for n in names]
+                row['geometric_mean_f1'] = math.exp(math.fsum(math.log(v) for v in values)/len(values)) if all(values) else 0.
         # Resolve ties by the lower cutoff, independently of JSON grid ordering.
-        threshold = max(curve, key=lambda v: (v['mean_f1'], -v['threshold']))['threshold']
-        calibration = dict(sources=names, metric='macro box F1', curve=curve, threshold=threshold)
+        criterion = 'geometric_mean_f1' if geometric else 'mean_f1'
+        threshold = max(curve, key=lambda v: (v[criterion], -v['threshold']))['threshold']
+        calibration = dict(sources=names, metric='geometric mean box F1' if geometric else 'macro box F1', curve=curve, threshold=threshold)
+        if geometric:
+            calibration['aggregation'] = 'geometric'
     def aggregate(names):
         selected = [by_threshold[n][threshold] for n in names]
         constants = [data[n].get('constant_foreground_f1') for n in names]

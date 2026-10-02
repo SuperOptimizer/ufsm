@@ -35,7 +35,7 @@ with tempfile.TemporaryDirectory(prefix='ufsm-production-') as tmp:
     r['stages'][1]['mem'] = 'wide'
     r['predict'].update(window=24, halo=4, shard=128, q=0, threads=1)
     r['evaluation'].update(level=0, thresholds=[0.333, 0.6], groups={'dense':['fixture','acceptance']},
-        calibration={'group':'dense','sources':['fixture']}, acceptance_sources=['acceptance'], source_levels={'fixture':0})
+        calibration={'group':'dense','aggregation':'geometric','sources':['fixture']}, acceptance_sources=['acceptance'], source_levels={'fixture':0})
     recipe = t / 'recipe.json'; recipe.write_text(json.dumps(r))
     run('train', '--recipe', recipe, '--out', t / 'run')
     manifest = json.loads((t / 'run/run.json').read_text())
@@ -51,6 +51,7 @@ with tempfile.TemporaryDirectory(prefix='ufsm-production-') as tmp:
     assert report['report_threshold'] is None
     assert all(v['prediction_seconds'] > 0 and v['boxes'] == 2 for v in report['profiles'].values())
     assert all(v['calibration']['sources'] == ['fixture'] and v['acceptance']['sources'] == ['acceptance'] for v in report['profiles'].values())
+    assert all(v['calibration']['aggregation'] == 'geometric' for v in report['profiles'].values())
     for profile in r['profiles']:
         scores = json.loads((t / 'run' / f'scores-{profile}.json').read_text())['scores']['fixture']
         assert scores['rows'][0]['threshold'] == 0.333
@@ -59,6 +60,7 @@ with tempfile.TemporaryDirectory(prefix='ufsm-production-') as tmp:
     run('export', t / 'run', '--profile', 'matched', '--out', t / 'bundle')
     model = json.loads((t / 'bundle/model.json').read_text())
     assert model['threshold'] == report['profiles']['matched']['threshold']
+    assert model['prediction']['grid-origin'] == '0,0,0'
     # Move the complete bundle: its binary, checkpoint and settings must be self-contained.
     (t / 'bundle').rename(t / 'moved')
     args = ['predict', t / 'moved', '--root', t, '--ct', 'ct', '--um', '1', '--out', t / 'pred',

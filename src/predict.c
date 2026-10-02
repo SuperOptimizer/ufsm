@@ -8,6 +8,7 @@
 #include "unet.h"
 #include "z3w.h"
 #include "zarr3.h"
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <sys/wait.h>
@@ -91,12 +92,24 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
     return dflt;
 }
 
+static int parse_grid_origin(const char *text, int64_t origin[3]) {
+    for (int d = 0; d < 3; d++) {
+        char *end; errno = 0;
+        long long value = strtoll(text, &end, 10);
+        if (errno || end == text || value < 0 || (d < 2 ? *end != ',' : *end != '\0')) return 1;
+        origin[d] = value;
+        text = end + (d < 2);
+    }
+    return 0;
+}
+
 int cmd_predict(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window 288] [--act-mx8 1]\n"
                         "       [--halo 8] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
                         "       [--prec 0|1|2|3|4] [--policy enc0=1,...] [--f16 0|1] [--fp4 0|1] [--input-mx 0|1] [--input-prec 0|4|8] [--ema 1]   EMA or current weights (0)\n"
                         "       [--gn-stats stored|legacy]   defaults to the checkpoint's normalization contract\n"
+                        "       [--grid-origin z,y,x]   anchor tile interiors in selected-level CT voxels, independent of the output box\n"
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n");
         fprintf(stderr, "  For exact shard tiling, window - 2*halo should divide the shard size: 528 with halo 8 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n");
         return 2;
@@ -109,12 +122,22 @@ int cmd_predict(int argc, char **argv) {
     const int use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
     float q = (float)atof(opt(argc, argv, "--q", "8"));
     const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
+    const char *grid = opt(argc, argv, "--grid-origin", nullptr);
+    int64_t grid_origin[3] = {0, 0, 0}; char grid_attrs[128] = "";
+    if (grid && parse_grid_origin(grid, grid_origin)) { fprintf(stderr, "--grid-origin needs three nonnegative integer coordinates\n"); return 2; }
+    if (grid) snprintf(grid_attrs, sizeof grid_attrs, ",\"grid_origin_zyx\":[%lld,%lld,%lld]", (long long)grid_origin[0], (long long)grid_origin[1], (long long)grid_origin[2]);
     long long boxv[6]; const char *box = opt(argc, argv, "--box", nullptr); char tail;
     if (!isfinite(um) || um <= 0 || W <= 0 || halo < 0 || halo >= W / 2 || shard < 128 || shard % 128 ||
         level < 0 || level > 20 || nlev < 1 || nlev > 20 || nthreads < 1 || !isfinite(q) || q < 0 ||
         (box && (sscanf(box, "%lld,%lld,%lld,%lld,%lld,%lld%c", &boxv[0], &boxv[1], &boxv[2], &boxv[3], &boxv[4], &boxv[5], &tail) != 6 ||
                  boxv[0] < 0 || boxv[1] < 0 || boxv[2] < 0 || boxv[3] <= 0 || boxv[4] <= 0 || boxv[5] <= 0))) {
         fprintf(stderr, "invalid prediction geometry: require positive --um/window/box, 0 <= halo < window/2, shard a multiple of 128, and valid levels/threads/q\n"); return 2;
+    }
+    if (box) for (int d = 0; d < 3; d++) {
+        int margin = W > shard ? W : shard;
+        if (boxv[d + 3] > INT64_MAX - margin || boxv[d] > INT64_MAX - margin - boxv[d + 3]) {
+            fprintf(stderr, "prediction box exceeds the coordinate range\n"); return 2;
+        }
     }
     unet_cfg cfg; int step = 0; checkpoint_runtime runtime;
     int embedded = checkpoint_runtime_read(ckpt, &runtime);
@@ -173,7 +196,7 @@ int cmd_predict(int argc, char **argv) {
             if (bad) { fprintf(stderr, "a predict worker failed\n"); return 1; }
             double um_l = um * (1 << level);
             int64_t bn[3]; { long long v[6] = {0, 0, 0, 0, 0, 0}; const char *b = opt(argc, argv, "--box", nullptr); if (!b || sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) { fprintf(stderr, "--gpus needs --box\n"); return 1; } for (int d = 0; d < 3; d++) bn[d] = v[3 + d]; }
-            char attrs[2000]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"recto probability (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"gpus\":%d,\"ema\":%d}}", ckpt, ngpu, use_ema);
+            char attrs[2000]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"recto probability (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"gpus\":%d,\"ema\":%d%s}}", ckpt, ngpu, use_ema, grid_attrs);
             for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
             if (pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs)) return 1;
             fprintf(stderr, "wrote %s (%d GPUs)\n", out, ngpu);
@@ -199,8 +222,8 @@ int cmd_predict(int argc, char **argv) {
     char lv[32], ldir[1400], attrs[1024];
     z3w_level_name(um_l, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
-    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"recto probability (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"ema\":%d}}",
-             ckpt, step, root, ak, (long long)bo[0], (long long)bo[1], (long long)bo[2], W, halo, use_ema);
+    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"recto probability (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"ema\":%d%s}}",
+             ckpt, step, root, ak, (long long)bo[0], (long long)bo[1], (long long)bo[2], W, halo, use_ema, grid_attrs);
     z3w *w = z3w_create(ldir, bn, shard, q, 0, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     int stride = W - 2 * halo;
@@ -226,12 +249,19 @@ int cmd_predict(int argc, char **argv) {
     reader_t rd = {0}; rd.ct = ct; rd.bo = bo; rd.W = W; rd.nthreads = nthreads;
     long cap = 0;
     for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
-        int64_t so[3] = {sz * shard, sy * shard, sx * shard}, se[3];
+        int64_t so[3] = {sz * shard, sy * shard, sx * shard}, se[3], first[3];
         if (ngpu > 1 && (((sz * ns[1] + sy) * ns[2] + sx) % ngpu) != part) continue;   /* another worker's shard */
         for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
-        for (int64_t tz = so[0] - halo; tz + halo < se[0]; tz += stride)
-        for (int64_t ty = so[1] - halo; ty + halo < se[1]; ty += stride)
-        for (int64_t tx = so[2] - halo; tx + halo < se[2]; tx += stride) {
+        for (int d = 0; d < 3; d++) {
+            int64_t phase = grid ? (bo[d] + so[d] - grid_origin[d]) % stride : 0;
+            if (phase < 0) phase += stride;
+            /* Read the complete globally anchored window, including CT outside
+               the requested box. Clip only its output into the current shard. */
+            first[d] = so[d] - phase - halo;
+        }
+        for (int64_t tz = first[0]; tz + halo < se[0]; tz += stride)
+        for (int64_t ty = first[1]; ty + halo < se[1]; ty += stride)
+        for (int64_t tx = first[2]; tx + halo < se[2]; tx += stride) {
             if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
             rd.tiles[rd.ntiles++] = (tile_t){tz, ty, tx, (sz * ns[1] + sy) * ns[2] + sx};
         }

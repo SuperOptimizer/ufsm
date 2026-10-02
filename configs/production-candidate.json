@@ -44,6 +44,7 @@
     "window": 528,
     "halo": 8,
     "shard": 512,
+    "grid-origin": "0,0,0",
     "ema": 1,
     "q": 8,
     "threads": 16
@@ -109,6 +110,7 @@
     },
     "calibration": {
       "group": "dense",
+      "aggregation": "geometric",
       "sources": [
         "PHercMANBp-hf",
         "PHercParis4-hf"

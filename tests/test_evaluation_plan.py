@@ -45,11 +45,45 @@ class EvaluationSplit(unittest.TestCase):
         self.assertNotIn('calibration',result)
         self.assertEqual(result['groups'],{})
 
+    def test_geometric_calibration_balances_relative_source_gains(self):
+        # The absolute mean prefers .6 (0.9 + 0.01), even though one source
+        # collapses. Equal relative gains prefer .3 (0.4 * 0.2 > 0.9 * 0.01).
+        data = copy.deepcopy(self.data)
+        data['cal-a'] = scores((.4,.9)); data['cal-b'] = scores((.2,.01))
+        arithmetic = summarize_scores(data,self.plan)
+        self.assertEqual(arithmetic['threshold'], .6)
+        self.plan['calibration']['aggregation'] = 'geometric'
+        geometric = summarize_scores(data,self.plan)
+        self.assertEqual(geometric['threshold'], .3)
+        self.assertAlmostEqual(geometric['calibration']['curve'][0]['geometric_mean_f1'], math.sqrt(.08))
+        changed = copy.deepcopy(data)
+        changed['accept'] = scores((0,1)); changed['partial'] = scores((0,1),.9)
+        self.assertEqual(summarize_scores(changed,self.plan)['calibration'],geometric['calibration'])
+
+    def test_geometric_zeros_ties_and_small_scores_are_finite(self):
+        self.plan['calibration']['aggregation'] = 'geometric'
+        data = copy.deepcopy(self.data)
+        data['cal-a'] = scores((.9,.4)); data['cal-b'] = scores((0,.1))
+        self.assertEqual(summarize_scores(data,self.plan)['threshold'],.6)
+        data['cal-b'] = scores((0,0))
+        self.plan['thresholds'] = [.6,.3]
+        self.assertEqual(summarize_scores(data,self.plan)['threshold'],.3)
+        data['cal-a'] = scores((1e-300,1e-200)); data['cal-b'] = scores((1e-300,1e-200))
+        result = summarize_scores(data,self.plan)
+        self.assertEqual(result['threshold'],.6)
+        self.assertTrue(all(math.isfinite(r['geometric_mean_f1']) and r['geometric_mean_f1']>0 for r in result['calibration']['curve']))
+
+    def test_arithmetic_calibration_reports_remain_unchanged(self):
+        before = summarize_scores(self.data,self.plan)
+        self.plan['calibration']['aggregation'] = 'arithmetic'
+        self.assertEqual(summarize_scores(self.data,self.plan),before)
+
     def test_overlapping_incomplete_and_unknown_partitions_are_rejected(self):
         for change in [dict(acceptance_sources=['cal-a']),dict(acceptance_sources=[]),
                        dict(groups={'dense':['cal-a','cal-b','accept','partial'],'other':['partial']}),
                        dict(groups={'dense':['cal-a','cal-b','accept']}),
                        dict(calibration={'group':'unknown','sources':['cal-a','cal-b']}),
+                       dict(calibration={'group':'dense','sources':['cal-a','cal-b'],'aggregation':'bad'}),
                        dict(source_levels={'missing':0}),dict(source_levels={'cal-a':True})]:
             plan = dict(self.plan,**change)
             with self.assertRaises(ValueError): evaluation_plan(plan,set(self.data))

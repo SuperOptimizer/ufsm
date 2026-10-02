@@ -58,6 +58,41 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     def chunks(path):
         return {p.relative_to(path): hashlib.sha256(p.read_bytes()).hexdigest() for p in path.rglob("*") if p.is_file() and p.name != "zarr.json"}
     assert chunks(t / "default") == chunks(t / "explicit"), "embedded and explicit precisions differ"
+    run(*pred, t / 'aligned-grid', *geometry, '--grid-origin', '0,0,0', '--q', '0')
+    run(*pred, t / 'aligned-legacy', *geometry, '--q', '0')
+    assert chunks(t / 'aligned-grid') == chunks(t / 'aligned-legacy')
+    attrs = json.loads((t / 'aligned-grid/1/zarr.json').read_text())['attributes']['ufsm']
+    assert attrs['grid_origin_zyx'] == [0, 0, 0]
+    assert 'grid_origin_zyx' not in json.loads((t / 'aligned-legacy/1/zarr.json').read_text())['attributes']['ufsm']
+
+    def read_bytes(path, origin, shape):
+        raw = t / 'crop.raw'
+        run('read', path, '1', *origin, *shape, raw, '--threads', '1')
+        data = raw.read_bytes()
+        assert len(data) == shape[0] * shape[1] * shape[2]
+        return data
+
+    # Complete windows stay anchored to CT coordinates even when a request starts
+    # between tiles, includes CT boundaries, or changes output shards / workers.
+    # Core 24 deliberately does not divide the 128-byte output shard dimension.
+    grid_opts = ['--um', '1', '--window', '32', '--halo', '4', '--levels', '1',
+                 '--grid-origin', '3,5,7', '--q', '0', '--threads', '1']
+    grid_shape = [144, 40, 40]
+    run(*pred, t / 'grid-base', *grid_opts, '--shard', '128', '--box', '0,0,0,144,40,40')
+    base = read_bytes(t / 'grid-base', [0, 0, 0], grid_shape)
+    assert any(base), 'grid fixture has no nonzero predictions'
+    for name, placement in [('grid-shard256', ['--shard', '256']),
+                            ('grid-workers', ['--shard', '128', '--gpus', '0,1'])]:
+        run(*pred, t / name, *grid_opts, *placement, '--box', '0,0,0,144,40,40')
+        assert read_bytes(t / name, [0, 0, 0], grid_shape) == base, name
+        assert json.loads((t / name / 'zarr.json').read_text())['attributes']['ufsm']['grid_origin_zyx'] == [3, 5, 7]
+    for i, (origin, shape) in enumerate([([1, 2, 3], [19, 17, 15]), ([119, 9, 11], [17, 19, 21])]):
+        expected = read_bytes(t / 'grid-base', origin, shape)
+        for host in (0, 1):
+            destination = t / f'grid-crop-{i}-{host}'
+            run(*pred, destination, *grid_opts, '--shard', '128', '--box', ','.join(map(str, origin + shape)),
+                extra_env={'UFSM_PRED_HOSTPATH': str(host)})
+            assert read_bytes(destination, [0, 0, 0], shape) == expected, (origin, shape, host)
     # Version-1 models without a normalization field keep the historical graph.
     header, payload = (t / 'moved.ckpt').read_bytes().split(b'\n', 1)
     legacy = json.loads(header[4:]); del legacy['extra']['runtime']['gn_stored']
@@ -91,7 +126,9 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
                     '--thr', threshold, '--scores', t / 'direct.json')
                 direct[threshold] = json.loads((t / 'direct.json').read_text())['thresholds'][0]
             assert grid == [direct[threshold] for threshold in thresholds], (tol, core, grid, direct)
-    for args in (["--window", "0"], ["--halo", "12"], ["--box", "bad"], ["--shard", "129"], ["--um", "nan"], ["--prec", "999"], ["--input-mx", "2"], ["--input-prec", "7"], ["--input-prec", "7", "--input-mx", "0"], ["--gn-stats", "invalid"]):
+    for args in (["--window", "0"], ["--halo", "12"], ["--box", "bad"], ["--shard", "129"], ["--um", "nan"], ["--prec", "999"], ["--input-mx", "2"], ["--input-prec", "7"], ["--input-prec", "7", "--input-mx", "0"], ["--gn-stats", "invalid"],
+                 ['--grid-origin', '1,2'], ['--grid-origin', '0,0,-1'], ['--grid-origin', '0,0,0,0'],
+                 ['--grid-origin', '0,0,9223372036854775808'], ['--box', '9223372036854775807,0,0,16,16,16']):
         # First occurrence wins, so put invalid overrides before the valid geometry.
         run(*pred, t / "invalid", *args, *geometry, ok=2)
     impossible = json.loads(cfg.read_text())
@@ -99,4 +136,4 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     cfg.write_text(json.dumps(impossible))
     msg = run('train', cfg, '--out', t / 'impossible', '--steps', '1', *opts, ok=1)
     assert 'no eligible sources' in msg, msg
-    print("real CLI resume, portable precision and geometry validation: ok")
+    print("real CLI resume, portable precision, globally anchored crop/shard/worker predictions and geometry validation: ok")
