@@ -1,0 +1,27 @@
+{
+  "cache": "/vesuvius/ufsm/cache",
+  "sources": [
+    {
+      "name": "PHercParis4-all-surfaces",
+      "root": "/vesuvius/usrm/volcomp",
+      "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "um": 2.4,
+      "targets": {
+        "recto": {
+          "root": "/vesuvius/ufsm/gt/paris4-all-surfaces/labels.zarr",
+          "group": "."
+        }
+      },
+      "weight": 1.0,
+      "holdout": [
+        48128,
+        17408,
+        16384,
+        1024,
+        1024,
+        1024
+      ],
+      "axis": "/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json"
+    }
+  ]
+}

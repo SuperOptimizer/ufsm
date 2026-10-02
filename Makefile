@@ -85,6 +85,12 @@ build/test_sample_ops: tests/test_sample_ops.c src/sample.c src/*.h $(SAMPLE_TES
 build/test_sampler_safety: tests/test_sampler_safety.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_sampler_safety.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
 
+build/test_raster: tests/test_raster.c src/ingest.c src/*.h $(SAMPLE_TEST_OBJ) build/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_raster.c $(SAMPLE_TEST_OBJ) build/surfcomp.o -o $@ $(LDLIBS)
+
+build/check_surface_samples: tools/check_surface_samples.c build/sample.o $(SAMPLE_TEST_OBJ)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+
 build/bench_sampler: tests/bench_sampler.c build/sample.o build/sources.o build/zarr3.o build/zarr2.o build/store.o build/json.o build/z3w.o build/tiff.o build/zipr.o build/hf.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz
 build/bench_read: tests/bench_read.c build/sample.o build/sources.o build/zarr3.o build/zarr2.o build/store.o build/json.o build/z3w.o build/tiff.o build/zipr.o build/hf.o build/nn.o build/nn_fp8.o
@@ -119,7 +125,7 @@ build/test_eval: tests/test_eval.c src/eval.c $(SAMPLE_TEST_OBJ)
 build:
 	mkdir -p build
 
-test: build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging build/test_stem_precision build/test_gn_contract build/test_sampler_safety build/test_optimizer_owners build/test_infer_buffers build/test_recompute_live build/test_checkpoint_runtime build/make_pipeline_fixture build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
+test: build/check_surface_samples build/test_raster build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging build/test_stem_precision build/test_gn_contract build/test_sampler_safety build/test_optimizer_owners build/test_infer_buffers build/test_recompute_live build/test_checkpoint_runtime build/make_pipeline_fixture build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
 	python3 tests/test_http_reader.py
 	python3 tests/test_eval_holdouts.py
 	python3 tests/test_evaluation_plan.py
@@ -139,6 +145,8 @@ test: build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging bu
 	./build/test_wgrad_staging
 	./build/test_eval
 	./build/test_sample_ops
+	./build/test_raster
+	python3 tests/test_surface_store.py
 	python3 tests/test_sampler_safety.py
 	./build/test_mx
 	./build/test_mx4

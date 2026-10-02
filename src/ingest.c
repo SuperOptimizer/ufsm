@@ -13,6 +13,7 @@
 #include "zipr.h"
 #include "pyramid.h"
 #include <math.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -577,15 +578,27 @@ static mesh *load_mesh(const char *path) {
         if (rc) { fprintf(stderr, "%s: read xyz failed (%d)\n", path, rc); free(m->xyz); free(m->valid); free(m); return nullptr; }
     } else {   /* tifxyz directory */
         const char *names[3] = {"x.tif", "y.tif", "z.tif"};
-        float *ax[3];
+        float *ax[3] = {nullptr, nullptr, nullptr};
         for (int a = 0; a < 3; a++) {
             char p[1400]; snprintf(p, sizeof p, "%s/%s", path, names[a]);
             tiff *t = tiff_open_file(p);
-            if (!t) { fprintf(stderr, "%s: %s\n", p, tiff_error()); free(m); return nullptr; }
-            tiff_page pg; tiff_page_info(t, 0, &pg);
+            if (!t) {
+                fprintf(stderr, "%s: %s\n", p, tiff_error());
+                for (int k = 0; k < a; k++) free(ax[k]);
+                free(m); return nullptr;
+            }
+            tiff_page pg;
+            if (tiff_page_info(t, 0, &pg) || pg.w < 2 || pg.h < 2 || pg.bits != 32 || pg.fmt != 3 || pg.spp != 1 ||
+                (a && (pg.w != m->w || pg.h != m->h))) {
+                fprintf(stderr, "%s: tifxyz axes must be matching 2-D float32 single-channel images\n", p);
+                tiff_close(t); for (int k = 0; k < a; k++) free(ax[k]); free(m); return nullptr;
+            }
             if (a == 0) { m->w = pg.w; m->h = pg.h; }
             ax[a] = malloc((size_t)pg.w * pg.h * 4);
-            tiff_read_page(t, 0, ax[a]);
+            if (!ax[a] || tiff_read_page(t, 0, ax[a])) {
+                fprintf(stderr, "%s: TIFF decode failed\n", p);
+                tiff_close(t); for (int k = 0; k <= a; k++) free(ax[k]); free(m); return nullptr;
+            }
             tiff_close(t);
         }
         m->xyz = malloc((size_t)m->w * m->h * 3 * sizeof(float));
@@ -605,7 +618,7 @@ static mesh *load_mesh(const char *path) {
 }
 
 /* chamfer 3-4-5 distance transform on a uint8 grid where 0 = surface, 255 = far; capped at `cap` */
-static void chamfer(uint8_t *d, int N, int cap) {
+static void chamfer_reference(uint8_t *d, int N, int cap) {
     static const int off[13][4] = {{-1,-1,-1,5},{-1,-1,0,4},{-1,-1,1,5},{-1,0,-1,4},{-1,0,0,3},{-1,0,1,4},{-1,1,-1,5},{-1,1,0,4},{-1,1,1,5},{0,-1,-1,4},{0,-1,0,3},{0,-1,1,4},{0,0,-1,3}};
     size_t NN = (size_t)N * N;
     for (int pass = 0; pass < 2; pass++)
@@ -624,7 +637,15 @@ static void chamfer(uint8_t *d, int N, int cap) {
         }
 }
 
-typedef struct { mesh **meshes; int nm; double scale; int shard, margin, T; int64_t ns[3]; int64_t shape[3]; z3w *w; atomic_int failed; atomic_int done; int nthreads; } rjob;
+typedef struct { int mi, r0, r1, c0, c1; double lo[3], hi[3]; } rtile;
+typedef struct {
+    mesh **meshes; int nm; double scale; int shard, margin, T;
+    int64_t ns[3]; int64_t shape[3]; z3w *w; atomic_int failed, done; int nthreads;
+    rtile *tiles; size_t ntile; size_t *offset; uint32_t *refs;
+    int indexed, reference_distance;
+} rjob;
+
+#include "raster_cpu.h"
 
 static void raster_shard(int si, int tid, void *ud) {
     rjob *j = ud;
@@ -632,8 +653,8 @@ static void raster_shard(int si, int tid, void *ud) {
     int S = j->shard, M = j->margin, N = S + 2 * M;
     double lo[3] = {(double)(sz * S - M), (double)(sy * S - M), (double)(sx * S - M)}, hi[3] = {lo[0] + N, lo[1] + N, lo[2] + N};
     /* meshes touching this box */
-    int any = 0;
-    for (int mi = 0; mi < j->nm; mi++) {
+    int any = j->indexed && j->offset[si + 1] > j->offset[si];
+    for (int mi = 0; !j->indexed && mi < j->nm; mi++) {
         mesh *m = j->meshes[mi];
         int hit = 1;
         for (int d = 0; d < 3; d++) if (m->lo[d] * j->scale > hi[d] || m->hi[d] * j->scale < lo[d]) hit = 0;
@@ -642,13 +663,19 @@ static void raster_shard(int si, int tid, void *ud) {
     if (!any) { atomic_fetch_add(&j->done, 1); return; }   /* missing shard = fill 255 = ignore */
     size_t NN = (size_t)N * N * N;
     uint8_t *d = malloc(NN);
+    if (!d) { atomic_store(&j->failed, 1); return; }
     memset(d, 255, NN);
-    for (int mi = 0; mi < j->nm; mi++) {
+    size_t begin = j->indexed ? j->offset[si] : 0, end = j->indexed ? j->offset[si + 1] : (size_t)j->nm;
+    for (size_t it = begin; it < end; it++) {
+        const rtile *tile = j->indexed ? &j->tiles[j->refs[it]] : nullptr;
+        int mi = tile ? tile->mi : (int)it;
         mesh *m = j->meshes[mi];
         int hit = 1;
         for (int dd = 0; dd < 3; dd++) if (m->lo[dd] * j->scale > hi[dd] || m->hi[dd] * j->scale < lo[dd]) hit = 0;
         if (!hit) continue;
-        for (int r = 0; r + 1 < m->h; r++) for (int c = 0; c + 1 < m->w; c++) {
+        int r0 = tile ? tile->r0 : 0, r1 = tile ? tile->r1 : m->h - 1;
+        int c0 = tile ? tile->c0 : 0, c1 = tile ? tile->c1 : m->w - 1;
+        for (int r = r0; r < r1; r++) for (int c = c0; c < c1; c++) {
             size_t i00 = (size_t)r * m->w + c, i01 = i00 + 1, i10 = i00 + (size_t)m->w, i11 = i10 + 1;
             if (!(m->valid[i00] && m->valid[i01] && m->valid[i10] && m->valid[i11])) continue;
             double p[4][3];
@@ -676,8 +703,10 @@ static void raster_shard(int si, int tid, void *ud) {
             }
         }
     }
-    chamfer(d, N, 3 * j->T + 3);
+    if (j->reference_distance) chamfer_reference(d, N, 3 * j->T + 3);
+    else raster_distance(d, N, 3 * j->T + 3);
     uint8_t *buf = malloc((size_t)S * S * S);
+    if (!buf) { free(d); atomic_store(&j->failed, 1); return; }
     for (int z = 0; z < S; z++) for (int y = 0; y < S; y++) {
         const uint8_t *src = d + ((size_t)(z + M) * N + (y + M)) * N + M;
         uint8_t *dst = buf + ((size_t)z * S + y) * S;
@@ -691,14 +720,17 @@ static void raster_shard(int si, int tid, void *ud) {
 }
 
 int cmd_raster(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm raster <out-dir> --shape Z,Y,X --um U [--level L] [--T 3] [--levels 6] [--threads 8] [--shard 1024] <mesh.sfc|tifxyz-dir>...\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm raster <out-dir> --shape Z,Y,X --um U [--level L] [--T 3] [--levels 6] [--threads 8] [--shard 1024] [--raster-index 1] [--reference-distance 0] <mesh.sfc|tifxyz-dir>...\n"); return 2; }
     const char *out = argv[2];
     long long Z = 0, Y = 0, X = 0;
-    if (sscanf(opt(argc, argv, "--shape", "0,0,0"), "%lld,%lld,%lld", &Z, &Y, &X) != 3 || !Z) { fprintf(stderr, "--shape Z,Y,X (level-0 voxels) required\n"); return 2; }
+    if (sscanf(opt(argc, argv, "--shape", "0,0,0"), "%lld,%lld,%lld", &Z, &Y, &X) != 3 || Z <= 0 || Y <= 0 || X <= 0) { fprintf(stderr, "--shape Z,Y,X (positive level-0 voxels) required\n"); return 2; }
     double um = atof(opt(argc, argv, "--um", "0"));
     int level = atoi(opt(argc, argv, "--level", "0")), T = atoi(opt(argc, argv, "--T", "3")), nlev = atoi(opt(argc, argv, "--levels", "6"));
     int nthreads = atoi(opt(argc, argv, "--threads", "8")), shard = atoi(opt(argc, argv, "--shard", "1024"));
-    if (um <= 0) { fprintf(stderr, "--um required\n"); return 2; }
+    if (!isfinite(um) || um <= 0 || level < 0 || level > 20 || T < 1 || T > 84 ||
+        nlev < 1 || nlev > MAXLEV_PYR || nthreads < 1 || nthreads > 256 || shard < 128 || shard % 128) {
+        fprintf(stderr, "raster: require positive um, level 0..20, T 1..84, levels 1..12, threads 1..256 and shard a positive multiple of 128\n"); return 2;
+    }
     mesh *meshes[4096]; int nm = 0;
     for (int i = 3; i < argc && nm < 4096; i++) {
         if (argv[i][0] == '-') { i++; continue; }
@@ -716,13 +748,23 @@ int cmd_raster(int argc, char **argv) {
     snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"T\":%d,\"encoding\":\"0=bg,254=surface,255=ignore\"}}", nm, T);
     z3w *w = z3w_create(ldir, shape, shard, 0.f, 255, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
-    rjob j = {meshes, nm, scale, shard, T + 3, T, {(shape[0] + shard - 1) / shard, (shape[1] + shard - 1) / shard, (shape[2] + shard - 1) / shard}, {shape[0], shape[1], shape[2]}, w, 0, 0, nthreads};
+    rjob j = {.meshes = meshes, .nm = nm, .scale = scale, .shard = shard, .margin = T + 3, .T = T,
+              .ns = {(shape[0] + shard - 1) / shard, (shape[1] + shard - 1) / shard, (shape[2] + shard - 1) / shard},
+              .shape = {shape[0], shape[1], shape[2]}, .w = w, .nthreads = nthreads,
+              .indexed = atoi(opt(argc, argv, "--raster-index", "1")),
+              .reference_distance = atoi(opt(argc, argv, "--reference-distance", "0"))};
     double t0 = now();
-    parallel_for((int)(j.ns[0] * j.ns[1] * j.ns[2]), nthreads, raster_shard, &j);
+    int result = 0;
+    long double nshards = (long double)j.ns[0] * j.ns[1] * j.ns[2];
+    if (nshards > INT_MAX) { fprintf(stderr, "raster: too many shards\n"); result = 1; }
+    else if (j.indexed && raster_index(&j)) { fprintf(stderr, "raster: spatial index allocation failed\n"); result = 1; }
+    else parallel_for((int)nshards, nthreads, raster_shard, &j);
     fprintf(stderr, "\nlevel %d rasterized in %.0fs\n", level, now() - t0);
     z3w_close(w);
-    if (atomic_load(&j.failed)) return 1;
-    for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, shape, shard, 0.f, 1, nthreads, attrs)) return 1;
-    pyramid_write_group(out, um_l, nlev, "raster-labels", attrs);
-    return 0;
+    result |= atomic_load(&j.failed);
+    for (int l = 1; !result && l < nlev; l++) result = pyramid_build_level(out, um_l, l, shape, shard, 0.f, 1, nthreads, attrs) != 0;
+    if (!result) result = pyramid_write_group(out, um_l, nlev, "raster-labels", attrs) != 0;
+    free(j.tiles); free(j.offset); free(j.refs);
+    for (int mi = 0; mi < nm; mi++) { free(meshes[mi]->xyz); free(meshes[mi]->valid); free(meshes[mi]); }
+    return result;
 }

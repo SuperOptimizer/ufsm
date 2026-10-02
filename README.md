@@ -29,6 +29,46 @@ ufsm eval <pred-root> <pred-group> <label-root> <label-group> --um U [--box ...]
 Pipeline scripts: `tools/pget.sh` (parallel ranged download), `tools/ingest_all.sh` (all label zarrs),
 `tools/ingest_segments.sh`, `tools/raster_all.sh`, `tools/make_sources.py` (writes `configs/all.json`).
 
+## One Paris 4 volume containing all AWS surfaces
+
+`tools/build_surface_store.py` downloads every segment's tifxyz coordinates registered to the
+Paris 4 scan `20260411134726` at 2.4 micrometers. The AWS inventory on 2026-10-02 contains 81
+segment directories with this registration. Other registrations of the same surface belong to
+different CT coordinate systems. A missing or ambiguous registration stops the build.
+
+```sh
+make build/ufsm build/check_surface_samples
+python3 tools/build_surface_store.py --threads 12
+python3 tools/verify_surface_store.py \
+  --work /vesuvius/ufsm/gt/paris4-all-surfaces \
+  --sources configs/paris4-all-surfaces.json \
+  --out /vesuvius/ufsm/gt/paris4-all-surfaces/sample-check
+```
+
+The result is **one sparse label pyramid**, `/vesuvius/ufsm/gt/paris4-all-surfaces/labels.zarr`,
+aligned with the native CT grid. Every mesh contributes seeds to the same volume before the
+distance transform; overlapping labels form a union. Each sampled cube can contain multiple
+surfaces. The six resolutions are views of this same volume, rather than separate teachers.
+Labels use `volcomp.h` with lossless `q=0`: 254 is the approximately three-voxel surface band,
+0 is nearby background within the default eight-voxel trust radius, and 255 is ignored space.
+Training with `--soft 3` generates continuous targets around the union when sampling.
+
+AWS files occupy about 18.8 GiB. The complete native raster is a substantial CPU job and takes
+hours; untouched shards remain implicit ignore values. Downloads retain ETags, sizes and SHA256
+receipts for reuse. Native rasterization uses a spatial mesh index and an equivalent row distance
+transform, checked against the original implementation. A `.building` directory is published only
+after every pyramid level succeeds; the script then writes the single-source configuration.
+An interrupted raster leaves its staging directory for inspection; raster restart currently requires
+moving that directory aside before rerunning. `--fetch-only` only prepares the AWS inputs.
+
+The verification command draws three real native 704-cubed training samples on the CPU, checks
+finite inputs, surface and soft-target coverage, and writes orthogonal CT/target/mask montages
+plus JSON counts. It supports `--wait` while the build is running and `--builder-unit` to detect
+failure of a systemd user build service. After this verification succeeds, train directly from
+`configs/paris4-all-surfaces.json` with the desired window and `--soft 3`.
+The existing Paris 4 held-out box remains excluded from training. Raw surfaces, labels, montages
+and build outputs stay outside Git; the repository contains the reproducible code and config.
+
 ## Reproducible training and deployment
 
 `tools/production.py` freezes the executable, sources configuration, axis files, recipe and evaluation
