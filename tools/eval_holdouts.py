@@ -72,6 +72,11 @@ def main():
     if scores_path and os.path.exists(scores_path):
         os.unlink(scores_path)  # a failed rerun must not leave an old success report
     cfg = json.load(open(src))
+    source_levels = json.loads(arg('--source-levels', '{}'))
+    expected_names = {s['name'] for s in cfg['sources'] if s.get('holdout')}
+    if (not isinstance(source_levels, dict) or set(source_levels) - expected_names or
+            any(type(v) is not int or not 0 <= v <= 20 for v in source_levels.values())):
+        raise SystemExit('Invalid source levels: require held-out names mapped to integers 0..20')
     cache = cfg.get("cache")
     identity = None
     if not score_only:
@@ -84,7 +89,7 @@ def main():
         if not h:
             continue
         name = s["name"]
-        source_level = str(max(int(level), s.get("min_level", 0)))
+        source_level = str(max(source_levels.get(name, int(level)), s.get("min_level", 0)))
         # Some rasters start below CT resolution. Keep their predictions separate from earlier, finer outputs.
         suffix = ".level" + source_level if source_level != level else ""
         pdir = os.path.join(out, name + suffix)

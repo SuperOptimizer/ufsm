@@ -120,6 +120,7 @@ build:
 test: build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging build/test_stem_precision build/test_gn_contract build/test_sampler_safety build/test_optimizer_owners build/test_infer_buffers build/test_checkpoint_runtime build/make_pipeline_fixture build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
 	python3 tests/test_http_reader.py
 	python3 tests/test_eval_holdouts.py
+	python3 tests/test_evaluation_plan.py
 	./build/test_checkpoint_runtime
 	./build/test_infer_buffers
 	python3 tests/test_pipeline_cli.py

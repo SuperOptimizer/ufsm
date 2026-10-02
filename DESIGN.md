@@ -13,6 +13,37 @@ checked. The target is approximately 500 cubed on one 16 GB GPU; 512 is a measur
 requirement to reject a faster nearby shape. Historical timings below include other batch sizes,
 two-GPU runs, shared GPUs, and earlier kernels; they are not directly comparable to this audit.
 
+Evaluation now declares dense/partial label groups, calibration sources and acceptance sources in
+the candidate recipe. Dense boxes are scored at native resolution; partial boxes use level 1 or
+their minimum available level. Each serving profile fits a single global cutoff on MANBp/Paris4,
+and the remaining six dense boxes are reported separately at that cutoff. Acceptance and partial
+scores cannot affect threshold fitting. Groups must cover all holdouts exactly once, calibration
+and acceptance must partition the declared dense group, and source-level overrides are validated.
+Export preserves the selected profile's fitted cutoff. Frozen old recipes retain their original
+fixed-threshold behavior. Historical inspection of these holdouts is disclosed; the new split is
+not claimed as an untouched final test. All 37 Make test commands pass, including adversarial
+cutoff-selection tests and calibrated train/evaluate/export/moved-bundle integration
+(`tile-contract-regressions.json`).
+
+A frozen stored-GN/wide-gradient checkpoint has completed 24 native prediction/score cases
+(`tile-contract-audit.json`): three serving precisions on two calibration scans, followed by
+two other scans at the fitted cutoffs with z/y/x tile shifts, halos 8/16/32, precision comparisons,
+and repeat controls. FP4 calibration selects 0.60; FP8/FP16 select 0.55. Their two-box acceptance
+mean F1 is 0.05825 / 0.06812 / 0.06700, against constant foreground 0.06524. Cutoff transfer is
+weak on PHerc0500. This does not show that FP4 destroys prediction detail: post-hoc fixed-cutoff
+diagnosis at 0.50 gives mean F1 0.08135 / 0.08134 / 0.08120, and FP4 also leads at 0.55. Those
+diagnostic cutoffs are not substituted into the calibrated acceptance report
+(`tile-contract-threshold-diagnostic.json`). Matched multi-seed training comparisons remain.
+
+On PHerc1667, shifting one tile axis by 256 changes FP4 F1 from 0.11230 to 0.12265 / 0.12452 /
+0.09759. Halo 16/32 gives 0.11299 / 0.11178, at 4.45 / 5.19 s versus 4.11 s for halo 8.
+PHerc0500 likewise shows no useful halo improvement. Repeat controls have byte-identical full
+prediction stores and identical metrics. Exact common-ROI comparisons independently reproduce
+label support and true-positive counts; prediction changes also occur away from seam bands
+(`tile-contract-stability.json`). These are bounds on one diagnostic checkpoint, not a production
+seam acceptance or a recommendation to pay for larger halos. Window/grid sensitivity and global
+cutoff generalization remain explicit quality concerns; production training stays on hold.
+
 The stored-tensor normalization and independently selectable stem precision pass the complete
 `make -j8 test` suite (`runs/recovery512/stem-gn-full-tests.log`). Fresh training's convolution-output
 GroupNorm statistics now describe rounded stored values, including MX4/MX8; legacy checkpoints

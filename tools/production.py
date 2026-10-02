@@ -65,7 +65,70 @@ def recipe(path):
             raise ValueError('output, resume and GPU selection belong to the runner')
     if r['evaluation']['report_threshold'] not in r['evaluation']['thresholds']:
         raise ValueError('report threshold must be included in the evaluation grid')
+    thresholds = r['evaluation']['thresholds']
+    if not 1 <= len(thresholds) <= 16 or len(set(thresholds)) != len(thresholds) or any(not math.isfinite(t) or not 0 <= t <= 1 for t in thresholds):
+        raise ValueError('threshold grid must contain 1..16 distinct finite values in [0,1]')
     return r
+
+
+def evaluation_plan(e, expected):
+    """Validate explicit label groups and a split before examining model scores."""
+    groups = e.get('groups', {})
+    assigned = []
+    for name, members in groups.items():
+        if not name or not isinstance(members, list) or not members:
+            raise ValueError('evaluation groups must have names and source lists')
+        assigned.extend(members)
+    if groups and (len(set(assigned)) != len(assigned) or set(assigned) != expected):
+        raise ValueError('evaluation groups must cover each held-out source exactly once')
+    levels = e.get('source_levels', {})
+    if set(levels) - expected or any(type(v) is not int or not 0 <= v <= 20 for v in levels.values()):
+        raise ValueError('source evaluation levels must name held-out sources and use integers 0..20')
+    calibration = e.get('calibration')
+    if calibration:
+        names = calibration.get('sources', [])
+        acceptance = e.get('acceptance_sources', [])
+        group = groups.get(calibration.get('group'), [])
+        if (not names or not acceptance or len(set(names)) != len(names) or len(set(acceptance)) != len(acceptance)
+                or set(names) & set(acceptance) or set(names + acceptance) != set(group)):
+            raise ValueError('calibration and acceptance must partition the configured calibration group')
+    elif e.get('acceptance_sources'):
+        raise ValueError('acceptance sources require a calibration split')
+    return groups
+
+
+def summarize_scores(data, e):
+    """Fit one cutoff per serving profile using calibration sources only."""
+    groups = evaluation_plan(e, set(data))
+    grid = e['thresholds']
+    by_threshold = {}
+    for name, score in data.items():
+        rows = score['rows']
+        if len(rows) != len(grid) or {r['threshold'] for r in rows} != set(grid):
+            raise ValueError(f'incomplete threshold grid: {name}')
+        by_threshold[name] = {r['threshold']: r for r in rows}
+        if any(not math.isfinite(row[k]) or not 0 <= row[k] <= 1 for row in rows for k in ('f1', 'band_f1')):
+            raise ValueError(f'invalid metrics: {name}')
+    threshold = e['report_threshold']
+    calibration = None
+    if e.get('calibration'):
+        names = e['calibration']['sources']
+        curve = [dict(threshold=t, mean_f1=sum(by_threshold[n][t]['f1'] for n in names)/len(names)) for t in grid]
+        # Resolve ties by the lower cutoff, independently of JSON grid ordering.
+        threshold = max(curve, key=lambda v: (v['mean_f1'], -v['threshold']))['threshold']
+        calibration = dict(sources=names, metric='macro box F1', curve=curve, threshold=threshold)
+    def aggregate(names):
+        selected = [by_threshold[n][threshold] for n in names]
+        constants = [data[n].get('constant_foreground_f1') for n in names]
+        return dict(sources=names, boxes=len(names), mean_f1=sum(r['f1'] for r in selected)/len(selected),
+                    mean_band_f1=sum(r['band_f1'] for r in selected)/len(selected),
+                    constant_foreground_mean_f1=sum(constants)/len(constants) if all(v is not None for v in constants) else None)
+    result = dict(threshold=threshold, **aggregate(list(data)), groups={name:aggregate(members) for name,members in groups.items()})
+    if calibration:
+        result.update(calibration=calibration, acceptance=aggregate(e['acceptance_sources']))
+    result['per_box_support'] = {n:dict(f1=by_threshold[n][threshold]['f1'], level=s.get('level'),
+        positive_fraction=s.get('positive_fraction'), constant_foreground_f1=s.get('constant_foreground_f1')) for n,s in data.items()}
+    return result
 
 
 def frozen_sources(source_path, dest):
@@ -142,7 +205,8 @@ def train(a):
     inputs = out / 'inputs'; inputs.mkdir()
     binary = inputs / 'ufsm'; shutil.copy2(Path(a.binary).resolve(), binary)
     shutil.copyfile(ROOT / 'tools/eval_holdouts.py', inputs / 'eval_holdouts.py')
-    frozen_sources(a.sources or r['sources'], inputs)
+    cfg = frozen_sources(a.sources or r['sources'], inputs)
+    evaluation_plan(r['evaluation'], {s['name'] for s in cfg['sources'] if s.get('holdout')})
     atomic_json(inputs / 'recipe.json', r)
     previous = None
     if a.resume:
@@ -191,8 +255,11 @@ def evaluate(a):
     cfg = json.loads((out / 'inputs/sources.json').read_text())
     expected = {s['name'] for s in cfg['sources'] if s.get('holdout')}
     if not expected: raise ValueError('no held-out boxes')
-    result = dict(version=1, checkpoint_sha256=state['checkpoint_sha256'], report_threshold=r['evaluation']['report_threshold'],
-                  scope='Configured holdouts at a fixed threshold; independent calibration and global optimality are not established.', profiles={})
+    evaluation_plan(r['evaluation'], expected)
+    calibrated = bool(r['evaluation'].get('calibration'))
+    result = dict(version=2, checkpoint_sha256=state['checkpoint_sha256'], report_threshold=None if calibrated else r['evaluation']['report_threshold'],
+                  scope=('One global cutoff per profile fitted on declared calibration sources; acceptance sources and label groups reported separately. Historical holdouts may have been inspected previously; this does not certify production quality.' if calibrated else
+                         'Configured holdouts at a fixed threshold; independent calibration and global optimality are not established.'), profiles={})
     with gpu_lock(a.gpu):
         for name in a.profiles.split(','):
             p = dict(r['predict'], **r['profiles'][name])
@@ -201,19 +268,17 @@ def evaluate(a):
             cmd = [sys.executable, out / 'inputs/eval_holdouts.py', state['checkpoint'], '--sources', out / 'inputs/sources.json',
                    '--out', Path(a.predictions).resolve() / out.name / name, '--gpu', a.gpu,
                    '--level', r['evaluation']['level'], '--thresholds', ','.join(map(str, r['evaluation']['thresholds'])), '--scores', scores]
+            if r['evaluation'].get('source_levels'):
+                cmd += ['--source-levels', json.dumps(r['evaluation']['source_levels'])]
             elapsed = execute(cmd, out / f'eval-{name}.log', env)
             data = json.loads(scores.read_text())['scores']
             if data.keys() != expected: raise RuntimeError('evaluation omitted or added held-out boxes')
-            rows = [next(row for row in s['rows'] if row['threshold'] == result['report_threshold']) for s in data.values()]
+            metrics = summarize_scores(data, r['evaluation'])
             times = [s['prediction_seconds'] for s in data.values()]
             seconds = sum(times) if all(t is not None for t in times) else None
-            result['profiles'][name] = dict(arguments=p, mean_f1=sum(v['f1'] for v in rows) / len(rows),
-                mean_band_f1=sum(v['band_f1'] for v in rows) / len(rows), boxes=len(rows), total_seconds=elapsed,
+            result['profiles'][name] = dict(metrics, arguments=p, total_seconds=elapsed,
                 prediction_seconds=seconds, output_mvox_per_second=sum(s['output_voxels'] for s in data.values()) / seconds / 1e6 if seconds else None,
                 scores_sha256=digest(scores))
-            support = {n: dict(f1=row['f1'], positive_fraction=data[n].get('positive_fraction'),
-                              constant_foreground_f1=data[n].get('constant_foreground_f1')) for n, row in zip(data, rows)}
-            result['profiles'][name]['per_box_support'] = support
             atomic_json(out / 'evaluation.json', result)
             print(json.dumps({name: result['profiles'][name]}), flush=True)
 
@@ -231,7 +296,7 @@ def export(a):
     if sidecar.is_file(): shutil.copyfile(sidecar, bundle / 'precision.txt')
     shutil.copyfile(out / 'evaluation.json', bundle / 'evaluation.json')
     atomic_json(bundle / 'model.json', dict(version=1, status='evaluated candidate', profile=a.profile,
-        prediction=selected['arguments'], threshold=report['report_threshold'], environment=r.get('environment', {}),
+        prediction=selected['arguments'], threshold=selected.get('threshold', report['report_threshold']), environment=r.get('environment', {}),
         artifacts={p.name: digest(p) for p in bundle.iterdir() if p.is_file()}))
     print(f"exported {bundle}; {selected['boxes']} held-outs scored", flush=True)
 

@@ -64,6 +64,22 @@ class HoldoutReuse(unittest.TestCase):
         self.assert_ok(self.run_eval())
         self.assertEqual(len(self.predicted()), 1)
 
+    def test_source_level_is_explicit_and_respects_available_labels(self):
+        self.source['min_level'] = 2
+        self.write_config()
+        self.assert_ok(self.run_eval(['--level','1','--source-levels','{"heldout":0}']))
+        cmd = self.predicted()[0]
+        self.assertEqual(cmd[cmd.index('--level')+1], '2')
+        self.assertIn('heldout.level2', cmd[4])
+        scores = json.loads(self.score.read_text())['scores']['heldout']
+        self.assertEqual(scores['level'], 2)
+
+    def test_unknown_or_invalid_source_level_is_rejected_before_prediction(self):
+        for levels in ['{"missing":0}', '{"heldout":-1}', '{"heldout":1.5}', '{"heldout":true}']:
+            r = self.run_eval(['--source-levels',levels])
+            self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(self.calls.exists())
+
     def test_overwritten_checkpoint_invalidates_prediction(self):
         self.assert_ok(self.run_eval())
         self.ckpt.write_text("other")

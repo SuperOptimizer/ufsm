@@ -3,23 +3,135 @@
   "status": "candidate: bounded stored-GN and wide-gradient trials complete; dense accuracy, calibration and precision acceptance pending",
   "sources": "configs/all2.json",
   "train": {
-    "fp4": 2, "mem": "auto", "opt": "muon", "muon-lr": 0.01,
-    "lr": 0.001, "sched": "wsd", "cooldown": 0.2, "soft": 3,
-    "intonly": 1, "down-norm": 1, "workers": 12, "seed": 1,
-    "input-prec": 8, "gn-stats": "stored",
-    "val-batches": 2, "log-every": 50, "val-every": 500, "ckpt-every": 1000
+    "fp4": 2,
+    "mem": "auto",
+    "opt": "muon",
+    "muon-lr": 0.01,
+    "lr": 0.001,
+    "sched": "wsd",
+    "cooldown": 0.2,
+    "soft": 3,
+    "intonly": 1,
+    "down-norm": 1,
+    "workers": 12,
+    "seed": 1,
+    "input-prec": 8,
+    "gn-stats": "stored",
+    "val-batches": 2,
+    "log-every": 50,
+    "val-every": 500,
+    "ckpt-every": 1000
   },
   "stages": [
-    {"name": "warmup", "P": 128, "B": 4, "steps": 100000, "seconds": 780, "warmup-seconds": 40},
-    {"name": "large", "P": 512, "B": 1, "steps": 20000, "warmup": 500, "mem": "wide"}
+    {
+      "name": "warmup",
+      "P": 128,
+      "B": 4,
+      "steps": 100000,
+      "seconds": 780,
+      "warmup-seconds": 40
+    },
+    {
+      "name": "large",
+      "P": 512,
+      "B": 1,
+      "steps": 20000,
+      "warmup": 500,
+      "mem": "wide"
+    }
   ],
-  "predict": {"window": 528, "halo": 8, "shard": 512, "ema": 1, "q": 8, "threads": 16},
+  "predict": {
+    "window": 528,
+    "halo": 8,
+    "shard": 512,
+    "ema": 1,
+    "q": 8,
+    "threads": 16
+  },
   "profiles": {
     "matched": {},
-    "fp4": {"prec": 3, "fp4": 1, "f16": 1},
-    "fp8": {"prec": 2, "fp4": 0, "f16": 1, "act-mx4": 0, "act-mx8": 1},
-    "fp16": {"prec": 4, "fp4": 0, "f16": 1, "act-mx4": 0, "act-mx8": 0}
+    "fp4": {
+      "prec": 3,
+      "fp4": 1,
+      "f16": 1
+    },
+    "fp8": {
+      "prec": 2,
+      "fp4": 0,
+      "f16": 1,
+      "act-mx4": 0,
+      "act-mx8": 1
+    },
+    "fp16": {
+      "prec": 4,
+      "fp4": 0,
+      "f16": 1,
+      "act-mx4": 0,
+      "act-mx8": 0
+    }
   },
-  "evaluation": {"level": 1, "thresholds": [0.3, 0.4, 0.5, 0.6, 0.7, 0.8], "report_threshold": 0.6},
+  "evaluation": {
+    "level": 1,
+    "thresholds": [
+      0.3,
+      0.4,
+      0.45,
+      0.475,
+      0.5,
+      0.525,
+      0.55,
+      0.6,
+      0.7,
+      0.8
+    ],
+    "report_threshold": 0.6,
+    "groups": {
+      "dense": [
+        "PHercMANBp-hf",
+        "PHerc0500P2-hf",
+        "PHerc0343P-hf",
+        "PHerc1667-hf",
+        "PHercParis4-hf",
+        "PHerc0139-hf-w023-w032",
+        "PHerc0139-hf-w037-w041",
+        "PHerc0139-hf-w047-w059"
+      ],
+      "partial": [
+        "PHerc0009B-seg-20250521125136",
+        "PHerc0009B-seg-20250820154339",
+        "PHerc0139-seg-20250728140407",
+        "PHerc0139-seg-20250820105138",
+        "PHerc0139-seg-20250822062710",
+        "PHerc0139-seg-20260319133050",
+        "PHerc0139-seg-20260319133554",
+        "PHerc0139-seg-20260413113053"
+      ]
+    },
+    "calibration": {
+      "group": "dense",
+      "sources": [
+        "PHercMANBp-hf",
+        "PHercParis4-hf"
+      ]
+    },
+    "acceptance_sources": [
+      "PHerc0500P2-hf",
+      "PHerc0343P-hf",
+      "PHerc1667-hf",
+      "PHerc0139-hf-w023-w032",
+      "PHerc0139-hf-w037-w041",
+      "PHerc0139-hf-w047-w059"
+    ],
+    "source_levels": {
+      "PHercMANBp-hf": 0,
+      "PHerc0500P2-hf": 0,
+      "PHerc0343P-hf": 0,
+      "PHerc1667-hf": 0,
+      "PHercParis4-hf": 0,
+      "PHerc0139-hf-w023-w032": 0,
+      "PHerc0139-hf-w037-w041": 0,
+      "PHerc0139-hf-w047-w059": 0
+    }
+  },
   "environment": {}
 }

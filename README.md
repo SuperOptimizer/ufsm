@@ -40,7 +40,7 @@ The current [candidate recipe](configs/production-candidate.json) uses a 128-cub
 512-cubed batch-1 training on one GPU, with 528-cubed / halo-8 inference. Staging closed the short-run
 accuracy gap on MANBp. The corrected short multi-source confirmation is complete, but dense-box
 accuracy remains weak and the aggregate score is distorted by partially labelled segments.
-Threshold calibration, seam validation and production accuracy qualification remain. A bounded
+Matched precision trials and production accuracy qualification remain. A bounded
 trial of corrected normalization and an FP8 stem has finished; dense-box scores remain weak.
 Fresh training computes GroupNorm statistics from rounded stored activations;
 resume and prediction preserve each checkpoint's contract (`--gn-stats stored|legacy`).
@@ -71,7 +71,15 @@ recipe. `--resume <checkpoint>` continues weights and optimizer state in a new r
 learning-rate schedules restart without resetting the global optimizer step. All precision profiles
 must return complete held-out scores; changed inputs are rejected before export. Reports distinguish
 prediction time from scoring time and leave throughput empty when cached predictions are reused.
-The default report threshold, 0.6, is provisional and is not independently calibrated.
+The candidate recipe scores dense labels at native resolution and partial labels at level 1
+(or their minimum available level). It fits one global cutoff per serving profile on MANBp and
+Paris4, then reports the six remaining dense boxes separately as acceptance sources. Dense and
+partial groups include their constant-foreground baselines. Exported bundles retain the selected
+profile's calibrated cutoff. Custom source configurations must provide matching evaluation groups
+and roles in their recipe; recipes without a calibration split retain their fixed report cutoff.
+The existing holdouts have been inspected during development, so this split supports threshold
+qualification and is not an untouched final test. A current native-resolution diagnostic found
+poor cutoff transfer to PHerc0500; precision and production-quality acceptance remain pending.
 
 Prediction uses a staging directory and replaces an earlier output only after success. Repeated calls
 reuse outputs only when hashes, source arguments, axis and settings match. The bundle is checked before
