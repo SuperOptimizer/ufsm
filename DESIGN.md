@@ -321,6 +321,27 @@ and repeated reads/global cleanup; file descriptors remain 4 -> 4. All 36 Make t
 the final executable (`io-qualified-v2-regressions.json`). Its CUDA fatbin is identical to the frozen
 baseline. Precision and model-quality acceptance remain open, and full training is still on hold.
 
+A 17-run concurrency diagnostic retains the current executable and changes only prediction reader
+threads (`pipeline-headroom-summary.json`). Fresh MANBp controls take 8.12 / 7.65 s around a
+32-thread run at 7.37 s; PHerc0500P2 takes 8.06 / 12.69 s around 7.56 s. The latter control is a
+large network outlier, so averaging it into a claimed gain would exaggerate the result. The initial
+8/16/32/64 sweep also has drifting controls. All cold cache files and prediction shards match.
+Cached MANBp takes 4.67 s at 32 threads versus 4.52 / 4.45 s controls; local PHerc1667 takes 4.16
+versus 4.09 / 4.11 s. Cached/local comparisons check prediction shards only. Higher concurrency
+is a modest cold-read candidate, not a universal improvement; the default remains 16. Cold readers
+still leave seconds of main-thread wait, while cached readers leave about 0.03 s. Reusing HTTP
+connections across reader jobs merits investigation; the current short-lived workers close their
+handles on exit. Existing tile read-ahead and asynchronous shard writing already overlap CPU work.
+
+Complete FP4 steady-profile controls put weight gradients at 41.9%, backward-data at 24.9%, forward
+convolutions at 21.2%, normalization at 8.0%, upsampling at 3.5%, and upload/loss/optimizer at 0.7%
+of the profiled time. Halving both gradient-convolution components would give a hypothetical 1.50x
+step speedup; halving all three convolution components would give 1.78x. These are component-budget
+calculations, not achieved gains or forecasts. Substantial training and cached-inference gains need
+less convolution operand preparation/repacking and better reuse; the accumulator probe provides no
+faster arithmetic replacement for the current block-scaled FP4/FP8 path. No further 2x pipeline gain
+has been demonstrated, and the broader precision/quality/seam qualification remains incomplete.
+
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is
 0.2969 versus control 0.3304, but eight partial segment boxes have 55–65% positives within their
