@@ -15,6 +15,8 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
     return dflt;
 }
 
+static inline uint8_t max_u8(uint8_t a, uint8_t b) { return a > b ? a : b; }
+
 /* Binary dilation by an Euclidean ball. Shift whole rows so the inner loop can be vectorised;
    scattering from each positive voxel is especially slow on large, dense predictions. */
 static void dilate(const uint8_t *in, uint8_t *out, const int64_t n[3], int tol) {
@@ -59,17 +61,111 @@ static void dilate(const uint8_t *in, uint8_t *out, const int64_t n[3], int tol)
     }
 }
 
+/* Maximum filter over an Euclidean ball (binary dilation for 0/1 input). Shift whole rows so the inner loop can be vectorised;
+   scattering from each positive voxel is especially slow on large, dense predictions. */
+static void max_dilate(const uint8_t *in, uint8_t *out, const int64_t n[3], int tol) {
+    /* A radius-2 Euclidean ball is the 3x3x3 cube plus the six axis-distance-2
+       points. Three separable maximum passes replace 33 repeated full-volume shifts. */
+    if (tol == 2) {
+        const size_t plane = (size_t)n[1] * n[2], nv = (size_t)n[0] * plane;
+        uint8_t *tmp = malloc(nv);
+        if (tmp) {
+            for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) {
+                size_t base = (size_t)z * plane + (size_t)y * n[2];
+                for (int64_t x = 0; x < n[2]; x++) out[base + x] = max_u8(in[base + x], max_u8(x ? in[base + x - 1] : 0, x + 1 < n[2] ? in[base + x + 1] : 0));
+            }
+            for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) {
+                size_t base = (size_t)z * plane + (size_t)y * n[2];
+                for (int64_t x = 0; x < n[2]; x++) tmp[base + x] = max_u8(out[base + x], max_u8(y ? out[base + x - n[2]] : 0, y + 1 < n[1] ? out[base + x + n[2]] : 0));
+            }
+            for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) {
+                size_t base = (size_t)z * plane + (size_t)y * n[2];
+                for (int64_t x = 0; x < n[2]; x++) {
+                    size_t i = base + x;
+                    out[i] = max_u8(max_u8(tmp[i], max_u8(z ? tmp[i - plane] : 0, z + 1 < n[0] ? tmp[i + plane] : 0)),
+                        max_u8(max_u8(x >= 2 ? in[i - 2] : 0, x + 2 < n[2] ? in[i + 2] : 0),
+                        max_u8(max_u8(y >= 2 ? in[i - 2 * n[2]] : 0, y + 2 < n[1] ? in[i + 2 * n[2]] : 0),
+                               max_u8(z >= 2 ? in[i - 2 * plane] : 0, z + 2 < n[0] ? in[i + 2 * plane] : 0))));
+                }
+            }
+            free(tmp); return;
+        }
+    }
+    memcpy(out, in, (size_t)n[0] * n[1] * n[2]);
+    for (int dz = -tol; dz <= tol; dz++) for (int dy = -tol; dy <= tol; dy++) for (int dx = -tol; dx <= tol; dx++) {
+        if ((!dz && !dy && !dx) || dz * dz + dy * dy + dx * dx > tol * tol) continue;
+        const int64_t z0 = dz < 0 ? -dz : 0, z1 = dz > 0 ? n[0] - dz : n[0];
+        const int64_t y0 = dy < 0 ? -dy : 0, y1 = dy > 0 ? n[1] - dy : n[1];
+        const int64_t x0 = dx < 0 ? -dx : 0, x1 = dx > 0 ? n[2] - dx : n[2];
+        for (int64_t z = z0; z < z1; z++) for (int64_t y = y0; y < y1; y++) {
+            const uint8_t *src = in + ((size_t)z * n[1] + y) * n[2];
+            uint8_t *dst = out + ((size_t)(z + dz) * n[1] + y + dy) * n[2];
+            for (int64_t x = x0; x < x1; x++) dst[x + dx] = max_u8(dst[x + dx], src[x]);
+        }
+    }
+}
+
 static int near_seam(int64_t q, int64_t n, int core, int band) {
     int64_t left = q / core * core, right = left + core;
     return (left > 0 && q - left < band) || (right < n && right - q <= band);
 }
 typedef struct { size_t valid, positive, tp, fp, fn, bph, bpt, brh, brt; } region_counts;
+/* A maximum filter commutes with thresholding. Histogram scores once, then sum
+   byte buckets >= threshold. Ignored predictions remain in the filter because
+   they can be near a valid positive; ignored labels never enter any counter. */
+static void score_histogram(const uint8_t *p, const uint8_t *l, const uint8_t *gtd, const uint8_t *pmax,
+                            const uint8_t *region, size_t nv, region_counts bins[3][256]) {
+    memset(bins, 0, 3 * 256 * sizeof(region_counts));
+    size_t valid[3] = {0}, positive[3] = {0};
+    for (size_t i = 0; i < nv; i++) if (l[i] != 255) {
+        int gt = l[i] >= 127;
+        int rs[2] = {0, region ? region[i] : 0};
+        for (int j = 0; j < (region ? 2 : 1); j++) {
+            int r = rs[j]; region_counts *c = &bins[r][p[i]];
+            valid[r]++; positive[r] += gt;
+            c->tp += gt; c->fp += !gt; c->bph += gtd[i];
+            if (gt) bins[r][pmax[i]].brh++;
+        }
+    }
+    for (int r = 0; r < (region ? 3 : 1); r++) {
+        region_counts c = {.valid = valid[r], .positive = positive[r], .brt = positive[r]};
+        for (int b = 255; b >= 0; b--) {
+            c.tp += bins[r][b].tp; c.fp += bins[r][b].fp;
+            c.bph += bins[r][b].bph; c.brh += bins[r][b].brh;
+            c.fn = positive[r] - c.tp; c.bpt = c.tp + c.fp;
+            bins[r][b] = c;
+        }
+    }
+}
+
 static void write_counts(FILE *f, const region_counts *c) {
     double p = c->tp + c->fp ? (double)c->tp / (c->tp + c->fp) : 0, r = c->tp + c->fn ? (double)c->tp / (c->tp + c->fn) : 0;
     double bp = c->bpt ? (double)c->bph / c->bpt : 0, br = c->brt ? (double)c->brh / c->brt : 0;
     fprintf(f, "{\"valid_voxels\":%zu,\"positive_voxels\":%zu,\"tp\":%zu,\"fp\":%zu,\"fn\":%zu,\"precision\":%.10g,\"recall\":%.10g,\"f1\":%.10g,\"band_precision\":%.10g,\"band_recall\":%.10g,\"band_f1\":%.10g}",
         c->valid, c->positive, c->tp, c->fp, c->fn, p, r, p + r ? 2 * p * r / (p + r) : 0, bp, br, bp + br ? 2 * bp * br / (bp + br) : 0);
 }
+/* Keep the one/two-cutoff scan independent of histogram setup and its stack frame. */
+static __attribute__((noinline)) void score_threshold(const uint8_t *p, const uint8_t *l, const uint8_t *gt, const uint8_t *gtd,
+    const uint8_t *region, size_t nv, size_t nvalid, size_t npos, uint8_t th, uint8_t *pr, uint8_t *prd,
+    const int64_t n[3], int tol, region_counts counts[3]) {
+    size_t tp = 0, fp = 0, fn = 0, bp_hit = 0, bp_tot = 0;
+    for (size_t i = 0; i < nv; i++) {
+        pr[i] = p[i] >= th;
+        if (l[i] == 255) continue;
+        tp += pr[i] && gt[i]; fp += pr[i] && !gt[i]; fn += !pr[i] && gt[i];
+        if (pr[i]) { bp_tot++; bp_hit += gtd[i]; }
+        if (region) {
+            region_counts *c = &counts[region[i]]; c->valid++; c->positive += gt[i];
+            c->tp += pr[i] && gt[i]; c->fp += pr[i] && !gt[i]; c->fn += !pr[i] && gt[i];
+            if (pr[i]) { c->bpt++; c->bph += gtd[i]; }
+        }
+    }
+    dilate(pr, prd, n, tol);
+    size_t br_hit = 0, br_tot = 0;
+    for (size_t i = 0; i < nv; i++) if (l[i] != 255 && gt[i]) { br_tot++; br_hit += prd[i]; if (region) { counts[region[i]].brt++; counts[region[i]].brh += prd[i]; } }
+    counts[0] = (region_counts){nvalid, npos, tp, fp, fn, bp_hit, bp_tot, br_hit, br_tot};
+}
+
 int cmd_eval(int argc, char **argv) {
     if (argc < 8) {
         fprintf(stderr, "usage: ufsm eval <pred-root> <pred-group> <label-root> <label-group> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--tol 2] [--pred-origin z,y,x] [--dump slice.pgm] [--thr 0.3,0.5,0.7]\n"
@@ -113,7 +209,8 @@ int cmd_eval(int argc, char **argv) {
     printf("box %lldx%lldx%lld at level %d: %zu valid voxels (%.1f%%), %zu labelled surface (%.2f%% of valid)\n", (long long)n[0], (long long)n[1], (long long)n[2], level, nvalid, 100.0 * nvalid / nv, npos, nvalid ? 100.0 * npos / nvalid : 0);
     if (!nvalid) return 0;
     printf("thr    prec   recall     f1   dice  | band(tol=%d) prec recall\n", tol);
-    uint8_t *gt = malloc(nv), *gtd = malloc(nv), *pr = malloc(nv), *prd = malloc(nv);
+    uint8_t *gt = malloc(nv), *gtd = malloc(nv), *prd = malloc(nv);
+    if (!gt || !gtd || !prd) { fprintf(stderr, "cannot allocate evaluation buffers\n"); return 1; }
     for (size_t i = 0; i < nv; i++) gt[i] = l[i] != 255 && l[i] >= 127;
     dilate(gt, gtd, n, tol);
     double thrs[16] = {0.3, 0.5, 0.7}; int nthr = 3;   /* --thr 0.1,0.2,0.3 overrides */
@@ -126,6 +223,11 @@ int cmd_eval(int argc, char **argv) {
         int zy = near_seam(o[0] + z, pm->shape[0], core, band) || near_seam(o[1] + y, pm->shape[1], core, band);
         for (int64_t x = 0; x < n[2]; x++) region[((size_t)z * n[1] + y) * n[2] + x] = zy || near_seam(o[2] + x, pm->shape[2], core, band) ? 1 : 2;
     }
+    uint8_t *pr = nthr <= 2 ? malloc(nv) : nullptr;
+    if (nthr <= 2 && !pr) { fprintf(stderr, "cannot allocate threshold buffer\n"); return 1; }
+    region_counts (*bins)[256] = nthr > 2 ? malloc(3 * 256 * sizeof(region_counts)) : nullptr;
+    if (nthr > 2 && !bins) { fprintf(stderr, "cannot allocate score histogram\n"); return 1; }
+    if (nthr > 2) { max_dilate(p, prd, n, tol); score_histogram(p, l, gtd, prd, region, nv, bins); }
     const char *score_path = opt(argc, argv, "--scores", nullptr);
     FILE *score = score_path ? fopen(score_path, "w") : nullptr;
     if (score_path && !score) { perror(score_path); return 1; }
@@ -136,22 +238,11 @@ int cmd_eval(int argc, char **argv) {
     double dice = (2 * sp + 1) / (ss + sg + 1);
     for (int t = 0; t < nthr; t++) {
         uint8_t th = (uint8_t)(thrs[t] * 255);
-        size_t tp = 0, fp = 0, fn = 0, bp_hit = 0, bp_tot = 0;
         region_counts counts[3] = {0};
-        for (size_t i = 0; i < nv; i++) {
-            pr[i] = p[i] >= th;
-            if (l[i] == 255) continue;
-            tp += pr[i] && gt[i]; fp += pr[i] && !gt[i]; fn += !pr[i] && gt[i];
-            if (pr[i]) { bp_tot++; bp_hit += gtd[i]; }
-            if (region) {
-                region_counts *c = &counts[region[i]]; c->valid++; c->positive += gt[i];
-                c->tp += pr[i] && gt[i]; c->fp += pr[i] && !gt[i]; c->fn += !pr[i] && gt[i];
-                if (pr[i]) { c->bpt++; c->bph += gtd[i]; }
-            }
-        }
-        dilate(pr, prd, n, tol);
-        size_t br_hit = 0, br_tot = 0;
-        for (size_t i = 0; i < nv; i++) if (l[i] != 255 && gt[i]) { br_tot++; br_hit += prd[i]; if (region) { counts[region[i]].brt++; counts[region[i]].brh += prd[i]; } }
+        if (nthr <= 2) score_threshold(p, l, gt, gtd, region, nv, nvalid, npos, th, pr, prd, n, tol, counts);
+        else for (int r = 0; r < 3; r++) counts[r] = bins[r][th];
+        const region_counts *c = &counts[0];
+        size_t tp = c->tp, fp = c->fp, fn = c->fn, bp_hit = c->bph, bp_tot = c->bpt, br_hit = c->brh, br_tot = c->brt;
         double prec = tp + fp ? (double)tp / (tp + fp) : 0, rec = tp + fn ? (double)tp / (tp + fn) : 0;
         double f1 = prec + rec ? 2 * prec * rec / (prec + rec) : 0;
         printf("%.2f  %.4f  %.4f  %.4f  %.4f  |  %.4f  %.4f\n", thrs[t], prec, rec, f1, dice, bp_tot ? (double)bp_hit / bp_tot : 0, br_tot ? (double)br_hit / br_tot : 0);
@@ -165,7 +256,7 @@ int cmd_eval(int argc, char **argv) {
     }
     int score_failed = 0;
     if (score) { fputs("]}\n", score); score_failed = ferror(score); if (fclose(score)) score_failed = 1; }
-    free(region);
+    free(bins); free(region);
     free(p); free(l); free(gt); free(gtd); free(pr); free(prd);
     z3_close(pz); z3_close(lz); store_close(ps); store_close(ls);
     return score_failed ? 1 : 0;

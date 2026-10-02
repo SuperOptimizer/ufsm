@@ -75,6 +75,22 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     for row in regions:
         for key in ('valid_voxels', 'positive_voxels', 'tp', 'fp', 'fn'):
             assert row['all'][key] == row['seam'][key] + row['interior'][key], (key, row)
+    # Histogram grids preserve CLI threshold conversion, order, duplicate rows,
+    # endpoints, tolerance and seam support relative to the direct one-cutoff path.
+    thresholds = ['1', '0', '0.333', '0.6', '0.333', '0.6']
+    for tol in range(4):
+        for core in (0, 8):
+            geometry_eval = ['--um', '1', '--level', '0', '--box', '0,0,0,16,16,16',
+                             '--tol', str(tol), '--seam-core', str(core), '--seam-band', '2']
+            run('eval', t / 'default', '.', t / 'labels', '.', *geometry_eval,
+                '--thr', ','.join(thresholds), '--scores', t / 'grid.json')
+            grid = json.loads((t / 'grid.json').read_text())['thresholds']
+            direct = {}
+            for threshold in dict.fromkeys(thresholds):
+                run('eval', t / 'default', '.', t / 'labels', '.', *geometry_eval,
+                    '--thr', threshold, '--scores', t / 'direct.json')
+                direct[threshold] = json.loads((t / 'direct.json').read_text())['thresholds'][0]
+            assert grid == [direct[threshold] for threshold in thresholds], (tol, core, grid, direct)
     for args in (["--window", "0"], ["--halo", "12"], ["--box", "bad"], ["--shard", "129"], ["--um", "nan"], ["--prec", "999"], ["--input-mx", "2"], ["--input-prec", "7"], ["--input-prec", "7", "--input-mx", "0"], ["--gn-stats", "invalid"]):
         # First occurrence wins, so put invalid overrides before the valid geometry.
         run(*pred, t / "invalid", *args, *geometry, ok=2)

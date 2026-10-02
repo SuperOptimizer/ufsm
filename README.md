@@ -40,8 +40,10 @@ The current [candidate recipe](configs/production-candidate.json) uses a 128-cub
 512-cubed batch-1 training on one GPU, with 528-cubed / halo-8 inference. Staging closed the short-run
 accuracy gap on MANBp. The corrected short multi-source confirmation is complete, but dense-box
 accuracy remains weak and the aggregate score is distorted by partially labelled segments.
-Matched precision trials and production accuracy qualification remain. A bounded
-trial of corrected normalization and an FP8 stem has finished; dense-box scores remain weak.
+Two matched seeds, each continued for 160 updates, show no consistent aggregate accuracy gain
+from FP8 weight gradients; the faster FP4 path remains the candidate. Production accuracy
+qualification remains. A bounded trial of corrected normalization and an FP8 stem has finished;
+dense-box scores remain weak.
 Fresh training computes GroupNorm statistics from rounded stored activations;
 resume and prediction preserve each checkpoint's contract (`--gn-stats stored|legacy`).
 `--input-prec 4|8` selects stem-input quantization independently of body storage and is saved in
@@ -51,10 +53,15 @@ candidate to about 71 Mvox/s at 512. The recipe's wider finest gradient buffer b
 MANBp inference gains about 12% with matched FP4; its decoded output is identical across the tested
 1024-cubed box. Nearby 496/528 shapes previously had comparable per-voxel speed; no production
 precision choice is final.
+Pure forward inference at 528 cubed takes 0.424–0.429 s on one RTX 5060 Ti 16 GB:
+343–347 million window voxels/s, or 313–317 million useful voxels/s after the halo-8 crop to 512.
+This restores the actual checkpoint and measures warm whole-network forwards on real device input;
+input preparation, transfers, reads, output encoding and writes are outside that timing.
+Cached/local complete predictions previously measured about 240–260 million useful voxels/s.
 Kaggle's 320-cubed regions participate in the warmup and are explicitly excluded at 512. The recipe's
 long run is on hold while those checks and remaining performance headroom are assessed.
 
-These commands run a **limited pipeline trial**, compare precision profiles at the same fixed threshold,
+These commands run a **limited pipeline trial**, calibrate and score precision profiles,
 and export a self-contained candidate bundle:
 
 ```sh
@@ -80,6 +87,11 @@ and roles in their recipe; recipes without a calibration split retain their fixe
 The existing holdouts have been inspected during development, so this split supports threshold
 qualification and is not an untouched final test. A current native-resolution diagnostic found
 poor cutoff transfer to PHerc0500; precision and production-quality acceptance remain pending.
+Evaluation grids with three or more cutoffs now filter prediction probabilities once and collect
+byte histograms instead of dilating each threshold separately. Complete ten-cutoff scoring is
+4.9–5.5x faster on the tested native dense and partial boxes, with byte-identical reports.
+One/two-cutoff evaluation retains the direct scan. This accelerates calibration and scoring,
+not training updates or CNN inference.
 
 Prediction uses a staging directory and replaces an earlier output only after success. Repeated calls
 reuse outputs only when hashes, source arguments, axis and settings match. The bundle is checked before

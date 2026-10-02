@@ -22,8 +22,63 @@ and acceptance must partition the declared dense group, and source-level overrid
 Export preserves the selected profile's fitted cutoff. Frozen old recipes retain their original
 fixed-threshold behavior. Historical inspection of these holdouts is disclosed; the new split is
 not claimed as an untouched final test. All 37 Make test commands pass, including adversarial
-cutoff-selection tests and calibrated train/evaluate/export/moved-bundle integration
-(`tile-contract-regressions.json`).
+cutoff-selection tests and calibrated train/evaluate/export/moved-bundle integration. The current
+scoring build repeats all 37 commands successfully (`eval-histogram-final-regressions.json`).
+
+Ten-cutoff scoring now uses one grayscale maximum filter and cumulative byte histograms, preserving
+exact binary threshold/dilation semantics. Predictions at ignored voxels still participate in the
+filter; ignored labels never enter counters. The one/two-cutoff path retains its direct scan.
+Twenty quiet whole-process controls on native 1024-cubed dense boxes and a partial-label box show
+4.94x / 5.49x / 4.94x ten-cutoff gains; single-cutoff controls improve 2.9% / 6.1%.
+All JSON reports and console scores match byte for byte (`eval-histogram-v3-quiet-bench.json`).
+The integrated evaluation object's executable text matches the qualified private object exactly;
+five additional real-volume CLI pairs match across tolerance 0–3, one/two/three/sixteen cutoffs,
+repeated/unsorted cutoffs, endpoints and seam masks. Independent scatter tests cover 6484 grayscale
+filter cases and 46080 histogram/direct counter cases over every byte cutoff, as well as the prior
+6480 binary dilation cases (`eval-histogram-integrated-cli.json`, `eval-histogram-integrated-fixture.log`).
+This is an evaluation/calibration gain, not a training-step or CNN-inference gain.
+
+The two-seed weight-gradient study is complete (`wgrad-precision-summary.json`). Both seeds resume
+the same checkpoint for 160 updates; only FP4 versus FP8 weight-gradient computation differs.
+Reports use raw final weights so EMA history does not mask this short continuation. Each of four
+models is served with matched FP4 and scored on all sixteen boxes, with native dense support and
+separate partial-label support. All calibration fits select 0.60. Six-box acceptance mean F1 is
+FP4/FP8 0.066569/0.065946 for seed 2 and 0.057726/0.057998 for seed 3; two-seed means are
+0.062148/0.061972 versus constant foreground 0.056580. Both band-F1 comparisons favor FP4.
+FP8 improves PHerc0500 and PHerc1667 at the fitted cutoff in both seeds, but the aggregate effect
+reverses with seed. The slower FP8 path therefore has no established aggregate benefit, and FP4
+remains provisional. These bounded diagnostics do not qualify production quality or cutoff transfer.
+
+Warm forward-only inference with the actual restored checkpoint takes 0.424–0.429 s at 528 cubed
+on one RTX 5060 Ti 16 GB: 343–347 million window voxels/s, or 313–317 million useful voxels/s
+after cropping halo 8 to 512 cubed. Four runs on two real inputs each include three warmup and
+twelve synchronized whole-network forwards, with the other GPU idle. Input construction, uploads,
+probability placement, downloads, reads/writes and startup are excluded. Each complete output store
+still matches its frozen production reference (`pure-inference-bench.json`). The earlier profiler's
+`gpu(fwd+d2h)` label is broader than a forward timer and, on the default device-placement path,
+does not include shard downloads charged to writer time. Use the dedicated benchmark for pure
+inference claims; do not combine its timing with instrumented whole-process duration.
+
+A suffix-index read prototype removes HEAD requests before uncached shard indexes. A local fixture
+passes 94 reader cases and 27 direct tail cases, reducing its shard request count from 29 to 22.
+Twenty-three complete predictions preserve all prediction-store and cold-cache bytes. Whole-process
+gains are only about 0.8–1.5% on two cold dense regions and 0.9% on the air-heavy region, while
+cached/local results remain within 0.4% (`http-suffix-bench.json`). These runs share the environment
+with quality evaluation on the other GPU, so such small changes do not qualify a default change.
+The prototype remains private; production retains the existing coalesced reader and HTTP handle pool.
+
+Increasing FP4 weight-gradient depth from 12 to 48/96 amortizes repeated halo setup and parameter
+atomics. Three full-size isolated kernel cases improve roughly 7–8%, with relative gradient changes
+below 3.2e-7 and worst absolute changes below 4.6e-6 of the largest reference gradient, within the
+repeated-control reduction noise (`wgrad-depth-probe-summary.json`). A quiet six-run, 40-update
+whole-training sweep at 512 and `--mem wide` gives 73.954 / 74.759 / 74.491 / 74.357 / 73.954 /
+72.209 Mvox/s for depths 12 / 48 / 96 / 96 / 48 / 12, at unchanged 14785 MiB peak device use.
+GPU temperature rises from 47–72 C in the initial control to 84 C, and active mean SM clock falls
+from 2868 to 2780 MHz. The hot depth-48 run and final depth-12 control have essentially equal
+clocks, with 2.4% greater whole-step throughput; hot depth-96 is about 3.0% faster at a slightly
+higher clock. These support a small tuning opportunity, not another 2x gain. A guarded automatic
+choice still needs direct qualification; the default remains depth 12
+(`wgrad-depth-quiet-train-bench.json`).
 
 A frozen stored-GN/wide-gradient checkpoint has completed 24 native prediction/score cases
 (`tile-contract-audit.json`): three serving precisions on two calibration scans, followed by
@@ -33,7 +88,8 @@ mean F1 is 0.05825 / 0.06812 / 0.06700, against constant foreground 0.06524. Cut
 weak on PHerc0500. This does not show that FP4 destroys prediction detail: post-hoc fixed-cutoff
 diagnosis at 0.50 gives mean F1 0.08135 / 0.08134 / 0.08120, and FP4 also leads at 0.55. Those
 diagnostic cutoffs are not substituted into the calibrated acceptance report
-(`tile-contract-threshold-diagnostic.json`). Matched multi-seed training comparisons remain.
+(`tile-contract-threshold-diagnostic.json`). The matched weight-gradient comparison above now bounds
+that precision choice over two seeds; serving precision, phase and cutoff transfer remain concerns.
 
 On PHerc1667, shifting one tile axis by 256 changes FP4 F1 from 0.11230 to 0.12265 / 0.12452 /
 0.09759. Halo 16/32 gives 0.11299 / 0.11178, at 4.45 / 5.19 s versus 4.11 s for halo 8.
