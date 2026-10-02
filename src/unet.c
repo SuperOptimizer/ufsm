@@ -273,11 +273,13 @@ static int recompute(void) { if (g_recompute < 0) { const char *e = getenv("UFSM
    (the GN statistics of a1 are kept from the forward) */
 static int recompute_a1(void) { return recompute() >= 2; }
 void unet_set_recompute(int on) { g_recompute = on; }
-#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8))
+#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8) + 16384 * unet_wide_up_grad())
 /* chunk mode (recompute, 16-bit activations and gradients, fused upsample): the decoder's up-part input gradient is
    produced in w[i]-channel chunks, each upsample-backwarded straight into its slice of gout[i + 1], so the shared
    gradient buffer B only needs w[i] channels (env UFSM_CHUNK_UP=0 turns it off) */
-static int g_chunk = -1, g_lean = -1;
+static int g_chunk = -1, g_lean = -1, g_wide_up = -1;
+void unet_set_wide_up_grad(int on) { g_wide_up = on != 0; }
+int unet_wide_up_grad(void) { return g_wide_up >= 0 ? g_wide_up : ufsm_env_on("UFSM_WIDE_UP_GRAD"); }
 void unet_set_lean(int on) { g_lean = on; }
 static int lean(void) { if (g_lean < 0) g_lean = getenv("UFSM_LEAN") ? atoi(getenv("UFSM_LEAN")) : 0; return g_lean; }
 void unet_set_chunk_up(int on) { g_chunk = on; }
@@ -428,6 +430,10 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 shape5 so = u->ls[i]; so.c = w[i];
                 size_t gob = gmx ? nn_mx8_bytes(so) : shape_numel(so) * (GBF ? 2 : 4);
                 if (u->nob && i < L - 1) { shape5 up = u->ls[i]; up.c = w[i + 1]; if (act_bytes_of(up) > gob) gob = act_bytes_of(up); }   /* also holds the MX up transient (level 1: 34 vs 33 B) */
+                if (u->nob && gmx && i == 0 && i < L - 1 && unet_wide_up_grad()) {
+                    shape5 up = u->ls[i]; up.c = w[i + 1];
+                    size_t ub = nn_mx8_bytes(up); if (ub > gob) gob = ub;
+                }   /* optional full finest-level up gradient; the chunk loop still defers the aliased skip write */
                 u->gA[i] = A;
                 u->gout[i] = gmx ? dalloc_grad_mx(u, gob) : dalloc_grad(u, gob / (GBF ? 2 : 4) + 1);
                 u->gskip[i] = i < L - 1 ? u->gout[i] : nullptr;

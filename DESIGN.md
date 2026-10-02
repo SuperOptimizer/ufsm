@@ -149,6 +149,25 @@ the full-size comparisons. The materialized 48-to-16 decoder improves from about
 matches the frozen CUDA control. These gains are below 1% of the isolated kernel, and no
 whole-step gain is established, so production remains unchanged (`wgrad-padding-experiment.json`).
 
+An optional larger final-decoder up-gradient buffer retains lean 2's deferred skip write, but
+allows its 32-channel up part to run in one backward-data launch. Paired 40-update runs give
+0.546–0.549 samples/s against controls 0.528–0.532 (about +3%), at 14796 versus 12748 MiB;
+the 16311 MiB card retains about 1.5 GiB. Widening every decoder gives similar throughput
+at 15374 MiB and is rejected in favor of the finest level (`wide-up-step-bench.json`,
+`wide-up-finest-step-bench.json`). These are isolated-device performance comparisons.
+The default is off. `UFSM_WIDE_UP_GRAD=1` or `unet_set_wide_up_grad(1)` changes only the
+finest-level buffer under lean 2 / MX8 gradients. The memory planner counts the extra allocation;
+the measured configuration explicitly uses `UFSM_CHUNK_UP=2 UFSM_RECOMPUTE=1 UFSM_GRAD_MX8=1
+UFSM_LEAN=2`, because automatic planning conservatively reserves additional workspace.
+Changing the option rebuilds existing model buffers. Whole-network forward/gradient tests
+cover dry allocation accounting, repeated runs, rounding modes and cached-buffer transitions.
+Round-to-nearest gradients agree within FP32 reduction noise; stochastic differences remain
+below baseline seed variation, which does not establish training quality. All 35 Make test
+commands pass with coverage and current artifact hashes recorded (`wide-up-regressions.json`).
+The unchanged CUDA objects are byte-identical to the measured frozen baseline. A bounded,
+equal-update 17-source continuation from the same stored-GN checkpoint is in progress;
+the production recipe remains unchanged pending its quality comparison.
+
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is
 0.2969 versus control 0.3304, but eight partial segment boxes have 55–65% positives within their
