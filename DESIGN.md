@@ -6,6 +6,75 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Current production audit (2026-10-01)
+
+The long training run is on hold while training and inference throughput and large-window accuracy are
+checked. The target is approximately 500 cubed on one 16 GB GPU; 512 is a measured candidate, not a
+requirement to reject a faster nearby shape. Historical timings below include other batch sizes,
+two-GPU runs, shared GPUs, and earlier kernels; they are not directly comparable to this audit.
+
+The recovered work and benchmark artifacts are in `runs/recovery512/`. Dirty experimental branches
+were archived before changes were integrated. The stochastic-rounding seed was missing from the MX
+activation / FP8 weight-gradient dispatch; the fix restores step-dependent rounding and has a regression
+test. Prediction and scoring errors now fail the confirmation instead of producing incomplete score rows.
+Scoring respects each source's minimum available label resolution.
+
+Single-GPU batch-1 measurements with the recovered memory changes:
+
+| training window | steady samples/s | million voxels/s | observed peak GPU memory, MiB |
+|---|---:|---:|---:|
+| 480 | 0.623 | 68.9 | 11826 |
+| 496 | 0.560 | 68.3 | 13010 |
+| 512 | 0.515 | 69.1 | 14272 |
+| 528 | 0.461 | 67.9 | 13280 |
+
+These are short runs, not accuracy comparisons. 512 leaves about 2 GiB unused on the 16311 MiB card.
+Dropping the saved coarse decoder SiLU buffers and packing four-channel MX inputs into eight-wide
+rows recovered that margin. 528 selects lean 2 and has more margin but no throughput advantage.
+The first kernel sweep's apparent improvements with shorter weight-gradient chunks were invalid:
+their spatial launch grid exceeded grid.z's 65535-block limit, so some gradients were never computed.
+Low-precision kernel launch errors had been cleared into a separate buffer which the trainer did not
+check. The correction joins that buffer into `nn_check` and puts the spatial grid in grid.x, which has
+a larger limit. Those benchmark runs must not be used as accuracy or speed evidence. Weight gradients
+accounted for about 42% of the valid original step; forward and backward-data also need examination
+to establish remaining speed headroom.
+
+After the grid fix, the valid paired 24-step timings at 512 are 0.514 samples/s with FP4 stride-1
+weight gradients and 0.505 with FP8 weight gradients. ZC=4 takes 0.482 and ZC=1 takes 0.345, so
+the existing ZC=12 remains the choice. Both complete all weight-gradient operations. The full test
+suite passes, including both split precision presets and the new large-grid/error-propagation tests.
+The execution manifest now reports actual dispatch separately from requested policy: the input conv
+is FP8, most stride-1 convolutions use FP4, downsampling uses FP8 forward/weight-gradient and FP32
+backward-data arithmetic, and the head uses FP32. Storage and FP32 accumulation are separate from
+the operand precision; master weights and optimizer state remain FP32 unless explicitly quantized.
+
+Inference at window 528 / halo 8, on the same cached MANBp 1024-cubed output and checkpoint, took a
+median 4.97 seconds with the previous host pipeline and head, 4.35 with device statistics and shard
+placement, and 4.28 with the new head. Both changes produced byte-identical output across all
+1,073,741,824 voxels. These end-to-end measurements include startup and writing. The GPU statistics
+and clipped placement also have CPU-reference tests. Sparse boxes can favor smaller windows by
+skipping more air; window 288 / halo 16 took 3.49 seconds here. A model trained at 512 still needs an
+accuracy comparison across inference sizes because its GroupNorm statistics depend on the window.
+With profiling and error propagation enabled, the same FP4 inference takes about 4.43 seconds versus
+5.37 with FP8 compute/storage. FP16 input gives 4.29 and 5.40 seconds respectively (two repetitions).
+These numbers are preliminary throughput measurements, not an accuracy selection for changed storage.
+Forcing three resident blocks on the register-heavy 16-channel FP4 convolution preserved the output
+but made inference about 5% and training about 4% slower; that variant was rejected. Batching complete
+staging rows reduced live registers without recomputing the input and was also byte-identical, but
+inference was about 3% and training about 1.5% slower. Neither experiment is integrated; the measured
+stock kernels remain the choice. Their source and results are retained under `runs/recovery512/`.
+
+The recovered 17-source confirmation now has scores for all 16 held-out boxes. Its FP4-minus-FP16
+mean best-threshold hard F1 is -0.0025, with a worst difference of -0.019 on MANBp. Both models were
+trained at 64 and scored at 528, and eight segment boxes have uninformative all-foreground optima.
+This is diagnostic evidence, not a production precision acceptance test. Large-window paired runs,
+threshold calibration, seam checks, and a final precision choice remain necessary. `train --seconds`
+and `--warmup-seconds` now allow comparisons using an actual wall-clock budget and time-based LR
+scheduling instead of guessed step counts.
+Accuracy trials can also score `predict --ema 0` (current weights) as well as the default EMA weights.
+EMA's horizon is measured in optimizer steps, so large-window trials with few steps can otherwise
+look worse merely because their EMA has not caught up. The output metadata records which view was used.
+
 ## Constraints
 - Host code is C23 (`gcc -std=c23`). GPU kernels are `.cu` files compiled by nvcc and linked into the
   same binary. No cuDNN, no cuBLAS: every kernel is ours.
@@ -53,7 +122,7 @@ Resolution: one model across voxel sizes, rung k = 0.6 x 2^k um; labels are pool
 4. `nn.cu`: conv3d 3^3 fwd/bwd, GroupNorm, SiLU, stride-2 conv, trilinear up, concat, BCE+Dice, AdamW,
    EMA; each op has a CPU reference and a finite-difference gradient test.
 5. `train`: LR warmup + cosine, raw-binary checkpoints with a JSON header, CSV log, held-out boxes.
-6. `predict`: sliding-window inference with Gaussian blend, writes a volcomp zarr v3 pyramid in the
+6. `predict`: sliding-window inference with halo cropping into output shards, writes a volcomp zarr v3 pyramid in the
    published layout.
 7. `eval`: recall/precision/offset against held-out meshes and label boxes.
 

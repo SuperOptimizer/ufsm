@@ -85,10 +85,14 @@ build/test_formats: tests/test_formats.c $(OBJ) build/nn.o build/nn_fp8.o
 build/test_json: tests/test_json.c build/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
+build/test_eval: tests/test_eval.c src/eval.c $(SAMPLE_TEST_OBJ)
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_eval.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
+
 build:
 	mkdir -p build
 
-test: build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
+test: build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
+	./build/test_eval
 	./build/test_sample_ops
 	./build/test_mx
 	./build/test_mx4

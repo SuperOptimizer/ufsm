@@ -18,7 +18,10 @@ int main(int argc, char **argv) {
     struct { const char *nm; int ci, co, s; } L[] = {{"16->16 @96", 16, 16, 96}, {"32->32 @48", 32, 32, 48}, {"64->64 @24", 64, 64, 24}, {"80->80 @12", 80, 80, 12}, {"48->16 @96", 48, 16, 96}, {"96->32 @48", 96, 32, 48}};
     printf("%-12s %8s %8s %8s  ms (min of %d)\n", "conv", "fp8", "fp4", "fp4+Had", it);
     for (int l = 0; l < (int)(sizeof L / sizeof L[0]); l++) {
-        shape5 xs = {2, L[l].ci, L[l].s, L[l].s, L[l].s}, ys = xs; ys.c = L[l].co;
+        if (getenv("BW_LAYER") && l != atoi(getenv("BW_LAYER"))) continue;
+        int P = getenv("BW_P") ? atoi(getenv("BW_P")) : 96;
+        int S = L[l].s * P / 96, B = getenv("BW_B") ? atoi(getenv("BW_B")) : 2;
+        shape5 xs = {B, L[l].ci, S, S, S}, ys = xs; ys.c = L[l].co;
         /* BW_MX=1: the training storage of --fp4: mx4 x, mx8 gy (random data, so the decode does real work) */
         const int mx = getenv("BW_MX") ? atoi(getenv("BW_MX")) : 0;
         const size_t bx = (mx & 1) ? lp_mx4_bytes(xs.n, xs.c, shape_spatial(xs)) : shape_numel(xs) * 2, bg = (mx & 2) ? lp_mx8_bytes(ys.n, ys.c, shape_spatial(ys)) : shape_numel(ys) * 2;

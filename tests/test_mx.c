@@ -259,6 +259,23 @@ int main(void) {
             cmp(nm, deq(gxm, xs), gxr, nx, TOL);
         }
     }
+    {   /* decoder conv1 with the up segment read from the coarse PRE-GN tensor: GN+SiLU of the coarse rows inside the up staging (no kept s2) */
+        shape5 fs = {N, 48, 12, 12, 16}, co = {N, 32, 6, 6, 8}, fu = fs, sk = fs, o16 = fs; fu.c = 32; sk.c = 16; o16.c = 16;
+        size_t NG = (size_t)N * G;
+        float *xc = dev_rand(shape_numel(co), 2.f), *xs_ = dev_rand(shape_numel(sk), 2.f);
+        void *xcm = mx_from(xc, co), *xsm = mx_from(xs_, sk); float *xcd = deq(xcm, co), *xsd = deq(xsm, sk);
+        float *gam = dev_rand(16, 1.f), *bet = dev_rand(16, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        float *gac = dev_rand(32, 1.f), *bec = dev_rand(32, 0.5f), *mec = dev_rand(NG, 0.2f), *rsc = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); nn_d2h(h, rsc, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rsc, h, NG * 4); }
+        float *w = dev_rand((size_t)16 * 48 * 27, 0.1f), *b = dev_rand(16, 0.1f);
+        float *tc = dev_zero(shape_numel(co)), *up = dev_zero(shape_numel(fu)), *t = dev_zero(shape_numel(sk)), *cat = dev_zero(shape_numel(fs)), *yr = dev_zero(shape_numel(o16));
+        mode_ref(); nn_gn_silu_apply(xcd, co, G, gac, bec, mec, rsc, tc); nn_up2_fwd_into(tc, co, up, 32, 0); nn_gn_silu_apply(xsd, sk, G, gam, bet, mean, rstd, t); nn_concat_fwd(up, 32, t, 16, fs, cat); nn_conv3d_fwd(cat, fs, w, b, 16, 3, 1, yr);
+        nn_gn_t gc = {gac, bec, mec, rsc, G}, g2 = {gam, bet, mean, rstd, G};
+        void *ym = mx_new(o16);
+        mode_mx(); int rv = nn_conv3d_fwd_x(xcm, &gc, xsm, &g2, 32, 1, fs, w, b, 16, 3, 1, (float *)ym, 0, 1e-5f, NULL, NULL);
+        if (rv) { printf("  dec conv1 up segment with GN: unsupported (rv %d)  FAIL\n", rv); bad++; }
+        else cmp("dec conv1 up segment from coarse pre-GN MX", deq(ym, o16), yr, shape_numel(o16), TOL);
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     printf(bad ? "mx FAIL (%d)\n" : "mx ok\n", bad);
     return bad != 0;

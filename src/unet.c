@@ -20,7 +20,18 @@ static void prof_collect(double *cat) {
     for (int i = 0; i < 8; i++) cat[i] = 0;
     for (int k = 0; k < PROF_NK; k++) { cat[k % 8] += ms[k]; if (k >= 8 && k % 8 < 3) g_prof_slot[k / 8 - 1][k % 8] += ms[k]; }
 }
-void unet_prof_report(void) { if (g_prof > 0) { double ms[8]; prof_collect(ms); double tot = 0; for (int i = 0; i < 7; i++) tot += ms[i]; for (int i = 0; i < 7; i++) if (ms[i] > 0) fprintf(stderr, "  %-14s %8.1f ms  %4.1f%%\n", g_names[i], ms[i], 100 * ms[i] / tot); } }
+void unet_prof_report(void) {
+    if (g_prof > 0) {
+        double ms[8]; prof_collect(ms); double tot = 0;
+        for (int i = 0; i < 7; i++) tot += ms[i];
+        for (int i = 0; i < 7; i++) if (ms[i] > 0) fprintf(stderr, "  %-14s %8.1f ms  %4.1f%%\n", g_names[i], ms[i], 100 * ms[i] / tot);
+        if (g_prof == 2) for (int i = 0; i < UNET_NSLOT; i++) {
+            if (g_prof_slot[i][0] + g_prof_slot[i][1] + g_prof_slot[i][2] > 0)
+                fprintf(stderr, "  slot %2d fwd %.1f bwd_data %.1f bwd_w %.1f ms\n", i, g_prof_slot[i][0], g_prof_slot[i][1], g_prof_slot[i][2]);
+            for (int j = 0; j < 3; j++) g_prof_slot[i][j] = 0;
+        }
+    }
+}
 void unet_prof_layers_on(int on) { PROF_INIT(); g_prof = on ? 2 : 0; }
 static double g_prof_cat[8];
 void unet_prof_layers(double out[][3]) {
@@ -83,6 +94,7 @@ struct unet {
     size_t conv_scratch_n, act_bytes, grad_bytes;
     size_t gB_bytes, gA_bytes;               /* capacity of the shared gradient buffers B and A */
     size_t gB_cap[UNET_MAXLEV];              /* capacity of gB[i] (noB: gout[i]) */
+    size_t gout_cap[UNET_MAXLEV];            /* bytes of gout[i] */
     int rc_ok; size_t rc_cap;                /* lean 2: a transient in gB[level] is allowed now; capacity of the transient's buffer */
     int nob;                                 /* lean 2: no buffer B; a block's own gout / gskip is its B (in-place GroupNorm backward) */
     size_t logits_bytes;                     /* lean: logits at the start of A, the 16-bit logit gradient after them */
@@ -300,7 +312,7 @@ static void build_block_acts(unet *u, block *b, shape5 xs, int train, int keep_s
     int G = G_of(u, b->c1.cout);
     (void)train;
     b->a1 = a1 ? a1 : dalloc_act_s(u, b->ys); b->a2 = a2 ? a2 : dalloc_act_s(u, b->ys);
-    b->s2 = recompute() && !keep_s2 ? nullptr : dalloc_act_s(u, b->ys);
+    b->s2 = recompute() && (!keep_s2 || act_mx8()) ? nullptr : dalloc_act_s(u, b->ys);   /* MX: the up staging normalises a2 itself */
     b->m1 = dalloc(u, (size_t)xs.n * G); b->r1 = dalloc(u, (size_t)xs.n * G); b->m2 = dalloc(u, (size_t)xs.n * G); b->r2 = dalloc(u, (size_t)xs.n * G);
 }
 static size_t act_bytes_of(shape5 s) { return act_mx8() ? nn_mx_bytes(s, act_dt()) : shape_numel(s) * (ABF ? 2 : 4); }
@@ -389,6 +401,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 u->gA[i] = A;
                 u->gout[i] = gmx ? dalloc_grad_mx(u, gob) : dalloc_grad(u, gob / (GBF ? 2 : 4) + 1);
                 u->gskip[i] = i < L - 1 ? u->gout[i] : nullptr;
+                u->gout_cap[i] = gmx ? gob : (gob / (GBF ? 2 : 4) + 1) * (GBF ? 2 : 4);
                 if (u->nob) { u->gB[i] = u->gout[i]; u->gB_cap[i] = gob; }   /* no B: the level's own gradient buffer serves as B */
                 else { u->gB[i] = B; u->gB_cap[i] = u->gB_bytes; }
             }
@@ -520,6 +533,16 @@ static float *rc_up(unet *u, block *b, int level, int *reg) {
     float *p = rc_tmp(u, level, us, reg);
     nn_gn_t g = gn_out(u, xb);
     if (xb->s2) PROF(5, nn_up2_fwd_into(xb->s2, xb->ys, p, b->c_split, 0));
+    else if (u->train && act_mx8() && g_in_bwd && level + 1 < u->cfg.nlev && u->gout_cap[level + 1] >= act_bytes_of(xb->ys)) {
+        /* no kept s2 under MX storage: silu(gn(a2)) of the coarse block once into gout[level + 1] (free until this block's up-part
+           gradient chunks write it), then the plain upsample (the GN inside up2_mx_k ran 8x per fine voxel: 3.6 vs 0.8 ms) */
+        float *t = u->gout[level + 1];
+        const int dt0 = nn_storage(t);
+        nn_set_storage(t, act_bytes_of(xb->ys), act_dt());
+        PROF(3, nn_gn_silu_apply(xb->a2, xb->ys, g.G, g.gamma, g.beta, g.mean, g.rstd, t));
+        PROF(5, nn_up2_fwd_into(t, xb->ys, p, b->c_split, 0));
+        if (dt0) nn_set_storage(t, u->gout_cap[level + 1], dt0); else nn_storage_forget(t);
+    }
     else PROF(5, nn_up2_fwd_gn_into(xb->a2, xb->ys, &g, p, b->c_split, 0));
     sp_halo(u, p, us, 0);
     return p;
@@ -537,6 +560,10 @@ static int dec_conv1(unet *u, block *b, int level, float *y, int G, float *m, fl
     if (fused_up(u) && xb->s2) {
         if (gy) PROF(2, rv = nn_conv3d_bwd_weight_x(xb->s2, nullptr, x2b->a2, &g2, b->c_split, 1, b->xs, gy, b->ys, 3, 1, gw, gbias));
         else PROF(0, rv = nn_conv3d_fwd_x(xb->s2, nullptr, x2b->a2, &g2, b->c_split, 1, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, y, G, 1e-5f, m, r));
+        if (!rv) return 0;
+    } else if (fused_up(u) && !gy && act_mx8()) {   /* no kept s2 (MX storage): the up staging applies the coarse block's GN+SiLU to its a2 */
+        nn_gn_t gxb = gn_out(u, xb);
+        PROF(0, rv = nn_conv3d_fwd_x(xb->a2, &gxb, x2b->a2, &g2, b->c_split, 1, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, y, G, 1e-5f, m, r));
         if (!rv) return 0;
     }
     int reg; float *up = rc_up(u, b, level, &reg);
@@ -593,8 +620,8 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     const int *w = u->cfg.widths;
     const float *cur = x;
     if (x_h16 && !ABF) { fprintf(stderr, "unet_forward_x: a 16-bit input needs the 16-bit activation storage\n"); abort(); }
-    /* the network input stays 16-bit under MX storage too (4 channels: an MX block row would hold 16): enc0.c1 reads it with the
-       fp8 tap-packed kernel into an MX a1, its weight gradient with vector loads (UFSM_XIN_MX=1: the former MX copy) */
+    /* Without MX gradients the four-channel input can stay 16-bit; the tap-packed FP8 kernel writes MX a1.
+       MX gradients require a packed input for the available weight-gradient kernels (eight-wide MX rows). */
     static int xin_env = -1; if (xin_env < 0) xin_env = getenv("UFSM_XIN_MX") ? atoi(getenv("UFSM_XIN_MX")) : 0;
     const int xin_mx = xin_env || grad_mx8();   /* MX-fp8 gradients: the enc0.c1 weight gradient needs an MX x (no 16-bit x / MX gy kernel) */
     if (ABF && !x_h16) { if (!u->xin) u->xin = xin_mx ? dalloc_act_s(u, xs) : dalloc_act(u, shape_numel(xs)); nn_f32_to_act(x, xs, u->xin); cur = u->xin; }
@@ -1073,7 +1100,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     const float *arrs[4] = {u->p, u->ema, u->m, u->v};
     for (int a = 0; a < 4; a++) { nn_d2h(h, arrs[a], u->np * 4); if (fwrite(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; } }
     free(h);
-    fclose(f);
+    if (fclose(f)) return -1;
     return rename(tmp, path);
 }
 

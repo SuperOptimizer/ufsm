@@ -26,6 +26,11 @@ extern "C" void nn_set_layer_prec(int id, int p) { lprec_init(); if (id >= 0 && 
 /* finer policy: per conv of a layer (sub 0 = c1, 1 = c2; down / head use sub 0) and per pass (0 forward, 1 backward-data,
    2 weight gradient); 0 = not set (falls back to the layer precision, then the global one) */
 static int g_sub = -1, g_pass = 0;
+static unsigned g_exec_prec[NN_MAXLAYER][2][3];
+static void exec_prec(int pass, int p) {
+    if (g_layer >= 0 && g_layer < NN_MAXLAYER)
+        __atomic_fetch_or(&g_exec_prec[g_layer][g_sub > 0 ? 1 : 0][pass], 1u << p, __ATOMIC_RELAXED);
+}
 /* stochastic rounding of fp8 gradient operands: one seed per conv call, derived from the step (deterministic per step) */
 static int g_sr = -1; static unsigned g_sr_step = 0, g_sr_ctr = 0;
 static int sr_on(void) { if (g_sr < 0) { const char *e = getenv("UFSM_SR"); g_sr = e ? atoi(e) : 0; } return g_sr; }
@@ -68,8 +73,8 @@ static int eff_prec_pass(int pass) {
 static int eff_prec(void) { return eff_prec_pass(g_pass); }
 static int eff_prec_w(void) { return eff_prec_pass(2); }
 extern "C" int nn_cur_prec(void) { return eff_prec(); }
-/* effective precision manifest: what each conv's three passes actually resolve to under the current global prec, layer
-   policy and wgrad override (storage modes are appended by the caller). Written next to checkpoints. */
+/* Requested precision policy; packed storage and unsupported kernel shapes can select a different compute path.
+   nn_exec_manifest reports the paths observed during execution. Storage modes are appended by the caller. */
 extern "C" int nn_prec_parse(const char *s) {
     static const char *nm[] = {"fp32", "bf16", "fp8", "fp4", "fp16"};
     for (int i = 0; i < 5; i++) if (!strcmp(s, nm[i])) return i;
@@ -125,13 +130,32 @@ static const char *pname16(int p) { return p == 1 && g_h16 ? "fp16" : nn_prec_na
 extern "C" int nn_prec_manifest(char *buf, size_t n) {
     static const char *names[] = {"enc0", "enc1", "enc2", "enc3", "down0", "down1", "down2", "dec2", "dec1", "dec0", "head"};
     int sl = g_layer, ss = g_sub; size_t off = 0;
-    off += (size_t)snprintf(buf + off, n - off, "prec %s sr %d policy:", pname16(g_prec), sr_on());
-    for (int l = 0; l < 11 && off < n; l++) for (int s2 = 0; s2 < (l >= 4 && l <= 6 ? 1 : l == 10 ? 1 : 2); s2++) {
+    if (!n) return 0;
+    off += (size_t)snprintf(buf + off, n - off, "prec %s sr %d requested_policy:", pname16(g_prec), sr_on());
+    for (int l = 0; l < 11 && off < n; l++) for (int s2 = 0; s2 < (l >= 4 && l <= 6 ? 1 : l == 10 ? 1 : 2) && off < n; s2++) {
         g_layer = l; g_sub = (l >= 4 && l <= 6) || l == 10 ? -1 : s2;
         off += (size_t)snprintf(buf + off, n - off, " %s%s=%s:%s:%s", names[l], g_sub < 0 ? "" : s2 ? ".c2" : ".c1", pname16(eff_prec_pass(0)), pname16(eff_prec_pass(1)), pname16(eff_prec_pass(2)));
     }
     g_layer = sl; g_sub = ss;
-    return (int)off;
+    return (int)(off < n ? off : n - 1);
+}
+extern "C" int nn_exec_manifest(char *buf, size_t n) {
+    static const char *names[] = {"enc0", "enc1", "enc2", "enc3", "down0", "down1", "down2", "dec2", "dec1", "dec0", "head"};
+    if (!n) return 0;
+    size_t off = (size_t)snprintf(buf, n, "executed_compute (fwd:bwd_data:wgrad; - = not observed):");
+    for (int l = 0; l < 11 && off < n; l++) for (int s2 = 0; s2 < ((l >= 4 && l <= 6) || l == 10 ? 1 : 2) && off < n; s2++) {
+        off += (size_t)snprintf(buf + off, n - off, " %s%s=", names[l], l >= 4 && (l <= 6 || l == 10) ? "" : s2 ? ".c2" : ".c1");
+        for (int pass = 0; pass < 3 && off < n; pass++) {
+            if (pass) off += (size_t)snprintf(buf + off, n - off, ":");
+            unsigned mask = __atomic_load_n(&g_exec_prec[l][s2][pass], __ATOMIC_RELAXED);
+            if (!mask && off < n) off += (size_t)snprintf(buf + off, n - off, "-");
+            int sep = 0;
+            for (int p = 0; p < 5 && off < n; p++) if (mask & (1u << p)) {
+                off += (size_t)snprintf(buf + off, n - off, "%s%s", sep ? "|" : "", pname16(p)); sep = 1;
+            }
+        }
+    }
+    return (int)(off < n ? off : n - 1);
 }
 extern "C" int nn_get_f16(void) { return g_h16; }
 #define LPDT(flag) ((flag) ? (g_h16 ? 2 : 1) : 0)   /* storage code of the lp_* (nn_fp8.cu) entry points: 0 fp32, 1 bf16, 2 fp16 */
@@ -144,6 +168,7 @@ extern "C" int nn_get_grad_bf16(void) { return g_gradbf; }
 #define GBF (ABF && g_gradbf)
 
 static cudaError_t g_err = cudaSuccess;
+extern "C" const char *lp_check(void);
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess && g_err == cudaSuccess) g_err = e_; } while (0)
 #define KCHECK() CK(cudaGetLastError())
 
@@ -152,7 +177,8 @@ extern "C" const char *nn_check(void) {
     cudaError_t e = g_err;
     g_err = cudaSuccess;
     if (e == cudaSuccess) e = cudaGetLastError();
-    return e == cudaSuccess ? nullptr : cudaGetErrorString(e);
+    const char *lp_error = lp_check();   /* low-precision kernels clear CUDA's last error into their own buffer */
+    return e == cudaSuccess ? lp_error : cudaGetErrorString(e);
 }
 extern "C" void *nn_malloc(size_t n) { void *p = nullptr; CK(cudaMalloc(&p, n)); return p; }
 /* ---- per-tensor storage registry: a tensor registered as MX-fp8 (dt 8) takes the MX paths of the ops that read or
@@ -177,8 +203,8 @@ static inline int mxdt_of(const void *p) { int d = g_nreg ? nn_storage(p) : 0; r
 #define MXDT(p) mxdt_of(p)
 #define ISMX(p) (mxdt_of(p) != 0)
 #define ISMX4(p) (mxdt_of(p) == 4)
-extern "C" size_t nn_mx8_bytes(shape5 s) { int bw = s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw + 1); }   /* = lp_mx8_bytes */
-extern "C" size_t nn_mx4_bytes(shape5 s) { int bw = s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw / 2 + 1); }   /* = lp_mx4_bytes */
+extern "C" size_t nn_mx8_bytes(shape5 s) { int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw + 1); }   /* = lp_mx8_bytes */
+extern "C" size_t nn_mx4_bytes(shape5 s) { int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw / 2 + 1); }   /* = lp_mx4_bytes */
 extern "C" size_t nn_mx_bytes(shape5 s, int dt) { return dt == 4 ? nn_mx4_bytes(s) : nn_mx8_bytes(s); }   /* registry dt */
 extern "C" void nn_free(void *p) { if (p) { if (g_nreg) nn_storage_forget(p); CK(cudaFree(p)); } }
 extern "C" void nn_zero(void *p, size_t n) { CK(cudaMemset(p, 0, n)); }
@@ -1208,6 +1234,8 @@ plain:
    ts != nullptr: parity-decomposed stride-2 backward-data (x = gy on its own grid, output scattered into gx) */
 static int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts = nullptr) {
     const int pr = eff_prec();
+    const int mx = ISMX(x) || ISMX(y);
+    exec_prec(g_pass, !ts && mx ? xs.c <= 8 ? 2 : MXDT(x) == 4 || pr == 3 ? 3 : 2 : !ts && !sp.up && (pr == 2 || pr == 3) ? xs.c <= 8 && pr == 3 ? 2 : pr : pr == 4 ? 4 : 1);
     if (!ts && (ISMX(x) || ISMX(y))) {   /* MX activation storage (fp8 or fp4): staged from the stored rows; fp4 storage or a
                                             prec-3 policy runs the fp4 kernel, else fp8 compute (copy staging) */
         const int mdt = MXDT(x);
@@ -1253,6 +1281,7 @@ static int conv_fwd_tc_s2_h(const void *x, int xbf, shape5 xs, const float *w, c
     return 0;
 }
 static int conv_fwd_tc_s2(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp = {}) {
+    exec_prec(g_pass, ISMX(x) || ISMX(y) || ((eff_prec() == 2 || eff_prec() == 3) && xbf == ybf) ? 2 : 1);
     if (ISMX(x) || ISMX(y)) { if (MXDT(x) != MXDT(y)) { fprintf(stderr, "conv s2: MX storage needs MX input and output of one format\n"); abort(); } return lp_conv_fwd_s2_f8(x, MXDT(x), xs, w, b, cout, y, MXDT(y), ys, gp); }
     if ((eff_prec() == 2 || eff_prec() == 3) && xbf == ybf) return lp_conv_fwd_s2_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), ys, gp);
     return g_h16 ? conv_fwd_tc_s2_h<f16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp) : conv_fwd_tc_s2_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp);
@@ -1278,6 +1307,7 @@ extern "C" shape5 nn_conv3d_out_shape(shape5 xs, int cout, int k, int stride) {
 }
 
 extern "C" void nn_conv3d_fwd(const float *x, shape5 xs, const float *w, const float *b, int cout, int k, int stride, float *y) {
+    if (k == 1 || !g_tf32) exec_prec(g_pass, 0);
     if (k == 1 && g_tf32 && ISMX(x)) { lp_conv1_fwd_mx(x, MXDT(x), xs, w, b, cout, y, gnp_t{}); KCHECK(); return; }   /* head reading an MX tensor (fp32 output) */
     shape5 ys = nn_conv3d_out_shape(xs, cout, k, stride);
     if (k == 3 && stride == 1 && g_tf32) { gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0}; split_t ns = {nullptr, 0, nullptr, 0}; conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, none, nullptr, 0, ns); KCHECK(); return; }
@@ -1376,6 +1406,7 @@ static void bwd_data_impl(const float *gy, shape5 ys, const float *w, shape5 xs,
 }
 static void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch, int accum) {
     int T = k * k * k;
+    if (k == 1 || !g_tf32 || (stride == 2 && (ISMX(gy) || ISMX(gx)))) exec_prec(1, 0);
     if (stride == 1) {
         size_t nw = (size_t)ys.c * xs.c * T;
         flip_w_k<<<nblk(nw, 256), 256>>>(w, scratch, ys.c, xs.c, T);
@@ -1413,6 +1444,7 @@ static void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs
             if (!fused) conv_fwd_tc(gy, GBF, ys, scratch, nullptr, xs.c, gx, GBF, none, nullptr, 0, ns, &ts);
         }
         if (fused) {   /* stage the gy tile once, run the 8 classes from it */
+            exec_prec(1, fprec == 4 ? 4 : 1);
             if (g_h16) s2b_fused<f16>(gy, ys, xs, gx, scratch, all, accum, fprec == 4);
             else s2b_fused<bf16>(gy, ys, xs, gx, scratch, all, accum, fprec == 4);
         }
@@ -1675,12 +1707,16 @@ static int f4_had_w(void) {   /* bit 0: Hadamard (UFSM_F4_HAD_W), bit 1: stochas
     return v;
 }
 static void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
+    exec_prec(2, eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x)) ? 3 : ISMX(x) || ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) ? 2 : 1);
     if (eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x))) {   /* sp.up: MX only (fused upsample in the tile decode) */
         if (sr_on()) sp.sr = sr_seed();
         lp_bwd_w_f4(x, ISMX(x) ? MXDT(x) : LPDT(xbf), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(gybf), ys, gw, gb, gp, sp, f4_had_w());
         return;
     }
-    if (ISMX(x)) { lp_bwd_w_f8(x, MXDT(x), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(gybf), ys, gw, gb, gp, sp); return; }
+    if (ISMX(x)) {
+        if (sr_on()) sp.sr = sr_seed();   /* MX activations still need SR when gy is requantised to fp8 */
+        lp_bwd_w_f8(x, MXDT(x), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(gybf), ys, gw, gb, gp, sp); return;
+    }
     if ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) { if (sr_on()) sp.sr = sr_seed(); }
     if ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) { lp_bwd_w_f8(x, LPDT(xbf), xs, gy, LPDT(gybf), ys, gw, gb, gp, sp); return; }   /* prec 4 (fp16) keeps the 16-bit kernel for the weight gradient */
     if (g_h16) launch_bwd_w_tc_h<f16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
@@ -1858,6 +1894,8 @@ static void bwd_w1_h(const float *x, shape5 xs, const float *gy, shape5 ys, floa
     else conv_bwd_w1_k<float, float, 64><<<nb, 256>>>(x, gy, gw, xs.n, xs.c, ys.c, So, xg);
 }
 extern "C" void nn_conv3d_bwd_weight(const float *x, shape5 xs, const float *gy, shape5 ys, int k, int stride, float *gw, float *gb) {
+    if (k == 1 || !g_tf32) exec_prec(2, 0);
+    else if (stride == 2) exec_prec(2, ISMX(x) || eff_prec_w() == 2 || eff_prec_w() == 3 ? 2 : 1);
     size_t So = shape_spatial(ys);
     if (k == 3 && stride == 1 && g_tf32) {
         gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0};
@@ -2033,7 +2071,7 @@ static int up_kernel_ok(const float *x, const float *x2, int wgrad) {
 }
 static int xsplit(const float *x2, const nn_gn_t *gx, const nn_gn_t *gx2, int c_split, int up, shape5 xs, split_t *sp) {
     *sp = split_t{};
-    if (up && (!x2 || (gx && gx->G) || ((xs.d | xs.h | xs.w) & 1))) return -1;   /* up: decoder split, x untransformed, even dims */
+    if (up && (!x2 || ((xs.d | xs.h | xs.w) & 1))) return -1;   /* up: decoder split, even dims (a GN on x: MX forward only, see the callers) */
     if (!x2) return 0;
     sp->up = up;
     if ((gx && gx->G) && !(gx2 && gx2->G)) { fprintf(stderr, "conv: a split input with a GroupNorm on x needs one on x2\n"); return -1; }
@@ -2048,6 +2086,7 @@ extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x
     if (k == 3 && stride == 1) {
         split_t sp; if (xsplit(x2, gx, gx2, c_split, up, xs, &sp)) return -1;
         if (up && !up_kernel_ok(x, x2, 0)) return -1;
+        if (up && gx && gx->G && !ISMX(x)) return -1;   /* GN+SiLU of the coarse x inside the up staging: MX kernels only */
         double *sums = nullptr;
         if (G_out) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); sp = zs_split(sp, ys.d); }
         conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, sp);
@@ -2058,6 +2097,7 @@ extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x
     if (x2 || up || G_out) return -1;
     if (k == 3 && stride == 2) { conv_fwd_tc_s2(x, ABF, xs, w, b, cout, y, ABF, ys, gp); KCHECK(); return 0; }
     if (k == 1 && stride == 1) {
+        exec_prec(0, 0);
         if (ISMX(x)) lp_conv1_fwd_mx(x, MXDT(x), xs, w, b, cout, y, gp);
         else { size_t S = shape_spatial(xs); dim3 gr(nblk((size_t)xs.n * S, 256));
             if (ABF && g_h16) conv1_f_k<f16, float><<<gr, 256>>>((const f16 *)x, w, b, y, xs.n, xs.c, cout, S, gp);
@@ -2075,12 +2115,14 @@ extern "C" int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const f
     if (k == 3 && stride == 1) {
         split_t sp; if (xsplit(x2, gx, gx2, c_split, up, xs, &sp)) return -1;
         if (up && !up_kernel_ok(x, x2, 1) && !mx_up_w_ok(x, x2, c_split, xs)) return -1;
+        if (up && gx && gx->G) return -1;   /* transformed up input is forward-only */
         launch_bwd_w_tc(x, ABF, xs, gy, GBF, ys, gw, gb, gp, sp);
         KCHECK();
         return 0;
     }
     if (x2 || up) return -1;
     if (k == 3 && stride == 2) {
+        exec_prec(2, ISMX(x) || eff_prec_w() == 2 || eff_prec_w() == 3 ? 2 : 1);
         if (ISMX(x)) lp_bwd_w_s2_f8(x, MXDT(x), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(GBF), ys, gw, gb, gp);
         else if (eff_prec_w() == 2 || eff_prec_w() == 3) lp_bwd_w_s2_f8(x, LPDT(ABF), xs, gy, LPDT(GBF), ys, gw, gb, gp);
         else if (g_h16) bwd_w_s2_h<f16>(x, xs, gy, ys, gw, gb, gp); else bwd_w_s2_h<bf16>(x, xs, gy, ys, gw, gb, gp);
@@ -2088,6 +2130,7 @@ extern "C" int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const f
         return 0;
     }
     if (k == 1 && stride == 1) {
+        exec_prec(2, 0);
         size_t So = shape_spatial(ys);
         if (ISMX(x)) lp_bwd_w1_mx(x, MXDT(x), xs, gy, LPDT(GBF), ys, gw, gp);
         else if (xs.c * ys.c <= 64 && ys.c <= 8) { if (g_h16) bwd_w1_h<f16>(x, xs, gy, ys, gw, So, gp); else bwd_w1_h<bf16>(x, xs, gy, ys, gw, So, gp); }
@@ -2690,6 +2733,46 @@ __global__ void pred_out_k(const float *lg, const uint8_t *ct, size_t n, uint8_t
     if (i < n) out[i] = ct[i] ? (uint8_t)(255.f / (1.f + __expf(-lg[i])) + 0.5f) : 0;
 }
 extern "C" void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out) { pred_out_k<<<nblk(n, 256), 256>>>(lg, ct, n, out); KCHECK(); }
+/* the probability of the window's interior (halo .. W - halo) written straight into a device shard buffer (shard^3, x fastest):
+   window voxel (z, y, x) lands at shard voxel (oz + z, oy + y, ox + x) when inside [0, e) (o = window origin - shard origin) */
+__global__ void pred_place_k(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    const int I = W - 2 * halo;
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)I * I * I) return;
+    const int x = halo + (int)(i % I), y = halo + (int)((i / I) % I), z = halo + (int)(i / ((size_t)I * I));
+    const int gz = oz + z, gy = oy + y, gx = ox + x;
+    if (gz < 0 || gz >= ez || gy < 0 || gy >= ey || gx < 0 || gx >= ex) return;
+    const size_t k = ((size_t)z * W + y) * W + x;
+    dsh[((size_t)gz * shard + gy) * shard + gx] = ct[k] ? (uint8_t)(255.f / (1.f + __expf(-lg[k])) + 0.5f) : 0;
+}
+extern "C" void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    const size_t I = (size_t)(W - 2 * halo);
+    pred_place_k<<<nblk(I * I * I, 256), 256>>>(lg, ct, W, halo, oz, oy, ox, ez, ey, ex, shard, dsh); KCHECK();
+}
+/* exact window statistics (nonzero count, sum, sum of squares) of a uint8 window: integer sums, as the host loop computed */
+__global__ void pred_stats_k(const uint8_t *ct, size_t n, unsigned long long *acc) {
+    unsigned long long nz = 0, sm = 0, sq = 0;
+    for (size_t i = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) * 16; i < n; i += (size_t)gridDim.x * blockDim.x * 16) {
+        if (i + 16 <= n && !(((uintptr_t)(ct + i)) & 15)) {
+            const uint4 u = *(const uint4 *)(ct + i);
+            const unsigned w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+#pragma unroll
+                for (int b = 0; b < 4; b++) { const unsigned v = (w[j] >> (8 * b)) & 255u; nz += v != 0; sm += v; sq += v * v; }
+        } else for (size_t j = i; j < n && j < i + 16; j++) { const unsigned v = ct[j]; nz += v != 0; sm += v; sq += v * v; }
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) { nz += __shfl_xor_sync(0xffffffffu, nz, o); sm += __shfl_xor_sync(0xffffffffu, sm, o); sq += __shfl_xor_sync(0xffffffffu, sq, o); }
+    if ((threadIdx.x & 31) == 0) { atomicAdd(acc, nz); atomicAdd(acc + 1, sm); atomicAdd(acc + 2, sq); }
+}
+extern "C" void nn_pred_stats(const uint8_t *ct, size_t n, void *scratch, size_t *nz, double *sum, double *sq) {
+    unsigned long long *acc = (unsigned long long *)scratch, h[3];
+    cudaMemsetAsync(acc, 0, 3 * sizeof *acc);
+    pred_stats_k<<<256, 256>>>(ct, n, acc); KCHECK();
+    cudaMemcpy(h, acc, sizeof h, cudaMemcpyDeviceToHost);
+    *nz = (size_t)h[0]; *sum = (double)h[1]; *sq = (double)h[2];
+}
 
 /* ================= trilinear 2x (align_corners = false) =================
    out[2m] = 0.75 in[m] + 0.25 in[m-1], out[2m+1] = 0.75 in[m] + 0.25 in[m+1], neighbours clamped. */
@@ -3015,7 +3098,7 @@ static void zs_xbar(const int *dev, int k) {
 extern "C" size_t nn_split_halo_bytes(shape5 s, int esz) {   /* bytes of one plane (send / receive buffer size) */
     const size_t HW = (size_t)s.h * s.w;
     if (esz) return (size_t)s.n * s.c * HW * esz;
-    const int bw = s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw;
+    const int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw;
     return (size_t)s.n * nb * HW * (bw + 1);
 }
 /* halo exchange of tensor t[i] on device dev[i] (same shape on both, h halo planes): the innermost halo plane receives the

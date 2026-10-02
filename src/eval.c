@@ -15,16 +15,19 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
     return dflt;
 }
 
-/* binary dilation by a ball of radius tol (chebyshev) on a n^3 cube, in place via a copy */
+/* Binary dilation by an Euclidean ball. Shift whole rows so the inner loop can be vectorised;
+   scattering from each positive voxel is especially slow on large, dense predictions. */
 static void dilate(const uint8_t *in, uint8_t *out, const int64_t n[3], int tol) {
     memcpy(out, in, (size_t)n[0] * n[1] * n[2]);
-    for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {
-        if (!in[((size_t)z * n[1] + y) * n[2] + x]) continue;
-        for (int dz = -tol; dz <= tol; dz++) for (int dy = -tol; dy <= tol; dy++) for (int dx = -tol; dx <= tol; dx++) {
-            if (dz * dz + dy * dy + dx * dx > tol * tol) continue;
-            int64_t zz = z + dz, yy = y + dy, xx = x + dx;
-            if (zz < 0 || zz >= n[0] || yy < 0 || yy >= n[1] || xx < 0 || xx >= n[2]) continue;
-            out[((size_t)zz * n[1] + yy) * n[2] + xx] = 1;
+    for (int dz = -tol; dz <= tol; dz++) for (int dy = -tol; dy <= tol; dy++) for (int dx = -tol; dx <= tol; dx++) {
+        if ((!dz && !dy && !dx) || dz * dz + dy * dy + dx * dx > tol * tol) continue;
+        const int64_t z0 = dz < 0 ? -dz : 0, z1 = dz > 0 ? n[0] - dz : n[0];
+        const int64_t y0 = dy < 0 ? -dy : 0, y1 = dy > 0 ? n[1] - dy : n[1];
+        const int64_t x0 = dx < 0 ? -dx : 0, x1 = dx > 0 ? n[2] - dx : n[2];
+        for (int64_t z = z0; z < z1; z++) for (int64_t y = y0; y < y1; y++) {
+            const uint8_t *src = in + ((size_t)z * n[1] + y) * n[2];
+            uint8_t *dst = out + ((size_t)(z + dz) * n[1] + y + dy) * n[2];
+            for (int64_t x = x0; x < x1; x++) dst[x + dx] |= src[x];
         }
     }
 }

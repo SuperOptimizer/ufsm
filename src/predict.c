@@ -30,22 +30,29 @@ typedef struct {
     atomic_long consumed;        /* tiles released by the main thread */
     atomic_int failed;
     pthread_mutex_t mu; pthread_cond_t cv;
+    double t_read, t_stats, t_wait;   /* UFSM_PRED_PROF: seconds in z3_read, the stats scan, waiting for a free slot */
+    int nostats;                      /* the window statistics are computed on the device (default path) */
 } reader_t;
 static void *reader_main(void *arg) {
     reader_t *r = arg;
     size_t w3 = (size_t)r->W * r->W * r->W;
     for (long i = 0; i < r->ntiles && !atomic_load(&r->failed); i++) {
+        double tw = now();
         pthread_mutex_lock(&r->mu);
         while (i - atomic_load(&r->consumed) >= NSLOT) pthread_cond_wait(&r->cv, &r->mu);
         pthread_mutex_unlock(&r->mu);
+        double t1 = now(); r->t_wait += t1 - tw;
         int k = (int)(i % NSLOT);
         tile_t *t = &r->tiles[i];
         int64_t o[3] = {r->bo[0] + t->tz, r->bo[1] + t->ty, r->bo[2] + t->tx}, n[3] = {r->W, r->W, r->W};
         if (z3_read(r->ct, o, n, r->buf[k], r->nthreads)) { atomic_store(&r->failed, 1); }
+        else if (r->nostats) r->t_read += now() - t1;
         else {
+            double t2 = now(); r->t_read += t2 - t1;
             const uint8_t *c = r->buf[k]; size_t nz = 0; double sum = 0, sq = 0;
             for (size_t j = 0; j < w3; j++) { nz += c[j] != 0; sum += c[j]; sq += (double)c[j] * c[j]; }
             r->nz[k] = nz; r->sum[k] = sum; r->sq[k] = sq;
+            r->t_stats += now() - t2;
         }
         pthread_mutex_lock(&r->mu); atomic_store(&r->filled, i + 1); pthread_cond_broadcast(&r->cv); pthread_mutex_unlock(&r->mu);
     }
@@ -87,7 +94,7 @@ int cmd_predict(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window 288] [--act-mx8 1]\n"
                         "       [--halo 16] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
-                        "       [--prec 1|2|3|4] [--policy enc0=1,...]   inference precision (fp8 / fp4 compute)\n"
+                        "       [--prec 1|2|3|4] [--policy enc0=1,...] [--ema 1]   EMA or current weights (0)\n"
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n");
         fprintf(stderr, "  window - 2*halo should divide the shard size (288 - 32 = 256 divides 256 and 512): tiles then cover each shard exactly. 288^3 needs ~5.5 GB; 160 for small GPUs.\n");
         return 2;
@@ -97,6 +104,7 @@ int cmd_predict(int argc, char **argv) {
     int level = atoi(opt(argc, argv, "--level", "0")), W = atoi(opt(argc, argv, "--window", "288")), halo = atoi(opt(argc, argv, "--halo", "8"));
     int shard = atoi(opt(argc, argv, "--shard", "512")), gpu = atoi(opt(argc, argv, "--gpu", "0")), nlev = atoi(opt(argc, argv, "--levels", "4"));
     int nthreads = atoi(opt(argc, argv, "--threads", "16"));
+    const int use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
     float q = (float)atof(opt(argc, argv, "--q", "8"));
     const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
     nn_set_prec(atoi(opt(argc, argv, "--prec", "1")));
@@ -130,7 +138,7 @@ int cmd_predict(int argc, char **argv) {
             if (bad) { fprintf(stderr, "a predict worker failed\n"); return 1; }
             double um_l = um * (1 << level);
             int64_t bn[3]; { long long v[6] = {0, 0, 0, 0, 0, 0}; const char *b = opt(argc, argv, "--box", nullptr); if (!b || sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) { fprintf(stderr, "--gpus needs --box\n"); return 1; } for (int d = 0; d < 3; d++) bn[d] = v[3 + d]; }
-            char attrs[2000]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"recto probability (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"gpus\":%d}}", ckpt, ngpu);
+            char attrs[2000]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"recto probability (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"gpus\":%d,\"ema\":%d}}", ckpt, ngpu, use_ema);
             for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
             pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs);
             fprintf(stderr, "wrote %s (%d GPUs)\n", out, ngpu);
@@ -142,7 +150,7 @@ int cmd_predict(int argc, char **argv) {
     if (unet_peek(ckpt, &cfg, &step)) { fprintf(stderr, "cannot read %s\n", ckpt); return 1; }
     unet *u = unet_create(&cfg);
     if (unet_load(u, ckpt) < 0) { fprintf(stderr, "cannot load %s\n", ckpt); return 1; }
-    unet_use_ema(u, 1);
+    unet_use_ema(u, use_ema);
     if (W % (1 << (cfg.nlev - 1))) { fprintf(stderr, "window must be divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
     store *s = store_open(root);
     char ak[1200];
@@ -159,19 +167,23 @@ int cmd_predict(int argc, char **argv) {
     char lv[32], ldir[1400], attrs[1024];
     z3w_level_name(um_l, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
-    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"recto probability (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d}}",
-             ckpt, step, root, ak, (long long)bo[0], (long long)bo[1], (long long)bo[2], W, halo);
+    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"recto probability (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"ema\":%d}}",
+             ckpt, step, root, ak, (long long)bo[0], (long long)bo[1], (long long)bo[2], W, halo, use_ema);
     z3w *w = z3w_create(ldir, bn, shard, q, 0, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     int stride = W - 2 * halo;
     size_t w3 = (size_t)W * W * W;
     writer_t WR = {0}; WR.w = w; WR.nthreads = nthreads; WR.bytes = (size_t)shard * shard * shard;
-    WR.buf[0] = malloc(WR.bytes); WR.buf[1] = malloc(WR.bytes); pthread_mutex_init(&WR.mu, nullptr); pthread_cond_init(&WR.cv, nullptr);
+    /* default path (UFSM_PRED_HOSTPATH=1: the previous host path, for A/B): pinned reader / shard buffers, window statistics
+       on the device, the interior probabilities placed into a device shard buffer that is downloaded once per shard */
+    const int gpath = !ufsm_env_on("UFSM_PRED_HOSTPATH");
+    WR.buf[0] = gpath ? nn_host_alloc(WR.bytes) : malloc(WR.bytes); WR.buf[1] = gpath ? nn_host_alloc(WR.bytes) : malloc(WR.bytes);
+    uint8_t *dsh = gpath ? nn_malloc(WR.bytes) : nullptr; void *stsc = nn_malloc(64); pthread_mutex_init(&WR.mu, nullptr); pthread_cond_init(&WR.cv, nullptr);
     pthread_t wth; pthread_create(&wth, nullptr, writer_main, &WR);
     int sb = 0; uint8_t *sbuf = WR.buf[0];
     /* the window goes up as uint8; the input channels are built on the device in the network's storage type */
     const int h16 = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8");
-    uint8_t *ctd = nn_malloc(w3), *pu = malloc(w3), *pud = nn_malloc(w3);
+    uint8_t *ctd = nn_malloc(w3), *pu = gpath ? nullptr : malloc(w3), *pud = gpath ? nullptr : nn_malloc(w3);
     float *dyo = malloc(2 * (size_t)W * sizeof(float)), *dxo = dyo + W, *dyd = nn_malloc(2 * (size_t)W * sizeof(float)), *dxd = dyd + W;
     void *xd = nn_malloc(4 * w3 * (h16 ? 2 : 4));
     shape5 xs = {1, 4, W, W, W};
@@ -192,33 +204,49 @@ int cmd_predict(int argc, char **argv) {
             rd.tiles[rd.ntiles++] = (tile_t){tz, ty, tx, (sz * ns[1] + sy) * ns[2] + sx};
         }
     }
-    for (int k = 0; k < NSLOT; k++) rd.buf[k] = malloc(w3);
+    for (int k = 0; k < NSLOT; k++) rd.buf[k] = gpath ? nn_host_alloc(w3) : malloc(w3);
+    rd.nostats = gpath;
     atomic_store(&rd.filled, 0); atomic_store(&rd.consumed, 0); atomic_store(&rd.failed, 0);
     pthread_mutex_init(&rd.mu, nullptr); pthread_cond_init(&rd.cv, nullptr);
     pthread_t rth; pthread_create(&rth, nullptr, reader_main, &rd);
     int64_t cur_shard = -1, so[3] = {0, 0, 0}, se[3] = {0, 0, 0}, sz = 0, sy = 0, sx = 0;
     int any = 0;
+    const int pprof = ufsm_env_on("UFSM_PRED_PROF");
+    double p_wait = 0, p_h2d = 0, p_gpu = 0, p_copy = 0, p_wr = 0, pt;
     for (long i = 0; i < rd.ntiles; i++) {
+        pt = now();
         pthread_mutex_lock(&rd.mu);
         while (atomic_load(&rd.filled) <= i && !atomic_load(&rd.failed)) pthread_cond_wait(&rd.cv, &rd.mu);
         pthread_mutex_unlock(&rd.mu);
+        p_wait += now() - pt;
         if (atomic_load(&rd.failed)) { fprintf(stderr, "%s\n", z3_error()); return 1; }
         const tile_t *t = &rd.tiles[i];
         if (t->shard != cur_shard) {   /* new shard: flush the previous one */
             if (cur_shard >= 0) {
-                if (any) { if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb ^= 1; sbuf = WR.buf[sb]; }
+                pt = now();
+                if (any) { if (gpath) nn_d2h(sbuf, dsh, WR.bytes); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb ^= 1; sbuf = WR.buf[sb]; }
+                p_wr += now() - pt;
                 fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   ", (long long)(cur_shard + 1), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
+                if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
             }
             cur_shard = t->shard; sz = cur_shard / (ns[1] * ns[2]); sy = (cur_shard / ns[2]) % ns[1]; sx = cur_shard % ns[2];
             so[0] = sz * shard; so[1] = sy * shard; so[2] = sx * shard;
             for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
-            memset(sbuf, 0, (size_t)shard * shard * shard); any = 0;
+            if (gpath) nn_zero(dsh, WR.bytes); else memset(sbuf, 0, (size_t)shard * shard * shard);
+            any = 0;
         }
         int k = (int)(i % NSLOT);
         const uint8_t *ctu = rd.buf[k];
         const int64_t tz = t->tz, ty = t->ty, tx = t->tx, o[3] = {bo[0] + tz, bo[1] + ty, bo[2] + tx};
         {
             size_t nz = rd.nz[k]; double sum = rd.sum[k], sq = rd.sq[k];
+            if (gpath) {   /* upload (pinned), statistics on the device, then the slot is free for the reader */
+                pt = now();
+                nn_h2d(ctd, ctu, w3);
+                nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq);
+                pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu);
+                p_h2d += now() - pt;
+            }
             if (nz == 0) { nskip++; pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu); continue; }
             double mean = sum / (double)w3, var = sq / (double)w3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
             for (int z = 0; z < W; z++) {   /* window origin relative to the axis at this slice (double on the host, small in float) */
@@ -227,11 +255,23 @@ int cmd_predict(int argc, char **argv) {
                 cy /= scale; cx /= scale;
                 dyo[z] = (float)((double)o[1] - cy); dxo[z] = (float)((double)o[2] - cx);
             }
-            nn_h2d(ctd, ctu, w3); nn_h2d(dyd, dyo, 2 * (size_t)W * sizeof(float));
+            pt = now();
+            if (!gpath) nn_h2d(ctd, ctu, w3);
+            nn_h2d(dyd, dyo, 2 * (size_t)W * sizeof(float));
+            if (pprof) { nn_sync(); p_h2d += now() - pt; pt = now(); }
             nn_pred_input(ctd, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0, xd, h16);
             const float *lg = unet_forward_x(u, xd, xs, 0, h16);
+            if (gpath) {   /* interior straight into the device shard buffer */
+                nn_pred_place(lg, ctd, W, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
+                const char *e = nn_check();
+                if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }
+                if (pprof) { nn_sync(); p_gpu += now() - pt; }
+                any = 1; ntiles++;
+                continue;
+            }
             nn_pred_output(lg, ctd, w3, pud);      /* channel 0 = recto */
             nn_d2h(pu, pud, w3);
+            if (pprof) { p_gpu += now() - pt; pt = now(); }
             pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu);   /* slot free: the window is on the device */
             const char *e = nn_check();
             if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }
@@ -248,13 +288,18 @@ int cmd_predict(int argc, char **argv) {
                 }
             }
             any = 1; ntiles++;
+            if (pprof) p_copy += now() - pt;
         }
     }
-    if (cur_shard >= 0 && any && writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+    if (pprof) fprintf(stderr, "\npredict profile (s): main: wait-reader %.2f h2d %.2f gpu(fwd+d2h) %.2f interior-copy %.2f writer-wait %.2f | reader: read %.2f stats %.2f slot-wait %.2f | wall %.2f, %ld tiles\n",
+                       p_wait, p_h2d, p_gpu, p_copy, p_wr, rd.t_read, rd.t_stats, rd.t_wait, now() - t0, ntiles);
+    if (cur_shard >= 0 && any) { if (gpath) nn_d2h(sbuf, dsh, WR.bytes); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } }
+    if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
     if (writer_finish(&WR, wth)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
-    free(WR.buf[0]); free(WR.buf[1]);
+    if (gpath) { nn_host_free(WR.buf[0]); nn_host_free(WR.buf[1]); nn_free(dsh); } else { free(WR.buf[0]); free(WR.buf[1]); }
+    nn_free(stsc);
     pthread_join(rth, nullptr);
-    for (int k = 0; k < NSLOT; k++) free(rd.buf[k]);
+    for (int k = 0; k < NSLOT; k++) { if (gpath) nn_host_free(rd.buf[k]); else free(rd.buf[k]); }
     free(rd.tiles);
     fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   \n", (long long)(ns[0] * ns[1] * ns[2]), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
     z3w_close(w);

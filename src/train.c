@@ -149,19 +149,25 @@ static void split_job(int side, void *a) {
 
 int cmd_train(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 96] [--B 2] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
+        fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 512] [--B 1] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--sr 1]\n"
+                        "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  --split z --gpus 0,1: every window is split along z across the two GPUs instead (batch B; P a multiple of 2^nlev).\n"
                         "  env UFSM_PROF=1 prints per-op GPU time every log interval (category 'upload+loss+opt').\n");
         return 2;
     }
     const char *src = argv[2], *out = opt(argc, argv, "--out", "runs/run");
-    int P = atoi(opt(argc, argv, "--P", "96")), B = atoi(opt(argc, argv, "--B", "2")), steps = atoi(opt(argc, argv, "--steps", "20000"));
+    int P = atoi(opt(argc, argv, "--P", "512")), B = atoi(opt(argc, argv, "--B", "1")), steps = atoi(opt(argc, argv, "--steps", "20000"));   /* 512^3 batch 1 per 16 GB GPU is the standard window (user, 2026-10-01) */
     float lr0 = (float)atof(opt(argc, argv, "--lr", "1e-3")), wd = (float)atof(opt(argc, argv, "--wd", "0.01")), dice_w = (float)atof(opt(argc, argv, "--dice", "0.5"));
     float ema = (float)atof(opt(argc, argv, "--ema", "0.999")), clip = (float)atof(opt(argc, argv, "--clip", "5"));
     int warmup = atoi(opt(argc, argv, "--warmup", "500")), workers = atoi(opt(argc, argv, "--workers", "12"));
+    double seconds = atof(opt(argc, argv, "--seconds", "0"));
+    double warmup_seconds = atof(opt(argc, argv, "--warmup-seconds", "-1"));
+    if (!isfinite(seconds) || seconds < 0 || !isfinite(warmup_seconds) || warmup_seconds < -1) { fprintf(stderr, "invalid time budget\n"); return 2; }
+    if (warmup_seconds < 0) warmup_seconds = seconds * 0.05;
+    if (seconds && warmup_seconds >= seconds) { fprintf(stderr, "warmup-seconds must be less than seconds\n"); return 2; }
     int nval = atoi(opt(argc, argv, "--val-batches", "8")), log_every = atoi(opt(argc, argv, "--log-every", "20"));
     int val_every = atoi(opt(argc, argv, "--val-every", "500")), ckpt_every = atoi(opt(argc, argv, "--ckpt-every", "1000"));
     uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "0"));
@@ -176,8 +182,14 @@ int cmd_train(int argc, char **argv) {
     const char *sched = opt(argc, argv, "--sched", "cos");   /* cos | wsd (warmup, constant, linear cooldown over the last --cooldown fraction; extendable runs) */
     float cooldown = (float)atof(opt(argc, argv, "--cooldown", "0.2"));
     int qat = atoi(opt(argc, argv, "--qat", "0"));
-    /* the effective precision manifest is printed after all precision options are applied and saved next to the checkpoints */
-#define WRITE_MANIFEST(path) do { char mf_[4096]; int mn_ = nn_prec_manifest(mf_, sizeof mf_); snprintf(mf_ + mn_, sizeof mf_ - mn_, " act_mx4 %d act_mx8 %d grad_mx8 %d f16 %d opt %s\n", ufsm_env_on("UFSM_ACT_MX4"), ufsm_env_on("UFSM_ACT_MX8"), unet_grad_mx8(), f16, optname); FILE *mff_ = fopen(path, "w"); if (mff_) { fputs(mf_, mff_); fclose(mff_); } } while (0)         /* quantization-aware training: forward/backward-data at precision 2 (fp8) or 3 (fp4), weight gradients at 16-bit */
+    /* Save the requested policy and the compute paths observed after dispatch, alongside storage modes. */
+#define WRITE_MANIFEST(path) do { \
+    char mf_[8192]; size_t mn_ = (size_t)nn_prec_manifest(mf_, sizeof mf_); \
+    int add_ = snprintf(mf_ + mn_, sizeof mf_ - mn_, " act_mx4 %d act_mx8 %d grad_mx8 %d f16 %d opt %s\n", ufsm_env_on("UFSM_ACT_MX4"), ufsm_env_on("UFSM_ACT_MX8"), unet_grad_mx8(), f16, optname); \
+    mn_ += add_ > 0 && (size_t)add_ < sizeof mf_ - mn_ ? (size_t)add_ : sizeof mf_ - mn_ - 1; \
+    nn_exec_manifest(mf_ + mn_, sizeof mf_ - mn_); \
+    FILE *mff_ = fopen(path, "w"); if (mff_) { fputs(mf_, mff_); fputc('\n', mff_); fclose(mff_); } \
+} while (0)
     if (qat) { nn_set_prec(qat); nn_set_prec_wgrad(1); }
     if (atoi(opt(argc, argv, "--sr", "0"))) nn_set_sr(1);                                   /* stochastic rounding of fp8 gradient operands */
     int wq = atoi(opt(argc, argv, "--wq", "0"));            /* 8 or 4: true fp8 / fp4 weights (stochastic rounding after each update) */
@@ -186,12 +198,10 @@ int cmd_train(int argc, char **argv) {
     nn_set_pos_weight((float)atof(opt(argc, argv, "--pos-weight", "1")));   /* BCE weight of surface voxels */
     int overfit = atoi(opt(argc, argv, "--overfit", "0"));   /* diagnostic: train on the first batch forever */
     int noaug = atoi(opt(argc, argv, "--noaug", "0"));       /* diagnostic: no augmentation */
-    /* --fp4 1: the fastest configuration that passed the paired stairs on two seeds: packed fp4 activation storage, fp4 forward
-       and backward-data, fp8 weight gradients, stochastic rounding of gradient operands, first conv 16-bit.
-       --fp4 2: fp4 weight gradients as well (also passed; slower than fp8 until its kernel is optimised). An explicit --policy
-       still overrides the precisions. */
-    /* default since the r11b 40k confirmation (2026-10-01): --fp4 1 unless a precision is chosen explicitly
-       (--prec, --wq, --fp32); --fp4 0 trains 16-bit */
+    /* --fp4 1: packed fp4 activations, fp4 stride-1 compute, fp8 weight gradients and stochastic rounding.
+       --fp4 2: fp4 stride-1 weight gradients as well. Small inputs and stride-2 operations have FP8 / FP32
+       fallbacks; a requested 16-bit policy does not promote MX storage. The executed manifest records these.
+       Explicit --policy changes the requested precisions; --fp4 0 uses 16-bit storage. */
     int expl = *opt(argc, argv, "--prec", "") || *opt(argc, argv, "--wq", "");
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--fp32")) expl = 1;
     const int fp4 = atoi(opt(argc, argv, "--fp4", expl ? "0" : "2"));   /* --fp4 2 since 2026-10-01 night: passed the stair (last.ckpt 0.299 / 0.284 vs --fp4 1 0.307 / 0.284) and the 40k confirmation (r11c), 1-4% faster */
@@ -342,7 +352,7 @@ int cmd_train(int argc, char **argv) {
     nn_init(G[0].dev);
     size_t np = unet_nparams(G[0].u);
     fprintf(stderr, "model widths"); for (int i = 0; i < cfg.nlev; i++) fprintf(stderr, " %d", cfg.widths[i]);
-    fprintf(stderr, ": %zu params; P=%d B=%d x %d GPU(s) [", np, P, B, ng); for (int g = 0; g < ng; g++) fprintf(stderr, "%s%d", g ? "," : "", devs[g]); fprintf(stderr, "] %s%s\n", nn_get_tf32() ? "bf16 tensor cores" : "fp32", split ? ", each window split along z" : "");
+    fprintf(stderr, ": %zu params; P=%d B=%d x %d GPU(s) [", np, P, B, ng); for (int g = 0; g < ng; g++) fprintf(stderr, "%s%d", g ? "," : "", devs[g]); fprintf(stderr, "] %s%s\n", nn_get_tf32() ? "tensor cores (see precision.txt for compute and storage)" : "fp32", split ? ", each window split along z" : "");
     split_ctx *sctx = split ? split_create(devs[0], devs[1]) : nullptr;
     nn_init(G[0].dev);
     float *gpeer = ng > 1 ? nn_malloc(np * 4) : nullptr;   /* on GPU 0: incoming gradients of the other GPUs */
@@ -372,6 +382,7 @@ int cmd_train(int argc, char **argv) {
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     int prof = ufsm_env_on("UFSM_PROF");
     double t0 = now(), tlog = t0, wait = 0, acc_loss = 0, acc_bce = 0, acc_dice = 0, acc_g = 0; int nacc = 0;
+    if (seconds) fprintf(stderr, "training budget %.1fs, time-based warmup %.1fs\n", seconds, warmup_seconds);
     double best_val = 1e30; int nskip = 0; (void)nskip;
     float parts[8][2 * NCH + 1];
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
@@ -485,7 +496,15 @@ int cmd_train(int argc, char **argv) {
         for (int g = 0; g < nl; g++) for (int c = 0; c < 2 * NCH; c++) if (!isfinite(parts[g][c])) fwd_nan = 1;
         if (fwd_nan && !overfit && !split) diagnose_nan(&G[0], B, P, step, out);
         float lr;
-        if (step <= warmup) lr = lr0 * (float)step / warmup;
+        if (seconds) {
+            double elapsed = fmin(now() - t0, seconds);
+            if (elapsed < warmup_seconds) lr = lr0 * (float)(elapsed / warmup_seconds);
+            else if (!strcmp(sched, "wsd")) {
+                double cd0 = seconds * (1.0 - cooldown);
+                lr = elapsed < cd0 ? lr0 : lr0 * (float)((seconds - elapsed) / (seconds - cd0));
+            } else lr = lr0 * 0.5f * (1.f + cosf(3.14159265f * (float)((elapsed - warmup_seconds) / (seconds - warmup_seconds))));
+        }
+        else if (step <= warmup) lr = lr0 * (float)step / warmup;
         else if (!strcmp(sched, "wsd")) { int cd0 = (int)(steps * (1.f - cooldown)); lr = step < cd0 ? lr0 : lr0 * (float)(steps - step) / (float)(steps - cd0); }
         else lr = lr0 * 0.5f * (1.f + cosf(3.14159265f * (float)(step - warmup) / (float)(steps - warmup)));
         if (soft_end != sc.soft) sampler_set_soft(sp, sc.soft + (soft_end - sc.soft) * (step < steps ? (float)step / (float)steps : 1.f));
@@ -514,12 +533,13 @@ int cmd_train(int argc, char **argv) {
         }
         const char *e = nn_check();
         if (e) { fprintf(stderr, "cuda error at step %d: %s\n", step, e); return 1; }
+        if (seconds && now() - t0 >= seconds) g_stop = 1;
         acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][cfg.cout]; acc_g += gn; nacc++;
-        if (step % log_every == 0 || step == steps) {
+        if (step % log_every == 0 || step == steps || g_stop) {
             double dt = now() - tlog;
             double vl = -1, vb = 0, vd = 0;
-            char vstr[128] = ",,,";
-            if (step % val_every == 0 || step == steps) {
+            char vstr[128] = ",,";
+            if (step % val_every == 0 || step == steps || g_stop) {
                 const int nv = split ? 2 : 1;   /* split: validation windows are split too */
                 for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, 1); }
                 {   /* validation on the buffer not holding the prefetched batch (its upload has completed: ev_up synced above) */
@@ -542,7 +562,7 @@ int cmd_train(int argc, char **argv) {
                 nn_init(G[0].dev);
                 if (nval) { vl /= nval; vb /= nval; vd /= nval; }
                 snprintf(vstr, sizeof vstr, "%.5f,%.5f,%.5f", vl, vb, vd);
-                if (nval && vl < best_val) { best_val = vl; char bp[1400]; snprintf(bp, sizeof bp, "%s/best.ckpt", out); unet_save(G[0].u, bp, step, nullptr); }
+                if (nval && vl < best_val) { best_val = vl; char bp[1400]; snprintf(bp, sizeof bp, "%s/best.ckpt", out); if (unet_save(G[0].u, bp, step, nullptr)) { fprintf(stderr, "cannot save %s\n", bp); return 1; } }
             }
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f gn %.2f %s %.2f samp/s (wait %.0f%%)%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, acc_g / nacc,
                     vl >= 0 ? "val" : "", (double)nacc * B * nl / dt, 100 * wait / dt, vl >= 0 ? vstr : "");
@@ -553,7 +573,11 @@ int cmd_train(int argc, char **argv) {
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);
             char cp[1400]; snprintf(cp, sizeof cp, "%s/last.ckpt", out);
-            unet_save(G[0].u, cp, step, nullptr);
+            if (unet_save(G[0].u, cp, step, nullptr)) { fprintf(stderr, "cannot save %s\n", cp); return 1; }
+        }
+        if (step == 1 || step == steps || g_stop) {
+            char mp[1400], em[4096]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp);
+            if (step == 1) { nn_exec_manifest(em, sizeof em); fprintf(stderr, "%s\n", em); }
         }
     }
     uint64_t prod, rej; sampler_stats(sp, &prod, &rej);

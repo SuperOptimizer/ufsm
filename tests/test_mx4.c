@@ -44,7 +44,7 @@ static float e2m1_rne(float a) {   /* a >= 0 in grid units */
     return (i & 1) ? hi : lo;   /* tie: even code */
 }
 static void host_mx4(const float *x, shape5 s, float *y) {
-    const int bw = s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; const size_t S = shape_spatial(s);
+    const int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; const size_t S = shape_spatial(s);
     for (int n = 0; n < s.n; n++) for (int b = 0; b < nb; b++) for (size_t v = 0; v < S; v++) {
         float am = 0.f;
         for (int k = 0; k < bw; k++) { int c = b * bw + k; if (c < s.c) am = fmaxf(am, fabsf(x[((size_t)n * s.c + c) * S + v])); }
@@ -727,6 +727,49 @@ int main(void) {
             snprintf(nm, sizeof nm, "dec conv1 wgrad fused up (fp4%s) vs materialised fp32 up", had ? ", H16" : "");
             cmp(nm, gw, gw2, nw, 0.03);   /* bf16 tile rounding of the interpolated values (rare e2m1 flips) */
         }
+    }
+    {   /* MX activation dispatch must preserve SR for an off-grid weight-gradient operand.
+           Stored MX-fp8 gy can already be exactly representable, so it need not vary with the seed. */
+        shape5 s = {1, 32, 8, 8, 16};
+        const size_t nw = (size_t)32 * 32 * 27;
+        float *x = dev_rand(shape_numel(s), 1.f), *gy = dev_rand(shape_numel(s), 1.f);
+        void *mx = mx4_from(x, s);
+        float *gw = dev_zero(nw), *h1 = malloc(nw * 4), *h2 = malloc(nw * 4);
+        nn_gn_t none = {0};
+        nn_set_tf32(1); nn_set_layer(0); nn_set_conv(0); nn_set_conv_prec(0, 0, 3, 3, 2); nn_set_sr(1);
+        double repeat = 0, changed = 0, norm = 0;
+        for (int k = 0; k < 3; k++) {
+            nn_set_sr_step(k == 2 ? 2 : 1); nn_zero(gw, nw * 4);
+            check("MX SR wgrad dispatch", !nn_conv3d_bwd_weight_x(mx, &none, nullptr, nullptr, 0, 0, s, gy, s, 3, 1, gw, nullptr));
+            nn_d2h(k ? h2 : h1, gw, nw * 4);
+            if (k) for (size_t j = 0; j < nw; j++) {
+                double d = (double)h1[j] - h2[j];
+                if (k == 1) repeat += d*d; else changed += d*d;
+            }
+        }
+        for (size_t j = 0; j < nw; j++) norm += (double)h1[j]*h1[j];
+        printf("  MX SR wgrad: repeat %.3g, different step %.3g\n", sqrt(repeat/norm), sqrt(changed/norm));
+        check("MX SR same step reproducible", repeat < norm*1e-8);
+        check("MX SR different steps change off-grid gy", changed > norm*1e-6);
+        nn_set_conv_prec(0, 0, 0, 0, 0); nn_set_layer(-1); nn_set_conv(-1); nn_set_sr(0);
+        nn_free(mx); nn_free(x); nn_free(gy); nn_free(gw); free(h1); free(h2);
+    }
+    {   /* decoder conv1 with the up segment read from the coarse PRE-GN tensor: GN+SiLU of the coarse rows inside the up staging (no kept s2) */
+        shape5 fs = {N, 48, 12, 12, 16}, co = {N, 32, 6, 6, 8}, fu = fs, sk = fs, o16 = fs; fu.c = 32; sk.c = 16; o16.c = 16;
+        size_t NG = (size_t)N * G;
+        float *xc = dev_rand(shape_numel(co), 2.f), *xs_ = dev_rand(shape_numel(sk), 2.f);
+        void *xcm = mx4_from(xc, co), *xsm = mx4_from(xs_, sk); float *xcd = deq4(xcm, co), *xsd = deq4(xsm, sk);
+        float *gam = dev_rand(16, 1.f), *bet = dev_rand(16, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        float *gac = dev_rand(32, 1.f), *bec = dev_rand(32, 0.5f), *mec = dev_rand(NG, 0.2f), *rsc = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); nn_d2h(h, rsc, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rsc, h, NG * 4); }
+        float *w = dev_rand((size_t)16 * 48 * 27, 0.1f), *b = dev_rand(16, 0.1f);
+        float *tc = dev_zero(shape_numel(co)), *up = dev_zero(shape_numel(fu)), *t = dev_zero(shape_numel(sk)), *cat = dev_zero(shape_numel(fs)), *yr = dev_zero(shape_numel(o16));
+        mode_ref(); nn_gn_silu_apply(xcd, co, G, gac, bec, mec, rsc, tc); nn_up2_fwd_into(tc, co, up, 32, 0); nn_gn_silu_apply(xsd, sk, G, gam, bet, mean, rstd, t); nn_concat_fwd(up, 32, t, 16, fs, cat); nn_conv3d_fwd(cat, fs, w, b, 16, 3, 1, yr);
+        nn_gn_t gc = {gac, bec, mec, rsc, G}, g2 = {gam, bet, mean, rstd, G};
+        void *ym = mx4_new(o16);
+        mode_mx(); int rv = nn_conv3d_fwd_x(xcm, &gc, xsm, &g2, 32, 1, fs, w, b, 16, 3, 1, (float *)ym, 0, 1e-5f, NULL, NULL);
+        if (rv) { printf("  dec conv1 up segment with GN: unsupported (rv %d)  FAIL\n", rv); bad++; }
+        else cmp("dec conv1 up from coarse pre-GN mx4 (fp4)", deq4(ym, o16), yr, shape_numel(o16), TOL4);
     }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }

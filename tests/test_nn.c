@@ -1,5 +1,6 @@
 /* CPU references + finite-difference gradient checks for every op in nn.h, on tiny tensors. */
 #include "nn.h"
+#include "nn_lp.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -265,21 +266,107 @@ static void test_adamw(void) {
     CHECK(d < 1e-5, "adamw");
 }
 
+static void test_predict_helpers(void) {
+    printf("prediction statistics + clipped shard placement\n");
+    const size_t cap = 65553;
+    uint8_t *ct = malloc(cap), *dc = nn_malloc(cap);
+    void *scratch = nn_malloc(24);
+    for (size_t i = 0; i < cap; i++) ct[i] = i % 7 ? (uint8_t)(i * 37) : 0;
+    nn_h2d(dc, ct, cap);
+    const size_t lengths[] = {0, 1, 15, 16, 17, 4097, 65536};
+    for (int off = 0; off < 2; off++) for (size_t j = 0; j < sizeof lengths / sizeof *lengths; j++) {
+        size_t n = lengths[j], nz = 0, refnz = 0;
+        double sm, sq, refsm = 0, refsq = 0;
+        for (size_t i = 0; i < n; i++) { unsigned v = ct[off + i]; refnz += v != 0; refsm += v; refsq += v * v; }
+        nn_pred_stats(dc + off, n, scratch, &nz, &sm, &sq);
+        CHECK(nz == refnz && sm == refsm && sq == refsq, "stats offset %d length %zu", off, n);
+    }
+    const int W = 16, halo = 2, shard = 11;
+    const size_t nw = (size_t)W * W * W, ns = (size_t)shard * shard * shard;
+    float *lg = randv(nw, 4), *dl = dev(lg, nw);
+    uint8_t *dp = nn_malloc(nw), *p = malloc(nw), *ds = nn_malloc(ns), *got = malloc(ns), *ref = malloc(ns);
+    nn_pred_output(dl, dc, nw, dp); nn_d2h(p, dp, nw);
+    const int origins[][3] = {{-2, -2, -2}, {-7, 1, -3}, {2, -6, 4}};
+    for (size_t t = 0; t < sizeof origins / sizeof *origins; t++) {
+        memset(ref, 123, ns); nn_h2d(ds, ref, ns);
+        const int *o = origins[t], ez = 9, ey = 7, ex = 10;
+        for (int z = halo; z < W - halo; z++) for (int y = halo; y < W - halo; y++) for (int x = halo; x < W - halo; x++) {
+            int gz = o[0] + z, gy = o[1] + y, gx = o[2] + x;
+            if (gz >= 0 && gz < ez && gy >= 0 && gy < ey && gx >= 0 && gx < ex)
+                ref[((size_t)gz * shard + gy) * shard + gx] = p[((size_t)z * W + y) * W + x];
+        }
+        nn_pred_place(dl, dc, W, halo, o[0], o[1], o[2], ez, ey, ex, shard, ds);
+        nn_d2h(got, ds, ns);
+        CHECK(!memcmp(got, ref, ns), "placement origin %zu", t);
+    }
+    free(ct); free(lg); free(p); free(got); free(ref);
+    nn_free(dc); nn_free(scratch); nn_free(dl); nn_free(dp); nn_free(ds);
+}
+
+static void test_large_weight_grid(void) {
+    /* 65552 spatial blocks: the old grid.z layout failed silently above CUDA's 65535 limit.
+       Constant, exactly representable operands make every tap's clipped voxel count the reference. */
+    printf("large spatial weight-gradient grid, FP8 and FP4\n");
+    shape5 s = {1, 1, 16, 16, 65552}; size_t n = shape_numel(s);
+    float *h = malloc(n * 4), *d = nn_malloc(n * 4);
+    for (size_t i = 0; i < n; i++) h[i] = 1.f;
+    nn_h2d(d, h, n * 4); free(h);
+    void *mx = nn_malloc(lp_mx8_bytes(s.n, s.c, shape_spatial(s)));
+    lp_f32_to_mx8(d, s.n, s.c, shape_spatial(s), mx); nn_free(d);
+    float *gw = nn_malloc(27 * 4), *gb = nn_malloc(4), got[27], bias;
+    const char *old = getenv("UFSM_F8_ZC"); char *saved = old ? strdup(old) : nullptr;
+    setenv("UFSM_F8_ZC", "1", 1);
+    old = getenv("UFSM_F4W_ZC"); char *saved4 = old ? strdup(old) : nullptr;
+    setenv("UFSM_F4W_ZC", "1", 1);
+    for (int fp4 = 0; fp4 < 2; fp4++) {
+        nn_zero(gw, 27 * 4); nn_zero(gb, 4);
+        if (fp4) lp_bwd_w_f4(mx, 3, s, mx, 3, s, gw, gb, (gnp_t){0}, (split_t){0}, 0);
+        else lp_bwd_w_f8(mx, 3, s, mx, 3, s, gw, gb, (gnp_t){0}, (split_t){0});
+        nn_sync(); const char *e = nn_check();
+        CHECK(!e, "FP%d large grid launch: %s", fp4 ? 4 : 8, e ? e : "");
+        nn_d2h(got, gw, sizeof got); nn_d2h(&bias, gb, sizeof bias);
+        for (int z = 0; z < 3; z++) for (int y = 0; y < 3; y++) for (int x = 0; x < 3; x++) {
+            double ref = (double)(s.d - abs(z - 1)) * (s.h - abs(y - 1)) * (s.w - abs(x - 1));
+            CHECK(fabs(got[(z * 3 + y) * 3 + x] - ref) <= 8, "FP%d large grid tap %d,%d,%d: %.0f vs %.0f", fp4 ? 4 : 8, z, y, x, got[(z * 3 + y) * 3 + x], ref);
+        }
+        CHECK(fabs(bias - (double)n) <= 8, "FP%d large grid bias", fp4 ? 4 : 8);
+    }
+    shape5 empty = s; empty.n = 0;   /* grid.x=0 deliberately fails the launch, which LPCK saves */
+    lp_bwd_w_f8(mx, 3, empty, mx, 3, empty, gw, gb, (gnp_t){0}, (split_t){0});
+    CHECK(nn_check() != nullptr, "low-precision launch error must reach nn_check");
+    CHECK(nn_check() == nullptr, "low-precision launch error is cleared after reporting");
+    if (saved) setenv("UFSM_F8_ZC", saved, 1); else unsetenv("UFSM_F8_ZC");
+    if (saved4) setenv("UFSM_F4W_ZC", saved4, 1); else unsetenv("UFSM_F4W_ZC");
+    free(saved); free(saved4); nn_free(mx); nn_free(gw); nn_free(gb);
+}
+
 int main(void) {
     if (nn_init(0)) { printf("no cuda device\n"); return 1; }
     nn_set_tf32(0);   /* finite-difference checks need the exact fp32 kernels */
+    nn_set_layer(0);
     srand(1);
     test_conv(3, 1, (shape5){2, 3, 5, 6, 7}, 4);
     test_conv(3, 2, (shape5){2, 3, 6, 7, 8}, 5);
     test_conv(3, 2, (shape5){1, 2, 5, 5, 5}, 3);
     test_conv(1, 1, (shape5){2, 5, 3, 4, 5}, 2);
     test_conv(3, 1, (shape5){1, 17, 3, 4, 5}, 9);
+    {   /* Executed arithmetic must report scalar FP32, independently of a requested policy. */
+        char manifest[4096]; nn_exec_manifest(manifest, sizeof manifest);
+        CHECK(strstr(manifest, "enc0.c1=fp32:fp32:fp32"), "executed precision manifest");
+        struct { char buf[12]; char guard; } small = {.guard = 42};
+        CHECK(nn_prec_manifest(small.buf, sizeof small.buf) == 11 && small.buf[11] == 0 && small.guard == 42, "policy manifest truncation");
+        CHECK(nn_exec_manifest(small.buf, sizeof small.buf) == 11 && small.buf[11] == 0 && small.guard == 42, "executed manifest truncation");
+        CHECK(nn_prec_manifest(nullptr, 0) == 0 && nn_exec_manifest(nullptr, 0) == 0, "empty manifest buffers");
+    }
+    nn_set_layer(-1);
     test_gn();
     test_silu();
     test_up2();
     test_concat();
     test_loss();
     test_adamw();
+    test_predict_helpers();
+    test_large_weight_grid();
     const char *e = nn_check();
     CHECK(!e, "cuda error: %s", e ? e : "");
     {   /* 2:4 mask: every group of 4 input channels keeps exactly its two largest magnitudes */

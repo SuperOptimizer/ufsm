@@ -83,7 +83,8 @@ int nn_get_conv_prec(int id, int sub, int pass);
 int nn_cur_prec(void);
 int nn_prec_parse(const char *name);     /* "bf16" 1, "fp8" 2, "fp4" 3, "fp16" 4, or a digit; -1 if unknown */
 const char *nn_prec_name(int p);
-int nn_prec_manifest(char *buf, size_t n);   /* effective per-conv fwd:bwd_data:wgrad precisions under the current policy */
+int nn_prec_manifest(char *buf, size_t n);   /* requested per-conv fwd:bwd_data:wgrad policy; returns characters written */
+int nn_exec_manifest(char *buf, size_t n);   /* observed compute paths, including storage/shape fallbacks; not storage precision */
 void nn_conv3d_fwd_fp8(const float *x, shape5 xs, const float *w, const float *b, int cout, float *y);        /* k=3 stride 1, fp32 tensors */
 void nn_conv3d_fwd_fp4(const float *x, shape5 xs, const float *w, const float *b, int cout, float *y);
 void nn_conv3d_bwd_weight_fp8(const float *x, shape5 xs, const float *gy, shape5 ys, float *gw, float *gb);
@@ -246,6 +247,8 @@ void nn_sigmoid(const float *x, size_t n, float *y);
    and recto probability * 255 (0 where the CT is 0) from the logits */
 void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16);
 void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out);
+void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);   /* interior -> device shard */
+void nn_pred_stats(const uint8_t *ct, size_t n, void *scratch, size_t *nz, double *sum, double *sq);   /* exact window stats (scratch: 24 B device) */
 
 #ifdef __cplusplus
 }
