@@ -128,6 +128,11 @@ or whole-step speedup is established (`f4p-reload-experiment.json`).
 A frozen-kernel precision probe also finds FP8 computation within about 2% of FP4 on these
 16-input-channel shapes; output bytes differ as expected. This is a speed diagnostic and does
 not establish gradient/model-quality equivalence (`f4p-vs-f8p-512.log`).
+FP8 weight-gradient computation is slower in the same frozen packed-input probes: at 512 the
+materialized-up / skip-GN decoder is 237.9 versus 193.4 ms, and 16-to-16 is 86.5 versus 67.9 ms;
+32-to-32 at 256 is 35.9 versus 33.2 ms. Gradient relative differences are 3.1–8.6%, as expected
+from changing precision; no accuracy acceptance is inferred (`wgrad-f4-vs-f8-512.log`).
+The validated FP4 weight-gradient path remains the throughput candidate.
 
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is
