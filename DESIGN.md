@@ -141,6 +141,18 @@ throughput gain. These standalone prototypes are rejected without production int
 whole-step claim; source, object, binary, compiler reports and exact-output logs are archived in
 `f4p-warp-experiment.json`. The tested production executable remains unchanged.
 
+A register-only accumulator probe on the RTX 5060 Ti checks the current block-scaled MMA forms
+against unscaled FP8/FP4 and FP16 operands (`accumulator-probe-summary.json`). PTX defines the
+current `mxf4` and `mxf8f6f4` block-scale forms with FP32 accumulators only. Two repetitions give
+approximately 425 TFLOP/s for MXFP4/FP32, 213 for MXFP8/FP32, 213 for ordinary FP8/FP16, and
+108 for the alternate unscaled FP4/FP16 form. Ordinary FP16 doubles from about 54 to 107 TFLOP/s
+when its accumulator format changes, but those instructions are not the dominant FP4 body path.
+Each mode checks every thread's result against an exact uniform-input sum; this is not a training
+accuracy qualification. The test excludes operand staging and external scale application, and
+does not rule out a shape-specific register benefit. It establishes no arithmetic-throughput
+advantage from replacing the current block-scaled FP4/FP8 instructions with these FP16-accumulator
+alternatives. Production retains the tested instructions and FP32 parameter reductions.
+
 FP8 weight-gradient computation is slower in the same frozen packed-input probes: at 512 the
 materialized-up / skip-GN decoder is 237.9 versus 193.4 ms, and 16-to-16 is 86.5 versus 67.9 ms;
 32-to-32 at 256 is 35.9 versus 33.2 ms. Gradient relative differences are 3.1–8.6%, as expected
