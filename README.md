@@ -96,6 +96,10 @@ and roles in their recipe; recipes without a calibration split retain their fixe
 The existing holdouts have been inspected during development, so this split supports threshold
 qualification and is not an untouched final test. A current native-resolution diagnostic found
 poor cutoff transfer to PHerc0500; precision and production-quality acceptance remain pending.
+A complete eight-dense-box serving comparison now gives nearly identical mean acceptance F1
+at diagnostic cutoff 0.50 for FP4/FP8/FP16 (0.0722/0.0730/0.0728), while the current calibrated
+cutoffs give 0.0540/0.0711/0.0704. Cutoff selection therefore needs validation before launch;
+these diagnostics have not changed the production calibration objective or serving defaults.
 Evaluation grids with three or more cutoffs now filter prediction probabilities once and collect
 byte histograms instead of dilating each threshold separately. Complete ten-cutoff scoring is
 4.9–5.5x faster on the tested native dense and partial boxes, with byte-identical reports.

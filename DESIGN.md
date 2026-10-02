@@ -139,6 +139,22 @@ label support and true-positive counts; prediction changes also occur away from 
 seam acceptance or a recommendation to pay for larger halos. Window/grid sensitivity and global
 cutoff generalization remain explicit quality concerns; production training stays on hold.
 
+The serving comparison now covers all eight native dense boxes at phase zero, using the same
+frozen stored-GN diagnostic checkpoint (`serving-dense-summary.json`). All 24 cases complete;
+twelve repeat earlier cases with byte-identical full stores and identical shared-cutoff counters.
+Observed manifests confirm FP8 stem/down and FP4 body for matched serving, FP8 convolutions for
+the FP8 profile, FP16 convolutions for the FP16 profile, and an FP32 head throughout.
+The existing arithmetic-mean-F1 calibration selects 0.60 / 0.55 / 0.55 for matched/FP8/FP16.
+Six-source acceptance mean F1 is 0.054022 / 0.071068 / 0.070368, against constant foreground
+0.056580. At a common diagnostic cutoff of 0.50, means are 0.072182 / 0.072976 / 0.072842.
+This locates much of the apparent serving-quality gap in cutoff selection. Fitting band-F1 only
+on the declared calibration sources selects matched cutoff 0.55 and gives acceptance F1 0.071841
+and band-F1 0.183754; these remain diagnostics and do not alter the production objective.
+Prediction averages are 4.46 / 5.60 / 9.11 s; one recovered matched case has no retained timing
+and is excluded from that average, while every case remains in quality reporting. The next
+step is to validate a calibration correction on bounded reference studies while preserving the
+calibration/acceptance roles, then qualify the supported serving grid. No long run has started.
+
 The stored-tensor normalization and independently selectable stem precision pass the complete
 `make -j8 test` suite (`runs/recovery512/stem-gn-full-tests.log`). Fresh training's convolution-output
 GroupNorm statistics now describe rounded stored values, including MX4/MX8; legacy checkpoints
