@@ -179,16 +179,28 @@ def environment(r, binary):
     return env
 
 
+def gpu_devices(selection):
+    parts = str(selection).split(',')
+    if not 1 <= len(parts) <= 8 or any(not p.strip() or any(c not in '0123456789' for c in p.strip()) for p in parts):
+        raise ValueError('GPU selection must contain 1..8 nonnegative device IDs')
+    devices = [int(p) for p in parts]
+    if len(set(devices)) != len(devices):
+        raise ValueError('GPU selection must not repeat a device')
+    return devices
+
+
 @contextlib.contextmanager
 def gpu_lock(gpu):
     # Cooperating production runners hold the lease through the whole command.
     lockdir = ROOT / 'runs/.gpu-locks'
     lockdir.mkdir(parents=True, exist_ok=True)
-    with (lockdir / f'gpu-{gpu}.lock').open('a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise RuntimeError(f'GPU {gpu} already leased by a production runner')
+    with contextlib.ExitStack() as locks:
+        for device in sorted(gpu_devices(gpu)):
+            lock = locks.enter_context((lockdir / f'gpu-{device}.lock').open('a'))
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError(f'GPU {device} already leased by a production runner')
         yield
 
 
@@ -213,6 +225,11 @@ def execute(cmd, log, env):
 
 def train(a):
     r = recipe(a.recipe)
+    if a.split is not None:
+        r['train']['split'] = a.split
+    if a.mem is not None:
+        for stage in r['stages']:
+            stage['mem'] = a.mem
     out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=False)
     inputs = out / 'inputs'; inputs.mkdir()
@@ -239,7 +256,10 @@ def train(a):
                     opts.update(seconds=a.trial_seconds, **{'warmup-seconds': min(40, a.trial_seconds * 0.05)})
                 cmd = [binary, 'train', inputs / 'sources.json', '--out', out / stage['name'], '--gpus', a.gpu, *flags(opts)]
                 if previous: cmd += ['--resume', previous]
-                row = dict(name=stage['name'], command=list(map(str, cmd)), start_step=start_step, status='running')
+                spatial = opts.get('split') == 'z'
+                row = dict(name=stage['name'], command=list(map(str, cmd)), start_step=start_step, status='running',
+                           parallelism='spatial' if spatial else 'data',
+                           effective_batch=opts['B'] * (1 if spatial else len(gpu_devices(a.gpu))))
                 state['stages'].append(row); state['status'] = 'training'; atomic_json(out / 'run.json', state)
                 row['seconds'] = execute(cmd, out / (stage['name'] + '.log'), environment(r, binary))
                 previous = out / stage['name'] / 'last.ckpt'
@@ -342,7 +362,12 @@ def main():
     p = sub.add_parser('plan'); p.add_argument('--recipe', default='configs/production-candidate.json')
     p = sub.add_parser('train'); p.add_argument('--recipe', default='configs/production-candidate.json')
     p.add_argument('--sources'); p.add_argument('--binary', default='build/ufsm'); p.add_argument('--out', required=True)
-    p.add_argument('--gpu', default='0'); p.add_argument('--resume'); p.add_argument('--trial-seconds', type=float, default=0)
+    devices = p.add_mutually_exclusive_group()
+    devices.add_argument('--gpu', default='0')
+    devices.add_argument('--gpus', help='comma-separated GPU IDs; batch size is per GPU unless --split z is selected')
+    p.add_argument('--split', choices=['0', 'z'], help='split each window along z across exactly two GPUs')
+    p.add_argument('--mem', choices=['auto', 'auto16', 'default', 'wide'], help='override memory mode for every training stage')
+    p.add_argument('--resume'); p.add_argument('--trial-seconds', type=float, default=0)
     p = sub.add_parser('evaluate'); p.add_argument('run'); p.add_argument('--gpu', default='0')
     p.add_argument('--profiles', default='matched,fp4,fp8,fp16'); p.add_argument('--predictions', required=True)
     p = sub.add_parser('export'); p.add_argument('run'); p.add_argument('--profile', required=True); p.add_argument('--out', required=True)
@@ -350,7 +375,25 @@ def main():
     p.add_argument('--um', required=True); p.add_argument('--out', required=True); p.add_argument('--box'); p.add_argument('--axis')
     p.add_argument('--cache'); p.add_argument('--gpu', default='0'); p.add_argument('--level', default='0'); p.add_argument('--levels', default='4')
     a = parser.parse_args()
-    if hasattr(a, 'gpu') and not a.gpu.isdigit(): parser.error('--gpu must select one nonnegative device')
+    if a.command == 'train' and a.gpus is not None:
+        try:
+            a.gpu = ','.join(map(str, gpu_devices(a.gpus)))
+        except ValueError as e:
+            parser.error(str(e))
+    if hasattr(a, 'gpu') and not (a.command == 'train' and a.gpus is not None):
+        try:
+            devices = gpu_devices(a.gpu)
+        except ValueError as e:
+            parser.error(str(e))
+        if len(devices) != 1:
+            parser.error('--gpu must select one nonnegative device; use train --gpus for multiple GPUs')
+        a.gpu = str(devices[0])
+    if a.command == 'train':
+        # Reject an invalid spatial split before creating the run directory or
+        # starting any stage; recipes may select it instead of the CLI override.
+        split = a.split if a.split is not None else recipe(a.recipe)['train'].get('split', '0')
+        if split == 'z' and len(gpu_devices(a.gpu)) != 2:
+            parser.error('--split z requires exactly two GPUs')
     if hasattr(a, 'trial_seconds') and (not math.isfinite(a.trial_seconds) or a.trial_seconds < 0): parser.error('invalid trial budget')
     if a.command == 'plan': print(json.dumps(recipe(a.recipe), indent=2))
     else: {'train': train, 'evaluate': evaluate, 'export': export, 'predict': predict}[a.command](a)

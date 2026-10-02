@@ -121,6 +121,7 @@ test: build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging bu
 	python3 tests/test_http_reader.py
 	python3 tests/test_eval_holdouts.py
 	python3 tests/test_evaluation_plan.py
+	python3 tests/test_gpu_leases.py
 	./build/test_checkpoint_runtime
 	./build/test_infer_buffers
 	python3 tests/test_pipeline_cli.py

@@ -9,7 +9,7 @@ No teacher models, no distillation. All upstream data is re-exported once into t
 ## Current production audit (2026-10-02)
 
 The pipeline is qualified to launch full training: major measured performance hypotheses are bounded,
-all 37 final Make commands pass, and calibration and global-grid checks have completed. No long run
+all 38 final Make commands pass, and calibration and global-grid checks have completed. No long run
 has started. The recipe selects 512/B1 on one 16 GB GPU and matched 528/halo8/shard512 serving.
 Another 2x gain is not established; globally optimal kernels and final model accuracy are not claimed.
 Historical timings below include other batch sizes, two-GPU runs, shared GPUs, and earlier kernels;
@@ -49,6 +49,23 @@ objects are unchanged by the calibration/grid commit; final tests also cover cal
 and relocated bundles (`github-publish-regressions.json`). A full model still requires scoring at
 its own calibrated cutoffs, dense/partial/constant reports and acceptance of its actual quality.
 Whole-sheet and verso labelling remain unstarted separate work.
+
+The production wrapper now exposes `train --gpus 0,1`, `--split z`, and a memory-mode override,
+with separate nonblocking leases for every selected device. Cross-process tests cover collisions
+with either single GPU, canonical ID aliases, rollback after a partial acquisition, and release.
+Real fixture trials exercise both-stage resume, calibrated evaluation and export in data-parallel,
+spatial-wide and spatial-auto modes; manifests record each stage's effective batch and parallelism.
+One same-checkpoint, 24-update benchmark per mode gives single-wide / dual-wide / split-wide /
+split-auto 75.62 / 149.71 / 141.73 / 144.36 Mvox/s total. The sampled card peaks are dual-wide
+14812/14795 MiB, split-wide 7878/7861 MiB, and split-auto 11236/11219 MiB. The recovered single-GPU
+CSV remains unchanged, but its transient GPU samples are unavailable after a benchmark-driver
+interval-count assertion; earlier single-GPU headroom measurements remain separate evidence.
+Five four-update intervals exclude initial partial and final validation intervals. Data parallel
+has effective batch 2 and 0.558 updates/s; split auto retains batch 1 at 1.076 updates/s, roughly
+1.91x single-GPU update throughput. This supports an approximately 5.2-hour large stage for 20,000
+updates, not a long-run convergence or sustained-clock guarantee (`dual-gpu-bench.json`). The GPU
+kernels and precision policy are unchanged; the new wrapper arguments reproduce the qualified
+split-auto flags. Both-GPU use is an optional execution mode; the single-GPU recipe remains available.
 
 ### Earlier qualification stages
 

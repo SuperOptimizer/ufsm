@@ -42,7 +42,7 @@ accuracy gap on MANBp. The corrected short multi-source confirmation is complete
 accuracy remains weak and the aggregate score is distorted by partially labelled segments.
 Two matched seeds, each continued for 160 updates, show no consistent aggregate accuracy gain
 from FP8 weight gradients; the recipe retains the faster FP4 path. The pipeline is qualified for
-a full training run after bounded precision, calibration and global-grid checks plus all 37 test
+a full training run after bounded precision, calibration and global-grid checks plus all 38 test
 commands. The resulting model still needs post-training acceptance; the short-trial dense scores
 remain weak.
 Fresh training computes GroupNorm statistics from rounded stored activations;
@@ -76,6 +76,28 @@ plus validation, checkpoint and final scoring time. Launch it with:
 ```sh
 python3 tools/production.py train --out runs/production512 --gpu 0
 ```
+
+The production runner also supports both GPUs. Data parallelism trains a separate 512-cubed window
+on each GPU and averages their parameter gradients; `B=1` then means effective batch 2. Spatial
+parallelism splits each window along z, exchanges boundary activations and gradients, and reduces
+normalization/loss statistics over both GPUs; effective batch remains 1. Both modes preserve staged
+resume and export, and acquire each device's lease separately.
+
+A fresh bounded comparison using the same checkpoint and 24 updates per mode measures 75.6 Mvox/s
+on one GPU, 149.7 total with data parallelism, and 141.7 / 144.4 total with spatial split in wide / auto
+memory mode. Five four-update intervals exclude startup and final validation. Split auto observes
+11236 / 11219 MiB total card use, leaving about 5 GiB per card. It completes about 1.076 updates/s,
+versus 0.563 on one GPU. The same 20,000 large-window updates therefore take approximately 5.2 hours
+plus warmup, validation and scoring; these short timings do not guarantee sustained clocks or convergence.
+For this batch-1 run, use:
+
+```sh
+python3 tools/production.py train --out runs/production512-split --gpus 0,1 --split z --mem auto
+```
+
+For data parallelism, use `--gpus 0,1` without `--split z`. Keeping 20,000 updates processes twice as
+many windows and retains approximately the single-GPU duration. Halving the updates matches the
+original voxel budget but changes the optimizer-step count; that is a different training recipe.
 
 These commands run a **limited pipeline trial**, calibrate and score precision profiles,
 and export a self-contained candidate bundle:

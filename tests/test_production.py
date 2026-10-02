@@ -14,7 +14,7 @@ RUNNER = ROOT / 'tools/production.py'
 def run(*args, fail=False):
     # Untracked precision settings must not leak into frozen production runs.
     env = dict(os.environ, UFSM_ACT_MX4='0', UFSM_F16='0')
-    gpu_args = ['--gpu', os.environ.get('UFSM_TEST_GPU', '0')] if args[0] in ('train', 'evaluate', 'predict') else []
+    gpu_args = ['--gpu', os.environ.get('UFSM_TEST_GPU', '0')] if args[0] in ('train', 'evaluate', 'predict') and '--gpus' not in args and '--gpu' not in args else []
     p = subprocess.run([sys.executable, str(RUNNER), *map(str, args), *gpu_args], env=env,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     assert (p.returncode != 0) if fail else (p.returncode == 0), p.stdout
@@ -73,4 +73,28 @@ with tempfile.TemporaryDirectory(prefix='ufsm-production-') as tmp:
     run(*bad, fail=True); assert group.stat().st_mtime_ns == unchanged
     with (t / 'moved/model.ckpt').open('ab') as f: f.write(b'changed')
     run(*args, fail=True); assert group.stat().st_mtime_ns == unchanged
-    print('production train/evaluate/export/moved-bundle/predict/reuse/failure integrity: ok')
+    for name, extra in [('dual', []), ('split', ['--split', 'z']), ('split-auto', ['--split', 'z', '--mem', 'auto'])]:
+        spatial = name.startswith('split')
+        destination = t / name
+        run('train', '--recipe', recipe, '--out', destination, '--gpus', '0,1', *extra)
+        state = json.loads((destination / 'run.json').read_text())
+        assert state['gpu'] == '0,1' and [s['end_step'] for s in state['stages']] == [2, 4]
+        assert all(s['effective_batch'] == (1 if spatial else 2) for s in state['stages'])
+        assert all(s['parallelism'] == ('spatial' if spatial else 'data') for s in state['stages'])
+        assert all(s['command'][s['command'].index('--gpus') + 1] == '0,1' for s in state['stages'])
+        frozen = json.loads((destination / 'inputs/recipe.json').read_text())
+        assert (frozen['train'].get('split') == 'z') == spatial
+        if name == 'split-auto':
+            assert all(s['mem'] == 'auto' for s in frozen['stages'])
+            assert all(s['command'][s['command'].index('--mem') + 1] == 'auto' for s in state['stages'])
+        run('evaluate', destination, '--profiles', 'matched', '--predictions', t / f'eval-{name}')
+        run('export', destination, '--profile', 'matched', '--out', t / f'bundle-{name}')
+        model = json.loads((t / f'bundle-{name}/model.json').read_text())
+        scores = json.loads((destination / 'evaluation.json').read_text())
+        assert model['threshold'] == scores['profiles']['matched']['threshold']
+    for invalid in [['--gpus', '0,0'], ['--gpus', 'bad'], ['--gpus', '0', '--split', 'z'],
+                    ['--gpu', '0,1'], ['--gpus', '0,1', '--gpu', '0']]:
+        invalid_out = t / 'invalid-devices'
+        run('train', '--recipe', recipe, '--out', invalid_out, *invalid, fail=True)
+        assert not invalid_out.exists(), invalid
+    print('production single/dual/spatial train/evaluate/export/moved-bundle/predict/reuse/failure integrity: ok')
