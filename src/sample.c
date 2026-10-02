@@ -103,7 +103,7 @@ struct sampler {
     pthread_mutex_t mu;
     pthread_cond_t cv_free, cv_ready;
     pthread_t *th;
-    atomic_int stop;
+    atomic_int stop, failed;
     atomic_uint_fast64_t produced, rejected;
     atomic_uint soft_bits;   /* current soft-target sigma (float bits), set by sampler_set_soft */
     int64_t *slot_j;         /* deterministic mode: batch index held by each slot */
@@ -137,6 +137,56 @@ static void free_batch(batch *b) { if (b->x) nn_host_free(b->x); if (b->x16) nn_
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
 /* which levels a source can serve (CT and at least one target open): computed once per (source, region channel) since
    source_ct / source_tgt take the global open lock and may open remote stores; before this every draw re-checked every level */
+/* Inclusive level-l origins whose whole patch lies in the CT, region and validation box.
+   Round starts up and ends down: flooring a non-aligned holdout start leaks outside it. */
+static int patch_bounds(const source *s, const z3_meta *m, int P, int l, const regions *r, int ri, int validation, int64_t lo[3], int64_t hi[3]) {
+    int64_t f = (int64_t)1 << l;
+    for (int d = 0; d < 3; d++) {
+        lo[d] = 0; hi[d] = m->shape[d] - P;
+        if (r) {
+            int64_t a = r->origin[ri][d], end = a + (r->rsize ? r->rsize[ri] : r->size);
+            int64_t rl = (a + f - 1) / f, rh = end / f - P;
+            if (rl > lo[d]) lo[d] = rl;
+            if (rh < hi[d]) hi[d] = rh;
+        }
+        if (validation) {
+            if (s->hold_n[d] <= 0) return 0;
+            int64_t hl = (s->hold_o[d] + f - 1) / f, hh = (s->hold_o[d] + s->hold_n[d]) / f - P;
+            if (hl > lo[d]) lo[d] = hl;
+            if (hh < hi[d]) hi[d] = hh;
+        }
+        if (hi[d] < lo[d]) return 0;
+    }
+    return 1;
+}
+static int same_ct(const source *a, const source *b) {
+    return a == b || (a->um == b->um && !strcmp(a->ct_key, b->ct_key) && !strcmp(store_root(a->s), store_root(b->s)));
+}
+static int training_hits_holdout(const sampler *sp, const source *s, const int64_t o[3], int l) {
+    int64_t span = (int64_t)sp->cfg.P << l;
+    for (int i = 0; i < sp->S->n; i++) {
+        const source *h = &sp->S->src[i]; if (!h->hold_n[0] || !same_ct(s, h)) continue;
+        int hit = 1;
+        for (int d = 0; d < 3; d++) { int64_t a = o[d] << l; if (a + span <= h->hold_o[d] || a >= h->hold_o[d] + h->hold_n[d]) hit = 0; }
+        if (hit) return 1;
+    }
+    return 0;
+}
+/* Any free cell of the origin grid begins at lo or just after a forbidden interval.
+   Check these corners to reject a source covered by the union of same-CT holdouts. */
+static int training_corner_exists(const sampler *sp, const source *s, int l, const int64_t lo[3], const int64_t hi[3]) {
+    int n[3] = {1, 1, 1}; int64_t v[3][sp->S->n + 1], f = (int64_t)1 << l;
+    for (int d = 0; d < 3; d++) v[d][0] = lo[d];
+    if (!training_hits_holdout(sp, s, lo, l)) return 1;
+    for (int i = 0; i < sp->S->n; i++) {
+        const source *h = &sp->S->src[i]; if (!h->hold_n[0] || !same_ct(s, h)) continue;
+        for (int d = 0; d < 3; d++) { int64_t end = (h->hold_o[d] + h->hold_n[d] + f - 1) / f; if (end > lo[d] && end <= hi[d]) v[d][n[d]++] = end; }
+    }
+    for (int z = 0; z < n[0]; z++) for (int y = 0; y < n[1]; y++) for (int x = 0; x < n[2]; x++) {
+        int64_t o[3] = {v[0][z], v[1][y], v[2][x]}; if (!training_hits_holdout(sp, s, o, l)) return 1;
+    }
+    return 0;
+}
 static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
     int key = region_ch >= 0 ? 1 : 0;
     unsigned char *cache = sp->lvl_ok[si][key];
@@ -144,20 +194,11 @@ static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
         int ok = source_ct(s, l) != nullptr;
         if (ok) {
             const z3_meta *m = z3_meta_of(source_ct(s, l));
-            const int P = sp->cfg.P; int64_t span = (int64_t)P << l;
-            for (int d = 0; d < 3; d++) if (m->shape[d] < P) ok = 0;
-            if (region_ch >= 0) {
-                regions *r = s->reg[region_ch]; int fits = 0;
-                for (int i = 0; i < r->n; i++) if ((r->rsize ? r->rsize[i] : r->size) >= span) fits = 1;
-                if (!fits) ok = 0;
-            }
-            if (sp->cfg.holdout) {
-                for (int d = 0; d < 3; d++) if (s->hold_n[d] < span) ok = 0;
-            } else if (region_ch < 0 && s->hold_n[0]) {
-                int outside = 0;
-                for (int d = 0; d < 3; d++) if (s->hold_o[d] >= span || (m->shape[d] << l) - s->hold_o[d] - s->hold_n[d] >= span) outside = 1;
-                if (!outside) ok = 0;
-            }
+            regions *r = region_ch >= 0 ? s->reg[region_ch] : nullptr;
+            int fits = 0; int64_t lo[3], hi[3];
+            for (int i = 0; i < (r ? r->n : 1); i++) if (patch_bounds(s, m, sp->cfg.P, l, r, i, sp->cfg.holdout, lo, hi) &&
+                (sp->cfg.holdout || training_corner_exists(sp, s, l, lo, hi))) { fits = 1; break; }
+            ok = fits;
         }
         if (ok) {
             int any = 0;
@@ -314,13 +355,11 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     if (region_ch >= 0) {
         regions *R = s->reg[region_ch];
         ri = (int)rint_below(r, R->n);
-        int64_t span = (int64_t)P << l;              /* level-0 extent of the patch */
-        int rs = R->rsize ? R->rsize[ri] : R->size;
-        if (span > rs) return 1;
-        for (int d = 0; d < 3; d++) o[d] = (R->origin[ri][d] + rint_below(r, rs - span + 1)) >> l;
+        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, P, l, R, ri, c->holdout, lo, hi)) return 1;
+        for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (c->holdout) {
-        int64_t span = (int64_t)P << l;
-        for (int d = 0; d < 3; d++) { if (s->hold_n[d] < span) return 1; o[d] = (s->hold_o[d] + rint_below(r, s->hold_n[d] - span + 1)) >> l; }
+        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, P, l, nullptr, 0, 1, lo, hi)) return 1;
+        for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (sp->occ[si].n) {   /* draw around a random coarse cell that contains papyrus */
         size_t k = (size_t)(runif(r) * (double)sp->occ[si].n); if (k >= sp->occ[si].n) k = sp->occ[si].n - 1;
         uint32_t id = sp->occ[si].idx[k];
@@ -336,7 +375,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     } else {
         for (int d = 0; d < 3; d++) { if (m->shape[d] < P) return 1; o[d] = rint_below(r, m->shape[d] - P + 1); }
     }
-    if (c->snap && region_ch < 0) {   /* align the window to the CT chunk grid: a 128^3 window then decodes 8 chunks of 64^3 instead of up to 27 */
+    if (c->snap && !c->holdout && region_ch < 0) {   /* training only: snapping a validation origin can leave its holdout */
         for (int d = 0; d < 3; d++) {
             int64_t cs = m->chunk[d]; if (cs <= 0) continue;
             o[d] -= o[d] % cs;
@@ -344,11 +383,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (o[d] < 0) o[d] = 0;
         }
     }
-    if (!c->holdout && s->hold_n[0]) {   /* training: reject patches touching the held-out box */
-        int64_t span = (int64_t)P << l, hit = 1;
-        for (int d = 0; d < 3; d++) { int64_t a = o[d] << l; if (a + span <= s->hold_o[d] || a >= s->hold_o[d] + s->hold_n[d]) hit = 0; }
-        if (hit) return 1;
-    }
+    if (!c->holdout && training_hits_holdout(sp, s, o, l)) return 1;
     PROF_MARK(PS_PICK);
     /* cheap occupancy test on a coarse level before fetching the fine cube */
     int lc = l + 3;
@@ -525,17 +560,18 @@ static void *worker(void *arg) {
         pthread_mutex_unlock(&sp->mu);
         if (k < 0) break;
         batch *b = &sp->slots[k];
-        int fail = 0; unsigned spin = 0;
+        int fail = 0, filled = 0; unsigned spin = 0;
         for (int i = 0; i < sp->cfg.B && !atomic_load(&sp->stop);) {
             if (det && spin == 0 && fail == 0) rseed(&r, sp->cfg.seed * 0x9e3779b97f4a7c15ull + (uint64_t)(jb * sp->cfg.B + i) * 1000003ull + 1);   /* per-sample stream */
             int rc = draw(sp, b, i, &r, xtmp, ttmp, big);
-            if (rc == 0) { i++; fail = 0; spin = 0; }
-            else if (rc > 0 && ++spin == (1u << 22)) fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d too large for the sources' regions, holdout boxes or levels?)\n", spin, sp->cfg.P);
-            else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->stop, 1); } }
+            if (rc == 0) { i++; filled = i; fail = 0; spin = 0; }
+            else if (rc > 0 && ++spin == (1u << 22)) { fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d), stopping\n", spin, sp->cfg.P); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); }
+            else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); } }
         }
         pthread_mutex_lock(&sp->mu);
-        sp->state[k] = READY;
+        sp->state[k] = filled == sp->cfg.B && !atomic_load(&sp->stop) ? READY : FREE;
         pthread_cond_broadcast(&sp->cv_ready);
+        pthread_cond_broadcast(&sp->cv_free);
         pthread_mutex_unlock(&sp->mu);
     }
     free(xtmp); free(ttmp); free(big);
@@ -650,6 +686,7 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction) {
     return 0;
 }
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
+    if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
     sampler *sp = calloc(1, sizeof *sp);
     sp->S = S;
     sp->cfg = *cfg;
@@ -694,6 +731,7 @@ batch *sampler_next(sampler *sp) {
     pthread_mutex_lock(&sp->mu);
     int k = -1;
     while (k < 0) {
+        if (atomic_load(&sp->stop)) { pthread_mutex_unlock(&sp->mu); return nullptr; }
         if (sp->cfg.deterministic) {   /* in batch order */
             int s = (int)(sp->next_take % sp->nslots);
             if (sp->state[s] == READY && sp->slot_j[s] == sp->next_take) { k = s; sp->next_take++; pthread_cond_broadcast(&sp->cv_free); }
@@ -731,6 +769,7 @@ void sampler_stop(sampler *sp) {
 }
 
 void sampler_set_soft(sampler *sp, float sigma) { unsigned sb; memcpy(&sb, &sigma, 4); atomic_store(&sp->soft_bits, sb); }
+int sampler_failed(const sampler *sp) { return atomic_load(&sp->failed); }
 void sampler_prof_print(const sampler *sp) {
     if (!sp->prof) return;
     uint64_t n = atomic_load(&sp->produced); if (!n) n = 1;

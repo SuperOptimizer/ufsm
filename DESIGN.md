@@ -19,6 +19,39 @@ activation / FP8 weight-gradient dispatch; the fix restores step-dependent round
 test. Prediction and scoring errors now fail the confirmation instead of producing incomplete score rows.
 Scoring respects each source's minimum available label resolution.
 
+The first 17-source staged confirmation is complete (`production17-summary.json`): 780 s of
+128-cubed warmup, then 780 s of 512-cubed training versus continuing at 128 from the same
+checkpoint. The large stage made 398 updates at 0.51 samples/s; the control made 6470.
+At the provisional threshold 0.6, mean F1 was 0.3074 for large-stage FP4 inference and 0.3320
+for the control. Large-stage FP8 scored 0.3081 and FP16 0.3367. Prediction-only throughput
+over all 16 boxes was approximately 200 / 165 / 130 Mvox/s for FP4 / FP8 / FP16. These are
+short, single-seed diagnostics, not a production acceptance. The segment-label scores need
+comparison with their constant-foreground baseline; their high surface fraction can make
+unselective predictions look good.
+
+That confirmation used the frozen earlier binary. Subsequent audit fixed overlapping optimizer
+ownership: Muon/ANVIL conv weights also received AdamW decay, and stale Adam moments could
+change them. Packed AdamW and EMA also traversed nonmonotonic offsets and updated overlapping
+ranges. Each parameter now has exactly one optimizer owner. Validation sampling no longer
+snaps outside its holdout; training excludes the union of holdouts for sources sharing a CT;
+read failures discard incomplete batches and fail the run. New checks fail on the earlier code
+and pass on the fixes. New checkpoints also capture stem-input MX quantization separately;
+prediction restores it without enabling gradient buffers. Older embedded headers infer this
+setting from the saved gradient mode. Previous "matched" inference did not restore it, so
+the precision comparison must be repeated before choosing the production profile.
+
+The complete `make -j8 test` passes, including optimizer ownership, input-format transitions,
+portable checkpoint/resume, model-buffer reuse, sampler failures, both spatial-split presets,
+and the production runner. Evaluation's common radius-2 dilation uses separable passes;
+6480 thin-volume and boundary cases match the scatter reference exactly. Soft Dice is computed
+once per volume. Structured scores retain exact thresholds and annotation support, and
+`eval --seam-core 512 --seam-band 16 --scores report.json` separates internal tile-boundary
+scores from interior scores. Full training remains held pending corrected precision/accuracy
+confirmation, calibration, real-volume seam validation and remaining performance checks.
+On an actual 1024-cubed segment holdout with six thresholds, two timings per implementation
+measured 26.27 / 26.01 s before and 18.78 / 18.59 s after: 1.40x faster scoring with identical
+printed metric tables (`eval-radius2-bench.json`). This gain is in CPU scoring, not GPU inference.
+
 Single-GPU batch-1 measurements with the recovered memory changes:
 
 | training window | steady samples/s | million voxels/s | observed peak GPU memory, MiB |

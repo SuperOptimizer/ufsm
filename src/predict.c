@@ -95,7 +95,7 @@ int cmd_predict(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window 288] [--act-mx8 1]\n"
                         "       [--halo 8] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
-                        "       [--prec 0|1|2|3|4] [--policy enc0=1,...] [--f16 0|1] [--fp4 0|1] [--ema 1]   EMA or current weights (0)\n"
+                        "       [--prec 0|1|2|3|4] [--policy enc0=1,...] [--f16 0|1] [--fp4 0|1] [--input-mx 0|1] [--ema 1]   EMA or current weights (0)\n"
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n");
         fprintf(stderr, "  For exact shard tiling, window - 2*halo should divide the shard size: 528 with halo 8 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n");
         return 2;
@@ -120,7 +120,9 @@ int cmd_predict(int argc, char **argv) {
     if (embedded < 0 || unet_peek(ckpt, &cfg, &step) || cfg.nlev < 1 || cfg.nlev > UNET_MAXLEV) { fprintf(stderr, "cannot read checkpoint settings: %s\n", ckpt); return 1; }
     if (W % (1 << (cfg.nlev - 1))) { fprintf(stderr, "window must be divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
     const int override = *opt(argc, argv, "--prec", "") || *opt(argc, argv, "--fp4", "") || *opt(argc, argv, "--policy", "");
-    nn_set_prec(*opt(argc, argv, "--prec", "") ? atoi(opt(argc, argv, "--prec", "1")) : embedded ? runtime.prec : 1);
+    int precision = *opt(argc, argv, "--prec", "") ? atoi(opt(argc, argv, "--prec", "1")) : embedded ? runtime.prec : 1;
+    if (precision < 0 || precision > 4) { fprintf(stderr, "--prec must be 0..4\n"); return 2; }
+    nn_set_prec(precision);
     if (nn_set_prec_policy(opt(argc, argv, "--policy", embedded && !override ? runtime.policy : ""))) return 2;
     if (embedded) nn_set_f16(runtime.f16);
     if (*opt(argc, argv, "--f16", "")) nn_set_f16(atoi(opt(argc, argv, "--f16", "0")) != 0);
@@ -139,7 +141,11 @@ int cmd_predict(int argc, char **argv) {
     if (*opt(argc, argv, "--act-mx4", "")) mx4 = atoi(opt(argc, argv, "--act-mx4", "0")) != 0;
     if (*opt(argc, argv, "--act-mx8", "")) { mx8 = atoi(opt(argc, argv, "--act-mx8", "0")) != 0; if (mx8 && !*opt(argc, argv, "--act-mx4", "")) mx4 = 0; }
     unet_set_act_mx4(mx4); unet_set_act_mx8(mx8);
-    fprintf(stderr, "prediction precision: %s checkpoint, prec=%d f16=%d act_mx4=%d act_mx8=%d\n", embedded ? "embedded" : "legacy", nn_get_prec(), nn_get_f16(), mx4, mx8);
+    unet_set_grad_mx8(0);   /* inference has no gradient buffers; restore input precision independently */
+    int input = *opt(argc, argv, "--input-mx", "") ? atoi(opt(argc, argv, "--input-mx", "0")) : embedded ? runtime.input_mx : ufsm_env_on("UFSM_XIN_MX");
+    if (input < 0 || input > 1) { fprintf(stderr, "--input-mx must be 0 or 1\n"); return 2; }
+    unet_set_input_mx(input);
+    fprintf(stderr, "prediction precision: %s checkpoint, prec=%d f16=%d act_mx4=%d act_mx8=%d input_mx=%d\n", embedded ? "embedded" : "legacy", nn_get_prec(), nn_get_f16(), mx4, mx8, unet_input_converted());
     /* --gpus a,b,...: one worker process per GPU, each writes every n-th shard of the same store; the parent builds the pyramid */
     int gpus[8], ngpu = 0, part = 0;
     { const char *gl = opt(argc, argv, "--gpus", nullptr); if (gl) { char *t = strdup(gl); for (char *q = strtok(t, ","); q && ngpu < 8; q = strtok(nullptr, ",")) gpus[ngpu++] = atoi(q); free(t); } }

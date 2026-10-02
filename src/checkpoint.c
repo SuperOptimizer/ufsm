@@ -7,7 +7,7 @@
 static int valid(const checkpoint_runtime *r) {
     return r->version == 1 && r->train_window > 0 && r->prec >= 0 && r->prec <= 4 &&
         (r->f16 == 0 || r->f16 == 1) && (r->act_mx4 == 0 || r->act_mx4 == 1) &&
-        (r->act_mx8 == 0 || r->act_mx8 == 1) && (r->grad_mx8 == 0 || r->grad_mx8 == 1);
+        (r->act_mx8 == 0 || r->act_mx8 == 1) && (r->grad_mx8 == 0 || r->grad_mx8 == 1) && (r->input_mx == 0 || r->input_mx == 1);
 }
 static int integer(const json *j, const char *key, int *v) {
     const json *n = json_get(j, key);
@@ -30,7 +30,12 @@ int checkpoint_runtime_read(const char *path, checkpoint_runtime *r) {
             integer(m, "act_mx8", &r->act_mx8) || integer(m, "grad_mx8", &r->grad_mx8) ||
             !p || p->type != J_STR || strlen(p->str) >= sizeof r->policy ||
             !o || o->type != J_STR || strlen(o->str) >= sizeof r->optimizer || !valid(r)) rc = -1;
-        else { strcpy(r->policy, p->str); strcpy(r->optimizer, o->str); rc = 1; }
+        else {
+            /* Earlier version-1 headers already record the gradient mode that forces input conversion. */
+            r->input_mx = r->grad_mx8;
+            if (json_get(m, "input_mx") && (integer(m, "input_mx", &r->input_mx) || !valid(r))) rc = -1;
+            else { strcpy(r->policy, p->str); strcpy(r->optimizer, o->str); rc = 1; }
+        }
     }
     json_free(j); return rc;
 }
@@ -48,7 +53,7 @@ static int quoted(const char *s, char *out, size_t cap) {
 int checkpoint_runtime_json(const checkpoint_runtime *r, char *out, size_t cap) {
     char p[4096], o[32];
     if (!valid(r) || quoted(r->policy, p, sizeof p) || quoted(r->optimizer, o, sizeof o)) return -1;
-    int n = snprintf(out, cap, "{\"runtime\":{\"version\":1,\"train_window\":%d,\"prec\":%d,\"f16\":%d,\"act_mx4\":%d,\"act_mx8\":%d,\"grad_mx8\":%d,\"policy\":\"%s\",\"optimizer\":\"%s\"}}",
-        r->train_window, r->prec, r->f16, r->act_mx4, r->act_mx8, r->grad_mx8, p, o);
+    int n = snprintf(out, cap, "{\"runtime\":{\"version\":1,\"train_window\":%d,\"prec\":%d,\"f16\":%d,\"act_mx4\":%d,\"act_mx8\":%d,\"grad_mx8\":%d,\"input_mx\":%d,\"policy\":\"%s\",\"optimizer\":\"%s\"}}",
+        r->train_window, r->prec, r->f16, r->act_mx4, r->act_mx8, r->grad_mx8, r->input_mx, p, o);
     return n < 0 || (size_t)n >= cap ? -1 : 0;
 }

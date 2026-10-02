@@ -177,6 +177,10 @@ void unet_free(unet *u) {
     free_acts(u);
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema);
     nn_free(u->gn_scratch); nn_free(u->red_scratch);
+    nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs);
+    nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs);
+    nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
+    nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
     free(u);
 }
 
@@ -230,7 +234,10 @@ static int act_dt(void) { return act_mx4() ? 4 : 8; }   /* registry dt of the MX
 void unet_set_act_mx8(int on) { g_act_mx8 = on; }
 void unet_set_act_mx4(int on) { g_act_mx4 = on; }
 static int g_grad_mx8 = -1;   /* MX-fp8 activation gradients (env UFSM_GRAD_MX8=1; needs the MX activations) */
+static int g_input_mx = -1;
 static int grad_mx8(void) { if (g_grad_mx8 < 0) g_grad_mx8 = ufsm_env_on("UFSM_GRAD_MX8"); return g_grad_mx8 && act_mx8(); }
+static int input_mx(void) { if (g_input_mx < 0) g_input_mx = ufsm_env_on("UFSM_XIN_MX"); return act_mx8() && (g_input_mx || grad_mx8()); }
+void unet_set_input_mx(int on) { g_input_mx = on; }
 void unet_set_grad_mx8(int on) { g_grad_mx8 = on; }
 int unet_grad_mx8(void) { return grad_mx8(); }
 static float *dalloc_grad_mx(unet *u, size_t bytes) { u->act_bytes += bytes; u->grad_bytes += bytes; float *p = dalloc_oom(dmalloc(bytes), bytes); dstorage(p, bytes, 8); return p; }
@@ -254,7 +261,7 @@ static int recompute(void) { if (g_recompute < 0) { const char *e = getenv("UFSM
    (the GN statistics of a1 are kept from the forward) */
 static int recompute_a1(void) { return recompute() >= 2; }
 void unet_set_recompute(int on) { g_recompute = on; }
-#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 64 * act_mx4() + 256 * chunk_up() + 1024 * lean())
+#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx())
 /* chunk mode (recompute, 16-bit activations and gradients, fused upsample): the decoder's up-part input gradient is
    produced in w[i]-channel chunks, each upsample-backwarded straight into its slice of gout[i + 1], so the shared
    gradient buffer B only needs w[i] channels (env UFSM_CHUNK_UP=0 turns it off) */
@@ -455,7 +462,7 @@ void unet_build(unet *u, shape5 xs, int train) {
 }
 int unet_act_mx(void) { return act_mx8(); }   /* MX activation storage (fp8 or fp4) */
 int unet_act_mx4(void) { return act_mx4(); }
-int unet_input_converted(void) { return act_mx8() && grad_mx8(); }   /* the 16-bit network input is copied into MX storage at the forward's start */
+int unet_input_converted(void) { return input_mx(); }   /* the 16-bit network input is copied into MX storage at the forward's start */
 /* lean mode: the gradient buffer B as scratch for the trainer's 16-bit logit gradient (free from the end of the forward until
    the head backward has read it); nullptr when not built for training, not lean, or too small */
 /* lean: where the trainer's 16-bit logit gradient goes: lean 2 after the logits in A (B is gout[0], which the head backward
@@ -634,8 +641,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     if (x_h16 && !ABF) { fprintf(stderr, "unet_forward_x: a 16-bit input needs the 16-bit activation storage\n"); abort(); }
     /* Without MX gradients the four-channel input can stay 16-bit; the tap-packed FP8 kernel writes MX a1.
        MX gradients require a packed input for the available weight-gradient kernels (eight-wide MX rows). */
-    static int xin_env = -1; if (xin_env < 0) xin_env = getenv("UFSM_XIN_MX") ? atoi(getenv("UFSM_XIN_MX")) : 0;
-    const int xin_mx = xin_env || grad_mx8();   /* MX-fp8 gradients: the enc0.c1 weight gradient needs an MX x (no 16-bit x / MX gy kernel) */
+    const int xin_mx = input_mx();   /* MX-fp8 gradients require an MX x for the available weight-gradient kernels */
     if (ABF && !x_h16) { if (!u->xin) u->xin = xin_mx ? dalloc_act_s(u, xs) : dalloc_act(u, shape_numel(xs)); nn_f32_to_act(x, xs, u->xin); cur = u->xin; }
     else if (x_h16 && act_mx8() && xin_mx) { if (!u->xin) u->xin = dalloc_act_s(u, xs); nn_h16_to_mx(x, xs, u->xin); cur = u->xin; }
     for (int i = 0; i < L; i++) {
@@ -885,15 +891,45 @@ static void wq_adamw(unet *u, float lr, float b1, float b2, float eps, float wd,
 static void wq_ema(unet *u, float decay);
 void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step) { if (u->wq) wq_adamw(u, lr, b1, b2, eps, wd, step); else nn_adamw(u->p, u->g, u->m, u->v, u->np, lr, b1, b2, eps, wd, step); }
 static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg);
+/* Conv traversal follows graph order, not parameter offsets. Sort weight intervals before
+   updating the complementary biases, norms and head, so each parameter has one owner. */
+typedef struct { const convp *c[64]; int n; } conv_list;
+static void collect_conv(unet *u, const convp *c, void *arg) {
+    (void)u; conv_list *a = arg; a->c[a->n++] = c;
+}
+static void plain_ranges(unet *u, void (*fn)(unet *, size_t, size_t, void *), void *arg) {
+    conv_list a = {0}; for_each_conv3(u, collect_conv, &a);
+    for (int i = 1; i < a.n; i++) {
+        const convp *c = a.c[i]; int j = i;
+        while (j && a.c[j - 1]->w > c->w) { a.c[j] = a.c[j - 1]; j--; }
+        a.c[j] = c;
+    }
+    size_t pos = 0;
+    for (int i = 0; i < a.n; i++) {
+        const convp *c = a.c[i]; size_t n = (size_t)c->cout * c->cin * c->k * c->k * c->k;
+        if (c->w < pos || c->w > u->np || n > u->np - c->w) { fprintf(stderr, "invalid optimizer parameter partition\n"); abort(); }
+        if (c->w > pos) fn(u, pos, c->w - pos, arg);
+        pos = c->w + n;
+    }
+    if (pos < u->np) fn(u, pos, u->np - pos, arg);
+}
+typedef struct { float lr, b1, b2, eps, wd; int step; } adam_arg;
+static void plain_adamw(unet *u, size_t off, size_t n, void *arg) {
+    adam_arg *a = arg;
+    nn_adamw(u->p + off, u->g + off, u->m + off, u->v + off, n, a->lr, a->b1, a->b2, a->eps, a->wd, a->step);
+}
+static void adamw_nonconv(unet *u, float lr, float b1, float b2, float eps, float wd, int step) {
+    adam_arg a = {lr, b1, b2, eps, wd, step}; plain_ranges(u, plain_adamw, &a);
+}
+static void plain_ema(unet *u, size_t off, size_t n, void *arg) { nn_ema(u->ema + off, u->p + off, n, *(float *)arg); }
 /* Muon for the 3^3 conv weights (viewed as [Co][Ci * 27]); biases, GroupNorm parameters and the head stay on AdamW.
-   The conv gradients are zeroed before the AdamW pass so it leaves those weights alone (their m and v stay 0). */
+   Exclude these weights from AdamW: zero gradients still allow decay and stale moments to change them. */
 typedef struct { float lr, beta, wd; } muon_arg;
 static void muon_conv(unet *u, const convp *c, void *arg) {
     muon_arg *a = arg; int K = c->cin * c->k * c->k * c->k; size_t n = (size_t)c->cout * K;
     size_t need = 2 * n + 2 * (size_t)c->cout * c->cout;
     if (u->muon_work_n < need) { if (u->muon_work) nn_free(u->muon_work); u->muon_work = nn_malloc(need * 4); u->muon_work_n = need; }
     nn_muon(u->p + c->w, u->g + c->w, u->muon_mom + c->w, c->cout, K, a->lr, a->beta, a->wd, u->muon_work);
-    nn_zero(u->g + c->w, n * 4);
 }
 typedef struct { float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K; } muon_desc_t;   /* mirrors nn.cu */
 typedef struct { muon_desc_t h[64]; int n; size_t pool; int maxco, maxk; } muon_build_t;
@@ -905,7 +941,6 @@ static void muon_collect(unet *u, const convp *c, void *arg) {
     if (c->cout > b->maxco) b->maxco = c->cout;
     if (K > b->maxk) b->maxk = K;
 }
-static void muon_zero_conv(unet *u, const convp *c, void *arg) { (void)arg; nn_zero(u->g + c->w, (size_t)c->cout * c->cin * c->k * c->k * c->k * 4); }
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step) {
     if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd, step); return; }   /* packed weights: AdamW only */
     if (!u->muon_mom) { u->muon_mom = nn_malloc(u->np * 4); nn_zero(u->muon_mom, u->np * 4); }
@@ -922,9 +957,8 @@ void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, floa
             u->muon_nconv = b.n; u->muon_maxco = b.maxco; u->muon_maxk = b.maxk; u->muon_work = pool;
         }
         nn_muon_batch(u->muon_descs, u->muon_nconv, u->muon_maxco, u->muon_maxk, lr_muon, beta, wd);
-        for_each_conv3(u, muon_zero_conv, nullptr);
     }
-    nn_adamw(u->p, u->g, u->m, u->v, u->np, lr_adam, b1, b2, eps, wd, step);
+    adamw_nonconv(u, lr_adam, b1, b2, eps, wd, step);
 }
 /* ANVIL II on the 3^3 conv weights (see nn.cu); AdamW elsewhere. step counts from 1; rail schedule as in the nanogpt record. */
 typedef struct { float *p; const float *g; float *v0, *X, *Y, *A, *B, *v1, *E, *R; int Co, K; } anvil_desc_t;
@@ -958,8 +992,7 @@ void unet_anvil(unet *u, float lr, float wd, int step, int steps, float lr_adam,
     else { bf = step < bwarm ? 0.85f + (0.93f - 0.85f) * (float)step / bwarm : 0.93f; w = 1.f; }
     (void)steps;
     nn_anvil_batch(u->anvil_descs, u->anvil_nconv, u->muon_maxco, u->muon_maxk, lr, bf, 0.98f, w, 0.95f, 0.9f, wd);
-    for_each_conv3(u, muon_zero_conv, nullptr);
-    nn_adamw(u->p, u->g, u->m, u->v, u->np, lr_adam, b1, b2, eps, wd_adam, step);
+    adamw_nonconv(u, lr_adam, b1, b2, eps, wd_adam, step);
 }
 void unet_ema(unet *u, float decay) { if (u->wq) wq_ema(u, decay); else nn_ema(u->ema, u->p, u->np, decay); }
 void unet_use_ema(unet *u, int on) { u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
@@ -1021,26 +1054,20 @@ static const convp *wq_conv(unet *u, int i) {   /* i-th 3^3 conv in for_each_con
 }
 /* optimizer step with packed weights: AdamW on the packed conv weights, the plain fp32 AdamW on everything in between */
 static void wq_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step) {
-    size_t pos = 0;
+    adamw_nonconv(u, lr, b1, b2, eps, wd, step);
     for (int i = 0; i < u->wq_n; i++) {
-        const convp *c = wq_conv(u, i); int T = c->k * c->k * c->k; size_t n = (size_t)c->cout * c->cin * T, qo = u->wq_qoff[i];
-        if (c->w > pos) nn_adamw(u->p + pos, u->g + pos, u->m + pos, u->v + pos, c->w - pos, lr, b1, b2, eps, wd, step);
+        const convp *c = wq_conv(u, i); int T = c->k * c->k * c->k; size_t qo = u->wq_qoff[i];
         nn_wq_adamw(u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->wq_r ? u->wq_r + c->w : nullptr, u->wq_r ? u->wq_rsc + u->wq_soff[i] : nullptr, u->g + c->w, u->m + c->w, u->v + c->w, c->cout, c->cin, T, u->wq, lr, b1, b2, eps, wd, step, (unsigned)step * 7919u + (unsigned)i);
         nn_wq_unpack(u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->p + c->w, c->cout, c->cin, T, u->wq);
-        pos = c->w + n;
     }
-    if (pos < u->np) nn_adamw(u->p + pos, u->g + pos, u->m + pos, u->v + pos, u->np - pos, lr, b1, b2, eps, wd, step);
 }
 static void wq_ema(unet *u, float decay) {
-    size_t pos = 0;
+    plain_ranges(u, plain_ema, &decay);
     for (int i = 0; i < u->wq_n; i++) {
-        const convp *c = wq_conv(u, i); int T = c->k * c->k * c->k; size_t n = (size_t)c->cout * c->cin * T, qo = u->wq_qoff[i];
-        if (c->w > pos) nn_ema(u->ema + pos, u->p + pos, c->w - pos, decay);
+        const convp *c = wq_conv(u, i); int T = c->k * c->k * c->k; size_t qo = u->wq_qoff[i];
         nn_wq_ema(u->wq_qe + qo, u->wq_sce + u->wq_soff[i], u->wq_re ? u->wq_re + c->w : nullptr, u->wq_re ? u->wq_rsce + u->wq_soff[i] : nullptr, u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->wq_r ? u->wq_r + c->w : nullptr, u->wq_r ? u->wq_rsc + u->wq_soff[i] : nullptr, c->cout, c->cin, T, u->wq, decay, (unsigned)(u->ema_step++) * 104729u + (unsigned)i);
         nn_wq_unpack(u->wq_qe + qo, u->wq_sce + u->wq_soff[i], u->ema + c->w, c->cout, c->cin, T, u->wq);
-        pos = c->w + n;
     }
-    if (pos < u->np) nn_ema(u->ema + pos, u->p + pos, u->np - pos, decay);
 }
 void unet_wquant(unet *u, unsigned seed) { (void)u; (void)seed; }   /* kept for API compatibility: packed storage makes it unnecessary */
 

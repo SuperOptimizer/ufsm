@@ -18,6 +18,33 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
 /* Binary dilation by an Euclidean ball. Shift whole rows so the inner loop can be vectorised;
    scattering from each positive voxel is especially slow on large, dense predictions. */
 static void dilate(const uint8_t *in, uint8_t *out, const int64_t n[3], int tol) {
+    /* A radius-2 Euclidean ball is the 3x3x3 cube plus the six axis-distance-2
+       points. Three separable OR passes replace 33 repeated full-volume shifts. */
+    if (tol == 2) {
+        const size_t plane = (size_t)n[1] * n[2], nv = (size_t)n[0] * plane;
+        uint8_t *tmp = malloc(nv);
+        if (tmp) {
+            for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) {
+                size_t base = (size_t)z * plane + (size_t)y * n[2];
+                for (int64_t x = 0; x < n[2]; x++) out[base + x] = in[base + x] | (x ? in[base + x - 1] : 0) | (x + 1 < n[2] ? in[base + x + 1] : 0);
+            }
+            for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) {
+                size_t base = (size_t)z * plane + (size_t)y * n[2];
+                for (int64_t x = 0; x < n[2]; x++) tmp[base + x] = out[base + x] | (y ? out[base + x - n[2]] : 0) | (y + 1 < n[1] ? out[base + x + n[2]] : 0);
+            }
+            for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) {
+                size_t base = (size_t)z * plane + (size_t)y * n[2];
+                for (int64_t x = 0; x < n[2]; x++) {
+                    size_t i = base + x;
+                    out[i] = tmp[i] | (z ? tmp[i - plane] : 0) | (z + 1 < n[0] ? tmp[i + plane] : 0) |
+                        (x >= 2 ? in[i - 2] : 0) | (x + 2 < n[2] ? in[i + 2] : 0) |
+                        (y >= 2 ? in[i - 2 * n[2]] : 0) | (y + 2 < n[1] ? in[i + 2 * n[2]] : 0) |
+                        (z >= 2 ? in[i - 2 * plane] : 0) | (z + 2 < n[0] ? in[i + 2 * plane] : 0);
+                }
+            }
+            free(tmp); return;
+        }
+    }
     memcpy(out, in, (size_t)n[0] * n[1] * n[2]);
     for (int dz = -tol; dz <= tol; dz++) for (int dy = -tol; dy <= tol; dy++) for (int dx = -tol; dx <= tol; dx++) {
         if ((!dz && !dy && !dx) || dz * dz + dy * dy + dx * dx > tol * tol) continue;
@@ -32,15 +59,29 @@ static void dilate(const uint8_t *in, uint8_t *out, const int64_t n[3], int tol)
     }
 }
 
+static int near_seam(int64_t q, int64_t n, int core, int band) {
+    int64_t left = q / core * core, right = left + core;
+    return (left > 0 && q - left < band) || (right < n && right - q <= band);
+}
+typedef struct { size_t valid, positive, tp, fp, fn, bph, bpt, brh, brt; } region_counts;
+static void write_counts(FILE *f, const region_counts *c) {
+    double p = c->tp + c->fp ? (double)c->tp / (c->tp + c->fp) : 0, r = c->tp + c->fn ? (double)c->tp / (c->tp + c->fn) : 0;
+    double bp = c->bpt ? (double)c->bph / c->bpt : 0, br = c->brt ? (double)c->brh / c->brt : 0;
+    fprintf(f, "{\"valid_voxels\":%zu,\"positive_voxels\":%zu,\"tp\":%zu,\"fp\":%zu,\"fn\":%zu,\"precision\":%.10g,\"recall\":%.10g,\"f1\":%.10g,\"band_precision\":%.10g,\"band_recall\":%.10g,\"band_f1\":%.10g}",
+        c->valid, c->positive, c->tp, c->fp, c->fn, p, r, p + r ? 2 * p * r / (p + r) : 0, bp, br, bp + br ? 2 * bp * br / (bp + br) : 0);
+}
 int cmd_eval(int argc, char **argv) {
     if (argc < 8) {
         fprintf(stderr, "usage: ufsm eval <pred-root> <pred-group> <label-root> <label-group> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--tol 2] [--pred-origin z,y,x] [--dump slice.pgm] [--thr 0.3,0.5,0.7]\n"
+                        "       [--scores JSON] [--seam-core N --seam-band 16]   separate scores near internal tile boundaries\n"
                         "  the prediction's origin_zyx (attribute written by predict) is subtracted from label coordinates\n");
         return 2;
     }
     const char *proot = argv[2], *pkey = argv[3], *lroot = argv[4], *lkey = argv[5];
     double um = atof(opt(argc, argv, "--um", "0"));
     int level = atoi(opt(argc, argv, "--level", "0")), tol = atoi(opt(argc, argv, "--tol", "2"));
+    int core = atoi(opt(argc, argv, "--seam-core", "0")), band = atoi(opt(argc, argv, "--seam-band", "16"));
+    if (core < 0 || (core && (band < 1 || band > core / 2)) || tol < 0 || tol > 32 || level < 0 || level > 20) { fprintf(stderr, "invalid evaluation levels, tolerance or seam geometry\n"); return 2; }
     if (um <= 0) { fprintf(stderr, "--um required\n"); return 2; }
     store *ps = store_open(proot), *ls = store_open(lroot);
     z3 *pz = pyramid_open_level(ps, pkey, level, um, nullptr), *lz = pyramid_open_level(ls, lkey, level, um, nullptr);
@@ -77,27 +118,55 @@ int cmd_eval(int argc, char **argv) {
     dilate(gt, gtd, n, tol);
     double thrs[16] = {0.3, 0.5, 0.7}; int nthr = 3;   /* --thr 0.1,0.2,0.3 overrides */
     { const char *ts = opt(argc, argv, "--thr", nullptr); if (ts) { nthr = 0; char *t = strdup(ts); for (char *q = strtok(t, ","); q && nthr < 16; q = strtok(nullptr, ",")) thrs[nthr++] = atof(q); free(t); } }
+    if (!nthr) { fprintf(stderr, "at least one threshold is required\n"); return 2; }
+    for (int t = 0; t < nthr; t++) if (!isfinite(thrs[t]) || thrs[t] < 0 || thrs[t] > 1) { fprintf(stderr, "thresholds must be finite and in [0,1]\n"); return 2; }
+    uint8_t *region = core ? malloc(nv) : nullptr;
+    if (core && !region) { fprintf(stderr, "cannot allocate seam mask\n"); return 1; }
+    if (region) for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) {
+        int zy = near_seam(o[0] + z, pm->shape[0], core, band) || near_seam(o[1] + y, pm->shape[1], core, band);
+        for (int64_t x = 0; x < n[2]; x++) region[((size_t)z * n[1] + y) * n[2] + x] = zy || near_seam(o[2] + x, pm->shape[2], core, band) ? 1 : 2;
+    }
+    const char *score_path = opt(argc, argv, "--scores", nullptr);
+    FILE *score = score_path ? fopen(score_path, "w") : nullptr;
+    if (score_path && !score) { perror(score_path); return 1; }
+    if (score) fprintf(score, "{\"version\":1,\"seam_core\":%d,\"seam_band\":%d,\"thresholds\":[", core, band);
+    /* Soft Dice is independent of the hard threshold. Scan the volume once. */
+    double sp = 0, ss = 0, sg = 0;
+    for (size_t i = 0; i < nv; i++) if (l[i] != 255) { double q = p[i] / 255.0; sp += q * gt[i]; ss += q; sg += gt[i]; }
+    double dice = (2 * sp + 1) / (ss + sg + 1);
     for (int t = 0; t < nthr; t++) {
         uint8_t th = (uint8_t)(thrs[t] * 255);
         size_t tp = 0, fp = 0, fn = 0, bp_hit = 0, bp_tot = 0;
+        region_counts counts[3] = {0};
         for (size_t i = 0; i < nv; i++) {
             pr[i] = p[i] >= th;
             if (l[i] == 255) continue;
             tp += pr[i] && gt[i]; fp += pr[i] && !gt[i]; fn += !pr[i] && gt[i];
             if (pr[i]) { bp_tot++; bp_hit += gtd[i]; }
+            if (region) {
+                region_counts *c = &counts[region[i]]; c->valid++; c->positive += gt[i];
+                c->tp += pr[i] && gt[i]; c->fp += pr[i] && !gt[i]; c->fn += !pr[i] && gt[i];
+                if (pr[i]) { c->bpt++; c->bph += gtd[i]; }
+            }
         }
         dilate(pr, prd, n, tol);
         size_t br_hit = 0, br_tot = 0;
-        for (size_t i = 0; i < nv; i++) if (l[i] != 255 && gt[i]) { br_tot++; br_hit += prd[i]; }
+        for (size_t i = 0; i < nv; i++) if (l[i] != 255 && gt[i]) { br_tot++; br_hit += prd[i]; if (region) { counts[region[i]].brt++; counts[region[i]].brh += prd[i]; } }
         double prec = tp + fp ? (double)tp / (tp + fp) : 0, rec = tp + fn ? (double)tp / (tp + fn) : 0;
         double f1 = prec + rec ? 2 * prec * rec / (prec + rec) : 0;
-        /* soft dice with p/255 against hard labels */
-        double sp = 0, ss = 0, sg = 0;
-        for (size_t i = 0; i < nv; i++) if (l[i] != 255) { double q = p[i] / 255.0; sp += q * gt[i]; ss += q; sg += gt[i]; }
-        double dice = (2 * sp + 1) / (ss + sg + 1);
-        printf("%.2f  %.4f  %.4f  %.4f  %.4f  |  %.4f  %.4f\n", thrs[t], prec, rec, f1, t == 0 ? dice : dice, bp_tot ? (double)bp_hit / bp_tot : 0, br_tot ? (double)br_hit / br_tot : 0);
+        printf("%.2f  %.4f  %.4f  %.4f  %.4f  |  %.4f  %.4f\n", thrs[t], prec, rec, f1, dice, bp_tot ? (double)bp_hit / bp_tot : 0, br_tot ? (double)br_hit / br_tot : 0);
+        if (score) {
+            counts[0] = (region_counts){nvalid, npos, tp, fp, fn, bp_hit, bp_tot, br_hit, br_tot};
+            fprintf(score, "%s{\"threshold\":%.10g,\"all\":", t ? "," : "", thrs[t]); write_counts(score, &counts[0]);
+            fprintf(score, ",\"dice\":%.10g", dice);
+            if (region) { fputs(",\"seam\":", score); write_counts(score, &counts[1]); fputs(",\"interior\":", score); write_counts(score, &counts[2]); }
+            fputc('}', score);
+        }
     }
+    int score_failed = 0;
+    if (score) { fputs("]}\n", score); score_failed = ferror(score); if (fclose(score)) score_failed = 1; }
+    free(region);
     free(p); free(l); free(gt); free(gtd); free(pr); free(prd);
     z3_close(pz); z3_close(lz); store_close(ps); store_close(ls);
-    return 0;
+    return score_failed ? 1 : 0;
 }

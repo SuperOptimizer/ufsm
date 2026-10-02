@@ -21,4 +21,9 @@ int main(void) {
         reference(a,b,n,tol); dilate(a,c,n,tol); assert(!memcmp(b,c,nv)); cases++;
     }
     printf("dilation: %d boundary, thin-volume and radius cases bit-exact\n",cases);
+    for (int n=1; n<=70; n++) for (int core=2; core<=20; core++) for (int band=1; band<=core/2; band++) for (int q=0; q<n; q++) {
+        int hit=0; for (int plane=core; plane<n; plane+=core) hit |= fabs(q+0.5-plane)<band;
+        assert(near_seam(q,n,core,band)==hit);
+    }
+    puts("internal seam masks: exact including partial last tiles and outer boundaries");
 }

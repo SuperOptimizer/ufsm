@@ -4,7 +4,7 @@
 usage: eval_holdouts.py <ckpt> [--sources configs/all.json] [--out /vesuvius/ufsm/eval/<run>] [--gpu 1] [--level 0]
 Prints one table per source. --scores writes structured metrics; any failed box makes the command fail.
 """
-import hashlib, json, math, os, shlex, shutil, subprocess, sys, tempfile, time
+import hashlib, json, math, os, re, shlex, shutil, subprocess, sys, tempfile, time
 
 # the ufsm binary of this checkout (env UFSM_BIN overrides), so checkpoints with newer config fields load
 B = os.environ.get("UFSM_BIN", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "ufsm"))
@@ -124,7 +124,10 @@ def main():
         ev = [B, "eval", pdir, ".", lroot, lgroup, "--um", str(s["um"]), "--level", source_level, "--tol", "2",
               "--pred-origin", ",".join(str(v) for v in h[:3]), "--thr", thresholds]
         started = time.monotonic()
-        r = subprocess.run(ev, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, text=True)
+        with tempfile.TemporaryDirectory(prefix="ufsm-eval-metrics-") as tmp:
+            metrics = os.path.join(tmp, "metrics.json")
+            r = subprocess.run(ev + ["--scores", metrics], stderr=subprocess.STDOUT, stdout=subprocess.PIPE, text=True)
+            structured = json.load(open(metrics)) if os.path.isfile(metrics) else None
         evaluation_seconds = time.monotonic() - started
         print(r.stdout, flush=True)
         rows = []
@@ -138,13 +141,19 @@ def main():
                 continue
             rows.append(dict(threshold=t, precision=p, recall=recall, f1=f1, dice=dice,
                              band_precision=bp, band_recall=br, band_f1=2*bp*br/(bp+br) if bp+br else 0))
+        if structured:
+            rows = [dict(threshold=row['threshold'], dice=row['dice'], **row['all']) for row in structured['thresholds']]
         if r.returncode or len(rows) != len(thresholds.split(",")):
             failures.append(name)
             print("ERROR: incomplete evaluation", flush=True)
         else:
+            support = re.search(r": (\d+) valid voxels.*?, (\d+) labelled surface", r.stdout)
+            valid, positive = map(int, support.groups()) if support else (None, None)
             scores[name] = dict(level=int(source_level), rows=rows, peak=max(rows, key=lambda row: row["f1"]),
                                 peak_band=max(rows, key=lambda row: row["band_f1"]), prediction_seconds=prediction_seconds,
-                                evaluation_seconds=evaluation_seconds, output_voxels=math.prod(v >> int(source_level) for v in h[3:]))
+                                evaluation_seconds=evaluation_seconds, output_voxels=math.prod(v >> int(source_level) for v in h[3:]),
+                                valid_voxels=valid, positive_voxels=positive, positive_fraction=positive/valid if valid else None,
+                                constant_foreground_f1=2*positive/(valid+positive) if valid else None)
     if failures:
         raise SystemExit("Failed held-out boxes: " + ", ".join(failures))
     if not scores:

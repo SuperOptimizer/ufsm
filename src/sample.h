@@ -43,6 +43,7 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction);
 sampler *sampler_start(sources *S, const sample_cfg *cfg);
 /* Block until a batch is ready; the pointer stays valid until sampler_release. */
 batch *sampler_next(sampler *sp);
+int sampler_failed(const sampler *sp);   /* read failure or exhausted draw retries; stopped samplers never publish partial batches */
 void sampler_release(sampler *sp, batch *b);
 void sampler_stop(sampler *sp);
 /* Stats: patches rejected / produced since start. */

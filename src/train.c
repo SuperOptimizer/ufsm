@@ -359,7 +359,7 @@ int cmd_train(int argc, char **argv) {
     nn_init(G[0].dev);
     size_t np = unet_nparams(G[0].u);
     checkpoint_runtime runtime = {.version = 1, .train_window = P, .prec = nn_get_prec(), .f16 = nn_get_f16(),
-        .act_mx4 = unet_act_mx4(), .act_mx8 = unet_act_mx() && !unet_act_mx4(), .grad_mx8 = unet_grad_mx8()};
+        .act_mx4 = unet_act_mx4(), .act_mx8 = unet_act_mx() && !unet_act_mx4(), .grad_mx8 = unet_grad_mx8(), .input_mx = unet_input_converted()};
     const char *saved_policy = opt(argc, argv, "--policy", "");
     if (!*saved_policy) saved_policy = fp4 >= 2 ? "all=fp4:fp4:fp4,enc0.c1=fp16" : fp4 ? "all=fp4:fp4:fp8,enc0.c1=fp16" : "";
     if (strlen(saved_policy) >= sizeof runtime.policy || strlen(optname) >= sizeof runtime.optimizer) { fprintf(stderr, "checkpoint settings too long\n"); return 2; }
@@ -388,7 +388,9 @@ int cmd_train(int argc, char **argv) {
         val[i].w = malloc((size_t)B * NCH); memcpy(val[i].w, b->w, (size_t)B * NCH);
         sampler_release(vs, b);
     }
+    int validation_failed = sampler_failed(vs);
     sampler_stop(vs);
+    if (validation_failed) { fprintf(stderr, "validation sampler failed\n"); return 1; }
     fprintf(stderr, "%d validation batches\n", nval);
 
     sampler *sp = sampler_start(S, &sc);
@@ -606,7 +608,8 @@ int cmd_train(int argc, char **argv) {
     uint64_t prod, rej; sampler_stats(sp, &prod, &rej);
     fprintf(stderr, "done in %.0fs; sampler produced %llu, rejected %llu\n", now() - t0, (unsigned long long)prod, (unsigned long long)rej);
     sampler_prof_print(sp);   /* UFSM_SAMPLER_PROF=1: per-stage cpu ms per patch */
+    int sampling_failed = sampler_failed(sp);
     sampler_stop(sp);
     if (log) fclose(log);
-    return 0;
+    return sampling_failed ? 1 : 0;
 }

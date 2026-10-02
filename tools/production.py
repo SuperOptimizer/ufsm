@@ -211,6 +211,9 @@ def evaluate(a):
                 mean_band_f1=sum(v['band_f1'] for v in rows) / len(rows), boxes=len(rows), total_seconds=elapsed,
                 prediction_seconds=seconds, output_mvox_per_second=sum(s['output_voxels'] for s in data.values()) / seconds / 1e6 if seconds else None,
                 scores_sha256=digest(scores))
+            support = {n: dict(f1=row['f1'], positive_fraction=data[n].get('positive_fraction'),
+                              constant_foreground_f1=data[n].get('constant_foreground_f1')) for n, row in zip(data, rows)}
+            result['profiles'][name]['per_box_support'] = support
             atomic_json(out / 'evaluation.json', result)
             print(json.dumps({name: result['profiles'][name]}), flush=True)
 

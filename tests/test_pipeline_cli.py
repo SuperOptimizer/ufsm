@@ -48,7 +48,14 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     def chunks(path):
         return {p.relative_to(path): hashlib.sha256(p.read_bytes()).hexdigest() for p in path.rglob("*") if p.is_file() and p.name != "zarr.json"}
     assert chunks(t / "default") == chunks(t / "explicit"), "embedded and explicit precisions differ"
-    for args in (["--window", "0"], ["--halo", "12"], ["--box", "bad"], ["--shard", "129"], ["--um", "nan"]):
+    run('eval', t / 'default', '.', t / 'labels', '.', '--um', '1', '--level', '0', '--thr', '0.333,0.6',
+        '--seam-core', '8', '--seam-band', '2', '--scores', t / 'regions.json')
+    regions = json.loads((t / 'regions.json').read_text())['thresholds']
+    assert regions[0]['threshold'] == 0.333
+    for row in regions:
+        for key in ('valid_voxels', 'positive_voxels', 'tp', 'fp', 'fn'):
+            assert row['all'][key] == row['seam'][key] + row['interior'][key], (key, row)
+    for args in (["--window", "0"], ["--halo", "12"], ["--box", "bad"], ["--shard", "129"], ["--um", "nan"], ["--prec", "999"], ["--input-mx", "2"]):
         # First occurrence wins, so put invalid overrides before the valid geometry.
         run(*pred, t / "invalid", *args, *geometry, ok=2)
     impossible = json.loads(cfg.read_text())

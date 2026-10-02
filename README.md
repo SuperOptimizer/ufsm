@@ -38,7 +38,9 @@ The runner removes inherited `UFSM_*` settings and uses the recipe's explicit en
 
 The current [candidate recipe](configs/production-candidate.json) uses a 128-cubed warmup followed by
 512-cubed batch-1 training on one GPU, with 528-cubed / halo-8 inference. Staging closed the short-run
-accuracy gap on MANBp; multi-source confirmation, threshold calibration and seam validation remain.
+accuracy gap on MANBp. The first multi-source trial trails its small-window control at the provisional
+cutoff; it also predates optimizer and input-precision fixes. Corrected confirmation, threshold
+calibration and seam validation remain.
 Kaggle's 320-cubed regions participate in the warmup and are explicitly excluded at 512. The recipe's
 long run is on hold while those checks and remaining performance headroom are assessed.
 

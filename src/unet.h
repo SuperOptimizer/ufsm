@@ -82,6 +82,7 @@ void unet_prof_cats(double out[8]);       /* per-category ms (conv_fwd, conv_bwd
    the convolutions that read them run in fp8; activation gradients keep their storage. Takes effect at the next build. */
 void unet_set_act_mx8(int on);
 void unet_set_act_mx4(int on);   /* packed fp4 activation storage (env UFSM_ACT_MX4=1); takes precedence over mx8 */
+void unet_set_input_mx(int on);  /* quantize the stem input to the activation MX format; mandatory with MX gradients */
 int unet_act_mx4(void);          /* effective FP4 activation storage */
 int unet_grad_mx8(void);   /* effective MX-fp8 gradient storage (env or set by train --mem auto) */
 void unet_set_grad_mx8(int on);   /* MX-fp8 activation gradients as well (env UFSM_GRAD_MX8=1; requires the MX activations) */
