@@ -27,6 +27,7 @@ void lp_set_w4_2d(int on);         /* 2D (32 x 32 tile) fp4 weight scales, share
 int lp_bwd_w_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp);   /* gybf: gy is bf16 (needs xbf) */
 void lp_set_f8w_coop(int c);   /* test hook: cooperative MX staging of lp_bwd_w_f8 (bit 0 x, bit 1 gy; default 1) */
 int lp_bwd_w_f4(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had);   /* fp4 (e2m1, SR on gy when sp.sr); had: bit 0 fixed-sign H32 on both operands, bit 1 SR on x too (diagnostic) */
+void lp_set_f4w_coop(int on);   /* test hook: cooperative MX8 gradient loads for Co <= 16, reusing the decoded-X tile */
 int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp);   /* stride 2; gp: input gn+silu */
 int lp_bwd_w_s2_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp);   /* stride 2, gw / gb accumulated */
 /* MX-fp8 activation storage (lp dtype 3), see nn_fp8.cu: channel-blocked e4m3 bytes + ue8m0 scale plane */

@@ -20,7 +20,8 @@ retain their historical contract on resume and prediction. Independent FP64 refe
 constant/varied groups, gradients, split inputs and FP16 saturation replay. Mixed MX8-to-MX4 and
 MX4-to-MX8 stem tests compare forward/weight-gradient operations with decoded operands. The input
 buffer is included in the dry memory planner; `--input-prec 4|8` and `--gn-stats stored|legacy` are
-portable checkpoint settings. New-format quality has not yet been established by a trained trial.
+portable checkpoint settings. A bounded multi-source trial is complete; it does not establish
+production quality.
 
 Frozen candidate `ufsm-stem-gn-candidate` (SHA256
 `5a0ab3077a95ba56de69e4133ae090ee77c1222ba9b34f0970b7b632cf1edcac`) gave these short, single-GPU,
@@ -36,11 +37,45 @@ batch-1 diagnostics (`stem-gn-bench.json`; approximately 35 training seconds per
 | 528 / 8 / stored | 0.449 | 66.09 | 13842 |
 
 512 with an FP8 stem selects lean 2, leaving 3687 MiB (3.6 GiB) on the 16311 MiB card. Correct stored
-statistics cost about 3–4%; the new inference baseline still needs measurement. The five steady-step
+statistics cost about 3–4%. The five steady-step
 profile is 41.7% weight gradient, 24.3% backward-data, 22.0% forward, 7.2% normalization and 4.1%
 upsampling (`stem-gn-p512-i8-stored.log`). Final decoder 48-to-16 alone accounts for 26.8% of the step.
 The extra output-statistics pass is included in forward timing. Prior tile/register tuning did not
 improve the valid baseline; the next work targets operand preparation/reuse and correct fusion.
+
+Cooperative MX8 gradient loading reuses the decoded-input shared tile after X packing, retaining
+the FP4 operand grids and stochastic-rounding keys. It is selected only for output widths <=16;
+the 32-channel experiment slowed down. Tiny gradient-scale blocks retain the original load path
+to preserve underflow behavior. Paired 40-step stored-GN/FP8-stem runs at 512 give 0.515/0.516
+samples/s versus bracketing controls 0.499/0.497 (about +3.5%); disabled in the same candidate,
+the result is 0.501. All peaks remain 12624 MiB (`wgrad-coop-step-bench.json`). Final decoder
+weight-gradient preparation was the first target. The candidate and final binaries contain
+byte-identical CUDA fatbins; the final host option lookup is read-only across GPU threads.
+All 30 commands of the Make test recipe pass, including both split presets
+(`wgrad-regressions.json`). The recorded Makefile and executable hashes match the current files;
+the command multiset covers the entire recipe. The option `UFSM_F4W_COOP_GY=0` retains the original
+gathering.
+
+Corrected native-resolution inference on the same cached MANBp 1024-cubed box now has three-run
+medians of 5.109 / 6.179 / 9.228 s for matching FP4 / FP8 / FP16, with peak memory 7202 / 10094 /
+14324 MiB (`stored-infer-bench.json`). These end-to-end diagnostics use a very short checkpoint,
+with a bounded trial on the other GPU, and do not select production precision. The fresh stored-GN,
+FP8-stem 17-source trial has completed 780-second warmup/large/control training and all 16 holdouts
+(`production17-stored-summary.json`). On eight dense boxes the best sampled global-cutoff mean F1
+is 0.07729 / 0.07794 / 0.07797 for matched FP4 / FP8 / FP16, versus 0.07052 for the small-window
+control, all at cutoff 0.5. This cutoff selection uses the evaluated holdouts and is diagnostic,
+not calibration or independent acceptance. At the provisional cutoff 0.6, dense means are
+0.03481 / 0.02680 / 0.02820 versus 0.02614; the sixteen-box aggregate 0.28540 versus 0.31334 is
+distorted by the partial labels. Dense-box quality remains weak. Prediction-only throughput is
+177.8 / 152.4 / 106.3 Mvox/s (`production17-stored-group-diagnostics.json`). The quality trial
+uses the frozen stored-GN baseline, preceding cooperative weight-gradient loading. Only bounded
+trials have been launched.
+
+Nsight of the first stored-MX4 statistics pass at 528 measures 18.32 ms: SM throughput 77.65%,
+DRAM 16.46%, L1/TEX 66.07%, 64 registers/thread and 62.92% achieved occupancy. The launch has
+574992 blocks, each 256 threads (`stored-gn.ncu-rep`). This pass is a concrete fusion target,
+provided partials describe rounded output values and are combined over complete GN groups.
+Its measured cost does not prove a 2x whole-pipeline opportunity.
 
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is
@@ -96,9 +131,10 @@ core took 4.51 / 4.84 / 5.58 / 7.34 s for halos 8 / 16 / 32 / 64 (windows 528 / 
 Diagnostic best F1 over the sampled cutoffs was 0.1048 / 0.1012 / 0.1030 / 0.1073.
 Halo 8 had seam/interior F1 0.1067 / 0.1046 at its best sampled cutoff; the larger halos
 did not establish a quality gain worth their extra prediction cost on this box. This one
-undertrained model is insufficient to qualify production seams. The corrected fresh 17-source
-confirmation is running as `production17-v2-*`; its large stage and paired control use seed 2
-to avoid restarting the warmup's sample streams. No long production model run has started.
+undertrained model is insufficient to qualify production seams. The corrected legacy-contract
+17-source confirmation completed as `production17-v2-*`; its large stage and paired control use
+seed 2 to avoid restarting the warmup's sample streams. Results are recorded above. No long
+production model run has started.
 
 Single-GPU batch-1 measurements with the recovered memory changes:
 
@@ -218,10 +254,11 @@ recompute 0/1/2 and all three storage modes. FP16 group-accumulator tests use an
 reference because atomic GN reduction order itself can change logits by about 0.1%. The full suite
 passes. `UFSM_INFER_SCRATCH_OLD=1` retains separate buffers for comparison.
 
-A new 17-source confirmation is running through the production runner: 13 minutes at 128 followed by
-13 minutes at 512, with the same warmup checkpoint continued at 128 as a control. New Muon state is
-preserved in both. It then scores all 16 configured held-outs and the inference precision profiles.
-Artifacts are under `runs/recovery512/production17-*`; this is a bounded trial, not the full model run.
+The legacy-contract 17-source confirmations completed through the production runner. The fresh
+stored-value contract/FP8-stem confirmation uses 13 minutes at 128 followed by 13 minutes at 512,
+with the same warmup checkpoint continued at 128 as a control. Muon state is preserved in both.
+It scores all 16 configured hold-outs and matching/FP8/FP16 profiles. Artifacts are under
+`runs/recovery512/production17-stored-*`; this is a bounded trial, not the full model run.
 
 ## Constraints
 - Host code is C23 (`gcc -std=c23`). GPU kernels are `.cu` files compiled by nvcc and linked into the

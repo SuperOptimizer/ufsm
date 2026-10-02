@@ -3334,6 +3334,11 @@ extern "C" void lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, sha
 #define G4_CS 144
 #define F4W_SGN 0x9c6d2a73u
 #define F4W_SGN16 0x2a73u   /* sign vector of the H16 variant (UFSM_F4_HAD_W=2), over the 16 x positions of a row window */
+static int g_f4w_coop = -1;
+extern "C" void lp_set_f4w_coop(int on) { g_f4w_coop = on != 0; }
+static int f4w_coop(void) {   /* read-only initialization for concurrent training on multiple GPUs */
+    return g_f4w_coop >= 0 ? g_f4w_coop : getenv("UFSM_F4W_COOP_GY") ? ufsm_env_on("UFSM_F4W_COOP_GY") : 1;
+}
 /* stochastic rounding onto the e2m1 grid with a 16-bit uniform (two per hash): P(up) = ceil(frac * 65536) / 65536, so the
    bias is below 2^-16 of a grid step; branch-light (the grid step is 0.5 / 1 / 2 on [0, 2) / [2, 4) / [4, 6]). */
 /* the same rounding returning the e2m1 nibble directly: the grid magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6} are the codes 0..7 and
@@ -3354,7 +3359,7 @@ __device__ __forceinline__ float sr_e2m1_u16(float v, unsigned u16) {
 __device__ __forceinline__ void had_lane(float &v, float p, bool hi) { v = hi ? p - v : v + p; }
 template <int MT, int NT, int LY, typename T, typename TG>   /* LY 0: 27 shifted blocks, 1: row pairs (2 pairings), 2: rows, one scale per (ci, plane) */
 __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
-                                                       int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC, int had) {
+                                                       int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC, int had, int coop) {
     constexpr int CH = 8 * NT, BMo = 16 * MT;
     constexpr int XPS = LY >= 2 ? 240 : X4_PS, XCS = LY >= 2 ? 976 : X4_CS;   /* x bytes per plane / per channel (LY 2: 10 rows x 24 B, LY 3: 3 kx x 10 rows x 8 B) */
     extern __shared__ __align__(128) unsigned char smem_raw[];
@@ -3365,7 +3370,8 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
     float *sbias = (float *)(sgs + BMo * 8);                          /* [BMo] */
     chan_t *ctab4 = (chan_t *)(((uintptr_t)(sbias + BMo) + 31) & ~(uintptr_t)31);   /* [CH] MX x only */
     __nv_bfloat16 *xt = (__nv_bfloat16 *)(ctab4 + (IS_MX(T) ? CH : 0));             /* [CH][10 rows][24] MX x, LY 1-3: decoded plane, p at 3 + p */
-    unsigned *ram = (unsigned *)(xt + (IS_MX(T) && LY ? CH * 240 : 0));   /* [CH][10] MX x, LY 1: row amax (bits) */
+    const int xt_len = IS_MX(T) && LY ? CH * 240 : 0;
+    unsigned *ram = (unsigned *)(xt + (coop ? max(xt_len, BMo * 256) : xt_len));   /* decoded X / GY share one tile */
     uint8_t *tsc = (uint8_t *)(ram + (IS_MX(T) && LY == 1 ? CH * 10 : 0));   /* [CH][9] MX x, LY 1: pair scale bytes */
     uint8_t *wsc = tsc + (IS_MX(T) && LY == 1 ? (CH * 9 + 15) / 16 * 16 : 0);   /* [9 warps][32] */
     float *scr = (float *)(wsc + 9 * 32);                             /* [9 warps][180], LY 0 only */
@@ -3668,6 +3674,41 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
         }
         }   /* LY 1 from the tile / tasks */
         }   /* pass */
+        bool gy_coop = false;
+        if constexpr (IS_MX8(TG)) {
+            const int gbw = mx_bw(Co);
+            if (coop && (co0 % gbw) + BMo <= gbw) {
+                gy_coop = true;
+                __shared__ int gy_unsafe;
+                if (threadIdx.x == 0) gy_unsafe = 0;
+                __syncthreads();   /* X packing has consumed its decoded tile */
+                if (threadIdx.x < 256) {
+                    const int row = threadIdx.x / 16, oz = oz0 + row / 8, oy = oy0 + row % 8, ox = ox0 + threadIdx.x % 16;
+                    const size_t Sg = (size_t)D * H * W;
+                    const size_t vo = ((size_t)oz * H + oy) * W + ox;
+                    const size_t ri = ((size_t)n * mx_nb(Co) + co0 / gbw) * Sg + vo;
+                    const uint8_t *gq = (const uint8_t *)gy;
+                    const bool ok = oz < D && oy < H && ox < W;
+                    const unsigned scale = ok ? gq[(size_t)N * mx_nb(Co) * Sg * gbw + ri] : 127u;
+                    /* Small scales can create FP32 subnormals before the BF16 store. The old
+                       fused load/scale arithmetic must be retained for these blocks. */
+                    if (ok && scale < 10u) atomicExch(&gy_unsafe, 1);
+                    const float sc = ok ? mx_scale(scale) : 0.f;
+#pragma unroll
+                    for (int w = 0; w < BMo / 4; w++) {
+                        const unsigned u = ok ? __ldg((const unsigned *)(gq + ri * gbw + co0 % gbw) + w) : 0u;
+                        const float2 a = dec_e4m3x2((unsigned short)u), b = dec_e4m3x2((unsigned short)(u >> 16));
+                        /* e4m3 times a power of two is exact in bf16 for finite training gradients. */
+                        xt[(4 * w + 0) * 256 + threadIdx.x] = __float2bfloat16(co0 + 4 * w + 0 < Co ? a.x * sc : 0.f);
+                        xt[(4 * w + 1) * 256 + threadIdx.x] = __float2bfloat16(co0 + 4 * w + 1 < Co ? a.y * sc : 0.f);
+                        xt[(4 * w + 2) * 256 + threadIdx.x] = __float2bfloat16(co0 + 4 * w + 2 < Co ? b.x * sc : 0.f);
+                        xt[(4 * w + 3) * 256 + threadIdx.x] = __float2bfloat16(co0 + 4 * w + 3 < Co ? b.y * sc : 0.f);
+                    }
+                }
+                __syncthreads();
+                gy_coop = gy_unsafe == 0;
+            }
+        }
         /* GY: block (co, pb) = row pair pb of the z-step (rows 2 pb, 2 pb + 1; vz = pb >> 2), 4 lanes x 8 values: lane f holds
            block elements 8 f .. 8 f + 7 (row f >> 1, x 8 (f & 1) ..) = one e2m1 word; a warp task covers 8 blocks */
         for (int task = warp; task < BMo; task += 9) {
@@ -3679,8 +3720,17 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             for (int j = 0; j < 8; j++) q[j] = 0.f;
             if (co < Co && oz < D && oy < H) {
                 if constexpr (IS_MX8(TG)) {
-                    const size_t vo = ((size_t)oz * H + oy) * W + ox, Sg = (size_t)D * H * W;
-                    ldmx8_8(gy, N, Co, Sg, n, co, vo, min(8, W - ox), (W & 7) == 0, q);
+                    if (gy_coop) {
+                        const __nv_bfloat16 *src = xt + c * 256 + row * 16 + vx;
+                        const uint4 u = *(const uint4 *)src;
+                        q[0] = __uint_as_float(u.x << 16); q[1] = __uint_as_float(u.x & 0xffff0000u);
+                        q[2] = __uint_as_float(u.y << 16); q[3] = __uint_as_float(u.y & 0xffff0000u);
+                        q[4] = __uint_as_float(u.z << 16); q[5] = __uint_as_float(u.z & 0xffff0000u);
+                        q[6] = __uint_as_float(u.w << 16); q[7] = __uint_as_float(u.w & 0xffff0000u);
+                    } else {
+                        const size_t vo = ((size_t)oz * H + oy) * W + ox, Sg = (size_t)D * H * W;
+                        ldmx8_8(gy, N, Co, Sg, n, co, vo, min(8, W - ox), (W & 7) == 0, q);
+                    }
                 } else {
                     const TG *src = gy + (((size_t)n * Co + co) * D + oz) * H * W + (size_t)oy * W + ox;
                     if (vec) {
@@ -3750,7 +3800,6 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
                     ldsm_x4(af[m], sg + co * G4_CS + (2 * ks + (mat >> 1)) * 16);
                     sa[m] = *(const unsigned short *)(sgs + (m * 16 + g + 8 * (t & 1)) * 8 + 2 * ks);
                 }
-#pragma unroll
                 if constexpr (LY == 3) {
 #pragma unroll
                     for (int q = 0; q < NT; q++) {
@@ -3818,10 +3867,11 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
 template <int MT, int NT, typename T, typename TG> static void launch_bw4(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC, int had, int lay) {
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 0, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 1, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 2, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 3, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    if (lay == 3) conv_bwd_w_f4_k<MT, NT, 3, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had);
-    else if (lay == 2) conv_bwd_w_f4_k<MT, NT, 2, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had);
-    else if (lay == 1) conv_bwd_w_f4_k<MT, NT, 1, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had);
-    else conv_bwd_w_f4_k<MT, NT, 0, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had);
+    const int coop = f4w_coop() && ys.c <= 16 && IS_MX(T) && IS_MX8(TG) && (lay == 1 || lay == 2);
+    if (lay == 3) conv_bwd_w_f4_k<MT, NT, 3, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop);
+    else if (lay == 2) conv_bwd_w_f4_k<MT, NT, 2, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop);
+    else if (lay == 1) conv_bwd_w_f4_k<MT, NT, 1, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop);
+    else conv_bwd_w_f4_k<MT, NT, 0, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop);
 }
 template <typename T, typename TG> static void bwd_w_f4_t(const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had) {
     static int nt_env = -2, mt_env = -2, zc_env = -2;
@@ -3837,6 +3887,7 @@ template <typename T, typename TG> static void bwd_w_f4_t(const void *x, shape5 
     if (mt_env > 0) MT = mt_env;
     size_t smem = (size_t)8 * NT * ((lay >= 2 ? 976 : X4_CS) + 2 * X4_SCS) + 16 * MT * (G4_CS + 8 + 4) + 9 * 32 + (lay == 0 || lay == 3 ? 9 * 180 * 4 : 0);
     if (IS_MX(T)) smem += 32 + (size_t)8 * NT * (sizeof(chan_t) + (lay ? 240 * 2 : 0)) + (lay == 1 ? (size_t)8 * NT * (40 + 9) + 16 : 0);   /* channel table + bf16 decoded plane (+ LY 1 row amax, pair scales) */
+    if (f4w_coop() && ys.c <= 16 && IS_MX(T) && IS_MX8(TG) && (lay == 1 || lay == 2)) smem += (size_t)max(0, 16 * MT * 256 - 8 * NT * 240) * 2;
     int nzt = nblk_(ys.d, 2), base = (int)(((xs.c + 8 * NT - 1) / (8 * NT)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * nblk_(ys.w, 16) * nblk_(ys.h, 8) * ys.n);
     int ZC = nzt < 12 ? nzt : 12;
     while (ZC > 1 && (size_t)base * nblk_(nzt, ZC) < 72) ZC--;
