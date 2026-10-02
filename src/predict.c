@@ -93,10 +93,10 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
 int cmd_predict(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window 288] [--act-mx8 1]\n"
-                        "       [--halo 16] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
+                        "       [--halo 8] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
                         "       [--prec 1|2|3|4] [--policy enc0=1,...] [--ema 1]   EMA or current weights (0)\n"
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n");
-        fprintf(stderr, "  window - 2*halo should divide the shard size (288 - 32 = 256 divides 256 and 512): tiles then cover each shard exactly. 288^3 needs ~5.5 GB; 160 for small GPUs.\n");
+        fprintf(stderr, "  For exact shard tiling, window - 2*halo should divide the shard size: 528 with halo 8 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n");
         return 2;
     }
     const char *ckpt = argv[2], *root = argv[3], *key = argv[4], *out = argv[5];

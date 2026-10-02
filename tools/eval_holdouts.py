@@ -4,7 +4,7 @@
 usage: eval_holdouts.py <ckpt> [--sources configs/all.json] [--out /vesuvius/ufsm/eval/<run>] [--gpu 1] [--level 0]
 Prints one table per source. --scores writes structured metrics; any failed box makes the command fail.
 """
-import json, os, shlex, subprocess, sys
+import hashlib, json, os, shlex, shutil, subprocess, sys, tempfile
 
 # the ufsm binary of this checkout (env UFSM_BIN overrides), so checkpoints with newer config fields load
 B = os.environ.get("UFSM_BIN", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "ufsm"))
@@ -13,6 +13,51 @@ B = os.environ.get("UFSM_BIN", os.path.join(os.path.dirname(os.path.abspath(__fi
 def arg(name, dflt):
     a = sys.argv
     return a[a.index(name) + 1] if name in a else dflt
+
+
+def digest(path):
+    with open(path, "rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def completed_prediction(pdir, signature):
+    if not os.path.isfile(os.path.join(pdir, "zarr.json")):
+        return False
+    try:
+        with open(os.path.join(pdir, ".ufsm-eval-prediction.json")) as f:
+            return json.load(f) == signature
+    except (OSError, ValueError):
+        return False
+
+
+def predict_atomic(cmd, pdir, signature):
+    """Replace a previous prediction only after the new one has completed."""
+    parent = os.path.dirname(os.path.abspath(pdir))
+    os.makedirs(parent, exist_ok=True)
+    prefix = "." + os.path.basename(pdir) + "-"
+    with tempfile.TemporaryDirectory(prefix=prefix, dir=parent) as staging:
+        run = cmd.copy()
+        run[5] = staging
+        r = subprocess.run(run, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, text=True)
+        print(r.stdout[-400:], flush=True)
+        if r.returncode or not os.path.isfile(os.path.join(staging, "zarr.json")):
+            return False
+        with open(os.path.join(staging, ".ufsm-eval-prediction.json"), "w") as f:
+            json.dump(signature, f, indent=2)
+        previous = None
+        if os.path.exists(pdir):
+            previous = tempfile.mkdtemp(prefix=prefix + "previous-", dir=parent)
+            os.rmdir(previous)
+            os.replace(pdir, previous)
+        try:
+            os.replace(staging, pdir)
+        except BaseException:
+            if previous:
+                os.replace(previous, pdir)
+            raise
+        if previous:
+            shutil.rmtree(previous)
+    return True
 
 
 def main():
@@ -28,6 +73,12 @@ def main():
         os.unlink(scores_path)  # a failed rerun must not leave an old success report
     cfg = json.load(open(src))
     cache = cfg.get("cache")
+    identity = None
+    if not score_only:
+        manifest = os.path.join(os.path.dirname(os.path.abspath(ckpt)), "precision.txt")
+        identity = dict(version=1, checkpoint_sha256=digest(ckpt), binary_sha256=digest(shutil.which(B) or B),
+                        precision_manifest_sha256=digest(manifest) if os.path.isfile(manifest) else None,
+                        environment={k: v for k, v in os.environ.items() if k.startswith("UFSM_")})
     for s in cfg["sources"]:
         h = s.get("holdout")
         if not h:
@@ -53,14 +104,15 @@ def main():
         if "axis" in s:
             cmd += ["--axis", s["axis"]]
         print("==", name, "box", box, "level", source_level, flush=True)
-        if not os.path.exists(os.path.join(pdir, "zarr.json")):
-            if score_only:
+        if score_only:
+            if not os.path.isfile(os.path.join(pdir, "zarr.json")):
                 failures.append(name)
                 print("ERROR: missing completed prediction", flush=True)
                 continue
-            r = subprocess.run(cmd, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, text=True)
-            print(r.stdout[-400:])
-            if r.returncode:
+        else:
+            signature = dict(identity, predict_command=cmd,
+                             axis_sha256=digest(s["axis"]) if "axis" in s else None)
+            if not completed_prediction(pdir, signature) and not predict_atomic(cmd, pdir, signature):
                 failures.append(name)
                 continue
         t = s["targets"]["recto"]

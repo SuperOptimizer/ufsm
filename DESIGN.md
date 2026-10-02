@@ -74,6 +74,11 @@ scheduling instead of guessed step counts.
 Accuracy trials can also score `predict --ema 0` (current weights) as well as the default EMA weights.
 EMA's horizon is measured in optimizer steps, so large-window trials with few steps can otherwise
 look worse merely because their EMA has not caught up. The output metadata records which view was used.
+Held-out prediction reuse now checks hashes of the checkpoint, binary, precision manifest and axis,
+plus the prediction arguments and UFSM environment settings. Changed settings trigger a new prediction
+in a staging directory; the previous output is replaced only after success. `--score-only` explicitly
+scores an existing prediction without regenerating it. CPU regression tests cover reuse, invalidation,
+failed replacements, legacy outputs and minimum label resolution.
 
 ## Constraints
 - Host code is C23 (`gcc -std=c23`). GPU kernels are `.cu` files compiled by nvcc and linked into the

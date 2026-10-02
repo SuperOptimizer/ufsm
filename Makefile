@@ -92,6 +92,7 @@ build:
 	mkdir -p build
 
 test: build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
+	python3 tests/test_eval_holdouts.py
 	./build/test_eval
 	./build/test_sample_ops
 	./build/test_mx
