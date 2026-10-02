@@ -142,6 +142,13 @@ actual lean-training input layout (materialized up segment, skip GN) measures 39
 and 8.1% short-scoreboard stalls (`wgrad-materialized-profile-summary.json`). The earlier
 cooperative profile above used fused-up staging. Both are isolated probes.
 
+A decoded-X row-padding probe retains the LY 1 quantization grid, gradient gathering and rounding
+keys. Strides of 26 and 28 BF16 elements pass all 24 small edge/split/upsample/scale cases and
+the full-size comparisons. The materialized 48-to-16 decoder improves from about 193.5 ms to
+191.8 ms (26) or 192.6 ms (28); 16-to-16 improves about 0.6%. An isolated unpadded rebuild
+matches the frozen CUDA control. These gains are below 1% of the isolated kernel, and no
+whole-step gain is established, so production remains unchanged (`wgrad-padding-experiment.json`).
+
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is
 0.2969 versus control 0.3304, but eight partial segment boxes have 55–65% positives within their
