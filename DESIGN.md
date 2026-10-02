@@ -106,8 +106,18 @@ establish a corresponding whole-step speedup.
 Rechecking an eight-input-channel weight-gradient tile after cooperative gathering still loses:
 the final decoder takes 347.2 ms versus bracketing 216.4/217.1 ms with sixteen input channels,
 and the 16-to-16 layer takes 110.8 ms versus 67.9/67.5 ms. Every gradient comparison passes
-(`wgrad-coop-nt-sweep.json`). Smaller tiles remain rejected; preparing gradient operands once
-and reusing them across input-channel tiles is the next larger experiment.
+(`wgrad-coop-nt-sweep.json`). Smaller tiles remain rejected. A once-per-convolution gradient-prepacking prototype also loses
+(`wgrad-prepack-experiment.json`; implementation and candidate binary archived). All 24 small
+cases exactly match the frozen CUDA implementation, and full-size gradients pass unchanged
+tolerances. At 512 the fused-up decoder is 219.4 ms versus 221.1 ms in the candidate's disabled
+path, but a frozen control is 216.3 ms; the 16-to-16 layer regresses from 69.0 to 79.9 ms.
+The materialized-up / skip-GN layout used by lean training is 197.4 ms versus 197.1 ms disabled
+and 193.9 ms frozen. Nsight separates about 11.35 ms of preparation from 208.1 ms of consumption
+for the fused-up probe. The preparation buffer adds 1344 MiB at 512. The prototype is removed;
+production keeps the validated cooperative in-block gathering. No whole-step speedup is claimed.
+The next target is the 16-channel FP4 convolution's operand-staging register footprint: the
+existing 528 profile reports 128 registers/thread and a two-block register limit
+(`infer528-p16-counters.json`). This is profiling evidence, not a demonstrated optimization.
 
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is
