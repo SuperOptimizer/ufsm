@@ -41,9 +41,10 @@ The current [candidate recipe](configs/production-candidate.json) uses a 128-cub
 accuracy gap on MANBp. The corrected short multi-source confirmation is complete, but dense-box
 accuracy remains weak and the aggregate score is distorted by partially labelled segments.
 Two matched seeds, each continued for 160 updates, show no consistent aggregate accuracy gain
-from FP8 weight gradients; the faster FP4 path remains the candidate. Production accuracy
-qualification remains. A bounded trial of corrected normalization and an FP8 stem has finished;
-dense-box scores remain weak.
+from FP8 weight gradients; the recipe retains the faster FP4 path. The pipeline is qualified for
+a full training run after bounded precision, calibration and global-grid checks plus all 37 test
+commands. The resulting model still needs post-training acceptance; the short-trial dense scores
+remain weak.
 Fresh training computes GroupNorm statistics from rounded stored activations;
 resume and prediction preserve each checkpoint's contract (`--gn-stats stored|legacy`).
 `--input-prec 4|8` selects stem-input quantization independently of body storage and is saved in
@@ -67,8 +68,14 @@ Cached/local complete predictions previously measured about 240–260 million us
 An exact forward-operand cache was tested and rejected: complete cached/local predictions took
 7–8% longer and used another 3664 MiB, despite identical output bytes. The major measured kernel
 and IO candidates have now been qualified or rejected; another 2x gain is not established.
-Kaggle's 320-cubed regions participate in the warmup and are explicitly excluded at 512. The recipe's
-long run remains on hold for serving-grid, calibration and quality qualification.
+All throughput figures above are per GPU. Kaggle's 320-cubed regions participate in the warmup and
+are explicitly excluded at 512. No long run has started. The full recipe uses 780 seconds of warmup
+and 20,000 large-window updates, approximately ten hours of training at the measured throughput,
+plus validation, checkpoint and final scoring time. Launch it with:
+
+```sh
+python3 tools/production.py train --out runs/production512 --gpu 0
+```
 
 These commands run a **limited pipeline trial**, calibrate and score precision profiles,
 and export a self-contained candidate bundle:
@@ -88,18 +95,31 @@ learning-rate schedules restart without resetting the global optimizer step. All
 must return complete held-out scores; changed inputs are rejected before export. Reports distinguish
 prediction time from scoring time and leave throughput empty when cached predictions are reused.
 The candidate recipe scores dense labels at native resolution and partial labels at level 1
-(or their minimum available level). It fits one global cutoff per serving profile on MANBp and
-Paris4, then reports the six remaining dense boxes separately as acceptance sources. Dense and
-partial groups include their constant-foreground baselines. Exported bundles retain the selected
+(or their minimum available level). It fits one global cutoff per serving profile by maximizing
+geometric mean F1 on MANBp and Paris4, then reports the six remaining dense boxes separately as
+acceptance sources. Relative source gains receive equal weight; exact zeros have no score floor.
+Dense and partial groups include their constant-foreground baselines. Exported bundles retain the selected
 profile's calibrated cutoff. Custom source configurations must provide matching evaluation groups
-and roles in their recipe; recipes without a calibration split retain their fixed report cutoff.
+and roles in their recipe; recipes without a calibration split retain their fixed report cutoff,
+and calibration without an aggregation setting retains arithmetic mean F1.
 The existing holdouts have been inspected during development, so this split supports threshold
-qualification and is not an untouched final test. A current native-resolution diagnostic found
-poor cutoff transfer to PHerc0500; precision and production-quality acceptance remain pending.
-A complete eight-dense-box serving comparison now gives nearly identical mean acceptance F1
-at diagnostic cutoff 0.50 for FP4/FP8/FP16 (0.0722/0.0730/0.0728), while the current calibrated
-cutoffs give 0.0540/0.0711/0.0704. Cutoff selection therefore needs validation before launch;
-these diagnostics have not changed the production calibration objective or serving defaults.
+qualification and is not an untouched final test. On the frozen eight-dense-box diagnostic,
+geometric calibration selects 0.525 / 0.500 / 0.525 for FP4/FP8/FP16 and gives mean acceptance F1
+0.0736 / 0.0730 / 0.0729, versus constant foreground 0.0566. The four two-seed training comparisons
+retain their original cutoffs and conclusions. Seven historical arithmetic reports remain exact;
+changing acceptance or partial scores cannot affect the fitted cutoff. These bounded checks
+qualify the serving choice, not the eventual production model's accuracy.
+
+The recipe sets `--grid-origin 0,0,0`, anchoring tile interiors to CT coordinates at the selected
+level. Changing the requested output box or shard layout therefore preserves the neural windows
+covering each shared voxel. Two native 1024-cubed regions preserve every common-ROI decoded byte
+under all three tested axis shifts; lossless fixture tests also cover arbitrary crop origins,
+host/device placement and multiple GPU workers. Without this flag, the historical box/shard-relative
+tiling remains available. Aligned 528/halo8/shard512 serving retains eight tiles per 1024-cubed box.
+Off-grid requests can repeat windows across output shards: the tested one-axis-expanded boxes use
+20 forwards instead of 12 unique windows. The aligned full-volume throughput does not apply to
+those requests. Lossy output encoding can also depend on codec-block placement; use `--q 0` for
+arbitrary-crop byte comparisons.
 Evaluation grids with three or more cutoffs now filter prediction probabilities once and collect
 byte histograms instead of dilating each threshold separately. Complete ten-cutoff scoring is
 4.9–5.5x faster on the tested native dense and partial boxes, with byte-identical reports.

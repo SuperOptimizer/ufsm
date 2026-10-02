@@ -8,10 +8,52 @@ No teacher models, no distillation. All upstream data is re-exported once into t
 
 ## Current production audit (2026-10-02)
 
-The long training run is on hold while training and inference throughput and large-window accuracy are
-checked. The target is approximately 500 cubed on one 16 GB GPU; 512 is a measured candidate, not a
-requirement to reject a faster nearby shape. Historical timings below include other batch sizes,
-two-GPU runs, shared GPUs, and earlier kernels; they are not directly comparable to this audit.
+The pipeline is qualified to launch full training: major measured performance hypotheses are bounded,
+all 37 final Make commands pass, and calibration and global-grid checks have completed. No long run
+has started. The recipe selects 512/B1 on one 16 GB GPU and matched 528/halo8/shard512 serving.
+Another 2x gain is not established; globally optimal kernels and final model accuracy are not claimed.
+Historical timings below include other batch sizes, two-GPU runs, shared GPUs, and earlier kernels;
+they are not directly comparable to this audit. References to benchmark files describe local evidence
+under `runs/recovery512/`; generated artifacts and checkpoints are not stored in Git.
+
+Geometric-mean-F1 calibration replaces the candidate's arithmetic mean, which permitted gains on
+MANBp to offset Paris4 collapse. It uses only the same two calibration sources and the unchanged
+threshold grid, with exact zeros and lower-cutoff tie breaking. Across the complete native dense
+diagnostic, matched/FP8/FP16 cutoffs become 0.525 / 0.500 / 0.525 and six-source acceptance F1 is
+0.073558 / 0.072976 / 0.072921, versus constant foreground 0.056580. Acceptance band-F1 is
+0.201834 / 0.201611 / 0.192906. The four two-seed 160-update raw-weight comparisons retain cutoff
+0.60 and their original precision conclusions. All seven old arithmetic reports remain exact,
+and adversarial acceptance/partial-score changes cannot affect calibration. Frozen old recipes
+preserve their original objective (`calibration-geometric-plan.json`,
+`calibration-geometric-summary.json`). These are bounded, previously inspected holdouts.
+
+Serving now optionally anchors tile interiors to selected-level CT coordinates with
+`--grid-origin z,y,x`; the recipe chooses zero. The reader loads complete anchored windows beyond
+the requested ROI, then clips only output placement. Two native dense scans pass legacy full-store
+replays, aligned probability-store comparisons, and all three axis shifts with every decoded byte
+in their common 1024-cubed ROI preserved (`global-grid-study.json`). CLI tests additionally cover
+nonzero anchors, arbitrary lossless crops, CT edges, shard dimensions that do not divide the tile
+core, host/device placement and multiple workers. All sixteen evaluation origins are 512-aligned
+at their configured levels, so serving work and historical aligned quality scores are unchanged.
+Off-grid shard boundaries can repeat network windows: the one-axis-expanded qualification requests
+perform 20 forwards for 12 unique windows. This is a remaining crop-specific optimization opportunity,
+not a gain available in the aligned production benchmark. Lossy codec placement can change decoded
+bytes for arbitrary voxel shifts; the arbitrary-crop regression uses lossless output.
+
+The full recipe is 780 seconds at 128/B4 followed by 20,000 updates at 512/B1, with an FP8 stem,
+MX4 body storage, MX8 activation gradients, predominantly FP4 operands and FP32 accumulation.
+Master weights, parameter gradients, optimizer state and EMA remain FP32. Training is approximately
+75 Mvox/s per GPU with about 1.5 GiB spare; warm pure inference is about 345 raw / 315 useful Mvox/s,
+and prior cached/local full predictions are about 240–260 useful Mvox/s. Training and serving GPU
+objects are unchanged by the calibration/grid commit; final tests also cover calibrated exports
+and relocated bundles (`github-publish-regressions.json`). A full model still requires scoring at
+its own calibrated cutoffs, dense/partial/constant reports and acceptance of its actual quality.
+Whole-sheet and verso labelling remain unstarted separate work.
+
+### Earlier qualification stages
+
+The entries below retain the preceding experiments and launch holds; the completed audit above
+supersedes their pending calibration and grid decisions.
 
 Evaluation now declares dense/partial label groups, calibration sources and acceptance sources in
 the candidate recipe. Dense boxes are scored at native resolution; partial boxes use level 1 or

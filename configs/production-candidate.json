@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "status": "candidate: bounded stored-GN and wide-gradient trials complete; dense accuracy, calibration and precision acceptance pending",
+  "status": "qualified pipeline for full training: bounded precision, calibration, global-grid and correctness checks complete; final model quality requires post-training acceptance",
   "sources": "configs/all2.json",
   "train": {
     "fp4": 2,
