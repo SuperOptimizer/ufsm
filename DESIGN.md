@@ -128,6 +128,19 @@ or whole-step speedup is established (`f4p-reload-experiment.json`).
 A frozen-kernel precision probe also finds FP8 computation within about 2% of FP4 on these
 16-input-channel shapes; output bytes differ as expected. This is a speed diagnostic and does
 not establish gradient/model-quality equivalence (`f4p-vs-f8p-512.log`).
+
+Warp-distributed staging also fails to improve the 16-input-channel FP4 convolution. Five private
+builds distribute a position over one, two, four or eight lanes, with two-/three-block launch
+bounds. All 185 small comparisons and all fifteen full-size comparisons match every packed output
+byte; pair scales, rounding keys and MMA order are retained. Three-block builds use 79–80 registers,
+but the 32-output instantiations spill. The best full-size version (one lane per position) takes
+55.0 versus bracketing 48.10 / 48.09 ms for normalized MX4 input, 65.7 versus 55.12 / 55.13 ms
+for unnormalized MX8 input with 16 outputs, and 121.9 versus 70.16 / 70.19 ms with 32 outputs.
+Two/four/eight-lane versions are slower still. Lower register counts alone have not yielded a
+throughput gain. These standalone prototypes are rejected without production integration or a
+whole-step claim; source, object, binary, compiler reports and exact-output logs are archived in
+`f4p-warp-experiment.json`. The tested production executable remains unchanged.
+
 FP8 weight-gradient computation is slower in the same frozen packed-input probes: at 512 the
 materialized-up / skip-GN decoder is 237.9 versus 193.4 ms, and 16-to-16 is 86.5 versus 67.9 ms;
 32-to-32 at 256 is 35.9 versus 33.2 ms. Gradient relative differences are 3.1–8.6%, as expected
