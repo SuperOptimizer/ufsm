@@ -52,6 +52,16 @@ On an actual 1024-cubed segment holdout with six thresholds, two timings per imp
 measured 26.27 / 26.01 s before and 18.78 / 18.59 s after: 1.40x faster scoring with identical
 printed metric tables (`eval-radius2-bench.json`). This gain is in CPU scoring, not GPU inference.
 
+The native-resolution MANBp halo check is complete (`seam17-summary.json`, 1024 cubed,
+eight tiles, the earlier short 17-source checkpoint). Matched-input inference with a 512-cubed
+core took 4.51 / 4.84 / 5.58 / 7.34 s for halos 8 / 16 / 32 / 64 (windows 528 / 544 / 576 / 640).
+Diagnostic best F1 over the sampled cutoffs was 0.1048 / 0.1012 / 0.1030 / 0.1073.
+Halo 8 had seam/interior F1 0.1067 / 0.1046 at its best sampled cutoff; the larger halos
+did not establish a quality gain worth their extra prediction cost on this box. This one
+undertrained model is insufficient to qualify production seams. The corrected fresh 17-source
+confirmation is running as `production17-v2-*`; its large stage and paired control use seed 2
+to avoid restarting the warmup's sample streams. No long production model run has started.
+
 Single-GPU batch-1 measurements with the recovered memory changes:
 
 | training window | steady samples/s | million voxels/s | observed peak GPU memory, MiB |
