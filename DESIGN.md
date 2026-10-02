@@ -59,6 +59,21 @@ still matches its frozen production reference (`pure-inference-bench.json`). The
 does not include shard downloads charged to writer time. Use the dedicated benchmark for pure
 inference claims; do not combine its timing with instrumented whole-process duration.
 
+Forward operand reuse has now been bounded with an inference-only cache of the exact existing
+16-channel pair-scaled FP4 operands. A separate single-position encoding preserves the final
+shared-tile column's scale, so this does not add another activation quantization. All 29 small
+batched/edge/scale cases and six repeated 528-cubed kernel cases match output bytes exactly.
+Cached convolution alone drops from 52.89 to 41.97 ms at 16 output channels, but preparation raises
+the total to 72.40 ms; the 32-output case rises from 70.26 to 88.01 ms. Eight complete native
+1024-cubed predictions use isolated 0/1/1/0 controls on cached MANBp and local PHerc1667.
+Complete wall time regresses 7.0% / 8.2%, while every store byte and metadata entry remains exact.
+Observed peak device use rises from 7315 to 10979 MiB. The prototype is rejected and remains private
+(`forward-pair-cache-summary.json`). A C16 FP32 normalized-value cache would need another
+8984 MiB, leaving only about 12 MiB at this whole-pipeline peak; it fails the memory-headroom
+requirement. This closes these specific cache hypotheses, not a claim of globally optimal kernels.
+The current profiling loop has no qualified remaining large gain. Serving/grid/cutoff quality
+qualification is the next launch gate; the full training run remains on hold.
+
 A suffix-index read prototype removes HEAD requests before uncached shard indexes. A local fixture
 passes 94 reader cases and 27 direct tail cases, reducing its shard request count from 29 to 22.
 Twenty-three complete predictions preserve all prediction-store and cold-cache bytes. Whole-process

@@ -64,8 +64,11 @@ Pure forward inference at 528 cubed takes 0.424–0.429 s on one RTX 5060 Ti 16 
 This restores the actual checkpoint and measures warm whole-network forwards on real device input;
 input preparation, transfers, reads, output encoding and writes are outside that timing.
 Cached/local complete predictions previously measured about 240–260 million useful voxels/s.
+An exact forward-operand cache was tested and rejected: complete cached/local predictions took
+7–8% longer and used another 3664 MiB, despite identical output bytes. The major measured kernel
+and IO candidates have now been qualified or rejected; another 2x gain is not established.
 Kaggle's 320-cubed regions participate in the warmup and are explicitly excluded at 512. The recipe's
-long run is on hold while those checks and remaining performance headroom are assessed.
+long run remains on hold for serving-grid, calibration and quality qualification.
 
 These commands run a **limited pipeline trial**, calibrate and score precision profiles,
 and export a self-contained candidate bundle:
