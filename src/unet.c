@@ -48,6 +48,7 @@ typedef struct { int c; size_t gamma, beta; } gnp;
 typedef struct {
     convp c1, c2;
     gnp n1, n2;
+    int keep_a1;                    /* recompute 2 can retain selected smaller activations */
     /* stored activations: conv outputs a1, a2 (GroupNorm inputs), GN stats, and the block output s2.
        gn(a) and silu(gn(a1)) are recomputed in backward. */
     const float *in, *in2;      /* in2: second input tensor for channels >= c_split (decoder skip), tensor-core path only */
@@ -98,6 +99,7 @@ struct unet {
     size_t gout_cap[UNET_MAXLEV];            /* bytes of gout[i] */
     int rc_ok; size_t rc_cap;                /* lean 2: a transient in gB[level] is allowed now; capacity of the transient's buffer */
     int nob;                                 /* lean 2: no buffer B; a block's own gout / gskip is its B (in-place GroupNorm backward) */
+    int last_a1_live;                        /* final decoder a1 survives the head until the first backward */
     size_t logits_bytes;                     /* lean: logits at the start of A, the 16-bit logit gradient after them */
     float *rc_extra; size_t rc_extra_bytes;  /* training transient for the upsampled decoder input when B is too small */
     int split_side, split_h0;                /* spatial split (unet_set_split): side 0 / 1, level-0 halo planes; h0 0 = off */
@@ -272,8 +274,13 @@ static int recompute(void) { if (g_recompute < 0) { const char *e = getenv("UFSM
 /* level 2: also no stored a1 in training. Every block's a1 lives in one shared buffer; backward re-runs conv1 into it
    (the GN statistics of a1 are kept from the forward) */
 static int recompute_a1(void) { return recompute() >= 2; }
+/* Optional retained coarse decoder activations. The finest shared buffer is unchanged.
+   This exchanges some available memory for fewer conv1 reruns. */
+static int keep_coarse_a1(void) {
+    return recompute_a1() && ufsm_env_on("UFSM_RC_KEEP_COARSE");
+}
 void unet_set_recompute(int on) { g_recompute = on; }
-#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8) + 16384 * unet_wide_up_grad())
+#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8) + 16384 * unet_wide_up_grad() + 32768 * keep_coarse_a1())
 /* chunk mode (recompute, 16-bit activations and gradients, fused upsample): the decoder's up-part input gradient is
    produced in w[i]-channel chunks, each upsample-backwarded straight into its slice of gout[i + 1], so the shared
    gradient buffer B only needs w[i] channels (env UFSM_CHUNK_UP=0 turns it off) */
@@ -325,14 +332,15 @@ static void free_acts(unet *u) {
     free_once(pp, np);
     u->logits = nullptr; u->conv_scratch = nullptr; u->xin = nullptr; u->glb = nullptr; u->conv_scratch_n = 0;
     u->built = 0; u->act_bytes = 0; u->grad_bytes = 0;
+    u->last_a1_live = 0;
 }
 
-/* a1 / a2: nullptr = allocate, else a shared buffer (inference) */
+/* a1 / a2: nullptr = allocate, else a shared buffer (inference or recompute 2) */
 static void build_block_acts(unet *u, block *b, shape5 xs, int train, int keep_s2, float *a1, float *a2, float *s2) {
     b->xs = xs;
     b->ys = xs; b->ys.c = b->c1.cout;
     int G = G_of(u, b->c1.cout);
-    (void)train;
+    b->keep_a1 = train && recompute_a1() && !a1;
     b->a1 = a1 ? a1 : dalloc_act_s(u, b->ys); b->a2 = a2 ? a2 : dalloc_act_s(u, b->ys);
     b->s2 = recompute() && (!keep_s2 || act_mx8()) ? nullptr : s2 ? s2 : dalloc_act_s(u, b->ys);   /* MX: the up staging normalises a2 itself */
     b->m1 = dalloc(u, (size_t)xs.n * G); b->r1 = dalloc(u, (size_t)xs.n * G); b->m2 = dalloc(u, (size_t)xs.n * G); b->r2 = dalloc(u, (size_t)xs.n * G);
@@ -374,7 +382,8 @@ static void build_acts(unet *u, shape5 xs, int train) {
     }
     for (int i = 0; i < L; i++) {
         shape5 bin = u->ls[i]; bin.c = i == 0 ? u->cfg.cin : w[i - 1];
-        build_block_acts(u, &u->enc[i], bin, train, i == L - 1, T1, rc ? nullptr : T2, nullptr);   /* recompute mode keeps the (small) outputs that get upsampled */
+        build_block_acts(u, &u->enc[i], bin, train, i == L - 1, T1,
+                         rc ? nullptr : T2, nullptr);   /* recompute mode keeps the (small) outputs that get upsampled */
         if (i < L - 1) {
             shape5 ds = u->ls[i + 1]; ds.c = w[i];
             u->downo[i] = share ? T2 : dalloc_act_s(u, ds);
@@ -393,7 +402,9 @@ static void build_acts(unet *u, shape5 xs, int train) {
         shape5 cin = li; cin.c = w[i] + w[i + 1];
         /* A 16-bit decoder's kept SiLU may also use its consumed encoder skip. In MX modes s2
            is absent and the next decoder normalizes a2 on the fly. Training keeps separate buffers. */
-        build_block_acts(u, &u->dec[i], cin, train, i > 0, T1, reuse_skip && i == 0 ? u->enc[0].a2 : T2,
+        build_block_acts(u, &u->dec[i], cin, train, i > 0,
+                         train && i > 0 && keep_coarse_a1() ? nullptr : T1,
+                         reuse_skip && i == 0 ? u->enc[0].a2 : T2,
                          reuse_skip && i > 0 ? u->enc[i].a2 : nullptr);
     }
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
@@ -712,6 +723,9 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         for (int i = L - 2; i >= 0; i--) fprintf(stderr, "dec%d cat %.4g a1 %.4g a2 %.4g s2 %.4g\n", i, nn_sumsq(u->cat[i], shape_numel(u->dec[i].xs), u->red_scratch), nn_sumsq(u->dec[i].a1, shape_numel(u->dec[i].ys), u->red_scratch), nn_sumsq(u->dec[i].a2, shape_numel(u->dec[i].ys), u->red_scratch), nn_sumsq(u->dec[i].s2, shape_numel(u->dec[i].ys), u->red_scratch));
         fprintf(stderr, "logits %.4g\n", nn_sumsq(u->logits, shape_numel(u->ls[0]) / u->ls[0].c * u->cfg.cout, u->red_scratch));
     }
+    /* Recompute 2 shares a1 across blocks. The last decoder wrote it last, and the head/loss
+       only consume a2/logits, so its first backward can consume the original a1. */
+    u->last_a1_live = train && recompute_a1() && !ufsm_env_on("UFSM_RC_REDO_LAST");
     return u->logits;
 }
 
@@ -722,7 +736,9 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     size_t n = shape_numel(b->ys);
     float *A = u->gA[level], *B = u->nob ? (float *)gy : u->gB[level], *t1 = u->t1[level], *t2 = u->t2[level];   /* no B: in place on gy */
     float *g = u->g;
-    if (recompute_a1()) {   /* a1 was overwritten by later blocks: re-run conv1 (same kernel and precision as the forward) */
+    const int live = u->last_a1_live && b == &u->dec[0];
+    u->last_a1_live = 0;   /* repeated backward without a new forward must rebuild the shared buffer */
+    if (recompute_a1() && !b->keep_a1 && !live) {   /* a1 was overwritten by later blocks: re-run conv1 (same kernel and precision as the forward) */
         nn_set_conv(0);
         int r;
         if (b->xb) r = dec_conv1(u, b, level, b->a1, G, nullptr, nullptr, nullptr, nullptr, nullptr);

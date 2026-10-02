@@ -67,6 +67,44 @@ updates, not a long-run convergence or sustained-clock guarantee (`dual-gpu-benc
 kernels and precision policy are unchanged; the new wrapper arguments reproduce the qualified
 split-auto flags. Both-GPU use is an optional execution mode; the single-GPU recipe remains available.
 
+Current larger-window split capacity and recovery (2026-10-02): same frozen production binary,
+FP8 stem, stored GroupNorm, FP4 body, MX8 gradients, B1, two idle 16 GB cards, and the same step-43
+warmup checkpoint. Twelve-update runs at 640, 704 and 720 finish optimizer steps, final validation
+and portable checkpoints; 736 and 768 fail activation allocation. Their sampled total card peaks
+are 12890/12873, 14510/14493 and 15496/15479 MiB. Two four-update intervals excluding startup/final
+validation give 138.94, 126.48 and 125.22 Mvox/s total. The capacity sweep predates the recovery
+change below; 720 is the largest tested fit, with about 0.8 GiB spare. Split windows are multiples
+of 16 (`large-split/results.json`). This supersedes the older 704 maximum under `--fp4 1` below.
+
+Recompute 2 shared a1 across every block and reran every first convolution during backward.
+The last decoder's a1 survives the head and loss, so its first backward can reuse that buffer
+without allocation. A per-model live flag is cleared on consumption/free and rearmed only by a
+new training forward; repeated backwards still reconstruct it. A frozen 24-update
+control/reuse/control comparison gives 126.03 / 132.73 / 125.05 Mvox/s, a 5.73% gain against the
+control mean, with identical 14510/14493 MiB sampled card peaks (`large-split/recover/results.json`).
+`UFSM_RC_REDO_LAST=1` retains the original rerun for comparisons.
+
+Optional `UFSM_RC_KEEP_COARSE=1` allocates private a1 buffers only for decoder levels above zero,
+so their backwards avoid their first-convolution reruns too. Allocation counts include these buffers
+in the existing dry memory planner, and the mode key forces a rebuild if retention changes.
+The flag defaults off; put it in the production recipe's frozen environment to reproduce the mode.
+An initial decoder-only trial gives 135.73 Mvox/s. A 24-update run of the final source confirms
+135.94 over five four-update intervals and 14964/14947 MiB sampled card peaks, about 1.3 GiB spare
+per card (`large-split-final/results.json`). Quantization, rounding seeds and accumulation precision
+are unchanged. Against the repeated original-mode control mean, this is an 8.28% gain and recovers
+about half of the gap to the 144.36 Mvox/s split-512 result. The same 20,000 updates would take
+about 14.3 hours before warmup, validation and scoring; context grows by 2.60x per window.
+
+The broader encoder-retention experiment was rejected after a preliminary stored-GN/FP8-stem
+split-gradient check returned NaN. Its driver had already started a bounded larger trial when
+stopped; that interrupted run has no completed checkpoint and is excluded from performance evidence.
+The decoder-only trial's original GPU samples are intact; a later 15284/15267 MiB observation belongs
+to the broader experiment and is excluded. Encoder retention is absent from the final source.
+The final suite covers 24 fresh/repeated-backward combinations across 16-bit/MX8/MX4 storage and
+lean modes, with and without decoder retention, plus the full spatial-split matrix with retention.
+The standard production training/serving recipe remains 512/528; larger-context training needs its
+own calibrated serving and quality acceptance. No long training run has started.
+
 ### Earlier qualification stages
 
 The entries below retain the preceding experiments and launch holds; the completed audit above

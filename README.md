@@ -42,7 +42,7 @@ accuracy gap on MANBp. The corrected short multi-source confirmation is complete
 accuracy remains weak and the aggregate score is distorted by partially labelled segments.
 Two matched seeds, each continued for 160 updates, show no consistent aggregate accuracy gain
 from FP8 weight gradients; the recipe retains the faster FP4 path. The pipeline is qualified for
-a full training run after bounded precision, calibration and global-grid checks plus all 38 test
+a full training run after bounded precision, calibration and global-grid checks plus all 40 test
 commands. The resulting model still needs post-training acceptance; the short-trial dense scores
 remain weak.
 Fresh training computes GroupNorm statistics from rounded stored activations;
@@ -94,6 +94,28 @@ For this batch-1 run, use:
 ```sh
 python3 tools/production.py train --out runs/production512-split --gpus 0,1 --split z --mem auto
 ```
+
+With the production FP8 stem and FP4 body, a bounded split-window sweep also trains 640, 704 and
+720 cubed at batch 1; 736 and 768 run out of memory. Window sizes must be multiples of 16.
+640 measures 138.9 Mvox/s total with about 3.3 GiB spare per card. The original 704 mode measures
+126.5 Mvox/s with 1.8 GiB spare; 720 fits with only 0.8 GiB spare. These include real optimizer
+steps, final validation and checkpoint writing, rather than allocation-only checks.
+
+The low-memory recompute mode now reuses the final decoder's surviving first activation on its
+first backward, preserving repeated-backward behavior. At 704, a control/reuse/control comparison
+gives 125.1–126.0 versus 132.7 Mvox/s with unchanged memory. Optional
+`UFSM_RC_KEEP_COARSE=1` retains the smaller decoder activations too. A final 24-update confirmation
+measures 135.9 Mvox/s total and 14964/14947 MiB sampled card peaks, leaving about 1.3 GiB per card.
+This recovers approximately half of the voxel-throughput gap to 512, with unchanged quantization
+and FP32 accumulation. The full suite checks fresh/repeated gradients and spatial split with retention.
+
+To select 704, copy the recipe, change the large stage's `P` to 704 and use `--mem auto` with
+`--gpus 0,1 --split z`. Enable decoder retention in the copied recipe's `environment` as
+`"UFSM_RC_KEEP_COARSE": "1"`; the production runner freezes that environment and clears ambient
+UFSM variables. Retention is optional and uses another 454 MiB per card in the measured 704 run.
+The standard recipe remains 512/528. Larger windows need their own serving-window calibration and
+quality acceptance. At the measured rate, 20,000 updates at 704 take approximately 14.3 hours plus
+warmup/validation/scoring; each window contains 2.6 times as many voxels as 512.
 
 For data parallelism, use `--gpus 0,1` without `--split z`. Keeping 20,000 updates processes twice as
 many windows and retains approximately the single-GPU duration. Halving the updates matches the

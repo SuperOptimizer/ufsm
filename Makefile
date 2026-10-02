@@ -62,6 +62,8 @@ build/test_wgrad_staging: tests/test_wgrad_staging.c build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 build/test_infer_buffers: tests/test_infer_buffers.c build/unet.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+build/test_recompute_live: tests/test_recompute_live.c build/unet.o build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 build/bench_gn: tests/bench_gn.c build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
@@ -117,13 +119,14 @@ build/test_eval: tests/test_eval.c src/eval.c $(SAMPLE_TEST_OBJ)
 build:
 	mkdir -p build
 
-test: build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging build/test_stem_precision build/test_gn_contract build/test_sampler_safety build/test_optimizer_owners build/test_infer_buffers build/test_checkpoint_runtime build/make_pipeline_fixture build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
+test: build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging build/test_stem_precision build/test_gn_contract build/test_sampler_safety build/test_optimizer_owners build/test_infer_buffers build/test_recompute_live build/test_checkpoint_runtime build/make_pipeline_fixture build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
 	python3 tests/test_http_reader.py
 	python3 tests/test_eval_holdouts.py
 	python3 tests/test_evaluation_plan.py
 	python3 tests/test_gpu_leases.py
 	./build/test_checkpoint_runtime
 	./build/test_infer_buffers
+	./build/test_recompute_live
 	python3 tests/test_pipeline_cli.py
 	python3 tests/test_production.py
 	./build/test_checkpoint
@@ -153,6 +156,7 @@ test: build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging bu
 	./build/test_split
 	UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./build/test_split
 	UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 ./build/test_split
+	UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 UFSM_RC_KEEP_COARSE=1 ./build/test_split
 	UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./build/test_split
 	./tests/test_formats.sh
 	./tests/test_zarr.sh
