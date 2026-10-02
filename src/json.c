@@ -151,7 +151,8 @@ const json *json_path(const json *j, const char *path) {
     size_t n = strlen(path);
     if (n >= sizeof buf) return nullptr;
     memcpy(buf, path, n + 1);
-    for (char *tok = strtok(buf, "."); tok && j; tok = strtok(nullptr, "."))
+    char *save = nullptr;
+    for (char *tok = strtok_r(buf, ".", &save); tok && j; tok = strtok_r(nullptr, ".", &save))
         j = j->type == J_ARR ? json_at(j, (size_t)strtoul(tok, nullptr, 10)) : json_get(j, tok);
     return j;
 }
