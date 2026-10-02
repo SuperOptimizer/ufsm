@@ -12,9 +12,10 @@ int store_is_local(const store *s);
 void store_set_bearer(store *s, const char *token);   /* Authorization: Bearer <token> on every request */
 const char *store_root(const store *s);
 
-/* Size of an object in bytes; -1 if absent or on error. */
+/* Size of an object in bytes; -2 if missing, -1 on error. Permission failures are errors. */
 int64_t store_size(store *s, const char *key);
-/* Read [off, off+len) of an object into out. Returns bytes read (== len on success), -1 on error. */
+/* Read [off, off+len) into out. Returns len on success, -2 if missing, -1 on error.
+   HTTP partial responses must describe the requested range; a whole response is valid only at offset zero. */
 int64_t store_read(store *s, const char *key, int64_t off, int64_t len, uint8_t *out);
 /* Read a whole object into a malloc'd buffer (nul-terminated for convenience). nullptr if absent. */
 uint8_t *store_read_all(store *s, const char *key, size_t *len);
@@ -28,6 +29,7 @@ long store_last_status(void);
    HuggingFace roots default to 14/s (their limit is 5000 per 5 minutes). 429 responses sleep until the window resets. */
 void store_set_rate(store *s, double rps);   /* HTTP status of this thread's last request (-1 = transport failure) */
 
-/* Global one-time init/teardown (libcurl). Safe to call repeatedly. */
+/* Global init/teardown (libcurl). Safe to call repeatedly. Cleanup requires other callers to have joined.
+   Calling threads automatically release their own curl handles on exit. */
 void store_global_init(void);
 void store_global_cleanup(void);

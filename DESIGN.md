@@ -268,7 +268,33 @@ identical. Cached 1024-cubed prediction remains about 4.39 s, and its full store
 frozen reader exactly. This is a promising cold-access gain on one box, with no demonstrated
 cached-GPU, training or whole-volume gain. HTTP error cases, connection/resource lifetime,
 other cold volumes and the full regression suite remain before promotion
-(`infer-coalesce-experiment.json`). The implementation and defaults in `src/` remain unchanged.
+(`infer-coalesce-experiment.json`). That experiment was initially kept outside `src/`.
+
+The reader has now been integrated and qualified (`io-qualified-summary.json`). In bracketed,
+independent cold caches of native 1024-cubed regions, MANBp takes 10.57 / 9.62 s with the frozen
+reader versus 7.59 / 7.66 s with the integrated candidate (1.32x); PHerc0500P2 takes 11.29 / 10.49
+versus 8.11 / 7.73 s (1.38x). All prediction-store bytes and all 743 / 978 cache files match
+exactly. Cached MANBp stays about 4.43 versus 4.46 s, and local PHerc1667 about 4.11 versus
+4.12 s. The final planner also removes absent chunks before grouping; this lowers fixture payload
+requests from 18 to 14 (original control 37), but its additional whole-process speedup is not
+established: both real scans remain within 1% of the initial integrated candidate. Its independently
+populated cache and prediction stores also match. This is cold-access qualification on two bounded
+regions, not a whole-volume, cached-GPU or training speedup.
+
+Production defaults enable bounded coalescing and parallel index fetching; either can be disabled
+with `UFSM_Z3_COALESCE=0` / `UFSM_Z3_INDEX_PARALLEL=0`. Parallel metadata fetching requires the
+disk cache and uses at most 16 threads; grouped payload spans remain at most 2 MiB with 64 KiB
+maximum gaps. The reader now validates index CRC32C and payload ranges, verifies HTTP Content-Range
+and exact response length, and propagates worker errors. Only true absence becomes sparse fill;
+403 responses fail rather than poisoning the missing-shard cache. Thread-specific curl handles and
+headers are destroyed when workers exit, cache temporary names include process and thread IDs, and
+writer CRC table initialization is thread-safe. Array-edge chunks are clipped to the declared shape,
+fixing the previous overwrite of fill values outside the array. A deterministic local HTTP fixture
+checks 89 reads against independent voxel bytes, sparse/unsharded/single-chunk shards, cold/hot/partial
+caches, redirects, retries, malformed responses, corrupt indexes, request bounds, concurrent writers,
+and repeated reads/global cleanup; file descriptors remain 4 -> 4. All 36 Make test commands pass on
+the final executable (`io-qualified-v2-regressions.json`). Its CUDA fatbin is identical to the frozen
+baseline. Precision and model-quality acceptance remain open, and full training is still on hold.
 
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is

@@ -37,7 +37,10 @@ void store_set_rate(store *s, double rps) { s->rps = rps; }
 static _Thread_local double tl_reset;
 static size_t on_ratelimit_hdr(char *buf, size_t sz, size_t nm, void *ud) {
     size_t n = sz * nm;
-    if (n > 10 && !strncasecmp(buf, "ratelimit:", 10)) { char *t = strstr(buf, ";t="); if (t) tl_reset = atof(t + 3); }
+    if (n > 10 && !strncasecmp(buf, "ratelimit:", 10)) {
+        char value[256]; snprintf(value, sizeof value, "%.*s", (int)(n - 10), buf + 10);
+        char *t = strstr(value, ";t="); if (t) tl_reset = atof(t + 3);
+    }
     if (ud) return ((size_t (*)(char *, size_t, size_t, void *))ud)(buf, sz, nm, nullptr);
     return n;
 }
@@ -48,15 +51,40 @@ static void sleep_429(void) {
     usleep((useconds_t)(t * 1e6));
 }
 
-static _Thread_local CURL *tl_curl;
 static _Thread_local long tl_code;
 long store_last_status(void) { return tl_code; }
 
-void store_global_init(void) {
-    static int done;
-    if (!done) { curl_global_init(CURL_GLOBAL_DEFAULT); done = 1; }
+typedef struct { CURL *curl; struct curl_slist *hdr; } thread_http;
+static _Thread_local thread_http *tl_http;
+static pthread_key_t http_key;
+static pthread_once_t http_key_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t http_global_mu = PTHREAD_MUTEX_INITIALIZER;
+static int http_initialized, http_key_error;
+static void http_thread_free(void *ptr) {
+    thread_http *h = ptr;
+    if (!h) return;
+    curl_easy_cleanup(h->curl);
+    curl_slist_free_all(h->hdr);
+    free(h);
 }
-void store_global_cleanup(void) { curl_global_cleanup(); }
+static void http_key_init(void) { http_key_error = pthread_key_create(&http_key, http_thread_free); }
+void store_global_init(void) {
+    pthread_once(&http_key_once, http_key_init);
+    pthread_mutex_lock(&http_global_mu);
+    if (!http_initialized) http_initialized = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+    pthread_mutex_unlock(&http_global_mu);
+}
+void store_global_cleanup(void) {
+    /* Call after the other store-using threads have joined. Their key destructors close their handles. */
+    if (tl_http) {
+        pthread_setspecific(http_key, nullptr);
+        http_thread_free(tl_http);
+        tl_http = nullptr;
+    }
+    pthread_mutex_lock(&http_global_mu);
+    if (http_initialized) { curl_global_cleanup(); http_initialized = 0; }
+    pthread_mutex_unlock(&http_global_mu);
+}
 
 store *store_open(const char *root) {
     store *s = calloc(1, sizeof *s);
@@ -64,6 +92,7 @@ store *store_open(const char *root) {
     size_t n = strlen(root);
     while (n > 1 && root[n - 1] == '/') n--;
     s->root = strndup(root, n);
+    if (!s->root) { free(s); return nullptr; }
     s->local = strncmp(root, "http://", 7) && strncmp(root, "https://", 8);
     if (!s->local) store_global_init();
     pthread_mutex_init(&s->mu, nullptr);
@@ -75,6 +104,7 @@ void store_close(store *s) {
     if (!s) return;
     free(s->root);
     free(s->bearer);
+    pthread_mutex_destroy(&s->mu);
     free(s);
 }
 
@@ -126,13 +156,16 @@ static int64_t local_read(const store *s, const char *key, int64_t off, int64_t 
 
 /* ---- http ---- */
 
-typedef struct { uint8_t *buf; size_t n, cap; int fixed; } sink;
+typedef struct {
+    uint8_t *buf; size_t n, cap; int fixed, overflow, has_range;
+    uint64_t range_start, range_end, range_total; int range_total_known;
+} sink;
 
 static size_t on_data(char *ptr, size_t sz, size_t nm, void *ud) {
     sink *k = ud;
     size_t n = sz * nm;
     if (k->fixed) {
-        if (k->n + n > k->cap) n = k->cap - k->n; /* truncate: server ignored the range */
+        if (n > k->cap - k->n) { k->overflow = 1; return 0; }
     } else if (k->n + n + 1 > k->cap) {
         size_t cap = k->cap ? k->cap * 2 : 65536;
         while (cap < k->n + n + 1) cap *= 2;
@@ -146,14 +179,35 @@ static size_t on_data(char *ptr, size_t sz, size_t nm, void *ud) {
     return sz * nm;
 }
 
-static _Thread_local struct curl_slist *tl_hdr;
+static size_t on_read_hdr(char *buf, size_t sz, size_t nm, void *ud) {
+    sink *k = ud; size_t n = sz * nm;
+    if (n >= 5 && !strncmp(buf, "HTTP/", 5)) { k->n = 0; k->has_range = 0; k->overflow = 0; }
+    if (n > 14 && !strncasecmp(buf, "content-range:", 14)) {
+        char value[128], tail; unsigned long long a, b, total;
+        snprintf(value, sizeof value, "%.*s", (int)(n - 14), buf + 14);
+        int fields = sscanf(value, " bytes %llu-%llu/%llu %c", &a, &b, &total, &tail);
+        if (fields == 3) {
+            k->has_range = 1; k->range_start = a; k->range_end = b; k->range_total = total; k->range_total_known = 1;
+        } else if (sscanf(value, " bytes %llu-%llu/* %c", &a, &b, &tail) == 2) {
+            k->has_range = 1; k->range_start = a; k->range_end = b; k->range_total_known = 0;
+        }
+    }
+    return on_ratelimit_hdr(buf, sz, nm, nullptr);
+}
 
 static CURL *fresh_handle(const store *s) {
-    if (!tl_curl) tl_curl = curl_easy_init();
-    CURL *c = tl_curl;
+    if (!tl_http) {
+        if (http_key_error || !http_initialized) return nullptr;
+        thread_http *h = calloc(1, sizeof *h);
+        if (!h) return nullptr;
+        h->curl = curl_easy_init();
+        if (!h->curl || pthread_setspecific(http_key, h)) { http_thread_free(h); return nullptr; }
+        tl_http = h;
+    }
+    CURL *c = tl_http->curl;
     curl_easy_reset(c);
-    if (tl_hdr) { curl_slist_free_all(tl_hdr); tl_hdr = nullptr; }
-    if (s->bearer) { tl_hdr = curl_slist_append(nullptr, s->bearer); curl_easy_setopt(c, CURLOPT_HTTPHEADER, tl_hdr); }
+    curl_slist_free_all(tl_http->hdr); tl_http->hdr = nullptr;
+    if (s->bearer) { tl_http->hdr = curl_slist_append(nullptr, s->bearer); curl_easy_setopt(c, CURLOPT_HTTPHEADER, tl_http->hdr); }
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 30L);
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
@@ -172,23 +226,25 @@ static long http_get(store *s, const char *key, int64_t off, int64_t len, sink *
     for (int attempt = 0; attempt < 12; attempt++) {
         pace(s);
         CURL *c = fresh_handle(s);
+        if (!c) break;
         curl_easy_setopt(c, CURLOPT_URL, url);
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, on_data);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, k);
-        curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, on_ratelimit_hdr);
-        curl_easy_setopt(c, CURLOPT_HEADERDATA, nullptr);
+        curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, on_read_hdr);
+        curl_easy_setopt(c, CURLOPT_HEADERDATA, k);
         tl_reset = 0;
         char range[64];
         if (len >= 0) {
             snprintf(range, sizeof range, "%lld-%lld", (long long)off, (long long)(off + len - 1));
             curl_easy_setopt(c, CURLOPT_RANGE, range);
         }
-        k->n = 0;
+        k->n = 0; k->overflow = 0; k->has_range = 0;
         CURLcode rc = curl_easy_perform(c);
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         if (rc == CURLE_OK) break;
-        if (code == 404 || code == 403) break;
+        if (k->overflow || rc == CURLE_WRITE_ERROR) { code = -1; break; }
         if (code == 429) { sleep_429(); continue; }
+        if (code >= 400 && code < 500) break;
         code = -1;
         usleep((useconds_t)(200000u << (attempt < 5 ? attempt : 5)));
     }
@@ -204,22 +260,25 @@ static int64_t http_size(store *s, const char *key) {
     for (int attempt = 0; attempt < 12; attempt++) {
         pace(s);
         CURL *c = fresh_handle(s);
+        if (!c) break;
         curl_easy_setopt(c, CURLOPT_URL, url);
         curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
         curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, on_ratelimit_hdr);
         curl_easy_setopt(c, CURLOPT_HEADERDATA, nullptr);
         tl_reset = 0;
-        if (curl_easy_perform(c) == CURLE_OK) {
+        CURLcode rc = curl_easy_perform(c);
+        long code = 0;
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+        tl_code = code;
+        if (rc == CURLE_OK && code >= 200 && code < 300) {
             curl_off_t cl = -1;
             curl_easy_getinfo(c, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
             out = cl;
             break;
         }
-        long code = 0;
-        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-        tl_code = code;
-        if (code == 404 || code == 403) { out = -2; break; }
+        if (code == 404) { out = -2; break; }
         if (code == 429) { sleep_429(); continue; }
+        if (code >= 400 && code < 500) break;
         usleep((useconds_t)(200000u << (attempt < 5 ? attempt : 5)));
     }
     free(url);
@@ -230,9 +289,11 @@ static int64_t http_size(store *s, const char *key) {
 typedef struct { char *next; } hdrs;
 static size_t on_hdr(char *buf, size_t sz, size_t nm, void *ud) {
     hdrs *h = ud; size_t n = sz * nm;
-    if (n > 10 && !strncasecmp(buf, "ratelimit:", 10)) { char *t = strstr(buf, ";t="); if (t) tl_reset = atof(t + 3); }
+    on_ratelimit_hdr(buf, sz, nm, nullptr);
     if (n > 6 && !strncasecmp(buf, "link:", 5)) {
-        char *p = buf + 5; while (*p == ' ') p++;
+        char *value = strndup(buf + 5, n - 5);
+        if (!value) return 0;
+        char *p = value; while (*p == ' ') p++;
         for (char *q = p; (q = strchr(q, '<')); q++) {
             char *e = strchr(q, '>'); if (!e) break;
             char *rel = strstr(e, "rel=\"next\"");
@@ -240,6 +301,7 @@ static size_t on_hdr(char *buf, size_t sz, size_t nm, void *ud) {
             if (rel && (!semi || rel < semi)) { free(h->next); h->next = strndup(q + 1, (size_t)(e - q - 1)); break; }
             q = e;
         }
+        free(value);
     }
     return n;
 }
@@ -251,6 +313,7 @@ uint8_t *store_get_url(store *s, const char *url, size_t *len, char **link_next)
     for (int attempt = 0; attempt < 12; attempt++) {
         pace(s);
         CURL *c = fresh_handle(s);
+        if (!c) break;
         curl_easy_setopt(c, CURLOPT_URL, url);
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, on_data);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, &k);
@@ -277,12 +340,17 @@ uint8_t *store_get_url(store *s, const char *url, size_t *len, char **link_next)
 int64_t store_size(store *s, const char *key) { return s->local ? local_size(s, key) : http_size(s, key); }
 
 int64_t store_read(store *s, const char *key, int64_t off, int64_t len, uint8_t *out) {
+    if (off < 0 || len < 0 || off > INT64_MAX - len) return -1;
+    if (!len) return 0;
     if (s->local) return local_read(s, key, off, len, out);
-    sink k = {out, 0, (size_t)len, 1};
+    sink k = {.buf = out, .cap = (size_t)len, .fixed = 1};
     long code = http_get(s, key, off, len, &k);
-    if (code == 404 || code == 403) return -2;
+    if (code == 404) return -2;
     if (code != 206 && code != 200) return -1;
-    return (int64_t)k.n == len ? len : -1;
+    if (k.overflow || (int64_t)k.n != len) return -1;
+    if (code == 200) return off == 0 ? len : -1;
+    return k.has_range && k.range_start == (uint64_t)off && k.range_end == (uint64_t)(off + len - 1) &&
+           (!k.range_total_known || k.range_total > k.range_end) ? len : -1;
 }
 
 uint8_t *store_read_all(store *s, const char *key, size_t *len) {

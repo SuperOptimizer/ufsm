@@ -102,6 +102,9 @@ build/test_formats: tests/test_formats.c $(OBJ) build/nn.o build/nn_fp8.o
 build/test_json: tests/test_json.c build/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
+build/test_http_reader: tests/test_http_reader.c build/store.o build/zarr3.o build/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+
 build/test_checkpoint_runtime: tests/test_checkpoint_runtime.c build/checkpoint.o build/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
 
@@ -114,7 +117,8 @@ build/test_eval: tests/test_eval.c src/eval.c $(SAMPLE_TEST_OBJ)
 build:
 	mkdir -p build
 
-test: build/test_wide_up_grad build/test_wgrad_staging build/test_stem_precision build/test_gn_contract build/test_sampler_safety build/test_optimizer_owners build/test_infer_buffers build/test_checkpoint_runtime build/make_pipeline_fixture build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
+test: build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging build/test_stem_precision build/test_gn_contract build/test_sampler_safety build/test_optimizer_owners build/test_infer_buffers build/test_checkpoint_runtime build/make_pipeline_fixture build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
+	python3 tests/test_http_reader.py
 	python3 tests/test_eval_holdouts.py
 	./build/test_checkpoint_runtime
 	./build/test_infer_buffers

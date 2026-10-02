@@ -14,16 +14,20 @@ static _Thread_local char errbuf[256];
 const char *z3w_error(void) { return errbuf; }
 static int fail(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vsnprintf(errbuf, sizeof errbuf, fmt, ap); va_end(ap); return -1; }
 
-uint32_t crc32c(uint32_t crc, const void *buf, size_t len) {
-    static uint32_t table[256];
-    static int init;
-    if (!init) {
-        for (uint32_t i = 0; i < 256; i++) { uint32_t c = i; for (int k = 0; k < 8; k++) c = c & 1 ? 0x82F63B78u ^ (c >> 1) : c >> 1; table[i] = c; }
-        init = 1;
+static uint32_t crc_table[256];
+static pthread_once_t crc_once = PTHREAD_ONCE_INIT;
+static void crc_init(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) c = c & 1 ? 0x82F63B78u ^ (c >> 1) : c >> 1;
+        crc_table[i] = c;
     }
+}
+uint32_t crc32c(uint32_t crc, const void *buf, size_t len) {
+    pthread_once(&crc_once, crc_init);
     const uint8_t *p = buf;
     crc = ~crc;
-    for (size_t i = 0; i < len; i++) crc = table[(crc ^ p[i]) & 0xff] ^ (crc >> 8);
+    for (size_t i = 0; i < len; i++) crc = crc_table[(crc ^ p[i]) & 0xff] ^ (crc >> 8);
     return ~crc;
 }
 

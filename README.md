@@ -46,7 +46,8 @@ Fresh training computes GroupNorm statistics from rounded stored activations;
 resume and prediction preserve each checkpoint's contract (`--gn-stats stored|legacy`).
 `--input-prec 4|8` selects stem-input quantization independently of body storage and is saved in
 the checkpoint. Cooperative gradient loading and fused stored-output statistics bring the FP8-stem
-candidate to about 71 Mvox/s at 512, with approximately 12.4 GiB observed device use. Cached native
+candidate to about 71 Mvox/s at 512. The recipe's wider finest gradient buffer brings this to
+73.7–74.2 Mvox/s, with 14796 MiB observed device use and about 1.5 GiB spare. Cached native
 MANBp inference gains about 12% with matched FP4; its decoded output is identical across the tested
 1024-cubed box. Nearby 496/528 shapes previously had comparable per-voxel speed; no production
 precision choice is final.
@@ -77,6 +78,15 @@ reuse outputs only when hashes, source arguments, axis and settings match. The b
 every prediction. GPU leases prevent overlapping commands from cooperating production runners; direct
 `ufsm` invocations must still be scheduled by the caller. Model-bundle status means an evaluated
 candidate; it does not certify a globally optimal precision choice or production model quality.
+
+Remote sharded Zarr reads combine nearby uncached chunks into bounded requests and fetch uncached
+shard indexes concurrently when a disk cache is configured. Both paths are enabled by default;
+`UFSM_Z3_COALESCE=0` and `UFSM_Z3_INDEX_PARALLEL=0` disable them for comparisons.
+Grouped requests span at most 2 MiB with at most 64 KiB gaps, and index fetching uses at most
+16 threads. Index checksums and ranges are checked; HTTP permission failures are errors, while
+genuinely missing shards retain the array's fill value. Cold native 1024-cubed trials on two scans
+showed about 1.3–1.4x whole-process inference speed, with identical prediction and cache bytes.
+Cached/local inference, GPU computation and training have no established speedup from this change.
 
 ## Label encoding (our exported stores)
 

@@ -27,7 +27,7 @@ void z3_close(z3 *z);
 const z3_meta *z3_meta_of(const z3 *z);
 const char *z3_key(const z3 *z);
 
-/* Read the box [o, o+n) (z,y,x) into out (C order, n[0]*n[1]*n[2] bytes). Out-of-range parts are 0.
+/* Read the box [o, o+n) (z,y,x) into out (C order, n[0]*n[1]*n[2] bytes). Out-of-range parts use fill_value.
    nthreads <= 0 picks the CPU count. Returns 0 on success, -1 on I/O or decode failure. */
 int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);
 
