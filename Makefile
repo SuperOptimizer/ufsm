@@ -120,6 +120,7 @@ test: build/test_wgrad_staging build/test_stem_precision build/test_gn_contract 
 	./build/test_checkpoint
 	./build/test_optimizer_owners
 	./build/test_gn_contract
+	UFSM_FUSED_STORED_GN=0 ./build/test_gn_contract
 	./build/test_stem_precision
 	./build/test_wgrad_staging
 	./build/test_eval
@@ -140,6 +141,8 @@ test: build/test_wgrad_staging build/test_stem_precision build/test_gn_contract 
 	UFSM_F16=1 ./build/test_fused
 	./build/test_split
 	UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./build/test_split
+	UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 ./build/test_split
+	UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./build/test_split
 	./tests/test_formats.sh
 	./tests/test_zarr.sh
 

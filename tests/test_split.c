@@ -128,6 +128,8 @@ int main(void) {
     for (int i = 0; i < B * NCH; i++) hw[i] = 1;
 
     nn_set_f16(1); nn_set_grad_scale(1024.f); nn_set_loss_grad_h16(1);
+    nn_set_gn_stored(ufsm_env_on("UFSM_TEST_GN_STORED"));
+    if (getenv("UFSM_TEST_INPUT_PREC") && unet_set_input_prec(atoi(getenv("UFSM_TEST_INPUT_PREC")))) return 2;
     setenv("UFSM_F4_WGRAD", "1", 0);   /* as train --fp4 2: fp4 weight gradients where the policy asks for them */
     split_ctx *ctx = split_create(0, 1);
     unet *probe = unet_create(&cfg); size_t np = unet_nparams(probe); unet_free(probe);

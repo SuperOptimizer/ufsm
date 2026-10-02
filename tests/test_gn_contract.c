@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
-static int fails;
+static int fails, owned;
 static void *activation(shape5 s, int bits) {
     size_t bytes = bits == 4 || bits == 8 ? nn_mx_bytes(s, bits) : shape_numel(s) * (bits ? 2 : 4);
     void *p = nn_malloc(bytes); nn_zero(p, bytes);
@@ -62,47 +62,61 @@ static void backward(void *x, shape5 s, int G, const float *values, float *mean,
     nn_free(gy); nn_free(gx); nn_free(gamma); nn_free(beta); nn_free(gg); nn_free(bg); nn_free(scratch);
     free(ref); free(got); free(ones); free(ga); free(gb);
 }
-static void run(int bits, int api, int varied) {
-    shape5 s = {2,32,5,7,9}, part = s, ys = s; part.c = 16; ys.c = 16;
+static void run(int bits, int api, int varied, int cout) {
+    shape5 s = api == 3 ? (shape5){2,32,6,8,10} : (shape5){2,32,5,7,9}, part = s, ys = s;
+    part.c = 16; ys.c = cout; shape5 part1 = part;
+    if (api == 3) { part.d /= 2; part.h /= 2; part.w /= 2; }
     const int G = 8, NG = s.n * G; size_t n = shape_numel(s), S = shape_spatial(s), nw = (size_t)ys.c * s.c * 27;
     nn_set_prec(bits == 4 ? 3 : bits == 8 ? 2 : 1); nn_set_prec_policy(""); nn_set_f16(bits == 16);
     nn_set_act_bf16(bits != 0); nn_set_sr(0);
-    float *host = malloc(n * 4), *weights = calloc(nw, 4), *bias = malloc(ys.c * 4);
+    size_t nh = n > shape_numel(ys) ? n : shape_numel(ys);
+    float *host = malloc(nh * 4), *weights = calloc(nw, 4), *bias = malloc(ys.c * 4);
     for (size_t i = 0; i < n; i++) host[i] = varied ? sinf((float)i * 0.17f) : 0.f;
     for (size_t i = 0; i < nw; i++) weights[i] = varied ? sinf((float)i * 0.037f) * 0.02f : 0.f;
     for (int c = 0; c < ys.c; c++) bias[c] = varied ? 0.1f * c : 1.2345f;
     float *xf = nn_malloc(n * 4), *w = nn_malloc(nw * 4), *b = nn_malloc(ys.c * 4);
     nn_h2d(xf, host, n * 4); nn_h2d(w, weights, nw * 4); nn_h2d(b, bias, ys.c * 4);
-    void *x = activation(s, bits), *y = activation(ys, bits), *x0 = activation(part, bits), *x1 = activation(part, bits);
+    void *x = activation(s, bits), *y = activation(ys, bits), *x0 = activation(part, bits), *x1 = activation(part1, bits);
     nn_f32_to_act(xf, s, x);
-    float *pf = nn_malloc(shape_numel(part) * 4);
+    float *pf = nn_malloc(shape_numel(part1) * 4);
+    float *ph = malloc(shape_numel(part1) * 4); size_t Sa = shape_spatial(part);
     for (int sample = 0; sample < s.n; sample++)
-        memcpy(weights + (size_t)sample * 16 * S, host + (size_t)sample * 32 * S, 16 * S * 4);
-    nn_h2d(pf, weights, shape_numel(part) * 4); nn_f32_to_act(pf, part, x0);
+        memcpy(ph + (size_t)sample * 16 * Sa, host + (size_t)sample * 32 * S, 16 * Sa * 4);
+    nn_h2d(pf, ph, shape_numel(part) * 4); nn_f32_to_act(pf, part, x0);
     for (int sample = 0; sample < s.n; sample++)
-        memcpy(weights + (size_t)sample * 16 * S, host + ((size_t)sample * 32 + 16) * S, 16 * S * 4);
-    nn_h2d(pf, weights, shape_numel(part) * 4); nn_f32_to_act(pf, part, x1);
+        memcpy(ph + (size_t)sample * 16 * S, host + ((size_t)sample * 32 + 16) * S, 16 * S * 4);
+    nn_h2d(pf, ph, shape_numel(part1) * 4); nn_f32_to_act(pf, part1, x1);
     float *mean = nn_malloc(NG * 4), *rstd = nn_malloc(NG * 4), m[16], r[16];
+    nn_split_cfg(owned ? 1 : 0, owned ? 1 : 0, owned ? s.d : 0, owned ? s.d - 2 : 0);
     int rc = api == 0 ? nn_conv3d_fwd_gn_stats(x, s, 0, nullptr, nullptr, nullptr, nullptr, w, b, ys.c, y, G, 1e-5f, mean, rstd)
         : api == 1 ? nn_conv3d_fwd_split(x0, x1, 16, s, 0, nullptr, nullptr, nullptr, nullptr, w, b, ys.c, y, G, 1e-5f, mean, rstd)
-        : nn_conv3d_fwd_x(x, nullptr, nullptr, nullptr, 0, 0, s, w, b, ys.c, 3, 1, y, G, 1e-5f, mean, rstd);
+        : nn_conv3d_fwd_x(api == 3 ? x0 : x, nullptr, api == 3 ? x1 : nullptr, nullptr, api == 3 ? 16 : 0, api == 3, s, w, b, ys.c, 3, 1, y, G, 1e-5f, mean, rstd);
     decode(y, ys, bits, host); nn_d2h(m, mean, NG * 4); nn_d2h(r, rstd, NG * 4);
     double worst_m = 0, worst_r = 0; int finite = rc == 0;
     for (int ng = 0; ng < NG; ng++) {
-        size_t len = 2 * S; const float *p = host + (size_t)ng * len;
-        double avg = 0, var = 0;
-        for (size_t i = 0; i < len; i++) { finite &= isfinite(p[i]); avg += p[i]; }
-        avg /= len;
-        for (size_t i = 0; i < len; i++) { double v = (double)p[i] - avg; var += v * v; }
-        double ref = 1 / sqrt(var / len + 1e-5f);
+        size_t len = (size_t)(ys.c / G) * S; const float *p = host + (size_t)ng * len;
+        double avg = 0, var = 0; size_t count = 0;
+        for (size_t i = 0; i < len; i++) {
+            int z = (int)((i % S) / ((size_t)s.h * s.w));
+            if (owned && (z == 0 || z == s.d - 1)) continue;
+            finite &= isfinite(p[i]); avg += p[i]; count++;
+        }
+        avg /= count;
+        for (size_t i = 0; i < len; i++) {
+            int z = (int)((i % S) / ((size_t)s.h * s.w));
+            if (owned && (z == 0 || z == s.d - 1)) continue;
+            double v = (double)p[i] - avg; var += v * v;
+        }
+        double ref = 1 / sqrt(var / count + 1e-5f);
         finite &= isfinite(m[ng]) && isfinite(r[ng]);
         worst_m = fmax(worst_m, fabs(m[ng] - avg)); worst_r = fmax(worst_r, fabs(r[ng] / ref - 1));
     }
     int ok = finite && worst_m < 3e-6 && worst_r < 2e-3;
-    printf("stored GN bits%d api%d %s: mean %.3g rstd %.3g %s\n", bits, api, varied ? "varied" : "constant", worst_m, worst_r, ok ? "ok" : "FAIL"); fails += !ok;
-    if (api == 0) backward(y, ys, G, host, mean, rstd);
+    printf("stored GN bits%d api%d cout%d owned%d %s: mean %.3g rstd %.3g %s\n", bits, api, cout, owned, varied ? "varied" : "constant", worst_m, worst_r, ok ? "ok" : "FAIL"); fails += !ok;
+    if (api == 0 && !owned) backward(y, ys, G, host, mean, rstd);
+    nn_split_cfg(0, 0, 0, 0);
     nn_free(xf); nn_free(pf); nn_free(w); nn_free(b); nn_free(x); nn_free(x0); nn_free(x1); nn_free(y); nn_free(mean); nn_free(rstd);
-    free(host); free(weights); free(bias);
+    free(host); free(weights); free(bias); free(ph);
 }
 static void replay(void) {
     shape5 s = {1,16,5,7,9}; const int G = 8; size_t n = shape_numel(s);
@@ -124,7 +138,15 @@ int main(void) {
     nn_set_gn_stored(1);
 #endif
     int bits[] = {0,16,1,8,4};
-    for (int k = 0; k < 5; k++) for (int api = 0; api < 3; api++) for (int varied = 0; varied <= 1; varied++) run(bits[k], api, varied);
+    for (int k = 0; k < 5; k++) for (int api = 0; api < 3; api++) for (int varied = 0; varied <= 1; varied++) run(bits[k], api, varied, 16);
+    int channels[] = {24,32,48,64,80};
+    for (int k = 0; k < 2; k++) for (int c = 0; c < 5; c++) for (int api = 0; api < 3; api++)
+        for (int varied = 0; varied <= 1; varied++) run(k ? 8 : 4, api, varied, channels[c]);
+    for (int k = 0; k < 2; k++) for (int c = 0; c < 5; c++)
+        for (int varied = 0; varied <= 1; varied++) run(k ? 8 : 4, 3, varied, channels[c]);
+    owned = 1;
+    for (int k = 0; k < 2; k++) for (int api = 0; api < 4; api++) run(k ? 8 : 4, api, 1, 48);
+    owned = 0;
 #ifndef TEST_GN_NO_REPLAY
     replay();
 #endif

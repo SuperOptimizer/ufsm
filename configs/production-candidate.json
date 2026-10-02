@@ -1,11 +1,12 @@
 {
   "version": 1,
-  "status": "candidate: multi-source accuracy and precision validation pending",
+  "status": "candidate: bounded stored-GN trial complete; dense accuracy, calibration and precision acceptance pending",
   "sources": "configs/all2.json",
   "train": {
     "fp4": 2, "mem": "auto", "opt": "muon", "muon-lr": 0.01,
     "lr": 0.001, "sched": "wsd", "cooldown": 0.2, "soft": 3,
     "intonly": 1, "down-norm": 1, "workers": 12, "seed": 1,
+    "input-prec": 8, "gn-stats": "stored",
     "val-batches": 2, "log-every": 50, "val-every": 500, "ckpt-every": 1000
   },
   "stages": [

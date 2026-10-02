@@ -15,7 +15,8 @@ typedef struct { const float *gamma, *beta, *mean, *rstd; int G; } gnp_t;   /* G
 /* wkey != 0: id of this conv (layer / conv / pass) for the prepared-weight memo of the fp4 kernel (see lp_wmemo_*) */
 /* zlo / zhi (spatial split, nn_split_cfg): the GroupNorm statistics of the output (osum) skip the first zlo and the last zhi
    z planes (halo planes owned by the other GPU); 0 / 0 = every plane */
-typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; unsigned wkey; int zlo, zhi; } split_t;
+/* stored_stats: output statistics use decoded rounded MX values, including bias exactly once. */
+typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; unsigned wkey; int zlo, zhi; int stored_stats; } split_t;
 /* k=3 stride 1 forward / weight gradient with the same semantics as the BF16 tensor-core paths in nn.cu
    (conv_fwd_tc / launch_bwd_w_tc): xbf / ybf = activation (and x2 / y2) storage type, 0 fp32, 1 bf16, 2 fp16; the
    forward needs xbf == ybf. Weights, biases and GroupNorm parameters are fp32; the weight gradient accepts fp32 or (with xbf) bf16 gy. */

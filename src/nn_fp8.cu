@@ -596,8 +596,16 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                             for (int mm = 0; mm < 2; mm++)
 #pragma unroll
                                 for (int h = 0; h < 2; h++) if (mm < MBt) {
-                                    if constexpr (B == 8) dst[mm * 16 + g + 8 * h] = cvt_e4m3(val[mm][h] * mult);
-                                    else if (!(g & 1)) dst[(mm * 16 + g + 8 * h) >> 1] = (uint8_t)(nib >> (8 * (2 * mm + h)));
+                                    if constexpr (B == 8) {
+                                        const uint8_t code = cvt_e4m3(val[mm][h] * mult);
+                                        dst[mm * 16 + g + 8 * h] = code;
+                                        if (osum && sp.stored_stats && j + mm < MT)
+                                            acc[j + mm][r][q2][2 * h + vv] = dec_e4m3(code) * exp2i(e);
+                                    } else {
+                                        if (!(g & 1)) dst[(mm * 16 + g + 8 * h) >> 1] = (uint8_t)(nib >> (8 * (2 * mm + h)));
+                                        if (osum && sp.stored_stats && j + mm < MT)
+                                            acc[j + mm][r][q2][2 * h + vv] = dec_e2m1n(nib >> (8 * (2 * mm + h))) * exp2i(e);
+                                    }
                                 }
                             if (g == 0) st[((size_t)n * nbt + blk) * S + v] = (uint8_t)(e + 127);
                         }
@@ -615,7 +623,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
             for (int r = 0; r < NR; r++) {
                 int oz = oz0 + wz * RZ + (r >> 1), oy = oy0 + wr + (r & 1);
                 if (oz >= D || oy >= H || co >= Co) continue;
-                float bias = b ? b[co] : 0.f;
+                float bias = IS_MX(T) && sp.stored_stats ? 0.f : b ? b[co] : 0.f;
                 const bool zst = oz >= zs0 && oz < zs1;
                 T *yp = IS_MX(T) ? y : (sp.y2 && co >= sp.o_split) ? (T *)sp.y2 + (((size_t)n * (Co - sp.o_split) + co - sp.o_split) * D + oz) * H * W + (size_t)oy * W
                                                     : y + (((size_t)n * (sp.y2 ? sp.o_split : Co) + co) * D + oz) * H * W + (size_t)oy * W;
@@ -623,7 +631,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                 for (int q = 0; q < 2; q++) {
                     int ox = ox0 + q * 8 + 2 * t;
                     float v0 = acc[m][r][q][2 * h] + bias, v1 = acc[m][r][q][2 * h + 1] + bias;
-                    if constexpr (IS_MX(T)) {   /* stores done above; statistics from the unquantized values */
+                    if constexpr (IS_MX(T)) {   /* stored_stats rewrites acc with the exact decoded output above */
                         if (ox < W && zst) { ps += v0; pss += v0 * v0; }
                         if (ox + 1 < W && zst) { ps += v1; pss += v1 * v1; }
                     } else {

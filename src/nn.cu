@@ -1131,6 +1131,12 @@ static void zs_range(int D, int *lo, int *hi) {   /* halo planes at the low / hi
 static size_t zs_len(size_t len, int D) { const auto &z = g_zs[cur_dev()]; return z.on ? len / D * (size_t)((long)z.Dg0 * D / z.D0) : len; }   /* element count of the whole window */
 static void zs_reduce(double *b, int n) { if (zs_on() && g_split_reduce) g_split_reduce(b, n); }   /* sum over both GPUs */
 static split_t zs_split(split_t sp, int D) { zs_range(D, &sp.zlo, &sp.zhi); return sp; }
+static int gn_fused_stored(const void *y, int cout) {
+    /* MX epilogues can reduce their rounded outputs directly. Ordinary outputs retain
+       the independent FP64 pass; the environment switch preserves the reference path. */
+    return g_gn_stored && ISMX(y) && cout >= 16 &&
+        (!getenv("UFSM_FUSED_STORED_GN") || ufsm_env_on("UFSM_FUSED_STORED_GN"));
+}
 /* x-shift packed weights for XP: wp[kz * 3 + ky][co][kx * 4 + c] (kx = 3 and c >= Ci zero), Cop rows */
 template <typename HT>
 __global__ void prep_wxp_k(const float *w, HT *wp, int Co, int Ci, int Cop) {
@@ -1957,12 +1963,14 @@ extern "C" int nn_conv3d_fwd_gn_stats(const float *x, shape5 xs, int G_in, const
     gnp_t gp = {gamma, beta, mean, rstd, G_in};
     int NG = xs.n * G_out;
     double *sums = nullptr;
-    if (!g_gn_stored && G_out && omean && orstd) { sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
+    const int fused = gn_fused_stored(y, cout);
+    if ((!g_gn_stored || fused) && G_out && omean && orstd) { sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
     split_t ns = zs_split(split_t{}, xs.d);
+    ns.stored_stats = fused;
     conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, ns);
     KCHECK();
     if (G_out && omean && orstd) {
-        if (g_gn_stored) { shape5 ys = xs; ys.c = cout; return nn_gn_stats(y, ys, G_out, eps, omean, orstd); }
+        if (g_gn_stored && !fused) { shape5 ys = xs; ys.c = cout; return nn_gn_stats(y, ys, G_out, eps, omean, orstd); }
         zs_reduce(sums, 2 * NG);
         gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zs_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd);
     }
@@ -1979,11 +1987,13 @@ extern "C" int nn_conv3d_fwd_split(const float *x, const float *x2, int c_split,
     split_t sp = {x2, c_split, nullptr, 0};
     sp = zs_split(sp, xs.d);
     double *sums = nullptr;
-    if (!g_gn_stored && G_out && omean && orstd) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
+    const int fused = gn_fused_stored(y, cout);
+    sp.stored_stats = fused;
+    if ((!g_gn_stored || fused) && G_out && omean && orstd) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
     conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, sp);
     KCHECK();
     if (G_out && omean && orstd) {
-        if (g_gn_stored) { shape5 ys = xs; ys.c = cout; return nn_gn_stats(y, ys, G_out, eps, omean, orstd); }
+        if (g_gn_stored && !fused) { shape5 ys = xs; ys.c = cout; return nn_gn_stats(y, ys, G_out, eps, omean, orstd); }
         zs_reduce(sums, 2 * xs.n * G_out); gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, zs_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd);
     }
     KCHECK();
@@ -2101,14 +2111,16 @@ extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x
         if (up && !up_kernel_ok(x, x2, 0)) return -1;
         if (up && gx && gx->G && !ISMX(x)) return -1;   /* GN+SiLU of the coarse x inside the up staging: MX kernels only */
         double *sums = nullptr;
+        const int fused = gn_fused_stored(y, cout);
+        sp.stored_stats = fused;
         if (G_out) {
             sp = zs_split(sp, ys.d);
-            if (!g_gn_stored && omean && orstd) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
+            if ((!g_gn_stored || fused) && omean && orstd) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
         }
         conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, sp);
         KCHECK();
         if (G_out && omean && orstd) {
-            if (g_gn_stored) return nn_gn_stats(y, ys, G_out, eps, omean, orstd);
+            if (g_gn_stored && !fused) return nn_gn_stats(y, ys, G_out, eps, omean, orstd);
             zs_reduce(sums, 2 * xs.n * G_out); gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, zs_len((size_t)(cout / G_out) * shape_spatial(ys), ys.d), eps, omean, orstd);
         }
         KCHECK();

@@ -40,12 +40,16 @@ The current [candidate recipe](configs/production-candidate.json) uses a 128-cub
 512-cubed batch-1 training on one GPU, with 528-cubed / halo-8 inference. Staging closed the short-run
 accuracy gap on MANBp. The corrected short multi-source confirmation is complete, but dense-box
 accuracy remains weak and the aggregate score is distorted by partially labelled segments.
-Threshold calibration, seam validation and fresh accuracy checks of the corrected normalization
-contract remain. Fresh training computes GroupNorm statistics from rounded stored activations;
+Threshold calibration, seam validation and production accuracy qualification remain. A bounded
+trial of corrected normalization and an FP8 stem has finished; dense-box scores remain weak.
+Fresh training computes GroupNorm statistics from rounded stored activations;
 resume and prediction preserve each checkpoint's contract (`--gn-stats stored|legacy`).
 `--input-prec 4|8` selects stem-input quantization independently of body storage and is saved in
-the checkpoint. The FP8-stem candidate reaches about 67 Mvox/s at 512, with a 12624 MiB observed
-peak. Nearby 496/528 shapes have comparable per-voxel speed; no production precision choice is final.
+the checkpoint. Cooperative gradient loading and fused stored-output statistics bring the FP8-stem
+candidate to about 71 Mvox/s at 512, with approximately 12.4 GiB observed device use. Cached native
+MANBp inference gains about 12% with matched FP4; its decoded output is identical across the tested
+1024-cubed box. Nearby 496/528 shapes previously had comparable per-voxel speed; no production
+precision choice is final.
 Kaggle's 320-cubed regions participate in the warmup and are explicitly excluded at 512. The recipe's
 long run is on hold while those checks and remaining performance headroom are assessed.
 

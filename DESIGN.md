@@ -77,6 +77,33 @@ DRAM 16.46%, L1/TEX 66.07%, 64 registers/thread and 62.92% achieved occupancy. T
 provided partials describe rounded output values and are combined over complete GN groups.
 Its measured cost does not prove a 2x whole-pipeline opportunity.
 
+Stored-MX output statistics are now fused into the convolution epilogue: it decodes the exact
+codes and scales it writes, then reduces those rounded values with the bias already included.
+Ordinary FP16/BF16/FP32 outputs retain the independent FP64 statistics pass; legacy checkpoints
+retain their original contract. `UFSM_FUSED_STORED_GN=0` selects the separate reference pass.
+At 512, paired 40-update runs improve 0.512/0.516 samples/s to 0.528/0.529 (about +2.8%,
+70.9 Mvox/s); the disabled candidate gives 0.513. All peaks in this comparison are 12750 MiB,
+including the additional idle-device allocation relative to the preceding benchmark.
+On the same cached native MANBp 1024-cubed box and fresh staged checkpoint, matched FP4
+prediction takes 4.479/4.515 s versus controls 4.953/5.113 s (+11.9% throughput); FP8 takes
+5.661/5.686 s versus 6.040/6.108 s (+7.1%). Memory is unchanged within each comparison
+(`gn-fusion-step-bench.json`, `gn-fusion-infer-bench.json`). These are isolated-box diagnostics.
+The FP4 decoded byte outputs are identical over all 1073741824 voxels. FP8 changes 9358 bytes,
+with maximum error 2 and 270/68 classification flips at byte thresholds 128/153; its two
+unfused controls are identical. Independent FP64 checks now cover output widths 16–80,
+groups crossing packed blocks, upsampling, owned planes and all three public convolution APIs.
+All 33 commands of the expanded Make test recipe pass, including both stored-GN/FP8-stem
+split presets (`gn-fusion-regressions.json`), with command coverage and current hashes verified.
+The measured candidate and tested final executable have identical CUDA fatbins. The production
+candidate recipe explicitly selects the trial's FP8 stem and stored normalization; dense quality
+and calibration remain unqualified.
+
+A fresh profile of the cooperative final-decoder weight-gradient kernel at 512 shows 44.6% SM
+throughput, 8.6% DRAM throughput, 33.9% L1/TEX throughput, 96 registers/thread and 37.3%
+achieved occupancy; long/short-scoreboard stalls are 17.5%/7.4% (`wgrad-coop-profile-summary.json`).
+This isolated decoder probe supports investigating operand reuse and occupancy; it does not
+establish a corresponding whole-step speedup.
+
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is
 0.2969 versus control 0.3304, but eight partial segment boxes have 55–65% positives within their
