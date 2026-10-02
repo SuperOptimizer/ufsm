@@ -80,6 +80,22 @@ in a staging directory; the previous output is replaced only after success. `--s
 scores an existing prediction without regenerating it. CPU regression tests cover reuse, invalidation,
 failed replacements, legacy outputs and minimum label resolution.
 
+The equal-time MANBp trials have completed (780 seconds each, batch 1 at 512 versus batch 4 at 128).
+Both process roughly 69 million voxels/s, but finish 398 versus 6467 optimizer updates. Best-threshold
+held-out hard F1 is:
+
+| training window | prediction window / halo | current weights | EMA weights |
+|---|---|---:|---:|
+| 512 | 528 / 8 | 0.2415 | 0.2076 |
+| 512 | 288 / 16 | 0.2181 | 0.2042 |
+| 128 | 528 / 8 | 0.3771 | 0.3772 |
+| 128 | 288 / 16 | 0.3769 | 0.3679 |
+
+The larger prediction window helps the 512-trained model on this box, but removing EMA lag does not
+close the training-window gap. These are one-seed, one-box diagnostic optima, not calibrated production
+scores. The production run remains on hold. A follow-up tests four times the learning rate at 512,
+with FP4 versus FP8 stride-1 weight gradients; a corrected tile sweep also checks kernel speed.
+
 ## Constraints
 - Host code is C23 (`gcc -std=c23`). GPU kernels are `.cu` files compiled by nvcc and linked into the
   same binary. No cuDNN, no cuBLAS: every kernel is ours.
