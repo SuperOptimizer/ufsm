@@ -30,6 +30,7 @@ long store_last_status(void);
 void store_set_rate(store *s, double rps);   /* HTTP status of this thread's last request (-1 = transport failure) */
 
 /* Global init/teardown (libcurl). Safe to call repeatedly. Cleanup requires other callers to have joined.
-   Calling threads automatically release their own curl handles on exit. */
+   Exiting threads return handles to a bounded idle pool; cleanup closes all pooled connections.
+   UFSM_HTTP_REUSE=0 disables pooling for controlled comparisons. */
 void store_global_init(void);
 void store_global_cleanup(void);

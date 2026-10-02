@@ -333,6 +333,34 @@ still leave seconds of main-thread wait, while cached readers leave about 0.03 s
 connections across reader jobs merits investigation; the current short-lived workers close their
 handles on exit. Existing tile read-ahead and asynchronous shard writing already overlap CPU work.
 
+That connection-reuse candidate is now integrated (`http-reuse-summary.json`). Workers return
+reset curl handles to a mutex-protected idle pool of at most 32; a handle belongs to exactly one
+caller, and each caches at most two connections. Reset detaches request callbacks and headers while
+retaining connection/DNS/TLS caches. Global cleanup drains the pool after callers join, and
+`UFSM_HTTP_REUSE=0` retains the close-on-worker-exit control. The local fixture verifies 60 fresh
+workers use one connection on one origin or two on two origins, against 60 connections with reuse
+disabled. Three 64-worker rounds retain exactly 32 connections between rounds, with stable 68 file
+descriptors and cleanup back to 4. Mixed HEAD/range/whole/absolute-URL requests verify method,
+range, callback and bearer reset; closed idle connections and an interrupted response recover.
+
+Thirty-eight isolated prediction comparisons cover two native dense regions, cached and local
+reads, a longer dense region, a coarse-level region and an air-heavy region. MANBp takes
+8.06 / 7.35 s with the frozen reader versus 5.27 / 5.29 s with reuse (1.46x); PHerc0500P2 takes
+8.37 / 7.66 versus 5.26 / 5.29 s (1.52x). A 2048-by-1024-by-1024 MANBp region takes
+12.48 / 12.82 versus 8.85 / 8.82 s (1.43x). A 1024-by-8192-by-1024 region skips 48 of 64 tiles
+and takes 17.57 / 17.16 versus 10.81 / 10.92 s (1.60x). Reuse-disabled candidates return to the
+control timings. The coarse-level region gains only 1.12x and has no wholly empty tiles, despite
+the historical `air-cold` artifact name. Cached/local trials remain within 1%. Every full prediction
+store, including metadata, and every independently populated cold cache match exactly. Warm cache
+bytes are not compared. The final rebuilt executable independently reproduces the MANBp gain
+(7.83 / 7.58 versus 5.36 / 5.44 s, 1.43x) and retains the identical CUDA fatbin. These are bounded
+cold-I/O gains; no GPU-kernel, training or whole-volume improvement is inferred.
+All 36 Make test commands pass on the final binary (`http-reuse-regressions.json`). Four bracketed
+512-cubed training checks give 74.02 / 73.62 Mvox/s controls and 73.75 / 73.69 Mvox/s candidates,
+all at 14796 MiB with identical executed precision manifests. These cached-sampler checks establish
+no material training regression and no training gain (`http-reuse-train-bench.json`). Precision,
+calibration and seam acceptance remain open; long production training stays on hold.
+
 Complete FP4 steady-profile controls put weight gradients at 41.9%, backward-data at 24.9%, forward
 convolutions at 21.2%, normalization at 8.0%, upsampling at 3.5%, and upload/loss/optimizer at 0.7%
 of the profiled time. Halving both gradient-convolution components would give a hypothetical 1.50x

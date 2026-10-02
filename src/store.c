@@ -59,29 +59,51 @@ static _Thread_local thread_http *tl_http;
 static pthread_key_t http_key;
 static pthread_once_t http_key_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t http_global_mu = PTHREAD_MUTEX_INITIALIZER;
-static int http_initialized, http_key_error;
-static void http_thread_free(void *ptr) {
-    thread_http *h = ptr;
+/* Each handle has one owner; worker exit returns it to a bounded idle pool.
+   Reset request options/headers, retaining only libcurl's connection/DNS/TLS caches. */
+static int http_initialized, http_key_error, http_reuse;
+enum { HTTP_IDLE_MAX = 32 };
+static thread_http *http_idle[HTTP_IDLE_MAX];
+static int http_idle_n;
+static void http_destroy(thread_http *h) {
     if (!h) return;
     curl_easy_cleanup(h->curl);
     curl_slist_free_all(h->hdr);
     free(h);
 }
+static void http_thread_free(void *ptr) {
+    thread_http *h = ptr;
+    if (!h) return;
+    curl_easy_reset(h->curl);
+    curl_slist_free_all(h->hdr); h->hdr = nullptr;
+    pthread_mutex_lock(&http_global_mu);
+    if (http_initialized && http_reuse && http_idle_n < HTTP_IDLE_MAX) {
+        http_idle[http_idle_n++] = h;
+        h = nullptr;
+    }
+    pthread_mutex_unlock(&http_global_mu);
+    http_destroy(h);
+}
 static void http_key_init(void) { http_key_error = pthread_key_create(&http_key, http_thread_free); }
 void store_global_init(void) {
     pthread_once(&http_key_once, http_key_init);
     pthread_mutex_lock(&http_global_mu);
-    if (!http_initialized) http_initialized = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+    if (!http_initialized) {
+        http_initialized = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+        const char *reuse = getenv("UFSM_HTTP_REUSE");
+        http_reuse = !reuse || atoi(reuse) != 0;
+    }
     pthread_mutex_unlock(&http_global_mu);
 }
 void store_global_cleanup(void) {
-    /* Call after the other store-using threads have joined. Their key destructors close their handles. */
+    /* Call after other store callers join; destroy every idle connection before global cleanup. */
     if (tl_http) {
         pthread_setspecific(http_key, nullptr);
         http_thread_free(tl_http);
         tl_http = nullptr;
     }
     pthread_mutex_lock(&http_global_mu);
+    while (http_idle_n) http_destroy(http_idle[--http_idle_n]);
     if (http_initialized) { curl_global_cleanup(); http_initialized = 0; }
     pthread_mutex_unlock(&http_global_mu);
 }
@@ -197,11 +219,17 @@ static size_t on_read_hdr(char *buf, size_t sz, size_t nm, void *ud) {
 
 static CURL *fresh_handle(const store *s) {
     if (!tl_http) {
-        if (http_key_error || !http_initialized) return nullptr;
-        thread_http *h = calloc(1, sizeof *h);
-        if (!h) return nullptr;
-        h->curl = curl_easy_init();
-        if (!h->curl || pthread_setspecific(http_key, h)) { http_thread_free(h); return nullptr; }
+        pthread_mutex_lock(&http_global_mu);
+        int ready = http_initialized && !http_key_error;
+        thread_http *h = ready && http_idle_n ? http_idle[--http_idle_n] : nullptr;
+        pthread_mutex_unlock(&http_global_mu);
+        if (!ready) return nullptr;
+        if (!h) {
+            h = calloc(1, sizeof *h);
+            if (!h) return nullptr;
+            h->curl = curl_easy_init();
+        }
+        if (!h->curl || pthread_setspecific(http_key, h)) { http_destroy(h); return nullptr; }
         tl_http = h;
     }
     CURL *c = tl_http->curl;
@@ -214,6 +242,8 @@ static CURL *fresh_handle(const store *s) {
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(c, CURLOPT_USERAGENT, "ufsm/0.1");
     curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(c, CURLOPT_MAXCONNECTS, 2L);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L);
     return c;
 }

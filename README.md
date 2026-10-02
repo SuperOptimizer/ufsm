@@ -88,6 +88,15 @@ genuinely missing shards retain the array's fill value. Cold native 1024-cubed t
 showed about 1.3–1.4x whole-process inference speed, with identical prediction and cache bytes.
 Cached/local inference, GPU computation and training have no established speedup from this change.
 
+Reader workers now return idle HTTP handles to a bounded pool, retaining connections between read
+jobs. `UFSM_HTTP_REUSE=0` disables this for comparisons. The pool retains at most 32 handles with
+two cached connections per handle; request options and authorization headers reset before reuse,
+and global cleanup closes the pool after callers join. Additional cold native trials take about
+5.3 s versus 7.4–8.4 s on two 1024-cubed regions. A longer dense region gains 1.43x, and a region
+with 48 empty tiles out of 64 gains 1.60x. Prediction stores and cold caches match exactly;
+cached/local inference stays within 1%. These are bounded cold-input gains, not GPU-kernel or
+whole-volume speedups.
+
 ## Label encoding (our exported stores)
 
 uint8, volcomp lossless, `fill_value` 255: `0` background, `254` surface, `255` ignore. Coarser pyramid

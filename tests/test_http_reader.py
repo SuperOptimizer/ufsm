@@ -105,6 +105,7 @@ def fixtures():
 OBJECTS = fixtures()
 REQUESTS = []
 COUNTS = {}
+CONNECTIONS = []
 LOCK = threading.Lock()
 
 
@@ -143,12 +144,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def serve(self, head=False):
         mode, _, key = self.path.lstrip("/").partition("/")
+        auth = {"auth-a": "Bearer fixture-a", "auth-b": "Bearer fixture-b", "noauth": None, "drop-idle": None}
+        if mode in auth:
+            with LOCK:
+                CONNECTIONS.append((self.server.server_port, self.client_address[1]))
+            if self.headers.get("Authorization") != auth[mode]:
+                return self.reply(403, head=head)
+        if mode == "drop-idle":
+            self.close_connection = True  # Deliberately omit Connection: close in a valid response.
         request_range = self.headers.get("Range")
         with LOCK:
             REQUESTS.append((mode, key, self.command, request_range))
             count_key = (mode, key, self.command)
             COUNTS[count_key] = COUNTS.get(count_key, 0) + 1
             count = COUNTS[count_key]
+        if mode == "transport-once" and count == 1:
+            self.close_connection = True
+            return  # Close before any response; subsequent requests must recover.
         if mode == "redirect":
             return self.reply(302, headers={"Location": "/ok/" + key}, head=head)
         data = OBJECTS.get(key)
@@ -264,6 +276,28 @@ def main():
             assert repeat_out.read_bytes() == expected((-2, -1, -3), (17, 18, 18))
             result = run([HELPER, "resources", url + "/auth"], clean)
             print(result.stdout.decode().strip())
+            # Fresh workers reuse idle connections while resetting method, Range, callbacks and bearer.
+            other = Server(("127.0.0.1", 0), Handler)
+            other_thread = threading.Thread(target=other.serve_forever, daemon=True); other_thread.start()
+            try:
+                urls = [url, f"http://127.0.0.1:{other.server_port}"]
+                for reuse, origins in itertools.product(("0", "1"), (1, 2)):
+                    CONNECTIONS.clear()
+                    run([HELPER, "handoff", *urls[:origins]], dict(clean, UFSM_HTTP_REUSE=reuse))
+                    count = len(set(CONNECTIONS))
+                    assert len(CONNECTIONS) == 60
+                    assert count == (origins if reuse == "1" else 60), (reuse, origins, count)
+                CONNECTIONS.clear()
+                result = run([HELPER, "bounded", url], clean)
+                rounds = [set(CONNECTIONS[i:i + 64]) for i in range(0, 192, 64)]
+                assert len(CONNECTIONS) == 192 and all(len(r) == 64 for r in rounds)
+                assert all(len(a & b) == 32 for a, b in zip(rounds, rounds[1:])), "idle pool exceeded 32 connections"
+                print(result.stdout.decode().strip())
+                CONNECTIONS.clear()
+                run([HELPER, "reconnect", url], clean)
+                assert len(CONNECTIONS) == 60 and len(set(CONNECTIONS)) == 31
+            finally:
+                other.shutdown(); other.server_close(); other_thread.join()
             # Distinguish true sparse absence from failures, with both metadata/chunk scheduling paths.
             for coalesce, parallel in itertools.product(("0", "1"), repeat=2):
                 for mode in ("wrong-range", "wrong-total", "no-range", "ignored", "short", "forbidden", "crc", "bounds", "overflow", "payload-missing"):
@@ -284,7 +318,7 @@ def main():
                     future.result()
             assert {str(p.relative_to(shared)): p.read_bytes() for p in shared.rglob("*") if p.is_file()} == manifests[0]
             # Direct store contract, including legal whole responses at offset zero and redirects.
-            for mode, off, length, result in [("ok", 7, 64, 64), ("redirect", 7, 64, 64),
+            for mode, off, length, result in [("ok", 7, 64, 64), ("redirect", 7, 64, 64), ("transport-once", 7, 64, 64),
                     ("ignored", 0, 128, 128), ("ignored", 7, 64, -1), ("short", 7, 64, -1),
                     ("wrong-range", 7, 64, -1), ("no-range", 7, 64, -1), ("wrong-total", 7, 64, -1),
                     ("missing", 7, 64, -2), ("forbidden", 7, 64, -1), ("ok", -1, 64, -1), ("ok", 0, 0, 0)]:
