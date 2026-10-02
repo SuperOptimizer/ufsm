@@ -117,7 +117,17 @@ for the fused-up probe. The preparation buffer adds 1344 MiB at 512. The prototy
 production keeps the validated cooperative in-block gathering. No whole-step speedup is claimed.
 The next target is the 16-channel FP4 convolution's operand-staging register footprint: the
 existing 528 profile reports 128 registers/thread and a two-block register limit
-(`infer528-p16-counters.json`). This is profiling evidence, not a demonstrated optimization.
+(`infer528-p16-counters.json`). A two-pass staging prototype exactly matches all 37 frozen
+small outputs and the full-size packed outputs, but retaining fewer values alone still compiles
+to 128 registers and loses at 512: normalized MX4 input is 70.8 versus 48.1 ms, and unnormalized
+MX8 input is 60.4 versus 55.2 ms (16 outputs) / 71.3 versus 70.4 ms (32 outputs). An isolated
+three-block launch bound produces 80 registers: the 16-output gradient shape improves to
+52.7 versus 55.1 ms, but normalization loses and 32 outputs spill and regress to 123.4 ms.
+With two z planes, all three large shapes lose. The broad replacement is removed; no production
+or whole-step speedup is established (`f4p-reload-experiment.json`).
+A frozen-kernel precision probe also finds FP8 computation within about 2% of FP4 on these
+16-input-channel shapes; output bytes differ as expected. This is a speed diagnostic and does
+not establish gradient/model-quality equivalence (`f4p-vs-f8p-512.log`).
 
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is
