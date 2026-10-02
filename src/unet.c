@@ -1033,7 +1033,7 @@ static void wq_ema(unet *u, float decay) {
 void unet_wquant(unet *u, unsigned seed) { (void)u; (void)seed; }   /* kept for API compatibility: packed storage makes it unnecessary */
 
 /* ---- checkpoints ---- */
-static int g_loaded_sparse = 0, g_loaded_wq = 0;   /* set by the header parser, applied by unet_load */
+static int g_loaded_sparse = 0, g_loaded_wq = 0, g_loaded_muon = 0;   /* set by the header parser, applied by unet_load */
 /* debug: per block, the GroupNorm statistics of the last forward (mean / rstd of a1 and a2 per sample and group:
    non-finite counts and extremes) and the largest |weight| of each conv. Localises a non-finite forward. */
 void unet_debug_stats(const unet *u) {
@@ -1095,10 +1095,14 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (!f) return -1;
     fprintf(f, "UFSM{\"nlev\":%d,\"widths\":[", u->cfg.nlev);
     for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.widths[i]);
-    fprintf(f, "],\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"extra\":%s}\n", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->np, step, u->sparse24, u->wq, extra ? extra : "{}");
+    fprintf(f, "],\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"muon_mom\":%d,\"extra\":%s}\n", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->np, step, u->sparse24, u->wq, u->muon_mom != nullptr, extra ? extra : "{}");
     float *h = malloc(u->np * 4);
     const float *arrs[4] = {u->p, u->ema, u->m, u->v};
     for (int a = 0; a < 4; a++) { nn_d2h(h, arrs[a], u->np * 4); if (fwrite(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; } }
+    if (u->muon_mom) {
+        nn_d2h(h, u->muon_mom, u->np * 4);
+        if (fwrite(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; }
+    }
     free(h);
     if (fclose(f)) return -1;
     return rename(tmp, path);
@@ -1121,6 +1125,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"step\":"))) *step = atoi(p + 7);
     if ((p = strstr(line, "\"sparse24\":"))) g_loaded_sparse = atoi(p + 11);
     if ((p = strstr(line, "\"wq\":"))) g_loaded_wq = atoi(p + 5);
+    if ((p = strstr(line, "\"muon_mom\":"))) g_loaded_muon = atoi(p + 11);
     return 0;
 }
 
@@ -1137,7 +1142,7 @@ int unet_load(unet *u, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     unet_cfg cfg; int step = 0; size_t np = 0;
-    g_loaded_sparse = 0; g_loaded_wq = 0;
+    g_loaded_sparse = 0; g_loaded_wq = 0; g_loaded_muon = 0;
     if (read_header(f, &cfg, &step, &np) || np != u->np) { fclose(f); return -1; }
     float *h = malloc(u->np * 4);
     float *arrs[4] = {u->p, u->ema, u->m, u->v};
@@ -1145,6 +1150,11 @@ int unet_load(unet *u, const char *path) {
         if (fread(h, 4, u->np, f) != u->np) { if (a < 2) { fclose(f); free(h); return -1; } break; }
         nn_h2d(arrs[a], h, u->np * 4);
     }
+    if (g_loaded_muon) {
+        if (fread(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; }
+        if (!u->muon_mom) u->muon_mom = nn_malloc(u->np * 4);
+        nn_h2d(u->muon_mom, h, u->np * 4);
+    } else if (u->muon_mom) nn_zero(u->muon_mom, u->np * 4);   /* old checkpoints have no Muon state */
     free(h);
     fclose(f);
     if (g_loaded_sparse) unet_set_sparse24(u, 1);

@@ -62,9 +62,11 @@ void unet_set_wq(unet *u, int bits);
 int unet_get_wq(const unet *u);
 void unet_wquant(unet *u, unsigned seed);
 
-/* Checkpoint: "UFSM" magic, JSON header line, then float32 params, ema, adam m, adam v. */
+/* Checkpoint: "UFSM" magic, JSON header line, then float32 params, ema, adam m, adam v;
+   optional Muon momentum follows when the header's muon_mom flag is set. */
 int unet_save(const unet *u, const char *path, int step, const char *extra_json);
-/* Loads params/ema/adam from a checkpoint created with the same cfg; returns the saved step or -1. */
+/* Loads weights and saved optimizer state from the same cfg; returns the saved step or -1.
+   Old checkpoints remain readable and start Muon with zero momentum. */
 int unet_load(unet *u, const char *path);
 /* Read only the cfg from a checkpoint (to construct the net before loading). */
 int unet_peek(const char *path, unet_cfg *cfg, int *step);

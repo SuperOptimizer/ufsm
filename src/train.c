@@ -259,9 +259,11 @@ int cmd_train(int argc, char **argv) {
         d->dev = devs[g]; d->side = split ? g : -1;
         if (nn_init(d->dev)) { fprintf(stderr, "cannot select GPU %d\n", d->dev); return 1; }
         d->u = unet_create(&cfg);
-        if (resume) { step0 = unet_load(d->u, resume); if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; } }
-        if (resume && atoi(opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* weights from the checkpoint, fresh schedule (QAT / low-precision fine-tuning) */
-        else unet_init(d->u, seed + 1);                   /* deterministic: every GPU starts identical */
+        if (resume) {
+            step0 = unet_load(d->u, resume);
+            if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; }
+            if (atoi(opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* loaded weights/state, fresh schedule */
+        } else unet_init(d->u, seed + 1);               /* deterministic: every GPU starts identical */
         if (wq) unet_set_wq(d->u, wq);
         if (split) { unet_set_split(d->u, g, g_h0, split_halo); if (!getenv("UFSM_SPLIT_SYNC")) unet_set_split_async(d->u, split_halo_begin, split_halo_end); }
         const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
@@ -378,7 +380,10 @@ int cmd_train(int argc, char **argv) {
     sampler *sp = sampler_start(S, &sc);
     char logp[1400]; snprintf(logp, sizeof logp, "%s/log.csv", out);
     FILE *log = fopen(logp, step0 ? "a" : "w");
-    if (log && !step0) fprintf(log, "step,lr,loss,bce,dice,active,gnorm,val_loss,val_bce,val_dice,samples_per_s,wait_s\n");
+    if (log) {
+        fseek(log, 0, SEEK_END);
+        if (ftell(log) == 0) fprintf(log, "step,lr,loss,bce,dice,active,gnorm,val_loss,val_bce,val_dice,samples_per_s,wait_s\n");
+    }
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     int prof = ufsm_env_on("UFSM_PROF");
     double t0 = now(), tlog = t0, wait = 0, acc_loss = 0, acc_bce = 0, acc_dice = 0, acc_g = 0; int nacc = 0;
@@ -575,9 +580,9 @@ int cmd_train(int argc, char **argv) {
             char cp[1400]; snprintf(cp, sizeof cp, "%s/last.ckpt", out);
             if (unet_save(G[0].u, cp, step, nullptr)) { fprintf(stderr, "cannot save %s\n", cp); return 1; }
         }
-        if (step == 1 || step == steps || g_stop) {
+        if (step == step0 + 1 || step == steps || g_stop) {
             char mp[1400], em[4096]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp);
-            if (step == 1) { nn_exec_manifest(em, sizeof em); fprintf(stderr, "%s\n", em); }
+            if (step == step0 + 1) { nn_exec_manifest(em, sizeof em); fprintf(stderr, "%s\n", em); }
         }
     }
     uint64_t prod, rej; sampler_stats(sp, &prod, &rej);

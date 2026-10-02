@@ -93,8 +93,21 @@ held-out hard F1 is:
 
 The larger prediction window helps the 512-trained model on this box, but removing EMA lag does not
 close the training-window gap. These are one-seed, one-box diagnostic optima, not calibrated production
-scores. The production run remains on hold. A follow-up tests four times the learning rate at 512,
-with FP4 versus FP8 stride-1 weight gradients; a corrected tile sweep also checks kernel speed.
+scores. The production run remains on hold. Four times the learning rate did not close the gap:
+current-weight F1 was 0.2336 with FP4 weight gradients and 0.1717 with FP8 (EMA 0.2092 / 0.1812).
+The FP4 trial completed 398 updates, the FP8 trial 381; both were finite and free of CUDA errors.
+These results do not establish a precision ranking across sources, but provide no reason to switch.
+The corrected tile sweep completed all eight runs. Controls at both ends were 0.501 samples/s;
+alternatives were 0.383–0.501. None improved speed, so the existing tile choices remain in use.
+
+Checkpoint resume now preserves loaded weights (the former conditional reinitialized them unless
+`--finetune 1` was specified). New checkpoints also include Muon momentum; older checkpoints load
+with zero Muon momentum. Regression tests verify that the next AdamW/Muon update after save/load is
+identical to uninterrupted training, reject missing declared momentum, and preserve old-format support.
+A real CLI test preserves trained parameters at zero learning rate and reproduces the reinitialization
+with the previous binary. The full suite passes. A short follow-up compares a 128 warmup followed by
+512 training against continuing at 128 for the same additional wall-clock budget; both use the same
+warm-start checkpoint. This is an accuracy experiment, not the long production run.
 
 ## Constraints
 - Host code is C23 (`gcc -std=c23`). GPU kernels are `.cu` files compiled by nvcc and linked into the
@@ -102,7 +115,8 @@ with FP4 versus FP8 stride-1 weight gradients; a corrected tile sweep also check
 - Third-party: libc/libm/pthreads, libcurl (HTTPS), libzstd, libblosc + zlib (only to read upstream
   zarr v2 / TIFF during ingest), CUDA runtime, and the vendored codecs `third_party/volcomp.h` and
   `third_party/surfcomp/` (both MIT, SuperOptimizer).
-- Hardware: 2x RTX 5060 Ti 16 GB (sm_120), 32 cores, 182 GB RAM, `/vesuvius` nvme (≈400 GB free).
+- Hardware: 2x RTX 5060 Ti 16 GB (sm_120), 32 cores, 182 GB RAM, `/vesuvius` nvme (≈790 GB free).
+  Both GPUs are under this session's exclusive control during the current audit.
 
 ## Ground truth
 | source | what | native form |
