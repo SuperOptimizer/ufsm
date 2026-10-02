@@ -174,6 +174,9 @@ one-seed diagnostic does not qualify the weak dense accuracy or independently ca
 production threshold (`wide-up-quality-summary.json`). All 35 commands pass again after
 adding the public memory mode and exercising it through staged train/evaluate/export/predict
 (`wide-up-mode-regressions.json`); the full training run remains on hold.
+The final public-mode sweep gives 73.7–74.2 Mvox/s at 512 (14796 MiB), versus 73.0 at
+496 (13496 MiB), so the recipe retains 512 (`wide-up-mode-window-sweep.json`). The two
+512 controls bracket 496; all three runs use the fully tested final executable.
 
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is
