@@ -1,6 +1,7 @@
 /* ufsm predict: sliding-window inference of a checkpoint over a CT box, written as a volcomp zarr v3
    probability pyramid (uint8 p*255, q=8) in the published layout. */
 #include "nn.h"
+#include "checkpoint.h"
 #include "pyramid.h"
 #include "sources.h"
 #include "store.h"
@@ -60,7 +61,7 @@ static void *reader_main(void *arg) {
     return nullptr;
 }
 /* shard writer: the main thread hands a filled shard buffer to a writer thread and continues into the other buffer */
-typedef struct { z3w *w; int nthreads; size_t bytes; uint8_t *buf[2]; int64_t sz[2], sy[2], sx[2]; int pending[2]; int failed; pthread_mutex_t mu; pthread_cond_t cv; int stop; } writer_t;
+typedef struct { z3w *w; int nthreads; size_t bytes; uint8_t *buf[2]; int64_t sz[2], sy[2], sx[2]; int pending[2]; atomic_int failed; pthread_mutex_t mu; pthread_cond_t cv; int stop; } writer_t;
 static void *writer_main(void *arg) {
     writer_t *W = arg;
     for (;;) {
@@ -69,7 +70,7 @@ static void *writer_main(void *arg) {
         while (k < 0 && !W->stop) { for (int i = 0; i < 2; i++) if (W->pending[i]) { k = i; break; } if (k < 0) pthread_cond_wait(&W->cv, &W->mu); }
         if (k < 0) { pthread_mutex_unlock(&W->mu); return nullptr; }
         pthread_mutex_unlock(&W->mu);
-        if (z3w_write_shard(W->w, W->sz[k], W->sy[k], W->sx[k], W->buf[k], W->nthreads)) W->failed = 1;
+        if (z3w_write_shard(W->w, W->sz[k], W->sy[k], W->sx[k], W->buf[k], W->nthreads)) atomic_store(&W->failed, 1);
         pthread_mutex_lock(&W->mu); W->pending[k] = 0; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
     }
 }
@@ -79,11 +80,11 @@ static int writer_submit(writer_t *W, int k, int64_t sz, int64_t sy, int64_t sx)
     W->sz[k] = sz; W->sy[k] = sy; W->sx[k] = sx; W->pending[k] = 1; pthread_cond_broadcast(&W->cv);
     while (W->pending[k ^ 1]) pthread_cond_wait(&W->cv, &W->mu);
     pthread_mutex_unlock(&W->mu);
-    return W->failed;
+    return atomic_load(&W->failed);
 }
 static int writer_finish(writer_t *W, pthread_t th) {
     pthread_mutex_lock(&W->mu); while (W->pending[0] || W->pending[1]) pthread_cond_wait(&W->cv, &W->mu); W->stop = 1; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
-    pthread_join(th, nullptr); return W->failed;
+    pthread_join(th, nullptr); return atomic_load(&W->failed);
 }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
@@ -94,7 +95,7 @@ int cmd_predict(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window 288] [--act-mx8 1]\n"
                         "       [--halo 8] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
-                        "       [--prec 1|2|3|4] [--policy enc0=1,...] [--ema 1]   EMA or current weights (0)\n"
+                        "       [--prec 0|1|2|3|4] [--policy enc0=1,...] [--f16 0|1] [--fp4 0|1] [--ema 1]   EMA or current weights (0)\n"
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n");
         fprintf(stderr, "  For exact shard tiling, window - 2*halo should divide the shard size: 528 with halo 8 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n");
         return 2;
@@ -107,24 +108,43 @@ int cmd_predict(int argc, char **argv) {
     const int use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
     float q = (float)atof(opt(argc, argv, "--q", "8"));
     const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
-    nn_set_prec(atoi(opt(argc, argv, "--prec", "1")));
-    if (nn_set_prec_policy(opt(argc, argv, "--policy", ""))) return 2;
+    long long boxv[6]; const char *box = opt(argc, argv, "--box", nullptr); char tail;
+    if (!isfinite(um) || um <= 0 || W <= 0 || halo < 0 || halo >= W / 2 || shard < 128 || shard % 128 ||
+        level < 0 || level > 20 || nlev < 1 || nlev > 20 || nthreads < 1 || !isfinite(q) || q < 0 ||
+        (box && (sscanf(box, "%lld,%lld,%lld,%lld,%lld,%lld%c", &boxv[0], &boxv[1], &boxv[2], &boxv[3], &boxv[4], &boxv[5], &tail) != 6 ||
+                 boxv[0] < 0 || boxv[1] < 0 || boxv[2] < 0 || boxv[3] <= 0 || boxv[4] <= 0 || boxv[5] <= 0))) {
+        fprintf(stderr, "invalid prediction geometry: require positive --um/window/box, 0 <= halo < window/2, shard a multiple of 128, and valid levels/threads/q\n"); return 2;
+    }
+    unet_cfg cfg; int step = 0; checkpoint_runtime runtime;
+    int embedded = checkpoint_runtime_read(ckpt, &runtime);
+    if (embedded < 0 || unet_peek(ckpt, &cfg, &step) || cfg.nlev < 1 || cfg.nlev > UNET_MAXLEV) { fprintf(stderr, "cannot read checkpoint settings: %s\n", ckpt); return 1; }
+    if (W % (1 << (cfg.nlev - 1))) { fprintf(stderr, "window must be divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
+    const int override = *opt(argc, argv, "--prec", "") || *opt(argc, argv, "--fp4", "") || *opt(argc, argv, "--policy", "");
+    nn_set_prec(*opt(argc, argv, "--prec", "") ? atoi(opt(argc, argv, "--prec", "1")) : embedded ? runtime.prec : 1);
+    if (nn_set_prec_policy(opt(argc, argv, "--policy", embedded && !override ? runtime.policy : ""))) return 2;
+    if (embedded) nn_set_f16(runtime.f16);
+    if (*opt(argc, argv, "--f16", "")) nn_set_f16(atoi(opt(argc, argv, "--f16", "0")) != 0);
     /* default --fp4 follows how the checkpoint was trained: models trained with fp4 storage (precision.txt next to the
        checkpoint says act_mx4 1) are calibrated for it; 16-bit-trained models keep MX-fp8 storage (fp4 storage shifts
        their best cutoff) */
-    int ckfp4 = 0;
-    { char mp[1400]; snprintf(mp, sizeof mp, "%s", ckpt); char *sl = strrchr(mp, '/'); if (sl) sl[1] = 0; else mp[0] = 0;
+    int ckfp4 = embedded ? runtime.act_mx4 : 0;
+    if (!embedded) { char mp[1400]; snprintf(mp, sizeof mp, "%s", ckpt); char *sl = strrchr(mp, '/'); if (sl) sl[1] = 0; else mp[0] = 0;
       strncat(mp, "precision.txt", sizeof mp - strlen(mp) - 1); FILE *mf = fopen(mp, "r");
       if (mf) { char ln[4096]; while (fgets(ln, sizeof ln, mf)) if (strstr(ln, "act_mx4 1")) ckfp4 = 1; fclose(mf); }
       if (ckfp4 && !*opt(argc, argv, "--fp4", "")) fprintf(stderr, "checkpoint trained with fp4 storage (%s): --fp4 1\n", mp); }
-    if (atoi(opt(argc, argv, "--fp4", ckfp4 ? "1" : "0"))) { unet_set_act_mx4(1); if (!*opt(argc, argv, "--prec", "")) nn_set_prec(3); }   /* fp4 storage + fp4 compute */
-    if (atoi(opt(argc, argv, "--act-mx4", "0"))) unet_set_act_mx4(1);   /* packed fp4 activation storage (default once yardstick A passes) */
-    else if (atoi(opt(argc, argv, "--act-mx8", "1"))) unet_set_act_mx8(1);   /* default on: free in accuracy (r5 0.197 vs 0.192, r8 0.2670 vs 0.2669), 1.3-1.5x faster */   /* MX-fp8 activation storage for this (inference-only) process */
-    if (um <= 0) { fprintf(stderr, "--um required\n"); return 2; }
+    int mx4 = atoi(opt(argc, argv, "--fp4", ckfp4 ? "1" : "0")) != 0;
+    int mx8 = embedded ? runtime.act_mx8 : 1;
+    if (*opt(argc, argv, "--fp4", "")) { mx8 = !mx4; if (mx4 && !*opt(argc, argv, "--prec", "")) nn_set_prec(3); }
+    else if (!embedded && mx4 && !*opt(argc, argv, "--prec", "")) nn_set_prec(3);
+    if (*opt(argc, argv, "--act-mx4", "")) mx4 = atoi(opt(argc, argv, "--act-mx4", "0")) != 0;
+    if (*opt(argc, argv, "--act-mx8", "")) { mx8 = atoi(opt(argc, argv, "--act-mx8", "0")) != 0; if (mx8 && !*opt(argc, argv, "--act-mx4", "")) mx4 = 0; }
+    unet_set_act_mx4(mx4); unet_set_act_mx8(mx8);
+    fprintf(stderr, "prediction precision: %s checkpoint, prec=%d f16=%d act_mx4=%d act_mx8=%d\n", embedded ? "embedded" : "legacy", nn_get_prec(), nn_get_f16(), mx4, mx8);
     /* --gpus a,b,...: one worker process per GPU, each writes every n-th shard of the same store; the parent builds the pyramid */
     int gpus[8], ngpu = 0, part = 0;
     { const char *gl = opt(argc, argv, "--gpus", nullptr); if (gl) { char *t = strdup(gl); for (char *q = strtok(t, ","); q && ngpu < 8; q = strtok(nullptr, ",")) gpus[ngpu++] = atoi(q); free(t); } }
     if (ngpu <= 1) { if (ngpu == 1) gpu = gpus[0]; ngpu = 1; }
+    if (ngpu > 1 && !box) { fprintf(stderr, "--gpus needs --box\n"); return 2; }
     pid_t kids[8] = {0}; int is_child = 0;
     if (ngpu > 1) {
         for (int i = 0; i < ngpu; i++) {
@@ -140,18 +160,15 @@ int cmd_predict(int argc, char **argv) {
             int64_t bn[3]; { long long v[6] = {0, 0, 0, 0, 0, 0}; const char *b = opt(argc, argv, "--box", nullptr); if (!b || sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) { fprintf(stderr, "--gpus needs --box\n"); return 1; } for (int d = 0; d < 3; d++) bn[d] = v[3 + d]; }
             char attrs[2000]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"recto probability (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"gpus\":%d,\"ema\":%d}}", ckpt, ngpu, use_ema);
             for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
-            pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs);
+            if (pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs)) return 1;
             fprintf(stderr, "wrote %s (%d GPUs)\n", out, ngpu);
             return 0;
         }
     }
     if (nn_init(gpu)) { fprintf(stderr, "cannot select GPU %d\n", gpu); return 1; }
-    unet_cfg cfg; int step;
-    if (unet_peek(ckpt, &cfg, &step)) { fprintf(stderr, "cannot read %s\n", ckpt); return 1; }
     unet *u = unet_create(&cfg);
     if (unet_load(u, ckpt) < 0) { fprintf(stderr, "cannot load %s\n", ckpt); return 1; }
     unet_use_ema(u, use_ema);
-    if (W % (1 << (cfg.nlev - 1))) { fprintf(stderr, "window must be divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
     store *s = store_open(root);
     char ak[1200];
     snprintf(ak, sizeof ak, "%s/level%d", key, level);
@@ -305,7 +322,7 @@ int cmd_predict(int argc, char **argv) {
     z3w_close(w);
     if (ngpu > 1) { fprintf(stderr, "gpu %d: %ld tiles in %.0fs\n", gpu, ntiles, now() - t0); z3_close(ct); store_close(s); unet_free(u); return 0; }   /* worker: the parent builds the pyramid */
     for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
-    pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs);
+    if (pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs)) return 1;
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs)\n", out, ntiles, now() - t0);
     z3_close(ct); store_close(s); unet_free(u);
     return 0;

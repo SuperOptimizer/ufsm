@@ -105,9 +105,42 @@ Checkpoint resume now preserves loaded weights (the former conditional reinitial
 with zero Muon momentum. Regression tests verify that the next AdamW/Muon update after save/load is
 identical to uninterrupted training, reject missing declared momentum, and preserve old-format support.
 A real CLI test preserves trained parameters at zero learning rate and reproduces the reinitialization
-with the previous binary. The full suite passes. A short follow-up compares a 128 warmup followed by
-512 training against continuing at 128 for the same additional wall-clock budget; both use the same
-warm-start checkpoint. This is an accuracy experiment, not the long production run.
+with the previous binary. The full suite passes. The staged follow-up has completed: both models start
+from the same 13-minute 128 checkpoint and get another 13 minutes. At prediction 528 / halo 8, switching
+to 512 gives current-weight best-threshold F1 0.3942 versus 0.3803 for continuing at 128. EMA scores are
+0.3850 versus 0.3849. At prediction 288 / halo 16, the corresponding current-weight scores are 0.3823
+and 0.3792. Thus the warmup closes the short-run large-window gap on this one seed/box, while 528 helps
+the staged 512 model. Both trials resumed a legacy checkpoint with zero initial Muon momentum; new
+checkpoints save it. This does not establish the recipe across sources or calibrate a production threshold.
+
+`tools/production.py` now freezes the binary, recipe, sources/axes and scoring script, performs staged
+training with continuous optimizer steps and fresh stage LR schedules, compares matched/FP4/FP8/FP16
+inference at a fixed threshold, and exports a hashed model bundle. Deployment verifies its artifacts
+and replaces predictions only after success. GPU leases cover cooperating runners. Local real-CLI tests
+exercise training, resume, the four inference profiles, bundle relocation, reuse, failed replacement,
+and changed-artifact rejection. Checkpoints embed inference storage and requested precision defaults;
+legacy sidecars remain supported. The default threshold 0.6 is provisional. The candidate recipe and
+its long training run remain under validation; no full production run has started.
+
+The sampler now filters source/level combinations that cannot fit the window, validation box or region,
+and fails immediately when none are eligible. In particular, Kaggle's 320 cubes participate in the 128
+warmup and are explicitly excluded from 512 training instead of repeatedly drawing impossible patches.
+The full suite, including the real CLI impossible-source case, passes.
+
+Inference now reuses consumed encoder skips for final decoder outputs and kept coarse SiLU buffers.
+At 528 / halo 8 on the cached 1024-cubed benchmark, FP4 peak memory falls from 7017 to 6053 MiB and
+FP8 from 10753 to 8945 MiB. Both outputs are byte-identical to separate buffers across 1,073,741,824
+voxels. FP16 previously failed to allocate a 1.18 GB buffer; it now completes at 14439 MiB. Three-run
+median end-to-end times are FP4 4.34 -> 4.44 seconds and FP8 5.57 -> 5.53; this is a memory change,
+not a demonstrated speed gain. FP16 takes 7.49 seconds. Repeated-forward tests cover two/four levels,
+recompute 0/1/2 and all three storage modes. FP16 group-accumulator tests use an unchanged-repeat
+reference because atomic GN reduction order itself can change logits by about 0.1%. The full suite
+passes. `UFSM_INFER_SCRATCH_OLD=1` retains separate buffers for comparison.
+
+A new 17-source confirmation is running through the production runner: 13 minutes at 128 followed by
+13 minutes at 512, with the same warmup checkpoint continued at 128 as a control. New Muon state is
+preserved in both. It then scores all 16 configured held-outs and the inference precision profiles.
+Artifacts are under `runs/recovery512/production17-*`; this is a bounded trial, not the full model run.
 
 ## Constraints
 - Host code is C23 (`gcc -std=c23`). GPU kernels are `.cu` files compiled by nvcc and linked into the

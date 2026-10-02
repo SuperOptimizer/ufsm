@@ -1,4 +1,5 @@
 #include "unet.h"
+#include "checkpoint.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -306,13 +307,13 @@ static void free_acts(unet *u) {
 }
 
 /* a1 / a2: nullptr = allocate, else a shared buffer (inference) */
-static void build_block_acts(unet *u, block *b, shape5 xs, int train, int keep_s2, float *a1, float *a2) {
+static void build_block_acts(unet *u, block *b, shape5 xs, int train, int keep_s2, float *a1, float *a2, float *s2) {
     b->xs = xs;
     b->ys = xs; b->ys.c = b->c1.cout;
     int G = G_of(u, b->c1.cout);
     (void)train;
     b->a1 = a1 ? a1 : dalloc_act_s(u, b->ys); b->a2 = a2 ? a2 : dalloc_act_s(u, b->ys);
-    b->s2 = recompute() && (!keep_s2 || act_mx8()) ? nullptr : dalloc_act_s(u, b->ys);   /* MX: the up staging normalises a2 itself */
+    b->s2 = recompute() && (!keep_s2 || act_mx8()) ? nullptr : s2 ? s2 : dalloc_act_s(u, b->ys);   /* MX: the up staging normalises a2 itself */
     b->m1 = dalloc(u, (size_t)xs.n * G); b->r1 = dalloc(u, (size_t)xs.n * G); b->m2 = dalloc(u, (size_t)xs.n * G); b->r2 = dalloc(u, (size_t)xs.n * G);
 }
 static size_t act_bytes_of(shape5 s) { return act_mx8() ? nn_mx_bytes(s, act_dt()) : shape_numel(s) * (ABF ? 2 : 4); }
@@ -326,6 +327,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
        not kept (decoder; encoder too unless recompute mode, where the encoder a2 are the skips); the upsampled decoder
        inputs share one buffer. Only the skips and the small upsample sources stay per tensor. */
     const int share = !train && nn_get_tf32(), rc = recompute();
+    const int reuse_skip = share && rc && L > 1 && !ufsm_env_on("UFSM_INFER_SCRATCH_OLD");
     float *T1 = nullptr, *T2 = nullptr, *TC = nullptr;
     {
         shape5 s = xs; for (int i = 0; i < L; i++) { u->ls[i] = s; if (i < L - 1) s = nn_conv3d_out_shape(s, w[i], 3, 2); }
@@ -339,13 +341,19 @@ static void build_acts(unet *u, shape5 xs, int train) {
         shape5 m1 = u->ls[0], m2, mc = u->ls[0]; m1.c = 0; mc.c = 0;
         for (int i = 0; i < L; i++) { shape5 y = u->ls[i]; y.c = w[i]; if (act_bytes_of(y) > act_bytes_of(m1)) m1 = y; }
         m2 = m1;
+        if (reuse_skip) {
+            /* Full-resolution decoder c2 is the only large T2 user. Its encoder skip is dead after
+               decoder c1, so c2 can write there. Earlier decoder outputs need only a smaller T2. */
+            m2.c = 0;
+            for (int i = 1; i < L - 1; i++) { shape5 y = u->ls[i]; y.c = w[i]; if (act_bytes_of(y) > act_bytes_of(m2)) m2 = y; }
+        }
         for (int i = 0; i < L - 1; i++) { shape5 d = u->ls[i + 1]; d.c = w[i]; if (act_bytes_of(d) > act_bytes_of(m2)) m2 = d; }
         for (int i = 0; i < L - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > act_bytes_of(mc)) mc = c; }
         T1 = dalloc_act_s(u, m1); T2 = dalloc_act_s(u, m2); TC = rc ? nullptr : dalloc_act_s(u, mc);   /* recompute: rc_tmp allocates on demand */
     }
     for (int i = 0; i < L; i++) {
         shape5 bin = u->ls[i]; bin.c = i == 0 ? u->cfg.cin : w[i - 1];
-        build_block_acts(u, &u->enc[i], bin, train, i == L - 1, T1, rc ? nullptr : T2);   /* recompute mode keeps the (small) outputs that get upsampled */
+        build_block_acts(u, &u->enc[i], bin, train, i == L - 1, T1, rc ? nullptr : T2, nullptr);   /* recompute mode keeps the (small) outputs that get upsampled */
         if (i < L - 1) {
             shape5 ds = u->ls[i + 1]; ds.c = w[i];
             u->downo[i] = share ? T2 : dalloc_act_s(u, ds);
@@ -362,7 +370,10 @@ static void build_acts(unet *u, shape5 xs, int train) {
         if (share && !rc) u->cat[i] = TC;
         else if (!rc) u->cat[i] = dalloc_act_s(u, cs_);
         shape5 cin = li; cin.c = w[i] + w[i + 1];
-        build_block_acts(u, &u->dec[i], cin, train, i > 0, T1, T2);
+        /* A 16-bit decoder's kept SiLU may also use its consumed encoder skip. In MX modes s2
+           is absent and the next decoder normalizes a2 on the fly. Training keeps separate buffers. */
+        build_block_acts(u, &u->dec[i], cin, train, i > 0, T1, reuse_skip && i == 0 ? u->enc[0].a2 : T2,
+                         reuse_skip && i > 0 ? u->enc[i].a2 : nullptr);
     }
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
     u->logits = nullptr;
@@ -443,6 +454,7 @@ void unet_build(unet *u, shape5 xs, int train) {
     if (!u->built || memcmp(&u->xs, &xs, sizeof xs) || (train && !u->train) || u->mode != UMODE()) build_acts(u, xs, train);
 }
 int unet_act_mx(void) { return act_mx8(); }   /* MX activation storage (fp8 or fp4) */
+int unet_act_mx4(void) { return act_mx4(); }
 int unet_input_converted(void) { return act_mx8() && grad_mx8(); }   /* the 16-bit network input is copied into MX storage at the forward's start */
 /* lean mode: the gradient buffer B as scratch for the trainer's 16-bit logit gradient (free from the end of the forward until
    the head backward has read it); nullptr when not built for training, not lean, or too small */
@@ -1111,8 +1123,8 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
 static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     char magic[4];
     if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "UFSM", 4)) return -1;
-    char line[4096];
-    if (!fgets(line, sizeof line, f)) return -1;
+    char line[UFSM_CHECKPOINT_HEADER];
+    if (!fgets(line, sizeof line, f) || !strchr(line, '\n')) return -1;
     memset(cfg, 0, sizeof *cfg);
     const char *p;
     if ((p = strstr(line, "\"nlev\":"))) cfg->nlev = atoi(p + 7);

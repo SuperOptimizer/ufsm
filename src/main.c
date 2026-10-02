@@ -162,6 +162,7 @@ static int cmd_sample(int argc, char **argv) {
     fprintf(stderr, "%d sources\n", S->n);
     double t0 = now();
     sampler *sp = sampler_start(S, &cfg);
+    if (!sp) return 1;
     int P = cfg.P;
     size_t p3 = (size_t)P * P * P;
     /* montage: one row per patch: CT | recto | sheet | mask | radial-y | radial-x (mid z slice) */

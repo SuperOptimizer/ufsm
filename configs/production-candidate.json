@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "status": "candidate: multi-source accuracy and precision validation pending",
+  "sources": "configs/all2.json",
+  "train": {
+    "fp4": 2, "mem": "auto", "opt": "muon", "muon-lr": 0.01,
+    "lr": 0.001, "sched": "wsd", "cooldown": 0.2, "soft": 3,
+    "intonly": 1, "down-norm": 1, "workers": 12, "seed": 1,
+    "val-batches": 2, "log-every": 50, "val-every": 500, "ckpt-every": 1000
+  },
+  "stages": [
+    {"name": "warmup", "P": 128, "B": 4, "steps": 100000, "seconds": 780, "warmup-seconds": 40},
+    {"name": "large", "P": 512, "B": 1, "steps": 20000, "warmup": 500}
+  ],
+  "predict": {"window": 528, "halo": 8, "shard": 512, "ema": 1, "q": 8, "threads": 16},
+  "profiles": {
+    "matched": {},
+    "fp4": {"prec": 3, "fp4": 1, "f16": 1},
+    "fp8": {"prec": 2, "fp4": 0, "f16": 1, "act-mx4": 0, "act-mx8": 1},
+    "fp16": {"prec": 4, "fp4": 0, "f16": 1, "act-mx4": 0, "act-mx8": 0}
+  },
+  "evaluation": {"level": 1, "thresholds": [0.3, 0.4, 0.5, 0.6, 0.7, 0.8], "report_threshold": 0.6},
+  "environment": {}
+}

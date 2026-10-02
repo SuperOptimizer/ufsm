@@ -2,3 +2,4 @@ build/
 runs/
 *.raw
 *.pgm
+__pycache__/

@@ -4,7 +4,7 @@
 usage: eval_holdouts.py <ckpt> [--sources configs/all.json] [--out /vesuvius/ufsm/eval/<run>] [--gpu 1] [--level 0]
 Prints one table per source. --scores writes structured metrics; any failed box makes the command fail.
 """
-import hashlib, json, os, shlex, shutil, subprocess, sys, tempfile
+import hashlib, json, math, os, shlex, shutil, subprocess, sys, tempfile, time
 
 # the ufsm binary of this checkout (env UFSM_BIN overrides), so checkpoints with newer config fields load
 B = os.environ.get("UFSM_BIN", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "ufsm"))
@@ -30,7 +30,7 @@ def completed_prediction(pdir, signature):
         return False
 
 
-def predict_atomic(cmd, pdir, signature):
+def predict_atomic(cmd, pdir, signature, env=None):
     """Replace a previous prediction only after the new one has completed."""
     parent = os.path.dirname(os.path.abspath(pdir))
     os.makedirs(parent, exist_ok=True)
@@ -38,7 +38,7 @@ def predict_atomic(cmd, pdir, signature):
     with tempfile.TemporaryDirectory(prefix=prefix, dir=parent) as staging:
         run = cmd.copy()
         run[5] = staging
-        r = subprocess.run(run, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, text=True)
+        r = subprocess.run(run, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, text=True, env=env)
         print(r.stdout[-400:], flush=True)
         if r.returncode or not os.path.isfile(os.path.join(staging, "zarr.json")):
             return False
@@ -104,6 +104,7 @@ def main():
         if "axis" in s:
             cmd += ["--axis", s["axis"]]
         print("==", name, "box", box, "level", source_level, flush=True)
+        prediction_seconds = None
         if score_only:
             if not os.path.isfile(os.path.join(pdir, "zarr.json")):
                 failures.append(name)
@@ -112,14 +113,19 @@ def main():
         else:
             signature = dict(identity, predict_command=cmd,
                              axis_sha256=digest(s["axis"]) if "axis" in s else None)
-            if not completed_prediction(pdir, signature) and not predict_atomic(cmd, pdir, signature):
-                failures.append(name)
-                continue
+            if not completed_prediction(pdir, signature):
+                started = time.monotonic()
+                if not predict_atomic(cmd, pdir, signature):
+                    failures.append(name)
+                    continue
+                prediction_seconds = time.monotonic() - started
         t = s["targets"]["recto"]
         lroot, lgroup = (t["root"], t["group"]) if isinstance(t, dict) and "group" in t else (s["root"], t)
         ev = [B, "eval", pdir, ".", lroot, lgroup, "--um", str(s["um"]), "--level", source_level, "--tol", "2",
               "--pred-origin", ",".join(str(v) for v in h[:3]), "--thr", thresholds]
+        started = time.monotonic()
         r = subprocess.run(ev, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, text=True)
+        evaluation_seconds = time.monotonic() - started
         print(r.stdout, flush=True)
         rows = []
         for line in r.stdout.splitlines():
@@ -137,7 +143,8 @@ def main():
             print("ERROR: incomplete evaluation", flush=True)
         else:
             scores[name] = dict(level=int(source_level), rows=rows, peak=max(rows, key=lambda row: row["f1"]),
-                                peak_band=max(rows, key=lambda row: row["band_f1"]))
+                                peak_band=max(rows, key=lambda row: row["band_f1"]), prediction_seconds=prediction_seconds,
+                                evaluation_seconds=evaluation_seconds, output_voxels=math.prod(v >> int(source_level) for v in h[3:]))
     if failures:
         raise SystemExit("Failed held-out boxes: " + ", ".join(failures))
     if not scores:

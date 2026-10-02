@@ -143,6 +143,23 @@ static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
     if (cache[l] == 0) {   /* 0 unknown, 1 no, 2 yes */
         int ok = source_ct(s, l) != nullptr;
         if (ok) {
+            const z3_meta *m = z3_meta_of(source_ct(s, l));
+            const int P = sp->cfg.P; int64_t span = (int64_t)P << l;
+            for (int d = 0; d < 3; d++) if (m->shape[d] < P) ok = 0;
+            if (region_ch >= 0) {
+                regions *r = s->reg[region_ch]; int fits = 0;
+                for (int i = 0; i < r->n; i++) if ((r->rsize ? r->rsize[i] : r->size) >= span) fits = 1;
+                if (!fits) ok = 0;
+            }
+            if (sp->cfg.holdout) {
+                for (int d = 0; d < 3; d++) if (s->hold_n[d] < span) ok = 0;
+            } else if (region_ch < 0 && s->hold_n[0]) {
+                int outside = 0;
+                for (int d = 0; d < 3; d++) if (s->hold_o[d] >= span || (m->shape[d] << l) - s->hold_o[d] - s->hold_n[d] >= span) outside = 1;
+                if (!outside) ok = 0;
+            }
+        }
+        if (ok) {
             int any = 0;
             for (int c = 0; c < NCH; c++) {
                 if (c == region_ch) { any = 1; continue; }
@@ -640,6 +657,17 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF");
     sp->lvl_ok = calloc((size_t)S->n, sizeof *sp->lvl_ok);
     sources_open_all(S, 32);   /* every (source, level, channel) store opened up front in parallel: lazily they serialise on one lock (254 opens, 17 s) */
+    sp->cum = malloc((size_t)S->n * sizeof(double));
+    double acc = 0;
+    for (int i = 0; i < S->n; i++) {
+        source *s = &S->src[i]; int region_ch = -1, eligible = 0;
+        for (int c = 0; c < NCH; c++) if (s->reg[c] && s->reg[c]->n) region_ch = c;
+        for (int l = s->min_level < 0 ? 0 : s->min_level; l < MAXLEV; l++) if (sp->cfg.level_p[l] > 0 && (region_ch < 0 || l <= 1) && level_ok(sp, s, i, l, region_ch)) eligible = 1;
+        if (!isfinite(s->weight) || s->weight < 0) { fprintf(stderr, "sampler: invalid source weight: %s\n", s->name); free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
+        if (!eligible && s->weight > 0) fprintf(stderr, "sampler: %s excluded: no %s patch fits P=%d and the enabled levels\n", s->name, cfg->holdout ? "validation" : "training", cfg->P);
+        acc += eligible ? s->weight : 0; sp->cum[i] = acc;
+    }
+    if (acc <= 0) { fprintf(stderr, "sampler: no eligible sources; check window, holdout boxes, regions and levels\n"); free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
     sp->nslots = cfg->nbuf;
     sp->slot_j = calloc((size_t)sp->nslots, sizeof *sp->slot_j);
     sp->slots = calloc((size_t)sp->nslots, sizeof *sp->slots);
@@ -653,9 +681,6 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         occ_index o = source_occupancy(&S->src[i]);
         sp->occ[i].idx = o.idx; sp->occ[i].n = o.n; sp->occ[i].lev = o.lev; for (int d = 0; d < 3; d++) sp->occ[i].shape[d] = o.shape[d];
     }
-    sp->cum = malloc((size_t)S->n * sizeof(double));
-    double acc = 0;
-    for (int i = 0; i < S->n; i++) { acc += S->src[i].weight; sp->cum[i] = acc; }
     sp->th = calloc((size_t)cfg->nworkers, sizeof(pthread_t));
     for (int i = 0; i < cfg->nworkers; i++) {
         warg *wa = malloc(sizeof *wa);
@@ -692,6 +717,7 @@ void sampler_release(sampler *sp, batch *b) {
 }
 
 void sampler_stop(sampler *sp) {
+    if (!sp) return;
     atomic_store(&sp->stop, 1);
     pthread_mutex_lock(&sp->mu);
     pthread_cond_broadcast(&sp->cv_free);
@@ -700,7 +726,7 @@ void sampler_stop(sampler *sp) {
     for (int i = 0; i < sp->cfg.nworkers; i++) pthread_join(sp->th[i], nullptr);
     for (int i = 0; i < sp->nslots; i++) free_batch(&sp->slots[i]);
     for (int i = 0; i < sp->S->n; i++) free(sp->occ[i].idx);
-    free(sp->occ); free(sp->slot_j); free(sp->slots); free(sp->state); free(sp->th); free(sp->cum);
+    free(sp->occ); free(sp->slot_j); free(sp->slots); free(sp->state); free(sp->th); free(sp->cum); free(sp->lvl_ok);
     free(sp);
 }
 

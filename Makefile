@@ -8,7 +8,7 @@ CUDA    ?= /usr/local/cuda
 NVFLAGS ?= -O3 -arch=sm_120 -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
 CUDALIBS = -L$(CUDA)/lib64 -lcudart
 
-SRC  = src/json.c src/store.c src/zarr3.c src/sources.c src/sample.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/unet.c src/split.c src/predict.c src/eval.c
+SRC  = src/json.c src/checkpoint.c src/store.c src/zarr3.c src/sources.c src/sample.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/unet.c src/split.c src/predict.c src/eval.c
 OBJ  = $(patsubst src/%.c,build/%.o,$(SRC)) build/surfcomp.o
 
 all: build/ufsm
@@ -49,6 +49,8 @@ build/test_muon: tests/test_muon.c build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 build/test_checkpoint: tests/test_checkpoint.c build/unet.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+build/test_infer_buffers: tests/test_infer_buffers.c build/unet.o build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 build/bench_gn: tests/bench_gn.c build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
@@ -87,14 +89,24 @@ build/test_formats: tests/test_formats.c $(OBJ) build/nn.o build/nn_fp8.o
 build/test_json: tests/test_json.c build/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
+build/test_checkpoint_runtime: tests/test_checkpoint_runtime.c build/checkpoint.o build/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
+
+build/make_pipeline_fixture: tests/make_pipeline_fixture.c build/z3w.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+
 build/test_eval: tests/test_eval.c src/eval.c $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_eval.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
 
 build:
 	mkdir -p build
 
-test: build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
+test: build/test_infer_buffers build/test_checkpoint_runtime build/make_pipeline_fixture build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
 	python3 tests/test_eval_holdouts.py
+	./build/test_checkpoint_runtime
+	./build/test_infer_buffers
+	python3 tests/test_pipeline_cli.py
+	python3 tests/test_production.py
 	./build/test_checkpoint
 	./build/test_eval
 	./build/test_sample_ops

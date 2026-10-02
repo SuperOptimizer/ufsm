@@ -1,6 +1,7 @@
 /* ufsm train: sampler -> pinned batches -> one or more GPUs (data parallel, gradients averaged through the
    host) -> UNet -> BCE+Dice -> AdamW/EMA, with held-out validation batches, CSV log and checkpoints. */
 #include "nn.h"
+#include "checkpoint.h"
 #include "sample.h"
 #include "sources.h"
 #include "split.h"
@@ -153,6 +154,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
+                        "       [--schedule-start STEP]   restart the LR schedule at this saved step, preserving optimizer state\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  --split z --gpus 0,1: every window is split along z across the two GPUs instead (batch B; P a multiple of 2^nlev).\n"
                         "  env UFSM_PROF=1 prints per-op GPU time every log interval (category 'upload+loss+opt').\n");
@@ -180,12 +182,14 @@ int cmd_train(int argc, char **argv) {
     int use_muon = !strcmp(optname, "muon"), use_anvil = !strcmp(optname, "anvil");
     float anvil_lr = (float)atof(opt(argc, argv, "--anvil-lr", "0.023")), anvil_wd = (float)atof(opt(argc, argv, "--anvil-wd", "2.25"));
     const char *sched = opt(argc, argv, "--sched", "cos");   /* cos | wsd (warmup, constant, linear cooldown over the last --cooldown fraction; extendable runs) */
+    int schedule_start = atoi(opt(argc, argv, "--schedule-start", "0"));
+    if (schedule_start < 0 || schedule_start >= steps) { fprintf(stderr, "schedule-start must precede the final step\n"); return 2; }
     float cooldown = (float)atof(opt(argc, argv, "--cooldown", "0.2"));
     int qat = atoi(opt(argc, argv, "--qat", "0"));
     /* Save the requested policy and the compute paths observed after dispatch, alongside storage modes. */
 #define WRITE_MANIFEST(path) do { \
     char mf_[8192]; size_t mn_ = (size_t)nn_prec_manifest(mf_, sizeof mf_); \
-    int add_ = snprintf(mf_ + mn_, sizeof mf_ - mn_, " act_mx4 %d act_mx8 %d grad_mx8 %d f16 %d opt %s\n", ufsm_env_on("UFSM_ACT_MX4"), ufsm_env_on("UFSM_ACT_MX8"), unet_grad_mx8(), f16, optname); \
+    int add_ = snprintf(mf_ + mn_, sizeof mf_ - mn_, " act_mx4 %d act_mx8 %d grad_mx8 %d f16 %d opt %s\n", unet_act_mx4(), unet_act_mx() && !unet_act_mx4(), unet_grad_mx8(), nn_get_f16(), optname); \
     mn_ += add_ > 0 && (size_t)add_ < sizeof mf_ - mn_ ? (size_t)add_ : sizeof mf_ - mn_ - 1; \
     nn_exec_manifest(mf_ + mn_, sizeof mf_ - mn_); \
     FILE *mff_ = fopen(path, "w"); if (mff_) { fputs(mf_, mff_); fputc('\n', mff_); fclose(mff_); } \
@@ -220,7 +224,7 @@ int cmd_train(int argc, char **argv) {
     g_g16 = nn_get_tf32() && nn_get_act_bf16() && nn_get_grad_bf16();
     if (ufsm_env_on("UFSM_X32")) g_xfmt = g_g16 = 0;   /* diagnostic: fp32 batches and logit gradient, converted on the device (the old path) */
     nn_set_loss_grad_h16(g_g16);
-    unet_cfg cfg = {4, {16, 32, 64, 80}, 4, NCH, 8};
+    unet_cfg cfg = {4, {16, 32, 64, 80}, 4, NCH, 8, 0};
     cfg.down_norm = atoi(opt(argc, argv, "--down-norm", "0"));
     if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) cfg.down_norm = pc.down_norm; }   /* the checkpoint decides */
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,80")); cfg.nlev = 0; for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
@@ -271,6 +275,7 @@ int cmd_train(int argc, char **argv) {
     int lean = getenv("UFSM_LEAN") ? atoi(getenv("UFSM_LEAN")) : 0;   /* lean: one device batch buffer (no upload overlap), the logit
                                                                      gradient in the model's gradient buffer, logits in A */
     if (resume) fprintf(stderr, "resumed %s at step %d\n", resume, step0);
+    if (schedule_start > step0) { fprintf(stderr, "schedule-start cannot follow the resumed step\n"); return 2; }
     {   /* --mem auto (default): the cheapest storage mode whose training buffers fit next to what is already allocated on every
            GPU; an explicit UFSM_CHUNK_UP / UFSM_RECOMPUTE / UFSM_GRAD_MX8 or --mem default keeps the env / built-in modes */
         const char *mm = opt(argc, argv, "--mem", "auto");   /* MX-fp8 gradients passed their stair (3 seeds, mean 0.293 vs 0.294) */
@@ -353,6 +358,14 @@ int cmd_train(int argc, char **argv) {
     }
     nn_init(G[0].dev);
     size_t np = unet_nparams(G[0].u);
+    checkpoint_runtime runtime = {.version = 1, .train_window = P, .prec = nn_get_prec(), .f16 = nn_get_f16(),
+        .act_mx4 = unet_act_mx4(), .act_mx8 = unet_act_mx() && !unet_act_mx4(), .grad_mx8 = unet_grad_mx8()};
+    const char *saved_policy = opt(argc, argv, "--policy", "");
+    if (!*saved_policy) saved_policy = fp4 >= 2 ? "all=fp4:fp4:fp4,enc0.c1=fp16" : fp4 ? "all=fp4:fp4:fp8,enc0.c1=fp16" : "";
+    if (strlen(saved_policy) >= sizeof runtime.policy || strlen(optname) >= sizeof runtime.optimizer) { fprintf(stderr, "checkpoint settings too long\n"); return 2; }
+    strcpy(runtime.policy, saved_policy); strcpy(runtime.optimizer, optname);
+    char checkpoint_extra[8192];
+    if (checkpoint_runtime_json(&runtime, checkpoint_extra, sizeof checkpoint_extra)) { fprintf(stderr, "invalid checkpoint settings\n"); return 2; }
     fprintf(stderr, "model widths"); for (int i = 0; i < cfg.nlev; i++) fprintf(stderr, " %d", cfg.widths[i]);
     fprintf(stderr, ": %zu params; P=%d B=%d x %d GPU(s) [", np, P, B, ng); for (int g = 0; g < ng; g++) fprintf(stderr, "%s%d", g ? "," : "", devs[g]); fprintf(stderr, "] %s%s\n", nn_get_tf32() ? "tensor cores (see precision.txt for compute and storage)" : "fp32", split ? ", each window split along z" : "");
     split_ctx *sctx = split ? split_create(devs[0], devs[1]) : nullptr;
@@ -363,6 +376,7 @@ int cmd_train(int argc, char **argv) {
     sample_cfg vc = sc; vc.seed = seed + 777; vc.augment = 0; vc.nworkers = 4; vc.nbuf = 2; vc.holdout = 1;
     { int any = 0; for (int i = 0; i < S->n; i++) any |= S->src[i].hold_n[0] > 0; if (!any) { vc.holdout = 0; fprintf(stderr, "no holdout boxes in the sources: validation batches come from the training distribution\n"); } }
     sampler *vs = sampler_start(S, &vc);
+    if (!vs) { fprintf(stderr, "cannot construct validation sampler\n"); return 1; }
     batch *val = calloc((size_t)nval, sizeof *val);
     for (int i = 0; i < nval; i++) {
         batch *b = sampler_next(vs);
@@ -378,6 +392,7 @@ int cmd_train(int argc, char **argv) {
     fprintf(stderr, "%d validation batches\n", nval);
 
     sampler *sp = sampler_start(S, &sc);
+    if (!sp) return 1;
     char logp[1400]; snprintf(logp, sizeof logp, "%s/log.csv", out);
     FILE *log = fopen(logp, step0 ? "a" : "w");
     if (log) {
@@ -509,9 +524,12 @@ int cmd_train(int argc, char **argv) {
                 lr = elapsed < cd0 ? lr0 : lr0 * (float)((seconds - elapsed) / (seconds - cd0));
             } else lr = lr0 * 0.5f * (1.f + cosf(3.14159265f * (float)((elapsed - warmup_seconds) / (seconds - warmup_seconds))));
         }
-        else if (step <= warmup) lr = lr0 * (float)step / warmup;
-        else if (!strcmp(sched, "wsd")) { int cd0 = (int)(steps * (1.f - cooldown)); lr = step < cd0 ? lr0 : lr0 * (float)(steps - step) / (float)(steps - cd0); }
-        else lr = lr0 * 0.5f * (1.f + cosf(3.14159265f * (float)(step - warmup) / (float)(steps - warmup)));
+        else {
+            int ss = step - schedule_start, total = steps - schedule_start;
+            if (ss <= warmup) lr = lr0 * (float)ss / warmup;
+            else if (!strcmp(sched, "wsd")) { int cd0 = (int)(total * (1.f - cooldown)); lr = ss < cd0 ? lr0 : lr0 * (float)(total - ss) / (float)(total - cd0); }
+            else lr = lr0 * 0.5f * (1.f + cosf(3.14159265f * (float)(ss - warmup) / (float)(total - warmup)));
+        }
         if (soft_end != sc.soft) sampler_set_soft(sp, sc.soft + (soft_end - sc.soft) * (step < steps ? (float)step / (float)steps : 1.f));
         double gn = 0;
         for (int g = 0; g < ng; g++) {
@@ -567,7 +585,7 @@ int cmd_train(int argc, char **argv) {
                 nn_init(G[0].dev);
                 if (nval) { vl /= nval; vb /= nval; vd /= nval; }
                 snprintf(vstr, sizeof vstr, "%.5f,%.5f,%.5f", vl, vb, vd);
-                if (nval && vl < best_val) { best_val = vl; char bp[1400]; snprintf(bp, sizeof bp, "%s/best.ckpt", out); if (unet_save(G[0].u, bp, step, nullptr)) { fprintf(stderr, "cannot save %s\n", bp); return 1; } }
+                if (nval && vl < best_val) { best_val = vl; char bp[1400]; snprintf(bp, sizeof bp, "%s/best.ckpt", out); if (unet_save(G[0].u, bp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", bp); return 1; } }
             }
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f gn %.2f %s %.2f samp/s (wait %.0f%%)%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, acc_g / nacc,
                     vl >= 0 ? "val" : "", (double)nacc * B * nl / dt, 100 * wait / dt, vl >= 0 ? vstr : "");
@@ -578,7 +596,7 @@ int cmd_train(int argc, char **argv) {
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);
             char cp[1400]; snprintf(cp, sizeof cp, "%s/last.ckpt", out);
-            if (unet_save(G[0].u, cp, step, nullptr)) { fprintf(stderr, "cannot save %s\n", cp); return 1; }
+            if (unet_save(G[0].u, cp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", cp); return 1; }
         }
         if (step == step0 + 1 || step == steps || g_stop) {
             char mp[1400], em[4096]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp);
