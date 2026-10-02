@@ -53,6 +53,12 @@ candidate to about 71 Mvox/s at 512. The recipe's wider finest gradient buffer b
 MANBp inference gains about 12% with matched FP4; its decoded output is identical across the tested
 1024-cubed box. Nearby 496/528 shapes previously had comparable per-voxel speed; no production
 precision choice is final.
+The large MX4-input/MX8-gradient weight-gradient path now uses deeper persistent tiles, retaining
+the existing depth for other layouts. A frozen four-run comparison gives 74.5–74.9 Mvox/s versus
+72.5–74.0 controls (2.0% by paired-run means), with unchanged 14785 MiB observed device use.
+Clocks and temperatures drift across the sweep; even the slower candidate exceeds the faster
+control by 0.7%. The arithmetic, rounding keys and compiled GPU kernels are unchanged;
+FP32 reduction grouping differs. `UFSM_F4W_ZC=12` retains the old depth for comparisons.
 Pure forward inference at 528 cubed takes 0.424–0.429 s on one RTX 5060 Ti 16 GB:
 343–347 million window voxels/s, or 313–317 million useful voxels/s after the halo-8 crop to 512.
 This restores the actual checkpoint and measures warm whole-network forwards on real device input;

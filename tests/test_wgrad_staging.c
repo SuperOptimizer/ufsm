@@ -85,6 +85,14 @@ int main(int argc,char **argv) {
         run(16,16,6,1,0,0,1,12345,3);
         run(48,16,6,1,1,1,1,12345,3);
         input_bits = 4;
+        /* Exercise automatic deeper row-pair tiles (nzt >= 64), including the
+           finest decoder's normalized upsampled input and both rounding modes. */
+        for (int sr = 0; sr < 2; sr++) {
+            run(16,16,128,0,0,0,1,sr ? 12345 : 0,1);
+            run(48,16,128,0,1,1,1,sr ? 12345 : 0,1);
+        }
+        run(64,64,128,0,0,0,1,12345,1);
+        run(48,16,128,1,1,1,1,12345,1);   /* two batches and partial edge tiles */
         int scales[] = {1,9,10,127,235};
         /* One spatial tile isolates operand arithmetic: multi-block FP32 atomics flush
            subnormal terms differently with different reduction orders, even on repeat. */

@@ -3897,7 +3897,11 @@ template <typename T, typename TG> static void bwd_w_f4_t(const void *x, shape5 
     if (IS_MX(T)) smem += 32 + (size_t)8 * NT * (sizeof(chan_t) + (lay ? 240 * 2 : 0)) + (lay == 1 ? (size_t)8 * NT * (40 + 9) + 16 : 0);   /* channel table + bf16 decoded plane (+ LY 1 row amax, pair scales) */
     if (f4w_coop() && ys.c <= 16 && IS_MX(T) && IS_MX8(TG) && (lay == 1 || lay == 2)) smem += (size_t)max(0, 16 * MT * 256 - 8 * NT * 240) * 2;
     int nzt = nblk_(ys.d, 2), base = (int)(((xs.c + 8 * NT - 1) / (8 * NT)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * nblk_(ys.w, 16) * nblk_(ys.h, 8) * ys.n);
-    int ZC = nzt < 12 ? nzt : 12;
+    /* Row-pair MX4/MX8 operands use global-element rounding keys. A deeper
+       persistent tile amortizes halo setup and atomics on large volumes without
+       enlarging per-block storage. Other layouts retain their existing depth. */
+    const int max_zc = !had && lay == 1 && IS_MX4(T) && IS_MX8(TG) && nzt >= 64 ? 96 : 12;
+    int ZC = nzt < max_zc ? nzt : max_zc;
     while (ZC > 1 && (size_t)base * nblk_(nzt, ZC) < 72) ZC--;
     if (zc_env > 0) ZC = zc_env;
     int nzc = (nzt + ZC - 1) / ZC;

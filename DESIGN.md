@@ -76,9 +76,33 @@ whole-training sweep at 512 and `--mem wide` gives 73.954 / 74.759 / 74.491 / 74
 GPU temperature rises from 47–72 C in the initial control to 84 C, and active mean SM clock falls
 from 2868 to 2780 MHz. The hot depth-48 run and final depth-12 control have essentially equal
 clocks, with 2.4% greater whole-step throughput; hot depth-96 is about 3.0% faster at a slightly
-higher clock. These support a small tuning opportunity, not another 2x gain. A guarded automatic
-choice still needs direct qualification; the default remains depth 12
+higher clock. These support a small tuning opportunity, not another 2x gain
 (`wgrad-depth-quiet-train-bench.json`).
+
+The guarded automatic choice is now integrated: depth up to 96 only for non-Hadamard row-pair
+MX4 inputs with MX8 activation gradients and at least 64 two-plane z tiles; smaller volumes and
+other layouts retain depth up to 12. The existing 72-block occupancy floor and explicit
+`UFSM_F4W_ZC` override remain. Four complete 40-update controls without a depth override give
+73.954 / 74.893 / 74.491 / 72.478 Mvox/s for reference / candidate / candidate / reference,
+at identical 14785 MiB peak use and identical executed precision manifests. Candidate/control
+mean throughput improves 2.0%; the slower candidate still exceeds the faster control by 0.7%.
+The frozen comparison records device clocks and temperature; these are bounded whole-step
+measurements, not steady full-run promises (`wgrad-depth-guarded-summary.json`).
+Twenty gradient comparisons cover 128/512 shapes, normalized inputs, decoder upsampling and
+three rounding seeds/modes. Relative changes remain <=2.6e-7, with worst element error <=5.1e-6
+of the largest reference gradient. Ten seed comparisons still vary by at least 16.5%. The CUDA
+fatbin is byte-identical: only the host's launch depth changes, altering FP32 reduction grouping.
+The regular staging test now exercises the larger automatic-depth geometry as well as its
+existing boundary, precision and underflow cases. Nine additional batched edge/upsampling comparisons
+at 128x130x132 match depth-12 gradients exactly in RN and two SR seeds. A real bounded recipe trial
+completes 43 warmup updates at 128/B4 and resumes to step 45 at 512/B1 across the full source
+configuration; embedded settings and executed manifests preserve the same stem/body/gradient
+precision. Its five-second budget applies to each stage; it is not the long production run.
+Two native 1024-cubed serving replays at 528/halo8 preserve every prediction-store byte and metadata
+entry. The integrated executable is byte-identical to the qualified candidate; all 37 Make commands
+pass on it (`wgrad-depth-guarded-inputs/numerics.json`,
+`wgrad-depth-guarded-inputs/batched-numerics.json`, `depth-pipeline-trial/run.json`,
+`wgrad-depth-integrated-serving.json`, `wgrad-depth-guarded-final-regressions.json`).
 
 A frozen stored-GN/wide-gradient checkpoint has completed 24 native prediction/score cases
 (`tile-contract-audit.json`): three serving precisions on two calibration scans, followed by
