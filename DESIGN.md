@@ -133,6 +133,14 @@ materialized-up / skip-GN decoder is 237.9 versus 193.4 ms, and 16-to-16 is 86.5
 32-to-32 at 256 is 35.9 versus 33.2 ms. Gradient relative differences are 3.1–8.6%, as expected
 from changing precision; no accuracy acceptance is inferred (`wgrad-f4-vs-f8-512.log`).
 The validated FP4 weight-gradient path remains the throughput candidate.
+The post-fusion nearby-window sweep (`gn-fused-window-sweep.json`) gives 71.2–71.9 Mvox/s
+at 512 (12750 MiB), 70.8 at 496 (13602 MiB), 70.2 at 528 (13968 MiB), and 64.1 at 544
+(13024 MiB, recompute 2). These are short single-GPU diagnostics, with 512 bracketing the
+other shapes; 512 remains the training candidate on speed and headroom. A profile using the
+actual lean-training input layout (materialized up segment, skip GN) measures 39.8% SM,
+14.3% DRAM, 34.9% L1/TEX, 96 registers and 37.3% occupancy, with 21.2% long-scoreboard
+and 8.1% short-scoreboard stalls (`wgrad-materialized-profile-summary.json`). The earlier
+cooperative profile above used fused-up staging. Both are isolated probes.
 
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is
