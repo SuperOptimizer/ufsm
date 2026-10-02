@@ -89,6 +89,10 @@ void nn_conv3d_fwd_fp8(const float *x, shape5 xs, const float *w, const float *b
 void nn_conv3d_fwd_fp4(const float *x, shape5 xs, const float *w, const float *b, int cout, float *y);
 void nn_conv3d_bwd_weight_fp8(const float *x, shape5 xs, const float *gy, shape5 ys, float *gw, float *gb);
 int nn_get_tf32(void);
+/* 1: convolution-output GN statistics describe the rounded stored tensor.
+   0: preserve the historical unrounded epilogue statistics for old checkpoints. */
+void nn_set_gn_stored(int on);
+int nn_get_gn_stored(void);
 /* Activation storage. With act-bf16 on (default; env UFSM_ACTF32=1 or nn_set_act_bf16(0) turns it off) and tensor
    cores on, the activation operands of the ops below (conv/up inputs x, conv/up/gn-apply outputs y, the x of the
    gn backward ops) are bf16 arrays behind the float* type: half the bytes. Gradients, GroupNorm statistics,
@@ -147,7 +151,8 @@ int nn_conv3d_fwd_gn(const float *x, shape5 xs, int G, const float *gamma, const
 int nn_conv3d_bwd_weight_gn(const float *x, shape5 xs, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                             const float *gy, shape5 ys, float *gw, float *gb);
 void nn_silu_bwd_gn(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy, float *gx);
-/* Conv whose epilogue also yields the GroupNorm statistics of its output (G_in > 0 applies gn+silu to the input). */
+/* Conv with output GN statistics under nn_set_gn_stored's contract (G_in > 0 transforms the input).
+   G_out > 0 with null mean/rstd replays the normalization-input store, including FP16 clamping, without reducing statistics. */
 int nn_conv3d_fwd_gn_stats(const float *x, shape5 xs, int G_in, const float *gamma, const float *beta, const float *mean, const float *rstd,
                            const float *w, const float *b, int cout, float *y, int G_out, float eps, float *omean, float *orstd);
 /* Input-side recompute. The conv input is silu(gn(x)) formed while staging from a stored pre-norm x (gx: GroupNorm
@@ -171,7 +176,7 @@ void nn_gn_silu_apply(const float *x, shape5 s, int G, const float *gamma, const
 void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy,
                     float *gx, float *ggamma, float *gbeta, float *scratch);
 /* GroupNorm forward fused with SiLU (y = silu(gn(x))), and recompute of both g = gn(x) and silu(g). */
-int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *mean, float *rstd);   /* stats of an activation-storage tensor; -1 for MX */
+int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *mean, float *rstd);   /* stats of the stored fp32, 16-bit or MX tensor; -1 for unsupported groups */
 void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd);
 void nn_gn_apply_silu(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *g, float *sil);
 /* Recompute y = gn(x) from saved mean/rstd (no statistics pass). */

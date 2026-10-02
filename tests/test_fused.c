@@ -7,11 +7,11 @@
 static float *up(size_t n, float lo, float hi) { float *h = malloc(n * 4); for (size_t i = 0; i < n; i++) h[i] = lo + (hi - lo) * (float)rand() / RAND_MAX; float *d = nn_malloc(n * 4); nn_h2d(d, h, n * 4); free(h); return d; }
 static double reldiff(const float *a, const float *b, size_t n) {   /* max |a-b| / max |b| */
     float *ha = malloc(n * 4), *hb = malloc(n * 4); nn_d2h(ha, a, n * 4); nn_d2h(hb, b, n * 4);
-    double m = 0, mx = 0; for (size_t i = 0; i < n; i++) { double d = fabs(ha[i] - hb[i]); if (d > m) m = d; if (fabs(hb[i]) > mx) mx = fabs(hb[i]); }
+    double m = 0, mx = 0; for (size_t i = 0; i < n; i++) { if (!isfinite(ha[i]) || !isfinite(hb[i])) { m = INFINITY; break; } double d = fabs(ha[i] - hb[i]); if (d > m) m = d; if (fabs(hb[i]) > mx) mx = fabs(hb[i]); }
     free(ha); free(hb); return mx > 0 ? m / mx : m;
 }
 static int fails = 0;
-static void check(const char *name, double r, double tol) { printf("  %-44s rel err %.3g %s\n", name, r, r <= tol ? "" : "FAIL"); if (r > tol) fails++; }
+static void check(const char *name, double r, double tol) { int ok = isfinite(r) && r <= tol; printf("  %-44s rel err %.3g %s\n", name, r, ok ? "" : "FAIL"); if (!ok) fails++; }
 static void run(int C, int P, int Co, int split) {
     int G = 8;
     shape5 xs = {2, C, P, P, P}, ys = xs; ys.c = Co;

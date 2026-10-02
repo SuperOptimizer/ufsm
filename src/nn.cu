@@ -11,6 +11,9 @@
 using namespace nvcuda;
 
 static int g_tf32 = 1;   /* 1 = tensor-core implicit GEMM for 3^3 convs, 0 = exact fp32 CUDA-core kernels */
+static int g_gn_stored = 0;   /* C API compatibility; fresh training explicitly selects the stored-tensor contract */
+extern "C" void nn_set_gn_stored(int on) { g_gn_stored = on != 0; }
+extern "C" int nn_get_gn_stored(void) { return g_gn_stored; }
 extern "C" void nn_set_f16(int on);
 static int g_prec = 1, g_pref = 1;   /* precision of the tensor-core path: 1 bf16, 2 fp8 (e4m3, MX block scales), 3 fp4 forward/backward-data + fp8 weight gradient (src/nn_fp8.cu) */
 extern "C" void nn_set_tf32(int on) { g_tf32 = on; g_prec = on ? g_pref : 0; }
@@ -833,7 +836,7 @@ __global__ void __launch_bounds__(fw_nth_z(MT, FZ), fw_blocks_z(MT, FZ)) conv_fw
                 for (int q = 0; q < 2; q++) {
                     int ox = ox0 + q * 8 + 2 * t;
                     float v0 = acc[m][r][q][2 * h] + bias, v1 = acc[m][r][q][2 * h + 1] + bias;
-                    if (osum && is_f16<TO>::v) {   /* activation feeding a GroupNorm, stored as fp16: saturate instead of inf (the statistics use the stored value) */
+                    if (Go > 0 && is_f16<TO>::v) {   /* also clamp normalization inputs during replay without statistics */
                         v0 = sat_h16(v0); v1 = sat_h16(v1);
                     }
                     if (!S2B && !(W & 1) && ox + 1 < W) { stv2(yp, (size_t)ox, v0, v1); if (zst) { ps += v0 + v1; pss += v0 * v0 + v1 * v1; } continue; }   /* paired store */
@@ -1240,6 +1243,8 @@ static int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const 
                                             prec-3 policy runs the fp4 kernel, else fp8 compute (copy staging) */
         const int mdt = MXDT(x);
         if (!mdt && ISMX(y) && xbf && xs.c <= 8 && !sp.x2 && !sp.y2 && !sp.accum) return lp_conv_fwd_f8(x, LPDT(xbf), xs, w, b, cout, y, MXDT(y), gp, osum, Go, sp);   /* 16-bit network input -> MX a1 */
+        if (mdt && ISMX(y) && mdt != MXDT(y) && xs.c <= 8 && !sp.x2 && !sp.y2 && !sp.up && !sp.accum)
+            return lp_conv_fwd_f8(x, mdt, xs, w, b, cout, y, MXDT(y), gp, osum, Go, sp);   /* independently quantized stem input */
         if (mdt == 4 && !ISMX(y) && !sp.y2 && !ybf) { sp.wkey = conv_wkey(); return lp_conv_fwd_f4(x, 4, xs, w, b, cout, y, 0, gp, osum, Go, sp); }   /* mx4 in, fp32 out (tests) */
         if (!mdt || MXDT(y) != mdt || (sp.x2 && MXDT(sp.x2) != mdt) || (sp.y2 && MXDT(sp.y2) != mdt)) { fprintf(stderr, "conv: MX storage needs MX inputs and outputs of one format\n"); abort(); }
         sp.wkey = conv_wkey();
@@ -1951,12 +1956,16 @@ extern "C" int nn_conv3d_fwd_gn_stats(const float *x, shape5 xs, int G_in, const
     if (!g_tf32) return -1;
     gnp_t gp = {gamma, beta, mean, rstd, G_in};
     int NG = xs.n * G_out;
-    double *sums = gn_dsums((size_t)2 * NG);
-    cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double));
+    double *sums = nullptr;
+    if (!g_gn_stored && G_out && omean && orstd) { sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
     split_t ns = zs_split(split_t{}, xs.d);
     conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, ns);
-    zs_reduce(sums, 2 * NG);
-    gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zs_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd);
+    KCHECK();
+    if (G_out && omean && orstd) {
+        if (g_gn_stored) { shape5 ys = xs; ys.c = cout; return nn_gn_stats(y, ys, G_out, eps, omean, orstd); }
+        zs_reduce(sums, 2 * NG);
+        gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zs_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd);
+    }
     KCHECK();
     return 0;
 }
@@ -1970,9 +1979,13 @@ extern "C" int nn_conv3d_fwd_split(const float *x, const float *x2, int c_split,
     split_t sp = {x2, c_split, nullptr, 0};
     sp = zs_split(sp, xs.d);
     double *sums = nullptr;
-    if (G_out) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
+    if (!g_gn_stored && G_out && omean && orstd) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
     conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, sp);
-    if (G_out) { zs_reduce(sums, 2 * xs.n * G_out); gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, zs_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd); }
+    KCHECK();
+    if (G_out && omean && orstd) {
+        if (g_gn_stored) { shape5 ys = xs; ys.c = cout; return nn_gn_stats(y, ys, G_out, eps, omean, orstd); }
+        zs_reduce(sums, 2 * xs.n * G_out); gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, zs_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd);
+    }
     KCHECK();
     return 0;
 }
@@ -2088,9 +2101,16 @@ extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x
         if (up && !up_kernel_ok(x, x2, 0)) return -1;
         if (up && gx && gx->G && !ISMX(x)) return -1;   /* GN+SiLU of the coarse x inside the up staging: MX kernels only */
         double *sums = nullptr;
-        if (G_out) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); sp = zs_split(sp, ys.d); }
+        if (G_out) {
+            sp = zs_split(sp, ys.d);
+            if (!g_gn_stored && omean && orstd) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
+        }
         conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, sp);
-        if (G_out) { zs_reduce(sums, 2 * xs.n * G_out); gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, zs_len((size_t)(cout / G_out) * shape_spatial(ys), ys.d), eps, omean, orstd); }
+        KCHECK();
+        if (G_out && omean && orstd) {
+            if (g_gn_stored) return nn_gn_stats(y, ys, G_out, eps, omean, orstd);
+            zs_reduce(sums, 2 * xs.n * G_out); gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, zs_len((size_t)(cout / G_out) * shape_spatial(ys), ys.d), eps, omean, orstd);
+        }
         KCHECK();
         return 0;
     }

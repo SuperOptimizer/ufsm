@@ -1,6 +1,7 @@
 """Exercise the real trainer's resume branch and portable prediction settings on local data."""
 import hashlib
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -10,8 +11,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 BIN = ROOT / "build/ufsm"
 
 
-def run(*args, ok=0):
-    r = subprocess.run([str(BIN), *map(str, args)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+def run(*args, ok=0, extra_env=None):
+    env = dict(os.environ)
+    env.update(extra_env or {})
+    r = subprocess.run([str(BIN), *map(str, args)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60, env=env)
     assert r.returncode == ok, r.stdout
     return r.stdout
 
@@ -29,14 +32,21 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     cfg.write_text(json.dumps({"sources": [{"name": "fixture", "root": str(t), "ct": "ct", "um": 1,
                                           "targets": {"recto": "labels"}, "holdout": [96, 96, 96, 32, 32, 32]}]}))
     opts = ["--P", "16", "--B", "1", "--levels", "1", "--gpus", "0", "--workers", "1", "--val-batches", "1",
-            "--log-every", "1", "--val-every", "1", "--ckpt-every", "1", "--fp4", "2", "--down-norm", "1"]
-    run("train", cfg, "--out", t / "first", "--steps", "2", "--warmup", "0", *opts)
+            "--log-every", "1", "--val-every", "1", "--ckpt-every", "1", "--fp4", "2", "--down-norm", "1", "--input-prec", "8"]
+    train_env = {"UFSM_GRAD_MX8": "1"}
+    run("train", cfg, "--out", t / "first", "--steps", "2", "--warmup", "0", *opts, extra_env=train_env)
     old, wp = weights(t / "first/last.ckpt")
     assert old["extra"]["runtime"]["act_mx4"] == 1
     assert old["extra"]["runtime"]["f16"] == 1
-    run("train", cfg, "--out", t / "resume", "--resume", t / "first/last.ckpt", "--steps", "3", "--lr", "0", *opts)
+    assert old['extra']['runtime']['input_prec'] == 8
+    assert old['extra']['runtime']['grad_mx8'] == 1
+    assert old['extra']['runtime']['gn_stored'] == 1
+    assert "input_prec 8" in (t / "first/precision.txt").read_text()
+    run("train", cfg, "--out", t / "resume", "--resume", t / "first/last.ckpt", "--steps", "3", "--lr", "0", *opts[:-2], extra_env=train_env)
     new, wr = weights(t / "resume/last.ckpt")
     assert new["step"] == 3 and wp == wr, "normal resume reinitialized or changed zero-LR weights"
+    assert new['extra']['runtime']['gn_stored'] == 1
+    assert new['extra']['runtime']['input_prec'] == 8
     assert (t / "resume/log.csv").read_text().startswith("step,"), "resumed CSV has no header"
     # Only the model file is moved; prediction must not depend on precision.txt.
     shutil.copyfile(t / "first/last.ckpt", t / "moved.ckpt")
@@ -44,10 +54,20 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     geometry = ["--um", "1", "--window", "24", "--halo", "4", "--shard", "128", "--levels", "1", "--box", "0,0,0,16,16,16"]
     out = run(*pred, t / "default", *geometry)
     assert "embedded checkpoint, prec=1 f16=1 act_mx4=1" in out, out
-    run(*pred, t / "explicit", *geometry, "--prec", "1", "--f16", "1", "--fp4", "1", "--policy", "all=fp4:fp4:fp4,enc0.c1=fp16")
+    run(*pred, t / "explicit", *geometry, "--prec", "1", "--f16", "1", "--fp4", "1", "--input-prec", "8", "--gn-stats", "stored", "--policy", "all=fp4:fp4:fp4,enc0.c1=fp16")
     def chunks(path):
         return {p.relative_to(path): hashlib.sha256(p.read_bytes()).hexdigest() for p in path.rglob("*") if p.is_file() and p.name != "zarr.json"}
     assert chunks(t / "default") == chunks(t / "explicit"), "embedded and explicit precisions differ"
+    # Version-1 models without a normalization field keep the historical graph.
+    header, payload = (t / 'moved.ckpt').read_bytes().split(b'\n', 1)
+    legacy = json.loads(header[4:]); del legacy['extra']['runtime']['gn_stored']
+    (t / 'legacy.ckpt').write_bytes(b'UFSM' + json.dumps(legacy, separators=(',', ':')).encode() + b'\n' + payload)
+    msg = run('predict', t / 'legacy.ckpt', t, 'ct', t / 'legacy-default', *geometry)
+    assert 'gn_stats=legacy' in msg
+    run('predict', t / 'legacy.ckpt', t, 'ct', t / 'legacy-explicit', *geometry, '--gn-stats', 'legacy')
+    assert chunks(t / 'legacy-default') == chunks(t / 'legacy-explicit')
+    run('train', cfg, '--out', t / 'legacy-resume', '--resume', t / 'legacy.ckpt', '--steps', '3', '--lr', '0', *opts[:-2], extra_env=train_env)
+    assert weights(t / 'legacy-resume/last.ckpt')[0]['extra']['runtime']['gn_stored'] == 0
     run('eval', t / 'default', '.', t / 'labels', '.', '--um', '1', '--level', '0', '--thr', '0.333,0.6',
         '--seam-core', '8', '--seam-band', '2', '--scores', t / 'regions.json')
     regions = json.loads((t / 'regions.json').read_text())['thresholds']
@@ -55,7 +75,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     for row in regions:
         for key in ('valid_voxels', 'positive_voxels', 'tp', 'fp', 'fn'):
             assert row['all'][key] == row['seam'][key] + row['interior'][key], (key, row)
-    for args in (["--window", "0"], ["--halo", "12"], ["--box", "bad"], ["--shard", "129"], ["--um", "nan"], ["--prec", "999"], ["--input-mx", "2"]):
+    for args in (["--window", "0"], ["--halo", "12"], ["--box", "bad"], ["--shard", "129"], ["--um", "nan"], ["--prec", "999"], ["--input-mx", "2"], ["--input-prec", "7"], ["--input-prec", "7", "--input-mx", "0"], ["--gn-stats", "invalid"]):
         # First occurrence wins, so put invalid overrides before the valid geometry.
         run(*pred, t / "invalid", *args, *geometry, ok=2)
     impossible = json.loads(cfg.read_text())

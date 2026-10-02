@@ -152,8 +152,9 @@ int cmd_train(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 512] [--B 1] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
-                        "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--sr 1]\n"
+                        "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
+                        "       [--gn-stats stored|legacy]   fresh training uses stored activations; resume preserves the saved contract\n"
                         "       [--schedule-start STEP]   restart the LR schedule at this saved step, preserving optimizer state\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  --split z --gpus 0,1: every window is split along z across the two GPUs instead (batch B; P a multiple of 2^nlev).\n"
@@ -174,8 +175,15 @@ int cmd_train(int argc, char **argv) {
     int val_every = atoi(opt(argc, argv, "--val-every", "500")), ckpt_every = atoi(opt(argc, argv, "--ckpt-every", "1000"));
     uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "0"));
     const char *resume = opt(argc, argv, "--resume", nullptr);
+    checkpoint_runtime resumed_runtime; int has_runtime = resume ? checkpoint_runtime_read(resume, &resumed_runtime) : 0;
+    if (has_runtime < 0) { fprintf(stderr, "cannot read checkpoint settings: %s\n", resume); return 1; }
+    const char *gn_stats = opt(argc, argv, "--gn-stats", resume && (!has_runtime || !resumed_runtime.gn_stored) ? "legacy" : "stored");
+    if (strcmp(gn_stats, "stored") && strcmp(gn_stats, "legacy")) { fprintf(stderr, "--gn-stats must be stored or legacy\n"); return 2; }
+    nn_set_gn_stored(!strcmp(gn_stats, "stored"));
     int f16 = atoi(opt(argc, argv, "--f16", "1"));       /* 16-bit storage/operands as fp16 (8x finer than bf16, same speed); 0 = bf16 */
     nn_set_prec(atoi(opt(argc, argv, "--prec", "1")));   /* 1 bf16, 2 fp8, 3 fp4 fwd + fp8 wgrad (2/3 force bf16 storage) */
+    if (has_runtime && resumed_runtime.input_prec) unet_set_input_prec(resumed_runtime.input_prec);
+    if (*opt(argc, argv, "--input-prec", "") && unet_set_input_prec(atoi(opt(argc, argv, "--input-prec", "0")))) { fprintf(stderr, "--input-prec must be 0, 4 or 8\n"); return 2; }
     if (f16) { nn_set_f16(1); nn_set_grad_scale((float)atof(opt(argc, argv, "--gscale", "1024"))); }
     const char *optname = opt(argc, argv, "--opt", "adamw");   /* adamw | muon (3^3 conv weights: nesterov momentum + Newton-Schulz orthogonalisation; rest AdamW) */
     float muon_lr = (float)atof(opt(argc, argv, "--muon-lr", "0.02")), muon_beta = (float)atof(opt(argc, argv, "--muon-beta", "0.95"));
@@ -189,7 +197,7 @@ int cmd_train(int argc, char **argv) {
     /* Save the requested policy and the compute paths observed after dispatch, alongside storage modes. */
 #define WRITE_MANIFEST(path) do { \
     char mf_[8192]; size_t mn_ = (size_t)nn_prec_manifest(mf_, sizeof mf_); \
-    int add_ = snprintf(mf_ + mn_, sizeof mf_ - mn_, " act_mx4 %d act_mx8 %d grad_mx8 %d f16 %d opt %s\n", unet_act_mx4(), unet_act_mx() && !unet_act_mx4(), unet_grad_mx8(), nn_get_f16(), optname); \
+    int add_ = snprintf(mf_ + mn_, sizeof mf_ - mn_, " act_mx4 %d act_mx8 %d grad_mx8 %d input_prec %d gn_stored %d f16 %d opt %s\n", unet_act_mx4(), unet_act_mx() && !unet_act_mx4(), unet_grad_mx8(), unet_input_prec(), nn_get_gn_stored(), nn_get_f16(), optname); \
     mn_ += add_ > 0 && (size_t)add_ < sizeof mf_ - mn_ ? (size_t)add_ : sizeof mf_ - mn_ - 1; \
     nn_exec_manifest(mf_ + mn_, sizeof mf_ - mn_); \
     FILE *mff_ = fopen(path, "w"); if (mff_) { fputs(mf_, mff_); fputc('\n', mff_); fclose(mff_); } \
@@ -359,7 +367,7 @@ int cmd_train(int argc, char **argv) {
     nn_init(G[0].dev);
     size_t np = unet_nparams(G[0].u);
     checkpoint_runtime runtime = {.version = 1, .train_window = P, .prec = nn_get_prec(), .f16 = nn_get_f16(),
-        .act_mx4 = unet_act_mx4(), .act_mx8 = unet_act_mx() && !unet_act_mx4(), .grad_mx8 = unet_grad_mx8(), .input_mx = unet_input_converted()};
+        .act_mx4 = unet_act_mx4(), .act_mx8 = unet_act_mx() && !unet_act_mx4(), .grad_mx8 = unet_grad_mx8(), .input_mx = unet_input_converted(), .input_prec = unet_input_prec(), .gn_stored = nn_get_gn_stored()};
     const char *saved_policy = opt(argc, argv, "--policy", "");
     if (!*saved_policy) saved_policy = fp4 >= 2 ? "all=fp4:fp4:fp4,enc0.c1=fp16" : fp4 ? "all=fp4:fp4:fp8,enc0.c1=fp16" : "";
     if (strlen(saved_policy) >= sizeof runtime.policy || strlen(optname) >= sizeof runtime.optimizer) { fprintf(stderr, "checkpoint settings too long\n"); return 2; }

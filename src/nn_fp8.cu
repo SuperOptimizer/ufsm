@@ -627,7 +627,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                         if (ox < W && zst) { ps += v0; pss += v0 * v0; }
                         if (ox + 1 < W && zst) { ps += v1; pss += v1 * v1; }
                     } else {
-                        if (osum && std::is_same<T, __half>::value) {   /* fp16 activation feeding a GroupNorm: saturate instead of inf (as conv_fwd_tc_k) */
+                        if (Go > 0 && std::is_same<T, __half>::value) {   /* include normalization-input replay without statistics */
                             v0 = sat_h16(v0); v1 = sat_h16(v1);
                         }
                         if (!(W & 1) && ox + 1 < W) {   /* paired store */
@@ -717,7 +717,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8_k(const T *__restrict__ x,
                 if (inb) {
                     size_t off = ((size_t)gz * H + gy) * W + gx;
                     const uint4 *src = (const uint4 *)((const uint8_t *)c0.p + off * c0.rb);
-                    h0 = __ldg(src); if (c0.bw == 32) h1 = __ldg(src + 1);
+                    if (c0.bw == 8) { const uint2 u = __ldg((const uint2 *)src); h0.x = u.x; h0.y = u.y; }
+                    else { h0 = __ldg(src); if (c0.bw == 32) h1 = __ldg(src + 1); }
                     sc = c0.sp[off];
                 }
                 *(uint4 *)(sx + sw16(pos, 0)) = h0;
@@ -988,7 +989,9 @@ __device__ __forceinline__ void stage_row16(const chan_t &c0, int Ci, size_t pla
         const uint8_t *p = (const uint8_t *)c0.p + off * c0.rb;
         const float s = mx_scale(c0.sp[off]);
         if constexpr (IS_MX8(T)) {
-            const uint4 u = __ldg((const uint4 *)p);
+            uint4 u;
+            if (c0.bw == 8) { const uint2 q = __ldg((const uint2 *)p); u = make_uint4(q.x, q.y, 0u, 0u); }
+            else u = __ldg((const uint4 *)p);
             const unsigned w[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
             for (int j = 0; j < 4; j++) {
@@ -996,7 +999,7 @@ __device__ __forceinline__ void stage_row16(const chan_t &c0, int Ci, size_t pla
                 v[4 * j] = a.x * s; v[4 * j + 1] = a.y * s; v[4 * j + 2] = b.x * s; v[4 * j + 3] = b.y * s;
             }
         } else {
-            const uint2 u = __ldg((const uint2 *)p);
+            const uint2 u = c0.bw == 8 ? make_uint2(__ldg((const unsigned *)p), 0u) : __ldg((const uint2 *)p);
             const unsigned w[2] = {u.x, u.y};
 #pragma unroll
             for (int j = 0; j < 2; j++)
@@ -1160,7 +1163,7 @@ template <typename T, typename TO = T> static void fwd_f8_t(const void *x, shape
     static int small = -1;
     if (small < 0) small = ufsm_env_on("UFSM_F8_NOSMALL") ? 0 : 1;
     /* tap-packed small-channel kernel: fp32 input up to 16 channels; with bf16 input the general kernel is as fast at 16 */
-    if (small && (std::is_same<T, TO>::value || (IS_MX(TO) && !IS_MX(T))) && xs.c <= (sizeof(T) == 2 || IS_MX(T) ? 8 : 16) && !sp.x2) {
+    if (small && (std::is_same<T, TO>::value || IS_MX(TO)) && xs.c <= (sizeof(T) == 2 || IS_MX(T) ? 8 : 16) && !sp.x2) {
         if (xs.c <= 4) small_f8<4, T, TO>(x, xs, w, b, cout, y, gp, osum, Go, sp);
         else if (xs.c <= 8) small_f8<8, T, TO>(x, xs, w, b, cout, y, gp, osum, Go, sp);
         else small_f8<16, T, TO>(x, xs, w, b, cout, y, gp, osum, Go, sp);
@@ -1202,6 +1205,13 @@ static int lp_dtype_check(const char *fn, int xbf, int ybf) {
     return xbf;
 }
 extern "C" int lp_conv_fwd_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp) {
+    if ((xbf == 3 || xbf == 4) && (ybf == 3 || ybf == 4) && xbf != ybf) {
+        if (xs.c > 8 || sp.x2 || sp.y2 || sp.up || sp.accum) { fprintf(stderr, "lp_conv_fwd_f8: mixed MX input/output only for the network stem (Ci <= 8)\n"); abort(); }
+        if (xbf == 3) fwd_f8_t<mx8_t, mx4_t>(x, xs, w, b, cout, y, gp, osum, Go, sp);
+        else fwd_f8_t<mx4_t, mx8_t>(x, xs, w, b, cout, y, gp, osum, Go, sp);
+        LPCK();
+        return 0;
+    }
     if ((xbf == 1 || xbf == 2) && ybf >= 3) {   /* 16-bit network input -> MX activation (tap-packed small kernel) */
         if (xs.c > 8 || sp.x2 || sp.accum) { fprintf(stderr, "lp_conv_fwd_f8: 16-bit in / MX out only for the network input (Ci <= 8)\n"); abort(); }
         if (xbf == 2 && ybf == 4) fwd_f8_t<__half, mx4_t>(x, xs, w, b, cout, y, gp, osum, Go, sp);

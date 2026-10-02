@@ -6,12 +6,50 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## Current production audit (2026-10-01)
+## Current production audit (2026-10-02)
 
 The long training run is on hold while training and inference throughput and large-window accuracy are
 checked. The target is approximately 500 cubed on one 16 GB GPU; 512 is a measured candidate, not a
 requirement to reject a faster nearby shape. Historical timings below include other batch sizes,
 two-GPU runs, shared GPUs, and earlier kernels; they are not directly comparable to this audit.
+
+The stored-tensor normalization and independently selectable stem precision pass the complete
+`make -j8 test` suite (`runs/recovery512/stem-gn-full-tests.log`). Fresh training's convolution-output
+GroupNorm statistics now describe rounded stored values, including MX4/MX8; legacy checkpoints
+retain their historical contract on resume and prediction. Independent FP64 reference tests cover
+constant/varied groups, gradients, split inputs and FP16 saturation replay. Mixed MX8-to-MX4 and
+MX4-to-MX8 stem tests compare forward/weight-gradient operations with decoded operands. The input
+buffer is included in the dry memory planner; `--input-prec 4|8` and `--gn-stats stored|legacy` are
+portable checkpoint settings. New-format quality has not yet been established by a trained trial.
+
+Frozen candidate `ufsm-stem-gn-candidate` (SHA256
+`5a0ab3077a95ba56de69e4133ae090ee77c1222ba9b34f0970b7b632cf1edcac`) gave these short, single-GPU,
+batch-1 diagnostics (`stem-gn-bench.json`; approximately 35 training seconds per case):
+
+| window / stem bits / GN | samples/s | Mvox/s | peak MiB |
+|---|---:|---:|---:|
+| 512 / 4 / legacy | 0.517 | 69.39 | 14272 |
+| 512 / 8 / legacy | 0.515 | 69.12 | 12624 |
+| 512 / 4 / stored | 0.499 | 66.97 | 14272 |
+| 512 / 8 / stored | 0.499 | 66.97 | 12624 |
+| 496 / 8 / stored | 0.544 | 66.38 | 13476 |
+| 528 / 8 / stored | 0.449 | 66.09 | 13842 |
+
+512 with an FP8 stem selects lean 2, leaving 3687 MiB (3.6 GiB) on the 16311 MiB card. Correct stored
+statistics cost about 3–4%; the new inference baseline still needs measurement. The five steady-step
+profile is 41.7% weight gradient, 24.3% backward-data, 22.0% forward, 7.2% normalization and 4.1%
+upsampling (`stem-gn-p512-i8-stored.log`). Final decoder 48-to-16 alone accounts for 26.8% of the step.
+The extra output-statistics pass is included in forward timing. Prior tile/register tuning did not
+improve the valid baseline; the next work targets operand preparation/reuse and correct fusion.
+
+The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
+and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is
+0.2969 versus control 0.3304, but eight partial segment boxes have 55–65% positives within their
+labelled support and uninformative all-foreground F1 of about 0.70–0.79. On the eight dense HF boxes,
+best sampled global-cutoff mean F1 is only 0.0770 / 0.0803 / 0.0801 for FP4 / FP8 / FP16, versus
+0.0787 for the control. These held-out cutoff optima are diagnostics, not independently calibrated
+acceptance. Prediction-only throughput is 197.2 / 162.5 / 129.1 Mvox/s across all 16 boxes, using the
+legacy numerical contract; it must not be attributed to the new stored-GN/FP8-stem candidate.
 
 The recovered work and benchmark artifacts are in `runs/recovery512/`. Dirty experimental branches
 were archived before changes were integrated. The stochastic-rounding seed was missing from the MX

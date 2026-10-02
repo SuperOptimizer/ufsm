@@ -4,7 +4,7 @@
 
 #define UFSM_CHECKPOINT_HEADER 16384
 typedef struct {
-    int version, train_window, prec, f16, act_mx4, act_mx8, grad_mx8, input_mx;
+    int version, train_window, prec, f16, act_mx4, act_mx8, grad_mx8, input_mx, input_prec, gn_stored;
     char policy[2048], optimizer[16];
 } checkpoint_runtime;
 

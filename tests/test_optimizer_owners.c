@@ -71,16 +71,23 @@ static void input_case(int bits) {
     for (size_t i = 0; i < n; i++) h[i] = (float)((i * 2654435761u) % 1009) / 504.f - 1.f;
     nn_h2d(xf, h, n * 4); nn_f32_to_h16(xf, n, xh, 1.f);
     unet *reused = unet_create(&cfg); unet_init(reused, 19);
-    for (int k = 0; k < 4; k++) {
-        int mx = k % 2; unet_set_input_mx(mx);
+    const int modes[] = {0,4,8,4,0,8};
+    for (int k = 0; k < 6; k++) {
+        int precision = modes[k], mx = precision != 0; unet_set_input_prec(precision); unet_set_input_mx(mx);
         const float *p = unet_forward_x(reused, xh, xs, 0, 1); nn_d2h(got, p, no * 4);
-        int storage = mx ? reused->xin && nn_storage(reused->xin) == bits : reused->xin == nullptr;
-        printf("input transition MX%d mode%d: storage %s\n", bits, mx, storage ? "ok" : "FAIL"); failures += !storage;
+        int storage = mx ? reused->xin && nn_storage(reused->xin) == precision : reused->xin == nullptr;
+        printf("input transition bodyMX%d input%d: storage %s\n", bits, precision, storage ? "ok" : "FAIL"); failures += !storage;
         unet *fresh = unet_create(&cfg); unet_init(fresh, 19);
         p = unet_forward_x(fresh, xh, xs, 0, 1); nn_d2h(want, p, no * 4);
         check("input transition matches fresh buffers", got, want, no, 2e-3); unet_free(fresh);
     }
-    unet_free(reused); nn_free(xf); nn_free(xh); free(h); free(got); free(want); unet_set_input_mx(0);
+    unet_set_input_prec(8); unet_set_input_mx(1); unet_set_grad_mx8(1);
+    size_t planned = unet_train_bytes(reused, xs);
+    unet_forward_x(reused, xh, xs, 1, 1);
+    int accounted = reused->act_bytes == planned && nn_storage(reused->xin) == 8;
+    printf("bodyMX%d stemMX8 dry memory includes input: %s\n", bits, accounted ? "ok" : "FAIL"); failures += !accounted;
+    unet_set_grad_mx8(0);
+    unet_free(reused); nn_free(xf); nn_free(xh); free(h); free(got); free(want); unet_set_input_prec(0); unet_set_input_mx(0);
 }
 int main(void) {
     if (nn_init(0)) return 1;
