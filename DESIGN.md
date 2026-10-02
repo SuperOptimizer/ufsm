@@ -103,6 +103,11 @@ throughput, 8.6% DRAM throughput, 33.9% L1/TEX throughput, 96 registers/thread a
 achieved occupancy; long/short-scoreboard stalls are 17.5%/7.4% (`wgrad-coop-profile-summary.json`).
 This isolated decoder probe supports investigating operand reuse and occupancy; it does not
 establish a corresponding whole-step speedup.
+Rechecking an eight-input-channel weight-gradient tile after cooperative gathering still loses:
+the final decoder takes 347.2 ms versus bracketing 216.4/217.1 ms with sixteen input channels,
+and the 16-to-16 layer takes 110.8 ms versus 67.9/67.5 ms. Every gradient comparison passes
+(`wgrad-coop-nt-sweep.json`). Smaller tiles remain rejected; preparing gradient operands once
+and reusing them across input-channel tiles is the next larger experiment.
 
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is
