@@ -178,6 +178,98 @@ The final public-mode sweep gives 73.7–74.2 Mvox/s at 512 (14796 MiB), versus 
 496 (13496 MiB), so the recipe retains 512 (`wide-up-mode-window-sweep.json`). The two
 512 controls bracket 496; all three runs use the fully tested final executable.
 
+A selective-compute experiment keeps the FP8 stem, packed MX4 body activations and MX8 gradients.
+The experimental `UFSM_MX4_FP8=1` dispatch allows a requested FP8 forward operation to use the
+existing FP8 kernel on MX4 input/output; it defaults off and has not been promoted to production.
+Legacy MX4 dispatch continues to select FP4 computation. A six-case isolated-GPU sweep at 512,
+batch 1 and `--mem wide` uses 45 training seconds per case and bracketing FP4 controls:
+
+| compute change from FP4 body | Mvox/s | throughput change | peak MiB |
+|---|---:|---:|---:|
+| controls, start / end | 74.09 / 73.55 | reference | 14796 |
+| FP8 forward | 68.45 | -7.3% | 14796 |
+| FP8 backward-data | 73.95 | +0.2% | 14796 |
+| FP8 weight gradient | 69.52 | -5.8% | 14796 |
+| FP8 all three passes | 65.23 | -11.6% | 14796 |
+
+These are speed diagnostics, not a precision acceptance (`mixed-fp8-step-bench.json`). Observed
+manifests confirm the selected arithmetic; all six runs finish without nonfinite steps. Middle,
+complete five-update profiles put the current FP4 controls at approximately 374 ms forward,
+439 ms backward-data, 740 ms weight gradient, 141 ms normalization and 61 ms upsampling per step
+(`mixed-fp8-steady-profile.json`). Forward FP8 adds about 143 ms; FP8 weight gradients add about
+106 ms. Neither is a throughput improvement. FP8 backward-data is already available through
+`--policy all=fp4:fp8:fp4,enc0.c1=fp16`; this setting merits a bounded learning comparison.
+
+Both experimental dispatch states pass thirteen forward cases and eight backward cases,
+including split/upsampled inputs and independent decoded-output statistics.
+Twelve additional body cases match independently decoded inputs, FP8 arithmetic and a separate
+MX4 output converter exactly, with normalization enabled/disabled and widths 16/32/48.
+Repeated whole-model backward-data tests pass with rounding enabled/disabled and with the
+legacy dispatch retained.
+All-compute FP8 occasionally differs by about 4.1% in a reused model's gradients; one forward-only
+stochastic test also fails its same-seed repeat tolerance. Those modes remain unqualified while
+the cause is investigated. Initialization checking reports zero errors, and a targeted check of
+two FP8/MX8 backward-data launches reports zero shared-memory hazards; neither proves the full
+network discrepancy harmless. The broader racecheck was deliberately stopped to narrow its
+scope. Numerical logs, hashes and limits are recorded in `mixed-fp8-experiment.json`.
+The equal-update FP4 / FP8-backward-data pair has completed 160 updates from the same checkpoint
+and all sixteen held-out boxes. Eight dense boxes average F1 0.076782 / 0.076816 at cutoff 0.5,
+with band F1 0.292076 / 0.292597. This provides no meaningful evidence of a quality advantage;
+at cutoff 0.6 the respective means are 0.036526 / 0.039963, illustrating cutoff sensitivity
+(`mixed-fp8-backward-quality-paired-summary.json`). The forward-FP8 continuation also completed
+160 updates and all sixteen boxes under matched and FP4 inference. Dense F1 at the diagnostic cutoff 0.5 is 0.077387 matched and 0.077166
+served with FP4, versus the control 0.076782. At cutoff 0.6 the forward-FP8 means are
+0.034870 / 0.039333, versus control 0.036526. These small one-seed changes do not establish
+a learning advantage or justify the measured 7.3% training throughput loss
+(`mixed-fp8-quality-summary.json`). The production recipe and long-training hold remain unchanged.
+
+A predecoded FP32 activation-slab probe preserves the current staging values and quantization
+rather than introducing BF16 rounding after GN/SiLU. The private dry allocator confirms a
+2 GiB unused tail while the wider finest gradient buffer holds its MX4 upsample; a 34-plane,
+48-channel FP32 slab would require 1.59 GiB. Actual buffer-tail aliasing was not implemented.
+The isolated 32-by-512-by-512 probe loses: all-FP32 preparation/consumption takes 25.07 ms
+versus packed controls 12.53 / 12.59 ms; preparing only the normalized skip takes 18.14 ms
+(3.65 ms preparation, 14.51 ms consumption). The normalized 16-to-16 probe takes 9.18 ms
+versus 4.45 / 4.49. Six small cases and both large probes match every gradient exactly, but
+these measured versions are rejected before full-step integration (`wgrad-fp32-slab-experiment.json`).
+
+A separate packed-layout prototype reduces the LY 1 row pitch from 24 to 16 bytes and the
+per-plane scale slots from 32 to 10 elements, retaining the same values, row pairings and
+rounding keys. With the existing two-block launch bound it gives no kernel gain. A three-block
+bound uses 72 registers and measures 183.24 versus 193.59 / 194.05 ms for the final decoder,
+and 62.89 versus 67.89 / 68.10 ms for 16-to-16 at 512. Twenty-eight small comparisons include
+nineteen selected compact-kernel cases plus fallback checks; full-size gradients remain within
+the frozen-reference tolerances. Whole-model rounding modes and reused-buffer transitions pass.
+In complete 45-second training diagnostics, two candidate runs give 0.553 samples/s versus
+bracketing controls 0.550 / 0.547, about +0.8%; the separate frozen control gives 0.552.
+All peaks are 14796 MiB and no run has nonfinite steps. Complete middle profiles show weight
+gradients reduced from about 742 to 722 ms per update, with smaller gains in the whole step.
+The prototype remains unpromoted: the complete regression suite has not been run with this
+implementation, and these short timings do not establish a substantial pipeline gain
+(`wgrad-compact-experiment.json`).
+
+
+An inference I/O audit separates cold remote access from cached GPU execution
+(`infer-io-audit.json`). On a 512-cubed MANBp box, a fresh compressed cache takes 4.07 s
+versus 1.39 s warm; the reader accounts for 2.68 versus 0.03 s. Cached native 1024-cubed
+MANBp and local PHerc1667 boxes take 4.43 / 4.12 s, with about 3.57 / 3.59 s in GPU
+input/forward/placement and only 0.03 s waiting for the reader. Profiling adds explicit
+synchronization; process times include startup and final writing, while the printed main-loop
+wall excludes part of that work. Reader and GPU times overlap and must not be added together.
+
+A bounded HTTP-read prototype coalesces nearby uncached chunk ranges (at most 64 KiB gaps,
+2 MiB spans) and fetches missing shard indices in parallel. On independent fresh caches of the
+same MANBp box, controls take 3.75 / 3.52 s versus 2.26 / 2.20 s for the candidate: about
+1.63x whole-process speed, with reader time falling from 2.30 / 2.22 to 0.97 / 0.92 s.
+The grouped plan has 77 tasks for 216 chunks and about 6.01 MB of range spans for 5.88 MB
+of requested chunk payload. Each cache contains the same 194 files and 5,945,604 bytes as
+the frozen reader; every cached encoded byte and every produced prediction-store byte is
+identical. Cached 1024-cubed prediction remains about 4.39 s, and its full store matches the
+frozen reader exactly. This is a promising cold-access gain on one box, with no demonstrated
+cached-GPU, training or whole-volume gain. HTTP error cases, connection/resource lifetime,
+other cold volumes and the full regression suite remain before promotion
+(`infer-coalesce-experiment.json`). The implementation and defaults in `src/` remain unchanged.
+
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is
 0.2969 versus control 0.3304, but eight partial segment boxes have 55–65% positives within their
