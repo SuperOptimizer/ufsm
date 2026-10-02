@@ -155,18 +155,25 @@ allows its 32-channel up part to run in one backward-data launch. Paired 40-upda
 the 16311 MiB card retains about 1.5 GiB. Widening every decoder gives similar throughput
 at 15374 MiB and is rejected in favor of the finest level (`wide-up-step-bench.json`,
 `wide-up-finest-step-bench.json`). These are isolated-device performance comparisons.
-The default is off. `UFSM_WIDE_UP_GRAD=1` or `unet_set_wide_up_grad(1)` changes only the
-finest-level buffer under lean 2 / MX8 gradients. The memory planner counts the extra allocation;
-the measured configuration explicitly uses `UFSM_CHUNK_UP=2 UFSM_RECOMPUTE=1 UFSM_GRAD_MX8=1
-UFSM_LEAN=2`, because automatic planning conservatively reserves additional workspace.
+The buffer option defaults off. `UFSM_WIDE_UP_GRAD=1` or `unet_set_wide_up_grad(1)` changes
+only the finest-level buffer under lean 2 / MX8 gradients. The memory planner counts the extra
+allocation; automatic planning conservatively reserves additional workspace. `--mem wide`
+explicitly selects chunk 2 / recompute 1 / MX8 gradients / lean 2 and the larger buffer, requiring
+tensor cores and MX activation storage. The candidate recipe selects this mode for its large
+stage while preserving automatic planning for the small-window warmup.
 Changing the option rebuilds existing model buffers. Whole-network forward/gradient tests
 cover dry allocation accounting, repeated runs, rounding modes and cached-buffer transitions.
 Round-to-nearest gradients agree within FP32 reduction noise; stochastic differences remain
 below baseline seed variation, which does not establish training quality. All 35 Make test
 commands pass with coverage and current artifact hashes recorded (`wide-up-regressions.json`).
 The unchanged CUDA objects are byte-identical to the measured frozen baseline. A bounded,
-equal-update 17-source continuation from the same stored-GN checkpoint is in progress;
-the production recipe remains unchanged pending its quality comparison.
+equal-update 17-source continuation from the same stored-GN checkpoint completed 160 updates
+per side and scored all 16 boxes. At cutoff 0.5, dense mean F1 is 0.07676 (narrow) versus
+0.07699 (wide); at 0.6 it is 0.03911 versus 0.03929. No obvious regression appears, but this
+one-seed diagnostic does not qualify the weak dense accuracy or independently calibrate a
+production threshold (`wide-up-quality-summary.json`). All 35 commands pass again after
+adding the public memory mode and exercising it through staged train/evaluate/export/predict
+(`wide-up-mode-regressions.json`); the full training run remains on hold.
 
 The corrected legacy-contract 17-source paired trial has finished (`production17-v2-summary.json`
 and `production17-v2-group-diagnostics.json`). At the provisional cutoff 0.6, staged FP4 mean F1 is

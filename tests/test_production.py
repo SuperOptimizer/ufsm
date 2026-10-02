@@ -31,12 +31,14 @@ with tempfile.TemporaryDirectory(prefix='ufsm-production-') as tmp:
     r['sources'] = str(source)
     r['train'].update({'workers': 1, 'val-batches': 1, 'levels': '1', 'val-every': 1, 'log-every': 1, 'ckpt-every': 1})
     r['stages'] = [{'name': name, 'P': 16, 'B': 1, 'steps': 2, 'warmup': 1} for name in ('warmup', 'large')]
+    r['stages'][1]['mem'] = 'wide'
     r['predict'].update(window=24, halo=4, shard=128, q=0, threads=1)
     r['evaluation'].update(level=0, thresholds=[0.333, 0.6])
     recipe = t / 'recipe.json'; recipe.write_text(json.dumps(r))
     run('train', '--recipe', recipe, '--out', t / 'run')
     manifest = json.loads((t / 'run/run.json').read_text())
     assert [s['end_step'] for s in manifest['stages']] == [2, 4]
+    assert 'wide finest-level up gradient' in (t / 'run/large.log').read_text()
     with (t / 'run/large/log.csv').open() as f:
         rows = list(csv.DictReader(f))
     assert float(rows[0]['lr']) == 0.001, 'second stage did not restart its LR schedule'

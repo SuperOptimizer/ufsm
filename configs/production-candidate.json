@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "status": "candidate: bounded stored-GN trial complete; dense accuracy, calibration and precision acceptance pending",
+  "status": "candidate: bounded stored-GN and wide-gradient trials complete; dense accuracy, calibration and precision acceptance pending",
   "sources": "configs/all2.json",
   "train": {
     "fp4": 2, "mem": "auto", "opt": "muon", "muon-lr": 0.01,
@@ -11,7 +11,7 @@
   },
   "stages": [
     {"name": "warmup", "P": 128, "B": 4, "steps": 100000, "seconds": 780, "warmup-seconds": 40},
-    {"name": "large", "P": 512, "B": 1, "steps": 20000, "warmup": 500}
+    {"name": "large", "P": 512, "B": 1, "steps": 20000, "warmup": 500, "mem": "wide"}
   ],
   "predict": {"window": 528, "halo": 8, "shard": 512, "ema": 1, "q": 8, "threads": 16},
   "profiles": {
