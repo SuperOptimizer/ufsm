@@ -172,7 +172,7 @@ def execute_candidate(out):
         if state["task"]=="surface_winding" and saved["extra"]["sheet"]["geometry_sha256"]!=state["geometry_sha256"]:
             raise ValueError("resume checkpoint belongs to another geometry dataset")
         command[command.index("--resume")+1]=str(checkpoint)
-        for flag in ("--sheet-init","--warm-start"):
+        for flag in ("--sheet-init","--warm-start","--cover-extend-from"):
             if flag in command:
                 pos=command.index(flag); del command[pos:pos+2]
         if saved["extra"]["cover"]["cursor"]==state["updates"]:
@@ -194,6 +194,72 @@ def execute_candidate(out):
 
 
 def resume(a): execute_candidate(a.run)
+
+
+def extend(a):
+    """Append held-out-safe tiles to a completed cover without resetting state."""
+    previous=Path(a.run).resolve(); old=json.loads((previous/"state.json").read_text())
+    verify_inputs(previous,old)
+    saved=header(previous/"model/last.ckpt")
+    committed=saved.get("extra",{}).get("cover",{})
+    prior=json.loads((previous/"inputs/cover.json").read_text())
+    plan=json.loads(Path(a.cover).read_text())
+    if (committed.get("sha256")!=digest(previous/"inputs/cover.json") or
+        committed.get("count")!=old["updates"] or committed.get("cursor")!=old["updates"] or
+        saved["step"]!=committed.get("base_step",-1)+committed.get("cursor",-1)):
+        raise ValueError("extension requires a completed matching cover checkpoint")
+    if (any(plan.get(k)!=prior.get(k) for k in ("version","P","level","source_names")) or
+        type(plan.get("count")) is not int or plan["count"]<=prior["count"] or
+        len(plan.get("tiles",[]))!=plan["count"] or plan["tiles"][:prior["count"]]!=prior["tiles"]):
+        raise ValueError("extended cover must preserve the completed plan as an unchanged prefix")
+    cfg=json.loads((previous/"inputs/sources.json").read_text())
+    tiles=plan["tiles"]; P=plan["P"]
+    if (any(len(t)!=4 or any(type(v) is not int or v<0 for v in t) or t[0]>=len(cfg["sources"]) for t in tiles) or
+        len({tuple(t) for t in tiles})!=len(tiles) or committed["base_step"]+plan["count"]>2147483647):
+        raise ValueError("invalid or duplicate extension tiles")
+    for tile in tiles:
+        source=cfg["sources"][tile[0]]; box=source.get("holdout")
+        if box and all(tile[d+1]<box[d]+box[d+3] and tile[d+1]+P>box[d] for d in range(3)):
+            raise ValueError("extended cover intersects a source holdout")
+    if old["task"]=="surface_winding":
+        if saved.get("extra",{}).get("sheet",{}).get("geometry_sha256")!=old["geometry_sha256"]:
+            raise ValueError("checkpoint/geometry contract mismatch")
+        audit=json.loads((previous/"inputs/geometry/audit.json").read_text())
+        boxes=audit["splits"]["development"]+audit["splits"]["test"]; guard=int(audit["guard"])
+        if any(all(t[d+1]<b[d]+b[d+3]+guard and t[d+1]+P>b[d]-guard for d in range(3)) for t in tiles for b in boxes):
+            raise ValueError("extended cover intersects a guarded geometry holdout")
+    out=Path(a.out).resolve()
+    if out.exists(): raise ValueError("choose a new extended run directory")
+    out.mkdir(parents=True); inputs=out/"inputs"
+    shutil.copytree(previous/"inputs",inputs)
+    shutil.copyfile(previous/"model/last.ckpt",inputs/"resume.ckpt")
+    if header(inputs/"resume.ckpt")!=saved: raise ValueError("checkpoint changed while preparing extension")
+    shutil.copyfile(inputs/"cover.json",inputs/"cover-previous.json")
+    atomic_json(inputs/"cover.json",plan); shutil.copy2(a.binary,inputs/"ufsm")
+    command=list(old["command"])
+    for i,value in enumerate(command):
+        if value.startswith(str(previous/"inputs")+"/"):
+            command[i]=str(inputs/Path(value).relative_to(previous/"inputs"))
+    for flag in ("--sheet-init","--warm-start","--cover-extend-from","--stop-at"):
+        if flag in command:
+            i=command.index(flag); del command[i:i+2]
+    for flag,value in (("--out",str(out/"model")),("--resume",str(inputs/"resume.ckpt")),("--steps",str(plan["count"]))):
+        command[command.index(flag)+1]=value
+    if "--cover-sha256" in command: command[command.index("--cover-sha256")+1]=digest(inputs/"cover.json")
+    command += ["--cover-extend-from",str(inputs/"cover-previous.json")]
+    for source in cfg["sources"]:
+        if source.get("axis","").startswith(str(previous/"inputs")+"/"):
+            source["axis"]=str(inputs/Path(source["axis"]).relative_to(previous/"inputs"))
+    atomic_json(inputs/"sources.json",cfg)
+    state=dict(old,status="prepared",command=command,updates=plan["count"],donor_sha256=digest(inputs/"resume.ckpt"),
+        inputs={str(p.relative_to(inputs)):digest(p) for p in inputs.rglob("*") if p.is_file()},
+        coverage_extension=dict(previous_run=str(previous),step=saved["step"],cursor=committed["cursor"],
+            previous_cover_sha256=committed["sha256"],previous_count=committed["count"],added_updates=plan["count"]-committed["count"],
+            base_step=committed["base_step"],schedule="extend WSD horizon; preserve origin, optimizer and geometry ramp"))
+    for key in ("checkpoint_sha256","wall_seconds","stop_reason","stopped_step"): state.pop(key,None)
+    atomic_json(out/"state.json",state)
+    if a.prepare_only: print(f"prepared coverage extension {out} at step {saved['step']}; {state['coverage_extension']['added_updates']} new updates")
+    else: execute_candidate(out)
 
 
 def reconfigure(a):
@@ -579,6 +645,9 @@ def main():
     t.add_argument("--baseline",action="store_true",help="legacy surface-only control with frozen winding reference")
     t.add_argument("--existing-targets",action="store_true",help="expanded-label/soft=3 control; supply the original sources")
     t=sub.add_parser("resume"); t.add_argument("--run",required=True)
+    t=sub.add_parser("extend",help="append tiles to a completed cover and extend its training schedule")
+    for name in ("run","cover","out"): t.add_argument("--"+name,required=True)
+    t.add_argument("--binary",default=BINARY); t.add_argument("--prepare-only",action="store_true")
     t=sub.add_parser("reconfigure",help="continue the same coverage plan with explicitly changed augmentation")
     for name in ("run","recipe","out"): t.add_argument("--"+name,required=True)
     t.add_argument("--binary",default=BINARY); t.add_argument("--prepare-only",action="store_true")

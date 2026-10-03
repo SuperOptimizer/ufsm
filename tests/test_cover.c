@@ -18,7 +18,16 @@ int main(void) {
     snprintf(header, sizeof header, "UFSM{\"step\":102,\"extra\":%s}\n", extra); write_file(path, header); assert(cover_checkpoint_read(path, &got) < 0);
     write_file(path, "UFSM{\"step\":100,\"extra\":{}}\n"); assert(!cover_checkpoint_read(path, &got));
     p.cursor = 3; assert(cover_checkpoint_extra("{}", &p, extra, sizeof extra) < 0);
-    cover_free(plan);
+    const char *extended = "{\"version\":1,\"P\":16,\"level\":0,\"count\":3,\"source_names\":[\"fixture\"],\"tiles\":[[0,0,0,0],[0,16,0,0],[0,32,0,0]]}";
+    write_file(path, extended); cover_plan *next = cover_load(path, &S, 16); assert(next);
+    p.cursor = p.count;
+    assert(!cover_validate_extension(plan, next, &p));
+    p.cursor--; assert(cover_validate_extension(plan, next, &p)); p.cursor++;
+    p.sha256[0] = p.sha256[0] == 'a' ? 'b' : 'a'; assert(cover_validate_extension(plan, next, &p)); strcpy(p.sha256, plan->sha256);
+    assert(cover_validate_extension(plan, plan, &p));
+    next->tiles[0][1]++; assert(cover_validate_extension(plan, next, &p)); next->tiles[0][1]--;
+    p.base_step = 2147483646; assert(cover_validate_extension(plan, next, &p));
+    cover_free(next); cover_free(plan);
     write_file(path, "{\"version\":1,\"P\":16,\"level\":0,\"count\":2,\"source_names\":[\"fixture\"],\"tiles\":[[0,0,0,0],[0,0,0,0]]}"); assert(!cover_load(path, &S, 16));
     write_file(path, valid); assert(!cover_load(path, &S, 32));
     s.name = "other"; assert(!cover_load(path, &S, 16));

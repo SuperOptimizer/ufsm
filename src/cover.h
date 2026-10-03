@@ -16,6 +16,8 @@ typedef struct {
 
 cover_plan *cover_load(const char *path, const sources *S, int P);
 void cover_free(cover_plan *p);
+/* Explicit extension: the saved plan must be complete and an unchanged prefix. */
+int cover_validate_extension(const cover_plan *previous, const cover_plan *next, const cover_progress *saved);
 /* 1 finite-cover checkpoint, 0 ordinary checkpoint, -1 malformed. */
 int cover_checkpoint_read(const char *path, cover_progress *p);
 int cover_checkpoint_extra(const char *runtime_json, const cover_progress *p, char *out, size_t cap);

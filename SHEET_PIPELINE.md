@@ -206,6 +206,17 @@ change boundary. Such a continuation has mixed augmentation history and is
 not a matched member of the old ablation cohort. Checkpoints record the effective
 augmentation settings under `extra.augmentation`.
 
+To train longer after a bounded cover completes, prepare a larger plan whose
+tile list keeps the entire completed plan as its unchanged prefix. Run
+`python3 tools/sheet_pipeline.py extend --run OLD_RUN --cover LARGER_PLAN.json
+--out NEW_RUN --prepare-only`, then `resume --run NEW_RUN`. The runner rejects
+changed prefixes, duplicate tiles and held-out geometry regions. The trainer
+uses `--cover-extend-from` for the first continuation only, preserving weights,
+optimizer, EMA, cursor and winding ramp origin while extending the WSD horizon.
+The longer horizon raises the learning rate from the previous final cooldown.
+Native `--stop-at STEP` saves an exact intermediate update without shortening
+that horizon; omit the extension flag when resuming the resulting checkpoint.
+
 `make test-sheet` checks lifting, exclusions, loss derivatives, reconstruction and
 file contracts on CPU. `make test-sheet-gpu` checks interpolation/scatter across
 both GPUs plus small real training, resume and floating-output prediction. The

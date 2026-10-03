@@ -115,6 +115,29 @@ def main():
             with (changed/"geometry.csv").open() as f: rows=list(csv.DictReader(f))
             assert len(rows)==2 and all(np.isfinite(float(r["weighted"])) for r in rows)
             print(f"{mode}: full 3D augmentation + winding checkpoint continuation: ok")
+            # Appending to a completed cover preserves the winding origin and
+            # schedule across exact update boundaries used for held-out checks.
+            extension=t/"extended-cover.json"
+            extended_plan=json.loads(experiment_cover.read_text())
+            extended_plan["tiles"] += [[0,96,0,0],[0,96,32,0]]
+            extended_plan["count"]=5; extension.write_text(json.dumps(extended_plan))
+            ext_command=list(command); ext_command[ext_command.index("--cover")+1]=extension
+            extended=t/(mode+"-extended"); boundary=t/(mode+"-boundary"); continuation=t/(mode+"-continued")
+            execute(ext_command+["--out",extended,"--resume",full/"last.ckpt","--cover-extend-from",experiment_cover])
+            execute(ext_command+["--out",boundary,"--resume",full/"last.ckpt","--cover-extend-from",experiment_cover,"--stop-at","6"])
+            hb=header(boundary/"last.ckpt"); he=header(extended/"last.ckpt")
+            assert hb["step"]==6 and hb["extra"]["cover"]["cursor"]==4
+            assert he["step"]==7 and he["extra"]["cover"]["cursor"]==5
+            assert he["extra"]["sheet"]==hf["extra"]["sheet"]
+            execute(ext_command+["--out",continuation,"--resume",boundary/"last.ckpt"])
+            assert header(continuation/"last.ckpt")["extra"]["cover"]==he["extra"]["cover"]
+            with (extended/"log.csv").open() as f: extended_rows=list(csv.DictReader(f))
+            with (continuation/"log.csv").open() as f: continued_rows=list(csv.DictReader(f))
+            assert [r["lr"] for r in extended_rows[1:]]==[r["lr"] for r in continued_rows]
+            rejected=subprocess.run(list(map(str,ext_command+["--out",t/(mode+"-invalid-extension"),
+                "--resume",partial/"last.ckpt","--cover-extend-from",experiment_cover])),env=env,capture_output=True,text=True)
+            assert rejected.returncode!=0 and "unchanged prefix" in rejected.stderr
+            print(f"{mode}: completed cover extension, exact stop, resumed LR and winding origin: ok")
             if mode=="single":
                 complete=t/"all-losses"
                 execute(command+["--out",complete,"--resume",t/"donor/last.ckpt","--sheet-init","1","--sheet-variant","2"])

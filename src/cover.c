@@ -72,6 +72,14 @@ int cover_checkpoint_read(const char *path, cover_progress *p) {
     }
     json_free(j); return rc;
 }
+int cover_validate_extension(const cover_plan *previous, const cover_plan *next, const cover_progress *saved) {
+    if (!previous || !next || !saved || saved->cursor != saved->count ||
+        saved->count != previous->count || strcmp(saved->sha256, previous->sha256) ||
+        previous->P != next->P || next->count <= previous->count ||
+        saved->base_step < 0 || (uint64_t)saved->base_step + next->count > INT_MAX ||
+        memcmp(previous->tiles, next->tiles, (size_t)previous->count * sizeof *previous->tiles)) return -1;
+    return 0;
+}
 int cover_checkpoint_extra(const char *runtime_json, const cover_progress *p, char *out, size_t cap) {
     size_t n = strlen(runtime_json);
     if (!n || runtime_json[n - 1] != '}' || !hash_valid(p->sha256) || p->cursor > p->count) return -1;

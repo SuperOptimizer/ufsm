@@ -193,7 +193,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
-                        "       [--cover PLAN.json] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
+                        "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
                         "       [--geometry-aug 0|1] [--rotate-deg 5] [--rotate-p 0.2] [--elastic 1] [--elastic-p 0.15] [--label-morph 0] [--label-morph-p 0.2]\n"
                         "       [--gn-stats stored|legacy]   fresh training uses stored activations; resume preserves the saved contract\n"
                         "       [--schedule-start STEP]   restart the LR schedule at this saved step, preserving optimizer state\n"
@@ -212,6 +212,8 @@ int cmd_train(int argc, char **argv) {
     double seconds = atof(opt(argc, argv, "--seconds", "0"));
     double limit_seconds = atof(opt(argc, argv, "--limit-seconds", "0"));
     if (!isfinite(limit_seconds) || limit_seconds < 0) { fprintf(stderr, "invalid limit-seconds\n"); return 2; }
+    int stop_at = atoi(opt(argc, argv, "--stop-at", "0"));
+    if (stop_at < 0) { fprintf(stderr, "stop-at must be nonnegative\n"); return 2; }
     double warmup_seconds = atof(opt(argc, argv, "--warmup-seconds", "-1"));
     if (!isfinite(seconds) || seconds < 0 || !isfinite(warmup_seconds) || warmup_seconds < -1) { fprintf(stderr, "invalid time budget\n"); return 2; }
     if (warmup_seconds < 0) warmup_seconds = seconds * 0.05;
@@ -354,10 +356,21 @@ int cmd_train(int argc, char **argv) {
     if (warm_start && (!resume || sheet_ck)) { fprintf(stderr,"--warm-start requires a legacy donor checkpoint\n"); return 2; }
     int has_cover = resume && !sheet_init && !warm_start ? cover_checkpoint_read(resume, &prior_cover) : 0;
     if (has_cover < 0 || (has_cover && !cover_path)) { fprintf(stderr, "finite-cover resume requires its original plan\n"); return 2; }
+    const char *extend_from = opt(argc, argv, "--cover-extend-from", nullptr);
+    if (extend_from && (!has_cover || !cover_path)) { fprintf(stderr, "cover extension requires a completed finite-cover checkpoint\n"); return 2; }
     if (cover_path) {
         if (B != 1 || nl != 1 || overfit || seconds || atoi(opt(argc, argv, "--finetune", "0"))) { fprintf(stderr, "cover requires B=1, one window per step, step-based schedule and no overfit/finetune\n"); return 2; }
         plan = cover_load(cover_path, S, P); if (!plan) return 2;
         const char *pinned = opt(argc, argv, "--cover-sha256", plan->sha256);
+        if (extend_from) {
+            cover_plan *previous = cover_load(extend_from, S, P);
+            int valid = cover_validate_extension(previous, plan, &prior_cover);
+            cover_free(previous);
+            if (valid) { fprintf(stderr, "cover extension must preserve the completed plan as an unchanged prefix\n"); return 2; }
+            fprintf(stderr, "extending completed cover: %llu -> %llu tiles, preserving cursor and schedule origin\n",
+                (unsigned long long)prior_cover.count, (unsigned long long)plan->count);
+            strcpy(prior_cover.sha256, plan->sha256); prior_cover.count = plan->count;
+        }
         if (strcmp(pinned, plan->sha256) || (has_cover && (strcmp(prior_cover.sha256, plan->sha256) || prior_cover.count != plan->count))) { fprintf(stderr, "cover SHA256/count mismatch\n"); return 2; }
         coverage = prior_cover; strcpy(coverage.sha256, plan->sha256); coverage.count = plan->count;
         sc.cover = plan; sc.cover_start = coverage.cursor; sc.deterministic = 1; sc.snap = 0;
@@ -406,6 +419,7 @@ int cmd_train(int argc, char **argv) {
         fprintf(stderr, "finite cover: %llu/%llu committed tiles, SHA256 %s, final step %d\n", (unsigned long long)coverage.cursor, (unsigned long long)coverage.count, coverage.sha256, steps);
     }
     if (schedule_start > step0) { fprintf(stderr, "schedule-start cannot follow the resumed step\n"); return 2; }
+    if (stop_at && (stop_at <= step0 || stop_at > steps)) { fprintf(stderr, "stop-at must follow the resumed step and not exceed the final step\n"); return 2; }
     if (sheet_init && !schedule_start) schedule_start=step0;
     if (schedule_start>=steps || (sheet_ck && schedule_start!=saved_sheet_start)) {
         fprintf(stderr,"invalid or changed winding schedule origin\n"); return 2;
@@ -729,7 +743,7 @@ int cmd_train(int argc, char **argv) {
         if (plan) { coverage.cursor = (uint64_t)(step - coverage.base_step); if (cover_checkpoint_extra(runtime_extra, &coverage, checkpoint_extra, sizeof checkpoint_extra)) return 2; }
         const char *e = nn_check();
         if (e) { fprintf(stderr, "cuda error at step %d: %s\n", step, e); return 1; }
-        if ((seconds && now() - t0 >= seconds) || (limit_seconds && now() - t0 >= limit_seconds)) g_stop = 1;
+        if ((seconds && now() - t0 >= seconds) || (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
         acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][cfg.cout]; acc_g += gn; nacc++;
         if (step % log_every == 0 || step == steps || g_stop) {
             double dt = now() - tlog;

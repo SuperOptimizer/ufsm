@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"tools"))
-from sheet_pipeline import freeze_geometry, score_geometry, decompress_zstd, mesh_evidence, export, select, sweep, train, verify_inputs, reconfigure
+from sheet_pipeline import freeze_geometry, score_geometry, decompress_zstd, mesh_evidence, export, select, sweep, train, verify_inputs, reconfigure, extend
 from sheet_geometry import make_record, write_dataset, digest
 from build_sheet_geometry import build, sample_edge
 from sheet_reconstruct import fit, extract, validate_mesh, canonical, canonical_domain, fitting_bounds
@@ -17,6 +17,41 @@ import tifffile
 
 
 class PipelineTests(unittest.TestCase):
+    def test_completed_cover_extension_preserves_payload_and_excludes_holdouts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); previous=root/"previous"; inputs=previous/"inputs"; inputs.mkdir(parents=True)
+            (inputs/"geometry").mkdir(); (previous/"model").mkdir()
+            (inputs/"ufsm").write_bytes(b"old binary"); (inputs/"axis.json").write_text("{}")
+            (inputs/"recipe.json").write_text(json.dumps(dict(train={"lr":.001},predict={})))
+            (inputs/"sources.json").write_text(json.dumps(dict(sources=[dict(axis=str(inputs/"axis.json"),holdout=[1000]*3+[32]*3)])))
+            (inputs/"geometry/audit.json").write_text(json.dumps(dict(splits=dict(development=[[1000]*3+[32]*3],test=[[2000]*3+[32]*3]),guard=32)))
+            plan=dict(version=1,P=32,level=0,count=2,source_names=["fixture"],tiles=[[0,0,0,0],[0,32,0,0]])
+            (inputs/"cover.json").write_text(json.dumps(plan)); (inputs/"resume.ckpt").write_bytes(b"donor")
+            saved=dict(step=5,extra=dict(cover=dict(sha256=digest(inputs/"cover.json"),count=2,cursor=2,base_step=3),sheet=dict(geometry_sha256="a"*64,schedule_start=3)))
+            payload=("UFSM"+json.dumps(saved)+"\n").encode()+b"weights, optimizer and EMA"
+            (previous/"model/last.ckpt").write_bytes(payload)
+            state=dict(task="surface_winding",status="trained",updates=2,geometry_sha256="a"*64,
+                command=[str(inputs/"ufsm"),"train",str(inputs/"sources.json"),"--out",str(previous/"model"),
+                    "--resume",str(inputs/"resume.ckpt"),"--cover",str(inputs/"cover.json"),"--steps","2","--sheet-init","1"],
+                inputs={str(p.relative_to(inputs)):digest(p) for p in inputs.rglob("*") if p.is_file()})
+            (previous/"state.json").write_text(json.dumps(state))
+            new_plan=dict(plan,count=3,tiles=plan["tiles"]+[[0,64,0,0]])
+            new_cover=root/"cover.json"; new_cover.write_text(json.dumps(new_plan))
+            binary=root/"binary"; binary.write_bytes(b"new binary")
+            args=argparse.Namespace(run=previous,cover=new_cover,binary=binary,out=root/"extended",prepare_only=True)
+            extend(args)
+            result=json.loads((args.out/"state.json").read_text()); verify_inputs(args.out,result)
+            self.assertEqual((args.out/"inputs/resume.ckpt").read_bytes(),payload)
+            self.assertEqual(result["coverage_extension"]["base_step"],3)
+            self.assertEqual(result["coverage_extension"]["added_updates"],1)
+            self.assertNotIn("--sheet-init",result["command"])
+            self.assertIn("--cover-extend-from",result["command"])
+            args.out=root/"invalid"
+            new_plan["tiles"][0]=[0,1,0,0]; new_cover.write_text(json.dumps(new_plan))
+            with self.assertRaisesRegex(ValueError,"unchanged prefix"): extend(args)
+            new_plan["tiles"][0]=plan["tiles"][0]; new_plan["tiles"][-1]=[0,950,1000,1000]; new_cover.write_text(json.dumps(new_plan))
+            with self.assertRaisesRegex(ValueError,"guarded geometry holdout"): extend(args)
+
     def test_augmentation_reconfigure_keeps_cursor_and_geometry(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); previous=root/"previous"; inputs=previous/"inputs"; inputs.mkdir(parents=True)
