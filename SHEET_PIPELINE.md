@@ -181,6 +181,9 @@ both GPUs plus small real training, resume and floating-output prediction. The
 CUDA integration fixture uses 32-cubes and widths 8,8, so it verifies behavior,
 not production capacity, accuracy or speed. Existing raster, sampler and production
 runner regression tests remain applicable.
+The FP16 weight-gradient regression also covers spatial launch grids larger than
+65,535 blocks and checks analytic weight/bias gradients at both strides. Spatial
+blocks use CUDA's large grid-X dimension.
 
 ## Local qualification (2026-10-03)
 
@@ -198,3 +201,12 @@ GPU training. The existing selected-surface production job still owns both GPUs.
 CPU and small single-/split-GPU integration tests pass; the complete GPU regression
 suite and the new task's large-window capacity, speed and quality gates remain
 to be measured when the production GPUs are available.
+
+The subsequent real-data pilot stopped production cleanly at step 42,408 and
+warm-started from that committed checkpoint. The winding task exceeded device
+memory at 704. Its 608-cube, batch-1 Z split completed twelve updates and final
+validation with all five geometric losses finite. Sampled peaks were 13,230 /
+13,213 MiB. Steady logged throughput was about 0.55 windows/s, or 124 Mvox/s
+total across both GPUs; this short pilot does not establish sustained throughput
+or convergence. It exposed and fixed an FP16 weight-gradient launch-grid limit
+that small CUDA fixtures did not exercise. Matched ablations use this newer donor.

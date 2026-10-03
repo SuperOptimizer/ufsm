@@ -119,12 +119,16 @@ build/test_sheet: tests/test_sheet.c build/sheet.o build/json.o
 build/test_sheet_gpu: tests/test_sheet_gpu.c build/split.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
+build/test_wgrad_grid: tests/test_wgrad_grid.c build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+
 test-sheet: build/test_sheet
 	python3 tests/test_sheet_geometry.py
 	python3 tests/test_sheet_native.py
 	python3 tests/test_sheet_pipeline.py
 
-test-sheet-gpu: build/ufsm build/test_sheet_gpu build/make_pipeline_fixture
+test-sheet-gpu: build/ufsm build/test_sheet_gpu build/test_wgrad_grid build/make_pipeline_fixture
+	./build/test_wgrad_grid
 	./build/test_sheet_gpu
 	python3 tests/test_sheet_cli.py
 
@@ -143,11 +147,14 @@ build/make_pipeline_fixture: tests/make_pipeline_fixture.c build/z3w.o
 build/test_eval: tests/test_eval.c src/eval.c $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_eval.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
 
+test: build/test_wgrad_grid
+
 build:
 	mkdir -p build
 
 test: build/test_sheet build/test_sheet_gpu build/test_cover build/test_ct_augment build/check_surface_samples build/test_raster build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging build/test_stem_precision build/test_gn_contract build/test_sampler_safety build/test_optimizer_owners build/test_infer_buffers build/test_recompute_live build/test_checkpoint_runtime build/make_pipeline_fixture build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
 	$(MAKE) test-sheet
+	./build/test_wgrad_grid
 	./build/test_sheet_gpu
 	python3 tests/test_sheet_cli.py
 	./build/test_cover
