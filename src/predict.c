@@ -2,6 +2,9 @@
    probability pyramid (uint8 p*255, q=8) in the published layout. */
 #include "nn.h"
 #include "checkpoint.h"
+#include "sheet.h"
+#include <zstd.h>
+#include <sys/stat.h>
 #include "pyramid.h"
 #include "sources.h"
 #include "store.h"
@@ -103,12 +106,23 @@ static int parse_grid_origin(const char *text, int64_t origin[3]) {
     return 0;
 }
 
+static int sheet_write_shard(const char *out,const float *q,int shard,int64_t z,int64_t y,int64_t x) {
+    char path[1600]; snprintf(path,sizeof path,"%s/winding/%lld.%lld.%lld.q.zst",out,(long long)z,(long long)y,(long long)x);
+    size_t bytes=(size_t)shard*shard*shard*4,cap=ZSTD_compressBound(bytes); void *compressed=malloc(cap);
+    if (!compressed) return -1;
+    size_t n=ZSTD_compress(compressed,cap,q,bytes,3);
+    if (ZSTD_isError(n)) { free(compressed); return -1; }
+    FILE *f=fopen(path,"wb"); if (!f) { free(compressed); return -1; }
+    int bad=fwrite(compressed,1,n,f)!=n; bad|=fclose(f)!=0; free(compressed); return bad?-1:0;
+}
+
 int cmd_predict(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window 288] [--act-mx8 1]\n"
                         "       [--halo 8] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
                         "       [--prec 0|1|2|3|4] [--policy enc0=1,...] [--f16 0|1] [--fp4 0|1] [--input-mx 0|1] [--input-prec 0|4|8] [--ema 1]   EMA or current weights (0)\n"
                         "       [--gn-stats stored|legacy]   defaults to the checkpoint's normalization contract\n"
+                        "       [--reference reference.json]   required for a surface_winding checkpoint, native level 0\n"
                         "       [--grid-origin z,y,x]   anchor tile interiors in selected-level CT voxels, independent of the output box\n"
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n");
         fprintf(stderr, "  For exact shard tiling, window - 2*halo should divide the shard size: 528 with halo 8 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n");
@@ -141,6 +155,15 @@ int cmd_predict(int argc, char **argv) {
     }
     unet_cfg cfg; int step = 0; checkpoint_runtime runtime;
     int embedded = checkpoint_runtime_read(ckpt, &runtime);
+    char geometry_sha[65],reference_sha[65]; int sheet_task=sheet_checkpoint(ckpt,geometry_sha,reference_sha);
+    sheet_dataset *sheet=nullptr; const char *geometry=opt(argc,argv,"--geometry",nullptr);
+    const char *reference=opt(argc,argv,"--reference",nullptr);
+    if (sheet_task<0 || (sheet_task && !geometry && !reference) || (!sheet_task && (geometry || reference)) || (geometry && reference)) { fprintf(stderr,"winding prediction requires its --reference or --geometry contract; legacy models do not accept it\n"); return 2; }
+    if (sheet_task) {
+        sheet=reference?sheet_load_reference(reference):sheet_load(geometry);
+        if (reference && sheet) strcpy(sheet->manifest_sha,geometry_sha);
+        if (!sheet || strcmp(geometry_sha,sheet->manifest_sha) || strcmp(reference_sha,sheet->reference_sha) || level!=0) { fprintf(stderr,"winding reference mismatch or non-native level\n"); return 2; }
+    }
     if (embedded < 0 || unet_peek(ckpt, &cfg, &step) || cfg.nlev < 1 || cfg.nlev > UNET_MAXLEV) { fprintf(stderr, "cannot read checkpoint settings: %s\n", ckpt); return 1; }
     const char *gn_stats = opt(argc, argv, "--gn-stats", embedded && runtime.gn_stored ? "stored" : "legacy");
     if (strcmp(gn_stats, "stored") && strcmp(gn_stats, "legacy")) { fprintf(stderr, "--gn-stats must be stored or legacy\n"); return 2; }
@@ -177,12 +200,14 @@ int cmd_predict(int argc, char **argv) {
     if (*opt(argc, argv, "--input-mx", "") && !atoi(opt(argc, argv, "--input-mx", "0"))) input = input_prec = 0;
     if (unet_set_input_prec(input_prec)) { fprintf(stderr, "--input-prec must be 0, 4 or 8\n"); return 2; }
     unet_set_input_mx(input);
+    if (sheet_task) { unet_set_input_mx(0); unet_set_input_prec(0); }
     fprintf(stderr, "prediction precision: %s checkpoint, prec=%d f16=%d act_mx4=%d act_mx8=%d input_mx=%d input_prec=%d gn_stats=%s\n", embedded ? "embedded" : "legacy", nn_get_prec(), nn_get_f16(), mx4, mx8, unet_input_converted(), unet_input_prec(), gn_stats);
     /* --gpus a,b,...: one worker process per GPU, each writes every n-th shard of the same store; the parent builds the pyramid */
     int gpus[8], ngpu = 0, part = 0;
     { const char *gl = opt(argc, argv, "--gpus", nullptr); if (gl) { char *t = strdup(gl); for (char *q = strtok(t, ","); q && ngpu < 8; q = strtok(nullptr, ",")) gpus[ngpu++] = atoi(q); free(t); } }
     if (ngpu <= 1) { if (ngpu == 1) gpu = gpus[0]; ngpu = 1; }
     if (ngpu > 1 && !box) { fprintf(stderr, "--gpus needs --box\n"); return 2; }
+    if (sheet_task && ngpu>1) { fprintf(stderr,"winding export currently uses one GPU per output store\n"); return 2; }
     pid_t kids[8] = {0}; int is_child = 0;
     if (ngpu > 1) {
         for (int i = 0; i < ngpu; i++) {
@@ -228,6 +253,15 @@ int cmd_predict(int argc, char **argv) {
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     int stride = W - 2 * halo;
     size_t w3 = (size_t)W * W * W;
+    float *sheet_window=nullptr,*sheet_shard=nullptr,*sheet_rows=nullptr;
+    if (sheet_task) {
+        char path[1400]; snprintf(path,sizeof path,"%s/winding",out); if (mkdir(path,0755) && errno!=EEXIST) return 1;
+        sheet_window=malloc(w3*4); sheet_shard=malloc((size_t)shard*shard*shard*4); sheet_rows=malloc(4*(size_t)W*sizeof(float));
+        if (!sheet_window || !sheet_shard || !sheet_rows) return 1;
+        snprintf(path,sizeof path,"%s/winding/manifest.json",out); FILE *f=fopen(path,"w"); if (!f) return 1;
+        fprintf(f,"{\"version\":1,\"task\":\"surface_winding\",\"dtype\":\"<f4\",\"codec\":\"zstd\",\"units\":\"turns\",\"shape\":[%lld,%lld,%lld],\"origin_zyx\":[%lld,%lld,%lld],\"shard\":%d,\"validity\":\"finite and surface probability >= 0.1\",\"geometry_sha256\":\"%s\",\"reference_sha256\":\"%s\"}\n",(long long)bn[0],(long long)bn[1],(long long)bn[2],(long long)bo[0],(long long)bo[1],(long long)bo[2],shard,geometry_sha,reference_sha);
+        if (fclose(f)) return 1;
+    }
     writer_t WR = {0}; WR.w = w; WR.nthreads = nthreads; WR.bytes = (size_t)shard * shard * shard;
     /* default path (UFSM_PRED_HOSTPATH=1: the previous host path, for A/B): pinned reader / shard buffers, window statistics
        on the device, the interior probabilities placed into a device shard buffer that is downloaded once per shard */
@@ -285,6 +319,7 @@ int cmd_predict(int argc, char **argv) {
         const tile_t *t = &rd.tiles[i];
         if (t->shard != cur_shard) {   /* new shard: flush the previous one */
             if (cur_shard >= 0) {
+                if (sheet_task && sheet_write_shard(out,sheet_shard,shard,sz,sy,sx)) return 1;
                 pt = now();
                 if (any) { if (gpath) nn_d2h(sbuf, dsh, WR.bytes); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb ^= 1; sbuf = WR.buf[sb]; }
                 p_wr += now() - pt;
@@ -296,6 +331,7 @@ int cmd_predict(int argc, char **argv) {
             for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
             if (gpath) nn_zero(dsh, WR.bytes); else memset(sbuf, 0, (size_t)shard * shard * shard);
             any = 0;
+            if (sheet_task) for (size_t j=0;j<(size_t)shard*shard*shard;j++) sheet_shard[j]=NAN;
         }
         int k = (int)(i % NSLOT);
         const uint8_t *ctu = rd.buf[k];
@@ -322,7 +358,23 @@ int cmd_predict(int argc, char **argv) {
             nn_h2d(dyd, dyo, 2 * (size_t)W * sizeof(float));
             if (pprof) { nn_sync(); p_h2d += now() - pt; pt = now(); }
             nn_pred_input(ctd, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0, xd, h16);
+            if (sheet_task) {
+                for (int z=0;z<W;z++) { double a[4]; sheet_parameters(sheet,o[0]+z,a); sheet_rows[4*z]=(float)(o[1]-a[0]); sheet_rows[4*z+1]=(float)(o[2]-a[1]); sheet_rows[4*z+2]=(float)(1/a[2]); sheet_rows[4*z+3]=(float)a[3]; }
+                nn_sheet_input(xd,W,sheet_rows,(float)sheet->center,(float)sheet->scale,h16);
+            }
             const float *lg = unet_forward_x(u, xd, xs, 0, h16);
+            if (sheet_task) {
+                nn_sheet_gate((float *)lg+w3,lg,ctd,W,sheet_rows);
+                nn_d2h(sheet_window,lg+w3,w3*4);
+                for (int z=halo;z<W-halo;z++) { int64_t gz=tz+z-so[0]; if (gz<0 || gz>=se[0]-so[0]) continue;
+                    for (int y=halo;y<W-halo;y++) { int64_t gy=ty+y-so[1]; if (gy<0 || gy>=se[1]-so[1]) continue;
+                        for (int x=halo;x<W-halo;x++) { int64_t gx=tx+x-so[2]; if (gx<0 || gx>=se[2]-so[2]) continue;
+                            size_t k=((size_t)z*W+y)*W+x;
+                            sheet_shard[((size_t)gz*shard+gy)*shard+gx]=sheet_window[k];
+                        }
+                    }
+                }
+            }
             if (gpath) {   /* interior straight into the device shard buffer */
                 nn_pred_place(lg, ctd, W, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
                 const char *e = nn_check();
@@ -356,6 +408,7 @@ int cmd_predict(int argc, char **argv) {
     if (pprof) fprintf(stderr, "\npredict profile (s): main: wait-reader %.2f h2d %.2f gpu(fwd+d2h) %.2f interior-copy %.2f writer-wait %.2f | reader: read %.2f stats %.2f slot-wait %.2f | wall %.2f, %ld tiles\n",
                        p_wait, p_h2d, p_gpu, p_copy, p_wr, rd.t_read, rd.t_stats, rd.t_wait, now() - t0, ntiles);
     if (cur_shard >= 0 && any) { if (gpath) nn_d2h(sbuf, dsh, WR.bytes); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } }
+    if (sheet_task && cur_shard>=0 && sheet_write_shard(out,sheet_shard,shard,sz,sy,sx)) return 1;
     if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
     if (writer_finish(&WR, wth)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     if (gpath) { nn_host_free(WR.buf[0]); nn_host_free(WR.buf[1]); nn_free(dsh); } else { free(WR.buf[0]); free(WR.buf[1]); }
@@ -370,5 +423,6 @@ int cmd_predict(int argc, char **argv) {
     if (pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs)) return 1;
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs)\n", out, ntiles, now() - t0);
     z3_close(ct); store_close(s); unet_free(u);
+    free(sheet_window); free(sheet_shard); free(sheet_rows); sheet_free(sheet);
     return 0;
 }

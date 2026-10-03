@@ -37,7 +37,12 @@ typedef struct {
     int lean;                    /* one batch buffer; logit gradient in the model's gradient buffer B */
     int cur;
     int side;                    /* --split z: 0 = low z half, 1 = high z half of every window; -1 = whole windows */
+    const sheet_batch *sheet;
+    double sheet_loss, sheet_parts[5];
 } gpu_state;
+static sheet_dataset *g_sheet;
+static float g_sheet_ramp;
+static int g_sheet_variant=2;
 /* --split z: both GPUs work on the same window, each on its z half plus g_h0 halo planes (depth g_Dl); the mask is zeroed on
    the halo planes (from a pinned zero buffer) so each voxel counts once */
 static int g_Dl, g_h0; static uint8_t *g_zeros;
@@ -62,6 +67,7 @@ static void upload_slab(gpu_state *d, const batch *b, int i, int B, int P, int a
 }
 /* synchronous upload (pageable host memory: validation batches) */
 static void upload(gpu_state *d, const batch *b, int B, int P) {
+    d->sheet=b->sheet?b->sheet[0]:nullptr;
     if (d->side >= 0) { upload_slab(d, b, d->cur, B, P, 0); return; }
     size_t p3 = (size_t)P * P * P;
     nn_h2d(d->x, bx(b), (size_t)B * 4 * p3 * xbytes());
@@ -71,6 +77,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
 }
 /* asynchronous upload of a pinned sampler batch into buffer i on the copy stream, after the compute that last used it */
 static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
+    d->sheet=b->sheet?b->sheet[0]:nullptr;
     size_t p3 = (size_t)P * P * P;
     nn_stream_wait(1, d->ev_done[i]);   /* the step two back: this upload overlaps the current step */
     if (d->lean) nn_stream_wait(1, d->ev_done[i ^ 1]);   /* lean: one buffer (inside the gradient buffers), free after the current step */
@@ -115,7 +122,36 @@ static void diagnose_nan(gpu_state *d, int B, int P, int step, const char *out) 
     if (f) { int hdr[4] = {B, P, g_xfmt, NCH}; fwrite(hdr, 4, 4, f); fwrite(hx, 1, xbytes_, f); fwrite(ht, 1, (size_t)B * NCH * p3, f); fwrite(hm, 1, (size_t)B * p3, f); fwrite(hw, 1, (size_t)B * NCH, f); fwrite(hl, 4, nl, f); fclose(f); fprintf(stderr, "  batch dumped to %s\n", fn); }
     free(hx); free(ht); free(hm); free(hw); free(hl);
 }
-/* forward + loss kernels on the uploaded batch of this GPU (asynchronous); fills gl when train. */
+typedef struct { uint64_t index; double value; } sheet_coo;
+static int coo_cmp(const void *a,const void *b) { uint64_t x=((const sheet_coo *)a)->index,y=((const sheet_coo *)b)->index; return (x>y)-(x<y); }
+static void sheet_objective(gpu_state *d,shape5 os,int P,int train) {
+    const sheet_batch *b=d->sheet; d->sheet_loss=0; memset(d->sheet_parts,0,sizeof d->sheet_parts);
+    if (!g_sheet || !b || !b->np) return;
+    float *xyz=malloc(3*b->np*sizeof *xyz); double *v=malloc(2*b->np*sizeof *v),*grad=malloc(2*b->np*sizeof *grad);
+    for (size_t p=0;p<b->np;p++) memcpy(xyz+3*p,b->points[p].xyz,3*sizeof(float));
+    int z0=d->side==1?P/2-g_h0:0,lo=d->side==1?P/2:0,hi=d->side==0?P/2:P;
+    nn_sheet_gather(d->lg,os,xyz,b->np,z0,lo,hi,v);
+    for (size_t p=0;p<b->np;p++) v[2*p+1]+=b->points[p].q0;
+    d->sheet_loss=sheet_loss(b,v,grad,d->sheet_parts,g_sheet_ramp,g_sheet_variant);
+    if (train) {
+        sheet_coo *coo=malloc(16*b->np*sizeof *coo); size_t count=0,S=(size_t)os.d*P*P;
+        for (size_t p=0;p<b->np;p++) {
+            int base[3]; double f[3]; for (int a=0;a<3;a++) { base[a]=(int)floor(xyz[3*p+a]); f[a]=xyz[3*p+a]-base[a]; }
+            for (int dz=0;dz<2;dz++) for (int dy=0;dy<2;dy++) for (int dx=0;dx<2;dx++) {
+                int gz=base[0]+dz,z=gz-z0,y=base[1]+dy,x=base[2]+dx;
+                if (gz<lo || gz>=hi || z<0 || z>=os.d || y<0 || y>=P || x<0 || x>=P) continue;
+                double w=(dz?f[0]:1-f[0])*(dy?f[1]:1-f[1])*(dx?f[2]:1-f[2]); if (w==0) continue;
+                size_t idx=((size_t)z*P+y)*P+x;
+                for (int c=0;c<2;c++) if (grad[2*p+c]!=0) coo[count++]=(sheet_coo){idx+c*S,w*grad[2*p+c]};
+            }
+        }
+        qsort(coo,count,sizeof *coo,coo_cmp); uint64_t *idx=malloc((count?count:1)*sizeof *idx); float *dg=malloc((count?count:1)*sizeof *dg); size_t n=0;
+        for (size_t i=0;i<count;) { uint64_t k=coo[i].index; double value=0; do { value+=coo[i++].value; } while (i<count && coo[i].index==k); idx[n]=k; dg[n++]=(float)value; }
+        nn_sheet_scatter(d->gl,idx,dg,n,g_g16); free(coo); free(idx); free(dg);
+    }
+    free(xyz); free(v); free(grad);
+}
+/* forward + loss kernels on the uploaded batch of this GPU; fills gl when train. */
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 xs = {B, 4, d->side >= 0 ? g_Dl : P, P, P};
     const float *lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
@@ -129,6 +165,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     int prof = ufsm_env_on("UFSM_PROF");
     if (prof) nn_prof_begin(6);
     nn_loss_async(lg, d->t, d->m, d->w, os, dice_w, train ? d->gl : nullptr, d->scratch);
+    sheet_objective(d,os,P,train);
     if (prof) nn_prof_end();
 }
 /* fetch the loss parts of the last run_batch on this GPU (synchronous); returns the scalar loss */
@@ -138,7 +175,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     int cout = unet_cfg_of(d->u)->cout;
     double loss = 0; int active = 0;
     for (int c = 0; c < cout; c++) if (out[c] > 0 || out[cout + c] > 0) { loss += out[c] + dice_w * out[cout + c]; active++; }
-    return active ? loss / active : 0;
+    return (active ? loss / active : 0)+d->sheet_loss;
 }
 
 /* --split z: forward, loss and backward of one window on both GPUs (src/split.h) */
@@ -159,6 +196,8 @@ int cmd_train(int argc, char **argv) {
                         "       [--cover PLAN.json] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
                         "       [--gn-stats stored|legacy]   fresh training uses stored activations; resume preserves the saved contract\n"
                         "       [--schedule-start STEP]   restart the LR schedule at this saved step, preserving optimizer state\n"
+                        "       [--task surface_winding --geometry geometry.json] [--sheet-init 1] [--sheet-variant 0|1|2]\n"
+                        "       [--warm-start 1]   start a new cover from a legacy checkpoint's weights/state\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  --split z --gpus 0,1: every window is split along z across the two GPUs instead (batch B; P a multiple of 2^nlev).\n"
                         "  env UFSM_PROF=1 prints per-op GPU time every log interval (category 'upload+loss+opt').\n");
@@ -180,6 +219,26 @@ int cmd_train(int argc, char **argv) {
     int val_every = atoi(opt(argc, argv, "--val-every", "500")), ckpt_every = atoi(opt(argc, argv, "--ckpt-every", "1000"));
     uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "0"));
     const char *resume = opt(argc, argv, "--resume", nullptr);
+    const char *geometry=opt(argc,argv,"--geometry",nullptr),*task=opt(argc,argv,"--task",geometry?"surface_winding":"surface");
+    int sheet_init=atoi(opt(argc,argv,"--sheet-init","0")); char old_geometry[65],old_reference[65];
+    int saved_variant=2,saved_sheet_start=0;
+    int sheet_ck=resume?sheet_checkpoint(resume,old_geometry,old_reference):0;
+    if (sheet_ck<0 || (strcmp(task,"surface") && strcmp(task,"surface_winding")) || (!strcmp(task,"surface_winding") != (geometry!=nullptr)) ||
+        (sheet_ck && (!geometry || sheet_init)) || (geometry && resume && !sheet_ck && !sheet_init) || (sheet_init && (!geometry || !resume))) {
+        fprintf(stderr,"task mismatch: surface_winding needs --geometry; legacy warm-start needs --sheet-init 1; winding resumes preserve their geometry\n"); return 2;
+    }
+    if (geometry) {
+        g_sheet=sheet_load(geometry); if (!g_sheet) return 2;
+        if (sheet_ck && (strcmp(old_geometry,g_sheet->manifest_sha) || strcmp(old_reference,g_sheet->reference_sha))) { fprintf(stderr,"winding geometry/reference changed at resume\n"); return 2; }
+        if (B!=1 || strcmp(opt(argc,argv,"--mem","auto"),"wide")==0 || atoi(opt(argc,argv,"--axis-jitter","0")) || atoi(opt(argc,argv,"--overfit","0")) || getenv("UFSM_SYNC_UPLOAD")) { fprintf(stderr,"winding task requires B=1, no wide/axis-jitter/overfit/sync-upload\n"); return 2; }
+        if (sheet_ck && sheet_checkpoint_options(resume,&saved_variant,&saved_sheet_start)) return 2;
+        const char *variant=opt(argc,argv,"--sheet-variant",nullptr);
+        g_sheet_variant=variant?atoi(variant):saved_variant;
+        if (g_sheet_variant<0 || g_sheet_variant>2 || (sheet_ck && g_sheet_variant!=saved_variant)) {
+            fprintf(stderr,"winding resume must preserve its loss variant\n"); return 2;
+        }
+        unet_set_input_mx(0); unet_set_input_prec(0); unet_set_grad_mx8(0);
+    }
     checkpoint_runtime resumed_runtime; int has_runtime = resume ? checkpoint_runtime_read(resume, &resumed_runtime) : 0;
     if (has_runtime < 0) { fprintf(stderr, "cannot read checkpoint settings: %s\n", resume); return 1; }
     const char *gn_stats = opt(argc, argv, "--gn-stats", resume && (!has_runtime || !resumed_runtime.gn_stored) ? "legacy" : "stored");
@@ -189,6 +248,7 @@ int cmd_train(int argc, char **argv) {
     nn_set_prec(atoi(opt(argc, argv, "--prec", "1")));   /* 1 bf16, 2 fp8, 3 fp4 fwd + fp8 wgrad (2/3 force bf16 storage) */
     if (has_runtime && resumed_runtime.input_prec) unet_set_input_prec(resumed_runtime.input_prec);
     if (*opt(argc, argv, "--input-prec", "") && unet_set_input_prec(atoi(opt(argc, argv, "--input-prec", "0")))) { fprintf(stderr, "--input-prec must be 0, 4 or 8\n"); return 2; }
+    if (g_sheet) { unet_set_input_mx(0); unet_set_input_prec(0); }
     if (f16) { nn_set_f16(1); nn_set_grad_scale((float)atof(opt(argc, argv, "--gscale", "1024"))); }
     const char *optname = opt(argc, argv, "--opt", "adamw");   /* adamw | muon (3^3 conv weights: nesterov momentum + Newton-Schulz orthogonalisation; rest AdamW) */
     float muon_lr = (float)atof(opt(argc, argv, "--muon-lr", "0.02")), muon_beta = (float)atof(opt(argc, argv, "--muon-beta", "0.95"));
@@ -196,7 +256,13 @@ int cmd_train(int argc, char **argv) {
     float anvil_lr = (float)atof(opt(argc, argv, "--anvil-lr", "0.023")), anvil_wd = (float)atof(opt(argc, argv, "--anvil-wd", "2.25"));
     const char *sched = opt(argc, argv, "--sched", "cos");   /* cos | wsd (warmup, constant, linear cooldown over the last --cooldown fraction; extendable runs) */
     int schedule_start = atoi(opt(argc, argv, "--schedule-start", "0"));
-    if (schedule_start < 0 || schedule_start >= steps) { fprintf(stderr, "schedule-start must precede the final step\n"); return 2; }
+    if (sheet_ck) {
+        if (*opt(argc,argv,"--schedule-start","") && schedule_start!=saved_sheet_start) {
+            fprintf(stderr,"winding resume must preserve its ramp/schedule origin\n"); return 2;
+        }
+        schedule_start=saved_sheet_start;
+    }
+    if (schedule_start < 0) { fprintf(stderr, "schedule-start must be nonnegative\n"); return 2; }
     float cooldown = (float)atof(opt(argc, argv, "--cooldown", "0.2"));
     int qat = atoi(opt(argc, argv, "--qat", "0"));
     /* Save the requested policy and the compute paths observed after dispatch, alongside storage modes. */
@@ -251,6 +317,7 @@ int cmd_train(int argc, char **argv) {
         g_zeros = nn_host_alloc((size_t)g_h0 * P * P); memset(g_zeros, 0, (size_t)g_h0 * P * P);
     }
     const int nl = split ? 1 : ng;   /* windows per step (loss averaging, samples / s) */
+    if (g_sheet && nl!=1) { fprintf(stderr,"winding currently supports one whole or spatially split window\n"); return 2; }
     char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", out); if (system(cmd)) return 1;
 
     sources *S = sources_load(src);
@@ -265,10 +332,14 @@ int cmd_train(int argc, char **argv) {
     sc.ct_augment = atoi(opt(argc, argv, "--ct-aug", "0"));
     sc.symmetry_p = (float)atof(opt(argc, argv, "--symmetry-p", "1"));
     sc.axis_jitter = (float)atof(opt(argc, argv, "--axis-jitter", "0"));
+    sc.sheet=g_sheet;
+    if (g_sheet) { sc.augment=noaug?0:3; memset(sc.level_p,0,sizeof sc.level_p); sc.level_p[0]=1; }
     if (!isfinite(sc.symmetry_p) || sc.symmetry_p < 0 || sc.symmetry_p > 1 || !isfinite(sc.axis_jitter) || sc.axis_jitter < 0) { fprintf(stderr, "invalid augmentation bounds\n"); return 2; }
     cover_plan *plan = nullptr; cover_progress coverage = {0}, prior_cover = {0};
     const char *cover_path = opt(argc, argv, "--cover", nullptr);
-    int has_cover = resume ? cover_checkpoint_read(resume, &prior_cover) : 0;
+    int warm_start=atoi(opt(argc,argv,"--warm-start","0"));
+    if (warm_start && (!resume || sheet_ck)) { fprintf(stderr,"--warm-start requires a legacy donor checkpoint\n"); return 2; }
+    int has_cover = resume && !sheet_init && !warm_start ? cover_checkpoint_read(resume, &prior_cover) : 0;
     if (has_cover < 0 || (has_cover && !cover_path)) { fprintf(stderr, "finite-cover resume requires its original plan\n"); return 2; }
     if (cover_path) {
         if (B != 1 || nl != 1 || overfit || seconds || atoi(opt(argc, argv, "--finetune", "0"))) { fprintf(stderr, "cover requires B=1, one window per step, step-based schedule and no overfit/finetune\n"); return 2; }
@@ -281,10 +352,14 @@ int cmd_train(int argc, char **argv) {
     }
     sc.dilate = atoi(opt(argc, argv, "--dilate", "0"));   /* thicken surface targets by D level-0 voxels (curriculum) */
     sc.soft = (float)atof(opt(argc, argv, "--soft", "0"));  /* soft ridge target with this sigma (level-0 voxels) */
+    if (g_sheet && (sc.soft<=0 || sc.soft>g_sheet->max_soft_sigma)) {
+        fprintf(stderr,"winding soft sigma must be positive and <= audited spacing cap %g\n",g_sheet->max_soft_sigma); return 2;
+    }
     float soft_end = (float)atof(opt(argc, argv, "--soft-end", "-1")); if (soft_end < 0) soft_end = sc.soft;   /* sigma annealed linearly to this value at the last step */
     if (plan && soft_end != sc.soft) { fprintf(stderr, "finite cover requires a fixed soft-target sigma for deterministic resume\n"); return 2; }
     if (soft_end != sc.soft) fprintf(stderr, "soft target sigma annealed %g -> %g; the fixed validation batches keep sigma %g, so the validation loss (and best.ckpt) is not comparable across the run: score last.ckpt\n", sc.soft, soft_end, sc.soft);
     { const char *lv = opt(argc, argv, "--levels", nullptr); if (lv) { char *t = strdup(lv); int l = 0; memset(sc.level_p, 0, sizeof sc.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) sc.level_p[l++] = atof(q); free(t); } }
+    if (g_sheet) { memset(sc.level_p,0,sizeof sc.level_p); sc.level_p[0]=1; if (S->n!=1) { fprintf(stderr,"winding v1 requires one registered source\n"); return 2; } }
 
     size_t p3 = (size_t)P * P * P, p3l = split ? (size_t)P * P * g_Dl : p3;   /* per-GPU voxels of a window */
     gpu_state G[8];
@@ -298,7 +373,11 @@ int cmd_train(int argc, char **argv) {
             step0 = unet_load(d->u, resume);
             if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; }
             if (atoi(opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* loaded weights/state, fresh schedule */
-        } else unet_init(d->u, seed + 1);               /* deterministic: every GPU starts identical */
+            if (sheet_init && unet_start_sheet(d->u)) return 2;
+        } else {
+            unet_init(d->u, seed + 1); /* deterministic: every GPU starts identical */
+            if (g_sheet && unet_start_sheet(d->u)) return 2;
+        }
         if (wq) unet_set_wq(d->u, wq);
         if (split) { unet_set_split(d->u, g, g_h0, split_halo); if (!getenv("UFSM_SPLIT_SYNC")) unet_set_split_async(d->u, split_halo_begin, split_halo_end); }
         const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
@@ -314,10 +393,14 @@ int cmd_train(int argc, char **argv) {
         fprintf(stderr, "finite cover: %llu/%llu committed tiles, SHA256 %s, final step %d\n", (unsigned long long)coverage.cursor, (unsigned long long)coverage.count, coverage.sha256, steps);
     }
     if (schedule_start > step0) { fprintf(stderr, "schedule-start cannot follow the resumed step\n"); return 2; }
+    if (sheet_init && !schedule_start) schedule_start=step0;
+    if (schedule_start>=steps || (sheet_ck && schedule_start!=saved_sheet_start)) {
+        fprintf(stderr,"invalid or changed winding schedule origin\n"); return 2;
+    }
     {   /* --mem auto (default): the cheapest storage mode whose training buffers fit next to what is already allocated on every
            GPU; an explicit UFSM_CHUNK_UP / UFSM_RECOMPUTE / UFSM_GRAD_MX8 or --mem default keeps the env / built-in modes */
         const char *mm = opt(argc, argv, "--mem", "auto");   /* MX-fp8 gradients passed their stair (3 seeds, mean 0.293 vs 0.294) */
-        const int auto16 = !strcmp(mm, "auto16") || !unet_act_mx();   /* auto16 (or 16-bit activations): 16-bit gradients only */
+        const int auto16 = g_sheet || !strcmp(mm, "auto16") || !unet_act_mx();   /* sheet reference keeps FP16 stem, hence 16-bit gradients */
         if (!strcmp(mm, "wide")) {
             if (!nn_get_tf32() || !unet_act_mx()) { fprintf(stderr, "--mem wide requires tensor cores and MX activation storage\n"); return 2; }
             unet_set_chunk_up(2); unet_set_recompute(1); unet_set_grad_mx8(1); unet_set_lean(2); unet_set_wide_up_grad(1);
@@ -410,6 +493,10 @@ int cmd_train(int argc, char **argv) {
     strcpy(runtime.policy, saved_policy); strcpy(runtime.optimizer, optname);
     char checkpoint_extra[8192], runtime_extra[8192];
     if (checkpoint_runtime_json(&runtime, runtime_extra, sizeof runtime_extra)) { fprintf(stderr, "invalid checkpoint settings\n"); return 2; }
+    if (g_sheet) {
+        size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"task\":\"surface_winding\",\"sheet\":{\"version\":1,\"units\":\"turns\",\"outputs\":[\"surface_logit\",\"winding_residual\"],\"geometry_sha256\":\"%s\",\"reference_sha256\":\"%s\",\"variant\":%d,\"schedule_start\":%d}}",g_sheet->manifest_sha,g_sheet->reference_sha,g_sheet_variant,schedule_start);
+    }
     strcpy(checkpoint_extra, runtime_extra);
     if (plan && cover_checkpoint_extra(runtime_extra, &coverage, checkpoint_extra, sizeof checkpoint_extra)) return 2;
     fprintf(stderr, "model widths"); for (int i = 0; i < cfg.nlev; i++) fprintf(stderr, " %d", cfg.widths[i]);
@@ -432,6 +519,7 @@ int cmd_train(int argc, char **argv) {
         val[i].t = malloc((size_t)B * NCH * p3); memcpy(val[i].t, b->t, (size_t)B * NCH * p3);
         val[i].m = malloc((size_t)B * p3); memcpy(val[i].m, b->m, (size_t)B * p3);
         val[i].w = malloc((size_t)B * NCH); memcpy(val[i].w, b->w, (size_t)B * NCH);
+        val[i].sheet=calloc((size_t)B,sizeof *val[i].sheet); val[i].sheet[0]=sheet_clone(b->sheet?b->sheet[0]:nullptr);
         sampler_release(vs, b);
     }
     int validation_failed = sampler_failed(vs);
@@ -443,6 +531,11 @@ int cmd_train(int argc, char **argv) {
     if (!sp) return 1;
     char logp[1400]; snprintf(logp, sizeof logp, "%s/log.csv", out);
     FILE *log = fopen(logp, step0 ? "a" : "w");
+    FILE *sheet_log=nullptr;
+    if (g_sheet) {
+        snprintf(logp,sizeof logp,"%s/geometry.csv",out); sheet_log=fopen(logp,step0&&!sheet_init?"a":"w");
+        if (sheet_log) { fseek(sheet_log,0,SEEK_END); if (!ftell(sheet_log)) fputs("step,coordinate,continuity,ordering,path,gap,weighted,ramp\n",sheet_log); }
+    }
     if (log) {
         fseek(log, 0, SEEK_END);
         if (ftell(log) == 0) fprintf(log, "step,lr,loss,bce,dice,active,gnorm,val_loss,val_bce,val_dice,samples_per_s,wait_s\n");
@@ -455,6 +548,7 @@ int cmd_train(int argc, char **argv) {
     double best_val = 1e30; int nskip = 0; (void)nskip;
     float parts[8][2 * NCH + 1];
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
+        g_sheet_ramp=fminf(1.f,(float)(step-schedule_start)/500.f);
         nn_set_sr_step((unsigned)step);
         double loss = 0, active = 0;
         /* forward + backward on every GPU; kernel launches are asynchronous so the GPUs overlap */
@@ -562,7 +656,9 @@ int cmd_train(int argc, char **argv) {
             for (int g = 1; g < ng; g++) nn_peer_copy(unet_grad_ptr(G[g].u), G[g].dev, unet_grad_ptr(G[0].u), G[0].dev, np * 4);
         }
         for (int g = 0; g < nl; g++) { nn_init(G[g].dev); loss += fetch_loss(&G[g], B, P, dice_w, parts[g]); active += parts[g][2 * NCH]; }   /* split: both sides hold the window's loss */
+        if (sheet_log) { fprintf(sheet_log,"%d",step); for (int k=0;k<5;k++) fprintf(sheet_log,",%.8g",G[0].sheet_parts[k]); fprintf(sheet_log,",%.8g,%.8g\n",G[0].sheet_loss,g_sheet_ramp); fflush(sheet_log); }
         int fwd_nan = 0;   /* non-finite loss parts: the forward itself produced non-finite logits (not a gradient-scale overflow) */
+        if (g_sheet && !isfinite(G[0].sheet_loss)) fwd_nan=1;
         for (int g = 0; g < nl; g++) for (int c = 0; c < 2 * NCH; c++) if (!isfinite(parts[g][c])) fwd_nan = 1;
         if (fwd_nan && !overfit && !split) diagnose_nan(&G[0], B, P, step, out);
         float lr;
@@ -636,6 +732,7 @@ int cmd_train(int argc, char **argv) {
                         select_buf(&G[g], keep);
                         batch *pb = split ? G[0].pending : G[g].pending;
                         if (G[g].lean && pb) { nn_init(G[g].dev); upload(&G[g], pb, B, P); }   /* one buffer: the prefetched batch was overwritten */
+                        G[g].sheet=pb && pb->sheet?pb->sheet[0]:nullptr;
                     }
                 }
                 for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, 0); }
@@ -670,6 +767,8 @@ int cmd_train(int argc, char **argv) {
     int sampling_failed = sampler_failed(sp);
     sampler_stop(sp);
     if (log) fclose(log);
+    if (sheet_log) fclose(sheet_log);
     cover_free(plan);
+    sheet_free(g_sheet); g_sheet=nullptr;
     return sampling_failed || training_failed ? 1 : 0;
 }

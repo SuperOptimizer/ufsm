@@ -1,0 +1,5 @@
+{
+  "development": [[48128, 17408, 16384, 384, 1024, 1024]],
+  "test": [[48768, 17408, 16384, 384, 1024, 1024]],
+  "note": "Both regions lie inside the existing withheld 1024-cube. The middle 256 axial voxels separate development and final test. Builder additionally excludes a 704-voxel training guard. Use a donor whose source/cover withheld this original cube."
+}

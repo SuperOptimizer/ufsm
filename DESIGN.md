@@ -6,7 +6,20 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## Current production audit (2026-10-02)
+## Continuous winding experiment (2026-10-03)
+
+The experimental surface/winding pipeline is implemented without changing the
+1,172,050-parameter backbone. It adds sparse coordinate, continuity, relative
+ordering, path-support and gap losses; floating winding output; constrained sheet
+reconstruction; and matched development/final-test evaluation. See
+[SHEET_PIPELINE.md](SHEET_PIPELINE.md) for commands, precision contracts and limits.
+The complete selected Paris4 geometry dataset is built and four 2,000-update
+ablations are prepared. Small native single-/split-GPU integration tests pass;
+large-window capacity, throughput and quality remain unmeasured for this task.
+The existing selected-surface coverage production run continues with its frozen
+binary. Its recipe is not replaced by the experimental winding task.
+
+## Earlier production audit (2026-10-02)
 
 The pipeline is qualified to launch full training: major measured performance hypotheses are bounded,
 all 38 final Make commands pass, and calibration and global-grid checks have completed. No long run

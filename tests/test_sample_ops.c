@@ -89,6 +89,30 @@ int main(void) {
         if (worst > 2e-4) { printf("fused input writer  FAIL\n"); bad++; }
         free(ct); free(A); free(B);
     }
+    { /* Scalar winding reference follows spatial augmentation without a sign flip. */
+        const int P=12; size_t p3=(size_t)P*P*P; const int64_t o[3]={1000,2345,3456};
+        double knots[2][5]={{1000,2350,3450,10,-2},{1012,2354,3448,12,-1}};
+        sheet_dataset sheet={.nk=2,.knots=knots,.center=4,.scale=20};
+        double params[12][4]; float cy[12],cx[12],nrow[12];
+        for (int z=0;z<P;z++) { sheet_parameters(&sheet,o[0]+z,params[z]); cy[z]=params[z][0]; cx[z]=params[z][1]; }
+        uint8_t *ct=calloc(p3,1); float *input=calloc(4*p3,4); uint16_t *half=calloc(4*p3,2);
+        int checked=0;
+        for (int si=0;si<48;si++) {
+            sym y=sym_of(si); if (y.perm[0]!=0 || y.flip[0]) continue;
+            write_x_aug(ct,P,o,0,1,1,cy,cx,y,0,1,0,0,&r,nrow,0,input,nullptr,nullptr,nullptr,nullptr,&sheet,params);
+            write_x_aug(ct,P,o,0,1,1,cy,cx,y,0,1,0,0,&r,nrow,1,nullptr,half,nullptr,nullptr,nullptr,&sheet,params);
+            for (int z=0;z<P;z++) for (int yy=0;yy<P;yy++) for (int x=0;x<P;x++) {
+                int out[3]={z,yy,x}; double world[3];
+                for (int d=0;d<3;d++) world[y.perm[d]]=o[y.perm[d]]+(y.flip[d]?P-1-out[d]:out[d]);
+                float expected=(sheet_reference(&sheet,world)-sheet.center)/sheet.scale;
+                size_t k=p3+((size_t)z*P+yy)*P+x; _Float16 h; memcpy(&h,half+k,2);
+                if (fabs(input[k]-expected)>1e-6 || fabs((float)h-expected)>2e-4) bad++;
+            }
+            checked++;
+        }
+        printf("winding input: %d Z-preserving symmetries, FP32/FP16 scalar reference checked\n",checked);
+        free(ct); free(input); free(half);
+    }
     size_t n = 1 << 24; float *X = calloc(n, 4);
     pthread_once(&g_ntab_once, ntab_init);
     for (size_t k = 0; k < n; k += 4) { uint64_t u = rnext(&r); X[k] = g_ntab[u & 0xffff]; X[k + 1] = g_ntab[(u >> 16) & 0xffff]; X[k + 2] = g_ntab[(u >> 32) & 0xffff]; X[k + 3] = g_ntab[u >> 48]; }

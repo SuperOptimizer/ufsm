@@ -141,6 +141,8 @@ def main():
     parser.add_argument("--segments-file", type=Path, help="exact segment directories, one per line")
     parser.add_argument("--download-cache", type=Path, help="reuse AWS files and receipts from another work directory")
     parser.add_argument("--binary", type=Path, default=REPO / "build/ufsm")
+    parser.add_argument("--band-chamfer", type=int, choices=(0, 4), default=4,
+                        help="0: unexpanded reference surface; 4: existing expanded binary band")
     parser.add_argument("--download-workers", type=int, default=6)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--shard", type=int, default=512)
@@ -201,6 +203,7 @@ def main():
     mesh_paths = [cache / "aws" / s["mesh_prefix"] for s in surfaces]
     command = [str(args.binary.resolve()), "raster", str(staging), "--shape", ",".join(map(str, shape)),
                "--um", str(args.um), "--level", str(args.level), "--binary", "1",
+               "--band-chamfer", str(args.band_chamfer),
                "--levels", str(args.levels), "--threads", str(args.threads), "--shard", str(args.shard),
                *map(str, mesh_paths)]
     provenance = {"scroll": args.scroll, "volume": args.volume, "ct_root": args.ct_root, "ct": args.ct,
@@ -209,7 +212,7 @@ def main():
                   "values": {"background": 0, "surface": 255}, "codec": "volcomp-mask-lossless",
                   "label_level": args.level, "label_um": args.um * 2**args.level,
                   "label_shape_zyx": [(n + 2**args.level - 1) // 2**args.level for n in shape],
-                  "surface_band_chamfer": 4, "pyramid_pool": "any-positive",
+                  "surface_band_chamfer": args.band_chamfer, "pyramid_pool": "any-positive",
                   "background_assumption": "All non-surface voxels are negative; released meshes may omit physical sheets.",
                   "train_upsample": "nearest voxel center, ties toward increasing coordinates",
                   "command": command,

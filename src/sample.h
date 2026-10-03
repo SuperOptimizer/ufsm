@@ -3,6 +3,7 @@
 #pragma once
 #include "sources.h"
 #include "cover.h"
+#include "sheet.h"
 #include <stdint.h>
 
 typedef struct {
@@ -27,6 +28,7 @@ typedef struct {
     int ct_augment;         /* conservative reconstructed-CT appearance augmentation */
     float symmetry_p;       /* chance of drawing a symmetry when augment enables geometry */
     float axis_jitter;      /* max auxiliary axis error in native voxels, p=.1, angle capped at 2 degrees */
+    const sheet_dataset *sheet; /* borrowed sparse geometry, native-level B=1 task */
 } sample_cfg;
 
 typedef struct {
@@ -38,6 +40,7 @@ typedef struct {
     int16_t *src;            /* B: source index */
     int8_t *level;           /* B: CT level */
     int64_t (*corner)[3];    /* B: level-0 corner */
+    sheet_batch **sheet;     /* B sparse records; null for legacy task */
 } batch;
 
 typedef struct sampler sampler;

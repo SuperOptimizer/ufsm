@@ -654,7 +654,7 @@ typedef struct {
     mesh **meshes; int nm; double scale; int shard, margin, T;
     int64_t ns[3]; int64_t shape[3]; z3w *w; atomic_int failed, done; int nthreads;
     rtile *tiles; size_t ntile; size_t *offset; uint32_t *refs;
-    int indexed, reference_distance, binary;
+    int indexed, reference_distance, binary, band;
 } rjob;
 
 #include "raster_cpu.h"
@@ -721,11 +721,11 @@ static void raster_shard(int si, int tid, void *ud) {
     }
     uint8_t *buf = malloc((size_t)S * S * S);
     if (!buf) { free(d); atomic_store(&j->failed, 1); return; }
-    if (j->binary && !j->reference_distance) raster_expand_mask(d, N, buf, S, M);
+    if (j->binary && !j->reference_distance && j->band) raster_expand_mask(d, N, buf, S, M);
     else for (int z = 0; z < S; z++) for (int y = 0; y < S; y++) {
         const uint8_t *src = d + ((size_t)(z + M) * N + (y + M)) * N + M;
         uint8_t *dst = buf + ((size_t)z * S + y) * S;
-        for (int x = 0; x < S; x++) dst[x] = j->binary ? (src[x] <= 4 ? 255 : 0) : src[x] <= 4 ? 254 : src[x] <= 3 * j->T ? 0 : 255;
+        for (int x = 0; x < S; x++) dst[x] = j->binary ? (src[x] <= j->band ? 255 : 0) : src[x] <= 4 ? 254 : src[x] <= 3 * j->T ? 0 : 255;
     }
     free(d);
     if (z3w_write_shard(j->w, sz, sy, sx, buf, 1)) { fprintf(stderr, "%s\n", z3w_error()); atomic_store(&j->failed, 1); }
@@ -735,7 +735,7 @@ static void raster_shard(int si, int tid, void *ud) {
 }
 
 int cmd_raster(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm raster <out-dir> --shape Z,Y,X --um U [--level L] [--binary 0|1] [--T 3] [--levels 6] [--threads 8] [--shard 1024] [--raster-index 1] [--reference-distance 0] <mesh.sfc|tifxyz-dir>...\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm raster <out-dir> --shape Z,Y,X --um U [--level L] [--binary 0|1] [--band-chamfer 0|4] [--T 3] [--levels 6] [--threads 8] [--shard 1024] [--raster-index 1] [--reference-distance 0] <mesh.sfc|tifxyz-dir>...\n"); return 2; }
     const char *out = argv[2];
     long long Z = 0, Y = 0, X = 0;
     if (sscanf(opt(argc, argv, "--shape", "0,0,0"), "%lld,%lld,%lld", &Z, &Y, &X) != 3 || Z <= 0 || Y <= 0 || X <= 0) { fprintf(stderr, "--shape Z,Y,X (positive level-0 voxels) required\n"); return 2; }
@@ -743,8 +743,9 @@ int cmd_raster(int argc, char **argv) {
     int level = atoi(opt(argc, argv, "--level", "0")), T = atoi(opt(argc, argv, "--T", "3")), nlev = atoi(opt(argc, argv, "--levels", "6"));
     int nthreads = atoi(opt(argc, argv, "--threads", "8")), shard = atoi(opt(argc, argv, "--shard", "1024"));
     int binary = atoi(opt(argc, argv, "--binary", "0"));
+    int band = atoi(opt(argc, argv, "--band-chamfer", "4"));
     if (!isfinite(um) || um <= 0 || level < 0 || level > 20 || T < 1 || T > 84 ||
-        nlev < 1 || nlev > MAXLEV_PYR || nthreads < 1 || nthreads > 256 || shard < 128 || shard % 128 || (binary != 0 && binary != 1)) {
+        nlev < 1 || nlev > MAXLEV_PYR || nthreads < 1 || nthreads > 256 || shard < 128 || shard % 128 || (binary != 0 && binary != 1) || (band!=0 && band!=4)) {
         fprintf(stderr, "raster: require positive um, level 0..20, T 1..84, levels 1..12, threads 1..256 and shard a positive multiple of 128\n"); return 2;
     }
     mesh *meshes[4096]; int nm = 0;
@@ -761,11 +762,11 @@ int cmd_raster(int argc, char **argv) {
     char lv[32], ldir[1400], attrs[512];
     z3w_level_name(um_l, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
-    if (binary) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"encoding\":\"binary\",\"surface_band_chamfer\":4,\"codec\":\"volcomp-mask-lossless\",\"background\":\"all non-surface voxels\"}}", nm);
+    if (binary) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"encoding\":\"binary\",\"surface_band_chamfer\":%d,\"codec\":\"volcomp-mask-lossless\",\"background\":\"all non-surface voxels\"}}", nm, band);
     else snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"T\":%d,\"encoding\":\"0=bg,254=surface,255=ignore\"}}", nm, T);
     z3w *w = binary ? z3w_create_mask(ldir, shape, shard, attrs) : z3w_create(ldir, shape, shard, 0.f, 255, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
-    rjob j = {.meshes = meshes, .nm = nm, .scale = scale, .shard = shard, .margin = binary ? 2 : T + 3, .T = T, .binary = binary,
+    rjob j = {.meshes = meshes, .nm = nm, .scale = scale, .shard = shard, .margin = binary ? 2 : T + 3, .T = T, .binary = binary, .band=band,
               .ns = {(shape[0] + shard - 1) / shard, (shape[1] + shard - 1) / shard, (shape[2] + shard - 1) / shard},
               .shape = {shape[0], shape[1], shape[2]}, .w = w, .nthreads = nthreads,
               .indexed = atoi(opt(argc, argv, "--raster-index", "1")),

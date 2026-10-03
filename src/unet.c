@@ -1235,3 +1235,17 @@ int unet_load(unet *u, const char *path) {
     if (g_loaded_wq) unet_set_wq(u, g_loaded_wq);
     return step;
 }
+
+int unet_start_sheet(unet *u) {
+    if (u->cfg.cin!=4 || u->cfg.cout!=2 || u->wq) {
+        fputs("winding initialization needs a four-input/two-output donor with FP32 master weights\n",stderr); return -1;
+    }
+    float *arrays[5]={u->p,u->ema,u->m,u->v,u->muon_mom};
+    const convp *stem=&u->enc[0].c1;
+    for (int a=0;a<5;a++) if (arrays[a]) {
+        for (int c=0;c<stem->cout;c++) nn_zero(arrays[a]+stem->w+((size_t)c*4+1)*27,27*4);
+        nn_zero(arrays[a]+u->head.w+u->head.cin,(size_t)u->head.cin*4);
+        nn_zero(arrays[a]+u->head.b+1,4);
+    }
+    return 0;
+}

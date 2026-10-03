@@ -1,0 +1,6 @@
+# Optional Python tools; native surface training has no new Python dependency.
+numpy>=1.26
+scipy>=1.11
+tifffile>=2023.7.10
+torch>=2.2
+matplotlib>=3.8

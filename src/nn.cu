@@ -353,6 +353,7 @@ template <> __device__ __forceinline__ float f2h<float>(float v) { return v; }  
 template <typename HT> __device__ __forceinline__ float h2f(HT v);
 template <> __device__ __forceinline__ float h2f<bf16>(bf16 v) { return __bfloat162float(v); }
 template <> __device__ __forceinline__ float h2f<f16>(f16 v) { return __half2float(v); }
+template <> __device__ __forceinline__ float h2f<float>(float v) { return v; }
 template <typename T> struct is_f16 { static const bool v = false; };
 template <> struct is_f16<f16> { static const bool v = true; };
 /* clamp to the fp16 range for a store that must not become inf; NaN stays NaN (fminf / fmaxf would turn it into
@@ -3066,6 +3067,73 @@ extern "C" void nn_loss(const float *logits, const uint8_t *t, const uint8_t *m,
                         float *gl, float *out, float *scratch) {
     nn_loss_async(logits, t, m, w, s, dice_w, gl, scratch);
     nn_loss_fetch(scratch, s, out);
+}
+
+__global__ void sheet_gather_k(const float *lg,shape5 s,const float *xyz,size_t np,int z0,int lo,int hi,double *out) {
+    size_t p=blockIdx.x*(size_t)blockDim.x+threadIdx.x; if (p>=np) return;
+    int iz=(int)floorf(xyz[3*p]),iy=(int)floorf(xyz[3*p+1]),ix=(int)floorf(xyz[3*p+2]);
+    double fz=xyz[3*p]-iz,fy=xyz[3*p+1]-iy,fx=xyz[3*p+2]-ix;
+    double a=0,b=0; size_t S=(size_t)s.d*s.h*s.w;
+    for (int dz=0;dz<2;dz++) for (int dy=0;dy<2;dy++) for (int dx=0;dx<2;dx++) {
+        int gz=iz+dz,z=gz-z0,y=iy+dy,x=ix+dx;
+        if (gz<lo || gz>=hi || z<0 || z>=s.d || y<0 || y>=s.h || x<0 || x>=s.w) continue;
+        double w=(dz?fz:1-fz)*(dy?fy:1-fy)*(dx?fx:1-fx);
+        if (w==0) continue; size_t k=((size_t)z*s.h+y)*s.w+x;
+        a+=w*lg[k]; b+=w*lg[S+k];
+    }
+    out[2*p]=a; out[2*p+1]=b;
+}
+extern "C" void nn_sheet_gather(const float *lg,shape5 s,const float *coords,size_t np,int z0,int lo,int hi,double *values) {
+    if (!np) return;
+    float *xyz; double *v; CK(cudaMalloc(&xyz,3*np*sizeof(float))); CK(cudaMalloc(&v,2*np*sizeof(double)));
+    CK(cudaMemcpy(xyz,coords,3*np*sizeof(float),cudaMemcpyHostToDevice));
+    sheet_gather_k<<<nblk(np,128),128>>>(lg,s,xyz,np,z0,lo,hi,v);
+    zs_reduce(v,(int)(2*np));
+    CK(cudaMemcpy(values,v,2*np*sizeof(double),cudaMemcpyDeviceToHost));
+    CK(cudaFree(xyz)); CK(cudaFree(v)); KCHECK();
+}
+template<typename T> __global__ void sheet_scatter_k(T *gl,const uint64_t *idx,const float *v,size_t n,float scale) {
+    size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x;
+    if (i<n) gl[idx[i]]=f2h<T>(h2f(gl[idx[i]])+v[i]*scale);
+}
+extern "C" void nn_sheet_scatter(float *gl,const uint64_t *indices,const float *values,size_t n,int h16) {
+    if (!n) return; uint64_t *ix; float *v;
+    CK(cudaMalloc(&ix,n*sizeof(uint64_t))); CK(cudaMalloc(&v,n*sizeof(float)));
+    CK(cudaMemcpy(ix,indices,n*sizeof(uint64_t),cudaMemcpyHostToDevice)); CK(cudaMemcpy(v,values,n*sizeof(float),cudaMemcpyHostToDevice));
+    if (!h16) sheet_scatter_k<float><<<nblk(n,256),256>>>(gl,ix,v,n,1.f);
+    else if (g_h16) sheet_scatter_k<f16><<<nblk(n,256),256>>>((f16 *)gl,ix,v,n,g_gscale);
+    else sheet_scatter_k<bf16><<<nblk(n,256),256>>>((bf16 *)gl,ix,v,n,g_gscale);
+    CK(cudaFree(ix)); CK(cudaFree(v)); KCHECK();
+}
+
+template<typename T> __global__ void sheet_input_k(T *input,int W,const float *rows,float center,float scale) {
+    size_t k=blockIdx.x*(size_t)blockDim.x+threadIdx.x,S=(size_t)W*W*W; if (k>=S) return;
+    int z=k/((size_t)W*W),y=(k/W)%W,x=k%W;
+    const float *r=rows+4*z;
+    input[S+k]=f2h<T>((hypotf(y+r[0],x+r[1])*r[2]+r[3]-center)/scale);
+}
+extern "C" void nn_sheet_input(void *input,int W,const float *rows,float center,float scale,int h16) {
+    float *r; CK(cudaMalloc(&r,4*(size_t)W*sizeof(float))); CK(cudaMemcpy(r,rows,4*(size_t)W*sizeof(float),cudaMemcpyHostToDevice));
+    size_t n=(size_t)W*W*W;
+    if (!h16) sheet_input_k<float><<<nblk(n,256),256>>>((float *)input,W,r,center,scale);
+    else if (g_h16) sheet_input_k<f16><<<nblk(n,256),256>>>((f16 *)input,W,r,center,scale);
+    else sheet_input_k<bf16><<<nblk(n,256),256>>>((bf16 *)input,W,r,center,scale);
+    CK(cudaFree(r)); KCHECK();
+}
+__global__ void sheet_gate_k(float *r,const float *surface,const uint8_t *ct,int W,const float *rows) {
+    size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x;
+    if (i>=(size_t)W*W*W) return;
+    if (!ct[i] || surface[i]<-2.19722458f) r[i]=nanf("");
+    else {
+        int z=i/((size_t)W*W),y=(i/W)%W,x=i%W;
+        const float *a=rows+4*z;
+        r[i]+=hypotf(y+a[0],x+a[1])*a[2]+a[3];
+    }
+}
+extern "C" void nn_sheet_gate(float *r,const float *surface,const uint8_t *ct,int W,const float *rows) {
+    float *a; CK(cudaMalloc(&a,4*(size_t)W*sizeof(float))); CK(cudaMemcpy(a,rows,4*(size_t)W*sizeof(float),cudaMemcpyHostToDevice));
+    sheet_gate_k<<<nblk((size_t)W*W*W,256),256>>>(r,surface,ct,W,a);
+    CK(cudaFree(a)); KCHECK();
 }
 
 /* ---- multi-GPU: copy between devices (peer access when available, else staged through the host) ---- */

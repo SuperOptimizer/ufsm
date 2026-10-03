@@ -4,6 +4,10 @@ C23 + CUDA, no PyTorch, no cuDNN. Trains a ~1 M-parameter 3-D convnet for the re
 Vesuvius Challenge scrolls from the released ground truth only (HuggingFace `scrollprize/datasets` and
 the AWS open-data bucket), after re-exporting that data into volcomp volumes and surfcomp surfaces.
 Design, data inventory and milestones: [DESIGN.md](DESIGN.md).
+The experimental surface-confidence and continuous-winding pipeline, including
+matched ablations and constrained sheet reconstruction, is documented in
+[SHEET_PIPELINE.md](SHEET_PIPELINE.md). It retains the native backbone; its optional
+geometry/reconstruction tools use SciPy and PyTorch.
 
 ```sh
 make && make test        # gcc -std=c23 + nvcc; needs libcurl, libzstd, libblosc, zlib, OpenSSL libcrypto, CUDA 13 (sm_120)

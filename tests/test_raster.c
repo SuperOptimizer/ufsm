@@ -47,7 +47,7 @@ static mesh *fixture(int which) {
 
 static void volumes(const char *root) {
     mesh *meshes[3] = {fixture(0), fixture(1), fixture(2)};
-    for (int ci = 0; ci < 8; ci++) {
+    for (int ci = 0; ci < 10; ci++) {
         double scale = ci & 1 ? 0.5 : 1.0; int T = ci < 2 ? 3 : 8;
         int binary = ci >= 4;
         int64_t shape[3] = {257, 129, 257};
@@ -55,7 +55,7 @@ static void volumes(const char *root) {
         for (int mode = 0; mode < 2; mode++) {
             snprintf(path[mode], sizeof path[mode], "%s/case%d-%s", root, ci, mode ? "indexed" : "reference");
             z3w *writer = binary ? z3w_create_mask(path[mode], shape, 128, "{\"ufsm\":{\"encoding\":\"binary\"}}") : z3w_create(path[mode], shape, 128, 0.f, 255, "{}");
-            rjob j = {.meshes = meshes, .nm = 3, .scale = scale, .shard = 128, .margin = binary ? 2 : T + 3, .T = T, .binary = binary,
+            rjob j = {.meshes = meshes, .nm = 3, .scale = scale, .shard = 128, .margin = binary ? 2 : T + 3, .T = T, .binary = binary, .band=ci>=8?0:4,
                       .ns = {3, 2, 3}, .shape = {257,129,257}, .w = writer,
                       .indexed = mode, .reference_distance = !mode, .nthreads = 1};
             if (mode && raster_index(&j)) { failures++; return; }

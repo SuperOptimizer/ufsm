@@ -129,10 +129,11 @@ static batch alloc_batch(const sample_cfg *c) {
     b.src = malloc((size_t)c->B * sizeof(int16_t));
     b.level = malloc((size_t)c->B * sizeof(int8_t));
     b.corner = malloc((size_t)c->B * sizeof *b.corner);
+    b.sheet = calloc((size_t)c->B, sizeof *b.sheet);
     return b;
 }
 
-static void free_batch(batch *b) { if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->corner); }
+static void free_batch(batch *b) { if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -298,7 +299,8 @@ static inline uint16_t bf16_rn(float f) { uint32_t u; memcpy(&u, &f, 4); u += 0x
    source component perm[d]). cyz / cxz: axis centre per source z. Output fp32 X (xfmt 0) or 16-bit H (1 fp16,
    2 bf16). One rng draw per 4 voxels, as the old separate jitter pass. nrow: P floats of scratch. */
 static void write_x_aug(const uint8_t *ctu, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
-                    sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H, const ct_aug_plan *ap, float *noise_row_state, float *noise_plane_state) {
+                    sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H, const ct_aug_plan *ap, float *noise_row_state, float *noise_plane_state,
+                    const sheet_dataset *sheet,const double (*sheet_params)[4]) {
     pthread_once(&g_ntab_once, ntab_init);
     const size_t p3 = (size_t)P * P * P;
     const float sgn[3] = {y.flip[0] ? -1.f : 1.f, y.flip[1] ? -1.f : 1.f, y.flip[2] ? -1.f : 1.f};
@@ -326,7 +328,13 @@ static void write_x_aug(const uint8_t *ctu, int P, const int64_t o[3], float fme
                     const float inv = 1.f / (sqrtf(dyv * dyv + dxv * dxv) + 1e-6f);
                     comp[1] = dyv * inv; comp[2] = dxv * inv;
                 }
-                const float v1 = sgn[0] * comp[y.perm[0]], v2 = sgn[1] * comp[y.perm[1]], v3 = sgn[2] * comp[y.perm[2]];
+                float v1 = sgn[0] * comp[y.perm[0]];
+                const float v2 = sgn[1] * comp[y.perm[1]], v3 = sgn[2] * comp[y.perm[2]];
+                if (sheet) {
+                    const double *a=sheet_params[sz_];
+                    double prior=hypot((double)(o[1]+sy_)-a[0],(double)(o[2]+sx_)-a[1])/a[2]+a[3];
+                    v1=(float)((prior-sheet->center)/sheet->scale);
+                }
                 const size_t k = ko + x;
                 if (xfmt == 1) { _Float16 h0 = (_Float16)v0, h1 = (_Float16)v1, h2 = (_Float16)v2, h3 = (_Float16)v3; memcpy(&H[k], &h0, 2); memcpy(&H[p3 + k], &h1, 2); memcpy(&H[2 * p3 + k], &h2, 2); memcpy(&H[3 * p3 + k], &h3, 2); }
                 else if (xfmt == 2) { H[k] = bf16_rn(v0); H[p3 + k] = bf16_rn(v1); H[2 * p3 + k] = bf16_rn(v2); H[3 * p3 + k] = bf16_rn(v3); }
@@ -336,7 +344,7 @@ static void write_x_aug(const uint8_t *ctu, int P, const int64_t o[3], float fme
 }
 static void write_x(const uint8_t *ctu, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
                     sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H) {
-    write_x_aug(ctu, P, o, fmean, fisd, hasax, cyz, cxz, y, jitter, ia, ib, isg, r, nrow, xfmt, X, H, nullptr, nullptr, nullptr);
+    write_x_aug(ctu, P, o, fmean, fisd, hasax, cyz, cxz, y, jitter, ia, ib, isg, r, nrow, xfmt, X, H, nullptr, nullptr, nullptr,nullptr,nullptr);
 }
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
     double pt = sp->prof ? tnow() : 0;
@@ -503,6 +511,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         for (size_t k = 0; k < p3; k++) { uint8_t v = dst[k]; if (v == 255) { ign[k] = 1; dst[k] = 0; } else dst[k] = (uint8_t)((v * 255 + 127) / 254); }
     }
     PROF_MARK(PS_ENCODE);
+    if (c->sheet) sheet_mask_contacts(c->sheet,o,P,ign);
     /* input channels (z-scored CT, radial unit vector) written in one pass straight into the batch with the symmetry
        and the jitter applied on the way (16-bit when cfg.xfmt, else fp32): no fp32 intermediates */
     double mean = sum / (double)p3, var = sq / (double)p3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
@@ -548,9 +557,21 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     PROF_MARK(PS_AUGMENT);
     float *X = c->xfmt ? nullptr : b->x + (size_t)i * 4 * p3;
     uint16_t *H = c->xfmt ? b->x16 + (size_t)i * 4 * p3 : nullptr;
-    if (app) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
-            X, H, app, noise_state, noise_state ? noise_state + P : nullptr);
+    double (*params)[4]=nullptr;
+    if (c->sheet) {
+        params=malloc((size_t)P*sizeof *params);
+        for (int sz=0;sz<P;sz++) sheet_parameters(c->sheet,o[0]+sz,params[sz]);
+    }
+    if (app || c->sheet) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
+            X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);
     else write_x(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H);
+    free(params);
+    if (c->sheet) {
+        sheet_batch_free(b->sheet[i]);
+        b->sheet[i] = sheet_sample(c->sheet, o, P, y.perm, y.flip, ctu,ttmp,rnext(r));
+        if (!b->sheet[i]) return -1;
+        w[1]=0; /* winding is supervised by the sparse regression objective */
+    }
     PROF_MARK(PS_X16);
     memcpy(b->w + (size_t)i * NCH, w, NCH);
     b->src[i] = (int16_t)si;

@@ -218,6 +218,17 @@ size_t nn_loss_scratch(shape5 s);
 void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch);
 void nn_set_pos_weight(float w);   /* BCE weight of positive targets (class balance), default 1 */
 void nn_loss_fetch(const float *scratch, shape5 s, float *out);
+/* Sparse trilinear samples. Ownership is global z in [own_lo,own_hi), so a
+   sample crossing a split boundary is reduced once and its corners get the
+   correct local gradients. coords is host [np][3], values host [np][2]. */
+void nn_sheet_gather(const float *logits, shape5 s, const float *coords, size_t np,
+                     int z0, int own_lo, int own_hi, double *values);
+/* Unique local flattened indices; gradients add to the dense loss buffer. */
+void nn_sheet_scatter(float *gl, const uint64_t *indices, const float *values, size_t n, int h16);
+/* rows[z] = {origin_y-axis_y,origin_x-axis_x,1/pitch,offset} in native voxels */
+void nn_sheet_input(void *input,int W,const float *rows,float center,float scale,int h16);
+/* In-place absolute q and validity, no additional dense device buffer. */
+void nn_sheet_gate(float *residual,const float *surface,const uint8_t *ct,int W,const float *rows);
 /* ---- spatial split of one window along z across two GPUs (unet_set_split, src/split.c) ----
    nn_split_cfg (per current device): this GPU's tensors carry lo0 halo planes at the low z end and hi0 at the high end of the
    level-0 local depth D0 (Dg0 = the whole window's level-0 depth); D0 = 0 turns it off. GroupNorm statistics then skip the
