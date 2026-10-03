@@ -181,6 +181,14 @@ int cmd_eval(int argc, char **argv) {
     if (um <= 0) { fprintf(stderr, "--um required\n"); return 2; }
     store *ps = store_open(proot), *ls = store_open(lroot);
     z3 *pz = pyramid_open_level(ps, pkey, level, um, nullptr), *lz = pyramid_open_level(ls, lkey, level, um, nullptr);
+    int label_level = level;
+    if (!lz) for (int l = level + 1; l < MAXLEV; l++) {
+        z3 *candidate = pyramid_open_level(ls, lkey, l, um, nullptr);
+        if (!candidate) continue;
+        if (z3_meta_of(candidate)->label_binary) { lz = candidate; label_level = l; }
+        else z3_close(candidate);
+        break;
+    }
     if (!pz || !lz) { fprintf(stderr, "cannot open %s or %s at level %d: %s\n", pkey, lkey, level, z3_error()); return 1; }
     const z3_meta *pm = z3_meta_of(pz);
     long long po[3] = {0, 0, 0};
@@ -191,7 +199,7 @@ int cmd_eval(int argc, char **argv) {
     if (nv > (size_t)1 << 31) { fprintf(stderr, "box too large (%zu voxels); use --box\n", nv); return 1; }
     uint8_t *p = malloc(nv), *l = malloc(nv);
     int64_t lo[3] = {o[0] + (po[0] >> level), o[1] + (po[1] >> level), o[2] + (po[2] >> level)};
-    if (z3_read(pz, o, n, p, 0) || z3_read(lz, lo, n, l, 0)) { fprintf(stderr, "read: %s\n", z3_error()); return 1; }
+    if (z3_read(pz, o, n, p, 0) || z3_read_label_grid(lz, z3_meta_of(lz)->label_binary, label_level - level, lo, n, l, 0)) { fprintf(stderr, "read: %s\n", z3_error()); return 1; }
     { const char *dp = opt(argc, argv, "--dump", nullptr);   /* middle z slice as a PGM: [CT |] prediction | label (ignore = dark grey) */
       if (dp) { FILE *f = fopen(dp, "wb"); if (f) {
         uint8_t *ct = nullptr;   /* optional CT panel: --ct-root R --ct G [--cache DIR] (same level, label coordinates) */

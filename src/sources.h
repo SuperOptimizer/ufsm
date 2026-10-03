@@ -57,6 +57,8 @@ typedef struct {
     char *tgt_key[NCH];
     z3 *tgt[NCH][MAXLEV];
     int tgt_present[NCH][MAXLEV];
+    int tgt_binary[NCH];      /* target bytes are 0/background, 255/surface; no ignore class */
+    int tgt_min_level[NCH];   /* finest stored CT rung; binary targets can upsample finer requests */
     regions *reg[NCH];
     z3 **reg_z[NCH];        /* lazily opened region arrays */
     z3 *reg_shared[NCH];    /* the shared array when reg[ch]->array is set */
@@ -77,6 +79,12 @@ void sources_free(sources *S);
 /* Lazily open CT / target arrays. Return nullptr if that level does not exist. */
 z3 *source_ct(source *s, int level);
 z3 *source_tgt(source *s, int ch, int level);          /* pyramid target only */
+z3 *source_tgt_for_level(source *s, int ch, int level, int *stored_level);
+/* Return labels in the trainer's canonical 0/background,254/surface,255/ignore
+   encoding. Binary masks are nearest-neighbour upsampled on their global voxel
+   centres when shift>0; interior samples clamp to the last stored centre. */
+int z3_read_label_grid(z3 *z, int binary, int shift, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);
+int source_read_target(source *s, int ch, int level, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);
 z3 *source_region(source *s, int ch, int i);           /* regions target only */
 int source_region_shared(const source *s, int ch);      /* 1 if region reads use absolute (array) coordinates */
 

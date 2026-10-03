@@ -10,6 +10,9 @@ typedef struct z3w z3w;
 /* dir is created. shard must be a multiple of 128 (typically 1024, or 128 for small arrays).
    fill: fill_value (chunks entirely equal to it are omitted). attrs_json: attributes object text or nullptr. */
 z3w *z3w_create(const char *dir, const int64_t shape[3], int shard, float q, int fill, const char *attrs_json);
+/* Pure binary surface masks: zero fill; the full 128^3 mask is coded losslessly
+   with volcomp.h mode 5 and decodes as 0/255. No implicit spatial downscale. */
+z3w *z3w_create_mask(const char *dir, const int64_t shape[3], int shard, const char *attrs_json);
 /* data: shard^3 bytes in C order (the part outside the array is ignored). Returns 0 on success.
    Thread-safe across different shards. */
 int z3w_write_shard(z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *data, int nthreads);

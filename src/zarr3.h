@@ -17,6 +17,7 @@ typedef struct {
     char sep;             /* chunk key separator */
     double scale_um;      /* voxel size from the parent group's OME multiscales, 0 if unknown */
     int fill;             /* fill_value for missing chunks / shards */
+    int label_binary;     /* ufsm.encoding=binary: 255 is positive, 0 is background */
 } z3_meta;
 
 typedef struct z3 z3;

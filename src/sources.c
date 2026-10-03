@@ -105,6 +105,14 @@ sources *sources_load(const char *path) {
             for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = -1;
             if (!t) continue;
             if (t->type == J_STR) { s->tgt_key[c] = strdup(t->str); continue; }
+            s->tgt_binary[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "binary");
+            double target_min = json_num(json_get(t, "min_level"), 0);
+            if (!isfinite(target_min) || target_min < 0 || target_min >= MAXLEV || target_min != (int)target_min ||
+                (target_min && !s->tgt_binary[c])) {
+                fprintf(stderr, "sources: %s/%s: invalid binary target min_level\n", s->name, CHNAME[c]);
+                json_free(j); sources_free(S); return nullptr;
+            }
+            s->tgt_min_level[c] = (int)target_min;
             const char *troot = json_str(json_get(t, "root"), nullptr);
             if (troot) s->tgt_store[c] = store_open(troot);
             const char *grp = json_str(json_get(t, "group"), nullptr);
@@ -246,7 +254,7 @@ z3 *source_ct(source *s, int level) {
 }
 
 z3 *source_tgt(source *s, int ch, int level) {
-    if (!s->tgt_key[ch] || level < 0 || level >= MAXLEV || s->tgt_present[ch][level] == 0) return nullptr;
+    if (!s->tgt_key[ch] || level < s->tgt_min_level[ch] || level < 0 || level >= MAXLEV || s->tgt_present[ch][level] == 0) return nullptr;
     if (!s->tgt[ch][level]) {
         z3 *z = open_level(s->tgt_store[ch] ? s->tgt_store[ch] : s->s, s->tgt_key[ch], level, s->um);
         pthread_mutex_lock(&g_open_mu);
@@ -255,6 +263,57 @@ z3 *source_tgt(source *s, int ch, int level) {
         if (z) z3_close(z);
     }
     return s->tgt[ch][level];
+}
+
+z3 *source_tgt_for_level(source *s, int ch, int level, int *stored_level) {
+    if (ch < 0 || ch >= NCH || level < 0 || level >= MAXLEV) return nullptr;
+    int actual = s->tgt_binary[ch] && level < s->tgt_min_level[ch] ? s->tgt_min_level[ch] : level;
+    if (stored_level) *stored_level = actual;
+    return source_tgt(s, ch, actual);
+}
+
+static int64_t mask_nearest(int64_t q, int shift, int64_t size) {
+    int64_t v = (q + ((int64_t)1 << (shift - 1))) >> shift;
+    return v < 0 ? 0 : v >= size ? size - 1 : v;
+}
+
+int z3_read_label_grid(z3 *z, int binary, int shift, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
+    if (!z || shift < 0 || shift >= MAXLEV || (!binary && shift)) return -1;
+    for (int d = 0; d < 3; d++) if (n[d] <= 0) return -1;
+    size_t nv = (size_t)n[0] * n[1] * n[2];
+    if (!shift) {
+        if (z3_read(z, o, n, out, nthreads)) return -1;
+        if (binary) for (size_t k = 0; k < nv; k++) out[k] = out[k] ? 254 : 0;
+        return 0;
+    }
+    const z3_meta *m = z3_meta_of(z); int64_t f = (int64_t)1 << shift, co[3], cn[3];
+    for (int d = 0; d < 3; d++) {
+        if (n[d] <= 0 || m->shape[d] <= 0) return -1;
+        co[d] = mask_nearest(o[d], shift, m->shape[d]);
+        cn[d] = mask_nearest(o[d] + n[d] - 1, shift, m->shape[d]) - co[d] + 1;
+    }
+    uint8_t *low = malloc((size_t)cn[0] * cn[1] * cn[2]);
+    if (!low) return -1;
+    if (z3_read(z, co, cn, low, nthreads)) { free(low); return -1; }
+    for (int64_t zc = 0; zc < n[0]; zc++) for (int64_t y = 0; y < n[1]; y++) {
+        int64_t gz = o[0] + zc, gy = o[1] + y;
+        int64_t iz = mask_nearest(gz, shift, m->shape[0]) - co[0];
+        int64_t iy = mask_nearest(gy, shift, m->shape[1]) - co[1];
+        const uint8_t *row = low + ((size_t)iz * cn[1] + iy) * cn[2];
+        uint8_t *dst = out + ((size_t)zc * n[1] + y) * n[2];
+        for (int64_t x = 0; x < n[2]; x++) {
+            int64_t gx = o[2] + x, ix = mask_nearest(gx, shift, m->shape[2]) - co[2];
+            int inside = gz >= 0 && gy >= 0 && gx >= 0 && gz < m->shape[0] * f && gy < m->shape[1] * f && gx < m->shape[2] * f;
+            dst[x] = inside && row[ix] ? 254 : 0;
+        }
+    }
+    free(low); return 0;
+}
+
+int source_read_target(source *s, int ch, int level, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
+    int actual = level; z3 *z = source_tgt_for_level(s, ch, level, &actual);
+    if (!z) return -1;
+    return z3_read_label_grid(z, s->tgt_binary[ch] || (z && z3_meta_of(z)->label_binary), actual - level, o, n, out, nthreads);
 }
 
 int source_region_shared(const source *s, int ch) { return s->reg[ch] && s->reg[ch]->array != nullptr; }

@@ -1,13 +1,17 @@
 /* Real threaded draws with local CT/labels and an injected read failure after one
    complete sample. Also check holdout containment and cross-source exclusions. */
 #include "zarr3.h"
+#include "sources.h"
 static int controlled_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int cache);
+static int controlled_target(source *s, int ch, int level, const int64_t o[3], const int64_t n[3], uint8_t *out, int cache);
 #define z3_read controlled_read
+#define source_read_target controlled_target
 #ifndef TEST_SAMPLE_SOURCE
 #define TEST_SAMPLE_SOURCE "../src/sample.c"
 #endif
 #include TEST_SAMPLE_SOURCE
 #undef z3_read
+#undef source_read_target
 #include <assert.h>
 
 void *nn_host_alloc(size_t n) { return malloc(n); }
@@ -18,6 +22,12 @@ static int controlled_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_
     if (budget == 0) return -1;
     if (budget > 0) atomic_fetch_sub(&read_budget, 1);
     return z3_read(z, o, n, out, cache);
+}
+static int controlled_target(source *s, int ch, int level, const int64_t o[3], const int64_t n[3], uint8_t *out, int cache) {
+    int budget = atomic_load(&read_budget);
+    if (budget == 0) return -1;
+    if (budget > 0) atomic_fetch_sub(&read_budget, 1);
+    return source_read_target(s, ch, level, o, n, out, cache);
 }
 static sources *fixture(const char *dir, const char *boxes) {
     char path[1400]; snprintf(path, sizeof path, "%s/safety-sources.json", dir);

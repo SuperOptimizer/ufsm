@@ -100,6 +100,7 @@ z3 *z3_open(store *s, const char *key, const char *cache_dir) {
     }
     for (int i = 0; i < 3; i++) m->shape[i] = (int64_t)json_num(json_at(shape, (size_t)i), 0);
     m->fill = (int)json_num(json_get(j, "fill_value"), 0);
+    m->label_binary = !strcmp(json_str(json_path(j, "attributes.ufsm.encoding"), ""), "binary");
     const json *cs = json_path(j, "chunk_grid.configuration.chunk_shape");
     if (!cs || cs->n != 3) { FAIL("%s: no chunk_shape", key); goto bad; }
     for (int i = 0; i < 3; i++) m->shard[i] = m->chunk[i] = (int)json_num(json_at(cs, (size_t)i), 0);

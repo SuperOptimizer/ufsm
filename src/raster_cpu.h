@@ -1,5 +1,26 @@
 /* Private CPU raster helpers, included after mesh/rjob in ingest.c. */
 
+/* Chamfer distance <=4 is exactly the seed plus its 6 face and 12 edge
+   neighbours. A local vectorizable stencil avoids computing unused distances. */
+static void raster_expand_mask(const uint8_t *seed, int N, uint8_t *out, int S, int M) {
+    size_t plane = (size_t)N * N;
+    for (int z = 0; z < S; z++) for (int y = 0; y < S; y++) {
+        const uint8_t *p = seed + ((size_t)(z + M) * N + y + M) * N + M;
+        uint8_t *dst = out + ((size_t)z * S + y) * S;
+        for (int x = 0; x < S; x++) {
+            const uint8_t *v = p + x;
+            int hit = (v[0] == 0) | (v[-1] == 0) | (v[1] == 0);
+            hit |= (v[-N] == 0) | (v[-N - 1] == 0) | (v[-N + 1] == 0);
+            hit |= (v[N] == 0) | (v[N - 1] == 0) | (v[N + 1] == 0);
+            hit |= (v[-(ptrdiff_t)plane] == 0) | (v[-(ptrdiff_t)plane - 1] == 0) | (v[-(ptrdiff_t)plane + 1] == 0);
+            hit |= (v[plane] == 0) | (v[plane - 1] == 0) | (v[plane + 1] == 0);
+            hit |= (v[-(ptrdiff_t)plane - N] == 0) | (v[-(ptrdiff_t)plane + N] == 0);
+            hit |= (v[plane - N] == 0) | (v[plane + N] == 0);
+            dst[x] = hit ? 255 : 0;
+        }
+    }
+}
+
 /* Same 3-4-5 transform as the scalar reference. Neighbouring rows are final
    for this pass; only the final within-row sweep carries a dependency. */
 static void raster_distance(uint8_t *d, int N, int cap) {

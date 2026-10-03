@@ -37,6 +37,7 @@ struct z3w {
     int shard, cg;      /* inner chunk grid per axis */
     float q;
     int fill;
+    int mask_lossless;
 };
 
 static int mkdirs(const char *path) {
@@ -75,6 +76,12 @@ z3w *z3w_create(const char *dir, const int64_t shape[3], int shard, float q, int
     return w;
 }
 
+z3w *z3w_create_mask(const char *dir, const int64_t shape[3], int shard, const char *attrs_json) {
+    z3w *w = z3w_create(dir, shape, shard, 0, 0, attrs_json);
+    if (w) w->mask_lossless = 1;
+    return w;
+}
+
 typedef struct { const z3w *w; const uint8_t *data; uint8_t **enc; size_t *len; int nc; atomic_int next, failed; } job;
 
 static void *worker(void *arg) {
@@ -95,7 +102,9 @@ static void *worker(void *arg) {
         }
         if (!any) { jb->enc[i] = nullptr; jb->len[i] = 0; continue; }
         size_t n;
-        volcomp_status st = volcomp_encode(chunk, w->q, enc, VOLCOMP_ENCODE_BOUND, &n);
+        volcomp_status st = w->mask_lossless
+            ? volcomp_mask_encode_lossless(chunk, enc, VOLCOMP_ENCODE_BOUND, &n)
+            : volcomp_encode(chunk, w->q, enc, VOLCOMP_ENCODE_BOUND, &n);
         if (st != VOLCOMP_OK) { fail("volcomp encode: %s", volcomp_status_string(st)); atomic_store(&jb->failed, 1); break; }
         jb->enc[i] = malloc(n);
         memcpy(jb->enc[i], enc, n);

@@ -103,7 +103,7 @@ class SurfaceStore(unittest.TestCase):
                                                      "trust_band": 8, "weight": 1}]}))
         return ["builder", "--binary", str(binary), "--source-template", str(template), "--ct-root", str(self.root),
                 "--ct", "20260411134726-ct", "--um", "1", "--work", str(self.work), "--out", str(self.out),
-                "--sources-out", str(self.cfg), "--shard", "128", "--levels", "4", "--T", "8", "--threads", "2"]
+                "--sources-out", str(self.cfg), "--shard", "128", "--levels", "4", "--threads", "2"]
 
     def test_registered_inventory_download_and_resume(self):
         surfaces = builder.inventory("PHercParis4", "20260411134726", 1, 2)
@@ -122,12 +122,27 @@ class SurfaceStore(unittest.TestCase):
         self.assertFalse(self.out.with_name(self.out.name + ".building").exists())
         self.assertEqual(json.loads((self.work / "build.json").read_text())["status"], "complete")
         self.assertEqual(len(json.loads(self.cfg.read_text())["sources"]), 1); self.assertEqual(len(self.gets), 8)
+        source = json.loads(self.cfg.read_text())["sources"][0]
+        self.assertNotIn("trust_band", source)
+        self.assertEqual(source["targets"]["recto"]["encoding"], "binary")
+        self.assertEqual(source["targets"]["recto"]["min_level"], 1)
+        self.assertFalse((self.out / "1").exists())
+        meta = json.loads((self.out / "2/zarr.json").read_text())
+        self.assertEqual(meta["shape"], [64, 64, 64]); self.assertEqual(meta["fill_value"], 0)
+        self.assertEqual(meta["attributes"]["ufsm"]["encoding"], "binary")
+        # Binary labels must be scored as surfaces, including native requests that upsample.
+        result = subprocess.run([str(REPO / "build/ufsm"), "eval", str(self.root), "20260411134726-ct",
+                                 str(self.out), ".", "--um", "1", "--level", "0", "--thr", "0.5"],
+                                check=True, capture_output=True, text=True)
+        self.assertIn("2097152 valid voxels (100.0%)", result.stdout)
+        self.assertNotIn(", 0 labelled surface", result.stdout)
         check = self.root / "check"; check.mkdir()
         subprocess.run([sys.executable, str(REPO / "tools/verify_surface_store.py"), "--work", str(self.work),
                         "--sources", str(self.cfg), "--out", str(check), "--binary", str(REPO / "build/check_surface_samples"),
                         "--P", "128", "--batches", "2"], check=True)
         samples = json.loads((check / "samples.json").read_text())
         self.assertTrue(samples["passed"]); self.assertEqual(len(samples["samples"]), 2)
+        self.assertTrue(all(s["valid"] == 128**3 for s in samples["samples"]))
         self.assertEqual(json.loads((check / "qualification.json").read_text())["status"], "complete")
         pgm = (check / "sample-00-axis-0.pgm").read_bytes().split(b"\n", 3)[3]
         # Both distinct surfaces must be visible in the same target slice.

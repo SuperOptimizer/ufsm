@@ -50,6 +50,9 @@ def main():
         provenance = json.loads((store / "provenance.json").read_text())
         if provenance["surface_segments"] != build["surface_segments"]:
             raise ValueError("store provenance does not match the inventoried surfaces")
+        if (provenance.get("encoding") != "binary" or target.get("encoding") != "binary" or
+                target.get("min_level") != provenance.get("label_level") or source.get("trust_band", 0)):
+            raise ValueError("expected a binary target at its declared finest level without a trust band")
         command = [str(args.binary.resolve()), str(args.sources.resolve()), str(args.out.resolve()),
                    str(args.P), str(args.batches)]
         atomic_json(report, {"status": "sampling", "surface_count": build["surface_count"], "command": command})

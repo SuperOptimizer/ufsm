@@ -45,18 +45,30 @@ python3 tools/verify_surface_store.py \
   --out /vesuvius/ufsm/gt/paris4-all-surfaces/sample-check
 ```
 
-The result is **one sparse label pyramid**, `/vesuvius/ufsm/gt/paris4-all-surfaces/labels.zarr`,
-aligned with the native CT grid. Every mesh contributes seeds to the same volume before the
-distance transform; overlapping labels form a union. Each sampled cube can contain multiple
-surfaces. The six resolutions are views of this same volume, rather than separate teachers.
-Labels use `volcomp.h` with lossless `q=0`: 254 is the approximately three-voxel surface band,
-0 is nearby background within the default eight-voxel trust radius, and 255 is ignored space.
-Training with `--soft 3` generates continuous targets around the union when sampling.
+The result is **one sparse binary mask pyramid**, `/vesuvius/ufsm/gt/paris4-all-surfaces/labels.zarr`,
+whose finest stored level is **4.8 micrometers** (`--level 1`). There is no 2.4-micrometer label
+array. All meshes contribute to the same union: 255 means expanded surface and 0 means no surface.
+The band includes each raster seed and its 18 face/edge neighbours (chamfer distance <= 4),
+about three stored voxels thick for an axis-aligned surface. Each cube can contain multiple sheets.
+All six levels remain binary; coarser levels use any-positive pooling to preserve thin surfaces.
 
-AWS files occupy about 18.8 GiB. The complete native raster is a substantial CPU job and takes
-hours; untouched shards remain implicit ignore values. Downloads retain ETags, sizes and SHA256
-receipts for reuse. Native rasterization uses a spatial mesh index and an equivalent row distance
-transform, checked against the original implementation. A `.building` directory is published only
+Chunks use the **lossless 128-cubed mask codec** in `volcomp.h`; its built-in lossy 2x pooling
+mode is not used. Empty chunks remain implicit zero bits. The source config declares
+`encoding: "binary", min_level: 1` on the target, while the CT stays at native 2.4 micrometers.
+The sampler reads the smallest matching mask region and upsamples finer requests with nearest
+voxel centres in global coordinates (ties toward increasing coordinates), including odd cube origins.
+Stored 255 is converted to the trainer's surface value before the legacy ignore handling.
+Optional `--soft 3` generates continuous targets at sampling time without storing fractional values.
+
+This source has **no ignore class or trust band**. Every CT-positive voxel outside the expanded
+surface mask contributes background supervision; air remains excluded. This assumes that regions
+without a released mesh are negative. Including all 81 released surfaces does not establish that
+every physical sheet was annotated, so omitted sheets would receive negative supervision.
+The existing partially annotated sources retain their original background/ignore rules.
+
+AWS files occupy about 18.8 GiB. Downloads retain ETags, sizes and SHA256 receipts for reuse.
+Rasterization uses a spatial mesh index and a direct 19-point binary expansion, checked against
+the original distance transform. A `.building` directory is published only
 after every pyramid level succeeds; the script then writes the single-source configuration.
 An interrupted raster leaves its staging directory for inspection; raster restart currently requires
 moving that directory aside before rerunning. `--fetch-only` only prepares the AWS inputs.
@@ -236,8 +248,11 @@ whole-volume speedups.
 
 ## Label encoding (our exported stores)
 
-uint8, volcomp lossless, `fill_value` 255: `0` background, `254` surface, `255` ignore. Coarser pyramid
+Legacy targets: uint8, volcomp lossless, `fill_value` 255: `0` background, `254` surface, `255` ignore. Coarser pyramid
 levels hold `round(254 * surface fraction)` of the non-ignore children, or 255 when at least half are
 ignore. The sampler turns this into a soft target and a loss mask (CT > 0 and not ignore).
+
+The Paris 4 all-surfaces target instead uses binary `0`/`255`, `fill_value` 0, the lossless mask
+codec, and a finest level of 4.8 micrometers. Its zeros are supervised background wherever CT > 0.
 
 Third-party code: `third_party/volcomp.h` and `third_party/surfcomp/` (MIT, SuperOptimizer).

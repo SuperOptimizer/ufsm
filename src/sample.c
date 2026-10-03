@@ -204,7 +204,7 @@ static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
             int any = 0;
             for (int c = 0; c < NCH; c++) {
                 if (c == region_ch) { any = 1; continue; }
-                if (s->tgt_key[c] && source_tgt(s, c, l)) any = 1;
+                if (s->tgt_key[c] && source_tgt_for_level(s, c, l, nullptr)) any = 1;
             }
             ok = any;
         }
@@ -424,9 +424,9 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             else { if (z3_read(rz, ro, rn, tmp, 1)) return -1; pool2_labels(tmp, (int)span, dst); }
             w[ch] = 1;
         } else if (s->tgt_key[ch]) {
-            z3 *tz = source_tgt(s, ch, l);
+            z3 *tz = source_tgt_for_level(s, ch, l, nullptr);
             if (!tz) { memset(dst, 0, p3); continue; }
-            if (z3_read(tz, o, n, dst, 1)) return -1;
+            if (source_read_target(s, ch, l, o, n, dst, 1)) return -1;
             w[ch] = 1;
         } else memset(dst, 0, p3);
         if (w[ch]) for (size_t k = 0; k < p3; k++) if (dst[k] != 255 && dst[k] > tmax) tmax = dst[k];
@@ -590,13 +590,14 @@ occ_index source_occupancy(source *s) {
     for (int l = MAXLEV - 1; l >= 3; l--) { z3 *t = source_tgt(s, 0, l); if (t) { const z3_meta *m = z3_meta_of(t); if ((double)m->shape[0] * m->shape[1] * m->shape[2] < 4.29e9) { lc = l; tz = t; break; } } }
     if (!tz) return o;
     const z3_meta *m = z3_meta_of(tz);
+    const int binary = s->tgt_binary[0] || m->label_binary;
     const size_t plane = (size_t)m->shape[1] * m->shape[2], tot = plane * (size_t)m->shape[0];
     const int64_t SZ = m->chunk[0] > 0 ? m->chunk[0] : 64;
     uint8_t *buf = malloc(plane * (size_t)SZ);
     if (!buf) return o;
     size_t cap = 1 << 20, n = 0; uint32_t *idx = malloc(cap * sizeof *idx);
     int surf = 1;
-    for (int pass = 0; pass < 2 && !n; pass++) {   /* pass 0: cells with surface; pass 1 (none found): every labelled cell */
+    for (int pass = 0; pass < (binary ? 1 : 2) && !n; pass++) {   /* binary: 255 is a surface, never ignore */
         surf = pass == 0;
         for (int64_t z0 = 0; z0 < m->shape[0]; z0 += SZ) {
             int64_t o0[3] = {z0, 0, 0}, nn[3] = {SZ < m->shape[0] - z0 ? SZ : m->shape[0] - z0, m->shape[1], m->shape[2]};
@@ -604,7 +605,7 @@ occ_index source_occupancy(source *s) {
             const size_t cnt = (size_t)nn[0] * plane, base = (size_t)z0 * plane;
             for (size_t k = 0; k < cnt; k++) {
                 const uint8_t v = buf[k];
-                if (v == 255 || (surf ? v == 0 : 0)) continue;
+                if (binary ? v == 0 : v == 255 || (surf ? v == 0 : 0)) continue;
                 if (n == cap) { cap *= 2; uint32_t *t2 = realloc(idx, cap * sizeof *idx); if (!t2) { free(buf); free(idx); return o; } idx = t2; }
                 idx[n++] = (uint32_t)(base + k);
             }

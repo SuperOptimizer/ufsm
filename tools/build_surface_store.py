@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build one lossless label pyramid from every AWS surface registered to a CT scan.
+"""Build one binary surface-mask pyramid from every AWS surface registered to a CT scan.
 
 The final store is published only after rasterization succeeds. Raw AWS files,
 ETags and SHA256 hashes remain in --work for restart and provenance.
@@ -118,17 +118,16 @@ def main():
     parser.add_argument("--download-workers", type=int, default=6)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--shard", type=int, default=512)
-    parser.add_argument("--level", type=int, default=0)
+    parser.add_argument("--level", type=int, default=1, help="finest mask level relative to native CT (default: 4.8 um)")
     parser.add_argument("--levels", type=int, default=6)
-    parser.add_argument("--T", type=int, default=8)
     parser.add_argument("--fetch-only", action="store_true")
     args = parser.parse_args()
     args.work = args.work.resolve()
     args.out = args.out.resolve()
     if (min(args.download_workers, args.threads) <= 0 or args.threads > 256 or
             args.shard < 128 or args.shard % 128 or not 1 <= args.levels <= 12 or
-            not 1 <= args.T <= 84 or not 0 <= args.level <= 20 or not math.isfinite(args.um) or args.um <= 0):
-        parser.error("invalid worker count, geometry or label width")
+            not 0 <= args.level < 10 or args.level + args.levels > 10 or not math.isfinite(args.um) or args.um <= 0):
+        parser.error("invalid worker count, geometry or label levels")
     args.work.mkdir(parents=True, exist_ok=True)
     manifest_path = args.work / "aws-registered-surfaces.json"
     if manifest_path.exists():
@@ -171,13 +170,19 @@ def main():
     shape = ct_meta["shape"]
     mesh_paths = [args.work / "aws" / s["mesh_prefix"] for s in surfaces]
     command = [str(args.binary.resolve()), "raster", str(staging), "--shape", ",".join(map(str, shape)),
-               "--um", str(args.um), "--level", str(args.level), "--T", str(args.T),
+               "--um", str(args.um), "--level", str(args.level), "--binary", "1",
                "--levels", str(args.levels), "--threads", str(args.threads), "--shard", str(args.shard),
                *map(str, mesh_paths)]
     provenance = {"scroll": args.scroll, "volume": args.volume, "ct_root": args.ct_root, "ct": args.ct,
                   "native_shape_zyx": shape, "native_um": args.um, "surface_count": len(surfaces),
-                  "surface_segments": [s["segment"] for s in surfaces], "encoding": "0=background,254=surface,255=ignore",
-                  "label_level": args.level, "T": args.T, "command": command,
+                  "surface_segments": [s["segment"] for s in surfaces], "encoding": "binary",
+                  "values": {"background": 0, "surface": 255}, "codec": "volcomp-mask-lossless",
+                  "label_level": args.level, "label_um": args.um * 2**args.level,
+                  "label_shape_zyx": [(n + 2**args.level - 1) // 2**args.level for n in shape],
+                  "surface_band_chamfer": 4, "pyramid_pool": "any-positive",
+                  "background_assumption": "All non-surface voxels are negative; released meshes may omit physical sheets.",
+                  "train_upsample": "nearest voxel center, ties toward increasing coordinates",
+                  "command": command,
                   "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
                   "inventory_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest()}
     atomic_json(args.work / "build.json", dict(provenance, status="rasterizing"))
@@ -192,8 +197,9 @@ def main():
     staging.rename(args.out)
     source = matching[0].copy()
     source.update(name=args.scroll + "-all-surfaces", root=args.ct_root, ct=args.ct, um=args.um,
-                  targets={"recto": {"root": str(args.out), "group": "."}}, weight=1.0)
-    source.pop("trust_band", None)  # validity is already encoded around the union of meshes
+                  targets={"recto": {"root": str(args.out), "group": ".", "encoding": "binary",
+                                     "min_level": args.level}}, weight=1.0)
+    source.pop("trust_band", None)  # this source supervises all CT-positive voxels
     atomic_json(args.sources_out, {"cache": template.get("cache"), "sources": [source]})
     atomic_json(args.work / "build.json", dict(provenance, status="complete", store=str(args.out), sources=str(args.sources_out)))
     print(f"SURFACE_STORE_READY {args.out}\nSOURCES_READY {args.sources_out}", flush=True)
