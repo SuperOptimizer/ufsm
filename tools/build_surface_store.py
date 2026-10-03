@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Build one binary surface-mask pyramid from every AWS surface registered to a CT scan.
+"""Build one binary surface-mask pyramid from registered AWS surfaces.
 
 The final store is published only after rasterization succeeds. Raw AWS files,
-ETags and SHA256 hashes remain in --work for restart and provenance.
+ETags and SHA256 hashes remain in the download cache for restart and provenance.
+An optional segment list selects exact segment directories, excluding older versions.
 """
 import argparse
 import concurrent.futures
@@ -10,6 +11,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import subprocess
 import time
 import urllib.parse
@@ -48,8 +50,30 @@ def list_objects(prefix, delimiter=None):
         params["continuation-token"] = root.find("s:NextContinuationToken", NS).text
 
 
-def inventory(scroll, volume, um, workers):
+def read_segments(path):
+    segments = [line.strip().rstrip("/") for line in path.read_text().splitlines()
+                if line.strip() and not line.lstrip().startswith("#")]
+    if not segments or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", s) for s in segments):
+        raise ValueError("segment list must contain nonempty directory names, one per line")
+    if len(set(segments)) != len(segments):
+        raise ValueError("segment list contains duplicates")
+    return segments
+
+
+def select_segments(rows, segments, key):
+    by_name = {key(row): row for row in rows}
+    if len(by_name) != len(rows):
+        raise ValueError("inventory contains duplicate segment directories")
+    missing = set(segments) - by_name.keys()
+    if missing:
+        raise ValueError(f"requested segments missing from inventory: {sorted(missing)}")
+    return [by_name[s] for s in segments]
+
+
+def inventory(scroll, volume, um, workers, segments=None):
     _, prefixes = list_objects(f"{scroll}/segments/", "/")
+    if segments is not None:
+        prefixes = select_segments(prefixes, segments, lambda p: p.rstrip("/").split("/")[-1])
     def get(prefix):
         segment = prefix.rstrip("/").split("/")[-1]
         _, meshes = list_objects(prefix + "mesh/", "/")
@@ -114,6 +138,8 @@ def main():
     parser.add_argument("--out", type=Path, default=Path("/vesuvius/ufsm/gt/paris4-all-surfaces/labels.zarr"))
     parser.add_argument("--sources-out", type=Path, default=REPO / "configs/paris4-all-surfaces.json")
     parser.add_argument("--source-template", type=Path, default=REPO / "configs/all2.json")
+    parser.add_argument("--segments-file", type=Path, help="exact segment directories, one per line")
+    parser.add_argument("--download-cache", type=Path, help="reuse AWS files and receipts from another work directory")
     parser.add_argument("--binary", type=Path, default=REPO / "build/ufsm")
     parser.add_argument("--download-workers", type=int, default=6)
     parser.add_argument("--threads", type=int, default=4)
@@ -124,6 +150,8 @@ def main():
     args = parser.parse_args()
     args.work = args.work.resolve()
     args.out = args.out.resolve()
+    cache = args.download_cache.resolve() if args.download_cache else args.work
+    segments = read_segments(args.segments_file) if args.segments_file else None
     if (min(args.download_workers, args.threads) <= 0 or args.threads > 256 or
             args.shard < 128 or args.shard % 128 or not 1 <= args.levels <= 12 or
             not 0 <= args.level < 10 or args.level + args.levels > 10 or not math.isfinite(args.um) or args.um <= 0):
@@ -132,13 +160,15 @@ def main():
     manifest_path = args.work / "aws-registered-surfaces.json"
     if manifest_path.exists():
         surfaces = json.loads(manifest_path.read_text())
+        if segments is not None:
+            surfaces = select_segments(surfaces, segments, lambda s: s["segment"])
         expected_prefix = f"{args.scroll}/segments/"
         expected_suffix = f"-on-{args.volume}-{args.um:g}um.tifxyz/"
         if not surfaces or any(not s["mesh_prefix"].startswith(expected_prefix) or
                                not s["mesh_prefix"].endswith(expected_suffix) for s in surfaces):
             raise ValueError("cached inventory belongs to another scan")
     else:
-        surfaces = inventory(args.scroll, args.volume, args.um, args.download_workers)
+        surfaces = inventory(args.scroll, args.volume, args.um, args.download_workers, segments)
         if not surfaces:
             raise ValueError("no registered surfaces found")
         atomic_json(manifest_path, surfaces)
@@ -147,7 +177,7 @@ def main():
           f"{sum(o['bytes'] for o in objects)/2**30:.2f} GiB", flush=True)
     receipts, downloaded = [], 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.download_workers) as pool:
-        jobs = {pool.submit(download, o, args.work): o for o in objects}
+        jobs = {pool.submit(download, o, cache): o for o in objects}
         for future in concurrent.futures.as_completed(jobs):
             receipt = future.result()
             receipts.append(receipt)
@@ -168,7 +198,7 @@ def main():
         raise ValueError("expected one matching template source for axis and held-out box")
     ct_meta = json.loads((Path(args.ct_root) / args.ct / "0/zarr.json").read_text())
     shape = ct_meta["shape"]
-    mesh_paths = [args.work / "aws" / s["mesh_prefix"] for s in surfaces]
+    mesh_paths = [cache / "aws" / s["mesh_prefix"] for s in surfaces]
     command = [str(args.binary.resolve()), "raster", str(staging), "--shape", ",".join(map(str, shape)),
                "--um", str(args.um), "--level", str(args.level), "--binary", "1",
                "--levels", str(args.levels), "--threads", str(args.threads), "--shard", str(args.shard),
@@ -185,8 +215,12 @@ def main():
                   "command": command,
                   "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
                   "inventory_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest()}
+    if args.segments_file:
+        provenance.update(segments_file=str(args.segments_file.resolve()),
+                          segments_sha256=hashlib.sha256(args.segments_file.read_bytes()).hexdigest())
+    provenance["download_cache"] = str(cache)
     atomic_json(args.work / "build.json", dict(provenance, status="rasterizing"))
-    print("Rasterizing every surface into one store", flush=True)
+    print(f"Rasterizing {len(surfaces)} selected surfaces into one store", flush=True)
     try:
         with (args.work / "raster.log").open("w") as log:
             subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT)
@@ -196,7 +230,7 @@ def main():
     atomic_json(staging / "provenance.json", provenance)
     staging.rename(args.out)
     source = matching[0].copy()
-    source.update(name=args.scroll + "-all-surfaces", root=args.ct_root, ct=args.ct, um=args.um,
+    source.update(name=args.scroll + ("-selected-surfaces" if segments else "-all-surfaces"), root=args.ct_root, ct=args.ct, um=args.um,
                   targets={"recto": {"root": str(args.out), "group": ".", "encoding": "binary",
                                      "min_level": args.level}}, weight=1.0)
     source.pop("trust_band", None)  # this source supervises all CT-positive voxels

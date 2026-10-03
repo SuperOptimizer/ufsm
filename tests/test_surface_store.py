@@ -116,6 +116,47 @@ class SurfaceStore(unittest.TestCase):
         with mock.patch.object(builder.time, "sleep"), self.assertRaises(Exception):
             builder.download(obj, self.work)
 
+    def test_exact_segment_selection_reuses_cache_and_excludes_other_surfaces(self):
+        cache = self.root / "download-cache"
+        for s in builder.inventory("PHercParis4", "20260411134726", 1, 2):
+            for obj in s["objects"]:
+                builder.download(obj, cache)
+        self.gets.clear()
+        # An excluded segment with no matching registration must not block the build.
+        self.objects = {k: v for k, v in self.objects.items()
+                        if "/s2/" not in k or "other-scan" in k}
+        segments = self.root / "segments.txt"
+        segments.write_text("# exact directory names\ns1/\n")
+        argv = self.args(REPO / "build/ufsm") + ["--segments-file", str(segments),
+                                                "--download-cache", str(cache)]
+        with mock.patch.object(sys, "argv", argv):
+            builder.main()
+        self.assertEqual(self.gets, [])
+        build = json.loads((self.work / "build.json").read_text())
+        self.assertEqual(build["surface_segments"], ["s1"])
+        self.assertEqual(build["surface_count"], 1)
+        self.assertEqual(build["segments_sha256"], hashlib.sha256(segments.read_bytes()).hexdigest())
+        self.assertEqual(build["command"][-1], str(cache / "aws" /
+            "PHercParis4/segments/s1/mesh/s1-on-20260411134726-1um.tifxyz"))
+        self.assertEqual(len(json.loads((self.work / "download-receipts.json").read_text())), 4)
+        raw = self.root / "selected.raw"
+        subprocess.run([str(REPO / "build/ufsm"), "read", str(self.out), "2",
+                        "0", "0", "0", "64", "64", "64", str(raw)], check=True)
+        values = raw.read_bytes()
+        self.assertEqual(values[(30 * 64 + 30) * 64 + 20], 255)
+        self.assertEqual(values[(30 * 64 + 30) * 64 + 40], 0)
+
+    def test_missing_or_invalid_segment_list_fails(self):
+        with self.assertRaisesRegex(ValueError, "missing"):
+            builder.inventory("PHercParis4", "20260411134726", 1, 2, ["s1", "absent"])
+        with self.assertRaisesRegex(ValueError, "missing"):
+            builder.select_segments([{"segment": "s1"}], ["s2"], lambda s: s["segment"])
+        path = self.root / "segments.txt"
+        for content in ["", "# empty\n", "s1\ns1/\n", "../s1\n", "s1/subdirectory\n"]:
+            path.write_text(content)
+            with self.assertRaises(ValueError):
+                builder.read_segments(path)
+
     def test_real_merged_store_and_native_training_sample(self):
         with mock.patch.object(sys, "argv", self.args(REPO / "build/ufsm")):
             builder.main()

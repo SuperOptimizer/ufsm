@@ -36,6 +36,46 @@ Paris 4 scan `20260411134726` at 2.4 micrometers. The AWS inventory on 2026-10-0
 segment directories with this registration. Other registrations of the same surface belong to
 different CT coordinate systems. A missing or ambiguous registration stops the build.
 
+That full inventory includes overlapping revisions of the same wraps. The current curated
+Paris 4 target uses exactly the 25 directories in `configs/paris4-segments-20260623.txt`
+(wrap groups w010–w123). Selection is by exact directory name, so another revision of the
+same wrap group does not enter the union. Missing or duplicate requested IDs stop the build.
+
+```sh
+python3 tools/build_surface_store.py \
+  --segments-file configs/paris4-segments-20260623.txt \
+  --download-cache /vesuvius/ufsm/gt/paris4-all-surfaces \
+  --work /vesuvius/ufsm/gt/paris4-selected-20260623 \
+  --out /vesuvius/ufsm/gt/paris4-selected-20260623/labels.zarr \
+  --sources-out configs/paris4-selected-20260623.json --threads 12
+python3 tools/verify_surface_store.py \
+  --work /vesuvius/ufsm/gt/paris4-selected-20260623 \
+  --sources configs/paris4-selected-20260623.json \
+  --out /vesuvius/ufsm/gt/paris4-selected-20260623/sample-check
+python3 tools/prepare_surface_training.py \
+  --work /vesuvius/ufsm/gt/paris4-selected-20260623 \
+  --out /vesuvius/ufsm/gt/paris4-selected-20260623/training-4p8.zarr \
+  --sources-out /vesuvius/ufsm/gt/paris4-selected-20260623/training-sources.json \
+  --source-template configs/paris4-selected-20260623.json
+```
+
+The cache flag reuses previously downloaded AWS files after comparing their sizes and
+ETags with the selected inventory; it also supports an empty cache. The resulting provenance
+records every selected directory, the selection-file hash, and input receipts. The mask
+geometry, binary codec, held-out box, and native nearest-neighbor upsampling are the same as
+below. The curated store has its own path, so an existing training job keeps consistent labels.
+Wraps omitted from this list contribute no positive labels. The background supervision
+assumption described below still applies.
+
+The 2026-10-03 selected build's finest mask occupies 4.86 GiB and rasterized in 728 seconds;
+the complete six-level pyramid occupies 6.40 GiB.
+Three real native 704-cubed training samples passed finite-input and target checks. In the
+fixed 192-cubed held-out preview, positive labels fell from 2,649,811 to 1,344,133 voxels
+(49.3% fewer), with no added positives and the same surface-band expansion. These are
+data-selection measurements, not accuracy scores for a model trained on the new labels.
+
+The earlier full-inventory build is reproducible with:
+
 ```sh
 make build/ufsm build/check_surface_samples
 python3 tools/build_surface_store.py --threads 12
