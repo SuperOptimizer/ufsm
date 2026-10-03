@@ -81,6 +81,25 @@ failure of a systemd user build service. After this verification succeeds, train
 The existing Paris 4 held-out box remains excluded from training. Raw surfaces, labels, montages
 and build outputs stay outside Git; the repository contains the reproducible code and config.
 
+To start native training after the 4.8-micrometer render finishes, while coarser levels
+are still building, freeze that completed level into a stable view:
+
+```sh
+python3 tools/prepare_surface_training.py \
+  --work /vesuvius/ufsm/gt/paris4-all-surfaces \
+  --out /vesuvius/ufsm/gt/paris4-all-surfaces/training-4p8.zarr \
+  --sources-out /vesuvius/ufsm/gt/paris4-all-surfaces/training-sources.json \
+  --source-template configs/paris4-all-surfaces.json
+ufsm train /vesuvius/ufsm/gt/paris4-all-surfaces/training-sources.json \
+  --out runs/paris4 --P 704 --B 1 --gpus 0,1 --split z --levels 1,0,0,0
+```
+
+The view uses hard links on the same filesystem, so it preserves the finished mask through
+the builder's final rename without duplicating its payload. An exact coarse occupancy array
+is built from nonempty inner chunks to guide sampling; native targets come from the 4.8 level.
+Its indexes are checksum-checked. The view's background and held-out box rules match the
+completed store. Optional `--resume` starts from an existing checkpoint.
+
 ## Reproducible training and deployment
 
 `tools/production.py` freezes the executable, sources configuration, axis files, recipe and evaluation

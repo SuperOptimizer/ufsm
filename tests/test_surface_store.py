@@ -148,6 +148,21 @@ class SurfaceStore(unittest.TestCase):
         # Both distinct surfaces must be visible in the same target slice.
         for xpos in [40, 80]:
             self.assertEqual(pgm[60 * 3 * 128 + 128 + xpos], 255)
+        # Native training can start from the finished finest level while its builder
+        # continues. The snapshot must survive the staging directory's eventual rename.
+        view = self.root / "training.zarr"; view_cfg = self.root / "training.json"
+        subprocess.run([sys.executable, str(REPO / "tools/prepare_surface_training.py"),
+                        "--work", str(self.work), "--out", str(view), "--sources-out", str(view_cfg),
+                        "--source-template", str(self.cfg)], check=True)
+        original = self.out / "2/c/0/0/0"
+        self.assertEqual(original.stat().st_ino, (view / "2/c/0/0/0").stat().st_ino)
+        self.out.rename(self.root / "renamed-labels.zarr")
+        native_check = self.root / "view-check"; native_check.mkdir()
+        subprocess.run([str(REPO / "build/check_surface_samples"), str(view_cfg), str(native_check), "128", "1"], check=True)
+        self.assertTrue(json.loads((native_check / "samples.json").read_text())["passed"])
+        raw = self.root / "occupancy.raw"
+        subprocess.run([str(REPO / "build/ufsm"), "read", str(view), "256", "0", "0", "0", "1", "1", "1", str(raw)], check=True)
+        self.assertEqual(raw.read_bytes(), b'\xff')
 
     def test_mismatched_tiff_axes_fail_the_entire_build(self):
         key = next(k for k in self.objects if k.endswith("y.tif"))
