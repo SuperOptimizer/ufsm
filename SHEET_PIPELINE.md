@@ -175,6 +175,37 @@ current production recipe.
 
 ## Verification
 
+The Paris4 recipe enables all 48 cube symmetries (including Z flips) with
+probability 0.5, additional three-axis rotations up to 5 degrees with probability
+0.2, and smooth elastic displacements up to one native voxel with probability
+0.15. The elastic map has a positive Jacobian by construction and uses no dense
+displacement buffer. Axis jitter is at most two native voxels, applied with
+probability 0.1 and capped at two degrees of radial-direction error. It changes
+only the auxiliary radial inputs; the winding reference remains fixed.
+
+Continuous transforms resample CT and soft surface targets together, carry the
+material winding scalar unchanged, transport radial vectors through their
+Jacobian, and forward-map every sparse path/ordering/coordinate record. Invalid
+crop corners and unresolved contacts remain excluded from supervision. The
+four-channel winding input retains q0 plus the Y/X projections of the radial
+vector; the network architecture is unchanged. Arbitrary cube permutations and
+tilts can move part of the radial vector into its omitted Z component.
+
+The soft ridge has sigma 1.75 native voxels. With probability 0.2, its distance
+field receives a signed offset of at most 0.25 voxel, dilating or eroding the
+soft band while preserving the surface centreline. The sigma plus maximum
+expansion stays within the audited two-voxel spacing cap. Validation disables
+all appearance, geometry, axis and morphology augmentation.
+
+For a deliberate augmentation change on an interrupted winding job, use
+`python3 tools/sheet_pipeline.py reconfigure --run OLD_RUN --recipe
+configs/paris4-sheet704.json --out NEW_RUN --prepare-only`, followed by `resume
+--run NEW_RUN`. This freezes a new executable and recipe and continues the same
+coverage plan/cursor, optimizer and winding ramp. Its state records the exact
+change boundary. Such a continuation has mixed augmentation history and is
+not a matched member of the old ablation cohort. Checkpoints record the effective
+augmentation settings under `extra.augmentation`.
+
 `make test-sheet` checks lifting, exclusions, loss derivatives, reconstruction and
 file contracts on CPU. `make test-sheet-gpu` checks interpolation/scatter across
 both GPUs plus small real training, resume and floating-output prediction. The

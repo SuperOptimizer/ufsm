@@ -27,8 +27,9 @@ def main():
         t=Path(tmp)
         subprocess.run([ROOT/"build/make_pipeline_fixture",t],check=True)
         source=t/"sources.json"
+        (t/"axis.json").write_text(json.dumps(dict(control_points=[dict(z=0,y=-40,x=-40),dict(z=128,y=-40,x=-40)])))
         source.write_text(json.dumps({"sources":[dict(name="fixture",root=str(t),ct="ct",um=1,
-            targets={"recto":"labels"},holdout=[96,96,96,32,32,32])]}))
+            axis=str(t/"axis.json"),targets={"recto":"labels"},holdout=[96,96,96,32,32,32])]}))
         reference=dict(version=1,units="turns",coordinate_order="zyx",
             knots=[[0,-40,-40,10,-2],[128,-40,-40,10,-2]],input_center=5,input_scale=10)
         rows=[]
@@ -98,6 +99,22 @@ def main():
             q=np.frombuffer(decompress_zstd(shards[0],128**3*4),"<f4").reshape(128,128,128)
             assert np.isfinite(q[:16,:16,:16]).any() and np.isnan(q[16:]).all()
             print(f"{mode}: donor cover detached, three updates, resume contract, floating prediction: ok")
+            augmented=list(command); augmented[augmented.index("--noaug")+1]="0"; augmented[augmented.index("--soft")+1]="1.75"
+            augmented += ["--geometry-aug","1","--rotate-deg","5","--rotate-p","1","--elastic","1","--elastic-p","1",
+                          "--label-morph","0.25","--label-morph-p","1","--axis-jitter","2","--ct-aug","1"]
+            # Resume an existing winding checkpoint: preserve the cover cursor,
+            # optimizer and q ramp while deliberately changing augmentation.
+            changed=t/(mode+"-augmented")
+            execute(augmented+["--out",changed,"--resume",partial/"last.ckpt"])
+            hc=header(changed/"last.ckpt")
+            assert hc["step"]==hf["step"] and hc["extra"]["cover"]==hf["extra"]["cover"]
+            assert hc["extra"]["sheet"]==hf["extra"]["sheet"]
+            aug=hc["extra"]["augmentation"]
+            assert aug["geometry"]==1 and aug["mode"]==1 and aug["rotate_p"]==aug["elastic_p"]==1
+            assert aug["axis_jitter"]==2 and aug["label_morph_voxels"]==.25
+            with (changed/"geometry.csv").open() as f: rows=list(csv.DictReader(f))
+            assert len(rows)==2 and all(np.isfinite(float(r["weighted"])) for r in rows)
+            print(f"{mode}: full 3D augmentation + winding checkpoint continuation: ok")
             if mode=="single":
                 complete=t/"all-losses"
                 execute(command+["--out",complete,"--resume",t/"donor/last.ckpt","--sheet-init","1","--sheet-variant","2"])

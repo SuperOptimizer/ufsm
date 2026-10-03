@@ -1,6 +1,7 @@
 #include "sample.h"
 #include "nn.h"
 #include "ct_augment.h"
+#include "spatial_augment.h"
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -346,6 +347,97 @@ static void write_x(const uint8_t *ctu, int P, const int64_t o[3], float fmean, 
                     sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H) {
     write_x_aug(ctu, P, o, fmean, fisd, hasax, cyz, cxz, y, jitter, ia, ib, isg, r, nrow, xfmt, X, H, nullptr, nullptr, nullptr,nullptr,nullptr);
 }
+/* Continuous geometry uses source coordinates for CT, labels, q0 and the axis.
+   Only valid source voxels are supervised: rotated cube corners are ignored.
+   The four input channels stay unchanged; a winding task uses q0 and the two
+   Y/X projections of the transported radial vector. */
+static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t *mask,
+                         uint8_t *T,uint8_t *M,int P,const int64_t o[3],float mean,float isd,
+                         int hasax,const float *cy,const float *cx,sym sy,const spatial_aug *a,
+                         float gain,float offset,float noise,rng *r,float *nrow,int xfmt,float *X,uint16_t *H,
+                         const ct_aug_plan *ap,float *noise_row,float *noise_plane,
+                         const sheet_dataset *sheet,const double (*params)[4],float *appearance) {
+    pthread_once(&g_ntab_once,ntab_init);
+    size_t p3=(size_t)P*P*P; float *table=malloc(6*(size_t)P*sizeof *table);
+    if (!table) abort();
+    spatial_aug_tables(a,table);
+    if (ap && ap->filter_mode) {
+        for (int z=0;z<P;z++) for (int y=0;y<P;y++) for (int x=0;x<P;x++)
+            appearance[((size_t)z*P+y)*P+x]=ct_aug_value(ap,ctu,P,z,y,x);
+    }
+    const float sign[3]={sy.flip[0]?-1:1,sy.flip[1]?-1:1,sy.flip[2]?-1:1};
+    for (int z=0;z<P;z++) for (int y=0;y<P;y++) {
+        for (int x=0;x+4<=P;x+=4) { uint64_t v=rnext(r); for (int j=0;j<4;j++) nrow[x+j]=g_ntab[(v>>(16*j))&65535]; }
+        for (int x=P&~3;x<P;x++) nrow[x]=g_ntab[rnext(r)&65535];
+        if (ap && ap->noise_rho>0) ct_aug_noise_row(ap,nrow,noise_row,noise_plane,P,z,y);
+        for (int x=0;x<P;x++) {
+            size_t k=((size_t)z*P+y)*P+x;
+            float u[3],jac[3],v[3]; spatial_aug_pull(a,table,z,y,x,u,jac);
+            for (int d=0;d<3;d++) v[sy.perm[d]]=sy.flip[d]?P-1-u[d]:u[d];
+            float out[4]={0}; int inside=1;
+            for (int d=0;d<3;d++) if (v[d]<0 || v[d]>P-1) inside=0;
+            for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=0;
+            M[k]=0;
+            if (inside) {
+                int base[3]; float f[3];
+                for (int d=0;d<3;d++) { base[d]=(int)v[d]; if (base[d]>=P-1) base[d]=P-2; f[d]=v[d]-base[d]; }
+                float tv[NCH]={0},cv=0; int valid=1;
+                for (int bz=0;bz<2;bz++) for (int by=0;by<2;by++) for (int bx=0;bx<2;bx++) {
+                    float weight=(bz?f[0]:1-f[0])*(by?f[1]:1-f[1])*(bx?f[2]:1-f[2]);
+                    if (weight<=1e-7f) continue;
+                    size_t j=((size_t)(base[0]+bz)*P+base[1]+by)*P+base[2]+bx;
+                    valid &= mask[j]!=0;
+                    float val=ap && ap->filter_mode?appearance[j]:ap?ap->lut[ctu[j]]:((float)ctu[j]-mean)*isd;
+                    cv+=weight*val;
+                    for (int ch=0;ch<NCH;ch++) tv[ch]+=weight*target[(size_t)ch*p3+j];
+                }
+                if (ap && !ap->filter_mode && P>1) for (int d=0;d<3;d++) cv+=ap->shading[d]*(2*v[d]/(P-1)-1);
+                out[0]=gain*cv+offset+noise*nrow[x]; M[k]=(uint8_t)valid;
+                for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=(uint8_t)lroundf(tv[ch]);
+                float frac=f[0],ayy=cy[base[0]]*(1-frac)+cy[base[0]+1]*frac;
+                float axx=cx[base[0]]*(1-frac)+cx[base[0]+1]*frac;
+                float dy=(float)o[1]+v[1]-ayy,dx=(float)o[2]+v[2]-axx;
+                float radius=sqrtf(dy*dy+dx*dx)+1e-6f;
+                float radial[3]={0,hasax?dy/radius:0,hasax?dx/radius:0},discrete[3],transported[3];
+                for (int d=0;d<3;d++) discrete[d]=sign[d]*radial[sy.perm[d]];
+                float norm=1e-12f;
+                for (int d=0;d<3;d++) { transported[d]=jac[d]*((float)a->R[d][0]*discrete[0]+(float)a->R[d][1]*discrete[1]+(float)a->R[d][2]*discrete[2]); norm+=transported[d]*transported[d]; }
+                norm=sqrtf(norm); for (int d=0;d<3;d++) out[1+d]=transported[d]/norm;
+                if (sheet) {
+                    double q[4]; for (int d=0;d<4;d++) q[d]=params[base[0]][d]*(1-(double)frac)+params[base[0]+1][d]*frac;
+                    double prior=hypot(o[1]+(double)v[1]-q[0],o[2]+(double)v[2]-q[1])/q[2]+q[3];
+                    out[1]=(float)((prior-sheet->center)/sheet->scale);
+                }
+            }
+            for (int ch=0;ch<4;ch++) {
+                size_t j=(size_t)ch*p3+k;
+                if (xfmt==1) { _Float16 h=(_Float16)out[ch]; memcpy(H+j,&h,2); }
+                else if (xfmt==2) H[j]=bf16_rn(out[ch]); else X[j]=out[ch];
+            }
+        }
+    }
+    free(table);
+}
+/* Keep complete sparse terms only. q/q0 are material scalar coordinates and
+   are invariant under reflection/deformation; coordinates use the same warp
+   as the dense targets. This also removes paths leaving the valid crop. */
+static void warp_sheet_batch(sheet_batch *b,const spatial_aug *a,const uint8_t *mask) {
+    size_t nt=0,np=0; int P=a->P;
+    for (size_t t=0;t<b->nt;t++) {
+        sheet_term term=b->terms[t]; sheet_point points[SHEET_PATH]; int valid=1;
+        for (unsigned i=0;i<term.count;i++) {
+            points[i]=b->points[term.first+i]; double source[3],output[3];
+            for (int d=0;d<3;d++) source[d]=points[i].xyz[d];
+            spatial_aug_forward(a,source,output);
+            int v[3]; for (int d=0;d<3;d++) { if (output[d]<0 || output[d]>=P-1) valid=0; points[i].xyz[d]=(float)output[d]; v[d]=(int)lround(output[d]); }
+            if (valid && !mask[((size_t)v[0]*P+v[1])*P+v[2]]) valid=0;
+        }
+        if (!valid) continue;
+        term.first=(uint32_t)np; b->terms[nt++]=term;
+        memcpy(b->points+np,points,term.count*sizeof *points); np+=term.count;
+    }
+    b->np=np; b->nt=nt;
+}
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
@@ -472,15 +564,18 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     PROF_MARK(PS_DILATE);
     /* soft ridge target: background voxels near the surface get 254 * exp(-(d / sigma)^2 / 2), d = 3-4-5 chamfer distance / 3 */
     float soft0; { unsigned sb = atomic_load(&sp->soft_bits); memcpy(&soft0, &sb, 4); }
+    float morph=0;
+    if (c->augment && c->label_morph>0 && runif(r)<c->label_morph_p) morph=(float)((2*runif(r)-1)*c->label_morph);
     uint16_t *dm = (uint16_t *)(big + 2 * p3);   /* chamfer distance to the annotated surface, per channel (3 per voxel); big has room */
     int dm_ch = -1, dm_any = 0;                   /* channel the map currently holds, and whether that channel had any surface */
 #define CHAMFER_FOR(ch_) do { if (dm_ch != (ch_)) { dm_ch = (ch_); dm_any = chamfer345(ttmp + (size_t)(ch_) * p3, dm, P); } } while (0)
     if (soft0 > 0 && region_ch < 0) {
         float sigma = soft0 / (float)(1 << l); if (sigma < 0.75f) sigma = 0.75f;
+        float shift=morph/(float)(1<<l);
         /* exp(-(d/3)^2 / (2 sigma^2)) tabulated over the chamfer distance (3 per voxel); beyond dcut it rounds to 0 */
-        int dcut = (int)(3.f * sigma * 4.5f) + 1; if (dcut > 4000) dcut = 4000;
+        int dcut = (int)(3.f * (sigma * 4.5f+fmaxf(0,shift))) + 1; if (dcut > 4000) dcut = 4000;
         uint8_t *etab = big + 4 * p3;
-        for (int d = 0; d <= dcut; d++) { float df = d / 3.f; int t = (int)(254.f * expf(-0.5f * df * df / (sigma * sigma)) + 0.5f); etab[d] = (uint8_t)(t > 254 ? 254 : t); }
+        for (int d = 0; d <= dcut; d++) { float df = fmaxf(0,d / 3.f-shift); int t = (int)(254.f * expf(-0.5f * df * df / (sigma * sigma)) + 0.5f); etab[d] = (uint8_t)(t > 254 ? 254 : t); }
         for (int ch = 0; ch < NCH; ch++) {
             if (!w[ch]) continue;
             uint8_t *dst = ttmp + (size_t)ch * p3;
@@ -552,8 +647,12 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         ct_aug_make(&ap, rnext(r), 1, mean, sd, P); app = &ap;
         if (ap.noise_rho > 0) isg = ap.noise_sigma;
     }
-    for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y);
-    sym_u8(mask, M, P, y);
+    spatial_aug spatial={0};
+    if (c->augment && c->geometry_augment) spatial_aug_make(&spatial,rnext(r),P,c->rotate_degrees,c->rotate_p,c->elastic,c->elastic_p);
+    if (!spatial.active) {
+        for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y);
+        sym_u8(mask, M, P, y);
+    }
     PROF_MARK(PS_AUGMENT);
     float *X = c->xfmt ? nullptr : b->x + (size_t)i * 4 * p3;
     uint16_t *H = c->xfmt ? b->x16 + (size_t)i * 4 * p3 : nullptr;
@@ -562,7 +661,9 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         params=malloc((size_t)P*sizeof *params);
         for (int sz=0;sz<P;sz++) sheet_parameters(c->sheet,o[0]+sz,params[sz]);
     }
-    if (app || c->sheet) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
+    if (spatial.active) write_spatial(ctu,ttmp,mask,T,M,P,o,(float)mean,(float)(1.0/sd),s->ax.n>0,cyz,cxz,y,&spatial,
+            ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+5*p3));
+    else if (app || c->sheet) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
             X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);
     else write_x(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H);
     free(params);
@@ -570,6 +671,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         sheet_batch_free(b->sheet[i]);
         b->sheet[i] = sheet_sample(c->sheet, o, P, y.perm, y.flip, ctu,ttmp,rnext(r));
         if (!b->sheet[i]) return -1;
+        if (spatial.active) warp_sheet_batch(b->sheet[i],&spatial,M);
         w[1]=0; /* winding is supervised by the sparse regression objective */
     }
     PROF_MARK(PS_X16);

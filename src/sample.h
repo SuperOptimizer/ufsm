@@ -28,6 +28,9 @@ typedef struct {
     int ct_augment;         /* conservative reconstructed-CT appearance augmentation */
     float symmetry_p;       /* chance of drawing a symmetry when augment enables geometry */
     float axis_jitter;      /* max auxiliary axis error in native voxels, p=.1, angle capped at 2 degrees */
+    int geometry_augment;  /* all 48 symmetries, including Z flips, with registered continuous warps */
+    float rotate_degrees, rotate_p, elastic, elastic_p;
+    float label_morph, label_morph_p; /* signed soft-band distance offset; centreline preserved */
     const sheet_dataset *sheet; /* borrowed sparse geometry, native-level B=1 task */
 } sample_cfg;
 

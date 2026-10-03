@@ -98,7 +98,7 @@ int main(void) {
         uint8_t *ct=calloc(p3,1); float *input=calloc(4*p3,4); uint16_t *half=calloc(4*p3,2);
         int checked=0;
         for (int si=0;si<48;si++) {
-            sym y=sym_of(si); if (y.perm[0]!=0 || y.flip[0]) continue;
+            sym y=sym_of(si);
             write_x_aug(ct,P,o,0,1,1,cy,cx,y,0,1,0,0,&r,nrow,0,input,nullptr,nullptr,nullptr,nullptr,&sheet,params);
             write_x_aug(ct,P,o,0,1,1,cy,cx,y,0,1,0,0,&r,nrow,1,nullptr,half,nullptr,nullptr,nullptr,&sheet,params);
             for (int z=0;z<P;z++) for (int yy=0;yy<P;yy++) for (int x=0;x<P;x++) {
@@ -110,7 +110,7 @@ int main(void) {
             }
             checked++;
         }
-        printf("winding input: %d Z-preserving symmetries, FP32/FP16 scalar reference checked\n",checked);
+        printf("winding input: %d full cube symmetries, FP32/FP16 scalar reference checked\n",checked);
         free(ct); free(input); free(half);
     }
     size_t n = 1 << 24; float *X = calloc(n, 4);

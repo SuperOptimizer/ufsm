@@ -130,7 +130,7 @@ def train(a):
     atomic_json(inputs/"cover.json",plan)
     opts=dict(recipe["train"],P=P,B=1,steps=a.updates,cover=str(inputs/"cover.json"),
               task="surface_winding",geometry=str(geometry),**{"sheet-init":1,"sheet-variant":a.variant})
-    opts.pop("input-prec",None); opts["axis-jitter"]=0; opts["mem"]="auto16"
+    opts.pop("input-prec",None); opts["mem"]="auto16"
     if a.baseline:
         for key in ("task","geometry","sheet-init","sheet-variant"): opts.pop(key,None)
         opts["warm-start"]=1; opts["input-prec"]=0
@@ -194,6 +194,66 @@ def execute_candidate(out):
 
 
 def resume(a): execute_candidate(a.run)
+
+
+def reconfigure(a):
+    """Explicitly change augmentation in an interrupted finite-cover run.
+
+    A new immutable run records the boundary; the checkpoint preserves the
+    optimizer, cover cursor and original winding ramp/schedule. This is not a
+    fresh matched ablation and must not be compared to the original cohort.
+    """
+    previous=Path(a.run).resolve(); old=json.loads((previous/"state.json").read_text())
+    verify_inputs(previous,old)
+    out=Path(a.out).resolve()
+    if out.exists(): raise ValueError("choose a new reconfigured run directory")
+    recipe=json.loads(Path(a.recipe).read_text())
+    allowed={"noaug","rotonly","zfix","intonly","ct-aug","symmetry-p","axis-jitter",
+             "geometry-aug","rotate-deg","rotate-p","elastic","elastic-p","label-morph","label-morph-p","soft"}
+    command=list(old["command"])
+    for key,value in recipe["train"].items():
+        flag="--"+key
+        if key not in allowed and (flag not in command or str(value)!=command[command.index(flag)+1]):
+            raise ValueError("reconfigure changes augmentation only: "+key)
+    # The trainer atomically publishes checkpoints. One copied snapshot binds
+    # both the header and payload even if this is prepared before shutdown.
+    out.mkdir(parents=True); inputs=out/"inputs"
+    shutil.copytree(previous/"inputs",inputs)
+    shutil.copyfile(previous/"model/last.ckpt",inputs/"resume.ckpt")
+    saved=header(inputs/"resume.ckpt"); cover=saved.get("extra",{}).get("cover",{})
+    if cover.get("sha256")!=digest(inputs/"cover.json") or cover.get("count")!=old["updates"]:
+        raise ValueError("checkpoint/coverage contract mismatch")
+    if cover["cursor"]>=cover["count"]: raise ValueError("finite cover is complete")
+    if old["task"]=="surface_winding" and saved.get("extra",{}).get("sheet",{}).get("geometry_sha256")!=old["geometry_sha256"]:
+        raise ValueError("checkpoint/geometry contract mismatch")
+    shutil.copy2(a.binary,inputs/"ufsm")
+    for i,value in enumerate(command):
+        if value.startswith(str(previous/"inputs")+"/"):
+            command[i]=str(inputs/Path(value).relative_to(previous/"inputs"))
+    for flag,value in (("--out",str(out/"model")),("--resume",str(inputs/"resume.ckpt"))):
+        command[command.index(flag)+1]=value
+    for flag in ("--sheet-init","--warm-start"):
+        if flag in command:
+            pos=command.index(flag); del command[pos:pos+2]
+    for key,value in recipe["train"].items():
+        if key not in allowed: continue
+        flag="--"+key
+        if flag in command: command[command.index(flag)+1]=str(value)
+        else: command.extend([flag,str(value)])
+    cfg=json.loads((inputs/"sources.json").read_text())
+    for source in cfg["sources"]:
+        if source.get("axis","").startswith(str(previous/"inputs")+"/"):
+            source["axis"]=str(inputs/Path(source["axis"]).relative_to(previous/"inputs"))
+    atomic_json(inputs/"sources.json",cfg); atomic_json(inputs/"recipe.json",recipe)
+    state=dict(old,status="prepared",command=command,donor_sha256=digest(inputs/"resume.ckpt"),
+        inputs={str(p.relative_to(inputs)):digest(p) for p in inputs.rglob("*") if p.is_file()},
+        augmentation_change=dict(previous_run=str(previous),step=saved["step"],cursor=cover["cursor"],
+            previous_recipe_sha256=old["inputs"]["recipe.json"],previous_checkpoint_augmentation=saved.get("extra",{}).get("augmentation"),
+            comparison="mixed augmentation history; a new matched cohort is required for promotion"))
+    for key in ("checkpoint_sha256","wall_seconds"): state.pop(key,None)
+    atomic_json(out/"state.json",state)
+    if a.prepare_only: print(f"prepared augmentation continuation {out} at step {saved['step']}")
+    else: execute_candidate(out)
 
 
 def sweep(a):
@@ -519,6 +579,9 @@ def main():
     t.add_argument("--baseline",action="store_true",help="legacy surface-only control with frozen winding reference")
     t.add_argument("--existing-targets",action="store_true",help="expanded-label/soft=3 control; supply the original sources")
     t=sub.add_parser("resume"); t.add_argument("--run",required=True)
+    t=sub.add_parser("reconfigure",help="continue the same coverage plan with explicitly changed augmentation")
+    for name in ("run","recipe","out"): t.add_argument("--"+name,required=True)
+    t.add_argument("--binary",default=BINARY); t.add_argument("--prepare-only",action="store_true")
     t=sub.add_parser("sweep")
     for name in ("geometry","sources","original-sources","cover","resume","out"): t.add_argument("--"+name,required=True)
     t.add_argument("--recipe",default="configs/paris4-sheet704.json")

@@ -95,6 +95,15 @@ int main(int argc, char **argv) {
     sp = sampler_start(S, &c); assert(sp); aug = sampler_next(sp); assert(aug);
     check("augmentation is reproducible across worker counts", !memcmp(input, aug->x, 4 * n * sizeof(float)));
     sampler_release(sp, aug); sampler_stop(sp); free(input); free(target); free(mask);
+    c.augment=1; c.geometry_augment=1; c.rotate_degrees=5; c.rotate_p=1; c.elastic=1; c.elastic_p=1;
+    c.soft=1.75; c.label_morph=.25; c.label_morph_p=1; c.nworkers=1;
+    input=malloc(4*n*sizeof(float)); target=malloc(NCH*n); mask=malloc(n);
+    sp=sampler_start(S,&c); assert(sp); aug=sampler_next(sp); assert(aug);
+    memcpy(input,aug->x,4*n*sizeof(float)); memcpy(target,aug->t,NCH*n); memcpy(mask,aug->m,n);
+    sampler_release(sp,aug); sampler_stop(sp); c.nworkers=4;
+    sp=sampler_start(S,&c); assert(sp); aug=sampler_next(sp); assert(aug);
+    check("3D warp/morphology deterministic across worker counts", !memcmp(input,aug->x,4*n*sizeof(float)) && !memcmp(target,aug->t,NCH*n) && !memcmp(mask,aug->m,n));
+    sampler_release(sp,aug); sampler_stop(sp); free(input); free(target); free(mask);
     c.cover_start = 0; S->src[0].hold_o[0] = 16; S->src[0].hold_n[0] = S->src[0].hold_n[1] = S->src[0].hold_n[2] = 16;
     sp = sampler_start(S, &c); check("finite plan rejects holdout intersection", !sp); sampler_stop(sp);
     sources_free(S);

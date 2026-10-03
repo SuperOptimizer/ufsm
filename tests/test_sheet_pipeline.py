@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"tools"))
-from sheet_pipeline import freeze_geometry, score_geometry, decompress_zstd, mesh_evidence, export, select, sweep, train, verify_inputs
+from sheet_pipeline import freeze_geometry, score_geometry, decompress_zstd, mesh_evidence, export, select, sweep, train, verify_inputs, reconfigure
 from sheet_geometry import make_record, write_dataset, digest
 from build_sheet_geometry import build, sample_edge
 from sheet_reconstruct import fit, extract, validate_mesh, canonical, canonical_domain, fitting_bounds
@@ -17,6 +17,38 @@ import tifffile
 
 
 class PipelineTests(unittest.TestCase):
+    def test_augmentation_reconfigure_keeps_cursor_and_geometry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); previous=root/"previous"; inputs=previous/"inputs"; inputs.mkdir(parents=True)
+            (previous/"model").mkdir()
+            (inputs/"ufsm").write_bytes(b"old binary")
+            (inputs/"sources.json").write_text(json.dumps(dict(sources=[dict(axis=str(inputs/"axis.json"))])))
+            (inputs/"axis.json").write_text("{}")
+            (inputs/"recipe.json").write_text(json.dumps(dict(train=dict(soft=2),predict={})))
+            (inputs/"cover.json").write_text(json.dumps(dict(count=4,tiles=[[0,0,0,0]]*4)))
+            (inputs/"resume.ckpt").write_bytes(b"initial donor")
+            saved=dict(step=5,extra=dict(cover=dict(sha256=digest(inputs/"cover.json"),count=4,cursor=2,base_step=3),
+                sheet=dict(geometry_sha256="a"*64,schedule_start=3)))
+            (previous/"model/last.ckpt").write_bytes(("UFSM "+json.dumps(saved)+"\n").encode()+b"optimizer payload")
+            state=dict(task="surface_winding",status="interrupted",updates=4,geometry_sha256="a"*64,
+                command=[str(inputs/"ufsm"),"train",str(inputs/"sources.json"),"--out",str(previous/"model"),
+                    "--resume",str(inputs/"resume.ckpt"),"--cover",str(inputs/"cover.json"),"--steps","4","--soft","2","--sheet-init","1"],
+                inputs={p.name:digest(p) for p in inputs.iterdir()})
+            (previous/"state.json").write_text(json.dumps(state))
+            recipe=root/"recipe.json"; recipe.write_text(json.dumps(dict(train={"soft":1.75,"geometry-aug":1,"axis-jitter":2},predict={})))
+            binary=root/"ufsm"; binary.write_bytes(b"new binary")
+            args=argparse.Namespace(run=previous,recipe=recipe,binary=binary,out=root/"continued",prepare_only=True)
+            reconfigure(args)
+            continued=json.loads((args.out/"state.json").read_text()); verify_inputs(args.out,continued)
+            self.assertNotIn("--sheet-init",continued["command"])
+            self.assertEqual(continued["augmentation_change"]["cursor"],2)
+            self.assertEqual(continued["augmentation_change"]["step"],5)
+            self.assertEqual((args.out/"inputs/resume.ckpt").read_bytes(),(previous/"model/last.ckpt").read_bytes())
+            self.assertIn("--geometry-aug",continued["command"])
+            self.assertEqual(continued["geometry_sha256"],state["geometry_sha256"])
+            recipe.write_text(json.dumps(dict(train={"lr":.1},predict={}))); args.out=root/"invalid"
+            with self.assertRaisesRegex(ValueError,"augmentation only"): reconfigure(args)
+
     def test_sweep_freezes_one_live_donor(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
