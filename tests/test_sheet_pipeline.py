@@ -14,9 +14,50 @@ from build_sheet_geometry import build, sample_edge
 from sheet_reconstruct import fit, extract, validate_mesh, canonical, canonical_domain, fitting_bounds
 import argparse
 import tifffile
+from sheet_pipeline import extract as extract_evidence, evaluate
 
 
 class PipelineTests(unittest.TestCase):
+    def test_empty_prediction_retains_identity_and_scores_zero_support(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); pred=root/"prediction"; (pred/"winding").mkdir(parents=True)
+            (pred/"zarr.json").write_text(json.dumps(dict(attributes=dict(multiscales=[dict(datasets=[dict(path="2.4")])]))))
+            (pred/"winding/manifest.json").write_text(json.dumps(dict(shard=4,shape=[4,4,4],origin_zyx=[0,0,0])))
+            (pred/"winding/reference.json").write_text("{}")
+            (pred/"winding/0.0.0.q.zst").write_bytes(b"fixture")
+            (pred/"candidate.json").write_text(json.dumps(dict(checkpoint_sha256="a"*64,comparison=dict(updates=2000))))
+            def read(command,**kw): Path(command[10]).write_bytes(bytes([51])*64)
+            args=argparse.Namespace(prediction=pred,out=root/"evidence.npz",binary="ufsm",stride=2,cell=4,threshold=.3)
+            with patch("sheet_pipeline.decompress_zstd",return_value=np.zeros(64,"<f4").tobytes()), patch("sheet_pipeline.subprocess.run",side_effect=read):
+                extract_evidence(args)
+            evidence=dict(np.load(args.out))
+            self.assertEqual(evidence["xyz"].shape,(0,3))
+            self.assertEqual(evidence["affinity_edges"].shape,(0,2))
+            self.assertEqual(str(evidence["checkpoint_sha256"]),"a"*64)
+            self.assertEqual(float(evidence["threshold"]),.3)
+            xyz=np.array([[0,0,x] for x in range(20)],float)
+            truth=dict(xyz=xyz,q=np.zeros(20),region=np.zeros(20,int),edges=np.array([[i,i+1] for i in range(19)]))
+            np.savez(root/"truth.npz",**truth)
+            report=root/"report.json"
+            evaluate(argparse.Namespace(truth=root/"truth.npz",evidence=args.out,out=report,split="development",reconstruction=None))
+            result=json.loads(report.read_text())
+            self.assertEqual(result["supported_coverage"],0)
+            self.assertEqual(result["median_correct_track_length"],0)
+            self.assertIsNone(result["coordinate_mae"])
+            self.assertIsNone(result["winding_switch_frequency"])
+            json.dumps(result,allow_nan=False)
+            baseline=dict(result,supported_coverage=1,winding_switch_frequency=.5,false_bridge_frequency=.5,median_correct_track_length=100)
+            (root/"baseline.json").write_text(json.dumps(baseline))
+            select(argparse.Namespace(baseline=root/"baseline.json",candidates=[report],out=root/"selection.json"))
+            self.assertEqual(json.loads((root/"selection.json").read_text())["status"],"no candidate passes")
+
+    def test_sparse_prediction_is_evaluable(self):
+        xyz=np.array([[0,0,x] for x in range(20)],float)
+        truth=dict(xyz=xyz,q=np.zeros(20),region=np.zeros(20,int),edges=np.array([[i,i+1] for i in range(19)]))
+        result=score_geometry(truth,dict(xyz=xyz[:1],q=np.zeros(1)),0)
+        self.assertEqual(result["evidence_points"],1)
+        self.assertEqual(result["supported_coverage"],.25)
+
     def test_completed_cover_extension_preserves_payload_and_excludes_holdouts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); previous=root/"previous"; inputs=previous/"inputs"; inputs.mkdir(parents=True)

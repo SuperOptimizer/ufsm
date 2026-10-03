@@ -217,6 +217,12 @@ The longer horizon raises the learning rate from the previous final cooldown.
 Native `--stop-at STEP` saves an exact intermediate update without shortening
 that horizon; omit the extension flag when resuming the resulting checkpoint.
 
+If no predicted surface evidence survives the fixed evaluation cutoff,
+`extract` writes an empty evidence file with checkpoint and cutoff provenance.
+Evaluation records zero coverage and track length; distance, coordinate error
+and switch/bridge rates are unavailable. This model outcome does not abort a
+longer training trial and cannot qualify as a topology improvement.
+
 `make test-sheet` checks lifting, exclusions, loss derivatives, reconstruction and
 file contracts on CPU. `make test-sheet-gpu` checks interpolation/scatter across
 both GPUs plus small real training, resume and floating-output prediction. The

@@ -424,7 +424,18 @@ def extract(a):
         gs=groups[order]; first=np.r_[True,(gs[1:]!=gs[:-1]).any(axis=1)]
         keep=order[first]
         point_parts.append(coords[keep]+origin+offset); q_parts.append(qq[keep]); p_parts.append(pp[keep])
-    if not point_parts: raise ValueError("prediction has no supported surface evidence")
+    candidate=json.loads((pred/"candidate.json").read_text())
+    metadata=dict(checkpoint_sha256=candidate["checkpoint_sha256"],threshold=a.threshold,
+                  comparison=json.dumps(candidate["comparison"],sort_keys=True),uses_winding=not baseline,
+                  reference_sha256=digest(pred/("reference.json" if baseline else "winding/reference.json")))
+    if not point_parts:
+        # An empty prediction at the fixed cutoff is a measured model outcome.
+        # Keep its identity and cutoff so evaluation can record zero support.
+        np.savez_compressed(a.out,xyz=np.empty((0,3),np.float32),q=np.empty(0,np.float32),
+                            probability=np.empty(0,np.float32),normal=np.empty((0,3),np.float32),
+                            affinity_edges=np.empty((0,2),np.int64),affinity_probability=np.empty(0,np.float32),**metadata)
+        print(f"extracted 0 surface evidence points at cutoff {a.threshold}: {a.out}")
+        return
     xyz,q,probability=[np.concatenate(v) for v in (point_parts,q_parts,p_parts)]
     # Local planes provide unoriented normals only when the neighbourhood is
     # genuinely sheet-like. Unsupported normals stay zero and carry no claim.
@@ -453,20 +464,20 @@ def extract(a):
             sampled=map_coordinates(volume,lines.reshape(-1,3).T,order=1,mode="constant",cval=0,output=np.float32)
             affinity[start:start+len(ids)]=sampled.reshape(-1,13).min(axis=1)/255
         del volume
-    candidate=json.loads((pred/"candidate.json").read_text())
     np.savez_compressed(a.out,xyz=xyz.astype(np.float32),q=q.astype(np.float32),
                         probability=probability.astype(np.float32),normal=normal.astype(np.float32),
-                        checkpoint_sha256=candidate["checkpoint_sha256"],threshold=a.threshold,
-                        comparison=json.dumps(candidate["comparison"],sort_keys=True),
-                        uses_winding=not baseline,affinity_edges=pairs,affinity_probability=affinity,
-                        reference_sha256=digest(pred/("reference.json" if baseline else "winding/reference.json")))
+                        affinity_edges=pairs,affinity_probability=affinity,**metadata)
     print(f"extracted {len(q)} surface evidence points: {a.out}")
 
 
 def score_geometry(truth,evidence,region):
     gt={k:v for k,v in truth.items()}; use=gt["region"]==region
     xyz=gt["xyz"][use]; q=gt["q"][use]
-    if len(xyz)<16 or len(evidence["xyz"])<16: raise ValueError("too few evaluation points")
+    if len(xyz)<16: raise ValueError("too few ground-truth evaluation points")
+    if not len(evidence["xyz"]):
+        return dict(points=len(xyz),evidence_points=0,supported_coverage=0.,surface_distance=None,coordinate_mae=None,
+                    winding_switch_frequency=None,false_bridge_frequency=None,winding_switch_count=0,false_bridge_count=0,
+                    median_correct_track_length=0.,metric_note="No supported evidence at the fixed cutoff; distance, winding and bridge rates are unavailable. Zero event counts do not certify topology.")
     tree=cKDTree(evidence["xyz"]); distance,nearest=tree.query(xyz,workers=1)
     observed=evidence["q"][nearest]; error=observed-q
     valid=distance<=4
@@ -517,7 +528,7 @@ def score_geometry(truth,evidence,region):
             last=dijkstra(local,directed=False,indices=int(np.argmax(first)))
             tracks.append(float(last.max()))
     edge_switch=float(jumps[valid[edges].all(axis=1)].mean()) if len(edges) and valid[edges].all(axis=1).any() else 0
-    return dict(points=len(xyz),supported_coverage=float(valid.mean()),
+    return dict(points=len(xyz),evidence_points=len(pred),supported_coverage=float(valid.mean()),
                 surface_distance=float(np.median(distance)),coordinate_mae=float(np.mean(abs(error[valid]))) if valid.any() else None,
                 winding_switch_frequency=max(edge_switch,float(affinity_switches.mean()) if len(pairs) else 0),
                 false_bridge_frequency=float(bridges.mean()) if len(bridges) else 0,
@@ -573,8 +584,10 @@ def evaluate(a):
         predicted=mesh_evidence(truth["xyz"],dict(np.load(root/"surface.npz")))
         # Nearest-evidence probabilities at mesh vertices must not turn an
         # inferred completion into an observed surface between those vertices.
-        distance,nearest=cKDTree(evidence["xyz"]).query(predicted["xyz"],workers=1)
-        supported=(predicted["probability"]>=result["threshold"]) & (distance<=4) & (evidence["probability"][nearest]>=result["threshold"])
+        if len(evidence["xyz"]):
+            distance,nearest=cKDTree(evidence["xyz"]).query(predicted["xyz"],workers=1)
+            supported=(predicted["probability"]>=result["threshold"]) & (distance<=4) & (evidence["probability"][nearest]>=result["threshold"])
+        else: supported=np.zeros(len(predicted["xyz"]),bool)
         predicted={k:v[supported] for k,v in predicted.items()}
         result.update(reconstruction_sha256=digest(root/"report.json"),
                       reconstruction_metrics=score_geometry(truth,predicted,0 if a.split=="development" else 1))
@@ -587,12 +600,13 @@ def select(a):
     for path,r in reports:
         if baseline.get("split")!="development" or r.get("split")!="development" or r.get("truth_sha256")!=baseline.get("truth_sha256") or r.get("threshold")!=baseline.get("threshold") or r.get("reference_sha256")!=baseline.get("reference_sha256") or r.get("comparison")!=baseline.get("comparison"):
             raise ValueError("selection requires matched development truth and threshold")
-        ok=(r["supported_coverage"]>=.95*baseline["supported_coverage"] and
+        ok=(r["supported_coverage"]>0 and baseline["supported_coverage"]>0 and
+            r["supported_coverage"]>=.95*baseline["supported_coverage"] and
             r["winding_switch_frequency"]<=.7*baseline["winding_switch_frequency"] and
             r["false_bridge_frequency"]<=.7*baseline["false_bridge_frequency"] and
             r["median_correct_track_length"]>=1.25*baseline["median_correct_track_length"])
         if ok: passing.append((path,r))
-    enough_failures=baseline["winding_switch_frequency"]>0 and baseline["false_bridge_frequency"]>0
+    enough_failures=(baseline["winding_switch_frequency"] or 0)>0 and (baseline["false_bridge_frequency"] or 0)>0
     if not enough_failures:
         result=dict(status="insufficient baseline failures",action="extend every candidate equally to 5000 updates")
     elif not passing: result=dict(status="no candidate passes",action="retain current production recipe")
