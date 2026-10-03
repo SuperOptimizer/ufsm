@@ -39,8 +39,8 @@ static int slices(const char *dir, int bi, const batch *b, int P) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3 || argc > 5) {
-        fprintf(stderr, "usage: check_surface_samples <sources.json> <output-dir> [P=704] [batches=3]\n");
+    if (argc < 3) {
+        fprintf(stderr, "usage: check_surface_samples <sources.json> <output-dir> [P=704] [batches=3] [--cover PLAN.json] [--ct-aug]\n");
         return 2;
     }
     int P = argc > 3 ? atoi(argv[3]) : 704, nb = argc > 4 ? atoi(argv[4]) : 3;
@@ -51,12 +51,18 @@ int main(int argc, char **argv) {
     c.P = P; c.B = 1; c.nworkers = 1; c.nbuf = 1; c.xfmt = 1;
     c.seed = 704; c.deterministic = 1; c.augment = 0; c.soft = 3;
     memset(c.level_p, 0, sizeof c.level_p); c.level_p[0] = 1;
+    cover_plan *plan = nullptr;
+    for (int ai = 5; ai < argc; ai++) {
+        if (!strcmp(argv[ai], "--cover") && ai + 1 < argc) { plan = cover_load(argv[++ai], S, P); if (!plan) return 2; c.cover = plan; }
+        else if (!strcmp(argv[ai], "--ct-aug")) { c.augment = 3; c.ct_augment = 1; c.symmetry_p = .5; c.axis_jitter = 32; c.seed = 2; }
+        else return 2;
+    }
     sampler *sp = sampler_start(S, &c);
     if (!sp) { sources_free(S); return 1; }
     char path[1400]; snprintf(path, sizeof path, "%s/samples.json.tmp", argv[2]);
     FILE *f = fopen(path, "w");
     if (!f) { sampler_stop(sp); sources_free(S); return 1; }
-    fprintf(f, "{\"P\":%d,\"B\":1,\"level\":0,\"soft\":3,\"seed\":704,\"samples\":[\n", P);
+    fprintf(f, "{\"P\":%d,\"B\":1,\"level\":0,\"soft\":3,\"seed\":%llu,\"ct_augment\":%d,\"samples\":[\n", P, (unsigned long long)c.seed, c.ct_augment);
     size_t n = (size_t)P * P * P; int failed = 0;
     for (int bi = 0; bi < nb; bi++) {
         batch *b = sampler_next(sp);
@@ -68,7 +74,7 @@ int main(int argc, char **argv) {
         }
         for (size_t k = 0; k < 4 * n; k++) nonfinite += !isfinite(input16(b->x16 + k));
         failed |= b->src[0] != 0 || b->level[0] != 0 || b->w[0] != 1 || b->w[1] != 0;
-        failed |= valid == 0 || fg == 0 || bg == 0 || soft == 0 || nonfinite != 0;
+        failed |= nonfinite != 0 || (!c.cover && (valid == 0 || fg == 0 || bg == 0 || soft == 0));
         failed |= slices(argv[2], bi, b, P);
         fprintf(f, "%s{\"corner_zyx\":[%lld,%lld,%lld],\"voxels\":%zu,\"valid\":%zu,"
                    "\"surface\":%zu,\"target_below_half\":%zu,\"soft\":%zu,\"nonfinite_input\":%zu}",
@@ -84,6 +90,7 @@ int main(int argc, char **argv) {
     failed |= fclose(f) != 0;
     sampler_stop(sp); sources_free(S);
     char final[1400]; snprintf(final, sizeof final, "%s/samples.json", argv[2]);
+    cover_free(plan);
     if (rename(path, final)) failed = 1;
     return failed != 0;
 }

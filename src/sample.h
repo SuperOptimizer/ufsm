@@ -2,6 +2,7 @@
    48 cube symmetries and intensity jitter, and hands out ready batches from a ring buffer. */
 #pragma once
 #include "sources.h"
+#include "cover.h"
 #include <stdint.h>
 
 typedef struct {
@@ -21,6 +22,11 @@ typedef struct {
     int deterministic;       /* 1: batch j holds samples j*B .. j*B+B-1, each drawn with its own rng seeded by (seed, index), and
                                 batches come out in order: runs with the same seed see the same data regardless of thread timing */
     int xfmt;                /* also fill batch.x16: 0 = no (x only), 1 = fp16, 2 = bf16 (the trainer uploads x16 straight into the network input) */
+    const cover_plan *cover; /* borrowed immutable finite plan; B=1, native resolution */
+    uint64_t cover_start;    /* committed tile cursor at resume */
+    int ct_augment;         /* conservative reconstructed-CT appearance augmentation */
+    float symmetry_p;       /* chance of drawing a symmetry when augment enables geometry */
+    float axis_jitter;      /* max auxiliary axis error in native voxels, p=.1, angle capped at 2 degrees */
 } sample_cfg;
 
 typedef struct {

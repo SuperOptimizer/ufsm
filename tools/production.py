@@ -14,10 +14,12 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from eval_holdouts import completed_prediction, predict_atomic
+import build_training_cover as training_cover
 
 
 def digest(path):
@@ -172,6 +174,101 @@ def frozen_sources(source_path, dest):
     return cfg
 
 
+def validate_cover(plan, cfg):
+    """Check finite-plan structure and the frozen source's volume identity.
+
+    The original source JSON checksum is provenance only: freezing changes axis
+    filenames. CT/label metadata, label provenance and holdout identities remain
+    stable and are checked explicitly instead.
+    """
+    names = [s['name'] for s in cfg['sources']]
+    if (len(names) != 1 or plan.get('version') != 1 or plan.get('level') != 0 or
+            plan.get('source_names') != names):
+        raise ValueError('cover must name the single merged native source')
+    P, count = plan.get('P'), plan.get('count')
+    tiles, bounds = plan.get('tiles'), plan.get('bounds')
+    if (type(P) is not int or P <= 0 or type(count) is not int or count <= 0 or
+            not isinstance(tiles, list) or len(tiles) != count or
+            not isinstance(bounds, list) or len(bounds) != 6 or
+            any(type(v) is not int or v < 0 for v in bounds) or
+            any(bounds[d + 3] - bounds[d] < P for d in range(3))):
+        raise ValueError('invalid cover dimensions, bounds or tile count')
+    source = cfg['sources'][0]
+    target = source['targets']['recto']
+    if not isinstance(target, dict) or target.get('encoding') != 'binary':
+        raise ValueError('cover requires a merged binary target')
+    binding, coverage = plan.get('binding', {}), plan.get('coverage', {})
+    ct_root = training_cover.local_root(source['root'])
+    label_root = training_cover.local_root(target.get('root', source['root']))
+    label_group = str(Path(target.get('group', '.')))
+    if (binding.get('ct_root') != ct_root or binding.get('ct') != source['ct'] or
+            binding.get('label_root') != label_root or
+            str(Path(binding.get('label_group', ''))) != label_group or
+            not math.isclose(binding.get('native_um', 0), source['um'], rel_tol=1e-8)):
+        raise ValueError('cover source CT or label identity does not match')
+    ct_group, sha = training_cover.read_metadata(ct_root, source['ct'])
+    if binding.get('ct_group_metadata_sha256') != sha:
+        raise ValueError('cover CT group metadata changed')
+    levels = training_cover.datasets(ct_group)
+    relative = all(math.isclose(v, 1, rel_tol=1e-8) for v in levels[0][1])
+    scale = 1 if relative else source['um']
+    native = next((k for k, s in levels if all(math.isclose(v, scale, rel_tol=1e-8) for v in s)), None)
+    if native is None:
+        raise ValueError('cover source has no native CT array')
+    meta, sha = training_cover.read_metadata(ct_root, source['ct'].rstrip('/') + '/' + native)
+    shape = training_cover.shape3(meta)
+    if binding.get('ct_array_metadata_sha256') != sha or binding.get('native_shape_zyx') != list(shape):
+        raise ValueError('cover CT shape or array metadata changed')
+    if any(bounds[d + 3] > shape[d] for d in range(3)):
+        raise ValueError('cover bounds exceed the native CT shape')
+    _, sha = training_cover.read_metadata(label_root, label_group)
+    if binding.get('label_group_metadata_sha256') != sha:
+        raise ValueError('cover label group metadata changed')
+    if '://' in label_root:
+        with urllib.request.urlopen(label_root.rstrip('/') + '/' + label_group + '/provenance.json', timeout=60) as f:
+            provenance_sha = hashlib.sha256(f.read()).hexdigest()
+    else:
+        provenance_sha = digest(Path(label_root) / label_group / 'provenance.json')
+    if binding.get('label_provenance_sha256') != provenance_sha:
+        raise ValueError('cover label provenance changed')
+    occupancy_key = binding.get('occupancy_array')
+    if not isinstance(occupancy_key, str) or not occupancy_key or '..' in Path(occupancy_key).parts:
+        raise ValueError('invalid cover occupancy array')
+    occupancy_meta, sha = training_cover.read_metadata(label_root, label_group + '/' + occupancy_key)
+    if (binding.get('occupancy_metadata_sha256') != sha or
+            binding.get('occupancy_shape_zyx') != list(training_cover.shape3(occupancy_meta))):
+        raise ValueError('cover occupancy metadata changed')
+    occupancy_sha = binding.get('occupancy_sha256', '')
+    if len(occupancy_sha) != 64 or any(c not in '0123456789abcdef' for c in occupancy_sha):
+        raise ValueError('invalid cover occupancy checksum')
+    holdout = source.get('holdout')
+    holes = [holdout[:3] + [holdout[d] + holdout[d + 3] for d in range(3)]] if holdout else []
+    if coverage.get('holdouts') != holes or coverage.get('snap') is not False or coverage.get('position_jitter') is not False:
+        raise ValueError('cover holdout, snapping or position-jitter contract changed')
+    seen = set()
+    for row in tiles:
+        if not isinstance(row, list) or len(row) != 4 or any(type(v) is not int for v in row) or row[0] != 0:
+            raise ValueError('invalid cover tile source or coordinates')
+        origin = row[1:]
+        if any(origin[d] < bounds[d] or origin[d] + P > bounds[d + 3] for d in range(3)):
+            raise ValueError('cover tile escapes its bounds')
+        if any(training_cover.intersects(tuple(origin) + tuple(v + P for v in origin), h) for h in holes):
+            raise ValueError('cover tile intersects a holdout')
+        if tuple(row) in seen:
+            raise ValueError('cover contains duplicate tiles')
+        seen.add(tuple(row))
+
+
+def cover_checkpoint(saved, sha, count):
+    value = saved.get('extra', {}).get('cover')
+    if (not isinstance(value, dict) or value.get('sha256') != sha or value.get('count') != count or
+            any(type(value.get(k)) is not int for k in ('count', 'cursor', 'base_step')) or
+            not 0 <= value['cursor'] <= count or value['base_step'] < 0 or
+            saved.get('step') != value['base_step'] + value['cursor']):
+        raise ValueError('checkpoint cover hash, count or committed cursor does not match')
+    return value
+
+
 def environment(r, binary):
     env = {k: v for k, v in os.environ.items() if not k.startswith('UFSM_')}
     env.update({k: str(v) for k, v in r.get('environment', {}).items()})
@@ -237,6 +334,30 @@ def train(a):
     shutil.copyfile(ROOT / 'tools/eval_holdouts.py', inputs / 'eval_holdouts.py')
     cfg = frozen_sources(a.sources or r['sources'], inputs)
     evaluation_plan(r['evaluation'], {s['name'] for s in cfg['sources'] if s.get('holdout')})
+    cover_path = (getattr(a, 'cover', None) or r['train'].get('cover') or
+                  next((s['cover'] for s in r['stages'] if s.get('cover')), None))
+    cover, cover_sha = None, None
+    if cover_path:
+        if len(r['stages']) != 1:
+            raise ValueError('a finite cover must be one complete-pass stage')
+        frozen_cover = inputs / 'cover.json'
+        shutil.copyfile(cover_path, frozen_cover)
+        cover = json.loads(frozen_cover.read_text()); cover_sha = digest(frozen_cover)
+        validate_cover(cover, cfg)
+        opts = dict(r['train'], **{k: v for k, v in r['stages'][0].items() if k != 'name'})
+        if opts['P'] != cover['P'] or opts['B'] != 1 or opts['steps'] != cover['count']:
+            raise ValueError('cover stage must use its P, batch 1 and exactly count steps')
+        if (int(opts.get('finetune', 0)) or int(opts.get('overfit', 0)) or
+                float(opts.get('seconds', 0)) or float(opts.get('limit-seconds', 0))):
+            raise ValueError('cover forbids finetune, overfit and recipe time budgets; use --trial-seconds for a trial')
+        if len(gpu_devices(a.gpu)) > 1 and opts.get('split') != 'z':
+            raise ValueError('cover with multiple GPUs requires spatial splitting')
+        if opts.get('split') == 'z' and len(gpu_devices(a.gpu)) != 2:
+            raise ValueError('cover spatial splitting requires exactly two GPUs')
+        r['train'].update(cover=str(frozen_cover), **{'cover-sha256': cover_sha})
+        r['stages'][0].pop('cover', None); r['stages'][0].pop('cover-sha256', None)
+    elif r['train'].get('cover-sha256') or any(s.get('cover-sha256') for s in r['stages']):
+        raise ValueError('cover-sha256 requires a cover plan')
     atomic_json(inputs / 'recipe.json', r)
     previous = None
     if a.resume:
@@ -249,29 +370,58 @@ def train(a):
         with gpu_lock(a.gpu):
             for stage in r['stages']:
                 opts = dict(r['train'], **{k: v for k, v in stage.items() if k != 'name'})
-                start_step = header(previous)['step'] if previous else 0
-                opts['steps'] = start_step + opts['steps']
-                opts['schedule-start'] = start_step
+                resumed = header(previous) if previous else {'step': 0}
+                start_step = resumed['step']
+                base_step, start_cursor = start_step, 0
+                if cover:
+                    if 'cover' in resumed.get('extra', {}):
+                        continuation = cover_checkpoint(resumed, cover_sha, cover['count'])
+                        base_step, start_cursor = continuation['base_step'], continuation['cursor']
+                        if start_cursor == cover['count']:
+                            raise ValueError('resumed cover already completed its pass')
+                    opts['steps'] = base_step + cover['count']
+                    opts['schedule-start'] = base_step
+                    opts.pop('seconds', None); opts.pop('warmup-seconds', None)
+                else:
+                    opts['steps'] = start_step + opts['steps']
+                    opts['schedule-start'] = start_step
                 if a.trial_seconds:
-                    opts.update(seconds=a.trial_seconds, **{'warmup-seconds': min(40, a.trial_seconds * 0.05)})
+                    if cover:
+                        opts['limit-seconds'] = a.trial_seconds
+                    else:
+                        opts.update(seconds=a.trial_seconds, **{'warmup-seconds': min(40, a.trial_seconds * 0.05)})
                 cmd = [binary, 'train', inputs / 'sources.json', '--out', out / stage['name'], '--gpus', a.gpu, *flags(opts)]
                 if previous: cmd += ['--resume', previous]
                 spatial = opts.get('split') == 'z'
                 row = dict(name=stage['name'], command=list(map(str, cmd)), start_step=start_step, status='running',
                            parallelism='spatial' if spatial else 'data',
                            effective_batch=opts['B'] * (1 if spatial else len(gpu_devices(a.gpu))))
+                if cover:
+                    row['cover'] = dict(sha256=cover_sha, count=cover['count'], cursor=start_cursor,
+                                        base_step=base_step, remaining=cover['count'] - start_cursor)
                 state['stages'].append(row); state['status'] = 'training'; atomic_json(out / 'run.json', state)
                 row['seconds'] = execute(cmd, out / (stage['name'] + '.log'), environment(r, binary))
                 previous = out / stage['name'] / 'last.ckpt'
                 saved = header(previous)
                 if saved['step'] <= start_step or not saved.get('extra', {}).get('runtime'):
                     raise RuntimeError('stage did not save a new, portable checkpoint')
-                row.update(status='complete', end_step=saved['step'], checkpoint_sha256=digest(previous))
-            state.update(status='trained', checkpoint=str(previous), checkpoint_sha256=digest(previous))
+                status = 'complete'
+                if cover:
+                    committed = cover_checkpoint(saved, cover_sha, cover['count'])
+                    if committed['base_step'] != base_step or committed['cursor'] <= start_cursor:
+                        raise RuntimeError('cover checkpoint changed schedule base or made no progress')
+                    remaining = cover['count'] - committed['cursor']
+                    row['cover'] = dict(committed, remaining=remaining)
+                    status = 'partial' if remaining else 'complete'
+                row.update(status=status, end_step=saved['step'], checkpoint_sha256=digest(previous))
+                if status == 'partial':
+                    break
+            partial = any(s['status'] == 'partial' for s in state['stages'])
+            state.update(status='partial' if partial else 'trained', checkpoint=str(previous), checkpoint_sha256=digest(previous))
             atomic_json(out / 'run.json', state)
     except BaseException as e:
         state.update(status='failed', error=str(e)); atomic_json(out / 'run.json', state); raise
-    print(f'trained checkpoint: {previous}', flush=True)
+    print(f"{'partial cover' if state['status'] == 'partial' else 'trained'} checkpoint: {previous}", flush=True)
 
 
 def run_inputs(path):
@@ -368,6 +518,7 @@ def main():
     p.add_argument('--split', choices=['0', 'z'], help='split each window along z across exactly two GPUs')
     p.add_argument('--mem', choices=['auto', 'auto16', 'default', 'wide'], help='override memory mode for every training stage')
     p.add_argument('--resume'); p.add_argument('--trial-seconds', type=float, default=0)
+    p.add_argument('--cover', help='immutable native-volume plan; one batch-1 stage whose steps equal its tile count')
     p = sub.add_parser('evaluate'); p.add_argument('run'); p.add_argument('--gpu', default='0')
     p.add_argument('--profiles', default='matched,fp4,fp8,fp16'); p.add_argument('--predictions', required=True)
     p = sub.add_parser('export'); p.add_argument('run'); p.add_argument('--profile', required=True); p.add_argument('--out', required=True)

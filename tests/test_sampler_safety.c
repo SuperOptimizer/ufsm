@@ -64,6 +64,40 @@ int main(int argc, char **argv) {
         sampler_stop(sp); atomic_store(&read_budget, -1);
     }
     sources_free(S);
+    /* A finite plan must drain ready slots in order, retain empty tiles, and
+       resume at the committed cursor even with several workers ahead. */
+    S = fixture(argv[1], "");
+    int64_t tiles[5][4] = {{0,0,0,0}, {0,16,0,0}, {0,32,0,0}, {0,48,0,0}, {0,64,0,0}};
+    cover_plan plan = {.P = 16, .count = 5, .tiles = tiles};
+    c = config(); c.B = 1; c.nworkers = 4; c.cover = &plan;
+    c.min_fg = 1.1; c.empty_keep = 0; /* random rejection rules cannot erase planned tiles */
+    for (int start = 0; start < 5; start++) {
+        c.cover_start = (uint64_t)start; sp = sampler_start(S, &c); assert(sp);
+        int ordered = 1;
+        for (int k = start; k < 5; k++) {
+            batch *b = sampler_next(sp); ordered &= b && b->corner[0][0] == 16 * k && b->corner[0][1] == 0 && b->corner[0][2] == 0;
+            if (b) sampler_release(sp, b);
+        }
+        ordered &= sampler_next(sp) == nullptr && !sampler_failed(sp);
+        sampler_stop(sp); check("finite plan drains to EOF and resumes exactly", ordered);
+    }
+    c.cover_start = 0; c.nworkers = 1;
+    sp = sampler_start(S, &c); assert(sp); batch *plain = sampler_next(sp); assert(plain);
+    size_t n = 16 * 16 * 16;
+    uint8_t *target = malloc(NCH * n), *mask = malloc(n);
+    memcpy(target, plain->t, NCH * n); memcpy(mask, plain->m, n);
+    sampler_release(sp, plain); sampler_stop(sp);
+    c.augment = 4; c.ct_augment = 1; c.seed = 2;
+    sp = sampler_start(S, &c); assert(sp); batch *aug = sampler_next(sp); assert(aug);
+    check("appearance augmentation preserves targets and validity", !memcmp(target, aug->t, NCH * n) && !memcmp(mask, aug->m, n));
+    float *input = malloc(4 * n * sizeof(float)); memcpy(input, aug->x, 4 * n * sizeof(float));
+    sampler_release(sp, aug); sampler_stop(sp); c.nworkers = 4;
+    sp = sampler_start(S, &c); assert(sp); aug = sampler_next(sp); assert(aug);
+    check("augmentation is reproducible across worker counts", !memcmp(input, aug->x, 4 * n * sizeof(float)));
+    sampler_release(sp, aug); sampler_stop(sp); free(input); free(target); free(mask);
+    c.cover_start = 0; S->src[0].hold_o[0] = 16; S->src[0].hold_n[0] = S->src[0].hold_n[1] = S->src[0].hold_n[2] = 16;
+    sp = sampler_start(S, &c); check("finite plan rejects holdout intersection", !sp); sampler_stop(sp);
+    sources_free(S);
     /* Two teachers share one CT. Their holdouts together cover it, although neither alone does. */
     S = fixture(argv[1], ",\"holdout\":[0,0,0,64,128,128]");
     S->src = realloc(S->src, 2 * sizeof *S->src); S->src[1] = (source){0}; S->n = 2;

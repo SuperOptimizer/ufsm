@@ -2,13 +2,13 @@
 CC      ?= gcc
 NVCC    ?= nvcc
 CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -pthread
-CPPFLAGS = -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp $(shell pkg-config --cflags libcurl libzstd blosc zlib)
-LDLIBS   = $(shell pkg-config --libs libcurl libzstd blosc zlib) -lm -lpthread
+CPPFLAGS = -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp $(shell pkg-config --cflags libcurl libzstd blosc zlib libcrypto)
+LDLIBS   = $(shell pkg-config --libs libcurl libzstd blosc zlib libcrypto) -lm -lpthread
 CUDA    ?= /usr/local/cuda
 NVFLAGS ?= -O3 -arch=sm_120 -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
 CUDALIBS = -L$(CUDA)/lib64 -lcudart
 
-SRC  = src/json.c src/checkpoint.c src/store.c src/zarr3.c src/sources.c src/sample.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/unet.c src/split.c src/predict.c src/eval.c
+SRC  = src/json.c src/checkpoint.c src/store.c src/zarr3.c src/sources.c src/sample.c src/ct_augment.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/unet.c src/split.c src/predict.c src/eval.c
 OBJ  = $(patsubst src/%.c,build/%.o,$(SRC)) build/surfcomp.o
 
 all: build/ufsm
@@ -79,7 +79,7 @@ build/test_unet: tests/test_unet.c build/unet.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 build/test_split: tests/test_split.c build/unet.o build/split.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-SAMPLE_TEST_OBJ = build/json.o build/store.o build/zarr3.o build/sources.o build/zarr2.o build/tiff.o build/z3w.o build/hf.o build/zipr.o
+SAMPLE_TEST_OBJ = build/ct_augment.o build/cover.o build/json.o build/store.o build/zarr3.o build/sources.o build/zarr2.o build/tiff.o build/z3w.o build/hf.o build/zipr.o
 build/test_sample_ops: tests/test_sample_ops.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_sample_ops.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
 build/test_sampler_safety: tests/test_sampler_safety.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
@@ -91,10 +91,10 @@ build/test_raster: tests/test_raster.c src/ingest.c src/*.h $(SAMPLE_TEST_OBJ) b
 build/check_surface_samples: tools/check_surface_samples.c build/sample.o $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
-build/bench_sampler: tests/bench_sampler.c build/sample.o build/sources.o build/zarr3.o build/zarr2.o build/store.o build/json.o build/z3w.o build/tiff.o build/zipr.o build/hf.o build/nn.o build/nn_fp8.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz
-build/bench_read: tests/bench_read.c build/sample.o build/sources.o build/zarr3.o build/zarr2.o build/store.o build/json.o build/z3w.o build/tiff.o build/zipr.o build/hf.o build/nn.o build/nn_fp8.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz
+build/bench_sampler: tests/bench_sampler.c build/sample.o build/ct_augment.o build/cover.o build/sources.o build/zarr3.o build/zarr2.o build/store.o build/json.o build/z3w.o build/tiff.o build/zipr.o build/hf.o build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
+build/bench_read: tests/bench_read.c build/sample.o build/ct_augment.o build/cover.o build/sources.o build/zarr3.o build/zarr2.o build/store.o build/json.o build/z3w.o build/tiff.o build/zipr.o build/hf.o build/nn.o build/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
 build/fwd_nan: tests/fwd_nan.c build/unet.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 build/test_fused: tests/test_fused.c build/nn.o build/nn_fp8.o
@@ -106,6 +106,12 @@ build/train_lp: tests/train_lp.c build/unet.o build/nn.o build/nn_fp8.o
 
 build/test_formats: tests/test_formats.c $(OBJ) build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+
+build/test_ct_augment: tests/test_ct_augment.c build/ct_augment.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
+
+build/test_cover: tests/test_cover.c build/cover.o build/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lcrypto -lm
 
 build/test_json: tests/test_json.c build/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
@@ -125,7 +131,11 @@ build/test_eval: tests/test_eval.c src/eval.c $(SAMPLE_TEST_OBJ)
 build:
 	mkdir -p build
 
-test: build/check_surface_samples build/test_raster build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging build/test_stem_precision build/test_gn_contract build/test_sampler_safety build/test_optimizer_owners build/test_infer_buffers build/test_recompute_live build/test_checkpoint_runtime build/make_pipeline_fixture build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
+test: build/test_cover build/test_ct_augment build/check_surface_samples build/test_raster build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging build/test_stem_precision build/test_gn_contract build/test_sampler_safety build/test_optimizer_owners build/test_infer_buffers build/test_recompute_live build/test_checkpoint_runtime build/make_pipeline_fixture build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
+	./build/test_cover
+	./build/test_ct_augment
+	python3 tests/test_training_cover.py
+	python3 tests/test_production_cover.py
 	python3 tests/test_http_reader.py
 	python3 tests/test_eval_holdouts.py
 	python3 tests/test_evaluation_plan.py
@@ -134,6 +144,7 @@ test: build/check_surface_samples build/test_raster build/test_http_reader build
 	./build/test_infer_buffers
 	./build/test_recompute_live
 	python3 tests/test_pipeline_cli.py
+	python3 tests/test_cover_training.py
 	python3 tests/test_production.py
 	./build/test_checkpoint
 	./build/test_optimizer_owners

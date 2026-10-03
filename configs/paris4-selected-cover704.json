@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "status": "Paris 4 selected June 23 surfaces: one shuffled native-resolution coverage pass with conservative CT augmentation",
+  "sources": "/vesuvius/ufsm/gt/paris4-selected-20260623/training-sources.json",
+  "train": {
+    "fp4": 2,
+    "mem": "auto",
+    "opt": "muon",
+    "muon-lr": 0.01,
+    "lr": 0.001,
+    "sched": "wsd",
+    "cooldown": 0.2,
+    "soft": 3,
+    "down-norm": 1,
+    "workers": 12,
+    "seed": 2,
+    "input-prec": 8,
+    "gn-stats": "stored",
+    "val-batches": 2,
+    "log-every": 20,
+    "val-every": 500,
+    "ckpt-every": 100,
+    "levels": "1,0,0,0",
+    "zfix": 1,
+    "symmetry-p": 0.5,
+    "ct-aug": 1,
+    "axis-jitter": 32,
+    "det": 1,
+    "cover": "/vesuvius/ufsm/gt/paris4-selected-20260623/cover704.json",
+    "widths": "16,32,64,80"
+  },
+  "stages": [
+    {
+      "name": "large",
+      "P": 704,
+      "B": 1,
+      "steps": 39453,
+      "warmup": 500,
+      "mem": "auto"
+    }
+  ],
+  "predict": {
+    "window": 720,
+    "halo": 8,
+    "shard": 512,
+    "grid-origin": "0,0,0",
+    "ema": 1,
+    "q": 8,
+    "threads": 16
+  },
+  "profiles": {
+    "matched": {},
+    "fp4": {
+      "prec": 3,
+      "fp4": 1,
+      "f16": 1
+    },
+    "fp8": {
+      "prec": 2,
+      "fp4": 0,
+      "f16": 1,
+      "act-mx4": 0,
+      "act-mx8": 1
+    },
+    "fp16": {
+      "prec": 4,
+      "fp4": 0,
+      "f16": 1,
+      "act-mx4": 0,
+      "act-mx8": 0
+    }
+  },
+  "evaluation": {
+    "level": 0,
+    "thresholds": [
+      0.3,
+      0.4,
+      0.45,
+      0.475,
+      0.5,
+      0.525,
+      0.55,
+      0.6,
+      0.7,
+      0.8
+    ],
+    "report_threshold": 0.6,
+    "groups": {
+      "dense": [
+        "PHercParis4-selected-surfaces"
+      ]
+    },
+    "source_levels": {
+      "PHercParis4-selected-surfaces": 0
+    }
+  },
+  "environment": {
+    "UFSM_RC_KEEP_COARSE": "1"
+  }
+}

@@ -6,7 +6,7 @@ the AWS open-data bucket), after re-exporting that data into volcomp volumes and
 Design, data inventory and milestones: [DESIGN.md](DESIGN.md).
 
 ```sh
-make && make test        # gcc -std=c23 + nvcc; needs libcurl, libzstd, libblosc, zlib, CUDA 13 (sm_120)
+make && make test        # gcc -std=c23 + nvcc; needs libcurl, libzstd, libblosc, zlib, OpenSSL libcrypto, CUDA 13 (sm_120)
 ```
 
 ## Commands
@@ -139,6 +139,60 @@ the builder's final rename without duplicating its payload. An exact coarse occu
 is built from nonempty inner chunks to guide sampling; native targets come from the 4.8 level.
 Its indexes are checksum-checked. The view's background and held-out box rules match the
 completed store. Optional `--resume` starts from an existing checkpoint.
+
+## One complete pass over the selected Paris 4 labels
+
+The cleaned June 23 labels can be trained with one finite, shuffled cover instead of random
+sampling. Prepare the stable 4.8-micrometer training view as above, then build the cover:
+
+```sh
+python3 tools/build_training_cover.py \
+  --sources /vesuvius/ufsm/gt/paris4-selected-20260623/training-sources.json \
+  --out /vesuvius/ufsm/gt/paris4-selected-20260623/cover704.json --P 704 --seed 2
+python3 tools/production.py train --recipe configs/paris4-selected-cover704.json \
+  --out runs/paris4-selected-cover --gpus 0,1 --split z --mem auto \
+  --resume runs/previous/large/last.ckpt
+```
+
+The current plan contains **39,453 distinct 704-cubed tiles**. It covers every occupied coarse
+label-cell box within native bounds `[27904,5376,5888]` to `[68096,29696,30464]`, excluding the
+held-out box. Six slabs around that box and clamped final tiles avoid coverage holes. Tiles
+near slab/tail boundaries overlap; each planned tile is visited once. This is a coverage pass,
+not a promise that every individual voxel is visited exactly once. Unlabeled scan ends are
+excluded. At the previous 0.378 cubes/s, GPU training would take about 29 hours; augmentation
+and uncached reads still need measured throughput.
+
+The network is unchanged: widths `16,32,64,80`, 1,172,050 parameters, one native 2.4-micrometer
+window split across both GPUs. Binary targets are nearest-neighbor upsampled from 4.8 micrometers.
+The hard label band and soft sigma 3 remain fixed. The recipe retains the FP4 body, FP8 stem input
+and activation-gradient storage, FP32 master/optimizer/reduction state, and existing automatic
+memory modes.
+
+Augmentation retains gain, offset and Gaussian noise. On half the samples it additionally draws
+from the eight z-preserving XY rotations/reflections, including identity. CT, targets, validity and
+radial vector components transform together. The optional reconstructed-CT appearance module uses
+mild gamma 0.9–1.1 (p 0.15), bounded linear shading (p 0.15), weak smoothing (p 0.10) or unsharp
+filtering (p 0.10), and correlated Gaussian noise (p 0.15). At most two of gamma/shading/filtering
+combine. Auxiliary axis uncertainty is applied on 10% of samples, bounded by 32 native voxels per
+XY component and a 2-degree radial direction change throughout the cube. Label dilation/erosion,
+CT/label misregistration, arbitrary z-axis swaps and crop-origin jitter are disabled. These
+appearance transforms approximate reconstruction sharpness/noise variation; they are not a
+simulation of the scanner's acquisition physics or a measured accuracy improvement.
+
+The runner freezes the cover, binary, source configuration, axis and recipe. Its SHA256, total
+count, committed cursor and original schedule base are saved in every checkpoint. A continuation
+using the same frozen cover and recipe resumes at the next tile and retains the original final
+step and LR schedule. Prefetched but uncommitted samples can be regenerated after interruption.
+Missing teachers, read failures or nonfinite updates cannot silently consume a planned tile.
+Keep augmentation settings and seed unchanged when resuming. Target-width annealing is rejected
+for finite covers because asynchronous prefetch would otherwise make it timing dependent.
+
+Use `--trial-seconds 60` for a bounded production smoke check. This retains the complete-pass
+step schedule, marks the resulting run **partial**, and allows resuming its checkpoint for the
+remaining tiles. Completed cover checkpoints reject another pass under the same plan. The CPU
+checks are `build/test_cover`, `build/test_ct_augment`, `build/test_sampler_safety`,
+`tests/test_training_cover.py` and `tests/test_production_cover.py`; the real single/split GPU
+exhaustion and resume regression is `python3 tests/test_cover_training.py`.
 
 ## Reproducible training and deployment
 

@@ -3,6 +3,8 @@
 #include "nn.h"
 #include "checkpoint.h"
 #include "sample.h"
+#include "cover.h"
+#include <limits.h>
 #include "sources.h"
 #include "split.h"
 #include "unet.h"
@@ -154,6 +156,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
+                        "       [--cover PLAN.json] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
                         "       [--gn-stats stored|legacy]   fresh training uses stored activations; resume preserves the saved contract\n"
                         "       [--schedule-start STEP]   restart the LR schedule at this saved step, preserving optimizer state\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
@@ -167,6 +170,8 @@ int cmd_train(int argc, char **argv) {
     float ema = (float)atof(opt(argc, argv, "--ema", "0.999")), clip = (float)atof(opt(argc, argv, "--clip", "5"));
     int warmup = atoi(opt(argc, argv, "--warmup", "500")), workers = atoi(opt(argc, argv, "--workers", "12"));
     double seconds = atof(opt(argc, argv, "--seconds", "0"));
+    double limit_seconds = atof(opt(argc, argv, "--limit-seconds", "0"));
+    if (!isfinite(limit_seconds) || limit_seconds < 0) { fprintf(stderr, "invalid limit-seconds\n"); return 2; }
     double warmup_seconds = atof(opt(argc, argv, "--warmup-seconds", "-1"));
     if (!isfinite(seconds) || seconds < 0 || !isfinite(warmup_seconds) || warmup_seconds < -1) { fprintf(stderr, "invalid time budget\n"); return 2; }
     if (warmup_seconds < 0) warmup_seconds = seconds * 0.05;
@@ -257,9 +262,27 @@ int cmd_train(int argc, char **argv) {
     if (atoi(opt(argc, argv, "--rotonly", "0"))) sc.augment = 2;   /* proper rotations only (no reflections) */
     if (atoi(opt(argc, argv, "--zfix", "0"))) sc.augment = 3;      /* diagnostic: symmetries that keep the z axis */
     if (atoi(opt(argc, argv, "--intonly", "0"))) sc.augment = 4;   /* diagnostic: intensity jitter, no symmetry */
+    sc.ct_augment = atoi(opt(argc, argv, "--ct-aug", "0"));
+    sc.symmetry_p = (float)atof(opt(argc, argv, "--symmetry-p", "1"));
+    sc.axis_jitter = (float)atof(opt(argc, argv, "--axis-jitter", "0"));
+    if (!isfinite(sc.symmetry_p) || sc.symmetry_p < 0 || sc.symmetry_p > 1 || !isfinite(sc.axis_jitter) || sc.axis_jitter < 0) { fprintf(stderr, "invalid augmentation bounds\n"); return 2; }
+    cover_plan *plan = nullptr; cover_progress coverage = {0}, prior_cover = {0};
+    const char *cover_path = opt(argc, argv, "--cover", nullptr);
+    int has_cover = resume ? cover_checkpoint_read(resume, &prior_cover) : 0;
+    if (has_cover < 0 || (has_cover && !cover_path)) { fprintf(stderr, "finite-cover resume requires its original plan\n"); return 2; }
+    if (cover_path) {
+        if (B != 1 || nl != 1 || overfit || seconds || atoi(opt(argc, argv, "--finetune", "0"))) { fprintf(stderr, "cover requires B=1, one window per step, step-based schedule and no overfit/finetune\n"); return 2; }
+        plan = cover_load(cover_path, S, P); if (!plan) return 2;
+        const char *pinned = opt(argc, argv, "--cover-sha256", plan->sha256);
+        if (strcmp(pinned, plan->sha256) || (has_cover && (strcmp(prior_cover.sha256, plan->sha256) || prior_cover.count != plan->count))) { fprintf(stderr, "cover SHA256/count mismatch\n"); return 2; }
+        coverage = prior_cover; strcpy(coverage.sha256, plan->sha256); coverage.count = plan->count;
+        sc.cover = plan; sc.cover_start = coverage.cursor; sc.deterministic = 1; sc.snap = 0;
+        memset(sc.level_p, 0, sizeof sc.level_p); sc.level_p[0] = 1;
+    }
     sc.dilate = atoi(opt(argc, argv, "--dilate", "0"));   /* thicken surface targets by D level-0 voxels (curriculum) */
     sc.soft = (float)atof(opt(argc, argv, "--soft", "0"));  /* soft ridge target with this sigma (level-0 voxels) */
     float soft_end = (float)atof(opt(argc, argv, "--soft-end", "-1")); if (soft_end < 0) soft_end = sc.soft;   /* sigma annealed linearly to this value at the last step */
+    if (plan && soft_end != sc.soft) { fprintf(stderr, "finite cover requires a fixed soft-target sigma for deterministic resume\n"); return 2; }
     if (soft_end != sc.soft) fprintf(stderr, "soft target sigma annealed %g -> %g; the fixed validation batches keep sigma %g, so the validation loss (and best.ckpt) is not comparable across the run: score last.ckpt\n", sc.soft, soft_end, sc.soft);
     { const char *lv = opt(argc, argv, "--levels", nullptr); if (lv) { char *t = strdup(lv); int l = 0; memset(sc.level_p, 0, sizeof sc.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) sc.level_p[l++] = atof(q); free(t); } }
 
@@ -283,6 +306,13 @@ int cmd_train(int argc, char **argv) {
     int lean = getenv("UFSM_LEAN") ? atoi(getenv("UFSM_LEAN")) : 0;   /* lean: one device batch buffer (no upload overlap), the logit
                                                                      gradient in the model's gradient buffer, logits in A */
     if (resume) fprintf(stderr, "resumed %s at step %d\n", resume, step0);
+    if (plan) {
+        if (!has_cover) coverage.base_step = step0;
+        if ((uint64_t)coverage.base_step + coverage.count > INT_MAX || step0 != coverage.base_step + (int)coverage.cursor) { fprintf(stderr, "cover checkpoint step/cursor mismatch\n"); return 2; }
+        steps = coverage.base_step + (int)coverage.count; schedule_start = coverage.base_step;
+        if (coverage.cursor == coverage.count) { fprintf(stderr, "cover already complete\n"); return 2; }
+        fprintf(stderr, "finite cover: %llu/%llu committed tiles, SHA256 %s, final step %d\n", (unsigned long long)coverage.cursor, (unsigned long long)coverage.count, coverage.sha256, steps);
+    }
     if (schedule_start > step0) { fprintf(stderr, "schedule-start cannot follow the resumed step\n"); return 2; }
     {   /* --mem auto (default): the cheapest storage mode whose training buffers fit next to what is already allocated on every
            GPU; an explicit UFSM_CHUNK_UP / UFSM_RECOMPUTE / UFSM_GRAD_MX8 or --mem default keeps the env / built-in modes */
@@ -378,8 +408,10 @@ int cmd_train(int argc, char **argv) {
     if (!*saved_policy) saved_policy = fp4 >= 2 ? "all=fp4:fp4:fp4,enc0.c1=fp16" : fp4 ? "all=fp4:fp4:fp8,enc0.c1=fp16" : "";
     if (strlen(saved_policy) >= sizeof runtime.policy || strlen(optname) >= sizeof runtime.optimizer) { fprintf(stderr, "checkpoint settings too long\n"); return 2; }
     strcpy(runtime.policy, saved_policy); strcpy(runtime.optimizer, optname);
-    char checkpoint_extra[8192];
-    if (checkpoint_runtime_json(&runtime, checkpoint_extra, sizeof checkpoint_extra)) { fprintf(stderr, "invalid checkpoint settings\n"); return 2; }
+    char checkpoint_extra[8192], runtime_extra[8192];
+    if (checkpoint_runtime_json(&runtime, runtime_extra, sizeof runtime_extra)) { fprintf(stderr, "invalid checkpoint settings\n"); return 2; }
+    strcpy(checkpoint_extra, runtime_extra);
+    if (plan && cover_checkpoint_extra(runtime_extra, &coverage, checkpoint_extra, sizeof checkpoint_extra)) return 2;
     fprintf(stderr, "model widths"); for (int i = 0; i < cfg.nlev; i++) fprintf(stderr, " %d", cfg.widths[i]);
     fprintf(stderr, ": %zu params; P=%d B=%d x %d GPU(s) [", np, P, B, ng); for (int g = 0; g < ng; g++) fprintf(stderr, "%s%d", g ? "," : "", devs[g]); fprintf(stderr, "] %s%s\n", nn_get_tf32() ? "tensor cores (see precision.txt for compute and storage)" : "fp32", split ? ", each window split along z" : "");
     split_ctx *sctx = split ? split_create(devs[0], devs[1]) : nullptr;
@@ -387,7 +419,7 @@ int cmd_train(int argc, char **argv) {
     float *gpeer = ng > 1 ? nn_malloc(np * 4) : nullptr;   /* on GPU 0: incoming gradients of the other GPUs */
 
     /* validation set: fixed batches from the held-out boxes (unaugmented), scored on GPU 0 */
-    sample_cfg vc = sc; vc.seed = seed + 777; vc.augment = 0; vc.nworkers = 4; vc.nbuf = 2; vc.holdout = 1;
+    sample_cfg vc = sc; vc.cover = nullptr; vc.cover_start = 0; vc.ct_augment = 0; vc.axis_jitter = 0; vc.seed = seed + 777; vc.augment = 0; vc.nworkers = 4; vc.nbuf = 2; vc.holdout = 1;
     { int any = 0; for (int i = 0; i < S->n; i++) any |= S->src[i].hold_n[0] > 0; if (!any) { vc.holdout = 0; fprintf(stderr, "no holdout boxes in the sources: validation batches come from the training distribution\n"); } }
     sampler *vs = sampler_start(S, &vc);
     if (!vs) { fprintf(stderr, "cannot construct validation sampler\n"); return 1; }
@@ -419,6 +451,7 @@ int cmd_train(int argc, char **argv) {
     int prof = ufsm_env_on("UFSM_PROF");
     double t0 = now(), tlog = t0, wait = 0, acc_loss = 0, acc_bce = 0, acc_dice = 0, acc_g = 0; int nacc = 0;
     if (seconds) fprintf(stderr, "training budget %.1fs, time-based warmup %.1fs\n", seconds, warmup_seconds);
+    int committed_step = step0, training_failed = 0;
     double best_val = 1e30; int nskip = 0; (void)nskip;
     float parts[8][2 * NCH + 1];
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
@@ -443,10 +476,13 @@ int cmd_train(int argc, char **argv) {
             split_run(sctx, split_job, &sa);
             for (int g = 0; g < 2; g++) { nn_init(G[g].dev); nn_event_record(G[g].ev_done[G[g].cur], 0); nn_event_sync(G[g].ev_up[G[g].cur]); }
             sampler_release(sp, G[0].pending);
-            double tw = now(); batch *nb = sampler_next(sp); wait += now() - tw;
-            if (!nb) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; G[0].pending = nullptr; break; }
-            for (int g = 0; g < 2; g++) { nn_init(G[g].dev); int nxt = G[g].cur ^ 1; upload_async(&G[g], nb, nxt, B, P); select_buf(&G[g], nxt); }
-            G[0].pending = nb;
+            G[0].pending = nullptr;
+            if (step < steps && !g_stop) {
+                double tw = now(); batch *nb = sampler_next(sp); wait += now() - tw;
+                if (!nb) { fprintf(stderr, "sampler stopped before final step\n"); training_failed = 1; break; }
+                for (int g = 0; g < 2; g++) { nn_init(G[g].dev); int nxt = G[g].cur ^ 1; upload_async(&G[g], nb, nxt, B, P); select_buf(&G[g], nxt); }
+                G[0].pending = nb;
+            }
         } else
         for (int g = 0; g < ng; g++) {
             gpu_state *d = &G[g];
@@ -510,16 +546,14 @@ int cmd_train(int argc, char **argv) {
             if (overfit) continue;                           /* keep computing on the same device buffer */
             sampler_release(sp, d->pending);
             /* prefetch the next batch into the other buffer while this step computes */
-            double tw = now();
-            batch *nb = sampler_next(sp);
-            wait += now() - tw;
-            if (!nb) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; d->pending = nullptr; break; }
-            int nxt = d->cur ^ 1;
-            upload_async(d, nb, nxt, B, P);
-            d->pending = nb;
-            select_buf(d, nxt);
+            d->pending = nullptr;
+            if (step < steps && !g_stop) {
+                double tw = now(); batch *nb = sampler_next(sp); wait += now() - tw;
+                if (!nb) { fprintf(stderr, "sampler stopped before final step\n"); training_failed = 1; break; }
+                int nxt = d->cur ^ 1; upload_async(d, nb, nxt, B, P); d->pending = nb; select_buf(d, nxt);
+            }
         }
-        if (g_stop) break;
+        if (g_stop || training_failed) break;
         /* average gradients across GPUs: sum on GPU 0 (peer copies), scale, broadcast */
         if (ng > 1) {
             nn_init(G[0].dev);
@@ -553,6 +587,10 @@ int cmd_train(int argc, char **argv) {
             nn_init(d->dev);
             if (prof) nn_prof_begin(6);
             if (g == 0) gn = unet_grad_norm(d->u);          /* identical on every GPU after averaging */
+            if (plan && (!isfinite(gn) || fwd_nan)) {
+                fprintf(stderr, "cover tile %llu has non-finite forward/gradients; aborting without advancing its cursor\n", (unsigned long long)coverage.cursor);
+                training_failed = 1; break;
+            }
             if (!isfinite(gn) || fwd_nan) {                   /* skip the step; a 16-bit gradient overflow also halves the gradient scale */
                 if (g == 0) {
                     if (fwd_nan) fprintf(stderr, "step %d: non-finite forward, skipping (grad scale kept at %g)\n", step, nn_get_grad_scale());
@@ -570,9 +608,12 @@ int cmd_train(int argc, char **argv) {
             unet_wquant(d->u, (unsigned)step);              /* no-op unless --wq */
             if (prof) nn_prof_end();
         }
+        if (training_failed) break;
+        committed_step = step;
+        if (plan) { coverage.cursor = (uint64_t)(step - coverage.base_step); if (cover_checkpoint_extra(runtime_extra, &coverage, checkpoint_extra, sizeof checkpoint_extra)) return 2; }
         const char *e = nn_check();
         if (e) { fprintf(stderr, "cuda error at step %d: %s\n", step, e); return 1; }
-        if (seconds && now() - t0 >= seconds) g_stop = 1;
+        if ((seconds && now() - t0 >= seconds) || (limit_seconds && now() - t0 >= limit_seconds)) g_stop = 1;
         acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][cfg.cout]; acc_g += gn; nacc++;
         if (step % log_every == 0 || step == steps || g_stop) {
             double dt = now() - tlog;
@@ -619,11 +660,16 @@ int cmd_train(int argc, char **argv) {
             if (step == step0 + 1) { nn_exec_manifest(em, sizeof em); fprintf(stderr, "%s\n", em); }
         }
     }
+    /* Signals can arrive between log/checkpoint boundaries; save only completed optimizer updates. */
+    nn_init(G[0].dev);
+    { char cp[1400]; snprintf(cp, sizeof cp, "%s/last.ckpt", out); if (unet_save(G[0].u, cp, committed_step, checkpoint_extra)) return 1; }
+    if (plan) fprintf(stderr, "cover progress %llu/%llu committed tiles\n", (unsigned long long)coverage.cursor, (unsigned long long)coverage.count);
     uint64_t prod, rej; sampler_stats(sp, &prod, &rej);
     fprintf(stderr, "done in %.0fs; sampler produced %llu, rejected %llu\n", now() - t0, (unsigned long long)prod, (unsigned long long)rej);
     sampler_prof_print(sp);   /* UFSM_SAMPLER_PROF=1: per-stage cpu ms per patch */
     int sampling_failed = sampler_failed(sp);
     sampler_stop(sp);
     if (log) fclose(log);
-    return sampling_failed ? 1 : 0;
+    cover_free(plan);
+    return sampling_failed || training_failed ? 1 : 0;
 }

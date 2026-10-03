@@ -1,5 +1,6 @@
 #include "sample.h"
 #include "nn.h"
+#include "ct_augment.h"
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -28,7 +29,7 @@ sample_cfg sample_cfg_default(void) {
     sample_cfg c = {0};
     c.P = 128; c.B = 2; c.nworkers = 8; c.nbuf = 6; c.seed = 0;
     c.level_p[0] = 0.5; c.level_p[1] = 0.25; c.level_p[2] = 0.15; c.level_p[3] = 0.1;
-    c.min_fg = 0.3; c.empty_keep = 0.2; c.augment = 1; c.snap = 1;
+    c.min_fg = 0.3; c.empty_keep = 0.2; c.augment = 1; c.snap = 1; c.symmetry_p = 1;
     return c;
 }
 
@@ -296,8 +297,8 @@ static inline uint16_t bf16_rn(float f) { uint32_t u; memcpy(&u, &f, 4); u += 0x
    symmetry y (output axis d reads source axis perm[d], reversed when flipped; vector channel 1 + d = (-1)^flip[d] *
    source component perm[d]). cyz / cxz: axis centre per source z. Output fp32 X (xfmt 0) or 16-bit H (1 fp16,
    2 bf16). One rng draw per 4 voxels, as the old separate jitter pass. nrow: P floats of scratch. */
-static void write_x(const uint8_t *ctu, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
-                    sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H) {
+static void write_x_aug(const uint8_t *ctu, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
+                    sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H, const ct_aug_plan *ap, float *noise_row_state, float *noise_plane_state) {
     pthread_once(&g_ntab_once, ntab_init);
     const size_t p3 = (size_t)P * P * P;
     const float sgn[3] = {y.flip[0] ? -1.f : 1.f, y.flip[1] ? -1.f : 1.f, y.flip[2] ? -1.f : 1.f};
@@ -310,12 +311,14 @@ static void write_x(const uint8_t *ctu, int P, const int64_t o[3], float fmean, 
             if (jitter) {
                 for (int x = 0; x + 4 <= P; x += 4) { uint64_t u = rnext(r); nrow[x] = g_ntab[u & 0xffff]; nrow[x + 1] = g_ntab[(u >> 16) & 0xffff]; nrow[x + 2] = g_ntab[(u >> 32) & 0xffff]; nrow[x + 3] = g_ntab[u >> 48]; }
                 for (int x = P & ~3; x < P; x++) nrow[x] = g_ntab[rnext(r) & 0xffff];
+                /* Isotropic correlated noise is generated in output coordinates; cube symmetries preserve its distribution. */
+                if (ap && ap->noise_rho > 0) ct_aug_noise_row(ap, nrow, noise_row_state, noise_plane_state, P, z, yy);
             }
             const size_t ko = ((size_t)z * P + yy) * P;
             for (int x = 0; x < P; x++) {
                 const int sz_ = s0[0] + ds[0] * x, sy_ = s0[1] + ds[1] * x, sx_ = s0[2] + ds[2] * x;
                 const size_t q = ((size_t)sz_ * P + sy_) * P + sx_;
-                float v0 = ((float)ctu[q] - fmean) * fisd;
+                float v0 = ap ? ct_aug_value(ap, ctu, P, sz_, sy_, sx_) : ((float)ctu[q] - fmean) * fisd;
                 if (jitter) v0 = ia * v0 + ib + isg * nrow[x];
                 float comp[3] = {0.f, 0.f, 0.f};
                 if (hasax) {
@@ -331,7 +334,11 @@ static void write_x(const uint8_t *ctu, int P, const int64_t o[3], float fmean, 
             }
         }
 }
-static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big) {
+static void write_x(const uint8_t *ctu, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
+                    sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H) {
+    write_x_aug(ctu, P, o, fmean, fisd, hasax, cyz, cxz, y, jitter, ia, ib, isg, r, nrow, xfmt, X, H, nullptr, nullptr, nullptr);
+}
+static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
     const int P = c->P;
@@ -339,20 +346,22 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     /* source by weight */
     double u = runif(r) * sp->cum[sp->S->n - 1];
     int si = 0;
-    while (si < sp->S->n - 1 && sp->cum[si] < u) si++;
+    if (c->cover) si = (int)c->cover->tiles[tile_index][0];
+    else while (si < sp->S->n - 1 && sp->cum[si] < u) si++;
     source *s = &sp->S->src[si];
     if (c->holdout && !s->hold_n[0]) return 1;
     /* regions target? pick one region, then a level in {0,1} */
     int region_ch = -1, ri = -1;
     for (int ch = 0; ch < NCH; ch++) if (s->reg[ch] && s->reg[ch]->n) region_ch = ch;
     PROF_MARK(PS_SRC);
-    int l = pick_level(sp, s, r, region_ch);
+    int l = c->cover ? 0 : pick_level(sp, s, r, region_ch);
     if (l < 0) return 1;
     PROF_MARK(PS_LEVEL);
     z3 *ct = source_ct(s, l);
     const z3_meta *m = z3_meta_of(ct);
     int64_t o[3], n[3] = {P, P, P};
-    if (region_ch >= 0) {
+    if (c->cover) memcpy(o, c->cover->tiles[tile_index] + 1, sizeof o);
+    else if (region_ch >= 0) {
         regions *R = s->reg[region_ch];
         ri = (int)rint_below(r, R->n);
         int64_t lo[3], hi[3]; if (!patch_bounds(s, m, P, l, R, ri, c->holdout, lo, hi)) return 1;
@@ -375,7 +384,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     } else {
         for (int d = 0; d < 3; d++) { if (m->shape[d] < P) return 1; o[d] = rint_below(r, m->shape[d] - P + 1); }
     }
-    if (c->snap && !c->holdout && region_ch < 0) {   /* training only: snapping a validation origin can leave its holdout */
+    if (!c->cover && c->snap && !c->holdout && region_ch < 0) {   /* training only: snapping a validation origin can leave its holdout */
         for (int d = 0; d < 3; d++) {
             int64_t cs = m->chunk[d]; if (cs <= 0) continue;
             o[d] -= o[d] % cs;
@@ -388,7 +397,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     /* cheap occupancy test on a coarse level before fetching the fine cube */
     int lc = l + 3;
     z3 *cct = lc < MAXLEV ? source_ct(s, lc) : nullptr;
-    if (cct) {
+    if (cct && !c->cover) {
         int pc = P >> 3;
         int64_t oc[3] = {o[0] >> 3, o[1] >> 3, o[2] >> 3}, nc[3] = {pc, pc, pc};
         if (z3_read(cct, oc, nc, big, 1)) return -1;
@@ -404,7 +413,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     size_t nz = 0;
     double sum = 0, sq = 0;
     for (size_t k = 0; k < p3; k++) { nz += ctu[k] != 0; sum += ctu[k]; sq += (double)ctu[k] * ctu[k]; }
-    if ((double)nz / (double)p3 < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); return 1; }
+    if (!c->cover && (double)nz / (double)p3 < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); return 1; }
     PROF_MARK(PS_STATS);
     /* targets */
     uint8_t w[NCH] = {0};
@@ -425,13 +434,13 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             w[ch] = 1;
         } else if (s->tgt_key[ch]) {
             z3 *tz = source_tgt_for_level(s, ch, l, nullptr);
-            if (!tz) { memset(dst, 0, p3); continue; }
+            if (!tz) { if (c->cover) return -1; memset(dst, 0, p3); continue; }
             if (source_read_target(s, ch, l, o, n, dst, 1)) return -1;
             w[ch] = 1;
         } else memset(dst, 0, p3);
         if (w[ch]) for (size_t k = 0; k < p3; k++) if (dst[k] != 255 && dst[k] > tmax) tmax = dst[k];
     }
-    if (tmax == 0 && runif(r) > c->empty_keep) { atomic_fetch_add(&sp->rejected, 1); return 1; }
+    if (!c->cover && tmax == 0 && runif(r) > c->empty_keep) { atomic_fetch_add(&sp->rejected, 1); return 1; }
     PROF_MARK(PS_TARGETS);
     /* curriculum: thicken the surface band by max-filtering the target (hard labels only, pyramid sources) */
     if (c->dilate > 0 && region_ch < 0) {
@@ -514,11 +523,34 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         double a = exp((runif(r) * 2 - 1) * 0.22), bb = (runif(r) * 2 - 1) * 0.2, sg = runif(r) * 0.1;
         ia = (float)a; ib = (float)bb; isg = (float)sg;
     }
+    if (c->augment && c->symmetry_p < 1 && runif(r) >= c->symmetry_p) y = sym_of(0);
+    if (c->augment && c->axis_jitter > 0 && s->ax.n > 0 && runif(r) < .1) {
+        float jy = (float)((2 * runif(r) - 1) * c->axis_jitter / scale);
+        float jx = (float)((2 * runif(r) - 1) * c->axis_jitter / scale);
+        /* Bound the auxiliary radial-direction perturbation throughout the patch. CT/targets remain registered. */
+        float radius = INFINITY;
+        for (int z = 0; z < P; z++) {
+            float dy = fmaxf(0, fmaxf((float)o[1] - cyz[z], cyz[z] - (float)(o[1] + P - 1)));
+            float dx = fmaxf(0, fmaxf((float)o[2] - cxz[z], cxz[z] - (float)(o[2] + P - 1)));
+            float rr = sqrtf(dy * dy + dx * dx); if (rr < radius) radius = rr;
+        }
+        float mag = sqrtf(jy * jy + jx * jx), cap = radius * .0348995f;
+        if (mag > cap && mag > 0) { jy *= cap / mag; jx *= cap / mag; }
+        for (int z = 0; z < P; z++) { cyz[z] += jy; cxz[z] += jx; }
+    }
+    ct_aug_plan ap; const ct_aug_plan *app = nullptr;
+    if (c->augment && c->ct_augment) {
+        ct_aug_make(&ap, rnext(r), 1, mean, sd, P); app = &ap;
+        if (ap.noise_rho > 0) isg = ap.noise_sigma;
+    }
     for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y);
     sym_u8(mask, M, P, y);
     PROF_MARK(PS_AUGMENT);
-    write_x(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
-            c->xfmt ? nullptr : b->x + (size_t)i * 4 * p3, c->xfmt ? b->x16 + (size_t)i * 4 * p3 : nullptr);
+    float *X = c->xfmt ? nullptr : b->x + (size_t)i * 4 * p3;
+    uint16_t *H = c->xfmt ? b->x16 + (size_t)i * 4 * p3 : nullptr;
+    if (app) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
+            X, H, app, noise_state, noise_state ? noise_state + P : nullptr);
+    else write_x(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H);
     PROF_MARK(PS_X16);
     memcpy(b->w + (size_t)i * NCH, w, NCH);
     b->src[i] = (int16_t)si;
@@ -541,11 +573,19 @@ static void *worker(void *arg) {
     uint8_t *ttmp = malloc(NCH * p3);
     uint8_t *big = malloc(10 * p3);   /* [0,P^3) CT (also the coarse probe), [P^3, 9P^3) (2P)^3 region scratch, [9P^3, 10P^3) mask */
     const int det = sp->cfg.deterministic;
+    float *noise_state = sp->cfg.ct_augment ? malloc(((size_t)sp->cfg.P * sp->cfg.P + sp->cfg.P) * sizeof(float)) : nullptr;
+    if (!xtmp || !ttmp || !big || (sp->cfg.ct_augment && !noise_state)) {
+        atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1);
+        pthread_mutex_lock(&sp->mu); pthread_cond_broadcast(&sp->cv_ready); pthread_cond_broadcast(&sp->cv_free); pthread_mutex_unlock(&sp->mu);
+    }
     while (!atomic_load(&sp->stop)) {
         pthread_mutex_lock(&sp->mu);
         int k = -1;
         int64_t jb = -1;
         if (det) {   /* claim the next batch index; its slot is fixed (jb % nslots) and must be free */
+            if (sp->cfg.cover && (uint64_t)sp->next_claim >= sp->cfg.cover->count - sp->cfg.cover_start) {
+                pthread_mutex_unlock(&sp->mu); break;
+            }
             jb = sp->next_claim++;
             k = (int)(jb % sp->nslots);
             while ((sp->state[k] != FREE || jb - sp->next_take >= sp->nslots) && !atomic_load(&sp->stop)) pthread_cond_wait(&sp->cv_free, &sp->mu);
@@ -562,8 +602,8 @@ static void *worker(void *arg) {
         batch *b = &sp->slots[k];
         int fail = 0, filled = 0; unsigned spin = 0;
         for (int i = 0; i < sp->cfg.B && !atomic_load(&sp->stop);) {
-            if (det && spin == 0 && fail == 0) rseed(&r, sp->cfg.seed * 0x9e3779b97f4a7c15ull + (uint64_t)(jb * sp->cfg.B + i) * 1000003ull + 1);   /* per-sample stream */
-            int rc = draw(sp, b, i, &r, xtmp, ttmp, big);
+            if (det && (sp->cfg.cover || (spin == 0 && fail == 0))) rseed(&r, sp->cfg.seed * 0x9e3779b97f4a7c15ull + (sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i)) * 1000003ull + 1);   /* per-sample stream */
+            int rc = draw(sp, b, i, &r, xtmp, ttmp, big, sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i), noise_state);
             if (rc == 0) { i++; filled = i; fail = 0; spin = 0; }
             else if (rc > 0 && ++spin == (1u << 22)) { fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d), stopping\n", spin, sp->cfg.P); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); }
             else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); } }
@@ -574,7 +614,7 @@ static void *worker(void *arg) {
         pthread_cond_broadcast(&sp->cv_free);
         pthread_mutex_unlock(&sp->mu);
     }
-    free(xtmp); free(ttmp); free(big);
+    free(xtmp); free(ttmp); free(big); free(noise_state);
     free(wa);
     return nullptr;
 }
@@ -691,6 +731,11 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sampler *sp = calloc(1, sizeof *sp);
     sp->S = S;
     sp->cfg = *cfg;
+    if (cfg->cover) {
+        if (cfg->holdout || cfg->B != 1 || cfg->cover->P != cfg->P || cfg->cover_start >= cfg->cover->count) { free(sp); return nullptr; }
+        sp->cfg.deterministic = 1; sp->cfg.snap = 0;
+        memset(sp->cfg.level_p, 0, sizeof sp->cfg.level_p); sp->cfg.level_p[0] = 1;
+    }
     { unsigned sb; memcpy(&sb, &cfg->soft, 4); atomic_store(&sp->soft_bits, sb); }
     sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF");
     sp->lvl_ok = calloc((size_t)S->n, sizeof *sp->lvl_ok);
@@ -706,6 +751,16 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         acc += eligible ? s->weight : 0; sp->cum[i] = acc;
     }
     if (acc <= 0) { fprintf(stderr, "sampler: no eligible sources; check window, holdout boxes, regions and levels\n"); free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
+    if (cfg->cover) for (uint64_t k = 0; k < cfg->cover->count; k++) {
+        const int64_t *t = cfg->cover->tiles[k]; source *s = &S->src[t[0]];
+        z3 *ct = source_ct(s, 0); const z3_meta *m = ct ? z3_meta_of(ct) : nullptr;
+        int ok = m && s->min_level == 0 && !s->reg[0] && !s->reg[1] && s->tgt_key[0] && source_tgt_for_level(s, 0, 0, nullptr);
+        for (int d = 0; ok && d < 3; d++) ok &= t[d + 1] >= 0 && t[d + 1] + cfg->P <= m->shape[d];
+        if (!ok || training_hits_holdout(sp, s, t + 1, 0)) {
+            fprintf(stderr, "sampler: cover tile %llu is out of bounds or intersects a holdout\n", (unsigned long long)k);
+            free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr;
+        }
+    }
     sp->nslots = cfg->nbuf;
     sp->slot_j = calloc((size_t)sp->nslots, sizeof *sp->slot_j);
     sp->slots = calloc((size_t)sp->nslots, sizeof *sp->slots);
@@ -715,7 +770,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     pthread_cond_init(&sp->cv_free, nullptr);
     pthread_cond_init(&sp->cv_ready, nullptr);
     sp->occ = calloc((size_t)S->n, sizeof *sp->occ);
-    for (int i = 0; i < S->n; i++) {
+    for (int i = 0; !cfg->cover && i < S->n; i++) {
         occ_index o = source_occupancy(&S->src[i]);
         sp->occ[i].idx = o.idx; sp->occ[i].n = o.n; sp->occ[i].lev = o.lev; for (int d = 0; d < 3; d++) sp->occ[i].shape[d] = o.shape[d];
     }
@@ -733,6 +788,7 @@ batch *sampler_next(sampler *sp) {
     int k = -1;
     while (k < 0) {
         if (atomic_load(&sp->stop)) { pthread_mutex_unlock(&sp->mu); return nullptr; }
+        if (sp->cfg.cover && (uint64_t)sp->next_take >= sp->cfg.cover->count - sp->cfg.cover_start) { pthread_mutex_unlock(&sp->mu); return nullptr; }
         if (sp->cfg.deterministic) {   /* in batch order */
             int s = (int)(sp->next_take % sp->nslots);
             if (sp->state[s] == READY && sp->slot_j[s] == sp->next_take) { k = s; sp->next_take++; pthread_cond_broadcast(&sp->cv_free); }
