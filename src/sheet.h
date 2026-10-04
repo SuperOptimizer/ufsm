@@ -33,12 +33,15 @@ sheet_dataset *sheet_load_reference(const char *path);
 void sheet_free(sheet_dataset *s);
 double sheet_reference(const sheet_dataset *s, const double xyz[3]);
 void sheet_parameters(const sheet_dataset *s,double z,double params[4]);
+/* Widen the audited cap with matching exclusions around close ordering pairs.
+   Apply once after loading; records/reference and their hashes stay immutable. */
+int sheet_widen_bands(sheet_dataset *s,double scale);
 /* Mark unresolved close contacts in the unaugmented native-voxel ignore mask. */
 void sheet_mask_contacts(const sheet_dataset *s,const int64_t origin[3],int P,uint8_t *ignore);
 /* Points transformed to augmented local cube coordinates. Empty batches valid. */
 sheet_batch *sheet_sample(const sheet_dataset *s, const int64_t origin[3], int P,
                          const int perm[3], const int flip[3], const uint8_t *ct,
-                         const uint8_t *surface_target,uint64_t seed);
+                         const uint8_t *surface_target,const uint8_t *loss_mask,uint64_t seed);
 sheet_batch *sheet_clone(const sheet_batch *b);
 void sheet_batch_free(sheet_batch *b);
 /* values = [point][surface logit, complete winding q], FP64 reference reduction.

@@ -275,7 +275,7 @@ def reconfigure(a):
     if out.exists(): raise ValueError("choose a new reconfigured run directory")
     recipe=json.loads(Path(a.recipe).read_text())
     allowed={"noaug","rotonly","zfix","intonly","ct-aug","symmetry-p","axis-jitter",
-             "geometry-aug","rotate-deg","rotate-p","elastic","elastic-p","label-morph","label-morph-p","soft"}
+             "geometry-aug","rotate-deg","rotate-p","elastic","elastic-p","label-morph","label-morph-p","soft","sheet-band-scale"}
     command=list(old["command"])
     for key,value in recipe["train"].items():
         flag="--"+key
@@ -298,7 +298,7 @@ def reconfigure(a):
             command[i]=str(inputs/Path(value).relative_to(previous/"inputs"))
     for flag,value in (("--out",str(out/"model")),("--resume",str(inputs/"resume.ckpt"))):
         command[command.index(flag)+1]=value
-    for flag in ("--sheet-init","--warm-start"):
+    for flag in ("--sheet-init","--warm-start","--cover-extend-from"):
         if flag in command:
             pos=command.index(flag); del command[pos:pos+2]
     for key,value in recipe["train"].items():

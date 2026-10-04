@@ -196,6 +196,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
                         "       [--geometry-aug 0|1] [--rotate-deg 5] [--rotate-p 0.2] [--elastic 1] [--elastic-p 0.15] [--label-morph 0] [--label-morph-p 0.2]\n"
+                        "       [--sheet-band-scale 1]   widen audited soft-band cap and close-gap exclusions together\n"
                         "       [--gn-stats stored|legacy]   fresh training uses stored activations; resume preserves the saved contract\n"
                         "       [--schedule-start STEP]   restart the LR schedule at this saved step, preserving optimizer state\n"
                         "       [--task surface_winding --geometry geometry.json] [--sheet-init 1] [--sheet-variant 0|1|2]\n"
@@ -386,6 +387,11 @@ int cmd_train(int argc, char **argv) {
     }
     sc.dilate = atoi(opt(argc, argv, "--dilate", "0"));   /* thicken surface targets by D level-0 voxels (curriculum) */
     sc.soft = (float)atof(opt(argc, argv, "--soft", "0"));  /* soft ridge target with this sigma (level-0 voxels) */
+    double sheet_band_scale=atof(opt(argc,argv,"--sheet-band-scale","1"));
+    if (!isfinite(sheet_band_scale) || sheet_band_scale<1 || (!g_sheet && sheet_band_scale!=1) ||
+        (g_sheet && sheet_widen_bands(g_sheet,sheet_band_scale))) {
+        fprintf(stderr,"invalid sheet band scale or close-gap radius exceeds 32 native voxels\n"); return 2;
+    }
     if (g_sheet && (!isfinite(sc.soft) || sc.soft<=0 || sc.soft+sc.label_morph>g_sheet->max_soft_sigma)) {
         fprintf(stderr,"winding soft sigma must be positive; sigma plus morphology expansion must be <= audited spacing cap %g\n",g_sheet->max_soft_sigma); return 2;
     }
@@ -534,8 +540,8 @@ int cmd_train(int argc, char **argv) {
     }
     {
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
-        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"augmentation\":{\"version\":1,\"mode\":%d,\"ct\":%d,\"symmetry_p\":%.9g,\"axis_jitter\":%.9g,\"geometry\":%d,\"rotate_degrees\":%.9g,\"rotate_p\":%.9g,\"elastic_voxels\":%.9g,\"elastic_p\":%.9g,\"label_morph_voxels\":%.9g,\"label_morph_p\":%.9g,\"soft_sigma\":%.9g}}",
-            sc.augment,sc.ct_augment,sc.symmetry_p,sc.axis_jitter,sc.geometry_augment,sc.rotate_degrees,sc.rotate_p,sc.elastic,sc.elastic_p,sc.label_morph,sc.label_morph_p,sc.soft);
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"augmentation\":{\"version\":1,\"mode\":%d,\"ct\":%d,\"symmetry_p\":%.9g,\"axis_jitter\":%.9g,\"geometry\":%d,\"rotate_degrees\":%.9g,\"rotate_p\":%.9g,\"elastic_voxels\":%.9g,\"elastic_p\":%.9g,\"label_morph_voxels\":%.9g,\"label_morph_p\":%.9g,\"soft_sigma\":%.9g,\"sheet_band_scale\":%.9g}}",
+            sc.augment,sc.ct_augment,sc.symmetry_p,sc.axis_jitter,sc.geometry_augment,sc.rotate_degrees,sc.rotate_p,sc.elastic,sc.elastic_p,sc.label_morph,sc.label_morph_p,sc.soft,sheet_band_scale);
     }
     fprintf(stderr,"augmentation: mode %d, CT %d, symmetry p %.3g, axis jitter %.3g voxels, geometry %d (rotation +/-%.3g degrees p %.3g; elastic <=%.3g voxels p %.3g), soft-band dilation/erosion +/-%.3g voxels p %.3g\n",
         sc.augment,sc.ct_augment,sc.symmetry_p,sc.axis_jitter,sc.geometry_augment,sc.rotate_degrees,sc.rotate_p,sc.elastic,sc.elastic_p,sc.label_morph,sc.label_morph_p);

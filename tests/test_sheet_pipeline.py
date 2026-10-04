@@ -115,15 +115,18 @@ class PipelineTests(unittest.TestCase):
             (previous/"model/last.ckpt").write_bytes(("UFSM "+json.dumps(saved)+"\n").encode()+b"optimizer payload")
             state=dict(task="surface_winding",status="interrupted",updates=4,geometry_sha256="a"*64,
                 command=[str(inputs/"ufsm"),"train",str(inputs/"sources.json"),"--out",str(previous/"model"),
-                    "--resume",str(inputs/"resume.ckpt"),"--cover",str(inputs/"cover.json"),"--steps","4","--soft","2","--sheet-init","1"],
+                    "--resume",str(inputs/"resume.ckpt"),"--cover",str(inputs/"cover.json"),"--steps","4","--soft","2","--sheet-init","1",
+                    "--cover-extend-from",str(inputs/"cover-previous.json")],
                 inputs={p.name:digest(p) for p in inputs.iterdir()})
             (previous/"state.json").write_text(json.dumps(state))
-            recipe=root/"recipe.json"; recipe.write_text(json.dumps(dict(train={"soft":1.75,"geometry-aug":1,"axis-jitter":2},predict={})))
+            recipe=root/"recipe.json"; recipe.write_text(json.dumps(dict(train={"soft":4.375,"sheet-band-scale":2.5,"geometry-aug":1,"axis-jitter":2},predict={})))
             binary=root/"ufsm"; binary.write_bytes(b"new binary")
             args=argparse.Namespace(run=previous,recipe=recipe,binary=binary,out=root/"continued",prepare_only=True)
             reconfigure(args)
             continued=json.loads((args.out/"state.json").read_text()); verify_inputs(args.out,continued)
             self.assertNotIn("--sheet-init",continued["command"])
+            self.assertNotIn("--cover-extend-from",continued["command"])
+            self.assertEqual(continued["command"][continued["command"].index("--sheet-band-scale")+1],"2.5")
             self.assertEqual(continued["augmentation_change"]["cursor"],2)
             self.assertEqual(continued["augmentation_change"]["step"],5)
             self.assertEqual((args.out/"inputs/resume.ckpt").read_bytes(),(previous/"model/last.ckpt").read_bytes())

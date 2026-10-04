@@ -84,10 +84,11 @@ def watch(args):
         execute(pipeline+['evaluate','--truth',progress['truth'],'--evidence',evidence,'--split','development','--out',target/'geometry.json'],root/'evaluation.log')
         baseline_raw=root/'hours/00/probability.raw'
         measured=diagnose(run,prediction,target/'model/last.ckpt',target,box,
-            baseline_raw=baseline_raw if index else None,baseline_step=progress['donor_step'])
+            baseline_raw=baseline_raw if index else None,baseline_step=progress.get('baseline_step',progress['donor_step']))
         preview=Path(progress.get('preview_dir','/tmp'))/f'paris4-sheet24-hour-{index:02d}.png'
         preview.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(measured['image'],preview)
-        measured.update(step=saved['step'],hour=index,image=str(preview),measured_at=time.time())
+        measured.update(step=saved['step'],hour=index,image=str(preview),measured_at=time.time(),
+            training_soft_sigma=saved.get('extra',{}).get('augmentation',{}).get('soft_sigma'))
         log=run/'model/log.csv'; validation={}
         if log.exists():
             rows=[r for r in csv.DictReader(log.open()) if r.get('val_loss')]
@@ -100,10 +101,10 @@ def watch(args):
         best_path=root/'hours'/f'{int(best):02d}'/'model/last.ckpt'
         shutil.copyfile(best_path,root/'best-development.ckpt')
         with (root/'hourly.csv').open('w',newline='') as f:
-            writer=csv.DictWriter(f,fieldnames=['hour','step','best_binary_f1','roc_auc','best_cutoff','trend','val_bce','val_dice','supported_coverage'])
+            writer=csv.DictWriter(f,fieldnames=['hour','step','training_soft_sigma','best_binary_f1','roc_auc','best_cutoff','trend','val_bce','val_dice','supported_coverage'])
             writer.writeheader()
             for key in sorted(prior,key=int):
-                d=prior[key]['diagnostic']; r={k:d.get(k) for k in ('hour','step','best_binary_f1','roc_auc','best_cutoff','trend')}
+                d=prior[key]['diagnostic']; r={k:d.get(k) for k in ('hour','step','training_soft_sigma','best_binary_f1','roc_auc','best_cutoff','trend')}
                 r.update({k:prior[key]['validation'].get(k) for k in ('val_bce','val_dice')});r['supported_coverage']=prior[key]['geometry']['supported_coverage'];writer.writerow(r)
         summary=f'Hour {index}: step {saved["step"]:,}, best-cutoff development F1 {measured["best_binary_f1"]:.4f} ({measured["trend"]}).\nBest checkpoint: hour {best}, F1 {best_data["best_binary_f1"]:.4f}.\nFixed-cutoff supported coverage: {report["geometry"]["supported_coverage"]:.4%}.\nPreview: {preview}\n'
         (root/'hourly-status.txt').write_text(summary)

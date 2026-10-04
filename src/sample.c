@@ -669,7 +669,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     free(params);
     if (c->sheet) {
         sheet_batch_free(b->sheet[i]);
-        b->sheet[i] = sheet_sample(c->sheet, o, P, y.perm, y.flip, ctu,ttmp,rnext(r));
+        b->sheet[i] = sheet_sample(c->sheet, o, P, y.perm, y.flip, ctu,ttmp,mask,rnext(r));
         if (!b->sheet[i]) return -1;
         if (spatial.active) warp_sheet_batch(b->sheet[i],&spatial,M);
         w[1]=0; /* winding is supervised by the sparse regression objective */

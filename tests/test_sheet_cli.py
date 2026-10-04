@@ -115,6 +115,19 @@ def main():
             with (changed/"geometry.csv").open() as f: rows=list(csv.DictReader(f))
             assert len(rows)==2 and all(np.isfinite(float(r["weighted"])) for r in rows)
             print(f"{mode}: full 3D augmentation + winding checkpoint continuation: ok")
+            wider=list(augmented); wider[wider.index("--soft")+1]="4.375"; wider[wider.index("--label-morph")+1]="0.625"
+            rejected=subprocess.run(list(map(str,wider+["--out",t/(mode+"-unsafe-width"),"--resume",partial/"last.ckpt"])),env=env,capture_output=True,text=True)
+            assert rejected.returncode!=0 and "audited spacing cap" in rejected.stderr
+            thick=t/(mode+"-thicker")
+            execute(wider+["--sheet-band-scale","2.5","--out",thick,"--resume",partial/"last.ckpt"])
+            ht=header(thick/"last.ckpt")
+            assert ht["extra"]["sheet"]==hf["extra"]["sheet"] and ht["extra"]["cover"]==hf["extra"]["cover"]
+            assert ht["extra"]["augmentation"]["soft_sigma"]==4.375
+            assert ht["extra"]["augmentation"]["label_morph_voxels"]==.625
+            assert ht["extra"]["augmentation"]["sheet_band_scale"]==2.5
+            with (thick/"geometry.csv").open() as f: thick_rows=list(csv.DictReader(f))
+            assert all(np.isfinite(float(r["weighted"])) for r in thick_rows)
+            print(f"{mode}: 2.5x thicker targets, close-gap masking, unchanged winding/cover resume: ok")
             # Appending to a completed cover preserves the winding origin and
             # schedule across exact update boundaries used for held-out checks.
             extension=t/"extended-cover.json"

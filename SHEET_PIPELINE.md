@@ -197,6 +197,19 @@ soft band while preserving the surface centreline. The sigma plus maximum
 expansion stays within the audited two-voxel spacing cap. Validation disables
 all appearance, geometry, axis and morphology augmentation.
 
+For the requested 2.5x wider continuation, sigma is 4.375 native voxels and the
+morphology offset is at most 0.625 voxel. `--sheet-band-scale 2.5` expands the
+audited sigma cap from 2 to 5 and the contact radius/gap threshold from 8 to 20
+native voxels. Existing contact exclusions expand, and audited ordering pairs
+with gaps below 20 voxels supply additional midpoint exclusions. The original
+geometry records, winding coordinates and reference hashes remain immutable.
+Sparse supervision also rejects records whose interpolation neighbourhood
+intersects the dense loss exclusion mask. This policy covers the audited
+relationships; unreleased surfaces and unsampled contacts remain limitations.
+Hourly diagnostics still score the same thin held-out labels. Validation loss
+changes definition with sigma and is not directly comparable across this boundary;
+the hourly CSV records the training sigma alongside those losses.
+
 For a deliberate augmentation change on an interrupted winding job, use
 `python3 tools/sheet_pipeline.py reconfigure --run OLD_RUN --recipe
 configs/paris4-sheet704.json --out NEW_RUN --prepare-only`, followed by `resume

@@ -132,6 +132,35 @@ double sheet_reference(const sheet_dataset *s,const double xyz[3]) {
     double a[4]; sheet_parameters(s,xyz[0],a);
     return hypot(xyz[1]-a[0],xyz[2]-a[1])/a[2]+a[3];
 }
+static int contact_order(const void *a,const void *b) {
+    float z0=((const float *)a)[0],z1=((const float *)b)[0]; return (z0>z1)-(z0<z1);
+}
+int sheet_widen_bands(sheet_dataset *s,double scale) {
+    if (!s || !isfinite(scale) || scale<1 || !isfinite(s->max_soft_sigma) || s->max_soft_sigma<=0) return -1;
+    if (scale==1) return 0;
+    double cap=s->max_soft_sigma*scale,radius=4*cap;
+    if (!isfinite(radius) || radius>32) return -1;
+    size_t capacity=s->nc;
+    for (size_t i=0;i<s->nr;i++) if (s->records[i].kind==2) capacity++;
+    float (*contacts)[4]=malloc((capacity?capacity:1)*sizeof *contacts); if (!contacts) return -1;
+    size_t count=s->nc;
+    for (size_t i=0;i<s->nc;i++) {
+        memcpy(contacts[i],s->contacts[i],sizeof *contacts);
+        contacts[i][3]=(float)fmax(radius,s->contacts[i][3]);
+    }
+    for (size_t i=0;i<s->nr;i++) {
+        const sheet_record *r=&s->records[i]; if (r->kind!=2) continue;
+        double distance=0;
+        for (int d=0;d<3;d++) { double dx=r->points[1][d]-r->points[0][d]; distance+=dx*dx; }
+        if (distance>=radius*radius) continue;
+        for (int d=0;d<3;d++) contacts[count][d]=.5f*(r->points[0][d]+r->points[1][d]);
+        contacts[count++][3]=(float)radius;
+    }
+    qsort(contacts,count,sizeof *contacts,contact_order);
+    free(s->contacts); s->contacts=contacts; s->nc=count; s->max_soft_sigma=cap;
+    fprintf(stderr,"sheet bands x%.9g: sigma cap %.9g, %zu contact exclusions, close-gap threshold/radius %.9g native voxels\n",scale,cap,count,radius);
+    return 0;
+}
 void sheet_mask_contacts(const sheet_dataset *s,const int64_t origin[3],int P,uint8_t *ignore) {
     size_t lo=0,hi=s->nc;
     while (lo<hi) { size_t m=lo+(hi-lo)/2; if (s->contacts[m][0]<origin[0]-32) lo=m+1; else hi=m; }
@@ -144,7 +173,7 @@ void sheet_mask_contacts(const sheet_dataset *s,const int64_t origin[3],int P,ui
     }
 }
 static uint64_t random64(uint64_t *x) { *x+=0x9e3779b97f4a7c15ull; uint64_t z=*x; z=(z^(z>>30))*0xbf58476d1ce4e5b9ull; z=(z^(z>>27))*0x94d049bb133111ebull; return z^(z>>31); }
-sheet_batch *sheet_sample(const sheet_dataset *s,const int64_t origin[3],int P,const int perm[3],const int flip[3],const uint8_t *ct,const uint8_t *surface_target,uint64_t seed) {
+sheet_batch *sheet_sample(const sheet_dataset *s,const int64_t origin[3],int P,const int perm[3],const int flip[3],const uint8_t *ct,const uint8_t *surface_target,const uint8_t *loss_mask,uint64_t seed) {
     static const unsigned caps[5]={4096,1024,1024,128,1024};
     const sheet_record **chosen[5]; unsigned count[5]={0}; uint64_t seen[5]={0};
     for (int k=0;k<5;k++) chosen[k]=malloc(caps[k]*sizeof *chosen[k]);
@@ -160,6 +189,11 @@ sheet_batch *sheet_sample(const sheet_dataset *s,const int64_t origin[3],int P,c
             for (unsigned p=0;p<r->count && ok;p++) {
                 int v[3]; for (int d=0;d<3;d++) { double x=r->points[p][d]-origin[d]; if (x<0 || x>=P-1) ok=0; v[d]=(int)lround(x); }
                 if (ok && ct && !ct[((size_t)v[0]*P+v[1])*P+v[2]]) ok=0;
+                if (ok && loss_mask) {
+                    int lo[3]; for (int d=0;d<3;d++) lo[d]=(int)floor(r->points[p][d]-origin[d]);
+                    for (int dz=0;dz<2;dz++) for (int dy=0;dy<2;dy++) for (int dx=0;dx<2;dx++)
+                        if (!loss_mask[((size_t)(lo[0]+dz)*P+lo[1]+dy)*P+lo[2]+dx]) ok=0;
+                }
                 if (ok && r->kind==4 && surface_target && surface_target[((size_t)v[0]*P+v[1])*P+v[2]]>25) ok=0;
             }
             if (!ok) continue;
