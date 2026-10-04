@@ -157,6 +157,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
                         "       [--cover PLAN.json] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
+                        "       [--erode 0|1] [--soft SIGMA]   native binary-core erosion before softening (--levels 1,0,0,0)\n"
                         "       [--gn-stats stored|legacy]   fresh training uses stored activations; resume preserves the saved contract\n"
                         "       [--schedule-start STEP]   restart the LR schedule at this saved step, preserving optimizer state\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
@@ -280,6 +281,10 @@ int cmd_train(int argc, char **argv) {
         memset(sc.level_p, 0, sizeof sc.level_p); sc.level_p[0] = 1;
     }
     sc.dilate = atoi(opt(argc, argv, "--dilate", "0"));   /* thicken surface targets by D level-0 voxels (curriculum) */
+    sc.erode = atoi(opt(argc, argv, "--erode", "0"));
+    if (sc.erode < 0 || sc.erode > 1 || (sc.erode && (sc.dilate))) {
+        fprintf(stderr, "--erode requires 0 or 1, no --dilate and no winding task\n"); return 2;
+    }
     sc.soft = (float)atof(opt(argc, argv, "--soft", "0"));  /* soft ridge target with this sigma (level-0 voxels) */
     float soft_end = (float)atof(opt(argc, argv, "--soft-end", "-1")); if (soft_end < 0) soft_end = sc.soft;   /* sigma annealed linearly to this value at the last step */
     if (plan && soft_end != sc.soft) { fprintf(stderr, "finite cover requires a fixed soft-target sigma for deterministic resume\n"); return 2; }
@@ -410,6 +415,12 @@ int cmd_train(int argc, char **argv) {
     strcpy(runtime.policy, saved_policy); strcpy(runtime.optimizer, optname);
     char checkpoint_extra[8192], runtime_extra[8192];
     if (checkpoint_runtime_json(&runtime, runtime_extra, sizeof runtime_extra)) { fprintf(stderr, "invalid checkpoint settings\n"); return 2; }
+    {
+        size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
+        snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1,
+            ",\"target\":{\"version\":1,\"erode_native_voxels\":%d,\"erosion_kernel\":\"face6\",\"soft_sigma\":%.9g}}", sc.erode, sc.soft);
+    }
+    fprintf(stderr, "surface targets: binary-core erosion %d native voxel(s), then soft sigma %g\n", sc.erode, sc.soft);
     strcpy(checkpoint_extra, runtime_extra);
     if (plan && cover_checkpoint_extra(runtime_extra, &coverage, checkpoint_extra, sizeof checkpoint_extra)) return 2;
     fprintf(stderr, "model widths"); for (int i = 0; i < cfg.nlev; i++) fprintf(stderr, " %d", cfg.widths[i]);

@@ -40,7 +40,7 @@ static int slices(const char *dir, int bi, const batch *b, int P) {
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: check_surface_samples <sources.json> <output-dir> [P=704] [batches=3] [--cover PLAN.json] [--ct-aug]\n");
+        fprintf(stderr, "usage: check_surface_samples <sources.json> <output-dir> [P=704] [batches=3] [--cover PLAN.json] [--ct-aug] [--erode 0|1] [--soft SIGMA]\n");
         return 2;
     }
     int P = argc > 3 ? atoi(argv[3]) : 704, nb = argc > 4 ? atoi(argv[4]) : 3;
@@ -55,6 +55,8 @@ int main(int argc, char **argv) {
     for (int ai = 5; ai < argc; ai++) {
         if (!strcmp(argv[ai], "--cover") && ai + 1 < argc) { plan = cover_load(argv[++ai], S, P); if (!plan) return 2; c.cover = plan; }
         else if (!strcmp(argv[ai], "--ct-aug")) { c.augment = 3; c.ct_augment = 1; c.symmetry_p = .5; c.axis_jitter = 32; c.seed = 2; }
+        else if (!strcmp(argv[ai], "--erode") && ai + 1 < argc) c.erode = atoi(argv[++ai]);
+        else if (!strcmp(argv[ai], "--soft") && ai + 1 < argc) c.soft = (float)atof(argv[++ai]);
         else return 2;
     }
     sampler *sp = sampler_start(S, &c);
@@ -62,7 +64,7 @@ int main(int argc, char **argv) {
     char path[1400]; snprintf(path, sizeof path, "%s/samples.json.tmp", argv[2]);
     FILE *f = fopen(path, "w");
     if (!f) { sampler_stop(sp); sources_free(S); return 1; }
-    fprintf(f, "{\"P\":%d,\"B\":1,\"level\":0,\"soft\":3,\"seed\":%llu,\"ct_augment\":%d,\"samples\":[\n", P, (unsigned long long)c.seed, c.ct_augment);
+    fprintf(f, "{\"P\":%d,\"B\":1,\"level\":0,\"soft\":%.9g,\"erode\":%d,\"seed\":%llu,\"ct_augment\":%d,\"samples\":[\n", P, c.soft, c.erode, (unsigned long long)c.seed, c.ct_augment);
     size_t n = (size_t)P * P * P; int failed = 0;
     for (int bi = 0; bi < nb; bi++) {
         batch *b = sampler_next(sp);

@@ -1,4 +1,5 @@
 #include "sample.h"
+#include "target_erode.h"
 #include "nn.h"
 #include "ct_augment.h"
 #include <math.h>
@@ -435,7 +436,12 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         } else if (s->tgt_key[ch]) {
             z3 *tz = source_tgt_for_level(s, ch, l, nullptr);
             if (!tz) { if (c->cover) return -1; memset(dst, 0, p3); continue; }
-            if (source_read_target(s, ch, l, o, n, dst, 1)) return -1;
+            if (c->erode) {
+                int64_t eo[3] = {o[0]-1, o[1]-1, o[2]-1}, en[3] = {P+2, P+2, P+2};
+                uint8_t *haloed = big + p3;   /* existing (2P)^3 scratch, P >= 2 */
+                if (source_read_target(s, ch, l, eo, en, haloed, 1)) return -1;
+                target_erode1(haloed, dst, P);
+            } else if (source_read_target(s, ch, l, o, n, dst, 1)) return -1;
             w[ch] = 1;
         } else memset(dst, 0, p3);
         if (w[ch]) for (size_t k = 0; k < p3; k++) if (dst[k] != 255 && dst[k] > tmax) tmax = dst[k];
@@ -728,6 +734,19 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction) {
 }
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
+    if (cfg->erode < 0 || cfg->erode > 1 || (cfg->erode && (cfg->P < 2 || cfg->dilate))) {
+        fprintf(stderr, "sampler: erode must be 0 or 1, with P >= 2, no dilation and no winding task\n"); return nullptr;
+    }
+    if (cfg->erode) {
+        for (int l = 1; l < MAXLEV; l++) if (!cfg->cover && cfg->level_p[l] > 0) {
+            fprintf(stderr, "sampler: erosion requires native level 0 (--levels 1,0,0,0)\n"); return nullptr;
+        }
+        for (int i = 0; i < S->n; i++) for (int ch = 0; ch < NCH; ch++) {
+            if (S->src[i].reg[ch] || (S->src[i].tgt_key[ch] && !S->src[i].tgt_binary[ch])) {
+                fprintf(stderr, "sampler: erosion requires binary pyramid targets\n"); return nullptr;
+            }
+        }
+    }
     sampler *sp = calloc(1, sizeof *sp);
     sp->S = S;
     sp->cfg = *cfg;
