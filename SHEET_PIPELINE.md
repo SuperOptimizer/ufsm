@@ -210,6 +210,16 @@ Hourly diagnostics still score the same thin held-out labels. Validation loss
 changes definition with sigma and is not directly comparable across this boundary;
 the hourly CSV records the training sigma alongside those losses.
 
+The hourly controller also supports a restored legacy surface-only run. Its
+`state.json` has `task: surface`; `testing.json` uses `lr_schedule: steps`, the
+original executable environment, and explicit `monitor_predict` parameters.
+This preserves the frozen pre-winding binary and finite-cover learning-rate
+schedule. Monitoring computes surface F1/AUC without winding extraction or
+geometry objectives. A separate frozen `evaluation-sources.json` can keep the
+same thin development labels while training uses the original expanded mask.
+`first_interval` continues the existing hourly cadence and absolute deadline.
+The active surface run is published under `runs/active-production.json`.
+
 For a deliberate augmentation change on an interrupted winding job, use
 `python3 tools/sheet_pipeline.py reconfigure --run OLD_RUN --recipe
 configs/paris4-sheet704.json --out NEW_RUN --prepare-only`, followed by `resume

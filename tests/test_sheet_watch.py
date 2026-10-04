@@ -15,22 +15,27 @@ from sheet_watch import interval_deadline,trend,watch
 
 class WatchTests(unittest.TestCase):
     def test_hourly_controller_resumes_state_and_survives_evaluation_failure(self):
-        for fail_evaluation in (False,True):
-            with self.subTest(fail_evaluation=fail_evaluation), tempfile.TemporaryDirectory() as tmp:
+        for surface_only,fail_evaluation in ((False,False),(False,True),(True,False),(True,True)):
+            with self.subTest(surface_only=surface_only,fail_evaluation=fail_evaluation), tempfile.TemporaryDirectory() as tmp:
                 repo=Path(tmp);root=repo/'job';run=root/'full';inputs=run/'inputs';inputs.mkdir(parents=True)
-                (inputs/'ufsm').write_text('fixture'); (inputs/'sources.json').write_text('{}')
+                (inputs/'ufsm').write_text('fixture'); (inputs/'sources.json').write_text(json.dumps(dict(sources=[dict(root='ct-store',ct='ct',um=2.4)])))
                 original=dict(step=5,extra=dict(cover=dict(base_step=2,cursor=3,count=3,sha256='old')))
                 def checkpoint(path,obj):path.parent.mkdir(parents=True,exist_ok=True);path.write_text('UFSM'+json.dumps(obj)+'\n')
                 checkpoint(inputs/'resume.ckpt',original)
                 state=dict(status='prepared',updates=100,inputs={'cover.json':'new'},command=[str(inputs/'ufsm'),'train',str(inputs/'sources.json'),
-                    '--out',str(run/'model'),'--resume',str(inputs/'resume.ckpt'),'--gpus','0,1','--cover-extend-from','previous'])
+                    '--out',str(run/'model'),'--resume',str(inputs/'resume.ckpt'),'--gpus','0,1','--cover-extend-from','previous',
+                    '--P','704','--soft','3','--warmup','500','--schedule-start','2'])
+                if surface_only:state['task']='surface'
                 (run/'state.json').write_text(json.dumps(state))
                 progress=dict(budget_seconds=20,evaluation_seconds=10,development_box=[0,0,0,16,16,16],truth='truth',donor_step=5,tool_sha256={},preview_dir=str(root/'previews'))
+                if surface_only:progress.update(lr_schedule='steps',environment={'UFSM_RC_KEEP_COARSE':'1'},monitor_predict=dict(window=528,halo=8,shard=512))
                 (root/'testing.json').write_text(json.dumps(progress))
                 clock=[100.];commands=[]
                 class Process:
                     pid=1234
-                    def __init__(self,command,**kw):self.command=command;commands.append(command)
+                    def __init__(self,command,**kw):
+                        self.command=command;commands.append(command)
+                        if surface_only:assert kw['env']['UFSM_RC_KEEP_COARSE']=='1'
                     def wait(self):
                         command=self.command
                         if command[1]=='train':
@@ -38,6 +43,10 @@ class WatchTests(unittest.TestCase):
                             saved['step']+=2;saved['extra']['cover'].update(cursor=saved['step']-2,count=100,sha256='new')
                             checkpoint(run/'model/last.ckpt',saved)
                             clock[0]+=float(command[command.index('--limit-seconds')+1])+.1
+                        elif command[1]=='predict':
+                            path=Path(command[5]);path.mkdir()
+                            if fail_evaluation and path.parent.name=='01':return 1
+                            (path/'zarr.json').write_text('{}')
                         elif 'predict' in command:Path(command[command.index('--out')+1]).mkdir()
                         elif 'evaluate' in command:
                             path=Path(command[command.index('--out')+1])
@@ -59,7 +68,16 @@ class WatchTests(unittest.TestCase):
                 self.assertEqual(len(training),2)
                 self.assertIn('--cover-extend-from',training[0]);self.assertNotIn('--cover-extend-from',training[1])
                 self.assertEqual(training[1][training[1].index('--resume')+1],str(run/'model/last.ckpt'))
-                self.assertAlmostEqual(float(training[1][training[1].index('--schedule-elapsed')+1]),10.1)
+                if surface_only:
+                    for command in training:
+                        self.assertNotIn('--schedule-seconds',command);self.assertNotIn('--schedule-elapsed',command)
+                        self.assertEqual(command[command.index('--schedule-start')+1],'2')
+                        self.assertEqual(command[command.index('--warmup')+1],'500')
+                        self.assertEqual(command[command.index('--P')+1],'704')
+                    self.assertFalse(any('extract' in c or 'evaluate' in c for c in commands))
+                    self.assertIsNone(result['reports']['2']['geometry'])
+                    self.assertTrue((repo/'runs/active-production.json').exists())
+                else:self.assertAlmostEqual(float(training[1][training[1].index('--schedule-elapsed')+1]),10.1)
                 self.assertEqual(result['best_hour'],2)
                 self.assertEqual(bool(result.get('evaluation_errors')),fail_evaluation)
 

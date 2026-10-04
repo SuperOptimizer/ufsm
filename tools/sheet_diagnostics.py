@@ -27,7 +27,8 @@ def binary_scores(pos, neg):
 def diagnose(run, prediction, checkpoint, output, box, baseline_raw=None, baseline_step=None):
     run=Path(run); output=Path(output); output.mkdir(parents=True,exist_ok=True)
     inputs=run/'inputs'; binary=inputs/'ufsm'
-    cfg=json.loads((inputs/'sources.json').read_text())['sources'][0]
+    eval_sources=inputs/'evaluation-sources.json'
+    cfg=json.loads((eval_sources if eval_sources.exists() else inputs/'sources.json').read_text())['sources'][0]
     origin=np.array(box[:3]); shape=tuple(box[3:])
     if cfg['um']!=2.4 or cfg['targets']['recto'].get('min_level')!=1:
         raise ValueError('diagnostics require native Paris4 CT and the registered 4.8um binary target')
@@ -48,11 +49,12 @@ def diagnose(run, prediction, checkpoint, output, box, baseline_raw=None, baseli
         valid=ct[z:z+16]>0; p=volume[z:z+16]
         pos+=np.bincount(p[truth&valid],minlength=256); neg+=np.bincount(p[~truth&valid],minlength=256)
     result=binary_scores(pos,neg)
-    truth=dict(np.load(inputs/'geometry/evaluation-mesh.npz')) if (inputs/'geometry/evaluation-mesh.npz').exists() else dict(np.load('/vesuvius/ufsm/gt/paris4-sheet-20261003/geometry/evaluation-mesh.npz'))
-    points=truth['xyz'][truth['region']==0]-origin
-    surface=map_coordinates(volume,points.T,order=1,mode='constant',cval=0,output=np.float32)/255
-    result.update(checkpoint_sha256=digest(checkpoint),surface_mean_probability=float(surface.mean()),
-        fraction_gt_points_above_cutoff={str(t):float((surface>=t).mean()) for t in (.2,.25,.3,.4,.5)},
+    if not eval_sources.exists():
+        truth=dict(np.load(inputs/'geometry/evaluation-mesh.npz')) if (inputs/'geometry/evaluation-mesh.npz').exists() else dict(np.load('/vesuvius/ufsm/gt/paris4-sheet-20261003/geometry/evaluation-mesh.npz'))
+        points=truth['xyz'][truth['region']==0]-origin
+        surface=map_coordinates(volume,points.T,order=1,mode='constant',cval=0,output=np.float32)/255
+        result.update(surface_mean_probability=float(surface.mean()),fraction_gt_points_above_cutoff={str(t):float((surface>=t).mean()) for t in (.2,.25,.3,.4,.5)})
+    result.update(checkpoint_sha256=digest(checkpoint),
         original_42408_best_binary_f1=.1825675723,
         metric_note='Development hard thin-label F1 with CT air excluded; best cutoff fitted on this same development box. Not final-test validation or topology certification.')
     import matplotlib
@@ -66,7 +68,7 @@ def diagnose(run, prediction, checkpoint, output, box, baseline_raw=None, baseli
     overlay=np.zeros((*plane.shape,4)); overlay[mask]=[0,.9,1,.8]; axes[1].imshow(overlay); axes[1].set_title('Thin labels (cyan)')
     before=np.memmap(baseline_raw,np.uint8,mode='r',shape=shape) if baseline_raw else volume
     axes[2].imshow(np.asarray(before[shape[0]//2],np.float32)/255,cmap='magma',vmin=0,vmax=.6)
-    axes[2].set_title(f'Start of 24-hour run\nStep {baseline_step:,}' if baseline_step is not None else 'Starting checkpoint')
+    axes[2].set_title(f'Starting checkpoint\nStep {baseline_step:,}' if baseline_step is not None else 'Starting checkpoint')
     im=axes[3].imshow(np.asarray(volume[shape[0]//2],np.float32)/255,cmap='magma',vmin=0,vmax=.6)
     axes[3].set_title(f'Current prediction\nBest development F1: {result["best_binary_f1"]:.3f}')
     for ax in axes: ax.set_xticks([]); ax.set_yticks([])
