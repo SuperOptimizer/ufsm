@@ -168,7 +168,7 @@ and uncached reads still need measured throughput.
 
 The network is unchanged: widths `16,32,64,80`, 1,172,050 parameters, one native 2.4-micrometer
 window split across both GPUs. Binary targets are nearest-neighbor upsampled from 4.8 micrometers.
-The hard label band and soft sigma 3 remain fixed. The recipe retains the FP4 body, FP8 stem input
+The original recipe fixes the hard label band and soft sigma 3. The recipe retains the FP4 body, FP8 stem input
 and activation-gradient storage, FP32 master/optimizer/reduction state, and existing automatic
 memory modes.
 
@@ -182,6 +182,17 @@ XY component and a 2-degree radial direction change throughout the cube. Label d
 CT/label misregistration, arbitrary z-axis swaps and crop-origin jitter are disabled. These
 appearance transforms approximate reconstruction sharpness/noise variation; they are not a
 simulation of the scanner's acquisition physics or a measured accuracy improvement.
+
+For thinner surface targets, `--erode 1 --soft 2 --levels 1,0,0,0` erodes the binary
+core by one native voxel using its six face neighbours, then adds the sigma-2 soft
+falloff. Erosion runs after nearest-neighbour upsampling from 4.8 to 2.4 micrometers.
+A one-voxel halo is read from the labels so crop faces do not cause false erosion.
+The option supports native-level binary pyramid targets, defaults to zero, and is
+applied to both training and validation. Source labels and coverage plans remain
+immutable. Every checkpoint records the target settings; use the same flags when
+resuming. Compare development F1/AUC across target changes, since BCE and Dice losses
+then use different targets. Erosion can remove thin bridges and thin valid bands;
+it does not certify that all touching sheets are separated.
 
 The runner freezes the cover, binary, source configuration, axis and recipe. Its SHA256, total
 count, committed cursor and original schedule base are saved in every checkpoint. A continuation

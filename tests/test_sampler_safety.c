@@ -43,6 +43,37 @@ static int failed;
 static void check(const char *name, int ok) { printf("sampler %-45s %s\n", name, ok ? "ok" : "FAIL"); failed += !ok; }
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
+    {
+        char path[1400]; snprintf(path,sizeof path,"%s/erosion-sources.json",argv[1]);
+        FILE *f=fopen(path,"w"); assert(f);
+        fprintf(f,"{\"sources\":[{\"name\":\"a\",\"root\":\"%s\",\"ct\":\"ct\",\"um\":1,\"targets\":{\"recto\":{\"root\":\"%s\",\"group\":\"binary\",\"encoding\":\"binary\",\"min_level\":1}}}]}\n",argv[1],argv[1]);
+        assert(!fclose(f)); sources *E=sources_load(path); assert(E);
+        int64_t etiles[2][4]={{0,9,15,4},{0,25,31,20}};
+        cover_plan ep={.P=16,.count=2,.tiles=etiles}; sample_cfg ec=config();
+        ec.B=1; ec.cover=&ep; ec.erode=1;
+        int exact=1;
+        for (int nw=1; nw<=3; nw+=2) {
+            ec.nworkers=nw; sampler *esp=sampler_start(E,&ec); assert(esp);
+            for (int bi=0; bi<2; bi++) {
+                batch *eb=sampler_next(esp); assert(eb);
+                for (int z=0;z<16;z++) for (int y=0;y<16;y++) for (int x=0;x<16;x++) {
+                    int phase=(int)(eb->corner[0][2]+x)%16;
+                    size_t k=((size_t)z*16+y)*16+x;
+                    exact &= eb->t[k]==((phase==6 || phase==7)?255:0) && eb->m[k];
+                }
+                sampler_release(esp,eb);
+            }
+            exact &= sampler_next(esp)==nullptr && !sampler_failed(esp); sampler_stop(esp);
+        }
+        check("native erosion after coarse upsampling, real halo",exact);
+        ec.nworkers=1; ec.soft=2; sampler *esp=sampler_start(E,&ec); assert(esp);
+        batch *eb=sampler_next(esp); assert(eb);
+        check("erosion precedes softening and retains unit core",eb->t[2]==255 && eb->t[3]==255 && eb->t[1]==225);
+        sampler_release(esp,eb); sampler_stop(esp);
+        ec.cover=nullptr; ec.level_p[1]=1; esp=sampler_start(E,&ec);
+        check("erosion rejects non-native sampling",esp==nullptr); sampler_stop(esp);
+        sources_free(E);
+    }
     sources *S = fixture(argv[1], ",\"holdout\":[7,11,13,51,53,55]");
     sample_cfg c = config(); c.holdout = 1; sampler *sp = sampler_start(S, &c); assert(sp);
     int contained = 1;

@@ -197,6 +197,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
                         "       [--geometry-aug 0|1] [--rotate-deg 5] [--rotate-p 0.2] [--elastic 1] [--elastic-p 0.15] [--label-morph 0] [--label-morph-p 0.2]\n"
                         "       [--sheet-band-scale 1]   widen audited soft-band cap and close-gap exclusions together\n"
+                        "       [--erode 0|1] [--soft SIGMA]   native binary-core erosion before softening (--levels 1,0,0,0)\n"
                         "       [--gn-stats stored|legacy]   fresh training uses stored activations; resume preserves the saved contract\n"
                         "       [--schedule-start STEP]   restart the LR schedule at this saved step, preserving optimizer state\n"
                         "       [--task surface_winding --geometry geometry.json] [--sheet-init 1] [--sheet-variant 0|1|2]\n"
@@ -386,6 +387,10 @@ int cmd_train(int argc, char **argv) {
         memset(sc.level_p, 0, sizeof sc.level_p); sc.level_p[0] = 1;
     }
     sc.dilate = atoi(opt(argc, argv, "--dilate", "0"));   /* thicken surface targets by D level-0 voxels (curriculum) */
+    sc.erode = atoi(opt(argc, argv, "--erode", "0"));
+    if (sc.erode < 0 || sc.erode > 1 || (sc.erode && (sc.dilate || g_sheet))) {
+        fprintf(stderr, "--erode requires 0 or 1, no --dilate and no winding task\n"); return 2;
+    }
     sc.soft = (float)atof(opt(argc, argv, "--soft", "0"));  /* soft ridge target with this sigma (level-0 voxels) */
     double sheet_band_scale=atof(opt(argc,argv,"--sheet-band-scale","1"));
     if (!isfinite(sheet_band_scale) || sheet_band_scale<1 || (!g_sheet && sheet_band_scale!=1) ||
@@ -534,6 +539,12 @@ int cmd_train(int argc, char **argv) {
     strcpy(runtime.policy, saved_policy); strcpy(runtime.optimizer, optname);
     char checkpoint_extra[8192], runtime_extra[8192];
     if (checkpoint_runtime_json(&runtime, runtime_extra, sizeof runtime_extra)) { fprintf(stderr, "invalid checkpoint settings\n"); return 2; }
+    {
+        size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
+        snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1,
+            ",\"target\":{\"version\":1,\"erode_native_voxels\":%d,\"erosion_kernel\":\"face6\",\"soft_sigma\":%.9g}}", sc.erode, sc.soft);
+    }
+    fprintf(stderr, "surface targets: binary-core erosion %d native voxel(s), then soft sigma %g\n", sc.erode, sc.soft);
     if (g_sheet) {
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
         snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"task\":\"surface_winding\",\"sheet\":{\"version\":1,\"units\":\"turns\",\"outputs\":[\"surface_logit\",\"winding_residual\"],\"geometry_sha256\":\"%s\",\"reference_sha256\":\"%s\",\"variant\":%d,\"schedule_start\":%d}}",g_sheet->manifest_sha,g_sheet->reference_sha,g_sheet_variant,schedule_start);

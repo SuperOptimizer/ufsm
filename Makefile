@@ -112,6 +112,11 @@ build/test_formats: tests/test_formats.c $(OBJ) build/nn.o build/nn_fp8.o
 build/test_ct_augment: tests/test_ct_augment.c build/ct_augment.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
 
+build/test_target_erode: tests/test_target_erode.c src/target_erode.h | build
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
+test: build/test_target_erode
+
 build/test_cover: tests/test_cover.c build/cover.o build/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lcrypto -lm
 
@@ -157,6 +162,7 @@ build:
 	mkdir -p build
 
 test: build/test_sheet build/test_sheet_gpu build/test_cover build/test_ct_augment build/check_surface_samples build/test_raster build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging build/test_stem_precision build/test_gn_contract build/test_sampler_safety build/test_optimizer_owners build/test_infer_buffers build/test_recompute_live build/test_checkpoint_runtime build/make_pipeline_fixture build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
+	./build/test_target_erode
 	$(MAKE) test-sheet
 	./build/test_wgrad_grid
 	./build/test_sheet_gpu
