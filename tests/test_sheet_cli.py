@@ -134,10 +134,29 @@ def main():
             with (extended/"log.csv").open() as f: extended_rows=list(csv.DictReader(f))
             with (continuation/"log.csv").open() as f: continued_rows=list(csv.DictReader(f))
             assert [r["lr"] for r in extended_rows[1:]]==[r["lr"] for r in continued_rows]
-            rejected=subprocess.run(list(map(str,ext_command+["--out",t/(mode+"-invalid-extension"),
+            partial_extension=t/(mode+"-partial-extension")
+            execute(ext_command+["--out",partial_extension,"--resume",partial/"last.ckpt","--cover-extend-from",experiment_cover,"--stop-at","4"])
+            hx=header(partial_extension/"last.ckpt")
+            assert hx["step"]==4 and hx["extra"]["cover"]["cursor"]==2 and hx["extra"]["sheet"]==hf["extra"]["sheet"]
+            invalid_plan=dict(extended_plan,tiles=[list(row) for row in extended_plan["tiles"]]); invalid_plan["tiles"][0][1]=1
+            invalid_cover=t/"invalid-extension.json"; invalid_cover.write_text(json.dumps(invalid_plan))
+            invalid_command=list(ext_command); invalid_command[invalid_command.index("--cover")+1]=invalid_cover
+            rejected=subprocess.run(list(map(str,invalid_command+["--out",t/(mode+"-invalid-extension"),
                 "--resume",partial/"last.ckpt","--cover-extend-from",experiment_cover])),env=env,capture_output=True,text=True)
             assert rejected.returncode!=0 and "unchanged prefix" in rejected.stderr
-            print(f"{mode}: completed cover extension, exact stop, resumed LR and winding origin: ok")
+            timed=t/(mode+"-wall-schedule")
+            execute(ext_command+["--out",timed,"--resume",full/"last.ckpt","--cover-extend-from",experiment_cover,
+                "--stop-at","6","--schedule-seconds","100","--schedule-elapsed","90","--warmup-seconds","0","--sched","wsd","--cooldown",".2"])
+            with (timed/"log.csv").open() as f: timed_rows=list(csv.DictReader(f))
+            assert .00045<float(timed_rows[0]["lr"])<=.0005
+            assert header(timed/"last.ckpt")["extra"]["time_schedule"]["elapsed_at_launch"]==90
+            timed_resume=t/(mode+"-wall-resume")
+            execute(ext_command+["--out",timed_resume,"--resume",timed/"last.ckpt",
+                "--schedule-seconds","100","--schedule-elapsed","95","--warmup-seconds","0","--sched","wsd","--cooldown",".2"])
+            with (timed_resume/"log.csv").open() as f: rows=list(csv.DictReader(f))
+            assert .0002<float(rows[0]["lr"])<=.00025
+            assert header(timed_resume/"last.ckpt")["extra"]["sheet"]==hf["extra"]["sheet"]
+            print(f"{mode}: partial/complete cover extension, exact stop, resumed wall-time LR and winding origin: ok")
             if mode=="single":
                 complete=t/"all-losses"
                 execute(command+["--out",complete,"--resume",t/"donor/last.ckpt","--sheet-init","1","--sheet-variant","2"])

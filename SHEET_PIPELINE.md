@@ -206,8 +206,8 @@ change boundary. Such a continuation has mixed augmentation history and is
 not a matched member of the old ablation cohort. Checkpoints record the effective
 augmentation settings under `extra.augmentation`.
 
-To train longer after a bounded cover completes, prepare a larger plan whose
-tile list keeps the entire completed plan as its unchanged prefix. Run
+To train longer from a saved bounded cover, prepare a larger plan whose
+tile list keeps the entire previous plan as its unchanged prefix. Run
 `python3 tools/sheet_pipeline.py extend --run OLD_RUN --cover LARGER_PLAN.json
 --out NEW_RUN --prepare-only`, then `resume --run NEW_RUN`. The runner rejects
 changed prefixes, duplicate tiles and held-out geometry regions. The trainer
@@ -222,6 +222,18 @@ If no predicted surface evidence survives the fixed evaluation cutoff,
 Evaluation records zero coverage and track length; distance, coordinate error
 and switch/bridge rates are unavailable. This model outcome does not abort a
 longer training trial and cannot qualify as a topology improvement.
+
+`python3 tools/sheet_watch.py --root RUN_ROOT` runs a prepared continuation whose
+`testing.json` pins its budget, hourly interval, development box/truth, tools and
+starting checkpoint. It keeps optimizer/EMA state and the winding ramp origin,
+using `--schedule-seconds`/`--schedule-elapsed` for one wall-time WSD horizon across
+evaluation pauses; a continuation sets `--warmup-seconds 0`. Hourly runs save
+checkpoints, probability/winding predictions, previews, F1, ROC AUC, validation
+BCE/Dice and fixed-cutoff geometry reports. `hourly.csv` and `hourly-status.txt`
+record improvements, stalls and regressions; the best development checkpoint is
+retained. Empty fixed-cutoff evidence is a valid zero-support result. Evaluation
+subprocess failures are recorded separately so they do not silently stop
+training. Final-test data is excluded and no production promotion is automatic.
 
 `make test-sheet` checks lifting, exclusions, loss derivatives, reconstruction and
 file contracts on CPU. `make test-sheet-gpu` checks interpolation/scatter across

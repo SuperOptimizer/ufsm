@@ -22,7 +22,8 @@ int main(void) {
     write_file(path, extended); cover_plan *next = cover_load(path, &S, 16); assert(next);
     p.cursor = p.count;
     assert(!cover_validate_extension(plan, next, &p));
-    p.cursor--; assert(cover_validate_extension(plan, next, &p)); p.cursor++;
+    p.cursor--; assert(!cover_validate_extension(plan, next, &p)); p.cursor++;
+    p.cursor=p.count+1; assert(cover_validate_extension(plan,next,&p)); p.cursor=p.count;
     p.sha256[0] = p.sha256[0] == 'a' ? 'b' : 'a'; assert(cover_validate_extension(plan, next, &p)); strcpy(p.sha256, plan->sha256);
     assert(cover_validate_extension(plan, plan, &p));
     next->tiles[0][1]++; assert(cover_validate_extension(plan, next, &p)); next->tiles[0][1]--;

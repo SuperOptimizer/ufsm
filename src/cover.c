@@ -73,7 +73,7 @@ int cover_checkpoint_read(const char *path, cover_progress *p) {
     json_free(j); return rc;
 }
 int cover_validate_extension(const cover_plan *previous, const cover_plan *next, const cover_progress *saved) {
-    if (!previous || !next || !saved || saved->cursor != saved->count ||
+    if (!previous || !next || !saved || saved->cursor > saved->count ||
         saved->count != previous->count || strcmp(saved->sha256, previous->sha256) ||
         previous->P != next->P || next->count <= previous->count ||
         saved->base_step < 0 || (uint64_t)saved->base_step + next->count > INT_MAX ||

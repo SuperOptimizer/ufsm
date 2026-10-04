@@ -87,6 +87,13 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(result["coverage_extension"]["added_updates"],1)
             self.assertNotIn("--sheet-init",result["command"])
             self.assertIn("--cover-extend-from",result["command"])
+            saved["step"]=4; saved["extra"]["cover"]["cursor"]=1
+            partial_payload=("UFSM"+json.dumps(saved)+"\n").encode()+b"partially trained payload"
+            (previous/"model/last.ckpt").write_bytes(partial_payload)
+            args.out=root/"partial-extension"; extend(args)
+            partial=json.loads((args.out/"state.json").read_text()); verify_inputs(args.out,partial)
+            self.assertEqual(partial["coverage_extension"]["cursor"],1)
+            self.assertEqual((args.out/"inputs/resume.ckpt").read_bytes(),partial_payload)
             args.out=root/"invalid"
             new_plan["tiles"][0]=[0,1,0,0]; new_cover.write_text(json.dumps(new_plan))
             with self.assertRaisesRegex(ValueError,"unchanged prefix"): extend(args)

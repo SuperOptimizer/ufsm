@@ -197,7 +197,7 @@ def resume(a): execute_candidate(a.run)
 
 
 def extend(a):
-    """Append held-out-safe tiles to a completed cover without resetting state."""
+    """Append held-out-safe tiles to a saved cover without resetting state."""
     previous=Path(a.run).resolve(); old=json.loads((previous/"state.json").read_text())
     verify_inputs(previous,old)
     saved=header(previous/"model/last.ckpt")
@@ -205,13 +205,13 @@ def extend(a):
     prior=json.loads((previous/"inputs/cover.json").read_text())
     plan=json.loads(Path(a.cover).read_text())
     if (committed.get("sha256")!=digest(previous/"inputs/cover.json") or
-        committed.get("count")!=old["updates"] or committed.get("cursor")!=old["updates"] or
+        committed.get("count")!=old["updates"] or type(committed.get("cursor")) is not int or not 0<=committed["cursor"]<=old["updates"] or
         saved["step"]!=committed.get("base_step",-1)+committed.get("cursor",-1)):
-        raise ValueError("extension requires a completed matching cover checkpoint")
+        raise ValueError("extension requires a matching cover checkpoint")
     if (any(plan.get(k)!=prior.get(k) for k in ("version","P","level","source_names")) or
         type(plan.get("count")) is not int or plan["count"]<=prior["count"] or
         len(plan.get("tiles",[]))!=plan["count"] or plan["tiles"][:prior["count"]]!=prior["tiles"]):
-        raise ValueError("extended cover must preserve the completed plan as an unchanged prefix")
+        raise ValueError("extended cover must preserve the saved plan as an unchanged prefix")
     cfg=json.loads((previous/"inputs/sources.json").read_text())
     tiles=plan["tiles"]; P=plan["P"]
     if (any(len(t)!=4 or any(type(v) is not int or v<0 for v in t) or t[0]>=len(cfg["sources"]) for t in tiles) or
