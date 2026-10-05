@@ -25,8 +25,15 @@ build/ufsm: $(OBJ) build/main.o build/nn.o build/nn_fp8.o
 build/nn.o: src/nn.cu src/nn.h src/nn_lp.h | build
 	$(NVCC) $(NVFLAGS) -c $< -o $@
 # FP8 / FP4 block-scaled mma (kind::mxf8f6f4 / kind::mxf4) needs the arch-specific sm_120a target
-build/nn_fp8.o: src/nn_fp8.cu src/nn.h src/nn_lp.h | build
-	$(NVCC) -O3 -gencode arch=compute_120a,code=sm_120a -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc -c $< -o $@
+# The low-precision kernels are split into one translation unit per kernel family (src/lp_*.cu, shared helpers in
+# src/lp_common.cuh) so make -j compiles them in parallel; build/nn_fp8.o is their relocatable link, so every target
+# that links build/nn_fp8.o is unchanged.
+LPSRC = $(wildcard src/lp_*.cu)
+LPOBJ = $(patsubst src/%.cu,build/%.o,$(LPSRC))
+build/lp_%.o: src/lp_%.cu $(wildcard src/lp_*.cuh) src/nn.h src/nn_lp.h | build
+	$(NVCC) -O3 -gencode arch=compute_120a,code=sm_120a -use_fast_math -Xcompiler -fno-threadsafe-statics -Xfatbin=-compress-all -Isrc -c $< -o $@
+build/nn_fp8.o: $(LPOBJ)
+	ld -r -o $@ $^
 
 build/unet.o: src/unet.c src/unet.h src/nn.h | build
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
