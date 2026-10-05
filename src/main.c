@@ -203,6 +203,7 @@ static int cmd_sample(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "train")) return cmd_train(argc, argv);
     if (argc < 3) return usage();
     const char *cmd = argv[1];
     if (!strcmp(cmd, "sample")) return cmd_sample(argc, argv);
