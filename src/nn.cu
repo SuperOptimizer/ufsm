@@ -2984,19 +2984,46 @@ extern "C" void nn_concat_bwd(const float *gy, int ca, int cb, shape5 s, float *
    scratch layout per (n,c): [nmask, bce_sum, sum_sig_p, sum_sig, sum_p] (5 floats). */
 static float g_posw = 1.f;   /* BCE weight of the positive class */
 extern "C" void nn_set_pos_weight(float w) { g_posw = w; }
-__global__ void loss_stats_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw) {
+/* Offset-tolerant positives (nn_set_loss_tol r > 0, channel 0 only): the positive parts of the loss (the BCE term
+   p * softplus(-x) and the dice intersection sig * p) use the maximum logit over the supervised voxels of the
+   (2r+1)^3 cube around the voxel, so a surface predicted up to r voxels away from the label still earns full credit;
+   the negative part (1 - p) * softplus(x) and the dice denominator stay on the voxel's own logit, so thick responses
+   are still penalised. The cube offset of the maximum is stored per voxel (code, 255 = none) and the gradient kernel
+   gathers, for each voxel, the sum of p over the voxels whose maximum it is. */
+static int g_tol = 0;
+extern "C" void nn_set_loss_tol(int r) { g_tol = r < 0 ? 0 : r > 2 ? 2 : r; }
+extern "C" int nn_get_loss_tol(void) { return g_tol; }
+__device__ __forceinline__ float tol_max(const float *l, const uint8_t *mp, size_t i, int D, int H, int W, int r, uint8_t *code) {
+    const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W), e = 2 * r + 1;
+    float best = l[i]; int bc = (r * e + r) * e + r;
+    for (int dz = -r; dz <= r; dz++) { const int zz = z + dz; if (zz < 0 || zz >= D) continue;
+        for (int dy = -r; dy <= r; dy++) { const int yy = y + dy; if (yy < 0 || yy >= H) continue;
+            for (int dx = -r; dx <= r; dx++) { const int xx = x + dx; if (xx < 0 || xx >= W) continue;
+                const size_t j = ((size_t)zz * H + yy) * W + xx;
+                if (mp[j] && l[j] > best) { best = l[j]; bc = ((dz + r) * e + dy + r) * e + dx + r; } } } }
+    *code = (uint8_t)bc;
+    return best;
+}
+__global__ void loss_stats_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
+                             int tol, uint8_t *code, int D, int H, int W) {
     int nc = blockIdx.x, slab = blockIdx.y, n = nc / C;
     float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0;   /* per-thread fp32 partials, fp64 block reduction */
     if (w[nc]) {
         const float *l = lg + (size_t)nc * S; const uint8_t *tp = t + (size_t)nc * S, *mp = m + (size_t)n * S;
+        uint8_t *cp = tol && nc % C == 0 ? code + (size_t)n * S : nullptr;
         size_t per = (S + KSLAB - 1) / KSLAB, lo = (size_t)slab * per, hi = lo + per < S ? lo + per : S;
         for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
             if (!mp[i]) continue;
             float x = l[i], p = tp[i] * (1.f / 255.f);
             float sg = 1.f / (1.f + __expf(-x));
             float spp = fmaxf(x, 0.f) + log1pf(__expf(-fabsf(x)));   /* softplus(x) */
-            float bce = pw * p * (spp - x) + (1.f - p) * spp;           /* softplus(-x) = softplus(x) - x */
-            a0 += 1; a1 += bce; a2 += sg * p; a3 += sg; a4 += p;
+            float xq = x, sq = sg, spq = spp;
+            if (cp && tp[i]) {
+                uint8_t c8; xq = tol_max(l, mp, i, D, H, W, tol, &c8); cp[i] = c8;
+                sq = 1.f / (1.f + __expf(-xq)); spq = fmaxf(xq, 0.f) + log1pf(__expf(-fabsf(xq)));
+            }
+            float bce = pw * p * (spq - xq) + (1.f - p) * spp;          /* softplus(-x) = softplus(x) - x */
+            a0 += 1; a1 += bce; a2 += sq * p; a3 += sg; a4 += p;
         }
     }
     __shared__ double r[5][256];
@@ -3025,16 +3052,28 @@ __global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, floa
     fin[2 * C + 1] = active ? 1.f / active : 0.f;
 }
 template <typename GT> __global__ void loss_grad_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N, int C, size_t S, const float *st,
-                            float dice_w, const float *fin, GT *gl, float pw, float gscale) {
+                            float dice_w, const float *fin, GT *gl, float pw, float gscale, int tol, const uint8_t *code, int D, int H, int W) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)N * C * S) return;
     int nc = (int)(i / S), n = nc / C;
     if (!w[nc] || !m[(size_t)n * S + i % S]) { gl[i] = f2h<GT>(0.f); return; }
     float nm = st[nc * 5], Ssp = st[nc * 5 + 2], Ss = st[nc * 5 + 3], Sp = st[nc * 5 + 4];
     float x = lg[i], p = t[i] * (1.f / 255.f), s = 1.f / (1.f + expf(-x));
-    float g = ((1.f - p) * s - pw * p * (1.f - s)) / fmaxf(nm, 1.f);
     float den = Ss + Sp + 1.f;
-    float ddice_ds = -(2.f * p * den - (2.f * Ssp + 1.f)) / (den * den);
+    float pq = p;   /* the target mass whose positive terms this voxel's logit carries */
+    if (code && nc % C == 0) {   /* offset-tolerant: gather p of the voxels whose cube maximum is this voxel */
+        const size_t v = i % S; const uint8_t *cp = code + (size_t)n * S, *tp = t + (size_t)nc * S;
+        const int z = (int)(v / ((size_t)H * W)), y = (int)((v / W) % H), xx0 = (int)(v % W), e = 2 * tol + 1;
+        pq = 0.f;
+        for (int dz = -tol; dz <= tol; dz++) { const int zz = z + dz; if (zz < 0 || zz >= D) continue;
+            for (int dy = -tol; dy <= tol; dy++) { const int yy = y + dy; if (yy < 0 || yy >= H) continue;
+                for (int dx = -tol; dx <= tol; dx++) { const int xx = xx0 + dx; if (xx < 0 || xx >= W) continue;
+                    const size_t j = ((size_t)zz * H + yy) * W + xx;
+                    /* voxel j's maximum sits at offset (-dz,-dy,-dx) from j */
+                    if (cp[j] == (uint8_t)(((tol - dz) * e + tol - dy) * e + tol - dx)) pq += tp[j] * (1.f / 255.f); } } }
+    }
+    float g = ((1.f - p) * s - pw * pq * (1.f - s)) / fmaxf(nm, 1.f);
+    float ddice_ds = -(2.f * pq * den - (2.f * Ssp + 1.f)) / (den * den);
     g += dice_w * ddice_ds * s * (1.f - s);
     gl[i] = f2h<GT>(g * fin[2 * C + 1] * gscale);
 }
@@ -3044,20 +3083,26 @@ extern "C" void nn_set_loss_grad_h16(int on) { g_loss_g16 = on; }
 extern "C" size_t nn_loss_scratch(shape5 s) { return ((size_t)5 * s.n * s.c + 2 * s.c + 2) * sizeof(float); }
 /* Asynchronous: launches the statistics, finalize and gradient kernels; nothing is copied to the host. */
 extern "C" void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch) {
+    nn_loss_async_tol(logits, t, m, w, s, dice_w, gl, scratch, nullptr);
+}
+extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch, uint8_t *code) {
     size_t S = shape_spatial(s);
     int NC = s.n * s.c;
     float *fin = scratch + (size_t)5 * NC;
     double *ds = gn_dsums((size_t)5 * NC);
+    const int tol = code ? g_tol : 0;
+    if (tol) cudaMemsetAsync(code, 255, (size_t)s.n * S);
+    else code = nullptr;
     cudaMemsetAsync(ds, 0, (size_t)5 * NC * sizeof(double));
-    loss_stats_k<<<dim3(NC, KSLAB), 256>>>(logits, t, m, w, s.c, S, ds, g_posw);
+    loss_stats_k<<<dim3(NC, KSLAB), 256>>>(logits, t, m, w, s.c, S, ds, g_posw, tol, code, s.d, s.h, s.w);
     zs_reduce(ds, 5 * NC);   /* spatial split: statistics of the whole window (the halo planes are masked out by the caller) */
     loss_d2f_k<<<nblk(5 * NC, 128), 128>>>(ds, scratch, 5 * NC);
     loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, fin);
     if (gl) {
         size_t n = shape_numel(s);
-        if (!g_loss_g16) loss_grad_k<float><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f);
-        else if (g_h16) loss_grad_k<f16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale);
-        else loss_grad_k<bf16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale);
+        if (!g_loss_g16) loss_grad_k<float><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w);
+        else if (g_h16) loss_grad_k<f16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w);
+        else loss_grad_k<bf16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w);
     }
     KCHECK();
 }

@@ -216,6 +216,10 @@ void nn_loss(const float *logits, const uint8_t *t, const uint8_t *m, const uint
 size_t nn_loss_scratch(shape5 s);
 /* Asynchronous loss: kernels only; fetch the host values later (bce per channel, dice per channel, active). */
 void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch);
+/* Offset-tolerant positives on channel 0 (radius r <= 2 voxels, 0 = off; see nn.cu): code is a uint8 [n][S] work buffer. */
+void nn_set_loss_tol(int r);
+int nn_get_loss_tol(void);
+void nn_loss_async_tol(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch, uint8_t *code);
 void nn_set_pos_weight(float w);   /* BCE weight of positive targets (class balance), default 1 */
 void nn_loss_fetch(const float *scratch, shape5 s, float *out);
 /* Sparse trilinear samples. Ownership is global z in [own_lo,own_hi), so a

@@ -247,6 +247,66 @@ static void test_loss(void) {
     CHECK(worst < 2e-3, "loss grad");
 }
 
+/* offset-tolerant positives (nn_set_loss_tol): positive terms on the cube maximum of the supervised logits, channel 0 */
+static int g_ctol;
+static double cpu_loss_tol(const float *l, const loss_ctx *c) {
+    size_t S = shape_spatial(c->s); int C = c->s.c, D = c->s.d, H = c->s.h, W = c->s.w, r = g_ctol; double tot = 0; int active = 0;
+    for (int nc = 0; nc < c->s.n * C; nc++) {
+        if (!c->w[nc]) continue;
+        int n = nc / C; double nm = 0, bce = 0, sp = 0, ss = 0, spp = 0;
+        const float *lp = l + (size_t)nc * S; const uint8_t *mp = c->m + (size_t)n * S;
+        for (size_t i = 0; i < S; i++) {
+            if (!mp[i]) continue;
+            double x = lp[i], p = c->t[(size_t)nc * S + i] / 255.0, s = 1 / (1 + exp(-x)), xq = x;
+            if (nc % C == 0 && p > 0) {
+                int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), xx = (int)(i % W);
+                for (int dz = -r; dz <= r; dz++) for (int dy = -r; dy <= r; dy++) for (int dx = -r; dx <= r; dx++) {
+                    int a = z + dz, b = y + dy, e = xx + dx; if (a < 0 || a >= D || b < 0 || b >= H || e < 0 || e >= W) continue;
+                    size_t j = ((size_t)a * H + b) * W + e; if (mp[j] && lp[j] > xq) xq = lp[j];
+                }
+            }
+            double sq = 1 / (1 + exp(-xq)), sppx = fmax(x, 0) + log1p(exp(-fabs(x))), sppq = fmax(xq, 0) + log1p(exp(-fabs(xq)));
+            nm++; bce += p * (sppq - xq) + (1 - p) * sppx; sp += sq * p; ss += s; spp += p;
+        }
+        if (nm < 1) continue;
+        active++;
+        tot += bce / nm + 0.5 * (1 - (2 * sp + 1) / (ss + spp + 1));
+    }
+    return active ? tot / active : 0;
+}
+static void test_loss_tol(int r) {
+    shape5 s = {2, 2, 5, 6, 7};
+    size_t S = shape_spatial(s), n = shape_numel(s);
+    printf("loss, offset tolerance %d\n", r);
+    loss_ctx c; c.s = s; g_ctol = r;
+    float *l = randv(n, 2);
+    c.t = malloc(n); c.m = malloc((size_t)s.n * S); c.w = malloc((size_t)s.n * s.c);
+    for (size_t i = 0; i < n; i++) c.t[i] = rand() % 3 ? 0 : (uint8_t)(rand() % 256);
+    for (size_t i = 0; i < (size_t)s.n * S; i++) c.m[i] = rand() % 5 != 0;
+    c.w[0] = 1; c.w[1] = 1; c.w[2] = 1; c.w[3] = 0;
+    c.dl = dev(l, n); c.dg = nn_malloc(n * 4); c.scr = nn_malloc(nn_loss_scratch(s));
+    c.dt = nn_malloc(n); nn_h2d(c.dt, c.t, n); c.dm = nn_malloc((size_t)s.n * S); nn_h2d(c.dm, c.m, (size_t)s.n * S); c.dw = nn_malloc(4); nn_h2d(c.dw, c.w, 4);
+    uint8_t *code = nn_malloc((size_t)s.n * S);
+    float out[8];
+    nn_set_loss_tol(r);
+    nn_loss_async_tol(c.dl, c.dt, c.dm, c.dw, s, 0.5f, c.dg, c.scr, code);
+    nn_loss_fetch(c.scr, s, out);
+    nn_set_loss_tol(0);
+    double ref = cpu_loss_tol(l, &c);
+    double got = ((out[0] + 0.5 * out[2]) * 2 + (out[1] + 0.5 * out[3]) * 1) / out[4];   /* w = [1,1,1,0]: channel 0 twice, channel 1 once */
+    printf("  loss cpu %.6f gpu %.6f (active %g)\n", ref, got, out[4]);
+    CHECK(fabs(ref - got) < 1e-4, "tolerant loss value");
+    float *g = malloc(n * 4); host(g, c.dg, n);
+    double worst = 0, scale = maxabs(g, n); int bad = 0;
+    for (size_t i = 0; i < n; i++) {   /* the max is not differentiable at ties: allow a few voxels whose step crosses one */
+        float o = l[i]; l[i] = o + 1e-4f; double lp = cpu_loss_tol(l, &c); l[i] = o - 1e-4f; double lm = cpu_loss_tol(l, &c); l[i] = o;
+        double fd = (lp - lm) / 2e-4, err = fabs(fd - g[i]) / (scale + 1e-9); if (err > 5e-3) bad++; else if (err > worst) worst = err;
+    }
+    printf("  grad fd rel err %.3g (%d of %zu voxels at an argmax tie)\n", worst, bad, n);
+    CHECK(worst < 5e-3 && bad <= 2, "tolerant loss grad");
+    nn_free(code);
+}
+
 static void test_adamw(void) {
     printf("adamw + reductions\n");
     size_t n = 1000;
@@ -364,6 +424,8 @@ int main(void) {
     test_up2();
     test_concat();
     test_loss();
+    test_loss_tol(1);
+    test_loss_tol(2);
     test_adamw();
     test_predict_helpers();
     test_large_weight_grid();
