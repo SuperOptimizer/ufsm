@@ -19,13 +19,14 @@ __global__ void loss_stats_k(const float *lg, const uint8_t *t, const uint8_t *m
             float x = l[i], p = tp[i] * (1.f / 255.f);
             float sg = 1.f / (1.f + __expf(-x));
             float spp = fmaxf(x, 0.f) + log1pf(__expf(-fabsf(x)));   /* softplus(x) */
-            float xq = x, sq = sg, spq = spp;
-            if (cp && tp[i]) {
-                uint8_t c8; xq = tol_max(l, mp, i, D, H, W, tol, &c8); cp[i] = c8;
-                sq = 1.f / (1.f + __expf(-xq)); spq = fmaxf(xq, 0.f) + log1pf(__expf(-fabsf(xq)));
+            float xq = x, spq = spp;
+            if (cp && tp[i] >= 128) {   /* offset-tolerant positive term (p >= 0.5): maximum along the sheet normal */
+                const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), xx = (int)(i % W);
+                uint8_t c8; xq = tol_line_max(l, mp, z, y, xx, D, H, W, tol_normal(tp, z, y, xx, D, H, W), tol, &c8); cp[i] = c8;
+                spq = fmaxf(xq, 0.f) + log1pf(__expf(-fabsf(xq)));
             }
             float bce = pw * p * (spq - xq) + (1.f - p) * spp;          /* softplus(-x) = softplus(x) - x */
-            a0 += 1; a1 += bce; a2 += sq * p; a3 += sg; a4 += p;
+            a0 += 1; a1 += bce; a2 += sg * p; a3 += sg; a4 += p;
         }
     }
     __shared__ double r[5][256];

@@ -247,26 +247,47 @@ static void test_loss(void) {
     CHECK(worst < 2e-3, "loss grad");
 }
 
-/* offset-tolerant positives (nn_set_loss_tol): positive terms on the cube maximum of the supervised logits, channel 0 */
+/* offset-tolerant positives (nn_set_loss_tol): positive BCE term of voxels with p >= 0.5 on the maximum logit along the
+   lattice direction of the local sheet normal (within r steps), channel 0; dice on own values. CPU reference. */
+static const int TDIR[13][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 0}, {1, -1, 0}, {1, 0, 1}, {1, 0, -1}, {0, 1, 1}, {0, 1, -1},
+                                {1, 1, 1}, {1, 1, -1}, {1, -1, 1}, {1, -1, -1}};
+static int cpu_tol_normal(const uint8_t *tp, int z, int y, int x, int D, int H, int W) {
+    double m0 = 0, mz = 0, my = 0, mx = 0, zz = 0, yy = 0, xx = 0, zy = 0, zx = 0, yx = 0;
+    for (int a = -2; a <= 2; a++) for (int b = -2; b <= 2; b++) for (int c = -2; c <= 2; c++) {
+        int za = z + a, yb = y + b, xc = x + c; if (za < 0 || za >= D || yb < 0 || yb >= H || xc < 0 || xc >= W) continue;
+        double v = tp[((size_t)za * H + yb) * W + xc]; if (v == 0) continue;
+        m0 += v; mz += v * a; my += v * b; mx += v * c; zz += v * a * a; yy += v * b * b; xx += v * c * c; zy += v * a * b; zx += v * a * c; yx += v * b * c;
+    }
+    if (m0 <= 0) return 0;
+    double iz = mz / m0, iy = my / m0, ix = mx / m0, czz = zz / m0 - iz * iz, cyy = yy / m0 - iy * iy, cxx = xx / m0 - ix * ix;
+    double czy = zy / m0 - iz * iy, czx = zx / m0 - iz * ix, cyx = yx / m0 - iy * ix, bq = 1e300; int best = 0;
+    for (int d = 0; d < 13; d++) {
+        int dz = TDIR[d][0], dy = TDIR[d][1], dx = TDIR[d][2];
+        double q = (czz * dz * dz + cyy * dy * dy + cxx * dx * dx + 2 * (czy * dz * dy + czx * dz * dx + cyx * dy * dx)) / (dz * dz + dy * dy + dx * dx);
+        if (q < bq) { bq = q; best = d; }
+    }
+    return best;
+}
 static int g_ctol;
 static double cpu_loss_tol(const float *l, const loss_ctx *c) {
     size_t S = shape_spatial(c->s); int C = c->s.c, D = c->s.d, H = c->s.h, W = c->s.w, r = g_ctol; double tot = 0; int active = 0;
     for (int nc = 0; nc < c->s.n * C; nc++) {
         if (!c->w[nc]) continue;
         int n = nc / C; double nm = 0, bce = 0, sp = 0, ss = 0, spp = 0;
-        const float *lp = l + (size_t)nc * S; const uint8_t *mp = c->m + (size_t)n * S;
+        const float *lp = l + (size_t)nc * S; const uint8_t *mp = c->m + (size_t)n * S, *tp = c->t + (size_t)nc * S;
         for (size_t i = 0; i < S; i++) {
             if (!mp[i]) continue;
-            double x = lp[i], p = c->t[(size_t)nc * S + i] / 255.0, s = 1 / (1 + exp(-x)), xq = x;
-            if (nc % C == 0 && p > 0) {
-                int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), xx = (int)(i % W);
-                for (int dz = -r; dz <= r; dz++) for (int dy = -r; dy <= r; dy++) for (int dx = -r; dx <= r; dx++) {
-                    int a = z + dz, b = y + dy, e = xx + dx; if (a < 0 || a >= D || b < 0 || b >= H || e < 0 || e >= W) continue;
+            double x = lp[i], p = tp[i] / 255.0, s = 1 / (1 + exp(-x)), xq = x;
+            if (nc % C == 0 && r && tp[i] >= 128) {
+                int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), xx = (int)(i % W), d = cpu_tol_normal(tp, z, y, xx, D, H, W);
+                for (int k = -r; k <= r; k++) {
+                    int a = z + k * TDIR[d][0], b = y + k * TDIR[d][1], e = xx + k * TDIR[d][2];
+                    if (k == 0 || a < 0 || a >= D || b < 0 || b >= H || e < 0 || e >= W) continue;
                     size_t j = ((size_t)a * H + b) * W + e; if (mp[j] && lp[j] > xq) xq = lp[j];
                 }
             }
-            double sq = 1 / (1 + exp(-xq)), sppx = fmax(x, 0) + log1p(exp(-fabs(x))), sppq = fmax(xq, 0) + log1p(exp(-fabs(xq)));
-            nm++; bce += p * (sppq - xq) + (1 - p) * sppx; sp += sq * p; ss += s; spp += p;
+            double sppx = fmax(x, 0) + log1p(exp(-fabs(x))), sppq = fmax(xq, 0) + log1p(exp(-fabs(xq)));
+            nm++; bce += p * (sppq - xq) + (1 - p) * sppx; sp += s * p; ss += s; spp += p;
         }
         if (nm < 1) continue;
         active++;
@@ -274,29 +295,37 @@ static double cpu_loss_tol(const float *l, const loss_ctx *c) {
     }
     return active ? tot / active : 0;
 }
+static double gpu_loss_tol(loss_ctx *c, const float *l, int r, float *grad) {
+    size_t S = shape_spatial(c->s), n = shape_numel(c->s);
+    uint8_t *code = nn_malloc((size_t)c->s.n * S); float out[8];
+    nn_h2d(c->dl, l, n * 4);
+    nn_set_loss_tol(r); nn_loss_async_tol(c->dl, c->dt, c->dm, c->dw, c->s, 0.5f, c->dg, c->scr, code); nn_loss_fetch(c->scr, c->s, out); nn_set_loss_tol(0);
+    if (grad) host(grad, c->dg, n);
+    nn_free(code);
+    double tot = 0; int cnt = 0;   /* mean over active (n, c) of bce + 0.5 dice, from the per-channel means */
+    for (int nc = 0; nc < c->s.n * c->s.c; nc++) if (c->w[nc]) cnt++;
+    int per[2] = {0, 0}; for (int nc = 0; nc < c->s.n * c->s.c; nc++) if (c->w[nc]) per[nc % c->s.c]++;
+    for (int ch = 0; ch < c->s.c && ch < 2; ch++) tot += (out[ch] + 0.5 * out[c->s.c + ch]) * per[ch];
+    return tot / out[2 * c->s.c];
+}
+static loss_ctx tol_ctx(shape5 s, uint8_t *t, uint8_t *m, uint8_t *w) {
+    size_t S = shape_spatial(s), n = shape_numel(s); loss_ctx c; c.s = s; c.t = t; c.m = m; c.w = w;
+    c.dl = nn_malloc(n * 4); c.dg = nn_malloc(n * 4); c.scr = nn_malloc(nn_loss_scratch(s));
+    c.dt = nn_malloc(n); nn_h2d(c.dt, t, n); c.dm = nn_malloc((size_t)s.n * S); nn_h2d(c.dm, m, (size_t)s.n * S); c.dw = nn_malloc((size_t)s.n * s.c); nn_h2d(c.dw, w, (size_t)s.n * s.c);
+    return c;
+}
 static void test_loss_tol(int r) {
-    shape5 s = {2, 2, 5, 6, 7};
+    shape5 s = {2, 2, 7, 8, 9};
     size_t S = shape_spatial(s), n = shape_numel(s);
-    printf("loss, offset tolerance %d\n", r);
-    loss_ctx c; c.s = s; g_ctol = r;
-    float *l = randv(n, 2);
-    c.t = malloc(n); c.m = malloc((size_t)s.n * S); c.w = malloc((size_t)s.n * s.c);
-    for (size_t i = 0; i < n; i++) c.t[i] = rand() % 3 ? 0 : (uint8_t)(rand() % 256);
-    for (size_t i = 0; i < (size_t)s.n * S; i++) c.m[i] = rand() % 5 != 0;
-    c.w[0] = 1; c.w[1] = 1; c.w[2] = 1; c.w[3] = 0;
-    c.dl = dev(l, n); c.dg = nn_malloc(n * 4); c.scr = nn_malloc(nn_loss_scratch(s));
-    c.dt = nn_malloc(n); nn_h2d(c.dt, c.t, n); c.dm = nn_malloc((size_t)s.n * S); nn_h2d(c.dm, c.m, (size_t)s.n * S); c.dw = nn_malloc(4); nn_h2d(c.dw, c.w, 4);
-    uint8_t *code = nn_malloc((size_t)s.n * S);
-    float out[8];
-    nn_set_loss_tol(r);
-    nn_loss_async_tol(c.dl, c.dt, c.dm, c.dw, s, 0.5f, c.dg, c.scr, code);
-    nn_loss_fetch(c.scr, s, out);
-    nn_set_loss_tol(0);
-    double ref = cpu_loss_tol(l, &c);
-    double got = ((out[0] + 0.5 * out[2]) * 2 + (out[1] + 0.5 * out[3]) * 1) / out[4];   /* w = [1,1,1,0]: channel 0 twice, channel 1 once */
-    printf("  loss cpu %.6f gpu %.6f (active %g)\n", ref, got, out[4]);
+    printf("loss, offset tolerance %d along the sheet normal\n", r);
+    uint8_t *t = malloc(n), *m = malloc((size_t)s.n * S), w[4] = {1, 1, 1, 0};
+    for (size_t i = 0; i < n; i++) t[i] = rand() % 3 ? 0 : (uint8_t)(rand() % 256);
+    for (size_t i = 0; i < (size_t)s.n * S; i++) m[i] = rand() % 5 != 0;
+    loss_ctx c = tol_ctx(s, t, m, w); g_ctol = r;
+    float *l = randv(n, 2), *g = malloc(n * 4);
+    double got = gpu_loss_tol(&c, l, r, g), ref = cpu_loss_tol(l, &c);
+    printf("  loss cpu %.6f gpu %.6f\n", ref, got);
     CHECK(fabs(ref - got) < 1e-4, "tolerant loss value");
-    float *g = malloc(n * 4); host(g, c.dg, n);
     double worst = 0, scale = maxabs(g, n); int bad = 0;
     for (size_t i = 0; i < n; i++) {   /* the max is not differentiable at ties: allow a few voxels whose step crosses one */
         float o = l[i]; l[i] = o + 1e-4f; double lp = cpu_loss_tol(l, &c); l[i] = o - 1e-4f; double lm = cpu_loss_tol(l, &c); l[i] = o;
@@ -304,7 +333,44 @@ static void test_loss_tol(int r) {
     }
     printf("  grad fd rel err %.3g (%d of %zu voxels at an argmax tie)\n", worst, bad, n);
     CHECK(worst < 5e-3 && bad <= 2, "tolerant loss grad");
-    nn_free(code);
+}
+/* a flat soft sheet: the normal is found, a sheet one voxel off scores like the exact one, a sparse lattice of dots on
+   the sheet (what a full-cube tolerance rewarded) scores far worse */
+static void test_loss_tol_sheet(void) {
+    printf("loss tolerance on a flat sheet\n");
+    shape5 s = {1, 1, 24, 24, 24}; size_t S = shape_spatial(s);
+    uint8_t *t = malloc(S), *m = malloc(S), w[1] = {1};
+    for (size_t i = 0; i < S; i++) {   /* sheet normal along y (direction 1), core at y = 12, soft sigma 2 */
+        int y = (int)((i / 24) % 24); double d = fabs(y - 12.0);
+        t[i] = (uint8_t)(255 * exp(-0.5 * d * d / 4) + 0.5); m[i] = 1;
+    }
+    int mism = 0;
+    for (size_t i = 0; i < S; i++) {
+        int z = (int)(i / 576), y = (int)((i / 24) % 24), x = (int)(i % 24);
+        if (t[i] >= 128 && z >= 2 && z < 22 && x >= 2 && x < 22 && cpu_tol_normal(t, z, y, x, 24, 24, 24) != 1) mism++;
+    }
+    CHECK(mism == 0, "flat sheet normal (%d voxels off)", mism);
+    loss_ctx c = tol_ctx(s, t, m, w);
+    float *ex = malloc(S * 4), *off = malloc(S * 4), *dots = malloc(S * 4);
+    for (size_t i = 0; i < S; i++) {
+        int z = (int)(i / 576), y = (int)((i / 24) % 24), x = (int)(i % 24);
+        ex[i] = y == 12 ? 6.f : -6.f; off[i] = y == 13 ? 6.f : -6.f;
+        dots[i] = (y == 12 && z % 5 == 2 && x % 5 == 2) ? 6.f : -6.f;
+    }
+    double e2 = gpu_loss_tol(&c, ex, 2, nullptr), o2 = gpu_loss_tol(&c, off, 2, nullptr), d2 = gpu_loss_tol(&c, dots, 2, nullptr);
+    double o0 = gpu_loss_tol(&c, off, 0, nullptr), e0 = gpu_loss_tol(&c, ex, 0, nullptr);
+    printf("  tol 2: exact %.4f, one voxel off %.4f, dot lattice %.4f | tol 0: exact %.4f, one voxel off %.4f\n", e2, o2, d2, e0, o0);
+    CHECK(o2 < e0 - 0.2, "a thin sheet one voxel off scores better than an exact one without tolerance");
+    CHECK(o2 - e2 < 0.25 * (d2 - e2), "the one-voxel offset costs little next to a dot lattice");
+    CHECK(d2 > o2 + 0.4, "a dot lattice does not satisfy the tolerant loss");
+    /* tilted sheet: normal (1, 1, 0) in (z, y, x) -> direction 3 */
+    for (size_t i = 0; i < S; i++) { int z = (int)(i / 576), y = (int)((i / 24) % 24); double d = fabs((z + y) - 24.0) / sqrt(2.0); t[i] = (uint8_t)(255 * exp(-0.5 * d * d / 4) + 0.5); }
+    mism = 0;
+    for (size_t i = 0; i < S; i++) {
+        int z = (int)(i / 576), y = (int)((i / 24) % 24), x = (int)(i % 24);
+        if (t[i] >= 128 && z >= 4 && z < 20 && y >= 4 && y < 20 && x >= 2 && x < 22 && cpu_tol_normal(t, z, y, x, 24, 24, 24) != 3) mism++;
+    }
+    CHECK(mism == 0, "diagonal sheet normal (%d voxels off)", mism);
 }
 
 static void test_adamw(void) {
@@ -426,6 +492,7 @@ int main(void) {
     test_loss();
     test_loss_tol(1);
     test_loss_tol(2);
+    test_loss_tol_sheet();
     test_adamw();
     test_predict_helpers();
     test_large_weight_grid();

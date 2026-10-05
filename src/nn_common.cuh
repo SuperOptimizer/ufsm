@@ -2090,24 +2090,56 @@ extern "C" void nn_concat_bwd(const float *gy, int ca, int cb, shape5 s, float *
    scratch layout per (n,c): [nmask, bce_sum, sum_sig_p, sum_sig, sum_p] (5 floats). */
 extern float g_posw;
 extern "C" void nn_set_pos_weight(float w);
-/* Offset-tolerant positives (nn_set_loss_tol r > 0, channel 0 only): the positive parts of the loss (the BCE term
-   p * softplus(-x) and the dice intersection sig * p) use the maximum logit over the supervised voxels of the
-   (2r+1)^3 cube around the voxel, so a surface predicted up to r voxels away from the label still earns full credit;
-   the negative part (1 - p) * softplus(x) and the dice denominator stay on the voxel's own logit, so thick responses
-   are still penalised. The cube offset of the maximum is stored per voxel (code, 255 = none) and the gradient kernel
-   gathers, for each voxel, the sum of p over the voxels whose maximum it is. */
+/* Offset-tolerant positives (nn_set_loss_tol r > 0, channel 0 only). For a supervised voxel with target p >= 0.5 the
+   positive BCE term p * softplus(-x) uses the maximum logit over the supervised voxels within r steps along the local
+   sheet normal, so a surface predicted up to r voxels off a misregistered label still earns full credit. The normal is
+   one of 13 lattice directions: the one along which the target mass of the 5^3 neighbourhood is most compact (smallest
+   second moment about its centroid; a sheet spreads in-plane). Tolerance along the normal only, so the prediction must
+   still cover every in-plane position (a sparse lattice of dots earns nothing: a full-cube tolerance allowed that).
+   The negative term (1 - p) * softplus(x) and both dice sums stay on each voxel's own logit (dice stays in [0, 1]).
+   code[i] = 5 * dir + (k + r) for the voxel at i + k * dir that carries i's positive term, 255 = i itself; the gradient
+   kernel gathers, for each voxel, the target mass of the voxels whose line maximum it is. */
 extern int g_tol;
 extern "C" void nn_set_loss_tol(int r);
 extern "C" int nn_get_loss_tol(void);
-__device__ __forceinline__ float tol_max(const float *l, const uint8_t *mp, size_t i, int D, int H, int W, int r, uint8_t *code) {
-    const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W), e = 2 * r + 1;
-    float best = l[i]; int bc = (r * e + r) * e + r;
-    for (int dz = -r; dz <= r; dz++) { const int zz = z + dz; if (zz < 0 || zz >= D) continue;
-        for (int dy = -r; dy <= r; dy++) { const int yy = y + dy; if (yy < 0 || yy >= H) continue;
-            for (int dx = -r; dx <= r; dx++) { const int xx = x + dx; if (xx < 0 || xx >= W) continue;
-                const size_t j = ((size_t)zz * H + yy) * W + xx;
-                if (mp[j] && l[j] > best) { best = l[j]; bc = ((dz + r) * e + dy + r) * e + dx + r; } } } }
-    *code = (uint8_t)bc;
+__device__ __forceinline__ void tol_dir(int d, int &dz, int &dy, int &dx) {   /* the 13 lattice directions (one of each +- pair) */
+    const int t[13][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 0}, {1, -1, 0}, {1, 0, 1}, {1, 0, -1}, {0, 1, 1}, {0, 1, -1},
+                          {1, 1, 1}, {1, 1, -1}, {1, -1, 1}, {1, -1, -1}};
+    dz = t[d][0]; dy = t[d][1]; dx = t[d][2];
+}
+/* lattice direction of the sheet normal at voxel (z, y, x) from the target t (uint8) of the 5^3 neighbourhood */
+__device__ __forceinline__ int tol_normal(const uint8_t *tp, int z, int y, int x, int D, int H, int W) {
+    float m0 = 0, mz = 0, my = 0, mx = 0, zz = 0, yy = 0, xx = 0, zy = 0, zx = 0, yx = 0;
+    for (int a = -2; a <= 2; a++) { const int za = z + a; if (za < 0 || za >= D) continue;
+        for (int b = -2; b <= 2; b++) { const int yb = y + b; if (yb < 0 || yb >= H) continue;
+            for (int c = -2; c <= 2; c++) { const int xc = x + c; if (xc < 0 || xc >= W) continue;
+                const float v = tp[((size_t)za * H + yb) * W + xc];
+                if (v == 0.f) continue;
+                m0 += v; mz += v * a; my += v * b; mx += v * c;
+                zz += v * a * a; yy += v * b * b; xx += v * c * c; zy += v * a * b; zx += v * a * c; yx += v * b * c; } } }
+    if (m0 <= 0.f) return 0;
+    const float iz = mz / m0, iy = my / m0, ix = mx / m0;   /* covariance about the centroid */
+    const float czz = zz / m0 - iz * iz, cyy = yy / m0 - iy * iy, cxx = xx / m0 - ix * ix, czy = zy / m0 - iz * iy, czx = zx / m0 - iz * ix, cyx = yx / m0 - iy * ix;
+    int best = 0; float bq = 3.4e38f;
+    for (int d = 0; d < 13; d++) {
+        int dz, dy, dx; tol_dir(d, dz, dy, dx);
+        const float q = (czz * dz * dz + cyy * dy * dy + cxx * dx * dx + 2.f * (czy * dz * dy + czx * dz * dx + cyx * dy * dx)) / (float)(dz * dz + dy * dy + dx * dx);
+        if (q < bq) { bq = q; best = d; }
+    }
+    return best;
+}
+/* maximum logit over the supervised voxels i + k * dir, |k| <= r; returns the logit and sets the code */
+__device__ __forceinline__ float tol_line_max(const float *l, const uint8_t *mp, int z, int y, int x, int D, int H, int W, int d, int r, uint8_t *code) {
+    int dz, dy, dx; tol_dir(d, dz, dy, dx);
+    float best = l[((size_t)z * H + y) * W + x]; int bk = 0;
+    for (int k = -r; k <= r; k++) {
+        if (!k) continue;
+        const int zz = z + k * dz, yy = y + k * dy, xx = x + k * dx;
+        if (zz < 0 || zz >= D || yy < 0 || yy >= H || xx < 0 || xx >= W) continue;
+        const size_t j = ((size_t)zz * H + yy) * W + xx;
+        if (mp[j] && l[j] > best) { best = l[j]; bk = k; }
+    }
+    *code = bk ? (uint8_t)(5 * d + bk + r) : (uint8_t)255;
     return best;
 }
 __global__ void loss_stats_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
@@ -2125,20 +2157,24 @@ template <typename GT> __global__ void loss_grad_k(const float *lg, const uint8_
     float nm = st[nc * 5], Ssp = st[nc * 5 + 2], Ss = st[nc * 5 + 3], Sp = st[nc * 5 + 4];
     float x = lg[i], p = t[i] * (1.f / 255.f), s = 1.f / (1.f + expf(-x));
     float den = Ss + Sp + 1.f;
-    float pq = p;   /* the target mass whose positive terms this voxel's logit carries */
-    if (code && nc % C == 0) {   /* offset-tolerant: gather p of the voxels whose cube maximum is this voxel */
+    float pq = p;   /* the target mass whose positive BCE terms this voxel's logit carries */
+    if (code && nc % C == 0) {   /* offset-tolerant: gather p of the voxels whose normal-line maximum is this voxel */
         const size_t v = i % S; const uint8_t *cp = code + (size_t)n * S, *tp = t + (size_t)nc * S;
-        const int z = (int)(v / ((size_t)H * W)), y = (int)((v / W) % H), xx0 = (int)(v % W), e = 2 * tol + 1;
-        pq = 0.f;
-        for (int dz = -tol; dz <= tol; dz++) { const int zz = z + dz; if (zz < 0 || zz >= D) continue;
-            for (int dy = -tol; dy <= tol; dy++) { const int yy = y + dy; if (yy < 0 || yy >= H) continue;
-                for (int dx = -tol; dx <= tol; dx++) { const int xx = xx0 + dx; if (xx < 0 || xx >= W) continue;
-                    const size_t j = ((size_t)zz * H + yy) * W + xx;
-                    /* voxel j's maximum sits at offset (-dz,-dy,-dx) from j */
-                    if (cp[j] == (uint8_t)(((tol - dz) * e + tol - dy) * e + tol - dx)) pq += tp[j] * (1.f / 255.f); } } }
+        const int z = (int)(v / ((size_t)H * W)), y = (int)((v / W) % H), x0 = (int)(v % W);
+        if (cp[v] != 255) pq = 0.f;   /* this voxel's own positive term moved to another voxel of its line */
+        for (int d = 0; d < 13; d++) {
+            int dz, dy, dx; tol_dir(d, dz, dy, dx);
+            for (int k = -tol; k <= tol; k++) {
+                if (!k) continue;
+                const int zz = z - k * dz, yy = y - k * dy, xx = x0 - k * dx;   /* voxel j with j + k * dir = this voxel */
+                if (zz < 0 || zz >= D || yy < 0 || yy >= H || xx < 0 || xx >= W) continue;
+                const size_t j = ((size_t)zz * H + yy) * W + xx;
+                if (cp[j] == (uint8_t)(5 * d + k + tol)) pq += tp[j] * (1.f / 255.f);
+            }
+        }
     }
     float g = ((1.f - p) * s - pw * pq * (1.f - s)) / fmaxf(nm, 1.f);
-    float ddice_ds = -(2.f * pq * den - (2.f * Ssp + 1.f)) / (den * den);
+    float ddice_ds = -(2.f * p * den - (2.f * Ssp + 1.f)) / (den * den);   /* dice on the voxel's own value */
     g += dice_w * ddice_ds * s * (1.f - s);
     gl[i] = f2h<GT>(g * fin[2 * C + 1] * gscale);
 }
