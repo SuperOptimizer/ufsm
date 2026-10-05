@@ -22,8 +22,14 @@ build/surfcomp.o: third_party/surfcomp/surfcomp.c third_party/surfcomp/*.h | bui
 build/ufsm: $(OBJ) build/main.o build/nn.o build/nn_fp8.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 
-build/nn.o: src/nn.cu src/nn.h src/nn_lp.h | build
-	$(NVCC) $(NVFLAGS) -c $< -o $@
+# The CUDA ops are split by section (src/nn_*.cu, shared declarations / device helpers / templates in src/nn_common.cuh)
+# so make -j compiles them in parallel; build/nn.o is their relocatable link.
+NNSRC = $(wildcard src/nn_*.cu)
+NNOBJ = $(patsubst src/%.cu,build/%.o,$(NNSRC))
+build/nn_%.o: src/nn_%.cu src/nn_common.cuh src/nn.h src/nn_lp.h | build
+	$(NVCC) $(NVFLAGS) -Xfatbin=-compress-all -c $< -o $@
+build/nn.o: $(NNOBJ)
+	ld -r -o $@ $^
 # FP8 / FP4 block-scaled mma (kind::mxf8f6f4 / kind::mxf4) needs the arch-specific sm_120a target
 # The low-precision kernels are split into one translation unit per kernel family (src/lp_*.cu, shared helpers in
 # src/lp_common.cuh) so make -j compiles them in parallel; build/nn_fp8.o is their relocatable link, so every target

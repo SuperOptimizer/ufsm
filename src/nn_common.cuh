@@ -1,3 +1,6 @@
+#pragma once
+/* Shared declarations, device helpers and templates of the CUDA ops (src/nn_*.cu, split out of nn.cu so the
+   sections compile as separate translation units in parallel). */
 /* CUDA ops behind src/nn.h. fp32, NCDHW. Direct convolutions with shared-memory tiling; no cuBLAS/cuDNN. */
 #include "nn.h"
 #include <math.h>
@@ -10,248 +13,138 @@
 #include <cuda_fp16.h>
 using namespace nvcuda;
 
-static int g_tf32 = 1;   /* 1 = tensor-core implicit GEMM for 3^3 convs, 0 = exact fp32 CUDA-core kernels */
-static int g_gn_stored = 0;   /* C API compatibility; fresh training explicitly selects the stored-tensor contract */
-extern "C" void nn_set_gn_stored(int on) { g_gn_stored = on != 0; }
-extern "C" int nn_get_gn_stored(void) { return g_gn_stored; }
+extern int g_tf32;
+extern int g_gn_stored;
+extern "C" void nn_set_gn_stored(int on);
+extern "C" int nn_get_gn_stored(void);
 extern "C" void nn_set_f16(int on);
-static int g_prec = 1, g_pref = 1;   /* precision of the tensor-core path: 1 bf16, 2 fp8 (e4m3, MX block scales), 3 fp4 forward/backward-data + fp8 weight gradient (src/nn_fp8.cu) */
-extern "C" void nn_set_tf32(int on) { g_tf32 = on; g_prec = on ? g_pref : 0; }
-extern "C" void nn_set_prec(int p) { g_prec = p; g_tf32 = p > 0; if (p > 0) g_pref = p; }   /* the fp8/fp4 kernels accept fp32, bf16 or fp16 storage */
-extern "C" int nn_get_prec(void) { return g_prec; }
+extern int g_prec, g_pref;
+extern "C" void nn_set_tf32(int on);
+extern "C" void nn_set_prec(int p);
+extern "C" int nn_get_prec(void);
 /* per-layer precision: unet.c tags each conv with a layer id; a layer may override the global tensor-core precision */
 #define NN_MAXLAYER 32
-static int g_layer = -1, g_lprec[NN_MAXLAYER];
-static int g_lprec_init = 0;
-static void lprec_init(void) { if (!g_lprec_init) { for (int i = 0; i < NN_MAXLAYER; i++) g_lprec[i] = -1; g_lprec_init = 1; } }
-extern "C" void nn_set_layer(int id) { g_layer = id; }
-extern "C" void nn_set_layer_prec(int id, int p) { lprec_init(); if (id >= 0 && id < NN_MAXLAYER) g_lprec[id] = p; }
+extern int g_layer, g_lprec[NN_MAXLAYER];
+extern int g_lprec_init;
+void lprec_init(void);
+extern "C" void nn_set_layer(int id);
+extern "C" void nn_set_layer_prec(int id, int p);
 /* finer policy: per conv of a layer (sub 0 = c1, 1 = c2; down / head use sub 0) and per pass (0 forward, 1 backward-data,
    2 weight gradient); 0 = not set (falls back to the layer precision, then the global one) */
-static int g_sub = -1, g_pass = 0;
-static unsigned g_exec_prec[NN_MAXLAYER][2][3];
-static void exec_prec(int pass, int p) {
-    if (g_layer >= 0 && g_layer < NN_MAXLAYER)
-        __atomic_fetch_or(&g_exec_prec[g_layer][g_sub > 0 ? 1 : 0][pass], 1u << p, __ATOMIC_RELAXED);
-}
+extern int g_sub, g_pass;
+extern unsigned g_exec_prec[NN_MAXLAYER][2][3];
+void exec_prec(int pass, int p);
 /* stochastic rounding of fp8 gradient operands: one seed per conv call, derived from the step (deterministic per step) */
-static int g_sr = -1; static unsigned g_sr_step = 0, g_sr_ctr = 0;
-static int sr_on(void) { if (g_sr < 0) { const char *e = getenv("UFSM_SR"); g_sr = e ? atoi(e) : 0; } return g_sr; }
-static unsigned sr_seed(void) {
-    unsigned h = g_sr_step * 0x9e3779b9u ^ (++g_sr_ctr) * 0x85ebca6bu;
-    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
-    return h | 1u;
-}
-extern "C" void nn_set_sr(int on) { g_sr = on; }
+extern int g_sr;
+extern unsigned g_sr_step, g_sr_ctr;
+int sr_on(void);
+unsigned sr_seed(void);
+extern "C" void nn_set_sr(int on);
 
-extern "C" void lp_wmemo_step(unsigned step); extern "C" void lp_wmemo_clear(void);   /* nn_lp.h (included below) */
-extern "C" void nn_set_sr_step(unsigned step) { g_sr_step = step; g_sr_ctr = 0; lp_wmemo_step(step); }
-extern "C" void nn_wmemo_clear(void) { lp_wmemo_clear(); }
+extern "C" void lp_wmemo_step(unsigned step); extern "C" void lp_wmemo_clear(void);
+extern "C" void nn_set_sr_step(unsigned step);
+extern "C" void nn_wmemo_clear(void);
 /* id of the current conv call for the fp4 prepared-weight memo (0 outside a layer context) */
-static unsigned conv_wkey(void) { return g_layer >= 0 ? (unsigned)((g_layer * 2 + (g_sub > 0 ? g_sub : 0)) * 4 + g_pass + 1) : 0u; }
-static signed char g_lprec3[NN_MAXLAYER][2][3];
-extern "C" void nn_set_conv(int sub) { g_sub = sub; }
-extern "C" int nn_get_layer(void) { return g_layer; }
-extern "C" int nn_get_conv(void) { return g_sub; }
-extern "C" void nn_set_conv_prec(int id, int sub, int p_fwd, int p_bwd_data, int p_wgrad) {
-    if (id < 0 || id >= NN_MAXLAYER) return;
-    for (int s2 = 0; s2 < 2; s2++) if (sub < 0 || sub == s2) { g_lprec3[id][s2][0] = (signed char)(p_fwd > 0 ? p_fwd : 0); g_lprec3[id][s2][1] = (signed char)(p_bwd_data > 0 ? p_bwd_data : 0); g_lprec3[id][s2][2] = (signed char)(p_wgrad > 0 ? p_wgrad : 0); }
-}
-extern "C" int nn_get_conv_prec(int id, int sub, int pass) { return id >= 0 && id < NN_MAXLAYER && sub >= 0 && sub < 2 && pass >= 0 && pass < 3 ? g_lprec3[id][sub][pass] : 0; }
+unsigned conv_wkey(void);
+extern signed char g_lprec3[NN_MAXLAYER][2][3];
+extern "C" void nn_set_conv(int sub);
+extern "C" int nn_get_layer(void);
+extern "C" int nn_get_conv(void);
+extern "C" void nn_set_conv_prec(int id, int sub, int p_fwd, int p_bwd_data, int p_wgrad);
+extern "C" int nn_get_conv_prec(int id, int sub, int pass);
 /* quantization-aware training: the weight gradient may use its own (higher) precision while forward / backward-data run
    at the deployment precision; -1 = same as the layer precision */
-static int g_prec_w = -1;
-extern "C" void nn_set_prec_wgrad(int p) { g_prec_w = p; }
-static int eff_prec_pass(int pass) {
-    lprec_init();
-    if (!g_tf32) return 0;
-    if (pass == 2 && g_prec_w >= 1) return g_prec_w;
-    if (g_layer >= 0 && g_layer < NN_MAXLAYER) {
-        int p3 = g_lprec3[g_layer][g_sub > 0 ? 1 : 0][pass];
-        if (p3 >= 1) return p3;
-        if (g_lprec[g_layer] >= 1) return g_lprec[g_layer];
-    }
-    return g_prec;
-}
-static int eff_prec(void) { return eff_prec_pass(g_pass); }
-static int eff_prec_w(void) { return eff_prec_pass(2); }
-extern "C" int nn_cur_prec(void) { return eff_prec(); }
+extern int g_prec_w;
+extern "C" void nn_set_prec_wgrad(int p);
+int eff_prec_pass(int pass);
+int eff_prec(void);
+int eff_prec_w(void);
+extern "C" int nn_cur_prec(void);
 /* Requested precision policy; packed storage and unsupported kernel shapes can select a different compute path.
    nn_exec_manifest reports the paths observed during execution. Storage modes are appended by the caller. */
-extern "C" int nn_prec_parse(const char *s) {
-    static const char *nm[] = {"fp32", "bf16", "fp8", "fp4", "fp16"};
-    for (int i = 0; i < 5; i++) if (!strcmp(s, nm[i])) return i;
-    char *e; long v = strtol(s, &e, 10);
-    return *s && !*e && v >= 0 && v <= 4 ? (int)v : -1;
-}
-extern "C" const char *nn_prec_name(int p) { static const char *nm[] = {"fp32", "bf16", "fp8", "fp4", "fp16"}; return p >= 0 && p <= 4 ? nm[p] : "?"; }
+extern "C" int nn_prec_parse(const char *s);
+extern "C" const char *nn_prec_name(int p);
 /* policy string: "enc0=1,enc1=2,down0=2,dec2=3,head=1" or positional "1,1,2,2,2,2,2,2,2,1,1" (unet order: enc0..3, down0..2,
    dec2, dec1, dec0, head); values 1 bf16, 2 fp8, 3 fp4, 4 fp16 (fp16 operands, fp16 group accumulation) or their names;
    a layer left out keeps the global precision. Finer entries: a single conv of a block (enc1.c2, dec0.c1), "all", and
    per-pass values fwd:bwd_data:wgrad (e.g. dec0=fp16:fp16:fp8). Later entries override earlier ones. */
-extern "C" int nn_set_prec_policy(const char *pol) {
-    static const char *names[] = {"enc0", "enc1", "enc2", "enc3", "down0", "down1", "down2", "dec2", "dec1", "dec0", "head"};
-    lprec_init();
-    for (int i = 0; i < NN_MAXLAYER; i++) { g_lprec[i] = -1; nn_set_conv_prec(i, -1, 0, 0, 0); }
-    if (!pol || !*pol) return 0;
-    char buf[2048]; snprintf(buf, sizeof buf, "%s", pol);
-    int pos = 0;
-    char *save = nullptr;
-    for (char *tok = strtok_r(buf, ", ", &save); tok; tok = strtok_r(nullptr, ", ", &save)) {
-        char *eq = strchr(tok, '=');
-        if (!eq) { int v = nn_prec_parse(tok); if (v < 1 || pos >= 11) { fprintf(stderr, "nn_set_prec_policy: bad entry '%s'\n", tok); return -1; } g_lprec[pos++] = v; continue; }
-        *eq = 0;
-        char *val = eq + 1, *c1 = strchr(val, ':'), *c2 = c1 ? strchr(c1 + 1, ':') : nullptr;
-        int pv[3];
-        if (c1 && c2) { *c1 = *c2 = 0; pv[0] = nn_prec_parse(val); pv[1] = nn_prec_parse(c1 + 1); pv[2] = nn_prec_parse(c2 + 1); }
-        else if (!c1) pv[0] = pv[1] = pv[2] = nn_prec_parse(val);
-        else pv[0] = -1;
-        if (pv[0] < 1 || pv[1] < 1 || pv[2] < 1) { fprintf(stderr, "nn_set_prec_policy: bad precision in '%s'\n", val); return -1; }
-        int sub = -1;
-        char *dot = strchr(tok, '.');
-        if (dot) { if (!strcmp(dot, ".c1")) sub = 0; else if (!strcmp(dot, ".c2")) sub = 1; else { fprintf(stderr, "nn_set_prec_policy: bad conv '%s'\n", tok); return -1; } *dot = 0; }
-        int lo = -1, hi = -1;
-        if (!strcmp(tok, "all")) { lo = 0; hi = 10; }
-        else for (int i = 0; i < 11; i++) if (!strcmp(tok, names[i])) lo = hi = i;
-        if (lo < 0) { fprintf(stderr, "nn_set_prec_policy: unknown layer '%s'\n", tok); return -1; }
-        for (int i = lo; i <= hi; i++) {
-            if (sub < 0 && pv[0] == pv[1] && pv[1] == pv[2]) { g_lprec[i] = pv[0]; nn_set_conv_prec(i, -1, 0, 0, 0); }
-            else nn_set_conv_prec(i, sub, pv[0], pv[1], pv[2]);
-        }
-    }
-    return 0;
-}
-extern "C" int nn_get_tf32(void) { return g_tf32; }
-static int g_actbf = 1;  /* 1 = activations stored as bf16 in tensor-core mode (gradients stay fp32) */
-extern "C" void nn_set_act_bf16(int on) { g_actbf = on; }
-extern "C" int nn_get_act_bf16(void) { return g_actbf; }
+extern "C" int nn_set_prec_policy(const char *pol);
+extern "C" int nn_get_tf32(void);
+extern int g_actbf;
+extern "C" void nn_set_act_bf16(int on);
+extern "C" int nn_get_act_bf16(void);
 #define ABF (g_tf32 && g_actbf)
-static int g_h16 = 0;     /* 16-bit type for activation/gradient storage and the MMA operands: 0 bf16, 1 fp16 (8x finer mantissa, same rate) */
-extern "C" void nn_set_f16(int on) { g_h16 = on; }
+extern int g_h16;
+extern "C" void nn_set_f16(int on);
 /* effective precision manifest (see nn.h) */
-static const char *pname16(int p) { return p == 1 && g_h16 ? "fp16" : nn_prec_name(p); }   /* prec 1 is the 16-bit storage type */
-extern "C" int nn_prec_manifest(char *buf, size_t n) {
-    static const char *names[] = {"enc0", "enc1", "enc2", "enc3", "down0", "down1", "down2", "dec2", "dec1", "dec0", "head"};
-    int sl = g_layer, ss = g_sub; size_t off = 0;
-    if (!n) return 0;
-    off += (size_t)snprintf(buf + off, n - off, "prec %s sr %d requested_policy:", pname16(g_prec), sr_on());
-    for (int l = 0; l < 11 && off < n; l++) for (int s2 = 0; s2 < (l >= 4 && l <= 6 ? 1 : l == 10 ? 1 : 2) && off < n; s2++) {
-        g_layer = l; g_sub = (l >= 4 && l <= 6) || l == 10 ? -1 : s2;
-        off += (size_t)snprintf(buf + off, n - off, " %s%s=%s:%s:%s", names[l], g_sub < 0 ? "" : s2 ? ".c2" : ".c1", pname16(eff_prec_pass(0)), pname16(eff_prec_pass(1)), pname16(eff_prec_pass(2)));
-    }
-    g_layer = sl; g_sub = ss;
-    return (int)(off < n ? off : n - 1);
-}
-extern "C" int nn_exec_manifest(char *buf, size_t n) {
-    static const char *names[] = {"enc0", "enc1", "enc2", "enc3", "down0", "down1", "down2", "dec2", "dec1", "dec0", "head"};
-    if (!n) return 0;
-    size_t off = (size_t)snprintf(buf, n, "executed_compute (fwd:bwd_data:wgrad; - = not observed):");
-    for (int l = 0; l < 11 && off < n; l++) for (int s2 = 0; s2 < ((l >= 4 && l <= 6) || l == 10 ? 1 : 2) && off < n; s2++) {
-        off += (size_t)snprintf(buf + off, n - off, " %s%s=", names[l], l >= 4 && (l <= 6 || l == 10) ? "" : s2 ? ".c2" : ".c1");
-        for (int pass = 0; pass < 3 && off < n; pass++) {
-            if (pass) off += (size_t)snprintf(buf + off, n - off, ":");
-            unsigned mask = __atomic_load_n(&g_exec_prec[l][s2][pass], __ATOMIC_RELAXED);
-            if (!mask && off < n) off += (size_t)snprintf(buf + off, n - off, "-");
-            int sep = 0;
-            for (int p = 0; p < 5 && off < n; p++) if (mask & (1u << p)) {
-                off += (size_t)snprintf(buf + off, n - off, "%s%s", sep ? "|" : "", pname16(p)); sep = 1;
-            }
-        }
-    }
-    return (int)(off < n ? off : n - 1);
-}
-extern "C" int nn_get_f16(void) { return g_h16; }
+const char *pname16(int p);
+extern "C" int nn_prec_manifest(char *buf, size_t n);
+extern "C" int nn_exec_manifest(char *buf, size_t n);
+extern "C" int nn_get_f16(void);
 #define LPDT(flag) ((flag) ? (g_h16 ? 2 : 1) : 0)   /* storage code of the lp_* (nn_fp8.cu) entry points: 0 fp32, 1 bf16, 2 fp16 */
-static float g_gscale = 1.f;   /* activation gradients are stored scaled by this (fp16 storage range); parameter grads are unscaled by the network */
-extern "C" void nn_set_grad_scale(float s) { g_gscale = s; }
-extern "C" float nn_get_grad_scale(void) { return g_gscale; }
-static int g_gradbf = 1;  /* 1 = activation gradients stored as bf16 as well (requires act-bf16) */
-extern "C" void nn_set_grad_bf16(int on) { g_gradbf = on; }
-extern "C" int nn_get_grad_bf16(void) { return g_gradbf; }
+extern float g_gscale;
+extern "C" void nn_set_grad_scale(float s);
+extern "C" float nn_get_grad_scale(void);
+extern int g_gradbf;
+extern "C" void nn_set_grad_bf16(int on);
+extern "C" int nn_get_grad_bf16(void);
 #define GBF (ABF && g_gradbf)
 
-static cudaError_t g_err = cudaSuccess;
+extern cudaError_t g_err;
 extern "C" const char *lp_check(void);
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess && g_err == cudaSuccess) { g_err = e_; if (ufsm_env_on("UFSM_CUDA_TRACE")) fprintf(stderr,"CUDA at %s:%d (%s): %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e_)); } } while (0)
 #define KCHECK() CK(cudaGetLastError())
 
-extern "C" int nn_init(int device) { if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } return cudaSetDevice(device) == cudaSuccess ? 0 : -1; }
-extern "C" const char *nn_check(void) {
-    cudaError_t e = g_err;
-    g_err = cudaSuccess;
-    if (e == cudaSuccess) e = cudaGetLastError();
-    const char *lp_error = lp_check();   /* low-precision kernels clear CUDA's last error into their own buffer */
-    return e == cudaSuccess ? lp_error : cudaGetErrorString(e);
-}
-extern "C" void *nn_malloc(size_t n) { void *p = nullptr; CK(cudaMalloc(&p, n)); return p; }
+extern "C" int nn_init(int device);
+extern "C" const char *nn_check(void);
+extern "C" void *nn_malloc(size_t n);
 /* ---- per-tensor storage registry: a tensor registered as MX-fp8 (dt 8) takes the MX paths of the ops that read or
    write it (see nn_set_storage in nn.h); lookups match any address inside a registered range ---- */
 #define NN_MAXREG 1024
-static struct { const char *p; size_t n; int dt; } g_reg[NN_MAXREG];
-static int g_nreg;
-extern "C" void nn_storage_forget(const void *p) { for (int i = 0; i < g_nreg; i++) if (g_reg[i].p == (const char *)p) { g_reg[i] = g_reg[--g_nreg]; return; } }
-extern "C" void nn_set_storage(const void *p, size_t bytes, int dt) {
-    nn_storage_forget(p);
-    if (!p || !dt) return;
-    if (g_nreg >= NN_MAXREG) { fprintf(stderr, "nn_set_storage: registry full\n"); abort(); }
-    g_reg[g_nreg].p = (const char *)p; g_reg[g_nreg].n = bytes; g_reg[g_nreg].dt = dt; g_nreg++;
-}
-extern "C" int nn_storage(const void *p) {
-    const char *c = (const char *)p;
-    for (int i = 0; i < g_nreg; i++) if (c >= g_reg[i].p && c < g_reg[i].p + g_reg[i].n) return g_reg[i].dt;
-    return 0;
-}
+struct g_reg_t { const char *p; size_t n; int dt; };
+extern g_reg_t g_reg[NN_MAXREG];
+extern int g_nreg;
+extern "C" void nn_storage_forget(const void *p);
+extern "C" void nn_set_storage(const void *p, size_t bytes, int dt);
+extern "C" int nn_storage(const void *p);
 /* registry dt 8 = MX-fp8, 4 = MX-fp4; MXDT(p) = the lp dtype of a registered tensor (3 fp8, 4 fp4), 0 = plane-major */
 static inline int mxdt_of(const void *p) { int d = g_nreg ? nn_storage(p) : 0; return d == 8 ? 3 : d == 4 ? 4 : 0; }
 #define MXDT(p) mxdt_of(p)
 #define ISMX(p) (mxdt_of(p) != 0)
 #define ISMX4(p) (mxdt_of(p) == 4)
-extern "C" size_t nn_mx8_bytes(shape5 s) { int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw + 1); }   /* = lp_mx8_bytes */
-extern "C" size_t nn_mx4_bytes(shape5 s) { int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw / 2 + 1); }   /* = lp_mx4_bytes */
-extern "C" size_t nn_mx_bytes(shape5 s, int dt) { return dt == 4 ? nn_mx4_bytes(s) : nn_mx8_bytes(s); }   /* registry dt */
-extern "C" void nn_free(void *p) { if (p) { if (g_nreg) nn_storage_forget(p); CK(cudaFree(p)); } }
-extern "C" void nn_zero(void *p, size_t n) { CK(cudaMemset(p, 0, n)); }
-extern "C" void nn_h2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyHostToDevice)); }
-extern "C" void nn_d2h(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToHost)); }
-extern "C" void nn_d2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToDevice)); }
-extern "C" void nn_sync(void) { CK(cudaDeviceSynchronize()); }
-extern "C" void *nn_host_alloc(size_t n) { void *p = nullptr; CK(cudaMallocHost(&p, n)); return p; }
-extern "C" void nn_host_free(void *p) { if (p) CK(cudaFreeHost(p)); }
+extern "C" size_t nn_mx8_bytes(shape5 s);
+extern "C" size_t nn_mx4_bytes(shape5 s);
+extern "C" size_t nn_mx_bytes(shape5 s, int dt);
+extern "C" void nn_free(void *p);
+extern "C" void nn_zero(void *p, size_t n);
+extern "C" void nn_h2d(void *d, const void *s, size_t n);
+extern "C" void nn_d2h(void *d, const void *s, size_t n);
+extern "C" void nn_d2d(void *d, const void *s, size_t n);
+extern "C" void nn_sync(void);
+extern "C" void *nn_host_alloc(size_t n);
+extern "C" void nn_host_free(void *p);
 /* per-device copy stream (non-blocking, overlaps the legacy compute stream) and events for host<->device pipelining */
-static cudaStream_t copy_stream(void) {
-    static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;
-    if (!st[d]) CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));
-    return st[d];
-}
-extern "C" void nn_h2d_copy_stream(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyHostToDevice, copy_stream())); }   /* s must be pinned */
-extern "C" void *nn_event_create(void) { cudaEvent_t e; CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); return (void *)e; }
-extern "C" void nn_event_record(void *e, int on_copy_stream) { CK(cudaEventRecord((cudaEvent_t)e, on_copy_stream ? copy_stream() : 0)); }
-extern "C" void nn_stream_wait(int copy_stream_waits, void *e) { CK(cudaStreamWaitEvent(copy_stream_waits ? copy_stream() : 0, (cudaEvent_t)e, 0)); }
-extern "C" void nn_event_sync(void *e) { CK(cudaEventSynchronize((cudaEvent_t)e)); }
+cudaStream_t copy_stream(void);
+extern "C" void nn_h2d_copy_stream(void *d, const void *s, size_t n);
+extern "C" void *nn_event_create(void);
+extern "C" void nn_event_record(void *e, int on_copy_stream);
+extern "C" void nn_stream_wait(int copy_stream_waits, void *e);
+extern "C" void nn_event_sync(void *e);
 /* ---- event profiler: GPU timestamps around ops, no host syncs ---- */
 #define NPROF 8192
-static cudaEvent_t g_ev[NPROF][2];
-static int g_evk[NPROF], g_nev, g_ev_init;
-extern "C" void nn_prof_begin(int k) {
-    if (!g_ev_init) { for (int i = 0; i < NPROF; i++) { cudaEventCreate(&g_ev[i][0]); cudaEventCreate(&g_ev[i][1]); } g_ev_init = 1; }
-    if (g_nev >= NPROF) return;
-    g_evk[g_nev] = k; cudaEventRecord(g_ev[g_nev][0], 0);
-}
-extern "C" void nn_prof_end(void) { if (g_nev < NPROF) { cudaEventRecord(g_ev[g_nev][1], 0); g_nev++; } }
+extern cudaEvent_t g_ev[NPROF][2];
+extern int g_evk[NPROF], g_nev, g_ev_init;
+extern "C" void nn_prof_begin(int k);
+extern "C" void nn_prof_end(void);
 /* sums elapsed ms per category into out[nk], resets */
-extern "C" void nn_prof_collect(double *out, int nk) {
-    cudaDeviceSynchronize();
-    for (int i = 0; i < nk; i++) out[i] = 0;
-    for (int i = 0; i < g_nev; i++) { float ms = 0; cudaEventElapsedTime(&ms, g_ev[i][0], g_ev[i][1]); if (g_evk[i] < nk) out[g_evk[i]] += ms; }
-    g_nev = 0;
-}
-extern "C" size_t nn_mem_free(void) { size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); return f; }
+extern "C" void nn_prof_collect(double *out, int nk);
+extern "C" size_t nn_mem_free(void);
 
 #ifndef KSLAB
 #define KSLAB 32
 #endif
-static int cur_dev(void);
-static double *gn_dsums(size_t n);
+int cur_dev(void);
+double *gn_dsums(size_t n);
 __global__ void d2f_k(const double *d, float *f, int n);
 __global__ void gn_finalize_k(const double *sums, int NG, size_t len, float eps, float *mean, float *rstd);
 template <int SILU, typename TI, typename TO> __global__ void gn_apply_k(const TI *x, const float *gamma, const float *beta, const float *mean, const float *rstd, TO *y, int C, int G, size_t S);
@@ -437,7 +330,7 @@ __device__ __forceinline__ void row18_gn(float *v, float a, float b, int x0, int
 #pragma unroll
     for (int j = 0; j < 18; j++) v[j] = x0 + j >= 0 && x0 + j < W ? silu_f(v[j] * a + b) : 0.f;
 }
-static gnp_t to_gnp(const nn_gn_t *g) { gnp_t p = {}; if (g && g->G) { p.gamma = g->gamma; p.beta = g->beta; p.mean = g->mean; p.rstd = g->rstd; p.G = g->G; } return p; }
+gnp_t to_gnp(const nn_gn_t *g);
 __device__ __forceinline__ float gn_silu_at(float v, const gnp_t &p, int n, int ci, int C) {
     if (!p.G) return v;
     int cpg = C / p.G, ng = n * p.G + ci / cpg;
@@ -480,26 +373,7 @@ __device__ __forceinline__ void mma16816_h(unsigned *c, const unsigned *a, const
                  : "+r"(c[0]), "+r"(c[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 /* prec 4 weights: fp16 wp[tap][co][ci] scaled per output channel, w * 2^-e with amax * 2^-e < 16; wsc[co] = 2^e. One block per padded co. */
-__global__ void prep_w16_k(const float *w, __half *wp, float *wsc, int Co, int Ci, int Cop, int Cip) {
-    const int co = blockIdx.x;
-    float am = 0.f;
-    if (co < Co) for (int i = threadIdx.x; i < Ci * 27; i += blockDim.x) am = fmaxf(am, fabsf(w[(size_t)co * Ci * 27 + i]));
-    __shared__ float red[32];
-    for (int o = 16; o; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, o));
-    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = am;
-    __syncthreads();
-    if (threadIdx.x < 32) { am = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f; for (int o = 16; o; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, o)); if (!threadIdx.x) red[0] = am; }
-    __syncthreads();
-    am = red[0];
-    int e = 0;
-    if (am > 0.f) frexpf(am / 16.f, &e);
-    float inv = ldexpf(1.f, -e);
-    if (threadIdx.x == 0) wsc[co] = ldexpf(1.f, e);
-    for (int i = threadIdx.x; i < 27 * Cip; i += blockDim.x) {
-        int t = i / Cip, ci = i % Cip;
-        wp[((size_t)t * Cop + co) * Cip + ci] = __float2half_rn((co < Co && ci < Ci) ? w[((size_t)co * Ci + ci) * 27 + t] * inv : 0.f);
-    }
-}
+__global__ void prep_w16_k(const float *w, __half *wp, float *wsc, int Co, int Ci, int Cop, int Cip);
 /* in-place conversion of a staged 16-bit tile (8 elements per uint4) to fp16 scaled by inv: HT = bf16 or f16 */
 template <typename HT> __device__ __forceinline__ void tile_to_f16(void *p, int n, float inv, int nthr) {
     for (int i = threadIdx.x * 8; i < n; i += nthr * 8) {
@@ -1114,30 +988,23 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_tc_s2_k(const TI *__restrict_
     }
 }
 
-static int cur_dev(void) { int d = 0; cudaGetDevice(&d); return d & 7; }
+int cur_dev(void);
 
 /* ---- spatial split of one window along z across two GPUs (nn_split_cfg, per device): every tensor of this GPU covers its own
    z planes plus halo planes owned by the other GPU (lo0 at the low end and hi0 at the high end of the level-0 depth D0; a
    level-l tensor of depth D has lo0 D / D0 and hi0 D / D0 of them). GroupNorm statistics skip the halo planes and are summed
    across the two GPUs (the reduce callback), so mean / rstd are those of the whole window (Dg0 planes at level 0). */
-static struct { int on, lo0, hi0, D0, Dg0; } g_zs[8];
-static void (*g_split_reduce)(double *, int);
-extern "C" void nn_split_cfg(int lo0, int hi0, int D0, int Dg0) { g_zs[cur_dev()] = {D0 > 0, lo0, hi0, D0, Dg0}; }
-extern "C" void nn_split_set_reduce(void (*fn)(double *, int)) { g_split_reduce = fn; }
-static int zs_on(void) { return g_zs[cur_dev()].on; }
-static void zs_range(int D, int *lo, int *hi) {   /* halo planes at the low / high end of a tensor of depth D */
-    const auto &z = g_zs[cur_dev()];
-    *lo = z.on ? (int)((long)z.lo0 * D / z.D0) : 0; *hi = z.on ? (int)((long)z.hi0 * D / z.D0) : 0;
-}
-static size_t zs_len(size_t len, int D) { const auto &z = g_zs[cur_dev()]; return z.on ? len / D * (size_t)((long)z.Dg0 * D / z.D0) : len; }   /* element count of the whole window */
-static void zs_reduce(double *b, int n) { if (zs_on() && g_split_reduce) g_split_reduce(b, n); }   /* sum over both GPUs */
-static split_t zs_split(split_t sp, int D) { zs_range(D, &sp.zlo, &sp.zhi); return sp; }
-static int gn_fused_stored(const void *y, int cout) {
-    /* MX epilogues can reduce their rounded outputs directly. Ordinary outputs retain
-       the independent FP64 pass; the environment switch preserves the reference path. */
-    return g_gn_stored && ISMX(y) && cout >= 16 &&
-        (!getenv("UFSM_FUSED_STORED_GN") || ufsm_env_on("UFSM_FUSED_STORED_GN"));
-}
+struct g_zs_t { int on, lo0, hi0, D0, Dg0; };
+extern g_zs_t g_zs[8];
+extern void (*g_split_reduce)(double *, int);
+extern "C" void nn_split_cfg(int lo0, int hi0, int D0, int Dg0);
+extern "C" void nn_split_set_reduce(void (*fn)(double *, int));
+int zs_on(void);
+void zs_range(int D, int *lo, int *hi);
+size_t zs_len(size_t len, int D);
+void zs_reduce(double *b, int n);
+split_t zs_split(split_t sp, int D);
+int gn_fused_stored(const void *y, int cout);
 /* x-shift packed weights for XP: wp[kz * 3 + ky][co][kx * 4 + c] (kx = 3 and c >= Ci zero), Cop rows */
 template <typename HT>
 __global__ void prep_wxp_k(const float *w, HT *wp, int Co, int Ci, int Cop) {
@@ -1146,19 +1013,13 @@ __global__ void prep_wxp_k(const float *w, HT *wp, int Co, int Ci, int Cop) {
     int k = i % 16, co = (i / 16) % Cop, t9 = i / (16 * Cop), kx = k >> 2, c = k & 3, kz = t9 / 3, ky = t9 % 3;
     wp[i] = f2h<HT>(kx < 3 && c < Ci && co < Co ? w[((size_t)co * Ci + c) * 27 + kz * 9 + ky * 3 + kx] : 0.f);
 }
-static void *tc_wbuf(size_t n) { static void *buf[8]; static size_t cap[8]; int d = cur_dev(); if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); cudaMalloc(&buf[d], n * 2); cap[d] = n; } return buf[d]; }
+void *tc_wbuf(size_t n);
 
 /* Tensor-core path for k=3, stride 1 (same spatial size). Returns 0 if handled. */
 /* output z planes per block: deeper tiles for MT = 1 (Cop = 16: the level-0 convs) amortise the halo and the weight loads
    over more outputs (env UFSM_FW_TZ = 2 / 4 / 6 overrides) */
-static int fw_tz(int MT) {
-    static int e = -2;
-    if (e == -2) { const char *v = getenv("UFSM_FW_TZ"); e = v ? atoi(v) : -1; }
-    if (MT != 1) return FW_TZ;
-    if (e == 2 || e == 4 || e == 6) return e;
-    return FW_TZ_MT1;
-}
-static size_t fw_smem(int MT, int tz) { return (size_t)(TC_CI * (tz + 2) * 180 + (MT <= 2 ? 2 : 1) * 9 * MT * 16 * TC_CI) * 2; }
+int fw_tz(int MT);
+size_t fw_smem(int MT, int tz);
 template <typename TI, typename TO, int S2B, typename HT, int OP = 0>
 static void conv_fwd_tc_launch(int MT, dim3 grid, size_t smem, const TI *x, const HT *wp, const float *b, TO *y, shape5 xs, int cout, int Cop, int Cip, gnp_t gp, double *osum, int Go, split_t sp, tapset_t ts, const float *wsc = nullptr) {
     static int attr_set[8][8];
@@ -1179,10 +1040,10 @@ static void conv_fwd_tc_launch(int MT, dim3 grid, size_t smem, const TI *x, cons
     default: conv_fwd_tc_k<4, TI, TO, S2B, HT, OP><<<grid, fw_nth(4), smem>>>(x, wp, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, ts, wsc); break;
     }
 }
-static float *tc_wscbuf(size_t n) { static float *buf[8]; static size_t cap[8]; int d = cur_dev(); if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); cudaMalloc(&buf[d], n * sizeof(float)); cap[d] = n; } return buf[d]; }
+float *tc_wscbuf(size_t n);
 /* prec 4 (16-bit storage HT): fp16 operands with fp16 group accumulation folded into fp32 (conv_fwd_tc_k OP = 1) */
 template <typename HT>
-static int conv_fwd_tc_f16acc(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts) {
+int conv_fwd_tc_f16acc(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts) {
     int Cop = (cout + 15) / 16 * 16, Cip = (xs.c + TC_CI - 1) / TC_CI * TC_CI;
     HT *wp = (HT *)tc_wbuf((size_t)27 * Cop * Cip);
     float *wsc = tc_wscbuf(Cop);
@@ -1205,7 +1066,7 @@ static int conv_fwd_tc_f16acc(const void *x, int xbf, shape5 xs, const float *w,
     return 0;
 }
 template <typename HT>
-static int conv_fwd_tc_h(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts) {
+int conv_fwd_tc_h(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts) {
     int Cop = (cout + 15) / 16 * 16, Cip = (xs.c + TC_CI - 1) / TC_CI * TC_CI;
     size_t nw = (size_t)27 * Cop * Cip;
     HT *wp = (HT *)tc_wbuf(nw);
@@ -1242,29 +1103,7 @@ plain:
 }
 /* xbf / ybf: input / output tensors are 16-bit (bf16, or fp16 with nn_set_f16) instead of float.
    ts != nullptr: parity-decomposed stride-2 backward-data (x = gy on its own grid, output scattered into gx) */
-static int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts = nullptr) {
-    const int pr = eff_prec();
-    const int mx = ISMX(x) || ISMX(y);
-    exec_prec(g_pass, !ts && mx ? xs.c <= 8 ? 2 : MXDT(x) == 4 || pr == 3 ? 3 : 2 : !ts && !sp.up && (pr == 2 || pr == 3) ? xs.c <= 8 && pr == 3 ? 2 : pr : pr == 4 ? 4 : 1);
-    if (!ts && (ISMX(x) || ISMX(y))) {   /* MX activation storage (fp8 or fp4): staged from the stored rows; fp4 storage or a
-                                            prec-3 policy runs the fp4 kernel, else fp8 compute (copy staging) */
-        const int mdt = MXDT(x);
-        if (!mdt && ISMX(y) && xbf && xs.c <= 8 && !sp.x2 && !sp.y2 && !sp.accum) return lp_conv_fwd_f8(x, LPDT(xbf), xs, w, b, cout, y, MXDT(y), gp, osum, Go, sp);   /* 16-bit network input -> MX a1 */
-        if (mdt && ISMX(y) && mdt != MXDT(y) && xs.c <= 8 && !sp.x2 && !sp.y2 && !sp.up && !sp.accum)
-            return lp_conv_fwd_f8(x, mdt, xs, w, b, cout, y, MXDT(y), gp, osum, Go, sp);   /* independently quantized stem input */
-        if (mdt == 4 && !ISMX(y) && !sp.y2 && !ybf) { sp.wkey = conv_wkey(); return lp_conv_fwd_f4(x, 4, xs, w, b, cout, y, 0, gp, osum, Go, sp); }   /* mx4 in, fp32 out (tests) */
-        if (!mdt || MXDT(y) != mdt || (sp.x2 && MXDT(sp.x2) != mdt) || (sp.y2 && MXDT(sp.y2) != mdt)) { fprintf(stderr, "conv: MX storage needs MX inputs and outputs of one format\n"); abort(); }
-        sp.wkey = conv_wkey();
-        if ((mdt == 4 || pr == 3) && g_pass == 1 && sr_on()) sp.sr = sr_seed();   /* fp4 backward-data: stochastic rounding of the (MX-fp8) gy operand */
-        if (mdt == 4 || pr == 3) return lp_conv_fwd_f4(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
-        return lp_conv_fwd_f8(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
-    }
-    if (!ts && (pr == 2 || pr == 3) && !sp.up && g_pass == 1) { if (sr_on()) sp.sr = sr_seed(); }   /* backward-data: gy is the staged operand (fp8 dither / exact e2m1 SR) */
-    if (!ts && pr == 2 && !sp.up) return lp_conv_fwd_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp);   /* sp.up: 16-bit kernels only */
-    if (!ts && pr == 3 && !sp.up) { sp.wkey = conv_wkey(); return lp_conv_fwd_f4(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp); }
-    if (pr == 4) return g_h16 ? conv_fwd_tc_f16acc<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : conv_fwd_tc_f16acc<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts);
-    return g_h16 ? conv_fwd_tc_h<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : conv_fwd_tc_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts);
-}
+int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts = nullptr);
 
 template <typename TI, typename TO, typename HT>
 static void conv_fwd_tc_s2_launch(int MT, dim3 grid, size_t smem, const TI *x, const HT *wp, const float *b, TO *y, shape5 xs, int cout, int Cop, int Cip, shape5 ys, gnp_t gp) {
@@ -1277,7 +1116,7 @@ static void conv_fwd_tc_s2_launch(int MT, dim3 grid, size_t smem, const TI *x, c
     }
 }
 template <typename HT>
-static int conv_fwd_tc_s2_h(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp) {
+int conv_fwd_tc_s2_h(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp) {
     int Cop = (cout + 15) / 16 * 16, Cip = (xs.c + TC_CI - 1) / TC_CI * TC_CI;
     size_t nw = (size_t)27 * Cop * Cip;
     HT *wp = (HT *)tc_wbuf(nw);
@@ -1292,12 +1131,7 @@ static int conv_fwd_tc_s2_h(const void *x, int xbf, shape5 xs, const float *w, c
     else conv_fwd_tc_s2_launch<float, float, HT>(MT, grid, smem, (const float *)x, wp, b, (float *)y, xs, cout, Cop, Cip, ys, gp);
     return 0;
 }
-static int conv_fwd_tc_s2(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp = {}) {
-    exec_prec(g_pass, ISMX(x) || ISMX(y) || ((eff_prec() == 2 || eff_prec() == 3) && xbf == ybf) ? 2 : 1);
-    if (ISMX(x) || ISMX(y)) { if (MXDT(x) != MXDT(y)) { fprintf(stderr, "conv s2: MX storage needs MX input and output of one format\n"); abort(); } return lp_conv_fwd_s2_f8(x, MXDT(x), xs, w, b, cout, y, MXDT(y), ys, gp); }
-    if ((eff_prec() == 2 || eff_prec() == 3) && xbf == ybf) return lp_conv_fwd_s2_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), ys, gp);
-    return g_h16 ? conv_fwd_tc_s2_h<f16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp) : conv_fwd_tc_s2_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp);
-}
+int conv_fwd_tc_s2(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp = {});
 
 /* 1^3 conv reading activations of type TI (head): y[co] = b[co] + sum_ci w[co][ci] x[ci] */
 template <typename TI, typename TO>
@@ -1313,47 +1147,15 @@ __global__ void conv1_f_k(const TI *__restrict__ x, const float *__restrict__ w,
     }
 }
 
-extern "C" shape5 nn_conv3d_out_shape(shape5 xs, int cout, int k, int stride) {
-    shape5 o = {xs.n, cout, (xs.d + 2 * (k / 2) - k) / stride + 1, (xs.h + 2 * (k / 2) - k) / stride + 1, (xs.w + 2 * (k / 2) - k) / stride + 1};
-    return o;
-}
+extern "C" shape5 nn_conv3d_out_shape(shape5 xs, int cout, int k, int stride);
 
-extern "C" void nn_conv3d_fwd(const float *x, shape5 xs, const float *w, const float *b, int cout, int k, int stride, float *y) {
-    if (k == 1 || !g_tf32) exec_prec(g_pass, 0);
-    if (k == 1 && g_tf32 && ISMX(x)) { lp_conv1_fwd_mx(x, MXDT(x), xs, w, b, cout, y, gnp_t{}); KCHECK(); return; }   /* head reading an MX tensor (fp32 output) */
-    shape5 ys = nn_conv3d_out_shape(xs, cout, k, stride);
-    if (k == 3 && stride == 1 && g_tf32) { gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0}; split_t ns = {nullptr, 0, nullptr, 0}; conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, none, nullptr, 0, ns); KCHECK(); return; }
-    if (k == 3 && stride == 2 && g_tf32) { conv_fwd_tc_s2(x, ABF, xs, w, b, cout, y, ABF, ys); KCHECK(); return; }
-    if (k == 1 && stride == 1 && ABF) { size_t S = shape_spatial(xs); if (g_h16) conv1_f_k<f16, float><<<nblk((size_t)xs.n * S, 256), 256>>>((const f16 *)x, w, b, y, xs.n, xs.c, cout, S); else conv1_f_k<bf16, float><<<nblk((size_t)xs.n * S, 256), 256>>>((const bf16 *)x, w, b, y, xs.n, xs.c, cout, S); KCHECK(); return; }
-    if (k == 3 && stride == 1) {
-        dim3 grid(nblk(ys.w, TX * 4), nblk(ys.h, TY), nblk(ys.d, TZ) * nblk(cout, COT) * xs.n);
-        conv_fwd_k<3, 1, 4><<<grid, 256>>>(x, w, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, ys.d, ys.h, ys.w);
-    } else if (k == 3 && stride == 2) {
-        dim3 grid(nblk(ys.w, TX * 2), nblk(ys.h, TY), nblk(ys.d, TZ) * nblk(cout, COT) * xs.n);
-        conv_fwd_k<3, 2, 2><<<grid, 256>>>(x, w, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, ys.d, ys.h, ys.w);
-    } else if (k == 1 && stride == 1) {
-        dim3 grid(nblk(ys.w, TX * 4), nblk(ys.h, TY), nblk(ys.d, TZ) * nblk(cout, COT) * xs.n);
-        conv_fwd_k<1, 1, 4><<<grid, 256>>>(x, w, b, y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, ys.d, ys.h, ys.w);
-    }
-    else { fprintf(stderr, "nn_conv3d_fwd: unsupported k=%d stride=%d\n", k, stride); abort(); }
-    KCHECK();
-}
+extern "C" void nn_conv3d_fwd(const float *x, shape5 xs, const float *w, const float *b, int cout, int k, int stride, float *y);
 
 /* ---- backward data ----
    stride 1: gx = conv(gy, w') with w'[ci][co][flipped tap]  (same fwd kernel).
    stride 2: gather kernel. */
-__global__ void transpose_w_k(const float *w, float *wt, int Co, int Ci, int T) {   /* wt[ci][co][t] = w[co][ci][t] */
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)Co * Ci * T) return;
-    int t = (int)(i % T), ci = (int)((i / T) % Ci), co = (int)(i / ((size_t)T * Ci));
-    wt[((size_t)ci * Co + co) * T + t] = w[i];
-}
-__global__ void flip_w_k(const float *w, float *wt, int Co, int Ci, int T) {
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)Co * Ci * T) return;
-    int t = (int)(i % T), ci = (int)((i / T) % Ci), co = (int)(i / ((size_t)T * Ci));
-    wt[((size_t)ci * Co + co) * T + (T - 1 - t)] = w[i];
-}
+__global__ void transpose_w_k(const float *w, float *wt, int Co, int Ci, int T);
+__global__ void flip_w_k(const float *w, float *wt, int Co, int Ci, int T);
 
 template <int K>
 __global__ void conv_bwd_data_s2_k(const float *__restrict__ gy, const float *__restrict__ w, float *__restrict__ gx,
@@ -1380,22 +1182,11 @@ __global__ void conv_bwd_data_s2_k(const float *__restrict__ gy, const float *__
     gx[i] = acc;
 }
 
-__global__ void dilate2_k(const float *gy, float *gd, int N, int C, int D, int H, int W, int Do, int Ho, int Wo) {
-    size_t Si = (size_t)D * H * W;
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)N * C * Si) return;
-    int x = (int)(i % W), y = (int)((i / W) % H), z = (int)((i / ((size_t)W * H)) % D), nc = (int)(i / Si);
-    float v = 0.f;
-    if (!(x & 1) && !(y & 1) && !(z & 1) && x / 2 < Wo && y / 2 < Ho && z / 2 < Do) v = gy[((size_t)nc * Do + z / 2) * Ho * Wo + (size_t)(y / 2) * Wo + x / 2];
-    gd[i] = v;
-}
+__global__ void dilate2_k(const float *gy, float *gd, int N, int C, int D, int H, int W, int Do, int Ho, int Wo);
 
 /* scratch: flipped weights, plus (stride 2) the zero-inserted gradient at input resolution */
 /* backward-data scratch: the flipped/transposed weights, plus (fp32 kernels only) the zero-inserted gradient for stride 2 */
-extern "C" size_t nn_conv3d_scratch(shape5 xs, int cout, int k) {
-    size_t w = (size_t)cout * xs.c * k * k * k * sizeof(float);
-    return g_tf32 ? w + 256 : w + (size_t)xs.n * cout * shape_spatial(xs) * sizeof(float);
-}
+extern "C" size_t nn_conv3d_scratch(shape5 xs, int cout, int k);
 
 template <typename HT>
 static void s2b_fused(const float *gy, shape5 ys, shape5 xs, float *gx, const float *wt, const s2cls_t &all, int accum, int op) {
@@ -1412,78 +1203,12 @@ static void s2b_fused(const float *gy, shape5 ys, shape5 xs, float *gx, const fl
     else { if (op) conv_bwd_s2_fused_k<float, 1, HT><<<grid, 128, smem>>>(gy, wp, gx, ys.n, ys.c, ys.d, ys.h, ys.w, xs.c, Cop, all, accum, wsc);
            else conv_bwd_s2_fused_k<float, 0, HT><<<grid, 128, smem>>>(gy, wp, gx, ys.n, ys.c, ys.d, ys.h, ys.w, xs.c, Cop, all, accum, wsc); }
 }
-static void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch, int accum);
-static void bwd_data_impl(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch, int accum) {
-    int save = g_pass; g_pass = 1; bwd_data_impl_(gy, ys, w, xs, k, stride, gx, scratch, accum); g_pass = save;
-}
-static void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch, int accum) {
-    int T = k * k * k;
-    if (k == 1 || !g_tf32 || (stride == 2 && (ISMX(gy) || ISMX(gx)))) exec_prec(1, 0);
-    if (stride == 1) {
-        size_t nw = (size_t)ys.c * xs.c * T;
-        flip_w_k<<<nblk(nw, 256), 256>>>(w, scratch, ys.c, xs.c, T);
-        /* gy has shape ys; treat it as input with ys.c channels, "cout" = xs.c. Spatial sizes equal for stride 1 / pad k/2. */
-        if (k == 3 && g_tf32) { gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0}; split_t ns = {nullptr, 0, nullptr, 0, accum}; conv_fwd_tc(gy, GBF, ys, scratch, nullptr, xs.c, gx, GBF, none, nullptr, 0, ns); }
-        else if (k == 1 && g_tf32 && ISMX(gx)) lp_conv1_to_mx(gy, ISMX(gy) ? 3 : LPDT(GBF), xs.n, ys.c, shape_spatial(xs), scratch, xs.c, gx);   /* head: logit gradient -> MX gout */
-        else if (k == 1 && GBF) { size_t S = shape_spatial(xs); if (g_h16) conv1_f_k<f16, f16><<<nblk((size_t)xs.n * S, 256), 256>>>((const f16 *)gy, scratch, nullptr, (f16 *)gx, xs.n, ys.c, xs.c, S); else conv1_f_k<bf16, bf16><<<nblk((size_t)xs.n * S, 256), 256>>>((const bf16 *)gy, scratch, nullptr, (bf16 *)gx, xs.n, ys.c, xs.c, S); }
-        else { int save = g_actbf; g_actbf = 0; nn_conv3d_fwd(gy, ys, scratch, nullptr, xs.c, k, 1, gx); g_actbf = save; }
-    } else if (stride == 2 && k == 3 && g_tf32 && (ISMX(gy) || ISMX(gx))) {   /* MX gradients: direct voxel-major kernel, accumulate in MX */
-        if (!ISMX(gy) || !ISMX(gx)) { fprintf(stderr, "bwd_data s2: MX gradient storage needs MX gy and gx\n"); abort(); }
-        lp_bwd_data_s2_mx(gy, ys, w, xs, gx, accum);
-    } else if (stride == 2 && k == 3 && g_tf32 && !ufsm_env_on("UFSM_S2DIL") && !(xs.d & 1) && !(xs.h & 1) && !(xs.w & 1)) {
-        /* parity decomposition: gx[2m + p] = sum over the taps compatible with parity p of w . gy[m + d]; each of the
-           8 parity classes is a stride-1 conv on the gy grid with 1..8 taps (27 total: no wasted MACs) */
-        size_t nw = (size_t)ys.c * xs.c * T;
-        transpose_w_k<<<nblk(nw, 256), 256>>>(w, scratch, ys.c, xs.c, T);
-        gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0};
-        split_t ns = {nullptr, 0, nullptr, 0, accum};
-        static int nofuse = -1;
-        if (nofuse < 0) nofuse = ufsm_env_on("UFSM_S2B_NOFUSE");
-        const int fprec = eff_prec();
-        const bool fused = !nofuse && ys.c <= TC_CI;   /* one launch for the 8 classes (gy of <= 16 channels) */
-        s2cls_t all = {};
-        for (int cls = 0; cls < 8; cls++) {
-            tapset_t &ts = all.c[cls];
-            ts.pz = cls >> 2; ts.py = (cls >> 1) & 1; ts.px = cls & 1; ts.Dx = xs.d; ts.Hx = xs.h; ts.Wx = xs.w;
-            /* per axis: even output -> tap 1 at offset 0; odd -> tap 0 at offset +1 and tap 2 at offset 0 */
-            int nz = ts.pz ? 2 : 1, ny = ts.py ? 2 : 1, nx = ts.px ? 2 : 1;
-            for (int a = 0; a < nz; a++) for (int bb = 0; bb < ny; bb++) for (int c = 0; c < nx; c++) {
-                int tz = ts.pz ? (a ? 2 : 0) : 1, ty = ts.py ? (bb ? 2 : 0) : 1, tx = ts.px ? (c ? 2 : 0) : 1;
-                int e = ts.ntap++;
-                ts.dz[e] = (signed char)(ts.pz ? (a ? 0 : 1) : 0); ts.dy[e] = (signed char)(ts.py ? (bb ? 0 : 1) : 0); ts.dx[e] = (signed char)(ts.px ? (c ? 0 : 1) : 0);
-                ts.wt[e] = (signed char)(tz * 9 + ty * 3 + tx);
-            }
-            if (!fused) conv_fwd_tc(gy, GBF, ys, scratch, nullptr, xs.c, gx, GBF, none, nullptr, 0, ns, &ts);
-        }
-        if (fused) {   /* stage the gy tile once, run the 8 classes from it */
-            exec_prec(1, fprec == 4 ? 4 : 1);
-            if (g_h16) s2b_fused<f16>(gy, ys, xs, gx, scratch, all, accum, fprec == 4);
-            else s2b_fused<bf16>(gy, ys, xs, gx, scratch, all, accum, fprec == 4);
-        }
-    } else if (stride == 2 && k == 3 && !(xs.d & 1) && !(xs.h & 1) && !(xs.w & 1)) {
-        /* even input sizes: gx = conv_s1(dilate2(gy), flip(w)) */
-        size_t nw = (size_t)ys.c * xs.c * T;
-        float *gd = scratch + nw;
-        flip_w_k<<<nblk(nw, 256), 256>>>(w, scratch, ys.c, xs.c, T);
-        shape5 ds = xs; ds.c = ys.c;
-        size_t n = shape_numel(ds);
-        dilate2_k<<<nblk(n, 256), 256>>>(gy, gd, xs.n, ys.c, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w);
-        if (g_tf32) { gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0}; split_t ns = {nullptr, 0, nullptr, 0, accum}; conv_fwd_tc(gd, 0, ds, scratch, nullptr, xs.c, gx, 0, none, nullptr, 0, ns); }
-        else nn_conv3d_fwd(gd, ds, scratch, nullptr, xs.c, k, 1, gx);
-    } else {
-        size_t n = shape_numel(xs);
-        if (k == 3) conv_bwd_data_s2_k<3><<<nblk(n, 256), 256>>>(gy, w, gx, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w);
-        else { fprintf(stderr, "nn_conv3d_bwd_data: unsupported k=%d stride=%d\n", k, stride); abort(); }
-    }
-    KCHECK();
-}
-extern "C" void nn_conv3d_bwd_data(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch) { bwd_data_impl(gy, ys, w, xs, k, stride, gx, scratch, 0); }
+void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch, int accum);
+void bwd_data_impl(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch, int accum);
+void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch, int accum);
+extern "C" void nn_conv3d_bwd_data(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch);
 /* gx += backward-data (tensor-core k=3 paths only; returns -1 otherwise, caller falls back to bwd_data + axpy) */
-extern "C" int nn_conv3d_bwd_data_acc(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch) {
-    if (!(g_tf32 && k == 3 && (stride == 1 || (stride == 2 && !(xs.d & 1) && !(xs.h & 1) && !(xs.w & 1))))) return -1;
-    bwd_data_impl(gy, ys, w, xs, k, stride, gx, scratch, 1);
-    return 0;
-}
+extern "C" int nn_conv3d_bwd_data_acc(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch);
 
 /* ---- backward weight ----
    Shared-memory tiled: a block owns one input channel ci, a group of 8 output channels and a 4x8x8 output
@@ -1713,29 +1438,9 @@ static void launch_bwd_w_tc_h(const void *x, int xbf, shape5 xs, const void *gy,
 }
 /* fp4 weight gradient (lp_bwd_w_f4) for prec-3 weight-gradient passes: opt-in (UFSM_F4_WGRAD=1) until it passes the stairs;
    UFSM_F4_HAD_W=1 adds the fixed-sign H32 on both operands. Stride 2 stays fp8. */
-static int f4_wgrad(void) { static int v = -1; if (v < 0) v = getenv("UFSM_F4_WGRAD") ? atoi(getenv("UFSM_F4_WGRAD")) : 0; return v; }
-static int f4_had_w(void) {   /* bit 0: Hadamard (UFSM_F4_HAD_W), bit 1: stochastic rounding of x as well (UFSM_F4_SRX), bit 2: H16 variant */
-    static int v = -1;
-    if (v < 0) { const int hw = getenv("UFSM_F4_HAD_W") ? atoi(getenv("UFSM_F4_HAD_W")) : 0;   /* 1: H32 per 32-position block, 2: H16 along x (faster) */
-                 v = (hw ? 1 : 0) | (hw == 2 ? 4 : 0) | (getenv("UFSM_F4_SRX") && atoi(getenv("UFSM_F4_SRX")) ? 2 : 0); }
-    return v;
-}
-static void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
-    exec_prec(2, eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x)) ? 3 : ISMX(x) || ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) ? 2 : 1);
-    if (eff_prec_w() == 3 && f4_wgrad() && (!sp.up || ISMX(x))) {   /* sp.up: MX only (fused upsample in the tile decode) */
-        if (sr_on()) sp.sr = sr_seed();
-        lp_bwd_w_f4(x, ISMX(x) ? MXDT(x) : LPDT(xbf), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(gybf), ys, gw, gb, gp, sp, f4_had_w());
-        return;
-    }
-    if (ISMX(x)) {
-        if (sr_on()) sp.sr = sr_seed();   /* MX activations still need SR when gy is requantised to fp8 */
-        lp_bwd_w_f8(x, MXDT(x), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(gybf), ys, gw, gb, gp, sp); return;
-    }
-    if ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) { if (sr_on()) sp.sr = sr_seed(); }
-    if ((eff_prec_w() == 2 || eff_prec_w() == 3) && !sp.up) { lp_bwd_w_f8(x, LPDT(xbf), xs, gy, LPDT(gybf), ys, gw, gb, gp, sp); return; }   /* prec 4 (fp16) keeps the 16-bit kernel for the weight gradient */
-    if (g_h16) launch_bwd_w_tc_h<f16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
-    else launch_bwd_w_tc_h<bf16>(x, xbf, xs, gy, gybf, ys, gw, gb, gp, sp);
-}
+int f4_wgrad(void);
+int f4_had_w(void);
+void launch_bwd_w_tc(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp);
 
 /* ---- stride-2 tensor-core weight gradient: output tile 2 z x 4 rows x 8 x (per row k = 8 outputs, two rows per
    k-step of 16). The input tile (6 x 10 x 18 per channel) is stored de-interleaved by x parity so that the pair
@@ -1907,163 +1612,34 @@ static void bwd_w1_h(const float *x, shape5 xs, const float *gy, shape5 ys, floa
     else if (ABF) conv_bwd_w1_k<HT, float, 64><<<nb, 256>>>((const HT *)x, gy, gw, xs.n, xs.c, ys.c, So, xg);
     else conv_bwd_w1_k<float, float, 64><<<nb, 256>>>(x, gy, gw, xs.n, xs.c, ys.c, So, xg);
 }
-extern "C" void nn_conv3d_bwd_weight(const float *x, shape5 xs, const float *gy, shape5 ys, int k, int stride, float *gw, float *gb) {
-    if (k == 1 || !g_tf32) exec_prec(2, 0);
-    else if (stride == 2) exec_prec(2, ISMX(x) || eff_prec_w() == 2 || eff_prec_w() == 3 ? 2 : 1);
-    size_t So = shape_spatial(ys);
-    if (k == 3 && stride == 1 && g_tf32) {
-        gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0};
-        split_t ns = {nullptr, 0, nullptr, 0};
-        launch_bwd_w_tc(x, ABF, xs, gy, GBF, ys, gw, gb, none, ns);
-        KCHECK();
-        return;
-    }
-    if (k == 3 && stride == 2 && g_tf32 && ISMX(x)) { lp_bwd_w_s2_f8(x, MXDT(x), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(GBF), ys, gw, gb, gnp_t{}); KCHECK(); return; }
-    if (k == 1 && stride == 1 && g_tf32 && ISMX(x)) {
-        lp_bwd_w1_mx(x, MXDT(x), xs, gy, LPDT(GBF), ys, gw, gnp_t{});
-        size_t So1 = shape_spatial(ys);
-        if (gb) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So1); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So1); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So1); }
-        KCHECK(); return;
-    }
-    if (k == 3 && stride == 2 && g_tf32 && (eff_prec_w() == 2 || eff_prec_w() == 3)) { lp_bwd_w_s2_f8(x, LPDT(ABF), xs, gy, LPDT(GBF), ys, gw, gb, gnp_t{}); KCHECK(); return; }
-    if (k == 3 && stride == 2 && g_tf32) {
-        if (g_h16) bwd_w_s2_h<f16>(x, xs, gy, ys, gw, gb); else bwd_w_s2_h<bf16>(x, xs, gy, ys, gw, gb);
-        KCHECK();
-        return;
-    }
-    if (k == 3) {
-        int nxt = (ys.w + WTX - 1) / WTX, nyt = (ys.h + WTY - 1) / WTY, nzt = (ys.d + WTZ - 1) / WTZ;
-        dim3 grid(xs.c, (ys.c + WCO - 1) / WCO, nxt * nyt * nzt * ys.n);
-        if (stride == 1) conv_bwd_w3_k<1><<<grid, 256>>>(x, gy, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w);
-        else if (stride == 2) conv_bwd_w3_k<2><<<grid, 256>>>(x, gy, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w);
-        else { fprintf(stderr, "nn_conv3d_bwd_weight: unsupported stride %d\n", stride); abort(); }
-    } else if (k == 1 && stride == 1 && xs.c * ys.c <= 64 && ys.c <= 8) {
-        if (g_h16) bwd_w1_h<f16>(x, xs, gy, ys, gw, So); else bwd_w1_h<bf16>(x, xs, gy, ys, gw, So);
-    } else { fprintf(stderr, "nn_conv3d_bwd_weight: unsupported k=%d stride=%d\n", k, stride); abort(); }
-    if (gb) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So); }
-    KCHECK();
-}
+extern "C" void nn_conv3d_bwd_weight(const float *x, shape5 xs, const float *gy, shape5 ys, int k, int stride, float *gw, float *gb);
 
 __global__ void silu_f_k(const float *x, float *y, size_t n);
 
 /* y = conv3d(silu(gn(x))) for k=3 stride 1 on the tensor-core path; returns -1 when that path is unavailable */
 extern "C" int nn_conv3d_fwd_gn(const float *x, shape5 xs, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
-                                const float *w, const float *b, int cout, float *y) {
-    if (G > xs.c) G = xs.c;   /* GroupNorm uses min(G, C) groups */
-    if (!g_tf32) return -1;
-    gnp_t gp = {gamma, beta, mean, rstd, G};
-    split_t ns = {nullptr, 0, nullptr, 0};
-    conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, nullptr, 0, ns);
-    KCHECK();
-    return 0;
-}
+                                const float *w, const float *b, int cout, float *y);
 /* Same conv (optionally with the gn+silu input transform when G_in > 0) that also produces the GroupNorm
    statistics of its OUTPUT for G_out groups: mean/rstd of y. Tensor-core path only; -1 when unavailable. */
 extern "C" int nn_conv3d_fwd_gn_stats(const float *x, shape5 xs, int G_in, const float *gamma, const float *beta, const float *mean, const float *rstd,
-                                      const float *w, const float *b, int cout, float *y, int G_out, float eps, float *omean, float *orstd) {
-    if (G_in > xs.c) G_in = xs.c; if (G_out > cout) G_out = cout;
-    if (!g_tf32) return -1;
-    gnp_t gp = {gamma, beta, mean, rstd, G_in};
-    int NG = xs.n * G_out;
-    double *sums = nullptr;
-    const int fused = gn_fused_stored(y, cout);
-    if ((!g_gn_stored || fused) && G_out && omean && orstd) { sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
-    split_t ns = zs_split(split_t{}, xs.d);
-    ns.stored_stats = fused;
-    conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, ns);
-    KCHECK();
-    if (G_out && omean && orstd) {
-        if (g_gn_stored && !fused) { shape5 ys = xs; ys.c = cout; return nn_gn_stats(y, ys, G_out, eps, omean, orstd); }
-        zs_reduce(sums, 2 * NG);
-        gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zs_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd);
-    }
-    KCHECK();
-    return 0;
-}
+                                      const float *w, const float *b, int cout, float *y, int G_out, float eps, float *omean, float *orstd);
 /* Forward with a channel-split input: channels [0, c_split) from x (xs.c = c_split + channels of x2), the rest
    from x2; otherwise like nn_conv3d_fwd_gn_stats (G_in applies gn+silu to BOTH inputs with the same params). */
 extern "C" int nn_conv3d_fwd_split(const float *x, const float *x2, int c_split, shape5 xs, int G_in, const float *gamma, const float *beta, const float *mean, const float *rstd,
-                                   const float *w, const float *b, int cout, float *y, int G_out, float eps, float *omean, float *orstd) {
-    if (G_in > xs.c) G_in = xs.c; if (G_out > cout) G_out = cout;
-    if (!g_tf32) return -1;
-    gnp_t gp = {gamma, beta, mean, rstd, G_in};
-    split_t sp = {x2, c_split, nullptr, 0};
-    sp = zs_split(sp, xs.d);
-    double *sums = nullptr;
-    const int fused = gn_fused_stored(y, cout);
-    sp.stored_stats = fused;
-    if ((!g_gn_stored || fused) && G_out && omean && orstd) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
-    conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, sp);
-    KCHECK();
-    if (G_out && omean && orstd) {
-        if (g_gn_stored && !fused) { shape5 ys = xs; ys.c = cout; return nn_gn_stats(y, ys, G_out, eps, omean, orstd); }
-        zs_reduce(sums, 2 * xs.n * G_out); gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, zs_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd);
-    }
-    KCHECK();
-    return 0;
-}
+                                   const float *w, const float *b, int cout, float *y, int G_out, float eps, float *omean, float *orstd);
 /* Backward-data (k=3, stride 1) writing input-channel gradients [0, o_split) to gx and the rest to gx2. */
-extern "C" int nn_conv3d_bwd_data_split(const float *gy, shape5 ys, const float *w, shape5 xs, float *gx, float *gx2, int o_split, float *scratch) {
-    if (!g_tf32) return -1;
-    int T = 27;
-    size_t nw = (size_t)ys.c * xs.c * T;
-    flip_w_k<<<nblk(nw, 256), 256>>>(w, scratch, ys.c, xs.c, T);
-    gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0};
-    split_t sp = {nullptr, 0, gx2, o_split};
-    int save = g_pass; g_pass = 1;
-    conv_fwd_tc(gy, GBF, ys, scratch, nullptr, xs.c, gx, GBF, none, nullptr, 0, sp);
-    g_pass = save;
-    KCHECK();
-    return 0;
-}
+extern "C" int nn_conv3d_bwd_data_split(const float *gy, shape5 ys, const float *w, shape5 xs, float *gx, float *gx2, int o_split, float *scratch);
 /* Backward-data (k=3, stride 1) of input channels [c0, c0 + nc) only, into gx (nc channels). scratch as for
    nn_conv3d_bwd_data. Lets a caller produce a wide input gradient in channel chunks. */
-extern "C" int nn_conv3d_bwd_data_range(const float *gy, shape5 ys, const float *w, shape5 xs, int c0, int nc, float *gx, float *scratch) {
-    if (!g_tf32 || c0 < 0 || nc <= 0 || c0 + nc > xs.c) return -1;
-    const int T = 27;
-    size_t nw = (size_t)ys.c * xs.c * T;
-    flip_w_k<<<nblk(nw, 256), 256>>>(w, scratch, ys.c, xs.c, T);   /* scratch[ci][co][t]: rows ci = output channels of this conv */
-    gnp_t none = {}; split_t ns = {};
-    shape5 gs = xs; gs.c = nc;
-    int save = g_pass; g_pass = 1;
-    conv_fwd_tc(gy, GBF, ys, scratch + (size_t)c0 * ys.c * T, nullptr, nc, gx, GBF, none, nullptr, 0, ns);
-    g_pass = save;
-    (void)gs;
-    KCHECK();
-    return 0;
-}
+extern "C" int nn_conv3d_bwd_data_range(const float *gy, shape5 ys, const float *w, shape5 xs, int c0, int nc, float *gx, float *scratch);
 /* y = silu(gn(x)) from precomputed statistics, one pass */
-extern "C" void nn_gn_silu_apply(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *y) {
-    if (G > s.c) G = s.c;
-    if (ISMX(x) || ISMX(y)) { if (!ISMX(y)) { fprintf(stderr, "gn_silu_apply: MX input needs an MX output\n"); abort(); } lp_gn_silu_apply_mx(x, ISMX(x) ? MXDT(x) : LPDT(ABF), s, G, gamma, beta, mean, rstd, y, MXDT(y)); KCHECK(); return; }   /* MX or 16-bit in, MX out */
-    size_t n = shape_numel(s);
-    if (ABF && g_h16) gn_apply_k<1, f16, f16><<<dim3(s.n * s.c, KSLAB), 256>>>((const f16 *)x, gamma, beta, mean, rstd, (f16 *)y, s.c, G, shape_spatial(s));
-    else if (ABF) gn_apply_k<1, bf16, bf16><<<dim3(s.n * s.c, KSLAB), 256>>>((const bf16 *)x, gamma, beta, mean, rstd, (bf16 *)y, s.c, G, shape_spatial(s));
-    else gn_apply_k<1, float, float><<<dim3(s.n * s.c, KSLAB), 256>>>(x, gamma, beta, mean, rstd, y, s.c, G, shape_spatial(s));
-    KCHECK();
-}
+extern "C" void nn_gn_silu_apply(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *y);
 /* gw += dconv/dw with the conv input silu(gn(x)) recomputed at staging; -1 when unavailable */
 extern "C" int nn_conv3d_bwd_weight_gn(const float *x, shape5 xs, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
-                                       const float *gy, shape5 ys, float *gw, float *gb) {
-    if (G > xs.c) G = xs.c;
-    if (!g_tf32) return -1;
-    gnp_t gp = {gamma, beta, mean, rstd, G};
-    split_t ns = {nullptr, 0, nullptr, 0};
-    launch_bwd_w_tc(x, ABF, xs, gy, GBF, ys, gw, gb, gp, ns);
-    KCHECK();
-    return 0;
-}
+                                       const float *gy, shape5 ys, float *gw, float *gb);
 /* Weight gradient with a channel-split input (see nn_conv3d_fwd_split); G > 0 applies gn+silu to both inputs. */
 extern "C" int nn_conv3d_bwd_weight_split(const float *x, const float *x2, int c_split, shape5 xs, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
-                                          const float *gy, shape5 ys, float *gw, float *gb) {
-    if (G > xs.c) G = xs.c;
-    if (!g_tf32) return -1;
-    gnp_t gp = {gamma, beta, mean, rstd, G};
-    split_t sp = {x2, c_split, nullptr, 0};
-    launch_bwd_w_tc(x, ABF, xs, gy, GBF, ys, gw, gb, gp, sp);
-    KCHECK();
-    return 0;
-}
+                                          const float *gy, shape5 ys, float *gw, float *gb);
 
 /* ---- input-side recompute: the conv input silu(gn(.)) of a stored pre-norm tensor (and, for the decoder, the nearest
    upsample of the coarse block output) is formed while staging, so neither the normalized activation nor the
@@ -2076,106 +1652,16 @@ extern "C" int nn_conv3d_bwd_weight_split(const float *x, const float *x2, int c
    interpolates the half-resolution x segment while staging (no full-resolution transient). Needs both segments MX of one
    type, 16-channel-aligned segments (the tiles never straddle) and, for the fp4 kernel, a layout with the decoded tile
    (not LY 0: the H32 / x-SR modes and UFSM_F4W_LAYOUT=0 keep the transient). */
-static int f4_had_w(void);
-static int f4_wgrad(void);
-static int eff_prec_w(void);
-static int mx_up_w_ok(const float *x, const float *x2, int c_split, shape5 xs) {
-    static int on = -1; if (on < 0) on = getenv("UFSM_MX_UP_W") ? atoi(getenv("UFSM_MX_UP_W")) : 1;
-    if (!on || !ISMX(x) || !ISMX(x2) || MXDT(x) != MXDT(x2) || c_split % 16 || (xs.c - c_split) % 16) return 0;
-    if (eff_prec_w() == 3 && f4_wgrad()) {
-        const int h = f4_had_w();
-        static int lay = -1; if (lay < 0) lay = getenv("UFSM_F4W_LAYOUT") ? atoi(getenv("UFSM_F4W_LAYOUT")) : 1;
-        if ((h & 3) && !(h & 4)) return 0;   /* LY 0 */
-        if (!(h & 7) && lay == 0) return 0;
-    }
-    return 1;
-}
-static int up_kernel_ok(const float *x, const float *x2, int wgrad) {
-    static int mxup = -1; if (mxup < 0) mxup = getenv("UFSM_MX_UP") ? atoi(getenv("UFSM_MX_UP")) : 1;
-    if (ISMX(x) || ISMX(x2)) return mxup && !wgrad && ISMX(x) && MXDT(x) == MXDT(x2);
-    return 1;
-}
-static int xsplit(const float *x2, const nn_gn_t *gx, const nn_gn_t *gx2, int c_split, int up, shape5 xs, split_t *sp) {
-    *sp = split_t{};
-    if (up && (!x2 || ((xs.d | xs.h | xs.w) & 1))) return -1;   /* up: decoder split, even dims (a GN on x: MX forward only, see the callers) */
-    if (!x2) return 0;
-    sp->up = up;
-    if ((gx && gx->G) && !(gx2 && gx2->G)) { fprintf(stderr, "conv: a split input with a GroupNorm on x needs one on x2\n"); return -1; }
-    sp->x2 = x2; sp->c_split = c_split; sp->gp2 = to_gnp(gx2);
-    return 0;
-}
+int f4_had_w(void);
+int f4_wgrad(void);
+int eff_prec_w(void);
+int mx_up_w_ok(const float *x, const float *x2, int c_split, shape5 xs);
+int up_kernel_ok(const float *x, const float *x2, int wgrad);
+int xsplit(const float *x2, const nn_gn_t *gx, const nn_gn_t *gx2, int c_split, int up, shape5 xs, split_t *sp);
 extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, int up, shape5 xs,
-                               const float *w, const float *b, int cout, int k, int stride, float *y, int G_out, float eps, float *omean, float *orstd) {
-    if (!g_tf32) return -1;
-    gnp_t gp = to_gnp(gx);
-    shape5 ys = nn_conv3d_out_shape(xs, cout, k, stride);
-    if (k == 3 && stride == 1) {
-        split_t sp; if (xsplit(x2, gx, gx2, c_split, up, xs, &sp)) return -1;
-        if (up && !up_kernel_ok(x, x2, 0)) return -1;
-        if (up && gx && gx->G && !ISMX(x)) return -1;   /* GN+SiLU of the coarse x inside the up staging: MX kernels only */
-        double *sums = nullptr;
-        const int fused = gn_fused_stored(y, cout);
-        sp.stored_stats = fused;
-        if (G_out) {
-            sp = zs_split(sp, ys.d);
-            if ((!g_gn_stored || fused) && omean && orstd) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
-        }
-        conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, sp);
-        KCHECK();
-        if (G_out && omean && orstd) {
-            if (g_gn_stored && !fused) return nn_gn_stats(y, ys, G_out, eps, omean, orstd);
-            zs_reduce(sums, 2 * xs.n * G_out); gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, zs_len((size_t)(cout / G_out) * shape_spatial(ys), ys.d), eps, omean, orstd);
-        }
-        KCHECK();
-        return 0;
-    }
-    if (x2 || up || G_out) return -1;
-    if (k == 3 && stride == 2) { conv_fwd_tc_s2(x, ABF, xs, w, b, cout, y, ABF, ys, gp); KCHECK(); return 0; }
-    if (k == 1 && stride == 1) {
-        exec_prec(0, 0);
-        if (ISMX(x)) lp_conv1_fwd_mx(x, MXDT(x), xs, w, b, cout, y, gp);
-        else { size_t S = shape_spatial(xs); dim3 gr(nblk((size_t)xs.n * S, 256));
-            if (ABF && g_h16) conv1_f_k<f16, float><<<gr, 256>>>((const f16 *)x, w, b, y, xs.n, xs.c, cout, S, gp);
-            else if (ABF) conv1_f_k<bf16, float><<<gr, 256>>>((const bf16 *)x, w, b, y, xs.n, xs.c, cout, S, gp);
-            else conv1_f_k<float, float><<<gr, 256>>>(x, w, b, y, xs.n, xs.c, cout, S, gp); }
-        KCHECK();
-        return 0;
-    }
-    return -1;
-}
+                               const float *w, const float *b, int cout, int k, int stride, float *y, int G_out, float eps, float *omean, float *orstd);
 extern "C" int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, int up, shape5 xs,
-                                      const float *gy, shape5 ys, int k, int stride, float *gw, float *gb) {
-    if (!g_tf32) return -1;
-    gnp_t gp = to_gnp(gx);
-    if (k == 3 && stride == 1) {
-        split_t sp; if (xsplit(x2, gx, gx2, c_split, up, xs, &sp)) return -1;
-        if (up && !up_kernel_ok(x, x2, 1) && !mx_up_w_ok(x, x2, c_split, xs)) return -1;
-        if (up && gx && gx->G) return -1;   /* transformed up input is forward-only */
-        launch_bwd_w_tc(x, ABF, xs, gy, GBF, ys, gw, gb, gp, sp);
-        KCHECK();
-        return 0;
-    }
-    if (x2 || up) return -1;
-    if (k == 3 && stride == 2) {
-        exec_prec(2, ISMX(x) || eff_prec_w() == 2 || eff_prec_w() == 3 ? 2 : 1);
-        if (ISMX(x)) lp_bwd_w_s2_f8(x, MXDT(x), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(GBF), ys, gw, gb, gp);
-        else if (eff_prec_w() == 2 || eff_prec_w() == 3) lp_bwd_w_s2_f8(x, LPDT(ABF), xs, gy, LPDT(GBF), ys, gw, gb, gp);
-        else if (g_h16) bwd_w_s2_h<f16>(x, xs, gy, ys, gw, gb, gp); else bwd_w_s2_h<bf16>(x, xs, gy, ys, gw, gb, gp);
-        KCHECK();
-        return 0;
-    }
-    if (k == 1 && stride == 1) {
-        exec_prec(2, 0);
-        size_t So = shape_spatial(ys);
-        if (ISMX(x)) lp_bwd_w1_mx(x, MXDT(x), xs, gy, LPDT(GBF), ys, gw, gp);
-        else if (xs.c * ys.c <= 64 && ys.c <= 8) { if (g_h16) bwd_w1_h<f16>(x, xs, gy, ys, gw, So, gp); else bwd_w1_h<bf16>(x, xs, gy, ys, gw, So, gp); }
-        else return -1;
-        if (gb) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So); }
-        KCHECK();
-        return 0;
-    }
-    return -1;
-}
+                                      const float *gy, shape5 ys, int k, int stride, float *gw, float *gb);
 
 /* gx = gy * silu'(g) with g = gn(x) recomputed from the saved statistics (no materialized g) */
 template <typename TI>
@@ -2187,14 +1673,7 @@ __global__ void silu_bwd_gn_k(const TI *x, const float *gamma, const float *beta
     float s = 1.f / (1.f + expf(-v));
     gx[i] = gy[i] * (s * (1.f + v * (1.f - s)));
 }
-extern "C" void nn_silu_bwd_gn(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy, float *gx) {
-    if (G > s.c) G = s.c;
-    size_t n = shape_numel(s);
-    if (ABF && g_h16) silu_bwd_gn_k<f16><<<nblk(n, 256), 256>>>((const f16 *)x, gamma, beta, mean, rstd, gy, gx, s.n, s.c, G, shape_spatial(s));
-    else if (ABF) silu_bwd_gn_k<bf16><<<nblk(n, 256), 256>>>((const bf16 *)x, gamma, beta, mean, rstd, gy, gx, s.n, s.c, G, shape_spatial(s));
-    else silu_bwd_gn_k<float><<<nblk(n, 256), 256>>>(x, gamma, beta, mean, rstd, gy, gx, s.n, s.c, G, shape_spatial(s));
-    KCHECK();
-}
+extern "C" void nn_silu_bwd_gn(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy, float *gx);
 
 
 /* ---- fused backward through silu(gn(x)): given gy = dL/d silu, produce gx = dL/dx and the gamma/beta grads.
@@ -2229,25 +1708,12 @@ __global__ void gn_silu_bwd_stats_k(const TI *x, const TG *gy, const float *gamm
     for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) { r1[threadIdx.x] += r1[threadIdx.x + o]; r2[threadIdx.x] += r2[threadIdx.x + o]; } __syncthreads(); }
     if (threadIdx.x == 0) { atomicAdd(&ds[2 * nc], r1[0]); atomicAdd(&ds[2 * nc + 1], r2[0]); }
 }
-__global__ void gn_group_sums_k(const float *st, const float *gamma, int N, int C, int G, float *AB, float f = 1.f) {   /* AB[2*ng] = f sum st*gamma, AB[2*ng+1] = f sum st2*gamma */
-    int ng = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ng >= N * G) return;
-    int n = ng / G, g = ng % G, cpg = C / G;
-    float A = 0.f, B = 0.f;
-    for (int cc = g * cpg; cc < (g + 1) * cpg; cc++) { A += st[2 * (n * C + cc)] * gamma[cc]; B += st[2 * (n * C + cc) + 1] * gamma[cc]; }
-    AB[2 * ng] = A * f; AB[2 * ng + 1] = B * f;
-}
+__global__ void gn_group_sums_k(const float *st, const float *gamma, int N, int C, int G, float *AB, float f = 1.f);
 /* spatial split: the per-(n, c) backward sums ds (2 NC doubles) of this GPU give its share of the GroupNorm parameter
    gradients (summed across GPUs with the weight gradients), then are summed across the GPUs for the group sums AB, which the
    apply kernels divide by their local element count: f rescales them to the whole window's count */
 __global__ void gn_param_grad_k2(const float *st, float *ggamma, float *gbeta, int N, int C);
-static float gn_bwd_reduce(double *ds, float *st, int NC, int D, float *ggamma, float *gbeta, int N, int C) {
-    if (!zs_on()) return 1.f;
-    gn_param_grad_k2<<<nblk(C, 128), 128>>>(st, ggamma, gbeta, N, C);
-    zs_reduce(ds, 2 * NC);
-    d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, st, 2 * NC);
-    return (float)D / (float)zs_len((size_t)D, D);
-}
+float gn_bwd_reduce(double *ds, float *st, int NC, int D, float *ggamma, float *gbeta, int N, int C);
 template <typename TI, typename TG, typename TO>
 __global__ void gn_silu_bwd_apply_k(const TI *x, const TG *gy, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *AB,
                                     TO *gx, int C, int G, size_t S) {
@@ -2296,30 +1762,7 @@ static void gn_silu_bwd_t(const TI *x, shape5 s, int G, const float *gamma, cons
     KCHECK();
 }
 extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy,
-                               float *gx, float *ggamma, float *gbeta, float *scratch) {
-    if (G > s.c) G = s.c;
-    if (ISMX(x)) {   /* MX x: voxel-major passes; gradients keep their storage */
-        int NC = s.n * s.c;
-        double *ds = gn_dsums((size_t)2 * NC);
-        float *AB = scratch + 2 * NC;
-        const int gdt = ISMX(gy) ? MXDT(gy) : LPDT(GBF), xdt = MXDT(x);
-        if (gdt != (ISMX(gx) ? MXDT(gx) : LPDT(GBF)) || gdt == 4) { fprintf(stderr, "gn_silu_bwd: gy and gx must share the storage (MX-fp8 or 16-bit; never fp4)\n"); abort(); }
-        lp_gn_silu_bwd_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, ds, scratch, AB);
-        d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
-        const int zsp = zs_on();
-        const float f = gn_bwd_reduce(ds, scratch, NC, s.d, ggamma, gbeta, s.n, s.c);
-        gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, f);
-        lp_gn_silu_bwd_apply_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, AB);
-        if (!zsp) gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
-        KCHECK();
-        return;
-    }
-    if (GBF && g_h16) gn_silu_bwd_t<f16, f16, f16>((const f16 *)x, s, G, gamma, beta, mean, rstd, (const f16 *)gy, (f16 *)gx, ggamma, gbeta, scratch);
-    else if (GBF) gn_silu_bwd_t<bf16, bf16, bf16>((const bf16 *)x, s, G, gamma, beta, mean, rstd, (const bf16 *)gy, (bf16 *)gx, ggamma, gbeta, scratch);
-    else if (ABF && g_h16) gn_silu_bwd_t<f16, float, float>((const f16 *)x, s, G, gamma, beta, mean, rstd, gy, gx, ggamma, gbeta, scratch);
-    else if (ABF) gn_silu_bwd_t<bf16, float, float>((const bf16 *)x, s, G, gamma, beta, mean, rstd, gy, gx, ggamma, gbeta, scratch);
-    else gn_silu_bwd_t<float, float, float>(x, s, G, gamma, beta, mean, rstd, gy, gx, ggamma, gbeta, scratch);
-}
+                               float *gx, float *ggamma, float *gbeta, float *scratch);
 
 /* ================= GroupNorm =================
    Statistics are reduced by (n*G) x KSLAB blocks accumulating into double sums with atomics, then finalized. */
@@ -2338,19 +1781,8 @@ __global__ void gn_sums_k(const T *x, int C, int G, size_t S, double *sums, size
     for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) { r1[threadIdx.x] += r1[threadIdx.x + o]; r2[threadIdx.x] += r2[threadIdx.x + o]; } __syncthreads(); }
     if (threadIdx.x == 0) { atomicAdd(&sums[2 * ng], r1[0]); atomicAdd(&sums[2 * ng + 1], r2[0]); }
 }
-__global__ void gn_finalize_k(const double *sums, int NG, size_t len, float eps, float *mean, float *rstd) {
-    int ng = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ng >= NG) return;
-    double m = sums[2 * ng] / (double)len, v = sums[2 * ng + 1] / (double)len - m * m;
-    mean[ng] = (float)m;
-    rstd[ng] = (float)(1.0 / sqrt((v > 0 ? v : 0) + (double)eps));
-}
-static double *gn_dsums(size_t n) {   /* small persistent device scratch for the double sums, per device */
-    static double *buf[8]; static size_t cap[8];
-    int d = cur_dev();
-    if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); cudaMalloc(&buf[d], n * sizeof(double)); cap[d] = n; }
-    return buf[d];
-}
+__global__ void gn_finalize_k(const double *sums, int NG, size_t len, float eps, float *mean, float *rstd);
+double *gn_dsums(size_t n);
 
 template <int SILU, typename TI, typename TO>
 __global__ void gn_apply_k(const TI *x, const float *gamma, const float *beta, const float *mean, const float *rstd, TO *y, int C, int G, size_t S) {
@@ -2370,195 +1802,54 @@ __global__ void gn_apply_k(const TI *x, const float *gamma, const float *beta, c
     }
 }
 
-extern "C" void nn_gn_fwd(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd) {
-    if (G > s.c) G = s.c;
-    size_t S = shape_spatial(s);
-    int NG = s.n * G;
-    double *sums = gn_dsums((size_t)2 * NG);
-    cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double));
-    gn_sums_k<<<dim3(NG, KSLAB), 256>>>(x, s.c, G, S, sums);
-    gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, (size_t)(s.c / G) * S, eps, mean, rstd);
-    size_t n = shape_numel(s);
-    if (y) gn_apply_k<0, float, float><<<dim3(s.n * s.c, KSLAB), 256>>>(x, gamma, beta, mean, rstd, y, s.c, G, S);   /* y == nullptr: statistics only */
-    KCHECK();
-}
+extern "C" void nn_gn_fwd(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd);
 /* GroupNorm statistics of a tensor in activation storage (16-bit, fp32 or MX-fp8) */
-extern "C" int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *mean, float *rstd) {
-    if (G > s.c) G = s.c;
-    size_t S = shape_spatial(s);
-    int NG = s.n * G;
-    double *sums = gn_dsums((size_t)2 * NG);
-    cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double));
-    int zlo, zhi; zs_range(s.d, &zlo, &zhi);
-    const size_t v0 = (size_t)zlo * s.h * s.w, v1 = (size_t)(s.d - zhi) * s.h * s.w;
-    if (ISMX(x)) {   /* MX storage: statistics of the dequantised values */
-        if (lp_gn_sums_mx(x, MXDT(x), s.n, s.c, G, S, sums, v0, v1)) return -1;
-        zs_reduce(sums, 2 * NG);
-        gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zs_len((size_t)(s.c / G) * S, s.d), eps, mean, rstd);
-        KCHECK();
-        return 0;
-    }
-    if (ABF && g_h16) gn_sums_k<f16><<<dim3(NG, KSLAB), 256>>>((const f16 *)x, s.c, G, S, sums, v0, v1);
-    else if (ABF) gn_sums_k<bf16><<<dim3(NG, KSLAB), 256>>>((const bf16 *)x, s.c, G, S, sums, v0, v1);
-    else gn_sums_k<float><<<dim3(NG, KSLAB), 256>>>(x, s.c, G, S, sums, v0, v1);
-    zs_reduce(sums, 2 * NG);
-    gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zs_len((size_t)(s.c / G) * S, s.d), eps, mean, rstd);
-    KCHECK();
-    return 0;
-}
-extern "C" void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd) {
-    if (G > s.c) G = s.c;
-    size_t S = shape_spatial(s);
-    int NG = s.n * G;
-    double *sums = gn_dsums((size_t)2 * NG);
-    cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double));
-    gn_sums_k<<<dim3(NG, KSLAB), 256>>>(x, s.c, G, S, sums);
-    gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, (size_t)(s.c / G) * S, eps, mean, rstd);
-    size_t n = shape_numel(s);
-    gn_apply_k<1, float, float><<<dim3(s.n * s.c, KSLAB), 256>>>(x, gamma, beta, mean, rstd, y, s.c, G, S);
-    KCHECK();
-}
-extern "C" void nn_gn_apply_silu(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *g, float *sil) {
-    if (G > s.c) G = s.c;
-    size_t n = shape_numel(s), S = shape_spatial(s);
-    gn_apply_k<0, float, float><<<dim3(s.n * s.c, KSLAB), 256>>>(x, gamma, beta, mean, rstd, g, s.c, G, S);
-    silu_f_k<<<nblk(n, 256), 256>>>(g, sil, n);
-    KCHECK();
-}
+extern "C" int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *mean, float *rstd);
+extern "C" void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd);
+extern "C" void nn_gn_apply_silu(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *g, float *sil);
 
 /* per (n,c): sum gy, sum gy*xhat -> dsums[2*(n*C+c)] (double, atomics over slabs), then copied to st (float) */
-__global__ void gn_bwd_stats_k(const float *x, const float *gy, const float *mean, const float *rstd, int C, int G, size_t S, double *ds) {
-    int nc = blockIdx.x, slab = blockIdx.y, n = nc / C, c = nc % C, cpg = C / G, ng = n * G + c / cpg;
-    const float *xp = x + (size_t)nc * S, *gp = gy + (size_t)nc * S;
-    float m = mean[ng], r = rstd[ng];
-    size_t per = (S + KSLAB - 1) / KSLAB, lo = (size_t)slab * per, hi = lo + per < S ? lo + per : S;
-    double s1 = 0, s2 = 0;
-    for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) { double g = gp[i]; s1 += g; s2 += g * ((xp[i] - m) * r); }
-    __shared__ double r1[256], r2[256];
-    r1[threadIdx.x] = s1; r2[threadIdx.x] = s2;
-    __syncthreads();
-    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) { r1[threadIdx.x] += r1[threadIdx.x + o]; r2[threadIdx.x] += r2[threadIdx.x + o]; } __syncthreads(); }
-    if (threadIdx.x == 0) { atomicAdd(&ds[2 * nc], r1[0]); atomicAdd(&ds[2 * nc + 1], r2[0]); }
-}
-__global__ void d2f_k(const double *d, float *f, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) f[i] = (float)d[i]; }
+__global__ void gn_bwd_stats_k(const float *x, const float *gy, const float *mean, const float *rstd, int C, int G, size_t S, double *ds);
+__global__ void d2f_k(const double *d, float *f, int n);
 
 __global__ void gn_bwd_apply_k(const float *x, const float *gy, const float *gamma, const float *mean, const float *rstd, const float *st,
-                               float *gx, int N, int C, int G, size_t S) {
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)N * C * S) return;
-    int c = (int)((i / S) % C), n = (int)(i / (S * C)), cpg = C / G, g = c / cpg, ng = n * G + g;
-    /* group sums of gxhat = gy*gamma and gxhat*xhat */
-    float a = 0.f, b = 0.f;
-    for (int cc = g * cpg; cc < (g + 1) * cpg; cc++) { a += st[2 * (n * C + cc)] * gamma[cc]; b += st[2 * (n * C + cc) + 1] * gamma[cc]; }
-    float len = (float)cpg * (float)S;
-    float xhat = (x[i] - mean[ng]) * rstd[ng];
-    float gxhat = gy[i] * gamma[c];
-    gx[i] = rstd[ng] * (gxhat - a / len - xhat * b / len);
-}
+                               float *gx, int N, int C, int G, size_t S);
 
-__global__ void gn_param_grad_k2(const float *st, float *ggamma, float *gbeta, int N, int C) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= C) return;
-    float sg = 0.f, sb = 0.f;
-    for (int n = 0; n < N; n++) { sb += st[2 * (n * C + c)]; sg += st[2 * (n * C + c) + 1]; }
-    ggamma[c] += sg;
-    gbeta[c] += sb;
-}
-__global__ void gn_param_grad_k(const float *st, float *ggamma, float *gbeta, int N, int C) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= C) return;
-    float sg = 0.f, sb = 0.f;
-    for (int n = 0; n < N; n++) { sb += st[2 * (n * C + c)]; sg += st[2 * (n * C + c) + 1]; }
-    ggamma[c] += sg;
-    gbeta[c] += sb;
-}
+__global__ void gn_param_grad_k2(const float *st, float *ggamma, float *gbeta, int N, int C);
+__global__ void gn_param_grad_k(const float *st, float *ggamma, float *gbeta, int N, int C);
 
-extern "C" size_t nn_gn_scratch(shape5 s) { return (size_t)4 * s.n * s.c * sizeof(float); }
-extern "C" void nn_gn_apply(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *y) {
-    if (G > s.c) G = s.c;
-    size_t n = shape_numel(s);
-    gn_apply_k<0, float, float><<<dim3(s.n * s.c, KSLAB), 256>>>(x, gamma, beta, mean, rstd, y, s.c, G, shape_spatial(s));
-    KCHECK();
-}
+extern "C" size_t nn_gn_scratch(shape5 s);
+extern "C" void nn_gn_apply(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *y);
 
 extern "C" void nn_gn_bwd(const float *x, shape5 s, int G, const float *gamma, const float *mean, const float *rstd, const float *gy,
-                          float *gx, float *ggamma, float *gbeta, float *scratch) {
-    if (G > s.c) G = s.c;
-    size_t S = shape_spatial(s);
-    int NC = s.n * s.c;
-    double *ds = gn_dsums((size_t)2 * NC);
-    cudaMemsetAsync(ds, 0, (size_t)2 * NC * sizeof(double));
-    gn_bwd_stats_k<<<dim3(NC, KSLAB), 256>>>(x, gy, mean, rstd, s.c, G, S, ds);
-    d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
-    size_t n = shape_numel(s);
-    gn_bwd_apply_k<<<nblk(n, 256), 256>>>(x, gy, gamma, mean, rstd, scratch, gx, s.n, s.c, G, S);
-    gn_param_grad_k<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
-    KCHECK();
-}
+                          float *gx, float *ggamma, float *gbeta, float *scratch);
 
 /* ================= elementwise ================= */
-__global__ void silu_f_k(const float *x, float *y, size_t n) {
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i < n) { float v = x[i]; y[i] = v / (1.f + expf(-v)); }
-}
-__global__ void silu_b_k(const float *x, const float *gy, float *gx, size_t n) {
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i < n) { float v = x[i], s = 1.f / (1.f + expf(-v)); gx[i] = gy[i] * (s * (1.f + v * (1.f - s))); }
-}
-__global__ void axpy_k(float *y, float a, const float *x, size_t n) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) y[i] += a * x[i]; }
-__global__ void scale_k(float *y, float a, size_t n) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) y[i] *= a; }
-__global__ void u8f_k(const uint8_t *x, float s, float *y, size_t n) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) y[i] = x[i] * s; }
-__global__ void sigm_k(const float *x, float *y, size_t n) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) y[i] = 1.f / (1.f + expf(-x[i])); }
+__global__ void silu_f_k(const float *x, float *y, size_t n);
+__global__ void silu_b_k(const float *x, const float *gy, float *gx, size_t n);
+__global__ void axpy_k(float *y, float a, const float *x, size_t n);
+__global__ void scale_k(float *y, float a, size_t n);
+__global__ void u8f_k(const uint8_t *x, float s, float *y, size_t n);
+__global__ void sigm_k(const float *x, float *y, size_t n);
 
-extern "C" void nn_silu_fwd(const float *x, size_t n, float *y) { silu_f_k<<<nblk(n, 256), 256>>>(x, y, n); KCHECK(); }
-extern "C" void nn_silu_bwd(const float *x, const float *gy, size_t n, float *gx) { silu_b_k<<<nblk(n, 256), 256>>>(x, gy, gx, n); KCHECK(); }
-extern "C" void nn_axpy(float *y, float a, const float *x, size_t n) { axpy_k<<<nblk(n, 256), 256>>>(y, a, x, n); KCHECK(); }
-extern "C" void nn_scale(float *y, float a, size_t n) { scale_k<<<nblk(n, 256), 256>>>(y, a, n); KCHECK(); }
-extern "C" void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y) { u8f_k<<<nblk(n, 256), 256>>>(x, scale, y, n); KCHECK(); }
+extern "C" void nn_silu_fwd(const float *x, size_t n, float *y);
+extern "C" void nn_silu_bwd(const float *x, const float *gy, size_t n, float *gx);
+extern "C" void nn_axpy(float *y, float a, const float *x, size_t n);
+extern "C" void nn_scale(float *y, float a, size_t n);
+extern "C" void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y);
 template <typename HT> __global__ void f2h_k(const float *x, HT *y, size_t n, float scale) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) y[i] = f2h<HT>(x[i] * scale); }
 /* fp32 -> the current 16-bit storage type (bf16, or fp16 with nn_set_f16), optionally scaled */
-extern "C" void nn_f32_to_h16(const float *x, size_t n, void *y, float scale) { if (g_h16) f2h_k<f16><<<nblk(n, 256), 256>>>(x, (f16 *)y, n, scale); else f2h_k<bf16><<<nblk(n, 256), 256>>>(x, (bf16 *)y, n, scale); KCHECK(); }
-extern "C" void nn_f32_to_bf16(const float *x, size_t n, void *y) { nn_f32_to_h16(x, n, y, 1.f); }
+extern "C" void nn_f32_to_h16(const float *x, size_t n, void *y, float scale);
+extern "C" void nn_f32_to_bf16(const float *x, size_t n, void *y);
 /* network input -> activation storage (16-bit, or MX-fp8 when y is registered MX) */
 /* a 16-bit tensor (the storage type of nn_set_f16) into an MX-registered tensor */
-extern "C" void nn_h16_to_mx(const void *x, shape5 s, void *y) {
-    if (ISMX4(y)) lp_h16_to_mx4(x, g_h16 ? 2 : 1, s.n, s.c, shape_spatial(s), y); else lp_h16_to_mx8(x, g_h16 ? 2 : 1, s.n, s.c, shape_spatial(s), y);
-    KCHECK();
-}
-extern "C" void nn_f32_to_act(const float *x, shape5 s, void *y) {
-    if (ISMX4(y)) { lp_f32_to_mx4(x, s.n, s.c, shape_spatial(s), y); KCHECK(); return; }
-    if (ISMX(y)) { lp_f32_to_mx8(x, s.n, s.c, shape_spatial(s), y); KCHECK(); return; }
-    nn_f32_to_h16(x, shape_numel(s), y, 1.f);
-}
+extern "C" void nn_h16_to_mx(const void *x, shape5 s, void *y);
+extern "C" void nn_f32_to_act(const float *x, shape5 s, void *y);
 /* 2:4 structured sparsity along the input channels of a [co][ci][taps] weight: in every group of 4 consecutive ci (same co, tap)
    only the two largest |w| survive. mask24: out = masked w (out may alias w). srste24: g = g (kept) + lambda * w (pruned):
    the sparse-refined straight-through estimator (pruned weights get a decaying pull so they can be revisited). */
-__global__ void mask24_k(const float *w, float *out, int Co, int Ci, int T) {
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x, ng = (size_t)Co * (Ci / 4) * T;
-    if (i >= ng) return;
-    int t = (int)(i % T), g4 = (int)((i / T) % (Ci / 4)), co = (int)(i / ((size_t)T * (Ci / 4)));
-    size_t base = ((size_t)co * Ci + 4 * g4) * T + t;
-    float v[4], a[4];
-#pragma unroll
-    for (int j = 0; j < 4; j++) { v[j] = w[base + (size_t)j * T]; a[j] = fabsf(v[j]); }
-    int i0 = 0; for (int j = 1; j < 4; j++) if (a[j] > a[i0]) i0 = j;
-    int i1 = -1; for (int j = 0; j < 4; j++) if (j != i0 && (i1 < 0 || a[j] > a[i1])) i1 = j;
-#pragma unroll
-    for (int j = 0; j < 4; j++) out[base + (size_t)j * T] = (j == i0 || j == i1) ? v[j] : 0.f;
-}
-__global__ void srste24_k(float *g, const float *w, int Co, int Ci, int T, float lambda) {
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x, ng = (size_t)Co * (Ci / 4) * T;
-    if (i >= ng) return;
-    int t = (int)(i % T), g4 = (int)((i / T) % (Ci / 4)), co = (int)(i / ((size_t)T * (Ci / 4)));
-    size_t base = ((size_t)co * Ci + 4 * g4) * T + t;
-    float a[4];
-#pragma unroll
-    for (int j = 0; j < 4; j++) a[j] = fabsf(w[base + (size_t)j * T]);
-    int i0 = 0; for (int j = 1; j < 4; j++) if (a[j] > a[i0]) i0 = j;
-    int i1 = -1; for (int j = 0; j < 4; j++) if (j != i0 && (i1 < 0 || a[j] > a[i1])) i1 = j;
-#pragma unroll
-    for (int j = 0; j < 4; j++) if (j != i0 && j != i1) g[base + (size_t)j * T] += lambda * w[base + (size_t)j * T];
-}
+__global__ void mask24_k(const float *w, float *out, int Co, int Ci, int T);
+__global__ void srste24_k(float *g, const float *w, int Co, int Ci, int T, float lambda);
 /* Weights kept on an fp8 (e4m3) or fp4 (e2m1) grid with MX block scaling (one power-of-two scale per 32 input channels
    of a (co, tap)): the master array holds the dequantized values, so the forward's quantization is exact and the model
    is a true fp8/fp4 model. Stochastic rounding keeps the expected update unbiased (round-to-nearest would discard
@@ -2568,28 +1859,7 @@ __device__ __forceinline__ float grid_spacing(float a, int bits) {   /* a = |x| 
     else { if (a < 1.f) return 0.5f; int e; frexpf(a, &e); return ldexpf(1.f, e - 1 - 1); }                           /* e2m1: 1 mantissa bit, subnormal step 0.5 */
 }
 __device__ __forceinline__ unsigned hash32(unsigned x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
-__global__ void wquant_k(float *w, int Co, int Ci, int T, int bits, unsigned seed) {
-    size_t nb = (size_t)Co * ((Ci + 31) / 32) * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= nb) return;
-    int t = (int)(i % T), blk = (int)((i / T) % ((Ci + 31) / 32)), co = (int)(i / ((size_t)T * ((Ci + 31) / 32)));
-    int c0 = blk * 32, c1 = c0 + 32 < Ci ? c0 + 32 : Ci;
-    const float qmax = bits == 8 ? 448.f : 6.f;
-    float amax = 0.f;
-    for (int c = c0; c < c1; c++) amax = fmaxf(amax, fabsf(w[((size_t)co * Ci + c) * T + t]));
-    if (amax == 0.f) return;
-    int e = (int)ceilf(log2f(amax / qmax));
-    float scale = ldexpf(1.f, e), inv = ldexpf(1.f, -e);
-    for (int c = c0; c < c1; c++) {
-        size_t k = ((size_t)co * Ci + c) * T + t;
-        float x = w[k], a = fabsf(x) * inv;
-        if (a > qmax) a = qmax;
-        float sp = grid_spacing(a, bits), lo = floorf(a / sp) * sp, hi = lo + sp;
-        if (hi > qmax) hi = qmax;
-        float u = (float)(hash32((unsigned)k * 2654435761u ^ seed) & 0xffffff) * (1.f / 16777216.f);
-        float q = (u < (a - lo) / sp) ? hi : lo;
-        w[k] = copysignf(q * scale, x);
-    }
-}
+__global__ void wquant_k(float *w, int Co, int Ci, int T, int bits, unsigned seed);
 /* ---- packed storage: one byte (e4m3) or one nibble (e2m1, low nibble first) per weight, plus one ue8m0 scale byte per block of
    32 input channels of a (co, tap). Element k = (co * Ci + ci) * T + t has block index ((co * nblk + ci / 32) * T + t). ---- */
 __device__ __forceinline__ float sr_quant(float a, int bits, float qmax, unsigned rnd) {   /* a >= 0 on the unit grid, stochastic rounding */
@@ -2635,117 +1905,26 @@ __device__ __forceinline__ void res_write(unsigned char *r, unsigned char *rsc, 
     for (int j = 0; j < cn; j++) r[ks[j]] = enc_e4m3(res[j] * inv);
 }
 /* block-wise kernels: one thread per (co, block of 32 ci, tap) */
-__global__ void wq_pack_k(const float *w, unsigned char *q, unsigned char *sc, int Co, int Ci, int T, int bits, unsigned seed) {
-    int nblk = (Ci + 31) / 32; size_t nb = (size_t)Co * nblk * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= nb) return;
-    int t = (int)(i % T), blk = (int)((i / T) % nblk), co = (int)(i / ((size_t)T * nblk)), c0 = blk * 32, c1 = c0 + 32 < Ci ? c0 + 32 : Ci;
-    const float qmax = bits == 8 ? 448.f : 6.f;
-    float amax = 0.f;
-    for (int c = c0; c < c1; c++) amax = fmaxf(amax, fabsf(w[((size_t)co * Ci + c) * T + t]));
-    int e = amax > 0.f ? (int)ceilf(log2f(amax / qmax)) : -40; if (e < -40) e = -40; if (e > 60) e = 60;   /* clamp: keeps 1/scale finite; values below 2^-40 flush to 0 */
-    sc[i] = (unsigned char)(e + 127);
-    float inv = ldexpf(1.f, -e);
-    for (int c = c0; c < c1; c++) {
-        size_t k = ((size_t)co * Ci + c) * T + t; float x = w[k];
-        float qv = seed ? sr_quant(fabsf(x) * inv, bits, qmax, hash32((unsigned)k * 2654435761u ^ seed)) : fminf(fabsf(x) * inv, qmax);
-        if (!seed) { float sp = grid_spacing(qv, bits); qv = rintf(qv / sp) * sp; }
-        wq_put(q, wq_sidx(bits, k, i, c - c0), bits, copysignf(qv, x));
-    }
-}
-__global__ void wq_unpack_k(const unsigned char *q, const unsigned char *sc, float *w, int Co, int Ci, int T, int bits) {
-    int nblk = (Ci + 31) / 32; size_t n = (size_t)Co * Ci * T, k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (k >= n) return;
-    int t = (int)(k % T), ci = (int)((k / T) % Ci), co = (int)(k / ((size_t)T * Ci));
-    size_t b = ((size_t)co * nblk + ci / 32) * T + t;
-    w[k] = wq_get(q, wq_sidx(bits, k, b, ci % 32), bits) * ldexpf(1.f, (int)sc[b] - 127);
-}
+__global__ void wq_pack_k(const float *w, unsigned char *q, unsigned char *sc, int Co, int Ci, int T, int bits, unsigned seed);
+__global__ void wq_unpack_k(const unsigned char *q, const unsigned char *sc, float *w, int Co, int Ci, int T, int bits);
 /* AdamW directly on the packed weights: dequantize the block, update in fp32 (m, v stay fp32), rescale, requantize stochastically */
 __global__ void wq_adamw_k(unsigned char *q, unsigned char *sc, unsigned char *r, unsigned char *rsc, const float *g, float *m, float *v, int Co, int Ci, int T, int bits,
-                           float lr, float b1, float b2, float eps, float wd, float c1, float c2, unsigned seed) {
-    int nblk = (Ci + 31) / 32; size_t nb = (size_t)Co * nblk * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= nb) return;
-    int t = (int)(i % T), blk = (int)((i / T) % nblk), co = (int)(i / ((size_t)T * nblk)), c0 = blk * 32, cn = c0 + 32 < Ci ? c0 + 32 : Ci;
-    const float qmax = bits == 8 ? 448.f : 6.f;
-    float scale = ldexpf(1.f, (int)sc[i] - 127), nw[32], amax = 0.f, rs = r ? ldexpf(1.f, (int)rsc[i] - 127) : 0.f;
-    for (int c = c0; c < cn; c++) {
-        size_t k = ((size_t)co * Ci + c) * T + t;
-        float x = wq_get(q, wq_sidx(bits, k, i, c - c0), bits) * scale + (r ? dec_e4m3(r[k]) * rs : 0.f), gi = g[k];
-        float mi = m[k] = b1 * m[k] + (1.f - b1) * gi, vi = v[k] = b2 * v[k] + (1.f - b2) * gi * gi;
-        x -= lr * ((mi / c1) / (sqrtf(vi / c2) + eps) + wd * x);
-        nw[c - c0] = x; amax = fmaxf(amax, fabsf(x));
-    }
-    int e = amax > 0.f ? (int)ceilf(log2f(amax / qmax)) : -40; if (e < -40) e = -40; if (e > 60) e = 60;   /* clamp: keeps 1/scale finite; values below 2^-40 flush to 0 */
-    sc[i] = (unsigned char)(e + 127);
-    float inv = ldexpf(1.f, -e);
-    if (r) {   /* round to nearest on the fp4 grid, residual carries the rest */
-        float res[32]; size_t ks[32];
-        for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = nw[c - c0], a = fminf(fabsf(x) * inv, qmax), sp = grid_spacing(a, bits), qv = rintf(a / sp) * sp; if (qv > qmax) qv = qmax; wq_put(q, wq_sidx(bits, k, i, c - c0), bits, copysignf(qv, x)); res[c - c0] = x - copysignf(qv, x) * ldexpf(1.f, e); ks[c - c0] = k; }
-        res_write(r, rsc, i, res, cn - c0, ks);
-        return;
-    }
-    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = nw[c - c0]; wq_put(q, wq_sidx(bits, k, i, c - c0), bits, copysignf(sr_quant(fabsf(x) * inv, bits, qmax, hash32((unsigned)k * 2654435761u ^ seed)), x)); }
-}
+                           float lr, float b1, float b2, float eps, float wd, float c1, float c2, unsigned seed);
 /* EMA directly on packed weights: e = d e + (1 - d) p, both packed; result requantized stochastically */
-__global__ void wq_ema_k(unsigned char *qe, unsigned char *sce, unsigned char *re, unsigned char *rsce, const unsigned char *qp, const unsigned char *scp, const unsigned char *rp, const unsigned char *rscp, int Co, int Ci, int T, int bits, float d, unsigned seed) {
-    int nblk = (Ci + 31) / 32; size_t nb = (size_t)Co * nblk * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= nb) return;
-    int t = (int)(i % T), blk = (int)((i / T) % nblk), co = (int)(i / ((size_t)T * nblk)), c0 = blk * 32, cn = c0 + 32 < Ci ? c0 + 32 : Ci;
-    const float qmax = bits == 8 ? 448.f : 6.f;
-    float se = ldexpf(1.f, (int)sce[i] - 127), sp = ldexpf(1.f, (int)scp[i] - 127), nw[32], amax = 0.f;
-    float rse = re ? ldexpf(1.f, (int)rsce[i] - 127) : 0.f, rsp = rp ? ldexpf(1.f, (int)rscp[i] - 127) : 0.f;
-    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t, si = wq_sidx(bits, k, i, c - c0); float x = d * (wq_get(qe, si, bits) * se + (re ? dec_e4m3(re[k]) * rse : 0.f)) + (1.f - d) * (wq_get(qp, si, bits) * sp + (rp ? dec_e4m3(rp[k]) * rsp : 0.f)); nw[c - c0] = x; amax = fmaxf(amax, fabsf(x)); }
-    int e = amax > 0.f ? (int)ceilf(log2f(amax / qmax)) : -40; if (e < -40) e = -40; if (e > 60) e = 60;   /* clamp: keeps 1/scale finite; values below 2^-40 flush to 0 */
-    sce[i] = (unsigned char)(e + 127);
-    float inv = ldexpf(1.f, -e);
-    if (re) {
-        float res[32]; size_t ks[32];
-        for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = nw[c - c0], a = fminf(fabsf(x) * inv, qmax), spc = grid_spacing(a, bits), qv = rintf(a / spc) * spc; if (qv > qmax) qv = qmax; wq_put(qe, wq_sidx(bits, k, i, c - c0), bits, copysignf(qv, x)); res[c - c0] = x - copysignf(qv, x) * ldexpf(1.f, e); ks[c - c0] = k; }
-        res_write(re, rsce, i, res, cn - c0, ks);
-        return;
-    }
-    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; float x = nw[c - c0]; wq_put(qe, wq_sidx(bits, k, i, c - c0), bits, copysignf(sr_quant(fabsf(x) * inv, bits, qmax, hash32((unsigned)k * 2654435761u ^ seed)), x)); }
-}
-extern "C" size_t nn_wq_nblocks(int co, int ci, int taps) { return (size_t)co * ((ci + 31) / 32) * taps; }
-extern "C" size_t nn_wq_bytes(int co, int ci, int taps, int bits) { return bits == 8 ? (size_t)co * ci * taps : nn_wq_nblocks(co, ci, taps) * 16; }
-__global__ void wq_residual_k(const float *w, const unsigned char *q, const unsigned char *sc, unsigned char *r, unsigned char *rsc, int Co, int Ci, int T, int bits) {
-    int nblk = (Ci + 31) / 32; size_t nb = (size_t)Co * nblk * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= nb) return;
-    int t = (int)(i % T), blk = (int)((i / T) % nblk), co = (int)(i / ((size_t)T * nblk)), c0 = blk * 32, cn = c0 + 32 < Ci ? c0 + 32 : Ci;
-    float scale = ldexpf(1.f, (int)sc[i] - 127), res[32]; size_t ks[32];
-    for (int c = c0; c < cn; c++) { size_t k = ((size_t)co * Ci + c) * T + t; res[c - c0] = w[k] - wq_get(q, wq_sidx(bits, k, i, c - c0), bits) * scale; ks[c - c0] = k; }
-    res_write(r, rsc, i, res, cn - c0, ks);
-}
-extern "C" void nn_wq_pack(const float *w, void *q, void *sc, int co, int ci, int taps, int bits, unsigned seed) {
-    size_t nb = nn_wq_nblocks(co, ci, taps); wq_pack_k<<<nblk(nb, 128), 128>>>(w, (unsigned char *)q, (unsigned char *)sc, co, ci, taps, bits, seed); KCHECK();
-}
-extern "C" void nn_wq_residual(const float *w, const void *q, const void *sc, void *r, void *rsc, int co, int ci, int taps, int bits) {
-    size_t nb = nn_wq_nblocks(co, ci, taps); wq_residual_k<<<nblk(nb, 128), 128>>>(w, (const unsigned char *)q, (const unsigned char *)sc, (unsigned char *)r, (unsigned char *)rsc, co, ci, taps, bits); KCHECK();
-}
-extern "C" void nn_wq_unpack(const void *q, const void *sc, float *w, int co, int ci, int taps, int bits) {
-    size_t n = (size_t)co * ci * taps; wq_unpack_k<<<nblk(n, 256), 256>>>((const unsigned char *)q, (const unsigned char *)sc, w, co, ci, taps, bits); KCHECK();
-}
+__global__ void wq_ema_k(unsigned char *qe, unsigned char *sce, unsigned char *re, unsigned char *rsce, const unsigned char *qp, const unsigned char *scp, const unsigned char *rp, const unsigned char *rscp, int Co, int Ci, int T, int bits, float d, unsigned seed);
+extern "C" size_t nn_wq_nblocks(int co, int ci, int taps);
+extern "C" size_t nn_wq_bytes(int co, int ci, int taps, int bits);
+__global__ void wq_residual_k(const float *w, const unsigned char *q, const unsigned char *sc, unsigned char *r, unsigned char *rsc, int Co, int Ci, int T, int bits);
+extern "C" void nn_wq_pack(const float *w, void *q, void *sc, int co, int ci, int taps, int bits, unsigned seed);
+extern "C" void nn_wq_residual(const float *w, const void *q, const void *sc, void *r, void *rsc, int co, int ci, int taps, int bits);
+extern "C" void nn_wq_unpack(const void *q, const void *sc, float *w, int co, int ci, int taps, int bits);
 /* r / rsc: optional fp8 error-feedback residual (fp4 weights); nullptr = stochastic rounding without residual */
-extern "C" void nn_wq_adamw(void *q, void *sc, void *r, void *rsc, const float *g, float *m, float *v, int co, int ci, int taps, int bits, float lr, float b1, float b2, float eps, float wd, int step, unsigned seed) {
-    float c1 = 1.f - powf(b1, (float)step), c2 = 1.f - powf(b2, (float)step);
-    size_t nb = nn_wq_nblocks(co, ci, taps);
-    wq_adamw_k<<<nblk(nb, 128), 128>>>((unsigned char *)q, (unsigned char *)sc, (unsigned char *)r, (unsigned char *)rsc, g, m, v, co, ci, taps, bits, lr, b1, b2, eps, wd, c1, c2, seed); KCHECK();
-}
-extern "C" void nn_wq_ema(void *qe, void *sce, void *re, void *rsce, const void *qp, const void *scp, const void *rp, const void *rscp, int co, int ci, int taps, int bits, float decay, unsigned seed) {
-    size_t nb = nn_wq_nblocks(co, ci, taps);
-    wq_ema_k<<<nblk(nb, 128), 128>>>((unsigned char *)qe, (unsigned char *)sce, (unsigned char *)re, (unsigned char *)rsce, (const unsigned char *)qp, (const unsigned char *)scp, (const unsigned char *)rp, (const unsigned char *)rscp, co, ci, taps, bits, decay, seed); KCHECK();
-}
-extern "C" void nn_wquant(float *w, int co, int ci, int taps, int bits, unsigned seed) {
-    size_t nb = (size_t)co * ((ci + 31) / 32) * taps; wquant_k<<<nblk(nb, 128), 128>>>(w, co, ci, taps, bits, seed); KCHECK();
-}
-extern "C" void nn_mask24(const float *w, float *out, int co, int ci, int taps) {
-    if (ci % 4) { if (out != w) cudaMemcpyAsync(out, w, (size_t)co * ci * taps * 4, cudaMemcpyDeviceToDevice); return; }
-    size_t ng = (size_t)co * (ci / 4) * taps; mask24_k<<<nblk(ng, 256), 256>>>(w, out, co, ci, taps); KCHECK();
-}
-extern "C" void nn_srste24(float *g, const float *w, int co, int ci, int taps, float lambda) {
-    if (ci % 4) return;
-    size_t ng = (size_t)co * (ci / 4) * taps; srste24_k<<<nblk(ng, 256), 256>>>(g, w, co, ci, taps, lambda); KCHECK();
-}
-extern "C" void nn_sigmoid(const float *x, size_t n, float *y) { sigm_k<<<nblk(n, 256), 256>>>(x, y, n); KCHECK(); }
+extern "C" void nn_wq_adamw(void *q, void *sc, void *r, void *rsc, const float *g, float *m, float *v, int co, int ci, int taps, int bits, float lr, float b1, float b2, float eps, float wd, int step, unsigned seed);
+extern "C" void nn_wq_ema(void *qe, void *sce, void *re, void *rsce, const void *qp, const void *scp, const void *rp, const void *rscp, int co, int ci, int taps, int bits, float decay, unsigned seed);
+extern "C" void nn_wquant(float *w, int co, int ci, int taps, int bits, unsigned seed);
+extern "C" void nn_mask24(const float *w, float *out, int co, int ci, int taps);
+extern "C" void nn_srste24(float *g, const float *w, int co, int ci, int taps, float lambda);
+extern "C" void nn_sigmoid(const float *x, size_t n, float *y);
 /* inference input straight from the uint8 CT window: channel 0 = (ct - mean) * isd, 1 = 0, 2/3 = unit radial (y, x) vector
    from the scroll axis (dyo[z] = window y origin - axis y at slice z, likewise dxo); written as the 16-bit storage type
    (h16: fp16 with nn_set_f16, else bf16) or fp32. Output: recto probability * 255 where the CT is nonzero, else 0. */
@@ -2756,58 +1935,16 @@ template <typename HT> __global__ void pred_in_k(const uint8_t *ct, int W, float
     float dy = dyo[z] + (float)y, dx = dxo[z] + (float)xx, inv = axis ? 1.f / (sqrtf(dy * dy + dx * dx) + 1e-6f) : 0.f;
     x[i] = f2h<HT>(((float)ct[i] - mean) * isd); x[w3 + i] = f2h<HT>(0.f); x[2 * w3 + i] = f2h<HT>(dy * inv); x[3 * w3 + i] = f2h<HT>(dx * inv);
 }
-extern "C" void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16) {
-    size_t n = (size_t)W * W * W;
-    if (!h16) pred_in_k<float><<<nblk(n, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, (float *)x);
-    else if (g_h16) pred_in_k<f16><<<nblk(n, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, (f16 *)x);
-    else pred_in_k<bf16><<<nblk(n, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, (bf16 *)x);
-    KCHECK();
-}
-__global__ void pred_out_k(const float *lg, const uint8_t *ct, size_t n, uint8_t *out) {
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i < n) out[i] = ct[i] ? (uint8_t)(255.f / (1.f + __expf(-lg[i])) + 0.5f) : 0;
-}
-extern "C" void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out) { pred_out_k<<<nblk(n, 256), 256>>>(lg, ct, n, out); KCHECK(); }
+extern "C" void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16);
+__global__ void pred_out_k(const float *lg, const uint8_t *ct, size_t n, uint8_t *out);
+extern "C" void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out);
 /* the probability of the window's interior (halo .. W - halo) written straight into a device shard buffer (shard^3, x fastest):
    window voxel (z, y, x) lands at shard voxel (oz + z, oy + y, ox + x) when inside [0, e) (o = window origin - shard origin) */
-__global__ void pred_place_k(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
-    const int I = W - 2 * halo;
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)I * I * I) return;
-    const int x = halo + (int)(i % I), y = halo + (int)((i / I) % I), z = halo + (int)(i / ((size_t)I * I));
-    const int gz = oz + z, gy = oy + y, gx = ox + x;
-    if (gz < 0 || gz >= ez || gy < 0 || gy >= ey || gx < 0 || gx >= ex) return;
-    const size_t k = ((size_t)z * W + y) * W + x;
-    dsh[((size_t)gz * shard + gy) * shard + gx] = ct[k] ? (uint8_t)(255.f / (1.f + __expf(-lg[k])) + 0.5f) : 0;
-}
-extern "C" void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
-    const size_t I = (size_t)(W - 2 * halo);
-    pred_place_k<<<nblk(I * I * I, 256), 256>>>(lg, ct, W, halo, oz, oy, ox, ez, ey, ex, shard, dsh); KCHECK();
-}
+__global__ void pred_place_k(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
+extern "C" void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 /* exact window statistics (nonzero count, sum, sum of squares) of a uint8 window: integer sums, as the host loop computed */
-__global__ void pred_stats_k(const uint8_t *ct, size_t n, unsigned long long *acc) {
-    unsigned long long nz = 0, sm = 0, sq = 0;
-    for (size_t i = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) * 16; i < n; i += (size_t)gridDim.x * blockDim.x * 16) {
-        if (i + 16 <= n && !(((uintptr_t)(ct + i)) & 15)) {
-            const uint4 u = *(const uint4 *)(ct + i);
-            const unsigned w[4] = {u.x, u.y, u.z, u.w};
-#pragma unroll
-            for (int j = 0; j < 4; j++)
-#pragma unroll
-                for (int b = 0; b < 4; b++) { const unsigned v = (w[j] >> (8 * b)) & 255u; nz += v != 0; sm += v; sq += v * v; }
-        } else for (size_t j = i; j < n && j < i + 16; j++) { const unsigned v = ct[j]; nz += v != 0; sm += v; sq += v * v; }
-    }
-#pragma unroll
-    for (int o = 16; o; o >>= 1) { nz += __shfl_xor_sync(0xffffffffu, nz, o); sm += __shfl_xor_sync(0xffffffffu, sm, o); sq += __shfl_xor_sync(0xffffffffu, sq, o); }
-    if ((threadIdx.x & 31) == 0) { atomicAdd(acc, nz); atomicAdd(acc + 1, sm); atomicAdd(acc + 2, sq); }
-}
-extern "C" void nn_pred_stats(const uint8_t *ct, size_t n, void *scratch, size_t *nz, double *sum, double *sq) {
-    unsigned long long *acc = (unsigned long long *)scratch, h[3];
-    cudaMemsetAsync(acc, 0, 3 * sizeof *acc);
-    pred_stats_k<<<256, 256>>>(ct, n, acc); KCHECK();
-    cudaMemcpy(h, acc, sizeof h, cudaMemcpyDeviceToHost);
-    *nz = (size_t)h[0]; *sum = (double)h[1]; *sq = (double)h[2];
-}
+__global__ void pred_stats_k(const uint8_t *ct, size_t n, unsigned long long *acc);
+extern "C" void nn_pred_stats(const uint8_t *ct, size_t n, void *scratch, size_t *nz, double *sum, double *sq);
 
 /* ================= trilinear 2x (align_corners = false) =================
    out[2m] = 0.75 in[m] + 0.25 in[m-1], out[2m+1] = 0.75 in[m] + 0.25 in[m+1], neighbours clamped. */
@@ -2938,61 +2075,30 @@ __global__ void __launch_bounds__(256) up2_b_k(const TG *gy, TO *gx, int NC, int
     const int nco = (nc / C) * ctot + c0 + nc % C;
     stv(gx, ((size_t)nco * D + mz) * H * W + (size_t)my * W + mx, acc);
 }
-extern "C" void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, float *y, int ctot, int c0) {
-    const gnp_t gp = to_gnp(g);
-    if (ISMX(x)) { if (!ISMX(y) || ctot != xs.c || c0) { fprintf(stderr, "up2: MX input needs a whole MX output tensor (y MX %d, ctot %d, c %d, c0 %d)\n", MXDT(y), ctot, xs.c, c0); abort(); } lp_up2_fwd_mx(x, MXDT(x), xs, y, MXDT(y), gp); KCHECK(); return; }
-    dim3 grid(nblk(2 * xs.w, 32), nblk(2 * xs.h, 8), (unsigned)(nblk(2 * xs.d, 4) * xs.n * xs.c));
-    if (ABF && g_h16) up2_f_k<f16, f16><<<grid, 256>>>((const f16 *)x, (f16 *)y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0, gp);
-    else if (ABF) up2_f_k<bf16, bf16><<<grid, 256>>>((const bf16 *)x, (bf16 *)y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0, gp);
-    else up2_f_k<float, float><<<grid, 256>>>(x, y, xs.n, xs.c, xs.d, xs.h, xs.w, ctot, c0, gp);
-    KCHECK();
-}
-extern "C" void nn_up2_fwd_into(const float *x, shape5 xs, float *y, int ctot, int c0) { nn_up2_fwd_gn_into(x, xs, nullptr, y, ctot, c0); }
-extern "C" void nn_up2_fwd(const float *x, shape5 xs, float *y) { nn_up2_fwd_into(x, xs, y, xs.c, 0); }
-extern "C" void nn_up2_bwd_into(const float *gy, shape5 xs, float *gx, int ctot, int c0) {
-    if (ISMX(gy)) { if (!ISMX(gx)) { fprintf(stderr, "up2_bwd: MX gy needs an MX gx\n"); abort(); } if (ctot == xs.c && !c0) lp_up2_bwd_mx(gy, xs, gx); else lp_up2_bwd_mx_slice(gy, xs, gx, ctot, c0); KCHECK(); return; }
-    dim3 grid(nblk(xs.w, 8), nblk(xs.h, 8), (unsigned)(nblk(xs.d, 4) * xs.n * xs.c));
-    if (GBF && g_h16) up2_b_k<f16, f16><<<grid, 256>>>((const f16 *)gy, (f16 *)gx, xs.n * xs.c, xs.d, xs.h, xs.w, xs.c, ctot, c0);
-    else if (GBF) up2_b_k<bf16, bf16><<<grid, 256>>>((const bf16 *)gy, (bf16 *)gx, xs.n * xs.c, xs.d, xs.h, xs.w, xs.c, ctot, c0);
-    else up2_b_k<float, float><<<grid, 256>>>(gy, gx, xs.n * xs.c, xs.d, xs.h, xs.w, xs.c, ctot, c0);
-    KCHECK();
-}
-extern "C" void nn_up2_bwd(const float *gy, shape5 xs, float *gx) { nn_up2_bwd_into(gy, xs, gx, xs.c, 0); }
+extern "C" void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, float *y, int ctot, int c0);
+extern "C" void nn_up2_fwd_into(const float *x, shape5 xs, float *y, int ctot, int c0);
+extern "C" void nn_up2_fwd(const float *x, shape5 xs, float *y);
+extern "C" void nn_up2_bwd_into(const float *gy, shape5 xs, float *gx, int ctot, int c0);
+extern "C" void nn_up2_bwd(const float *gy, shape5 xs, float *gx);
 
 /* ================= concat ================= */
-__global__ void concat_k(const float *a, int ca, const float *b, int cb, float *y, int N, size_t S, int fwd) {
-    int C = ca + cb;
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)N * C * S) return;
-    int c = (int)((i / S) % C), n = (int)(i / (S * C));
-    size_t s = i % S;
-    float *src = c < ca ? (float *)a + ((size_t)n * ca + c) * S + s : (float *)b + ((size_t)n * cb + c - ca) * S + s;
-    if (fwd) y[i] = *src; else *src = y[i];
-}
-extern "C" void nn_concat_fwd(const float *a, int ca, const float *b, int cb, shape5 s, float *y) {
-    size_t S = shape_spatial(s), n = (size_t)s.n * (ca + cb) * S;
-    concat_k<<<nblk(n, 256), 256>>>(a, ca, b, cb, y, s.n, S, 1);
-    KCHECK();
-}
-extern "C" void nn_concat_bwd(const float *gy, int ca, int cb, shape5 s, float *ga, float *gb) {
-    size_t S = shape_spatial(s), n = (size_t)s.n * (ca + cb) * S;
-    concat_k<<<nblk(n, 256), 256>>>(ga, ca, gb, cb, (float *)gy, s.n, S, 0);
-    KCHECK();
-}
+__global__ void concat_k(const float *a, int ca, const float *b, int cb, float *y, int N, size_t S, int fwd);
+extern "C" void nn_concat_fwd(const float *a, int ca, const float *b, int cb, shape5 s, float *y);
+extern "C" void nn_concat_bwd(const float *gy, int ca, int cb, shape5 s, float *ga, float *gb);
 
 /* ================= loss =================
    scratch layout per (n,c): [nmask, bce_sum, sum_sig_p, sum_sig, sum_p] (5 floats). */
-static float g_posw = 1.f;   /* BCE weight of the positive class */
-extern "C" void nn_set_pos_weight(float w) { g_posw = w; }
+extern float g_posw;
+extern "C" void nn_set_pos_weight(float w);
 /* Offset-tolerant positives (nn_set_loss_tol r > 0, channel 0 only): the positive parts of the loss (the BCE term
    p * softplus(-x) and the dice intersection sig * p) use the maximum logit over the supervised voxels of the
    (2r+1)^3 cube around the voxel, so a surface predicted up to r voxels away from the label still earns full credit;
    the negative part (1 - p) * softplus(x) and the dice denominator stay on the voxel's own logit, so thick responses
    are still penalised. The cube offset of the maximum is stored per voxel (code, 255 = none) and the gradient kernel
    gathers, for each voxel, the sum of p over the voxels whose maximum it is. */
-static int g_tol = 0;
-extern "C" void nn_set_loss_tol(int r) { g_tol = r < 0 ? 0 : r > 2 ? 2 : r; }
-extern "C" int nn_get_loss_tol(void) { return g_tol; }
+extern int g_tol;
+extern "C" void nn_set_loss_tol(int r);
+extern "C" int nn_get_loss_tol(void);
 __device__ __forceinline__ float tol_max(const float *l, const uint8_t *mp, size_t i, int D, int H, int W, int r, uint8_t *code) {
     const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W), e = 2 * r + 1;
     float best = l[i]; int bc = (r * e + r) * e + r;
@@ -3005,52 +2111,11 @@ __device__ __forceinline__ float tol_max(const float *l, const uint8_t *mp, size
     return best;
 }
 __global__ void loss_stats_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
-                             int tol, uint8_t *code, int D, int H, int W) {
-    int nc = blockIdx.x, slab = blockIdx.y, n = nc / C;
-    float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0;   /* per-thread fp32 partials, fp64 block reduction */
-    if (w[nc]) {
-        const float *l = lg + (size_t)nc * S; const uint8_t *tp = t + (size_t)nc * S, *mp = m + (size_t)n * S;
-        uint8_t *cp = tol && nc % C == 0 ? code + (size_t)n * S : nullptr;
-        size_t per = (S + KSLAB - 1) / KSLAB, lo = (size_t)slab * per, hi = lo + per < S ? lo + per : S;
-        for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
-            if (!mp[i]) continue;
-            float x = l[i], p = tp[i] * (1.f / 255.f);
-            float sg = 1.f / (1.f + __expf(-x));
-            float spp = fmaxf(x, 0.f) + log1pf(__expf(-fabsf(x)));   /* softplus(x) */
-            float xq = x, sq = sg, spq = spp;
-            if (cp && tp[i]) {
-                uint8_t c8; xq = tol_max(l, mp, i, D, H, W, tol, &c8); cp[i] = c8;
-                sq = 1.f / (1.f + __expf(-xq)); spq = fmaxf(xq, 0.f) + log1pf(__expf(-fabsf(xq)));
-            }
-            float bce = pw * p * (spq - xq) + (1.f - p) * spp;          /* softplus(-x) = softplus(x) - x */
-            a0 += 1; a1 += bce; a2 += sq * p; a3 += sg; a4 += p;
-        }
-    }
-    __shared__ double r[5][256];
-    r[0][threadIdx.x] = a0; r[1][threadIdx.x] = a1; r[2][threadIdx.x] = a2; r[3][threadIdx.x] = a3; r[4][threadIdx.x] = a4;
-    __syncthreads();
-    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 5; k++) r[k][threadIdx.x] += r[k][threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) for (int k = 0; k < 5; k++) atomicAdd(&ds[nc * 5 + k], r[k][0]);
-}
-__global__ void loss_d2f_k(const double *d, float *f, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) f[i] = (float)d[i]; }
+                             int tol, uint8_t *code, int D, int H, int W);
+__global__ void loss_d2f_k(const double *d, float *f, int n);
 /* finalize on device: per-channel mean bce / dice, active count, and 1/active for the gradient kernel.
    layout of fin[]: [0..C) bce, [C..2C) dice, [2C] active, [2C+1] inv_active */
-__global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, float *fin) {
-    if (threadIdx.x || blockIdx.x) return;
-    int active = 0, cnt[16] = {0};
-    for (int c = 0; c < 2 * C + 2; c++) fin[c] = 0.f;
-    for (int nc = 0; nc < N * C; nc++) {
-        if (!w[nc] || st[nc * 5] < 1.f) continue;
-        active++;
-        int c = nc % C;
-        fin[c] += st[nc * 5 + 1] / st[nc * 5];
-        fin[C + c] += 1.f - (2.f * st[nc * 5 + 2] + 1.f) / (st[nc * 5 + 3] + st[nc * 5 + 4] + 1.f);
-        cnt[c]++;
-    }
-    for (int c = 0; c < C; c++) if (cnt[c]) { fin[c] /= cnt[c]; fin[C + c] /= cnt[c]; }
-    fin[2 * C] = (float)active;
-    fin[2 * C + 1] = active ? 1.f / active : 0.f;
-}
+__global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, float *fin);
 template <typename GT> __global__ void loss_grad_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N, int C, size_t S, const float *st,
                             float dice_w, const float *fin, GT *gl, float pw, float gscale, int tol, const uint8_t *code, int D, int H, int W) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -3077,81 +2142,25 @@ template <typename GT> __global__ void loss_grad_k(const float *lg, const uint8_
     g += dice_w * ddice_ds * s * (1.f - s);
     gl[i] = f2h<GT>(g * fin[2 * C + 1] * gscale);
 }
-static int g_loss_g16 = 0;
-extern "C" void nn_set_loss_grad_h16(int on) { g_loss_g16 = on; }
+extern int g_loss_g16;
+extern "C" void nn_set_loss_grad_h16(int on);
 /* scratch: 5 floats per (n,c) statistics followed by 2C+2 finalized values */
-extern "C" size_t nn_loss_scratch(shape5 s) { return ((size_t)5 * s.n * s.c + 2 * s.c + 2) * sizeof(float); }
+extern "C" size_t nn_loss_scratch(shape5 s);
 /* Asynchronous: launches the statistics, finalize and gradient kernels; nothing is copied to the host. */
-extern "C" void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch) {
-    nn_loss_async_tol(logits, t, m, w, s, dice_w, gl, scratch, nullptr);
-}
-extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch, uint8_t *code) {
-    size_t S = shape_spatial(s);
-    int NC = s.n * s.c;
-    float *fin = scratch + (size_t)5 * NC;
-    double *ds = gn_dsums((size_t)5 * NC);
-    const int tol = code ? g_tol : 0;
-    if (tol) cudaMemsetAsync(code, 255, (size_t)s.n * S);
-    else code = nullptr;
-    cudaMemsetAsync(ds, 0, (size_t)5 * NC * sizeof(double));
-    loss_stats_k<<<dim3(NC, KSLAB), 256>>>(logits, t, m, w, s.c, S, ds, g_posw, tol, code, s.d, s.h, s.w);
-    zs_reduce(ds, 5 * NC);   /* spatial split: statistics of the whole window (the halo planes are masked out by the caller) */
-    loss_d2f_k<<<nblk(5 * NC, 128), 128>>>(ds, scratch, 5 * NC);
-    loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, fin);
-    if (gl) {
-        size_t n = shape_numel(s);
-        if (!g_loss_g16) loss_grad_k<float><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w);
-        else if (g_h16) loss_grad_k<f16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w);
-        else loss_grad_k<bf16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w);
-    }
-    KCHECK();
-}
+extern "C" void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch);
+extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch, uint8_t *code);
 /* Copies the finalized values (2C+1 floats: bce per channel, dice per channel, active) to the host (synchronous). */
-extern "C" void nn_loss_fetch(const float *scratch, shape5 s, float *out) {
-    CK(cudaMemcpy(out, scratch + (size_t)5 * s.n * s.c, (size_t)(2 * s.c + 1) * sizeof(float), cudaMemcpyDeviceToHost));
-}
+extern "C" void nn_loss_fetch(const float *scratch, shape5 s, float *out);
 extern "C" void nn_loss(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w,
-                        float *gl, float *out, float *scratch) {
-    nn_loss_async(logits, t, m, w, s, dice_w, gl, scratch);
-    nn_loss_fetch(scratch, s, out);
-}
+                        float *gl, float *out, float *scratch);
 
-__global__ void sheet_gather_k(const float *lg,shape5 s,const float *xyz,size_t np,int z0,int lo,int hi,double *out) {
-    size_t p=blockIdx.x*(size_t)blockDim.x+threadIdx.x; if (p>=np) return;
-    int iz=(int)floorf(xyz[3*p]),iy=(int)floorf(xyz[3*p+1]),ix=(int)floorf(xyz[3*p+2]);
-    double fz=xyz[3*p]-iz,fy=xyz[3*p+1]-iy,fx=xyz[3*p+2]-ix;
-    double a=0,b=0; size_t S=(size_t)s.d*s.h*s.w;
-    for (int dz=0;dz<2;dz++) for (int dy=0;dy<2;dy++) for (int dx=0;dx<2;dx++) {
-        int gz=iz+dz,z=gz-z0,y=iy+dy,x=ix+dx;
-        if (gz<lo || gz>=hi || z<0 || z>=s.d || y<0 || y>=s.h || x<0 || x>=s.w) continue;
-        double w=(dz?fz:1-fz)*(dy?fy:1-fy)*(dx?fx:1-fx);
-        if (w==0) continue; size_t k=((size_t)z*s.h+y)*s.w+x;
-        a+=w*lg[k]; b+=w*lg[S+k];
-    }
-    out[2*p]=a; out[2*p+1]=b;
-}
-extern "C" void nn_sheet_gather(const float *lg,shape5 s,const float *coords,size_t np,int z0,int lo,int hi,double *values) {
-    if (!np) return;
-    float *xyz; double *v; CK(cudaMalloc(&xyz,3*np*sizeof(float))); CK(cudaMalloc(&v,2*np*sizeof(double)));
-    CK(cudaMemcpy(xyz,coords,3*np*sizeof(float),cudaMemcpyHostToDevice));
-    sheet_gather_k<<<nblk(np,128),128>>>(lg,s,xyz,np,z0,lo,hi,v);
-    zs_reduce(v,(int)(2*np));
-    CK(cudaMemcpy(values,v,2*np*sizeof(double),cudaMemcpyDeviceToHost));
-    CK(cudaFree(xyz)); CK(cudaFree(v)); KCHECK();
-}
+__global__ void sheet_gather_k(const float *lg,shape5 s,const float *xyz,size_t np,int z0,int lo,int hi,double *out);
+extern "C" void nn_sheet_gather(const float *lg,shape5 s,const float *coords,size_t np,int z0,int lo,int hi,double *values);
 template<typename T> __global__ void sheet_scatter_k(T *gl,const uint64_t *idx,const float *v,size_t n,float scale) {
     size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x;
     if (i<n) gl[idx[i]]=f2h<T>(h2f(gl[idx[i]])+v[i]*scale);
 }
-extern "C" void nn_sheet_scatter(float *gl,const uint64_t *indices,const float *values,size_t n,int h16) {
-    if (!n) return; uint64_t *ix; float *v;
-    CK(cudaMalloc(&ix,n*sizeof(uint64_t))); CK(cudaMalloc(&v,n*sizeof(float)));
-    CK(cudaMemcpy(ix,indices,n*sizeof(uint64_t),cudaMemcpyHostToDevice)); CK(cudaMemcpy(v,values,n*sizeof(float),cudaMemcpyHostToDevice));
-    if (!h16) sheet_scatter_k<float><<<nblk(n,256),256>>>(gl,ix,v,n,1.f);
-    else if (g_h16) sheet_scatter_k<f16><<<nblk(n,256),256>>>((f16 *)gl,ix,v,n,g_gscale);
-    else sheet_scatter_k<bf16><<<nblk(n,256),256>>>((bf16 *)gl,ix,v,n,g_gscale);
-    CK(cudaFree(ix)); CK(cudaFree(v)); KCHECK();
-}
+extern "C" void nn_sheet_scatter(float *gl,const uint64_t *indices,const float *values,size_t n,int h16);
 
 template<typename T> __global__ void sheet_input_k(T *input,int W,const float *rows,float center,float scale) {
     size_t k=blockIdx.x*(size_t)blockDim.x+threadIdx.x,S=(size_t)W*W*W; if (k>=S) return;
@@ -3159,95 +2168,29 @@ template<typename T> __global__ void sheet_input_k(T *input,int W,const float *r
     const float *r=rows+4*z;
     input[S+k]=f2h<T>((hypotf(y+r[0],x+r[1])*r[2]+r[3]-center)/scale);
 }
-extern "C" void nn_sheet_input(void *input,int W,const float *rows,float center,float scale,int h16) {
-    float *r; CK(cudaMalloc(&r,4*(size_t)W*sizeof(float))); CK(cudaMemcpy(r,rows,4*(size_t)W*sizeof(float),cudaMemcpyHostToDevice));
-    size_t n=(size_t)W*W*W;
-    if (!h16) sheet_input_k<float><<<nblk(n,256),256>>>((float *)input,W,r,center,scale);
-    else if (g_h16) sheet_input_k<f16><<<nblk(n,256),256>>>((f16 *)input,W,r,center,scale);
-    else sheet_input_k<bf16><<<nblk(n,256),256>>>((bf16 *)input,W,r,center,scale);
-    CK(cudaFree(r)); KCHECK();
-}
-__global__ void sheet_gate_k(float *r,const float *surface,const uint8_t *ct,int W,const float *rows) {
-    size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x;
-    if (i>=(size_t)W*W*W) return;
-    if (!ct[i] || surface[i]<-2.19722458f) r[i]=nanf("");
-    else {
-        int z=i/((size_t)W*W),y=(i/W)%W,x=i%W;
-        const float *a=rows+4*z;
-        r[i]+=hypotf(y+a[0],x+a[1])*a[2]+a[3];
-    }
-}
-extern "C" void nn_sheet_gate(float *r,const float *surface,const uint8_t *ct,int W,const float *rows) {
-    float *a; CK(cudaMalloc(&a,4*(size_t)W*sizeof(float))); CK(cudaMemcpy(a,rows,4*(size_t)W*sizeof(float),cudaMemcpyHostToDevice));
-    sheet_gate_k<<<nblk((size_t)W*W*W,256),256>>>(r,surface,ct,W,a);
-    CK(cudaFree(a)); KCHECK();
-}
+extern "C" void nn_sheet_input(void *input,int W,const float *rows,float center,float scale,int h16);
+__global__ void sheet_gate_k(float *r,const float *surface,const uint8_t *ct,int W,const float *rows);
+extern "C" void nn_sheet_gate(float *r,const float *surface,const uint8_t *ct,int W,const float *rows);
 
 /* ---- multi-GPU: copy between devices (peer access when available, else staged through the host) ---- */
-extern "C" void nn_peer_copy(void *dst, int dst_dev, const void *src, int src_dev, size_t bytes) {
-    static char enabled[8][8];
-    if (!enabled[dst_dev & 7][src_dev & 7]) {
-        int can = 0; cudaDeviceCanAccessPeer(&can, dst_dev, src_dev);
-        if (can) { int cur; cudaGetDevice(&cur); cudaSetDevice(dst_dev); cudaDeviceEnablePeerAccess(src_dev, 0); cudaGetLastError(); cudaSetDevice(cur); }
-        enabled[dst_dev & 7][src_dev & 7] = 1;
-    }
-    CK(cudaMemcpyPeer(dst, dst_dev, src, src_dev, bytes));
-}
+extern "C" void nn_peer_copy(void *dst, int dst_dev, const void *src, int src_dev, size_t bytes);
 
 /* ---- spatial split: halo exchange and sums across the two GPUs (called by one host thread for both sides) ----
    A tensor is one or two plane-major segments (rows of D planes): esz > 0 = [rows = n c][D][H][W] elements of esz bytes; esz 0 =
    the MX tensor registered at p: data [n][blk][voxel][rb] (rows n nb of D planes of H W rb bytes) + the scale plane (rows of H W
    bytes). Side 0 owns the low z planes (its halo is at the high end), side 1 the high ones. */
 typedef struct { size_t base, rows, pb, pitch; } zseg_t;
-static int zsegs(const void *p, shape5 s, int esz, zseg_t *sg) {
-    const size_t HW = (size_t)s.h * s.w, S = HW * s.d;
-    if (esz) { sg[0] = {0, (size_t)s.n * s.c, HW * esz, S * esz}; return 1; }
-    const int dt = nn_storage(p), bw = s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw, rb = dt == 4 ? bw / 2 : bw;
-    if (dt != 4 && dt != 8) { fprintf(stderr, "split: tensor %p has no MX registration\n", p); abort(); }
-    sg[0] = {0, (size_t)s.n * nb, HW * rb, S * rb};
-    sg[1] = {(size_t)s.n * nb * S * rb, (size_t)s.n * nb, HW, S};
-    return 2;
-}
-static size_t zsegs_plane_bytes(const zseg_t *sg, int ns) { size_t b = 0; for (int i = 0; i < ns; i++) b += sg[i].rows * sg[i].pb; return b; }
+int zsegs(const void *p, shape5 s, int esz, zseg_t *sg);
+size_t zsegs_plane_bytes(const zseg_t *sg, int ns);
 /* planes [z0, z0 + nz) of every segment of t <-> contiguous buffer c (dir 0: gather into c, 1: scatter from c) */
-static void zsegs_copy(void *t, const zseg_t *sg, int ns, int z0, int nz, void *c, int dir) {
-    char *cb = (char *)c;
-    for (int i = 0; i < ns; i++) {
-        char *tp = (char *)t + sg[i].base + (size_t)z0 * sg[i].pb;
-        const size_t w = (size_t)nz * sg[i].pb;
-        if (dir) CK(cudaMemcpy2DAsync(tp, sg[i].pitch, cb, w, w, sg[i].rows, cudaMemcpyDeviceToDevice, 0));
-        else CK(cudaMemcpy2DAsync(cb, w, tp, sg[i].pitch, w, sg[i].rows, cudaMemcpyDeviceToDevice, 0));
-        cb += w * sg[i].rows;
-    }
-}
-static void zsegs_zero(void *t, const zseg_t *sg, int ns, int z0, int nz) {
-    if (nz <= 0) return;
-    for (int i = 0; i < ns; i++) CK(cudaMemset2DAsync((char *)t + sg[i].base + (size_t)z0 * sg[i].pb, sg[i].pitch, 0, (size_t)nz * sg[i].pb, sg[i].rows, 0));
-}
+void zsegs_copy(void *t, const zseg_t *sg, int ns, int z0, int nz, void *c, int dir);
+void zsegs_zero(void *t, const zseg_t *sg, int ns, int z0, int nz);
 /* zero the halo planes (lo at the low end, hi at the high end) of a tensor on the current device */
-extern "C" void nn_split_zero(const void *t, shape5 s, int esz, int lo, int hi) {
-    zseg_t sg[2]; int ns = zsegs(t, s, esz, sg);
-    zsegs_zero((void *)t, sg, ns, 0, lo); zsegs_zero((void *)t, sg, ns, s.d - hi, hi);
-    KCHECK();
-}
-static cudaEvent_t zs_ev(int dev, int k) {   /* per-device events for the cross-GPU ordering */
-    static cudaEvent_t ev[8][4]; static int init[8];
-    if (!init[dev]) { int cur; cudaGetDevice(&cur); cudaSetDevice(dev); for (int i = 0; i < 4; i++) cudaEventCreateWithFlags(&ev[dev][i], cudaEventDisableTiming); cudaSetDevice(cur); init[dev] = 1; }
-    return ev[dev][k];
-}
+extern "C" void nn_split_zero(const void *t, shape5 s, int esz, int lo, int hi);
+cudaEvent_t zs_ev(int dev, int k);
 /* both default streams wait for each other (event k) */
-static void zs_xbar(const int *dev, int k) {
-    int cur; cudaGetDevice(&cur);
-    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaEventRecord(zs_ev(dev[i], k), 0)); }
-    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaStreamWaitEvent(0, zs_ev(dev[1 - i], k), 0)); }
-    cudaSetDevice(cur);
-}
-extern "C" size_t nn_split_halo_bytes(shape5 s, int esz) {   /* bytes of one plane (send / receive buffer size) */
-    const size_t HW = (size_t)s.h * s.w;
-    if (esz) return (size_t)s.n * s.c * HW * esz;
-    const int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw;
-    return (size_t)s.n * nb * HW * (bw + 1);
-}
+void zs_xbar(const int *dev, int k);
+extern "C" size_t nn_split_halo_bytes(shape5 s, int esz);
 /* halo exchange of tensor t[i] on device dev[i] (same shape on both, h halo planes): the innermost halo plane receives the
    other side's boundary plane, the outer h - 1 halo planes are zeroed. sb / rb: per-side send / receive buffers of at least
    nn_split_halo_bytes. Asynchronous in two parts: begin (both sides at once) packs each side's boundary plane and zeroes its
@@ -3255,126 +2198,27 @@ extern "C" size_t nn_split_halo_bytes(shape5 s, int esz) {   /* bytes of one pla
    stream, so the compute stream runs on (a weight gradient that does not read the halo) while the plane crosses PCIe; end
    (each side, its own thread) makes the compute stream wait for the arrival and unpacks. One exchange in flight per slot
    (0 / 1: the caller's own buffers and events). */
-static cudaStream_t zs_comm(int dev) {
-    static cudaStream_t st[8];
-    if (!st[dev]) { int cur; cudaGetDevice(&cur); cudaSetDevice(dev); cudaStreamCreateWithFlags(&st[dev], cudaStreamNonBlocking); cudaSetDevice(cur); }
-    return st[dev];
-}
-static cudaEvent_t zs_hev(int dev, int slot, int k) {   /* 0 packed, 1 arrived, 2 unpacked */
-    static cudaEvent_t ev[8][2][3]; static int init[8];
-    if (!init[dev]) { int cur; cudaGetDevice(&cur); cudaSetDevice(dev); for (int i = 0; i < 6; i++) cudaEventCreateWithFlags(&ev[dev][i / 3][i % 3], cudaEventDisableTiming); cudaSetDevice(cur); init[dev] = 1; }
-    return ev[dev][slot & 1][k];
-}
-extern "C" void nn_split_halo_begin(void *const *t, const int *dev, shape5 s, int esz, int h, void *const *sb, void *const *rb, int slot) {
-    int cur; cudaGetDevice(&cur);
-    zseg_t sg[2][2]; int ns = 0;
-    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); ns = zsegs(t[i], s, esz, sg[i]); }
-    const size_t nbytes = zsegs_plane_bytes(sg[0], ns);
-    const int D = s.d;
-    /* side 0 sends its last own plane D - h - 1, side 1 its first own plane h; the outer halo planes are zeroed */
-    const int zsend[2] = {D - h - 1, h}, zlo[2] = {D - h + 1, 0};
-    for (int i = 0; i < 2; i++) {
-        cudaSetDevice(dev[i]);
-        CK(cudaStreamWaitEvent(0, zs_hev(dev[1 - i], slot, 1), 0));   /* the previous exchange has read this side's send buffer */
-        zsegs_copy(t[i], sg[i], ns, zsend[i], 1, sb[i], 0);
-        zsegs_zero(t[i], sg[i], ns, zlo[i], h - 1);
-        CK(cudaEventRecord(zs_hev(dev[i], slot, 0), 0));
-    }
-    for (int i = 0; i < 2; i++) {
-        cudaSetDevice(dev[i]);
-        cudaStream_t cs = zs_comm(dev[i]);
-        CK(cudaStreamWaitEvent(cs, zs_hev(dev[1 - i], slot, 0), 0));
-        CK(cudaStreamWaitEvent(cs, zs_hev(dev[i], slot, 2), 0));        /* the previous exchange has unpacked this receive buffer */
-        CK(cudaMemcpyPeerAsync(rb[i], dev[i], sb[1 - i], dev[1 - i], nbytes, cs));
-        CK(cudaEventRecord(zs_hev(dev[i], slot, 1), cs));
-    }
-    cudaSetDevice(cur);
-    KCHECK();
-}
-extern "C" void nn_split_halo_end(void *t, int side, shape5 s, int esz, int h, void *rb, int slot) {   /* current device = this side's */
-    zseg_t sg[2]; int ns = zsegs(t, s, esz, sg);
-    const int dev = cur_dev();
-    CK(cudaStreamWaitEvent(0, zs_hev(dev, slot, 1), 0));
-    zsegs_copy(t, sg, ns, side ? h - 1 : s.d - h, 1, rb, 1);
-    CK(cudaEventRecord(zs_hev(dev, slot, 2), 0));
-    KCHECK();
-}
-__global__ void zs_add_k(double *a, const double *b, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] += b[i]; }
+cudaStream_t zs_comm(int dev);
+cudaEvent_t zs_hev(int dev, int slot, int k);
+extern "C" void nn_split_halo_begin(void *const *t, const int *dev, shape5 s, int esz, int h, void *const *sb, void *const *rb, int slot);
+extern "C" void nn_split_halo_end(void *t, int side, shape5 s, int esz, int h, void *rb, int slot);
+__global__ void zs_add_k(double *a, const double *b, int n);
 /* b[i] (n doubles on dev[i]) = b[0] + b[1] on both devices; r[i]: n-double receive buffers */
-extern "C" void nn_split_allreduce(double *const *b, const int *dev, int n, double *const *r) {
-    int cur; cudaGetDevice(&cur);
-    zs_xbar(dev, 2);
-    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaMemcpyPeerAsync(r[i], dev[i], b[1 - i], dev[1 - i], (size_t)n * sizeof(double), 0)); }
-    zs_xbar(dev, 3);   /* both copies done before either sum overwrites its source */
-    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); zs_add_k<<<nblk(n, 128), 128>>>(b[i], r[i], n); }
-    cudaSetDevice(cur);
-    KCHECK();
-}
+extern "C" void nn_split_allreduce(double *const *b, const int *dev, int n, double *const *r);
 
 /* ================= optimizer / reductions ================= */
-__global__ void adamw_k(float *p, const float *g, float *m, float *v, size_t n, float lr, float b1, float b2, float eps, float wd, float c1, float c2) {
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float gi = g[i];
-    float mi = m[i] = b1 * m[i] + (1.f - b1) * gi;
-    float vi = v[i] = b2 * v[i] + (1.f - b2) * gi * gi;
-    float mh = mi / c1, vh = vi / c2;
-    p[i] -= lr * (mh / (sqrtf(vh) + eps) + wd * p[i]);
-}
+__global__ void adamw_k(float *p, const float *g, float *m, float *v, size_t n, float lr, float b1, float b2, float eps, float wd, float c1, float c2);
 /* ---- Muon (modded-nanogpt): momentum, then Newton-Schulz orthogonalisation of the Co x K gradient matrix ---- */
-__global__ void mm_xxt_k(const float *X, int Co, int K, float *A) {   /* A = X X^T (Co x Co) */
-    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= Co) return;
-    const float *a = X + (size_t)i * K, *b = X + (size_t)j * K; float s = 0.f;
-    for (int k = 0; k < K; k++) s += a[k] * b[k];
-    A[(size_t)i * Co + j] = s;
-}
-__global__ void mm_sq_k(const float *A, int Co, float b, float c, float *B) {   /* B = b A + c A A (Co x Co) */
-    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= Co) return;
-    float s = 0.f;
-    for (int k = 0; k < Co; k++) s += A[(size_t)i * Co + k] * A[(size_t)k * Co + j];
-    B[(size_t)i * Co + j] = b * A[(size_t)i * Co + j] + c * s;
-}
-__global__ void mm_bx_k(const float *B, const float *X, int Co, int K, float a, float *Y) {   /* Y = a X + B X (Co x K) */
-    int i = blockIdx.y; size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (k >= (size_t)K) return;
-    float s = 0.f;
-    for (int j = 0; j < Co; j++) s += B[(size_t)i * Co + j] * X[(size_t)j * K + k];
-    Y[(size_t)i * K + k] = a * X[(size_t)i * K + k] + s;
-}
-__global__ void muon_mom_k(const float *g, float *mom, float *x, size_t n, float beta) {   /* nesterov momentum: mom = beta mom + g; x = g + beta mom */
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= n) return;
-    float m = beta * mom[i] + g[i]; mom[i] = m; x[i] = g[i] + beta * m;
-}
-__global__ void muon_sumsq_k(const float *x, size_t n, double *ss) {   /* block-reduced sum of squares into one double */
-    __shared__ float r[256]; float a = 0.f; for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) a += x[i] * x[i];
-    r[threadIdx.x] = a; __syncthreads(); for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) atomicAdd(ss, (double)r[0]);
-}
-__global__ void muon_scale_k(float *x, size_t n, const double *ss, float eps) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) x[i] *= (float)(1.0 / (sqrt(*ss) + eps)); }
-__global__ void muon_apply_k(float *p, const float *o, size_t n, float lr, float scale, float wd) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) p[i] = p[i] * (1.f - lr * wd) - lr * scale * o[i]; }
+__global__ void mm_xxt_k(const float *X, int Co, int K, float *A);
+__global__ void mm_sq_k(const float *A, int Co, float b, float c, float *B);
+__global__ void mm_bx_k(const float *B, const float *X, int Co, int K, float a, float *Y);
+__global__ void muon_mom_k(const float *g, float *mom, float *x, size_t n, float beta);
+__global__ void muon_sumsq_k(const float *x, size_t n, double *ss);
+__global__ void muon_scale_k(float *x, size_t n, const double *ss, float eps);
+__global__ void muon_apply_k(float *p, const float *o, size_t n, float lr, float scale, float wd);
 /* work: >= 2 Co K + 2 Co Co floats; the gradient of a [Co][K] weight (row-major) is orthogonalised with 5 Newton-Schulz
    iterations (coefficients from modded-nanogpt) and applied with lr * sqrt(max(1, Co / K)). mom is the momentum buffer. */
-extern "C" void nn_muon(float *p, const float *g, float *mom, int Co, int K, float lr, float beta, float wd, float *work) {
-    size_t n = (size_t)Co * K;
-    float *X = work, *Y = work + n, *A = work + 2 * n, *B = A + (size_t)Co * Co;
-    muon_mom_k<<<nblk(n, 256), 256>>>(g, mom, X, n, beta);
-    double *ss = gn_dsums(1); cudaMemsetAsync(ss, 0, sizeof(double));
-    muon_sumsq_k<<<nblk(n, 256) > 64 ? 64 : nblk(n, 256), 256>>>(X, n, ss);
-    muon_scale_k<<<nblk(n, 256), 256>>>(X, n, ss, 1e-7f);
-    const float a = 3.4445f, b = -4.7750f, c = 2.0315f;
-    dim3 gco(nblk(Co, 128), Co), gk(nblk(K, 256), Co);
-    for (int it = 0; it < 5; it++) {
-        mm_xxt_k<<<gco, 128>>>(X, Co, K, A);
-        mm_sq_k<<<gco, 128>>>(A, Co, b, c, B);
-        mm_bx_k<<<gk, 256>>>(B, X, Co, K, a, Y);
-        float *t = X; X = Y; Y = t;
-    }
-    float scale = sqrtf(fmaxf(1.f, (float)Co / (float)K));
-    muon_apply_k<<<nblk(n, 256), 256>>>(p, X, n, lr, scale, wd);
-    KCHECK();
-}
+extern "C" void nn_muon(float *p, const float *g, float *mom, int Co, int K, float lr, float beta, float wd, float *work);
 /* tiled small-matrix products for the orthogonalisation cascades (Muon, ANVIL): blockIdx.z = conv.
    xxt: A[i][j] = sum_k X[i][k] X[j][k]; 16x16 output tile per block, K staged in 32-wide smem slabs (both operands are rows of X).
    bx:  Y[i][k] = a X[i][k] + sum_j B[i][j] X[j][k]; B (Co x Co, <= 128x128 floats) staged in smem once, 128 k-columns per block. */
@@ -3409,176 +2253,38 @@ template <typename DT> __global__ void __launch_bounds__(256) tile_bx_k(const DT
 }
 /* batched Muon: one launch per stage for all convs (blockIdx.z = conv). descs live on the device. */
 typedef struct { float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K; } muon_desc_t;
-__global__ void bmuon_mom_k(const muon_desc_t *d, float beta, double *ss) {
-    const muon_desc_t D = d[blockIdx.z]; size_t n = (size_t)D.Co * D.K;
-    __shared__ float r[256]; float a = 0.f;
-    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) { float m = beta * D.mom[i] + D.g[i]; D.mom[i] = m; float x = D.g[i] + beta * m; D.X[i] = x; a += x * x; }
-    r[threadIdx.x] = a; __syncthreads(); for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) atomicAdd(&ss[blockIdx.z], (double)r[0]);
-}
-__global__ void bmuon_scale_k(const muon_desc_t *d, const double *ss) {
-    const muon_desc_t D = d[blockIdx.z]; size_t n = (size_t)D.Co * D.K; float inv = (float)(1.0 / (sqrt(ss[blockIdx.z]) + 1e-7));
-    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.X[i] *= inv;
-}
-__global__ void bmm_xxt_k(const muon_desc_t *d, int swap) {   /* A = X X^T; swap: X and Y roles alternate per iteration */
-    const muon_desc_t D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; int Co = D.Co, K = D.K;
-    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x; if (i >= Co || j >= Co) return;
-    const float *a = X + (size_t)i * K, *b = X + (size_t)j * K; float s = 0.f;
-    for (int k = 0; k < K; k++) s += a[k] * b[k];
-    D.A[(size_t)i * Co + j] = s;
-}
-__global__ void bmm_sq_k(const muon_desc_t *d, float b, float c) {   /* B = b A + c A A */
-    const muon_desc_t D = d[blockIdx.z]; int Co = D.Co;
-    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x; if (i >= Co || j >= Co) return;
-    float s = 0.f; for (int k = 0; k < Co; k++) s += D.A[(size_t)i * Co + k] * D.A[(size_t)k * Co + j];
-    D.B[(size_t)i * Co + j] = b * D.A[(size_t)i * Co + j] + c * s;
-}
-__global__ void bmm_bx_k(const muon_desc_t *d, int swap, float a) {   /* Y = a X + B X (into the other buffer) */
-    const muon_desc_t D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; float *Y = swap ? D.X : D.Y; int Co = D.Co, K = D.K;
-    int i = blockIdx.y; size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= Co || k >= (size_t)K) return;
-    float s = 0.f; for (int j = 0; j < Co; j++) s += D.B[(size_t)i * Co + j] * X[(size_t)j * K + k];
-    Y[(size_t)i * K + k] = a * X[(size_t)i * K + k] + s;
-}
-__global__ void bmuon_apply_k(const muon_desc_t *d, int swap, float lr, float wd) {
-    const muon_desc_t D = d[blockIdx.z]; const float *O = swap ? D.Y : D.X; size_t n = (size_t)D.Co * D.K;
-    float scale = sqrtf(fmaxf(1.f, (float)D.Co / (float)D.K));
-    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.p[i] = D.p[i] * (1.f - lr * wd) - lr * scale * O[i];
-}
+__global__ void bmuon_mom_k(const muon_desc_t *d, float beta, double *ss);
+__global__ void bmuon_scale_k(const muon_desc_t *d, const double *ss);
+__global__ void bmm_xxt_k(const muon_desc_t *d, int swap);
+__global__ void bmm_sq_k(const muon_desc_t *d, float b, float c);
+__global__ void bmm_bx_k(const muon_desc_t *d, int swap, float a);
+__global__ void bmuon_apply_k(const muon_desc_t *d, int swap, float lr, float wd);
 /* descs: device array of nconv descriptors (p, g, mom, X, Y, A, B scratch of Co K, Co K, Co Co, Co Co floats, Co, K);
    maxco / maxk: the largest Co and K among them. 18 launches for all convs. */
-extern "C" void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta, float wd) {
-    const muon_desc_t *d = (const muon_desc_t *)descs;
-    double *ss = gn_dsums((size_t)nconv); cudaMemsetAsync(ss, 0, (size_t)nconv * sizeof(double));
-    dim3 g1(32, 1, nconv), gco(nblk(maxco, 128), maxco, nconv), gk(nblk(maxk, 256), maxco, nconv);
-    bmuon_mom_k<<<g1, 256>>>(d, beta, ss);
-    bmuon_scale_k<<<g1, 256>>>(d, ss);
-    const float a = 3.4445f, b = -4.7750f, c = 2.0315f;
-    int swap = 0;
-    dim3 gxx(nblk(maxco, 16), nblk(maxco, 16), nconv), gbx(nblk(maxk, 128), 1, nconv);
-    const int tiled = maxco <= 96;
-    for (int it = 0; it < 5; it++) {
-        if (tiled) tile_xxt_k<muon_desc_t><<<gxx, 256>>>(d, swap); else bmm_xxt_k<<<gco, 128>>>(d, swap);
-        bmm_sq_k<<<gco, 128>>>(d, b, c);
-        if (tiled) tile_bx_k<muon_desc_t><<<gbx, 256>>>(d, swap, a); else bmm_bx_k<<<gk, 256>>>(d, swap, a);
-        swap ^= 1;
-    }
-    bmuon_apply_k<<<g1, 256>>>(d, swap, lr, wd);
-    KCHECK();
-}
+extern "C" void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta, float wd);
 /* ---- ANVIL II (modded-nanogpt record #90, hyperstition.cc): twin-rail Nesterov velocity, 1.05 Frobenius normalisation,
    six quintic spectral maps, per-row energy equalisation at constant norm (NorMuon), sign-aligned weight decay.
    Descriptor layout as Muon plus: v1 (slow rail, uses the Muon mom field as v0), E (Co floats lane energy), R (Co floats scratch). */
 typedef struct { float *p; const float *g; float *v0, *X, *Y, *A, *B, *v1, *E, *R; int Co, K; } anvil_desc_t;
-__constant__ float c_anvil_maps[6][3] = {{3.923798038567f, -6.095026865488f, 3.905234618423f}, {3.278126713798f, -3.328923386476f, 0.989127286973f},
-    {3.505298394150f, -5.137358782410f, 1.968325560615f}, {2.815058591845f, -3.685181239622f, 1.417196497642f},
-    {2.245503932403f, -2.443826979899f, 0.963091710461f}, {2.256537145403f, -2.166840097229f, 0.929501253245f}};
-__global__ void anvil_mom_k(const anvil_desc_t *d, float bf, float bs, float w, float mu, double *ss) {
-    const anvil_desc_t D = d[blockIdx.z]; size_t n = (size_t)D.Co * D.K;
-    __shared__ float r[256]; float a = 0.f;
-    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
-        float g = D.g[i], v0 = D.v0[i] + (1.f - bf) * (g - D.v0[i]), v1 = D.v1[i] + (1.f - bs) * (g - D.v1[i]);
-        D.v0[i] = v0; D.v1[i] = v1;
-        float m = w * v0 + (1.f - w) * v1, x = g + mu * (m - g);
-        D.X[i] = x; a += x * x;
-    }
-    r[threadIdx.x] = a; __syncthreads(); for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) atomicAdd(&ss[blockIdx.z], (double)r[0]);
-}
-__global__ void anvil_scale_k(const anvil_desc_t *d, const double *ss) {
-    const anvil_desc_t D = d[blockIdx.z]; size_t n = (size_t)D.Co * D.K; float inv = (float)(1.0 / (sqrt(ss[blockIdx.z]) * 1.05 + 1e-6));
-    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.X[i] *= inv;
-}
-__global__ void anvil_xxt_k(const anvil_desc_t *d, int swap) {
-    const anvil_desc_t D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; int Co = D.Co, K = D.K;
-    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x; if (i >= Co || j >= Co) return;
-    const float *a = X + (size_t)i * K, *b = X + (size_t)j * K; float s = 0.f; for (int k = 0; k < K; k++) s += a[k] * b[k];
-    D.A[(size_t)i * Co + j] = s;
-}
-__global__ void anvil_sq_k(const anvil_desc_t *d, int it) {
-    const anvil_desc_t D = d[blockIdx.z]; int Co = D.Co; float b = c_anvil_maps[it][1], c = c_anvil_maps[it][2];
-    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x; if (i >= Co || j >= Co) return;
-    float s = 0.f; for (int k = 0; k < Co; k++) s += D.A[(size_t)i * Co + k] * D.A[(size_t)k * Co + j];
-    D.B[(size_t)i * Co + j] = b * D.A[(size_t)i * Co + j] + c * s;
-}
-__global__ void anvil_bx_k(const anvil_desc_t *d, int swap, int it) {
-    const anvil_desc_t D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; float *Y = swap ? D.X : D.Y; int Co = D.Co, K = D.K; float a = c_anvil_maps[it][0];
-    int i = blockIdx.y; size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= Co || k >= (size_t)K) return;
-    float s = 0.f; for (int j = 0; j < Co; j++) s += D.B[(size_t)i * Co + j] * X[(size_t)j * K + k];
-    Y[(size_t)i * K + k] = a * X[(size_t)i * K + k] + s;
-}
+__global__ void anvil_mom_k(const anvil_desc_t *d, float bf, float bs, float w, float mu, double *ss);
+__global__ void anvil_scale_k(const anvil_desc_t *d, const double *ss);
+__global__ void anvil_xxt_k(const anvil_desc_t *d, int swap);
+__global__ void anvil_sq_k(const anvil_desc_t *d, int it);
+__global__ void anvil_bx_k(const anvil_desc_t *d, int swap, int it);
 /* lane (row) power of the cascade output, one block per row */
-__global__ void anvil_rowpow_k(const anvil_desc_t *d, int swap) {
-    const anvil_desc_t D = d[blockIdx.z]; const float *O = swap ? D.Y : D.X; int i = blockIdx.x; if (i >= D.Co) return;
-    __shared__ float r[256]; float a = 0.f; for (int k = threadIdx.x; k < D.K; k += blockDim.x) { float v = O[(size_t)i * D.K + k]; a += v * v; }
-    r[threadIdx.x] = a; __syncthreads(); for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) D.R[i] = r[0] / (float)D.K;
-}
+__global__ void anvil_rowpow_k(const anvil_desc_t *d, int swap);
 /* per conv: lane energy EMA, gain = 1/sqrt(E), global rescale to the pre-equalisation Frobenius norm; R <- row scale */
-__global__ void anvil_eq_k(const anvil_desc_t *d, float b2) {
-    const anvil_desc_t D = d[blockIdx.x]; if (threadIdx.x) return;
-    float pre = 0.f, post = 0.f;
-    for (int i = 0; i < D.Co; i++) { float pw = D.R[i]; pre += pw; D.E[i] += (1.f - b2) * (pw - D.E[i]); float gn = rsqrtf(fmaxf(D.E[i], 1e-10f)); post += pw * gn * gn; }
-    float s = sqrtf(pre) / fmaxf(sqrtf(post), 1e-10f);
-    for (int i = 0; i < D.Co; i++) D.R[i] = rsqrtf(fmaxf(D.E[i], 1e-10f)) * s;
-}
-__global__ void anvil_apply_k(const anvil_desc_t *d, int swap, float lr, float wd) {   /* sign-aligned decay + update */
-    const anvil_desc_t D = d[blockIdx.z]; const float *O = swap ? D.Y : D.X; size_t n = (size_t)D.Co * D.K;
-    float scale = sqrtf(fmaxf(1.f, (float)D.Co / (float)D.K));
-    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
-        float u = O[i] * D.R[i / (size_t)D.K] * scale, p = D.p[i];
-        float dec = (u * p >= 0.f) ? lr * wd * p : 0.f;
-        D.p[i] = p - dec - lr * u;
-    }
-}
-extern "C" void nn_anvil_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta_fast, float beta_slow, float w_fast, float mu, float beta2, float wd) {
-    const anvil_desc_t *d = (const anvil_desc_t *)descs;
-    double *ss = gn_dsums((size_t)nconv); cudaMemsetAsync(ss, 0, (size_t)nconv * sizeof(double));
-    dim3 g1(32, 1, nconv), gco(nblk(maxco, 128), maxco, nconv), gk(nblk(maxk, 256), maxco, nconv), grow(maxco, 1, nconv);
-    anvil_mom_k<<<g1, 256>>>(d, beta_fast, beta_slow, w_fast, mu, ss);
-    anvil_scale_k<<<g1, 256>>>(d, ss);
-    int swap = 0;
-    static const float maps_a[6] = {3.923798038567f, 3.278126713798f, 3.505298394150f, 2.815058591845f, 2.245503932403f, 2.256537145403f};
-    dim3 gxx(nblk(maxco, 16), nblk(maxco, 16), nconv), gbx(nblk(maxk, 128), 1, nconv);
-    const int tiled = maxco <= 96;
-    for (int it = 0; it < 6; it++) {
-        if (tiled) tile_xxt_k<anvil_desc_t><<<gxx, 256>>>(d, swap); else anvil_xxt_k<<<gco, 128>>>(d, swap);
-        anvil_sq_k<<<gco, 128>>>(d, it);
-        if (tiled) tile_bx_k<anvil_desc_t><<<gbx, 256>>>(d, swap, maps_a[it]); else anvil_bx_k<<<gk, 256>>>(d, swap, it);
-        swap ^= 1;
-    }
-    anvil_rowpow_k<<<grow, 256>>>(d, swap);
-    anvil_eq_k<<<nconv, 32>>>(d, beta2);
-    anvil_apply_k<<<g1, 256>>>(d, swap, lr, wd);
-    KCHECK();
-}
-extern "C" void nn_adamw(float *p, const float *g, float *m, float *v, size_t n, float lr, float b1, float b2, float eps, float wd, int step) {
-    float c1 = 1.f - powf(b1, (float)step), c2 = 1.f - powf(b2, (float)step);
-    adamw_k<<<nblk(n, 256), 256>>>(p, g, m, v, n, lr, b1, b2, eps, wd, c1, c2);
-    KCHECK();
-}
-__global__ void ema_k(float *e, const float *p, size_t n, float d) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) e[i] = d * e[i] + (1.f - d) * p[i]; }
-extern "C" void nn_ema(float *ema, const float *p, size_t n, float decay) { ema_k<<<nblk(n, 256), 256>>>(ema, p, n, decay); KCHECK(); }
+__global__ void anvil_eq_k(const anvil_desc_t *d, float b2);
+__global__ void anvil_apply_k(const anvil_desc_t *d, int swap, float lr, float wd);
+extern "C" void nn_anvil_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta_fast, float beta_slow, float w_fast, float mu, float beta2, float wd);
+extern "C" void nn_adamw(float *p, const float *g, float *m, float *v, size_t n, float lr, float b1, float b2, float eps, float wd, int step);
+__global__ void ema_k(float *e, const float *p, size_t n, float d);
+extern "C" void nn_ema(float *ema, const float *p, size_t n, float decay);
 
-__global__ void sum_k(const float *x, size_t n, float *out, int sq) {
-    double s = 0;
-    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) { double v = x[i]; s += sq ? v * v : v; }
-    __shared__ double r[256];
-    r[threadIdx.x] = s;
-    __syncthreads();
-    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) out[blockIdx.x] = (float)r[0];
-}
-static double reduce(const float *x, size_t n, float *scratch, int sq) {
-    int nb = 1024;
-    sum_k<<<nb, 256>>>(x, n, scratch, sq);
-    float h[1024];
-    CK(cudaMemcpy(h, scratch, sizeof h, cudaMemcpyDeviceToHost));
-    double s = 0;
-    for (int i = 0; i < nb; i++) s += h[i];
-    return s;
-}
-extern "C" double nn_sum(const float *x, size_t n, float *scratch) { return reduce(x, n, scratch, 0); }
-extern "C" double nn_sumsq(const float *x, size_t n, float *scratch) { return reduce(x, n, scratch, 1); }
+__global__ void sum_k(const float *x, size_t n, float *out, int sq);
+double reduce(const float *x, size_t n, float *scratch, int sq);
+extern "C" double nn_sum(const float *x, size_t n, float *scratch);
+extern "C" double nn_sumsq(const float *x, size_t n, float *scratch);
 
 /* ---- fake quantization of stored activations (accuracy study of narrower storage formats) ----
    The tensor (activation storage type) is rounded in place to the values a block-scaled format can hold; groups are
@@ -3621,15 +2327,7 @@ __global__ void fq_aff_k(T *x, int N, int C, size_t S, int fmt, const float *mea
 }
 template <typename T>
 __global__ void fq_k(T *x, int N, int C, size_t S, int fmt, const unsigned *am);
-extern "C" void nn_fake_quant_affine(void *x, shape5 s, int fmt, const float *mean, const float *rstd, int G) {
-    if (fmt <= 0 || ISMX(x) || fmt == 1) return;   /* MX formats only (the tensor scale of NVFP4 is not meaningful after the affine) */
-    size_t S = shape_spatial(s); int C = s.c, N = s.n; const int gs = 32, ng = (C + gs - 1) / gs;
-    size_t tot = (size_t)N * ng * S;
-    if (ABF && g_h16) fq_aff_k<f16><<<nblk(tot, 256), 256>>>((f16 *)x, N, C, S, fmt, mean, rstd, G);
-    else if (ABF) fq_aff_k<bf16><<<nblk(tot, 256), 256>>>((bf16 *)x, N, C, S, fmt, mean, rstd, G);
-    else fq_aff_k<float><<<nblk(tot, 256), 256>>>((float *)x, N, C, S, fmt, mean, rstd, G);
-    KCHECK();
-}
+extern "C" void nn_fake_quant_affine(void *x, shape5 s, int fmt, const float *mean, const float *rstd, int G);
 template <typename T>
 __global__ void fq_k(T *x, int N, int C, size_t S, int fmt, const unsigned *am) {
     const int gs = fmt == 1 ? 16 : 32, ng = (C + gs - 1) / gs;
@@ -3655,16 +2353,5 @@ __global__ void fq_k(T *x, int N, int C, size_t S, int fmt, const unsigned *am) 
     }
     for (int k = 0; k < cn; k++) { float val = ldv(p, (size_t)k * S); stv(p, (size_t)k * S, fq_round(val / sc, mb, emin, qmax) * sc); }
 }
-extern "C" void nn_fake_quant(void *x, shape5 s, int fmt) {
-    if (fmt <= 0 || ISMX(x)) return;
-    size_t S = shape_spatial(s), n = shape_numel(s);
-    static unsigned *am[8];
-    if (!am[cur_dev()]) cudaMalloc(&am[cur_dev()], 4);
-    cudaMemsetAsync(am[cur_dev()], 0, 4);
-    const int gs = fmt == 1 ? 16 : 32;
-    size_t nt = (size_t)s.n * ((s.c + gs - 1) / gs) * S;
-    if (ABF && g_h16) { fq_amax_k<f16><<<512, 256>>>((const f16 *)x, n, am[cur_dev()]); fq_k<f16><<<nblk(nt, 256), 256>>>((f16 *)x, s.n, s.c, S, fmt, am[cur_dev()]); }
-    else if (ABF) { fq_amax_k<bf16><<<512, 256>>>((const bf16 *)x, n, am[cur_dev()]); fq_k<bf16><<<nblk(nt, 256), 256>>>((bf16 *)x, s.n, s.c, S, fmt, am[cur_dev()]); }
-    else { fq_amax_k<float><<<512, 256>>>((const float *)x, n, am[cur_dev()]); fq_k<float><<<nblk(nt, 256), 256>>>((float *)x, s.n, s.c, S, fmt, am[cur_dev()]); }
-    KCHECK();
-}
+extern "C" void nn_fake_quant(void *x, shape5 s, int fmt);
+
