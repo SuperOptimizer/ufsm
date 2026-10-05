@@ -204,10 +204,23 @@ for finite covers because asynchronous prefetch would otherwise make it timing d
 
 Use `--trial-seconds 60` for a bounded production smoke check. This retains the complete-pass
 step schedule, marks the resulting run **partial**, and allows resuming its checkpoint for the
-remaining tiles. Completed cover checkpoints reject another pass under the same plan. The CPU
+remaining tiles. Without `--cover-next-pass`, completed cover checkpoints reject another pass. The CPU
 checks are `build/test_cover`, `build/test_ct_augment`, `build/test_sampler_safety`,
 `tests/test_training_cover.py` and `tests/test_production_cover.py`; the real single/split GPU
 exhaustion and resume regression is `python3 tests/test_cover_training.py`.
+
+A completed surface cover can start a new immutable shuffled pass with
+`--cover-next-pass 1 --resume CHECKPOINT --cover NEXT_PLAN`. This retains the model,
+EMA, optimizer moments and global step, resetting only the coverage cursor. An
+unfinished pass rejects this flag. `--schedule-seconds` and `--schedule-elapsed`
+keep one learning-rate horizon across passes and hourly evaluation pauses.
+For a detached surface run, `python3 tools/extend_surface_training.py --hours 24
+--binary /path/to/ufsm` adds a day to its existing deadline, freezes the latest
+checkpoint and repeat plans, retains prior metrics and the best checkpoint, and
+starts a replacement systemd user service with hourly checks. Supply
+`--binary-source-patch PATCH --training-code-commit COMMIT` when using a trainer
+built from a historical surface-only revision. The trainer must support the two
+schedule flags and `--cover-next-pass`; its kernels and precision need not change.
 
 ## Reproducible training and deployment
 

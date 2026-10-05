@@ -30,6 +30,37 @@ def interval_deadline(start,seconds,interval,index):
     return min(start+seconds,start+interval*index)
 
 
+def setflag(command,flag,value):
+    if flag in command: command[command.index(flag)+1]=str(value)
+    else: command.extend([flag,str(value)])
+
+
+def removeflag(command,flag):
+    if flag in command:
+        i=command.index(flag);del command[i:i+2]
+
+
+def cover_continuation(command,saved,passes):
+    """Resume the same immutable pass, or advance only after its final update."""
+    command=list(command)
+    cover=saved['extra']['cover']
+    if saved['step']!=cover['base_step']+cover['cursor'] or not 0<=cover['cursor']<=cover['count']:
+        raise RuntimeError('checkpoint coverage step/cursor changed')
+    index=next((i for i,p in enumerate(passes) if p['sha256']==cover['sha256']),None)
+    if index is None or passes[index]['count']!=cover['count']:
+        raise RuntimeError('checkpoint is not from a frozen coverage pass')
+    complete=cover['cursor']==cover['count']
+    if complete: index+=1
+    if index==len(passes): return None
+    plan=passes[index];base=saved['step'] if complete else cover['base_step']
+    removeflag(command,'--cover-next-pass');removeflag(command,'--cover-extend-from')
+    if complete: setflag(command,'--cover-next-pass',1)
+    for flag,value in {'--cover':plan['path'],'--cover-sha256':plan['sha256'],
+                       '--seed':plan['seed'],'--steps':base+plan['count'],'--schedule-start':base}.items():
+        setflag(command,flag,value)
+    return command,plan['sha256'],index+1
+
+
 def watch(args):
     root=Path(args.root).resolve(); run=root/'full'
     state=json.loads((run/'state.json').read_text()); progress=json.loads((root/'testing.json').read_text())
@@ -61,9 +92,6 @@ def watch(args):
         worker=None
         if stopping: raise InterruptedError('stopped by signal')
         if code: raise subprocess.CalledProcessError(code,command)
-    def setflag(command,flag,value):
-        if flag in command: command[command.index(flag)+1]=str(value)
-        else: command.extend([flag,str(value)])
     def snapshot(index,checkpoint):
         target=root/'hours'/f'{index:02d}'; target.mkdir(parents=True,exist_ok=True)
         saved=header(checkpoint); model=target/'model'
@@ -134,6 +162,20 @@ def watch(args):
         print(summary,flush=True)
     try:
         verify_inputs(run,state)
+        passes=progress.get('cover_passes',[])
+        if passes:
+            if not surface_only: raise RuntimeError('repeat coverage currently requires surface-only training')
+            from production import validate_cover
+            cfg=json.loads((run/'inputs/sources.json').read_text()); first=None
+            for p in passes:
+                path=Path(p['path'])
+                if path.parent.resolve()!=(run/'inputs').resolve() or state['inputs'].get(path.name)!=p['sha256']:
+                    raise RuntimeError('coverage pass is not a frozen input')
+                plan=json.loads(path.read_text());validate_cover(plan,cfg)
+                if plan['count']!=p['count'] or plan['seed']!=p['seed']: raise RuntimeError('coverage pass metadata changed')
+                tiles={tuple(t) for t in plan['tiles']}
+                if first is None: first=tiles
+                elif tiles!=first: raise RuntimeError('repeat pass changed the labelled coverage or holdouts')
         donor=run/'inputs/resume.ckpt'
         if '0' not in progress.get('reports',{}): evaluate(0,donor)
         if 'started_at' not in progress:
@@ -145,8 +187,17 @@ def watch(args):
             if str(index) in progress.get('reports',{}): continue
             checkpoint=run/'model/last.ckpt'; current=header(checkpoint if checkpoint.exists() else donor)
             remaining=interval_deadline(start,seconds,interval,index)-time.time()
-            if remaining>0:
+            expected_sha=state['inputs']['cover.json']
+            while remaining>0:
                 command=list(state['command'])
+                if passes:
+                    continuation=cover_continuation(command,current,passes)
+                    if continuation is None:
+                        raise RuntimeError('all frozen coverage passes exhausted before the requested deadline')
+                    command,expected_sha,pass_number=continuation
+                    state.update(active_cover_pass=pass_number,active_cover_sha256=expected_sha,
+                                 active_cover=command[command.index('--cover')+1])
+                    publish(cover_pass=pass_number)
                 if checkpoint.exists():
                     setflag(command,'--resume',checkpoint)
                     if '--cover-extend-from' in command:
@@ -162,10 +213,23 @@ def watch(args):
                 state['status']='training';atomic_json(run/'state.json',state)
                 publish(status='training',phase='train',hour=index,checkpoint_step=current['step'],next_evaluation_at=interval_deadline(start,seconds,interval,index),remaining_seconds=max(0,end-time.time()))
                 with gpu_lock('0,1'): execute(command,run/'train.log')
+                current=header(checkpoint)
+                if current['extra']['cover']['sha256']!=expected_sha or current['step']!=current['extra']['cover']['base_step']+current['extra']['cover']['cursor']:
+                    raise RuntimeError('checkpoint coverage identity/cursor changed')
+                remaining=interval_deadline(start,seconds,interval,index)-time.time()
+                if not passes or current['extra']['cover']['cursor']!=current['extra']['cover']['count']: break
+                completed=progress.get('completed_cover_passes',[])
+                if not any(p['sha256']==expected_sha for p in completed):
+                    completed.append(dict(pass_number=pass_number,sha256=expected_sha,step=current['step'],completed_at=time.time()))
+                    publish(completed_cover_passes=completed)
             if not checkpoint.exists(): raise RuntimeError('no committed continuation checkpoint')
             saved=header(checkpoint)
             if surface_only and saved.get('extra',{}).get('sheet'): raise RuntimeError('surface continuation produced a winding checkpoint')
-            if saved['extra']['cover']['sha256']!=state['inputs']['cover.json'] or saved['step']!=saved['extra']['cover']['base_step']+saved['extra']['cover']['cursor']:
+            if passes:
+                if not any(p['sha256']==saved['extra']['cover']['sha256'] and p['count']==saved['extra']['cover']['count'] for p in passes):
+                    raise RuntimeError('checkpoint is not from a frozen coverage pass')
+                expected_sha=saved['extra']['cover']['sha256']
+            if saved['extra']['cover']['sha256']!=expected_sha or saved['step']!=saved['extra']['cover']['base_step']+saved['extra']['cover']['cursor']:
                 raise RuntimeError('checkpoint coverage identity/cursor changed')
             cover_complete=saved['extra']['cover']['cursor']==saved['extra']['cover']['count']
             if cover_complete and not surface_only and time.time()<end-60:
@@ -175,9 +239,9 @@ def watch(args):
             except subprocess.CalledProcessError as error:
                 errors=progress.get('evaluation_errors',[]);errors.append(dict(hour=index,step=saved['step'],error=str(error)))
                 publish(evaluation_errors=errors,last_evaluation_error=str(error));print('evaluation failed; retaining checkpoint and continuing training',error,flush=True)
-            if time.time()>=end or cover_complete: break
+            if time.time()>=end or (cover_complete and not passes): break
         state.update(status='trained' if cover_complete else 'budget_complete',checkpoint_sha256=digest(run/'model/last.ckpt'));atomic_json(run/'state.json',state)
-        publish(status='coverage pass complete' if cover_complete else '24-hour run complete',phase='complete',completed_at=time.time(),remaining_seconds=0,checkpoint_step=header(run/'model/last.ckpt')['step'])
+        publish(status='coverage pass complete' if cover_complete and not passes else progress.get('completion_status','24-hour run complete'),phase='complete',completed_at=time.time(),remaining_seconds=0,checkpoint_step=header(run/'model/last.ckpt')['step'])
     except InterruptedError as error:
         state['status']='interrupted';atomic_json(run/'state.json',state);publish(status='interrupted',error=str(error));raise SystemExit(143)
     except Exception as error:

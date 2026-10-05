@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+BINARY = Path(os.environ.get('UFSM_TEST_BINARY', ROOT / 'build/ufsm'))
 
 def header(path):
     with path.open('rb') as f:
@@ -23,7 +24,7 @@ with tempfile.TemporaryDirectory(prefix='ufsm-cover-cli-') as tmp:
     cover.write_text(json.dumps({'version': 1, 'P': 32, 'level': 0, 'count': 3,
         'source_names': ['fixture'], 'tiles': [[0, 0, 0, 0], [0, 32, 0, 0], [0, 64, 0, 0]]}))
     env = {k: v for k, v in os.environ.items() if not k.startswith('UFSM_')}
-    base = [ROOT / 'build/ufsm', 'train', source, '--P', '32', '--B', '1', '--cover', cover,
+    base = [BINARY, 'train', source, '--P', '32', '--B', '1', '--cover', cover,
             '--steps', '3', '--warmup', '10', '--seed', '2', '--workers', '2', '--val-batches', '1',
             '--levels', '1', '--log-every', '1', '--ckpt-every', '1', '--val-every', '10',
             '--down-norm', '1', '--zfix', '1', '--symmetry-p', '.5', '--ct-aug', '1', '--soft', '3',
@@ -55,3 +56,22 @@ with tempfile.TemporaryDirectory(prefix='ufsm-cover-cli-') as tmp:
             with path.open('rb') as f: f.readline(); return f.read(1172050 * 4)
         assert weights(full / 'last.ckpt') != weights(partial / 'last.ckpt')
         print(f'{mode}: all3 tiles applied; partial cursor1 resumes at2 with original LR: ok')
+        # Repeating a pass retains the global optimizer step, and only a fully
+        # committed pass may transition to a different shuffled plan.
+        bad = subprocess.run(list(map(str,command + ['--out',t/'bad','--resume',partial/'last.ckpt',
+            '--cover-next-pass','1'])),env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+        assert bad.returncode and 'requires a completed' in bad.stdout,bad.stdout
+        second=t/'second.json'; plan=json.loads(cover.read_text());plan['seed']=3;plan['tiles'].reverse()
+        second.write_text(json.dumps(plan))
+        command[command.index('--cover')+1]=second
+        command += ['--sched','wsd','--schedule-seconds','10000','--schedule-elapsed','6000','--warmup-seconds','0']
+        next_partial, hn = train('next-partial',['--resume',full/'last.ckpt','--cover-next-pass','1','--limit-seconds','.000001'])
+        assert hn['step']==4 and hn['extra']['cover']['cursor']==1 and hn['extra']['cover']['base_step']==3
+        assert hn['extra']['cover']['sha256']!=h['extra']['cover']['sha256'] and hn['muon_mom']==1
+        next_full, hf = train('next-resumed',['--resume',next_partial/'last.ckpt'])
+        assert hf['step']==6 and hf['extra']['cover']['cursor']==3 and hf['extra']['cover']['base_step']==3
+        assert weights(next_partial/'last.ckpt')!=weights(full/'last.ckpt')
+        for out in (next_partial,next_full):
+            rows=list(csv.DictReader((out/'log.csv').open()))
+            assert all(float(r['lr'])==.001 for r in rows),rows
+        print(f'{mode}: completed pass transitions and resumes with optimizer step and wall-time LR intact: ok')

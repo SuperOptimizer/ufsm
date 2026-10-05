@@ -194,7 +194,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
-                        "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
+                        "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--cover-next-pass 1] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
                         "       [--geometry-aug 0|1] [--rotate-deg 5] [--rotate-p 0.2] [--elastic 1] [--elastic-p 0.15] [--label-morph 0] [--label-morph-p 0.2]\n"
                         "       [--sheet-band-scale 1]   widen audited soft-band cap and close-gap exclusions together\n"
                         "       [--erode 0|1] [--soft SIGMA]   native binary-core erosion before softening (--levels 1,0,0,0)\n"
@@ -366,6 +366,11 @@ int cmd_train(int argc, char **argv) {
     if (warm_start && (!resume || sheet_ck)) { fprintf(stderr,"--warm-start requires a legacy donor checkpoint\n"); return 2; }
     int has_cover = resume && !sheet_init && !warm_start ? cover_checkpoint_read(resume, &prior_cover) : 0;
     if (has_cover < 0 || (has_cover && !cover_path)) { fprintf(stderr, "finite-cover resume requires its original plan\n"); return 2; }
+    int next_pass = atoi(opt(argc, argv, "--cover-next-pass", "0"));
+    if (next_pass < 0 || next_pass > 1 || (next_pass && (!has_cover || !cover_path || prior_cover.cursor != prior_cover.count))) {
+        fprintf(stderr, "--cover-next-pass requires a completed finite-cover checkpoint and the next plan\n"); return 2;
+    }
+    if (next_pass) has_cover = 0; /* Keep model, EMA, optimizer and global step; reset only the tile cursor. */
     const char *extend_from = opt(argc, argv, "--cover-extend-from", nullptr);
     if (extend_from && (!has_cover || !cover_path)) { fprintf(stderr, "cover extension requires a matching finite-cover checkpoint\n"); return 2; }
     if (cover_path) {
@@ -382,7 +387,7 @@ int cmd_train(int argc, char **argv) {
             strcpy(prior_cover.sha256, plan->sha256); prior_cover.count = plan->count;
         }
         if (strcmp(pinned, plan->sha256) || (has_cover && (strcmp(prior_cover.sha256, plan->sha256) || prior_cover.count != plan->count))) { fprintf(stderr, "cover SHA256/count mismatch\n"); return 2; }
-        coverage = prior_cover; strcpy(coverage.sha256, plan->sha256); coverage.count = plan->count;
+        coverage = next_pass ? (cover_progress){0} : prior_cover; strcpy(coverage.sha256, plan->sha256); coverage.count = plan->count;
         sc.cover = plan; sc.cover_start = coverage.cursor; sc.deterministic = 1; sc.snap = 0;
         memset(sc.level_p, 0, sizeof sc.level_p); sc.level_p[0] = 1;
     }

@@ -135,6 +135,7 @@ test-sheet: build/test_sheet build/test_spatial_augment
 	python3 tests/test_sheet_native.py
 	python3 tests/test_sheet_pipeline.py
 	python3 tests/test_sheet_watch.py
+	python3 tests/test_extend_surface_training.py
 
 test-sheet-gpu: build/ufsm build/test_sheet_gpu build/test_wgrad_grid build/make_pipeline_fixture
 	./build/test_wgrad_grid
