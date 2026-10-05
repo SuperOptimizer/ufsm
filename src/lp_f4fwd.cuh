@@ -11,43 +11,13 @@
    requantised), mx8 (dequantised, requantised to e2m1), fp32 / 16-bit (staged as the fp8 kernel). Output type TO
    separate from the input (the backward feeds mx8 gradients into 16-bit / mx8 outputs). Inputs with 9..16 channels take the
    packed 16-channel kernel conv_fwd_f4p_k, Ci <= 8 (the network input) the fp8 tap-packed kernel. */
-static __global__ void prep_w4_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx = -1, int CxP = 0, int Ox = -1, int OxP = 0) {
-    const int nch = Cip / 32;
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)28 * Cop * nch) return;              /* tap 27 = the zero half of the last pair */
-    int ch = (int)(i % nch), cop = (int)((i / nch) % Cop), t = (int)(i / ((size_t)nch * Cop));
-    int co = Ox < 0 ? cop : seg_ci(cop, Co, Ox, OxP);   /* padded output row -> real output channel (-1 = padding) */
-    float v[32], amax = 0.f;
-#pragma unroll
-    for (int k = 0; k < 32; k++) { int ci = Cx < 0 ? ch * 32 + k : seg_ci(ch * 32 + k, Ci, Cx, CxP); v[k] = (t < 27 && co >= 0 && co < Co && ci >= 0 && ci < Ci) ? w[((size_t)co * Ci + ci) * 27 + t] : 0.f; amax = fmaxf(amax, fabsf(v[k])); }
-    int e = mx_exp(amax, 1.f / 6.f);
-    float m = exp2i(-e);
-    *(uint4 *)(wq + ((size_t)t * Cop + cop) * (Cip / 2) + ch * 16) = make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m));
-    ws[i] = (uint8_t)(e + 127);
-}
+__global__ void prep_w4_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx = -1, int CxP = 0, int Ox = -1, int OxP = 0);   /* defined in lp_f4fwd.cu */
 /* 2D weight scales (UFSM_W4_2D=1): one ue8m0 per (tap, 32 padded output rows, 32-channel input chunk) tile instead of per
    (tap, row, chunk). The flipped weights of the backward-data conv tile the same 32 x 32 blocks with rows and chunks swapped,
    so forward and backward-data multiply the same quantised weights (exactly when both sides use the same 32-channel
    alignment: plane-major / 16-bit on both, or MX segments on both). Warp per tile, lane = row; same layout as prep_w4_k. */
 extern int g_w2d;
-static __global__ void prep_w4_2d_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx = -1, int CxP = 0, int Ox = -1, int OxP = 0) {
-    const int nch = Cip / 32, nrt = (Cop + 31) / 32, lane = threadIdx.x & 31;
-    const size_t tile = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) >> 5;
-    if (tile >= (size_t)28 * nrt * nch) return;
-    const int ch = (int)(tile % nch), rt = (int)((tile / nch) % nrt), t = (int)(tile / ((size_t)nch * nrt));
-    const int cop = rt * 32 + lane;
-    const int co = cop >= Cop ? -1 : Ox < 0 ? cop : seg_ci(cop, Co, Ox, OxP);
-    float v[32], amax = 0.f;
-#pragma unroll
-    for (int k = 0; k < 32; k++) { int ci = Cx < 0 ? ch * 32 + k : seg_ci(ch * 32 + k, Ci, Cx, CxP); v[k] = (t < 27 && co >= 0 && co < Co && ci >= 0 && ci < Ci) ? w[((size_t)co * Ci + ci) * 27 + t] : 0.f; amax = fmaxf(amax, fabsf(v[k])); }
-#pragma unroll
-    for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
-    const int e = mx_exp(amax, 1.f / 6.f);
-    const float m = exp2i(-e);
-    if (cop >= Cop) return;
-    *(uint4 *)(wq + ((size_t)t * Cop + cop) * (Cip / 2) + ch * 16) = make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m));
-    ws[((size_t)t * Cop + cop) * nch + ch] = (uint8_t)(e + 127);
-}
+__global__ void prep_w4_2d_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx = -1, int CxP = 0, int Ox = -1, int OxP = 0);   /* defined in lp_f4fwd.cu */
 template <int MT, int TZ, typename T, typename TO>
 __global__ void __launch_bounds__(256, 2) conv_fwd_f4_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                      const float *__restrict__ b, TO *__restrict__ y,
@@ -202,23 +172,7 @@ static int wmemo_get(unsigned key, const float *w, int Cop, int Cip, int Cx, int
    NaN encoding and both halves share the pair scale, so it adds nothing). B scale: one ue8m0 per pair (the mma's 32-element
    block: max over the two positions, so each position is quantised once per pair it belongs to), A scales one per (row, co,
    32-K block). Weights wq4p[r][Cop][32 B], ws[r][Cop][2]. Staging shared with the fp8 version (stage_row16). */
-static __global__ void prep_w4p_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Ox, int OxP, int Cs = -1, int cofs = 0) {   /* Cs: w channel stride (-1: Ci), cofs: first channel */
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;   /* (r, co, block) */
-    if (i >= (size_t)9 * Cop * 2) return;
-    const int blk = (int)(i & 1), cop = (int)((i >> 1) % Cop), r = (int)((i >> 1) / Cop);
-    const int co = Ox < 0 ? cop : seg_ci(cop, Co, Ox, OxP);
-    float v[32], amax = 0.f;
-#pragma unroll
-    for (int k = 0; k < 32; k++) {
-        const int kx = 2 * blk + (k >> 4), ci = k & 15;
-        v[k] = (kx < 3 && co >= 0 && co < Co && ci < Ci) ? w[((size_t)co * (Cs < 0 ? Ci : Cs) + cofs + ci) * 27 + r * 3 + kx] : 0.f;
-        amax = fmaxf(amax, fabsf(v[k]));
-    }
-    const int e = mx_exp(amax, 1.f / 6.f);
-    const float m = exp2i(-e);
-    *(uint4 *)(wq + ((size_t)r * Cop + cop) * 32 + blk * 16) = make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m));
-    ws[i] = (uint8_t)(e + 127);
-}
+__global__ void prep_w4p_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Ox, int OxP, int Cs = -1, int cofs = 0);   /* defined in lp_f4fwd.cu */
 template <int MT, int TZ, typename T, typename TO>
 __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                       const float *__restrict__ b, TO *__restrict__ y,

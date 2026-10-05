@@ -10,8 +10,11 @@ B := build
 TYPEFLAGS :=
 endif
 
-CC      ?= gcc
-NVCC    ?= nvcc
+# ccache (when installed) makes recompiling unchanged sources free: switching VERIFY, make clean, other worktrees.
+# CCACHE= disables it.
+CCACHE  ?= $(shell command -v ccache 2>/dev/null)
+CC      := $(CCACHE) gcc
+NVCC    ?= $(CCACHE) nvcc
 CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -pthread
 CPPFLAGS = -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp $(shell pkg-config --cflags libcurl libzstd blosc zlib libcrypto)
 LDLIBS   = $(shell pkg-config --libs libcurl libzstd blosc zlib libcrypto) -lm -lpthread
