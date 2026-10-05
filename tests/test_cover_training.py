@@ -9,6 +9,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get('UFSM_TEST_BINARY', ROOT / 'build/ufsm'))
+help_result = subprocess.run([BINARY,'train'],capture_output=True,text=True)
+assert help_result.returncode == 2 and '--cover-next-pass' in help_result.stderr and '--schedule-seconds' in help_result.stderr
 
 def header(path):
     with path.open('rb') as f:
