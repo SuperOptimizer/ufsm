@@ -20,6 +20,7 @@ UFSM_RC_KEEP_COARSE=1 "$B" "${TR[@]}" --steps 200 --out "$O/train_rate" >"$O/tra
 UFSM_RC_KEEP_COARSE=1 UFSM_PROF=1 "$B" "${TR[@]}" --steps 60 --out "$O/train_prof" >"$O/train_prof.log" 2>&1 || echo "train prof run failed"
 UFSM_RC_KEEP_COARSE=1 UFSM_PROF=layers "$B" "${TR[@]}" --steps 40 --out "$O/train_layers" >"$O/train_layers.log" 2>&1 || echo "train layers run failed"
 grep "samp/s" "$O/train_rate.log" | tail -3
+python3 tools/roofline.py "$O/train_layers.log" --P 704 --split 1 --steps-per-report 20 --gpus 2 | tee "$O/roofline.txt" || echo "roofline failed"
 # inference: serving recipe on the 1024^3 held-out box, both GPUs; then one GPU with the stage profile
 CK=$R/best-development.ckpt
 PR=(predict "$CK" /vesuvius/usrm/volcomp PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr)
