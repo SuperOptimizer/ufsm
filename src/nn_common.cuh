@@ -1057,12 +1057,12 @@ int conv_fwd_tc_f16acc(const void *x, int xbf, shape5 xs, const float *w, const 
     const tapset_t &tt = ts ? *ts : none;
     if (ts) {
         if (xbf && ybf) conv_fwd_tc_launch<HT, HT, 1, HT, 1>(MT, grid, smem, (const HT *)x, wp, b, (HT *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, tt, wsc);
-        else conv_fwd_tc_launch<float, float, 1, HT, 1>(MT, grid, smem, (const float *)x, wp, b, (float *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, tt, wsc);
+        else VERIFY_ONLY(conv_fwd_tc_launch<float, float, 1, HT, 1>(MT, grid, smem, (const float *)x, wp, b, (float *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, tt, wsc));
     }
     else if (xbf && ybf) conv_fwd_tc_launch<HT, HT, 0, HT, 1>(MT, grid, smem, (const HT *)x, wp, b, (HT *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, tt, wsc);
-    else if (xbf) conv_fwd_tc_launch<HT, float, 0, HT, 1>(MT, grid, smem, (const HT *)x, wp, b, (float *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, tt, wsc);
-    else if (ybf) conv_fwd_tc_launch<float, HT, 0, HT, 1>(MT, grid, smem, (const float *)x, wp, b, (HT *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, tt, wsc);
-    else conv_fwd_tc_launch<float, float, 0, HT, 1>(MT, grid, smem, (const float *)x, wp, b, (float *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, tt, wsc);
+    else if (xbf) VERIFY_ONLY(conv_fwd_tc_launch<HT, float, 0, HT, 1>(MT, grid, smem, (const HT *)x, wp, b, (float *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, tt, wsc));
+    else if (ybf) VERIFY_ONLY(conv_fwd_tc_launch<float, HT, 0, HT, 1>(MT, grid, smem, (const float *)x, wp, b, (HT *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, tt, wsc));
+    else VERIFY_ONLY(conv_fwd_tc_launch<float, float, 0, HT, 1>(MT, grid, smem, (const float *)x, wp, b, (float *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, tt, wsc));
     return 0;
 }
 template <typename HT>
@@ -1093,12 +1093,12 @@ plain:
     tapset_t none = {};
     if (ts) {
         if (xbf && ybf) conv_fwd_tc_launch<HT, HT, 1, HT>(MT, grid, smem, (const HT *)x, wp, b, (HT *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, *ts);
-        else conv_fwd_tc_launch<float, float, 1, HT>(MT, grid, smem, (const float *)x, wp, b, (float *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, *ts);
+        else VERIFY_ONLY(conv_fwd_tc_launch<float, float, 1, HT>(MT, grid, smem, (const float *)x, wp, b, (float *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, *ts));
     }
     else if (xbf && ybf) conv_fwd_tc_launch<HT, HT, 0, HT>(MT, grid, smem, (const HT *)x, wp, b, (HT *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, none);
-    else if (xbf) conv_fwd_tc_launch<HT, float, 0, HT>(MT, grid, smem, (const HT *)x, wp, b, (float *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, none);
-    else if (ybf) conv_fwd_tc_launch<float, HT, 0, HT>(MT, grid, smem, (const float *)x, wp, b, (HT *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, none);
-    else conv_fwd_tc_launch<float, float, 0, HT>(MT, grid, smem, (const float *)x, wp, b, (float *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, none);
+    else if (xbf) VERIFY_ONLY(conv_fwd_tc_launch<HT, float, 0, HT>(MT, grid, smem, (const HT *)x, wp, b, (float *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, none));
+    else if (ybf) VERIFY_ONLY(conv_fwd_tc_launch<float, HT, 0, HT>(MT, grid, smem, (const float *)x, wp, b, (HT *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, none));
+    else VERIFY_ONLY(conv_fwd_tc_launch<float, float, 0, HT>(MT, grid, smem, (const float *)x, wp, b, (float *)y, xs, cout, Cop, Cip, gp, osum, Go, sp, none));
     return 0;
 }
 /* xbf / ybf: input / output tensors are 16-bit (bf16, or fp16 with nn_set_f16) instead of float.

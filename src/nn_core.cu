@@ -200,3 +200,6 @@ extern "C" void nn_prof_collect(double *out, int nk) {
     g_nev = 0;
 }
 extern "C" size_t nn_mem_free(void) { size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); return f; }
+extern "C" void ufsm_no_verify_types(const char *fn) {
+    fprintf(stderr, "%s: bf16 / fp32 tensor-core kernels are not in this build (rebuild with make VERIFY=1)\n", fn); abort();
+}

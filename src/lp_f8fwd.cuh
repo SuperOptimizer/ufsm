@@ -261,7 +261,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
 }
 
 
-template <int MT, int CP, typename T, typename TO> static void launch_f8s(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, gnp_t gp, double *osum, int Go, split_t sp) {
+template <int MT, int CP, typename T, typename TO> void launch_f8s(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, gnp_t gp, double *osum, int Go, split_t sp) {
     constexpr int TPK = 32 / CP, NKB = (27 + TPK - 1) / TPK;
     size_t smem = (size_t)F8_T * CP + NKB * MT * 16 * 32 + ((NKB * MT * 16 + 15) & ~15) + 16 + 16 * sizeof(chan_t);
     if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
@@ -402,7 +402,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8p_k(const T *__restrict__ x
     }
     fwd_epilogue<MT, NR, TO>(acc, smem_raw, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N);
 }
-template <int MT, int TZ, typename T, typename TO> static void launch_f8p(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, gnp_t gp, double *osum, int Go, split_t sp) {
+template <int MT, int TZ, typename T, typename TO> void launch_f8p(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, gnp_t gp, double *osum, int Go, split_t sp) {
     constexpr int TT = (TZ + 2) * 180, BM = MT * 16;
     size_t smem = (size_t)TT * 16 + 16 + 64 + P16_KS * BM * 32 + ((P16_KS * BM + 15) & ~15) + 32 * sizeof(chan_t) + 64 * 4;
     if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
@@ -430,7 +430,7 @@ template <typename T, typename TO> static void p16_f8(const void *x, shape5 xs, 
     default: launch_f8p<4, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     }
 }
-template <int MT, int TZ, typename T, typename TO> static void launch_f8g(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, int Cip, gnp_t gp, double *osum, int Go, split_t sp) {
+template <int MT, int TZ, typename T, typename TO> void launch_f8g(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, int Cip, gnp_t gp, double *osum, int Go, split_t sp) {
     constexpr int TT = (TZ + 2) * 180;
     size_t smem = (size_t)TT * 32 + ((TT + 127) & ~127) + 9 * MT * 16 * 33 + 64 + 32 * sizeof(chan_t) + 32 * 8 + 16 + (sp.up ? (TZ / 2 + 4) * 96 * 33 + 16 : 0);
     if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
@@ -448,6 +448,10 @@ template <typename T, typename TO = T> void fwd_f8_t(const void *x, shape5 xs, c
         else small_f8<16, T, TO>(x, xs, w, b, cout, y, gp, osum, Go, sp);
         return;
     }
+    if constexpr (!std::is_same<T, TO>::value) {   /* mixed in / out types exist only for the network stem (Ci <= 8, small kernel):
+                                                       the general kernels are not instantiated for them (compile time) */
+        fprintf(stderr, "lp_conv_fwd_f8: mixed input / output storage needs the small-channel kernel (Ci %d, UFSM_F8_NOSMALL unset)\n", xs.c); abort();
+    } else {
     int Cop = (cout + 15) / 16 * 16, Cip = (xs.c + 31) / 32 * 32;
     int Cx = sp.x2 ? sp.c_split : xs.c, CxP = (Cx + 31) / 32 * 32;
     int Ox = sp.y2 ? sp.o_split : cout, OxP = (Ox + 31) / 32 * 32;
@@ -477,5 +481,6 @@ template <typename T, typename TO = T> void fwd_f8_t(const void *x, shape5 xs, c
     case 22: launch_f8g<2, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp); break;
     case 24: launch_f8g<2, 4, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp); break;
     default: launch_f8g<4, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp); break;
+    }
     }
 }

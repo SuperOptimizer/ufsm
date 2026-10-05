@@ -3,3 +3,4 @@ runs/
 *.raw
 *.pgm
 __pycache__/
+build-verify/

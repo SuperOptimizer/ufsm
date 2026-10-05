@@ -4,6 +4,14 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* bf16 / fp32 tensor-core instantiations (verification, legacy --f16 0) are only compiled with -DUFSM_ALL_TYPES
+   (make VERIFY=1); otherwise a call routed to one stops with a message instead of running. */
+void ufsm_no_verify_types(const char *fn);
+#ifdef UFSM_ALL_TYPES
+#define VERIFY_ONLY(...) (__VA_ARGS__)
+#else
+#define VERIFY_ONLY(...) (ufsm_no_verify_types(__func__), 0)
+#endif
 typedef struct { const float *gamma, *beta, *mean, *rstd; int G; } gnp_t;   /* G == 0: no transform */
 /* channel split: input channels >= c_split come from x2 (channel ci - c_split); output channels >= o_split go to y2 */
 /* accum: y += conv instead of y = conv. gp2 (G > 0): GroupNorm + SiLU of the x2 segment (its own channel indices / groups);

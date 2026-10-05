@@ -1,4 +1,15 @@
 # ufsm — C23 host code (gcc), CUDA kernels (nvcc) added later.
+# Default build: the fp16 / MX kernels used by training and inference. VERIFY=1 builds the bf16 and fp32 tensor-core
+# instantiations as well (verification, legacy --f16 0) into build-verify/, so the two builds never invalidate each other.
+VERIFY ?= 0
+ifeq ($(VERIFY),1)
+B := build-verify
+TYPEFLAGS := -DUFSM_ALL_TYPES
+else
+B := build
+TYPEFLAGS :=
+endif
+
 CC      ?= gcc
 NVCC    ?= nvcc
 CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -pthread
@@ -9,230 +20,238 @@ NVFLAGS ?= -O3 -arch=sm_120 -use_fast_math -Xcompiler -fno-threadsafe-statics -I
 CUDALIBS = -L$(CUDA)/lib64 -lcudart
 
 SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/ct_augment.c src/spatial_augment.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/unet.c src/split.c src/predict.c src/eval.c
-OBJ  = $(patsubst src/%.c,build/%.o,$(SRC)) build/surfcomp.o
+OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
-all: build/ufsm
+all: $(B)/ufsm
 
-build/%.o: src/%.c src/*.h third_party/volcomp.h | build
+# make test: the default binary (used by the python CLI tests), then the whole suite on the VERIFY=1 build
+test:
+	$(MAKE) VERIFY=0 build/ufsm
+	$(MAKE) VERIFY=1 test-all
+
+$(B)/%.o: src/%.c src/*.h third_party/volcomp.h | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-build/surfcomp.o: third_party/surfcomp/surfcomp.c third_party/surfcomp/*.h | build
+$(B)/surfcomp.o: third_party/surfcomp/surfcomp.c third_party/surfcomp/*.h | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Wno-all -Wno-extra -c $< -o $@
 
-build/ufsm: $(OBJ) build/main.o build/nn.o build/nn_fp8.o
+$(B)/ufsm: $(OBJ) $(B)/main.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 
 # The CUDA ops are split by section (src/nn_*.cu, shared declarations / device helpers / templates in src/nn_common.cuh)
-# so make -j compiles them in parallel; build/nn.o is their relocatable link.
+# so make -j compiles them in parallel; $(B)/nn.o is their relocatable link.
 NNSRC = $(wildcard src/nn_*.cu)
-NNOBJ = $(patsubst src/%.cu,build/%.o,$(NNSRC))
-build/nn_%.o: src/nn_%.cu src/nn_common.cuh src/nn.h src/nn_lp.h | build
-	$(NVCC) $(NVFLAGS) -Xfatbin=-compress-all -c $< -o $@
-build/nn.o: $(NNOBJ)
+NNOBJ = $(patsubst src/%.cu,$(B)/%.o,$(NNSRC))
+$(B)/nn_%.o: src/nn_%.cu | $(B)
+	$(NVCC) $(NVFLAGS) $(TYPEFLAGS) -Xfatbin=-compress-all -MMD -MP -c $< -o $@
+$(B)/nn.o: $(NNOBJ)
 	ld -r -o $@ $^
 # FP8 / FP4 block-scaled mma (kind::mxf8f6f4 / kind::mxf4) needs the arch-specific sm_120a target
 # The low-precision kernels are split into one translation unit per kernel family (src/lp_*.cu, shared helpers in
-# src/lp_common.cuh) so make -j compiles them in parallel; build/nn_fp8.o is their relocatable link, so every target
-# that links build/nn_fp8.o is unchanged.
+# src/lp_common.cuh) so make -j compiles them in parallel; $(B)/nn_fp8.o is their relocatable link, so every target
+# that links $(B)/nn_fp8.o is unchanged.
 LPSRC = $(wildcard src/lp_*.cu)
-LPOBJ = $(patsubst src/%.cu,build/%.o,$(LPSRC))
-build/lp_%.o: src/lp_%.cu $(wildcard src/lp_*.cuh) src/nn.h src/nn_lp.h | build
-	$(NVCC) -O3 -gencode arch=compute_120a,code=sm_120a -use_fast_math -Xcompiler -fno-threadsafe-statics -Xfatbin=-compress-all -Isrc -c $< -o $@
-build/nn_fp8.o: $(LPOBJ)
+LPOBJ = $(patsubst src/%.cu,$(B)/%.o,$(LPSRC))
+$(B)/lp_%.o: src/lp_%.cu | $(B)
+	$(NVCC) -O3 -gencode arch=compute_120a,code=sm_120a -use_fast_math -Xcompiler -fno-threadsafe-statics $(TYPEFLAGS) -Xfatbin=-compress-all -MMD -MP -Isrc -c $< -o $@
+$(B)/nn_fp8.o: $(LPOBJ)
 	ld -r -o $@ $^
 
-build/unet.o: src/unet.c src/unet.h src/nn.h | build
+$(B)/unet.o: src/unet.c src/unet.h src/nn.h | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-build/prof_infer: tests/prof_infer.c build/unet.o build/nn.o build/nn_fp8.o
+$(B)/prof_infer: tests/prof_infer.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
-build/test_nn: tests/test_nn.c build/nn.o build/nn_fp8.o
+$(B)/test_nn: tests/test_nn.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
-build/bench_conv: tests/bench_conv.c build/nn.o build/nn_fp8.o
+$(B)/bench_conv: tests/bench_conv.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
-build/prec_sweep: tests/prec_sweep.c build/unet.o build/nn.o build/nn_fp8.o
+$(B)/prec_sweep: tests/prec_sweep.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
-build/test_rc: tests/test_rc.c build/nn.o build/nn_fp8.o
+$(B)/test_rc: tests/test_rc.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-build/test_muon: tests/test_muon.c build/nn.o build/nn_fp8.o
+$(B)/test_muon: tests/test_muon.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-build/test_checkpoint: tests/test_checkpoint.c build/unet.o build/nn.o build/nn_fp8.o
+$(B)/test_checkpoint: tests/test_checkpoint.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-build/test_optimizer_owners: tests/test_optimizer_owners.c src/unet.c src/*.h build/nn.o build/nn_fp8.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_optimizer_owners.c build/nn.o build/nn_fp8.o -o $@ $(CUDALIBS) -lm
+$(B)/test_optimizer_owners: tests/test_optimizer_owners.c src/unet.c src/*.h $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_optimizer_owners.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(CUDALIBS) -lm
 
-build/test_wide_up_grad: tests/test_wide_up_grad.c src/unet.c src/*.h build/nn.o build/nn_fp8.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_wide_up_grad.c build/nn.o build/nn_fp8.o -o $@ $(CUDALIBS) -lm
-build/test_gn_contract: tests/test_gn_contract.c build/nn.o build/nn_fp8.o
+$(B)/test_wide_up_grad: tests/test_wide_up_grad.c src/unet.c src/*.h $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_wide_up_grad.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(CUDALIBS) -lm
+$(B)/test_gn_contract: tests/test_gn_contract.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-build/test_stem_precision: tests/test_stem_precision.c build/nn.o build/nn_fp8.o
+$(B)/test_stem_precision: tests/test_stem_precision.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-build/test_wgrad_staging: tests/test_wgrad_staging.c build/nn.o build/nn_fp8.o
+$(B)/test_wgrad_staging: tests/test_wgrad_staging.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-build/test_infer_buffers: tests/test_infer_buffers.c build/unet.o build/nn.o build/nn_fp8.o
+$(B)/test_infer_buffers: tests/test_infer_buffers.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-build/test_recompute_live: tests/test_recompute_live.c build/unet.o build/nn.o build/nn_fp8.o
+$(B)/test_recompute_live: tests/test_recompute_live.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-build/bench_gn: tests/bench_gn.c build/nn.o build/nn_fp8.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-
-build/bench_mem: tests/bench_mem.c build/unet.o build/nn.o build/nn_fp8.o
+$(B)/bench_gn: tests/bench_gn.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
-build/test_mx: tests/test_mx.c build/nn.o build/nn_fp8.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-build/test_mx4: tests/test_mx4.c build/nn.o build/nn_fp8.o
+$(B)/bench_mem: tests/bench_mem.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
-build/test_unet: tests/test_unet.c build/unet.o build/nn.o build/nn_fp8.o
+$(B)/test_mx: tests/test_mx.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-build/test_split: tests/test_split.c build/unet.o build/split.o build/nn.o build/nn_fp8.o
+$(B)/test_mx4: tests/test_mx4.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-SAMPLE_TEST_OBJ = build/sheet.o build/ct_augment.o build/spatial_augment.o build/cover.o build/json.o build/store.o build/zarr3.o build/sources.o build/zarr2.o build/tiff.o build/z3w.o build/hf.o build/zipr.o
-build/test_sample_ops: tests/test_sample_ops.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
+
+$(B)/test_unet: tests/test_unet.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/test_split: tests/test_split.c $(B)/unet.o $(B)/split.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+SAMPLE_TEST_OBJ = $(B)/sheet.o $(B)/ct_augment.o $(B)/spatial_augment.o $(B)/cover.o $(B)/json.o $(B)/store.o $(B)/zarr3.o $(B)/sources.o $(B)/zarr2.o $(B)/tiff.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o
+$(B)/test_sample_ops: tests/test_sample_ops.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_sample_ops.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
-build/test_sampler_safety: tests/test_sampler_safety.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
+$(B)/test_sampler_safety: tests/test_sampler_safety.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_sampler_safety.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
-build/test_spatial_augment: tests/test_spatial_augment.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
+$(B)/test_spatial_augment: tests/test_spatial_augment.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_spatial_augment.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
 
-build/test_raster: tests/test_raster.c src/ingest.c src/*.h $(SAMPLE_TEST_OBJ) build/surfcomp.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_raster.c $(SAMPLE_TEST_OBJ) build/surfcomp.o -o $@ $(LDLIBS)
+$(B)/test_raster: tests/test_raster.c src/ingest.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_raster.c $(SAMPLE_TEST_OBJ) $(B)/surfcomp.o -o $@ $(LDLIBS)
 
-build/check_surface_samples: tools/check_surface_samples.c build/sample.o $(SAMPLE_TEST_OBJ)
+$(B)/check_surface_samples: tools/check_surface_samples.c $(B)/sample.o $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
-build/bench_sampler: tests/bench_sampler.c build/sample.o build/sheet.o build/ct_augment.o build/spatial_augment.o build/cover.o build/sources.o build/zarr3.o build/zarr2.o build/store.o build/json.o build/z3w.o build/tiff.o build/zipr.o build/hf.o build/nn.o build/nn_fp8.o
+$(B)/bench_sampler: tests/bench_sampler.c $(B)/sample.o $(B)/sheet.o $(B)/ct_augment.o $(B)/spatial_augment.o $(B)/cover.o $(B)/sources.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-build/bench_read: tests/bench_read.c build/sample.o build/sheet.o build/ct_augment.o build/spatial_augment.o build/cover.o build/sources.o build/zarr3.o build/zarr2.o build/store.o build/json.o build/z3w.o build/tiff.o build/zipr.o build/hf.o build/nn.o build/nn_fp8.o
+$(B)/bench_read: tests/bench_read.c $(B)/sample.o $(B)/sheet.o $(B)/ct_augment.o $(B)/spatial_augment.o $(B)/cover.o $(B)/sources.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-build/fwd_nan: tests/fwd_nan.c build/unet.o build/nn.o build/nn_fp8.o
+$(B)/fwd_nan: tests/fwd_nan.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-build/test_fused: tests/test_fused.c build/nn.o build/nn_fp8.o
+$(B)/test_fused: tests/test_fused.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-build/bench_lp: tests/bench_lp.c build/nn.o build/nn_fp8.o
+$(B)/bench_lp: tests/bench_lp.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-build/train_lp: tests/train_lp.c build/unet.o build/nn.o build/nn_fp8.o
+$(B)/train_lp: tests/train_lp.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
-build/test_formats: tests/test_formats.c $(OBJ) build/nn.o build/nn_fp8.o
+$(B)/test_formats: tests/test_formats.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 
-build/test_ct_augment: tests/test_ct_augment.c build/ct_augment.o
+$(B)/test_ct_augment: tests/test_ct_augment.c $(B)/ct_augment.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
 
-build/test_target_erode: tests/test_target_erode.c src/target_erode.h | build
+$(B)/test_target_erode: tests/test_target_erode.c src/target_erode.h | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
-test: build/test_target_erode
+test-all: $(B)/test_target_erode
 
-build/test_cover: tests/test_cover.c build/cover.o build/json.o
+$(B)/test_cover: tests/test_cover.c $(B)/cover.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lcrypto -lm
 
-build/test_sheet: tests/test_sheet.c build/sheet.o build/json.o
+$(B)/test_sheet: tests/test_sheet.c $(B)/sheet.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lcrypto -lm
 
-build/test_sheet_gpu: tests/test_sheet_gpu.c build/split.o build/nn.o build/nn_fp8.o
+$(B)/test_sheet_gpu: tests/test_sheet_gpu.c $(B)/split.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
-build/test_wgrad_grid: tests/test_wgrad_grid.c build/nn.o build/nn_fp8.o
+$(B)/test_wgrad_grid: tests/test_wgrad_grid.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
-test-sheet: build/test_sheet build/test_spatial_augment
-	./build/test_spatial_augment
+test-sheet: $(B)/test_sheet $(B)/test_spatial_augment
+	./$(B)/test_spatial_augment
 	python3 tests/test_sheet_geometry.py
 	python3 tests/test_sheet_native.py
 	python3 tests/test_sheet_pipeline.py
 	python3 tests/test_sheet_watch.py
 	python3 tests/test_extend_surface_training.py
 
-test-sheet-gpu: build/ufsm build/test_sheet_gpu build/test_wgrad_grid build/make_pipeline_fixture
-	./build/test_wgrad_grid
-	./build/test_sheet_gpu
+test-sheet-gpu: $(B)/ufsm $(B)/test_sheet_gpu $(B)/test_wgrad_grid $(B)/make_pipeline_fixture
+	./$(B)/test_wgrad_grid
+	./$(B)/test_sheet_gpu
 	python3 tests/test_sheet_cli.py
 
-build/test_json: tests/test_json.c build/json.o
+$(B)/test_json: tests/test_json.c $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
-build/test_http_reader: tests/test_http_reader.c build/store.o build/zarr3.o build/json.o
+$(B)/test_http_reader: tests/test_http_reader.c $(B)/store.o $(B)/zarr3.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
-build/test_checkpoint_runtime: tests/test_checkpoint_runtime.c build/checkpoint.o build/json.o
+$(B)/test_checkpoint_runtime: tests/test_checkpoint_runtime.c $(B)/checkpoint.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lm
 
-build/make_pipeline_fixture: tests/make_pipeline_fixture.c build/z3w.o
+$(B)/make_pipeline_fixture: tests/make_pipeline_fixture.c $(B)/z3w.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
-build/test_eval: tests/test_eval.c src/eval.c $(SAMPLE_TEST_OBJ)
+$(B)/test_eval: tests/test_eval.c src/eval.c $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_eval.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
 
-test: build/test_wgrad_grid
+test-all: $(B)/test_wgrad_grid
 
-build:
-	mkdir -p build
+$(B):
+	mkdir -p $(B)
 
-test: build/test_sheet build/test_sheet_gpu build/test_cover build/test_ct_augment build/check_surface_samples build/test_raster build/test_http_reader build/test_wide_up_grad build/test_wgrad_staging build/test_stem_precision build/test_gn_contract build/test_sampler_safety build/test_optimizer_owners build/test_infer_buffers build/test_recompute_live build/test_checkpoint_runtime build/make_pipeline_fixture build/test_checkpoint build/test_eval build/test_sample_ops build/test_json build/test_nn build/test_unet build/test_fused build/test_formats build/ufsm build/test_mx build/test_mx4 build/test_rc build/test_split
-	./build/test_target_erode
+test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/check_surface_samples $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_rc $(B)/test_split
+	./$(B)/test_target_erode
 	$(MAKE) test-sheet
-	./build/test_wgrad_grid
-	./build/test_sheet_gpu
+	./$(B)/test_wgrad_grid
+	./$(B)/test_sheet_gpu
 	python3 tests/test_sheet_cli.py
-	./build/test_cover
-	./build/test_ct_augment
+	./$(B)/test_cover
+	./$(B)/test_ct_augment
 	python3 tests/test_training_cover.py
 	python3 tests/test_production_cover.py
 	python3 tests/test_http_reader.py
 	python3 tests/test_eval_holdouts.py
 	python3 tests/test_evaluation_plan.py
 	python3 tests/test_gpu_leases.py
-	./build/test_checkpoint_runtime
-	./build/test_infer_buffers
-	./build/test_recompute_live
+	./$(B)/test_checkpoint_runtime
+	./$(B)/test_infer_buffers
+	./$(B)/test_recompute_live
 	python3 tests/test_pipeline_cli.py
 	python3 tests/test_cover_training.py
 	python3 tests/test_production.py
-	./build/test_checkpoint
-	./build/test_optimizer_owners
-	./build/test_wide_up_grad
-	UFSM_TEST_SR=0 ./build/test_wide_up_grad
-	./build/test_gn_contract
-	UFSM_FUSED_STORED_GN=0 ./build/test_gn_contract
-	./build/test_stem_precision
-	./build/test_wgrad_staging
-	./build/test_eval
-	./build/test_sample_ops
-	./build/test_raster
+	./$(B)/test_checkpoint
+	./$(B)/test_optimizer_owners
+	./$(B)/test_wide_up_grad
+	UFSM_TEST_SR=0 ./$(B)/test_wide_up_grad
+	./$(B)/test_gn_contract
+	UFSM_FUSED_STORED_GN=0 ./$(B)/test_gn_contract
+	./$(B)/test_stem_precision
+	./$(B)/test_wgrad_staging
+	./$(B)/test_eval
+	./$(B)/test_sample_ops
+	./$(B)/test_raster
 	python3 tests/test_surface_store.py
 	python3 tests/test_sampler_safety.py
-	./build/test_mx
-	./build/test_mx4
-	UFSM_F4W_LAYOUT=1 ./build/test_mx4
-	./build/test_rc
-	UFSM_FUSED_UP=0 UFSM_F16=1 ./build/test_unet
-	UFSM_RECOMPUTE=2 UFSM_F16=1 ./build/test_unet
-	./build/test_json
-	./build/test_nn
-	./build/test_unet
-	UFSM_P=48 UFSM_B=1 ./build/test_unet
-	UFSM_F16=1 ./build/test_unet
-	./build/test_fused
-	UFSM_F16=1 ./build/test_fused
-	./build/test_split
-	UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./build/test_split
-	UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 ./build/test_split
-	UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 UFSM_RC_KEEP_COARSE=1 ./build/test_split
-	UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./build/test_split
+	./$(B)/test_mx
+	./$(B)/test_mx4
+	UFSM_F4W_LAYOUT=1 ./$(B)/test_mx4
+	./$(B)/test_rc
+	UFSM_FUSED_UP=0 UFSM_F16=1 ./$(B)/test_unet
+	UFSM_RECOMPUTE=2 UFSM_F16=1 ./$(B)/test_unet
+	./$(B)/test_json
+	./$(B)/test_nn
+	./$(B)/test_unet
+	UFSM_P=48 UFSM_B=1 ./$(B)/test_unet
+	UFSM_F16=1 ./$(B)/test_unet
+	./$(B)/test_fused
+	UFSM_F16=1 ./$(B)/test_fused
+	./$(B)/test_split
+	UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./$(B)/test_split
+	UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 ./$(B)/test_split
+	UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 UFSM_RC_KEEP_COARSE=1 ./$(B)/test_split
+	UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./$(B)/test_split
 	./tests/test_formats.sh
 	./tests/test_zarr.sh
 
 clean:
-	rm -rf build
+	rm -rf build build-verify
 
-.PHONY: all test clean
+.PHONY: all test test-all clean
 
-build/bench_wgrad4: tests/bench_wgrad4.c build/nn.o build/nn_fp8.o
+$(B)/bench_wgrad4: tests/bench_wgrad4.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+
+# header dependencies of the CUDA units (nvcc -MMD -MP)
+-include $(wildcard $(B)/nn_*.d $(B)/lp_*.d)

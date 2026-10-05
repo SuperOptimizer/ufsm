@@ -2,11 +2,17 @@
 #include "nn_common.cuh"
 /* instantiated in nn_fwdi*.cu */
 extern template int conv_fwd_tc_h<f16>(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts);
+#ifdef UFSM_ALL_TYPES
 extern template int conv_fwd_tc_h<bf16>(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts);
+#endif
 extern template int conv_fwd_tc_f16acc<f16>(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts);
+#ifdef UFSM_ALL_TYPES
 extern template int conv_fwd_tc_f16acc<bf16>(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts);
+#endif
 extern template int conv_fwd_tc_s2_h<f16>(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp);
+#ifdef UFSM_ALL_TYPES
 extern template int conv_fwd_tc_s2_h<bf16>(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp);
+#endif
 
 g_zs_t g_zs[8];
 void (*g_split_reduce)(double *, int);
@@ -56,14 +62,14 @@ int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *
     if (!ts && (pr == 2 || pr == 3) && !sp.up && g_pass == 1) { if (sr_on()) sp.sr = sr_seed(); }   /* backward-data: gy is the staged operand (fp8 dither / exact e2m1 SR) */
     if (!ts && pr == 2 && !sp.up) return lp_conv_fwd_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp);   /* sp.up: 16-bit kernels only */
     if (!ts && pr == 3 && !sp.up) { sp.wkey = conv_wkey(); return lp_conv_fwd_f4(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), gp, osum, Go, sp); }
-    if (pr == 4) return g_h16 ? conv_fwd_tc_f16acc<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : conv_fwd_tc_f16acc<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts);
-    return g_h16 ? conv_fwd_tc_h<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : conv_fwd_tc_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts);
+    if (pr == 4) return g_h16 ? conv_fwd_tc_f16acc<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : VERIFY_ONLY(conv_fwd_tc_f16acc<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts));
+    return g_h16 ? conv_fwd_tc_h<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : VERIFY_ONLY(conv_fwd_tc_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts));
 }
 int conv_fwd_tc_s2(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp) {
     exec_prec(g_pass, ISMX(x) || ISMX(y) || ((eff_prec() == 2 || eff_prec() == 3) && xbf == ybf) ? 2 : 1);
     if (ISMX(x) || ISMX(y)) { if (MXDT(x) != MXDT(y)) { fprintf(stderr, "conv s2: MX storage needs MX input and output of one format\n"); abort(); } return lp_conv_fwd_s2_f8(x, MXDT(x), xs, w, b, cout, y, MXDT(y), ys, gp); }
     if ((eff_prec() == 2 || eff_prec() == 3) && xbf == ybf) return lp_conv_fwd_s2_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), ys, gp);
-    return g_h16 ? conv_fwd_tc_s2_h<f16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp) : conv_fwd_tc_s2_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp);
+    return g_h16 ? conv_fwd_tc_s2_h<f16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp) : VERIFY_ONLY(conv_fwd_tc_s2_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp));
 }
 extern "C" shape5 nn_conv3d_out_shape(shape5 xs, int cout, int k, int stride) {
     shape5 o = {xs.n, cout, (xs.d + 2 * (k / 2) - k) / stride + 1, (xs.h + 2 * (k / 2) - k) / stride + 1, (xs.w + 2 * (k / 2) - k) / stride + 1};
