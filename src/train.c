@@ -156,7 +156,8 @@ int cmd_train(int argc, char **argv) {
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
-                        "       [--cover PLAN.json] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
+                        "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across evaluation pauses\n"
+                        "       [--cover PLAN.json] [--cover-next-pass 1] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
                         "       [--erode 0|1] [--soft SIGMA]   native binary-core erosion before softening (--levels 1,0,0,0)\n"
                         "       [--gn-stats stored|legacy]   fresh training uses stored activations; resume preserves the saved contract\n"
                         "       [--schedule-start STEP]   restart the LR schedule at this saved step, preserving optimizer state\n"
@@ -171,12 +172,19 @@ int cmd_train(int argc, char **argv) {
     float ema = (float)atof(opt(argc, argv, "--ema", "0.999")), clip = (float)atof(opt(argc, argv, "--clip", "5"));
     int warmup = atoi(opt(argc, argv, "--warmup", "500")), workers = atoi(opt(argc, argv, "--workers", "12"));
     double seconds = atof(opt(argc, argv, "--seconds", "0"));
+    double schedule_seconds = atof(opt(argc, argv, "--schedule-seconds", "0"));
+    double schedule_elapsed = atof(opt(argc, argv, "--schedule-elapsed", "0"));
+    if (!isfinite(schedule_seconds) || schedule_seconds < 0 || !isfinite(schedule_elapsed) || schedule_elapsed < 0 ||
+        (schedule_seconds && (seconds || schedule_elapsed >= schedule_seconds)) || (!schedule_seconds && schedule_elapsed)) {
+        fprintf(stderr, "invalid wall-time schedule horizon/elapsed or conflicting --seconds\n"); return 2;
+    }
+    double time_horizon = schedule_seconds ? schedule_seconds : seconds;
     double limit_seconds = atof(opt(argc, argv, "--limit-seconds", "0"));
     if (!isfinite(limit_seconds) || limit_seconds < 0) { fprintf(stderr, "invalid limit-seconds\n"); return 2; }
     double warmup_seconds = atof(opt(argc, argv, "--warmup-seconds", "-1"));
     if (!isfinite(seconds) || seconds < 0 || !isfinite(warmup_seconds) || warmup_seconds < -1) { fprintf(stderr, "invalid time budget\n"); return 2; }
-    if (warmup_seconds < 0) warmup_seconds = seconds * 0.05;
-    if (seconds && warmup_seconds >= seconds) { fprintf(stderr, "warmup-seconds must be less than seconds\n"); return 2; }
+    if (warmup_seconds < 0) warmup_seconds = time_horizon * 0.05;
+    if (time_horizon && warmup_seconds >= time_horizon) { fprintf(stderr, "warmup-seconds must be less than time horizon\n"); return 2; }
     int nval = atoi(opt(argc, argv, "--val-batches", "8")), log_every = atoi(opt(argc, argv, "--log-every", "20"));
     int val_every = atoi(opt(argc, argv, "--val-every", "500")), ckpt_every = atoi(opt(argc, argv, "--ckpt-every", "1000"));
     uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "0"));
@@ -271,12 +279,17 @@ int cmd_train(int argc, char **argv) {
     const char *cover_path = opt(argc, argv, "--cover", nullptr);
     int has_cover = resume ? cover_checkpoint_read(resume, &prior_cover) : 0;
     if (has_cover < 0 || (has_cover && !cover_path)) { fprintf(stderr, "finite-cover resume requires its original plan\n"); return 2; }
+    int next_pass = atoi(opt(argc, argv, "--cover-next-pass", "0"));
+    if (next_pass < 0 || next_pass > 1 || (next_pass && (!has_cover || !cover_path || prior_cover.cursor != prior_cover.count))) {
+        fprintf(stderr, "--cover-next-pass requires a completed finite-cover checkpoint and the next plan\n"); return 2;
+    }
+    if (next_pass) has_cover = 0; /* Keep model, EMA, optimizer and global step; reset only the tile cursor. */
     if (cover_path) {
         if (B != 1 || nl != 1 || overfit || seconds || atoi(opt(argc, argv, "--finetune", "0"))) { fprintf(stderr, "cover requires B=1, one window per step, step-based schedule and no overfit/finetune\n"); return 2; }
         plan = cover_load(cover_path, S, P); if (!plan) return 2;
         const char *pinned = opt(argc, argv, "--cover-sha256", plan->sha256);
         if (strcmp(pinned, plan->sha256) || (has_cover && (strcmp(prior_cover.sha256, plan->sha256) || prior_cover.count != plan->count))) { fprintf(stderr, "cover SHA256/count mismatch\n"); return 2; }
-        coverage = prior_cover; strcpy(coverage.sha256, plan->sha256); coverage.count = plan->count;
+        coverage = next_pass ? (cover_progress){0} : prior_cover; strcpy(coverage.sha256, plan->sha256); coverage.count = plan->count;
         sc.cover = plan; sc.cover_start = coverage.cursor; sc.deterministic = 1; sc.snap = 0;
         memset(sc.level_p, 0, sizeof sc.level_p); sc.level_p[0] = 1;
     }
@@ -577,13 +590,13 @@ int cmd_train(int argc, char **argv) {
         for (int g = 0; g < nl; g++) for (int c = 0; c < 2 * NCH; c++) if (!isfinite(parts[g][c])) fwd_nan = 1;
         if (fwd_nan && !overfit && !split) diagnose_nan(&G[0], B, P, step, out);
         float lr;
-        if (seconds) {
-            double elapsed = fmin(now() - t0, seconds);
+        if (time_horizon) {
+            double elapsed = fmin(schedule_elapsed + now() - t0, time_horizon);
             if (elapsed < warmup_seconds) lr = lr0 * (float)(elapsed / warmup_seconds);
             else if (!strcmp(sched, "wsd")) {
-                double cd0 = seconds * (1.0 - cooldown);
-                lr = elapsed < cd0 ? lr0 : lr0 * (float)((seconds - elapsed) / (seconds - cd0));
-            } else lr = lr0 * 0.5f * (1.f + cosf(3.14159265f * (float)((elapsed - warmup_seconds) / (seconds - warmup_seconds))));
+                double cd0 = time_horizon * (1.0 - cooldown);
+                lr = elapsed < cd0 ? lr0 : lr0 * (float)((time_horizon - elapsed) / (time_horizon - cd0));
+            } else lr = lr0 * 0.5f * (1.f + cosf(3.14159265f * (float)((elapsed - warmup_seconds) / (time_horizon - warmup_seconds))));
         }
         else {
             int ss = step - schedule_start, total = steps - schedule_start;
