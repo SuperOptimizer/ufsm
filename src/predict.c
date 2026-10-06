@@ -167,6 +167,7 @@ int cmd_predict(int argc, char **argv) {
         if (!sheet || strcmp(geometry_sha,sheet->manifest_sha) || strcmp(reference_sha,sheet->reference_sha) || level!=0) { fprintf(stderr,"winding reference mismatch or non-native level\n"); return 2; }
     }
     if (embedded < 0 || unet_peek(ckpt, &cfg, &step) || cfg.nlev < 1 || cfg.nlev > UNET_MAXLEV) { fprintf(stderr, "cannot read checkpoint settings: %s\n", ckpt); return 1; }
+    nn_set_nlev(cfg.nlev);   /* layer names of the embedded / requested policy */
     if (out_ch < 0 || out_ch >= cfg.cout) { fprintf(stderr, "predict: --channel %d outside the checkpoint's %d outputs\n", out_ch, cfg.cout); return 2; }
     const char *gn_stats = opt(argc, argv, "--gn-stats", embedded && runtime.gn_stored ? "stored" : "legacy");
     if (strcmp(gn_stats, "stored") && strcmp(gn_stats, "legacy")) { fprintf(stderr, "--gn-stats must be stored or legacy\n"); return 2; }

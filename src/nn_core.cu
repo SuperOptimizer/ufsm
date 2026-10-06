@@ -10,6 +10,27 @@ extern "C" void nn_set_tf32(int on) { g_tf32 = on; g_prec = on ? g_pref : 0; }
 extern "C" void nn_set_prec(int p) { g_prec = p; g_tf32 = p > 0; if (p > 0) g_pref = p; }   /* the fp8/fp4 kernels accept fp32, bf16 or fp16 storage */
 extern "C" int nn_get_prec(void) { return g_prec; }
 int g_layer = -1, g_lprec[NN_MAXLAYER];
+/* U-Net depth L behind the layer ids: enc0..enc(L-1) = 0..L-1, down0..down(L-2) = L..2L-2, dec(L-2)..dec0 = 2L-1..3L-3,
+   head = 3L-2 (L = 4: the original enc0..3 = 0..3, down0..2 = 4..6, dec2..0 = 7..9, head = 10) */
+int g_nlev = 4;
+static char g_policy[2048];   /* the last accepted policy, re-applied when the depth changes */
+extern "C" void nn_set_nlev(int L) {
+    if (L < 1 || 3 * L - 1 > NN_MAXLAYER || L == g_nlev) return;
+    g_nlev = L;
+    if (*g_policy) { char p[sizeof g_policy]; memcpy(p, g_policy, sizeof p); if (nn_set_prec_policy(p)) { fprintf(stderr, "precision policy '%s' does not fit a %d-level net\n", p, L); abort(); } }
+}
+extern "C" int nn_get_nlev(void) { return g_nlev; }
+static int nlayers(void) { return 3 * g_nlev - 1; }
+static int layer_single(int l) { return (l >= g_nlev && l <= 2 * g_nlev - 2) || l == 3 * g_nlev - 2; }   /* down convs and the head */
+static const char *layer_name(int l, char b[16]) {
+    const int L = g_nlev;
+    if (l < L) snprintf(b, 16, "enc%d", l);
+    else if (l <= 2 * L - 2) snprintf(b, 16, "down%d", l - L);
+    else if (l <= 3 * L - 3) snprintf(b, 16, "dec%d", 3 * L - 3 - l);
+    else snprintf(b, 16, "head");
+    return b;
+}
+extern "C" const char *nn_layer_name(int id, char *buf) { return layer_name(id, buf); }   /* buf: 16 bytes */
 int g_lprec_init = 0;
 void lprec_init(void) { if (!g_lprec_init) { for (int i = 0; i < NN_MAXLAYER; i++) g_lprec[i] = -1; g_lprec_init = 1; } }
 extern "C" void nn_set_layer(int id) { g_layer = id; }
@@ -65,16 +86,17 @@ extern "C" int nn_prec_parse(const char *s) {
 }
 extern "C" const char *nn_prec_name(int p) { static const char *nm[] = {"fp32", "bf16", "fp8", "fp4", "fp16"}; return p >= 0 && p <= 4 ? nm[p] : "?"; }
 extern "C" int nn_set_prec_policy(const char *pol) {
-    static const char *names[] = {"enc0", "enc1", "enc2", "enc3", "down0", "down1", "down2", "dec2", "dec1", "dec0", "head"};
     lprec_init();
+    char nm[16];
     for (int i = 0; i < NN_MAXLAYER; i++) { g_lprec[i] = -1; nn_set_conv_prec(i, -1, 0, 0, 0); }
+    g_policy[0] = 0;
     if (!pol || !*pol) return 0;
-    char buf[2048]; snprintf(buf, sizeof buf, "%s", pol);
+    char buf[sizeof g_policy]; snprintf(buf, sizeof buf, "%s", pol);
     int pos = 0;
     char *save = nullptr;
     for (char *tok = strtok_r(buf, ", ", &save); tok; tok = strtok_r(nullptr, ", ", &save)) {
         char *eq = strchr(tok, '=');
-        if (!eq) { int v = nn_prec_parse(tok); if (v < 1 || pos >= 11) { fprintf(stderr, "nn_set_prec_policy: bad entry '%s'\n", tok); return -1; } g_lprec[pos++] = v; continue; }
+        if (!eq) { int v = nn_prec_parse(tok); if (v < 1 || pos >= nlayers()) { fprintf(stderr, "nn_set_prec_policy: bad entry '%s'\n", tok); return -1; } g_lprec[pos++] = v; continue; }
         *eq = 0;
         char *val = eq + 1, *c1 = strchr(val, ':'), *c2 = c1 ? strchr(c1 + 1, ':') : nullptr;
         int pv[3];
@@ -86,14 +108,15 @@ extern "C" int nn_set_prec_policy(const char *pol) {
         char *dot = strchr(tok, '.');
         if (dot) { if (!strcmp(dot, ".c1")) sub = 0; else if (!strcmp(dot, ".c2")) sub = 1; else { fprintf(stderr, "nn_set_prec_policy: bad conv '%s'\n", tok); return -1; } *dot = 0; }
         int lo = -1, hi = -1;
-        if (!strcmp(tok, "all")) { lo = 0; hi = 10; }
-        else for (int i = 0; i < 11; i++) if (!strcmp(tok, names[i])) lo = hi = i;
+        if (!strcmp(tok, "all")) { lo = 0; hi = nlayers() - 1; }
+        else for (int i = 0; i < nlayers(); i++) if (!strcmp(tok, layer_name(i, nm))) lo = hi = i;
         if (lo < 0) { fprintf(stderr, "nn_set_prec_policy: unknown layer '%s'\n", tok); return -1; }
         for (int i = lo; i <= hi; i++) {
             if (sub < 0 && pv[0] == pv[1] && pv[1] == pv[2]) { g_lprec[i] = pv[0]; nn_set_conv_prec(i, -1, 0, 0, 0); }
             else nn_set_conv_prec(i, sub, pv[0], pv[1], pv[2]);
         }
     }
+    snprintf(g_policy, sizeof g_policy, "%s", pol);
     return 0;
 }
 extern "C" int nn_get_tf32(void) { return g_tf32; }
@@ -104,23 +127,23 @@ int g_h16 = 0;
 extern "C" void nn_set_f16(int on) { g_h16 = on; }
 const char *pname16(int p) { return p == 1 && g_h16 ? "fp16" : nn_prec_name(p); }   /* prec 1 is the 16-bit storage type */
 extern "C" int nn_prec_manifest(char *buf, size_t n) {
-    static const char *names[] = {"enc0", "enc1", "enc2", "enc3", "down0", "down1", "down2", "dec2", "dec1", "dec0", "head"};
+    char nm[16];
     int sl = g_layer, ss = g_sub; size_t off = 0;
     if (!n) return 0;
     off += (size_t)snprintf(buf + off, n - off, "prec %s sr %d requested_policy:", pname16(g_prec), sr_on());
-    for (int l = 0; l < 11 && off < n; l++) for (int s2 = 0; s2 < (l >= 4 && l <= 6 ? 1 : l == 10 ? 1 : 2) && off < n; s2++) {
-        g_layer = l; g_sub = (l >= 4 && l <= 6) || l == 10 ? -1 : s2;
-        off += (size_t)snprintf(buf + off, n - off, " %s%s=%s:%s:%s", names[l], g_sub < 0 ? "" : s2 ? ".c2" : ".c1", pname16(eff_prec_pass(0)), pname16(eff_prec_pass(1)), pname16(eff_prec_pass(2)));
+    for (int l = 0; l < nlayers() && off < n; l++) for (int s2 = 0; s2 < (layer_single(l) ? 1 : 2) && off < n; s2++) {
+        g_layer = l; g_sub = layer_single(l) ? -1 : s2;
+        off += (size_t)snprintf(buf + off, n - off, " %s%s=%s:%s:%s", layer_name(l, nm), g_sub < 0 ? "" : s2 ? ".c2" : ".c1", pname16(eff_prec_pass(0)), pname16(eff_prec_pass(1)), pname16(eff_prec_pass(2)));
     }
     g_layer = sl; g_sub = ss;
     return (int)(off < n ? off : n - 1);
 }
 extern "C" int nn_exec_manifest(char *buf, size_t n) {
-    static const char *names[] = {"enc0", "enc1", "enc2", "enc3", "down0", "down1", "down2", "dec2", "dec1", "dec0", "head"};
+    char nm[16];
     if (!n) return 0;
     size_t off = (size_t)snprintf(buf, n, "executed_compute (fwd:bwd_data:wgrad; - = not observed):");
-    for (int l = 0; l < 11 && off < n; l++) for (int s2 = 0; s2 < ((l >= 4 && l <= 6) || l == 10 ? 1 : 2) && off < n; s2++) {
-        off += (size_t)snprintf(buf + off, n - off, " %s%s=", names[l], l >= 4 && (l <= 6 || l == 10) ? "" : s2 ? ".c2" : ".c1");
+    for (int l = 0; l < nlayers() && off < n; l++) for (int s2 = 0; s2 < (layer_single(l) ? 1 : 2) && off < n; s2++) {
+        off += (size_t)snprintf(buf + off, n - off, " %s%s=", layer_name(l, nm), layer_single(l) ? "" : s2 ? ".c2" : ".c1");
         for (int pass = 0; pass < 3 && off < n; pass++) {
             if (pass) off += (size_t)snprintf(buf + off, n - off, ":");
             unsigned mask = __atomic_load_n(&g_exec_prec[l][s2][pass], __ATOMIC_RELAXED);

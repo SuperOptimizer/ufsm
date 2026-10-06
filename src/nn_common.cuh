@@ -28,6 +28,9 @@ extern int g_layer, g_lprec[NN_MAXLAYER];
 extern int g_lprec_init;
 void lprec_init(void);
 extern "C" void nn_set_layer(int id);
+extern "C" void nn_set_nlev(int L);
+extern "C" int nn_get_nlev(void);
+extern "C" const char *nn_layer_name(int id, char *buf);
 extern "C" void nn_set_layer_prec(int id, int p);
 /* finer policy: per conv of a layer (sub 0 = c1, 1 = c2; down / head use sub 0) and per pass (0 forward, 1 backward-data,
    2 weight gradient); 0 = not set (falls back to the layer precision, then the global one) */
@@ -2261,45 +2264,60 @@ __global__ void muon_apply_k(float *p, const float *o, size_t n, float lr, float
 /* work: >= 2 Co K + 2 Co Co floats; the gradient of a [Co][K] weight (row-major) is orthogonalised with 5 Newton-Schulz
    iterations (coefficients from modded-nanogpt) and applied with lr * sqrt(max(1, Co / K)). mom is the momentum buffer. */
 extern "C" void nn_muon(float *p, const float *g, float *mom, int Co, int K, float lr, float beta, float wd, float *work);
-/* tiled small-matrix products for the orthogonalisation cascades (Muon, ANVIL): blockIdx.z = conv.
-   xxt: A[i][j] = sum_k X[i][k] X[j][k]; 16x16 output tile per block, K staged in 32-wide smem slabs (both operands are rows of X).
-   bx:  Y[i][k] = a X[i][k] + sum_j B[i][j] X[j][k]; B (Co x Co, <= 128x128 floats) staged in smem once, 128 k-columns per block. */
-template <typename DT> __global__ void __launch_bounds__(256) tile_xxt_k(const DT *d, int swap) {
-    const DT D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; int Co = D.Co, K = D.K;
-    int i0 = blockIdx.y * 16, j0 = blockIdx.x * 16; if (i0 >= Co || j0 >= Co) return;
-    __shared__ float sa[16][33], sb[16][33];
-    int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;   /* 256 threads: 16 x 16 outputs */
-    float acc = 0.f;
-    for (int k0 = 0; k0 < K; k0 += 32) {
-        for (int t = threadIdx.x; t < 16 * 32; t += 256) { int r = t >> 5, c = t & 31; int k = k0 + c;
-            sa[r][c] = (i0 + r < Co && k < K) ? X[(size_t)(i0 + r) * K + k] : 0.f;
-            sb[r][c] = (j0 + r < Co && k < K) ? X[(size_t)(j0 + r) * K + k] : 0.f; }
+/* batched register-tiled fp32 products of the orthogonalisation cascades (Muon, ANVIL), blockIdx.z = conv, any Co:
+   MODE 0 (xxt): A = X X^T          (M = N = Co, contraction K)
+   MODE 1 (sq):  B = b A + c A A    (M = N = contraction = Co)
+   MODE 2 (bx):  Y = b X + B X      (M = Co, N = K, contraction Co; Y is the other buffer)
+   64 x 64 output tile per block (grid x over N, y over M), 256 threads with 4 x 4 outputs each, the contraction staged 16
+   at a time. Every output sums its products in increasing contraction order in one accumulator, as the scalar kernels did. */
+template <int MODE, typename DT> __global__ void __launch_bounds__(256) gemm_ns_k(const DT *d, int swap, float b, float c) {
+    const DT D = d[blockIdx.z];
+    const int Co = D.Co, K = D.K, M = Co, N = MODE == 2 ? K : Co, KC = MODE == 0 ? K : Co;
+    const int m0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+    if (m0 >= M || n0 >= N) return;
+    const float *X = swap ? D.Y : D.X;
+    const float *Lm = MODE == 0 ? X : MODE == 1 ? D.A : D.B;   /* L[m][k], row stride KC */
+    const float *Rm = MODE == 1 ? D.A : X;                     /* R[k][n]: X[n][k] (MODE 0), A[k][n], X[k][n] */
+    __shared__ __align__(16) float sl[16][68], sr[16][68];     /* [k][m], [k][n] */
+    const int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;
+    float acc[4][4] = {};
+    for (int k0 = 0; k0 < KC; k0 += 16) {
+        for (int t = threadIdx.x; t < 1024; t += 256) {
+            const int r = t >> 4, kk = t & 15, m = m0 + r, k = k0 + kk;
+            sl[kk][r] = m < M && k < KC ? Lm[(size_t)m * KC + k] : 0.f;
+            if (MODE == 0) { const int n = n0 + r; sr[kk][r] = n < N && k < KC ? Rm[(size_t)n * K + k] : 0.f; }
+            else { const int k2 = k0 + (t >> 6), n = n0 + (t & 63); sr[t >> 6][t & 63] = n < N && k2 < KC ? Rm[(size_t)k2 * N + n] : 0.f; }
+        }
         __syncthreads();
 #pragma unroll
-        for (int c = 0; c < 32; c++) acc += sa[ty][c] * sb[tx][c];
+        for (int kk = 0; kk < 16; kk++) {
+            const float4 l = *(const float4 *)&sl[kk][ty * 4], r = *(const float4 *)&sr[kk][tx * 4];
+            const float lv[4] = {l.x, l.y, l.z, l.w}, rv[4] = {r.x, r.y, r.z, r.w};
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] += lv[i] * rv[j];
+        }
         __syncthreads();
     }
-    if (i0 + ty < Co && j0 + tx < Co) D.A[(size_t)(i0 + ty) * Co + j0 + tx] = acc;
-}
-template <typename DT> __global__ void __launch_bounds__(256) tile_bx_k(const DT *d, int swap, float a) {
-    const DT D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; float *Y = swap ? D.X : D.Y; int Co = D.Co, K = D.K;
-    __shared__ float sB[96 * 96];
-    for (int t = threadIdx.x; t < Co * Co; t += 256) sB[t] = D.B[t];
-    __syncthreads();
-    int k = blockIdx.x * 128 + (threadIdx.x & 127), ihalf = threadIdx.x >> 7;   /* two thread groups split the rows */
-    if (k >= K) return;
-    for (int i = ihalf; i < Co; i += 2) {
-        float s = 0.f; for (int j = 0; j < Co; j++) s += sB[i * Co + j] * X[(size_t)j * K + k];
-        Y[(size_t)i * K + k] = a * X[(size_t)i * K + k] + s;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int m = m0 + ty * 4 + i;
+        if (m >= M) continue;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int n = n0 + tx * 4 + j;
+            if (n >= N) continue;
+            if (MODE == 0) D.A[(size_t)m * Co + n] = acc[i][j];
+            else if (MODE == 1) D.B[(size_t)m * Co + n] = b * D.A[(size_t)m * Co + n] + c * acc[i][j];
+            else (swap ? D.X : D.Y)[(size_t)m * K + n] = b * X[(size_t)m * K + n] + acc[i][j];
+        }
     }
 }
 /* batched Muon: one launch per stage for all convs (blockIdx.z = conv). descs live on the device. */
 typedef struct { float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K; } muon_desc_t;
 __global__ void bmuon_mom_k(const muon_desc_t *d, float beta, double *ss);
 __global__ void bmuon_scale_k(const muon_desc_t *d, const double *ss);
-__global__ void bmm_xxt_k(const muon_desc_t *d, int swap);
-__global__ void bmm_sq_k(const muon_desc_t *d, float b, float c);
-__global__ void bmm_bx_k(const muon_desc_t *d, int swap, float a);
 __global__ void bmuon_apply_k(const muon_desc_t *d, int swap, float lr, float wd);
 /* descs: device array of nconv descriptors (p, g, mom, X, Y, A, B scratch of Co K, Co K, Co Co, Co Co floats, Co, K);
    maxco / maxk: the largest Co and K among them. 18 launches for all convs. */
@@ -2310,9 +2328,7 @@ extern "C" void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk,
 typedef struct { float *p; const float *g; float *v0, *X, *Y, *A, *B, *v1, *E, *R; int Co, K; } anvil_desc_t;
 __global__ void anvil_mom_k(const anvil_desc_t *d, float bf, float bs, float w, float mu, double *ss);
 __global__ void anvil_scale_k(const anvil_desc_t *d, const double *ss);
-__global__ void anvil_xxt_k(const anvil_desc_t *d, int swap);
 __global__ void anvil_sq_k(const anvil_desc_t *d, int it);
-__global__ void anvil_bx_k(const anvil_desc_t *d, int swap, int it);
 /* lane (row) power of the cascade output, one block per row */
 __global__ void anvil_rowpow_k(const anvil_desc_t *d, int swap);
 /* per conv: lane energy EMA, gain = 1/sqrt(E), global rescale to the pre-equalisation Frobenius norm; R <- row scale */

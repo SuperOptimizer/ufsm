@@ -7,7 +7,7 @@
 #include <time.h>
 
 static int g_prof = -1;
-static const char *g_names[8] = {"conv_fwd", "conv_bwd_data", "conv_bwd_w", "gn", "elementwise", "up/concat", "upload+loss+opt", ""};
+static const char *g_names[8] = {"conv_fwd", "conv_bwd_data", "conv_bwd_w", "gn", "elementwise", "up/concat", "loss", "optimizer"};
 /* UFSM_PROF=1: per-category event timing; UFSM_PROF=layers (or unet_prof_layers_on): also per conv, event category
    k + 8 * (slot + 1) with slot = 2 * layer + conv (layer ids as in nn_set_layer, conv 0 = c1 / single, 1 = c2) */
 #define PROF_INIT() do { if (g_prof < 0) { const char *e_ = getenv("UFSM_PROF"); g_prof = !e_ || !*e_ || !strcmp(e_, "0") ? 0 : !strcmp(e_, "layers") ? 2 : 1; } } while (0)
@@ -24,11 +24,15 @@ static void prof_collect(double *cat) {
 void unet_prof_report(void) {
     if (g_prof > 0) {
         double ms[8]; prof_collect(ms); double tot = 0;
-        for (int i = 0; i < 7; i++) tot += ms[i];
-        for (int i = 0; i < 7; i++) if (ms[i] > 0) fprintf(stderr, "  %-14s %8.1f ms  %4.1f%%\n", g_names[i], ms[i], 100 * ms[i] / tot);
+        for (int i = 0; i < 8; i++) tot += ms[i];
+        for (int i = 0; i < 8; i++) if (ms[i] > 0) fprintf(stderr, "  %-14s %8.1f ms  %4.1f%%\n", g_names[i], ms[i], 100 * ms[i] / tot);
         if (g_prof == 2) for (int i = 0; i < UNET_NSLOT; i++) {
             if (g_prof_slot[i][0] + g_prof_slot[i][1] + g_prof_slot[i][2] > 0)
-                fprintf(stderr, "  slot %2d fwd %.1f bwd_data %.1f bwd_w %.1f ms\n", i, g_prof_slot[i][0], g_prof_slot[i][1], g_prof_slot[i][2]);
+            {
+                char nm[16]; nn_layer_name(i / 2, nm);
+                fprintf(stderr, "  slot %2d fwd %.1f bwd_data %.1f bwd_w %.1f ms  %s%s\n", i, g_prof_slot[i][0], g_prof_slot[i][1], g_prof_slot[i][2], nm,
+                        !strncmp(nm, "down", 4) || !strcmp(nm, "head") ? "" : i % 2 ? ".c2" : ".c1");
+            }
             for (int j = 0; j < 3; j++) g_prof_slot[i][j] = 0;
         }
     }
@@ -659,6 +663,7 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
 const float *unet_forward(unet *u, const float *x, shape5 xs, int train) { return unet_forward_x(u, x, xs, train, 0); }
 const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x_h16) {
     const float *x = (const float *)xv;
+    nn_set_nlev(u->cfg.nlev);   /* layer ids / names of the precision policy, manifests and profiles (a no-op unless the depth changed) */
     int div = 1 << (u->cfg.nlev - 1);
     if (xs.d % div || xs.h % div || xs.w % div) { fprintf(stderr, "unet: spatial size %dx%dx%d must be divisible by %d\n", xs.d, xs.h, xs.w, div); abort(); }
     if (!u->built || memcmp(&u->xs, &xs, sizeof xs) || (train && !u->train) || u->mode != UMODE()) build_acts(u, xs, train);
@@ -678,7 +683,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         nn_set_layer(i); block_fwd(u, &u->enc[i], i, cur);
         cur = u->enc[i].s2;
         if (i < L - 1) {
-            nn_set_layer(4 + i);
+            nn_set_layer(L + i);
             if (recompute()) { nn_gn_t g = gn_out(u, &u->enc[i]); int r; PROF(0, r = nn_conv3d_fwd_x(u->enc[i].a2, &g, nullptr, nullptr, 0, 0, u->enc[i].ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i], 0, 0.f, nullptr, nullptr)); if (r) rc_fail("down conv"); }
             else PROF(0, nn_conv3d_fwd(cur, u->enc[i].ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i]));
             { shape5 ds = u->ls[i + 1]; ds.c = w[i]; sp_halo(u, u->downo[i], ds, 0); }
@@ -712,10 +717,10 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
                 nn_d2d(u->cat[i] + ((size_t)n * (w[i + 1] + w[i]) + w[i + 1]) * S, u->enc[i].s2 + (size_t)n * w[i] * S, (size_t)w[i] * S * 4);
             u->dec[i].in2 = nullptr;
         }
-        nn_set_layer(9 - i); block_fwd(u, &u->dec[i], i, u->cat[i]);
+        nn_set_layer(3 * L - 3 - i); block_fwd(u, &u->dec[i], i, u->cat[i]);
         cur = u->dec[i].s2;
     }
-    nn_set_layer(10);
+    nn_set_layer(3 * L - 2);
     if (recompute()) { nn_gn_t g = gn_out(u, &u->dec[0]); int r; PROF(0, r = nn_conv3d_fwd_x(u->dec[0].a2, &g, nullptr, nullptr, 0, 0, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, 1, 1, u->logits, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("head"); }
     else PROF(0, nn_conv3d_fwd(cur, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, 1, 1, u->logits));
     if (ufsm_env_on("UFSM_DEBUG") && !ABF && !recompute()) {
@@ -850,6 +855,7 @@ void unet_backward(unet *u, const float *glogits) { unet_backward_x(u, glogits, 
 void unet_backward_x(unet *u, const void *gv, int g_h16) {
     const float *glogits = (const float *)gv;
     int L = u->cfg.nlev;
+    nn_set_nlev(L);
     g_in_bwd = 1;
     const float gscale = GBF ? nn_get_grad_scale() : 1.f;
     sp_cfg(u);
@@ -867,7 +873,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     }
     block *d0 = &u->dec[0];
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
-    nn_set_layer(10);
+    nn_set_layer(3 * L - 2);
     if (recompute()) { nn_gn_t gg = gn_out(u, d0); int r; PROF(2, r = nn_conv3d_bwd_weight_x(d0->a2, &gg, nullptr, nullptr, 0, 0, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b)); if (r) rc_fail("head weight gradient"); }
     else PROF(2, nn_conv3d_bwd_weight(d0->s2, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b));
     PROF(1, nn_conv3d_bwd_data(glogits, os, P(u, u->head.w), d0->ys, 1, 1, u->gout[0], u->conv_scratch));
@@ -878,12 +884,12 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         shape5 li = u->ls[i];
         shape5 src = u->ls[i + 1]; src.c = w[i + 1];
         if (nn_get_tf32()) {
-            nn_set_layer(9 - i); float *gup = block_bwd(u, &u->dec[i], i, u->gout[i], u->gskip[i]);   /* gB[i]: grad wrt the upsampled part; skip grad written in place */
+            nn_set_layer(3 * L - 3 - i); float *gup = block_bwd(u, &u->dec[i], i, u->gout[i], u->gskip[i]);   /* gB[i]: grad wrt the upsampled part; skip grad written in place */
             if (gup) { shape5 us = li; us.c = w[i + 1]; sp_halo(u, gup, us, 1); }
             if (gup) PROF(5, nn_up2_bwd(gup, src, u->gout[i + 1]));   /* nullptr: chunk mode wrote gout[i + 1] */
             FQG(u->gout[i + 1], src);
         } else {
-            nn_set_layer(9 - i); float *gcat = block_bwd(u, &u->dec[i], i, u->gout[i], nullptr);       /* gB[i]: grad wrt concat */
+            nn_set_layer(3 * L - 3 - i); float *gcat = block_bwd(u, &u->dec[i], i, u->gout[i], nullptr);       /* gB[i]: grad wrt concat */
             PROF(5, nn_concat_bwd(gcat, w[i + 1], w[i], li, u->gA[i], u->gskip[i]));
             PROF(5, nn_up2_bwd(u->gA[i], src, u->gout[i + 1]));
         }
@@ -895,7 +901,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         if (i > 0) {
             /* enc[i] input = downo[i-1] = down[i-1](enc[i-1].s2): propagate to enc[i-1].s2, accumulate into gskip[i-1] */
             shape5 ds = u->enc[i].xs;                                     /* == down output shape */
-            nn_set_layer(4 + i - 1);
+            nn_set_layer(L + i - 1);
             sp_zero(u, gin, ds, 1);
             sp_begin(u, gin, ds, 1);
             if (recompute()) { nn_gn_t gg = gn_out(u, &u->enc[i - 1]); int r; PROF(2, r = nn_conv3d_bwd_weight_x(u->enc[i - 1].a2, &gg, nullptr, nullptr, 0, 0, u->enc[i - 1].ys, gin, ds, 3, 2, g + u->down[i - 1].w, g + u->down[i - 1].b)); if (r) rc_fail("down weight gradient"); }

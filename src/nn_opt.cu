@@ -72,25 +72,6 @@ __global__ void bmuon_scale_k(const muon_desc_t *d, const double *ss) {
     const muon_desc_t D = d[blockIdx.z]; size_t n = (size_t)D.Co * D.K; float inv = (float)(1.0 / (sqrt(ss[blockIdx.z]) + 1e-7));
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.X[i] *= inv;
 }
-__global__ void bmm_xxt_k(const muon_desc_t *d, int swap) {   /* A = X X^T; swap: X and Y roles alternate per iteration */
-    const muon_desc_t D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; int Co = D.Co, K = D.K;
-    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x; if (i >= Co || j >= Co) return;
-    const float *a = X + (size_t)i * K, *b = X + (size_t)j * K; float s = 0.f;
-    for (int k = 0; k < K; k++) s += a[k] * b[k];
-    D.A[(size_t)i * Co + j] = s;
-}
-__global__ void bmm_sq_k(const muon_desc_t *d, float b, float c) {   /* B = b A + c A A */
-    const muon_desc_t D = d[blockIdx.z]; int Co = D.Co;
-    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x; if (i >= Co || j >= Co) return;
-    float s = 0.f; for (int k = 0; k < Co; k++) s += D.A[(size_t)i * Co + k] * D.A[(size_t)k * Co + j];
-    D.B[(size_t)i * Co + j] = b * D.A[(size_t)i * Co + j] + c * s;
-}
-__global__ void bmm_bx_k(const muon_desc_t *d, int swap, float a) {   /* Y = a X + B X (into the other buffer) */
-    const muon_desc_t D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; float *Y = swap ? D.X : D.Y; int Co = D.Co, K = D.K;
-    int i = blockIdx.y; size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= Co || k >= (size_t)K) return;
-    float s = 0.f; for (int j = 0; j < Co; j++) s += D.B[(size_t)i * Co + j] * X[(size_t)j * K + k];
-    Y[(size_t)i * K + k] = a * X[(size_t)i * K + k] + s;
-}
 __global__ void bmuon_apply_k(const muon_desc_t *d, int swap, float lr, float wd) {
     const muon_desc_t D = d[blockIdx.z]; const float *O = swap ? D.Y : D.X; size_t n = (size_t)D.Co * D.K;
     float scale = sqrtf(fmaxf(1.f, (float)D.Co / (float)D.K));
@@ -99,17 +80,15 @@ __global__ void bmuon_apply_k(const muon_desc_t *d, int swap, float lr, float wd
 extern "C" void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta, float wd) {
     const muon_desc_t *d = (const muon_desc_t *)descs;
     double *ss = gn_dsums((size_t)nconv); cudaMemsetAsync(ss, 0, (size_t)nconv * sizeof(double));
-    dim3 g1(32, 1, nconv), gco(nblk(maxco, 128), maxco, nconv), gk(nblk(maxk, 256), maxco, nconv);
+    dim3 g1(32, 1, nconv), gco(nblk(maxco, 64), nblk(maxco, 64), nconv), gk(nblk(maxk, 64), nblk(maxco, 64), nconv);
     bmuon_mom_k<<<g1, 256>>>(d, beta, ss);
     bmuon_scale_k<<<g1, 256>>>(d, ss);
     const float a = 3.4445f, b = -4.7750f, c = 2.0315f;
     int swap = 0;
-    dim3 gxx(nblk(maxco, 16), nblk(maxco, 16), nconv), gbx(nblk(maxk, 128), 1, nconv);
-    const int tiled = maxco <= 96;
     for (int it = 0; it < 5; it++) {
-        if (tiled) tile_xxt_k<muon_desc_t><<<gxx, 256>>>(d, swap); else bmm_xxt_k<<<gco, 128>>>(d, swap);
-        bmm_sq_k<<<gco, 128>>>(d, b, c);
-        if (tiled) tile_bx_k<muon_desc_t><<<gbx, 256>>>(d, swap, a); else bmm_bx_k<<<gk, 256>>>(d, swap, a);
+        gemm_ns_k<0, muon_desc_t><<<gco, 256>>>(d, swap, 0.f, 0.f);
+        gemm_ns_k<1, muon_desc_t><<<gco, 256>>>(d, swap, b, c);
+        gemm_ns_k<2, muon_desc_t><<<gk, 256>>>(d, swap, a, 0.f);
         swap ^= 1;
     }
     bmuon_apply_k<<<g1, 256>>>(d, swap, lr, wd);
@@ -134,23 +113,11 @@ __global__ void anvil_scale_k(const anvil_desc_t *d, const double *ss) {
     const anvil_desc_t D = d[blockIdx.z]; size_t n = (size_t)D.Co * D.K; float inv = (float)(1.0 / (sqrt(ss[blockIdx.z]) * 1.05 + 1e-6));
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.X[i] *= inv;
 }
-__global__ void anvil_xxt_k(const anvil_desc_t *d, int swap) {
-    const anvil_desc_t D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; int Co = D.Co, K = D.K;
-    int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x; if (i >= Co || j >= Co) return;
-    const float *a = X + (size_t)i * K, *b = X + (size_t)j * K; float s = 0.f; for (int k = 0; k < K; k++) s += a[k] * b[k];
-    D.A[(size_t)i * Co + j] = s;
-}
 __global__ void anvil_sq_k(const anvil_desc_t *d, int it) {
     const anvil_desc_t D = d[blockIdx.z]; int Co = D.Co; float b = c_anvil_maps[it][1], c = c_anvil_maps[it][2];
     int i = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x; if (i >= Co || j >= Co) return;
     float s = 0.f; for (int k = 0; k < Co; k++) s += D.A[(size_t)i * Co + k] * D.A[(size_t)k * Co + j];
     D.B[(size_t)i * Co + j] = b * D.A[(size_t)i * Co + j] + c * s;
-}
-__global__ void anvil_bx_k(const anvil_desc_t *d, int swap, int it) {
-    const anvil_desc_t D = d[blockIdx.z]; const float *X = swap ? D.Y : D.X; float *Y = swap ? D.X : D.Y; int Co = D.Co, K = D.K; float a = c_anvil_maps[it][0];
-    int i = blockIdx.y; size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= Co || k >= (size_t)K) return;
-    float s = 0.f; for (int j = 0; j < Co; j++) s += D.B[(size_t)i * Co + j] * X[(size_t)j * K + k];
-    Y[(size_t)i * K + k] = a * X[(size_t)i * K + k] + s;
 }
 __global__ void anvil_rowpow_k(const anvil_desc_t *d, int swap) {
     const anvil_desc_t D = d[blockIdx.z]; const float *O = swap ? D.Y : D.X; int i = blockIdx.x; if (i >= D.Co) return;
@@ -177,17 +144,15 @@ __global__ void anvil_apply_k(const anvil_desc_t *d, int swap, float lr, float w
 extern "C" void nn_anvil_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta_fast, float beta_slow, float w_fast, float mu, float beta2, float wd) {
     const anvil_desc_t *d = (const anvil_desc_t *)descs;
     double *ss = gn_dsums((size_t)nconv); cudaMemsetAsync(ss, 0, (size_t)nconv * sizeof(double));
-    dim3 g1(32, 1, nconv), gco(nblk(maxco, 128), maxco, nconv), gk(nblk(maxk, 256), maxco, nconv), grow(maxco, 1, nconv);
+    dim3 g1(32, 1, nconv), gco(nblk(maxco, 128), maxco, nconv), g64(nblk(maxco, 64), nblk(maxco, 64), nconv), gk(nblk(maxk, 64), nblk(maxco, 64), nconv), grow(maxco, 1, nconv);
     anvil_mom_k<<<g1, 256>>>(d, beta_fast, beta_slow, w_fast, mu, ss);
     anvil_scale_k<<<g1, 256>>>(d, ss);
     int swap = 0;
     static const float maps_a[6] = {3.923798038567f, 3.278126713798f, 3.505298394150f, 2.815058591845f, 2.245503932403f, 2.256537145403f};
-    dim3 gxx(nblk(maxco, 16), nblk(maxco, 16), nconv), gbx(nblk(maxk, 128), 1, nconv);
-    const int tiled = maxco <= 96;
     for (int it = 0; it < 6; it++) {
-        if (tiled) tile_xxt_k<anvil_desc_t><<<gxx, 256>>>(d, swap); else anvil_xxt_k<<<gco, 128>>>(d, swap);
+        gemm_ns_k<0, anvil_desc_t><<<g64, 256>>>(d, swap, 0.f, 0.f);
         anvil_sq_k<<<gco, 128>>>(d, it);
-        if (tiled) tile_bx_k<anvil_desc_t><<<gbx, 256>>>(d, swap, maps_a[it]); else anvil_bx_k<<<gk, 256>>>(d, swap, it);
+        gemm_ns_k<2, anvil_desc_t><<<gk, 256>>>(d, swap, maps_a[it], 0.f);
         swap ^= 1;
     }
     anvil_rowpow_k<<<grow, 256>>>(d, swap);

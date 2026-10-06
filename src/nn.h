@@ -53,6 +53,9 @@ int nn_get_prec(void);
 /* per-layer precision: the network tags each conv with a layer id (unet order: enc0..3 = 0..3, down0..2 = 4..6, dec2, dec1,
    dec0 = 7..9, head = 10); a layer precision >= 1 overrides the global one. Policy strings: "enc0=1,dec0=1" or positional. */
 void nn_set_layer(int id);
+void nn_set_nlev(int L);   /* U-Net depth behind the layer ids / names (default 4; unet_create sets it) */
+int nn_get_nlev(void);
+const char *nn_layer_name(int id, char *buf);   /* "enc2", "down0", "dec1", "head" for the current depth; buf: 16 bytes */
 void nn_set_prec_wgrad(int p);   /* QAT: weight-gradient precision override (-1 = same as the layer); e.g. prec 2 forward with wgrad 1 */
 /* 2:4 structured weight sparsity (groups of 4 input channels keep their 2 largest weights) and its SR-STE gradient term */
 void nn_mask24(const float *w, float *out, int co, int ci, int taps);

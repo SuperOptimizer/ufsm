@@ -149,7 +149,7 @@ template <int MT, int TZ, typename T, typename TO> void launch_f4(dim3 grid, con
    memo (prep every call, as before). lp_wmemo_clear() after any weight change that is not a training step (checkpoint load,
    EMA swap). UFSM_W4_MEMO=0 disables it. */
 extern unsigned g_wmemo_step, g_wmemo_gen;
-#define WMEMO_N 64
+#define WMEMO_N 256   /* > every conv_wkey (NN_MAXLAYER 32): no two convs share an entry */
 struct wmemo_s { unsigned key, step, gen; const float *w; int Cop, Cip, Cx, CxP, Ox, OxP; uint8_t *wq, *ws; size_t nq, ns; }; extern wmemo_s g_wmemo[8][WMEMO_N];
 static int wmemo_on(void) { static int on = -1; if (on < 0) on = getenv("UFSM_W4_MEMO") ? atoi(getenv("UFSM_W4_MEMO")) : 1; return on; }
 /* returns 1 if the buffers already hold this weight (no prep needed), 0 if they must be filled; sets *wq / *ws */

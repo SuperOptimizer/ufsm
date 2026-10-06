@@ -47,7 +47,7 @@ int main(int argc, char **argv) {
     int n = it < 64 ? it : 64; qsort(tot, n, sizeof(double), cmpd);
     double sum = 0;
     printf("%s P=%d B=%d policy=%s f16=%d\n", train ? "train" : "infer", P, B, getenv("UFSM_PREC_POLICY") ? getenv("UFSM_PREC_POLICY") : "-", getenv("UFSM_F16") != nullptr);
-    for (int i = 0; i < UNET_NSLOT; i++) if (slot[i][0]) {
+    for (int i = 0; i < UNET_NSLOT; i++) if (slot[i] && slot[i][0]) {
         if (train) { printf("  %-8s fwd %7.3f  bwd_data %7.3f  bwd_w %7.3f ms\n", slot[i], best[i][0], best[i][1], best[i][2]); sum += best[i][0] + best[i][1] + best[i][2]; }
         else { printf("  %-8s %7.3f ms\n", slot[i], best[i][0]); sum += best[i][0]; }
     }

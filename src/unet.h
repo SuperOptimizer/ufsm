@@ -77,9 +77,10 @@ int unet_start_sheet(unet *u);
 int unet_peek(const char *path, unet_cfg *cfg, int *step);
 size_t unet_activation_bytes(const unet *u);
 void unet_prof_report(void);   /* with UFSM_PROF=1: print and reset per-op timings */
-/* per-conv kernel timing: slot = 2 * layer + conv (layer ids of nn_set_layer: enc0..3 = 0..3, down0..2 = 4..6, dec2, dec1,
-   dec0 = 7..9, head = 10; conv 0 = c1 or the single conv, 1 = c2) */
-#define UNET_NSLOT 22
+/* per-conv kernel timing: slot = 2 * layer + conv (layer ids of nn_set_layer for L levels: enc0..enc(L-1) = 0..L-1,
+   down0..down(L-2) = L..2L-2, dec(L-2)..dec0 = 2L-1..3L-3, head = 3L-2; L = 4: enc0..3 = 0..3, down0..2 = 4..6, dec2..0 = 7..9,
+   head = 10; conv 0 = c1 or the single conv, 1 = c2) */
+#define UNET_NSLOT (2 * (3 * UNET_MAXLEV - 1))
 void unet_prof_layers_on(int on);          /* same as env UFSM_PROF=layers */
 void unet_prof_layers(double out[][3]);    /* [UNET_NSLOT][fwd, bwd_data, bwd_w] ms since the last call (resets) */
 void unet_prof_cats(double out[8]);       /* per-category ms (conv_fwd, conv_bwd_data, conv_bwd_w, gn, elementwise, up/concat, ...) of the last unet_prof_layers call */

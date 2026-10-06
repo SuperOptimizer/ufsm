@@ -222,7 +222,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--warm-start 1]   start a new cover from a legacy checkpoint's weights/state\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  --split z --gpus 0,1: every window is split along z across the two GPUs instead (batch B; P a multiple of 2^nlev).\n"
-                        "  env UFSM_PROF=1 prints per-op GPU time every log interval (category 'upload+loss+opt').\n");
+                        "  env UFSM_PROF=1 prints per-op GPU time every log interval (categories 'loss' and 'optimizer').\n");
         return 2;
     }
     const char *src = argv[2], *out = opt(argc, argv, "--out", "runs/run");
@@ -325,6 +325,7 @@ int cmd_train(int argc, char **argv) {
     int expl = *opt(argc, argv, "--prec", "") || *opt(argc, argv, "--wq", "");
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--fp32")) expl = 1;
     const int fp4 = atoi(opt(argc, argv, "--fp4", expl ? "0" : "2"));   /* --fp4 2 since 2026-10-01 night: passed the stair (last.ckpt 0.299 / 0.284 vs --fp4 1 0.307 / 0.284) and the 40k confirmation (r11c), 1-4% faster */
+    { int nl = 1; for (const char *q = opt(argc, argv, "--widths", "16,32,64,80"); *q; q++) nl += *q == ','; nn_set_nlev(nl < UNET_MAXLEV ? nl : UNET_MAXLEV); }   /* layer names of the policy */
     if (fp4) {
         unet_set_act_mx4(1); setenv("UFSM_ACT_MX4", "1", 0); nn_set_sr(1);
         if (nn_set_prec_policy(fp4 >= 2 ? "all=fp4:fp4:fp4,enc0.c1=fp16" : "all=fp4:fp4:fp8,enc0.c1=fp16")) return 2;
@@ -794,7 +795,7 @@ int cmd_train(int argc, char **argv) {
         for (int g = 0; g < ng; g++) {
             gpu_state *d = &G[g];
             nn_init(d->dev);
-            if (prof) nn_prof_begin(6);
+            if (prof) nn_prof_begin(7);
             if (g == 0) gn = unet_grad_norm(d->u);          /* identical on every GPU after averaging */
             if (plan && (!isfinite(gn) || fwd_nan)) {
                 fprintf(stderr, "cover tile %llu has non-finite forward/gradients; aborting without advancing its cursor\n", (unsigned long long)coverage.cursor);
