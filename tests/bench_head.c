@@ -17,6 +17,8 @@ static void f_fwd(void *p) { B *a = p; if (nn_conv3d_fwd_x(a->xq, &a->gp, nullpt
 static void f_wgrad(void *p) { B *a = p; if (nn_conv3d_bwd_weight_x(a->xq, &a->gp, nullptr, nullptr, 0, 0, a->xs, a->gyh, a->os, 1, 1, a->gw, a->gb)) abort(); }
 static void f_bdata(void *p) { B *a = p; nn_conv3d_bwd_data(a->gyh, a->os, a->w, a->xs, 1, 1, a->gout, a->scr); }
 static void f_aff(void *p) { B *a = p; nn_aff_loss_async(a->y, a->os, 1, a->band, a->off, 0.5f, 1.f, a->gyh, a->fin); }
+static uint8_t *g_t, *g_m, *g_w; static float *g_lscr;
+static void f_recto(void *p) { B *a = p; shape5 ts = a->os; ts.c = 1; nn_loss_async_tol(a->y, g_t, g_m, g_w, ts, 0.5f, a->gyh, g_lscr, nullptr); }   /* channel 0 of the logits */
 static double best(void (*f)(void *), void *a) {
     f(a); nn_sync();
     double m = 1e30;
@@ -57,7 +59,16 @@ int main(int argc, char **argv) {
     }
     a.off = (aff_offsets_t){6, {0, 1, 2, 0, 1, 2}, {1, 1, 1, 8, 8, 8}};
     a.fin = nn_malloc(nn_aff_scratch(6)); a.scr = nn_malloc(1 << 16);
-    double t_fwd = best(f_fwd, &a), t_aff = best(f_aff, &a), t_w = best(f_wgrad, &a), t_d = best(f_bdata, &a);
+    {   /* recto loss inputs: soft targets, mask (air excluded), active (n, c) */
+        uint8_t *h = malloc(S);
+        for (size_t i = 0; i < S; i++) h[i] = (uint8_t)((i * 2654435761u >> 13) & 0xff);
+        g_t = nn_malloc(S); nn_h2d(g_t, h, S);
+        for (size_t i = 0; i < S; i++) h[i] = (i % 97) != 0;
+        g_m = nn_malloc(S); nn_h2d(g_m, h, S); free(h);
+        uint8_t one = 1; g_w = nn_malloc(64); nn_h2d(g_w, &one, 1);
+        shape5 ts = a.os; ts.c = 1; g_lscr = nn_malloc(nn_loss_scratch(ts) + 64);
+    }
+    double t_fwd = best(f_fwd, &a), t_aff = best(f_aff, &a), t_w = best(f_wgrad, &a), t_d = best(f_bdata, &a), t_rl = best(f_recto, &a);
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); return 1; }
     {   /* checksums of the outputs, to compare kernel variants */
         float *h = malloc(S * Co * 4); f_fwd(&a); nn_sync(); nn_d2h(h, a.y, S * Co * 4);
@@ -72,5 +83,6 @@ int main(int argc, char **argv) {
     printf("P %d (%.1f M voxels), head %d -> %d:\n  fwd (gn+silu, MX4 -> fp32)   %7.2f ms\n  weight + bias gradient        %7.2f ms\n"
            "  backward-data (-> MX8)       %7.2f ms\n  affinity loss + gradient     %7.2f ms\n  total                        %7.2f ms\n",
            P, S / 1e6, Ci, Co, t_fwd, t_w, t_d, t_aff, t_fwd + t_w + t_d + t_aff);
+    printf("  recto loss + gradient        %7.2f ms\n", t_rl);
     return 0;
 }

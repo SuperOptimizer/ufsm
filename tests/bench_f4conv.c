@@ -88,6 +88,24 @@ int main(int argc, char **argv) {
         printf("%-32s @%d %8.3f ms  |gw| %.9g\n", WL[l].nm, Pl, best, a);
         nn_free(x); nn_free(gy); nn_free(gw); nn_free(gb);
     }
+    {   /* decoder upsample at level 1 -> 0 (32 channels): forward of silu(gn(x)) MX-fp4 -> MX-fp4, backward MX-fp8 -> MX-fp8 */
+        const int Pc = P / 2, C = 32; const size_t Sc = (size_t)Pc * Pc * Pc;
+        shape5 cs = {1, C, Pc, Pc, Pc};
+        void *xc = mx(4, C, Sc, 2.f, 41), *yf = nn_malloc(lp_mx4_bytes(1, C, S)), *gf = mx(8, C, S, 1e-3f, 42), *gc = nn_malloc(lp_mx8_bytes(1, C, Sc));
+        float *ug = rnd(C, 1.f, 43), *ub = rnd(C, 0.5f, 44);
+        const gnp_t gp = {ug, ub, mean, rstd, G};
+        double b0 = 1e9, b1 = 1e9;
+        for (int it = 0; it < 10; it++) {
+            nn_sync(); double t0 = now(); lp_up2_fwd_mx(xc, 4, cs, yf, 4, gp); nn_sync(); double t1 = now(); lp_up2_bwd_mx(gf, cs, gc); nn_sync(); double t2 = now();
+            if (it >= 2) { if ((t1 - t0) * 1e3 < b0) b0 = (t1 - t0) * 1e3; if ((t2 - t1) * 1e3 < b1) b1 = (t2 - t1) * 1e3; }
+        }
+        printf("%-32s @%d %8.3f ms  out %016llx\n", "up2 fwd 32 ch (gn+silu, mx4)", P, b0, (unsigned long long)fnv(yf, lp_mx4_bytes(1, C, S)));
+        { double bp = 1e9; const gnp_t none = {0};
+          for (int it = 0; it < 10; it++) { nn_sync(); double t0 = now(); lp_up2_fwd_mx(xc, 4, cs, yf, 4, none); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < bp) bp = (now() - t0) * 1e3; }
+          printf("%-32s @%d %8.3f ms  out %016llx\n", "up2 fwd 32 ch (plain, mx4)", P, bp, (unsigned long long)fnv(yf, lp_mx4_bytes(1, C, S))); }
+        printf("%-32s @%d %8.3f ms  out %016llx\n", "up2 bwd 32 ch (mx8)", P, b1, (unsigned long long)fnv(gc, lp_mx8_bytes(1, C, Sc)));
+        nn_free(xc); nn_free(yf); nn_free(gf); nn_free(gc); nn_free(ug); nn_free(ub);
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); return 1; }
     return 0;
 }

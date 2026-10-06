@@ -13,7 +13,7 @@ __global__ void loss_stats_k(const float *lg, const uint8_t *t, const uint8_t *m
     if (w[nc]) {
         const float *l = lg + (size_t)nc * S; const uint8_t *tp = t + (size_t)nc * S, *mp = m + (size_t)n * S;
         uint8_t *cp = tol && nc % C == 0 ? code + (size_t)n * S : nullptr;
-        size_t per = (S + KSLAB - 1) / KSLAB, lo = (size_t)slab * per, hi = lo + per < S ? lo + per : S;
+        size_t per = (S + gridDim.y - 1) / gridDim.y, lo = (size_t)slab * per, hi = lo + per < S ? lo + per : S;
         for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
             if (!mp[i]) continue;
             float x = l[i], p = tp[i] * (1.f / 255.f);
@@ -67,7 +67,9 @@ extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const u
     if (tol) cudaMemsetAsync(code, 255, (size_t)s.n * S);
     else code = nullptr;
     cudaMemsetAsync(ds, 0, (size_t)5 * NC * sizeof(double));
-    loss_stats_k<<<dim3(NC, KSLAB), 256>>>(logits, t, m, w, s.c, S, ds, g_posw, tol, code, s.d, s.h, s.w);
+    /* slabs per (n, c): at least KSLAB and ~512 blocks in all (one recto channel with KSLAB slabs left most SMs idle) */
+    const int slabs = NC >= 16 ? KSLAB : 512 / NC;
+    loss_stats_k<<<dim3(NC, slabs), 256>>>(logits, t, m, w, s.c, S, ds, g_posw, tol, code, s.d, s.h, s.w);
     zs_reduce(ds, 5 * NC);   /* spatial split: statistics of the whole window (the halo planes are masked out by the caller) */
     loss_d2f_k<<<nblk(5 * NC, 128), 128>>>(ds, scratch, 5 * NC);
     loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, fin);
