@@ -256,7 +256,7 @@ int sheet_checkpoint(const char *path,char manifest_sha[65],char reference_sha[6
     if (!got || strncmp(text,"UFSM",4) || !strchr(text,'\n')) return -1;
     json *j=json_parse(text+4,strlen(text+4)); if (!j) return -1;
     const json *s=json_path(j,"extra.sheet"),*task=json_path(j,"extra.task"); int rc=0;
-    if (task || s) {
+    if (s || (task && strcmp(json_str(task,""),"band_affinity"))) {   /* band_affinity checkpoints are not winding models */
         const char *m=json_str(json_get(s,"geometry_sha256"),""),*r=json_str(json_get(s,"reference_sha256"),"");
         if (strcmp(json_str(task,""),"surface_winding") || json_num(json_get(s,"version"),0)!=1 || strlen(m)!=64 || strlen(r)!=64) rc=-1;
         else { strcpy(manifest_sha,m); strcpy(reference_sha,r); rc=1; }
