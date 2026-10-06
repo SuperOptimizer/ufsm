@@ -542,7 +542,7 @@ __global__ void prep_w8_k(const float *__restrict__ w, uint8_t *__restrict__ wq,
 /* Forward epilogue straight from the accumulators: bias, optional accumulate into y (sp.accum), channel-split
    output (sp.y2), optional GroupNorm statistics of the output (osum, per (n, group) sums reduced in smem). Warp row r
    of NR maps to z = oz0 + wz * NR/2 + r/2, y = oy0 + wr + r%2. */
-template <int MT, int NR, typename T>
+template <int MT, int NR, typename T, bool FST = false>   /* FST: try the shared-memory MX store path (checks its own requirements) */
 __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigned char *smem_raw, T *y, const float *b, int n, int co0, int Co,
                                              int D, int H, int W, int oz0, int oy0, int ox0, int wz, int wr, double *osum, int Go, const split_t &sp, int N = 0) {
     constexpr int BM = MT * 16, RZ = NR / 2;
@@ -550,7 +550,95 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
     const int zs0 = sp.zlo, zs1 = D - sp.zhi;   /* statistics over the z planes this GPU owns (spatial split) */
     float *cs = (float *)smem_raw;
     if (osum) { __syncthreads(); for (int i = threadIdx.x; i < 2 * BM; i += blockDim.x) cs[i] = 0.f; __syncthreads(); }
-    if constexpr (IS_MX(T)) {   /* MX output: per voxel and 32- (16-) channel block, amax over the block's rows (lanes g, h, m);
+    bool mx_done = false;
+    if constexpr (IS_MX(T) && FST) {
+        /* MX output through shared memory: per output block (a 16- or 32-row channel block of the output tensor, or of the
+           second tensor of a split output), the quantised rows and scales of the warp's NR x 16 voxels are assembled in a
+           per-warp buffer and written as 16-byte chunks (a row of 16 voxels is contiguous: 16 x 8 .. 32 bytes) instead of
+           single-byte stores per lane; the bias is loaded once. Values, scales and stored_stats as in the per-lane path below.
+           Needs W % 16 == 0 (16-byte alignment) and the kernel's dynamic smem to hold 512 + 8 warps x NR x 16 x 33 bytes. */
+        constexpr int B = MX_BITS(T), RBM = 32 * B / 8, WBUF = NR * 16 * (RBM + 1);
+        unsigned dsm; asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dsm));
+        if ((W & 15) == 0 && blockDim.x == 256 && dsm >= 512u + 8u * WBUF) {
+            const int warp = threadIdx.x >> 5;
+            const size_t S = (size_t)D * H * W;
+            const int OxP = sp.y2 ? (sp.o_split + 31) / 32 * 32 : Co;
+            __syncthreads();   /* every warp is past its MMA loop: the staging tiles are free */
+            uint8_t *wb = smem_raw + 512 + warp * WBUF;
+            float bias[MT][2];
+#pragma unroll
+            for (int m = 0; m < MT; m++)
+#pragma unroll
+                for (int h = 0; h < 2; h++) { const int co = co0 + m * 16 + g + 8 * h; bias[m][h] = b && !sp.y2 && co < Co ? b[co] : 0.f; }
+#pragma unroll
+            for (int j = 0; j < MT; j++) {
+                const int cp = co0 + j * 16, sec = sp.y2 && cp >= OxP, Ct = !sp.y2 ? Co : sec ? Co - sp.o_split : sp.o_split;
+                const int cl = sec ? cp - OxP : cp, bwt = mx_bw(Ct), MBt = bwt / 16, rbt = mx_rb(bwt, B);
+                if (cl % bwt || cl >= Ct) continue;   /* not the first tile of a block, or pure padding (block-uniform) */
+                uint8_t *wsb = wb + NR * 16 * rbt;
+#pragma unroll
+                for (int r = 0; r < NR; r++)
+#pragma unroll
+                    for (int q2 = 0; q2 < 2; q2++)
+#pragma unroll
+                        for (int vv = 0; vv < 2; vv++) {
+                            const int lv = r * 16 + q2 * 8 + 2 * t + vv;
+                            float val[2][2], am = 0.f;
+#pragma unroll
+                            for (int mm = 0; mm < 2; mm++)
+#pragma unroll
+                                for (int h = 0; h < 2; h++) {
+                                    const int m = j + mm;
+                                    const float v = mm < MBt && m < MT ? acc[m < MT ? m : 0][r][q2][2 * h + vv] + bias[m < MT ? m : 0][h] : 0.f;
+                                    val[mm][h] = v; am = fmaxf(am, fabsf(v));
+                                }
+                            am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 4)); am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 8)); am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 16));
+                            const int e = mx_exp(am, mxf<B>::inv_qmax);
+                            const float mult = exp2i(-e);
+                            if constexpr (B == 4) {
+                                unsigned nib = 0u;
+#pragma unroll
+                                for (int mm = 0; mm < 2; mm++)
+#pragma unroll
+                                    for (int h = 0; h < 2; h++) nib |= (unsigned)(cvt_e2m1x2(val[mm][h] * mult, 0.f) & 15) << (8 * (2 * mm + h));
+                                nib |= __shfl_down_sync(0xffffffff, nib, 4) << 4;   /* channel g + 1 into the high nibbles */
+#pragma unroll
+                                for (int mm = 0; mm < 2; mm++)
+#pragma unroll
+                                    for (int h = 0; h < 2; h++) if (mm < MBt) {
+                                        if (!(g & 1)) wb[lv * rbt + ((mm * 16 + g + 8 * h) >> 1)] = (uint8_t)(nib >> (8 * (2 * mm + h)));
+                                        if (osum && sp.stored_stats && j + mm < MT) acc[j + mm < MT ? j + mm : 0][r][q2][2 * h + vv] = dec_e2m1n(nib >> (8 * (2 * mm + h))) * exp2i(e);
+                                    }
+                            } else {
+#pragma unroll
+                                for (int mm = 0; mm < 2; mm++)
+#pragma unroll
+                                    for (int h = 0; h < 2; h++) if (mm < MBt) {
+                                        const uint8_t code = cvt_e4m3(val[mm][h] * mult);
+                                        wb[lv * rbt + mm * 16 + g + 8 * h] = code;
+                                        if (osum && sp.stored_stats && j + mm < MT) acc[j + mm < MT ? j + mm : 0][r][q2][2 * h + vv] = dec_e4m3(code) * exp2i(e);
+                                    }
+                            }
+                            if (g == 0) wsb[lv] = (uint8_t)(e + 127);
+                        }
+                __syncwarp();
+                const int blk = cl / bwt, nbt = mx_nb(Ct);
+                uint8_t *qt = sec ? (uint8_t *)sp.y2 : (uint8_t *)y, *st = qt + (size_t)N * nbt * S * rbt;
+                const int nch = rbt;   /* 16-byte chunks per row of 16 voxels */
+                for (int i = lane; i < NR * nch; i += 32) {
+                    const int r = i / nch, c = i % nch, oz = oz0 + wz * RZ + (r >> 1), oy = oy0 + wr + (r & 1);
+                    if (oz < D && oy < H) *(uint4 *)(qt + (((size_t)n * nbt + blk) * S + ((size_t)oz * H + oy) * W + ox0) * rbt + c * 16) = *(const uint4 *)(wb + r * 16 * rbt + c * 16);
+                }
+                if (lane < NR) {
+                    const int r = lane, oz = oz0 + wz * RZ + (r >> 1), oy = oy0 + wr + (r & 1);
+                    if (oz < D && oy < H) *(uint4 *)(st + ((size_t)n * nbt + blk) * S + ((size_t)oz * H + oy) * W + ox0) = *(const uint4 *)(wsb + r * 16);
+                }
+                __syncwarp();   /* the buffer is reused by the next block */
+            }
+            mx_done = true;
+        }
+    }
+    if constexpr (IS_MX(T)) if (!mx_done) {   /* MX output: per voxel and 32- (16-) channel block, amax over the block's rows (lanes g, h, m);
                                    fp4: the nibbles of channels (2k, 2k+1) sit in lanes g, g + 1 -> paired with a shuffle, one byte per even g */
         constexpr int B = MX_BITS(T);
         const size_t S = (size_t)D * H * W;
