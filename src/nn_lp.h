@@ -58,6 +58,7 @@ void lp_gn_silu_apply_mx(const void *x, int xdt, shape5 s, int G, const float *g
 void lp_up2_fwd_mx(const void *x, int xdt, shape5 xs, void *y, int ydt, gnp_t gp);   /* gp: silu(gn(x)) upsampled */
 void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp);
 void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp);
+int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp);   /* also gb when it returns 1 */
 void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                        const void *gy, void *gx, int gdt, double *ds, float *st, float *AB);
 void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
@@ -65,7 +66,7 @@ void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G, const floa
 void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y);
 void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx);
 void lp_up2_bwd_mx_slice(const void *gy, shape5 xs, void *gx, int ctot, int c0);   /* channels [c0, c0 + xs.c) of an MX-fp8 gx (ctot ch) */
-void lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum);
+int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum);   /* returns the compute precision (2 fp8, 0 fp32) */
 const char *lp_check(void);
 void lp_f32_to_bf16(const float *x, size_t n, void *y);   /* test helpers */
 void lp_bf16_to_f32(const void *x, size_t n, float *y);

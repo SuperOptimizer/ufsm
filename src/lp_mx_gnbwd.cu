@@ -167,8 +167,52 @@ __global__ void conv1_to_mx_k(const TG *x, const float *w, uint8_t *y, int N, in
     }
     mx_store_row(y, y + (size_t)N * nb * S * bw, i, bw, r);
 }
+/* the same with the input count a template parameter: grid (voxels, n x MX block), so no 64-bit index divisions, the block's
+   weights staged in smem, the CI inputs in registers; same arithmetic order as conv1_to_mx_k */
+template <typename TG, int CI>
+__global__ void __launch_bounds__(256) conv1_to_mx_t_k(const TG *x, const float *w, uint8_t *y, int N, int Co, size_t S) {
+    __shared__ float sw[32 * CI];
+    const int bw = mx_bw(Co), nb = mx_nb(Co), n = blockIdx.y / nb, blk = blockIdx.y % nb;
+    for (int t = threadIdx.x; t < 32 * CI; t += blockDim.x) { const int co = blk * bw + t / CI; sw[t] = t / CI < bw && co < Co ? w[co * CI + t % CI] : 0.f; }
+    __syncthreads();
+    const size_t v = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (v >= S) return;
+    float xi[CI], r[32];
+#pragma unroll
+    for (int ci = 0; ci < CI; ci++) xi[ci] = ldx(x, ((size_t)n * CI + ci) * S + v);
+#pragma unroll
+    for (int k = 0; k < 32; k++) {
+        float a = 0.f;
+#pragma unroll
+        for (int ci = 0; ci < CI; ci++) a += sw[k * CI + ci] * xi[ci];
+        r[k] = a;
+    }
+    mx_store_row(y, y + (size_t)N * nb * S * bw, ((size_t)n * nb + blk) * S + v, bw, r);
+}
+template <typename TG> static void conv1_to_mx_t(const TG *x, int N, int Ci, size_t S, const float *w, int Co, void *y) {
+    const dim3 grid(nblk_(S, 256), N * mx_nb(Co));
+    uint8_t *yq = (uint8_t *)y;
+    switch (Ci) {
+        case 1: conv1_to_mx_t_k<TG, 1><<<grid, 256>>>(x, w, yq, N, Co, S); break;
+        case 2: conv1_to_mx_t_k<TG, 2><<<grid, 256>>>(x, w, yq, N, Co, S); break;
+        case 3: conv1_to_mx_t_k<TG, 3><<<grid, 256>>>(x, w, yq, N, Co, S); break;
+        case 4: conv1_to_mx_t_k<TG, 4><<<grid, 256>>>(x, w, yq, N, Co, S); break;
+        case 5: conv1_to_mx_t_k<TG, 5><<<grid, 256>>>(x, w, yq, N, Co, S); break;
+        case 6: conv1_to_mx_t_k<TG, 6><<<grid, 256>>>(x, w, yq, N, Co, S); break;
+        case 7: conv1_to_mx_t_k<TG, 7><<<grid, 256>>>(x, w, yq, N, Co, S); break;
+        default: conv1_to_mx_t_k<TG, 8><<<grid, 256>>>(x, w, yq, N, Co, S);
+    }
+}
 extern "C" void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y) {
     if (Ci > 8) { fprintf(stderr, "lp_conv1_to_mx: Ci %d > 8\n", Ci); abort(); }
+    static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
+    if (!old) {
+        if (gdt == 2) conv1_to_mx_t((const __half *)x, N, Ci, S, w, Co, y);
+        else if (gdt == 1) conv1_to_mx_t((const bf16 *)x, N, Ci, S, w, Co, y);
+        else conv1_to_mx_t((const float *)x, N, Ci, S, w, Co, y);
+        LPCK();
+        return;
+    }
     size_t n = (size_t)N * mx_nb(Co) * S;
     if (gdt == 2) conv1_to_mx_k<__half><<<nblk_(n, 256), 256>>>((const __half *)x, w, (uint8_t *)y, N, Ci, Co, S);
     else if (gdt == 1) conv1_to_mx_k<bf16><<<nblk_(n, 256), 256>>>((const bf16 *)x, w, (uint8_t *)y, N, Ci, Co, S);

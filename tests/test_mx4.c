@@ -792,6 +792,19 @@ int main(void) {
             lp_bwd_w1_mx(xm, dt == 4 ? 4 : 3, xs, gy, 0, ys, gw, gp);
             char nm[96]; snprintf(nm, sizeof nm, "head wgrad 16 -> %d, mx%d%s", co, dt, G ? ", gn+silu" : "");
             cmp(nm, gw, gr, (size_t)co * 16, 1e-4);
+            {   /* fp16 gy (the training storage): tensor-core kernel with the bias gradient in the same pass; fp16 rounding of
+                   gy and of the activations bounds the agreement */
+                const int f16 = nn_get_f16(); nn_set_f16(1);
+                void *gyh = nn_malloc(shape_numel(ys) * 2); nn_f32_to_h16(gy, shape_numel(ys), gyh, 1.f);
+                float *grb = dev_zero(co), *gw2 = dev_zero((size_t)co * 16), *gb2 = dev_zero(co), *gr2 = dev_zero((size_t)co * 16);
+                mode_ref(); nn_conv3d_bwd_weight(xa, xs, gy, ys, 1, 1, gr2, grb);
+                const int bd = lp_bwd_w1_mx_b(xm, dt == 4 ? 4 : 3, xs, gyh, 2, ys, gw2, gb2, gp);
+                char nm2[112]; snprintf(nm2, sizeof nm2, "head wgrad 16 -> %d, mx%d%s, fp16 gy (tensor cores)", co, dt, G ? ", gn+silu" : "");
+                cmp(nm2, gw2, gr2, (size_t)co * 16, 3e-3);
+                if (bd) { snprintf(nm2, sizeof nm2, "head bias grad -> %d, fp16 gy, same pass", co); cmp(nm2, gb2, grb, co, 3e-3); }
+                else { printf("  head wgrad fp16 gy: tensor-core path not taken  FAIL\n"); bad++; }
+                nn_set_f16(f16); nn_free(gyh); nn_free(grb); nn_free(gw2); nn_free(gb2); nn_free(gr2);
+            }
             nn_free(x); nn_free(gy); nn_free(xm); nn_free(xd); nn_free(xa); nn_free(gr); nn_free(gw); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd);
             (void)S;
         }

@@ -125,7 +125,7 @@ void bwd_data_impl(const float *gy, shape5 ys, const float *w, shape5 xs, int k,
 }
 void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs, int k, int stride, float *gx, float *scratch, int accum) {
     int T = k * k * k;
-    if (k == 1 || !g_tf32 || (stride == 2 && (ISMX(gy) || ISMX(gx)))) exec_prec(1, 0);
+    if (k == 1 || !g_tf32) exec_prec(1, 0);
     if (stride == 1) {
         size_t nw = (size_t)ys.c * xs.c * T;
         flip_w_k<<<nblk(nw, 256), 256>>>(w, scratch, ys.c, xs.c, T);
@@ -136,7 +136,7 @@ void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs, int k
         else { int save = g_actbf; g_actbf = 0; nn_conv3d_fwd(gy, ys, scratch, nullptr, xs.c, k, 1, gx); g_actbf = save; }
     } else if (stride == 2 && k == 3 && g_tf32 && (ISMX(gy) || ISMX(gx))) {   /* MX gradients: direct voxel-major kernel, accumulate in MX */
         if (!ISMX(gy) || !ISMX(gx)) { fprintf(stderr, "bwd_data s2: MX gradient storage needs MX gy and gx\n"); abort(); }
-        lp_bwd_data_s2_mx(gy, ys, w, xs, gx, accum);
+        exec_prec(1, lp_bwd_data_s2_mx(gy, ys, w, xs, gx, accum));
     } else if (stride == 2 && k == 3 && g_tf32 && !ufsm_env_on("UFSM_S2DIL") && !(xs.d & 1) && !(xs.h & 1) && !(xs.w & 1)) {
         /* parity decomposition: gx[2m + p] = sum over the taps compatible with parity p of w . gy[m + d]; each of the
            8 parity classes is a stride-1 conv on the gy grid with 1..8 taps (27 total: no wasted MACs) */

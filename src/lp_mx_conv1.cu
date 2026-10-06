@@ -31,9 +31,8 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
     for (int i = threadIdx.x; i < CO * Ci; i += blockDim.x) sw[i] = w[i];
     __syncthreads();
     const int bw = mx_bw(Ci), nb = mx_nb(Ci);
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)N * S) return;
-    const int n = (int)(i / S); const size_t v = i % S;
+    const int n = blockIdx.y; const size_t v = blockIdx.x * (size_t)blockDim.x + threadIdx.x;   /* grid (voxels, sample) */
+    if (v >= S) return;
     float acc[CO];
 #pragma unroll
     for (int co = 0; co < CO; co++) acc[co] = b ? b[co] : 0.f;
@@ -55,15 +54,19 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
 }
 template <int B, int CO> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, float *y, gnp_t gp) {
     const size_t S = shape_spatial(xs), sm = (size_t)(2 * xs.n * xs.c + CO * xs.c) * sizeof(float);
-    conv1_mx_t_k<B, CO><<<nblk_((size_t)xs.n * S, 256), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp);
+    conv1_mx_t_k<B, CO><<<dim3(nblk_(S, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp);
 }
 extern "C" void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp) {
     if (cout > 8) { fprintf(stderr, "lp_conv1_fwd_mx: cout %d > 8\n", cout); abort(); }
     size_t S = shape_spatial(xs);
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
-    if (!old && (cout == 1 || cout == 2) && (size_t)(2 * xs.n * xs.c + 2 * xs.c) * sizeof(float) <= 32 * 1024) {
-        if (xdt == 4) { if (cout == 1) conv1_mx_t<4, 1>(x, xs, w, b, y, gp); else conv1_mx_t<4, 2>(x, xs, w, b, y, gp); }
-        else { if (cout == 1) conv1_mx_t<8, 1>(x, xs, w, b, y, gp); else conv1_mx_t<8, 2>(x, xs, w, b, y, gp); }
+    if (!old && (size_t)(2 * xs.n * xs.c + cout * xs.c) * sizeof(float) <= 32 * 1024) {
+#define C1T(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, y, gp); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, y, gp); break; \
+                               case 3: conv1_mx_t<B, 3>(x, xs, w, b, y, gp); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, y, gp); break; \
+                               case 5: conv1_mx_t<B, 5>(x, xs, w, b, y, gp); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, y, gp); break; \
+                               case 7: conv1_mx_t<B, 7>(x, xs, w, b, y, gp); break; default: conv1_mx_t<B, 8>(x, xs, w, b, y, gp); } } while (0)
+        if (xdt == 4) C1T(4); else C1T(8);
+#undef C1T
     } else if (xdt == 4) conv1_mx_k<4><<<nblk_((size_t)xs.n * S, 256), 256>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, cout, S, gp);
     else conv1_mx_k<8><<<nblk_((size_t)xs.n * S, 256), 256>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, cout, S, gp);
     LPCK();
@@ -146,6 +149,79 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
     }
     __syncthreads();
     if (threadIdx.x < Ci * CO) { const int k = threadIdx.x / CO, co = threadIdx.x % CO; if (co < Co) atomicAdd(&gw[(size_t)co * Ci + k], red[threadIdx.x]); }
+}
+/* tensor-core head weight gradient for one 16-channel MX block row and up to 8 outputs with fp16 gy (the training
+   storage): gw[co][ci] += sum_v act(x)[ci][v] gy[co][v], and (gb) gb[co] += sum_v gy[co][v] in the same pass over gy.
+   Per warp and 16 voxels: lanes 0-15 dequantise one voxel row each and apply the GN+SiLU affine into fp16 A[ci][voxel],
+   lanes 16-31 copy that voxel's gy into B[co][voxel] (and sum it for the bias); one m16n8k16 MMA with fp32 accumulation.
+   The fp16 rounding of act(x) is the only numerical difference from conv_bwd_w1_mx1_k. */
+template <int B>
+__global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const __half *gy, float *gw, float *gb, int N, size_t S, gnp_t gp, int nper, int Co) {
+    __shared__ float ca[16], cb[16], red[8][16 * 8 + 8];
+    __shared__ __align__(16) __half sA[8][16][24], sB[8][8][24];   /* [warp][ci][voxel], [warp][co][voxel]; rows padded */
+    const int n = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (threadIdx.x < 16) {
+        const int k = threadIdx.x;
+        float a = 1.f, bb = 0.f;
+        if (gp.G) { const int ng = n * gp.G + k / (16 / gp.G); a = gp.rstd[ng] * gp.gamma[k]; bb = gp.beta[k] - gp.mean[ng] * a; }
+        ca[k] = a; cb[k] = bb;
+    }
+    __syncthreads();
+    const uint8_t *sc = mx_sc<B>(x, N, 16, S);
+    float c[4] = {0.f, 0.f, 0.f, 0.f}, bs[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    const int j = lane & 15, g = lane >> 2, t4 = lane & 3;
+    const size_t v0 = (size_t)blockIdx.x * nper, v1 = min(S, v0 + nper);
+    for (size_t vb = v0 + warp * 16; vb < v1; vb += 8 * 16) {
+        const size_t v = vb + j; const bool in = v < v1;
+        if (lane < 16) {
+            float r[32];
+            if (in) mx_load_row_b<B>(x, sc, (size_t)n * S + v, 16, r);
+#pragma unroll
+            for (int k = 0; k < 16; k++) sA[warp][k][j] = __float2half_rn(in ? (gp.G ? act_ab(r[k], ca[k], cb[k], true) : r[k]) : 0.f);
+        } else {
+#pragma unroll
+            for (int co = 0; co < 8; co++) {
+                const __half h = in && co < Co ? gy[((size_t)n * Co + co) * S + v] : __float2half_rn(0.f);
+                sB[warp][co][j] = h; bs[co] += __half2float(h);
+            }
+        }
+        __syncwarp();
+        unsigned a[4], b[2];
+        a[0] = *(const unsigned *)&sA[warp][g][2 * t4];     a[1] = *(const unsigned *)&sA[warp][g + 8][2 * t4];
+        a[2] = *(const unsigned *)&sA[warp][g][2 * t4 + 8]; a[3] = *(const unsigned *)&sA[warp][g + 8][2 * t4 + 8];
+        b[0] = *(const unsigned *)&sB[warp][g][2 * t4];     b[1] = *(const unsigned *)&sB[warp][g][2 * t4 + 8];
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                     : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+        __syncwarp();
+    }
+    /* C[ci][co]: c0, c1 = C[g][2 t4 .. + 1], c2, c3 = C[g + 8][2 t4 .. + 1] */
+    red[warp][g * 8 + 2 * t4] = c[0]; red[warp][g * 8 + 2 * t4 + 1] = c[1];
+    red[warp][(g + 8) * 8 + 2 * t4] = c[2]; red[warp][(g + 8) * 8 + 2 * t4 + 1] = c[3];
+#pragma unroll
+    for (int co = 0; co < 8; co++) { float s = bs[co]; for (int o = 8; o; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o); bs[co] = s; }
+    if (lane == 16) for (int co = 0; co < 8; co++) red[warp][128 + co] = bs[co];
+    __syncthreads();
+    if (threadIdx.x < 136) {
+        float s = 0.f;
+        for (int w = 0; w < 8; w++) s += red[w][threadIdx.x];
+        if (threadIdx.x < 128) { const int ci = threadIdx.x / 8, co = threadIdx.x % 8; if (co < Co) atomicAdd(&gw[(size_t)co * 16 + ci], s); }
+        else if (gb && threadIdx.x - 128 < Co) atomicAdd(&gb[threadIdx.x - 128], s);
+    }
+}
+/* returns 1 when the bias gradient (gb) was accumulated as well (tensor-core head path), else 0 (the caller adds it) */
+extern "C" int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp) {
+    static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
+    if (!old && xs.c == 16 && ys.c <= 8 && gydt == 2 && (!gp.G || 16 % gp.G == 0)) {
+        const size_t S = shape_spatial(xs);
+        const int nper = 8192;
+        const dim3 grid((unsigned)((S + nper - 1) / nper), xs.n);
+        if (xdt == 4) conv_bwd_w1_tc_k<4><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c);
+        else conv_bwd_w1_tc_k<8><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c);
+        LPCK();
+        return gb != nullptr;
+    }
+    lp_bwd_w1_mx(x, xdt, xs, gy, gydt, ys, gw, gp);
+    return 0;
 }
 extern "C" void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp) {
     if (xs.c <= 32 && ys.c <= 8) {

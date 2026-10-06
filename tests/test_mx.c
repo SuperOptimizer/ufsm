@@ -180,6 +180,24 @@ int main(void) {
         cmp("s2 bwd_weight (MX x, MX gy)", gw2, gw1, (size_t)32 * 32 * 27, TOL);
         cmp("s2 bias grad", gb2, gb1, 32, TOL);
     }
+    for (int wc = 0; wc < 2; wc++) {   /* stride-2 backward-data of wide layers (dilated fp8 tensor-core path), set and accumulate */
+        const int Ci = wc ? 160 : 96, Co = wc ? 128 : 96;
+        shape5 xs = {N, Ci, 12, 10, 14}, ys = {N, Co, 6, 5, 7};
+        size_t nx = shape_numel(xs), ny = shape_numel(ys);
+        float *w = dev_rand((size_t)Co * Ci * 27, 0.05f), *gy = dev_rand(ny, 1e-3f);
+        void *gym = mx_from(gy, ys); float *gyd = deq(gym, ys);
+        float *scr = nn_malloc(nn_conv3d_scratch(xs, Co, 3) * 2 + (size_t)xs.n * Co * shape_spatial(xs) * 4), *gxr = dev_zero(nx);
+        void *gxm = mx_new(xs);
+        mode_ref(); nn_conv3d_bwd_data(gyd, ys, w, xs, 3, 2, gxr, scr);
+        mode_mx(); nn_conv3d_bwd_data(gym, ys, w, xs, 3, 2, (float *)gxm, scr);
+        char nm[96]; snprintf(nm, sizeof nm, "s2 bwd_data %d -> %d (MX, dilated fp8)", Co, Ci);
+        cmp(nm, deq(gxm, xs), gxr, nx, TOL);
+        float *gx0 = dev_rand(nx, 1e-3f); void *gx0m = mx_from(gx0, xs); float *gx0d = deq(gx0m, xs);
+        mode_ref(); nn_axpy(gxr, 1.f, gx0d, nx);
+        mode_mx(); nn_conv3d_bwd_data_acc(gym, ys, w, xs, 3, 2, (float *)gx0m, scr);
+        snprintf(nm, sizeof nm, "s2 bwd_data %d -> %d accumulate (MX, dilated fp8)", Co, Ci);
+        cmp(nm, deq(gx0m, xs), gxr, nx, TOL);
+    }
     {   /* head: 1^3 conv forward, weight gradient, backward-data into MX */
         shape5 xs = {N, 16, 10, 10, 10}, ys = xs; ys.c = 1;
         size_t nx = shape_numel(xs), ny = shape_numel(ys);

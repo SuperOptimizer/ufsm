@@ -67,17 +67,62 @@ __global__ void __launch_bounds__(128) bwd_data_s2_mx2_k(const uint8_t *gy, cons
     mx_store_row_b<8>(gx, scx, ri, bwx, acc);
 }
 extern "C" void lp_bwd_data_s2_mx_wide(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum);   /* lp_mx_s2bwd_wide.cu */
-extern "C" void lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum) {
+/* ---- wide layers on the tensor cores: gx = conv_s1(dilate2(gy), flip(w)^T) with the MX-fp8 stride-1 kernel. dilate2 puts gy
+   row o at fine position u = 2 o (every axis) and zero rows elsewhere, so gx[u] = sum_k w[k] gd[u + 1 - k] is a pad-1 stride-1
+   convolution with the spatially flipped, channel-transposed weights. 8x the MACs of the parity form, but fp8 MMA instead of
+   fp32 FMA (and the weights are quantised to fp8 like every other tensor-core pass); gy rows are copied verbatim. */
+__global__ void dilate2_mx8_k(const uint8_t *gy, uint8_t *gd, int NB, int D, int H, int W, int Do, int Ho, int Wo) {
+    const unsigned S = (unsigned)D * H * W, So = (unsigned)Do * Ho * Wo;
+    const unsigned u = blockIdx.x * blockDim.x + threadIdx.x; if (u >= S) return;
+    const size_t r = (size_t)blockIdx.y * S + u;   /* row (n * nb + blk, u); 32 e4m3 bytes, scales after the NB * S rows */
+    const unsigned ux = u % W, uy = (u / W) % H, uz = u / (W * H);
+    uint4 *d = (uint4 *)(gd + r * 32);
+    if (!(ux & 1) && !(uy & 1) && !(uz & 1) && (uz >> 1) < (unsigned)Do && (uy >> 1) < (unsigned)Ho && (ux >> 1) < (unsigned)Wo) {
+        const size_t ro = (size_t)blockIdx.y * So + ((size_t)(uz >> 1) * Ho + (uy >> 1)) * Wo + (ux >> 1);
+        const uint4 *s = (const uint4 *)(gy + ro * 32);
+        d[0] = s[0]; d[1] = s[1]; gd[(size_t)NB * S * 32 + r] = gy[(size_t)NB * So * 32 + ro];
+    } else { d[0] = d[1] = make_uint4(0, 0, 0, 0); gd[(size_t)NB * S * 32 + r] = 127; }
+}
+__global__ void flipT_w_k(const float *w, float *wt, int Co, int Ci) {   /* wt[ci][co][t] = w[co][ci][26 - t] */
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= (size_t)Co * Ci * 27) return;
+    const int t = (int)(i % 27), co = (int)((i / 27) % Co), ci = (int)(i / ((size_t)27 * Co));
+    wt[i] = w[((size_t)co * Ci + ci) * 27 + 26 - t];
+}
+__global__ void mx8_add_k(uint8_t *y, const uint8_t *t, size_t rows) {   /* y += t, MX-fp8 rows of 32 (re-encoded) */
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= rows) return;
+    float a[32], b[32];
+    mx_load_row_b<8>(y, y + rows * 32, i, 32, a); mx_load_row_b<8>(t, t + rows * 32, i, 32, b);
+#pragma unroll
+    for (int k = 0; k < 32; k++) a[k] += b[k];
+    mx_store_row_b<8>(y, y + rows * 32, i, 32, a);
+}
+static int s2b_dilate(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum) {
+    static int on = -1; if (on < 0) on = getenv("UFSM_S2B_DIL") ? atoi(getenv("UFSM_S2B_DIL")) : 1;
+    if (!on || xs.c < 64 || ys.c < 64 || mx_bw(xs.c) != 32 || mx_bw(ys.c) != 32) return 0;
+    const size_t S = shape_spatial(xs), rd = (size_t)xs.n * mx_nb(ys.c) * S, rx = (size_t)xs.n * mx_nb(xs.c) * S;
+    uint8_t *gd = lp_buf<uint8_t>(2, rd * 33), *tmp = accum ? lp_buf<uint8_t>(3, rx * 33) : (uint8_t *)gx;
+    float *wt = lp_buf<float>(4, (size_t)ys.c * xs.c * 27);
+    dilate2_mx8_k<<<dim3(nblk_(S, 256), (unsigned)(xs.n * mx_nb(ys.c))), 256>>>((const uint8_t *)gy, gd, xs.n * mx_nb(ys.c), xs.d, xs.h, xs.w, ys.d, ys.h, ys.w);
+    flipT_w_k<<<nblk_((size_t)ys.c * xs.c * 27, 256), 256>>>(w, wt, ys.c, xs.c);
+    shape5 ds = xs; ds.c = ys.c;
+    lp_conv_fwd_f8(gd, 3, ds, wt, nullptr, xs.c, tmp, 3, gnp_t{}, nullptr, 0, split_t{});
+    if (accum) mx8_add_k<<<nblk_(rx, 256), 256>>>((uint8_t *)gx, tmp, rx);
+    LPCK();
+    return 1;
+}
+/* returns the compute precision used: 2 (fp8 tensor cores, wide layers) or 0 (fp32) */
+extern "C" int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum) {
+    if (s2b_dilate(gy, ys, w, xs, gx, accum)) return 2;
     {
         const int bwx = mx_bw(xs.c), nbx = mx_nb(xs.c);
         const size_t smem = (size_t)8 * ys.c * bwx * sizeof(float);
-        if (smem > 96 * 1024) { lp_bwd_data_s2_mx_wide(gy, ys, w, xs, gx, accum); return; }   /* wide layers: thread-per-voxel kernel */
+        if (smem > 96 * 1024) { lp_bwd_data_s2_mx_wide(gy, ys, w, xs, gx, accum); return 0; }   /* wide layers: thread-per-voxel kernel */
         static int attr[8];
         if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)bwd_data_s2_mx2_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
         const size_t mmax = (size_t)((xs.d + 1) / 2) * ((xs.h + 1) / 2) * ((xs.w + 1) / 2);
         const dim3 grid(nblk_(mmax, 128), 8, (unsigned)(nbx * xs.n));
         bwd_data_s2_mx2_k<<<grid, 128, smem>>>((const uint8_t *)gy, w, (uint8_t *)gx, xs.n, xs.c, ys.c, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum);
         LPCK();
-        return;
+        return 0;
     }
 }

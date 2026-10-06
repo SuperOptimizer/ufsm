@@ -37,9 +37,9 @@ extern "C" void nn_conv3d_bwd_weight(const float *x, shape5 xs, const float *gy,
     }
     if (k == 3 && stride == 2 && g_tf32 && ISMX(x)) { lp_bwd_w_s2_f8(x, MXDT(x), xs, gy, ISMX(gy) ? MXDT(gy) : LPDT(GBF), ys, gw, gb, gnp_t{}); KCHECK(); return; }
     if (k == 1 && stride == 1 && g_tf32 && ISMX(x)) {
-        lp_bwd_w1_mx(x, MXDT(x), xs, gy, LPDT(GBF), ys, gw, gnp_t{});
+        const int bdone = lp_bwd_w1_mx_b(x, MXDT(x), xs, gy, LPDT(GBF), ys, gw, gb, gnp_t{});
         size_t So1 = shape_spatial(ys);
-        if (gb) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So1); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So1); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So1); }
+        if (gb && !bdone) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So1); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So1); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So1); }
         KCHECK(); return;
     }
     if (k == 3 && stride == 2 && g_tf32 && (eff_prec_w() == 2 || eff_prec_w() == 3)) { lp_bwd_w_s2_f8(x, LPDT(ABF), xs, gy, LPDT(GBF), ys, gw, gb, gnp_t{}); KCHECK(); return; }
