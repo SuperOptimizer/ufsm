@@ -136,6 +136,20 @@ int main(int argc, char **argv) {
         }
         float h[16 * 16 * 27]; nn_d2h(h, gw, sizeof h); double a = 0; for (int i = 0; i < 16 * 16 * 27; i++) a += fabs(h[i]);
         printf("%-32s @%d %8.3f ms  |gw| %.9g\n", "wgrad s2 down0 16 -> 16 (fp8)", P, best, a);
+        {   /* down2-like: 96 -> 96 at P / 4 (MX-fp4 x, MX-fp8 gy) */
+            const int Pf = P / 4, Pq = P / 8; const size_t Sf = (size_t)Pf * Pf * Pf, Sq = (size_t)Pq * Pq * Pq, nw = (size_t)96 * 96 * 27;
+            shape5 xs2 = {1, 96, Pf, Pf, Pf}, ys2 = {1, 96, Pq, Pq, Pq};
+            void *x2 = mx(4, 96, Sf, 2.f, 53), *gy2 = mx(8, 96, Sq, 1e-3f, 54);
+            float *gw2 = nn_malloc(nw * 4), *gb2 = nn_malloc(96 * 4);
+            double b2 = 1e9;
+            for (int it = 0; it < 10; it++) {
+                nn_zero(gw2, nw * 4); nn_zero(gb2, 96 * 4);
+                nn_sync(); double t0 = now(); lp_bwd_w_s2_f8(x2, 4, xs2, gy2, 3, ys2, gw2, gb2, (gnp_t){0}); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < b2) b2 = (now() - t0) * 1e3;
+            }
+            float *h2 = malloc(nw * 4); nn_d2h(h2, gw2, nw * 4); double a2 = 0; for (size_t i = 0; i < nw; i++) a2 += fabs(h2[i]); free(h2);
+            printf("%-32s @%d %8.3f ms  |gw| %.9g\n", "wgrad s2 down2 96 -> 96 (fp8)", Pf, b2, a2);
+            nn_free(x2); nn_free(gy2); nn_free(gw2); nn_free(gb2);
+        }
         nn_free(x); nn_free(gy);
         shape5 x4 = {1, 4, P, P, P}, y4 = {1, 16, P, P, P};
         void *xi = mx(8, 4, S, 2.f, 53), *g4 = mx(8, 16, S, 1e-3f, 54);

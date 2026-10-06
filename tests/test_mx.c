@@ -279,6 +279,28 @@ int main(void) {
         mode_mx(); lp_conv_fwd_s2_f8(x3, 0, x12, w3, NULL, 16, y3, 0, ys, (gnp_t){0});
         cmp("s2 fwd 12 ch fp32 I/O, two taps per k", y3, yr3, ny, TOL);
     }
+    {   /* stride-2 weight gradient (down0 16 -> 16 / down2-like 64 -> 64): odd sizes, plain and gn+silu input (down_norm) */
+        const int Cs[2] = {16, 64};
+        for (int k = 0; k < 2; k++) {
+            const int C = Cs[k];
+            shape5 xs = {N, C, 13, 10, 22}, ys = nn_conv3d_out_shape(xs, C, 3, 2);
+            size_t nx = shape_numel(xs), ny = shape_numel(ys), NG = (size_t)N * G, nw = (size_t)C * C * 27;
+            float *x = dev_rand(nx, 1.f), *gy = dev_rand(ny, 1e-3f);
+            void *xm = mx_from(x, xs), *gym = mx_from(gy, ys); float *xd = deq(xm, xs), *gyd = deq(gym, ys);
+            float *gam = dev_rand(C, 1.f), *bet = dev_rand(C, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+            { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+            nn_gn_t g = {gam, bet, mean, rstd, G};
+            for (int gn = 0; gn < 2; gn++) {
+                float *gw1 = dev_zero(nw), *gw2 = dev_zero(nw), *gb1 = dev_zero(C), *gb2 = dev_zero(C), *t = dev_zero(nx);
+                mode_ref(); if (gn) nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, t); nn_conv3d_bwd_weight(gn ? t : xd, xs, gyd, ys, 3, 2, gw1, gb1);
+                mode_mx(); nn_conv3d_bwd_weight_x(xm, gn ? &g : NULL, NULL, NULL, 0, 0, xs, gym, ys, 3, 2, gw2, gb2);
+                char nm[96]; snprintf(nm, sizeof nm, "s2 bwd_weight %d -> %d, odd sizes%s (MX)", C, C, gn ? ", gn+silu input" : "");
+                cmp(nm, gw2, gw1, nw, TOL);
+                snprintf(nm, sizeof nm, "s2 bias grad %d, odd sizes%s (MX)", C, gn ? ", gn+silu input" : "");
+                cmp(nm, gb2, gb1, C, TOL);
+            }
+        }
+    }
     {   /* stride-2 backward-data on MX-fp8 gradients, other widths (down0 16 -> 16, odd sizes; down2-like 64 -> 64, accumulate) */
         const int cis[2] = {16, 64}, cos_[2] = {16, 64}, Ds[2] = {14, 8};
         for (int k = 0; k < 2; k++) {
