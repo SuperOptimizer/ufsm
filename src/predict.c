@@ -124,7 +124,8 @@ int cmd_predict(int argc, char **argv) {
                         "       [--gn-stats stored|legacy]   defaults to the checkpoint's normalization contract\n"
                         "       [--reference reference.json]   required for a surface_winding checkpoint, native level 0\n"
                         "       [--grid-origin z,y,x]   anchor tile interiors in selected-level CT voxels, independent of the output box\n"
-                        "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n");
+                        "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n"
+                        "       [--channel 0]   output channel written (band_affinity checkpoints: 1..6 = affinities z1 y1 x1 z8 y8 x8)\n");
         fprintf(stderr, "  For exact shard tiling, window - 2*halo should divide the shard size: 528 with halo 8 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n");
         return 2;
     }
@@ -134,6 +135,7 @@ int cmd_predict(int argc, char **argv) {
     int shard = atoi(opt(argc, argv, "--shard", "512")), gpu = atoi(opt(argc, argv, "--gpu", "0")), nlev = atoi(opt(argc, argv, "--levels", "4"));
     int nthreads = atoi(opt(argc, argv, "--threads", "16"));
     const int use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
+    const int out_ch = atoi(opt(argc, argv, "--channel", "0"));   /* output channel to write (band_affinity: 1..6 = affinities) */
     float q = (float)atof(opt(argc, argv, "--q", "8"));
     const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
     const char *grid = opt(argc, argv, "--grid-origin", nullptr);
@@ -165,6 +167,7 @@ int cmd_predict(int argc, char **argv) {
         if (!sheet || strcmp(geometry_sha,sheet->manifest_sha) || strcmp(reference_sha,sheet->reference_sha) || level!=0) { fprintf(stderr,"winding reference mismatch or non-native level\n"); return 2; }
     }
     if (embedded < 0 || unet_peek(ckpt, &cfg, &step) || cfg.nlev < 1 || cfg.nlev > UNET_MAXLEV) { fprintf(stderr, "cannot read checkpoint settings: %s\n", ckpt); return 1; }
+    if (out_ch < 0 || out_ch >= cfg.cout) { fprintf(stderr, "predict: --channel %d outside the checkpoint's %d outputs\n", out_ch, cfg.cout); return 2; }
     const char *gn_stats = opt(argc, argv, "--gn-stats", embedded && runtime.gn_stored ? "stored" : "legacy");
     if (strcmp(gn_stats, "stored") && strcmp(gn_stats, "legacy")) { fprintf(stderr, "--gn-stats must be stored or legacy\n"); return 2; }
     nn_set_gn_stored(!strcmp(gn_stats, "stored"));
@@ -363,6 +366,7 @@ int cmd_predict(int argc, char **argv) {
                 nn_sheet_input(xd,W,sheet_rows,(float)sheet->center,(float)sheet->scale,h16);
             }
             const float *lg = unet_forward_x(u, xd, xs, 0, h16);
+            lg += (size_t)out_ch * w3;   /* channel c of the [c][W^3] logits (B = 1) */
             if (sheet_task) {
                 nn_sheet_gate((float *)lg+w3,lg,ctd,W,sheet_rows);
                 nn_d2h(sheet_window,lg+w3,w3*4);
