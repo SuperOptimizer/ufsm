@@ -84,7 +84,7 @@ def compare(ref, pred, known):
 def main():
     a = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     a.add_argument('--out', required=True); a.add_argument('--boxes', default=BOXES); a.add_argument('--gpu', default='0')
-    a.add_argument('--cutoffs', default='0.3,0.4'); a.add_argument('ckpts', nargs='+')
+    a.add_argument('--cutoffs', default='0.15,0.175,0.2,0.225,0.25,0.3'); a.add_argument('--aff-cuts', default='0.55,0.6,0.625,0.65,0.7'); a.add_argument('ckpts', nargs='+')
     g = a.parse_args()
     out = Path(g.out); out.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -118,13 +118,18 @@ def main():
                     bnd |= pool2max(read(cd / ('ch%d' % c), '2.4', (0, 0, 0), n, cd / 'p.raw') < 128)
                 lab = pieces(bnd, inside)
                 result.append(dict(name=name, box=box, method='affinity d1', **compare(ref, lab, known)))
-                bnd8 = np.zeros(nl, bool)   # offset-8 channels: an 8-voxel cut strip before each boundary, refilled by the nearest piece
+                dmax = None   # offset-8 channels: per label voxel the strongest "different" (255 - affinity) of the 2x block
                 for c in (4, 5, 6):
                     predict(ck, box, cd / ('ch%d' % c), g.gpu, c)
-                    bnd8 |= pool2max(read(cd / ('ch%d' % c), '2.4', (0, 0, 0), n, cd / 'p.raw') < 128)
-                result.append(dict(name=name, box=box, method='affinity d8', **compare(ref, pieces(bnd8, inside), known)))
-                result.append(dict(name=name, box=box, method='affinity d1+d8', **compare(ref, pieces(bnd | bnd8, inside), known)))
+                    dv = pool2max(255 - read(cd / ('ch%d' % c), '2.4', (0, 0, 0), n, cd / 'p.raw'))
+                    dmax = dv if dmax is None else np.maximum(dmax, dv)
+                for t in [float(c) for c in g.aff_cuts.split(',')]:   # boundary where "same" < t
+                    result.append(dict(name=name, box=box, method='affinity d8<%.3f' % t,
+                                       **compare(ref, pieces(dmax > int(round((1 - t) * 255)), inside), known)))
             (cd / 'p.raw').unlink(missing_ok=True)
+            for m in ('recto', 'affinity d8'):   # best cutoff per method (tuned on this box, the same way for every checkpoint)
+                c = [r for r in result if r['method'].startswith(m)]
+                if c: b = min(c, key=lambda r: r['voi']); result.append(dict(b, method='BEST ' + b['method']))
             json.dump(result, open(res, 'w'), indent=1); rows += result
     for r in rows:
         print('%-16s box%s %-12s VOI %.3f (split %.3f merge %.3f) ARAND %.3f | bands %d pieces %d split %d merged %d' %
