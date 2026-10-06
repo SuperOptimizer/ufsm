@@ -391,6 +391,12 @@ __device__ __forceinline__ int mx_exp(float amax, float inv_qmax) {
     return max(-126, min(126, e));
 }
 __device__ __forceinline__ float exp2i(int e) { return __uint_as_float((unsigned)(127 + e) << 23); }
+/* asynchronous global -> shared copy of NB (4, 8, 16) bytes, zero-filled when !ok (nothing is read then); cp_async_wait: commit
+   and wait for all of this thread's copies (a barrier then makes them visible to the block) */
+template <int NB> __device__ __forceinline__ void cp_async(void *sdst, const void *gsrc, bool ok) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;\n" :: "r"((unsigned)__cvta_generic_to_shared(sdst)), "l"(gsrc), "n"(NB), "r"(ok ? NB : 0) : "memory");
+}
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory"); }
 __device__ __forceinline__ unsigned cvt_e4m3x4(float a, float b, float c, float d) {   /* bytes a,b,c,d (a lowest) */
     unsigned short lo, hi;
     asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(b), "f"(a));

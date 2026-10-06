@@ -36,8 +36,18 @@
 #define X4_CS 1744
 #define X4_SCS 130   /* u16 per channel of the scale-pair table (4 planes x 32 + 2 pad) */
 #define G4_CS 144
+#define GP4_REC 136   /* gy pre-pass record: 8 blocks x 16 B + 8 scale bytes per (n, co, z-step, 8-row tile, 16-x tile) */
 #define F4W_SGN 0x9c6d2a73u
 #define F4W_SGN16 0x2a73u   /* sign vector of the H16 variant (UFSM_F4_HAD_W=2), over the 16 x positions of a row window */
+#ifndef F4W_PROF
+#define F4W_PROF 0   /* 1: per-phase clock64 sums of conv_bwd_w_f4_k (x staging / gy staging / mma), printed per call when env F4W_PROF is set */
+#endif
+#if F4W_PROF
+__device__ unsigned long long g_f4wprof[6];
+#define FP_T(v) unsigned long long v = 0; if (threadIdx.x == 0) v = clock64();
+#else
+#define FP_T(v)
+#endif
 extern int g_f4w_coop;
 extern int g_f4w_gypre_kb;
 static int f4w_coop(void) {   /* read-only initialization for concurrent training on multiple GPUs */
@@ -64,7 +74,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
     uint8_t *sg = (uint8_t *)(sxp + CH * X4_SCS);                     /* [BMo][G4_CS] */
     uint8_t *sgs = sg + BMo * G4_CS;                                  /* [BMo][8] */
     float *sbias = (float *)(sgs + BMo * 8);                          /* [BMo] */
-    chan_t *ctab4 = (chan_t *)(((uintptr_t)(sbias + BMo) + 31) & ~(uintptr_t)31);   /* [CH] MX x only */
+    chan_t *ctab4 = (chan_t *)(smem_raw + (((unsigned char *)(sbias + BMo) - smem_raw + 31) & ~31));   /* offset from smem_raw: an integer round trip would make every access below a generic load */   /* [CH] MX x only */
     __nv_bfloat16 *xt = (__nv_bfloat16 *)(ctab4 + (IS_MX(T) ? CH : 0));             /* [CH][10 rows][24] MX x, LY 1-3: decoded plane, p at 3 + p */
     const int xt_len = IS_MX(T) && LY ? CH * 240 : 0;
     unsigned *ram = (unsigned *)(xt + (coop ? max(xt_len, BMo * 256) : xt_len));   /* decoded X / GY share one tile */
@@ -103,10 +113,24 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
         for (int q = 1; q < CH; q++) if (ctab4[q].p && (ctab4[q].sp != ctab4[0].sp || ctab4[q].nib != ctab4[0].nib + q)) mxu = false;
     }
     if (upt && !mxu) __trap();   /* only the tile path upsamples (host: LY 1-3, aligned 16-channel tiles) */
+#if F4W_PROF
+    unsigned long long pa = 0, pb_ = 0, pc = 0, sA = 0, sB = 0, tq = 0;   /* x / gy / mma phases; x: tile decode, LY 1 act + quantise */
+#endif
     for (int zt = zt_begin; zt < nzt && zt < zt_begin + ZC; zt++) {
         const int oz0 = zt * 2;
         const int np = zt == zt_begin ? 4 : 2, gz_first = zt == zt_begin ? oz0 - 1 : oz0 + 1;
         __syncthreads();
+        FP_T(t0)
+        if (gpre) {   /* gy pre-pass: this z-step's 136-byte record per output channel (8 blocks + 8 scale bytes, gy_pre4_k) copied
+                         asynchronously into sg / sgs (warp per channel, lane = word, lane 0 also the scales); waited for after the x staging */
+            const int ZT = (min(2 * nzt, D) - 2 * zs0 + 1) / 2, TY = (H + 7) / 8, TX = (W + 15) / 16;
+            for (int task = warp; task < BMo; task += 9) {
+                const int co = co0 + task;
+                const uint8_t *rec = gpre + (((((size_t)n * Co + (co < Co ? co : 0)) * ZT + (zt - zs0)) * TY + (oy0 >> 3)) * TX + (ox0 >> 4)) * GP4_REC;
+                cp_async<4>(sg + task * G4_CS + 4 * lane, rec + 4 * lane, co < Co);
+                if (lane == 0) cp_async<8>(sgs + task * 8, rec + 128, co < Co);
+            }
+        }
         /* X: warp per (channel, plane). Phase 1: the 10 x 18 positions (GN+SiLU applied) into the warp's fp32 plane,
            position p of a row = x ox0 - 1 + p. Phase 2: the 27 shifted 32-position blocks, 4 lanes x 8 values each. */
         constexpr int U = LY == 1 || LY == 2 ? 2 : 1;   /* x tasks in flight per warp: the loads of both are issued before either is quantised */
@@ -116,6 +140,9 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
         for (int pass = 0; pass < (mxu ? np : 1); pass++) {
         if (mxu) {
             __syncthreads();
+#if F4W_PROF
+            if (threadIdx.x == 0) tq = clock64();
+#endif
             const int tid = threadIdx.x, row = tid / 18, pp = tid % 18, gz = gz_first + pass, gyy = oy0 - 1 + row, gx = ox0 - 1 + pp;
             if (tid < 180) {
                 float v[CH];
@@ -127,42 +154,58 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
                 for (int q = 0; q < CH; q++) xt[(q * 10 + row) * 24 + 3 + pp] = __float2bfloat16(v[q]);   /* raw decoded value: exact in bf16 */
             }
             __syncthreads();
+#if F4W_PROF
+            if (threadIdx.x == 0) { unsigned long long t = clock64(); sA += t - tq; tq = t; }
+#endif
         }
-        if (LY == 1 && mxu) {   /* LY 1 from the tile: thread per (channel q, row r): 18 values, row amax locally, pair amax from smem */
-            const int tid = threadIdx.x, q = tid / 10, r = tid % 10, gz = gz_first + pass, slot = (gz + 1) & 3, gyy = oy0 - 1 + r;
-            const bool act = tid < CH * 10;
+        if (LY == 1 && mxu) {   /* LY 1 from the tile: lane (channel q = 3 warp + lane / 10, row r = lane % 10) < 30: 18 values, row amax
+                                   locally, the pair amaxes and the scale-pair table from the neighbouring rows' lanes (shuffles, no barrier);
+                                   straight-line loads / activation / selects so the 18 values overlap (bit-identical to the per-value form) */
+            const unsigned FM = 0xffffffffu;
+            const int grp = lane / 10, r = lane - 10 * grp, q = 3 * warp + grp, gz = gz_first + pass, slot = (gz + 1) & 3, gyy = oy0 - 1 + r;
+            const bool act = grp < 3 && q < CH;
+            const chan_t &cq = ctab4[act ? q : 0];
+            const bool rok = act && cq.p && gz >= 0 && gz < D && gyy >= 0 && gyy < H, G = (gp.G != 0 || sp.gp2.G != 0) && cq.g;
+            const float ca = cq.a, cb = cq.b;
+            const int jlo = ox0 == 0 ? 1 : 0, jhi = W - ox0 + 1;   /* x = ox0 - 1 + j inside [0, W) */
+            const unsigned *src = (const unsigned *)(xt + ((act ? q : 0) * 10 + r) * 24 + 2);   /* words: bf16 2 .. 21 = positions -1 .. 18 */
+            unsigned wv[10];
+#pragma unroll
+            for (int i = 0; i < 10; i++) wv[i] = src[i];
             float v[18];
             unsigned am = 0u;
-            if (act) {
-                const chan_t &cq = ctab4[q];
-                const bool rok = cq.p && gz >= 0 && gz < D && gyy >= 0 && gyy < H, G = (gp.G != 0 || sp.gp2.G != 0) && cq.g;
-                const __nv_bfloat16 *src = xt + (q * 10 + r) * 24 + 3;
 #pragma unroll
-                for (int j = 0; j < 18; j++) {
-                    const int gx = ox0 - 1 + j;
-                    v[j] = rok && gx >= 0 && gx < W ? act_ab(__bfloat162float(src[j]), cq.a, cq.b, G) : 0.f;
-                    am = amax_u(am, v[j]);
-                }
-                ram[q * 10 + r] = am;
+            for (int j = 0; j < 18; j++) {
+                const float xv = __uint_as_float((j & 1) ? wv[(j + 1) >> 1] << 16 : wv[j >> 1] & 0xffff0000u);   /* position j = bf16 3 + j */
+                const float u = fmaf(xv, ca, cb), h = 0.5f * u;
+                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+                v[j] = rok && j >= jlo && j < jhi ? (G ? fmaf(h, th, h) : xv) : 0.f;
+                am = amax_u(am, v[j]);
             }
-            __syncthreads();
-            if (act) {
-                uint8_t *dst = sxq + q * XCS + slot * XPS;
+            const unsigned amE = max(am, __shfl_xor_sync(FM, am, 1));                                   /* rows (2 P, 2 P + 1) */
+            const unsigned amO = max(am, __shfl_sync(FM, am, (r & 1) ? min(lane + 1, 31) : max(lane - 1, 0)));   /* rows (2 P + 1, 2 P + 2), r = 1 .. 8 */
+            int eP[2];
+            uint8_t *dst = sxq + (act ? q : 0) * XCS + slot * XPS;
 #pragma unroll
-                for (int pz = 0; pz < 2; pz++) {
-                    if (pz && (r < 1 || r > 8)) continue;
-                    const int part = pz ? ((r & 1) ? r + 1 : r - 1) : (r ^ 1);
-                    const int e = mx_exp(__uint_as_float(max(am, ram[q * 10 + part])), 1.f / 6.f);
-                    const float m = exp2i(-e);
-                    const int pair = pz ? 5 + ((r - 1) >> 1) : r >> 1, rin = pz ? (r - 1) & 1 : r & 1;
-                    uint2 *o = (uint2 *)(dst + pair * 48 + rin * 24);
-                    o[0] = make_uint2(((unsigned)cvt_e2m1x2(v[0] * m, 0.f) & 15u) << 28, cvt_e2m1x8(v + 1, m));
-                    o[1] = make_uint2(cvt_e2m1x8(v + 9, m), (unsigned)cvt_e2m1x2(v[17] * m, 0.f) & 15u);
-                    if (rin == 0) tsc[q * 9 + pair] = (uint8_t)(e + 127);
-                }
+            for (int pz = 0; pz < 2; pz++) {
+                const int e = mx_exp(__uint_as_float(pz ? amO : amE), 1.f / 6.f);
+                eP[pz] = e;
+                if (!act || (pz && (r < 1 || r > 8))) continue;
+                const float m = exp2i(-e);
+                const int pair = pz ? 5 + ((r - 1) >> 1) : r >> 1, rin = pz ? (r - 1) & 1 : r & 1;
+                uint2 *o = (uint2 *)(dst + pair * 48 + rin * 24);
+                o[0] = make_uint2(((unsigned)cvt_e2m1x2(v[0] * m, 0.f) & 15u) << 28, cvt_e2m1x8(v + 1, m));
+                o[1] = make_uint2(cvt_e2m1x8(v + 9, m), (unsigned)cvt_e2m1x2(v[17] * m, 0.f) & 15u);
             }
+            /* scale pairs (byte 0 = pair P, byte 1 = pair P + 1 of the same alignment, none after P = 4 / 8): even pair P = r / 2 from
+               lane r = 2 P with pair P + 1 two lanes up; odd pair P = 5 + (r - 1) / 2 from lane r odd, likewise */
+            const unsigned eb = (unsigned)(((r & 1) ? eP[1] : eP[0]) + 127) & 255u;
+            const unsigned up = __shfl_down_sync(FM, eb, 2);
+            if (act && r < 9) sxp[q * X4_SCS + slot * 32 + ((r & 1) ? 5 + ((r - 1) >> 1) : r >> 1)] = (unsigned short)(eb | (r < 7 ? up << 8 : 0u));
+#if F4W_PROF
             __syncthreads();
-            if (tid < CH * 9) { const int qq = tid / 9, P = tid % 9; sxp[qq * X4_SCS + ((gz_first + pass + 1) & 3) * 32 + P] = (unsigned short)(tsc[qq * 9 + P] | (P != 4 && P < 8 ? (unsigned)tsc[qq * 9 + P + 1] << 8 : 0u)); }
+            if (threadIdx.x == 0) { unsigned long long t = clock64(); sB += t - tq; tq = t; }
+#endif
         } else {
         const int NXT = mxu ? CH : CH * np;
         for (int task0 = warp; task0 < NXT; task0 += 9 * U) {
@@ -371,6 +414,10 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
         }
         }   /* LY 1 from the tile / tasks */
         }   /* pass */
+#if F4W_PROF
+        __syncthreads();
+#endif
+        FP_T(t1)
         bool gy_coop = false;
         if constexpr (IS_MX8(TG)) {
             const int gbw = mx_bw(Co);
@@ -408,21 +455,8 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
         }
         /* GY: block (co, pb) = row pair pb of the z-step (rows 2 pb, 2 pb + 1; vz = pb >> 2), 4 lanes x 8 values: lane f holds
            block elements 8 f .. 8 f + 7 (row f >> 1, x 8 (f & 1) ..) = one e2m1 word; a warp task covers 8 blocks */
-        if (gpre) {   /* pre-rounded blocks of this slab (gy_pre4_k): one word per lane, the scale byte per block */
-            const int Hp = (H + 1) / 2, Wb = (W + 15) / 16, Zs = min(2 * nzt, D) - 2 * zs0;
-            const size_t nblk = (size_t)N * Co * Zs * Hp * Wb;
-            for (int task = warp; task < BMo; task += 9) {
-                const int blk = task * 8 + (lane >> 2), c = blk >> 3, pb = blk & 7, f = lane & 3;
-                const int row = pb * 2 + (f >> 1), co = co0 + c, oz = oz0 + (row >> 3), yp = (oy0 + (row & 7)) >> 1;
-                unsigned word = 0u, scb = 127u;
-                if (co < Co && oz < D && yp < Hp) {
-                    const size_t bi = ((((size_t)n * Co + co) * Zs + (oz - 2 * zs0)) * Hp + yp) * Wb + (ox0 >> 4);
-                    word = __ldg((const unsigned *)(gpre + bi * 16) + f);
-                    if (f == 0) scb = gpre[nblk * 16 + bi];
-                }
-                *(unsigned *)(sg + c * G4_CS + pb * 16 + 4 * f) = word;
-                if (f == 0) sgs[c * 8 + pb] = (uint8_t)scb;
-            }
+        if (gpre) {
+            cp_async_wait();   /* the barrier below publishes the copies */
         } else
         for (int task = warp; task < BMo; task += 9) {
             int blk = task * 8 + (lane >> 2), c = blk >> 3, pb = blk & 7, f = lane & 3;
@@ -497,6 +531,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             if (f == 0) { sgs[c * 8 + pb] = (uint8_t)(e + 127); if (do_bias) atomicAdd(&sbias[c], sm); }
         }
         __syncthreads();
+        FP_T(t2)
 #pragma unroll
         for (int vz = 0; vz < 2; vz++) {
             const int slot = (oz0 + vz + kz) & 3;
@@ -554,7 +589,15 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
                 }
             }
         }
+#if F4W_PROF
+        __syncthreads();
+        if (threadIdx.x == 0) { unsigned long long t3 = clock64(); pa += t1 - t0; pb_ += t2 - t1; pc += t3 - t2; }
+#endif
     }
+#if F4W_PROF
+    if (threadIdx.x == 0) { atomicAdd(&g_f4wprof[0], pa); atomicAdd(&g_f4wprof[1], pb_); atomicAdd(&g_f4wprof[2], pc); atomicAdd(&g_f4wprof[3], 1ull);
+                            atomicAdd(&g_f4wprof[4], sA); atomicAdd(&g_f4wprof[5], sB); }
+#endif
     if (do_bias) { __syncthreads(); if (threadIdx.x < BMo && co0 + (int)threadIdx.x < Co) atomicAdd(&gb[co0 + threadIdx.x], sbias[threadIdx.x]); }
     const float osc = (had & 4) ? 1.f / 16.f : (had & 1) ? 1.f / 32.f : 1.f;
 #pragma unroll
@@ -579,7 +622,9 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
    staging forms it, once per layer instead of in every block's z-step. Block (n, co, z, row pair yp, 16-x block xb) = rows
    2 yp, 2 yp + 1 x 16 xb ..; lane word f = row f >> 1, x 8 (f & 1) .. + 7 (zero outside the volume); ue8m0 of the block amax
    / 6 (byte e + 127) and exact SR keyed by the word's first element, as in the kernel. Covers the planes [z0, z0 + Zs) of
-   one slab: out = Zs-plane blocks (16 B each) then their scale bytes. gb: += the sum of gy over those planes.
+   one slab, laid out as the kernel copies it: one 136-byte record per (n, co, z-step zt, 8-row tile ty, 16-x tile xb) =
+   its 8 blocks pb = 4 (z & 1) + (yp & 3) (16 B each) then their 8 scale bytes, blocks past the volume zero (scale byte 1).
+   gb: += the sum of gy over those planes.
    A warp per tile (32 voxels x one MX channel block: lane k decodes voxel k's row), tiles strided over all warps of the grid,
    only warp-level synchronisation; the BW channels x 4 words are BW / 8 tasks per lane (the 4 words of a block in 4
    consecutive lanes for the amax shuffles). The bias sums stay in registers until the end (block-reduced, one atomic per
@@ -591,21 +636,21 @@ template <int BW> __global__ void __launch_bounds__(256) gy_pre4_k(const uint8_t
     __shared__ float bred[BW];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nb = mx_nb(Co), cb = blockIdx.y % nb, n = blockIdx.y / nb;
-    const int Hp = (H + 1) / 2, Wb = (W + 15) / 16;
-    const size_t Sg = (size_t)D * H * W, ntile = (size_t)Zs * Hp * Wb, nblk = (size_t)N * Co * ntile;
+    const int Wb = (W + 15) / 16, ZT = (Zs + 1) / 2, TY = (H + 7) / 8, Yb = 4 * TY;   /* padded block grid: 2 ZT planes x 4 TY row pairs */
+    const size_t Sg = (size_t)D * H * W, ntile = (size_t)2 * ZT * Yb * Wb;
     const uint8_t *gsc = gy + (size_t)N * nb * Sg * BW;
     if (threadIdx.x < BW) bred[threadIdx.x] = 0.f;
     float bacc[NTASK];
 #pragma unroll
     for (int k = 0; k < NTASK; k++) bacc[k] = 0.f;
     for (size_t tile = (size_t)blockIdx.x * 8 + warp; tile < ntile; tile += (size_t)gridDim.x * 8) {
-        const int xb = (int)(tile % Wb), yp = (int)((tile / Wb) % Hp), zz = (int)(tile / ((size_t)Wb * Hp)), z = z0 + zz;
+        const int xb = (int)(tile % Wb), yp = (int)((tile / Wb) % Yb), zz = (int)(tile / ((size_t)Wb * Yb)), z = z0 + zz;
         {
             const int y = 2 * yp + (lane >> 4), x = 16 * xb + (lane & 15);
             float r[32];
 #pragma unroll
             for (int j = 0; j < 32; j++) r[j] = 0.f;
-            if (y < H && x < W) {
+            if (zz < Zs && y < H && x < W) {
                 const size_t ri = ((size_t)n * nb + cb) * Sg + ((size_t)z * H + y) * W + x;
                 mxf<8>::dec_row(gy + ri * BW, BW, mx_scale(gsc[ri]), r);
             }
@@ -631,9 +676,10 @@ template <int BW> __global__ void __launch_bounds__(256) gy_pre4_k(const uint8_t
             sr_hash4(sr, vid, hh);
             const unsigned word = sr_e2m1_word(q, m, hh);
             if (co < Co) {
-                const size_t bi = ((((size_t)n * Co + co) * Zs + zz) * Hp + yp) * Wb + xb;
-                *(unsigned *)(out + bi * 16 + 4 * f) = word;
-                if (f == 0) out[nblk * 16 + bi] = (uint8_t)(e + 127);
+                uint8_t *rec = out + (((((size_t)n * Co + co) * ZT + (zz >> 1)) * TY + (yp >> 2)) * Wb + xb) * GP4_REC;
+                const int pb = 4 * (zz & 1) + (yp & 3);
+                *(unsigned *)(rec + pb * 16 + 4 * f) = word;
+                if (f == 0) rec[128 + pb] = (uint8_t)(e + 127);
             }
         }
         __syncwarp();   /* the warp's tile buffer is reused */
@@ -649,6 +695,16 @@ template <int BW> __global__ void __launch_bounds__(256) gy_pre4_k(const uint8_t
         if (threadIdx.x < BW && cb * BW + (int)threadIdx.x < Co) atomicAdd(&gb[cb * BW + threadIdx.x], bred[threadIdx.x]);
     }
 }
+#if F4W_PROF
+static void f4w_prof_dump(shape5 xs, shape5 ys, int MT, int NT, int lay) {
+    if (!getenv("F4W_PROF")) return;
+    unsigned long long h[6]; cudaDeviceSynchronize(); cudaMemcpyFromSymbol(h, g_f4wprof, sizeof h);
+    const double s = (double)(h[0] + h[1] + h[2]);
+    fprintf(stderr, "f4wprof %d->%d @%d MT %d NT %d LY %d blocks %llu: x %.1f%% (decode %.1f, act + quantise %.1f) gy %.1f%% mma %.1f%%  (Mcyc/block %.3f)\n", xs.c, ys.c, xs.d, MT, NT, lay, h[3],
+            100 * h[0] / s, 100 * h[4] / s, 100 * h[5] / s, 100 * h[1] / s, 100 * h[2] / s, s / h[3] / 1e6);
+    memset(h, 0, sizeof h); cudaMemcpyToSymbol(g_f4wprof, h, sizeof h);
+}
+#endif
 template <int MT, int NT, typename T, typename TG> static void launch_bw4(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC, int had, int lay,
                                                                           const uint8_t *gpre = nullptr, int zs0 = 0, int zs1 = 0) {
     static int attr[8];
@@ -691,14 +747,14 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
        pass and the shallower slab tiles (22 vs 25 ms at 384^3); 32 -> 32 / 64 -> 64 / 96 -> 32 / 48 -> 16 gain 30 / 35 / 30 / 7% */
     const bool pre_ok = g_f4w_gypre_kb > 0 || ys.c > 16 || xs.c > 8 * NT;
     if constexpr (IS_MX8(TG)) if (cap_kb && pre_ok && sp.sr && !had && (lay == 1 || lay == 2) && zc_env <= 0) {
-        const int Hp = (ys.h + 1) / 2, Wb = (ys.w + 15) / 16, gbw = mx_bw(ys.c);
-        const size_t per_zt = (size_t)ys.n * ys.c * 2 * Hp * Wb * 17;
+        const int Wb = (ys.w + 15) / 16, gbw = mx_bw(ys.c);
+        const size_t per_zt = (size_t)ys.n * ys.c * ((ys.h + 7) / 8) * Wb * GP4_REC;   /* one record per (n, co, z-step, 8-row tile, 16-x tile) */
         const size_t cap_zt = (cap_kb << 10) / per_zt;
         const int szt = cap_zt < 1 ? 1 : cap_zt < (size_t)nzt ? (int)cap_zt : nzt;
         uint8_t *buf = lp_buf<uint8_t>(4, per_zt * szt);
         for (int zs0 = 0; zs0 < nzt; zs0 += szt) {
             const int zs1 = zs0 + szt < nzt ? zs0 + szt : nzt, Zs = (2 * zs1 < ys.d ? 2 * zs1 : ys.d) - 2 * zs0;
-            const size_t ntile = (size_t)Zs * Hp * Wb;
+            const size_t ntile = (size_t)2 * ((Zs + 1) / 2) * 4 * ((ys.h + 7) / 8) * Wb;   /* the padded block grid of the records */
             const size_t nwb = (ntile + 7) / 8;   /* CTAs of 8 warps, a few tiles per warp */
             const dim3 pg((unsigned)(nwb < 4096 ? nwb : 4096), (unsigned)(ys.n * mx_nb(ys.c)));
             if (gbw == 16) gy_pre4_k<16><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr);
@@ -715,6 +771,9 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
             default: fprintf(stderr, "lp_bwd_w_f4: bad MT/NT %d/%d\n", MT, NT); abort();
             }
         }
+#if F4W_PROF
+        f4w_prof_dump(xs, ys, MT, NT, lay);
+#endif
         return;
     }
     int nzc = (nzt + ZC - 1) / ZC;
@@ -727,4 +786,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
     case 22: launch_bw4<2, 2, T, TG>(grid, smem, x, xs, gy, ys, gw, gb, gp, sp, ZC, had, lay); break;
     default: fprintf(stderr, "lp_bwd_w_f4: bad MT/NT %d/%d\n", MT, NT); abort();
     }
+#if F4W_PROF
+    f4w_prof_dump(xs, ys, MT, NT, lay);
+#endif
 }

@@ -21,7 +21,7 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
     uint8_t *sgs = sg + BMo * G8_CS;                /* [BMo][8 ksteps] */
     uint8_t *sxs = sgs + BMo * 8;                   /* [CH][4 slots] */
     float *sbias = (float *)(sxs + CH * 4);         /* [BMo] */
-    chan_t *ctab8 = (chan_t *)(((uintptr_t)(sbias + BMo) + 31) & ~(uintptr_t)31);   /* [CH] MX x: per-channel descriptors */
+    chan_t *ctab8 = (chan_t *)(smem_raw + (((unsigned char *)(sbias + BMo) - smem_raw + 31) & ~31));   /* offset from smem_raw: an integer round trip would make every access below a generic load */   /* [CH] MX x: per-channel descriptors */
     unsigned *amx = (unsigned *)(ctab8 + CH);      /* [2][CH] MX x: per-channel plane amax (bits), double-buffered by plane */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int ci0 = blockIdx.y * CH, co0 = blockIdx.z * BMo;

@@ -39,7 +39,7 @@ int main(int argc, char **argv) {
     const int P = argc > 1 ? atoi(argv[1]) : 384, G = 8;
     nn_init(0); nn_set_f16(1);
     const size_t S = (size_t)P * P * P;
-    float *gam = rnd(48, 1.f, 4), *bet = rnd(48, 0.5f, 5), *mean = rnd(G, 0.1f, 6), *rstd = rnd(G, 0.1f, 7);
+    float *gam = rnd(192, 1.f, 4), *bet = rnd(192, 0.5f, 5), *mean = rnd(G, 0.1f, 6), *rstd = rnd(G, 0.1f, 7);
     double *osum = nn_malloc(2 * 64 * sizeof(double));
     struct { const char *nm; int xb, ci, co, osplit, gn, stats, sr; } L[] = {
         {"fwd 16 -> 16 (gn+silu, stats)", 4, 16, 16, 0, 1, 1, 0}, {"fwd 48 -> 16 (gn+silu, stats)", 4, 48, 16, 0, 1, 1, 0},
@@ -83,9 +83,10 @@ int main(int argc, char **argv) {
         }
     }
     /* weight gradient (fp4, the --fp4 2 recipe): MX-fp4 x with GN+SiLU in staging, MX-fp8 gy with SR, bias */
-    struct { const char *nm; int ci, co; } WL[] = {{"wgrad 16 -> 16 (gn+silu, SR)", 16, 16}, {"wgrad 48 -> 16 (gn+silu, SR)", 48, 16}, {"wgrad 32 -> 32 (gn+silu, SR) @P/2", 32, 32}};
-    for (int l = 0; l < 3; l++) {
-        const int Pl = l == 2 ? P / 2 : P; const size_t Sl = (size_t)Pl * Pl * Pl;
+    struct { const char *nm; int ci, co, dv; } WL[] = {{"wgrad 16 -> 16 (gn+silu, SR)", 16, 16, 1}, {"wgrad 48 -> 16 (gn+silu, SR)", 48, 16, 1}, {"wgrad 32 -> 32 (gn+silu, SR) @P/2", 32, 32, 2},
+                                                  {"wgrad 128 -> 32 (gn+silu, SR) @P/2", 128, 32, 2}, {"wgrad 96 -> 96 (gn+silu, SR) @P/4", 96, 96, 4}};
+    for (int l = 0; l < (int)(sizeof WL / sizeof WL[0]); l++) {
+        const int Pl = P / WL[l].dv; const size_t Sl = (size_t)Pl * Pl * Pl;
         shape5 xs = {1, WL[l].ci, Pl, Pl, Pl}, ys = xs; ys.c = WL[l].co;
         void *x = mx(4, WL[l].ci, Sl, 2.f, 21 + l), *gy = mx(8, WL[l].co, Sl, 1e-3f, 31 + l);
         const size_t nw = (size_t)WL[l].co * WL[l].ci * 27;
@@ -101,6 +102,26 @@ int main(int argc, char **argv) {
         float *h = malloc(nw * 4); nn_d2h(h, gw, nw * 4); double a = 0; for (size_t i = 0; i < nw; i++) a += fabs(h[i]); free(h);
         printf("%-32s @%d %8.3f ms  |gw| %.9g\n", WL[l].nm, Pl, best, a);
         nn_free(x); nn_free(gy); nn_free(gw); nn_free(gb);
+    }
+    {   /* decoder conv1 weight gradients: [up2(coarse s2) | silu(gn(skip))] staged inside the kernel (sp.up), as dec0.c1 / dec1.c1 train */
+        struct { const char *nm; int cu, cs, co, dv; } UL[] = {{"wgrad up 32 + 16 -> 16 (dec0.c1)", 32, 16, 16, 1}, {"wgrad up 96 + 32 -> 32 (dec1.c1) @P/2", 96, 32, 32, 2}};
+        for (int l = 0; l < 2; l++) {
+            const int Pl = P / UL[l].dv; const size_t Sl = (size_t)Pl * Pl * Pl, Sc = Sl / 8;
+            shape5 xs = {1, UL[l].cu + UL[l].cs, Pl, Pl, Pl}, ys = xs; ys.c = UL[l].co;
+            void *xc = mx(4, UL[l].cu, Sc, 2.f, 71 + l), *xk = mx(4, UL[l].cs, Sl, 2.f, 73 + l), *gy = mx(8, UL[l].co, Sl, 1e-3f, 75 + l);
+            const size_t nw = (size_t)UL[l].co * xs.c * 27;
+            float *gw = nn_malloc(nw * 4), *gb = nn_malloc(UL[l].co * 4);
+            double best = 1e9;
+            for (unsigned it = 0; it < 10; it++) {
+                split_t sp = {0}; sp.sr = 0x51ed270bu + it; sp.up = 1; sp.x2 = xk; sp.c_split = UL[l].cu; sp.gp2 = (gnp_t){gam, bet, mean, rstd, G};
+                nn_zero(gw, nw * 4); nn_zero(gb, UL[l].co * 4);
+                nn_sync(); double t0 = now(); lp_bwd_w_f4(xc, 4, xs, gy, 3, ys, gw, gb, (gnp_t){0}, sp, 0); nn_sync(); double t = (now() - t0) * 1e3;
+                if (it >= 2 && t < best) best = t;
+            }
+            float *h = malloc(nw * 4); nn_d2h(h, gw, nw * 4); double a = 0; for (size_t i = 0; i < nw; i++) a += fabs(h[i]); free(h);
+            printf("%-32s @%d %8.3f ms  |gw| %.9g\n", UL[l].nm, Pl, best, a);
+            nn_free(xc); nn_free(xk); nn_free(gy); nn_free(gw); nn_free(gb);
+        }
     }
     {   /* fp8 weight gradients at level 0: down0 (stride 2, MX-fp4 x level 0 -> MX-fp8 gy level 1, 16 -> 16) and the stem
            (enc0.c1: MX-fp8 4-channel input, MX-fp8 gy, SR) */
