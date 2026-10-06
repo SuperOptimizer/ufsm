@@ -39,6 +39,7 @@
 #define F4W_SGN 0x9c6d2a73u
 #define F4W_SGN16 0x2a73u   /* sign vector of the H16 variant (UFSM_F4_HAD_W=2), over the 16 x positions of a row window */
 extern int g_f4w_coop;
+extern int g_f4w_gypre_kb;
 static int f4w_coop(void) {   /* read-only initialization for concurrent training on multiple GPUs */
     return g_f4w_coop >= 0 ? g_f4w_coop : getenv("UFSM_F4W_COOP_GY") ? ufsm_env_on("UFSM_F4W_COOP_GY") : 1;
 }
@@ -62,7 +63,8 @@ __device__ __forceinline__ float sr_e2m1_u16(float v, unsigned u16) {
 __device__ __forceinline__ void had_lane(float &v, float p, bool hi) { v = hi ? p - v : v + p; }
 template <int MT, int NT, int LY, typename T, typename TG>   /* LY 0: 27 shifted blocks, 1: row pairs (2 pairings), 2: rows, one scale per (ci, plane) */
 __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
-                                                       int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC, int had, int coop) {
+                                                       int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC, int had, int coop,
+                                                       const uint8_t *__restrict__ gpre, int zs0, int zs1) {
     constexpr int CH = 8 * NT, BMo = 16 * MT;
     constexpr int XPS = LY >= 2 ? 240 : X4_PS, XCS = LY >= 2 ? 976 : X4_CS;   /* x bytes per plane / per channel (LY 2: 10 rows x 24 B, LY 3: 3 kx x 10 rows x 8 B) */
     extern __shared__ __align__(128) unsigned char smem_raw[];
@@ -81,15 +83,16 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int ci0 = blockIdx.y * CH, co0 = blockIdx.z * BMo;
     int bz = blockIdx.x;   /* spatial tiles use grid.x: grid.z is limited to 65535 */
-    const int nxt = (W + 15) / 16, nyt = (H + 7) / 8, nzt = (D + 1) / 2;
+    /* z-steps [zs0, nzt) of the volume (zs1 > 0: a slab [zs0, zs1), with gpre holding its pre-rounded gy blocks) */
+    const int nxt = (W + 15) / 16, nyt = (H + 7) / 8, nzt = zs1 > 0 ? zs1 : (D + 1) / 2;
     const int ox0 = (bz % nxt) * 16; bz /= nxt;
     const int oy0 = (bz % nyt) * 8; bz /= nyt;
-    const int nzc = (nzt + ZC - 1) / ZC;
+    const int nzc = (nzt - zs0 + ZC - 1) / ZC;
     const int zc = bz % nzc; const int n = bz / nzc;
     const size_t plane = (size_t)D * H * W;
     const int Cx = sp.x2 ? sp.c_split : Ci;
     const int kz = warp / 3, ky = warp % 3;
-    const bool do_bias = gb && blockIdx.y == 0;
+    const bool do_bias = gb && blockIdx.y == 0 && !gpre;   /* the gy pre-pass accumulates the bias itself */
     float *ws = scr + warp * 180;
     uint8_t *wscw = wsc + warp * 32;
     float acc[3][MT][NT][4];
@@ -97,7 +100,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
     for (int a = 0; a < 3; a++) for (int m = 0; m < MT; m++) for (int q = 0; q < NT; q++) for (int k = 0; k < 4; k++) acc[a][m][q][k] = 0.f;
     if (threadIdx.x < BMo) sbias[threadIdx.x] = 0.f;
     const bool vec = (W & 3) == 0;
-    const int zt_begin = zc * ZC;
+    const int zt_begin = zs0 + zc * ZC;
     bool mxu = false;
     const bool upt = sp.up && ci0 < Cx;   /* fused decoder upsample (see conv_bwd_w_f8_k) */
     if constexpr (IS_MX(T)) {
@@ -109,7 +112,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
         for (int q = 1; q < CH; q++) if (ctab4[q].p && (ctab4[q].sp != ctab4[0].sp || ctab4[q].nib != ctab4[0].nib + q)) mxu = false;
     }
     if (upt && !mxu) __trap();   /* only the tile path upsamples (host: LY 1-3, aligned 16-channel tiles) */
-    for (int zt = zt_begin; zt < nzt && zt < (zc + 1) * ZC; zt++) {
+    for (int zt = zt_begin; zt < nzt && zt < zt_begin + ZC; zt++) {
         const int oz0 = zt * 2;
         const int np = zt == zt_begin ? 4 : 2, gz_first = zt == zt_begin ? oz0 - 1 : oz0 + 1;
         __syncthreads();
@@ -380,7 +383,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
         bool gy_coop = false;
         if constexpr (IS_MX8(TG)) {
             const int gbw = mx_bw(Co);
-            if (coop && (co0 % gbw) + BMo <= gbw) {
+            if (coop && !gpre && (co0 % gbw) + BMo <= gbw) {
                 gy_coop = true;
                 __shared__ int gy_unsafe;
                 if (threadIdx.x == 0) gy_unsafe = 0;
@@ -414,6 +417,22 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
         }
         /* GY: block (co, pb) = row pair pb of the z-step (rows 2 pb, 2 pb + 1; vz = pb >> 2), 4 lanes x 8 values: lane f holds
            block elements 8 f .. 8 f + 7 (row f >> 1, x 8 (f & 1) ..) = one e2m1 word; a warp task covers 8 blocks */
+        if (gpre) {   /* pre-rounded blocks of this slab (gy_pre4_k): one word per lane, the scale byte per block */
+            const int Hp = (H + 1) / 2, Wb = (W + 15) / 16, Zs = min(2 * nzt, D) - 2 * zs0;
+            const size_t nblk = (size_t)N * Co * Zs * Hp * Wb;
+            for (int task = warp; task < BMo; task += 9) {
+                const int blk = task * 8 + (lane >> 2), c = blk >> 3, pb = blk & 7, f = lane & 3;
+                const int row = pb * 2 + (f >> 1), co = co0 + c, oz = oz0 + (row >> 3), yp = (oy0 + (row & 7)) >> 1;
+                unsigned word = 0u, scb = 127u;
+                if (co < Co && oz < D && yp < Hp) {
+                    const size_t bi = ((((size_t)n * Co + co) * Zs + (oz - 2 * zs0)) * Hp + yp) * Wb + (ox0 >> 4);
+                    word = __ldg((const unsigned *)(gpre + bi * 16) + f);
+                    if (f == 0) scb = gpre[nblk * 16 + bi];
+                }
+                *(unsigned *)(sg + c * G4_CS + pb * 16 + 4 * f) = word;
+                if (f == 0) sgs[c * 8 + pb] = (uint8_t)scb;
+            }
+        } else
         for (int task = warp; task < BMo; task += 9) {
             int blk = task * 8 + (lane >> 2), c = blk >> 3, pb = blk & 7, f = lane & 3;
             int row = pb * 2 + (f >> 1), vx = 8 * (f & 1), vz = row >> 3, vy = row & 7;
@@ -567,14 +586,76 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             }
     }
 }
-template <int MT, int NT, typename T, typename TG> static void launch_bw4(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC, int had, int lay) {
+/* gy pre-pass of the fp4 weight gradient (MX-fp8 gy, stochastic rounding, plain mode): the A operand exactly as the kernel's
+   staging forms it, once per layer instead of in every block's z-step. Block (n, co, z, row pair yp, 16-x block xb) = rows
+   2 yp, 2 yp + 1 x 16 xb ..; lane word f = row f >> 1, x 8 (f & 1) .. + 7 (zero outside the volume); ue8m0 of the block amax
+   / 6 (byte e + 127) and exact SR keyed by the word's first element, as in the kernel. Covers the planes [z0, z0 + Zs) of
+   one slab: out = Zs-plane blocks (16 B each) then their scale bytes. gb: += the sum of gy over those planes. A CTA walks
+   tiles (32 voxels x one MX channel block) with a stride; 128 threads = 32 channels x 4 words. */
+template <int BW> __global__ void __launch_bounds__(128) gy_pre4_k(const uint8_t *__restrict__ gy, uint8_t *__restrict__ out, float *__restrict__ gb,
+                                                                  int N, int Co, int D, int H, int W, int z0, int Zs, unsigned sr) {
+    __shared__ float v[BW][33];   /* [channel][block element k = 16 row + x] */
+    const int nb = mx_nb(Co), cb = blockIdx.y % nb, n = blockIdx.y / nb;
+    const int Hp = (H + 1) / 2, Wb = (W + 15) / 16;
+    const size_t Sg = (size_t)D * H * W, ntile = (size_t)Zs * Hp * Wb, nblk = (size_t)N * Co * ntile;
+    const int c = threadIdx.x >> 2, f = threadIdx.x & 3, co = cb * BW + c;
+    float bacc = 0.f;
+    for (size_t tile = blockIdx.x; tile < ntile; tile += gridDim.x) {
+        const int xb = (int)(tile % Wb), yp = (int)((tile / Wb) % Hp), zz = (int)(tile / ((size_t)Wb * Hp)), z = z0 + zz;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            const int k = threadIdx.x, y = 2 * yp + (k >> 4), x = 16 * xb + (k & 15);
+            float r[32];
+#pragma unroll
+            for (int j = 0; j < 32; j++) r[j] = 0.f;
+            if (y < H && x < W) {
+                const size_t ri = ((size_t)n * nb + cb) * Sg + ((size_t)z * H + y) * W + x;
+                mxf<8>::dec_row(gy + ri * BW, BW, mx_scale(gy[(size_t)N * nb * Sg * BW + ri]), r);
+            }
+#pragma unroll
+            for (int j = 0; j < BW; j++) v[j][k] = r[j];
+        }
+        __syncthreads();
+        if (threadIdx.x < 4 * BW) {
+            float q[8];
+#pragma unroll
+            for (int j = 0; j < 8; j++) q[j] = v[c][8 * f + j];
+            bacc += ((q[0] + q[1]) + (q[2] + q[3])) + ((q[4] + q[5]) + (q[6] + q[7]));
+            unsigned amu = 0u;
+#pragma unroll
+            for (int j = 0; j < 8; j++) amu = amax_u(amu, q[j]);
+            amu = max(amu, __shfl_xor_sync(0xffffffffu, amu, 1)); amu = max(amu, __shfl_xor_sync(0xffffffffu, amu, 2));
+            const int e = mx_exp(__uint_as_float(amu), 1.f / 6.f);
+            const float m = exp2i(-e);
+            const uint64_t vid = ((((uint64_t)n * Co + co) * D + z) * H + (2 * yp + (f >> 1))) * (uint64_t)W + 16 * xb + 8 * (f & 1);
+            uint32_t hh[4];
+            hh[0] = sr_hash(sr, vid);
+#pragma unroll
+            for (int i = 1; i < 4; i++) { uint32_t h1 = (hh[i - 1] ^ (hh[i - 1] >> 15)) * 0x2c1b3c6du; h1 ^= h1 >> 12; h1 *= 0x297a2d39u; hh[i] = h1 ^ (h1 >> 15); }
+            unsigned word = 0u;
+#pragma unroll
+            for (int j = 0; j < 8; j++) word |= sr_e2m1_nib(q[j] * m, (hh[j >> 1] >> (16 * (j & 1))) & 0xffffu) << (4 * j);
+            if (co < Co) {
+                const size_t bi = ((((size_t)n * Co + co) * Zs + zz) * Hp + yp) * Wb + xb;
+                *(unsigned *)(out + bi * 16 + 4 * f) = word;
+                if (f == 0) out[nblk * 16 + bi] = (uint8_t)(e + 127);
+            }
+        }
+    }
+    if (gb && threadIdx.x < 4 * BW) {
+        bacc += __shfl_xor_sync(0xffffffffu, bacc, 1); bacc += __shfl_xor_sync(0xffffffffu, bacc, 2);
+        if (f == 0 && co < Co) atomicAdd(&gb[co], bacc);
+    }
+}
+template <int MT, int NT, typename T, typename TG> static void launch_bw4(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC, int had, int lay,
+                                                                          const uint8_t *gpre = nullptr, int zs0 = 0, int zs1 = 0) {
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 0, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 1, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 2, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); cudaFuncSetAttribute((const void *)conv_bwd_w_f4_k<MT, NT, 3, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     const int coop = f4w_coop() && ys.c <= 16 && IS_MX(T) && IS_MX8(TG) && (lay == 1 || lay == 2);
-    if (lay == 3) conv_bwd_w_f4_k<MT, NT, 3, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop);
-    else if (lay == 2) conv_bwd_w_f4_k<MT, NT, 2, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop);
-    else if (lay == 1) conv_bwd_w_f4_k<MT, NT, 1, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop);
-    else conv_bwd_w_f4_k<MT, NT, 0, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop);
+    if (lay == 3) conv_bwd_w_f4_k<MT, NT, 3, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1);
+    else if (lay == 2) conv_bwd_w_f4_k<MT, NT, 2, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1);
+    else if (lay == 1) conv_bwd_w_f4_k<MT, NT, 1, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1);
+    else conv_bwd_w_f4_k<MT, NT, 0, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1);
 }
 template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had) {
     static int nt_env = -2, mt_env = -2, zc_env = -2;
@@ -599,6 +680,40 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
     int ZC = nzt < max_zc ? nzt : max_zc;
     while (ZC > 1 && (size_t)base * nblk_(nzt, ZC) < 72) ZC--;
     if (zc_env > 0) ZC = zc_env;
+    /* gy pre-pass (MX-fp8 gy with SR, plain mode): z slabs of at most ~96 MB of pre-rounded blocks, each followed by the
+       kernel over that slab's z-steps; UFSM_F4W_GYPRE=0 keeps the in-kernel rounding */
+    static int pre_env = -1;
+    if (pre_env < 0) pre_env = getenv("UFSM_F4W_GYPRE") ? atoi(getenv("UFSM_F4W_GYPRE")) : 96;
+    const size_t cap_kb = g_f4w_gypre_kb >= 0 ? (size_t)g_f4w_gypre_kb : (size_t)pre_env * 1024;
+    /* not for a single 16-channel block of each (16 -> 16): its cooperative in-kernel gy path is cheaper than the extra
+       pass and the shallower slab tiles (22 vs 25 ms at 384^3); 32 -> 32 / 64 -> 64 / 96 -> 32 / 48 -> 16 gain 30 / 35 / 30 / 7% */
+    const bool pre_ok = g_f4w_gypre_kb > 0 || ys.c > 16 || xs.c > 8 * NT;
+    if constexpr (IS_MX8(TG)) if (cap_kb && pre_ok && sp.sr && !had && (lay == 1 || lay == 2) && zc_env <= 0) {
+        const int Hp = (ys.h + 1) / 2, Wb = (ys.w + 15) / 16, gbw = mx_bw(ys.c);
+        const size_t per_zt = (size_t)ys.n * ys.c * 2 * Hp * Wb * 17;
+        const size_t cap_zt = (cap_kb << 10) / per_zt;
+        const int szt = cap_zt < 1 ? 1 : cap_zt < (size_t)nzt ? (int)cap_zt : nzt;
+        uint8_t *buf = lp_buf<uint8_t>(4, per_zt * szt);
+        for (int zs0 = 0; zs0 < nzt; zs0 += szt) {
+            const int zs1 = zs0 + szt < nzt ? zs0 + szt : nzt, Zs = (2 * zs1 < ys.d ? 2 * zs1 : ys.d) - 2 * zs0;
+            const size_t ntile = (size_t)Zs * Hp * Wb;
+            const dim3 pg((unsigned)(ntile < 1024 ? ntile : 1024), (unsigned)(ys.n * mx_nb(ys.c)));
+            if (gbw == 16) gy_pre4_k<16><<<pg, 128>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr);
+            else gy_pre4_k<32><<<pg, 128>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr);
+            int zc_s = zs1 - zs0 < max_zc ? zs1 - zs0 : max_zc;
+            while (zc_s > 1 && (size_t)base * nblk_(zs1 - zs0, zc_s) < 72) zc_s--;
+            const dim3 g((unsigned)(nblk_(ys.w, 16) * nblk_(ys.h, 8) * nblk_(zs1 - zs0, zc_s) * ys.n), (xs.c + 8 * NT - 1) / (8 * NT), (ys.c + 16 * MT - 1) / (16 * MT));
+            switch (MT * 10 + NT) {
+            case 11: launch_bw4<1, 1, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1); break;
+            case 12: launch_bw4<1, 2, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1); break;
+            case 13: launch_bw4<1, 3, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1); break;
+            case 21: launch_bw4<2, 1, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1); break;
+            case 22: launch_bw4<2, 2, T, TG>(g, smem, x, xs, gy, ys, gw, gb, gp, sp, zc_s, had, lay, buf, zs0, zs1); break;
+            default: fprintf(stderr, "lp_bwd_w_f4: bad MT/NT %d/%d\n", MT, NT); abort();
+            }
+        }
+        return;
+    }
     int nzc = (nzt + ZC - 1) / ZC;
     dim3 grid((unsigned)(nblk_(ys.w, 16) * nblk_(ys.h, 8) * nzc * ys.n), (xs.c + 8 * NT - 1) / (8 * NT), (ys.c + 16 * MT - 1) / (16 * MT));
     switch (MT * 10 + NT) {

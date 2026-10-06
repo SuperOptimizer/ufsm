@@ -671,6 +671,31 @@ int main(void) {
             cmp(nm, a, b, nw, 1e-6);
         }
     }
+    {   /* fp4 weight gradient with the gy pre-pass (pre-rounded A blocks, z slabs; bias from the pre-pass) == in-kernel
+           rounding bit for bit (fp32 reduction order aside), SR and gn+silu included, ragged W / H / D and slab edges */
+        const int Gn = 8;
+        struct { int ci, co, d, h, w; const char *nm; } cs[] = {{16, 16, 9, 11, 20, "16 -> 16, 9 x 11 x 20"}, {32, 32, 6, 10, 16, "32 -> 32"},
+                                                              {48, 16, 7, 8, 24, "48 -> 16"}, {32, 48, 5, 9, 18, "32 -> 48 (MT 2)"}};
+        for (int i = 0; i < 4; i++) for (int kb = 1; kb <= 2; kb++) {
+            shape5 xs = {2, cs[i].ci, cs[i].d, cs[i].h, cs[i].w}, ys = xs; ys.c = cs[i].co;
+            size_t nx = shape_numel(xs), ny = shape_numel(ys), nw = (size_t)cs[i].co * cs[i].ci * 27, NG = (size_t)2 * Gn;
+            float *xr = dev_rand(nx, 2.f), *gr = dev_rand(ny, 1e-3f);
+            float *gam = dev_rand(cs[i].ci, 1.f), *bet = dev_rand(cs[i].ci, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+            { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t j = 0; j < NG; j++) h[j] = 0.8f + fabsf(h[j]); nn_h2d(rstd, h, NG * 4); }
+            void *xm = mx4_from(xr, xs), *gm = mx8_from(gr, ys);
+            gnp_t gp = {gam, bet, mean, rstd, Gn}; split_t sr = {0}; sr.sr = 0x3c6ef372u;
+            float *a = dev_zero(nw), *b = dev_zero(nw), *ab = dev_zero(cs[i].co), *bb = dev_zero(cs[i].co);
+            lp_set_f4w_gypre_kb(kb == 1 ? 1 : 1 << 20);   /* 1 KiB: one z-step per slab; 1 GiB: one slab */
+            lp_bwd_w_f4(xm, 4, xs, gm, 3, ys, a, ab, gp, sr, 0);
+            lp_set_f4w_gypre_kb(0);
+            lp_bwd_w_f4(xm, 4, xs, gm, 3, ys, b, bb, gp, sr, 0);
+            lp_set_f4w_gypre_kb(-1);
+            char nm[112]; snprintf(nm, sizeof nm, "f4 wgrad gy pre-pass == in-kernel (%s, %s)", cs[i].nm, kb == 1 ? "1 z-step slabs" : "one slab");
+            cmp(nm, a, b, nw, 1e-6);
+            snprintf(nm, sizeof nm, "f4 wgrad gy pre-pass bias (%s)", cs[i].nm); cmp(nm, ab, bb, cs[i].co, 1e-5);
+            nn_free(xr); nn_free(gr); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd); nn_free(xm); nn_free(gm); nn_free(a); nn_free(b); nn_free(ab); nn_free(bb);
+        }
+    }
     {   /* fp8 weight gradient on MX inputs: the cooperative staging (x row decoded once per voxel for all channels, gy per
            voxel for all outputs) must reproduce the per-element staging bit for bit, SR and gn+silu included */
         const int Gn = 8;

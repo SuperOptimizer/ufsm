@@ -3,6 +3,8 @@
 
 extern "C" void lp_set_f4w_coop(int on) { g_f4w_coop = on != 0; }
 int g_f4w_coop = -1;
+int g_f4w_gypre_kb = -1;   /* gy pre-pass slab cap in KiB (0 off, -1 env UFSM_F4W_GYPRE in MiB, default 96) */
+extern "C" void lp_set_f4w_gypre_kb(int kb) { g_f4w_gypre_kb = kb; }
 /* instantiated in lp_f4wgrad_i*.cu */
 extern template void bwd_w_f4_t<mx4_t, mx8_t>(const void *x, shape5 xs, const mx8_t *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had);
 extern template void bwd_w_f4_t<mx4_t, __half>(const void *x, shape5 xs, const __half *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had);
