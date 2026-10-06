@@ -89,11 +89,14 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4_k(const T *__restrict__ x,
             for (int k = 0; k < 32; k++) amu = amax_u(amu, v[k]);
             int e = mx_exp(__uint_as_float(amu), 1.f / 6.f);
             float m = exp2i(-e);
-            if (sp.sr) {   /* gradient operand: exact stochastic rounding keyed by the element (deterministic per call) */
+            if (sp.sr) {   /* gradient operand: exact stochastic rounding keyed by the element (deterministic per call): one hash and three
+                              remixes per 8 values, the nibbles straight from the rounding (sr_e2m1_word) */
                 const uint64_t vid = (((uint64_t)n * Cip + ci0) * D + gz) * (uint64_t)H * W + (uint64_t)gy * W + gx;
+                unsigned wd[4];
 #pragma unroll
-                for (int k = 0; k < 32; k += 2) { const uint32_t h = sr_hash(sp.sr, vid * 16 + k / 2); v[k] = sr_e2m1_u(v[k] * m, sr_u16(h, 0)) / m; v[k + 1] = sr_e2m1_u(v[k + 1] * m, sr_u16(h, 1)) / m; }
-            }
+                for (int q = 0; q < 4; q++) { uint32_t hh[4]; sr_hash4(sp.sr, vid * 4 + q, hh); wd[q] = sr_e2m1_word(v + 8 * q, m, hh); }
+                *(uint4 *)(sx + pos * 16) = make_uint4(wd[0], wd[1], wd[2], wd[3]);
+            } else
             *(uint4 *)(sx + pos * 16) = make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m));
             sxs[pos] = (uint8_t)(e + 127);
         }
@@ -231,19 +234,21 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
             const int e = mx_exp(__uint_as_float(max(a0, an)), 1.f / 6.f), ep = mx_exp(__uint_as_float(max(a0, ap)), 1.f / 6.f);
             const float m = exp2i(-e), mp = exp2i(-ep);
             float *w = v[it];
-            float wl[16], wh[16];
-            if (sp.sr) {   /* gradient operand: exact stochastic rounding keyed by the element (each copy with its own scale) */
+            uint2 lo, hi;
+            if (sp.sr) {   /* gradient operand: exact stochastic rounding keyed by the element (each copy with its own scale, the same
+                              uniform): one hash and three remixes per 8 values, the nibbles straight from the rounding */
                 const int gz = oz0 - 1 + row / 10, gy = oy0 - 1 + row % 10, gx = ox0 - 1 + ix;
                 const uint64_t vid = (((uint64_t)n * D + gz) * H + gy) * (uint64_t)W + gx;
-                uint32_t h0 = 0u;
-#pragma unroll
-                for (int k = 0; k < 16; k++) { const uint32_t h = (k & 1) ? h0 : (h0 = sr_hash(sp.sr, vid * 8 + k / 2)); const float u = sr_u16(h, k & 1); wl[k] = sr_e2m1_u(w[k] * m, u) / m; wh[k] = sr_e2m1_u(w[k] * mp, u) / mp; }
+                uint32_t ha[4], hb[4];
+                sr_hash4(sp.sr, vid * 2, ha); sr_hash4(sp.sr, vid * 2 + 1, hb);
+                lo = make_uint2(sr_e2m1_word(w, m, ha), sr_e2m1_word(w + 8, m, hb));
+                hi = make_uint2(sr_e2m1_word(w, mp, ha), sr_e2m1_word(w + 8, mp, hb));
             } else {
-#pragma unroll
-                for (int k = 0; k < 16; k++) { wl[k] = w[k]; wh[k] = w[k]; }
+                lo = make_uint2(cvt_e2m1x8(w, m), cvt_e2m1x8(w + 8, m));
+                hi = make_uint2(cvt_e2m1x8(w, mp), cvt_e2m1x8(w + 8, mp));
             }
-            *(uint2 *)(sx + pos * 16) = make_uint2(cvt_e2m1x8(wl, m), cvt_e2m1x8(wl + 8, m));                       /* low half of pair[pos] */
-            if (ix) *(uint2 *)(sx + (pos - 1) * 16 + 8) = make_uint2(cvt_e2m1x8(wh, mp), cvt_e2m1x8(wh + 8, mp));   /* high half of pair[pos - 1] */
+            *(uint2 *)(sx + pos * 16) = lo;                       /* low half of pair[pos] */
+            if (ix) *(uint2 *)(sx + (pos - 1) * 16 + 8) = hi;     /* high half of pair[pos - 1] */
             if (ix == 17) *(uint2 *)(sx + pos * 16 + 8) = make_uint2(0u, 0u);                                      /* the row's last pair: [17 | 0] */
             sxs[pos] = (uint8_t)(e + 127);
         }

@@ -45,15 +45,6 @@ static int f4w_coop(void) {   /* read-only initialization for concurrent trainin
 }
 /* stochastic rounding onto the e2m1 grid with a 16-bit uniform (two per hash): P(up) = ceil(frac * 65536) / 65536, so the
    bias is below 2^-16 of a grid step; branch-light (the grid step is 0.5 / 1 / 2 on [0, 2) / [2, 4) / [4, 6]). */
-/* the same rounding returning the e2m1 nibble directly: the grid magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6} are the codes 0..7 and
-   t(a) = 2a / a + 2 / a/2 + 4 on [0, 2) / [2, 4) / [4, 6] is linear between consecutive grid points, so floor(t + u) is exact
-   stochastic rounding (P(up) = frac to 2^-16) and needs no conversion instruction */
-__device__ __forceinline__ unsigned sr_e2m1_nib(float v, unsigned u16) {   /* |v| <= 6 (block-scaled); t concave -> min of its 3 lines */
-    const float a = fabsf(v);
-    const float tt = fminf(fminf(a + a, a + 2.f), fmaf(a, 0.5f, 4.f));
-    const float u = __uint_as_float(0x3f800000u | (u16 << 7)) - 1.f;   /* u16 / 65536 exactly, no int -> float conversion */
-    return min((unsigned)(tt + u), 7u) | (__float_as_uint(v) >> 28 & 8u);
-}
 __device__ __forceinline__ float sr_e2m1_u16(float v, unsigned u16) {
     const float a = fminf(fabsf(v), 6.f);
     const float inv = a < 2.f ? 2.f : a < 4.f ? 1.f : 0.5f, fl = floorf(a * inv);
@@ -497,9 +488,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             if (sp.sr) {   /* exact stochastic rounding of the gradient operand, keyed by the element (block slot): one hash + 3 remixes */
                 const uint64_t vid = ((((uint64_t)n * Co + co) * D + oz) * H + oy) * (uint64_t)W + ox;
                 uint32_t hh[4];
-                hh[0] = sr_hash(sp.sr, vid);
-#pragma unroll
-                for (int i = 1; i < 4; i++) { uint32_t h1 = (hh[i - 1] ^ (hh[i - 1] >> 15)) * 0x2c1b3c6du; h1 ^= h1 >> 12; h1 *= 0x297a2d39u; hh[i] = h1 ^ (h1 >> 15); }
+                sr_hash4(sp.sr, vid, hh);
                 word = 0u;
 #pragma unroll
                 for (int j = 0; j < 8; j++) word |= sr_e2m1_nib(q[j] * m, (hh[j >> 1] >> (16 * (j & 1))) & 0xffffu) << (4 * j);
@@ -629,9 +618,7 @@ template <int BW> __global__ void __launch_bounds__(128) gy_pre4_k(const uint8_t
             const float m = exp2i(-e);
             const uint64_t vid = ((((uint64_t)n * Co + co) * D + z) * H + (2 * yp + (f >> 1))) * (uint64_t)W + 16 * xb + 8 * (f & 1);
             uint32_t hh[4];
-            hh[0] = sr_hash(sr, vid);
-#pragma unroll
-            for (int i = 1; i < 4; i++) { uint32_t h1 = (hh[i - 1] ^ (hh[i - 1] >> 15)) * 0x2c1b3c6du; h1 ^= h1 >> 12; h1 *= 0x297a2d39u; hh[i] = h1 ^ (h1 >> 15); }
+            sr_hash4(sr, vid, hh);
             unsigned word = 0u;
 #pragma unroll
             for (int j = 0; j < 8; j++) word |= sr_e2m1_nib(q[j] * m, (hh[j >> 1] >> (16 * (j & 1))) & 0xffffu) << (4 * j);

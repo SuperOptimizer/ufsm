@@ -438,6 +438,28 @@ __device__ __forceinline__ float sr_e2m1_u(float v, float u) {
 __device__ __forceinline__ float sr_e2m1(float v, uint32_t h) { return sr_e2m1_u(v, (float)(h >> 8) * (1.f / 16777216.f)); }
 /* two 16-bit uniforms from one hash (the SR loops of the fp4 staging: half the hashing) */
 __device__ __forceinline__ float sr_u16(uint32_t h, int hi) { return (float)(hi ? h >> 16 : h & 0xffffu) * (1.f / 65536.f); }
+/* the same rounding returning the e2m1 nibble directly: the grid magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6} are the codes 0..7 and
+   t(a) = 2a / a + 2 / a/2 + 4 on [0, 2) / [2, 4) / [4, 6] is linear between consecutive grid points, so floor(t + u) is exact
+   stochastic rounding (P(up) = frac to 2^-16) and needs no conversion instruction */
+__device__ __forceinline__ unsigned sr_e2m1_nib(float v, unsigned u16) {   /* |v| <= 6 (block-scaled); t concave -> min of its 3 lines */
+    const float a = fabsf(v);
+    const float tt = fminf(fminf(a + a, a + 2.f), fmaf(a, 0.5f, 4.f));
+    const float u = __uint_as_float(0x3f800000u | (u16 << 7)) - 1.f;   /* u16 / 65536 exactly, no int -> float conversion */
+    return min((unsigned)(tt + u), 7u) | (__float_as_uint(v) >> 28 & 8u);
+}
+/* four 32-bit words (eight 16-bit uniforms) from one hash of key and three remixes: the per-8-value SR of the fp4 staging */
+__device__ __forceinline__ void sr_hash4(uint32_t seed, uint64_t key, uint32_t *hh) {
+    hh[0] = sr_hash(seed, key);
+#pragma unroll
+    for (int i = 1; i < 4; i++) { uint32_t h1 = (hh[i - 1] ^ (hh[i - 1] >> 15)) * 0x2c1b3c6du; h1 ^= h1 >> 12; h1 *= 0x297a2d39u; hh[i] = h1 ^ (h1 >> 15); }
+}
+/* eight values (already scaled by m into [-6, 6]) -> one e2m1 word (v[0] lowest), exact SR with the uniforms of hh */
+__device__ __forceinline__ unsigned sr_e2m1_word(const float *v, float m, const uint32_t *hh) {
+    unsigned w = 0u;
+#pragma unroll
+    for (int j = 0; j < 8; j++) w |= sr_e2m1_nib(v[j] * m, (hh[j >> 1] >> (16 * (j & 1))) & 0xffffu) << (4 * j);
+    return w;
+}
 /* decoder up segment, shared-memory version: the coarse rows a block's fine tile needs ((TZ/2 + 4) x 8 x 12 for a TZ x 8 x 16 tile)
    are decoded, put through the coarse tensor's GN+SiLU (gmask) and stored once as e4m3 rows + one scale per row; each fine
    position then interpolates 8 of them from shared memory (the per-position global version decoded and normalised 8 rows

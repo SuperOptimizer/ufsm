@@ -642,6 +642,36 @@ int main(void) {
         check("fp4 backward-data = adjoint of the forward with 2D weight scales", rel[1] < 1e-5);
         free(h); free(hy); free(hg);
     }
+    {   /* SR of the fp4 conv operand (the backward-data gy, MX-fp8): unbiased on both staging paths (16 channels: packed pair
+           scales; 32: one scale per position). Weights in {-c, 0, c} with c = 6 / 16 are lossless in e2m1 whatever the block
+           scales, the output is fp16, so the 32-seed mean must approach the fp32 conv of the stored gy ~1/sqrt(32) */
+        for (int ci = 16; ci <= 32; ci += 16) {
+            shape5 xs = {N, ci, 8, 10, 20};
+            const int co = 16; shape5 ys = xs; ys.c = co;
+            const size_t nx = shape_numel(xs), ny = shape_numel(ys), nw = (size_t)co * ci * 27;
+            float *hx = malloc(nx * 4), *hw = malloc(nw * 4);
+            for (size_t i = 0; i < nx; i++) hx[i] = nrand() * 1e-3f;
+            for (size_t i = 0; i < nw; i++) { const float r = frand(); hw[i] = r < -0.33f ? -0.375f : r > 0.33f ? 0.375f : 0.f; }
+            float *xf = nn_malloc(nx * 4), *w = nn_malloc(nw * 4); nn_h2d(xf, hx, nx * 4); nn_h2d(w, hw, nw * 4);
+            void *xm = mx8_from(xf, xs); float *xd = deq8(xm, xs), *yr = dev_zero(ny);
+            mode_ref(); nn_conv3d_fwd(xd, xs, w, nullptr, co, 3, 1, yr);
+            float *hr = malloc(ny * 4), *acc = calloc(ny, 4), *one = malloc(ny * 4); nn_d2h(hr, yr, ny * 4);
+            _Float16 *hh = malloc(ny * 2); void *yh = nn_malloc(ny * 2);
+            const int NSD = 32; double e1 = 0, ea = 0, rr = 0;
+            mode_mx();
+            for (int k = 0; k < NSD; k++) {
+                gnp_t none = {0}; split_t sr = {0}; sr.sr = (0x9e3779b9u * (unsigned)(k + 1)) | 1u;
+                lp_conv_fwd_f4(xm, 3, xs, w, nullptr, co, yh, 2, none, nullptr, 0, sr);
+                nn_d2h(hh, yh, ny * 2);
+                for (size_t i = 0; i < ny; i++) { acc[i] += (float)hh[i]; if (k == 0) one[i] = (float)hh[i]; }
+            }
+            for (size_t i = 0; i < ny; i++) { const double r = hr[i], a = acc[i] / NSD; e1 += (one[i] - r) * (one[i] - r); ea += (a - r) * (a - r); rr += r * r; }
+            e1 = sqrt(e1 / rr); ea = sqrt(ea / rr);
+            char nm[112]; snprintf(nm, sizeof nm, "fp4 conv SR operand (%d ch, mx8): one seed %.3g, %d-seed mean %.3g", ci, e1, NSD, ea);
+            check(nm, e1 > 1e-3 && ea < 0.35 * e1);
+            free(hx); free(hw); free(hr); free(acc); free(one); free(hh); nn_free(xf); nn_free(w); nn_free(xm); nn_free(xd); nn_free(yr); nn_free(yh);
+        }
+    }
     {   /* dec0.c1 backward-data shape on the packed fp4 kernel: gy 16 ch -> 48 outputs split 32 + 16 (one 48-row tile, MT 3) */
         shape5 o16 = {N, 16, 16, 12, 16}, cs = o16, c1 = o16, c2 = o16; cs.c = 48; c1.c = 32;
         float *gy = dev_rand(shape_numel(o16), 1.f), *w = dev_rand((size_t)16 * 48 * 27, 0.1f), *scr = nn_malloc(nn_conv3d_scratch(cs, 16, 3) + 4096);
