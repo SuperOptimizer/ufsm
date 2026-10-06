@@ -110,9 +110,11 @@ static int s2b_dilate(const void *gy, shape5 ys, const float *w, shape5 xs, void
     LPCK();
     return 1;
 }
-/* returns the compute precision used: 2 (fp8 tensor cores, wide layers) or 0 (fp32) */
+extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum);   /* lp_mx_s2bwd_tc.cu */
+/* returns the compute precision used: 2 (fp8 tensor cores, wide layers), 1 (bf16 tensor cores, 16 / 32 channels) or 0 (fp32) */
 extern "C" int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum) {
     if (s2b_dilate(gy, ys, w, xs, gx, accum)) return 2;
+    if (lp_bwd_data_s2_mx_tc(gy, ys, w, xs, gx, accum)) return 1;
     {
         const int bwx = mx_bw(xs.c), nbx = mx_nb(xs.c);
         const size_t smem = (size_t)8 * ys.c * bwx * sizeof(float);

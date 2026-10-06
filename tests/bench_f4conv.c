@@ -68,6 +68,20 @@ int main(int argc, char **argv) {
         printf("\n");
         nn_free((void *)j.x); nn_free(j.y); if (j.y2) nn_free(j.y2); nn_free(w); if (b) nn_free(b);
     }
+    {   /* the same 16 -> 16 / 48 -> 16 forwards on the fp8 kernel (MX-fp4 storage, fp8 compute) */
+        for (int ci = 16; ci <= 48; ci += 32) {
+            shape5 xs = {1, ci, P, P, P}; void *x = mx(4, ci, S, 2.f, 61 + ci), *y = nn_malloc(lp_mx4_bytes(1, 16, S));
+            float *w = rnd((size_t)16 * ci * 27, 0.1f, 62), *b = rnd(16, 0.1f, 63);
+            const gnp_t gp = {gam, bet, mean, rstd, G};
+            double best = 1e9;
+            for (int it = 0; it < 10; it++) {
+                nn_zero(osum, 2 * 64 * sizeof(double));
+                nn_sync(); double t0 = now(); lp_conv_fwd_f8(x, 4, xs, w, b, 16, y, 4, gp, osum, G, (split_t){0}); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+            }
+            printf("fwd %2d -> 16 fp8 compute (gn+silu, stats) @%d %8.3f ms\n", ci, P, best);
+            nn_free(x); nn_free(y); nn_free(w); nn_free(b);
+        }
+    }
     /* weight gradient (fp4, the --fp4 2 recipe): MX-fp4 x with GN+SiLU in staging, MX-fp8 gy with SR, bias */
     struct { const char *nm; int ci, co; } WL[] = {{"wgrad 16 -> 16 (gn+silu, SR)", 16, 16}, {"wgrad 48 -> 16 (gn+silu, SR)", 48, 16}, {"wgrad 32 -> 32 (gn+silu, SR) @P/2", 32, 32}};
     for (int l = 0; l < 3; l++) {
@@ -87,6 +101,45 @@ int main(int argc, char **argv) {
         float *h = malloc(nw * 4); nn_d2h(h, gw, nw * 4); double a = 0; for (size_t i = 0; i < nw; i++) a += fabs(h[i]); free(h);
         printf("%-32s @%d %8.3f ms  |gw| %.9g\n", WL[l].nm, Pl, best, a);
         nn_free(x); nn_free(gy); nn_free(gw); nn_free(gb);
+    }
+    {   /* fp8 weight gradients at level 0: down0 (stride 2, MX-fp4 x level 0 -> MX-fp8 gy level 1, 16 -> 16) and the stem
+           (enc0.c1: MX-fp8 4-channel input, MX-fp8 gy, SR) */
+        const int Pc = P / 2; const size_t Sc = (size_t)Pc * Pc * Pc;
+        shape5 xs = {1, 16, P, P, P}, ys = {1, 16, Pc, Pc, Pc};
+        void *x = mx(4, 16, S, 2.f, 51), *gy = mx(8, 16, Sc, 1e-3f, 52);
+        float *gw = nn_malloc(16 * 16 * 27 * 4), *gb = nn_malloc(16 * 4);
+        double best = 1e9;
+        for (int it = 0; it < 10; it++) {
+            nn_zero(gw, 16 * 16 * 27 * 4); nn_zero(gb, 64);
+            nn_sync(); double t0 = now(); lp_bwd_w_s2_f8(x, 4, xs, gy, 3, ys, gw, gb, (gnp_t){0}); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+        }
+        float h[16 * 16 * 27]; nn_d2h(h, gw, sizeof h); double a = 0; for (int i = 0; i < 16 * 16 * 27; i++) a += fabs(h[i]);
+        printf("%-32s @%d %8.3f ms  |gw| %.9g\n", "wgrad s2 down0 16 -> 16 (fp8)", P, best, a);
+        nn_free(x); nn_free(gy);
+        shape5 x4 = {1, 4, P, P, P}, y4 = {1, 16, P, P, P};
+        void *xi = mx(8, 4, S, 2.f, 53), *g4 = mx(8, 16, S, 1e-3f, 54);
+        best = 1e9;
+        for (unsigned it = 0; it < 10; it++) {
+            split_t sp = {0}; sp.sr = 0x6d2b79f5u + it;
+            nn_zero(gw, 16 * 4 * 27 * 4); nn_zero(gb, 64);
+            nn_sync(); double t0 = now(); lp_bwd_w_f8(xi, 3, x4, g4, 3, y4, gw, gb, (gnp_t){0}, sp); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+        }
+        nn_d2h(h, gw, 16 * 4 * 27 * 4); a = 0; for (int i = 0; i < 16 * 4 * 27; i++) a += fabs(h[i]);
+        printf("%-32s @%d %8.3f ms  |gw| %.9g\n", "wgrad stem 4 -> 16 (fp8, SR)", P, best, a);
+        nn_free(xi); nn_free(g4); nn_free(gw); nn_free(gb);
+    }
+    {   /* stride-2 backward-data, accumulating into the level's gradient (down0: 16 -> 16, down1: 32 -> 32 at P / 2) */
+        for (int l = 0; l < 2; l++) {
+            const int Pf = l ? P / 2 : P, Pc = Pf / 2, C = l ? 32 : 16; const size_t Sf = (size_t)Pf * Pf * Pf, Sc = (size_t)Pc * Pc * Pc;
+            shape5 xs = {1, C, Pf, Pf, Pf}, ys = {1, C, Pc, Pc, Pc};
+            void *gy = mx(8, C, Sc, 1e-3f, 71 + l), *gx = mx(8, C, Sf, 1e-3f, 73 + l);
+            float *w = rnd((size_t)C * C * 27, 0.1f, 75);
+            double best = 1e9;
+            for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
+            nn_free(gx); gx = mx(8, C, Sf, 1e-3f, 73 + l); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1); nn_sync();
+            printf("bdata s2 %s %d -> %d (mx8, acc) @%d %8.3f ms  out %016llx\n", l ? "down1" : "down0", C, C, Pf, best, (unsigned long long)fnv(gx, lp_mx8_bytes(1, C, Sf)));
+            nn_free(gy); nn_free(gx); nn_free(w);
+        }
     }
     {   /* decoder upsample at level 1 -> 0 (32 channels): forward of silu(gn(x)) MX-fp4 -> MX-fp4, backward MX-fp8 -> MX-fp8 */
         const int Pc = P / 2, C = 32; const size_t Sc = (size_t)Pc * Pc * Pc;
