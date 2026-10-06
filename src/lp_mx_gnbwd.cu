@@ -120,7 +120,7 @@ extern "C" void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const
     if (slabs > 1024) slabs = 1024;
     const dim3 grid((unsigned)slabs, (unsigned)(nb * (bw / 16)), (unsigned)s.n);
     float *part = lp_buf<float>(5, slabs * 2 * NC);
-    if (s.c > 160) { fprintf(stderr, "lp_gn_silu_bwd_mx: C %d > 160\n", s.c); abort(); }
+    if (s.c > 1024) { fprintf(stderr, "lp_gn_silu_bwd_mx: C %d > 1024\n", s.c); abort(); }
     if (gdt == 4) { fprintf(stderr, "lp_gn_silu_bwd_mx: fp4 gradients are not supported\n"); abort(); }
     cudaMemsetAsync(ds, 0, (size_t)2 * NC * sizeof(double));
     const uint8_t *xq = (const uint8_t *)x;

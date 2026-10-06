@@ -218,7 +218,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--erode 0|1] [--soft SIGMA]   native binary-core erosion before softening (--levels 1,0,0,0)\n"
                         "       [--gn-stats stored|legacy]   fresh training uses stored activations; resume preserves the saved contract\n"
                         "       [--schedule-start STEP]   restart the LR schedule at this saved step, preserving optimizer state\n"
-                        "       [--task surface_winding --geometry geometry.json] [--sheet-init 1] [--sheet-variant 0|1|2] [--task band_affinity --grow-head 1 --aff-lambda 1]\n"
+                        "       [--task surface_winding --geometry geometry.json] [--sheet-init 1] [--sheet-variant 0|1|2] [--task band_affinity --grow-head 1 --aff-lambda 1] [--init-from CKPT (shape-matching layers)]\n"
                         "       [--warm-start 1]   start a new cover from a legacy checkpoint's weights/state\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  --split z --gpus 0,1: every window is split along z across the two GPUs instead (batch B; P a multiple of 2^nlev).\n"
@@ -453,6 +453,12 @@ int cmd_train(int argc, char **argv) {
             if (sheet_init && unet_start_sheet(d->u)) return 2;
         } else {
             unet_init(d->u, seed + 1); /* deterministic: every GPU starts identical */
+            const char *init_from = opt(argc, argv, "--init-from", nullptr);   /* partial warm start from another architecture */
+            if (init_from) {
+                const int nt = unet_init_from(d->u, init_from);
+                if (nt < 0) { fprintf(stderr, "cannot initialise from %s\n", init_from); return 1; }
+                if (g == 0) fprintf(stderr, "initialised %d layer tensors from %s (the rest fresh)\n", nt, init_from);
+            }
             if (g_sheet && unet_start_sheet(d->u)) return 2;
         }
         if (wq) unet_set_wq(d->u, wq);

@@ -76,6 +76,22 @@ int main(void) {
         cmp("gn+silu bwd ggamma", gg2, gg1, 16, 1e-4);
         cmp("gn+silu bwd gbeta", gb2, gb1, 16, 1e-4);
     }
+    for (int C = 192; C <= 256; C += 64) {   /* GroupNorm + SiLU backward on wide MX tensors (6-level nets: 192 / 256 channels) */
+        shape5 s = {N, C, 6, 6, 8};
+        size_t n = shape_numel(s), NG = (size_t)N * G;
+        float *x = dev_rand(n, 2.f), *gam = dev_rand(C, 1.f), *bet = dev_rand(C, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+        void *xm = mx_from(x, s); float *xd = deq(xm, s);
+        float *gy = dev_rand(n, 1e-3f); void *gym = mx_from(gy, s); float *gyd = deq(gym, s);
+        float *gxr = dev_zero(n), *gg1 = dev_zero(C), *gb1 = dev_zero(C), *gg2 = dev_zero(C), *gb2 = dev_zero(C), *scr = nn_malloc(nn_gn_scratch(s) + 4096);
+        void *gxm = mx_new(s);
+        mode_ref(); nn_gn_silu_bwd(xd, s, G, gam, bet, mean, rstd, gyd, gxr, gg1, gb1, scr);
+        mode_mx(); nn_gn_silu_bwd(xm, s, G, gam, bet, mean, rstd, gym, gxm, gg2, gb2, scr);
+        char nm[64];
+        snprintf(nm, sizeof nm, "gn+silu bwd gx, %d channels", C); cmp(nm, deq(gxm, s), gxr, n, TOL);
+        snprintf(nm, sizeof nm, "gn+silu bwd ggamma, %d channels", C); cmp(nm, gg2, gg1, C, 1e-4);
+        snprintf(nm, sizeof nm, "gn+silu bwd gbeta, %d channels", C); cmp(nm, gb2, gb1, C, 1e-4);
+    }
     {   /* stride-1 convs: fused gn forward with output stats, split forward, backward-data (+ split), weight gradients */
         shape5 xs = {N, 16, 12, 12, 16}, ys = xs; ys.c = 32;
         size_t nx = shape_numel(xs), ny = shape_numel(ys), NG = (size_t)N * G;

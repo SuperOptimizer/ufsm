@@ -31,9 +31,12 @@ MIN_PIECE = 2000
 FULL = np.ones((3, 3, 3), bool)
 
 
+WINDOW = [528, 8]   # prediction window / halo (--window W,H; 6-level nets need W divisible by 32: 544,16)
+
+
 def predict(ck, box, out, gpu, channel):
     if (out / 'zarr.json').exists(): return
-    cmd = [str(UFSM), 'predict', ck, ROOT, CT, str(out), '--um', '2.4', '--box', ','.join(map(str, box)), '--window', '528', '--halo', '8',
+    cmd = [str(UFSM), 'predict', ck, ROOT, CT, str(out), '--um', '2.4', '--box', ','.join(map(str, box)), '--window', str(WINDOW[0]), '--halo', str(WINDOW[1]),
            '--shard', '512', '--grid-origin', '0,0,0', '--ema', '1', '--q', '8', '--threads', '16', '--axis', AXIS, '--levels', '1',
            '--gpu', str(gpu), '--channel', str(channel)]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -83,9 +86,10 @@ def compare(ref, pred, known):
 
 def main():
     a = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    a.add_argument('--out', required=True); a.add_argument('--boxes', default=BOXES); a.add_argument('--gpu', default='0')
+    a.add_argument('--out', required=True); a.add_argument('--window', default='528,8'); a.add_argument('--boxes', default=BOXES); a.add_argument('--gpu', default='0')
     a.add_argument('--cutoffs', default='0.15,0.175,0.2,0.225,0.25,0.3'); a.add_argument('--aff-cuts', default='0.55,0.6,0.625,0.65,0.7'); a.add_argument('ckpts', nargs='+')
     g = a.parse_args()
+    WINDOW[:] = [int(v) for v in g.window.split(',')]
     out = Path(g.out); out.mkdir(parents=True, exist_ok=True)
     rows = []
     for bi, bs in enumerate(g.boxes.split(';')):

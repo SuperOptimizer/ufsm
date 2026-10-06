@@ -1271,6 +1271,46 @@ int unet_load_grow(unet *u, const char *path, int keep, float new_bias) {
     return step;
 }
 
+/* Partial warm start across architectures (e.g. a deeper / wider net): every conv and GroupNorm whose shape matches the
+   same layer of the checkpoint's net (enc / down / dec by level, head, down_norm) is copied into the weights and the EMA;
+   everything else keeps its fresh initialisation, optimiser state starts at zero. Returns the number of copied tensors or -1. */
+static int copy_conv(unet *u, const unet *o, const convp *a, const convp *b) {
+    if (a->cin != b->cin || a->cout != b->cout || a->k != b->k || a->stride != b->stride) return 0;
+    const size_t nw = (size_t)a->cout * a->cin * a->k * a->k * a->k;
+    nn_d2d(u->p + a->w, o->p + b->w, nw * 4); nn_d2d(u->ema + a->w, o->ema + b->w, nw * 4);
+    nn_d2d(u->p + a->b, o->p + b->b, (size_t)a->cout * 4); nn_d2d(u->ema + a->b, o->ema + b->b, (size_t)a->cout * 4);
+    return 1;
+}
+static int copy_gn(unet *u, const unet *o, const gnp *a, const gnp *b) {
+    if (a->c != b->c) return 0;
+    nn_d2d(u->p + a->gamma, o->p + b->gamma, (size_t)a->c * 4); nn_d2d(u->ema + a->gamma, o->ema + b->gamma, (size_t)a->c * 4);
+    nn_d2d(u->p + a->beta, o->p + b->beta, (size_t)a->c * 4); nn_d2d(u->ema + a->beta, o->ema + b->beta, (size_t)a->c * 4);
+    return 1;
+}
+int unet_init_from(unet *u, const char *path) {
+    unet_cfg oc; int step;
+    if (unet_peek(path, &oc, &step) || oc.cin != u->cfg.cin) return -1;
+    unet *o = unet_create(&oc);
+    if (unet_load(o, path) < 0) { unet_free(o); return -1; }
+    int n = 0;
+    const int L = u->cfg.nlev < oc.nlev ? u->cfg.nlev : oc.nlev;
+    for (int i = 0; i < L; i++) {
+        const block *a = &u->enc[i], *b = &o->enc[i];
+        n += copy_conv(u, o, &a->c1, &b->c1) + copy_gn(u, o, &a->n1, &b->n1) + copy_conv(u, o, &a->c2, &b->c2) + copy_gn(u, o, &a->n2, &b->n2);
+    }
+    for (int i = 0; i < L - 1; i++) {
+        n += copy_conv(u, o, &u->down[i], &o->down[i]);
+        if (u->cfg.down_norm && oc.down_norm) n += copy_gn(u, o, &u->dn[i], &o->dn[i]);
+        const block *a = &u->dec[i], *b = &o->dec[i];   /* dec[i] works at level i in both nets */
+        n += copy_conv(u, o, &a->c1, &b->c1) + copy_gn(u, o, &a->n1, &b->n1) + copy_conv(u, o, &a->c2, &b->c2) + copy_gn(u, o, &a->n2, &b->n2);
+    }
+    n += copy_conv(u, o, &u->head, &o->head);
+    unet_free(o);
+    nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4);
+    if (u->muon_mom) nn_zero(u->muon_mom, u->np * 4);
+    return n;
+}
+
 int unet_start_sheet(unet *u) {
     if (u->cfg.cin!=4 || u->cfg.cout!=2 || u->wq) {
         fputs("winding initialization needs a four-input/two-output donor with FP32 master weights\n",stderr); return -1;

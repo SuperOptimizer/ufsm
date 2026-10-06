@@ -148,7 +148,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
     if (threadIdx.x < Ci * CO) { const int k = threadIdx.x / CO, co = threadIdx.x % CO; if (co < Co) atomicAdd(&gw[(size_t)co * Ci + k], red[threadIdx.x]); }
 }
 extern "C" void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp) {
-    if ((xs.c <= 32 && ys.c <= 2) || (xs.c <= 16 && ys.c <= 8)) {
+    if (xs.c <= 32 && ys.c <= 8) {
         const size_t S = shape_spatial(xs);
         const int nper = 8192, nbx = (int)((S + nper - 1) / nper);
         const dim3 grid(nbx, xs.n);
@@ -156,7 +156,8 @@ extern "C" void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, 
 #define BW1F(B, CO, KM) do { if (gydt == 2) conv_bwd_w1_mx1_k<B, __half, CO, KM><<<grid, 256>>>(xq, (const __half *)gy, gw, xs.n, xs.c, S, gp, nper, ys.c); \
                          else if (gydt == 1) conv_bwd_w1_mx1_k<B, bf16, CO, KM><<<grid, 256>>>(xq, (const bf16 *)gy, gw, xs.n, xs.c, S, gp, nper, ys.c); \
                          else conv_bwd_w1_mx1_k<B, float, CO, KM><<<grid, 256>>>(xq, (const float *)gy, gw, xs.n, xs.c, S, gp, nper, ys.c); } while (0)
-        if (ys.c > 2) { if (xdt == 4) BW1F(4, 8, 16); else BW1F(8, 8, 16); }   /* affinity heads: up to 8 outputs, Ci <= 16 */
+        if (ys.c > 2 && xs.c <= 16) { if (xdt == 4) BW1F(4, 8, 16); else BW1F(8, 8, 16); }   /* affinity heads: up to 8 outputs */
+        else if (ys.c > 2) { if (xdt == 4) BW1F(4, 8, 32); else BW1F(8, 8, 32); }
         else if (xdt == 4) { if (ys.c == 2) BW1F(4, 2, 32); else BW1F(4, 1, 32); }
         else { if (ys.c == 2) BW1F(8, 2, 32); else BW1F(8, 1, 32); }
 #undef BW1F

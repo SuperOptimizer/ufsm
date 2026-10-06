@@ -66,11 +66,12 @@ __global__ void __launch_bounds__(128) bwd_data_s2_mx2_k(const uint8_t *gy, cons
     }
     mx_store_row_b<8>(gx, scx, ri, bwx, acc);
 }
+extern "C" void lp_bwd_data_s2_mx_wide(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum);   /* lp_mx_s2bwd_wide.cu */
 extern "C" void lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum) {
     {
         const int bwx = mx_bw(xs.c), nbx = mx_nb(xs.c);
         const size_t smem = (size_t)8 * ys.c * bwx * sizeof(float);
-        if (smem > 96 * 1024) { fprintf(stderr, "lp_bwd_data_s2_mx: %d output channels exceed the shared-memory weight tile\n", ys.c); abort(); }
+        if (smem > 96 * 1024) { lp_bwd_data_s2_mx_wide(gy, ys, w, xs, gx, accum); return; }   /* wide layers: thread-per-voxel kernel */
         static int attr[8];
         if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)bwd_data_s2_mx2_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
         const size_t mmax = (size_t)((xs.d + 1) / 2) * ((xs.h + 1) / 2) * ((xs.w + 1) / 2);

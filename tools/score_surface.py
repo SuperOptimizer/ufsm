@@ -20,10 +20,13 @@ AXIS = '/vesuvius/ufsm/runs/noisy-labels-20261005/axis-0.json'
 BOXES = '48128,17408,16384,384,1024,1024;48512,17408,16384,512,1024,1024'
 
 
+WINDOW = [528, 8]   # prediction window / halo (--window W,H; 6-level nets need W divisible by 32: 544,16)
+
+
 def predict(ckpt, box, out, gpu):
     if (out / 'zarr.json').exists(): return
-    cmd = [str(UFSM), 'predict', ckpt, ROOT, CT, str(out), '--um', '2.4', '--box', ','.join(map(str, box)), '--window', '528',
-           '--halo', '8', '--shard', '512', '--grid-origin', '0,0,0', '--ema', '1', '--q', '8', '--threads', '16', '--axis', AXIS,
+    cmd = [str(UFSM), 'predict', ckpt, ROOT, CT, str(out), '--um', '2.4', '--box', ','.join(map(str, box)), '--window', str(WINDOW[0]),
+           '--halo', str(WINDOW[1]), '--shard', '512', '--grid-origin', '0,0,0', '--ema', '1', '--q', '8', '--threads', '16', '--axis', AXIS,
            '--levels', '1', '--gpu', str(gpu)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode: raise RuntimeError(r.stderr[-2000:])
@@ -45,9 +48,10 @@ def f1_auc(prob, box, tmp):
 
 def main():
     a = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    a.add_argument('--out', required=True); a.add_argument('--boxes', default=BOXES); a.add_argument('--gpu', default='0')
+    a.add_argument('--out', required=True); a.add_argument('--window', default='528,8'); a.add_argument('--boxes', default=BOXES); a.add_argument('--gpu', default='0')
     a.add_argument('ckpts', nargs='+')
     g = a.parse_args()
+    WINDOW[:] = [int(v) for v in g.window.split(',')]
     out = Path(g.out); out.mkdir(parents=True, exist_ok=True)
     boxes = [[int(v) for v in b.split(',')] for b in g.boxes.split(';')]
     rows = []
