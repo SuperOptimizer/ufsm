@@ -374,7 +374,11 @@ __device__ __forceinline__ float sat_h16(float v) { return fabsf(v) > 65504.f ? 
 __device__ __forceinline__ float act_ab(float v, float a, float b, bool G) {
     if (!G) return v;
     v = fmaf(v, a, b);
-    return __fdividef(v, 1.f + __expf(-v));
+    /* SiLU through one MUFU op: u sigmoid(u) = h + h tanh(h), h = u / 2 (tanh.approx: ~2^-11 relative, far below the e2m1 /
+       e4m3 rounding that follows in every caller; the staging was MUFU-bound with exp + reciprocal) */
+    const float h = 0.5f * v;
+    float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+    return fmaf(h, th, h);
 }
 /* exponent e (scale 2^e) such that amax * 2^-e <= qmax; returned as the ue8m0 byte e + 127 */
 /* NaN-propagating block amax: unsigned max over the magnitude bits (finite magnitudes order as their bits; NaN bits exceed inf),
