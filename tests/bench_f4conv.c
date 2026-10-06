@@ -5,6 +5,7 @@
    usage: bench_f4conv [P] */
 #include "nn.h"
 #include "nn_lp.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,6 +67,26 @@ int main(int argc, char **argv) {
         if (L[l].stats) printf("  stats %.9g %.9g", hs[0], hs[1]);
         printf("\n");
         nn_free((void *)j.x); nn_free(j.y); if (j.y2) nn_free(j.y2); nn_free(w); if (b) nn_free(b);
+    }
+    /* weight gradient (fp4, the --fp4 2 recipe): MX-fp4 x with GN+SiLU in staging, MX-fp8 gy with SR, bias */
+    struct { const char *nm; int ci, co; } WL[] = {{"wgrad 16 -> 16 (gn+silu, SR)", 16, 16}, {"wgrad 48 -> 16 (gn+silu, SR)", 48, 16}, {"wgrad 32 -> 32 (gn+silu, SR) @P/2", 32, 32}};
+    for (int l = 0; l < 3; l++) {
+        const int Pl = l == 2 ? P / 2 : P; const size_t Sl = (size_t)Pl * Pl * Pl;
+        shape5 xs = {1, WL[l].ci, Pl, Pl, Pl}, ys = xs; ys.c = WL[l].co;
+        void *x = mx(4, WL[l].ci, Sl, 2.f, 21 + l), *gy = mx(8, WL[l].co, Sl, 1e-3f, 31 + l);
+        const size_t nw = (size_t)WL[l].co * WL[l].ci * 27;
+        float *gw = nn_malloc(nw * 4), *gb = nn_malloc(WL[l].co * 4);
+        const gnp_t gp = {gam, bet, mean, rstd, G};
+        double best = 1e9;
+        for (unsigned it = 0; it < 10; it++) {
+            split_t sp = {0}; sp.sr = 0x51ed270bu + it;
+            nn_zero(gw, nw * 4); nn_zero(gb, WL[l].co * 4);
+            nn_sync(); double t0 = now(); lp_bwd_w_f4(x, 4, xs, gy, 3, ys, gw, gb, gp, sp, 0); nn_sync(); double t = (now() - t0) * 1e3;
+            if (it >= 2 && t < best) best = t;
+        }
+        float *h = malloc(nw * 4); nn_d2h(h, gw, nw * 4); double a = 0; for (size_t i = 0; i < nw; i++) a += fabs(h[i]); free(h);
+        printf("%-32s @%d %8.3f ms  |gw| %.9g\n", WL[l].nm, Pl, best, a);
+        nn_free(x); nn_free(gy); nn_free(gw); nn_free(gb);
     }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); return 1; }
     return 0;
