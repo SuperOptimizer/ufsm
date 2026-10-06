@@ -13,7 +13,7 @@ make test >"$O/test.log" 2>&1 && echo "make test: PASS" || echo "make test: FAIL
 IN=$R/full/inputs
 TR=(train "$IN/sources.json" --gpus 0,1 --fp4 2 --mem auto --opt muon --muon-lr 0.01 --lr 0.001 --sched wsd --cooldown 0.2
     --soft 2 --down-norm 1 --workers 12 --seed 2 --input-prec 8 --gn-stats stored --val-batches 2 --val-every 100000 --ckpt-every 100000 --log-every 20
-    --levels 1,0,0,0 --zfix 1 --symmetry-p 0.5 --ct-aug 1 --axis-jitter 32 --det 1 --cover "$IN/cover.json"
+    --levels 1,0,0,0 --zfix 1 --symmetry-p 0.5 --ct-aug 1 --axis-jitter 32 --det 1
     --widths 16,32,64,80 --split z --P 704 --B 1 --warmup 10 --erode 1)
 # training: steady-state rate (no profiler), then per-op and per-layer profiles
 UFSM_RC_KEEP_COARSE=1 "$B" "${TR[@]}" --steps 200 --out "$O/train_rate" >"$O/train_rate.log" 2>&1 || echo "train rate run failed"

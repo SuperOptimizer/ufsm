@@ -133,6 +133,17 @@ sources *sources_load(const char *path) {
             s->reg[c] = r;
             s->reg_z[c] = calloc(org->n, sizeof(z3 *));
         }
+        const json *bt = json_get(tg, "band");
+        if (bt) {
+            const char *broot = json_str(json_get(bt, "root"), nullptr), *bkey = json_str(json_get(bt, "key"), "4.8");
+            s->band_radius = (float)json_num(json_get(bt, "radius"), 80); s->band_span = (float)json_num(json_get(bt, "span"), 75);
+            store *bs = broot ? store_open(broot) : nullptr;
+            s->band = bs ? z3_open(bs, bkey, nullptr) : nullptr;
+            if (!s->band || !(s->band_radius > 0) || !(s->band_span >= 0)) {
+                fprintf(stderr, "sources: %s: cannot open band target %s/%s (%s)\n", s->name, broot ? broot : "?", bkey, z3_error());
+                json_free(j); sources_free(S); return nullptr;
+            }
+        }
         const json *ho = json_get(e, "holdout");
         if (ho && ho->type == J_ARR && ho->n == 6) for (int d = 0; d < 3; d++) { s->hold_o[d] = (int64_t)json_num(json_at(ho, (size_t)d), 0); s->hold_n[d] = (int64_t)json_num(json_at(ho, (size_t)(3 + d)), 0); }
         const char *ap = json_str(json_get(e, "axis"), nullptr);

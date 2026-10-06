@@ -1,4 +1,5 @@
 #include "sample.h"
+#include "band.h"
 #include "target_erode.h"
 #include "nn.h"
 #include "ct_augment.h"
@@ -132,10 +133,11 @@ static batch alloc_batch(const sample_cfg *c) {
     b.level = malloc((size_t)c->B * sizeof(int8_t));
     b.corner = malloc((size_t)c->B * sizeof *b.corner);
     b.sheet = calloc((size_t)c->B, sizeof *b.sheet);
+    b.band = c->band ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b) { if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->band) nn_host_free(b->band); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -439,6 +441,41 @@ static void warp_sheet_batch(sheet_batch *b,const spatial_aug *a,const uint8_t *
     }
     b->np=np; b->nt=nt;
 }
+/* band of a native window (task band_affinity): the band field (src/band.h) on the label grid of the window plus a halo,
+   nearest-upsampled like the binary labels (native g -> label (g + 1) >> 1). out: P^3. */
+static int band_window(source *s, const int64_t o[3], int P, uint8_t *out) {
+    band_params bp = {s->band_radius, s->band_span};
+    const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
+    int64_t lo[3], ln[3], ro[3], rn[3]; int ni[3];
+    const z3_meta *m = z3_meta_of(s->band);
+    for (int d = 0; d < 3; d++) {
+        lo[d] = ((o[d] + 1) >> 1) - halo; ln[d] = ((o[d] + P) >> 1) - ((o[d] + 1) >> 1) + 1 + 2 * halo; ni[d] = (int)ln[d];
+        ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
+    }
+    const size_t N = (size_t)ln[0] * ln[1] * ln[2];
+    uint8_t *codes = calloc(N, 1), *bl = malloc(N);
+    double *cy = malloc(ln[0] * sizeof(double)), *cx = malloc(ln[0] * sizeof(double));
+    int rc = !codes || !bl || !cy || !cx;
+    if (!rc && rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
+        uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
+        rc = !tmp || z3_read(s->band, ro, rn, tmp, 1);
+        if (!rc) for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
+            memcpy(codes + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
+        free(tmp);
+    }
+    if (!rc) {
+        for (int64_t z = 0; z < ln[0]; z++) axis_at(&s->ax, 2.0 * (z + lo[0]) + 0.5, &cy[z], &cx[z]);
+        rc = band_field(codes, ni, lo, cy, cx, bp, bl);
+    }
+    if (!rc) for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
+        const uint8_t *row = bl + ((size_t)(((o[0] + z + 1) >> 1) - lo[0]) * ln[1] + (((o[1] + y + 1) >> 1) - lo[1])) * ln[2];
+        uint8_t *dst = out + ((size_t)z * P + y) * P;
+        for (int x = 0; x < P; x++) dst[x] = row[((o[2] + x + 1) >> 1) - lo[2]];
+    }
+    free(codes); free(bl); free(cy); free(cx);
+    return rc ? -1 : 0;
+}
+
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
@@ -658,6 +695,14 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     if (!spatial.active) {
         for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y);
         sym_u8(mask, M, P, y);
+    }
+    if (c->band) {   /* band labels: computed on the source grid, unknown on CT air, then the same symmetry as CT and targets */
+        if (!s->band || l != 0 || spatial.active) return -1;
+        uint8_t *bw = malloc(p3);
+        if (!bw || band_window(s, o, P, bw)) { free(bw); return -1; }
+        for (size_t k = 0; k < p3; k++) if (!ctu[k]) bw[k] = BAND_UNKNOWN;
+        sym_u8(bw, b->band + (size_t)i * p3, P, y);
+        free(bw);
     }
     PROF_MARK(PS_AUGMENT);
     float *X = c->xfmt ? nullptr : b->x + (size_t)i * 4 * p3;

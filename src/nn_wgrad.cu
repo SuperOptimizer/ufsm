@@ -54,7 +54,7 @@ extern "C" void nn_conv3d_bwd_weight(const float *x, shape5 xs, const float *gy,
         if (stride == 1) conv_bwd_w3_k<1><<<grid, 256>>>(x, gy, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w);
         else if (stride == 2) conv_bwd_w3_k<2><<<grid, 256>>>(x, gy, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w);
         else { fprintf(stderr, "nn_conv3d_bwd_weight: unsupported stride %d\n", stride); abort(); }
-    } else if (k == 1 && stride == 1 && xs.c * ys.c <= 64 && ys.c <= 8) {
+    } else if (k == 1 && stride == 1 && xs.c * ys.c <= 128 && ys.c <= 8) {
         if (g_h16) bwd_w1_h<f16>(x, xs, gy, ys, gw, So); else bwd_w1_h<bf16>(x, xs, gy, ys, gw, So);
     } else { fprintf(stderr, "nn_conv3d_bwd_weight: unsupported k=%d stride=%d\n", k, stride); abort(); }
     if (gb) { if (GBF && g_h16) bias_grad_k<f16><<<dim3(ys.c, KSLAB), 256>>>((const f16 *)gy, gb, ys.n, ys.c, So); else if (GBF) bias_grad_k<bf16><<<dim3(ys.c, KSLAB), 256>>>((const bf16 *)gy, gb, ys.n, ys.c, So); else bias_grad_k<float><<<dim3(ys.c, KSLAB), 256>>>(gy, gb, ys.n, ys.c, So); }

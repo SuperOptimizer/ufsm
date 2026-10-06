@@ -96,10 +96,11 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx_k(const uint8_t *x, const 
     __syncthreads();
     if (threadIdx.x < Ci * Co && threadIdx.x < 64) { int ci = threadIdx.x / Co, co = threadIdx.x % Co; atomicAdd(&gw[(size_t)co * Ci + ci], red[threadIdx.x]); }
 }
-/* fast path: one MX block row (Ci <= 32) and CO <= 2 outputs (the head): static accumulator indices (the generic kernel's
-   acc[ci * Co + co] lived in local memory), per-sample GN coefficients in shared memory; grid (voxel chunks, sample) */
-template <int B, typename TG, int CO>
-__global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const TG *gy, float *gw, int N, int Ci, size_t S, gnp_t gp, int nper) {
+/* fast path: one MX block row (Ci <= KM <= 32) and up to CO outputs (the head; Co <= CO at run time): static accumulator
+   indices (the generic kernel's acc[ci * Co + co] lived in local memory), per-sample GN coefficients in shared memory;
+   grid (voxel chunks, sample). KM = 16 keeps the 8-output accumulators (affinity heads) in registers. */
+template <int B, typename TG, int CO, int KM = 32>
+__global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const TG *gy, float *gw, int N, int Ci, size_t S, gnp_t gp, int nper, int Co) {
     const int bw = mx_bw(Ci), n = blockIdx.y;
     __shared__ float ca[32], cb[32], red[32 * CO];
     if (threadIdx.x < 32) {
@@ -111,9 +112,9 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
     if (threadIdx.x < 32 * CO) red[threadIdx.x] = 0.f;
     __syncthreads();
     const uint8_t *sc = mx_sc<B>(x, N, Ci, S);
-    float acc[32][CO];
+    float acc[KM][CO];
 #pragma unroll
-    for (int k = 0; k < 32; k++)
+    for (int k = 0; k < KM; k++)
 #pragma unroll
         for (int co = 0; co < CO; co++) acc[k][co] = 0.f;
     const size_t v0 = (size_t)blockIdx.x * nper, v1 = min(S, v0 + nper);
@@ -121,9 +122,9 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
         float r[32], g[CO];
         mx_load_row_b<B>(x, sc, (size_t)n * S + v, bw, r);
 #pragma unroll
-        for (int co = 0; co < CO; co++) g[co] = ldx(gy, ((size_t)n * CO + co) * S + v);
+        for (int co = 0; co < CO; co++) g[co] = co < Co ? ldx(gy, ((size_t)n * Co + co) * S + v) : 0.f;
 #pragma unroll
-        for (int k = 0; k < 32; k++) {
+        for (int k = 0; k < KM; k++) {
             if (k < Ci) {
                 const float xv = gp.G ? act_ab(r[k], ca[k], cb[k], true) : r[k];
 #pragma unroll
@@ -132,10 +133,11 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
         }
     }
 #pragma unroll
-    for (int k = 0; k < 32; k++) {
+    for (int k = 0; k < KM; k++) {
         if (k < Ci) {
 #pragma unroll
             for (int co = 0; co < CO; co++) {
+                if (co >= Co) continue;
                 float a = acc[k][co];
                 for (int o = 16; o; o >>= 1) a += __shfl_xor_sync(0xffffffff, a, o);
                 if ((threadIdx.x & 31) == 0) atomicAdd(&red[k * CO + co], a);
@@ -143,19 +145,20 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
         }
     }
     __syncthreads();
-    if (threadIdx.x < Ci * CO) { const int k = threadIdx.x / CO, co = threadIdx.x % CO; atomicAdd(&gw[(size_t)co * Ci + k], red[threadIdx.x]); }
+    if (threadIdx.x < Ci * CO) { const int k = threadIdx.x / CO, co = threadIdx.x % CO; if (co < Co) atomicAdd(&gw[(size_t)co * Ci + k], red[threadIdx.x]); }
 }
 extern "C" void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp) {
-    if (xs.c <= 32 && ys.c <= 2) {
+    if ((xs.c <= 32 && ys.c <= 2) || (xs.c <= 16 && ys.c <= 8)) {
         const size_t S = shape_spatial(xs);
         const int nper = 8192, nbx = (int)((S + nper - 1) / nper);
         const dim3 grid(nbx, xs.n);
         const uint8_t *xq = (const uint8_t *)x;
-#define BW1F(B, CO) do { if (gydt == 2) conv_bwd_w1_mx1_k<B, __half, CO><<<grid, 256>>>(xq, (const __half *)gy, gw, xs.n, xs.c, S, gp, nper); \
-                         else if (gydt == 1) conv_bwd_w1_mx1_k<B, bf16, CO><<<grid, 256>>>(xq, (const bf16 *)gy, gw, xs.n, xs.c, S, gp, nper); \
-                         else conv_bwd_w1_mx1_k<B, float, CO><<<grid, 256>>>(xq, (const float *)gy, gw, xs.n, xs.c, S, gp, nper); } while (0)
-        if (xdt == 4) { if (ys.c == 2) BW1F(4, 2); else BW1F(4, 1); }
-        else { if (ys.c == 2) BW1F(8, 2); else BW1F(8, 1); }
+#define BW1F(B, CO, KM) do { if (gydt == 2) conv_bwd_w1_mx1_k<B, __half, CO, KM><<<grid, 256>>>(xq, (const __half *)gy, gw, xs.n, xs.c, S, gp, nper, ys.c); \
+                         else if (gydt == 1) conv_bwd_w1_mx1_k<B, bf16, CO, KM><<<grid, 256>>>(xq, (const bf16 *)gy, gw, xs.n, xs.c, S, gp, nper, ys.c); \
+                         else conv_bwd_w1_mx1_k<B, float, CO, KM><<<grid, 256>>>(xq, (const float *)gy, gw, xs.n, xs.c, S, gp, nper, ys.c); } while (0)
+        if (ys.c > 2) { if (xdt == 4) BW1F(4, 8, 16); else BW1F(8, 8, 16); }   /* affinity heads: up to 8 outputs, Ci <= 16 */
+        else if (xdt == 4) { if (ys.c == 2) BW1F(4, 2, 32); else BW1F(4, 1, 32); }
+        else { if (ys.c == 2) BW1F(8, 2, 32); else BW1F(8, 1, 32); }
 #undef BW1F
         LPCK();
         return;

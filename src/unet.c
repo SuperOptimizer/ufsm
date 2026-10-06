@@ -1236,6 +1236,41 @@ int unet_load(unet *u, const char *path) {
     return step;
 }
 
+/* Warm start into a wider head (band affinity outputs): load a checkpoint of the same net with fewer outputs. The body is
+   copied as is, head rows < keep (and their biases) are kept, new rows get zero weights and bias new_bias (zero optimiser
+   state), and the parameters after the head (down_norm GroupNorms) shift. Returns the checkpoint step or -1. */
+int unet_load_grow(unet *u, const char *path, int keep, float new_bias) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    unet_cfg oc; int step = 0; size_t onp = 0;
+    g_loaded_sparse = 0; g_loaded_wq = 0; g_loaded_muon = 0;
+    if (read_header(f, &oc, &step, &onp)) { fclose(f); return -1; }
+    const unet_cfg *c = &u->cfg;
+    int same = oc.nlev == c->nlev && oc.cin == c->cin && oc.G == c->G && oc.down_norm == c->down_norm && oc.cout <= c->cout && keep <= oc.cout;
+    for (int i = 0; same && i < c->nlev; i++) same = oc.widths[i] == c->widths[i];
+    const size_t hw = u->head.w, ci = (size_t)u->head.cin, tail_new = u->head.b + (size_t)c->cout, tail = u->np - tail_new;
+    if (!same || onp != hw + ci * oc.cout + oc.cout + tail || g_loaded_sparse || g_loaded_wq) {
+        fprintf(stderr, "grow-head: %s is not the same network with <= %d outputs\n", path, c->cout); fclose(f); return -1;
+    }
+    float *h = malloc(onp * 4), *n = malloc(u->np * 4);
+    float *arrs[5] = {u->p, u->ema, u->m, u->v, u->muon_mom};
+    int na = g_loaded_muon ? 5 : 4;
+    if (g_loaded_muon && !u->muon_mom) { u->muon_mom = nn_malloc(u->np * 4); arrs[4] = u->muon_mom; }
+    for (int a = 0; a < na; a++) {
+        if (fread(h, 4, onp, f) != onp) { free(h); free(n); fclose(f); return -1; }
+        const int weights = a < 2;   /* p and ema: new biases = new_bias; optimiser state: zero */
+        memcpy(n, h, hw * 4);
+        for (int co = 0; co < c->cout; co++)
+            for (size_t k = 0; k < ci; k++) n[hw + (size_t)co * ci + k] = co < keep ? h[hw + (size_t)co * ci + k] : 0.f;
+        for (int co = 0; co < c->cout; co++) n[u->head.b + co] = co < keep ? h[hw + ci * oc.cout + co] : weights ? new_bias : 0.f;
+        memcpy(n + tail_new, h + hw + ci * oc.cout + oc.cout, tail * 4);
+        nn_h2d(arrs[a], n, u->np * 4);
+    }
+    if (!g_loaded_muon && u->muon_mom) nn_zero(u->muon_mom, u->np * 4);
+    free(h); free(n); fclose(f);
+    return step;
+}
+
 int unet_start_sheet(unet *u) {
     if (u->cfg.cin!=4 || u->cfg.cout!=2 || u->wq) {
         fputs("winding initialization needs a four-input/two-output donor with FP32 master weights\n",stderr); return -1;

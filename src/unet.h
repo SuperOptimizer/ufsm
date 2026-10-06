@@ -68,6 +68,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra_json)
 /* Loads weights and saved optimizer state from the same cfg; returns the saved step or -1.
    Old checkpoints remain readable and start Muon with zero momentum. */
 int unet_load(unet *u, const char *path);
+int unet_load_grow(unet *u, const char *path, int keep, float new_bias);   /* warm start into a wider head (src/unet.c) */
 /* Retain surface response, zero the new scalar input and winding output,
    including EMA/Adam/Muon state for those parameters. */
 int unet_start_sheet(unet *u);

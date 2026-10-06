@@ -1,6 +1,7 @@
 /* ufsm CLI. */
 #include "sample.h"
 #include "sources.h"
+#include "band.h"
 #include "store.h"
 #include "zarr3.h"
 #include <dirent.h>
@@ -147,6 +148,54 @@ static int cmd_axis(store *s, const char *key, const char *out, const char *cach
 }
 
 /* ---- sample: dump montages of drawn patches ---- */
+/* ufsm band <codes-root> <key> z,y,x,nz,ny,nx <out.raw> [--axis umbilicus.json] [--radius 80] [--span 75] [--threads 8]
+   Band field (src/band.h) of a native-voxel box (even origin and size) from a winding_mod14 raster level (label grid, 2 native
+   voxels per label voxel): writes the band per label voxel, (nz/2) x (ny/2) x (nx/2) uint8, 0..251 or 255 unknown. */
+static int cmd_band(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "usage: ufsm band <codes-root> <key> z,y,x,nz,ny,nx <out.raw> [--axis A] [--radius 80] [--span 75]\n"); return 2; }
+    long long b[6];
+    if (sscanf(argv[4], "%lld,%lld,%lld,%lld,%lld,%lld", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return usage();
+    for (int d = 0; d < 6; d++) if (b[d] % 2 || (d >= 3 && b[d] <= 0)) { fprintf(stderr, "band: box must be even and positive\n"); return 2; }
+    band_params bp = {(float)atof(opt(argc, argv, "--radius", "80")), (float)atof(opt(argc, argv, "--span", "75"))};
+    axis ax = {0};
+    if (axis_load(&ax, opt(argc, argv, "--axis", "/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "band: cannot load axis\n"); return 1; }
+    const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
+    int64_t o[3], n[3]; int ni[3];
+    for (int d = 0; d < 3; d++) { o[d] = b[d] / 2 - halo; n[d] = b[3 + d] / 2 + 2 * halo; ni[d] = (int)n[d]; }
+    store *s = store_open(argv[2]);
+    z3 *z = z3_open(s, argv[3], nullptr);
+    if (!z) { fprintf(stderr, "%s\n", z3_error()); return 1; }
+    const z3_meta *m = z3_meta_of(z);
+    const size_t N = (size_t)n[0] * n[1] * n[2];
+    uint8_t *codes = calloc(N, 1), *band = malloc(N);
+    int64_t ro[3], rn[3];   /* the in-bounds part of the haloed box; outside stays empty */
+    for (int d = 0; d < 3; d++) { ro[d] = o[d] < 0 ? 0 : o[d]; int64_t e = o[d] + n[d] < m->shape[d] ? o[d] + n[d] : m->shape[d]; rn[d] = e - ro[d]; }
+    if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
+        uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
+        if (z3_read(z, ro, rn, tmp, atoi(opt(argc, argv, "--threads", "8")))) { fprintf(stderr, "band: read failed: %s\n", z3_error()); return 1; }
+        for (int64_t zz = 0; zz < rn[0]; zz++) for (int64_t yy = 0; yy < rn[1]; yy++)
+            memcpy(codes + ((size_t)(zz + ro[0] - o[0]) * n[1] + (yy + ro[1] - o[1])) * n[2] + (ro[2] - o[2]), tmp + ((size_t)zz * rn[1] + yy) * rn[2], (size_t)rn[2]);
+        free(tmp);
+    }
+    double *cy = malloc(n[0] * sizeof(double)), *cx = malloc(n[0] * sizeof(double));
+    for (int64_t zz = 0; zz < n[0]; zz++) axis_at(&ax, 2.0 * (zz + o[0]) + 0.5, &cy[zz], &cx[zz]);
+    double t0 = now();
+    if (band_field(codes, ni, o, cy, cx, bp, band)) { fprintf(stderr, "band: out of memory\n"); return 1; }
+    const int64_t on[3] = {b[3] / 2, b[4] / 2, b[5] / 2};
+    FILE *f = fopen(argv[5], "wb");
+    size_t unknown = 0;
+    for (int64_t zz = 0; zz < on[0]; zz++) for (int64_t yy = 0; yy < on[1]; yy++) {
+        const uint8_t *row = band + ((size_t)(zz + halo) * n[1] + yy + halo) * n[2] + halo;
+        for (int64_t xx = 0; xx < on[2]; xx++) unknown += row[xx] == BAND_UNKNOWN;
+        if (!f || fwrite(row, 1, (size_t)on[2], f) != (size_t)on[2]) { fprintf(stderr, "band: write failed\n"); return 1; }
+    }
+    fclose(f);
+    fprintf(stderr, "band field %lldx%lldx%lld (halo %d) in %.1fs, unknown %.1f%%\n", (long long)on[0], (long long)on[1], (long long)on[2], halo,
+            now() - t0, 100.0 * unknown / ((double)on[0] * on[1] * on[2]));
+    free(codes); free(band); free(cy); free(cx); z3_close(z);
+    return 0;
+}
+
 static int cmd_sample(int argc, char **argv) {
     const char *path = argv[2];
     sample_cfg cfg = sample_cfg_default();
@@ -221,6 +270,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "train")) return cmd_train(argc, argv);
     if (!strcmp(cmd, "predict")) return cmd_predict(argc, argv);
     if (!strcmp(cmd, "eval")) return cmd_eval(argc, argv);
+    if (!strcmp(cmd, "band")) return cmd_band(argc, argv);
     if (argc < 4) return usage();
     const char *root = argv[2], *key = argv[3];
     const char *cache = opt(argc, argv, "--cache", nullptr);

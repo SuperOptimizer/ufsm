@@ -220,6 +220,14 @@ void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, cons
 void nn_set_loss_tol(int r);
 int nn_get_loss_tol(void);
 void nn_loss_async_tol(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch, uint8_t *code);
+/* Affinity loss on band labels (task band_affinity, src/nn_loss.cu): output channels c0 .. c0 + K - 1 are affinities for
+   the offsets off (axis 0 z / 1 y / 2 x, distance d); band [n][S] holds band values in 1/18-turn steps mod 252, 255 =
+   unknown. Writes those channels of gl (scaled by lambda / K); fin: nn_aff_scratch(K) bytes of per-channel results
+   [bce, dice, wdiff, 1/norm, den, num]. Split z: pairs are owned by this GPU's planes, partners may lie in the halo. */
+typedef struct { int K; int ax[8]; int d[8]; } aff_offsets_t;
+size_t nn_aff_scratch(int K);
+void nn_aff_loss_async(const float *logits, shape5 s, int c0, const uint8_t *band, aff_offsets_t off, float dice_w, float lambda, float *gl, float *fin);
+void nn_aff_loss_fetch(const float *fin, int K, float *out);
 void nn_set_pos_weight(float w);   /* BCE weight of positive targets (class balance), default 1 */
 void nn_loss_fetch(const float *scratch, shape5 s, float *out);
 /* Sparse trilinear samples. Ownership is global z in [own_lo,own_hi), so a

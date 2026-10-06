@@ -373,6 +373,56 @@ static void test_loss_tol_sheet(void) {
     CHECK(mism == 0, "diagonal sheet normal (%d voxels off)", mism);
 }
 
+/* affinity loss on band labels: CPU reference (value and finite-difference gradient) */
+static int aff_md(int a, int b) { int d = ((a - b + 126) % 252 + 252) % 252; return d - 126; }
+static double cpu_aff_loss(const float *l, shape5 s, int c0, const uint8_t *band, aff_offsets_t off, float dice_w) {
+    size_t S = shape_spatial(s); int D = s.d, H = s.h, W = s.w; double tot = 0;
+    for (int k = 0; k < off.K; k++) {
+        double ns = 0, nd = 0, sps = 0, spd = 0, P = 0, I = 0;
+        for (int n = 0; n < s.n; n++) for (size_t i = 0; i < S; i++) {
+            const uint8_t *bp = band + (size_t)n * S; if (bp[i] == 255) continue;
+            int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
+            int zz = z + (off.ax[k] == 0 ? off.d[k] : 0), yy = y + (off.ax[k] == 1 ? off.d[k] : 0), xx = x + (off.ax[k] == 2 ? off.d[k] : 0);
+            if (zz < 0 || zz >= D || yy < 0 || yy >= H || xx < 0 || xx >= W) continue;
+            size_t j = ((size_t)zz * H + yy) * W + xx; if (bp[j] == 255) continue;
+            double v = l[((size_t)n * s.c + c0 + k) * S + i], sg = 1 / (1 + exp(-v)), sp = fmax(v, 0) + log1p(exp(-fabs(v)));
+            if (abs(aff_md(bp[i], bp[j])) < 9) { ns++; sps += sp - v; } else { nd++; spd += sp; I += 1 - sg; }
+            P += 1 - sg;
+        }
+        double w = nd > 0 ? fmin(10, fmax(1, ns / nd)) : 1, norm = ns + w * nd;
+        tot += (sps + w * spd) / norm + dice_w * (1 - (2 * I + 1) / (P + nd + 1));
+    }
+    return tot / off.K;
+}
+static void test_aff_loss(void) {
+    printf("affinity loss on band labels\n");
+    shape5 s = {2, 4, 6, 7, 8}; size_t S = shape_spatial(s), n = shape_numel(s);
+    aff_offsets_t off = {3, {0, 1, 2}, {1, -2, 1}};
+    uint8_t *band = malloc((size_t)s.n * S);
+    for (size_t i = 0; i < (size_t)s.n * S; i++) {   /* bands 2 voxels thick along x, codes wrapping around 252, some unknown */
+        int x = (int)(i % 8), y = (int)((i / 8) % 7);
+        band[i] = rand() % 9 == 0 ? 255 : (uint8_t)((240 + 18 * ((x + y) / 2) + rand() % 3) % 252);
+    }
+    float *l = randv(n, 2), *g = malloc(n * 4), fin[48];
+    float *dl = dev(l, n), *dg = nn_malloc(n * 4), *dfin = nn_malloc(nn_aff_scratch(3)); uint8_t *db = nn_malloc((size_t)s.n * S);
+    nn_h2d(db, band, (size_t)s.n * S); nn_zero(dg, n * 4);
+    nn_aff_loss_async(dl, s, 1, db, off, 0.5f, 1.f, dg, dfin); nn_aff_loss_fetch(dfin, 3, fin); host(g, dg, n);
+    double got = 0; for (int k = 0; k < 3; k++) got += fin[k * 6] + 0.5 * fin[k * 6 + 1]; got /= 3;
+    double ref = cpu_aff_loss(l, s, 1, band, off, 0.5f);
+    printf("  loss cpu %.6f gpu %.6f\n", ref, got);
+    CHECK(fabs(ref - got) < 1e-4, "affinity loss value");
+    double worst = 0, scale = maxabs(g, n); int zero_ok = 1;
+    for (size_t i = 0; i < n; i++) {
+        int c = (int)((i / S) % s.c);
+        if (c == 0) { zero_ok &= g[i] == 0.f; continue; }   /* channel 0 is not an affinity channel: untouched */
+        float o = l[i]; l[i] = o + 1e-3f; double lp = cpu_aff_loss(l, s, 1, band, off, 0.5f); l[i] = o - 1e-3f; double lm = cpu_aff_loss(l, s, 1, band, off, 0.5f); l[i] = o;
+        double fd = (lp - lm) / 2e-3, err = fabs(fd - g[i]) / (scale + 1e-9); if (err > worst) worst = err;
+    }
+    printf("  grad fd rel err %.3g\n", worst);
+    CHECK(worst < 2e-3 && zero_ok, "affinity loss grad");
+    nn_free(dl); nn_free(dg); nn_free(dfin); nn_free(db);
+}
+
 static void test_adamw(void) {
     printf("adamw + reductions\n");
     size_t n = 1000;
@@ -493,6 +543,7 @@ int main(void) {
     test_loss_tol(1);
     test_loss_tol(2);
     test_loss_tol_sheet();
+    test_aff_loss();
     test_adamw();
     test_predict_helpers();
     test_large_weight_grid();

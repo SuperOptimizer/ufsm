@@ -251,3 +251,88 @@ extern "C" void nn_split_allreduce(double *const *b, const int *dev, int n, doub
     cudaSetDevice(cur);
     KCHECK();
 }
+
+/* ---- affinity loss on band labels (task band_affinity) ----
+   band[n][S]: band value of each voxel in steps of 1/18 turn mod 252 (winding_mod14), 255 = unknown. For output channel
+   c0 + j (offset j: d voxels along axis a), voxel i owns the pair (i, i + d e_a) when i lies in this GPU's planes
+   [zlo, D - zhi) and both voxels are known (the partner may lie in the split halo). Target 1 = same band (modular
+   difference < half a turn), 0 = different. Loss per channel: class-weighted BCE (the "different" class weighted by
+   clamp(#same / #different, 1, 10)) + dice_w * dice on the "different" class (prediction 1 - sigmoid). Gradient into the
+   owning voxel's channel only. Statistics per channel (double): [n_same, n_diff, sum softplus(-x) same, sum softplus(x)
+   diff, sum (1 - s), sum (1 - s) over diff]. */
+#define AFF_NS 6
+__device__ __forceinline__ int aff_partner(int a, int d, int z, int y, int x, int D, int H, int W, size_t *j) {
+    int zz = z + (a == 0 ? d : 0), yy = y + (a == 1 ? d : 0), xx = x + (a == 2 ? d : 0);
+    if (zz < 0 || zz >= D || yy < 0 || yy >= H || xx < 0 || xx >= W) return 0;
+    *j = ((size_t)zz * H + yy) * W + xx; return 1;
+}
+__device__ __forceinline__ int aff_target(uint8_t bi, uint8_t bj) {   /* 1 same band, 0 different */
+    int dd = ((int)bi - (int)bj + 126) % 252; if (dd < 0) dd += 252; dd -= 126;
+    return abs(dd) < 9;
+}
+__global__ void aff_stats_k(const float *lg, const uint8_t *band, aff_offsets_t off, int C, int c0, int D, int H, int W, int zlo, int zhi, double *ds) {
+    const int nj = blockIdx.y, n = nj / off.K, k = nj % off.K;
+    const size_t S = (size_t)D * H * W;
+    const float *l = lg + ((size_t)n * C + c0 + k) * S; const uint8_t *bp = band + (size_t)n * S;
+    float a[AFF_NS] = {0, 0, 0, 0, 0, 0};
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < S; i += (size_t)gridDim.x * blockDim.x) {
+        const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
+        if (z < zlo || z >= D - zhi || bp[i] == 255) continue;
+        size_t j; if (!aff_partner(off.ax[k], off.d[k], z, y, x, D, H, W, &j) || bp[j] == 255) continue;
+        const float v = l[i], s = 1.f / (1.f + __expf(-v)), sp = fmaxf(v, 0.f) + log1pf(__expf(-fabsf(v)));
+        if (aff_target(bp[i], bp[j])) { a[0] += 1; a[2] += sp - v; } else { a[1] += 1; a[3] += sp; a[5] += 1.f - s; }
+        a[4] += 1.f - s;
+    }
+    __shared__ double r[AFF_NS][256];
+    for (int q = 0; q < AFF_NS; q++) r[q][threadIdx.x] = a[q];
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) for (int q = 0; q < AFF_NS; q++) r[q][threadIdx.x] += r[q][threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) for (int q = 0; q < AFF_NS; q++) atomicAdd(&ds[k * AFF_NS + q], r[q][0]);
+}
+/* fin per channel: [bce, dice, wdiff, 1 / (n_same + w n_diff), den, 2 I + 1] (6 floats per channel) */
+__global__ void aff_fin_k(const double *ds, int K, float *fin) {
+    const int k = threadIdx.x; if (k >= K) return;
+    const double *t = ds + k * AFF_NS;
+    const double ns = t[0], nd = t[1], w = nd > 0 ? fmin(10.0, fmax(1.0, ns / nd)) : 1.0, norm = ns + w * nd;
+    const double den = t[4] + nd + 1.0, num = 2.0 * t[5] + 1.0;
+    float *f = fin + k * 6;
+    f[0] = norm > 0 ? (float)((t[2] + w * t[3]) / norm) : 0.f; f[1] = norm > 0 ? (float)(1.0 - num / den) : 0.f;
+    f[2] = (float)w; f[3] = norm > 0 ? (float)(1.0 / norm) : 0.f; f[4] = (float)den; f[5] = (float)num;
+}
+template <typename GT> __global__ void aff_grad_k(const float *lg, const uint8_t *band, aff_offsets_t off, int N, int C, int c0, int D, int H, int W,
+                                                  int zlo, int zhi, const float *fin, float dice_w, float scale, GT *gl) {
+    const size_t S = (size_t)D * H * W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    const int nk = blockIdx.y, n = nk / off.K, k = nk % off.K;
+    if (i >= S) return;
+    const size_t o = ((size_t)n * C + c0 + k) * S + i;
+    const uint8_t *bp = band + (size_t)n * S;
+    const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
+    size_t j;
+    if (z < zlo || z >= D - zhi || bp[i] == 255 || !aff_partner(off.ax[k], off.d[k], z, y, x, D, H, W, &j) || bp[j] == 255) { gl[o] = f2h<GT>(0.f); return; }
+    const float *f = fin + k * 6, v = lg[o], s = 1.f / (1.f + expf(-v));
+    const int same = aff_target(bp[i], bp[j]);
+    float g = (same ? -(1.f - s) : f[2] * s) * f[3];
+    g += dice_w * ((same ? 0.f : 2.f) * f[4] - f[5]) / (f[4] * f[4]) * s * (1.f - s);
+    gl[o] = f2h<GT>(g * scale);
+}
+extern "C" size_t nn_aff_scratch(int K) { return (size_t)K * 6 * sizeof(float); }
+extern "C" void nn_aff_loss_async(const float *logits, shape5 s, int c0, const uint8_t *band, aff_offsets_t off, float dice_w, float lambda,
+                                  float *gl, float *fin) {
+    const int zlo_hi_on = zs_on();
+    int zlo = 0, zhi = 0; if (zlo_hi_on) zs_range(s.d, &zlo, &zhi);
+    double *ds = gn_dsums((size_t)AFF_NS * off.K);
+    cudaMemsetAsync(ds, 0, (size_t)AFF_NS * off.K * sizeof(double));
+    aff_stats_k<<<dim3(64, s.n * off.K), 256>>>(logits, band, off, s.c, c0, s.d, s.h, s.w, zlo, zhi, ds);
+    zs_reduce(ds, AFF_NS * off.K);
+    aff_fin_k<<<1, 32>>>(ds, off.K, fin);
+    if (gl) {
+        const size_t S = shape_spatial(s); const dim3 grid(nblk(S, 256), s.n * off.K);
+        const float scale = lambda / off.K;   /* mean over channels (each channel's loss already covers all samples) */
+        if (!g_loss_g16) aff_grad_k<float><<<grid, 256>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale, gl);
+        else if (g_h16) aff_grad_k<f16><<<grid, 256>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (f16 *)gl);
+        else VERIFY_ONLY(aff_grad_k<bf16><<<grid, 256>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (bf16 *)gl));
+    }
+    KCHECK();
+}
+/* host copy of the per-channel [bce, dice, wdiff, ...] (6 floats per channel) */
+extern "C" void nn_aff_loss_fetch(const float *fin, int K, float *out) { CK(cudaMemcpy(out, fin, (size_t)K * 6 * sizeof(float), cudaMemcpyDeviceToHost)); }

@@ -33,6 +33,7 @@ typedef struct {
     float rotate_degrees, rotate_p, elastic, elastic_p;
     float label_morph, label_morph_p; /* signed soft-band distance offset; centreline preserved */
     const sheet_dataset *sheet; /* borrowed sparse geometry, native-level B=1 task */
+    int band;                /* 1: fill batch.band from each source's band target (task band_affinity, native level, no geometry warp) */
 } sample_cfg;
 
 typedef struct {
@@ -45,6 +46,7 @@ typedef struct {
     int8_t *level;           /* B: CT level */
     int64_t (*corner)[3];    /* B: level-0 corner */
     sheet_batch **sheet;     /* B sparse records; null for legacy task */
+    uint8_t *band;           /* B x P^3 band per voxel (src/band.h: 1/18-turn steps mod 252, 255 unknown) when cfg.band */
 } batch;
 
 typedef struct sampler sampler;

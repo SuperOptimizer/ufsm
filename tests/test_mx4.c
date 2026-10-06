@@ -775,5 +775,26 @@ int main(void) {
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
     printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);
     (void)mode_ref; (void)mode_mx; (void)TOL4; (void)TOL; (void)G; (void)dev_rand;
+    {   /* wide heads (band affinity outputs): 1^3 weight gradient, 16 MX inputs (optionally GN+SiLU) x 3..8 outputs, vs fp32 */
+        shape5 xs = {2, 16, 6, 10, 12};
+        const size_t S = shape_spatial(xs);
+        for (int dt = 4; dt <= 8; dt += 4) for (int co = 3; co <= 8; co += 4) for (int G = 0; G <= 4; G += 4) {
+            shape5 ys = xs; ys.c = co;
+            float *x = dev_rand(shape_numel(xs), 2.f), *gy = dev_rand(shape_numel(ys), 1.f);
+            void *xm = dt == 4 ? mx4_from(x, xs) : mx8_from(x, xs); float *xd = dt == 4 ? deq4(xm, xs) : deq8(xm, xs);
+            float *gam = dev_rand(16, 1.f), *bet = dev_rand(16, 0.5f), *mean = dev_rand((size_t)xs.n * 4, 0.2f), *rstd = dev_rand((size_t)xs.n * 4, 0.3f);
+            { float h[8]; nn_d2h(h, rstd, (size_t)xs.n * 4 * 4); for (int k = 0; k < xs.n * 4; k++) h[k] = 0.8f + fabsf(h[k]); nn_h2d(rstd, h, (size_t)xs.n * 4 * 4); }
+            float *xa = dev_zero(shape_numel(xs)), *gr = dev_zero((size_t)co * 16), *gw = dev_zero((size_t)co * 16);
+            mode_ref();
+            if (G) nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, xa); else nn_d2d(xa, xd, shape_numel(xs) * 4);
+            nn_conv3d_bwd_weight(xa, xs, gy, ys, 1, 1, gr, nullptr);
+            gnp_t gp = {G ? gam : nullptr, G ? bet : nullptr, G ? mean : nullptr, G ? rstd : nullptr, G};
+            lp_bwd_w1_mx(xm, dt == 4 ? 4 : 3, xs, gy, 0, ys, gw, gp);
+            char nm[96]; snprintf(nm, sizeof nm, "head wgrad 16 -> %d, mx%d%s", co, dt, G ? ", gn+silu" : "");
+            cmp(nm, gw, gr, (size_t)co * 16, 1e-4);
+            nn_free(x); nn_free(gy); nn_free(xm); nn_free(xd); nn_free(xa); nn_free(gr); nn_free(gw); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd);
+            (void)S;
+        }
+    }
     return bad != 0;
 }

@@ -568,7 +568,7 @@ int cmd_ingest_zip(int argc, char **argv) {
 }
 
 /* ================= raster: segment meshes -> label pyramid ================= */
-typedef struct { int w, h; float *xyz; uint8_t *valid; double lo[3], hi[3]; } mesh;
+typedef struct { int w, h; float *xyz; uint8_t *valid; float *val; double lo[3], hi[3]; } mesh;   /* val: optional per-vertex value (raster --value) */
 
 static mesh *load_mesh(const char *path) {
     mesh *m = calloc(1, sizeof *m);
@@ -629,6 +629,25 @@ static mesh *load_mesh(const char *path) {
     return m;
 }
 
+/* per-vertex value image <tifxyz>/<name> (float32, same grid; NaN = no value) */
+static int load_mesh_value(mesh *m, const char *dir, const char *name) {
+    char p[1400]; snprintf(p, sizeof p, "%s/%s", dir, name);
+    tiff *t = tiff_open_file(p);
+    if (!t) { fprintf(stderr, "%s: %s\n", p, tiff_error()); return -1; }
+    tiff_page pg;
+    if (tiff_page_info(t, 0, &pg) || pg.w != m->w || pg.h != m->h || pg.bits != 32 || pg.fmt != 3 || pg.spp != 1) {
+        fprintf(stderr, "%s: value image must be float32 %dx%d\n", p, m->w, m->h); tiff_close(t); return -1;
+    }
+    m->val = malloc((size_t)m->w * m->h * 4);
+    if (!m->val || tiff_read_page(t, 0, m->val)) { fprintf(stderr, "%s: TIFF decode failed\n", p); tiff_close(t); return -1; }
+    tiff_close(t);
+    return 0;
+}
+/* winding_mod14 code: 1 + (round(q * 18) mod 252), 0 = empty, 255 = conflict. Period 14 turns (even: wrap parity is
+   kept), step 1/18 turn (half a turn = 9 steps); only differences of nearby codes are used (unambiguous within 7 turns) */
+static inline uint8_t wind_code(double q) { long k = lround(q * 18.0) % 252; if (k < 0) k += 252; return (uint8_t)(1 + k); }
+static inline int wind_diff(uint8_t a, uint8_t b) { int d = ((int)a - (int)b) % 252; if (d < -126) d += 252; if (d >= 126) d -= 252; return d; }
+
 /* chamfer 3-4-5 distance transform on a uint8 grid where 0 = surface, 255 = far; capped at `cap` */
 static void chamfer_reference(uint8_t *d, int N, int cap) {
     static const int off[13][4] = {{-1,-1,-1,5},{-1,-1,0,4},{-1,-1,1,5},{-1,0,-1,4},{-1,0,0,3},{-1,0,1,4},{-1,1,-1,5},{-1,1,0,4},{-1,1,1,5},{0,-1,-1,4},{0,-1,0,3},{0,-1,1,4},{0,0,-1,3}};
@@ -654,7 +673,7 @@ typedef struct {
     mesh **meshes; int nm; double scale; int shard, margin, T;
     int64_t ns[3]; int64_t shape[3]; z3w *w; atomic_int failed, done; int nthreads;
     rtile *tiles; size_t ntile; size_t *offset; uint32_t *refs;
-    int indexed, reference_distance, binary, band;
+    int indexed, reference_distance, binary, band, value;   /* value: write winding_mod14 codes of the per-vertex values */
 } rjob;
 
 #include "raster_cpu.h"
@@ -676,7 +695,7 @@ static void raster_shard(int si, int tid, void *ud) {
     size_t NN = (size_t)N * N * N;
     uint8_t *d = malloc(NN);
     if (!d) { atomic_store(&j->failed, 1); return; }
-    memset(d, 255, NN);
+    memset(d, j->value ? 0 : 255, NN);
     size_t begin = j->indexed ? j->offset[si] : 0, end = j->indexed ? j->offset[si + 1] : (size_t)j->nm;
     for (size_t it = begin; it < end; it++) {
         const rtile *tile = j->indexed ? &j->tiles[j->refs[it]] : nullptr;
@@ -690,6 +709,11 @@ static void raster_shard(int si, int tid, void *ud) {
         for (int r = r0; r < r1; r++) for (int c = c0; c < c1; c++) {
             size_t i00 = (size_t)r * m->w + c, i01 = i00 + 1, i10 = i00 + (size_t)m->w, i11 = i10 + 1;
             if (!(m->valid[i00] && m->valid[i01] && m->valid[i10] && m->valid[i11])) continue;
+            double qv[4] = {0, 0, 0, 0};
+            if (j->value) {
+                qv[0] = m->val[i00]; qv[1] = m->val[i01]; qv[2] = m->val[i10]; qv[3] = m->val[i11];
+                if (!(isfinite(qv[0]) && isfinite(qv[1]) && isfinite(qv[2]) && isfinite(qv[3]))) continue;
+            }
             double p[4][3];
             const size_t idx[4] = {i00, i01, i10, i11};
             double cl[3] = {1e30, 1e30, 1e30}, ch[3] = {-1e30, -1e30, -1e30};
@@ -711,17 +735,25 @@ static void raster_shard(int si, int tid, void *ud) {
                     vox[dd] = (int)floor(q - lo[dd] + 0.5);
                     if (vox[dd] < 0 || vox[dd] >= N) in = 0;
                 }
-                if (in) d[((size_t)vox[0] * N + vox[1]) * N + vox[2]] = 0;
+                if (!in) continue;
+                uint8_t *dv = &d[((size_t)vox[0] * N + vox[1]) * N + vox[2]];
+                if (!j->value) { *dv = 0; continue; }
+                const uint8_t code = wind_code((1 - u) * (1 - v) * qv[0] + u * (1 - v) * qv[1] + (1 - u) * v * qv[2] + u * v * qv[3]);
+                if (*dv == 0) *dv = code;
+                else if (*dv != 255 && abs(wind_diff(*dv, code)) > 4) *dv = 255;   /* another surface more than 1/4 turn apart */
             }
         }
     }
-    if (!j->binary || j->reference_distance) {
+    if (j->value) {}   /* codes are written as rasterised (no distance band) */
+    else if (!j->binary || j->reference_distance) {
         if (j->reference_distance) chamfer_reference(d, N, 3 * j->T + 3);
         else raster_distance(d, N, 3 * j->T + 3);
     }
     uint8_t *buf = malloc((size_t)S * S * S);
     if (!buf) { free(d); atomic_store(&j->failed, 1); return; }
-    if (j->binary && !j->reference_distance && j->band) raster_expand_mask(d, N, buf, S, M);
+    if (j->value) for (int z = 0; z < S; z++) for (int y = 0; y < S; y++)
+        memcpy(buf + ((size_t)z * S + y) * S, d + ((size_t)(z + M) * N + (y + M)) * N + M, (size_t)S);
+    else if (j->binary && !j->reference_distance && j->band) raster_expand_mask(d, N, buf, S, M);
     else for (int z = 0; z < S; z++) for (int y = 0; y < S; y++) {
         const uint8_t *src = d + ((size_t)(z + M) * N + (y + M)) * N + M;
         uint8_t *dst = buf + ((size_t)z * S + y) * S;
@@ -735,7 +767,8 @@ static void raster_shard(int si, int tid, void *ud) {
 }
 
 int cmd_raster(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm raster <out-dir> --shape Z,Y,X --um U [--level L] [--binary 0|1] [--band-chamfer 0|4] [--T 3] [--levels 6] [--threads 8] [--shard 1024] [--raster-index 1] [--reference-distance 0] <mesh.sfc|tifxyz-dir>...\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm raster <out-dir> --shape Z,Y,X --um U [--level L] [--binary 0|1] [--band-chamfer 0|4] [--T 3] [--levels 6] [--threads 8] [--shard 1024] [--raster-index 1] [--reference-distance 0] [--value q.tif] <mesh.sfc|tifxyz-dir>...\n"
+                                  "  --value NAME: per-vertex float32 image in each tifxyz dir (winding q, turns) -> winding_mod14 codes (one level, no band)\n"); return 2; }
     const char *out = argv[2];
     long long Z = 0, Y = 0, X = 0;
     if (sscanf(opt(argc, argv, "--shape", "0,0,0"), "%lld,%lld,%lld", &Z, &Y, &X) != 3 || Z <= 0 || Y <= 0 || X <= 0) { fprintf(stderr, "--shape Z,Y,X (positive level-0 voxels) required\n"); return 2; }
@@ -748,11 +781,14 @@ int cmd_raster(int argc, char **argv) {
         nlev < 1 || nlev > MAXLEV_PYR || nthreads < 1 || nthreads > 256 || shard < 128 || shard % 128 || (binary != 0 && binary != 1) || (band!=0 && band!=4)) {
         fprintf(stderr, "raster: require positive um, level 0..20, T 1..84, levels 1..12, threads 1..256 and shard a positive multiple of 128\n"); return 2;
     }
+    const char *value_name = opt(argc, argv, "--value", "");
+    if (*value_name && (binary || nlev != 1)) { fprintf(stderr, "raster --value: use --binary 0 --levels 1\n"); return 2; }
     mesh *meshes[4096]; int nm = 0;
     for (int i = 3; i < argc && nm < 4096; i++) {
         if (argv[i][0] == '-') { i++; continue; }
         mesh *m = load_mesh(argv[i]);
         if (!m) return 1;
+        if (*value_name && load_mesh_value(m, argv[i], value_name)) return 1;
         meshes[nm++] = m;
         fprintf(stderr, "%s: %dx%d, bbox z %.0f-%.0f y %.0f-%.0f x %.0f-%.0f\n", argv[i], m->w, m->h, m->lo[0], m->hi[0], m->lo[1], m->hi[1], m->lo[2], m->hi[2]);
     }
@@ -762,11 +798,12 @@ int cmd_raster(int argc, char **argv) {
     char lv[32], ldir[1400], attrs[512];
     z3w_level_name(um_l, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
-    if (binary) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"encoding\":\"binary\",\"surface_band_chamfer\":%d,\"codec\":\"volcomp-mask-lossless\",\"background\":\"all non-surface voxels\"}}", nm, band);
+    if (*value_name) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"winding\",\"source\":\"raster of %d meshes, value %s\",\"encoding\":\"winding_mod14\",\"code\":\"1 + (round(q*18) mod 252); 0 empty; 255 conflict (>1/4 turn)\"}}", nm, value_name);
+    else if (binary) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"encoding\":\"binary\",\"surface_band_chamfer\":%d,\"codec\":\"volcomp-mask-lossless\",\"background\":\"all non-surface voxels\"}}", nm, band);
     else snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"T\":%d,\"encoding\":\"0=bg,254=surface,255=ignore\"}}", nm, T);
-    z3w *w = binary ? z3w_create_mask(ldir, shape, shard, attrs) : z3w_create(ldir, shape, shard, 0.f, 255, attrs);
+    z3w *w = binary ? z3w_create_mask(ldir, shape, shard, attrs) : z3w_create(ldir, shape, shard, 0.f, *value_name ? 0 : 255, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
-    rjob j = {.meshes = meshes, .nm = nm, .scale = scale, .shard = shard, .margin = binary ? 2 : T + 3, .T = T, .binary = binary, .band=band,
+    rjob j = {.meshes = meshes, .nm = nm, .scale = scale, .shard = shard, .margin = binary || *value_name ? 2 : T + 3, .T = T, .binary = binary, .band=band, .value = *value_name != 0,
               .ns = {(shape[0] + shard - 1) / shard, (shape[1] + shard - 1) / shard, (shape[2] + shard - 1) / shard},
               .shape = {shape[0], shape[1], shape[2]}, .w = w, .nthreads = nthreads,
               .indexed = atoi(opt(argc, argv, "--raster-index", "1")),
@@ -783,6 +820,6 @@ int cmd_raster(int argc, char **argv) {
     for (int l = 1; !result && l < nlev; l++) result = pyramid_build_level(out, um_l, l, shape, shard, 0.f, binary ? 2 : 1, nthreads, attrs) != 0;
     if (!result) result = pyramid_write_group(out, um_l, nlev, "raster-labels", attrs) != 0;
     free(j.tiles); free(j.offset); free(j.refs);
-    for (int mi = 0; mi < nm; mi++) { free(meshes[mi]->xyz); free(meshes[mi]->valid); free(meshes[mi]); }
+    for (int mi = 0; mi < nm; mi++) { free(meshes[mi]->xyz); free(meshes[mi]->valid); free(meshes[mi]->val); free(meshes[mi]); }
     return result;
 }

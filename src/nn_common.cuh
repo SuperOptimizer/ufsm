@@ -1608,6 +1608,12 @@ static void bwd_w_s2_h(const float *x, shape5 xs, const float *gy, shape5 ys, fl
 template <typename HT>
 static void bwd_w1_h(const float *x, shape5 xs, const float *gy, shape5 ys, float *gw, size_t So, gnp_t xg = {}) {
     int nb = (int)((So + 2047) / 2048); if (nb > 4096) nb = 4096; if (nb < 1) nb = 1;
+    if (xs.c * ys.c > 64) {   /* wide heads (affinity outputs): up to 128 channel pairs */
+        if (GBF) conv_bwd_w1_k<HT, HT, 128><<<nb, 256>>>((const HT *)x, (const HT *)gy, gw, xs.n, xs.c, ys.c, So, xg);
+        else if (ABF) conv_bwd_w1_k<HT, float, 128><<<nb, 256>>>((const HT *)x, gy, gw, xs.n, xs.c, ys.c, So, xg);
+        else conv_bwd_w1_k<float, float, 128><<<nb, 256>>>(x, gy, gw, xs.n, xs.c, ys.c, So, xg);   /* exact fp32 (reference) */
+        return;
+    }
     if (GBF) conv_bwd_w1_k<HT, HT, 64><<<nb, 256>>>((const HT *)x, (const HT *)gy, gw, xs.n, xs.c, ys.c, So, xg);
     else if (ABF) conv_bwd_w1_k<HT, float, 64><<<nb, 256>>>((const HT *)x, gy, gw, xs.n, xs.c, ys.c, So, xg);
     else conv_bwd_w1_k<float, float, 64><<<nb, 256>>>(x, gy, gw, xs.n, xs.c, ys.c, So, xg);

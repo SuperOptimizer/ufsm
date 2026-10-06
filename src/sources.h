@@ -64,6 +64,10 @@ typedef struct {
     z3 *reg_shared[NCH];    /* the shared array when reg[ch]->array is set */
     axis ax;                /* n == 0 when unknown */
     int64_t hold_o[3], hold_n[3];   /* optional held-out box (level-0 voxels); hold_n[0] == 0 when absent */
+    /* optional band target (task band_affinity, src/band.h): winding_mod14 raster array on the 2x label grid,
+       {"band": {"root": ..., "key": "4.8", "radius": 80, "span": 75}} under "targets" */
+    z3 *band;
+    float band_radius, band_span;   /* native voxels */
 } source;
 
 typedef struct {
