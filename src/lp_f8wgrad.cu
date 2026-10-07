@@ -2,7 +2,8 @@
 #include "lp_f8wgrad.cuh"
 
 extern "C" void lp_set_f8w_coop(int c) { g_f8w_coop = c; }
-int g_f8w_coop = 1;   /* gy (bit 1) measured mixed: -7% at 96->32, +5..14% elsewhere (per-channel work per thread) */
+int g_f8w_coop = 1 | 4;   /* gy (bit 1) measured mixed: -7% at 96->32, +5..14% elsewhere (per-channel work per thread); bit 2 (auto): gy
+                             coop for the network input conv only (Ci <= 8, one 16-channel gy block: 16.7 -> 13.1 ms at 384^3) */
 /* instantiated in lp_f8wgrad_i*.cu */
 extern template void bwd_w_f8_t<mx4_t, mx8_t>(const void *x, shape5 xs, const mx8_t *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp);
 extern template void bwd_w_f8_t<mx4_t, __half>(const void *x, shape5 xs, const __half *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp);

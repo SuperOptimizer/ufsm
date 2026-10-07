@@ -729,8 +729,9 @@ int main(void) {
     {   /* fp8 weight gradient on MX inputs: the cooperative staging (x row decoded once per voxel for all channels, gy per
            voxel for all outputs) must reproduce the per-element staging bit for bit, SR and gn+silu included */
         const int Gn = 8;
-        struct { int ci, co, w; const char *nm; } cs[] = {{32, 32, 16, "32 -> 32, W 16"}, {16, 16, 20, "16 -> 16, W 20"}, {48, 16, 16, "48 -> 16 (NT 3)"}, {80, 80, 12, "80 -> 80, W 12"}};
-        for (int i = 0; i < 4; i++) {
+        struct { int ci, co, w; const char *nm; } cs[] = {{32, 32, 16, "32 -> 32, W 16"}, {16, 16, 20, "16 -> 16, W 20"}, {48, 16, 16, "48 -> 16 (NT 3)"}, {80, 80, 12, "80 -> 80, W 12"},
+                                                          {4, 16, 16, "4 -> 16 (network input), W 16"}};
+        for (int i = 0; i < 5; i++) {
             shape5 xs = {2, cs[i].ci, 6, 10, cs[i].w}, ys = xs; ys.c = cs[i].co;
             size_t nx = shape_numel(xs), ny = shape_numel(ys), nw = (size_t)cs[i].co * cs[i].ci * 27, NG = (size_t)2 * Gn;
             float *xr = dev_rand(nx, 2.f), *gr = dev_rand(ny, 1e-3f);
@@ -743,7 +744,7 @@ int main(void) {
                 nn_zero(a, nw * 4); nn_zero(b, nw * 4); nn_zero(ab, cs[i].co * 4); nn_zero(bb, cs[i].co * 4);
                 lp_set_f8w_coop(3); lp_bwd_w_f8(xt == 4 ? xm : x8, xt, xs, gm, 3, ys, a, ab, gp, sr);   /* both cooperative paths */
                 lp_set_f8w_coop(0); lp_bwd_w_f8(xt == 4 ? xm : x8, xt, xs, gm, 3, ys, b, bb, gp, sr);
-                lp_set_f8w_coop(1);
+                lp_set_f8w_coop(1 | 4);   /* the default: x cooperative, gy cooperative for the network input conv */
                 char nm[96]; snprintf(nm, sizeof nm, "f8 wgrad coop == per-element (%s, %s x, SR, gn)", cs[i].nm, xt == 4 ? "mx4" : "mx8");
                 cmp(nm, a, b, nw, 1e-6);
                 snprintf(nm, sizeof nm, "f8 wgrad coop bias (%s)", cs[i].nm); cmp(nm, ab, bb, cs[i].co, 1e-6);

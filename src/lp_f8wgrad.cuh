@@ -41,6 +41,9 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
     if (threadIdx.x < BMo) sbias[threadIdx.x] = 0.f;
     const bool vec = (W & 3) == 0;
     const int zt_begin = zc * ZC;
+    float bpart[BMo];   /* coop gy path: this thread's gy sums per output channel over the block's z-steps (reduced once at the end) */
+#pragma unroll
+    for (int c = 0; c < BMo; c++) bpart[c] = 0.f;
     /* MX x whose CH channels are consecutive entries of one stored block row (the common case): the voxel's row words are
        loaded and decoded once for all CH channels (thread per voxel), instead of one strided byte per (channel, voxel) */
     bool uni = false;
@@ -75,13 +78,21 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
 #pragma unroll
                     for (int q = 0; q < CH; q++) { const chan_t &cq = ctab8[q]; v[q] = cq.p ? act_ab(v[q], cq.a, cq.b, Gany && cq.g) : 0.f; }
                 }
+                unsigned ra[CH];   /* the channels' warp amaxes first (independent reductions), then lane 0's shared maxima */
 #pragma unroll
-                for (int q = 0; q < CH; q++) { const unsigned a = __reduce_max_sync(0xffffffffu, __float_as_uint(v[q]) & 0x7fffffffu); if (lane == 0 && a) atomicMax(&am[q], a); }
+                for (int q = 0; q < CH; q++) ra[q] = __reduce_max_sync(0xffffffffu, __float_as_uint(v[q]) & 0x7fffffffu);
+                if (lane == 0) {
+#pragma unroll
+                    for (int q = 0; q < CH; q++) if (ra[q]) atomicMax(&am[q], ra[q]);
+                }
                 __syncthreads();
                 if (tid < 180) {
                     uint8_t *dst = sxq + slot * X8_PS + row * 24 + 3 + p;
+                    float mq[CH];   /* the multipliers read once (the stores below could alias am for the compiler) */
 #pragma unroll
-                    for (int q = 0; q < CH; q++) dst[q * X8_CS] = cvt_e4m3(v[q] * exp2i(-mx_exp(__uint_as_float(am[q]), 1.f / 448.f)));
+                    for (int q = 0; q < CH; q++) mq[q] = exp2i(-mx_exp(__uint_as_float(am[q]), 1.f / 448.f));
+#pragma unroll
+                    for (int q = 0; q < CH; q++) dst[q * X8_CS] = cvt_e4m3(v[q] * mq[q]);
                 }
                 if (tid < CH) { sxs[tid * 4 + slot] = (uint8_t)(mx_exp(__uint_as_float(am[tid]), 1.f / 448.f) + 127); amx[((pi + 1) & 1) * CH + tid] = 0u; }
             }
@@ -158,20 +169,32 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
                         for (int c = 0; c < BMo; c++) if (co0 + c >= Co) v[c] = 0.f;
                     }
                     const uint64_t vid0 = (((uint64_t)n * Co * D + oz) * H + oy) * (uint64_t)W + ox;   /* element id of channel 0; + c * D H W */
+                    /* in phases over the BMo channels (the block amaxes, the scales, then the rounding), so the channels' latency
+                       chains overlap; the SR test is outside the loops and the bias sums stay in registers */
+                    unsigned amc[BMo];
+#pragma unroll
+                    for (int c = 0; c < BMo; c++) amc[c] = __reduce_max_sync(0xffffffffu, __float_as_uint(v[c]) & 0x7fffffffu);
+                    int ec[BMo];
 #pragma unroll
                     for (int c = 0; c < BMo; c++) {
-                        const int e = mx_exp(__uint_as_float(__reduce_max_sync(0xffffffffu, __float_as_uint(v[c]) & 0x7fffffffu)), 1.f / 448.f);
-                        float q = v[c] * exp2i(-e);
-                        if (sp.sr) q = sr_e4m3(q, sr_hash(sp.sr, vid0 + (uint64_t)(co0 + c) * Sg));   /* same key as the per-block path */
-                        sg[c * G8_CS + row * 16 + xx] = cvt_e4m3(q);
-                        if (lane == 0) sgs[c * 8 + ks] = (uint8_t)(e + 127);
-                        if (do_bias) {
-                            float sm = v[c];
-#pragma unroll
-                            for (int o = 16; o; o >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, o);
-                            if (lane == 0) atomicAdd(&sbias[c], sm);
-                        }
+                        const unsigned u = __float_as_uint(__uint_as_float(amc[c]) * (1.f / 448.f));   /* mx_exp without its early return */
+                        const int e = max(-126, min(126, (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0)));
+                        ec[c] = (u & 0x7fffffffu) > 0x7f800000u ? 128 : e;
                     }
+                    if (sp.sr) {
+#pragma unroll
+                        for (int c = 0; c < BMo; c++)   /* same key as the per-block path */
+                            sg[c * G8_CS + row * 16 + xx] = cvt_e4m3(sr_e4m3(v[c] * exp2i(-ec[c]), sr_hash(sp.sr, vid0 + (uint64_t)(co0 + c) * Sg)));
+                    } else {
+#pragma unroll
+                        for (int c = 0; c < BMo; c++) sg[c * G8_CS + row * 16 + xx] = cvt_e4m3(v[c] * exp2i(-ec[c]));
+                    }
+                    if (lane == 0) {
+#pragma unroll
+                        for (int c = 0; c < BMo; c++) sgs[c * 8 + ks] = (uint8_t)(ec[c] + 127);
+                    }
+#pragma unroll
+                    for (int c = 0; c < BMo; c++) bpart[c] += v[c];
                 }
             }
         }
@@ -237,7 +260,17 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
             }
         }
     }
-    if (do_bias) { __syncthreads(); if (threadIdx.x < BMo && co0 + (int)threadIdx.x < Co) atomicAdd(&gb[co0 + threadIdx.x], sbias[threadIdx.x]); }
+    if (do_bias) {   /* the coop path's register partials (zero otherwise): one warp reduction per channel for the whole block */
+#pragma unroll
+        for (int c = 0; c < BMo; c++) {
+            float sm = bpart[c];
+#pragma unroll
+            for (int o = 16; o; o >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, o);
+            if (lane == 0 && sm != 0.f) atomicAdd(&sbias[c], sm);
+        }
+        __syncthreads();
+        if (threadIdx.x < BMo && co0 + (int)threadIdx.x < Co) atomicAdd(&gb[co0 + threadIdx.x], sbias[threadIdx.x]);
+    }
 #pragma unroll
     for (int kx = 0; kx < 3; kx++) {
         int tap = (kz * 3 + ky) * 3 + kx;
@@ -262,7 +295,8 @@ extern int g_f8w_coop;
 template <int MT, int NT, typename T, typename TG> static void launch_bw8(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC) {
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f8_k<MT, NT, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    conv_bwd_w_f8_k<MT, NT, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, g_f8w_coop);
+    const int coop = g_f8w_coop | ((g_f8w_coop & 4) && xs.c <= 8 && ys.c <= 16 ? 2 : 0);   /* bit 2: the cooperative gy path for the network input conv */
+    conv_bwd_w_f8_k<MT, NT, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, coop);
 }
 template <typename T, typename TG> void bwd_w_f8_t(const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
     int MT = ys.c >= 32 ? 2 : 1;
