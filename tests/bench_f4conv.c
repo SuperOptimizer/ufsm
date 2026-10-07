@@ -49,16 +49,19 @@ int main(int argc, char **argv) {
     const size_t S = (size_t)P * P * P;
     float *gam = rnd(256, 1.f, 4), *bet = rnd(256, 0.5f, 5), *mean = rnd(G, 0.1f, 6), *rstd = rnd(G, 0.1f, 7);
     double *osum = nn_malloc(2 * 64 * sizeof(double));
-    struct { const char *nm; int xb, ci, co, osplit, gn, stats, sr; } L[] = {
-        {"fwd 16 -> 16 (gn+silu, stats)", 4, 16, 16, 0, 1, 1, 0}, {"fwd 48 -> 16 (gn+silu, stats)", 4, 48, 16, 0, 1, 1, 0},
-        {"bdata 16 -> 16 (mx8, SR)", 3, 16, 16, 0, 0, 0, 1}, {"bdata 16 -> 32 + 16 (mx8, SR)", 3, 16, 48, 32, 0, 0, 1},
-        {"fwd 32 -> 32 (gn+silu, stats)", 4, 32, 32, 0, 1, 1, 0}, {"bdata 32 -> 32 (mx8, SR)", 3, 32, 32, 0, 0, 0, 1}, {"bdata 32 -> 64 + 32 (mx8, SR)", 3, 32, 96, 64, 0, 0, 1}};
+    struct { const char *nm; int xb, ci, co, osplit, gn, stats, sr, dv; } L[] = {
+        {"fwd 16 -> 16 (gn+silu, stats)", 4, 16, 16, 0, 1, 1, 0, 1}, {"fwd 48 -> 16 (gn+silu, stats)", 4, 48, 16, 0, 1, 1, 0, 1},
+        {"bdata 16 -> 16 (mx8, SR)", 3, 16, 16, 0, 0, 0, 1, 1}, {"bdata 16 -> 32 + 16 (mx8, SR)", 3, 16, 48, 32, 0, 0, 1, 1},
+        {"fwd 32 -> 32 (gn+silu, stats)", 4, 32, 32, 0, 1, 1, 0, 1}, {"bdata 32 -> 32 (mx8, SR)", 3, 32, 32, 0, 0, 0, 1, 1}, {"bdata 32 -> 64 + 32 (mx8, SR)", 3, 32, 96, 64, 0, 0, 1, 1},
+        {"fwd 64 -> 64 (gn+silu, stats) @P/2", 4, 64, 64, 0, 1, 1, 0, 2}, {"bdata 64 -> 64 (mx8, SR) @P/2", 3, 64, 64, 0, 0, 0, 1, 2},
+        {"bdata 64 -> 96 + 64 (mx8, SR) @P/2", 3, 64, 160, 96, 0, 0, 1, 2}};
     for (int l = 0; l < (int)(sizeof L / sizeof L[0]) && want("fwd"); l++) {
-        shape5 xs = {1, L[l].ci, P, P, P};
+        const int Pl = P / L[l].dv; const size_t Sl = (size_t)Pl * Pl * Pl;
+        shape5 xs = {1, L[l].ci, Pl, Pl, Pl};
         job j = {0};
-        j.x = mx(L[l].xb == 4 ? 4 : 8, L[l].ci, S, L[l].xb == 4 ? 2.f : 1e-3f, 11 + l); j.xb = L[l].xb; j.ci = L[l].ci; j.co = L[l].co; j.xs = xs; j.sr = L[l].sr;
+        j.x = mx(L[l].xb == 4 ? 4 : 8, L[l].ci, Sl, L[l].xb == 4 ? 2.f : 1e-3f, 11 + l); j.xb = L[l].xb; j.ci = L[l].ci; j.co = L[l].co; j.xs = xs; j.sr = L[l].sr;
         const int c1 = L[l].osplit ? L[l].osplit : L[l].co, c2 = L[l].co - c1, bits = L[l].xb == 4 ? 4 : 8;
-        const size_t by1 = bits == 4 ? lp_mx4_bytes(1, c1, S) : lp_mx8_bytes(1, c1, S), by2 = c2 ? (bits == 4 ? lp_mx4_bytes(1, c2, S) : lp_mx8_bytes(1, c2, S)) : 0;
+        const size_t by1 = bits == 4 ? lp_mx4_bytes(1, c1, Sl) : lp_mx8_bytes(1, c1, Sl), by2 = c2 ? (bits == 4 ? lp_mx4_bytes(1, c2, Sl) : lp_mx8_bytes(1, c2, Sl)) : 0;
         j.y = nn_malloc(by1); j.y2 = c2 ? nn_malloc(by2) : nullptr; j.osplit = L[l].osplit;
         float *w = rnd((size_t)L[l].co * L[l].ci * 27, 0.1f, 2), *b = L[l].osplit || L[l].sr ? nullptr : rnd(L[l].co, 0.1f, 3);
         j.w = w; j.b = b;
@@ -72,7 +75,7 @@ int main(int argc, char **argv) {
         run(&j, 0); nn_sync();
         const uint64_t h = fnv(j.y, by1) ^ (c2 ? fnv(j.y2, by2) * 31 : 0);
         double hs[2] = {0, 0}; if (L[l].stats) nn_d2h(hs, osum, sizeof hs);
-        printf("%-32s @%d %8.3f ms  out %016llx", L[l].nm, P, best, (unsigned long long)h);
+        printf("%-32s @%d %8.3f ms  out %016llx", L[l].nm, Pl, best, (unsigned long long)h);
         if (L[l].stats) printf("  stats %.9g %.9g", hs[0], hs[1]);
         printf("\n");
         nn_free((void *)j.x); nn_free(j.y); if (j.y2) nn_free(j.y2); nn_free(w); if (b) nn_free(b);
