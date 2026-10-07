@@ -287,6 +287,11 @@ template <int MT, int TZ, int NCH, typename T, typename TO> static void launch_f
     size_t scr = (size_t)8 * 256 * sizeof(float);
     if (IS_MX(TO) && scr < (size_t)512 + 8 * NR * 16 * (RBM + 1)) scr = (size_t)512 + 8 * NR * 16 * (RBM + 1);
     const size_t wst = (size_t)7 * BM * 32 + ((7 * BM * 2 + 15) & ~15);
+    if (IS_MX(TO) && MT % 2 == 0) {   /* the transposed MX epilogue (fwd_epi_mxt): whole rows when that adds <= 2 KB, else half rows */
+        const size_t s0 = scr > wst ? scr : wst;
+        if (s0 < FEPI_SCR(8)) scr = FEPI_SCR(8);
+        if (s0 < FEPI_SCR(16) && FEPI_SCR(16) <= s0 + 2048) scr = FEPI_SCR(16);
+    }
     const size_t smem = f4r_wa_off<MT, TZ, NCH>() + (scr > wst ? scr : wst);
     const int nzt = nblk_(xs.d, TZ);
     const size_t base = (size_t)nblk_(xs.w, 16) * nblk_(xs.h, 8) * xs.n;

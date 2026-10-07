@@ -549,6 +549,98 @@ __device__ __forceinline__ void mma_f4(float *c, const unsigned *a, const unsign
 /* ======================= weights: wq[tap][Cop][Cip] e4m3, ws[tap][Cop][Cip/32] ue8m0 ======================= */
 __global__ void prep_w8_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx = -1, int CxP = 0, int Ox = -1, int OxP = 0);   /* defined in lp_f8fwd.cu */
 
+/* MX output of fwd_epilogue when every 32-channel tile is one stored 32-channel block: a warp passes each row (HV 16) or half
+   row (HV 8) of 16 output voxels, per 32-channel block, through an [HV][36] fp32 buffer tb (per warp, after 512 bytes of
+   statistics), so a lane holds 32 / (32 / HV) channels of one voxel: the block amax is one or two shuffles away, the voxels go
+   out as contiguous 4 .. 16-byte stores and the GN statistics are lane-per-channel sums over the buffer (rewritten with the
+   decoded stored values under stored_stats) into cs. Stored bytes as the per-lane paths (same values, amax and conversions);
+   statistics summed in another order. FEPI_SCR(HV): the scratch bytes it needs. */
+#define FEPI_SCR(HV) (512u + 8u * (HV) * 36u * 4u)
+template <int HV, int MT, int NR, typename T>
+__device__ __forceinline__ void fwd_epi_mxt(float (&acc)[MT][NR][2][4], float *tb, float *cs, T *y, const float *b, int n, int co0, int Co, int D, int H, int W,
+                                            int oz0, int oy0, int ox0, int wz, int wr, bool stats, const split_t &sp, int N, int zs0, int zs1) {
+    constexpr int B = MX_BITS(T), RBM = 32 * B / 8, LPV = 32 / HV, CPL = 32 / LPV, NW = CPL * B / 32, RZ = NR / 2, BM = MT * 16;
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, vx = lane / LPV, qd = lane % LPV;
+    const size_t S = (size_t)D * H * W;
+    const bool sst = stats && sp.stored_stats;
+    const int OxP = sp.y2 ? (sp.o_split + 31) / 32 * 32 : Co;
+    tb += (threadIdx.x >> 5) * HV * 36;
+    float bias[MT][2];
+#pragma unroll
+    for (int m = 0; m < MT; m++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) { const int co = co0 + m * 16 + g + 8 * h; bias[m][h] = b && !sp.y2 && co < Co ? b[co] : 0.f; }
+    float ps[MT / 2], pss[MT / 2];
+#pragma unroll
+    for (int jb = 0; jb < MT / 2; jb++) { ps[jb] = 0.f; pss[jb] = 0.f; }
+#pragma unroll
+    for (int r = 0; r < NR; r++) {
+        const int oz = oz0 + wz * RZ + (r >> 1), oy = oy0 + wr + (r & 1);
+        if (oz >= D || oy >= H) continue;   /* warp-uniform */
+        const bool zst = oz >= zs0 && oz < zs1;
+#pragma unroll
+        for (int jb = 0; jb < MT / 2; jb++) {
+            const int cp = co0 + 32 * jb, sec = sp.y2 && cp >= OxP, Ct = !sp.y2 ? Co : sec ? Co - sp.o_split : sp.o_split, cl = sec ? cp - OxP : cp;
+            if (cl >= Ct) continue;   /* pure padding */
+            const int blk = cl / 32, nbt = mx_nb(Ct);
+            uint8_t *qt = sec ? (uint8_t *)sp.y2 : (uint8_t *)y;
+#pragma unroll
+            for (int ps2 = 0; ps2 < 16 / HV; ps2++) {   /* HV 8: voxels 8 ps2 .. 8 ps2 + 7 of the row */
+#pragma unroll
+                for (int q2 = 0; q2 < 2; q2++) {
+                    if (HV == 8 && q2 != ps2) continue;
+#pragma unroll
+                    for (int mm = 0; mm < 2; mm++)
+#pragma unroll
+                        for (int k = 0; k < 4; k++) tb[((HV == 16 ? 8 * q2 : 0) + 2 * t + (k & 1)) * 36 + mm * 16 + g + 8 * (k >> 1)] = acc[2 * jb + mm][r][q2][k] + bias[2 * jb + mm][k >> 1];
+                }
+                __syncwarp();
+                float v[CPL], am = 0.f;
+#pragma unroll
+                for (int k = 0; k < CPL / 4; k++) { const float4 f = *(const float4 *)(tb + vx * 36 + CPL * qd + 4 * k); v[4 * k] = f.x; v[4 * k + 1] = f.y; v[4 * k + 2] = f.z; v[4 * k + 3] = f.w; }
+#pragma unroll
+                for (int k = 0; k < CPL; k++) am = fmaxf(am, fabsf(v[k]));
+#pragma unroll
+                for (int o = 1; o < LPV; o <<= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+                const int e = mx_exp(am, mxf<B>::inv_qmax);
+                const float mult = exp2i(-e), sc = exp2i(e);
+                const size_t ri = ((size_t)n * nbt + blk) * S + ((size_t)oz * H + oy) * W + ox0 + 8 * ps2 + vx;
+                unsigned wq[NW];
+#pragma unroll
+                for (int k = 0; k < NW; k++) wq[k] = mxf<B>::enc8x(v + (32 / B) * k, mult);
+                uint8_t *dst = qt + ri * RBM + (CPL * B / 8) * qd;
+                if constexpr (NW == 4) *(uint4 *)dst = make_uint4(wq[0], wq[1], wq[2], wq[3]);
+                else if constexpr (NW == 2) *(uint2 *)dst = make_uint2(wq[0], wq[1]);
+                else *(unsigned *)dst = wq[0];
+                if (!qd) (qt + (size_t)N * nbt * S * RBM)[ri] = (uint8_t)(e + 127);
+                if (stats && zst) {
+                    if (sst) {   /* the decoded stored values */
+#pragma unroll
+                        for (int k = 0; k < NW; k++) {
+                            if constexpr (B == 4) {
+#pragma unroll
+                                for (int c = 0; c < 4; c++) { const float2 d = dec_e2m1x2((wq[k] >> (8 * c)) & 255u); v[8 * k + 2 * c] = d.x * sc; v[8 * k + 2 * c + 1] = d.y * sc; }
+                            } else {
+                                const float2 d0 = dec_e4m3x2((unsigned short)(wq[k] & 0xffffu)), d1 = dec_e4m3x2((unsigned short)(wq[k] >> 16));
+                                v[4 * k] = d0.x * sc; v[4 * k + 1] = d0.y * sc; v[4 * k + 2] = d1.x * sc; v[4 * k + 3] = d1.y * sc;
+                            }
+                        }
+                        __syncwarp();
+#pragma unroll
+                        for (int k = 0; k < CPL / 4; k++) *(float4 *)(tb + vx * 36 + CPL * qd + 4 * k) = make_float4(v[4 * k], v[4 * k + 1], v[4 * k + 2], v[4 * k + 3]);
+                    }
+                    __syncwarp();
+#pragma unroll
+                    for (int k = 0; k < HV; k++) { const float x = tb[k * 36 + lane]; ps[jb] += x; pss[jb] += x * x; }
+                }
+                __syncwarp();   /* the buffer is reused by the next (half) row */
+            }
+        }
+    }
+    if (stats)
+#pragma unroll
+        for (int jb = 0; jb < MT / 2; jb++) { atomicAdd(&cs[32 * jb + lane], ps[jb]); atomicAdd(&cs[BM + 32 * jb + lane], pss[jb]); }
+}
 /* Forward epilogue straight from the accumulators: bias, optional accumulate into y (sp.accum), channel-split
    output (sp.y2), optional GroupNorm statistics of the output (osum, per (n, group) sums reduced in smem). Warp row r
    of NR maps to z = oz0 + wz * NR/2 + r/2, y = oy0 + wr + r%2. */
@@ -561,8 +653,25 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
     const int zs0 = sp.zlo, zs1 = D - sp.zhi;   /* statistics over the z planes this GPU owns (spatial split) */
     float *cs = (float *)smem_raw;
     if (osum) { __syncthreads(); for (int i = threadIdx.x; i < 2 * BM; i += blockDim.x) cs[i] = 0.f; __syncthreads(); }
-    bool mx_done = false;
-    if constexpr (IS_MX(T) && FST) {
+    bool mx_done = false, st_done = false;
+    if constexpr (IS_MX(T) && FST && MT % 2 == 0) {
+        unsigned dsm; asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dsm));
+        const int OxP = sp.y2 ? (sp.o_split + 31) / 32 * 32 : Co;
+        bool fit = (W & 15) == 0 && blockDim.x == 256 && dsm >= scr_off + FEPI_SCR(8) && (co0 & 31) == 0 && !(osum && !sp.stored_stats && sp.y2 && b);
+#pragma unroll
+        for (int jb = 0; jb < MT / 2; jb++) {   /* block-uniform: each 32-channel tile a whole 32-wide block (or pure padding) */
+            const int cp = co0 + 32 * jb, sec = sp.y2 && cp >= OxP, Ct = !sp.y2 ? Co : sec ? Co - sp.o_split : sp.o_split, cl = sec ? cp - OxP : cp;
+            if (cl < Ct && mx_bw(Ct) != 32) fit = false;
+        }
+        if (fit) {
+            __syncthreads();   /* every warp is past its MMA loop: the scratch (weight stage) is free */
+            float *tb = (float *)(smem_raw + 512);
+            if (dsm >= scr_off + FEPI_SCR(16)) fwd_epi_mxt<16>(acc, tb, cs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
+            else fwd_epi_mxt<8>(acc, tb, cs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
+            mx_done = st_done = true;
+        }
+    }
+    if constexpr (IS_MX(T) && FST) if (!mx_done) {
         /* MX output through shared memory: per output block (a 16- or 32-row channel block of the output tensor, or of the
            second tensor of a split output), the quantised rows and scales of the warp's NR x 16 voxels are assembled in a
            per-warp buffer and written as 16-byte chunks (a row of 16 voxels is contiguous: 16 x 8 .. 32 bytes) instead of
@@ -718,6 +827,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                 }
         }
     }
+    if (!st_done)
 #pragma unroll
     for (int m = 0; m < MT; m++)
 #pragma unroll
