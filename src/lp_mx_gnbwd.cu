@@ -62,11 +62,14 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, 
     if ((int)threadIdx.x < kmax) { const size_t c = (size_t)n * C + blk * bw + h0 + threadIdx.x, o = ((size_t)blockIdx.x * N * C + c) * 2; part[o] = s1[threadIdx.x]; part[o + 1] = s2[threadIdx.x]; }
 }
 __global__ void gn_part_sum_k(const float *part, int nsl, int NC, double *ds) {   /* ds[2 c + j] = sum over slabs (double) */
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    /* a warp per output: lanes stride over the slabs (up to 1024: one thread walking them serially in fp64 took 0.1 ms per call) */
+    const int i = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5), lane = threadIdx.x & 31;
     if (i >= 2 * NC) return;
     double a = 0.0;
-    for (int sl = 0; sl < nsl; sl++) a += (double)part[(size_t)sl * 2 * NC + i];
-    ds[i] = a;
+    for (int sl = lane; sl < nsl; sl += 32) a += (double)part[(size_t)sl * 2 * NC + i];
+#pragma unroll
+    for (int o = 16; o; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+    if (lane == 0) ds[i] = a;
 }
 template <int B, typename TG, typename TO>
 __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx_k(const uint8_t *x, const TG *gy, const float *gamma, const float *beta, const float *mean, const float *rstd,
@@ -132,7 +135,7 @@ extern "C" void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const
     if (xdt == 4) GBS(4); else GBS(8);
 #undef GBS
 #undef GBS2
-    gn_part_sum_k<<<nblk_((size_t)2 * NC, 128), 128>>>(part, (int)slabs, NC, ds);
+    gn_part_sum_k<<<nblk_((size_t)2 * NC * 32, 256), 256>>>(part, (int)slabs, NC, ds);
     (void)st; (void)AB;
     LPCK();
 }

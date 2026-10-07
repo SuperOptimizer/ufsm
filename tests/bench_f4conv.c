@@ -35,7 +35,7 @@ static void run(job *j, unsigned it) {
     if (j->osum) nn_zero(j->osum, 2 * 64 * sizeof(double));
     lp_conv_fwd_f4(j->x, j->xb, j->xs, j->w, j->b, j->co, j->y, j->xb, j->gp, j->osum, j->Go, sp);
 }
-/* BENCH_ONLY: comma list of sections to run (fwd, f8fwd, wgrad, up, f8w, s2b, up2; default all); BENCH_WL: one wgrad case index */
+/* BENCH_ONLY: comma list of sections to run (fwd, f8fwd, wgrad, up, gnbwd, f8w, s2b, up2; default all); BENCH_WL: one wgrad case index */
 static int want(const char *key) {
     const char *o = getenv("BENCH_ONLY");
     if (!o) return 1;
@@ -131,6 +131,26 @@ int main(int argc, char **argv) {
             float *h = malloc(nw * 4); nn_d2h(h, gw, nw * 4); double a = 0; for (size_t i = 0; i < nw; i++) a += fabs(h[i]); free(h);
             printf("%-32s @%d %8.3f ms  |gw| %.9g\n", UL[l].nm, Pl, best, a);
             nn_free(xc); nn_free(xk); nn_free(gy); nn_free(gw); nn_free(gb);
+        }
+    }
+    if (want("gnbwd")) {   /* GroupNorm+SiLU backward on the training storage: MX-fp4 x, MX-fp8 gy / gx (16 ch at P, 32 at P / 2) */
+        for (int k = 0; k < 2; k++) {
+            const int C = k ? 32 : 16, Pl = k ? P / 2 : P; const size_t Sl = (size_t)Pl * Pl * Pl;
+            shape5 s = {1, C, Pl, Pl, Pl};
+            void *x = mx(4, C, Sl, 2.f, 81 + k), *gy = mx(8, C, Sl, 1e-3f, 83 + k);
+            const size_t b8 = lp_mx8_bytes(1, C, Sl);
+            void *gx = nn_malloc(b8);
+            nn_set_storage(x, lp_mx4_bytes(1, C, Sl), 4); nn_set_storage(gy, b8, 8); nn_set_storage(gx, b8, 8);
+            float *gm = rnd(C, 1.f, 85), *bt = rnd(C, 0.5f, 86), *gg = nn_malloc(C * 4), *gb2 = nn_malloc(C * 4), *scr = nn_malloc(nn_gn_scratch(s) + 4096);
+            nn_set_prec(3);
+            double best = 1e9;
+            for (int it = 0; it < 10; it++) {
+                nn_sync(); double t0 = now(); nn_gn_silu_bwd(x, s, G, gm, bt, mean, rstd, gy, gx, gg, gb2, scr); nn_sync();
+                if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+            }
+            printf("%-32s @%d %8.3f ms  out %016llx\n", k ? "gn+silu bwd 32 ch (mx4 x, mx8 g) @P/2" : "gn+silu bwd 16 ch (mx4 x, mx8 g)", Pl, best, (unsigned long long)fnv(gx, b8));
+            nn_storage_forget(x); nn_storage_forget(gy); nn_storage_forget(gx);
+            nn_free(x); nn_free(gy); nn_free(gx); nn_free(gm); nn_free(bt); nn_free(gg); nn_free(gb2); nn_free(scr);
         }
     }
     if (want("f8w")) {   /* fp8 weight gradients at level 0: down0 (stride 2, MX-fp4 x level 0 -> MX-fp8 gy level 1, 16 -> 16) and the stem
