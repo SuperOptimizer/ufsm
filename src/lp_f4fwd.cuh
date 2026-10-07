@@ -176,24 +176,30 @@ static int wmemo_get(unsigned key, const float *w, int Cop, int Cip, int Cx, int
    block: max over the two positions, so each position is quantised once per pair it belongs to), A scales one per (row, co,
    32-K block). Weights wq4p[r][Cop][32 B], ws[r][Cop][2]. Staging shared with the fp8 version (stage_row16). */
 __global__ void prep_w4p_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Ox, int OxP, int Cs = -1, int cofs = 0);   /* defined in lp_f4fwd.cu */
+/* the epilogue scratch of conv_fwd_f4p_k: after its ring and tables, so the halo planes survive into the next z tile */
+template <int MT, int TZ> __host__ __device__ constexpr unsigned f4p_scr_off() {
+    constexpr int BM = MT * 16, TT = (TZ + 2) * 180;
+    return (unsigned)((TT * 16 + ((TT + 127) & ~127) + 9 * BM * 32 + ((9 * BM * 2 + 15) & ~15) + 32 * 32 + TT * 4 + 127) & ~127);
+}
 template <int MT, int TZ, typename T, typename TO>
 __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                       const float *__restrict__ b, TO *__restrict__ y,
-                                                      int N, int Ci, int D, int H, int W, int Co, int Cop, gnp_t gp, double *__restrict__ osum, int Go, split_t sp) {
-    constexpr int BM = MT * 16, RZ = TZ / 2, NR = 2 * RZ, NROW = (TZ + 2) * 10, TT = NROW * 18;
+                                                      int N, int Ci, int D, int H, int W, int Co, int Cop, gnp_t gp, double *__restrict__ osum, int Go, split_t sp, int ZC) {
+    constexpr int BM = MT * 16, RZ = TZ / 2, NR = 2 * RZ, NP = TZ + 2, TT = NP * 180;
     extern __shared__ __align__(128) unsigned char smem_raw[];
-    uint8_t *sx = smem_raw;                    /* [TT pos][16 B] = [pos | pos + 1] */
+    uint8_t *sx = smem_raw;                    /* [NP slots x 180 pos][16 B] = [pos | pos + 1]; input plane gz in slot (gz + 1) % NP */
     uint8_t *sxs = sx + TT * 16;               /* [TT] pair scales */
     uint8_t *wa = sxs + ((TT + 127) & ~127);   /* [9 r][BM co][32 B] swizzled */
     unsigned short *was = (unsigned short *)(wa + 9 * BM * 32);   /* [9][BM] (byte 0 block 0, byte 1 block 1) */
     chan_t *ctab = (chan_t *)(wa + 9 * BM * 32 + ((9 * BM * 2 + 15) & ~15));   /* [32] */
     unsigned *pam = (unsigned *)(ctab + 32);    /* [TT] per-position amax (bits) */
+    unsigned char *scr = smem_raw + f4p_scr_off<MT, TZ>();   /* epilogue scratch */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int wz = warp >> 2, wr = (warp & 3) * 2;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * 8;
     int bz = blockIdx.z;
-    const int nzt = (D + TZ - 1) / TZ;
-    const int oz0 = (bz % nzt) * TZ; bz /= nzt;
+    const int nzt = (D + TZ - 1) / TZ, nzc = (nzt + ZC - 1) / ZC;
+    const int zc = bz % nzc; bz /= nzc;
     const int nmt = Cop / BM;
     const int co0 = (bz % nmt) * BM; const int n = bz / nmt;
     const size_t plane = (size_t)D * H * W;
@@ -205,31 +211,37 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
     for (int i = threadIdx.x; i < 9 * BM; i += 256) { const size_t o = ((size_t)(i / BM) * Cop + co0 + i % BM) * 2; was[i] = (unsigned short)(wsc[o] | (wsc[o + 1] << 8)); }
     if (threadIdx.x < 32) ctab[threadIdx.x] = make_chan(threadIdx.x < 16 ? (int)threadIdx.x : -1, Ci, Ci, n, plane, x, sp, gp, N);
     __syncthreads();
+    const chan_t c0 = ctab[0];
+    float2 gab[16];
+#pragma unroll
+    for (int k = 0; k < 16; k++) gab[k] = make_float2(ctab[k].a, ctab[k].b);
+    /* z tiles of TZ output planes: the block walks ZC of them; tile oz0 reads input planes oz0 - 1 .. oz0 + TZ, of which the
+       first two are the previous tile's last two (kept in the ring), so after the first tile only TZ planes are staged */
+    for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
+    const int oz0 = tz * TZ, p0 = tz == zc * ZC ? 0 : 2, npos = (NP - p0) * 180;   /* tile planes p0 .. NP - 1 are new */
+    __syncthreads();   /* the previous tile's MMA has read the slots about to be replaced */
     {   /* staging: thread per position, values kept in registers; pair p = [p | p + 1] is quantised with its own scale
            s_p = amax over both positions (the MX 32-element block of the mma), so every position is quantised twice: low half
            of pair p with s_p, high half of pair p - 1 with s_(p-1) */
         constexpr int NIT = (TT + 255) / 256;
-        const chan_t c0 = ctab[0];
-        float2 gab[16];
-#pragma unroll
-        for (int k = 0; k < 16; k++) gab[k] = make_float2(ctab[k].a, ctab[k].b);
         float v[NIT][16];
 #pragma unroll
         for (int it = 0; it < NIT; it++) {
-            const int pos = threadIdx.x + 256 * it, row = pos / 18, ix = pos - 18 * row;
-            const int gz = oz0 - 1 + row / 10, gy = oy0 - 1 + row % 10, gx = ox0 - 1 + ix;
-            const bool inb = pos < TT && gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W;
+            const int li = threadIdx.x + 256 * it, pl = p0 + li / 180, rem = li % 180, row = rem / 18, ix = rem - 18 * row;
+            const int gz = oz0 - 1 + pl, gy = oy0 - 1 + row, gx = ox0 - 1 + ix, spos = ((gz + 1) % NP) * 180 + rem;
+            const bool inb = li < npos && gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W;
             stage_row16<T>(c0, Ci, plane, inb ? ((size_t)gz * H + gy) * W + gx : 0, inb, G, gab, v[it]);
             unsigned am = 0u;
 #pragma unroll
             for (int k = 0; k < 16; k++) am = amax_u(am, v[it][k]);
-            if (pos < TT) pam[pos] = am;
+            if (li < npos) pam[spos] = am;
         }
         __syncthreads();
 #pragma unroll
         for (int it = 0; it < NIT; it++) {
-            const int pos = threadIdx.x + 256 * it, row = pos / 18, ix = pos - 18 * row;
-            if (pos >= TT) break;
+            const int li = threadIdx.x + 256 * it, pl = p0 + li / 180, rem = li % 180, row = rem / 18, ix = rem - 18 * row;
+            if (li >= npos) break;
+            const int gz = oz0 - 1 + pl, pos = ((gz + 1) % NP) * 180 + rem;
             const unsigned a0 = pam[pos], an = ix < 17 ? pam[pos + 1] : 0u, ap = ix ? pam[pos - 1] : 0u;
             const int e = mx_exp(__uint_as_float(max(a0, an)), 1.f / 6.f), ep = mx_exp(__uint_as_float(max(a0, ap)), 1.f / 6.f);
             const float m = exp2i(-e), mp = exp2i(-ep);
@@ -237,7 +249,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
             uint2 lo, hi;
             if (sp.sr) {   /* gradient operand: exact stochastic rounding keyed by the element (each copy with its own scale, the same
                               uniform): one hash and three remixes per 8 values, the nibbles straight from the rounding */
-                const int gz = oz0 - 1 + row / 10, gy = oy0 - 1 + row % 10, gx = ox0 - 1 + ix;
+                const int gy = oy0 - 1 + row, gx = ox0 - 1 + ix;
                 const uint64_t vid = (((uint64_t)n * D + gz) * H + gy) * (uint64_t)W + gx;
                 uint32_t ha[4], hb[4];
                 sr_hash4(sp.sr, vid * 2, ha); sr_hash4(sp.sr, vid * 2 + 1, hb);
@@ -264,7 +276,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
         unsigned bfr[NR][4], sb[NR][2];
 #pragma unroll
         for (int r = 0; r < NR; r++) {
-            const int rowi = (wz * RZ + (r >> 1) + kz) * 10 + wr + (r & 1) + ky;
+            const int rowi = ((oz0 + wz * RZ + (r >> 1) + kz) % NP) * 10 + wr + (r & 1) + ky;   /* the tile plane's ring slot */
             ldsm_x4(bfr[r], sx + (rowi * 18 + vx + 2 * kb) * 16);   /* block 0: [x | x+1], block 1: [x+2 | x+3] */
 #pragma unroll
             for (int q2 = 0; q2 < 2; q2++) { const int pc = rowi * 18 + q2 * 8 + g; sb[r][q2] = (unsigned)sxs[pc] | ((unsigned)sxs[pc + 2] << 8); }   /* column g: pair scales */
@@ -279,15 +291,27 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
             for (int r = 0; r < NR; r++) { mma_f4(acc[m][r][0], af, bfr[r], sa, sb[r][0]); mma_f4(acc[m][r][1], af, bfr[r] + 2, sa, sb[r][1]); }
         }
     }
-    fwd_epilogue<MT, NR, TO, true>(acc, smem_raw, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N);
+    fwd_epilogue<MT, NR, TO, true>(acc, scr, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N, f4p_scr_off<MT, TZ>());
+    }
 }
-template <int MT, int TZ, typename T, typename TO> void launch_f4p(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, gnp_t gp, double *osum, int Go, split_t sp) {
-    constexpr int TT = (TZ + 2) * 180, BM = MT * 16, NROW = (TZ + 2) * 10;
-    size_t smem = (size_t)TT * 16 + ((TT + 127) & ~127) + 9 * BM * 32 + ((9 * BM * 2 + 15) & ~15) + 32 * sizeof(chan_t) + TT * 4;
-    if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
+template <int MT, int TZ, typename T, typename TO> void launch_f4p(dim3, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, gnp_t gp, double *osum, int Go, split_t sp) {
+    constexpr int BM = MT * 16, RZ = TZ / 2, NR = 2 * RZ;
+    constexpr int RBM = IS_MX(TO) ? 32 * MX_BITS(TO) / 8 : 0;   /* the epilogue's MX smem store path: 512 + 8 warps x NR x 16 x (RBM + 1) */
+    size_t scr = (size_t)8 * 256 * sizeof(float);
+    if (IS_MX(TO) && scr < (size_t)512 + 8 * NR * 16 * (RBM + 1)) scr = (size_t)512 + 8 * NR * 16 * (RBM + 1);
+    const size_t smem = f4p_scr_off<MT, TZ>() + scr;
+    (void)BM;
+    /* z tiles per block: the ring saves 2 of TZ + 2 staged planes per tile after the first; keep >= 4 blocks per SM-pair of waves */
+    const int nzt = nblk_(xs.d, TZ), nmt = Cop / BM;
+    const size_t base = (size_t)nblk_(xs.w, 16) * nblk_(xs.h, 8) * nmt * xs.n;
+    static int zc_env = -2;
+    if (zc_env == -2) zc_env = getenv("UFSM_F4P_ZC") ? atoi(getenv("UFSM_F4P_ZC")) : -1;
+    int ZC = zc_env > 0 ? zc_env : nzt < 8 ? nzt : 8;
+    while (ZC > 1 && base * nblk_(nzt, ZC) < 480) ZC--;
+    const dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(nblk_(nzt, ZC) * nmt * xs.n));   /* (the caller's grid argument is unused) */
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4p_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    conv_fwd_f4p_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp);
+    conv_fwd_f4p_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp, ZC);
 }
 static int wmemo_get(unsigned key, const float *w, int Cop, int Cip, int Cx, int CxP, int Ox, int OxP, size_t nq, size_t ns, uint8_t **wq, uint8_t **ws, int slot = 2);
 template <typename T, typename TO> static void p16_f4(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, int Cop, int Ox, int OxP, gnp_t gp, double *osum, int Go, split_t sp) {
@@ -301,15 +325,15 @@ template <typename T, typename TO> static void p16_f4(const void *x, shape5 xs, 
     if (tz_env < 0) tz_env = getenv("UFSM_F4_TZ") ? atoi(getenv("UFSM_F4_TZ")) : 0;
     int TZ = tz_env ? tz_env : (MT <= 2 && xs.d >= 16 ? 4 : 2);
     if (MT == 4) TZ = 2;
-    dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(nblk_(xs.d, TZ) * nmt * xs.n));
+    (void)nmt;
     switch (MT * 10 + TZ) {
-    case 12: launch_f4p<1, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
-    case 14: launch_f4p<1, 4, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
-    case 22: launch_f4p<2, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
-    case 24: launch_f4p<2, 4, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
-    case 32: launch_f4p<3, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
-    case 34: launch_f4p<3, 4, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
-    default: launch_f4p<4, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    case 12: launch_f4p<1, 2, T, TO>(dim3(), x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    case 14: launch_f4p<1, 4, T, TO>(dim3(), x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    case 22: launch_f4p<2, 2, T, TO>(dim3(), x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    case 24: launch_f4p<2, 4, T, TO>(dim3(), x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    case 32: launch_f4p<3, 2, T, TO>(dim3(), x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    case 34: launch_f4p<3, 4, T, TO>(dim3(), x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
+    default: launch_f4p<4, 2, T, TO>(dim3(), x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     }
 }
 template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp) {

@@ -554,7 +554,8 @@ __global__ void prep_w8_k(const float *__restrict__ w, uint8_t *__restrict__ wq,
    of NR maps to z = oz0 + wz * NR/2 + r/2, y = oy0 + wr + r%2. */
 template <int MT, int NR, typename T, bool FST = false>   /* FST: try the shared-memory MX store path (checks its own requirements) */
 __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigned char *smem_raw, T *y, const float *b, int n, int co0, int Co,
-                                             int D, int H, int W, int oz0, int oy0, int ox0, int wz, int wr, double *osum, int Go, const split_t &sp, int N = 0) {
+                                             int D, int H, int W, int oz0, int oy0, int ox0, int wz, int wr, double *osum, int Go, const split_t &sp, int N = 0,
+                                             unsigned scr_off = 0) {   /* smem_raw: the scratch, scr_off bytes into the dynamic smem */
     constexpr int BM = MT * 16, RZ = NR / 2;
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int zs0 = sp.zlo, zs1 = D - sp.zhi;   /* statistics over the z planes this GPU owns (spatial split) */
@@ -569,7 +570,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
            Needs W % 16 == 0 (16-byte alignment) and the kernel's dynamic smem to hold 512 + 8 warps x NR x 16 x 33 bytes. */
         constexpr int B = MX_BITS(T), RBM = 32 * B / 8, WBUF = NR * 16 * (RBM + 1);
         unsigned dsm; asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dsm));
-        if ((W & 15) == 0 && blockDim.x == 256 && dsm >= 512u + 8u * WBUF) {
+        if ((W & 15) == 0 && blockDim.x == 256 && dsm >= scr_off + 512u + 8u * WBUF) {
             const int warp = threadIdx.x >> 5;
             const size_t S = (size_t)D * H * W;
             const int OxP = sp.y2 ? (sp.o_split + 31) / 32 * 32 : Co;
