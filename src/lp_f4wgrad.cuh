@@ -628,7 +628,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
    544 threads give 120 registers each, so the accumulators stay in registers. Same values and summation order as
    conv_bwd_w_f4_k with gpre: identical weight gradients. ---- */
 #define WS_NC 9            /* consumer (MMA) warps */
-#define WS_NP 8            /* producer warps */
+#define WS_NP 12           /* producer warps */
 #define WS_NT ((WS_NC + WS_NP) * 32)
 #define WS_PS 432          /* x bytes per (channel, plane slot): LY 1, 9 row pairs x 2 rows x 24 B */
 #define WS_CS 2640         /* per channel: 6 slots x 432 B + 48 (660 words == 20 mod 32, as X4_CS) */
