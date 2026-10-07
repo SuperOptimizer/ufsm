@@ -35,7 +35,7 @@ static void run(job *j, unsigned it) {
     if (j->osum) nn_zero(j->osum, 2 * 64 * sizeof(double));
     lp_conv_fwd_f4(j->x, j->xb, j->xs, j->w, j->b, j->co, j->y, j->xb, j->gp, j->osum, j->Go, sp);
 }
-/* BENCH_ONLY: comma list of sections to run (fwd, f8fwd, wgrad, up, gnbwd, f8w, s2b, up2; default all); BENCH_WL: one wgrad case index */
+/* BENCH_ONLY: comma list of sections to run (fwd, upfwd, f8fwd, wgrad, up, gnbwd, f8w, s2b, up2; default all); BENCH_WL: one wgrad case index */
 static int want(const char *key) {
     const char *o = getenv("BENCH_ONLY");
     if (!o) return 1;
@@ -47,7 +47,7 @@ int main(int argc, char **argv) {
     const int P = argc > 1 ? atoi(argv[1]) : 384, G = 8;
     nn_init(0); nn_set_f16(1);
     const size_t S = (size_t)P * P * P;
-    float *gam = rnd(192, 1.f, 4), *bet = rnd(192, 0.5f, 5), *mean = rnd(G, 0.1f, 6), *rstd = rnd(G, 0.1f, 7);
+    float *gam = rnd(256, 1.f, 4), *bet = rnd(256, 0.5f, 5), *mean = rnd(G, 0.1f, 6), *rstd = rnd(G, 0.1f, 7);
     double *osum = nn_malloc(2 * 64 * sizeof(double));
     struct { const char *nm; int xb, ci, co, osplit, gn, stats, sr; } L[] = {
         {"fwd 16 -> 16 (gn+silu, stats)", 4, 16, 16, 0, 1, 1, 0}, {"fwd 48 -> 16 (gn+silu, stats)", 4, 48, 16, 0, 1, 1, 0},
@@ -76,6 +76,22 @@ int main(int argc, char **argv) {
         printf("\n");
         nn_free((void *)j.x); nn_free(j.y); if (j.y2) nn_free(j.y2); nn_free(w); if (b) nn_free(b);
     }
+    if (want("upfwd")) {   /* decoder conv1 forward as dec0.c1 trains: [up2(silu(gn(coarse a2))) | silu(gn(skip a2))] staged in the kernel,
+                              MX-fp4 out with GN statistics (32 + 16 -> 16 at P) */
+        const int Pc = P / 2; const size_t Sc = (size_t)Pc * Pc * Pc;
+        shape5 xs = {1, 48, P, P, P};
+        void *xc = mx(4, 32, Sc, 2.f, 91), *xk = mx(4, 16, S, 2.f, 92), *y = nn_malloc(lp_mx4_bytes(1, 16, S));
+        float *w = rnd((size_t)16 * 48 * 27, 0.1f, 93), *b = rnd(16, 0.1f, 94);
+        double best = 1e9;
+        for (int it = 0; it < 10; it++) {
+            split_t sp = {0}; sp.up = 1; sp.x2 = xk; sp.c_split = 32; sp.gp2 = (gnp_t){gam, bet, mean, rstd, G}; sp.stored_stats = 1;
+            nn_zero(osum, 2 * 64 * sizeof(double));
+            nn_sync(); double t0 = now(); lp_conv_fwd_f4(xc, 4, xs, w, b, 16, y, 4, (gnp_t){gam + 64, bet + 64, mean, rstd, G}, osum, G, sp); nn_sync();
+            if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+        }
+        printf("%-32s @%d %8.3f ms  out %016llx\n", "fwd up 32 + 16 -> 16 (dec0.c1)", P, best, (unsigned long long)fnv(y, lp_mx4_bytes(1, 16, S)));
+        nn_free(xc); nn_free(xk); nn_free(y); nn_free(w); nn_free(b);
+    }
     if (want("f8fwd")) {   /* the same 16 -> 16 / 48 -> 16 forwards on the fp8 kernel (MX-fp4 storage, fp8 compute) */
         for (int ci = 16; ci <= 48; ci += 32) {
             shape5 xs = {1, ci, P, P, P}; void *x = mx(4, ci, S, 2.f, 61 + ci), *y = nn_malloc(lp_mx4_bytes(1, 16, S));
@@ -92,7 +108,8 @@ int main(int argc, char **argv) {
     }
     /* weight gradient (fp4, the --fp4 2 recipe): MX-fp4 x with GN+SiLU in staging, MX-fp8 gy with SR, bias */
     struct { const char *nm; int ci, co, dv; } WL[] = {{"wgrad 16 -> 16 (gn+silu, SR)", 16, 16, 1}, {"wgrad 48 -> 16 (gn+silu, SR)", 48, 16, 1}, {"wgrad 32 -> 32 (gn+silu, SR) @P/2", 32, 32, 2},
-                                                  {"wgrad 128 -> 32 (gn+silu, SR) @P/2", 128, 32, 2}, {"wgrad 96 -> 96 (gn+silu, SR) @P/4", 96, 96, 4}};
+                                                  {"wgrad 128 -> 32 (gn+silu, SR) @P/2", 128, 32, 2}, {"wgrad 96 -> 96 (gn+silu, SR) @P/4", 96, 96, 4},
+                                                  {"wgrad 224 -> 96 (gn+silu, SR) @P/4", 224, 96, 4}, {"wgrad 128 -> 128 (gn+silu, SR) @P/8", 128, 128, 8}};
     if (getenv("BENCH_GYPRE")) lp_set_f4w_gypre_kb(atoi(getenv("BENCH_GYPRE")));   /* KiB > 0: force the gy pre-pass (also 16 -> 16) */
     for (int l = 0; l < (int)(sizeof WL / sizeof WL[0]) && want("wgrad"); l++) {
         if (getenv("BENCH_WL") && l != atoi(getenv("BENCH_WL"))) continue;

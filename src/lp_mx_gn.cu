@@ -76,15 +76,17 @@ __global__ void up2_mx_k(const uint8_t *x, uint8_t *y, int N, int C, int D, int 
    it with the weights and order of up2_mx_k (identical output); up2_mx_k decoded each coarse row 8 times from global memory */
 template <int BX, int BY>
 __global__ void __launch_bounds__(256) up2_mx_tile_k(const uint8_t *x, uint8_t *y, int N, int C, int D, int H, int W) {
-    constexpr int CZ = 4, CY = 6, CX = 18;
+    /* block = 4 x 4 x 32 fine voxels (thread: x lane, y (tid >> 5) & 3, two z); the coarse rows they read decoded once into an fp32
+       tile (exact: the stored values), so the 8 x 32 trilinear terms of a voxel are plain loads + FMAs (no bf16 unpacking) */
+    constexpr int CZ = 4, CY = 4, CX = 18, RS = 36;   /* RS: floats per coarse row (+4: neighbouring columns' float4 reads hit different banks) */
     extern __shared__ __align__(16) unsigned char up_smem[];
-    __nv_bfloat16 *tile = (__nv_bfloat16 *)up_smem;   /* [CZ][CY][CX][32] */
+    float *tile = (float *)up_smem;   /* [CZ][CY][CX][RS] */
     const int bw = mx_bw(C), Do = 2 * D, Ho = 2 * H, Wo = 2 * W;
     const size_t S = (size_t)D * H * W, So = (size_t)Do * Ho * Wo;
-    const int nbk = blockIdx.y, ntx = (Wo + 31) / 32, nty = (Ho + 7) / 8;
+    const int nbk = blockIdx.y, ntx = (Wo + 31) / 32, nty = (Ho + 3) / 4;
     int bt = blockIdx.x;
     const int ox0 = (bt % ntx) * 32; bt /= ntx;
-    const int oy0 = (bt % nty) * 8; bt /= nty;
+    const int oy0 = (bt % nty) * 4; bt /= nty;
     const int oz0 = bt * 4;
     const int cz0 = (oz0 >> 1) - 1, cy0 = (oy0 >> 1) - 1, cx0 = (ox0 >> 1) - 1;
     const uint8_t *sc = mx_sc<BX>(x, N, C, S);
@@ -93,16 +95,16 @@ __global__ void __launch_bounds__(256) up2_mx_tile_k(const uint8_t *x, uint8_t *
         const int z = min(max(cz0 + tz, 0), D - 1), yy = min(max(cy0 + ty, 0), H - 1), xx = min(max(cx0 + tx, 0), W - 1);
         float r[32];
         mx_load_row_b<BX>(x, sc, (size_t)nbk * S + ((size_t)z * H + yy) * W + xx, bw, r);
-        __nv_bfloat16 *d = tile + (size_t)i * 32;
+        float4 *d = (float4 *)(tile + (size_t)i * RS);
 #pragma unroll
-        for (int k = 0; k < 32; k += 2) *(__nv_bfloat162 *)(d + k) = __floats2bfloat162_rn(k < bw ? r[k] : 0.f, k + 1 < bw ? r[k + 1] : 0.f);
+        for (int k = 0; k < 32; k += 4) d[k / 4] = make_float4(k < bw ? r[k] : 0.f, k + 1 < bw ? r[k + 1] : 0.f, k + 2 < bw ? r[k + 2] : 0.f, k + 3 < bw ? r[k + 3] : 0.f);
     }
     __syncthreads();
     const float wt[2] = {0.75f, 0.25f};
-    const int ox = ox0 + (threadIdx.x & 31), oy = oy0 + (threadIdx.x >> 5);
+    const int ox = ox0 + (threadIdx.x & 31), oy = oy0 + ((threadIdx.x >> 5) & 3), dz0 = (threadIdx.x >> 7) * 2;
     if (ox >= Wo || oy >= Ho) return;
     const int my[2] = {oy >> 1, min(max((oy >> 1) + ((oy & 1) ? 1 : -1), 0), H - 1)}, mx[2] = {ox >> 1, min(max((ox >> 1) + ((ox & 1) ? 1 : -1), 0), W - 1)};
-    for (int dz = 0; dz < 4; dz++) {
+    for (int dz = dz0; dz < dz0 + 2; dz++) {
         const int oz = oz0 + dz;
         if (oz >= Do) break;
         const int mz[2] = {oz >> 1, min(max((oz >> 1) + ((oz & 1) ? 1 : -1), 0), D - 1)};
@@ -116,16 +118,11 @@ __global__ void __launch_bounds__(256) up2_mx_tile_k(const uint8_t *x, uint8_t *
                     /* tile index of the clamped coarse coordinate: the tile holds clamp(c0 + t) at t, and c0 + t == m is in range */
                     const int tz = mz[a] - cz0, ty = my[bb] - cy0, tx = mx[c] - cx0;
                     const float w3 = wt[a] * wt[bb] * wt[c];
-                    const uint4 *src = (const uint4 *)(tile + ((size_t)(tz * CY + ty) * CX + tx) * 32);
+                    const float4 *src = (const float4 *)(tile + ((size_t)(tz * CY + ty) * CX + tx) * RS);
 #pragma unroll
-                    for (int q = 0; q < 4; q++) {
-                        const uint4 u = src[q];
-                        const unsigned w4[4] = {u.x, u.y, u.z, u.w};
-#pragma unroll
-                        for (int j = 0; j < 4; j++) {
-                            const float2 f = __bfloat1622float2(*(const __nv_bfloat162 *)&w4[j]);
-                            acc[8 * q + 2 * j] += w3 * f.x; acc[8 * q + 2 * j + 1] += w3 * f.y;
-                        }
+                    for (int q = 0; q < 8; q++) {
+                        const float4 f = src[q];
+                        acc[4 * q] += w3 * f.x; acc[4 * q + 1] += w3 * f.y; acc[4 * q + 2] += w3 * f.z; acc[4 * q + 3] += w3 * f.w;
                     }
                 }
         mx_store_row_b<BY>(y, mx_sc<BY>(y, N, C, So), (size_t)nbk * So + ((size_t)oz * Ho + oy) * Wo + ox, bw, acc);
@@ -137,8 +134,8 @@ extern "C" void lp_up2_fwd_mx(const void *x, int xdt, shape5 xs, void *y, int yd
     const uint8_t *xq = (const uint8_t *)x; uint8_t *yq = (uint8_t *)y;
     static int tiled = -1; if (tiled < 0) tiled = getenv("UFSM_UP2_TILE") ? atoi(getenv("UFSM_UP2_TILE")) : 1;
     if (tiled && !gp.G) {
-        const size_t sm = (size_t)4 * 6 * 18 * 32 * 2;
-        const dim3 gt((unsigned)(((2 * xs.w + 31) / 32) * ((2 * xs.h + 7) / 8) * ((2 * xs.d + 3) / 4)), (unsigned)(xs.n * mx_nb(xs.c)));
+        const size_t sm = (size_t)4 * 4 * 18 * 36 * 4;
+        const dim3 gt((unsigned)(((2 * xs.w + 31) / 32) * ((2 * xs.h + 3) / 4) * ((2 * xs.d + 3) / 4)), (unsigned)(xs.n * mx_nb(xs.c)));
 #define U2T(BX, BY) up2_mx_tile_k<BX, BY><<<gt, 256, sm>>>(xq, yq, xs.n, xs.c, xs.d, xs.h, xs.w)
         if (xdt == 4) { if (ydt == 4) U2T(4, 4); else U2T(4, 8); }
         else { if (ydt == 4) U2T(8, 4); else U2T(8, 8); }
