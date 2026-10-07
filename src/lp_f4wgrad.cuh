@@ -633,18 +633,22 @@ template <int BW> __global__ void __launch_bounds__(256) gy_pre4_k(const uint8_t
                                                                   int N, int Co, int D, int H, int W, int z0, int Zs, unsigned sr) {
     constexpr int NTASK = BW / 8;   /* (channel, word) tasks per lane */
     __shared__ float v[8][BW][33];  /* per warp: [channel][block element k = 16 row + x] */
+    __shared__ __align__(16) uint8_t recb[BW][GP4_REC];   /* the CTA's records (one per channel), written out whole */
     __shared__ float bred[BW];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nb = mx_nb(Co), cb = blockIdx.y % nb, n = blockIdx.y / nb;
     const int Wb = (W + 15) / 16, ZT = (Zs + 1) / 2, TY = (H + 7) / 8, Yb = 4 * TY;   /* padded block grid: 2 ZT planes x 4 TY row pairs */
-    const size_t Sg = (size_t)D * H * W, ntile = (size_t)2 * ZT * Yb * Wb;
+    const size_t Sg = (size_t)D * H * W;
+    const unsigned ngrp = (unsigned)ZT * TY * Wb;   /* record groups (z-step, 8-row tile, 16-x tile): a CTA each, warp = block pb */
+    (void)Yb;
     const uint8_t *gsc = gy + (size_t)N * nb * Sg * BW;
     if (threadIdx.x < BW) bred[threadIdx.x] = 0.f;
     float bacc[NTASK];
 #pragma unroll
     for (int k = 0; k < NTASK; k++) bacc[k] = 0.f;
-    for (size_t tile = (size_t)blockIdx.x * 8 + warp; tile < ntile; tile += (size_t)gridDim.x * 8) {
-        const int xb = (int)(tile % Wb), yp = (int)((tile / Wb) % Yb), zz = (int)(tile / ((size_t)Wb * Yb)), z = z0 + zz;
+    for (unsigned grp = blockIdx.x; grp < ngrp; grp += gridDim.x) {
+        const int xb = (int)(grp % Wb), ty = (int)((grp / Wb) % TY), zt = (int)(grp / ((unsigned)Wb * TY));
+        const int zz = 2 * zt + (warp >> 2), yp = 4 * ty + (warp & 3), z = z0 + zz;   /* this warp's block: pb = warp */
         {
             const int y = 2 * yp + (lane >> 4), x = 16 * xb + (lane & 15);
             float r[32];
@@ -675,14 +679,15 @@ template <int BW> __global__ void __launch_bounds__(256) gy_pre4_k(const uint8_t
             uint32_t hh[4];
             sr_hash4(sr, vid, hh);
             const unsigned word = sr_e2m1_word(q, m, hh);
-            if (co < Co) {
-                uint8_t *rec = out + (((((size_t)n * Co + co) * ZT + (zz >> 1)) * TY + (yp >> 2)) * Wb + xb) * GP4_REC;
-                const int pb = 4 * (zz & 1) + (yp & 3);
-                *(unsigned *)(rec + pb * 16 + 4 * f) = word;
-                if (f == 0) rec[128 + pb] = (uint8_t)(e + 127);
-            }
+            *(unsigned *)(recb[c] + warp * 16 + 4 * f) = word;
+            if (f == 0) recb[c][128 + warp] = (uint8_t)(e + 127);
         }
-        __syncwarp();   /* the warp's tile buffer is reused */
+        __syncthreads();
+        for (int i = threadIdx.x; i < BW * (GP4_REC / 8); i += blockDim.x) {   /* whole records: 8-byte stores, consecutive in a record */
+            const int c = i / (GP4_REC / 8), w8 = i % (GP4_REC / 8), co = cb * BW + c;
+            if (co < Co) *(uint2 *)(out + ((((size_t)n * Co + co) * ZT + zt) * TY + ty) * Wb * GP4_REC + (size_t)xb * GP4_REC + 8 * w8) = *(const uint2 *)(recb[c] + 8 * w8);
+        }
+        __syncthreads();   /* the tile and record buffers are reused */
     }
     if (gb) {
         __syncthreads();
@@ -743,10 +748,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
     static int pre_env = -1;
     if (pre_env < 0) pre_env = getenv("UFSM_F4W_GYPRE") ? atoi(getenv("UFSM_F4W_GYPRE")) : 96;
     const size_t cap_kb = g_f4w_gypre_kb >= 0 ? (size_t)g_f4w_gypre_kb : (size_t)pre_env * 1024;
-    /* not for a single 16-channel block of each (16 -> 16): its cooperative in-kernel gy path is cheaper than the extra
-       pass and the shallower slab tiles (22 vs 25 ms at 384^3); 32 -> 32 / 64 -> 64 / 96 -> 32 / 48 -> 16 gain 30 / 35 / 30 / 7% */
-    const bool pre_ok = g_f4w_gypre_kb > 0 || ys.c > 16 || xs.c > 8 * NT;
-    if constexpr (IS_MX8(TG)) if (cap_kb && pre_ok && sp.sr && !had && (lay == 1 || lay == 2) && zc_env <= 0) {
+    if constexpr (IS_MX8(TG)) if (cap_kb && sp.sr && !had && (lay == 1 || lay == 2) && zc_env <= 0) {
         const int Wb = (ys.w + 15) / 16, gbw = mx_bw(ys.c);
         const size_t per_zt = (size_t)ys.n * ys.c * ((ys.h + 7) / 8) * Wb * GP4_REC;   /* one record per (n, co, z-step, 8-row tile, 16-x tile) */
         const size_t cap_zt = (cap_kb << 10) / per_zt;
@@ -757,7 +759,8 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
             const size_t ntile = (size_t)2 * ((Zs + 1) / 2) * 4 * ((ys.h + 7) / 8) * Wb;   /* the padded block grid of the records */
             const size_t nwb = (ntile + 7) / 8;   /* CTAs of 8 warps, a few tiles per warp */
             const dim3 pg((unsigned)(nwb < 4096 ? nwb : 4096), (unsigned)(ys.n * mx_nb(ys.c)));
-            if (gbw == 16) gy_pre4_k<16><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr);
+            if (gbw == 8) gy_pre4_k<8><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr);
+            else if (gbw == 16) gy_pre4_k<16><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr);
             else gy_pre4_k<32><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr);
             int zc_s = zs1 - zs0 < max_zc ? zs1 - zs0 : max_zc;
             while (zc_s > 1 && (size_t)base * nblk_(zs1 - zs0, zc_s) < 72) zc_s--;

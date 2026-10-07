@@ -35,6 +35,14 @@ static void run(job *j, unsigned it) {
     if (j->osum) nn_zero(j->osum, 2 * 64 * sizeof(double));
     lp_conv_fwd_f4(j->x, j->xb, j->xs, j->w, j->b, j->co, j->y, j->xb, j->gp, j->osum, j->Go, sp);
 }
+/* BENCH_ONLY: comma list of sections to run (fwd, f8fwd, wgrad, up, f8w, s2b, up2; default all); BENCH_WL: one wgrad case index */
+static int want(const char *key) {
+    const char *o = getenv("BENCH_ONLY");
+    if (!o) return 1;
+    const size_t k = strlen(key);
+    for (const char *p = o; (p = strstr(p, key)); p += k) if ((p == o || p[-1] == ',') && (p[k] == 0 || p[k] == ',')) return 1;
+    return 0;
+}
 int main(int argc, char **argv) {
     const int P = argc > 1 ? atoi(argv[1]) : 384, G = 8;
     nn_init(0); nn_set_f16(1);
@@ -44,7 +52,7 @@ int main(int argc, char **argv) {
     struct { const char *nm; int xb, ci, co, osplit, gn, stats, sr; } L[] = {
         {"fwd 16 -> 16 (gn+silu, stats)", 4, 16, 16, 0, 1, 1, 0}, {"fwd 48 -> 16 (gn+silu, stats)", 4, 48, 16, 0, 1, 1, 0},
         {"bdata 16 -> 16 (mx8, SR)", 3, 16, 16, 0, 0, 0, 1}, {"bdata 16 -> 32 + 16 (mx8, SR)", 3, 16, 48, 32, 0, 0, 1}};
-    for (int l = 0; l < 4; l++) {
+    for (int l = 0; l < 4 && want("fwd"); l++) {
         shape5 xs = {1, L[l].ci, P, P, P};
         job j = {0};
         j.x = mx(L[l].xb == 4 ? 4 : 8, L[l].ci, S, L[l].xb == 4 ? 2.f : 1e-3f, 11 + l); j.xb = L[l].xb; j.ci = L[l].ci; j.co = L[l].co; j.xs = xs; j.sr = L[l].sr;
@@ -68,7 +76,7 @@ int main(int argc, char **argv) {
         printf("\n");
         nn_free((void *)j.x); nn_free(j.y); if (j.y2) nn_free(j.y2); nn_free(w); if (b) nn_free(b);
     }
-    {   /* the same 16 -> 16 / 48 -> 16 forwards on the fp8 kernel (MX-fp4 storage, fp8 compute) */
+    if (want("f8fwd")) {   /* the same 16 -> 16 / 48 -> 16 forwards on the fp8 kernel (MX-fp4 storage, fp8 compute) */
         for (int ci = 16; ci <= 48; ci += 32) {
             shape5 xs = {1, ci, P, P, P}; void *x = mx(4, ci, S, 2.f, 61 + ci), *y = nn_malloc(lp_mx4_bytes(1, 16, S));
             float *w = rnd((size_t)16 * ci * 27, 0.1f, 62), *b = rnd(16, 0.1f, 63);
@@ -85,7 +93,9 @@ int main(int argc, char **argv) {
     /* weight gradient (fp4, the --fp4 2 recipe): MX-fp4 x with GN+SiLU in staging, MX-fp8 gy with SR, bias */
     struct { const char *nm; int ci, co, dv; } WL[] = {{"wgrad 16 -> 16 (gn+silu, SR)", 16, 16, 1}, {"wgrad 48 -> 16 (gn+silu, SR)", 48, 16, 1}, {"wgrad 32 -> 32 (gn+silu, SR) @P/2", 32, 32, 2},
                                                   {"wgrad 128 -> 32 (gn+silu, SR) @P/2", 128, 32, 2}, {"wgrad 96 -> 96 (gn+silu, SR) @P/4", 96, 96, 4}};
-    for (int l = 0; l < (int)(sizeof WL / sizeof WL[0]); l++) {
+    if (getenv("BENCH_GYPRE")) lp_set_f4w_gypre_kb(atoi(getenv("BENCH_GYPRE")));   /* KiB > 0: force the gy pre-pass (also 16 -> 16) */
+    for (int l = 0; l < (int)(sizeof WL / sizeof WL[0]) && want("wgrad"); l++) {
+        if (getenv("BENCH_WL") && l != atoi(getenv("BENCH_WL"))) continue;
         const int Pl = P / WL[l].dv; const size_t Sl = (size_t)Pl * Pl * Pl;
         shape5 xs = {1, WL[l].ci, Pl, Pl, Pl}, ys = xs; ys.c = WL[l].co;
         void *x = mx(4, WL[l].ci, Sl, 2.f, 21 + l), *gy = mx(8, WL[l].co, Sl, 1e-3f, 31 + l);
@@ -103,7 +113,7 @@ int main(int argc, char **argv) {
         printf("%-32s @%d %8.3f ms  |gw| %.9g\n", WL[l].nm, Pl, best, a);
         nn_free(x); nn_free(gy); nn_free(gw); nn_free(gb);
     }
-    {   /* decoder conv1 weight gradients: [up2(coarse s2) | silu(gn(skip))] staged inside the kernel (sp.up), as dec0.c1 / dec1.c1 train */
+    if (want("up")) {   /* decoder conv1 weight gradients: [up2(coarse s2) | silu(gn(skip))] staged inside the kernel (sp.up), as dec0.c1 / dec1.c1 train */
         struct { const char *nm; int cu, cs, co, dv; } UL[] = {{"wgrad up 32 + 16 -> 16 (dec0.c1)", 32, 16, 16, 1}, {"wgrad up 96 + 32 -> 32 (dec1.c1) @P/2", 96, 32, 32, 2}};
         for (int l = 0; l < 2; l++) {
             const int Pl = P / UL[l].dv; const size_t Sl = (size_t)Pl * Pl * Pl, Sc = Sl / 8;
@@ -123,7 +133,7 @@ int main(int argc, char **argv) {
             nn_free(xc); nn_free(xk); nn_free(gy); nn_free(gw); nn_free(gb);
         }
     }
-    {   /* fp8 weight gradients at level 0: down0 (stride 2, MX-fp4 x level 0 -> MX-fp8 gy level 1, 16 -> 16) and the stem
+    if (want("f8w")) {   /* fp8 weight gradients at level 0: down0 (stride 2, MX-fp4 x level 0 -> MX-fp8 gy level 1, 16 -> 16) and the stem
            (enc0.c1: MX-fp8 4-channel input, MX-fp8 gy, SR) */
         const int Pc = P / 2; const size_t Sc = (size_t)Pc * Pc * Pc;
         shape5 xs = {1, 16, P, P, P}, ys = {1, 16, Pc, Pc, Pc};
@@ -163,7 +173,7 @@ int main(int argc, char **argv) {
         printf("%-32s @%d %8.3f ms  |gw| %.9g\n", "wgrad stem 4 -> 16 (fp8, SR)", P, best, a);
         nn_free(xi); nn_free(g4); nn_free(gw); nn_free(gb);
     }
-    {   /* stride-2 backward-data, accumulating into the level's gradient (down0: 16 -> 16, down1: 32 -> 32 at P / 2) */
+    if (want("s2b")) {   /* stride-2 backward-data, accumulating into the level's gradient (down0: 16 -> 16, down1: 32 -> 32 at P / 2) */
         for (int l = 0; l < 2; l++) {
             const int Pf = l ? P / 2 : P, Pc = Pf / 2, C = l ? 32 : 16; const size_t Sf = (size_t)Pf * Pf * Pf, Sc = (size_t)Pc * Pc * Pc;
             shape5 xs = {1, C, Pf, Pf, Pf}, ys = {1, C, Pc, Pc, Pc};
@@ -176,7 +186,7 @@ int main(int argc, char **argv) {
             nn_free(gy); nn_free(gx); nn_free(w);
         }
     }
-    {   /* decoder upsample at level 1 -> 0 (32 channels): forward of silu(gn(x)) MX-fp4 -> MX-fp4, backward MX-fp8 -> MX-fp8 */
+    if (want("up2")) {   /* decoder upsample at level 1 -> 0 (32 channels): forward of silu(gn(x)) MX-fp4 -> MX-fp4, backward MX-fp8 -> MX-fp8 */
         const int Pc = P / 2, C = 32; const size_t Sc = (size_t)Pc * Pc * Pc;
         shape5 cs = {1, C, Pc, Pc, Pc};
         void *xc = mx(4, C, Sc, 2.f, 41), *yf = nn_malloc(lp_mx4_bytes(1, C, S)), *gf = mx(8, C, S, 1e-3f, 42), *gc = nn_malloc(lp_mx8_bytes(1, C, Sc));
