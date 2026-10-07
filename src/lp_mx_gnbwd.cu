@@ -1,15 +1,19 @@
 /* GroupNorm+SiLU backward on MX tensors and 1x1 conv to MX */
 #include "lp_mxops.cuh"
-template <int B, typename TG, int V>   /* V consecutive voxels per thread step (vector gy loads; 1: any S) */
+template <int B, typename TG, int V, int HPB>   /* V consecutive voxels per thread step (vector gy loads; 1: any S); HPB 16-channel halves per row */
 __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, const TG *gy, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                                            int N, int C, int G, size_t S, float *part) {
+    /* block = (voxel slab, stored channel block, sample); a thread holds 16 channels (registers: occupancy). 32-wide blocks: the
+       lane pair (2 k, 2 k + 1) takes the two halves of one voxel's row, so a warp reads 16 whole contiguous rows (a block per
+       half read every row twice from DRAM: its partner block ran a whole grid row later) */
     const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G;
-    const int hpb = bw / 16, blk = blockIdx.y / hpb, h0 = (blockIdx.y % hpb) * 16, n = blockIdx.z, nsl = gridDim.x;   /* 16 channels per block (registers: occupancy) */
+    const int blk = blockIdx.y, n = blockIdx.z, nsl = gridDim.x;
+    const int h0 = HPB == 2 ? 16 * (int)(threadIdx.x & 1) : 0, tv = (int)threadIdx.x / HPB, nt = 256 / HPB;
     const size_t nq = S / V, q0 = nq * blockIdx.x / nsl, q1 = nq * (blockIdx.x + 1) / nsl;   /* slab in units of V voxels */
-    __shared__ float cm[16], cr[16], cg[16], cb[16], s1[16], s2[16];
-    if (threadIdx.x < 16) {
-        const int k = threadIdx.x, c = blk * bw + h0 + k;
-        const bool ok = h0 + k < bw && c < C;
+    __shared__ float cm[32], cr[32], cg[32], cb[32], s1[32], s2[32];
+    if (threadIdx.x < 32) {
+        const int k = threadIdx.x, c = blk * bw + k;
+        const bool ok = k < bw && c < C;
         const int ng = n * G + (ok ? c / cpg : 0);
         cm[k] = ok ? mean[ng] : 0.f; cr[k] = ok ? rstd[ng] : 0.f; cg[k] = ok ? gamma[c] : 0.f; cb[k] = ok ? beta[c] : 0.f; s1[k] = 0.f; s2[k] = 0.f;
     }
@@ -21,7 +25,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, 
     const int kmax = max(0, min(min(bw, C - blk * bw) - h0, 16));
     const size_t rbase = ((size_t)n * nb + blk) * S;
     const TG *gyb = IS_MX8(TG) ? gy : gy + ((size_t)n * C + blk * bw + h0) * S;
-    for (size_t q = q0 + threadIdx.x; q < q1; q += 256) {
+    for (size_t q = q0 + tv; q < q1; q += nt) {
         const size_t v = q * V;
         float g[V][16];
         if constexpr (!IS_MX8(TG)) {
@@ -42,7 +46,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, 
 #pragma unroll
             for (int k = 0; k < 16; k++) {
                 if (k < kmax) {
-                    const float xhat = (r[k] - cm[k]) * cr[k], u = xhat * cg[k] + cb[k], sg = __fdividef(1.f, 1.f + __expf(-u));
+                    const float xhat = (r[k] - cm[h0 + k]) * cr[h0 + k], u = xhat * cg[h0 + k] + cb[h0 + k], sg = __fdividef(1.f, 1.f + __expf(-u));
                     const float a = (IS_MX8(TG) ? gr[k] : g[j][k]) * (sg * (1.f + u * (1.f - sg)));
                     a1[k] += a; a2[k] += a * xhat;
                 }
@@ -50,16 +54,15 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, 
         }
     }
 #pragma unroll
-    for (int k = 0; k < 16; k++) {
-        if (k < kmax) {
-            float a = a1[k], q = a2[k];
-            for (int o = 16; o; o >>= 1) { a += __shfl_xor_sync(0xffffffff, a, o); q += __shfl_xor_sync(0xffffffff, q, o); }
-            if ((threadIdx.x & 31) == 0) { atomicAdd(&s1[k], a); atomicAdd(&s2[k], q); }
-        }
+    for (int k = 0; k < 16; k++) {   /* kmax differs between the halves only in its padding tail: reduce all 16, add the real ones */
+        float a = a1[k], q = a2[k];
+        for (int o = 16; o >= HPB; o >>= 1) { a += __shfl_xor_sync(0xffffffff, a, o); q += __shfl_xor_sync(0xffffffff, q, o); }
+        if ((int)(threadIdx.x & 31) < HPB && k < kmax) { atomicAdd(&s1[h0 + k], a); atomicAdd(&s2[h0 + k], q); }
     }
     __syncthreads();
     /* per-slab partials (same-address double atomics across slabs serialised at the small levels); summed by gn_part_sum_k */
-    if ((int)threadIdx.x < kmax) { const size_t c = (size_t)n * C + blk * bw + h0 + threadIdx.x, o = ((size_t)blockIdx.x * N * C + c) * 2; part[o] = s1[threadIdx.x]; part[o + 1] = s2[threadIdx.x]; }
+    const int kb = min(bw, C - blk * bw);
+    if ((int)threadIdx.x < kb) { const size_t c = (size_t)n * C + blk * bw + threadIdx.x, o = ((size_t)blockIdx.x * N * C + c) * 2; part[o] = s1[threadIdx.x]; part[o + 1] = s2[threadIdx.x]; }
 }
 __global__ void gn_part_sum_k(const float *part, int nsl, int NC, double *ds) {   /* ds[2 c + j] = sum over slabs (double) */
     /* a warp per output: lanes stride over the slabs (up to 1024: one thread walking them serially in fp64 took 0.1 ms per call) */
@@ -116,24 +119,26 @@ extern "C" void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const
     const int NC = s.n * s.c, nb = mx_nb(s.c), bw = mx_bw(s.c);
     /* slabs: >= 8 voxel steps per thread (256 threads x V 2) to amortise the end-of-block reduction, but >= ~160 blocks in all
        (small levels were latency-bound with a handful of blocks), and >= one step per thread */
-    const size_t ny = (size_t)nb * (bw / 16) * s.n;
+    const size_t ny = (size_t)nb * s.n;
     size_t slabs = S / 4096, want = (160 + ny - 1) / ny, maxs = S / 512 > 0 ? S / 512 : 1;
     if (slabs < want) slabs = want;
     if (slabs > maxs) slabs = maxs;
     if (slabs > 1024) slabs = 1024;
-    const dim3 grid((unsigned)slabs, (unsigned)(nb * (bw / 16)), (unsigned)s.n);
+    const dim3 grid((unsigned)slabs, (unsigned)nb, (unsigned)s.n);
     float *part = lp_buf<float>(5, slabs * 2 * NC);
     if (s.c > 1024) { fprintf(stderr, "lp_gn_silu_bwd_mx: C %d > 1024\n", s.c); abort(); }
     if (gdt == 4) { fprintf(stderr, "lp_gn_silu_bwd_mx: fp4 gradients are not supported\n"); abort(); }
     cudaMemsetAsync(ds, 0, (size_t)2 * NC * sizeof(double));
     const uint8_t *xq = (const uint8_t *)x;
-#define GBS2(B, V) do { if (gdt == 3) gn_silu_bwd_stats_mx_k<B, mx8_t, 1><<<grid, 256>>>(xq, (const mx8_t *)gy, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
-                    else if (gdt == 2) gn_silu_bwd_stats_mx_k<B, __half, V><<<grid, 256>>>(xq, (const __half *)gy, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
-                    else if (gdt == 1) gn_silu_bwd_stats_mx_k<B, bf16, V><<<grid, 256>>>(xq, (const bf16 *)gy, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
-                    else gn_silu_bwd_stats_mx_k<B, float, V><<<grid, 256>>>(xq, (const float *)gy, gamma, beta, mean, rstd, s.n, s.c, G, S, part); } while (0)
-#define GBS(B) do { if (S % 4 == 0) GBS2(B, 2); else GBS2(B, 1); } while (0)
+#define GBS2(B, V, H) do { if (gdt == 3) gn_silu_bwd_stats_mx_k<B, mx8_t, 1, H><<<grid, 256>>>(xq, (const mx8_t *)gy, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
+                    else if (gdt == 2) gn_silu_bwd_stats_mx_k<B, __half, V, H><<<grid, 256>>>(xq, (const __half *)gy, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
+                    else if (gdt == 1) gn_silu_bwd_stats_mx_k<B, bf16, V, H><<<grid, 256>>>(xq, (const bf16 *)gy, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
+                    else gn_silu_bwd_stats_mx_k<B, float, V, H><<<grid, 256>>>(xq, (const float *)gy, gamma, beta, mean, rstd, s.n, s.c, G, S, part); } while (0)
+#define GBS1(B, H) do { if (S % 4 == 0) GBS2(B, 2, H); else GBS2(B, 1, H); } while (0)
+#define GBS(B) do { if (bw == 32) GBS1(B, 2); else GBS1(B, 1); } while (0)
     if (xdt == 4) GBS(4); else GBS(8);
 #undef GBS
+#undef GBS1
 #undef GBS2
     gn_part_sum_k<<<nblk_((size_t)2 * NC * 32, 256), 256>>>(part, (int)slabs, NC, ds);
     (void)st; (void)AB;

@@ -155,9 +155,9 @@ int main(int argc, char **argv) {
             nn_free(xc); nn_free(xk); nn_free(gy); nn_free(gw); nn_free(gb);
         }
     }
-    if (want("gnbwd")) {   /* GroupNorm+SiLU backward on the training storage: MX-fp4 x, MX-fp8 gy / gx (16 ch at P, 32 at P / 2) */
-        for (int k = 0; k < 2; k++) {
-            const int C = k ? 32 : 16, Pl = k ? P / 2 : P; const size_t Sl = (size_t)Pl * Pl * Pl;
+    if (want("gnbwd")) {   /* GroupNorm+SiLU backward on the training storage: MX-fp4 x, MX-fp8 gy / gx (16 ch at P, 32 at P / 2, 32 at P) */
+        for (int k = 0; k < 3; k++) {
+            const int C = k ? 32 : 16, Pl = k == 1 ? P / 2 : P; const size_t Sl = (size_t)Pl * Pl * Pl;
             shape5 s = {1, C, Pl, Pl, Pl};
             void *x = mx(4, C, Sl, 2.f, 81 + k), *gy = mx(8, C, Sl, 1e-3f, 83 + k);
             const size_t b8 = lp_mx8_bytes(1, C, Sl);
@@ -170,7 +170,8 @@ int main(int argc, char **argv) {
                 nn_sync(); double t0 = now(); nn_gn_silu_bwd(x, s, G, gm, bt, mean, rstd, gy, gx, gg, gb2, scr); nn_sync();
                 if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
             }
-            printf("%-32s @%d %8.3f ms  out %016llx\n", k ? "gn+silu bwd 32 ch (mx4 x, mx8 g) @P/2" : "gn+silu bwd 16 ch (mx4 x, mx8 g)", Pl, best, (unsigned long long)fnv(gx, b8));
+            double hg[2]; { float t2[2]; nn_d2h(t2, gg, 8); hg[0] = t2[0]; hg[1] = t2[1]; }
+            printf("%-32s @%d %8.3f ms  out %016llx  dgamma %.7g %.7g\n", k == 1 ? "gn+silu bwd 32 ch (mx4 x, mx8 g) @P/2" : k ? "gn+silu bwd 32 ch (mx4 x, mx8 g)" : "gn+silu bwd 16 ch (mx4 x, mx8 g)", Pl, best, (unsigned long long)fnv(gx, b8), hg[0], hg[1]);
             nn_storage_forget(x); nn_storage_forget(gy); nn_storage_forget(gx);
             nn_free(x); nn_free(gy); nn_free(gx); nn_free(gm); nn_free(bt); nn_free(gg); nn_free(gb2); nn_free(scr);
         }
