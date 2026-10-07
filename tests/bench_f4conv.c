@@ -51,8 +51,9 @@ int main(int argc, char **argv) {
     double *osum = nn_malloc(2 * 64 * sizeof(double));
     struct { const char *nm; int xb, ci, co, osplit, gn, stats, sr; } L[] = {
         {"fwd 16 -> 16 (gn+silu, stats)", 4, 16, 16, 0, 1, 1, 0}, {"fwd 48 -> 16 (gn+silu, stats)", 4, 48, 16, 0, 1, 1, 0},
-        {"bdata 16 -> 16 (mx8, SR)", 3, 16, 16, 0, 0, 0, 1}, {"bdata 16 -> 32 + 16 (mx8, SR)", 3, 16, 48, 32, 0, 0, 1}};
-    for (int l = 0; l < 4 && want("fwd"); l++) {
+        {"bdata 16 -> 16 (mx8, SR)", 3, 16, 16, 0, 0, 0, 1}, {"bdata 16 -> 32 + 16 (mx8, SR)", 3, 16, 48, 32, 0, 0, 1},
+        {"fwd 32 -> 32 (gn+silu, stats)", 4, 32, 32, 0, 1, 1, 0}, {"bdata 32 -> 32 (mx8, SR)", 3, 32, 32, 0, 0, 0, 1}, {"bdata 32 -> 64 + 32 (mx8, SR)", 3, 32, 96, 64, 0, 0, 1}};
+    for (int l = 0; l < (int)(sizeof L / sizeof L[0]) && want("fwd"); l++) {
         shape5 xs = {1, L[l].ci, P, P, P};
         job j = {0};
         j.x = mx(L[l].xb == 4 ? 4 : 8, L[l].ci, S, L[l].xb == 4 ? 2.f : 1e-3f, 11 + l); j.xb = L[l].xb; j.ci = L[l].ci; j.co = L[l].co; j.xs = xs; j.sr = L[l].sr;
