@@ -110,7 +110,8 @@ int main(int argc, char **argv) {
     /* weight gradient (fp4, the --fp4 2 recipe): MX-fp4 x with GN+SiLU in staging, MX-fp8 gy with SR, bias */
     struct { const char *nm; int ci, co, dv; } WL[] = {{"wgrad 16 -> 16 (gn+silu, SR)", 16, 16, 1}, {"wgrad 48 -> 16 (gn+silu, SR)", 48, 16, 1}, {"wgrad 32 -> 32 (gn+silu, SR) @P/2", 32, 32, 2},
                                                   {"wgrad 128 -> 32 (gn+silu, SR) @P/2", 128, 32, 2}, {"wgrad 96 -> 96 (gn+silu, SR) @P/4", 96, 96, 4},
-                                                  {"wgrad 224 -> 96 (gn+silu, SR) @P/4", 224, 96, 4}, {"wgrad 128 -> 128 (gn+silu, SR) @P/8", 128, 128, 8}};
+                                                  {"wgrad 224 -> 96 (gn+silu, SR) @P/4", 224, 96, 4}, {"wgrad 128 -> 128 (gn+silu, SR) @P/8", 128, 128, 8},
+                                                  {"wgrad 32 -> 32 (gn+silu, SR)", 32, 32, 1}, {"wgrad 96 -> 32 (gn+silu, SR)", 96, 32, 1}};
     if (getenv("BENCH_GYPRE")) lp_set_f4w_gypre_kb(atoi(getenv("BENCH_GYPRE")));   /* KiB > 0: force the gy pre-pass (also 16 -> 16) */
     for (int l = 0; l < (int)(sizeof WL / sizeof WL[0]) && want("wgrad"); l++) {
         if (getenv("BENCH_WL") && l != atoi(getenv("BENCH_WL"))) continue;
