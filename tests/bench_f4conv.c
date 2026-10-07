@@ -235,12 +235,16 @@ int main(int argc, char **argv) {
             shape5 xs = {1, 32, P, P, P}, ys = {1, 32, Pc, Pc, Pc};
             void *x = mx(4, 32, S, 2.f, 103), *gy = mx(8, 32, Sc, 1e-3f, 104), *gx = mx(8, 32, S, 1e-3f, 105);
             float *gw = nn_malloc(32 * 32 * 27 * 4), *gb = nn_malloc(32 * 4), *w = rnd((size_t)32 * 32 * 27, 0.1f, 106);
-            best = 1e9;
-            for (int it = 0; it < 8; it++) {
-                nn_zero(gw, 32 * 32 * 27 * 4); nn_zero(gb, 32 * 4);
-                nn_sync(); double t0 = now(); lp_bwd_w_s2_f8(x, 4, xs, gy, 3, ys, gw, gb, (gnp_t){0}); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+            for (int gn = 0; gn < 2; gn++) {   /* training reads the stored enc0 output through its GroupNorm + SiLU */
+                const gnp_t gp = gn ? (gnp_t){gam, bet, mean, rstd, G} : (gnp_t){0};
+                best = 1e9;
+                for (int it = 0; it < 8; it++) {
+                    nn_zero(gw, 32 * 32 * 27 * 4); nn_zero(gb, 32 * 4);
+                    nn_sync(); double t0 = now(); lp_bwd_w_s2_f8(x, 4, xs, gy, 3, ys, gw, gb, gp); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+                }
+                float hw[32 * 32 * 27]; nn_d2h(hw, gw, sizeof hw); double a = 0; for (int i = 0; i < 32 * 32 * 27; i++) a += fabs(hw[i]);
+                printf("%-32s @%d %8.3f ms  |gw| %.9g\n", gn ? "wgrad s2 down0 32 -> 32 (gn+silu)" : "wgrad s2 down0 32 -> 32 (fp8)", P, best, a);
             }
-            printf("%-32s @%d %8.3f ms\n", "wgrad s2 down0 32 -> 32 (fp8)", P, best);
             best = 1e9;
             for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
             nn_free(gx); gx = mx(8, 32, S, 1e-3f, 105); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1); nn_sync();

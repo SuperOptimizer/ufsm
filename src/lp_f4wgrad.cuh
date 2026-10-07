@@ -622,19 +622,29 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
    LY 1, no transform modes, gy from the pre-pass records, no fused upsample): the staging of conv_bwd_w_f4_k ran between
    block barriers with 5-6 of its 9 warps busy, ~4x longer than its work. Here 8 producer warps stage z-step i + 1 (both new
    x planes: decode tile, then the LY 1 lanes; the gy records by cp.async) while the 9 MMA warps (as conv_bwd_w_f4_k: warp =
-   tap row) consume z-step i. The x planes live in a ring of 6 slots (plane gz in slot (gz + 1) % 6: the slots a z-step stages
-   were last read by the z-step two before), gy in two buffers; named barriers FULL[i & 1] (producers arrive, consumers wait)
-   and EMPTY[i & 1] (consumers arrive after their MMA, producers wait before staging i + 2). One block per SM (~74 KB smem);
-   544 threads give 120 registers each, so the accumulators stay in registers. Same values and summation order as
-   conv_bwd_w_f4_k with gpre: identical weight gradients. ---- */
+   tap row) consume z-step i. Persistent: one block per SM walks (16 x 8 tile, z chunk) items of its channel tile, i counting
+   z-steps across items, and keeps accumulating in registers, so the per-block fill, drain and gw atomics (~20% of a
+   20-z-step block) happen once per SM. The x planes live in a ring of 8 slots, numbered by a running plane count (an item
+   with s z-steps holds 2 s + 2 planes), so the slots a z-step stages were last read three z-steps before, also across an
+   item boundary (whose first z-step stages 4 planes); gy in two buffers; named barriers FULL[i & 1] (producers arrive,
+   consumers wait) and EMPTY[i & 1] (consumers arrive after their MMA, producers wait before staging i + 2). One block per
+   SM (~89 KB smem); 672 threads get 80 registers each. Same values as conv_bwd_w_f4_k with gpre; the gw sums group
+   differently (per block over several tiles). ---- */
 #define WS_NC 9            /* consumer (MMA) warps */
 #define WS_NP 12           /* producer warps */
 #define WS_NT ((WS_NC + WS_NP) * 32)
 #define WS_PS 432          /* x bytes per (channel, plane slot): LY 1, 9 row pairs x 2 rows x 24 B */
-#define WS_CS 2640         /* per channel: 6 slots x 432 B + 48 (660 words == 20 mod 32, as X4_CS) */
-#define WS_SCS 194         /* u16 per channel of the scale-pair table: 6 slots x 32 + 2 */
+#define WS_NS 8            /* x plane slots */
+#define WS_CS 3536         /* per channel: 8 slots x 432 B + 80 (884 words == 20 mod 32, as X4_CS) */
+#define WS_SCS 258         /* u16 per channel of the scale-pair table: 8 slots x 32 + 2 */
 __device__ __forceinline__ void ws_bar_sync(int id, int n) { asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(n) : "memory"); }
 __device__ __forceinline__ void ws_bar_arrive(int id, int n) { asm volatile("bar.arrive %0, %1;" :: "r"(id), "r"(n) : "memory"); }
+static int ws_nsm(void) {   /* SMs of the current device */
+    static int n[8];
+    const int d = cur_dev_();
+    if (!n[d]) { int dev = 0; cudaGetDevice(&dev); cudaDeviceGetAttribute(&n[d], cudaDevAttrMultiProcessorCount, dev); if (n[d] < 1) n[d] = 1; }
+    return n[d];
+}
 template <int MT, int NT> __host__ __device__ constexpr size_t ws_smem() {
     return (size_t)8 * NT * WS_CS + (size_t)8 * NT * WS_SCS * 2 + 2 * (size_t)16 * MT * (G4_CS + 8) + 32 * 32 + (size_t)2 * 8 * NT * 240 * 2 + 64;
 }
@@ -651,15 +661,13 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
     __nv_bfloat16 *xt = (__nv_bfloat16 *)(ctab4 + 32);                    /* [2 planes][CH][10 rows][24] */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int ci0 = blockIdx.y * CH, co0 = blockIdx.z * BMo;
-    int bz = blockIdx.x;
     const int nxt = (W + 15) / 16, nyt = (H + 7) / 8, nzt = zs1;
-    const int ox0 = (bz % nxt) * 16; bz /= nxt;
-    const int oy0 = (bz % nyt) * 8; bz /= nyt;
-    const int nzc = (nzt - zs0 + ZC - 1) / ZC;
-    const int zc = bz % nzc; const int n = bz / nzc;
+    const int nzc = (nzt - zs0 + ZC - 1) / ZC, nitem = nxt * nyt * nzc, nper = gridDim.x / N;
+    const int n = blockIdx.x / nper, w0 = blockIdx.x % nper;   /* items w0, w0 + nper, ... of batch entry n */
     const size_t plane = (size_t)D * H * W;
     const int Cx = sp.x2 ? sp.c_split : Ci;
-    const int zt_begin = zs0 + zc * ZC, zt_end = min(nzt, zt_begin + ZC), nzs = zt_end - zt_begin;
+    int ntot = 0;   /* z-steps of this block */
+    for (int w = w0; w < nitem; w += nper) { const int zb = zs0 + (w / (nxt * nyt)) * ZC; ntot += min(nzt, zb + ZC) - zb; }
     if (threadIdx.x < CH) { const int ci = ci0 + threadIdx.x; ctab4[threadIdx.x] = make_chan(ci < Ci ? ci : Ci, Ci, Cx, n, plane, x, sp, gp, N); }
     __syncthreads();
     {
@@ -672,9 +680,13 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
         const int pt = threadIdx.x - WS_NC * 32, pw = warp - WS_NC;   /* 0 .. 255, 0 .. 7 */
         const int ZT = (min(2 * nzt, D) - 2 * zs0 + 1) / 2, TY = (H + 7) / 8, TX = (W + 15) / 16;
         const bool Gany = gp.G != 0 || sp.gp2.G != 0;
-        for (int i = 0; i < nzs; i++) {
-            const int zt = zt_begin + i, oz0 = 2 * zt, b = i & 1;
-            if (i >= 2) ws_bar_sync(3 + b, WS_NT);   /* EMPTY[b]: z-step i - 2 is consumed (its gy buffer and the slots staged now) */
+        int it = 0, pbase = 0;   /* z-steps and planes of the earlier items */
+        for (int w = w0; w < nitem; w += nper) {
+        const int ox0 = (w % nxt) * 16, oy0 = ((w / nxt) % nyt) * 8, zt_begin = zs0 + (w / (nxt * nyt)) * ZC, nzs = min(nzt, zt_begin + ZC) - zt_begin;
+        const int pz0 = 2 * zt_begin - 1 - pbase;   /* plane gz lives in slot (gz - pz0) % WS_NS */
+        for (int i = 0; i < nzs; i++, it++) {
+            const int zt = zt_begin + i, oz0 = 2 * zt, b = it & 1;
+            if (it >= 2) ws_bar_sync(3 + b, WS_NT);   /* EMPTY[b]: z-step it - 2 is consumed (its gy buffer; the slots staged now were read by it - 3) */
             /* gy records of z-step i -> buffer b (waited for at the end) */
             for (int task = pw; task < BMo; task += WS_NP) {
                 const int co = co0 + task;
@@ -701,7 +713,7 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
                 for (int grp0 = pw * 3; grp0 < 2 * CH; grp0 += WS_NP * 3) {
                     const unsigned FM = 0xffffffffu;
                     const int gi = lane / 10, r = lane - 10 * gi, grp = grp0 + gi, pl = grp / CH, q = grp % CH;
-                    const int gz = gz_first + pp0 + pl, slot = (gz + 1) % 6, gyy = oy0 - 1 + r;
+                    const int gz = gz_first + pp0 + pl, slot = (gz - pz0) % WS_NS, gyy = oy0 - 1 + r;
                     const bool act = gi < 3 && grp < 2 * CH;
                     const chan_t &cq = ctab4[act ? q : 0];
                     const bool rok = act && cq.p && gz >= 0 && gz < D && gyy >= 0 && gyy < H, G = Gany && cq.g;
@@ -742,7 +754,9 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
                 }
             }
             cp_async_wait();
-            ws_bar_arrive(1 + b, WS_NT);   /* FULL[b]: z-step i is staged */
+            ws_bar_arrive(1 + b, WS_NT);   /* FULL[b]: z-step it is staged */
+        }
+        pbase += 2 * nzs + 2;
         }
         return;
     }
@@ -751,13 +765,16 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
     float acc[3][MT][NT][4];
 #pragma unroll
     for (int a = 0; a < 3; a++) for (int m = 0; m < MT; m++) for (int q = 0; q < NT; q++) for (int k = 0; k < 4; k++) acc[a][m][q][k] = 0.f;
-    for (int i = 0; i < nzs; i++) {
-        const int oz0 = 2 * (zt_begin + i), b = i & 1;
+    int it = 0, pbase = 0;
+    for (int w = w0; w < nitem; w += nper) {
+    const int zt_begin = zs0 + (w / (nxt * nyt)) * ZC, nzs = min(nzt, zt_begin + ZC) - zt_begin;
+    for (int i = 0; i < nzs; i++, it++) {
+        const int b = it & 1, s0 = pbase + 2 * i;   /* the slot index of plane oz0 - 1 (before the modulo) */
         const uint8_t *sg = sgb + b * BMo * G4_CS, *sgs = sgsb + b * BMo * 8;
         ws_bar_sync(1 + b, WS_NT);   /* FULL[b] */
 #pragma unroll
         for (int vz = 0; vz < 2; vz++) {
-            const int slot = (oz0 + vz + kz) % 6;   /* plane oz0 + vz + kz - 1 */
+            const int slot = (s0 + vz + kz) % WS_NS;   /* plane oz0 + vz + kz - 1 */
 #pragma unroll
             for (int kk = 0; kk < 2; kk++) {
                 const int ks = vz * 2 + kk, r0 = 4 * kk + ky;
@@ -782,7 +799,9 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
                 }
             }
         }
-        if (i + 2 < nzs) ws_bar_arrive(3 + b, WS_NT);   /* EMPTY[b] (producers wait for it before staging z-step i + 2) */
+        if (it + 2 < ntot) ws_bar_arrive(3 + b, WS_NT);   /* EMPTY[b] (producers wait for it before staging z-step it + 2) */
+    }
+    pbase += 2 * nzs + 2;
     }
 #pragma unroll
     for (int kx = 0; kx < 3; kx++) {
@@ -952,10 +971,19 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
             static int ws_env = -1;
             if (ws_env < 0) ws_env = getenv("UFSM_F4W_WS") ? atoi(getenv("UFSM_F4W_WS")) : 1;
             if constexpr (IS_MX(T)) if (ws_env && lay == 1 && !had && !sp.up && NT == 2 && MT == 2 && (sp.x2 == nullptr || sp.c_split % 16 == 0)) {   /* MT 1 (16 outputs): no gain */
-                /* warp-specialised kernel: one block per SM, so a deeper z range per block */
-                int zc_w = zs1 - zs0 < 32 ? zs1 - zs0 : 32;
-                while (zc_w > 1 && (size_t)base * nblk_(zs1 - zs0, zc_w) < 120) zc_w--;
-                const dim3 gw3((unsigned)(nblk_(ys.w, 16) * nblk_(ys.h, 8) * nblk_(zs1 - zs0, zc_w) * ys.n), (xs.c + 15) / 16, (ys.c + 16 * MT - 1) / (16 * MT));
+                /* warp-specialised persistent kernel: the blocks of a channel tile split its (tile, z chunk) items; z chunks
+                   short enough for >= 4 items per SM, then the block count with the shortest estimated makespan (waves x
+                   items per block, in z-steps: + 1 per item for its 4-plane first step, + 6 per block for fill and drain) */
+                const int nsm = ws_nsm(), combos = ((xs.c + 15) / 16) * ((ys.c + 16 * MT - 1) / (16 * MT)) * ys.n, ntile = nblk_(ys.w, 16) * nblk_(ys.h, 8);
+                int zc_w = zs1 - zs0;
+                while (zc_w > 4 && (size_t)combos * ntile * nblk_(zs1 - zs0, zc_w) < (size_t)4 * nsm) zc_w = (zc_w + 1) / 2;
+                const int nitem = ntile * nblk_(zs1 - zs0, zc_w);
+                int nper = 1; double best = 1e30;
+                for (int k = 1; k <= nitem; k++) {
+                    const double waves = (double)nblk_(combos * k, nsm), cost = waves * ((double)nblk_(nitem, k) * (zc_w + 1) + 6);
+                    if (cost < best - 1e-9) { best = cost; nper = k; }
+                }
+                const dim3 gw3((unsigned)(nper * ys.n), (xs.c + 15) / 16, (ys.c + 16 * MT - 1) / (16 * MT));
                 static int wattr[8][2];
                 const int mi = MT - 1;
                 if (MT == 1) {
