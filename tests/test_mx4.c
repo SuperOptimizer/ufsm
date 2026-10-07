@@ -73,6 +73,24 @@ static void host_w4p(float *w, int Co, int Ci) {
 }
 static void mode_ref(void) { nn_set_tf32(0); }
 static void mode_mx(void) { nn_set_prec(3); }
+/* host reference of a 1^3 weight gradient (and bias): gw[co][ci] = sum_n,v x[n][ci][v] gy[n][co][v] */
+static void w1_ref(const float *x, shape5 xs, const float *gy, int co, float *gw, float *gb) {
+    const size_t S = shape_spatial(xs), nx = shape_numel(xs), ng = (size_t)xs.n * co * S;
+    float *hx = malloc(nx * 4), *hg = malloc(ng * 4), *hw = malloc((size_t)co * xs.c * 4), *hb = malloc((size_t)co * 4);
+    nn_d2h(hx, x, nx * 4); nn_d2h(hg, gy, ng * 4);
+    for (int o = 0; o < co; o++) {
+        double b = 0;
+        for (int n = 0; n < xs.n; n++) for (size_t v = 0; v < S; v++) b += hg[((size_t)n * co + o) * S + v];
+        hb[o] = (float)b;
+        for (int c = 0; c < xs.c; c++) {
+            double a = 0;
+            for (int n = 0; n < xs.n; n++) for (size_t v = 0; v < S; v++) a += (double)hx[((size_t)n * xs.c + c) * S + v] * hg[((size_t)n * co + o) * S + v];
+            hw[(size_t)o * xs.c + c] = (float)a;
+        }
+    }
+    nn_h2d(gw, hw, (size_t)co * xs.c * 4); if (gb) nn_h2d(gb, hb, (size_t)co * 4);
+    free(hx); free(hg); free(hw); free(hb);
+}
 int main(void) {
     nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0);
     nn_set_act_bf16(0); nn_set_grad_bf16(0);   /* non-MX operands are fp32 */
@@ -831,32 +849,33 @@ int main(void) {
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
     printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);
     (void)mode_ref; (void)mode_mx; (void)TOL4; (void)TOL; (void)G; (void)dev_rand;
-    {   /* wide heads (band affinity outputs): 1^3 weight gradient, 16 MX inputs (optionally GN+SiLU) x 3..8 outputs, vs fp32 */
-        shape5 xs = {2, 16, 6, 10, 12};
+    for (int CI = 16; CI <= 32; CI += 16) {   /* wide heads (band affinity outputs): 1^3 weight gradient, 16 / 32 MX inputs (optionally
+                                                 GN+SiLU) x 3..8 outputs, vs fp32 */
+        shape5 xs = {2, CI, 6, 10, 12};
         const size_t S = shape_spatial(xs);
         for (int dt = 4; dt <= 8; dt += 4) for (int co = 3; co <= 8; co += 4) for (int G = 0; G <= 4; G += 4) {
             shape5 ys = xs; ys.c = co;
             float *x = dev_rand(shape_numel(xs), 2.f), *gy = dev_rand(shape_numel(ys), 1.f);
             void *xm = dt == 4 ? mx4_from(x, xs) : mx8_from(x, xs); float *xd = dt == 4 ? deq4(xm, xs) : deq8(xm, xs);
-            float *gam = dev_rand(16, 1.f), *bet = dev_rand(16, 0.5f), *mean = dev_rand((size_t)xs.n * 4, 0.2f), *rstd = dev_rand((size_t)xs.n * 4, 0.3f);
+            float *gam = dev_rand(CI, 1.f), *bet = dev_rand(CI, 0.5f), *mean = dev_rand((size_t)xs.n * 4, 0.2f), *rstd = dev_rand((size_t)xs.n * 4, 0.3f);
             { float h[8]; nn_d2h(h, rstd, (size_t)xs.n * 4 * 4); for (int k = 0; k < xs.n * 4; k++) h[k] = 0.8f + fabsf(h[k]); nn_h2d(rstd, h, (size_t)xs.n * 4 * 4); }
-            float *xa = dev_zero(shape_numel(xs)), *gr = dev_zero((size_t)co * 16), *gw = dev_zero((size_t)co * 16);
+            float *xa = dev_zero(shape_numel(xs)), *gr = dev_zero((size_t)co * CI), *gw = dev_zero((size_t)co * CI);
             mode_ref();
             if (G) nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, xa); else nn_d2d(xa, xd, shape_numel(xs) * 4);
-            nn_conv3d_bwd_weight(xa, xs, gy, ys, 1, 1, gr, nullptr);
+            if (CI == 16) nn_conv3d_bwd_weight(xa, xs, gy, ys, 1, 1, gr, nullptr); else w1_ref(xa, xs, gy, co, gr, nullptr);
             gnp_t gp = {G ? gam : nullptr, G ? bet : nullptr, G ? mean : nullptr, G ? rstd : nullptr, G};
             lp_bwd_w1_mx(xm, dt == 4 ? 4 : 3, xs, gy, 0, ys, gw, gp);
-            char nm[96]; snprintf(nm, sizeof nm, "head wgrad 16 -> %d, mx%d%s", co, dt, G ? ", gn+silu" : "");
-            cmp(nm, gw, gr, (size_t)co * 16, 1e-4);
+            char nm[96]; snprintf(nm, sizeof nm, "head wgrad %d -> %d, mx%d%s", CI, co, dt, G ? ", gn+silu" : "");
+            cmp(nm, gw, gr, (size_t)co * CI, 1e-4);
             {   /* fp16 gy (the training storage): tensor-core kernel with the bias gradient in the same pass; fp16 rounding of
                    gy and of the activations bounds the agreement */
                 const int f16 = nn_get_f16(); nn_set_f16(1);
                 void *gyh = nn_malloc(shape_numel(ys) * 2); nn_f32_to_h16(gy, shape_numel(ys), gyh, 1.f);
-                float *grb = dev_zero(co), *gw2 = dev_zero((size_t)co * 16), *gb2 = dev_zero(co), *gr2 = dev_zero((size_t)co * 16);
-                mode_ref(); nn_conv3d_bwd_weight(xa, xs, gy, ys, 1, 1, gr2, grb);
+                float *grb = dev_zero(co), *gw2 = dev_zero((size_t)co * CI), *gb2 = dev_zero(co), *gr2 = dev_zero((size_t)co * CI);
+                mode_ref(); if (CI == 16) nn_conv3d_bwd_weight(xa, xs, gy, ys, 1, 1, gr2, grb); else w1_ref(xa, xs, gy, co, gr2, grb);
                 const int bd = lp_bwd_w1_mx_b(xm, dt == 4 ? 4 : 3, xs, gyh, 2, ys, gw2, gb2, gp);
-                char nm2[112]; snprintf(nm2, sizeof nm2, "head wgrad 16 -> %d, mx%d%s, fp16 gy (tensor cores)", co, dt, G ? ", gn+silu" : "");
-                cmp(nm2, gw2, gr2, (size_t)co * 16, 3e-3);
+                char nm2[112]; snprintf(nm2, sizeof nm2, "head wgrad %d -> %d, mx%d%s, fp16 gy (tensor cores)", CI, co, dt, G ? ", gn+silu" : "");
+                cmp(nm2, gw2, gr2, (size_t)co * CI, 3e-3);
                 if (bd) { snprintf(nm2, sizeof nm2, "head bias grad -> %d, fp16 gy, same pass", co); cmp(nm2, gb2, grb, co, 3e-3); }
                 else { printf("  head wgrad fp16 gy: tensor-core path not taken  FAIL\n"); bad++; }
                 nn_set_f16(f16); nn_free(gyh); nn_free(grb); nn_free(gw2); nn_free(gb2); nn_free(gr2);

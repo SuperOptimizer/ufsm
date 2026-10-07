@@ -155,68 +155,83 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
    Per warp and 16 voxels: lanes 0-15 dequantise one voxel row each and apply the GN+SiLU affine into fp16 A[ci][voxel],
    lanes 16-31 copy that voxel's gy into B[co][voxel] (and sum it for the bias); one m16n8k16 MMA with fp32 accumulation.
    The fp16 rounding of act(x) is the only numerical difference from conv_bwd_w1_mx1_k. */
-template <int B>
+template <int B, int CI>   /* CI = 16 or 32 input channels (one MX block row): CI / 16 MMA row tiles per 16 voxels */
 __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const __half *gy, float *gw, float *gb, int N, size_t S, gnp_t gp, int nper, int Co) {
-    __shared__ float ca[16], cb[16], red[8][16 * 8 + 8];
-    __shared__ __align__(16) __half sA[8][16][24], sB[8][8][24];   /* [warp][ci][voxel], [warp][co][voxel]; rows padded */
+    constexpr int MTI = CI / 16;
+    __shared__ float ca[CI], cb[CI], red[8][CI * 8 + 8];
+    __shared__ __align__(16) __half sA[8][CI][40], sB[8][8][40];   /* [warp][ci][voxel], [warp][co][voxel] (32 voxels); rows padded */
     const int n = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if (threadIdx.x < 16) {
+    if (threadIdx.x < CI) {
         const int k = threadIdx.x;
         float a = 1.f, bb = 0.f;
-        if (gp.G) { const int ng = n * gp.G + k / (16 / gp.G); a = gp.rstd[ng] * gp.gamma[k]; bb = gp.beta[k] - gp.mean[ng] * a; }
+        if (gp.G) { const int ng = n * gp.G + k / (CI / gp.G); a = gp.rstd[ng] * gp.gamma[k]; bb = gp.beta[k] - gp.mean[ng] * a; }
         ca[k] = a; cb[k] = bb;
     }
     __syncthreads();
-    const uint8_t *sc = mx_sc<B>(x, N, 16, S);
-    float c[4] = {0.f, 0.f, 0.f, 0.f}, bs[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-    const int j = lane & 15, g = lane >> 2, t4 = lane & 3;
-    const size_t v0 = (size_t)blockIdx.x * nper, v1 = min(S, v0 + nper);
-    for (size_t vb = v0 + warp * 16; vb < v1; vb += 8 * 16) {
-        const size_t v = vb + j; const bool in = v < v1;
-        if (lane < 16) {
-            float r[32];
-            if (in) mx_load_row_b<B>(x, sc, (size_t)n * S + v, 16, r);
+    const uint8_t *sc = mx_sc<B>(x, N, CI, S);
+    float c[MTI][4], bs[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-            for (int k = 0; k < 16; k++) sA[warp][k][j] = __float2half_rn(in ? (gp.G ? act_ab(r[k], ca[k], cb[k], true) : r[k]) : 0.f);
-        } else {
+    for (int m = 0; m < MTI; m++) c[m][0] = c[m][1] = c[m][2] = c[m][3] = 0.f;
+    const int g = lane >> 2, t4 = lane & 3;
+    const size_t v0 = (size_t)blockIdx.x * nper, v1 = min(S, v0 + nper);
+    for (size_t vb = v0 + warp * 32; vb < v1; vb += 8 * 32) {   /* 32 voxels per warp step: lane = voxel (its x row and its gy) */
+        const size_t v = vb + lane; const bool in = v < v1;
+        {
+            float r[32];
+            if (in) mx_load_row_b<B>(x, sc, (size_t)n * S + v, CI, r);
+#pragma unroll
+            for (int k = 0; k < CI; k++) sA[warp][k][lane] = __float2half_rn(in ? (gp.G ? act_ab(r[k], ca[k], cb[k], true) : r[k]) : 0.f);
 #pragma unroll
             for (int co = 0; co < 8; co++) {
                 const __half h = in && co < Co ? gy[((size_t)n * Co + co) * S + v] : __float2half_rn(0.f);
-                sB[warp][co][j] = h; bs[co] += __half2float(h);
+                sB[warp][co][lane] = h; bs[co] += __half2float(h);
             }
         }
         __syncwarp();
-        unsigned a[4], b[2];
-        a[0] = *(const unsigned *)&sA[warp][g][2 * t4];     a[1] = *(const unsigned *)&sA[warp][g + 8][2 * t4];
-        a[2] = *(const unsigned *)&sA[warp][g][2 * t4 + 8]; a[3] = *(const unsigned *)&sA[warp][g + 8][2 * t4 + 8];
-        b[0] = *(const unsigned *)&sB[warp][g][2 * t4];     b[1] = *(const unsigned *)&sB[warp][g][2 * t4 + 8];
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                     : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#pragma unroll
+        for (int ks = 0; ks < 2; ks++) {
+            unsigned b[2];
+            b[0] = *(const unsigned *)&sB[warp][g][16 * ks + 2 * t4];     b[1] = *(const unsigned *)&sB[warp][g][16 * ks + 2 * t4 + 8];
+#pragma unroll
+            for (int m = 0; m < MTI; m++) {
+                unsigned a[4];
+                a[0] = *(const unsigned *)&sA[warp][16 * m + g][16 * ks + 2 * t4];     a[1] = *(const unsigned *)&sA[warp][16 * m + g + 8][16 * ks + 2 * t4];
+                a[2] = *(const unsigned *)&sA[warp][16 * m + g][16 * ks + 2 * t4 + 8]; a[3] = *(const unsigned *)&sA[warp][16 * m + g + 8][16 * ks + 2 * t4 + 8];
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                             : "+f"(c[m][0]), "+f"(c[m][1]), "+f"(c[m][2]), "+f"(c[m][3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+            }
+        }
         __syncwarp();
     }
-    /* C[ci][co]: c0, c1 = C[g][2 t4 .. + 1], c2, c3 = C[g + 8][2 t4 .. + 1] */
-    red[warp][g * 8 + 2 * t4] = c[0]; red[warp][g * 8 + 2 * t4 + 1] = c[1];
-    red[warp][(g + 8) * 8 + 2 * t4] = c[2]; red[warp][(g + 8) * 8 + 2 * t4 + 1] = c[3];
+    /* C[ci][co]: c0, c1 = C[16 m + g][2 t4 .. + 1], c2, c3 = C[16 m + g + 8][2 t4 .. + 1] */
 #pragma unroll
-    for (int co = 0; co < 8; co++) { float s = bs[co]; for (int o = 8; o; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o); bs[co] = s; }
-    if (lane == 16) for (int co = 0; co < 8; co++) red[warp][128 + co] = bs[co];
+    for (int m = 0; m < MTI; m++) {
+        red[warp][(16 * m + g) * 8 + 2 * t4] = c[m][0]; red[warp][(16 * m + g) * 8 + 2 * t4 + 1] = c[m][1];
+        red[warp][(16 * m + g + 8) * 8 + 2 * t4] = c[m][2]; red[warp][(16 * m + g + 8) * 8 + 2 * t4 + 1] = c[m][3];
+    }
+#pragma unroll
+    for (int co = 0; co < 8; co++) { float s = bs[co]; for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o); bs[co] = s; }
+    if (lane == 0) for (int co = 0; co < 8; co++) red[warp][CI * 8 + co] = bs[co];
     __syncthreads();
-    if (threadIdx.x < 136) {
+    for (int i = threadIdx.x; i < CI * 8 + 8; i += blockDim.x) {
         float s = 0.f;
-        for (int w = 0; w < 8; w++) s += red[w][threadIdx.x];
-        if (threadIdx.x < 128) { const int ci = threadIdx.x / 8, co = threadIdx.x % 8; if (co < Co) atomicAdd(&gw[(size_t)co * 16 + ci], s); }
-        else if (gb && threadIdx.x - 128 < Co) atomicAdd(&gb[threadIdx.x - 128], s);
+        for (int w = 0; w < 8; w++) s += red[w][i];
+        if (i < CI * 8) { const int ci = i / 8, co = i % 8; if (co < Co) atomicAdd(&gw[(size_t)co * CI + ci], s); }
+        else if (gb && i - CI * 8 < Co) atomicAdd(&gb[i - CI * 8], s);
     }
 }
 /* returns 1 when the bias gradient (gb) was accumulated as well (tensor-core head path), else 0 (the caller adds it) */
 extern "C" int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp) {
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
-    if (!old && xs.c == 16 && ys.c <= 8 && gydt == 2 && (!gp.G || 16 % gp.G == 0)) {
+    if (!old && (xs.c == 16 || xs.c == 32) && ys.c <= 8 && gydt == 2 && (!gp.G || xs.c % gp.G == 0)) {
         const size_t S = shape_spatial(xs);
         const int nper = 8192;
         const dim3 grid((unsigned)((S + nper - 1) / nper), xs.n);
-        if (xdt == 4) conv_bwd_w1_tc_k<4><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c);
-        else conv_bwd_w1_tc_k<8><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c);
+        if (xs.c == 32) {   /* 32 inputs: the CUDA-core kernel kept 32 x 8 accumulators per thread (spilled; 14.4 vs ~2 ms at 384^3) */
+            if (xdt == 4) conv_bwd_w1_tc_k<4, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c);
+            else conv_bwd_w1_tc_k<8, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c);
+        } else if (xdt == 4) conv_bwd_w1_tc_k<4, 16><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c);
+        else conv_bwd_w1_tc_k<8, 16><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c);
         LPCK();
         return gb != nullptr;
     }
