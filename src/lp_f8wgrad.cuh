@@ -295,7 +295,7 @@ extern int g_f8w_coop;
 template <int MT, int NT, typename T, typename TG> static void launch_bw8(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC) {
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f8_k<MT, NT, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    const int coop = g_f8w_coop | ((g_f8w_coop & 4) && xs.c <= 8 && ys.c <= 16 ? 2 : 0);   /* bit 2: the cooperative gy path for the network input conv */
+    const int coop = g_f8w_coop | ((g_f8w_coop & 4) && xs.c <= 8 && ys.c <= 32 ? 2 : 0);   /* bit 2: the cooperative gy path for the network input conv */
     conv_bwd_w_f8_k<MT, NT, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, coop);
 }
 template <typename T, typename TG> void bwd_w_f8_t(const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {

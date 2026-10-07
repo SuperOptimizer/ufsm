@@ -8,8 +8,16 @@
    (MX-fp8 values are exact in bf16; zero outside the coarse grid) and writes each fine voxel's MX-fp8 row once (decoded,
    added to the existing row when accumulating, re-encoded). Differs from the fp32 parity kernel by the bf16 weights
    (2^-9 relative, below the e4m3 output rounding) and the summation order. */
+/* the weights once per call as bf16 [27 taps][C ci][C + 8 co] (the kernels' per-class A tiles are then contiguous 16-byte copies) */
+template <int C> __global__ void s2tc_prep_w_k(const float *__restrict__ w, __nv_bfloat16 *__restrict__ wtg) {
+    constexpr int GROW = C + 8;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 27 * C * GROW) return;
+    const int co = i % GROW, ci = (i / GROW) % C, tap = i / (GROW * C);
+    wtg[i] = __float2bfloat16_rn(co < C ? w[((size_t)co * C + ci) * 27 + tap] : 0.f);
+}
 template <int C>
-__global__ void __launch_bounds__(256) bwd_data_s2_tc_k(const uint8_t *__restrict__ gy, const float *__restrict__ w, uint8_t *__restrict__ gx,
+__global__ void __launch_bounds__(256) bwd_data_s2_tc_k(const uint8_t *__restrict__ gy, const __nv_bfloat16 *__restrict__ wtg, uint8_t *__restrict__ gx,
                                                      int N, int D, int H, int W, int Do, int Ho, int Wo, int accum) {
     constexpr int TMZ = 2, TMY = 8, TMX = C == 16 ? 16 : 8;   /* class positions per block */
     constexpr int GZ = TMZ + 1, GY = TMY + 1, GX = TMX + 1, GROW = C + 8;   /* gy tile, rows padded by 8 bf16 (bank spread) */
@@ -47,16 +55,29 @@ __global__ void __launch_bounds__(256) bwd_data_s2_tc_k(const uint8_t *__restric
         const int pz = p >> 2, py = (p >> 1) & 1, px = p & 1;
         const int nz = pz ? 2 : 1, ny = py ? 2 : 1, nx = px ? 2 : 1, ntap = nz * ny * nx;
         __syncthreads();   /* the previous class's A tiles are consumed (and, for p = 0, the gy tile is written) */
-        for (int i = threadIdx.x; i < ntap * C * C; i += blockDim.x) {
-            const int co = i % C, ci = (i / C) % C, tl = i / (C * C);
+        constexpr int TQ = C * GROW / 8;   /* uint4 per tap tile */
+        for (int i = threadIdx.x; i < ntap * TQ; i += blockDim.x) {
+            const int tl = i / TQ, j = i % TQ;
             const int a = tl / (ny * nx), bb = (tl / nx) % ny, c = tl % nx;
             const int kz = pz ? (a ? 2 : 0) : 1, ky = py ? (bb ? 2 : 0) : 1, kx = px ? (c ? 2 : 0) : 1;
-            wt[((size_t)tl * C + ci) * GROW + co] = __float2bfloat16_rn(w[((size_t)co * C + ci) * 27 + (kz * 3 + ky) * 3 + kx]);
+            ((uint4 *)(wt + (size_t)tl * C * GROW))[j] = __ldg((const uint4 *)(wtg + (size_t)((kz * 3 + ky) * 3 + kx) * C * GROW) + j);
         }
         __syncthreads();
 #pragma unroll 1
         for (int nt = 0; nt < NTW; nt++) {
             const int tile = warp * NTW + nt, row = tile / (TMX / 8), xh = tile % (TMX / 8), rz = row / TMY, ry = row % TMY;
+            /* this lane's slice of the old gx row (accumulating), loaded before the MMA so its latency is hidden */
+            constexpr int CQ = C / 4;
+            const int vl = lane >> 2, part = lane & 3;
+            const int uz = 2 * (mz0 + rz) + pz, uy = 2 * (my0 + ry) + py, ux = 2 * (mx0 + 8 * xh + vl) + px;
+            const bool ok = uz < D && uy < H && ux < W;
+            const size_t ri = ok ? (size_t)n * S + ((size_t)uz * H + uy) * W + ux : 0;
+            unsigned wd[CQ / 4] = {}, osc = 0u;
+            if (accum && ok) {
+                if constexpr (CQ == 8) { const uint2 u = *(const uint2 *)(gx + ri * C + part * CQ); wd[0] = u.x; wd[1] = u.y; }
+                else wd[0] = *(const unsigned *)(gx + ri * C + part * CQ);
+                osc = xsc[ri];   /* plain loads: this thread rewrites the row below */
+            }
             float acc[MT][4];
 #pragma unroll
             for (int m = 0; m < MT; m++) acc[m][0] = acc[m][1] = acc[m][2] = acc[m][3] = 0.f;
@@ -85,26 +106,29 @@ __global__ void __launch_bounds__(256) bwd_data_s2_tc_k(const uint8_t *__restric
                 wob[(2 * t) * C + 16 * m + g + 8] = acc[m][2]; wob[(2 * t + 1) * C + 16 * m + g + 8] = acc[m][3];
             }
             __syncwarp();
-            if (lane < 8) {
-                const int mz = mz0 + rz, my = my0 + ry, mx = mx0 + 8 * xh + lane;
-                const int uz = 2 * mz + pz, uy = 2 * my + py, ux = 2 * mx + px;
-                if (uz < D && uy < H && ux < W) {
-                    const size_t ri = (size_t)n * S + ((size_t)uz * H + uy) * W + ux;
-                    float v[32];
+            {   /* 4 lanes per voxel (lane >> 2), C / 4 channels each: add the old row (accumulating), block amax by shuffles,
+                   encode (the same per-value conversions as mxf<8>::enc_row) */
+                float v[CQ];
 #pragma unroll
-                    for (int k = 0; k < 32; k++) v[k] = k < C ? wob[lane * C + k] : 0.f;
-                    if (accum) {
-                        float o[32];
-                        mxf<8>::dec_row(gx + ri * C, C, mx_scale(xsc[ri]), o);
+                for (int k = 0; k < CQ; k++) v[k] = wob[vl * C + part * CQ + k];
+                if (accum && ok) {
+                    const float sc = mx_scale(osc);
 #pragma unroll
-                        for (int k = 0; k < C; k++) v[k] += o[k];
+                    for (int q = 0; q < CQ / 4; q++) {
+                        const float2 d0 = dec_e4m3x2((unsigned short)(wd[q] & 0xffffu)), d1 = dec_e4m3x2((unsigned short)(wd[q] >> 16));
+                        v[4 * q] += d0.x * sc; v[4 * q + 1] += d0.y * sc; v[4 * q + 2] += d1.x * sc; v[4 * q + 3] += d1.y * sc;
                     }
-                    unsigned am = 0u;
+                }
+                unsigned am = 0u;
 #pragma unroll
-                    for (int k = 0; k < C; k++) am = amax_u(am, v[k]);
-                    const int e = mx_exp(__uint_as_float(am), mxf<8>::inv_qmax);
-                    mxf<8>::enc_row(gx + ri * C, C, v, exp2i(-e));
-                    gx[(size_t)N * S * C + ri] = (uint8_t)(e + 127);
+                for (int k = 0; k < CQ; k++) am = amax_u(am, v[k]);
+                am = max(am, __shfl_xor_sync(0xffffffffu, am, 1)); am = max(am, __shfl_xor_sync(0xffffffffu, am, 2));
+                const int e = mx_exp(__uint_as_float(am), mxf<8>::inv_qmax);
+                const float m = exp2i(-e);
+                if (ok) {
+                    if constexpr (CQ == 8) *(uint2 *)(gx + ri * C + part * CQ) = make_uint2(mxf<8>::enc8x(v, m), mxf<8>::enc8x(v + 4, m));
+                    else *(unsigned *)(gx + ri * C + part * CQ) = mxf<8>::enc8x(v, m);
+                    if (part == 0) gx[(size_t)N * S * C + ri] = (uint8_t)(e + 127);
                 }
             }
             __syncwarp();   /* the warp's output buffer is reused by the next tile */
@@ -125,8 +149,14 @@ extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, s
         if (C == 16) cudaFuncSetAttribute((const void *)bwd_data_s2_tc_k<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
         else cudaFuncSetAttribute((const void *)bwd_data_s2_tc_k<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
     }
-    if (C == 16) bwd_data_s2_tc_k<16><<<nb, 256, sm>>>((const uint8_t *)gy, w, (uint8_t *)gx, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum);
-    else bwd_data_s2_tc_k<32><<<nb, 256, sm>>>((const uint8_t *)gy, w, (uint8_t *)gx, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum);
+    __nv_bfloat16 *wtg = lp_buf<__nv_bfloat16>(0, (size_t)27 * C * (C + 8));
+    if (C == 16) {
+        s2tc_prep_w_k<16><<<nblk_(27 * 16 * 24, 256), 256>>>(w, wtg);
+        bwd_data_s2_tc_k<16><<<nb, 256, sm>>>((const uint8_t *)gy, wtg, (uint8_t *)gx, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum);
+    } else {
+        s2tc_prep_w_k<32><<<nblk_(27 * 32 * 40, 256), 256>>>(w, wtg);
+        bwd_data_s2_tc_k<32><<<nb, 256, sm>>>((const uint8_t *)gy, wtg, (uint8_t *)gx, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum);
+    }
     LPCK();
     return 1;
 }

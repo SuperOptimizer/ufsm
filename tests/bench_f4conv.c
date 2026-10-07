@@ -35,7 +35,7 @@ static void run(job *j, unsigned it) {
     if (j->osum) nn_zero(j->osum, 2 * 64 * sizeof(double));
     lp_conv_fwd_f4(j->x, j->xb, j->xs, j->w, j->b, j->co, j->y, j->xb, j->gp, j->osum, j->Go, sp);
 }
-/* BENCH_ONLY: comma list of sections to run (fwd, upfwd, f8fwd, wgrad, up, gnbwd, f8w, s2b, up2; default all); BENCH_WL: one wgrad case index */
+/* BENCH_ONLY: comma list of sections to run (fwd, upfwd, f8fwd, wgrad, up, gnbwd, f8w, w32, s2b, up2; default all); BENCH_WL: one wgrad case index */
 static int want(const char *key) {
     const char *o = getenv("BENCH_ONLY");
     if (!o) return 1;
@@ -209,6 +209,53 @@ int main(int argc, char **argv) {
         nn_d2h(h, gw, 16 * 4 * 27 * 4); a = 0; for (int i = 0; i < 16 * 4 * 27; i++) a += fabs(h[i]);
         printf("%-32s @%d %8.3f ms  |gw| %.9g\n", "wgrad stem 4 -> 16 (fp8, SR)", P, best, a);
         nn_free(xi); nn_free(g4); nn_free(gw); nn_free(gb);
+    }
+    if (want("w32")) {   /* level 0 of the 32,64,... net: stem 4 -> 32 wgrad, down0 32 -> 32 stride-2 wgrad / bdata, head 32 -> 7 wgrad */
+        const int Pc = P / 2; const size_t Sc = (size_t)Pc * Pc * Pc;
+        double best;
+        {
+            shape5 x4 = {1, 4, P, P, P}, y32 = {1, 32, P, P, P};
+            void *xi = mx(8, 4, S, 2.f, 101), *g = mx(8, 32, S, 1e-3f, 102);
+            float *gw = nn_malloc(32 * 4 * 27 * 4), *gb = nn_malloc(32 * 4);
+            best = 1e9;
+            for (unsigned it = 0; it < 8; it++) {
+                split_t sp = {0}; sp.sr = 0x6d2b79f5u + it;
+                nn_zero(gw, 32 * 4 * 27 * 4); nn_zero(gb, 32 * 4);
+                nn_sync(); double t0 = now(); lp_bwd_w_f8(xi, 3, x4, g, 3, y32, gw, gb, (gnp_t){0}, sp); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+            }
+            printf("%-32s @%d %8.3f ms\n", "wgrad stem 4 -> 32 (fp8, SR)", P, best);
+            nn_free(xi); nn_free(g); nn_free(gw); nn_free(gb);
+        }
+        {
+            shape5 xs = {1, 32, P, P, P}, ys = {1, 32, Pc, Pc, Pc};
+            void *x = mx(4, 32, S, 2.f, 103), *gy = mx(8, 32, Sc, 1e-3f, 104), *gx = mx(8, 32, S, 1e-3f, 105);
+            float *gw = nn_malloc(32 * 32 * 27 * 4), *gb = nn_malloc(32 * 4), *w = rnd((size_t)32 * 32 * 27, 0.1f, 106);
+            best = 1e9;
+            for (int it = 0; it < 8; it++) {
+                nn_zero(gw, 32 * 32 * 27 * 4); nn_zero(gb, 32 * 4);
+                nn_sync(); double t0 = now(); lp_bwd_w_s2_f8(x, 4, xs, gy, 3, ys, gw, gb, (gnp_t){0}); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+            }
+            printf("%-32s @%d %8.3f ms\n", "wgrad s2 down0 32 -> 32 (fp8)", P, best);
+            best = 1e9;
+            for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
+            nn_free(gx); gx = mx(8, 32, S, 1e-3f, 105); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1); nn_sync();
+            printf("%-32s @%d %8.3f ms  out %016llx\n", "bdata s2 down0 32 -> 32 (mx8, acc)", P, best, (unsigned long long)fnv(gx, lp_mx8_bytes(1, 32, S)));
+            nn_free(x); nn_free(gy); nn_free(gx); nn_free(gw); nn_free(gb); nn_free(w);
+        }
+        {
+            shape5 xs = {1, 32, P, P, P}, ys = {1, 7, P, P, P};
+            void *x = mx(4, 32, S, 2.f, 107); float *gyf = rnd(S * 7, 1e-3f, 108); void *gyh = nn_malloc(S * 7 * 2);
+            nn_f32_to_h16(gyf, S * 7, gyh, 1.f);
+            float *gw = nn_malloc(7 * 32 * 4), *gb = nn_malloc(7 * 4);
+            const gnp_t gp = {gam, bet, mean, rstd, G};
+            best = 1e9;
+            for (int it = 0; it < 8; it++) {
+                nn_zero(gw, 7 * 32 * 4); nn_zero(gb, 7 * 4);
+                nn_sync(); double t0 = now(); lp_bwd_w1_mx_b(x, 4, xs, gyh, 2, ys, gw, gb, gp); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+            }
+            printf("%-32s @%d %8.3f ms\n", "wgrad head 32 -> 7 (mx4 x, fp16 gy)", P, best);
+            nn_free(x); nn_free(gyf); nn_free(gyh); nn_free(gw); nn_free(gb);
+        }
     }
     if (want("s2b")) {   /* stride-2 backward-data, accumulating into the level's gradient (down0: 16 -> 16, down1: 32 -> 32 at P / 2) */
         for (int l = 0; l < 2; l++) {

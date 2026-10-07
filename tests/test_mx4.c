@@ -730,8 +730,8 @@ int main(void) {
            voxel for all outputs) must reproduce the per-element staging bit for bit, SR and gn+silu included */
         const int Gn = 8;
         struct { int ci, co, w; const char *nm; } cs[] = {{32, 32, 16, "32 -> 32, W 16"}, {16, 16, 20, "16 -> 16, W 20"}, {48, 16, 16, "48 -> 16 (NT 3)"}, {80, 80, 12, "80 -> 80, W 12"},
-                                                          {4, 16, 16, "4 -> 16 (network input), W 16"}};
-        for (int i = 0; i < 5; i++) {
+                                                          {4, 16, 16, "4 -> 16 (network input), W 16"}, {4, 32, 16, "4 -> 32 (network input), W 16"}};
+        for (int i = 0; i < 6; i++) {
             shape5 xs = {2, cs[i].ci, 6, 10, cs[i].w}, ys = xs; ys.c = cs[i].co;
             size_t nx = shape_numel(xs), ny = shape_numel(ys), nw = (size_t)cs[i].co * cs[i].ci * 27, NG = (size_t)2 * Gn;
             float *xr = dev_rand(nx, 2.f), *gr = dev_rand(ny, 1e-3f);
