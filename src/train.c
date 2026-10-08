@@ -493,20 +493,22 @@ int cmd_train(int argc, char **argv) {
             fprintf(stderr, "memory: MX-fp8 gradients, chunked, lean 2, wide finest-level up gradient (explicit mode)\n");
             { char mp[1400]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp); }
         } else if ((!strcmp(mm, "auto") || auto16) && nn_get_tf32() && !getenv("UFSM_CHUNK_UP") && !getenv("UFSM_RECOMPUTE") && !getenv("UFSM_GRAD_MX8")) {
-            static const struct { int chunk, rc, gmx, lean; const char *what; } cand[] = {
+            static const struct { int chunk, rc, gmx, lean, sea; const char *what; } cand[] = {
                 /* by step cost (MX-fp8 gradients passed their 3-seed stair and cost nothing; lean costs ~nothing, the upload is
                    ~3% of a large-window step; recompute 2 ~10%), the 16-bit-gradient modes only for --mem auto16 / 16-bit activations.
                    Model bytes per level-0 voxel / step at 96^3 B2 (--fp4 1): MX-fp8 164 / 26.2 ms, + chunked 148 / 27.2, + recompute 2
                    133 / 29.8; 16-bit default 219 / 26.4, chunked 186 / 27.4, + recompute 2 171 / 29.8. lean 1: one batch buffer, logits
                    in A, logit gradient / targets / mask (/ input) in B; lean 2: no gradient buffer B (each block's incoming gradient
                    buffer serves as B), -17 B */
-                {1, 1, 1, 0, "MX-fp8 gradients"}, {2, 1, 1, 0, "MX-fp8 gradients, chunked up-part gradient"},
-                {2, 1, 1, 1, "MX-fp8 gradients, chunked, lean"}, {2, 1, 1, 2, "MX-fp8 gradients, chunked, lean 2"},
-                {2, 2, 1, 0, "MX-fp8 gradients, chunked, recompute 2"}, {2, 2, 1, 1, "MX-fp8 gradients, chunked, recompute 2, lean"},
-                {2, 2, 1, 2, "MX-fp8 gradients, chunked, recompute 2, lean 2"},
-                {1, 1, 0, 0, "16-bit gradients"}, {2, 1, 0, 0, "16-bit gradients, chunked up-part gradient (UFSM_CHUNK_UP=2)"},
-                {2, 2, 0, 0, "16-bit gradients, chunked, recompute 2"}, {2, 2, 0, 1, "16-bit gradients, chunked, recompute 2, lean"},
-                {2, 2, 0, 2, "16-bit gradients, chunked, recompute 2, lean 2"}};
+                {1, 1, 1, 0, 0, "MX-fp8 gradients"}, {2, 1, 1, 0, 0, "MX-fp8 gradients, chunked up-part gradient"},
+                {2, 1, 1, 1, 0, "MX-fp8 gradients, chunked, lean"}, {2, 1, 1, 2, 0, "MX-fp8 gradients, chunked, lean 2"},
+                {2, 1, 1, 2, 1, "MX-fp8 gradients, chunked, lean 2, shared encoder a1"},   /* ~-22 B / level-0 voxel, ~2.5% (encoder conv1 re-run) */
+                {2, 2, 1, 0, 0, "MX-fp8 gradients, chunked, recompute 2"}, {2, 2, 1, 1, 0, "MX-fp8 gradients, chunked, recompute 2, lean"},
+                {2, 2, 1, 2, 0, "MX-fp8 gradients, chunked, recompute 2, lean 2"},
+                {1, 1, 0, 0, 0, "16-bit gradients"}, {2, 1, 0, 0, 0, "16-bit gradients, chunked up-part gradient (UFSM_CHUNK_UP=2)"},
+                {2, 2, 0, 0, 0, "16-bit gradients, chunked, recompute 2"}, {2, 2, 0, 1, 0, "16-bit gradients, chunked, recompute 2, lean"},
+                {2, 2, 0, 2, 0, "16-bit gradients, chunked, recompute 2, lean 2"}};
+            const int sea_force = ufsm_env_on("UFSM_RC_ENC_A1");   /* shared encoder a1 in every mode where it applies (recompute 1) */
             const int nc = (int)(sizeof cand / sizeof cand[0]);
             size_t fmin = (size_t)-1;
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); size_t f = nn_mem_free(); if (f < fmin) fmin = f; }
@@ -516,16 +518,17 @@ int cmd_train(int argc, char **argv) {
             int pick = -1; size_t need = 0;
             for (int c = 0; c < nc && pick < 0; c++) {
                 if (cand[c].gmx == auto16) continue;   /* auto: MX-fp8 gradient modes; auto16: the 16-bit ones */
-                unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean);
+                unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean); unet_set_share_enc_a1(cand[c].sea || sea_force);
                 const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
                 size_t trainer = nbuf * ((size_t)B * 4 * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
                 if (cand[c].lean) trainer = cand[c].gmx ? 0 : (size_t)B * 4 * p3 * xbytes();   /* batch buffers inside the gradient buffer B (estimate) */
                 need = tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (need <= fmin) pick = c;
             }
-            if (pick < 0) { pick = auto16 ? nc - 1 : 6; /* the smallest mode of the list */ fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
+            if (pick < 0) { pick = auto16 ? nc - 1 : 7; /* the smallest mode of the list */ fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
             else fprintf(stderr, "memory: %s, %.2f of %.2f GB free per GPU\n", cand[pick].what, need / 1e9, fmin / 1e9);
-            unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean);
+            unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean); unet_set_share_enc_a1(cand[pick].sea || sea_force);
+            if (unet_share_enc_a1() && !cand[pick].sea) fprintf(stderr, "memory: + shared encoder a1 (UFSM_RC_ENC_A1)\n");
             lean = cand[pick].lean;
             { char mp[1400]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp); }   /* the planner's modes */
         }

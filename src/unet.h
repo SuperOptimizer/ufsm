@@ -107,6 +107,8 @@ int unet_act_mx(void);   /* 1: MX activation storage (MX-fp8 gradients need it) 
 void unet_set_chunk_up(int on);   /* chunked up-part gradient: 0 off, 1 (default) 16-bit storage only, 2 also under MX storage */
 void unet_set_wide_up_grad(int on);   /* optional larger level-0 MX8 up-gradient scratch under lean 2; default off, env UFSM_WIDE_UP_GRAD */
 int unet_wide_up_grad(void);
+void unet_set_share_enc_a1(int on);   /* training, recompute 1: encoder blocks above the bottom keep no a1 (backward re-runs conv1 into the same-level decoder's a1) */
+int unet_share_enc_a1(void);
 size_t unet_train_bytes(unet *u, shape5 xs);   /* training activation + gradient bytes at xs for the current modes (dry build) */
 size_t unet_grad_bytes(const unet *u);   /* the activation-gradient part of unet_activation_bytes */
 /* spatial split of one window along z across two GPUs (src/split.h): side 0 holds the low z planes, side 1 the high ones, each

@@ -96,6 +96,8 @@ $(B)/test_infer_buffers: tests/test_infer_buffers.c $(B)/unet.o $(B)/nn.o $(B)/n
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_recompute_live: tests/test_recompute_live.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/test_share_enc_a1: tests/test_share_enc_a1.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/bench_f4conv: tests/bench_f4conv.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/bench_head: tests/bench_head.c $(B)/nn.o $(B)/nn_fp8.o
@@ -198,7 +200,7 @@ test-all: $(B)/test_wgrad_grid
 $(B):
 	mkdir -p $(B)
 
-test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/check_surface_samples $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon
+test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/check_surface_samples $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon
 	./$(B)/test_target_erode
 	$(MAKE) test-sheet
 	./$(B)/test_wgrad_grid
@@ -215,6 +217,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_checkpoint_runtime
 	./$(B)/test_infer_buffers
 	./$(B)/test_recompute_live
+	./$(B)/test_share_enc_a1
 	python3 tests/test_pipeline_cli.py
 	python3 tests/test_cover_training.py
 	python3 tests/test_production.py

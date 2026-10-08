@@ -53,6 +53,8 @@ typedef struct {
     convp c1, c2;
     gnp n1, n2;
     int keep_a1;                    /* recompute 2 can retain selected smaller activations */
+    int a1_shared;                  /* shared encoder a1 (training): a1 lives in the same-level decoder block's a1 buffer and backward re-runs conv1 */
+    int a1_lent;                    /* decoder whose a1 buffer an encoder shares: re-run conv1 in a repeated backward (no forward between) */
     /* stored activations: conv outputs a1, a2 (GroupNorm inputs), GN stats, and the block output s2.
        gn(a) and silu(gn(a1)) are recomputed in backward. */
     const float *in, *in2;      /* in2: second input tensor for channels >= c_split (decoder skip), tensor-core path only */
@@ -104,6 +106,7 @@ struct unet {
     int rc_ok; size_t rc_cap;                /* lean 2: a transient in gB[level] is allowed now; capacity of the transient's buffer */
     int nob;                                 /* lean 2: no buffer B; a block's own gout / gskip is its B (in-place GroupNorm backward) */
     int last_a1_live;                        /* final decoder a1 survives the head until the first backward */
+    int sea_stale;                           /* shared encoder a1: a backward left the encoders' a1 in the decoders' buffers */
     size_t logits_bytes;                     /* lean: logits at the start of A, the 16-bit logit gradient after them */
     float *rc_extra; size_t rc_extra_bytes;  /* training transient for the upsampled decoder input when B is too small */
     int split_side, split_h0;                /* spatial split (unet_set_split): side 0 / 1, level-0 halo planes; h0 0 = off */
@@ -224,7 +227,15 @@ void unet_init(unet *u, uint64_t seed) {
 /* ---- activation buffers ---- */
 /* dry run (unet_train_bytes): the activation allocators only count bytes and hand out a dummy pointer */
 static int g_dry = 0;
-static float *dmalloc(size_t b) { return g_dry ? (float *)(uintptr_t)4096 : nn_malloc(b); }
+/* UFSM_MEM_REPORT=1: unet_train_bytes prints the dry build's bytes per buffer group (g_mlab, set in build_acts) */
+static const char *g_mlab = "other";
+static struct { const char *lab; size_t b; int n; } g_mrep[64]; static int g_nmrep = 0;
+static void mrep_add(size_t b) {
+    int i = 0; while (i < g_nmrep && strcmp(g_mrep[i].lab, g_mlab)) i++;
+    if (i == g_nmrep) { if (g_nmrep == 64) return; g_mrep[g_nmrep].lab = g_mlab; g_mrep[g_nmrep].b = 0; g_mrep[g_nmrep].n = 0; g_nmrep++; }
+    g_mrep[i].b += b; g_mrep[i].n++;
+}
+static float *dmalloc(size_t b) { if (g_dry) mrep_add(b); return g_dry ? (float *)(uintptr_t)4096 : nn_malloc(b); }
 static void dstorage(const void *p, size_t b, int dt) { if (!g_dry) nn_set_storage(p, b, dt); }
 static float *dalloc(unet *u, size_t n) { u->act_bytes += n * 4; return dmalloc(n * 4); }
 #define ABF (nn_get_tf32() && nn_get_act_bf16())
@@ -284,7 +295,17 @@ static int keep_coarse_a1(void) {
     return recompute_a1() && ufsm_env_on("UFSM_RC_KEEP_COARSE");
 }
 void unet_set_recompute(int on) { g_recompute = on; }
-#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8) + 16384 * unet_wide_up_grad() + 32768 * keep_coarse_a1())
+/* shared encoder a1 (recompute 1, training): an encoder block's conv1 output has its same-level decoder block's a1 shape; it is
+   dead once the encoder's conv2 has run (forward) and the decoder writes its own a1 there later, while in backward every
+   decoder block finishes before the encoder ones. So encoder blocks above the bottom keep no a1 of their own: backward re-runs
+   their conv1 into the shared buffer (as recompute 2, same kernel, precision and rounding keys). Level-0 voxel: -17 B of the
+   ~178 (all levels ~-22 B) for one encoder conv1 forward per level (the stem, 32 -> 64 @ P / 2, ...: ~2.5% of a step).
+   env UFSM_RC_ENC_A1=1 or the memory planner. */
+static int g_share_enc_a1 = -1;
+static int share_enc_a1(void) { if (g_share_enc_a1 < 0) g_share_enc_a1 = ufsm_env_on("UFSM_RC_ENC_A1"); return g_share_enc_a1 && recompute() == 1 && nn_get_tf32(); }
+void unet_set_share_enc_a1(int on) { g_share_enc_a1 = on; }
+int unet_share_enc_a1(void) { return share_enc_a1(); }
+#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8) + 16384 * unet_wide_up_grad() + 32768 * keep_coarse_a1() + 65536 * share_enc_a1())
 /* chunk mode (recompute, 16-bit activations and gradients, fused upsample): the decoder's up-part input gradient is
    produced in w[i]-channel chunks, each upsample-backwarded straight into its slice of gout[i + 1], so the shared
    gradient buffer B only needs w[i] channels (env UFSM_CHUNK_UP=0 turns it off) */
@@ -345,6 +366,7 @@ static void build_block_acts(unet *u, block *b, shape5 xs, int train, int keep_s
     b->ys = xs; b->ys.c = b->c1.cout;
     int G = G_of(u, b->c1.cout);
     b->keep_a1 = train && recompute_a1() && !a1;
+    b->a1_shared = b->a1_lent = 0;
     b->a1 = a1 ? a1 : dalloc_act_s(u, b->ys); b->a2 = a2 ? a2 : dalloc_act_s(u, b->ys);
     b->s2 = recompute() && (!keep_s2 || act_mx8()) ? nullptr : s2 ? s2 : dalloc_act_s(u, b->ys);   /* MX: the up staging normalises a2 itself */
     b->m1 = dalloc(u, (size_t)xs.n * G); b->r1 = dalloc(u, (size_t)xs.n * G); b->m2 = dalloc(u, (size_t)xs.n * G); b->r2 = dalloc(u, (size_t)xs.n * G);
@@ -365,6 +387,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
     {
         shape5 s = xs; for (int i = 0; i < L; i++) { u->ls[i] = s; if (i < L - 1) s = nn_conv3d_out_shape(s, w[i], 3, 2); }
     }
+    g_mlab = "T1 (shared a1, recompute 2)";
     if (train && recompute_a1()) {
         shape5 m1 = u->ls[0]; m1.c = 0;
         for (int i = 0; i < L; i++) { shape5 y = u->ls[i]; y.c = w[i]; if (act_bytes_of(y) > act_bytes_of(m1)) m1 = y; }
@@ -384,10 +407,15 @@ static void build_acts(unet *u, shape5 xs, int train) {
         for (int i = 0; i < L - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > act_bytes_of(mc)) mc = c; }
         T1 = dalloc_act_s(u, m1); T2 = dalloc_act_s(u, m2); TC = rc ? nullptr : dalloc_act_s(u, mc);   /* recompute: rc_tmp allocates on demand */
     }
+    g_mlab = "encoder a1 / a2 / GN stats + down outputs";
+    const int sea = train && share_enc_a1() && L > 1;
     for (int i = 0; i < L; i++) {
         shape5 bin = u->ls[i]; bin.c = i == 0 ? u->cfg.cin : w[i - 1];
-        build_block_acts(u, &u->enc[i], bin, train, i == L - 1, T1,
+        float *ea1 = T1;
+        if (sea && i < L - 1) { shape5 y = u->ls[i]; y.c = w[i]; ea1 = dalloc_act_s(u, y); }   /* shared with dec[i].a1 (below) */
+        build_block_acts(u, &u->enc[i], bin, train, i == L - 1, ea1,
                          rc ? nullptr : T2, nullptr);   /* recompute mode keeps the (small) outputs that get upsampled */
+        if (sea && i < L - 1) u->enc[i].a1_shared = 1;
         if (i < L - 1) {
             shape5 ds = u->ls[i + 1]; ds.c = w[i];
             u->downo[i] = share ? T2 : dalloc_act_s(u, ds);
@@ -398,6 +426,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
             }
         }
     }
+    g_mlab = "decoder a1 / a2 / GN stats";
     for (int i = L - 2; i >= 0; i--) {
         shape5 li = u->ls[i];
         shape5 cs_ = li; cs_.c = nn_get_tf32() ? w[i + 1] : w[i] + w[i + 1];
@@ -407,9 +436,10 @@ static void build_acts(unet *u, shape5 xs, int train) {
         /* A 16-bit decoder's kept SiLU may also use its consumed encoder skip. In MX modes s2
            is absent and the next decoder normalizes a2 on the fly. Training keeps separate buffers. */
         build_block_acts(u, &u->dec[i], cin, train, i > 0,
-                         train && i > 0 && keep_coarse_a1() ? nullptr : T1,
+                         sea ? u->enc[i].a1 : train && i > 0 && keep_coarse_a1() ? nullptr : T1,
                          reuse_skip && i == 0 ? u->enc[0].a2 : T2,
                          reuse_skip && i > 0 ? u->enc[i].a2 : nullptr);
+        if (sea) u->dec[i].a1_lent = 1;
     }
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
     u->logits = nullptr;
@@ -418,6 +448,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
             /* tensor-core path: A only holds the level width and B the widest of {width, decoder up part, encoder block
                input}; both are block-local, so one pair sized for the largest level serves every level. gout[i] is dead
                once dec[i]'s backward has read it, before that block writes gskip[i]: they share a buffer. */
+            g_mlab = "gradient buffer A";
             const int gmx = grad_mx8(), chunk = chunk_up();
             size_t na = 0, nbb = 0;   /* elements (16-bit / fp32) or bytes (MX) */
             for (int i = 0; i < L; i++) {
@@ -441,6 +472,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
                readable after the backward (the trainer's non-finite diagnosis then reports post-backward values) */
             if (lean() && (gmx ? na : na * (GBF ? 2 : 4)) >= shape_numel(os) * 4) u->logits = A;
             u->logits_bytes = shape_numel(os) * 4;
+            g_mlab = "gradient buffers gout / gskip (per level)";
             for (int i = 0; i < L; i++) {
                 shape5 so = u->ls[i]; so.c = w[i];
                 size_t gob = gmx ? nn_mx8_bytes(so) : shape_numel(so) * (GBF ? 2 : 4);
@@ -457,6 +489,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 else { u->gB[i] = B; u->gB_cap[i] = u->gB_bytes; }
             }
             if (u->nob) u->gB_bytes = u->gB_cap[0];
+            g_mlab = "decoder up-part transient (rc_extra)";
             if (act_mx8() && recompute()) {   /* the MX weight-gradient transient of the decoder up part where it does not fit its level's
                                                  buffer: allocated now so the dry build (memory planner) counts it */
                 shape5 m = u->ls[0]; m.c = 0;
@@ -474,6 +507,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
             if (!nn_get_tf32()) { u->t1[i] = dalloc(u, nw); u->t2[i] = dalloc(u, nw); }
             u->gskip[i] = dalloc_grad(u, nw); u->gout[i] = dalloc_grad(u, nw);
         }
+        g_mlab = "conv scratch";
         size_t cs = 0;
         for (int i = 0; i < L; i++) {
             size_t a = nn_conv3d_scratch(u->enc[i].xs, w[i], 3), b = nn_conv3d_scratch(u->enc[i].ys, w[i], 3);
@@ -483,6 +517,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
         }
         u->conv_scratch = dmalloc(cs); u->conv_scratch_n = cs; u->act_bytes += cs;
     }
+    g_mlab = "logits (fp32) / network input";
     if (!u->logits) u->logits = dalloc(u, shape_numel(os));
     u->xin = ABF && input_mx() ? dalloc_input(u, xs) : nullptr;   /* include mandatory input storage in the dry planner */
     u->glb = nullptr;   /* allocated on first use for a fp32 logit gradient */
@@ -512,9 +547,14 @@ void *unet_grad_scratch(unet *u, size_t bytes) { return u->built && u->train && 
    (dry build); the model is left unbuilt */
 size_t unet_train_bytes(unet *u, shape5 xs) {
     if (u->built) free_acts(u);
-    g_dry = 1;
+    g_dry = 1; g_nmrep = 0; g_mlab = "other";
     build_acts(u, xs, 1);
     const size_t b = u->act_bytes;
+    if (ufsm_env_on("UFSM_MEM_REPORT")) {
+        const double nv = (double)xs.n * xs.d * xs.h * xs.w;
+        fprintf(stderr, "memory report (dry build %dx%dx%dx%d, mode %d): %.3f GB, %.1f B per input voxel\n", xs.n, xs.d, xs.h, xs.w, UMODE(), b / 1e9, b / nv);
+        for (int i = 0; i < g_nmrep; i++) fprintf(stderr, "  %-46s %8.3f GB %6.1f B/voxel (%d allocations)\n", g_mrep[i].lab, g_mrep[i].b / 1e9, g_mrep[i].b / nv, g_mrep[i].n);
+    }
     free_acts(u);
     g_dry = 0;
     return b;
@@ -731,6 +771,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     /* Recompute 2 shares a1 across blocks. The last decoder wrote it last, and the head/loss
        only consume a2/logits, so its first backward can consume the original a1. */
     u->last_a1_live = train && recompute_a1() && !ufsm_env_on("UFSM_RC_REDO_LAST");
+    u->sea_stale = 0;
     return u->logits;
 }
 
@@ -743,7 +784,7 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     float *g = u->g;
     const int live = u->last_a1_live && b == &u->dec[0];
     u->last_a1_live = 0;   /* repeated backward without a new forward must rebuild the shared buffer */
-    if (recompute_a1() && !b->keep_a1 && !live) {   /* a1 was overwritten by later blocks: re-run conv1 (same kernel and precision as the forward) */
+    if ((recompute_a1() && !b->keep_a1 && !live) || b->a1_shared || (b->a1_lent && u->sea_stale)) {   /* a1 was overwritten by later blocks: re-run conv1 (same kernel and precision as the forward) */
         nn_set_conv(0);
         int r;
         if (b->xb) r = dec_conv1(u, b, level, b->a1, G, nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -916,6 +957,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         }
     }
     if (gscale != 1.f) nn_scale(g, 1.f / gscale, u->np);   /* activation gradients were scaled for 16-bit storage */
+    if (share_enc_a1()) u->sea_stale = 1;   /* the decoders' a1 buffers now hold the encoders' */
     g_in_bwd = 0;
 }
 
