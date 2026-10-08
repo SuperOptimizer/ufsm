@@ -247,6 +247,56 @@ static void test_loss(void) {
     CHECK(worst < 2e-3, "loss grad");
 }
 
+/* fp16 logits (unet lean 2: the logit gradient beside them in the gradient buffer): the losses read them through
+   nn_set_logits_h16; with fp16-representable logits every value and gradient equals the fp32-logit run (BCE + dice, the
+   offset-tolerant variant and the affinity loss) */
+static void test_loss_h16(void) {
+    shape5 s = {1, 4, 6, 7, 8};
+    const size_t S = shape_spatial(s), n = shape_numel(s);
+    printf("loss with fp16 logits\n");
+    float *l = randv(n, 3);
+    _Float16 *l16 = malloc(n * 2);
+    for (size_t i = 0; i < n; i++) { l16[i] = (_Float16)l[i]; l[i] = (float)l16[i]; }
+    uint8_t *t = malloc(n), *m = malloc(S), w[4] = {1, 1, 1, 1}, *band = malloc(S);
+    for (size_t i = 0; i < n; i++) t[i] = (uint8_t)(rand() % 2 ? 255 : rand() % 256);
+    for (size_t i = 0; i < S; i++) { m[i] = rand() % 5 != 0; band[i] = rand() % 7 == 0 ? 255 : (uint8_t)(rand() % 252); }
+    float *dl = dev(l, n); void *dl16 = nn_malloc(n * 2); nn_h2d(dl16, l16, n * 2);
+    uint8_t *dt = nn_malloc(n), *dm = nn_malloc(S), *dw = nn_malloc(4), *db = nn_malloc(S), *code = nn_malloc(S);
+    nn_h2d(dt, t, n); nn_h2d(dm, m, S); nn_h2d(dw, w, 4); nn_h2d(db, band, S);
+    float *scr = nn_malloc(nn_loss_scratch(s)), *g = nn_malloc(n * 4), *fin = nn_malloc(nn_aff_scratch(4));
+    float *hg[2], out[2][16], af[2][24];
+    for (int r = 0; r <= 1; r++) {
+        for (int h = 0; h < 2; h++) {
+            hg[h] = malloc(n * 4);
+            nn_set_logits_h16(h);
+            nn_set_loss_tol(r); nn_loss_async_tol(h ? (const float *)dl16 : dl, dt, dm, dw, s, 0.5f, g, scr, r ? code : nullptr); nn_loss_fetch(scr, s, out[h]); nn_set_loss_tol(0);
+            host(hg[h], g, n);
+            nn_set_logits_h16(0);
+        }
+        int same = !memcmp(out[0], out[1], (2 * s.c + 1) * 4) && !memcmp(hg[0], hg[1], n * 4);
+        printf("  bce + dice%s: fp16 logits %s\n", r ? " (offset-tolerant)" : "", same ? "identical" : "DIFFER");
+        CHECK(same, "fp16 logits loss %d", r);
+        free(hg[0]); free(hg[1]);
+    }
+    {
+        aff_offsets_t off = {3, {0, 1, 2}, {1, 1, 2}};
+        for (int h = 0; h < 2; h++) {
+            hg[h] = malloc(n * 4);
+            nn_zero(g, n * 4);
+            nn_set_logits_h16(h);
+            nn_aff_loss_async(h ? (const float *)dl16 : dl, s, 1, db, off, 0.5f, 1.f, g, fin);
+            nn_set_logits_h16(0);
+            host(hg[h], g, n); host(af[h], fin, 18);
+        }
+        int same = !memcmp(af[0], af[1], 18 * 4) && !memcmp(hg[0], hg[1], n * 4);
+        printf("  affinity: fp16 logits %s\n", same ? "identical" : "DIFFER");
+        CHECK(same, "fp16 logits affinity loss");
+        free(hg[0]); free(hg[1]);
+    }
+    nn_free(dl); nn_free(dl16); nn_free(dt); nn_free(dm); nn_free(dw); nn_free(db); nn_free(code); nn_free(scr); nn_free(g); nn_free(fin);
+    free(l); free(l16); free(t); free(m); free(band);
+}
+
 /* offset-tolerant positives (nn_set_loss_tol): positive BCE term of voxels with p >= 0.5 on the maximum logit along the
    lattice direction of the local sheet normal (within r steps), channel 0; dice on own values. CPU reference. */
 static const int TDIR[13][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 0}, {1, -1, 0}, {1, 0, 1}, {1, 0, -1}, {0, 1, 1}, {0, 1, -1},
@@ -540,6 +590,7 @@ int main(void) {
     test_up2();
     test_concat();
     test_loss();
+    test_loss_h16();
     test_loss_tol(1);
     test_loss_tol(2);
     test_loss_tol_sheet();

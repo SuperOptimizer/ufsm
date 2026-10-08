@@ -58,6 +58,7 @@ void lp_cvt_e2m1_probe(const float *hv, unsigned char *ho, int n);   /* test pro
 void lp_gn_silu_apply_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, void *y, int ydt);
 void lp_up2_fwd_mx(const void *x, int xdt, shape5 xs, void *y, int ydt, gnp_t gp);   /* gp: silu(gn(x)) upsampled */
 void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp);
+void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp);   /* fp16 output */
 void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp);
 int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp);   /* also gb when it returns 1 */
 void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,

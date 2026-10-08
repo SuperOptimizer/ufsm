@@ -6,17 +6,21 @@ extern "C" void nn_set_pos_weight(float w) { g_posw = w; }
 int g_tol = 0;
 extern "C" void nn_set_loss_tol(int r) { g_tol = r < 0 ? 0 : r > 2 ? 2 : r; }
 extern "C" int nn_get_loss_tol(void) { return g_tol; }
-__global__ void loss_stats_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
-                             int tol, uint8_t *code, int D, int H, int W) {
+int g_logits_h16 = 0;   /* the logits the losses read are fp16 (unet_logits_h16: lean training with the logit gradient beside them) */
+extern "C" void nn_set_logits_h16(int on) { g_logits_h16 = on; }
+int g_head_h16 = 0;
+extern "C" void nn_set_head_out_h16(int on) { g_head_h16 = on; }
+template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
+                                                   int tol, uint8_t *code, int D, int H, int W) {
     int nc = blockIdx.x, slab = blockIdx.y, n = nc / C;
     float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0;   /* per-thread fp32 partials, fp64 block reduction */
     if (w[nc]) {
-        const float *l = lg + (size_t)nc * S; const uint8_t *tp = t + (size_t)nc * S, *mp = m + (size_t)n * S;
+        const LT *l = lg + (size_t)nc * S; const uint8_t *tp = t + (size_t)nc * S, *mp = m + (size_t)n * S;
         uint8_t *cp = tol && nc % C == 0 ? code + (size_t)n * S : nullptr;
         size_t per = (S + gridDim.y - 1) / gridDim.y, lo = (size_t)slab * per, hi = lo + per < S ? lo + per : S;
         for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
             if (!mp[i]) continue;
-            float x = l[i], p = tp[i] * (1.f / 255.f);
+            float x = lgv(l, i), p = tp[i] * (1.f / 255.f);
             float sg = 1.f / (1.f + __expf(-x));
             float spp = fmaxf(x, 0.f) + log1pf(__expf(-fabsf(x)));   /* softplus(x) */
             float xq = x, spq = spp;
@@ -69,12 +73,19 @@ extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const u
     cudaMemsetAsync(ds, 0, (size_t)5 * NC * sizeof(double));
     /* slabs per (n, c): at least KSLAB and ~512 blocks in all (one recto channel with KSLAB slabs left most SMs idle) */
     const int slabs = NC >= 16 ? KSLAB : 512 / NC;
-    loss_stats_k<<<dim3(NC, slabs), 256>>>(logits, t, m, w, s.c, S, ds, g_posw, tol, code, s.d, s.h, s.w);
+    if (g_logits_h16) loss_stats_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, tol, code, s.d, s.h, s.w);
+    else loss_stats_k<float><<<dim3(NC, slabs), 256>>>(logits, t, m, w, s.c, S, ds, g_posw, tol, code, s.d, s.h, s.w);
     zs_reduce(ds, 5 * NC);   /* spatial split: statistics of the whole window (the halo planes are masked out by the caller) */
     loss_d2f_k<<<nblk(5 * NC, 128), 128>>>(ds, scratch, 5 * NC);
     loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, fin);
     if (gl) {
         size_t n = shape_numel(s);
+        if (g_logits_h16) {
+            const f16 *l16 = (const f16 *)logits;
+            if (!g_loss_g16) loss_grad_k<float, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w);
+            else if (g_h16) loss_grad_k<f16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w);
+            else loss_grad_k<bf16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w);
+        } else
         if (!g_loss_g16) loss_grad_k<float><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w);
         else if (g_h16) loss_grad_k<f16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w);
         else loss_grad_k<bf16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w);
@@ -89,7 +100,7 @@ extern "C" void nn_loss(const float *logits, const uint8_t *t, const uint8_t *m,
     nn_loss_async(logits, t, m, w, s, dice_w, gl, scratch);
     nn_loss_fetch(scratch, s, out);
 }
-__global__ void sheet_gather_k(const float *lg,shape5 s,const float *xyz,size_t np,int z0,int lo,int hi,double *out) {
+template <typename LT> __global__ void sheet_gather_k(const LT *lg,shape5 s,const float *xyz,size_t np,int z0,int lo,int hi,double *out) {
     size_t p=blockIdx.x*(size_t)blockDim.x+threadIdx.x; if (p>=np) return;
     int iz=(int)floorf(xyz[3*p]),iy=(int)floorf(xyz[3*p+1]),ix=(int)floorf(xyz[3*p+2]);
     double fz=xyz[3*p]-iz,fy=xyz[3*p+1]-iy,fx=xyz[3*p+2]-ix;
@@ -99,7 +110,7 @@ __global__ void sheet_gather_k(const float *lg,shape5 s,const float *xyz,size_t 
         if (gz<lo || gz>=hi || z<0 || z>=s.d || y<0 || y>=s.h || x<0 || x>=s.w) continue;
         double w=(dz?fz:1-fz)*(dy?fy:1-fy)*(dx?fx:1-fx);
         if (w==0) continue; size_t k=((size_t)z*s.h+y)*s.w+x;
-        a+=w*lg[k]; b+=w*lg[S+k];
+        a+=w*lgv(lg,k); b+=w*lgv(lg,S+k);
     }
     out[2*p]=a; out[2*p+1]=b;
 }
@@ -107,7 +118,8 @@ extern "C" void nn_sheet_gather(const float *lg,shape5 s,const float *coords,siz
     if (!np) return;
     float *xyz; double *v; CK(cudaMalloc(&xyz,3*np*sizeof(float))); CK(cudaMalloc(&v,2*np*sizeof(double)));
     CK(cudaMemcpy(xyz,coords,3*np*sizeof(float),cudaMemcpyHostToDevice));
-    sheet_gather_k<<<nblk(np,128),128>>>(lg,s,xyz,np,z0,lo,hi,v);
+    if (g_logits_h16) sheet_gather_k<f16><<<nblk(np,128),128>>>((const f16 *)lg,s,xyz,np,z0,lo,hi,v);
+    else sheet_gather_k<float><<<nblk(np,128),128>>>(lg,s,xyz,np,z0,lo,hi,v);
     zs_reduce(v,(int)(2*np));
     CK(cudaMemcpy(values,v,2*np*sizeof(double),cudaMemcpyDeviceToHost));
     CK(cudaFree(xyz)); CK(cudaFree(v)); KCHECK();
@@ -269,10 +281,10 @@ __device__ __forceinline__ int aff_target(uint8_t bi, uint8_t bj) {   /* 1 same 
 }
 /* row-major traversal: a (z, y) row per block iteration and threads along x, so the voxel coordinates need no 64-bit
    divisions; only this GPU's owned planes are visited */
-__global__ void __launch_bounds__(128) aff_stats_k(const float *lg, const uint8_t *band, aff_offsets_t off, int C, int c0, int D, int H, int W, int zlo, int zhi, double *ds) {
+template <typename LT> __global__ void __launch_bounds__(128) aff_stats_k(const LT *lg, const uint8_t *band, aff_offsets_t off, int C, int c0, int D, int H, int W, int zlo, int zhi, double *ds) {
     const int nj = blockIdx.y, n = nj / off.K, k = nj % off.K;
     const size_t S = (size_t)D * H * W;
-    const float *l = lg + ((size_t)n * C + c0 + k) * S; const uint8_t *bp = band + (size_t)n * S;
+    const LT *l = lg + ((size_t)n * C + c0 + k) * S; const uint8_t *bp = band + (size_t)n * S;
     const int a = off.ax[k], dz = a == 0 ? off.d[k] : 0, dy = a == 1 ? off.d[k] : 0, dx = a == 2 ? off.d[k] : 0;
     const long dj = ((long)dz * H + dy) * W + dx;
     float acc[AFF_NS] = {0, 0, 0, 0, 0, 0};
@@ -286,7 +298,7 @@ __global__ void __launch_bounds__(128) aff_stats_k(const float *lg, const uint8_
             const size_t i = row + x;
             const uint8_t bi = bp[i], bj = bp[i + dj];
             if (bi == 255 || bj == 255) continue;
-            const float v = l[i], s = 1.f / (1.f + __expf(-v)), sp = fmaxf(v, 0.f) + log1pf(__expf(-fabsf(v)));
+            const float v = lgv(l, i), s = 1.f / (1.f + __expf(-v)), sp = fmaxf(v, 0.f) + log1pf(__expf(-fabsf(v)));
             if (aff_target(bi, bj)) { acc[0] += 1; acc[2] += sp - v; } else { acc[1] += 1; acc[3] += sp; acc[5] += 1.f - s; }
             acc[4] += 1.f - s;
         }
@@ -308,7 +320,7 @@ __global__ void aff_fin_k(const double *ds, int K, float *fin) {
     f[2] = (float)w; f[3] = norm > 0 ? (float)(1.0 / norm) : 0.f; f[4] = (float)den; f[5] = (float)num;
 }
 /* block per (z, y) row (blockIdx.x), threads along x; every voxel's channel is written (0 when it owns no pair) */
-template <typename GT> __global__ void __launch_bounds__(128) aff_grad_k(const float *lg, const uint8_t *band, aff_offsets_t off, int N, int C, int c0, int D, int H, int W,
+template <typename GT, typename LT = float> __global__ void __launch_bounds__(128) aff_grad_k(const LT *lg, const uint8_t *band, aff_offsets_t off, int N, int C, int c0, int D, int H, int W,
                                                   int zlo, int zhi, const float *fin, float dice_w, float scale, GT *gl) {
     const size_t S = (size_t)D * H * W;
     const int nk = blockIdx.y, n = nk / off.K, k = nk % off.K;
@@ -324,7 +336,7 @@ template <typename GT> __global__ void __launch_bounds__(128) aff_grad_k(const f
         if (rowok && x + dx >= 0 && x + dx < W) {
             const uint8_t bi = bp[x], bj = bp[x + dj];
             if (bi != 255 && bj != 255) {
-                const float v = lg[ob + x], s = 1.f / (1.f + expf(-v));
+                const float v = lgv(lg, ob + x), s = 1.f / (1.f + expf(-v));
                 const int same = aff_target(bi, bj);
                 g = (same ? -(1.f - s) : f[2] * s) * f[3];
                 g += dice_w * ((same ? 0.f : 2.f) * f[4] - f[5]) / (f[4] * f[4]) * s * (1.f - s);
@@ -340,12 +352,19 @@ extern "C" void nn_aff_loss_async(const float *logits, shape5 s, int c0, const u
     int zlo = 0, zhi = 0; if (zlo_hi_on) zs_range(s.d, &zlo, &zhi);
     double *ds = gn_dsums((size_t)AFF_NS * off.K);
     cudaMemsetAsync(ds, 0, (size_t)AFF_NS * off.K * sizeof(double));
-    aff_stats_k<<<dim3(512, s.n * off.K), 128>>>(logits, band, off, s.c, c0, s.d, s.h, s.w, zlo, zhi, ds);
+    if (g_logits_h16) aff_stats_k<f16><<<dim3(512, s.n * off.K), 128>>>((const f16 *)logits, band, off, s.c, c0, s.d, s.h, s.w, zlo, zhi, ds);
+    else aff_stats_k<float><<<dim3(512, s.n * off.K), 128>>>(logits, band, off, s.c, c0, s.d, s.h, s.w, zlo, zhi, ds);
     zs_reduce(ds, AFF_NS * off.K);
     aff_fin_k<<<1, 32>>>(ds, off.K, fin);
     if (gl) {
         const dim3 grid((unsigned)(s.d * s.h), s.n * off.K);
         const float scale = lambda / off.K;   /* mean over channels (each channel's loss already covers all samples) */
+        if (g_logits_h16) {
+            const f16 *l16 = (const f16 *)logits;
+            if (!g_loss_g16) aff_grad_k<float, f16><<<grid, 128>>>(l16, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale, gl);
+            else if (g_h16) aff_grad_k<f16, f16><<<grid, 128>>>(l16, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (f16 *)gl);
+            else VERIFY_ONLY(aff_grad_k<bf16, f16><<<grid, 128>>>(l16, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (bf16 *)gl));
+        } else
         if (!g_loss_g16) aff_grad_k<float><<<grid, 128>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale, gl);
         else if (g_h16) aff_grad_k<f16><<<grid, 128>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (f16 *)gl);
         else VERIFY_ONLY(aff_grad_k<bf16><<<grid, 128>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (bf16 *)gl));

@@ -2137,34 +2137,41 @@ __device__ __forceinline__ int tol_normal(const uint8_t *tp, int z, int y, int x
     }
     return best;
 }
+/* logits element as float: fp32 or fp16 storage (training logits in the gradient buffer, nn_set_logits_h16) */
+template <typename LT> __device__ __forceinline__ float lgv(const LT *p, size_t i);
+template <> __device__ __forceinline__ float lgv<float>(const float *p, size_t i) { return p[i]; }
+template <> __device__ __forceinline__ float lgv<f16>(const f16 *p, size_t i) { return __half2float(p[i]); }
+extern int g_logits_h16;
+extern int g_head_h16;   /* the MX head (1^3 conv) writes fp16 logits (nn_set_head_out_h16) */
 /* maximum logit over the supervised voxels i + k * dir, |k| <= r; returns the logit and sets the code */
-__device__ __forceinline__ float tol_line_max(const float *l, const uint8_t *mp, int z, int y, int x, int D, int H, int W, int d, int r, uint8_t *code) {
+template <typename LT>
+__device__ __forceinline__ float tol_line_max(const LT *l, const uint8_t *mp, int z, int y, int x, int D, int H, int W, int d, int r, uint8_t *code) {
     int dz, dy, dx; tol_dir(d, dz, dy, dx);
-    float best = l[((size_t)z * H + y) * W + x]; int bk = 0;
+    float best = lgv(l, ((size_t)z * H + y) * W + x); int bk = 0;
     for (int k = -r; k <= r; k++) {
         if (!k) continue;
         const int zz = z + k * dz, yy = y + k * dy, xx = x + k * dx;
         if (zz < 0 || zz >= D || yy < 0 || yy >= H || xx < 0 || xx >= W) continue;
         const size_t j = ((size_t)zz * H + yy) * W + xx;
-        if (mp[j] && l[j] > best) { best = l[j]; bk = k; }
+        if (mp[j] && lgv(l, j) > best) { best = lgv(l, j); bk = k; }
     }
     *code = bk ? (uint8_t)(5 * d + bk + r) : (uint8_t)255;
     return best;
 }
-__global__ void loss_stats_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
-                             int tol, uint8_t *code, int D, int H, int W);
+template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
+                                                   int tol, uint8_t *code, int D, int H, int W);
 __global__ void loss_d2f_k(const double *d, float *f, int n);
 /* finalize on device: per-channel mean bce / dice, active count, and 1/active for the gradient kernel.
    layout of fin[]: [0..C) bce, [C..2C) dice, [2C] active, [2C+1] inv_active */
 __global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, float *fin);
-template <typename GT> __global__ void loss_grad_k(const float *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N, int C, size_t S, const float *st,
+template <typename GT, typename LT = float> __global__ void loss_grad_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N, int C, size_t S, const float *st,
                             float dice_w, const float *fin, GT *gl, float pw, float gscale, int tol, const uint8_t *code, int D, int H, int W) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)N * C * S) return;
     int nc = (int)(i / S), n = nc / C;
     if (!w[nc] || !m[(size_t)n * S + i % S]) { gl[i] = f2h<GT>(0.f); return; }
     float nm = st[nc * 5], Ssp = st[nc * 5 + 2], Ss = st[nc * 5 + 3], Sp = st[nc * 5 + 4];
-    float x = lg[i], p = t[i] * (1.f / 255.f), s = 1.f / (1.f + expf(-x));
+    float x = lgv(lg, i), p = t[i] * (1.f / 255.f), s = 1.f / (1.f + expf(-x));
     float den = Ss + Sp + 1.f;
     float pq = p;   /* the target mass whose positive BCE terms this voxel's logit carries */
     if (code && nc % C == 0) {   /* offset-tolerant: gather p of the voxels whose normal-line maximum is this voxel */

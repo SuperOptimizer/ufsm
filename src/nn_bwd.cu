@@ -77,7 +77,7 @@ extern "C" shape5 nn_conv3d_out_shape(shape5 xs, int cout, int k, int stride) {
 }
 extern "C" void nn_conv3d_fwd(const float *x, shape5 xs, const float *w, const float *b, int cout, int k, int stride, float *y) {
     if (k == 1 || !g_tf32) exec_prec(g_pass, 0);
-    if (k == 1 && g_tf32 && ISMX(x)) { lp_conv1_fwd_mx(x, MXDT(x), xs, w, b, cout, y, gnp_t{}); KCHECK(); return; }   /* head reading an MX tensor (fp32 output) */
+    if (k == 1 && g_tf32 && ISMX(x)) { if (g_head_h16) lp_conv1_fwd_mx_h16(x, MXDT(x), xs, w, b, cout, y, gnp_t{}); else lp_conv1_fwd_mx(x, MXDT(x), xs, w, b, cout, y, gnp_t{}); KCHECK(); return; }   /* head reading an MX tensor (fp32 output; fp16 with nn_set_head_out_h16) */
     shape5 ys = nn_conv3d_out_shape(xs, cout, k, stride);
     if (k == 3 && stride == 1 && g_tf32) { gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0}; split_t ns = {nullptr, 0, nullptr, 0}; conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, none, nullptr, 0, ns); KCHECK(); return; }
     if (k == 3 && stride == 2 && g_tf32) { conv_fwd_tc_s2(x, ABF, xs, w, b, cout, y, ABF, ys); KCHECK(); return; }

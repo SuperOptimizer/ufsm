@@ -128,6 +128,8 @@ void nn_f32_to_h16(const float *x, size_t n, void *y, float scale);
 void nn_set_f16(int on);
 int nn_get_f16(void);
 void nn_set_grad_scale(float s);
+void nn_set_logits_h16(int on);     /* the losses read fp16 logits (unet_logits_h16) */
+void nn_set_head_out_h16(int on);   /* the MX head writes fp16 logits (set by unet around its head) */
 void nn_set_loss_grad_h16(int on);   /* nn_loss_async writes gl as the 16-bit storage type scaled by the gradient scale (unet_backward_x(.., 1)) */
 float nn_get_grad_scale(void);
 

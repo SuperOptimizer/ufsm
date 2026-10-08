@@ -22,8 +22,8 @@ __global__ void conv1_mx_k(const uint8_t *x, const float *w, const float *b, flo
    the weights and the bias staged once per block in smem instead of reloaded per voxel; same arithmetic order as conv1_mx_k.
    Weights [ci][8] (two broadcast float4 loads per input channel) and coefficients float2 [n][ci]: one scalar smem load per
    (co, ci) made the kernel smem-instruction-bound */
-template <int B, int CO>
-__global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const float *w, const float *b, float *y, int N, int Ci, size_t S, gnp_t gp) {
+template <int B, int CO, typename YT = float>   /* YT: fp32 or fp16 logits (lean training: the logit gradient fits beside fp16 logits) */
+__global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const float *w, const float *b, YT *y, int N, int Ci, size_t S, gnp_t gp) {
     extern __shared__ __align__(16) float c1s[];
     float4 *sw = (float4 *)c1s;                       /* [Ci][2] (co 0..3, 4..7) */
     float2 *sab = (float2 *)(sw + 2 * Ci);            /* [N][Ci] (a, b) */
@@ -56,11 +56,23 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
         }
     }
 #pragma unroll
-    for (int co = 0; co < CO; co++) y[((size_t)n * CO + co) * S + v] = acc[co];
+    for (int co = 0; co < CO; co++) { if constexpr (sizeof(YT) == 2) y[((size_t)n * CO + co) * S + v] = __float2half(acc[co]); else y[((size_t)n * CO + co) * S + v] = acc[co]; }
 }
-template <int B, int CO> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, float *y, gnp_t gp) {
+template <int B, int CO, typename YT = float> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, YT *y, gnp_t gp) {
     const size_t S = shape_spatial(xs), sm = (size_t)(2 * xs.n * xs.c + 8 * xs.c) * sizeof(float);
-    conv1_mx_t_k<B, CO><<<dim3(nblk_(S, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp);
+    conv1_mx_t_k<B, CO, YT><<<dim3(nblk_(S, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp);
+}
+/* the same with fp16 logits (unet lean training; the staged path only) */
+extern "C" void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp) {
+    if (cout > 8 || (size_t)(2 * xs.n * xs.c + 8 * xs.c) * sizeof(float) > 32 * 1024) { fprintf(stderr, "lp_conv1_fwd_mx_h16: cout %d / %d inputs unsupported\n", cout, xs.c); abort(); }
+    __half *yh = (__half *)y;
+#define C1H(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, yh, gp); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, yh, gp); break; \
+                               case 3: conv1_mx_t<B, 3>(x, xs, w, b, yh, gp); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, yh, gp); break; \
+                               case 5: conv1_mx_t<B, 5>(x, xs, w, b, yh, gp); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, yh, gp); break; \
+                               case 7: conv1_mx_t<B, 7>(x, xs, w, b, yh, gp); break; default: conv1_mx_t<B, 8>(x, xs, w, b, yh, gp); } } while (0)
+    if (xdt == 4) C1H(4); else C1H(8);
+#undef C1H
+    LPCK();
 }
 extern "C" void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp) {
     if (cout > 8) { fprintf(stderr, "lp_conv1_fwd_mx: cout %d > 8\n", cout); abort(); }

@@ -109,7 +109,9 @@ static void diagnose_nan(gpu_state *d, int B, int P, int step, const char *out) 
     void *hx = malloc(xbytes_); nn_d2h(hx, d->xb[cb], xbytes_);
     uint8_t *ht = malloc((size_t)B * NCH * p3), *hm = malloc((size_t)B * p3), *hw = malloc((size_t)B * NCH);
     nn_d2h(ht, d->tb[cb], (size_t)B * NCH * p3); nn_d2h(hm, d->mb[cb], (size_t)B * p3); nn_d2h(hw, d->wb[cb], (size_t)B * NCH);
-    float *hl = malloc(nl * 4); nn_d2h(hl, d->lg, nl * 4);
+    float *hl = malloc(nl * 4);
+    if (unet_logits_h16(d->u)) { _Float16 *h16 = malloc(nl * 2); nn_d2h(h16, d->lg, nl * 2); for (size_t k = 0; k < nl; k++) hl[k] = (float)h16[k]; free(h16); }
+    else nn_d2h(hl, d->lg, nl * 4);
     double xmax = 0; size_t xnf = 0;
     for (size_t k = 0; k < nx; k++) {
         float v;
@@ -173,6 +175,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     int prof = ufsm_env_on("UFSM_PROF");
     if (prof) nn_prof_begin(6);
     shape5 ts = os; if (g_aff) ts.c = NCH;   /* B == 1: the target channels are the leading output channels */
+    nn_set_logits_h16(unet_logits_h16(d->u));   /* lean 2: fp16 logits in the gradient buffer */
     nn_loss_async_tol(lg, d->t, d->m, d->w, ts, dice_w, train ? d->gl : nullptr, d->scratch, d->tolc);
     if (g_aff) nn_aff_loss_async(lg, os, 1, d->band, g_aff_off, dice_w, g_aff_lambda, train ? d->gl : nullptr, d->aff_fin);
     sheet_objective(d,os,P,train);

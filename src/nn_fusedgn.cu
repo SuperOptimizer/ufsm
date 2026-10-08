@@ -55,7 +55,8 @@ extern "C" int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x
     if (k == 3 && stride == 2) { conv_fwd_tc_s2(x, ABF, xs, w, b, cout, y, ABF, ys, gp); KCHECK(); return 0; }
     if (k == 1 && stride == 1) {
         exec_prec(0, 0);
-        if (ISMX(x)) lp_conv1_fwd_mx(x, MXDT(x), xs, w, b, cout, y, gp);
+        if (ISMX(x) && g_head_h16) lp_conv1_fwd_mx_h16(x, MXDT(x), xs, w, b, cout, y, gp);   /* fp16 logits (nn_set_head_out_h16) */
+        else if (ISMX(x)) lp_conv1_fwd_mx(x, MXDT(x), xs, w, b, cout, y, gp);
         else { size_t S = shape_spatial(xs); dim3 gr(nblk((size_t)xs.n * S, 256));
             if (ABF && g_h16) conv1_f_k<f16, float><<<gr, 256>>>((const f16 *)x, w, b, y, xs.n, xs.c, cout, S, gp);
             else if (ABF) conv1_f_k<bf16, float><<<gr, 256>>>((const bf16 *)x, w, b, y, xs.n, xs.c, cout, S, gp);

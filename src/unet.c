@@ -108,6 +108,7 @@ struct unet {
     int last_a1_live;                        /* final decoder a1 survives the head until the first backward */
     int sea_stale;                           /* shared encoder a1: a backward left the encoders' a1 in the decoders' buffers */
     size_t logits_bytes;                     /* lean: logits at the start of A, the 16-bit logit gradient after them */
+    int logits_h16;                          /* lean 2: fp16 logits, so the 16-bit logit gradient fits after them in A */
     float *rc_extra; size_t rc_extra_bytes;  /* training transient for the upsampled decoder input when B is too small */
     int split_side, split_h0;                /* spatial split (unet_set_split): side 0 / 1, level-0 halo planes; h0 0 = off */
     unet_halo_fn split_halo, split_begin, split_end;
@@ -442,7 +443,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
         if (sea) u->dec[i].a1_lent = 1;
     }
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
-    u->logits = nullptr;
+    u->logits = nullptr; u->logits_h16 = 0;
     if (train) {
         if (nn_get_tf32()) {
             /* tensor-core path: A only holds the level width and B the widest of {width, decoder up part, encoder block
@@ -471,7 +472,13 @@ static void build_acts(unet *u, shape5 xs, int train) {
                reads them before; A is unregistered for the plane-major fp32 writes of the head). Costs: logits are not
                readable after the backward (the trainer's non-finite diagnosis then reports post-backward values) */
             if (lean() && (gmx ? na : na * (GBF ? 2 : 4)) >= shape_numel(os) * 4) u->logits = A;
-            u->logits_bytes = shape_numel(os) * 4;
+            /* lean 2 with the MX head: fp16 logits when the 16-bit logit gradient then fits after them in A and not after fp32
+               logits (desk widths: A 33 B / level-0 voxel, logits 28 B + gradient 14 B; else a separate 14 B / voxel buffer) */
+            {
+                const size_t ab = u->gA_bytes, l32 = (shape_numel(os) * 4 + 255) & ~(size_t)255, l16 = (shape_numel(os) * 2 + 255) & ~(size_t)255, g16 = shape_numel(os) * 2;
+                u->logits_h16 = u->logits == A && u->nob && act_mx8() && ab < l32 + g16 && ab >= l16 + g16 && !ufsm_env_on("UFSM_LOGITS32");
+            }
+            u->logits_bytes = shape_numel(os) * (u->logits_h16 ? 2 : 4);
             g_mlab = "gradient buffers gout / gskip (per level)";
             for (int i = 0; i < L; i++) {
                 shape5 so = u->ls[i]; so.c = w[i];
@@ -542,6 +549,7 @@ void *unet_logit_grad_scratch(unet *u, size_t bytes) {
     return u->gB[0] && u->gB_bytes >= bytes ? (void *)u->gB[0] : nullptr;
 }
 int unet_lean_nob(const unet *u) { return u->nob; }
+int unet_logits_h16(const unet *u) { return u->built && u->logits_h16; }
 void *unet_grad_scratch(unet *u, size_t bytes) { return u->built && u->train && lean() && u->gB[0] && u->gB_bytes >= bytes ? (void *)u->gB[0] : nullptr; }
 /* device bytes of the training activations / gradients at input shape xs under the current storage modes, without allocating
    (dry build); the model is left unbuilt */
@@ -761,8 +769,10 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         cur = u->dec[i].s2;
     }
     nn_set_layer(3 * L - 2);
+    nn_set_head_out_h16(u->logits_h16);
     if (recompute()) { nn_gn_t g = gn_out(u, &u->dec[0]); int r; PROF(0, r = nn_conv3d_fwd_x(u->dec[0].a2, &g, nullptr, nullptr, 0, 0, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, 1, 1, u->logits, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("head"); }
     else PROF(0, nn_conv3d_fwd(cur, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, 1, 1, u->logits));
+    nn_set_head_out_h16(0);
     if (ufsm_env_on("UFSM_DEBUG") && !ABF && !recompute()) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d a1 %.4g a2 %.4g s2 %.4g%s\n", i, nn_sumsq(u->enc[i].a1, shape_numel(u->enc[i].ys), u->red_scratch), nn_sumsq(u->enc[i].a2, shape_numel(u->enc[i].ys), u->red_scratch), nn_sumsq(u->enc[i].s2, shape_numel(u->enc[i].ys), u->red_scratch), i < L - 1 ? "" : " (bottom)");
         for (int i = L - 2; i >= 0; i--) fprintf(stderr, "dec%d cat %.4g a1 %.4g a2 %.4g s2 %.4g\n", i, nn_sumsq(u->cat[i], shape_numel(u->dec[i].xs), u->red_scratch), nn_sumsq(u->dec[i].a1, shape_numel(u->dec[i].ys), u->red_scratch), nn_sumsq(u->dec[i].a2, shape_numel(u->dec[i].ys), u->red_scratch), nn_sumsq(u->dec[i].s2, shape_numel(u->dec[i].ys), u->red_scratch));
