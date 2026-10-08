@@ -118,21 +118,22 @@ static int sheet_write_shard(const char *out,const float *q,int shard,int64_t z,
 
 int cmd_predict(int argc, char **argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window 288] [--act-mx8 1]\n"
-                        "       [--halo 8] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
+        fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window W] [--act-mx8 1]\n"
+                        "       [--halo H] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
                         "       [--prec 0|1|2|3|4] [--policy enc0=1,...] [--f16 0|1] [--fp4 0|1] [--input-mx 0|1] [--input-prec 0|4|8] [--ema 1]   EMA or current weights (0)\n"
                         "       [--gn-stats stored|legacy]   defaults to the checkpoint's normalization contract\n"
                         "       [--reference reference.json]   required for a surface_winding checkpoint, native level 0\n"
                         "       [--grid-origin z,y,x]   anchor tile interiors in selected-level CT voxels, independent of the output box\n"
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n"
                         "       [--channel 0]   output channel written (band_affinity checkpoints: 1..6 = affinities z1 y1 x1 z8 y8 x8)\n");
-        fprintf(stderr, "  For exact shard tiling, window - 2*halo should divide the shard size: 528 with halo 8 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n");
+        fprintf(stderr, "  Default window: shard + 32 with halo 16 (one window per shard) when it fits the GPU, else 288 with halo 8. For exact shard tiling, window - 2*halo should divide the shard size: 544 with halo 16 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n");
         return 2;
     }
     const char *ckpt = argv[2], *root = argv[3], *key = argv[4], *out = argv[5];
     double um = atof(opt(argc, argv, "--um", "0"));
     int level = atoi(opt(argc, argv, "--level", "0")), W = atoi(opt(argc, argv, "--window", "288")), halo = atoi(opt(argc, argv, "--halo", "8"));
     int shard = atoi(opt(argc, argv, "--shard", "512")), gpu = atoi(opt(argc, argv, "--gpu", "0")), nlev = atoi(opt(argc, argv, "--levels", "4"));
+    const int win_given = *opt(argc, argv, "--window", "") || *opt(argc, argv, "--halo", "");
     int nthreads = atoi(opt(argc, argv, "--threads", "16"));
     const int use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
     const int out_ch = atoi(opt(argc, argv, "--channel", "0"));   /* output channel to write (band_affinity: 1..6 = affinities) */
@@ -236,6 +237,7 @@ int cmd_predict(int argc, char **argv) {
     unet *u = unet_create(&cfg);
     if (unet_load(u, ckpt) < 0) { fprintf(stderr, "cannot load %s\n", ckpt); return 1; }
     unet_use_ema(u, use_ema);
+    if (!sheet_task) unet_set_head_channels(u, out_ch, 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
     store *s = store_open(root);
     char ak[1200];
     snprintf(ak, sizeof ak, "%s/level%d", key, level);
@@ -244,6 +246,16 @@ int cmd_predict(int argc, char **argv) {
     const z3_meta *m = z3_meta_of(ct);
     int64_t bo[3] = {0, 0, 0}, bn[3] = {m->shape[0], m->shape[1], m->shape[2]};
     { const char *b = opt(argc, argv, "--box", nullptr); long long v[6]; if (b && sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) { for (int d = 0; d < 3; d++) { bo[d] = v[d]; bn[d] = v[3 + d]; } } }
+    if (!win_given && !sheet_task && bn[0] >= shard && bn[1] >= shard && bn[2] >= shard) {   /* default window: one per shard (shard + 2 x 16 halo) for boxes of whole shards when it fits this GPU, else 288 / 8.
+                                          Desk widths, 512 shards, laptop: 16% less GPU time per shard than 8 windows of 288, peak 9.4 GB */
+        const int Wc = shard + 32, div = 1 << (cfg.nlev - 1);
+        if (Wc % div == 0) {
+            const size_t wc3 = (size_t)Wc * Wc * Wc, need = unet_infer_bytes(u, (shape5){1, 4, Wc, Wc, Wc}) + 2 * wc3 + (size_t)shard * shard * shard + ((size_t)1 << 30);
+            if (need <= nn_mem_free()) { W = Wc; halo = 16; }
+        }
+        fprintf(stderr, "predict: window %d, halo %d (default: one window per %d shard when it fits, else 288 / 8; --window / --halo set them)\n", W, halo, shard);
+        if (box) for (int d = 0; d < 3; d++) if (boxv[d + 3] > INT64_MAX - W || boxv[d] > INT64_MAX - W - boxv[d + 3]) { fprintf(stderr, "prediction box exceeds the coordinate range\n"); return 2; }
+    }
     axis ax = {0};
     if (axisf && axis_load(&ax, axisf)) { fprintf(stderr, "cannot load axis %s\n", axisf); return 1; }
     double um_l = um * (1 << level), scale = (double)(1 << level);
@@ -278,8 +290,12 @@ int cmd_predict(int argc, char **argv) {
     const int h16 = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8");
     uint8_t *ctd = nn_malloc(w3), *pu = gpath ? nullptr : malloc(w3), *pud = gpath ? nullptr : nn_malloc(w3);
     float *dyo = malloc(2 * (size_t)W * sizeof(float)), *dxo = dyo + W, *dyd = nn_malloc(2 * (size_t)W * sizeof(float)), *dxd = dyd + W;
-    void *xd = nn_malloc(4 * w3 * (h16 ? 2 : 4));
     shape5 xs = {1, 4, W, W, W};
+    /* the 16-bit input in the network's shared a1 scratch when it has one (free until the stem conv, after the input conversion) */
+    unet_build(u, xs, 0);
+    void *xd = h16 && !sheet_task ? unet_input_scratch(u, 4 * w3 * 2) : nullptr;
+    const int xd_shared = xd != nullptr;
+    if (!xd) xd = nn_malloc(4 * w3 * (h16 ? 2 : 4));
     int64_t ns[3];
     for (int d = 0; d < 3; d++) ns[d] = (bn[d] + shard - 1) / shard;
     double t0 = now(); long ntiles = 0, nskip = 0;
@@ -361,13 +377,14 @@ int cmd_predict(int argc, char **argv) {
             if (!gpath) nn_h2d(ctd, ctu, w3);
             nn_h2d(dyd, dyo, 2 * (size_t)W * sizeof(float));
             if (pprof) { nn_sync(); p_h2d += now() - pt; pt = now(); }
+            if (xd_shared && unet_input_scratch(u, 4 * w3 * 2) != xd) { fprintf(stderr, "predict: the network was rebuilt under its input scratch\n"); return 1; }
             nn_pred_input(ctd, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0, xd, h16);
             if (sheet_task) {
                 for (int z=0;z<W;z++) { double a[4]; sheet_parameters(sheet,o[0]+z,a); sheet_rows[4*z]=(float)(o[1]-a[0]); sheet_rows[4*z+1]=(float)(o[2]-a[1]); sheet_rows[4*z+2]=(float)(1/a[2]); sheet_rows[4*z+3]=(float)a[3]; }
                 nn_sheet_input(xd,W,sheet_rows,(float)sheet->center,(float)sheet->scale,h16);
             }
             const float *lg = unet_forward_x(u, xd, xs, 0, h16);
-            lg += (size_t)out_ch * w3;   /* channel c of the [c][W^3] logits (B = 1) */
+            if (sheet_task) lg += (size_t)out_ch * w3;   /* channel c of the [c][W^3] logits (B = 1); otherwise the only one */
             if (sheet_task) {
                 nn_sheet_gate((float *)lg+w3,lg,ctd,W,sheet_rows);
                 nn_d2h(sheet_window,lg+w3,w3*4);

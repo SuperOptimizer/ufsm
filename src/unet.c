@@ -111,6 +111,7 @@ struct unet {
     size_t logits_bytes;                     /* lean: logits at the start of A, the 16-bit logit gradient after them */
     int logits_h16;                          /* lean 2: fp16 logits, so the 16-bit logit gradient fits after them in A */
     float *rc_extra; size_t rc_extra_bytes;  /* training transient for the upsampled decoder input when B is too small */
+    int head_c0, head_nc;                    /* inference builds: only logit channels [c0, c0 + nc) (nc 0: all) */
     int split_side, split_h0;                /* spatial split (unet_set_split): side 0 / 1, level-0 halo planes; h0 0 = off */
     unet_halo_fn split_halo, split_begin, split_end;
 };
@@ -557,6 +558,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
         u->conv_scratch = dmalloc(cs); u->conv_scratch_n = cs; u->act_bytes += cs;
     }
     g_mlab = "logits (fp32) / network input";
+    if (!train && u->head_nc) os.c = u->head_nc;   /* inference: the requested logit channels only */
     if (!u->logits) u->logits = dalloc(u, shape_numel(os));
     u->xin = ABF && input_mx() ? dalloc_input(u, xs) : nullptr;   /* include mandatory input storage in the dry planner */
     u->glb = nullptr;   /* allocated on first use for a fp32 logit gradient */
@@ -565,6 +567,21 @@ static void build_acts(unet *u, shape5 xs, int train) {
 
 size_t unet_activation_bytes(const unet *u) { return u->act_bytes; }
 /* build the activation / gradient buffers for xs now (as the first forward would) */
+/* inference: compute and keep only logit channels [c0, c0 + nc) (nc 0: all); the forward's logits then hold those channels */
+void unet_set_head_channels(unet *u, int c0, int nc) {
+    if (c0 < 0 || nc < 0 || c0 + nc > u->cfg.cout) { fprintf(stderr, "unet_set_head_channels: [%d, %d) outside %d outputs\n", c0, c0 + nc, u->cfg.cout); abort(); }
+    if (nc == u->cfg.cout) nc = 0;
+    if (u->head_c0 == c0 && u->head_nc == nc) return;
+    if (u->built && !u->train) free_acts(u);
+    u->head_c0 = c0; u->head_nc = nc;
+}
+/* inference build: the shared a1 scratch, free from the forward's start until the stem conv writes it (after the input
+   conversion has read the network input), so a caller's 16-bit input may live there; nullptr if too small or not built so */
+void *unet_input_scratch(unet *u, size_t bytes) {
+    if (!u->built || u->train || !nn_get_tf32() || !input_mx() || !u->enc[0].a1) return nullptr;
+    const block *b = &u->enc[0]; shape5 s = b->ys;
+    return act_bytes_of(s) >= bytes && u->dec[0].a1 == b->a1 ? (void *)b->a1 : nullptr;
+}
 void unet_build(unet *u, shape5 xs, int train) {
     if (!u->built || memcmp(&u->xs, &xs, sizeof xs) || (train && !u->train) || u->mode != UMODE()) build_acts(u, xs, train);
 }
@@ -603,20 +620,22 @@ void *unet_batch_scratch(unet *u, size_t head, size_t tail) {
 }
 /* device bytes of the training activations / gradients at input shape xs under the current storage modes, without allocating
    (dry build); the model is left unbuilt */
-size_t unet_train_bytes(unet *u, shape5 xs) {
+static size_t dry_bytes(unet *u, shape5 xs, int train) {
     if (u->built) free_acts(u);
     g_dry = 1; g_nmrep = 0; g_mlab = "other";
-    build_acts(u, xs, 1);
+    build_acts(u, xs, train);
     const size_t b = u->act_bytes;
     if (ufsm_env_on("UFSM_MEM_REPORT")) {
         const double nv = (double)xs.n * xs.d * xs.h * xs.w;
-        fprintf(stderr, "memory report (dry build %dx%dx%dx%d, mode %d): %.3f GB, %.1f B per input voxel\n", xs.n, xs.d, xs.h, xs.w, UMODE(), b / 1e9, b / nv);
+        fprintf(stderr, "memory report (dry %s build %dx%dx%dx%d, mode %d): %.3f GB, %.1f B per input voxel\n", train ? "training" : "inference", xs.n, xs.d, xs.h, xs.w, UMODE(), b / 1e9, b / nv);
         for (int i = 0; i < g_nmrep; i++) fprintf(stderr, "  %-46s %8.3f GB %6.1f B/voxel (%d allocations)\n", g_mrep[i].lab, g_mrep[i].b / 1e9, g_mrep[i].b / nv, g_mrep[i].n);
     }
     free_acts(u);
     g_dry = 0;
     return b;
 }
+size_t unet_train_bytes(unet *u, shape5 xs) { return dry_bytes(u, xs, 1); }
+size_t unet_infer_bytes(unet *u, shape5 xs) { return dry_bytes(u, xs, 0); }
 size_t unet_grad_bytes(const unet *u) { return u->grad_bytes; }
 shape5 unet_out_shape(const unet *u, shape5 xs) { xs.c = u->cfg.cout; return xs; }
 
@@ -852,8 +871,10 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     }
     nn_set_layer(3 * L - 2);
     nn_set_head_out_h16(u->logits_h16);
-    if (recompute()) { nn_gn_t g = gn_out(u, &u->dec[0]); int r; PROF(0, r = nn_conv3d_fwd_x(u->dec[0].a2, &g, nullptr, nullptr, 0, 0, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, 1, 1, u->logits, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("head"); }
-    else PROF(0, nn_conv3d_fwd(cur, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, 1, 1, u->logits));
+    const int hc0 = !u->train && u->head_nc ? u->head_c0 : 0, hnc = !u->train && u->head_nc ? u->head_nc : u->cfg.cout;   /* rows of the 1^3 head */
+    const float *hw = P(u, u->head.w) + (size_t)hc0 * w[0], *hb = P(u, u->head.b) + hc0;
+    if (recompute()) { nn_gn_t g = gn_out(u, &u->dec[0]); int r; PROF(0, r = nn_conv3d_fwd_x(u->dec[0].a2, &g, nullptr, nullptr, 0, 0, u->dec[0].ys, hw, hb, hnc, 1, 1, u->logits, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("head"); }
+    else PROF(0, nn_conv3d_fwd(cur, u->dec[0].ys, hw, hb, hnc, 1, 1, u->logits));
     nn_set_head_out_h16(0);
     if (ufsm_env_on("UFSM_DEBUG") && !ABF && !recompute()) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d a1 %.4g a2 %.4g s2 %.4g%s\n", i, nn_sumsq(u->enc[i].a1, shape_numel(u->enc[i].ys), u->red_scratch), nn_sumsq(u->enc[i].a2, shape_numel(u->enc[i].ys), u->red_scratch), nn_sumsq(u->enc[i].s2, shape_numel(u->enc[i].ys), u->red_scratch), i < L - 1 ? "" : " (bottom)");
