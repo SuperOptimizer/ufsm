@@ -309,7 +309,7 @@ int cmd_train(int argc, char **argv) {
     /* Save the requested policy and the compute paths observed after dispatch, alongside storage modes. */
 #define WRITE_MANIFEST(path) do { \
     char mf_[8192]; size_t mn_ = (size_t)nn_prec_manifest(mf_, sizeof mf_); \
-    int add_ = snprintf(mf_ + mn_, sizeof mf_ - mn_, " act_mx4 %d act_mx8 %d grad_mx8 %d input_prec %d gn_stored %d f16 %d opt %s\n", unet_act_mx4(), unet_act_mx() && !unet_act_mx4(), unet_grad_mx8(), unet_input_prec(), nn_get_gn_stored(), nn_get_f16(), optname); \
+    int add_ = snprintf(mf_ + mn_, sizeof mf_ - mn_, " act_mx4 %d act_mx8 %d grad_mx8 %d grad_mx4 %d input_prec %d gn_stored %d f16 %d opt %s\n", unet_act_mx4(), unet_act_mx() && !unet_act_mx4(), unet_grad_mx8(), unet_grad_mx4(), unet_input_prec(), nn_get_gn_stored(), nn_get_f16(), optname); \
     mn_ += add_ > 0 && (size_t)add_ < sizeof mf_ - mn_ ? (size_t)add_ : sizeof mf_ - mn_ - 1; \
     nn_exec_manifest(mf_ + mn_, sizeof mf_ - mn_); \
     FILE *mff_ = fopen(path, "w"); if (mff_) { fputs(mf_, mff_); fputc('\n', mff_); fclose(mff_); } \
@@ -520,19 +520,27 @@ int cmd_train(int argc, char **argv) {
             const shape5 xs = {B, cfg.cin, split ? g_Dl : P, P, P};   /* split: this GPU's slab of the window */
             const size_t p3 = p3l;
             int pick = -1; size_t need = 0;
-            for (int c = 0; c < nc && pick < 0; c++) {
-                if (cand[c].gmx == auto16) continue;   /* auto: MX-fp8 gradient modes; auto16: the 16-bit ones */
-                unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean); unet_set_share_enc_a1(cand[c].sea || sea_force);
-                const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
-                size_t trainer = nbuf * ((size_t)B * 4 * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
-                if (cand[c].lean) trainer = cand[c].gmx ? 0 : (size_t)B * 4 * p3 * xbytes();   /* batch buffers inside the gradient buffer B (estimate) */
-                need = tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
-                if (need <= fmin) pick = c;
+            const int g4_env = getenv("UFSM_GRAD_MX4") != nullptr;
+            for (int tier = 0; tier < 2 && pick < 0; tier++) {
+                if (tier) {   /* nothing fits with MX-fp8 gradients: the same modes with MX-fp4 ones (opt-in otherwise; UFSM_GRAD_MX4=0 never) */
+                    if (auto16 || g4_env) break;
+                    unet_set_grad_mx4(1);
+                }
+                for (int c = 0; c < nc && pick < 0; c++) {
+                    if (cand[c].gmx == auto16) continue;   /* auto: MX-fp8 gradient modes; auto16: the 16-bit ones */
+                    unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean); unet_set_share_enc_a1(cand[c].sea || sea_force);
+                    const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
+                    size_t trainer = nbuf * ((size_t)B * 4 * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
+                    if (cand[c].lean) trainer = cand[c].gmx ? 0 : (size_t)B * 4 * p3 * xbytes();   /* batch buffers inside the gradient buffer B (estimate) */
+                    need = tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                    if (need <= fmin) pick = c;
+                }
             }
-            if (pick < 0) { pick = auto16 ? nc - 1 : 7; /* the smallest mode of the list */ fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
+            if (pick < 0) { pick = auto16 ? nc - 1 : 7; /* the smallest mode of the list (with MX-fp4 gradients when that tier ran) */ fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
             else fprintf(stderr, "memory: %s, %.2f of %.2f GB free per GPU\n", cand[pick].what, need / 1e9, fmin / 1e9);
             unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean); unet_set_share_enc_a1(cand[pick].sea || sea_force);
             if (unet_share_enc_a1() && !cand[pick].sea) fprintf(stderr, "memory: + shared encoder a1 (UFSM_RC_ENC_A1)\n");
+            if (unet_grad_mx4()) fprintf(stderr, "memory: + MX-fp4 activation gradients (%s)\n", g4_env ? "UFSM_GRAD_MX4" : "no mode fits with MX-fp8 ones; UFSM_GRAD_MX4=0 disables");
             lean = cand[pick].lean;
             { char mp[1400]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp); }   /* the planner's modes */
         }
