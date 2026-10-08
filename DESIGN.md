@@ -6,6 +6,22 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Memory and inference defaults (2026-10-08)
+
+- Training stores the MX activation gradients as MX-fp4 with exact stochastic rounding by default when every width is a
+  multiple of 32 and P is divisible by 2^levels (`UFSM_GRAD_MX4=0` keeps MX-fp8). Desk mode (lean 2, chunk 2,
+  recompute 1) at 512^3: 177.7 -> 139.8 B per level-0 voxel (-2.9 GB per GPU of the split slab), same step time
+  (laptop P 384: 985 vs 984 ms of kernels). Paired 500-step runs at P 256 (two seeds): validation loss +0.1..0.8%.
+  Against 16-bit gradients over 16 rounding seeds the fp4 parameter gradients are unbiased; MX-fp8's
+  round-to-nearest stores are not (mean residual 0.14). A 16 GB GPU now trains a whole 512^3 window (0.43 samples/s).
+- The decoder conv1 weight gradient runs over 32-channel up slices, so gout[0] holds one slice; with fp4 gradients the
+  fp16 logits sit at the start of gout[0], the logit gradient in A, the batch at gout[0]'s end.
+- Shared encoder a1 (`UFSM_RC_ENC_A1=1`, -1.66 GB, ~2.3% slower) stays a planner choice for when lean 2 does not fit.
+- predict computes only the written logit channel and keeps its 16-bit input in the network's shared a1 scratch
+  (inference 80.5 -> ~57 B per window voxel). Boxes of whole shards default to one window per shard (shard + 32,
+  halo 16) when it fits the GPU, else 288 / halo 8: laptop, 8 shards of 512, 16% less GPU time (5.20 vs 6.21 s),
+  9.4 GB peak, and twice the halo. `--window` / `--halo` override.
+
 ## Continuous winding experiment (2026-10-03)
 
 The experimental surface/winding pipeline is implemented without changing the

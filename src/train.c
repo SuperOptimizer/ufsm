@@ -490,6 +490,16 @@ int cmd_train(int argc, char **argv) {
            GPU; an explicit UFSM_CHUNK_UP / UFSM_RECOMPUTE / UFSM_GRAD_MX8 or --mem default keeps the env / built-in modes */
         const char *mm = opt(argc, argv, "--mem", "auto");   /* MX-fp8 gradients passed their stair (3 seeds, mean 0.293 vs 0.294) */
         const int auto16 = g_sheet || !strcmp(mm, "auto16") || !unet_act_mx();   /* sheet reference keeps FP16 stem, hence 16-bit gradients */
+        /* MX gradient modes store MX-fp4 activation gradients by default (paired 500-step runs: same step time, -2.9 GB per desk GPU,
+           validation loss +0.1..0.8%) where the fp4 kernels apply: widths in 32-channel blocks, an even coarsest level;
+           UFSM_GRAD_MX4=0 keeps MX-fp8 */
+        {
+            int g4ok = P % (1 << cfg.nlev) == 0;
+            for (int i = 0; i < cfg.nlev; i++) if (cfg.widths[i] % 32) g4ok = 0;
+            const int g4 = getenv("UFSM_GRAD_MX4") ? ufsm_env_on("UFSM_GRAD_MX4") : g4ok;
+            if (g4 && !g4ok) { fprintf(stderr, "UFSM_GRAD_MX4: MX-fp4 gradients need widths that are multiples of 32 and P divisible by %d\n", 1 << cfg.nlev); return 2; }
+            unet_set_grad_mx4(g4);
+        }
         if (!strcmp(mm, "wide")) {
             if (!nn_get_tf32() || !unet_act_mx()) { fprintf(stderr, "--mem wide requires tensor cores and MX activation storage\n"); return 2; }
             unet_set_chunk_up(2); unet_set_recompute(1); unet_set_grad_mx8(1); unet_set_lean(2); unet_set_wide_up_grad(1);
@@ -504,11 +514,11 @@ int cmd_train(int argc, char **argv) {
                    133 / 29.8; 16-bit default 219 / 26.4, chunked 186 / 27.4, + recompute 2 171 / 29.8. lean 1: one batch buffer, logits
                    in A, logit gradient / targets / mask (/ input) in B; lean 2: no gradient buffer B (each block's incoming gradient
                    buffer serves as B), -17 B */
-                {1, 1, 1, 0, 0, "MX-fp8 gradients"}, {2, 1, 1, 0, 0, "MX-fp8 gradients, chunked up-part gradient"},
-                {2, 1, 1, 1, 0, "MX-fp8 gradients, chunked, lean"}, {2, 1, 1, 2, 0, "MX-fp8 gradients, chunked, lean 2"},
-                {2, 1, 1, 2, 1, "MX-fp8 gradients, chunked, lean 2, shared encoder a1"},   /* ~-22 B / level-0 voxel, ~2.5% (encoder conv1 re-run) */
-                {2, 2, 1, 0, 0, "MX-fp8 gradients, chunked, recompute 2"}, {2, 2, 1, 1, 0, "MX-fp8 gradients, chunked, recompute 2, lean"},
-                {2, 2, 1, 2, 0, "MX-fp8 gradients, chunked, recompute 2, lean 2"},
+                {1, 1, 1, 0, 0, "MX gradients"}, {2, 1, 1, 0, 0, "MX gradients, chunked up-part gradient"},
+                {2, 1, 1, 1, 0, "MX gradients, chunked, lean"}, {2, 1, 1, 2, 0, "MX gradients, chunked, lean 2"},
+                {2, 1, 1, 2, 1, "MX gradients, chunked, lean 2, shared encoder a1"},   /* ~-22 B / level-0 voxel, ~2.5% (encoder conv1 re-run) */
+                {2, 2, 1, 0, 0, "MX gradients, chunked, recompute 2"}, {2, 2, 1, 1, 0, "MX gradients, chunked, recompute 2, lean"},
+                {2, 2, 1, 2, 0, "MX gradients, chunked, recompute 2, lean 2"},
                 {1, 1, 0, 0, 0, "16-bit gradients"}, {2, 1, 0, 0, 0, "16-bit gradients, chunked up-part gradient (UFSM_CHUNK_UP=2)"},
                 {2, 2, 0, 0, 0, "16-bit gradients, chunked, recompute 2"}, {2, 2, 0, 1, 0, "16-bit gradients, chunked, recompute 2, lean"},
                 {2, 2, 0, 2, 0, "16-bit gradients, chunked, recompute 2, lean 2"}};
@@ -520,27 +530,20 @@ int cmd_train(int argc, char **argv) {
             const shape5 xs = {B, cfg.cin, split ? g_Dl : P, P, P};   /* split: this GPU's slab of the window */
             const size_t p3 = p3l;
             int pick = -1; size_t need = 0;
-            const int g4_env = getenv("UFSM_GRAD_MX4") != nullptr;
-            for (int tier = 0; tier < 2 && pick < 0; tier++) {
-                if (tier) {   /* nothing fits with MX-fp8 gradients: the same modes with MX-fp4 ones (opt-in otherwise; UFSM_GRAD_MX4=0 never) */
-                    if (auto16 || g4_env) break;
-                    unet_set_grad_mx4(1);
-                }
-                for (int c = 0; c < nc && pick < 0; c++) {
-                    if (cand[c].gmx == auto16) continue;   /* auto: MX-fp8 gradient modes; auto16: the 16-bit ones */
-                    unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean); unet_set_share_enc_a1(cand[c].sea || sea_force);
-                    const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
-                    size_t trainer = nbuf * ((size_t)B * 4 * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
-                    if (cand[c].lean) trainer = cand[c].gmx ? 0 : (size_t)B * 4 * p3 * xbytes();   /* batch buffers inside the gradient buffer B (estimate) */
-                    need = tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
-                    if (need <= fmin) pick = c;
-                }
+            for (int c = 0; c < nc && pick < 0; c++) {
+                if (cand[c].gmx == auto16) continue;   /* auto: MX gradient modes; auto16: the 16-bit ones */
+                unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean); unet_set_share_enc_a1(cand[c].sea || sea_force);
+                const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
+                size_t trainer = nbuf * ((size_t)B * 4 * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
+                if (cand[c].lean) trainer = cand[c].gmx ? 0 : (size_t)B * 4 * p3 * xbytes();   /* batch buffers inside the gradient buffer B (estimate) */
+                need = tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                if (need <= fmin) pick = c;
             }
-            if (pick < 0) { pick = auto16 ? nc - 1 : 7; /* the smallest mode of the list (with MX-fp4 gradients when that tier ran) */ fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
+            if (pick < 0) { pick = auto16 ? nc - 1 : 7; /* the smallest mode of the list */ fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
             else fprintf(stderr, "memory: %s, %.2f of %.2f GB free per GPU\n", cand[pick].what, need / 1e9, fmin / 1e9);
             unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean); unet_set_share_enc_a1(cand[pick].sea || sea_force);
             if (unet_share_enc_a1() && !cand[pick].sea) fprintf(stderr, "memory: + shared encoder a1 (UFSM_RC_ENC_A1)\n");
-            if (unet_grad_mx4()) fprintf(stderr, "memory: + MX-fp4 activation gradients (%s)\n", g4_env ? "UFSM_GRAD_MX4" : "no mode fits with MX-fp8 ones; UFSM_GRAD_MX4=0 disables");
+            if (unet_grad_mx4()) fprintf(stderr, "memory: MX gradients stored as MX-fp4 (default; UFSM_GRAD_MX4=0: MX-fp8)\n");
             lean = cand[pick].lean;
             { char mp[1400]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp); }   /* the planner's modes */
         }
