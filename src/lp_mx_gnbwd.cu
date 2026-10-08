@@ -17,13 +17,16 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, 
     const int blk = blockIdx.y, n = blockIdx.z, nsl = gridDim.x;
     const int h0 = HPB == 2 ? 16 * (int)(threadIdx.x & 1) : 0, tv = (int)threadIdx.x / HPB, nt = 256 / HPB;
     const size_t nq = S / V, q0 = nq * blockIdx.x / nsl, q1 = nq * (blockIdx.x + 1) / nsl;   /* slab in units of V voxels */
-    __shared__ float cm[32], cr[32], cg[32], cb[32], s1[32], s2[32];
+    /* per-warp partials summed in warp order below (shared-memory float atomics made the sums, hence the stored gradients'
+       MX rounding, depend on the warps' timing: identical runs differed) */
+    __shared__ float cm[32], cr[32], cg[32], cb[32], w1[8][32], w2[8][32];
     if (threadIdx.x < 32) {
         const int k = threadIdx.x, c = blk * bw + k;
         const bool ok = k < bw && c < C;
         const int ng = n * G + (ok ? c / cpg : 0);
-        cm[k] = ok ? mean[ng] : 0.f; cr[k] = ok ? rstd[ng] : 0.f; cg[k] = ok ? gamma[c] : 0.f; cb[k] = ok ? beta[c] : 0.f; s1[k] = 0.f; s2[k] = 0.f;
+        cm[k] = ok ? mean[ng] : 0.f; cr[k] = ok ? rstd[ng] : 0.f; cg[k] = ok ? gamma[c] : 0.f; cb[k] = ok ? beta[c] : 0.f;
     }
+    w1[threadIdx.x >> 5][threadIdx.x & 31] = 0.f; w2[threadIdx.x >> 5][threadIdx.x & 31] = 0.f;
     __syncthreads();
     const uint8_t *sc = mx_sc<B>(x, N, C, S);
     float a1[16], a2[16];
@@ -64,12 +67,17 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, 
     for (int k = 0; k < 16; k++) {   /* kmax differs between the halves only in its padding tail: reduce all 16, add the real ones */
         float a = a1[k], q = a2[k];
         for (int o = 16; o >= HPB; o >>= 1) { a += __shfl_xor_sync(0xffffffff, a, o); q += __shfl_xor_sync(0xffffffff, q, o); }
-        if ((int)(threadIdx.x & 31) < HPB && k < kmax) { atomicAdd(&s1[h0 + k], a); atomicAdd(&s2[h0 + k], q); }
+        if ((int)(threadIdx.x & 31) < HPB && k < kmax) { w1[threadIdx.x >> 5][h0 + k] = a; w2[threadIdx.x >> 5][h0 + k] = q; }
     }
     __syncthreads();
     /* per-slab partials (same-address double atomics across slabs serialised at the small levels); summed by gn_part_sum_k */
     const int kb = min(bw, C - blk * bw);
-    if ((int)threadIdx.x < kb) { const size_t c = (size_t)n * C + blk * bw + threadIdx.x, o = ((size_t)blockIdx.x * N * C + c) * 2; part[o] = s1[threadIdx.x]; part[o + 1] = s2[threadIdx.x]; }
+    if ((int)threadIdx.x < kb) {
+        float a = 0.f, q = 0.f;
+#pragma unroll
+        for (int w = 0; w < 8; w++) { a += w1[w][threadIdx.x]; q += w2[w][threadIdx.x]; }
+        const size_t c = (size_t)n * C + blk * bw + threadIdx.x, o = ((size_t)blockIdx.x * N * C + c) * 2; part[o] = a; part[o + 1] = q;
+    }
 }
 __global__ void gn_part_sum_k(const float *part, int nsl, int NC, double *ds) {   /* ds[2 c + j] = sum over slabs (double) */
     /* a warp per output: lanes stride over the slabs (up to 1024: one thread walking them serially in fp64 took 0.1 ms per call) */

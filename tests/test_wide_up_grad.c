@@ -51,6 +51,7 @@ int main(void) {
   int ok=f<1e-5 && (sr?g<1.5*noise+1e-3:g<1e-5);printf("seed=%u logits_rel=%.6g grad_rel=%.6g baseline_seed_rel=%.6g %s\n",seeds[j],f,g,noise,ok?"ok":"FAIL");failures+=!ok;
  }
  double repeat=rel(grads[4],grads[0],np);printf("repeat narrow grad_rel=%.6g\n",repeat);failures+=repeat>=1e-5;
+ if(repeat>=1e-5||getenv("UFSM_TEST_SEGS"))for(int t=0;t<nsegment;t++){segment sg=segments[t];printf("  repeat %s grad_rel=%.6g\n",sg.name,rel(grads[4]+sg.off,grads[0]+sg.off,sg.len));}
  nn_set_sr(0);unet_set_wide_up_grad(0);unet *reused=unet_create(&cfg);unet_init(reused,7);
  const int transitions[]={0,1,0,1};
  for(int k=0;k<4;k++){
