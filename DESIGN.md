@@ -28,10 +28,14 @@ No teacher models, no distillation. All upstream data is re-exported once into t
   dec[0].a2 is dead after the first op of dec[0]'s backward. The skip enc[0].a2 (idle from dec[0]'s conv1 to that conv's
   weight gradient) gets a pinned host copy after the encoders' a1 copies; its buffer takes the 16-bit logit gradient
   from the loss to the head's backward, the skip comes back before dec[0]'s conv1 weight gradient, and the input returns
-  into it once enc[0]'s backward has read a2. A shrinks to the coarser levels (17 -> 4.2 B). Desk mode 108.6 -> 95.9 B
-  per level-0 voxel (12.9 GB at 512^3, ~7.2 GB per desk GPU's split slab); +0.4% step (queued before the encoders' a1
-  copies it stalled dec[1]'s forward: +3%). `--mem auto` now runs a 512^3 window at recompute 1 on a 16 GB GPU
-  (13.6 GB peak).
+  into it once enc[0]'s backward has read a2. Every coarser decoder level's A is likewise its dec[i].a2's buffer (no
+  copies: nothing else holds it), so the separate A only serves the bottom level; a repeated backward re-runs the
+  decoders' conv2 bottom-up. Desk mode 108.6 -> 91.6 B per level-0 voxel (12.3 GB at 512^3, ~6.9 GB per desk GPU's
+  split slab); +0.4% step (the skip's copy queued before the encoders' a1 copies stalled dec[1]'s forward: +3%).
+  `--mem auto` now runs a 512^3 window at recompute 1 on a 16 GB GPU (13.6 GB peak).
+- Before / after the memory work (ac690ae vs now, laptop, same profiler): training steps at P 384 in the desk mode
+  ~823 -> ~815 ms (fp8 -> fp4 gradients included); inference forward at 288^3 unchanged (~93 ms); predict over 8
+  shards 6.35 -> 5.28 s of GPU time, wall 6.7 -> 5.9 s.
 - predict computes only the written logit channel and keeps its 16-bit input in the network's shared a1 scratch
   (inference 80.5 -> ~57 B per window voxel). Boxes of whole shards default to one window per shard (shard + 32,
   halo 16) when it fits the GPU, else 288 / halo 8: laptop, 8 shards of 512, 16% less GPU time (5.20 vs 6.21 s),
