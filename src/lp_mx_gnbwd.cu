@@ -1,5 +1,12 @@
 /* GroupNorm+SiLU backward on MX tensors and 1x1 conv to MX */
 #include "lp_mxops.cuh"
+/* d silu(u) / du = sg (1 + u (1 - sg)), sg = sigmoid(u) = 1/2 + tanh(u / 2) / 2: one MUFU op (exp + reciprocal took two;
+   tanh.approx ~2^-11 relative, far below the e4m3 rounding of the stored gradient) */
+__device__ __forceinline__ float dsilu(float u) {
+    float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(0.5f * u));
+    const float sg = fmaf(0.5f, th, 0.5f);
+    return sg * (1.f + u * (1.f - sg));
+}
 template <int B, typename TG, int V, int HPB>   /* V consecutive voxels per thread step (vector gy loads; 1: any S); HPB 16-channel halves per row */
 __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, const TG *gy, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                                            int N, int C, int G, size_t S, float *part) {
@@ -46,8 +53,8 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, 
 #pragma unroll
             for (int k = 0; k < 16; k++) {
                 if (k < kmax) {
-                    const float xhat = (r[k] - cm[h0 + k]) * cr[h0 + k], u = xhat * cg[h0 + k] + cb[h0 + k], sg = __fdividef(1.f, 1.f + __expf(-u));
-                    const float a = (IS_MX8(TG) ? gr[k] : g[j][k]) * (sg * (1.f + u * (1.f - sg)));
+                    const float xhat = (r[k] - cm[h0 + k]) * cr[h0 + k], u = xhat * cg[h0 + k] + cb[h0 + k];
+                    const float a = (IS_MX8(TG) ? gr[k] : g[j][k]) * dsilu(u);
                     a1[k] += a; a2[k] += a * xhat;
                 }
             }
@@ -104,8 +111,8 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx_k(const uint8_t *x, 
         out[k] = 0.f;
         if (k < kmax) {
             const float rs = cr[k], ga = cg[k];
-            const float xhat = (r[k] - cm[k]) * rs, u = xhat * ga + cb[k], sg = __fdividef(1.f, 1.f + __expf(-u));
-            const float a = (IS_MX8(TG) ? gr[k] : ldx(gyb, (size_t)k * S)) * (sg * (1.f + u * (1.f - sg)));
+            const float xhat = (r[k] - cm[k]) * rs, u = xhat * ga + cb[k];
+            const float a = (IS_MX8(TG) ? gr[k] : ldx(gyb, (size_t)k * S)) * dsilu(u);
             const float gv = rs * (a * ga - ca[k] - xhat * cc[k]);
             if constexpr (IS_MX8(TO)) out[k] = gv; else stx(gxb, (size_t)k * S, gv);
         }
