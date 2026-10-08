@@ -99,6 +99,7 @@ void unet_set_grad_mx8(int on);   /* MX-fp8 activation gradients as well (env UF
 void unet_set_recompute(int on);
 void unet_set_lean(int on);
 void *unet_grad_scratch(unet *u, size_t bytes);
+void *unet_batch_scratch(unet *u, size_t head, size_t tail);   /* lean 2: the batch as [head (input) | tail (targets, masks)] */
 void *unet_logit_grad_scratch(unet *u, size_t bytes);   /* lean: home of the 16-bit logit gradient (A after the logits under lean 2, else B) */
 int unet_lean_nob(const unet *u);   /* lean 2 build: no gradient buffer B (gout[0] is the batch scratch) */
 void unet_build(unet *u, shape5 xs, int train);   /* build the buffers for xs now (the first forward would) */
@@ -109,7 +110,10 @@ void unet_set_wide_up_grad(int on);   /* optional larger level-0 MX8 up-gradient
 int unet_wide_up_grad(void);
 void unet_set_share_enc_a1(int on);   /* training, recompute 1: encoder blocks above the bottom keep no a1 (backward re-runs conv1 into the same-level decoder's a1) */
 int unet_share_enc_a1(void);
-int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp16 (lean 2 training: the logit gradient fits after them) */
+int unet_logits_h16(const unet *u);
+void unet_set_grad_mx4(int on);   /* MX-fp4 activation gradients (with the MX gradient mode; opt-in, env UFSM_GRAD_MX4) */
+int unet_grad_mx4(void);
+void unet_set_up_wg_chunk(int on);   /* decoder conv1 weight gradient in 32-channel up slices (-1 default: with MX-fp4 gradients) */   /* the logits unet_forward returns are fp16 (lean 2 training: the logit gradient fits after them) */
 size_t unet_train_bytes(unet *u, shape5 xs);   /* training activation + gradient bytes at xs for the current modes (dry build) */
 size_t unet_grad_bytes(const unet *u);   /* the activation-gradient part of unet_activation_bytes */
 /* spatial split of one window along z across two GPUs (src/split.h): side 0 holds the low z planes, side 1 the high ones, each

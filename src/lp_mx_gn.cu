@@ -75,7 +75,8 @@ __global__ void up2_mx_k(const uint8_t *x, uint8_t *y, int N, int C, int D, int 
    edge-clamped coordinates) once into smem as bf16 (decoded MX values are exact in bf16) and every fine voxel interpolates from
    it with the weights and order of up2_mx_k (identical output); up2_mx_k decoded each coarse row 8 times from global memory */
 template <int BX, int BY>
-__global__ void __launch_bounds__(256) up2_mx_tile_k(const uint8_t *x, uint8_t *y, int N, int C, int D, int H, int W) {
+__global__ void __launch_bounds__(256) up2_mx_tile_k(const uint8_t *x, uint8_t *y, int N, int C, int D, int H, int W, int Cx, int xb0) {   /* C: y channels;
+                                                                                    x: Cx channels, its blocks xb0.. (32-wide when Cx != C) */
     /* block = 4 x 4 x 32 fine voxels (thread: x lane, y (tid >> 5) & 3, two z); the coarse rows they read decoded once into an fp32
        tile (exact: the stored values), so the 8 x 32 trilinear terms of a voxel are plain loads + FMAs (no bf16 unpacking) */
     constexpr int CZ = 4, CY = 4, CX = 18, RS = 36;   /* RS: floats per coarse row (+4: neighbouring columns' float4 reads hit different banks) */
@@ -83,18 +84,19 @@ __global__ void __launch_bounds__(256) up2_mx_tile_k(const uint8_t *x, uint8_t *
     float *tile = (float *)up_smem;   /* [CZ][CY][CX][RS] */
     const int bw = mx_bw(C), Do = 2 * D, Ho = 2 * H, Wo = 2 * W;
     const size_t S = (size_t)D * H * W, So = (size_t)Do * Ho * Wo;
-    const int nbk = blockIdx.y, ntx = (Wo + 31) / 32, nty = (Ho + 3) / 4;
+    const int nbk = blockIdx.y, ntx = (Wo + 31) / 32, nty = (Ho + 3) / 4, nby = mx_nb(C);
+    const size_t xrb = (size_t)((nbk / nby) * mx_nb(Cx) + xb0 + nbk % nby) * S;   /* the source block's first row */
     int bt = blockIdx.x;
     const int ox0 = (bt % ntx) * 32; bt /= ntx;
     const int oy0 = (bt % nty) * 4; bt /= nty;
     const int oz0 = bt * 4;
     const int cz0 = (oz0 >> 1) - 1, cy0 = (oy0 >> 1) - 1, cx0 = (ox0 >> 1) - 1;
-    const uint8_t *sc = mx_sc<BX>(x, N, C, S);
+    const uint8_t *sc = mx_sc<BX>(x, N, Cx, S);
     for (int i = threadIdx.x; i < CZ * CY * CX; i += 256) {
         const int tx = i % CX, ty = (i / CX) % CY, tz = i / (CX * CY);
         const int z = min(max(cz0 + tz, 0), D - 1), yy = min(max(cy0 + ty, 0), H - 1), xx = min(max(cx0 + tx, 0), W - 1);
         float r[32];
-        mx_load_row_b<BX>(x, sc, (size_t)nbk * S + ((size_t)z * H + yy) * W + xx, bw, r);
+        mx_load_row_b<BX>(x, sc, xrb + ((size_t)z * H + yy) * W + xx, bw, r);
         float4 *d = (float4 *)(tile + (size_t)i * RS);
 #pragma unroll
         for (int k = 0; k < 32; k += 4) d[k / 4] = make_float4(k < bw ? r[k] : 0.f, k + 1 < bw ? r[k + 1] : 0.f, k + 2 < bw ? r[k + 2] : 0.f, k + 3 < bw ? r[k + 3] : 0.f);
@@ -136,7 +138,7 @@ extern "C" void lp_up2_fwd_mx(const void *x, int xdt, shape5 xs, void *y, int yd
     if (tiled && !gp.G) {
         const size_t sm = (size_t)4 * 4 * 18 * 36 * 4;
         const dim3 gt((unsigned)(((2 * xs.w + 31) / 32) * ((2 * xs.h + 3) / 4) * ((2 * xs.d + 3) / 4)), (unsigned)(xs.n * mx_nb(xs.c)));
-#define U2T(BX, BY) up2_mx_tile_k<BX, BY><<<gt, 256, sm>>>(xq, yq, xs.n, xs.c, xs.d, xs.h, xs.w)
+#define U2T(BX, BY) up2_mx_tile_k<BX, BY><<<gt, 256, sm>>>(xq, yq, xs.n, xs.c, xs.d, xs.h, xs.w, xs.c, 0)
         if (xdt == 4) { if (ydt == 4) U2T(4, 4); else U2T(4, 8); }
         else { if (ydt == 4) U2T(8, 4); else U2T(8, 8); }
 #undef U2T
@@ -147,6 +149,18 @@ extern "C" void lp_up2_fwd_mx(const void *x, int xdt, shape5 xs, void *y, int yd
     if (xdt == 4) { if (ydt == 4) U2(4, 4); else U2(4, 8); }
     else { if (ydt == 4) U2(8, 4); else U2(8, 8); }
 #undef U2
+    LPCK();
+}
+/* the plain upsample of 32-channel blocks [b0, b0 + nbk) of x (xs.c channels) into a 32 nbk-channel y */
+extern "C" void lp_up2_fwd_mx_blocks(const void *x, int xdt, shape5 xs, int b0, int nbk, void *y, int ydt) {
+    if (mx_bw(xs.c) != 32 || b0 < 0 || b0 + nbk > mx_nb(xs.c)) { fprintf(stderr, "lp_up2_fwd_mx_blocks: blocks %d + %d of %d channels\n", b0, nbk, xs.c); abort(); }
+    const size_t sm = (size_t)4 * 4 * 18 * 36 * 4;
+    const dim3 gt((unsigned)(((2 * xs.w + 31) / 32) * ((2 * xs.h + 3) / 4) * ((2 * xs.d + 3) / 4)), (unsigned)(xs.n * nbk));
+    const uint8_t *xq = (const uint8_t *)x; uint8_t *yq = (uint8_t *)y;
+#define U2T(BX, BY) up2_mx_tile_k<BX, BY><<<gt, 256, sm>>>(xq, yq, xs.n, 32 * nbk, xs.d, xs.h, xs.w, xs.c, b0)
+    if (xdt == 4) { if (ydt == 4) U2T(4, 4); else U2T(4, 8); }
+    else { if (ydt == 4) U2T(8, 4); else U2T(8, 8); }
+#undef U2T
     LPCK();
 }
 /* in-place silu(gn(.)) of the bw channels of block blk of an MX row (gp.G == 0: none) */

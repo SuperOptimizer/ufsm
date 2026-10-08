@@ -110,12 +110,32 @@ static int s2b_dilate(const void *gy, shape5 ys, const float *w, shape5 xs, void
     LPCK();
     return 1;
 }
+/* MX row format change (BI -> BO bits, same channels): fp4 -> fp8 is exact; fp8 -> fp4 with exact SR keyed by sr */
+template <int BI, int BO> __global__ void mx_recode_k(const uint8_t *x, uint8_t *y, int N, int C, size_t S, unsigned sr) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x, rows = (size_t)N * mx_nb(C) * S;
+    if (i >= rows) return;
+    const int bw = mx_bw(C);
+    float r[32];
+    mx_load_row_b<BI>(x, mx_sc<BI>(x, N, C, S), i, bw, r);
+    mx_store_row_b<BO>(y, mx_sc<BO>(y, N, C, S), i, bw, r, sr);
+}
 extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr);   /* lp_mx_s2bwd_tc.cu */
 /* returns the compute precision used: 2 (fp8 tensor cores, wide layers), 1 (bf16 tensor cores, 16 / 32 channels) or 0 (fp32) */
 extern "C" int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr) {
     /* the direct tensor-core kernel first (16 / 32 / 64 channels: no fine-level scratch), then the dilated fp8 conv (wider) */
     if (lp_bwd_data_s2_mx_tc(gy, ys, w, xs, gx, accum, gdt, xdt, osr)) return 1;
-    if (gdt == 4 || xdt == 4) { fprintf(stderr, "lp_bwd_data_s2_mx: MX-fp4 gradients need 32 or 64 channels (Ci == Co)\n"); abort(); }
+    if (gdt == 4 || xdt == 4) {   /* MX-fp4 gradients on the wide (small, coarse) levels: through MX-fp8 copies (gy and the old gx exact,
+                                     the result back to fp4 with SR) */
+        if (gdt != 4 || xdt != 4) { fprintf(stderr, "lp_bwd_data_s2_mx: gy and gx must share the MX format\n"); abort(); }
+        const size_t Sy = shape_spatial(ys), Sx = shape_spatial(xs), ry = (size_t)ys.n * mx_nb(ys.c) * Sy, rx = (size_t)xs.n * mx_nb(xs.c) * Sx;
+        uint8_t *gy8 = lp_buf<uint8_t>(5, lp_mx8_bytes(ys.n, ys.c, Sy)), *gx8 = lp_buf<uint8_t>(4, lp_mx8_bytes(xs.n, xs.c, Sx));   /* slots 4 (the wgrad gy pre-pass, free here) and 5 */
+        mx_recode_k<4, 8><<<nblk_(ry, 256), 256>>>((const uint8_t *)gy, gy8, ys.n, ys.c, Sy, 0u);
+        if (accum) mx_recode_k<4, 8><<<nblk_(rx, 256), 256>>>((const uint8_t *)gx, gx8, xs.n, xs.c, Sx, 0u);
+        const int pr = lp_bwd_data_s2_mx(gy8, ys, w, xs, gx8, accum, 3, 3, 0u);
+        mx_recode_k<8, 4><<<nblk_(rx, 256), 256>>>(gx8, (uint8_t *)gx, xs.n, xs.c, Sx, osr);
+        LPCK();
+        return pr;
+    }
     if (s2b_dilate(gy, ys, w, xs, gx, accum)) return 2;
     {
         const int bwx = mx_bw(xs.c), nbx = mx_nb(xs.c);

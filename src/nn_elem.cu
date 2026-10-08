@@ -376,8 +376,22 @@ extern "C" void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, 
 }
 extern "C" void nn_up2_fwd_into(const float *x, shape5 xs, float *y, int ctot, int c0) { nn_up2_fwd_gn_into(x, xs, nullptr, y, ctot, c0); }
 extern "C" void nn_up2_fwd(const float *x, shape5 xs, float *y) { nn_up2_fwd_into(x, xs, y, xs.c, 0); }
+extern "C" void nn_up2_fwd_mx_range(const float *x, shape5 xs, int c0, int nc, float *y) {
+    if (!ISMX(x) || !ISMX(y) || c0 % 32 || nc % 32) { fprintf(stderr, "nn_up2_fwd_mx_range: MX tensors and 32-channel blocks only\n"); abort(); }
+    lp_up2_fwd_mx_blocks(x, MXDT(x), xs, c0 / 32, nc / 32, y, MXDT(y)); KCHECK();
+}
+__global__ void add_rows_k(float *d, size_t dld, const float *s, size_t sld, int rows, size_t cols) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * cols) return;
+    const size_t r = i / cols, c = i % cols;
+    d[r * dld + c] += s[r * sld + c];
+}
+extern "C" void nn_add_rows(float *dst, size_t dld, const float *src, size_t sld, int rows, size_t cols) {
+    if (rows < 1 || !cols) return;
+    add_rows_k<<<nblk((size_t)rows * cols, 256), 256>>>(dst, dld, src, sld, rows, cols); KCHECK();
+}
 extern "C" void nn_up2_bwd_into(const float *gy, shape5 xs, float *gx, int ctot, int c0) {
-    if (ISMX(gy)) { if (!ISMX(gx)) { fprintf(stderr, "up2_bwd: MX gy needs an MX gx\n"); abort(); } if (ctot == xs.c && !c0) lp_up2_bwd_mx(gy, xs, gx); else lp_up2_bwd_mx_slice(gy, xs, gx, ctot, c0); KCHECK(); return; }
+    if (ISMX(gy)) { if (!ISMX(gx)) { fprintf(stderr, "up2_bwd: MX gy needs an MX gx\n"); abort(); } const unsigned osr_ = MXDT(gx) == 4 ? sr_seed() : 0u; if (ctot == xs.c && !c0) lp_up2_bwd_mx(gy, xs, gx, MXDT(gy), MXDT(gx), osr_); else lp_up2_bwd_mx_slice(gy, xs, gx, ctot, c0, MXDT(gy), MXDT(gx), osr_); KCHECK(); return; }
     dim3 grid(nblk(xs.w, 8), nblk(xs.h, 8), (unsigned)(nblk(xs.d, 4) * xs.n * xs.c));
     if (GBF && g_h16) up2_b_k<f16, f16><<<grid, 256>>>((const f16 *)gy, (f16 *)gx, xs.n * xs.c, xs.d, xs.h, xs.w, xs.c, ctot, c0);
     else if (GBF) up2_b_k<bf16, bf16><<<grid, 256>>>((const bf16 *)gy, (bf16 *)gx, xs.n * xs.c, xs.d, xs.h, xs.w, xs.c, ctot, c0);

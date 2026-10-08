@@ -57,6 +57,7 @@ void lp_cvt_e2m1_probe(const float *hv, unsigned char *ho, int n);   /* test pro
    gradients (gy / gx, gdt) are never mx4 */
 void lp_gn_silu_apply_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, void *y, int ydt);
 void lp_up2_fwd_mx(const void *x, int xdt, shape5 xs, void *y, int ydt, gnp_t gp);   /* gp: silu(gn(x)) upsampled */
+void lp_up2_fwd_mx_blocks(const void *x, int xdt, shape5 xs, int b0, int nbk, void *y, int ydt);   /* 32-channel blocks [b0, b0 + nbk) of x */
 void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp);
 void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp);   /* fp16 output */
 void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp);
@@ -66,8 +67,8 @@ void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const float *gam
 void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                              const void *gy, void *gx, int gdt, const float *AB, unsigned gsr);   /* gsr: SR seed of an MX-fp4 gx (gdt 4) */
 void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr);   /* ydt 3 MX-fp8, 4 MX-fp4 (exact SR keyed by sr) */
-void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx);
-void lp_up2_bwd_mx_slice(const void *gy, shape5 xs, void *gx, int ctot, int c0);   /* channels [c0, c0 + xs.c) of an MX-fp8 gx (ctot ch) */
+void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx, int gdt, int xdt, unsigned osr);   /* gdt / xdt: MX dt 3 (fp8) or 4 (fp4, gx with exact SR keyed by osr) */
+void lp_up2_bwd_mx_slice(const void *gy, shape5 xs, void *gx, int ctot, int c0, int gdt, int xdt, unsigned osr);   /* channels [c0, c0 + xs.c) of an MX-fp8 gx (ctot ch) */
 int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr);   /* returns the compute precision (2 fp8, 1 bf16, 0 fp32) */
 const char *lp_check(void);
 void lp_f32_to_bf16(const float *x, size_t n, void *y);   /* test helpers */

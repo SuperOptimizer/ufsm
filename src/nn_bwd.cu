@@ -53,7 +53,7 @@ int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *
         if (mdt && ISMX(y) && mdt != MXDT(y) && xs.c <= 8 && !sp.x2 && !sp.y2 && !sp.up && !sp.accum)
             return lp_conv_fwd_f8(x, mdt, xs, w, b, cout, y, MXDT(y), gp, osum, Go, sp);   /* independently quantized stem input */
         if (mdt == 4 && !ISMX(y) && !sp.y2 && !ybf) { sp.wkey = conv_wkey(); return lp_conv_fwd_f4(x, 4, xs, w, b, cout, y, 0, gp, osum, Go, sp); }   /* mx4 in, fp32 out (tests) */
-        if (!mdt || MXDT(y) != mdt || (sp.x2 && MXDT(sp.x2) != mdt) || (sp.y2 && MXDT(sp.y2) != mdt)) { fprintf(stderr, "conv: MX storage needs MX inputs and outputs of one format\n"); abort(); }
+        if (!mdt || MXDT(y) != mdt || (sp.x2 && MXDT(sp.x2) != mdt) || (sp.y2 && MXDT(sp.y2) != mdt)) { fprintf(stderr, "conv: MX storage needs MX inputs and outputs of one format (x %d y %d x2 %d y2 %d, %dx%d ch, pass %d)\n", mdt, MXDT(y), sp.x2 ? MXDT(sp.x2) : -1, sp.y2 ? MXDT(sp.y2) : -1, xs.c, cout, g_pass); abort(); }
         sp.wkey = conv_wkey();
         if ((mdt == 4 || pr == 3) && g_pass == 1 && sr_on()) sp.sr = sr_seed();   /* fp4 backward-data: stochastic rounding of the (MX-fp8) gy operand */
         if (mdt == 4 && g_pass == 1) { sp.sr = 0; sp.osr = sr_seed(); }   /* MX-fp4 gradients: gy already on the e2m1 grid (copy staging), gx stored with exact SR */

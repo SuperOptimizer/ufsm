@@ -198,6 +198,8 @@ void nn_u8_to_f32(const uint8_t *x, size_t n, float scale, float *y);
 void nn_up2_fwd(const float *x, shape5 xs, float *y);
 /* Same, writing into channels [c0, c0 + xs.c) of a destination tensor with ctot channels (e.g. a concat buffer). */
 void nn_up2_fwd_into(const float *x, shape5 xs, float *y, int ctot, int c0);
+void nn_up2_fwd_mx_range(const float *x, shape5 xs, int c0, int nc, float *y);   /* MX: channels [c0, c0 + nc) of x (32-aligned) upsampled into an nc-channel y */
+void nn_add_rows(float *dst, size_t dld, const float *src, size_t sld, int rows, size_t cols);   /* dst[r dld + c] += src[r sld + c] */
 /* accuracy study: round a stored activation (activation storage type) in place to a narrower block-scaled format:
    1 NVFP4 (e2m1, e4m3 scale per 16 channels, fp32 tensor scale), 2 MXFP4, 3 MXFP6 e2m3, 4 MXFP6 e3m2, 5 MXFP8 e4m3
    (ue8m0 per 32 channels). No-op for MX-stored tensors. */

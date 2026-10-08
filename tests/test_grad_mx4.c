@@ -4,6 +4,7 @@
    independently rounded outputs must approach the reference ~1 / sqrt(K) (a biased rounding plateaus). */
 #include "nn.h"
 #include "nn_lp.h"
+#include "unet.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -134,7 +135,7 @@ int main(void) {
         printf("  %-46s gw fp4 vs fp8 gy %.3g, bias %.3g%s\n", which ? "wgrad s2 32 -> 32, gy MX-fp4 (FAST)" : "wgrad stem 4 -> 32, gy MX-fp4 (FAST)", d, db, ok ? "" : "  FAIL");
         if (!ok) bad++;
     }
-    for (int C = 32; C <= 64; C *= 2) for (int accum = 0; accum < 2; accum++) {   /* stride-2 backward-data (tensor cores), MX-fp4 gy / gx */
+    for (int C = 32; C <= 96; C += 32) for (int accum = 0; accum < 2; accum++) {   /* stride-2 backward-data, MX-fp4 gy / gx (tensor cores; 96: the dilated fp8 path via MX-fp8 copies) */
         shape5 xs = {1, C, 16, 16, 32}, ys = {1, C, 8, 8, 16};
         size_t nx = shape_numel(xs), ny = shape_numel(ys);
         float *w = dev_rand((size_t)C * C * 27, 0.1f), *gy = dev_rand_wide(ny, 1e-3f), *g0 = dev_rand(nx, 1e-3f);
@@ -156,6 +157,93 @@ int main(void) {
         }
         char nm[96]; snprintf(nm, sizeof nm, "s2 bwd_data %d -> %d MX-fp4%s", C, C, accum ? " (accumulate)" : "");
         report(nm, relerr(one, gxr, nx), relerr(acc, gxr, nx), K, 0.35);
+    }
+    for (int C = 32; C <= 64; C *= 2) {   /* upsample backward (tiled): fine MX-fp4 gy -> coarse MX-fp4 gx */
+        shape5 cs = {1, C, 6, 8, 10}, fs = {1, C, 12, 16, 20};
+        size_t nc = shape_numel(cs), nf = shape_numel(fs);
+        float *gy = dev_rand_wide(nf, 1e-3f); void *gym = mx4_from(gy, fs); float *gyd = deq4(gym, fs);
+        float *gxr = dev_zero(nc);
+        mode_ref(); nn_up2_bwd(gyd, cs, gxr);
+        void *gxm = mx4_new(cs); float *acc = dev_zero(nc), *one = dev_zero(nc), *tmp = dev_zero(nc);
+        mode_mx();
+        for (int k = 0; k < K; k++) {
+            nn_set_sr_step(5000 + k);
+            nn_up2_bwd(gym, cs, (float *)gxm);
+            deq4_into(gxm, cs, tmp);
+            if (!k) nn_d2d(one, tmp, nc * 4);
+            nn_axpy(acc, 1.f / K, tmp, nc);
+        }
+        char nm[96]; snprintf(nm, sizeof nm, "up2 bwd %d ch MX-fp4", C);
+        report(nm, relerr(one, gxr, nc), relerr(acc, gxr, nc), K, 0.35);
+    }
+    {   /* end to end: a small MX net's parameter gradients with MX-fp4 activation gradients vs MX-fp8 (fp4 storage noise is
+           unbiased, so the mean of K differently-rounded backwards approaches the fp8 gradients) */
+        nn_set_tf32(1); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1); nn_set_gn_stored(1);
+        nn_set_prec(3); if (nn_set_prec_policy("all=fp4:fp4:fp4,enc0.c1=fp16")) bad++;
+        setenv("UFSM_F4_WGRAD", "1", 1);
+        unet_set_act_mx4(1); unet_set_grad_mx8(1); unet_set_input_prec(8); unet_set_recompute(1); unet_set_chunk_up(2); unet_set_lean(2);
+        unet_cfg cfg = {3, {32, 64, 96}, 4, 1, 8, 1};
+        shape5 xs = {1, 4, 32, 32, 32}; size_t nx = shape_numel(xs), no = nx / 4;
+        float *x = dev_rand(nx, 1.f), *gyo = dev_rand(no, 1.f);
+        unet *u = unet_create(&cfg); unet_init(u, 23); size_t np = unet_nparams(u);
+        float *gr = malloc(np * 4), *g8 = malloc(np * 4), *g4 = malloc(np * 4), *dm = calloc(np, 4), *rm = calloc(np, 4), *d8 = calloc(np, 4);
+        {   /* the sliced decoder conv1 weight gradient == the whole up transient's (no SR: same operands, other summation order) */
+            nn_set_sr(0); unet_set_grad_mx4(0);
+            unet_set_up_wg_chunk(0); unet_forward(u, x, xs, 1); unet_zero_grad(u); unet_backward(u, gyo); unet_grad_d2h(u, gr);
+            unet_set_up_wg_chunk(1); unet_forward(u, x, xs, 1); unet_zero_grad(u); unet_backward(u, gyo); unet_grad_d2h(u, g8);
+            unet_set_up_wg_chunk(-1); nn_set_sr(1);
+            double d2 = 0, r2 = 0;
+            for (size_t i = 0; i < np; i++) { double d = (double)g8[i] - gr[i]; d2 += d * d; r2 += (double)gr[i] * gr[i]; }
+            const double rel = sqrt(d2 / r2);
+            printf("  %-46s rel diff %.3g%s\n", "unet param. grads, sliced up wgrad vs whole", rel, rel < 1e-4 ? "" : "  FAIL");
+            if (!(rel < 1e-4)) bad++;
+        }
+        /* per k one forward seed for all three runs: 16-bit gradients (reference), MX-fp8, MX-fp4. MX-fp8 stores round to nearest,
+           so its error is deterministic; MX-fp4 is SR throughout, so its mean over k must approach the reference */
+        double one = 0, one8 = 0;
+        for (int k = 0; k < K; k++) {
+            unet_set_grad_mx8(0); nn_set_sr_step(6000 + k); unet_forward(u, x, xs, 1); unet_zero_grad(u); unet_backward(u, gyo); unet_grad_d2h(u, gr);
+            unet_set_grad_mx8(1); unet_set_grad_mx4(0); nn_set_sr_step(6000 + k); unet_forward(u, x, xs, 1); unet_zero_grad(u); unet_backward(u, gyo); unet_grad_d2h(u, g8);
+            unet_set_grad_mx4(1); nn_set_sr_step(6000 + k); unet_forward(u, x, xs, 1); unet_zero_grad(u); unet_backward(u, gyo); unet_grad_d2h(u, g4);
+            double a2 = 0, b2 = 0, r2 = 0;
+            for (size_t i = 0; i < np; i++) {
+                dm[i] += (g4[i] - gr[i]) / K; d8[i] += (g8[i] - gr[i]) / K; rm[i] += gr[i] / K;
+                double d = (double)g4[i] - gr[i], e = (double)g8[i] - gr[i]; a2 += d * d; b2 += e * e; r2 += (double)gr[i] * gr[i];
+            }
+            if (!k) { one = sqrt(a2 / r2); one8 = sqrt(b2 / r2); }
+        }
+        double a2 = 0, b2 = 0, r2 = 0;
+        for (size_t i = 0; i < np; i++) { a2 += (double)dm[i] * dm[i]; b2 += (double)d8[i] * d8[i]; r2 += (double)rm[i] * rm[i]; }
+        const double avg = sqrt(a2 / r2), avg8 = sqrt(b2 / r2);
+        const int ok = isfinite(one) && avg < one * 2.0 / sqrt((double)K) + 0.01;
+        printf("  %-46s one %.3g, mean of %d %.3g\n", "unet param. grads, MX-fp8 act. grads vs 16-bit", one8, K, avg8);
+        printf("  %-46s one %.3g, mean of %d %.3g%s\n", "unet param. grads, MX-fp4 act. grads vs 16-bit", one, K, avg, ok ? "" : "  FAIL");
+        if (!ok) bad++;
+        if (!ok || getenv("GM4_DETAIL")) {   /* per tensor (unet_create's layout): where the residual comes from */
+            const char *nm[64]; size_t sz[64]; int nt = 0; char names[64][24];
+            const int *w = cfg.widths, L = cfg.nlev;
+#define T(fmt, a, n) do { snprintf(names[nt], 24, fmt, a); nm[nt] = names[nt]; sz[nt++] = (n); } while (0)
+            for (int i = 0; i < L; i++) { int ci = i ? w[i - 1] : cfg.cin, co = w[i];
+                T("enc%d.c1.w", i, (size_t)co * ci * 27); T("enc%d.c1.b", i, co); T("enc%d.n1", i, 2 * co);
+                T("enc%d.c2.w", i, (size_t)co * co * 27); T("enc%d.c2.b", i, co); T("enc%d.n2", i, 2 * co); }
+            for (int i = 0; i < L - 1; i++) { T("down%d.w", i, (size_t)w[i] * w[i] * 27); T("down%d.b", i, w[i]); }
+            for (int i = L - 2; i >= 0; i--) { int ci = w[i] + w[i + 1], co = w[i];
+                T("dec%d.c1.w", i, (size_t)co * ci * 27); T("dec%d.c1.b", i, co); T("dec%d.n1", i, 2 * co);
+                T("dec%d.c2.w", i, (size_t)co * co * 27); T("dec%d.c2.b", i, co); T("dec%d.n2", i, 2 * co); }
+            T("head.w%s", "", (size_t)cfg.cout * w[0]); T("head.b%s", "", cfg.cout);
+            for (int i = 0; i < L - 1; i++) T("dn%d", i, 2 * w[i]);
+#undef T
+            size_t o = 0;
+            for (int t = 0; t < nt; t++) {
+                double a2 = 0, b2 = 0, c2 = 0;
+                for (size_t i = o; i < o + sz[t]; i++) { double d = (double)g4[i] - gr[i]; a2 += d * d; b2 += (double)dm[i] * dm[i]; c2 += (double)rm[i] * rm[i]; }
+                double e2 = 0; for (size_t i = o; i < o + sz[t]; i++) e2 += (double)d8[i] * d8[i];
+                printf("    %-12s %7zu  fp4 last %.3g mean %.3g   fp8 mean %.3g\n", nm[t], sz[t], sqrt(a2 / c2), sqrt(b2 / c2), sqrt(e2 / c2));
+                o += sz[t];
+            }
+            if (o != np) printf("    layout mismatch: %zu of %zu\n", o, np);
+        }
+        unet_set_grad_mx4(0); unet_free(u); free(gr); free(g8); free(g4); free(dm); free(rm); free(d8);
     }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     printf("gradient MX-fp4: %s\n", bad ? "FAIL" : "ok");

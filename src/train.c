@@ -36,6 +36,7 @@ typedef struct {
     void *ev_up[2], *ev_done[2]; /* upload into buffer i finished; the compute that last used buffer i finished */
     batch *pending;              /* host batch whose upload into buffer (cur ^ 1) is in flight */
     int lean;                    /* one batch buffer; logit gradient in the model's gradient buffer B */
+    int gl_inside;               /* lean: the logit gradient lives in the model's gradient buffers (setup checked the batch overlap) */
     int cur;
     int side;                    /* --split z: 0 = low z half, 1 = high z half of every window; -1 = whole windows */
     const sheet_batch *sheet;
@@ -168,7 +169,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     d->lg = lg;
     if (d->lean && train) {   /* the logit gradient lives in the model's gradient buffer B (built by the forward above) */
         const size_t gb = (size_t)B * g_cout * xs.d * P * P * (g_g16 ? 2 : 4);
-        void *pg = unet_logit_grad_scratch(d->u, gb);
+        void *pg = d->gl_inside ? unet_logit_grad_scratch(d->u, gb) : nullptr;
         if (pg) d->gl = pg;   /* (re)built model: its scratch moved; otherwise the separate buffer allocated at setup */
     }
     shape5 os = unet_out_shape(d->u, xs);
@@ -548,19 +549,25 @@ int cmd_train(int argc, char **argv) {
         const int xin_b = lean && unet_input_converted() && g_xfmt;
         size_t goff = 0;
         int xin_in = 0;
-        d->gl = nullptr;
+        d->gl = nullptr; d->gl_inside = 0;
         if (lean) {
             unet_build(d->u, (shape5){B, cfg.cin, split ? g_Dl : P, P, P}, 1);
             goff = unet_lean_nob(d->u) ? 0 : glb;
-            if (xin_b && (bs = unet_grad_scratch(d->u, goff + tbb + mbb + xbb))) xin_in = 1;
+            if (unet_lean_nob(d->u)) {   /* lean 2: [input | targets | mask] (the input may lie over the logits, see unet_batch_scratch) */
+                if (xin_b && (bs = unet_batch_scratch(d->u, xbb, tbb + mbb))) xin_in = 1;
+                else bs = unet_batch_scratch(d->u, 0, tbb + mbb);
+            } else if (xin_b && (bs = unet_grad_scratch(d->u, goff + tbb + mbb + xbb))) xin_in = 1;
             else bs = unet_grad_scratch(d->u, goff + tbb + mbb);
             d->gl = unet_logit_grad_scratch(d->u, glb);
+            if (d->gl && bs && (char *)d->gl < bs + goff + tbb + mbb + (xin_in ? xbb : 0) && (char *)d->gl + glb > bs) d->gl = nullptr;   /* never over the batch */
+            d->gl_inside = d->gl != nullptr;
         }
         for (int i = 0; i < 2; i++) {
             if (i && lean) { d->xb[1] = d->xb[0]; d->tb[1] = d->tb[0]; d->mb[1] = d->mb[0]; d->wb[1] = d->wb[0]; }
             else if (bs) {
-                d->tb[i] = (uint8_t *)(bs + goff); d->mb[i] = (uint8_t *)(bs + goff + tbb);
-                d->xb[i] = xin_in ? (void *)(bs + goff + tbb + mbb) : nn_malloc((size_t)B * 4 * p3 * xbytes());
+                const size_t toff = goff + (unet_lean_nob(d->u) && xin_in ? xbb : 0), xoff = unet_lean_nob(d->u) ? 0 : goff + tbb + mbb;
+                d->tb[i] = (uint8_t *)(bs + toff); d->mb[i] = (uint8_t *)(bs + toff + tbb);
+                d->xb[i] = xin_in ? (void *)(bs + xoff) : nn_malloc((size_t)B * 4 * p3 * xbytes());
                 d->wb[i] = nn_malloc((size_t)B * NCH);
             }
             else { d->xb[i] = nn_malloc((size_t)B * 4 * p3 * xbytes()); d->tb[i] = nn_malloc((size_t)B * NCH * p3); d->mb[i] = nn_malloc((size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * NCH); }

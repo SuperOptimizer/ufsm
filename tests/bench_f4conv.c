@@ -326,7 +326,7 @@ int main(int argc, char **argv) {
         const gnp_t gp = {ug, ub, mean, rstd, G};
         double b0 = 1e9, b1 = 1e9;
         for (int it = 0; it < 10; it++) {
-            nn_sync(); double t0 = now(); lp_up2_fwd_mx(xc, 4, cs, yf, 4, gp); nn_sync(); double t1 = now(); lp_up2_bwd_mx(gf, cs, gc); nn_sync(); double t2 = now();
+            nn_sync(); double t0 = now(); lp_up2_fwd_mx(xc, 4, cs, yf, 4, gp); nn_sync(); double t1 = now(); lp_up2_bwd_mx(gf, cs, gc, 3, 3, 0u); nn_sync(); double t2 = now();
             if (it >= 2) { if ((t1 - t0) * 1e3 < b0) b0 = (t1 - t0) * 1e3; if ((t2 - t1) * 1e3 < b1) b1 = (t2 - t1) * 1e3; }
         }
         printf("%-32s @%d %8.3f ms  out %016llx\n", "up2 fwd 32 ch (gn+silu, mx4)", P, b0, (unsigned long long)fnv(yf, lp_mx4_bytes(1, C, S)));
