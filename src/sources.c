@@ -98,6 +98,8 @@ sources *sources_load(const char *path) {
         s->weight = json_num(json_get(e, "weight"), 1.0);
         s->trust_band = (int)json_num(json_get(e, "trust_band"), 0);
         s->min_level = (int)json_num(json_get(e, "min_level"), 0);
+        s->max_level = (int)json_num(json_get(e, "max_level"), -1);
+        s->geometry = (int)json_num(json_get(e, "geometry"), 1);
         for (int l = 0; l < MAXLEV; l++) s->ct_present[l] = -1; /* unknown until probed */
         const json *tg = json_get(e, "targets");
         for (int c = 0; c < NCH; c++) {
@@ -106,6 +108,7 @@ sources *sources_load(const char *path) {
             if (!t) continue;
             if (t->type == J_STR) { s->tgt_key[c] = strdup(t->str); continue; }
             s->tgt_binary[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "binary");
+            s->tgt_prob[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "prob");
             double target_min = json_num(json_get(t, "min_level"), 0);
             if (!isfinite(target_min) || target_min < 0 || target_min >= MAXLEV || target_min != (int)target_min ||
                 (target_min && !s->tgt_binary[c])) {
@@ -324,7 +327,12 @@ int z3_read_label_grid(z3 *z, int binary, int shift, const int64_t o[3], const i
 int source_read_target(source *s, int ch, int level, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     int actual = level; z3 *z = source_tgt_for_level(s, ch, level, &actual);
     if (!z) return -1;
-    return z3_read_label_grid(z, s->tgt_binary[ch] || (z && z3_meta_of(z)->label_binary), actual - level, o, n, out, nthreads);
+    int rc = z3_read_label_grid(z, s->tgt_binary[ch] || (z && z3_meta_of(z)->label_binary), actual - level, o, n, out, nthreads);
+    if (!rc && s->tgt_prob[ch]) {   /* p * 255 -> p * 254: 255 is the ignore code downstream */
+        size_t nv = (size_t)n[0] * n[1] * n[2];
+        for (size_t k = 0; k < nv; k++) out[k] = (uint8_t)((out[k] * 254 + 127) / 255);
+    }
+    return rc;
 }
 
 int source_region_shared(const source *s, int ch) { return s->reg[ch] && s->reg[ch]->array != nullptr; }

@@ -16,7 +16,8 @@
     ]}
 
    A pyramid target has levels named by voxel size in um; level l of the CT (2^l x um) is matched to the
-   target level with that voxel size. A regions target is a set of single-level arrays at CT level 0,
+   target level with that voxel size. Optional per source: "min_level" / "max_level" (levels drawn), "geometry": 0 (no spatial
+   augmentation), and per target "encoding": "binary" | "prob". A regions target is a set of single-level arrays at CT level 0,
    each covering [origin, origin + size). Channels: 0 = recto, 1 = sheet (m7 whole-sheet band). */
 #pragma once
 #include "store.h"
@@ -47,6 +48,8 @@ typedef struct {
     double um;              /* level-0 voxel size */
     double weight;
     int min_level;    /* training never draws levels below this (e.g. 1 for a 1.1 um scan whose level 0 is finer than the others) */
+    int max_level;    /* ... nor above this (-1: no limit); e.g. a teacher target whose coarser levels are only downsampled copies */
+    int geometry;     /* 0: never spatially augmented (zoom / rotation / elastic) */
     int trust_band;   /* > 0: background labels are trusted only within this many level-0 voxels of an annotated surface (partial annotations) */
     z3 *ct[MAXLEV];         /* lazily opened per level */
     int ct_present[MAXLEV]; /* 1 if the level exists in the pyramid */
@@ -59,6 +62,8 @@ typedef struct {
     int tgt_present[NCH][MAXLEV];
     int tgt_binary[NCH];      /* target bytes are 0/background, 255/surface; no ignore class */
     int tgt_min_level[NCH];   /* finest stored CT rung; binary targets can upsample finer requests */
+    int tgt_prob[NCH];        /* "encoding": "prob": bytes are round(p * 255) (teacher probabilities, no ignore class); read as
+                                 round(p * 254) and passed through without erode / dilate / soft / trust band */
     regions *reg[NCH];
     z3 **reg_z[NCH];        /* lazily opened region arrays */
     z3 *reg_shared[NCH];    /* the shared array when reg[ch]->array is set */

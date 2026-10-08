@@ -131,13 +131,14 @@ static batch alloc_batch(const sample_cfg *c) {
     b.w = nn_host_alloc((size_t)c->B * NCH);
     b.src = malloc((size_t)c->B * sizeof(int16_t));
     b.level = malloc((size_t)c->B * sizeof(int8_t));
+    b.um = malloc((size_t)c->B * sizeof(float));
     b.corner = malloc((size_t)c->B * sizeof *b.corner);
     b.sheet = calloc((size_t)c->B, sizeof *b.sheet);
     b.band = c->band ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b) { if (b->band) nn_host_free(b->band); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->band) nn_host_free(b->band); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -225,7 +226,7 @@ static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
         p[l] = sp->cfg.level_p[l];
         if (p[l] <= 0) continue;
         if (region_ch >= 0 && l > 1) { p[l] = 0; continue; }
-        if (l < s->min_level) { p[l] = 0; continue; }
+        if (l < s->min_level || (s->max_level >= 0 && l > s->max_level)) { p[l] = 0; continue; }
         if (!level_ok(sp, s, si, l, region_ch)) { p[l] = 0; continue; }
         tot += p[l];
     }
@@ -238,8 +239,8 @@ static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
 /* Fill patch i of batch b. Returns 0 on success, 1 if rejected (try again), -1 on I/O error. */
 static double tnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 #define PROF_MARK(stage) do { if (sp->prof) { double t_ = tnow(); atomic_fetch_add(&sp->prof_ns[stage], (uint_fast64_t)((t_ - pt) * 1e9)); pt = t_; } } while (0)
-enum { PS_SRC, PS_LEVEL, PS_PICK, PS_PROBE, PS_READ, PS_STATS, PS_TARGETS, PS_DILATE, PS_SOFT, PS_TRUST, PS_ENCODE, PS_ZSCORE, PS_AUGMENT, PS_X16, PS_N };
-static const char *prof_names[PS_N] = {"src", "level", "pick", "probe", "ctread", "ctstats", "targets", "dilate", "soft", "trust", "encode", "zscore", "augment", "x16"};
+enum { PS_SRC, PS_LEVEL, PS_PICK, PS_PROBE, PS_READ, PS_STATS, PS_TARGETS, PS_DILATE, PS_SOFT, PS_TRUST, PS_ENCODE, PS_ZSCORE, PS_AUGMENT, PS_X16, PS_SCAN, PS_N };
+static const char *prof_names[PS_N] = {"src", "level", "pick", "probe", "ctread", "ctstats", "targets", "dilate", "soft", "trust", "encode", "zscore", "augment", "x16", "scan"};
 /* 3-4-5 chamfer distance (3 per voxel step) from the voxels of t that are annotated surface (0 < t < 255): two raster
    passes. Returns 0 (dm all CH_INF) when the patch has no surface. */
 #define CH_INF 60000
@@ -403,6 +404,7 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                 float radius=sqrtf(dy*dy+dx*dx)+1e-6f;
                 float radial[3]={0,hasax?dy/radius:0,hasax?dx/radius:0},discrete[3],transported[3];
                 for (int d=0;d<3;d++) discrete[d]=sign[d]*radial[sy.perm[d]];
+                if (a->affine) { float q[3]; for (int d=0;d<3;d++) q[d]=(float)a->Ainv[d][0]*discrete[0]+(float)a->Ainv[d][1]*discrete[1]+(float)a->Ainv[d][2]*discrete[2]; memcpy(discrete,q,sizeof q); }
                 float norm=1e-12f;
                 for (int d=0;d<3;d++) { transported[d]=jac[d]*((float)a->R[d][0]*discrete[0]+(float)a->R[d][1]*discrete[1]+(float)a->R[d][2]*discrete[2]); norm+=transported[d]*transported[d]; }
                 norm=sqrtf(norm); for (int d=0;d<3;d++) out[1+d]=transported[d]/norm;
@@ -573,7 +575,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         } else if (s->tgt_key[ch]) {
             z3 *tz = source_tgt_for_level(s, ch, l, nullptr);
             if (!tz) { if (c->cover) return -1; memset(dst, 0, p3); continue; }
-            if (c->erode) {
+            if (c->erode && !s->tgt_prob[ch] && l == 0) {
                 int64_t eo[3] = {o[0]-1, o[1]-1, o[2]-1}, en[3] = {P+2, P+2, P+2};
                 uint8_t *haloed = big + p3;   /* existing (2P)^3 scratch, P >= 2 */
                 if (source_read_target(s, ch, l, eo, en, haloed, 1)) return -1;
@@ -590,7 +592,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         int D = c->dilate >> l; if (D < 1) D = 1;
         uint8_t *tmp2 = big + 2 * p3;
         for (int ch = 0; ch < NCH; ch++) {
-            if (!w[ch]) continue;
+            if (!w[ch] || s->tgt_prob[ch]) continue;
             uint8_t *dst = ttmp + (size_t)ch * p3;
             for (int pass = 0; pass < 3; pass++) {
                 size_t str = pass == 0 ? 1 : pass == 1 ? (size_t)P : (size_t)P * P;
@@ -613,14 +615,14 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     int dm_ch = -1, dm_any = 0;                   /* channel the map currently holds, and whether that channel had any surface */
 #define CHAMFER_FOR(ch_) do { if (dm_ch != (ch_)) { dm_ch = (ch_); dm_any = chamfer345(ttmp + (size_t)(ch_) * p3, dm, P); } } while (0)
     if (soft0 > 0 && region_ch < 0) {
-        float sigma = soft0 / (float)(1 << l); if (sigma < 0.75f) sigma = 0.75f;
+        float sigma = (c->soft_um ? soft0 / (float)s->um : soft0) / (float)(1 << l); if (sigma < 0.75f) sigma = 0.75f;
         float shift=morph/(float)(1<<l);
         /* exp(-(d/3)^2 / (2 sigma^2)) tabulated over the chamfer distance (3 per voxel); beyond dcut it rounds to 0 */
         int dcut = (int)(3.f * (sigma * 4.5f+fmaxf(0,shift))) + 1; if (dcut > 4000) dcut = 4000;
         uint8_t *etab = big + 4 * p3;
         for (int d = 0; d <= dcut; d++) { float df = fmaxf(0,d / 3.f-shift); int t = (int)(254.f * expf(-0.5f * df * df / (sigma * sigma)) + 0.5f); etab[d] = (uint8_t)(t > 254 ? 254 : t); }
         for (int ch = 0; ch < NCH; ch++) {
-            if (!w[ch]) continue;
+            if (!w[ch] || s->tgt_prob[ch]) continue;
             uint8_t *dst = ttmp + (size_t)ch * p3;
             CHAMFER_FOR(ch);
             if (!dm_any) continue;   /* no surface in the patch: nothing to soften */
@@ -632,7 +634,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     if (s->trust_band > 0) {
         int R = s->trust_band >> l; if (R < 1) R = 1;
         for (int ch = 0; ch < NCH; ch++) {
-            if (!w[ch]) continue;
+            if (!w[ch] || s->tgt_prob[ch]) continue;
             uint8_t *dst = ttmp + (size_t)ch * p3;
             CHAMFER_FOR(ch);   /* measured from the hard surface (the soft values added above are not surface) */
             if (!dm_any) { for (size_t k = 0; k < p3; k++) if (dst[k] == 0) dst[k] = 255; continue; }   /* nothing annotated: ignore all background */
@@ -656,6 +658,15 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     double scale = (double)(1 << l);
     float *cyz = xtmp, *cxz = xtmp + P, *nrow = xtmp + 2 * P;
     for (int z = 0; z < P; z++) { double cy, cx; axis_at(&s->ax, (double)(o[0] + z) * scale, &cy, &cx); cyz[z] = (float)(cy / scale); cxz[z] = (float)(cx / scale); }
+    if (c->augment && scan_aug_enabled(&c->scan)) {   /* scanner domains on the source grid; the per-patch z-score follows them, as at inference */
+        PROF_MARK(PS_ZSCORE);
+        if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band, big + p3)) {
+            sum = sq = 0;
+            for (size_t k = 0; k < p3; k++) { sum += ctu[k]; sq += (double)ctu[k] * ctu[k]; }
+            mean = sum / (double)p3; var = sq / (double)p3 - mean * mean; sd = sqrt(var > 0 ? var : 0) + 1e-3;
+        }
+        PROF_MARK(PS_SCAN);
+    }
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
     for (size_t k = 0; k < p3; k++) mask[k] = ctu[k] != 0 && !mask[k];
     PROF_MARK(PS_ZSCORE);
@@ -691,18 +702,28 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         if (ap.noise_rho > 0) isg = ap.noise_sigma;
     }
     spatial_aug spatial={0};
-    if (c->augment && c->geometry_augment) spatial_aug_make(&spatial,rnext(r),P,c->rotate_degrees,c->rotate_p,c->elastic,c->elastic_p);
+    /* band-labelled native samples keep the exact voxel grid (the band field is not interpolated) */
+    const int band_sample = c->band && s->band && l == 0;
+    if (c->augment && c->geometry_augment && s->geometry && !band_sample) {
+        spatial_aug_make(&spatial,rnext(r),P,c->rotate_degrees,c->rotate_p,c->elastic,c->elastic_p);
+        if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(r) < c->zoom_p) spatial_aug_zoom(&spatial, exp(runif(r) * log(c->zoom_min)));
+        if (c->affine_p > 0 && c->scan.strength > 0 && runif(r) < c->affine_p)
+            spatial_aug_affine(&spatial, rnext(r), c->affine_aniso * c->scan.strength, c->affine_shear * c->scan.strength);
+    }
+    b->um[i] = (float)(s->um * (double)(1 << l) * (spatial.active ? spatial.scale * cbrt(spatial.det) : 1.0));   /* affine: the volume-preserving voxel size */
     if (!spatial.active) {
         for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y);
         sym_u8(mask, M, P, y);
     }
     if (c->band) {   /* band labels: computed on the source grid, unknown on CT air, then the same symmetry as CT and targets */
-        if (!s->band || l != 0 || spatial.active) return -1;
-        uint8_t *bw = malloc(p3);
-        if (!bw || band_window(s, o, P, bw)) { free(bw); return -1; }
-        for (size_t k = 0; k < p3; k++) if (!ctu[k]) bw[k] = BAND_UNKNOWN;
-        sym_u8(bw, b->band + (size_t)i * p3, P, y);
-        free(bw);
+        if (!band_sample || spatial.active) memset(b->band + (size_t)i * p3, BAND_UNKNOWN, p3);   /* no band labels: affinities unsupervised */
+        else {
+            uint8_t *bw = malloc(p3);
+            if (!bw || band_window(s, o, P, bw)) { free(bw); return -1; }
+            for (size_t k = 0; k < p3; k++) if (!ctu[k]) bw[k] = BAND_UNKNOWN;
+            sym_u8(bw, b->band + (size_t)i * p3, P, y);
+            free(bw);
+        }
     }
     PROF_MARK(PS_AUGMENT);
     float *X = c->xfmt ? nullptr : b->x + (size_t)i * 4 * p3;
@@ -906,11 +927,9 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         fprintf(stderr, "sampler: erode must be 0 or 1, with P >= 2, no dilation and no winding task\n"); return nullptr;
     }
     if (cfg->erode) {
-        for (int l = 1; l < MAXLEV; l++) if (!cfg->cover && cfg->level_p[l] > 0) {
-            fprintf(stderr, "sampler: erosion requires native level 0 (--levels 1,0,0,0)\n"); return nullptr;
-        }
+        /* erosion applies to binary targets at native level 0 only (coarser levels and "prob" targets are read as stored) */
         for (int i = 0; i < S->n; i++) for (int ch = 0; ch < NCH; ch++) {
-            if (S->src[i].reg[ch] || (S->src[i].tgt_key[ch] && !S->src[i].tgt_binary[ch])) {
+            if (S->src[i].reg[ch] || (S->src[i].tgt_key[ch] && !S->src[i].tgt_binary[ch] && !S->src[i].tgt_prob[ch])) {
                 fprintf(stderr, "sampler: erosion requires binary pyramid targets\n"); return nullptr;
             }
         }

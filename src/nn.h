@@ -274,6 +274,13 @@ void nn_ema(float *ema, const float *p, size_t n, float decay);
 double nn_sum(const float *x, size_t n, float *scratch);     /* scratch: >= 4096 floats */
 double nn_sumsq(const float *x, size_t n, float *scratch);
 void nn_sigmoid(const float *x, size_t n, float *y);
+void nn_flip_sign(void *x, size_t n, int h16);   /* x[i] = -x[i] for n fp32 (h16 0) or 16-bit (h16 1) values: a sign-bit flip, exact */
+void nn_prob_u8(const float *logits, size_t n, uint8_t *out, float hard);   /* out[i] = round(255 sigmoid(logits[i])); hard > 0: 255 where sigmoid >= hard, else 0 */
+/* thin ridge of a uint8 probability volume along the per-voxel direction in channels 1..3 of the network input x ([4][d][h][w],
+   fp32 / fp16 / bf16 by xfmt 0 / 1 / 2): out = 255 where some voxel within 1 step along the direction is a ridge (p >= thr and
+   p >= p at +-1 and +-2 steps along the direction, nearest-voxel sampling), else 0 */
+void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out);
+void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n);   /* where m == 0 and vm != 0: t = src, m = 1 */
 /* inference: network input from the uint8 CT window on the device (z-score + radial channels; 16-bit storage when h16),
    and recto probability * 255 (0 where the CT is 0) from the logits */
 void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16);
