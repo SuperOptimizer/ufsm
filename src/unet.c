@@ -108,6 +108,12 @@ struct unet {
     int nob;                                 /* lean 2: no buffer B; a block's own gout / gskip is its B (in-place GroupNorm backward) */
     int last_a1_live;                        /* final decoder a1 survives the head until the first backward */
     int sea_stale;                           /* shared encoder a1: a backward left the encoders' a1 in the decoders' buffers */
+    void *h_a1[UNET_MAXLEV];                 /* shared encoder a1 offload: pinned host copies of the encoders' a1 */
+    void *ev_a1[UNET_MAXLEV][4];             /* (start, done) of the copy out after the encoder's forward, of the copy back */
+    int a1_out[UNET_MAXLEV];                 /* a copy out is pending (the decoder's conv1 must wait for it) / has a host copy */
+    int xin_shared, xin_out, a2_stale, fwd_train;       /* training: the network input lives in dec[0].a2's buffer (host copy in between); the
+                                                buffer holds the input since a backward (a repeated backward re-runs dec[0].c2) */
+    size_t xin_bytes; void *h_xin, *ev_xin[4];
     size_t logits_bytes;                     /* lean: logits at the start of A, the 16-bit logit gradient after them */
     int logits_h16;                          /* lean 2: fp16 logits, so the 16-bit logit gradient fits after them in A */
     float *rc_extra; size_t rc_extra_bytes;  /* training transient for the upsampled decoder input when B is too small */
@@ -326,8 +332,21 @@ void unet_set_recompute(int on) { g_recompute = on; }
 static int g_share_enc_a1 = -1;
 static int share_enc_a1(void) { if (g_share_enc_a1 < 0) g_share_enc_a1 = ufsm_env_on("UFSM_RC_ENC_A1"); return g_share_enc_a1 && recompute() == 1 && nn_get_tf32(); }
 void unet_set_share_enc_a1(int on) { g_share_enc_a1 = on; }
+/* shared encoder a1 without the re-run: each encoder's a1 is copied to pinned host memory once its block's forward is done
+   and copied back after the same-level decoder's backward (the backward of the coarser levels hides both copies; desk
+   slab ~1.7 GB each way per step at ~28 GB/s). Default on; env UFSM_A1_OFFLOAD=0 re-runs the encoder conv1 instead */
+static int g_a1_offload = -1;
+static int a1_offload(void) { if (g_a1_offload < 0) g_a1_offload = getenv("UFSM_A1_OFFLOAD") ? ufsm_env_on("UFSM_A1_OFFLOAD") : 1; return g_a1_offload && share_enc_a1(); }
+void unet_set_a1_offload(int on) { g_a1_offload = on; }
+int unet_a1_offload(void) { return a1_offload(); }
+/* training: the MX network input (read by the stem conv's forward and weight gradient only) shares dec[0].a2's buffer, which is
+   free before the decoder's forward and after its backward; pinned host copy in between (desk slab 0.68 GB each way).
+   -9 B per level-0 voxel at fp8 input. Default on; env UFSM_XIN_OFFLOAD=0 keeps a separate buffer */
+static int g_xin_offload = -1;
+static int xin_offload(void) { if (g_xin_offload < 0) g_xin_offload = getenv("UFSM_XIN_OFFLOAD") ? ufsm_env_on("UFSM_XIN_OFFLOAD") : 1; return g_xin_offload; }
+void unet_set_xin_offload(int on) { g_xin_offload = on; }
 int unet_share_enc_a1(void) { return share_enc_a1(); }
-#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8) + 16384 * unet_wide_up_grad() + 32768 * keep_coarse_a1() + 65536 * share_enc_a1() + 131072 * grad_mx4() + 262144 * up_wg_chunk())
+#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8) + 16384 * unet_wide_up_grad() + 32768 * keep_coarse_a1() + 65536 * share_enc_a1() + 131072 * grad_mx4() + 262144 * up_wg_chunk() + 524288 * a1_offload() + 1048576 * xin_offload())
 /* chunk mode (recompute, 16-bit activations and gradients, fused upsample): the decoder's up-part input gradient is
    produced in w[i]-channel chunks, each upsample-backwarded straight into its slice of gout[i + 1], so the shared
    gradient buffer B only needs w[i] channels (env UFSM_CHUNK_UP=0 turns it off) */
@@ -378,6 +397,12 @@ static void free_acts(unet *u) {
     u->rc_extra = nullptr; u->rc_extra_bytes = 0; u->gB_bytes = 0; pp[np++] = u->xin; pp[np++] = u->glb;
     free_once(pp, np);
     u->logits = nullptr; u->conv_scratch = nullptr; u->xin = nullptr; u->glb = nullptr; u->conv_scratch_n = 0;
+    for (int i = 0; i < UNET_MAXLEV; i++) {
+        if (u->h_a1[i]) { if (u->a1_out[i]) nn_sync(); nn_host_free(u->h_a1[i]); }   /* (a copy may still be in flight) */
+        u->h_a1[i] = nullptr; u->a1_out[i] = 0;
+    }
+    if (u->h_xin) { if (u->xin_out) nn_sync(); nn_host_free(u->h_xin); }
+    u->h_xin = nullptr; u->xin_shared = u->xin_out = u->a2_stale = 0; u->xin_bytes = 0;
     u->built = 0; u->act_bytes = 0; u->grad_bytes = 0;
     u->last_a1_live = 0;
 }
@@ -437,7 +462,15 @@ static void build_acts(unet *u, shape5 xs, int train) {
         if (sea && i < L - 1) { shape5 y = u->ls[i]; y.c = w[i]; ea1 = dalloc_act_s(u, y); }   /* shared with dec[i].a1 (below) */
         build_block_acts(u, &u->enc[i], bin, train, i == L - 1, ea1,
                          rc ? nullptr : T2, nullptr);   /* recompute mode keeps the (small) outputs that get upsampled */
-        if (sea && i < L - 1) u->enc[i].a1_shared = 1;
+        if (sea && i < L - 1) {
+            u->enc[i].a1_shared = 1;
+            if (a1_offload() && !g_dry) {
+                shape5 y = u->ls[i]; y.c = w[i];
+                u->h_a1[i] = nn_host_alloc_try(act_bytes_of(y));   /* nullptr: this level re-runs conv1 */
+                if (!u->h_a1[i]) fprintf(stderr, "unet: cannot pin %.2f GB for the encoder a1 offload; level %d re-runs conv1\n", act_bytes_of(y) / 1e9, i);
+                for (int k = 0; k < 4; k++) if (!u->ev_a1[i][k]) u->ev_a1[i][k] = nn_event_create();
+            }
+        }
         if (i < L - 1) {
             shape5 ds = u->ls[i + 1]; ds.c = w[i];
             u->downo[i] = share ? T2 : dalloc_act_s(u, ds);
@@ -560,7 +593,18 @@ static void build_acts(unet *u, shape5 xs, int train) {
     g_mlab = "logits (fp32) / network input";
     if (!train && u->head_nc) os.c = u->head_nc;   /* inference: the requested logit channels only */
     if (!u->logits) u->logits = dalloc(u, shape_numel(os));
-    u->xin = ABF && input_mx() ? dalloc_input(u, xs) : nullptr;   /* include mandatory input storage in the dry planner */
+    u->xin = nullptr;
+    if (ABF && input_mx()) {   /* include mandatory input storage in the dry planner */
+        const int idt = unet_input_prec(); const size_t xb_ = nn_mx_bytes(xs, idt);
+        if (train && nn_get_tf32() && act_mx8() && xin_offload() && L > 1 && act_bytes_of(u->dec[0].ys) >= xb_) {
+            void *h = g_dry ? nullptr : nn_host_alloc_try(xb_);
+            if (g_dry || h) {
+                u->xin = u->dec[0].a2; u->xin_shared = 1; u->h_xin = h; u->xin_bytes = xb_;
+                if (!g_dry) for (int k = 0; k < 4; k++) if (!u->ev_xin[k]) u->ev_xin[k] = nn_event_create();
+            } else fprintf(stderr, "unet: cannot pin %.2f GB for the input offload; a separate input buffer\n", xb_ / 1e9);
+        }
+        if (!u->xin) u->xin = dalloc_input(u, xs);
+    }
     u->glb = nullptr;   /* allocated on first use for a fp32 logit gradient */
     u->xs = xs; u->built = 1; u->train = train; u->mode = UMODE();
 }
@@ -795,6 +839,9 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
         else { nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1)); }   /* down_norm: gn + silu of the input in staging */
         FQ(b->a1, b->ys); FQ_AFF(b->a1, b->ys, b->pm1, b->pr1, G);
         sp_halo(u, b->a1, b->ys, 0);
+        if (b == &u->enc[0] && u->xin_shared && u->fwd_train && u->h_xin) {   /* the stem has read the input: to the host during conv2 and the coarser levels */
+            nn_offload_copy(u->h_xin, u->xin, u->xin_bytes, 1, u->ev_xin[0], u->ev_xin[1]); u->xin_out = 1;
+        }
         nn_set_conv(1);
         PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, b->m2, b->r2));
         nn_set_conv(-1);
@@ -826,10 +873,16 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     /* Without MX gradients the four-channel input can stay 16-bit; the tap-packed FP8 kernel writes MX a1.
        MX gradients require a packed input for the available weight-gradient kernels (eight-wide MX rows). */
     const int xin_mx = input_mx();   /* MX-fp8 gradients require an MX x for the available weight-gradient kernels */
+    if (u->xin_shared) { nn_set_storage(u->xin, u->xin_bytes, unet_input_prec()); u->a2_stale = 1; }   /* dec[0].a2's buffer holds the input until the decoder */
+    u->fwd_train = train;
     if (ABF && !x_h16) { if (!u->xin) u->xin = dalloc_input(u, xs); nn_f32_to_act(x, xs, u->xin); cur = u->xin; }
     else if (x_h16 && act_mx8() && xin_mx) { if (!u->xin) u->xin = dalloc_input(u, xs); nn_h16_to_mx(x, xs, u->xin); cur = u->xin; }
     for (int i = 0; i < L; i++) {
         nn_set_layer(i); block_fwd(u, &u->enc[i], i, cur);
+        if (u->h_a1[i] && u->enc[i].a1_shared && train) {   /* a1 is dead until the encoder's backward: to the host while the coarser levels run */
+            nn_offload_copy(u->h_a1[i], u->enc[i].a1, act_bytes_of(u->enc[i].ys), 1, u->ev_a1[i][0], u->ev_a1[i][1]);
+            u->a1_out[i] = 1;
+        }
         cur = u->enc[i].s2;
         if (i < L - 1) {
             nn_set_layer(L + i);
@@ -866,6 +919,11 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
                 nn_d2d(u->cat[i] + ((size_t)n * (w[i + 1] + w[i]) + w[i + 1]) * S, u->enc[i].s2 + (size_t)n * w[i] * S, (size_t)w[i] * S * 4);
             u->dec[i].in2 = nullptr;
         }
+        if (u->a1_out[i]) nn_stream_wait(0, u->ev_a1[i][1]);   /* the decoder's conv1 overwrites the shared buffer */
+        if (i == 0 && u->xin_shared) {   /* its conv2 writes a2 over the input */
+            if (u->xin_out) nn_stream_wait(0, u->ev_xin[1]);
+            nn_set_storage(u->dec[0].a2, act_bytes_of(u->dec[0].ys), act_dt()); u->a2_stale = 0;
+        }
         nn_set_layer(3 * L - 3 - i); block_fwd(u, &u->dec[i], i, u->cat[i]);
         cur = u->dec[i].s2;
     }
@@ -897,7 +955,9 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     float *g = u->g;
     const int live = u->last_a1_live && b == &u->dec[0];
     u->last_a1_live = 0;   /* repeated backward without a new forward must rebuild the shared buffer */
-    if ((recompute_a1() && !b->keep_a1 && !live) || b->a1_shared || (b->a1_lent && u->sea_stale)) {   /* a1 was overwritten by later blocks: re-run conv1 (same kernel and precision as the forward) */
+    const int lvl_off = b->a1_shared && level < UNET_MAXLEV && u->a1_out[level];
+    if (lvl_off) nn_stream_wait(0, u->ev_a1[level][3]);   /* offloaded encoder a1: back from the host */
+    else if ((recompute_a1() && !b->keep_a1 && !live) || b->a1_shared || (b->a1_lent && u->sea_stale)) {   /* a1 was overwritten by later blocks: re-run conv1 (same kernel and precision as the forward) */
         nn_set_conv(0);
         int r;
         if (b->xb) r = dec_conv1(u, b, level, b->a1, G, nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -1017,6 +1077,20 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     if (GBF && !g_h16) { shape5 os = u->ls[0]; os.c = u->cfg.cout; if (!u->glb) u->glb = dalloc_grad(u, shape_numel(os)); nn_f32_to_h16(glogits, shape_numel(os), u->glb, gscale); glogits = u->glb; }
     const int *w = u->cfg.widths;
     float *g = u->g;
+    if (u->xin_shared && u->a2_stale) {   /* repeated backward: dec[0].a2's buffer holds the input -> re-run dec[0]'s conv2 (and conv1 if
+                                             the shared encoder a1 overwrote it), the forward's kernels and precision */
+        block *b = &u->dec[0];
+        const int G = G_of(u, b->c1.cout);
+        if (!u->xin_out) { fprintf(stderr, "unet: a backward needs a training forward first (the input offload)\n"); abort(); }
+        nn_set_layer(3 * L - 3);
+        if (b->a1_lent && u->sea_stale) { nn_set_conv(0); if (dec_conv1(u, b, 0, b->a1, G, nullptr, nullptr, nullptr, nullptr, nullptr)) rc_fail("decoder conv1 recompute"); sp_halo(u, b->a1, b->ys, 0); }
+        nn_set_storage(b->a2, act_bytes_of(b->ys), act_dt());
+        nn_set_conv(1);
+        PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, b->m2, b->r2));
+        nn_set_conv(-1);
+        sp_halo(u, b->a2, b->ys, 0);
+        u->a2_stale = 0;
+    }
     /* head; lean mode: the 16-bit logit gradient may sit in B (unet_grad_scratch), whose MX-fp8 registration must not make the
        head ops read it as MX */
     int ghide = 0; float *gbuf = nullptr; size_t gcap = 0;
@@ -1041,6 +1115,13 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         shape5 src = u->ls[i + 1]; src.c = w[i + 1];
         if (nn_get_tf32()) {
             nn_set_layer(3 * L - 3 - i); float *gup = block_bwd(u, &u->dec[i], i, u->gout[i], u->gskip[i]);   /* gB[i]: grad wrt the upsampled part; skip grad written in place */
+            if (u->a1_out[i]) nn_offload_copy(u->enc[i].a1, u->h_a1[i], act_bytes_of(u->enc[i].ys), 0, u->ev_a1[i][2], u->ev_a1[i][3]);   /* the decoder's a1 is dead */
+            if (i == 0 && u->xin_shared) {   /* and its a2: the input back for the stem's weight gradient */
+                if (!u->xin_out) { fprintf(stderr, "unet: a backward needs a training forward first (the input offload)\n"); abort(); }
+                nn_set_storage(u->xin, u->xin_bytes, unet_input_prec());
+                nn_offload_copy(u->xin, u->h_xin, u->xin_bytes, 0, u->ev_xin[2], u->ev_xin[3]);
+                u->a2_stale = 1;
+            }
             if (gup) { shape5 us = li; us.c = w[i + 1]; sp_halo(u, gup, us, 1); }
             if (gup) PROF(5, nn_up2_bwd(gup, src, u->gout[i + 1]));   /* nullptr: chunk mode wrote gout[i + 1] */
             FQG(u->gout[i + 1], src);
@@ -1053,6 +1134,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     /* encoder, from the bottom */
     for (int i = L - 1; i >= 0; i--) {
         float *gy = i < L - 1 ? u->gskip[i] : u->gout[i];   /* enc[i].s2 receives skip + down-conv grads; the bottom gets the up-path grad */
+        if (i == 0 && u->xin_shared) nn_stream_wait(0, u->ev_xin[3]);
         nn_set_layer(i); float *gin = block_bwd(u, &u->enc[i], i, gy, nullptr);            /* grad wrt enc[i] input */
         if (i > 0) {
             /* enc[i] input = downo[i-1] = down[i-1](enc[i-1].s2): propagate to enc[i-1].s2, accumulate into gskip[i-1] */

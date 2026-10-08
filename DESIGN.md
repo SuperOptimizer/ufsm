@@ -16,7 +16,14 @@ No teacher models, no distillation. All upstream data is re-exported once into t
   round-to-nearest stores are not (mean residual 0.14). A 16 GB GPU now trains a whole 512^3 window (0.43 samples/s).
 - The decoder conv1 weight gradient runs over 32-channel up slices, so gout[0] holds one slice; with fp4 gradients the
   fp16 logits sit at the start of gout[0], the logit gradient in A, the batch at gout[0]'s end.
-- Shared encoder a1 (`UFSM_RC_ENC_A1=1`, -1.66 GB, ~2.3% slower) stays a planner choice for when lean 2 does not fit.
+- Shared encoder a1 is on by default (recompute 1; `UFSM_RC_ENC_A1=0` off): the decoders reuse the encoders' a1 buffers and
+  each encoder a1 goes to pinned host memory once its block's forward is done and comes back after the same-level
+  decoder's backward (`UFSM_A1_OFFLOAD=0`: re-run the encoder conv1 instead, +2.5%). The training input copy lives in
+  dec[0].a2's buffer, free before the decoder's forward and after its backward; host copy from the stem's forward to
+  the stem's weight gradient (`UFSM_XIN_OFFLOAD=0` off). Copies at ~28 GB/s on their own stream; a repeated backward
+  re-runs dec[0]'s conv2. Fixed-batch steps at P 384: 811 -> 817 ms (+0.7%). Desk mode: 139.8 -> 108.6 B per level-0
+  voxel (split slab ~8.2 GB per GPU, 13.4 GB before fp4 gradients); a whole 512^3 window trains on a 16 GB GPU at
+  recompute 1 (15.2 GB peak). If the host cannot pin the buffers, the level re-runs conv1 / keeps a separate input.
 - predict computes only the written logit channel and keeps its 16-bit input in the network's shared a1 scratch
   (inference 80.5 -> ~57 B per window voxel). Boxes of whole shards default to one window per shard (shard + 32,
   halo 16) when it fits the GPU, else 288 / halo 8: laptop, 8 shards of 512, 16% less GPU time (5.20 vs 6.21 s),

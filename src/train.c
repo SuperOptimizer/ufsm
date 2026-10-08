@@ -499,6 +499,8 @@ int cmd_train(int argc, char **argv) {
             const int g4 = getenv("UFSM_GRAD_MX4") ? ufsm_env_on("UFSM_GRAD_MX4") : g4ok;
             if (g4 && !g4ok) { fprintf(stderr, "UFSM_GRAD_MX4: MX-fp4 gradients need widths that are multiples of 32 and P divisible by %d\n", 1 << cfg.nlev); return 2; }
             unet_set_grad_mx4(g4);
+            /* shared encoder a1 (recompute 1) with its host offload by default: ~0.6% step, -22 B per level-0 voxel; UFSM_RC_ENC_A1=0 off */
+            unet_set_share_enc_a1(getenv("UFSM_RC_ENC_A1") ? ufsm_env_on("UFSM_RC_ENC_A1") : 1);
         }
         if (!strcmp(mm, "wide")) {
             if (!nn_get_tf32() || !unet_act_mx()) { fprintf(stderr, "--mem wide requires tensor cores and MX activation storage\n"); return 2; }
@@ -522,7 +524,9 @@ int cmd_train(int argc, char **argv) {
                 {1, 1, 0, 0, 0, "16-bit gradients"}, {2, 1, 0, 0, 0, "16-bit gradients, chunked up-part gradient (UFSM_CHUNK_UP=2)"},
                 {2, 2, 0, 0, 0, "16-bit gradients, chunked, recompute 2"}, {2, 2, 0, 1, 0, "16-bit gradients, chunked, recompute 2, lean"},
                 {2, 2, 0, 2, 0, "16-bit gradients, chunked, recompute 2, lean 2"}};
-            const int sea_force = ufsm_env_on("UFSM_RC_ENC_A1");   /* shared encoder a1 in every mode where it applies (recompute 1) */
+            /* shared encoder a1 in every mode where it applies (recompute 1): with its host offload ~0.6% step for -22 B per
+               level-0 voxel (desk slab -1.66 GB per GPU); default on, UFSM_RC_ENC_A1=0 off */
+            const int sea_force = getenv("UFSM_RC_ENC_A1") ? ufsm_env_on("UFSM_RC_ENC_A1") : 1;
             const int nc = (int)(sizeof cand / sizeof cand[0]);
             size_t fmin = (size_t)-1;
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); size_t f = nn_mem_free(); if (f < fmin) fmin = f; }
@@ -542,7 +546,7 @@ int cmd_train(int argc, char **argv) {
             if (pick < 0) { pick = auto16 ? nc - 1 : 7; /* the smallest mode of the list */ fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
             else fprintf(stderr, "memory: %s, %.2f of %.2f GB free per GPU\n", cand[pick].what, need / 1e9, fmin / 1e9);
             unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean); unet_set_share_enc_a1(cand[pick].sea || sea_force);
-            if (unet_share_enc_a1() && !cand[pick].sea) fprintf(stderr, "memory: + shared encoder a1 (UFSM_RC_ENC_A1)\n");
+            if (unet_share_enc_a1()) fprintf(stderr, "memory: shared encoder a1, %s (default; UFSM_RC_ENC_A1=0 off)\n", unet_a1_offload() ? "offloaded to pinned host memory between its uses" : "conv1 re-run in the backward");
             if (unet_grad_mx4()) fprintf(stderr, "memory: MX gradients stored as MX-fp4 (default; UFSM_GRAD_MX4=0: MX-fp8)\n");
             lean = cand[pick].lean;
             { char mp[1400]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp); }   /* the planner's modes */

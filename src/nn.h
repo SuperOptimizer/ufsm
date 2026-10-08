@@ -28,6 +28,7 @@ void nn_d2h(void *dst, const void *src, size_t bytes);
 void nn_d2d(void *dst, const void *src, size_t bytes);
 void nn_sync(void);
 void *nn_host_alloc(size_t bytes);       /* pinned host memory */
+void *nn_host_alloc_try(size_t bytes);   /* the same, nullptr when the host cannot pin that much */
 void nn_host_free(void *p);
 /* pipelined uploads: an async copy on a per-device copy stream (pinned source), events to order it against the compute stream */
 void nn_h2d_copy_stream(void *dst, const void *src, size_t bytes);
@@ -35,6 +36,9 @@ void *nn_event_create(void);
 void nn_event_record(void *ev, int on_copy_stream);      /* 0: compute stream, 1: copy stream */
 void nn_stream_wait(int copy_stream_waits, void *ev);    /* make the copy stream (1) or the compute stream (0) wait for ev */
 void nn_event_sync(void *ev);
+/* activation offload: copy (pinned host <-> device) on an offload stream once the compute stream reaches this point (ev_start);
+   ev_done completes with the copy (nn_stream_wait(0, ev_done) before the compute stream touches dst / src again) */
+void nn_offload_copy(void *dst, const void *src, size_t n, int to_host, void *ev_start, void *ev_done);
 size_t nn_mem_free(void);
 /* event profiler (no host syncs): bracket ops, then collect per-category GPU milliseconds */
 void nn_prof_begin(int k);

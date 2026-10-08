@@ -115,6 +115,9 @@ int unet_share_enc_a1(void);
 int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp16 (lean 2 training: the logit gradient fits after them) */
 void unet_set_grad_mx4(int on);   /* MX-fp4 activation gradients (with the MX gradient mode; opt-in, env UFSM_GRAD_MX4) */
 int unet_grad_mx4(void);
+void unet_set_a1_offload(int on);
+int unet_a1_offload(void);
+void unet_set_xin_offload(int on);   /* training: the input in dec[0].a2's buffer, pinned host copy in between (default on; UFSM_XIN_OFFLOAD) */   /* shared encoder a1: pinned host copies instead of the conv1 re-run (default on; UFSM_A1_OFFLOAD) */
 void unet_set_up_wg_chunk(int on);   /* decoder conv1 weight gradient in 32-channel up slices (-1 default: with MX-fp4 gradients) */
 size_t unet_train_bytes(unet *u, shape5 xs);   /* training activation + gradient bytes at xs for the current modes (dry build) */
 size_t unet_infer_bytes(unet *u, shape5 xs);   /* the same for the inference forward (buffers allocated at build time) */

@@ -197,6 +197,7 @@ extern "C" void nn_d2h(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n
 extern "C" void nn_d2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToDevice)); }
 extern "C" void nn_sync(void) { CK(cudaDeviceSynchronize()); }
 extern "C" void *nn_host_alloc(size_t n) { void *p = nullptr; CK(cudaMallocHost(&p, n)); return p; }
+extern "C" void *nn_host_alloc_try(size_t n) { void *p = nullptr; if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
 extern "C" void nn_host_free(void *p) { if (p) CK(cudaFreeHost(p)); }
 cudaStream_t copy_stream(void) {
     static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;
@@ -208,6 +209,17 @@ extern "C" void *nn_event_create(void) { cudaEvent_t e; CK(cudaEventCreateWithFl
 extern "C" void nn_event_record(void *e, int on_copy_stream) { CK(cudaEventRecord((cudaEvent_t)e, on_copy_stream ? copy_stream() : 0)); }
 extern "C" void nn_stream_wait(int copy_stream_waits, void *e) { CK(cudaStreamWaitEvent(copy_stream_waits ? copy_stream() : 0, (cudaEvent_t)e, 0)); }
 extern "C" void nn_event_sync(void *e) { CK(cudaEventSynchronize((cudaEvent_t)e)); }
+static cudaStream_t offload_stream(void) {   /* activation offload: its own stream, so it never queues behind batch uploads */
+    static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;
+    if (!st[d]) CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));
+    return st[d];
+}
+extern "C" void nn_offload_copy(void *dst, const void *src, size_t n, int to_host, void *ev_start, void *ev_done) {
+    CK(cudaEventRecord((cudaEvent_t)ev_start, 0));
+    CK(cudaStreamWaitEvent(offload_stream(), (cudaEvent_t)ev_start, 0));
+    CK(cudaMemcpyAsync(dst, src, n, to_host ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, offload_stream()));
+    CK(cudaEventRecord((cudaEvent_t)ev_done, offload_stream()));
+}
 cudaEvent_t g_ev[NPROF][2];
 int g_evk[NPROF], g_nev, g_ev_init;
 extern "C" void nn_prof_begin(int k) {

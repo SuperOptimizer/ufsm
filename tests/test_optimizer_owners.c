@@ -84,7 +84,7 @@ static void input_case(int bits) {
     unet_set_input_prec(8); unet_set_input_mx(1); unet_set_grad_mx8(1);
     size_t planned = unet_train_bytes(reused, xs);
     unet_forward_x(reused, xh, xs, 1, 1);
-    int accounted = reused->act_bytes == planned && nn_storage(reused->xin) == 8;
+    int accounted = reused->act_bytes == planned && (reused->xin_shared ? reused->xin == reused->dec[0].a2 : nn_storage(reused->xin) == 8);   /* input offload: in dec[0].a2's buffer (holding a2 after the forward) */
     printf("bodyMX%d stemMX8 dry memory includes input: %s\n", bits, accounted ? "ok" : "FAIL"); failures += !accounted;
     unet_set_grad_mx8(0);
     unet_free(reused); nn_free(xf); nn_free(xh); free(h); free(got); free(want); unet_set_input_prec(0); unet_set_input_mx(0);

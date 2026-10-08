@@ -1,6 +1,6 @@
 /* Per-layer GPU time of the inference forward (event profiler), for one precision setting.
    usage: prof_infer [P] [B] [iters]   env: UFSM_PREC_POLICY / UFSM_PREC, UFSM_F16, UFSM_DOWN_NORM, UFSM_ACT_MX8 / UFSM_ACT_MX4,
-   UFSM_XIN_MX / UFSM_XIN_PREC, UFSM_GN_STORED, UFSM_WIDTHS (e.g. 32,64,96,128,160,192), UFSM_COUT.
+   UFSM_XIN_MX / UFSM_XIN_PREC, UFSM_GN_STORED, UFSM_SR, UFSM_BF16, UFSM_WIDTHS (e.g. 32,64,96,128,160,192), UFSM_COUT.
    Prints, per conv slot, the minimum over iterations of its forward time, the category totals (min over iterations),
    and the end-to-end forward time (wall clock, min and median). */
 #include "unet.h"
@@ -18,6 +18,8 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_PREC")) nn_set_prec(atoi(getenv("UFSM_PREC")));
     if (getenv("UFSM_PREC_POLICY") && nn_set_prec_policy(getenv("UFSM_PREC_POLICY"))) return 2;
     if (getenv("UFSM_GN_STORED")) nn_set_gn_stored(1);
+    if (getenv("UFSM_SR")) nn_set_sr(1);                                                  /* training as the trainer: SR (MX-fp4 gradients need it) */
+    if (getenv("UFSM_BF16")) { nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_grad_scale(1024); }   /* 16-bit storage modes */
     unet_cfg cfg = {4, {16, 32, 64, 80}, 4, 2, 8};
     if (getenv("UFSM_WIDTHS")) { char *t = strdup(getenv("UFSM_WIDTHS")); cfg.nlev = 0; for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (getenv("UFSM_COUT")) cfg.cout = atoi(getenv("UFSM_COUT"));
