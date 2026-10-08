@@ -131,13 +131,13 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
         double *ds = gn_dsums((size_t)2 * NC);
         float *AB = scratch + 2 * NC;
         const int gdt = ISMX(gy) ? MXDT(gy) : LPDT(GBF), xdt = MXDT(x);
-        if (gdt != (ISMX(gx) ? MXDT(gx) : LPDT(GBF)) || gdt == 4) { fprintf(stderr, "gn_silu_bwd: gy and gx must share the storage (MX-fp8 or 16-bit; never fp4)\n"); abort(); }
+        if (gdt != (ISMX(gx) ? MXDT(gx) : LPDT(GBF))) { fprintf(stderr, "gn_silu_bwd: gy and gx must share the storage\n"); abort(); }
         lp_gn_silu_bwd_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, ds, scratch, AB);
         d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
         const int zsp = zs_on();
         const float f = gn_bwd_reduce(ds, scratch, NC, s.d, ggamma, gbeta, s.n, s.c);
         gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, f);
-        lp_gn_silu_bwd_apply_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, AB);
+        lp_gn_silu_bwd_apply_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, AB, gdt == 4 ? sr_seed() : 0u);   /* MX-fp4 gradients: unbiased SR (always, whatever nn_set_sr) */
         if (!zsp) gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
         KCHECK();
         return;

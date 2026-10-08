@@ -177,12 +177,13 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
         };
         const int gbw = mx_bw(Co);
         const size_t Sg = (size_t)D * H * W, gri = ((size_t)n * mx_nb(Co) + co0 / gbw) * Sg;
-        const uint8_t *gq = (const uint8_t *)gy, *gqs = gq + (size_t)N * mx_nb(Co) * Sg * gbw;
+        constexpr int GB = MX_BITS(TG), GRB = BMo * GB / 8, GCB = GRB >= 16 ? 16 : 8;   /* gy bits (MX-fp8 or MX-fp4 gradients), raw row bytes, copy chunk */
+        const uint8_t *gq = (const uint8_t *)gy, *gqs = gq + (size_t)N * mx_nb(Co) * Sg * mx_rb(gbw, GB);
         auto gload = [&](int oz0) {   /* cp.async: voxel i = row 16 + xx of the z-step (row = vz 8 + vy) */
-            for (int k = tid; k < 256 * (BMo / 16); k += 288) {
-                const int i = k / (BMo / 16), h = k % (BMo / 16), row = i >> 4, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + (i & 15);
+            for (int k = tid; k < 256 * (GRB / GCB); k += 288) {
+                const int i = k / (GRB / GCB), h = k % (GRB / GCB), row = i >> 4, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + (i & 15);
                 const bool ok = oz < D && oy < H && ox < W;
-                cp_async<16>(graw + i * BMo + 16 * h, ok ? gq + (gri + ((size_t)oz * H + oy) * W + ox) * gbw + co0 % gbw + 16 * h : gq, ok);
+                cp_async<GCB>(graw + i * GRB + GCB * h, ok ? gq + (gri + ((size_t)oz * H + oy) * W + ox) * mx_rb(gbw, GB) + (co0 % gbw) * GB / 8 + GCB * h : gq, ok);
             }
             if (tid < 64) {   /* scale bytes, 4 voxels per copy (host: W % 4 == 0) */
                 const int row = tid >> 2, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + 4 * (tid & 3);
@@ -196,12 +197,14 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
             const int c = lane % BMo, ks = warp * KPW + lane / BMo;
             if (ks >= 8) return;
             const bool cok = co0 + c < Co;
-            const uint8_t *rb = graw + ks * 32 * BMo + c, *sb = gscl + ks * 32;
+            const uint8_t *rb = graw + ks * 32 * GRB + (GB == 8 ? c : c >> 1), *sb = gscl + ks * 32;
             float v[32];
             unsigned am = 0u;
 #pragma unroll
             for (int i = 0; i < 32; i += 2) {
-                const float2 d = dec_e4m3x2((unsigned short)(rb[i * BMo] | (rb[(i + 1) * BMo] << 8)));
+                float2 d;
+                if constexpr (GB == 8) d = dec_e4m3x2((unsigned short)(rb[i * GRB] | (rb[(i + 1) * GRB] << 8)));
+                else { const float2 a = dec_e2m1x2(rb[i * GRB]), b = dec_e2m1x2(rb[(i + 1) * GRB]); d = (c & 1) ? make_float2(a.y, b.y) : make_float2(a.x, b.x); }   /* this lane's nibble of each row */
                 v[i] = cok ? d.x * mx_scale(sb[i]) : 0.f; v[i + 1] = cok ? d.y * mx_scale(sb[i + 1]) : 0.f;
                 am = max(am, max(__float_as_uint(v[i]) & 0x7fffffffu, __float_as_uint(v[i + 1]) & 0x7fffffffu));
             }
@@ -465,7 +468,7 @@ extern int g_f8w_coop;
 template <int MT, int NT, typename T, typename TG> static void launch_bw8(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC) {
     static int attr[8][2];
     const int coop = g_f8w_coop | ((g_f8w_coop & 4) && xs.c <= 8 && ys.c <= 32 ? 2 : 0);   /* bit 2: the cooperative gy path for the network input conv */
-    if constexpr (NT == 1 && IS_MX(T) && IS_MX8(TG)) {   /* the network input conv: conv_bwd_w_f8_k's FAST path */
+    if constexpr (NT == 1 && IS_MX(T) && IS_MX(TG)) {   /* the network input conv: conv_bwd_w_f8_k's FAST path (MX-fp8 or MX-fp4 gy) */
         if (xs.c <= 8 && !sp.up && !sp.x2 && x && (coop & 3) == 3 && 16 * MT <= mx_bw(ys.c) && ys.w % 4 == 0) {
             if (!attr[cur_dev_()][1]) { attr[cur_dev_()][1] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f8_k<MT, NT, T, TG, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
             smem += 2 * 8 * NT * 4 + 16 + 256 * 16 * MT + 256;   /* plane multipliers, raw gy rows and scales */
@@ -473,8 +476,11 @@ template <int MT, int NT, typename T, typename TG> static void launch_bw8(dim3 g
             return;
         }
     }
+    if constexpr (IS_MX4(TG)) { fprintf(stderr, "lp_bwd_w_f8: MX-fp4 gradients only for the network input conv's FAST path\n"); abort(); }
+    else {
     if (!attr[cur_dev_()][0]) { attr[cur_dev_()][0] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f8_k<MT, NT, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_bwd_w_f8_k<MT, NT, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, coop);
+    }
 }
 template <typename T, typename TG> void bwd_w_f8_t(const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
     int MT = ys.c >= 32 ? 2 : 1;

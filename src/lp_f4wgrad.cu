@@ -36,8 +36,17 @@ extern template void bwd_w_f4_t<bf16, float>(const void *x, shape5 xs, const flo
 extern template void bwd_w_f4_t<float, float>(const void *x, shape5 xs, const float *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had);
 #endif
 
+int g_f4w_gy4 = 0;
 extern "C" int lp_bwd_w_f4(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had) {
-    if (gybf == 4) { fprintf(stderr, "lp_bwd_w_f4: fp4 gradients are not supported\n"); abort(); }
+    if (gybf == 4) {   /* MX-fp4 gradients: the gy pre-pass decodes the fp4 rows; the kernels read only its records */
+        if (xbf != 4 && xbf != 3) { fprintf(stderr, "lp_bwd_w_f4: MX-fp4 gradients need an MX x\n"); abort(); }
+        g_f4w_gy4 = 1;
+        if (xbf == 4) bwd_w_f4_t<mx4_t, mx8_t>(x, xs, (const mx8_t *)gy, ys, gw, gb, gp, sp, had);
+        else bwd_w_f4_t<mx8_t, mx8_t>(x, xs, (const mx8_t *)gy, ys, gw, gb, gp, sp, had);
+        g_f4w_gy4 = 0;
+        LPCK();
+        return 0;
+    }
     if (xbf == 4 && gybf == 3) bwd_w_f4_t<mx4_t, mx8_t>(x, xs, (const mx8_t *)gy, ys, gw, gb, gp, sp, had);
     else if (xbf == 4 && gybf == 2) bwd_w_f4_t<mx4_t, __half>(x, xs, (const __half *)gy, ys, gw, gb, gp, sp, had);
     else if (xbf == 4 && gybf == 1) VERIFY_ONLY(bwd_w_f4_t<mx4_t, bf16>(x, xs, (const bf16 *)gy, ys, gw, gb, gp, sp, had));

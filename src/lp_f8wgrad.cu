@@ -35,8 +35,16 @@ extern template void bwd_w_f8_t<bf16, float>(const void *x, shape5 xs, const flo
 extern template void bwd_w_f8_t<float, float>(const void *x, shape5 xs, const float *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp);
 #endif
 
+template void bwd_w_f8_t<mx8_t, mx4_t>(const void *x, shape5 xs, const mx4_t *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp);
+template void bwd_w_f8_t<mx4_t, mx4_t>(const void *x, shape5 xs, const mx4_t *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp);
 extern "C" int lp_bwd_w_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
-    if (gybf == 4) { fprintf(stderr, "lp_bwd_w_f8: fp4 gradients are not supported\n"); abort(); }
+    if (gybf == 4) {   /* MX-fp4 gradients: the network input conv (FAST path) only */
+        if (xbf == 3) bwd_w_f8_t<mx8_t, mx4_t>(x, xs, (const mx4_t *)gy, ys, gw, gb, gp, sp);
+        else if (xbf == 4) bwd_w_f8_t<mx4_t, mx4_t>(x, xs, (const mx4_t *)gy, ys, gw, gb, gp, sp);
+        else { fprintf(stderr, "lp_bwd_w_f8: MX-fp4 gradients need an MX x\n"); abort(); }
+        LPCK();
+        return 0;
+    }
     if (xbf == 4 && gybf == 3) bwd_w_f8_t<mx4_t, mx8_t>(x, xs, (const mx8_t *)gy, ys, gw, gb, gp, sp);
     else if (xbf == 4 && gybf == 2) bwd_w_f8_t<mx4_t, __half>(x, xs, (const __half *)gy, ys, gw, gb, gp, sp);
     else if (xbf == 4 && gybf == 1) VERIFY_ONLY(bwd_w_f8_t<mx4_t, bf16>(x, xs, (const bf16 *)gy, ys, gw, gb, gp, sp));

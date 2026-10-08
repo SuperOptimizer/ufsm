@@ -279,8 +279,8 @@ int main(int argc, char **argv) {
                 nn_free(xx); nn_free(gg); nn_free(gw1); nn_free(gb1); nn_free(g64); nn_free(b64);
             }
             best = 1e9;
-            for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
-            nn_free(gx); gx = mx(8, 32, S, 1e-3f, 105); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1); nn_sync();
+            for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1, 3, 3, 0u); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
+            nn_free(gx); gx = mx(8, 32, S, 1e-3f, 105); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1, 3, 3, 0u); nn_sync();
             printf("%-32s @%d %8.3f ms  out %016llx\n", "bdata s2 down0 32 -> 32 (mx8, acc)", P, best, (unsigned long long)fnv(gx, lp_mx8_bytes(1, 32, S)));
             nn_free(x); nn_free(gy); nn_free(gx); nn_free(gw); nn_free(gb); nn_free(w);
         }
@@ -305,15 +305,16 @@ int main(int argc, char **argv) {
         }
     }
     if (want("s2b")) {   /* stride-2 backward-data, accumulating into the level's gradient (down0: 16 -> 16, down1: 32 -> 32 at P / 2) */
-        for (int l = 0; l < 2; l++) {
-            const int Pf = l ? P / 2 : P, Pc = Pf / 2, C = l ? 32 : 16; const size_t Sf = (size_t)Pf * Pf * Pf, Sc = (size_t)Pc * Pc * Pc;
+        for (int l = 0; l < 3; l++) {   /* l 2: the desk widths' down1, 64 -> 64 at P / 2 */
+            const int Pf = l ? P / 2 : P, Pc = Pf / 2, C = l == 2 ? 64 : l ? 32 : 16; const size_t Sf = (size_t)Pf * Pf * Pf, Sc = (size_t)Pc * Pc * Pc;
             shape5 xs = {1, C, Pf, Pf, Pf}, ys = {1, C, Pc, Pc, Pc};
             void *gy = mx(8, C, Sc, 1e-3f, 71 + l), *gx = mx(8, C, Sf, 1e-3f, 73 + l);
             float *w = rnd((size_t)C * C * 27, 0.1f, 75);
             double best = 1e9;
-            for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
-            nn_free(gx); gx = mx(8, C, Sf, 1e-3f, 73 + l); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1); nn_sync();
+            for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1, 3, 3, 0u); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
+            nn_free(gx); gx = mx(8, C, Sf, 1e-3f, 73 + l); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1, 3, 3, 0u); nn_sync();
             printf("bdata s2 %s %d -> %d (mx8, acc) @%d %8.3f ms  out %016llx\n", l ? "down1" : "down0", C, C, Pf, best, (unsigned long long)fnv(gx, lp_mx8_bytes(1, C, Sf)));
+            if (l == 2) { float *a = nn_malloc(Sf * C * 4); lp_mx8_to_f32(gx, 1, C, Sf, a); float *h = malloc(Sf * C * 4); nn_d2h(h, a, Sf * C * 4); double s1 = 0; for (size_t i = 0; i < Sf * C; i++) s1 += fabs(h[i]); printf("  |gx| %.9g\n", s1); free(h); nn_free(a); }
             nn_free(gy); nn_free(gx); nn_free(w);
         }
     }

@@ -832,8 +832,9 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
    only warp-level synchronisation; the BW channels x 4 words are BW / 8 tasks per lane (the 4 words of a block in 4
    consecutive lanes for the amax shuffles). The bias sums stay in registers until the end (block-reduced, one atomic per
    channel and CTA). */
-template <int BW> __global__ void __launch_bounds__(256) gy_pre4_k(const uint8_t *__restrict__ gy, uint8_t *__restrict__ out, float *__restrict__ gb,
-                                                                  int N, int Co, int D, int H, int W, int z0, int Zs, unsigned sr) {
+extern int g_f4w_gy4;   /* lp_bwd_w_f4: the (mx8_t-typed) gy holds MX-fp4 rows; only the gy pre-pass reads it */
+template <int BW, int GB = 8> __global__ void __launch_bounds__(256) gy_pre4_k(const uint8_t *__restrict__ gy, uint8_t *__restrict__ out, float *__restrict__ gb,
+                                                                  int N, int Co, int D, int H, int W, int z0, int Zs, unsigned sr) {   /* GB: gy MX bits */
     constexpr int NTASK = BW / 8;   /* (channel, word) tasks per lane */
     __shared__ float v[8][BW][33];  /* per warp: [channel][block element k = 16 row + x] */
     __shared__ __align__(16) uint8_t recb[BW][GP4_REC];   /* the CTA's records (one per channel), written out whole */
@@ -844,7 +845,7 @@ template <int BW> __global__ void __launch_bounds__(256) gy_pre4_k(const uint8_t
     const size_t Sg = (size_t)D * H * W;
     const unsigned ngrp = (unsigned)ZT * TY * Wb;   /* record groups (z-step, 8-row tile, 16-x tile): a CTA each, warp = block pb */
     (void)Yb;
-    const uint8_t *gsc = gy + (size_t)N * nb * Sg * BW;
+    const uint8_t *gsc = gy + (size_t)N * nb * Sg * mx_rb(BW, GB);
     if (threadIdx.x < BW) bred[threadIdx.x] = 0.f;
     float bacc[NTASK];
 #pragma unroll
@@ -859,7 +860,7 @@ template <int BW> __global__ void __launch_bounds__(256) gy_pre4_k(const uint8_t
             for (int j = 0; j < 32; j++) r[j] = 0.f;
             if (zz < Zs && y < H && x < W) {
                 const size_t ri = ((size_t)n * nb + cb) * Sg + ((size_t)z * H + y) * W + x;
-                mxf<8>::dec_row(gy + ri * BW, BW, mx_scale(gsc[ri]), r);
+                mxf<GB>::dec_row(gy + ri * mx_rb(BW, GB), BW, mx_scale(gsc[ri]), r);
             }
 #pragma unroll
             for (int j = 0; j < BW; j++) v[warp][j][lane] = r[j];
@@ -951,6 +952,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
     static int pre_env = -1;
     if (pre_env < 0) pre_env = getenv("UFSM_F4W_GYPRE") ? atoi(getenv("UFSM_F4W_GYPRE")) : 96;
     const size_t cap_kb = g_f4w_gypre_kb >= 0 ? (size_t)g_f4w_gypre_kb : (size_t)pre_env * 1024;
+    if (g_f4w_gy4 && !(IS_MX8(TG) && cap_kb && sp.sr && !had && (lay == 1 || lay == 2) && zc_env <= 0)) { fprintf(stderr, "lp_bwd_w_f4: MX-fp4 gradients need the gy pre-pass (SR on, plain layout)\n"); abort(); }
     if constexpr (IS_MX8(TG)) if (cap_kb && sp.sr && !had && (lay == 1 || lay == 2) && zc_env <= 0) {
         const int Wb = (ys.w + 15) / 16, gbw = mx_bw(ys.c);
         const size_t per_zt = (size_t)ys.n * ys.c * ((ys.h + 7) / 8) * Wb * GP4_REC;   /* one record per (n, co, z-step, 8-row tile, 16-x tile) */
@@ -962,9 +964,11 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
             const size_t ntile = (size_t)2 * ((Zs + 1) / 2) * 4 * ((ys.h + 7) / 8) * Wb;   /* the padded block grid of the records */
             const size_t nwb = (ntile + 7) / 8;   /* CTAs of 8 warps, a few tiles per warp */
             const dim3 pg((unsigned)(nwb < 4096 ? nwb : 4096), (unsigned)(ys.n * mx_nb(ys.c)));
-            if (gbw == 8) gy_pre4_k<8><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr);
-            else if (gbw == 16) gy_pre4_k<16><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr);
-            else gy_pre4_k<32><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr);
+#define GP4(GB) do { if (gbw == 8) gy_pre4_k<8, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr); \
+                        else if (gbw == 16) gy_pre4_k<16, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr); \
+                        else gy_pre4_k<32, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr); } while (0)
+            if (g_f4w_gy4) GP4(4); else GP4(8);
+#undef GP4
             int zc_s = zs1 - zs0 < max_zc ? zs1 - zs0 : max_zc;
             while (zc_s > 1 && (size_t)base * nblk_(zs1 - zs0, zc_s) < 72) zc_s--;
             const dim3 g((unsigned)(nblk_(ys.w, 16) * nblk_(ys.h, 8) * nblk_(zs1 - zs0, zc_s) * ys.n), (xs.c + 8 * NT - 1) / (8 * NT), (ys.c + 16 * MT - 1) / (16 * MT));

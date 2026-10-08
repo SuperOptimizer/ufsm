@@ -110,11 +110,13 @@ static int s2b_dilate(const void *gy, shape5 ys, const float *w, shape5 xs, void
     LPCK();
     return 1;
 }
-extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum);   /* lp_mx_s2bwd_tc.cu */
+extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr);   /* lp_mx_s2bwd_tc.cu */
 /* returns the compute precision used: 2 (fp8 tensor cores, wide layers), 1 (bf16 tensor cores, 16 / 32 channels) or 0 (fp32) */
-extern "C" int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum) {
+extern "C" int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr) {
+    /* the direct tensor-core kernel first (16 / 32 / 64 channels: no fine-level scratch), then the dilated fp8 conv (wider) */
+    if (lp_bwd_data_s2_mx_tc(gy, ys, w, xs, gx, accum, gdt, xdt, osr)) return 1;
+    if (gdt == 4 || xdt == 4) { fprintf(stderr, "lp_bwd_data_s2_mx: MX-fp4 gradients need 32 or 64 channels (Ci == Co)\n"); abort(); }
     if (s2b_dilate(gy, ys, w, xs, gx, accum)) return 2;
-    if (lp_bwd_data_s2_mx_tc(gy, ys, w, xs, gx, accum)) return 1;
     {
         const int bwx = mx_bw(xs.c), nbx = mx_nb(xs.c);
         const size_t smem = (size_t)8 * ys.c * bwx * sizeof(float);

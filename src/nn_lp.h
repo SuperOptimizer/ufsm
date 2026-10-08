@@ -24,7 +24,7 @@ typedef struct { const float *gamma, *beta, *mean, *rstd; int G; } gnp_t;   /* G
 /* zlo / zhi (spatial split, nn_split_cfg): the GroupNorm statistics of the output (osum) skip the first zlo and the last zhi
    z planes (halo planes owned by the other GPU); 0 / 0 = every plane */
 /* stored_stats: output statistics use decoded rounded MX values, including bias exactly once. */
-typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; unsigned wkey; int zlo, zhi; int stored_stats; } split_t;
+typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; unsigned wkey; int zlo, zhi; int stored_stats; unsigned osr; } split_t;   /* osr: exact SR seed of an MX-fp4 output (fp4 gradients) */
 /* k=3 stride 1 forward / weight gradient with the same semantics as the BF16 tensor-core paths in nn.cu
    (conv_fwd_tc / launch_bwd_w_tc): xbf / ybf = activation (and x2 / y2) storage type, 0 fp32, 1 bf16, 2 fp16; the
    forward needs xbf == ybf. Weights, biases and GroupNorm parameters are fp32; the weight gradient accepts fp32 or (with xbf) bf16 gy. */
@@ -64,11 +64,11 @@ int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, 
 void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                        const void *gy, void *gx, int gdt, double *ds, float *st, float *AB);
 void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
-                             const void *gy, void *gx, int gdt, const float *AB);
-void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y);
+                             const void *gy, void *gx, int gdt, const float *AB, unsigned gsr);   /* gsr: SR seed of an MX-fp4 gx (gdt 4) */
+void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr);   /* ydt 3 MX-fp8, 4 MX-fp4 (exact SR keyed by sr) */
 void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx);
 void lp_up2_bwd_mx_slice(const void *gy, shape5 xs, void *gx, int ctot, int c0);   /* channels [c0, c0 + xs.c) of an MX-fp8 gx (ctot ch) */
-int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum);   /* returns the compute precision (2 fp8, 1 bf16, 0 fp32) */
+int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr);   /* returns the compute precision (2 fp8, 1 bf16, 0 fp32) */
 const char *lp_check(void);
 void lp_f32_to_bf16(const float *x, size_t n, void *y);   /* test helpers */
 void lp_bf16_to_f32(const void *x, size_t n, float *y);

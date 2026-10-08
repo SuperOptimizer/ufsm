@@ -608,6 +608,10 @@ __device__ __forceinline__ void fwd_epi_mxt(float (&acc)[MT][NR][2][4], float *t
                 unsigned wq[NW];
 #pragma unroll
                 for (int k = 0; k < NW; k++) wq[k] = mxf<B>::enc8x(v + (32 / B) * k, mult);
+                if constexpr (B == 4) if (sp.osr) {   /* MX-fp4 gradient: exact SR, a hash per word (8 values) keyed by (row, word) */
+#pragma unroll
+                    for (int k = 0; k < NW; k++) { uint32_t hh[4]; sr_hash4(sp.osr, (uint64_t)ri * 4 + (CPL * qd) / 8 + k, hh); wq[k] = sr_e2m1_word(v + 8 * k, mult, hh); }
+                }
                 uint8_t *dst = qt + ri * RBM + (CPL * B / 8) * qd;
                 if constexpr (NW == 4) *(uint4 *)dst = make_uint4(wq[0], wq[1], wq[2], wq[3]);
                 else if constexpr (NW == 2) *(uint2 *)dst = make_uint2(wq[0], wq[1]);
@@ -720,7 +724,13 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
 #pragma unroll
                                 for (int mm = 0; mm < 2; mm++)
 #pragma unroll
-                                    for (int h = 0; h < 2; h++) nib |= (unsigned)(cvt_e2m1x2(val[mm][h] * mult, 0.f) & 15) << (8 * (2 * mm + h));
+                                    for (int h = 0; h < 2; h++) {
+                                        const float q = val[mm][h] * mult;
+                                        /* MX-fp4 gradient: exact SR keyed by (output channel, voxel) */
+                                        const unsigned c4 = sp.osr ? sr_e2m1_nib(q, sr_hash(sp.osr, ((uint64_t)n * Co + co0 + (j + mm) * 16 + g + 8 * h) * (uint64_t)S + ((size_t)(oz0 + wz * (NR / 2) + (r >> 1)) * H + oy0 + wr + (r & 1)) * W + ox0 + q2 * 8 + 2 * t + vv) & 0xffffu)
+                                                                   : (unsigned)(cvt_e2m1x2(q, 0.f) & 15);
+                                        nib |= c4 << (8 * (2 * mm + h));
+                                    }
                                 nib |= __shfl_down_sync(0xffffffff, nib, 4) << 4;   /* channel g + 1 into the high nibbles */
 #pragma unroll
                                 for (int mm = 0; mm < 2; mm++)
@@ -798,7 +808,12 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
 #pragma unroll
                             for (int mm = 0; mm < 2; mm++)
 #pragma unroll
-                                for (int h = 0; h < 2; h++) nib |= (unsigned)(cvt_e2m1x2(val[mm][h] * mult, 0.f) & 15) << (8 * (2 * mm + h));
+                                for (int h = 0; h < 2; h++) {
+                                    const float q = val[mm][h] * mult;
+                                    const unsigned c4 = sp.osr ? sr_e2m1_nib(q, sr_hash(sp.osr, ((uint64_t)n * Co + co0 + (j + mm) * 16 + g + 8 * h) * (uint64_t)S + ((size_t)oz * H + oy) * W + ox) & 0xffffu)
+                                                               : (unsigned)(cvt_e2m1x2(q, 0.f) & 15);
+                                    nib |= c4 << (8 * (2 * mm + h));
+                                }
                             nib |= __shfl_down_sync(0xffffffff, nib, 4) << 4;   /* channel g + 1 (next lane group) into the high nibbles */
                         }
                         if (ok) {
@@ -886,7 +901,12 @@ __device__ __forceinline__ int sw16(int row, int half) { return row * 32 + ((hal
 template <typename T> T *lp_buf(int slot, size_t n) {
     static void *buf[8][6]; static size_t cap[8][6];
     int d = cur_dev_();
-    if (n * sizeof(T) > cap[d][slot]) { if (buf[d][slot]) cudaFree(buf[d][slot]); cudaMalloc(&buf[d][slot], n * sizeof(T)); cap[d][slot] = n * sizeof(T); }
+    if (n * sizeof(T) > cap[d][slot]) {
+        if (buf[d][slot]) cudaFree(buf[d][slot]);
+        cudaMalloc(&buf[d][slot], n * sizeof(T)); cap[d][slot] = n * sizeof(T);
+        static int rep = -1; if (rep < 0) rep = getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) > 0;
+        if (rep) fprintf(stderr, "lp_buf: %zu-byte elements, slot %d -> %.1f MB (GPU %d)\n", sizeof(T), slot, cap[d][slot] / 1e6, d);   /* kernel workspaces (outside the planner's dry build) */
+    }
     return (T *)buf[d][slot];
 }
 #define P16_KS 18

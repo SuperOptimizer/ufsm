@@ -56,6 +56,7 @@ int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *
         if (!mdt || MXDT(y) != mdt || (sp.x2 && MXDT(sp.x2) != mdt) || (sp.y2 && MXDT(sp.y2) != mdt)) { fprintf(stderr, "conv: MX storage needs MX inputs and outputs of one format\n"); abort(); }
         sp.wkey = conv_wkey();
         if ((mdt == 4 || pr == 3) && g_pass == 1 && sr_on()) sp.sr = sr_seed();   /* fp4 backward-data: stochastic rounding of the (MX-fp8) gy operand */
+        if (mdt == 4 && g_pass == 1) { sp.sr = 0; sp.osr = sr_seed(); }   /* MX-fp4 gradients: gy already on the e2m1 grid (copy staging), gx stored with exact SR */
         if (mdt == 4 || pr == 3) return lp_conv_fwd_f4(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
         return lp_conv_fwd_f8(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
     }
@@ -131,12 +132,12 @@ void bwd_data_impl_(const float *gy, shape5 ys, const float *w, shape5 xs, int k
         flip_w_k<<<nblk(nw, 256), 256>>>(w, scratch, ys.c, xs.c, T);
         /* gy has shape ys; treat it as input with ys.c channels, "cout" = xs.c. Spatial sizes equal for stride 1 / pad k/2. */
         if (k == 3 && g_tf32) { gnp_t none = {nullptr, nullptr, nullptr, nullptr, 0}; split_t ns = {nullptr, 0, nullptr, 0, accum}; conv_fwd_tc(gy, GBF, ys, scratch, nullptr, xs.c, gx, GBF, none, nullptr, 0, ns); }
-        else if (k == 1 && g_tf32 && ISMX(gx)) lp_conv1_to_mx(gy, ISMX(gy) ? 3 : LPDT(GBF), xs.n, ys.c, shape_spatial(xs), scratch, xs.c, gx);   /* head: logit gradient -> MX gout */
+        else if (k == 1 && g_tf32 && ISMX(gx)) lp_conv1_to_mx(gy, ISMX(gy) ? 3 : LPDT(GBF), xs.n, ys.c, shape_spatial(xs), scratch, xs.c, gx, MXDT(gx), MXDT(gx) == 4 ? sr_seed() : 0u);   /* head: logit gradient -> MX gout */
         else if (k == 1 && GBF) { size_t S = shape_spatial(xs); if (g_h16) conv1_f_k<f16, f16><<<nblk((size_t)xs.n * S, 256), 256>>>((const f16 *)gy, scratch, nullptr, (f16 *)gx, xs.n, ys.c, xs.c, S); else conv1_f_k<bf16, bf16><<<nblk((size_t)xs.n * S, 256), 256>>>((const bf16 *)gy, scratch, nullptr, (bf16 *)gx, xs.n, ys.c, xs.c, S); }
         else { int save = g_actbf; g_actbf = 0; nn_conv3d_fwd(gy, ys, scratch, nullptr, xs.c, k, 1, gx); g_actbf = save; }
     } else if (stride == 2 && k == 3 && g_tf32 && (ISMX(gy) || ISMX(gx))) {   /* MX gradients: direct voxel-major kernel, accumulate in MX */
         if (!ISMX(gy) || !ISMX(gx)) { fprintf(stderr, "bwd_data s2: MX gradient storage needs MX gy and gx\n"); abort(); }
-        exec_prec(1, lp_bwd_data_s2_mx(gy, ys, w, xs, gx, accum));
+        exec_prec(1, lp_bwd_data_s2_mx(gy, ys, w, xs, gx, accum, MXDT(gy), MXDT(gx), MXDT(gx) == 4 ? sr_seed() : 0u));
     } else if (stride == 2 && k == 3 && g_tf32 && !ufsm_env_on("UFSM_S2DIL") && !(xs.d & 1) && !(xs.h & 1) && !(xs.w & 1)) {
         /* parity decomposition: gx[2m + p] = sum over the taps compatible with parity p of w . gy[m + d]; each of the
            8 parity classes is a stride-1 conv on the gy grid with 1..8 taps (27 total: no wasted MACs) */
