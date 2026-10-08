@@ -265,6 +265,7 @@ template <int MT, int CP, typename T, typename TO> void launch_f8s(dim3 grid, co
     constexpr int TPK = 32 / CP, NKB = (27 + TPK - 1) / TPK;
     size_t smem = (size_t)F8_T * CP + NKB * MT * 16 * 32 + ((NKB * MT * 16 + 15) & ~15) + 16 + 16 * sizeof(chan_t);
     if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
+    if (IS_MX(TO) && MT % 2 == 0 && smem < FEPI_SCR(16)) smem = FEPI_SCR(16);   /* the transposed MX epilogue's scratch (with 8 KB it fell back to the generic one) */
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f8s_k<MT, CP, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_fwd_f8s_k<MT, CP, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp);

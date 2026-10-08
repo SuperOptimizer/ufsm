@@ -35,7 +35,7 @@ static void run(job *j, unsigned it) {
     if (j->osum) nn_zero(j->osum, 2 * 64 * sizeof(double));
     lp_conv_fwd_f4(j->x, j->xb, j->xs, j->w, j->b, j->co, j->y, j->xb, j->gp, j->osum, j->Go, sp);
 }
-/* BENCH_ONLY: comma list of sections to run (fwd, upfwd, f8fwd, wgrad, up, gnbwd, f8w, w32, s2b, up2; default all); BENCH_WL: one wgrad case index; BENCH_W32: stem / s2 / head */
+/* BENCH_ONLY: comma list of sections to run (fwd, upfwd, f8fwd, wgrad, up, gnbwd, f8w, w32, s2b, up2; default all); BENCH_WL: one wgrad case index; BENCH_FL: one fwd / bdata case index; BENCH_NOSTATS: fwd without GN statistics; BENCH_W32: stem / stemf / s2 / head */
 static int want(const char *key) {
     const char *o = getenv("BENCH_ONLY");
     if (!o) return 1;
@@ -56,6 +56,7 @@ int main(int argc, char **argv) {
         {"fwd 64 -> 64 (gn+silu, stats) @P/2", 4, 64, 64, 0, 1, 1, 0, 2}, {"bdata 64 -> 64 (mx8, SR) @P/2", 3, 64, 64, 0, 0, 0, 1, 2},
         {"bdata 64 -> 96 + 64 (mx8, SR) @P/2", 3, 64, 160, 96, 0, 0, 1, 2}};
     for (int l = 0; l < (int)(sizeof L / sizeof L[0]) && want("fwd"); l++) {
+        if (getenv("BENCH_FL") && l != atoi(getenv("BENCH_FL"))) continue;   /* one forward / bdata case */
         const int Pl = P / L[l].dv; const size_t Sl = (size_t)Pl * Pl * Pl;
         shape5 xs = {1, L[l].ci, Pl, Pl, Pl};
         job j = {0};
@@ -66,7 +67,7 @@ int main(int argc, char **argv) {
         float *w = rnd((size_t)L[l].co * L[l].ci * 27, 0.1f, 2), *b = L[l].osplit || L[l].sr ? nullptr : rnd(L[l].co, 0.1f, 3);
         j.w = w; j.b = b;
         if (L[l].gn) j.gp = (gnp_t){gam, bet, mean, rstd, G};
-        if (L[l].stats) { j.osum = osum; j.Go = G; }
+        if (L[l].stats && !getenv("BENCH_NOSTATS")) { j.osum = osum; j.Go = G; }   /* BENCH_NOSTATS: the cost of the statistics */
         double best = 1e9;
         for (unsigned it = 0; it < 12; it++) {
             nn_sync(); double t0 = now(); run(&j, it); nn_sync(); double t = (now() - t0) * 1e3;
@@ -234,6 +235,19 @@ int main(int argc, char **argv) {
             double a = 0, ab = 0; for (int i = 0; i < 32 * 4 * 27; i++) a += fabs(hw[i]); for (int i = 0; i < 32; i++) ab += fabs(hb[i]);
             printf("%-32s @%d %8.3f ms  |gw| %.9g |gb| %.9g\n", "wgrad stem 4 -> 32 (fp8, SR)", P, best, a, ab);
             nn_free(xi); nn_free(g); nn_free(gw); nn_free(gb);
+        }
+        if (!wsel || !strcmp(wsel, "stemf")) {   /* stem forward: MX-fp8 network input -> MX-fp4 32 channels with GN statistics */
+            shape5 x4 = {1, 4, P, P, P};
+            void *xi = mx(8, 4, S, 2.f, 113), *yo = nn_malloc(lp_mx4_bytes(1, 32, S));
+            float *w = rnd((size_t)32 * 4 * 27, 0.1f, 114), *b = rnd(32, 0.1f, 115);
+            best = 1e9;
+            for (int it = 0; it < 8; it++) {
+                nn_zero(osum, 2 * 64 * sizeof(double));
+                nn_sync(); double t0 = now(); lp_conv_fwd_f8(xi, 3, x4, w, b, 32, yo, 4, (gnp_t){0}, osum, G, (split_t){0}); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+            }
+            double hs[16]; nn_d2h(hs, osum, sizeof hs);
+            printf("%-32s @%d %8.3f ms  out %016llx  osum %.9g %.9g\n", "fwd stem 4 -> 32 (mx8 -> mx4, stats)", P, best, (unsigned long long)fnv(yo, lp_mx4_bytes(1, 32, S)), hs[0], hs[1]);
+            nn_free(xi); nn_free(yo); nn_free(w); nn_free(b);
         }
         if (!wsel || !strcmp(wsel, "s2")) {
             shape5 xs = {1, 32, P, P, P}, ys = {1, 32, Pc, Pc, Pc};
