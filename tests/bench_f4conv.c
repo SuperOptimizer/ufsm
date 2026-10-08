@@ -249,6 +249,21 @@ int main(int argc, char **argv) {
                 float hw[32 * 32 * 27]; nn_d2h(hw, gw, sizeof hw); double a = 0; for (int i = 0; i < 32 * 32 * 27; i++) a += fabs(hw[i]);
                 printf("%-32s @%d %8.3f ms  |gw| %.9g\n", gn ? "wgrad s2 down0 32 -> 32 (gn+silu)" : "wgrad s2 down0 32 -> 32 (fp8)", P, best, a);
             }
+            {   /* down1 of the desk widths: 64 -> 64 at P / 2 (gn+silu) */
+                const int P1 = P / 2, P1c = P1 / 2; const size_t S1 = (size_t)P1 * P1 * P1, S1c = (size_t)P1c * P1c * P1c;
+                shape5 x1 = {1, 64, P1, P1, P1}, y1 = {1, 64, P1c, P1c, P1c};
+                void *xx = mx(4, 64, S1, 2.f, 109), *gg = mx(8, 64, S1c, 1e-3f, 110);
+                float *gw1 = nn_malloc(64 * 64 * 27 * 4), *gb1 = nn_malloc(64 * 4), *g64 = rnd(64, 1.f, 111), *b64 = rnd(64, 0.5f, 112);
+                const gnp_t gp1 = {g64, b64, mean, rstd, G};
+                best = 1e9;
+                for (int it = 0; it < 8; it++) {
+                    nn_zero(gw1, 64 * 64 * 27 * 4); nn_zero(gb1, 64 * 4);
+                    nn_sync(); double t0 = now(); lp_bwd_w_s2_f8(xx, 4, x1, gg, 3, y1, gw1, gb1, gp1); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+                }
+                float *hw = (float *)malloc(64 * 64 * 27 * 4); nn_d2h(hw, gw1, 64 * 64 * 27 * 4); double a = 0; for (int i = 0; i < 64 * 64 * 27; i++) a += fabs(hw[i]); free(hw);
+                printf("%-32s @%d %8.3f ms  |gw| %.9g\n", "wgrad s2 down1 64 -> 64 (gn+silu)", P1, best, a);
+                nn_free(xx); nn_free(gg); nn_free(gw1); nn_free(gb1); nn_free(g64); nn_free(b64);
+            }
             best = 1e9;
             for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
             nn_free(gx); gx = mx(8, 32, S, 1e-3f, 105); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1); nn_sync();

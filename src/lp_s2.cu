@@ -307,7 +307,7 @@ __device__ unsigned long long g_s2wprof[4];
 #endif
 #define XS2_CS 3088   /* per channel: 5 planes x 17 rows x 36 B = 3060, padded to 772 words == 4 mod 32 */
 #define XS2_PS 612
-template <int MT, int NT, typename T, typename TG>
+template <int MT, int NT, typename T, typename TG, bool FAST = false>
 __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
                                                           int N, int Ci, int D, int H, int W, int Co, int Do, int Ho, int Wo, int ZC, gnp_t gp) {
     constexpr int CH = 8 * NT, BMo = 16 * MT;
@@ -352,6 +352,212 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
 #if S2W_PROF
     unsigned long long pa = 0, pb_ = 0, pc = 0, t0 = 0, t1 = 0, t2 = 0;
 #endif
+    auto mma_zstep = [&](int oz0) {   /* the z-step's MMAs from the staged x ring and gy tile */
+#pragma unroll
+        for (int vz = 0; vz < 2; vz++) {
+            const int iz = (2 * oz0 + 2 * vz + kz) % 5;   /* ring slot of input plane 2 oz0 - 1 + 2 vz + kz */
+            unsigned sb[NT];
+#pragma unroll
+            for (int q = 0; q < NT; q++) sb[q] = sxs[(q * 8 + g) * 8 + iz];
+#pragma unroll 2
+            for (int kk = 0; kk < 4; kk++) {
+                const int ks = vz * 4 + kk, vy0 = 2 * kk;
+                unsigned af[MT][4], sa[MT];
+#pragma unroll
+                for (int m = 0; m < MT; m++) {
+                    int mat = lane >> 3, co = m * 16 + (mat & 1) * 8 + (lane & 7), row = 2 * ks + (mat >> 1);
+                    ldsm_x4(af[m], sg + co * G8_CS + row * 16);
+                    sa[m] = sgs[(m * 16 + g + 8 * (t & 1)) * 8 + ks];
+                }
+                const int iy0 = 2 * vy0 + ky;
+#pragma unroll
+                for (int q = 0; q < NT; q++) {
+                    const unsigned *p0 = (const unsigned *)(sxq + (q * 8 + g) * XS2_CS + iz * XS2_PS + iy0 * 36) + t;
+                    const unsigned *p1 = p0 + 18;                 /* input row iy0 + 2 (= next output row): +72 B */
+                    unsigned e0 = p0[0], e1 = p0[1], o0 = p0[5], f0 = p1[0], f1 = p1[1], o1 = p1[5];
+                    unsigned b[3][2] = {{e0, f0}, {o0, o1}, {__funnelshift_r(e0, e1, 8), __funnelshift_r(f0, f1, 8)}};
+#pragma unroll
+                    for (int kx = 0; kx < 3; kx++)
+#pragma unroll
+                        for (int m = 0; m < MT; m++) mma_f8(acc[kx][m][q], af[m], b[kx], sa[m], sb[q]);
+                }
+            }
+        }
+    };
+    /* FAST (NT 1, MX x whose 8 channels are one stored block's entries, MX-fp8 gy with the tile's outputs in one stored block):
+       x: thread per position, a barrier per input plane; each plane's raw words are loaded into registers during the previous
+       pass (the z-step's first plane during the gy staging and the MMA; more planes in flight spilled, and the spill store
+       waited for the load), each channel's scale computed by one lane and shuffled (not by every thread for every channel); gy: raw rows and scale bytes copied into smem (cp.async) during the MMA, rounded with lane
+       = channel (a warp per 32-voxel K block: in-lane amax, scale and bias sum, e4m3 four to a word), as the network input
+       conv's FAST path. Same values and scales as the per-element paths (bias: summation order differs). */
+    float bacc = 0.f;
+    if constexpr (FAST) {
+        if (!uni || (co0 % mx_bw(Co)) + BMo > mx_bw(Co)) __trap();   /* the host only picks FAST for these */
+        uint8_t *graw = smem_raw + (((unsigned char *)(amx + 3 * CH) - smem_raw + 15) & ~15);   /* [256 voxels][BMo] raw gy (e4m3) */
+        uint8_t *gscl = graw + 256 * BMo;                                                     /* [256] gy scale bytes */
+        constexpr int XW = IS_MX4(T) ? 1 : 2;   /* 32-bit words of the 8-channel x row */
+        const chan_t c0 = ctab[0];
+        const bool Gany = gp.G != 0;
+        const int tid = threadIdx.x;
+        int prow[2], pu[2]; bool pin[2];   /* this thread's positions idx = tid + 288 r of a plane: row, column, inside H x W */
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const int idx = tid + 288 * r, row = idx / 33, u = idx - 33 * row, gyy = 2 * oy0 - 1 + row, gx = 2 * ox0 - 1 + u;
+            prow[r] = row; pu[r] = u; pin[r] = idx < 561 && gyy >= 0 && gyy < H && gx >= 0 && gx < W;
+        }
+        unsigned xra[2][XW], xsa[2], xrb[2][XW], xsb[2];   /* raw positions of the next pass's plane and the one after, alternating */
+        auto xload1 = [&](unsigned (&r_)[2][XW], unsigned (&s_)[2], int gz) {
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+                s_[r] = 0u;   /* scale byte 0: the position is outside (decoded as 0) */
+#pragma unroll
+                for (int w = 0; w < XW; w++) r_[r][w] = 0u;
+                if (pin[r] && gz >= 0 && gz < D) {
+                    const size_t off = ((size_t)gz * H + 2 * oy0 - 1 + prow[r]) * W + 2 * ox0 - 1 + pu[r];
+                    const unsigned *rw = (const unsigned *)((const uint8_t *)c0.p + off * c0.rb + (IS_MX4(T) ? (c0.nib >> 1) : 0));
+                    s_[r] = c0.sp[off] | 0x100u;   /* bit 8: inside */
+#pragma unroll
+                    for (int w = 0; w < XW; w++) r_[r][w] = __ldg(rw + w);
+                }
+            }
+        };
+        auto xdec = [&](const unsigned (&r_)[2][XW], const unsigned (&s_)[2], float (&v)[2][CH]) {
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+#pragma unroll
+                for (int q = 0; q < CH; q++) v[r][q] = 0.f;
+                if (s_[r] & 0x100u) {
+                    const float sc = mx_scale(s_[r] & 0xffu);
+                    if constexpr (IS_MX4(T)) {
+#pragma unroll
+                        for (int q = 0; q < 4; q++) { const float2 d = dec_e2m1x2(r_[r][0] >> (8 * q)); v[r][2 * q] = fmaf(1.f, d.x * sc, 0.f); v[r][2 * q + 1] = fmaf(1.f, d.y * sc, 0.f); }
+                    } else {
+#pragma unroll
+                        for (int w = 0; w < 2; w++) {
+                            const float2 d0 = dec_e4m3x2((unsigned short)(r_[r][w] & 0xffffu)), d1 = dec_e4m3x2((unsigned short)(r_[r][w] >> 16));
+                            v[r][4 * w] = fmaf(1.f, d0.x * sc, 0.f); v[r][4 * w + 1] = fmaf(1.f, d0.y * sc, 0.f);
+                            v[r][4 * w + 2] = fmaf(1.f, d1.x * sc, 0.f); v[r][4 * w + 3] = fmaf(1.f, d1.y * sc, 0.f);
+                        }
+                    }
+#pragma unroll
+                    for (int q = 0; q < CH; q++) { const chan_t &cq = ctab[q]; v[r][q] = cq.p ? act_ab(v[r][q], cq.a, cq.b, Gany && cq.g) : 0.f; }
+                }
+            }
+        };
+        /* plane gz: amax into the pass's buffer, one barrier, the scales by lanes < CH, e4m3 into the ring (slot (gz + 1) % 5;
+           position u: even -> E[u / 2], odd -> O[(u - 1) / 2] at byte 20 + (u - 1) / 2) */
+        auto xpass = [&](const unsigned (&r_)[2][XW], const unsigned (&s_)[2], int gz) {
+            float v[2][CH];
+            xdec(r_, s_, v);
+            unsigned *am = amx + (npass % 3) * CH;
+            unsigned ra[CH];
+#pragma unroll
+            for (int q = 0; q < CH; q++) ra[q] = __reduce_max_sync(0xffffffffu, max(__float_as_uint(v[0][q]) & 0x7fffffffu, __float_as_uint(v[1][q]) & 0x7fffffffu));
+            if (lane == 0) {   /* red.shared directly (atomicMax by one lane got warp-aggregation code) */
+#pragma unroll
+                for (int q = 0; q < CH; q++) asm volatile("red.shared.max.u32 [%0], %1;" :: "r"((unsigned)__cvta_generic_to_shared(&am[q])), "r"(ra[q]) : "memory");
+            }
+            __syncthreads();
+            const int e = mx_exp(__uint_as_float(am[lane % CH]), 1.f / 448.f);
+            const float ml = exp2i(-e);
+            const int slot = (gz + 1) % 5;
+            if (warp == 0 && lane < CH) sxs[lane * 8 + slot] = (uint8_t)(e + 127);
+            if (tid < CH) amx[((npass + 2) % 3) * CH + tid] = 0u;   /* the buffer two passes ahead (its last readers are done) */
+            float mq[CH];
+#pragma unroll
+            for (int q = 0; q < CH; q++) mq[q] = __shfl_sync(0xffffffffu, ml, q);
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+                if (tid + 288 * r < 561) {
+                    const int u = pu[r];
+                    uint8_t *dst = sxq + slot * XS2_PS + prow[r] * 36 + ((u & 1) ? 20 + (u >> 1) : u >> 1);
+#pragma unroll
+                    for (int q = 0; q < CH; q++) dst[q * XS2_CS] = cvt_e4m3(v[r][q] * mq[q]);
+                }
+            }
+            npass++;
+        };
+        const int gbw = mx_bw(Co);
+        const size_t Sg = (size_t)Do * Ho * Wo, gri = ((size_t)n * mx_nb(Co) + co0 / gbw) * Sg;
+        const uint8_t *gq = (const uint8_t *)gy, *gqs = gq + (size_t)N * mx_nb(Co) * Sg * gbw;
+        auto gload = [&](int oz0) {   /* cp.async: voxel i = row 16 + xx of the z-step (row = vz 8 + vy) */
+            for (int k = tid; k < 256 * (BMo / 16); k += 288) {
+                const int i = k / (BMo / 16), h = k % (BMo / 16), row = i >> 4, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + (i & 15);
+                const bool ok = oz < Do && oy < Ho && ox < Wo;
+                cp_async<16>(graw + i * BMo + 16 * h, ok ? gq + (gri + ((size_t)oz * Ho + oy) * Wo + ox) * gbw + co0 % gbw + 16 * h : gq, ok);
+            }
+            if (tid < 64) {   /* scale bytes, 4 voxels per copy (host: Wo % 4 == 0) */
+                const int row = tid >> 2, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + 4 * (tid & 3);
+                const bool ok = oz < Do && oy < Ho && ox < Wo;
+                cp_async<4>(gscl + 4 * tid, ok ? gqs + gri + ((size_t)oz * Ho + oy) * Wo + ox : gqs, ok);
+            }
+            asm volatile("cp.async.commit_group;\n" ::: "memory");
+        };
+        auto gstage = [&]() {   /* lane = channel c of K block ks (KPW blocks per warp) */
+            constexpr int KPW = 32 / BMo;
+            const int c = lane % BMo, ks = warp * KPW + lane / BMo;
+            if (ks >= 8) return;
+            const bool cok = co0 + c < Co;
+            const uint8_t *rb = graw + ks * 32 * BMo + c, *sb = gscl + ks * 32;
+            float v[32];
+            unsigned am = 0u;
+#pragma unroll
+            for (int i = 0; i < 32; i += 2) {
+                const float2 d = dec_e4m3x2((unsigned short)(rb[i * BMo] | (rb[(i + 1) * BMo] << 8)));
+                v[i] = cok ? d.x * mx_scale(sb[i]) : 0.f; v[i + 1] = cok ? d.y * mx_scale(sb[i + 1]) : 0.f;
+                am = max(am, max(__float_as_uint(v[i]) & 0x7fffffffu, __float_as_uint(v[i + 1]) & 0x7fffffffu));
+            }
+            const int e = mx_exp(__uint_as_float(am), 1.f / 448.f);
+            const float m = exp2i(-e);
+            sgs[c * 8 + ks] = (uint8_t)(e + 127);
+            unsigned *dst = (unsigned *)(sg + c * G8_CS + ks * 32);
+#pragma unroll
+            for (int w = 0; w < 8; w++) dst[w] = cvt_e4m3x4(v[4 * w] * m, v[4 * w + 1] * m, v[4 * w + 2] * m, v[4 * w + 3] * m);
+            if (do_bias) {
+                float bs = 0.f;
+#pragma unroll
+                for (int i = 0; i < 32; i++) bs += v[i];
+                bacc += bs;
+            }
+        };
+        const int zt_end = min(nzt, (zc + 1) * ZC);
+        {   /* the first z-step's leading plane, then its four new ones prefetched */
+            const int gz = 2 * (2 * zt_begin) - 1;
+            xload1(xra, xsa, gz);
+            gload(2 * zt_begin);
+            xpass(xra, xsa, gz);
+            xload1(xra, xsa, gz + 1);
+        }
+        for (int zt = zt_begin; zt < zt_end; zt++) {
+            const int oz0 = zt * 2, gz1 = 2 * oz0;   /* new input planes 2 oz0 .. 2 oz0 + 3 */
+            __syncthreads();   /* the previous MMA is done with the ring slots being overwritten and the gy tile */
+#if S2W_PROF
+            if (threadIdx.x == 0) t0 = clock64();
+#endif
+            xload1(xrb, xsb, gz1 + 1); xpass(xra, xsa, gz1);   /* each plane's loads in flight during the previous pass */
+            xload1(xra, xsa, gz1 + 2); xpass(xrb, xsb, gz1 + 1);
+            xload1(xrb, xsb, gz1 + 3); xpass(xra, xsa, gz1 + 2);
+            xpass(xrb, xsb, gz1 + 3);
+#if S2W_PROF
+            __syncthreads();
+            if (threadIdx.x == 0) t1 = clock64();
+#endif
+            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+            __syncthreads();   /* graw has landed */
+            gstage();
+            if (zt + 1 < zt_end) xload1(xra, xsa, gz1 + 4);
+            __syncthreads();
+            if (zt + 1 < zt_end) gload(oz0 + 2);
+#if S2W_PROF
+            if (threadIdx.x == 0) t2 = clock64();
+#endif
+            mma_zstep(oz0);
+#if S2W_PROF
+            __syncthreads();
+            if (threadIdx.x == 0) { const unsigned long long t3 = clock64(); pa += t1 - t0; pb_ += t2 - t1; pc += t3 - t2; }
+#endif
+        }
+    } else
     for (int zt = zc * ZC; zt < nzt && zt < (zc + 1) * ZC; zt++) {
         const int oz0 = zt * 2;
         __syncthreads();
@@ -496,36 +702,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
 #if S2W_PROF
         if (threadIdx.x == 0) t2 = clock64();
 #endif
-#pragma unroll
-        for (int vz = 0; vz < 2; vz++) {
-            const int iz = (2 * oz0 + 2 * vz + kz) % 5;   /* ring slot of input plane 2 oz0 - 1 + 2 vz + kz */
-            unsigned sb[NT];
-#pragma unroll
-            for (int q = 0; q < NT; q++) sb[q] = sxs[(q * 8 + g) * 8 + iz];
-#pragma unroll 2
-            for (int kk = 0; kk < 4; kk++) {
-                const int ks = vz * 4 + kk, vy0 = 2 * kk;
-                unsigned af[MT][4], sa[MT];
-#pragma unroll
-                for (int m = 0; m < MT; m++) {
-                    int mat = lane >> 3, co = m * 16 + (mat & 1) * 8 + (lane & 7), row = 2 * ks + (mat >> 1);
-                    ldsm_x4(af[m], sg + co * G8_CS + row * 16);
-                    sa[m] = sgs[(m * 16 + g + 8 * (t & 1)) * 8 + ks];
-                }
-                const int iy0 = 2 * vy0 + ky;
-#pragma unroll
-                for (int q = 0; q < NT; q++) {
-                    const unsigned *p0 = (const unsigned *)(sxq + (q * 8 + g) * XS2_CS + iz * XS2_PS + iy0 * 36) + t;
-                    const unsigned *p1 = p0 + 18;                 /* input row iy0 + 2 (= next output row): +72 B */
-                    unsigned e0 = p0[0], e1 = p0[1], o0 = p0[5], f0 = p1[0], f1 = p1[1], o1 = p1[5];
-                    unsigned b[3][2] = {{e0, f0}, {o0, o1}, {__funnelshift_r(e0, e1, 8), __funnelshift_r(f0, f1, 8)}};
-#pragma unroll
-                    for (int kx = 0; kx < 3; kx++)
-#pragma unroll
-                        for (int m = 0; m < MT; m++) mma_f8(acc[kx][m][q], af[m], b[kx], sa[m], sb[q]);
-                }
-            }
-        }
+        mma_zstep(oz0);
 #if S2W_PROF
         __syncthreads();
         if (threadIdx.x == 0) { const unsigned long long t3 = clock64(); pa += t1 - t0; pb_ += t2 - t1; pc += t3 - t2; }
@@ -534,6 +711,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
 #if S2W_PROF
     if (threadIdx.x == 0) { atomicAdd(&g_s2wprof[0], pa); atomicAdd(&g_s2wprof[1], pb_); atomicAdd(&g_s2wprof[2], pc); atomicAdd(&g_s2wprof[3], 1ull); }
 #endif
+    if constexpr (FAST) if (do_bias && warp * (32 / BMo) + lane / BMo < 8 && bacc != 0.f) atomicAdd(&sbias[lane % BMo], bacc);
     if (do_bias) { __syncthreads(); if (threadIdx.x < BMo && co0 + (int)threadIdx.x < Co) atomicAdd(&gb[co0 + threadIdx.x], sbias[threadIdx.x]); }
 #pragma unroll
     for (int kx = 0; kx < 3; kx++) {
@@ -554,12 +732,24 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
     }
 }
 template <int MT, int NT, typename T, typename TG> static void launch_bws2(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, int ZC, gnp_t gp) {
-    static int attr[8];
-    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_s2_f8_k<MT, NT, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    static int attr[8][2];
+    static int fast_env = -1;
+    if (fast_env < 0) fast_env = getenv("UFSM_S2W_FAST") ? atoi(getenv("UFSM_S2W_FAST")) : 1;
+    if constexpr (NT == 1 && IS_MX(T) && IS_MX8(TG)) {   /* conv_bwd_w_s2_f8_k's FAST path (x: one 8-channel block row per voxel) */
+        if (fast_env && x && 16 * MT <= mx_bw(ys.c) && ys.w % 4 == 0) {
+            if (!attr[cur_dev_()][1]) { attr[cur_dev_()][1] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_s2_f8_k<MT, NT, T, TG, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+            smem += 16 + 256 * 16 * MT + 256;   /* raw gy rows and scales */
+            conv_bwd_w_s2_f8_k<MT, NT, T, TG, true><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, ZC, gp);
+            return;
+        }
+    }
+    if (!attr[cur_dev_()][0]) { attr[cur_dev_()][0] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_s2_f8_k<MT, NT, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_bwd_w_s2_f8_k<MT, NT, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, ZC, gp);
 }
 template <typename T, typename TG> static void bwd_w_s2_f8_t(const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp) {
-    int MT = ys.c >= 32 ? 2 : 1, NT = xs.c <= 8 ? 1 : 2;
+    int MT = ys.c >= 32 ? 2 : 1, NT = 1;   /* 8 input channels: 2 blocks per SM (16 needed 59 KB of smem: one 9-warp block, -15..25%) */
+    if (getenv("UFSM_S2W_NT")) NT = atoi(getenv("UFSM_S2W_NT"));
+    if (getenv("UFSM_S2W_MT")) MT = atoi(getenv("UFSM_S2W_MT"));
     size_t smem = (size_t)8 * NT * XS2_CS + 16 * MT * (G8_CS + 8) + 8 * NT * 8 + 16 * MT * 4 + 32 + (size_t)8 * NT * (sizeof(chan_t) + 3 * 4);
     int nzt = nblk_(ys.d, 2), base = (int)(((xs.c + 8 * NT - 1) / (8 * NT)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * nblk_(ys.w, 16) * nblk_(ys.h, 8) * ys.n);
     int ZC = nzt < 8 ? nzt : 8;

@@ -280,10 +280,10 @@ int main(void) {
         cmp("s2 fwd 12 ch fp32 I/O, two taps per k", y3, yr3, ny, TOL);
     }
     {   /* stride-2 weight gradient (down0 16 -> 16 / down2-like 64 -> 64): odd sizes, plain and gn+silu input (down_norm) */
-        const int Cs[2] = {16, 64};
-        for (int k = 0; k < 2; k++) {
+        const int Cs[4] = {16, 64, 32, 16}, Ws[4] = {22, 22, 40, 24};   /* output width % 4 == 0: the kernel's FAST staging */
+        for (int k = 0; k < 4; k++) {
             const int C = Cs[k];
-            shape5 xs = {N, C, 13, 10, 22}, ys = nn_conv3d_out_shape(xs, C, 3, 2);
+            shape5 xs = {N, C, 13, 10, Ws[k]}, ys = nn_conv3d_out_shape(xs, C, 3, 2);
             size_t nx = shape_numel(xs), ny = shape_numel(ys), NG = (size_t)N * G, nw = (size_t)C * C * 27;
             float *x = dev_rand(nx, 1.f), *gy = dev_rand(ny, 1e-3f);
             void *xm = mx_from(x, xs), *gym = mx_from(gy, ys); float *xd = deq(xm, xs), *gyd = deq(gym, ys);
@@ -294,9 +294,9 @@ int main(void) {
                 float *gw1 = dev_zero(nw), *gw2 = dev_zero(nw), *gb1 = dev_zero(C), *gb2 = dev_zero(C), *t = dev_zero(nx);
                 mode_ref(); if (gn) nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, t); nn_conv3d_bwd_weight(gn ? t : xd, xs, gyd, ys, 3, 2, gw1, gb1);
                 mode_mx(); nn_conv3d_bwd_weight_x(xm, gn ? &g : NULL, NULL, NULL, 0, 0, xs, gym, ys, 3, 2, gw2, gb2);
-                char nm[96]; snprintf(nm, sizeof nm, "s2 bwd_weight %d -> %d, odd sizes%s (MX)", C, C, gn ? ", gn+silu input" : "");
+                char nm[96]; snprintf(nm, sizeof nm, "s2 bwd_weight %d -> %d, odd sizes, W %d%s (MX)", C, C, Ws[k], gn ? ", gn+silu input" : "");
                 cmp(nm, gw2, gw1, nw, TOL);
-                snprintf(nm, sizeof nm, "s2 bias grad %d, odd sizes%s (MX)", C, gn ? ", gn+silu input" : "");
+                snprintf(nm, sizeof nm, "s2 bias grad %d, odd sizes, W %d%s (MX)", C, Ws[k], gn ? ", gn+silu input" : "");
                 cmp(nm, gb2, gb1, C, TOL);
             }
         }
