@@ -243,7 +243,36 @@ int main(void) {
             }
             if (o != np) printf("    layout mismatch: %zu of %zu\n", o, np);
         }
-        unet_set_grad_mx4(0); unet_free(u); free(gr); free(g8); free(g4); free(dm); free(rm); free(d8);
+        unet_set_grad_mx4(0); unet_free(u);
+        {   /* level-0 A in dec[0].a2's buffer with the skip on the host and the logit gradient in its buffer (the trainer's path:
+               unet_logit_grad_scratch), with the shared encoder a1 / input offloads: the same gradients as separate buffers;
+               a repeated backward (no forward) the same as the first */
+            unet_set_grad_mx4(1); unet_set_share_enc_a1(1);
+            unet *v = unet_create(&cfg); unet_init(v, 23);
+            float *ga = malloc(np * 4), *gb2 = malloc(np * 4), *gc = malloc(np * 4);
+            size_t mem[2];
+            for (int on = 1; on >= 0; on--) {
+                unet_set_a0_share(on);
+                mem[on] = unet_train_bytes(v, xs);
+                nn_set_sr_step(9000); unet_forward(v, x, xs, 1); unet_zero_grad(v);
+                void *gl = unet_logit_grad_scratch(v, no * 2);
+                if (on && !gl) { printf("  a0 share: no logit gradient scratch  FAIL\n"); bad++; }
+                if (!gl) { static void *own; if (!own) own = nn_malloc(no * 2); gl = own; }
+                nn_f32_to_h16(gyo, no, gl, nn_get_grad_scale());
+                nn_set_sr_step(9100); unet_backward_x(v, gl, 1); unet_grad_d2h(v, on ? ga : gb2);
+                if (on) { unet_zero_grad(v); nn_set_sr_step(9100); unet_backward(v, gyo); unet_grad_d2h(v, gc); }   /* repeated backward (fp32 gradient: its own buffer) */
+            }
+            double d2 = 0, e2 = 0, r2 = 0;
+            for (size_t i = 0; i < np; i++) { double d = (double)ga[i] - gb2[i]; d2 += d * d; r2 += (double)gb2[i] * gb2[i]; }
+            float *gr2 = malloc(np * 4);   /* the repeated backward against a fresh one with the fp32 gradient */
+            unet_set_a0_share(0); nn_set_sr_step(9000); unet_forward(v, x, xs, 1); unet_zero_grad(v); nn_set_sr_step(9100); unet_backward(v, gyo); unet_grad_d2h(v, gr2);
+            for (size_t i = 0; i < np; i++) { double d = (double)gc[i] - gr2[i]; e2 += d * d; }
+            const double rel = sqrt(d2 / r2), rel2 = sqrt(e2 / r2);
+            const int ok = rel < 1e-6 && rel2 < 1e-6 && mem[1] < mem[0];
+            printf("  %-46s rel diff %.3g, repeated %.3g, train bytes %zu -> %zu%s\n", "level-0 A share (skip offload) vs separate", rel, rel2, mem[0], mem[1], ok ? "" : "  FAIL");
+            if (!ok) bad++;
+            unet_set_a0_share(-1); unet_set_share_enc_a1(0); unet_set_grad_mx4(0); unet_free(v); free(ga); free(gb2); free(gc); free(gr2);
+        } free(gr); free(g8); free(g4); free(dm); free(rm); free(d8);
     }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     printf("gradient MX-fp4: %s\n", bad ? "FAIL" : "ok");
