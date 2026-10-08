@@ -19,16 +19,19 @@ __global__ void conv1_mx_k(const uint8_t *x, const float *w, const float *b, flo
     for (int co = 0; co < Co && co < 8; co++) y[((size_t)n * Co + co) * S + v] = acc[co];
 }
 /* the same with the output count a template parameter (accumulators in registers) and the gn+silu coefficients (per n, ci),
-   the weights and the bias staged once per block in smem instead of reloaded per voxel; same arithmetic order as conv1_mx_k */
+   the weights and the bias staged once per block in smem instead of reloaded per voxel; same arithmetic order as conv1_mx_k.
+   Weights [ci][8] (two broadcast float4 loads per input channel) and coefficients float2 [n][ci]: one scalar smem load per
+   (co, ci) made the kernel smem-instruction-bound */
 template <int B, int CO>
 __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const float *w, const float *b, float *y, int N, int Ci, size_t S, gnp_t gp) {
-    extern __shared__ float c1s[];
-    float *sa = c1s, *sb = sa + N * Ci, *sw = sb + N * Ci;   /* [N][Ci] a, b; [CO][Ci] w */
+    extern __shared__ __align__(16) float c1s[];
+    float4 *sw = (float4 *)c1s;                       /* [Ci][2] (co 0..3, 4..7) */
+    float2 *sab = (float2 *)(sw + 2 * Ci);            /* [N][Ci] (a, b) */
     for (int i = threadIdx.x; i < N * Ci; i += blockDim.x) {
         const int n = i / Ci, ci = i % Ci;
-        if (gp.G) { const int ng = n * gp.G + ci / (Ci / gp.G); const float a = gp.rstd[ng] * gp.gamma[ci]; sa[i] = a; sb[i] = gp.beta[ci] - gp.mean[ng] * a; }
+        if (gp.G) { const int ng = n * gp.G + ci / (Ci / gp.G); const float a = gp.rstd[ng] * gp.gamma[ci]; sab[i] = make_float2(a, gp.beta[ci] - gp.mean[ng] * a); }
     }
-    for (int i = threadIdx.x; i < CO * Ci; i += blockDim.x) sw[i] = w[i];
+    for (int i = threadIdx.x; i < 8 * Ci; i += blockDim.x) { const int ci = i >> 3, co = i & 7; c1s[i] = co < CO ? w[co * Ci + ci] : 0.f; }
     __syncthreads();
     const int bw = mx_bw(Ci), nb = mx_nb(Ci);
     const int n = blockIdx.y; const size_t v = blockIdx.x * (size_t)blockDim.x + threadIdx.x;   /* grid (voxels, sample) */
@@ -44,23 +47,26 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
         for (int k = 0; k < 32; k++) {
             const int ci = blk * bw + k;
             if (k >= bw || ci >= Ci) break;
-            const float xv = gp.G ? act_ab(r[k], sa[n * Ci + ci], sb[n * Ci + ci], true) : r[k];
+            float xv = r[k];
+            if (gp.G) { const float2 ab = sab[n * Ci + ci]; xv = act_ab(xv, ab.x, ab.y, true); }
+            const float4 w0 = sw[2 * ci], w1 = sw[2 * ci + 1];
+            const float wv[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
 #pragma unroll
-            for (int co = 0; co < CO; co++) acc[co] += sw[co * Ci + ci] * xv;
+            for (int co = 0; co < CO; co++) acc[co] += wv[co] * xv;
         }
     }
 #pragma unroll
     for (int co = 0; co < CO; co++) y[((size_t)n * CO + co) * S + v] = acc[co];
 }
 template <int B, int CO> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, float *y, gnp_t gp) {
-    const size_t S = shape_spatial(xs), sm = (size_t)(2 * xs.n * xs.c + CO * xs.c) * sizeof(float);
+    const size_t S = shape_spatial(xs), sm = (size_t)(2 * xs.n * xs.c + 8 * xs.c) * sizeof(float);
     conv1_mx_t_k<B, CO><<<dim3(nblk_(S, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp);
 }
 extern "C" void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp) {
     if (cout > 8) { fprintf(stderr, "lp_conv1_fwd_mx: cout %d > 8\n", cout); abort(); }
     size_t S = shape_spatial(xs);
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
-    if (!old && (size_t)(2 * xs.n * xs.c + cout * xs.c) * sizeof(float) <= 32 * 1024) {
+    if (!old && (size_t)(2 * xs.n * xs.c + 8 * xs.c) * sizeof(float) <= 32 * 1024) {
 #define C1T(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, y, gp); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, y, gp); break; \
                                case 3: conv1_mx_t<B, 3>(x, xs, w, b, y, gp); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, y, gp); break; \
                                case 5: conv1_mx_t<B, 5>(x, xs, w, b, y, gp); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, y, gp); break; \

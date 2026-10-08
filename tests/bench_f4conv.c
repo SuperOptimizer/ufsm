@@ -296,6 +296,11 @@ int main(int argc, char **argv) {
                 nn_sync(); double t0 = now(); lp_bwd_w1_mx_b(x, 4, xs, gyh, 2, ys, gw, gb, gp); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
             }
             printf("%-32s @%d %8.3f ms\n", "wgrad head 32 -> 7 (mx4 x, fp16 gy)", P, best);
+            float *yh = nn_malloc(S * 7 * 4), *wh = rnd(7 * 32, 0.1f, 116), *bh = rnd(7, 0.1f, 117);
+            best = 1e9;
+            for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_conv1_fwd_mx(x, 4, xs, wh, bh, 7, yh, gp); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
+            printf("%-32s @%d %8.3f ms  out %016llx\n", "fwd head 32 -> 7 (mx4 x, gn+silu)", P, best, (unsigned long long)fnv(yh, S * 7 * 4));
+            nn_free(yh); nn_free(wh); nn_free(bh);
             nn_free(x); nn_free(gyf); nn_free(gyh); nn_free(gw); nn_free(gb);
         }
     }
