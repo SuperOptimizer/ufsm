@@ -104,6 +104,7 @@ static void *worker(void *p) {
     const int me = w->side;
     t_ctx = c; t_side = me;
     nn_init(c->dev[me]);
+    if (c->dev[0] == c->dev[1]) nn_split_thread_slot(me);
     pthread_mutex_lock(&c->mu);
     while (c->turn != me) pthread_cond_wait(&c->cv, &c->mu);
     pthread_mutex_unlock(&c->mu);
@@ -114,6 +115,7 @@ static void *worker(void *p) {
     if (!c->done[1 - me]) { c->turn = 1 - me; pthread_cond_broadcast(&c->cv); }
     pthread_mutex_unlock(&c->mu);
     t_ctx = nullptr; t_side = -1;
+    nn_split_thread_slot(-1);
     return nullptr;
 }
 

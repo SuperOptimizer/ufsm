@@ -14,16 +14,20 @@ extern template int conv_fwd_tc_s2_h<f16>(const void *x, int xbf, shape5 xs, con
 extern template int conv_fwd_tc_s2_h<bf16>(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp);
 #endif
 
-g_zs_t g_zs[8];
+g_zs_t g_zs[10];
+/* both split halves on one GPU (tests): each side's thread keeps its own config in slot 8 + side instead of the device's */
+static thread_local int t_zs_slot = -1;
+extern "C" void nn_split_thread_slot(int side) { t_zs_slot = side < 0 ? -1 : 8 + (side & 1); }
+int zs_slot(void) { return t_zs_slot >= 0 ? t_zs_slot : cur_dev(); }
 void (*g_split_reduce)(double *, int);
-extern "C" void nn_split_cfg(int lo0, int hi0, int D0, int Dg0) { g_zs[cur_dev()] = {D0 > 0, lo0, hi0, D0, Dg0}; }
+extern "C" void nn_split_cfg(int lo0, int hi0, int D0, int Dg0) { g_zs[zs_slot()] = {D0 > 0, lo0, hi0, D0, Dg0}; }
 extern "C" void nn_split_set_reduce(void (*fn)(double *, int)) { g_split_reduce = fn; }
-int zs_on(void) { return g_zs[cur_dev()].on; }
+int zs_on(void) { return g_zs[zs_slot()].on; }
 void zs_range(int D, int *lo, int *hi) {   /* halo planes at the low / high end of a tensor of depth D */
-    const auto &z = g_zs[cur_dev()];
+    const auto &z = g_zs[zs_slot()];
     *lo = z.on ? (int)((long)z.lo0 * D / z.D0) : 0; *hi = z.on ? (int)((long)z.hi0 * D / z.D0) : 0;
 }
-size_t zs_len(size_t len, int D) { const auto &z = g_zs[cur_dev()]; return z.on ? len / D * (size_t)((long)z.Dg0 * D / z.D0) : len; }   /* element count of the whole window */
+size_t zs_len(size_t len, int D) { const auto &z = g_zs[zs_slot()]; return z.on ? len / D * (size_t)((long)z.Dg0 * D / z.D0) : len; }   /* element count of the whole window */
 void zs_reduce(double *b, int n) { if (zs_on() && g_split_reduce) g_split_reduce(b, n); }   /* sum over both GPUs */
 split_t zs_split(split_t sp, int D) { zs_range(D, &sp.zlo, &sp.zhi); return sp; }
 int gn_fused_stored(const void *y, int cout) {

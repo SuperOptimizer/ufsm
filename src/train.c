@@ -494,10 +494,11 @@ int cmd_train(int argc, char **argv) {
            validation loss +0.1..0.8%) where the fp4 kernels apply: widths in 32-channel blocks, an even coarsest level;
            UFSM_GRAD_MX4=0 keeps MX-fp8 */
         {
-            int g4ok = P % (1 << cfg.nlev) == 0;
+            int g4ok = P % (1 << cfg.nlev) == 0 && fp4 >= 2 && !*opt(argc, argv, "--policy", "");   /* the fp8 weight gradients of --fp4 1
+                                                                                                     (or a --policy) take no MX-fp4 gy */
             for (int i = 0; i < cfg.nlev; i++) if (cfg.widths[i] % 32) g4ok = 0;
             const int g4 = getenv("UFSM_GRAD_MX4") ? ufsm_env_on("UFSM_GRAD_MX4") : g4ok;
-            if (g4 && !g4ok) { fprintf(stderr, "UFSM_GRAD_MX4: MX-fp4 gradients need widths that are multiples of 32 and P divisible by %d\n", 1 << cfg.nlev); return 2; }
+            if (g4 && !g4ok) { fprintf(stderr, "UFSM_GRAD_MX4: MX-fp4 gradients need --fp4 2 (fp4 weight gradients), widths that are multiples of 32 and P divisible by %d\n", 1 << cfg.nlev); return 2; }
             unet_set_grad_mx4(g4);
             /* shared encoder a1 (recompute 1) with its host offload by default: ~0.6% step, -22 B per level-0 voxel; UFSM_RC_ENC_A1=0 off */
             unet_set_share_enc_a1(getenv("UFSM_RC_ENC_A1") ? ufsm_env_on("UFSM_RC_ENC_A1") : 1);

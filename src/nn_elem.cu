@@ -9,8 +9,8 @@ __global__ void gn_finalize_k(const double *sums, int NG, size_t len, float eps,
     rstd[ng] = (float)(1.0 / sqrt((v > 0 ? v : 0) + (double)eps));
 }
 double *gn_dsums(size_t n) {   /* small persistent device scratch for the double sums, per device */
-    static double *buf[8]; static size_t cap[8];
-    int d = cur_dev();
+    static double *buf[10]; static size_t cap[10];
+    int d = zs_slot();   /* (both split halves on one GPU: per half) */
     if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); cudaMalloc(&buf[d], n * sizeof(double)); cap[d] = n; }
     return buf[d];
 }

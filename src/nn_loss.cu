@@ -211,18 +211,22 @@ extern "C" size_t nn_split_halo_bytes(shape5 s, int esz) {   /* bytes of one pla
     const int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw;
     return (size_t)s.n * nb * HW * (bw + 1);
 }
-cudaStream_t zs_comm(int dev) {
-    static cudaStream_t st[8];
-    if (!st[dev]) { int cur; cudaGetDevice(&cur); cudaSetDevice(dev); cudaStreamCreateWithFlags(&st[dev], cudaStreamNonBlocking); cudaSetDevice(cur); }
-    return st[dev];
+/* both halves on one GPU (split_create(d, d): tests emulate the two-GPU split): the halo streams and events are per side */
+static int g_zs_same = 0;
+static int zs_key(int dev, int side) { return g_zs_same ? 8 + side : dev & 7; }
+cudaStream_t zs_comm(int dev, int side) {
+    static cudaStream_t st[10]; const int q = zs_key(dev, side);
+    if (!st[q]) { int cur; cudaGetDevice(&cur); cudaSetDevice(dev); cudaStreamCreateWithFlags(&st[q], cudaStreamNonBlocking); cudaSetDevice(cur); }
+    return st[q];
 }
-cudaEvent_t zs_hev(int dev, int slot, int k) {   /* 0 packed, 1 arrived, 2 unpacked */
-    static cudaEvent_t ev[8][2][3]; static int init[8];
-    if (!init[dev]) { int cur; cudaGetDevice(&cur); cudaSetDevice(dev); for (int i = 0; i < 6; i++) cudaEventCreateWithFlags(&ev[dev][i / 3][i % 3], cudaEventDisableTiming); cudaSetDevice(cur); init[dev] = 1; }
-    return ev[dev][slot & 1][k];
+cudaEvent_t zs_hev(int dev, int side, int slot, int k) {   /* 0 packed, 1 arrived, 2 unpacked */
+    static cudaEvent_t ev[10][2][3]; static int init[10]; const int q = zs_key(dev, side);
+    if (!init[q]) { int cur; cudaGetDevice(&cur); cudaSetDevice(dev); for (int i = 0; i < 6; i++) cudaEventCreateWithFlags(&ev[q][i / 3][i % 3], cudaEventDisableTiming); cudaSetDevice(cur); init[q] = 1; }
+    return ev[q][slot & 1][k];
 }
 extern "C" void nn_split_halo_begin(void *const *t, const int *dev, shape5 s, int esz, int h, void *const *sb, void *const *rb, int slot) {
     int cur; cudaGetDevice(&cur);
+    g_zs_same = dev[0] == dev[1];
     zseg_t sg[2][2]; int ns = 0;
     for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); ns = zsegs(t[i], s, esz, sg[i]); }
     const size_t nbytes = zsegs_plane_bytes(sg[0], ns);
@@ -231,18 +235,18 @@ extern "C" void nn_split_halo_begin(void *const *t, const int *dev, shape5 s, in
     const int zsend[2] = {D - h - 1, h}, zlo[2] = {D - h + 1, 0};
     for (int i = 0; i < 2; i++) {
         cudaSetDevice(dev[i]);
-        CK(cudaStreamWaitEvent(0, zs_hev(dev[1 - i], slot, 1), 0));   /* the previous exchange has read this side's send buffer */
+        CK(cudaStreamWaitEvent(0, zs_hev(dev[1 - i], 1 - i, slot, 1), 0));   /* the previous exchange has read this side's send buffer */
         zsegs_copy(t[i], sg[i], ns, zsend[i], 1, sb[i], 0);
         zsegs_zero(t[i], sg[i], ns, zlo[i], h - 1);
-        CK(cudaEventRecord(zs_hev(dev[i], slot, 0), 0));
+        CK(cudaEventRecord(zs_hev(dev[i], i, slot, 0), 0));
     }
     for (int i = 0; i < 2; i++) {
         cudaSetDevice(dev[i]);
-        cudaStream_t cs = zs_comm(dev[i]);
-        CK(cudaStreamWaitEvent(cs, zs_hev(dev[1 - i], slot, 0), 0));
-        CK(cudaStreamWaitEvent(cs, zs_hev(dev[i], slot, 2), 0));        /* the previous exchange has unpacked this receive buffer */
+        cudaStream_t cs = zs_comm(dev[i], i);
+        CK(cudaStreamWaitEvent(cs, zs_hev(dev[1 - i], 1 - i, slot, 0), 0));
+        CK(cudaStreamWaitEvent(cs, zs_hev(dev[i], i, slot, 2), 0));        /* the previous exchange has unpacked this receive buffer */
         CK(cudaMemcpyPeerAsync(rb[i], dev[i], sb[1 - i], dev[1 - i], nbytes, cs));
-        CK(cudaEventRecord(zs_hev(dev[i], slot, 1), cs));
+        CK(cudaEventRecord(zs_hev(dev[i], i, slot, 1), cs));
     }
     cudaSetDevice(cur);
     KCHECK();
@@ -250,9 +254,9 @@ extern "C" void nn_split_halo_begin(void *const *t, const int *dev, shape5 s, in
 extern "C" void nn_split_halo_end(void *t, int side, shape5 s, int esz, int h, void *rb, int slot) {   /* current device = this side's */
     zseg_t sg[2]; int ns = zsegs(t, s, esz, sg);
     const int dev = cur_dev();
-    CK(cudaStreamWaitEvent(0, zs_hev(dev, slot, 1), 0));
+    CK(cudaStreamWaitEvent(0, zs_hev(dev, side, slot, 1), 0));
     zsegs_copy(t, sg, ns, side ? h - 1 : s.d - h, 1, rb, 1);
-    CK(cudaEventRecord(zs_hev(dev, slot, 2), 0));
+    CK(cudaEventRecord(zs_hev(dev, side, slot, 2), 0));
     KCHECK();
 }
 __global__ void zs_add_k(double *a, const double *b, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] += b[i]; }

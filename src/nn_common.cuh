@@ -998,11 +998,12 @@ int cur_dev(void);
    level-l tensor of depth D has lo0 D / D0 and hi0 D / D0 of them). GroupNorm statistics skip the halo planes and are summed
    across the two GPUs (the reduce callback), so mean / rstd are those of the whole window (Dg0 planes at level 0). */
 struct g_zs_t { int on, lo0, hi0, D0, Dg0; };
-extern g_zs_t g_zs[8];
+extern g_zs_t g_zs[10];
 extern void (*g_split_reduce)(double *, int);
 extern "C" void nn_split_cfg(int lo0, int hi0, int D0, int Dg0);
 extern "C" void nn_split_set_reduce(void (*fn)(double *, int));
 int zs_on(void);
+int zs_slot(void);   /* index of this GPU's (or, both halves on one GPU, this half's) split state */
 void zs_range(int D, int *lo, int *hi);
 size_t zs_len(size_t len, int D);
 void zs_reduce(double *b, int n);

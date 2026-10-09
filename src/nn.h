@@ -258,6 +258,7 @@ void nn_sheet_gate(float *residual,const float *surface,const uint8_t *ct,int W,
    halo planes and, like the GroupNorm backward sums and the loss statistics, are summed across both GPUs by the reduce
    callback (registered once; called on the GPU's own thread with a device buffer of n doubles to sum in place). */
 void nn_split_cfg(int lo0, int hi0, int D0, int Dg0);
+void nn_split_thread_slot(int side);   /* both halves on one GPU: this thread's split config is side's (-1: the device's) */
 void nn_split_set_reduce(void (*fn)(double *, int));
 /* esz: bytes per element of a plane-major tensor, 0 = an MX-registered tensor */
 void nn_split_zero(const void *t, shape5 s, int esz, int lo, int hi);   /* zero the halo planes (current device) */
