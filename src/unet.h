@@ -120,6 +120,7 @@ int unet_a1_offload(void);
 void unet_set_a0_share(int on);   /* lean 2, MX-fp4: each decoder level's A in its dec[i].a2's buffer, the skip on the host meanwhile (default on; UFSM_A0_SHARE) */
 void unet_set_coarse_grad_share(int on);   /* lean 2, level-0 A share: the coarse levels' gout in dec[0]'s buffers (default on; UFSM_COARSE_GRAD_SHARE) */
 void unet_set_down_offload(int on);   /* with the coarse gradient share: the down-conv outputs in dec[0].a2's buffer, host copy in between (default on; UFSM_DOWN_OFFLOAD) */
+void unet_set_skip_offload(int on);   /* with the down-conv output offload: the coarse skips in dec[0].a2's buffer, host copy in between (default on; UFSM_SKIP_OFFLOAD) */
 void unet_set_xin_offload(int on);   /* training: the input in dec[0].a2's buffer, pinned host copy in between (default on; UFSM_XIN_OFFLOAD) */
 void unet_set_up_wg_chunk(int on);   /* decoder conv1 weight gradient in 32-channel up slices (-1 default: with MX-fp4 gradients) */
 size_t unet_train_bytes(unet *u, shape5 xs);   /* training activation + gradient bytes at xs for the current modes (dry build) */

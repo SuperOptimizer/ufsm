@@ -264,18 +264,18 @@ int main(void) {
             }
             double d2 = 0, e2 = 0, r2 = 0;
             for (size_t i = 0; i < np; i++) { double d = (double)ga[i] - gb2[i]; d2 += d * d; r2 += (double)gb2[i] * gb2[i]; }
-            for (int what = 0; what < 2; what++) {   /* the coarse gradient buffers / the down-conv outputs in dec[0]'s buffers (on by default
+            for (int what = 0; what < 3; what++) {   /* the coarse gradient buffers / the down-conv outputs in dec[0]'s buffers (on by default
                                                        above) against their own buffers */
-                float *gd = malloc(np * 4); unet_set_a0_share(1); if (what) unet_set_down_offload(0); else unet_set_coarse_grad_share(0);
+                float *gd = malloc(np * 4); unet_set_a0_share(1); if (what == 2) unet_set_skip_offload(0); else if (what) unet_set_down_offload(0); else unet_set_coarse_grad_share(0);
                 const size_t m2 = unet_train_bytes(v, xs);
                 nn_set_sr_step(9000); unet_forward(v, x, xs, 1); unet_zero_grad(v);
                 void *gl = unet_logit_grad_scratch(v, no * 2);
                 nn_f32_to_h16(gyo, no, gl, nn_get_grad_scale());
                 nn_set_sr_step(9100); unet_backward_x(v, gl, 1); unet_grad_d2h(v, gd);
-                unet_set_coarse_grad_share(-1); unet_set_down_offload(-1);
+                unet_set_coarse_grad_share(-1); unet_set_down_offload(-1); unet_set_skip_offload(-1);
                 double q2 = 0, s2 = 0; for (size_t i = 0; i < np; i++) { double d = (double)ga[i] - gd[i]; q2 += d * d; s2 += (double)gd[i] * gd[i]; }
                 const int okc = sqrt(q2 / s2) < 1e-6 && mem[1] < m2;
-                printf("  %-46s rel diff %.3g, train bytes %zu -> %zu%s\n", what ? "down-conv outputs offloaded vs own" : "coarse gout in dec[0]'s buffers vs own", sqrt(q2 / s2), m2, mem[1], okc ? "" : "  FAIL");
+                printf("  %-46s rel diff %.3g, train bytes %zu -> %zu%s\n", what == 2 ? "coarse skips offloaded vs own" : what ? "down-conv outputs offloaded vs own" : "coarse gout in dec[0]'s buffers vs own", sqrt(q2 / s2), m2, mem[1], okc ? "" : "  FAIL");
                 if (!okc) bad++;
                 free(gd);
             }

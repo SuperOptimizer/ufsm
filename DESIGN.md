@@ -44,6 +44,13 @@ No teacher models, no distillation. All upstream data is re-exported once into t
   input it holds first), with a pinned host copy from that conv1 to dec[0]'s backward (desk slab 0.21 GB each way; back ahead
   of the encoders' a1). Same gradients, fresh and repeated backward; P 384 step +0.2% (ABBA medians). Desk mode 86.4 -> 83.7 B
   per level-0 voxel: 512^3 11.23 GB, desk split slab 6.32 GB. `UFSM_DOWN_OFFLOAD=0` off.
+- The coarse skips enc[1 .. L-2].a2 (written by their encoder's conv2, read by the down conv and their decoder's conv1, idle
+  until that decoder's backward) sit at the start of dec[0].a2's buffer (enc[1]'s conv2 waits for the input's copy out), with
+  a pinned host copy from their decoder's conv1 to dec[0]'s backward (desk slab 0.39 GB each way). The copies are waited for
+  where the data is used: dec[0]'s conv2 (not its conv1, which the last skip's copy out overlaps) and the decoder's conv1
+  weight gradient (not its backward's start): +10 ms -> +0.6 ms per P 384 step (ABBA medians, 0.08%). Same gradients, fresh
+  and repeated backward. Desk mode 83.7 -> 78.5 B per level-0 voxel: 512^3 10.53 GB, desk split slab 5.93 GB.
+  `UFSM_SKIP_OFFLOAD=0` off.
 - test_split runs on one GPU when there is only one (both halves take turns on the host anyway; the halo streams / events,
   the split config and the double-sum scratch are kept per half). New cases with the trainer's defaults (MX-fp4 gradients,
   the a1 / input / skip offloads, the shared gradient buffers): split vs one GPU at the rounding-seed noise, and the memory
