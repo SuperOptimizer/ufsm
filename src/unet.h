@@ -58,6 +58,14 @@ void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int 
 void unet_ema(unet *u, float decay);
 /* Use the EMA weights (1) or the live weights (0) for forward. */
 void unet_use_ema(unet *u, int on);
+/* Frozen GroupNorm statistics for inference: unet_gn_nstats floats per sample (means and reciprocal standard deviations of every
+   GroupNorm in a fixed order); unet_gn_stats_get copies sample 0 of the last forward (tensor-core path); unet_gn_freeze(h) makes
+   every later inference forward use h instead of the window's statistics (nullptr: back to the window's). */
+size_t unet_gn_nstats(unet *u);
+int unet_gn_stats_get(unet *u, float *h);
+void unet_gn_freeze(unet *u, const float *h);
+void unet_gn_accumulate(unet *u);           /* add the last forward's statistics (sample 0) to a running pool */
+long unet_gn_pooled(unet *u, float *h);     /* pooled statistics (unet_gn_nstats floats) of the accumulated forwards; returns their count */
 /* 2:4 structured sparsity of the 3^3 conv weights (groups of 4 input channels keep 2): the forward reads a masked copy
    of the weights (unet_apply_sparse24 runs inside unet_forward); unet_srste24 adds the SR-STE term lambda * w to the
    gradient of the pruned weights so they keep decaying but can be revisited. The flag is saved in checkpoints. */

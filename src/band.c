@@ -58,6 +58,9 @@ static int edt_feature(const uint8_t *seed, const int n[3], float *d2, int32_t *
 }
 
 int band_field(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out) {
+    return band_field_side(codes, n, o, cy, cx, p, out, nullptr);
+}
+int band_field_side(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out, uint8_t *side) {
     const size_t N = (size_t)n[0] * n[1] * n[2], sy = (size_t)n[2], sz = (size_t)n[1] * n[2];
     uint8_t *seed = malloc(N), *flag = malloc(N);
     float *d2 = malloc(N * 4); int32_t *idx = malloc(N * 4);
@@ -67,13 +70,14 @@ int band_field(const uint8_t *codes, const int n[3], const int64_t o[3], const d
     /* band = nearest surface winding +- half a turn; unknown beyond the flood radius */
     const float r2 = (p.radius / 2.f) * (p.radius / 2.f);
     for (size_t i = 0; i < N; i++) {
-        if (idx[i] < 0 || d2[i] > r2) { out[i] = BAND_UNKNOWN; continue; }
+        if (idx[i] < 0 || d2[i] > r2) { out[i] = BAND_UNKNOWN; if (side) side[i] = SIDE_UNKNOWN; continue; }
         const size_t s = (size_t)idx[i];
         const int z = (int)(i / sz), y = (int)((i / sy) % n[1]), x = (int)(i % sy);
         const int zs = (int)(s / sz), ys = (int)((s / sy) % n[1]), xs = (int)(s % sy);
         const double rv = hypot(2.0 * (y + o[1]) + 0.5 - cy[z], 2.0 * (x + o[2]) + 0.5 - cx[z]);
         const double rs = hypot(2.0 * (ys + o[1]) + 0.5 - cy[zs], 2.0 * (xs + o[2]) + 0.5 - cx[zs]);
         const int k = (int)codes[s] - 1 + (rv >= rs ? BAND_HALF : -BAND_HALF);
+        if (side) side[i] = rv >= rs ? SIDE_RECTO : SIDE_VERSO;
         out[i] = (uint8_t)((k % BAND_PERIOD + BAND_PERIOD) % BAND_PERIOD);
     }
     /* conflicts (two surfaces > 1/4 turn apart in one voxel): unknown within one voxel */
@@ -104,6 +108,7 @@ int band_field(const uint8_t *codes, const int n[3], const int64_t o[3], const d
         const float s2 = (p.span / 2.f) * (p.span / 2.f);
         for (size_t i = 0; i < N; i++) if (d2[i] <= s2) out[i] = BAND_UNKNOWN;
     }
+    if (side) for (size_t i = 0; i < N; i++) if (out[i] == BAND_UNKNOWN) side[i] = SIDE_UNKNOWN;
     free(seed); free(flag); free(d2); free(idx);
     return 0;
 }

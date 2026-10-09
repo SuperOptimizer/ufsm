@@ -364,6 +364,11 @@ __global__ void fill_unl_k(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i < n && !m[i] && vm[i]) { t[i] = src[i]; m[i] = 1; }
 }
+__global__ void side_tg_k(const uint8_t *s, size_t n, uint8_t *t, uint8_t *m) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) { const uint8_t v = s[i]; t[i] = v == 1 ? 255 : 0; m[i] = v <= 1; }
+}
+extern "C" void nn_side_targets(const uint8_t *side, size_t n, uint8_t *t, uint8_t *m) { side_tg_k<<<nblk(n, 256), 256>>>(side, n, t, m); KCHECK(); }
 extern "C" void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n) { fill_unl_k<<<nblk(n, 256), 256>>>(t, m, vm, src, n); KCHECK(); }
 extern "C" void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out) {
     const size_t n = (size_t)d * h * w;

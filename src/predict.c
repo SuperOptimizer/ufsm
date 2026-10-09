@@ -126,7 +126,9 @@ int cmd_predict(int argc, char **argv) {
                         "       [--grid-origin z,y,x]   anchor tile interiors in selected-level CT voxels, independent of the output box\n"
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n"
                         "       [--channel 0]   output channel written (band_affinity checkpoints: 1..6 = affinities z1 y1 x1 z8 y8 x8)\n"
-                        "       [--radial-sign 1|-1]   -1 reverses the direction input (the CT is unchanged): a recto model then marks the verso face\n");
+                        "       [--radial-sign 1|-1]   -1 reverses the direction input (the CT is unchanged): a recto model then marks the verso face\n"
+                        "       [--gn-save FILE]   pool the GroupNorm statistics of every window processed into FILE (calibration)\n"
+                        "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n");
         fprintf(stderr, "  Default window: shard + 32 with halo 16 (one window per shard) when it fits the GPU, else 288 with halo 8. For exact shard tiling, window - 2*halo should divide the shard size: 544 with halo 16 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n");
         return 2;
     }
@@ -240,6 +242,17 @@ int cmd_predict(int argc, char **argv) {
     unet *u = unet_create(&cfg);
     if (unet_load(u, ckpt) < 0) { fprintf(stderr, "cannot load %s\n", ckpt); return 1; }
     unet_use_ema(u, use_ema);
+    const char *gn_save = opt(argc, argv, "--gn-save", nullptr), *gn_frozen = opt(argc, argv, "--gn-frozen", nullptr);
+    if (gn_save && ngpu > 1) { fprintf(stderr, "predict: --gn-save needs one GPU\n"); return 2; }
+    if (gn_frozen) {   /* header line UFSMGN{"nstats":N,...} then N float32 */
+        FILE *f = fopen(gn_frozen, "rb"); char line[512]; long ns = -1;
+        if (!f || !fgets(line, sizeof line, f) || strncmp(line, "UFSMGN{", 7) || !strstr(line, "\"nstats\":")) { fprintf(stderr, "predict: cannot read %s\n", gn_frozen); return 1; }
+        ns = atol(strstr(line, "\"nstats\":") + 9);
+        if (ns != (long)unet_gn_nstats(u)) { fprintf(stderr, "predict: %s holds %ld statistics, the network needs %zu\n", gn_frozen, ns, unet_gn_nstats(u)); return 1; }
+        float *h = malloc((size_t)ns * 4);
+        if (fread(h, 4, (size_t)ns, f) != (size_t)ns) { fprintf(stderr, "predict: %s is truncated\n", gn_frozen); return 1; }
+        fclose(f); unet_gn_freeze(u, h); free(h);
+    }
     if (!sheet_task) unet_set_head_channels(u, out_ch, 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
     if (cfg.scale_cond) {   /* voxel-size conditioning: the CT level's voxel size, or --scale-um to override */
         const double sum_ = atof(opt(argc, argv, "--scale-um", "0"));
@@ -391,6 +404,7 @@ int cmd_predict(int argc, char **argv) {
                 nn_sheet_input(xd,W,sheet_rows,(float)sheet->center,(float)sheet->scale,h16);
             }
             const float *lg = unet_forward_x(u, xd, xs, 0, h16);
+            if (gn_save) unet_gn_accumulate(u);
             if (sheet_task) lg += (size_t)out_ch * w3;   /* channel c of the [c][W^3] logits (B = 1); otherwise the only one */
             if (sheet_task) {
                 nn_sheet_gate((float *)lg+w3,lg,ctd,W,sheet_rows);
@@ -447,6 +461,14 @@ int cmd_predict(int argc, char **argv) {
     free(rd.tiles);
     fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   \n", (long long)(ns[0] * ns[1] * ns[2]), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
     z3w_close(w);
+    if (gn_save) {
+        const size_t ns = unet_gn_nstats(u); float *h = malloc(ns * 4); const long nw = unet_gn_pooled(u, h);
+        FILE *f = fopen(gn_save, "wb");
+        if (!nw || !f) { fprintf(stderr, "predict: no GroupNorm statistics to save (%ld windows)\n", nw); return 1; }
+        fprintf(f, "UFSMGN{\"nstats\":%zu,\"windows\":%ld,\"window\":%d,\"ema\":%d,\"ckpt\":\"%s\"}\n", ns, nw, W, use_ema, ckpt);
+        if (fwrite(h, 4, ns, f) != ns || fclose(f)) { fprintf(stderr, "predict: cannot write %s\n", gn_save); return 1; }
+        fprintf(stderr, "GroupNorm statistics of %ld windows -> %s\n", nw, gn_save); free(h);
+    }
     if (ngpu > 1) { fprintf(stderr, "gpu %d: %ld tiles in %.0fs\n", gpu, ntiles, now() - t0); z3_close(ct); store_close(s); unet_free(u); return 0; }   /* worker: the parent builds the pyramid */
     for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
     if (pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs)) return 1;

@@ -290,7 +290,8 @@ void nn_prob_u8(const float *logits, size_t n, uint8_t *out, float hard);   /* o
    fp32 / fp16 / bf16 by xfmt 0 / 1 / 2): out = 255 where some voxel within 1 step along the direction is a ridge (p >= thr and
    p >= p at +-1 and +-2 steps along the direction, nearest-voxel sampling), else 0 */
 void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out);
-void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n);   /* where m == 0 and vm != 0: t = src, m = 1 */
+void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n);
+void nn_side_targets(const uint8_t *side, size_t n, uint8_t *t, uint8_t *m);   /* band.h SIDE_* labels -> loss target (recto 255, verso 0) and mask (known) */   /* where m == 0 and vm != 0: t = src, m = 1 */
 /* inference: network input from the uint8 CT window on the device (z-score + radial channels; 16-bit storage when h16),
    and recto probability * 255 (0 where the CT is 0) from the logits */
 void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16);

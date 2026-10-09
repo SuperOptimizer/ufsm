@@ -6,6 +6,53 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Sheet extraction: thickness, recto/verso sides, scoring (2026-10-09)
+
+Plan (research by 7 agents + codebase exploration, user-approved): extract SHEETS, not a recto probability. No vision
+transformers or Mamba (they lose or tie well-tuned CNN U-Nets in rigorous 3-D benchmarks; the Kaggle surface-detection
+top 10 were nnU-Net ResEnc ensembles); levers in order: target representation, long training, post-processing, then
+ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or per-voxel normalisation).
+
+- Scoring harness `tools/score_sheets.py` (laptop wrapper ~/ufsm-data/score_local.sh; unit test tests/test_score_sheets.py)
+  on the Paris4 holdout boxes against the thin reference (paris4-sheet-20261003) and the winding band reference: pixel
+  F1/AUC, F1 at tolerance 0/1/2 label voxels raw and after radial non-maximum suppression, the radial profile through
+  label centres (peak offset, FWHM, double peaks), band-instance VOI/ARAND/splits/merges over known and over material
+  voxels (4.8 um CT >= Otsu tau), and sheet pieces from a recto/verso side channel (`--side-channel`).
+  `tools/label_grid.py` is the trainer's native <-> 4.8 um mapping (label j covers natives 2j-1, 2j); score_bands,
+  sheet_connectivity, score_surface and score_open used {2j, 2j+1} pooling or floor indices before (F1 moves ~0.003).
+- Baseline (P528 W544/16 EMA; FWHM in 2.4 um voxels; labels themselves measure ~3.8):
+
+  | checkpoint | box | F1 | AUC | F1 tol 0/1/2 | FWHM | VOI (merge) |
+  |---|---|---|---|---|---|---|
+  | verso3 step 5000 | 48128 | 0.242 | 0.777 | 0.239/0.409/0.573 | 21.1 | 1.48 (1.21) |
+  | verso3 teacher | 48128 | 0.242 | 0.778 | 0.239/0.408/0.574 | 22.0 | 1.49 (1.22) |
+  | start-E (4 levels) | 48128 | 0.192 | 0.725 | 0.191/0.337/0.490 | 25.4 | 1.98 (1.10) |
+  | verso3 step 5000 | 48512 | 0.259 | 0.796 | 0.256/0.434/0.612 | 23.0 | 1.43 (1.19) |
+  | verso3 teacher | 48512 | 0.261 | 0.793 | 0.256/0.432/0.612 | 23.9 | 1.27 (0.98) |
+  | start-E | 48512 | 0.197 | 0.733 | 0.195/0.345/0.512 | 27.2 | 1.73 (1.32) |
+
+  The recto output is a plateau ~5x wider than the labels (63% of profiles never fall below half maximum within +-16
+  voxels; peak offset spread +-5.6 voxels); radial thinning does not help (no ridge inside the plateau); merges dominate the
+  instance error. A Gaussian target around jittered traces makes the jitter-blurred bump the BCE optimum (width^2 =
+  sigma^2 + jitter^2); a class boundary or a signed distance keeps its crossing under jitter.
+- Recto/verso side labels: `band_field_side` (src/band.c) returns, for every voxel the band field knows, whether it lies
+  outward of its nearest labelled recto (SIDE_RECTO) or inward (SIDE_VERSO). The recto faces the scroll axis, so going
+  outward the side turns verso -> recto exactly on each recto face and recto -> verso midway to the next recto; unknown
+  where the band is (beyond the flood radius, conflicts, missing wraps). tests/test_side.c (concentric shells). `ufsm band
+  --side` writes it for a box; the sampler fills batch.side (sample.c band_window, CT <= --side-air unknown); `train --side 1
+  [--side-lambda L --side-air T]` (task band_affinity) adds the last output channel, BCE over its own mask
+  (nn_side_targets), split-z halo planes masked; `--head-map` maps donor head rows for --init-from.
+- Extraction from sides (score_sheets.side_pieces): cut the recto-side voxels on verso -> recto boundaries (a verso-side
+  material 6-neighbour, and the smoothed recto share increasing outward along the radial direction), 6-connected
+  components of material minus cuts, small pieces dropped, the rest to the nearest piece. On the reference sides of box
+  48128 (oracle) it recovers the band instances: VOI 0.001 (23 pieces, 23 bands, ARAND 1.000) over all CT, 0.024 over CT >=
+  80 (vs 1.48 from the recto channel). Checking only the radial neighbour leaked through oblique faces; smoothing that
+  counted unknown voxels as verso flipped the orientation at the edges of the known region (normalised smoothing fixes it).
+- Frozen GroupNorm statistics (plan D1): `unet_gn_nstats / unet_gn_stats_get / unet_gn_accumulate / unet_gn_pooled /
+  unet_gn_freeze` (inference forwards replay the stores without reducing statistics), `predict --gn-save FILE` (pooled over
+  every window: mean of window means, within-window variance + variance of the means) and `--gn-frozen FILE`. A window
+  replayed with its own frozen statistics is byte-identical (tests/test_gn_frozen.c, predict on a 256^3 box).
+
 ## Memory and inference defaults (2026-10-08)
 
 - Training stores the MX activation gradients as MX-fp4 with exact stochastic rounding by default when every width is a

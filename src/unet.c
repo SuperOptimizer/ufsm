@@ -78,6 +78,8 @@ struct unet {
     unsigned char *wq_r, *wq_rsc, *wq_re, *wq_rsce;  /* fp4: fp8 error-feedback residuals (live, EMA) */
     size_t wq_qoff[64], wq_soff[64]; int wq_n; unsigned ema_step;   /* per 3^3 conv (for_each_conv3 order): offsets into the packed arrays */
     int using_ema;
+    float *gn_frz; size_t gn_frz_n;   /* unet_gn_freeze: per-sample GroupNorm statistics used by inference forwards instead of the window's */
+    double *gn_acc; long gn_acc_n;     /* unet_gn_accumulate: sums of the window statistics (mean, mean^2 per mean slot, variance per rstd slot) */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
@@ -209,7 +211,7 @@ void unet_free(unet *u) {
     free_acts(u);
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
-    nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b);
+    nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b); free(u->gn_frz); free(u->gn_acc);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
     nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
@@ -961,9 +963,13 @@ static nn_gn_t gn_in(const unet *u, const block *b) {
     if (b->ing) { g.gamma = P(u, b->ing->gamma); g.beta = P(u, b->ing->beta); g.mean = b->inm; g.rstd = b->inr; g.G = G_of(u, b->ing->c); }
     return g;
 }
+static int gn_frozen(const unet *u) { return u->gn_frz && !u->fwd_train && nn_get_tf32(); }
+static void gn_frozen_load(unet *u);
 static void block_fwd(unet *u, block *b, int level, const float *x) {
     b->in = x;
     int G = G_of(u, b->c1.cout);
+    const int frz = gn_frozen(u);   /* frozen statistics already sit in m1/r1/m2/r2: the convs only replay the stores */
+    float *om1 = frz ? nullptr : b->m1, *or1 = frz ? nullptr : b->r1, *om2 = frz ? nullptr : b->m2, *or2 = frz ? nullptr : b->r2;
     float *t1 = u->t1[level] ? u->t1[level] : b->s2;    /* inference: no scratch, s2 doubles as temp */
     if (nn_get_tf32()) {   /* conv1 yields the stats of a1; conv2 applies gn + silu to a1 while staging and yields the stats of a2 */
         nn_set_conv(0);
@@ -971,9 +977,9 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
             if (!b->pm1) { b->pm1 = nn_malloc((size_t)b->ys.n * G * 4 * 4); b->pr1 = b->pm1 + (size_t)b->ys.n * G; b->pm2 = b->pr1 + (size_t)b->ys.n * G; b->pr2 = b->pm2 + (size_t)b->ys.n * G; { size_t m = (size_t)b->ys.n * G; float *one = malloc(m * 4); for (size_t k = 0; k < m; k++) one[k] = 1.f; nn_zero(b->pm1, m * 4 * 4); nn_h2d(b->pr1, one, m * 4); nn_h2d(b->pr2, one, m * 4); free(one); } }
             nn_d2d(b->pm1, b->m1, (size_t)b->ys.n * G * 4); nn_d2d(b->pr1, b->r1, (size_t)b->ys.n * G * 4); nn_d2d(b->pm2, b->m2, (size_t)b->ys.n * G * 4); nn_d2d(b->pr2, b->r2, (size_t)b->ys.n * G * 4);
         }
-        if (b->xb) { if (dec_conv1(u, b, level, b->a1, G, b->m1, b->r1, nullptr, nullptr, nullptr)) rc_fail("decoder conv1"); }   /* [up2(coarse) | silu(gn(skip a2))] */
-        else if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), B1(u, b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1));
-        else { nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, b->a1, G, 1e-5f, b->m1, b->r1)); }   /* down_norm: gn + silu of the input in staging */
+        if (b->xb) { if (dec_conv1(u, b, level, b->a1, G, om1, or1, nullptr, nullptr, nullptr)) rc_fail("decoder conv1"); }   /* [up2(coarse) | silu(gn(skip a2))] */
+        else if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), B1(u, b), b->c1.cout, b->a1, G, 1e-5f, om1, or1));
+        else { nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, b->a1, G, 1e-5f, om1, or1)); }   /* down_norm: gn + silu of the input in staging */
         FQ(b->a1, b->ys); FQ_AFF(b->a1, b->ys, b->pm1, b->pr1, G);
         sp_halo(u, b->a1, b->ys, 0);
         if (b == &u->enc[0] && u->xin_shared && u->fwd_train && u->h_xin) {   /* the stem has read the input: to the host during conv2 and the coarser levels */
@@ -990,7 +996,7 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
             nn_set_storage(u->dec[0].a2, act_bytes_of(u->dec[0].ys), act_dt());
         }
         nn_set_conv(1);
-        PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, b->m2, b->r2));
+        PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, om2, or2));
         nn_set_conv(-1);
         FQ(b->a2, b->ys); FQ_AFF(b->a2, b->ys, b->pm2, b->pr2, G);
         sp_halo(u, b->a2, b->ys, 0);
@@ -1029,6 +1035,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     if (u->xin_shared) { nn_set_storage(u->xin, u->xin_bytes, unet_input_prec()); u->a2_stale = 1; }   /* dec[0].a2's buffer holds the input until the decoder */
     u->fwd_train = train;
     if (u->a0_share) nn_set_storage(u->enc[0].a2, act_bytes_of(u->enc[0].ys), act_dt());   /* a backward left the input in it */
+    if (gn_frozen(u)) gn_frozen_load(u);
     if (ABF && !x_h16) { if (!u->xin) u->xin = dalloc_input(u, xs); nn_f32_to_act(x, xs, u->xin); cur = u->xin; }
     else if (x_h16 && act_mx8() && xin_mx) { if (!u->xin) u->xin = dalloc_input(u, xs); nn_h16_to_mx(x, xs, u->xin); cur = u->xin; }
     for (int i = 0; i < L; i++) {
@@ -1053,7 +1060,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
                 const int G = G_of(u, w[i]);
                 block *nb = &u->enc[i + 1];
                 nb->inx = u->downo[i]; nb->ing = &u->dn[i]; nb->inm = u->dm[i]; nb->inr = u->dr[i];
-                if (nn_get_tf32()) { if (nn_gn_stats(u->downo[i], ds, G, 1e-5f, u->dm[i], u->dr[i])) { fprintf(stderr, "unet: down_norm GroupNorm statistics unsupported for this storage\n"); abort(); } }
+                if (nn_get_tf32()) { if (!gn_frozen(u) && nn_gn_stats(u->downo[i], ds, G, 1e-5f, u->dm[i], u->dr[i])) { fprintf(stderr, "unet: down_norm GroupNorm statistics unsupported for this storage\n"); abort(); } }
                 else { PROF(3, nn_gn_fwd_silu(u->downo[i], ds, G, 1e-5f, P(u, u->dn[i].gamma), P(u, u->dn[i].beta), u->downs[i], u->dm[i], u->dr[i])); cur = u->downs[i]; continue; }
             }
             { shape5 ds = u->ls[i + 1]; ds.c = w[i]; FQ(u->downo[i], ds); }
@@ -1497,6 +1504,66 @@ void unet_grad_head_only(unet *u, int blocks) {   /* blocks: also train the last
 void unet_use_params(unet *u, const float *w) {
     u->live = w ? (float *)w : u->using_ema ? u->ema : u->p;
     if (!u->sparse24) u->fw = u->live;
+}
+/* GroupNorm statistic sites in a fixed order: enc[0..L-1] (m1 r1 m2 r2), down norms (dm dr), dec[L-2..0] (m1 r1 m2 r2); each
+   holds n x G floats. fn gets the device array and its group count. */
+static size_t gn_sites(unet *u, void (*fn)(unet *, float *, int, size_t, void *), void *arg) {
+    size_t off = 0; const int L = u->cfg.nlev;
+#define GN_SITE(ptr, g) do { if (fn) fn(u, ptr, g, off, arg); off += (size_t)(g); } while (0)
+    for (int i = 0; i < L; i++) { block *b = &u->enc[i]; GN_SITE(b->m1, G_of(u, b->c1.cout)); GN_SITE(b->r1, G_of(u, b->c1.cout)); GN_SITE(b->m2, G_of(u, b->c2.cout)); GN_SITE(b->r2, G_of(u, b->c2.cout)); }
+    if (u->cfg.down_norm) for (int i = 0; i < L - 1; i++) { GN_SITE(u->dm[i], G_of(u, u->cfg.widths[i])); GN_SITE(u->dr[i], G_of(u, u->cfg.widths[i])); }
+    for (int i = L - 2; i >= 0; i--) { block *b = &u->dec[i]; GN_SITE(b->m1, G_of(u, b->c1.cout)); GN_SITE(b->r1, G_of(u, b->c1.cout)); GN_SITE(b->m2, G_of(u, b->c2.cout)); GN_SITE(b->r2, G_of(u, b->c2.cout)); }
+#undef GN_SITE
+    return off;
+}
+size_t unet_gn_nstats(unet *u) { return gn_sites(u, nullptr, nullptr); }
+static void gn_get1(unet *u, float *d, int g, size_t off, void *h) { (void)u; nn_d2h((float *)h + off, d, (size_t)g * 4); }
+int unet_gn_stats_get(unet *u, float *h) {   /* sample 0 of the last forward */
+    if (!u->built || !nn_get_tf32()) return -1;
+    gn_sites(u, gn_get1, h);
+    return 0;
+}
+static void gn_put1(unet *u, float *d, int g, size_t off, void *arg) {
+    (void)arg;
+    for (int n = 0; n < u->xs.n; n++) nn_h2d(d + (size_t)n * g, u->gn_frz + off, (size_t)g * 4);
+}
+static void gn_frozen_load(unet *u) { gn_sites(u, gn_put1, nullptr); }
+/* pooling over windows: sites come in (mean, rstd) pairs of equal group count; the pooled variance is the mean within-window
+   variance plus the variance of the window means */
+typedef struct { const float *t; double *acc; float *out; double nw; int k; } gn_pool_t;
+static void gn_pool1(unet *u, float *d, int g, size_t off, void *arg) {
+    (void)u; (void)d; gn_pool_t *q = arg;
+    if (q->k++ & 1) return;   /* the rstd site of the pair: handled with its mean */
+    const size_t n = unet_gn_nstats(u);
+    for (int i = 0; i < g; i++) {
+        const size_t im = off + (size_t)i, ir = off + (size_t)g + i;
+        if (q->t) {
+            const double m = q->t[im], r = q->t[ir];
+            q->acc[im] += m; q->acc[n + im] += m * m; q->acc[ir] += 1.0 / (r * r) - 1e-5;
+        } else {
+            const double m = q->acc[im] / q->nw, v = q->acc[ir] / q->nw + q->acc[n + im] / q->nw - m * m;
+            q->out[im] = (float)m; q->out[ir] = (float)(1.0 / sqrt((v > 0 ? v : 0) + 1e-5));
+        }
+    }
+}
+void unet_gn_accumulate(unet *u) {
+    const size_t n = unet_gn_nstats(u);
+    if (!u->gn_acc) { u->gn_acc = calloc(2 * n, sizeof(double)); u->gn_acc_n = 0; }
+    float *t = malloc(n * 4);
+    if (!unet_gn_stats_get(u, t)) { gn_pool_t q = {t, u->gn_acc, nullptr, 0, 0}; gn_sites(u, gn_pool1, &q); u->gn_acc_n++; }
+    free(t);
+}
+long unet_gn_pooled(unet *u, float *h) {
+    if (!u->gn_acc || !u->gn_acc_n) return 0;
+    gn_pool_t q = {nullptr, u->gn_acc, h, (double)u->gn_acc_n, 0}; gn_sites(u, gn_pool1, &q);
+    return u->gn_acc_n;
+}
+void unet_gn_freeze(unet *u, const float *h) {
+    free(u->gn_frz); u->gn_frz = nullptr; u->gn_frz_n = 0;
+    if (!h) return;
+    u->gn_frz_n = unet_gn_nstats(u);
+    u->gn_frz = malloc(u->gn_frz_n * 4);
+    memcpy(u->gn_frz, h, u->gn_frz_n * 4);
 }
 void unet_use_ema(unet *u, int on) { u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
 /* ---- 2:4 structured sparsity: the forward reads a masked copy of the live weights; SR-STE keeps the master weights dense ---- */

@@ -47,6 +47,7 @@ typedef struct {
     double sheet_loss, sheet_parts[5];
     float umb[2], um;            /* input voxel size of the batch in each buffer / the current one (scale_cond) */
     uint8_t *bandb[2], *band;    /* task band_affinity: band per voxel (double-buffered like t / m), current */
+    uint8_t *sideb[2], *sdb, *sidet, *sidem, *sidew; float *sscratch, sout[3]; double side_loss;   /* --side: SIDE_* labels, loss target / mask / weight */
     float *aff_fin, aff_out[48]; double aff_loss;
 } gpu_state;
 /* task band_affinity: output channel 0 = recto (dense loss on target channel 0), channels 1..K = affinities for g_aff_off */
@@ -54,6 +55,9 @@ static int g_aff, g_cout = NCH; static aff_offsets_t g_aff_off; static float g_a
 /* --verso 1: output channel 1 is the verso face. Its target is the model's own recto channel (eval forward, no gradient) with
    the radial input reversed and the CT unchanged: a recto model marks the other face of the sheet when the direction flips
    (the usrm2 radial-sign trick). Band affinities then start at channel 2. g_verso_on: from --verso-start on. */
+/* --side 1 (task band_affinity): one more output channel, the last, classifies every papyrus voxel near labelled rectos as on the
+   recto side (outward of the nearest recto) or the verso side of it (src/band.h SIDE_*): BCE over its own mask, times g_side_lambda */
+static int g_side, g_side_ch; static float g_side_lambda = 1.f;
 static float g_verso_swap, g_verso_lambda = 1.f;   /* lambda: verso loss weight (its gradient and its share of the reported loss) */ static int g_verso_flip, g_head_only;   /* swap: probability of a step with the direction reversed and recto/verso targets exchanged */
 static int g_verso, g_verso_start, g_verso_on, g_verso_self, g_verso_zero, g_verso_ridge, g_verso_anchor;   /* anchor: recto voxels without a trusted label take the teacher's normal-direction output */ static float g_verso_hard;   /* ridge: thin verso targets, the teacher's ridge along the direction at >= this byte */   /* hard: binary verso targets at this teacher probability; zero: fresh verso head row */   /* self: targets from the live weights (collapses: the net learns to ignore the direction) */
 static sheet_dataset *g_sheet;
@@ -66,7 +70,7 @@ static int g_Dl, g_h0; static uint8_t *g_zeros;
 static int g_xfmt = 0, g_g16 = 0;   /* input batches uploaded as 16-bit (1 fp16, 2 bf16); loss gradient written as 16-bit */
 static size_t xbytes(void) { return g_xfmt ? 2 : 4; }
 static const void *bx(const batch *b) { return g_xfmt ? (const void *)b->x16 : (const void *)b->x; }
-static void select_buf(gpu_state *d, int i) { d->cur = i; d->x = d->xb[i]; d->t = d->tb[i]; d->m = d->mb[i]; d->w = d->wb[i]; d->band = d->bandb[i]; d->um = d->umb[i]; }
+static void select_buf(gpu_state *d, int i) { d->cur = i; d->x = d->xb[i]; d->t = d->tb[i]; d->m = d->mb[i]; d->w = d->wb[i]; d->band = d->bandb[i]; d->sdb = d->sideb[i]; d->um = d->umb[i]; }
 /* this GPU's z slab of a batch: rows of the [rows][P][P][P] arrays, planes [z0, z0 + g_Dl); mask halo planes from zeros */
 static void upload_slab(gpu_state *d, const batch *b, int i, int B, int P, int async) {
     void (*cp)(void *, const void *, size_t) = async ? nn_h2d_copy_stream : nn_h2d;
@@ -81,6 +85,7 @@ static void upload_slab(gpu_state *d, const batch *b, int i, int B, int P, int a
     }
     cp(d->wb[i], b->w, (size_t)B * NCH);
     if (g_aff) for (int n = 0; n < B; n++) cp(d->bandb[i] + n * l3, b->band + n * p3 + z0 * p2, l3);   /* halo planes too: partners of owned voxels */
+    if (g_side) for (int n = 0; n < B; n++) cp(d->sideb[i] + n * l3, b->side + n * p3 + z0 * p2, l3);   /* halo planes: masked at the loss */
 }
 /* synchronous upload (pageable host memory: validation batches) */
 static void upload(gpu_state *d, const batch *b, int B, int P) {
@@ -94,6 +99,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     nn_h2d(d->m, b->m, (size_t)B * p3);
     nn_h2d(d->w, b->w, (size_t)B * NCH);
     if (g_aff) nn_h2d(d->band, b->band, (size_t)B * p3);
+    if (g_side) nn_h2d(d->sdb, b->side, (size_t)B * p3);
 }
 /* asynchronous upload of a pinned sampler batch into buffer i on the copy stream, after the compute that last used it */
 static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
@@ -110,6 +116,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
         nn_h2d_copy_stream(d->mb[i], b->m, (size_t)B * p3);
         nn_h2d_copy_stream(d->wb[i], b->w, (size_t)B * NCH);
         if (g_aff) nn_h2d_copy_stream(d->bandb[i], b->band, (size_t)B * p3);
+        if (g_side) nn_h2d_copy_stream(d->sideb[i], b->side, (size_t)B * p3);
     }
     nn_event_record(d->ev_up[i], 1);
 }
@@ -289,6 +296,16 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         free(h);
     }
     if (g_aff) nn_aff_loss_async(lg, os, 1 + g_verso, d->band, g_aff_off, dice_w, g_aff_lambda, train ? d->gl : nullptr, d->aff_fin);
+    if (g_side) {   /* recto / verso side: BCE over known papyrus voxels (B == 1); split: halo planes are the other GPU's */
+        const size_t l3 = (size_t)os.d * os.h * os.w, eb = g_g16 ? 2 : 4, le = unet_logits_h16(d->u) ? 2 : 4;
+        nn_side_targets(d->sdb, l3, d->sidet, d->sidem);
+        if (d->side == 0) nn_zero(d->sidem + l3 - (size_t)g_h0 * P * P, (size_t)g_h0 * P * P);
+        else if (d->side == 1) nn_zero(d->sidem, (size_t)g_h0 * P * P);
+        const shape5 one = {1, 1, os.d, os.h, os.w};
+        nn_loss_async_tol((const float *)((const char *)lg + g_side_ch * l3 * le), d->sidet, d->sidem, d->sidew, one, 0.f,
+                          train ? (float *)((char *)d->gl + g_side_ch * l3 * eb) : nullptr, d->sscratch, nullptr);
+        if (train && g_side_lambda != 1.f) nn_loss_grad_scale((char *)d->gl + g_side_ch * l3 * eb, l3, g_side_lambda);
+    }
     sheet_objective(d,os,P,train);
     if (prof) nn_prof_end();
 }
@@ -303,6 +320,8 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
         for (int k = 0; k < g_aff_off.K; k++) d->aff_loss += d->aff_out[k * 6] + dice_w * d->aff_out[k * 6 + 1];
         d->aff_loss *= g_aff_lambda / g_aff_off.K;
     }
+    d->side_loss = 0;
+    if (g_side) { nn_loss_fetch(d->sscratch, (shape5){1, 1, 1, 1, 1}, d->sout); d->side_loss = g_side_lambda * d->sout[0]; }
     d->verso_loss = 0;
     if (g_verso_on) {   /* the recto loss ran as a single-channel call: lay its parts out as the NCH-channel fetch does */
         float r[3]; nn_loss_fetch(d->scratch, (shape5){1, 1, 1, 1, 1}, r);
@@ -314,7 +333,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     double loss = 0; int active = 0;
     if (g_aff) cout = NCH;
     for (int c = 0; c < cout; c++) if (out[c] > 0 || out[cout + c] > 0) { loss += out[c] + dice_w * out[cout + c]; active++; }
-    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss+d->verso_loss;
+    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss+d->verso_loss+d->side_loss;
 }
 
 /* --split z: forward, loss and backward of one window on both GPUs (src/split.h) */
@@ -393,6 +412,12 @@ int cmd_train(int argc, char **argv) {
     if (g_verso) {
         if (B != 1 || geometry || strcmp(task,"surface_winding")==0) { fprintf(stderr,"--verso: B=1, not with the winding task\n"); return 2; }
         if (g_aff) g_cout = 2 + g_aff_off.K;   /* recto, verso, affinities */
+    }
+    g_side = atoi(opt(argc,argv,"--side","0")); g_side_lambda = (float)atof(opt(argc,argv,"--side-lambda","1"));
+    if (g_side) {
+        if (!g_aff) { fprintf(stderr,"--side needs --task band_affinity (side labels come from the band sources)\n"); return 2; }
+        g_side_ch = g_cout++;   /* the last output channel */
+        fprintf(stderr, "side: channel %d, lambda %g, air <= %s\n", g_side_ch, g_side_lambda, opt(argc,argv,"--side-air","0"));
     }
     if (sheet_ck<0 || (strcmp(task,"surface") && strcmp(task,"surface_winding") && !g_aff) || (!strcmp(task,"surface_winding") != (geometry!=nullptr)) ||
         (sheet_ck && (!geometry || sheet_init)) || (geometry && resume && !sheet_ck && !sheet_init) || (sheet_init && (!geometry || !resume))) {
@@ -503,7 +528,7 @@ int cmd_train(int argc, char **argv) {
     if (atoi(opt(argc, argv, "--rotonly", "0"))) sc.augment = 2;   /* proper rotations only (no reflections) */
     if (atoi(opt(argc, argv, "--zfix", "0"))) sc.augment = 3;      /* diagnostic: symmetries that keep the z axis */
     if (atoi(opt(argc, argv, "--intonly", "0"))) sc.augment = 4;   /* diagnostic: intensity jitter, no symmetry */
-    sc.band = g_aff;
+    sc.band = g_aff; sc.side = g_side; sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
     sc.ct_augment = atoi(opt(argc, argv, "--ct-aug", "0"));
     sc.symmetry_p = (float)atof(opt(argc, argv, "--symmetry-p", "1"));
     sc.axis_jitter = (float)atof(opt(argc, argv, "--axis-jitter", "0"));
@@ -620,7 +645,10 @@ int cmd_train(int argc, char **argv) {
                     rows[0] = 0; rows[1] = g_verso_zero ? -1 : 0;
                     for (int co = 2; co < cfg.cout; co++) rows[co] = dc.cout == cfg.cout ? co : co - 1 < dc.cout ? co - 1 : -1;
                     if (dc.cout == cfg.cout && g_aff) { fprintf(stderr, "--verso --init-from: %s already has %d outputs; use --resume\n", init_from, dc.cout); return 1; } }
-                const int nt = g_verso ? unet_init_from_map(d->u, init_from, rows) : unet_init_from(d->u, init_from);
+                const char *hm = opt(argc, argv, "--head-map", nullptr);   /* explicit donor row per output channel (-1 fresh), e.g. 0,2,3,4,5,6,7,-1 */
+                if (hm) { int k = 0; char *t = strdup(hm); for (char *q = strtok(t, ","); q && k < 16; q = strtok(nullptr, ",")) rows[k++] = atoi(q); free(t);
+                    if (k != cfg.cout) { fprintf(stderr, "--head-map has %d rows, the network %d outputs\n", k, cfg.cout); return 2; } }
+                const int nt = g_verso || hm ? unet_init_from_map(d->u, init_from, rows) : unet_init_from(d->u, init_from);
                 if (nt < 0) { fprintf(stderr, "cannot initialise from %s\n", init_from); return 1; }
                 if (g == 0) fprintf(stderr, "initialised %d layer tensors from %s (the rest fresh)\n", nt, init_from);
             }
@@ -773,6 +801,12 @@ int cmd_train(int argc, char **argv) {
             d->bandb[0] = nn_malloc((size_t)B * p3); d->bandb[1] = lean ? d->bandb[0] : nn_malloc((size_t)B * p3);
             d->aff_fin = nn_malloc(nn_aff_scratch(g_aff_off.K)); d->band = d->bandb[d->cur];
         }
+        if (g_side) {
+            d->sideb[0] = nn_malloc((size_t)B * p3); d->sideb[1] = lean ? d->sideb[0] : nn_malloc((size_t)B * p3); d->sdb = d->sideb[d->cur];
+            d->sidet = nn_malloc((size_t)B * p3); d->sidem = nn_malloc((size_t)B * p3);
+            d->sidew = nn_malloc(1); static const uint8_t one_w = 1; nn_h2d(d->sidew, &one_w, 1);
+            d->sscratch = nn_malloc(nn_loss_scratch((shape5){1, 1, P, P, P}) + 64);
+        }
         d->scratch = nn_malloc(nn_loss_scratch((shape5){B, NCH, P, P, P}) + 64);
         d->tolc = nn_get_loss_tol() ? nn_malloc((size_t)B * p3) : nullptr;
         d->lean = lean;
@@ -801,6 +835,10 @@ int cmd_train(int argc, char **argv) {
     if (g_verso) {   /* channel 1 = verso; band affinities (if any) follow at 2.. */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
         snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"verso\":{\"version\":1,\"channel\":1,\"target\":\"%s recto channel with the radial input reversed\",\"start_step\":%d}}",g_verso_self?"live":"frozen starting weights",g_verso_start);
+    }
+    if (g_side) {   /* the last channel: recto / verso side of the nearest labelled recto (src/band.h) */
+        size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"side\":{\"version\":1,\"channel\":%d,\"positive\":\"recto side (outward of the nearest labelled recto)\",\"air\":%d,\"lambda\":%.9g}}",g_side_ch,sc.side_air,g_side_lambda);
     }
     if (g_sheet) {
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
@@ -852,6 +890,7 @@ int cmd_train(int argc, char **argv) {
         val[i].w = malloc((size_t)B * NCH); memcpy(val[i].w, b->w, (size_t)B * NCH);
         val[i].um = malloc((size_t)B * sizeof(float)); memcpy(val[i].um, b->um, (size_t)B * sizeof(float));
         if (g_aff) { val[i].band = malloc((size_t)B * p3); memcpy(val[i].band, b->band, (size_t)B * p3); }
+        if (g_side) { val[i].side = malloc((size_t)B * p3); memcpy(val[i].side, b->side, (size_t)B * p3); }
         val[i].sheet=calloc((size_t)B,sizeof *val[i].sheet); val[i].sheet[0]=sheet_clone(b->sheet?b->sheet[0]:nullptr);
         sampler_release(vs, b);
     }
@@ -881,7 +920,7 @@ int cmd_train(int argc, char **argv) {
     int committed_step = step0, training_failed = 0;
     double best_val = 1e30; int nskip = 0; (void)nskip;
     float parts[8][2 * NCH + 1];
-    double acc_vbce = 0, acc_vdice = 0;   /* verso channel */
+    double acc_vbce = 0, acc_vdice = 0, acc_side = 0;   /* verso channel, side channel */
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
         g_verso_on = g_verso && step >= g_verso_start;
         { uint64_t h = (uint64_t)step * 0x9E3779B97F4A7C15ull + (uint64_t)seed; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
@@ -1053,6 +1092,7 @@ int cmd_train(int argc, char **argv) {
             (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
         acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][g_aff ? NCH : cfg.cout]; acc_g += gn; nacc++;
         if (g_verso_on) { acc_vbce += G[0].vout[0]; acc_vdice += G[0].vout[1]; }
+        if (g_side) acc_side += G[0].sout[0];
         if (step % log_every == 0 || step == steps || g_stop) {
             double dt = now() - tlog;
             double vl = -1, vb = 0, vd = 0;
@@ -1084,15 +1124,16 @@ int cmd_train(int argc, char **argv) {
                 snprintf(vstr, sizeof vstr, "%.5f,%.5f,%.5f", vl, vb, vd);
                 if (nval && vl < best_val) { best_val = vl; char bp[1400]; snprintf(bp, sizeof bp, "%s/best.ckpt", out); if (unet_save(G[0].u, bp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", bp); return 1; } }
             }
-            char affs[160] = "";
+            char affs[200] = "";
             if (g_verso) snprintf(affs, 64, " verso bce %.4f dice %.4f", acc_vbce / nacc, acc_vdice / nacc);
+            if (g_side) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " side bce %.4f", acc_side / nacc); }
             if (g_aff) { const float *a = G[0].aff_out; size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " aff %.4f (d1 bce %.3f dice %.3f | d8 bce %.3f dice %.3f)", G[0].aff_loss,
                                     (a[0] + a[6] + a[12]) / 3, (a[1] + a[7] + a[13]) / 3, (a[18] + a[24] + a[30]) / 3, (a[19] + a[25] + a[31]) / 3); }
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %s %.2f samp/s (wait %.0f%%)%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, affs, acc_g / nacc,
                     vl >= 0 ? "val" : "", (double)nacc * B * nl / dt, 100 * wait / dt, vl >= 0 ? vstr : "");
             if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, active, acc_g / nacc, vstr, (double)nacc * B * nl / dt, wait); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
-            acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = 0; nacc = 0; tlog = now(); wait = 0;
+            acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = 0; nacc = 0; tlog = now(); wait = 0;
         }
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);

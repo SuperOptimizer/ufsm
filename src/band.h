@@ -19,6 +19,12 @@ typedef struct {
    Returns 0, or -1 when out of memory. Neighbourhoods are limited to the array: callers pass a halo of at least
    (radius + span) / 2 + 2 label voxels and crop. */
 int band_field(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out);
+/* the same plus the side of every known voxel relative to its nearest labelled recto: SIDE_RECTO outward of it (away from the
+   umbilicus, the papyrus behind the recto face and the inner half of the gap beyond it), SIDE_VERSO inward (the outer half of the
+   gap before it), SIDE_UNKNOWN where the band is unknown. Going outward the side turns VERSO -> RECTO exactly at each labelled
+   recto face and RECTO -> VERSO midway between consecutive rectos: a dense two-class label whose boundaries are the sheets. */
+enum { SIDE_VERSO = 0, SIDE_RECTO = 1, SIDE_UNKNOWN = 255 };
+int band_field_side(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out, uint8_t *side);
 
 /* modular difference of band / winding steps in (-126, 126] */
 static inline int band_diff(int a, int b) { int d = ((a - b + 126) % 252 + 252) % 252; return d - 126; }
