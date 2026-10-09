@@ -130,6 +130,23 @@ __global__ void __launch_bounds__(256) up2_mx_tile_k(const uint8_t *x, uint8_t *
         mx_store_row_b<BY>(y, mx_sc<BY>(y, N, C, So), (size_t)nbk * So + ((size_t)oz * Ho + oy) * Wo + ox, bw, acc);
     }
 }
+/* y += x for two MX tensors of the same format (rows re-encoded; sr != 0: exact stochastic rounding keyed by sr) */
+template <int B> __global__ void add_mx_k(uint8_t *y, const uint8_t *x, int N, int C, size_t S, unsigned sr) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * mx_nb(C) * S) return;
+    const int bw = mx_bw(C);
+    float a[32], b[32];
+    mx_load_row_b<B>(y, mx_sc<B>(y, N, C, S), i, bw, a); mx_load_row_b<B>(x, mx_sc<B>(x, N, C, S), i, bw, b);
+#pragma unroll
+    for (int k = 0; k < 32; k++) a[k] += b[k];
+    mx_store_row_b<B>(y, mx_sc<B>(y, N, C, S), i, bw, a, sr);
+}
+extern "C" void lp_add_mx(void *y, const void *x, shape5 s, int dt, unsigned sr) {
+    const size_t S = shape_spatial(s), rows = (size_t)s.n * mx_nb(s.c) * S;
+    if (dt == 4) add_mx_k<4><<<nblk_(rows, 256), 256>>>((uint8_t *)y, (const uint8_t *)x, s.n, s.c, S, sr);
+    else add_mx_k<8><<<nblk_(rows, 256), 256>>>((uint8_t *)y, (const uint8_t *)x, s.n, s.c, S, sr);
+    LPCK();
+}
 extern "C" void lp_up2_fwd_mx(const void *x, int xdt, shape5 xs, void *y, int ydt, gnp_t gp) {
     const size_t So = 8 * shape_spatial(xs);
     const dim3 grid(nblk_(So, 256), (unsigned)(xs.n * mx_nb(xs.c)));

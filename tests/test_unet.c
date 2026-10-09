@@ -56,6 +56,7 @@ int main(void) {
     cfg.down_norm = getenv("UFSM_DOWN_NORM") ? atoi(getenv("UFSM_DOWN_NORM")) : 0;
     if (getenv("UFSM_TINY")) { cfg.nlev = 0; char *t = strdup(getenv("UFSM_TINY")); for (char *q = strtok(t, ","); q; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); }
     cfg.scale_cond = getenv("UFSM_SCALE_COND") ? atoi(getenv("UFSM_SCALE_COND")) : 0;   /* voxel-size conditioning: also check its vector */
+    if (getenv("UFSM_ENC_BLOCKS")) { char *t = strdup(getenv("UFSM_ENC_BLOCKS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.enc_blocks[l++] = atoi(q); free(t); }
     if (getenv("UFSM_DEC_WIDTHS")) { char *t = strdup(getenv("UFSM_DEC_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.dec_widths[l++] = atoi(q); free(t); }   /* narrower decoder levels */
     unet *u = unet_create(&cfg);
     unet_init(u, 1);
@@ -135,6 +136,7 @@ int main(void) {
     nn_set_tf32(getenv("UFSM_FP32") ? 0 : 1);
     unet_cfg big = {4, {16, 32, 64, 80}, 4, 1, 8};
     big.down_norm = cfg.down_norm;
+    if (getenv("UFSM_BIG_ENC_BLOCKS")) { char *t = strdup(getenv("UFSM_BIG_ENC_BLOCKS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) big.enc_blocks[l++] = atoi(q); free(t); }
     if (getenv("UFSM_BIG_DEC_WIDTHS")) { char *t = strdup(getenv("UFSM_BIG_DEC_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) big.dec_widths[l++] = atoi(q); free(t); }   /* narrower decoder levels */
     unet *b = unet_create(&big);
     unet_init(b, 2);

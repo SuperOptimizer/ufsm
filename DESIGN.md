@@ -92,6 +92,22 @@ ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or
   ridge mask along z and the in-plane tangent (perpendicular to the radial direction) by 2 label voxels: 1.24 (merge 1.08 ->
   0.85, ARAND 0.50 -> 0.63; 4 and 8 voxels over-split).
 
+- Residual coarse blocks (plan A): `unet_cfg.enc_blocks` / `train --enc-blocks 0,0,2,3,3,3` adds pre-activation residual blocks
+  after encoder level i >= 1: x_k = x_{k-1} + conv2(silu(gn1(conv1(silu(gn(x_{k-1})))))), gn(x_{k-1}) the previous block's
+  output normalisation applied in conv1's staging (the down_norm input path); a2 holds the sum, its statistics taken after
+  `nn_add_into` (new MX / 16-bit / fp32 elementwise add, fp4 with exact SR). The last block's output is the level's skip,
+  down-conv input and bottom. Backward: block_bwd(pre, gid, save): the tensor-core chain backpropagates each block's input
+  GroupNorm inside it, so the block before takes d/d a2 directly (pre) and the saved identity gradient (gres per level) is
+  added after; the fp32 path adds it after the GroupNorm backward instead. Parameters appended last (header "enc_blocks");
+  fresh blocks start as the identity (zero conv2) and take the level's output normalisation on --init-from: a net warm-started
+  from verso3 with 7 blocks gives byte-identical logits. The coarse-skip offload is off with residual blocks. Desk mode
+  (512^3): [0,0,1,1,1,1] 86.6 B/voxel / 15.7M params, [0,0,2,3,3,3] 88.8 / 24.7M, [0,0,3,5,5,5] 91.0 / 33.8M (78.5 / 11.0M
+  without). test_unet (UFSM_ENC_BLOCKS, UFSM_RB_NONZERO: finite differences with non-zero residual weights; UFSM_BIG_ENC_BLOCKS
+  tensor-core agreement), test_split case 37 (desk mode, levels 1-3 at 1/2/2). Found on the way: the fp4 weight memo keyed
+  convs by (layer, conv, pass) and compared a scratch pointer on the backward-data path, so convs sharing a layer id read each
+  other's prepared weights (here: enc[i].c2's backward used the zero residual conv2: zero gradients below every level);
+  the key now carries a block id (nn_set_block, WMEMO_N 4096).
+
 ## Memory and inference defaults (2026-10-08)
 
 - Training stores the MX activation gradients as MX-fp4 with exact stochastic rounding by default when every width is a

@@ -364,6 +364,24 @@ __global__ void fill_unl_k(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i < n && !m[i] && vm[i]) { t[i] = src[i]; m[i] = 1; }
 }
+template <typename T> __global__ void add_into_k(T *y, const T *x, size_t n) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) y[i] = f2h<T>((float)y[i] + (float)x[i]);
+}
+/* y += x in y's storage: MX when registered (both tensors in the same format; fp4 with stochastic rounding when SR is on),
+   else 16-bit (h16 1: fp16 or bf16 by the 16-bit mode) or fp32 */
+extern "C" void nn_add_into(void *y, const void *x, shape5 s, int h16) {
+    const int dt = nn_storage(y);
+    if (dt == 4 || dt == 8) {
+        if (nn_storage(x) != dt) { fprintf(stderr, "nn_add_into: operands in different MX formats (%d, %d)\n", dt, nn_storage(x)); abort(); }
+        lp_add_mx(y, x, s, dt, dt == 4 && sr_on() ? sr_seed() : 0u); return;
+    }
+    const size_t n = shape_numel(s);
+    if (!h16) add_into_k<float><<<nblk(n, 256), 256>>>((float *)y, (const float *)x, n);
+    else if (g_h16) add_into_k<f16><<<nblk(n, 256), 256>>>((f16 *)y, (const f16 *)x, n);
+    else add_into_k<bf16><<<nblk(n, 256), 256>>>((bf16 *)y, (const bf16 *)x, n);
+    KCHECK();
+}
 __global__ void side_tg_k(const uint8_t *s, size_t n, uint8_t *t, uint8_t *m) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i < n) { const uint8_t v = s[i]; t[i] = v == 1 ? 255 : 0; m[i] = v <= 1; }

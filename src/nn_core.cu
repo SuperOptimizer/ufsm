@@ -52,7 +52,9 @@ unsigned sr_seed(void) {
 extern "C" void nn_set_sr(int on) { g_sr = on; }
 extern "C" void nn_set_sr_step(unsigned step) { g_sr_step = step; g_sr_ctr = 0; lp_wmemo_step(step); }
 extern "C" void nn_wmemo_clear(void) { lp_wmemo_clear(); }
-unsigned conv_wkey(void) { return g_layer >= 0 ? (unsigned)((g_layer * 2 + (g_sub > 0 ? g_sub : 0)) * 4 + g_pass + 1) : 0u; }
+int g_block = 0;   /* nn_set_block: several convs under one layer id (residual blocks) memoise their weights apart */
+extern "C" void nn_set_block(int blk) { g_block = blk < 0 ? 0 : blk > 15 ? 15 : blk; }
+unsigned conv_wkey(void) { return g_layer >= 0 ? (unsigned)((g_layer * 2 + (g_sub > 0 ? g_sub : 0)) * 4 + g_pass + 1 + 256 * g_block) : 0u; }
 signed char g_lprec3[NN_MAXLAYER][2][3];
 extern "C" void nn_set_conv(int sub) { g_sub = sub; }
 extern "C" int nn_get_layer(void) { return g_layer; }

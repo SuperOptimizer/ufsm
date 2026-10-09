@@ -83,6 +83,7 @@ int nn_set_prec_policy(const char *policy);   /* see nn.cu: block names, enc1.c2
    nn_set_conv tags the conv within the current layer (0 = c1, 1 = c2, -1 = untagged); nn_set_conv_prec sets the
    (forward, backward-data, weight-gradient) precisions of conv sub (-1 = both) of layer id (0 = follow the layer). */
 void nn_set_conv(int sub);
+void nn_set_block(int blk);   /* 0..15: which of several convs under one layer id (residual blocks); part of the weight-memo key */
 int nn_get_layer(void);
 int nn_get_conv(void);
 void nn_set_conv_prec(int id, int sub, int p_fwd, int p_bwd_data, int p_wgrad);
@@ -291,6 +292,7 @@ void nn_prob_u8(const float *logits, size_t n, uint8_t *out, float hard);   /* o
    p >= p at +-1 and +-2 steps along the direction, nearest-voxel sampling), else 0 */
 void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out);
 void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n);
+void nn_add_into(void *y, const void *x, shape5 s, int h16);   /* y += x in y's storage (MX by registration, else 16-bit or fp32) */
 void nn_side_targets(const uint8_t *side, size_t n, uint8_t *t, uint8_t *m);   /* band.h SIDE_* labels -> loss target (recto 255, verso 0) and mask (known) */   /* where m == 0 and vm != 0: t = src, m = 1 */
 /* inference: network input from the uint8 CT window on the device (z-score + radial channels; 16-bit storage when h16),
    and recto probability * 255 (0 where the CT is 0) from the logits */

@@ -104,6 +104,11 @@ static void segs_build(const unet_cfg *cfg) {
 #undef DW
     off = addconv("head", w[0], cfg->cout, 1, off);
     if (cfg->down_norm) for (int i = 0; i < L - 1; i++) { snprintf(b, 24, "dn%d", i); off = addgn(b, w[i], off); }
+    if (cfg->scale_cond) off = addseg("scale", off, w[0]);
+    for (int i = 0; i < L; i++) for (int k = 0; k < cfg->enc_blocks[i]; k++) {   /* residual blocks, appended last */
+        snprintf(b, 24, "rb%d.%d.c1", i, k); off = addconv(b, w[i], w[i], 3, off); snprintf(b, 24, "rb%d.%d.n1", i, k); off = addgn(b, w[i], off);
+        snprintf(b, 24, "rb%d.%d.c2", i, k); off = addconv(b, w[i], w[i], 3, off); snprintf(b, 24, "rb%d.%d.n2", i, k); off = addgn(b, w[i], off);
+    }
 }
 static double rel(const float *a, const float *b, size_t off, size_t n) {
     double d2 = 0, r2 = 0;
@@ -146,7 +151,8 @@ int main(void) {
     setenv("UFSM_F4_WGRAD", "1", 0);   /* as train --fp4 2: fp4 weight gradients where the policy asks for them */
     split_ctx *ctx = split_create(DEV[0], DEV[1]);
     size_t np = 0;   /* host gradients sized for the widest case (the trainer-default widths, down_norm) */
-    { unet_cfg wc = {4, {32, 64, 96, 128}, 4, NCH, 8, 1}; unet *probe = unet_create(&wc); np = unet_nparams(probe); unet_free(probe); }
+    { unet_cfg wc = {4, {32, 64, 96, 128}, 4, NCH, 8, 1}; wc.enc_blocks[1] = 1; wc.enc_blocks[2] = 2; wc.enc_blocks[3] = 2;   /* (the residual case) */
+      unet *probe = unet_create(&wc); np = unet_nparams(probe); unet_free(probe); }
     float *g0 = malloc(np * 4), *g1 = malloc(np * 4), *g2 = malloc(np * 4);
     int fails = 0;
     printf("test_split: P %d B %d, level-0 halo %d planes, local depth %d%s\n", P, B, H0, Dl, DEV[0] == DEV[1] ? ", both halves on one GPU" : "");
@@ -165,6 +171,7 @@ int main(void) {
     cases[ncase++] = (tcfg){2, 1, 1, 2, 1, 2, 1};
     cases[ncase++] = (tcfg){2, 1, 1, 2, 1, 1, 1};
     cases[ncase++] = (tcfg){2, 1, 1, 2, 1, 2, 2};   /* the same with narrower decoder levels 1 and 2 (unet_cfg.dec_widths) */
+    cases[ncase++] = (tcfg){2, 1, 1, 2, 1, 2, 3};   /* the same with residual blocks at levels 1..3 (unet_cfg.enc_blocks) */
     for (int ci = 0; ci < ncase; ci++) {
         const tcfg c = cases[ci];
         if (getenv("UFSM_ONLY") && ci != atoi(getenv("UFSM_ONLY"))) continue;
@@ -177,9 +184,10 @@ int main(void) {
         static const unet_cfg base = {4, {16, 32, 64, 80}, 4, NCH, 8, 1}, desk = {4, {32, 64, 96, 128}, 4, NCH, 8, 1};
         cfg = c.desk ? desk : base;
         if (c.desk == 2) { cfg.dec_widths[1] = 32; cfg.dec_widths[2] = 64; }
+        if (c.desk == 3) { cfg.enc_blocks[1] = 1; cfg.enc_blocks[2] = 2; cfg.enc_blocks[3] = 2; }
         char tag[128]; snprintf(tag, sizeof tag, "%2d %s down_norm %d recompute %d%s%s%s%s", ci, fp4 == 0 ? "fp16  " : fp4 == 1 ? "fp4 rn" : "fp4 sr", dn, rc,
                                 c.chunk == 2 ? " chunk 2" : "", c.gmx ? " grad-mx8" : "", c.lean == 2 ? " lean 2" : c.lean ? " lean 1" : "",
-                                c.desk == 2 ? " +fp4 grads, offloads, decoder 32/64 at levels 1/2" : c.desk ? " +fp4 grads, offloads (train defaults)" : "");
+                                c.desk == 3 ? " +fp4 grads, offloads, residual blocks 1/2/2 at levels 1-3" : c.desk == 2 ? " +fp4 grads, offloads, decoder 32/64 at levels 1/2" : c.desk ? " +fp4 grads, offloads (train defaults)" : "");
         {
                 cfg.down_norm = dn; segs_build(&cfg);
                 { unet *pr = unet_create(&cfg); np = unet_nparams(pr); unet_free(pr); }
@@ -209,6 +217,10 @@ int main(void) {
                     int ok = dl < 3 * nl + 1e-3 && dg < 1.5 * ng + 1e-3 && wg < 1.5 * nw + 0.05;   /* + floor: some modes do not round stochastically (seeds identical) */
                     printf("  %s: loss %.6f vs %.6f (rel %.1e; seeds %.1e), grad rel %.3g (seeds %.3g), worst %s %.3g (seeds %s %.3g)  %s\n",
                            tag, lp, ls, dl, nl, dg, ng, wn, wg, wn2, nw, ok ? "ok" : "FAIL");
+                    if (getenv("UFSM_SEGS")) for (int i = 0; i < nseg; i++) {
+                        double a = 0, b = 0; for (size_t j = segs[i].off; j < segs[i].off + segs[i].len; j++) { a += (double)g1[j] * g1[j]; b += (double)g0[j] * g0[j]; }
+                        printf("      %-12s split |g| %.3e  single |g| %.3e  rel %.2e\n", segs[i].name, sqrt(a), sqrt(b), rel(g1, g0, segs[i].off, segs[i].len));
+                    }
                     fails += !ok;
                     if (c.desk) {   /* the memory layout (shared a1 + offload, input / skip offloads, A in a2) against separate
                                        buffers with the same rounding keys: the same arithmetic. A fixed logit gradient: without the

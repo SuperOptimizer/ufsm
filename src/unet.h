@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #define UNET_MAXLEV 8
+#define UNET_MAXCONV 160   /* 3^3 convs (encoder, down, decoder, residual blocks) */
 
 typedef struct {
     int nlev;
@@ -19,6 +20,9 @@ typedef struct {
     int dec_widths[UNET_MAXLEV];   /* decoder output channels per level (0 = widths[i]); <= widths[i] (multiples of 32 for MX storage), level 0 = widths[0]:
                                       a narrower coarse decoder upsamples fewer channels into the level below (dec[i].c1 reads
                                       dec_widths[i+1] + widths[i]) */
+    int enc_blocks[UNET_MAXLEV];   /* extra pre-activation residual blocks after encoder level i (levels >= 1; 0 = none): x_k = x_{k-1} +
+                                      conv2(silu(gn(conv1(silu(gn(x_{k-1})))))), widths[i] -> widths[i]; the last one's output is the level's
+                                      skip and down-conv input. Parameters appended last; a fresh block starts as the identity (zero conv2) */
 } unet_cfg;
 
 typedef struct unet unet;

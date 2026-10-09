@@ -56,6 +56,7 @@ void lp_cvt_e2m1_probe(const float *hv, unsigned char *ho, int n);   /* test pro
 /* MX elementwise ops: xdt / ydt = lp dtype of the operand (3 mx8, 4 mx4; gn_silu_apply also takes a plane-major 0 / 1 / 2 input);
    gradients (gy / gx, gdt) are never mx4 */
 void lp_gn_silu_apply_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, void *y, int ydt);
+void lp_add_mx(void *y, const void *x, shape5 s, int dt, unsigned sr);   /* y += x, MX (dt 4 / 8) */
 void lp_up2_fwd_mx(const void *x, int xdt, shape5 xs, void *y, int ydt, gnp_t gp);   /* gp: silu(gn(x)) upsampled */
 void lp_up2_fwd_mx_blocks(const void *x, int xdt, shape5 xs, int b0, int nbk, void *y, int ydt);   /* 32-channel blocks [b0, b0 + nbk) of x */
 void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp);
