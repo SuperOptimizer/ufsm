@@ -71,7 +71,12 @@ ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or
   (a0_share), so its A is the shared one. Desk widths, level 1 at 32: step -14% (laptop, GPU shared: 1001-1030 -> 861-872 ms;
   dec0.c1 222 -> 157 ms, dec1.c1 88 -> 40 ms), memory 78.5 -> 80.6 B/voxel, 10.96M -> 10.71M parameters. test_unet
   (finite differences, UFSM_DEC_WIDTHS / UFSM_BIG_DEC_WIDTHS) and test_split case 36 (desk mode, levels 1/2 at 32/64) pass.
-  Accuracy A/B pending (needs a fresh decoder: --init-from copies only shape-matching layers).
+  Accuracy A/B (laptop, from scratch on the Paris4 band block, cover x13 = 7048 steps, P256, Muon 0.01 WSD, seeds 1-2;
+  F1 / AUC per holdout box 48128 | 48512): control 0.242 / 0.239 | 0.277 / 0.278 (AUC 0.769-0.775 | 0.806-0.808), dec_widths
+  0,32 0.250 / 0.241 | 0.278 / 0.273 (AUC 0.768-0.775 | 0.805-0.808); FWHM equal (16.3-16.5 | 17.9-18.4); band VOI noisy
+  (control 2.48 / 2.48 | 1.29 / 1.42, narrow 2.41 / 1.90 | 1.07 / 1.67). Mean dF1 +0.005 | -0.002: within the seed spread at
+  -14% step time -> recommended for new runs (`--dec-widths 0,32`; a fresh decoder, not on resume). Side note: a net trained
+  from scratch on this one block next to the holdout matches the 37-scroll desk model there (locality, not missing data).
 
 - Side A/B (laptop, Paris4 band block cover x5 = 2738 steps, P256, warm start verso3 step 5000, Muon 0.005 / lr 5e-4 WSD;
   control = recto + affinities, side = + `--side 1 --side-air 80`), seed 1, box 48128: recto unchanged (F1 0.265 vs 0.261,
