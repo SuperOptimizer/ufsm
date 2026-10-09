@@ -83,6 +83,14 @@ ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or
   none (compressed sheets: the trace is an interpolation); the face position is not visible where the side boundary must
   be placed, the same limit that keeps the recto ridge wide. Laptop runs were sampler-bound (6 batches in flight with the
   band-field EDT per sample): `train --sampler-slots N`.
+- Continued (another 2738 steps, fresh optimizer, side loss x2): side accuracy 72.0 -> 75.4% (box 48128), 79.4% (box 48512);
+  pieces from it still merge (VOI 3.73 / 3.20); recto unchanged vs control (F1 0.266 / 0.289 vs 0.271 / 0.292). The recto F1
+  plateaus with more fine-tuning on the one band block (0.265 -> 0.271, 0.293 -> 0.292) while recto-cutoff VOI is noisy
+  (1.32 -> 1.92, 1.01 -> 1.23: one ridge gap anywhere merges whole windings). Side channel in this form: shelved.
+- Other extractions on control seed 1 (box 48128, VOI): winding affinities (offset 1 merges everything, 4.0; offset 8
+  "different" > 0.3: 1.91), seeded watershed on the recto ridges (2.4-4.2), recto cutoff 0.10 (1.34) plus a closing of the
+  ridge mask along z and the in-plane tangent (perpendicular to the radial direction) by 2 label voxels: 1.24 (merge 1.08 ->
+  0.85, ARAND 0.50 -> 0.63; 4 and 8 voxels over-split).
 
 ## Memory and inference defaults (2026-10-08)
 
