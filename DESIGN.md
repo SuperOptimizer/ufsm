@@ -33,6 +33,25 @@ No teacher models, no distillation. All upstream data is re-exported once into t
   decoders' conv2 bottom-up. Desk mode 108.6 -> 91.6 B per level-0 voxel (12.3 GB at 512^3, ~6.9 GB per desk GPU's
   split slab); +0.4% step (the skip's copy queued before the encoders' a1 copies stalled dec[1]'s forward: +3%).
   `--mem auto` now runs a 512^3 window at recompute 1 on a 16 GB GPU (13.6 GB peak).
+- The coarse levels' gradient buffers gout[1..] (up-part and skip gradients) live at the end of dec[0].a2's buffer, dead from
+  the end of dec[0]'s backward to enc[0]'s conv2 backward-data; gout[1], also written in dec[0]'s backward (the sliced weight
+  gradient's coarse silu(gn(a2)), the up-part gradient), sits at the end of dec[0].a1's buffer there (dead after dec[0]'s GN1
+  backward) and is copied over before that buffer takes the encoder's a1 back (desk slab 0.32 GB of device copy). Same
+  gradients as own buffers (test_grad_mx4, test_split), no measurable step time (P 384 medians within 0.5 ms either order).
+  Desk mode 91.6 -> 86.4 B per level-0 voxel: 512^3 12.30 -> 11.60 GB, desk split slab 6.92 -> 6.53 GB.
+  `UFSM_COARSE_GRAD_SHARE=0` off.
+- The down-conv outputs (read by the next encoder's conv1 and its backward) sit below them in dec[0].a2's buffer (above the
+  input it holds first), with a pinned host copy from that conv1 to dec[0]'s backward (desk slab 0.21 GB each way; back ahead
+  of the encoders' a1). Same gradients, fresh and repeated backward; P 384 step +0.2% (ABBA medians). Desk mode 86.4 -> 83.7 B
+  per level-0 voxel: 512^3 11.23 GB, desk split slab 6.32 GB. `UFSM_DOWN_OFFLOAD=0` off.
+- test_split runs on one GPU when there is only one (both halves take turns on the host anyway; the halo streams / events,
+  the split config and the double-sum scratch are kept per half). New cases with the trainer's defaults (MX-fp4 gradients,
+  the a1 / input / skip offloads, the shared gradient buffers): split vs one GPU at the rounding-seed noise, and the memory
+  layout vs separate buffers with a fixed logit gradient within 1e-8, split and one GPU. MX-fp4 gradients are not bitwise
+  reproducible: now and then (~1 in 7 identical steps here) a last-bit difference of an atomic sum flips a stochastic rounding
+  and the change spreads to the seed-noise level; both outcomes are equally far from MX-fp8 gradients (0.078 rel).
+- train: the MX-fp4 gradient default needs --fp4 2 and no --policy (the fp8 weight gradients of --fp4 1 took no MX-fp4 gy and
+  aborted).
 - Before / after the memory work (ac690ae vs now, laptop, same profiler): training steps at P 384 in the desk mode
   ~823 -> ~815 ms (fp8 -> fp4 gradients included); inference forward at 288^3 unchanged (~93 ms); predict over 8
   shards 6.35 -> 5.28 s of GPU time, wall 6.7 -> 5.9 s.
