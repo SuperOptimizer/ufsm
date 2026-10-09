@@ -99,7 +99,9 @@ static void segs_build(const unet_cfg *cfg) {
     const int *w = cfg->widths, L = cfg->nlev; size_t off = 0; char b[24]; nseg = 0;
     for (int i = 0; i < L; i++) { int ci = i ? w[i - 1] : cfg->cin; snprintf(b, 24, "enc%d.c1", i); off = addconv(b, ci, w[i], 3, off); snprintf(b, 24, "enc%d.n1", i); off = addgn(b, w[i], off); snprintf(b, 24, "enc%d.c2", i); off = addconv(b, w[i], w[i], 3, off); snprintf(b, 24, "enc%d.n2", i); off = addgn(b, w[i], off); }
     for (int i = 0; i < L - 1; i++) { snprintf(b, 24, "down%d", i); off = addconv(b, w[i], w[i], 3, off); }
-    for (int i = L - 2; i >= 0; i--) { int ci = w[i] + w[i + 1]; snprintf(b, 24, "dec%d.c1", i); off = addconv(b, ci, w[i], 3, off); snprintf(b, 24, "dec%d.n1", i); off = addgn(b, w[i], off); snprintf(b, 24, "dec%d.c2", i); off = addconv(b, w[i], w[i], 3, off); snprintf(b, 24, "dec%d.n2", i); off = addgn(b, w[i], off); }
+#define DW(i) ((i) < L - 1 && cfg->dec_widths[i] ? cfg->dec_widths[i] : w[i])   /* decoder widths (narrow coarse levels) */
+    for (int i = L - 2; i >= 0; i--) { int ci = w[i] + DW(i + 1), co = DW(i); snprintf(b, 24, "dec%d.c1", i); off = addconv(b, ci, co, 3, off); snprintf(b, 24, "dec%d.n1", i); off = addgn(b, co, off); snprintf(b, 24, "dec%d.c2", i); off = addconv(b, co, co, 3, off); snprintf(b, 24, "dec%d.n2", i); off = addgn(b, co, off); }
+#undef DW
     off = addconv("head", w[0], cfg->cout, 1, off);
     if (cfg->down_norm) for (int i = 0; i < L - 1; i++) { snprintf(b, 24, "dn%d", i); off = addgn(b, w[i], off); }
 }
@@ -162,6 +164,7 @@ int main(void) {
        and skip offloads, every decoder level's gradient buffer in its a2's buffer */
     cases[ncase++] = (tcfg){2, 1, 1, 2, 1, 2, 1};
     cases[ncase++] = (tcfg){2, 1, 1, 2, 1, 1, 1};
+    cases[ncase++] = (tcfg){2, 1, 1, 2, 1, 2, 2};   /* the same with narrower decoder levels 1 and 2 (unet_cfg.dec_widths) */
     for (int ci = 0; ci < ncase; ci++) {
         const tcfg c = cases[ci];
         if (getenv("UFSM_ONLY") && ci != atoi(getenv("UFSM_ONLY"))) continue;
@@ -170,12 +173,13 @@ int main(void) {
         if (fp4) { unet_set_act_mx4(1); nn_set_sr(fp4 == 2); if (nn_set_prec_policy(getenv("UFSM_TEST_POLICY") ? getenv("UFSM_TEST_POLICY") : "all=fp4:fp4:fp4,enc0.c1=fp16")) return 2; }
         else { unet_set_act_mx4(0); nn_set_sr(0); nn_set_prec_policy(""); }
         unet_set_chunk_up(c.chunk); unet_set_grad_mx8(c.gmx); unet_set_lean(c.lean);
-        unet_set_grad_mx4(c.desk); unet_set_share_enc_a1(c.desk);
+        unet_set_grad_mx4(c.desk != 0); unet_set_share_enc_a1(c.desk != 0);
         static const unet_cfg base = {4, {16, 32, 64, 80}, 4, NCH, 8, 1}, desk = {4, {32, 64, 96, 128}, 4, NCH, 8, 1};
         cfg = c.desk ? desk : base;
+        if (c.desk == 2) { cfg.dec_widths[1] = 32; cfg.dec_widths[2] = 64; }
         char tag[128]; snprintf(tag, sizeof tag, "%2d %s down_norm %d recompute %d%s%s%s%s", ci, fp4 == 0 ? "fp16  " : fp4 == 1 ? "fp4 rn" : "fp4 sr", dn, rc,
                                 c.chunk == 2 ? " chunk 2" : "", c.gmx ? " grad-mx8" : "", c.lean == 2 ? " lean 2" : c.lean ? " lean 1" : "",
-                                c.desk ? " +fp4 grads, offloads (train defaults)" : "");
+                                c.desk == 2 ? " +fp4 grads, offloads, decoder 32/64 at levels 1/2" : c.desk ? " +fp4 grads, offloads (train defaults)" : "");
         {
                 cfg.down_norm = dn; segs_build(&cfg);
                 { unet *pr = unet_create(&cfg); np = unet_nparams(pr); unet_free(pr); }

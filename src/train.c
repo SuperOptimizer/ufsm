@@ -348,7 +348,7 @@ static void split_job(int side, void *a) {
 int cmd_train(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 512] [--B 1] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
-                        "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
+                        "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12] [--sampler-slots N] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--val-batches 8] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--srste 2e-4] [--pos-weight 1] [--tol 0..2] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
@@ -504,7 +504,9 @@ int cmd_train(int argc, char **argv) {
     cfg.down_norm = atoi(opt(argc, argv, "--down-norm", "0"));
     cfg.scale_cond = atoi(opt(argc, argv, "--scale-cond", "0"));   /* voxel-size conditioning of the stem (unet_set_scale per batch) */
     if (cfg.scale_cond && B != 1) { fprintf(stderr, "--scale-cond needs --B 1 (one voxel size per forward)\n"); return 2; }
-    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.down_norm = pc.down_norm; cfg.scale_cond = pc.scale_cond; } }   /* the checkpoint decides */
+    { const char *dw = opt(argc, argv, "--dec-widths", nullptr);   /* narrower coarse decoder levels (0 = encoder width), e.g. 0,32 */
+      if (dw) { char *t = strdup(dw); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.dec_widths[l++] = atoi(q); free(t); } }
+    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.down_norm = pc.down_norm; cfg.scale_cond = pc.scale_cond; memcpy(cfg.dec_widths, pc.dec_widths, sizeof cfg.dec_widths); } }   /* the checkpoint decides */
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,80")); cfg.nlev = 0; for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "P must be divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
     const int split = !strcmp(opt(argc, argv, "--split", "0"), "z");
@@ -522,7 +524,7 @@ int cmd_train(int argc, char **argv) {
     sources *S = sources_load(src);
     if (!S) return 1;
     sample_cfg sc = sample_cfg_default();
-    sc.P = P; sc.B = B; sc.nworkers = workers; sc.nbuf = 4 * ng + 2; sc.seed = seed; sc.xfmt = g_xfmt;
+    sc.P = P; sc.B = B; sc.nworkers = workers; sc.nbuf = atoi(opt(argc, argv, "--sampler-slots", "0")) > 0 ? atoi(opt(argc, argv, "--sampler-slots", "0")) : 4 * ng + 2;   /* batches in flight (each worker fills one; pinned memory per slot) */ sc.seed = seed; sc.xfmt = g_xfmt;
     sc.deterministic = atoi(opt(argc, argv, "--det", "0"));   /* same batches for the same seed regardless of thread timing (paired comparisons; off: a slow worker can stall the ring) */
     if (noaug) sc.augment = 0;
     if (atoi(opt(argc, argv, "--rotonly", "0"))) sc.augment = 2;   /* proper rotations only (no reflections) */

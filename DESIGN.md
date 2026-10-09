@@ -53,6 +53,37 @@ ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or
   every window: mean of window means, within-window variance + variance of the means) and `--gn-frozen FILE`. A window
   replayed with its own frozen statistics is byte-identical (tests/test_gn_frozen.c, predict on a 256^3 box).
 
+- D1 result (verso3 step 5000, box 48128, calibration: 8 windows of 544 in the training block below the holdout): frozen
+  statistics cost F1 at every window and do not remove the window effect, which is context, not GroupNorm:
+
+  | window | statistics | F1 | best cutoff | AUC | F1 at 115/255 |
+  |---|---|---|---|---|---|
+  | 288 | live | 0.233 | 0.573 | 0.769 | 0.217 |
+  | 288 | frozen | 0.224 | 0.592 | 0.758 | 0.214 |
+  | 544 | live | 0.242 | 0.584 | 0.777 | 0.222 |
+  | 544 | frozen | 0.233 | 0.604 | 0.766 | 0.218 |
+
+  Not adopted (the options stay for other checkpoints); the per-voxel channel norm (plan D2) is not pursued: on current
+  checkpoints the best cutoff moves by ~0.01 between windows.
+- Narrower coarse decoder (plan B1): `unet_cfg.dec_widths` / `train --dec-widths 0,32` (checkpoint header "dec_widths" only
+  when set; level 0 keeps the encoder width so the level-0 memory modes are unchanged). dec[i].c1 reads dec_widths[i+1] +
+  widths[i]; a level whose decoder is narrower than its encoder cannot hold the encoder's gradient in dec[i].a2's buffer
+  (a0_share), so its A is the shared one. Desk widths, level 1 at 32: step -14% (laptop, GPU shared: 1001-1030 -> 861-872 ms;
+  dec0.c1 222 -> 157 ms, dec1.c1 88 -> 40 ms), memory 78.5 -> 80.6 B/voxel, 10.96M -> 10.71M parameters. test_unet
+  (finite differences, UFSM_DEC_WIDTHS / UFSM_BIG_DEC_WIDTHS) and test_split case 36 (desk mode, levels 1/2 at 32/64) pass.
+  Accuracy A/B pending (needs a fresh decoder: --init-from copies only shape-matching layers).
+
+- Side A/B (laptop, Paris4 band block cover x5 = 2738 steps, P256, warm start verso3 step 5000, Muon 0.005 / lr 5e-4 WSD;
+  control = recto + affinities, side = + `--side 1 --side-air 80`), seed 1, box 48128: recto unchanged (F1 0.265 vs 0.261,
+  FWHM 16.9 vs 17.1); fine-tuning itself helped (verso3 0.242 -> control 0.265; VOI 1.48 -> 1.32). The side channel reaches
+  72% accuracy on known voxels (48% within one voxel of a recto face, ~77% far from boundaries) and the cut-based pieces
+  merge almost everything (VOI 4.01); components of its confident recto-side stripes (P >= 0.7) give VOI 1.97 — both worse
+  than the recto-cutoff pieces (1.32). Not adopted at this training length. Diagnosis: along the radial line through the
+  traced recto points of this box only 25% show a clear CT edge (contrast > 30; edge offset std 2.9 voxels), 57% almost
+  none (compressed sheets: the trace is an interpolation); the face position is not visible where the side boundary must
+  be placed, the same limit that keeps the recto ridge wide. Laptop runs were sampler-bound (6 batches in flight with the
+  band-field EDT per sample): `train --sampler-slots N`.
+
 ## Memory and inference defaults (2026-10-08)
 
 - Training stores the MX activation gradients as MX-fp4 with exact stochastic rounding by default when every width is a

@@ -138,6 +138,10 @@ struct unet {
 };
 
 static int G_of(const unet *u, int c) { return u->cfg.G < c ? u->cfg.G : c; }
+/* output channels of the coarse block at level i that the decoder upsamples into level i - 1: dec[i] (cfg.dec_widths, 0 = the
+   encoder width), the bottom level's enc[L-1] */
+static int dw_of(const unet_cfg *c, int i) { return i >= c->nlev - 1 || !c->dec_widths[i] ? c->widths[i] : c->dec_widths[i]; }
+#define UPW(i) dw_of(&u->cfg, (i))
 
 /* ---- spatial split along z (unet_set_split): this GPU's tensors are its z planes plus 2^(L-1-l) halo planes at level l on the
    side facing the other GPU (h0 = 2^(L-1) at level 0, so every level keeps the stride-2 parity and the shapes the U-Net needs).
@@ -186,7 +190,11 @@ unet *unet_create(const unet_cfg *cfg) {
     size_t off = 0;
     for (int i = 0; i < L; i++) off = add_block(u, &u->enc[i], i == 0 ? cfg->cin : w[i - 1], w[i], off);
     for (int i = 0; i < L - 1; i++) off = add_conv(u, &u->down[i], w[i], w[i], 3, 2, off);
-    for (int i = L - 2; i >= 0; i--) off = add_block(u, &u->dec[i], w[i] + w[i + 1], w[i], off);
+    for (int i = 0; i < L - 1; i++) {
+        const int d = dw_of(cfg, i);
+        if (d <= 0 || d > w[i] || (i == 0 && d != w[0])) { fprintf(stderr, "unet: decoder width %d at level %d must be in 1..%d and the encoder width at level 0 (MX storage: multiples of 32)\n", d, i, w[i]); abort(); }
+    }
+    for (int i = L - 2; i >= 0; i--) off = add_block(u, &u->dec[i], w[i] + dw_of(cfg, i + 1), dw_of(cfg, i), off);
     off = add_conv(u, &u->head, w[0], cfg->cout, 1, 1, off);
     if (cfg->down_norm) for (int i = 0; i < L - 1; i++) off = add_gn(u, &u->dn[i], w[i], off);
     if (cfg->scale_cond) { u->sc_w = off; off += (size_t)w[0]; }
@@ -508,7 +516,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
             for (int i = 1; i < L - 1; i++) { shape5 y = u->ls[i]; y.c = w[i]; if (act_bytes_of(y) > act_bytes_of(m2)) m2 = y; }
         }
         for (int i = 0; i < L - 1; i++) { shape5 d = u->ls[i + 1]; d.c = w[i]; if (act_bytes_of(d) > act_bytes_of(m2)) m2 = d; }
-        for (int i = 0; i < L - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > act_bytes_of(mc)) mc = c; }
+        for (int i = 0; i < L - 1; i++) { shape5 c = u->ls[i]; c.c = UPW(i + 1); if (act_bytes_of(c) > act_bytes_of(mc)) mc = c; }
         T1 = dalloc_act_s(u, m1); T2 = dalloc_act_s(u, m2); TC = rc ? nullptr : dalloc_act_s(u, mc);   /* recompute: rc_tmp allocates on demand */
     }
     g_mlab = "encoder a1 / a2 / GN stats + down outputs";
@@ -542,10 +550,10 @@ static void build_acts(unet *u, shape5 xs, int train) {
     g_mlab = "decoder a1 / a2 / GN stats";
     for (int i = L - 2; i >= 0; i--) {
         shape5 li = u->ls[i];
-        shape5 cs_ = li; cs_.c = nn_get_tf32() ? w[i + 1] : w[i] + w[i + 1];
+        shape5 cs_ = li; cs_.c = nn_get_tf32() ? UPW(i + 1) : w[i] + UPW(i + 1);
         if (share && !rc) u->cat[i] = TC;
         else if (!rc) u->cat[i] = dalloc_act_s(u, cs_);
-        shape5 cin = li; cin.c = w[i] + w[i + 1];
+        shape5 cin = li; cin.c = w[i] + UPW(i + 1);
         /* A 16-bit decoder's kept SiLU may also use its consumed encoder skip. In MX modes s2
            is absent and the next decoder normalizes a2 on the fly. Training keeps separate buffers. */
         build_block_acts(u, &u->dec[i], cin, train, i > 0,
@@ -580,7 +588,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
             size_t na = 0, nbb = 0;   /* elements (16-bit / fp32) or bytes (MX) */
             for (int i = 0; i < L; i++) {
                 /* chunk mode: the up-part gradient goes through B in w[i]-channel chunks, so B needs no w[i+1] */
-                int cb[3] = {w[i], i < L - 1 && !chunk ? w[i + 1] : 0, i ? w[i - 1] : u->cfg.cin};
+                int cb[3] = {w[i], i < L - 1 && !chunk ? UPW(i + 1) : 0, i ? w[i - 1] : u->cfg.cin};
                 for (int k = 0; k < 3; k++) {   /* B holds each of these tensors at this level */
                     shape5 sb = u->ls[i]; sb.c = cb[k];
                     size_t e = !cb[k] ? 0 : gmx ? nn_mx_bytes(sb, grad_dt()) : shape_numel(sb);
@@ -588,7 +596,8 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 }
                 shape5 sa = u->ls[i]; sa.c = w[i];
                 size_t e = gmx ? nn_mx_bytes(sa, grad_dt()) : shape_numel(sa);
-                if (e > na && !(u->a0_share && i < L - 1)) na = e;   /* a0_share: a decoder level's A is its dec[i].a2's buffer */
+                if (e > na && !(u->a0_share && i < L - 1 && UPW(i) >= w[i])) na = e;   /* a0_share: a decoder level's A is its dec[i].a2's buffer
+                                                                                     (a narrower decoder's is too small for the encoder's gradient) */
             }
             u->nob = lean() >= 2 && chunk;   /* lean 2: no B (needs the chunked up-part gradient: the up part goes through gout[i]) */
             float *A = gmx ? dalloc_grad_mx(u, na) : dalloc_grad(u, na), *B = u->nob ? nullptr : gmx ? dalloc_grad_mx(u, nbb) : dalloc_grad(u, nbb);
@@ -615,11 +624,11 @@ static void build_acts(unet *u, shape5 xs, int train) {
             for (int i = 0; i < L; i++) {
                 shape5 so = u->ls[i]; so.c = w[i];
                 size_t gob = gmx ? nn_mx_bytes(so, grad_dt()) : shape_numel(so) * (GBF ? 2 : 4);
-                if (u->nob && i < L - 1 && !up_wg_chunk()) { shape5 up = u->ls[i]; up.c = w[i + 1]; if (act_bytes_of(up) > gob) gob = act_bytes_of(up); }   /* also holds the MX up transient (level 1: 34 vs 33 B) */
+                if (u->nob && i < L - 1 && !up_wg_chunk()) { shape5 up = u->ls[i]; up.c = UPW(i + 1); if (act_bytes_of(up) > gob) gob = act_bytes_of(up); }   /* also holds the MX up transient (level 1: 34 vs 33 B) */
                 if (up_wg_chunk() && i > 0 && act_bytes_of(so) > gob) gob = act_bytes_of(so);   /* holds the coarse silu(gn(a2)) the level below's weight gradient reads */
                 if (up_wg_chunk() && i < L - 1) { shape5 sl = u->ls[i]; sl.c = 32; if (act_bytes_of(sl) > gob) gob = act_bytes_of(sl); }   /* one upsampled 32-channel slice */
                 if (u->nob && gmx && i == 0 && i < L - 1 && unet_wide_up_grad()) {
-                    shape5 up = u->ls[i]; up.c = w[i + 1];
+                    shape5 up = u->ls[i]; up.c = UPW(i + 1);
                     size_t ub = nn_mx_bytes(up, grad_dt()); if (ub > gob) gob = ub;
                 }   /* optional full finest-level up gradient; the chunk loop still defers the aliased skip write */
                 if (lg_gout && i == 0) gob += 4096;   /* alignment slack: [fp16 logits | ... | batch] (unet_batch_scratch) */
@@ -635,7 +644,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
             size_t gco_off = act_bytes_of(u->dec[0].ys) & ~(size_t)255;
             for (int i = 0; i < L; i++) {
                 const size_t gob = gobs[i];
-                u->gA[i] = u->a0_share && i < L - 1 ? u->dec[i].a2 : A;   /* dead after the first op of dec[i]'s backward */
+                u->gA[i] = u->a0_share && i < L - 1 && UPW(i) >= w[i] ? u->dec[i].a2 : A;   /* dead after the first op of dec[i]'s backward */
                 if (u->gco && i > 0) {
                     gco_off -= (gob + 255) & ~(size_t)255;
                     u->gout[i] = (float *)((char *)u->dec[0].a2 + gco_off);
@@ -698,14 +707,14 @@ static void build_acts(unet *u, shape5 xs, int train) {
             if (act_mx8() && recompute() && !up_wg_chunk()) {   /* the MX weight-gradient transient of the decoder up part where it does not fit its level's
                                                  buffer: allocated now so the dry build (memory planner) counts it */
                 shape5 m = u->ls[0]; m.c = 0;
-                for (int i = 0; i < L - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > u->gB_cap[i] && act_bytes_of(c) > act_bytes_of(m)) m = c; }
+                for (int i = 0; i < L - 1; i++) { shape5 c = u->ls[i]; c.c = UPW(i + 1); if (act_bytes_of(c) > u->gB_cap[i] && act_bytes_of(c) > act_bytes_of(m)) m = c; }
                 if (m.c) { u->rc_extra = dalloc_act_s(u, m); u->rc_extra_bytes = act_bytes_of(m); }
             }
         } else
         for (int i = 0; i < L; i++) {
             shape5 li = u->ls[i];
             size_t S = shape_spatial(li);
-            int wmax = i < L - 1 ? w[i] + w[i + 1] : w[i];
+            int wmax = i < L - 1 ? w[i] + UPW(i + 1) : w[i];
             if (i == 0 && u->cfg.cin > wmax) wmax = u->cfg.cin;
             size_t nb = (size_t)li.n * wmax * S, nw = (size_t)li.n * w[i] * S;
             u->gA[i] = dalloc_grad(u, nb); u->gB[i] = dalloc_grad(u, nb);
@@ -860,16 +869,16 @@ static float *rc_tmp(unet *u, int level, shape5 s, int *reg) {
     if (u->train && act_bytes_of(s) > u->gB_cap[level]) {   /* chunk mode left B too small for this (fp8 / MX) transient */
         if (act_bytes_of(s) > u->rc_extra_bytes) {
             if (u->rc_extra) { nn_storage_forget(u->rc_extra); nn_free(u->rc_extra); u->act_bytes -= u->rc_extra_bytes; }
-            const int *w = u->cfg.widths; shape5 m = u->ls[0]; m.c = 0;   /* the largest transient that does not fit its level's buffer */
-            for (int i = 0; i < u->cfg.nlev - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > u->gB_cap[i] && act_bytes_of(c) > act_bytes_of(m)) m = c; }
+            shape5 m = u->ls[0]; m.c = 0;   /* the largest transient that does not fit its level's buffer */
+            for (int i = 0; i < u->cfg.nlev - 1; i++) { shape5 c = u->ls[i]; c.c = UPW(i + 1); if (act_bytes_of(c) > u->gB_cap[i] && act_bytes_of(c) > act_bytes_of(m)) m = c; }
             u->rc_extra = dalloc_act_s(u, m); u->rc_extra_bytes = act_bytes_of(m);
         }
         *reg = 0;
         return u->rc_extra;
     }
     if (!u->train && !u->cat[0]) {   /* inference: the transient is only allocated if the fused path is unavailable */
-        const int *w = u->cfg.widths; shape5 m = u->ls[0]; m.c = 0;
-        for (int i = 0; i < u->cfg.nlev - 1; i++) { shape5 c = u->ls[i]; c.c = w[i + 1]; if (act_bytes_of(c) > act_bytes_of(m)) m = c; }
+        shape5 m = u->ls[0]; m.c = 0;
+        for (int i = 0; i < u->cfg.nlev - 1; i++) { shape5 c = u->ls[i]; c.c = UPW(i + 1); if (act_bytes_of(c) > act_bytes_of(m)) m = c; }
         u->cat[0] = dalloc_act_s(u, m);
     }
     float *p = u->train ? u->gB[level] : u->cat[0];
@@ -1073,21 +1082,22 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         u->a2_out = 1;
     }
     for (int i = L - 2; i >= 0; i--) {
-        shape5 src = u->ls[i + 1]; src.c = w[i + 1];
+        const int uw = UPW(i + 1);   /* channels upsampled into this level */
+        shape5 src = u->ls[i + 1]; src.c = uw;
         shape5 li = u->ls[i];
         u->dec[i].xb = u->dec[i].x2b = nullptr;
         if (recompute()) {   /* nothing materialised: dec conv1 stages up2(silu(gn(a2))) of the coarse block and silu(gn(a2)) of the skip */
             u->dec[i].xb = i == L - 2 ? (const void *)&u->enc[L - 1] : (const void *)&u->dec[i + 1];
-            u->dec[i].x2b = &u->enc[i]; u->dec[i].in2 = nullptr; u->dec[i].c_split = w[i + 1];
+            u->dec[i].x2b = &u->enc[i]; u->dec[i].in2 = nullptr; u->dec[i].c_split = uw;
         } else if (nn_get_tf32()) {   /* cat holds only the upsampled part; the skip is read in place by the split conv */
-            PROF(5, nn_up2_fwd_into(cur, src, u->cat[i], w[i + 1], 0));
-            { shape5 us = li; us.c = w[i + 1]; sp_halo(u, u->cat[i], us, 0); }
-            u->dec[i].in2 = u->enc[i].s2; u->dec[i].c_split = w[i + 1];
+            PROF(5, nn_up2_fwd_into(cur, src, u->cat[i], uw, 0));
+            { shape5 us = li; us.c = uw; sp_halo(u, u->cat[i], us, 0); }
+            u->dec[i].in2 = u->enc[i].s2; u->dec[i].c_split = uw;
         } else {
-            PROF(5, nn_up2_fwd_into(cur, src, u->cat[i], w[i + 1] + w[i], 0));
+            PROF(5, nn_up2_fwd_into(cur, src, u->cat[i], uw + w[i], 0));
             size_t S = shape_spatial(li);
             for (int n = 0; n < li.n; n++)
-                nn_d2d(u->cat[i] + ((size_t)n * (w[i + 1] + w[i]) + w[i + 1]) * S, u->enc[i].s2 + (size_t)n * w[i] * S, (size_t)w[i] * S * 4);
+                nn_d2d(u->cat[i] + ((size_t)n * (uw + w[i]) + uw) * S, u->enc[i].s2 + (size_t)n * w[i] * S, (size_t)w[i] * S * 4);
             u->dec[i].in2 = nullptr;
         }
         if (u->a1_out[i]) nn_stream_wait(0, u->ev_a1[i][1]);   /* the decoder's conv1 overwrites the shared buffer */
@@ -1310,13 +1320,13 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     /* decoder, bottom-up in the graph = i from 0 to L-2 */
     for (int i = 0; i < L - 1; i++) {
         shape5 li = u->ls[i];
-        shape5 src = u->ls[i + 1]; src.c = w[i + 1];
+        shape5 src = u->ls[i + 1]; src.c = UPW(i + 1);
         if (nn_get_tf32()) {
             if (i > 0 && u->sko && u->sea_stale) nn_stream_wait(0, u->ev_sk[i][3]);   /* its skip back from the host (a conv1 re-run reads it at once) */
             nn_set_layer(3 * L - 3 - i); float *gup = block_bwd(u, &u->dec[i], i, u->gout[i], u->gskip[i]);   /* gB[i]: grad wrt the upsampled part; skip grad written in place */
             if (i == 0 && u->gco) {   /* gout[1] (the up-part gradient) to dec[0].a2's buffer before dec[0].a1's takes the encoder's a1 back */
                 if (gup) rc_fail("coarse gradient share: an unchunked up-part gradient");
-                shape5 g1 = u->ls[1]; g1.c = w[1];
+                shape5 g1 = u->ls[1]; g1.c = UPW(1);
                 nn_d2d(u->gout_home1, u->gout_x1, nn_mx_bytes(g1, grad_dt()));
                 u->gout[1] = u->gB[1] = u->gout_home1; if (L > 2) u->gskip[1] = u->gout_home1;
             }
@@ -1335,12 +1345,12 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
                 nn_offload_copy(u->xin, u->h_xin, u->xin_bytes, 0, u->ev_xin[2], u->ev_xin[3]);
             }
             if (i == 0 && (u->xin_shared || u->a0_share)) u->a2_stale = 1;
-            if (gup) { shape5 us = li; us.c = w[i + 1]; sp_halo(u, gup, us, 1); }
+            if (gup) { shape5 us = li; us.c = UPW(i + 1); sp_halo(u, gup, us, 1); }
             if (gup) PROF(5, nn_up2_bwd(gup, src, u->gout[i + 1]));   /* nullptr: chunk mode wrote gout[i + 1] */
             FQG(u->gout[i + 1], src);
         } else {
             nn_set_layer(3 * L - 3 - i); float *gcat = block_bwd(u, &u->dec[i], i, u->gout[i], nullptr);       /* gB[i]: grad wrt concat */
-            PROF(5, nn_concat_bwd(gcat, w[i + 1], w[i], li, u->gA[i], u->gskip[i]));
+            PROF(5, nn_concat_bwd(gcat, UPW(i + 1), w[i], li, u->gA[i], u->gskip[i]));
             PROF(5, nn_up2_bwd(u->gA[i], src, u->gout[i + 1]));
         }
     }
@@ -1704,7 +1714,10 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (!f) return -1;
     fprintf(f, "UFSM{\"nlev\":%d,\"widths\":[", u->cfg.nlev);
     for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.widths[i]);
-    fprintf(f, "],\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"scale_cond\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"muon_mom\":%d,\"extra\":%s}\n", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->cfg.scale_cond, u->np, step, u->sparse24, u->wq, u->muon_mom != nullptr, extra ? extra : "{}");
+    fputc(']', f);
+    { int any = 0; for (int i = 0; i < u->cfg.nlev; i++) any |= u->cfg.dec_widths[i] != 0;   /* only when set: older readers see the old header */
+      if (any) { fputs(",\"dec_widths\":[", f); for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.dec_widths[i]); fputc(']', f); } }
+    fprintf(f, ",\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"scale_cond\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"muon_mom\":%d,\"extra\":%s}\n", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->cfg.scale_cond, u->np, step, u->sparse24, u->wq, u->muon_mom != nullptr, extra ? extra : "{}");
     float *h = malloc(u->np * 4);
     const float *arrs[4] = {u->p, u->ema, u->m, u->v};
     for (int a = 0; a < 4; a++) { nn_d2h(h, arrs[a], u->np * 4); if (fwrite(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; } }
@@ -1731,6 +1744,8 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"G\":"))) cfg->G = atoi(p + 4);
     if ((p = strstr(line, "\"down_norm\":"))) cfg->down_norm = atoi(p + 12);
     if ((p = strstr(line, "\"scale_cond\":"))) cfg->scale_cond = atoi(p + 13);
+    memset(cfg->dec_widths, 0, sizeof cfg->dec_widths);
+    if ((p = strstr(line, "\"dec_widths\":["))) { p += 14; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->dec_widths[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"nparams\":"))) *np = (size_t)atoll(p + 10);
     if ((p = strstr(line, "\"step\":"))) *step = atoi(p + 7);
     if ((p = strstr(line, "\"sparse24\":"))) g_loaded_sparse = atoi(p + 11);

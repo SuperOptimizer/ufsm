@@ -16,6 +16,9 @@ typedef struct {
     int down_norm;         /* 1: GroupNorm + SiLU after each stride-2 down conv (params appended after the head; 0 keeps the old layout) */
     int scale_cond;        /* 1: voxel-size conditioning: the stem conv bias is b + c * v, c = unet_scale_code(input voxel size), v a learned
                               per-channel vector (appended last, zero-initialised: a donor without it is unchanged) */
+    int dec_widths[UNET_MAXLEV];   /* decoder output channels per level (0 = widths[i]); <= widths[i] (multiples of 32 for MX storage), level 0 = widths[0]:
+                                      a narrower coarse decoder upsamples fewer channels into the level below (dec[i].c1 reads
+                                      dec_widths[i+1] + widths[i]) */
 } unet_cfg;
 
 typedef struct unet unet;
