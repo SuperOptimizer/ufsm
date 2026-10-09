@@ -445,8 +445,9 @@ static void warp_sheet_batch(sheet_batch *b,const spatial_aug *a,const uint8_t *
     b->np=np; b->nt=nt;
 }
 /* band of a native window (task band_affinity): the band field (src/band.h) on the label grid of the window plus a halo,
-   nearest-upsampled like the binary labels (native g -> label (g + 1) >> 1). out: P^3; side (optional): P^3 SIDE_* labels. */
-static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8_t *side) {
+   nearest-upsampled like the binary labels (native g -> label (g + 1) >> 1). out: P^3; side (optional): P^3 SIDE_* labels, or
+   with phase the winding phase (band.h PHASE_*). */
+static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8_t *side, int phase) {
     band_params bp = {s->band_radius, s->band_span};
     const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
     int64_t lo[3], ln[3], ro[3], rn[3]; int ni[3];
@@ -468,7 +469,7 @@ static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8
     }
     if (!rc) {
         for (int64_t z = 0; z < ln[0]; z++) axis_at(&s->ax, 2.0 * (z + lo[0]) + 0.5, &cy[z], &cx[z]);
-        rc = band_field_side(codes, ni, lo, cy, cx, bp, bl, sl);
+        rc = phase ? band_field_phase(codes, ni, lo, cy, cx, bp, bl, sl) : band_field_side(codes, ni, lo, cy, cx, bp, bl, sl);
     }
     if (!rc) for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
         const size_t r0 = ((size_t)(((o[0] + z + 1) >> 1) - lo[0]) * ln[1] + (((o[1] + y + 1) >> 1) - lo[1])) * ln[2];
@@ -724,10 +725,10 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (c->side) memset(b->side + (size_t)i * p3, SIDE_UNKNOWN, p3);
         } else {
             uint8_t *bw = malloc(p3), *sw = c->side ? malloc(p3) : nullptr;
-            if (!bw || (c->side && !sw) || band_window(s, o, P, bw, sw)) { free(bw); free(sw); return -1; }
+            if (!bw || (c->side && !sw) || band_window(s, o, P, bw, sw, c->side == 2)) { free(bw); free(sw); return -1; }
             for (size_t k = 0; k < p3; k++) if (!ctu[k]) bw[k] = BAND_UNKNOWN;
             sym_u8(bw, b->band + (size_t)i * p3, P, y);
-            if (sw) {   /* sides of papyrus only: air (CT <= side_air) stays unsupervised */
+            if (sw) {   /* sides (phases) above CT side_air only: air (CT <= side_air) stays unsupervised */
                 for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) sw[k] = SIDE_UNKNOWN;
                 sym_u8(sw, b->side + (size_t)i * p3, P, y);
             }

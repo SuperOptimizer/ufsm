@@ -1,6 +1,7 @@
 /* band_field_side on concentric cylinder shells (src/band.h): every known voxel is on the recto side (outward of its nearest
    labelled recto) or the verso side; going outward the side turns verso -> recto exactly at each recto shell; voxels beyond the
-   flood radius, and around a missing wrap, are unknown; the band is unchanged by asking for the sides. */
+   flood radius, and around a missing wrap, are unknown; the band is unchanged by asking for the sides. band_field_phase: the
+   fraction of the way between consecutive shells, known only between labelled consecutive shells. */
 #include "band.h"
 #include <math.h>
 #include <stdio.h>
@@ -61,7 +62,41 @@ int main(void) {
     CHECK(!band_field_side(codes, n, o, cy, cx, bp, band, side), "band_field_side failed (missing wrap)");
     const int xm = (int)(XC + R0 + 2.5 * PITCH);
     CHECK(side[((size_t)2 * NY + (int)YC) * NX + xm] == SIDE_UNKNOWN, "a missing wrap must leave the gap unknown");
-    free(codes); free(band); free(band2); free(side);
+    /* phase: between consecutive shells the fraction of the way outward, (r - R_j) / PITCH, wrapping to 0 on each shell;
+       unknown inside the innermost and outside the outermost shell and across the missing wrap; the band is unchanged */
+    uint8_t *phase = malloc(N);
+    shells(codes, turn);
+    CHECK(!band_field_side(codes, n, o, cy, cx, bp, band2, side) && !band_field_phase(codes, n, o, cy, cx, bp, band, phase), "band_field_phase failed");
+    CHECK(!memcmp(band, band2, N), "the band changes when the phase is requested");
+    size_t pk = 0, pin = 0, outside = 0, outside_known = 0, side_bad = 0; double perr = 0, pmax = 0;
+    for (int z = 0; z < NZ; z++) for (int y = 0; y < NY; y++) for (int x = 0; x < NX; x++) {
+        const size_t i = ((size_t)z * NY + y) * NX + x;
+        const double r = hypot(y - YC, x - XC);
+        if (r < R0 - 2 || r > R0 + (NSH - 1) * PITCH + 2) { outside++; outside_known += phase[i] != PHASE_UNKNOWN; continue; }
+        if (r < R0 + 1 || r > R0 + (NSH - 1) * PITCH - 1) continue;
+        pin++;
+        if (phase[i] == PHASE_UNKNOWN) continue;
+        pk++;
+        const double f = (r - R0) / PITCH - floor((r - R0) / PITCH), g = phase[i] / (double)PHASE_PERIOD;
+        double e = fabs(f - g); e = fmin(e, 1 - e);
+        perr += e; pmax = fmax(pmax, e);
+        if (side[i] != SIDE_UNKNOWN && (phase[i] < PHASE_PERIOD / 2) != (side[i] == SIDE_RECTO) && fabs(f - 0.5) > 1.0 / PITCH && fmin(f, 1 - f) > 1.0 / PITCH) side_bad++;
+    }
+    CHECK(pk > pin * 0.95, "phase known for %zu of %zu voxels between the shells", pk, pin);
+    CHECK(perr / pk < 0.02 && pmax < 0.09, "phase error mean %.4f max %.4f (turns)", perr / pk, pmax);
+    CHECK(outside_known < outside / 200, "phase known for %zu of %zu voxels inside the innermost / outside the outermost shell", outside_known, outside);
+    CHECK(side_bad == 0, "%zu voxels where the phase half disagrees with the side", side_bad);
+    for (int k = 1; k < NSH; k++) {   /* outward along +x: the phase rises and wraps to 0 on each shell */
+        const int xr = (int)(XC + R0 + k * PITCH), z = 2;
+        const uint8_t a = phase[((size_t)z * NY + (int)YC) * NX + xr - 1], b = phase[((size_t)z * NY + (int)YC) * NX + xr];
+        CHECK(a > PHASE_PERIOD * 0.85 && a < PHASE_PERIOD && b == 0, "shell %d: phase %d -> %d going outward (want ~1 -> 0)", k, a, b);
+    }
+    shells(codes, turn2);
+    CHECK(!band_field_phase(codes, n, o, cy, cx, bp, band, phase), "band_field_phase failed (missing wrap)");
+    CHECK(phase[((size_t)2 * NY + (int)YC) * NX + xm] == PHASE_UNKNOWN, "a missing wrap must leave the phase unknown");
+    for (size_t i = 0; i < N; i++) if (band[i] == BAND_UNKNOWN && phase[i] != PHASE_UNKNOWN) { CHECK(0, "phase known where the band is not"); break; }
+    printf("phase: %zu of %zu known between the shells, error mean %.4f max %.4f turns\n", pk, pin, perr / pk, pmax);
+    free(codes); free(band); free(band2); free(side); free(phase);
     if (fails) return 1;
     printf("test_side: ok (%zu known voxels between the shells)\n", known);
     return 0;

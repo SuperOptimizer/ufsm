@@ -849,11 +849,13 @@ int main(void) {
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
     printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);
     (void)mode_ref; (void)mode_mx; (void)TOL4; (void)TOL; (void)G; (void)dev_rand;
-    for (int CI = 16; CI <= 32; CI += 16) {   /* wide heads (band affinity outputs): 1^3 weight gradient, 16 / 32 MX inputs (optionally
-                                                 GN+SiLU) x 3..8 outputs, vs fp32 */
+    for (int CI = 16; CI <= 32; CI += 16) {   /* wide heads (band affinity outputs, + 2 phase channels): 1^3 weight gradient, 16 / 32 MX
+                                                 inputs (optionally GN+SiLU) x 3..16 outputs, vs fp32 */
         shape5 xs = {2, CI, 6, 10, 12};
         const size_t S = shape_spatial(xs);
-        for (int dt = 4; dt <= 8; dt += 4) for (int co = 3; co <= 8; co += 4) for (int G = 0; G <= 4; G += 4) {
+        static const int cos_[4] = {3, 7, 9, 16};
+        for (int dt = 4; dt <= 8; dt += 4) for (int ic = 0; ic < 4; ic++) for (int G = 0; G <= 4; G += 4) {
+            const int co = cos_[ic];
             shape5 ys = xs; ys.c = co;
             float *x = dev_rand(shape_numel(xs), 2.f), *gy = dev_rand(shape_numel(ys), 1.f);
             void *xm = dt == 4 ? mx4_from(x, xs) : mx8_from(x, xs); float *xd = dt == 4 ? deq4(xm, xs) : deq8(xm, xs);
@@ -862,7 +864,7 @@ int main(void) {
             float *xa = dev_zero(shape_numel(xs)), *gr = dev_zero((size_t)co * CI), *gw = dev_zero((size_t)co * CI);
             mode_ref();
             if (G) nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, xa); else nn_d2d(xa, xd, shape_numel(xs) * 4);
-            if (CI == 16) nn_conv3d_bwd_weight(xa, xs, gy, ys, 1, 1, gr, nullptr); else w1_ref(xa, xs, gy, co, gr, nullptr);
+            if (CI == 16 && co <= 8) nn_conv3d_bwd_weight(xa, xs, gy, ys, 1, 1, gr, nullptr); else w1_ref(xa, xs, gy, co, gr, nullptr);
             gnp_t gp = {G ? gam : nullptr, G ? bet : nullptr, G ? mean : nullptr, G ? rstd : nullptr, G};
             lp_bwd_w1_mx(xm, dt == 4 ? 4 : 3, xs, gy, 0, ys, gw, gp);
             char nm[96]; snprintf(nm, sizeof nm, "head wgrad %d -> %d, mx%d%s", CI, co, dt, G ? ", gn+silu" : "");
@@ -872,7 +874,7 @@ int main(void) {
                 const int f16 = nn_get_f16(); nn_set_f16(1);
                 void *gyh = nn_malloc(shape_numel(ys) * 2); nn_f32_to_h16(gy, shape_numel(ys), gyh, 1.f);
                 float *grb = dev_zero(co), *gw2 = dev_zero((size_t)co * CI), *gb2 = dev_zero(co), *gr2 = dev_zero((size_t)co * CI);
-                mode_ref(); if (CI == 16) nn_conv3d_bwd_weight(xa, xs, gy, ys, 1, 1, gr2, grb); else w1_ref(xa, xs, gy, co, gr2, grb);
+                mode_ref(); if (CI == 16 && co <= 8) nn_conv3d_bwd_weight(xa, xs, gy, ys, 1, 1, gr2, grb); else w1_ref(xa, xs, gy, co, gr2, grb);
                 const int bd = lp_bwd_w1_mx_b(xm, dt == 4 ? 4 : 3, xs, gyh, 2, ys, gw2, gb2, gp);
                 char nm2[112]; snprintf(nm2, sizeof nm2, "head wgrad %d -> %d, mx%d%s, fp16 gy (tensor cores)", CI, co, dt, G ? ", gn+silu" : "");
                 cmp(nm2, gw2, gr2, (size_t)co * CI, 3e-3);
@@ -883,6 +885,42 @@ int main(void) {
             nn_free(x); nn_free(gy); nn_free(xm); nn_free(xd); nn_free(xa); nn_free(gr); nn_free(gw); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd);
             (void)S;
         }
+    }
+    for (int CI = 16; CI <= 32; CI += 16) for (int co = 8; co <= 16; co += co == 8 ? 1 : 7) {   /* heads of 8, 9 and 16 outputs (phase: recto + 6
+        affinities + cos + sin): 1^3 forward (fp32 and fp16 logits, plain and GN+SiLU input) and backward data into an MX-fp4 gradient */
+        shape5 xs = {2, CI, 6, 10, 12}, ys = xs; ys.c = co;
+        const size_t nx = shape_numel(xs), ny = shape_numel(ys);
+        float *x = dev_rand(nx, 2.f), *w = dev_rand((size_t)co * CI, 0.3f), *b = dev_rand(co, 0.1f);
+        void *xm = mx4_from(x, xs); float *xd = deq4(xm, xs);
+        float *gam = dev_rand(CI, 1.f), *bet = dev_rand(CI, 0.5f), *mean = dev_rand((size_t)xs.n * 4, 0.2f), *rstd = dev_rand((size_t)xs.n * 4, 0.3f);
+        { float h[8]; nn_d2h(h, rstd, (size_t)xs.n * 4 * 4); for (int k = 0; k < xs.n * 4; k++) h[k] = 0.8f + fabsf(h[k]); nn_h2d(rstd, h, (size_t)xs.n * 4 * 4); }
+        for (int G = 0; G <= 4; G += 4) {
+            float *xa = dev_zero(nx), *yr = dev_zero(ny), *ym = dev_zero(ny);
+            mode_ref();
+            if (G) nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, xa); else nn_d2d(xa, xd, nx * 4);
+            nn_conv3d_fwd(xa, xs, w, b, co, 1, 1, yr);
+            gnp_t gp = {G ? gam : nullptr, G ? bet : nullptr, G ? mean : nullptr, G ? rstd : nullptr, G};
+            lp_conv1_fwd_mx(xm, 4, xs, w, b, co, ym, gp);
+            char nm[96]; snprintf(nm, sizeof nm, "head fwd %d -> %d (mx4 x%s)", CI, co, G ? ", gn+silu" : "");
+            cmp(nm, ym, yr, ny, 1e-5);
+            void *yh = nn_malloc(ny * 2); float *yhf = dev_zero(ny);
+            lp_conv1_fwd_mx_h16(xm, 4, xs, w, b, co, yh, gp);
+            {   /* fp16 -> fp32 on the host */
+                uint16_t *hh = malloc(ny * 2); float *hf = malloc(ny * 4); nn_d2h(hh, yh, ny * 2);
+                for (size_t k = 0; k < ny; k++) { const int e = (hh[k] >> 10) & 31, m = hh[k] & 1023; const float v = e ? ldexpf((float)(m + 1024), e - 25) : ldexpf((float)m, -24); hf[k] = hh[k] >> 15 ? -v : v; }
+                nn_h2d(yhf, hf, ny * 4); free(hh); free(hf);
+            }
+            snprintf(nm, sizeof nm, "head fwd %d -> %d (mx4 x%s, fp16 logits)", CI, co, G ? ", gn+silu" : "");
+            cmp(nm, yhf, yr, ny, 2e-3);
+            nn_free(xa); nn_free(yr); nn_free(ym); nn_free(yh); nn_free(yhf);
+        }
+        float *gy = dev_rand(ny, 1e-2f), *scr = nn_malloc((size_t)co * CI * 4 + 64), *gxr = dev_zero(nx); void *gxm = mx4_new(xs);
+        mode_ref(); nn_conv3d_bwd_data(gy, ys, w, xs, 1, 1, gxr, scr);
+        mode_mx(); nn_conv3d_bwd_data(gy, ys, w, xs, 1, 1, (float *)gxm, scr);
+        char nm[96]; snprintf(nm, sizeof nm, "head bwd_data %d -> %d (fp32 gy -> mx4 gx)", co, CI);
+        cmp(nm, deq4(gxm, xs), gxr, nx, TOL4);
+        nn_free(x); nn_free(w); nn_free(b); nn_free(xm); nn_free(xd); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd);
+        nn_free(gy); nn_free(scr); nn_free(gxr); nn_free(gxm);
     }
     return bad != 0;
 }

@@ -387,6 +387,15 @@ __global__ void side_tg_k(const uint8_t *s, size_t n, uint8_t *t, uint8_t *m) {
     if (i < n) { const uint8_t v = s[i]; t[i] = v == 1 ? 255 : 0; m[i] = v <= 1; }
 }
 extern "C" void nn_side_targets(const uint8_t *side, size_t n, uint8_t *t, uint8_t *m) { side_tg_k<<<nblk(n, 256), 256>>>(side, n, t, m); KCHECK(); }
+__global__ void phase_tg_k(const uint8_t *ph, size_t n, uint8_t *t, uint8_t *m) {   /* PHASE_PERIOD 252, PHASE_UNKNOWN 255 (src/band.h) */
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint8_t v = ph[i];
+    if (v >= 252) { t[i] = t[n + i] = 0; m[i] = 0; return; }
+    float sn, cs; sincospif((float)v / 126.f, &sn, &cs);
+    t[i] = (uint8_t)__float2int_rn(127.5f + 127.5f * cs); t[n + i] = (uint8_t)__float2int_rn(127.5f + 127.5f * sn); m[i] = 1;
+}
+extern "C" void nn_phase_targets(const uint8_t *phase, size_t n, uint8_t *t, uint8_t *m) { phase_tg_k<<<nblk(n, 256), 256>>>(phase, n, t, m); KCHECK(); }
 extern "C" void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n) { fill_unl_k<<<nblk(n, 256), 256>>>(t, m, vm, src, n); KCHECK(); }
 extern "C" void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out) {
     const size_t n = (size_t)d * h * w;

@@ -149,6 +149,7 @@ static int cmd_axis(store *s, const char *key, const char *out, const char *cach
 
 /* ---- sample: dump montages of drawn patches ---- */
 /* ufsm band <codes-root> <key> z,y,x,nz,ny,nx <out.raw> [--axis umbilicus.json] [--radius 80] [--span 75] [--threads 8] [--side side.raw]
+   [--phase phase.raw]
    Band field (src/band.h) of a native-voxel box (even origin and size) from a winding_mod14 raster level (label grid, 2 native
    voxels per label voxel): writes the band per label voxel, (nz/2) x (ny/2) x (nx/2) uint8, 0..251 or 255 unknown. */
 static int cmd_band(int argc, char **argv) {
@@ -168,7 +169,8 @@ static int cmd_band(int argc, char **argv) {
     const z3_meta *m = z3_meta_of(z);
     const size_t N = (size_t)n[0] * n[1] * n[2];
     const char *side_path = opt(argc, argv, "--side", nullptr);   /* also the recto / verso side per label voxel (band.h SIDE_*) */
-    uint8_t *codes = calloc(N, 1), *band = malloc(N), *side = side_path ? malloc(N) : nullptr;
+    const char *phase_path = opt(argc, argv, "--phase", nullptr);   /* and / or the winding phase (band.h PHASE_*) */
+    uint8_t *codes = calloc(N, 1), *band = malloc(N), *side = side_path ? malloc(N) : nullptr, *phase = phase_path ? malloc(N) : nullptr;
     int64_t ro[3], rn[3];   /* the in-bounds part of the haloed box; outside stays empty */
     for (int d = 0; d < 3; d++) { ro[d] = o[d] < 0 ? 0 : o[d]; int64_t e = o[d] + n[d] < m->shape[d] ? o[d] + n[d] : m->shape[d]; rn[d] = e - ro[d]; }
     if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
@@ -181,7 +183,7 @@ static int cmd_band(int argc, char **argv) {
     double *cy = malloc(n[0] * sizeof(double)), *cx = malloc(n[0] * sizeof(double));
     for (int64_t zz = 0; zz < n[0]; zz++) axis_at(&ax, 2.0 * (zz + o[0]) + 0.5, &cy[zz], &cx[zz]);
     double t0 = now();
-    if (band_field_side(codes, ni, o, cy, cx, bp, band, side)) { fprintf(stderr, "band: out of memory\n"); return 1; }
+    if (band_field_side(codes, ni, o, cy, cx, bp, band, side) || (phase && band_field_phase(codes, ni, o, cy, cx, bp, band, phase))) { fprintf(stderr, "band: out of memory\n"); return 1; }
     const int64_t on[3] = {b[3] / 2, b[4] / 2, b[5] / 2};
     FILE *f = fopen(argv[5], "wb");
     size_t unknown = 0;
@@ -196,6 +198,12 @@ static int cmd_band(int argc, char **argv) {
         for (int64_t zz = 0; zz < on[0]; zz++) for (int64_t yy = 0; yy < on[1]; yy++)
             if (!fs || fwrite(side + ((size_t)(zz + halo) * n[1] + yy + halo) * n[2] + halo, 1, (size_t)on[2], fs) != (size_t)on[2]) { fprintf(stderr, "band: side write failed\n"); return 1; }
         fclose(fs); free(side);
+    }
+    if (phase) {
+        FILE *fp = fopen(phase_path, "wb");
+        for (int64_t zz = 0; zz < on[0]; zz++) for (int64_t yy = 0; yy < on[1]; yy++)
+            if (!fp || fwrite(phase + ((size_t)(zz + halo) * n[1] + yy + halo) * n[2] + halo, 1, (size_t)on[2], fp) != (size_t)on[2]) { fprintf(stderr, "band: phase write failed\n"); return 1; }
+        fclose(fp); free(phase);
     }
     fprintf(stderr, "band field %lldx%lldx%lld (halo %d) in %.1fs, unknown %.1f%%\n", (long long)on[0], (long long)on[1], (long long)on[2], halo,
             now() - t0, 100.0 * unknown / ((double)on[0] * on[1] * on[2]));

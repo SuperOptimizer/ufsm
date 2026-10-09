@@ -20,25 +20,26 @@ __global__ void conv1_mx_k(const uint8_t *x, const float *w, const float *b, flo
 }
 /* the same with the output count a template parameter (accumulators in registers) and the gn+silu coefficients (per n, ci),
    the weights and the bias staged once per block in smem instead of reloaded per voxel; same arithmetic order as conv1_mx_k.
-   Weights [ci][8] (two broadcast float4 loads per input channel) and coefficients float2 [n][ci]: one scalar smem load per
-   (co, ci) made the kernel smem-instruction-bound */
+   Weights [ci][CP] (CP / 4 broadcast float4 loads per input channel) and coefficients float2 [n][ci]: one scalar smem load per
+   (co, ci) made the kernel smem-instruction-bound. CO <= 8 (CP 8) or 16 (CP 16: 9..16 outputs, Co at run time). */
 template <int B, int CO, typename YT = float>   /* YT: fp32 or fp16 logits (lean training: the logit gradient fits beside fp16 logits) */
-__global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const float *w, const float *b, YT *y, int N, int Ci, size_t S, gnp_t gp) {
+__global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const float *w, const float *b, YT *y, int N, int Ci, size_t S, gnp_t gp, int Co) {
+    constexpr int CP = CO <= 8 ? 8 : 16, C4 = CP / 4;
     extern __shared__ __align__(16) float c1s[];
-    float4 *sw = (float4 *)c1s;                       /* [Ci][2] (co 0..3, 4..7) */
-    float2 *sab = (float2 *)(sw + 2 * Ci);            /* [N][Ci] (a, b) */
+    float4 *sw = (float4 *)c1s;                       /* [Ci][C4] (co 0..3, 4..7, ..) */
+    float2 *sab = (float2 *)(sw + C4 * Ci);           /* [N][Ci] (a, b) */
     for (int i = threadIdx.x; i < N * Ci; i += blockDim.x) {
         const int n = i / Ci, ci = i % Ci;
         if (gp.G) { const int ng = n * gp.G + ci / (Ci / gp.G); const float a = gp.rstd[ng] * gp.gamma[ci]; sab[i] = make_float2(a, gp.beta[ci] - gp.mean[ng] * a); }
     }
-    for (int i = threadIdx.x; i < 8 * Ci; i += blockDim.x) { const int ci = i >> 3, co = i & 7; c1s[i] = co < CO ? w[co * Ci + ci] : 0.f; }
+    for (int i = threadIdx.x; i < CP * Ci; i += blockDim.x) { const int ci = i / CP, co = i % CP; c1s[i] = co < Co ? w[co * Ci + ci] : 0.f; }
     __syncthreads();
     const int bw = mx_bw(Ci), nb = mx_nb(Ci);
     const int n = blockIdx.y; const size_t v = blockIdx.x * (size_t)blockDim.x + threadIdx.x;   /* grid (voxels, sample) */
     if (v >= S) return;
     float acc[CO];
 #pragma unroll
-    for (int co = 0; co < CO; co++) acc[co] = b ? b[co] : 0.f;
+    for (int co = 0; co < CO; co++) acc[co] = b && co < Co ? b[co] : 0.f;
     const uint8_t *sc = mx_sc<B>(x, N, Ci, S);
     for (int blk = 0; blk < nb; blk++) {
         float r[32];
@@ -49,40 +50,48 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
             if (k >= bw || ci >= Ci) break;
             float xv = r[k];
             if (gp.G) { const float2 ab = sab[n * Ci + ci]; xv = act_ab(xv, ab.x, ab.y, true); }
-            const float4 w0 = sw[2 * ci], w1 = sw[2 * ci + 1];
-            const float wv[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+            float wv[CP];
+#pragma unroll
+            for (int j = 0; j < C4; j++) { const float4 q = sw[C4 * ci + j]; wv[4 * j] = q.x; wv[4 * j + 1] = q.y; wv[4 * j + 2] = q.z; wv[4 * j + 3] = q.w; }
 #pragma unroll
             for (int co = 0; co < CO; co++) acc[co] += wv[co] * xv;
         }
     }
 #pragma unroll
-    for (int co = 0; co < CO; co++) { if constexpr (sizeof(YT) == 2) y[((size_t)n * CO + co) * S + v] = __float2half(acc[co]); else y[((size_t)n * CO + co) * S + v] = acc[co]; }
+    for (int co = 0; co < CO; co++) {
+        if (co >= Co) break;
+        if constexpr (sizeof(YT) == 2) y[((size_t)n * Co + co) * S + v] = __float2half(acc[co]); else y[((size_t)n * Co + co) * S + v] = acc[co];
+    }
 }
-template <int B, int CO, typename YT = float> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, YT *y, gnp_t gp) {
-    const size_t S = shape_spatial(xs), sm = (size_t)(2 * xs.n * xs.c + 8 * xs.c) * sizeof(float);
-    conv1_mx_t_k<B, CO, YT><<<dim3(nblk_(S, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp);
+static size_t conv1_smem(shape5 xs, int cout) { return (size_t)(2 * xs.n * xs.c + (cout <= 8 ? 8 : 16) * xs.c) * sizeof(float); }
+template <int B, int CO, typename YT = float> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, YT *y, gnp_t gp, int cout) {
+    const size_t S = shape_spatial(xs), sm = conv1_smem(xs, cout);
+    conv1_mx_t_k<B, CO, YT><<<dim3(nblk_(S, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp, cout);
 }
 /* the same with fp16 logits (unet lean training; the staged path only) */
 extern "C" void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp) {
-    if (cout > 8 || (size_t)(2 * xs.n * xs.c + 8 * xs.c) * sizeof(float) > 32 * 1024) { fprintf(stderr, "lp_conv1_fwd_mx_h16: cout %d / %d inputs unsupported\n", cout, xs.c); abort(); }
+    if (cout > 16 || conv1_smem(xs, cout) > 32 * 1024) { fprintf(stderr, "lp_conv1_fwd_mx_h16: cout %d / %d inputs unsupported\n", cout, xs.c); abort(); }
     __half *yh = (__half *)y;
-#define C1H(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, yh, gp); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, yh, gp); break; \
-                               case 3: conv1_mx_t<B, 3>(x, xs, w, b, yh, gp); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, yh, gp); break; \
-                               case 5: conv1_mx_t<B, 5>(x, xs, w, b, yh, gp); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, yh, gp); break; \
-                               case 7: conv1_mx_t<B, 7>(x, xs, w, b, yh, gp); break; default: conv1_mx_t<B, 8>(x, xs, w, b, yh, gp); } } while (0)
+#define C1H(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, yh, gp, cout); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, yh, gp, cout); break; \
+                               case 3: conv1_mx_t<B, 3>(x, xs, w, b, yh, gp, cout); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, yh, gp, cout); break; \
+                               case 5: conv1_mx_t<B, 5>(x, xs, w, b, yh, gp, cout); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, yh, gp, cout); break; \
+                               case 7: conv1_mx_t<B, 7>(x, xs, w, b, yh, gp, cout); break; case 8: conv1_mx_t<B, 8>(x, xs, w, b, yh, gp, cout); break; \
+                               default: conv1_mx_t<B, 16>(x, xs, w, b, yh, gp, cout); } } while (0)
     if (xdt == 4) C1H(4); else C1H(8);
 #undef C1H
     LPCK();
 }
 extern "C" void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp) {
-    if (cout > 8) { fprintf(stderr, "lp_conv1_fwd_mx: cout %d > 8\n", cout); abort(); }
+    if (cout > 16) { fprintf(stderr, "lp_conv1_fwd_mx: cout %d > 16\n", cout); abort(); }
     size_t S = shape_spatial(xs);
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
-    if (!old && (size_t)(2 * xs.n * xs.c + 8 * xs.c) * sizeof(float) <= 32 * 1024) {
-#define C1T(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, y, gp); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, y, gp); break; \
-                               case 3: conv1_mx_t<B, 3>(x, xs, w, b, y, gp); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, y, gp); break; \
-                               case 5: conv1_mx_t<B, 5>(x, xs, w, b, y, gp); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, y, gp); break; \
-                               case 7: conv1_mx_t<B, 7>(x, xs, w, b, y, gp); break; default: conv1_mx_t<B, 8>(x, xs, w, b, y, gp); } } while (0)
+    if (cout > 8 && (old || conv1_smem(xs, cout) > 32 * 1024)) { fprintf(stderr, "lp_conv1_fwd_mx: %d outputs need the staged kernel\n", cout); abort(); }
+    if (!old && conv1_smem(xs, cout) <= 32 * 1024) {
+#define C1T(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, y, gp, cout); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, y, gp, cout); break; \
+                               case 3: conv1_mx_t<B, 3>(x, xs, w, b, y, gp, cout); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, y, gp, cout); break; \
+                               case 5: conv1_mx_t<B, 5>(x, xs, w, b, y, gp, cout); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, y, gp, cout); break; \
+                               case 7: conv1_mx_t<B, 7>(x, xs, w, b, y, gp, cout); break; case 8: conv1_mx_t<B, 8>(x, xs, w, b, y, gp, cout); break; \
+                               default: conv1_mx_t<B, 16>(x, xs, w, b, y, gp, cout); } } while (0)
         if (xdt == 4) C1T(4); else C1T(8);
 #undef C1T
     } else if (xdt == 4) conv1_mx_k<4><<<nblk_((size_t)xs.n * S, 256), 256>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, cout, S, gp);
@@ -120,8 +129,8 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx_k(const uint8_t *x, const 
 /* fast path: one MX block row (Ci <= KM <= 32) and up to CO outputs (the head; Co <= CO at run time): static accumulator
    indices (the generic kernel's acc[ci * Co + co] lived in local memory), per-sample GN coefficients in shared memory;
    grid (voxel chunks, sample). KM = 16 keeps the 8-output accumulators (affinity heads) in registers. */
-template <int B, typename TG, int CO, int KM = 32>
-__global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const TG *gy, float *gw, int N, int Ci, size_t S, gnp_t gp, int nper, int Co) {
+template <int B, typename TG, int CO, int KM = 32>   /* outputs co0 .. co0 + CO - 1 of Co (heads wider than CO: one launch per CO outputs) */
+__global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const TG *gy, float *gw, int N, int Ci, size_t S, gnp_t gp, int nper, int Co, int co0 = 0) {
     const int bw = mx_bw(Ci), n = blockIdx.y;
     __shared__ float ca[32], cb[32], red[32 * CO];
     if (threadIdx.x < 32) {
@@ -143,7 +152,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
         float r[32], g[CO];
         mx_load_row_b<B>(x, sc, (size_t)n * S + v, bw, r);
 #pragma unroll
-        for (int co = 0; co < CO; co++) g[co] = co < Co ? ldx(gy, ((size_t)n * Co + co) * S + v) : 0.f;
+        for (int co = 0; co < CO; co++) g[co] = co0 + co < Co ? ldx(gy, ((size_t)n * Co + co0 + co) * S + v) : 0.f;
 #pragma unroll
         for (int k = 0; k < KM; k++) {
             if (k < Ci) {
@@ -158,7 +167,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
         if (k < Ci) {
 #pragma unroll
             for (int co = 0; co < CO; co++) {
-                if (co >= Co) continue;
+                if (co0 + co >= Co) continue;
                 float a = acc[k][co];
                 for (int o = 16; o; o >>= 1) a += __shfl_xor_sync(0xffffffff, a, o);
                 if ((threadIdx.x & 31) == 0) atomicAdd(&red[k * CO + co], a);
@@ -166,15 +175,15 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
         }
     }
     __syncthreads();
-    if (threadIdx.x < Ci * CO) { const int k = threadIdx.x / CO, co = threadIdx.x % CO; if (co < Co) atomicAdd(&gw[(size_t)co * Ci + k], red[threadIdx.x]); }
+    if (threadIdx.x < Ci * CO) { const int k = threadIdx.x / CO, co = threadIdx.x % CO; if (co0 + co < Co) atomicAdd(&gw[(size_t)(co0 + co) * Ci + k], red[threadIdx.x]); }
 }
 /* tensor-core head weight gradient for one 16-channel MX block row and up to 8 outputs with fp16 gy (the training
    storage): gw[co][ci] += sum_v act(x)[ci][v] gy[co][v], and (gb) gb[co] += sum_v gy[co][v] in the same pass over gy.
    Per warp and 16 voxels: lanes 0-15 dequantise one voxel row each and apply the GN+SiLU affine into fp16 A[ci][voxel],
    lanes 16-31 copy that voxel's gy into B[co][voxel] (and sum it for the bias); one m16n8k16 MMA with fp32 accumulation.
    The fp16 rounding of act(x) is the only numerical difference from conv_bwd_w1_mx1_k. */
-template <int B, int CI>   /* CI = 16 or 32 input channels (one MX block row): CI / 16 MMA row tiles per 16 voxels */
-__global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const __half *gy, float *gw, float *gb, int N, size_t S, gnp_t gp, int nper, int Co) {
+template <int B, int CI>   /* CI = 16 or 32 input channels (one MX block row): CI / 16 MMA row tiles per 16 voxels; outputs co0 .. co0 + 7 */
+__global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const __half *gy, float *gw, float *gb, int N, size_t S, gnp_t gp, int nper, int Co, int co0) {
     constexpr int MTI = CI / 16;
     __shared__ float ca[CI], cb[CI], red[8][CI * 8 + 8];
     __shared__ __align__(16) __half sA[8][CI][40], sB[8][8][40];   /* [warp][ci][voxel], [warp][co][voxel] (32 voxels); rows padded */
@@ -201,7 +210,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
             for (int k = 0; k < CI; k++) sA[warp][k][lane] = __float2half_rn(in ? (gp.G ? act_ab(r[k], ca[k], cb[k], true) : r[k]) : 0.f);
 #pragma unroll
             for (int co = 0; co < 8; co++) {
-                const __half h = in && co < Co ? gy[((size_t)n * Co + co) * S + v] : __float2half_rn(0.f);
+                const __half h = in && co0 + co < Co ? gy[((size_t)n * Co + co0 + co) * S + v] : __float2half_rn(0.f);
                 sB[warp][co][lane] = h; bs[co] += __half2float(h);
             }
         }
@@ -234,22 +243,24 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
     for (int i = threadIdx.x; i < CI * 8 + 8; i += blockDim.x) {
         float s = 0.f;
         for (int w = 0; w < 8; w++) s += red[w][i];
-        if (i < CI * 8) { const int ci = i / 8, co = i % 8; if (co < Co) atomicAdd(&gw[(size_t)co * CI + ci], s); }
-        else if (gb && i - CI * 8 < Co) atomicAdd(&gb[i - CI * 8], s);
+        if (i < CI * 8) { const int ci = i / 8, co = i % 8; if (co0 + co < Co) atomicAdd(&gw[(size_t)(co0 + co) * CI + ci], s); }
+        else if (gb && co0 + i - CI * 8 < Co) atomicAdd(&gb[co0 + i - CI * 8], s);
     }
 }
 /* returns 1 when the bias gradient (gb) was accumulated as well (tensor-core head path), else 0 (the caller adds it) */
 extern "C" int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp) {
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
-    if (!old && (xs.c == 16 || xs.c == 32) && ys.c <= 8 && gydt == 2 && (!gp.G || xs.c % gp.G == 0)) {
+    if (!old && (xs.c == 16 || xs.c == 32) && ys.c <= 16 && gydt == 2 && (!gp.G || xs.c % gp.G == 0)) {
         const size_t S = shape_spatial(xs);
         const int nper = 8192;
         const dim3 grid((unsigned)((S + nper - 1) / nper), xs.n);
-        if (xs.c == 32) {   /* 32 inputs: the CUDA-core kernel kept 32 x 8 accumulators per thread (spilled; 14.4 vs ~2 ms at 384^3) */
-            if (xdt == 4) conv_bwd_w1_tc_k<4, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c);
-            else conv_bwd_w1_tc_k<8, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c);
-        } else if (xdt == 4) conv_bwd_w1_tc_k<4, 16><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c);
-        else conv_bwd_w1_tc_k<8, 16><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c);
+        for (int co0 = 0; co0 < ys.c; co0 += 8) {   /* 8 outputs per pass (one m16n8k16 column tile) */
+            if (xs.c == 32) {   /* 32 inputs: the CUDA-core kernel kept 32 x 8 accumulators per thread (spilled; 14.4 vs ~2 ms at 384^3) */
+                if (xdt == 4) conv_bwd_w1_tc_k<4, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0);
+                else conv_bwd_w1_tc_k<8, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0);
+            } else if (xdt == 4) conv_bwd_w1_tc_k<4, 16><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0);
+            else conv_bwd_w1_tc_k<8, 16><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0);
+        }
         LPCK();
         return gb != nullptr;
     }
@@ -257,16 +268,17 @@ extern "C" int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy,
     return 0;
 }
 extern "C" void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp) {
-    if (xs.c <= 32 && ys.c <= 8) {
+    if (xs.c <= 32 && ys.c <= 16) {
         const size_t S = shape_spatial(xs);
         const int nper = 8192, nbx = (int)((S + nper - 1) / nper);
         const dim3 grid(nbx, xs.n);
         const uint8_t *xq = (const uint8_t *)x;
-#define BW1F(B, CO, KM) do { if (gydt == 2) conv_bwd_w1_mx1_k<B, __half, CO, KM><<<grid, 256>>>(xq, (const __half *)gy, gw, xs.n, xs.c, S, gp, nper, ys.c); \
-                         else if (gydt == 1) conv_bwd_w1_mx1_k<B, bf16, CO, KM><<<grid, 256>>>(xq, (const bf16 *)gy, gw, xs.n, xs.c, S, gp, nper, ys.c); \
-                         else conv_bwd_w1_mx1_k<B, float, CO, KM><<<grid, 256>>>(xq, (const float *)gy, gw, xs.n, xs.c, S, gp, nper, ys.c); } while (0)
-        if (ys.c > 2 && xs.c <= 16) { if (xdt == 4) BW1F(4, 8, 16); else BW1F(8, 8, 16); }   /* affinity heads: up to 8 outputs */
-        else if (ys.c > 2) { if (xdt == 4) BW1F(4, 8, 32); else BW1F(8, 8, 32); }
+        int co0 = 0;
+#define BW1F(B, CO, KM) do { if (gydt == 2) conv_bwd_w1_mx1_k<B, __half, CO, KM><<<grid, 256>>>(xq, (const __half *)gy, gw, xs.n, xs.c, S, gp, nper, ys.c, co0); \
+                         else if (gydt == 1) conv_bwd_w1_mx1_k<B, bf16, CO, KM><<<grid, 256>>>(xq, (const bf16 *)gy, gw, xs.n, xs.c, S, gp, nper, ys.c, co0); \
+                         else conv_bwd_w1_mx1_k<B, float, CO, KM><<<grid, 256>>>(xq, (const float *)gy, gw, xs.n, xs.c, S, gp, nper, ys.c, co0); } while (0)
+        if (ys.c > 2 && xs.c <= 16) { for (; co0 < ys.c; co0 += 8) { if (xdt == 4) BW1F(4, 8, 16); else BW1F(8, 8, 16); } }   /* affinity heads: 8 outputs per pass */
+        else if (ys.c > 2) { for (; co0 < ys.c; co0 += 8) { if (xdt == 4) BW1F(4, 8, 32); else BW1F(8, 8, 32); } }
         else if (xdt == 4) { if (ys.c == 2) BW1F(4, 2, 32); else BW1F(4, 1, 32); }
         else { if (ys.c == 2) BW1F(8, 2, 32); else BW1F(8, 1, 32); }
 #undef BW1F

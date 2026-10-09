@@ -57,16 +57,16 @@ static int edt_feature(const uint8_t *seed, const int n[3], float *d2, int32_t *
     return 0;
 }
 
-int band_field(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out) {
-    return band_field_side(codes, n, o, cy, cx, p, out, nullptr);
-}
-int band_field_side(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out, uint8_t *side) {
+/* band and side; d2k / idxk (optional, N each): keep the squared distance and index of the nearest labelled recto voxel */
+static int band_impl(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out,
+                     uint8_t *side, float *d2k, int32_t *idxk) {
     const size_t N = (size_t)n[0] * n[1] * n[2], sy = (size_t)n[2], sz = (size_t)n[1] * n[2];
-    uint8_t *seed = malloc(N), *flag = malloc(N);
-    float *d2 = malloc(N * 4); int32_t *idx = malloc(N * 4);
-    if (!seed || !flag || !d2 || !idx) { free(seed); free(flag); free(d2); free(idx); return -1; }
+    uint8_t *seed = calloc(N, 1), *flag = malloc(N);   /* calloc: gcc cannot see that the loop below fills it */
+    float *d2 = d2k ? d2k : malloc(N * 4); int32_t *idx = idxk ? idxk : malloc(N * 4);
+#define BAND_FREE() do { free(seed); free(flag); if (!d2k) free(d2); if (!idxk) free(idx); } while (0)
+    if (!seed || !flag || !d2 || !idx) { BAND_FREE(); return -1; }
     for (size_t i = 0; i < N; i++) seed[i] = codes[i] > 0 && codes[i] < 255;
-    if (edt_feature(seed, n, d2, idx)) { free(seed); free(flag); free(d2); free(idx); return -1; }
+    if (edt_feature(seed, n, d2, idx)) { BAND_FREE(); return -1; }
     /* band = nearest surface winding +- half a turn; unknown beyond the flood radius */
     const float r2 = (p.radius / 2.f) * (p.radius / 2.f);
     for (size_t i = 0; i < N; i++) {
@@ -104,11 +104,73 @@ int band_field_side(const uint8_t *codes, const int n[3], const int64_t o[3], co
         }
     }
     if (any) {
-        if (edt_feature(seed, n, d2, idx)) { free(seed); free(flag); free(d2); free(idx); return -1; }
+        float *e2 = d2k ? malloc(N * 4) : d2; int32_t *ei = idxk ? malloc(N * 4) : idx;
+        const int rc = !e2 || !ei || edt_feature(seed, n, e2, ei);
         const float s2 = (p.span / 2.f) * (p.span / 2.f);
-        for (size_t i = 0; i < N; i++) if (d2[i] <= s2) out[i] = BAND_UNKNOWN;
+        if (!rc) for (size_t i = 0; i < N; i++) if (e2[i] <= s2) out[i] = BAND_UNKNOWN;
+        if (d2k) free(e2);
+        if (idxk) free(ei);
+        if (rc) { BAND_FREE(); return -1; }
     }
     if (side) for (size_t i = 0; i < N; i++) if (out[i] == BAND_UNKNOWN) side[i] = SIDE_UNKNOWN;
-    free(seed); free(flag); free(d2); free(idx);
+    BAND_FREE();
+#undef BAND_FREE
     return 0;
+}
+
+int band_field(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out) {
+    return band_impl(codes, n, o, cy, cx, p, out, nullptr, nullptr, nullptr);
+}
+int band_field_side(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out, uint8_t *side) {
+    return band_impl(codes, n, o, cy, cx, p, out, side, nullptr, nullptr);
+}
+
+/* Phase: the midpoints between consecutive rectos are the neighbour pairs on opposite sides with (nearly) the same band (at a
+   recto face the band jumps by a turn instead). With ds the distance to the nearest recto and dm the distance to the nearest
+   midpoint (+ half a voxel: the midpoint lies between the pair), a voxel on the recto side sits 0.5 ds / (ds + dm) of the
+   way from its recto to the next one outward, a voxel on the verso side 1 - 0.5 ds / (ds + dm): linear between parallel
+   rectos. Known only between two labelled consecutive rectos: the half spacing ds + dm within the flood radius, and the
+   nearest recto and the nearest midpoint on opposite sides of the voxel (else it lies beyond the outermost or innermost
+   labelled recto, or past the end of a trace). */
+int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out, uint8_t *phase) {
+    const size_t N = (size_t)n[0] * n[1] * n[2], sy = (size_t)n[2], sz = (size_t)n[1] * n[2];
+    uint8_t *side = malloc(N), *mid = malloc(N);
+    float *d2 = malloc(N * 4), *m2 = malloc(N * 4); int32_t *idx = malloc(N * 4), *im = malloc(N * 4);
+    int rc = !side || !mid || !d2 || !m2 || !idx || !im || band_impl(codes, n, o, cy, cx, p, out, side, d2, idx);
+    if (!rc) {
+        memset(mid, 0, N);
+        for (int z = 0; z < n[0]; z++) for (int y = 0; y < n[1]; y++) for (int x = 0; x < n[2]; x++) {
+            const size_t i = z * sz + y * sy + x;
+            if (side[i] == SIDE_UNKNOWN) continue;
+            const size_t nb[3] = {z + 1 < n[0] ? i + sz : i, y + 1 < n[1] ? i + sy : i, x + 1 < n[2] ? i + 1 : i};
+            for (int a = 0; a < 3; a++) {
+                const size_t j = nb[a];
+                if (j == i || side[j] == SIDE_UNKNOWN || side[j] == side[i]) continue;
+                if (abs(band_diff(out[i], out[j])) < BAND_HALF) mid[i] = mid[j] = 1;
+            }
+        }
+        rc = edt_feature(mid, n, m2, im);
+    }
+    if (!rc) {
+        const float h = p.radius / 2.f;   /* label voxels */
+        for (size_t i = 0; i < N; i++) {
+            phase[i] = PHASE_UNKNOWN;
+            if (side[i] == SIDE_UNKNOWN || im[i] < 0) continue;
+            const float ds = sqrtf(d2[i]), dm = sqrtf(m2[i]);
+            if (ds + dm > h) continue;
+            if (ds > 1.5f && dm > 1.5f) {
+                const long z = (long)(i / sz), y = (long)((i / sy) % n[1]), x = (long)(i % sy);
+                const size_t s = (size_t)idx[i], m = (size_t)im[i];
+                const float az = (float)((long)(s / sz) - z), ay = (float)((long)((s / sy) % n[1]) - y), ax = (float)((long)(s % sy) - x);
+                const float bz = (float)((long)(m / sz) - z), by = (float)((long)((m / sy) % n[1]) - y), bx = (float)((long)(m % sy) - x);
+                if (az * bz + ay * by + ax * bx > -0.5f * ds * dm) continue;
+            }
+            float f = 0.5f * ds / (ds + dm + 0.5f);
+            if (side[i] == SIDE_VERSO) f = 1.f - f;
+            int q = (int)lrintf(f * PHASE_PERIOD);
+            phase[i] = (uint8_t)(q >= PHASE_PERIOD ? q - PHASE_PERIOD : q);
+        }
+    }
+    free(side); free(mid); free(d2); free(m2); free(idx); free(im);
+    return rc ? -1 : 0;
 }

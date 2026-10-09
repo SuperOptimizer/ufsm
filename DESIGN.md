@@ -112,6 +112,28 @@ ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or
   convs by (layer, conv, pass) and compared a scratch pointer on the backward-data path, so convs sharing a layer id read each
   other's prepared weights (here: enc[i].c2's backward used the zero residual conv2: zero gradients below every level);
   the key now carries a block id (nn_set_block, WMEMO_N 4096).
+- Residual A/B (laptop, warm start from verso3 on the Paris4 band block, 3000 steps, cover x5, seeds 1 / 2, both arms the
+  same recipe; `--enc-blocks 0,0,2,3,3,3` vs none): F1 box 48128 0.260 / 0.271 vs control 0.263 / 0.271, box 48512 0.293 /
+  0.295 vs 0.294 / 0.294 (mean -0.001; the plan's bar was +0.01); FWHM 0.1-0.4 voxels wider; recto-cutoff band VOI lower in
+  all four pairs (box 48128 1.255 / 1.265 vs 1.402 / 1.614, box 48512 0.839 / 0.986 vs 0.855 / 1.108: fewer merges);
+  3.46 vs 3.75 samples/s (+8.5% step). Not adopted for the recto; the merge reduction is worth re-testing with a longer run.
+- Winding phase (after upstream lasagna's cos target, made signed): `band_field_phase` (src/band.c) gives every voxel between
+  two labelled consecutive rectos the fraction of the way outward from the recto it lies outward of to the next one (x252;
+  0 on a recto, 126 midway, wrapping to 0 at the next recto). The midpoints are the neighbour pairs on opposite sides whose
+  band is (nearly) equal (at a recto face the band jumps by a turn); with ds the distance to the nearest recto and dm to the
+  nearest midpoint (+ half a voxel), phase = 0.5 ds / (ds + dm) on the recto side and 1 - that on the verso side (linear
+  between parallel rectos); known only if ds + dm is within the flood radius and the nearest recto and midpoint lie on
+  opposite sides of the voxel (not beyond the outermost / innermost labelled recto or past a trace's end). Concentric shells
+  (tests/test_side.c): all voxels between the shells known, error 0.015 turns mean / 0.057 max. Holdout boxes: known on
+  62% / 77% of CT voxels (the side: 65% / 79%), its half agrees with the side everywhere; cutting the reference phase at its
+  wraps (6-neighbours > half a turn apart) within known voxels recovers the band instances (VOI 0.001 / 0.006); unknown
+  voxels in the domain bridge windings (VOI 4.1), so predicted pieces are cut within confident voxels. ~10% on top of the
+  band field. `train --side 2` (task band_affinity, B 1): two channels, soft BCE targets 0.5 + 0.5 cos / sin (2 pi phase)
+  (nn_phase_targets), mask = known phase (CT <= --side-air unknown, default only CT 0: gaps are supervised); `ufsm band
+  --phase`; score_sheets `--phase-channel C`: circular error, side accuracy of phase < 0.5, confidence, pieces at the wraps.
+  The MX head kernels (forward fp32 / fp16 logits, weight gradient, backward data) now take up to 16 outputs (recto + 6
+  affinities + 2 = 9): staged weights padded to 16, the tensor-core / CUDA-core weight gradients run once per 8 outputs
+  (test_mx4: 9 and 16 outputs). The 16-bit (non-MX) 1^3 weight gradient still takes at most 8 outputs.
 
 ## Memory and inference defaults (2026-10-08)
 

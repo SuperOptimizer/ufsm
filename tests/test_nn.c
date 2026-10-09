@@ -612,6 +612,25 @@ int main(void) {
         printf("mask24 %s\n", bad ? "FAIL" : "ok"); if (bad) fails++;
         free(h); free(m); nn_free(dw); nn_free(dm);
     }
+    {   /* side / phase loss targets (train --side 1 / 2): SIDE_RECTO -> 255, phase v -> 255 (0.5 + 0.5 (cos, sin)(2 pi v / 252)),
+           unknown (255) -> masked out */
+        enum { NV = 260 };
+        uint8_t h[NV], t[2 * NV], m[NV];
+        for (int i = 0; i < NV; i++) h[i] = (uint8_t)(i < 252 ? i : 255);
+        uint8_t *dh = nn_malloc(NV), *dt = nn_malloc(2 * NV), *dm = nn_malloc(NV); nn_h2d(dh, h, NV);
+        nn_phase_targets(dh, NV, dt, dm); nn_d2h(t, dt, 2 * NV); nn_d2h(m, dm, NV);
+        int bad = 0;
+        for (int i = 0; i < NV; i++) {
+            if (i >= 252) { bad += m[i] != 0; continue; }
+            const double a = 2 * M_PI * i / 252.0;
+            bad += m[i] != 1 || abs((int)t[i] - (int)lrint(127.5 + 127.5 * cos(a))) > 1 || abs((int)t[NV + i] - (int)lrint(127.5 + 127.5 * sin(a))) > 1;
+        }
+        CHECK(!bad, "phase targets (%d wrong)", bad);
+        uint8_t sd[3] = {0, 1, 255}; nn_h2d(dh, sd, 3); nn_side_targets(dh, 3, dt, dm); nn_d2h(t, dt, 3); nn_d2h(m, dm, 3);
+        CHECK(t[0] == 0 && t[1] == 255 && m[0] == 1 && m[1] == 1 && m[2] == 0, "side targets");
+        nn_free(dh); nn_free(dt); nn_free(dm);
+        printf("side / phase targets %s\n", bad ? "FAIL" : "ok");
+    }
     printf(fails ? "%d FAILURES\n" : "nn ok\n", fails);
     return fails != 0;
 }

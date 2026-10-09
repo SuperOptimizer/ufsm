@@ -14,6 +14,11 @@ Per box and checkpoint (output channel 0 = recto unless --channel):
              split, pieces merged; pieces = connected voxels below the recto cutoff), over known voxels and over known
              material voxels (4.8 um CT mean >= tau; tau = Otsu over the box's CT > 0 voxels unless --material-tau)
   legacy     the label-grid scores again with the older {2j, 2j + 1} pooling of the tools before 2026-10-09
+  side       (--side-channel C, train --side 1) accuracy of the recto/verso side and sheet pieces cut on its verso -> recto faces
+  phase      (--phase-channel C, train --side 2: channels C = 0.5 + 0.5 cos, C + 1 = 0.5 + 0.5 sin of the winding phase)
+             circular phase error (turns) against the reference phase (ufsm band --phase) over known voxels, the side it
+             implies (phase < 0.5: recto side) and its accuracy, mean confidence (length of the (cos, sin) vector), and sheet
+             pieces cut where the phase wraps (6-neighbours more than half a turn apart), over all CT and over material
 usage: score_sheets.py --out DIR NAME=CKPT [...] [--boxes z,y,x,nz,ny,nx;...] [--gpu 0] [--root R --ct G --cache C
        --labels L --codes Q --axis A] [--window 544,16] [--channel 0]
 """
@@ -215,6 +220,59 @@ def side_pieces(side_r, material, inside, lo, axis, conn=1, sigma=1.0, valid=Non
     return lab, float(cut.sum() / max(material.sum(), 1))
 
 
+def phase_of(c, s):
+    """label-grid phase in turns [0, 1) and confidence [0, 1] from the cos / sin channels (bytes, 0.5 + 0.5 cos x 255)"""
+    x = c.astype(np.float32) - 127.5; y = s.astype(np.float32) - 127.5
+    return np.mod(np.arctan2(y, x) / (2 * np.pi), 1.0), np.minimum(np.hypot(x, y) / 127.5, 1.0)
+
+
+def phase_cut(ph, domain):
+    """wrap voxels: the low-phase voxel of every 6-neighbour pair inside the domain whose phases differ by more than half a
+    turn (the recto face, where the phase falls from ~1 back to 0 going outward)"""
+    cut = np.zeros(ph.shape, bool)
+    for ax in range(3):
+        a = [slice(None)] * 3; b = [slice(None)] * 3
+        a[ax] = slice(0, -1); b[ax] = slice(1, None); a = tuple(a); b = tuple(b)
+        d = ph[b] - ph[a]; both = domain[a] & domain[b]
+        cut[a] |= both & (d > 0.5); cut[b] |= both & (d < -0.5)
+    return cut
+
+
+def phase_pieces(ph, domain, inside, conn=1):
+    """sheet instances from the phase: connected domain voxels minus the wraps; small pieces dropped; every other voxel inside
+    takes the nearest piece"""
+    cut = phase_cut(ph, domain)
+    lab, nl = ndi.label(domain & ~cut, ndi.generate_binary_structure(3, conn))
+    size = np.bincount(lab.ravel(), minlength=nl + 1); keep = size >= MIN_PIECE; keep[0] = False
+    lab = np.where(keep[lab], lab, 0)
+    if (lab > 0).any():
+        _, ind = ndi.distance_transform_edt(lab == 0, return_indices=True)
+        lab = np.where(inside, lab[tuple(ind)], 0)
+    return lab, float(cut.sum() / max(domain.sum(), 1))
+
+
+PHASE_CONF = (0.0, 0.2, 0.4, 0.6)   # pieces are cut within voxels at least this confident (best VOI reported, like the recto cutoffs)
+
+
+def phase_scores(ph, conf, pref, inside, material, ref, known, confs=PHASE_CONF):
+    pk = (pref < 252) & inside
+    g = pref.astype(np.float32) / 252.0
+    e = np.abs(ph - g); e = np.minimum(e, 1 - e)
+    r = dict(known_fraction=float(pk.sum() / max(inside.sum(), 1)),
+             error_mean=float(e[pk].mean()), error_median=float(np.median(e[pk])), error_mean_material=float(e[pk & material].mean()),
+             within_0p1=float((e[pk] < 0.1).mean()),
+             side_accuracy=float(((ph[pk] < 0.5) == (g[pk] < 0.5)).mean()), side_accuracy_material=float(((ph[pk & material] < 0.5) == (g[pk & material] < 0.5)).mean()),
+             confidence_known=float(conf[pk].mean()), confidence_inside=float(conf[inside].mean()))
+    for dom, nm in ((inside, 'all'), (material, 'material')):
+        rr = []
+        for c in confs:
+            lab, cf = phase_pieces(ph, dom & (conf >= c), inside)
+            rr.append(dict(confidence=c, cut_fraction=cf, known=compare(ref, lab, known), material=compare(ref, lab, known & material)))
+        r['pieces_' + nm] = min(rr, key=lambda x: x['known']['voi'])
+        r['pieces_' + nm + '_by_confidence'] = rr
+    return r
+
+
 def main():
     a = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     a.add_argument('--out', required=True); a.add_argument('--boxes', default=BOXES); a.add_argument('--gpu', default='0')
@@ -224,6 +282,7 @@ def main():
     a.add_argument('--predict-args', default='', help='extra ufsm predict options (e.g. "--gn-frozen F")')
     a.add_argument('--quick', action='store_true', help='pixel and label-grid tolerance scores only')
     a.add_argument('--side-channel', type=int, help='output channel of the recto/verso side (train --side): sheet pieces from it')
+    a.add_argument('--phase-channel', type=int, help='first of the two winding-phase channels (train --side 2): phase error and pieces')
     a.add_argument('--cutoffs', default='0.1,0.15,0.2,0.25,0.3,0.4,0.5'); a.add_argument('ckpts', nargs='+')
     g = a.parse_args()
     g.window = g.window.split(',')
@@ -252,6 +311,10 @@ def main():
         if g.side_channel is not None and not side_ref.exists():
             run([UFSM, 'band', g.codes, '4.8', bs, bd / 'band.raw', '--axis', g.axis, '--side', bd / 'side.raw'])
             np.save(side_ref, np.fromfile(bd / 'side.raw', np.uint8).reshape(tuple(ln))); (bd / 'side.raw').unlink(); (bd / 'band.raw').unlink()
+        phase_ref = bd / 'phase_ref.npy'
+        if g.phase_channel is not None and not phase_ref.exists():
+            run([UFSM, 'band', g.codes, '4.8', bs, bd / 'band.raw', '--axis', g.axis, '--phase', bd / 'phase.raw'])
+            np.save(phase_ref, np.fromfile(bd / 'phase.raw', np.uint8).reshape(tuple(ln))); (bd / 'phase.raw').unlink(); (bd / 'band.raw').unlink()
         R = np.load(ref_path)
         k, ref, inside, gt, tau = R['k'], R['lab'], R['inside'], R['gt'], int(R['tau'])
         material = inside & (R['ctm'].astype(np.float32) >= tau)
@@ -287,6 +350,14 @@ def main():
                 lab, cf = side_pieces(ps, material, inside, lo, axis)
                 r['side'] = dict(accuracy_known=float((ps[sk] == (sref[sk] == 1)).mean()), accuracy_material=float((ps[sk & material] == (sref[sk & material] == 1)).mean()),
                                  cut_fraction=cf, known=compare(ref, lab, known), material=compare(ref, lab, known & material))
+            if g.phase_channel is not None:   # winding phase (label grid, mean over each label voxel's natives)
+                cs = []
+                for c in (g.phase_channel, g.phase_channel + 1):
+                    predict(g, ck, box, cd / ('ch%d' % c), str(c))
+                    cs.append(pool_mean(read(cd / ('ch%d' % c), '2.4', (0, 0, 0), n, cd / 'p.raw'), o))
+                ph, conf = phase_of(*cs)
+                np.savez_compressed(cd / 'phase.npz', ph=(ph * 252).astype(np.uint8), conf=(conf * 255).astype(np.uint8))
+                r['phase'] = phase_scores(ph, conf, np.load(phase_ref), inside, material, ref, known)
             json.dump(r, open(res, 'w'), indent=1); rows.append(r)
             del p, thin
     for r in rows:
@@ -307,6 +378,13 @@ def main():
             print('%-14s box%d side: accuracy %.3f (material %.3f) | pieces VOI %.3f (split %.3f merge %.3f) ARAND %.3f, material VOI %.3f (merge %.3f), split %d merged %d'
                   % (r['name'], r['box'][0], sd['accuracy_known'], sd['accuracy_material'], sd['known']['voi'], sd['known']['voi_split'], sd['known']['voi_merge'],
                      sd['known']['adjusted_rand'], sd['material']['voi'], sd['material']['voi_merge'], sd['known']['bands_split'], sd['known']['pieces_merged']), flush=True)
+        if 'phase' in r:
+            q = r['phase']; pa, pm = q['pieces_all'], q['pieces_material']
+            print('%-14s box%d phase: error %.3f turns (median %.3f, material %.3f, <0.1 %.3f) side accuracy %.3f (material %.3f) confidence %.2f | '
+                  'pieces all (conf >= %.1f) VOI %.3f (merge %.3f) material VOI %.3f (merge %.3f) | material pieces (conf >= %.1f) VOI %.3f (merge %.3f)'
+                  % (r['name'], r['box'][0], q['error_mean'], q['error_median'], q['error_mean_material'], q['within_0p1'], q['side_accuracy'],
+                     q['side_accuracy_material'], q['confidence_known'], pa['confidence'], pa['known']['voi'], pa['known']['voi_merge'], pa['material']['voi'],
+                     pa['material']['voi_merge'], pm['confidence'], pm['known']['voi'], pm['known']['voi_merge']), flush=True)
     json.dump(rows, open(out / 'summary.json', 'w'), indent=1)
 
 

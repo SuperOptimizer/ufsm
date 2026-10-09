@@ -43,7 +43,7 @@ typedef struct {
     const sheet_dataset *sheet; /* borrowed sparse geometry, native-level B=1 task */
     int band;                /* 1: fill batch.band from each source's band target (task band_affinity, native level, no geometry warp) */
     int side, side_air;      /* side: 1 fills batch.side (band.h SIDE_*: recto / verso side of the nearest labelled recto) from the same band
-                                field; voxels with CT <= side_air (and CT 0) are SIDE_UNKNOWN */
+                                field, 2 fills it with the winding phase (band.h PHASE_*); voxels with CT <= side_air (and CT 0) are unknown */
 } sample_cfg;
 
 typedef struct {
@@ -58,7 +58,7 @@ typedef struct {
     int64_t (*corner)[3];    /* B: level-0 corner */
     sheet_batch **sheet;     /* B sparse records; null for legacy task */
     uint8_t *band;           /* B x P^3 band per voxel (src/band.h: 1/18-turn steps mod 252, 255 unknown) when cfg.band */
-    uint8_t *side;           /* B x P^3 side per voxel (src/band.h SIDE_*) when cfg.side */
+    uint8_t *side;           /* B x P^3 side (src/band.h SIDE_*) or winding phase (PHASE_*) per voxel when cfg.side */
 } batch;
 
 typedef struct sampler sampler;
