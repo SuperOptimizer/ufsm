@@ -162,6 +162,7 @@ __global__ void __launch_bounds__(256) bwd_data_s2_tc_k(const uint8_t *__restric
         }
     }
 }
+/* the 96 KB dynamic shared memory attribute is per device: set it once on every GPU that launches (split z uses two) */
 extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr) {
     static int on = -1; if (on < 0) on = getenv("UFSM_S2B_TC") ? atoi(getenv("UFSM_S2B_TC")) : 1;
     if (!on || xs.c != ys.c || (xs.c != 16 && xs.c != 32 && xs.c != 64)) return 0;
@@ -174,7 +175,7 @@ extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, s
     const dim3 grid(nb, (unsigned)(C / CB));
     __nv_bfloat16 *wtg = lp_buf<__nv_bfloat16>(0, (size_t)27 * C * (C + 8));
     const uint8_t *gq = (const uint8_t *)gy; uint8_t *xq = (uint8_t *)gx;
-#define S2TC(CC, G, X) do { static int at_ = 0; if (!at_) { at_ = 1; cudaFuncSetAttribute((const void *)bwd_data_s2_tc_k<CC, G, X>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
+#define S2TC(CC, G, X) do { static unsigned at_ = 0; int dev_ = 0; cudaGetDevice(&dev_); if (!(at_ >> dev_ & 1u)) { at_ |= 1u << dev_; cudaFuncSetAttribute((const void *)bwd_data_s2_tc_k<CC, G, X>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
                             s2tc_prep_w_k<CC><<<nblk_(27 * CC * (CC + 8), 256), 256>>>(w, wtg); \
                             bwd_data_s2_tc_k<CC, G, X><<<grid, 256, sm>>>(gq, wtg, xq, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum, osr); } while (0)
     if (C == 16) S2TC(16, 8, 8);

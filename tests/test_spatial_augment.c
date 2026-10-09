@@ -16,9 +16,11 @@ int main(void) {
         sheet_parameters(&sheet,z,params[z]); cy[z]=params[z][0]; cx[z]=params[z][1];
         for (int y=0;y<P;y++) for (int x=0;x<P;x++) { size_t k=((size_t)z*P+y)*P+x; ct[k]=60+z+2*y+3*x; target[k]=z+2*y+3*x; mask[k]=z!=0; }
     }
-    for (int mode=0;mode<3;mode++) {
+    for (int mode=0;mode<5;mode++) {   /* 0 rotation, 1 elastic, 2 both, 3 both + zoom-in 0.8, 4 both + anisotropic scale/shear */
         spatial_aug a,b; spatial_aug_make(&a,17,P,mode==1?0:5,1,mode==0?0:1,1);
         spatial_aug_make(&b,17,P,mode==1?0:5,1,mode==0?0:1,1); assert(!memcmp(&a,&b,sizeof a));
+        if (mode==3) spatial_aug_zoom(&a,.8);
+        if (mode==4) { spatial_aug_affine(&a,99,.2,.12); assert(a.det>.5 && a.det<2); }
         spatial_aug_tables(&a,table);
         for (int d=0;d<3;d++) for (int u=0;u<P;u++) assert(fabs(table[(3+d)*P+u])<=.090001);
         int cropped=0,checked=0;
@@ -47,7 +49,8 @@ int main(void) {
         double source[3]={11.25,17.2,13.6},out[3]; spatial_aug_forward(&a,source,out);
         double v[3],recovered[3],center=.5*(P-1);
         for (int d=0;d<3;d++) v[d]=out[d]-center-a.amplitude[d]*sin(a.frequency*out[d]+a.phase[d]);
-        for (int d=0;d<3;d++) { recovered[d]=center; for (int j=0;j<3;j++) recovered[d]+=a.R[j][d]*v[j]; assert(fabs(recovered[d]-source[d])<1e-10); }
+        double w[3]; for (int d=0;d<3;d++) { w[d]=0; for (int j=0;j<3;j++) w[d]+=a.R[j][d]*v[j]; }
+        for (int d=0;d<3;d++) { recovered[d]=center; for (int j=0;j<3;j++) recovered[d]+=a.scale*(a.affine?a.A[d][j]:j==d)*w[j]; assert(fabs(recovered[d]-source[d])<1e-10); }
         sheet_point points[4]={{{11.25,17.2,13.6},3,.5},{{13,15,17},3.2,.7},{{11.25,17.2,13.6},3,.5},{{-100,0,0},4,.8}};
         sheet_term terms[2]={{2,2,0,1,.2},{3,2,2,1,0}};
         sheet_batch batch={.np=4,.nt=2,.points=points,.terms=terms}; memset(M,1,n);

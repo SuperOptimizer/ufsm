@@ -2,6 +2,7 @@
    by GroupNorm(G) + SiLU; stride-2 3^3 conv down; trilinear 2x up + channel concat; 1^3 head.
    Parameters, gradients, Adam moments and the EMA copy live in flat device arrays. */
 #pragma once
+#include <math.h>
 #include "nn.h"
 #include <stdint.h>
 
@@ -13,14 +14,23 @@ typedef struct {
     int cin, cout;
     int G;                 /* GroupNorm groups (min(G, C) is used) */
     int down_norm;         /* 1: GroupNorm + SiLU after each stride-2 down conv (params appended after the head; 0 keeps the old layout) */
+    int scale_cond;        /* 1: voxel-size conditioning: the stem conv bias is b + c * v, c = unet_scale_code(input voxel size), v a learned
+                              per-channel vector (appended last, zero-initialised: a donor without it is unchanged) */
 } unet_cfg;
 
 typedef struct unet unet;
 
 unet *unet_create(const unet_cfg *cfg);
+/* scale code of an input voxel size (um): log2(um / 4.8), so 2.4 um -> -1, 9.6 um -> +1 */
+static inline float unet_scale_code(double um) { return um > 0 ? (float)log2(um / 4.8) : 0.f; }
+/* input voxel size of the following forward passes (scale_cond nets; one value per forward, i.e. per batch) */
+void unet_set_scale(unet *u, double um);
 void unet_free(unet *u);
 const unet_cfg *unet_cfg_of(const unet *u);
 size_t unet_nparams(const unet *u);
+const float *unet_live_params(const unet *u);   /* device weights the optimiser trains (p) */
+void unet_use_params(unet *u, const float *w);  /* forward with these device weights (unet_nparams floats); nullptr restores */
+void unet_grad_head_only(unet *u, int blocks);   /* zero all gradients but the output head's (and the last decoder blocks') */
 void unet_init(unet *u, uint64_t seed);                 /* Kaiming-normal convs, GN gamma 1 / beta 0, head bias -2 */
 
 /* Forward for one input shape (activation buffers are (re)allocated when the shape changes).
@@ -70,6 +80,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra_json)
 int unet_load(unet *u, const char *path);
 int unet_load_grow(unet *u, const char *path, int keep, float new_bias);   /* warm start into a wider head (src/unet.c) */
 int unet_init_from(unet *u, const char *path);   /* partial warm start: shape-matching layers of another net (src/unet.c) */
+int unet_init_from_map(unet *u, const char *path, const int *head_rows);   /* the same with an explicit head row map (src/unet.c) */
 /* Retain surface response, zero the new scalar input and winding output,
    including EMA/Adam/Muon state for those parameters. */
 int unet_start_sheet(unet *u);

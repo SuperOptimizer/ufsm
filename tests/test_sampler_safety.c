@@ -70,8 +70,11 @@ int main(int argc, char **argv) {
         batch *eb=sampler_next(esp); assert(eb);
         check("erosion precedes softening and retains unit core",eb->t[2]==255 && eb->t[3]==255 && eb->t[1]==225);
         sampler_release(esp,eb); sampler_stop(esp);
+        E->src[0].um=2.5; ec.soft=5; ec.soft_um=1; esp=sampler_start(E,&ec); assert(esp); eb=sampler_next(esp); assert(eb);
+        check("soft sigma in um divides by the source voxel size",eb->t[2]==255 && eb->t[3]==255 && eb->t[1]==225);
+        sampler_release(esp,eb); sampler_stop(esp); E->src[0].um=1; ec.soft=2; ec.soft_um=0;
         ec.cover=nullptr; ec.level_p[1]=1; esp=sampler_start(E,&ec);
-        check("erosion rejects non-native sampling",esp==nullptr); sampler_stop(esp);
+        check("erosion allows coarser levels (it erodes level 0 only)",esp!=nullptr); sampler_stop(esp);
         sources_free(E);
     }
     sources *S = fixture(argv[1], ",\"holdout\":[7,11,13,51,53,55]");
@@ -126,8 +129,31 @@ int main(int argc, char **argv) {
     sp = sampler_start(S, &c); assert(sp); aug = sampler_next(sp); assert(aug);
     check("augmentation is reproducible across worker counts", !memcmp(input, aug->x, 4 * n * sizeof(float)));
     sampler_release(sp, aug); sampler_stop(sp); free(input); free(target); free(mask);
+    {   /* scanner-domain ops: strength 0 is bit-identical; otherwise targets stay, supervision can only shrink */
+        sample_cfg sc = c; sc.ct_augment = 0; sc.nworkers = 1;
+        input = malloc(4 * n * sizeof(float)); target = malloc(NCH * n); mask = malloc(n);
+        sp = sampler_start(S, &sc); assert(sp); aug = sampler_next(sp); assert(aug);
+        memcpy(input, aug->x, 4 * n * sizeof(float)); memcpy(target, aug->t, NCH * n); memcpy(mask, aug->m, n);
+        sampler_release(sp, aug); sampler_stop(sp);
+        for (int i = 0; i < SA_N; i++) sc.scan.p[i] = 1;
+        sc.scan.strength = 0;
+        sp = sampler_start(S, &sc); assert(sp); aug = sampler_next(sp); assert(aug);
+        check("scanner augmentation strength 0 is the identity", !memcmp(input, aug->x, 4 * n * sizeof(float)) && !memcmp(target, aug->t, NCH * n) && !memcmp(mask, aug->m, n));
+        sampler_release(sp, aug); sampler_stop(sp);
+        sc.scan.strength = 2; sc.scan.p[SA_SEAM] = 0; sc.scan.drop_ignore = 1;
+        sp = sampler_start(S, &sc); assert(sp); aug = sampler_next(sp); assert(aug);
+        int kept = !memcmp(target, aug->t, NCH * n), changed = !!memcmp(input, aug->x, n * sizeof(float)), finite = 1;
+        for (size_t k = 0; k < n; k++) kept &= aug->m[k] <= mask[k];
+        for (size_t k = 0; k < 4 * n; k++) finite &= isfinite(aug->x[k]);
+        float *again = malloc(4 * n * sizeof(float)); memcpy(again, aug->x, 4 * n * sizeof(float));
+        sampler_release(sp, aug); sampler_stop(sp); sc.nworkers = 4;
+        sp = sampler_start(S, &sc); assert(sp); aug = sampler_next(sp); assert(aug);
+        check("scanner augmentation keeps targets, only drops supervision", kept && changed && finite);
+        check("scanner augmentation reproducible across worker counts", !memcmp(again, aug->x, 4 * n * sizeof(float)));
+        sampler_release(sp, aug); sampler_stop(sp); free(again); free(input); free(target); free(mask);
+    }
     c.augment=1; c.geometry_augment=1; c.rotate_degrees=5; c.rotate_p=1; c.elastic=1; c.elastic_p=1;
-    c.soft=1.75; c.label_morph=.25; c.label_morph_p=1; c.nworkers=1;
+    c.soft=1.75; c.label_morph=.25; c.label_morph_p=1; c.nworkers=1; c.affine_p=1; c.affine_aniso=.1f; c.affine_shear=.06f; c.scan.strength=1;
     input=malloc(4*n*sizeof(float)); target=malloc(NCH*n); mask=malloc(n);
     sp=sampler_start(S,&c); assert(sp); aug=sampler_next(sp); assert(aug);
     memcpy(input,aug->x,4*n*sizeof(float)); memcpy(target,aug->t,NCH*n); memcpy(mask,aug->m,n);

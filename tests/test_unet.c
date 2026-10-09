@@ -55,8 +55,10 @@ int main(void) {
     unet_cfg cfg = {3, {4, 6, 8}, 4, 2, 2};
     cfg.down_norm = getenv("UFSM_DOWN_NORM") ? atoi(getenv("UFSM_DOWN_NORM")) : 0;
     if (getenv("UFSM_TINY")) { cfg.nlev = 0; char *t = strdup(getenv("UFSM_TINY")); for (char *q = strtok(t, ","); q; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); }
+    cfg.scale_cond = getenv("UFSM_SCALE_COND") ? atoi(getenv("UFSM_SCALE_COND")) : 0;   /* voxel-size conditioning: also check its vector */
     unet *u = unet_create(&cfg);
     unet_init(u, 1);
+    if (cfg.scale_cond) unet_set_scale(u, 9.6);   /* code +1 */
     size_t np = unet_nparams(u);
     printf("tiny unet: %zu params\n", np);
     shape5 xs = {getenv("UFSM_TN") ? atoi(getenv("UFSM_TN")) : 2, 4, 8, 8, 16};
@@ -98,9 +100,9 @@ int main(void) {
     fread(p, 4, np, f); fread(g, 4, np, f); fread(g, 4, np, f); fclose(f);   /* third array = m = g */
     double worst = 0, gmax = 0;
     for (size_t i = 0; i < np; i++) if (fabs(g[i]) > gmax) gmax = fabs(g[i]);
-    int K = 60, bad = 0;
-    for (int k = 0; k < K; k++) {
-        size_t i = (size_t)rand() % np;
+    int K = 60, bad = 0, KS = cfg.scale_cond ? cfg.widths[0] : 0;   /* scale_cond: every entry of the conditioning vector (last in the layout) */
+    for (int k = 0; k < K + KS; k++) {
+        size_t i = k < K ? (size_t)rand() % np : np - (size_t)KS + (size_t)(k - K);
         float o = p[i], eps = 1e-2f;
         float *dp = nullptr; (void)dp;
         /* nudge parameter i on the device: rewrite the whole param array (small net) */
@@ -117,7 +119,7 @@ int main(void) {
     }
     { FILE *w = fopen(ckpt_path, "r+b"); fseek(w, 4, SEEK_SET); fgets(line, sizeof line, w); fwrite(p, 4, np, w); fclose(w); }
     unet_load(u, ckpt_path);
-    printf("param fd check: worst rel err %.3g over %d params (%d bad)\n", worst, K, bad);
+    printf("param fd check: worst rel err %.3g over %d params (%d bad)\n", worst, K + KS, bad);
     /* EMA/use_ema path sanity: ema == p right after init copy? we changed p via adamw(lr=0) so p unchanged: outputs equal */
     unet_use_ema(u, 1);
     double le = loss_of(u, dx, xs, dgy, nl, h);

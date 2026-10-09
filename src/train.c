@@ -37,15 +37,25 @@ typedef struct {
     batch *pending;              /* host batch whose upload into buffer (cur ^ 1) is in flight */
     int lean;                    /* one batch buffer; logit gradient in the model's gradient buffer B */
     int gl_inside;               /* lean: the logit gradient lives in the model's gradient buffers (setup checked the batch overlap) */
+    int64_t cornb[2][3]; int lvlb[2];   /* level-0 corner / level of the batch in each buffer (verso dump) */
+    uint8_t *vsoft, *vanch;      /* --verso-ridge: the soft teacher output of the window; --verso-anchor ridge target */
+    uint8_t *vmask, *vw; float *vscratch, vout[3]; double verso_loss;   /* verso loss: own mask (every owned voxel), weight byte, scratch, parts */
+    float *teacher;              /* --verso frozen teacher: the starting weights, read by the verso target forward */
     int cur;
     int side;                    /* --split z: 0 = low z half, 1 = high z half of every window; -1 = whole windows */
     const sheet_batch *sheet;
     double sheet_loss, sheet_parts[5];
+    float umb[2], um;            /* input voxel size of the batch in each buffer / the current one (scale_cond) */
     uint8_t *bandb[2], *band;    /* task band_affinity: band per voxel (double-buffered like t / m), current */
     float *aff_fin, aff_out[48]; double aff_loss;
 } gpu_state;
 /* task band_affinity: output channel 0 = recto (dense loss on target channel 0), channels 1..K = affinities for g_aff_off */
 static int g_aff, g_cout = NCH; static aff_offsets_t g_aff_off; static float g_aff_lambda = 1.f;
+/* --verso 1: output channel 1 is the verso face. Its target is the model's own recto channel (eval forward, no gradient) with
+   the radial input reversed and the CT unchanged: a recto model marks the other face of the sheet when the direction flips
+   (the usrm2 radial-sign trick). Band affinities then start at channel 2. g_verso_on: from --verso-start on. */
+static float g_verso_swap, g_verso_lambda = 1.f;   /* lambda: verso loss weight (its gradient and its share of the reported loss) */ static int g_verso_flip, g_head_only;   /* swap: probability of a step with the direction reversed and recto/verso targets exchanged */
+static int g_verso, g_verso_start, g_verso_on, g_verso_self, g_verso_zero, g_verso_ridge, g_verso_anchor;   /* anchor: recto voxels without a trusted label take the teacher's normal-direction output */ static float g_verso_hard;   /* ridge: thin verso targets, the teacher's ridge along the direction at >= this byte */   /* hard: binary verso targets at this teacher probability; zero: fresh verso head row */   /* self: targets from the live weights (collapses: the net learns to ignore the direction) */
 static sheet_dataset *g_sheet;
 static float g_sheet_ramp;
 static int g_sheet_variant=2;
@@ -56,7 +66,7 @@ static int g_Dl, g_h0; static uint8_t *g_zeros;
 static int g_xfmt = 0, g_g16 = 0;   /* input batches uploaded as 16-bit (1 fp16, 2 bf16); loss gradient written as 16-bit */
 static size_t xbytes(void) { return g_xfmt ? 2 : 4; }
 static const void *bx(const batch *b) { return g_xfmt ? (const void *)b->x16 : (const void *)b->x; }
-static void select_buf(gpu_state *d, int i) { d->cur = i; d->x = d->xb[i]; d->t = d->tb[i]; d->m = d->mb[i]; d->w = d->wb[i]; d->band = d->bandb[i]; }
+static void select_buf(gpu_state *d, int i) { d->cur = i; d->x = d->xb[i]; d->t = d->tb[i]; d->m = d->mb[i]; d->w = d->wb[i]; d->band = d->bandb[i]; d->um = d->umb[i]; }
 /* this GPU's z slab of a batch: rows of the [rows][P][P][P] arrays, planes [z0, z0 + g_Dl); mask halo planes from zeros */
 static void upload_slab(gpu_state *d, const batch *b, int i, int B, int P, int async) {
     void (*cp)(void *, const void *, size_t) = async ? nn_h2d_copy_stream : nn_h2d;
@@ -75,6 +85,8 @@ static void upload_slab(gpu_state *d, const batch *b, int i, int B, int P, int a
 /* synchronous upload (pageable host memory: validation batches) */
 static void upload(gpu_state *d, const batch *b, int B, int P) {
     d->sheet=b->sheet?b->sheet[0]:nullptr;
+    d->um = d->umb[d->cur] = b->um ? b->um[0] : 0.f;
+    if (b->corner && b->level) { memcpy(d->cornb[d->cur], b->corner[0], sizeof d->cornb[0]); d->lvlb[d->cur] = b->level[0]; }   /* validation copies carry none */
     if (d->side >= 0) { upload_slab(d, b, d->cur, B, P, 0); return; }
     size_t p3 = (size_t)P * P * P;
     nn_h2d(d->x, bx(b), (size_t)B * 4 * p3 * xbytes());
@@ -86,6 +98,8 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
 /* asynchronous upload of a pinned sampler batch into buffer i on the copy stream, after the compute that last used it */
 static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     d->sheet=b->sheet?b->sheet[0]:nullptr;
+    d->umb[i] = b->um ? b->um[0] : 0.f;
+    if (b->corner && b->level) { memcpy(d->cornb[i], b->corner[0], sizeof d->cornb[0]); d->lvlb[i] = b->level[0]; }
     size_t p3 = (size_t)P * P * P;
     nn_stream_wait(1, d->ev_done[i]);   /* the step two back: this upload overlaps the current step */
     if (d->lean) nn_stream_wait(1, d->ev_done[i ^ 1]);   /* lean: one buffer (inside the gradient buffers), free after the current step */
@@ -163,8 +177,89 @@ static void sheet_objective(gpu_state *d,shape5 os,int P,int train) {
     free(xyz); free(v); free(grad);
 }
 /* forward + loss kernels on the uploaded batch of this GPU; fills gl when train. */
+/* the verso teacher labels every sheet: supervise every voxel this GPU owns (split: not the halo planes) */
+#define VMASK_INIT() do { if (!d->vmask) { \
+        const size_t p2_ = (size_t)xs.h * xs.w, hz_ = d->side >= 0 ? (size_t)g_h0 * p2_ : 0; \
+        uint8_t *h_ = malloc(l3); memset(h_, 1, l3); \
+        if (d->side == 0) memset(h_ + l3 - hz_, 0, hz_); else if (d->side == 1) memset(h_, 0, hz_); \
+        d->vmask = nn_malloc(l3); nn_h2d(d->vmask, h_, l3); free(h_); \
+        d->vw = nn_malloc(1); static const uint8_t one_ = 1; nn_h2d(d->vw, &one_, 1); \
+        d->vscratch = nn_malloc(nn_loss_scratch((shape5){1, 1, xs.d, xs.h, xs.w}) + 64); } } while (0)
+static void verso_target(gpu_state *d, shape5 xs) {
+    nn_set_logits_h16(unet_logits_h16(d->u));   /* nn_prob_u8 reads the logits in the network's storage format */
+    const size_t l3 = (size_t)xs.d * xs.h * xs.w;   /* B == 1: x is [4][l3], t is [NCH][l3] (this GPU's slab, halo planes included) */
+    const int h16 = g_xfmt != 0, check = ufsm_env_on("UFSM_VERSO_CHECK");
+    const size_t xb = 4 * l3 * (h16 ? 2 : 4);
+    uint8_t *h0 = nullptr;
+    if (check) { h0 = malloc(xb + 2 * l3); nn_d2h(h0, d->x, xb); nn_d2h(h0 + xb, d->t, l3); nn_d2h(h0 + xb + l3, d->m, l3); }
+    nn_flip_sign((uint8_t *)d->x + l3 * (h16 ? 2 : 4), 3 * l3, h16);   /* radial channels 1..3 */
+    if (d->teacher) unet_use_params(d->u, d->teacher);
+    const float *lg = unet_forward_x(d->u, d->x, xs, 0, h16);
+    if (d->teacher) unet_use_params(d->u, nullptr);
+    shape5 os = unet_out_shape(d->u, xs);
+    if (os.d != xs.d || os.h != xs.h || os.w != xs.w) { fprintf(stderr, "verso: output grid differs from the input grid\n"); abort(); }
+    if (g_verso_ridge) {   /* soft teacher output into the (not yet used) logit-gradient buffer, then its thin ridge into the verso target */
+        if (!d->vsoft) d->vsoft = nn_malloc(l3);
+        uint8_t *soft = d->vsoft; nn_prob_u8(lg, l3, soft, 0.f);
+        nn_ridge_u8(soft, d->x, g_xfmt, xs.d, xs.h, xs.w, g_verso_ridge, d->t + l3);
+    } else nn_prob_u8(lg, l3, d->t + l3, g_verso_hard);
+    nn_flip_sign((uint8_t *)d->x + l3 * (h16 ? 2 : 4), 3 * l3, h16);
+    if (g_verso_anchor) {   /* the same teacher with the direction as is: recto pseudo-labels where the recto target is not trusted */
+        if (d->teacher) unet_use_params(d->u, d->teacher);
+        const float *la = unet_forward_x(d->u, d->x, xs, 0, h16);
+        if (d->teacher) unet_use_params(d->u, nullptr);
+        uint8_t *soft = d->vsoft ? d->vsoft : (d->vsoft = nn_malloc(l3)), *dst = d->vsoft;
+        if (g_verso_ridge && g_verso_anchor == 1) {   /* 1: thin ridge where unlabelled; 2: soft where unlabelled; 3: soft everywhere (recto distilled) */
+            if (!d->vanch) d->vanch = nn_malloc(l3);
+            nn_prob_u8(la, l3, soft, 0.f); nn_ridge_u8(soft, d->x, g_xfmt, xs.d, xs.h, xs.w, g_verso_ridge, d->vanch); dst = d->vanch;
+        } else nn_prob_u8(la, l3, dst, 0.f);
+        VMASK_INIT();
+        if (g_verso_anchor == 3) { nn_d2d(d->t, dst, l3); nn_d2d(d->m, d->vmask, l3); static const uint8_t one = 1; nn_h2d(d->w, &one, 1); }
+        else nn_fill_unlabelled(d->t, d->m, d->vmask, dst, l3);
+    }
+    VMASK_INIT();
+    if (g_verso_flip) nn_flip_sign((uint8_t *)d->x + l3 * (h16 ? 2 : 4), 3 * l3, h16);   /* swap step: train on the reversed direction */
+    if (check && !g_verso_flip) {   /* the eval forward must leave the batch buffers (inside the gradient buffers in lean modes) intact */
+        uint8_t *h1 = malloc(xb + 2 * l3); nn_d2h(h1, d->x, xb); nn_d2h(h1 + xb, d->t, l3); nn_d2h(h1 + xb + l3, d->m, l3);
+        fprintf(stderr, "verso check (GPU %d): input %s, recto target %s, mask %s\n", d->dev, memcmp(h0, h1, xb) ? "CHANGED" : "intact",
+                memcmp(h0 + xb, h1 + xb, l3) ? "CHANGED" : "intact", memcmp(h0 + xb + l3, h1 + xb + l3, l3) ? "CHANGED" : "intact");
+        free(h1); free(h0);
+        /* the same eval forward without the reversal: how far the verso target is from the recto output on this window */
+        uint8_t *vt = malloc(2 * l3); nn_d2h(vt, d->t + l3, l3);
+        if (d->teacher) unet_use_params(d->u, d->teacher);
+        const float *lr = unet_forward_x(d->u, d->x, xs, 0, h16);
+        if (d->teacher) unet_use_params(d->u, nullptr); nn_prob_u8(lr, l3, d->t + l3, 0.f); nn_d2h(vt + l3, d->t + l3, l3);
+        double ad = 0, sa = 0, sb = 0; for (size_t k = 0; k < l3; k++) { ad += abs((int)vt[k] - (int)vt[l3 + k]); sa += vt[k]; sb += vt[l3 + k]; }
+        fprintf(stderr, "verso check (GPU %d): mean verso target %.1f, recto output %.1f, mean |difference| %.1f (of 255)\n", d->dev, sa / l3, sb / l3, ad / l3);
+        const char *dump = getenv("UFSM_VERSO_DUMP");   /* dir: mid-z planes of CT input, verso target, recto output, recto label */
+        if (dump) {
+            static int nd; char fn[1200]; snprintf(fn, sizeof fn, "%s/verso_%d_%d.raw", dump, d->dev, nd++);
+            const size_t pl = (size_t)xs.h * xs.w, zm = (size_t)xs.d / 2;
+            uint8_t *lab = malloc(l3); nn_d2h(lab, d->t, l3);
+            uint8_t *xh = malloc(xb); nn_d2h(xh, d->x, xb);
+            FILE *f = fopen(fn, "wb");
+            if (f) { int hdr[3] = {xs.h, xs.w, h16}; fwrite(hdr, 4, 3, f); fwrite(d->cornb[d->cur], 8, 3, f); fwrite(&d->lvlb[d->cur], 4, 1, f); fwrite(xh + zm * pl * (h16 ? 2 : 4), h16 ? 2 : 4, pl, f);
+                     fwrite(vt + zm * pl, 1, pl, f); fwrite(vt + l3 + zm * pl, 1, pl, f); fwrite(lab + zm * pl, 1, pl, f);
+                     for (int ch = 1; ch < 4; ch++) fwrite(xh + (ch * l3 + zm * pl) * (h16 ? 2 : 4), h16 ? 2 : 4, pl, f); fclose(f); }
+            free(lab); free(xh);
+        }
+        /* train-mode forward (live weights), direction as is vs reversed: does the training forward see the direction? */
+        { uint8_t *a = malloc(2 * l3);
+          const float *f1 = unet_forward_x(d->u, d->x, xs, 1, h16); nn_prob_u8(f1, l3, d->t + l3, 0.f); nn_d2h(a, d->t + l3, l3);
+          nn_flip_sign((uint8_t *)d->x + l3 * (h16 ? 2 : 4), 3 * l3, h16);
+          const float *f2 = unet_forward_x(d->u, d->x, xs, 1, h16); nn_prob_u8(f2, l3, d->t + l3, 0.f); nn_d2h(a + l3, d->t + l3, l3);
+          nn_flip_sign((uint8_t *)d->x + l3 * (h16 ? 2 : 4), 3 * l3, h16);
+          const float *e1 = unet_forward_x(d->u, d->x, xs, 0, h16); nn_prob_u8(e1, l3, d->t + l3, 0.f); uint8_t *e = malloc(l3); nn_d2h(e, d->t + l3, l3);
+          double dt = 0, de = 0, dte = 0; for (size_t k = 0; k < l3; k++) { dt += abs((int)a[k] - (int)a[l3 + k]); de += abs((int)vt[k] - (int)vt[l3 + k]); dte += abs((int)a[k] - (int)e[k]); }
+          fprintf(stderr, "verso check (GPU %d): |normal - reversed| train-mode %.1f, eval-mode teacher %.1f; |train - eval| normal %.1f\n", d->dev, dt / l3, de / l3, dte / l3);
+          free(a); free(e); }
+        nn_h2d(d->t + l3, vt, l3); free(vt);
+    }
+}
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 xs = {B, 4, d->side >= 0 ? g_Dl : P, P, P};
+    if (unet_cfg_of(d->u)->scale_cond) unet_set_scale(d->u, d->um);   /* B == 1 (checked at startup) */
+    if (g_verso_on) verso_target(d, xs);
     const float *lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
     if (d->lean && train) {   /* the logit gradient lives in the model's gradient buffer B (built by the forward above) */
@@ -177,8 +272,23 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     if (prof) nn_prof_begin(6);
     shape5 ts = os; if (g_aff) ts.c = NCH;   /* B == 1: the target channels are the leading output channels */
     nn_set_logits_h16(unet_logits_h16(d->u));   /* lean 2: fp16 logits in the gradient buffer */
-    nn_loss_async_tol(lg, d->t, d->m, d->w, ts, dice_w, train ? d->gl : nullptr, d->scratch, d->tolc);
-    if (g_aff) nn_aff_loss_async(lg, os, 1, d->band, g_aff_off, dice_w, g_aff_lambda, train ? d->gl : nullptr, d->aff_fin);
+    if (!g_verso_on) nn_loss_async_tol(lg, d->t, d->m, d->w, ts, dice_w, train ? d->gl : nullptr, d->scratch, d->tolc);
+    else {   /* recto labels (trust-band mask) and verso teacher targets (every owned voxel), each its own loss. A swap step
+                (direction reversed) exchanges the output channels they train: reversing the direction exchanges the faces */
+        const size_t l3 = (size_t)os.d * os.h * os.w, eb = g_g16 ? 2 : 4, le = unet_logits_h16(d->u) ? 2 : 4;
+        const int cr = g_verso_flip ? 1 : 0, cv = 1 - cr;
+        const shape5 one = {1, 1, os.d, os.h, os.w};
+        nn_loss_async_tol((const float *)((const char *)lg + cr * l3 * le), d->t, d->m, d->w, one, dice_w, train ? (float *)((char *)d->gl + cr * l3 * eb) : nullptr, d->scratch, d->tolc);
+        nn_loss_async_tol((const float *)((const char *)lg + cv * l3 * le), d->t + l3, d->vmask, d->vw, one, dice_w, train ? (float *)((char *)d->gl + cv * l3 * eb) : nullptr, d->vscratch, nullptr);
+        if (train && g_verso_lambda != 1.f) nn_loss_grad_scale((char *)d->gl + cv * l3 * eb, l3, g_verso_lambda);
+    }
+    if (g_verso_on && ufsm_env_on("UFSM_VERSO_CHECK")) {   /* what the losses actually read */
+        const size_t l3 = (size_t)os.d * os.h * os.w; uint8_t *h = malloc(2 * l3); nn_sync(); nn_d2h(h, d->t, 2 * l3);
+        double a = 0, b = 0, ab = 0; for (size_t k = 0; k < l3; k++) { a += h[k]; b += h[l3 + k]; ab += abs((int)h[k] - (int)h[l3 + k]); }
+        fprintf(stderr, "verso check (GPU %d) at the loss: mean recto target %.1f, verso target %.1f, |difference| %.1f\n", d->dev, a / l3, b / l3, ab / l3);
+        free(h);
+    }
+    if (g_aff) nn_aff_loss_async(lg, os, 1 + g_verso, d->band, g_aff_off, dice_w, g_aff_lambda, train ? d->gl : nullptr, d->aff_fin);
     sheet_objective(d,os,P,train);
     if (prof) nn_prof_end();
 }
@@ -186,18 +296,25 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
 static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     shape5 os = unet_out_shape(d->u, (shape5){B, 4, d->side >= 0 ? g_Dl : P, P, P});
     if (g_aff) os.c = NCH;
-    nn_loss_fetch(d->scratch, os, out);
+    if (!g_verso_on) nn_loss_fetch(d->scratch, os, out);
     d->aff_loss = 0;
     if (g_aff) {   /* mean over the affinity channels of bce + dice_w dice, times lambda */
         nn_aff_loss_fetch(d->aff_fin, g_aff_off.K, d->aff_out);
         for (int k = 0; k < g_aff_off.K; k++) d->aff_loss += d->aff_out[k * 6] + dice_w * d->aff_out[k * 6 + 1];
         d->aff_loss *= g_aff_lambda / g_aff_off.K;
     }
+    d->verso_loss = 0;
+    if (g_verso_on) {   /* the recto loss ran as a single-channel call: lay its parts out as the NCH-channel fetch does */
+        float r[3]; nn_loss_fetch(d->scratch, (shape5){1, 1, 1, 1, 1}, r);
+        for (int c = 0; c < 2 * NCH + 1; c++) out[c] = 0;
+        out[0] = r[0]; out[NCH] = r[1]; out[2 * NCH] = r[2];
+        nn_loss_fetch(d->vscratch, (shape5){1, 1, 1, 1, 1}, d->vout); d->verso_loss = g_verso_lambda * (d->vout[0] + dice_w * d->vout[1]);
+    }
     int cout = unet_cfg_of(d->u)->cout;
     double loss = 0; int active = 0;
     if (g_aff) cout = NCH;
     for (int c = 0; c < cout; c++) if (out[c] > 0 || out[cout + c] > 0) { loss += out[c] + dice_w * out[cout + c]; active++; }
-    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss;
+    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss+d->verso_loss;
 }
 
 /* --split z: forward, loss and backward of one window on both GPUs (src/split.h) */
@@ -218,8 +335,10 @@ int cmd_train(int argc, char **argv) {
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--cover-next-pass 1] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
                         "       [--geometry-aug 0|1] [--rotate-deg 5] [--rotate-p 0.2] [--elastic 1] [--elastic-p 0.15] [--label-morph 0] [--label-morph-p 0.2]\n"
+                        "       [--aug-strength 1 (0..2)] [--aug-p 0 (default p of every scanner op)] [--aug-OP-p P] [--aug-drop-ignore 1] [--aug-affine-p 0] [--aug-aniso 0.1] [--aug-shear 0.06]\n"
+                        "         scanner ops (source grid, z = scan axis): seam air lowres blur sharpen bias ring cupping slice noise cnoise tone quant dropslice cutout chunk\n"
                         "       [--sheet-band-scale 1]   widen audited soft-band cap and close-gap exclusions together\n"
-                        "       [--erode 0|1] [--soft SIGMA]   native binary-core erosion before softening (--levels 1,0,0,0)\n"
+                        "       [--erode 0|1] [--soft SIGMA] [--soft-unit vox|um]   native binary-core erosion before softening (--levels 1,0,0,0); sigma in level-0 voxels or um\n"
                         "       [--gn-stats stored|legacy]   fresh training uses stored activations; resume preserves the saved contract\n"
                         "       [--schedule-start STEP]   restart the LR schedule at this saved step, preserving optimizer state\n"
                         "       [--task surface_winding --geometry geometry.json] [--sheet-init 1] [--sheet-variant 0|1|2] [--task band_affinity --grow-head 1 --aff-lambda 1] [--init-from CKPT (shape-matching layers)]\n"
@@ -263,6 +382,17 @@ int cmd_train(int argc, char **argv) {
         g_aff_off = (aff_offsets_t){6, {0, 1, 2, 0, 1, 2}, {1, 1, 1, 8, 8, 8}};
         g_cout = 1 + g_aff_off.K; g_aff_lambda = (float)atof(opt(argc,argv,"--aff-lambda","1"));
         if (B != 1 || geometry || atoi(opt(argc,argv,"--overfit","0")) || strcmp(opt(argc,argv,"--mem","auto"),"wide")==0) { fprintf(stderr,"band_affinity: B=1, no geometry / overfit / wide\n"); return 2; }
+    }
+    g_verso = atoi(opt(argc,argv,"--verso","0")); g_verso_start = atoi(opt(argc,argv,"--verso-start","0"));
+    { const char *vt = opt(argc,argv,"--verso-teacher","frozen"); if (strcmp(vt,"frozen") && strcmp(vt,"self")) { fprintf(stderr,"--verso-teacher frozen|self\n"); return 2; } g_verso_self = !strcmp(vt,"self"); }
+    g_verso_hard = (float)atof(opt(argc,argv,"--verso-hard","0")); g_verso_zero = !strcmp(opt(argc,argv,"--verso-init","copy"),"zero");
+    g_verso_ridge = atoi(opt(argc,argv,"--verso-ridge","0")); g_verso_anchor = atoi(opt(argc,argv,"--verso-anchor","0"));
+    g_verso_swap = (float)atof(opt(argc,argv,"--verso-swap","0")); g_verso_lambda = (float)atof(opt(argc,argv,"--verso-lambda","1")); g_head_only = atoi(opt(argc,argv,"--train-head-only","0"));
+    if (g_verso) fprintf(stderr, "verso: channel 1, teacher %s, targets %s (hard %g, ridge %d), head %s, from step %d\n", g_verso_self ? "live" : "frozen",
+                         g_verso_ridge ? "ridge" : g_verso_hard > 0 ? "hard" : "soft", g_verso_hard, g_verso_ridge, g_verso_zero ? "fresh" : "copy of recto", g_verso_start);
+    if (g_verso) {
+        if (B != 1 || geometry || strcmp(task,"surface_winding")==0) { fprintf(stderr,"--verso: B=1, not with the winding task\n"); return 2; }
+        if (g_aff) g_cout = 2 + g_aff_off.K;   /* recto, verso, affinities */
     }
     if (sheet_ck<0 || (strcmp(task,"surface") && strcmp(task,"surface_winding") && !g_aff) || (!strcmp(task,"surface_winding") != (geometry!=nullptr)) ||
         (sheet_ck && (!geometry || sheet_init)) || (geometry && resume && !sheet_ck && !sheet_init) || (sheet_init && (!geometry || !resume))) {
@@ -345,9 +475,11 @@ int cmd_train(int argc, char **argv) {
     g_g16 = nn_get_tf32() && nn_get_act_bf16() && nn_get_grad_bf16();
     if (ufsm_env_on("UFSM_X32")) g_xfmt = g_g16 = 0;   /* diagnostic: fp32 batches and logit gradient, converted on the device (the old path) */
     nn_set_loss_grad_h16(g_g16);
-    unet_cfg cfg = {4, {16, 32, 64, 80}, 4, g_cout, 8, 0};
+    unet_cfg cfg = {4, {16, 32, 64, 80}, 4, g_cout, 8, 0, 0};
     cfg.down_norm = atoi(opt(argc, argv, "--down-norm", "0"));
-    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) cfg.down_norm = pc.down_norm; }   /* the checkpoint decides */
+    cfg.scale_cond = atoi(opt(argc, argv, "--scale-cond", "0"));   /* voxel-size conditioning of the stem (unet_set_scale per batch) */
+    if (cfg.scale_cond && B != 1) { fprintf(stderr, "--scale-cond needs --B 1 (one voxel size per forward)\n"); return 2; }
+    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.down_norm = pc.down_norm; cfg.scale_cond = pc.scale_cond; } }   /* the checkpoint decides */
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,80")); cfg.nlev = 0; for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "P must be divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
     const int split = !strcmp(opt(argc, argv, "--split", "0"), "z");
@@ -380,13 +512,32 @@ int cmd_train(int argc, char **argv) {
     sc.rotate_p=(float)atof(opt(argc,argv,"--rotate-p","0.2"));
     sc.elastic=(float)atof(opt(argc,argv,"--elastic","1"));
     sc.elastic_p=(float)atof(opt(argc,argv,"--elastic-p","0.15"));
+    sc.zoom_min=(float)atof(opt(argc,argv,"--zoom-min","0.7071"));   /* zoom-in down to this scale (needs --geometry-aug 1) */
+    sc.zoom_p=(float)atof(opt(argc,argv,"--zoom-p","0"));
     sc.label_morph=(float)atof(opt(argc,argv,"--label-morph","0"));
     sc.label_morph_p=(float)atof(opt(argc,argv,"--label-morph-p","0.2"));
+    sc.scan.strength=(float)atof(opt(argc,argv,"--aug-strength","1"));
+    sc.scan.drop_ignore=atoi(opt(argc,argv,"--aug-drop-ignore","1"));
+    {
+        const char *all=opt(argc,argv,"--aug-p","0");
+        for (int i=0;i<SA_N;i++) { char f[48]; snprintf(f,sizeof f,"--aug-%s-p",scan_aug_names[i]); sc.scan.p[i]=(float)atof(opt(argc,argv,f,all)); }
+    }
+    sc.affine_p=(float)atof(opt(argc,argv,"--aug-affine-p","0"));
+    sc.affine_aniso=(float)atof(opt(argc,argv,"--aug-aniso","0.1"));
+    sc.affine_shear=(float)atof(opt(argc,argv,"--aug-shear","0.06"));
+    {
+        int bad=!isfinite(sc.scan.strength) || sc.scan.strength<0 || sc.scan.strength>2 || sc.scan.drop_ignore<0 || sc.scan.drop_ignore>1 ||
+                !isfinite(sc.affine_p) || sc.affine_p<0 || sc.affine_p>1 || !isfinite(sc.affine_aniso) || sc.affine_aniso<0 || sc.affine_aniso>.3f ||
+                !isfinite(sc.affine_shear) || sc.affine_shear<0 || sc.affine_shear>.2f || (sc.affine_p>0 && !sc.geometry_augment);
+        for (int i=0;i<SA_N;i++) bad|=!isfinite(sc.scan.p[i]) || sc.scan.p[i]<0 || sc.scan.p[i]>1;
+        if (bad) { fprintf(stderr,"invalid scanner/affine augmentation bounds (--aug-affine-p needs --geometry-aug 1)\n"); return 2; }
+    }
     sc.sheet=g_sheet;
     if (g_sheet) { sc.augment=noaug?0:sc.geometry_augment?1:3; memset(sc.level_p,0,sizeof sc.level_p); sc.level_p[0]=1; }
     if (!isfinite(sc.symmetry_p) || sc.symmetry_p < 0 || sc.symmetry_p > 1 || !isfinite(sc.axis_jitter) || sc.axis_jitter < 0) { fprintf(stderr, "invalid augmentation bounds\n"); return 2; }
     if (sc.geometry_augment<0 || sc.geometry_augment>1 || !isfinite(sc.rotate_degrees) || sc.rotate_degrees<0 || sc.rotate_degrees>15 || !isfinite(sc.elastic) || sc.elastic<0 || sc.elastic>2 ||
         !isfinite(sc.rotate_p) || sc.rotate_p<0 || sc.rotate_p>1 || !isfinite(sc.elastic_p) || sc.elastic_p<0 || sc.elastic_p>1 ||
+        !isfinite(sc.zoom_min) || sc.zoom_min<0.25f || sc.zoom_min>1 || !isfinite(sc.zoom_p) || sc.zoom_p<0 || sc.zoom_p>1 ||
         !isfinite(sc.label_morph) || sc.label_morph<0 || sc.label_morph>1 || !isfinite(sc.label_morph_p) || sc.label_morph_p<0 || sc.label_morph_p>1) {
         fprintf(stderr,"invalid continuous geometry/morphology augmentation bounds\n"); return 2;
     }
@@ -428,6 +579,10 @@ int cmd_train(int argc, char **argv) {
         fprintf(stderr, "--erode requires 0 or 1, no --dilate and no winding task\n"); return 2;
     }
     sc.soft = (float)atof(opt(argc, argv, "--soft", "0"));  /* soft ridge target with this sigma (level-0 voxels) */
+    { const char *u = opt(argc, argv, "--soft-unit", "vox");   /* um: --soft/--soft-end in um for every source and level */
+      if (strcmp(u, "vox") && strcmp(u, "um")) { fprintf(stderr, "--soft-unit must be vox or um\n"); return 2; }
+      sc.soft_um = !strcmp(u, "um");
+      if (sc.soft_um && g_sheet) { fprintf(stderr, "--soft-unit um is not supported with the winding task\n"); return 2; } }
     double sheet_band_scale=atof(opt(argc,argv,"--sheet-band-scale","1"));
     if (!isfinite(sheet_band_scale) || sheet_band_scale<1 || (!g_sheet && sheet_band_scale!=1) ||
         (g_sheet && sheet_widen_bands(g_sheet,sheet_band_scale))) {
@@ -460,13 +615,33 @@ int cmd_train(int argc, char **argv) {
             unet_init(d->u, seed + 1); /* deterministic: every GPU starts identical */
             const char *init_from = opt(argc, argv, "--init-from", nullptr);   /* partial warm start from another architecture */
             if (init_from) {
-                const int nt = unet_init_from(d->u, init_from);
+                int rows[16];   /* --verso: recto copied into the verso channel, the donor's other rows (affinities) shifted up */
+                if (g_verso) { unet_cfg dc; int ds; if (unet_peek(init_from, &dc, &ds)) { fprintf(stderr, "cannot read %s\n", init_from); return 1; }
+                    rows[0] = 0; rows[1] = g_verso_zero ? -1 : 0;
+                    for (int co = 2; co < cfg.cout; co++) rows[co] = dc.cout == cfg.cout ? co : co - 1 < dc.cout ? co - 1 : -1;
+                    if (dc.cout == cfg.cout && g_aff) { fprintf(stderr, "--verso --init-from: %s already has %d outputs; use --resume\n", init_from, dc.cout); return 1; } }
+                const int nt = g_verso ? unet_init_from_map(d->u, init_from, rows) : unet_init_from(d->u, init_from);
                 if (nt < 0) { fprintf(stderr, "cannot initialise from %s\n", init_from); return 1; }
                 if (g == 0) fprintf(stderr, "initialised %d layer tensors from %s (the rest fresh)\n", nt, init_from);
             }
             if (g_sheet && unet_start_sheet(d->u)) return 2;
         }
         if (wq) unet_set_wq(d->u, wq);
+        d->teacher = nullptr; d->vsoft = d->vanch = nullptr; d->vmask = d->vw = nullptr; d->vscratch = nullptr; d->verso_loss = 0;
+        if (g_verso && !g_verso_self) {   /* frozen teacher: --verso-teacher-ckpt CKPT (warm-start mapping as --init-from), else the starting weights */
+            const size_t np = unet_nparams(d->u); d->teacher = nn_malloc(np * 4);
+            const char *tp = opt(argc, argv, "--verso-teacher-ckpt", nullptr);
+            if (tp) {
+                unet *tu = unet_create(&cfg); unet_cfg tc; int ts;
+                if (unet_peek(tp, &tc, &ts)) { fprintf(stderr, "cannot read %s\n", tp); return 1; }
+                int trows[16]; trows[0] = 0; trows[1] = 0;
+                for (int co = 2; co < cfg.cout; co++) trows[co] = tc.cout == cfg.cout ? co : co - 1 < tc.cout ? co - 1 : -1;
+                if (tc.cout == cfg.cout) for (int co = 0; co < cfg.cout; co++) trows[co] = co;
+                if (unet_init_from_map(tu, tp, trows) < 0) { fprintf(stderr, "cannot load the verso teacher %s\n", tp); return 1; }
+                nn_d2d(d->teacher, unet_live_params(tu), np * 4); unet_free(tu);
+                if (g == 0) fprintf(stderr, "verso: frozen teacher from %s\n", tp);
+            } else nn_d2d(d->teacher, unet_live_params(d->u), np * 4);
+        }
         if (split) { unet_set_split(d->u, g, g_h0, split_halo); if (!getenv("UFSM_SPLIT_SYNC")) unet_set_split_async(d->u, split_halo_begin, split_halo_end); }
         const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
     }
@@ -540,7 +715,8 @@ int cmd_train(int argc, char **argv) {
                 unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean); unet_set_share_enc_a1(cand[c].sea || sea_force);
                 const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
                 size_t trainer = nbuf * ((size_t)B * 4 * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
-                if (cand[c].lean) trainer = cand[c].gmx ? 0 : (size_t)B * 4 * p3 * xbytes();   /* batch buffers inside the gradient buffer B (estimate) */
+                if (cand[c].lean) trainer = (cand[c].gmx ? 0 : (size_t)B * 4 * p3 * xbytes())   /* batch buffers inside the gradient buffer B (estimate) */
+                                            + (g_cout > NCH ? (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) : 0);   /* > 2 outputs (affinities, verso): the logit gradient may not fit beside the logits */
                 need = tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (need <= fmin) pick = c;
             }
@@ -615,12 +791,16 @@ int cmd_train(int argc, char **argv) {
     {
         size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
         snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1,
-            ",\"target\":{\"version\":1,\"erode_native_voxels\":%d,\"erosion_kernel\":\"face6\",\"soft_sigma\":%.9g,\"loss_tolerance_voxels\":%d}}", sc.erode, sc.soft, nn_get_loss_tol());
+            ",\"target\":{\"version\":1,\"erode_native_voxels\":%d,\"erosion_kernel\":\"face6\",\"soft_sigma\":%.9g,\"soft_unit\":\"%s\",\"loss_tolerance_voxels\":%d}}", sc.erode, sc.soft, sc.soft_um ? "um" : "vox", nn_get_loss_tol());
     }
-    fprintf(stderr, "surface targets: binary-core erosion %d native voxel(s), then soft sigma %g; loss offset tolerance %d voxel(s)\n", sc.erode, sc.soft, nn_get_loss_tol());
+    fprintf(stderr, "surface targets: binary-core erosion %d native voxel(s), then soft sigma %g %s; loss offset tolerance %d voxel(s)\n", sc.erode, sc.soft, sc.soft_um ? "um" : "level-0 voxels", nn_get_loss_tol());
     if (g_aff) {
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
         snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"task\":\"band_affinity\",\"affinity\":{\"version\":1,\"channel0\":\"recto\",\"offsets_axis_d\":[[0,1],[1,1],[2,1],[0,8],[1,8],[2,8]],\"band\":\"winding_mod14 nearest-recto +- half turn\",\"lambda\":%.9g}}",g_aff_lambda);
+    }
+    if (g_verso) {   /* channel 1 = verso; band affinities (if any) follow at 2.. */
+        size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"verso\":{\"version\":1,\"channel\":1,\"target\":\"%s recto channel with the radial input reversed\",\"start_step\":%d}}",g_verso_self?"live":"frozen starting weights",g_verso_start);
     }
     if (g_sheet) {
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
@@ -630,6 +810,16 @@ int cmd_train(int argc, char **argv) {
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
         snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"augmentation\":{\"version\":1,\"mode\":%d,\"ct\":%d,\"symmetry_p\":%.9g,\"axis_jitter\":%.9g,\"geometry\":%d,\"rotate_degrees\":%.9g,\"rotate_p\":%.9g,\"elastic_voxels\":%.9g,\"elastic_p\":%.9g,\"label_morph_voxels\":%.9g,\"label_morph_p\":%.9g,\"soft_sigma\":%.9g,\"sheet_band_scale\":%.9g}}",
             sc.augment,sc.ct_augment,sc.symmetry_p,sc.axis_jitter,sc.geometry_augment,sc.rotate_degrees,sc.rotate_p,sc.elastic,sc.elastic_p,sc.label_morph,sc.label_morph_p,sc.soft,sheet_band_scale);
+    }
+    if (scan_aug_enabled(&sc.scan) || (sc.affine_p>0 && sc.scan.strength>0)) {   /* recorded only when on: older runs keep their metadata */
+        size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
+        int k=snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"scan_augmentation\":{\"version\":1,\"strength\":%.9g,\"drop_ignore\":%d,\"affine_p\":%.9g,\"aniso\":%.9g,\"shear\":%.9g,\"p\":{",
+            sc.scan.strength,sc.scan.drop_ignore,sc.affine_p,sc.affine_aniso,sc.affine_shear);
+        for (int i=0;i<SA_N;i++) k+=snprintf(runtime_extra+n-1+k,sizeof runtime_extra-n+1-k,"%s\"%s\":%.9g",i?",":"",scan_aug_names[i],sc.scan.p[i]);
+        snprintf(runtime_extra+n-1+k,sizeof runtime_extra-n+1-k,"}}}");
+        fprintf(stderr,"scanner augmentation: strength %.3g, drop-ignore %d, affine p %.3g (aniso %.3g shear %.3g); p",sc.scan.strength,sc.scan.drop_ignore,sc.affine_p,sc.affine_aniso,sc.affine_shear);
+        for (int i=0;i<SA_N;i++) if (sc.scan.p[i]>0) fprintf(stderr," %s %.3g",scan_aug_names[i],sc.scan.p[i]);
+        fprintf(stderr,"\n");
     }
     fprintf(stderr,"augmentation: mode %d, CT %d, symmetry p %.3g, axis jitter %.3g voxels, geometry %d (rotation +/-%.3g degrees p %.3g; elastic <=%.3g voxels p %.3g), soft-band dilation/erosion +/-%.3g voxels p %.3g\n",
         sc.augment,sc.ct_augment,sc.symmetry_p,sc.axis_jitter,sc.geometry_augment,sc.rotate_degrees,sc.rotate_p,sc.elastic,sc.elastic_p,sc.label_morph,sc.label_morph_p);
@@ -647,7 +837,7 @@ int cmd_train(int argc, char **argv) {
     float *gpeer = ng > 1 ? nn_malloc(np * 4) : nullptr;   /* on GPU 0: incoming gradients of the other GPUs */
 
     /* validation set: fixed batches from the held-out boxes (unaugmented), scored on GPU 0 */
-    sample_cfg vc = sc; vc.cover = nullptr; vc.cover_start = 0; vc.ct_augment = 0; vc.axis_jitter = 0; vc.geometry_augment=0; vc.label_morph=0; vc.seed = seed + 777; vc.augment = 0; vc.nworkers = 4; vc.nbuf = 2; vc.holdout = 1;
+    sample_cfg vc = sc; vc.cover = nullptr; vc.cover_start = 0; vc.ct_augment = 0; vc.axis_jitter = 0; vc.geometry_augment=0; vc.label_morph=0; vc.scan.strength=0; vc.affine_p=0; vc.seed = seed + 777; vc.augment = 0; vc.nworkers = 4; vc.nbuf = 2; vc.holdout = 1;
     { int any = 0; for (int i = 0; i < S->n; i++) any |= S->src[i].hold_n[0] > 0; if (!any) { vc.holdout = 0; fprintf(stderr, "no holdout boxes in the sources: validation batches come from the training distribution\n"); } }
     sampler *vs = sampler_start(S, &vc);
     if (!vs) { fprintf(stderr, "cannot construct validation sampler\n"); return 1; }
@@ -660,6 +850,7 @@ int cmd_train(int argc, char **argv) {
         val[i].t = malloc((size_t)B * NCH * p3); memcpy(val[i].t, b->t, (size_t)B * NCH * p3);
         val[i].m = malloc((size_t)B * p3); memcpy(val[i].m, b->m, (size_t)B * p3);
         val[i].w = malloc((size_t)B * NCH); memcpy(val[i].w, b->w, (size_t)B * NCH);
+        val[i].um = malloc((size_t)B * sizeof(float)); memcpy(val[i].um, b->um, (size_t)B * sizeof(float));
         if (g_aff) { val[i].band = malloc((size_t)B * p3); memcpy(val[i].band, b->band, (size_t)B * p3); }
         val[i].sheet=calloc((size_t)B,sizeof *val[i].sheet); val[i].sheet[0]=sheet_clone(b->sheet?b->sheet[0]:nullptr);
         sampler_release(vs, b);
@@ -690,7 +881,11 @@ int cmd_train(int argc, char **argv) {
     int committed_step = step0, training_failed = 0;
     double best_val = 1e30; int nskip = 0; (void)nskip;
     float parts[8][2 * NCH + 1];
+    double acc_vbce = 0, acc_vdice = 0;   /* verso channel */
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
+        g_verso_on = g_verso && step >= g_verso_start;
+        { uint64_t h = (uint64_t)step * 0x9E3779B97F4A7C15ull + (uint64_t)seed; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
+          g_verso_flip = g_verso_on && g_verso_swap > 0 && (double)(h >> 11) * 0x1p-53 < g_verso_swap; }   /* same on every GPU */
         g_sheet_ramp=fminf(1.f,(float)(step-schedule_start)/500.f);
         nn_set_sr_step((unsigned)step);
         double loss = 0, active = 0;
@@ -736,6 +931,7 @@ int cmd_train(int argc, char **argv) {
                     cp->t = malloc((size_t)B * NCH * p3b); memcpy(cp->t, b->t, (size_t)B * NCH * p3b);
                     cp->m = malloc((size_t)B * p3b); memcpy(cp->m, b->m, (size_t)B * p3b);
                     cp->w = malloc((size_t)B * NCH); memcpy(cp->w, b->w, (size_t)B * NCH);
+                    cp->um = malloc((size_t)B * sizeof(float)); memcpy(cp->um, b->um, (size_t)B * sizeof(float));
                     sampler_release(sp, b); fixed[nfixed++] = cp;
                 }
                 upload(d, fixed[k], B, P);
@@ -838,6 +1034,7 @@ int cmd_train(int argc, char **argv) {
                 }
                 continue;
             }
+            if (g_head_only) unet_grad_head_only(d->u, g_head_only - 1);   /* --train-head-only N: head + last N-1 decoder blocks (frozen rest: --wd 0) */
             if (clip > 0 && gn > clip) unet_clip_grad(d->u, clip);
             unet_srste24(d->u, srste);                       /* no-op unless sparse */
             if (use_anvil) unet_anvil(d->u, anvil_lr * (lr / lr0), anvil_wd, step, steps, lr, 0.9f, 0.999f, 1e-8f, wd);
@@ -855,6 +1052,7 @@ int cmd_train(int argc, char **argv) {
         if ((seconds && now() - t0 >= seconds) || (schedule_seconds && schedule_elapsed+now()-t0>=schedule_seconds) ||
             (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
         acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][g_aff ? NCH : cfg.cout]; acc_g += gn; nacc++;
+        if (g_verso_on) { acc_vbce += G[0].vout[0]; acc_vdice += G[0].vout[1]; }
         if (step % log_every == 0 || step == steps || g_stop) {
             double dt = now() - tlog;
             double vl = -1, vb = 0, vd = 0;
@@ -865,6 +1063,7 @@ int cmd_train(int argc, char **argv) {
                 {   /* validation on the buffer not holding the prefetched batch (its upload has completed: ev_up synced above) */
                     int keep = G[0].cur;
                     for (int g = 0; g < nv; g++) { if (G[g].lean) { nn_init(G[g].dev); nn_event_sync(G[g].ev_up[keep]); } select_buf(&G[g], keep ^ 1); }   /* lean: one buffer, the prefetch must have landed */
+                    g_verso_flip = 0;   /* validation: the direction as is */
                     for (int i = 0; i < nval; i++) {
                         float vp[2 * NCH + 1];
                         for (int g = 0; g < nv; g++) { nn_init(G[g].dev); upload(&G[g], &val[i], B, P); }
@@ -885,14 +1084,15 @@ int cmd_train(int argc, char **argv) {
                 snprintf(vstr, sizeof vstr, "%.5f,%.5f,%.5f", vl, vb, vd);
                 if (nval && vl < best_val) { best_val = vl; char bp[1400]; snprintf(bp, sizeof bp, "%s/best.ckpt", out); if (unet_save(G[0].u, bp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", bp); return 1; } }
             }
-            char affs[96] = "";
-            if (g_aff) { const float *a = G[0].aff_out; snprintf(affs, sizeof affs, " aff %.4f (d1 bce %.3f dice %.3f | d8 bce %.3f dice %.3f)", G[0].aff_loss,
+            char affs[160] = "";
+            if (g_verso) snprintf(affs, 64, " verso bce %.4f dice %.4f", acc_vbce / nacc, acc_vdice / nacc);
+            if (g_aff) { const float *a = G[0].aff_out; size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " aff %.4f (d1 bce %.3f dice %.3f | d8 bce %.3f dice %.3f)", G[0].aff_loss,
                                     (a[0] + a[6] + a[12]) / 3, (a[1] + a[7] + a[13]) / 3, (a[18] + a[24] + a[30]) / 3, (a[19] + a[25] + a[31]) / 3); }
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %s %.2f samp/s (wait %.0f%%)%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, affs, acc_g / nacc,
                     vl >= 0 ? "val" : "", (double)nacc * B * nl / dt, 100 * wait / dt, vl >= 0 ? vstr : "");
             if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, active, acc_g / nacc, vstr, (double)nacc * B * nl / dt, wait); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
-            acc_loss = acc_bce = acc_dice = acc_g = 0; nacc = 0; tlog = now(); wait = 0;
+            acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = 0; nacc = 0; tlog = now(); wait = 0;
         }
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);

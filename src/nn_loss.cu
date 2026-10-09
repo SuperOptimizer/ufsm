@@ -62,6 +62,17 @@ extern "C" size_t nn_loss_scratch(shape5 s) { return ((size_t)5 * s.n * s.c + 2 
 extern "C" void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch) {
     nn_loss_async_tol(logits, t, m, w, s, dice_w, gl, scratch, nullptr);
 }
+template <typename GT> __global__ void gscale_k(GT *g, size_t n, float a) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) g[i] = f2h<GT>(a * (float)g[i]);
+}
+/* g *= a over n logit-gradient elements in the losses' storage (fp32, or 16-bit when nn_set_loss_grad_h16) */
+extern "C" void nn_loss_grad_scale(void *g, size_t n, float a) {
+    if (!g_loss_g16) gscale_k<float><<<nblk(n, 256), 256>>>((float *)g, n, a);
+    else if (g_h16) gscale_k<f16><<<nblk(n, 256), 256>>>((f16 *)g, n, a);
+    else gscale_k<bf16><<<nblk(n, 256), 256>>>((bf16 *)g, n, a);
+    KCHECK();
+}
 extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch, uint8_t *code) {
     size_t S = shape_spatial(s);
     int NC = s.n * s.c;

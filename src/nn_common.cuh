@@ -1942,7 +1942,7 @@ template <typename HT> __global__ void pred_in_k(const uint8_t *ct, int W, float
     size_t w3 = (size_t)W * W * W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= w3) return;
     int xx = (int)(i % W), y = (int)((i / W) % W), z = (int)(i / ((size_t)W * W));
-    float dy = dyo[z] + (float)y, dx = dxo[z] + (float)xx, inv = axis ? 1.f / (sqrtf(dy * dy + dx * dx) + 1e-6f) : 0.f;
+    float dy = dyo[z] + (float)y, dx = dxo[z] + (float)xx, inv = axis ? (float)axis / (sqrtf(dy * dy + dx * dx) + 1e-6f) : 0.f;   /* axis: 0 none, 1, or -1 = reversed direction */
     x[i] = f2h<HT>(((float)ct[i] - mean) * isd); x[w3 + i] = f2h<HT>(0.f); x[2 * w3 + i] = f2h<HT>(dy * inv); x[3 * w3 + i] = f2h<HT>(dx * inv);
 }
 extern "C" void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16);

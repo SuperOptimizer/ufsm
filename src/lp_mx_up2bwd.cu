@@ -136,8 +136,8 @@ static int up2b_tile_on(void) { static int on = -1; if (on < 0) on = getenv("UFS
 static void up2_bwd_tile(const void *gy, int nby, int yb0, shape5 xs, void *gx, int nbx, int ob0, int nob, int gdt, int xdt, unsigned osr) {   /* xs: coarse */
     int ZC = 8;
     const dim3 grid((unsigned)nblk_(xs.w, 16), (unsigned)nblk_(xs.h, 4), (unsigned)(nblk_(xs.d, ZC) * xs.n * nob));
-#define U2BT(G, X) do { static int at_ = 0; const size_t sm_ = 2 * U2B_BUFB(32 * G / 8); \
-                        if (!at_) { at_ = 1; cudaFuncSetAttribute((const void *)up2_bwd_mx_tile_k<G, X>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_); } \
+#define U2BT(G, X) do { static unsigned at_ = 0; int dev_ = 0; cudaGetDevice(&dev_); const size_t sm_ = 2 * U2B_BUFB(32 * G / 8); \
+                        if (!(at_ >> dev_ & 1u)) { at_ |= 1u << dev_; cudaFuncSetAttribute((const void *)up2_bwd_mx_tile_k<G, X>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_); } \
                         up2_bwd_mx_tile_k<G, X><<<grid, 256, sm_>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, nby, nbx, yb0, ob0, nob, xs.d, xs.h, xs.w, ZC, osr); } while (0)
     if (gdt == 4 && xdt == 4) U2BT(4, 4); else if (gdt != 4 && xdt != 4) U2BT(8, 8);
     else { fprintf(stderr, "up2_bwd: gy and gx must share the MX format\n"); abort(); }
