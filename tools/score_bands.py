@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Instance (whole-sheet) scoring of checkpoints on held-out boxes against the band reference (task band_affinity).
 
-Everything is compared on the 4.8 um label grid (the reference band field's grid; prediction max-pooled 2x where noted).
+Everything is compared on the 4.8 um label grid (the reference band field's grid; prediction max-pooled onto it with the
+trainer's mapping, tools/label_grid.py: label j covers natives 2j-1, 2j; before 2026-10-09 the pooling took 2j, 2j+1).
 Reference instances: `ufsm band` on the box (winding_mod14 raster), connected across neighbours in the same band.
 Predicted instances, two ways:
   aff   (band_affinity checkpoints) boundary = any offset-1 affinity (channels 1..3; or offset 8, channels 4..6) says
@@ -21,6 +22,7 @@ from scipy import ndimage as ndi
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sheet_connectivity import read, UFSM
 from band_field import instances as ref_instances
+from label_grid import pool_max
 
 ROOT = '/vesuvius/usrm/volcomp'
 CT = 'PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr'
@@ -49,9 +51,6 @@ def cout_of(ckpt):
     return int(line.split('"cout":')[1].split(',')[0])
 
 
-def pool2max(v):
-    s = tuple(n // 2 * 2 for n in v.shape); v = v[:s[0], :s[1], :s[2]]
-    return v.reshape(s[0] // 2, 2, s[1] // 2, 2, s[2] // 2, 2).max(axis=(1, 3, 5))
 
 
 def pieces(boundary, inside):
@@ -111,7 +110,7 @@ def main():
             if res.exists(): rows += json.load(open(res)); continue
             nout = cout_of(ck); result = []
             predict(ck, box, cd / 'ch0', g.gpu, 0)
-            p0 = pool2max(read(cd / 'ch0', '2.4', (0, 0, 0), n, cd / 'p.raw'))
+            p0 = pool_max(read(cd / 'ch0', '2.4', (0, 0, 0), n, cd / 'p.raw'), o)
             for cut in [float(c) for c in g.cutoffs.split(',')]:
                 lab = pieces(p0 >= int(round(cut * 255)), inside)
                 result.append(dict(name=name, box=box, method='recto>=%.2f' % cut, **compare(ref, lab, known)))
@@ -119,13 +118,13 @@ def main():
                 bnd = np.zeros(nl, bool)
                 for c in (1, 2, 3):
                     predict(ck, box, cd / ('ch%d' % c), g.gpu, c)
-                    bnd |= pool2max(read(cd / ('ch%d' % c), '2.4', (0, 0, 0), n, cd / 'p.raw') < 128)
+                    bnd |= pool_max(read(cd / ('ch%d' % c), '2.4', (0, 0, 0), n, cd / 'p.raw') < 128, o)
                 lab = pieces(bnd, inside)
                 result.append(dict(name=name, box=box, method='affinity d1', **compare(ref, lab, known)))
                 dmax = None   # offset-8 channels: per label voxel the strongest "different" (255 - affinity) of the 2x block
                 for c in (4, 5, 6):
                     predict(ck, box, cd / ('ch%d' % c), g.gpu, c)
-                    dv = pool2max(255 - read(cd / ('ch%d' % c), '2.4', (0, 0, 0), n, cd / 'p.raw'))
+                    dv = pool_max(255 - read(cd / ('ch%d' % c), '2.4', (0, 0, 0), n, cd / 'p.raw'), o)
                     dmax = dv if dmax is None else np.maximum(dmax, dv)
                 for t in [float(c) for c in g.aff_cuts.split(',')]:   # boundary where "same" < t
                     result.append(dict(name=name, box=box, method='affinity d8<%.3f' % t,

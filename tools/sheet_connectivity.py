@@ -18,6 +18,10 @@ from pathlib import Path
 import numpy as np
 from scipy import ndimage as ndi
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from label_grid import pool_max
+
 UFSM = Path(__file__).resolve().parent.parent / 'build/ufsm'
 LABELS = '/vesuvius/ufsm/gt/paris4-sheet-20261003/training-4p8.zarr'
 MIN_SHEET, MIN_COVER, TOL = 200, 50, 2   # label voxels
@@ -30,9 +34,8 @@ def read(store, key, lo, size, path):
     return np.fromfile(path, np.uint8).reshape(size)
 
 
-def pool2(v):   # max over 2x2x2 blocks (odd tails dropped)
-    s = tuple(n // 2 * 2 for n in v.shape); v = v[:s[0], :s[1], :s[2]]
-    return v.reshape(s[0] // 2, 2, s[1] // 2, 2, s[2] // 2, 2).max(axis=(1, 3, 5))
+def pool2(v, o):   # max over each 4.8 um label voxel's natives (trainer's mapping, tools/label_grid.py; box origin o even)
+    return pool_max(v, np.asarray(o))
 
 
 def analyse(prob, ref, thr):
@@ -69,7 +72,7 @@ def main():
     box = [int(x) for x in g.box.split(',')]; o, n = np.array(box[:3]), tuple(box[3:])
     if any(v % 2 for v in (*o, *n)): raise SystemExit('box origin and size must be even (2x pooling onto the 4.8 um grid)')
     with tempfile.TemporaryDirectory() as d:
-        prob = pool2(read(g.pred, '2.4', (0, 0, 0), n, Path(d) / 'p.raw'))
+        prob = pool2(read(g.pred, '2.4', (0, 0, 0), n, Path(d) / 'p.raw'), o)
         ref = read(g.labels, '4.8', o // 2, tuple(v // 2 for v in n), Path(d) / 'l.raw') > 0
     r = analyse(prob, ref, [float(t) for t in g.thr.split(',')])
     r.update(pred=g.pred, box=box, labels=g.labels, tolerance_label_voxels=TOL, min_cover=MIN_COVER, min_sheet=MIN_SHEET)

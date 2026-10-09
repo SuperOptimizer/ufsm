@@ -17,6 +17,7 @@ from scipy import ndimage as ndi
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sheet_diagnostics import binary_scores
+from label_grid import label_index
 
 UFSM = Path(__file__).resolve().parent.parent / 'build/ufsm'
 GT = Path('/vesuvius/ufsm/gt/open-surfaces-20261007')
@@ -44,9 +45,10 @@ def labels_at(b, L, box, tmp):
     keys = sorted([p.name for p in Path(b['labels']).iterdir() if p.is_dir()], key=float)
     ll = b['label_level']
     if L >= ll: return read(b['labels'], keys[L - ll], box[:3], box[3:], tmp) > 0
-    f = 2 ** (ll - L); o = np.array(box[:3]); n = box[3:]
-    lab = read(b['labels'], keys[0], o // f, [(o[i] + n[i] - 1) // f - o[i] // f + 1 for i in range(3)], tmp) > 0
-    idx = [(o[i] + np.arange(n[i])) // f - o[i] // f for i in range(3)]
+    f = 2 ** (ll - L); o = np.array(box[:3]); n = box[3:]   # trainer's mapping (tools/label_grid.py): label j covers natives f j - f/2 ..
+    lo = label_index(o, f)
+    lab = read(b['labels'], keys[0], lo, [label_index(o[i] + n[i] - 1, f) - lo[i] + 1 for i in range(3)], tmp) > 0
+    idx = [label_index(o[i] + np.arange(n[i]), f) - lo[i] for i in range(3)]
     return lab[np.ix_(*idx)]
 
 

@@ -64,7 +64,7 @@ def main():
                 predict(ck, box, d / 'pred', g.gpu)
                 prob = read(d / 'pred', '2.4', (0, 0, 0), tuple(box[3:]), d / 'prob.raw')
                 s, lab = f1_auc(prob, box, d)
-                conn = analyse(pool2(prob), lab, [0.3, 0.4, 0.5, s['best_cutoff']])
+                conn = analyse(pool2(prob, box[:3]), lab, [0.3, 0.4, 0.5, s['best_cutoff']])
                 json.dump(dict(name=name, ckpt=ck, box=box, pixel=s, connectivity=conn), open(res, 'w'), indent=1)
                 for f in ('prob.raw', 'ct.raw', 'lab.raw', 'lab2.raw'): (d / f).unlink(missing_ok=True)
             r = json.load(open(res)); rows.append(r)
