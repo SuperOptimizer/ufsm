@@ -132,7 +132,8 @@ int band_field_side(const uint8_t *codes, const int n[3], const int64_t o[3], co
    rectos. Known only between two labelled consecutive rectos: the half spacing ds + dm within the flood radius, and the
    nearest recto and the nearest midpoint on opposite sides of the voxel (else it lies beyond the outermost or innermost
    labelled recto, or past the end of a trace). */
-int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out, uint8_t *phase) {
+int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out, uint8_t *phase,
+                     uint8_t *spacing) {
     const size_t N = (size_t)n[0] * n[1] * n[2], sy = (size_t)n[2], sz = (size_t)n[1] * n[2];
     uint8_t *side = malloc(N), *mid = malloc(N);
     float *d2 = malloc(N * 4), *m2 = malloc(N * 4); int32_t *idx = malloc(N * 4), *im = malloc(N * 4);
@@ -155,6 +156,7 @@ int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], c
         const float h = p.radius / 2.f;   /* label voxels */
         for (size_t i = 0; i < N; i++) {
             phase[i] = PHASE_UNKNOWN;
+            if (spacing) spacing[i] = 0;
             if (side[i] == SIDE_UNKNOWN || im[i] < 0) continue;
             const float ds = sqrtf(d2[i]), dm = sqrtf(m2[i]);
             if (ds + dm > h) continue;
@@ -169,6 +171,7 @@ int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], c
             if (side[i] == SIDE_VERSO) f = 1.f - f;
             int q = (int)lrintf(f * PHASE_PERIOD);
             phase[i] = (uint8_t)(q >= PHASE_PERIOD ? q - PHASE_PERIOD : q);
+            if (spacing) { const long sp = lrintf(2.f * (ds + dm + 0.5f)); spacing[i] = (uint8_t)(sp < 1 ? 1 : sp > 255 ? 255 : sp); }
         }
     }
     free(side); free(mid); free(d2); free(m2); free(idx); free(im);

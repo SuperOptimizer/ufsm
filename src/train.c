@@ -547,6 +547,9 @@ int cmd_train(int argc, char **argv) {
     if (atoi(opt(argc, argv, "--zfix", "0"))) sc.augment = 3;      /* diagnostic: symmetries that keep the z axis */
     if (atoi(opt(argc, argv, "--intonly", "0"))) sc.augment = 4;   /* diagnostic: intensity jitter, no symmetry */
     sc.band = g_aff; sc.side = g_side; sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
+    sc.phase_dense = atoi(opt(argc, argv, "--phase-dense", "0"));   /* side 2: weigh windings closer than this (label voxels) up */
+    if (sc.phase_dense && g_side != 2) { fprintf(stderr, "--phase-dense needs --side 2\n"); return 2; }
+    if (sc.phase_dense) fprintf(stderr, "phase: windings wider than %d label voxels supervised at a rate dense / spacing\n", sc.phase_dense);
     sc.ct_augment = atoi(opt(argc, argv, "--ct-aug", "0"));
     sc.symmetry_p = (float)atof(opt(argc, argv, "--symmetry-p", "1"));
     sc.axis_jitter = (float)atof(opt(argc, argv, "--axis-jitter", "0"));
@@ -860,7 +863,7 @@ int cmd_train(int argc, char **argv) {
     }
     if (g_side == 2) {   /* the last two channels: winding phase between consecutive rectos (src/band.h PHASE_*) */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
-        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"phase\":{\"version\":1,\"channel\":%d,\"channels\":[\"0.5+0.5cos(2pi phase)\",\"0.5+0.5sin(2pi phase)\"],\"phase\":\"fraction of the way outward from a recto to the next\",\"air\":%d,\"lambda\":%.9g}}",g_side_ch,sc.side_air,g_side_lambda);
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"phase\":{\"version\":1,\"channel\":%d,\"channels\":[\"0.5+0.5cos(2pi phase)\",\"0.5+0.5sin(2pi phase)\"],\"phase\":\"fraction of the way outward from a recto to the next\",\"air\":%d,\"lambda\":%.9g,\"dense\":%d}}",g_side_ch,sc.side_air,g_side_lambda,sc.phase_dense);
     }
     if (g_sheet) {
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;

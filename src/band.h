@@ -29,9 +29,11 @@ int band_field_side(const uint8_t *codes, const int n[3], const int64_t o[3], co
 /* the same plus the winding phase of every voxel between two labelled consecutive rectos: the fraction of the way outward from
    the recto it lies outward of to the next recto, times PHASE_PERIOD (0 on a recto face, PHASE_PERIOD / 2 midway, rising
    outward and wrapping to 0 at the next recto); PHASE_UNKNOWN elsewhere (beyond the outermost / innermost labelled recto,
-   past the end of a trace, where the band is unknown). The recto side is phase < PHASE_PERIOD / 2. */
+   past the end of a trace, where the band is unknown). The recto side is phase < PHASE_PERIOD / 2. spacing (optional): the local
+   distance between the two rectos (label voxels, 1..255; 0 where the phase is unknown). */
 enum { PHASE_PERIOD = 252, PHASE_UNKNOWN = 255 };
-int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out, uint8_t *phase);
+int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out, uint8_t *phase,
+                     uint8_t *spacing);
 
 /* modular difference of band / winding steps in (-126, 126] */
 static inline int band_diff(int a, int b) { int d = ((a - b + 126) % 252 + 252) % 252; return d - 126; }

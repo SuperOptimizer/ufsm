@@ -446,8 +446,11 @@ static void warp_sheet_batch(sheet_batch *b,const spatial_aug *a,const uint8_t *
 }
 /* band of a native window (task band_affinity): the band field (src/band.h) on the label grid of the window plus a halo,
    nearest-upsampled like the binary labels (native g -> label (g + 1) >> 1). out: P^3; side (optional): P^3 SIDE_* labels, or
-   with phase the winding phase (band.h PHASE_*). */
-static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8_t *side, int phase) {
+   with phase the winding phase (band.h PHASE_*). dense > 0 (phase): a phase voxel whose windings lie more than dense label voxels
+   apart is kept with probability dense / spacing (a hash of its global position and seed, no RNG draws), so the loss weighs
+   closely packed windings up, as upstream lasagna's density weight. */
+static uint64_t mix64(uint64_t x) { x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 27; x *= 0x94d049bb133111ebull; return x ^ (x >> 31); }
+static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8_t *side, int phase, int dense, uint64_t seed) {
     band_params bp = {s->band_radius, s->band_span};
     const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
     int64_t lo[3], ln[3], ro[3], rn[3]; int ni[3];
@@ -457,9 +460,9 @@ static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8
         ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
     }
     const size_t N = (size_t)ln[0] * ln[1] * ln[2];
-    uint8_t *codes = calloc(N, 1), *bl = malloc(N), *sl = side ? malloc(N) : nullptr;
+    uint8_t *codes = calloc(N, 1), *bl = malloc(N), *sl = side ? malloc(N) : nullptr, *sp = side && phase && dense > 0 ? malloc(N) : nullptr;
     double *cy = malloc(ln[0] * sizeof(double)), *cx = malloc(ln[0] * sizeof(double));
-    int rc = !codes || !bl || !cy || !cx || (side && !sl);
+    int rc = !codes || !bl || !cy || !cx || (side && !sl) || (side && phase && dense > 0 && !sp);
     if (!rc && rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
         uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
         rc = !tmp || z3_read(s->band, ro, rn, tmp, 1);
@@ -469,7 +472,7 @@ static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8
     }
     if (!rc) {
         for (int64_t z = 0; z < ln[0]; z++) axis_at(&s->ax, 2.0 * (z + lo[0]) + 0.5, &cy[z], &cx[z]);
-        rc = phase ? band_field_phase(codes, ni, lo, cy, cx, bp, bl, sl) : band_field_side(codes, ni, lo, cy, cx, bp, bl, sl);
+        rc = phase ? band_field_phase(codes, ni, lo, cy, cx, bp, bl, sl, sp) : band_field_side(codes, ni, lo, cy, cx, bp, bl, sl);
     }
     if (!rc) for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
         const size_t r0 = ((size_t)(((o[0] + z + 1) >> 1) - lo[0]) * ln[1] + (((o[1] + y + 1) >> 1) - lo[1])) * ln[2];
@@ -477,8 +480,17 @@ static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8
         uint8_t *dst = out + ((size_t)z * P + y) * P;
         for (int x = 0; x < P; x++) dst[x] = row[((o[2] + x + 1) >> 1) - lo[2]];
         if (side) { const uint8_t *sr = sl + r0; uint8_t *sd = side + ((size_t)z * P + y) * P; for (int x = 0; x < P; x++) sd[x] = sr[((o[2] + x + 1) >> 1) - lo[2]]; }
+        if (sp) {
+            const uint8_t *spr = sp + r0; uint8_t *sd = side + ((size_t)z * P + y) * P;
+            const uint64_t hz = mix64(seed ^ (uint64_t)(o[0] + z) * 0x9e3779b97f4a7c15ull ^ (uint64_t)(o[1] + y) * 0xc2b2ae3d27d4eb4full);
+            for (int x = 0; x < P; x++) {
+                const int v = spr[((o[2] + x + 1) >> 1) - lo[2]];
+                if (sd[x] >= PHASE_PERIOD || v <= dense) continue;
+                if ((mix64(hz ^ (uint64_t)(o[2] + x)) >> 40) * (uint64_t)v >= ((uint64_t)dense << 24)) sd[x] = PHASE_UNKNOWN;   /* keep with p = dense / v */
+            }
+        }
     }
-    free(codes); free(bl); free(sl); free(cy); free(cx);
+    free(codes); free(bl); free(sl); free(sp); free(cy); free(cx);
     return rc ? -1 : 0;
 }
 
@@ -725,7 +737,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (c->side) memset(b->side + (size_t)i * p3, SIDE_UNKNOWN, p3);
         } else {
             uint8_t *bw = malloc(p3), *sw = c->side ? malloc(p3) : nullptr;
-            if (!bw || (c->side && !sw) || band_window(s, o, P, bw, sw, c->side == 2)) { free(bw); free(sw); return -1; }
+            if (!bw || (c->side && !sw) || band_window(s, o, P, bw, sw, c->side == 2, c->phase_dense, tile_index ^ c->seed)) { free(bw); free(sw); return -1; }
             for (size_t k = 0; k < p3; k++) if (!ctu[k]) bw[k] = BAND_UNKNOWN;
             sym_u8(bw, b->band + (size_t)i * p3, P, y);
             if (sw) {   /* sides (phases) above CT side_air only: air (CT <= side_air) stays unsupervised */

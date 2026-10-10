@@ -183,7 +183,7 @@ static int cmd_band(int argc, char **argv) {
     double *cy = malloc(n[0] * sizeof(double)), *cx = malloc(n[0] * sizeof(double));
     for (int64_t zz = 0; zz < n[0]; zz++) axis_at(&ax, 2.0 * (zz + o[0]) + 0.5, &cy[zz], &cx[zz]);
     double t0 = now();
-    if (band_field_side(codes, ni, o, cy, cx, bp, band, side) || (phase && band_field_phase(codes, ni, o, cy, cx, bp, band, phase))) { fprintf(stderr, "band: out of memory\n"); return 1; }
+    if (band_field_side(codes, ni, o, cy, cx, bp, band, side) || (phase && band_field_phase(codes, ni, o, cy, cx, bp, band, phase, nullptr))) { fprintf(stderr, "band: out of memory\n"); return 1; }
     const int64_t on[3] = {b[3] / 2, b[4] / 2, b[5] / 2};
     FILE *f = fopen(argv[5], "wb");
     size_t unknown = 0;

@@ -147,6 +147,18 @@ ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or
   ~/ufsm-data/scratch-20261009/unwrap) 1.32 / 1.00 with the fewest merges (0.70-0.78 / 0.54-0.62) but more splits. Box 48128
   -15%, box 48512 +2%: short of the plan's -15% on both boxes. Not adopted yet; the unwrapping's splits (offset errors
   around defects) are the next target.
+- Where the phase fails (seed 1): 4.5-6% of confident known voxels are > 0.35 turn off; there the reference windings are
+  packed (spacing median 28-30 label voxels vs 42-46 overall) and the prediction cycles slower (median 0.62-0.68 of the
+  reference rate); over the boxes it advances 12-15% less phase per voxel than the reference: it under-counts windings
+  where sheets are compressed (the CT often shows no gap there), which is where pieces merge. Extraction variants on the
+  same predictions all land at VOI ~1.28 / ~0.97-1.0: fragments (confident voxels minus recto >= 0.2 and wraps) labelled by
+  the unwrapping's majority winding 1.28 / 0.97; Gaussian smoothing of the (cos, sin) vector before cutting / unwrapping
+  (sigma 1-3) no better (unwrap 1.26-1.32 / 1.03-1.04; the combined cut loses confident voxels and gets worse).
+- `train --phase-dense S` (lasagna's density weight as supervision thinning: a phase voxel whose windings are more than S
+  label voxels apart is kept with probability S / spacing, position hash, no RNG; band_field_phase's optional spacing
+  output): S 30 keeps ~65-70% of the phase voxels. Seed 1: phase error 0.119 / 0.102 turns, side 76.7% / 80.0%, F1 0.266 /
+  0.291, combined-cut VOI 1.29 / 1.01, phase advance ratio 0.855 / 0.883 - identical to the unweighted arm. The packed
+  windings are not under-weighted; they are not visible to the net in a 256^3 window.
 
 ## Memory and inference defaults (2026-10-08)
 

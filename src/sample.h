@@ -44,6 +44,8 @@ typedef struct {
     int band;                /* 1: fill batch.band from each source's band target (task band_affinity, native level, no geometry warp) */
     int side, side_air;      /* side: 1 fills batch.side (band.h SIDE_*: recto / verso side of the nearest labelled recto) from the same band
                                 field, 2 fills it with the winding phase (band.h PHASE_*); voxels with CT <= side_air (and CT 0) are unknown */
+    int phase_dense;         /* side 2: > 0 keeps a phase voxel whose windings lie more than phase_dense label voxels apart with probability
+                                phase_dense / spacing (position hash): denser windings weigh more in the loss */
 } sample_cfg;
 
 typedef struct {
