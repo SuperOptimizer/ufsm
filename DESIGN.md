@@ -134,6 +134,19 @@ ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or
   The MX head kernels (forward fp32 / fp16 logits, weight gradient, backward data) now take up to 16 outputs (recto + 6
   affinities + 2 = 9): staged weights padded to 16, the tensor-core / CUDA-core weight gradients run once per 8 outputs
   (test_mx4: 9 and 16 outputs). The 16-bit (non-MX) 1^3 weight gradient still takes at most 8 outputs.
+- Phase A/B (laptop, the residual A/B's recipe and seeds; control = its control arms; `--side 2 --head-map
+  0,2,3,4,5,6,7,-1,-1`; 2.7-2.9 vs 3.75 samples/s, sampler-bound): recto unchanged (F1 box 48128 0.266 / 0.271 vs 0.263 /
+  0.271, box 48512 0.291 / 0.292 vs 0.294 / 0.294; FWHM equal). The phase is learned: median error 0.071-0.076 / 0.063-0.066
+  turns (mean 0.115-0.119 / 0.100-0.101), 60-68% of known voxels within 0.1 turn, its side (phase < 0.5) 76-77% / 79-80%
+  correct (the side channel: 72% / 79% at this length); the training loss plateaus at ~0.56 from step 1000 (0.69 = no
+  information, 0.39 = the targets' entropy). Sheet pieces, VOI box 48128 / 48512, mean of the two seeds (cutoffs chosen
+  per box, as for every method): control recto cutoff 1.51 / 0.98; phase arm recto cutoff 1.68 / 1.02; phase wraps alone
+  1.55 / 1.25 (merges where the predicted phase has defects: a stripe that ends lets the windings meet around the cut's
+  end); recto ridge OR phase wraps within confidence >= 0.6 (score_sheets pieces_combo) 1.28 / 1.01; quality-guided
+  unwrapping of the phase (confidence order, piece = floor of the unwrapped phase; prototype
+  ~/ufsm-data/scratch-20261009/unwrap) 1.32 / 1.00 with the fewest merges (0.70-0.78 / 0.54-0.62) but more splits. Box 48128
+  -15%, box 48512 +2%: short of the plan's -15% on both boxes. Not adopted yet; the unwrapping's splits (offset errors
+  around defects) are the next target.
 
 ## Memory and inference defaults (2026-10-08)
 

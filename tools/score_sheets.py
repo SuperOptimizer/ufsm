@@ -18,7 +18,8 @@ Per box and checkpoint (output channel 0 = recto unless --channel):
   phase      (--phase-channel C, train --side 2: channels C = 0.5 + 0.5 cos, C + 1 = 0.5 + 0.5 sin of the winding phase)
              circular phase error (turns) against the reference phase (ufsm band --phase) over known voxels, the side it
              implies (phase < 0.5: recto side) and its accuracy, mean confidence (length of the (cos, sin) vector), and sheet
-             pieces cut where the phase wraps (6-neighbours more than half a turn apart), over all CT and over material
+             pieces cut where the phase wraps (6-neighbours more than half a turn apart), over all CT and over material,
+             and pieces cut at the phase wraps and the recto ridge together (best recto cutoff and confidence)
 usage: score_sheets.py --out DIR NAME=CKPT [...] [--boxes z,y,x,nz,ny,nx;...] [--gpu 0] [--root R --ct G --cache C
        --labels L --codes Q --axis A] [--window 544,16] [--channel 0]
 """
@@ -238,10 +239,11 @@ def phase_cut(ph, domain):
     return cut
 
 
-def phase_pieces(ph, domain, inside, conn=1):
-    """sheet instances from the phase: connected domain voxels minus the wraps; small pieces dropped; every other voxel inside
-    takes the nearest piece"""
+def phase_pieces(ph, domain, inside, conn=1, extra=None):
+    """sheet instances from the phase: connected domain voxels minus the wraps (and minus extra, e.g. the recto ridge); small
+    pieces dropped; every other voxel inside takes the nearest piece"""
     cut = phase_cut(ph, domain)
+    if extra is not None: cut |= extra
     lab, nl = ndi.label(domain & ~cut, ndi.generate_binary_structure(3, conn))
     size = np.bincount(lab.ravel(), minlength=nl + 1); keep = size >= MIN_PIECE; keep[0] = False
     lab = np.where(keep[lab], lab, 0)
@@ -254,7 +256,10 @@ def phase_pieces(ph, domain, inside, conn=1):
 PHASE_CONF = (0.0, 0.2, 0.4, 0.6)   # pieces are cut within voxels at least this confident (best VOI reported, like the recto cutoffs)
 
 
-def phase_scores(ph, conf, pref, inside, material, ref, known, confs=PHASE_CONF):
+COMBO_CUT = (0.1, 0.2, 0.3, 0.5)   # recto cutoffs of the combined cut (recto ridge or phase wrap)
+
+
+def phase_scores(ph, conf, pref, inside, material, ref, known, confs=PHASE_CONF, pl=None):
     pk = (pref < 252) & inside
     g = pref.astype(np.float32) / 252.0
     e = np.abs(ph - g); e = np.minimum(e, 1 - e)
@@ -270,6 +275,15 @@ def phase_scores(ph, conf, pref, inside, material, ref, known, confs=PHASE_CONF)
             rr.append(dict(confidence=c, cut_fraction=cf, known=compare(ref, lab, known), material=compare(ref, lab, known & material)))
         r['pieces_' + nm] = min(rr, key=lambda x: x['known']['voi'])
         r['pieces_' + nm + '_by_confidence'] = rr
+    if pl is not None:   # combined: cut at the recto ridge (label-grid max >= cutoff) and at the phase wraps, within confident voxels
+        rr = []
+        for t in COMBO_CUT:
+            rm = pl >= int(round(t * 255))
+            for c in confs[1:]:
+                lab, cf = phase_pieces(ph, inside & (conf >= c), inside, extra=rm)
+                rr.append(dict(recto=t, confidence=c, cut_fraction=cf, known=compare(ref, lab, known), material=compare(ref, lab, known & material)))
+        r['pieces_combo'] = min(rr, key=lambda x: x['known']['voi'])
+        r['pieces_combo_all'] = rr
     return r
 
 
@@ -357,7 +371,7 @@ def main():
                     cs.append(pool_mean(read(cd / ('ch%d' % c), '2.4', (0, 0, 0), n, cd / 'p.raw'), o))
                 ph, conf = phase_of(*cs)
                 np.savez_compressed(cd / 'phase.npz', ph=(ph * 252).astype(np.uint8), conf=(conf * 255).astype(np.uint8))
-                r['phase'] = phase_scores(ph, conf, np.load(phase_ref), inside, material, ref, known)
+                r['phase'] = phase_scores(ph, conf, np.load(phase_ref), inside, material, ref, known, pl=pl)
             json.dump(r, open(res, 'w'), indent=1); rows.append(r)
             del p, thin
     for r in rows:
@@ -385,6 +399,11 @@ def main():
                   % (r['name'], r['box'][0], q['error_mean'], q['error_median'], q['error_mean_material'], q['within_0p1'], q['side_accuracy'],
                      q['side_accuracy_material'], q['confidence_known'], pa['confidence'], pa['known']['voi'], pa['known']['voi_merge'], pa['material']['voi'],
                      pa['material']['voi_merge'], pm['confidence'], pm['known']['voi'], pm['known']['voi_merge']), flush=True)
+            if 'pieces_combo' in q:
+                pc = q['pieces_combo']
+                print('%-14s box%d combined cut (recto >= %.1f or phase wrap, confidence >= %.1f): VOI %.3f (split %.3f merge %.3f) ARAND %.3f, material VOI %.3f'
+                      % (r['name'], r['box'][0], pc['recto'], pc['confidence'], pc['known']['voi'], pc['known']['voi_split'], pc['known']['voi_merge'],
+                         pc['known']['adjusted_rand'], pc['material']['voi']), flush=True)
     json.dump(rows, open(out / 'summary.json', 'w'), indent=1)
 
 
