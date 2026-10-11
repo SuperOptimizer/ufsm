@@ -297,6 +297,24 @@ void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t
 void nn_add_into(void *y, const void *x, shape5 s, int h16);   /* y += x in y's storage (MX by registration, else 16-bit or fp32) */
 void nn_side_targets(const uint8_t *side, size_t n, uint8_t *t, uint8_t *m);   /* band.h SIDE_* labels -> loss target (recto 255, verso 0) and mask (known) */   /* where m == 0 and vm != 0: t = src, m = 1 */
 void nn_phase_targets(const uint8_t *phase, size_t n, uint8_t *t, uint8_t *m);   /* band.h PHASE_* -> targets t[0..n) = 0.5 + 0.5 cos(2 pi phase), t[n..2n) = 0.5 + 0.5 sin (x255), mask (known) */
+/* half-resolution networks (unet_cfg.half_res): the network runs on 2x2x2 blocks of the full-resolution window.
+   nn_half_input: the 4-channel input x ([n][4][D][H][W], 16-bit storage type when h16, else fp32) -> the network input y at half
+   resolution, same type: mode 1 (pool) the block mean of every channel (4 channels); mode 2 (pack) those 4 means plus, from the block's
+   8 CT voxels, the first-order Haar details along z, y, x ((upper half - lower half) / 8) and the mean absolute deviation from the
+   block mean (8 channels: the stem kernels take at most 8).
+   nn_half_output: half-resolution logits lg (fp16 when lh16, else fp32) -> full-resolution fp32 logits y [n][hs.c][2d][2h][2w]: pool
+   ([n][hs.c][d][h][w] logits) trilinear 2x (fine voxel f samples (f + 0.5) / 2 - 0.5, edge-clamped); pack ([n][8 hs.c][d][h][w]) channel
+   8 c + k is sub-voxel k of channel c. nn_half_grad: the adjoint, full-resolution gradient g -> half-resolution gh (16-bit storage
+   type when g16, else fp32). hs: the half-resolution shape with c = the full-resolution output channels. */
+void nn_half_input(const void *x, shape5 s, int mode, void *y, int h16);
+void nn_half_output(const void *lg, int lh16, shape5 hs, int mode, float *y);
+void nn_half_grad(const void *g, int g16, shape5 hs, int mode, void *gh);
+/* the same at div 2 or 4 (unet_cfg.half_res 3 / 4: quarter resolution): div 4 first pools 2x (input) / ends with a trilinear 2x
+   (logits), mode as above on the remaining 2x. qs: the network's grid, c = the full-resolution output channels. tmp (div 4): the
+   intermediate grid (full / 8 voxels) for 4 input channels in the input's type, or qs.c channels of fp32 logits / the gradient type */
+void nn_lowres_input(const void *x, shape5 s, int div, int mode, void *tmp, void *y, int h16);
+void nn_lowres_output(const void *lg, int lh16, shape5 qs, int div, int mode, float *tmp, float *y);
+void nn_lowres_grad(const void *g, int g16, shape5 qs, int div, int mode, void *tmp, void *gh);
 /* inference: network input from the uint8 CT window on the device (z-score + radial channels; 16-bit storage when h16),
    and recto probability * 255 (0 where the CT is 0) from the logits */
 void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16);

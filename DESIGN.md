@@ -160,6 +160,45 @@ ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or
   0.291, combined-cut VOI 1.29 / 1.01, phase advance ratio 0.855 / 0.883 - identical to the unweighted arm. The packed
   windings are not under-weighted; they are not visible to the net in a 256^3 window.
 
+## Half-resolution networks (2026-10-11)
+
+- `train --half-res pool|pack|pool4|pack4` (task surface; checkpoint header `"half_res":1-4`, absent = full resolution):
+  the U-Net runs on 2^3 (pool, pack) or 4^3 (pool4, pack4) blocks of the window, the loss stays at full resolution
+  (fp32 logits mapped up, their gradient mapped back by the exact adjoint). pool: input = the block means of the 4 input
+  channels, logits upsampled 2x trilinear (fine voxel f samples coarse (f + 0.5) / 2 - 0.5, edge-clamped). pack: 8 input
+  channels = the 4 means + the CT block's Haar details along z, y, x ((upper half - lower half) / 8) and its mean absolute
+  deviation (the stem kernels take at most 8 inputs, so not all 16 sub-voxel values), and 8 logits per output channel, one
+  per sub-voxel (channel 8c + k, k = 4dz + 2dy + dx; no interpolation). pool4 / pack4 put a 2x pool in front of the pool /
+  pack stage (pack4's sub-voxel logits are at 2x, then upsampled 2x trilinear). Kernels nn_half_input / nn_half_output /
+  nn_half_grad and the chained nn_lowres_* (src/nn_elem.cu); predict runs the net on W / div (the window must be divisible
+  by div * 2^(levels-1); no --split, sheet task or host path for these nets). The MX head weight gradient now takes any
+  multiple of 32 inputs in blocks of 32 (a 64-wide level 0), and the stem's cooperative weight gradient any multiple of 32
+  outputs. Tests: tests/test_half.c (layouts, host trilinear reference, adjoints, quarter chains, checkpoint), test_mx4
+  (head 16-96 inputs, stem 4 / 8 -> 64 / 96).
+- A/B (laptop, the dec_widths A/B's recipe: Paris4 band block cover x13 = 7048 steps, P256 B1, Muon 0.01 WSD, soft 7 um,
+  seeds 1-2; control = 32-192 with `--dec-widths 0,32`; pool / pack = 64-192 at 4.8 um; pool4 / pack4 = 96-192 at 9.6 um).
+  F1 (seeds 1 / 2, mean) and AUC per holdout box 48128 | 48512; ridge F1 at tolerance 1 (label grid, after NMS); FWHM in
+  2.4 um voxels; train wall time (laptop, sampler incl.):
+
+  | arm | F1 48128 | F1 48512 | AUC | ridge F1 tol 1 | FWHM | train |
+  |---|---|---|---|---|---|---|
+  | control | 0.252 / 0.247 (0.250) | 0.272 / 0.273 (0.273) | 0.771-0.776 / 0.803-0.804 | 0.386 / 0.424 | 16.2 / 18.0 | 1557 s |
+  | pool | 0.254 / 0.242 (0.248) | 0.277 / 0.278 (0.278) | 0.769-0.779 / 0.804-0.806 | 0.389 / 0.440 | 16.2 / 17.9 | 700 s |
+  | pack | 0.250 / 0.250 (0.250) | 0.271 / 0.281 (0.276) | 0.770-0.780 / 0.803-0.807 | 0.388 / 0.440 | 16.2 / 18.1 | 705 s |
+  | pool4 | 0.244 / 0.243 (0.244) | 0.273 / 0.264 (0.269) | 0.772-0.773 / 0.796-0.805 | 0.381 / 0.425 | 16.4 / 18.1 | 325 s |
+  | pack4 | 0.255 / 0.236 (0.246) | 0.272 / 0.268 (0.270) | 0.758-0.781 / 0.801 | 0.388 / 0.428 | 16.4 / 18.1 | 327 s |
+
+  At 2x nothing is lost (mean dF1 -0.002 / +0.005 pool, 0.000 / +0.004 pack; ridge F1 tol 1 at or above the control; the
+  ridge width and double-peak rate (0.037-0.039 / 0.021-0.022) equal: the sub-voxel head shows no block pattern), at ~2.2x
+  the training speed. At 4x the mean F1 drops 0.003-0.006 on both boxes (pool4 -0.006 / -0.004, pack4 -0.004 / -0.003),
+  at ~4.8x; the 4x runs are sampler-bound on the laptop (40% wait, ~21 samples/s). pack's sub-voxel CT detail is
+  not measurably better than pool at 2x or 4x. The ridge width is set by the labels (jittered traces, soft 7 um targets), not
+  by the network's grid. GPU ms per training step (UFSM_PROF, idle laptop GPU, 100 steps without a cover) control / pool /
+  pack / pool4 / pack4: P256 211 / 99 / 99 / 39 / 38, P384 673 / 297 / 305 / 96 / 98 (2.1-2.3x and 5.4-7x); wall samples/s
+  P256 4.7 / 9.9 / 9.9 / 24 / 23, P384 1.42 / 3.3 / 3.2 / 7-9 / 7.5-8.5: the 4x nets outrun the sampler (~400 M voxels/s).
+- Recommendation: `--half-res pool --widths 64,96,128,160,192` for new runs (fresh net; not on resume of a full-resolution
+  checkpoint). 4x only where speed matters more than ~0.005 F1. Not deployed on the desk (the user's call).
+
 ## Inference memory (2026-10-11)
 
 INFERENCE_MEMORY_PLAN.md phases 1, 2 and 2b (status table there): the inference build of the production net (one head

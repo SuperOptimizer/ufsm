@@ -182,20 +182,20 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
    Per warp and 16 voxels: lanes 0-15 dequantise one voxel row each and apply the GN+SiLU affine into fp16 A[ci][voxel],
    lanes 16-31 copy that voxel's gy into B[co][voxel] (and sum it for the bias); one m16n8k16 MMA with fp32 accumulation.
    The fp16 rounding of act(x) is the only numerical difference from conv_bwd_w1_mx1_k. */
-template <int B, int CI>   /* CI = 16 or 32 input channels (one MX block row): CI / 16 MMA row tiles per 16 voxels; outputs co0 .. co0 + 7 */
-__global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const __half *gy, float *gw, float *gb, int N, size_t S, gnp_t gp, int nper, int Co, int co0) {
+template <int B, int CI>   /* CI = 16 or 32 input channels (one MX block row, block blk of Ct): CI / 16 MMA row tiles per 16 voxels; outputs co0 .. co0 + 7 */
+__global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const __half *gy, float *gw, float *gb, int N, size_t S, gnp_t gp, int nper, int Co, int co0, int Ct, int blk) {
     constexpr int MTI = CI / 16;
     __shared__ float ca[CI], cb[CI], red[8][CI * 8 + 8];
     __shared__ __align__(16) __half sA[8][CI][40], sB[8][8][40];   /* [warp][ci][voxel], [warp][co][voxel] (32 voxels); rows padded */
     const int n = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     if (threadIdx.x < CI) {
-        const int k = threadIdx.x;
+        const int k = threadIdx.x, kc = blk * CI + k;
         float a = 1.f, bb = 0.f;
-        if (gp.G) { const int ng = n * gp.G + k / (CI / gp.G); a = gp.rstd[ng] * gp.gamma[k]; bb = gp.beta[k] - gp.mean[ng] * a; }
+        if (gp.G) { const int ng = n * gp.G + kc / (Ct / gp.G); a = gp.rstd[ng] * gp.gamma[kc]; bb = gp.beta[kc] - gp.mean[ng] * a; }
         ca[k] = a; cb[k] = bb;
     }
     __syncthreads();
-    const uint8_t *sc = mx_sc<B>(x, N, CI, S);
+    const uint8_t *sc = mx_sc<B>(x, N, Ct, S);
     float c[MTI][4], bs[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
     for (int m = 0; m < MTI; m++) c[m][0] = c[m][1] = c[m][2] = c[m][3] = 0.f;
@@ -205,7 +205,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
         const size_t v = vb + lane; const bool in = v < v1;
         {
             float r[32];
-            if (in) mx_load_row_b<B>(x, sc, (size_t)n * S + v, CI, r);
+            if (in) mx_load_row_b<B>(x, sc, ((size_t)n * (Ct / CI) + blk) * S + v, CI, r);
 #pragma unroll
             for (int k = 0; k < CI; k++) sA[warp][k][lane] = __float2half_rn(in ? (gp.G ? act_ab(r[k], ca[k], cb[k], true) : r[k]) : 0.f);
 #pragma unroll
@@ -243,24 +243,25 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
     for (int i = threadIdx.x; i < CI * 8 + 8; i += blockDim.x) {
         float s = 0.f;
         for (int w = 0; w < 8; w++) s += red[w][i];
-        if (i < CI * 8) { const int ci = i / 8, co = i % 8; if (co0 + co < Co) atomicAdd(&gw[(size_t)(co0 + co) * CI + ci], s); }
-        else if (gb && co0 + i - CI * 8 < Co) atomicAdd(&gb[co0 + i - CI * 8], s);
+        if (i < CI * 8) { const int ci = i / 8, co = i % 8; if (co0 + co < Co) atomicAdd(&gw[(size_t)(co0 + co) * Ct + blk * CI + ci], s); }
+        else if (gb && !blk && co0 + i - CI * 8 < Co) atomicAdd(&gb[co0 + i - CI * 8], s);
     }
 }
 /* returns 1 when the bias gradient (gb) was accumulated as well (tensor-core head path), else 0 (the caller adds it) */
 extern "C" int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp) {
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
-    if (!old && (xs.c == 16 || xs.c == 32) && ys.c <= 16 && gydt == 2 && (!gp.G || xs.c % gp.G == 0)) {
+    if (!old && (xs.c == 16 || xs.c % 32 == 0) && ys.c <= 16 && gydt == 2 && (!gp.G || xs.c % gp.G == 0)) {   /* > 32 inputs: one pass per 32-channel block */
         const size_t S = shape_spatial(xs);
         const int nper = 8192;
         const dim3 grid((unsigned)((S + nper - 1) / nper), xs.n);
-        for (int co0 = 0; co0 < ys.c; co0 += 8) {   /* 8 outputs per pass (one m16n8k16 column tile) */
-            if (xs.c == 32) {   /* 32 inputs: the CUDA-core kernel kept 32 x 8 accumulators per thread (spilled; 14.4 vs ~2 ms at 384^3) */
-                if (xdt == 4) conv_bwd_w1_tc_k<4, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0);
-                else conv_bwd_w1_tc_k<8, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0);
-            } else if (xdt == 4) conv_bwd_w1_tc_k<4, 16><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0);
-            else conv_bwd_w1_tc_k<8, 16><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0);
-        }
+        for (int co0 = 0; co0 < ys.c; co0 += 8)   /* 8 outputs per pass (one m16n8k16 column tile) */
+            for (int blk = 0; blk < (xs.c == 16 ? 1 : xs.c / 32); blk++) {
+                if (xs.c >= 32) {   /* 32 inputs: the CUDA-core kernel kept 32 x 8 accumulators per thread (spilled; 14.4 vs ~2 ms at 384^3) */
+                    if (xdt == 4) conv_bwd_w1_tc_k<4, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0, xs.c, blk);
+                    else conv_bwd_w1_tc_k<8, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0, xs.c, blk);
+                } else if (xdt == 4) conv_bwd_w1_tc_k<4, 16><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0, 16, 0);
+                else conv_bwd_w1_tc_k<8, 16><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0, 16, 0);
+            }
         LPCK();
         return gb != nullptr;
     }

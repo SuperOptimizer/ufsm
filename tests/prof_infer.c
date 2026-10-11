@@ -1,6 +1,6 @@
 /* Per-layer GPU time of the inference forward (event profiler), for one precision setting.
    usage: prof_infer [P] [B] [iters]   env: UFSM_PREC_POLICY / UFSM_PREC, UFSM_F16, UFSM_DOWN_NORM, UFSM_ACT_MX8 / UFSM_ACT_MX4,
-   UFSM_XIN_MX / UFSM_XIN_PREC, UFSM_GN_STORED, UFSM_SR, UFSM_BF16, UFSM_WIDTHS (e.g. 32,64,96,128,160,192), UFSM_COUT.
+   UFSM_XIN_MX / UFSM_XIN_PREC, UFSM_GN_STORED, UFSM_SR, UFSM_BF16, UFSM_WIDTHS (e.g. 32,64,96,128,160,192), UFSM_COUT, UFSM_CIN.
    Prints, per conv slot, the minimum over iterations of its forward time, the category totals (min over iterations),
    and the end-to-end forward time (wall clock, min and median). */
 #include "unet.h"
@@ -23,11 +23,12 @@ int main(int argc, char **argv) {
     unet_cfg cfg = {4, {16, 32, 64, 80}, 4, 2, 8};
     if (getenv("UFSM_WIDTHS")) { char *t = strdup(getenv("UFSM_WIDTHS")); cfg.nlev = 0; for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (getenv("UFSM_COUT")) cfg.cout = atoi(getenv("UFSM_COUT"));
+    if (getenv("UFSM_CIN")) cfg.cin = atoi(getenv("UFSM_CIN"));   /* half-resolution nets: 4 (pool) or 8 (pack) at P / 2 */
     if (getenv("UFSM_ENC_BLOCKS")) { char *t = strdup(getenv("UFSM_ENC_BLOCKS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.enc_blocks[l++] = atoi(q); free(t); }
     if (getenv("UFSM_DEC_WIDTHS")) { char *t = strdup(getenv("UFSM_DEC_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.dec_widths[l++] = atoi(q); free(t); }   /* narrower decoder levels */
     cfg.down_norm = getenv("UFSM_DOWN_NORM") ? atoi(getenv("UFSM_DOWN_NORM")) : 0;
     unet *u = unet_create(&cfg); unet_init(u, 1);
-    shape5 xs = {B, 4, P, P, P};
+    shape5 xs = {B, cfg.cin, P, P, P};
     if (getenv("UFSM_MEM_REPORT")) unet_infer_bytes(u, xs);
     float *x = nn_malloc(shape_numel(xs) * 4); nn_zero(x, shape_numel(xs) * 4);
     { float *h = malloc(shape_numel(xs) * 4); for (size_t i = 0; i < shape_numel(xs); i++) h[i] = (float)((i * 2654435761u) % 1000) / 500.f - 1.f; nn_h2d(x, h, shape_numel(xs) * 4); free(h); }

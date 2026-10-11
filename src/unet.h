@@ -23,7 +23,13 @@ typedef struct {
     int enc_blocks[UNET_MAXLEV];   /* extra pre-activation residual blocks after encoder level i (levels >= 1; 0 = none): x_k = x_{k-1} +
                                       conv2(silu(gn(conv1(silu(gn(x_{k-1})))))), widths[i] -> widths[i]; the last one's output is the level's
                                       skip and down-conv input. Parameters appended last; a fresh block starts as the identity (zero conv2) */
+    int half_res;          /* the caller runs the network on 2x2x2 blocks of its window (nn_half_*): 1 pool (cin 4, the block means; logits
+                              upsampled trilinearly), 2 pack (cin 8: the block means, the CT's sub-voxel gradients and contrast;
+                              cout 8 per output, one per sub-voxel); 3 pool4, 4 pack4: the network on 4^3 blocks (a 2x pool / trilinear 2x
+                              around pool / pack). The network itself does not use it; train / predict apply the transforms (nn_lowres_*) */
 } unet_cfg;
+static inline int unet_hr_div(int hr) { return hr >= 3 ? 4 : hr ? 2 : 1; }      /* the window voxels per network voxel along each axis */
+static inline int unet_hr_mode(int hr) { return hr == 2 || hr == 4 ? 2 : 1; }   /* the last stage: 1 pool, 2 pack (nn_half_*) */
 
 typedef struct unet unet;
 

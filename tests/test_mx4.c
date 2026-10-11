@@ -748,8 +748,10 @@ int main(void) {
            voxel for all outputs) must reproduce the per-element staging bit for bit, SR and gn+silu included */
         const int Gn = 8;
         struct { int ci, co, w; const char *nm; } cs[] = {{32, 32, 16, "32 -> 32, W 16"}, {16, 16, 20, "16 -> 16, W 20"}, {48, 16, 16, "48 -> 16 (NT 3)"}, {80, 80, 12, "80 -> 80, W 12"},
-                                                          {4, 16, 16, "4 -> 16 (network input), W 16"}, {4, 32, 16, "4 -> 32 (network input), W 16"}};
-        for (int i = 0; i < 6; i++) {
+                                                          {4, 16, 16, "4 -> 16 (network input), W 16"}, {4, 32, 16, "4 -> 32 (network input), W 16"},
+                                                          {4, 64, 16, "4 -> 64 (half-resolution input), W 16"}, {8, 64, 16, "8 -> 64 (half-resolution input), W 16"},
+                                                          {8, 96, 16, "8 -> 96 (quarter-resolution input), W 16"}};
+        for (int i = 0; i < 9; i++) {
             shape5 xs = {2, cs[i].ci, 6, 10, cs[i].w}, ys = xs; ys.c = cs[i].co;
             size_t nx = shape_numel(xs), ny = shape_numel(ys), nw = (size_t)cs[i].co * cs[i].ci * 27, NG = (size_t)2 * Gn;
             float *xr = dev_rand(nx, 2.f), *gr = dev_rand(ny, 1e-3f);
@@ -849,8 +851,8 @@ int main(void) {
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
     printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);
     (void)mode_ref; (void)mode_mx; (void)TOL4; (void)TOL; (void)G; (void)dev_rand;
-    for (int CI = 16; CI <= 32; CI += 16) {   /* wide heads (band affinity outputs, + 2 phase channels): 1^3 weight gradient, 16 / 32 MX
-                                                 inputs (optionally GN+SiLU) x 3..16 outputs, vs fp32 */
+    for (int CI = 16; CI <= 96; CI += CI < 32 ? 16 : 32) {   /* wide heads (band affinity outputs, + 2 phase channels): 1^3 weight gradient, 16 / 32 /
+                                                 64 / 96 MX inputs (optionally GN+SiLU) x 3..16 outputs, vs fp32 (> 32: low-resolution nets, tensor cores only) */
         shape5 xs = {2, CI, 6, 10, 12};
         const size_t S = shape_spatial(xs);
         static const int cos_[4] = {3, 7, 9, 16};
@@ -866,9 +868,11 @@ int main(void) {
             if (G) nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, xa); else nn_d2d(xa, xd, shape_numel(xs) * 4);
             if (CI == 16 && co <= 8) nn_conv3d_bwd_weight(xa, xs, gy, ys, 1, 1, gr, nullptr); else w1_ref(xa, xs, gy, co, gr, nullptr);
             gnp_t gp = {G ? gam : nullptr, G ? bet : nullptr, G ? mean : nullptr, G ? rstd : nullptr, G};
-            lp_bwd_w1_mx(xm, dt == 4 ? 4 : 3, xs, gy, 0, ys, gw, gp);
-            char nm[96]; snprintf(nm, sizeof nm, "head wgrad %d -> %d, mx%d%s", CI, co, dt, G ? ", gn+silu" : "");
-            cmp(nm, gw, gr, (size_t)co * CI, 1e-4);
+            if (CI <= 32) {
+                lp_bwd_w1_mx(xm, dt == 4 ? 4 : 3, xs, gy, 0, ys, gw, gp);
+                char nm[96]; snprintf(nm, sizeof nm, "head wgrad %d -> %d, mx%d%s", CI, co, dt, G ? ", gn+silu" : "");
+                cmp(nm, gw, gr, (size_t)co * CI, 1e-4);
+            }
             {   /* fp16 gy (the training storage): tensor-core kernel with the bias gradient in the same pass; fp16 rounding of
                    gy and of the activations bounds the agreement */
                 const int f16 = nn_get_f16(); nn_set_f16(1);
@@ -886,7 +890,7 @@ int main(void) {
             (void)S;
         }
     }
-    for (int CI = 16; CI <= 32; CI += 16) for (int co = 8; co <= 16; co += co == 8 ? 1 : 7) {   /* heads of 8, 9 and 16 outputs (phase: recto + 6
+    for (int CI = 16; CI <= 96; CI += CI < 32 ? 16 : 32) for (int co = 8; co <= 16; co += co == 8 ? 1 : 7) {   /* heads of 8, 9 and 16 outputs (phase: recto + 6
         affinities + cos + sin): 1^3 forward (fp32 and fp16 logits, plain and GN+SiLU input) and backward data into an MX-fp4 gradient */
         shape5 xs = {2, CI, 6, 10, 12}, ys = xs; ys.c = co;
         const size_t nx = shape_numel(xs), ny = shape_numel(ys);

@@ -467,7 +467,8 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
 extern int g_f8w_coop;
 template <int MT, int NT, typename T, typename TG> static void launch_bw8(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int ZC) {
     static int attr[8][2];
-    const int coop = g_f8w_coop | ((g_f8w_coop & 4) && xs.c <= 8 && ys.c <= 32 ? 2 : 0);   /* bit 2: the cooperative gy path for the network input conv */
+    const int coop = g_f8w_coop | ((g_f8w_coop & 4) && xs.c <= 8 && (ys.c <= 32 || ys.c % 32 == 0) ? 2 : 0);   /* bit 2: the cooperative gy path for the
+                                                                    network input conv (> 32 outputs: half-resolution nets, 32-output tiles) */
     if constexpr (NT == 1 && IS_MX(T) && IS_MX(TG)) {   /* the network input conv: conv_bwd_w_f8_k's FAST path (MX-fp8 or MX-fp4 gy) */
         if (xs.c <= 8 && !sp.up && !sp.x2 && x && (coop & 3) == 3 && 16 * MT <= mx_bw(ys.c) && ys.w % 4 == 0) {
             if (!attr[cur_dev_()][1]) { attr[cur_dev_()][1] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f8_k<MT, NT, T, TG, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }

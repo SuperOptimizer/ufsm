@@ -414,6 +414,112 @@ extern "C" void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, c
     else pred_in_k<bf16><<<nblk(n, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, (bf16 *)x);
     KCHECK();
 }
+/* half-resolution networks (unet_cfg.half_res, nn.h nn_half_*) */
+template <typename T> __global__ void half_in_k(const T *x, int n, int C, int d, int h, int w, int mode, T *y) {   /* one thread per half voxel */
+    const size_t hv = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)n * hv) return;
+    const int b = (int)(i / hv); const size_t v = i % hv;
+    const int z = (int)(v / ((size_t)h * w)), yy = (int)(v / w % h), xx = (int)(v % w);
+    const size_t H = 2 * (size_t)h, Wf = 2 * (size_t)w, fv = 8 * hv, f0 = ((size_t)2 * z * H + 2 * yy) * Wf + 2 * xx;
+    T *yo = y + (size_t)b * (mode == 2 ? 8 : C) * hv + v;
+    for (int c = 0; c < C; c++) {
+        const T *xc = x + ((size_t)b * C + c) * fv + f0;
+        float q[8], s = 0.f;
+        for (int k = 0; k < 8; k++) { q[k] = ldv(xc, ((k >> 2) * H + (k >> 1 & 1)) * Wf + (k & 1)); s += q[k]; }
+        const float m = 0.125f * s;
+        stv(yo, (size_t)c * hv, m);
+        if (mode == 2 && c == 0) {   /* the CT block's first-order Haar details along z, y, x and its mean absolute deviation */
+            float g[3] = {0.f, 0.f, 0.f}, a = 0.f;
+            for (int k = 0; k < 8; k++) { g[0] += k & 4 ? q[k] : -q[k]; g[1] += k & 2 ? q[k] : -q[k]; g[2] += k & 1 ? q[k] : -q[k]; a += fabsf(q[k] - m); }
+            for (int e = 0; e < 3; e++) stv(yo, (size_t)(4 + e) * hv, 0.125f * g[e]);
+            stv(yo, (size_t)7 * hv, 0.125f * a);
+        }
+    }
+}
+/* weight of coarse sample j in the 2x linear interpolation at fine index f (n coarse samples, edge-clamped) */
+__device__ __forceinline__ float half_tw(int f, int j, int n) {
+    const int i = f >> 1, o = f & 1 ? min(i + 1, n - 1) : max(i - 1, 0);
+    return (i == j ? 0.75f : 0.f) + (o == j ? 0.25f : 0.f);
+}
+template <typename T> __global__ void half_out_k(const T *lg, int n, int C, int d, int h, int w, int mode, float *y) {   /* one thread per full voxel */
+    const size_t hv = (size_t)d * h * w, fv = 8 * hv, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)n * C * fv) return;
+    const size_t bc = i / fv, v = i % fv;
+    const int H = 2 * h, Wf = 2 * w, z = (int)(v / ((size_t)H * Wf)), yy = (int)(v / Wf % H), xx = (int)(v % Wf);
+    if (mode == 2) {
+        const int k = (z & 1) * 4 + (yy & 1) * 2 + (xx & 1);
+        y[i] = ldv(lg, (bc * 8 + k) * hv + ((size_t)(z >> 1) * h + (yy >> 1)) * w + (xx >> 1));
+        return;
+    }
+    const T *l = lg + bc * hv;
+    int iz[2] = {z >> 1, z & 1 ? min((z >> 1) + 1, d - 1) : max((z >> 1) - 1, 0)}, iy[2] = {yy >> 1, yy & 1 ? min((yy >> 1) + 1, h - 1) : max((yy >> 1) - 1, 0)},
+        ix[2] = {xx >> 1, xx & 1 ? min((xx >> 1) + 1, w - 1) : max((xx >> 1) - 1, 0)};
+    float s = 0.f;
+    for (int a = 0; a < 2; a++) for (int b = 0; b < 2; b++) for (int c = 0; c < 2; c++)
+        s += (a ? 0.25f : 0.75f) * (b ? 0.25f : 0.75f) * (c ? 0.25f : 0.75f) * ldv(l, ((size_t)iz[a] * h + iy[b]) * w + ix[c]);
+    y[i] = s;
+}
+template <typename T> __global__ void half_grad_k(const T *g, int n, int C, int d, int h, int w, int mode, T *gh) {   /* one thread per half voxel and channel */
+    const size_t hv = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)n * C * hv) return;
+    const size_t bc = i / hv, v = i % hv;
+    const int z = (int)(v / ((size_t)h * w)), yy = (int)(v / w % h), xx = (int)(v % w), H = 2 * h, Wf = 2 * w;
+    const T *gc = g + bc * 8 * hv;
+    if (mode == 2) {
+        for (int k = 0; k < 8; k++) stv(gh, (bc * 8 + k) * hv + v, ldv(gc, ((size_t)(2 * z + (k >> 2)) * H + 2 * yy + (k >> 1 & 1)) * Wf + 2 * xx + (k & 1)));
+        return;
+    }
+    float s = 0.f;
+    for (int fz = max(2 * z - 1, 0); fz <= min(2 * z + 2, 2 * d - 1); fz++) {
+        const float wz = half_tw(fz, z, d); if (wz == 0.f) continue;
+        for (int fy = max(2 * yy - 1, 0); fy <= min(2 * yy + 2, H - 1); fy++) {
+            const float wy = wz * half_tw(fy, yy, h); if (wy == 0.f) continue;
+            for (int fx = max(2 * xx - 1, 0); fx <= min(2 * xx + 2, Wf - 1); fx++) {
+                const float wx = half_tw(fx, xx, w); if (wx == 0.f) continue;
+                s += wy * wx * ldv(gc, ((size_t)fz * H + fy) * Wf + fx);
+            }
+        }
+    }
+    stv(gh, i, s);
+}
+extern "C" void nn_half_input(const void *x, shape5 s, int mode, void *y, int h16) {
+    const int d = s.d / 2, h = s.h / 2, w = s.w / 2; const size_t n = (size_t)s.n * d * h * w;
+    if (!h16) half_in_k<float><<<nblk(n, 256), 256>>>((const float *)x, s.n, s.c, d, h, w, mode, (float *)y);
+    else if (g_h16) half_in_k<f16><<<nblk(n, 256), 256>>>((const f16 *)x, s.n, s.c, d, h, w, mode, (f16 *)y);
+    else half_in_k<bf16><<<nblk(n, 256), 256>>>((const bf16 *)x, s.n, s.c, d, h, w, mode, (bf16 *)y);
+    KCHECK();
+}
+extern "C" void nn_half_output(const void *lg, int lh16, shape5 hs, int mode, float *y) {
+    const size_t n = 8 * shape_numel(hs);
+    if (lh16) half_out_k<f16><<<nblk(n, 256), 256>>>((const f16 *)lg, hs.n, hs.c, hs.d, hs.h, hs.w, mode, y);
+    else half_out_k<float><<<nblk(n, 256), 256>>>((const float *)lg, hs.n, hs.c, hs.d, hs.h, hs.w, mode, y);
+    KCHECK();
+}
+extern "C" void nn_half_grad(const void *g, int g16, shape5 hs, int mode, void *gh) {
+    const size_t n = shape_numel(hs);
+    if (!g16) half_grad_k<float><<<nblk(n, 256), 256>>>((const float *)g, hs.n, hs.c, hs.d, hs.h, hs.w, mode, (float *)gh);
+    else if (g_h16) half_grad_k<f16><<<nblk(n, 256), 256>>>((const f16 *)g, hs.n, hs.c, hs.d, hs.h, hs.w, mode, (f16 *)gh);
+    else half_grad_k<bf16><<<nblk(n, 256), 256>>>((const bf16 *)g, hs.n, hs.c, hs.d, hs.h, hs.w, mode, (bf16 *)gh);
+    KCHECK();
+}
+extern "C" void nn_lowres_input(const void *x, shape5 s, int div, int mode, void *tmp, void *y, int h16) {
+    if (div == 2) { nn_half_input(x, s, mode, y, h16); return; }
+    nn_half_input(x, s, 1, tmp, h16);
+    shape5 t = s; t.d /= 2; t.h /= 2; t.w /= 2;
+    nn_half_input(tmp, t, mode, y, h16);
+}
+extern "C" void nn_lowres_output(const void *lg, int lh16, shape5 qs, int div, int mode, float *tmp, float *y) {
+    if (div == 2) { nn_half_output(lg, lh16, qs, mode, y); return; }
+    nn_half_output(lg, lh16, qs, mode, tmp);
+    shape5 t = qs; t.d *= 2; t.h *= 2; t.w *= 2;
+    nn_half_output(tmp, 0, t, 1, y);
+}
+extern "C" void nn_lowres_grad(const void *g, int g16, shape5 qs, int div, int mode, void *tmp, void *gh) {
+    if (div == 2) { nn_half_grad(g, g16, qs, mode, gh); return; }
+    shape5 t = qs; t.d *= 2; t.h *= 2; t.w *= 2;
+    nn_half_grad(g, g16, t, 1, tmp);
+    nn_half_grad(tmp, g16, qs, mode, gh);
+}
 __global__ void pred_out_k(const float *lg, const uint8_t *ct, size_t n, uint8_t *out) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i < n) out[i] = ct[i] ? (uint8_t)(255.f / (1.f + __expf(-lg[i])) + 0.5f) : 0;
