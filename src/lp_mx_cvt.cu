@@ -17,6 +17,35 @@ __global__ void f32_to_mx_k(const TI *x, uint8_t *y, int N, int C, size_t S) {
     for (int k = 0; k < 32; k++) { int c = blk * bw + k; r[k] = k < bw && c < C ? ldx(x, ((size_t)n * C + c) * S + v) : 0.f; }
     mx_store_row_b<B>(y, mx_sc<B>(y, N, C, S), i, bw, r);
 }
+/* the network input of predict (nn_pred_input: z-scored CT, 0, and the unit direction away from the axis) for window planes
+   [z0, z0 + nz), each value rounded to the 16-bit input type (HD 2 fp16, 1 bf16, 0 none) and stored as MX-fp8 rows of one
+   8-channel block (channels 4..7 zero): bit for bit nn_pred_input followed by the 16-bit -> MX-fp8 input conversion, without the
+   16-bit window. y: an MX-fp8 tensor of 4 channels and depth nz. */
+template <int HD> __device__ __forceinline__ float in_round(float v) {
+    if constexpr (HD == 2) return __half2float(__float2half(v));
+    else if constexpr (HD == 1) return __bfloat162float(__float2bfloat16(v));
+    else return v;
+}
+template <int HD>
+__global__ void pred_in_mx8_k(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, int z0, int nz, uint8_t *y) {
+    const size_t S = (size_t)nz * W * W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= S) return;
+    const int xx = (int)(i % W), yy = (int)((i / W) % W), z = z0 + (int)(i / ((size_t)W * W));
+    const float dy = dyo[z] + (float)yy, dx = dxo[z] + (float)xx, inv = axis ? (float)axis / (sqrtf(dy * dy + dx * dx) + 1e-6f) : 0.f;
+    float r[32];
+#pragma unroll
+    for (int k = 0; k < 32; k++) r[k] = 0.f;
+    r[0] = in_round<HD>(((float)ct[(size_t)z * W * W + (size_t)yy * W + xx] - mean) * isd); r[1] = in_round<HD>(0.f);
+    r[2] = in_round<HD>(dy * inv); r[3] = in_round<HD>(dx * inv);
+    mx_store_row_b<8>(y, mx_sc<8>(y, 1, 4, S), i, 8, r);
+}
+extern "C" void lp_pred_input_mx8(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, int z0, int nz, void *y, int hd) {
+    const size_t S = (size_t)nz * W * W;
+    if (hd == 2) pred_in_mx8_k<2><<<nblk_(S, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, z0, nz, (uint8_t *)y);
+    else if (hd == 1) pred_in_mx8_k<1><<<nblk_(S, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, z0, nz, (uint8_t *)y);
+    else pred_in_mx8_k<0><<<nblk_(S, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, z0, nz, (uint8_t *)y);
+    LPCK();
+}
 extern "C" void lp_f32_to_mx8(const float *x, int N, int C, size_t S, void *y) {
     size_t n = (size_t)N * mx_nb(C) * S;
     f32_to_mx_k<8, float><<<nblk_(n, 256), 256>>>(x, (uint8_t *)y, N, C, S); LPCK();

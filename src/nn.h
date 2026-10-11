@@ -26,6 +26,8 @@ void nn_zero(void *p, size_t bytes);
 void nn_h2d(void *dst, const void *src, size_t bytes);
 void nn_d2h(void *dst, const void *src, size_t bytes);
 void nn_d2d(void *dst, const void *src, size_t bytes);
+void nn_d2d_async(void *dst, const void *src, size_t bytes);   /* on the default stream, no host sync */
+void nn_set_zrange(int z0, int Di, int first, int last, int Do);   /* z-range of the next MX forward convs (see nn_bwd.cu): input planes z0 + .. of a depth-Di input; Do output planes in all; Di 0 = off */
 void nn_sync(void);
 void *nn_host_alloc(size_t bytes);       /* pinned host memory */
 void *nn_host_alloc_try(size_t bytes);   /* the same, nullptr when the host cannot pin that much */
@@ -299,6 +301,7 @@ void nn_phase_targets(const uint8_t *phase, size_t n, uint8_t *t, uint8_t *m);  
    and recto probability * 255 (0 where the CT is 0) from the logits */
 void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16);
 void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out);
+void nn_pred_input_mx8(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, int z0, int nz, void *y, int h16);   /* nn_pred_input of planes [z0, z0 + nz) straight to MX-fp8 (depth-nz tensor), bit-identical to nn_pred_input + the input conversion */
 void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);   /* interior -> device shard */
 void nn_pred_stats(const uint8_t *ct, size_t n, void *scratch, size_t *nz, double *sum, double *sq);   /* exact window stats (scratch: 24 B device) */
 void nn_pred_ctmask(const uint8_t *ct, size_t n, uint32_t *bits);   /* CT != 0 as bits ((n + 31) / 32 words) */

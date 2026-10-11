@@ -197,6 +197,7 @@ extern "C" void nn_zero(void *p, size_t n) { CK(cudaMemset(p, 0, n)); }
 extern "C" void nn_h2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyHostToDevice)); }
 extern "C" void nn_d2h(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToHost)); }
 extern "C" void nn_d2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToDevice)); }
+extern "C" void nn_d2d_async(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToDevice, 0)); }   /* ordered with the kernels */
 extern "C" void nn_sync(void) { CK(cudaDeviceSynchronize()); }
 extern "C" void *nn_host_alloc(size_t n) { void *p = nullptr; CK(cudaMallocHost(&p, n)); return p; }
 extern "C" void *nn_host_alloc_try(size_t n) { void *p = nullptr; if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }

@@ -35,14 +35,15 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8_k(const T *__restrict__ x,
     float acc[MT][NR][2][4];
 #pragma unroll
     for (int m = 0; m < MT; m++) for (int r = 0; r < NR; r++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[m][r][q][k] = 0.f;
-    const size_t plane = (size_t)D * H * W;
+    const int zi0 = sp.zi0, Di = sp.Di ? sp.Di : D;   /* z-range (nn_set_zrange): output plane z reads input plane z + zi0 of a depth-Di input */
+    const size_t plane = (size_t)Di * H * W;
     const int Cx = sp.x2 ? sp.c_split : Ci;
     const bool G = gp.G != 0 || sp.gp2.G != 0;
     for (int ci0 = 0; ci0 < Cip; ci0 += F8_CI) {
         __syncthreads();
         const bool upc = IS_MX(T) && sp.up && ci0 < (Cx + 31) / 32 * 32;   /* this chunk is the half-resolution x segment (decoder up part) */
         if (threadIdx.x < 32) {
-            const chan_t c = make_chan(IS_MX(T) ? seg_ci(ci0 + threadIdx.x, Ci, Cx, (Cx + 31) / 32 * 32) : ci0 + threadIdx.x, Ci, Cx, n, upc ? (size_t)(D >> 1) * (H >> 1) * (W >> 1) : plane, x, sp, gp, N);
+            const chan_t c = make_chan(IS_MX(T) ? seg_ci(ci0 + threadIdx.x, Ci, Cx, (Cx + 31) / 32 * 32) : ci0 + threadIdx.x, Ci, Cx, n, upc ? (size_t)(Di >> 1) * (H >> 1) * (W >> 1) : plane, x, sp, gp, N);
             ctab[threadIdx.x] = c;
             cab[threadIdx.x] = make_float2(c.a, c.b);   /* compact GN coefficients for the MX staging (one broadcast LDS.64 per element) */
             const unsigned gm = __ballot_sync(0xffffffffu, c.g != 0);
@@ -50,17 +51,17 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8_k(const T *__restrict__ x,
         }
         __syncthreads();
         const unsigned gmask = *sgm;
-        if (upc) { stage_up_coarse<T>(ctab[0], cu, cus, (oz0 >> 1) - 2, (oy0 >> 1) - 2, (ox0 >> 1) - 2, TZ / 2 + 4, D, H, W, cab, gmask); __syncthreads(); }
+        if (upc) { stage_up_coarse<T>(ctab[0], cu, cus, ((oz0 + zi0) >> 1) - 2, (oy0 >> 1) - 2, (ox0 >> 1) - 2, TZ / 2 + 4, Di, H, W, cab, gmask); __syncthreads(); }
         if constexpr (IS_MX8(T)) if (!G && !upc) {   /* MX-fp8 input without transform: the chunk is one stored block -> copy bytes and scales */
             const chan_t c0 = ctab[0];
             for (int pos = threadIdx.x; pos < TT; pos += 256) {
                 int ix = pos % 18, iy = (pos / 18) % 10, iz = pos / 180;
                 int gz = oz0 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
-                bool inb = c0.p && gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W;
+                bool inb = c0.p && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
                 uint4 h0 = make_uint4(0u, 0u, 0u, 0u), h1 = h0;
                 unsigned sc = 1u;
                 if (inb) {
-                    size_t off = ((size_t)gz * H + gy) * W + gx;
+                    size_t off = ((size_t)(gz + zi0) * H + gy) * W + gx;
                     const uint4 *src = (const uint4 *)((const uint8_t *)c0.p + off * c0.rb);
                     if (c0.bw == 8) { const uint2 u = __ldg((const uint2 *)src); h0.x = u.x; h0.y = u.y; }
                     else { h0 = __ldg(src); if (c0.bw == 32) h1 = __ldg(src + 1); }
@@ -76,10 +77,10 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8_k(const T *__restrict__ x,
         if (!IS_MX8(T) || G || upc) for (int pos = threadIdx.x; pos < TT; pos += 256) {
             int ix = pos % 18, iy = (pos / 18) % 10, iz = pos / 180;
             int gz = oz0 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
-            bool inb = gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W;
-            size_t off = inb ? ((size_t)gz * H + gy) * W + gx : 0;
+            bool inb = gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+            size_t off = inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0;
             float v[32], amax = 0.f;
-            if (upc) stage_up_smem(cu, cus, (oz0 >> 1) - 2, (oy0 >> 1) - 2, (ox0 >> 1) - 2, gz, gy, gx, D, H, W, inb, v); else stage_row32<T>(ctab, off, inb, G, v, cab, gmask);
+            if (upc) stage_up_smem(cu, cus, ((oz0 + zi0) >> 1) - 2, (oy0 >> 1) - 2, (ox0 >> 1) - 2, gz + zi0, gy, gx, Di, H, W, inb, v); else stage_row32<T>(ctab, off, inb, G, v, cab, gmask);
 #pragma unroll
             for (int k = 0; k < 32; k++) amax = fmaxf(amax, fabsf(v[k]));   /* e4m3 keeps a NaN element itself (0x7f): plain max */
             int e = mx_exp(amax, 1.f / 448.f);
@@ -182,7 +183,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
     float acc[MT][2][2][4];
 #pragma unroll
     for (int m = 0; m < MT; m++) for (int r = 0; r < 2; r++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[m][r][q][k] = 0.f;
-    const size_t plane = (size_t)D * H * W;
+    const int zi0 = sp.zi0, Di = sp.Di ? sp.Di : D;   /* z-range (nn_set_zrange): output plane z reads input plane z + zi0 of a depth-Di input */
+    const size_t plane = (size_t)Di * H * W;
     const int Cx = sp.x2 ? sp.c_split : Ci;
     chan_t *ctab = (chan_t *)(samax + 4);              /* [16] */
     const bool G = gp.G != 0 || sp.gp2.G != 0;
@@ -201,8 +203,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
         int pos = threadIdx.x + 256 * j;
         int ix = pos % 18, iy = (pos / 18) % 10, iz = pos / 180;
         int gz = oz0 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
-        bool inb = pos < F8_T && gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W;
-        size_t off = inb ? ((size_t)gz * H + gy) * W + gx : 0;
+        bool inb = pos < F8_T && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+        size_t off = inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0;
 #pragma unroll
         for (int k = 0; k < CP; k++) {
             float val = 0.f;
@@ -316,7 +318,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8p_k(const T *__restrict__ x
     const int oz0 = (bz % nzt) * TZ; bz /= nzt;
     const int nmt = Cop / BM;
     const int co0 = (bz % nmt) * BM; const int n = bz / nmt;
-    const size_t plane = (size_t)D * H * W;
+    const int zi0 = sp.zi0, Di = sp.Di ? sp.Di : D;   /* z-range (nn_set_zrange): output plane z reads input plane z + zi0 of a depth-Di input */
+    const size_t plane = (size_t)Di * H * W;
     const bool G = gp.G != 0;
     for (int i = threadIdx.x; i < P16_KS * BM * 2; i += 256) {
         const int ks = i / (BM * 2), r = i % (BM * 2), c = r >> 1, h = r & 1;
@@ -342,8 +345,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8p_k(const T *__restrict__ x
         for (int it = 0; it < NIT; it++) {
             const int pos = threadIdx.x + 256 * it, row = pos / 18, ix = pos - 18 * row;
             const int gz = oz0 - 1 + row / 10, gy = oy0 - 1 + row % 10, gx = ox0 - 1 + ix;
-            const bool inb = pos < TT && gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W;
-            stage_row16<T>(c0, Ci, plane, inb ? ((size_t)gz * H + gy) * W + gx : 0, inb, G, gab, v[it]);
+            const bool inb = pos < TT && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+            stage_row16<T>(c0, Ci, plane, inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0, inb, G, gab, v[it]);
             unsigned am = 0u;
 #pragma unroll
             for (int k = 0; k < 16; k++) { const unsigned u = __float_as_uint(fabsf(v[it][k])); am = u <= 0x7f800000u ? max(am, u) : am; }   /* finite magnitudes (as fmaxf: e4m3 keeps a NaN element itself) */

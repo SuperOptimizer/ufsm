@@ -43,14 +43,15 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4_k(const T *__restrict__ x,
     float acc[MT][NR][2][4];
 #pragma unroll
     for (int m = 0; m < MT; m++) for (int r = 0; r < NR; r++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[m][r][q][k] = 0.f;
-    const size_t plane = (size_t)D * H * W;
+    const int zi0 = sp.zi0, Di = sp.Di ? sp.Di : D;   /* z-range (nn_set_zrange): output plane z reads input plane z + zi0 of a depth-Di input */
+    const size_t plane = (size_t)Di * H * W;
     const int Cx = sp.x2 ? sp.c_split : Ci;
     const bool G = gp.G != 0 || sp.gp2.G != 0;
     for (int ci0 = 0; ci0 < Cip; ci0 += 32) {
         __syncthreads();
         const bool upc = IS_MX(T) && sp.up && ci0 < (Cx + 31) / 32 * 32;   /* this chunk is the half-resolution x segment (decoder up part) */
         if (threadIdx.x < 32) {
-            const chan_t c = make_chan(IS_MX(T) ? seg_ci(ci0 + threadIdx.x, Ci, Cx, (Cx + 31) / 32 * 32) : ci0 + threadIdx.x, Ci, Cx, n, upc ? (size_t)(D >> 1) * (H >> 1) * (W >> 1) : plane, x, sp, gp, N);
+            const chan_t c = make_chan(IS_MX(T) ? seg_ci(ci0 + threadIdx.x, Ci, Cx, (Cx + 31) / 32 * 32) : ci0 + threadIdx.x, Ci, Cx, n, upc ? (size_t)(Di >> 1) * (H >> 1) * (W >> 1) : plane, x, sp, gp, N);
             ctab[threadIdx.x] = c;
             cab[threadIdx.x] = make_float2(c.a, c.b);   /* compact GN coefficients for the MX staging (one broadcast LDS.64 per element) */
             const unsigned gm = __ballot_sync(0xffffffffu, c.g != 0);
@@ -58,17 +59,17 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4_k(const T *__restrict__ x,
         }
         __syncthreads();
         const unsigned gmask = *sgm;
-        if (upc) { stage_up_coarse<T>(ctab[0], cu, cus, (oz0 >> 1) - 2, (oy0 >> 1) - 2, (ox0 >> 1) - 2, TZ / 2 + 4, D, H, W, cab, gmask); __syncthreads(); }
+        if (upc) { stage_up_coarse<T>(ctab[0], cu, cus, ((oz0 + zi0) >> 1) - 2, (oy0 >> 1) - 2, (ox0 >> 1) - 2, TZ / 2 + 4, Di, H, W, cab, gmask); __syncthreads(); }
         if constexpr (IS_MX4(T)) if (!G && !sp.sr && !upc) {   /* mx4 input without transform: the chunk is one stored block -> copy the row and its scale */
             const chan_t c0 = ctab[0];
             for (int pos = threadIdx.x; pos < TT; pos += 256) {
                 int ix = pos % 18, iy = (pos / 18) % 10, iz = pos / 180;
                 int gz = oz0 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
-                bool inb = c0.p && gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W;
+                bool inb = c0.p && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
                 uint4 h0 = make_uint4(0u, 0u, 0u, 0u);
                 unsigned sc = 1u;
                 if (inb) {
-                    size_t off = ((size_t)gz * H + gy) * W + gx;
+                    size_t off = ((size_t)(gz + zi0) * H + gy) * W + gx;
                     const uint8_t *src = (const uint8_t *)c0.p + off * c0.rb;
                     if (c0.bw == 32) h0 = __ldg((const uint4 *)src); else { uint2 u = __ldg((const uint2 *)src); h0.x = u.x; h0.y = u.y; }
                     sc = c0.sp[off];
@@ -80,10 +81,10 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4_k(const T *__restrict__ x,
         if (!IS_MX4(T) || G || sp.sr || upc) for (int pos = threadIdx.x; pos < TT; pos += 256) {   /* stage: dequantise / read, transform, requantise to e2m1 */
             int ix = pos % 18, iy = (pos / 18) % 10, iz = pos / 180;
             int gz = oz0 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
-            bool inb = gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W;
-            size_t off = inb ? ((size_t)gz * H + gy) * W + gx : 0;
+            bool inb = gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+            size_t off = inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0;
             float v[32];
-            if (upc) stage_up_smem(cu, cus, (oz0 >> 1) - 2, (oy0 >> 1) - 2, (ox0 >> 1) - 2, gz, gy, gx, D, H, W, inb, v); else stage_row32<T>(ctab, off, inb, G, v, cab, gmask);
+            if (upc) stage_up_smem(cu, cus, ((oz0 + zi0) >> 1) - 2, (oy0 >> 1) - 2, (ox0 >> 1) - 2, gz + zi0, gy, gx, Di, H, W, inb, v); else stage_row32<T>(ctab, off, inb, G, v, cab, gmask);
             unsigned amu = 0u;
 #pragma unroll
             for (int k = 0; k < 32; k++) amu = amax_u(amu, v[k]);
@@ -174,7 +175,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4r_k(const T *__restrict__ x
     const int nzt = (D + TZ - 1) / TZ, nzc = (nzt + ZC - 1) / ZC;
     const int zc = blockIdx.z % nzc, n = blockIdx.z / nzc;
     const int nmt = Cop / BM, nch = NCH;
-    const size_t plane = (size_t)D * H * W;
+    const int zi0 = sp.zi0, Di = sp.Di ? sp.Di : D;   /* z-range (nn_set_zrange): output plane z reads input plane z + zi0 of a depth-Di input */
+    const size_t plane = (size_t)Di * H * W;
     const int Cx = sp.x2 ? sp.c_split : Ci;
     const bool G = gp.G != 0 || sp.gp2.G != 0;
     if (threadIdx.x < 32 * NCH) {
@@ -198,11 +200,11 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4r_k(const T *__restrict__ x
                 for (int li = threadIdx.x; li < npos; li += 256) {
                     const int pl = p0n + li / 180, rem = li % 180, ix = rem % 18, iy = rem / 18;
                     const int gz = oz0 - 1 + pl, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix, pos = ((gz + 1) % NP) * 180 + rem;
-                    const bool inb = c0.p && gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W;
+                    const bool inb = c0.p && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
                     uint4 h0 = make_uint4(0u, 0u, 0u, 0u);
                     unsigned sc = 1u;
                     if (inb) {
-                        size_t off = ((size_t)gz * H + gy) * W + gx;
+                        size_t off = ((size_t)(gz + zi0) * H + gy) * W + gx;
                         const uint8_t *src = (const uint8_t *)c0.p + off * c0.rb;
                         if (c0.bw == 32) h0 = __ldg((const uint4 *)src); else { uint2 u = __ldg((const uint2 *)src); h0.x = u.x; h0.y = u.y; }
                         sc = c0.sp[off];
@@ -214,8 +216,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4r_k(const T *__restrict__ x
             if (!IS_MX4(T) || G || sp.sr) for (int li = threadIdx.x; li < npos; li += 256) {   /* stage: dequantise / read, transform, requantise */
                 const int pl = p0n + li / 180, rem = li % 180, ix = rem % 18, iy = rem / 18;
                 const int gz = oz0 - 1 + pl, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix, pos = ((gz + 1) % NP) * 180 + rem;
-                const bool inb = gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W;
-                const size_t off = inb ? ((size_t)gz * H + gy) * W + gx : 0;
+                const bool inb = gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+                const size_t off = inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0;
                 float v[32];
                 stage_row32<T>(ct, off, inb, G, v, cab + 32 * ch, sgm[ch]);
                 unsigned amu = 0u;
@@ -359,7 +361,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
     const int zc = bz % nzc; bz /= nzc;
     const int nmt = Cop / BM;
     const int co0 = (bz % nmt) * BM; const int n = bz / nmt;
-    const size_t plane = (size_t)D * H * W;
+    const int zi0 = sp.zi0, Di = sp.Di ? sp.Di : D;   /* z-range (nn_set_zrange): output plane z reads input plane z + zi0 of a depth-Di input */
+    const size_t plane = (size_t)Di * H * W;
     const bool G = gp.G != 0;
     for (int i = threadIdx.x; i < 9 * BM * 2; i += 256) {
         const int r = i / (BM * 2), q = i % (BM * 2), c = q >> 1, h = q & 1;
@@ -386,8 +389,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
         for (int it = 0; it < NIT; it++) {
             const int li = threadIdx.x + 256 * it, pl = p0 + li / 180, rem = li % 180, row = rem / 18, ix = rem - 18 * row;
             const int gz = oz0 - 1 + pl, gy = oy0 - 1 + row, gx = ox0 - 1 + ix, spos = ((gz + 1) % NP) * 180 + rem;
-            const bool inb = li < npos && gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W;
-            stage_row16<T>(c0, Ci, plane, inb ? ((size_t)gz * H + gy) * W + gx : 0, inb, G, gab, v[it]);
+            const bool inb = li < npos && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+            stage_row16<T>(c0, Ci, plane, inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0, inb, G, gab, v[it]);
             unsigned am = 0u;
 #pragma unroll
             for (int k = 0; k < 16; k++) am = amax_u(am, v[it][k]);

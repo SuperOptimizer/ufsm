@@ -78,15 +78,16 @@ extern "C" int nn_conv3d_fwd_gn_stats(const float *x, shape5 xs, int G_in, const
     int NG = xs.n * G_out;
     double *sums = nullptr;
     const int fused = gn_fused_stored(y, cout);
-    if ((!g_gn_stored || fused) && G_out && omean && orstd) { sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
+    if ((!g_gn_stored || fused) && G_out && omean && orstd) { sums = gn_dsums((size_t)2 * NG); if (zr_zero()) cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
     split_t ns = zs_split(split_t{}, xs.d);
     ns.stored_stats = fused;
+    if (g_zr_Di && G_out && omean && orstd && g_gn_stored && !fused) { fprintf(stderr, "conv: the z-range needs fused output statistics\n"); abort(); }
     conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, ns);
     KCHECK();
-    if (G_out && omean && orstd) {
+    if (G_out && omean && orstd && zr_final()) {
         if (g_gn_stored && !fused) { shape5 ys = xs; ys.c = cout; return nn_gn_stats(y, ys, G_out, eps, omean, orstd); }
         zs_reduce(sums, 2 * NG);
-        gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zs_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd);
+        gn_finalize_k<<<nblk(NG, 128), 128>>>(sums, NG, zr_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd);
     }
     KCHECK();
     return 0;
@@ -101,12 +102,13 @@ extern "C" int nn_conv3d_fwd_split(const float *x, const float *x2, int c_split,
     double *sums = nullptr;
     const int fused = gn_fused_stored(y, cout);
     sp.stored_stats = fused;
-    if ((!g_gn_stored || fused) && G_out && omean && orstd) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
+    if ((!g_gn_stored || fused) && G_out && omean && orstd) { int NG = xs.n * G_out; sums = gn_dsums((size_t)2 * NG); if (zr_zero()) cudaMemsetAsync(sums, 0, (size_t)2 * NG * sizeof(double)); }
+    if (g_zr_Di && G_out && omean && orstd && g_gn_stored && !fused) { fprintf(stderr, "conv: the z-range needs fused output statistics\n"); abort(); }
     conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, sums, G_out, sp);
     KCHECK();
-    if (G_out && omean && orstd) {
+    if (G_out && omean && orstd && zr_final()) {
         if (g_gn_stored && !fused) { shape5 ys = xs; ys.c = cout; return nn_gn_stats(y, ys, G_out, eps, omean, orstd); }
-        zs_reduce(sums, 2 * xs.n * G_out); gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, zs_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd);
+        zs_reduce(sums, 2 * xs.n * G_out); gn_finalize_k<<<nblk(xs.n * G_out, 128), 128>>>(sums, xs.n * G_out, zr_len((size_t)(cout / G_out) * shape_spatial(xs), xs.d), eps, omean, orstd);
     }
     KCHECK();
     return 0;

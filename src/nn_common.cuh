@@ -1008,6 +1008,10 @@ void zs_range(int D, int *lo, int *hi);
 size_t zs_len(size_t len, int D);
 void zs_reduce(double *b, int n);
 split_t zs_split(split_t sp, int D);
+extern int g_zr_z0, g_zr_Di, g_zr_first, g_zr_last, g_zr_Do;
+size_t zr_len(size_t len, int D);   /* zs_len, or the whole depth of a z-range */
+int zr_zero(void);                  /* zero the output GroupNorm sums (not a z-range, or its first slab) */
+int zr_final(void);                 /* finalise them (not a z-range, or its last slab) */
 int gn_fused_stored(const void *y, int cout);
 /* x-shift packed weights for XP: wp[kz * 3 + ky][co][kx * 4 + c] (kx = 3 and c >= Ci zero), Cop rows */
 template <typename HT>

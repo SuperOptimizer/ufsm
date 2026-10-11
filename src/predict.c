@@ -254,6 +254,8 @@ int cmd_predict(int argc, char **argv) {
         fclose(f); unet_gn_freeze(u, h); free(h);
     }
     if (!sheet_task) unet_set_head_channels(u, out_ch, 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
+    /* the network takes the uint8 CT window itself (with in-place slabs the stem builds its input per slab: no 16-bit window) */
+    if (!sheet_task && !ufsm_env_on("UFSM_PRED_HOSTPATH")) unet_set_ct_input(u, 1);
     if (cfg.scale_cond) {   /* voxel-size conditioning: the CT level's voxel size, or --scale-um to override */
         const double sum_ = atof(opt(argc, argv, "--scale-um", "0"));
         unet_set_scale(u, sum_ > 0 ? sum_ : um * (1 << level));
@@ -313,15 +315,17 @@ int cmd_predict(int argc, char **argv) {
     shape5 xs = {1, 4, W, W, W};
     /* the 16-bit input in the network's shared a1 scratch when it has one (free until the stem conv, after the input conversion) */
     unet_build(u, xs, 0);
+    const int ct_stem = unet_ct_stem(u);   /* unet_forward_ct: no 16-bit input */
     /* the uint8 CT window in the network's level-0 skip buffer (free until the forward's input conversion); the output mask then
        goes through a bit plane (the buffer does not survive the forward) */
     uint8_t *ctd = gpath && !sheet_task ? unet_input_scratch2(u, w3) : nullptr;
     const int ct_shared = ctd != nullptr;
     if (!ctd) ctd = nn_malloc(w3);
     uint32_t *ctm = ct_shared ? nn_malloc((w3 + 31) / 32 * 4) : nullptr;
-    void *xd = h16 && !sheet_task ? unet_input_scratch(u, 4 * w3 * 2) : nullptr;
+    void *xd = ct_stem ? nullptr : h16 && !sheet_task ? unet_input_scratch(u, 4 * w3 * 2) : nullptr;
     const int xd_shared = xd != nullptr;
-    if (!xd) xd = nn_malloc(4 * w3 * (h16 ? 2 : 4));
+    if (!xd && !ct_stem) xd = nn_malloc(4 * w3 * (h16 ? 2 : 4));
+    if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
     int64_t ns[3];
     for (int d = 0; d < 3; d++) ns[d] = (bn[d] + shard - 1) / shard;
     double t0 = now(); long ntiles = 0, nskip = 0;
@@ -404,13 +408,14 @@ int cmd_predict(int argc, char **argv) {
             nn_h2d(dyd, dyo, 2 * (size_t)W * sizeof(float));
             if (pprof) { nn_sync(); p_h2d += now() - pt; pt = now(); }
             if ((xd_shared && unet_input_scratch(u, 4 * w3 * 2) != xd) || (ct_shared && unet_input_scratch2(u, w3) != ctd)) { fprintf(stderr, "predict: the network was rebuilt under its input scratch\n"); return 1; }
-            nn_pred_input(ctd, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xd, h16);
+            if (!ct_stem) nn_pred_input(ctd, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xd, h16);
             if (ct_shared) nn_pred_ctmask(ctd, w3, ctm);   /* the forward overwrites ctd */
             if (sheet_task) {
                 for (int z=0;z<W;z++) { double a[4]; sheet_parameters(sheet,o[0]+z,a); sheet_rows[4*z]=(float)(o[1]-a[0]); sheet_rows[4*z+1]=(float)(o[2]-a[1]); sheet_rows[4*z+2]=(float)(1/a[2]); sheet_rows[4*z+3]=(float)a[3]; }
                 nn_sheet_input(xd,W,sheet_rows,(float)sheet->center,(float)sheet->scale,h16);
             }
-            const float *lg = unet_forward_x(u, xd, xs, 0, h16);
+            const float *lg = ct_stem ? unet_forward_ct(u, ctd, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xs, h16)
+                                      : unet_forward_x(u, xd, xs, 0, h16);
             if (gn_save) unet_gn_accumulate(u);
             if (sheet_task) lg += (size_t)out_ch * w3;   /* channel c of the [c][W^3] logits (B = 1); otherwise the only one */
             if (sheet_task) {
