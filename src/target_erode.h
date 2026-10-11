@@ -10,10 +10,11 @@ static inline void target_erode1(const uint8_t *haloed, uint8_t *out, int P) {
     for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
         const uint8_t *row = haloed + (size_t)(z + 1) * Q2 + (size_t)(y + 1) * Q + 1;
         uint8_t *dst = out + ((size_t)z * P + y) * P;
-        for (int x = 0; x < P; x++) {
+        for (int x = 0; x < P; x++) {   /* branch-free (vectorises) */
             const uint8_t *v = row + x;
-            dst[x] = v[0] && v[0] < 255 && v[-1] && v[1] && v[-(ptrdiff_t)Q] && v[Q] &&
-                v[-(ptrdiff_t)Q2] && v[Q2] ? v[0] : 0;
+            const int keep = (v[0] != 0) & (v[0] != 255) & (v[-1] != 0) & (v[1] != 0) & (v[-(ptrdiff_t)Q] != 0) & (v[Q] != 0) &
+                (v[-(ptrdiff_t)Q2] != 0) & (v[Q2] != 0);
+            dst[x] = keep ? v[0] : 0;
         }
     }
 }

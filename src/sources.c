@@ -307,21 +307,30 @@ int z3_read_label_grid(z3 *z, int binary, int shift, const int64_t o[3], const i
         cn[d] = mask_nearest(o[d] + n[d] - 1, shift, m->shape[d]) - co[d] + 1;
     }
     uint8_t *low = malloc((size_t)cn[0] * cn[1] * cn[2]);
-    if (!low) return -1;
-    if (z3_read(z, co, cn, low, nthreads)) { free(low); return -1; }
-    for (int64_t zc = 0; zc < n[0]; zc++) for (int64_t y = 0; y < n[1]; y++) {
-        int64_t gz = o[0] + zc, gy = o[1] + y;
-        int64_t iz = mask_nearest(gz, shift, m->shape[0]) - co[0];
-        int64_t iy = mask_nearest(gy, shift, m->shape[1]) - co[1];
-        const uint8_t *row = low + ((size_t)iz * cn[1] + iy) * cn[2];
-        uint8_t *dst = out + ((size_t)zc * n[1] + y) * n[2];
-        for (int64_t x = 0; x < n[2]; x++) {
-            int64_t gx = o[2] + x, ix = mask_nearest(gx, shift, m->shape[2]) - co[2];
-            int inside = gz >= 0 && gy >= 0 && gx >= 0 && gz < m->shape[0] * f && gy < m->shape[1] * f && gx < m->shape[2] * f;
-            dst[x] = inside && row[ix] ? 254 : 0;
+    int32_t *ixm = malloc((size_t)n[2] * sizeof *ixm);   /* per output x: low-row index, -1 outside the volume */
+    if (!low || !ixm) { free(low); free(ixm); return -1; }
+    if (z3_read(z, co, cn, low, nthreads)) { free(low); free(ixm); return -1; }
+    for (int64_t x = 0; x < n[2]; x++) { int64_t gx = o[2] + x; ixm[x] = gx >= 0 && gx < m->shape[2] * f ? (int32_t)(mask_nearest(gx, shift, m->shape[2]) - co[2]) : -1; }
+    /* consecutive output rows (planes) that read the same low row (plane) are copies: 2^shift of each */
+    const size_t rowb = (size_t)n[1] * n[2];
+    int64_t pz = -2;
+    for (int64_t zc = 0; zc < n[0]; zc++) {
+        int64_t gz = o[0] + zc, iz = gz >= 0 && gz < m->shape[0] * f ? mask_nearest(gz, shift, m->shape[0]) - co[0] : -1;
+        uint8_t *plane = out + (size_t)zc * rowb;
+        if (zc && iz == pz) { memcpy(plane, plane - rowb, rowb); continue; }
+        pz = iz;
+        int64_t py = -2;
+        for (int64_t y = 0; y < n[1]; y++) {
+            int64_t gy = o[1] + y, iy = gy >= 0 && gy < m->shape[1] * f ? mask_nearest(gy, shift, m->shape[1]) - co[1] : -1;
+            uint8_t *dst = plane + (size_t)y * n[2];
+            if (y && iy == py) { memcpy(dst, dst - n[2], (size_t)n[2]); continue; }
+            py = iy;
+            if (iz < 0 || iy < 0) { memset(dst, 0, (size_t)n[2]); continue; }
+            const uint8_t *row = low + ((size_t)iz * cn[1] + iy) * cn[2];
+            for (int64_t x = 0; x < n[2]; x++) dst[x] = ixm[x] >= 0 && row[ixm[x]] ? 254 : 0;
         }
     }
-    free(low); return 0;
+    free(low); free(ixm); return 0;
 }
 
 int source_read_target(source *s, int ch, int level, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {

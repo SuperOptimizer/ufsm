@@ -36,6 +36,7 @@ struct z3 {
     z3_meta m;
     int nc;        /* inner chunks per shard */
     int cgrid[3];  /* inner chunk grid within a shard */
+    uint64_t id;   /* process-unique: keys the decoded-mask cache */
 };
 
 /* ---------- metadata ---------- */
@@ -91,6 +92,7 @@ z3 *z3_open(store *s, const char *key, const char *cache_dir) {
     z3 *z = calloc(1, sizeof *z);
     z->s = s;
     z->key = strdup(key);
+    { static atomic_uint_fast64_t next_id = 1; z->id = atomic_fetch_add(&next_id, 1); }
     z->cache = cache_dir && !store_is_local(s) ? strdup(cache_dir) : nullptr;
     z3_meta *m = &z->m;
     m->sep = '/';
@@ -345,9 +347,10 @@ static void copy_chunk(const job *jb, const work *w, const uint8_t *chunk) {
         }
 }
 
-static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch) {
+static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch, int *mask) {
     const z3_meta *m = &z->m;
     size_t cv = (size_t)m->chunk[0] * m->chunk[1] * m->chunk[2];
+    if (mask) *mask = 0;
     if (m->zstd) {
         size_t r = ZSTD_decompressDCtx(dctx, scratch, VOLCOMP_ENCODE_BOUND > cv ? VOLCOMP_ENCODE_BOUND : cv, enc, n);
         if (ZSTD_isError(r)) return FAIL("zstd: %s", ZSTD_getErrorName(r));
@@ -355,6 +358,8 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
         n = r;
     }
     if (m->q >= 0) {
+        uint32_t mode;
+        if (mask && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK) *mask = mode == VLL_MODE_MASK || mode == VLL_MODE_MASK_LL;
         volcomp_status st = volcomp_decode(enc, n, dec, cv);
         if (st != VOLCOMP_OK) return FAIL("volcomp: %s", volcomp_status_string(st));
         return 0;
@@ -458,6 +463,85 @@ static int prefetch_indices(z3 *z, const int64_t *s0, const int64_t *s1, int nth
     return atomic_load(&j.failed) ? FAIL("parallel shard index: %s", j.error) : 0;
 }
 
+/* ---------- decoded mask chunks ----------
+   The volcomp mask codec is a serial arithmetic coder (~10 ms per 128^3 chunk, the sampler's largest decode for binary
+   labels). Decoded mask chunks with two values are kept in memory as bits, process-wide, the least recently used dropped
+   past UFSM_Z3_MASK_CACHE_MB (default 1024; 0 = off). Keys: the z3's id, shard and inner chunk. */
+typedef struct mc_entry { uint64_t z, tick; int64_t s[3]; int ci, refs, dead; uint8_t v0, v1; uint8_t *bits; size_t nbytes; struct mc_entry *next; } mc_entry;
+#define MC_NB 8192
+static pthread_mutex_t g_mc_mu = PTHREAD_MUTEX_INITIALIZER;
+static mc_entry *g_mc_b[MC_NB];
+static size_t g_mc_bytes, g_mc_n; static uint64_t g_mc_tick; static long long g_mc_budget = -1;
+static long long mc_budget(void) {
+    if (g_mc_budget < 0) { const char *e = getenv("UFSM_Z3_MASK_CACHE_MB"); g_mc_budget = (e && *e ? atoll(e) : 1024) << 20; }
+    return g_mc_budget;
+}
+static size_t mc_hash(uint64_t z, const work *w) {
+    uint64_t h = z * 0x9e3779b97f4a7c15ull ^ (uint64_t)w->sz * 0xc2b2ae3d27d4eb4full ^ (uint64_t)w->sy * 0x165667b19e3779f9ull ^
+                 (uint64_t)w->sx * 0x27d4eb2f165667c5ull ^ (uint64_t)(w->ci + 1) * 0x94d049bb133111ebull;
+    h ^= h >> 31; return (size_t)(h & (MC_NB - 1));
+}
+/* copy the window part of a cached chunk (copy_chunk on the expanded bits) */
+static int mc_copy(const job *jb, const work *w) {
+    const z3 *z = jb->z; const z3_meta *m = &z->m;
+    pthread_mutex_lock(&g_mc_mu);
+    mc_entry *e = g_mc_b[mc_hash(z->id, w)];
+    while (e && !(e->z == z->id && e->s[0] == w->sz && e->s[1] == w->sy && e->s[2] == w->sx && e->ci == w->ci)) e = e->next;
+    if (!e) { pthread_mutex_unlock(&g_mc_mu); return 0; }
+    e->tick = ++g_mc_tick; e->refs++;   /* copied outside the lock; an evicted entry in use is freed by its last reader */
+    pthread_mutex_unlock(&g_mc_mu);
+    int64_t c0[3] = {w->sz * m->shard[0] + (int64_t)w->cz * m->chunk[0], w->sy * m->shard[1] + (int64_t)w->cy * m->chunk[1],
+                     w->sx * m->shard[2] + (int64_t)w->cx * m->chunk[2]}, lo[3], hi[3];
+    int empty = 0;
+    for (int i = 0; i < 3; i++) {
+        lo[i] = jb->o[i] > c0[i] ? jb->o[i] : c0[i];
+        int64_t ce = c0[i] + m->chunk[i], oe = jb->o[i] + jb->n[i];
+        if (ce > m->shape[i]) ce = m->shape[i];
+        hi[i] = ce < oe ? ce : oe;
+        if (hi[i] <= lo[i]) empty = 1;
+    }
+    const uint8_t v0 = e->v0, v1 = e->v1, *bits = e->bits;
+    for (int64_t zz = lo[0]; !empty && zz < hi[0]; zz++)
+        for (int64_t yy = lo[1]; yy < hi[1]; yy++) {
+            size_t b = (size_t)(((zz - c0[0]) * m->chunk[1] + (yy - c0[1])) * m->chunk[2] + (lo[2] - c0[2]));
+            uint8_t *dst = jb->out + ((zz - jb->o[0]) * jb->n[1] + (yy - jb->o[1])) * jb->n[2] + (lo[2] - jb->o[2]);
+            for (int64_t x = 0; x < hi[2] - lo[2]; x++, b++) dst[x] = bits[b >> 3] >> (b & 7) & 1 ? v1 : v0;
+        }
+    pthread_mutex_lock(&g_mc_mu);
+    if (!--e->refs && e->dead) { free(e->bits); free(e); }
+    pthread_mutex_unlock(&g_mc_mu);
+    return 1;
+}
+static void mc_put(const z3 *z, const work *w, const uint8_t *dec, size_t cv) {
+    const long long budget = mc_budget();
+    const size_t nb = (cv + 7) / 8;
+    if (budget <= 0 || (long long)nb > budget) return;
+    uint8_t v0 = dec[0], v1 = dec[0]; size_t k = 0;
+    for (; k < cv && dec[k] == v0; k++) {}
+    if (k < cv) v1 = dec[k];
+    uint8_t *bits = calloc(nb, 1);
+    if (!bits) return;
+    for (k = 0; k < cv; k++) {
+        if (dec[k] == v1 && v1 != v0) bits[k >> 3] |= (uint8_t)(1u << (k & 7));
+        else if (dec[k] != v0) { free(bits); return; }   /* three values: not a mask */
+    }
+    mc_entry *ne = malloc(sizeof *ne);
+    if (!ne) { free(bits); return; }
+    *ne = (mc_entry){z->id, 0, {w->sz, w->sy, w->sx}, w->ci, 0, 0, v0, v1, bits, nb, nullptr};
+    pthread_mutex_lock(&g_mc_mu);
+    const size_t h = mc_hash(z->id, w);
+    for (mc_entry *e = g_mc_b[h]; e; e = e->next)
+        if (e->z == z->id && e->s[0] == w->sz && e->s[1] == w->sy && e->s[2] == w->sx && e->ci == w->ci) { pthread_mutex_unlock(&g_mc_mu); free(bits); free(ne); return; }
+    while (g_mc_n && (long long)(g_mc_bytes + nb) > budget) {   /* drop the least recently used */
+        mc_entry **victim = nullptr;
+        for (size_t i = 0; i < MC_NB; i++) for (mc_entry **pe = &g_mc_b[i]; *pe; pe = &(*pe)->next) if (!victim || (*pe)->tick < (*victim)->tick) victim = pe;
+        mc_entry *v = *victim; *victim = v->next; g_mc_bytes -= v->nbytes; g_mc_n--;
+        if (v->refs) v->dead = 1; else { free(v->bits); free(v); }
+    }
+    ne->tick = ++g_mc_tick; ne->next = g_mc_b[h]; g_mc_b[h] = ne; g_mc_bytes += nb; g_mc_n++;
+    pthread_mutex_unlock(&g_mc_mu);
+}
+
 static void *worker(void *arg) {
     job *jb = arg;
     z3 *z = jb->z;
@@ -465,6 +549,7 @@ static void *worker(void *arg) {
     uint8_t *dec = malloc(cv);
     uint8_t *scratch = malloc(VOLCOMP_ENCODE_BOUND > cv ? VOLCOMP_ENCODE_BOUND : cv);
     ZSTD_DCtx *dctx = ZSTD_createDCtx();
+    const int mc_on = mc_budget() > 0;
     if (!dec || !scratch || !dctx) { FAIL("chunk decode allocation"); job_failed(jb); }
     for (;;) {
         int task = atomic_fetch_add(&jb->next, 1);
@@ -482,13 +567,16 @@ static void *worker(void *arg) {
                 work *w = &jb->items[i + j]; char item[16]; snprintf(item, sizeof item, "%d", w->ci);
                 const uint8_t *enc = group + (size_t)(w->off - rg->off); size_t n = (size_t)w->len;
                 cache_put(z, skey, item, enc, n); atomic_fetch_add(&g_z3_store_reads, 1);
-                if (decode_into(z, enc, n, dec, dctx, scratch)) { job_failed(jb); break; }
+                int msk;
+                if (decode_into(z, enc, n, dec, dctx, scratch, &msk)) { job_failed(jb); break; }
+                if (msk) mc_put(z, w, dec, cv);
                 copy_chunk(jb, w, dec);
             }
             free(group); continue;
         }
         work *w = &jb->items[i];
         if (!w->present) continue;
+        if (mc_on && mc_copy(jb, w)) continue;
         char skey[1200], item[16];
         shard_key(z, w->sz, w->sy, w->sx, skey, sizeof skey);
         snprintf(item, sizeof item, "%d", w->ci < 0 ? 0 : w->ci);
@@ -514,9 +602,10 @@ static void *worker(void *arg) {
             }
             cache_put(z, skey, item, b, n);
         }
-        int rc = decode_into(z, b, n, dec, dctx, scratch);
+        int msk, rc = decode_into(z, b, n, dec, dctx, scratch, &msk);
         free(b);
         if (rc) { job_failed(jb); break; }
+        if (msk && mc_on) mc_put(z, w, dec, cv);
         copy_chunk(jb, w, dec);
     }
     ZSTD_freeDCtx(dctx);

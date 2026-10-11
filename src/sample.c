@@ -13,6 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef __F16C__
+#include <immintrin.h>
+#endif
 
 /* ---- rng (xoshiro256**) ---- */
 typedef struct { uint64_t s[4]; } rng;
@@ -284,6 +287,52 @@ static int chamfer345(const uint8_t *t, uint16_t *dm, int P) {
     chamfer_pass(dm, P, -1);
     return 1;
 }
+/* The same 3-4-5 chamfer distance saturated at 255 in bytes (dm8 = min(distance, 255): every path to a distance below 255
+   only passes values below it, so the saturating adds and mins are exact there). The in-row scans run as log-step
+   min-plus scans (offsets 1..64; 3 * 85 >= 255 saturates) in vectorisable loops. Callers use it when every threshold
+   they compare with is below 255. */
+static inline uint8_t sadd8(uint8_t a, uint8_t b) { const uint8_t v = (uint8_t)(a + b); return v < a ? 255 : v; }   /* vpaddusb */
+static inline uint8_t mn8(uint8_t a, uint8_t b) { return a < b ? a : b; }
+static void chamfer_pass8(uint8_t *dm, int P, int dir, uint8_t *tmp) {
+    const size_t P2 = (size_t)P * P;
+    for (int zi = 0; zi < P; zi++) {
+        const int z = dir > 0 ? zi : P - 1 - zi, zp = z - dir;
+        for (int yi = 0; yi < P; yi++) {
+            const int y = dir > 0 ? yi : P - 1 - yi, yp = y - dir;
+            uint8_t *row = dm + (size_t)z * P2 + (size_t)y * P;
+            const uint8_t *nb[4] = {nullptr, nullptr, nullptr, nullptr}; const uint8_t wf[4] = {3, 3, 4, 4}, we[4] = {4, 4, 5, 5};
+            if (yp >= 0 && yp < P) nb[0] = dm + (size_t)z * P2 + (size_t)yp * P;
+            if (zp >= 0 && zp < P) {
+                nb[1] = dm + (size_t)zp * P2 + (size_t)y * P;
+                if (y > 0) nb[2] = nb[1] - P;
+                if (y + 1 < P) nb[3] = nb[1] + P;
+            }
+            for (int q = 0; q < 4; q++) {
+                const uint8_t *r = nb[q]; if (!r) continue;
+                const uint8_t f = wf[q], e = we[q];
+                row[0] = mn8(row[0], sadd8(r[0], f)); if (P > 1) row[0] = mn8(row[0], sadd8(r[1], e));
+                for (int x = 1; x < P - 1; x++) row[x] = mn8(mn8(row[x], sadd8(r[x], f)), mn8(sadd8(r[x - 1], e), sadd8(r[x + 1], e)));
+                if (P > 1) { row[P - 1] = mn8(row[P - 1], sadd8(r[P - 1], f)); row[P - 1] = mn8(row[P - 1], sadd8(r[P - 2], e)); }
+            }
+            for (int st = 1; st < P && st <= 64; st <<= 1) {   /* row[x] = min over j of row[j] + 3 |x - j|, j before x in the pass direction */
+                const uint8_t a = (uint8_t)(3 * st);
+                memcpy(tmp, row, (size_t)P);
+                if (dir > 0) for (int x = st; x < P; x++) row[x] = mn8(row[x], sadd8(tmp[x - st], a));
+                else for (int x = 0; x < P - st; x++) row[x] = mn8(row[x], sadd8(tmp[x + st], a));
+            }
+        }
+    }
+}
+static int chamfer345_8(const uint8_t *t, uint8_t *dm, int P) {
+    size_t p3 = (size_t)P * P * P; unsigned any = 0;
+    for (size_t k = 0; k < p3; k++) { const unsigned sv = (t[k] != 255) & (t[k] > 0); dm[k] = sv ? 0 : 255; any |= sv; }
+    if (!any) return 0;
+    uint8_t *tmp = malloc((size_t)P); if (!tmp) abort();
+    chamfer_pass8(dm, P, 1, tmp);
+    chamfer_pass8(dm, P, -1, tmp);
+    free(tmp);
+    return 1;
+}
 /* per-voxel Gaussian noise: 65536 N(0,1) quantiles (Acklam's inverse normal CDF), indexed by 16 random bits */
 static float g_ntab[65536];
 static pthread_once_t g_ntab_once = PTHREAD_ONCE_INIT;
@@ -348,9 +397,62 @@ static void write_x_aug(const uint8_t *ctu, int P, const int64_t o[3], float fme
             }
         }
 }
+/* fp16 (round to nearest even, as the (_Float16) cast) of n floats: F16C 8 at a time, which the cast loop does not vectorise to */
+static void f16_row(const float *v, uint16_t *h, int n) {
+    int x = 0;
+#ifdef __F16C__
+    for (; x + 8 <= n; x += 8) _mm_storeu_si128((__m128i *)(h + x), _mm256_cvtps_ph(_mm256_loadu_ps(v + x), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+#endif
+    for (; x < n; x++) { _Float16 t = (_Float16)v[x]; memcpy(h + x, &t, 2); }
+}
+/* write_x_aug without an appearance plan or sheet prior, one output row at a time in vectorisable loops (no math errno, so
+   sqrtf vectorises); bit-identical to it: the same expressions, rng draws and signed zeros. */
+[[gnu::optimize("no-math-errno")]]
 static void write_x(const uint8_t *ctu, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
                     sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H) {
-    write_x_aug(ctu, P, o, fmean, fisd, hasax, cyz, cxz, y, jitter, ia, ib, isg, r, nrow, xfmt, X, H, nullptr, nullptr, nullptr,nullptr,nullptr);
+    pthread_once(&g_ntab_once, ntab_init);
+    const size_t p3 = (size_t)P * P * P;
+    const float sgn[3] = {y.flip[0] ? -1.f : 1.f, y.flip[1] ? -1.f : 1.f, y.flip[2] ? -1.f : 1.f};
+    float *a = malloc(9 * (size_t)P * sizeof *a);   /* rows: v0..v3, dy, dx, radial y, radial x, zero */
+    if (!a) abort();
+    float *v[4] = {a, a + P, a + 2 * P, a + 3 * P}, *dy = a + 4 * P, *dx = a + 5 * P, *comp[3] = {a + 8 * P, a + 6 * P, a + 7 * P};
+    memset(comp[0], 0, (size_t)P * sizeof *a);
+    if (!hasax) { memset(comp[1], 0, (size_t)P * sizeof *a); memset(comp[2], 0, (size_t)P * sizeof *a); }
+    const int o1 = (int)o[1], o2 = (int)o[2];
+    for (int z = 0; z < P; z++)
+        for (int yy = 0; yy < P; yy++) {
+            const int io[3] = {z, yy, 0};
+            int s0[3], ds[3] = {0, 0, 0};
+            for (int d = 0; d < 3; d++) s0[y.perm[d]] = y.flip[d] ? P - 1 - io[d] : io[d];
+            ds[y.perm[2]] = y.flip[2] ? -1 : 1;
+            if (jitter) {
+                for (int x = 0; x + 4 <= P; x += 4) { uint64_t u = rnext(r); nrow[x] = g_ntab[u & 0xffff]; nrow[x + 1] = g_ntab[(u >> 16) & 0xffff]; nrow[x + 2] = g_ntab[(u >> 32) & 0xffff]; nrow[x + 3] = g_ntab[u >> 48]; }
+                for (int x = P & ~3; x < P; x++) nrow[x] = g_ntab[rnext(r) & 0xffff];
+            }
+            const ptrdiff_t q0 = ((ptrdiff_t)s0[0] * P + s0[1]) * P + s0[2], qs = ((ptrdiff_t)ds[0] * P + ds[1]) * P + ds[2];
+            const uint8_t *src = ctu + q0;
+            float *v0 = v[0];
+            if (qs == 1) for (int x = 0; x < P; x++) v0[x] = ((float)src[x] - fmean) * fisd;
+            else for (int x = 0; x < P; x++) v0[x] = ((float)src[qs * x] - fmean) * fisd;
+            if (jitter) for (int x = 0; x < P; x++) v0[x] = ia * v0[x] + ib + isg * nrow[x];
+            if (hasax) {
+                float *ry = comp[1], *rx = comp[2];
+                if (!ds[0]) {   /* the source z is fixed along the row */
+                    const float cy = cyz[s0[0]], cx = cxz[s0[0]];
+                    for (int x = 0; x < P; x++) { dy[x] = (float)(o1 + s0[1] + ds[1] * x) - cy; dx[x] = (float)(o2 + s0[2] + ds[2] * x) - cx; }
+                } else for (int x = 0; x < P; x++) { const int sz_ = s0[0] + ds[0] * x; dy[x] = (float)(o1 + s0[1]) - cyz[sz_]; dx[x] = (float)(o2 + s0[2]) - cxz[sz_]; }
+                for (int x = 0; x < P; x++) { const float inv = 1.f / (sqrtf(dy[x] * dy[x] + dx[x] * dx[x]) + 1e-6f); ry[x] = dy[x] * inv; rx[x] = dx[x] * inv; }
+            }
+            for (int d = 0; d < 3; d++) { const float g = sgn[d], *cp = comp[y.perm[d]]; float *vd = v[1 + d]; for (int x = 0; x < P; x++) vd[x] = g * cp[x]; }
+            const size_t ko = ((size_t)z * P + yy) * P;
+            for (int ch = 0; ch < 4; ch++) {
+                const float *vc = v[ch];
+                if (xfmt == 1) f16_row(vc, H + (size_t)ch * p3 + ko, P);
+                else if (xfmt == 2) { uint16_t *hd = H + (size_t)ch * p3 + ko; for (int x = 0; x < P; x++) hd[x] = bf16_rn(vc[x]); }
+                else memcpy(X + (size_t)ch * p3 + ko, vc, (size_t)P * sizeof *vc);
+            }
+        }
+    free(a);
 }
 /* Continuous geometry uses source coordinates for CT, labels, q0 and the axis.
    Only valid source voxels are supervised: rotated cube corners are ignored.
@@ -494,6 +596,18 @@ static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8
     return rc ? -1 : 0;
 }
 
+/* nonzero count, sum and sum of squares of a uint8 array: integer partial sums per 4096 values (vectorise), exact as the
+   double accumulation of the integers they replace */
+static void u8_stats(const uint8_t *a, size_t n, size_t *nz, double *sum, double *sq) {
+    uint64_t z = 0, s1 = 0, s2 = 0;
+    for (size_t i = 0; i < n; i += 4096) {
+        const size_t e = n - i < 4096 ? n - i : 4096;
+        uint32_t cz = 0, c1 = 0, c2 = 0;
+        for (size_t k = 0; k < e; k++) { const uint32_t v = a[i + k]; cz += v != 0; c1 += v; c2 += v * v; }
+        z += cz; s1 += c1; s2 += c2;
+    }
+    *nz = (size_t)z; *sum = (double)s1; *sq = (double)s2;
+}
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
@@ -568,7 +682,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     PROF_MARK(PS_READ);
     size_t nz = 0;
     double sum = 0, sq = 0;
-    for (size_t k = 0; k < p3; k++) { nz += ctu[k] != 0; sum += ctu[k]; sq += (double)ctu[k] * ctu[k]; }
+    u8_stats(ctu, p3, &nz, &sum, &sq);
     if (!c->cover && (double)nz / (double)p3 < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); return 1; }
     PROF_MARK(PS_STATS);
     /* targets */
@@ -599,7 +713,11 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             } else if (source_read_target(s, ch, l, o, n, dst, 1)) return -1;
             w[ch] = 1;
         } else memset(dst, 0, p3);
-        if (w[ch]) for (size_t k = 0; k < p3; k++) if (dst[k] != 255 && dst[k] > tmax) tmax = dst[k];
+        if (w[ch] && !c->cover) {   /* largest known target value (only the empty-patch rejection reads it) */
+            uint8_t mx = 0;
+            for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k] == 255 ? 0 : dst[k]; mx = v > mx ? v : mx; }
+            if (mx > tmax) tmax = mx;
+        }
     }
     if (!c->cover && tmax == 0 && runif(r) > c->empty_keep) { atomic_fetch_add(&sp->rejected, 1); return 1; }
     PROF_MARK(PS_TARGETS);
@@ -628,33 +746,44 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     float morph=0;
     if (c->augment && c->label_morph>0 && runif(r)<c->label_morph_p) morph=(float)((2*runif(r)-1)*c->label_morph);
     uint16_t *dm = (uint16_t *)(big + 2 * p3);   /* chamfer distance to the annotated surface, per channel (3 per voxel); big has room */
+    uint8_t *dm8 = big + 2 * p3;                  /* the same saturated at 255, when every threshold below is under 255 */
     int dm_ch = -1, dm_any = 0;                   /* channel the map currently holds, and whether that channel had any surface */
-#define CHAMFER_FOR(ch_) do { if (dm_ch != (ch_)) { dm_ch = (ch_); dm_any = chamfer345(ttmp + (size_t)(ch_) * p3, dm, P); } } while (0)
-    if (soft0 > 0 && region_ch < 0) {
-        float sigma = (c->soft_um ? soft0 / (float)s->um : soft0) / (float)(1 << l); if (sigma < 0.75f) sigma = 0.75f;
-        float shift=morph/(float)(1<<l);
+    const int soft_on = soft0 > 0 && region_ch < 0;
+    float sigma = 0, shift = 0; int dcut = 0;
+    if (soft_on) {
+        sigma = (c->soft_um ? soft0 / (float)s->um : soft0) / (float)(1 << l); if (sigma < 0.75f) sigma = 0.75f;
+        shift=morph/(float)(1<<l);
         /* exp(-(d/3)^2 / (2 sigma^2)) tabulated over the chamfer distance (3 per voxel); beyond dcut it rounds to 0 */
-        int dcut = (int)(3.f * (sigma * 4.5f+fmaxf(0,shift))) + 1; if (dcut > 4000) dcut = 4000;
+        dcut = (int)(3.f * (sigma * 4.5f+fmaxf(0,shift))) + 1; if (dcut > 4000) dcut = 4000;
+    }
+    const int trust_r = s->trust_band > 0 ? (s->trust_band >> l < 1 ? 1 : s->trust_band >> l) : 0;
+    const int use8 = (!soft_on || dcut <= 254) && 3 * trust_r <= 254;
+#define CHAMFER_FOR(ch_) do { if (dm_ch != (ch_)) { dm_ch = (ch_); dm_any = use8 ? chamfer345_8(ttmp + (size_t)(ch_) * p3, dm8, P) : chamfer345(ttmp + (size_t)(ch_) * p3, dm, P); } } while (0)
+    if (soft_on) {
         uint8_t *etab = big + 4 * p3;
         for (int d = 0; d <= dcut; d++) { float df = fmaxf(0,d / 3.f-shift); int t = (int)(254.f * expf(-0.5f * df * df / (sigma * sigma)) + 0.5f); etab[d] = (uint8_t)(t > 254 ? 254 : t); }
+        if (use8) for (int d = dcut + 1; d < 256; d++) etab[d] = 0;   /* indexed by the saturated distance */
         for (int ch = 0; ch < NCH; ch++) {
             if (!w[ch] || s->tgt_prob[ch]) continue;
             uint8_t *dst = ttmp + (size_t)ch * p3;
             CHAMFER_FOR(ch);
             if (!dm_any) continue;   /* no surface in the patch: nothing to soften */
-            for (size_t k = 0; k < p3; k++) if (dst[k] == 0 && dm[k] <= dcut) { uint8_t t = etab[dm[k]]; if (t) dst[k] = t; }
+            if (use8) for (size_t k = 0; k < p3; k++) dst[k] = dst[k] == 0 ? etab[dm8[k]] : dst[k];
+            else for (size_t k = 0; k < p3; k++) if (dst[k] == 0 && dm[k] <= dcut) { uint8_t t = etab[dm[k]]; if (t) dst[k] = t; }
         }
     }
     PROF_MARK(PS_SOFT);
     /* partial annotations: trust background only within R voxels of an annotated surface, ignore the rest */
-    if (s->trust_band > 0) {
-        int R = s->trust_band >> l; if (R < 1) R = 1;
+    if (trust_r > 0) {
+        const int R = trust_r;
         for (int ch = 0; ch < NCH; ch++) {
             if (!w[ch] || s->tgt_prob[ch]) continue;
             uint8_t *dst = ttmp + (size_t)ch * p3;
             CHAMFER_FOR(ch);   /* measured from the hard surface (the soft values added above are not surface) */
             if (!dm_any) { for (size_t k = 0; k < p3; k++) if (dst[k] == 0) dst[k] = 255; continue; }   /* nothing annotated: ignore all background */
-            for (size_t k = 0; k < p3; k++) if (dst[k] == 0 && dm[k] > 3 * R) dst[k] = 255;
+            const int tr = 3 * R;
+            if (use8) for (size_t k = 0; k < p3; k++) dst[k] = dst[k] == 0 && dm8[k] > tr ? 255 : dst[k];
+            else for (size_t k = 0; k < p3; k++) dst[k] = dst[k] == 0 && dm[k] > tr ? 255 : dst[k];
         }
     }
     /* label encoding -> target probability * 255 and the ignore mask (255 = ignore) */
@@ -664,7 +793,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     for (int ch = 0; ch < NCH; ch++) {
         if (!w[ch]) continue;
         uint8_t *dst = ttmp + (size_t)ch * p3;
-        for (size_t k = 0; k < p3; k++) { uint8_t v = dst[k]; if (v == 255) { ign[k] = 1; dst[k] = 0; } else dst[k] = (uint8_t)((v * 255 + 127) / 254); }
+        for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k]; ign[k] |= v == 255; dst[k] = v == 255 ? 0 : (uint8_t)(v + (v >= 127)); }   /* (v * 255 + 127) / 254 for v < 255 */
     }
     PROF_MARK(PS_ENCODE);
     if (c->sheet) sheet_mask_contacts(c->sheet,o,P,ign);
@@ -684,7 +813,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         PROF_MARK(PS_SCAN);
     }
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
-    for (size_t k = 0; k < p3; k++) mask[k] = ctu[k] != 0 && !mask[k];
+    for (size_t k = 0; k < p3; k++) mask[k] = (ctu[k] != 0) & (mask[k] == 0);
     PROF_MARK(PS_ZSCORE);
     uint8_t *T = b->t + (size_t)i * NCH * p3, *M = b->m + (size_t)i * p3;
     sym y = sym_of(0);

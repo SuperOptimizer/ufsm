@@ -191,13 +191,33 @@ ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or
   At 2x nothing is lost (mean dF1 -0.002 / +0.005 pool, 0.000 / +0.004 pack; ridge F1 tol 1 at or above the control; the
   ridge width and double-peak rate (0.037-0.039 / 0.021-0.022) equal: the sub-voxel head shows no block pattern), at ~2.2x
   the training speed. At 4x the mean F1 drops 0.003-0.006 on both boxes (pool4 -0.006 / -0.004, pack4 -0.004 / -0.003),
-  at ~4.8x; the 4x runs are sampler-bound on the laptop (40% wait, ~21 samples/s). pack's sub-voxel CT detail is
-  not measurably better than pool at 2x or 4x. The ridge width is set by the labels (jittered traces, soft 7 um targets), not
-  by the network's grid. GPU ms per training step (UFSM_PROF, idle laptop GPU, 100 steps without a cover) control / pool /
-  pack / pool4 / pack4: P256 211 / 99 / 99 / 39 / 38, P384 673 / 297 / 305 / 96 / 98 (2.1-2.3x and 5.4-7x); wall samples/s
-  P256 4.7 / 9.9 / 9.9 / 24 / 23, P384 1.42 / 3.3 / 3.2 / 7-9 / 7.5-8.5: the 4x nets outrun the sampler (~400 M voxels/s).
+  at ~4.8x; the 4x runs were sampler-bound on the laptop (40% wait, ~21 samples/s; now fed, see Sampler CPU). pack's
+  sub-voxel CT detail is not measurably better than pool at 2x or 4x. The ridge width is set by the labels (jittered traces,
+  soft 7 um targets), not by the network's grid. GPU ms per training step (UFSM_PROF, idle laptop GPU, 100 steps without a
+  cover) control / pool / pack / pool4 / pack4: P256 211 / 99 / 99 / 39 / 38, P384 673 / 297 / 305 / 96 / 98 (2.1-2.3x and
+  5.4-7x); wall samples/s P256 4.7 / 9.9 / 9.9 / 24 / 23, P384 1.42 / 3.3 / 3.2 / 7-9 / 7.5-8.5 (the 4x nets outran the
+  sampler at ~400 M voxels/s; fixed, Sampler CPU below). predict W544 halo 16, forward GPU ms per window: 540 / 225 / 225 /
+  65 / 63.
 - Recommendation: `--half-res pool --widths 64,96,128,160,192` for new runs (fresh net; not on resume of a full-resolution
   checkpoint). 4x only where speed matters more than ~0.005 F1. Not deployed on the desk (the user's call).
+
+## Sampler CPU (2026-10-11)
+
+The 4x nets outran the sampler (pool4 cover recipe: ~21.5 samples/s, 40% wait). CPU per P256 patch (bench_sampler, cover
+recipe, 16 workers, ms summed over workers) 586 -> ~295, standalone 28.4 -> 55.8 samples/s, batches byte-identical:
+- label read (`z3_read_label_grid`): an x index map, and the 2^shift output rows / planes that read one label row are copies;
+  target_erode1 branch-free; the empty-patch maximum skipped under a cover. Decoded volcomp mask chunks (binary labels: a
+  serial arithmetic coder, ~10 ms per 128^3 chunk, 8 chunks per window) are kept in memory as bits, process-wide, least
+  recently used dropped past `UFSM_Z3_MASK_CACHE_MB` (default 1024 = 4096 chunks; 0 off). targets 170 -> ~30 ms.
+- soft targets: the 3-4-5 chamfer in bytes saturated at 255 (exact below 255; used when the soft cutoff and the trust band
+  are below 255, else the 16-bit map) with saturating byte adds and log-step row scans: 125 -> ~65 ms.
+- input channels (`write_x`): per output row in vectorised loops (no math errno for sqrtf) and F16C conversion (the
+  _Float16 cast loop stayed scalar); write_x_aug only for the appearance plan / sheet prior: 154 -> ~61 ms.
+- CT statistics as integer partial sums, encode / trust / mask loops branch-free: 55 -> ~25 ms together.
+Byte identity: tests/bench_sampler `UFSM_BENCH_HASH=1` against the previous build (cover recipe 404 batches; training recipe
+with augment 0-3; the default recipe deterministic; soft 80 um (16-bit chamfer) and no soft). Training (laptop): pool4 /
+pack4 at P256 and P384 now wait 0% (cover recipe 26-27 samples/s; P384 pool4 7-9 -> 9.45 samples/s). Left: soft ~65, input
+~61, CT read ~56 (whole 128^3 chunks decoded for a window on the 32-voxel grid; volcomp substreams would allow less).
 
 ## Inference memory (2026-10-11)
 
