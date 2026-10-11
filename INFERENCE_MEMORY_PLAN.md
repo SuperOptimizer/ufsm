@@ -274,6 +274,34 @@ Report `UFSM_PRED_PROF=1` and `UFSM_PROF=layers` before and after.
 **Headroom.** On the 5080, the largest W that runs: 704 after Phase 1, 832-840 after Phase 2. Record the seam ratio
 (as in "Why it matters") and the ink F1 at the largest window with interior 512.
 
+## Status (2026-10-11, implemented on the laptop RTX 5080 16 GB)
+
+| | B per window voxel (production net, one head channel) | switch |
+|---|---|---|
+| before | 56.45 | |
+| phase 1 (aliasing) | 43.45 | `UFSM_INFER_ALIAS` (default 1) |
+| phase 2 + 2b (in-place slabs at levels 0 and 1, stem from the CT) | 26.0-28.2 (W 544-1024; 32-plane slabs ~1 B less than 64) | `UFSM_INFER_SLAB=N` planes (default 64; 0 = phase 1) |
+
+- Phase 1 exactly as planned, except 1.3: `pred_place` reads the CT after the forward (output mask), so the CT
+  window cannot simply move into enc[0].a2's buffer; a CT != 0 bit plane (0.125 B) carries the mask
+  (`nn_pred_ctmask`, `nn_pred_place_m`). 1.4 (uint8 head epilogue) not needed: the logits always find a dead buffer
+  (T1, or the level-1 buffer Y with slabs).
+- Phase 2: the input side of the z-range is in the kernels (`split_t.zi0 / Di`, `nn_set_zrange`); slab outputs go to a
+  temp and are copied back with a one-plane carry, so the epilogues are unchanged. Level 1 in place too (one buffer Y).
+  The GroupNorm statistics came out identical (not only within an ulp) on every test; logits and `ufsm predict`
+  output are byte-identical to phase 1.
+- Phase 2b: `unet_forward_ct` builds the stem's MX-fp8 input per slab from the uint8 CT (`nn_pred_input_mx8`, bit for
+  bit the 16-bit input + conversion); predict keeps the CT at the end of X, i.e. X's last scale planes, which the carry
+  order overwrites only once dead.
+- Phase 3 not implemented: phase 2 reaches the target window (interior 512, halo 128 = W 768) on 16 GB; it would save
+  ~4 B per voxel more (T1 / T2 / the deeper levels inside X's buffer while X is on the host) for 34 B per voxel of PCIe.
+- Tiling: interior = k x shard (k >= 2, box on the stride grid) computes one window per k^3 shards (checked: shard 128
+  with interior 256 gives the same volume as shard 256 from 8 instead of 64 windows).
+- Measured (laptop, verso3, Paris4 48512,17408,16384 512^3): every window size byte-identical to the old layout;
+  largest fast window (this GPU spills to host memory rather than failing): < 640 before, 672 after phase 1, 800
+  after phase 2 (832 spills). Forward time at W 640 (interleaved, +-15% run-to-run): +2.5% with 64-plane slabs,
+  +5.5% with 32. tests/test_infer_mem.c covers phases 1, 2 and 2b.
+
 ## Notes for the implementer
 
 - **The planner.** predict picks the default window with `unet_infer_bytes(...) + 2*W^3 + shard^3 + 1 GiB`

@@ -160,6 +160,18 @@ ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or
   0.291, combined-cut VOI 1.29 / 1.01, phase advance ratio 0.855 / 0.883 - identical to the unweighted arm. The packed
   windings are not under-weighted; they are not visible to the net in a 256^3 window.
 
+## Inference memory (2026-10-11)
+
+INFERENCE_MEMORY_PLAN.md phases 1, 2 and 2b (status table there): the inference build of the production net (one head
+channel) goes 56.45 -> 43.45 B per window voxel by aliasing (the stem input in enc[0].a2's buffer, the logits in T1, predict's
+CT window in the skip buffer with a bit-plane output mask; `UFSM_INFER_ALIAS`) and -> 26-28 B by in-place z-slab
+convolutions at levels 0 and 1 (`UFSM_INFER_SLAB`, default 64 planes): one buffer per level, slab launches through an input
+z-range in the MX forward kernels (`split_t.zi0 / Di`, `nn_set_zrange`) into a temp copied back with a one-plane carry, the
+GroupNorm sums accumulated over the slabs, and the stem built per slab from the uint8 CT (`unet_forward_ct`). Output
+byte-identical to the previous layout; on the 16 GB laptop GPU the largest fast window goes from < 640 to 800 (interior 512
+with halo 144), at +2.5% forward time (W 640). predict computes one window per k^3 shards when the interior is k whole
+shards. Phase 3 (host offload of the level-0 skip) not needed for the target window.
+
 ## Memory and inference defaults (2026-10-08)
 
 - Training stores the MX activation gradients as MX-fp4 with exact stochastic rounding by default when every width is a
