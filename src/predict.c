@@ -270,7 +270,7 @@ int cmd_predict(int argc, char **argv) {
                                           Desk widths, 512 shards, laptop: 16% less GPU time per shard than 8 windows of 288, peak 9.4 GB */
         const int Wc = shard + 32, div = 1 << (cfg.nlev - 1);
         if (Wc % div == 0) {
-            const size_t wc3 = (size_t)Wc * Wc * Wc, need = unet_infer_bytes(u, (shape5){1, 4, Wc, Wc, Wc}) + 2 * wc3 + (size_t)shard * shard * shard + ((size_t)1 << 30);
+            const size_t wc3 = (size_t)Wc * Wc * Wc, need = unet_infer_bytes(u, (shape5){1, 4, Wc, Wc, Wc}) + wc3 + wc3 / 8 + (size_t)shard * shard * shard + ((size_t)1 << 30);   /* (+ the CT window, or its mask when it lives in the network's skip buffer) */
             if (need <= nn_mem_free()) { W = Wc; halo = 16; }
         }
         fprintf(stderr, "predict: window %d, halo %d (default: one window per %d shard when it fits, else 288 / 8; --window / --halo set them)\n", W, halo, shard);
@@ -308,11 +308,17 @@ int cmd_predict(int argc, char **argv) {
     int sb = 0; uint8_t *sbuf = WR.buf[0];
     /* the window goes up as uint8; the input channels are built on the device in the network's storage type */
     const int h16 = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8");
-    uint8_t *ctd = nn_malloc(w3), *pu = gpath ? nullptr : malloc(w3), *pud = gpath ? nullptr : nn_malloc(w3);
+    uint8_t *pu = gpath ? nullptr : malloc(w3), *pud = gpath ? nullptr : nn_malloc(w3);
     float *dyo = malloc(2 * (size_t)W * sizeof(float)), *dxo = dyo + W, *dyd = nn_malloc(2 * (size_t)W * sizeof(float)), *dxd = dyd + W;
     shape5 xs = {1, 4, W, W, W};
     /* the 16-bit input in the network's shared a1 scratch when it has one (free until the stem conv, after the input conversion) */
     unet_build(u, xs, 0);
+    /* the uint8 CT window in the network's level-0 skip buffer (free until the forward's input conversion); the output mask then
+       goes through a bit plane (the buffer does not survive the forward) */
+    uint8_t *ctd = gpath && !sheet_task ? unet_input_scratch2(u, w3) : nullptr;
+    const int ct_shared = ctd != nullptr;
+    if (!ctd) ctd = nn_malloc(w3);
+    uint32_t *ctm = ct_shared ? nn_malloc((w3 + 31) / 32 * 4) : nullptr;
     void *xd = h16 && !sheet_task ? unet_input_scratch(u, 4 * w3 * 2) : nullptr;
     const int xd_shared = xd != nullptr;
     if (!xd) xd = nn_malloc(4 * w3 * (h16 ? 2 : 4));
@@ -397,8 +403,9 @@ int cmd_predict(int argc, char **argv) {
             if (!gpath) nn_h2d(ctd, ctu, w3);
             nn_h2d(dyd, dyo, 2 * (size_t)W * sizeof(float));
             if (pprof) { nn_sync(); p_h2d += now() - pt; pt = now(); }
-            if (xd_shared && unet_input_scratch(u, 4 * w3 * 2) != xd) { fprintf(stderr, "predict: the network was rebuilt under its input scratch\n"); return 1; }
+            if ((xd_shared && unet_input_scratch(u, 4 * w3 * 2) != xd) || (ct_shared && unet_input_scratch2(u, w3) != ctd)) { fprintf(stderr, "predict: the network was rebuilt under its input scratch\n"); return 1; }
             nn_pred_input(ctd, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xd, h16);
+            if (ct_shared) nn_pred_ctmask(ctd, w3, ctm);   /* the forward overwrites ctd */
             if (sheet_task) {
                 for (int z=0;z<W;z++) { double a[4]; sheet_parameters(sheet,o[0]+z,a); sheet_rows[4*z]=(float)(o[1]-a[0]); sheet_rows[4*z+1]=(float)(o[2]-a[1]); sheet_rows[4*z+2]=(float)(1/a[2]); sheet_rows[4*z+3]=(float)a[3]; }
                 nn_sheet_input(xd,W,sheet_rows,(float)sheet->center,(float)sheet->scale,h16);
@@ -419,7 +426,8 @@ int cmd_predict(int argc, char **argv) {
                 }
             }
             if (gpath) {   /* interior straight into the device shard buffer */
-                nn_pred_place(lg, ctd, W, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
+                if (ct_shared) nn_pred_place_m(lg, ctm, W, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
+                else nn_pred_place(lg, ctd, W, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
                 const char *e = nn_check();
                 if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }
                 if (pprof) { nn_sync(); p_gpu += now() - pt; }

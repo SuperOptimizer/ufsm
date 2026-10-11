@@ -75,7 +75,8 @@ static void input_case(int bits) {
     for (int k = 0; k < 6; k++) {
         int precision = modes[k], mx = precision != 0; unet_set_input_prec(precision); unet_set_input_mx(mx);
         const float *p = unet_forward_x(reused, xh, xs, 0, 1); nn_d2h(got, p, no * 4);
-        int storage = mx ? reused->xin && nn_storage(reused->xin) == precision : reused->xin == nullptr;
+        /* inference aliasing: the input lives in enc[0].a2's buffer, registered as the input only from the conversion to the stem */
+        int storage = mx ? reused->xin && (reused->xin_inf ? reused->xin == reused->enc[0].a2 : nn_storage(reused->xin) == precision) : reused->xin == nullptr;
         printf("input transition bodyMX%d input%d: storage %s\n", bits, precision, storage ? "ok" : "FAIL"); failures += !storage;
         unet *fresh = unet_create(&cfg); unet_init(fresh, 19);
         p = unet_forward_x(fresh, xh, xs, 0, 1); nn_d2h(want, p, no * 4);

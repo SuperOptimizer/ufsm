@@ -430,6 +430,30 @@ extern "C" void nn_pred_place(const float *lg, const uint8_t *ct, int W, int hal
     const size_t I = (size_t)(W - 2 * halo);
     pred_place_k<<<nblk(I * I * I, 256), 256>>>(lg, ct, W, halo, oz, oy, ox, ez, ey, ex, shard, dsh); KCHECK();
 }
+/* the CT window's nonzero voxels as bits (word k >> 5, bit k & 31): the output mask of pred_place when the uint8 window does not
+   survive the forward (predict keeps the CT in the network's level-0 skip buffer) */
+__global__ void pred_ctmask_k(const uint8_t *ct, size_t n, uint32_t *bits) {
+    const size_t w = blockIdx.x * (size_t)blockDim.x + threadIdx.x, i0 = w * 32;
+    if (i0 >= n) return;
+    uint32_t m = 0;
+    for (int j = 0; j < 32 && i0 + j < n; j++) m |= (uint32_t)(ct[i0 + j] != 0) << j;
+    bits[w] = m;
+}
+extern "C" void nn_pred_ctmask(const uint8_t *ct, size_t n, uint32_t *bits) { pred_ctmask_k<<<nblk((n + 31) / 32, 256), 256>>>(ct, n, bits); KCHECK(); }
+__global__ void pred_place_m_k(const float *lg, const uint32_t *bits, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    const int I = W - 2 * halo;
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)I * I * I) return;
+    const int x = halo + (int)(i % I), y = halo + (int)((i / I) % I), z = halo + (int)(i / ((size_t)I * I));
+    const int gz = oz + z, gy = oy + y, gx = ox + x;
+    if (gz < 0 || gz >= ez || gy < 0 || gy >= ey || gx < 0 || gx >= ex) return;
+    const size_t k = ((size_t)z * W + y) * W + x;
+    dsh[((size_t)gz * shard + gy) * shard + gx] = (bits[k >> 5] >> (k & 31)) & 1u ? (uint8_t)(255.f / (1.f + __expf(-lg[k])) + 0.5f) : 0;
+}
+extern "C" void nn_pred_place_m(const float *lg, const uint32_t *bits, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    const size_t I = (size_t)(W - 2 * halo);
+    pred_place_m_k<<<nblk(I * I * I, 256), 256>>>(lg, bits, W, halo, oz, oy, ox, ez, ey, ex, shard, dsh); KCHECK();
+}
 __global__ void pred_stats_k(const uint8_t *ct, size_t n, unsigned long long *acc) {
     unsigned long long nz = 0, sm = 0, sq = 0;
     for (size_t i = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) * 16; i < n; i += (size_t)gridDim.x * blockDim.x * 16) {

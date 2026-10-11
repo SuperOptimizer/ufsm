@@ -301,6 +301,8 @@ void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float 
 void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out);
 void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);   /* interior -> device shard */
 void nn_pred_stats(const uint8_t *ct, size_t n, void *scratch, size_t *nz, double *sum, double *sq);   /* exact window stats (scratch: 24 B device) */
+void nn_pred_ctmask(const uint8_t *ct, size_t n, uint32_t *bits);   /* CT != 0 as bits ((n + 31) / 32 words) */
+void nn_pred_place_m(const float *lg, const uint32_t *bits, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);   /* nn_pred_place with the CT mask as bits */
 
 #ifdef __cplusplus
 }
