@@ -29,13 +29,20 @@ void zs_range(int D, int *lo, int *hi) {   /* halo planes at the low / high end 
 }
 size_t zs_len(size_t len, int D) { const auto &z = g_zs[zs_slot()]; return z.on ? len / D * (size_t)((long)z.Dg0 * D / z.D0) : len; }   /* element count of the whole window */
 void zs_reduce(double *b, int n) { if (zs_on() && g_split_reduce) g_split_reduce(b, n); }   /* sum over both GPUs */
-split_t zs_split(split_t sp, int D) { zs_range(D, &sp.zlo, &sp.zhi); return sp; }
-/* z-range (in-place slab convs, unet inference): the next 3^3 stride-1 MX convs compute output planes [z0, z0 + xs.d) of a depth-Di
-   input into a depth-xs.d output; their output GroupNorm sums are zeroed only by the first slab's call and finalised (over the
-   whole depth Di) only by the last's. Di 0 = off. */
-int g_zr_z0, g_zr_Di, g_zr_first, g_zr_last, g_zr_Do;
-extern "C" void nn_set_zrange(int z0, int Di, int first, int last, int Do) { g_zr_z0 = z0; g_zr_Di = Di; g_zr_first = first; g_zr_last = last; g_zr_Do = Do; }
-size_t zr_len(size_t len, int D) { return g_zr_Di ? len / D * (size_t)g_zr_Do : zs_len(len, D); }   /* the statistics cover all Do output planes */
+/* z-range (in-place slab convs, unet inference): the next 3^3 stride-1 MX convs compute output planes [zo, zo + xs.d) of a depth-Do
+   tensor into a depth-xs.d output, output plane z reading input plane z + zi0 of a depth-Di input; their output GroupNorm sums are
+   zeroed only by the first slab's call and finalised (over all Do planes) only by the last's. Di 0 = off. Per host thread (the two
+   halves of a split window run on two threads that hand over inside a conv's statistics reduction). */
+thread_local int g_zr_z0, g_zr_Di, g_zr_first, g_zr_last, g_zr_Do, g_zr_zo;
+extern "C" void nn_set_zrange(int zi0, int Di, int first, int last, int Do, int zo) { g_zr_z0 = zi0; g_zr_Di = Di; g_zr_first = first; g_zr_last = last; g_zr_Do = Do; g_zr_zo = zo; }
+/* the statistics planes of a split half: its owned planes; under a z-range those of the depth-Do tensor that fall into the slab */
+split_t zs_split(split_t sp, int D) {
+    if (!g_zr_Di || !zs_on()) { zs_range(D, &sp.zlo, &sp.zhi); return sp; }
+    int lo, hi; zs_range(g_zr_Do, &lo, &hi);
+    sp.zlo = min(max(lo - g_zr_zo, 0), D); sp.zhi = min(max(g_zr_zo + D - (g_zr_Do - hi), 0), D);
+    return sp;
+}
+size_t zr_len(size_t len, int D) { return g_zr_Di ? len / D * zs_len((size_t)g_zr_Do, g_zr_Do) : zs_len(len, D); }   /* the statistics cover all Do output planes (split: of the window) */
 int zr_zero(void) { return !g_zr_Di || g_zr_first; }
 int zr_final(void) { return !g_zr_Di || g_zr_last; }
 int gn_fused_stored(const void *y, int cout) {
@@ -56,7 +63,7 @@ size_t fw_smem(int MT, int tz) { return (size_t)(TC_CI * (tz + 2) * 180 + (MT <=
 float *tc_wscbuf(size_t n) { static float *buf[8]; static size_t cap[8]; int d = cur_dev(); if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); cudaMalloc(&buf[d], n * sizeof(float)); cap[d] = n; } return buf[d]; }
 int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts) {
     if (g_zr_Di) {   /* z-range: the MX forward kernels (and the tap-packed stem kernel) */
-        if (ts || !ISMX(y) || (!ISMX(x) && xs.c > 8) || sp.y2 || sp.accum || zs_on() || g_pass) { fprintf(stderr, "conv: the z-range needs an MX output and input (forward, no split)\n"); abort(); }
+        if (ts || !ISMX(y) || (!ISMX(x) && xs.c > 8) || sp.y2 || sp.accum || g_pass) { fprintf(stderr, "conv: the z-range needs an MX output and input (forward)\n"); abort(); }
         sp.zi0 = g_zr_z0; sp.Di = g_zr_Di;
     }
     const int pr = eff_prec();

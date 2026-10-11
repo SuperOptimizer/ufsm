@@ -125,6 +125,13 @@ struct unet {
     int slab, slab1, slab_s; float *slab_tmp, *slab_carry, *t1p;   /* slab1: level 1 in place too (Y = enc[1].a2's buffer; UFSM_INFER_SLAB_L1=0 off) */
     int ct_mode, ct_stem; float *slab_xin;    /* unet_set_ct_input: the caller passes the uint8 CT window (unet_forward_ct); with slabs and an MX-fp8 stem
                                                  input the stem builds its input per slab from it (no full-window input) */
+    /* coarse offload (UFSM_INFER_OFFLOAD, with level-1 slabs): the last r_bytes of X's data region (R, from plane zr on) go to pinned host
+       memory (h_r) from enc[0]'s end to dec[0]'s conv1; R holds every coarse buffer meanwhile (T1, T2, the skips below level 1, the
+       level-1 slab temp and carry), Y the level-0 slab temp and the stem input (free there) and the down-conv output that enc[1]'s conv1
+       reads in place; dec[0]'s conv1 slabs use R as temp, then Y's consumed coarse planes (slab_tmpd: its own temp if that schedule
+       does not fit) */
+    int p3, zr, r_out, r_in; float *R, *Xp, *Yp; size_t r_bytes, x_bytes, y_bytes; void *h_r, *ev_r[4];
+    float *slab_tmp1, *slab_carry1, *slab_tmpd;
     struct { const uint8_t *ct; float mean, isd; const float *dyo, *dxo; int axis, h16, on; } ctin;   /* in-place z-slab convs at level 0 (UFSM_INFER_SLAB): enc[0] / dec[0] a1 and a2 all in
                                                          X = enc[0].a2's buffer; slab_s output planes per launch into slab_tmp (+ one carry plane) */     /* inference aliasing (UFSM_INFER_ALIAS, default on): the MX network input in enc[0].a2's buffer
                                                 (dead from the stem to enc[0].c2), the fp32 logits in T1 (dec[0].a1, dead after dec[0].c2) */
@@ -377,6 +384,9 @@ static int g_share_enc_a1 = -1;
 static int g_infer_alias = -1;
 static int infer_alias(void) { if (g_infer_alias < 0) g_infer_alias = getenv("UFSM_INFER_ALIAS") ? ufsm_env_on("UFSM_INFER_ALIAS") : 1; return g_infer_alias; }
 void unet_set_infer_alias(int on) { g_infer_alias = on; }
+static int g_infer_off = -1;
+static int infer_offload(void) { if (g_infer_off < 0) g_infer_off = getenv("UFSM_INFER_OFFLOAD") ? ufsm_env_on("UFSM_INFER_OFFLOAD") : 1; return g_infer_off; }
+void unet_set_infer_offload(int on) { g_infer_off = on; }
 static int g_infer_slab = -1;
 static int infer_slab(void) { if (g_infer_slab < 0) g_infer_slab = getenv("UFSM_INFER_SLAB") ? atoi(getenv("UFSM_INFER_SLAB")) : 64; return g_infer_slab; }   /* planes per slab (default 64), 0 off */
 void unet_set_infer_slab(int planes) { g_infer_slab = planes; }
@@ -430,7 +440,7 @@ static int sko_on(void) { if (g_sko < 0) g_sko = getenv("UFSM_SKIP_OFFLOAD") ? u
 void unet_set_skip_offload(int on) { g_sko = on; }
 #define SKO_DEFER ((float *)(uintptr_t)1)   /* build: an encoder a2 placed later */
 int unet_share_enc_a1(void) { return share_enc_a1(); }
-#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8) + 16384 * unet_wide_up_grad() + 32768 * keep_coarse_a1() + 65536 * share_enc_a1() + 131072 * grad_mx4() + 262144 * up_wg_chunk() + 524288 * a1_offload() + 1048576 * xin_offload() + 2097152 * a0_share_on() + 4194304 * gco_on() + 8388608 * dno_on() + 16777216 * sko_on() + 33554432 * infer_alias() + 67108864 * (infer_slab() > 0))
+#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8) + 16384 * unet_wide_up_grad() + 32768 * keep_coarse_a1() + 65536 * share_enc_a1() + 131072 * grad_mx4() + 262144 * up_wg_chunk() + 524288 * a1_offload() + 1048576 * xin_offload() + 2097152 * a0_share_on() + 4194304 * gco_on() + 8388608 * dno_on() + 16777216 * sko_on() + 33554432 * infer_alias() + 67108864 * (infer_slab() > 0) + 134217728 * infer_offload())
 /* chunk mode (recompute, 16-bit activations and gradients, fused upsample): the decoder's up-part input gradient is
    produced in w[i]-channel chunks, each upsample-backwarded straight into its slice of gout[i + 1], so the shared
    gradient buffer B only needs w[i] channels (env UFSM_CHUNK_UP=0 turns it off) */
@@ -460,6 +470,11 @@ static void free_once(float **ptrs, int n) {
         for (int j = 0; j < i; j++) if (ptrs[j] == ptrs[i]) { dup = 1; break; }
         if (!dup) nn_free(ptrs[i]);
     }
+}
+/* coarse-offload layout (unet.p3): a buffer placed inside X or Y is no allocation of its own */
+static int interior(const unet *u, const void *p) {
+    const char *c = (const char *)p;
+    return u->p3 && p && ((u->Xp && c > (const char *)u->Xp && c < (const char *)u->Xp + u->x_bytes) || (u->Yp && c > (const char *)u->Yp && c < (const char *)u->Yp + u->y_bytes));
 }
 static void free_acts(unet *u) {
     float *pp[UNET_MAXLEV * 30 + 8]; int np = 0;
@@ -493,6 +508,7 @@ static void free_acts(unet *u) {
     pp[np++] = u->logits; pp[np++] = u->conv_scratch; pp[np++] = u->rc_extra;
     if (u->rc_extra && !g_dry) nn_storage_forget(u->rc_extra);
     u->rc_extra = nullptr; u->rc_extra_bytes = 0; u->gB_bytes = 0; pp[np++] = u->xin; pp[np++] = u->glb;
+    for (int j = 0; j < np; j++) if (interior(u, pp[j])) pp[j] = nullptr;
     free_once(pp, np);
     u->logits = nullptr; u->conv_scratch = nullptr; u->xin = nullptr; u->glb = nullptr; u->conv_scratch_n = 0;
     for (int i = 0; i < UNET_MAXLEV; i++) {
@@ -504,7 +520,13 @@ static void free_acts(unet *u) {
     if (u->h_a2) { if (u->a2_out) nn_sync(); nn_host_free(u->h_a2); }
     u->h_a2 = nullptr; u->a0_share = u->a2_out = 0;
     u->xin_inf = u->lg_t1 = 0; u->t1_bytes = 0; u->lg_p = nullptr; u->lg_bytes = 0;
-    { float *q[3] = {u->slab_tmp, u->slab_carry, u->slab_xin}; free_once(q, 3); u->slab_tmp = u->slab_carry = u->slab_xin = nullptr; u->slab = u->slab1 = u->slab_s = u->ct_stem = 0; }
+    {
+        float *q[6] = {u->slab_tmp, u->slab_carry, u->slab_xin, u->slab_tmp1, u->slab_carry1, u->slab_tmpd};
+        for (int j = 0; j < 6; j++) if (interior(u, q[j])) { if (!g_dry && j == 2) nn_storage_forget(q[j]); q[j] = nullptr; }
+        free_once(q, 6); u->slab_tmp = u->slab_carry = u->slab_xin = u->slab_tmp1 = u->slab_carry1 = u->slab_tmpd = nullptr; u->slab = u->slab1 = u->slab_s = u->ct_stem = 0;
+    }
+    if (u->h_r) { if (u->r_out || u->r_in) nn_sync(); nn_host_free(u->h_r); }
+    u->h_r = nullptr; u->p3 = u->r_out = u->r_in = 0; u->R = u->Xp = u->Yp = nullptr; u->r_bytes = u->x_bytes = u->y_bytes = 0; u->zr = 0;
     u->gco = 0; u->gout_x1 = u->gout_home1 = nullptr; u->dno = u->dn_out = 0; u->sko = u->sk_out = 0;
     u->built = 0; u->act_bytes = 0; u->grad_bytes = 0;
     u->last_a1_live = 0;
@@ -523,6 +545,36 @@ static void build_block_acts(unet *u, block *b, shape5 xs, int train, int keep_s
 }
 static size_t act_bytes_of(shape5 s) { return act_mx8() ? nn_mx_bytes(s, act_dt()) : shape_numel(s) * (ABF ? 2 : 4); }
 
+/* coarse offload: enc[1]'s conv1 reads down0's output (w[0] channels) in place in Y (w[1]): placed at the data rows of Y's last
+   w[0] / 32 blocks, so plane z of each of its blocks (data rows, then scales) sits where Y's plane z of a block goes */
+static size_t p3_down_off(const unet *u) {
+    const int bw = 32, nb0 = (u->cfg.widths[0] + bw - 1) / bw, nb1 = (u->cfg.widths[1] + bw - 1) / bw, rb = act_mx4() ? bw / 2 : bw;
+    return (size_t)(nb1 - nb0) * shape_spatial(u->ls[1]) * rb;
+}
+/* dec[0]'s conv1 under the coarse offload: planes of the slab at z0 that fit its temp in Y's consumed coarse planes (block 0's
+   data rows below (z0 >> 1) - 3; the up staging reads from (z0 >> 1) - 2 on), from Y + 256, a multiple of 4 */
+static int dc1_fity(const unet *u, int z0) {
+    const int cz = (z0 >> 1) - 3, rb = act_mx4() ? 16 : 32;
+    if (cz <= 0) return 0;
+    const long long avail = (long long)cz * u->ls[1].h * u->ls[1].w * rb - 256;
+    shape5 p = u->ls[0]; p.c = u->cfg.widths[0]; p.d = 1;
+    const long long n = avail > 0 ? avail / (long long)act_bytes_of(p) : 0;
+    return (int)(n / 4 * 4);
+}
+/* the slab at z0 (0: none fits); *B: 0 phase A (temp in R, the slab's input planes below zr), 1 phase B (temp in Y). The switch:
+   once Y holds min(s, 16) planes, or when phase A cannot go on */
+static int dc1_next(const unet *u, int z0, int *B) {
+    const int D = u->ls[0].d, s = u->slab_s, fy = dc1_fity(u, z0);
+    if (!*B) {
+        int sa = s < D - z0 ? s : D - z0;
+        if (z0 + sa >= u->zr) sa = (u->zr - 1 - z0) / 4 * 4;
+        if (sa >= 4 && fy < (s < 16 ? s : 16)) return sa;
+        *B = 1;
+    }
+    if (D - z0 <= (s < fy ? s : fy)) return D - z0;
+    const int sk = s < fy ? s : fy;
+    return sk >= 4 ? sk : 0;
+}
 static void build_acts(unet *u, shape5 xs, int train) {
     free_acts(u);
     int L = u->cfg.nlev;
@@ -548,6 +600,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
     const int slab1 = slab && L > 2 && w[1] % 32 == 0 && u->cfg.enc_blocks[1] == 0 && (!getenv("UFSM_INFER_SLAB_L1") || ufsm_env_on("UFSM_INFER_SLAB_L1"));
     float *X = nullptr, *Y = nullptr;
     u->slab = slab; u->slab1 = slab1; u->slab_s = slab ? (infer_slab() + 3) / 4 * 4 : 0;
+    float *SK[UNET_MAXLEV] = {0};   /* coarse offload: the skips below level 1 inside R */
     if (share) {
         shape5 m1 = u->ls[0], m2, mc = u->ls[0]; m1.c = 0; mc.c = 0;
         for (int i = slab1 ? 2 : slab ? 1 : 0; i < L; i++) { shape5 y = u->ls[i]; y.c = w[i]; if (act_bytes_of(y) > act_bytes_of(m1)) m1 = y; }
@@ -558,23 +611,92 @@ static void build_acts(unet *u, shape5 xs, int train) {
             m2.c = 0;
             for (int i = slab1 ? 2 : 1; i < L - 1; i++) { shape5 y = u->ls[i]; y.c = w[i]; if (act_bytes_of(y) > act_bytes_of(m2)) m2 = y; }
         }
-        for (int i = 0; i < L - 1; i++) { shape5 d = u->ls[i + 1]; d.c = w[i]; if (act_bytes_of(d) > act_bytes_of(m2)) m2 = d; }
+        const int off_ok = slab1 && infer_offload() && !u->nrb_any && w[1] >= w[0];   /* (enc[1]'s conv1 in place over the down output in Y) */
+        for (int i = off_ok ? 1 : 0; i < L - 1; i++) { shape5 d = u->ls[i + 1]; d.c = w[i]; if (act_bytes_of(d) > act_bytes_of(m2)) m2 = d; }
         for (int i = 0; i < L - 1; i++) { shape5 c = u->ls[i]; c.c = UPW(i + 1); if (act_bytes_of(c) > act_bytes_of(mc)) mc = c; }
-        T1 = dalloc_act_s(u, m1); T2 = dalloc_act_s(u, m2); TC = rc ? nullptr : dalloc_act_s(u, mc);   /* recompute: rc_tmp allocates on demand */
-        u->t1_bytes = act_bytes_of(m1); u->t1p = T1;
+        /* the coarse offload (unet.p3): R's contents, the slab size that fits Y's level-0 temps, the dec[0] conv1 schedule */
+        shape5 y0 = u->ls[0]; y0.c = w[0];
+        shape5 y1 = u->ls[1]; y1.c = w[1];
+        const int ct_ok = u->ct_mode && input_mx() && unet_input_prec() == 8 && xs.h == xs.w && xs.n == 1 && u->cfg.cin == 4;
+        int p3 = 0;
+        if (off_ok) {
+            const size_t xb = act_bytes_of(y0), yb = act_bytes_of(y1), A = 256;
+            const int bw0 = 32, nb0 = (w[0] + bw0 - 1) / bw0, rb0 = act_mx4() ? bw0 / 2 : bw0;
+            const size_t S0 = shape_spatial(y0), blk_data = S0 * rb0;
+            int s = u->slab_s;
+            for (; s >= 4; s -= 4) {
+                shape5 t0 = y0; t0.d = s < y0.d ? s : y0.d;
+                shape5 xi = xs; xi.d = t0.d + 2; if (xi.d > xs.d) xi.d = xs.d;
+                if (A + ((act_bytes_of(t0) + 255) & ~(size_t)255) + (ct_ok ? nn_mx_bytes(xi, 8) : 0) <= yb) break;
+            }
+            if (s >= 4) {
+                shape5 t0 = y0; t0.d = s < y0.d ? s : y0.d;
+                shape5 t1 = y1; t1.d = s < y1.d ? s : y1.d;
+                shape5 c1 = y1; c1.d = 1;
+                size_t rs = A;
+                rs += (act_bytes_of(m1) + 255) & ~(size_t)255; rs += (act_bytes_of(m2) + 255) & ~(size_t)255;
+                for (int i = 2; i < L; i++) { shape5 y = u->ls[i]; y.c = w[i]; rs += (act_bytes_of(y) + 255) & ~(size_t)255; }
+                rs += (act_bytes_of(t1) + 255) & ~(size_t)255; rs += (act_bytes_of(c1) + 255) & ~(size_t)255;
+                const size_t rt = A + ((act_bytes_of(t0) + 255) & ~(size_t)255);   /* dec[0]'s conv1 phase-A temp (R alone then) */
+                if (rt > rs) rs = rt;
+                if (rs + A <= blk_data) {
+                    p3 = 1; u->slab_s = s; u->r_bytes = rs; u->x_bytes = xb; u->y_bytes = yb;
+                    const size_t data_end = (size_t)nb0 * blk_data, off = (data_end - rs) & ~(size_t)255;
+                    u->zr = (int)((off - (size_t)(nb0 - 1) * blk_data) / ((size_t)y0.h * y0.w * rb0));
+                    u->r_bytes = data_end - off;
+                }
+            }
+        }
+        if (p3 && !g_dry) {
+            u->h_r = nn_host_alloc_try(u->r_bytes);
+            if (!u->h_r) { fprintf(stderr, "unet: cannot pin %.2f GB for the coarse offload; separate coarse buffers\n", u->r_bytes / 1e9); p3 = 0; u->slab_s = slab ? (infer_slab() + 3) / 4 * 4 : 0; }
+            else for (int k = 0; k < 4; k++) if (!u->ev_r[k]) u->ev_r[k] = nn_event_create();
+        }
+        if (!p3 && off_ok) { shape5 d = u->ls[1]; d.c = w[0]; if (act_bytes_of(d) > act_bytes_of(m2)) m2 = d; }   /* down0's output back in T2 */
         if (slab) {
             g_mlab = "X (level 0, in-place slabs) + slab temp";
-            shape5 y0 = u->ls[0]; y0.c = w[0];
             X = dalloc_act_s(u, y0);
-            if (slab1) { shape5 y1 = u->ls[1]; y1.c = w[1]; Y = dalloc_act_s(u, y1); }
-            shape5 ts = y0; ts.d = u->slab_s < y0.d ? u->slab_s : y0.d; u->slab_tmp = dalloc_act_s(u, ts);
-            ts.d = 1; u->slab_carry = dalloc_act_s(u, ts);
-            u->ct_stem = u->ct_mode && input_mx() && unet_input_prec() == 8 && xs.d == xs.h && xs.h == xs.w && xs.n == 1 && u->cfg.cin == 4;
-            if (u->ct_stem) {   /* the stem's MX-fp8 input of one slab and its halo planes */
-                g_mlab = "logits (fp32) / network input";
-                shape5 xi = xs; xi.d = (u->slab_s < xs.d ? u->slab_s : xs.d) + 2; if (xi.d > xs.d) xi.d = xs.d;
-                const size_t xb_ = nn_mx_bytes(xi, 8); u->act_bytes += xb_;
-                u->slab_xin = dalloc_oom(dmalloc(xb_), xb_); dstorage(u->slab_xin, xb_, 8);
+            if (slab1) Y = dalloc_act_s(u, y1);
+        }
+        u->p3 = p3;
+        if (p3) {   /* R = the end of X's data region; every coarse buffer inside it, the level-0 temps inside Y */
+            u->Xp = X; u->Yp = Y;
+            {   /* (MX layout: data rows of every block, then the scales; R ends where X's data ends) */
+                const int bw0 = 32, nb0 = (w[0] + bw0 - 1) / bw0, rb0 = act_mx4() ? bw0 / 2 : bw0;
+                u->R = (float *)((char *)X + (size_t)nb0 * shape_spatial(y0) * rb0 - u->r_bytes);
+            }
+            char *r = (char *)u->R + 256;
+            T1 = (float *)r; r += (act_bytes_of(m1) + 255) & ~(size_t)255;
+            T2 = (float *)r; r += (act_bytes_of(m2) + 255) & ~(size_t)255;
+            for (int i = 2; i < L; i++) { shape5 y = u->ls[i]; y.c = w[i]; SK[i] = (float *)r; r += (act_bytes_of(y) + 255) & ~(size_t)255; }
+            u->slab_tmp1 = (float *)r; { shape5 t1 = y1; t1.d = u->slab_s < y1.d ? u->slab_s : y1.d; r += (act_bytes_of(t1) + 255) & ~(size_t)255; }
+            u->slab_carry1 = (float *)r;
+            u->slab_tmp = (float *)((char *)Y + 256);
+            { shape5 t0 = y0; t0.d = u->slab_s < y0.d ? u->slab_s : y0.d; u->slab_xin = (float *)((char *)u->slab_tmp + ((act_bytes_of(t0) + 255) & ~(size_t)255)); }
+            g_mlab = "X (level 0, in-place slabs) + slab temp";
+            { shape5 c0 = y0; c0.d = 1; u->slab_carry = dalloc_act_s(u, c0); }
+            /* dec[0]'s conv1: R, then Y's consumed coarse planes as temp; its own temp if that schedule does not reach the end */
+            int B = 0, ok = 1;
+            for (int z0 = 0, sk; z0 < y0.d && ok; z0 += sk) { sk = dc1_next(u, z0, &B); if (!sk) ok = 0; }
+            if (!ok || infer_offload() == 2) { shape5 t0 = y0; t0.d = u->slab_s < y0.d ? u->slab_s : y0.d; u->slab_tmpd = dalloc_act_s(u, t0); }   /* (2: always, a test hook) */
+            u->ct_stem = ct_ok;
+            u->t1_bytes = act_bytes_of(m1); u->t1p = T1;
+            TC = nullptr;
+        } else {
+            T1 = dalloc_act_s(u, m1); T2 = dalloc_act_s(u, m2); TC = rc ? nullptr : dalloc_act_s(u, mc);   /* recompute: rc_tmp allocates on demand */
+            u->t1_bytes = act_bytes_of(m1); u->t1p = T1;
+            if (slab) {
+                g_mlab = "X (level 0, in-place slabs) + slab temp";
+                shape5 ts = y0; ts.d = u->slab_s < y0.d ? u->slab_s : y0.d; u->slab_tmp = dalloc_act_s(u, ts);
+                ts.d = 1; u->slab_carry = dalloc_act_s(u, ts);
+                u->slab_tmp1 = u->slab_tmp; u->slab_carry1 = u->slab_carry;
+                u->ct_stem = ct_ok;
+                if (u->ct_stem) {   /* the stem's MX-fp8 input of one slab and its halo planes */
+                    g_mlab = "logits (fp32) / network input";
+                    shape5 xi = xs; xi.d = (u->slab_s < xs.d ? u->slab_s : xs.d) + 2; if (xi.d > xs.d) xi.d = xs.d;
+                    const size_t xb_ = nn_mx_bytes(xi, 8); u->act_bytes += xb_;
+                    u->slab_xin = dalloc_oom(dmalloc(xb_), xb_); dstorage(u->slab_xin, xb_, 8);
+                }
             }
         }
     }
@@ -587,7 +709,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
         if (slab && i == 0) ea1 = X;
         if (slab1 && i == 1) ea1 = Y;
         build_block_acts(u, &u->enc[i], bin, train, i == L - 1, ea1,
-                         slab && i == 0 ? X : slab1 && i == 1 ? Y : rc && train && sko_on() && !u->nrb_any && i > 0 && i < L - 1 ? SKO_DEFER : rc || u->cfg.enc_blocks[i] ? nullptr : T2, nullptr);   /* recompute mode keeps the (small) outputs that
+                         slab && i == 0 ? X : slab1 && i == 1 ? Y : u->p3 ? SK[i] : rc && train && sko_on() && !u->nrb_any && i > 0 && i < L - 1 ? SKO_DEFER : rc || u->cfg.enc_blocks[i] ? nullptr : T2, nullptr);   /* recompute mode keeps the (small) outputs that
                                                                                                                          get upsampled; training: the coarse skips placed later */
         if (sea && i < L - 1) {
             u->enc[i].a1_shared = 1;
@@ -600,7 +722,8 @@ static void build_acts(unet *u, shape5 xs, int train) {
         }
         if (i < L - 1) {
             shape5 ds = u->ls[i + 1]; ds.c = w[i];
-            u->downo[i] = share ? T2 : train && dno_on() ? nullptr : dalloc_act_s(u, ds);   /* (training: placed with the gradient buffers) */
+            u->downo[i] = u->p3 && i == 0 ? (float *)((char *)Y + p3_down_off(u)) : share ? T2 : train && dno_on() ? nullptr : dalloc_act_s(u, ds);   /* (training: placed with the gradient buffers;
+                                                                                         coarse offload: down0's output in Y, read in place by enc[1]'s conv1) */
             if (u->cfg.down_norm) {
                 int G = G_of(u, w[i]);
                 u->dm[i] = dalloc(u, (size_t)ds.n * G); u->dr[i] = dalloc(u, (size_t)ds.n * G);
@@ -812,7 +935,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
     if (!train && u->head_nc) os.c = u->head_nc;   /* inference: the requested logit channels only */
     const int ialias = share && reuse_skip && infer_alias() && act_mx8();   /* inference aliasing (see unet.xin_inf / lg_t1) */
     u->lg_t1 = u->xin_inf = 0;
-    if (!u->logits && ialias && shape_numel(os) * 4 <= u->t1_bytes) { u->logits = T1; u->lg_t1 = 1; u->lg_p = T1; u->lg_bytes = u->t1_bytes; }
+    if (!u->logits && ialias && !u->p3 && shape_numel(os) * 4 <= u->t1_bytes) { u->logits = T1; u->lg_t1 = 1; u->lg_p = T1; u->lg_bytes = u->t1_bytes; }   /* (coarse offload: T1 is in X) */
     else if (!u->logits && slab1 && shape_numel(os) * 4 <= act_bytes_of(u->enc[1].ys)) {   /* Y: dec[1].a2, dead once dec[0]'s conv1 has upsampled it */
         u->logits = Y; u->lg_t1 = 1; u->lg_p = Y; u->lg_bytes = act_bytes_of(u->enc[1].ys);
     }
@@ -1098,35 +1221,61 @@ static void stem_slab_run(unet *u, block *b, int G, float *om, float *orr) {
         const int tlo = z0 > 0 ? z0 - 1 : 0, thi = z0 + sk + 1 < D ? z0 + sk + 1 : D, nt = thi - tlo;
         nn_set_storage(u->slab_xin, xb_, 8);
         nn_pred_input_mx8(u->ctin.ct, W, u->ctin.mean, u->ctin.isd, u->ctin.dyo, u->ctin.dxo, u->ctin.axis, tlo, nt, u->slab_xin, u->ctin.h16);
-        nn_set_zrange(z0 - tlo, nt, k == 0, last, D);
+        nn_set_zrange(z0 - tlo, nt, k == 0, last, D, z0);
         shape5 xs = {1, 4, sk, ys.h, ys.w};
         PROF(0, nn_conv3d_fwd_gn_stats(u->slab_xin, xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, u->slab_tmp, G, 1e-5f, om, orr));
-        nn_set_zrange(0, 0, 0, 0, 0);
+        nn_set_zrange(0, 0, 0, 0, 0, 0);
         if (k) mx_copy_planes(X, D, z0 - 1, u->slab_carry, 1, 0, 1, ys);
         mx_copy_planes(X, D, z0, u->slab_tmp, sk, 0, last ? sk : sk - 1, ys);
         if (!last) mx_copy_planes(u->slab_carry, 1, 0, u->slab_tmp, sk, sk - 1, 1, ys);
     }
+    if (u->p3) nn_storage_forget(u->slab_xin);   /* (inside Y: its fp8 registration would outlive the stem) */
 }
-static void slab_run(unet *u, block *b, int level, int conv, int G, float *om, float *orr) {
+/* conv 1 of an encoder block reads x (coarse offload: enc[1]'s conv1 over down0's output, which sits in Y plane for plane, see
+   p3_down_off); dec[0]'s conv1 under the coarse offload takes its temp from R, then from Y's consumed coarse planes (dc1_next), and
+   brings R back from the host between the two (waited before a slab reaches plane zr) */
+static void slab_run(unet *u, block *b, int level, int conv, const float *x, int G, float *om, float *orr) {
     float *X = b->a2;
     const shape5 ys = b->ys; const int D = ys.d, s = u->slab_s;
-    for (int z0 = 0, k = 0; z0 < D; z0 += s, k++) {
-        const int sk = D - z0 < s ? D - z0 : s, last = z0 + sk >= D;
-        nn_set_zrange(z0, D, k == 0, last, D);
-        if (conv == 1) {
+    float *carry = level ? u->slab_carry1 : u->slab_carry;
+    const int dc1 = u->p3 && conv == 1 && b == &u->dec[0];
+    int B = 0, waited = 0;
+    if (dc1 && u->slab_tmpd && u->r_out) { nn_offload_copy(u->R, u->h_r, u->r_bytes, 0, u->ev_r[2], u->ev_r[3]); u->r_in = 1; }   /* (own temp: R comes back at once) */
+    for (int z0 = 0, k = 0, sk; z0 < D; z0 += sk, k++) {
+        float *tmp = level ? u->slab_tmp1 : u->slab_tmp;
+        if (dc1 && !u->slab_tmpd) {
+            const int B0 = B;
+            sk = dc1_next(u, z0, &B);
+            if (!sk) { fprintf(stderr, "unet: dec[0] conv1 slab schedule does not fit\n"); abort(); }
+            if (B && !B0 && u->r_out) { nn_offload_copy(u->R, u->h_r, u->r_bytes, 0, u->ev_r[2], u->ev_r[3]); u->r_in = 1; }   /* R no longer the temp: back from the host */
+            tmp = B ? (float *)((char *)u->Yp + 256) : u->R;
+        } else {
+            sk = D - z0 < s ? D - z0 : s;
+            if (dc1) tmp = u->slab_tmpd;
+        }
+        if (dc1 && u->r_in && !waited && z0 + sk >= u->zr) { nn_stream_wait(0, u->ev_r[3]); waited = 1; }   /* this slab reads (and writes) R's planes */
+        const int last = z0 + sk >= D;
+        nn_set_zrange(z0, D, k == 0, last, D, z0);
+        if (conv == 1 && b->xb) {
             const shape5 full = b->xs; b->xs.d = sk;
-            const int rv = dec_conv1(u, b, level, u->slab_tmp, G, om, orr, nullptr, nullptr, nullptr);
+            const int rv = dec_conv1(u, b, level, tmp, G, om, orr, nullptr, nullptr, nullptr);
             b->xs = full;
             if (rv) rc_fail("decoder conv1 (slab)");
+        } else if (conv == 1) {
+            shape5 xs = b->xs; xs.d = sk;
+            nn_gn_t gi = gn_in(u, b);
+            PROF(0, nn_conv3d_fwd_gn_stats(x, xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, tmp, G, 1e-5f, om, orr));
         } else {
             shape5 xs = ys; xs.d = sk;
-            PROF(0, nn_conv3d_fwd_gn_stats(X, xs, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, u->slab_tmp, G, 1e-5f, om, orr));
+            PROF(0, nn_conv3d_fwd_gn_stats(X, xs, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, tmp, G, 1e-5f, om, orr));
         }
-        nn_set_zrange(0, 0, 0, 0, 0);
-        if (k) mx_copy_planes(X, D, z0 - 1, u->slab_carry, 1, 0, 1, ys);
-        mx_copy_planes(X, D, z0, u->slab_tmp, sk, 0, last ? sk : sk - 1, ys);
-        if (!last) mx_copy_planes(u->slab_carry, 1, 0, u->slab_tmp, sk, sk - 1, 1, ys);
+        nn_set_zrange(0, 0, 0, 0, 0, 0);
+        if (k) mx_copy_planes(X, D, z0 - 1, carry, 1, 0, 1, ys);
+        mx_copy_planes(X, D, z0, tmp, sk, 0, last ? sk : sk - 1, ys);
+        if (!last) mx_copy_planes(carry, 1, 0, tmp, sk, sk - 1, 1, ys);
     }
+    if (dc1 && u->r_in && !waited) nn_stream_wait(0, u->ev_r[3]);
+    if (dc1) u->r_out = u->r_in = 0;
 }
 static void block_fwd(unet *u, block *b, int level, const float *x) {
     b->in = x;
@@ -1141,7 +1290,8 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
             nn_d2d(b->pm1, b->m1, (size_t)b->ys.n * G * 4); nn_d2d(b->pr1, b->r1, (size_t)b->ys.n * G * 4); nn_d2d(b->pm2, b->m2, (size_t)b->ys.n * G * 4); nn_d2d(b->pr2, b->r2, (size_t)b->ys.n * G * 4);
         }
         const int inplace = u->slab && (b == &u->enc[0] || b == &u->dec[0] || (u->slab1 && (b == &u->enc[1] || b == &u->dec[1])));   /* a1 == a2 == X (Y): in-place slab convs */
-        if (b->xb && inplace) slab_run(u, b, level, 1, G, om1, or1);
+        if (b->xb && inplace) slab_run(u, b, level, 1, nullptr, G, om1, or1);
+        else if (inplace && u->p3 && b == &u->enc[1]) slab_run(u, b, level, 1, x, G, om1, or1);   /* down0's output, in Y */
         else if (b->xb) { if (dec_conv1(u, b, level, b->a1, G, om1, or1, nullptr, nullptr, nullptr)) rc_fail("decoder conv1"); }   /* [up2(coarse) | silu(gn(skip a2))] */
         else if (b == &u->enc[0] && u->ctin.on) stem_slab_run(u, b, G, om1, or1);
         else if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), B1(u, b), b->c1.cout, b->a1, G, 1e-5f, om1, or1));
@@ -1163,7 +1313,7 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
             nn_set_storage(u->dec[0].a2, act_bytes_of(u->dec[0].ys), act_dt());
         }
         nn_set_conv(1);
-        if (inplace) slab_run(u, b, level, 2, G, om2, or2);
+        if (inplace) slab_run(u, b, level, 2, nullptr, G, om2, or2);
         else PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, om2, or2));
         nn_set_conv(-1);
         FQ(b->a2, b->ys); FQ_AFF(b->a2, b->ys, b->pm2, b->pr2, G);
@@ -1243,13 +1393,17 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     if (u->a0_share) nn_set_storage(u->enc[0].a2, act_bytes_of(u->enc[0].ys), act_dt());   /* a backward left the input in it */
     if (gn_frozen(u)) gn_frozen_load(u);
     if (u->lg_t1) nn_set_storage(u->lg_p, u->lg_bytes, act_dt());   /* the last head wrote fp32 logits there (unregistered) */
-    if (u->slab && sp_on(u)) { fprintf(stderr, "unet: in-place slab convs (UFSM_INFER_SLAB) do not support the spatial split\n"); abort(); }
     if (u->xin_inf) nn_set_storage(u->xin, u->xin_bytes, unet_input_prec());   /* enc[0].a2's buffer holds the input until enc[0].c2 */
     if (u->ctin.on) cur = nullptr;   /* unet_forward_ct: the stem builds its input per slab from the CT */
     else if (ABF && !x_h16) { if (!u->xin) u->xin = dalloc_input(u, xs); nn_f32_to_act(x, xs, u->xin); cur = u->xin; }
     else if (x_h16 && act_mx8() && xin_mx) { if (!u->xin) u->xin = dalloc_input(u, xs); nn_h16_to_mx(x, xs, u->xin); cur = u->xin; }
     for (int i = 0; i < L; i++) {
+        if (i == 1 && u->r_out) nn_stream_wait(0, u->ev_r[1]);   /* the coarse levels write R: its copy out done */
         nn_set_layer(i); block_fwd(u, &u->enc[i], i, cur);
+        if (i == 0 && u->p3) {   /* X's planes from zr on: to the host while down0 reads them (R takes the coarse levels after that) */
+            nn_offload_copy(u->h_r, u->R, u->r_bytes, 1, u->ev_r[0], u->ev_r[1]);
+            u->r_out = 1;
+        }
         if (u->h_a1[i] && u->enc[i].a1_shared && train) {   /* a1 is dead until the encoder's backward: to the host while the coarser levels run */
             nn_offload_copy(u->h_a1[i], u->enc[i].a1, act_bytes_of(u->enc[i].ys), 1, u->ev_a1[i][0], u->ev_a1[i][1]);
             u->a1_out[i] = 1;

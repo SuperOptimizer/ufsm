@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include "pyramid.h"
 #include "sources.h"
+#include "split.h"
 #include "store.h"
 #include "unet.h"
 #include "z3w.h"
@@ -116,6 +117,104 @@ static int sheet_write_shard(const char *out,const float *q,int shard,int64_t z,
     int bad=fwrite(compressed,1,n,f)!=n; bad|=fclose(f)!=0; free(compressed); return bad?-1:0;
 }
 
+/* --split z: each window across two GPUs along z (src/split.h). GPU s holds the window planes [zoff, zoff + Dl) (its half plus
+   2^(nlev-1) halo planes toward the other) and runs the CT-stem forward on them; the halves exchange halo planes and sum the
+   GroupNorm statistics and the window's CT statistics, so the logits equal one GPU's. Each places the interior planes it owns into
+   its device shard buffer and copies those planes to the host shard; side 0 hands the shard to the writer. The two job threads take
+   turns on the host (split_run) and run the same sequence of collectives: the tile loop, the air decisions and the shard changes
+   are identical on both. */
+typedef struct { unet *u; uint8_t *ctd, *dsh, *own; uint32_t *ctm; void *stsc; float *dyd, *rows; double *red; int cuda_bad; } pside_t;
+typedef struct {
+    pside_t s[2];
+    reader_t *rd; writer_t *WR; const tile_t *tiles; long ntiles;
+    int W, halo, shard, Dl, H0, kss, h16, sign, sb, fail; int64_t ns[3], nss[3], bn[3], bo[3];
+    const axis *ax; double scale, t0; long ndone, nskip;
+} pjob_t;
+static void psplit_flush(pjob_t *J, int side, int64_t qz, int64_t qy, int64_t qx) {   /* both sides: the owned planes to the host shard; side 0 submits */
+    pside_t *S = &J->s[side];
+    const size_t pl = (size_t)J->shard * J->shard;
+    split_reduce(S->red, 1);   /* (side 0 has handed the previous shard to the writer: J->sb is this one's buffer; both have placed) */
+    uint8_t *sbuf = J->WR->buf[J->sb];
+    for (int z = 0; z < J->shard;) {
+        if (!S->own[z]) { z++; continue; }
+        int e = z; while (e < J->shard && S->own[e]) e++;
+        nn_d2h(sbuf + (size_t)z * pl, S->dsh + (size_t)z * pl, (size_t)(e - z) * pl);
+        z = e;
+    }
+    if (!side) for (int z = 0; z < J->shard; z++) if (!J->s[0].own[z] && !J->s[1].own[z]) memset(sbuf + (size_t)z * pl, 0, pl);   /* (before the barrier: side 1
+                                                                                                          may reset its marks right after it) */
+    split_reduce(S->red, 1);   /* both halves copied */
+    if (side) return;
+    if (writer_submit(J->WR, J->sb, qz, qy, qx)) J->fail = 1;
+    J->sb ^= 1;
+}
+static void psplit_mark(uint8_t *own, int shard, int64_t oz, int64_t ez, int zlo, int zhi) {   /* shard planes oz + [zlo, zhi) within [0, ez) */
+    for (int z = zlo; z < zhi; z++) { const int64_t g = oz + z; if (g >= 0 && g < ez && g < shard) own[g] = 1; }
+}
+static void psplit_job(int side, void *arg) {
+    pjob_t *J = arg; pside_t *S = &J->s[side]; reader_t *rd = J->rd;
+    const int W = J->W, Dl = J->Dl, H0 = J->H0, halo = J->halo, shard = J->shard;
+    const int zoff = side ? W / 2 - H0 : 0, olo = side ? W / 2 : 0, ohi = side ? W : W / 2;   /* window planes held / owned */
+    const int ilo = olo > halo ? olo : halo, ihi = ohi < W - halo ? ohi : W - halo;          /* owned interior planes */
+    const size_t pl = (size_t)W * W, l3 = (size_t)Dl * pl, sh3 = (size_t)shard * shard * shard;
+    const shape5 xs = {1, 4, Dl, W, W};
+    int64_t cur = -1, so[3] = {0, 0, 0}, se[3] = {0, 0, 0}, sz = 0, sy = 0, sx = 0; int any = 0;
+    for (long i = 0; i < J->ntiles; i++) {
+        pthread_mutex_lock(&rd->mu);
+        while (atomic_load(&rd->filled) <= i && !atomic_load(&rd->failed)) pthread_cond_wait(&rd->cv, &rd->mu);
+        pthread_mutex_unlock(&rd->mu);
+        const tile_t *t = &J->tiles[i];
+        if (J->kss == 1 && t->shard != cur) {   /* new shard: the previous one out */
+            if (cur >= 0 && any) psplit_flush(J, side, sz, sy, sx);
+            cur = t->shard; sz = cur / (J->ns[1] * J->ns[2]); sy = (cur / J->ns[2]) % J->ns[1]; sx = cur % J->ns[2];
+            so[0] = sz * shard; so[1] = sy * shard; so[2] = sx * shard;
+            for (int d = 0; d < 3; d++) se[d] = so[d] + shard < J->bn[d] ? so[d] + shard : J->bn[d];
+            nn_zero(S->dsh, sh3); memset(S->own, 0, (size_t)shard); any = 0;
+        }
+        const int bad = atomic_load(&rd->failed) && atomic_load(&rd->filled) <= i;
+        double h[4] = {0, 0, 0, (double)(bad || J->fail || S->cuda_bad)};
+        if (!bad) {   /* this half's planes up; the CT statistics over the planes it owns, summed over both */
+            nn_h2d(S->ctd, rd->buf[i % NSLOT] + (size_t)zoff * pl, l3);
+            size_t nz; double sum, sq;
+            nn_pred_stats(S->ctd + (size_t)(olo - zoff) * pl, (size_t)(W / 2) * pl, S->stsc, &nz, &sum, &sq);
+            h[0] = (double)nz; h[1] = sum; h[2] = sq;
+        }
+        nn_h2d(S->red, h, sizeof h); split_reduce(S->red, 4); nn_d2h(h, S->red, sizeof h);
+        pthread_mutex_lock(&rd->mu); if (atomic_load(&rd->consumed) < i + 1) atomic_store(&rd->consumed, i + 1); pthread_cond_broadcast(&rd->cv); pthread_mutex_unlock(&rd->mu);
+        if (h[3] > 0) { J->fail = J->fail ? J->fail : 2; return; }   /* (both halves see it at the same collective) */
+        if (h[0] == 0) { if (!side) J->nskip++; continue; }
+        const double w3 = (double)W * W * W, mean = h[1] / w3, var = h[2] / w3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
+        const int64_t o[3] = {J->bo[0] + t->tz, J->bo[1] + t->ty, J->bo[2] + t->tx};
+        for (int z = 0; z < Dl; z++) {   /* window origin relative to the axis at this half's slices */
+            double cy, cx;
+            axis_at(J->ax, (double)(o[0] + zoff + z) * J->scale, &cy, &cx);
+            cy /= J->scale; cx /= J->scale;
+            S->rows[z] = (float)((double)o[1] - cy); S->rows[Dl + z] = (float)((double)o[2] - cx);
+        }
+        nn_h2d(S->dyd, S->rows, 2 * (size_t)Dl * sizeof(float));
+        nn_pred_ctmask(S->ctd, l3, S->ctm);   /* the forward overwrites ctd */
+        const float *lg = unet_forward_ct(S->u, S->ctd, (float)mean, (float)(1.0 / sd), S->dyd, S->dyd + Dl, J->ax->n > 0 ? J->sign : 0, xs, J->h16);
+        if (J->kss > 1) {   /* every shard of this super-shard from the one window */
+            const int64_t SZ = t->shard / (J->nss[1] * J->nss[2]), SY = (t->shard / J->nss[2]) % J->nss[1], SX = t->shard % J->nss[2], k = J->kss;
+            for (int64_t qz = SZ * k; qz < SZ * k + k && qz < J->ns[0]; qz++) for (int64_t qy = SY * k; qy < SY * k + k && qy < J->ns[1]; qy++)
+            for (int64_t qx = SX * k; qx < SX * k + k && qx < J->ns[2]; qx++) {
+                const int64_t qo[3] = {qz * shard, qy * shard, qx * shard}, qe[3] = {qo[0] + shard < J->bn[0] ? qo[0] + shard : J->bn[0], qo[1] + shard < J->bn[1] ? qo[1] + shard : J->bn[1], qo[2] + shard < J->bn[2] ? qo[2] + shard : J->bn[2]};
+                nn_zero(S->dsh, sh3); memset(S->own, 0, (size_t)shard);
+                nn_pred_place_mz(lg, S->ctm, W, halo, olo, ohi, zoff, (int)(t->tz - qo[0]), (int)(t->ty - qo[1]), (int)(t->tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, S->dsh);
+                psplit_mark(S->own, shard, t->tz - qo[0], qe[0] - qo[0], ilo, ihi);
+                psplit_flush(J, side, qz, qy, qx);
+            }
+        } else {
+            nn_pred_place_mz(lg, S->ctm, W, halo, olo, ohi, zoff, (int)(t->tz - so[0]), (int)(t->ty - so[1]), (int)(t->tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, S->dsh);
+            psplit_mark(S->own, shard, t->tz - so[0], se[0] - so[0], ilo, ihi);
+            any = 1;
+        }
+        if (nn_check()) S->cuda_bad = 1;
+        if (!side) { J->ndone++; fprintf(stderr, "\rwindow %ld/%ld  %ld tiles (%ld air)  %.0fs   ", i + 1, J->ntiles, J->ndone, J->nskip, now() - J->t0); }
+    }
+    if (J->kss == 1 && cur >= 0 && any) psplit_flush(J, side, sz, sy, sx);
+}
+
 int cmd_predict(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window W] [--act-mx8 1]\n"
@@ -125,13 +224,15 @@ int cmd_predict(int argc, char **argv) {
                         "       [--reference reference.json]   required for a surface_winding checkpoint, native level 0\n"
                         "       [--grid-origin z,y,x]   anchor tile interiors in selected-level CT voxels, independent of the output box\n"
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n"
+                        "       [--split z --gpus 0,1]   both GPUs on every window, one z half each (window a multiple of 2^levels; default window shard + 128, halo 64)\n"
                         "       [--channel 0]   output channel written (band_affinity checkpoints: 1..6 = affinities z1 y1 x1 z8 y8 x8)\n"
                         "       [--radial-sign 1|-1]   -1 reverses the direction input (the CT is unchanged): a recto model then marks the verso face\n"
                         "       [--gn-save FILE]   pool the GroupNorm statistics of every window processed into FILE (calibration)\n"
                         "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n");
         fprintf(stderr, "  Default window: shard + 32 with halo 16 (one window per shard) when it fits the GPU, else 288 with halo 8. For exact shard tiling, window - 2*halo should divide the shard size: 544 with halo 16 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n"
                         "  Window - 2*halo = k * shard (k >= 2) with the box on that grid computes one window per k^3 shards (big GPUs: fewer, larger windows).\n"
-                        "  Inference memory: UFSM_INFER_SLAB=N (default 64) runs the level-0/1 convs in place in N-plane slabs (~27 B per window voxel; 0: ~43.5 B).\n");
+                        "  Inference memory: UFSM_INFER_SLAB=N (default 64) runs the level-0/1 convs in place in N-plane slabs; UFSM_INFER_OFFLOAD=1 (default) keeps\n"
+                        "  the coarse levels in the level-0 buffer's tail while it waits on the host: ~21.3 B per window voxel (0: ~27; slabs 0: ~43.5).\n");
         return 2;
     }
     const char *ckpt = argv[2], *root = argv[3], *key = argv[4], *out = argv[5];
@@ -218,10 +319,15 @@ int cmd_predict(int argc, char **argv) {
     int gpus[8], ngpu = 0, part = 0;
     { const char *gl = opt(argc, argv, "--gpus", nullptr); if (gl) { char *t = strdup(gl); for (char *q = strtok(t, ","); q && ngpu < 8; q = strtok(nullptr, ",")) gpus[ngpu++] = atoi(q); free(t); } }
     if (ngpu <= 1) { if (ngpu == 1) gpu = gpus[0]; ngpu = 1; }
-    if (ngpu > 1 && !box) { fprintf(stderr, "--gpus needs --box\n"); return 2; }
+    /* --split z --gpus a,b: both GPUs on every window, each on one z half (see psplit_job); a and b may be one GPU (a test) */
+    const int split = !strcmp(opt(argc, argv, "--split", "0"), "z");
+    if (split && (ngpu != 2 || sheet_task || ufsm_env_on("UFSM_PRED_HOSTPATH"))) { fprintf(stderr, "--split z needs --gpus with two devices (recto / affinity checkpoints, the device path)\n"); return 2; }
+    if (split) gpu = gpus[0];
+    const int nwork = split ? 1 : ngpu;   /* worker processes */
+    if (nwork > 1 && !box) { fprintf(stderr, "--gpus needs --box\n"); return 2; }
     if (sheet_task && ngpu>1) { fprintf(stderr,"winding export currently uses one GPU per output store\n"); return 2; }
     pid_t kids[8] = {0}; int is_child = 0;
-    if (ngpu > 1) {
+    if (nwork > 1) {
         for (int i = 0; i < ngpu; i++) {
             pid_t c = fork();
             if (c < 0) { perror("fork"); return 1; }
@@ -245,23 +351,39 @@ int cmd_predict(int argc, char **argv) {
     if (unet_load(u, ckpt) < 0) { fprintf(stderr, "cannot load %s\n", ckpt); return 1; }
     unet_use_ema(u, use_ema);
     const char *gn_save = opt(argc, argv, "--gn-save", nullptr), *gn_frozen = opt(argc, argv, "--gn-frozen", nullptr);
-    if (gn_save && ngpu > 1) { fprintf(stderr, "predict: --gn-save needs one GPU\n"); return 2; }
+    if (gn_save && (ngpu > 1 || split)) { fprintf(stderr, "predict: --gn-save needs one GPU\n"); return 2; }
+    float *gnh = nullptr;
     if (gn_frozen) {   /* header line UFSMGN{"nstats":N,...} then N float32 */
         FILE *f = fopen(gn_frozen, "rb"); char line[512]; long ns = -1;
         if (!f || !fgets(line, sizeof line, f) || strncmp(line, "UFSMGN{", 7) || !strstr(line, "\"nstats\":")) { fprintf(stderr, "predict: cannot read %s\n", gn_frozen); return 1; }
         ns = atol(strstr(line, "\"nstats\":") + 9);
         if (ns != (long)unet_gn_nstats(u)) { fprintf(stderr, "predict: %s holds %ld statistics, the network needs %zu\n", gn_frozen, ns, unet_gn_nstats(u)); return 1; }
-        float *h = malloc((size_t)ns * 4);
-        if (fread(h, 4, (size_t)ns, f) != (size_t)ns) { fprintf(stderr, "predict: %s is truncated\n", gn_frozen); return 1; }
-        fclose(f); unet_gn_freeze(u, h); free(h);
+        gnh = malloc((size_t)ns * 4);
+        if (fread(gnh, 4, (size_t)ns, f) != (size_t)ns) { fprintf(stderr, "predict: %s is truncated\n", gn_frozen); return 1; }
+        fclose(f);
     }
-    if (!sheet_task) unet_set_head_channels(u, out_ch, 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
-    /* the network takes the uint8 CT window itself (with in-place slabs the stem builds its input per slab: no 16-bit window) */
-    if (!sheet_task && !ufsm_env_on("UFSM_PRED_HOSTPATH")) unet_set_ct_input(u, 1);
-    if (cfg.scale_cond) {   /* voxel-size conditioning: the CT level's voxel size, or --scale-um to override */
-        const double sum_ = atof(opt(argc, argv, "--scale-um", "0"));
-        unet_set_scale(u, sum_ > 0 ? sum_ : um * (1 << level));
+    unet *u1 = nullptr;   /* --split: the network on the second GPU */
+    if (split) {
+        if (nn_init(gpus[1])) { fprintf(stderr, "cannot select GPU %d\n", gpus[1]); return 1; }
+        u1 = unet_create(&cfg);
+        if (unet_load(u1, ckpt) < 0) { fprintf(stderr, "cannot load %s\n", ckpt); return 1; }
+        unet_use_ema(u1, use_ema);
+        nn_init(gpu);
     }
+    for (int k = 0; k < 1 + split; k++) {
+        unet *uk = k ? u1 : u;
+        if (k) nn_init(gpus[1]);
+        if (gnh) unet_gn_freeze(uk, gnh);
+        if (!sheet_task) unet_set_head_channels(uk, out_ch, 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
+        /* the network takes the uint8 CT window itself (with in-place slabs the stem builds its input per slab: no 16-bit window) */
+        if (!sheet_task && !ufsm_env_on("UFSM_PRED_HOSTPATH")) unet_set_ct_input(uk, 1);
+        if (cfg.scale_cond) {   /* voxel-size conditioning: the CT level's voxel size, or --scale-um to override */
+            const double sum_ = atof(opt(argc, argv, "--scale-um", "0"));
+            unet_set_scale(uk, sum_ > 0 ? sum_ : um * (1 << level));
+        }
+        if (k) nn_init(gpu);
+    }
+    free(gnh);
     store *s = store_open(root);
     char ak[1200];
     snprintf(ak, sizeof ak, "%s/level%d", key, level);
@@ -270,7 +392,10 @@ int cmd_predict(int argc, char **argv) {
     const z3_meta *m = z3_meta_of(ct);
     int64_t bo[3] = {0, 0, 0}, bn[3] = {m->shape[0], m->shape[1], m->shape[2]};
     { const char *b = opt(argc, argv, "--box", nullptr); long long v[6]; if (b && sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) { for (int d = 0; d < 3; d++) { bo[d] = v[d]; bn[d] = v[3 + d]; } } }
-    if (!win_given && !sheet_task && bn[0] >= shard && bn[1] >= shard && bn[2] >= shard) {   /* default window: one per shard (shard + 2 x 16 halo) for boxes of whole shards when it fits this GPU, else 288 / 8.
+    const int H0 = 1 << (cfg.nlev - 1);   /* --split: halo planes of each half */
+    if (split && !win_given) { W = shard + 128; halo = 64; fprintf(stderr, "predict: window %d, halo %d (split default; --window / --halo set them; window - 2 halo = k * shard computes one window per k^3 shards)\n", W, halo); }
+    if (split && W % (2 * H0)) { fprintf(stderr, "--split z: the window must be a multiple of %d\n", 2 * H0); return 2; }
+    if (!split && !win_given && !sheet_task && bn[0] >= shard && bn[1] >= shard && bn[2] >= shard) {   /* default window: one per shard (shard + 2 x 16 halo) for boxes of whole shards when it fits this GPU, else 288 / 8.
                                           Desk widths, 512 shards, laptop: 16% less GPU time per shard than 8 windows of 288, peak 9.4 GB */
         const int Wc = shard + 32, div = 1 << (cfg.nlev - 1);
         if (Wc % div == 0) {
@@ -307,27 +432,49 @@ int cmd_predict(int argc, char **argv) {
        on the device, the interior probabilities placed into a device shard buffer that is downloaded once per shard */
     const int gpath = !ufsm_env_on("UFSM_PRED_HOSTPATH");
     WR.buf[0] = gpath ? nn_host_alloc(WR.bytes) : malloc(WR.bytes); WR.buf[1] = gpath ? nn_host_alloc(WR.bytes) : malloc(WR.bytes);
-    uint8_t *dsh = gpath ? nn_malloc(WR.bytes) : nullptr; void *stsc = nn_malloc(64); pthread_mutex_init(&WR.mu, nullptr); pthread_cond_init(&WR.cv, nullptr);
+    uint8_t *dsh = gpath && !split ? nn_malloc(WR.bytes) : nullptr; void *stsc = nn_malloc(64); pthread_mutex_init(&WR.mu, nullptr); pthread_cond_init(&WR.cv, nullptr);
     pthread_t wth; pthread_create(&wth, nullptr, writer_main, &WR);
     int sb = 0; uint8_t *sbuf = WR.buf[0];
     /* the window goes up as uint8; the input channels are built on the device in the network's storage type */
     const int h16 = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8");
     uint8_t *pu = gpath ? nullptr : malloc(w3), *pud = gpath ? nullptr : nn_malloc(w3);
     float *dyo = malloc(2 * (size_t)W * sizeof(float)), *dxo = dyo + W, *dyd = nn_malloc(2 * (size_t)W * sizeof(float)), *dxd = dyd + W;
-    shape5 xs = {1, 4, W, W, W};
+    const int Dl = split ? W / 2 + H0 : W;   /* planes per GPU */
+    shape5 xs = {1, 4, Dl, W, W};
     /* the 16-bit input in the network's shared a1 scratch when it has one (free until the stem conv, after the input conversion) */
     unet_build(u, xs, 0);
     const int ct_stem = unet_ct_stem(u);   /* unet_forward_ct: no 16-bit input */
-    /* the uint8 CT window in the network's level-0 skip buffer (free until the forward's input conversion); the output mask then
-       goes through a bit plane (the buffer does not survive the forward) */
-    uint8_t *ctd = gpath && !sheet_task ? unet_input_scratch2(u, w3) : nullptr;
-    const int ct_shared = ctd != nullptr;
-    if (!ctd) ctd = nn_malloc(w3);
-    uint32_t *ctm = ct_shared ? nn_malloc((w3 + 31) / 32 * 4) : nullptr;
-    void *xd = ct_stem ? nullptr : h16 && !sheet_task ? unet_input_scratch(u, 4 * w3 * 2) : nullptr;
-    const int xd_shared = xd != nullptr;
-    if (!xd && !ct_stem) xd = nn_malloc(4 * w3 * (h16 ? 2 : 4));
-    if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
+    uint8_t *ctd = nullptr; uint32_t *ctm = nullptr; void *xd = nullptr; int ct_shared = 0, xd_shared = 0;
+    pjob_t J = {0};
+    split_ctx *sctx = nullptr;
+    if (split) {   /* per GPU: the network on its half, the CT half in its scratch, the mask bits, a device shard */
+        const size_t l3 = (size_t)Dl * W * W;
+        for (int k = 0; k < 2; k++) {
+            unet *uk = k ? u1 : u; pside_t *S = &J.s[k];
+            nn_init(gpus[k]);
+            unet_set_split(uk, k, H0, split_halo); unet_set_split_async(uk, split_halo_begin, split_halo_end);
+            unet_build(uk, xs, 0);
+            S->u = uk; S->ctd = unet_input_scratch2(uk, l3);
+            if (!unet_ct_stem(uk) || !S->ctd) { fprintf(stderr, "--split z needs the CT-stem build (UFSM_INFER_SLAB > 0, MX-fp8 stem input)\n"); return 2; }
+            S->ctm = nn_malloc((l3 + 31) / 32 * 4); S->dsh = nn_malloc(WR.bytes); S->stsc = nn_malloc(64); S->red = nn_malloc(4 * sizeof(double));
+            S->dyd = nn_malloc(2 * (size_t)Dl * sizeof(float)); S->rows = malloc(2 * (size_t)Dl * sizeof(float)); S->own = calloc((size_t)shard, 1);
+            if (!S->ctm || !S->dsh || !S->stsc || !S->red || !S->dyd) { fprintf(stderr, "predict: out of device memory on GPU %d\n", gpus[k]); return 1; }
+            fprintf(stderr, "predict: GPU %d holds window planes [%d, %d) of %d (%.1f B per voxel held, %.2f GB)\n", gpus[k], k ? W / 2 - H0 : 0, (k ? W / 2 - H0 : 0) + Dl, W, (double)unet_activation_bytes(uk) / l3, unet_activation_bytes(uk) / 1e9);
+        }
+        nn_init(gpu);
+        sctx = split_create(gpus[0], gpus[1]);
+    } else {
+        /* the uint8 CT window in the network's level-0 skip buffer (free until the forward's input conversion); the output mask then
+           goes through a bit plane (the buffer does not survive the forward) */
+        ctd = gpath && !sheet_task ? unet_input_scratch2(u, w3) : nullptr;
+        ct_shared = ctd != nullptr;
+        if (!ctd) ctd = nn_malloc(w3);
+        ctm = ct_shared ? nn_malloc((w3 + 31) / 32 * 4) : nullptr;
+        xd = ct_stem ? nullptr : h16 && !sheet_task ? unet_input_scratch(u, 4 * w3 * 2) : nullptr;
+        xd_shared = xd != nullptr;
+        if (!xd && !ct_stem) xd = nn_malloc(4 * w3 * (h16 ? 2 : 4));
+        if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
+    }
     int64_t ns[3];
     for (int d = 0; d < 3; d++) ns[d] = (bn[d] + shard - 1) / shard;
     /* interior = k whole shards (k >= 2, the tile grid on the shard grid): one window per k^3 shards, each shard placed from it and
@@ -341,13 +488,13 @@ int cmd_predict(int argc, char **argv) {
     reader_t rd = {0}; rd.ct = ct; rd.bo = bo; rd.W = W; rd.nthreads = nthreads;
     long cap = 0;
     if (kss > 1) for (int64_t sz = 0; sz < nss[0]; sz++) for (int64_t sy = 0; sy < nss[1]; sy++) for (int64_t sx = 0; sx < nss[2]; sx++) {   /* super-shards */
-        if (ngpu > 1 && (((sz * nss[1] + sy) * nss[2] + sx) % ngpu) != part) continue;
+        if (nwork > 1 && (((sz * nss[1] + sy) * nss[2] + sx) % ngpu) != part) continue;
         if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
         rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx};
     }
     if (kss == 1) for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
         int64_t so[3] = {sz * shard, sy * shard, sx * shard}, se[3], first[3];
-        if (ngpu > 1 && (((sz * ns[1] + sy) * ns[2] + sx) % ngpu) != part) continue;   /* another worker's shard */
+        if (nwork > 1 && (((sz * ns[1] + sy) * ns[2] + sx) % ngpu) != part) continue;   /* another worker's shard */
         for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
         for (int d = 0; d < 3; d++) {
             int64_t phase = grid ? (bo[d] + so[d] - grid_origin[d]) % stride : 0;
@@ -372,6 +519,17 @@ int cmd_predict(int argc, char **argv) {
     int any = 0;
     const int pprof = ufsm_env_on("UFSM_PRED_PROF");
     double p_wait = 0, p_h2d = 0, p_gpu = 0, p_copy = 0, p_wr = 0, pt;
+    if (split) {   /* both GPUs on every window */
+        J.rd = &rd; J.WR = &WR; J.tiles = rd.tiles; J.ntiles = rd.ntiles;
+        J.W = W; J.halo = halo; J.shard = shard; J.Dl = Dl; J.H0 = H0; J.kss = kss; J.h16 = h16; J.sign = (int)radial_sign;
+        for (int d = 0; d < 3; d++) { J.ns[d] = ns[d]; J.nss[d] = nss[d]; J.bn[d] = bn[d]; J.bo[d] = bo[d]; }
+        J.ax = &ax; J.scale = scale; J.t0 = t0;
+        split_run(sctx, psplit_job, &J);
+        for (int k = 0; k < 2; k++) { nn_init(gpus[k]); const char *e = nn_check(); if (e) { fprintf(stderr, "cuda (GPU %d): %s\n", gpus[k], e); J.fail = 3; } }
+        nn_init(gpu);
+        if (J.fail) { fprintf(stderr, "\npredict: the split run failed (%s)\n", J.fail == 1 ? z3w_error() : J.fail == 2 ? z3_error() : "device error"); return 1; }
+        ntiles = J.ndone; nskip = J.nskip;
+    } else
     for (long i = 0; i < rd.ntiles; i++) {
         pt = now();
         pthread_mutex_lock(&rd.mu);
@@ -514,7 +672,11 @@ int cmd_predict(int argc, char **argv) {
         if (fwrite(h, 4, ns, f) != ns || fclose(f)) { fprintf(stderr, "predict: cannot write %s\n", gn_save); return 1; }
         fprintf(stderr, "GroupNorm statistics of %ld windows -> %s\n", nw, gn_save); free(h);
     }
-    if (ngpu > 1) { fprintf(stderr, "gpu %d: %ld tiles in %.0fs\n", gpu, ntiles, now() - t0); z3_close(ct); store_close(s); unet_free(u); return 0; }   /* worker: the parent builds the pyramid */
+    if (split) {
+        for (int k = 0; k < 2; k++) { pside_t *S = &J.s[k]; nn_init(gpus[k]); nn_free(S->ctm); nn_free(S->dsh); nn_free(S->stsc); nn_free(S->red); nn_free(S->dyd); free(S->rows); free(S->own); }
+        nn_init(gpus[1]); unet_free(u1); nn_init(gpu); split_free(sctx);
+    }
+    if (nwork > 1) { fprintf(stderr, "gpu %d: %ld tiles in %.0fs\n", gpu, ntiles, now() - t0); z3_close(ct); store_close(s); unet_free(u); return 0; }   /* worker: the parent builds the pyramid */
     for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
     if (pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs)) return 1;
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs)\n", out, ntiles, now() - t0);

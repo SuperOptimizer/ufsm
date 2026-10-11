@@ -119,7 +119,7 @@ $(B)/test_unet: tests/test_unet.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_gn_frozen: tests/test_gn_frozen.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-$(B)/test_infer_mem: tests/test_infer_mem.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_infer_mem: tests/test_infer_mem.c $(B)/unet.o $(B)/split.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_split: tests/test_split.c $(B)/unet.o $(B)/split.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm

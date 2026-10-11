@@ -134,6 +134,7 @@ void *unet_input_scratch(unet *u, size_t bytes);
 void *unet_input_scratch2(unet *u, size_t bytes);   /* inference: enc[0].a2's buffer, free until the forward's input conversion (predict: the uint8 CT) */
 void unet_set_infer_alias(int on);
 void unet_set_infer_slab(int planes);   /* inference: level-0 convs in place in z-slabs of this many planes (UFSM_INFER_SLAB; 0 off) */   /* inference aliasing of the network input and the logits into level-0 buffers (UFSM_INFER_ALIAS, default 1) */   /* inference build: scratch for the 16-bit network input (or nullptr) */
+void unet_set_infer_offload(int on);   /* inference with level-1 slabs: the coarse levels in the tail of the level-0 buffer, which waits on the host (UFSM_INFER_OFFLOAD, default 1) */
 void unet_set_ct_input(unet *u, int on);   /* inference input is the uint8 CT window (unet_forward_ct); with slabs the stem builds its input per slab */
 int unet_ct_stem(const unet *u);             /* built so: unet_forward_ct applies */
 const float *unet_forward_ct(unet *u, const uint8_t *ct, float mean, float isd, const float *dyo, const float *dxo, int axis, shape5 xs, int h16);   /* predict: CT window + axis rows (nn_pred_input's arguments) */

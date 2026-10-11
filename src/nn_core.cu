@@ -184,10 +184,12 @@ extern "C" void nn_set_storage(const void *p, size_t bytes, int dt) {
     if (g_nreg >= NN_MAXREG) { fprintf(stderr, "nn_set_storage: registry full\n"); abort(); }
     g_reg[g_nreg].p = (const char *)p; g_reg[g_nreg].n = bytes; g_reg[g_nreg].dt = dt; g_nreg++;
 }
+/* the innermost registration containing p: a buffer placed inside another one (an inference temp in a level buffer) keeps its own type */
 extern "C" int nn_storage(const void *p) {
     const char *c = (const char *)p;
-    for (int i = 0; i < g_nreg; i++) if (c >= g_reg[i].p && c < g_reg[i].p + g_reg[i].n) return g_reg[i].dt;
-    return 0;
+    int dt = 0; size_t n = SIZE_MAX;
+    for (int i = 0; i < g_nreg; i++) if (c >= g_reg[i].p && c < g_reg[i].p + g_reg[i].n && g_reg[i].n < n) { dt = g_reg[i].dt; n = g_reg[i].n; }
+    return dt;
 }
 extern "C" size_t nn_mx8_bytes(shape5 s) { int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw + 1); }   /* = lp_mx8_bytes */
 extern "C" size_t nn_mx4_bytes(shape5 s) { int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw / 2 + 1); }   /* = lp_mx4_bytes */

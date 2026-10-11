@@ -1008,7 +1008,7 @@ void zs_range(int D, int *lo, int *hi);
 size_t zs_len(size_t len, int D);
 void zs_reduce(double *b, int n);
 split_t zs_split(split_t sp, int D);
-extern int g_zr_z0, g_zr_Di, g_zr_first, g_zr_last, g_zr_Do;
+extern thread_local int g_zr_z0, g_zr_Di, g_zr_first, g_zr_last, g_zr_Do, g_zr_zo;
 size_t zr_len(size_t len, int D);   /* zs_len, or the whole depth of a z-range */
 int zr_zero(void);                  /* zero the output GroupNorm sums (not a z-range, or its first slab) */
 int zr_final(void);                 /* finalise them (not a z-range, or its last slab) */

@@ -170,7 +170,18 @@ z-range in the MX forward kernels (`split_t.zi0 / Di`, `nn_set_zrange`) into a t
 GroupNorm sums accumulated over the slabs, and the stem built per slab from the uint8 CT (`unet_forward_ct`). Output
 byte-identical to the previous layout; on the 16 GB laptop GPU the largest fast window goes from < 640 to 800 (interior 512
 with halo 144), at +2.5% forward time (W 640). predict computes one window per k^3 shards when the interior is k whole
-shards. Phase 3 (host offload of the level-0 skip) not needed for the target window.
+shards.
+
+Phase 3 and the split (same day): with the coarse offload (`UFSM_INFER_OFFLOAD`, default 1) the coarse levels live in the tail
+of the level-0 buffer X, whose last planes wait in pinned host memory from enc[0]'s end to dec[0]'s conv1 (~2.8 B per voxel
+each way, overlapped with down0 and dec[0]'s conv1); the level-1 buffer Y holds the level-0 slab temps and the stem input while
+it is free, and down0's output, which enc[1]'s conv1 now reads in place; dec[0]'s conv1 takes its temp from R, then from Y's
+consumed coarse planes. 26.8 -> 21.3 B per window voxel (X 17 + Y 4.25), logits byte-identical, forward time unchanged
+(W 640 +0.5%, noise); largest fast window on the laptop 800 -> 896. In-place slabs now run under the spatial split (z-range
+aware owned-plane statistics, per-thread z-range), and `predict --split z --gpus 0,1` runs each window on both GPUs (a half
+plus 32 halo planes each; CT statistics and GroupNorm sums reduced across them): 21.4 B per held voxel, so a 1024^3 window
+needs ~12.2 GB per GPU. Byte-identical to one GPU on the Paris4 box (window 576; 320 with 128 shards, both tilings), halves
+emulated on the laptop's one GPU. Two real GPUs not yet run.
 
 ## Memory and inference defaults (2026-10-08)
 

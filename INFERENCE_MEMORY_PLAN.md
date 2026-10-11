@@ -281,6 +281,8 @@ Report `UFSM_PRED_PROF=1` and `UFSM_PROF=layers` before and after.
 | before | 56.45 | |
 | phase 1 (aliasing) | 43.45 | `UFSM_INFER_ALIAS` (default 1) |
 | phase 2 + 2b (in-place slabs at levels 0 and 1, stem from the CT) | 26.0-28.2 (W 544-1024; 32-plane slabs ~1 B less than 64) | `UFSM_INFER_SLAB=N` planes (default 64; 0 = phase 1) |
+| phase 3 (coarse levels in X's tail, which waits on the host) | 21.3 (W 512-1024) | `UFSM_INFER_OFFLOAD` (default 1; 0 = phase 2) |
+| split (`predict --split z --gpus a,b`) | 21.4 per voxel held (half + 32 halo planes) | per run |
 
 - Phase 1 exactly as planned, except 1.3: `pred_place` reads the CT after the forward (output mask), so the CT
   window cannot simply move into enc[0].a2's buffer; a CT != 0 bit plane (0.125 B) carries the mask
@@ -293,13 +295,31 @@ Report `UFSM_PRED_PROF=1` and `UFSM_PROF=layers` before and after.
 - Phase 2b: `unet_forward_ct` builds the stem's MX-fp8 input per slab from the uint8 CT (`nn_pred_input_mx8`, bit for
   bit the 16-bit input + conversion); predict keeps the CT at the end of X, i.e. X's last scale planes, which the carry
   order overwrites only once dead.
-- Phase 3 not implemented: phase 2 reaches the target window (interior 512, halo 128 = W 768) on 16 GB; it would save
-  ~4 B per voxel more (T1 / T2 / the deeper levels inside X's buffer while X is on the host) for 34 B per voxel of PCIe.
+- Phase 3, reworked so that only part of X travels: R = the last ~2.8 B per voxel of X's data rows (planes zr..), copied to
+  pinned host memory after enc[0] (overlapped with down0) and back during dec[0]'s conv1. R holds every coarse buffer meanwhile
+  (T1, T2, the skips below level 1, the level-1 slab temp and carry). Y holds the level-0 slab temp and the stem input while it
+  is free (stem, enc[0].c2, dec[0].c2) and down0's output, placed at the data rows of Y's last block(s) so that enc[1]'s conv1
+  runs in place over it with the same carry rule. dec[0]'s conv1 cannot use Y (it reads the up source there): its temp is R
+  for the first slabs, then Y's consumed coarse planes (block 0's data rows below (z0 >> 1) - 3, slabs growing with z0); R's
+  copy back starts at that switch and is waited for before a slab reaches zr. Peak = X + Y + one carry plane: 21.3 B per
+  voxel, logits identical, no measurable time; the registry now resolves a pointer to its innermost registration (the fp8
+  stem input inside Y).
+- Split: the z-range kernels already restricted the statistics per launch (`split_t.zlo / zhi`); under a z-range they are
+  the owned planes of the depth-Do tensor that fall into the slab (`zs_split`), the count is the window's (`zr_len`), and the
+  z-range state is per host thread (the halves hand over inside a statistics reduction). `predict --split z`: each GPU holds
+  window planes [0, W/2 + 32) or [W/2 - 32, W) in its own network, reduces the CT statistics of its owned planes with the
+  other, places its owned interior planes and copies them into the host shard (side 0 submits). Both halves on one GPU
+  (`--gpus 0,0`) is the test mode.
+- Not done (the floor of this design): Y beside X at down0 and dec[0]'s conv1. Removing it needs down0's output and the up
+  source streamed through the host (an up-source z offset in the MX kernels' up staging, a ring of coarse planes per slab,
+  a slab head writing the logits into X's consumed planes): ~18-18.5 B per voxel for ~21 B per voxel more PCIe traffic. With
+  the split it would allow W 1152 (interior 1024 = 2 x 512 shards, halo 64, 1.42x compute per output voxel); phase 3 already
+  allows W 1024 with 128 shards (interior 896, halo 64, 1.49x).
 - Tiling: interior = k x shard (k >= 2, box on the stride grid) computes one window per k^3 shards (checked: shard 128
   with interior 256 gives the same volume as shard 256 from 8 instead of 64 windows).
 - Measured (laptop, verso3, Paris4 48512,17408,16384 512^3): every window size byte-identical to the old layout;
   largest fast window (this GPU spills to host memory rather than failing): < 640 before, 672 after phase 1, 800
-  after phase 2 (832 spills). Forward time at W 640 (interleaved, +-15% run-to-run): +2.5% with 64-plane slabs,
+  after phase 2 (832 spills), 896 after phase 3 (928 spills). Forward time at W 640 (interleaved, +-15% run-to-run): +2.5% with 64-plane slabs,
   +5.5% with 32. tests/test_infer_mem.c covers phases 1, 2 and 2b.
 
 ## Notes for the implementer

@@ -27,7 +27,7 @@ void nn_h2d(void *dst, const void *src, size_t bytes);
 void nn_d2h(void *dst, const void *src, size_t bytes);
 void nn_d2d(void *dst, const void *src, size_t bytes);
 void nn_d2d_async(void *dst, const void *src, size_t bytes);   /* on the default stream, no host sync */
-void nn_set_zrange(int z0, int Di, int first, int last, int Do);   /* z-range of the next MX forward convs (see nn_bwd.cu): input planes z0 + .. of a depth-Di input; Do output planes in all; Di 0 = off */
+void nn_set_zrange(int zi0, int Di, int first, int last, int Do, int zo);   /* z-range of the next MX forward convs (see nn_bwd.cu): output planes zo + .. of Do, reading input planes zi0 + .. of a depth-Di input; Di 0 = off */
 void nn_sync(void);
 void *nn_host_alloc(size_t bytes);       /* pinned host memory */
 void *nn_host_alloc_try(size_t bytes);   /* the same, nullptr when the host cannot pin that much */
@@ -306,6 +306,7 @@ void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, 
 void nn_pred_stats(const uint8_t *ct, size_t n, void *scratch, size_t *nz, double *sum, double *sq);   /* exact window stats (scratch: 24 B device) */
 void nn_pred_ctmask(const uint8_t *ct, size_t n, uint32_t *bits);   /* CT != 0 as bits ((n + 31) / 32 words) */
 void nn_pred_place_m(const float *lg, const uint32_t *bits, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);   /* nn_pred_place with the CT mask as bits */
+void nn_pred_place_mz(const float *lg, const uint32_t *bits, int W, int halo, int zlo, int zhi, int zoff, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);   /* the same from a split half: lg / bits hold window planes [zoff, ..), window planes [zlo, zhi) placed */
 
 #ifdef __cplusplus
 }

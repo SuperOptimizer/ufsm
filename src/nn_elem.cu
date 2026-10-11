@@ -457,6 +457,24 @@ extern "C" void nn_pred_place_m(const float *lg, const uint32_t *bits, int W, in
     const size_t I = (size_t)(W - 2 * halo);
     pred_place_m_k<<<nblk(I * I * I, 256), 256>>>(lg, bits, W, halo, oz, oy, ox, ez, ey, ex, shard, dsh); KCHECK();
 }
+/* a window held as planes [zoff, zoff + D) (one half of a split window): its window planes [zlo, zhi) (owned, inside the interior) */
+__global__ void pred_place_mz_k(const float *lg, const uint32_t *bits, int W, int halo, int zlo, int nz, int zoff, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    const int I = W - 2 * halo;
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)nz * I * I) return;
+    const int x = halo + (int)(i % I), y = halo + (int)((i / I) % I), z = zlo + (int)(i / ((size_t)I * I));
+    const int gz = oz + z, gy = oy + y, gx = ox + x;
+    if (gz < 0 || gz >= ez || gy < 0 || gy >= ey || gx < 0 || gx >= ex) return;
+    const size_t k = ((size_t)(z - zoff) * W + y) * W + x;
+    dsh[((size_t)gz * shard + gy) * shard + gx] = (bits[k >> 5] >> (k & 31)) & 1u ? (uint8_t)(255.f / (1.f + __expf(-lg[k])) + 0.5f) : 0;
+}
+extern "C" void nn_pred_place_mz(const float *lg, const uint32_t *bits, int W, int halo, int zlo, int zhi, int zoff, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    if (zlo < halo) zlo = halo;
+    if (zhi > W - halo) zhi = W - halo;
+    if (zhi <= zlo) return;
+    const size_t I = (size_t)(W - 2 * halo);
+    pred_place_mz_k<<<nblk((size_t)(zhi - zlo) * I * I, 256), 256>>>(lg, bits, W, halo, zlo, zhi - zlo, zoff, oz, oy, ox, ez, ey, ex, shard, dsh); KCHECK();
+}
 __global__ void pred_stats_k(const uint8_t *ct, size_t n, unsigned long long *acc) {
     unsigned long long nz = 0, sm = 0, sq = 0;
     for (size_t i = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) * 16; i < n; i += (size_t)gridDim.x * blockDim.x * 16) {
