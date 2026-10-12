@@ -283,6 +283,21 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   normals median 5 degrees. Fitter knobs do not rescue bad phase: gradient-only fits 27% (oracle fields: 53%, so the phase is
   essential), node unwrapping 41%, flood confidence thresholds 0.2-0.6 no gain, a model-referenced phase-consistency quality
   map +3 to +7 points (not kept).
+- Wrap placement on block B (9-block 48k 9.6 um net, out of sample): vertex distance to the nearest labelled sheet median 2.0
+  native voxels, p75 4.5, p90 11.5; 72.7% within 4, 84.9% within 8, 6.8% beyond 16 (labels cover 25 segment groups, so part of
+  the tail is unlabelled sheet). `ufsm wraps --snap ROOT KEY [--snap-range 0.35] [--snap-min 0.5]` moves each vertex along its
+  ray to the recto maximum within +- range pitches (the predict output; origin_zyx from its attributes; tiles of 64 x 512
+  vertices read only their box) and median-filters the displacements over 5 x 5 vertices: no gain with the 9.6 um recto
+  (within 4: 71.7%); kept opt-in for 2.4 um recto. `ufsm wrapdist <wraps> <labels-root> <labels-key>` measures this (the
+  labels' key is their um; z-chunks with --max rows of overlap, exact up to --max) on src/edt.c, an exact threaded distance
+  transform (Felzenszwalb-Huttenlocher, float32 squared distances, 4 B/voxel; tests/test_edt vs brute force; 256^3 in 0.15 s):
+  block B 12.7 s, 1.35 GB, the same numbers as the scipy analysis it replaces (30+ min, up to 23 GB; heavy compute stays out
+  of Python).
+- Laptop memory: three WSL VM restarts (2026-10-10/11/12) were OOM kills of my own jobs with RAM and the 16 GB swap full (a
+  scipy EDT over 851M voxels, `ufsm band` on a whole block with 16 threads (27 GB), a 23 GB ufsm job); Windows then restarts the
+  24 GB VM. Heavy laptop jobs now run in a systemd user slice capped at 18 GB + 2 GB swap (~/ufsm-data/capped.sh), and
+  `ufsm band` refuses boxes needing more than 80% of the memory it can get (24 B per label voxel vs MemAvailable and the cgroup
+  limit), pointing at phase-raster + band --phase-raster.
 - Left: BigTIFF for renders over 4 GB compressed; 9.6 um training on all of Paris4 (desk band codes); the desk runs.
 
 ## Half-resolution networks (2026-10-11)

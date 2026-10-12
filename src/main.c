@@ -2,6 +2,7 @@
 #include "sample.h"
 #include "sources.h"
 #include "band.h"
+#include "edt.h"
 #include "store.h"
 #include "zarr3.h"
 #include "fit.h"
@@ -283,6 +284,29 @@ static int cmd_phase_raster(int argc, char **argv) {
    [--phase phase.raw]
    Band field (src/band.h) of a native-voxel box (even origin and size) from a winding_mod14 raster level (label grid, 2 native
    voxels per label voxel): writes the band per label voxel, (nz/2) x (ny/2) x (nx/2) uint8, 0..251 or 255 unknown. */
+/* bytes this process may still allocate: MemAvailable, capped by its cgroup's memory.max minus memory.current (e.g. inside
+   ~/ufsm-data/capped.sh's ufsm.slice); 0 when unknown */
+static size_t mem_available(void) {
+    size_t avail = 0; char line[512];
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (f) { while (fgets(line, sizeof line, f)) { unsigned long long kb; if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) { avail = (size_t)kb << 10; break; } } fclose(f); }
+    f = fopen("/proc/self/cgroup", "r");
+    if (f) {
+        if (fgets(line, sizeof line, f) && !strncmp(line, "0::", 3)) {
+            line[strcspn(line, "\n")] = 0;
+            for (char *dir = line + 3; *dir; ) {   /* this cgroup and its ancestors: the tightest max - current */
+                char pm[700], pc[700]; snprintf(pm, sizeof pm, "/sys/fs/cgroup%s/memory.max", dir); snprintf(pc, sizeof pc, "/sys/fs/cgroup%s/memory.current", dir);
+                FILE *a = fopen(pm, "r"), *b = fopen(pc, "r"); unsigned long long mx = 0, cur = 0; int lim = 0;
+                if (a) { lim = fscanf(a, "%llu", &mx) == 1; fclose(a); }
+                if (b) { if (fscanf(b, "%llu", &cur) != 1) cur = 0; fclose(b); }
+                if (lim && mx > cur && (!avail || mx - cur < avail)) avail = (size_t)(mx - cur);
+                char *sl = strrchr(dir, '/'); if (!sl || sl == dir) break; *sl = 0;
+            }
+        }
+        fclose(f);
+    }
+    return avail;
+}
 static int cmd_band(int argc, char **argv) {
     if (argc < 6) { fprintf(stderr, "usage: ufsm band <codes-root> <key> z,y,x,nz,ny,nx <out.raw> [--axis A] [--radius 80] [--span 75]\n"); return 2; }
     long long b[6];
@@ -328,6 +352,12 @@ static int cmd_band(int argc, char **argv) {
     }
     const int ffh = atoi(opt(argc, argv, "--fit-h", "8"));   /* field voxel edge, native voxels (even) */
     if (ff_dir && (ffh < 2 || ffh % 2 || b[3] % ffh || b[4] % ffh || b[5] % ffh)) { fprintf(stderr, "band: --fit-h must be even and divide the box\n"); return 2; }
+    {   /* the whole haloed box in memory: ~24 bytes per label voxel (5 arrays + the band field's distance maps); refuse rather than
+           drive the 24 GB WSL VM into swap and a restart (block B, 1.2e9 voxels: 27 GB). Big boxes: ufsm phase-raster (blockwise),
+           then band --fit-fields --phase-raster */
+        const double need = 24.0 * (double)N; const size_t av = mem_available();
+        if (av && need > 0.8 * (double)av) { fprintf(stderr, "band: the %.2fe9-voxel box needs ~%.1f GB, %.1f GB available; use a smaller box, or ufsm phase-raster (blockwise) and band --fit-fields --phase-raster\n", N / 1e9, need / 1e9, av / 1e9); return 2; }
+    }
     uint8_t *codes = calloc(N, 1), *band = malloc(N), *side = side_path ? malloc(N) : nullptr, *phase = phase_path || ff_dir ? malloc(N) : nullptr,
             *spacing = ff_dir ? malloc(N) : nullptr;
     int64_t ro[3], rn[3];   /* the in-bounds part of the haloed box; outside stays empty */
@@ -484,10 +514,92 @@ static int cmd_fit(int argc, char **argv) {
 }
 
 /* ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4] [--threads 16]
+   [--snap ROOT KEY [--snap-range 0.35] [--snap-min 0.5] [--snap-origin z,y,x]]
    One tifxyz per wrap of a fitted winding model (ufsm fit --out): wrap k is the level set W = k. Rows every step native voxels in
    z, columns every step / r_k radians of theta over the box's angular range (r_k: the wrap's radius at the box centre), each
    vertex the root of W = k along the ray from the umbilicus (src/fit.h fit_ray_root); vertices outside the box, without a root,
    or (--fields) in a field voxel without data are -1. Coordinates are global native voxels. */
+static float trilin(const uint8_t *v, const int64_t n[3], double z, double y, double x);
+/* ufsm wraps --snap: each vertex moved along its ray from the axis to the recto maximum within +- range pitches, read from a
+   recto probability array on the model's native grid (array voxel = native - ro), when that maximum is >= pmin; then the
+   displacements are median-filtered over 5 x 5 vertices so a stray peak cannot tear the surface. Tiles of rows x columns read
+   only their own box (plus the search range); the vertices of a tile run on threads. */
+typedef struct { const fit_model *m; const uint8_t *vol; int64_t o[3], n[3]; const float *px, *py, *pz; float *disp; int cols, r0, r1, c0, c1;
+                 double range, pmin; _Atomic int next; } snap_job;
+static double model_pitch(const fit_model *m, double z) {
+    double k = z / m->knot_dz; if (k < 0) k = 0; if (k > m->nk - 1) k = m->nk - 1;
+    int k0 = (int)k; if (k0 > m->nk - 2) k0 = m->nk - 2 < 0 ? 0 : m->nk - 2;
+    return m->nk > 1 ? m->pitch[k0] + (k - k0) * (m->pitch[k0 + 1] - m->pitch[k0]) : m->pitch[0];
+}
+static void *snap_rows(void *arg) {
+    snap_job *J = arg; const fit_model *m = J->m; const int na = (int)(m->D * m->h) + 1;
+    for (int r; (r = J->r0 + atomic_fetch_add(&J->next, 1)) < J->r1;) for (int c = J->c0; c < J->c1; c++) {
+        const size_t i = (size_t)r * J->cols + c; if (J->pz[i] < 0) continue;
+        const double zl = J->pz[i] - m->origin[0], zi = fmin(fmax(zl, 0), na - 1);
+        const double cy = m->cy[(int)zi] + m->origin[1], cx = m->cx[(int)zi] + m->origin[2];
+        double uy = J->py[i] - cy, ux = J->px[i] - cx; const double ul = hypot(uy, ux); if (ul < 1e-6) continue; uy /= ul; ux /= ul;
+        const double R = J->range * model_pitch(m, zl);
+        float best = -1; double bt = 0;
+        for (double t = -R; t <= R; t += 0.5) {
+            const float v = trilin(J->vol, J->n, J->pz[i] - J->o[0], J->py[i] + t * uy - J->o[1], J->px[i] + t * ux - J->o[2]);
+            if (v > best) { best = v; bt = t; }
+        }
+        if (best >= J->pmin * 255) J->disp[i] = (float)bt;
+    }
+    return nullptr;
+}
+static int cmp_fl(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
+static size_t wraps_snap(z3 *rz, const int64_t ro[3], const fit_model *m, int rows, int cols, float *px, float *py, float *pz, double range, double pmin, int nthreads) {
+    const size_t nv = (size_t)rows * cols; float *disp = malloc(nv * 4); for (size_t i = 0; i < nv; i++) disp[i] = NAN;
+    const z3_meta *zm = z3_meta_of(rz); double pmax = 0; for (int k = 0; k < m->nk; k++) if (m->pitch[k] > pmax) pmax = m->pitch[k];
+    const int TR = 64, TC = 512; const double mar = range * pmax + 3;
+    for (int r0 = 0; r0 < rows; r0 += TR) for (int c0 = 0; c0 < cols; c0 += TC) {
+        const int r1 = r0 + TR < rows ? r0 + TR : rows, c1 = c0 + TC < cols ? c0 + TC : cols;
+        double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+        for (int r = r0; r < r1; r++) for (int c = c0; c < c1; c++) {
+            const size_t i = (size_t)r * cols + c; if (pz[i] < 0) continue;
+            const double v[3] = {pz[i], py[i], px[i]}; for (int d = 0; d < 3; d++) { if (v[d] < lo[d]) lo[d] = v[d]; if (v[d] > hi[d]) hi[d] = v[d]; }
+        }
+        if (lo[0] > hi[0]) continue;
+        snap_job J = {m, nullptr, {0, 0, 0}, {0, 0, 0}, px, py, pz, disp, cols, r0, r1, c0, c1, range, pmin, 0};
+        int ok = 1;
+        for (int d = 0; d < 3; d++) {
+            const double g = d ? mar : 2;   /* rays are horizontal: the search moves y / x only */
+            int64_t a = (int64_t)floor(lo[d] - g) - ro[d], b = (int64_t)ceil(hi[d] + g) + 1 - ro[d];
+            if (a < 0) a = 0;
+            if (b > zm->shape[d]) b = zm->shape[d];
+            if (b <= a) ok = 0;
+            J.o[d] = a + ro[d]; J.n[d] = b - a;
+        }
+        if (!ok) continue;
+        uint8_t *vol = malloc((size_t)J.n[0] * J.n[1] * J.n[2]);
+        const int64_t ao[3] = {J.o[0] - ro[0], J.o[1] - ro[1], J.o[2] - ro[2]};
+        if (!vol || z3_read(rz, ao, J.n, vol, nthreads)) { free(vol); continue; }
+        J.vol = vol;
+        pthread_t th[64]; const int nt = nthreads < 64 ? (nthreads > 0 ? nthreads : 1) : 64;
+        for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, snap_rows, &J);
+        for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+        free(vol);
+    }
+    size_t moved = 0; float *med = malloc(nv * 4); float win[25];
+    for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) {
+        const size_t i = (size_t)r * cols + c; med[i] = NAN; if (pz[i] < 0) continue;
+        int k = 0;
+        for (int a = r - 2; a <= r + 2; a++) for (int b = c - 2; b <= c + 2; b++)
+            if (a >= 0 && a < rows && b >= 0 && b < cols && !isnan(disp[(size_t)a * cols + b])) win[k++] = disp[(size_t)a * cols + b];
+        if (k >= 5) { qsort(win, k, sizeof(float), cmp_fl); med[i] = win[k / 2]; }
+    }
+    const int na = (int)(m->D * m->h) + 1;
+    for (size_t i = 0; i < nv; i++) {
+        if (isnan(med[i]) || med[i] == 0) continue;
+        const double zl = pz[i] - m->origin[0], zi = fmin(fmax(zl, 0), na - 1);
+        const double cy = m->cy[(int)zi] + m->origin[1], cx = m->cx[(int)zi] + m->origin[2];
+        double uy = py[i] - cy, ux = px[i] - cx; const double ul = hypot(uy, ux); if (ul < 1e-6) continue;
+        py[i] = (float)(py[i] + med[i] * uy / ul); px[i] = (float)(px[i] + med[i] * ux / ul); moved++;
+    }
+    free(disp); free(med);
+    return moved;
+}
 typedef struct {   /* ufsm wraps: one wrap's rows over threads */
     const fit_set *fs; const fit_model *m; const uint8_t *wf; int wsh[3]; double wh;
     double step, Z; int na; double th0, dth; int rows, cols, k; double rk;
@@ -520,6 +632,23 @@ static int cmd_wraps(int argc, char **argv) {
     const fit_model *m = fs->global;   /* the box, the axis; rows dispatch to the slab model of their z */
     const double step = atof(opt(argc, argv, "--step", "8")), um = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : fs->global->um;
     const int nthreads = atoi(opt(argc, argv, "--threads", "16"));
+    const int si = arg_index(argc, argv, "--snap");   /* --snap ROOT KEY: a recto probability array on the model's grid (predict output) */
+    z3 *snapz = nullptr; int64_t snapo[3] = {0, 0, 0}; const double snap_range = atof(opt(argc, argv, "--snap-range", "0.35")), snap_min = atof(opt(argc, argv, "--snap-min", "0.5"));
+    const int verbose_snap = arg_index(argc, argv, "--quiet") < 0;
+    if (si > 0) {
+        if (si + 2 >= argc) { fprintf(stderr, "wraps: --snap ROOT KEY\n"); return 2; }
+        snapz = z3_open(store_open(argv[si + 1]), argv[si + 2], opt(argc, argv, "--cache", nullptr));
+        if (!snapz) { fprintf(stderr, "wraps: --snap: %s\n", z3_error()); return 1; }
+        const char *so = opt(argc, argv, "--snap-origin", nullptr);   /* else the array's ufsm.origin_zyx (predict writes it) */
+        if (so) { long long v[3]; if (sscanf(so, "%lld,%lld,%lld", v, v + 1, v + 2) != 3) { fprintf(stderr, "wraps: --snap-origin z,y,x\n"); return 2; } for (int d = 0; d < 3; d++) snapo[d] = v[d]; }
+        else {
+            char jp[1400]; snprintf(jp, sizeof jp, "%s/%s/zarr.json", argv[si + 1], argv[si + 2]); FILE *jf = fopen(jp, "rb"); char jb[8192] = {0};
+            if (jf) { size_t nr = fread(jb, 1, sizeof jb - 1, jf); (void)nr; fclose(jf); }
+            const char *q = strstr(jb, "\"origin_zyx\":"); long long v[3];
+            if (!q || sscanf(q + 13, " [%lld,%lld,%lld]", v, v + 1, v + 2) != 3) { fprintf(stderr, "wraps: --snap: no origin_zyx in %s (give --snap-origin)\n", jp); return 2; }
+            for (int d = 0; d < 3; d++) snapo[d] = v[d];
+        }
+    }
     const double Z = m->D * m->h, Y = m->H * m->h, X = m->W * m->h;
     uint8_t *wf = nullptr; int wsh[3] = {0, 0, 0}; double wh = 0;   /* optional: the fields' data weight (max-pooled to <= ~1 GB) */
     const char *fd = opt(argc, argv, "--fields", nullptr);
@@ -567,6 +696,7 @@ static int cmd_wraps(int argc, char **argv) {
         for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wraps_rows, &J);
         for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
         const size_t valid = atomic_load(&J.valid);
+        if (snapz && valid) { const size_t mv = wraps_snap(snapz, snapo, m, rows, cols, px, py, pz, snap_range, snap_min, nthreads); if (verbose_snap) fprintf(stderr, "wraps: w%03d: %zu of %zu vertices snapped\n", k, mv, valid); }
         if (valid > 16) {
             char wd[1400]; snprintf(wd, sizeof wd, "%s/w%03d", argv[3], k);
             if (tifxyz_write(wd, cols, rows, px, py, pz, step, um, k, "ufsm wraps (fitted winding level set)")) { fprintf(stderr, "wraps: cannot write %s\n", wd); return 1; }
@@ -575,7 +705,7 @@ static int cmd_wraps(int argc, char **argv) {
         free(px); free(py); free(pz);
     }
     fprintf(stderr, "wraps: %d wraps (%d..%d) with %zu vertices written to %s\n", nwr, k0, k1, nvalid_all, argv[3]);
-    fit_set_free(fs); free(wf);
+    fit_set_free(fs); free(wf); if (snapz) z3_close(snapz);
     return 0;
 }
 
@@ -670,6 +800,85 @@ static int cmd_downsample(int argc, char **argv) {
     fprintf(stderr, "downsample: %d shards of %s written to %s\n", nsh, lv, od);
     return 0;
 }
+
+/* ufsm wrapdist <wraps-dir> <labels-root> <labels-key> [--max 32] [--chunk 128] [--threads 16] [--per-wrap]
+   How far the wraps' vertices (every <wraps-dir>/wNNN tifxyz) lie from the nearest labelled sheet voxel (label value != 0) of
+   a label array whose key is its voxel size in um (e.g. 4.8; the wraps' voxel_size_um from meta.json scales the vertices onto
+   it). Exact distance transform (src/edt.c) over the vertices' bounding box in z-chunks of --chunk label rows with --max rows
+   of overlap: distances up to --max label voxels are exact, larger ones reported as beyond it. Memory ~5 bytes per voxel of
+   one chunk. */
+static float *wd_read(const char *path, int *w, int *h);
+static int cmd_wrapdist(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: ufsm wrapdist <wraps-dir> <labels-root> <labels-key> [--max 32] [--chunk 128] [--threads 16] [--per-wrap] [--cache DIR]\n"); return 2; }
+    const int M = atoi(opt(argc, argv, "--max", "32")), C = atoi(opt(argc, argv, "--chunk", "128")), nt = atoi(opt(argc, argv, "--threads", "16"));
+    const int per = arg_index(argc, argv, "--per-wrap") > 0; const double lum = atof(argv[4]);
+    if (!(lum > 0) || M < 1 || C < 1) { fprintf(stderr, "wrapdist: the labels key must be its voxel size in um (e.g. 4.8); --max, --chunk >= 1\n"); return 2; }
+    z3 *z = z3_open(store_open(argv[3]), argv[4], opt(argc, argv, "--cache", nullptr)); if (!z) { fprintf(stderr, "wrapdist: %s\n", z3_error()); return 1; }
+    const z3_meta *zm = z3_meta_of(z);
+    /* vertices of every wrap, in label voxels */
+    size_t nv = 0, cap = 1 << 20; float (*v)[3] = malloc(cap * sizeof *v); int *wid = malloc(cap * sizeof(int)); int nw = 0, ids[4096];
+    DIR *dd = opendir(argv[2]); struct dirent *de; if (!dd) { fprintf(stderr, "wrapdist: cannot open %s\n", argv[2]); return 1; }
+    while ((de = readdir(dd)) && nw < 4096) {
+        if (de->d_name[0] != 'w') continue;
+        char p[1400]; int w, h, w2, h2, w3, h3;
+        snprintf(p, sizeof p, "%s/%s/x.tif", argv[2], de->d_name); float *X = wd_read(p, &w, &h);
+        snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = wd_read(p, &w2, &h2);
+        snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = wd_read(p, &w3, &h3);
+        snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name); double wum = 0;
+        { FILE *f = fopen(p, "rb"); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"voxel_size_um\":"); if (q) wum = atof(q + 16); } }
+        if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || !(wum > 0)) { free(X); free(Y); free(Z); continue; }
+        const double sc = wum / lum;
+        for (size_t i = 0; i < (size_t)w * h; i++) {
+            if (Z[i] < 0) continue;
+            if (nv == cap) { cap *= 2; v = realloc(v, cap * sizeof *v); wid = realloc(wid, cap * sizeof(int)); }
+            v[nv][0] = (float)(Z[i] * sc); v[nv][1] = (float)(Y[i] * sc); v[nv][2] = (float)(X[i] * sc); wid[nv++] = nw;
+        }
+        ids[nw++] = atoi(de->d_name + 1); free(X); free(Y); free(Z);
+    }
+    closedir(dd);
+    if (!nv) { fprintf(stderr, "wrapdist: no vertices in %s\n", argv[2]); return 1; }
+    double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+    for (size_t i = 0; i < nv; i++) for (int d = 0; d < 3; d++) { if (v[i][d] < lo[d]) lo[d] = v[i][d]; if (v[i][d] > hi[d]) hi[d] = v[i][d]; }
+    int64_t bo[3], bn[3];
+    for (int d = 0; d < 3; d++) { bo[d] = (int64_t)floor(lo[d]) - M; if (bo[d] < 0) bo[d] = 0; int64_t e = (int64_t)ceil(hi[d]) + M + 1; if (e > zm->shape[d]) e = zm->shape[d]; bn[d] = e - bo[d]; }
+    float *dist = malloc(nv * sizeof(float)); for (size_t i = 0; i < nv; i++) dist[i] = INFINITY;
+    const size_t plane = (size_t)bn[1] * bn[2];
+    uint8_t *lab = malloc((size_t)(C + 2 * M) * plane); float *dsq = malloc((size_t)(C + 2 * M) * plane * sizeof(float));
+    if (!lab || !dsq) { fprintf(stderr, "wrapdist: no memory for a chunk of %lld rows of %zu voxels (lower --chunk)\n", (long long)(C + 2 * M), plane); return 1; }
+    for (int64_t z0 = bo[0]; z0 < bo[0] + bn[0]; z0 += C) {
+        const int64_t a = z0 - M < bo[0] ? bo[0] : z0 - M, b = z0 + C + M > bo[0] + bn[0] ? bo[0] + bn[0] : z0 + C + M;
+        int any = 0; for (size_t i = 0; i < nv && !any; i++) any = v[i][0] >= z0 - 0.5 && v[i][0] < z0 + C - 0.5;
+        if (!any) continue;
+        const int64_t o[3] = {a, bo[1], bo[2]}, n[3] = {b - a, bn[1], bn[2]};
+        if (z3_read(z, o, n, lab, nt)) { fprintf(stderr, "wrapdist: %s\n", z3_error()); return 1; }
+        if (edt_sq(lab, n, dsq, nt)) { fprintf(stderr, "wrapdist: out of memory\n"); return 1; }
+        for (size_t i = 0; i < nv; i++) {
+            const int64_t q0 = (int64_t)lround(v[i][0]); if (q0 < z0 || q0 >= z0 + C) continue;
+            const int64_t q1 = (int64_t)lround(v[i][1]) - bo[1], q2 = (int64_t)lround(v[i][2]) - bo[2];
+            if (q1 < 0 || q2 < 0 || q1 >= bn[1] || q2 >= bn[2]) continue;
+            const float s = dsq[((size_t)(q0 - a) * bn[1] + q1) * bn[2] + q2];
+            dist[i] = s >= EDT_INF ? (float)(M + 1) : fminf(sqrtf(s), (float)(M + 1));
+        }
+    }
+    free(lab); free(dsq); z3_close(z);
+    /* stats in label voxels and um; per wrap optionally */
+    for (int w = -1; w < (per ? nw : 0); w++) {   /* all, then each wrap */
+        size_t k = 0; float *a = malloc(nv * sizeof(float));
+        for (size_t i = 0; i < nv; i++) if (isfinite(dist[i]) && (w < 0 || wid[i] == w)) a[k++] = dist[i];
+        if (k) {
+            qsort(a, k, sizeof(float), cmp_fl);
+            size_t c1 = 0, c2 = 0, c4 = 0, cm = 0; for (size_t i = 0; i < k; i++) { c1 += a[i] * lum <= 9.6; c2 += a[i] * lum <= 19.2; c4 += a[i] * lum > 38.4; cm += a[i] > M; }
+            if (w < 0) printf("wrapdist: %zu vertices of %d wraps (%zu outside the labels' extent); distance to the nearest labelled voxel (label voxel %.3g um):\n", k, nw, nv - k, lum);
+            char tag[16]; if (w < 0) snprintf(tag, sizeof tag, "all"); else snprintf(tag, sizeof tag, "w%03d", ids[w]);
+            printf("  %-5s %8zu vertices: median %.1f um, p75 %.1f, p90 %.1f; <= 9.6 um %.3f, <= 19.2 um %.3f, > 38.4 um %.3f, beyond --max (%.0f um) %.3f\n",
+                   tag, k, a[k / 2] * lum, a[k * 3 / 4] * lum, a[k * 9 / 10] * lum, (double)c1 / k, (double)c2 / k, (double)c4 / k, M * lum, (double)cm / k);
+        }
+        free(a);
+    }
+    free(v); free(wid); free(dist);
+    return 0;
+}
+static float *wd_read(const char *path, int *w, int *h) { return read_tif_f32(path, w, h); }
 
 typedef struct {   /* ufsm render: one output tile's pixel rows over threads */
     const float *X, *Y, *Z; int w, h; double gs;   /* the vertex grid; output pixels per grid step */
@@ -836,6 +1045,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
+    if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);
     if (argc < 4) return usage();
     const char *root = argv[2], *key = argv[3];
     const char *cache = opt(argc, argv, "--cache", nullptr);
