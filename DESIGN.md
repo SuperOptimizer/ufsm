@@ -314,6 +314,15 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   repeats agree). Open: case 35 (lean 1, fp4 grads, offloads) is two-state: identical runs, split or single GPU, sometimes
   differ by grad rel 0.29-0.35 (other cases repeat to 1e-8). Either a flipped stochastic rounding spreading into an equally
   valid MX-fp4 sample, or a race in that path: compare both outcomes with an fp32 reference gradient.
+- 24 blocks (8 + 16 more, same selection rules), 9.6 um, 96k steps (66 min, resumed once after the laptop's standby): fields
+  as good as the 9-block net's (phase gross errors 12.3%, normals 4.5 degrees, spacing ratio p10-p90 0.72-1.39) but B 53.5%,
+  A 46.7%. `fit --score-detail` (integer error -2..+2 by z octile and by 0.5 mm radius ring) shows why: the errors are radial
+  and systematic, +1 / +2 turns inside ~2.5 mm and -1 / -2 beyond ~5.5 mm for both nets (the 9-block net's correct band is
+  just wider): the network phase misses ~3-4 turns across the block's 7 mm radial span, mostly in packed regions (29% gross
+  phase errors where the sheets are < 100 um apart, 5-10 voxels per turn at 9.6 um), and the fit follows it. A region-vote
+  unwrapping (regions along model-checked reliable steps, offsets decided by weighted votes over whole region boundaries,
+  merged in order of decisiveness) changed nothing (82.2 / 53.6%; not kept): the errors are not path slips. Next: a 4.8 um
+  winding net (20+ voxels per packed turn; the blocks' stored phase is native 4.8 um).
 - `ufsm phase-raster --pool 2` writes only the 2x circular-mean pooled phase (<out>/9.6, shards of 256: one per 4.8 um shard
   of 512); `--resume 1` skips written shards. A whole-scroll Paris4 phase at 4.8 um would be ~326 GB (25 MB per shard, 13054
   shards; the desk has 317 GB free), at 9.6 um ~65 GB. Block B: identical known / unknown masks to phase-raster + downsample,

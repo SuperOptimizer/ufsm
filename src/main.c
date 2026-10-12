@@ -499,6 +499,9 @@ static int cmd_fit(int argc, char **argv) {
         const double cf = atof(argv[ci + 2]) > 0 ? atof(argv[ci + 2]) / fb.um : 2;   /* label voxel in native voxels (the codes' key is its um: 4.8) */
         int64_t lo[3], ln[3]; for (int d = 0; d < 3; d++) { lo[d] = (int64_t)floor(org[d] / cf); ln[d] = (int64_t)(shp[d] * h / cf); }
         enum { NB = 14 * 72, NF = 14 * 1024 }; size_t *hist = calloc(NB, sizeof(size_t)), *fine = calloc(NF, sizeof(size_t)), nd = 0;   /* d = U - q mod 14: 1/72 and 1/1024 turn bins */
+        const int detail = arg_index(argc, argv, "--score-detail") > 0;   /* integer errors by z octile and by radius */
+        typedef struct { float d; uint8_t z, r; } score_rec; score_rec *dd = nullptr; size_t ndet = 0, dcap = 0;
+        const int na_ax = (int)(shp[0] * h) + 1;
         FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;   /* box-local z y x, U - q mod 14 per voxel */
         const size_t plane = (size_t)ln[1] * ln[2]; int64_t zc = (int64_t)((32u << 20) / plane); if (zc < 1) zc = 1;
         uint8_t *codes = malloc(zc * plane); float *U = malloc(zc * plane * 4);
@@ -519,6 +522,12 @@ static int cmd_fit(int argc, char **argv) {
                 double d = fmod(U[i] - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14; if (d >= 14) d = 0;
                 if (dump) { const float rec[4] = {(float)pz, (float)py, (float)px, (float)d}; if (fwrite(rec, 4, 4, dump) != 4) { fclose(dump); dump = nullptr; } }
                 hist[(int)(d / 14 * NB) % NB]++; fine[(int)(d / 14 * NF) % NF]++; nd++;
+                if (detail) {   /* d and the voxel's z / radius bins for the breakdown after the gauge is known */
+                    if (ndet == dcap) { dcap = dcap ? 2 * dcap : 1 << 20; dd = realloc(dd, dcap * sizeof *dd); }
+                    const int zi = (int)fmin(7, fmax(0, pz / (shp[0] * h) * 8));
+                    const int ai = (int)fmin(na_ax - 1, fmax(0, pz)); const double rr = hypot(py - fb.cy[ai], px - fb.cx[ai]) * fb.um;
+                    dd[ndet++] = (score_rec){(float)d, (uint8_t)zi, (uint8_t)fmin(255, rr / 250)};   /* radius in 250 um bins */
+                }
             }
         }
         fit_set_dev_free(gd); free(codes); free(U);
@@ -534,6 +543,20 @@ static int cmd_fit(int argc, char **argv) {
         double med = 0, p90 = 0; { size_t c = 0; int got = 0; for (int k = 0; k <= NF / 28; k++) { c += ah[k]; if (!got && c * 2 >= na2) { med = (k + 0.5) / 1024; got = 1; } if (c * 10 >= na2 * 9) { p90 = (k + 0.5) / 1024; break; } } }
         printf("fit score: %zu labelled voxels, gauge %.3f, winding ids right %.4f, |error| < 0.08 turn %.4f, |error| median %.3f p90 %.3f turn\n", nd, mode + mean,
                nd ? (double)right / nd : 0, nd ? (double)close / nd : 0, na2 ? med : 0, na2 ? p90 : 0);
+        if (detail && ndet) {
+            size_t ie[8][9] = {{0}}, re[64][9] = {{0}};   /* integer error -4..4 by z octile / by 250 um radius bin (up to 16 mm) */
+            for (size_t i = 0; i < ndet; i++) {
+                double e = dd[i].d - mode - mean; e -= 14 * round(e / 14); const int k = (int)lround(e);
+                if (k < -4 || k > 4) continue;
+                ie[dd[i].z][k + 4]++; if (dd[i].r < 64) re[dd[i].r][k + 4]++;
+            }
+            printf("  integer error -2 -1 0 +1 +2 (fractions):\n");
+            for (int zb = 0; zb < 8; zb++) { size_t t = 0; for (int k = 0; k < 9; k++) t += ie[zb][k]; if (!t) continue;
+                printf("    z octile %d %9zu voxels: %.3f %.3f %.3f %.3f %.3f\n", zb, t, (double)ie[zb][2] / t, (double)ie[zb][3] / t, (double)ie[zb][4] / t, (double)ie[zb][5] / t, (double)ie[zb][6] / t); }
+            for (int rb = 0; rb < 64; rb += 2) { size_t t = 0, c[9] = {0}; for (int k = 0; k < 9; k++) { c[k] = re[rb][k] + (rb + 1 < 64 ? re[rb + 1][k] : 0); t += c[k]; } if (t < 1000) continue;
+                printf("    radius %5.1f-%4.1f mm %9zu voxels: %.3f %.3f %.3f %.3f %.3f\n", rb * 0.25, rb * 0.25 + 0.5, t, (double)c[2] / t, (double)c[3] / t, (double)c[4] / t, (double)c[5] / t, (double)c[6] / t); }
+        }
+        free(dd);
         free(ah); free(hist); free(fine);
         z3_close(z); if (dump) fclose(dump);
     }
