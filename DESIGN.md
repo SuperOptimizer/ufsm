@@ -210,6 +210,9 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   Network fields (step-7048 checkpoint, predict --fit-fields, 75 s): 73.4% with the node unwrapping -> 90.6% with the voxel
   unwrapping; the wrong ids are mostly -1 (the fit under-counts, as the network's density does) and at the largest radii.
   `ufsm fit --model DIR` scores / exports a saved model, `--score-dump F` writes the per-voxel errors.
+  The data terms now take grad W analytically at the voxel centre (trilinear delta gradient, the prior's and theta's z / y / x
+  derivatives with the axis slope) on a random ~2M-voxel subset per step (nn_fit_loss2; knots fixed after the prior; the 7-point
+  finite-difference kernel stays as --analytic 0): network fields 90.9% in 16 s (was 132 s), oracle 93.0% in 8 s (was 91 s).
 - `ufsm wraps` (one tifxyz per wrap: rows every step native in z, columns every step / r_k in theta, each vertex the root of
   W = k along the ray from the umbilicus; tifxyz per upstream save_tifxyz: x/y/z float32, -1 invalid, meta.json scale / bbox /
   area / winding) and `ufsm render` (vertex grid to 1 px per native voxel, ink zarr max-composited over +-depth along the

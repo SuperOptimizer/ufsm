@@ -224,3 +224,85 @@ extern "C" void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo
                                                 F[1], F[2], nf, ch_recto, ch_phase, ch_normal, ch_density, acc);
     KCHECK();
 }
+
+/* analytic data terms (nn_fit_loss2): one evaluation per voxel */
+__device__ __forceinline__ unsigned fit_hash(unsigned x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
+__global__ void fit_loss2_k(fit_dev f, double *parts, float *g_delta) {
+    __shared__ double red[5][FIT_TPB];
+    double lp[5] = {0, 0, 0, 0, 0};
+    const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    const float wv = i < n && (f.stride <= 1 || fit_hash((unsigned)i ^ f.salt) % (unsigned)f.stride == 0) ? f.w[i] * (1.f / 255.f) : 0.f;
+    if (wv > 0.f) {
+        const int z = (int)(i / ((size_t)f.H * f.W)), y = (int)((i / f.W) % f.H), x = (int)(i % f.W);
+        const float pz = (z + 0.5f) * f.h, py = (y + 0.5f) * f.h, px = (x + 0.5f) * f.h, sc = (float)(f.stride > 1 ? f.stride : 1);
+        /* axis and its z slope */
+        float az = fminf(fmaxf(pz, 0.f), (float)(f.naxis - 1)); int ai = min((int)az, f.naxis - 2 < 0 ? 0 : f.naxis - 2); const float at = f.naxis > 1 ? az - ai : 0.f;
+        const int ai1 = f.naxis > 1 ? ai + 1 : ai;
+        const float cy = f.cy[ai] + at * (f.cy[ai1] - f.cy[ai]), cx = f.cx[ai] + at * (f.cx[ai1] - f.cx[ai]), cyz = f.cy[ai1] - f.cy[ai], cxz = f.cx[ai1] - f.cx[ai];
+        const float dy = py - cy, dx = px - cx, r2 = dy * dy + dx * dx + 1e-6f, r = sqrtf(r2), th = atan2f(dy, dx);
+        /* knots (fixed): value and z slope */
+        float kz = fminf(fmaxf(pz / (float)f.knot_dz, 0.f), (float)(f.nk - 1)); const int k0 = min((int)kz, f.nk - 2 < 0 ? 0 : f.nk - 2), k1 = f.nk > 1 ? k0 + 1 : k0; const float kt = f.nk > 1 ? kz - k0 : 0.f;
+        const float pit = f.pitch[k0] + kt * (f.pitch[k1] - f.pitch[k0]), off = f.offset[k0] + kt * (f.offset[k1] - f.offset[k0]);
+        const float pitz = (f.pitch[k1] - f.pitch[k0]) / (float)f.knot_dz, offz = (f.offset[k1] - f.offset[k0]) / (float)f.knot_dz;
+        if (r >= f.core * pit) {
+            /* trilinear delta, value and gradient */
+            const float q[3] = {pz / (float)f.L, py / (float)f.L, px / (float)f.L}; const int dim[3] = {f.lz, f.ly, f.lx}; int c0[3]; float ct[3];
+            for (int d = 0; d < 3; d++) { const float a = fminf(fmaxf(q[d], 0.f), (float)(dim[d] - 1)); c0[d] = min((int)a, dim[d] - 2 < 0 ? 0 : dim[d] - 2); ct[d] = dim[d] > 1 ? a - c0[d] : 0.f; }
+            float del = 0.f, gdel[3] = {0, 0, 0}, wc[8], gw[8][3]; size_t ic[8];
+            const float iL = 1.f / (float)f.L;
+            for (int c = 0; c < 8; c++) {
+                const int bz = c >> 2 & 1, by = c >> 1 & 1, bx = c & 1;
+                const float wz = bz ? ct[0] : 1.f - ct[0], wy = by ? ct[1] : 1.f - ct[1], wx = bx ? ct[2] : 1.f - ct[2];
+                wc[c] = wz * wy * wx;
+                gw[c][0] = (bz ? iL : -iL) * wy * wx; gw[c][1] = wz * (by ? iL : -iL) * wx; gw[c][2] = wz * wy * (bx ? iL : -iL);
+                ic[c] = ((size_t)min(c0[0] + bz, f.lz - 1) * f.ly + min(c0[1] + by, f.ly - 1)) * f.lx + min(c0[2] + bx, f.lx - 1);
+                const float v = f.delta[ic[c]];
+                del += wc[c] * v; for (int d = 0; d < 3; d++) gdel[d] += gw[c][d] * v;
+            }
+            const float i2p = 0.15915494309189535f, sdir = (float)f.dir;
+            const float drz = -(dy * cyz + dx * cxz) / r;
+            float g[3] = {drz / pit - r * pitz / (pit * pit) + offz + gdel[0], dy / (r * pit) + gdel[1], dx / (r * pit) + gdel[2]};
+            const float thz = (-dx * cyz + dy * cxz) / r2, thy = dx / r2, thx = -dy / r2;
+            g[0] -= sdir * thz * i2p; g[1] -= sdir * thy * i2p; g[2] -= sdir * thx * i2p;
+            const float W0 = r / pit + off + del - sdir * th * i2p;
+            float dW = 0.f, dg[3] = {0, 0, 0};
+            const float mc = ((int)f.pc[i] - 128) * (1.f / 127.f), ms = ((int)f.ps[i] - 128) * (1.f / 127.f), conf = sqrtf(mc * mc + ms * ms);
+            if (conf > 0.05f && f.w_phase > 0.f) {
+                const float a = 6.283185307179586f * W0 - atan2f(ms, mc); float sa, ca; sincosf(a, &sa, &ca);
+                const float cc = f.w_phase * wv * fminf(conf, 1.f) * sc;
+                lp[1] += cc * (1.f - ca); dW += cc * 6.283185307179586f * sa;
+            }
+            const float g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2] + 1e-12f, gl = sqrtf(g2);
+            const size_t pl = n;
+            const float tzz = f.t[i] * (1.f / 255.f), tyy = f.t[pl + i] * (1.f / 255.f), txx = f.t[2 * pl + i] * (1.f / 255.f);
+            const float tzy = f.t[3 * pl + i] * (1.f / 255.f) - 0.5f, tzx = f.t[4 * pl + i] * (1.f / 255.f) - 0.5f, tyx = f.t[5 * pl + i] * (1.f / 255.f) - 0.5f;
+            const float tr = tzz + tyy + txx;
+            if (tr > 0.1f && f.w_normal > 0.f) {
+                const float Tg[3] = {tzz * g[0] + tzy * g[1] + tzx * g[2], tzy * g[0] + tyy * g[1] + tyx * g[2], tzx * g[0] + tyx * g[1] + txx * g[2]};
+                const float gTg = g[0] * Tg[0] + g[1] * Tg[1] + g[2] * Tg[2], cc = f.w_normal * wv * sc;
+                lp[2] += cc * (1.f - gTg / (g2 * tr));
+                for (int d = 0; d < 3; d++) dg[d] += -cc * (2.f * Tg[d] / (g2 * tr) - 2.f * gTg * g[d] / (g2 * g2 * tr));
+            }
+            if (f.sp[i]) {
+                const float rho = 8.f / (f.h * (float)f.sp[i]), lr = logf(gl) - logf(rho);
+                if (f.w_density > 0.f) { const float cc = f.w_density * wv * sc; lp[3] += cc * lr * lr; for (int d = 0; d < 3; d++) dg[d] += cc * 2.f * lr * g[d] / g2; }
+                const float lo = 0.4f * rho - gl;
+                if (lo > 0.f && f.w_nondeg > 0.f) { const float cc = f.w_nondeg * wv * sc; lp[4] += cc * lo * lo; for (int d = 0; d < 3; d++) dg[d] += -cc * 2.f * lo * g[d] / gl; }
+            }
+            lp[0] = lp[1] + lp[2] + lp[3] + lp[4];
+            for (int c = 0; c < 8; c++) {
+                const float gv = dW * wc[c] + dg[0] * gw[c][0] + dg[1] * gw[c][1] + dg[2] * gw[c][2];
+                if (gv != 0.f) atomicAdd(&g_delta[ic[c]], gv);
+            }
+        }
+    }
+    for (int k = 0; k < 5; k++) red[k][threadIdx.x] = lp[k];
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 5; k++) red[k][threadIdx.x] += red[k][threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) for (int k = 0; k < 5; k++) atomicAdd(&parts[k], red[k][0]);
+}
+extern "C" void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta) {
+    const size_t n = (size_t)f->D * f->H * f->W;
+    fit_loss2_k<<<nblk(n, FIT_TPB), FIT_TPB>>>(*f, parts, g_delta);
+    KCHECK();
+}

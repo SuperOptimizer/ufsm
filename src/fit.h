@@ -28,6 +28,8 @@ typedef struct {
                                        integrate the turn count); the phase term (periodic) refines from this stage on */
     float phase_ramp;               /* phase_stage: phase weight from phase_ramp * w_phase to w_phase */
     int unwrap_voxels;              /* phase-stage init: 1 voxel-level quality-guided unwrapping (default), 0 lattice-node unwrapping */
+    int analytic;                   /* 1: nn_fit_loss2 (analytic grad W, voxel minibatches; knots fixed after the prior), 0: nn_fit_loss */
+    int batch;                      /* analytic: field voxels per step (about; 0 = all) */
     float core;                     /* no data terms within core * pitch of the axis */
     int verbose;
 } fit_cfg;
@@ -67,10 +69,14 @@ typedef struct {
     int dir, nk, knot_dz; const float *pitch, *offset;
     int L, lz, ly, lx; const float *delta;
     float w_phase, w_normal, w_density, w_nondeg, core;
+    int stride; unsigned salt;              /* nn_fit_loss2: voxels with hash(i, salt) % stride == 0 this step, data terms x stride */
 } fit_dev;
 /* the data terms over every field voxel: loss parts (double[5]: total, phase, normal, density, nondeg, accumulated) and the
    gradients of delta and of the knots (accumulated: zero them first) */
 void nn_fit_loss(const fit_dev *f, double *parts, float *g_delta, float *g_pitch, float *g_offset);
+/* the same data terms with grad W analytic (trilinear delta, the prior's and theta's derivatives, the axis slope) at the voxel
+   centre only, on a random 1 / stride subset of the voxels; the knots get no gradient (delta carries the fit) */
+void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta);
 /* smoothness w_smooth * sum (laplacian delta)^2 + w_decay * sum delta^2 over the lattice (lap: lattice-sized scratch): adds to
    parts[5] and g_delta */
 void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float w_smooth, float w_decay, float *lap, double *parts, float *g_delta);

@@ -19,7 +19,7 @@ fit_cfg fit_cfg_default(void) {
     memcpy(c.lattice, lat, sizeof lat); memcpy(c.steps, st, sizeof st);
     c.lr = 0.02f; c.lr_knot = 0.005f;
     c.w_phase = 1.f; c.w_normal = 1.f; c.w_density = 1.f; c.w_nondeg = 1.f; c.w_smooth = 0.1f; c.w_decay = 1e-4f;
-    c.phase_ramp = 0.1f; c.core = 3.f; c.unwrap_voxels = 1;
+    c.phase_ramp = 0.1f; c.core = 3.f; c.unwrap_voxels = 1; c.analytic = 1; c.batch = 2000000;
     return c;
 }
 
@@ -400,7 +400,12 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
             const double ramp = st < c->phase_stage ? 0 : st == c->phase_stage ? c->phase_ramp + (1 - c->phase_ramp) * (double)it / (c->steps[st] > 1 ? c->steps[st] - 1 : 1) : 1;
             fd.w_phase = (float)(c->w_phase * ramp * norm);
             nn_zero(gd, nl * 4); nn_zero(gpi, nk * 4); nn_zero(gof, nk * 4); nn_zero(dparts, 6 * sizeof(double));
-            nn_fit_loss(&fd, dparts, gd, gpi, gof);
+            if (c->analytic) {   /* random voxel subsets of ~batch per step */
+                const size_t nvox = (size_t)fd.D * fd.H * fd.W;
+                fd.stride = c->batch > 0 && nvox > (size_t)c->batch ? (int)(nvox / c->batch) : 1;
+                fd.salt = (unsigned)(kstep * 2654435761u + 12345u);
+                nn_fit_loss2(&fd, dparts, gd);
+            } else nn_fit_loss(&fd, dparts, gd, gpi, gof);
             nn_fit_smooth(dd, lz, ly, lx, ws, wdec, lap, dparts, gd);
             nn_adamw(dd, gd, md, vd, nl, c->lr, 0.9f, 0.999f, 1e-8f, 0.f, it + 1);
             ++kstep;
