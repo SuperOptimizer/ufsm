@@ -298,6 +298,14 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   24 GB VM. Heavy laptop jobs now run in a systemd user slice capped at 18 GB + 2 GB swap (~/ufsm-data/capped.sh), and
   `ufsm band` refuses boxes needing more than 80% of the memory it can get (24 B per label voxel vs MemAvailable and the cgroup
   limit), pointing at phase-raster + band --phase-raster.
+- 2.4 um vs 9.6 um winding nets on the laptop budget: a 2.4 um net on the 8 blocks (P256, ink head off, 30k steps, 2.0 h,
+  4.2 samples/s) 51.2% on B / 46.9% on A, |error| median 0.19 turn, still far from converged (a P256 patch at 2.4 um holds 1/8
+  of the physical volume of a P128 patch at 9.6 um); the 9.6 um net (9 blocks, 48k steps, 33 min) 83.7% / 54.2%. Winding
+  fields come from a 9.6 um net; recto and ink stay at 2.4 um. `ufsm wraps --out-um 2.4` writes a 9.6 um fit's wraps on the
+  2.4 um grid (voxel centres to voxel centres, grid step and voxel_size_um scaled) so they render with the 2.4 um ink
+  (wrapdist unchanged: 72.2 vs 72.7% within 9.6 um).
+- Open: test_split's "memory layout vs separate buffers" check of the train-default offload configuration failed twice
+  under GPU contention (cases 34 and 35, grad rel ~0.3) and passes alone: a timing-dependent race to find.
 - Left: BigTIFF for renders over 4 GB compressed; 9.6 um training on all of Paris4 (desk band codes); the desk runs.
 
 ## Half-resolution networks (2026-10-11)

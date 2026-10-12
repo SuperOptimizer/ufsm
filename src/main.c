@@ -514,7 +514,7 @@ static int cmd_fit(int argc, char **argv) {
 }
 
 /* ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4] [--threads 16]
-   [--snap ROOT KEY [--snap-range 0.35] [--snap-min 0.5] [--snap-origin z,y,x]]
+   [--snap ROOT KEY [--snap-range 0.35] [--snap-min 0.5] [--snap-origin z,y,x]] [--out-um U]
    One tifxyz per wrap of a fitted winding model (ufsm fit --out): wrap k is the level set W = k. Rows every step native voxels in
    z, columns every step / r_k radians of theta over the box's angular range (r_k: the wrap's radius at the box centre), each
    vertex the root of W = k along the ray from the umbilicus (src/fit.h fit_ray_root); vertices outside the box, without a root,
@@ -632,6 +632,7 @@ static int cmd_wraps(int argc, char **argv) {
     const fit_model *m = fs->global;   /* the box, the axis; rows dispatch to the slab model of their z */
     const double step = atof(opt(argc, argv, "--step", "8")), um = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : fs->global->um;
     const int nthreads = atoi(opt(argc, argv, "--threads", "16"));
+    const double out_um = atof(opt(argc, argv, "--out-um", "0"));   /* e.g. 2.4: a 9.6 um fit's wraps on the 2.4 um grid (renders with 2.4 um ink) */
     const int si = arg_index(argc, argv, "--snap");   /* --snap ROOT KEY: a recto probability array on the model's grid (predict output) */
     z3 *snapz = nullptr; int64_t snapo[3] = {0, 0, 0}; const double snap_range = atof(opt(argc, argv, "--snap-range", "0.35")), snap_min = atof(opt(argc, argv, "--snap-min", "0.5"));
     const int verbose_snap = arg_index(argc, argv, "--quiet") < 0;
@@ -699,7 +700,13 @@ static int cmd_wraps(int argc, char **argv) {
         if (snapz && valid) { const size_t mv = wraps_snap(snapz, snapo, m, rows, cols, px, py, pz, snap_range, snap_min, nthreads); if (verbose_snap) fprintf(stderr, "wraps: w%03d: %zu of %zu vertices snapped\n", k, mv, valid); }
         if (valid > 16) {
             char wd[1400]; snprintf(wd, sizeof wd, "%s/w%03d", argv[3], k);
-            if (tifxyz_write(wd, cols, rows, px, py, pz, step, um, k, "ufsm wraps (fitted winding level set)")) { fprintf(stderr, "wraps: cannot write %s\n", wd); return 1; }
+            double wstep = step, wum = um;
+            if (out_um > 0 && fabs(out_um - um) > 1e-9) {   /* --out-um: coordinates on another grid of the same scan (voxel centres to voxel centres) */
+                const double f = um / out_um;
+                for (size_t i = 0; i < nv; i++) if (pz[i] >= 0) { px[i] = (float)((px[i] + 0.5) * f - 0.5); py[i] = (float)((py[i] + 0.5) * f - 0.5); pz[i] = (float)((pz[i] + 0.5) * f - 0.5); }
+                wstep = step * f; wum = out_um;
+            }
+            if (tifxyz_write(wd, cols, rows, px, py, pz, wstep, wum, k, "ufsm wraps (fitted winding level set)")) { fprintf(stderr, "wraps: cannot write %s\n", wd); return 1; }
             nwr++; nvalid_all += valid;
         }
         free(px); free(py); free(pz);
