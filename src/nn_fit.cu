@@ -306,3 +306,25 @@ extern "C" void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta) {
     fit_loss2_k<<<nblk(n, FIT_TPB), FIT_TPB>>>(*f, parts, g_delta);
     KCHECK();
 }
+
+__global__ void fit_grid_k(const fit_dev *ms, const fit_grid_row *rows, int ny, int nx, float y0, float x0, float step, int with_theta, float *out) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; const int a = blockIdx.y;
+    if (i >= (size_t)ny * nx) return;
+    const int b = (int)(i / nx), c = (int)(i % nx);
+    const fit_grid_row r = rows[a];
+    const float y = y0 + ((float)b + 0.5f) * step, x = x0 + ((float)c + 0.5f) * step, itp = 0.15915494309189535f;
+    fit_pt p; fit_eval(ms[r.a], r.z - r.za, y, x, p);
+    const float tha = p.th;
+    float W = p.U - (float)ms[r.a].dir * p.th * itp;
+    if (r.t > 0.f) { fit_pt q; fit_eval(ms[r.b], r.z - r.zb, y, x, q); W = (1.f - r.t) * W + r.t * (q.U - (float)ms[r.b].dir * q.th * itp); }
+    out[(size_t)a * ny * nx + i] = with_theta ? W + (float)ms[r.a].dir * tha * itp : W;
+}
+void nn_fit_grid(const fit_dev *ms, const fit_grid_row *rows, int nz, int ny, int nx, float y0, float x0, float step, int with_theta, float *out) {
+    if (nz <= 0 || ny <= 0 || nx <= 0) return;
+    const size_t per = (size_t)ny * nx;
+    for (int z0 = 0; z0 < nz; z0 += 65535) {
+        const int n = nz - z0 < 65535 ? nz - z0 : 65535;
+        fit_grid_k<<<dim3((unsigned)((per + 255) / 256), (unsigned)n), 256>>>(ms, rows + z0, ny, nx, y0, x0, step, with_theta, out + (size_t)z0 * per);
+    }
+    CK(cudaGetLastError());
+}

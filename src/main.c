@@ -397,7 +397,6 @@ static int cmd_fit(int argc, char **argv) {
     if (!min && !slab) for (int d = 0; d < 3; d++) fs->global->origin[d] = fb.origin[d];
     const long long org[3] = {m->origin[0], m->origin[1], m->origin[2]};
     const int shp[3] = {fb.shape[0], fb.shape[1], fb.shape[2]}; const double h = fb.h;
-    const int na = (int)(shp[0] * h) + 1; const float *cy = fb.cy, *cx = fb.cx;
     fprintf(stderr, "fit: dir %+d, %d slab model(s), global lattice %d (%dx%dx%d), loss %.5f in %.1fs\n", m->dir, fs->n, m->L, m->lz, m->ly, m->lx, m->loss[0], now() - t0);
     const char *mout = opt(argc, argv, "--out", nullptr);
     if (mout && (fs->n ? fit_set_save(fs, mout) : fit_save(fs->global, mout))) { fprintf(stderr, "fit: cannot save %s\n", mout); return 1; }
@@ -410,73 +409,115 @@ static int cmd_fit(int argc, char **argv) {
                  m->dir, org[0], org[1], org[2], ws);
         z3w *zw = z3w_create_typed(ld, gs, 128, 1, 0.f, 0.0, at);
         if (!zw || z3w_write_group(wout, (const double[]){um * ws}, 1, "ufsm-winding", at)) { fprintf(stderr, "fit: %s\n", z3w_error()); return 1; }
-        uint16_t *sb = malloc((size_t)128 * 128 * 128 * 2);
+        uint16_t *sb = malloc((size_t)128 * 128 * 128 * 2); float *wv = malloc((size_t)128 * 128 * 128 * 4);
+        fit_set_dev *gd = fit_set_upload(fs); if (!gd) return 1;
         for (int64_t sz = 0; sz * 128 < gs[0]; sz++) for (int64_t sy = 0; sy * 128 < gs[1]; sy++) for (int64_t sx = 0; sx * 128 < gs[2]; sx++) {
+            const int64_t n3[3] = {gs[0] - sz * 128 < 128 ? gs[0] - sz * 128 : 128, gs[1] - sy * 128 < 128 ? gs[1] - sy * 128 : 128, gs[2] - sx * 128 < 128 ? gs[2] - sx * 128 : 128};
+            const double o3[3] = {(double)sz * 128 * ws, (double)sy * 128 * ws, (double)sx * 128 * ws};
+            if (fit_set_grid(gd, fs, o3, n3, ws, 0, wv)) { fprintf(stderr, "fit: no device memory for the winding grid\n"); return 1; }
             memset(sb, 0, (size_t)128 * 128 * 128 * 2);
-            for (int a = 0; a < 128 && sz * 128 + a < gs[0]; a++) for (int b = 0; b < 128 && sy * 128 + b < gs[1]; b++) for (int c2 = 0; c2 < 128 && sx * 128 + c2 < gs[2]; c2++) {
-                const double W = fit_set_W(fs, ((sz * 128 + a) + 0.5) * ws, ((sy * 128 + b) + 0.5) * ws, ((sx * 128 + c2) + 0.5) * ws);
-                const double v = W * 256; sb[((size_t)a * 128 + b) * 128 + c2] = (uint16_t)(v < 0 ? 0 : v > 65535 ? 65535 : lround(v));
+            for (int64_t a = 0; a < n3[0]; a++) for (int64_t b = 0; b < n3[1]; b++) for (int64_t c2 = 0; c2 < n3[2]; c2++) {
+                const double v = (double)wv[((size_t)a * n3[1] + b) * n3[2] + c2] * 256; sb[((size_t)a * 128 + b) * 128 + c2] = (uint16_t)(v < 0 ? 0 : v > 65535 ? 65535 : lround(v));
             }
             if (z3w_write_shard(zw, sz, sy, sx, (const uint8_t *)sb, 8)) { fprintf(stderr, "fit: %s\n", z3w_error()); return 1; }
         }
+        fit_set_dev_free(gd); free(wv);
         z3w_close(zw); free(sb);
         fprintf(stderr, "fit: winding %lldx%lldx%lld (step %d) written to %s\n", (long long)gs[0], (long long)gs[1], (long long)gs[2], ws, wout);
     }
     const int ci = arg_index(argc, argv, "--codes");
-    if (ci > 0 && ci + 2 < argc) {   /* score against the band codes of the box */
+    if (ci > 0 && ci + 2 < argc) {   /* score against the band codes of the box, streamed in label z-chunks (U on the GPU) */
         store *s = store_open(argv[ci + 1]); z3 *z = z3_open(s, argv[ci + 2], nullptr);
         if (!z) { fprintf(stderr, "%s\n", z3_error()); return 1; }
         int64_t lo[3], ln[3]; for (int d = 0; d < 3; d++) { lo[d] = org[d] / 2; ln[d] = (int64_t)(shp[d] * h / 2); }
-        const size_t nl = (size_t)ln[0] * ln[1] * ln[2]; uint8_t *codes = malloc(nl);
-        if (z3_read(z, lo, ln, codes, 8)) { fprintf(stderr, "fit: code read failed: %s\n", z3_error()); return 1; }
-        enum { NB = 14 * 72 }; static size_t hist[NB]; memset(hist, 0, sizeof hist);
-        float *dv = malloc(nl * sizeof(float)); size_t nd = 0;
+        enum { NB = 14 * 72, NF = 14 * 1024 }; size_t *hist = calloc(NB, sizeof(size_t)), *fine = calloc(NF, sizeof(size_t)), nd = 0;   /* d = U - q mod 14: 1/72 and 1/1024 turn bins */
         FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;   /* box-local z y x, U - q mod 14 per voxel */
-        for (int64_t zz = 0; zz < ln[0]; zz++) for (int64_t yy = 0; yy < ln[1]; yy++) for (int64_t xx = 0; xx < ln[2]; xx++) {
-            const uint8_t cd = codes[((size_t)zz * ln[1] + yy) * ln[2] + xx];
-            if (cd < 1 || cd > 252) continue;
-            const double pz = 2.0 * (zz + lo[0]) + 0.5 - org[0], py = 2.0 * (yy + lo[1]) + 0.5 - org[1], px = 2.0 * (xx + lo[2]) + 0.5 - org[2];
-            if (pz < 0 || py < 0 || px < 0 || pz > shp[0] * h || py > shp[1] * h || px > shp[2] * h) continue;
-            const double cya = cy[(int)fmin(pz, na - 1)], cxa = cx[(int)fmin(pz, na - 1)];
-            const double U = fit_set_W(fs, pz, py, px) + m->dir * atan2(py - cya, px - cxa) / (2 * M_PI);
-            double d = fmod(U - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14;
-            if (dump) { const float rec[4] = {(float)pz, (float)py, (float)px, (float)d}; if (fwrite(rec, 4, 4, dump) != 4) { fclose(dump); dump = nullptr; } }
-            dv[nd++] = (float)d; hist[(int)(d / 14 * NB) % NB]++;
+        const size_t plane = (size_t)ln[1] * ln[2]; int64_t zc = (int64_t)((32u << 20) / plane); if (zc < 1) zc = 1;
+        uint8_t *codes = malloc(zc * plane); float *U = malloc(zc * plane * 4);
+        fit_set_dev *gd = fit_set_upload(fs); if (!gd) return 1;
+        for (int64_t z0 = 0; z0 < ln[0]; z0 += zc) {
+            const int64_t nz = ln[0] - z0 < zc ? ln[0] - z0 : zc;
+            const int64_t o3[3] = {lo[0] + z0, lo[1], lo[2]}, n3[3] = {nz, ln[1], ln[2]};
+            if (z3_read(z, o3, n3, codes, 8)) { fprintf(stderr, "fit: code read failed: %s\n", z3_error()); return 1; }
+            size_t any = 0; for (size_t i = 0; i < (size_t)nz * plane && !any; i++) any = codes[i] >= 1 && codes[i] <= 252;
+            if (!any) continue;
+            const double og[3] = {2.0 * o3[0] - 0.5 - org[0], 2.0 * lo[1] - 0.5 - org[1], 2.0 * lo[2] - 0.5 - org[2]};   /* label voxel i at 2 (i + lo) + 0.5 - org */
+            if (fit_set_grid(gd, fs, og, n3, 2.0, 1, U)) { fprintf(stderr, "fit: no device memory for the score grid\n"); return 1; }
+            for (int64_t zz = 0; zz < nz; zz++) for (int64_t yy = 0; yy < ln[1]; yy++) for (int64_t xx = 0; xx < ln[2]; xx++) {
+                const size_t i = ((size_t)zz * ln[1] + yy) * ln[2] + xx; const uint8_t cd = codes[i];
+                if (cd < 1 || cd > 252) continue;
+                const double pz = 2.0 * (zz + o3[0]) + 0.5 - org[0], py = 2.0 * (yy + lo[1]) + 0.5 - org[1], px = 2.0 * (xx + lo[2]) + 0.5 - org[2];
+                if (pz < 0 || py < 0 || px < 0 || pz > shp[0] * h || py > shp[1] * h || px > shp[2] * h) continue;
+                double d = fmod(U[i] - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14; if (d >= 14) d = 0;
+                if (dump) { const float rec[4] = {(float)pz, (float)py, (float)px, (float)d}; if (fwrite(rec, 4, 4, dump) != 4) { fclose(dump); dump = nullptr; } }
+                hist[(int)(d / 14 * NB) % NB]++; fine[(int)(d / 14 * NF) % NF]++; nd++;
+            }
         }
+        fit_set_dev_free(gd); free(codes); free(U);
         size_t best = 0; int bi = 0;
         for (int k = 0; k < NB; k++) { size_t sacc = 0; for (int e = -18; e <= 18; e++) sacc += hist[(k + e + NB) % NB]; if (sacc > best) { best = sacc; bi = k; } }   /* +-0.25 turn window */
         const double mode = (bi + 0.5) * 14.0 / NB;
         size_t right = 0, close = 0; double mean = 0;
-        for (size_t i = 0; i < nd; i++) { double e = dv[i] - mode; e -= 14 * round(e / 14); if (fabs(e) < 0.5) { right++; mean += e; } }
+        for (int k = 0; k < NF; k++) { double e = (k + 0.5) * 14.0 / NF - mode; e -= 14 * round(e / 14); if (fabs(e) < 0.5) { right += fine[k]; mean += e * fine[k]; } }
         mean = right ? mean / right : 0;   /* the gauge refined to the mean error of the right voxels */
-        float *ae = malloc((nd + 1) * sizeof(float)); size_t na2 = 0;
-        for (size_t i = 0; i < nd; i++) { double e = dv[i] - mode - mean; e -= 14 * round(e / 14); close += fabs(e) < 0.08; if (fabs(e) < 0.5) ae[na2++] = (float)fabs(e); }
-        qsort(ae, na2, sizeof(float), cmp_float);
+        size_t *ah = calloc(NF / 28 + 1, sizeof(size_t));   /* |e| < 0.5 in 1/1024 turn bins */
+        for (int k = 0; k < NF; k++) { double e = (k + 0.5) * 14.0 / NF - mode - mean; e -= 14 * round(e / 14); close += fabs(e) < 0.08 ? fine[k] : 0; if (fabs(e) < 0.5) ah[(int)(fabs(e) * 1024)] += fine[k]; }
+        size_t na2 = 0; for (int k = 0; k <= NF / 28; k++) na2 += ah[k];
+        double med = 0, p90 = 0; { size_t c = 0; int got = 0; for (int k = 0; k <= NF / 28; k++) { c += ah[k]; if (!got && c * 2 >= na2) { med = (k + 0.5) / 1024; got = 1; } if (c * 10 >= na2 * 9) { p90 = (k + 0.5) / 1024; break; } } }
         printf("fit score: %zu labelled voxels, gauge %.3f, winding ids right %.4f, |error| < 0.08 turn %.4f, |error| median %.3f p90 %.3f turn\n", nd, mode + mean,
-               nd ? (double)right / nd : 0, nd ? (double)close / nd : 0, na2 ? ae[na2 / 2] : 0, na2 ? ae[na2 * 9 / 10] : 0);
-        free(ae);
-        free(codes); free(dv); z3_close(z); if (dump) fclose(dump);
+               nd ? (double)right / nd : 0, nd ? (double)close / nd : 0, na2 ? med : 0, na2 ? p90 : 0);
+        free(ah); free(hist); free(fine);
+        z3_close(z); if (dump) fclose(dump);
     }
     fit_set_free(fs); fit_fields_free(&fb);
     return 0;
 }
 
-/* ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4]
+/* ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4] [--threads 16]
    One tifxyz per wrap of a fitted winding model (ufsm fit --out): wrap k is the level set W = k. Rows every step native voxels in
    z, columns every step / r_k radians of theta over the box's angular range (r_k: the wrap's radius at the box centre), each
    vertex the root of W = k along the ray from the umbilicus (src/fit.h fit_ray_root); vertices outside the box, without a root,
    or (--fields) in a field voxel without data are -1. Coordinates are global native voxels. */
+typedef struct {   /* ufsm wraps: one wrap's rows over threads */
+    const fit_set *fs; const fit_model *m; const uint8_t *wf; int wsh[3]; double wh;
+    double step, Z; int na; double th0, dth; int rows, cols, k; double rk;
+    float *px, *py, *pz; _Atomic int next; _Atomic size_t valid;
+} wraps_job;
+static void *wraps_rows(void *arg) {
+    wraps_job *J = arg; const fit_model *m = J->m;
+    for (int r; (r = atomic_fetch_add(&J->next, 1)) < J->rows;) {
+        const double z = fmin(r * J->step, J->Z), cy = m->cy[(int)fmin(z, J->na - 1)], cx = m->cx[(int)fmin(z, J->na - 1)];
+        double rprev = J->rk; size_t valid = 0;
+        for (int c = 0; c < J->cols; c++) {
+            const size_t i = (size_t)r * J->cols + (J->cols - 1 - c);   /* column 0 = the largest theta side (upstream: outermost first) */
+            const double th = J->th0 + c * J->dth; double rr;
+            J->px[i] = J->py[i] = J->pz[i] = -1;
+            if (fit_set_ray_root(J->fs, z, th, J->k, rprev, &rr)) continue;
+            const double y = cy + rr * sin(th), x = cx + rr * cos(th);
+            if (J->wf) {
+                const int fz = (int)fmin(z / J->wh, J->wsh[0] - 1), fy = (int)fmin(y / J->wh, J->wsh[1] - 1), fx = (int)fmin(x / J->wh, J->wsh[2] - 1);
+                if (fy < 0 || fx < 0 || !J->wf[((size_t)fz * J->wsh[1] + fy) * J->wsh[2] + fx]) continue;
+            }
+            J->px[i] = (float)(x + m->origin[2]); J->py[i] = (float)(y + m->origin[1]); J->pz[i] = (float)(z + m->origin[0]); valid++; rprev = rr;
+        }
+        atomic_fetch_add(&J->valid, valid);
+    }
+    return nullptr;
+}
 static int cmd_wraps(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4] [--threads 16]\n"); return 2; }
     fit_set *fs = fit_set_load(argv[2]); if (!fs) { fprintf(stderr, "wraps: cannot load %s\n", argv[2]); return 1; }
     const fit_model *m = fs->global;   /* the box, the axis; rows dispatch to the slab model of their z */
     const double step = atof(opt(argc, argv, "--step", "8")), um = atof(opt(argc, argv, "--um", "2.4"));
+    const int nthreads = atoi(opt(argc, argv, "--threads", "16"));
     const double Z = m->D * m->h, Y = m->H * m->h, X = m->W * m->h;
-    uint8_t *wf = nullptr;   /* optional: the fields' data weight */
+    uint8_t *wf = nullptr; int wsh[3] = {0, 0, 0}; double wh = 0;   /* optional: the fields' data weight (max-pooled to <= ~1 GB) */
     const char *fd = opt(argc, argv, "--fields", nullptr);
     if (fd) {
-        char p[1400]; snprintf(p, sizeof p, "%s/w.raw", fd); const size_t nf = (size_t)m->D * m->H * m->W; wf = malloc(nf);
-        FILE *f = fopen(p, "rb"); if (!f || fread(wf, 1, nf, f) != nf) { fprintf(stderr, "wraps: cannot read %s\n", p); return 1; } fclose(f);
+        fit_fields_buf g; if (fit_fields_load(fd, 0, 0, 0, &g)) { fprintf(stderr, "wraps: cannot read the fields in %s\n", fd); return 1; }
+        int pool = 1; while ((double)g.shape[0] * g.shape[1] * g.shape[2] / ((double)pool * pool * pool) > 1e9) pool *= 2;
+        wh = (double)g.h * pool; fit_fields_free(&g);
+        if (!(wf = fit_field_array(fd, "w", pool, wsh))) { fprintf(stderr, "wraps: cannot read the data weight in %s\n", fd); return 1; }
     }
     double wmin = 1e300, wmax = -1e300;   /* the wraps that meet the box */
     for (int a = 0; a <= 16; a++) for (int b = 0; b <= 16; b++) for (int c = 0; c <= 16; c++) {
@@ -510,23 +551,12 @@ static int cmd_wraps(int argc, char **argv) {
         const double dth = step / fmax(rk, step);
         const int cols = (int)ceil((th1 - th0) / dth) + 1;
         const size_t nv = (size_t)rows * cols;
-        float *px = malloc(nv * 4), *py = malloc(nv * 4), *pz = malloc(nv * 4); size_t valid = 0;
-        for (int r = 0; r < rows; r++) {
-            const double z = fmin(r * step, Z), cy = m->cy[(int)fmin(z, na - 1)], cx = m->cx[(int)fmin(z, na - 1)];
-            double rprev = rk;
-            for (int c = 0; c < cols; c++) {
-                const size_t i = (size_t)r * cols + (cols - 1 - c);   /* column 0 = the largest theta side (upstream: outermost first) */
-                const double th = th0 + c * dth; double rr;
-                px[i] = py[i] = pz[i] = -1;
-                if (fit_set_ray_root(fs, z, th, k, rprev, &rr)) continue;
-                const double y = cy + rr * sin(th), x = cx + rr * cos(th);
-                if (wf) {
-                    const int fz = (int)fmin(z / m->h, m->D - 1), fy = (int)fmin(y / m->h, m->H - 1), fx = (int)fmin(x / m->h, m->W - 1);
-                    if (fy < 0 || fx < 0 || !wf[((size_t)fz * m->H + fy) * m->W + fx]) continue;
-                }
-                px[i] = (float)(x + m->origin[2]); py[i] = (float)(y + m->origin[1]); pz[i] = (float)(z + m->origin[0]); valid++; rprev = rr;
-            }
-        }
+        float *px = malloc(nv * 4), *py = malloc(nv * 4), *pz = malloc(nv * 4);
+        wraps_job J = {fs, m, wf, {wsh[0], wsh[1], wsh[2]}, wh, step, Z, na, th0, dth, rows, cols, k, rk, px, py, pz, 0, 0};
+        pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
+        for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wraps_rows, &J);
+        for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+        const size_t valid = atomic_load(&J.valid);
         if (valid > 16) {
             char wd[1400]; snprintf(wd, sizeof wd, "%s/w%03d", argv[3], k);
             if (tifxyz_write(wd, cols, rows, px, py, pz, step, um, k, "ufsm wraps (fitted winding level set)")) { fprintf(stderr, "wraps: cannot write %s\n", wd); return 1; }
@@ -539,11 +569,12 @@ static int cmd_wraps(int argc, char **argv) {
     return 0;
 }
 
-/* ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8]
+/* ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16]
    Per wrap (each <wraps-dir>/wNNN tifxyz): the vertex grid bilinearly interpolated to scale pixels per native voxel, the
    surface normal from the grid derivatives, the volume (an ink zarr level, uint8) sampled trilinearly at t = -depth..depth native
    voxels along it and max-composited into <out-dir>/wNNN.tif (uint8); --ct also the CT at t = 0 into wNNN_ct.tif. Pixels whose
-   cell has an invalid corner are 0. The volume box under the wrap is read once (sub-block wraps). */
+   cell has an invalid corner are 0. Rendered in output tiles of --tile pixels, each reading only the volume around its own
+   vertices (+- depth), its pixel rows over --threads: any wrap size in bounded memory. */
 static float trilin(const uint8_t *v, const int64_t n[3], double z, double y, double x) {
     if (z < 0 || y < 0 || x < 0 || z > n[0] - 1 || y > n[1] - 1 || x > n[2] - 1) return 0.f;
     int z0 = (int)z, y0 = (int)y, x0 = (int)x;
@@ -566,11 +597,41 @@ static float *read_tif_f32(const char *path, int *w, int *h) {
     if (tiff_read_page(t, 0, d)) { free(d); tiff_close(t); return nullptr; }
     *w = pg.w; *h = pg.h; tiff_close(t); return d;
 }
+typedef struct {   /* ufsm render: one output tile's pixel rows over threads */
+    const float *X, *Y, *Z; int w, h; double gs;   /* the vertex grid; output pixels per grid step */
+    const uint8_t *vol, *ct; int64_t o[3], n[3]; int depth;
+    uint8_t *img, *cimg; int ow, px0, px1, py0, py1; _Atomic int next;
+} render_job;
+static void *render_rows(void *arg) {
+    render_job *J = arg; const int w = J->w, h = J->h;
+    for (int py; (py = J->py0 + atomic_fetch_add(&J->next, 1)) < J->py1;) for (int px = J->px0; px < J->px1; px++) {
+        const double gu = px / J->gs, gv = py / J->gs;
+        int c0 = (int)gu, r0 = (int)gv; if (c0 >= w - 1) c0 = w - 2; if (r0 >= h - 1) r0 = h - 2; if (c0 < 0 || r0 < 0) continue;
+        const double fu = gu - c0, fv = gv - r0;
+        const size_t i00 = (size_t)r0 * w + c0, i01 = i00 + 1, i10 = i00 + w, i11 = i10 + 1;
+        if (J->Z[i00] < 0 || J->Z[i01] < 0 || J->Z[i10] < 0 || J->Z[i11] < 0) continue;
+        const float *A[3] = {J->Z, J->Y, J->X}; double P[3], du[3], dv[3];
+        for (int d = 0; d < 3; d++) {
+            const double a = A[d][i00], b = A[d][i01], c = A[d][i10], e = A[d][i11];
+            P[d] = (1 - fv) * ((1 - fu) * a + fu * b) + fv * ((1 - fu) * c + fu * e);
+            du[d] = (1 - fv) * (b - a) + fv * (e - c); dv[d] = (1 - fu) * (c - a) + fu * (e - b);
+        }
+        double N[3] = {du[1] * dv[2] - du[2] * dv[1], du[2] * dv[0] - du[0] * dv[2], du[0] * dv[1] - du[1] * dv[0]};
+        const double nl = sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]); if (nl < 1e-12) continue;
+        for (int d = 0; d < 3; d++) N[d] /= nl;
+        float m = 0;
+        for (int t = -J->depth; t <= J->depth; t++) { const float v = trilin(J->vol, J->n, P[0] + t * N[0] - J->o[0], P[1] + t * N[1] - J->o[1], P[2] + t * N[2] - J->o[2]); if (v > m) m = v; }
+        J->img[(size_t)py * J->ow + px] = (uint8_t)lroundf(m);
+        if (J->cimg) J->cimg[(size_t)py * J->ow + px] = (uint8_t)lroundf(trilin(J->ct, J->n, P[0] - J->o[0], P[1] - J->o[1], P[2] - J->o[2]));
+    }
+    return nullptr;
+}
 static int cmd_render(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16]\n"); return 2; }
     const int vi = arg_index(argc, argv, "--volume"), ci = arg_index(argc, argv, "--ct");
     if (vi < 0 || vi + 2 >= argc) { fprintf(stderr, "render: --volume ROOT KEY\n"); return 2; }
     const double scale = atof(opt(argc, argv, "--scale", "1")); const int depth = atoi(opt(argc, argv, "--depth", "8"));
+    const int tile = atoi(opt(argc, argv, "--tile", "512")), nthreads = atoi(opt(argc, argv, "--threads", "16"));
     const char *cache = opt(argc, argv, "--cache", nullptr);
     z3 *vz = z3_open(store_open(argv[vi + 1]), argv[vi + 2], cache), *cz = ci > 0 && ci + 2 < argc ? z3_open(store_open(argv[ci + 1]), argv[ci + 2], cache) : nullptr;
     if (!vz || (ci > 0 && !cz)) { fprintf(stderr, "render: %s\n", z3_error()); return 1; }
@@ -583,42 +644,38 @@ static int cmd_render(int argc, char **argv) {
         snprintf(p, sizeof p, "%s/%s/x.tif", argv[2], de->d_name); float *X = read_tif_f32(p, &w, &h);
         snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = read_tif_f32(p, &w2, &h2);
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = read_tif_f32(p, &w3, &h3);
-        if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3) { free(X); free(Y); free(Z); continue; }
+        if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || w < 2 || h < 2) { free(X); free(Y); free(Z); continue; }
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
         double step = 1; { FILE *f = fopen(p, "rb"); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"scale\": ["); if (q) step = 1 / atof(q + 10); } }
-        double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
-        for (size_t i = 0; i < (size_t)w * h; i++) { if (Z[i] < 0) continue; const double v[3] = {Z[i], Y[i], X[i]}; for (int d = 0; d < 3; d++) { if (v[d] < lo[d]) lo[d] = v[d]; if (v[d] > hi[d]) hi[d] = v[d]; } }
-        if (lo[0] > hi[0]) { free(X); free(Y); free(Z); continue; }
-        int64_t o[3], n[3];
-        for (int d = 0; d < 3; d++) { o[d] = (int64_t)floor(lo[d]) - depth - 2; if (o[d] < 0) o[d] = 0; n[d] = (int64_t)ceil(hi[d]) + depth + 3 - o[d]; }
-        uint8_t *vol = malloc((size_t)n[0] * n[1] * n[2]), *ct = cz ? malloc((size_t)n[0] * n[1] * n[2]) : nullptr;
-        if (z3_read(vz, o, n, vol, 16) || (cz && z3_read(cz, o, n, ct, 16))) { fprintf(stderr, "render: read failed: %s\n", z3_error()); return 1; }
-        const int ow = (int)((w - 1) * step * scale) + 1, oh = (int)((h - 1) * step * scale) + 1;
+        const double gs = step * scale;   /* output pixels per grid step */
+        const int ow = (int)((w - 1) * gs) + 1, oh = (int)((h - 1) * gs) + 1;
         uint8_t *img = calloc((size_t)ow * oh, 1), *cimg = cz ? calloc((size_t)ow * oh, 1) : nullptr;
-        for (int py = 0; py < oh; py++) for (int px = 0; px < ow; px++) {
-            const double gu = px / (step * scale), gv = py / (step * scale);
-            int c0 = (int)gu, r0 = (int)gv; if (c0 >= w - 1) c0 = w - 2; if (r0 >= h - 1) r0 = h - 2; if (c0 < 0 || r0 < 0) continue;
-            const double fu = gu - c0, fv = gv - r0;
-            const size_t i00 = (size_t)r0 * w + c0, i01 = i00 + 1, i10 = i00 + w, i11 = i10 + 1;
-            if (Z[i00] < 0 || Z[i01] < 0 || Z[i10] < 0 || Z[i11] < 0) continue;
-            const float *A[3] = {Z, Y, X}; double P[3], du[3], dv[3];
-            for (int d = 0; d < 3; d++) {
-                const double a = A[d][i00], b = A[d][i01], c = A[d][i10], e = A[d][i11];
-                P[d] = (1 - fv) * ((1 - fu) * a + fu * b) + fv * ((1 - fu) * c + fu * e);
-                du[d] = (1 - fv) * (b - a) + fv * (e - c); dv[d] = (1 - fu) * (c - a) + fu * (e - b);
+        /* output tiles: each reads only the volume around its own vertices (+- depth), so a wrap of any size renders in bounded memory */
+        for (int ty = 0; ty < oh; ty += tile) for (int tx = 0; tx < ow; tx += tile) {
+            const int py1 = ty + tile < oh ? ty + tile : oh, px1 = tx + tile < ow ? tx + tile : ow;
+            const int r0 = (int)(ty / gs), r1 = (int)fmin(h - 1, ceil(py1 / gs) + 1), c0 = (int)(tx / gs), c1 = (int)fmin(w - 1, ceil(px1 / gs) + 1);
+            double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+            for (int r = r0; r <= r1; r++) for (int c = c0; c <= c1; c++) {
+                const size_t i = (size_t)r * w + c; if (Z[i] < 0) continue;
+                const double v[3] = {Z[i], Y[i], X[i]}; for (int d = 0; d < 3; d++) { if (v[d] < lo[d]) lo[d] = v[d]; if (v[d] > hi[d]) hi[d] = v[d]; }
             }
-            double N[3] = {du[1] * dv[2] - du[2] * dv[1], du[2] * dv[0] - du[0] * dv[2], du[0] * dv[1] - du[1] * dv[0]};
-            const double nl = sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]); if (nl < 1e-12) continue;
-            for (int d = 0; d < 3; d++) N[d] /= nl;
-            float m = 0;
-            for (int t = -depth; t <= depth; t++) { const float v = trilin(vol, n, P[0] + t * N[0] - o[0], P[1] + t * N[1] - o[1], P[2] + t * N[2] - o[2]); if (v > m) m = v; }
-            img[(size_t)py * ow + px] = (uint8_t)lroundf(m);
-            if (cimg) cimg[(size_t)py * ow + px] = (uint8_t)lroundf(trilin(ct, n, P[0] - o[0], P[1] - o[1], P[2] - o[2]));
+            if (lo[0] > hi[0]) continue;
+            render_job J = {X, Y, Z, w, h, gs, nullptr, nullptr, {0, 0, 0}, {0, 0, 0}, depth, img, cimg, ow, tx, px1, ty, py1, 0};
+            for (int d = 0; d < 3; d++) { J.o[d] = (int64_t)floor(lo[d]) - depth - 2; if (J.o[d] < 0) J.o[d] = 0; J.n[d] = (int64_t)ceil(hi[d]) + depth + 3 - J.o[d]; }
+            const size_t nv = (size_t)J.n[0] * J.n[1] * J.n[2];
+            if (nv > ((size_t)4 << 30)) { fprintf(stderr, "render: %s tile %d,%d spans %lldx%lldx%lld voxels (a fold?): skipped; use a smaller --tile\n", de->d_name, ty, tx, (long long)J.n[0], (long long)J.n[1], (long long)J.n[2]); continue; }
+            uint8_t *vol = malloc(nv), *ct = cz ? malloc(nv) : nullptr;
+            if (!vol || (cz && !ct) || z3_read(vz, J.o, J.n, vol, 16) || (cz && z3_read(cz, J.o, J.n, ct, 16))) { fprintf(stderr, "render: read failed: %s\n", z3_error()); return 1; }
+            J.vol = vol; J.ct = ct;
+            pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
+            for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, render_rows, &J);
+            for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+            free(vol); free(ct);
         }
         snprintf(p, sizeof p, "%s/%s.tif", argv[3], de->d_name);
         if (tiffw_write(p, ow, oh, 1, img, 1)) { fprintf(stderr, "render: cannot write %s\n", p); return 1; }
         if (cimg) { snprintf(p, sizeof p, "%s/%s_ct.tif", argv[3], de->d_name); if (tiffw_write(p, ow, oh, 1, cimg, 1)) return 1; }
-        free(X); free(Y); free(Z); free(vol); free(ct); free(img); free(cimg); nw++;
+        free(X); free(Y); free(Z); free(img); free(cimg); nw++;
     }
     closedir(dd);
     fprintf(stderr, "render: %d wraps written to %s\n", nw, argv[3]);

@@ -235,9 +235,19 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   90.85%, 4 slabs of 512 (knots every 512) 90.93% vs 90.87% for one box at the same knots; wraps 40-52 from the 4-slab set have
   no seams (row-to-row steps at the slab boundaries: median 4.5 / p99 11.6 native vs 4.4 / 13.3 elsewhere). The fitter only
   loads one slab's full-resolution fields at a time (`fit_fields_load` rows [fz0, fz1), pooled, or geometry only); 1.6 GB peak.
-- Left: the winding writer, the scoring and the wraps root finding are single-threaded CPU loops (GPU next); the field-zarr
-  size for all of Paris4 at h 8 (~0.5 TB raw before compression; h 16 is 8x smaller, its fit quality unmeasured); the 9.6 um
-  version; the desk runs.
+- Grid evaluation of a set on the GPU (`fit_set_upload` / `fit_set_grid`, nn_fit_grid: per z row model a, optionally blended
+  with b, as fit_set_W): `fit --winding` writes shard by shard and `fit --codes` streams label z-chunks (~32M voxels) through U on
+  the GPU into 1/72- and 1/1024-turn histograms (mode, refined gauge, |error| quantiles; no per-voxel arrays, no whole-box code
+  read). Smoke block, 4-slab set: score + winding 13.7 s -> 5.4 s, 1.4 -> 0.34 GB; winding volume vs the CPU writer: 0.05% of
+  voxels differ, by 1/256 turn; score unchanged (0.9093). `ufsm wraps` runs rows on --threads (16) and finds each vertex's root
+  scanning outward from the previous vertex's radius (the first ring of pitch / 4 intervals with a crossing; 24 bisections)
+  instead of along the whole ray: wraps 40-52 6.8 -> 0.79 s (1 thread 4.0 s); neighbour steps > 3 grid steps 0.13% before and
+  after. `--fields` reads raw or zarr fields, the data weight max-pooled to <= ~1 GB. `ufsm render` works in output tiles
+  (--tile 512 px), each reading only the volume around its own vertices (+- depth), pixel rows over --threads: renders of the
+  oracle wraps byte-identical with 64-px tiles, 43 MB peak. Whole-scroll estimates: wraps ~640k vertices/s (Paris4's ~1.4e9
+  in ~40 min on 16 threads); render bound by decoding the ink zarr around each wrap.
+- Left: the field-zarr size for all of Paris4 at h 8 (~0.5 TB raw before compression; h 16 is 8x smaller, its fit quality
+  unmeasured); BigTIFF for renders over 4 GB compressed; the 9.6 um version; the desk runs.
 
 ## Half-resolution networks (2026-10-11)
 

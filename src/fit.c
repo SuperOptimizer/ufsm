@@ -539,18 +539,29 @@ static int ray_root(double (*ev)(const void *, double, double, double), const vo
     }
     if (rhi <= rlo) return -1;
     const double pit = knot_lerp(m->pitch, m->nk, m->knot_dz, z), dr = pit / 4;
-    double best = -1, bestd = 1e300, rp = rlo, fp = ev(ctx, z, cy + rlo * sy, cx + rlo * sx) - k;
-    for (double rr = rlo + dr; rp < rhi; rr += dr) {
-        if (rr > rhi) rr = rhi;
-        const double fr = ev(ctx, z, cy + rr * sy, cx + rr * sx) - k;
-        if ((fp < 0) != (fr < 0) && fabs(fp - fr) < 0.5) {   /* a crossing (not the theta cut of a nearby ray: |jump| < half a turn) */
-            double a = rp, b = rr, fa = fp;
-            for (int it = 0; it < 40; it++) { const double mid = 0.5 * (a + b), fm = ev(ctx, z, cy + mid * sy, cx + mid * sx) - k; if ((fa < 0) == (fm < 0)) { a = mid; fa = fm; } else b = mid; }
+    /* intervals of dr stepping outward from the hint on both sides; the first ring of intervals with a crossing (|jump| < half a
+       turn: not the theta cut of a nearby ray) holds the crossing nearest the hint (to within dr) */
+    const double h0 = fmin(fmax(r_hint, rlo), rhi), f0 = ev(ctx, z, cy + h0 * sy, cx + h0 * sx) - k;
+    double ro = h0, fo = f0, ri = h0, fi = f0, best = -1, bestd = 1e300;
+    while (ro < rhi || ri > rlo) {
+        double seg[2][3]; int ns = 0;   /* (a, b, f(a)) of this ring's crossing intervals */
+        if (ro < rhi) {
+            const double rn = fmin(ro + dr, rhi), fn = ev(ctx, z, cy + rn * sy, cx + rn * sx) - k;
+            if ((fo < 0) != (fn < 0) && fabs(fo - fn) < 0.5) { seg[ns][0] = ro; seg[ns][1] = rn; seg[ns][2] = fo; ns++; }
+            ro = rn; fo = fn;
+        }
+        if (ri > rlo) {
+            const double rn = fmax(ri - dr, rlo), fn = ev(ctx, z, cy + rn * sy, cx + rn * sx) - k;
+            if ((fi < 0) != (fn < 0) && fabs(fi - fn) < 0.5) { seg[ns][0] = rn; seg[ns][1] = ri; seg[ns][2] = fn; ns++; }
+            ri = rn; fi = fn;
+        }
+        for (int q = 0; q < ns; q++) {
+            double a = seg[q][0], b = seg[q][1], fa = seg[q][2];
+            for (int it = 0; it < 24; it++) { const double mid = 0.5 * (a + b), fm = ev(ctx, z, cy + mid * sy, cx + mid * sx) - k; if ((fa < 0) == (fm < 0)) { a = mid; fa = fm; } else b = mid; }
             const double root = 0.5 * (a + b);
             if (fabs(root - r_hint) < bestd) { bestd = fabs(root - r_hint); best = root; }
         }
-        rp = rr; fp = fr;
-        if (rr >= rhi) break;
+        if (ns) break;
     }
     if (best < 0) return -1;
     *r = best;
@@ -779,4 +790,82 @@ fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap)
         fit_fields_free(&sb);
     }
     return s;
+}
+
+/* ---- grid evaluation of a fit set on the GPU ---- */
+struct fit_set_dev { int nm; fit_dev *hm, *dm; void *buf[5 * 65]; int nb; float *out; size_t outn; fit_grid_row *rows; int nrows; };
+static void *dev_copy(fit_set_dev *g, const void *src, size_t n) { void *d = nn_malloc(n ? n : 4); if (n) nn_h2d(d, src, n); g->buf[g->nb++] = d; return d; }
+fit_set_dev *fit_set_upload(const fit_set *s) {
+    if (s->n + 1 > 64) { fprintf(stderr, "fit_set_upload: at most 63 slabs\n"); return nullptr; }
+    fit_set_dev *g = calloc(1, sizeof *g); g->nm = s->n + 1; g->hm = calloc(g->nm, sizeof(fit_dev));
+    for (int k = 0; k < g->nm; k++) {
+        const fit_model *m = k < s->n ? s->slab[k] : s->global; fit_dev *d = &g->hm[k];
+        const int na = (int)(m->D * m->h) + 1;
+        d->D = m->D; d->H = m->H; d->W = m->W; d->h = (float)m->h;
+        d->cy = dev_copy(g, m->cy, na * 4); d->cx = dev_copy(g, m->cx, na * 4); d->naxis = na;
+        d->dir = m->dir; d->nk = m->nk; d->knot_dz = m->knot_dz; d->pitch = dev_copy(g, m->pitch, m->nk * 4); d->offset = dev_copy(g, m->offset, m->nk * 4);
+        d->L = m->L; d->lz = m->lz; d->ly = m->ly; d->lx = m->lx; d->delta = dev_copy(g, m->delta, (size_t)m->lz * m->ly * m->lx * 4);
+    }
+    g->dm = dev_copy(g, g->hm, g->nm * sizeof(fit_dev));
+    return g;
+}
+void fit_set_dev_free(fit_set_dev *g) {
+    if (!g) return;
+    for (int k = 0; k < g->nb; k++) nn_free(g->buf[k]);
+    if (g->out) nn_free(g->out);
+    if (g->rows) nn_free(g->rows);
+    free(g->hm); free(g);
+}
+static fit_grid_row set_row(const fit_set *s, double z) {   /* the models of box-local z, as fit_set_W */
+    fit_grid_row r = {s->n, s->n, (float)z, 0.f, 0.f, 0.f};
+    for (int k = 0; k < s->n; k++) {
+        if (z < s->z0[k] || z >= s->z1[k]) continue;
+        r.a = r.b = k;
+        if (k > 0 && s->blend > 0 && z < s->z0[k] + s->blend) { r.a = k - 1; r.b = k; r.t = (float)((z - s->z0[k] + s->blend) / (2 * s->blend)); }
+        else if (k + 1 < s->n && s->blend > 0 && z >= s->z1[k] - s->blend) { r.a = k; r.b = k + 1; r.t = (float)((z - s->z1[k] + s->blend) / (2 * s->blend)); }
+        break;
+    }
+    r.za = r.a < s->n ? (float)(s->slab[r.a]->origin[0] - s->global->origin[0]) : 0.f;
+    r.zb = r.b < s->n ? (float)(s->slab[r.b]->origin[0] - s->global->origin[0]) : 0.f;
+    return r;
+}
+int fit_set_grid(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, float *out) {
+    const size_t per = (size_t)n[1] * n[2]; if (!per || n[0] <= 0) return 0;
+    int64_t zb = (int64_t)((64u << 20) / per); if (zb < 1) zb = 1; if (zb > n[0]) zb = n[0];   /* ~256 MB of output per batch */
+    if (g->outn < (size_t)zb * per) { if (g->out) nn_free(g->out); g->outn = (size_t)zb * per; g->out = nn_malloc(g->outn * 4); if (!g->out) return -1; }
+    if (g->nrows < zb) { if (g->rows) nn_free(g->rows); g->nrows = (int)zb; g->rows = nn_malloc(zb * sizeof(fit_grid_row)); }
+    fit_grid_row *hr = malloc(zb * sizeof *hr);
+    for (int64_t z0 = 0; z0 < n[0]; z0 += zb) {
+        const int64_t nz = n[0] - z0 < zb ? n[0] - z0 : zb;
+        for (int64_t a = 0; a < nz; a++) hr[a] = set_row(s, o[0] + ((double)(z0 + a) + 0.5) * step);
+        nn_h2d(g->rows, hr, nz * sizeof *hr);
+        nn_fit_grid(g->dm, g->rows, (int)nz, (int)n[1], (int)n[2], (float)(o[1]), (float)(o[2]), (float)step, with_theta, g->out);
+        nn_d2h(out + (size_t)z0 * per, g->out, (size_t)nz * per * 4);
+    }
+    free(hr);
+    return 0;
+}
+
+/* one field array (name: pc ps t0..t5 sp w) of a fit-field directory, max-pooled by pool per axis (raw or zarr; read in z-blocks) */
+uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[3]) {
+    fit_fields_buf g; if (fit_fields_load(dir, 0, 0, 0, &g)) return nullptr;
+    const int D = g.shape[0], H = g.shape[1], W = g.shape[2], Dp = (D + pool - 1) / pool, Hp = (H + pool - 1) / pool, Wp = (W + pool - 1) / pool;
+    char p[1400]; snprintf(p, sizeof p, "%s/fields.json", dir); json *j = read_json_file(p);
+    const int zarr = j && !strcmp(json_str(json_get(j, "format"), "raw"), "zarr"); json_free(j); fit_fields_free(&g);
+    z3 *za = nullptr; FILE *fr = nullptr;
+    if (zarr) za = z3_open(store_open(dir), name, nullptr); else { snprintf(p, sizeof p, "%s/%s.raw", dir, name); fr = fopen(p, "rb"); }
+    if (!za && !fr) return nullptr;
+    uint8_t *out = calloc((size_t)Dp * Hp * Wp, 1), *blk = malloc((size_t)pool * H * W);
+    for (int z0 = 0; z0 < D; z0 += pool) {
+        const int nz = z0 + pool <= D ? pool : D - z0;
+        if (za) { const int64_t o[3] = {z0, 0, 0}, n[3] = {nz, H, W}; if (z3_read(za, o, n, blk, 8)) { free(out); out = nullptr; break; } }
+        else if (fseek(fr, (long)((size_t)z0 * H * W), SEEK_SET) || fread(blk, 1, (size_t)nz * H * W, fr) != (size_t)nz * H * W) { free(out); out = nullptr; break; }
+        uint8_t *o = out + (size_t)(z0 / pool) * Hp * Wp;
+        for (int a = 0; a < nz; a++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            const uint8_t v = blk[((size_t)a * H + y) * W + x]; uint8_t *d = &o[(size_t)(y / pool) * Wp + x / pool]; if (v > *d) *d = v;
+        }
+    }
+    free(blk); if (za) z3_close(za); if (fr) fclose(fr);
+    if (out) { shape[0] = Dp; shape[1] = Hp; shape[2] = Wp; }
+    return out;
 }

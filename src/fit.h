@@ -91,6 +91,11 @@ void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float w_smooth, f
    (12 planes over F = ceil(box / h), see src/nn_fit.cu); t = the window origin relative to the box */
 void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
                   int ch_recto, int ch_phase, int ch_normal, int ch_density, float *acc);
+/* W (or U = W + dir theta / 2 pi when with_theta) on a grid: row a at box-local native z rows[a].z, voxel (b, c) at y0 + (b + 0.5)
+   step, x0 + (c + 0.5) step; per row model a (z - za) blended with model b (z - zb) by t: (1 - t) W_a + t W_b. ms: device array of
+   models (device pointers inside); out: device float nz x ny x nx */
+typedef struct { int a, b; float z, t, za, zb; } fit_grid_row;
+void nn_fit_grid(const fit_dev *ms, const fit_grid_row *rows, int nz, int ny, int nx, float y0, float x0, float step, int with_theta, float *out);
 
 /* fit fields of a directory (ufsm band --fit-fields / predict --fit-fields: raw arrays; predict --fit-zarr: zarr arrays), field
    rows [fz0, fz1) (fz1 <= 0: to the end), pooled by pool per axis (1: none; pooled phase vectors are left uninformative, so
@@ -109,3 +114,12 @@ int fit_set_save(const fit_set *s, const char *dir);   /* dir/global, dir/slabNN
 fit_set *fit_set_load(const char *dir);                 /* a set directory or a single model directory */
 void fit_set_free(fit_set *s);
 fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap);
+
+/* a fit set on the GPU (every model's knots, lattice and axis) for grid evaluation */
+typedef struct fit_set_dev fit_set_dev;
+fit_set_dev *fit_set_upload(const fit_set *s);
+void fit_set_dev_free(fit_set_dev *g);
+/* W (with_theta: U) of the set on the grid of n[0] x n[1] x n[2] points at box-local native (o + (i + 0.5) step) per axis, into the
+   host float array out (row-major); evaluated on the GPU in z-row batches. Matches fit_set_W up to float rounding. */
+int fit_set_grid(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, float *out);
+uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[3]);   /* one field array, max-pooled (raw or zarr) */
