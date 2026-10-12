@@ -29,6 +29,7 @@ typedef struct {
     float phase_ramp;               /* phase_stage: phase weight from phase_ramp * w_phase to w_phase */
     int unwrap_voxels;              /* phase-stage init: 1 voxel-level quality-guided unwrapping (default), 0 lattice-node unwrapping */
     int analytic;                   /* 1: nn_fit_loss2 (analytic grad W, voxel minibatches; knots fixed after the prior), 0: nn_fit_loss */
+    double um;                      /* native voxel size: the slab driver's lattices / pooling are physical (2.4 um: 512 ... 32) */
     const struct fit_model *init;   /* start from this model instead of the prior (its direction and knots; delta sampled at the first
                                        stage), its box origin at init_off (native) in this box's coordinates negated: point p here is
                                        p + init_off there */
@@ -49,18 +50,20 @@ typedef struct fit_model {
     float *delta;                   /* lz * ly * lx */
     int D, H, W; double h;          /* the field box (native extent D h, H h, W h) */
     long long origin[3];            /* the box's native origin (set by the caller; saved with the model) */
+    double um;                      /* native voxel size (saved; 0 = unknown, read as 2.4) */
     float *cy, *cx;                 /* axis table (D h + 1 entries) */
     double loss[6];                 /* final loss parts: total, phase, normal, density, nondegeneracy, smoothness */
 } fit_model;
 
 fit_cfg fit_cfg_default(void);
+int fit_scale_L(int L, double f);   /* a lattice / knot spacing scaled by f (>= 2) */
 fit_model *fit_run(const fit_fields *f, const fit_cfg *c);
 void fit_free(fit_model *m);
 double fit_W(const fit_model *m, double z, double y, double x);   /* winding coordinate at a box-local native point (host) */
 int fit_save(const fit_model *m, const char *dir);
 /* a fit-field directory (the input of ufsm fit): pc ps t0..t5 sp w .raw (shape[0] x shape[1] x shape[2] uint8) and fields.json
    (origin, shape, h, the axis per native z of the box in box-local coordinates, na = shape[0] h + 1 entries) */
-int fit_fields_save(const char *dir, const long long origin[3], const int shape[3], int h, uint8_t *const a[10], const float *cy, const float *cx, int na);   /* dir/model.json, delta.f32 (lattice), axis.f32 (cy then cx) */
+int fit_fields_save(const char *dir, const long long origin[3], const int shape[3], int h, double um, uint8_t *const a[10], const float *cy, const float *cx, int na);   /* um: the native voxel size */   /* dir/model.json, delta.f32 (lattice), axis.f32 (cy then cx) */
 fit_model *fit_load(const char *dir);
 /* the radius along the ray at box-local z and angle theta from the axis where W = k (bisection between consecutive samples
    with a sign change, the crossing nearest r_hint); returns 0 and sets *r, or -1 when the ray crosses no W = k inside the box */
@@ -90,7 +93,7 @@ void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float w_smooth, f
 /* predict --fit-fields: pool a window's interior (logits [c][W^3] fp32, the window's CT) into the box's fit-field accumulators
    (12 planes over F = ceil(box / h), see src/nn_fit.cu); t = the window origin relative to the box */
 void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
-                  int ch_recto, int ch_phase, int ch_normal, int ch_density, float *acc);
+                  int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, float *acc);   /* dscale: the checkpoint's density_scale */
 /* W (or U = W + dir theta / 2 pi when with_theta) on a grid: row a at box-local native z rows[a].z, voxel (b, c) at y0 + (b + 0.5)
    step, x0 + (c + 0.5) step; per row model a (z - za) blended with model b (z - zb) by t: (1 - t) W_a + t W_b. ms: device array of
    models (device pointers inside); out: device float nz x ny x nx */
@@ -101,7 +104,7 @@ void nn_fit_grid(const fit_dev *ms, const fit_grid_row *rows, int nz, int ny, in
    rows [fz0, fz1) (fz1 <= 0: to the end), pooled by pool per axis (1: none; pooled phase vectors are left uninformative, so
    pooled fields are for the gradient-only stages; 0: the geometry and the whole axis table only, no arrays). The slab's native origin (box-local) is (fz0 h, 0, 0); f.cy / f.cx are the
    slab's axis table (box-local y, x). */
-typedef struct { fit_fields f; uint8_t *a[10]; float *cy, *cx; long long origin[3]; int shape[3]; int h; } fit_fields_buf;
+typedef struct { fit_fields f; uint8_t *a[10]; float *cy, *cx; long long origin[3]; int shape[3]; int h; double um; } fit_fields_buf;   /* um: native voxel size (fields.json "um", default 2.4) */
 int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b);
 void fit_fields_free(fit_fields_buf *b);
 

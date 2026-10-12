@@ -3,7 +3,7 @@
    seed 1, fp16 input); UFSM_BENCH_COVER=plan.json: draw the cover's tiles (as train --cover); UFSM_BENCH_HASH=1: print a hash of
    every batch's input, targets, mask and weights (deterministic mode: the same for any worker count; byte-identity checks);
    UFSM_BENCH_AUG=N: augment mode; UFSM_BENCH_DET=1: deterministic default recipe; UFSM_BENCH_SOFT=S: soft sigma;
-   UFSM_BENCH_SIDE=2: the winding phase of band sources (task unwrap), hashed too;
+   UFSM_BENCH_SIDE=2: the winding phase of band sources (task unwrap), hashed too; UFSM_BENCH_LEVELS=p0,p1,...: level draw weights;
    UFSM_BENCH_PAPYRUS=sigma,tau_lo,tau_hi,clean: task papyrus labels (cutoffs U(50, 128), conditioned); UFSM_BENCH_SCAN=P: the
    papyrus recipe's scanner ops (noise cnoise blur lowres sharpen ring slice quant) at probability P;
    UFSM_BENCH_DUMP=prefix: mid-z planes of the first batch (prefix-input.pgm, -target.pgm, -mask.pgm) and its cutoff code */
@@ -33,6 +33,7 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_BENCH_AUG")) c.augment = atoi(getenv("UFSM_BENCH_AUG"));
     if (getenv("UFSM_BENCH_DET")) { c.deterministic = 1; c.seed = 1; }
     if (getenv("UFSM_BENCH_SOFT")) c.soft = (float)atof(getenv("UFSM_BENCH_SOFT"));
+    if (getenv("UFSM_BENCH_LEVELS")) { char *t = strdup(getenv("UFSM_BENCH_LEVELS")); int l = 0; memset(c.level_p, 0, sizeof c.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) c.level_p[l++] = atof(q); free(t); }   /* as train --levels */
     if (getenv("UFSM_BENCH_SIDE")) c.side = atoi(getenv("UFSM_BENCH_SIDE"));   /* task unwrap's phase (no band affinities): the side array is hashed too */
     if (getenv("UFSM_BENCH_COVER")) {
         cover_plan *plan = cover_load(getenv("UFSM_BENCH_COVER"), S, P); if (!plan) return 1;

@@ -1,5 +1,5 @@
 /* nn_unwrap_targets (task unwrap): on a planar phase field phase = frac(k . x) and on a radial one phase = frac(r / pitch) the
-   targets are the sign-free normal n n^T and min(1, 32 rho) with rho = |grad phase| (turns per voxel); unknown voxels, voxels
+   targets are the sign-free normal n n^T and min(1, scale rho) (32; also 8) with rho = |grad phase| (turns per voxel); unknown voxels, voxels
    whose +-s stencil samples are unknown and the border are masked. */
 #include "nn.h"
 #include <math.h>
@@ -8,12 +8,13 @@
 #include <string.h>
 
 static int fails;
+static float g_ds = 32.f;   /* the density scale: min(1, g_ds rho) */
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
 
 static void run(const uint8_t *ph, int D, int H, int W, int s, uint8_t *t, uint8_t *m) {
     const size_t n = (size_t)D * H * W;
     uint8_t *dp = nn_malloc(n), *dt = nn_malloc(7 * n), *dm = nn_malloc(n);
-    nn_h2d(dp, ph, n); nn_unwrap_targets(dp, D, H, W, s, dt, dm); nn_sync();
+    nn_h2d(dp, ph, n); nn_unwrap_targets(dp, D, H, W, s, g_ds, dt, dm); nn_sync();
     nn_d2h(t, dt, 7 * n); nn_d2h(m, dm, n);
     nn_free(dp); nn_free(dt); nn_free(dm);
 }
@@ -24,7 +25,7 @@ static double check(const uint8_t *t, const uint8_t *m, int D, int H, int W, voi
         const size_t i = ((size_t)z * H + y) * W + x;
         if (!m[i]) continue;
         double nv[3], rho; truth(z, y, x, nv, &rho);
-        const double ref[7] = {nv[0] * nv[0], nv[1] * nv[1], nv[2] * nv[2], 0.5 + nv[0] * nv[1], 0.5 + nv[0] * nv[2], 0.5 + nv[1] * nv[2], fmin(1, 32 * rho)};
+        const double ref[7] = {nv[0] * nv[0], nv[1] * nv[1], nv[2] * nv[2], 0.5 + nv[0] * nv[1], 0.5 + nv[0] * nv[2], 0.5 + nv[1] * nv[2], fmin(1, g_ds * rho)};
         for (int c = 0; c < 7; c++) err = fmax(err, fabs(t[c * n + i] / 255. - ref[c]));
         (*cnt)++;
     }
@@ -57,6 +58,10 @@ int main(void) {
     CHECK(cnt == inner, "plane: %zu masked voxels, expected the %zu interior ones", cnt, inner);
     CHECK(e < 0.03, "plane: max target error %.4f", e);
     printf("plane: %zu voxels, max target error %.4f\n", cnt, e);
+    g_ds = 8.f;   /* the 9.6 um density code (--density-scale 8) */
+    run(ph, D, H, W, s, t, m); e = check(t, m, D, H, W, plane_truth, &cnt);
+    CHECK(e < 0.03, "plane, density scale 8: max target error %.4f", e);
+    g_ds = 32.f;
     for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {   /* radial, with an unknown slab */
         const size_t i = ((size_t)z * H + y) * W + x;
         double q = hypot(y - cy, x - cx) / pitch; q -= floor(q);

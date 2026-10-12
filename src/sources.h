@@ -74,7 +74,11 @@ typedef struct {
     z3 *band;
     float band_radius, band_span;   /* native voxels */
     z3 *phase;   /* optional: the band field's winding phase (band.h PHASE_*) precomputed on the same label grid (ufsm phase-raster),
-                    {"band": {..., "phase": {"root": ..., "key": "4.8"}}}: windows read it instead of computing the band field */
+                    {"band": {..., "phase": {"root": ..., "key": "4.8"}}}: windows read it instead of computing the band field;
+                    "level": L (default 1, the label grid) when it is on the grid of CT level L (e.g. "9.6" pooled by ufsm downsample,
+                    level 2): samples of level L read it directly, of level L - 1 upsampled 2x */
+    int phase_level, phase_direct;   /* the CT level whose grid the stored phase is on (1: the 4.8 um label grid of 2.4 um scans);
+                                        phase_direct: "level" given, so samples of that level read it directly */
 } source;
 
 typedef struct {

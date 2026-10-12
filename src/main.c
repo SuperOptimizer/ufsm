@@ -11,6 +11,7 @@
 #include "z3w.h"
 #include "tiff.h"
 #include <dirent.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <math.h>
@@ -50,6 +51,11 @@ static int usage(void) {
         "  ufsm eval <pred-root> <pred-group> <label-root> <label-group> --um U [--box ...]   precision/recall/dice\n"
         "  ufsm sample  <sources.json> [--P 128] [--B 2] [--n 4] [--seed S] [--workers W] [--out DIR] [--noaug]\n"
         "  ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1]   warm the CT chunk cache for the labelled cells\n"
+        "  ufsm phase-raster <codes-root> <key> <out-dir> [--box ...]          band phase precomputed for the sampler\n"
+        "  ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase  one array halved per axis (labels, phase)\n"
+        "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
+        "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
+        "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
         "root: local dir or https://.../volcomp ; keys are paths under root\n");
     return 2;
 }
@@ -193,7 +199,7 @@ static int band_fit_fields(const uint8_t *ph, const uint8_t *spc, const int n[3]
     const int na = D * h + 1; float *cy = malloc(na * sizeof(float)), *cx = malloc(na * sizeof(float));
     for (int z = 0; z < na; z++) { double y, x; axis_at(ax, (double)(b[0] + z), &y, &x); cy[z] = (float)(y - b[1]); cx[z] = (float)(x - b[2]); }
     const long long org[3] = {b[0], b[1], b[2]}; const int shp[3] = {D, H, W};
-    const int rc = fit_fields_save(dir, org, shp, h, a, cy, cx, na);
+    const int rc = fit_fields_save(dir, org, shp, h, 2.4, a, cy, cx, na);   /* the band field: 2.4 um native (4.8 um labels) */
     for (int k = 0; k < 10; k++) free(a[k]);
     free(cy); free(cx);
     return rc;
@@ -373,7 +379,6 @@ static int cmd_band(int argc, char **argv) {
    a global coarse fit plus z-slabs of Z native voxels (a fit set; --out writes it, --model reads a set or a model). --codes: score
    against a winding_mod14 band raster (label grid, 2 native voxels per label voxel, code = 1 + round(18 q) mod 252 with q the mesh
    coordinate, q = U for dir +1): on every labelled voxel of the box U_fit - q must be one constant mod 14 turns. */
-static int cmp_float(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
 static int cmd_fit(int argc, char **argv) {
     const char *dir = argv[2];
     fit_cfg c = fit_cfg_default();
@@ -388,6 +393,9 @@ static int cmd_fit(int argc, char **argv) {
     const int slab = atoi(opt(argc, argv, "--slab", "0")), overlap = atoi(opt(argc, argv, "--overlap", "256"));
     fit_fields_buf fb; memset(&fb, 0, sizeof fb);
     if (fit_fields_load(dir, 0, 0, min || slab > 0 ? 0 : 1, &fb)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }   /* (slab runs load per slab; a given model needs the geometry only) */
+    c.um = fb.um;   /* default lattices and knots are physical: given in 2.4 um voxels, scaled to the fields' native voxels */
+    if (!*opt(argc, argv, "--knot-dz", "")) c.knot_dz = fit_scale_L(1024, 2.4 / fb.um);
+    if (!*opt(argc, argv, "--lattice", "")) for (int k = 0; k < c.nstage; k++) c.lattice[k] = fit_scale_L(c.lattice[k], 2.4 / fb.um);
     fit_set *fs = nullptr;
     if (min) fs = fit_set_load(min);
     else if (slab > 0) fs = fit_run_slabs(dir, &c, slab, overlap);
@@ -395,6 +403,7 @@ static int cmd_fit(int argc, char **argv) {
     if (!fs) { fprintf(stderr, "fit: no model%s%s\n", min ? " in " : "", min ? min : ""); return 1; }
     const fit_model *m = fs->global;
     if (!min && !slab) for (int d = 0; d < 3; d++) fs->global->origin[d] = fb.origin[d];
+    if (!min) { fs->global->um = fb.um; for (int k = 0; k < fs->n; k++) fs->slab[k]->um = fb.um; }
     const long long org[3] = {m->origin[0], m->origin[1], m->origin[2]};
     const int shp[3] = {fb.shape[0], fb.shape[1], fb.shape[2]}; const double h = fb.h;
     fprintf(stderr, "fit: dir %+d, %d slab model(s), global lattice %d (%dx%dx%d), loss %.5f in %.1fs\n", m->dir, fs->n, m->L, m->lz, m->ly, m->lx, m->loss[0], now() - t0);
@@ -402,7 +411,7 @@ static int cmd_fit(int argc, char **argv) {
     if (mout && (fs->n ? fit_set_save(fs, mout) : fit_save(fs->global, mout))) { fprintf(stderr, "fit: cannot save %s\n", mout); return 1; }
     const char *wout = opt(argc, argv, "--winding", nullptr);
     if (wout) {   /* the per-voxel winding number W * 256 (uint16, exact volcomp typed chunks) on a grid of --winding-step native voxels */
-        const int ws = atoi(opt(argc, argv, "--winding-step", "4")); const double um = atof(opt(argc, argv, "--um", "2.4"));
+        const int ws = atoi(opt(argc, argv, "--winding-step", "4")); const double um = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : fb.um;
         const int64_t gs[3] = {(int64_t)ceil(shp[0] * h / ws), (int64_t)ceil(shp[1] * h / ws), (int64_t)ceil(shp[2] * h / ws)};
         char lv[32], ld[1400], at[600]; z3w_level_name(um * ws, lv, sizeof lv); snprintf(ld, sizeof ld, "%s/%s", wout, lv);
         snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"winding coordinate W * 256 (uint16; W = U - dir theta / 2 pi, sheets at integer W)\",\"dir\":%d,\"origin_zyx\":[%lld,%lld,%lld],\"step\":%d}}",
@@ -429,7 +438,8 @@ static int cmd_fit(int argc, char **argv) {
     if (ci > 0 && ci + 2 < argc) {   /* score against the band codes of the box, streamed in label z-chunks (U on the GPU) */
         store *s = store_open(argv[ci + 1]); z3 *z = z3_open(s, argv[ci + 2], nullptr);
         if (!z) { fprintf(stderr, "%s\n", z3_error()); return 1; }
-        int64_t lo[3], ln[3]; for (int d = 0; d < 3; d++) { lo[d] = org[d] / 2; ln[d] = (int64_t)(shp[d] * h / 2); }
+        const double cf = atof(argv[ci + 2]) > 0 ? atof(argv[ci + 2]) / fb.um : 2;   /* label voxel in native voxels (the codes' key is its um: 4.8) */
+        int64_t lo[3], ln[3]; for (int d = 0; d < 3; d++) { lo[d] = (int64_t)floor(org[d] / cf); ln[d] = (int64_t)(shp[d] * h / cf); }
         enum { NB = 14 * 72, NF = 14 * 1024 }; size_t *hist = calloc(NB, sizeof(size_t)), *fine = calloc(NF, sizeof(size_t)), nd = 0;   /* d = U - q mod 14: 1/72 and 1/1024 turn bins */
         FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;   /* box-local z y x, U - q mod 14 per voxel */
         const size_t plane = (size_t)ln[1] * ln[2]; int64_t zc = (int64_t)((32u << 20) / plane); if (zc < 1) zc = 1;
@@ -441,12 +451,12 @@ static int cmd_fit(int argc, char **argv) {
             if (z3_read(z, o3, n3, codes, 8)) { fprintf(stderr, "fit: code read failed: %s\n", z3_error()); return 1; }
             size_t any = 0; for (size_t i = 0; i < (size_t)nz * plane && !any; i++) any = codes[i] >= 1 && codes[i] <= 252;
             if (!any) continue;
-            const double og[3] = {2.0 * o3[0] - 0.5 - org[0], 2.0 * lo[1] - 0.5 - org[1], 2.0 * lo[2] - 0.5 - org[2]};   /* label voxel i at 2 (i + lo) + 0.5 - org */
-            if (fit_set_grid(gd, fs, og, n3, 2.0, 1, U)) { fprintf(stderr, "fit: no device memory for the score grid\n"); return 1; }
+            const double og[3] = {cf * o3[0] - 0.25 * cf - org[0], cf * lo[1] - 0.25 * cf - org[1], cf * lo[2] - 0.25 * cf - org[2]};   /* label voxel i at cf (i + lo + 1 / 4) - org */
+            if (fit_set_grid(gd, fs, og, n3, cf, 1, U)) { fprintf(stderr, "fit: no device memory for the score grid\n"); return 1; }
             for (int64_t zz = 0; zz < nz; zz++) for (int64_t yy = 0; yy < ln[1]; yy++) for (int64_t xx = 0; xx < ln[2]; xx++) {
                 const size_t i = ((size_t)zz * ln[1] + yy) * ln[2] + xx; const uint8_t cd = codes[i];
                 if (cd < 1 || cd > 252) continue;
-                const double pz = 2.0 * (zz + o3[0]) + 0.5 - org[0], py = 2.0 * (yy + lo[1]) + 0.5 - org[1], px = 2.0 * (xx + lo[2]) + 0.5 - org[2];
+                const double pz = cf * (zz + o3[0] + 0.25) - org[0], py = cf * (yy + lo[1] + 0.25) - org[1], px = cf * (xx + lo[2] + 0.25) - org[2];
                 if (pz < 0 || py < 0 || px < 0 || pz > shp[0] * h || py > shp[1] * h || px > shp[2] * h) continue;
                 double d = fmod(U[i] - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14; if (d >= 14) d = 0;
                 if (dump) { const float rec[4] = {(float)pz, (float)py, (float)px, (float)d}; if (fwrite(rec, 4, 4, dump) != 4) { fclose(dump); dump = nullptr; } }
@@ -508,7 +518,7 @@ static int cmd_wraps(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4] [--threads 16]\n"); return 2; }
     fit_set *fs = fit_set_load(argv[2]); if (!fs) { fprintf(stderr, "wraps: cannot load %s\n", argv[2]); return 1; }
     const fit_model *m = fs->global;   /* the box, the axis; rows dispatch to the slab model of their z */
-    const double step = atof(opt(argc, argv, "--step", "8")), um = atof(opt(argc, argv, "--um", "2.4"));
+    const double step = atof(opt(argc, argv, "--step", "8")), um = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : fs->global->um;
     const int nthreads = atoi(opt(argc, argv, "--threads", "16"));
     const double Z = m->D * m->h, Y = m->H * m->h, X = m->W * m->h;
     uint8_t *wf = nullptr; int wsh[3] = {0, 0, 0}; double wh = 0;   /* optional: the fields' data weight (max-pooled to <= ~1 GB) */
@@ -597,6 +607,70 @@ static float *read_tif_f32(const char *path, int *w, int *h) {
     if (tiff_read_page(t, 0, d)) { free(d); tiff_close(t); return nullptr; }
     *w = pg.w; *h = pg.h; tiff_close(t); return d;
 }
+/* ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase [--box z,y,x,nz,ny,nx] [--shard 512] [--cache DIR] [--threads 16]
+   One uint8 array halved per axis (lossless volcomp) into <out-group>/<out-um> (an OME group of that one level): max (binary
+   labels: any positive) or phase (the band phase codes, src/band.h: the circular mean of the known codes of the 2^3 block,
+   PHASE_UNKNOWN where none is known or their resultant is under half their count). --box (source voxels) limits the work to
+   the output shards it meets; others stay missing (the fill value). */
+static int cmd_downsample(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "usage: ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase [--box z,y,x,nz,ny,nx] [--shard 512] [--cache DIR] [--threads 16]\n"); return 2; }
+    const char *mode = opt(argc, argv, "--mode", "max"); const int phase = !strcmp(mode, "phase");
+    if (!phase && strcmp(mode, "max")) { fprintf(stderr, "downsample: --mode max|phase\n"); return 2; }
+    const int S = atoi(opt(argc, argv, "--shard", "512")), nt = atoi(opt(argc, argv, "--threads", "16")); const double um = atof(argv[5]);
+    z3 *z = z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr));
+    if (!z) { fprintf(stderr, "downsample: %s\n", z3_error()); return 1; }
+    const z3_meta *m = z3_meta_of(z); const int fill = phase ? PHASE_UNKNOWN : m->fill;
+    int64_t bo[3] = {0, 0, 0}, bn[3] = {m->shape[0], m->shape[1], m->shape[2]};
+    if (*opt(argc, argv, "--box", "")) { long long v[6]; if (sscanf(opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", v, v + 1, v + 2, v + 3, v + 4, v + 5) != 6) { fprintf(stderr, "downsample: --box z,y,x,nz,ny,nx\n"); return 2; } for (int d = 0; d < 3; d++) { bo[d] = v[d]; bn[d] = v[3 + d]; } }
+    const int64_t osh[3] = {(m->shape[0] + 1) / 2, (m->shape[1] + 1) / 2, (m->shape[2] + 1) / 2};
+    char lv[32], od[1400], at[400]; z3w_level_name(um, lv, sizeof lv); snprintf(od, sizeof od, "%s/%s", argv[4], lv);
+    snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"%s halved (%s)\"%s}}", argv[3], mode, m->label_binary ? ",\"encoding\":\"binary\"" : "");
+    z3w *w = z3w_create(od, osh, S, 0, fill, at);
+    double lum[16]; int nl = 0;   /* the group lists every level already in it (each a number-named array), sorted, plus this one */
+    { DIR *gd = opendir(argv[4]); struct dirent *ge;
+      while (gd && (ge = readdir(gd)) && nl < 15) { char *e; const double v = strtod(ge->d_name, &e); char zj[1400]; snprintf(zj, sizeof zj, "%s/%s/zarr.json", argv[4], ge->d_name);
+          if (v > 0 && !*e && fabs(v - um) > 1e-6 && access(zj, R_OK) == 0) lum[nl++] = v; }
+      if (gd) closedir(gd); }
+    lum[nl++] = um;
+    for (int a = 1; a < nl; a++) for (int b = a; b > 0 && lum[b] < lum[b - 1]; b--) { const double t = lum[b]; lum[b] = lum[b - 1]; lum[b - 1] = t; }
+    if (!w || z3w_write_group(argv[4], lum, nl, "ufsm-downsample", nullptr)) { fprintf(stderr, "downsample: %s\n", z3w_error()); return 1; }
+    uint8_t *sb = malloc((size_t)S * S * S), *src = malloc((size_t)2 * 2 * S * 2 * S);   /* one output shard; two source rows */
+    int nsh = 0;
+    for (int64_t sz = (bo[0] / 2) / S; sz * S < osh[0] && sz * S * 2 < bo[0] + bn[0]; sz++)
+    for (int64_t sy = (bo[1] / 2) / S; sy * S < osh[1] && sy * S * 2 < bo[1] + bn[1]; sy++)
+    for (int64_t sx = (bo[2] / 2) / S; sx * S < osh[2] && sx * S * 2 < bo[2] + bn[2]; sx++) {
+        memset(sb, fill, (size_t)S * S * S);
+        const int64_t ny = osh[1] - sy * S < S ? osh[1] - sy * S : S, nx = osh[2] - sx * S < S ? osh[2] - sx * S : S;
+        for (int64_t a = 0; a < S && sz * S + a < osh[0]; a++) {   /* output row a from source rows 2 a, 2 a + 1 */
+            const int64_t o[3] = {2 * (sz * S + a), 2 * sy * S, 2 * sx * S};
+            const int64_t n[3] = {m->shape[0] - o[0] < 2 ? m->shape[0] - o[0] : 2, m->shape[1] - o[1] < 2 * ny ? m->shape[1] - o[1] : 2 * ny, m->shape[2] - o[2] < 2 * nx ? m->shape[2] - o[2] : 2 * nx};
+            if (z3_read(z, o, n, src, nt)) { fprintf(stderr, "downsample: %s\n", z3_error()); return 1; }
+            for (int64_t b = 0; b < ny; b++) for (int64_t c = 0; c < nx; c++) {
+                double cs = 0, sn = 0; int known = 0, mx = 0;
+                for (int k = 0; k < 8; k++) {
+                    const int64_t zz = k >> 2 & 1, yy = 2 * b + (k >> 1 & 1), xx = 2 * c + (k & 1);
+                    if (zz >= n[0] || yy >= n[1] || xx >= n[2]) continue;
+                    const int v = src[((size_t)zz * n[1] + yy) * n[2] + xx];
+                    if (!phase) { if (v > mx) mx = v; continue; }
+                    if (v >= PHASE_PERIOD) continue;
+                    cs += cos(2 * M_PI * v / PHASE_PERIOD); sn += sin(2 * M_PI * v / PHASE_PERIOD); known++;
+                }
+                uint8_t out = (uint8_t)mx;
+                if (phase) {
+                    out = PHASE_UNKNOWN;
+                    if (known && hypot(cs, sn) >= 0.5 * known) { double t = atan2(sn, cs) / (2 * M_PI); if (t < 0) t += 1; out = (uint8_t)((int)lround(t * PHASE_PERIOD) % PHASE_PERIOD); }
+                }
+                sb[((size_t)a * S + b) * S + c] = out;
+            }
+        }
+        if (z3w_write_shard(w, sz, sy, sx, sb, nt)) { fprintf(stderr, "downsample: %s\n", z3w_error()); return 1; }
+        nsh++;
+    }
+    z3w_close(w); free(sb); free(src); z3_close(z);
+    fprintf(stderr, "downsample: %d shards of %s written to %s\n", nsh, lv, od);
+    return 0;
+}
+
 typedef struct {   /* ufsm render: one output tile's pixel rows over threads */
     const float *X, *Y, *Z; int w, h; double gs;   /* the vertex grid; output pixels per grid step */
     const uint8_t *vol, *ct; int64_t o[3], n[3]; int depth;
@@ -761,6 +835,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
+    if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
     if (argc < 4) return usage();
     const char *root = argv[2], *key = argv[3];
     const char *cache = opt(argc, argv, "--cache", nullptr);

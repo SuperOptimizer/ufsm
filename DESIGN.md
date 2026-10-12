@@ -251,7 +251,24 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   ambiguity. h 8 stays. A model-guided flood (neighbours stepped by the current model's predicted U difference instead of none)
   changes nothing (identical scores): the network's -1 errors are not unwrapping slips but turns missing from its phase in
   packed regions, so the lever is the network (longer / larger training: the desk run).
-- Left: BigTIFF for renders over 4 GB compressed; the 9.6 um version; the desk runs.
+- 9.6 um version (Stage 6, smoke). `ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase [--box]` halves an
+  array (max: binary labels; phase: the circular mean of the known band phase codes of each 2^3 block, unknown where the
+  resultant is under half their count) into an OME group that lists every level present. The smoke region's labels at 9.6 /
+  19.2 / 38.4 / 76.8 (the sampler's occupancy index needs a level >= 3 under 4.3e9 cells) and phase at 9.6 (29 s). Sources:
+  the stored phase takes `"level": L` (its CT-level grid; samples of level L read it directly, of L - 1 upsampled; without
+  "level" the old behaviour: unwrap batches byte-identical, bench_sampler hash 1eccaa34d8e977fb); the unwrap density target is
+  min(1, s rho) with `--density-scale s` (32 at 2.4 um, 8 at 9.6 um: the same physical code; recorded in runtime_extra.unwrap,
+  read by predict's pooling). predict --fit-fields / --fit-zarr run at any --level (fields.json "um", the axis scaled to the
+  level); the fitter's default lattices, knots and slab pooling are physical (2.4 um values x 2.4 / um); models save "um";
+  fit --codes scales the label grid (code um / native um); wraps / winding default to the fields' or model's um.
+  Smoke run (CT level 2, P128 = 1.2 mm, random draws at level 2, --normal-step 1 --density-scale 8, 6000 steps, 4 min, 25
+  samples/s): predict --level 2 --fit-zarr --fit-h 2 (19.2 um cells) of the whole smoke block 5 s (2.4 um: 61 s); fit 94.6%
+  winding ids, |error| median 0.045 p90 0.144 turn (2.4 um net: 90.9%, 0.058 / 0.207; both in-sample, the 9.6 net trained on
+  the smoke block only); 2 slabs of 256: 94.5%. Wraps 40-52 (step 2) and ink renders (ink 9.6, CT level 2, depth 2) 2.3 s; the
+  CT renders show papyrus fibres. The coarser net sees 4x the physical context per patch, which plausibly helps counting
+  sheets in packed regions; whether winding fields from 9.6 beat 2.4 out of sample is open (needs band codes beyond the smoke
+  block: on the desk).
+- Left: BigTIFF for renders over 4 GB compressed; 9.6 um training on all of Paris4 (desk band codes); the desk runs.
 
 ## Half-resolution networks (2026-10-11)
 

@@ -176,7 +176,7 @@ extern "C" void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float 
    density rho = sigma / 32, 11 the max recto probability (float bits, atomicMax as int: non-negative). The window covers box
    voxels [t + halo, t + W - halo) (t: the window origin relative to the box, may be negative), clipped to the box. */
 __global__ void fit_accum_k(const float *lg, const uint8_t *ct, int W, int halo, int tz, int ty, int tx, int bz, int by, int bx, int h,
-                            int fz0, int fy0, int fx0, int nfy, int nfx, int F1, int F2, size_t nf, int ch_recto, int ch_phase, int ch_normal, int ch_density, float *acc) {
+                            int fz0, int fy0, int fx0, int nfy, int nfx, int F1, int F2, size_t nf, int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, float *acc) {
     __shared__ float red[11][512];
     const int fi = blockIdx.x, fz = fz0 + fi / (nfy * nfx), fy = fy0 + (fi / nfx) % nfy, fx = fx0 + fi % nfx;
     float v[11] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; float rmax = 0.f;
@@ -192,7 +192,7 @@ __global__ void fit_accum_k(const float *lg, const uint8_t *ct, int W, int halo,
         auto sg = [&](int c) { return 1.f / (1.f + __expf(-lg[(size_t)c * w3 + i])); };
         v[1] += 1.f; v[2] += 2.f * sg(ch_phase) - 1.f; v[3] += 2.f * sg(ch_phase + 1) - 1.f;
         for (int k = 0; k < 6; k++) v[4 + k] += sg(ch_normal + k) - (k < 3 ? 0.f : 0.5f);
-        v[10] += sg(ch_density) * (1.f / 32.f);
+        v[10] += sg(ch_density) / dscale;
         rmax = fmaxf(rmax, sg(ch_recto));
     }
     for (int k = 0; k < 11; k++) red[k][threadIdx.x] = v[k];
@@ -209,7 +209,7 @@ __global__ void fit_accum_k(const float *lg, const uint8_t *ct, int W, int halo,
     }
 }
 extern "C" void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
-                             int ch_recto, int ch_phase, int ch_normal, int ch_density, float *acc) {
+                             int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, float *acc) {
     int f0[3], f1[3];
     const int t[3] = {tz, ty, tx};
     for (int d = 0; d < 3; d++) {
@@ -221,7 +221,7 @@ extern "C" void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo
     const size_t nf = (size_t)F[0] * F[1] * F[2];
     if (h > 32 || nf > 0x7fffffff) { fprintf(stderr, "nn_fit_accum: h %d or field grid too large\n", h); abort(); }
     fit_accum_k<<<nfz * nfy * nfx, h * h * h < 512 ? h * h * h : 512>>>(lg, ct, W, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfy, nfx,
-                                                F[1], F[2], nf, ch_recto, ch_phase, ch_normal, ch_density, acc);
+                                                F[1], F[2], nf, ch_recto, ch_phase, ch_normal, ch_density, dscale, acc);
     KCHECK();
 }
 

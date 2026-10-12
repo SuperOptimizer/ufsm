@@ -13,9 +13,10 @@
 #include <time.h>
 static double nn_wall_seconds(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
+int fit_scale_L(int L, double f) { const int v = (int)lround(L * f); return v < 2 ? 2 : v; }
 fit_cfg fit_cfg_default(void) {
     fit_cfg c = {0};
-    c.dir = 0; c.knot_dz = 1024;
+    c.dir = 0; c.knot_dz = 1024; c.um = 2.4;
     c.nstage = 6; c.phase_stage = 4;
     const int lat[6] = {512, 256, 128, 64, 64, 32}, st[6] = {300, 300, 300, 300, 300, 300};
     memcpy(c.lattice, lat, sizeof lat); memcpy(c.steps, st, sizeof st);
@@ -481,8 +482,8 @@ int fit_save(const fit_model *m, const char *dir) {
     char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", dir); if (system(p)) return -1;
     snprintf(p, sizeof p, "%s/model.json", dir);
     FILE *f = fopen(p, "w"); if (!f) return -1;
-    fprintf(f, "{\"version\": 1, \"dir\": %d, \"knot_dz\": %d, \"L\": %d, \"lattice\": [%d, %d, %d], \"shape\": [%d, %d, %d], \"h\": %.9g, "
-               "\"origin\": [%lld, %lld, %lld], \"loss\": %.9g, \"pitch\": [", m->dir, m->knot_dz, m->L, m->lz, m->ly, m->lx, m->D, m->H, m->W, m->h,
+    fprintf(f, "{\"version\": 1, \"dir\": %d, \"knot_dz\": %d, \"L\": %d, \"lattice\": [%d, %d, %d], \"shape\": [%d, %d, %d], \"h\": %.9g, \"um\": %.9g, "
+               "\"origin\": [%lld, %lld, %lld], \"loss\": %.9g, \"pitch\": [", m->dir, m->knot_dz, m->L, m->lz, m->ly, m->lx, m->D, m->H, m->W, m->h, m->um > 0 ? m->um : 2.4,
             m->origin[0], m->origin[1], m->origin[2], m->loss[0]);
     for (int k = 0; k < m->nk; k++) fprintf(f, "%s%.9g", k ? ", " : "", m->pitch[k]);
     fprintf(f, "], \"offset\": [");
@@ -507,7 +508,7 @@ fit_model *fit_load(const char *dir) {
     m->dir = (int)json_num(json_get(j, "dir"), 1); m->knot_dz = (int)json_num(json_get(j, "knot_dz"), 1024); m->L = (int)json_num(json_get(j, "L"), 64);
     m->lz = (int)json_num(json_at(json_get(j, "lattice"), 0), 0); m->ly = (int)json_num(json_at(json_get(j, "lattice"), 1), 0); m->lx = (int)json_num(json_at(json_get(j, "lattice"), 2), 0);
     m->D = (int)json_num(json_at(json_get(j, "shape"), 0), 0); m->H = (int)json_num(json_at(json_get(j, "shape"), 1), 0); m->W = (int)json_num(json_at(json_get(j, "shape"), 2), 0);
-    m->h = json_num(json_get(j, "h"), 8); m->loss[0] = json_num(json_get(j, "loss"), 0);
+    m->h = json_num(json_get(j, "h"), 8); m->loss[0] = json_num(json_get(j, "loss"), 0); m->um = json_num(json_get(j, "um"), 2.4);
     for (int d = 0; d < 3; d++) m->origin[d] = (long long)json_num(json_at(json_get(j, "origin"), d), 0);
     const json *pj = json_get(j, "pitch"), *oj = json_get(j, "offset");
     m->nk = pj ? (int)pj->n : 0;
@@ -570,7 +571,7 @@ static int ray_root(double (*ev)(const void *, double, double, double), const vo
 static double ev_model(const void *m, double z, double y, double x) { return fit_W(m, z, y, x); }
 int fit_ray_root(const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root(ev_model, m, m, z, theta, k, r_hint, r); }
 
-int fit_fields_save(const char *dir, const long long origin[3], const int shape[3], int h, uint8_t *const a[10], const float *cy, const float *cx, int na) {
+int fit_fields_save(const char *dir, const long long origin[3], const int shape[3], int h, double um, uint8_t *const a[10], const float *cy, const float *cx, int na) {
     static const char *nm[10] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w"};
     char path[1400]; snprintf(path, sizeof path, "mkdir -p '%s'", dir); if (system(path)) return -1;
     const size_t nf = (size_t)shape[0] * shape[1] * shape[2];
@@ -580,7 +581,7 @@ int fit_fields_save(const char *dir, const long long origin[3], const int shape[
     }
     snprintf(path, sizeof path, "%s/fields.json", dir);
     FILE *f = fopen(path, "w"); if (!f) return -1;
-    fprintf(f, "{\"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"axis\": [", origin[0], origin[1], origin[2], shape[0], shape[1], shape[2], h);
+    fprintf(f, "{\"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.9g, \"axis\": [", origin[0], origin[1], origin[2], shape[0], shape[1], shape[2], h, um);
     for (int z = 0; z < na; z++) fprintf(f, "%s[%.3f, %.3f]", z ? ", " : "", cy[z], cx[z]);
     fprintf(f, "]}\n");
     return fclose(f) ? -1 : 0;
@@ -601,6 +602,7 @@ int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf 
     int shp[3]; long long org[3];
     for (int d = 0; d < 3; d++) { org[d] = (long long)json_num(json_at(json_get(j, "origin"), d), 0); shp[d] = (int)json_num(json_at(json_get(j, "shape"), d), 0); }
     const int h = (int)json_num(json_get(j, "h"), 8), zarr = !strcmp(json_str(json_get(j, "format"), "raw"), "zarr");
+    b->um = json_num(json_get(j, "um"), 2.4);
     if (fz1 <= 0 || fz1 > shp[0]) fz1 = shp[0];
     if (fz0 < 0) fz0 = 0;
     if (pool == 0) {   /* the geometry and the whole axis table only */
@@ -721,7 +723,8 @@ fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap)
     json *j = read_json_file(p); if (!j) return nullptr;
     const int h = (int)json_num(json_get(j, "h"), 8), D = (int)json_num(json_at(json_get(j, "shape"), 0), 0);
     json_free(j);
-    int pool = 1; while (2 * pool * h <= 64) pool *= 2;
+    const double fu = 2.4 / (c->um > 0 ? c->um : 2.4);   /* lattices and pooling in 2.4 um voxels -> native */
+    int pool = 1; while (2 * pool * h <= 64 * fu) pool *= 2;
     if (fit_fields_load(dir, 0, 0, pool, &all)) return nullptr;
     /* the prior from full-resolution rows, slab by slab: knots at the global knot positions (slabs start on them), offsets made
        continuous across slabs, the direction from the summed ring votes */
@@ -749,7 +752,7 @@ fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap)
     P.L = 1 << 20; P.lz = P.ly = P.lx = 2; P.delta = calloc(8, sizeof(float));   /* delta 0 */
     P.D = all.shape[0]; P.H = all.shape[1]; P.W = all.shape[2]; P.h = all.h; P.cy = all.cy; P.cx = all.cx;
     if (c->verbose) fprintf(stderr, "fit slabs: prior dir %+d (vote %.2f), pitch %.1f..%.1f over %d knots\n", P.dir, vote, P.pitch[0], P.pitch[P.nk - 1], P.nk);
-    fit_cfg cg = *c; cg.nstage = 3; cg.lattice[0] = 512; cg.lattice[1] = 256; cg.lattice[2] = 128; cg.phase_stage = 3; cg.init = &P; cg.init_off[0] = cg.init_off[1] = cg.init_off[2] = 0; cg.dir = P.dir;
+    fit_cfg cg = *c; cg.nstage = 3; cg.lattice[0] = fit_scale_L(512, fu); cg.lattice[1] = fit_scale_L(256, fu); cg.lattice[2] = fit_scale_L(128, fu); cg.phase_stage = 3; cg.init = &P; cg.init_off[0] = cg.init_off[1] = cg.init_off[2] = 0; cg.dir = P.dir;
     for (int k = 0; k < 3; k++) cg.steps[k] = c->steps[0];
     if (c->verbose) fprintf(stderr, "fit slabs: global coarse fit on fields pooled by %d (%dx%dx%d, h %d)\n", pool, all.shape[0], all.shape[1], all.shape[2], all.h);
     fit_set *s = calloc(1, sizeof *s); s->blend = overlap / 2.0;
@@ -769,7 +772,7 @@ fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap)
         if (k > 0) {   /* the flood continues from the previous slab's interior (the overlap below zi0) */
             cs.seed = s->slab[k - 1]; cs.seed_off = (double)(fz0 * h) - (double)(s->slab[k - 1]->origin[0] - s->global->origin[0]); cs.seed_z = zi0 - (double)fz0 * h;
         }
-        cs.nstage = 2; cs.lattice[0] = 64; cs.lattice[1] = 32; cs.phase_stage = 0; cs.steps[0] = cs.steps[1] = c->steps[c->nstage > 4 ? 4 : 0];
+        cs.nstage = 2; cs.lattice[0] = fit_scale_L(64, fu); cs.lattice[1] = fit_scale_L(32, fu); cs.phase_stage = 0; cs.steps[0] = cs.steps[1] = c->steps[c->nstage > 4 ? 4 : 0];
         if (c->verbose) fprintf(stderr, "fit slabs: slab %d of %d, native z [%.0f, %.0f) with fields [%d, %d)\n", k + 1, ns, zi0, zi1, fz0, fz1);
         fit_model *m = fit_run(&sb.f, &cs);
         if (!m) { fit_fields_free(&sb); fit_set_free(s); return nullptr; }

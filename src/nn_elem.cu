@@ -398,10 +398,10 @@ __global__ void phase_tg_k(const uint8_t *ph, size_t n, uint8_t *t, uint8_t *m) 
 extern "C" void nn_phase_targets(const uint8_t *phase, size_t n, uint8_t *t, uint8_t *m) { phase_tg_k<<<nblk(n, 256), 256>>>(phase, n, t, m); KCHECK(); }
 /* task unwrap: the winding-phase gradient by wrap-aware central differences over +-s voxels (all of v, v +- s e_d known):
    g = dphase / dx in turns per voxel, rho = |g| (the sheet density, 1 / spacing), n = g / rho. Targets (x255) in 7 planes of n
-   voxels: n_z^2, n_y^2, n_x^2, 0.5 + n_z n_y, 0.5 + n_z n_x, 0.5 + n_y n_x (sign-free n n^T), min(1, 32 rho); mask = all known
-   and rho > 1/1000. The phase is a scalar transformed with the batch's symmetry, so the gradient is in output coordinates. */
+   voxels: n_z^2, n_y^2, n_x^2, 0.5 + n_z n_y, 0.5 + n_z n_x, 0.5 + n_y n_x (sign-free n n^T), min(1, dscale rho); mask = all known
+   and rho > 1/1000 (the density scale: 32 at 2.4 um, 32 x 2.4 / um at coarser voxels). The phase is a scalar transformed with the batch's symmetry, so the gradient is in output coordinates. */
 __device__ __forceinline__ int phase_diff(int a, int b) { int d = a - b; d -= 252 * (d > 126); d += 252 * (d <= -126); return d; }
-__global__ void unwrap_tg_k(const uint8_t *ph, int D, int H, int W, int s, uint8_t *t, uint8_t *m) {
+__global__ void unwrap_tg_k(const uint8_t *ph, int D, int H, int W, int s, float dscale, uint8_t *t, uint8_t *m) {
     const size_t n = (size_t)D * H * W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
@@ -417,13 +417,13 @@ __global__ void unwrap_tg_k(const uint8_t *ph, int D, int H, int W, int s, uint8
     const float rho = sqrtf(gz * gz + gy * gy + gx * gx);
     if (rho < 1e-3f) return;
     const float nz = gz / rho, ny = gy / rho, nx = gx / rho;
-    const float c7[7] = {nz * nz, ny * ny, nx * nx, 0.5f + nz * ny, 0.5f + nz * nx, 0.5f + ny * nx, fminf(1.f, 32.f * rho)};
+    const float c7[7] = {nz * nz, ny * ny, nx * nx, 0.5f + nz * ny, 0.5f + nz * nx, 0.5f + ny * nx, fminf(1.f, dscale * rho)};
     for (int c = 0; c < 7; c++) t[c * n + i] = (uint8_t)__float2int_rn(255.f * fminf(1.f, fmaxf(0.f, c7[c])));
     m[i] = 1;
 }
-extern "C" void nn_unwrap_targets(const uint8_t *phase, int d, int h, int w, int s, uint8_t *t, uint8_t *m) {
+extern "C" void nn_unwrap_targets(const uint8_t *phase, int d, int h, int w, int s, float dscale, uint8_t *t, uint8_t *m) {
     const size_t n = (size_t)d * h * w;
-    unwrap_tg_k<<<nblk(n, 256), 256>>>(phase, d, h, w, s, t, m); KCHECK();
+    unwrap_tg_k<<<nblk(n, 256), 256>>>(phase, d, h, w, s, dscale, t, m); KCHECK();
 }
 extern "C" void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n) { fill_unl_k<<<nblk(n, 256), 256>>>(t, m, vm, src, n); KCHECK(); }
 extern "C" void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out) {

@@ -68,7 +68,7 @@ static int g_side, g_side_ch, g_side_nc; static float g_side_lambda = 1.f;
 /* --task unwrap (B == 1): channel 0 recto (target 0, the label mask), 1 ink (target slot 1 = the source's "ink" prob teacher, BCE over
    all papyrus with dice g_ink_dice, times g_ink_lambda), 2-3 the winding phase (the --side 2 path), 4-9 the sign-free normal n n^T and
    10 the sheet density, both from the phase gradient over +-g_norm_s voxels (nn_unwrap_targets; BCE, times g_norm_lambda) */
-static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f;
+static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_scale = 32.f;
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
    (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */
 static int g_papyrus; static papyrus_cfg g_pap;
@@ -372,7 +372,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     }
     if (g_unwrap) {   /* normal n n^T and density from the phase gradient; split: halo planes are the other GPU's */
         const size_t l3 = (size_t)os.d * os.h * os.w, eb = g_g16 ? 2 : 4, le = unet_logits_h16(d->u) ? 2 : 4;
-        nn_unwrap_targets(d->sdb, os.d, os.h, os.w, g_norm_s, d->nt, d->nm);
+        nn_unwrap_targets(d->sdb, os.d, os.h, os.w, g_norm_s, g_dens_scale, d->nt, d->nm);
         if (d->side == 0) nn_zero(d->nm + l3 - (size_t)g_h0 * P * P, (size_t)g_h0 * P * P);
         else if (d->side == 1) nn_zero(d->nm, (size_t)g_h0 * P * P);
         const shape5 seven = {1, 7, os.d, os.h, os.w};
@@ -500,6 +500,8 @@ int cmd_train(int argc, char **argv) {
         g_ink_lambda = (float)atof(opt(argc,argv,"--ink-lambda","1")); g_ink_dice = (float)atof(opt(argc,argv,"--ink-dice","0"));
         g_norm_lambda = (float)atof(opt(argc,argv,"--normal-lambda","1")); g_norm_s = atoi(opt(argc,argv,"--normal-step","4"));
         if (g_norm_s < 1 || g_norm_s > 16) { fprintf(stderr,"--normal-step 1..16\n"); return 2; }
+        g_dens_scale = (float)atof(opt(argc,argv,"--density-scale","32"));   /* density target min(1, scale rho): 32 at 2.4 um, 8 at 9.6 um (the same physical code) */
+        if (!(g_dens_scale > 0)) { fprintf(stderr,"--density-scale > 0\n"); return 2; }
     }
     if (g_aff) {   /* affinities at offsets 1 and 8 along z, y, x (8 = the split halo at four levels) */
         g_aff_off = (aff_offsets_t){6, {0, 1, 2, 0, 1, 2}, {1, 1, 1, 8, 8, 8}};
@@ -1003,8 +1005,8 @@ int cmd_train(int argc, char **argv) {
     }
     if (g_unwrap) {   /* channel layout of the unwrap heads */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
-        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"unwrap\":{\"version\":1,\"channels\":{\"recto\":0,\"ink\":1,\"phase\":[%d,%d],\"normal\":[%d,%d,%d,%d,%d,%d],\"density\":%d},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"min(1, 32 rho), rho = |grad phase| turns per voxel\",\"ink_lambda\":%.9g,\"ink_dice\":%.9g,\"normal_lambda\":%.9g,\"normal_step\":%d}}",
-                 g_side_ch,g_side_ch+1,g_norm_ch,g_norm_ch+1,g_norm_ch+2,g_norm_ch+3,g_norm_ch+4,g_norm_ch+5,g_norm_ch+6,g_ink_lambda,g_ink_dice,g_norm_lambda,g_norm_s);
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"unwrap\":{\"version\":1,\"channels\":{\"recto\":0,\"ink\":1,\"phase\":[%d,%d],\"normal\":[%d,%d,%d,%d,%d,%d],\"density\":%d},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"min(1, density_scale rho), rho = |grad phase| turns per voxel\",\"density_scale\":%.9g,\"ink_lambda\":%.9g,\"ink_dice\":%.9g,\"normal_lambda\":%.9g,\"normal_step\":%d}}",
+                 g_side_ch,g_side_ch+1,g_norm_ch,g_norm_ch+1,g_norm_ch+2,g_norm_ch+3,g_norm_ch+4,g_norm_ch+5,g_norm_ch+6,g_dens_scale,g_ink_lambda,g_ink_dice,g_norm_lambda,g_norm_s);
     }
     if (g_sheet) {
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
