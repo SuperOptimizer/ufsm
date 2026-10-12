@@ -314,6 +314,10 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   repeats agree). Open: case 35 (lean 1, fp4 grads, offloads) is two-state: identical runs, split or single GPU, sometimes
   differ by grad rel 0.29-0.35 (other cases repeat to 1e-8). Either a flipped stochastic rounding spreading into an equally
   valid MX-fp4 sample, or a race in that path: compare both outcomes with an fp32 reference gradient.
+- `ufsm phase-raster --pool 2` writes only the 2x circular-mean pooled phase (<out>/9.6, shards of 256: one per 4.8 um shard
+  of 512); `--resume 1` skips written shards. A whole-scroll Paris4 phase at 4.8 um would be ~326 GB (25 MB per shard, 13054
+  shards; the desk has 317 GB free), at 9.6 um ~65 GB. Block B: identical known / unknown masks to phase-raster + downsample,
+  1.2% of voxels differing by exactly 1 code (float lookup tables vs double trigonometry at rounding boundaries).
 - Left: BigTIFF for renders over 4 GB compressed; 9.6 um training on all of Paris4 (desk band codes); the desk runs.
 
 ## Half-resolution networks (2026-10-11)
