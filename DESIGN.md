@@ -350,6 +350,21 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   nearly all papyrus, 40% nearly all void, 16% partly void (the sub-voxel gaps). A 96k-step 9.6 um run on it is the test; it is
   not deployable for 9 um-only scans (it needs a 2.4 um scan), so it measures how much a 9.6 um student could gain from 2.4 um
   information (the plan: a 2.4 um teacher on the desk, distilled to 9.6 um).
+- Papyrus gap labels, no cutoff (`train --task papyrus --pap-local R`, default off; src/papyrus.h papyrus_local). A random
+  cutoff without conditioning only teaches P(s > t) averaged over t, a smoothed CT (one effective cutoff, ~89); conditioning
+  makes the cutoff a dial. The user: a voxel is papyrus or not, the cutoffs only exist because the CT is not bimodal. Rule:
+  void where the CT smoothed by sigma is <= t_lo (open void is dark), or in the lower half of a gap: the closing (min of the
+  max over a (2R+1)^3 window of the CT smoothed by local_sigma) fills only dark features with brighter material around them,
+  so where closing - floor >= local_depth the threshold is the gap's half depth (blur puts a boundary at half the step),
+  clamped to [t_lo, t_hi]; a step or a faint plateau (bright on one side only) is not filled and keeps t_lo. A plain local
+  max / min (first try) called faint papyrus beside a bright sheet void. Ignored: local_margin x depth around the half depth
+  in gaps, and +-band around t. Running max / min: van Herk / Gil-Werman, separable, 3 comparisons per voxel; tests against
+  brute force. Block B (6.8 Gvox, `ufsm papyrus-labels`, 2 min on 8 threads), R 8, sigmas 1 / 1.5, depth 30, margin 0.1,
+  cut 55,128, band 5: gap-compare packed (< 100 um) density 1.08 (cutoff 55: 0.72, 80: 1.04), loose over-count 1.5-2.35
+  (cutoff 55: 1.0-1.55): the gap labels also find splits and pores inside sheets, right for a material reading, wrong for
+  counting sheets. With t_lo 50 open air (up to ~50 here) left papyrus specks; 55 plus band 5 leaves them ignored. 28% of the
+  recto label band on B lies in void by these labels (the band straddles the face). `ufsm overlay` draws a CT plane beside
+  label panels as a PNG (zlib). Training A/B against the cutoff-80 net: not run yet (user hold).
 - `ufsm phase-raster --pool 2` writes only the 2x circular-mean pooled phase (<out>/9.6, shards of 256: one per 4.8 um shard
   of 512); `--resume 1` skips written shards. A whole-scroll Paris4 phase at 4.8 um would be ~326 GB (25 MB per shard, 13054
   shards; the desk has 317 GB free), at 9.6 um ~65 GB. Block B: identical known / unknown masks to phase-raster + downsample,

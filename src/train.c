@@ -81,13 +81,27 @@ static int papyrus_args(int argc, char **argv, int B) {
               (rel && sscanf(rel, "%f,%f", &c->rel_lo, &c->rel_hi) != 2);
     c->rel_p = rel ? (float)atof(opt(argc, argv, "--pap-rel-p", "0.5")) : 0.f;
     c->sigma = (float)atof(opt(argc, argv, "--pap-sigma", "1")); c->band = (float)atof(opt(argc, argv, "--pap-band", "0"));
-    c->clean = atoi(opt(argc, argv, "--pap-clean", "0")); c->cond = atoi(opt(argc, argv, "--pap-cond", "1"));   /* 1 stem bias, 2 input zero */
+    c->local = atoi(opt(argc, argv, "--pap-local", "0"));   /* gap labels (papyrus_local): no cutoff, so no conditioning by default */
+    c->local_sigma = (float)atof(opt(argc, argv, "--pap-local-sigma", "1.5")); c->local_depth = (float)atof(opt(argc, argv, "--pap-local-depth", "30"));
+    c->local_margin = (float)atof(opt(argc, argv, "--pap-local-margin", "0.1"));
+    c->clean = atoi(opt(argc, argv, "--pap-clean", "0")); c->cond = atoi(opt(argc, argv, "--pap-cond", c->local > 0 ? "0" : "1"));   /* 1 stem bias, 2 input zero */
+    if (c->local < 0 || (c->local > 0 && (c->cond || rel || c->tau_hi > 0 || !(c->local_sigma >= 0 && c->local_sigma <= PAPYRUS_RMAX / 3.f) ||
+                                          !(c->local_depth > 0) || !(c->local_margin >= 0 && c->local_margin < 0.5f)))) {
+        fprintf(stderr, "--task papyrus --pap-local R (voxels): gap labels with no cutoff, so no --pap-cond, --pap-rel or --pap-tau; [--pap-local-sigma 0..%.3g] [--pap-local-depth D > 0] [--pap-local-margin 0..0.5)\n", PAPYRUS_RMAX / 3.0);
+        return 1;
+    }
     bad |= !(c->t_lo >= 0 && c->t_lo <= c->t_hi && c->t_hi <= 255) || !(c->rel_p >= 0 && c->rel_p <= 1) || (rel && !(c->rel_lo > 0 && c->rel_lo <= c->rel_hi)) ||
            !(c->sigma >= 0 && c->sigma <= PAPYRUS_RMAX / 3.f) || !(c->tau_lo >= 0 && c->tau_lo <= c->tau_hi) || (c->tau_hi > 0 && !(c->tau_lo > 0)) ||
            !(c->band >= 0) || c->clean < 0 || c->cond < 0 || c->cond > 2;
     if (bad) { fprintf(stderr, "--task papyrus: --pap-cut LO,HI (0..255) [--pap-rel LO,HI --pap-rel-p P] [--pap-sigma 0..%.3g] [--pap-tau LO,HI (> 0)] [--pap-band B] [--pap-clean N] [--pap-cond 0|1|2]\n", PAPYRUS_RMAX / 3.0); return 1; }
     if (c->cond == 1 && B != 1) { fprintf(stderr, "--task papyrus --pap-cond 1 needs --B 1 (one cutoff per forward)\n"); return 1; }
     if (atoi(opt(argc, argv, "--ct-aug", "0"))) { fprintf(stderr, "--task papyrus: not with --ct-aug (its input is not the z-scored CT the cutoff code assumes)\n"); return 1; }
+    if (c->local > 0) {
+        fprintf(stderr, "papyrus: gap labels (no cutoff): void where the CT smoothed by sigma %g is <= %g, or in the lower half of a gap at least %g deep "
+                        "(closing - floor of the CT smoothed by sigma %g, radius %d voxels; threshold clamped to [%g, %g]); margin %g, ignore band %g, cleanup < %d voxels\n",
+                (double)c->sigma, (double)c->t_lo, (double)c->local_depth, (double)c->local_sigma, c->local, (double)c->t_lo, (double)c->t_hi, (double)c->local_margin, (double)c->band, c->clean);
+        return 0;
+    }
     fprintf(stderr, "papyrus: cutoff U(%g, %g)", c->t_lo, c->t_hi);
     if (c->rel_p > 0) fprintf(stderr, ", with p %g Otsu x U(%g, %g)", c->rel_p, c->rel_lo, c->rel_hi);
     fprintf(stderr, " of the CT smoothed by sigma %g; %s targets", c->sigma, c->tau_hi > 0 ? "soft" : "hard");
@@ -1002,6 +1016,11 @@ int cmd_train(int argc, char **argv) {
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
         snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"task\":\"papyrus\",\"papyrus\":{\"version\":1,\"cond\":%d,\"code\":\"%s\",\"cut\":[%.9g,%.9g],\"rel\":[%.9g,%.9g],\"rel_p\":%.9g,\"sigma\":%.9g,\"tau\":[%.9g,%.9g],\"band\":%.9g,\"clean\":%d}}",
                  g_pap.cond,g_pap.cond==2?"input (ct - cutoff) / window sd":g_pap.cond?"stem bias (cutoff - window mean) / window sd":"none",g_pap.t_lo,g_pap.t_hi,g_pap.rel_lo,g_pap.rel_hi,g_pap.rel_p,g_pap.sigma,g_pap.tau_lo,g_pap.tau_hi,g_pap.band,g_pap.clean);
+        if (g_pap.local > 0) {   /* gap labels (papyrus_local): inside the papyrus object */
+            n=strlen(runtime_extra); runtime_extra[n-2]=0;
+            snprintf(runtime_extra+n-2,sizeof runtime_extra-n+2,",\"labels\":\"gap\",\"local\":%d,\"local_sigma\":%.9g,\"local_depth\":%.9g,\"local_margin\":%.9g}}",
+                     g_pap.local,g_pap.local_sigma,g_pap.local_depth,g_pap.local_margin);
+        }
     }
     if (g_verso) {   /* channel 1 = verso; band affinities (if any) follow at 2.. */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;

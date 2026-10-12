@@ -10,6 +10,8 @@
 #include "nn.h"
 #include "tiffw.h"
 #include "z3w.h"
+#include "papyrus.h"
+#include <zlib.h>
 #include "tiff.h"
 #include <dirent.h>
 #include <unistd.h>
@@ -59,6 +61,8 @@ static int usage(void) {
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
+        "  ufsm papyrus-labels <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx   papyrus / void training labels of a CT box (gap labels, no cutoff)\n"
+        "  ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w --labels G1,G2   a CT plane beside label panels (void blue, ignored yellow)\n"
         "root: local dir or https://.../volcomp ; keys are paths under root\n");
     return 2;
 }
@@ -1202,6 +1206,151 @@ static int cmd_void_pool(int argc, char **argv) {
     return 0;
 }
 
+/* ufsm papyrus-labels <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx [--um 2.4] [--local 8] [--local-sigma 1.5] [--depth 30]
+   [--margin 0.1] [--sigma 1] [--cut 50,128] [--band 0] [--cutoff T] [--threads 8] [--cache DIR]
+   The task papyrus training labels (src/papyrus.h) of a CT box as a box-local uint8 array <out-group>/<um> (ufsm.origin_zyx, so
+   gap-compare and the overlays place it): 255 papyrus, 0 void or outside the scroll, 128 ignored. Gap labels by default (--local
+   R, papyrus_local); --cutoff T: the old global cutoff at T instead. Per 512^3 output shard the CT is read once with a halo covering
+   the smoothing and the closing window, then labelled in 256^3 tiles, one per thread. */
+typedef struct { const uint8_t *ct; int64_t cn[3]; const papyrus_cfg *c; float t; int T, H, P; uint8_t *out; int64_t on[3], oo[3]; _Atomic int next; } plab_job;
+static void *plab_tiles(void *arg) {
+    plab_job *J = arg; const int P = J->P, T = J->T, H = J->H; const size_t p3 = (size_t)P * P * P;
+    uint8_t *ct = malloc(p3), *tg = malloc(p3), *ig = malloc(p3), *fg = malloc(p3), *sc = malloc(8 * p3);
+    if (!ct || !tg || !ig || !fg || !sc) abort();
+    for (int k; (k = atomic_fetch_add(&J->next, 1)) < 8;) {
+        const int64_t t0[3] = {(k >> 2 & 1) * (int64_t)T, (k >> 1 & 1) * (int64_t)T, (k & 1) * (int64_t)T};   /* tile origin in the shard */
+        if (t0[0] >= J->on[0] || t0[1] >= J->on[1] || t0[2] >= J->on[2]) continue;
+        for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {   /* the haloed tile from the shard's CT (zero outside it) */
+            const int64_t a = t0[0] + z, b = t0[1] + y; uint8_t *d = ct + ((size_t)z * P + y) * P;
+            if (a >= J->cn[0] || b >= J->cn[1]) { memset(d, 0, P); continue; }
+            const int64_t nx = J->cn[2] - t0[2] < P ? J->cn[2] - t0[2] : P;
+            memcpy(d, J->ct + ((size_t)a * J->cn[1] + b) * J->cn[2] + t0[2], (size_t)nx); if (nx < P) memset(d + nx, 0, (size_t)(P - nx));
+        }
+        memset(ig, 0, p3);
+        papyrus_labels(ct, P, J->c, J->t, 0.0, tg, ig, fg, sc);
+        for (int z = 0; z < T && t0[0] + z < J->on[0]; z++) for (int y = 0; y < T && t0[1] + y < J->on[1]; y++) {
+            const size_t s = ((size_t)(z + H) * P + y + H) * P + H; uint8_t *o = J->out + ((size_t)(t0[0] + z) * J->on[1] + t0[1] + y) * J->on[2] + t0[2];
+            for (int x = 0; x < T && t0[2] + x < J->on[2]; x++) o[x] = ig[s + x] ? 128 : tg[s + x];
+        }
+    }
+    free(ct); free(tg); free(ig); free(fg); free(sc);
+    return nullptr;
+}
+static int cmd_papyrus_labels(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: ufsm papyrus-labels <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx [--um 2.4] [--local 8] [--local-sigma 1.5] [--depth 30] [--margin 0.1] [--sigma 1] [--cut 50,128] [--band 0] [--cutoff T] [--threads 8] [--cache DIR]\n"); return 2; }
+    long long bx[6]; papyrus_cfg c; memset(&c, 0, sizeof c);
+    if (sscanf(opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", bx, bx + 1, bx + 2, bx + 3, bx + 4, bx + 5) != 6) { fprintf(stderr, "papyrus-labels: --box z,y,x,nz,ny,nx\n"); return 2; }
+    const float cutoff = (float)atof(opt(argc, argv, "--cutoff", "-1"));
+    c.local = cutoff >= 0 ? 0 : atoi(opt(argc, argv, "--local", "8")); c.local_sigma = (float)atof(opt(argc, argv, "--local-sigma", "1.5"));
+    c.local_depth = (float)atof(opt(argc, argv, "--depth", "30")); c.local_margin = (float)atof(opt(argc, argv, "--margin", "0.1"));
+    c.sigma = (float)atof(opt(argc, argv, "--sigma", "1")); c.band = (float)atof(opt(argc, argv, "--band", "0"));
+    if (sscanf(opt(argc, argv, "--cut", "50,128"), "%f,%f", &c.t_lo, &c.t_hi) != 2 || !(c.sigma >= 0 && c.sigma <= PAPYRUS_RMAX / 3.f) ||
+        !(c.local_sigma >= 0 && c.local_sigma <= PAPYRUS_RMAX / 3.f) || (cutoff < 0 && c.local < 1)) { fprintf(stderr, "papyrus-labels: bad label options\n"); return 2; }
+    const int nt = atoi(opt(argc, argv, "--threads", "8")), S = 512, T = S / 2;
+    float w[2 * PAPYRUS_RMAX + 1]; const int rs = papyrus_taps(c.sigma, w), rl = papyrus_taps(c.local_sigma, w);
+    const int H = cutoff >= 0 ? rs : (rs > 2 * c.local + rl ? rs : 2 * c.local + rl), P = T + 2 * H;   /* what a core voxel's label can see */
+    z3 *cz = z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr)); if (!cz) { fprintf(stderr, "papyrus-labels: %s\n", z3_error()); return 1; }
+    const z3_meta *cm = z3_meta_of(cz); const double um = atof(opt(argc, argv, "--um", "2.4"));
+    const int64_t shp[3] = {bx[3], bx[4], bx[5]};
+    char lv[32], od[1400]; z3w_level_name(um, lv, sizeof lv); snprintf(od, sizeof od, "%s/%s", argv[4], lv);
+    char at[600];
+    if (cutoff >= 0) snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"papyrus labels at cutoff %g (255 papyrus, 0 void, 128 ignored)\",\"origin_zyx\":[%lld,%lld,%lld],\"sigma\":%g,\"band\":%g}}", (double)cutoff, bx[0], bx[1], bx[2], (double)c.sigma, (double)c.band);
+    else snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"papyrus gap labels (255 papyrus, 0 void, 128 ignored)\",\"origin_zyx\":[%lld,%lld,%lld],\"sigma\":%g,\"cut\":[%g,%g],\"local\":%d,\"local_sigma\":%g,\"local_depth\":%g,\"local_margin\":%g,\"band\":%g}}",
+                  bx[0], bx[1], bx[2], (double)c.sigma, (double)c.t_lo, (double)c.t_hi, c.local, (double)c.local_sigma, (double)c.local_depth, (double)c.local_margin, (double)c.band);
+    z3w *ow = z3w_create(od, shp, S, 0, 0, at); if (!ow || z3w_write_group(argv[4], &um, 1, "ufsm-papyrus-labels", nullptr)) { fprintf(stderr, "papyrus-labels: %s\n", z3w_error()); return 1; }
+    const size_t cap = (size_t)(S + 2 * H) * (S + 2 * H) * (S + 2 * H);
+    uint8_t *cbuf = malloc(cap), *obuf = malloc((size_t)S * S * S); if (!cbuf || !obuf) { fprintf(stderr, "papyrus-labels: out of memory\n"); return 1; }
+    const double t0 = now(); int nsh = 0; const int64_t ns[3] = {(shp[0] + S - 1) / S, (shp[1] + S - 1) / S, (shp[2] + S - 1) / S};
+    for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
+        const int64_t so[3] = {sz * S, sy * S, sx * S}, on[3] = {shp[0] - so[0] < S ? shp[0] - so[0] : S, shp[1] - so[1] < S ? shp[1] - so[1] : S, shp[2] - so[2] < S ? shp[2] - so[2] : S};
+        int64_t want0[3], cn[3], ro[3], rn[3];   /* the haloed shard in volume coordinates, and the part inside the volume */
+        for (int d = 0; d < 3; d++) { want0[d] = bx[d] + so[d] - H; cn[d] = on[d] + 2 * H; ro[d] = want0[d] < 0 ? 0 : want0[d]; int64_t e = want0[d] + cn[d]; if (e > cm->shape[d]) e = cm->shape[d]; rn[d] = e - ro[d]; }
+        memset(cbuf, 0, (size_t)cn[0] * cn[1] * cn[2]);
+        if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
+            uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
+            if (!tmp || z3_read(cz, ro, rn, tmp, nt)) { fprintf(stderr, "papyrus-labels: %s\n", z3_error()); return 1; }
+            for (int64_t a = 0; a < rn[0]; a++) for (int64_t b = 0; b < rn[1]; b++)
+                memcpy(cbuf + ((size_t)(ro[0] - want0[0] + a) * cn[1] + (ro[1] - want0[1] + b)) * cn[2] + (ro[2] - want0[2]), tmp + ((size_t)a * rn[1] + b) * rn[2], (size_t)rn[2]);
+            free(tmp);
+        }
+        memset(obuf, 0, (size_t)S * S * S);
+        plab_job J = {cbuf, {cn[0], cn[1], cn[2]}, &c, cutoff, T, H, P, obuf, {on[0], on[1], on[2]}, {0, 0, 0}, 0};
+        /* the job writes rows of on[2] voxels; the shard writer wants S^3 */
+        uint8_t *dense = malloc((size_t)on[0] * on[1] * on[2]); if (!dense) abort(); J.out = dense;
+        pthread_t th[8]; const int k = nt < 1 ? 1 : nt > 8 ? 8 : nt;
+        for (int t = 0; t < k; t++) pthread_create(&th[t], nullptr, plab_tiles, &J);
+        for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
+        for (int64_t a = 0; a < on[0]; a++) for (int64_t b = 0; b < on[1]; b++) memcpy(obuf + ((size_t)a * S + b) * S, dense + ((size_t)a * on[1] + b) * on[2], (size_t)on[2]);
+        free(dense);
+        if (z3w_write_shard(ow, sz, sy, sx, obuf, nt)) { fprintf(stderr, "papyrus-labels: %s\n", z3w_error()); return 1; }
+        fprintf(stderr, "\rpapyrus-labels: shard %d / %lld  %.0fs", ++nsh, (long long)(ns[0] * ns[1] * ns[2]), now() - t0);
+    }
+    z3w_close(ow); z3_close(cz); free(cbuf); free(obuf);
+    fprintf(stderr, "\npapyrus-labels: %s (%s labels, halo %d) in %.0fs\n", od, cutoff >= 0 ? "cutoff" : "gap", H, now() - t0);
+    return 0;
+}
+
+/* An 8-bit RGB PNG (zlib deflate, filter 0 rows) */
+static void png_chunk(FILE *f, const char *type, const uint8_t *d, uint32_t n) {
+    const uint8_t be[4] = {(uint8_t)(n >> 24), (uint8_t)(n >> 16), (uint8_t)(n >> 8), (uint8_t)n}; fwrite(be, 1, 4, f); fwrite(type, 1, 4, f);
+    if (n) fwrite(d, 1, n, f);
+    uLong c = crc32(0L, Z_NULL, 0); c = crc32(c, (const Bytef *)type, 4); if (n) c = crc32(c, d, n);
+    const uint8_t cb[4] = {(uint8_t)(c >> 24), (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c}; fwrite(cb, 1, 4, f);
+}
+static int png_write_rgb(const char *path, int w, int h, const uint8_t *rgb) {
+    const size_t rs = (size_t)w * 3 + 1, raw = rs * (size_t)h; uint8_t *r = malloc(raw); uLongf zn = compressBound(raw); uint8_t *z = malloc(zn);
+    if (!r || !z) { free(r); free(z); return 1; }
+    for (int y = 0; y < h; y++) { r[(size_t)y * rs] = 0; memcpy(r + (size_t)y * rs + 1, rgb + (size_t)y * w * 3, (size_t)w * 3); }
+    FILE *f = compress2(z, &zn, r, raw, 6) == Z_OK ? fopen(path, "wb") : nullptr;
+    if (f) {
+        static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10}; fwrite(sig, 1, 8, f);
+        const uint8_t ih[13] = {(uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w, (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h, 8, 2, 0, 0, 0};
+        png_chunk(f, "IHDR", ih, 13); png_chunk(f, "IDAT", z, (uint32_t)zn); png_chunk(f, "IEND", nullptr, 0);
+    }
+    free(r); free(z);
+    return f ? fclose(f) != 0 : 1;
+}
+/* ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w [--labels G1,G2,..] [--um 2.4] [--zoom 1] [--cache DIR]
+   One CT plane (volume coordinates) beside the same plane of each label group (papyrus-labels output: key = --um level, placed by
+   its ufsm.origin_zyx): void (0 inside the scroll) tinted blue, ignored (128) yellow, papyrus left grey. Panels left to right in
+   --labels order after the plain CT, 4 white pixels apart; --zoom N repeats pixels. */
+static int cmd_overlay(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w [--labels G1,G2,..] [--um 2.4] [--zoom 1] [--cache DIR]\n"); return 2; }
+    long long pz[5]; if (sscanf(opt(argc, argv, "--plane", ""), "%lld,%lld,%lld,%lld,%lld", pz, pz + 1, pz + 2, pz + 3, pz + 4) != 5 || pz[3] < 1 || pz[4] < 1) { fprintf(stderr, "overlay: --plane z,y,x,h,w\n"); return 2; }
+    const int H = (int)pz[3], W = (int)pz[4], Z = atoi(opt(argc, argv, "--zoom", "1")) < 1 ? 1 : atoi(opt(argc, argv, "--zoom", "1"));
+    char lv[32]; z3w_level_name(atof(opt(argc, argv, "--um", "2.4")), lv, sizeof lv);
+    char lab[4096]; snprintf(lab, sizeof lab, "%s", opt(argc, argv, "--labels", "")); const char *names[16]; int nl = 0;
+    for (char *s = lab, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
+    const size_t n2 = (size_t)H * W; uint8_t *ct = malloc(n2), *lb = malloc(n2 * (nl ? nl : 1));
+    z3 *cz = z3_open(store_open(argv[3]), argv[4], opt(argc, argv, "--cache", nullptr)); if (!cz || !ct || !lb) { fprintf(stderr, "overlay: %s\n", z3_error()); return 1; }
+    const int64_t o[3] = {pz[0], pz[1], pz[2]}, n[3] = {1, H, W};
+    if (z3_read(cz, o, n, ct, 8)) { fprintf(stderr, "overlay: %s\n", z3_error()); return 1; }
+    for (int i = 0; i < nl; i++) {
+        long long po[3] = {0, 0, 0}; char jp[1400]; snprintf(jp, sizeof jp, "%s/%s/zarr.json", names[i], lv); FILE *jf = fopen(jp, "rb"); char jb[8192] = {0};
+        if (jf) { size_t nr = fread(jb, 1, sizeof jb - 1, jf); (void)nr; fclose(jf); }
+        const char *q = strstr(jb, "\"origin_zyx\":"); if (q) sscanf(q + 13, " [%lld,%lld,%lld]", po, po + 1, po + 2);
+        z3 *lz = z3_open(store_open(names[i]), lv, nullptr); if (!lz) { fprintf(stderr, "overlay: %s: %s\n", names[i], z3_error()); return 1; }
+        const int64_t lo[3] = {pz[0] - po[0], pz[1] - po[1], pz[2] - po[2]};
+        if (z3_read(lz, lo, n, lb + n2 * i, 8)) { fprintf(stderr, "overlay: %s: %s\n", names[i], z3_error()); return 1; }
+        z3_close(lz);
+    }
+    const int gap = 4, OW = (W * Z + gap) * (nl + 1) - gap, OH = H * Z; uint8_t *img = malloc((size_t)OW * OH * 3); if (!img) return 1;
+    memset(img, 255, (size_t)OW * OH * 3);
+    for (int p = 0; p <= nl; p++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        const uint8_t g = ct[(size_t)y * W + x]; int r = g, gg = g, b = g;
+        if (p) { const uint8_t v = lb[n2 * (p - 1) + (size_t)y * W + x];
+                 if (g && v == 0) { r = g / 2; gg = g / 2 + 30; b = g / 2 + 120; } else if (v == 128) { r = g / 2 + 120; gg = g / 2 + 100; b = g / 2; } }
+        for (int dy = 0; dy < Z; dy++) for (int dx = 0; dx < Z; dx++) {
+            uint8_t *px = img + (((size_t)y * Z + dy) * OW + (size_t)p * (W * Z + gap) + (size_t)x * Z + dx) * 3;
+            px[0] = (uint8_t)(r > 255 ? 255 : r); px[1] = (uint8_t)(gg > 255 ? 255 : gg); px[2] = (uint8_t)(b > 255 ? 255 : b);
+        }
+    }
+    const int rc = png_write_rgb(argv[2], OW, OH, img);
+    if (rc) fprintf(stderr, "overlay: cannot write %s\n", argv[2]); else fprintf(stderr, "overlay: %s (%d x %d, %d panels)\n", argv[2], OW, OH, nl + 1);
+    z3_close(cz); free(ct); free(lb); free(img);
+    return rc;
+}
+
 typedef struct {   /* ufsm render: one output tile's pixel rows over threads */
     const float *X, *Y, *Z; int w, h; double gs;   /* the vertex grid; output pixels per grid step */
     const uint8_t *vol, *ct; int64_t o[3], n[3]; int depth;
@@ -1372,6 +1521,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "gap-compare")) return cmd_gap_compare(argc, argv);
     if (!strcmp(cmd, "gap-density")) return cmd_gap_density(argc, argv);
     if (!strcmp(cmd, "void-pool")) return cmd_void_pool(argc, argv);
+    if (!strcmp(cmd, "papyrus-labels")) return cmd_papyrus_labels(argc, argv);
+    if (!strcmp(cmd, "overlay")) return cmd_overlay(argc, argv);
     if (argc < 4) return usage();
     const char *root = argv[2], *key = argv[3];
     const char *cache = opt(argc, argv, "--cache", nullptr);

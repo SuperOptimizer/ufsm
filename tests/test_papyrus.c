@@ -104,8 +104,66 @@ int main(void) {
       CHECK(papyrus_checkpoint(fn, &cond) == 0, "band_affinity checkpoint taken for papyrus");
       remove(fn); CHECK(papyrus_checkpoint(fn, &cond) == -1, "missing checkpoint"); }
 
+    /* running max / min and the closing vs brute force, windows cut at the faces, radii from 0 to past the cube */
+    { enum { Q = 17 }; const size_t q3 = (size_t)Q * Q * Q;
+      uint8_t *in = malloc(q3), *o = malloc(q3), *T = malloc(q3), *Cl = malloc(q3), *F = malloc(q3), *dil = malloc(q3);
+      uint32_t st = 12345; for (size_t k = 0; k < q3; k++) { st = st * 1664525u + 1013904223u; in[k] = (uint8_t)(st >> 24); }
+#define QI(z, y, x) (((size_t)(z) * Q + (y)) * Q + (x))
+      const int radii[] = {0, 1, 2, 5, 9, 20};
+      for (int ri = 0; ri < 6; ri++) for (int mx = 0; mx <= 1; mx++) {
+          const int r = radii[ri]; int bad = 0;
+          papyrus_filter(in, o, Q, r, mx, T);
+          for (int z = 0; z < Q; z++) for (int y = 0; y < Q; y++) for (int x = 0; x < Q; x++) {
+              int e = mx ? 0 : 255;
+              for (int c = z - r; c <= z + r; c++) for (int b = y - r; b <= y + r; b++) for (int a = x - r; a <= x + r; a++) {
+                  if (c < 0 || b < 0 || a < 0 || c >= Q || b >= Q || a >= Q) continue;
+                  const int v = in[QI(c, b, a)]; e = mx ? (v > e ? v : e) : (v < e ? v : e);
+              }
+              bad += o[QI(z, y, x)] != e;
+          }
+          CHECK(!bad, "%s filter r %d: %d voxels differ from brute force", mx ? "max" : "min", r, bad);
+      }
+      { const int r = 2; int bad = 0;   /* closing = min of the max; floor = min */
+        papyrus_levels(in, Q, r, Cl, F, T);
+        papyrus_filter(in, dil, Q, r, 1, T); papyrus_filter(dil, o, Q, r, 0, T);
+        for (size_t k = 0; k < q3; k++) bad += Cl[k] != o[k] || Cl[k] < in[k];
+        papyrus_filter(in, o, Q, r, 0, T);
+        for (size_t k = 0; k < q3; k++) bad += F[k] != o[k];
+        CHECK(!bad, "closing / floor: %d voxels wrong", bad); }
+#undef QI
+      free(in); free(o); free(T); free(Cl); free(F); free(dil); }
+
+    /* gap labels (no cutoff) on a synthetic scroll varying along x: open air 20 | faint papyrus 70 | sheet 160 | packed gap 80 |
+       sheet 160 | sheet 200 with a shallow dip to 150 (above t_hi: texture, not void); then noisy uniform papyrus */
+    { enum { Q = 64 }; const size_t q3 = (size_t)Q * Q * Q;
+      uint8_t *c = malloc(q3), *tg = malloc(q3), *ig = calloc(q3, 1), *f = malloc(q3), *sc = malloc(8 * q3);
+      papyrus_cfg L = {.t_lo = 50, .t_hi = 128, .sigma = 0, .local = 6, .local_sigma = 0, .local_depth = 30, .local_margin = 0};
+      int prof[Q], want[Q];
+      for (int x = 0; x < Q; x++) {
+          prof[x] = x < 10 ? 20 : x < 18 ? 70 : x < 30 ? 160 : x < 33 ? 80 : x < 45 ? 160 : x >= 52 && x < 55 ? 150 : 200;
+          want[x] = !(x < 10 || (x >= 30 && x < 33));
+      }
+      for (size_t k = 0; k < q3; k++) c[k] = (uint8_t)prof[k % Q];
+      papyrus_labels(c, Q, &L, 0.f, 0.0, tg, ig, f, sc);
+      int bad = 0, first = -1;
+      for (size_t k = 0; k < q3; k++) if ((tg[k] == 255) != want[k % Q] || ig[k]) { bad++; if (first < 0) first = (int)(k % Q); }
+      CHECK(!bad, "gap labels: %d voxels wrong (first at x %d: CT %d label %d)", bad, first, first >= 0 ? prof[first] : 0, first >= 0 ? tg[first] : 0);
+      { papyrus_cfg G = L; G.local = 0; papyrus_labels(c, Q, &G, 55.f, 0.0, tg, ig, f, sc);   /* the old way at cutoff 55 */
+        CHECK(tg[31] == 255, "a global cutoff of 55 should have called the packed gap papyrus"); }
+      L.local_margin = 0.2f; memset(ig, 0, q3);   /* the margin ignores the half-depth band of a ramp, not the plateaus */
+      for (size_t k = 0; k < q3; k++) { const int x = (int)(k % Q); c[k] = (uint8_t)(x == 29 || x == 33 ? 120 : prof[x]); }
+      papyrus_labels(c, Q, &L, 0.f, 0.0, tg, ig, f, sc);
+      CHECK(ig[29] && ig[33] && !ig[25] && !ig[31] && !ig[40], "margin: ramp voxels %d %d ignored, plateaus %d %d %d not", ig[29], ig[33], ig[25], ig[31], ig[40]);
+      uint32_t st = 777; L.local_margin = 0; memset(ig, 0, q3);   /* noise +-12 on uniform papyrus 100 (inside [t_lo, t_hi], so only the
+                                                                     depth gate keeps it papyrus) is texture: no void */
+      for (size_t k = 0; k < q3; k++) { st = st * 1664525u + 1013904223u; c[k] = (uint8_t)(100 + (int)((st >> 24) % 25) - 12); }
+      papyrus_labels(c, Q, &L, 0.f, 0.0, tg, ig, f, sc);
+      int nv = 0; for (size_t k = 0; k < q3; k++) nv += tg[k] != 255;
+      CHECK(!nv, "noisy uniform papyrus: %d voxels called void", nv);
+      free(c); free(tg); free(ig); free(f); free(sc); }
+
     free(ct); free(t); free(ign); free(fg); free(scratch); free(A); free(B);
     if (fails) { fprintf(stderr, "test_papyrus: %d failures\n", fails); return 1; }
-    puts("papyrus labels: smoothing, hard / soft cutoffs, ignore band, cleanup, Otsu, checkpoint tag ok");
+    puts("papyrus labels: smoothing, hard / soft cutoffs, ignore band, cleanup, Otsu, gap labels, checkpoint tag ok");
     return 0;
 }
