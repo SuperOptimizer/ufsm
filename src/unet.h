@@ -38,6 +38,8 @@ unet *unet_create(const unet_cfg *cfg);
 static inline float unet_scale_code(double um) { return um > 0 ? (float)log2(um / 4.8) : 0.f; }
 /* input voxel size of the following forward passes (scale_cond nets; one value per forward, i.e. per batch) */
 void unet_set_scale(unet *u, double um);
+/* the conditioning code c itself (scale_cond nets used for another scalar, e.g. task papyrus: the cutoff in input units) */
+void unet_set_cond(unet *u, float c);
 void unet_free(unet *u);
 const unet_cfg *unet_cfg_of(const unet *u);
 size_t unet_nparams(const unet *u);

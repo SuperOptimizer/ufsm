@@ -5,6 +5,7 @@
 #include "sheet.h"
 #include <zstd.h>
 #include <sys/stat.h>
+#include "papyrus.h"
 #include "pyramid.h"
 #include "sources.h"
 #include "split.h"
@@ -161,6 +162,7 @@ typedef struct {
     reader_t *rd; writer_t *WR; const tile_t *tiles; long ntiles;
     int W, halo, shard, Dl, H0, kss, h16, sign, sb, fail; int64_t ns[3], nss[3], bn[3], bo[3];
     const axis *ax; double scale, t0; long ndone, nskip;
+    double pcut; int pcond;   /* task papyrus: the cutoff (raw CT units) of a conditioned net, else < 0; its conditioning (papyrus.h) */
 } pjob_t;
 static void psplit_flush(pjob_t *J, int side, int64_t qz, int64_t qy, int64_t qx) {   /* both sides: the owned planes to the host shard; side 0 submits */
     pside_t *S = &J->s[side];
@@ -215,7 +217,9 @@ static void psplit_job(int side, void *arg) {
         pthread_mutex_lock(&rd->mu); if (atomic_load(&rd->consumed) < i + 1) atomic_store(&rd->consumed, i + 1); pthread_cond_broadcast(&rd->cv); pthread_mutex_unlock(&rd->mu);
         if (h[3] > 0) { J->fail = J->fail ? J->fail : 2; return; }   /* (both halves see it at the same collective) */
         if (h[0] == 0) { if (!side) J->nskip++; continue; }
-        const double w3 = (double)W * W * W, mean = h[1] / w3, var = h[2] / w3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
+        const double w3 = (double)W * W * W, wmean = h[1] / w3, var = h[2] / w3 - wmean * wmean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
+        if (J->pcut >= 0 && J->pcond == 1) unet_set_cond(S->u, (float)((J->pcut - wmean) / sd));   /* papyrus: the cutoff in this window's input units */
+        const double mean = J->pcut >= 0 && J->pcond == 2 ? J->pcut : wmean;                        /* (or the input's zero) */
         const int64_t o[3] = {J->bo[0] + t->tz, J->bo[1] + t->ty, J->bo[2] + t->tx};
         for (int z = 0; z < Dl; z++) {   /* window origin relative to the axis at this half's slices */
             double cy, cx;
@@ -262,7 +266,8 @@ int cmd_predict(int argc, char **argv) {
                         "       [--fit-zarr DIR]                 the same fields as zarr arrays, flushed slab by slab (whole volumes)\n"
                         "       [--radial-sign 1|-1]   -1 reverses the direction input (the CT is unchanged): a recto model then marks the verso face\n"
                         "       [--gn-save FILE]   pool the GroupNorm statistics of every window processed into FILE (calibration)\n"
-                        "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n");
+                        "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n"
+                        "       [--papyrus-cut T]   task papyrus nets conditioned on the cutoff: papyrus where the smoothed CT exceeds T (raw CT units)\n");
         fprintf(stderr, "  Default window: shard + 32 with halo 16 (one window per shard) when it fits the GPU, else 288 with halo 8. For exact shard tiling, window - 2*halo should divide the shard size: 544 with halo 16 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n"
                         "  Window - 2*halo = k * shard (k >= 2) with the box on that grid computes one window per k^3 shards (big GPUs: fewer, larger windows).\n"
                         "  Inference memory: UFSM_INFER_SLAB=N (default 64) runs the level-0/1 convs in place in N-plane slabs; UFSM_INFER_OFFLOAD=1 (default) keeps\n"
@@ -324,6 +329,11 @@ int cmd_predict(int argc, char **argv) {
                                                                      network (nn_lowres_*): hdiv window voxels per network voxel; pack has 8 logits per output */
     if (out_ch < 0 || out_ch >= nout) { fprintf(stderr, "predict: --channel %d outside the checkpoint's %d outputs\n", out_ch, nout); return 2; }
     if (ffd && (cfg.cout != 11 || half || sheet_task || level)) { fprintf(stderr, "predict: --fit-fields needs a task unwrap checkpoint (11 outputs), full resolution, level 0\n"); return 2; }
+    int pap_cond = 0; const int pap = papyrus_checkpoint(ckpt, &pap_cond) == 1;   /* task papyrus: the conditioned nets take the cutoff per window */
+    const double pcut = pap && pap_cond ? atof(opt(argc, argv, "--papyrus-cut", "-1")) : -1;
+    if (pap && pap_cond && !(pcut >= 0 && pcut <= 255)) { fprintf(stderr, "predict: %s is conditioned on the papyrus cutoff: --papyrus-cut T (raw CT units 0..255, e.g. 80)\n", ckpt); return 2; }
+    if (*opt(argc, argv, "--papyrus-cut", "") && !(pap && pap_cond)) { fprintf(stderr, "predict: --papyrus-cut needs a cutoff-conditioned papyrus checkpoint\n"); return 2; }
+    char content[96]; if (pap && pcut >= 0) snprintf(content, sizeof content, "papyrus probability at cutoff %g", pcut); else snprintf(content, sizeof content, "%s probability", pap ? "papyrus" : "recto");
     const char *gn_stats = opt(argc, argv, "--gn-stats", embedded && runtime.gn_stored ? "stored" : "legacy");
     if (strcmp(gn_stats, "stored") && strcmp(gn_stats, "legacy")) { fprintf(stderr, "--gn-stats must be stored or legacy\n"); return 2; }
     nn_set_gn_stored(!strcmp(gn_stats, "stored"));
@@ -387,7 +397,7 @@ int cmd_predict(int argc, char **argv) {
             if (bad) { fprintf(stderr, "a predict worker failed\n"); return 1; }
             double um_l = um * (1 << level);
             int64_t bn[3]; { long long v[6] = {0, 0, 0, 0, 0, 0}; const char *b = opt(argc, argv, "--box", nullptr); if (!b || sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) { fprintf(stderr, "--gpus needs --box\n"); return 1; } for (int d = 0; d < 3; d++) bn[d] = v[3 + d]; }
-            char attrs[2000]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"recto probability (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"gpus\":%d,\"ema\":%d%s}}", ckpt, ngpu, use_ema, grid_attrs);
+            char attrs[2000]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"gpus\":%d,\"ema\":%d%s}}", content, ckpt, ngpu, use_ema, grid_attrs);
             for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
             if (pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs)) return 1;
             fprintf(stderr, "wrote %s (%d GPUs)\n", out, ngpu);
@@ -426,7 +436,7 @@ int cmd_predict(int argc, char **argv) {
         else if (!sheet_task) unet_set_head_channels(uk, hmode == 2 ? 8 * out_ch : out_ch, hmode == 2 ? 8 : 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
         /* the network takes the uint8 CT window itself (with in-place slabs the stem builds its input per slab: no 16-bit window) */
         if (!sheet_task && !half && !ufsm_env_on("UFSM_PRED_HOSTPATH")) unet_set_ct_input(uk, 1);
-        if (cfg.scale_cond) {   /* voxel-size conditioning: the CT level's voxel size, or --scale-um to override */
+        if (cfg.scale_cond && !(pcut >= 0 && pap_cond == 1)) {   /* voxel-size conditioning: the CT level's voxel size, or --scale-um to override */
             const double sum_ = atof(opt(argc, argv, "--scale-um", "0"));
             unet_set_scale(uk, sum_ > 0 ? sum_ : um * (1 << level));
         }
@@ -462,8 +472,8 @@ int cmd_predict(int argc, char **argv) {
     char lv[32], ldir[1400], attrs[1024];
     z3w_level_name(um_l, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
-    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"recto probability (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"ema\":%d%s}}",
-             ckpt, step, root, ak, (long long)bo[0], (long long)bo[1], (long long)bo[2], W, halo, use_ema, grid_attrs);
+    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"ema\":%d%s}}",
+             content, ckpt, step, root, ak, (long long)bo[0], (long long)bo[1], (long long)bo[2], W, halo, use_ema, grid_attrs);
     z3w *w = z3w_create(ldir, bn, shard, q, 0, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     int stride = W - 2 * halo;
@@ -602,7 +612,7 @@ int cmd_predict(int argc, char **argv) {
         J.rd = &rd; J.WR = &WR; J.tiles = rd.tiles; J.ntiles = rd.ntiles;
         J.W = W; J.halo = halo; J.shard = shard; J.Dl = Dl; J.H0 = H0; J.kss = kss; J.h16 = h16; J.sign = (int)radial_sign;
         for (int d = 0; d < 3; d++) { J.ns[d] = ns[d]; J.nss[d] = nss[d]; J.bn[d] = bn[d]; J.bo[d] = bo[d]; }
-        J.ax = &ax; J.scale = scale; J.t0 = t0;
+        J.ax = &ax; J.scale = scale; J.t0 = t0; J.pcut = pcut; J.pcond = pap_cond;
         split_run(sctx, psplit_job, &J);
         for (int k = 0; k < 2; k++) { nn_init(gpus[k]); const char *e = nn_check(); if (e) { fprintf(stderr, "cuda (GPU %d): %s\n", gpus[k], e); J.fail = 3; } }
         nn_init(gpu);
@@ -647,6 +657,8 @@ int cmd_predict(int argc, char **argv) {
             }
             if (nz == 0) { nskip++; pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu); continue; }
             double mean = sum / (double)w3, var = sq / (double)w3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
+            if (pcut >= 0 && pap_cond == 1) unet_set_cond(u, (float)((pcut - mean) / sd));   /* papyrus: the cutoff in this window's input units */
+            if (pcut >= 0 && pap_cond == 2) mean = pcut;                                         /* (or the input's zero) */
             for (int z = 0; z < W; z++) {   /* window origin relative to the axis at this slice (double on the host, small in float) */
                 double cy, cx;
                 axis_at(&ax, (double)(o[0] + z) * scale, &cy, &cx);

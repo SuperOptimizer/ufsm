@@ -1,6 +1,7 @@
 #include "sample.h"
 #include "band.h"
 #include "target_erode.h"
+#include "papyrus.h"
 #include "nn.h"
 #include "ct_augment.h"
 #include "spatial_augment.h"
@@ -139,7 +140,7 @@ static batch alloc_batch(const sample_cfg *c) {
     b.sheet = calloc((size_t)c->B, sizeof *b.sheet);
     b.band = c->band ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     b.side = c->side ? nn_host_alloc((size_t)c->B * p3) : nullptr;
-    b.pm = c->papyrus ? nn_host_alloc((size_t)c->B * p3) : nullptr;
+    b.pm = c->pmask ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     return b;
 }
 
@@ -719,6 +720,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     int tmax = 0;
     for (int ch = 0; ch < NCH; ch++) {
         uint8_t *dst = ttmp + (size_t)ch * p3;
+        if (c->papyrus) { memset(dst, 0, p3); continue; }   /* task papyrus: labels from the CT below */
         if (ch == region_ch) {
             z3 *rz = source_region(s, ch, ri);
             if (!rz) return -1;
@@ -748,7 +750,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (mx > tmax) tmax = mx;
         }
     }
-    if (!c->cover && tmax == 0 && runif(r) > c->empty_keep) { atomic_fetch_add(&sp->rejected, 1); return 1; }
+    if (!c->cover && !c->papyrus && tmax == 0 && runif(r) > c->empty_keep) { atomic_fetch_add(&sp->rejected, 1); return 1; }
     PROF_MARK(PS_TARGETS);
     /* curriculum: thicken the surface band by max-filtering the target (hard labels only, pyramid sources) */
     if (c->dilate > 0 && region_ch < 0) {
@@ -824,6 +826,14 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         uint8_t *dst = ttmp + (size_t)ch * p3;
         for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k]; ign[k] |= v == 255; dst[k] = v == 255 ? 0 : (uint8_t)(v + (v >= 127)); }   /* (v * 255 + 127) / 254 for v < 255 */
     }
+    float pap_t = 0;
+    if (c->papyrus) {   /* task papyrus: channel 0 (probability x 255) and its ignore band from the clean CT, before the scanner augmentation */
+        const double u_mode = runif(r), u_t = runif(r), u_tau = runif(r);
+        pap_t = papyrus_cutoff(c->papyrus, ctu, p3, u_mode, u_t);
+        papyrus_labels(ctu, P, c->papyrus, pap_t, u_tau, ttmp, ign, ttmp + p3, big + p3);   /* channel 1 as scratch, scratch 8 P^3 */
+        memset(ttmp + p3, 0, p3);
+        w[0] = 1;
+    }
     PROF_MARK(PS_ENCODE);
     if (c->sheet) sheet_mask_contacts(c->sheet,o,P,ign);
     /* input channels (z-scored CT, radial unit vector) written in one pass straight into the batch with the symmetry
@@ -885,11 +895,13 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             spatial_aug_affine(&spatial, rnext(r), c->affine_aniso * c->scan.strength, c->affine_shear * c->scan.strength);
     }
     b->um[i] = (float)(s->um * (double)(1 << l) * (spatial.active ? spatial.scale * cbrt(spatial.det) : 1.0));   /* affine: the volume-preserving voxel size */
+    if (c->papyrus) b->um[i] = c->papyrus->cond == 1 ? (float)(ia * ((pap_t - mean) / sd) + ib) : 0.f;   /* the cutoff where the input puts it */
+    if (c->papyrus && c->papyrus->cond == 2) { mean = pap_t; ib = 0.f; }   /* the CT channel (ct - t) / sd: the cutoff at zero */
     if (!spatial.active) {
         for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y);
         sym_u8(mask, M, P, y);
     }
-    if (c->papyrus && !spatial.active) {   /* CT > 0 through the same symmetry (big + 2 P^3, the soft / trust distance map, is free here) */
+    if (c->pmask && !spatial.active) {   /* CT > 0 through the same symmetry (big + 2 P^3, the soft / trust distance map, is free here) */
         uint8_t *pt = big + 2 * p3;
         for (size_t k = 0; k < p3; k++) pt[k] = ctu[k] != 0;
         sym_u8(pt, b->pm + (size_t)i * p3, P, y);
@@ -937,7 +949,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         if (spatial.active) warp_sheet_batch(b->sheet[i],&spatial,M);
         w[1]=0; /* winding is supervised by the sparse regression objective */
     }
-    if (spatial.active && c->papyrus) memcpy(b->pm + (size_t)i * p3, M, p3);   /* warped samples: the warped loss mask */
+    if (spatial.active && c->pmask) memcpy(b->pm + (size_t)i * p3, M, p3);   /* warped samples: the warped loss mask */
     PROF_MARK(PS_X16);
     memcpy(b->w + (size_t)i * NCH, w, NCH);
     b->src[i] = (int16_t)si;

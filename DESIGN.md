@@ -298,6 +298,58 @@ with augment 0-3; the default recipe deterministic; soft 80 um (16-bit chamfer) 
 pack4 at P256 and P384 now wait 0% (cover recipe 26-27 samples/s; P384 pool4 7-9 -> 9.45 samples/s). Left: soft ~65, input
 ~61, CT read ~56 (whole 128^3 chunks decoded for a window on the 32-voxel grid; volcomp substreams would allow less).
 
+## Papyrus / void network (2026-10-11)
+
+User request: a small conv3d net that separates papyrus (foreground) from void / air inside the scroll (the outside is masked
+to 0 already). Low CT means void, but there is no exact cutoff (Paris4 ~80), so train on random cutoffs t in [50, 128].
+- `train --task papyrus` (src/papyrus.h, header-only; hooks in sample.c / train.c / predict.c, existing tasks byte-identical:
+  bench_sampler hashes of the x13 cover's training recipe, augment 1, no soft and the default recipe). The sampler reads no
+  targets: per native patch it draws t (`--pap-cut 50,128`; `--pap-rel LO,HI --pap-rel-p P`: Otsu of the patch x U(LO, HI)),
+  smooths the CLEAN CT (`--pap-sigma 1`, separable Gaussian streamed through a ring of 7 planes: ~70 ms at P256) and writes
+  channel 0 = 255 sigmoid((s - t) / tau), tau ~ U(`--pap-tau 2,8`) raw units (hard s > t without --pap-tau; `--pap-band B`
+  ignores |s - t| < B; `--pap-clean N` flips 6-connected specks / holes below N voxels). Then the scanner augmentation
+  corrupts only the input (recipe: noise .3, cnoise .15, blur .2, lowres .15, sharpen .1, ring .15, slice .15, quant .1;
+  no tone / bias / cupping, which would move the cutoff). CT 0 stays out of the loss; predict writes 0 there.
+- Conditioning on t (`--pap-cond`): 2 (recommended) z-scores the CT channel around the cutoff, (ct - t) / window sd (no
+  offset jitter), so the cutoff is the input's zero; predict `--papyrus-cut T` passes T as the window "mean" (the CT stem is
+  unchanged). 1 adds (t - mean) / sd to the stem bias through the --scale-cond vector (`unet_set_cond`): learned too slowly
+  (train loss 0.33-0.36 flat from step 200, val 0.445 at 1000 = the unconditioned arm's; stopped). 0 trains the marginal
+  P(s > t) over t, read at p > (t - 50) / 78. Checkpoint tag `"task":"papyrus","papyrus":{..."cond":2}`.
+- Data (holdout sub-box 256x512x512): material mean 87, sd 36, percentiles 5/25/50/75/95 = 37/49/90/117/141, void mode 40-49,
+  histogram minimum 60-69, Otsu 84; CT - G1(CT) residual sd 3.65 (the scan is clean); BCE floor of the soft targets 0.14
+  (an ideal unconditioned predictor: 0.36). Cleanup flips < 0.04% (N 64) / < 0.15% (N 512) of the voxels at t 50-110: off.
+- Evaluation without human labels (`tools/papyrus_eval.py`, holdout boxes 48128 384x1024^2 and 48512 512x1024^2, predict
+  window 416 / halo 16): IoU with the reference label (G1 CT > t), papyrus fraction, recall of the training-4p8 recto voxels,
+  CT 0 called void (1.000 by construction), per-block fraction (2x4x4 blocks) vs the reference, mid-plane PNG grids.
+  Arms (16,32,64,96 = 1.3M params full resolution, or --half-res pool 32,64,96,128 = 3.1M at 4.8 um; Muon 0.01 WSD,
+  P256 B1, soft tau 2-8, sigma 1, --dice 0, MX-fp4 body, 16-bit or MX-fp8 stem input), IoU box 48128 at t = 50 / 65 / 80 /
+  95 / 110 / 128 (box 48512 within 0.01):
+
+  | arm | steps | val loss | IoU | papyrus fraction at t 80 (ref 0.587) |
+  |---|---|---|---|---|
+  | raw CT > t (no smoothing) | - | - | 0.972 / 0.973 / 0.964 / 0.942 / 0.903 / 0.810 | 0.575 |
+  | B marginal, read at (t - 50) / 78 | 2738 | 0.434 | 0.763 / 0.943 / 0.883 / 0.832 / 0.791 / 0.000 | 0.521 |
+  | A2 cond 2, full res | 2738 | 0.158 | 0.972 / 0.991 / 0.977 / 0.977 / 0.958 / 0.936 | 0.573 |
+  | E cond 2, half-res pool | 2738 | 0.157 | 0.966 / 0.986 / 0.983 / 0.974 / 0.949 / 0.910 | 0.578 |
+  | F-pool cond 2, half-res pool | 7048 | 0.153 | 0.981 / 0.992 / 0.991 / 0.984 / 0.973 / 0.944 | 0.585 |
+  | F-full cond 2, full res | 7048 | 0.153 | 0.984 / 0.993 / 0.993 / 0.990 / 0.986 / 0.971 | 0.584 |
+
+  Recto-label recall follows the reference's within 0.012 (F-pool box 48128 t 65 / 80 / 95: 0.768 / 0.676 / 0.542; the label
+  band straddles the face, so the reference itself reaches 0.771 / 0.678 / 0.545; F-full 0.767 / 0.675 / 0.543); per block (2x4x4) the papyrus fraction is
+  within 0.0014-0.0034 of the reference's at t >= 65 (0.011-0.014 at 50); the block-to-block spread (sd 0.017-0.099) is the
+  reference's own, i.e. real variation, not instability. Predict (idle laptop GPU, window 544 / halo 16, 512^3 shards, a
+  shard-aligned 512x1024^2 box = 537 M voxels, one window per shard): F-full 1.33 s GPU (~400 M voxels/s), 1.65 s wall;
+  F-pool 0.43 s GPU (~1.25 G voxels/s), ~0.8 s wall (reads dominate); Paris4's ~15 T occupied voxels ~10 h vs ~3.3 h of GPU.
+  Training (x13 cover, shared GPU): F-full 1539 s (5.7 samples/s, GPU-bound, 6 workers), F-pool 689 s (10-11, sampler-bound,
+  8 workers). The papyrus sampler costs ~95 ms per P256 patch for the labels (smoothing ~70); batches are deterministic
+  across worker counts (bench_sampler UFSM_BENCH_PAPYRUS hash, 4 and 10 workers).
+- Recommendation: F-pool (`--half-res pool --widths 32,64,96,128 --pap-cond 2 --pap-tau 2,8 --pap-sigma 1 --dice 0`) for
+  whole-scroll runs: 3x faster inference, within 0.007 IoU of full resolution at cutoffs 50-95 (-0.013 at 110, -0.027 at 128);
+  F-full where aggressive cutoffs (>= 110) matter. Not measured: transfer to other scans (the Otsu-relative cutoffs
+  `--pap-rel` exist for that), robustness on actually noisier scans, `--pap-band` (soft targets used instead). Checkpoints
+  ~/ufsm-data/runs/papyrus-20261011/F-{pool,full}-x13/last.ckpt (laptop). Paris4 cutoffs: 80 (default: the user's estimate, Otsu 84), 65 (conservative: the
+  histogram minimum, keeps faint papyrus), 95-110 (aggressive: only dense papyrus; specks at 110+ come from the label itself).
+
 ## Inference memory (2026-10-11)
 
 INFERENCE_MEMORY_PLAN.md phases 1, 2 and 2b (status table there): the inference build of the production net (one head

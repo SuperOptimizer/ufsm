@@ -180,6 +180,11 @@ $(B)/test_target_erode: tests/test_target_erode.c src/target_erode.h | $(B)
 
 test-all: $(B)/test_target_erode
 
+$(B)/test_papyrus: tests/test_papyrus.c src/papyrus.h | $(B)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ -lm
+
+test-all: $(B)/test_papyrus
+
 $(B)/test_cover: tests/test_cover.c $(B)/cover.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ -lcrypto -lm
 
@@ -227,6 +232,7 @@ $(B):
 
 test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/check_surface_samples $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_tiffw $(B)/test_typed_zarr
 	./$(B)/test_target_erode
+	./$(B)/test_papyrus
 	$(MAKE) test-sheet
 	./$(B)/test_wgrad_grid
 	./$(B)/test_sheet_gpu
