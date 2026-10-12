@@ -329,6 +329,16 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   9-block net; not kept): the network density under-counts in the same places. Three fitter-side remedies failed, so the
   winding accuracy is bounded by the network's view of packed sheets; the lever is the network (desk-scale data and steps,
   and losses that weight packed regions).
+- Papyrus / void net as a sheet counter (`ufsm gap-compare <papyrus> <key> <reference-fields> [--net FIELDS]`: void -> papyrus
+  entries along each cell's radial ray, +-115 um, vs the reference density, by reference spacing; native, 17 s): on block B
+  with the full-res papyrus net (2.4 um, cutoff 80) the gap count is 1.04 x the true density where sheets are < 100 um apart,
+  where the 9.6 um winding net is at 0.72 (its missing turns); but 1.44-2.16 x in loose regions (each sheet's own layers and
+  cracks read as gaps), where the net is 0.94-1.48. Cutoff 110 is similar. `ufsm gap-density` fuses them (the gaps' spacing
+  where the fields' is under --fuse-um and the gaps' is smaller; packed 0.72 -> 1.01 at 150 um) and `fit --packed-um T`
+  lowers the phase weight (to 0.1 at 0.6 T) where the fields' spacing is packed and keeps those voxels out of the integer
+  unwrapping: together they halve the radial turn drift on B (+1 at 0.5-1 mm 56 -> 34%, -2 beyond 6 mm 10-23% -> 0) but the
+  score moves only 83.7 -> 84.05% and some settings flip the whole-block alignment (~54%). Better use: the papyrus net's
+  2.4 um gaps as an input channel of the 9.6 um winding net, which sees CT averaged over 4^3 voxels where packed gaps vanish.
 - `ufsm phase-raster --pool 2` writes only the 2x circular-mean pooled phase (<out>/9.6, shards of 256: one per 4.8 um shard
   of 512); `--resume 1` skips written shards. A whole-scroll Paris4 phase at 4.8 um would be ~326 GB (25 MB per shard, 13054
   shards; the desk has 317 GB free), at 9.6 um ~65 GB. Block B: identical known / unknown masks to phase-raster + downsample,

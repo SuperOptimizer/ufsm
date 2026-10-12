@@ -39,6 +39,10 @@ __device__ __forceinline__ void fit_eval(const fit_dev &f, float z, float y, flo
     }
     o.U = o.r / o.p + off + del;
 }
+__device__ __forceinline__ float fit_packed(const fit_dev &f, size_t i) {   /* the phase weight factor of packed cells */
+    if (f.packed_sp <= 0.f || !f.sp[i]) return 1.f;
+    return fminf(1.f, fmaxf(f.packed_floor, ((float)f.sp[i] - 0.6f * f.packed_sp) / (0.4f * f.packed_sp)));
+}
 __device__ __forceinline__ float fit_wrap(float a) {   /* into (-pi, pi] */
     const float tp = 6.283185307179586f;
     a -= tp * floorf((a + 3.14159265358979f) / tp);
@@ -72,7 +76,7 @@ __global__ void fit_loss_k(fit_dev f, double *parts, float *g_delta, float *g_pi
             if (conf > 0.05f && f.w_phase > 0.f) {
                 const float ph = atan2f(ms, mc), a = 6.283185307179586f * W0 - ph;
                 float sa, ca; sincosf(a, &sa, &ca);
-                const float c = f.w_phase * wv * fminf(conf, 1.f);
+                const float c = f.w_phase * wv * fminf(conf, 1.f) * fit_packed(f, i);
                 lp[1] += c * (1.f - ca); dU[0] += c * 6.283185307179586f * sa;
             }
             const float g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2] + 1e-12f, gl = sqrtf(g2);
@@ -269,7 +273,7 @@ __global__ void fit_loss2_k(fit_dev f, double *parts, float *g_delta) {
             const float mc = ((int)f.pc[i] - 128) * (1.f / 127.f), ms = ((int)f.ps[i] - 128) * (1.f / 127.f), conf = sqrtf(mc * mc + ms * ms);
             if (conf > 0.05f && f.w_phase > 0.f) {
                 const float a = 6.283185307179586f * W0 - atan2f(ms, mc); float sa, ca; sincosf(a, &sa, &ca);
-                const float cc = f.w_phase * wv * fminf(conf, 1.f) * sc;
+                const float cc = f.w_phase * wv * fminf(conf, 1.f) * sc * fit_packed(f, i);
                 lp[1] += cc * (1.f - ca); dW += cc * 6.283185307179586f * sa;
             }
             const float g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2] + 1e-12f, gl = sqrtf(g2);

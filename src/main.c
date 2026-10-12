@@ -442,7 +442,7 @@ static int cmd_fit(int argc, char **argv) {
     fit_cfg c = fit_cfg_default();
     c.verbose = arg_index(argc, argv, "--quiet") < 0;
     c.dir = atoi(opt(argc, argv, "--dir", "0")); c.unwrap_voxels = atoi(opt(argc, argv, "--unwrap-voxels", "1"));
-    c.analytic = atoi(opt(argc, argv, "--analytic", "1")); c.batch = atoi(opt(argc, argv, "--batch", "2000000")); c.knot_dz = atoi(opt(argc, argv, "--knot-dz", "1024")); c.phase_stage = atoi(opt(argc, argv, "--phase-stage", "4"));
+    c.analytic = atoi(opt(argc, argv, "--analytic", "1")); c.packed_um = atof(opt(argc, argv, "--packed-um", "0")); c.batch = atoi(opt(argc, argv, "--batch", "2000000")); c.knot_dz = atoi(opt(argc, argv, "--knot-dz", "1024")); c.phase_stage = atoi(opt(argc, argv, "--phase-stage", "4"));
     if (*opt(argc, argv, "--lattice", "")) { c.nstage = 0; char *t = strdup(opt(argc, argv, "--lattice", "")); for (char *q = strtok(t, ","); q && c.nstage < 8; q = strtok(nullptr, ",")) c.lattice[c.nstage++] = atoi(q); free(t); }
     if (*opt(argc, argv, "--steps", "")) { int k = 0; char *t = strdup(opt(argc, argv, "--steps", "")); for (char *q = strtok(t, ","); q && k < 8; q = strtok(nullptr, ",")) c.steps[k++] = atoi(q); for (; k < c.nstage; k++) c.steps[k] = c.steps[k - 1]; free(t); }
     nn_init(atoi(opt(argc, argv, "--gpu", "0")));
@@ -1001,6 +1001,139 @@ static int cmd_fit_compare(int argc, char **argv) {
     return 0;
 }
 
+/* ufsm gap-compare <papyrus-root> <papyrus-key> <reference-fields> [--net FIELDS] [--R 48] [--thr 128] [--min-run 2]
+   Sheet density from a papyrus / void probability (predict of a task papyrus checkpoint, on the reference fields' native grid,
+   origin_zyx from its attributes): per reference field cell with phase (confidence > 0.3) the radial ray through the cell centre
+   at its z, +-R native voxels, binarised at --thr, void -> papyrus entries counted (runs shorter than --min-run ignored) per
+   2R voxels; against the reference's sheet density (1 / spacing), by reference spacing; --net: the same for a field set's
+   density (e.g. a winding network's, any native voxel size covering the same cells). Medians / quantiles of the ratios. */
+static double axis_lerp_tab(const float *v, int n, double z) {   /* a per-native-z axis table at fractional z (clamped) */
+    if (z <= 0) return v[0];
+    if (z >= n - 1) return v[n - 1];
+    const int i = (int)z; const double t = z - i; return v[i] + t * (v[i + 1] - v[i]);
+}
+typedef struct { const uint8_t *pl; int64_t H, W; const fit_fields_buf *A, *Bn; int fz, R, thr, minrun; size_t (*hg)[5][200], (*hn)[5][200]; pthread_mutex_t *mu; _Atomic int next; } gap_job;
+static void *gap_rows(void *arg) {
+    gap_job *J = arg; const fit_fields *f = &J->A->f; const int na = (int)(f->D * f->h) + 1;
+    size_t lg[5][200] = {{0}}, ln[5][200] = {{0}};
+    for (int fy; (fy = atomic_fetch_add(&J->next, 1)) < f->H;) for (int fx = 0; fx < f->W; fx++) {
+        const size_t i = ((size_t)J->fz * f->H + fy) * f->W + fx;
+        if (!f->w[i] || !f->sp[i]) continue;
+        const double mc = (f->pc[i] - 128) / 127.0, ms = (f->ps[i] - 128) / 127.0; if (hypot(mc, ms) <= 0.3) continue;
+        const double pz = (J->fz + 0.5) * f->h, py = (fy + 0.5) * f->h, px = (fx + 0.5) * f->h;
+        const double cy = axis_lerp_tab(f->cy, na, pz), cx = axis_lerp_tab(f->cx, na, pz);
+        double uy = py - cy, ux = px - cx; const double ul = hypot(uy, ux); if (ul < 1) continue; uy /= ul; ux /= ul;
+        int prev = -1, run = 0, entries = 0, lastv = -1;
+        for (int t = -J->R; t <= J->R; t++) {
+            const int64_t yy = (int64_t)lround(py + t * uy), xx = (int64_t)lround(px + t * ux);
+            if (yy < 0 || xx < 0 || yy >= J->H || xx >= J->W) { prev = -1; run = 0; continue; }
+            const int v = J->pl[(size_t)yy * J->W + xx] >= J->thr;
+            if (v == prev) { run++; if (run == J->minrun && v == 1 && lastv == 0) entries++; if (run >= J->minrun) lastv = v; }
+            else { prev = v; run = 1; if (J->minrun <= 1) { if (v == 1 && lastv == 0) entries++; lastv = v; } }
+        }
+        const double spa = f->sp[i] * f->h / 8.0 * J->A->um, rho_ref = 1.0 / spa;   /* sheets per um */
+        const double rho_gap = entries / (2.0 * J->R * J->A->um);
+        int sbin = spa < 100 ? 0 : spa < 140 ? 1 : spa < 180 ? 2 : spa < 240 ? 3 : 4;
+        if (rho_gap > 0) lg[sbin][(int)fmin(199, fmax(0, (log2(rho_gap / rho_ref) + 2) / 4 * 200))]++; else lg[sbin][0]++;
+        if (J->Bn && J->Bn->f.sp[i]) { const double spb = J->Bn->f.sp[i] * J->Bn->h / 8.0 * J->Bn->um; ln[sbin][(int)fmin(199, fmax(0, (log2(spa / spb) + 2) / 4 * 200))]++; }
+    }
+    pthread_mutex_lock(J->mu);
+    for (int a = 0; a < 5; a++) for (int b = 0; b < 200; b++) { (*J->hg)[a][b] += lg[a][b]; (*J->hn)[a][b] += ln[a][b]; }
+    pthread_mutex_unlock(J->mu);
+    return nullptr;
+}
+static int cmd_gap_compare(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: ufsm gap-compare <papyrus-root> <papyrus-key> <reference-fields> [--net FIELDS] [--R 48] [--thr 128] [--min-run 2] [--threads 16]\n"); return 2; }
+    const int R = atoi(opt(argc, argv, "--R", "48")), thr = atoi(opt(argc, argv, "--thr", "128")), minrun = atoi(opt(argc, argv, "--min-run", "2")), nt = atoi(opt(argc, argv, "--threads", "16"));
+    fit_fields_buf A, Bn; const char *net = opt(argc, argv, "--net", nullptr);
+    if (fit_fields_load(argv[4], 0, 0, 1, &A) || (net && fit_fields_load(net, 0, 0, 1, &Bn))) { fprintf(stderr, "gap-compare: cannot load the fields\n"); return 1; }
+    z3 *pz = z3_open(store_open(argv[2]), argv[3], nullptr); if (!pz) { fprintf(stderr, "gap-compare: %s\n", z3_error()); return 1; }
+    long long po[3] = {0, 0, 0};
+    { char jp[1400]; snprintf(jp, sizeof jp, "%s/%s/zarr.json", argv[2], argv[3]); FILE *jf = fopen(jp, "rb"); char jb[8192] = {0};
+      if (jf) { size_t nr = fread(jb, 1, sizeof jb - 1, jf); (void)nr; fclose(jf); }
+      const char *q = strstr(jb, "\"origin_zyx\":"); if (!q || sscanf(q + 13, " [%lld,%lld,%lld]", po, po + 1, po + 2) != 3) { fprintf(stderr, "gap-compare: no origin_zyx in %s\n", jp); return 2; } }
+    const z3_meta *zm = z3_meta_of(pz); const int64_t H = zm->shape[1], W = zm->shape[2];
+    if (po[0] != A.origin[0] || po[1] != A.origin[1] || po[2] != A.origin[2]) { fprintf(stderr, "gap-compare: the papyrus box (origin %lld,%lld,%lld) is not the fields' (%lld,%lld,%lld)\n", po[0], po[1], po[2], A.origin[0], A.origin[1], A.origin[2]); return 2; }
+    uint8_t *pl = malloc((size_t)H * W); size_t hg[5][200] = {{0}}, hn[5][200] = {{0}}; pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    for (int fz = 0; fz < A.shape[0]; fz++) {
+        const int64_t z = (int64_t)((fz + 0.5) * A.h); if (z >= zm->shape[0]) break;
+        const int64_t o[3] = {z, 0, 0}, n[3] = {1, H, W};
+        if (z3_read(pz, o, n, pl, nt)) { fprintf(stderr, "gap-compare: %s\n", z3_error()); return 1; }
+        gap_job J = {pl, H, W, &A, net ? &Bn : nullptr, fz, R, thr, minrun, &hg, &hn, &mu, 0};
+        pthread_t th[64]; const int k = nt < 1 ? 1 : nt > 64 ? 64 : nt;
+        for (int t = 0; t < k; t++) pthread_create(&th[t], nullptr, gap_rows, &J);
+        for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
+    }
+    static const char *bn[5] = {"< 100 um", "100-140", "140-180", "180-240", ">= 240"};
+    printf("gap-compare: density ratio to the reference (median, p10, p90) by reference spacing; R %d, threshold %d, min run %d\n", R, thr, minrun);
+    for (int a = 0; a < 5; a++) {
+        size_t t = 0; for (int b = 0; b < 200; b++) t += hg[a][b]; if (!t) continue;
+        printf("  %-9s %8zu cells: papyrus gaps %.2f (%.2f-%.2f)", bn[a], t, exp2(hist_q(hg[a], 200, -2, 4.0 / 200, 0.5)), exp2(hist_q(hg[a], 200, -2, 4.0 / 200, 0.1)), exp2(hist_q(hg[a], 200, -2, 4.0 / 200, 0.9)));
+        size_t u = 0; for (int b = 0; b < 200; b++) u += hn[a][b];
+        if (u) printf("   net density %.2f (%.2f-%.2f)", exp2(hist_q(hn[a], 200, -2, 4.0 / 200, 0.5)), exp2(hist_q(hn[a], 200, -2, 4.0 / 200, 0.1)), exp2(hist_q(hn[a], 200, -2, 4.0 / 200, 0.9)));
+        printf("\n");
+    }
+    free(pl); z3_close(pz); fit_fields_free(&A); if (net) fit_fields_free(&Bn);
+    return 0;
+}
+
+/* ufsm gap-density <papyrus-root> <papyrus-key> <fields-in> <fields-out> [--fuse-um 150] [--R-um 115] [--thr 128] [--min-run 2]
+   A field set (any native voxel size) with its sheet spacing fused with the papyrus-gap spacing: per cell the radial ray through
+   its centre at its z, +-R um, over the papyrus / void probability (task papyrus predict output; its key is its voxel size in um,
+   origin_zyx from its attributes), void -> papyrus entries counted (runs shorter than --min-run voxels ignored). Where the
+   fields' spacing is under --fuse-um and the gaps' is smaller, the gaps' replaces it: networks under-count packed sheets (block B:
+   0.72 of the true density under 100 um) while papyrus gaps count them (1.04) but over-count loose sheets (each sheet's own
+   layers and cracks: 1.4-2.2). Writes fields-out as raw fit fields. */
+static int cmd_gap_density(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "usage: ufsm gap-density <papyrus-root> <papyrus-key> <fields-in> <fields-out> [--fuse-um 150] [--R-um 115] [--thr 128] [--min-run 2]\n"); return 2; }
+    const double fuse = atof(opt(argc, argv, "--fuse-um", "150")), Rum = atof(opt(argc, argv, "--R-um", "115")), ump = atof(argv[3]);
+    const int thr = atoi(opt(argc, argv, "--thr", "128")), minrun = atoi(opt(argc, argv, "--min-run", "2")), nt = atoi(opt(argc, argv, "--threads", "16"));
+    if (!(ump > 0)) { fprintf(stderr, "gap-density: the papyrus key must be its voxel size in um\n"); return 2; }
+    fit_fields_buf A; if (fit_fields_load(argv[4], 0, 0, 1, &A)) { fprintf(stderr, "gap-density: cannot load %s\n", argv[4]); return 1; }
+    z3 *pz = z3_open(store_open(argv[2]), argv[3], nullptr); if (!pz) { fprintf(stderr, "gap-density: %s\n", z3_error()); return 1; }
+    long long po[3] = {0, 0, 0};
+    { char jp[1400]; snprintf(jp, sizeof jp, "%s/%s/zarr.json", argv[2], argv[3]); FILE *jf = fopen(jp, "rb"); char jb[8192] = {0};
+      if (jf) { size_t nr = fread(jb, 1, sizeof jb - 1, jf); (void)nr; fclose(jf); }
+      const char *q = strstr(jb, "\"origin_zyx\":"); if (!q || sscanf(q + 13, " [%lld,%lld,%lld]", po, po + 1, po + 2) != 3) { fprintf(stderr, "gap-density: no origin_zyx in %s\n", jp); return 2; } }
+    const z3_meta *zm = z3_meta_of(pz); const int64_t PH = zm->shape[1], PW = zm->shape[2];
+    const double s = A.um / ump;   /* fields' native voxel -> papyrus voxels */
+    const int R = (int)lround(Rum / ump); const int na = (int)(A.f.D * A.f.h) + 1;
+    uint8_t *pl = malloc((size_t)PH * PW), *sp = malloc((size_t)A.shape[0] * A.shape[1] * A.shape[2]);
+    size_t fused = 0, cells = 0;
+    for (int fz = 0; fz < A.shape[0]; fz++) {
+        const double zf = (fz + 0.5) * A.h; const int64_t zp = (int64_t)lround((zf + A.origin[0]) * s) - po[0];
+        const int have = zp >= 0 && zp < zm->shape[0];
+        if (have) { const int64_t o[3] = {zp, 0, 0}, n[3] = {1, PH, PW}; if (z3_read(pz, o, n, pl, nt)) { fprintf(stderr, "gap-density: %s\n", z3_error()); return 1; } }
+        const double cy = axis_lerp_tab(A.f.cy, na, zf), cx = axis_lerp_tab(A.f.cx, na, zf);
+        for (int fy = 0; fy < A.shape[1]; fy++) for (int fx = 0; fx < A.shape[2]; fx++) {
+            const size_t i = ((size_t)fz * A.shape[1] + fy) * A.shape[2] + fx; sp[i] = A.f.sp[i];
+            if (!have || !A.f.w[i] || !A.f.sp[i]) continue;
+            const double spn = A.f.sp[i] * A.h / 8.0 * A.um; if (spn >= fuse) continue;
+            const double yf = (fy + 0.5) * A.h, xf = (fx + 0.5) * A.h; double uy = yf - cy, ux = xf - cx; const double ul = hypot(uy, ux); if (ul < 1) continue; uy /= ul; ux /= ul;
+            const double yp = (yf + A.origin[1]) * s - po[1], xp = (xf + A.origin[2]) * s - po[2];
+            int prev = -1, run = 0, entries = 0, lastv = -1, len = 0;
+            for (int t = -R; t <= R; t++) {
+                const int64_t yy = (int64_t)lround(yp + t * uy), xx = (int64_t)lround(xp + t * ux);
+                if (yy < 0 || xx < 0 || yy >= PH || xx >= PW) { prev = -1; run = 0; continue; }
+                len++;
+                const int v = pl[(size_t)yy * PW + xx] >= thr;
+                if (v == prev) { run++; if (run == minrun && v == 1 && lastv == 0) entries++; if (run >= minrun) lastv = v; }
+                else { prev = v; run = 1; if (minrun <= 1) { if (v == 1 && lastv == 0) entries++; lastv = v; } }
+            }
+            cells++;
+            if (!entries || len < R) continue;
+            const double spg = len * ump / entries;   /* um per sheet */
+            if (spg < spn) { const double v = spg / A.um / A.h * 8.0; sp[i] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lround(v)); fused++; }
+        }
+    }
+    uint8_t *a[10] = {A.a[0], A.a[1], A.a[2], A.a[3], A.a[4], A.a[5], A.a[6], A.a[7], sp, A.a[9]};
+    const long long org[3] = {A.origin[0], A.origin[1], A.origin[2]};
+    if (fit_fields_save(argv[5], org, A.shape, A.h, A.um, a, A.cy, A.cx, na)) { fprintf(stderr, "gap-density: cannot write %s\n", argv[5]); return 1; }
+    fprintf(stderr, "gap-density: %zu of %zu packed cells took the papyrus-gap spacing -> %s\n", fused, cells, argv[5]);
+    free(pl); free(sp); z3_close(pz); fit_fields_free(&A);
+    return 0;
+}
+
 typedef struct {   /* ufsm render: one output tile's pixel rows over threads */
     const float *X, *Y, *Z; int w, h; double gs;   /* the vertex grid; output pixels per grid step */
     const uint8_t *vol, *ct; int64_t o[3], n[3]; int depth;
@@ -1168,6 +1301,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
     if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);
     if (!strcmp(cmd, "fit-compare")) return cmd_fit_compare(argc, argv);
+    if (!strcmp(cmd, "gap-compare")) return cmd_gap_compare(argc, argv);
+    if (!strcmp(cmd, "gap-density")) return cmd_gap_density(argc, argv);
     if (argc < 4) return usage();
     const char *root = argv[2], *key = argv[3];
     const char *cache = opt(argc, argv, "--cache", nullptr);
