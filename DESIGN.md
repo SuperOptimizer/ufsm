@@ -304,6 +304,10 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   fields come from a 9.6 um net; recto and ink stay at 2.4 um. `ufsm wraps --out-um 2.4` writes a 9.6 um fit's wraps on the
   2.4 um grid (voxel centres to voxel centres, grid step and voxel_size_um scaled) so they render with the 2.4 um ink
   (wrapdist unchanged: 72.2 vs 72.7% within 9.6 um).
+- `ufsm fit-compare <reference-fields> <fields>` (any native voxel sizes covering the same physical cells; histograms; block B
+  in 9 s, 0.33 GB): vs the oracle on B, the 9.6 um net (9 blocks, 48k) phase |error| median 0.069 turn, 12.1% > 1/4 turn
+  (29% where sheets are < 100 um apart), confidence 0.73; the 2.4 um net (8 blocks, 30k) 0.207 turn, 41% > 1/4, confidence
+  0.04 (its phase head still outputs ~0.5 everywhere); both: spacing ratio ~1.0 (p10-p90 ~0.7-1.4), normals ~5 degrees.
 - test_split's "memory layout vs separate buffers" check failed twice under GPU contention (cases 34, 35; grad rel ~0.3) and
   passed alone. It took the best of three tries, assuming run-to-run noise is rare; it now also repeats the separate-buffer
   runs and passes a try whose layout difference is within 1.5x of that repeat difference (a layout error differs where

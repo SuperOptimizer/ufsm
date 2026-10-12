@@ -57,6 +57,8 @@ static int usage(void) {
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
+        "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
+        "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
         "root: local dir or https://.../volcomp ; keys are paths under root\n");
     return 2;
 }
@@ -887,6 +889,69 @@ static int cmd_wrapdist(int argc, char **argv) {
 }
 static float *wd_read(const char *path, int *w, int *h) { return read_tif_f32(path, w, h); }
 
+/* ufsm fit-compare <reference-fields> <fields>: how a field set (e.g. a network's, predict --fit-zarr) agrees with a reference
+   (e.g. the oracle, band --fit-fields) cell by cell; both must cover the same physical cells (origin x um, h x um equal), at any
+   native voxel sizes. Over cells where the reference phase confidence is > 0.3 and both have material: phase |error| (turns),
+   phase confidence, sheet spacing ratio (um / um), normal angle (principal eigenvectors of n n^T), and the share of gross
+   phase errors (> 1/4 turn) by reference spacing and by the fields' confidence. Histograms, no per-cell arrays. */
+static void fc_axis(const fit_fields *f, size_t i, double v[3]) {   /* principal eigenvector of the cell's n n^T (power iteration) */
+    double T[3][3]; const double t[6] = {f->t[0][i] / 255.0, f->t[1][i] / 255.0, f->t[2][i] / 255.0, f->t[3][i] / 255.0 - 0.5, f->t[4][i] / 255.0 - 0.5, f->t[5][i] / 255.0 - 0.5};
+    T[0][0] = t[0]; T[1][1] = t[1]; T[2][2] = t[2]; T[0][1] = T[1][0] = t[3]; T[0][2] = T[2][0] = t[4]; T[1][2] = T[2][1] = t[5];
+    int k = T[0][0] >= T[1][1] && T[0][0] >= T[2][2] ? 0 : T[1][1] >= T[2][2] ? 1 : 2; v[0] = v[1] = v[2] = 0; v[k] = 1;   /* start: the largest diagonal axis */
+    for (int it = 0; it < 24; it++) {
+        double w[3] = {0, 0, 0}; for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) w[a] += T[a][b] * v[b];
+        const double l = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]); if (l < 1e-12) return; for (int a = 0; a < 3; a++) v[a] = w[a] / l;
+    }
+}
+static double hist_q(const size_t *h, int nb, double lo, double w, double q) {   /* quantile of a histogram (bin centres) */
+    size_t n = 0; for (int k = 0; k < nb; k++) n += h[k];
+    size_t c = 0; for (int k = 0; k < nb; k++) { c += h[k]; if (n && (double)c >= q * n) return lo + (k + 0.5) * w; }
+    return lo + nb * w;
+}
+static int cmd_fit_compare(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm fit-compare <reference-fields> <fields>\n"); return 2; }
+    fit_fields_buf A, B;
+    if (fit_fields_load(argv[2], 0, 0, 1, &A) || fit_fields_load(argv[3], 0, 0, 1, &B)) { fprintf(stderr, "fit-compare: cannot load the fields\n"); return 1; }
+    for (int d = 0; d < 3; d++) {
+        if (A.shape[d] != B.shape[d] || fabs(A.origin[d] * A.um - B.origin[d] * B.um) > 0.5 * A.h * A.um || fabs(A.h * A.um - B.h * B.um) > 1e-6 * A.h * A.um) {
+            fprintf(stderr, "fit-compare: the field sets cover different cells (shape %d/%d, origin %.1f/%.1f um, cell %.2f/%.2f um on axis %d)\n", A.shape[d], B.shape[d], A.origin[d] * A.um, B.origin[d] * B.um, A.h * A.um, B.h * B.um, d); return 2;
+        }
+    }
+    const size_t n = (size_t)A.shape[0] * A.shape[1] * A.shape[2];
+    enum { NP = 500, NC = 100, NR = 200, NA = 900, NS = 5, NK = 4 };
+    size_t hp[NP] = {0}, hca[NC] = {0}, hcb[NC] = {0}, hr[NR] = {0}, ha[NA] = {0}, sn[NS] = {0}, sg[NS] = {0}, kn[NK] = {0}, kg[NK] = {0}, m = 0, lt01 = 0, gt25 = 0;
+    const double sb[NS + 1] = {0, 100, 140, 180, 240, 1e30}, cb[NK + 1] = {0, 0.2, 0.4, 0.6, 1.01};
+    for (size_t i = 0; i < n; i++) {
+        if (!A.f.w[i] || !B.f.w[i]) continue;
+        const double ac = (A.f.pc[i] - 128) / 127.0, as = (A.f.ps[i] - 128) / 127.0, bc = (B.f.pc[i] - 128) / 127.0, bs = (B.f.ps[i] - 128) / 127.0;
+        const double ca = hypot(ac, as), cbv = hypot(bc, bs); if (ca <= 0.3) continue;
+        m++;
+        double e = (atan2(bs, bc) - atan2(as, ac)) / (2 * M_PI); e -= round(e); e = fabs(e);
+        hp[(int)fmin(NP - 1, e / 0.5 * NP)]++; lt01 += e < 0.1; gt25 += e > 0.25;
+        hca[(int)fmin(NC - 1, ca * NC)]++; hcb[(int)fmin(NC - 1, cbv * NC)]++;
+        const double spa = A.f.sp[i] * A.h / 8.0 * A.um, spb = B.f.sp[i] * B.h / 8.0 * B.um;   /* spacing in um (sp = 8 / (h rho)) */
+        if (spa > 0 && spb > 0) hr[(int)fmin(NR - 1, fmax(0, (log2(spb / spa) + 2) / 4 * NR))]++;   /* log2 ratio in [-2, 2) */
+        for (int k = 0; k < NS; k++) if (spa >= sb[k] && spa < sb[k + 1]) { sn[k]++; sg[k] += e > 0.25; }
+        for (int k = 0; k < NK; k++) if (cbv >= cb[k] && cbv < cb[k + 1]) { kn[k]++; kg[k] += e > 0.25; }
+        double va[3], vb[3]; fc_axis(&A.f, i, va); fc_axis(&B.f, i, vb);
+        const double ang = acos(fmin(1, fabs(va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]))) * 180 / M_PI;
+        ha[(int)fmin(NA - 1, ang / 90 * NA)]++;
+    }
+    if (!m) { fprintf(stderr, "fit-compare: no cells with reference phase\n"); return 1; }
+    printf("fit-compare: %zu cells with reference phase (confidence > 0.3) and material in both\n", m);
+    printf("  phase |error| (turns): median %.3f p75 %.3f p90 %.3f; < 0.1 %.3f, > 0.25 %.3f\n", hist_q(hp, NP, 0, 0.5 / NP, 0.5), hist_q(hp, NP, 0, 0.5 / NP, 0.75), hist_q(hp, NP, 0, 0.5 / NP, 0.9), (double)lt01 / m, (double)gt25 / m);
+    printf("  phase confidence: median %.2f (reference %.2f)\n", hist_q(hcb, NC, 0, 1.0 / NC, 0.5), hist_q(hca, NC, 0, 1.0 / NC, 0.5));
+    printf("  spacing ratio: median %.3f p10 %.3f p90 %.3f\n", exp2(hist_q(hr, NR, -2, 4.0 / NR, 0.5)), exp2(hist_q(hr, NR, -2, 4.0 / NR, 0.1)), exp2(hist_q(hr, NR, -2, 4.0 / NR, 0.9)));
+    printf("  normal angle (degrees): median %.1f p90 %.1f\n", hist_q(ha, NA, 0, 90.0 / NA, 0.5), hist_q(ha, NA, 0, 90.0 / NA, 0.9));
+    printf("  gross phase errors by reference spacing:");
+    for (int k = 0; k < NS; k++) printf("  %s%.0f um %.3f (%zu)", k == NS - 1 ? ">= " : "< ", k == NS - 1 ? sb[k] : sb[k + 1], sn[k] ? (double)sg[k] / sn[k] : 0, sn[k]);
+    printf("\n  gross phase errors by confidence:");
+    for (int k = 0; k < NK; k++) printf("  %.1f-%.1f %.3f (%zu)", cb[k], fmin(1, cb[k + 1]), kn[k] ? (double)kg[k] / kn[k] : 0, kn[k]);
+    printf("\n");
+    fit_fields_free(&A); fit_fields_free(&B);
+    return 0;
+}
+
 typedef struct {   /* ufsm render: one output tile's pixel rows over threads */
     const float *X, *Y, *Z; int w, h; double gs;   /* the vertex grid; output pixels per grid step */
     const uint8_t *vol, *ct; int64_t o[3], n[3]; int depth;
@@ -1053,6 +1118,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
     if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);
+    if (!strcmp(cmd, "fit-compare")) return cmd_fit_compare(argc, argv);
     if (argc < 4) return usage();
     const char *root = argv[2], *key = argv[3];
     const char *cache = opt(argc, argv, "--cache", nullptr);
