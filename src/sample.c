@@ -128,8 +128,9 @@ static size_t P3(const sampler *sp) { return (size_t)sp->cfg.P * sp->cfg.P * sp-
 static batch alloc_batch(const sample_cfg *c) {
     size_t p3 = (size_t)c->P * c->P * c->P;
     batch b;
-    b.x = c->xfmt ? nullptr : nn_host_alloc((size_t)c->B * 4 * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
-    b.x16 = c->xfmt ? nn_host_alloc((size_t)c->B * 4 * p3 * 2) : nullptr;
+    const size_t xc = 4 + (c->aux != 0);   /* input channels per sample */
+    b.x = c->xfmt ? nullptr : nn_host_alloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
+    b.x16 = c->xfmt ? nn_host_alloc((size_t)c->B * xc * p3 * 2) : nullptr;
     b.t = nn_host_alloc((size_t)c->B * NCH * p3);
     b.m = nn_host_alloc((size_t)c->B * p3);
     b.w = nn_host_alloc((size_t)c->B * NCH);
@@ -639,6 +640,18 @@ static int phase_window(source *s, const int64_t o[3], int P, int shift, uint8_t
     return 0;
 }
 
+/* the source's aux volume (src/sources.h) over a window of its level; outside the volume 0 */
+static int aux_window(source *s, const int64_t o[3], int P, uint8_t *dst) {
+    const z3_meta *m = z3_meta_of(s->aux); int64_t ro[3], rn[3];
+    for (int d = 0; d < 3; d++) { ro[d] = o[d] < 0 ? 0 : o[d]; const int64_t e = o[d] + P < m->shape[d] ? o[d] + P : m->shape[d]; rn[d] = e - ro[d]; if (rn[d] <= 0) return 0; }
+    uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
+    if (!tmp || z3_read(s->aux, ro, rn, tmp, 1)) { free(tmp); return -1; }
+    for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
+        memcpy(dst + ((size_t)(z + ro[0] - o[0]) * P + (y + ro[1] - o[1])) * P + (ro[2] - o[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
+    free(tmp);
+    return 0;
+}
+
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
@@ -932,8 +945,9 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         }
     }
     PROF_MARK(PS_AUGMENT);
-    float *X = c->xfmt ? nullptr : b->x + (size_t)i * 4 * p3;
-    uint16_t *H = c->xfmt ? b->x16 + (size_t)i * 4 * p3 : nullptr;
+    const size_t xc = 4 + (c->aux != 0);
+    float *X = c->xfmt ? nullptr : b->x + (size_t)i * xc * p3;
+    uint16_t *H = c->xfmt ? b->x16 + (size_t)i * xc * p3 : nullptr;
     double (*params)[4]=nullptr;
     if (c->sheet) {
         params=malloc((size_t)P*sizeof *params);
@@ -945,6 +959,16 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);
     else write_x(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H);
     free(params);
+    if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
+        uint8_t *aw = calloc(p3, 1), *as = malloc(p3);
+        if (!aw || !as || (s->aux && s->aux_level == l && aux_window(s, o, P, aw))) { free(aw); free(as); return -1; }
+        sym_u8(aw, as, P, y);
+        for (size_t k = 0; k < p3; k++) {
+            const float v = as[k] / 127.5f - 1.f;
+            if (X) X[4 * p3 + k] = v; else if (c->xfmt == 1) { _Float16 hv = (_Float16)v; memcpy(&H[4 * p3 + k], &hv, 2); } else H[4 * p3 + k] = bf16_rn(v);
+        }
+        free(aw); free(as);
+    }
     if (c->sheet) {
         sheet_batch_free(b->sheet[i]);
         b->sheet[i] = sheet_sample(c->sheet, o, P, y.perm, y.flip, ctu,ttmp,mask,rnext(r));

@@ -1001,10 +1001,10 @@ static int cmd_fit_compare(int argc, char **argv) {
     return 0;
 }
 
-/* ufsm gap-compare <papyrus-root> <papyrus-key> <reference-fields> [--net FIELDS] [--R 48] [--thr 128] [--min-run 2]
-   Sheet density from a papyrus / void probability (predict of a task papyrus checkpoint, on the reference fields' native grid,
-   origin_zyx from its attributes): per reference field cell with phase (confidence > 0.3) the radial ray through the cell centre
-   at its z, +-R native voxels, binarised at --thr, void -> papyrus entries counted (runs shorter than --min-run ignored) per
+/* ufsm gap-compare <array-root> <array-key> <reference-fields> [--net FIELDS] [--R-um 115] [--thr 128] [--min-run 2] [--origin z,y,x]
+   Sheet density from gaps in a uint8 array (a papyrus / void probability from predict, or a raw CT level; the key is its voxel
+   size in um, positions mapped physically; origin from --origin, ufsm.origin_zyx, else 0): per reference field cell with phase
+   (confidence > 0.3) the radial ray through the cell centre at its z, +-R um, binarised at --thr, void -> papyrus entries counted (runs shorter than --min-run ignored) per
    2R voxels; against the reference's sheet density (1 / spacing), by reference spacing; --net: the same for a field set's
    density (e.g. a winding network's, any native voxel size covering the same cells). Medians / quantiles of the ratios. */
 static double axis_lerp_tab(const float *v, int n, double z) {   /* a per-native-z axis table at fractional z (clamped) */
@@ -1012,7 +1012,7 @@ static double axis_lerp_tab(const float *v, int n, double z) {   /* a per-native
     if (z >= n - 1) return v[n - 1];
     const int i = (int)z; const double t = z - i; return v[i] + t * (v[i + 1] - v[i]);
 }
-typedef struct { const uint8_t *pl; int64_t H, W; const fit_fields_buf *A, *Bn; int fz, R, thr, minrun; size_t (*hg)[5][200], (*hn)[5][200]; pthread_mutex_t *mu; _Atomic int next; } gap_job;
+typedef struct { const uint8_t *pl; int64_t H, W; const fit_fields_buf *A, *Bn; int fz, R, thr, minrun; double s; long long po[3]; size_t (*hg)[5][200], (*hn)[5][200]; pthread_mutex_t *mu; _Atomic int next; } gap_job;
 static void *gap_rows(void *arg) {
     gap_job *J = arg; const fit_fields *f = &J->A->f; const int na = (int)(f->D * f->h) + 1;
     size_t lg[5][200] = {{0}}, ln[5][200] = {{0}};
@@ -1023,16 +1023,19 @@ static void *gap_rows(void *arg) {
         const double pz = (J->fz + 0.5) * f->h, py = (fy + 0.5) * f->h, px = (fx + 0.5) * f->h;
         const double cy = axis_lerp_tab(f->cy, na, pz), cx = axis_lerp_tab(f->cx, na, pz);
         double uy = py - cy, ux = px - cx; const double ul = hypot(uy, ux); if (ul < 1) continue; uy /= ul; ux /= ul;
-        int prev = -1, run = 0, entries = 0, lastv = -1;
+        const double yp = (py + J->A->origin[1]) * J->s - J->po[1], xp = (px + J->A->origin[2]) * J->s - J->po[2];   /* on the array's grid */
+        int prev = -1, run = 0, entries = 0, lastv = -1, len = 0;
         for (int t = -J->R; t <= J->R; t++) {
-            const int64_t yy = (int64_t)lround(py + t * uy), xx = (int64_t)lround(px + t * ux);
+            const int64_t yy = (int64_t)lround(yp + t * uy), xx = (int64_t)lround(xp + t * ux);
             if (yy < 0 || xx < 0 || yy >= J->H || xx >= J->W) { prev = -1; run = 0; continue; }
+            len++;
             const int v = J->pl[(size_t)yy * J->W + xx] >= J->thr;
             if (v == prev) { run++; if (run == J->minrun && v == 1 && lastv == 0) entries++; if (run >= J->minrun) lastv = v; }
             else { prev = v; run = 1; if (J->minrun <= 1) { if (v == 1 && lastv == 0) entries++; lastv = v; } }
         }
+        if (len < J->R) continue;
         const double spa = f->sp[i] * f->h / 8.0 * J->A->um, rho_ref = 1.0 / spa;   /* sheets per um */
-        const double rho_gap = entries / (2.0 * J->R * J->A->um);
+        const double rho_gap = entries / (len * J->A->um / J->s);
         int sbin = spa < 100 ? 0 : spa < 140 ? 1 : spa < 180 ? 2 : spa < 240 ? 3 : 4;
         if (rho_gap > 0) lg[sbin][(int)fmin(199, fmax(0, (log2(rho_gap / rho_ref) + 2) / 4 * 200))]++; else lg[sbin][0]++;
         if (J->Bn && J->Bn->f.sp[i]) { const double spb = J->Bn->f.sp[i] * J->Bn->h / 8.0 * J->Bn->um; ln[sbin][(int)fmin(199, fmax(0, (log2(spa / spb) + 2) / 4 * 200))]++; }
@@ -1043,32 +1046,43 @@ static void *gap_rows(void *arg) {
     return nullptr;
 }
 static int cmd_gap_compare(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm gap-compare <papyrus-root> <papyrus-key> <reference-fields> [--net FIELDS] [--R 48] [--thr 128] [--min-run 2] [--threads 16]\n"); return 2; }
-    const int R = atoi(opt(argc, argv, "--R", "48")), thr = atoi(opt(argc, argv, "--thr", "128")), minrun = atoi(opt(argc, argv, "--min-run", "2")), nt = atoi(opt(argc, argv, "--threads", "16"));
+    if (argc < 5) { fprintf(stderr, "usage: ufsm gap-compare <array-root> <array-key> <reference-fields> [--net FIELDS] [--R-um 115] [--thr 128] [--min-run 2] [--origin z,y,x] [--um U] [--cache DIR] [--threads 16]\n"); return 2; }
+    const double aum = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : atof(argv[3]), Rum = atof(opt(argc, argv, "--R-um", "115"));   /* --um: when the key is not the voxel size */
+    const int thr = atoi(opt(argc, argv, "--thr", "128")), minrun = atoi(opt(argc, argv, "--min-run", "2")), nt = atoi(opt(argc, argv, "--threads", "16"));
+    if (!(aum > 0)) { fprintf(stderr, "gap-compare: the array key must be its voxel size in um (e.g. 2.4)\n"); return 2; }
     fit_fields_buf A, Bn; const char *net = opt(argc, argv, "--net", nullptr);
     if (fit_fields_load(argv[4], 0, 0, 1, &A) || (net && fit_fields_load(net, 0, 0, 1, &Bn))) { fprintf(stderr, "gap-compare: cannot load the fields\n"); return 1; }
-    z3 *pz = z3_open(store_open(argv[2]), argv[3], nullptr); if (!pz) { fprintf(stderr, "gap-compare: %s\n", z3_error()); return 1; }
-    long long po[3] = {0, 0, 0};
-    { char jp[1400]; snprintf(jp, sizeof jp, "%s/%s/zarr.json", argv[2], argv[3]); FILE *jf = fopen(jp, "rb"); char jb[8192] = {0};
-      if (jf) { size_t nr = fread(jb, 1, sizeof jb - 1, jf); (void)nr; fclose(jf); }
-      const char *q = strstr(jb, "\"origin_zyx\":"); if (!q || sscanf(q + 13, " [%lld,%lld,%lld]", po, po + 1, po + 2) != 3) { fprintf(stderr, "gap-compare: no origin_zyx in %s\n", jp); return 2; } }
-    const z3_meta *zm = z3_meta_of(pz); const int64_t H = zm->shape[1], W = zm->shape[2];
-    if (po[0] != A.origin[0] || po[1] != A.origin[1] || po[2] != A.origin[2]) { fprintf(stderr, "gap-compare: the papyrus box (origin %lld,%lld,%lld) is not the fields' (%lld,%lld,%lld)\n", po[0], po[1], po[2], A.origin[0], A.origin[1], A.origin[2]); return 2; }
+    z3 *pz = z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr)); if (!pz) { fprintf(stderr, "gap-compare: %s\n", z3_error()); return 1; }
+    long long po[3] = {0, 0, 0};   /* the array's origin on its own grid: --origin, else ufsm.origin_zyx (predict outputs), else 0 (whole volumes) */
+    if (*opt(argc, argv, "--origin", "")) sscanf(opt(argc, argv, "--origin", ""), "%lld,%lld,%lld", po, po + 1, po + 2);
+    else { char jp[1400]; snprintf(jp, sizeof jp, "%s/%s/zarr.json", argv[2], argv[3]); FILE *jf = fopen(jp, "rb"); char jb[8192] = {0};
+           if (jf) { size_t nr = fread(jb, 1, sizeof jb - 1, jf); (void)nr; fclose(jf); }
+           const char *q = strstr(jb, "\"origin_zyx\":"); if (q) sscanf(q + 13, " [%lld,%lld,%lld]", po, po + 1, po + 2); }
+    const z3_meta *zm = z3_meta_of(pz); const double s = A.um / aum; const int R = (int)lround(Rum / aum);
+    /* the planes of the array covering the fields' y / x extent */
+    long long lo[2], hi[2];
+    for (int d = 1; d < 3; d++) {
+        lo[d - 1] = (long long)floor(A.origin[d] * s) - po[d] - R - 2; hi[d - 1] = (long long)ceil((A.origin[d] + A.shape[d] * A.h) * s) - po[d] + R + 2;
+        if (lo[d - 1] < 0) lo[d - 1] = 0;
+        if (hi[d - 1] > zm->shape[d]) hi[d - 1] = zm->shape[d];
+    }
+    const int64_t H = hi[0] - lo[0], W = hi[1] - lo[1];
     uint8_t *pl = malloc((size_t)H * W); size_t hg[5][200] = {{0}}, hn[5][200] = {{0}}; pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    const long long pol[3] = {po[0], po[1] + lo[0], po[2] + lo[1]};
     for (int fz = 0; fz < A.shape[0]; fz++) {
-        const int64_t z = (int64_t)((fz + 0.5) * A.h); if (z >= zm->shape[0]) break;
-        const int64_t o[3] = {z, 0, 0}, n[3] = {1, H, W};
+        const int64_t z = (int64_t)lround(((fz + 0.5) * A.h + A.origin[0]) * s) - po[0]; if (z < 0 || z >= zm->shape[0]) continue;
+        const int64_t o[3] = {z, lo[0], lo[1]}, n[3] = {1, H, W};
         if (z3_read(pz, o, n, pl, nt)) { fprintf(stderr, "gap-compare: %s\n", z3_error()); return 1; }
-        gap_job J = {pl, H, W, &A, net ? &Bn : nullptr, fz, R, thr, minrun, &hg, &hn, &mu, 0};
+        gap_job J = {pl, H, W, &A, net ? &Bn : nullptr, fz, R, thr, minrun, s, {pol[0], pol[1], pol[2]}, &hg, &hn, &mu, 0};
         pthread_t th[64]; const int k = nt < 1 ? 1 : nt > 64 ? 64 : nt;
         for (int t = 0; t < k; t++) pthread_create(&th[t], nullptr, gap_rows, &J);
         for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
     }
     static const char *bn[5] = {"< 100 um", "100-140", "140-180", "180-240", ">= 240"};
-    printf("gap-compare: density ratio to the reference (median, p10, p90) by reference spacing; R %d, threshold %d, min run %d\n", R, thr, minrun);
+    printf("gap-compare: density ratio to the reference (median, p10, p90) by reference spacing; R %.0f um, threshold %d, min run %d\n", Rum, thr, minrun);
     for (int a = 0; a < 5; a++) {
         size_t t = 0; for (int b = 0; b < 200; b++) t += hg[a][b]; if (!t) continue;
-        printf("  %-9s %8zu cells: papyrus gaps %.2f (%.2f-%.2f)", bn[a], t, exp2(hist_q(hg[a], 200, -2, 4.0 / 200, 0.5)), exp2(hist_q(hg[a], 200, -2, 4.0 / 200, 0.1)), exp2(hist_q(hg[a], 200, -2, 4.0 / 200, 0.9)));
+        printf("  %-9s %8zu cells: gaps %.2f (%.2f-%.2f)", bn[a], t, exp2(hist_q(hg[a], 200, -2, 4.0 / 200, 0.5)), exp2(hist_q(hg[a], 200, -2, 4.0 / 200, 0.1)), exp2(hist_q(hg[a], 200, -2, 4.0 / 200, 0.9)));
         size_t u = 0; for (int b = 0; b < 200; b++) u += hn[a][b];
         if (u) printf("   net density %.2f (%.2f-%.2f)", exp2(hist_q(hn[a], 200, -2, 4.0 / 200, 0.5)), exp2(hist_q(hn[a], 200, -2, 4.0 / 200, 0.1)), exp2(hist_q(hn[a], 200, -2, 4.0 / 200, 0.9)));
         printf("\n");
@@ -1131,6 +1145,60 @@ static int cmd_gap_density(int argc, char **argv) {
     if (fit_fields_save(argv[5], org, A.shape, A.h, A.um, a, A.cy, A.cx, na)) { fprintf(stderr, "gap-density: cannot write %s\n", argv[5]); return 1; }
     fprintf(stderr, "gap-density: %zu of %zu packed cells took the papyrus-gap spacing -> %s\n", fused, cells, argv[5]);
     free(pl); free(sp); z3_close(pz); fit_fields_free(&A);
+    return 0;
+}
+
+/* ufsm void-pool <pred-root> <pred-key> <out-group> <out-um> --vol-shape z,y,x [--factor 4] [--thr 128] [--shard 512]
+   The aux input for a coarse winding net (train --aux-input): per output voxel the fraction of its factor^3 source voxels that are
+   void (papyrus probability < --thr) x 255, from a task papyrus predict output (box-local, ufsm.origin_zyx; on the level-0 grid
+   of --vol-shape) into <out-group>/<out-um>, a whole-volume array (shape ceil(vol-shape / factor)) shared by many boxes: each
+   output shard the box meets is read, the box's part replaced, and written back. Thin gaps between packed sheets survive as
+   void fractions where a 9.6 um CT averages them away. */
+static int cmd_void_pool(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "usage: ufsm void-pool <pred-root> <pred-key> <out-group> <out-um> --vol-shape z,y,x [--factor 4] [--thr 128] [--shard 512]\n"); return 2; }
+    const int F = atoi(opt(argc, argv, "--factor", "4")), thr = atoi(opt(argc, argv, "--thr", "128")), S = atoi(opt(argc, argv, "--shard", "512")), nt = 16;
+    long long vs[3]; if (sscanf(opt(argc, argv, "--vol-shape", ""), "%lld,%lld,%lld", vs, vs + 1, vs + 2) != 3 || F < 1 || S < 1) { fprintf(stderr, "void-pool: --vol-shape z,y,x (level 0)\n"); return 2; }
+    z3 *pz = z3_open(store_open(argv[2]), argv[3], nullptr); if (!pz) { fprintf(stderr, "void-pool: %s\n", z3_error()); return 1; }
+    long long po[3] = {0, 0, 0};
+    { char jp[1400]; snprintf(jp, sizeof jp, "%s/%s/zarr.json", argv[2], argv[3]); FILE *jf = fopen(jp, "rb"); char jb[8192] = {0};
+      if (jf) { size_t nr = fread(jb, 1, sizeof jb - 1, jf); (void)nr; fclose(jf); }
+      const char *q = strstr(jb, "\"origin_zyx\":"); if (!q || sscanf(q + 13, " [%lld,%lld,%lld]", po, po + 1, po + 2) != 3) { fprintf(stderr, "void-pool: no origin_zyx in %s\n", jp); return 2; } }
+    const z3_meta *pm = z3_meta_of(pz); const double um = atof(argv[5]);
+    const int64_t osh[3] = {(vs[0] + F - 1) / F, (vs[1] + F - 1) / F, (vs[2] + F - 1) / F};
+    char lv[32], od[1400]; z3w_level_name(um, lv, sizeof lv); snprintf(od, sizeof od, "%s/%s", argv[4], lv);
+    char at[300]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"papyrus void fraction x 255 over %d^3 voxels (probability < %d)\",\"factor\":%d}}", F, thr, F);
+    z3w *w = z3w_create(od, osh, S, 0, 0, at); if (!w || z3w_write_group(argv[4], &um, 1, "ufsm-void-fraction", nullptr)) { fprintf(stderr, "void-pool: %s\n", z3w_error()); return 1; }
+    z3 *oz = z3_open(store_open(argv[4]), lv, nullptr);   /* existing shard contents (other boxes) */
+    int64_t lo[3], hi[3]; for (int d = 0; d < 3; d++) { lo[d] = po[d] / F; hi[d] = (po[d] + pm->shape[d] + F - 1) / F; if (hi[d] > osh[d]) hi[d] = osh[d]; }
+    uint8_t *sb = malloc((size_t)S * S * S), *src = nullptr; size_t srccap = 0; int nsh = 0;
+    for (int64_t sz = lo[0] / S; sz * S < hi[0]; sz++) for (int64_t sy = lo[1] / S; sy * S < hi[1]; sy++) for (int64_t sx = lo[2] / S; sx * S < hi[2]; sx++) {
+        const int64_t so[3] = {sz * S, sy * S, sx * S}, sn[3] = {osh[0] - so[0] < S ? osh[0] - so[0] : S, osh[1] - so[1] < S ? osh[1] - so[1] : S, osh[2] - so[2] < S ? osh[2] - so[2] : S};
+        memset(sb, 0, (size_t)S * S * S);
+        if (oz) { uint8_t *t = malloc((size_t)sn[0] * sn[1] * sn[2]); if (t && !z3_read(oz, so, sn, t, nt)) for (int64_t a = 0; a < sn[0]; a++) for (int64_t b = 0; b < sn[1]; b++) memcpy(sb + ((size_t)a * S + b) * S, t + ((size_t)a * sn[1] + b) * sn[2], (size_t)sn[2]); free(t); }
+        int64_t c0[3], c1[3];   /* this shard's output voxels inside the box */
+        for (int d = 0; d < 3; d++) { c0[d] = lo[d] > so[d] ? lo[d] : so[d]; c1[d] = hi[d] < so[d] + sn[d] ? hi[d] : so[d] + sn[d]; }
+        if (c1[0] <= c0[0] || c1[1] <= c0[1] || c1[2] <= c0[2]) continue;
+        for (int64_t a0 = c0[0]; a0 < c1[0]; a0 += 32) {   /* 32 output rows at a time: a ~0.5 GB source slab (a whole 2048^3 box: 8.7 GB) */
+            const int64_t a1 = a0 + 32 < c1[0] ? a0 + 32 : c1[0], cl[3] = {a0, c0[1], c0[2]}, ch[3] = {a1, c1[1], c1[2]};
+            int64_t ro[3], rn[3];   /* the source voxels behind them (box-local) */
+            for (int d = 0; d < 3; d++) { ro[d] = cl[d] * F - po[d]; int64_t e = ch[d] * F - po[d]; if (ro[d] < 0) ro[d] = 0; if (e > pm->shape[d]) e = pm->shape[d]; rn[d] = e - ro[d]; }
+            if (rn[0] <= 0 || rn[1] <= 0 || rn[2] <= 0) continue;
+            const size_t need = (size_t)rn[0] * rn[1] * rn[2]; if (need > srccap) { free(src); src = malloc(need); srccap = need; }
+            if (!src || z3_read(pz, ro, rn, src, nt)) { fprintf(stderr, "void-pool: %s\n", z3_error()); return 1; }
+            for (int64_t a = a0; a < a1; a++) for (int64_t b = c0[1]; b < c1[1]; b++) for (int64_t c = c0[2]; c < c1[2]; c++) {
+                int tot = 0, vd = 0;
+                for (int64_t za = a * F - po[0]; za < (a + 1) * F - po[0]; za++) { if (za < ro[0] || za >= ro[0] + rn[0]) continue;
+                    for (int64_t ya = b * F - po[1]; ya < (b + 1) * F - po[1]; ya++) { if (ya < ro[1] || ya >= ro[1] + rn[1]) continue;
+                        for (int64_t xa = c * F - po[2]; xa < (c + 1) * F - po[2]; xa++) { if (xa < ro[2] || xa >= ro[2] + rn[2]) continue;
+                            tot++; vd += src[((size_t)(za - ro[0]) * rn[1] + (ya - ro[1])) * rn[2] + (xa - ro[2])] < thr; } } }
+                if (tot) sb[((size_t)(a - so[0]) * S + (b - so[1])) * S + (c - so[2])] = (uint8_t)((vd * 255 + tot / 2) / tot);
+            }
+        }
+        if (z3w_write_shard(w, sz, sy, sx, sb, nt)) { fprintf(stderr, "void-pool: %s\n", z3w_error()); return 1; }
+        nsh++;
+    }
+    z3w_close(w); if (oz) z3_close(oz); z3_close(pz); free(sb); free(src);
+    fprintf(stderr, "void-pool: %d shards of %s updated from %s\n", nsh, od, argv[2]);
     return 0;
 }
 
@@ -1303,6 +1371,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fit-compare")) return cmd_fit_compare(argc, argv);
     if (!strcmp(cmd, "gap-compare")) return cmd_gap_compare(argc, argv);
     if (!strcmp(cmd, "gap-density")) return cmd_gap_density(argc, argv);
+    if (!strcmp(cmd, "void-pool")) return cmd_void_pool(argc, argv);
     if (argc < 4) return usage();
     const char *root = argv[2], *key = argv[3];
     const char *cache = opt(argc, argv, "--cache", nullptr);

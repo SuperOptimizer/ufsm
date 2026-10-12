@@ -68,6 +68,7 @@ static int g_side, g_side_ch, g_side_nc; static float g_side_lambda = 1.f;
 /* --task unwrap (B == 1): channel 0 recto (target 0, the label mask), 1 ink (target slot 1 = the source's "ink" prob teacher, BCE over
    all papyrus with dice g_ink_dice, times g_ink_lambda), 2-3 the winding phase (the --side 2 path), 4-9 the sign-free normal n n^T and
    10 the sheet density, both from the phase gradient over +-g_norm_s voxels (nn_unwrap_targets; BCE, times g_norm_lambda) */
+static int g_xc = 4;   /* input channels per sample: CT + radial (3), + the aux volume with --aux-input */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_scale = 32.f;
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
    (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */
@@ -113,7 +114,7 @@ static void upload_slab(gpu_state *d, const batch *b, int i, int B, int P, int a
     void (*cp)(void *, const void *, size_t) = async ? nn_h2d_copy_stream : nn_h2d;
     const size_t p2 = (size_t)P * P, p3 = p2 * P, l3 = p2 * g_Dl, own = l3 - g_h0 * p2;
     const size_t z0 = d->side ? (size_t)(P / 2 - g_h0) : 0, xb = xbytes();
-    for (int r = 0; r < B * 4; r++) cp((char *)d->xb[i] + r * l3 * xb, (const char *)bx(b) + (r * p3 + z0 * p2) * xb, l3 * xb);
+    for (int r = 0; r < B * g_xc; r++) cp((char *)d->xb[i] + r * l3 * xb, (const char *)bx(b) + (r * p3 + z0 * p2) * xb, l3 * xb);
     for (int r = 0; r < B * NCH; r++) cp(d->tb[i] + r * l3, b->t + r * p3 + z0 * p2, l3);
     for (int n = 0; n < B; n++) {
         uint8_t *m = d->mb[i] + n * l3;
@@ -136,7 +137,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     if (b->corner && b->level) { memcpy(d->cornb[d->cur], b->corner[0], sizeof d->cornb[0]); d->lvlb[d->cur] = b->level[0]; }   /* validation copies carry none */
     if (d->side >= 0) { upload_slab(d, b, d->cur, B, P, 0); return; }
     size_t p3 = (size_t)P * P * P;
-    nn_h2d(d->x, bx(b), (size_t)B * 4 * p3 * xbytes());
+    nn_h2d(d->x, bx(b), (size_t)B * g_xc * p3 * xbytes());
     nn_h2d(d->t, b->t, (size_t)B * NCH * p3);
     nn_h2d(d->m, b->m, (size_t)B * p3);
     nn_h2d(d->w, b->w, (size_t)B * NCH);
@@ -154,7 +155,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     if (d->lean) nn_stream_wait(1, d->ev_done[i ^ 1]);   /* lean: one buffer (inside the gradient buffers), free after the current step */
     if (d->side >= 0) upload_slab(d, b, i, B, P, 1);
     else {
-        nn_h2d_copy_stream(d->xb[i], bx(b), (size_t)B * 4 * p3 * xbytes());
+        nn_h2d_copy_stream(d->xb[i], bx(b), (size_t)B * g_xc * p3 * xbytes());
         nn_h2d_copy_stream(d->tb[i], b->t, (size_t)B * NCH * p3);
         nn_h2d_copy_stream(d->mb[i], b->m, (size_t)B * p3);
         nn_h2d_copy_stream(d->wb[i], b->w, (size_t)B * NCH);
@@ -169,7 +170,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
    since select_buf already moved on) and a raw dump <out>/nan_step<N>.bin (x16|x32, t, m, w, logits) */
 static void diagnose_nan(gpu_state *d, int B, int P, int step, const char *out) {
     nn_init(d->dev); nn_sync();
-    size_t p3 = (size_t)P * P * P, nx = (size_t)B * 4 * p3, nl = (size_t)B * NCH * p3;
+    size_t p3 = (size_t)P * P * P, nx = (size_t)B * g_xc * p3, nl = (size_t)B * NCH * p3;
     int cb = d->cur ^ 1;
     size_t xbytes_ = nx * xbytes();
     void *hx = malloc(xbytes_); nn_d2h(hx, d->xb[cb], xbytes_);
@@ -308,7 +309,7 @@ static void verso_target(gpu_state *d, shape5 xs) {
     }
 }
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
-    shape5 xs = {B, 4, d->side >= 0 ? g_Dl : P, P, P};
+    shape5 xs = {B, g_xc, d->side >= 0 ? g_Dl : P, P, P};
     if (unet_cfg_of(d->u)->scale_cond) { if (g_papyrus) unet_set_cond(d->u, d->um); else unet_set_scale(d->u, d->um); }   /* B == 1 (checked at
                                                                                                     startup); papyrus: um is the cutoff code */
     if (g_verso_on) verso_target(d, xs);
@@ -386,7 +387,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
 }
 /* fetch the loss parts of the last run_batch on this GPU (synchronous); returns the scalar loss */
 static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
-    shape5 os = g_half ? (shape5){B, g_cout, P, P, P} : unet_out_shape(d->u, (shape5){B, 4, d->side >= 0 ? g_Dl : P, P, P});
+    shape5 os = g_half ? (shape5){B, g_cout, P, P, P} : unet_out_shape(d->u, (shape5){B, g_xc, d->side >= 0 ? g_Dl : P, P, P});
     if (g_aff) os.c = NCH;
     if (!g_verso_on && !g_unwrap) nn_loss_fetch(d->scratch, os, out);
     d->ink_loss = d->norm_loss = 0;
@@ -447,6 +448,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--aug-strength 1 (0..2)] [--aug-p 0 (default p of every scanner op)] [--aug-OP-p P] [--aug-drop-ignore 1] [--aug-affine-p 0] [--aug-aniso 0.1] [--aug-shear 0.06]\n"
                         "         scanner ops (source grid, z = scan axis): seam air lowres blur sharpen bias ring cupping slice noise cnoise tone quant dropslice cutout chunk\n"
                         "       [--sheet-band-scale 1]   widen audited soft-band cap and close-gap exclusions together\n"
+                        "       [--aux-input 1]   a fifth input channel from the sources' \"aux\" volumes (e.g. the papyrus void fraction)\n"
                         "       [--erode 0|1] [--soft SIGMA] [--soft-unit vox|um]   native binary-core erosion before softening (--levels 1,0,0,0); sigma in level-0 voxels or um\n"
                         "       [--gn-stats stored|legacy]   fresh training uses stored activations; resume preserves the saved contract\n"
                         "       [--schedule-start STEP]   restart the LR schedule at this saved step, preserving optimizer state\n"
@@ -651,6 +653,15 @@ int cmd_train(int argc, char **argv) {
             fprintf(stderr, "low resolution (%s): the network runs on %d^3 blocks of %d^3 voxels, %d inputs, %d outputs\n", hr, P / g_hdiv, g_hdiv, cfg.cin, cfg.cout);
         }
     }
+    {   /* --aux-input 1: a fifth input channel from each source's aux volume (src/sources.h; e.g. the papyrus void fraction pooled
+           from 2.4 um, which keeps the packed gaps a 9.6 um CT averages away); the checkpoint's cin decides on resume */
+        g_xc = atoi(opt(argc, argv, "--aux-input", "0")) ? 5 : 4;
+        if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && !pc.half_res) g_xc = pc.cin == 5 ? 5 : 4; }
+        if (g_xc == 5) {
+            if (g_half || split || g_sheet) { fprintf(stderr, "--aux-input: not with --half-res, --split or winding geometry\n"); return 2; }
+            cfg.cin = 5; fprintf(stderr, "inputs: CT, radial (3), aux (sources' \"aux\" volumes)\n");
+        }
+    }
     const int nl = split ? 1 : ng;   /* windows per step (loss averaging, samples / s) */
     if (g_sheet && nl!=1) { fprintf(stderr,"winding currently supports one whole or spatially split window\n"); return 2; }
     char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", out); if (system(cmd)) return 1;
@@ -664,6 +675,7 @@ int cmd_train(int argc, char **argv) {
     if (atoi(opt(argc, argv, "--rotonly", "0"))) sc.augment = 2;   /* proper rotations only (no reflections) */
     if (atoi(opt(argc, argv, "--zfix", "0"))) sc.augment = 3;      /* diagnostic: symmetries that keep the z axis */
     if (atoi(opt(argc, argv, "--intonly", "0"))) sc.augment = 4;   /* diagnostic: intensity jitter, no symmetry */
+    sc.aux = g_xc == 5;
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
     sc.papyrus = g_papyrus ? &g_pap : nullptr;
     sc.phase_dense = atoi(opt(argc, argv, "--phase-dense", "0"));   /* side 2: weigh windings closer than this (label voxels) up */
@@ -883,8 +895,8 @@ int cmd_train(int argc, char **argv) {
                 if (g_half && cand[c].lean) continue;   /* (the batch buffers are full resolution, the network's half) */
                 unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean); unet_set_share_enc_a1(cand[c].sea || sea_force);
                 const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
-                size_t trainer = nbuf * ((size_t)B * 4 * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
-                if (cand[c].lean) trainer = (cand[c].gmx ? 0 : (size_t)B * 4 * p3 * xbytes())   /* batch buffers inside the gradient buffer B (estimate) */
+                size_t trainer = nbuf * ((size_t)B * g_xc * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
+                if (cand[c].lean) trainer = (cand[c].gmx ? 0 : (size_t)B * g_xc * p3 * xbytes())   /* batch buffers inside the gradient buffer B (estimate) */
                                             + (g_cout > NCH ? (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) : 0);   /* > 2 outputs (affinities, verso): the logit gradient may not fit beside the logits */
                 need = tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (size_t)15 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (need <= fmin) pick = c;
@@ -907,7 +919,7 @@ int cmd_train(int argc, char **argv) {
         char *bs = nullptr;
         const size_t p3 = p3l;   /* this GPU's voxels of a window */
         const size_t a256 = 255, glb = ((size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) + a256) & ~a256, tbb = ((size_t)B * NCH * p3 + a256) & ~a256,
-                     mbb = ((size_t)B * p3 + a256) & ~a256, xbb = ((size_t)B * 4 * p3 * xbytes() + a256) & ~a256;
+                     mbb = ((size_t)B * p3 + a256) & ~a256, xbb = ((size_t)B * g_xc * p3 * xbytes() + a256) & ~a256;
         const int xin_b = lean && unet_input_converted() && g_xfmt;
         size_t goff = 0;
         int xin_in = 0;
@@ -929,10 +941,10 @@ int cmd_train(int argc, char **argv) {
             else if (bs) {
                 const size_t toff = goff + (unet_lean_nob(d->u) && xin_in ? xbb : 0), xoff = unet_lean_nob(d->u) ? 0 : goff + tbb + mbb;
                 d->tb[i] = (uint8_t *)(bs + toff); d->mb[i] = (uint8_t *)(bs + toff + tbb);
-                d->xb[i] = xin_in ? (void *)(bs + xoff) : nn_malloc((size_t)B * 4 * p3 * xbytes());
+                d->xb[i] = xin_in ? (void *)(bs + xoff) : nn_malloc((size_t)B * g_xc * p3 * xbytes());
                 d->wb[i] = nn_malloc((size_t)B * NCH);
             }
-            else { d->xb[i] = nn_malloc((size_t)B * 4 * p3 * xbytes()); d->tb[i] = nn_malloc((size_t)B * NCH * p3); d->mb[i] = nn_malloc((size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * NCH); }
+            else { d->xb[i] = nn_malloc((size_t)B * g_xc * p3 * xbytes()); d->tb[i] = nn_malloc((size_t)B * NCH * p3); d->mb[i] = nn_malloc((size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * NCH); }
             d->ev_up[i] = nn_event_create();
         }
         if (lean && g == 0) fprintf(stderr, "lean %d: batch buffers %s, logit gradient %s\n", lean, !bs ? "separate" : xin_in ? "and input inside the gradient buffers" : "inside the gradient buffers, input separate", d->gl ? "inside" : "separate");
@@ -1051,8 +1063,8 @@ int cmd_train(int argc, char **argv) {
     for (int i = 0; i < nval; i++) {
         batch *b = sampler_next(vs);
         if (!b) { nval = i; break; }
-        if (g_xfmt) { val[i].x16 = malloc((size_t)B * 4 * p3 * 2); memcpy(val[i].x16, b->x16, (size_t)B * 4 * p3 * 2); }
-        else { val[i].x = malloc((size_t)B * 4 * p3 * 4); memcpy(val[i].x, b->x, (size_t)B * 4 * p3 * 4); }
+        if (g_xfmt) { val[i].x16 = malloc((size_t)B * g_xc * p3 * 2); memcpy(val[i].x16, b->x16, (size_t)B * g_xc * p3 * 2); }
+        else { val[i].x = malloc((size_t)B * g_xc * p3 * 4); memcpy(val[i].x, b->x, (size_t)B * g_xc * p3 * 4); }
         val[i].t = malloc((size_t)B * NCH * p3); memcpy(val[i].t, b->t, (size_t)B * NCH * p3);
         val[i].m = malloc((size_t)B * p3); memcpy(val[i].m, b->m, (size_t)B * p3);
         val[i].w = malloc((size_t)B * NCH); memcpy(val[i].w, b->w, (size_t)B * NCH);
@@ -1134,8 +1146,8 @@ int cmd_train(int argc, char **argv) {
                     double tw = now(); batch *b = sampler_next(sp); wait += now() - tw;
                     if (!b) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; break; }
                     batch *cp = calloc(1, sizeof *cp); size_t p3b = (size_t)P * P * P;
-                    if (g_xfmt) { cp->x16 = malloc((size_t)B * 4 * p3b * 2); memcpy(cp->x16, b->x16, (size_t)B * 4 * p3b * 2); }
-                    else { cp->x = malloc((size_t)B * 4 * p3b * 4); memcpy(cp->x, b->x, (size_t)B * 4 * p3b * 4); }
+                    if (g_xfmt) { cp->x16 = malloc((size_t)B * g_xc * p3b * 2); memcpy(cp->x16, b->x16, (size_t)B * g_xc * p3b * 2); }
+                    else { cp->x = malloc((size_t)B * g_xc * p3b * 4); memcpy(cp->x, b->x, (size_t)B * g_xc * p3b * 4); }
                     cp->t = malloc((size_t)B * NCH * p3b); memcpy(cp->t, b->t, (size_t)B * NCH * p3b);
                     cp->m = malloc((size_t)B * p3b); memcpy(cp->m, b->m, (size_t)B * p3b);
                     cp->w = malloc((size_t)B * NCH); memcpy(cp->w, b->w, (size_t)B * NCH);

@@ -339,6 +339,17 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   unwrapping: together they halve the radial turn drift on B (+1 at 0.5-1 mm 56 -> 34%, -2 beyond 6 mm 10-23% -> 0) but the
   score moves only 83.7 -> 84.05% and some settings flip the whole-block alignment (~54%). Better use: the papyrus net's
   2.4 um gaps as an input channel of the 9.6 um winding net, which sees CT averaged over 4^3 voxels where packed gaps vanish.
+  gap-compare on raw CT (--um, physical mapping to any grid): packed-sheet gap counts 1.24 at 2.4 um (noise adds gaps), 0.82 at
+  9.6 um, vs the papyrus net's 1.02: the 9.6 um CT has lost about a fifth of the packed gaps before any network sees it.
+- Aux input channel (`train --aux-input 1`, default off; default batches byte-identical, bench hash 1eccaa34d8e977fb): a fifth
+  network input from each source's `"aux": {"root", "key", "level"}` volume, written by the sampler with the CT's symmetry
+  (v / 127.5 - 1), cin 5 in the checkpoint; `predict --aux ROOT KEY` reads it per window (5-input checkpoints need it; one GPU, no
+  split; the fused CT stem needs cin 4, so the generic input path). `ufsm void-pool` builds it: per 9.6 um voxel the fraction of
+  its 4^3 2.4 um voxels the papyrus net calls void, merged box by box into a whole-scroll array (32-row source slabs, 0.85 GB,
+  10 s per 2048^3 block). The papyrus net (F-full, cutoff 80) over the 24 training blocks + A + B: 1.5 GB at 9.6 um; voxels 44%
+  nearly all papyrus, 40% nearly all void, 16% partly void (the sub-voxel gaps). A 96k-step 9.6 um run on it is the test; it is
+  not deployable for 9 um-only scans (it needs a 2.4 um scan), so it measures how much a 9.6 um student could gain from 2.4 um
+  information (the plan: a 2.4 um teacher on the desk, distilled to 9.6 um).
 - `ufsm phase-raster --pool 2` writes only the 2x circular-mean pooled phase (<out>/9.6, shards of 256: one per 4.8 um shard
   of 512); `--resume 1` skips written shards. A whole-scroll Paris4 phase at 4.8 um would be ~326 GB (25 MB per shard, 13054
   shards; the desk has 317 GB free), at 9.6 um ~65 GB. Block B: identical known / unknown masks to phase-raster + downsample,

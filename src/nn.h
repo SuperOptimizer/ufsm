@@ -319,6 +319,7 @@ void nn_lowres_grad(const void *g, int g16, shape5 qs, int div, int mode, void *
 /* inference: network input from the uint8 CT window on the device (z-score + radial channels; 16-bit storage when h16),
    and recto probability * 255 (0 where the CT is 0) from the logits */
 void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16);
+void nn_aux_input(const uint8_t *a, size_t n, void *x, int h16);   /* the aux input channel: v / 127.5 - 1 in the input format */
 void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out);
 void nn_pred_input_mx8(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, int z0, int nz, void *y, int h16);   /* nn_pred_input of planes [z0, z0 + nz) straight to MX-fp8 (depth-nz tensor), bit-identical to nn_pred_input + the input conversion */
 void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);   /* interior -> device shard */

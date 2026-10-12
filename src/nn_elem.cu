@@ -686,3 +686,12 @@ extern "C" void nn_concat_bwd(const float *gy, int ca, int cb, shape5 s, float *
     concat_k<<<nblk(n, 256), 256>>>(ga, ca, gb, cb, (float *)gy, s.n, S, 0);
     KCHECK();
 }
+
+/* the aux input channel (train / predict --aux): uint8 -> v / 127.5 - 1 in the input format (as the sampler writes it) */
+template <typename HT> __global__ void aux_in_k(const uint8_t *a, size_t n, HT *x) { const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) x[i] = f2h<HT>((float)a[i] * (1.f / 127.5f) - 1.f); }
+extern "C" void nn_aux_input(const uint8_t *a, size_t n, void *x, int h16) {
+    if (!h16) aux_in_k<float><<<nblk(n, 256), 256>>>(a, n, (float *)x);
+    else if (g_h16) aux_in_k<f16><<<nblk(n, 256), 256>>>(a, n, (f16 *)x);
+    else aux_in_k<bf16><<<nblk(n, 256), 256>>>(a, n, (bf16 *)x);
+    KCHECK();
+}

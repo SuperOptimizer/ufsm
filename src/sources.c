@@ -161,6 +161,13 @@ sources *sources_load(const char *path) {
                 }
             }
         }
+        const json *aj = json_get(e, "aux");
+        if (aj) {
+            const char *ar = json_str(json_get(aj, "root"), nullptr), *ak = json_str(json_get(aj, "key"), "9.6");
+            store *as = ar ? store_open(ar) : nullptr;
+            s->aux = as ? z3_open(as, ak, nullptr) : nullptr; s->aux_level = (int)json_num(json_get(aj, "level"), 2);
+            if (!s->aux) { fprintf(stderr, "sources: %s: cannot open the aux volume %s/%s\n", s->name, ar ? ar : "?", ak); json_free(j); sources_free(S); return nullptr; }
+        }
         const json *ho = json_get(e, "holdout");
         if (ho && ho->type == J_ARR && ho->n == 6) for (int d = 0; d < 3; d++) { s->hold_o[d] = (int64_t)json_num(json_at(ho, (size_t)d), 0); s->hold_n[d] = (int64_t)json_num(json_at(ho, (size_t)(3 + d)), 0); }
         const char *ap = json_str(json_get(e, "axis"), nullptr);
@@ -180,7 +187,7 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
-        z3_close(s->band); z3_close(s->phase);
+        z3_close(s->band); z3_close(s->phase); z3_close(s->aux);
         for (int c = 0; c < NCH; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {

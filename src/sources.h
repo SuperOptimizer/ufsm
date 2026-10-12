@@ -73,6 +73,8 @@ typedef struct {
        {"band": {"root": ..., "key": "4.8", "radius": 80, "span": 75}} under "targets" */
     z3 *band;
     float band_radius, band_span;   /* native voxels */
+    z3 *aux; int aux_level;   /* optional {"aux": {"root", "key", "level"}}: a uint8 input volume on the grid of CT level aux_level (e.g. the
+                                 papyrus void fraction pooled from 2.4 um); with sample_cfg.aux it becomes a fifth input channel */
     z3 *phase;   /* optional: the band field's winding phase (band.h PHASE_*) precomputed on the same label grid (ufsm phase-raster),
                     {"band": {..., "phase": {"root": ..., "key": "4.8"}}}: windows read it instead of computing the band field;
                     "level": L (default 1, the label grid) when it is on the grid of CT level L (e.g. "9.6" pooled by ufsm downsample,
