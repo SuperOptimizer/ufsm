@@ -246,8 +246,12 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   (--tile 512 px), each reading only the volume around its own vertices (+- depth), pixel rows over --threads: renders of the
   oracle wraps byte-identical with 64-px tiles, 43 MB peak. Whole-scroll estimates: wraps ~640k vertices/s (Paris4's ~1.4e9
   in ~40 min on 16 threads); render bound by decoding the ink zarr around each wrap.
-- Left: the field-zarr size for all of Paris4 at h 8 (~0.5 TB raw before compression; h 16 is 8x smaller, its fit quality
-  unmeasured); BigTIFF for renders over 4 GB compressed; the 9.6 um version; the desk runs.
+- Field cell size: h 16 fields are 8x smaller (smoke block 9.1 vs 72 MB) but the fit drops to 44.9% winding ids (h 8: 90.9%):
+  a 16-voxel cell spans ~1/3 turn in packed regions, blurring the phase and leaving neighbouring cells near the half-turn
+  ambiguity. h 8 stays. A model-guided flood (neighbours stepped by the current model's predicted U difference instead of none)
+  changes nothing (identical scores): the network's -1 errors are not unwrapping slips but turns missing from its phase in
+  packed regions, so the lever is the network (longer / larger training: the desk run).
+- Left: BigTIFF for renders over 4 GB compressed; the 9.6 um version; the desk runs.
 
 ## Half-resolution networks (2026-10-11)
 
