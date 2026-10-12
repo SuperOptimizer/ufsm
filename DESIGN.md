@@ -219,8 +219,25 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   normal, plus the CT at t = 0) on src/tiffw.c (TIFF writer: uint8 / float32, deflate; tests/test_tiffw round trip). Oracle
   wraps 42-56 of the sub-block: vertices on the labelled sheets (median distance 0-2 native, p90 <= 3.5, 96-100% within 4
   voxels except the sparse edge wrap); the CT renders show papyrus fibre texture.
-- Left: GPU root finding / brick-sparse lattice / z-slabs for whole-scroll fits, a stored phase raster for the sampler,
-  volcomp typed modes (uint16 winding zarr; agent), the 9.6 um version, the desk runs.
+- Whole-scroll scaling. `predict --fit-zarr DIR` writes the same fields as 10 uint8 zarr arrays (lossless volcomp, shards of
+  128 field voxels) plus fields.json (`"format": "zarr"`): each window's whole interior cells are accumulated in a small device
+  buffer, finalized on the host into a slab of 128 field rows, and the slab is flushed when the windows leave it (needs the
+  window stride, the shard and 128 h aligned to h; one window per shard). Smoke block: byte-identical to --fit-fields, 61 s (was
+  75 s), 0.74 GB peak RSS, 72 MB (raw 127 MB). `nn_fit_accum` takes field cells up to 32^3 voxels (--fit-h 2..32).
+  `ufsm fit DIR --slab Z [--overlap 256]` (src/fit.c fit_run_slabs): the prior from full-resolution slabs (knots on the global
+  knot grid, offsets made continuous, the direction from the summed ring votes), a global gradient-only fit (lattices 512 /
+  256 / 128) on fields pooled to ~64 native, then per z-slab of Z native (+- overlap) the voxel unwrapping and the phase stages
+  at 64 / 32 started from the global model (delta = the global U minus the slab's base at the nodes). The slab's flood starts
+  from every confident voxel below its interior, with the integers of the previous slab's model, so the unwrapping continues
+  across slabs and the gauge carries over (a slab flooded from its own seed: 80.6% in its range, 3 turns off the gauge). The
+  set (dir/global, dir/slabNNN, set.json) blends adjacent slab models linearly over +- overlap / 2; `fit --model`, `--winding`
+  and `ufsm wraps` read sets (fit_set_W, fit_set_ray_root). Network fields of the smoke block: one box 90.88%, 2 slabs of 1024
+  90.85%, 4 slabs of 512 (knots every 512) 90.93% vs 90.87% for one box at the same knots; wraps 40-52 from the 4-slab set have
+  no seams (row-to-row steps at the slab boundaries: median 4.5 / p99 11.6 native vs 4.4 / 13.3 elsewhere). The fitter only
+  loads one slab's full-resolution fields at a time (`fit_fields_load` rows [fz0, fz1), pooled, or geometry only); 1.6 GB peak.
+- Left: the winding writer, the scoring and the wraps root finding are single-threaded CPU loops (GPU next); the field-zarr
+  size for all of Paris4 at h 8 (~0.5 TB raw before compression; h 16 is 8x smaller, its fit quality unmeasured); the 9.6 um
+  version; the desk runs.
 
 ## Half-resolution networks (2026-10-11)
 

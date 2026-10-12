@@ -29,12 +29,19 @@ typedef struct {
     float phase_ramp;               /* phase_stage: phase weight from phase_ramp * w_phase to w_phase */
     int unwrap_voxels;              /* phase-stage init: 1 voxel-level quality-guided unwrapping (default), 0 lattice-node unwrapping */
     int analytic;                   /* 1: nn_fit_loss2 (analytic grad W, voxel minibatches; knots fixed after the prior), 0: nn_fit_loss */
+    const struct fit_model *init;   /* start from this model instead of the prior (its direction and knots; delta sampled at the first
+                                       stage), its box origin at init_off (native) in this box's coordinates negated: point p here is
+                                       p + init_off there */
+    double init_off[3];
+    const struct fit_model *seed;   /* voxel unwrapping: field voxels below box-local z seed_z take their integer from this model
+                                       (its z = ours + seed_off) instead of flooding from one seed (the previous slab of a set) */
+    double seed_off, seed_z;
     int batch;                      /* analytic: field voxels per step (about; 0 = all) */
     float core;                     /* no data terms within core * pitch of the axis */
     int verbose;
 } fit_cfg;
 
-typedef struct {
+typedef struct fit_model {
     int dir, nk, knot_dz;
     double dir_vote;                /* |median winding per radial ring| of the prior (1 = clear; < 0.5 ambiguous) */
     float *pitch, *offset;          /* per knot (knot k at box-local z = k * knot_dz) */
@@ -84,3 +91,21 @@ void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float w_smooth, f
    (12 planes over F = ceil(box / h), see src/nn_fit.cu); t = the window origin relative to the box */
 void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
                   int ch_recto, int ch_phase, int ch_normal, int ch_density, float *acc);
+
+/* fit fields of a directory (ufsm band --fit-fields / predict --fit-fields: raw arrays; predict --fit-zarr: zarr arrays), field
+   rows [fz0, fz1) (fz1 <= 0: to the end), pooled by pool per axis (1: none; pooled phase vectors are left uninformative, so
+   pooled fields are for the gradient-only stages; 0: the geometry and the whole axis table only, no arrays). The slab's native origin (box-local) is (fz0 h, 0, 0); f.cy / f.cx are the
+   slab's axis table (box-local y, x). */
+typedef struct { fit_fields f; uint8_t *a[10]; float *cy, *cx; long long origin[3]; int shape[3]; int h; } fit_fields_buf;
+int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b);
+void fit_fields_free(fit_fields_buf *b);
+
+/* a fit set: the global model plus z-slab models whose interiors [z0, z1) (box-local native z of the global box) partition it */
+typedef struct { fit_model *global; int n; fit_model **slab; double *z0, *z1, blend; } fit_set;   /* blend: W blended linearly over +-blend around slab boundaries */
+const fit_model *fit_set_model(const fit_set *s, double z, double *zoff);   /* the model for box-local z, and its z offset */
+double fit_set_W(const fit_set *s, double z, double y, double x);
+int fit_set_ray_root(const fit_set *s, double z, double theta, double k, double r_hint, double *r);   /* fit_ray_root of the set (global box, axis, pitch) */
+int fit_set_save(const fit_set *s, const char *dir);   /* dir/global, dir/slabNNN, dir/set.json */
+fit_set *fit_set_load(const char *dir);                 /* a set directory or a single model directory */
+void fit_set_free(fit_set *s);
+fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap);

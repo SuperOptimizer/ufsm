@@ -179,21 +179,21 @@ __global__ void fit_accum_k(const float *lg, const uint8_t *ct, int W, int halo,
                             int fz0, int fy0, int fx0, int nfy, int nfx, int F1, int F2, size_t nf, int ch_recto, int ch_phase, int ch_normal, int ch_density, float *acc) {
     __shared__ float red[11][512];
     const int fi = blockIdx.x, fz = fz0 + fi / (nfy * nfx), fy = fy0 + (fi / nfx) % nfy, fx = fx0 + fi % nfx;
-    const int lz = threadIdx.x / (h * h), ly = (threadIdx.x / h) % h, lx = threadIdx.x % h;
-    const int gz = fz * h + lz, gy = fy * h + ly, gx = fx * h + lx;   /* box coordinates */
-    const int wz = gz - tz, wy = gy - ty, wx = gx - tx;              /* window coordinates */
     float v[11] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; float rmax = 0.f;
     const size_t w3 = (size_t)W * W * W;
-    if (gz < bz && gy < by && gx < bx && wz >= halo && wz < W - halo && wy >= halo && wy < W - halo && wx >= halo && wx < W - halo) {
+    for (int t = threadIdx.x; t < h * h * h; t += blockDim.x) {   /* h^3 voxels of the field cell over the block's threads */
+        const int lz = t / (h * h), ly = (t / h) % h, lx = t % h;
+        const int gz = fz * h + lz, gy = fy * h + ly, gx = fx * h + lx;   /* box coordinates */
+        const int wz = gz - tz, wy = gy - ty, wx = gx - tx;              /* window coordinates */
+        if (gz >= bz || gy >= by || gx >= bx || wz < halo || wz >= W - halo || wy < halo || wy >= W - halo || wx < halo || wx >= W - halo) continue;
         const size_t i = ((size_t)wz * W + wy) * W + wx;
-        v[0] = 1.f;
-        if (ct[i]) {
-            auto sg = [&](int c) { return 1.f / (1.f + __expf(-lg[(size_t)c * w3 + i])); };
-            v[1] = 1.f; v[2] = 2.f * sg(ch_phase) - 1.f; v[3] = 2.f * sg(ch_phase + 1) - 1.f;
-            for (int k = 0; k < 6; k++) v[4 + k] = sg(ch_normal + k) - (k < 3 ? 0.f : 0.5f);
-            v[10] = sg(ch_density) * (1.f / 32.f);
-            rmax = sg(ch_recto);
-        }
+        v[0] += 1.f;
+        if (!ct[i]) continue;
+        auto sg = [&](int c) { return 1.f / (1.f + __expf(-lg[(size_t)c * w3 + i])); };
+        v[1] += 1.f; v[2] += 2.f * sg(ch_phase) - 1.f; v[3] += 2.f * sg(ch_phase + 1) - 1.f;
+        for (int k = 0; k < 6; k++) v[4 + k] += sg(ch_normal + k) - (k < 3 ? 0.f : 0.5f);
+        v[10] += sg(ch_density) * (1.f / 32.f);
+        rmax = fmaxf(rmax, sg(ch_recto));
     }
     for (int k = 0; k < 11; k++) red[k][threadIdx.x] = v[k];
     __shared__ float rm[512]; rm[threadIdx.x] = rmax;
@@ -219,8 +219,8 @@ extern "C" void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo
     }
     const int nfz = f1[0] - f0[0], nfy = f1[1] - f0[1], nfx = f1[2] - f0[2];
     const size_t nf = (size_t)F[0] * F[1] * F[2];
-    if (h * h * h > 512 || nf > 0x7fffffff) { fprintf(stderr, "nn_fit_accum: h %d or field grid too large\n", h); abort(); }
-    fit_accum_k<<<nfz * nfy * nfx, h * h * h>>>(lg, ct, W, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfy, nfx,
+    if (h > 32 || nf > 0x7fffffff) { fprintf(stderr, "nn_fit_accum: h %d or field grid too large\n", h); abort(); }
+    fit_accum_k<<<nfz * nfy * nfx, h * h * h < 512 ? h * h * h : 512>>>(lg, ct, W, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfy, nfx,
                                                 F[1], F[2], nf, ch_recto, ch_phase, ch_normal, ch_density, acc);
     KCHECK();
 }

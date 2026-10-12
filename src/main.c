@@ -367,32 +367,15 @@ static int cmd_band(int argc, char **argv) {
 }
 
 /* ufsm fit <fields-dir> [--codes ROOT KEY] [--dir 0|1|-1] [--lattice 512,256,128,64,64,32] [--steps 300,...] [--phase-stage 4]
-   [--knot-dz 1024] [--quiet] [--out MODEL-DIR] [--winding ZARR-DIR [--winding-step 4] [--um 2.4]]
-   The winding fitter (src/fit.h) on a directory of fit fields (ufsm band --fit-fields, or predict --fit-fields later). --codes: score
+   [--knot-dz 1024] [--quiet] [--out MODEL-DIR] [--winding ZARR-DIR [--winding-step 4] [--um 2.4]] [--slab Z [--overlap 256]]
+   [--model MODEL-DIR]
+   The winding fitter (src/fit.h) on a directory of fit fields (ufsm band --fit-fields, predict --fit-fields / --fit-zarr). --slab:
+   a global coarse fit plus z-slabs of Z native voxels (a fit set; --out writes it, --model reads a set or a model). --codes: score
    against a winding_mod14 band raster (label grid, 2 native voxels per label voxel, code = 1 + round(18 q) mod 252 with q the mesh
    coordinate, q = U for dir +1): on every labelled voxel of the box U_fit - q must be one constant mod 14 turns. */
 static int cmp_float(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
 static int cmd_fit(int argc, char **argv) {
     const char *dir = argv[2];
-    char path[1400]; snprintf(path, sizeof path, "%s/fields.json", dir);
-    size_t jn; FILE *jf = fopen(path, "rb"); if (!jf) { fprintf(stderr, "fit: no %s\n", path); return 1; }
-    fseek(jf, 0, SEEK_END); jn = (size_t)ftell(jf); fseek(jf, 0, SEEK_SET); char *jt = malloc(jn + 1); if (fread(jt, 1, jn, jf) != jn) return 1; fclose(jf); jt[jn] = 0;
-    json *j = json_parse(jt, jn); free(jt); if (!j) { fprintf(stderr, "fit: bad fields.json\n"); return 1; }
-    long long org[3]; int shp[3];
-    for (int d = 0; d < 3; d++) { org[d] = (long long)json_num(json_at(json_get(j, "origin"), d), 0); shp[d] = (int)json_num(json_at(json_get(j, "shape"), d), 0); }
-    const double h = json_num(json_get(j, "h"), 8);
-    const json *axj = json_get(j, "axis"); const int na = (int)axj->n;
-    float *cy = malloc(na * sizeof(float)), *cx = malloc(na * sizeof(float));
-    for (int z = 0; z < na; z++) { cy[z] = (float)json_num(json_at(json_at(axj, z), 0), 0); cx[z] = (float)json_num(json_at(json_at(axj, z), 1), 0); }
-    json_free(j);
-    const size_t n = (size_t)shp[0] * shp[1] * shp[2];
-    static const char *nm[10] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w"};
-    uint8_t *a[10];
-    for (int k = 0; k < 10; k++) {
-        snprintf(path, sizeof path, "%s/%s.raw", dir, nm[k]); a[k] = malloc(n);
-        FILE *f = fopen(path, "rb"); if (!f || fread(a[k], 1, n, f) != n) { fprintf(stderr, "fit: cannot read %s\n", path); return 1; } fclose(f);
-    }
-    fit_fields ff = {shp[0], shp[1], shp[2], h, a[0], a[1], {a[2], a[3], a[4], a[5], a[6], a[7]}, a[8], a[9], cy, cx};
     fit_cfg c = fit_cfg_default();
     c.verbose = arg_index(argc, argv, "--quiet") < 0;
     c.dir = atoi(opt(argc, argv, "--dir", "0")); c.unwrap_voxels = atoi(opt(argc, argv, "--unwrap-voxels", "1"));
@@ -401,13 +384,23 @@ static int cmd_fit(int argc, char **argv) {
     if (*opt(argc, argv, "--steps", "")) { int k = 0; char *t = strdup(opt(argc, argv, "--steps", "")); for (char *q = strtok(t, ","); q && k < 8; q = strtok(nullptr, ",")) c.steps[k++] = atoi(q); for (; k < c.nstage; k++) c.steps[k] = c.steps[k - 1]; free(t); }
     nn_init(atoi(opt(argc, argv, "--gpu", "0")));
     const double t0 = now();
-    const char *min = opt(argc, argv, "--model", nullptr);   /* score / export a saved model instead of fitting */
-    fit_model *m = min ? fit_load(min) : fit_run(&ff, &c);
-    if (!m) { fprintf(stderr, "fit: no model%s%s\n", min ? " in " : "", min ? min : ""); return 1; }
-    fprintf(stderr, "fit: dir %+d, %d knots, lattice %d (%dx%dx%d), loss %.5f in %.1fs\n", m->dir, m->nk, m->L, m->lz, m->ly, m->lx, m->loss[0], now() - t0);
-    for (int d = 0; d < 3; d++) m->origin[d] = org[d];
+    const char *min = opt(argc, argv, "--model", nullptr);   /* score / export a saved model or set instead of fitting */
+    const int slab = atoi(opt(argc, argv, "--slab", "0")), overlap = atoi(opt(argc, argv, "--overlap", "256"));
+    fit_fields_buf fb; memset(&fb, 0, sizeof fb);
+    if (fit_fields_load(dir, 0, 0, min || slab > 0 ? 0 : 1, &fb)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }   /* (slab runs load per slab; a given model needs the geometry only) */
+    fit_set *fs = nullptr;
+    if (min) fs = fit_set_load(min);
+    else if (slab > 0) fs = fit_run_slabs(dir, &c, slab, overlap);
+    else { fs = calloc(1, sizeof *fs); fs->global = fit_run(&fb.f, &c); if (!fs->global) { free(fs); fs = nullptr; } }
+    if (!fs) { fprintf(stderr, "fit: no model%s%s\n", min ? " in " : "", min ? min : ""); return 1; }
+    const fit_model *m = fs->global;
+    if (!min && !slab) for (int d = 0; d < 3; d++) fs->global->origin[d] = fb.origin[d];
+    const long long org[3] = {m->origin[0], m->origin[1], m->origin[2]};
+    const int shp[3] = {fb.shape[0], fb.shape[1], fb.shape[2]}; const double h = fb.h;
+    const int na = (int)(shp[0] * h) + 1; const float *cy = fb.cy, *cx = fb.cx;
+    fprintf(stderr, "fit: dir %+d, %d slab model(s), global lattice %d (%dx%dx%d), loss %.5f in %.1fs\n", m->dir, fs->n, m->L, m->lz, m->ly, m->lx, m->loss[0], now() - t0);
     const char *mout = opt(argc, argv, "--out", nullptr);
-    if (mout && fit_save(m, mout)) { fprintf(stderr, "fit: cannot save %s\n", mout); return 1; }
+    if (mout && (fs->n ? fit_set_save(fs, mout) : fit_save(fs->global, mout))) { fprintf(stderr, "fit: cannot save %s\n", mout); return 1; }
     const char *wout = opt(argc, argv, "--winding", nullptr);
     if (wout) {   /* the per-voxel winding number W * 256 (uint16, exact volcomp typed chunks) on a grid of --winding-step native voxels */
         const int ws = atoi(opt(argc, argv, "--winding-step", "4")); const double um = atof(opt(argc, argv, "--um", "2.4"));
@@ -420,9 +413,9 @@ static int cmd_fit(int argc, char **argv) {
         uint16_t *sb = malloc((size_t)128 * 128 * 128 * 2);
         for (int64_t sz = 0; sz * 128 < gs[0]; sz++) for (int64_t sy = 0; sy * 128 < gs[1]; sy++) for (int64_t sx = 0; sx * 128 < gs[2]; sx++) {
             memset(sb, 0, (size_t)128 * 128 * 128 * 2);
-            for (int a = 0; a < 128 && sz * 128 + a < gs[0]; a++) for (int b = 0; b < 128 && sy * 128 + b < gs[1]; b++) for (int c = 0; c < 128 && sx * 128 + c < gs[2]; c++) {
-                const double W = fit_W(m, ((sz * 128 + a) + 0.5) * ws, ((sy * 128 + b) + 0.5) * ws, ((sx * 128 + c) + 0.5) * ws);
-                const double v = W * 256; sb[((size_t)a * 128 + b) * 128 + c] = (uint16_t)(v < 0 ? 0 : v > 65535 ? 65535 : lround(v));
+            for (int a = 0; a < 128 && sz * 128 + a < gs[0]; a++) for (int b = 0; b < 128 && sy * 128 + b < gs[1]; b++) for (int c2 = 0; c2 < 128 && sx * 128 + c2 < gs[2]; c2++) {
+                const double W = fit_set_W(fs, ((sz * 128 + a) + 0.5) * ws, ((sy * 128 + b) + 0.5) * ws, ((sx * 128 + c2) + 0.5) * ws);
+                const double v = W * 256; sb[((size_t)a * 128 + b) * 128 + c2] = (uint16_t)(v < 0 ? 0 : v > 65535 ? 65535 : lround(v));
             }
             if (z3w_write_shard(zw, sz, sy, sx, (const uint8_t *)sb, 8)) { fprintf(stderr, "fit: %s\n", z3w_error()); return 1; }
         }
@@ -445,7 +438,7 @@ static int cmd_fit(int argc, char **argv) {
             const double pz = 2.0 * (zz + lo[0]) + 0.5 - org[0], py = 2.0 * (yy + lo[1]) + 0.5 - org[1], px = 2.0 * (xx + lo[2]) + 0.5 - org[2];
             if (pz < 0 || py < 0 || px < 0 || pz > shp[0] * h || py > shp[1] * h || px > shp[2] * h) continue;
             const double cya = cy[(int)fmin(pz, na - 1)], cxa = cx[(int)fmin(pz, na - 1)];
-            const double U = fit_W(m, pz, py, px) + m->dir * atan2(py - cya, px - cxa) / (2 * M_PI);
+            const double U = fit_set_W(fs, pz, py, px) + m->dir * atan2(py - cya, px - cxa) / (2 * M_PI);
             double d = fmod(U - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14;
             if (dump) { const float rec[4] = {(float)pz, (float)py, (float)px, (float)d}; if (fwrite(rec, 4, 4, dump) != 4) { fclose(dump); dump = nullptr; } }
             dv[nd++] = (float)d; hist[(int)(d / 14 * NB) % NB]++;
@@ -464,7 +457,7 @@ static int cmd_fit(int argc, char **argv) {
         free(ae);
         free(codes); free(dv); z3_close(z); if (dump) fclose(dump);
     }
-    fit_free(m); for (int k = 0; k < 10; k++) free(a[k]); free(cy); free(cx);
+    fit_set_free(fs); fit_fields_free(&fb);
     return 0;
 }
 
@@ -475,7 +468,8 @@ static int cmd_fit(int argc, char **argv) {
    or (--fields) in a field voxel without data are -1. Coordinates are global native voxels. */
 static int cmd_wraps(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4]\n"); return 2; }
-    fit_model *m = fit_load(argv[2]); if (!m) { fprintf(stderr, "wraps: cannot load %s\n", argv[2]); return 1; }
+    fit_set *fs = fit_set_load(argv[2]); if (!fs) { fprintf(stderr, "wraps: cannot load %s\n", argv[2]); return 1; }
+    const fit_model *m = fs->global;   /* the box, the axis; rows dispatch to the slab model of their z */
     const double step = atof(opt(argc, argv, "--step", "8")), um = atof(opt(argc, argv, "--um", "2.4"));
     const double Z = m->D * m->h, Y = m->H * m->h, X = m->W * m->h;
     uint8_t *wf = nullptr;   /* optional: the fields' data weight */
@@ -486,7 +480,7 @@ static int cmd_wraps(int argc, char **argv) {
     }
     double wmin = 1e300, wmax = -1e300;   /* the wraps that meet the box */
     for (int a = 0; a <= 16; a++) for (int b = 0; b <= 16; b++) for (int c = 0; c <= 16; c++) {
-        const double w = fit_W(m, Z * a / 16, Y * b / 16, X * c / 16); if (w < wmin) wmin = w; if (w > wmax) wmax = w;
+        const double w = fit_set_W(fs, Z * a / 16, Y * b / 16, X * c / 16); if (w < wmin) wmin = w; if (w > wmax) wmax = w;
     }
     int k0 = (int)ceil(wmin), k1 = (int)floor(wmax);
     if (*opt(argc, argv, "--first", "")) { int f = atoi(opt(argc, argv, "--first", "")); if (f > k0) k0 = f; }
@@ -512,7 +506,7 @@ static int cmd_wraps(int argc, char **argv) {
         /* the wrap's radius at the box centre: the root along the central ray */
         const double zc = Z / 2, cyc = m->cy[(int)fmin(zc, na - 1)], cxc = m->cx[(int)fmin(zc, na - 1)];
         const double thc = atan2(Y / 2 - cyc, X / 2 - cxc); double rk;
-        if (fit_ray_root(m, zc, thc, k, hypot(Y / 2 - cyc, X / 2 - cxc), &rk)) rk = hypot(Y / 2 - cyc, X / 2 - cxc);
+        if (fit_set_ray_root(fs, zc, thc, k, hypot(Y / 2 - cyc, X / 2 - cxc), &rk)) rk = hypot(Y / 2 - cyc, X / 2 - cxc);
         const double dth = step / fmax(rk, step);
         const int cols = (int)ceil((th1 - th0) / dth) + 1;
         const size_t nv = (size_t)rows * cols;
@@ -524,7 +518,7 @@ static int cmd_wraps(int argc, char **argv) {
                 const size_t i = (size_t)r * cols + (cols - 1 - c);   /* column 0 = the largest theta side (upstream: outermost first) */
                 const double th = th0 + c * dth; double rr;
                 px[i] = py[i] = pz[i] = -1;
-                if (fit_ray_root(m, z, th, k, rprev, &rr)) continue;
+                if (fit_set_ray_root(fs, z, th, k, rprev, &rr)) continue;
                 const double y = cy + rr * sin(th), x = cx + rr * cos(th);
                 if (wf) {
                     const int fz = (int)fmin(z / m->h, m->D - 1), fy = (int)fmin(y / m->h, m->H - 1), fx = (int)fmin(x / m->h, m->W - 1);
@@ -541,7 +535,7 @@ static int cmd_wraps(int argc, char **argv) {
         free(px); free(py); free(pz);
     }
     fprintf(stderr, "wraps: %d wraps (%d..%d) with %zu vertices written to %s\n", nwr, k0, k1, nvalid_all, argv[3]);
-    fit_free(m); free(wf);
+    fit_set_free(fs); free(wf);
     return 0;
 }
 

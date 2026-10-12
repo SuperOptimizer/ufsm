@@ -123,8 +123,8 @@ $(B)/test_half: tests/test_half.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_unwrap_targets: tests/test_unwrap_targets.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-$(B)/test_fit: tests/test_fit.c $(B)/fit.o $(B)/json.o $(B)/nn.o $(B)/nn_fp8.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/test_fit: tests/test_fit.c $(B)/fit.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_tiffw: tests/test_tiffw.c $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 $(B)/test_infer_mem: tests/test_infer_mem.c $(B)/unet.o $(B)/split.o $(B)/nn.o $(B)/nn_fp8.o

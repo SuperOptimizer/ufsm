@@ -3,6 +3,8 @@
 #include "fit.h"
 #include "nn.h"
 #include "json.h"
+#include "zarr3.h"
+#include "store.h"
 #include <complex.h>
 #include <math.h>
 #include <stdio.h>
@@ -50,12 +52,14 @@ static double lattice_at(const float *d, int L, int lz, int ly, int lx, double z
     }
     return s;
 }
-double fit_W(const fit_model *m, double z, double y, double x) {
+static double fit_base(const fit_model *m, double z, double y, double x, double *th) {   /* r / pitch + offset; theta */
     const int na = (int)(m->D * m->h) + 1;
     const double cy = axis_lerp(m->cy, na, z), cx = axis_lerp(m->cx, na, z);
-    const double r = hypot(y - cy, x - cx), th = atan2(y - cy, x - cx);
-    const double U = r / knot_lerp(m->pitch, m->nk, m->knot_dz, z) + knot_lerp(m->offset, m->nk, m->knot_dz, z) +
-                     lattice_at(m->delta, m->L, m->lz, m->ly, m->lx, z, y, x);
+    *th = atan2(y - cy, x - cx);
+    return hypot(y - cy, x - cx) / knot_lerp(m->pitch, m->nk, m->knot_dz, z) + knot_lerp(m->offset, m->nk, m->knot_dz, z);
+}
+double fit_W(const fit_model *m, double z, double y, double x) {
+    double th; const double U = fit_base(m, z, y, x, &th) + lattice_at(m->delta, m->L, m->lz, m->ly, m->lx, z, y, x);
     return U - m->dir * th / (2 * M_PI);
 }
 
@@ -167,10 +171,19 @@ int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
     return 0;
 }
 
-static float *prolong(const fit_model *m, int L, int lz, int ly, int lx) {   /* old delta at the new lattice nodes */
+static float *prolong(const fit_model *m, int L, int lz, int ly, int lx, const fit_cfg *c) {   /* old delta at the new lattice nodes */
     float *d = calloc((size_t)lz * ly * lx, sizeof(float));
     if (m->delta) for (int a = 0; a < lz; a++) for (int b = 0; b < ly; b++) for (int e = 0; e < lx; e++)
         d[((size_t)a * ly + b) * lx + e] = (float)lattice_at(m->delta, m->L, m->lz, m->ly, m->lx, (double)a * L, (double)b * L, (double)e * L);
+    else if (c && c->init) {   /* the first stage from a given model: delta = its U minus this model's base at the nodes, so that U
+                                 starts equal to the model's (knots interpolated differently, axis tables of different extent) */
+        const fit_model *g = c->init; double th;
+        for (int a = 0; a < lz; a++) for (int b = 0; b < ly; b++) for (int e = 0; e < lx; e++) {
+            const double z = (double)a * L, y = (double)b * L, x = (double)e * L, zg = z + c->init_off[0], yg = y + c->init_off[1], xg = x + c->init_off[2];
+            const double Ug = fit_base(g, zg, yg, xg, &th) + lattice_at(g->delta, g->L, g->lz, g->ly, g->lx, zg, yg, xg);
+            d[((size_t)a * ly + b) * lx + e] = (float)(Ug - fit_base(m, z, y, x, &th));
+        }
+    }
     return d;
 }
 
@@ -192,7 +205,7 @@ static fit_heap_e heap_pop(fit_heap_e *h, int *n) {
    voxel is ~0.1 turn); the seed takes the integer nearest the current model. Then per lattice node the mean of (U_unwrapped -
    U_model) over its voxels (no integer ambiguity left) is added to delta; nodes without voxels get their neighbours' mean.
    Returns the number of voxels reached. */
-static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_conf) {
+static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_conf, const fit_cfg *c) {
     const size_t n = (size_t)f->D * f->H * f->W; const int na = (int)(f->D * f->h) + 1;
     float *uw = malloc(n * sizeof(float)), *q = malloc(n * sizeof(float)); double *Uv = malloc(n * sizeof(double)); uint8_t *vis = calloc(n, 1);
     size_t seed = (size_t)-1; float qbest = 0;
@@ -211,12 +224,22 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
     size_t reached = 0;
     if (seed != (size_t)-1) {
         fit_heap_e *hp = malloc(n * sizeof *hp); int hn = 0;
-        { const int z = (int)(seed / ((size_t)f->H * f->W)), y = (int)((seed / f->W) % f->H), x = (int)(seed % f->W);
+        if (c->seed) for (size_t i = 0; i < n; i++) {   /* the seed model's region: its integers */
+            const int z = (int)(i / ((size_t)f->H * f->W)), y = (int)((i / f->W) % f->H), x = (int)(i % f->W);
+            const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (x + 0.5) * f->h;
+            if (q[i] <= 0 || pz >= c->seed_z) continue;
+            const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
+            const double Us = fit_W(c->seed, pz + c->seed_off, py, px) + m->dir * th / (2 * M_PI);
+            Uv[i] = uw[i] + round(Us - uw[i]); vis[i] = 1; reached++; heap_push(hp, &hn, (fit_heap_e){q[i], (int)i});
+        }
+        if (!reached) {
+          const int z = (int)(seed / ((size_t)f->H * f->W)), y = (int)((seed / f->W) % f->H), x = (int)(seed % f->W);
           const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (x + 0.5) * f->h;
           const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
           const double Um = fit_W(m, pz, py, px) + m->dir * th / (2 * M_PI);
-          Uv[seed] = uw[seed] + round(Um - uw[seed]); }
-        vis[seed] = 1; reached = 1; heap_push(hp, &hn, (fit_heap_e){q[seed], (int)seed});
+          Uv[seed] = uw[seed] + round(Um - uw[seed]);
+          vis[seed] = 1; reached = 1; heap_push(hp, &hn, (fit_heap_e){q[seed], (int)seed});
+        }
         while (hn) {
             const fit_heap_e e = heap_pop(hp, &hn); const size_t i = (size_t)e.i;
             const int z = (int)(i / ((size_t)f->H * f->W)), y = (int)((i / f->W) % f->H), x = (int)(i % f->W);
@@ -350,7 +373,16 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
     const int na = (int)(f->D * f->h) + 1;
     m->cy = malloc(na * sizeof(float)); m->cx = malloc(na * sizeof(float));
     memcpy(m->cy, f->cy, na * sizeof(float)); memcpy(m->cx, f->cx, na * sizeof(float));
-    if (fit_init_prior(f, c, m)) { fit_free(m); return nullptr; }
+    if (c->init) {   /* the given model's direction and knots (sampled at this box's knot positions) */
+        m->dir = c->init->dir; m->dir_vote = 1; m->knot_dz = c->knot_dz;
+        m->nk = (int)ceil(f->D * f->h / c->knot_dz) + 1; if (m->nk < 2) m->nk = 2;
+        m->pitch = calloc(m->nk, sizeof(float)); m->offset = calloc(m->nk, sizeof(float));
+        for (int k = 0; k < m->nk; k++) {
+            const double zg = (double)k * c->knot_dz + c->init_off[0];
+            m->pitch[k] = (float)knot_lerp(c->init->pitch, c->init->nk, c->init->knot_dz, zg);
+            m->offset[k] = (float)knot_lerp(c->init->offset, c->init->nk, c->init->knot_dz, zg);
+        }
+    } else if (fit_init_prior(f, c, m)) { fit_free(m); return nullptr; }
     const size_t n = (size_t)f->D * f->H * f->W;
     size_t ndata = 0; for (size_t i = 0; i < n; i++) ndata += f->w[i] != 0;
     uint8_t *dpc = nn_malloc(n), *dps = nn_malloc(n), *dt = nn_malloc(6 * n), *dsp = nn_malloc(n), *dw = nn_malloc(n);
@@ -370,11 +402,11 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
         const double tst = nn_wall_seconds();
         const int L = c->lattice[st], lz = (int)ceil(f->D * f->h / L) + 1, ly = (int)ceil(f->H * f->h / L) + 1, lx = (int)ceil(f->W * f->h / L) + 1;
         const size_t nl = (size_t)lz * ly * lx;
-        float *hd = prolong(m, L, lz, ly, lx);
+        float *hd = prolong(m, L, lz, ly, lx, c);
         free(m->delta); m->delta = hd; m->L = L; m->lz = lz; m->ly = ly; m->lx = lx;
         if (st == c->phase_stage) {   /* the current knots too: W reads them */
             nn_d2h(m->pitch, dpi, nk * 4); nn_d2h(m->offset, dof, nk * 4);
-            if (c->unwrap_voxels) { const size_t rch = fit_unwrap_voxels(m, f, 0.3); if (c->verbose) fprintf(stderr, "fit: voxel unwrapping reached %zu field voxels\n", rch); }
+            if (c->unwrap_voxels) { const size_t rch = fit_unwrap_voxels(m, f, 0.3, c); if (c->verbose) fprintf(stderr, "fit: voxel unwrapping reached %zu field voxels\n", rch); }
             else fit_unwrap_init(m, f, 0.3);
         }
         float *dd = nn_malloc(nl * 4), *gd = nn_malloc(nl * 4), *md = nn_malloc(nl * 4), *vd = nn_malloc(nl * 4), *lap = nn_malloc(nl * 4);
@@ -492,7 +524,8 @@ fit_model *fit_load(const char *dir) {
     return m;
 }
 
-int fit_ray_root(const fit_model *m, double z, double theta, double k, double r_hint, double *r) {
+/* the root of W = k along the ray (theta) from the axis nearest r_hint, W evaluated by ev; the axis, box and pitch of m */
+static int ray_root(double (*ev)(const void *, double, double, double), const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double *r) {
     const int na = (int)(m->D * m->h) + 1;
     const double cy = axis_lerp(m->cy, na, z), cx = axis_lerp(m->cx, na, z), sy = sin(theta), sx = cos(theta);
     const double Y = m->H * m->h, X = m->W * m->h;
@@ -506,13 +539,13 @@ int fit_ray_root(const fit_model *m, double z, double theta, double k, double r_
     }
     if (rhi <= rlo) return -1;
     const double pit = knot_lerp(m->pitch, m->nk, m->knot_dz, z), dr = pit / 4;
-    double best = -1, bestd = 1e300, rp = rlo, fp = fit_W(m, z, cy + rlo * sy, cx + rlo * sx) - k;
+    double best = -1, bestd = 1e300, rp = rlo, fp = ev(ctx, z, cy + rlo * sy, cx + rlo * sx) - k;
     for (double rr = rlo + dr; rp < rhi; rr += dr) {
         if (rr > rhi) rr = rhi;
-        const double fr = fit_W(m, z, cy + rr * sy, cx + rr * sx) - k;
+        const double fr = ev(ctx, z, cy + rr * sy, cx + rr * sx) - k;
         if ((fp < 0) != (fr < 0) && fabs(fp - fr) < 0.5) {   /* a crossing (not the theta cut of a nearby ray: |jump| < half a turn) */
             double a = rp, b = rr, fa = fp;
-            for (int it = 0; it < 40; it++) { const double mid = 0.5 * (a + b), fm = fit_W(m, z, cy + mid * sy, cx + mid * sx) - k; if ((fa < 0) == (fm < 0)) { a = mid; fa = fm; } else b = mid; }
+            for (int it = 0; it < 40; it++) { const double mid = 0.5 * (a + b), fm = ev(ctx, z, cy + mid * sy, cx + mid * sx) - k; if ((fa < 0) == (fm < 0)) { a = mid; fa = fm; } else b = mid; }
             const double root = 0.5 * (a + b);
             if (fabs(root - r_hint) < bestd) { bestd = fabs(root - r_hint); best = root; }
         }
@@ -523,6 +556,8 @@ int fit_ray_root(const fit_model *m, double z, double theta, double k, double r_
     *r = best;
     return 0;
 }
+static double ev_model(const void *m, double z, double y, double x) { return fit_W(m, z, y, x); }
+int fit_ray_root(const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root(ev_model, m, m, z, theta, k, r_hint, r); }
 
 int fit_fields_save(const char *dir, const long long origin[3], const int shape[3], int h, uint8_t *const a[10], const float *cy, const float *cx, int na) {
     static const char *nm[10] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w"};
@@ -538,4 +573,210 @@ int fit_fields_save(const char *dir, const long long origin[3], const int shape[
     for (int z = 0; z < na; z++) fprintf(f, "%s[%.3f, %.3f]", z ? ", " : "", cy[z], cx[z]);
     fprintf(f, "]}\n");
     return fclose(f) ? -1 : 0;
+}
+
+static json *read_json_file(const char *path) {
+    FILE *f = fopen(path, "rb"); if (!f) return nullptr;
+    fseek(f, 0, SEEK_END); const size_t n = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
+    char *t = malloc(n + 1); if (fread(t, 1, n, f) != n) { fclose(f); free(t); return nullptr; } fclose(f); t[n] = 0;
+    json *j = json_parse(t, n); free(t); return j;
+}
+void fit_fields_free(fit_fields_buf *b) { for (int k = 0; k < 10; k++) free(b->a[k]); free(b->cy); free(b->cx); memset(b, 0, sizeof *b); }
+int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b) {
+    static const char *nm[10] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w"};
+    memset(b, 0, sizeof *b);
+    char path[1400]; snprintf(path, sizeof path, "%s/fields.json", dir);
+    json *j = read_json_file(path); if (!j) { fprintf(stderr, "fit: cannot read %s\n", path); return -1; }
+    int shp[3]; long long org[3];
+    for (int d = 0; d < 3; d++) { org[d] = (long long)json_num(json_at(json_get(j, "origin"), d), 0); shp[d] = (int)json_num(json_at(json_get(j, "shape"), d), 0); }
+    const int h = (int)json_num(json_get(j, "h"), 8), zarr = !strcmp(json_str(json_get(j, "format"), "raw"), "zarr");
+    if (fz1 <= 0 || fz1 > shp[0]) fz1 = shp[0];
+    if (fz0 < 0) fz0 = 0;
+    if (pool == 0) {   /* the geometry and the whole axis table only */
+        const json *axj = json_get(j, "axis"); const int nat = axj ? (int)axj->n : 0, na = (int)((double)shp[0] * h) + 1;
+        b->cy = malloc(na * sizeof(float)); b->cx = malloc(na * sizeof(float));
+        for (int z = 0; z < na; z++) { const int zi = z < nat ? z : nat - 1; b->cy[z] = (float)json_num(json_at(json_at(axj, zi), 0), 0); b->cx[z] = (float)json_num(json_at(json_at(axj, zi), 1), 0); }
+        json_free(j);
+        b->h = h; for (int d = 0; d < 3; d++) { b->shape[d] = shp[d]; b->origin[d] = org[d]; }
+        b->f = (fit_fields){shp[0], shp[1], shp[2], (double)h, nullptr, nullptr, {0}, nullptr, nullptr, b->cy, b->cx};
+        return 0;
+    }
+    if (fz0 >= fz1 || pool < 1) { json_free(j); return -1; }
+    const json *axj = json_get(j, "axis"); const int nat = axj ? (int)axj->n : 0;
+    const int D = fz1 - fz0, H = shp[1], W = shp[2], Dp = (D + pool - 1) / pool, Hp = (H + pool - 1) / pool, Wp = (W + pool - 1) / pool;
+    const int na = (int)((double)Dp * pool * h) + 1;   /* the slab's axis table (native z from fz0 h) */
+    b->cy = malloc(na * sizeof(float)); b->cx = malloc(na * sizeof(float));
+    for (int z = 0; z < na; z++) {
+        int zi = fz0 * h + z; if (zi > nat - 1) zi = nat - 1; if (zi < 0) zi = 0;
+        b->cy[z] = (float)json_num(json_at(json_at(axj, zi), 0), 0); b->cx[z] = (float)json_num(json_at(json_at(axj, zi), 1), 0);
+    }
+    json_free(j);
+    const size_t np = (size_t)Dp * Hp * Wp, plane = (size_t)H * W;
+    for (int k = 0; k < 10; k++) b->a[k] = calloc(np, 1);
+    /* read in z-blocks of `pool` rows (or 64 when not pooling), pool each block into the output rows */
+    const int zb = pool > 1 ? pool : 64;
+    uint8_t *blk[10]; for (int k = 0; k < 10; k++) blk[k] = malloc((size_t)zb * plane);
+    z3 *za[10] = {0}; FILE *fr[10] = {0};
+    for (int k = 0; k < 10; k++) {
+        if (zarr) { snprintf(path, sizeof path, "%s/%s", dir, nm[k]); za[k] = z3_open(store_open(dir), nm[k], nullptr); }
+        else { snprintf(path, sizeof path, "%s/%s.raw", dir, nm[k]); fr[k] = fopen(path, "rb"); }
+        if ((zarr && !za[k]) || (!zarr && !fr[k])) { fprintf(stderr, "fit: cannot open %s\n", path); return -1; }
+    }
+    fit_fields src = {0}; src.h = h;
+    for (int z0 = fz0; z0 < fz1; z0 += zb) {
+        const int nz = z0 + zb <= fz1 ? zb : fz1 - z0;
+        for (int k = 0; k < 10; k++) {
+            if (zarr) { const int64_t o[3] = {z0, 0, 0}, n[3] = {nz, H, W}; if (z3_read(za[k], o, n, blk[k], 8)) { fprintf(stderr, "fit: %s\n", z3_error()); return -1; } }
+            else if (fseek(fr[k], (long)((size_t)z0 * plane), SEEK_SET) || fread(blk[k], 1, (size_t)nz * plane, fr[k]) != (size_t)nz * plane) { fprintf(stderr, "fit: short read\n"); return -1; }
+        }
+        if (pool == 1) { for (int k = 0; k < 10; k++) memcpy(b->a[k] + (size_t)(z0 - fz0) * plane, blk[k], (size_t)nz * plane); continue; }
+        src.D = nz; src.H = H; src.W = W; src.pc = blk[0]; src.ps = blk[1]; for (int t = 0; t < 6; t++) src.t[t] = blk[2 + t]; src.sp = blk[8]; src.w = blk[9];
+        fit_pooled pp = fit_pool(&src, pool);   /* one output row */
+        const int zo = (z0 - fz0) / pool;
+        for (int k = 0; k < 10; k++) { memcpy(b->a[k] + (size_t)zo * Hp * Wp, pp.a[k], (size_t)pp.H * pp.W); free(pp.a[k]); }
+    }
+    for (int k = 0; k < 10; k++) { free(blk[k]); if (za[k]) z3_close(za[k]); if (fr[k]) fclose(fr[k]); }
+    b->h = h * pool; b->shape[0] = Dp; b->shape[1] = Hp; b->shape[2] = Wp;
+    b->origin[0] = org[0] + (long long)fz0 * h; b->origin[1] = org[1]; b->origin[2] = org[2];
+    b->f = (fit_fields){Dp, Hp, Wp, (double)b->h, b->a[0], b->a[1], {b->a[2], b->a[3], b->a[4], b->a[5], b->a[6], b->a[7]}, b->a[8], b->a[9], b->cy, b->cx};
+    return 0;
+}
+
+/* ---- a fit set: the global model plus z-slab models (ufsm fit --slab) ---- */
+const fit_model *fit_set_model(const fit_set *s, double z, double *zoff) {   /* the model whose interior holds box-local z */
+    for (int k = 0; k < s->n; k++) if (z >= s->z0[k] && z < s->z1[k]) { *zoff = (double)(s->slab[k]->origin[0] - s->global->origin[0]); return s->slab[k]; }
+    *zoff = 0; return s->global;
+}
+static double slab_W(const fit_set *s, int k, double z, double y, double x) { return fit_W(s->slab[k], z - (double)(s->slab[k]->origin[0] - s->global->origin[0]), y, x); }
+double fit_set_W(const fit_set *s, double z, double y, double x) {   /* blended linearly over +-blend around each slab boundary */
+    for (int k = 0; k < s->n; k++) {
+        if (z < s->z0[k] || z >= s->z1[k]) continue;
+        if (k > 0 && s->blend > 0 && z < s->z0[k] + s->blend) { const double t = (z - s->z0[k] + s->blend) / (2 * s->blend); return (1 - t) * slab_W(s, k - 1, z, y, x) + t * slab_W(s, k, z, y, x); }
+        if (k + 1 < s->n && s->blend > 0 && z >= s->z1[k] - s->blend) { const double t = (z - s->z1[k] + s->blend) / (2 * s->blend); return (1 - t) * slab_W(s, k, z, y, x) + t * slab_W(s, k + 1, z, y, x); }
+        return slab_W(s, k, z, y, x);
+    }
+    return fit_W(s->global, z, y, x);
+}
+static double ev_set(const void *s, double z, double y, double x) { return fit_set_W(s, z, y, x); }
+int fit_set_ray_root(const fit_set *s, double z, double theta, double k, double r_hint, double *r) { return ray_root(ev_set, s, s->global, z, theta, k, r_hint, r); }
+int fit_set_save(const fit_set *s, const char *dir) {
+    char p[1400]; snprintf(p, sizeof p, "%s/global", dir);
+    if (fit_save(s->global, p)) return -1;
+    snprintf(p, sizeof p, "%s/set.json", dir);
+    FILE *f = fopen(p, "w"); if (!f) return -1;
+    fprintf(f, "{\"global\": \"global\", \"slabs\": [");
+    for (int k = 0; k < s->n; k++) {
+        char sd[1400]; snprintf(sd, sizeof sd, "%s/slab%03d", dir, k);
+        if (fit_save(s->slab[k], sd)) { fclose(f); return -1; }
+        fprintf(f, "%s{\"dir\": \"slab%03d\", \"z0\": %.3f, \"z1\": %.3f}", k ? ", " : "", k, s->z0[k], s->z1[k]);
+    }
+    fprintf(f, "], \"blend\": %.3f}\n", s->blend);
+    return fclose(f) ? -1 : 0;
+}
+fit_set *fit_set_load(const char *dir) {
+    char p[1400]; snprintf(p, sizeof p, "%s/set.json", dir);
+    fit_set *s = calloc(1, sizeof *s);
+    json *j = read_json_file(p);
+    if (!j) {   /* a single model directory */
+        s->global = fit_load(dir);
+        if (!s->global) { free(s); return nullptr; }
+        return s;
+    }
+    snprintf(p, sizeof p, "%s/%s", dir, json_str(json_get(j, "global"), "global"));
+    s->global = fit_load(p); s->blend = json_num(json_get(j, "blend"), 0);
+    const json *sl = json_get(j, "slabs"); s->n = sl ? (int)sl->n : 0;
+    s->slab = calloc(s->n + 1, sizeof *s->slab); s->z0 = calloc(s->n + 1, sizeof(double)); s->z1 = calloc(s->n + 1, sizeof(double));
+    for (int k = 0; k < s->n; k++) {
+        const json *e = json_at(sl, k);
+        snprintf(p, sizeof p, "%s/%s", dir, json_str(json_get(e, "dir"), ""));
+        s->slab[k] = fit_load(p); s->z0[k] = json_num(json_get(e, "z0"), 0); s->z1[k] = json_num(json_get(e, "z1"), 0);
+        if (!s->slab[k]) { json_free(j); fit_set_free(s); return nullptr; }
+    }
+    json_free(j);
+    if (!s->global) { fit_set_free(s); return nullptr; }
+    return s;
+}
+void fit_set_free(fit_set *s) {
+    if (!s) return;
+    fit_free(s->global); for (int k = 0; k < s->n; k++) fit_free(s->slab[k]);
+    free(s->slab); free(s->z0); free(s->z1); free(s);
+}
+
+/* Slab driver: the global coarse fit on fields pooled to ~64 native voxels (gradient terms, lattices 512 / 256 / 128), then per
+   z-slab of slab native voxels (+ overlap on both sides) the fine fit (lattices 64 / 32, phase from the start with the voxel
+   unwrapping) started from the global model; each slab's integer gauge is aligned to the previous slab's on their overlap. */
+fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap) {
+    fit_fields_buf all; char p[1400]; snprintf(p, sizeof p, "%s/fields.json", dir);
+    json *j = read_json_file(p); if (!j) return nullptr;
+    const int h = (int)json_num(json_get(j, "h"), 8), D = (int)json_num(json_at(json_get(j, "shape"), 0), 0);
+    json_free(j);
+    int pool = 1; while (2 * pool * h <= 64) pool *= 2;
+    if (fit_fields_load(dir, 0, 0, pool, &all)) return nullptr;
+    /* the prior from full-resolution rows, slab by slab: knots at the global knot positions (slabs start on them), offsets made
+       continuous across slabs, the direction from the summed ring votes */
+    const int nkg = (int)ceil((double)all.shape[0] * all.h / c->knot_dz) + 1;
+    fit_model P = {0}; P.knot_dz = c->knot_dz; P.nk = nkg < 2 ? 2 : nkg;
+    P.pitch = calloc(P.nk, sizeof(float)); P.offset = calloc(P.nk, sizeof(float)); uint8_t *have = calloc(P.nk, 1);
+    double vote = 0;
+    if (slab % c->knot_dz) { fprintf(stderr, "fit slabs: --slab must be a multiple of the knot spacing %d\n", c->knot_dz); fit_fields_free(&all); return nullptr; }
+    for (int z0 = 0; z0 < D * h; z0 += slab) {
+        fit_fields_buf cb; const int fz0 = z0 / h, fz1 = (int)fmin(D, ceil((double)(z0 + slab) / h));
+        if (fit_fields_load(dir, fz0, fz1, 1, &cb)) { fit_fields_free(&all); return nullptr; }
+        fit_model tmp = {0}; fit_cfg cp = *c; cp.verbose = 0;
+        if (!fit_init_prior(&cb.f, &cp, &tmp)) {
+            vote += tmp.dir * tmp.dir_vote;
+            for (int k = 0; k < tmp.nk; k++) { const int kg = z0 / c->knot_dz + k; if (kg < P.nk && !have[kg]) { P.pitch[kg] = tmp.pitch[k]; P.offset[kg] = tmp.offset[k]; have[kg] = 1; } }
+        }
+        free(tmp.pitch); free(tmp.offset); fit_fields_free(&cb);
+    }
+    { int first = -1; for (int k = 0; k < P.nk; k++) if (have[k]) { first = k; break; }
+      if (first < 0) { fprintf(stderr, "fit slabs: no data for the prior\n"); fit_fields_free(&all); return nullptr; }
+      double po = P.offset[first], pp = P.pitch[first];
+      for (int k = 0; k < P.nk; k++) { if (!have[k]) { P.pitch[k] = (float)pp; P.offset[k] = (float)po; } P.offset[k] += (float)round(po - P.offset[k]); po = P.offset[k]; pp = P.pitch[k]; } }
+    free(have);
+    P.dir = c->dir ? c->dir : (vote > 0 ? 1 : -1);   /* the prior's dir_vote sign convention: dir * |vote| */
+    P.L = 1 << 20; P.lz = P.ly = P.lx = 2; P.delta = calloc(8, sizeof(float));   /* delta 0 */
+    P.D = all.shape[0]; P.H = all.shape[1]; P.W = all.shape[2]; P.h = all.h; P.cy = all.cy; P.cx = all.cx;
+    if (c->verbose) fprintf(stderr, "fit slabs: prior dir %+d (vote %.2f), pitch %.1f..%.1f over %d knots\n", P.dir, vote, P.pitch[0], P.pitch[P.nk - 1], P.nk);
+    fit_cfg cg = *c; cg.nstage = 3; cg.lattice[0] = 512; cg.lattice[1] = 256; cg.lattice[2] = 128; cg.phase_stage = 3; cg.init = &P; cg.init_off[0] = cg.init_off[1] = cg.init_off[2] = 0; cg.dir = P.dir;
+    for (int k = 0; k < 3; k++) cg.steps[k] = c->steps[0];
+    if (c->verbose) fprintf(stderr, "fit slabs: global coarse fit on fields pooled by %d (%dx%dx%d, h %d)\n", pool, all.shape[0], all.shape[1], all.shape[2], all.h);
+    fit_set *s = calloc(1, sizeof *s); s->blend = overlap / 2.0;
+    s->global = fit_run(&all.f, &cg);
+    free(P.pitch); free(P.offset); free(P.delta);
+    if (!s->global) { fit_fields_free(&all); free(s); return nullptr; }
+    for (int d = 0; d < 3; d++) s->global->origin[d] = all.origin[d];
+    fit_fields_free(&all);
+    const double Z = (double)D * h; const int ns = (int)ceil(Z / slab);
+    s->slab = calloc(ns, sizeof *s->slab); s->z0 = calloc(ns, sizeof(double)); s->z1 = calloc(ns, sizeof(double));
+    for (int k = 0; k < ns; k++) {
+        const double zi0 = (double)k * slab, zi1 = fmin(Z, zi0 + slab);
+        const int fz0 = (int)fmax(0, floor((zi0 - overlap) / h)), fz1 = (int)fmin(D, ceil((zi1 + overlap) / h));
+        fit_fields_buf sb;
+        if (fit_fields_load(dir, fz0, fz1, 1, &sb)) { fit_set_free(s); return nullptr; }
+        fit_cfg cs = *c; cs.init = s->global; cs.init_off[0] = (double)fz0 * h; cs.init_off[1] = cs.init_off[2] = 0; cs.dir = s->global->dir;
+        if (k > 0) {   /* the flood continues from the previous slab's interior (the overlap below zi0) */
+            cs.seed = s->slab[k - 1]; cs.seed_off = (double)(fz0 * h) - (double)(s->slab[k - 1]->origin[0] - s->global->origin[0]); cs.seed_z = zi0 - (double)fz0 * h;
+        }
+        cs.nstage = 2; cs.lattice[0] = 64; cs.lattice[1] = 32; cs.phase_stage = 0; cs.steps[0] = cs.steps[1] = c->steps[c->nstage > 4 ? 4 : 0];
+        if (c->verbose) fprintf(stderr, "fit slabs: slab %d of %d, native z [%.0f, %.0f) with fields [%d, %d)\n", k + 1, ns, zi0, zi1, fz0, fz1);
+        fit_model *m = fit_run(&sb.f, &cs);
+        if (!m) { fit_fields_free(&sb); fit_set_free(s); return nullptr; }
+        for (int d = 0; d < 3; d++) m->origin[d] = sb.origin[d];
+        if (k > 0) {   /* the integer gauge: the median rounded difference to the previous slab on the overlap */
+            const fit_model *pm = s->slab[k - 1]; int hist[21] = {0};
+            const double zlo = fmax(zi0 - overlap, 0), zhi = fmin(zi0 + overlap, Z), Y = sb.shape[1] * (double)h, X = sb.shape[2] * (double)h;
+            for (int t = 0; t < 4000; t++) {
+                const double z = zlo + (zhi - zlo) * ((t * 0.6180339887) - floor(t * 0.6180339887)), y = Y * ((t * 0.7548776662) - floor(t * 0.7548776662)), x = X * ((t * 0.5698402910) - floor(t * 0.5698402910));
+                const long dk = lround(fit_W(m, z - (m->origin[0] - s->global->origin[0]), y, x) - fit_W(pm, z - (pm->origin[0] - s->global->origin[0]), y, x));
+                if (dk >= -10 && dk <= 10) hist[dk + 10]++;
+            }
+            int best = 10; for (int q = 0; q < 21; q++) if (hist[q] > hist[best]) best = q;
+            const int shift = best - 10;
+            if (shift) { for (int q = 0; q < m->nk; q++) m->offset[q] -= (float)shift; if (c->verbose) fprintf(stderr, "fit slabs: slab %d gauge shifted by %d to match slab %d\n", k + 1, -shift, k); }
+        }
+        s->slab[k] = m; s->z0[k] = zi0; s->z1[k] = zi1; s->n = k + 1;
+        fit_fields_free(&sb);
+    }
+    return s;
 }
