@@ -321,8 +321,14 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   just wider): the network phase misses ~3-4 turns across the block's 7 mm radial span, mostly in packed regions (29% gross
   phase errors where the sheets are < 100 um apart, 5-10 voxels per turn at 9.6 um), and the fit follows it. A region-vote
   unwrapping (regions along model-checked reliable steps, offsets decided by weighted votes over whole region boundaries,
-  merged in order of decisiveness) changed nothing (82.2 / 53.6%; not kept): the errors are not path slips. Next: a 4.8 um
-  winding net (20+ voxels per packed turn; the blocks' stored phase is native 4.8 um).
+  merged in order of decisiveness) changed nothing (82.2 / 53.6%; not kept): the errors are not path slips.
+  A 4.8 um winding net (24 blocks, P128 = 614 um, level-1 draws, normal step 2, density scale 16, 96k steps, 66 min): B 43.9%,
+  A 41.8%, phase gross errors 25.5%, confidence 0.14: undertrained like the 2.4 um net, with the same radial under-count. Down-
+  weighting the phase where the fields' spacing is packed (ramp to 0.1 below a threshold, those voxels out of the integer
+  unwrapping, so density and normals count the turns there): no gain at 100 / 140 um, worse at 180 um (B 83.7 -> 53.2% for the
+  9-block net; not kept): the network density under-counts in the same places. Three fitter-side remedies failed, so the
+  winding accuracy is bounded by the network's view of packed sheets; the lever is the network (desk-scale data and steps,
+  and losses that weight packed regions).
 - `ufsm phase-raster --pool 2` writes only the 2x circular-mean pooled phase (<out>/9.6, shards of 256: one per 4.8 um shard
   of 512); `--resume 1` skips written shards. A whole-scroll Paris4 phase at 4.8 um would be ~326 GB (25 MB per shard, 13054
   shards; the desk has 317 GB free), at 9.6 um ~65 GB. Block B: identical known / unknown masks to phase-raster + downsample,
