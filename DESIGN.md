@@ -268,6 +268,21 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   CT renders show papyrus fibres. The coarser net sees 4x the physical context per patch, which plausibly helps counting
   sheets in packed regions; whether winding fields from 9.6 beat 2.4 out of sample is open (needs band codes beyond the smoke
   block: on the desk).
+- Out of sample (block B: native 49408,16576,14336 + 1792x1856x2048, the block above the smoke block in z; 8 band-code shards
+  copied read-only from the desk, its stored phase 203 s on 4 threads, 6 GB): the oracle fit (band fields) 98.5% winding ids,
+  |error| median 0.029 turn, so block B is a fair test; the smoke-trained nets 43.5% (2.4 um) and 43.7% (9.6 um): both
+  overfit their single training block (their in-sample 90.9 / 94.6% say little). The networks need many blocks (the desk run on
+  all of Paris4); a laptop check at 9.6 um trains on 8 more blocks spread over the scroll (prep_blocks_9p6.sh).
+  8 blocks of 2x2x2 band-code shards (2048^3 native each, shard indices multiples of 4 in distinct z groups so no two blocks
+  share a shard at any level; codes 457 MB copied read-only; stored phase ~185 s per block on 4 threads; 9.6 phase / labels by
+  ufsm downsample) + the smoke block, 9.6 um, P128: 12k steps (8 min) 33.3% on B, 45.7% on A; 48k steps (33 min) 83.7% on B
+  (out of sample), 54.2% on A (A's oracle is 94.5%: thin labels). Training length is the lever. The phase BCE has an entropy
+  floor of 0.386 nats (soft cos / sin targets), so the training phase loss (0.40-0.45) says little; judge by fits. Network vs
+  oracle fields on B (12k net): phase |error| median 0.087 turn, 14% of cells > 1/4 turn off (35% where the sheets are < 100 um
+  apart, 8-12% elsewhere; 32% at network phase confidence < 0.2, 4% above 0.6), spacing ratio median 1.04 (p10-p90 0.73-1.51),
+  normals median 5 degrees. Fitter knobs do not rescue bad phase: gradient-only fits 27% (oracle fields: 53%, so the phase is
+  essential), node unwrapping 41%, flood confidence thresholds 0.2-0.6 no gain, a model-referenced phase-consistency quality
+  map +3 to +7 points (not kept).
 - Left: BigTIFF for renders over 4 GB compressed; 9.6 um training on all of Paris4 (desk band codes); the desk runs.
 
 ## Half-resolution networks (2026-10-11)
