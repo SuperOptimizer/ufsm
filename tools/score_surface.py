@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sheet_connectivity import analyse, pool2, read, UFSM
 from sheet_diagnostics import binary_scores
 
-ROOT = '/vesuvius/usrm/volcomp'
+ROOT = '/vesuvius/ufsm/volcomp'
 CT = 'PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr'
 LABELS = '/vesuvius/ufsm/gt/paris4-sheet-20261003/training-4p8.zarr'
 AXIS = '/vesuvius/ufsm/runs/noisy-labels-20261005/axis-0.json'

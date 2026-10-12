@@ -24,7 +24,7 @@ from sheet_connectivity import read, UFSM
 from band_field import instances as ref_instances
 from label_grid import pool_max
 
-ROOT = '/vesuvius/usrm/volcomp'
+ROOT = '/vesuvius/ufsm/volcomp'
 CT = 'PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr'
 CODES = '/vesuvius/ufsm/gt/paris4-band-20261005/q-4p8.zarr'
 AXIS = '/vesuvius/ufsm/runs/noisy-labels-20261005/axis-0.json'

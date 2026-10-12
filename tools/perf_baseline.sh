@@ -23,7 +23,7 @@ grep "samp/s" "$O/train_rate.log" | tail -3
 python3 tools/roofline.py "$O/train_layers.log" --P 704 --split 1 --steps-per-report 20 --gpus 2 | tee "$O/roofline.txt" || echo "roofline failed"
 # inference: serving recipe on the 1024^3 held-out box, both GPUs; then one GPU with the stage profile
 CK=$R/best-development.ckpt
-PR=(predict "$CK" /vesuvius/usrm/volcomp PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr)
+PR=(predict "$CK" /vesuvius/ufsm/volcomp PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr)
 PO=(--um 2.4 --box 48128,17408,16384,1024,1024,1024 --halo 8 --shard 512 --grid-origin 0,0,0 --ema 1 --q 8 --threads 16
     --axis "$IN/axis-0.json" --levels 1)
 for w in 720 528; do

@@ -36,7 +36,7 @@ from band_field import instances as ref_instances
 from sheet_diagnostics import binary_scores
 
 UFSM = Path(__file__).resolve().parent.parent / 'build/ufsm'
-ROOT = '/vesuvius/usrm/volcomp'
+ROOT = '/vesuvius/ufsm/volcomp'
 CT = 'PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr'
 LABELS = '/vesuvius/ufsm/gt/paris4-sheet-20261003/training-4p8.zarr'
 CODES = '/vesuvius/ufsm/gt/paris4-band-20261005/q-4p8.zarr'

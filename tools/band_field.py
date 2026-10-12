@@ -20,8 +20,8 @@ from scipy import ndimage as ndi
 
 UFSM = Path(__file__).resolve().parent.parent / 'build/ufsm'
 CODES = '/vesuvius/ufsm/gt/paris4-band-20261005/q-4p8.zarr'   # winding_mod14 raster (ufsm raster --value q.tif)
-CT_ROOT, CT = '/vesuvius/usrm/volcomp', 'PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr'
-AXIS = '/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json'
+CT_ROOT, CT = '/vesuvius/ufsm/volcomp', 'PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr'
+AXIS = '/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json'
 REFERENCE = '/vesuvius/ufsm/gt/paris4-sheet-20261003/geometry/reference.json'
 R_NATIVE = 80   # flood radius (native voxels): about 3/4 of the local turn pitch (90-128 native voxels per turn)
 

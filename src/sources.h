@@ -6,7 +6,7 @@
        "ct": "PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr", "um": 8.64,
        "targets": {"recto": "PHerc0800/representations/labels/...zarr"           (same root)
                    or {"root": "/vesuvius/ufsm/gt/labels/x.zarr", "group": "."}   (own root)},
-       "axis": "/vesuvius/usrm/umbilicus/PHerc0800/umbilicus-full-resolution.json",   (optional)
+       "axis": "/vesuvius/ufsm/umbilicus/PHerc0800/umbilicus-full-resolution.json",   (optional)
        "holdout": [z, y, x, nz, ny, nx],                                              (optional, level-0 voxels)
        "weight": 1.0},
       {"name": "Paris4-recto", "root": "...", "ct": "PHercParis4/volumes/...zarr", "um": 2.4,

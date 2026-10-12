@@ -22,7 +22,7 @@ from build_sheet_geometry import load_axis
 
 MESHES = '/vesuvius/ufsm/gt/paris4-all-surfaces/aws'
 SEGMENTS = Path(__file__).resolve().parent.parent / 'configs/paris4-segments-20260623.txt'
-AXIS = '/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json'
+AXIS = '/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json'
 VOLUME = '20260411134726'
 
 

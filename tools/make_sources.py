@@ -5,15 +5,15 @@ Sources:
   - HF label pyramids (gt/labels/<name>/) paired with the volcomp CT mirror of the same scan
   - rasterized segment labels (gt/raster/<scroll>/<vol>/) paired with that scan's CT mirror
   - Kaggle cubes (gt/kaggle/) as a shared-array regions source
-CT comes from the local mirror under /vesuvius/usrm/volcomp when present, else the published tree over HTTPS
+CT comes from the local mirror under /vesuvius/ufsm/volcomp when present, else the published tree over HTTPS
 with the chunk cache. Usage: make_sources.py [--out configs/all.json] [--no-kaggle]
 """
 import json, os, subprocess, sys, urllib.request, re
 
 GT = "/vesuvius/ufsm/gt"
 ROOT = "https://dl.ash2txt.org/community-uploads/forrest/volcomp"
-LOCAL = "/vesuvius/usrm/volcomp"
-UMB = "/vesuvius/usrm/umbilicus"
+LOCAL = "/vesuvius/ufsm/volcomp"
+UMB = "/vesuvius/ufsm/umbilicus"
 CACHE = "/vesuvius/ufsm/cache"
 
 # HF label zarr -> (scroll, volume id, um)

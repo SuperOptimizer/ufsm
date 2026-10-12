@@ -132,7 +132,7 @@ def main():
     parser.add_argument("--scroll", default="PHercParis4")
     parser.add_argument("--volume", default="20260411134726")
     parser.add_argument("--um", type=float, default=2.4)
-    parser.add_argument("--ct-root", default="/vesuvius/usrm/volcomp")
+    parser.add_argument("--ct-root", default="/vesuvius/ufsm/volcomp")
     parser.add_argument("--ct", default="PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr")
     parser.add_argument("--work", type=Path, default=Path("/vesuvius/ufsm/gt/paris4-all-surfaces"))
     parser.add_argument("--out", type=Path, default=Path("/vesuvius/ufsm/gt/paris4-all-surfaces/labels.zarr"))

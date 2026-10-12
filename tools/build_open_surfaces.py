@@ -28,7 +28,7 @@ REPO = Path(__file__).resolve().parents[1]
 UFSM, DEDUP = REPO / 'build/ufsm', REPO / 'build/surface_dedup'
 INV = '/vesuvius/ufsm/gt/open-data-inventory/inventory.json'
 REMOTE = 'https://dl.ash2txt.org/community-uploads/forrest/volcomp'
-LOCAL = Path('/vesuvius/usrm/volcomp')
+LOCAL = Path('/vesuvius/ufsm/volcomp')
 AXES = Path('/vesuvius/ufsm/runs/m7-finetune/axes')
 CELL_UM = 25.0          # dedup cell; a sample is a duplicate within one cell (25-50 um) of an earlier surface
 HOLD_UM = 2458.0        # held-out cube edge (1024 voxels at 2.4 um)
@@ -62,7 +62,7 @@ def ct_shape(root, ct):
 
 
 def axis_for(scroll, ct):
-    u = Path(f'/vesuvius/usrm/umbilicus/{scroll}/umbilicus-full-resolution.json')
+    u = Path(f'/vesuvius/ufsm/umbilicus/{scroll}/umbilicus-full-resolution.json')
     if u.exists() and str(LOCAL) in ct: return str(u)
     a = AXES / (ct.split('/')[-1].replace('.zarr', '') + '.json')
     return str(a) if a.exists() else None

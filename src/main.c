@@ -271,7 +271,7 @@ static int cmd_phase_raster(int argc, char **argv) {
     if (pool != 1 && pool != 2) { fprintf(stderr, "phase-raster: --pool 1|2\n"); return 2; }
     band_params bp = {(float)atof(opt(argc, argv, "--radius", "80")), (float)atof(opt(argc, argv, "--span", "75"))};
     axis ax = {0};
-    if (axis_load(&ax, opt(argc, argv, "--axis", "/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "phase-raster: cannot load axis\n"); return 1; }
+    if (axis_load(&ax, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "phase-raster: cannot load axis\n"); return 1; }
     z3 *z = z3_open(store_open(argv[2]), argv[3], nullptr); if (!z) { fprintf(stderr, "%s\n", z3_error()); return 1; }
     const z3_meta *m = z3_meta_of(z); const int64_t shape[3] = {m->shape[0], m->shape[1], m->shape[2]};
     const int blk = atoi(opt(argc, argv, "--block", "256")), nth = atoi(opt(argc, argv, "--threads", "4"));
@@ -342,7 +342,7 @@ static int cmd_band(int argc, char **argv) {
     for (int d = 0; d < 6; d++) if (b[d] % 2 || (d >= 3 && b[d] <= 0)) { fprintf(stderr, "band: box must be even and positive\n"); return 2; }
     band_params bp = {(float)atof(opt(argc, argv, "--radius", "80")), (float)atof(opt(argc, argv, "--span", "75"))};
     axis ax = {0};
-    if (axis_load(&ax, opt(argc, argv, "--axis", "/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "band: cannot load axis\n"); return 1; }
+    if (axis_load(&ax, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "band: cannot load axis\n"); return 1; }
     const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
     int64_t o[3], n[3]; int ni[3];
     for (int d = 0; d < 3; d++) { o[d] = b[d] / 2 - halo; n[d] = b[3 + d] / 2 + 2 * halo; ni[d] = (int)n[d]; }
@@ -371,7 +371,7 @@ static int cmd_band(int argc, char **argv) {
             memcpy(phs + ((size_t)(zz + ro2[0] - po[0]) * pnn[1] + (yy + ro2[1] - po[1])) * pnn[2] + (ro2[2] - po[2]), tmp + ((size_t)zz * rn2[1] + yy) * rn2[2], (size_t)rn2[2]);
         free(tmp); z3_close(pz);
         axis axr = {0};
-        if (axis_load(&axr, opt(argc, argv, "--axis", "/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "band: cannot load axis\n"); return 1; }
+        if (axis_load(&axr, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "band: cannot load axis\n"); return 1; }
         const double t0p = now();
         if (band_fit_fields(phs, nullptr, pn, ph, b, ffh2, &axr, ff_dir)) { fprintf(stderr, "band: cannot write the fit fields to %s\n", ff_dir); return 1; }
         fprintf(stderr, "band: fit fields from the stored phase in %.1fs -> %s\n", now() - t0p, ff_dir);
