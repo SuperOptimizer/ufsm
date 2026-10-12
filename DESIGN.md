@@ -304,8 +304,12 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   fields come from a 9.6 um net; recto and ink stay at 2.4 um. `ufsm wraps --out-um 2.4` writes a 9.6 um fit's wraps on the
   2.4 um grid (voxel centres to voxel centres, grid step and voxel_size_um scaled) so they render with the 2.4 um ink
   (wrapdist unchanged: 72.2 vs 72.7% within 9.6 um).
-- Open: test_split's "memory layout vs separate buffers" check of the train-default offload configuration failed twice
-  under GPU contention (cases 34 and 35, grad rel ~0.3) and passes alone: a timing-dependent race to find.
+- test_split's "memory layout vs separate buffers" check failed twice under GPU contention (cases 34, 35; grad rel ~0.3) and
+  passed alone. It took the best of three tries, assuming run-to-run noise is rare; it now also repeats the separate-buffer
+  runs and passes a try whose layout difference is within 1.5x of that repeat difference (a layout error differs where
+  repeats agree). Open: case 35 (lean 1, fp4 grads, offloads) is two-state: identical runs, split or single GPU, sometimes
+  differ by grad rel 0.29-0.35 (other cases repeat to 1e-8). Either a flipped stochastic rounding spreading into an equally
+  valid MX-fp4 sample, or a race in that path: compare both outcomes with an fp32 reference gradient.
 - Left: BigTIFF for renders over 4 GB compressed; 9.6 um training on all of Paris4 (desk band codes); the desk runs.
 
 ## Half-resolution networks (2026-10-11)

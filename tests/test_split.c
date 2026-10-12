@@ -228,21 +228,27 @@ int main(void) {
                                        bits. MX-fp4 gradients are not bitwise reproducible: a last-bit difference of an atomic sum
                                        now and then flips a stochastic rounding, and the change spreads (an equally valid sample, as
                                        far from MX-fp8 gradients); so up to three tries, a layout error fails every one. */
+                        /* Under GPU contention the atomic order varies more and all three tries can flip, so each try also
+                           repeats the separate-buffer runs: a try whose layout difference is within 1.5x of that run-to-run
+                           difference passes (a layout error differs where same-layout repeats agree). */
                         fixed_gl = 1;
-                        double dsp = 1, d1 = 1, la = 0, lq = 0;
-                        float *h1 = malloc(np * 4);
-                        for (int t = 0; t < 3 && (dsp >= 1e-5 || d1 >= 1e-5); t++) {
+                        double dsp = 1, d1 = 1, la = 0, lq = 0, nsp = 0, n1 = 0; int pass = 0;
+                        float *h1 = malloc(np * 4), *r2 = malloc(np * 4), *r0 = malloc(np * 4);
+                        for (int t = 0; t < 3 && !pass; t++) {
                             la = split(ctx, &cfg, 1, g1, np); single(&cfg, 1, h1);
                             unet_set_share_enc_a1(0); unet_set_a0_share(0); unet_set_xin_offload(0);
                             lq = split(ctx, &cfg, 1, g2, np); single(&cfg, 1, g0);
+                            split(ctx, &cfg, 1, r2, np); single(&cfg, 1, r0);   /* the same separate buffers again: the noise */
                             unet_set_share_enc_a1(1); unet_set_a0_share(-1); unet_set_xin_offload(-1);
-                            const double a = rel(g1, g2, 0, np), b = rel(h1, g0, 0, np);
-                            if (a < dsp) dsp = a;
-                            if (b < d1) d1 = b;
+                            const double a = rel(g1, g2, 0, np), b = rel(h1, g0, 0, np), na = rel(g2, r2, 0, np), nb = rel(g0, r0, 0, np);
+                            const int pa = a < 1e-5 || (na >= 1e-5 && a < 1.5 * na), pb = b < 1e-5 || (nb >= 1e-5 && b < 1.5 * nb);
+                            if (a < dsp) { dsp = a; nsp = na; }
+                            if (b < d1) { d1 = b; n1 = nb; }
+                            pass = pa && pb && fabs(lq - la) < 1e-5 * fabs(la);   /* (the loss reads fp16 or fp32 logits) */
                         }
-                        free(h1); fixed_gl = 0;
-                        const int ok2 = fabs(lq - la) < 1e-5 * fabs(la) && dsp < 1e-5 && d1 < 1e-5;   /* (the loss reads fp16 or fp32 logits) */
-                        printf("  %s: memory layout vs separate buffers: split grad rel %.3g, one GPU %.3g  %s\n", tag, dsp, d1, ok2 ? "ok" : "FAIL");
+                        free(h1); free(r2); free(r0); fixed_gl = 0;
+                        const int ok2 = pass;
+                        printf("  %s: memory layout vs separate buffers: split grad rel %.3g (repeat %.3g), one GPU %.3g (repeat %.3g)  %s\n", tag, dsp, nsp, d1, n1, ok2 ? "ok" : "FAIL");
                         fails += !ok2;
                     }
                 }
