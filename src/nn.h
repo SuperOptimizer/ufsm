@@ -297,6 +297,7 @@ void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t
 void nn_add_into(void *y, const void *x, shape5 s, int h16);   /* y += x in y's storage (MX by registration, else 16-bit or fp32) */
 void nn_side_targets(const uint8_t *side, size_t n, uint8_t *t, uint8_t *m);   /* band.h SIDE_* labels -> loss target (recto 255, verso 0) and mask (known) */   /* where m == 0 and vm != 0: t = src, m = 1 */
 void nn_phase_targets(const uint8_t *phase, size_t n, uint8_t *t, uint8_t *m);   /* band.h PHASE_* -> targets t[0..n) = 0.5 + 0.5 cos(2 pi phase), t[n..2n) = 0.5 + 0.5 sin (x255), mask (known) */
+void nn_unwrap_targets(const uint8_t *phase, int d, int h, int w, int s, uint8_t *t, uint8_t *m);   /* task unwrap: sign-free normal n n^T (6) and density min(1, 32 rho) (x255, 7 planes) from the phase gradient over +-s voxels; mask */
 /* half-resolution networks (unet_cfg.half_res): the network runs on 2x2x2 blocks of the full-resolution window.
    nn_half_input: the 4-channel input x ([n][4][D][H][W], 16-bit storage type when h16, else fp32) -> the network input y at half
    resolution, same type: mode 1 (pool) the block mean of every channel (4 channels); mode 2 (pack) those 4 means plus, from the block's

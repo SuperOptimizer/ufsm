@@ -10,6 +10,7 @@
 #include "split.h"
 #include "store.h"
 #include "unet.h"
+#include "fit.h"
 #include "z3w.h"
 #include "zarr3.h"
 #include <errno.h>
@@ -226,6 +227,7 @@ int cmd_predict(int argc, char **argv) {
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n"
                         "       [--split z --gpus 0,1]   both GPUs on every window, one z half each (window a multiple of 2^levels; default window shard + 128, halo 64)\n"
                         "       [--channel 0]   output channel written (band_affinity checkpoints: 1..6 = affinities z1 y1 x1 z8 y8 x8)\n"
+                        "       [--fit-fields DIR] [--fit-h 8]   task unwrap checkpoints: also the winding fitter's input fields of the box (ufsm fit DIR)\n"
                         "       [--radial-sign 1|-1]   -1 reverses the direction input (the CT is unchanged): a recto model then marks the verso face\n"
                         "       [--gn-save FILE]   pool the GroupNorm statistics of every window processed into FILE (calibration)\n"
                         "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n");
@@ -245,6 +247,11 @@ int cmd_predict(int argc, char **argv) {
     const double radial_sign = atof(opt(argc, argv, "--radial-sign", "1"));   /* -1: reversed direction input (a recto model then marks the verso face) */
     if (radial_sign != 1 && radial_sign != -1) { fprintf(stderr, "predict: --radial-sign must be 1 or -1\n"); return 2; }
     const int out_ch = atoi(opt(argc, argv, "--channel", "0"));   /* output channel to write (band_affinity: 1..6 = affinities) */
+    /* --fit-fields DIR (task unwrap checkpoints: recto 0, ink 1, phase 2-3, normal 4-9, density 10): every head computed, each
+       window's interior pooled on the device into the winding fitter's fields (h native voxels per field voxel, --fit-h 8) of the
+       box, written to DIR at the end (src/fit.h fit_fields_save). One GPU, the CT window in its own buffer (no aliasing). */
+    const char *ffd = opt(argc, argv, "--fit-fields", nullptr); const int ffh = atoi(opt(argc, argv, "--fit-h", "8"));
+    if (ffd) { setenv("UFSM_INFER_ALIAS", "0", 1); if (ffh < 2 || ffh > 8) { fprintf(stderr, "--fit-h 2..8\n"); return 2; } }
     float q = (float)atof(opt(argc, argv, "--q", "8"));
     const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
     const char *grid = opt(argc, argv, "--grid-origin", nullptr);
@@ -280,6 +287,7 @@ int cmd_predict(int argc, char **argv) {
     const int half = cfg.half_res, hdiv = unet_hr_div(half), hmode = unet_hr_mode(half), nout = hmode == 2 ? cfg.cout / 8 : cfg.cout;   /* low-resolution
                                                                      network (nn_lowres_*): hdiv window voxels per network voxel; pack has 8 logits per output */
     if (out_ch < 0 || out_ch >= nout) { fprintf(stderr, "predict: --channel %d outside the checkpoint's %d outputs\n", out_ch, nout); return 2; }
+    if (ffd && (cfg.cout != 11 || half || sheet_task || level)) { fprintf(stderr, "predict: --fit-fields needs a task unwrap checkpoint (11 outputs), full resolution, level 0\n"); return 2; }
     const char *gn_stats = opt(argc, argv, "--gn-stats", embedded && runtime.gn_stored ? "stored" : "legacy");
     if (strcmp(gn_stats, "stored") && strcmp(gn_stats, "legacy")) { fprintf(stderr, "--gn-stats must be stored or legacy\n"); return 2; }
     nn_set_gn_stored(!strcmp(gn_stats, "stored"));
@@ -327,6 +335,7 @@ int cmd_predict(int argc, char **argv) {
     if (split) gpu = gpus[0];
     if (half && (split || sheet_task || ufsm_env_on("UFSM_PRED_HOSTPATH"))) { fprintf(stderr, "predict: half-resolution checkpoints run on one GPU per window, the device path\n"); return 2; }
     const int nwork = split ? 1 : ngpu;   /* worker processes */
+    if (ffd && (split || ngpu > 1 || out_ch)) { fprintf(stderr, "predict: --fit-fields runs on one GPU and writes channel 0\n"); return 2; }
     if (nwork > 1 && !box) { fprintf(stderr, "--gpus needs --box\n"); return 2; }
     if (sheet_task && ngpu>1) { fprintf(stderr,"winding export currently uses one GPU per output store\n"); return 2; }
     pid_t kids[8] = {0}; int is_child = 0;
@@ -377,7 +386,8 @@ int cmd_predict(int argc, char **argv) {
         unet *uk = k ? u1 : u;
         if (k) nn_init(gpus[1]);
         if (gnh) unet_gn_freeze(uk, gnh);
-        if (!sheet_task) unet_set_head_channels(uk, hmode == 2 ? 8 * out_ch : out_ch, hmode == 2 ? 8 : 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
+        if (ffd) unet_set_head_channels(uk, 0, cfg.cout);   /* every head: the recto channel 0 is written, the others pooled */
+        else if (!sheet_task) unet_set_head_channels(uk, hmode == 2 ? 8 * out_ch : out_ch, hmode == 2 ? 8 : 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
         /* the network takes the uint8 CT window itself (with in-place slabs the stem builds its input per slab: no 16-bit window) */
         if (!sheet_task && !half && !ufsm_env_on("UFSM_PRED_HOSTPATH")) unet_set_ct_input(uk, 1);
         if (cfg.scale_cond) {   /* voxel-size conditioning: the CT level's voxel size, or --scale-um to override */
@@ -489,6 +499,14 @@ int cmd_predict(int argc, char **argv) {
     int kss = !sheet_task && gpath && stride % shard == 0 && stride / shard >= 2 ? stride / shard : 1;
     for (int d = 0; d < 3 && kss > 1; d++) { int64_t ph = grid ? (bo[d] - grid_origin[d]) % stride : 0; if (ph < 0) ph += stride; if (ph) kss = 1; }
     int64_t nss[3]; for (int d = 0; d < 3; d++) nss[d] = (ns[d] + kss - 1) / kss;
+    float *ffacc = nullptr; int ffbox[3], ffF[3]; size_t ffn = 0;
+    if (ffd) {
+        if (ct_shared) { fprintf(stderr, "predict: --fit-fields: the CT window is shared with the network (set UFSM_INFER_ALIAS=0)\n"); return 2; }
+        for (int d = 0; d < 3; d++) { ffbox[d] = (int)bn[d]; ffF[d] = (int)((bn[d] + ffh - 1) / ffh); }
+        ffn = (size_t)ffF[0] * ffF[1] * ffF[2]; ffacc = nn_malloc(12 * ffn * 4);
+        if (!ffacc) { fprintf(stderr, "predict: no device memory for the fit fields\n"); return 1; }
+        nn_zero(ffacc, 12 * ffn * 4);
+    }
     if (kss > 1) fprintf(stderr, "predict: one window per %d^3 shards (interior %d)\n", kss, stride);
     double t0 = now(); long ntiles = 0, nskip = 0;
     /* enumerate the tiles in shard order, then let the reader run ahead */
@@ -601,6 +619,7 @@ int cmd_predict(int argc, char **argv) {
             } else lg = ct_stem ? unet_forward_ct(u, ctd, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xs, h16)
                                 : unet_forward_x(u, xd, xs, 0, h16);
             if (gn_save) unet_gn_accumulate(u);
+            if (ffd) nn_fit_accum(lg, ctd, W, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, 0, 2, 4, 10, ffacc);
             if (sheet_task) lg += (size_t)out_ch * w3;   /* channel c of the [c][W^3] logits (B = 1); otherwise the only one */
             if (sheet_task) {
                 nn_sheet_gate((float *)lg+w3,lg,ctd,W,sheet_rows);
@@ -670,6 +689,27 @@ int cmd_predict(int argc, char **argv) {
     if (sheet_task && cur_shard>=0 && sheet_write_shard(out,sheet_shard,shard,sz,sy,sx)) return 1;
     if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
     if (writer_finish(&WR, wth)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+    if (ffd) {   /* the fit fields: means over material (CT > 0) of the pooled heads, material fraction, max recto */
+        float *acc = malloc(12 * ffn * 4); nn_sync(); nn_d2h(acc, ffacc, 12 * ffn * 4); nn_free(ffacc);
+        uint8_t *a[10]; for (int k = 0; k < 10; k++) a[k] = calloc(ffn, 1);
+        for (size_t i = 0; i < ffn; i++) {
+            const float cnt = acc[i], mat = acc[ffn + i];
+            a[0][i] = a[1][i] = 128;
+            if (cnt <= 0 || mat <= 0) continue;
+            a[9][i] = (uint8_t)lroundf(255.f * fminf(1.f, mat / cnt));
+            a[0][i] = (uint8_t)lroundf(128.f + 127.f * acc[2 * ffn + i] / mat); a[1][i] = (uint8_t)lroundf(128.f + 127.f * acc[3 * ffn + i] / mat);
+            for (int k = 0; k < 6; k++) a[2 + k][i] = (uint8_t)lroundf(255.f * fminf(1.f, fmaxf(0.f, (k < 3 ? 0.f : 0.5f) + acc[(4 + k) * ffn + i] / mat)));
+            const float rho = acc[10 * ffn + i] / mat;   /* turns per native voxel */
+            if (rho > 0) { const float v = 8.f / (ffh * rho); a[8][i] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lroundf(v)); }
+        }
+        const int na = (int)bn[0] + 1; float *cyb = malloc(na * sizeof(float)), *cxb = malloc(na * sizeof(float));
+        for (int z = 0; z < na; z++) { double cy = 0, cx = 0; if (ax.n) axis_at(&ax, (double)(bo[0] + z), &cy, &cx); cyb[z] = (float)(cy - bo[1]); cxb[z] = (float)(cx - bo[2]); }
+        const long long org[3] = {bo[0], bo[1], bo[2]};
+        if (fit_fields_save(ffd, org, ffF, ffh, a, cyb, cxb, na)) { fprintf(stderr, "predict: cannot write the fit fields to %s\n", ffd); return 1; }
+        fprintf(stderr, "predict: fit fields %dx%dx%d (h %d) written to %s\n", ffF[0], ffF[1], ffF[2], ffh, ffd);
+        for (int k = 0; k < 10; k++) free(a[k]);
+        free(acc); free(cyb); free(cxb);
+    }
     if (gpath) { nn_host_free(WR.buf[0]); nn_host_free(WR.buf[1]); nn_free(dsh); } else { free(WR.buf[0]); free(WR.buf[1]); }
     nn_free(stsc); nn_free(x2); nn_free(lgf); nn_free(lrt);
     pthread_join(rth, nullptr);

@@ -13,8 +13,11 @@ z3w *z3w_create(const char *dir, const int64_t shape[3], int shard, float q, int
 /* Pure binary surface masks: zero fill; the full 128^3 mask is coded losslessly
    with volcomp.h mode 5 and decodes as 0/255. No implicit spatial downscale. */
 z3w *z3w_create_mask(const char *dir, const int64_t shape[3], int shard, const char *attrs_json);
-/* data: shard^3 bytes in C order (the part outside the array is ignored). Returns 0 on success.
-   Thread-safe across different shards. */
+/* Typed arrays (volcomp format revision 5, modes 7 / 8): dtype a volcomp_dtype (1 uint16, 2 int16, 3 uint32, 4 int32, 5 float32),
+   q = 0 exact, q > 0 error-bounded (|error| <= q / 2 in value units), fill_value the element fill. */
+z3w *z3w_create_typed(const char *dir, const int64_t shape[3], int shard, int dtype, float q, double fill, const char *attrs_json);
+/* data: shard^3 elements in C order (bytes for uint8; the array's element type otherwise; the part outside the array is ignored).
+   Returns 0 on success. Thread-safe across different shards. */
 int z3w_write_shard(z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *data, int nthreads);
 int z3w_close(z3w *w);
 /* Write an OME group zarr.json at dir listing levels[i] with voxel sizes um[i]; names are "%g" of um. */

@@ -80,7 +80,7 @@ static void group_scale(store *s, const char *key, z3_meta *m) {
     json_free(j);
 }
 
-z3 *z3_open(store *s, const char *key, const char *cache_dir) {
+static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int typed) {
     char mk[1024];
     snprintf(mk, sizeof mk, "%s/zarr.json", key);
     size_t n;
@@ -97,11 +97,13 @@ z3 *z3_open(store *s, const char *key, const char *cache_dir) {
     z3_meta *m = &z->m;
     m->sep = '/';
     const json *shape = json_get(j, "shape");
-    if (!shape || shape->n != 3 || strcmp(json_str(json_get(j, "data_type"), ""), "uint8")) {
-        FAIL("%s: need a 3-D uint8 array", key); goto bad;
-    }
+    static const char *dtn[6] = {"uint8", "uint16", "int16", "uint32", "int32", "float32"};
+    const char *dts = json_str(json_get(j, "data_type"), "");
+    m->dtype = -1; for (int k = 0; k < 6; k++) if (!strcmp(dts, dtn[k])) m->dtype = k;
+    if (!shape || shape->n != 3 || m->dtype < 0 || (m->dtype && !typed)) { FAIL(typed ? "%s: need a 3-D uint8 / uint16 / int16 / uint32 / int32 / float32 array" : "%s: need a 3-D uint8 array", key); goto bad; }
+    m->esize = m->dtype == 0 ? 1 : m->dtype <= 2 ? 2 : 4;
     for (int i = 0; i < 3; i++) m->shape[i] = (int64_t)json_num(json_at(shape, (size_t)i), 0);
-    m->fill = (int)json_num(json_get(j, "fill_value"), 0);
+    m->fill = (int)json_num(json_get(j, "fill_value"), 0); m->fillv = json_num(json_get(j, "fill_value"), 0);
     m->label_binary = !strcmp(json_str(json_path(j, "attributes.ufsm.encoding"), ""), "binary");
     const json *cs = json_path(j, "chunk_grid.configuration.chunk_shape");
     if (!cs || cs->n != 3) { FAIL("%s: no chunk_shape", key); goto bad; }
@@ -136,6 +138,9 @@ bad:
     z3_close(z);
     return nullptr;
 }
+
+z3 *z3_open(store *s, const char *key, const char *cache_dir) { return z3_open_impl(s, key, cache_dir, 0); }
+z3 *z3_open_typed(store *s, const char *key, const char *cache_dir) { return z3_open_impl(s, key, cache_dir, 1); }
 
 void z3_close(z3 *z) {
     if (!z) return;
@@ -338,11 +343,11 @@ static void copy_chunk(const job *jb, const work *w, const uint8_t *chunk) {
         hi[i] = ce < oe ? ce : oe;
         if (hi[i] <= lo[i]) return;
     }
-    size_t row = (size_t)(hi[2] - lo[2]);
+    const size_t es = (size_t)m->esize, row = (size_t)(hi[2] - lo[2]) * es;
     for (int64_t zz = lo[0]; zz < hi[0]; zz++)
         for (int64_t yy = lo[1]; yy < hi[1]; yy++) {
-            const uint8_t *src = chunk + ((zz - c0[0]) * m->chunk[1] + (yy - c0[1])) * m->chunk[2] + (lo[2] - c0[2]);
-            uint8_t *dst = jb->out + ((zz - jb->o[0]) * jb->n[1] + (yy - jb->o[1])) * jb->n[2] + (lo[2] - jb->o[2]);
+            const uint8_t *src = chunk + (((zz - c0[0]) * m->chunk[1] + (yy - c0[1])) * m->chunk[2] + (lo[2] - c0[2])) * es;
+            uint8_t *dst = jb->out + (((zz - jb->o[0]) * jb->n[1] + (yy - jb->o[1])) * jb->n[2] + (lo[2] - jb->o[2])) * es;
             memcpy(dst, src, row);
         }
 }
@@ -352,10 +357,16 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
     size_t cv = (size_t)m->chunk[0] * m->chunk[1] * m->chunk[2];
     if (mask) *mask = 0;
     if (m->zstd) {
-        size_t r = ZSTD_decompressDCtx(dctx, scratch, VOLCOMP_ENCODE_BOUND > cv ? VOLCOMP_ENCODE_BOUND : cv, enc, n);
+        const size_t cap = m->esize > 1 ? (VOLCOMP_TYPED_ENCODE_BOUND > cv * m->esize ? VOLCOMP_TYPED_ENCODE_BOUND : cv * m->esize) : (VOLCOMP_ENCODE_BOUND > cv ? VOLCOMP_ENCODE_BOUND : cv);
+        size_t r = ZSTD_decompressDCtx(dctx, scratch, cap, enc, n);
         if (ZSTD_isError(r)) return FAIL("zstd: %s", ZSTD_getErrorName(r));
         enc = scratch;
         n = r;
+    }
+    if (m->q >= 0 && m->esize > 1) {   /* typed chunk (volcomp modes 7 / 8) */
+        volcomp_status st = volcomp_decode_typed(enc, n, dec, cv * m->esize, (volcomp_dtype)m->dtype);
+        if (st != VOLCOMP_OK) return FAIL("volcomp typed: %s", volcomp_status_string(st));
+        return 0;
     }
     if (m->q >= 0) {
         uint32_t mode;
@@ -364,8 +375,8 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
         if (st != VOLCOMP_OK) return FAIL("volcomp: %s", volcomp_status_string(st));
         return 0;
     }
-    if (n != cv) return FAIL("raw chunk size %zu != %zu in %s (q %d, zstd %d)", n, cv, z->key, m->q, m->zstd);
-    memcpy(dec, enc, cv);
+    if (n != cv * m->esize) return FAIL("raw chunk size %zu != %zu in %s (q %d, zstd %d)", n, cv * m->esize, z->key, m->q, m->zstd);
+    memcpy(dec, enc, cv * m->esize);
     return 0;
 }
 
@@ -546,10 +557,11 @@ static void *worker(void *arg) {
     job *jb = arg;
     z3 *z = jb->z;
     size_t cv = (size_t)z->m.chunk[0] * z->m.chunk[1] * z->m.chunk[2];
-    uint8_t *dec = malloc(cv);
-    uint8_t *scratch = malloc(VOLCOMP_ENCODE_BOUND > cv ? VOLCOMP_ENCODE_BOUND : cv);
+    const size_t es = (size_t)z->m.esize, cvb = cv * es, sb = es > 1 ? (VOLCOMP_TYPED_ENCODE_BOUND > cvb ? VOLCOMP_TYPED_ENCODE_BOUND : cvb) : (VOLCOMP_ENCODE_BOUND > cv ? VOLCOMP_ENCODE_BOUND : cv);
+    uint8_t *dec = malloc(cvb);
+    uint8_t *scratch = malloc(sb);
     ZSTD_DCtx *dctx = ZSTD_createDCtx();
-    const int mc_on = mc_budget() > 0;
+    const int mc_on = mc_budget() > 0 && es == 1;
     if (!dec || !scratch || !dctx) { FAIL("chunk decode allocation"); job_failed(jb); }
     for (;;) {
         int task = atomic_fetch_add(&jb->next, 1);
@@ -630,7 +642,19 @@ int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx) {
 
 int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     const z3_meta *m = &z->m;
-    memset(out, m->fill, (size_t)n[0] * n[1] * n[2]);
+    const size_t nv = (size_t)n[0] * n[1] * n[2];
+    if (m->esize == 1) memset(out, m->fill, nv);
+    else {   /* typed fill: one element, then copied */
+        uint8_t e[4] = {0}; const double f = m->fillv;
+        switch (m->dtype) {
+        case 1: { uint16_t v = (uint16_t)f; memcpy(e, &v, 2); break; }
+        case 2: { int16_t v = (int16_t)f; memcpy(e, &v, 2); break; }
+        case 3: { uint32_t v = (uint32_t)f; memcpy(e, &v, 4); break; }
+        case 4: { int32_t v = (int32_t)f; memcpy(e, &v, 4); break; }
+        case 5: { float v = (float)f; memcpy(e, &v, 4); break; }
+        }
+        for (size_t i = 0; i < nv; i++) memcpy(out + i * m->esize, e, (size_t)m->esize);
+    }
     int64_t lo[3], hi[3];
     for (int i = 0; i < 3; i++) {
         lo[i] = o[i] < 0 ? 0 : o[i];

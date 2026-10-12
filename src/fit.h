@@ -1,0 +1,79 @@
+/* Winding fitter (ufsm fit): a smooth "unwrapped radius in turns" U(x) fitted to dense fit fields (winding phase, sign-free
+   normal n n^T, sheet spacing, material weight), so that the winding coordinate W = U - dir theta / 2 pi has its integer level
+   sets on the recto faces. theta = atan2(y - cy(z), x - cx(z)) around the umbilicus; dir = +1 when the radius grows with the
+   unwrapped theta along a sheet (PHercParis4). Every loss reads cos / sin (2 pi W) and grad W, both smooth away from the axis, so
+   the branch cut of theta only shows in floor(W). U = r / pitch(z) + offset(z) + delta(x): pitch and offset on z knots (linear),
+   delta on a dense trilinear lattice refined coarse to fine. Coordinates are native voxels relative to the field box origin. */
+#pragma once
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct {
+    int D, H, W;                    /* field grid */
+    double h;                       /* field voxel edge in native voxels; voxel (i, j, k) is centred at h (i + 0.5, j + 0.5, k + 0.5) */
+    const uint8_t *pc, *ps;         /* phase vector: 128 + 127 * (confidence * cos / sin (2 pi phase)), 128 = no information */
+    const uint8_t *t[6];            /* n n^T x255: n_z^2, n_y^2, n_x^2, 0.5 + n_z n_y, 0.5 + n_z n_x, 0.5 + n_y n_x */
+    const uint8_t *sp;              /* sheet spacing in units of h / 8 (0 = unknown), i.e. 8 / (h rho); native voxels at h = 8 */
+    const uint8_t *w;               /* material fraction x255 (0 = no data) */
+    const float *cy, *cx;           /* umbilicus per native z of the box, D * h + 1 entries (box-local coordinates) */
+} fit_fields;
+
+typedef struct {
+    int dir;                        /* +1 / -1, 0 = choose the more phase-coherent */
+    int knot_dz;                    /* native voxels between pitch / offset knots */
+    int nstage, lattice[8], steps[8];   /* delta lattice spacing (native voxels) and Adam steps per stage */
+    float lr, lr_knot;              /* Adam learning rates for delta and the knots */
+    float w_phase, w_normal, w_density, w_nondeg, w_smooth, w_decay;
+    int phase_stage;                /* stages before it fit the gradient terms only (normal, density: no integer ambiguity, they
+                                       integrate the turn count); the phase term (periodic) refines from this stage on */
+    float phase_ramp;               /* phase_stage: phase weight from phase_ramp * w_phase to w_phase */
+    float core;                     /* no data terms within core * pitch of the axis */
+    int verbose;
+} fit_cfg;
+
+typedef struct {
+    int dir, nk, knot_dz;
+    double dir_vote;                /* |median winding per radial ring| of the prior (1 = clear; < 0.5 ambiguous) */
+    float *pitch, *offset;          /* per knot (knot k at box-local z = k * knot_dz) */
+    int L, lz, ly, lx;              /* lattice spacing and dims (node (a, b, c) at box-local (a L, b L, c L)) */
+    float *delta;                   /* lz * ly * lx */
+    int D, H, W; double h;          /* the field box (native extent D h, H h, W h) */
+    long long origin[3];            /* the box's native origin (set by the caller; saved with the model) */
+    float *cy, *cx;                 /* axis table (D h + 1 entries) */
+    double loss[6];                 /* final loss parts: total, phase, normal, density, nondegeneracy, smoothness */
+} fit_model;
+
+fit_cfg fit_cfg_default(void);
+fit_model *fit_run(const fit_fields *f, const fit_cfg *c);
+void fit_free(fit_model *m);
+double fit_W(const fit_model *m, double z, double y, double x);   /* winding coordinate at a box-local native point (host) */
+int fit_save(const fit_model *m, const char *dir);
+/* a fit-field directory (the input of ufsm fit): pc ps t0..t5 sp w .raw (shape[0] x shape[1] x shape[2] uint8) and fields.json
+   (origin, shape, h, the axis per native z of the box in box-local coordinates, na = shape[0] h + 1 entries) */
+int fit_fields_save(const char *dir, const long long origin[3], const int shape[3], int h, uint8_t *const a[10], const float *cy, const float *cx, int na);   /* dir/model.json, delta.f32 (lattice), axis.f32 (cy then cx) */
+fit_model *fit_load(const char *dir);
+/* the radius along the ray at box-local z and angle theta from the axis where W = k (bisection between consecutive samples
+   with a sign change, the crossing nearest r_hint); returns 0 and sets *r, or -1 when the ray crosses no W = k inside the box */
+int fit_ray_root(const fit_model *m, double z, double theta, double k, double r_hint, double *r);
+/* initial pitch / offset per knot and the direction from the fields (no labels): exposed for tests */
+int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m);
+
+/* GPU side (src/nn_fit.cu) */
+typedef struct {
+    int D, H, W; float h;
+    const uint8_t *pc, *ps, *t, *sp, *w;    /* device: t holds the 6 planes back to back */
+    const float *cy, *cx; int naxis;
+    int dir, nk, knot_dz; const float *pitch, *offset;
+    int L, lz, ly, lx; const float *delta;
+    float w_phase, w_normal, w_density, w_nondeg, core;
+} fit_dev;
+/* the data terms over every field voxel: loss parts (double[5]: total, phase, normal, density, nondeg, accumulated) and the
+   gradients of delta and of the knots (accumulated: zero them first) */
+void nn_fit_loss(const fit_dev *f, double *parts, float *g_delta, float *g_pitch, float *g_offset);
+/* smoothness w_smooth * sum (laplacian delta)^2 + w_decay * sum delta^2 over the lattice (lap: lattice-sized scratch): adds to
+   parts[5] and g_delta */
+void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float w_smooth, float w_decay, float *lap, double *parts, float *g_delta);
+/* predict --fit-fields: pool a window's interior (logits [c][W^3] fp32, the window's CT) into the box's fit-field accumulators
+   (12 planes over F = ceil(box / h), see src/nn_fit.cu); t = the window origin relative to the box */
+void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
+                  int ch_recto, int ch_phase, int ch_normal, int ch_density, float *acc);

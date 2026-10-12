@@ -160,6 +160,56 @@ ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or
   0.291, combined-cut VOI 1.29 / 1.01, phase advance ratio 0.855 / 0.883 - identical to the unweighted arm. The packed
   windings are not under-weighted; they are not visible to the net in a 256^3 window.
 
+## Unwrap pipeline: one network + our own winding fitter (2026-10-11)
+
+Goal (user): our own single model does the whole unwrap from the published Paris4 wraps alone (no human annotations), with the
+published 3-D ink as the ink teacher. Per scroll: a 3-D ink zarr, per-voxel winding numbers, one tifxyz per wrap, and ink
+rendered on each wrap. 2.4 um first, then a 9.6 um version for the 8-9 um scans. Plan: ~/.claude/plans/bright-forging-seahorse.md.
+The upstream villa spiral fit (spiral-fitting/, ~826M-parameter torch flow fit) works from sparse tracks plus normals, and in its
+default mode from human patches / outer shell / winding-model rays; its winding inputs are relative (it counts from the
+umbilicus = winding 0). Ours fits one scalar winding field to the network's dense fields (level sets never cross).
+
+- `train --task unwrap` (B 1): output channels 0 recto (wrap labels, the usual loss), 1 ink (a source target named "ink",
+  prob encoding, target slot 1; BCE over all papyrus, `--ink-lambda`, `--ink-dice`), 2-3 the winding phase (the --side 2 path),
+  4-9 a sign-free normal n n^T and 10 the sheet density min(1, 32 rho), both from the phase gradient over +-4 voxels on the GPU
+  (`nn_unwrap_targets`: the phase is symmetry-transformed as a scalar, so the gradient is in output coordinates; BCE,
+  `--normal-lambda`, `--normal-step`). The sampler adds a papyrus mask (`batch.pm`, CT > 0) for the ink loss. Checkpoint
+  `runtime_extra.unwrap` records the layout. tests/test_unwrap_targets (planar and radial phase fields: max target error 0.03).
+  Smoke run (Paris4 smoke block, cover x13 = 7048 steps, P256, the dec_widths recipe + scale-cond, seed 1; 52 min,
+  band-field bound at ~2 samples/s): final train losses recto bce 0.42 / dice 0.43, phase 0.51, ink 0.13, normal 0.55. Recto
+  F1 / AUC on the holdout boxes 0.246 / 0.776 | 0.277 / 0.812 vs the recto-only control's 0.250 / 0.774 | 0.273 / 0.804: the
+  extra heads cost nothing. `ufsm phase-raster` precomputes the band field phase over a box (blocks of 256 label voxels plus
+  the band halo, in parallel, lossless volcomp; the smoke region in 8.5 min on 3 threads) and a band target's
+  `"phase": {"root", "key"}` makes the sampler read it: batches byte-identical to the per-window computation (bench_sampler
+  UFSM_BENCH_SIDE=2 hashes), 2.4 -> 13.8 samples/s (12 workers).
+- Winding fitter `ufsm fit` (src/fit.c, src/nn_fit.cu): U = r / pitch(z) + offset(z) + delta (trilinear lattice), W = U -
+  dir theta / 2 pi. Losses at field voxels: phase 1 - cos 2 pi (W - phi) (weight x phasor confidence), normal 1 - g^T T g /
+  (|g|^2 tr T), density (log |g| - log rho)^2, non-degeneracy, lattice smoothness; grad W by central differences with the theta
+  difference wrapped (no branch cut). Schedule: lattices 512 / 256 / 128 / 64 native with the gradient terms only (they carry
+  no integer ambiguity and integrate the turn count), then a phase-unwrapping initialisation (per lattice node the residual
+  phasor, corrections unwrapped node to node in coherence order) and the phase term at 64 / 32. Prior: pitch from the spacing
+  field refined by sector coherence; direction from the unwrapped sector offsets per radial ring (they change by -dir per turn);
+  when that vote is ambiguous both directions are fitted and the lower loss wins (wrong direction: 40x the loss).
+  tests/test_fit (Archimedean spiral, tilted axis, z-varying pitch, a half-turn wobble, a 1.6x packed sector, a hole, dir +-1):
+  100% winding ids, |error| < 0.08 turn everywhere; with the phase under-counting the packed sector by 15%: 99.3% ids.
+- Oracle fit (`ufsm band --fit-fields`: the fields from the wrap labels' band field; Paris4 smoke sub-block 512^3 native at
+  47616,16896,14848, fields at h = 8 native, --dir 1): winding ids right 99.2% of the 796k labelled voxels (band codes q mod 14
+  turns), |error| median 0.029 turn (~1.5 native voxels), p90 0.082 (the codes' own quantisation is 1/18 turn). 18 s.
+- `predict --fit-fields DIR` (unwrap checkpoints): every head in one pass, each window's interior pooled on the GPU into the
+  fitter's fields (nn_fit_accum: material-weighted means of the phase vector, n n^T, density, material fraction, max recto).
+  Network fields of the step-4000 smoke checkpoint on the same box: median spacing 58 vs the labels' 50 (the known
+  under-count), phase confidence 0.69; fitted: winding ids right 64%, |error| median 0.083 turn. The final (step 7048)
+  checkpoint: winding ids right 96.9%, |error| median 0.050 p90 0.154 turn (in-sample: the box lies in the training block).
+  `ufsm fit --winding DIR` writes W * 256 as a uint16 zarr (volcomp typed chunks, exact; 128^3 at step 4: 800 KB).
+- `ufsm wraps` (one tifxyz per wrap: rows every step native in z, columns every step / r_k in theta, each vertex the root of
+  W = k along the ray from the umbilicus; tifxyz per upstream save_tifxyz: x/y/z float32, -1 invalid, meta.json scale / bbox /
+  area / winding) and `ufsm render` (vertex grid to 1 px per native voxel, ink zarr max-composited over +-depth along the
+  normal, plus the CT at t = 0) on src/tiffw.c (TIFF writer: uint8 / float32, deflate; tests/test_tiffw round trip). Oracle
+  wraps 42-56 of the sub-block: vertices on the labelled sheets (median distance 0-2 native, p90 <= 3.5, 96-100% within 4
+  voxels except the sparse edge wrap); the CT renders show papyrus fibre texture.
+- Left: GPU root finding / brick-sparse lattice / z-slabs for whole-scroll fits, a stored phase raster for the sampler,
+  volcomp typed modes (uint16 winding zarr; agent), the 9.6 um version, the desk runs.
+
 ## Half-resolution networks (2026-10-11)
 
 - `train --half-res pool|pack|pool4|pack4` (task surface; checkpoint header `"half_res":1-4`, absent = full resolution):

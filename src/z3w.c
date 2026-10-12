@@ -38,7 +38,10 @@ struct z3w {
     float q;
     int fill;
     int mask_lossless;
+    int dtype, esize;   /* typed arrays (volcomp_dtype, element bytes); 0 / 1 = uint8 */
+    double fillv;
 };
+static const char *dtype_name(int dt) { static const char *n[6] = {"uint8", "uint16", "int16", "uint32", "int32", "float32"}; return dt >= 0 && dt < 6 ? n[dt] : "?"; }
 
 static int mkdirs(const char *path) {
     char tmp[1400];
@@ -76,6 +79,30 @@ z3w *z3w_create(const char *dir, const int64_t shape[3], int shard, float q, int
     return w;
 }
 
+z3w *z3w_create_typed(const char *dir, const int64_t shape[3], int shard, int dtype, float q, double fill, const char *attrs_json) {
+    if (dtype < 1 || dtype > 5) { fail("typed array: dtype %d", dtype); return nullptr; }
+    if (shard % 128 || shard <= 0) { fail("shard must be a multiple of 128"); return nullptr; }
+    if (mkdirs(dir)) { fail("mkdir %s: %s", dir, strerror(errno)); return nullptr; }
+    char p[1400];
+    snprintf(p, sizeof p, "%s/zarr.json", dir);
+    FILE *f = fopen(p, "w");
+    if (!f) { fail("cannot write %s", p); return nullptr; }
+    fprintf(f,
+        "{\"zarr_format\":3,\"node_type\":\"array\",\"shape\":[%lld,%lld,%lld],\"data_type\":\"%s\","
+        "\"chunk_grid\":{\"name\":\"regular\",\"configuration\":{\"chunk_shape\":[%d,%d,%d]}},"
+        "\"chunk_key_encoding\":{\"name\":\"default\",\"configuration\":{\"separator\":\"/\"}},\"fill_value\":%.17g,"
+        "\"codecs\":[{\"name\":\"sharding_indexed\",\"configuration\":{\"chunk_shape\":[128,128,128],"
+        "\"codecs\":[{\"name\":\"volcomp\",\"configuration\":{\"q\":%.9g}}],"
+        "\"index_codecs\":[{\"name\":\"bytes\",\"configuration\":{\"endian\":\"little\"}},{\"name\":\"crc32c\"}],\"index_location\":\"end\"}}],"
+        "\"attributes\":%s,\"dimension_names\":[\"z\",\"y\",\"x\"]}\n",
+        (long long)shape[0], (long long)shape[1], (long long)shape[2], dtype_name(dtype), shard, shard, shard, fill, (double)q, attrs_json ? attrs_json : "{}");
+    fclose(f);
+    z3w *w = calloc(1, sizeof *w);
+    w->dir = strdup(dir); memcpy(w->shape, shape, sizeof w->shape);
+    w->shard = shard; w->cg = shard / 128; w->q = q; w->dtype = dtype; w->esize = (int)volcomp_dtype_size((volcomp_dtype)dtype); w->fillv = fill;
+    return w;
+}
+
 z3w *z3w_create_mask(const char *dir, const int64_t shape[3], int shard, const char *attrs_json) {
     z3w *w = z3w_create(dir, shape, shard, 0, 0, attrs_json);
     if (w) w->mask_lossless = 1;
@@ -84,26 +111,38 @@ z3w *z3w_create_mask(const char *dir, const int64_t shape[3], int shard, const c
 
 typedef struct { const z3w *w; const uint8_t *data; uint8_t **enc; size_t *len; int nc; atomic_int next, failed; } job;
 
+static int elem_is_fill(const uint8_t *e, int dtype, double fillv) {   /* one element equals the array's fill value */
+    switch (dtype) {
+    case 1: { uint16_t v; memcpy(&v, e, 2); return v == (uint16_t)fillv; }
+    case 2: { int16_t v; memcpy(&v, e, 2); return v == (int16_t)fillv; }
+    case 3: { uint32_t v; memcpy(&v, e, 4); return v == (uint32_t)fillv; }
+    case 4: { int32_t v; memcpy(&v, e, 4); return v == (int32_t)fillv; }
+    case 5: { float v; memcpy(&v, e, 4); return v == (float)fillv; }
+    }
+    return 0;
+}
 static void *worker(void *arg) {
     job *jb = arg;
     const z3w *w = jb->w;
-    uint8_t *chunk = malloc(VOLCOMP_CHUNK_VOXELS);
-    uint8_t *enc = malloc(VOLCOMP_ENCODE_BOUND);
+    const int es = w->dtype ? w->esize : 1;
+    const size_t bound = w->dtype ? VOLCOMP_TYPED_ENCODE_BOUND : VOLCOMP_ENCODE_BOUND;
+    uint8_t *chunk = malloc((size_t)VOLCOMP_CHUNK_VOXELS * es);
+    uint8_t *enc = malloc(bound);
     for (;;) {
         int i = atomic_fetch_add(&jb->next, 1);
         if (i >= jb->nc || atomic_load(&jb->failed)) break;
         int cz = i / (w->cg * w->cg), cy = (i / w->cg) % w->cg, cx = i % w->cg;
         int any = 0;
         for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) {
-            const uint8_t *src = jb->data + ((size_t)(cz * 128 + z) * w->shard + (cy * 128 + y)) * w->shard + cx * 128;
-            uint8_t *dst = chunk + ((size_t)z * 128 + y) * 128;
-            memcpy(dst, src, 128);
-            if (!any) for (int x = 0; x < 128; x++) if (src[x] != (uint8_t)w->fill) { any = 1; break; }
+            const uint8_t *src = jb->data + (((size_t)(cz * 128 + z) * w->shard + (cy * 128 + y)) * w->shard + cx * 128) * es;
+            uint8_t *dst = chunk + ((size_t)z * 128 + y) * 128 * es;
+            memcpy(dst, src, (size_t)128 * es);
+            if (!any) for (int x = 0; x < 128; x++) if (w->dtype ? !elem_is_fill(src + (size_t)x * es, w->dtype, w->fillv) : src[x] != (uint8_t)w->fill) { any = 1; break; }
         }
         if (!any) { jb->enc[i] = nullptr; jb->len[i] = 0; continue; }
         size_t n;
-        volcomp_status st = w->mask_lossless
-            ? volcomp_mask_encode_lossless(chunk, enc, VOLCOMP_ENCODE_BOUND, &n)
+        volcomp_status st = w->dtype ? volcomp_encode_typed(chunk, (volcomp_dtype)w->dtype, w->q, enc, bound, &n)
+            : w->mask_lossless ? volcomp_mask_encode_lossless(chunk, enc, VOLCOMP_ENCODE_BOUND, &n)
             : volcomp_encode(chunk, w->q, enc, VOLCOMP_ENCODE_BOUND, &n);
         if (st != VOLCOMP_OK) { fail("volcomp encode: %s", volcomp_status_string(st)); atomic_store(&jb->failed, 1); break; }
         jb->enc[i] = malloc(n);

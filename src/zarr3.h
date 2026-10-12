@@ -18,19 +18,23 @@ typedef struct {
     double scale_um;      /* voxel size from the parent group's OME multiscales, 0 if unknown */
     int fill;             /* fill_value for missing chunks / shards */
     int label_binary;     /* ufsm.encoding=binary: 255 is positive, 0 is background */
+    int dtype, esize;     /* element type (volcomp_dtype: 0 uint8, 1 uint16, 2 int16, 3 uint32, 4 int32, 5 float32) and bytes; z3_read
+                             fills esize bytes per voxel (native byte order) */
+    double fillv;         /* fill_value of a typed array */
 } z3_meta;
 
 typedef struct z3 z3;
 
 /* key = path of the ARRAY directory inside the store (e.g. ".../foo.zarr/0"). cache may be nullptr. */
-z3 *z3_open(store *s, const char *key, const char *cache_dir);
+z3 *z3_open(store *s, const char *key, const char *cache_dir);   /* uint8 arrays only */
+z3 *z3_open_typed(store *s, const char *key, const char *cache_dir);   /* also uint16 / int16 / uint32 / int32 / float32 (meta.esize bytes per voxel) */
 void z3_close(z3 *z);
 const z3_meta *z3_meta_of(const z3 *z);
 const char *z3_key(const z3 *z);
 
 /* Read the box [o, o+n) (z,y,x) into out (C order, n[0]*n[1]*n[2] bytes). Out-of-range parts use fill_value.
    nthreads <= 0 picks the CPU count. Returns 0 on success, -1 on I/O or decode failure. */
-int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);
+int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);   /* out: n[0] n[1] n[2] * esize bytes */
 
 /* Shard-level presence: 1 if the shard object exists in the store, 0 if not, -1 on error. */
 int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx);

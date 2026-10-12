@@ -139,10 +139,11 @@ static batch alloc_batch(const sample_cfg *c) {
     b.sheet = calloc((size_t)c->B, sizeof *b.sheet);
     b.band = c->band ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     b.side = c->side ? nn_host_alloc((size_t)c->B * p3) : nullptr;
+    b.pm = c->papyrus ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b) { if (b->band) nn_host_free(b->band); if (b->side) nn_host_free(b->side); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->band) nn_host_free(b->band); if (b->side) nn_host_free(b->side); if (b->pm) nn_host_free(b->pm); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -608,6 +609,34 @@ static void u8_stats(const uint8_t *a, size_t n, size_t *nz, double *sum, double
     }
     *nz = (size_t)z; *sum = (double)s1; *sq = (double)s2;
 }
+/* the stored phase (src/sources.h source.phase) of a native window, nearest-upsampled from the label grid as band_window does */
+static int phase_window(source *s, const int64_t o[3], int P, uint8_t *side) {
+    int64_t lo[3], ln[3], ro[3], rn[3];
+    const z3_meta *m = z3_meta_of(s->phase);
+    for (int d = 0; d < 3; d++) {
+        lo[d] = (o[d] + 1) >> 1; ln[d] = ((o[d] + P) >> 1) - lo[d] + 1;
+        ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
+    }
+    const size_t N = (size_t)ln[0] * ln[1] * ln[2];
+    uint8_t *ph = malloc(N);
+    if (!ph) return -1;
+    memset(ph, PHASE_UNKNOWN, N);
+    if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
+        uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
+        if (!tmp || z3_read(s->phase, ro, rn, tmp, 1)) { free(tmp); free(ph); return -1; }
+        for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
+            memcpy(ph + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
+        free(tmp);
+    }
+    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
+        const uint8_t *row = ph + ((size_t)(((o[0] + z + 1) >> 1) - lo[0]) * ln[1] + (((o[1] + y + 1) >> 1) - lo[1])) * ln[2];
+        uint8_t *dst = side + ((size_t)z * P + y) * P;
+        for (int x = 0; x < P; x++) dst[x] = row[((o[2] + x + 1) >> 1) - lo[2]];
+    }
+    free(ph);
+    return 0;
+}
+
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
@@ -805,7 +834,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     for (int z = 0; z < P; z++) { double cy, cx; axis_at(&s->ax, (double)(o[0] + z) * scale, &cy, &cx); cyz[z] = (float)(cy / scale); cxz[z] = (float)(cx / scale); }
     if (c->augment && scan_aug_enabled(&c->scan)) {   /* scanner domains on the source grid; the per-patch z-score follows them, as at inference */
         PROF_MARK(PS_ZSCORE);
-        if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band, big + p3)) {
+        if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {
             sum = sq = 0;
             for (size_t k = 0; k < p3; k++) { sum += ctu[k]; sq += (double)ctu[k] * ctu[k]; }
             mean = sum / (double)p3; var = sq / (double)p3 - mean * mean; sd = sqrt(var > 0 ? var : 0) + 1e-3;
@@ -848,7 +877,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     }
     spatial_aug spatial={0};
     /* band-labelled native samples keep the exact voxel grid (the band field is not interpolated) */
-    const int band_sample = c->band && s->band && l == 0;
+    const int band_sample = (c->band || c->side) && s->band && l == 0;   /* (c->side without c->band: task unwrap, the phase only) */
     if (c->augment && c->geometry_augment && s->geometry && !band_sample) {
         spatial_aug_make(&spatial,rnext(r),P,c->rotate_degrees,c->rotate_p,c->elastic,c->elastic_p);
         if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(r) < c->zoom_p) spatial_aug_zoom(&spatial, exp(runif(r) * log(c->zoom_min)));
@@ -860,15 +889,26 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y);
         sym_u8(mask, M, P, y);
     }
-    if (c->band) {   /* band labels: computed on the source grid, unknown on CT air, then the same symmetry as CT and targets */
+    if (c->papyrus && !spatial.active) {   /* CT > 0 through the same symmetry (big + 2 P^3, the soft / trust distance map, is free here) */
+        uint8_t *pt = big + 2 * p3;
+        for (size_t k = 0; k < p3; k++) pt[k] = ctu[k] != 0;
+        sym_u8(pt, b->pm + (size_t)i * p3, P, y);
+    }
+    if (c->band || c->side) {   /* band labels: computed on the source grid, unknown on CT air, then the same symmetry as CT and targets */
         if (!band_sample || spatial.active) {   /* no band labels: affinities (and sides) unsupervised */
-            memset(b->band + (size_t)i * p3, BAND_UNKNOWN, p3);
+            if (c->band) memset(b->band + (size_t)i * p3, BAND_UNKNOWN, p3);
             if (c->side) memset(b->side + (size_t)i * p3, SIDE_UNKNOWN, p3);
+        } else if (!c->band && c->side == 2 && s->phase && !c->phase_dense) {   /* the stored phase (ufsm phase-raster) */
+            uint8_t *sw = malloc(p3);
+            if (!sw || phase_window(s, o, P, sw)) { free(sw); return -1; }
+            for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) sw[k] = SIDE_UNKNOWN;
+            sym_u8(sw, b->side + (size_t)i * p3, P, y);
+            free(sw);
         } else {
             uint8_t *bw = malloc(p3), *sw = c->side ? malloc(p3) : nullptr;
             if (!bw || (c->side && !sw) || band_window(s, o, P, bw, sw, c->side == 2, c->phase_dense, tile_index ^ c->seed)) { free(bw); free(sw); return -1; }
             for (size_t k = 0; k < p3; k++) if (!ctu[k]) bw[k] = BAND_UNKNOWN;
-            sym_u8(bw, b->band + (size_t)i * p3, P, y);
+            if (c->band) sym_u8(bw, b->band + (size_t)i * p3, P, y);
             if (sw) {   /* sides (phases) above CT side_air only: air (CT <= side_air) stays unsupervised */
                 for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) sw[k] = SIDE_UNKNOWN;
                 sym_u8(sw, b->side + (size_t)i * p3, P, y);
@@ -897,6 +937,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         if (spatial.active) warp_sheet_batch(b->sheet[i],&spatial,M);
         w[1]=0; /* winding is supervised by the sparse regression objective */
     }
+    if (spatial.active && c->papyrus) memcpy(b->pm + (size_t)i * p3, M, p3);   /* warped samples: the warped loss mask */
     PROF_MARK(PS_X16);
     memcpy(b->w + (size_t)i * NCH, w, NCH);
     b->src[i] = (int16_t)si;

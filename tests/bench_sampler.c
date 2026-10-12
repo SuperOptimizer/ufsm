@@ -2,7 +2,8 @@
    env UFSM_BENCH_TRAIN=1: the trainer's surface recipe (B 1, --soft 7 --soft-unit um --erode 1 --zfix 1 --symmetry-p 0.5 --det 1,
    seed 1, fp16 input); UFSM_BENCH_COVER=plan.json: draw the cover's tiles (as train --cover); UFSM_BENCH_HASH=1: print a hash of
    every batch's input, targets, mask and weights (deterministic mode: the same for any worker count; byte-identity checks);
-   UFSM_BENCH_AUG=N: augment mode; UFSM_BENCH_DET=1: deterministic default recipe; UFSM_BENCH_SOFT=S: soft sigma */
+   UFSM_BENCH_AUG=N: augment mode; UFSM_BENCH_DET=1: deterministic default recipe; UFSM_BENCH_SOFT=S: soft sigma;
+   UFSM_BENCH_SIDE=2: the winding phase of band sources (task unwrap), hashed too */
 #include "nn.h"
 #include "sample.h"
 #include "sources.h"
@@ -27,6 +28,7 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_BENCH_AUG")) c.augment = atoi(getenv("UFSM_BENCH_AUG"));
     if (getenv("UFSM_BENCH_DET")) { c.deterministic = 1; c.seed = 1; }
     if (getenv("UFSM_BENCH_SOFT")) c.soft = (float)atof(getenv("UFSM_BENCH_SOFT"));
+    if (getenv("UFSM_BENCH_SIDE")) c.side = atoi(getenv("UFSM_BENCH_SIDE"));   /* task unwrap's phase (no band affinities): the side array is hashed too */
     if (getenv("UFSM_BENCH_COVER")) {
         cover_plan *plan = cover_load(getenv("UFSM_BENCH_COVER"), S, P); if (!plan) return 1;
         c.B = 1; c.cover = plan; c.deterministic = 1; c.snap = 0; memset(c.level_p, 0, sizeof c.level_p); c.level_p[0] = 1;
@@ -35,11 +37,11 @@ int main(int argc, char **argv) {
     const size_t p3 = (size_t)P * P * P;
     uint64_t h = 0xcbf29ce484222325ull;
     sampler *sp = sampler_start(S, &c);
-    for (int i = 0; i < 4; i++) { batch *b = sampler_next(sp); if (!b) return 1; if (hashing) { h = hash(h, b->x16, (size_t)c.B * 4 * p3 * 2); h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); h = hash(h, b->w, (size_t)c.B * NCH); } sampler_release(sp, b); }   /* warm-up */
+    for (int i = 0; i < 4; i++) { batch *b = sampler_next(sp); if (!b) return 1; if (hashing) { h = hash(h, b->x16, (size_t)c.B * 4 * p3 * 2); h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); } sampler_release(sp, b); }   /* warm-up */
     double t0 = now();
     for (int i = 0; i < NB; i++) {
         batch *b = sampler_next(sp); if (!b) return 1;
-        if (hashing) { h = hash(h, b->x16, (size_t)c.B * 4 * p3 * 2); h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); h = hash(h, b->w, (size_t)c.B * NCH); }
+        if (hashing) { h = hash(h, b->x16, (size_t)c.B * 4 * p3 * 2); h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); }
         sampler_release(sp, b);
     }
     double dt = now() - t0;

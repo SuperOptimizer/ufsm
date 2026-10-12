@@ -104,6 +104,7 @@ sources *sources_load(const char *path) {
         const json *tg = json_get(e, "targets");
         for (int c = 0; c < NCH; c++) {
             const json *t = json_get(tg, CHNAME[c]);
+            if (!t && c == CH_SHEET) t = json_get(tg, "ink");   /* task unwrap: the ink teacher (prob) in target slot 1 */
             for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = -1;
             if (!t) continue;
             if (t->type == J_STR) { s->tgt_key[c] = strdup(t->str); continue; }
@@ -146,6 +147,17 @@ sources *sources_load(const char *path) {
                 fprintf(stderr, "sources: %s: cannot open band target %s/%s (%s)\n", s->name, broot ? broot : "?", bkey, z3_error());
                 json_free(j); sources_free(S); return nullptr;
             }
+            const json *pt = json_get(bt, "phase");
+            if (pt) {
+                const char *proot = json_str(json_get(pt, "root"), nullptr), *pkey = json_str(json_get(pt, "key"), "4.8");
+                store *ps = proot ? store_open(proot) : nullptr;
+                s->phase = ps ? z3_open(ps, pkey, nullptr) : nullptr;
+                const z3_meta *bm = z3_meta_of(s->band), *pm = s->phase ? z3_meta_of(s->phase) : nullptr;
+                if (!pm || pm->shape[0] != bm->shape[0] || pm->shape[1] != bm->shape[1] || pm->shape[2] != bm->shape[2]) {
+                    fprintf(stderr, "sources: %s: cannot open the stored phase %s/%s or its shape differs from the band codes'\n", s->name, proot ? proot : "?", pkey);
+                    json_free(j); sources_free(S); return nullptr;
+                }
+            }
         }
         const json *ho = json_get(e, "holdout");
         if (ho && ho->type == J_ARR && ho->n == 6) for (int d = 0; d < 3; d++) { s->hold_o[d] = (int64_t)json_num(json_at(ho, (size_t)d), 0); s->hold_n[d] = (int64_t)json_num(json_at(ho, (size_t)(3 + d)), 0); }
@@ -166,6 +178,7 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
+        z3_close(s->band); z3_close(s->phase);
         for (int c = 0; c < NCH; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {

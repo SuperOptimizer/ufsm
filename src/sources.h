@@ -73,6 +73,8 @@ typedef struct {
        {"band": {"root": ..., "key": "4.8", "radius": 80, "span": 75}} under "targets" */
     z3 *band;
     float band_radius, band_span;   /* native voxels */
+    z3 *phase;   /* optional: the band field's winding phase (band.h PHASE_*) precomputed on the same label grid (ufsm phase-raster),
+                    {"band": {..., "phase": {"root": ..., "key": "4.8"}}}: windows read it instead of computing the band field */
 } source;
 
 typedef struct {

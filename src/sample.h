@@ -44,6 +44,8 @@ typedef struct {
     int band;                /* 1: fill batch.band from each source's band target (task band_affinity, native level, no geometry warp) */
     int side, side_air;      /* side: 1 fills batch.side (band.h SIDE_*: recto / verso side of the nearest labelled recto) from the same band
                                 field, 2 fills it with the winding phase (band.h PHASE_*); voxels with CT <= side_air (and CT 0) are unknown */
+    int papyrus;             /* 1: fill batch.pm, the papyrus mask (CT > 0, symmetry applied) for heads whose loss covers all papyrus
+                                (task unwrap: ink) */
     int phase_dense;         /* side 2: > 0 keeps a phase voxel whose windings lie more than phase_dense label voxels apart with probability
                                 phase_dense / spacing (position hash): denser windings weigh more in the loss */
 } sample_cfg;
@@ -61,6 +63,7 @@ typedef struct {
     sheet_batch **sheet;     /* B sparse records; null for legacy task */
     uint8_t *band;           /* B x P^3 band per voxel (src/band.h: 1/18-turn steps mod 252, 255 unknown) when cfg.band */
     uint8_t *side;           /* B x P^3 side (src/band.h SIDE_*) or winding phase (PHASE_*) per voxel when cfg.side */
+    uint8_t *pm;             /* B x P^3 papyrus mask (1 where CT > 0) when cfg.papyrus */
 } batch;
 
 typedef struct sampler sampler;
