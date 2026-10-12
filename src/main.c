@@ -30,6 +30,7 @@ int cmd_predict(int argc, char **argv);
 int cmd_eval(int argc, char **argv);
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
 
 static int usage(void) {
     fprintf(stderr,
@@ -295,6 +296,30 @@ static int cmd_band(int argc, char **argv) {
     const char *side_path = opt(argc, argv, "--side", nullptr);   /* also the recto / verso side per label voxel (band.h SIDE_*) */
     const char *phase_path = opt(argc, argv, "--phase", nullptr);   /* and / or the winding phase (band.h PHASE_*) */
     const char *ff_dir = opt(argc, argv, "--fit-fields", nullptr);   /* and / or the winding fitter's input fields (oracle) */
+    const int pri = arg_index(argc, argv, "--phase-raster");   /* with --fit-fields: read the phase from ufsm phase-raster ROOT KEY (large boxes) */
+    if (ff_dir && pri > 0 && pri + 2 < argc) {
+        const int ffh2 = atoi(opt(argc, argv, "--fit-h", "8"));
+        if (ffh2 < 2 || ffh2 % 2 || b[3] % ffh2 || b[4] % ffh2 || b[5] % ffh2) { fprintf(stderr, "band: --fit-h must be even and divide the box\n"); return 2; }
+        z3 *pz = z3_open(store_open(argv[pri + 1]), argv[pri + 2], nullptr); if (!pz) { fprintf(stderr, "%s\n", z3_error()); return 1; }
+        const int ph = 1; int pn[3]; int64_t po[3], pnn[3];   /* the label box with a one-voxel halo (central differences) */
+        for (int d = 0; d < 3; d++) { po[d] = b[d] / 2 - ph; pnn[d] = b[3 + d] / 2 + 2 * ph; pn[d] = (int)pnn[d]; }
+        const size_t PN = (size_t)pn[0] * pn[1] * pn[2]; uint8_t *phs = malloc(PN);
+        memset(phs, PHASE_UNKNOWN, PN);
+        int64_t ro2[3], rn2[3]; const z3_meta *pm = z3_meta_of(pz);
+        for (int d = 0; d < 3; d++) { ro2[d] = po[d] < 0 ? 0 : po[d]; const int64_t e = po[d] + pnn[d] < pm->shape[d] ? po[d] + pnn[d] : pm->shape[d]; rn2[d] = e - ro2[d]; }
+        uint8_t *tmp = malloc((size_t)rn2[0] * rn2[1] * rn2[2]);
+        if (z3_read(pz, ro2, rn2, tmp, 8)) { fprintf(stderr, "band: phase read failed: %s\n", z3_error()); return 1; }
+        for (int64_t zz = 0; zz < rn2[0]; zz++) for (int64_t yy = 0; yy < rn2[1]; yy++)
+            memcpy(phs + ((size_t)(zz + ro2[0] - po[0]) * pnn[1] + (yy + ro2[1] - po[1])) * pnn[2] + (ro2[2] - po[2]), tmp + ((size_t)zz * rn2[1] + yy) * rn2[2], (size_t)rn2[2]);
+        free(tmp); z3_close(pz);
+        axis axr = {0};
+        if (axis_load(&axr, opt(argc, argv, "--axis", "/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "band: cannot load axis\n"); return 1; }
+        const double t0p = now();
+        if (band_fit_fields(phs, nullptr, pn, ph, b, ffh2, &axr, ff_dir)) { fprintf(stderr, "band: cannot write the fit fields to %s\n", ff_dir); return 1; }
+        fprintf(stderr, "band: fit fields from the stored phase in %.1fs -> %s\n", now() - t0p, ff_dir);
+        free(phs);
+        return 0;
+    }
     const int ffh = atoi(opt(argc, argv, "--fit-h", "8"));   /* field voxel edge, native voxels (even) */
     if (ff_dir && (ffh < 2 || ffh % 2 || b[3] % ffh || b[4] % ffh || b[5] % ffh)) { fprintf(stderr, "band: --fit-h must be even and divide the box\n"); return 2; }
     uint8_t *codes = calloc(N, 1), *band = malloc(N), *side = side_path ? malloc(N) : nullptr, *phase = phase_path || ff_dir ? malloc(N) : nullptr,
@@ -347,7 +372,6 @@ static int cmd_band(int argc, char **argv) {
    against a winding_mod14 band raster (label grid, 2 native voxels per label voxel, code = 1 + round(18 q) mod 252 with q the mesh
    coordinate, q = U for dir +1): on every labelled voxel of the box U_fit - q must be one constant mod 14 turns. */
 static int cmp_float(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
-static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
 static int cmd_fit(int argc, char **argv) {
     const char *dir = argv[2];
     char path[1400]; snprintf(path, sizeof path, "%s/fields.json", dir);
@@ -371,13 +395,14 @@ static int cmd_fit(int argc, char **argv) {
     fit_fields ff = {shp[0], shp[1], shp[2], h, a[0], a[1], {a[2], a[3], a[4], a[5], a[6], a[7]}, a[8], a[9], cy, cx};
     fit_cfg c = fit_cfg_default();
     c.verbose = arg_index(argc, argv, "--quiet") < 0;
-    c.dir = atoi(opt(argc, argv, "--dir", "0")); c.knot_dz = atoi(opt(argc, argv, "--knot-dz", "1024")); c.phase_stage = atoi(opt(argc, argv, "--phase-stage", "4"));
+    c.dir = atoi(opt(argc, argv, "--dir", "0")); c.unwrap_voxels = atoi(opt(argc, argv, "--unwrap-voxels", "1")); c.knot_dz = atoi(opt(argc, argv, "--knot-dz", "1024")); c.phase_stage = atoi(opt(argc, argv, "--phase-stage", "4"));
     if (*opt(argc, argv, "--lattice", "")) { c.nstage = 0; char *t = strdup(opt(argc, argv, "--lattice", "")); for (char *q = strtok(t, ","); q && c.nstage < 8; q = strtok(nullptr, ",")) c.lattice[c.nstage++] = atoi(q); free(t); }
     if (*opt(argc, argv, "--steps", "")) { int k = 0; char *t = strdup(opt(argc, argv, "--steps", "")); for (char *q = strtok(t, ","); q && k < 8; q = strtok(nullptr, ",")) c.steps[k++] = atoi(q); for (; k < c.nstage; k++) c.steps[k] = c.steps[k - 1]; free(t); }
     nn_init(atoi(opt(argc, argv, "--gpu", "0")));
     const double t0 = now();
-    fit_model *m = fit_run(&ff, &c);
-    if (!m) return 1;
+    const char *min = opt(argc, argv, "--model", nullptr);   /* score / export a saved model instead of fitting */
+    fit_model *m = min ? fit_load(min) : fit_run(&ff, &c);
+    if (!m) { fprintf(stderr, "fit: no model%s%s\n", min ? " in " : "", min ? min : ""); return 1; }
     fprintf(stderr, "fit: dir %+d, %d knots, lattice %d (%dx%dx%d), loss %.5f in %.1fs\n", m->dir, m->nk, m->L, m->lz, m->ly, m->lx, m->loss[0], now() - t0);
     for (int d = 0; d < 3; d++) m->origin[d] = org[d];
     const char *mout = opt(argc, argv, "--out", nullptr);
@@ -412,6 +437,7 @@ static int cmd_fit(int argc, char **argv) {
         if (z3_read(z, lo, ln, codes, 8)) { fprintf(stderr, "fit: code read failed: %s\n", z3_error()); return 1; }
         enum { NB = 14 * 72 }; static size_t hist[NB]; memset(hist, 0, sizeof hist);
         float *dv = malloc(nl * sizeof(float)); size_t nd = 0;
+        FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;   /* box-local z y x, U - q mod 14 per voxel */
         for (int64_t zz = 0; zz < ln[0]; zz++) for (int64_t yy = 0; yy < ln[1]; yy++) for (int64_t xx = 0; xx < ln[2]; xx++) {
             const uint8_t cd = codes[((size_t)zz * ln[1] + yy) * ln[2] + xx];
             if (cd < 1 || cd > 252) continue;
@@ -420,6 +446,7 @@ static int cmd_fit(int argc, char **argv) {
             const double cya = cy[(int)fmin(pz, na - 1)], cxa = cx[(int)fmin(pz, na - 1)];
             const double U = fit_W(m, pz, py, px) + m->dir * atan2(py - cya, px - cxa) / (2 * M_PI);
             double d = fmod(U - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14;
+            if (dump) { const float rec[4] = {(float)pz, (float)py, (float)px, (float)d}; if (fwrite(rec, 4, 4, dump) != 4) { fclose(dump); dump = nullptr; } }
             dv[nd++] = (float)d; hist[(int)(d / 14 * NB) % NB]++;
         }
         size_t best = 0; int bi = 0;
@@ -434,7 +461,7 @@ static int cmd_fit(int argc, char **argv) {
         printf("fit score: %zu labelled voxels, gauge %.3f, winding ids right %.4f, |error| < 0.08 turn %.4f, |error| median %.3f p90 %.3f turn\n", nd, mode + mean,
                nd ? (double)right / nd : 0, nd ? (double)close / nd : 0, na2 ? ae[na2 / 2] : 0, na2 ? ae[na2 * 9 / 10] : 0);
         free(ae);
-        free(codes); free(dv); z3_close(z);
+        free(codes); free(dv); z3_close(z); if (dump) fclose(dump);
     }
     fit_free(m); for (int k = 0; k < 10; k++) free(a[k]); free(cy); free(cx);
     return 0;

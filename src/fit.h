@@ -27,6 +27,7 @@ typedef struct {
     int phase_stage;                /* stages before it fit the gradient terms only (normal, density: no integer ambiguity, they
                                        integrate the turn count); the phase term (periodic) refines from this stage on */
     float phase_ramp;               /* phase_stage: phase weight from phase_ramp * w_phase to w_phase */
+    int unwrap_voxels;              /* phase-stage init: 1 voxel-level quality-guided unwrapping (default), 0 lattice-node unwrapping */
     float core;                     /* no data terms within core * pitch of the axis */
     int verbose;
 } fit_cfg;

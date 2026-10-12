@@ -201,6 +201,15 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   under-count), phase confidence 0.69; fitted: winding ids right 64%, |error| median 0.083 turn. The final (step 7048)
   checkpoint: winding ids right 96.9%, |error| median 0.050 p90 0.154 turn (in-sample: the box lies in the training block).
   `ufsm fit --winding DIR` writes W * 256 as a uint16 zarr (volcomp typed chunks, exact; 128^3 at step 4: 800 KB).
+- Whole smoke block (1792 x 1856 x 2048 native, fields 224 x 232 x 256 at h 8): the gradient-only stages now read fields pooled
+  to ~4 field voxels per lattice cell (stages 0-3: 300 s -> 6 s; the fit 6.4 -> 1.5 min), and the phase stage starts from a
+  voxel-level quality-guided unwrapping of U mod 1 = frac(phi + dir theta / 2 pi) (flooded in confidence order, half-turn
+  continuity between 6-neighbours) instead of the lattice-node unwrapping. Oracle fields (`ufsm band --fit-fields
+  --phase-raster`): 94.5% winding ids, limited by label coverage (known phase 24-49% of the field voxels in the end z-slabs vs
+  81-83% in the middle; the wrong ids sit at large radius in the end slabs, where the fit bridges unlabelled stretches).
+  Network fields (step-7048 checkpoint, predict --fit-fields, 75 s): 73.4% with the node unwrapping -> 90.6% with the voxel
+  unwrapping; the wrong ids are mostly -1 (the fit under-counts, as the network's density does) and at the largest radii.
+  `ufsm fit --model DIR` scores / exports a saved model, `--score-dump F` writes the per-voxel errors.
 - `ufsm wraps` (one tifxyz per wrap: rows every step native in z, columns every step / r_k in theta, each vertex the root of
   W = k along the ray from the umbilicus; tifxyz per upstream save_tifxyz: x/y/z float32, -1 invalid, meta.json scale / bbox /
   area / winding) and `ufsm render` (vertex grid to 1 px per native voxel, ink zarr max-composited over +-depth along the
