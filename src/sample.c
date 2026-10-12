@@ -1,6 +1,7 @@
 #include "sample.h"
 #include "band.h"
 #include "target_erode.h"
+#include "papyrus.h"
 #include "nn.h"
 #include "ct_augment.h"
 #include "spatial_augment.h"
@@ -690,6 +691,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     int tmax = 0;
     for (int ch = 0; ch < NCH; ch++) {
         uint8_t *dst = ttmp + (size_t)ch * p3;
+        if (c->papyrus) { memset(dst, 0, p3); continue; }   /* task papyrus: labels from the CT below */
         if (ch == region_ch) {
             z3 *rz = source_region(s, ch, ri);
             if (!rz) return -1;
@@ -719,7 +721,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (mx > tmax) tmax = mx;
         }
     }
-    if (!c->cover && tmax == 0 && runif(r) > c->empty_keep) { atomic_fetch_add(&sp->rejected, 1); return 1; }
+    if (!c->cover && !c->papyrus && tmax == 0 && runif(r) > c->empty_keep) { atomic_fetch_add(&sp->rejected, 1); return 1; }
     PROF_MARK(PS_TARGETS);
     /* curriculum: thicken the surface band by max-filtering the target (hard labels only, pyramid sources) */
     if (c->dilate > 0 && region_ch < 0) {
@@ -795,6 +797,14 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         uint8_t *dst = ttmp + (size_t)ch * p3;
         for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k]; ign[k] |= v == 255; dst[k] = v == 255 ? 0 : (uint8_t)(v + (v >= 127)); }   /* (v * 255 + 127) / 254 for v < 255 */
     }
+    float pap_t = 0;
+    if (c->papyrus) {   /* task papyrus: channel 0 (probability x 255) and its ignore band from the clean CT, before the scanner augmentation */
+        const double u_mode = runif(r), u_t = runif(r), u_tau = runif(r);
+        pap_t = papyrus_cutoff(c->papyrus, ctu, p3, u_mode, u_t);
+        papyrus_labels(ctu, P, c->papyrus, pap_t, u_tau, ttmp, ign, ttmp + p3, big + p3);   /* channel 1 as scratch, scratch 8 P^3 */
+        memset(ttmp + p3, 0, p3);
+        w[0] = 1;
+    }
     PROF_MARK(PS_ENCODE);
     if (c->sheet) sheet_mask_contacts(c->sheet,o,P,ign);
     /* input channels (z-scored CT, radial unit vector) written in one pass straight into the batch with the symmetry
@@ -856,6 +866,8 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             spatial_aug_affine(&spatial, rnext(r), c->affine_aniso * c->scan.strength, c->affine_shear * c->scan.strength);
     }
     b->um[i] = (float)(s->um * (double)(1 << l) * (spatial.active ? spatial.scale * cbrt(spatial.det) : 1.0));   /* affine: the volume-preserving voxel size */
+    if (c->papyrus) b->um[i] = c->papyrus->cond == 1 ? (float)(ia * ((pap_t - mean) / sd) + ib) : 0.f;   /* the cutoff where the input puts it */
+    if (c->papyrus && c->papyrus->cond == 2) { mean = pap_t; ib = 0.f; }   /* the CT channel (ct - t) / sd: the cutoff at zero */
     if (!spatial.active) {
         for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y);
         sym_u8(mask, M, P, y);

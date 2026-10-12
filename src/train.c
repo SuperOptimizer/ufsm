@@ -3,6 +3,7 @@
 #include "nn.h"
 #include "checkpoint.h"
 #include "sample.h"
+#include "papyrus.h"
 #include "cover.h"
 #include <limits.h>
 #include "sources.h"
@@ -63,6 +64,32 @@ static int g_aff, g_cout = NCH; static aff_offsets_t g_aff_off; static float g_a
    --side 2: two channels, the winding phase between labelled consecutive rectos (src/band.h PHASE_*) as soft targets
    0.5 + 0.5 cos(2 pi phase) and 0.5 + 0.5 sin(2 pi phase) (BCE: minimised at the target, so an unsure net shrinks towards 0.5). */
 static int g_side, g_side_ch, g_side_nc; static float g_side_lambda = 1.f;
+/* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
+   (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */
+static int g_papyrus; static papyrus_cfg g_pap;
+static int papyrus_args(int argc, char **argv, int B) {
+    papyrus_cfg *c = &g_pap; memset(c, 0, sizeof *c);
+    const char *rel = opt(argc, argv, "--pap-rel", nullptr);
+    int bad = sscanf(opt(argc, argv, "--pap-cut", "50,128"), "%f,%f", &c->t_lo, &c->t_hi) != 2 ||
+              sscanf(opt(argc, argv, "--pap-tau", "0,0"), "%f,%f", &c->tau_lo, &c->tau_hi) != 2 ||
+              (rel && sscanf(rel, "%f,%f", &c->rel_lo, &c->rel_hi) != 2);
+    c->rel_p = rel ? (float)atof(opt(argc, argv, "--pap-rel-p", "0.5")) : 0.f;
+    c->sigma = (float)atof(opt(argc, argv, "--pap-sigma", "1")); c->band = (float)atof(opt(argc, argv, "--pap-band", "0"));
+    c->clean = atoi(opt(argc, argv, "--pap-clean", "0")); c->cond = atoi(opt(argc, argv, "--pap-cond", "1"));   /* 1 stem bias, 2 input zero */
+    bad |= !(c->t_lo >= 0 && c->t_lo <= c->t_hi && c->t_hi <= 255) || !(c->rel_p >= 0 && c->rel_p <= 1) || (rel && !(c->rel_lo > 0 && c->rel_lo <= c->rel_hi)) ||
+           !(c->sigma >= 0 && c->sigma <= PAPYRUS_RMAX / 3.f) || !(c->tau_lo >= 0 && c->tau_lo <= c->tau_hi) || (c->tau_hi > 0 && !(c->tau_lo > 0)) ||
+           !(c->band >= 0) || c->clean < 0 || c->cond < 0 || c->cond > 2;
+    if (bad) { fprintf(stderr, "--task papyrus: --pap-cut LO,HI (0..255) [--pap-rel LO,HI --pap-rel-p P] [--pap-sigma 0..%.3g] [--pap-tau LO,HI (> 0)] [--pap-band B] [--pap-clean N] [--pap-cond 0|1|2]\n", PAPYRUS_RMAX / 3.0); return 1; }
+    if (c->cond == 1 && B != 1) { fprintf(stderr, "--task papyrus --pap-cond 1 needs --B 1 (one cutoff per forward)\n"); return 1; }
+    if (atoi(opt(argc, argv, "--ct-aug", "0"))) { fprintf(stderr, "--task papyrus: not with --ct-aug (its input is not the z-scored CT the cutoff code assumes)\n"); return 1; }
+    fprintf(stderr, "papyrus: cutoff U(%g, %g)", c->t_lo, c->t_hi);
+    if (c->rel_p > 0) fprintf(stderr, ", with p %g Otsu x U(%g, %g)", c->rel_p, c->rel_lo, c->rel_hi);
+    fprintf(stderr, " of the CT smoothed by sigma %g; %s targets", c->sigma, c->tau_hi > 0 ? "soft" : "hard");
+    if (c->tau_hi > 0) fprintf(stderr, " (tau U(%g, %g))", c->tau_lo, c->tau_hi);
+    fprintf(stderr, ", ignore band %g, cleanup < %d voxels, %s\n", c->band, c->clean, c->cond == 1 ? "conditioned on the cutoff (stem bias)" :
+            c->cond == 2 ? "conditioned on the cutoff (the CT input's zero)" : "marginalised over cutoffs");
+    return 0;
+}
 static float g_verso_swap, g_verso_lambda = 1.f;   /* lambda: verso loss weight (its gradient and its share of the reported loss) */ static int g_verso_flip, g_head_only;   /* swap: probability of a step with the direction reversed and recto/verso targets exchanged */
 static int g_verso, g_verso_start, g_verso_on, g_verso_self, g_verso_zero, g_verso_ridge, g_verso_anchor;   /* anchor: recto voxels without a trusted label take the teacher's normal-direction output */ static float g_verso_hard;   /* ridge: thin verso targets, the teacher's ridge along the direction at >= this byte */   /* hard: binary verso targets at this teacher probability; zero: fresh verso head row */   /* self: targets from the live weights (collapses: the net learns to ignore the direction) */
 static sheet_dataset *g_sheet;
@@ -270,7 +297,8 @@ static void verso_target(gpu_state *d, shape5 xs) {
 }
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 xs = {B, 4, d->side >= 0 ? g_Dl : P, P, P};
-    if (unet_cfg_of(d->u)->scale_cond) unet_set_scale(d->u, d->um);   /* B == 1 (checked at startup) */
+    if (unet_cfg_of(d->u)->scale_cond) { if (g_papyrus) unet_set_cond(d->u, d->um); else unet_set_scale(d->u, d->um); }   /* B == 1 (checked at
+                                                                                                    startup); papyrus: um is the cutoff code */
     if (g_verso_on) verso_target(d, xs);
     const int q = P / g_hdiv, hm = unet_hr_mode(g_half);
     const shape5 hs = {B, g_cout, q, q, q};   /* --half-res: the network's grid, the full-resolution output channels */
@@ -388,6 +416,9 @@ int cmd_train(int argc, char **argv) {
                         "                                     upsampled; pack = means + the CT's sub-voxel gradients / contrast in, 8 sub-voxel logits out\n"
                         "                                     (pack4: of the 2x-pooled window, logits upsampled 2x after); task surface\n"
                         "       [--task surface_winding --geometry geometry.json] [--sheet-init 1] [--sheet-variant 0|1|2] [--task band_affinity --grow-head 1 --aff-lambda 1] [--init-from CKPT (shape-matching layers)]\n"
+                        "       [--task papyrus [--pap-cut 50,128] [--pap-rel 0.6,1.6 --pap-rel-p 0.5] [--pap-sigma 1] [--pap-tau LO,HI] [--pap-band 0] [--pap-clean 0] [--pap-cond 1|2|0]]\n"
+                        "                                     papyrus vs void labels from the clean CT at a random cutoff per patch (src/papyrus.h); --pap-cond 1|2:\n"
+                        "                                     the net is conditioned on the cutoff (1 stem bias, 2 the CT input's zero; predict --papyrus-cut T)\n"
                         "       [--warm-start 1]   start a new cover from a legacy checkpoint's weights/state\n"
                         "  B is the per-GPU batch; gradients are averaged across GPUs every step (effective batch B x ngpus).\n"
                         "  --split z --gpus 0,1: every window is split along z across the two GPUs instead (batch B; P a multiple of 2^nlev).\n"
@@ -448,7 +479,10 @@ int cmd_train(int argc, char **argv) {
         fprintf(stderr, "%s: channel%s %d%s, lambda %g, air <= %s\n", g_side == 2 ? "phase" : "side", g_side == 2 ? "s" : "", g_side_ch,
                 g_side == 2 ? " (cos), +1 (sin)" : "", g_side_lambda, opt(argc,argv,"--side-air","0"));
     }
-    if (sheet_ck<0 || (strcmp(task,"surface") && strcmp(task,"surface_winding") && !g_aff) || (!strcmp(task,"surface_winding") != (geometry!=nullptr)) ||
+    g_papyrus = !strcmp(task, "papyrus");
+    if (g_papyrus && (geometry || g_verso || g_side)) { fprintf(stderr, "--task papyrus: no geometry, verso or side\n"); return 2; }
+    if (g_papyrus && papyrus_args(argc, argv, B)) return 2;
+    if (sheet_ck<0 || (strcmp(task,"surface") && strcmp(task,"surface_winding") && !g_aff && !g_papyrus) || (!strcmp(task,"surface_winding") != (geometry!=nullptr)) ||
         (sheet_ck && (!geometry || sheet_init)) || (geometry && resume && !sheet_ck && !sheet_init) || (sheet_init && (!geometry || !resume))) {
         fprintf(stderr,"task mismatch: surface_winding needs --geometry; legacy warm-start needs --sheet-init 1; winding resumes preserve their geometry\n"); return 2;
     }
@@ -532,6 +566,7 @@ int cmd_train(int argc, char **argv) {
     unet_cfg cfg = {4, {16, 32, 64, 80}, 4, g_cout, 8, 0, 0};
     cfg.down_norm = atoi(opt(argc, argv, "--down-norm", "0"));
     cfg.scale_cond = atoi(opt(argc, argv, "--scale-cond", "0"));   /* voxel-size conditioning of the stem (unet_set_scale per batch) */
+    if (g_papyrus) cfg.scale_cond = g_pap.cond == 1;   /* task papyrus: the stem-bias conditioning carries the cutoff instead */
     if (cfg.scale_cond && B != 1) { fprintf(stderr, "--scale-cond needs --B 1 (one voxel size per forward)\n"); return 2; }
     { const char *dw = opt(argc, argv, "--dec-widths", nullptr);   /* narrower coarse decoder levels (0 = encoder width), e.g. 0,32 */
       if (dw) { char *t = strdup(dw); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.dec_widths[l++] = atoi(q); free(t); } }
@@ -576,6 +611,7 @@ int cmd_train(int argc, char **argv) {
     if (atoi(opt(argc, argv, "--zfix", "0"))) sc.augment = 3;      /* diagnostic: symmetries that keep the z axis */
     if (atoi(opt(argc, argv, "--intonly", "0"))) sc.augment = 4;   /* diagnostic: intensity jitter, no symmetry */
     sc.band = g_aff; sc.side = g_side; sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
+    sc.papyrus = g_papyrus ? &g_pap : nullptr;
     sc.phase_dense = atoi(opt(argc, argv, "--phase-dense", "0"));   /* side 2: weigh windings closer than this (label voxels) up */
     if (sc.phase_dense && g_side != 2) { fprintf(stderr, "--phase-dense needs --side 2\n"); return 2; }
     if (sc.phase_dense) fprintf(stderr, "phase: windings wider than %d label voxels supervised at a rate dense / spacing\n", sc.phase_dense);
@@ -888,6 +924,11 @@ int cmd_train(int argc, char **argv) {
     if (g_aff) {
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
         snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"task\":\"band_affinity\",\"affinity\":{\"version\":1,\"channel0\":\"recto\",\"offsets_axis_d\":[[0,1],[1,1],[2,1],[0,8],[1,8],[2,8]],\"band\":\"winding_mod14 nearest-recto +- half turn\",\"lambda\":%.9g}}",g_aff_lambda);
+    }
+    if (g_papyrus) {   /* channel 0 = papyrus (src/papyrus.h); predict reads "cond" (papyrus_checkpoint) */
+        size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"task\":\"papyrus\",\"papyrus\":{\"version\":1,\"cond\":%d,\"code\":\"%s\",\"cut\":[%.9g,%.9g],\"rel\":[%.9g,%.9g],\"rel_p\":%.9g,\"sigma\":%.9g,\"tau\":[%.9g,%.9g],\"band\":%.9g,\"clean\":%d}}",
+                 g_pap.cond,g_pap.cond==2?"input (ct - cutoff) / window sd":g_pap.cond?"stem bias (cutoff - window mean) / window sd":"none",g_pap.t_lo,g_pap.t_hi,g_pap.rel_lo,g_pap.rel_hi,g_pap.rel_p,g_pap.sigma,g_pap.tau_lo,g_pap.tau_hi,g_pap.band,g_pap.clean);
     }
     if (g_verso) {   /* channel 1 = verso; band affinities (if any) follow at 2.. */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;

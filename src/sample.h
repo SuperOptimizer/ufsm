@@ -46,6 +46,9 @@ typedef struct {
                                 field, 2 fills it with the winding phase (band.h PHASE_*); voxels with CT <= side_air (and CT 0) are unknown */
     int phase_dense;         /* side 2: > 0 keeps a phase voxel whose windings lie more than phase_dense label voxels apart with probability
                                 phase_dense / spacing (position hash): denser windings weigh more in the loss */
+    const struct papyrus_cfg *papyrus; /* task papyrus (src/papyrus.h; nullptr = off): no target reads; channel 0 = papyrus labels from the
+                                patch's clean CT at a random cutoff (before the scanner augmentation); batch.um then holds that cutoff in
+                                input units ((t - mean) / sd, times the intensity jitter: the conditioning code) instead of a voxel size */
 } sample_cfg;
 
 typedef struct {

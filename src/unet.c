@@ -1049,6 +1049,7 @@ static const float *P(const unet *u, size_t off) { return u->fw + off; }
 /* conv1 bias of an encoder block: the scale-conditioned effective bias for the stem */
 static const float *B1(const unet *u, const block *b) { return b == &u->enc[0] && u->cfg.scale_cond ? u->stem_b : P(u, b->c1.b); }
 void unet_set_scale(unet *u, double um) { u->sc_c = unet_scale_code(um); }
+void unet_set_cond(unet *u, float c) { u->sc_c = c; }
 void unet_apply_sparse24(unet *u);
 
 /* the GroupNorm (params + stats) of a block's output: silu(gn(a2)) = s2 */
