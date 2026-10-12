@@ -28,7 +28,13 @@ ufsm sample <sources.json> --out DIR                   # dump patch montages to 
 ufsm train <sources.json> --out runs/r1 --gpus 0 --P 512 --B 1 --steps 20000
 ufsm predict <ckpt> <root> <ct-group> <out> --um U [--box z,y,x,nz,ny,nx]
 ufsm eval <pred-root> <pred-group> <label-root> <label-group> --um U [--box ...]
+ufsm train <sources.json> --task papyrus --pap-cond 2 --pap-tau 2,8 --dice 0 ...   # papyrus vs void, labels from the CT itself
+ufsm predict <papyrus.ckpt> <root> <ct-group> <out> --um U --papyrus-cut 80        # papyrus where the smoothed CT exceeds 80
 ```
+
+Papyrus / void network (DESIGN.md "Papyrus / void network"): per patch a random cutoff t, labels = the clean CT smoothed
+by a Gaussian above t, scanner augmentation on the input only, the cutoff fed as the input's zero, so one checkpoint serves
+every cutoff. `tools/papyrus_eval.py` scores checkpoints on the Paris4 holdout boxes and writes CT / overlay PNG grids.
 
 Pipeline scripts: `tools/pget.sh` (parallel ranged download), `tools/ingest_all.sh` (all label zarrs),
 `tools/ingest_segments.sh`, `tools/raster_all.sh`, `tools/make_sources.py` (writes `configs/all.json`).
