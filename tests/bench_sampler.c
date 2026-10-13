@@ -6,7 +6,8 @@
    UFSM_BENCH_SIDE=2: the winding phase of band sources (task unwrap), hashed too; UFSM_BENCH_LEVELS=p0,p1,...: level draw weights;
    UFSM_BENCH_PAPYRUS=sigma,tau_lo,tau_hi,clean: task papyrus labels (cutoffs U(50, 128), conditioned); UFSM_BENCH_SCAN=P: the
    papyrus recipe's scanner ops (noise cnoise blur lowres sharpen ring slice quant) at probability P;
-   UFSM_BENCH_DUMP=prefix: mid-z planes of the first batch (prefix-input.pgm, -target.pgm, -mask.pgm) and its cutoff code */
+   UFSM_BENCH_DUMP=prefix: mid-z planes of the first batch (prefix-input.pgm, -target.pgm, -mask.pgm, -phase.pgm with SIDE=2) and its
+   cutoff code; UFSM_BENCH_PZ=N: N x P x P slab windows */
 #include "nn.h"
 #include "sample.h"
 #include "sources.h"
@@ -34,7 +35,9 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_BENCH_DET")) { c.deterministic = 1; c.seed = 1; }
     if (getenv("UFSM_BENCH_SOFT")) c.soft = (float)atof(getenv("UFSM_BENCH_SOFT"));
     if (getenv("UFSM_BENCH_LEVELS")) { char *t = strdup(getenv("UFSM_BENCH_LEVELS")); int l = 0; memset(c.level_p, 0, sizeof c.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) c.level_p[l++] = atof(q); free(t); }   /* as train --levels */
-    if (getenv("UFSM_BENCH_SIDE")) c.side = atoi(getenv("UFSM_BENCH_SIDE"));   /* task unwrap's phase (no band affinities): the side array is hashed too */
+    if (getenv("UFSM_BENCH_SIDE")) c.side = atoi(getenv("UFSM_BENCH_SIDE"));
+    if (getenv("UFSM_BENCH_PZ")) c.Pz = atoi(getenv("UFSM_BENCH_PZ"));
+    const int Pz = c.Pz > 0 ? c.Pz : P;   /* task unwrap's phase (no band affinities): the side array is hashed too */
     if (getenv("UFSM_BENCH_COVER")) {
         cover_plan *plan = cover_load(getenv("UFSM_BENCH_COVER"), S, P); if (!plan) return 1;
         c.B = 1; c.cover = plan; c.deterministic = 1; c.snap = 0; memset(c.level_p, 0, sizeof c.level_p); c.level_p[0] = 1;
@@ -50,19 +53,20 @@ int main(int argc, char **argv) {
         for (size_t k = 0; k < sizeof ops / sizeof ops[0]; k++) c.scan.p[ops[k]] = p;
     }
     const int hashing = getenv("UFSM_BENCH_HASH") != nullptr;
-    const size_t p3 = (size_t)P * P * P;
+    const size_t p3 = (size_t)Pz * P * P;
     uint64_t h = 0xcbf29ce484222325ull;
-    sampler *sp = sampler_start(S, &c);
+    sampler *sp = sampler_start(S, &c); if (!sp) return 1;
     if (getenv("UFSM_BENCH_DUMP")) {   /* mid-z planes of the first batch: input (z-scored CT x 40 + 128), target, mask */
         batch *b = sampler_next(sp); if (!b) return 1;
-        const char *pre = getenv("UFSM_BENCH_DUMP"); const size_t pl = (size_t)P * P, z0 = (size_t)(P / 2) * pl;
+        const char *pre = getenv("UFSM_BENCH_DUMP"); const size_t pl = (size_t)P * P, z0 = (size_t)(Pz / 2) * pl;
         uint8_t *img = malloc(pl); char fn[1024];
-        for (int k = 0; k < 3; k++) {
+        for (int k = 0; k < (b->side ? 4 : 3); k++) {
             for (size_t j = 0; j < pl; j++) {
                 if (k == 0) { _Float16 h; memcpy(&h, b->x16 + z0 + j, 2); const float v = 128.f + 40.f * (float)h; img[j] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
+                else if (k == 3) img[j] = b->side[z0 + j] < 252 ? (uint8_t)(1 + b->side[z0 + j]) : 0;   /* phase codes 0..251 (0: unknown) */
                 else img[j] = k == 1 ? b->t[z0 + j] : (uint8_t)(b->m[z0 + j] ? 255 : 0);
             }
-            snprintf(fn, sizeof fn, "%s-%s.pgm", pre, k == 0 ? "input" : k == 1 ? "target" : "mask");
+            snprintf(fn, sizeof fn, "%s-%s.pgm", pre, k == 0 ? "input" : k == 1 ? "target" : k == 2 ? "mask" : "phase");
             FILE *f = fopen(fn, "wb"); if (f) { fprintf(f, "P5\n%d %d\n255\n", P, P); fwrite(img, 1, pl, f); fclose(f); }
         }
         printf("dumped %s-*.pgm: um / cutoff code %g, corner %lld %lld %lld\n", pre, b->um[0], (long long)b->corner[0][0], (long long)b->corner[0][1], (long long)b->corner[0][2]);
@@ -77,7 +81,7 @@ int main(int argc, char **argv) {
     }
     double dt = now() - t0;
     uint64_t prod, rej; sampler_stats(sp, &prod, &rej);
-    printf("P=%d workers=%d: %.1f samples/s (%d batches of %d in %.1fs; produced %llu rejected %llu)\n", P, W, NB * c.B / dt, NB, c.B, dt, (unsigned long long)prod, (unsigned long long)rej);
+    printf("%dx%dx%d workers=%d: %.1f samples/s (%d batches of %d in %.1fs; produced %llu rejected %llu)\n", Pz, P, P, W, NB * c.B / dt, NB, c.B, dt, (unsigned long long)prod, (unsigned long long)rej);
     if (hashing) printf("hash %016llx over %d batches\n", (unsigned long long)h, NB + 4);
     sampler_prof_print(sp);
     sampler_stop(sp);

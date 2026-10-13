@@ -526,13 +526,14 @@ extern "C" void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, in
 extern "C" void nn_pred_input_mx8(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, int z0, int nz, void *y, int h16) {
     lp_pred_input_mx8(ct, W, mean, isd, dyo, dxo, axis, z0, nz, y, !h16 ? 0 : g_h16 ? 2 : 1); KCHECK();
 }
-extern "C" void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16) {
-    size_t n = (size_t)W * W * W;
-    if (!h16) pred_in_k<float><<<nblk(n, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, (float *)x);
-    else if (g_h16) pred_in_k<f16><<<nblk(n, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, (f16 *)x);
-    else pred_in_k<bf16><<<nblk(n, 256), 256>>>(ct, W, mean, isd, dyo, dxo, axis, (bf16 *)x);
+extern "C" void nn_pred_input_d(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16) {
+    size_t n = (size_t)D * W * W;
+    if (!h16) pred_in_k<float><<<nblk(n, 256), 256>>>(ct, D, W, mean, isd, dyo, dxo, axis, (float *)x);
+    else if (g_h16) pred_in_k<f16><<<nblk(n, 256), 256>>>(ct, D, W, mean, isd, dyo, dxo, axis, (f16 *)x);
+    else pred_in_k<bf16><<<nblk(n, 256), 256>>>(ct, D, W, mean, isd, dyo, dxo, axis, (bf16 *)x);
     KCHECK();
 }
+extern "C" void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16) { nn_pred_input_d(ct, W, W, mean, isd, dyo, dxo, axis, x, h16); }
 /* half-resolution networks (unet_cfg.half_res, nn.h nn_half_*) */
 template <typename T> __global__ void half_in_k(const T *x, int n, int C, int d, int h, int w, int mode, T *y) {   /* one thread per half voxel */
     const size_t hv = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -644,19 +645,22 @@ __global__ void pred_out_k(const float *lg, const uint8_t *ct, size_t n, uint8_t
     if (i < n) out[i] = ct[i] ? (uint8_t)(255.f / (1.f + __expf(-lg[i])) + 0.5f) : 0;
 }
 extern "C" void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out) { pred_out_k<<<nblk(n, 256), 256>>>(lg, ct, n, out); KCHECK(); }
-__global__ void pred_place_k(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
-    const int I = W - 2 * halo;
+__global__ void pred_place_k(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    const int I = W - 2 * halo, Iz = D - 2 * hz;   /* a D x W x W window, interior planes [hz, D - hz) */
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)I * I * I) return;
-    const int x = halo + (int)(i % I), y = halo + (int)((i / I) % I), z = halo + (int)(i / ((size_t)I * I));
+    if (i >= (size_t)Iz * I * I) return;
+    const int x = halo + (int)(i % I), y = halo + (int)((i / I) % I), z = hz + (int)(i / ((size_t)I * I));
     const int gz = oz + z, gy = oy + y, gx = ox + x;
     if (gz < 0 || gz >= ez || gy < 0 || gy >= ey || gx < 0 || gx >= ex) return;
     const size_t k = ((size_t)z * W + y) * W + x;
     dsh[((size_t)gz * shard + gy) * shard + gx] = ct[k] ? (uint8_t)(255.f / (1.f + __expf(-lg[k])) + 0.5f) : 0;
 }
+extern "C" void nn_pred_place_d(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    const size_t I = (size_t)(W - 2 * halo), Iz = (size_t)(D - 2 * hz);
+    pred_place_k<<<nblk(Iz * I * I, 256), 256>>>(lg, ct, D, W, hz, halo, oz, oy, ox, ez, ey, ex, shard, dsh); KCHECK();
+}
 extern "C" void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
-    const size_t I = (size_t)(W - 2 * halo);
-    pred_place_k<<<nblk(I * I * I, 256), 256>>>(lg, ct, W, halo, oz, oy, ox, ez, ey, ex, shard, dsh); KCHECK();
+    nn_pred_place_d(lg, ct, W, W, halo, halo, oz, oy, ox, ez, ey, ex, shard, dsh);
 }
 /* the CT window's nonzero voxels as bits (word k >> 5, bit k & 31): the output mask of pred_place when the uint8 window does not
    survive the forward (predict keeps the CT in the network's level-0 skip buffer) */
@@ -668,19 +672,22 @@ __global__ void pred_ctmask_k(const uint8_t *ct, size_t n, uint32_t *bits) {
     bits[w] = m;
 }
 extern "C" void nn_pred_ctmask(const uint8_t *ct, size_t n, uint32_t *bits) { pred_ctmask_k<<<nblk((n + 31) / 32, 256), 256>>>(ct, n, bits); KCHECK(); }
-__global__ void pred_place_m_k(const float *lg, const uint32_t *bits, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
-    const int I = W - 2 * halo;
+__global__ void pred_place_m_k(const float *lg, const uint32_t *bits, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    const int I = W - 2 * halo, Iz = D - 2 * hz;
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)I * I * I) return;
-    const int x = halo + (int)(i % I), y = halo + (int)((i / I) % I), z = halo + (int)(i / ((size_t)I * I));
+    if (i >= (size_t)Iz * I * I) return;
+    const int x = halo + (int)(i % I), y = halo + (int)((i / I) % I), z = hz + (int)(i / ((size_t)I * I));
     const int gz = oz + z, gy = oy + y, gx = ox + x;
     if (gz < 0 || gz >= ez || gy < 0 || gy >= ey || gx < 0 || gx >= ex) return;
     const size_t k = ((size_t)z * W + y) * W + x;
     dsh[((size_t)gz * shard + gy) * shard + gx] = (bits[k >> 5] >> (k & 31)) & 1u ? (uint8_t)(255.f / (1.f + __expf(-lg[k])) + 0.5f) : 0;
 }
+extern "C" void nn_pred_place_m_d(const float *lg, const uint32_t *bits, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+    const size_t I = (size_t)(W - 2 * halo), Iz = (size_t)(D - 2 * hz);
+    pred_place_m_k<<<nblk(Iz * I * I, 256), 256>>>(lg, bits, D, W, hz, halo, oz, oy, ox, ez, ey, ex, shard, dsh); KCHECK();
+}
 extern "C" void nn_pred_place_m(const float *lg, const uint32_t *bits, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
-    const size_t I = (size_t)(W - 2 * halo);
-    pred_place_m_k<<<nblk(I * I * I, 256), 256>>>(lg, bits, W, halo, oz, oy, ox, ez, ey, ex, shard, dsh); KCHECK();
+    nn_pred_place_m_d(lg, bits, W, W, halo, halo, oz, oy, ox, ez, ey, ex, shard, dsh);
 }
 /* a window held as planes [zoff, zoff + D) (one half of a split window): its window planes [zlo, zhi) (owned, inside the interior) */
 __global__ void pred_place_mz_k(const float *lg, const uint32_t *bits, int W, int halo, int zlo, int nz, int zoff, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {

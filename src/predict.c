@@ -32,7 +32,7 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 #define NSLOT 3
 typedef struct { int64_t tz, ty, tx; int64_t shard; } tile_t;
 typedef struct {
-    z3 *ct; const int64_t *bo; int W, nthreads;
+    z3 *ct; const int64_t *bo; int W, Wz, nthreads;   /* windows Wz x W x W */
     tile_t *tiles; long ntiles;
     uint8_t *buf[NSLOT]; size_t nz[NSLOT]; double sum[NSLOT], sq[NSLOT];
     atomic_long filled;          /* tiles read so far (slot = i % NSLOT) */
@@ -44,7 +44,7 @@ typedef struct {
 } reader_t;
 static void *reader_main(void *arg) {
     reader_t *r = arg;
-    size_t w3 = (size_t)r->W * r->W * r->W;
+    size_t w3 = (size_t)r->Wz * r->W * r->W;
     for (long i = 0; i < r->ntiles && !atomic_load(&r->failed); i++) {
         double tw = now();
         pthread_mutex_lock(&r->mu);
@@ -53,7 +53,7 @@ static void *reader_main(void *arg) {
         double t1 = now(); r->t_wait += t1 - tw;
         int k = (int)(i % NSLOT);
         tile_t *t = &r->tiles[i];
-        int64_t o[3] = {r->bo[0] + t->tz, r->bo[1] + t->ty, r->bo[2] + t->tx}, n[3] = {r->W, r->W, r->W};
+        int64_t o[3] = {r->bo[0] + t->tz, r->bo[1] + t->ty, r->bo[2] + t->tx}, n[3] = {r->Wz, r->W, r->W};
         if (z3_read(r->ct, o, n, r->buf[k], r->nthreads)) { atomic_store(&r->failed, 1); }
         else if (r->nostats) r->t_read += now() - t1;
         else {
@@ -280,6 +280,11 @@ int cmd_predict(int argc, char **argv) {
     int level = atoi(opt(argc, argv, "--level", "0")), W = atoi(opt(argc, argv, "--window", "288")), halo = atoi(opt(argc, argv, "--halo", "8"));
     int shard = atoi(opt(argc, argv, "--shard", "512")), gpu = atoi(opt(argc, argv, "--gpu", "0")), nlev = atoi(opt(argc, argv, "--levels", "4"));
     const int win_given = *opt(argc, argv, "--window", "") || *opt(argc, argv, "--halo", "");
+    /* --window-z WZ [--halo-z HZ]: slab windows WZ x W x W (train --Pz nets; HZ default WZ / 4), the plain GPU path only */
+    int Wz = atoi(opt(argc, argv, "--window-z", "0")), hz = atoi(opt(argc, argv, "--halo-z", "-1"));
+    const int slab = Wz > 0 && Wz != W;
+    if (Wz <= 0) Wz = W;
+    if (hz < 0) hz = slab ? Wz / 4 : halo;
     int nthreads = atoi(opt(argc, argv, "--threads", "16"));
     const int use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
     const double radial_sign = atof(opt(argc, argv, "--radial-sign", "1"));   /* -1: reversed direction input (a recto model then marks the verso face) */
@@ -480,6 +485,12 @@ int cmd_predict(int argc, char **argv) {
         fprintf(stderr, "predict: window %d, halo %d (default: one window per %d shard when it fits, else 288 / 8; --window / --halo set them)\n", W, halo, shard);
         if (box) for (int d = 0; d < 3; d++) if (boxv[d + 3] > INT64_MAX - W || boxv[d] > INT64_MAX - W - boxv[d + 3]) { fprintf(stderr, "prediction box exceeds the coordinate range\n"); return 2; }
     }
+    if (!slab) { Wz = W; hz = halo; }
+    else if (!win_given || Wz > W || Wz % (1 << (cfg.nlev - 1)) || hz >= Wz / 2 || split || half || sheet_task || auxz || sweep_out || ufsm_env_on("UFSM_PRED_HOSTPATH")) {
+        fprintf(stderr, "predict: --window-z: at most --window (given), a multiple of %d, --halo-z under half of it; one GPU's plain path (no --split, "
+                        "half-resolution, winding, --aux, --cond-sweep or UFSM_PRED_HOSTPATH)\n", 1 << (cfg.nlev - 1));
+        return 2;
+    }
     axis ax = {0};
     if (axisf && axis_load(&ax, axisf)) { fprintf(stderr, "cannot load axis %s\n", axisf); return 1; }
     double um_l = um * (1 << level), scale = (double)(1 << level);
@@ -497,12 +508,13 @@ int cmd_predict(int argc, char **argv) {
     char lv[32], ldir[1400], attrs[1024];
     z3w_level_name(um_l, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
-    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"ema\":%d%s}}",
-             content, ckpt, step, root, ak, (long long)bo[0], (long long)bo[1], (long long)bo[2], W, halo, use_ema, grid_attrs);
+    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"window_z\":%d,\"halo_z\":%d,\"ema\":%d%s}}",
+             content, ckpt, step, root, ak, (long long)bo[0], (long long)bo[1], (long long)bo[2], W, halo, Wz, hz, use_ema, grid_attrs);
     z3w *w = z3w_create(ldir, bn, shard, q, 0, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     int stride = W - 2 * halo;
-    size_t w3 = (size_t)W * W * W;
+    const int strd[3] = {Wz - 2 * hz, stride, stride}, hal[3] = {hz, halo, halo}, wn[3] = {Wz, W, W};   /* per axis (slabs: z differs) */
+    size_t w3 = (size_t)Wz * W * W;
     float *sheet_window=nullptr,*sheet_shard=nullptr,*sheet_rows=nullptr;
     if (sheet_task) {
         char path[1400]; snprintf(path,sizeof path,"%s/winding",out); if (mkdir(path,0755) && errno!=EEXIST) return 1;
@@ -524,7 +536,7 @@ int cmd_predict(int argc, char **argv) {
     const int h16 = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8");
     uint8_t *pu = gpath ? nullptr : malloc(w3), *pud = gpath ? nullptr : nn_malloc(w3);
     float *dyo = malloc(2 * (size_t)W * sizeof(float)), *dxo = dyo + W, *dyd = nn_malloc(2 * (size_t)W * sizeof(float)), *dxd = dyd + W;
-    const int Dl = split ? W / 2 + H0 : W;   /* planes per GPU */
+    const int Dl = split ? W / 2 + H0 : Wz;   /* planes per GPU */
     shape5 xs = {1, !half && (cfg.cin == 5 || cfg.cin == 7) ? cfg.cin : 4, Dl, W, W};   /* (7: a train --cond net, its condition inputs zero here) */
     const shape5 xn = half ? (shape5){1, cfg.cin, W / hdiv, W / hdiv, W / hdiv} : xs;   /* the network's input */
     void *x2 = nullptr, *lrt = nullptr; float *lgf = nullptr;   /* half: the network's input, the intermediate grid (div 4), the full-resolution logits */
@@ -568,7 +580,7 @@ int cmd_predict(int argc, char **argv) {
     for (int d = 0; d < 3; d++) ns[d] = (bn[d] + shard - 1) / shard;
     /* interior = k whole shards (k >= 2, the tile grid on the shard grid): one window per k^3 shards, each shard placed from it and
        written (INFERENCE_MEMORY_PLAN.md, memory into speed); otherwise one or more windows per shard, clipped to it */
-    int kss = !sheet_task && gpath && stride % shard == 0 && stride / shard >= 2 ? stride / shard : 1;
+    int kss = !slab && !sheet_task && gpath && stride % shard == 0 && stride / shard >= 2 ? stride / shard : 1;
     for (int d = 0; d < 3 && kss > 1; d++) { int64_t ph = grid ? (bo[d] - grid_origin[d]) % stride : 0; if (ph < 0) ph += stride; if (ph) kss = 1; }
     int64_t nss[3]; for (int d = 0; d < 3; d++) nss[d] = (ns[d] + kss - 1) / kss;
     float *ffacc = nullptr; int ffbox[3], ffF[3]; size_t ffn = 0;
@@ -581,7 +593,7 @@ int cmd_predict(int argc, char **argv) {
             if (!ffacc) { fprintf(stderr, "predict: no device memory for the fit fields\n"); return 1; }
             nn_zero(ffacc, 12 * ffn * 4);
         } else {   /* per window: an accumulator of its interior cells; the field slab of FFS cells in z on the host */
-            if (stride % ffh || kss > 1 || shard % ffh || (FFS * ffh) % shard) { fprintf(stderr, "predict: --fit-zarr needs window - 2 halo and the shard divisible by --fit-h, FFS * h a multiple of the shard, one window per shard\n"); return 2; }
+            if (stride % ffh || strd[0] % ffh || kss > 1 || shard % ffh || (FFS * ffh) % shard) { fprintf(stderr, "predict: --fit-zarr needs window - 2 halo and the shard divisible by --fit-h, FFS * h a multiple of the shard, one window per shard\n"); return 2; }
             for (int d = 0; d < 3; d++) { const int64_t ph = grid ? (bo[d] - grid_origin[d]) % ffh : 0; if (ph) { fprintf(stderr, "predict: --fit-zarr: the box must be aligned to --fit-h on the tile grid\n"); return 2; } }
             char at[512]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"winding fitter fields (src/fit.h)\",\"h\":%d,\"origin_zyx\":[%lld,%lld,%lld],\"checkpoint\":\"%s\"}}", ffh, (long long)bo[0], (long long)bo[1], (long long)bo[2], ckpt);
             const int64_t fsh[3] = {ffF[0], ffF[1], ffF[2]};
@@ -592,7 +604,7 @@ int cmd_predict(int argc, char **argv) {
                 if (!ffzw[k] || !ffsl[k]) { fprintf(stderr, "predict: --fit-zarr: %s\n", z3w_error()); return 1; }
                 memset(ffsl[k], ffz_fill[k], (size_t)FFS * ffF[1] * ffF[2]);
             }
-            ffwc = stride / ffh + 1; ffwn = (size_t)ffwc * ffwc * ffwc;
+            ffwc = stride / ffh + 1; ffwn = (size_t)(strd[0] / ffh + 1) * ffwc * ffwc;
             ffacc = nn_malloc(12 * ffwn * 4); ffacch = malloc(12 * ffwn * 4);
             if (!ffacc || !ffacch) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }
         }
@@ -600,7 +612,7 @@ int cmd_predict(int argc, char **argv) {
     if (kss > 1) fprintf(stderr, "predict: one window per %d^3 shards (interior %d)\n", kss, stride);
     double t0 = now(); long ntiles = 0, nskip = 0;
     /* enumerate the tiles in shard order, then let the reader run ahead */
-    reader_t rd = {0}; rd.ct = ct; rd.bo = bo; rd.W = W; rd.nthreads = nthreads;
+    reader_t rd = {0}; rd.ct = ct; rd.bo = bo; rd.W = W; rd.Wz = Wz; rd.nthreads = nthreads;
     long cap = 0;
     if (kss > 1) for (int64_t sz = 0; sz < nss[0]; sz++) for (int64_t sy = 0; sy < nss[1]; sy++) for (int64_t sx = 0; sx < nss[2]; sx++) {   /* super-shards */
         if (nwork > 1 && (((sz * nss[1] + sy) * nss[2] + sx) % ngpu) != part) continue;
@@ -612,13 +624,13 @@ int cmd_predict(int argc, char **argv) {
         if (nwork > 1 && (((sz * ns[1] + sy) * ns[2] + sx) % ngpu) != part) continue;   /* another worker's shard */
         for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
         for (int d = 0; d < 3; d++) {
-            int64_t phase = grid ? (bo[d] + so[d] - grid_origin[d]) % stride : 0;
-            if (phase < 0) phase += stride;
+            int64_t phase = grid ? (bo[d] + so[d] - grid_origin[d]) % strd[d] : 0;
+            if (phase < 0) phase += strd[d];
             /* Read the complete globally anchored window, including CT outside
                the requested box. Clip only its output into the current shard. */
-            first[d] = so[d] - phase - halo;
+            first[d] = so[d] - phase - hal[d];
         }
-        for (int64_t tz = first[0]; tz + halo < se[0]; tz += stride)
+        for (int64_t tz = first[0]; tz + hz < se[0]; tz += strd[0])
         for (int64_t ty = first[1]; ty + halo < se[1]; ty += stride)
         for (int64_t tx = first[2]; tx + halo < se[2]; tx += stride) {
             if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
@@ -685,7 +697,7 @@ int cmd_predict(int argc, char **argv) {
             double mean = sum / (double)w3, var = sq / (double)w3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
             if (pcut >= 0 && pap_cond == 1) unet_set_cond(u, (float)((pcut - mean) / sd));   /* papyrus: the cutoff in this window's input units */
             if (pcut >= 0 && pap_cond == 2) mean = pcut;                                         /* (or the input's zero) */
-            for (int z = 0; z < W; z++) {   /* window origin relative to the axis at this slice (double on the host, small in float) */
+            for (int z = 0; z < Wz; z++) {   /* window origin relative to the axis at this slice (double on the host, small in float) */
                 double cy, cx;
                 axis_at(&ax, (double)(o[0] + z) * scale, &cy, &cx);
                 cy /= scale; cx /= scale;
@@ -696,7 +708,7 @@ int cmd_predict(int argc, char **argv) {
             nn_h2d(dyd, dyo, 2 * (size_t)W * sizeof(float));
             if (pprof) { nn_sync(); p_h2d += now() - pt; pt = now(); }
             if ((xd_shared && unet_input_scratch(u, 4 * w3 * 2) != xd) || (ct_shared && unet_input_scratch2(u, w3) != ctd)) { fprintf(stderr, "predict: the network was rebuilt under its input scratch\n"); return 1; }
-            if (!ct_stem) nn_pred_input(ctd, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xd, h16);
+            if (!ct_stem) nn_pred_input_d(ctd, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xd, h16);
             if (cfg.cin == 7 && !half) nn_zero((char *)xd + 4 * w3 * (h16 ? 2 : 4), 3 * w3 * (h16 ? 2 : 4));   /* no condition: inputs 4-6 zero */
             if (auxz) {   /* the fifth channel: the aux volume over this window (level coordinates as the CT; outside 0) */
                 const z3_meta *am = z3_meta_of(auxz); int64_t ao[3], an[3]; int inb = 1;
@@ -726,13 +738,13 @@ int cmd_predict(int argc, char **argv) {
             } else lg = ct_stem ? unet_forward_ct(u, ctd, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xs, h16)
                                 : unet_forward_x(u, xd, xs, 0, h16);
             if (gn_save) unet_gn_accumulate(u);
-            if (ffd && !ffzm) nn_fit_accum(lg, ctd, W, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, 0, 2, 4, 10, ffds, ffacc);
+            if (ffd && !ffzm) nn_fit_accum_d(lg, ctd, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, 0, 2, 4, 10, ffds, ffacc);
             if (ffzm) {   /* the window interior's whole cells, finalized into the field slab (flushed when the slab is left) */
                 int c0[3], c1[3], nc3[3], ok = 1; const int64_t tw[3] = {tz, ty, tx};
                 for (int d = 0; d < 3; d++) {
-                    int64_t lo = tw[d] + halo, hi = tw[d] + W - halo; if (lo < 0) lo = 0; if (hi > bn[d]) hi = bn[d];
+                    int64_t lo = tw[d] + hal[d], hi = tw[d] + wn[d] - hal[d]; if (lo < 0) lo = 0; if (hi > bn[d]) hi = bn[d];
                     c0[d] = (int)((lo + ffh - 1) / ffh); c1[d] = (int)(hi / ffh); if (hi == bn[d]) c1[d] = ffF[d];   /* the box's last, possibly partial, cell */
-                    nc3[d] = c1[d] - c0[d]; if (nc3[d] <= 0 || nc3[d] > ffwc) ok = 0;
+                    nc3[d] = c1[d] - c0[d]; if (nc3[d] <= 0 || nc3[d] > (d ? ffwc : strd[0] / ffh + 1)) ok = 0;
                 }
                 if (ok) {
                     const int64_t slab = c0[0] / FFS;
@@ -742,7 +754,7 @@ int cmd_predict(int argc, char **argv) {
                     const int lbox[3] = {(int)(bn[0] - (int64_t)c0[0] * ffh < (int64_t)nc3[0] * ffh ? bn[0] - (int64_t)c0[0] * ffh : (int64_t)nc3[0] * ffh),
                                          (int)(bn[1] - (int64_t)c0[1] * ffh < (int64_t)nc3[1] * ffh ? bn[1] - (int64_t)c0[1] * ffh : (int64_t)nc3[1] * ffh),
                                          (int)(bn[2] - (int64_t)c0[2] * ffh < (int64_t)nc3[2] * ffh ? bn[2] - (int64_t)c0[2] * ffh : (int64_t)nc3[2] * ffh)};
-                    nn_fit_accum(lg, ctd, W, halo, (int)(tz - (int64_t)c0[0] * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, nc3, 0, 2, 4, 10, ffds, ffacc);
+                    nn_fit_accum_d(lg, ctd, Wz, W, hz, halo, (int)(tz - (int64_t)c0[0] * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, nc3, 0, 2, 4, 10, ffds, ffacc);
                     nn_d2h(ffacch, ffacc, 12 * nl * 4);
                     uint8_t *wa[10]; for (int k = 0; k < 10; k++) wa[k] = malloc(nl);
                     fit_finalize(ffacch, nl, ffh, wa);
@@ -784,8 +796,8 @@ int cmd_predict(int argc, char **argv) {
                 continue;
             }
             if (gpath) {   /* interior straight into the device shard buffer */
-                if (ct_shared) nn_pred_place_m(lg, ctm, W, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
-                else nn_pred_place(lg, ctd, W, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
+                if (ct_shared) nn_pred_place_m_d(lg, ctm, Wz, W, hz, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
+                else nn_pred_place_d(lg, ctd, Wz, W, hz, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
                 const char *e = nn_check();
                 if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }
                 if (pprof) { nn_sync(); p_gpu += now() - pt; }

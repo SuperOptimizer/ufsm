@@ -65,7 +65,8 @@ static void pool2_labels(const uint8_t *in, int n, uint8_t *out) {
     }
 }
 
-/* ---- cube symmetries: out[z,y,x] = in[q] with q[perm[d]] = (flip[d] ? P-1-i_d : i_d) ---- */
+/* ---- cube symmetries: out[z,y,x] = in[q] with q[perm[d]] = (flip[d] ? P-1-i_d : i_d); slabs (D x P x P, D != P) only
+   take the symmetries that keep z (perm[0] == 0) ---- */
 typedef struct { int perm[3]; int flip[3]; } sym;
 
 static sym sym_of(int s) { /* s in [0, 48) */
@@ -84,15 +85,16 @@ static int sym_is_rotation(sym y) {
 }
 
 #define APPLY_SYM(T, name)                                                                        \
-    static void name(const T *in, T *out, int P, sym y) {                                         \
-        if (y.perm[0] == 0 && y.perm[1] == 1 && !y.flip[0] && !y.flip[1] && !y.flip[2]) { memcpy(out, in, (size_t)P * P * P * sizeof(T)); return; } \
-        int64_t stride[3] = {(int64_t)P * P, P, 1};                                                \
-        for (int z = 0; z < P; z++)                                                               \
+    static void name(const T *in, T *out, int D, int P, sym y) {                                  \
+        if (y.perm[0] == 0 && y.perm[1] == 1 && !y.flip[0] && !y.flip[1] && !y.flip[2]) { memcpy(out, in, (size_t)D * P * P * sizeof(T)); return; } \
+        if (D != P && y.perm[0] != 0) abort();                                                    \
+        int64_t stride[3] = {(int64_t)P * P, P, 1}; const int n[3] = {D, P, P};                    \
+        for (int z = 0; z < D; z++)                                                               \
             for (int yy = 0; yy < P; yy++)                                                        \
                 for (int x = 0; x < P; x++) {                                                     \
                     int i[3] = {z, yy, x};                                                        \
                     int64_t q = 0;                                                                \
-                    for (int d = 0; d < 3; d++) q += stride[y.perm[d]] * (y.flip[d] ? P - 1 - i[d] : i[d]); \
+                    for (int d = 0; d < 3; d++) q += stride[y.perm[d]] * (y.flip[d] ? n[d] - 1 - i[d] : i[d]); \
                     out[((int64_t)z * P + yy) * P + x] = in[q];                                   \
                 }                                                                                 \
     }
@@ -123,10 +125,11 @@ struct sampler {
     struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } *occ;   /* per source: coarse label cells containing papyrus (guides the position draw) */
 };
 
-static size_t P3(const sampler *sp) { return (size_t)sp->cfg.P * sp->cfg.P * sp->cfg.P; }
+static int PZ(const sample_cfg *c) { return c->Pz > 0 ? c->Pz : c->P; }   /* window depth (z) */
+static size_t P3(const sampler *sp) { return (size_t)PZ(&sp->cfg) * sp->cfg.P * sp->cfg.P; }
 
 static batch alloc_batch(const sample_cfg *c) {
-    size_t p3 = (size_t)c->P * c->P * c->P;
+    size_t p3 = (size_t)PZ(c) * c->P * c->P;
     batch b;
     const size_t xc = 4 + (c->aux != 0) + (c->cond ? 3 : 0);   /* input channels per sample */
     b.x = c->xfmt ? nullptr : nn_host_alloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
@@ -155,9 +158,10 @@ static void free_batch(batch *b) { if (b->pap) nn_host_free(b->pap); if (b->wind
    source_ct / source_tgt take the global open lock and may open remote stores; before this every draw re-checked every level */
 /* Inclusive level-l origins whose whole patch lies in the CT, region and validation box.
    Round starts up and ends down: flooring a non-aligned holdout start leaks outside it. */
-static int patch_bounds(const source *s, const z3_meta *m, int P, int l, const regions *r, int ri, int validation, int64_t lo[3], int64_t hi[3]) {
+static int patch_bounds(const source *s, const z3_meta *m, const int64_t wn[3], int l, const regions *r, int ri, int validation, int64_t lo[3], int64_t hi[3]) {
     int64_t f = (int64_t)1 << l;
     for (int d = 0; d < 3; d++) {
+        const int64_t P = wn[d];
         lo[d] = 0; hi[d] = m->shape[d] - P;
         if (r) {
             int64_t a = r->origin[ri][d], end = a + (r->rsize ? r->rsize[ri] : r->size);
@@ -179,11 +183,11 @@ static int same_ct(const source *a, const source *b) {
     return a == b || (a->um == b->um && !strcmp(a->ct_key, b->ct_key) && !strcmp(store_root(a->s), store_root(b->s)));
 }
 static int training_hits_holdout(const sampler *sp, const source *s, const int64_t o[3], int l) {
-    int64_t span = (int64_t)sp->cfg.P << l;
+    const int64_t span[3] = {(int64_t)PZ(&sp->cfg) << l, (int64_t)sp->cfg.P << l, (int64_t)sp->cfg.P << l};
     for (int i = 0; i < sp->S->n; i++) {
         const source *h = &sp->S->src[i]; if (!h->hold_n[0] || !same_ct(s, h)) continue;
         int hit = 1;
-        for (int d = 0; d < 3; d++) { int64_t a = o[d] << l; if (a + span <= h->hold_o[d] || a >= h->hold_o[d] + h->hold_n[d]) hit = 0; }
+        for (int d = 0; d < 3; d++) { int64_t a = o[d] << l; if (a + span[d] <= h->hold_o[d] || a >= h->hold_o[d] + h->hold_n[d]) hit = 0; }
         if (hit) return 1;
     }
     return 0;
@@ -211,8 +215,8 @@ static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
         if (ok) {
             const z3_meta *m = z3_meta_of(source_ct(s, l));
             regions *r = region_ch >= 0 ? s->reg[region_ch] : nullptr;
-            int fits = 0; int64_t lo[3], hi[3];
-            for (int i = 0; i < (r ? r->n : 1); i++) if (patch_bounds(s, m, sp->cfg.P, l, r, i, sp->cfg.holdout, lo, hi) &&
+            int fits = 0; int64_t lo[3], hi[3]; const int64_t wn[3] = {PZ(&sp->cfg), sp->cfg.P, sp->cfg.P};
+            for (int i = 0; i < (r ? r->n : 1); i++) if (patch_bounds(s, m, wn, l, r, i, sp->cfg.holdout, lo, hi) &&
                 (sp->cfg.holdout || training_corner_exists(sp, s, l, lo, hi))) { fits = 1; break; }
             ok = fits;
         }
@@ -257,17 +261,17 @@ static inline uint16_t mn16(uint16_t a, uint16_t b) { return a < b ? a : b; }
 /* one raster pass (dir +1 forward, -1 backward). Per row, the neighbours in the previous row and the previous plane are
    final for the pass, so they are folded in for the whole row at once (vectorisable); the in-row dependency is then a
    scalar scan. Same result as visiting the voxels in raster order. */
-static void chamfer_pass(uint16_t *dm, int P, int dir) {
+static void chamfer_pass(uint16_t *dm, int D, int P, int dir) {   /* a D x P x P window */
     const size_t P2 = (size_t)P * P;
-    for (int zi = 0; zi < P; zi++) {
-        const int z = dir > 0 ? zi : P - 1 - zi, zp = z - dir;
+    for (int zi = 0; zi < D; zi++) {
+        const int z = dir > 0 ? zi : D - 1 - zi, zp = z - dir;
         for (int yi = 0; yi < P; yi++) {
             const int y = dir > 0 ? yi : P - 1 - yi, yp = y - dir;
             uint16_t *row = dm + (size_t)z * P2 + (size_t)y * P;
             /* (row, weight face / edge) pairs: previous row of this plane (3, 4); previous plane rows y (3, 4), y-1 and y+1 (4, 5) */
             const uint16_t *nb[4] = {nullptr, nullptr, nullptr, nullptr}; uint16_t wf[4] = {3, 3, 4, 4}, we[4] = {4, 4, 5, 5};
             if (yp >= 0 && yp < P) nb[0] = dm + (size_t)z * P2 + (size_t)yp * P;
-            if (zp >= 0 && zp < P) {
+            if (zp >= 0 && zp < D) {
                 nb[1] = dm + (size_t)zp * P2 + (size_t)y * P;
                 if (y > 0) nb[2] = nb[1] - P;
                 if (y + 1 < P) nb[3] = nb[1] + P;
@@ -284,12 +288,12 @@ static void chamfer_pass(uint16_t *dm, int P, int dir) {
         }
     }
 }
-static int chamfer345(const uint8_t *t, uint16_t *dm, int P) {
-    size_t p3 = (size_t)P * P * P; int any = 0;
+static int chamfer345(const uint8_t *t, uint16_t *dm, int D, int P) {
+    size_t p3 = (size_t)D * P * P; int any = 0;
     for (size_t k = 0; k < p3; k++) { int s = t[k] != 255 && t[k] > 0; dm[k] = s ? 0 : CH_INF; any |= s; }
     if (!any) return 0;
-    chamfer_pass(dm, P, 1);
-    chamfer_pass(dm, P, -1);
+    chamfer_pass(dm, D, P, 1);
+    chamfer_pass(dm, D, P, -1);
     return 1;
 }
 /* The same 3-4-5 chamfer distance saturated at 255 in bytes (dm8 = min(distance, 255): every path to a distance below 255
@@ -298,16 +302,16 @@ static int chamfer345(const uint8_t *t, uint16_t *dm, int P) {
    they compare with is below 255. */
 static inline uint8_t sadd8(uint8_t a, uint8_t b) { const uint8_t v = (uint8_t)(a + b); return v < a ? 255 : v; }   /* vpaddusb */
 static inline uint8_t mn8(uint8_t a, uint8_t b) { return a < b ? a : b; }
-static void chamfer_pass8(uint8_t *dm, int P, int dir, uint8_t *tmp) {
+static void chamfer_pass8(uint8_t *dm, int D, int P, int dir, uint8_t *tmp) {
     const size_t P2 = (size_t)P * P;
-    for (int zi = 0; zi < P; zi++) {
-        const int z = dir > 0 ? zi : P - 1 - zi, zp = z - dir;
+    for (int zi = 0; zi < D; zi++) {
+        const int z = dir > 0 ? zi : D - 1 - zi, zp = z - dir;
         for (int yi = 0; yi < P; yi++) {
             const int y = dir > 0 ? yi : P - 1 - yi, yp = y - dir;
             uint8_t *row = dm + (size_t)z * P2 + (size_t)y * P;
             const uint8_t *nb[4] = {nullptr, nullptr, nullptr, nullptr}; const uint8_t wf[4] = {3, 3, 4, 4}, we[4] = {4, 4, 5, 5};
             if (yp >= 0 && yp < P) nb[0] = dm + (size_t)z * P2 + (size_t)yp * P;
-            if (zp >= 0 && zp < P) {
+            if (zp >= 0 && zp < D) {
                 nb[1] = dm + (size_t)zp * P2 + (size_t)y * P;
                 if (y > 0) nb[2] = nb[1] - P;
                 if (y + 1 < P) nb[3] = nb[1] + P;
@@ -328,13 +332,13 @@ static void chamfer_pass8(uint8_t *dm, int P, int dir, uint8_t *tmp) {
         }
     }
 }
-static int chamfer345_8(const uint8_t *t, uint8_t *dm, int P) {
-    size_t p3 = (size_t)P * P * P; unsigned any = 0;
+static int chamfer345_8(const uint8_t *t, uint8_t *dm, int D, int P) {
+    size_t p3 = (size_t)D * P * P; unsigned any = 0;
     for (size_t k = 0; k < p3; k++) { const unsigned sv = (t[k] != 255) & (t[k] > 0); dm[k] = sv ? 0 : 255; any |= sv; }
     if (!any) return 0;
     uint8_t *tmp = malloc((size_t)P); if (!tmp) abort();
-    chamfer_pass8(dm, P, 1, tmp);
-    chamfer_pass8(dm, P, -1, tmp);
+    chamfer_pass8(dm, D, P, 1, tmp);
+    chamfer_pass8(dm, D, P, -1, tmp);
     free(tmp);
     return 1;
 }
@@ -411,12 +415,13 @@ static void f16_row(const float *v, uint16_t *h, int n) {
     for (; x < n; x++) { _Float16 t = (_Float16)v[x]; memcpy(h + x, &t, 2); }
 }
 /* write_x_aug without an appearance plan or sheet prior, one output row at a time in vectorisable loops (no math errno, so
-   sqrtf vectorises); bit-identical to it: the same expressions, rng draws and signed zeros. */
+   sqrtf vectorises); bit-identical to it: the same expressions, rng draws and signed zeros. D x P x P windows (D != P: slabs,
+   z-keeping symmetries only). */
 [[gnu::optimize("no-math-errno")]]
-static void write_x(const uint8_t *ctu, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
+static void write_x(const uint8_t *ctu, int D, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
                     sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H) {
     pthread_once(&g_ntab_once, ntab_init);
-    const size_t p3 = (size_t)P * P * P;
+    const size_t p3 = (size_t)D * P * P; const int nd[3] = {D, P, P};
     const float sgn[3] = {y.flip[0] ? -1.f : 1.f, y.flip[1] ? -1.f : 1.f, y.flip[2] ? -1.f : 1.f};
     float *a = malloc(9 * (size_t)P * sizeof *a);   /* rows: v0..v3, dy, dx, radial y, radial x, zero */
     if (!a) abort();
@@ -424,11 +429,11 @@ static void write_x(const uint8_t *ctu, int P, const int64_t o[3], float fmean, 
     memset(comp[0], 0, (size_t)P * sizeof *a);
     if (!hasax) { memset(comp[1], 0, (size_t)P * sizeof *a); memset(comp[2], 0, (size_t)P * sizeof *a); }
     const int o1 = (int)o[1], o2 = (int)o[2];
-    for (int z = 0; z < P; z++)
+    for (int z = 0; z < D; z++)
         for (int yy = 0; yy < P; yy++) {
             const int io[3] = {z, yy, 0};
             int s0[3], ds[3] = {0, 0, 0};
-            for (int d = 0; d < 3; d++) s0[y.perm[d]] = y.flip[d] ? P - 1 - io[d] : io[d];
+            for (int d = 0; d < 3; d++) s0[y.perm[d]] = y.flip[d] ? nd[d] - 1 - io[d] : io[d];
             ds[y.perm[2]] = y.flip[2] ? -1 : 1;
             if (jitter) {
                 for (int x = 0; x + 4 <= P; x += 4) { uint64_t u = rnext(r); nrow[x] = g_ntab[u & 0xffff]; nrow[x + 1] = g_ntab[(u >> 16) & 0xffff]; nrow[x + 2] = g_ntab[(u >> 32) & 0xffff]; nrow[x + 3] = g_ntab[u >> 48]; }
@@ -619,13 +624,13 @@ static void u8_stats(const uint8_t *a, size_t n, size_t *nz, double *sum, double
    g j + (g - 1) / 2 (src/band.c); each window voxel gets the weighted mean phasor of its 8 grid neighbours with a known phase,
    unknown when they hold under half the weight. Between two rectos the phase is a linear ramp, which this reproduces; the 1 -> 0
    wrap at a recto is continuous on the circle. */
-static int phase_window_interp(z3 *a, const int64_t o[3], int P, int shift, uint8_t *side) {
+static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shift, uint8_t *side) {   /* a D x P x P window, D <= P */
     static float cs[PHASE_PERIOD], sn[PHASE_PERIOD]; static _Atomic int init;
     if (!atomic_load(&init)) { for (int k = 0; k < PHASE_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); sn[k] = (float)sin(2 * M_PI * k / PHASE_PERIOD); } atomic_store(&init, 1); }
-    const int g = 1 << shift; const double c0 = 0.5 * (g - 1);
+    const int g = 1 << shift; const double c0 = 0.5 * (g - 1); const int wn[3] = {D, P, P};
     int64_t lo[3], ln[3], ro[3], rn[3]; const z3_meta *m = z3_meta_of(a);
     for (int d = 0; d < 3; d++) {
-        lo[d] = (int64_t)floor((o[d] - c0) / g); ln[d] = (int64_t)floor((o[d] + P - 1 - c0) / g) + 2 - lo[d];
+        lo[d] = (int64_t)floor((o[d] - c0) / g); ln[d] = (int64_t)floor((o[d] + wn[d] - 1 - c0) / g) + 2 - lo[d];
         ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
     }
     const size_t N = (size_t)ln[0] * ln[1] * ln[2];
@@ -639,11 +644,11 @@ static int phase_window_interp(z3 *a, const int64_t o[3], int P, int shift, uint
             memcpy(ph + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
         free(tmp);
     }
-    for (int d = 0; d < 3; d++) for (int k = 0; k < P; k++) {   /* per axis: the lower grid neighbour (in the read region) and the fraction */
+    for (int d = 0; d < 3; d++) for (int k = 0; k < wn[d]; k++) {   /* per axis: the lower grid neighbour (in the read region) and the fraction */
         const double u = (o[d] + k - c0) / g; const int64_t j = (int64_t)floor(u);
         j0[d * P + k] = (int)(j - lo[d]); tf[d * P + k] = (float)(u - j);
     }
-    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
+    for (int z = 0; z < D; z++) for (int y = 0; y < P; y++) {
         const int az = j0[z], ay = j0[P + y]; const float tz = tf[z], ty = tf[P + y];
         uint8_t *dst = side + ((size_t)z * P + y) * P;
         for (int x = 0; x < P; x++) {
@@ -663,12 +668,12 @@ static int phase_window_interp(z3 *a, const int64_t o[3], int P, int shift, uint
     free(ph); free(j0); free(tf);
     return 0;
 }
-static int phase_window(z3 *a, const int64_t o[3], int P, int shift, uint8_t *side) {   /* a: s->phase, or s->wind (same grid) */
-    if (shift >= 2) return phase_window_interp(a, o, P, shift, side);
-    int64_t lo[3], ln[3], ro[3], rn[3];
+static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint8_t *side) {   /* a: s->phase, or s->wind (same grid); D x P x P */
+    if (shift >= 2) return phase_window_interp(a, o, D, P, shift, side);
+    int64_t lo[3], ln[3], ro[3], rn[3]; const int wn[3] = {D, P, P};
     const z3_meta *m = z3_meta_of(a);
     for (int d = 0; d < 3; d++) {
-        lo[d] = (o[d] + shift) >> shift; ln[d] = ((o[d] + P - 1 + shift) >> shift) - lo[d] + 1;
+        lo[d] = (o[d] + shift) >> shift; ln[d] = ((o[d] + wn[d] - 1 + shift) >> shift) - lo[d] + 1;
         ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
     }
     const size_t N = (size_t)ln[0] * ln[1] * ln[2];
@@ -682,7 +687,7 @@ static int phase_window(z3 *a, const int64_t o[3], int P, int shift, uint8_t *si
             memcpy(ph + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
         free(tmp);
     }
-    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
+    for (int z = 0; z < D; z++) for (int y = 0; y < P; y++) {
         const uint8_t *row = ph + ((size_t)(((o[0] + z + shift) >> shift) - lo[0]) * ln[1] + (((o[1] + y + shift) >> shift) - lo[1])) * ln[2];
         uint8_t *dst = side + ((size_t)z * P + y) * P;
         for (int x = 0; x < P; x++) dst[x] = row[((o[2] + x + shift) >> shift) - lo[2]];
@@ -762,7 +767,7 @@ void sample_cond_draw(uint64_t seed, int P, const uint8_t *w, uint8_t *wout, flo
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
-    const int P = c->P;
+    const int P = c->P, Pz = PZ(c);   /* window Pz x P x P (Pz < P: a slab) */
     const size_t p3 = P3(sp);
     /* source by weight */
     double u = runif(r) * sp->cum[sp->S->n - 1];
@@ -780,15 +785,15 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     PROF_MARK(PS_LEVEL);
     z3 *ct = source_ct(s, l);
     const z3_meta *m = z3_meta_of(ct);
-    int64_t o[3], n[3] = {P, P, P};
+    int64_t o[3], n[3] = {Pz, P, P};
     if (c->cover) memcpy(o, c->cover->tiles[tile_index] + 1, sizeof o);
     else if (region_ch >= 0) {
         regions *R = s->reg[region_ch];
         ri = (int)rint_below(r, R->n);
-        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, P, l, R, ri, c->holdout, lo, hi)) return 1;
+        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, R, ri, c->holdout, lo, hi)) return 1;
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (c->holdout) {
-        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, P, l, nullptr, 0, 1, lo, hi)) return 1;
+        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, nullptr, 0, 1, lo, hi)) return 1;
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (sp->occ[si].n) {   /* draw around a random coarse cell that contains papyrus */
         size_t k = (size_t)(runif(r) * (double)sp->occ[si].n); if (k >= sp->occ[si].n) k = sp->occ[si].n - 1;
@@ -797,19 +802,19 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         int64_t cc[3] = {cz, cy, cx};
         int dl = sp->occ[si].lev - l;    /* coarse cell -> level-l voxels */
         for (int d = 0; d < 3; d++) {
-            if (m->shape[d] < P) return 1;
+            if (m->shape[d] < n[d]) return 1;
             int64_t f = dl >= 0 ? (int64_t)1 << dl : 1;
             int64_t v = dl >= 0 ? cc[d] * f + rint_below(r, f) : cc[d] >> (-dl);
-            o[d] = v - P / 2; if (o[d] < 0) o[d] = 0; if (o[d] > m->shape[d] - P) o[d] = m->shape[d] - P;
+            o[d] = v - n[d] / 2; if (o[d] < 0) o[d] = 0; if (o[d] > m->shape[d] - n[d]) o[d] = m->shape[d] - n[d];
         }
     } else {
-        for (int d = 0; d < 3; d++) { if (m->shape[d] < P) return 1; o[d] = rint_below(r, m->shape[d] - P + 1); }
+        for (int d = 0; d < 3; d++) { if (m->shape[d] < n[d]) return 1; o[d] = rint_below(r, m->shape[d] - n[d] + 1); }
     }
     if (!c->cover && c->snap && !c->holdout && region_ch < 0) {   /* training only: snapping a validation origin can leave its holdout */
         for (int d = 0; d < 3; d++) {
             int64_t cs = m->chunk[d]; if (cs <= 0) continue;
             o[d] -= o[d] % cs;
-            if (o[d] > m->shape[d] - P) o[d] = m->shape[d] - P;   /* the last window of an axis may stay unaligned */
+            if (o[d] > m->shape[d] - n[d]) o[d] = m->shape[d] - n[d];   /* the last window of an axis may stay unaligned */
             if (o[d] < 0) o[d] = 0;
         }
     }
@@ -818,11 +823,11 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     /* cheap occupancy test on a coarse level before fetching the fine cube */
     int lc = l + 3;
     z3 *cct = lc < MAXLEV ? source_ct(s, lc) : nullptr;
-    if (cct && !c->cover) {
+    if (cct && !c->cover && Pz >= 8) {
         int pc = P >> 3;
-        int64_t oc[3] = {o[0] >> 3, o[1] >> 3, o[2] >> 3}, nc[3] = {pc, pc, pc};
+        int64_t oc[3] = {o[0] >> 3, o[1] >> 3, o[2] >> 3}, nc[3] = {Pz >> 3, pc, pc};
         if (z3_read(cct, oc, nc, big, 1)) return -1;
-        size_t nz = 0, tot = (size_t)pc * pc * pc;
+        size_t nz = 0, tot = (size_t)nc[0] * pc * pc;
         for (size_t k = 0; k < tot; k++) nz += big[k] != 0;
         if ((double)nz / (double)tot < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); return 1; }
     }
@@ -910,7 +915,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     }
     const int trust_r = s->trust_band > 0 ? (s->trust_band >> l < 1 ? 1 : s->trust_band >> l) : 0;
     const int use8 = (!soft_on || dcut <= 254) && 3 * trust_r <= 254;
-#define CHAMFER_FOR(ch_) do { if (dm_ch != (ch_)) { dm_ch = (ch_); dm_any = use8 ? chamfer345_8(ttmp + (size_t)(ch_) * p3, dm8, P) : chamfer345(ttmp + (size_t)(ch_) * p3, dm, P); } } while (0)
+#define CHAMFER_FOR(ch_) do { if (dm_ch != (ch_)) { dm_ch = (ch_); dm_any = use8 ? chamfer345_8(ttmp + (size_t)(ch_) * p3, dm8, Pz, P) : chamfer345(ttmp + (size_t)(ch_) * p3, dm, Pz, P); } } while (0)
     if (soft_on) {
         uint8_t *etab = big + 4 * p3;
         for (int d = 0; d <= dcut; d++) { float df = fmaxf(0,d / 3.f-shift); int t = (int)(254.f * expf(-0.5f * df * df / (sigma * sigma)) + 0.5f); etab[d] = (uint8_t)(t > 254 ? 254 : t); }
@@ -970,7 +975,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     double mean = sum / (double)p3, var = sq / (double)p3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
     double scale = (double)(1 << l);
     float *cyz = xtmp, *cxz = xtmp + P, *nrow = xtmp + 2 * P;
-    for (int z = 0; z < P; z++) { double cy, cx; axis_at(&s->ax, (double)(o[0] + z) * scale, &cy, &cx); cyz[z] = (float)(cy / scale); cxz[z] = (float)(cx / scale); }
+    for (int z = 0; z < Pz; z++) { double cy, cx; axis_at(&s->ax, (double)(o[0] + z) * scale, &cy, &cx); cyz[z] = (float)(cy / scale); cxz[z] = (float)(cx / scale); }
     if (c->augment && scan_aug_enabled(&c->scan)) {   /* scanner domains on the source grid; the per-patch z-score follows them, as at inference */
         PROF_MARK(PS_ZSCORE);
         if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {
@@ -991,6 +996,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         if (c->augment == 4) y = sym_of(0);   /* intensity jitter only */
         if (c->augment == 2) while (!sym_is_rotation(y)) y = sym_of((int)rint_below(r, 48));   /* rotations only */
         if (c->augment == 3) { y = sym_of((int)rint_below(r, 48)); while (y.perm[0] != 0 || y.flip[0]) y = sym_of((int)rint_below(r, 48)); }   /* z fixed: y/x swaps and flips only */
+        if (Pz != P && y.perm[0] != 0) return -1;   /* (sampler_start allows slabs only with augment 0, 3, 4) */
         double a = exp((runif(r) * 2 - 1) * 0.22), bb = (runif(r) * 2 - 1) * 0.2, sg = runif(r) * 0.1;
         ia = (float)a; ib = (float)bb; isg = (float)sg;
     }
@@ -1000,14 +1006,14 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         float jx = (float)((2 * runif(r) - 1) * c->axis_jitter / scale);
         /* Bound the auxiliary radial-direction perturbation throughout the patch. CT/targets remain registered. */
         float radius = INFINITY;
-        for (int z = 0; z < P; z++) {
+        for (int z = 0; z < Pz; z++) {
             float dy = fmaxf(0, fmaxf((float)o[1] - cyz[z], cyz[z] - (float)(o[1] + P - 1)));
             float dx = fmaxf(0, fmaxf((float)o[2] - cxz[z], cxz[z] - (float)(o[2] + P - 1)));
             float rr = sqrtf(dy * dy + dx * dx); if (rr < radius) radius = rr;
         }
         float mag = sqrtf(jy * jy + jx * jx), cap = radius * .0348995f;
         if (mag > cap && mag > 0) { jy *= cap / mag; jx *= cap / mag; }
-        for (int z = 0; z < P; z++) { cyz[z] += jy; cxz[z] += jx; }
+        for (int z = 0; z < Pz; z++) { cyz[z] += jy; cxz[z] += jx; }
     }
     ct_aug_plan ap; const ct_aug_plan *app = nullptr;
     if (c->augment && c->ct_augment) {
@@ -1029,16 +1035,16 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     if (c->papyrus) b->um[i] = c->papyrus->cond == 1 ? (float)(ia * ((pap_t - mean) / sd) + ib) : 0.f;   /* the cutoff where the input puts it */
     if (c->papyrus && c->papyrus->cond == 2) { mean = pap_t; ib = 0.f; }   /* the CT channel (ct - t) / sd: the cutoff at zero */
     if (!spatial.active) {
-        for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, P, y);
-        sym_u8(mask, M, P, y);
+        for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, Pz, P, y);
+        sym_u8(mask, M, Pz, P, y);
     }
     if (c->pmask && !spatial.active) {   /* CT > 0 through the same symmetry (big + 2 P^3, the soft / trust distance map, is free here) */
         uint8_t *pt = big + 2 * p3;
         for (size_t k = 0; k < p3; k++) pt[k] = ctu[k] != 0;
-        sym_u8(pt, b->pm + (size_t)i * p3, P, y);
+        sym_u8(pt, b->pm + (size_t)i * p3, Pz, P, y);
     }
     if (c->pap_head) {   /* the gap labels through the same symmetry; warped samples: all ignored */
-        if (spatial.active) memset(b->pap + (size_t)i * p3, 255, p3); else sym_u8(papc, b->pap + (size_t)i * p3, P, y);
+        if (spatial.active) memset(b->pap + (size_t)i * p3, 255, p3); else sym_u8(papc, b->pap + (size_t)i * p3, Pz, P, y);
         free(papc);
     }
     if (c->band || c->side) {   /* band labels: computed on the source grid, unknown on CT air, then the same symmetry as CT and targets */
@@ -1047,18 +1053,19 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (c->side) memset(b->side + (size_t)i * p3, SIDE_UNKNOWN, p3);
         } else if (stored_phase) {   /* the stored phase (ufsm phase-raster, ufsm downsample --mode phase) */
             uint8_t *sw = malloc(p3);
-            if (!sw || phase_window(s->phase, o, P, pshift, sw)) { free(sw); return -1; }
+            if (!sw || phase_window(s->phase, o, Pz, P, pshift, sw)) { free(sw); return -1; }
             for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) sw[k] = SIDE_UNKNOWN;
-            sym_u8(sw, b->side + (size_t)i * p3, P, y);
+            sym_u8(sw, b->side + (size_t)i * p3, Pz, P, y);
             free(sw);
         } else {
+            if (Pz != P) { fprintf(stderr, "sampler: slab windows take the phase from a stored raster (sources \"phase\" at this level or one coarser)\n"); return -1; }
             uint8_t *bw = malloc(p3), *sw = c->side ? malloc(p3) : nullptr;
             if (!bw || (c->side && !sw) || band_window(s, o, P, bw, sw, c->side == 2, c->phase_dense, tile_index ^ c->seed)) { free(bw); free(sw); return -1; }
             for (size_t k = 0; k < p3; k++) if (!ctu[k]) bw[k] = BAND_UNKNOWN;
-            if (c->band) sym_u8(bw, b->band + (size_t)i * p3, P, y);
+            if (c->band) sym_u8(bw, b->band + (size_t)i * p3, Pz, P, y);
             if (sw) {   /* sides (phases) above CT side_air only: air (CT <= side_air) stays unsupervised */
                 for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) sw[k] = SIDE_UNKNOWN;
-                sym_u8(sw, b->side + (size_t)i * p3, P, y);
+                sym_u8(sw, b->side + (size_t)i * p3, Pz, P, y);
             }
             free(bw); free(sw);
         }
@@ -1076,12 +1083,12 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+5*p3));
     else if (app || c->sheet) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
             X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);
-    else write_x(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H);
+    else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H);
     free(params);
     if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
         uint8_t *aw = calloc(p3, 1), *as = malloc(p3);
         if (!aw || !as || (s->aux && s->aux_level == l && aux_window(s, o, P, aw))) { free(aw); free(as); return -1; }
-        sym_u8(aw, as, P, y);
+        sym_u8(aw, as, Pz, P, y);
         for (size_t k = 0; k < p3; k++) {
             const float v = as[k] / 127.5f - 1.f;
             if (X) X[4 * p3 + k] = v; else if (c->xfmt == 1) { _Float16 hv = (_Float16)v; memcpy(&H[4 * p3 + k], &hv, 2); } else H[4 * p3 + k] = bf16_rn(v);
@@ -1092,10 +1099,10 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         uint8_t *ww = malloc(p3), *ws = malloc(p3);
         if (!ww || !ws) { free(ww); free(ws); return -1; }
         if (stored_phase && s->wind) {
-            if (phase_window(s->wind, o, P, pshift, ww)) { free(ww); free(ws); return -1; }
+            if (phase_window(s->wind, o, Pz, P, pshift, ww)) { free(ww); free(ws); return -1; }
             for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) ww[k] = 255;
         } else memset(ww, 255, p3);
-        sym_u8(ww, ws, P, y);
+        sym_u8(ww, ws, Pz, P, y);
         cond_draw(r, P, ws, b->wind + (size_t)i * p3, X, H, c->xfmt, c->cond_outside);
         free(ww); free(ws);
     }
@@ -1295,6 +1302,14 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
             }
         }
     }
+    if (cfg->Pz > 0 && cfg->Pz != cfg->P) {   /* slab windows: the paths that take a Pz x P x P window */
+        const char *why = cfg->Pz > cfg->P ? "Pz above P" : cfg->cover ? "a cover plan" : cfg->sheet ? "winding geometry" : cfg->band ? "band affinities" :
+            cfg->aux ? "an aux input" : cfg->cond ? "conditioning" : cfg->papyrus || cfg->pap_head ? "papyrus labels" : cfg->dilate ? "dilation" :
+            cfg->ct_augment ? "CT augmentation" : cfg->geometry_augment ? "geometry augmentation" : scan_aug_enabled(&cfg->scan) ? "scanner augmentation" :
+            (cfg->augment == 1 || cfg->augment == 2) ? "symmetries that move z (use --zfix 1)" : (cfg->erode && cfg->level_p[0] > 0) ? "native-level erosion" : nullptr;
+        for (int i = 0; !why && i < S->n; i++) for (int ch = 0; ch < NCH; ch++) if (S->src[i].reg[ch]) why = "region targets";
+        if (why) { fprintf(stderr, "sampler: slab windows (Pz %d < P %d) do not support %s\n", cfg->Pz, cfg->P, why); return nullptr; }
+    }
     sampler *sp = calloc(1, sizeof *sp);
     sp->S = S;
     sp->cfg = *cfg;
@@ -1314,7 +1329,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         for (int c = 0; c < NCH; c++) if (s->reg[c] && s->reg[c]->n) region_ch = c;
         for (int l = s->min_level < 0 ? 0 : s->min_level; l < MAXLEV; l++) if (sp->cfg.level_p[l] > 0 && (region_ch < 0 || l <= 1) && level_ok(sp, s, i, l, region_ch)) eligible = 1;
         if (!isfinite(s->weight) || s->weight < 0) { fprintf(stderr, "sampler: invalid source weight: %s\n", s->name); free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
-        if (!eligible && s->weight > 0) fprintf(stderr, "sampler: %s excluded: no %s patch fits P=%d and the enabled levels\n", s->name, cfg->holdout ? "validation" : "training", cfg->P);
+        if (!eligible && s->weight > 0) fprintf(stderr, "sampler: %s excluded: no %s patch fits %dx%dx%d and the enabled levels\n", s->name, cfg->holdout ? "validation" : "training", PZ(cfg), cfg->P, cfg->P);
         acc += eligible ? s->weight : 0; sp->cum[i] = acc;
     }
     if (acc <= 0) { fprintf(stderr, "sampler: no eligible sources; check window, holdout boxes, regions and levels\n"); free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }

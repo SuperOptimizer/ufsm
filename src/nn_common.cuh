@@ -1942,19 +1942,20 @@ extern "C" void nn_sigmoid(const float *x, size_t n, float *y);
 /* inference input straight from the uint8 CT window: channel 0 = (ct - mean) * isd, 1 = 0, 2/3 = unit radial (y, x) vector
    from the scroll axis (dyo[z] = window y origin - axis y at slice z, likewise dxo); written as the 16-bit storage type
    (h16: fp16 with nn_set_f16, else bf16) or fp32. Output: recto probability * 255 where the CT is nonzero, else 0. */
-template <typename HT> __global__ void pred_in_k(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, HT *x) {
-    size_t w3 = (size_t)W * W * W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+template <typename HT> __global__ void pred_in_k(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, HT *x) {   /* a D x W x W window */
+    size_t w3 = (size_t)D * W * W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= w3) return;
     int xx = (int)(i % W), y = (int)((i / W) % W), z = (int)(i / ((size_t)W * W));
     float dy = dyo[z] + (float)y, dx = dxo[z] + (float)xx, inv = axis ? (float)axis / (sqrtf(dy * dy + dx * dx) + 1e-6f) : 0.f;   /* axis: 0 none, 1, or -1 = reversed direction */
     x[i] = f2h<HT>(((float)ct[i] - mean) * isd); x[w3 + i] = f2h<HT>(0.f); x[2 * w3 + i] = f2h<HT>(dy * inv); x[3 * w3 + i] = f2h<HT>(dx * inv);
 }
 extern "C" void nn_pred_input(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16);
+extern "C" void nn_pred_input_d(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *x, int h16);
 __global__ void pred_out_k(const float *lg, const uint8_t *ct, size_t n, uint8_t *out);
 extern "C" void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out);
 /* the probability of the window's interior (halo .. W - halo) written straight into a device shard buffer (shard^3, x fastest):
    window voxel (z, y, x) lands at shard voxel (oz + z, oy + y, ox + x) when inside [0, e) (o = window origin - shard origin) */
-__global__ void pred_place_k(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
+__global__ void pred_place_k(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 extern "C" void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 /* exact window statistics (nonzero count, sum, sum of squares) of a uint8 window: integer sums, as the host loop computed */
 __global__ void pred_stats_k(const uint8_t *ct, size_t n, unsigned long long *acc);

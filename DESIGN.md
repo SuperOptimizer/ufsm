@@ -406,6 +406,16 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   of 512); `--resume 1` skips written shards. A whole-scroll Paris4 phase at 4.8 um would be ~326 GB (25 MB per shard, 13054
   shards; the desk has 317 GB free), at 9.6 um ~65 GB. Block B: identical known / unknown masks to phase-raster + downsample,
   1.2% of voxels differing by exactly 1 code (float lookup tables vs double trigonometry at rounding boundaries).
+- Slab windows (2026-10-13; user: "what if we didnt do cubes"): the windings change across y / x, while z mostly repeats the same
+  wrap, so `train --Pz N` draws N x P x P windows (N <= P, a multiple of 2^(nlev-1): 32 for 6 levels, the coarsest level then 1
+  plane deep) and `predict --window-z N --halo-z H` (default N / 4) tiles with them. The convolutions already take any depth (the
+  --split z halves); the sampler, trainer and the predict input / placement / fit-pooling kernels gained the depth. Slabs: pyramid
+  targets at levels >= 1 with a stored phase, --zfix 1 symmetries, no regions, cover, band affinities, aux, cond, papyrus labels,
+  dilation, CT / scanner / geometry augmentation, --split or --half-res; predict on one GPU's plain path. Cube windows unchanged:
+  bench_sampler hashes (augment 0 / 1 / 3, phase, 16-bit chamfer, default recipe) and predict's fit fields and shards byte-identical.
+  Laptop: 32 x 256 x 256 at 9.6 um, a 1.5M net (widths 32,32,32,32,64,64), 36 samples/s. A 6-level net sees ~480 voxels (9.6 um
+  ~4.6 mm, 19.2 um ~9 mm), so wider slabs need xy-only pooling levels (not built). A net trained on slabs is run on slabs: its
+  coarsest z taps only ever saw padding.
 - Left: BigTIFF for renders over 4 GB compressed; 9.6 um training on all of Paris4 (desk band codes); the desk runs.
 
 ## Half-resolution networks (2026-10-11)

@@ -44,9 +44,9 @@ static void write_x_ref(const uint8_t *ctu, int P, const int64_t o[3], double me
     for (int z = 0; z < P; z++) for (int yy = 0; yy < P; yy++) { double dy = (double)(o[1] + yy) - cy[z]; for (int x = 0; x < P; x++) {
         size_t k = ((size_t)z * P + yy) * P + x; double dx = (double)(o[2] + x) - cx[z], nn = sqrt(dy * dy + dx * dx) + 1e-6;
         xt[k] = (float)((ctu[k] - mean) / sd); xt[p3 + k] = 0; xt[2 * p3 + k] = (float)(dy / nn); xt[3 * p3 + k] = (float)(dx / nn); } }
-    sym_f32_ref(xt, X, P, y);
+    sym_f32_ref(xt, X, P, P, y);
     for (size_t k = 0; k < p3; k++) X[k] = a * X[k] + b;
-    for (int d = 0; d < 3; d++) { sym_f32_ref(xt + (size_t)(1 + y.perm[d]) * p3, X + (size_t)(1 + d) * p3, P, y); if (y.flip[d]) for (size_t k = 0; k < p3; k++) X[(size_t)(1 + d) * p3 + k] = -X[(size_t)(1 + d) * p3 + k]; }
+    for (int d = 0; d < 3; d++) { sym_f32_ref(xt + (size_t)(1 + y.perm[d]) * p3, X + (size_t)(1 + d) * p3, P, P, y); if (y.flip[d]) for (size_t k = 0; k < p3; k++) X[(size_t)(1 + d) * p3 + k] = -X[(size_t)(1 + d) * p3 + k]; }
     free(xt);
 }
 int main(void) {
@@ -59,7 +59,7 @@ int main(void) {
             uint16_t *a = malloc(p3 * 2), *b = malloc(p3 * 2), *tmp = malloc((size_t)P * P * 2);
             uint8_t *n1 = malloc(p3), *n2 = malloc(p3), *t2 = malloc(p3);
             for (size_t k = 0; k < p3; k++) { int on = runif(&r) < pr; a[k] = b[k] = on ? 0 : 60000; n1[k] = n2[k] = (uint8_t)on; }
-            chamfer_pass(a, P, 1); chamfer_pass(a, P, -1); chamfer_ref(b, P);
+            chamfer_pass(a, P, P, 1); chamfer_pass(a, P, P, -1); chamfer_ref(b, P);
             size_t dif = 0; for (size_t k = 0; k < p3; k++) dif += a[k] != b[k];
             if (dif) { printf("chamfer P %d dens %g: %zu differ  FAIL\n", P, pr, dif); bad++; }
             free(a); free(b); free(tmp); free(n1); free(n2); free(t2);
@@ -69,7 +69,7 @@ int main(void) {
         const int P = 128; size_t p3 = (size_t)P * P * P; uint16_t *a = malloc(p3 * 2), *b = malloc(p3 * 2);
         for (size_t k = 0; k < p3; k++) a[k] = b[k] = runif(&r) < 3e-3 ? 0 : 60000;
         struct timespec t0, t1, t2; clock_gettime(CLOCK_MONOTONIC, &t0);
-        chamfer_pass(a, P, 1); chamfer_pass(a, P, -1); clock_gettime(CLOCK_MONOTONIC, &t1); chamfer_ref(b, P); clock_gettime(CLOCK_MONOTONIC, &t2);
+        chamfer_pass(a, P, P, 1); chamfer_pass(a, P, P, -1); clock_gettime(CLOCK_MONOTONIC, &t1); chamfer_ref(b, P); clock_gettime(CLOCK_MONOTONIC, &t2);
         printf("chamfer P=128: row-wise %.1f ms, raster %.1f ms\n", (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6);
         free(a); free(b);
     }
@@ -82,7 +82,7 @@ int main(void) {
         for (int si = 0; si < 48; si++) {
             sym y = sym_of(si);
             write_x_ref(ct, P, o, 101.5, 37.25, cy, cx, y, 1.1f, -0.05f, A);
-            write_x(ct, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.f, &r, nrow, 0, B, nullptr);
+            write_x(ct, P, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.f, &r, nrow, 0, B, nullptr);
             for (size_t k = 0; k < 4 * p3; k++) { double d = fabs((double)A[k] - B[k]); if (d > worst) worst = d; }
         }
         printf("fused input writer vs old path, 48 symmetries: max abs diff %.3g\n", worst);

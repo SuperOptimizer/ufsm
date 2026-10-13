@@ -185,7 +185,7 @@ int main(int argc, char **argv) {
     z3_meta m = {.shape = {128,128,128}}; source bound = {.hold_o = {7,11,13}, .hold_n = {51,53,55}};
     int aligned = 1;
     for (int l = 0; l < 5; l++) {
-        int64_t lo[3], hi[3]; int fits = patch_bounds(&bound, &m, 2, l, nullptr, 0, 1, lo, hi);
+        int64_t lo[3], hi[3]; const int64_t wn2[3] = {2, 2, 2}; int fits = patch_bounds(&bound, &m, wn2, l, nullptr, 0, 1, lo, hi);
         for (int d = 0; fits && d < 3; d++) aligned &= (lo[d] << l) >= bound.hold_o[d] && ((hi[d] + 2) << l) <= bound.hold_o[d] + bound.hold_n[d];
     }
     check("coarse origins remain inside unaligned holdouts", aligned);

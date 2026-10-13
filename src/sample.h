@@ -8,7 +8,10 @@
 #include <stdint.h>
 
 typedef struct {
-    int P;                   /* patch edge */
+    int P;                   /* patch edge (y, x; and z unless Pz) */
+    int Pz;                  /* > 0: a slab window Pz x P x P (z thinner than y / x: the windings change in y / x); 0 = a P^3 cube.
+                                Slabs: pyramid targets at levels >= 1 with a stored phase, z-keeping symmetries (augment 0, 3, 4),
+                                no regions, cover, sheet, band, aux, cond, papyrus, dilation, CT / scanner / geometry augmentation */
     int B;                   /* batch size */
     int nworkers;
     int nbuf;                /* ring depth (batches) */

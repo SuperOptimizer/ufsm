@@ -525,6 +525,24 @@ static void test_predict_helpers(void) {
         nn_d2h(got, ds, ns);
         CHECK(!memcmp(got, ref, ns), "placement origin %zu", t);
     }
+    {   /* slab windows (predict --window-z): D x W x W, interior planes [hz, D - hz); the plain and the CT-bit-mask placement */
+        const int D = 8, hz = 1; uint32_t *bits = nn_malloc(((size_t)D * W * W + 31) / 32 * 4);
+        nn_pred_ctmask(dc, (size_t)D * W * W, bits);
+        for (size_t t = 0; t < sizeof origins / sizeof *origins; t++) for (int m = 0; m < 2; m++) {
+            memset(ref, 123, ns); nn_h2d(ds, ref, ns);
+            const int *o = origins[t], ez = 9, ey = 7, ex = 10;
+            for (int z = hz; z < D - hz; z++) for (int y = halo; y < W - halo; y++) for (int x = halo; x < W - halo; x++) {
+                int gz = o[0] + z, gy = o[1] + y, gx = o[2] + x;
+                if (gz >= 0 && gz < ez && gy >= 0 && gy < ey && gx >= 0 && gx < ex)
+                    ref[((size_t)gz * shard + gy) * shard + gx] = p[((size_t)z * W + y) * W + x];
+            }
+            if (m) nn_pred_place_m_d(dl, bits, D, W, hz, halo, o[0], o[1], o[2], ez, ey, ex, shard, ds);
+            else nn_pred_place_d(dl, dc, D, W, hz, halo, o[0], o[1], o[2], ez, ey, ex, shard, ds);
+            nn_d2h(got, ds, ns);
+            CHECK(!memcmp(got, ref, ns), "slab placement origin %zu (%s)", t, m ? "mask bits" : "CT");
+        }
+        nn_free(bits);
+    }
     free(ct); free(lg); free(p); free(got); free(ref);
     nn_free(dc); nn_free(scratch); nn_free(dl); nn_free(dp); nn_free(ds);
 }
