@@ -11,6 +11,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <stdatomic.h>
 static double nn_wall_seconds(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 int fit_scale_L(int L, double f) { const int v = (int)lround(L * f); return v < 2 ? 2 : v; }
@@ -200,84 +205,226 @@ static fit_heap_e heap_pop(fit_heap_e *h, int *n) {
     for (;;) { int l = 2 * i + 1, r = l + 1, b = i; if (l < *n && h[l].c > h[b].c) b = l; if (r < *n && h[r].c > h[b].c) b = r; if (b == i) break; fit_heap_e t = h[i]; h[i] = h[b]; h[b] = t; i = b; }
     return top;
 }
+/* Threads over field z planes for the voxel loops of the unwrapping: fn(ctx, z0, z1, t) on nt contiguous ranges (UFSM_FIT_THREADS
+   overrides the core count) */
+typedef void (*fit_zfn)(void *ctx, int z0, int z1, int t);
+typedef struct { fit_zfn fn; void *ctx; int z0, z1, t; } fit_zjob;
+static void *fit_zrun(void *a) { fit_zjob *j = a; j->fn(j->ctx, j->z0, j->z1, j->t); return nullptr; }
+static int fit_nthreads(int D) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN); const char *e = getenv("UFSM_FIT_THREADS"); if (e && atoi(e) > 0) n = atoi(e);
+    if (n > 64) n = 64;
+    if (n > D) n = D;
+    return n < 1 ? 1 : (int)n;
+}
+static void fit_zpar(int D, int nt, fit_zfn fn, void *ctx) {
+    pthread_t th[64]; fit_zjob jb[64]; int up[64] = {0};
+    for (int t = 0; t < nt; t++) jb[t] = (fit_zjob){fn, ctx, (int)((long)D * t / nt), (int)((long)D * (t + 1) / nt), t};
+    for (int t = 1; t < nt; t++) up[t] = pthread_create(&th[t], nullptr, fit_zrun, &jb[t]) == 0;
+    fit_zrun(&jb[0]);
+    for (int t = 1; t < nt; t++) { if (up[t]) pthread_join(th[t], nullptr); else fit_zrun(&jb[t]); }
+}
+
 /* Voxel-level quality-guided phase unwrapping: per field voxel the wrapped unwrapped-radius u = frac(phi + dir theta / 2 pi) (U mod 1,
    single-valued away from the axis), flooded from the most confident voxel in order of confidence (phasor length x material),
    each new voxel taking the integer that keeps it within half a turn of the voxel it is reached from (6-neighbours; one field
    voxel is ~0.1 turn); the seed takes the integer nearest the current model. Then per lattice node the mean of (U_unwrapped -
    U_model) over its voxels (no integer ambiguity left) is added to delta; nodes without voxels get their neighbours' mean.
-   Returns the number of voxels reached. */
+   Speed (a 3.9 cm x 2.5 mm slab at 19.2 um: 537M field voxels, 242M flooded): the flood is one serial walk bound by memory latency
+   (~10 cache lines per voxel), 250 s with the binary heap it replaces -> 30 s: 8 B records (float, 16-bit integer relative to the
+   seed's, 16-bit level; 16 B: 36 -> 47 s) in 8^3 bricks (4^3: 35 s at prefetch 8) on huge pages, a bucket queue (confidence in
+   4094 levels, FIFO within a level, the next non-empty level from a two-level bitmap) of per-level id arrays, so the voxel 16
+   pops ahead is known and its record and z / y neighbours are prefetched (none: 57 s; 8 / 32 ahead: 36 / 33 s). The result is
+   the original's (same voxels, same integers). Tiled floods stitched by votes were 30x faster but got 14-16% of the winding ids
+   against 19.6% (each tile commits its own low-confidence bridges). The voxel loops run on threads. Returns the number of voxels
+   reached. */
+enum { UQ_LEVELS = 4096 };
+#define UQ_NONE UINT32_MAX
+#define UK_UNSET INT16_MIN
+typedef struct { float uw; int16_t k; uint16_t bk; } uw_vox;   /* wrapped U; integer turns minus the seed's (UK_UNSET: not reached);
+                                                                confidence bucket (0: not unwrapped). 8 B: the flood is memory bound */
+static_assert(sizeof(uw_vox) == 8);
+/* records in UB_S^3 bricks (UB = log2 UB_S; a voxel's six neighbours mostly within the brick; linear rows put z neighbours 32 MB away) */
+#ifndef UB
+#define UB 3
+#endif
+enum { UB_S = 1 << UB, UB_M = UB_S - 1 };
+typedef struct { int D, H, W, bH, bW; } uw_geo;
+static inline uint32_t ub_id(const uw_geo *g, int z, int y, int x) {
+    return (uint32_t)(((((size_t)(z >> UB) * g->bH + (y >> UB)) * g->bW + (x >> UB)) << (3 * UB)) | (uint32_t)((z & UB_M) << (2 * UB) | (y & UB_M) << UB | (x & UB_M)));
+}
+static inline void ub_zyx(const uw_geo *g, uint32_t id, int *z, int *y, int *x) {
+    const uint32_t b = id >> (3 * UB), r = id & ((1u << (3 * UB)) - 1), bx = b % g->bW, t = b / g->bW;
+    *z = (int)((t / g->bH) << UB | r >> (2 * UB)); *y = (int)((t % g->bH) << UB | (r >> UB & UB_M)); *x = (int)(bx << UB | (r & UB_M));
+}
+typedef struct {
+    fit_model *m; const fit_fields *f; const fit_cfg *c; double min_conf; int na, nt; uw_geo g;
+    uw_vox *V; int32_t kb;                 /* the records; their integer base (the seed's integer) */
+    _Atomic size_t over;                   /* integers more than 32767 turns from the base (left unreached) */
+    float qb[64]; size_t sb[64];            /* per thread: the best confidence and its voxel */
+    double *acc, *wsum;
+} uw_ctx;
+static void *uw_alloc_huge(size_t bytes) {   /* 2 MB aligned and advised onto transparent huge pages */
+    const size_t A = (size_t)2 << 20; bytes = (bytes + A - 1) / A * A;
+    void *p = aligned_alloc(A, bytes); if (p) madvise(p, bytes, MADV_HUGEPAGE); return p;
+}
+/* the voxel's confidence (0: excluded) and its phase angle */
+static float uw_q(const fit_fields *f, size_t i, double min_conf, const fit_cfg *c, double *ang) {
+    if (!f->w[i]) return 0;
+    const double mc = (f->pc[i] - 128) / 127.0, ms = (f->ps[i] - 128) / 127.0, conf = sqrt(mc * mc + ms * ms);
+    if (conf < min_conf) return 0;
+    if (c->packed_um > 0 && f->sp[i] && f->sp[i] * f->h / 8.0 * (c->um > 0 ? c->um : 2.4) < 0.6 * c->packed_um) return 0;   /* packed: no phase integers */
+    *ang = atan2(ms, mc);
+    return (float)(conf * f->w[i] / 255.0);
+}
+static void uw_zero(void *a, int b0, int b1, int t) {   /* brick layers [b0, b1) (first touch of the huge pages, on threads) */
+    uw_ctx *x = a; const size_t L = (size_t)x->g.bH * x->g.bW << (3 * UB); memset(x->V + (size_t)b0 * L, 0, (size_t)(b1 - b0) * L * sizeof *x->V);
+}
+static void uw_setup(void *a, int z0, int z1, int t) {
+    uw_ctx *x = a; const fit_fields *f = x->f; const size_t HW = (size_t)f->H * f->W;
+    float qb = 0; size_t sb = (size_t)-1;
+    for (int z = z0; z < z1; z++) {
+        const double pz = (z + 0.5) * f->h, cy = axis_lerp(f->cy, x->na, pz), cx = axis_lerp(f->cx, x->na, pz);
+        for (int y = 0; y < f->H; y++) for (int xx = 0; xx < f->W; xx++) {
+            const size_t i = z * HW + (size_t)y * f->W + xx; double ang = 0; uw_vox *v = &x->V[ub_id(&x->g, z, y, xx)];
+            v->k = UK_UNSET;
+            const float q = uw_q(f, i, x->min_conf, x->c, &ang);
+            if (q <= 0) { v->bk = 0; v->uw = 0; continue; }
+            const double th = atan2((y + 0.5) * f->h - cy, (xx + 0.5) * f->h - cx);
+            double u = ang / (2 * M_PI) + x->m->dir * th / (2 * M_PI); u -= floor(u);
+            v->uw = (float)u; v->bk = (uint16_t)(1 + (int)(fminf(q, 1.f) * (UQ_LEVELS - 2)));
+            if (q > qb) { qb = q; sb = i; }
+        }
+    }
+    x->qb[t] = qb; x->sb[t] = sb;
+}
+static void uw_seedmodel(void *a, int z0, int z1, int t) {   /* the seed model's region below seed_z: its integers */
+    uw_ctx *x = a; const fit_fields *f = x->f; const fit_cfg *c = x->c;
+    for (int z = z0; z < z1; z++) {
+        const double pz = (z + 0.5) * f->h; if (pz >= c->seed_z) continue;
+        const double cy = axis_lerp(f->cy, x->na, pz), cx = axis_lerp(f->cx, x->na, pz);
+        for (int y = 0; y < f->H; y++) for (int xx = 0; xx < f->W; xx++) {
+            uw_vox *v = &x->V[ub_id(&x->g, z, y, xx)]; if (!v->bk) continue;
+            const double py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h, th = atan2(py - cy, px - cx);
+            const double Us = fit_W(c->seed, pz + c->seed_off, py, px) + x->m->dir * th / (2 * M_PI);
+            const int32_t kr = (int32_t)round(Us - v->uw) - x->kb;
+            if (kr > INT16_MIN && kr <= INT16_MAX) v->k = (int16_t)kr; else atomic_fetch_add(&x->over, 1);
+        }
+    }
+}
+static void uw_accum(void *a, int z0_, int z1_, int t) {   /* thread t owns lattice z planes [lz t / nt, lz (t + 1) / nt): no shared nodes */
+    uw_ctx *x = a; const fit_fields *f = x->f; const fit_model *m = x->m; const size_t HW = (size_t)f->H * f->W;
+    const int a0 = (int)((long)m->lz * t / x->nt), a1 = (int)((long)m->lz * (t + 1) / x->nt);
+    for (int z = 0; z < f->D; z++) {
+        const double pz = (z + 0.5) * f->h; int az = (int)lround(pz / m->L); if (az >= m->lz) az = m->lz - 1;
+        if (az < a0 || az >= a1) continue;
+        const double cy = axis_lerp(f->cy, x->na, pz), cx = axis_lerp(f->cx, x->na, pz);
+        for (int y = 0; y < f->H; y++) for (int xx = 0; xx < f->W; xx++) {
+            const size_t i = z * HW + (size_t)y * f->W + xx; const uw_vox *v = &x->V[ub_id(&x->g, z, y, xx)]; if (v->k == UK_UNSET) continue;
+            double ang; const float q = uw_q(f, i, x->min_conf, x->c, &ang);
+            const double py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h, th = atan2(py - cy, px - cx);
+            const double Um = fit_W(m, pz, py, px) + m->dir * th / (2 * M_PI), Uv = (double)v->uw + (x->kb + v->k);
+            const int b = (int)lround(py / m->L), cc = (int)lround(px / m->L);
+            const size_t kn = ((size_t)az * m->ly + (b < m->ly ? b : m->ly - 1)) * m->lx + (cc < m->lx ? cc : m->lx - 1);
+            x->acc[kn] += q * (Uv - Um); x->wsum[kn] += q;
+        }
+    }
+}
 static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_conf, const fit_cfg *c) {
     const size_t n = (size_t)f->D * f->H * f->W; const int na = (int)(f->D * f->h) + 1;
-    float *uw = malloc(n * sizeof(float)), *q = malloc(n * sizeof(float)); double *Uv = malloc(n * sizeof(double)); uint8_t *vis = calloc(n, 1);
+    const uw_geo g = {f->D, f->H, f->W, (f->H + UB_M) / UB_S, (f->W + UB_M) / UB_S};
+    const size_t nr = ((size_t)((f->D + UB_M) / UB_S) * g.bH * g.bW) << (3 * UB);   /* records, the bricks padded */
+    if (nr >= UQ_NONE) { fprintf(stderr, "fit: %zu field voxels exceed the unwrapping's 32-bit queue: use --slab\n", n); return 0; }
+    const double t0 = nn_wall_seconds();
+    uw_ctx x = {.m = m, .f = f, .c = c, .min_conf = min_conf, .na = na, .nt = fit_nthreads(f->D), .g = g};
+    uw_vox *V = x.V = uw_alloc_huge(nr * sizeof *V);
+    if (!V) { fprintf(stderr, "fit: out of memory for the voxel unwrapping\n"); return 0; }
+    fit_zpar((f->D + UB_M) / UB_S, x.nt, uw_zero, &x);   /* padding records: bk 0 (never flooded) */
+    fit_zpar(f->D, x.nt, uw_setup, &x);
     size_t seed = (size_t)-1; float qbest = 0;
-    for (size_t i = 0; i < n; i++) {
-        q[i] = 0;
-        if (!f->w[i]) continue;
-        const double mc = (f->pc[i] - 128) / 127.0, ms = (f->ps[i] - 128) / 127.0, conf = sqrt(mc * mc + ms * ms);
-        if (conf < min_conf) continue;
-        if (c->packed_um > 0 && f->sp[i] && f->sp[i] * f->h / 8.0 * (c->um > 0 ? c->um : 2.4) < 0.6 * c->packed_um) continue;   /* packed: no phase integers */
-        const int z = (int)(i / ((size_t)f->H * f->W)), y = (int)((i / f->W) % f->H), x = (int)(i % f->W);
-        const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (x + 0.5) * f->h;
-        const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
-        double u = atan2(ms, mc) / (2 * M_PI) + m->dir * th / (2 * M_PI); u -= floor(u);
-        uw[i] = (float)u; q[i] = (float)(conf * f->w[i] / 255.0);
-        if (q[i] > qbest) { qbest = q[i]; seed = i; }
-    }
+    for (int t = 0; t < x.nt; t++) if (x.qb[t] > qbest) { qbest = x.qb[t]; seed = x.sb[t]; }   /* ties: the lowest voxel, as serially */
+    const double t1 = nn_wall_seconds();
     size_t reached = 0;
+    /* the bucket queue: per confidence level an array of voxel ids, appended at n and popped at h (FIFO; reset when emptied):
+       sequential pushes, and the ids UQ_PD ahead are known, so their records are prefetched long before they are popped */
+    typedef struct { uint32_t *a; size_t n, h, cap; } uq_lev;
+    uq_lev *Q = calloc(UQ_LEVELS, sizeof *Q); int cur = 0;
+    uint64_t occ[UQ_LEVELS / 64] = {0}, occ1 = 0;   /* non-empty levels: a bit per level, a bit per word (the next level down in O(1)) */
+    static_assert(UQ_LEVELS / 64 <= 64);
+    enum { UQ_PD = 16 };
+#define UQ_PUSH(j) do { const uint32_t j_ = (uint32_t)(j); const int b_ = V[j_].bk; uq_lev *q_ = &Q[b_]; \
+        if (q_->n == q_->cap) { q_->cap = q_->cap ? 2 * q_->cap : 4096; q_->a = realloc(q_->a, q_->cap * sizeof *q_->a); if (!q_->a) abort(); } \
+        q_->a[q_->n++] = j_; occ[b_ >> 6] |= 1ull << (b_ & 63); occ1 |= 1ull << (b_ >> 6); if (b_ > cur) cur = b_; } while (0)
     if (seed != (size_t)-1) {
-        fit_heap_e *hp = malloc(n * sizeof *hp); int hn = 0;
-        if (c->seed) for (size_t i = 0; i < n; i++) {   /* the seed model's region: its integers */
-            const int z = (int)(i / ((size_t)f->H * f->W)), y = (int)((i / f->W) % f->H), x = (int)(i % f->W);
-            const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (x + 0.5) * f->h;
-            if (q[i] <= 0 || pz >= c->seed_z) continue;
+        {   /* the integer base: the seed (or seed model's) integer at the most confident voxel */
+            const int z = (int)(seed / ((size_t)f->H * f->W)), y = (int)((seed / f->W) % f->H), xx = (int)(seed % f->W);
+            const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
             const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
-            const double Us = fit_W(c->seed, pz + c->seed_off, py, px) + m->dir * th / (2 * M_PI);
-            Uv[i] = uw[i] + round(Us - uw[i]); vis[i] = 1; reached++; heap_push(hp, &hn, (fit_heap_e){q[i], (int)i});
+            const double Ub = (c->seed ? fit_W(c->seed, pz + c->seed_off, py, px) : fit_W(m, pz, py, px)) + m->dir * th / (2 * M_PI);
+            x.kb = (int32_t)round(Ub - V[ub_id(&g, z, y, xx)].uw);
         }
-        if (!reached) {
-          const int z = (int)(seed / ((size_t)f->H * f->W)), y = (int)((seed / f->W) % f->H), x = (int)(seed % f->W);
-          const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (x + 0.5) * f->h;
-          const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
-          const double Um = fit_W(m, pz, py, px) + m->dir * th / (2 * M_PI);
-          Uv[seed] = uw[seed] + round(Um - uw[seed]);
-          vis[seed] = 1; reached = 1; heap_push(hp, &hn, (fit_heap_e){q[seed], (int)seed});
-        }
-        while (hn) {
-            const fit_heap_e e = heap_pop(hp, &hn); const size_t i = (size_t)e.i;
-            const int z = (int)(i / ((size_t)f->H * f->W)), y = (int)((i / f->W) % f->H), x = (int)(i % f->W);
-            const int nb[6][3] = {{z - 1, y, x}, {z + 1, y, x}, {z, y - 1, x}, {z, y + 1, x}, {z, y, x - 1}, {z, y, x + 1}};
-            for (int k = 0; k < 6; k++) {
-                if (nb[k][0] < 0 || nb[k][1] < 0 || nb[k][2] < 0 || nb[k][0] >= f->D || nb[k][1] >= f->H || nb[k][2] >= f->W) continue;
-                const size_t j = ((size_t)nb[k][0] * f->H + nb[k][1]) * f->W + nb[k][2];
-                if (vis[j] || q[j] <= 0) continue;
-                Uv[j] = uw[j] + round(Uv[i] - uw[j]); vis[j] = 1; reached++;
-                heap_push(hp, &hn, (fit_heap_e){q[j], (int)j});
+        if (c->seed) {
+            fit_zpar(f->D, x.nt, uw_seedmodel, &x);
+            for (int z = 0; z < f->D; z++) for (int y = 0; y < f->H; y++) for (int xx = 0; xx < f->W; xx++) {   /* linear order, as before */
+                const uint32_t id = ub_id(&g, z, y, xx); if (V[id].bk && V[id].k != UK_UNSET) { reached++; UQ_PUSH(id); }
             }
         }
-        free(hp);
+        if (!reached) {
+            const int z = (int)(seed / ((size_t)f->H * f->W)), y = (int)((seed / f->W) % f->H), xx = (int)(seed % f->W);
+            const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
+            const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
+            const double Um = fit_W(m, pz, py, px) + m->dir * th / (2 * M_PI);
+            const uint32_t sid = ub_id(&g, z, y, xx);
+            V[sid].k = (int16_t)((int32_t)round(Um - V[sid].uw) - x.kb); reached = 1; UQ_PUSH(sid);
+        }
+        for (;;) {
+            while (Q[cur].h == Q[cur].n) {   /* level emptied: reset it, the highest marked level next (a level a push left behind may be
+                                                 marked yet empty: hence the loop) */
+                Q[cur].h = Q[cur].n = 0; occ[cur >> 6] &= ~(1ull << (cur & 63)); if (!occ[cur >> 6]) occ1 &= ~(1ull << (cur >> 6));
+                if (!occ1) { cur = 0; break; }
+                const int w = 63 - __builtin_clzll(occ1); cur = (w << 6) | (63 - __builtin_clzll(occ[w]));
+            }
+            if (cur <= 0) break;
+            uq_lev *ql = &Q[cur]; const uint32_t i = ql->a[ql->h++];
+            if (ql->h + UQ_PD < ql->n) {   /* a voxel UQ_PD pops ahead: its record and its z / y neighbours' (x ones share its line or the next) */
+                const uint32_t pf = ql->a[ql->h + UQ_PD]; int pz_, py_, px_; ub_zyx(&g, pf, &pz_, &py_, &px_);
+                __builtin_prefetch(&V[pf]);
+                if (pz_ > 0) __builtin_prefetch(&V[ub_id(&g, pz_ - 1, py_, px_)]);
+                if (pz_ + 1 < f->D) __builtin_prefetch(&V[ub_id(&g, pz_ + 1, py_, px_)]);
+                if (py_ > 0) __builtin_prefetch(&V[ub_id(&g, pz_, py_ - 1, px_)]);
+                if (py_ + 1 < f->H) __builtin_prefetch(&V[ub_id(&g, pz_, py_ + 1, px_)]);
+            }
+            int z, y, xx; ub_zyx(&g, i, &z, &y, &xx);
+            const int ok[6] = {z > 0, z + 1 < f->D, y > 0, y + 1 < f->H, xx > 0, xx + 1 < f->W};
+            const int nb3[6][3] = {{z - 1, y, xx}, {z + 1, y, xx}, {z, y - 1, xx}, {z, y + 1, xx}, {z, y, xx - 1}, {z, y, xx + 1}};
+            const double ui = (double)V[i].uw + (x.kb + V[i].k);
+            for (int q = 0; q < 6; q++) {
+                if (!ok[q]) continue;
+                const uint32_t j = ub_id(&g, nb3[q][0], nb3[q][1], nb3[q][2]); uw_vox *vj = &V[j];
+                if (!vj->bk || vj->k != UK_UNSET) continue;
+                const int32_t kr = (int32_t)round(ui - vj->uw) - x.kb;
+                if (kr <= INT16_MIN || kr > INT16_MAX) { x.over++; continue; }
+                vj->k = (int16_t)kr; reached++;
+                UQ_PUSH(j);
+            }
+        }
     }
+    for (int b = 0; b < UQ_LEVELS; b++) free(Q[b].a);
+    free(Q);
+#undef UQ_PUSH
+    const double t2 = nn_wall_seconds();
     /* per lattice node: mean of (U_unwrapped - U_model) over the reached voxels nearest to it */
     const size_t nl = (size_t)m->lz * m->ly * m->lx;
-    double *acc = calloc(nl, sizeof(double)), *wsum = calloc(nl, sizeof(double));
-    for (size_t i = 0; i < n; i++) {
-        if (!vis[i]) continue;
-        const int z = (int)(i / ((size_t)f->H * f->W)), y = (int)((i / f->W) % f->H), x = (int)(i % f->W);
-        const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (x + 0.5) * f->h;
-        const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
-        const double Um = fit_W(m, pz, py, px) + m->dir * th / (2 * M_PI);
-        const int a = (int)lround(pz / m->L), b = (int)lround(py / m->L), c = (int)lround(px / m->L);
-        const size_t k = ((size_t)(a < m->lz ? a : m->lz - 1) * m->ly + (b < m->ly ? b : m->ly - 1)) * m->lx + (c < m->lx ? c : m->lx - 1);
-        acc[k] += q[i] * (Uv[i] - Um); wsum[k] += q[i];
-    }
+    x.acc = calloc(nl, sizeof(double)); x.wsum = calloc(nl, sizeof(double));
+    fit_zpar(f->D, x.nt, uw_accum, &x);
     uint8_t *have = calloc(nl, 1); double *corr = calloc(nl, sizeof(double));
-    for (size_t k = 0; k < nl; k++) if (wsum[k] > 0) { corr[k] = acc[k] / wsum[k]; have[k] = 1; }
+    for (size_t k = 0; k < nl; k++) if (x.wsum[k] > 0) { corr[k] = x.acc[k] / x.wsum[k]; have[k] = 1; }
     for (int pass = 0; pass < 64; pass++) {   /* nodes without voxels: the mean of their neighbours */
         int changed = 0;
         for (size_t k = 0; k < nl; k++) {
             if (have[k]) continue;
-            const int a = (int)(k / ((size_t)m->ly * m->lx)), b = (int)((k / m->lx) % m->ly), c = (int)(k % m->lx);
+            const int a = (int)(k / ((size_t)m->ly * m->lx)), b = (int)((k / m->lx) % m->ly), cc = (int)(k % m->lx);
             double sm = 0; int cnt = 0;
-            const int nb[6][3] = {{a - 1, b, c}, {a + 1, b, c}, {a, b - 1, c}, {a, b + 1, c}, {a, b, c - 1}, {a, b, c + 1}};
+            const int nb[6][3] = {{a - 1, b, cc}, {a + 1, b, cc}, {a, b - 1, cc}, {a, b + 1, cc}, {a, b, cc - 1}, {a, b, cc + 1}};
             for (int t = 0; t < 6; t++) {
                 if (nb[t][0] < 0 || nb[t][1] < 0 || nb[t][2] < 0 || nb[t][0] >= m->lz || nb[t][1] >= m->ly || nb[t][2] >= m->lx) continue;
                 const size_t j = ((size_t)nb[t][0] * m->ly + nb[t][1]) * m->lx + nb[t][2];
@@ -289,7 +436,9 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
         if (!changed) break;
     }
     for (size_t k = 0; k < nl; k++) m->delta[k] += (float)corr[k];
-    free(uw); free(q); free(Uv); free(vis); free(acc); free(wsum); free(have); free(corr);
+    if (c->verbose) fprintf(stderr, "fit: voxel unwrapping %d threads: setup %.1fs, flood %.1fs, nodes %.1fs\n", x.nt, t1 - t0, t2 - t1, nn_wall_seconds() - t2);
+    if (x.over) fprintf(stderr, "fit: %zu voxels over 32767 turns from the seed left unreached\n", (size_t)x.over);
+    free(V); free(x.acc); free(x.wsum); free(have); free(corr);
     return reached;
 }
 

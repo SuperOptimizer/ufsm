@@ -498,20 +498,26 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
     enum { NB = 14 * 72, NF = 14 * 1024 }; size_t *hist = calloc(NB, sizeof(size_t)), *fine = calloc(NF, sizeof(size_t)), nd = 0, nan = 0;   /* d = U - q mod 14: 1/72 and 1/1024 turn bins */
     typedef struct { float d; uint8_t z, r; } score_rec; score_rec *dd = nullptr; size_t ndet = 0, dcap = 0;
     const int na_ax = (int)(shp[0] * h) + 1;
-    const size_t plane = (size_t)ln[1] * ln[2]; int64_t zc = (int64_t)((32u << 20) / plane); if (zc < 1) zc = 1;
-    uint8_t *codes = malloc(zc * plane); float *U = malloc(zc * plane * 4);
-    for (int64_t z0 = 0; z0 < ln[0]; z0 += zc) {
-        const int64_t nz = ln[0] - z0 < zc ? ln[0] - z0 : zc;
-        const int64_t o3[3] = {lo[0] + z0, lo[1], lo[2]}, n3[3] = {nz, ln[1], ln[2]};
-        if (z3_read(z, o3, n3, codes, 8)) { fprintf(stderr, "score: code read failed: %s\n", z3_error()); free(codes); free(U); free(hist); free(fine); free(dd); return 1; }
-        size_t any = 0; for (size_t i = 0; i < (size_t)nz * plane && !any; i++) any = codes[i] >= 1 && codes[i] <= 252;
+    /* blocks of up to 128 x 1024 x 1024 label voxels aligned to the codes' 128^3 chunks (z planes one at a time decoded every chunk
+       128 times: minutes on a 3.9 cm slab) */
+    enum { SBZ = 128, SBY = 1024, SBX = 1024 };
+    uint8_t *codes = malloc((size_t)SBZ * SBY * SBX); float *U = malloc((size_t)SBZ * SBY * SBX * 4);
+    for (int64_t za = lo[0]; za < lo[0] + ln[0]; za = (za / SBZ + 1) * SBZ)
+    for (int64_t ya = lo[1]; ya < lo[1] + ln[1]; ya = (ya / SBY + 1) * SBY)
+    for (int64_t xa = lo[2]; xa < lo[2] + ln[2]; xa = (xa / SBX + 1) * SBX) {
+        const int64_t ze = (za / SBZ + 1) * SBZ < lo[0] + ln[0] ? (za / SBZ + 1) * SBZ : lo[0] + ln[0];
+        const int64_t ye = (ya / SBY + 1) * SBY < lo[1] + ln[1] ? (ya / SBY + 1) * SBY : lo[1] + ln[1];
+        const int64_t xe = (xa / SBX + 1) * SBX < lo[2] + ln[2] ? (xa / SBX + 1) * SBX : lo[2] + ln[2];
+        const int64_t o3[3] = {za, ya, xa}, n3[3] = {ze - za, ye - ya, xe - xa}; const size_t nb3 = (size_t)n3[0] * n3[1] * n3[2];
+        if (z3_read(z, o3, n3, codes, 16)) { fprintf(stderr, "score: code read failed: %s\n", z3_error()); free(codes); free(U); free(hist); free(fine); free(dd); return 1; }
+        size_t any = 0; for (size_t i = 0; i < nb3 && !any; i++) any = codes[i] >= 1 && codes[i] <= 252;
         if (!any) continue;
-        const double og[3] = {cf * o3[0] - 0.25 * cf - org[0], cf * lo[1] - 0.25 * cf - org[1], cf * lo[2] - 0.25 * cf - org[2]};   /* label voxel i at cf (i + lo + 1 / 4) - org */
+        const double og[3] = {cf * o3[0] - 0.25 * cf - org[0], cf * o3[1] - 0.25 * cf - org[1], cf * o3[2] - 0.25 * cf - org[2]};   /* label voxel i at cf (i + lo + 1 / 4) - org */
         if (fill(ctx, og, n3, cf, U)) { fprintf(stderr, "score: cannot evaluate U on the score grid\n"); free(codes); free(U); free(hist); free(fine); free(dd); return 1; }
-        for (int64_t zz = 0; zz < nz; zz++) for (int64_t yy = 0; yy < ln[1]; yy++) for (int64_t xx = 0; xx < ln[2]; xx++) {
-            const size_t i = ((size_t)zz * ln[1] + yy) * ln[2] + xx; const uint8_t cd = codes[i];
+        for (int64_t zz = 0; zz < n3[0]; zz++) for (int64_t yy = 0; yy < n3[1]; yy++) for (int64_t xx = 0; xx < n3[2]; xx++) {
+            const size_t i = ((size_t)zz * n3[1] + yy) * n3[2] + xx; const uint8_t cd = codes[i];
             if (cd < 1 || cd > 252) continue;
-            const double pz = cf * (zz + o3[0] + 0.25) - org[0], py = cf * (yy + lo[1] + 0.25) - org[1], px = cf * (xx + lo[2] + 0.25) - org[2];
+            const double pz = cf * (zz + o3[0] + 0.25) - org[0], py = cf * (yy + o3[1] + 0.25) - org[1], px = cf * (xx + o3[2] + 0.25) - org[2];
             if (pz < 0 || py < 0 || px < 0 || pz > shp[0] * h || py > shp[1] * h || px > shp[2] * h) continue;
             if (!(U[i] == U[i])) { nan++; continue; }   /* no U here (a raster's unreached voxel) */
             double d = fmod(U[i] - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14; if (d >= 14) d = 0;
@@ -571,7 +577,10 @@ static int cmd_fit(int argc, char **argv) {
     const char *min = opt(argc, argv, "--model", nullptr);   /* score / export a saved model or set instead of fitting */
     const int slab = atoi(opt(argc, argv, "--slab", "0")), overlap = atoi(opt(argc, argv, "--overlap", "256"));
     fit_fields_buf fb; memset(&fb, 0, sizeof fb);
-    if (fit_fields_load(dir, 0, 0, min || slab > 0 ? 0 : 1, &fb)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }   /* (slab runs load per slab; a given model needs the geometry only) */
+    struct timespec tl0, tl1; clock_gettime(CLOCK_MONOTONIC, &tl0);
+    if (fit_fields_load(dir, 0, 0, min || slab > 0 ? 0 : 1, &fb)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
+    clock_gettime(CLOCK_MONOTONIC, &tl1);
+    if (c.verbose) fprintf(stderr, "fit: fields %dx%dx%d loaded in %.1fs\n", fb.shape[0], fb.shape[1], fb.shape[2], (double)(tl1.tv_sec - tl0.tv_sec) + (tl1.tv_nsec - tl0.tv_nsec) * 1e-9);   /* (slab runs load per slab; a given model needs the geometry only) */
     c.um = fb.um;   /* default lattices and knots are physical: given in 2.4 um voxels, scaled to the fields' native voxels */
     if (!*opt(argc, argv, "--knot-dz", "")) c.knot_dz = fit_scale_L(1024, 2.4 / fb.um);
     if (!*opt(argc, argv, "--lattice", "")) for (int k = 0; k < c.nstage; k++) c.lattice[k] = fit_scale_L(c.lattice[k], 2.4 / fb.um);
