@@ -482,9 +482,10 @@ int cmd_predict(int argc, char **argv) {
                                                      + wc3 + wc3 / 8 + (size_t)shard * shard * shard + ((size_t)1 << 30);   /* (+ the CT window, or its mask when it lives in the network's skip buffer) */
             if (need <= nn_mem_free()) { W = Wc; halo = 16; }
         }
-        fprintf(stderr, "predict: window %d, halo %d (default: one window per %d shard when it fits, else 288 / 8; --window / --halo set them)\n", W, halo, shard);
+        fprintf(stderr, "predict: window %d, halo %d (default: one window per %d shard when it fits, else 288 / 8, 288 / 16 with --fit-zarr; --window / --halo set them)\n", W, halo, shard);
         if (box) for (int d = 0; d < 3; d++) if (boxv[d + 3] > INT64_MAX - W || boxv[d] > INT64_MAX - W - boxv[d + 3]) { fprintf(stderr, "prediction box exceeds the coordinate range\n"); return 2; }
     }
+    if (ffz && !win_given && !split && W == 288 && halo == 8) halo = 16;   /* --fit-zarr fallback: a z stride (256) dividing the shard */
     if (!slab) { Wz = W; hz = halo; }
     else if (!win_given || Wz > W || Wz % (1 << (cfg.nlev - 1)) || hz >= Wz / 2 || split || half || sheet_task || auxz || sweep_out || ufsm_env_on("UFSM_PRED_HOSTPATH")) {
         fprintf(stderr, "predict: --window-z: at most --window (given), a multiple of %d, --halo-z under half of it; one GPU's plain path (no --split, "
@@ -593,7 +594,13 @@ int cmd_predict(int argc, char **argv) {
             if (!ffacc) { fprintf(stderr, "predict: no device memory for the fit fields\n"); return 1; }
             nn_zero(ffacc, 12 * ffn * 4);
         } else {   /* per window: an accumulator of its interior cells; the field slab of FFS cells in z on the host */
-            if (stride % ffh || strd[0] % ffh || kss > 1 || shard % ffh || (FFS * ffh) % shard) { fprintf(stderr, "predict: --fit-zarr needs window - 2 halo and the shard divisible by --fit-h, FFS * h a multiple of the shard, one window per shard\n"); return 2; }
+            /* the field slab (FFS cells in z) is flushed once the windows leave it: a window's interior must not straddle two, so its
+               z stride divides the shard (the shard divides FFS h); 288 / 8 (stride 272) wrote past the slab and crashed */
+            if (stride % ffh || strd[0] % ffh || kss > 1 || shard % ffh || (FFS * ffh) % shard || shard % strd[0]) {
+                fprintf(stderr, "predict: --fit-zarr needs the window strides (window - 2 halo; z: %d) divisible by --fit-h, the z stride dividing the shard, "
+                                "the shard dividing --fit-h * %d and by --fit-h (e.g. --window 288 --halo 16 or 544 / 16 with --shard 512)\n", strd[0], FFS);
+                return 2;
+            }
             for (int d = 0; d < 3; d++) { const int64_t ph = grid ? (bo[d] - grid_origin[d]) % ffh : 0; if (ph) { fprintf(stderr, "predict: --fit-zarr: the box must be aligned to --fit-h on the tile grid\n"); return 2; } }
             char at[512]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"winding fitter fields (src/fit.h)\",\"h\":%d,\"origin_zyx\":[%lld,%lld,%lld],\"checkpoint\":\"%s\"}}", ffh, (long long)bo[0], (long long)bo[1], (long long)bo[2], ckpt);
             const int64_t fsh[3] = {ffF[0], ffF[1], ffF[2]};
