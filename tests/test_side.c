@@ -28,7 +28,7 @@ int main(void) {
     const int n[3] = {NZ, NY, NX}; const int64_t o[3] = {0, 0, 0};
     double cy[NZ], cx[NZ];
     for (int z = 0; z < NZ; z++) { cy[z] = 2 * YC + 0.5; cx[z] = 2 * XC + 0.5; }   /* native coordinates of the label-grid centre */
-    band_params bp = {80, 75};
+    band_params bp = {80, 75, 0};
     uint8_t *codes = malloc(N), *band = malloc(N), *band2 = malloc(N), *side = malloc(N);
     int turn[NSH] = {0, 1, 2, 3, 4};
     shells(codes, turn);
@@ -68,6 +68,15 @@ int main(void) {
     shells(codes, turn);
     CHECK(!band_field_side(codes, n, o, cy, cx, bp, band2, side) && !band_field_phase(codes, n, o, cy, cx, bp, band, phase, spacing), "band_field_phase failed");
     CHECK(!memcmp(band, band2, N), "the band changes when the phase is requested");
+    {   /* the same field on a grid of 4 native voxels (codes pooled to 9.6 um): radius, span and axis scaled with the grid give it voxel
+           for voxel (band_params.gs) */
+        uint8_t *b4 = malloc(N), *p4 = malloc(N); double cy4[NZ], cx4[NZ];
+        for (int z = 0; z < NZ; z++) { cy4[z] = 4 * YC + 1.5; cx4[z] = 4 * XC + 1.5; }
+        const band_params bp4 = {160, 150, 4};
+        CHECK(!band_field_phase(codes, n, o, cy4, cx4, bp4, b4, p4, nullptr), "band_field_phase failed (gs 4)");
+        CHECK(!memcmp(band, b4, N) && !memcmp(phase, p4, N), "gs 4 with scaled radius / span / axis differs from gs 2");
+        free(b4); free(p4);
+    }
     size_t pk = 0, pin = 0, outside = 0, outside_known = 0, side_bad = 0, sp_bad = 0; double perr = 0, pmax = 0;
     for (int z = 0; z < NZ; z++) for (int y = 0; y < NY; y++) for (int x = 0; x < NX; x++) {
         const size_t i = ((size_t)z * NY + y) * NX + x;

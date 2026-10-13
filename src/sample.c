@@ -558,7 +558,7 @@ static void warp_sheet_batch(sheet_batch *b,const spatial_aug *a,const uint8_t *
    closely packed windings up, as upstream lasagna's density weight. */
 static uint64_t mix64(uint64_t x) { x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 27; x *= 0x94d049bb133111ebull; return x ^ (x >> 31); }
 static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8_t *side, int phase, int dense, uint64_t seed) {
-    band_params bp = {s->band_radius, s->band_span};
+    band_params bp = {s->band_radius, s->band_span, 0};
     const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
     int64_t lo[3], ln[3], ro[3], rn[3]; int ni[3];
     const z3_meta *m = z3_meta_of(s->band);
@@ -615,7 +615,56 @@ static void u8_stats(const uint8_t *a, size_t n, size_t *nz, double *sum, double
 }
 /* the stored phase (src/sources.h source.phase) of a window of the sample's level: shift 1 nearest-upsampled from the grid one
    level coarser (the label grid for native windows) as band_window does, shift 0 read directly */
+/* shift >= 2 (a 9.6 um phase for 2.4 um windows): circular trilinear interpolation. Grid voxel j of g = 2^shift native voxels sits at
+   g j + (g - 1) / 2 (src/band.c); each window voxel gets the weighted mean phasor of its 8 grid neighbours with a known phase,
+   unknown when they hold under half the weight. Between two rectos the phase is a linear ramp, which this reproduces; the 1 -> 0
+   wrap at a recto is continuous on the circle. */
+static int phase_window_interp(z3 *a, const int64_t o[3], int P, int shift, uint8_t *side) {
+    static float cs[PHASE_PERIOD], sn[PHASE_PERIOD]; static _Atomic int init;
+    if (!atomic_load(&init)) { for (int k = 0; k < PHASE_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); sn[k] = (float)sin(2 * M_PI * k / PHASE_PERIOD); } atomic_store(&init, 1); }
+    const int g = 1 << shift; const double c0 = 0.5 * (g - 1);
+    int64_t lo[3], ln[3], ro[3], rn[3]; const z3_meta *m = z3_meta_of(a);
+    for (int d = 0; d < 3; d++) {
+        lo[d] = (int64_t)floor((o[d] - c0) / g); ln[d] = (int64_t)floor((o[d] + P - 1 - c0) / g) + 2 - lo[d];
+        ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
+    }
+    const size_t N = (size_t)ln[0] * ln[1] * ln[2];
+    uint8_t *ph = malloc(N); int *j0 = malloc(3 * (size_t)P * sizeof *j0); float *tf = malloc(3 * (size_t)P * sizeof *tf);
+    if (!ph || !j0 || !tf) { free(ph); free(j0); free(tf); return -1; }
+    memset(ph, PHASE_UNKNOWN, N);
+    if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
+        uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
+        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { free(tmp); free(ph); free(j0); free(tf); return -1; }
+        for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
+            memcpy(ph + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
+        free(tmp);
+    }
+    for (int d = 0; d < 3; d++) for (int k = 0; k < P; k++) {   /* per axis: the lower grid neighbour (in the read region) and the fraction */
+        const double u = (o[d] + k - c0) / g; const int64_t j = (int64_t)floor(u);
+        j0[d * P + k] = (int)(j - lo[d]); tf[d * P + k] = (float)(u - j);
+    }
+    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
+        const int az = j0[z], ay = j0[P + y]; const float tz = tf[z], ty = tf[P + y];
+        uint8_t *dst = side + ((size_t)z * P + y) * P;
+        for (int x = 0; x < P; x++) {
+            const int ax = j0[2 * P + x]; const float tx = tf[2 * P + x];
+            float sx = 0.f, sy = 0.f, wk = 0.f;
+            for (int c = 0; c < 8; c++) {
+                const int v = ph[((size_t)(az + (c >> 2 & 1)) * ln[1] + ay + (c >> 1 & 1)) * ln[2] + ax + (c & 1)];
+                if (v >= PHASE_PERIOD) continue;
+                const float wv = (c & 4 ? tz : 1.f - tz) * (c & 2 ? ty : 1.f - ty) * (c & 1 ? tx : 1.f - tx);
+                sx += wv * cs[v]; sy += wv * sn[v]; wk += wv;
+            }
+            if (wk < 0.5f || sx * sx + sy * sy < 1e-8f) { dst[x] = PHASE_UNKNOWN; continue; }
+            float t = atan2f(sy, sx) * (float)(PHASE_PERIOD / (2 * M_PI)); if (t < 0) t += PHASE_PERIOD;
+            const int q = (int)lrintf(t); dst[x] = (uint8_t)(q >= PHASE_PERIOD ? q - PHASE_PERIOD : q);
+        }
+    }
+    free(ph); free(j0); free(tf);
+    return 0;
+}
 static int phase_window(z3 *a, const int64_t o[3], int P, int shift, uint8_t *side) {   /* a: s->phase, or s->wind (same grid) */
+    if (shift >= 2) return phase_window_interp(a, o, P, shift, side);
     int64_t lo[3], ln[3], ro[3], rn[3];
     const z3_meta *m = z3_meta_of(a);
     for (int d = 0; d < 3; d++) {
@@ -968,7 +1017,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     spatial_aug spatial={0};
     /* band-labelled native samples keep the exact voxel grid (the band field is not interpolated) */
     const int pshift = s->phase ? s->phase_level - l : -1;   /* the stored phase: its grid relative to this level's (0 direct, 1 upsampled) */
-    const int stored_phase = !c->band && c->side == 2 && s->phase && !c->phase_dense && (pshift == 1 || (pshift == 0 && s->phase_direct));
+    const int stored_phase = !c->band && c->side == 2 && s->phase && !c->phase_dense && (pshift == 1 || ((pshift == 0 || pshift == 2) && s->phase_direct));   /* (2: a 9.6 um phase interpolated into 2.4 um windows) */
     const int band_sample = (c->band || c->side) && s->band && (l == 0 || stored_phase);   /* (c->side without c->band: task unwrap, the phase only) */
     if (c->augment && c->geometry_augment && s->geometry && !band_sample) {
         spatial_aug_make(&spatial,rnext(r),P,c->rotate_degrees,c->rotate_p,c->elastic,c->elastic_p);

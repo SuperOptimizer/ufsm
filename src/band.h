@@ -12,12 +12,14 @@ enum { BAND_STEPS = 18, BAND_PERIOD = 252, BAND_HALF = 9, BAND_UNKNOWN = 255 };
 typedef struct {
     float radius;      /* flood radius in native voxels (beyond: unknown); about 3/4 of the turn pitch */
     float span;        /* native voxels around a missing-wrap jump that become unknown */
+    float gs;          /* native voxels per grid voxel of the codes (0 = 2: the 4.8 um label grid of a 2.4 um scan; 4: codes pooled to 9.6 um) */
 } band_params;
 
-/* codes: winding_mod14 raster on the label grid (one label voxel = 2 native voxels), dims n[3] (z, y, x), origin o[3] in
+/* codes: winding_mod14 raster on the label grid (one label voxel = gs native voxels, default 2), dims n[3] (z, y, x), origin o[3] in
    label voxels; cy, cx: umbilicus centre (native voxels) at each label z plane. out: band per voxel (0..251 or 255).
    Returns 0, or -1 when out of memory. Neighbourhoods are limited to the array: callers pass a halo of at least
-   (radius + span) / 2 + 2 label voxels and crop. */
+   (radius + span) / gs + 2 label voxels and crop; band_gs(p) is gs with the default applied. */
+static inline float band_gs(band_params p) { return p.gs > 0 ? p.gs : 2.f; }
 int band_field(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out);
 /* the same plus the side of every known voxel relative to its nearest labelled recto: SIDE_RECTO outward of it (away from the
    umbilicus, the papyrus behind the recto face and the inner half of the gap beyond it), SIDE_VERSO inward (the outer half of the

@@ -68,14 +68,14 @@ static int band_impl(const uint8_t *codes, const int n[3], const int64_t o[3], c
     for (size_t i = 0; i < N; i++) seed[i] = codes[i] > 0 && codes[i] < 255;
     if (edt_feature(seed, n, d2, idx)) { BAND_FREE(); return -1; }
     /* band = nearest surface winding +- half a turn; unknown beyond the flood radius */
-    const float r2 = (p.radius / 2.f) * (p.radius / 2.f);
+    const float g = band_gs(p), r2 = (p.radius / g) * (p.radius / g), c0 = 0.5f * (g - 1.f);   /* label voxel i sits at g i + (g - 1) / 2 native */
     for (size_t i = 0; i < N; i++) {
         if (idx[i] < 0 || d2[i] > r2) { out[i] = BAND_UNKNOWN; if (side) side[i] = SIDE_UNKNOWN; continue; }
         const size_t s = (size_t)idx[i];
         const int z = (int)(i / sz), y = (int)((i / sy) % n[1]), x = (int)(i % sy);
         const int zs = (int)(s / sz), ys = (int)((s / sy) % n[1]), xs = (int)(s % sy);
-        const double rv = hypot(2.0 * (y + o[1]) + 0.5 - cy[z], 2.0 * (x + o[2]) + 0.5 - cx[z]);
-        const double rs = hypot(2.0 * (ys + o[1]) + 0.5 - cy[zs], 2.0 * (xs + o[2]) + 0.5 - cx[zs]);
+        const double rv = hypot(g * (y + o[1]) + c0 - cy[z], g * (x + o[2]) + c0 - cx[z]);
+        const double rs = hypot(g * (ys + o[1]) + c0 - cy[zs], g * (xs + o[2]) + c0 - cx[zs]);
         const int k = (int)codes[s] - 1 + (rv >= rs ? BAND_HALF : -BAND_HALF);
         if (side) side[i] = rv >= rs ? SIDE_RECTO : SIDE_VERSO;
         out[i] = (uint8_t)((k % BAND_PERIOD + BAND_PERIOD) % BAND_PERIOD);
@@ -106,7 +106,7 @@ static int band_impl(const uint8_t *codes, const int n[3], const int64_t o[3], c
     if (any) {
         float *e2 = d2k ? malloc(N * 4) : d2; int32_t *ei = idxk ? malloc(N * 4) : idx;
         const int rc = !e2 || !ei || edt_feature(seed, n, e2, ei);
-        const float s2 = (p.span / 2.f) * (p.span / 2.f);
+        const float s2 = (p.span / g) * (p.span / g);
         if (!rc) for (size_t i = 0; i < N; i++) if (e2[i] <= s2) out[i] = BAND_UNKNOWN;
         if (d2k) free(e2);
         if (idxk) free(ei);
@@ -153,7 +153,7 @@ int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], c
         rc = edt_feature(mid, n, m2, im);
     }
     if (!rc) {
-        const float h = p.radius / 2.f;   /* label voxels */
+        const float g = band_gs(p), h = p.radius / g;   /* label voxels */
         for (size_t i = 0; i < N; i++) {
             phase[i] = PHASE_UNKNOWN;
             if (spacing) spacing[i] = 0;
@@ -171,7 +171,7 @@ int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], c
             if (side[i] == SIDE_VERSO) f = 1.f - f;
             int q = (int)lrintf(f * PHASE_PERIOD);
             phase[i] = (uint8_t)(q >= PHASE_PERIOD ? q - PHASE_PERIOD : q);
-            if (spacing) { const long sp = lrintf(2.f * (ds + dm + 0.5f)); spacing[i] = (uint8_t)(sp < 1 ? 1 : sp > 255 ? 255 : sp); }
+            if (spacing) { const long sp = lrintf(g * (ds + dm + 0.5f)); spacing[i] = (uint8_t)(sp < 1 ? 1 : sp > 255 ? 255 : sp); }
         }
     }
     free(side); free(mid); free(d2); free(m2); free(idx); free(im);

@@ -220,8 +220,42 @@ static int band_fit_fields(const uint8_t *ph, const uint8_t *spc, const int n[3]
    band halo, in parallel, shard by shard (512 label voxels); blocks without codes stay unknown. --box (native) limits it.
    --pool 2 writes only the 2x circular-mean pooling, <out-dir>/9.6 (a whole scroll at 4.8 um is ~25 MB per shard, 9.6 um
    ~5 MB); --resume 1 skips shards already written (long runs). --winding 1 writes the winding mod 14 turns (band_winding, same
-   encoding and pooling: 1/18 turn steps) instead of the 1-turn phase, for targets beyond one turn. */
-typedef struct { z3 *codes; const int64_t *shape; const axis *ax; band_params bp; int halo, blk; int64_t s0[3]; uint8_t *shard; atomic_int next; int nblk[3]; size_t nonempty; pthread_mutex_t mu; int winding; } praster_job;
+   encoding and pooling: 1/18 turn steps) instead of the 1-turn phase, for targets beyond one turn. --gs 4 computes the field on the
+   codes pooled 2x (praster_read: circular mean, conflicts kept) into <out-dir>/9.6: 35x faster (block B 7.5 s vs 4.4 min); against the
+   4.8 um phase pooled to 9.6 on B: mean 0.016 turn apart, 1% over 0.1 turn. A source reads it for 2.4 um windows with "phase":
+   {"key": "9.6", "level": 2} (sample.c phase_window_interp: circular trilinear 4x). */
+typedef struct { z3 *codes; const int64_t *shape; const axis *ax; band_params bp; int halo, blk; int64_t s0[3]; uint8_t *shard; atomic_int next; int nblk[3]; size_t nonempty; pthread_mutex_t mu; int winding; int pf; const int64_t *fshape; } praster_job;   /* pf 2: the grid is the 4.8 um codes (fshape) pooled 2x */
+/* the codes over the grid box ro / rn: read directly (pf 1), or from the 2x finer codes with every 2^3 block pooled (pf 2): empty when
+   all are empty, 255 (conflict) when any is or two lie more than a quarter turn apart, else their circular mean */
+static int praster_read(const praster_job *J, const int64_t ro[3], const int64_t rn[3], uint8_t *out) {
+    if (J->pf == 1) return z3_read(J->codes, ro, rn, out, 1);
+    static float cs[BAND_PERIOD], sn[BAND_PERIOD]; static _Atomic int init;
+    if (!atomic_load(&init)) { for (int k = 0; k < BAND_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / BAND_PERIOD); sn[k] = (float)sin(2 * M_PI * k / BAND_PERIOD); } atomic_store(&init, 1); }
+    int64_t fo[3], fn[3];
+    for (int d = 0; d < 3; d++) { fo[d] = 2 * ro[d]; const int64_t e = 2 * (ro[d] + rn[d]) < J->fshape[d] ? 2 * (ro[d] + rn[d]) : J->fshape[d]; fn[d] = e - fo[d]; }
+    memset(out, 0, (size_t)rn[0] * rn[1] * rn[2]);
+    if (fn[0] <= 0 || fn[1] <= 0 || fn[2] <= 0) return 0;
+    uint8_t *f = malloc((size_t)fn[0] * fn[1] * fn[2]);
+    if (!f || z3_read(J->codes, fo, fn, f, 1)) { free(f); return -1; }
+    for (int64_t a = 0; a < rn[0]; a++) for (int64_t b = 0; b < rn[1]; b++) for (int64_t c = 0; c < rn[2]; c++) {
+        int first = -1, conflict = 0, k = 0; float x = 0, y = 0;
+        for (int q = 0; q < 8 && !conflict; q++) {
+            const int64_t z = 2 * a + (q >> 2 & 1), yy = 2 * b + (q >> 1 & 1), xx = 2 * c + (q & 1);
+            if (z >= fn[0] || yy >= fn[1] || xx >= fn[2]) continue;
+            const int v = f[((size_t)z * fn[1] + yy) * fn[2] + xx];
+            if (!v) continue;
+            if (v == 255 || (first >= 0 && 2 * abs(band_diff(v - 1, first)) > BAND_STEPS / 2)) { conflict = 1; break; }
+            if (first < 0) first = v - 1;
+            x += cs[v - 1]; y += sn[v - 1]; k++;
+        }
+        uint8_t o = 0;
+        if (conflict) o = 255;
+        else if (k) { double t = atan2(y, x) / (2 * M_PI); if (t < 0) t += 1; o = (uint8_t)(1 + (int)lround(t * BAND_PERIOD) % BAND_PERIOD); }
+        out[((size_t)a * rn[1] + b) * rn[2] + c] = o;
+    }
+    free(f);
+    return 0;
+}
 static void *praster_worker(void *arg) {
     praster_job *J = arg; const int B = J->blk, Hh = J->halo, nb = J->nblk[0] * J->nblk[1] * J->nblk[2];
     for (;;) {
@@ -238,14 +272,14 @@ static void *praster_worker(void *arg) {
         if (!ok) continue;
         const size_t N = (size_t)n[0] * n[1] * n[2];
         uint8_t *codes = calloc(N, 1), *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
-        if (!codes || !tmp || z3_read(J->codes, ro, rn, tmp, 1)) { free(codes); free(tmp); fprintf(stderr, "phase-raster: read failed: %s\n", z3_error()); continue; }
+        if (!codes || !tmp || praster_read(J, ro, rn, tmp)) { free(codes); free(tmp); fprintf(stderr, "phase-raster: read failed: %s\n", z3_error()); continue; }
         size_t nz = 0; for (size_t k = 0; k < (size_t)rn[0] * rn[1] * rn[2]; k++) nz += tmp[k] != 0;
         if (!nz) { free(codes); free(tmp); continue; }
         for (int64_t zz = 0; zz < rn[0]; zz++) for (int64_t yy = 0; yy < rn[1]; yy++)
             memcpy(codes + ((size_t)(zz + ro[0] - o[0]) * n[1] + (yy + ro[1] - o[1])) * n[2] + (ro[2] - o[2]), tmp + ((size_t)zz * rn[1] + yy) * rn[2], (size_t)rn[2]);
         free(tmp);
         double *cy = malloc(n[0] * sizeof(double)), *cx = malloc(n[0] * sizeof(double));
-        for (int64_t zz = 0; zz < n[0]; zz++) axis_at(J->ax, 2.0 * (zz + o[0]) + 0.5, &cy[zz], &cx[zz]);
+        const double g = band_gs(J->bp); for (int64_t zz = 0; zz < n[0]; zz++) axis_at(J->ax, g * (zz + o[0]) + 0.5 * (g - 1), &cy[zz], &cx[zz]);
         uint8_t *band = malloc(N), *phase = malloc(N);
         if (!band || !phase || band_field_phase(codes, ni, o, cy, cx, J->bp, band, phase, nullptr)) { fprintf(stderr, "phase-raster: out of memory\n"); free(codes); free(band); free(phase); free(cy); free(cx); continue; }
         if (J->winding) for (size_t k = 0; k < N; k++) phase[k] = band_winding(band[k], phase[k]);   /* --winding: mod 14 turns */
@@ -273,25 +307,29 @@ static void phase_pool2(const uint8_t *src, uint8_t *dst) {
     }
 }
 static int cmd_phase_raster(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm phase-raster <codes-root> <key> <out-dir> [--axis A] [--radius 80] [--span 75] [--box z,y,x,nz,ny,nx] [--threads 4] [--block 256] [--pool 2] [--resume 1] [--winding 1]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm phase-raster <codes-root> <key> <out-dir> [--axis A] [--radius 80] [--span 75] [--box z,y,x,nz,ny,nx] [--threads 4] [--block 256] [--pool 2] [--resume 1] [--winding 1] [--gs 4]\n"); return 2; }
     const int pool = atoi(opt(argc, argv, "--pool", "1")), resume = atoi(opt(argc, argv, "--resume", "0"));   /* --pool 2: write only the 9.6 um (2x circular-mean) phase; --resume: skip written shards */
     const int winding = atoi(opt(argc, argv, "--winding", "0"));   /* the winding mod 14 turns (band_winding) instead of the 1-turn phase */
     if (pool != 1 && pool != 2) { fprintf(stderr, "phase-raster: --pool 1|2\n"); return 2; }
-    band_params bp = {(float)atof(opt(argc, argv, "--radius", "80")), (float)atof(opt(argc, argv, "--span", "75"))};
+    const int gs = atoi(opt(argc, argv, "--gs", "2")), pf = gs / 2;   /* native voxels per output grid voxel: 2 the codes' own 4.8 um grid, 4 the codes pooled 2x (9.6 um) */
+    if (gs != 2 && gs != 4) { fprintf(stderr, "phase-raster: --gs 2|4\n"); return 2; }
+    if (gs == 4 && pool != 1) { fprintf(stderr, "phase-raster: --gs 4 writes the 9.6 um grid itself (no --pool)\n"); return 2; }
+    band_params bp = {(float)atof(opt(argc, argv, "--radius", "80")), (float)atof(opt(argc, argv, "--span", "75")), (float)gs};
     axis ax = {0};
     if (axis_load(&ax, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "phase-raster: cannot load axis\n"); return 1; }
     z3 *z = z3_open(store_open(argv[2]), argv[3], nullptr); if (!z) { fprintf(stderr, "%s\n", z3_error()); return 1; }
-    const z3_meta *m = z3_meta_of(z); const int64_t shape[3] = {m->shape[0], m->shape[1], m->shape[2]};
+    const z3_meta *m = z3_meta_of(z); const int64_t fshape[3] = {m->shape[0], m->shape[1], m->shape[2]};
+    const int64_t shape[3] = {(fshape[0] + pf - 1) / pf, (fshape[1] + pf - 1) / pf, (fshape[2] + pf - 1) / pf};   /* the output grid */
     const int blk = atoi(opt(argc, argv, "--block", "256")), nth = atoi(opt(argc, argv, "--threads", "4"));
     if (512 % blk) { fprintf(stderr, "phase-raster: --block must divide 512\n"); return 2; }
     int64_t lo[3] = {0, 0, 0}, hi[3] = {shape[0], shape[1], shape[2]};
     const char *bx = opt(argc, argv, "--box", nullptr);
-    if (bx) { long long v[6]; if (sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return usage(); for (int d = 0; d < 3; d++) { lo[d] = v[d] / 2; hi[d] = (v[d] + v[3 + d] + 1) / 2; } }
-    const double um = 4.8 * pool; char lv[32]; z3w_level_name(um, lv, sizeof lv);
+    if (bx) { long long v[6]; if (sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return usage(); for (int d = 0; d < 3; d++) { lo[d] = v[d] / gs; hi[d] = (v[d] + v[3 + d] + gs - 1) / gs; } }
+    const double um = 2.4 * gs * pool; char lv[32]; z3w_level_name(um, lv, sizeof lv);
     char dir[1400]; snprintf(dir, sizeof dir, "%s/%s", argv[4], lv);
     char attrs[600]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s%s\",\"codes\":\"%s/%s\",\"radius\":%g,\"span\":%g}}",
                                    winding ? "band field winding mod 14 turns x 18 (src/band.h band_winding: 0..251, 255 unknown)" : "band field winding phase (src/band.h PHASE_*: 0..251, 255 unknown)",
-                                   pool == 2 ? ", pooled 2x (circular mean of the known codes)" : "", argv[2], argv[3], bp.radius, bp.span);
+                                   pool == 2 ? ", pooled 2x (circular mean of the known codes)" : gs == 4 ? ", computed on the codes pooled 2x (9.6 um grid)" : "", argv[2], argv[3], bp.radius, bp.span);
     const int64_t oshape[3] = {(shape[0] + pool - 1) / pool, (shape[1] + pool - 1) / pool, (shape[2] + pool - 1) / pool};
     z3w *w = z3w_create(dir, oshape, 512 / pool, 0, PHASE_UNKNOWN, attrs);   /* a 4.8 shard of 512 -> one output shard */
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
@@ -302,7 +340,7 @@ static int cmd_phase_raster(int argc, char **argv) {
     for (int64_t sz = lo[0] / 512; sz * 512 < hi[0]; sz++) for (int64_t sy = lo[1] / 512; sy * 512 < hi[1]; sy++) for (int64_t sx = lo[2] / 512; sx * 512 < hi[2]; sx++) {
         if (resume) { char sp[1600]; snprintf(sp, sizeof sp, "%s/c/%lld/%lld/%lld", dir, (long long)sz, (long long)sy, (long long)sx); if (access(sp, F_OK) == 0) { skipped++; continue; } }
         memset(shard, PHASE_UNKNOWN, (size_t)512 * 512 * 512);
-        praster_job J = {z, shape, &ax, bp, (int)ceilf((bp.radius + bp.span) / 2.f) + 2, blk, {sz * 512, sy * 512, sx * 512}, shard, 0, {512 / blk, 512 / blk, 512 / blk}, 0, PTHREAD_MUTEX_INITIALIZER, winding};
+        praster_job J = {z, shape, &ax, bp, (int)ceilf((bp.radius + bp.span) / (float)gs) + 2, blk, {sz * 512, sy * 512, sx * 512}, shard, 0, {512 / blk, 512 / blk, 512 / blk}, 0, PTHREAD_MUTEX_INITIALIZER, winding, pf, fshape};
         pthread_t th[64]; const int nt = nth < 1 ? 1 : nth > 64 ? 64 : nth;
         for (int k = 0; k < nt; k++) pthread_create(&th[k], nullptr, praster_worker, &J);
         for (int k = 0; k < nt; k++) pthread_join(th[k], nullptr);
@@ -349,7 +387,7 @@ static int cmd_band(int argc, char **argv) {
     long long b[6];
     if (sscanf(argv[4], "%lld,%lld,%lld,%lld,%lld,%lld", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return usage();
     for (int d = 0; d < 6; d++) if (b[d] % 2 || (d >= 3 && b[d] <= 0)) { fprintf(stderr, "band: box must be even and positive\n"); return 2; }
-    band_params bp = {(float)atof(opt(argc, argv, "--radius", "80")), (float)atof(opt(argc, argv, "--span", "75"))};
+    band_params bp = {(float)atof(opt(argc, argv, "--radius", "80")), (float)atof(opt(argc, argv, "--span", "75")), 0};
     axis ax = {0};
     if (axis_load(&ax, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "band: cannot load axis\n"); return 1; }
     const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
