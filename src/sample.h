@@ -49,6 +49,8 @@ typedef struct {
     int pmask;               /* 1: fill batch.pm, the papyrus mask (CT > 0, symmetry applied) for heads whose loss covers all papyrus
                                 (task unwrap: ink) */
     int cond_outside;        /* --cond-loss outside: batch.wind only where the condition does not reach (the net must count sheets there) */
+    const struct papyrus_cfg *pap_head; /* task unwrap --pap-head (nullptr = off): batch.pap = the papyrus / void gap labels (src/papyrus.h
+                                papyrus_local) of the clean CT before the scanner augmentation, symmetry applied */
     int cond;                /* 1 (train --cond): inputs 4-6 hold a condition drawn from the source's winding raster (cos, sin of
                                 2 pi q' / 14, mask; q' = q + a random gauge k per sample, in a random pattern of the output frame) and
                                 batch.wind the gauge-shifted winding for the targets (all unknown when no condition was drawn) */
@@ -74,6 +76,7 @@ typedef struct {
     uint8_t *side;           /* B x P^3 side (src/band.h SIDE_*) or winding phase (PHASE_*) per voxel when cfg.side */
     uint8_t *pm;             /* B x P^3 papyrus mask (1 where CT > 0) when cfg.pmask */
     uint8_t *wind;           /* B x P^3 winding mod 14 + gauge (band.h band_winding encoding, 255 unknown) when cfg.cond */
+    uint8_t *pap;            /* B x P^3 papyrus labels when cfg.pap_head: 0 void, 1 papyrus, 255 ignored */
 } batch;
 
 typedef struct sampler sampler;

@@ -411,6 +411,12 @@ __global__ void cond_tg_k(const uint8_t *wv, size_t n, uint8_t *t, uint8_t *m) {
     m[i] = 1;
 }
 extern "C" void nn_cond_targets(const uint8_t *wind, size_t n, uint8_t *t, uint8_t *m) { cond_tg_k<<<nblk(n, 256), 256>>>(wind, n, t, m); KCHECK(); }
+/* --pap-head: the gap labels (0 void, 1 papyrus, 255 ignored) -> target 0 / 255, mask = not ignored and inside the scroll (pm, CT > 0) */
+__global__ void pap_tg_k(const uint8_t *pl, const uint8_t *pm, size_t n, uint8_t *t, uint8_t *m) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) { const uint8_t v = pl[i]; t[i] = v == 1 ? 255 : 0; m[i] = v != 255 && pm[i]; }
+}
+extern "C" void nn_pap_targets(const uint8_t *pl, const uint8_t *pm, size_t n, uint8_t *t, uint8_t *m) { pap_tg_k<<<nblk(n, 256), 256>>>(pl, pm, n, t, m); KCHECK(); }
 /* --cond: of the voxels with a known (gauge-shifted) winding, how many the 14-turn head (logits lg[0..n), lg[n..2n): cos, sin) puts on the
    right turn, |q_pred - q| < 0.5 mod 14: cnt[0] += known, cnt[1] += right (two 64-bit device counters) */
 template <typename LT> __global__ void cond_acc_k(const LT *lg, const uint8_t *wv, size_t n, unsigned long long *cnt) {

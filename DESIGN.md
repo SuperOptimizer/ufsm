@@ -396,6 +396,12 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   counting sheets. With t_lo 50 open air (up to ~50 here) left papyrus specks; 55 plus band 5 leaves them ignored. 28% of the
   recto label band on B lies in void by these labels (the band straddles the face). `ufsm overlay` draws a CT plane beside
   label panels as a PNG (zlib). Training A/B against the cutoff-80 net: not run yet (user hold).
+- Papyrus head in the unified model (`train --task unwrap --pap-head 1`, default off): one more output channel after the others
+  (11 without --cond), the gap labels of each window's clean CT computed by the sampler before the scanner augmentation (B's
+  settings by default: cut 55,128, band 5, local 8, depth 30, margin 0.1), the CT's symmetry; BCE over voxels inside the scroll
+  (CT > 0) not ignored, times --pap-lambda. The net gets no cutoff and gives one papyrus / void reading. Laptop smoke (2.4 um, 8
+  blocks, warm start from the 30k net, head fresh): papyrus bce 1.37 -> 0.10 in 400 steps, the other heads unchanged.
+  predict --channel 11 writes it; --fit-fields accepts any unwrap checkpoint with 11+ outputs.
 - `ufsm phase-raster --pool 2` writes only the 2x circular-mean pooled phase (<out>/9.6, shards of 256: one per 4.8 um shard
   of 512); `--resume 1` skips written shards. A whole-scroll Paris4 phase at 4.8 um would be ~326 GB (25 MB per shard, 13054
   shards; the desk has 317 GB free), at 9.6 um ~65 GB. Block B: identical known / unknown masks to phase-raster + downsample,

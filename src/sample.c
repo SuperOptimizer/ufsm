@@ -143,10 +143,11 @@ static batch alloc_batch(const sample_cfg *c) {
     b.side = c->side ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     b.pm = c->pmask ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     b.wind = c->cond ? nn_host_alloc((size_t)c->B * p3) : nullptr;
+    b.pap = c->pap_head ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b) { if (b->wind) nn_host_free(b->wind); if (b->band) nn_host_free(b->band); if (b->side) nn_host_free(b->side); if (b->pm) nn_host_free(b->pm); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->pap) nn_host_free(b->pap); if (b->wind) nn_host_free(b->wind); if (b->band) nn_host_free(b->band); if (b->side) nn_host_free(b->side); if (b->pm) nn_host_free(b->pm); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -905,6 +906,14 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         memset(ttmp + p3, 0, p3);
         w[0] = 1;
     }
+    uint8_t *papc = nullptr;   /* --pap-head: the gap labels of the clean CT, 0 void / 1 papyrus / 255 ignored (the symmetry below, with pm) */
+    if (c->pap_head) {
+        uint8_t *pt = malloc(p3), *pg = calloc(p3, 1), *pf = malloc(p3); papc = malloc(p3);
+        if (!pt || !pg || !pf || !papc) { free(pt); free(pg); free(pf); free(papc); return -1; }
+        papyrus_labels(ctu, P, c->pap_head, 0.f, 0.0, pt, pg, pf, big + p3);   /* (scratch 8 P^3: free until the scanner augmentation) */
+        for (size_t k = 0; k < p3; k++) papc[k] = pg[k] ? 255 : pt[k] ? 1 : 0;
+        free(pt); free(pg); free(pf);
+    }
     PROF_MARK(PS_ENCODE);
     if (c->sheet) sheet_mask_contacts(c->sheet,o,P,ign);
     /* input channels (z-scored CT, radial unit vector) written in one pass straight into the batch with the symmetry
@@ -978,6 +987,10 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         uint8_t *pt = big + 2 * p3;
         for (size_t k = 0; k < p3; k++) pt[k] = ctu[k] != 0;
         sym_u8(pt, b->pm + (size_t)i * p3, P, y);
+    }
+    if (c->pap_head) {   /* the gap labels through the same symmetry; warped samples: all ignored */
+        if (spatial.active) memset(b->pap + (size_t)i * p3, 255, p3); else sym_u8(papc, b->pap + (size_t)i * p3, P, y);
+        free(papc);
     }
     if (c->band || c->side) {   /* band labels: computed on the source grid, unknown on CT air, then the same symmetry as CT and targets */
         if (!band_sample || spatial.active) {   /* no band labels: affinities (and sides) unsupervised */
