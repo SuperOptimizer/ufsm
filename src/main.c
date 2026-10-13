@@ -1152,6 +1152,55 @@ static int cmd_fit_compare(int argc, char **argv) {
     printf("\n  gross phase errors by confidence:");
     for (int k = 0; k < NK; k++) printf("  %.1f-%.1f %.3f (%zu)", cb[k], fmin(1, cb[k + 1]), kn[k] ? (double)kg[k] / kn[k] : 0, kn[k]);
     printf("\n");
+    {   /* the turn count without the fitter: 0.5 mm segments along the radial direction (away from the axis, in z planes) from
+           every 4th reference cell; the reference crosses n turns (its phase unwrapped along the segment, every step known with
+           confidence > 0.3); the candidate's count from its phase unwrapped the same way, and from its density integrated along
+           the segment (|n . r| / spacing, n the principal axis of its n n^T): a field too coarse for its phase to resolve the
+           sheets can still count them by density. Error = candidate - reference turns (negative: sheets missed) */
+        const double L = 500.0, ds = 0.5 * A.h * A.um;   /* segment length and step (um) */
+        const int ns = (int)(L / ds);
+        enum { NE = 400 }; size_t hep[NE] = {0}, hed[NE] = {0}, nseg = 0, slp = 0, sld = 0; double bp = 0, bd = 0, rt = 0;
+        size_t pk_n = 0, pk_sp = 0, pk_sd = 0;   /* segments whose reference spacing is under 100 um: slips */
+        const double cu = A.h * A.um, ccu = B.h * B.um;   /* reference / candidate cell edge (um) */
+        for (int z = 0; z < A.shape[0]; z += 4) for (int y = 0; y < A.shape[1]; y += 4) for (int x = 0; x < A.shape[2]; x += 4) {
+            const double nz = A.h * (z + 0.5);   /* native z of the cell centre (reference's native voxels, box-local) */
+            const int az = (int)fmin(fmax(nz, 0), A.shape[0] * A.h); const double cyv = A.f.cy[az], cxv = A.f.cx[az];
+            double py = A.h * (y + 0.5), px = A.h * (x + 0.5);
+            double ry = py - cyv, rx = px - cxv; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
+            double pa = 0, pb = 0, ta = 0, tb = 0, td = 0, la = 0, lb = 0, spsum = 0; int ok = 1, hb = 0;
+            for (int k = 0; k <= ns && ok; k++) {
+                const double qy = py + ry * k * ds / A.um, qx = px + rx * k * ds / A.um;   /* native voxels */
+                const int iy = (int)(qy / A.h), ix = (int)(qx / A.h);
+                if (iy < 0 || ix < 0 || iy >= A.shape[1] || ix >= A.shape[2]) { ok = 0; break; }
+                const size_t i = ((size_t)z * A.shape[1] + iy) * A.shape[2] + ix;
+                const double ac = (A.f.pc[i] - 128) / 127.0, as = (A.f.ps[i] - 128) / 127.0;
+                if (!A.f.w[i] || hypot(ac, as) <= 0.3) { ok = 0; break; }
+                const size_t j = (((size_t)(nz * A.um / ccu)) * B.shape[1] + (size_t)(qy * A.um / ccu)) * B.shape[2] + (size_t)(qx * A.um / ccu);
+                const double bc = (B.f.pc[j] - 128) / 127.0, bs = (B.f.ps[j] - 128) / 127.0;
+                pa = atan2(as, ac) / (2 * M_PI); spsum += A.f.sp[i] * cu / 8.0;
+                if (k) { double d = pa - la; d -= round(d); ta += d; }
+                la = pa;
+                if (hypot(bc, bs) > 1e-3) { pb = atan2(bs, bc) / (2 * M_PI); if (hb) { double d = pb - lb; d -= round(d); tb += d; } lb = pb; hb = 1; }
+                if (k < ns && B.f.sp[j] && B.f.w[j]) {   /* density: |n . r| / spacing over the step */
+                    double v[3]; fc_axis(&B.f, j, v);
+                    td += fabs(v[1] * ry + v[2] * rx) * ds / (B.f.sp[j] * ccu / 8.0);
+                }
+            }
+            if (!ok) continue;
+            const double ref = fabs(ta); if (ref < 0.5) continue;   /* a segment with under half a turn says nothing about counting */
+            const double ep = fabs(tb) - ref, ed = td - ref;
+            hep[(int)fmin(NE - 1, fmax(0, (ep + 4) / 8 * NE))]++; hed[(int)fmin(NE - 1, fmax(0, (ed + 4) / 8 * NE))]++;
+            nseg++; slp += fabs(ep) >= 0.5; sld += fabs(ed) >= 0.5; bp += ep; bd += ed; rt += ref;
+            if (spsum / (ns + 1) < 100) { pk_n++; pk_sp += fabs(ep) >= 0.5; pk_sd += fabs(ed) >= 0.5; }
+        }
+        if (nseg) {
+            printf("  turn counts on %zu radial 0.5 mm segments (reference %.2f turns each on average):\n", nseg, rt / nseg);
+            printf("    by phase:   error median %+.2f, mean %+.2f turns, off by >= 0.5 turn %.3f (packed < 100 um: %.3f of %zu)\n",
+                   hist_q(hep, NE, -4, 8.0 / NE, 0.5), bp / nseg, (double)slp / nseg, pk_n ? (double)pk_sp / pk_n : 0, pk_n);
+            printf("    by density: error median %+.2f, mean %+.2f turns, off by >= 0.5 turn %.3f (packed < 100 um: %.3f)\n",
+                   hist_q(hed, NE, -4, 8.0 / NE, 0.5), bd / nseg, (double)sld / nseg, pk_n ? (double)pk_sd / pk_n : 0);
+        }
+    }
     fit_fields_free(&A); fit_fields_free(&B);
     return 0;
 }
