@@ -1187,8 +1187,8 @@ int cmd_train(int argc, char **argv) {
     /* validation set: fixed batches from the held-out boxes (unaugmented), scored on GPU 0 */
     sample_cfg vc = sc; vc.cover = nullptr; vc.cover_start = 0; vc.ct_augment = 0; vc.axis_jitter = 0; vc.geometry_augment=0; vc.label_morph=0; vc.scan.strength=0; vc.affine_p=0; vc.seed = seed + 777; vc.augment = 0; vc.nworkers = 4; vc.nbuf = 2; vc.holdout = 1;
     { int any = 0; for (int i = 0; i < S->n; i++) any |= S->src[i].hold_n[0] > 0; if (!any) { vc.holdout = 0; fprintf(stderr, "no holdout boxes in the sources: validation batches come from the training distribution\n"); } }
-    sampler *vs = sampler_start(S, &vc);
-    if (!vs) { fprintf(stderr, "cannot construct validation sampler\n"); return 1; }
+    sampler *vs = nval > 0 ? sampler_start(S, &vc) : nullptr;   /* --val-batches 0: no validation (e.g. windows wider than the holdout) */
+    if (nval > 0 && !vs) { fprintf(stderr, "cannot construct validation sampler\n"); return 1; }
     batch *val = calloc((size_t)nval, sizeof *val);
     for (int i = 0; i < nval; i++) {
         batch *b = sampler_next(vs);
@@ -1207,8 +1207,8 @@ int cmd_train(int argc, char **argv) {
         val[i].sheet=calloc((size_t)B,sizeof *val[i].sheet); val[i].sheet[0]=sheet_clone(b->sheet?b->sheet[0]:nullptr);
         sampler_release(vs, b);
     }
-    int validation_failed = sampler_failed(vs);
-    sampler_stop(vs);
+    int validation_failed = vs && sampler_failed(vs);
+    if (vs) sampler_stop(vs);
     if (validation_failed) { fprintf(stderr, "validation sampler failed\n"); return 1; }
     fprintf(stderr, "%d validation batches\n", nval);
 
