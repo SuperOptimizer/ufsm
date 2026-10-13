@@ -1032,7 +1032,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         ia = (float)a; ib = (float)bb; isg = (float)sg;
     }
     if (c->augment && c->symmetry_p < 1 && runif(r) >= c->symmetry_p) y = sym_of(0);
-    if (c->augment && c->axis_jitter > 0 && s->ax.n > 0 && runif(r) < .1) {
+    if (c->augment && c->axis_jitter > 0 && s->ax.n > 0 && runif(r) < (c->axis_jitter_p > 0 ? c->axis_jitter_p : .1)) {
         float jy = (float)((2 * runif(r) - 1) * c->axis_jitter / scale);
         float jx = (float)((2 * runif(r) - 1) * c->axis_jitter / scale);
         /* Bound the auxiliary radial-direction perturbation throughout the patch. CT/targets remain registered. */
@@ -1042,7 +1042,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             float dx = fmaxf(0, fmaxf((float)o[2] - cxz[z], cxz[z] - (float)(o[2] + P - 1)));
             float rr = sqrtf(dy * dy + dx * dx); if (rr < radius) radius = rr;
         }
-        float mag = sqrtf(jy * jy + jx * jx), cap = radius * .0348995f;
+        float mag = sqrtf(jy * jy + jx * jx), cap = radius * (c->axis_jitter_deg > 0 ? sinf(c->axis_jitter_deg * 0.0174532925f) : .0348995f);
         if (mag > cap && mag > 0) { jy *= cap / mag; jx *= cap / mag; }
         for (int z = 0; z < Pz; z++) { cyz[z] += jy; cxz[z] += jx; }
     }

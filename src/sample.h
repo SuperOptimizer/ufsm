@@ -34,6 +34,7 @@ typedef struct {
     int ct_augment;         /* conservative reconstructed-CT appearance augmentation */
     float symmetry_p;       /* chance of drawing a symmetry when augment enables geometry */
     float axis_jitter;      /* max auxiliary axis error in native voxels, p=.1, angle capped at 2 degrees */
+    float axis_jitter_p, axis_jitter_deg;   /* its probability and angle cap (0: .1 and 2 degrees): an estimated umbilicus on other scrolls */
     int geometry_augment;  /* all 48 symmetries, including Z flips, with registered continuous warps */
     float rotate_degrees, rotate_p, elastic, elastic_p;
     float zoom_min, zoom_p;  /* zoom-in augmentation: with probability zoom_p the window shows a 1/z of the read cube, z uniform
