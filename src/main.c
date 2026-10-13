@@ -905,6 +905,44 @@ static float *read_tif_f32(const char *path, int *w, int *h) {
    labels: any positive) or phase (the band phase codes, src/band.h: the circular mean of the known codes of the 2^3 block,
    PHASE_UNKNOWN where none is known or their resultant is under half their count). --box (source voxels) limits the work to
    the output shards it meets; others stay missing (the fill value). */
+/* cmd_downsample's pooling of one source slab (n[0] rows, even, from output row 0 of dst): output rows split over threads; phase
+   mode with cos / sin tables (the same doubles as cos / sin of each code) */
+static double g_ds_cs[PHASE_PERIOD], g_ds_sn[PHASE_PERIOD];
+static void ds_tables(void) { for (int k = 0; k < PHASE_PERIOD; k++) { g_ds_cs[k] = cos(2 * M_PI * k / PHASE_PERIOD); g_ds_sn[k] = sin(2 * M_PI * k / PHASE_PERIOD); } }
+typedef struct { const uint8_t *src; int64_t n[3]; uint8_t *dst; int S; int64_t ny, nx, na; int phase; atomic_long next; } ds_job;
+static void *ds_worker(void *arg) {
+    ds_job *jb = arg; const int64_t *n = jb->n; const int S = jb->S;
+    for (int64_t a; (a = atomic_fetch_add(&jb->next, 1)) < jb->na;) {
+        const uint8_t *r0 = jb->src + (size_t)(2 * a) * n[1] * n[2], *r1 = 2 * a + 1 < n[0] ? r0 + (size_t)n[1] * n[2] : nullptr;
+        for (int64_t b = 0; b < jb->ny; b++) {
+            uint8_t *out = jb->dst + ((size_t)a * S + b) * S;
+            const int64_t y0 = 2 * b, y1 = 2 * b + 1 < n[1] ? 2 * b + 1 : -1;
+            for (int64_t c = 0; c < jb->nx; c++) {
+                const int64_t x0 = 2 * c, x1 = 2 * c + 1 < n[2] ? 2 * c + 1 : -1;
+                int v[8], nv = 0;
+                for (int k = 0; k < 8; k++) {   /* the old order: z, y, x bits */
+                    const uint8_t *r = k >> 2 & 1 ? r1 : r0; const int64_t yy = k >> 1 & 1 ? y1 : y0, xx = k & 1 ? x1 : x0;
+                    if (r && yy >= 0 && xx >= 0) v[nv++] = r[(size_t)yy * n[2] + xx];
+                }
+                if (!jb->phase) { int mx = 0; for (int k = 0; k < nv; k++) mx = v[k] > mx ? v[k] : mx; out[c] = (uint8_t)mx; continue; }
+                double cs = 0, sn = 0; int known = 0;
+                for (int k = 0; k < nv; k++) if (v[k] < PHASE_PERIOD) { cs += g_ds_cs[v[k]]; sn += g_ds_sn[v[k]]; known++; }
+                uint8_t o = PHASE_UNKNOWN;
+                if (known && hypot(cs, sn) >= 0.5 * known) { double t = atan2(sn, cs) / (2 * M_PI); if (t < 0) t += 1; o = (uint8_t)((int)lround(t * PHASE_PERIOD) % PHASE_PERIOD); }
+                out[c] = o;
+            }
+        }
+    }
+    return nullptr;
+}
+static void ds_run(ds_job *jb, int nt) {
+    atomic_store(&jb->next, 0);
+    nt = nt < 1 ? 1 : nt > 64 ? 64 : nt;
+    pthread_t th[64]; int k = 0;
+    for (; k < nt - 1 && pthread_create(&th[k], nullptr, ds_worker, jb) == 0; k++) {}
+    ds_worker(jb);
+    for (int i = 0; i < k; i++) pthread_join(th[i], nullptr);
+}
 static int cmd_downsample(int argc, char **argv) {
     if (argc < 6) { fprintf(stderr, "usage: ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase [--box z,y,x,nz,ny,nx] [--shard 512] [--cache DIR] [--threads 16]\n"); return 2; }
     const char *mode = opt(argc, argv, "--mode", "max"); const int phase = !strcmp(mode, "phase");
@@ -927,38 +965,43 @@ static int cmd_downsample(int argc, char **argv) {
     lum[nl++] = um;
     for (int a = 1; a < nl; a++) for (int b = a; b > 0 && lum[b] < lum[b - 1]; b--) { const double t = lum[b]; lum[b] = lum[b - 1]; lum[b - 1] = t; }
     if (!w || z3w_write_group(argv[4], lum, nl, "ufsm-downsample", nullptr)) { fprintf(stderr, "downsample: %s\n", z3w_error()); return 1; }
-    uint8_t *sb = malloc((size_t)S * S * S), *src = malloc((size_t)2 * 2 * S * 2 * S);   /* one output shard; two source rows */
-    int nsh = 0;
+    /* per output shard: its 2S source cube read in slabs of the source chunk depth (each inner chunk decoded once; reading two planes
+       at a time decoded every chunk it met once per plane pair), the slab pooled on nt threads; output shards whose source shards are
+       all absent are skipped (all fill: z3w writes nothing for them either) */
+    int64_t sd = m->chunk[0] > 0 ? m->chunk[0] : 128; if (sd % 2) sd *= 2; if (sd > 2 * (int64_t)S) sd = 2 * (int64_t)S;   /* source planes per slab */
+    uint8_t *sb = malloc((size_t)S * S * S), *src = malloc((size_t)sd * 2 * S * 2 * S);
+    if (!sb || !src) { fprintf(stderr, "downsample: out of memory\n"); return 1; }
+    ds_tables();
+    int nsh = 0, nskip = 0;
     for (int64_t sz = (bo[0] / 2) / S; sz * S < osh[0] && sz * S * 2 < bo[0] + bn[0]; sz++)
     for (int64_t sy = (bo[1] / 2) / S; sy * S < osh[1] && sy * S * 2 < bo[1] + bn[1]; sy++)
     for (int64_t sx = (bo[2] / 2) / S; sx * S < osh[2] && sx * S * 2 < bo[2] + bn[2]; sx++) {
+        const int64_t so[3] = {sz, sy, sx}; int present = 0;   /* the source shards under this output shard */
+        int64_t q0[3], q1[3];
+        for (int d = 0; d < 3; d++) {
+            const int64_t a = 2 * so[d] * S, e = 2 * (so[d] + 1) * S < m->shape[d] ? 2 * (so[d] + 1) * S : m->shape[d];
+            q0[d] = a / m->shard[d]; q1[d] = (e - 1) / m->shard[d];
+        }
+        for (int64_t a = q0[0]; a <= q1[0] && !present; a++) for (int64_t b = q0[1]; b <= q1[1] && !present; b++) for (int64_t c = q0[2]; c <= q1[2] && !present; c++)
+            present = z3_shard_present(z, a, b, c) != 0;   /* (-1, an error: read it and let the read report) */
+        if (!present) { nskip++; continue; }
         memset(sb, fill, (size_t)S * S * S);
         const int64_t ny = osh[1] - sy * S < S ? osh[1] - sy * S : S, nx = osh[2] - sx * S < S ? osh[2] - sx * S : S;
-        for (int64_t a = 0; a < S && sz * S + a < osh[0]; a++) {   /* output row a from source rows 2 a, 2 a + 1 */
-            const int64_t o[3] = {2 * (sz * S + a), 2 * sy * S, 2 * sx * S};
-            const int64_t n[3] = {m->shape[0] - o[0] < 2 ? m->shape[0] - o[0] : 2, m->shape[1] - o[1] < 2 * ny ? m->shape[1] - o[1] : 2 * ny, m->shape[2] - o[2] < 2 * nx ? m->shape[2] - o[2] : 2 * nx};
+        for (int64_t a0 = 0; a0 < S && sz * S + a0 < osh[0]; a0 += sd / 2) {   /* output rows a0 .. from source rows 2 a0 .. */
+            const int64_t o[3] = {2 * (sz * S + a0), 2 * sy * S, 2 * sx * S};
+            const int64_t n[3] = {m->shape[0] - o[0] < sd ? m->shape[0] - o[0] : sd, m->shape[1] - o[1] < 2 * ny ? m->shape[1] - o[1] : 2 * ny, m->shape[2] - o[2] < 2 * nx ? m->shape[2] - o[2] : 2 * nx};
             if (z3_read(z, o, n, src, nt)) { fprintf(stderr, "downsample: %s\n", z3_error()); return 1; }
-            for (int64_t b = 0; b < ny; b++) for (int64_t c = 0; c < nx; c++) {
-                double cs = 0, sn = 0; int known = 0, mx = 0;
-                for (int k = 0; k < 8; k++) {
-                    const int64_t zz = k >> 2 & 1, yy = 2 * b + (k >> 1 & 1), xx = 2 * c + (k & 1);
-                    if (zz >= n[0] || yy >= n[1] || xx >= n[2]) continue;
-                    const int v = src[((size_t)zz * n[1] + yy) * n[2] + xx];
-                    if (!phase) { if (v > mx) mx = v; continue; }
-                    if (v >= PHASE_PERIOD) continue;
-                    cs += cos(2 * M_PI * v / PHASE_PERIOD); sn += sin(2 * M_PI * v / PHASE_PERIOD); known++;
-                }
-                uint8_t out = (uint8_t)mx;
-                if (phase) {
-                    out = PHASE_UNKNOWN;
-                    if (known && hypot(cs, sn) >= 0.5 * known) { double t = atan2(sn, cs) / (2 * M_PI); if (t < 0) t += 1; out = (uint8_t)((int)lround(t * PHASE_PERIOD) % PHASE_PERIOD); }
-                }
-                sb[((size_t)a * S + b) * S + c] = out;
-            }
+            const size_t sn_ = (size_t)n[0] * n[1] * n[2]; size_t k = 0;
+            while (k < sn_ && src[k] == (uint8_t)m->fill) k++;
+            if (k == sn_ && fill == m->fill) continue;   /* all fill in, all fill out (max of fills; phase: unknown) */
+            int64_t na = (n[0] + 1) / 2; if (a0 + na > S) na = S - a0; if (sz * S + a0 + na > osh[0]) na = osh[0] - sz * S - a0;
+            ds_job jb = {src, {n[0], n[1], n[2]}, sb + (size_t)a0 * S * S, S, ny, nx, na, phase, 0};
+            ds_run(&jb, nt);
         }
         if (z3w_write_shard(w, sz, sy, sx, sb, nt)) { fprintf(stderr, "downsample: %s\n", z3w_error()); return 1; }
         nsh++;
     }
+    if (nskip) fprintf(stderr, "downsample: %d output shards skipped (no source shard)\n", nskip);
     z3w_close(w); free(sb); free(src); z3_close(z);
     fprintf(stderr, "downsample: %d shards of %s written to %s\n", nsh, lv, od);
     return 0;
