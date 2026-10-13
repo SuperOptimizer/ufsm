@@ -6,6 +6,7 @@
 #include <zstd.h>
 #include <sys/stat.h>
 #include "papyrus.h"
+#include "scan_augment.h"
 #include "pyramid.h"
 #include "sources.h"
 #include "split.h"
@@ -285,6 +286,12 @@ int cmd_predict(int argc, char **argv) {
     const int slab = Wz > 0 && Wz != W;
     if (Wz <= 0) Wz = W;
     if (hz < 0) hz = slab ? Wz / 4 : halo;
+    /* --aug-OP-p P [--aug-p P] [--aug-strength S] [--aug-seed N]: degrade every CT window with train's scanner augmentation
+       (src/scan_augment.h; seam off) before the network, seeded by the window's origin: robustness of a checkpoint to
+       scanner-domain shifts (blur, noise, rings, quantisation, ...) on held-out boxes */
+    scan_aug_cfg dg = {.strength = (float)atof(opt(argc, argv, "--aug-strength", "1")), .drop_ignore = 1};
+    for (int i = 0; i < SA_N; i++) { char f[48]; snprintf(f, sizeof f, "--aug-%s-p", scan_aug_names[i]); dg.p[i] = (float)atof(opt(argc, argv, f, opt(argc, argv, "--aug-p", "0"))); }
+    const int degrade = scan_aug_enabled(&dg); const uint64_t dg_seed = strtoull(opt(argc, argv, "--aug-seed", "1"), nullptr, 10);
     int nthreads = atoi(opt(argc, argv, "--threads", "16"));
     const int use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
     const double radial_sign = atof(opt(argc, argv, "--radial-sign", "1"));   /* -1: reversed direction input (a recto model then marks the verso face) */
@@ -296,7 +303,7 @@ int cmd_predict(int argc, char **argv) {
     const char *ffd = opt(argc, argv, "--fit-fields", nullptr); const int ffh = atoi(opt(argc, argv, "--fit-h", "8"));
     const char *ffz = opt(argc, argv, "--fit-zarr", nullptr);   /* the same fields of a whole volume: 10 uint8 zarr arrays, flushed slab by slab */
     if (ffd && ffz) { fprintf(stderr, "predict: --fit-fields or --fit-zarr\n"); return 2; }
-    if (ffd || ffz) { setenv("UFSM_INFER_ALIAS", "0", 1); if (ffh < 2 || ffh > 32) { fprintf(stderr, "--fit-h 2..32\n"); return 2; } }
+    if (ffd || ffz) { setenv("UFSM_INFER_ALIAS", "0", 1); if (ffh < 1 || ffh > 32) { fprintf(stderr, "--fit-h 1..32\n"); return 2; } }
     if (ffz) ffd = ffz;   /* the shared checks and settings below */
     const int ffzm = ffz != nullptr;
     float q = (float)atof(opt(argc, argv, "--q", "8"));
@@ -486,6 +493,9 @@ int cmd_predict(int argc, char **argv) {
         if (box) for (int d = 0; d < 3; d++) if (boxv[d + 3] > INT64_MAX - W || boxv[d] > INT64_MAX - W - boxv[d + 3]) { fprintf(stderr, "prediction box exceeds the coordinate range\n"); return 2; }
     }
     if (ffz && !win_given && !split && W == 288 && halo == 8) halo = 16;   /* --fit-zarr fallback: a z stride (256) dividing the shard */
+    if (degrade && (slab || split || half || sheet_task || sweep_out || ufsm_env_on("UFSM_PRED_HOSTPATH") || W > 1024)) {
+        fprintf(stderr, "predict: --aug-*: cube windows up to 1024 on one GPU's plain path\n"); return 2;
+    }
     if (!slab) { Wz = W; hz = halo; }
     else if (!win_given || Wz > W || Wz % (1 << (cfg.nlev - 1)) || hz >= Wz / 2 || split || half || sheet_task || auxz || sweep_out || ufsm_env_on("UFSM_PRED_HOSTPATH")) {
         fprintf(stderr, "predict: --window-z: at most --window (given), a multiple of %d, --halo-z under half of it; one GPU's plain path (no --split, "
@@ -691,6 +701,14 @@ int cmd_predict(int argc, char **argv) {
         int k = (int)(i % NSLOT);
         const uint8_t *ctu = rd.buf[k];
         const int64_t tz = t->tz, ty = t->ty, tx = t->tx, o[3] = {bo[0] + tz, bo[1] + ty, bo[2] + tx};
+        if (degrade) {   /* the scanner ops on this window's uint8 CT (the reader's pinned slot), its axis centres per z */
+            static uint8_t *dsc; static float *dcy; if (!dsc) { dsc = malloc(6 * w3); dcy = malloc(2 * (size_t)W * sizeof *dcy); if (!dsc || !dcy) { fprintf(stderr, "predict: out of memory\n"); return 1; } }
+            for (int z = 0; z < W; z++) { double cy, cx; axis_at(&ax, (double)(o[0] + z) * scale, &cy, &cx); dcy[z] = (float)(cy / scale); dcy[W + z] = (float)(cx / scale); }
+            const z3_meta *cm = z3_meta_of(ct); const int chk[3] = {(int)cm->chunk[0], (int)cm->chunk[1], (int)cm->chunk[2]};
+            uint64_t sd = dg_seed * 0x9e3779b97f4a7c15ull ^ (uint64_t)o[0] * 0xc2b2ae3d27d4eb4full ^ (uint64_t)o[1] * 0x165667b19e3779f9ull ^ (uint64_t)o[2] * 0x27d4eb2f165667c5ull;
+            memset(dsc, 0, w3);   /* (the ignore mask: unused here) */
+            scan_aug_apply(&dg, sd, (uint8_t *)rd.buf[k], nullptr, 0, dsc, W, o, dcy, dcy + W, ax.n > 0, chk, 0, dsc + w3);
+        }
         {
             size_t nz = rd.nz[k]; double sum = rd.sum[k], sq = rd.sq[k];
             if (gpath) {   /* upload (pinned), statistics on the device, then the slot is free for the reader */
