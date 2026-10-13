@@ -104,6 +104,78 @@ extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const u
     }
     KCHECK();
 }
+/* ---- count loss (train --count-lambda): turns along sheet-normal segments ----
+   K segments per window, each from a random voxel whose ground-truth phase gradient (over +-s voxels) is known, L unit steps along
+   that gradient (nearest voxels); a segment counts when every step's phase is known and it crosses at least half a turn. True turns
+   Tg = the phase unwrapped along it; predicted Tp = sum of rho over its voxels, rho = exp(logit) / dscale (the density code x / (1 + x),
+   x = exp(logit): train --density-code 1). Loss |log((Tp + e) / (Tg + e))| (e 0.05 turn), the mean over valid segments; its
+   gradient sign / (Tp + e) rho_k per voxel accumulates in acc (fp32) and is added, times lambda / valid, into the density channel
+   of the logit gradient. out2 (device): mean loss, valid segments, mean Tp / Tg (the count ratio). */
+__device__ __forceinline__ int cnt_pdiff(int a, int b) { int d = a - b; d -= 252 * (d > 126); d += 252 * (d <= -126); return d; }
+__device__ __forceinline__ uint64_t cnt_mix(uint64_t x) { x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 27; x *= 0x94d049bb133111ebull; return x ^ (x >> 31); }
+template <typename LT> __global__ void count_seg_k(const LT *dl, const uint8_t *ph, int D, int H, int W, int s, int K, int L, float dscale, uint64_t seed,
+                                                   float *acc, float *seg, unsigned *nvalid) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x; if (k >= K) return;
+    seg[3 * k] = -1.f;
+    const size_t HW = (size_t)H * W, n = (size_t)D * HW;
+    uint64_t h = cnt_mix(seed * 0x9e3779b97f4a7c15ull + (uint64_t)k * 0xc2b2ae3d27d4eb4full);
+    for (int tries = 0; tries < 16; tries++) {
+        h = cnt_mix(h + 0x9e3779b97f4a7c15ull);
+        const size_t i0 = (size_t)(h % n); const int z = (int)(i0 / HW), y = (int)(i0 / W % H), x = (int)(i0 % W);
+        if (ph[i0] >= 252 || z < s || z >= D - s || y < s || y >= H - s || x < s || x >= W - s) continue;
+        const size_t sz = (size_t)s * HW, sy = (size_t)s * W;
+        const int a[6] = {ph[i0 + sz], ph[i0 - sz], ph[i0 + sy], ph[i0 - sy], ph[i0 + s], ph[i0 - s]};
+        int ok = 1; for (int q = 0; q < 6; q++) ok &= a[q] < 252; if (!ok) continue;
+        float g[3] = {(float)cnt_pdiff(a[0], a[1]), (float)cnt_pdiff(a[2], a[3]), (float)cnt_pdiff(a[4], a[5])};
+        const float gn = sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]); if (gn < 1e-3f) continue;
+        for (int q = 0; q < 3; q++) g[q] /= gn;
+        float tg = 0.f, tp = 0.f; int prev = ph[i0], valid = 1;
+        for (int j = 0; j < L && valid; j++) {
+            const int zz = (int)lrintf(z + j * g[0]), yy = (int)lrintf(y + j * g[1]), xx = (int)lrintf(x + j * g[2]);
+            if (zz < 0 || zz >= D || yy < 0 || yy >= H || xx < 0 || xx >= W) { valid = 0; break; }
+            const size_t i = (size_t)zz * HW + (size_t)yy * W + xx; const int v = ph[i];
+            if (v >= 252) { valid = 0; break; }
+            if (j) tg += cnt_pdiff(v, prev) * (1.f / 252.f);
+            prev = v; if (j < L - 1) tp += __expf(fminf(lgv(dl, i), 20.f)) / dscale;   /* L - 1 unit steps: rho of each step's start */
+        }
+        if (!valid || tg < .5f) continue;
+        const float e = .05f, r = logf((tp + e) / (tg + e)), coef = (r > 0 ? 1.f : -1.f) / (tp + e);
+        seg[3 * k] = fabsf(r); seg[3 * k + 1] = tp; seg[3 * k + 2] = tg;
+        atomicAdd(nvalid, 1u);
+        for (int j = 0; j < L - 1; j++) {
+            const int zz = (int)lrintf(z + j * g[0]), yy = (int)lrintf(y + j * g[1]), xx = (int)lrintf(x + j * g[2]);
+            const size_t i = (size_t)zz * HW + (size_t)yy * W + xx;
+            atomicAdd(&acc[i], coef * __expf(fminf(lgv(dl, i), 20.f)) / dscale);
+        }
+        return;
+    }
+}
+__global__ void count_sum_k(const float *seg, int K, const unsigned *nvalid, float *out2) {
+    if (threadIdx.x || blockIdx.x) return;
+    double l = 0, tp = 0, tg = 0; for (int k = 0; k < K; k++) if (seg[3 * k] >= 0) { l += seg[3 * k]; tp += seg[3 * k + 1]; tg += seg[3 * k + 2]; }
+    const unsigned nv = *nvalid; out2[0] = nv ? (float)(l / nv) : 0.f; out2[1] = (float)nv; out2[2] = tg > 0 ? (float)(tp / tg) : 0.f;
+}
+template <typename GT> __global__ void count_apply_k(GT *gl, float *acc, size_t n, const unsigned *nvalid, float scale) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= n) return;
+    const float a = acc[i]; if (a == 0.f) return;
+    acc[i] = 0.f;
+    const unsigned nv = *nvalid; if (!nv) return;
+    gl[i] = f2h<GT>((float)gl[i] + scale / (float)nv * a);
+}
+extern "C" void nn_count_loss(const void *dens_logits, const uint8_t *phase, int d, int h, int w, int s, int K, int L, float dscale, uint64_t seed,
+                              float lambda, void *dens_grad, float *acc, float *seg, unsigned *nvalid, float *out2) {
+    const size_t n = (size_t)d * h * w;
+    cudaMemsetAsync(nvalid, 0, sizeof *nvalid);
+    if (g_logits_h16) count_seg_k<f16><<<nblk(K, 128), 128>>>((const f16 *)dens_logits, phase, d, h, w, s, K, L, dscale, seed, acc, seg, nvalid);
+    else count_seg_k<float><<<nblk(K, 128), 128>>>((const float *)dens_logits, phase, d, h, w, s, K, L, dscale, seed, acc, seg, nvalid);
+    count_sum_k<<<1, 32>>>(seg, K, nvalid, out2);
+    if (dens_grad) {
+        if (!g_loss_g16) count_apply_k<float><<<nblk(n, 256), 256>>>((float *)dens_grad, acc, n, nvalid, lambda);
+        else if (g_h16) count_apply_k<f16><<<nblk(n, 256), 256>>>((f16 *)dens_grad, acc, n, nvalid, lambda * g_gscale);
+        else count_apply_k<bf16><<<nblk(n, 256), 256>>>((bf16 *)dens_grad, acc, n, nvalid, lambda * g_gscale);
+    } else cudaMemsetAsync(acc, 0, n * sizeof *acc);   /* validation: no gradient */
+    KCHECK();
+}
 extern "C" void nn_loss_fetch(const float *scratch, shape5 s, float *out) {
     CK(cudaMemcpy(out, scratch + (size_t)5 * s.n * s.c, (size_t)(2 * s.c + 1) * sizeof(float), cudaMemcpyDeviceToHost));
 }

@@ -98,6 +98,40 @@ int main(void) {
     CHECK(e < 0.04, "radial: max target error %.4f", e);
     printf("radial: %zu voxels, max target error %.4f\n", cnt, e);
     free(ph); free(t); free(m);
+    {   /* nn_count_loss (train --count-lambda) on a planar phase of 0.0436 turns per voxel (64^3), segments of 32 voxels: density logits
+           log(c rho dscale) predict c rho (the x / (1 + x) code): c = 1 gives a turns ratio ~1 and loss ~0; c = 0.5 a ratio ~0.5,
+           loss ~ log 2 and a gradient that raises every logit it touches; the gradient matches finite differences of the loss */
+        const int Q = 64; const size_t q3 = (size_t)Q * Q * Q; const double k3[3] = {.02, .03, .025}, rho = sqrt(k3[0] * k3[0] + k3[1] * k3[1] + k3[2] * k3[2]);
+        const int K = 512, L = 32; const float ds = 8.f, lam = 1.f;
+        uint8_t *qp = malloc(q3); float *lg = malloc(q3 * 4), *g = malloc(q3 * 4), out[3];
+        for (int z = 0; z < Q; z++) for (int y = 0; y < Q; y++) for (int x = 0; x < Q; x++) { double q = k3[0] * z + k3[1] * y + k3[2] * x; q -= floor(q); qp[((size_t)z * Q + y) * Q + x] = (uint8_t)((int)lround(q * 252) % 252); }
+        uint8_t *dp = nn_malloc(q3); float *dl = nn_malloc(q3 * 4), *dg = nn_malloc(q3 * 4), *acc = nn_malloc(q3 * 4), *seg = nn_malloc(3 * K * 4), *o2 = nn_malloc(16); unsigned *nv = nn_malloc(4);
+        nn_h2d(dp, qp, q3); nn_zero(acc, q3 * 4);
+        const double cs[2] = {1, .5};
+        for (int ci = 0; ci < 2; ci++) {
+            for (size_t i = 0; i < q3; i++) lg[i] = (float)log(cs[ci] * rho * ds);
+            nn_h2d(dl, lg, q3 * 4); nn_zero(dg, q3 * 4);
+            nn_count_loss(dl, dp, Q, Q, Q, 1, K, L, ds, 7, lam, dg, acc, seg, nv, o2); nn_sync(); nn_d2h(out, o2, 12); nn_d2h(g, dg, q3 * 4);
+            double gs = 0; size_t pos = 0; for (size_t i = 0; i < q3; i++) { gs += g[i]; pos += g[i] > 0; }
+            printf("count loss, density x %.1f: %d segments, loss %.4f, turns ratio %.3f, gradient sum %.3f\n", cs[ci], (int)out[1], out[0], out[2], gs);
+            CHECK(out[1] > K / 2, "count loss: most segments valid (%d of %d)", (int)out[1], K);
+            if (ci == 0) CHECK(out[0] < .03 && fabs(out[2] - 1) < .03, "count loss: exact density -> loss %.4f ratio %.3f", out[0], out[2]);
+            else {
+                CHECK(fabs(out[2] - .5) < .03 && fabs(out[0] - log(2.)) < .1, "count loss: half density -> ratio %.3f loss %.4f", out[2], out[0]);
+                CHECK(pos == 0 && gs < -.8 * lam && gs > -1.0 * lam, "count loss: under-count raises every touched logit (sum %.3f, %zu positive)", gs, pos);
+                size_t probe[4] = {0}; int np = 0; for (size_t i = 0; i < q3 && np < 4; i += 9973) if (g[i] != 0.f) probe[np++] = i;
+                for (int pi = 0; pi < np; pi++) {   /* the loss as lambda x mean over segments: d / d logit by central differences */
+                    const size_t i = probe[pi]; float lp, lm, o3[3];
+                    lg[i] += 1e-2f; nn_h2d(dl, lg, q3 * 4); nn_count_loss(dl, dp, Q, Q, Q, 1, K, L, ds, 7, lam, nullptr, acc, seg, nv, o2); nn_sync(); nn_d2h(o3, o2, 12); lp = o3[0];
+                    lg[i] -= 2e-2f; nn_h2d(dl, lg, q3 * 4); nn_count_loss(dl, dp, Q, Q, Q, 1, K, L, ds, 7, lam, nullptr, acc, seg, nv, o2); nn_sync(); nn_d2h(o3, o2, 12); lm = o3[0];
+                    lg[i] += 1e-2f;
+                    const double fd = lam * (lp - lm) / 2e-2;
+                    CHECK(fabs(fd - g[i]) < .02 * fabs(g[i]) + 1e-6, "count loss gradient voxel %zu: analytic %.6g finite difference %.6g", i, g[i], fd);
+                }
+            }
+        }
+        nn_free(dp); nn_free(dl); nn_free(dg); nn_free(acc); nn_free(seg); nn_free(o2); nn_free(nv); free(qp); free(lg); free(g);
+    }
     if (fails) { fprintf(stderr, "test_unwrap_targets: %d failure(s)\n", fails); return 1; }
     printf("test_unwrap_targets: OK\n");
     return 0;
