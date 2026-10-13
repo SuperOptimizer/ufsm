@@ -1109,8 +1109,12 @@ static int cmd_fit_compare(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm fit-compare <reference-fields> <fields>\n"); return 2; }
     fit_fields_buf A, B;
     if (fit_fields_load(argv[2], 0, 0, 1, &A) || fit_fields_load(argv[3], 0, 0, 1, &B)) { fprintf(stderr, "fit-compare: cannot load the fields\n"); return 1; }
+    /* the candidate's cells may be k times the reference's (a coarser net, e.g. 38.4 um cells against the 19.2 um oracle): each
+       reference cell reads the candidate cell that contains it */
+    const int k = (int)lround(B.h * B.um / (A.h * A.um));
     for (int d = 0; d < 3; d++) {
-        if (A.shape[d] != B.shape[d] || fabs(A.origin[d] * A.um - B.origin[d] * B.um) > 0.5 * A.h * A.um || fabs(A.h * A.um - B.h * B.um) > 1e-6 * A.h * A.um) {
+        if (k < 1 || fabs(k * A.h * A.um - B.h * B.um) > 1e-6 * B.h * B.um || (A.shape[d] + k - 1) / k != B.shape[d] ||
+            fabs(A.origin[d] * A.um - B.origin[d] * B.um) > 0.5 * A.h * A.um) {
             fprintf(stderr, "fit-compare: the field sets cover different cells (shape %d/%d, origin %.1f/%.1f um, cell %.2f/%.2f um on axis %d)\n", A.shape[d], B.shape[d], A.origin[d] * A.um, B.origin[d] * B.um, A.h * A.um, B.h * B.um, d); return 2;
         }
     }
@@ -1118,19 +1122,22 @@ static int cmd_fit_compare(int argc, char **argv) {
     enum { NP = 500, NC = 100, NR = 200, NA = 900, NS = 5, NK = 4 };
     size_t hp[NP] = {0}, hca[NC] = {0}, hcb[NC] = {0}, hr[NR] = {0}, ha[NA] = {0}, sn[NS] = {0}, sg[NS] = {0}, kn[NK] = {0}, kg[NK] = {0}, m = 0, lt01 = 0, gt25 = 0;
     const double sb[NS + 1] = {0, 100, 140, 180, 240, 1e30}, cb[NK + 1] = {0, 0.2, 0.4, 0.6, 1.01};
+    if (k > 1) printf("fit-compare: candidate cells %dx the reference's\n", k);
     for (size_t i = 0; i < n; i++) {
-        if (!A.f.w[i] || !B.f.w[i]) continue;
-        const double ac = (A.f.pc[i] - 128) / 127.0, as = (A.f.ps[i] - 128) / 127.0, bc = (B.f.pc[i] - 128) / 127.0, bs = (B.f.ps[i] - 128) / 127.0;
+        const size_t az = i / ((size_t)A.shape[1] * A.shape[2]), ay = i / A.shape[2] % A.shape[1], ax = i % A.shape[2];
+        const size_t j = ((az / k) * B.shape[1] + ay / k) * B.shape[2] + ax / k;   /* the candidate cell */
+        if (!A.f.w[i] || !B.f.w[j]) continue;
+        const double ac = (A.f.pc[i] - 128) / 127.0, as = (A.f.ps[i] - 128) / 127.0, bc = (B.f.pc[j] - 128) / 127.0, bs = (B.f.ps[j] - 128) / 127.0;
         const double ca = hypot(ac, as), cbv = hypot(bc, bs); if (ca <= 0.3) continue;
         m++;
         double e = (atan2(bs, bc) - atan2(as, ac)) / (2 * M_PI); e -= round(e); e = fabs(e);
         hp[(int)fmin(NP - 1, e / 0.5 * NP)]++; lt01 += e < 0.1; gt25 += e > 0.25;
         hca[(int)fmin(NC - 1, ca * NC)]++; hcb[(int)fmin(NC - 1, cbv * NC)]++;
-        const double spa = A.f.sp[i] * A.h / 8.0 * A.um, spb = B.f.sp[i] * B.h / 8.0 * B.um;   /* spacing in um (sp = 8 / (h rho)) */
+        const double spa = A.f.sp[i] * A.h / 8.0 * A.um, spb = B.f.sp[j] * B.h / 8.0 * B.um;   /* spacing in um (sp = 8 / (h rho)) */
         if (spa > 0 && spb > 0) hr[(int)fmin(NR - 1, fmax(0, (log2(spb / spa) + 2) / 4 * NR))]++;   /* log2 ratio in [-2, 2) */
         for (int k = 0; k < NS; k++) if (spa >= sb[k] && spa < sb[k + 1]) { sn[k]++; sg[k] += e > 0.25; }
         for (int k = 0; k < NK; k++) if (cbv >= cb[k] && cbv < cb[k + 1]) { kn[k]++; kg[k] += e > 0.25; }
-        double va[3], vb[3]; fc_axis(&A.f, i, va); fc_axis(&B.f, i, vb);
+        double va[3], vb[3]; fc_axis(&A.f, i, va); fc_axis(&B.f, j, vb);
         const double ang = acos(fmin(1, fabs(va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]))) * 180 / M_PI;
         ha[(int)fmin(NA - 1, ang / 90 * NA)]++;
     }
