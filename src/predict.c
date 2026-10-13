@@ -489,7 +489,7 @@ int cmd_predict(int argc, char **argv) {
         sweep_cfg sw = {.u = u, .ch14 = cfg.cout - 4, .ct = ct, .bo = {bo[0], bo[1], bo[2]}, .bn = {bn[0], bn[1], bn[2]}, .um = um_l, .scale = scale,
                         .ax = &ax, .axis_path = axisf, .axis_flag = (int)radial_sign, .W = W, .halo = halo,
                         .h16 = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8"), .nthreads = nthreads,
-                        .dir = atoi(opt(argc, argv, "--cond-dir", "1")), .reverse = atoi(opt(argc, argv, "--cond-reverse", "0")), .out = sweep_out, .ckpt = ckpt};
+                        .dir = atoi(opt(argc, argv, "--cond-dir", "1")), .reverse = atoi(opt(argc, argv, "--cond-reverse", "0")), .raw = atoi(opt(argc, argv, "--cond-raw", "0")), .out = sweep_out, .ckpt = ckpt};
         fprintf(stderr, "predict: conditioned sweep, window %d, halo %d%s -> %s\n", W, halo, sw.reverse ? ", reversed order" : "", sweep_out);
         return cond_sweep(&sw);
     }

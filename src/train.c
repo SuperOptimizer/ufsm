@@ -52,6 +52,7 @@ typedef struct {
     float *aff_fin, aff_out[48]; double aff_loss;
     uint8_t *pmb[2], *pm, *nt, *nm, *nw; float *iscratch, *nscratch, iout[3], nout[15]; double ink_loss, norm_loss;   /* task unwrap: papyrus mask (ink loss), normal / density targets, mask, weights; scratch and parts of the ink and normal losses */
     uint8_t *wdb[2], *wd, *ct4, *cm4, *cw4; float *cscratch, cout4[9]; double cond_loss;   /* --cond: the gauge-shifted winding per voxel, its 4 targets, mask, weights; scratch and parts */
+    unsigned long long *cacc, cacc_h[2];   /* --cond: known / right-turn voxel counts of the 14-turn head (device, last batch on the host) */
     void *x2, *glh, *lrt; float *lgf;  /* --half-res: the network's input and logit gradient, the intermediate grid (div 4), the full-resolution fp32 logits */
 } gpu_state;
 /* task band_affinity: output channel 0 = recto (dense loss on target channel 0), channels 1..K = affinities for g_aff_off */
@@ -74,7 +75,7 @@ static int g_xc = 4;   /* input channels per sample: CT + radial (3), + the aux 
    turns where one exists: cos and sin of 2 pi q' / 14 and a validity mask, q' = q + k with a random integer gauge k per sample;
    outputs g_cond_ch.. +3 are cos / sin of 2 pi q' / 14 and 2 pi q' / 2 (soft BCE like the phase), so the net carries the gauge it
    is handed across the window. The sampler draws the condition from the sources' "winding" raster (src/sample.c cond patterns) */
-static int g_cond, g_cond_ch; static float g_cond_lambda = 1.f;
+static int g_cond, g_cond_ch, g_cond_outside; static float g_cond_lambda = 1.f;
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_scale = 32.f;
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
    (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */
@@ -411,6 +412,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         nn_loss_async_tol((const float *)((const char *)lg + g_cond_ch * l3 * le), d->ct4, d->cm4, d->cw4, four, 0.f,
                           train ? (float *)((char *)d->gl + g_cond_ch * l3 * eb) : nullptr, d->cscratch, nullptr);
         if (train && g_cond_lambda != 1.f) nn_loss_grad_scale((char *)d->gl + g_cond_ch * l3 * eb, 4 * l3, g_cond_lambda);
+        nn_zero(d->cacc, 2 * sizeof(unsigned long long)); nn_cond_acc((const char *)lg + g_cond_ch * l3 * le, le == 2, d->wd, l3, d->cacc);
     }
     sheet_objective(d,os,P,train);
     if (g_half && train) nn_lowres_grad(d->gl, g_g16, hs, g_hdiv, hm, d->lrt, d->glh);   /* the logit gradient on the network's grid */
@@ -435,6 +437,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     if (g_cond) {   /* mean bce over the 4 winding channels, times lambda */
         nn_loss_fetch(d->cscratch, (shape5){1, 4, 1, 1, 1}, d->cout4);
         d->cond_loss = g_cond_lambda * (d->cout4[0] + d->cout4[1] + d->cout4[2] + d->cout4[3]) / 4;
+        nn_d2h(d->cacc_h, d->cacc, 2 * sizeof(unsigned long long));
     }
     d->aff_loss = 0;
     if (g_aff) {   /* mean over the affinity channels of bce + dice_w dice, times lambda */
@@ -572,6 +575,9 @@ int cmd_train(int argc, char **argv) {
                 g_ink_lambda, g_ink_dice, g_side_ch, g_side_ch + 1, g_norm_ch, g_norm_ch + 5, g_norm_ch + 6, g_norm_lambda, g_norm_s);
     }
     g_cond = atoi(opt(argc, argv, "--cond", "0")); g_cond_lambda = (float)atof(opt(argc, argv, "--cond-lambda", "1"));
+    const char *closs = opt(argc, argv, "--cond-loss", "all");   /* all: the winding heads supervised everywhere known; outside: only where the condition does not reach */
+    if (strcmp(closs, "all") && strcmp(closs, "outside")) { fprintf(stderr, "--cond-loss all|outside\n"); return 2; }
+    g_cond_outside = !strcmp(closs, "outside");
     if (g_cond) {
         if (!g_unwrap || B != 1) { fprintf(stderr, "--cond: task unwrap, B 1\n"); return 2; }
         g_cond_ch = g_cout; g_cout += 4;
@@ -723,7 +729,7 @@ int cmd_train(int argc, char **argv) {
     if (atoi(opt(argc, argv, "--rotonly", "0"))) sc.augment = 2;   /* proper rotations only (no reflections) */
     if (atoi(opt(argc, argv, "--zfix", "0"))) sc.augment = 3;      /* diagnostic: symmetries that keep the z axis */
     if (atoi(opt(argc, argv, "--intonly", "0"))) sc.augment = 4;   /* diagnostic: intensity jitter, no symmetry */
-    sc.aux = g_xc == 5; sc.cond = g_cond;
+    sc.aux = g_xc == 5; sc.cond = g_cond; sc.cond_outside = g_cond_outside;
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
     sc.papyrus = g_papyrus ? &g_pap : nullptr;
     sc.phase_dense = atoi(opt(argc, argv, "--phase-dense", "0"));   /* side 2: weigh windings closer than this (label voxels) up */
@@ -1026,6 +1032,7 @@ int cmd_train(int argc, char **argv) {
             d->ct4 = nn_malloc((size_t)4 * B * p3); d->cm4 = nn_malloc((size_t)B * p3);
             d->cw4 = nn_malloc(4); static const uint8_t four_w[4] = {1, 1, 1, 1}; nn_h2d(d->cw4, four_w, 4);
             d->cscratch = nn_malloc(nn_loss_scratch((shape5){1, 4, P, P, P}) + 64);
+            d->cacc = nn_malloc(2 * sizeof(unsigned long long));
         }
         d->scratch = nn_malloc(nn_loss_scratch((shape5){B, NCH, P, P, P}) + 64);
         d->tolc = nn_get_loss_tol() ? nn_malloc((size_t)B * p3) : nullptr;
@@ -1080,8 +1087,8 @@ int cmd_train(int argc, char **argv) {
                  g_side_ch,g_side_ch+1,g_norm_ch,g_norm_ch+1,g_norm_ch+2,g_norm_ch+3,g_norm_ch+4,g_norm_ch+5,g_norm_ch+6,g_dens_scale,g_ink_lambda,g_ink_dice,g_norm_lambda,g_norm_s);
         if (g_cond) {   /* conditioned inference (predict --cond-sweep): inside the unwrap object */
             n=strlen(runtime_extra); runtime_extra[n-2]=0;
-            snprintf(runtime_extra+n-2,sizeof runtime_extra-n+2,",\"cond\":{\"version\":1,\"inputs\":[4,5,6],\"input\":\"cos, sin of 2 pi q / 14, mask\",\"channels\":[%d,%d,%d,%d],\"periods\":[14,2],\"lambda\":%.9g}}}",
-                     g_cond_ch,g_cond_ch+1,g_cond_ch+2,g_cond_ch+3,g_cond_lambda);
+            snprintf(runtime_extra+n-2,sizeof runtime_extra-n+2,",\"cond\":{\"version\":1,\"inputs\":[4,5,6],\"input\":\"cos, sin of 2 pi q / 14, mask\",\"channels\":[%d,%d,%d,%d],\"periods\":[14,2],\"lambda\":%.9g,\"loss\":\"%s\"}}}",
+                     g_cond_ch,g_cond_ch+1,g_cond_ch+2,g_cond_ch+3,g_cond_lambda,g_cond_outside?"outside":"all");
         }
     }
     if (g_sheet) {
@@ -1166,7 +1173,7 @@ int cmd_train(int argc, char **argv) {
     int committed_step = step0, training_failed = 0;
     double best_val = 1e30; int nskip = 0; (void)nskip;
     float parts[8][2 * NCH + 1];
-    double acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0;   /* verso channel, side channel; --cond */
+    double acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0;   /* verso channel, side channel; --cond (loss, known / right counts) */
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
         g_verso_on = g_verso && step >= g_verso_start;
         { uint64_t h = (uint64_t)step * 0x9E3779B97F4A7C15ull + (uint64_t)seed; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
@@ -1340,7 +1347,7 @@ int cmd_train(int argc, char **argv) {
         if (g_verso_on) { acc_vbce += G[0].vout[0]; acc_vdice += G[0].vout[1]; }
         if (g_side) acc_side += G[0].sout[0];
         if (g_unwrap) { acc_ink += G[0].iout[0]; acc_norm += G[0].norm_loss / (g_norm_lambda ? g_norm_lambda : 1.f); }
-        if (g_cond) acc_cond += G[0].cond_loss / (g_cond_lambda ? g_cond_lambda : 1.f);
+        if (g_cond) { acc_cond += G[0].cond_loss / (g_cond_lambda ? g_cond_lambda : 1.f); acc_ck += (double)G[0].cacc_h[0]; acc_cr += (double)G[0].cacc_h[1]; }
         if (step % log_every == 0 || step == steps || g_stop) {
             double dt = now() - tlog;
             double vl = -1, vb = 0, vd = 0;
@@ -1376,14 +1383,14 @@ int cmd_train(int argc, char **argv) {
             if (g_verso) snprintf(affs, 64, " verso bce %.4f dice %.4f", acc_vbce / nacc, acc_vdice / nacc);
             if (g_side) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " %s bce %.4f", g_side == 2 ? "phase" : "side", acc_side / nacc); }
             if (g_unwrap) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f normal bce %.4f", acc_ink / nacc, acc_norm / nacc); }
-            if (g_cond) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " cond bce %.4f", acc_cond / nacc); }
+            if (g_cond) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " cond bce %.4f acc %.3f", acc_cond / nacc, acc_ck > 0 ? acc_cr / acc_ck : -1.0); }
             if (g_aff) { const float *a = G[0].aff_out; size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " aff %.4f (d1 bce %.3f dice %.3f | d8 bce %.3f dice %.3f)", G[0].aff_loss,
                                     (a[0] + a[6] + a[12]) / 3, (a[1] + a[7] + a[13]) / 3, (a[18] + a[24] + a[30]) / 3, (a[19] + a[25] + a[31]) / 3); }
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %s %.2f samp/s (wait %.0f%%)%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, affs, acc_g / nacc,
                     vl >= 0 ? "val" : "", (double)nacc * B * nl / dt, 100 * wait / dt, vl >= 0 ? vstr : "");
             if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, active, acc_g / nacc, vstr, (double)nacc * B * nl / dt, wait); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
-            acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = 0; nacc = 0; tlog = now(); wait = 0;
+            acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = 0; nacc = 0; tlog = now(); wait = 0;
         }
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);

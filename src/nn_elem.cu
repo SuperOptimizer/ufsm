@@ -411,6 +411,26 @@ __global__ void cond_tg_k(const uint8_t *wv, size_t n, uint8_t *t, uint8_t *m) {
     m[i] = 1;
 }
 extern "C" void nn_cond_targets(const uint8_t *wind, size_t n, uint8_t *t, uint8_t *m) { cond_tg_k<<<nblk(n, 256), 256>>>(wind, n, t, m); KCHECK(); }
+/* --cond: of the voxels with a known (gauge-shifted) winding, how many the 14-turn head (logits lg[0..n), lg[n..2n): cos, sin) puts on the
+   right turn, |q_pred - q| < 0.5 mod 14: cnt[0] += known, cnt[1] += right (two 64-bit device counters) */
+template <typename LT> __global__ void cond_acc_k(const LT *lg, const uint8_t *wv, size_t n, unsigned long long *cnt) {
+    __shared__ unsigned int sk, sr;
+    if (threadIdx.x == 0) sk = sr = 0;
+    __syncthreads();
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n && wv[i] < 252) {
+        const float c = 2.f / (1.f + __expf(-ldv<LT>(lg, i))) - 1.f, s = 2.f / (1.f + __expf(-ldv<LT>(lg, n + i))) - 1.f;
+        float d = atan2f(s, c) * (14.f / 6.2831853f) - wv[i] / 18.f; d -= 14.f * rintf(d / 14.f);
+        atomicAdd(&sk, 1u); if (fabsf(d) < 0.5f) atomicAdd(&sr, 1u);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && sk) { atomicAdd(&cnt[0], (unsigned long long)sk); atomicAdd(&cnt[1], (unsigned long long)sr); }
+}
+extern "C" void nn_cond_acc(const void *lg, int lg_h16, const uint8_t *wind, size_t n, unsigned long long *cnt) {
+    if (lg_h16) cond_acc_k<f16><<<nblk(n, 256), 256>>>((const f16 *)lg, wind, n, cnt);
+    else cond_acc_k<float><<<nblk(n, 256), 256>>>((const float *)lg, wind, n, cnt);
+    KCHECK();
+}
 /* predict --cond-sweep (src/sweep.c). The box canvas (N voxels, planar): c14[0..N) / [N..2N) the 14-turn phasor and p1 the 1-turn phase
    as 127.5 + 127.5 (2 sigmoid - 1), recto 255 sigmoid, done 0 (not yet predicted), 1 (papyrus: CT > 0), 2 (air).
    gather: the condition inputs 4-6 of a window at box offset o (window voxel k at o + k): where the voxel lies in the box, is done

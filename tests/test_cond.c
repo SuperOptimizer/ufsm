@@ -24,7 +24,7 @@ int main(void) {
     int none = 0, cube = 0, slab = 0, bad_gauge = 0, bad_mask = 0, bad_zero = 0, bad_shape = 0; double emax = 0;
     for (int s = 0; s < N; s++) {
         memset(X, 0x7f, 7 * p3 * sizeof *X);
-        sample_cond_draw(1000 + s, P, w, wo, X);
+        sample_cond_draw(1000 + s, P, w, wo, X, 0);
         const float *C = X + 4 * p3, *S = X + 5 * p3, *M = X + 6 * p3;
         size_t nm = 0, known = 0; for (size_t k = 0; k < p3; k++) { nm += M[k] == 1.f; known += wo[k] != 255; }
         if (!known) {   /* no condition: no targets, all condition inputs zero */
@@ -56,6 +56,21 @@ int main(void) {
         if (ext2 <= 12 && nm <= 12 * 12 * 12) cube++;
         else if (face) slab++;
         else bad_shape++;
+    }
+    {   /* --cond-loss outside: the same draws, targets only where the condition mask is 0 (the inputs unchanged) */
+        int bad_out = 0, kept = 0;
+        float *X2 = malloc(7 * p3 * sizeof *X2); uint8_t *wo2 = malloc(p3);
+        for (int s = 0; s < 40; s++) {
+            sample_cond_draw(1000 + s, P, w, wo, X, 0); sample_cond_draw(1000 + s, P, w, wo2, X2, 1);
+            for (size_t k = 0; k < p3; k++) {
+                const int masked = X2[6 * p3 + k] == 1.f;
+                if (X2[4 * p3 + k] != X[4 * p3 + k] || X2[6 * p3 + k] != X[6 * p3 + k]) bad_out++;   /* inputs identical */
+                if (masked ? wo2[k] != 255 : wo2[k] != wo[k]) bad_out++;
+                kept += wo2[k] != 255;
+            }
+        }
+        CHECK(!bad_out && kept > 0, "outside-only targets: %d voxels wrong (%d kept)", bad_out, kept);
+        free(X2); free(wo2);
     }
     CHECK(none >= N / 20 && none <= N / 6, "%d of %d draws without a condition (want ~10%%)", none, N);
     CHECK(cube >= N / 20 && slab >= N / 2, "patterns: %d seed cubes, %d face slabs of %d", cube, slab, N);

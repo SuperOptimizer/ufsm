@@ -140,6 +140,21 @@ int cond_sweep(const sweep_cfg *c) {
     nn_sync(); nn_d2h(hc14, dc14, 2 * N); nn_d2h(hp1, dp1, 2 * N); nn_d2h(hdone, ddone, N);
     for (int64_t z = 0; z < c->bn[0]; z++) { double y = 0, x = 0; axis_at(c->ax, (double)(c->bo[0] + z) * c->scale, &y, &x); cy[z] = (float)(y / c->scale - c->bo[1]); cx[z] = (float)(x / c->scale - c->bo[2]); }
     size_t npap = 0; for (size_t g = 0; g < N; g++) npap += hdone[g] == 1;
+    if (c->raw) {   /* diagnostic: the 14-turn head's own value (turns, [0, 14)) per voxel, no snapping or flood, as <out>-raw/U.f32 for wind-score */
+        char rd[1400], rp[1500]; snprintf(rd, sizeof rd, "%s-raw", c->out);
+        if (mkdir(rd, 0755) && errno != EEXIST) { fprintf(stderr, "cond-sweep: cannot create %s\n", rd); return 1; }
+        for (size_t g = 0; g < N; g++) {
+            if (hdone[g] != 1) { U[g] = NAN; continue; }
+            double qc = atan2((hc14[N + g] - 127.5) / 127.5, (hc14[g] - 127.5) / 127.5) / (2 * M_PI) * 14; if (qc < 0) qc += 14;
+            U[g] = (float)qc;
+        }
+        snprintf(rp, sizeof rp, "%s/U.f32", rd); FILE *rf = fopen(rp, "wb");
+        if (!rf || fwrite(U, sizeof(float), N, rf) != N || fclose(rf)) { fprintf(stderr, "cond-sweep: cannot write %s\n", rp); return 1; }
+        snprintf(rp, sizeof rp, "%s/sweep.json", rd); rf = fopen(rp, "w"); if (!rf) return 1;
+        fprintf(rf, "{\"content\":\"the 14-turn head's value (turns) per voxel, raw\",\"shape\":[%lld,%lld,%lld],\"origin_zyx\":[%lld,%lld,%lld],\"um\":%.9g,\"scale\":%.9g,\"axis\":\"%s\"}\n",
+                (long long)c->bn[0], (long long)c->bn[1], (long long)c->bn[2], (long long)c->bo[0], (long long)c->bo[1], (long long)c->bo[2], c->um, c->scale, c->axis_path ? c->axis_path : "");
+        fclose(rf);
+    }
     const size_t reached = seeded ? sweep_unwrap(hc14, hp1, hdone, c->bn, cy, cx, c->dir, seed, U) : 0;
     if (!seeded) for (size_t g = 0; g < N; g++) U[g] = NAN;
     fprintf(stderr, "cond-sweep: U reached %zu of %zu papyrus voxels (%.4f) from the seed\n", reached, npap, npap ? (double)reached / npap : 0);

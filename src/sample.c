@@ -663,7 +663,7 @@ static inline void put_x(float *X, uint16_t *H, int xfmt, size_t idx, float v) {
    supervised), a seed cube of 4..12 voxels (p 0.15), else slabs at the window faces (each axis with p 0.5, at least one; thickness
    U(P/8, P/2), the low face with p 0.75), then with p 0.3 one or two dropout cubes (4..P/4). Inputs 4-6: cos, sin of 2 pi q' / 14 with
    a smooth angle noise (a 16-voxel grid of N(0, 0.03 turn), trilinear) and 1, where the pattern covers a known voxel; 0 elsewhere. */
-static void cond_draw(rng *r, int P, const uint8_t *w, uint8_t *wout, float *X, uint16_t *H, int xfmt) {
+static void cond_draw(rng *r, int P, const uint8_t *w, uint8_t *wout, float *X, uint16_t *H, int xfmt, int outside) {
     const size_t p2 = (size_t)P * P, p3 = p2 * P;
     const int gauge = (int)rint_below(r, 14);
     uint8_t *cm = calloc(p3, 1); if (!cm) abort();
@@ -703,10 +703,11 @@ static void cond_draw(rng *r, int P, const uint8_t *w, uint8_t *wout, float *X, 
         }
         put_x(X, H, xfmt, 4 * p3 + k, cv); put_x(X, H, xfmt, 5 * p3 + k, sv); put_x(X, H, xfmt, 6 * p3 + k, mv);
     }
+    if (outside) for (size_t k = 0; k < p3; k++) if (cm[k]) wout[k] = 255;   /* --cond-loss outside: supervise only where the net must count */
     free(nf); free(cm);
 }
 
-void sample_cond_draw(uint64_t seed, int P, const uint8_t *w, uint8_t *wout, float *X) { rng r; rseed(&r, seed); cond_draw(&r, P, w, wout, X, nullptr, 0); }
+void sample_cond_draw(uint64_t seed, int P, const uint8_t *w, uint8_t *wout, float *X, int outside) { rng r; rseed(&r, seed); cond_draw(&r, P, w, wout, X, nullptr, 0, outside); }
 
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
     double pt = sp->prof ? tnow() : 0;
@@ -1033,7 +1034,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) ww[k] = 255;
         } else memset(ww, 255, p3);
         sym_u8(ww, ws, P, y);
-        cond_draw(r, P, ws, b->wind + (size_t)i * p3, X, H, c->xfmt);
+        cond_draw(r, P, ws, b->wind + (size_t)i * p3, X, H, c->xfmt, c->cond_outside);
         free(ww); free(ws);
     }
     if (c->sheet) {

@@ -48,6 +48,7 @@ typedef struct {
                                 batch.x / x16 then hold 5 channels per sample */
     int pmask;               /* 1: fill batch.pm, the papyrus mask (CT > 0, symmetry applied) for heads whose loss covers all papyrus
                                 (task unwrap: ink) */
+    int cond_outside;        /* --cond-loss outside: batch.wind only where the condition does not reach (the net must count sheets there) */
     int cond;                /* 1 (train --cond): inputs 4-6 hold a condition drawn from the source's winding raster (cos, sin of
                                 2 pi q' / 14, mask; q' = q + a random gauge k per sample, in a random pattern of the output frame) and
                                 batch.wind the gauge-shifted winding for the targets (all unknown when no condition was drawn) */
@@ -98,4 +99,4 @@ sample_cfg sample_cfg_default(void);
 void pool2_u8(const uint8_t *in, int n, uint8_t *out);
 /* --cond: one sample's condition and gauge-shifted winding (src/sample.c cond_draw) with an rng seeded by seed; X: 7 x P^3 floats,
    inputs 4-6 written. Exposed for tests. */
-void sample_cond_draw(uint64_t seed, int P, const uint8_t *w, uint8_t *wout, float *X);
+void sample_cond_draw(uint64_t seed, int P, const uint8_t *w, uint8_t *wout, float *X, int outside);

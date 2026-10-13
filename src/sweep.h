@@ -13,7 +13,8 @@ typedef struct {
     z3 *ct; int64_t bo[3], bn[3];       /* the CT level, the box on it */
     double um, scale;                   /* the level's voxel size (um), level voxels per native voxel */
     const axis *ax; const char *axis_path; int axis_flag;   /* the umbilicus, its file, nn_pred_input's radial flag (0: none) */
-    int W, halo, h16, nthreads, dir, reverse;   /* window, halo; 16-bit inputs; handedness (+1: q = sheet + theta / 2 pi); reversed sweep order */
+    int W, halo, h16, nthreads, dir, reverse, raw;   /* window, halo; 16-bit inputs; handedness (+1: q = sheet + theta / 2 pi); reversed sweep order;
+                                                     raw: also <out>-raw/U.f32, the 14-turn head itself (diagnostic) */
     const char *out, *ckpt;
 } sweep_cfg;
 
