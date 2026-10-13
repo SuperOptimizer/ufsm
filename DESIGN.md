@@ -423,6 +423,19 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   not help: its target min(1, scale rho) clips every spacing under ~77 um. `train --density-code 1` targets x / (1 + x) (x = scale
   rho; recorded as "density_code", decoded by predict) and `--packed-weight W --packed-um S` weighs the phase and normal / density
   losses 1 at a spacing of S or more up to W at S / 2 (the loss mask byte is a per-voxel weight: 0/1 masks are unchanged).
+- Generalising to other scrolls (2026-10-13; the model must work from 8-9 um scans only). The targets (0343 / 0175A / 1447 at
+  8.64 um, 116 keV, 1.2 m; 0139 / 0813 at 9.36 um, 113 keV) are ~2x smoother than Paris4 at 9.6 um: per box, relative to the
+  material sd, high-frequency noise 0.19 vs 0.35, Laplacian energy 0.68 vs 1.39, no phase-contrast halos (the 2.4 um Paris4
+  reconstruction ends with an unsharp mask). Train's blur + low-res at strength 0.5 on Paris4 matches them (0.18 / 0.63). Scanner
+  augmentation, same training otherwise (+140k steps from a 60k net), on block B degraded at strength 2: miscounted 0.5 mm segments
+  68.3% -> 54.6%, phase median error 0.115 -> 0.088; clean unchanged (31.5 / 31.9%). Added: per-op strength (`--aug-OP-s`); ops
+  `paganin` (per-axis two-sided exponential low-pass, the 1 / (1 + c f^2) phase-retrieval form), `gin` (random shallow conv
+  remap, positive-biased, rescaled to the window's material mean / sd, blended) and `hist` (the material histogram mapped onto a
+  target scroll's, `--aug-hist FILE` from `ufsm ct-hist`); geometric augmentation (zoom, rotation, elastic, affine) for stored-phase
+  unwrap samples: the phase raster is pulled through the same warp with phasor interpolation (an analytic ramp: < 0.004 turn).
+  Existing recipes give byte-identical batches. Recipe: blur .6 (strength 1.5), lowres .4, paganin .3, tone .3, gin .15, hist .15,
+  bias .15, noise .15, cnoise / ring / slice / quant / cupping .1, sharpen .03; --geometry-aug 1, zoom .3 down to 0.85, rotate .2,
+  elastic .15. Inference on 8.64 / 9.36 um scans: area-resample to the net grid.
 - Left: BigTIFF for renders over 4 GB compressed; 9.6 um training on all of Paris4 (desk band codes); the desk runs.
 
 ## Half-resolution networks (2026-10-11)

@@ -291,6 +291,8 @@ int cmd_predict(int argc, char **argv) {
        scanner-domain shifts (blur, noise, rings, quantisation, ...) on held-out boxes */
     scan_aug_cfg dg = {.strength = (float)atof(opt(argc, argv, "--aug-strength", "1")), .drop_ignore = 1};
     for (int i = 0; i < SA_N; i++) { char f[48]; snprintf(f, sizeof f, "--aug-%s-p", scan_aug_names[i]); dg.p[i] = (float)atof(opt(argc, argv, f, opt(argc, argv, "--aug-p", "0"))); }
+    for (int i = 0; i < SA_N; i++) { char f[48]; snprintf(f, sizeof f, "--aug-%s-s", scan_aug_names[i]); dg.s[i] = (float)atof(opt(argc, argv, f, "0")); }
+    if (*opt(argc, argv, "--aug-hist", "") && scan_aug_load_hist(opt(argc, argv, "--aug-hist", ""), &dg)) { fprintf(stderr, "predict: --aug-hist: cannot read the file\n"); return 2; }
     const int degrade = scan_aug_enabled(&dg); const uint64_t dg_seed = strtoull(opt(argc, argv, "--aug-seed", "1"), nullptr, 10);
     int nthreads = atoi(opt(argc, argv, "--threads", "16"));
     const int use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;

@@ -803,6 +803,11 @@ int cmd_train(int argc, char **argv) {
     {
         const char *all=opt(argc,argv,"--aug-p","0");
         for (int i=0;i<SA_N;i++) { char f[48]; snprintf(f,sizeof f,"--aug-%s-p",scan_aug_names[i]); sc.scan.p[i]=(float)atof(opt(argc,argv,f,all)); }
+        for (int i=0;i<SA_N;i++) { char f[48]; snprintf(f,sizeof f,"--aug-%s-s",scan_aug_names[i]); sc.scan.s[i]=(float)atof(opt(argc,argv,f,"0")); }   /* per-op strength (0: --aug-strength) */
+        const char *hf=opt(argc,argv,"--aug-hist",nullptr);   /* target histograms for the hist op (ufsm ct-hist) */
+        if (hf && scan_aug_load_hist(hf,&sc.scan)) { fprintf(stderr,"--aug-hist: cannot read %s\n",hf); return 2; }
+        if (sc.scan.p[SA_HIST]>0 && !sc.scan.nhist) { fprintf(stderr,"--aug-hist-p needs --aug-hist FILE\n"); return 2; }
+        for (int i=0;i<SA_N;i++) if (!isfinite(sc.scan.s[i]) || sc.scan.s[i]<0 || sc.scan.s[i]>3) { fprintf(stderr,"--aug-%s-s: 0..3\n",scan_aug_names[i]); return 2; }
     }
     sc.affine_p=(float)atof(opt(argc,argv,"--aug-affine-p","0"));
     sc.affine_aniso=(float)atof(opt(argc,argv,"--aug-aniso","0.1"));
@@ -1172,9 +1177,13 @@ int cmd_train(int argc, char **argv) {
         int k=snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"scan_augmentation\":{\"version\":1,\"strength\":%.9g,\"drop_ignore\":%d,\"affine_p\":%.9g,\"aniso\":%.9g,\"shear\":%.9g,\"p\":{",
             sc.scan.strength,sc.scan.drop_ignore,sc.affine_p,sc.affine_aniso,sc.affine_shear);
         for (int i=0;i<SA_N;i++) k+=snprintf(runtime_extra+n-1+k,sizeof runtime_extra-n+1-k,"%s\"%s\":%.9g",i?",":"",scan_aug_names[i],sc.scan.p[i]);
-        snprintf(runtime_extra+n-1+k,sizeof runtime_extra-n+1-k,"}}}");
+        k+=snprintf(runtime_extra+n-1+k,sizeof runtime_extra-n+1-k,"}");
+        { int any=0; for (int i=0;i<SA_N;i++) if (sc.scan.s[i]>0) { k+=snprintf(runtime_extra+n-1+k,sizeof runtime_extra-n+1-k,"%s\"%s\":%.9g",any?",":",\"s\":{",scan_aug_names[i],sc.scan.s[i]); any=1; } if (any) k+=snprintf(runtime_extra+n-1+k,sizeof runtime_extra-n+1-k,"}"); }
+        if (sc.scan.nhist) k+=snprintf(runtime_extra+n-1+k,sizeof runtime_extra-n+1-k,",\"hist_targets\":%d",sc.scan.nhist);
+        snprintf(runtime_extra+n-1+k,sizeof runtime_extra-n+1-k,"}}");
         fprintf(stderr,"scanner augmentation: strength %.3g, drop-ignore %d, affine p %.3g (aniso %.3g shear %.3g); p",sc.scan.strength,sc.scan.drop_ignore,sc.affine_p,sc.affine_aniso,sc.affine_shear);
-        for (int i=0;i<SA_N;i++) if (sc.scan.p[i]>0) fprintf(stderr," %s %.3g",scan_aug_names[i],sc.scan.p[i]);
+        for (int i=0;i<SA_N;i++) if (sc.scan.p[i]>0) fprintf(stderr," %s %.3g%s",scan_aug_names[i],sc.scan.p[i],sc.scan.s[i]>0?"*":"");
+        { int any=0; for (int i=0;i<SA_N;i++) if (sc.scan.s[i]>0) { fprintf(stderr,"%s%s %.3g",any?", ":"; strength ",scan_aug_names[i],sc.scan.s[i]); any=1; } }
         fprintf(stderr,"\n");
     }
     fprintf(stderr,"augmentation: mode %d, CT %d, symmetry p %.3g, axis jitter %.3g voxels, geometry %d (rotation +/-%.3g degrees p %.3g; elastic <=%.3g voxels p %.3g), soft-band dilation/erosion +/-%.3g voxels p %.3g\n",

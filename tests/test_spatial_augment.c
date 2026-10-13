@@ -60,6 +60,35 @@ int main(void) {
         assert(batch.terms[0].target==.2f && batch.points[1].q==3.2f);
         printf("spatial mode %d: %d registered voxels, %d ignored corners, 48 symmetries, sparse round trip: ok\n",mode,checked,cropped);
     }
+    {   /* the stored phase through the same warps (warp_phase, task unwrap): a planar phase ramp of 0.02 / 0.03 / 0.025 turns per voxel
+           pulled through each mode and every 6th symmetry equals the analytic phase at the pulled source point (phasor interpolation of
+           a linear ramp: < 0.01 turn), unknown where the pull leaves the window */
+        uint8_t *ph=malloc(n),*out=malloc(n); const double g[3]={.02,.03,.025};
+        for (int z=0;z<P;z++) for (int y=0;y<P;y++) for (int x=0;x<P;x++) { double q=g[0]*z+g[1]*y+g[2]*x; q-=floor(q); ph[((size_t)z*P+y)*P+x]=(uint8_t)((int)lround(q*PHASE_PERIOD)%PHASE_PERIOD); }
+        for (int mode=0;mode<5;mode++) {
+            spatial_aug a; spatial_aug_make(&a,23,P,mode==1?0:5,1,mode==0?0:1,1);
+            if (mode==3) spatial_aug_zoom(&a,.8);
+            if (mode==4) spatial_aug_affine(&a,99,.2,.12);
+            spatial_aug_tables(&a,table);
+            double worst=0; int known=0,outside=0;
+            for (int si=0;si<48;si+=6) {
+                sym sy=sym_of(si); warp_phase(ph,out,P,sy,&a);
+                for (int z=0;z<P;z++) for (int y=0;y<P;y++) for (int x=0;x<P;x++) {
+                    size_t k=((size_t)z*P+y)*P+x; float pulled[3],jac[3]; spatial_aug_pull(&a,table,z,y,x,pulled,jac);
+                    double world[3]; int inside=1;
+                    for (int d=0;d<3;d++) world[sy.perm[d]]=sy.flip[d]?P-1-pulled[d]:pulled[d];
+                    for (int d=0;d<3;d++) inside &= world[d]>=0 && world[d]<=P-1;
+                    if (!inside) { assert(out[k]==PHASE_UNKNOWN); outside++; continue; }
+                    assert(out[k]<PHASE_PERIOD);
+                    double q=g[0]*world[0]+g[1]*world[1]+g[2]*world[2], e=out[k]/(double)PHASE_PERIOD-q; e-=round(e);
+                    if (fabs(e)>worst) worst=fabs(e); known++;
+                }
+            }
+            assert(worst<.01);
+            printf("phase warp mode %d: %d voxels, max error %.4f turn, %d outside the window unknown: ok\n",mode,known,worst,outside);
+        }
+        free(ph); free(out);
+    }
     free(ct); free(target); free(mask); free(T); free(M); free(X); free(H); free(scratch);
     puts("spatial augmentation registration: ok"); return 0;
 }

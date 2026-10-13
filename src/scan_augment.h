@@ -9,14 +9,22 @@
 #include <stdint.h>
 
 enum { SA_SEAM, SA_AIR, SA_LOWRES, SA_BLUR, SA_SHARPEN, SA_BIAS, SA_RING, SA_CUPPING, SA_SLICE, SA_NOISE, SA_CNOISE,
-       SA_TONE, SA_QUANT, SA_DROPSLICE, SA_CUTOUT, SA_CHUNK, SA_N };
+       SA_TONE, SA_QUANT, SA_DROPSLICE, SA_CUTOUT, SA_CHUNK, SA_PAGANIN, SA_GIN, SA_HIST, SA_N };
 extern const char *const scan_aug_names[SA_N];
 
 typedef struct {
     float strength;   /* magnitude scale, 0..2 */
     float p[SA_N];    /* per-op probability */
     int drop_ignore;  /* 1: dropped slices and cutouts are unsupervised (else the label stays and the net must infer it) */
+    float s[SA_N];    /* per-op magnitude scale overriding strength (0: strength) */
+    const float *hist; int nhist;   /* SA_HIST: nhist target material CDFs of 256 values each (scan_aug_load_hist) */
 } scan_aug_cfg;
+/* SA_PAGANIN: phase-retrieval-like low-pass, per axis the two-sided exponential exp(-|t| / lambda) (transfer 1 / (1 + c f^2), the
+   Paganin form), lambda (0.4 .. 1.6) s voxels. SA_GIN: a random shallow conv net on the CT (1..3 voxel kernels, 2..4 positive-biased
+   channels, leaky ReLU), rescaled to the window's material mean / sd and blended in (alpha 0.3 .. 1). SA_HIST: the window's material
+   histogram mapped onto a random target CDF (scans of other scrolls), blended (alpha 0.5 .. 1). Ops with p 0 draw nothing. */
+/* read target histograms (text: one line of 256 counts per box, the format of ufsm ct-hist) into c->hist / c->nhist; 0 on success */
+int scan_aug_load_hist(const char *path, scan_aug_cfg *c);
 
 static inline int scan_aug_enabled(const scan_aug_cfg *c) {
     if (!(c->strength > 0)) return 0;

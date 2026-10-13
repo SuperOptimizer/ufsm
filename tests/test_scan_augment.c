@@ -26,7 +26,13 @@ static void fill(vol *v, int air, int flat) {
     }
     for (int z = 0; z < P; z++) { v->cy[z] = (float)O[1] + .5f * (P - 1); v->cx[z] = (float)O[2] + .5f * (P - 1); }
 }
-static scan_aug_cfg one(int op, float strength) { scan_aug_cfg c = {.strength = strength, .drop_ignore = 1}; if (op >= 0) c.p[op] = 1; return c; }
+static float g_tcdf[256];   /* the hist op's target: material uniform over 150..220 */
+static scan_aug_cfg one(int op, float strength) {
+    scan_aug_cfg c = {.strength = strength, .drop_ignore = 1}; if (op >= 0) c.p[op] = 1;
+    for (int v = 0; v < 256; v++) g_tcdf[v] = v < 150 ? 0.f : v >= 220 ? 1.f : (v - 149) / 71.f;
+    c.hist = g_tcdf; c.nhist = 1;
+    return c;
+}
 static unsigned run(const scan_aug_cfg *c, uint64_t seed, vol *v, int hasax, int seam) {
     return scan_aug_apply(c, seed, v->ct, v->tgt, NCHT, v->ign, P, O, v->cy, v->cx, hasax, CHUNK, seam, scratch);
 }
@@ -137,9 +143,39 @@ static void test_operators(void) {
     }
 }
 
+/* the ops added for scroll-to-scroll generalisation: paganin keeps a constant and lowers the Laplacian energy; gin keeps the
+   material mean / sd (it is rescaled to them); hist moves the material median toward the target's; a per-op strength overrides
+   the global one exactly */
+static double lap_energy(const vol *v) {
+    double e = 0; for (int z = 1; z < P - 1; z++) for (int y = 1; y < P - 1; y++) for (int x = 1; x < P - 1; x++) {
+        const size_t i = ((size_t)z * P + y) * P + x; const double L = v->ct[i + P * P] + v->ct[i - P * P] + v->ct[i + P] + v->ct[i - P] + v->ct[i + 1] + v->ct[i - 1] - 6.0 * v->ct[i]; e += L * L; }
+    return e;
+}
+static void stats(const vol *v, double *mean, double *sd, int *median) {
+    size_t h[256] = {0}, n = 0; double s1 = 0, s2 = 0; for (size_t k = 0; k < N; k++) if (v->ct[k]) { h[v->ct[k]]++; n++; s1 += v->ct[k]; s2 += (double)v->ct[k] * v->ct[k]; }
+    *mean = s1 / n; *sd = sqrt(s2 / n - *mean * *mean); size_t c = 0; *median = 0; for (int b = 1; b < 256; b++) { c += h[b]; if (2 * c >= n) { *median = b; break; } }
+}
+static void test_generalisation_ops(void) {
+    for (uint64_t seed = 0; seed < 6; seed++) {
+        fill(&v0, 0, 1); v1 = v0; scan_aug_cfg c = one(SA_PAGANIN, 2); run(&c, seed, &v1, 1, 1);
+        CHECK(!memcmp(v0.ct, v1.ct, N), "paganin preserves a constant");
+        fill(&v0, 1, 0); v1 = v0; c = one(SA_PAGANIN, 1); run(&c, seed, &v1, 1, 1);
+        CHECK(lap_energy(&v1) < .7 * lap_energy(&v0), "paganin is a low-pass");
+        fill(&v0, 1, 0); v1 = v0; c = one(SA_GIN, 1); run(&c, seed, &v1, 1, 1);
+        double m0, s0, m1, s1; int md0, md1; stats(&v0, &m0, &s0, &md0); stats(&v1, &m1, &s1, &md1);
+        CHECK(fabs(m1 - m0) < .1 * s0 && fabs(s1 - s0) < .35 * s0, "gin keeps the material mean and sd");
+        fill(&v0, 1, 0); v1 = v0; c = one(SA_HIST, 1); run(&c, seed, &v1, 1, 1); stats(&v1, &m1, &s1, &md1);
+        CHECK(abs(md1 - 185) < abs(md0 - 185), "hist moves the material median toward the target's");
+        fill(&v0, 1, 0); v1 = v0; v2 = v0;
+        scan_aug_cfg a = one(SA_BLUR, .5f), b = one(SA_BLUR, 2); a.s[SA_BLUR] = 2;
+        run(&a, seed, &v1, 1, 1); run(&b, seed, &v2, 1, 1);
+        CHECK(same(&v1, &v2), "a per-op strength overrides the global strength");
+    }
+}
+
 int main(void) {
-    test_identity(); test_ops(); test_seam(); test_operators();
+    test_identity(); test_ops(); test_seam(); test_operators(); test_generalisation_ops();
     if (failures) { fprintf(stderr, "scan augment: %d failure(s)\n", failures); return 1; }
-    printf("scan augment: identity, determinism, label/ignore consistency of %d ops, seam registration, operators: ok\n", SA_N);
+    printf("scan augment: identity, determinism, label/ignore consistency of %d ops, seam registration, operators, paganin / gin / hist / per-op strength: ok\n", SA_N);
     return 0;
 }

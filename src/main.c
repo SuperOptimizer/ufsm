@@ -56,6 +56,7 @@ static int usage(void) {
         "  ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1]   warm the CT chunk cache for the labelled cells\n"
         "  ufsm phase-raster <codes-root> <key> <out-dir> [--box ...]          band phase precomputed for the sampler\n"
         "  ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase  one array halved per axis (labels, phase)\n"
+        "  ufsm ct-hist <out.txt> <root> <key> z,y,x,n [...]  CT histograms of boxes (targets of train --aug-hist, the hist op)\n"
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
@@ -905,6 +906,32 @@ static float *read_tif_f32(const char *path, int *w, int *h) {
    labels: any positive) or phase (the band phase codes, src/band.h: the circular mean of the known codes of the 2^3 block,
    PHASE_UNKNOWN where none is known or their resultant is under half their count). --box (source voxels) limits the work to
    the output shards it meets; others stay missing (the fill value). */
+/* ufsm ct-hist <out.txt> <root> <key> z,y,x,n [z,y,x,n ...] [--cache DIR]
+   The CT histogram of each box (n^3 at array key): one line of 256 counts per box (index 0 = masked air), boxes under 10% material
+   skipped. The scanner augmentation's hist op (train / predict --aug-hist FILE --aug-hist-p P) maps a training window's material
+   histogram onto one of these lines: boxes of the scans a model must generalise to (e.g. other scrolls). */
+static int cmd_ct_hist(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "usage: ufsm ct-hist <out.txt> <root> <key> z,y,x,n [z,y,x,n ...] [--cache DIR]\n"); return 2; }
+    z3 *z = z3_open(store_open(argv[3]), argv[4], opt(argc, argv, "--cache", nullptr));
+    if (!z) { fprintf(stderr, "ct-hist: %s\n", z3_error()); return 1; }
+    FILE *f = fopen(argv[2], "w"); if (!f) { fprintf(stderr, "ct-hist: cannot write %s\n", argv[2]); return 1; }
+    int nw = 0;
+    for (int a = 5; a < argc; a++) {
+        if (argv[a][0] == '-') { a++; continue; }
+        long long v[4]; if (sscanf(argv[a], "%lld,%lld,%lld,%lld", v, v + 1, v + 2, v + 3) != 4 || v[3] < 1 || v[3] > 1024) { fprintf(stderr, "ct-hist: box %s: z,y,x,n (n <= 1024)\n", argv[a]); fclose(f); return 2; }
+        const int64_t o[3] = {v[0], v[1], v[2]}, n[3] = {v[3], v[3], v[3]}; const size_t T = (size_t)v[3] * v[3] * v[3];
+        uint8_t *b = malloc(T); if (!b) { fclose(f); return 1; }
+        if (z3_read(z, o, n, b, 16)) { fprintf(stderr, "ct-hist: %s\n", z3_error()); free(b); fclose(f); return 1; }
+        size_t h[256] = {0}; for (size_t k = 0; k < T; k++) h[b[k]]++;
+        free(b);
+        if (T - h[0] < T / 10) { fprintf(stderr, "ct-hist: box %s: %.1f%% material, skipped\n", argv[a], 100.0 * (T - h[0]) / T); continue; }
+        for (int k = 0; k < 256; k++) fprintf(f, "%zu%c", h[k], k == 255 ? '\n' : ' ');
+        nw++;
+    }
+    fclose(f); z3_close(z);
+    fprintf(stderr, "ct-hist: %d histograms written to %s\n", nw, argv[2]);
+    return nw ? 0 : 1;
+}
 /* cmd_downsample's pooling of one source slab (n[0] rows, even, from output row 0 of dst): output rows split over threads; phase
    mode with cos / sin tables (the same doubles as cos / sin of each code) */
 static double g_ds_cs[PHASE_PERIOD], g_ds_sn[PHASE_PERIOD];
@@ -1716,6 +1743,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
+    if (!strcmp(cmd, "ct-hist")) return cmd_ct_hist(argc, argv);
     if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);
     if (!strcmp(cmd, "fit-compare")) return cmd_fit_compare(argc, argv);
     if (!strcmp(cmd, "gap-compare")) return cmd_gap_compare(argc, argv);
