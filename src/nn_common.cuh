@@ -2195,7 +2195,8 @@ template <typename GT, typename LT = float> __global__ void loss_grad_k(const LT
             }
         }
     }
-    float g = ((1.f - p) * s - pw * pq * (1.f - s)) / fmaxf(nm, 1.f);
+    const float mw = m[(size_t)n * S + i % S];   /* the mask as a weight (1 = plain); nm is the weight sum */
+    float g = mw * ((1.f - p) * s - pw * pq * (1.f - s)) / fmaxf(nm, 1.f);
     float ddice_ds = -(2.f * p * den - (2.f * Ssp + 1.f)) / (den * den);   /* dice on the voxel's own value */
     g += dice_w * ddice_ds * s * (1.f - s);
     gl[i] = f2h<GT>(g * fin[2 * C + 1] * gscale);

@@ -180,7 +180,7 @@ extern "C" void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float 
    density rho = sigma / 32, 11 the max recto probability (float bits, atomicMax as int: non-negative). The window covers box
    voxels [t + halo, t + W - halo) (t: the window origin relative to the box, may be negative), clipped to the box. */
 __global__ void fit_accum_k(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, int bz, int by, int bx, int h,
-                            int fz0, int fy0, int fx0, int nfy, int nfx, int F1, int F2, size_t nf, int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, float *acc) {
+                            int fz0, int fy0, int fx0, int nfy, int nfx, int F1, int F2, size_t nf, int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc) {
     __shared__ float red[11][512];
     const int fi = blockIdx.x, fz = fz0 + fi / (nfy * nfx), fy = fy0 + (fi / nfx) % nfy, fx = fx0 + fi % nfx;
     float v[11] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; float rmax = 0.f;
@@ -196,7 +196,7 @@ __global__ void fit_accum_k(const float *lg, const uint8_t *ct, int D, int W, in
         auto sg = [&](int c) { return 1.f / (1.f + __expf(-lg[(size_t)c * w3 + i])); };
         v[1] += 1.f; v[2] += 2.f * sg(ch_phase) - 1.f; v[3] += 2.f * sg(ch_phase + 1) - 1.f;
         for (int k = 0; k < 6; k++) v[4 + k] += sg(ch_normal + k) - (k < 3 ? 0.f : 0.5f);
-        v[10] += sg(ch_density) / dscale;
+        { const float sd = sg(ch_density); v[10] += (dcode ? fminf(sd, 0.999f) / (1.f - fminf(sd, 0.999f)) : sd) / dscale; }   /* the density code back to rho */
         rmax = fmaxf(rmax, sg(ch_recto));
     }
     for (int k = 0; k < 11; k++) red[k][threadIdx.x] = v[k];
@@ -213,7 +213,7 @@ __global__ void fit_accum_k(const float *lg, const uint8_t *ct, int D, int W, in
     }
 }
 extern "C" void nn_fit_accum_d(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
-                               int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, float *acc) {
+                               int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc) {
     int f0[3], f1[3];
     const int t[3] = {tz, ty, tx}, wn[3] = {D, W, W}, hn[3] = {hz, halo, halo};
     for (int d = 0; d < 3; d++) {
@@ -225,12 +225,12 @@ extern "C" void nn_fit_accum_d(const float *lg, const uint8_t *ct, int D, int W,
     const size_t nf = (size_t)F[0] * F[1] * F[2];
     if (h > 32 || nf > 0x7fffffff) { fprintf(stderr, "nn_fit_accum: h %d or field grid too large\n", h); abort(); }
     fit_accum_k<<<nfz * nfy * nfx, h * h * h < 512 ? h * h * h : 512>>>(lg, ct, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfy, nfx,
-                                                F[1], F[2], nf, ch_recto, ch_phase, ch_normal, ch_density, dscale, acc);
+                                                F[1], F[2], nf, ch_recto, ch_phase, ch_normal, ch_density, dscale, dcode, acc);
     KCHECK();
 }
 extern "C" void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
                              int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, float *acc) {
-    nn_fit_accum_d(lg, ct, W, W, halo, halo, tz, ty, tx, box, h, F, ch_recto, ch_phase, ch_normal, ch_density, dscale, acc);
+    nn_fit_accum_d(lg, ct, W, W, halo, halo, tz, ty, tx, box, h, F, ch_recto, ch_phase, ch_normal, ch_density, dscale, 0, acc);
 }
 
 /* analytic data terms (nn_fit_loss2): one evaluation per voxel */

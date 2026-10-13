@@ -81,6 +81,7 @@ static int g_cond, g_cond_ch, g_cond_outside; static float g_cond_lambda = 1.f;
    sampler's batch.pap), BCE over voxels inside the scroll (CT > 0) that are not ignored, times g_pap_lambda */
 static int g_pap_head, g_pap_ch; static float g_pap_lambda = 1.f; static papyrus_cfg g_paph;
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_scale = 32.f;
+static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --density-code, --packed-weight, --packed-um (task unwrap) */
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
    (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */
 static int g_papyrus; static papyrus_cfg g_pap;
@@ -391,6 +392,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     if (g_side) {   /* recto / verso side: BCE over known papyrus voxels (B == 1); split: halo planes are the other GPU's */
         const size_t l3 = (size_t)os.d * os.h * os.w, eb = g_g16 ? 2 : 4, le = unet_logits_h16(d->u) ? 2 : 4;
         if (g_side == 2) nn_phase_targets(d->sdb, l3, d->sidet, d->sidem); else nn_side_targets(d->sdb, l3, d->sidet, d->sidem);
+        if (g_side == 2 && g_unwrap && g_packed_w > 1) nn_packed_mask(d->sdb, os.d, os.h, os.w, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem);   /* packed sheets weigh more */
         if (ufsm_env_on("UFSM_SIDE_CHECK")) {   /* what the side / phase loss reads: known labels and the mask */
             uint8_t *h = malloc(2 * l3); nn_sync(); nn_d2h(h, d->sdb, l3); nn_d2h(h + l3, d->sidem, l3);
             size_t kn = 0, mk = 0; for (size_t k = 0; k < l3; k++) { kn += h[k] != 255; mk += h[l3 + k] != 0; }
@@ -405,7 +407,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     }
     if (g_unwrap) {   /* normal n n^T and density from the phase gradient; split: halo planes are the other GPU's */
         const size_t l3 = (size_t)os.d * os.h * os.w, eb = g_g16 ? 2 : 4, le = unet_logits_h16(d->u) ? 2 : 4;
-        nn_unwrap_targets(d->sdb, os.d, os.h, os.w, g_norm_s, g_dens_scale, d->nt, d->nm);
+        nn_unwrap_targets2(d->sdb, os.d, os.h, os.w, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm);
         if (d->side == 0) nn_zero(d->nm + l3 - (size_t)g_h0 * P * P, (size_t)g_h0 * P * P);
         else if (d->side == 1) nn_zero(d->nm, (size_t)g_h0 * P * P);
         const shape5 seven = {1, 7, os.d, os.h, os.w};
@@ -564,6 +566,11 @@ int cmd_train(int argc, char **argv) {
         if (g_norm_s < 1 || g_norm_s > 16) { fprintf(stderr,"--normal-step 1..16\n"); return 2; }
         g_dens_scale = (float)atof(opt(argc,argv,"--density-scale","32"));   /* density target min(1, scale rho): 32 at 2.4 um, 8 at 9.6 um (the same physical code) */
         if (!(g_dens_scale > 0)) { fprintf(stderr,"--density-scale > 0\n"); return 2; }
+        /* --density-code 1: density target x / (1 + x), x = scale rho (never saturates; 0: min(1, x), which clips every spacing under
+           scale x voxel size, 77 um at the default codes); --packed-weight W (> 1): the phase and normal / density losses weigh a voxel
+           1 at a sheet spacing of --packed-um (120) or more, rising to W at half of it (the nets under-count packed sheets) */
+        g_dens_code = atoi(opt(argc,argv,"--density-code","0")); g_packed_w = (float)atof(opt(argc,argv,"--packed-weight","0")); g_packed_um = (float)atof(opt(argc,argv,"--packed-um","120"));
+        if (g_dens_code < 0 || g_dens_code > 1 || g_packed_w < 0 || g_packed_w > 255 || !(g_packed_um > 0)) { fprintf(stderr,"--density-code 0|1, --packed-weight 0..255, --packed-um > 0\n"); return 2; }
     }
     if (g_aff) {   /* affinities at offsets 1 and 8 along z, y, x (8 = the split halo at four levels) */
         g_aff_off = (aff_offsets_t){6, {0, 1, 2, 0, 1, 2}, {1, 1, 1, 8, 8, 8}};
@@ -1133,8 +1140,9 @@ int cmd_train(int argc, char **argv) {
     }
     if (g_unwrap) {   /* channel layout of the unwrap heads */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
-        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"unwrap\":{\"version\":1,\"channels\":{\"recto\":0,\"ink\":1,\"phase\":[%d,%d],\"normal\":[%d,%d,%d,%d,%d,%d],\"density\":%d},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"min(1, density_scale rho), rho = |grad phase| turns per voxel\",\"density_scale\":%.9g,\"ink_lambda\":%.9g,\"ink_dice\":%.9g,\"normal_lambda\":%.9g,\"normal_step\":%d}}",
-                 g_side_ch,g_side_ch+1,g_norm_ch,g_norm_ch+1,g_norm_ch+2,g_norm_ch+3,g_norm_ch+4,g_norm_ch+5,g_norm_ch+6,g_dens_scale,g_ink_lambda,g_ink_dice,g_norm_lambda,g_norm_s);
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"unwrap\":{\"version\":1,\"channels\":{\"recto\":0,\"ink\":1,\"phase\":[%d,%d],\"normal\":[%d,%d,%d,%d,%d,%d],\"density\":%d},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"%s, rho = |grad phase| turns per voxel\",\"density_scale\":%.9g,\"density_code\":%d,\"packed_weight\":%.9g,\"packed_um\":%.9g,\"ink_lambda\":%.9g,\"ink_dice\":%.9g,\"normal_lambda\":%.9g,\"normal_step\":%d}}",
+                 g_side_ch,g_side_ch+1,g_norm_ch,g_norm_ch+1,g_norm_ch+2,g_norm_ch+3,g_norm_ch+4,g_norm_ch+5,g_norm_ch+6,
+                 g_dens_code ? "x / (1 + x), x = density_scale rho" : "min(1, density_scale rho)",g_dens_scale,g_dens_code,g_packed_w,g_packed_um,g_ink_lambda,g_ink_dice,g_norm_lambda,g_norm_s);
         if (g_cond) {   /* conditioned inference (predict --cond-sweep): inside the unwrap object */
             n=strlen(runtime_extra); runtime_extra[n-2]=0;
             snprintf(runtime_extra+n-2,sizeof runtime_extra-n+2,",\"cond\":{\"version\":1,\"inputs\":[4,5,6],\"input\":\"cos, sin of 2 pi q / 14, mask\",\"channels\":[%d,%d,%d,%d],\"periods\":[14,2],\"lambda\":%.9g,\"loss\":\"%s\"}}}",

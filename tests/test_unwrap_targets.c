@@ -1,6 +1,7 @@
 /* nn_unwrap_targets (task unwrap): on a planar phase field phase = frac(k . x) and on a radial one phase = frac(r / pitch) the
    targets are the sign-free normal n n^T and min(1, scale rho) (32; also 8) with rho = |grad phase| (turns per voxel); unknown voxels, voxels
-   whose +-s stencil samples are unknown and the border are masked. */
+   whose +-s stencil samples are unknown and the border are masked. nn_unwrap_targets2: the unclipped density code x / (1 + x) and the
+   packed-sheet loss weight in the mask. */
 #include "nn.h"
 #include <math.h>
 #include <stdio.h>
@@ -11,10 +12,12 @@ static int fails;
 static float g_ds = 32.f;   /* the density scale: min(1, g_ds rho) */
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
 
+static int g_code;   /* the density code: 0 min(1, x), 1 x / (1 + x) (train --density-code), x = g_ds rho */
+static float g_um, g_pum, g_pw;   /* the packed-sheet weight: voxel size, --packed-um, --packed-weight (0: off) */
 static void run(const uint8_t *ph, int D, int H, int W, int s, uint8_t *t, uint8_t *m) {
     const size_t n = (size_t)D * H * W;
     uint8_t *dp = nn_malloc(n), *dt = nn_malloc(7 * n), *dm = nn_malloc(n);
-    nn_h2d(dp, ph, n); nn_unwrap_targets(dp, D, H, W, s, g_ds, dt, dm); nn_sync();
+    nn_h2d(dp, ph, n); nn_unwrap_targets2(dp, D, H, W, s, g_ds, g_code, g_um, g_pum, g_pw, dt, dm); nn_sync();
     nn_d2h(t, dt, 7 * n); nn_d2h(m, dm, n);
     nn_free(dp); nn_free(dt); nn_free(dm);
 }
@@ -25,7 +28,8 @@ static double check(const uint8_t *t, const uint8_t *m, int D, int H, int W, voi
         const size_t i = ((size_t)z * H + y) * W + x;
         if (!m[i]) continue;
         double nv[3], rho; truth(z, y, x, nv, &rho);
-        const double ref[7] = {nv[0] * nv[0], nv[1] * nv[1], nv[2] * nv[2], 0.5 + nv[0] * nv[1], 0.5 + nv[0] * nv[2], 0.5 + nv[1] * nv[2], fmin(1, g_ds * rho)};
+        const double xd = g_ds * rho;
+        const double ref[7] = {nv[0] * nv[0], nv[1] * nv[1], nv[2] * nv[2], 0.5 + nv[0] * nv[1], 0.5 + nv[0] * nv[2], 0.5 + nv[1] * nv[2], g_code ? xd / (1 + xd) : fmin(1, xd)};
         for (int c = 0; c < 7; c++) err = fmax(err, fabs(t[c * n + i] / 255. - ref[c]));
         (*cnt)++;
     }
@@ -61,7 +65,23 @@ int main(void) {
     g_ds = 8.f;   /* the 9.6 um density code (--density-scale 8) */
     run(ph, D, H, W, s, t, m); e = check(t, m, D, H, W, plane_truth, &cnt);
     CHECK(e < 0.03, "plane, density scale 8: max target error %.4f", e);
-    g_ds = 32.f;
+    g_ds = 32.f; g_code = 1;   /* the unclipped code: x = 32 rho = 0.39 here, and where min(1, x) clips (scale 160: x = 1.94) */
+    run(ph, D, H, W, s, t, m); e = check(t, m, D, H, W, plane_truth, &cnt);
+    CHECK(e < 0.03, "plane, density code 1: max target error %.4f", e);
+    g_ds = 160.f; run(ph, D, H, W, s, t, m); e = check(t, m, D, H, W, plane_truth, &cnt);
+    CHECK(e < 0.03, "plane, density code 1, scale 160: max target error %.4f", e);
+    g_ds = 32.f; g_code = 0;
+    {   /* the packed-sheet weight: rho = 0.0121 turns per voxel; at 0.5 um voxels the spacing is 41 um (< 120 / 2: weight 8), at 2 um
+           165 um (>= 120: 1), at 1.2 um 99 um (between: 1 + 7 (120 - 99) / 60 = 3.4 -> 3) */
+        const float ums[3] = {0.5f, 2.f, 1.2f}; const int want[3] = {8, 1, 3};
+        for (int k = 0; k < 3; k++) {
+            g_um = ums[k]; g_pum = 120.f; g_pw = 8.f; run(ph, D, H, W, s, t, m);
+            size_t ok = 0, tot = 0; for (size_t i = 0; i < n; i++) if (m[i]) { tot++; ok += k < 2 ? m[i] == want[k] : abs(m[i] - want[k]) <= 1; }   /* (the middle
+               case: the 1/252-turn phase quantisation moves the local spacing a few percent, 3.4 rounds to 3 or 4) */
+            CHECK(tot && ok == tot, "packed weight at %.1f um voxels: %zu of %zu masked voxels weigh %d", ums[k], ok, tot, want[k]);
+        }
+        g_pw = 0.f;
+    }
     for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {   /* radial, with an unknown slab */
         const size_t i = ((size_t)z * H + y) * W + x;
         double q = hypot(y - cy, x - cx) / pitch; q -= floor(q);

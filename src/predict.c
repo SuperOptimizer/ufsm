@@ -344,9 +344,10 @@ int cmd_predict(int argc, char **argv) {
     const char *sweep_out = opt(argc, argv, "--cond-sweep", nullptr);   /* train --cond checkpoints: conditioned inference (src/sweep.h) */
     if (sweep_out && (cfg.cin != 7 || cfg.cout < 15 || half || sheet_task || ffd)) { fprintf(stderr, "predict: --cond-sweep needs a train --cond checkpoint (7 inputs, 15 outputs), no --fit-fields\n"); return 2; }
     if (ffd && (cfg.cout < 11 || half || sheet_task)) { fprintf(stderr, "predict: --fit-fields needs a task unwrap checkpoint (11+ outputs) at full resolution\n"); return 2; }
-    float ffds = 32.f;   /* the checkpoint's density code: min(1, density_scale rho) */
+    float ffds = 32.f; int ffdc = 0;   /* the checkpoint's density code: min(1, density_scale rho), or x / (1 + x) (density_code 1) */
     if (ffd) { FILE *cf = fopen(ckpt, "rb"); char *hb = malloc(1 << 16); size_t nr = cf ? fread(hb, 1, (1 << 16) - 1, cf) : 0; if (cf) fclose(cf); hb[nr] = 0;
-               char *e = memchr(hb, '\n', nr); if (e) *e = 0; const char *q = strstr(hb, "\"density_scale\":"); if (q) ffds = (float)atof(q + 16); free(hb); }
+               char *e = memchr(hb, '\n', nr); if (e) *e = 0; const char *q = strstr(hb, "\"density_scale\":"); if (q) ffds = (float)atof(q + 16);
+               q = strstr(hb, "\"density_code\":"); if (q) ffdc = atoi(q + 15); free(hb); }
     int pap_cond = 0; const int pap = papyrus_checkpoint(ckpt, &pap_cond) == 1;   /* task papyrus: the conditioned nets take the cutoff per window */
     const double pcut = pap && pap_cond ? atof(opt(argc, argv, "--papyrus-cut", "-1")) : -1;
     if (pap && pap_cond && !(pcut >= 0 && pcut <= 255)) { fprintf(stderr, "predict: %s is conditioned on the papyrus cutoff: --papyrus-cut T (raw CT units 0..255, e.g. 80)\n", ckpt); return 2; }
@@ -763,7 +764,7 @@ int cmd_predict(int argc, char **argv) {
             } else lg = ct_stem ? unet_forward_ct(u, ctd, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xs, h16)
                                 : unet_forward_x(u, xd, xs, 0, h16);
             if (gn_save) unet_gn_accumulate(u);
-            if (ffd && !ffzm) nn_fit_accum_d(lg, ctd, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, 0, 2, 4, 10, ffds, ffacc);
+            if (ffd && !ffzm) nn_fit_accum_d(lg, ctd, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, 0, 2, 4, 10, ffds, ffdc, ffacc);
             if (ffzm) {   /* the window interior's whole cells, finalized into the field slab (flushed when the slab is left) */
                 int c0[3], c1[3], nc3[3], ok = 1; const int64_t tw[3] = {tz, ty, tx};
                 for (int d = 0; d < 3; d++) {
@@ -779,7 +780,7 @@ int cmd_predict(int argc, char **argv) {
                     const int lbox[3] = {(int)(bn[0] - (int64_t)c0[0] * ffh < (int64_t)nc3[0] * ffh ? bn[0] - (int64_t)c0[0] * ffh : (int64_t)nc3[0] * ffh),
                                          (int)(bn[1] - (int64_t)c0[1] * ffh < (int64_t)nc3[1] * ffh ? bn[1] - (int64_t)c0[1] * ffh : (int64_t)nc3[1] * ffh),
                                          (int)(bn[2] - (int64_t)c0[2] * ffh < (int64_t)nc3[2] * ffh ? bn[2] - (int64_t)c0[2] * ffh : (int64_t)nc3[2] * ffh)};
-                    nn_fit_accum_d(lg, ctd, Wz, W, hz, halo, (int)(tz - (int64_t)c0[0] * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, nc3, 0, 2, 4, 10, ffds, ffacc);
+                    nn_fit_accum_d(lg, ctd, Wz, W, hz, halo, (int)(tz - (int64_t)c0[0] * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, nc3, 0, 2, 4, 10, ffds, ffdc, ffacc);
                     nn_d2h(ffacch, ffacc, 12 * nl * 4);
                     uint8_t *wa[10]; for (int k = 0; k < 10; k++) wa[k] = malloc(nl);
                     fit_finalize(ffacch, nl, ffh, wa);

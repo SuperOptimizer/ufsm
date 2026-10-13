@@ -20,6 +20,7 @@ template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t 
         size_t per = (S + gridDim.y - 1) / gridDim.y, lo = (size_t)slab * per, hi = lo + per < S ? lo + per : S;
         for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
             if (!mp[i]) continue;
+            const float mw = mp[i];   /* the mask is a weight (1 = plain; nn_packed_mask / nn_unwrap_targets2 write more) */
             float x = lgv(l, i), p = tp[i] * (1.f / 255.f);
             float sg = 1.f / (1.f + __expf(-x));
             float spp = fmaxf(x, 0.f) + log1pf(__expf(-fabsf(x)));   /* softplus(x) */
@@ -30,7 +31,7 @@ template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t 
                 spq = fmaxf(xq, 0.f) + log1pf(__expf(-fabsf(xq)));
             }
             float bce = pw * p * (spq - xq) + (1.f - p) * spp;          /* softplus(-x) = softplus(x) - x */
-            a0 += 1; a1 += bce; a2 += sg * p; a3 += sg; a4 += p;
+            a0 += mw; a1 += mw * bce; a2 += sg * p; a3 += sg; a4 += p;
         }
     }
     __shared__ double r[5][256];

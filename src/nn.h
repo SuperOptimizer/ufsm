@@ -298,6 +298,10 @@ void nn_add_into(void *y, const void *x, shape5 s, int h16);   /* y += x in y's 
 void nn_side_targets(const uint8_t *side, size_t n, uint8_t *t, uint8_t *m);   /* band.h SIDE_* labels -> loss target (recto 255, verso 0) and mask (known) */   /* where m == 0 and vm != 0: t = src, m = 1 */
 void nn_phase_targets(const uint8_t *phase, size_t n, uint8_t *t, uint8_t *m);   /* band.h PHASE_* -> targets t[0..n) = 0.5 + 0.5 cos(2 pi phase), t[n..2n) = 0.5 + 0.5 sin (x255), mask (known) */
 void nn_unwrap_targets(const uint8_t *phase, int d, int h, int w, int s, float dscale, uint8_t *t, uint8_t *m);   /* task unwrap: sign-free normal n n^T (6) and density min(1, dscale rho) (x255, 7 planes) from the phase gradient over +-s voxels; mask */
+/* the same with the density code (0: min(1, x), 1: x / (1 + x), x = dscale rho: never saturates) and the mask holding the packed-sheet
+   loss weight (1 at a spacing um / rho of packed_um or more, up to packed_w at packed_um / 2; um: the batch's voxel size in um) */
+void nn_unwrap_targets2(const uint8_t *phase, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, uint8_t *t, uint8_t *m);
+void nn_packed_mask(const uint8_t *phase, int d, int h, int w, int s, float um, float packed_um, float packed_w, uint8_t *m);   /* 0/1 mask x the weight */
 void nn_cond_targets(const uint8_t *wind, size_t n, uint8_t *t, uint8_t *m);   /* --cond: winding mod 14 (band.h band_winding) -> 4 targets: cos / sin of 2 pi q / 14 and 2 pi q / 2 (x255, 4 planes), mask (known) */
 void nn_cond_acc(const void *lg, int lg_h16, const uint8_t *wind, size_t n, unsigned long long *cnt);   /* --cond: known / right-turn counts of the 14-turn head (cnt: 2 device u64, accumulated) */
 void nn_pap_targets(const uint8_t *pl, const uint8_t *pm, size_t n, uint8_t *t, uint8_t *m);   /* --pap-head: gap labels (0 / 1 / 255 ignored) -> target, mask (not ignored, inside the scroll) */

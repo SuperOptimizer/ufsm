@@ -416,6 +416,13 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   Laptop: 32 x 256 x 256 at 9.6 um, a 1.5M net (widths 32,32,32,32,64,64), 36 samples/s. A 6-level net sees ~480 voxels (9.6 um
   ~4.6 mm, 19.2 um ~9 mm), so wider slabs need xy-only pooling levels (not built). A net trained on slabs is run on slabs: its
   coarsest z taps only ever saw padding.
+- Counting turns (2026-10-13): `fit-compare` also counts turns on 0.5 mm radial segments without the fitter (whose winding-id
+  score swung 5-20 points between inference windows of one weak net). On block B every net so far (2.4 um teacher, 9.6 / 19.2 um,
+  cubes, slabs, 7 levels, 1.5M to 10.7M) misses 0.4-0.6 of ~3.4 turns per segment and gets 94-99% of the packed (< 100 um)
+  segments wrong; best: 19.2 um input, 10.7M, 60k (30.7% of segments off by >= 1/2 turn; 9.6 um 33.1%). The density head could
+  not help: its target min(1, scale rho) clips every spacing under ~77 um. `train --density-code 1` targets x / (1 + x) (x = scale
+  rho; recorded as "density_code", decoded by predict) and `--packed-weight W --packed-um S` weighs the phase and normal / density
+  losses 1 at a spacing of S or more up to W at S / 2 (the loss mask byte is a per-voxel weight: 0/1 masks are unchanged).
 - Left: BigTIFF for renders over 4 GB compressed; 9.6 um training on all of Paris4 (desk band codes); the desk runs.
 
 ## Half-resolution networks (2026-10-11)

@@ -101,7 +101,7 @@ void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo, int tz, i
                   int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, float *acc);   /* dscale: the checkpoint's density_scale */
 /* the same for a D x W x W window with interior planes [hz, D - hz) (predict --window-z slabs); nn_fit_accum = D W, hz halo */
 void nn_fit_accum_d(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
-                    int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, float *acc);
+                    int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc);   /* dcode: train --density-code */
 /* W (or U = W + dir theta / 2 pi when with_theta) on a grid: row a at box-local native z rows[a].z, voxel (b, c) at y0 + (b + 0.5)
    step, x0 + (c + 0.5) step; per row model a (z - za) blended with model b (z - zb) by t: (1 - t) W_a + t W_b. ms: device array of
    models (device pointers inside); out: device float nz x ny x nx */

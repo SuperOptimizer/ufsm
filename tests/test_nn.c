@@ -208,9 +208,10 @@ static double cpu_loss(const float *l, const loss_ctx *c) {
         if (!c->w[nc]) continue;
         int n = nc / C; double nm = 0, bce = 0, sp = 0, ss = 0, spp = 0;
         for (size_t i = 0; i < S; i++) {
-            if (!c->m[(size_t)n * S + i]) continue;
+            const double mw = c->m[(size_t)n * S + i];   /* the mask is a per-voxel weight of the BCE (1 = plain) */
+            if (!mw) continue;
             double x = l[(size_t)nc * S + i], p = c->t[(size_t)nc * S + i] / 255.0, s = 1 / (1 + exp(-x));
-            nm++; bce += fmax(x, 0) - x * p + log1p(exp(-fabs(x))); sp += s * p; ss += s; spp += p;
+            nm += mw; bce += mw * (fmax(x, 0) - x * p + log1p(exp(-fabs(x)))); sp += s * p; ss += s; spp += p;
         }
         if (nm < 1) continue;
         active++;
@@ -245,6 +246,20 @@ static void test_loss(void) {
     }
     printf("  grad fd rel err %.3g\n", worst);
     CHECK(worst < 2e-3, "loss grad");
+    /* the mask as a weight (train --packed-weight): weights 0..3, the same value and gradient checks */
+    for (size_t i = 0; i < (size_t)s.n * S; i++) c.m[i] = (uint8_t)(rand() % 4);
+    nn_h2d(c.dm, c.m, (size_t)s.n * S);
+    nn_loss(c.dl, c.dt, c.dm, c.dw, s, 0.5f, c.dg, out, c.scr);
+    ref = cpu_loss(l, &c); got = ((out[0] + 0.5 * out[2]) * 2 + (out[1] + 0.5 * out[3]) * 1) / out[4];
+    printf("  weighted mask: loss cpu %.6f gpu %.6f\n", ref, got);
+    CHECK(fabs(ref - got) < 1e-4, "weighted loss value");
+    host(g, c.dg, n); worst = 0; scale = maxabs(g, n);
+    for (size_t i = 0; i < n; i++) {
+        float o = l[i]; l[i] = o + 1e-3f; double lp = cpu_loss(l, &c); l[i] = o - 1e-3f; double lm = cpu_loss(l, &c); l[i] = o;
+        double fd = (lp - lm) / 2e-3, err = fabs(fd - g[i]) / (scale + 1e-9); if (err > worst) worst = err;
+    }
+    printf("  weighted mask: grad fd rel err %.3g\n", worst);
+    CHECK(worst < 2e-3, "weighted loss grad");
 }
 
 /* fp16 logits (unet lean 2: the logit gradient beside them in the gradient buffer): the losses read them through
