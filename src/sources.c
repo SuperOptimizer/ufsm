@@ -159,6 +159,17 @@ sources *sources_load(const char *path) {
                     fprintf(stderr, "sources: %s: cannot open the stored phase %s/%s or its shape differs from the band codes'\n", s->name, proot ? proot : "?", pkey);
                     json_free(j); sources_free(S); return nullptr;
                 }
+                const json *wt = json_get(bt, "winding");   /* the winding mod 14 on the stored phase's grid */
+                if (wt) {
+                    const char *wroot = json_str(json_get(wt, "root"), nullptr), *wkey = json_str(json_get(wt, "key"), pkey);
+                    store *ws = wroot ? store_open(wroot) : nullptr;
+                    s->wind = ws ? z3_open(ws, wkey, nullptr) : nullptr;
+                    const z3_meta *wm = s->wind ? z3_meta_of(s->wind) : nullptr;
+                    if (!wm || memcmp(wm->shape, pm->shape, sizeof wm->shape)) {
+                        fprintf(stderr, "sources: %s: cannot open the winding raster %s/%s or its shape differs from the stored phase's\n", s->name, wroot ? wroot : "?", wkey);
+                        json_free(j); sources_free(S); return nullptr;
+                    }
+                }
             }
         }
         const json *aj = json_get(e, "aux");
@@ -187,7 +198,7 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
-        z3_close(s->band); z3_close(s->phase); z3_close(s->aux);
+        z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux);
         for (int c = 0; c < NCH; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {

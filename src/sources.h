@@ -81,6 +81,8 @@ typedef struct {
                     level 2): samples of level L read it directly, of level L - 1 upsampled 2x */
     int phase_level, phase_direct;   /* the CT level whose grid the stored phase is on (1: the 4.8 um label grid of 2.4 um scans);
                                         phase_direct: "level" given, so samples of that level read it directly */
+    z3 *wind;    /* optional, with a stored phase: the winding mod 14 turns on the same grid (ufsm phase-raster --winding; band.h
+                    band_winding), {"band": {..., "phase": {...}, "winding": {"root": ..., "key": ...}}}: the --cond targets / condition */
 } source;
 
 typedef struct {

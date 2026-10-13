@@ -61,6 +61,7 @@ static int usage(void) {
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
+        "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm papyrus-labels <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx   papyrus / void training labels of a CT box (gap labels, no cutoff)\n"
         "  ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w --labels G1,G2   a CT plane beside label panels (void blue, ignored yellow)\n"
         "root: local dir or https://.../volcomp ; keys are paths under root\n");
@@ -218,8 +219,9 @@ static int band_fit_fields(const uint8_t *ph, const uint8_t *spc, const int n[3]
    a source then reads it with "band": {..., "phase": {"root": <out-dir>, "key": "4.8"}}. Blocks of --block label voxels plus the
    band halo, in parallel, shard by shard (512 label voxels); blocks without codes stay unknown. --box (native) limits it.
    --pool 2 writes only the 2x circular-mean pooling, <out-dir>/9.6 (a whole scroll at 4.8 um is ~25 MB per shard, 9.6 um
-   ~5 MB); --resume 1 skips shards already written (long runs). */
-typedef struct { z3 *codes; const int64_t *shape; const axis *ax; band_params bp; int halo, blk; int64_t s0[3]; uint8_t *shard; atomic_int next; int nblk[3]; size_t nonempty; pthread_mutex_t mu; } praster_job;
+   ~5 MB); --resume 1 skips shards already written (long runs). --winding 1 writes the winding mod 14 turns (band_winding, same
+   encoding and pooling: 1/18 turn steps) instead of the 1-turn phase, for targets beyond one turn. */
+typedef struct { z3 *codes; const int64_t *shape; const axis *ax; band_params bp; int halo, blk; int64_t s0[3]; uint8_t *shard; atomic_int next; int nblk[3]; size_t nonempty; pthread_mutex_t mu; int winding; } praster_job;
 static void *praster_worker(void *arg) {
     praster_job *J = arg; const int B = J->blk, Hh = J->halo, nb = J->nblk[0] * J->nblk[1] * J->nblk[2];
     for (;;) {
@@ -246,6 +248,7 @@ static void *praster_worker(void *arg) {
         for (int64_t zz = 0; zz < n[0]; zz++) axis_at(J->ax, 2.0 * (zz + o[0]) + 0.5, &cy[zz], &cx[zz]);
         uint8_t *band = malloc(N), *phase = malloc(N);
         if (!band || !phase || band_field_phase(codes, ni, o, cy, cx, J->bp, band, phase, nullptr)) { fprintf(stderr, "phase-raster: out of memory\n"); free(codes); free(band); free(phase); free(cy); free(cx); continue; }
+        if (J->winding) for (size_t k = 0; k < N; k++) phase[k] = band_winding(band[k], phase[k]);   /* --winding: mod 14 turns */
         for (int zz = 0; zz < B; zz++) for (int yy = 0; yy < B; yy++)   /* the block interior into the shard buffer (512^3) */
             memcpy(J->shard + ((size_t)(bz * B + zz) * 512 + by * B + yy) * 512 + bx * B, phase + ((size_t)(zz + Hh) * n[1] + yy + Hh) * n[2] + Hh, (size_t)B);
         pthread_mutex_lock(&J->mu); J->nonempty++; pthread_mutex_unlock(&J->mu);
@@ -270,8 +273,9 @@ static void phase_pool2(const uint8_t *src, uint8_t *dst) {
     }
 }
 static int cmd_phase_raster(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm phase-raster <codes-root> <key> <out-dir> [--axis A] [--radius 80] [--span 75] [--box z,y,x,nz,ny,nx] [--threads 4] [--block 256] [--pool 2] [--resume 1]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm phase-raster <codes-root> <key> <out-dir> [--axis A] [--radius 80] [--span 75] [--box z,y,x,nz,ny,nx] [--threads 4] [--block 256] [--pool 2] [--resume 1] [--winding 1]\n"); return 2; }
     const int pool = atoi(opt(argc, argv, "--pool", "1")), resume = atoi(opt(argc, argv, "--resume", "0"));   /* --pool 2: write only the 9.6 um (2x circular-mean) phase; --resume: skip written shards */
+    const int winding = atoi(opt(argc, argv, "--winding", "0"));   /* the winding mod 14 turns (band_winding) instead of the 1-turn phase */
     if (pool != 1 && pool != 2) { fprintf(stderr, "phase-raster: --pool 1|2\n"); return 2; }
     band_params bp = {(float)atof(opt(argc, argv, "--radius", "80")), (float)atof(opt(argc, argv, "--span", "75"))};
     axis ax = {0};
@@ -285,7 +289,8 @@ static int cmd_phase_raster(int argc, char **argv) {
     if (bx) { long long v[6]; if (sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return usage(); for (int d = 0; d < 3; d++) { lo[d] = v[d] / 2; hi[d] = (v[d] + v[3 + d] + 1) / 2; } }
     const double um = 4.8 * pool; char lv[32]; z3w_level_name(um, lv, sizeof lv);
     char dir[1400]; snprintf(dir, sizeof dir, "%s/%s", argv[4], lv);
-    char attrs[600]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"band field winding phase (src/band.h PHASE_*: 0..251, 255 unknown)%s\",\"codes\":\"%s/%s\",\"radius\":%g,\"span\":%g}}",
+    char attrs[600]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s%s\",\"codes\":\"%s/%s\",\"radius\":%g,\"span\":%g}}",
+                                   winding ? "band field winding mod 14 turns x 18 (src/band.h band_winding: 0..251, 255 unknown)" : "band field winding phase (src/band.h PHASE_*: 0..251, 255 unknown)",
                                    pool == 2 ? ", pooled 2x (circular mean of the known codes)" : "", argv[2], argv[3], bp.radius, bp.span);
     const int64_t oshape[3] = {(shape[0] + pool - 1) / pool, (shape[1] + pool - 1) / pool, (shape[2] + pool - 1) / pool};
     z3w *w = z3w_create(dir, oshape, 512 / pool, 0, PHASE_UNKNOWN, attrs);   /* a 4.8 shard of 512 -> one output shard */
@@ -297,7 +302,7 @@ static int cmd_phase_raster(int argc, char **argv) {
     for (int64_t sz = lo[0] / 512; sz * 512 < hi[0]; sz++) for (int64_t sy = lo[1] / 512; sy * 512 < hi[1]; sy++) for (int64_t sx = lo[2] / 512; sx * 512 < hi[2]; sx++) {
         if (resume) { char sp[1600]; snprintf(sp, sizeof sp, "%s/c/%lld/%lld/%lld", dir, (long long)sz, (long long)sy, (long long)sx); if (access(sp, F_OK) == 0) { skipped++; continue; } }
         memset(shard, PHASE_UNKNOWN, (size_t)512 * 512 * 512);
-        praster_job J = {z, shape, &ax, bp, (int)ceilf((bp.radius + bp.span) / 2.f) + 2, blk, {sz * 512, sy * 512, sx * 512}, shard, 0, {512 / blk, 512 / blk, 512 / blk}, 0, PTHREAD_MUTEX_INITIALIZER};
+        praster_job J = {z, shape, &ax, bp, (int)ceilf((bp.radius + bp.span) / 2.f) + 2, blk, {sz * 512, sy * 512, sx * 512}, shard, 0, {512 / blk, 512 / blk, 512 / blk}, 0, PTHREAD_MUTEX_INITIALIZER, winding};
         pthread_t th[64]; const int nt = nth < 1 ? 1 : nth > 64 ? 64 : nth;
         for (int k = 0; k < nt; k++) pthread_create(&th[k], nullptr, praster_worker, &J);
         for (int k = 0; k < nt; k++) pthread_join(th[k], nullptr);
@@ -441,6 +446,79 @@ static int cmd_band(int argc, char **argv) {
    a global coarse fit plus z-slabs of Z native voxels (a fit set; --out writes it, --model reads a set or a model). --codes: score
    against a winding_mod14 band raster (label grid, 2 native voxels per label voxel, code = 1 + round(18 q) mod 252 with q the mesh
    coordinate, q = U for dir +1): on every labelled voxel of the box U_fit - q must be one constant mod 14 turns. */
+/* U (the unwrapped radius in turns; sheets where U - dir theta / 2 pi is an integer) for the scorer: fill(ctx, og, n3, step, U) writes U
+   at og + i step (native voxels relative to the box origin) over the n3 grid, NaN where unknown; returns nonzero on failure */
+typedef int (*score_fill_fn)(void *ctx, const double og[3], const int64_t n3[3], double step, float *U);
+/* Score U against the band codes (winding_mod14) of a box, streamed in label z-chunks: the gauge (the mode of U - q mod 14), the
+   fraction of winding ids right (|e| < 0.5 turn), |e| < 0.08 turn, median / p90 |e|; detail: integer errors by z octile and by radius
+   (cy, cx: the axis per native z, box-local, (int)(shp[0] h) + 1 entries; um: the native voxel size); dump: box-local z y x and U - q
+   per voxel. cf: a label voxel in native voxels. Returns 0, or 1 on a read failure. */
+static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3], double h, double um, const float *cy, const float *cx, int detail, FILE *dump,
+                       score_fill_fn fill, void *ctx) {
+    int64_t lo[3], ln[3]; for (int d = 0; d < 3; d++) { lo[d] = (int64_t)floor(org[d] / cf); ln[d] = (int64_t)(shp[d] * h / cf); }
+    enum { NB = 14 * 72, NF = 14 * 1024 }; size_t *hist = calloc(NB, sizeof(size_t)), *fine = calloc(NF, sizeof(size_t)), nd = 0, nan = 0;   /* d = U - q mod 14: 1/72 and 1/1024 turn bins */
+    typedef struct { float d; uint8_t z, r; } score_rec; score_rec *dd = nullptr; size_t ndet = 0, dcap = 0;
+    const int na_ax = (int)(shp[0] * h) + 1;
+    const size_t plane = (size_t)ln[1] * ln[2]; int64_t zc = (int64_t)((32u << 20) / plane); if (zc < 1) zc = 1;
+    uint8_t *codes = malloc(zc * plane); float *U = malloc(zc * plane * 4);
+    for (int64_t z0 = 0; z0 < ln[0]; z0 += zc) {
+        const int64_t nz = ln[0] - z0 < zc ? ln[0] - z0 : zc;
+        const int64_t o3[3] = {lo[0] + z0, lo[1], lo[2]}, n3[3] = {nz, ln[1], ln[2]};
+        if (z3_read(z, o3, n3, codes, 8)) { fprintf(stderr, "score: code read failed: %s\n", z3_error()); free(codes); free(U); free(hist); free(fine); free(dd); return 1; }
+        size_t any = 0; for (size_t i = 0; i < (size_t)nz * plane && !any; i++) any = codes[i] >= 1 && codes[i] <= 252;
+        if (!any) continue;
+        const double og[3] = {cf * o3[0] - 0.25 * cf - org[0], cf * lo[1] - 0.25 * cf - org[1], cf * lo[2] - 0.25 * cf - org[2]};   /* label voxel i at cf (i + lo + 1 / 4) - org */
+        if (fill(ctx, og, n3, cf, U)) { fprintf(stderr, "score: cannot evaluate U on the score grid\n"); free(codes); free(U); free(hist); free(fine); free(dd); return 1; }
+        for (int64_t zz = 0; zz < nz; zz++) for (int64_t yy = 0; yy < ln[1]; yy++) for (int64_t xx = 0; xx < ln[2]; xx++) {
+            const size_t i = ((size_t)zz * ln[1] + yy) * ln[2] + xx; const uint8_t cd = codes[i];
+            if (cd < 1 || cd > 252) continue;
+            const double pz = cf * (zz + o3[0] + 0.25) - org[0], py = cf * (yy + lo[1] + 0.25) - org[1], px = cf * (xx + lo[2] + 0.25) - org[2];
+            if (pz < 0 || py < 0 || px < 0 || pz > shp[0] * h || py > shp[1] * h || px > shp[2] * h) continue;
+            if (!(U[i] == U[i])) { nan++; continue; }   /* no U here (a raster's unreached voxel) */
+            double d = fmod(U[i] - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14; if (d >= 14) d = 0;
+            if (dump) { const float rec[4] = {(float)pz, (float)py, (float)px, (float)d}; if (fwrite(rec, 4, 4, dump) != 4) dump = nullptr; }
+            hist[(int)(d / 14 * NB) % NB]++; fine[(int)(d / 14 * NF) % NF]++; nd++;
+            if (detail) {   /* d and the voxel's z / radius bins for the breakdown after the gauge is known */
+                if (ndet == dcap) { dcap = dcap ? 2 * dcap : 1 << 20; dd = realloc(dd, dcap * sizeof *dd); }
+                const int zi = (int)fmin(7, fmax(0, pz / (shp[0] * h) * 8));
+                const int ai = (int)fmin(na_ax - 1, fmax(0, pz)); const double rr = hypot(py - cy[ai], px - cx[ai]) * um;
+                dd[ndet++] = (score_rec){(float)d, (uint8_t)zi, (uint8_t)fmin(255, rr / 250)};   /* radius in 250 um bins */
+            }
+        }
+    }
+    free(codes); free(U);
+    size_t best = 0; int bi = 0;
+    for (int k = 0; k < NB; k++) { size_t sacc = 0; for (int e = -18; e <= 18; e++) sacc += hist[(k + e + NB) % NB]; if (sacc > best) { best = sacc; bi = k; } }   /* +-0.25 turn window */
+    const double mode = (bi + 0.5) * 14.0 / NB;
+    size_t right = 0, close = 0; double mean = 0;
+    for (int k = 0; k < NF; k++) { double e = (k + 0.5) * 14.0 / NF - mode; e -= 14 * round(e / 14); if (fabs(e) < 0.5) { right += fine[k]; mean += e * fine[k]; } }
+    mean = right ? mean / right : 0;   /* the gauge refined to the mean error of the right voxels */
+    size_t *ah = calloc(NF / 28 + 1, sizeof(size_t));   /* |e| < 0.5 in 1/1024 turn bins */
+    for (int k = 0; k < NF; k++) { double e = (k + 0.5) * 14.0 / NF - mode - mean; e -= 14 * round(e / 14); close += fabs(e) < 0.08 ? fine[k] : 0; if (fabs(e) < 0.5) ah[(int)(fabs(e) * 1024)] += fine[k]; }
+    size_t na2 = 0; for (int k = 0; k <= NF / 28; k++) na2 += ah[k];
+    double med = 0, p90 = 0; { size_t c = 0; int got = 0; for (int k = 0; k <= NF / 28; k++) { c += ah[k]; if (!got && c * 2 >= na2) { med = (k + 0.5) / 1024; got = 1; } if (c * 10 >= na2 * 9) { p90 = (k + 0.5) / 1024; break; } } }
+    printf("fit score: %zu labelled voxels, gauge %.3f, winding ids right %.4f, |error| < 0.08 turn %.4f, |error| median %.3f p90 %.3f turn\n", nd, mode + mean,
+           nd ? (double)right / nd : 0, nd ? (double)close / nd : 0, na2 ? med : 0, na2 ? p90 : 0);
+    if (nan) printf("  %zu labelled voxels without U (%.4f of those in the box), not scored\n", nan, (double)nan / (nan + nd));
+    if (detail && ndet) {
+        size_t ie[8][9] = {{0}}, re[64][9] = {{0}};   /* integer error -4..4 by z octile / by 250 um radius bin (up to 16 mm) */
+        for (size_t i = 0; i < ndet; i++) {
+            double e = dd[i].d - mode - mean; e -= 14 * round(e / 14); const int k = (int)lround(e);
+            if (k < -4 || k > 4) continue;
+            ie[dd[i].z][k + 4]++; if (dd[i].r < 64) re[dd[i].r][k + 4]++;
+        }
+        printf("  integer error -2 -1 0 +1 +2 (fractions):\n");
+        for (int zb = 0; zb < 8; zb++) { size_t t = 0; for (int k = 0; k < 9; k++) t += ie[zb][k]; if (!t) continue;
+            printf("    z octile %d %9zu voxels: %.3f %.3f %.3f %.3f %.3f\n", zb, t, (double)ie[zb][2] / t, (double)ie[zb][3] / t, (double)ie[zb][4] / t, (double)ie[zb][5] / t, (double)ie[zb][6] / t); }
+        for (int rb = 0; rb < 64; rb += 2) { size_t t = 0, c[9] = {0}; for (int k = 0; k < 9; k++) { c[k] = re[rb][k] + (rb + 1 < 64 ? re[rb + 1][k] : 0); t += c[k]; } if (t < 1000) continue;
+            printf("    radius %5.1f-%4.1f mm %9zu voxels: %.3f %.3f %.3f %.3f %.3f\n", rb * 0.25, rb * 0.25 + 0.5, t, (double)c[2] / t, (double)c[3] / t, (double)c[4] / t, (double)c[5] / t, (double)c[6] / t); }
+    }
+    free(dd); free(ah); free(hist); free(fine);
+    return 0;
+}
+typedef struct { fit_set_dev *gd; const fit_set *fs; } fit_fill_ctx;
+static int fit_fill(void *c, const double og[3], const int64_t n3[3], double step, float *U) { fit_fill_ctx *f = c; return fit_set_grid(f->gd, f->fs, og, n3, step, 1, U); }
+
 static int cmd_fit(int argc, char **argv) {
     const char *dir = argv[2];
     fit_cfg c = fit_cfg_default();
@@ -498,74 +576,59 @@ static int cmd_fit(int argc, char **argv) {
     }
     const int ci = arg_index(argc, argv, "--codes");
     if (ci > 0 && ci + 2 < argc) {   /* score against the band codes of the box, streamed in label z-chunks (U on the GPU) */
-        store *s = store_open(argv[ci + 1]); z3 *z = z3_open(s, argv[ci + 2], nullptr);
+        z3 *z = z3_open(store_open(argv[ci + 1]), argv[ci + 2], nullptr);
         if (!z) { fprintf(stderr, "%s\n", z3_error()); return 1; }
         const double cf = atof(argv[ci + 2]) > 0 ? atof(argv[ci + 2]) / fb.um : 2;   /* label voxel in native voxels (the codes' key is its um: 4.8) */
-        int64_t lo[3], ln[3]; for (int d = 0; d < 3; d++) { lo[d] = (int64_t)floor(org[d] / cf); ln[d] = (int64_t)(shp[d] * h / cf); }
-        enum { NB = 14 * 72, NF = 14 * 1024 }; size_t *hist = calloc(NB, sizeof(size_t)), *fine = calloc(NF, sizeof(size_t)), nd = 0;   /* d = U - q mod 14: 1/72 and 1/1024 turn bins */
-        const int detail = arg_index(argc, argv, "--score-detail") > 0;   /* integer errors by z octile and by radius */
-        typedef struct { float d; uint8_t z, r; } score_rec; score_rec *dd = nullptr; size_t ndet = 0, dcap = 0;
-        const int na_ax = (int)(shp[0] * h) + 1;
         FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;   /* box-local z y x, U - q mod 14 per voxel */
-        const size_t plane = (size_t)ln[1] * ln[2]; int64_t zc = (int64_t)((32u << 20) / plane); if (zc < 1) zc = 1;
-        uint8_t *codes = malloc(zc * plane); float *U = malloc(zc * plane * 4);
         fit_set_dev *gd = fit_set_upload(fs); if (!gd) return 1;
-        for (int64_t z0 = 0; z0 < ln[0]; z0 += zc) {
-            const int64_t nz = ln[0] - z0 < zc ? ln[0] - z0 : zc;
-            const int64_t o3[3] = {lo[0] + z0, lo[1], lo[2]}, n3[3] = {nz, ln[1], ln[2]};
-            if (z3_read(z, o3, n3, codes, 8)) { fprintf(stderr, "fit: code read failed: %s\n", z3_error()); return 1; }
-            size_t any = 0; for (size_t i = 0; i < (size_t)nz * plane && !any; i++) any = codes[i] >= 1 && codes[i] <= 252;
-            if (!any) continue;
-            const double og[3] = {cf * o3[0] - 0.25 * cf - org[0], cf * lo[1] - 0.25 * cf - org[1], cf * lo[2] - 0.25 * cf - org[2]};   /* label voxel i at cf (i + lo + 1 / 4) - org */
-            if (fit_set_grid(gd, fs, og, n3, cf, 1, U)) { fprintf(stderr, "fit: no device memory for the score grid\n"); return 1; }
-            for (int64_t zz = 0; zz < nz; zz++) for (int64_t yy = 0; yy < ln[1]; yy++) for (int64_t xx = 0; xx < ln[2]; xx++) {
-                const size_t i = ((size_t)zz * ln[1] + yy) * ln[2] + xx; const uint8_t cd = codes[i];
-                if (cd < 1 || cd > 252) continue;
-                const double pz = cf * (zz + o3[0] + 0.25) - org[0], py = cf * (yy + lo[1] + 0.25) - org[1], px = cf * (xx + lo[2] + 0.25) - org[2];
-                if (pz < 0 || py < 0 || px < 0 || pz > shp[0] * h || py > shp[1] * h || px > shp[2] * h) continue;
-                double d = fmod(U[i] - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14; if (d >= 14) d = 0;
-                if (dump) { const float rec[4] = {(float)pz, (float)py, (float)px, (float)d}; if (fwrite(rec, 4, 4, dump) != 4) { fclose(dump); dump = nullptr; } }
-                hist[(int)(d / 14 * NB) % NB]++; fine[(int)(d / 14 * NF) % NF]++; nd++;
-                if (detail) {   /* d and the voxel's z / radius bins for the breakdown after the gauge is known */
-                    if (ndet == dcap) { dcap = dcap ? 2 * dcap : 1 << 20; dd = realloc(dd, dcap * sizeof *dd); }
-                    const int zi = (int)fmin(7, fmax(0, pz / (shp[0] * h) * 8));
-                    const int ai = (int)fmin(na_ax - 1, fmax(0, pz)); const double rr = hypot(py - fb.cy[ai], px - fb.cx[ai]) * fb.um;
-                    dd[ndet++] = (score_rec){(float)d, (uint8_t)zi, (uint8_t)fmin(255, rr / 250)};   /* radius in 250 um bins */
-                }
-            }
-        }
-        fit_set_dev_free(gd); free(codes); free(U);
-        size_t best = 0; int bi = 0;
-        for (int k = 0; k < NB; k++) { size_t sacc = 0; for (int e = -18; e <= 18; e++) sacc += hist[(k + e + NB) % NB]; if (sacc > best) { best = sacc; bi = k; } }   /* +-0.25 turn window */
-        const double mode = (bi + 0.5) * 14.0 / NB;
-        size_t right = 0, close = 0; double mean = 0;
-        for (int k = 0; k < NF; k++) { double e = (k + 0.5) * 14.0 / NF - mode; e -= 14 * round(e / 14); if (fabs(e) < 0.5) { right += fine[k]; mean += e * fine[k]; } }
-        mean = right ? mean / right : 0;   /* the gauge refined to the mean error of the right voxels */
-        size_t *ah = calloc(NF / 28 + 1, sizeof(size_t));   /* |e| < 0.5 in 1/1024 turn bins */
-        for (int k = 0; k < NF; k++) { double e = (k + 0.5) * 14.0 / NF - mode - mean; e -= 14 * round(e / 14); close += fabs(e) < 0.08 ? fine[k] : 0; if (fabs(e) < 0.5) ah[(int)(fabs(e) * 1024)] += fine[k]; }
-        size_t na2 = 0; for (int k = 0; k <= NF / 28; k++) na2 += ah[k];
-        double med = 0, p90 = 0; { size_t c = 0; int got = 0; for (int k = 0; k <= NF / 28; k++) { c += ah[k]; if (!got && c * 2 >= na2) { med = (k + 0.5) / 1024; got = 1; } if (c * 10 >= na2 * 9) { p90 = (k + 0.5) / 1024; break; } } }
-        printf("fit score: %zu labelled voxels, gauge %.3f, winding ids right %.4f, |error| < 0.08 turn %.4f, |error| median %.3f p90 %.3f turn\n", nd, mode + mean,
-               nd ? (double)right / nd : 0, nd ? (double)close / nd : 0, na2 ? med : 0, na2 ? p90 : 0);
-        if (detail && ndet) {
-            size_t ie[8][9] = {{0}}, re[64][9] = {{0}};   /* integer error -4..4 by z octile / by 250 um radius bin (up to 16 mm) */
-            for (size_t i = 0; i < ndet; i++) {
-                double e = dd[i].d - mode - mean; e -= 14 * round(e / 14); const int k = (int)lround(e);
-                if (k < -4 || k > 4) continue;
-                ie[dd[i].z][k + 4]++; if (dd[i].r < 64) re[dd[i].r][k + 4]++;
-            }
-            printf("  integer error -2 -1 0 +1 +2 (fractions):\n");
-            for (int zb = 0; zb < 8; zb++) { size_t t = 0; for (int k = 0; k < 9; k++) t += ie[zb][k]; if (!t) continue;
-                printf("    z octile %d %9zu voxels: %.3f %.3f %.3f %.3f %.3f\n", zb, t, (double)ie[zb][2] / t, (double)ie[zb][3] / t, (double)ie[zb][4] / t, (double)ie[zb][5] / t, (double)ie[zb][6] / t); }
-            for (int rb = 0; rb < 64; rb += 2) { size_t t = 0, c[9] = {0}; for (int k = 0; k < 9; k++) { c[k] = re[rb][k] + (rb + 1 < 64 ? re[rb + 1][k] : 0); t += c[k]; } if (t < 1000) continue;
-                printf("    radius %5.1f-%4.1f mm %9zu voxels: %.3f %.3f %.3f %.3f %.3f\n", rb * 0.25, rb * 0.25 + 0.5, t, (double)c[2] / t, (double)c[3] / t, (double)c[4] / t, (double)c[5] / t, (double)c[6] / t); }
-        }
-        free(dd);
-        free(ah); free(hist); free(fine);
-        z3_close(z); if (dump) fclose(dump);
+        fit_fill_ctx fc = {gd, fs};
+        const int rc = score_codes(z, cf, org, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, &fc);
+        fit_set_dev_free(gd); z3_close(z); if (dump) fclose(dump);
+        if (rc) return 1;
     }
     fit_set_free(fs); fit_fields_free(&fb);
     return 0;
+}
+
+/* ufsm wind-score <sweep-dir> <codes-root> <codes-key> [--score-detail 1] [--score-dump FILE]
+   The fitter's --codes score (score_codes) of a winding raster written by predict --cond-sweep: <sweep-dir>/U.f32 (float32 [z][y][x]
+   over the box, NaN where the sweep did not reach) and sweep.json (shape, origin_zyx and um of the box's level grid, scale = level
+   voxels per native 2.4 um voxel, axis). U is read at the voxel holding each label voxel; the same gauge, ids-right, |error| and
+   by-z / by-radius integer errors as fit --codes, plus the labelled voxels the sweep did not reach. */
+typedef struct { const float *U; int64_t n[3]; } raster_fill_ctx;
+static int raster_fill(void *c, const double og[3], const int64_t n3[3], double step, float *U) {
+    const raster_fill_ctx *r = c;
+    for (int64_t a = 0; a < n3[0]; a++) for (int64_t b = 0; b < n3[1]; b++) for (int64_t x = 0; x < n3[2]; x++) {
+        const int64_t iz = (int64_t)floor(og[0] + a * step), iy = (int64_t)floor(og[1] + b * step), ix = (int64_t)floor(og[2] + x * step);
+        U[((size_t)a * n3[1] + b) * n3[2] + x] = iz < 0 || iy < 0 || ix < 0 || iz >= r->n[0] || iy >= r->n[1] || ix >= r->n[2] ? NAN : r->U[((size_t)iz * r->n[1] + iy) * r->n[2] + ix];
+    }
+    return 0;
+}
+static int cmd_wind_score(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: ufsm wind-score <sweep-dir> <codes-root> <codes-key> [--score-detail 1] [--score-dump FILE]\n"); return 2; }
+    char p[1400]; snprintf(p, sizeof p, "%s/sweep.json", argv[2]);
+    FILE *f = fopen(p, "rb"); if (!f) { fprintf(stderr, "wind-score: cannot read %s\n", p); return 1; }
+    char jb[65536]; const size_t jn = fread(jb, 1, sizeof jb - 1, f); fclose(f); jb[jn] = 0;
+    json *j = json_parse(jb, jn); if (!j) { fprintf(stderr, "wind-score: bad %s\n", p); return 1; }
+    long long org[3]; int shp[3];
+    for (int d = 0; d < 3; d++) { org[d] = (long long)json_num(json_at(json_get(j, "origin_zyx"), d), 0); shp[d] = (int)json_num(json_at(json_get(j, "shape"), d), 0); }
+    const double um = json_num(json_get(j, "um"), 9.6), scale = json_num(json_get(j, "scale"), 4);
+    axis ax = {0};
+    if (axis_load(&ax, json_str(json_get(j, "axis"), ""))) { fprintf(stderr, "wind-score: cannot load the axis named in %s\n", p); json_free(j); return 1; }
+    json_free(j);
+    const size_t nv = (size_t)shp[0] * shp[1] * shp[2]; float *Ur = malloc(nv * 4);
+    snprintf(p, sizeof p, "%s/U.f32", argv[2]); f = fopen(p, "rb");
+    if (!Ur || !f || fread(Ur, 4, nv, f) != nv) { fprintf(stderr, "wind-score: cannot read %s (%zu values)\n", p, nv); if (f) fclose(f); return 1; }
+    fclose(f);
+    const int na = shp[0] + 1; float *cy = malloc((size_t)na * 4), *cx = malloc((size_t)na * 4);   /* the axis per box z, box-local level voxels */
+    for (int z = 0; z < na; z++) { double y, x; axis_at(&ax, (org[0] + z) * scale, &y, &x); cy[z] = (float)(y / scale - org[1]); cx[z] = (float)(x / scale - org[2]); }
+    z3 *zc = z3_open(store_open(argv[3]), argv[4], nullptr); if (!zc) { fprintf(stderr, "wind-score: %s\n", z3_error()); return 1; }
+    const double cf = atof(argv[4]) > 0 ? atof(argv[4]) / um : 2;
+    FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;
+    raster_fill_ctx rc = {Ur, {shp[0], shp[1], shp[2]}};
+    const int r = score_codes(zc, cf, org, shp, 1.0, um, cy, cx, atoi(opt(argc, argv, "--score-detail", "0")) > 0, dump, raster_fill, &rc);
+    z3_close(zc); if (dump) fclose(dump); free(Ur); free(cy); free(cx);
+    return r;
 }
 
 /* ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4] [--threads 16]
@@ -1523,6 +1586,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "void-pool")) return cmd_void_pool(argc, argv);
     if (!strcmp(cmd, "papyrus-labels")) return cmd_papyrus_labels(argc, argv);
     if (!strcmp(cmd, "overlay")) return cmd_overlay(argc, argv);
+    if (!strcmp(cmd, "wind-score")) return cmd_wind_score(argc, argv);
     if (argc < 4) return usage();
     const char *root = argv[2], *key = argv[3];
     const char *cache = opt(argc, argv, "--cache", nullptr);

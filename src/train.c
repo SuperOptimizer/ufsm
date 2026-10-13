@@ -51,6 +51,7 @@ typedef struct {
     uint8_t *sideb[2], *sdb, *sidet, *sidem, *sidew; float *sscratch, sout[5]; double side_loss;   /* --side: SIDE_* / PHASE_* labels, loss target / mask / weight */
     float *aff_fin, aff_out[48]; double aff_loss;
     uint8_t *pmb[2], *pm, *nt, *nm, *nw; float *iscratch, *nscratch, iout[3], nout[15]; double ink_loss, norm_loss;   /* task unwrap: papyrus mask (ink loss), normal / density targets, mask, weights; scratch and parts of the ink and normal losses */
+    uint8_t *wdb[2], *wd, *ct4, *cm4, *cw4; float *cscratch, cout4[9]; double cond_loss;   /* --cond: the gauge-shifted winding per voxel, its 4 targets, mask, weights; scratch and parts */
     void *x2, *glh, *lrt; float *lgf;  /* --half-res: the network's input and logit gradient, the intermediate grid (div 4), the full-resolution fp32 logits */
 } gpu_state;
 /* task band_affinity: output channel 0 = recto (dense loss on target channel 0), channels 1..K = affinities for g_aff_off */
@@ -68,7 +69,12 @@ static int g_side, g_side_ch, g_side_nc; static float g_side_lambda = 1.f;
 /* --task unwrap (B == 1): channel 0 recto (target 0, the label mask), 1 ink (target slot 1 = the source's "ink" prob teacher, BCE over
    all papyrus with dice g_ink_dice, times g_ink_lambda), 2-3 the winding phase (the --side 2 path), 4-9 the sign-free normal n n^T and
    10 the sheet density, both from the phase gradient over +-g_norm_s voxels (nn_unwrap_targets; BCE, times g_norm_lambda) */
-static int g_xc = 4;   /* input channels per sample: CT + radial (3), + the aux volume with --aux-input */
+static int g_xc = 4;   /* input channels per sample: CT + radial (3), + the aux volume with --aux-input, + 3 with --cond */
+/* --cond 1 (task unwrap): conditioned inference (predict --cond-sweep). Inputs 4-6 hold an earlier prediction of the winding mod 14
+   turns where one exists: cos and sin of 2 pi q' / 14 and a validity mask, q' = q + k with a random integer gauge k per sample;
+   outputs g_cond_ch.. +3 are cos / sin of 2 pi q' / 14 and 2 pi q' / 2 (soft BCE like the phase), so the net carries the gauge it
+   is handed across the window. The sampler draws the condition from the sources' "winding" raster (src/sample.c cond patterns) */
+static int g_cond, g_cond_ch; static float g_cond_lambda = 1.f;
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_scale = 32.f;
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
    (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */
@@ -122,7 +128,7 @@ static int g_Dl, g_h0; static uint8_t *g_zeros;
 static int g_xfmt = 0, g_g16 = 0;   /* input batches uploaded as 16-bit (1 fp16, 2 bf16); loss gradient written as 16-bit */
 static size_t xbytes(void) { return g_xfmt ? 2 : 4; }
 static const void *bx(const batch *b) { return g_xfmt ? (const void *)b->x16 : (const void *)b->x; }
-static void select_buf(gpu_state *d, int i) { d->cur = i; d->x = d->xb[i]; d->t = d->tb[i]; d->m = d->mb[i]; d->w = d->wb[i]; d->band = d->bandb[i]; d->sdb = d->sideb[i]; d->pm = d->pmb[i]; d->um = d->umb[i]; }
+static void select_buf(gpu_state *d, int i) { d->cur = i; d->x = d->xb[i]; d->t = d->tb[i]; d->m = d->mb[i]; d->w = d->wb[i]; d->band = d->bandb[i]; d->sdb = d->sideb[i]; d->pm = d->pmb[i]; d->wd = d->wdb[i]; d->um = d->umb[i]; }
 /* this GPU's z slab of a batch: rows of the [rows][P][P][P] arrays, planes [z0, z0 + g_Dl); mask halo planes from zeros */
 static void upload_slab(gpu_state *d, const batch *b, int i, int B, int P, int async) {
     void (*cp)(void *, const void *, size_t) = async ? nn_h2d_copy_stream : nn_h2d;
@@ -143,6 +149,7 @@ static void upload_slab(gpu_state *d, const batch *b, int i, int B, int P, int a
         if (d->side) { cp(pm, g_zeros, g_h0 * p2); cp(pm + g_h0 * p2, b->pm + n * p3 + (z0 + g_h0) * p2, own); }
         else { cp(pm, b->pm + n * p3, own); cp(pm + own, g_zeros, g_h0 * p2); }
     }
+    if (g_cond) for (int n = 0; n < B; n++) cp(d->wdb[i] + n * l3, b->wind + n * p3 + z0 * p2, l3);   /* (--cond excludes --split: whole windows) */
 }
 /* synchronous upload (pageable host memory: validation batches) */
 static void upload(gpu_state *d, const batch *b, int B, int P) {
@@ -158,6 +165,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     if (g_aff) nn_h2d(d->band, b->band, (size_t)B * p3);
     if (g_side) nn_h2d(d->sdb, b->side, (size_t)B * p3);
     if (g_unwrap) nn_h2d(d->pm, b->pm, (size_t)B * p3);
+    if (g_cond) nn_h2d(d->wd, b->wind, (size_t)B * p3);
 }
 /* asynchronous upload of a pinned sampler batch into buffer i on the copy stream, after the compute that last used it */
 static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
@@ -176,6 +184,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
         if (g_aff) nn_h2d_copy_stream(d->bandb[i], b->band, (size_t)B * p3);
         if (g_side) nn_h2d_copy_stream(d->sideb[i], b->side, (size_t)B * p3);
         if (g_unwrap) nn_h2d_copy_stream(d->pmb[i], b->pm, (size_t)B * p3);
+        if (g_cond) nn_h2d_copy_stream(d->wdb[i], b->wind, (size_t)B * p3);
     }
     nn_event_record(d->ev_up[i], 1);
 }
@@ -395,6 +404,14 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
                           train ? (float *)((char *)d->gl + g_norm_ch * l3 * eb) : nullptr, d->nscratch, nullptr);
         if (train && g_norm_lambda != 1.f) nn_loss_grad_scale((char *)d->gl + g_norm_ch * l3 * eb, 7 * l3, g_norm_lambda);
     }
+    if (g_cond) {   /* the winding mod 14 / mod 2 heads (unknown winding, and samples drawn without a condition, are masked) */
+        const size_t l3 = (size_t)os.d * os.h * os.w, eb = g_g16 ? 2 : 4, le = unet_logits_h16(d->u) ? 2 : 4;
+        nn_cond_targets(d->wd, l3, d->ct4, d->cm4);
+        const shape5 four = {1, 4, os.d, os.h, os.w};
+        nn_loss_async_tol((const float *)((const char *)lg + g_cond_ch * l3 * le), d->ct4, d->cm4, d->cw4, four, 0.f,
+                          train ? (float *)((char *)d->gl + g_cond_ch * l3 * eb) : nullptr, d->cscratch, nullptr);
+        if (train && g_cond_lambda != 1.f) nn_loss_grad_scale((char *)d->gl + g_cond_ch * l3 * eb, 4 * l3, g_cond_lambda);
+    }
     sheet_objective(d,os,P,train);
     if (g_half && train) nn_lowres_grad(d->gl, g_g16, hs, g_hdiv, hm, d->lrt, d->glh);   /* the logit gradient on the network's grid */
     if (prof) nn_prof_end();
@@ -413,6 +430,11 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
         nn_loss_fetch(d->nscratch, (shape5){1, 7, 1, 1, 1}, d->nout);
         float nb = 0; for (int c = 0; c < 7; c++) nb += d->nout[c];
         d->norm_loss = g_norm_lambda * nb / 7;
+    }
+    d->cond_loss = 0;
+    if (g_cond) {   /* mean bce over the 4 winding channels, times lambda */
+        nn_loss_fetch(d->cscratch, (shape5){1, 4, 1, 1, 1}, d->cout4);
+        d->cond_loss = g_cond_lambda * (d->cout4[0] + d->cout4[1] + d->cout4[2] + d->cout4[3]) / 4;
     }
     d->aff_loss = 0;
     if (g_aff) {   /* mean over the affinity channels of bce + dice_w dice, times lambda */
@@ -438,7 +460,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     double loss = 0; int active = 0;
     if (g_aff || g_unwrap) cout = NCH;
     for (int c = 0; c < cout; c++) if (out[c] > 0 || out[cout + c] > 0) { loss += out[c] + dice_w * out[cout + c]; active++; }
-    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss+d->verso_loss+d->side_loss+d->ink_loss+d->norm_loss;
+    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss+d->verso_loss+d->side_loss+d->ink_loss+d->norm_loss+d->cond_loss;
 }
 
 /* --split z: forward, loss and backward of one window on both GPUs (src/split.h) */
@@ -548,6 +570,13 @@ int cmd_train(int argc, char **argv) {
         g_norm_ch = g_cout; g_cout += 7;
         fprintf(stderr, "unwrap: channels 0 recto, 1 ink (lambda %g, dice %g), %d-%d phase, %d-%d normal n n^T, %d density (lambda %g, step %d)\n",
                 g_ink_lambda, g_ink_dice, g_side_ch, g_side_ch + 1, g_norm_ch, g_norm_ch + 5, g_norm_ch + 6, g_norm_lambda, g_norm_s);
+    }
+    g_cond = atoi(opt(argc, argv, "--cond", "0")); g_cond_lambda = (float)atof(opt(argc, argv, "--cond-lambda", "1"));
+    if (g_cond) {
+        if (!g_unwrap || B != 1) { fprintf(stderr, "--cond: task unwrap, B 1\n"); return 2; }
+        g_cond_ch = g_cout; g_cout += 4;
+        fprintf(stderr, "cond: inputs 4-6 the winding mod 14 condition (cos, sin, mask), outputs %d-%d cos / sin of 2 pi q / 14 and 2 pi q / 2 (lambda %g)\n",
+                g_cond_ch, g_cond_ch + 3, g_cond_lambda);
     }
     g_papyrus = !strcmp(task, "papyrus");
     if (g_papyrus && (geometry || g_verso || g_side || g_unwrap)) { fprintf(stderr, "--task papyrus: no geometry, verso, side or unwrap\n"); return 2; }
@@ -669,11 +698,16 @@ int cmd_train(int argc, char **argv) {
     }
     {   /* --aux-input 1: a fifth input channel from each source's aux volume (src/sources.h; e.g. the papyrus void fraction pooled
            from 2.4 um, which keeps the packed gaps a 9.6 um CT averages away); the checkpoint's cin decides on resume */
-        g_xc = atoi(opt(argc, argv, "--aux-input", "0")) ? 5 : 4;
-        if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && !pc.half_res) g_xc = pc.cin == 5 ? 5 : 4; }
+        g_xc = atoi(opt(argc, argv, "--aux-input", "0")) ? 5 : g_cond ? 7 : 4;
+        if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && !pc.half_res) g_xc = pc.cin == 5 || pc.cin == 7 ? pc.cin : 4; }
         if (g_xc == 5) {
-            if (g_half || split || g_sheet) { fprintf(stderr, "--aux-input: not with --half-res, --split or winding geometry\n"); return 2; }
+            if (g_half || split || g_sheet || g_cond) { fprintf(stderr, "--aux-input: not with --half-res, --split, --cond or winding geometry\n"); return 2; }
             cfg.cin = 5; fprintf(stderr, "inputs: CT, radial (3), aux (sources' \"aux\" volumes)\n");
+        }
+        if ((g_xc == 7) != (g_cond != 0)) { fprintf(stderr, "--cond: the checkpoint's inputs (%d) and --cond %d disagree\n", g_xc, g_cond); return 2; }
+        if (g_cond) {
+            if (g_half || split || g_sheet) { fprintf(stderr, "--cond: not with --half-res, --split or winding geometry\n"); return 2; }
+            cfg.cin = 7; fprintf(stderr, "inputs: CT, radial (3), winding condition (cos, sin, mask)\n");
         }
     }
     const int nl = split ? 1 : ng;   /* windows per step (loss averaging, samples / s) */
@@ -689,7 +723,7 @@ int cmd_train(int argc, char **argv) {
     if (atoi(opt(argc, argv, "--rotonly", "0"))) sc.augment = 2;   /* proper rotations only (no reflections) */
     if (atoi(opt(argc, argv, "--zfix", "0"))) sc.augment = 3;      /* diagnostic: symmetries that keep the z axis */
     if (atoi(opt(argc, argv, "--intonly", "0"))) sc.augment = 4;   /* diagnostic: intensity jitter, no symmetry */
-    sc.aux = g_xc == 5;
+    sc.aux = g_xc == 5; sc.cond = g_cond;
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
     sc.papyrus = g_papyrus ? &g_pap : nullptr;
     sc.phase_dense = atoi(opt(argc, argv, "--phase-dense", "0"));   /* side 2: weigh windings closer than this (label voxels) up */
@@ -912,7 +946,7 @@ int cmd_train(int argc, char **argv) {
                 size_t trainer = nbuf * ((size_t)B * g_xc * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
                 if (cand[c].lean) trainer = (cand[c].gmx ? 0 : (size_t)B * g_xc * p3 * xbytes())   /* batch buffers inside the gradient buffer B (estimate) */
                                             + (g_cout > NCH ? (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) : 0);   /* > 2 outputs (affinities, verso): the logit gradient may not fit beside the logits */
-                need = tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (size_t)15 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                need = tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (size_t)15 * B * p3 : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (need <= fmin) pick = c;
             }
             if (pick < 0) { pick = auto16 ? nc - 1 : 7; /* the smallest mode of the list */ fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
@@ -987,6 +1021,12 @@ int cmd_train(int argc, char **argv) {
             d->iscratch = nn_malloc(nn_loss_scratch((shape5){1, 1, P, P, P}) + 64);
             d->nscratch = nn_malloc(nn_loss_scratch((shape5){1, 7, P, P, P}) + 64);
         }
+        if (g_cond) {
+            d->wdb[0] = nn_malloc((size_t)B * p3); d->wdb[1] = lean ? d->wdb[0] : nn_malloc((size_t)B * p3); d->wd = d->wdb[d->cur];
+            d->ct4 = nn_malloc((size_t)4 * B * p3); d->cm4 = nn_malloc((size_t)B * p3);
+            d->cw4 = nn_malloc(4); static const uint8_t four_w[4] = {1, 1, 1, 1}; nn_h2d(d->cw4, four_w, 4);
+            d->cscratch = nn_malloc(nn_loss_scratch((shape5){1, 4, P, P, P}) + 64);
+        }
         d->scratch = nn_malloc(nn_loss_scratch((shape5){B, NCH, P, P, P}) + 64);
         d->tolc = nn_get_loss_tol() ? nn_malloc((size_t)B * p3) : nullptr;
         d->lean = lean;
@@ -1038,6 +1078,11 @@ int cmd_train(int argc, char **argv) {
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
         snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"unwrap\":{\"version\":1,\"channels\":{\"recto\":0,\"ink\":1,\"phase\":[%d,%d],\"normal\":[%d,%d,%d,%d,%d,%d],\"density\":%d},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"min(1, density_scale rho), rho = |grad phase| turns per voxel\",\"density_scale\":%.9g,\"ink_lambda\":%.9g,\"ink_dice\":%.9g,\"normal_lambda\":%.9g,\"normal_step\":%d}}",
                  g_side_ch,g_side_ch+1,g_norm_ch,g_norm_ch+1,g_norm_ch+2,g_norm_ch+3,g_norm_ch+4,g_norm_ch+5,g_norm_ch+6,g_dens_scale,g_ink_lambda,g_ink_dice,g_norm_lambda,g_norm_s);
+        if (g_cond) {   /* conditioned inference (predict --cond-sweep): inside the unwrap object */
+            n=strlen(runtime_extra); runtime_extra[n-2]=0;
+            snprintf(runtime_extra+n-2,sizeof runtime_extra-n+2,",\"cond\":{\"version\":1,\"inputs\":[4,5,6],\"input\":\"cos, sin of 2 pi q / 14, mask\",\"channels\":[%d,%d,%d,%d],\"periods\":[14,2],\"lambda\":%.9g}}}",
+                     g_cond_ch,g_cond_ch+1,g_cond_ch+2,g_cond_ch+3,g_cond_lambda);
+        }
     }
     if (g_sheet) {
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
@@ -1091,6 +1136,7 @@ int cmd_train(int argc, char **argv) {
         if (g_aff) { val[i].band = malloc((size_t)B * p3); memcpy(val[i].band, b->band, (size_t)B * p3); }
         if (g_side) { val[i].side = malloc((size_t)B * p3); memcpy(val[i].side, b->side, (size_t)B * p3); }
         if (g_unwrap) { val[i].pm = malloc((size_t)B * p3); memcpy(val[i].pm, b->pm, (size_t)B * p3); }
+        if (g_cond) { val[i].wind = malloc((size_t)B * p3); memcpy(val[i].wind, b->wind, (size_t)B * p3); }
         val[i].sheet=calloc((size_t)B,sizeof *val[i].sheet); val[i].sheet[0]=sheet_clone(b->sheet?b->sheet[0]:nullptr);
         sampler_release(vs, b);
     }
@@ -1120,7 +1166,7 @@ int cmd_train(int argc, char **argv) {
     int committed_step = step0, training_failed = 0;
     double best_val = 1e30; int nskip = 0; (void)nskip;
     float parts[8][2 * NCH + 1];
-    double acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0;   /* verso channel, side channel */
+    double acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0;   /* verso channel, side channel; --cond */
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
         g_verso_on = g_verso && step >= g_verso_start;
         { uint64_t h = (uint64_t)step * 0x9E3779B97F4A7C15ull + (uint64_t)seed; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
@@ -1294,6 +1340,7 @@ int cmd_train(int argc, char **argv) {
         if (g_verso_on) { acc_vbce += G[0].vout[0]; acc_vdice += G[0].vout[1]; }
         if (g_side) acc_side += G[0].sout[0];
         if (g_unwrap) { acc_ink += G[0].iout[0]; acc_norm += G[0].norm_loss / (g_norm_lambda ? g_norm_lambda : 1.f); }
+        if (g_cond) acc_cond += G[0].cond_loss / (g_cond_lambda ? g_cond_lambda : 1.f);
         if (step % log_every == 0 || step == steps || g_stop) {
             double dt = now() - tlog;
             double vl = -1, vb = 0, vd = 0;
@@ -1329,13 +1376,14 @@ int cmd_train(int argc, char **argv) {
             if (g_verso) snprintf(affs, 64, " verso bce %.4f dice %.4f", acc_vbce / nacc, acc_vdice / nacc);
             if (g_side) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " %s bce %.4f", g_side == 2 ? "phase" : "side", acc_side / nacc); }
             if (g_unwrap) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f normal bce %.4f", acc_ink / nacc, acc_norm / nacc); }
+            if (g_cond) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " cond bce %.4f", acc_cond / nacc); }
             if (g_aff) { const float *a = G[0].aff_out; size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " aff %.4f (d1 bce %.3f dice %.3f | d8 bce %.3f dice %.3f)", G[0].aff_loss,
                                     (a[0] + a[6] + a[12]) / 3, (a[1] + a[7] + a[13]) / 3, (a[18] + a[24] + a[30]) / 3, (a[19] + a[25] + a[31]) / 3); }
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %s %.2f samp/s (wait %.0f%%)%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, affs, acc_g / nacc,
                     vl >= 0 ? "val" : "", (double)nacc * B * nl / dt, 100 * wait / dt, vl >= 0 ? vstr : "");
             if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, active, acc_g / nacc, vstr, (double)nacc * B * nl / dt, wait); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
-            acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = 0; nacc = 0; tlog = now(); wait = 0;
+            acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = 0; nacc = 0; tlog = now(); wait = 0;
         }
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);

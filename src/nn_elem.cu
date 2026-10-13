@@ -396,6 +396,70 @@ __global__ void phase_tg_k(const uint8_t *ph, size_t n, uint8_t *t, uint8_t *m) 
     t[i] = (uint8_t)__float2int_rn(127.5f + 127.5f * cs); t[n + i] = (uint8_t)__float2int_rn(127.5f + 127.5f * sn); m[i] = 1;
 }
 extern "C" void nn_phase_targets(const uint8_t *phase, size_t n, uint8_t *t, uint8_t *m) { phase_tg_k<<<nblk(n, 256), 256>>>(phase, n, t, m); KCHECK(); }
+/* --cond: the winding mod 14 turns in 1/18-turn steps (band.h band_winding, 0..251, 255 unknown) -> 4 target planes, cos / sin of
+   2 pi q / 14 and of 2 pi q / 2 (q = v / 18 turns), each 127.5 + 127.5 x; mask = known */
+__global__ void cond_tg_k(const uint8_t *wv, size_t n, uint8_t *t, uint8_t *m) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint8_t v = wv[i];
+    if (v >= 252) { t[i] = t[n + i] = t[2 * n + i] = t[3 * n + i] = 0; m[i] = 0; return; }
+    float s14, c14, s2, c2;
+    sincospif((float)v / 126.f, &s14, &c14);              /* 2 pi (v / 18) / 14 */
+    sincospif((float)(v % 36) / 18.f, &s2, &c2);          /* 2 pi (v / 18) / 2, period 36 steps */
+    t[i] = (uint8_t)__float2int_rn(127.5f + 127.5f * c14); t[n + i] = (uint8_t)__float2int_rn(127.5f + 127.5f * s14);
+    t[2 * n + i] = (uint8_t)__float2int_rn(127.5f + 127.5f * c2); t[3 * n + i] = (uint8_t)__float2int_rn(127.5f + 127.5f * s2);
+    m[i] = 1;
+}
+extern "C" void nn_cond_targets(const uint8_t *wind, size_t n, uint8_t *t, uint8_t *m) { cond_tg_k<<<nblk(n, 256), 256>>>(wind, n, t, m); KCHECK(); }
+/* predict --cond-sweep (src/sweep.c). The box canvas (N voxels, planar): c14[0..N) / [N..2N) the 14-turn phasor and p1 the 1-turn phase
+   as 127.5 + 127.5 (2 sigmoid - 1), recto 255 sigmoid, done 0 (not yet predicted), 1 (papyrus: CT > 0), 2 (air).
+   gather: the condition inputs 4-6 of a window at box offset o (window voxel k at o + k): where the voxel lies in the box, is done
+   papyrus and its own CT is nonzero, the unit vector of its 14-turn phasor and 1; else 0, 0, 0 (what train --cond shows) */
+template <typename HT> __global__ void cond_gather_k(const uint8_t *c14, const uint8_t *done, const uint8_t *ct, int W, int oz, int oy, int ox, int bz, int by, int bx, size_t N, HT *x) {
+    const size_t w3 = (size_t)W * W * W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= w3) return;
+    const int xx = (int)(i % W), yy = (int)((i / W) % W), zz = (int)(i / ((size_t)W * W));
+    const int gz = oz + zz, gy = oy + yy, gx = ox + xx;
+    float c = 0.f, s = 0.f, m = 0.f;
+    if (ct[i] && gz >= 0 && gy >= 0 && gx >= 0 && gz < bz && gy < by && gx < bx) {
+        const size_t g = ((size_t)gz * by + gy) * bx + gx;
+        if (done[g] == 1) {
+            const float cc = (c14[g] - 127.5f) * (1.f / 127.5f), ss = (c14[N + g] - 127.5f) * (1.f / 127.5f), r = sqrtf(cc * cc + ss * ss);
+            if (r > 1e-3f) { c = cc / r; s = ss / r; m = 1.f; }
+        }
+    }
+    x[4 * w3 + i] = f2h<HT>(c); x[5 * w3 + i] = f2h<HT>(s); x[6 * w3 + i] = f2h<HT>(m);
+}
+extern "C" void nn_cond_gather(const uint8_t *c14, const uint8_t *done, const uint8_t *ct, int W, int oz, int oy, int ox, int bz, int by, int bx, size_t N, void *x, int h16) {
+    const size_t w3 = (size_t)W * W * W;
+    if (!h16) cond_gather_k<float><<<nblk(w3, 256), 256>>>(c14, done, ct, W, oz, oy, ox, bz, by, bx, N, (float *)x);
+    else if (g_h16) cond_gather_k<f16><<<nblk(w3, 256), 256>>>(c14, done, ct, W, oz, oy, ox, bz, by, bx, N, (f16 *)x);
+    else cond_gather_k<bf16><<<nblk(w3, 256), 256>>>(c14, done, ct, W, oz, oy, ox, bz, by, bx, N, (bf16 *)x);
+    KCHECK();
+}
+/* place: the window interior [halo, W - halo)^3 inside the box, where not done yet, from the fp32 logits [c][W^3] (channels 0 recto,
+   2-3 the 1-turn phase, ch14 / ch14 + 1 the 14-turn phasor); done = 1 or 2 by the window's CT */
+__global__ void cond_place_k(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int bz, int by, int bx, size_t N, int ch14,
+                             uint8_t *c14, uint8_t *p1, uint8_t *recto, uint8_t *done) {
+    const int I = W - 2 * halo; const size_t i3 = (size_t)I * I * I, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= i3) return;
+    const int xx = halo + (int)(i % I), yy = halo + (int)((i / I) % I), zz = halo + (int)(i / ((size_t)I * I));
+    const int gz = oz + zz, gy = oy + yy, gx = ox + xx;
+    if (gz < 0 || gy < 0 || gx < 0 || gz >= bz || gy >= by || gx >= bx) return;
+    const size_t g = ((size_t)gz * by + gy) * bx + gx, w3 = (size_t)W * W * W, k = ((size_t)zz * W + yy) * W + xx;
+    if (done[g]) return;
+    #define SIG2(c) (2.f / (1.f + __expf(-lg[(size_t)(c) * w3 + k])) - 1.f)
+    c14[g] = (uint8_t)__float2int_rn(127.5f + 127.5f * SIG2(ch14)); c14[N + g] = (uint8_t)__float2int_rn(127.5f + 127.5f * SIG2(ch14 + 1));
+    p1[g] = (uint8_t)__float2int_rn(127.5f + 127.5f * SIG2(2)); p1[N + g] = (uint8_t)__float2int_rn(127.5f + 127.5f * SIG2(3));
+    recto[g] = (uint8_t)__float2int_rn(127.5f + 127.5f * SIG2(0));
+    #undef SIG2
+    done[g] = ct[k] ? 1 : 2;
+}
+extern "C" void nn_cond_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int bz, int by, int bx, size_t N, int ch14,
+                              uint8_t *c14, uint8_t *p1, uint8_t *recto, uint8_t *done) {
+    const int I = W - 2 * halo; const size_t i3 = (size_t)I * I * I;
+    cond_place_k<<<nblk(i3, 256), 256>>>(lg, ct, W, halo, oz, oy, ox, bz, by, bx, N, ch14, c14, p1, recto, done); KCHECK();
+}
 /* task unwrap: the winding-phase gradient by wrap-aware central differences over +-s voxels (all of v, v +- s e_d known):
    g = dphase / dx in turns per voxel, rho = |g| (the sheet density, 1 / spacing), n = g / rho. Targets (x255) in 7 planes of n
    voxels: n_z^2, n_y^2, n_x^2, 0.5 + n_z n_y, 0.5 + n_z n_x, 0.5 + n_y n_x (sign-free n n^T), min(1, dscale rho); mask = all known

@@ -350,6 +350,28 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
   nearly all papyrus, 40% nearly all void, 16% partly void (the sub-voxel gaps). A 96k-step 9.6 um run on it is the test; it is
   not deployable for 9 um-only scans (it needs a 2.4 um scan), so it measures how much a 9.6 um student could gain from 2.4 um
   information (the plan: a 2.4 um teacher on the desk, distilled to 9.6 um).
+- Aux input result (24 blocks, 96k steps, papyrus void fraction as the fifth input): B 42.1%, A 69.8% winding ids (baseline
+  53.5% / 46.7%; the fitter flips between two states, so these move with it), but packed-region gross phase errors are unchanged
+  (30.2% where sheets are < 100 um apart, baseline 29%) and so is the radial drift: the void-fraction input does not fix the phase.
+- Conditioned inference (2026-10-12, user: keep to in-window relative reasoning, no cascade or whole-scroll net). A window knows
+  winding only up to an integer; the fitter stitches windows globally and drifts. Instead windows run in sequence and each gets
+  the earlier windows' winding where they reached it, so one gauge is carried across the box.
+  - Ground truth beyond one turn: the published band codes are q mod 14 at 1/18 turn (q = sheet + theta / 2 pi, the mesh
+    coordinate); per voxel q mod 14 = band - 9 + phase / 14 steps (band.h band_winding; `phase-raster --winding 1`). On B it
+    agrees with the stored 1-turn phase as frac(q - phase - theta / 2 pi) ~ 0: mean 0.047 turn (the codes' 1/18-turn steps).
+  - `train --cond 1` (task unwrap): inputs 4-6 = cos, sin of 2 pi q' / 14 and a mask (the stem takes at most 8 inputs);
+    outputs 11-14 = cos / sin of 2 pi q' / 14 and 2 pi q' / 2, q' = q + a random integer gauge per sample. The sampler draws the
+    condition in the output frame: none (10%, the gauge heads unsupervised), a 4-12 voxel seed cube (15%), else face slabs
+    (each axis with p 0.5, thickness P/8..P/2, low face 75%), dropout cubes, smooth 0.03-turn angle noise. Sources: "winding"
+    next to the stored phase. Warm start: `--init-from --head-map` now grows the inputs (unet_init_from_map: the stem's new
+    input weights zero, so the net computes the donor's function; test_checkpoint).
+  - `predict --cond-sweep DIR` (src/sweep.c): windows in one z, y, x raster (W 128, halo 32 at 9.6 um), a device canvas of the
+    box (14-turn phasor, 1-turn phase, recto, done: 6 B / voxel), the condition gathered from it, interiors placed into it. Seed:
+    the first window's most confident papyrus voxel, a 4^3 cube at gauge 0 from its phase + theta / 2 pi, then that window again,
+    conditioned. Then q mod 14 = the 14-turn phasor snapped to phase + dir theta / 2 pi, flood-unwrapped from the seed (period 14,
+    16 confidence buckets) into U.f32. `ufsm wind-score` scores it exactly as `fit --codes` (the scoring is now one function,
+    score_codes, fed by the fitter or by a raster; byte-identical fit output). test_sweep: a 26-turn spiral with +-0.35 turn of
+    noise on the 14-turn phasor unwraps to within 0.0014 turn.
 - Papyrus gap labels, no cutoff (`train --task papyrus --pap-local R`, default off; src/papyrus.h papyrus_local). A random
   cutoff without conditioning only teaches P(s > t) averaged over t, a smoothed CT (one effective cutoff, ~89); conditioning
   makes the cutoff a dial. The user: a voxel is papyrus or not, the cutoffs only exist because the CT is not bimodal. Rule:

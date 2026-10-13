@@ -93,6 +93,25 @@ int main(void) {
         const uint8_t a = phase[((size_t)z * NY + (int)YC) * NX + xr - 1], b = phase[((size_t)z * NY + (int)YC) * NX + xr];
         CHECK(a > PHASE_PERIOD * 0.85 && a < PHASE_PERIOD && b == 0, "shell %d: phase %d -> %d going outward (want ~1 -> 0)", k, a, b);
     }
+    /* winding mod 14 (band_winding, what phase-raster --winding writes): turn[j] + the fraction to the next shell, in 1/18 turns,
+       on shells numbered 11.. so the 14-turn wrap is crossed (11, 12, 13, 14 = 0, 15 = 1) */
+    { int turn3[NSH] = {11, 12, 13, 14, 15}; size_t wk = 0, wbad = 0;
+      shells(codes, turn3);
+      CHECK(!band_field_phase(codes, n, o, cy, cx, bp, band, phase, nullptr), "band_field_phase failed (winding)");
+      for (int z = 0; z < NZ; z++) for (int y = 0; y < NY; y++) for (int x = 0; x < NX; x++) {
+          const size_t i = ((size_t)z * NY + y) * NX + x; const uint8_t w = band_winding(band[i], phase[i]);
+          if ((w == PHASE_UNKNOWN) != (phase[i] == PHASE_UNKNOWN)) { wbad++; continue; }
+          if (w == PHASE_UNKNOWN) continue;
+          const double r = hypot(y - YC, x - XC), q = 11 + (r - R0) / PITCH;   /* the true winding, turns */
+          if (r < R0 + 1 || r > R0 + (NSH - 1) * PITCH - 1) continue;
+          wk++;
+          const int dq = band_diff(w, (int)lround(q * BAND_STEPS) % BAND_PERIOD);
+          if (abs(dq) > 2) wbad++;
+      }
+      CHECK(wk > 1000 && !wbad, "winding mod 14: %zu of %zu voxels more than 2/18 turn off", wbad, wk);
+      CHECK(band_winding(BAND_UNKNOWN, 0) == PHASE_UNKNOWN && band_winding(9, PHASE_UNKNOWN) == PHASE_UNKNOWN, "unknown band / phase");
+      CHECK(band_winding(9, 0) == 0 && band_winding(9 + 18 * 13, 251) == 0 && band_winding(9 + 18 * 13, 126) == 18 * 13 + 9, "winding encoding"); }
+
     shells(codes, turn2);
     CHECK(!band_field_phase(codes, n, o, cy, cx, bp, band, phase, nullptr), "band_field_phase failed (missing wrap)");
     CHECK(phase[((size_t)2 * NY + (int)YC) * NX + xm] == PHASE_UNKNOWN, "a missing wrap must leave the phase unknown");

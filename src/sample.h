@@ -48,6 +48,9 @@ typedef struct {
                                 batch.x / x16 then hold 5 channels per sample */
     int pmask;               /* 1: fill batch.pm, the papyrus mask (CT > 0, symmetry applied) for heads whose loss covers all papyrus
                                 (task unwrap: ink) */
+    int cond;                /* 1 (train --cond): inputs 4-6 hold a condition drawn from the source's winding raster (cos, sin of
+                                2 pi q' / 14, mask; q' = q + a random gauge k per sample, in a random pattern of the output frame) and
+                                batch.wind the gauge-shifted winding for the targets (all unknown when no condition was drawn) */
     int phase_dense;         /* side 2: > 0 keeps a phase voxel whose windings lie more than phase_dense label voxels apart with probability
                                 phase_dense / spacing (position hash): denser windings weigh more in the loss */
     const struct papyrus_cfg *papyrus; /* task papyrus (src/papyrus.h; nullptr = off): no target reads; channel 0 = papyrus labels from the
@@ -69,6 +72,7 @@ typedef struct {
     uint8_t *band;           /* B x P^3 band per voxel (src/band.h: 1/18-turn steps mod 252, 255 unknown) when cfg.band */
     uint8_t *side;           /* B x P^3 side (src/band.h SIDE_*) or winding phase (PHASE_*) per voxel when cfg.side */
     uint8_t *pm;             /* B x P^3 papyrus mask (1 where CT > 0) when cfg.pmask */
+    uint8_t *wind;           /* B x P^3 winding mod 14 + gauge (band.h band_winding encoding, 255 unknown) when cfg.cond */
 } batch;
 
 typedef struct sampler sampler;
@@ -92,3 +96,6 @@ sample_cfg sample_cfg_default(void);
 
 /* Pool a uint8 cube by 2 (mean); out has edge n/2. Exposed for tests. */
 void pool2_u8(const uint8_t *in, int n, uint8_t *out);
+/* --cond: one sample's condition and gauge-shifted winding (src/sample.c cond_draw) with an rng seeded by seed; X: 7 x P^3 floats,
+   inputs 4-6 written. Exposed for tests. */
+void sample_cond_draw(uint64_t seed, int P, const uint8_t *w, uint8_t *wout, float *X);

@@ -37,3 +37,12 @@ int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], c
 
 /* modular difference of band / winding steps in (-126, 126] */
 static inline int band_diff(int a, int b) { int d = ((a - b + 126) % 252 + 252) % 252; return d - 126; }
+
+/* The winding mod 14 turns of a voxel in BAND_STEPS per turn, in the phase encoding (0..251, PHASE_UNKNOWN unknown), from its
+   band (the winding of the recto inward of it + BAND_HALF) and its phase (the fraction of the way to the next recto outward x
+   PHASE_PERIOD): (band - BAND_HALF + phase / 14) mod 252. What ufsm phase-raster --winding writes. */
+static inline uint8_t band_winding(uint8_t band, uint8_t phase) {
+    if (band == BAND_UNKNOWN || phase == PHASE_UNKNOWN) return PHASE_UNKNOWN;
+    const int w = (int)band - BAND_HALF + ((int)phase * BAND_STEPS + PHASE_PERIOD / 2) / PHASE_PERIOD;
+    return (uint8_t)(((w % BAND_PERIOD) + BAND_PERIOD) % BAND_PERIOD);
+}

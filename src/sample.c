@@ -128,7 +128,7 @@ static size_t P3(const sampler *sp) { return (size_t)sp->cfg.P * sp->cfg.P * sp-
 static batch alloc_batch(const sample_cfg *c) {
     size_t p3 = (size_t)c->P * c->P * c->P;
     batch b;
-    const size_t xc = 4 + (c->aux != 0);   /* input channels per sample */
+    const size_t xc = 4 + (c->aux != 0) + (c->cond ? 3 : 0);   /* input channels per sample */
     b.x = c->xfmt ? nullptr : nn_host_alloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
     b.x16 = c->xfmt ? nn_host_alloc((size_t)c->B * xc * p3 * 2) : nullptr;
     b.t = nn_host_alloc((size_t)c->B * NCH * p3);
@@ -142,10 +142,11 @@ static batch alloc_batch(const sample_cfg *c) {
     b.band = c->band ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     b.side = c->side ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     b.pm = c->pmask ? nn_host_alloc((size_t)c->B * p3) : nullptr;
+    b.wind = c->cond ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b) { if (b->band) nn_host_free(b->band); if (b->side) nn_host_free(b->side); if (b->pm) nn_host_free(b->pm); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->wind) nn_host_free(b->wind); if (b->band) nn_host_free(b->band); if (b->side) nn_host_free(b->side); if (b->pm) nn_host_free(b->pm); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -613,9 +614,9 @@ static void u8_stats(const uint8_t *a, size_t n, size_t *nz, double *sum, double
 }
 /* the stored phase (src/sources.h source.phase) of a window of the sample's level: shift 1 nearest-upsampled from the grid one
    level coarser (the label grid for native windows) as band_window does, shift 0 read directly */
-static int phase_window(source *s, const int64_t o[3], int P, int shift, uint8_t *side) {
+static int phase_window(z3 *a, const int64_t o[3], int P, int shift, uint8_t *side) {   /* a: s->phase, or s->wind (same grid) */
     int64_t lo[3], ln[3], ro[3], rn[3];
-    const z3_meta *m = z3_meta_of(s->phase);
+    const z3_meta *m = z3_meta_of(a);
     for (int d = 0; d < 3; d++) {
         lo[d] = (o[d] + shift) >> shift; ln[d] = ((o[d] + P - 1 + shift) >> shift) - lo[d] + 1;
         ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
@@ -626,7 +627,7 @@ static int phase_window(source *s, const int64_t o[3], int P, int shift, uint8_t
     memset(ph, PHASE_UNKNOWN, N);
     if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
         uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
-        if (!tmp || z3_read(s->phase, ro, rn, tmp, 1)) { free(tmp); free(ph); return -1; }
+        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { free(tmp); free(ph); return -1; }
         for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
             memcpy(ph + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
         free(tmp);
@@ -651,6 +652,61 @@ static int aux_window(source *s, const int64_t o[3], int P, uint8_t *dst) {
     free(tmp);
     return 0;
 }
+
+static double rnorm(rng *r) { double u1 = runif(r); const double u2 = runif(r); if (u1 < 1e-300) u1 = 1e-300; return sqrt(-2 * log(u1)) * cos(2 * M_PI * u2); }
+static inline void put_x(float *X, uint16_t *H, int xfmt, size_t idx, float v) {
+    if (X) X[idx] = v; else if (xfmt == 1) { _Float16 hv = (_Float16)v; memcpy(&H[idx], &hv, 2); } else H[idx] = bf16_rn(v);
+}
+/* --cond: the condition of one sample, drawn in the output frame (what predict --cond-sweep hands a window: the outputs of earlier
+   windows where they exist). w: the sample's winding mod 14 after the symmetry (band_winding encoding, 255 unknown), shifted by a
+   random gauge of k turns into wout (the targets). Pattern: none (p 0.1; wout all unknown, so the gauge-dependent heads are not
+   supervised), a seed cube of 4..12 voxels (p 0.15), else slabs at the window faces (each axis with p 0.5, at least one; thickness
+   U(P/8, P/2), the low face with p 0.75), then with p 0.3 one or two dropout cubes (4..P/4). Inputs 4-6: cos, sin of 2 pi q' / 14 with
+   a smooth angle noise (a 16-voxel grid of N(0, 0.03 turn), trilinear) and 1, where the pattern covers a known voxel; 0 elsewhere. */
+static void cond_draw(rng *r, int P, const uint8_t *w, uint8_t *wout, float *X, uint16_t *H, int xfmt) {
+    const size_t p2 = (size_t)P * P, p3 = p2 * P;
+    const int gauge = (int)rint_below(r, 14);
+    uint8_t *cm = calloc(p3, 1); if (!cm) abort();
+    const double u = runif(r); int any = u >= 0.10;
+#define CUBE(v, s, c0, c1, c2) for (int z_ = (c0); z_ < (c0) + (s); z_++) for (int y_ = (c1); y_ < (c1) + (s); y_++) memset(cm + ((size_t)z_ * P + y_) * P + (c2), (v), (size_t)(s))
+    if (any && u < 0.25) { const int s = 4 + (int)rint_below(r, 9), a = (int)rint_below(r, P - s + 1), b = (int)rint_below(r, P - s + 1), c = (int)rint_below(r, P - s + 1); CUBE(1, s, a, b, c); }
+    else if (any) {
+        int axes[3], na = 0;
+        for (int d = 0; d < 3; d++) if (runif(r) < 0.5) axes[na++] = d;
+        if (!na) axes[na++] = (int)rint_below(r, 3);
+        for (int a = 0; a < na; a++) {
+            const int d = axes[a], t = P / 8 + (int)rint_below(r, P / 2 - P / 8 + 1), high = runif(r) < 0.25, lo = high ? P - t : 0, hi = high ? P : t;
+            for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
+                uint8_t *row = cm + ((size_t)z * P + y) * P;
+                if (d == 2) memset(row + lo, 1, (size_t)(hi - lo));
+                else if ((d == 0 ? z : y) >= lo && (d == 0 ? z : y) < hi) memset(row, 1, (size_t)P);
+            }
+        }
+    }
+    if (any && runif(r) < 0.3) for (int nb = 1 + (int)rint_below(r, 2); nb > 0; nb--) {
+        const int s = 4 + (int)rint_below(r, P / 4 - 3 > 1 ? P / 4 - 3 : 1), a = (int)rint_below(r, P - s + 1), b = (int)rint_below(r, P - s + 1), c = (int)rint_below(r, P - s + 1);
+        CUBE(0, s, a, b, c);
+    }
+#undef CUBE
+    for (size_t k = 0; k < p3; k++) wout[k] = !any || w[k] >= 252 ? 255 : (uint8_t)((w[k] + 18 * gauge) % 252);
+    const int G = P / 16 + 2; float *nf = malloc((size_t)G * G * G * sizeof *nf); if (!nf) abort();
+    for (size_t k = 0; k < (size_t)G * G * G; k++) nf[k] = (float)(0.03 * rnorm(r));
+    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
+        const size_t k = ((size_t)z * P + y) * P + x;
+        float cv = 0.f, sv = 0.f, mv = 0.f;
+        if (cm[k] && wout[k] < 252) {
+            const float fz = z / 16.f, fy = y / 16.f, fx = x / 16.f; const int iz = (int)fz, iy = (int)fy, ix = (int)fx;
+            const float tz = fz - iz, ty = fy - iy, tx = fx - ix; float nz = 0.f;
+            for (int c = 0; c < 8; c++) nz += ((c & 4) ? tz : 1 - tz) * ((c & 2) ? ty : 1 - ty) * ((c & 1) ? tx : 1 - tx) * nf[((size_t)(iz + (c >> 2 & 1)) * G + iy + (c >> 1 & 1)) * G + ix + (c & 1)];
+            const double a = 2 * M_PI * (wout[k] / 18.0 + nz) / 14.0;
+            cv = (float)cos(a); sv = (float)sin(a); mv = 1.f;
+        }
+        put_x(X, H, xfmt, 4 * p3 + k, cv); put_x(X, H, xfmt, 5 * p3 + k, sv); put_x(X, H, xfmt, 6 * p3 + k, mv);
+    }
+    free(nf); free(cm);
+}
+
+void sample_cond_draw(uint64_t seed, int P, const uint8_t *w, uint8_t *wout, float *X) { rng r; rseed(&r, seed); cond_draw(&r, P, w, wout, X, nullptr, 0); }
 
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
     double pt = sp->prof ? tnow() : 0;
@@ -928,7 +984,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (c->side) memset(b->side + (size_t)i * p3, SIDE_UNKNOWN, p3);
         } else if (stored_phase) {   /* the stored phase (ufsm phase-raster, ufsm downsample --mode phase) */
             uint8_t *sw = malloc(p3);
-            if (!sw || phase_window(s, o, P, pshift, sw)) { free(sw); return -1; }
+            if (!sw || phase_window(s->phase, o, P, pshift, sw)) { free(sw); return -1; }
             for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) sw[k] = SIDE_UNKNOWN;
             sym_u8(sw, b->side + (size_t)i * p3, P, y);
             free(sw);
@@ -968,6 +1024,17 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (X) X[4 * p3 + k] = v; else if (c->xfmt == 1) { _Float16 hv = (_Float16)v; memcpy(&H[4 * p3 + k], &hv, 2); } else H[4 * p3 + k] = bf16_rn(v);
         }
         free(aw); free(as);
+    }
+    if (c->cond) {   /* inputs 4-6 and batch.wind from the source's winding raster (on the stored phase's grid; air unknown like the phase) */
+        uint8_t *ww = malloc(p3), *ws = malloc(p3);
+        if (!ww || !ws) { free(ww); free(ws); return -1; }
+        if (stored_phase && s->wind) {
+            if (phase_window(s->wind, o, P, pshift, ww)) { free(ww); free(ws); return -1; }
+            for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) ww[k] = 255;
+        } else memset(ww, 255, p3);
+        sym_u8(ww, ws, P, y);
+        cond_draw(r, P, ws, b->wind + (size_t)i * p3, X, H, c->xfmt);
+        free(ww); free(ws);
     }
     if (c->sheet) {
         sheet_batch_free(b->sheet[i]);

@@ -77,6 +77,32 @@ int main(void) {
         }
         unet_free(live); unet_free(resumed);
     }
+    {   /* warm start into more inputs and outputs (train --cond: 4 -> 7 inputs, --head-map): the grown net computes the donor's
+           outputs on the mapped rows whatever the new inputs hold */
+        unet_cfg dc = cfg; dc.cout = 3; unet_cfg gc = dc; gc.cin = 7; gc.cout = 5;
+        unet *donor = unet_create(&dc), *grown = unet_create(&gc);
+        unet_init(donor, 5); unet_init(grown, 6);
+        check("save donor", unet_save(donor, base, 7, nullptr) == 0);
+        const int rows[5] = {0, 1, 2, -1, -1};
+        check("warm start 4 -> 7 inputs, 3 -> 5 outputs", unet_init_from_map(grown, base, rows) > 0);
+        enum { P = 16 }; const size_t p3 = (size_t)P * P * P;
+        float *h = malloc(7 * p3 * 4); unsigned s = 77;
+        for (size_t k = 0; k < 7 * p3; k++) { s = s * 1664525u + 1013904223u; h[k] = ((s >> 8) / 16777216.f - 0.5f) * 2.f; }
+        float *dx = nn_malloc(7 * p3 * 4), *od = malloc(3 * p3 * 4), *og = malloc(5 * p3 * 4);
+        nn_h2d(dx, h, 4 * p3 * 4);
+        const float *ld = unet_forward_x(donor, dx, (shape5){1, 4, P, P, P}, 0, 0); nn_sync(); nn_d2h(od, ld, 3 * p3 * 4);
+        double emax = 0;
+        for (int pass = 0; pass < 2; pass++) {   /* new inputs zero, then random */
+            float *g7 = malloc(7 * p3 * 4); memcpy(g7, h, 4 * p3 * 4);
+            if (pass) memcpy(g7 + 4 * p3, h + 4 * p3, 3 * p3 * 4); else memset(g7 + 4 * p3, 0, 3 * p3 * 4);
+            nn_h2d(dx, g7, 7 * p3 * 4); free(g7);
+            const float *lg = unet_forward_x(grown, dx, (shape5){1, 7, P, P, P}, 0, 0); nn_sync(); nn_d2h(og, lg, 5 * p3 * 4);
+            for (size_t k = 0; k < 3 * p3; k++) { const double e = fabs((double)og[k] - od[k]); if (e > emax) emax = e; }
+        }
+        printf("  grown net vs donor: max |logit difference| %.3g\n", emax);
+        check("grown net computes the donor's mapped outputs", emax < 1e-3);
+        free(h); free(od); free(og); nn_free(dx); unet_free(donor); unet_free(grown);
+    }
     const char *e = nn_check(); check("CUDA checks", !e); if (e) printf("%s\n", e);
     unlink(base); unlink(a); unlink(b); unlink(old); unlink(cut);
     return failures != 0;

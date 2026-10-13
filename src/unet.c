@@ -2228,16 +2228,30 @@ int unet_init_from(unet *u, const char *path) { return unet_init_from_map(u, pat
 /* head_rows (u's cout entries, or nullptr = shape-matched copy): output row co of u's head takes the checkpoint's head row
    head_rows[co] (weights and bias), -1 = keep the fresh row. E.g. a verso warm start {0, 0, 1, 2, ...}: recto copied into the
    new verso channel 1, the old rows 1.. shifted up by one. */
+/* the stem when the inputs grew (e.g. train --cond: 4 -> 7): the donor's weights for its inputs, zero for the new ones, so the net
+   computes the donor's function whatever the new inputs hold */
+static int copy_conv_in(unet *u, const unet *o, const convp *a, const convp *b) {
+    if (a->cin < b->cin || a->cout != b->cout || a->k != b->k || a->stride != b->stride) return 0;
+    const size_t k3 = (size_t)a->k * a->k * a->k, ra = (size_t)a->cin * k3, rb = (size_t)b->cin * k3;
+    for (int e = 0; e < 2; e++) {
+        float *dst = e ? u->ema : u->p; const float *sp = e ? o->ema : o->p;
+        nn_zero(dst + a->w, (size_t)a->cout * ra * 4);
+        for (int co = 0; co < a->cout; co++) nn_d2d(dst + a->w + co * ra, sp + b->w + co * rb, rb * 4);
+        nn_d2d(dst + a->b, sp + b->b, (size_t)a->cout * 4);
+    }
+    return 1;
+}
 int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
     unet_cfg oc; int step;
-    if (unet_peek(path, &oc, &step) || oc.cin != u->cfg.cin) return -1;
+    if (unet_peek(path, &oc, &step) || oc.cin > u->cfg.cin) return -1;   /* (more inputs: the stem grows, copy_conv_in) */
     unet *o = unet_create(&oc);
     if (unet_load(o, path) < 0) { unet_free(o); return -1; }
     int n = 0;
     const int L = u->cfg.nlev < oc.nlev ? u->cfg.nlev : oc.nlev;
     for (int i = 0; i < L; i++) {
         const block *a = &u->enc[i], *b = &o->enc[i];
-        n += copy_conv(u, o, &a->c1, &b->c1) + copy_gn(u, o, &a->n1, &b->n1) + copy_conv(u, o, &a->c2, &b->c2) + copy_gn(u, o, &a->n2, &b->n2);
+        n += (i == 0 && oc.cin < u->cfg.cin ? copy_conv_in(u, o, &a->c1, &b->c1) : copy_conv(u, o, &a->c1, &b->c1)) + copy_gn(u, o, &a->n1, &b->n1) +
+             copy_conv(u, o, &a->c2, &b->c2) + copy_gn(u, o, &a->n2, &b->n2);
     }
     for (int i = 0; i < L - 1; i++) {
         n += copy_conv(u, o, &u->down[i], &o->down[i]);
