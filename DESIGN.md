@@ -372,6 +372,15 @@ umbilicus = winding 0). Ours fits one scalar winding field to the network's dens
     16 confidence buckets) into U.f32. `ufsm wind-score` scores it exactly as `fit --codes` (the scoring is now one function,
     score_codes, fed by the fitter or by a raster; byte-identical fit output). test_sweep: a 26-turn spiral with +-0.35 turn of
     noise on the 14-turn phasor unwraps to within 0.0014 turn.
+  - Result (desk, 24 blocks, warm start from the 96k laptop net, 24k steps, ~24 samples/s per 5060 Ti): punted. The sweep scored
+    chance on B and A (7.4% / 7.5% ids right, integer errors uniform; within a window only 24% of voxels share one gauge), the
+    fitter path unchanged (B 53.1% vs the control's 53.2%). The 14-turn head alone (`--cond-raw`) is chance too: supervised
+    inside the condition as well, it learned to copy the input there (its loss fell to 0.377, like the phase head's) and never
+    to count; its turn accuracy outside the condition was 0.10-0.14 (chance 0.07). With `--cond-loss outside` (supervision only
+    where the condition does not reach; the trainer logs that turn accuracy as "acc") two runs stayed at chance through 13k
+    steps (0.06-0.08) while the loss fell (the head hedges towards 0.5): counting sheets 3-6 turns from a condition is not
+    learned in this form at 9.6 um. Untried: accuracy binned by distance from the condition (is even near-boundary copying
+    learned?) and thin-shell extension (each window adds about one sheet, sweeps with small strides).
 - Papyrus gap labels, no cutoff (`train --task papyrus --pap-local R`, default off; src/papyrus.h papyrus_local). A random
   cutoff without conditioning only teaches P(s > t) averaged over t, a smoothed CT (one effective cutoff, ~89); conditioning
   makes the cutoff a dial. The user: a voxel is papyrus or not, the cutoffs only exist because the CT is not bimodal. Rule:
