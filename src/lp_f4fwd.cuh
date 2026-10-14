@@ -153,6 +153,15 @@ template <int MT, int TZ, typename T, typename TO> void launch_f4(dim3 grid, con
    slot (gz + 1) % NP), so after the first tile only TZ planes are staged. Staging, MMA order (chunks, then tap pairs) and
    epilogue as conv_fwd_f4_k (identical results); the epilogue scratch shares the weight stage (the epilogue starts after every
    warp's MMA; the next weight stage after a barrier). ---- */
+#ifndef F4R_PROF
+#define F4R_PROF 0   /* 1: clock64 phase sums of conv_fwd_f4r_k (thread 0: staging, weight stages, mma, epilogue), printed per call */
+#endif
+#if F4R_PROF
+__device__ unsigned long long g_f4r_prof[8];
+#define F4RP(i) do { if (threadIdx.x == 0) { const long long t_ = clock64(); atomicAdd(&g_f4r_prof[i], (unsigned long long)(t_ - t_prev)); t_prev = t_; } } while (0)
+#else
+#define F4RP(i) do { } while (0)
+#endif
 template <int MT, int TZ, int NCH> __host__ __device__ constexpr unsigned f4r_wa_off() {   /* the rings, then the channel tables */
     constexpr int TT = (TZ + 2) * 180;
     return (unsigned)((NCH * (TT * 16 + ((TT + 127) & ~127)) + NCH * 32 * 32 + NCH * 32 * 8 + 16 + 127) & ~127);
@@ -188,9 +197,13 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4r_k(const T *__restrict__ x
         if ((cp & 31) == 0) sgm[cp >> 5] = gm;
     }
     __syncthreads();
+#if F4R_PROF
+    long long t_prev = clock64();
+#endif
     for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
         const int oz0 = tz * TZ, p0n = tz == zc * ZC ? 0 : 2, npos = (NP - p0n) * 180;   /* tile planes p0n .. NP - 1 are new */
         __syncthreads();   /* the previous tile's MMA (and epilogue scratch use) is done */
+        F4RP(0);
 #pragma unroll
         for (int ch = 0; ch < NCH; ch++) {
             uint8_t *sx = smem_raw + ch * RB, *sxs = sx + TT * 16;
@@ -245,6 +258,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4r_k(const T *__restrict__ x
                 const uint8_t *sx = smem_raw + ch * RB, *sxs = sx + TT * 16;
                 for (int p0 = 0; p0 < 14; p0 += PG) {
                     __syncthreads();
+                    F4RP(p0 ? 3 : 1);   /* 1: staging (its barrier), 3: the first pair group's mma */
                     for (int i = threadIdx.x; i < PG * BM * 2; i += 256) {
                         int pp = i / (BM * 2), r = i % (BM * 2), c = r >> 1, h = r & 1, tap = 2 * (p0 + pp) + h;
                         *(uint4 *)(wa + pp * BM * 32 + sw16(c, h)) = __ldg((const uint4 *)(wq + ((size_t)tap * Cop + co0 + c) * (Cip / 2) + 16 * ch));
@@ -254,6 +268,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4r_k(const T *__restrict__ x
                         was[i] = (unsigned short)(wsc[((size_t)tap * Cop + co0 + c) * nch + ch] | (wsc[((size_t)(tap + 1) * Cop + co0 + c) * nch + ch] << 8));
                     }
                     __syncthreads();
+                    F4RP(2);
 #pragma unroll
                     for (int pp = 0; pp < PG; pp++) {
                         const int tA = 2 * (p0 + pp), tB = min(tA + 1, 26);
@@ -280,9 +295,17 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4r_k(const T *__restrict__ x
                     }
                 }
             }
+#if F4R_PROF
+            __syncthreads();
+#endif
+            F4RP(4);   /* the second pair group's mma (to the barrier: the slowest warp) */
             fwd_epilogue<MT, NR, TO, true>(acc, scr, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N, f4r_wa_off<MT, TZ, NCH>());
+            F4RP(5);
         }
     }
+#if F4R_PROF
+    if (threadIdx.x == 0) atomicAdd(&g_f4r_prof[7], 1ull);
+#endif
 }
 template <int MT, int TZ, int NCH, typename T, typename TO> static void launch_f4r(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, gnp_t gp, double *osum, int Go, split_t sp) {
     constexpr int NR = TZ, RBM = IS_MX(TO) ? 32 * MX_BITS(TO) / 8 : 0, BM = MT * 16;
@@ -305,6 +328,15 @@ template <int MT, int TZ, int NCH, typename T, typename TO> static void launch_f
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4r_k<MT, TZ, NCH, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_fwd_f4r_k<MT, TZ, NCH, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp, ZC);
+#if F4R_PROF
+    if (getenv("F4R_PROF")) {
+        unsigned long long h[8]; cudaDeviceSynchronize(); cudaMemcpyFromSymbol(h, g_f4r_prof, sizeof h);
+        const double nb = (double)h[7], tot = (double)(h[0] + h[1] + h[2] + h[3] + h[4] + h[5]);
+        fprintf(stderr, "f4r %d->%d @%dx%dx%d MT %d TZ %d NCH %d ZC %d: per block %.0f cycles: tile start %.0f%% staging %.0f%% wstage %.0f%% mma1 %.0f%% mma2 %.0f%% epilogue %.0f%%\n",
+                xs.c, cout, xs.d, xs.h, xs.w, MT, TZ, NCH, ZC, tot / nb, 100 * h[0] / tot, 100 * h[1] / tot, 100 * h[2] / tot, 100 * h[3] / tot, 100 * h[4] / tot, 100 * h[5] / tot);
+        cudaMemset(g_f4r_prof, 0, sizeof h); unsigned long long z[8] = {}; cudaMemcpyToSymbol(g_f4r_prof, z, sizeof z);
+    }
+#endif
 }
 /* prepared-weight memo: one (wq, ws) pair per conv id (split_t::wkey, set by nn.cu from layer / conv / pass) and device, valid
    while the weight pointer, the shapes and the step counter (lp_wmemo_step, from nn_set_sr_step) are unchanged; wkey 0 = no

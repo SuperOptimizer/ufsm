@@ -1,6 +1,7 @@
 /* Per-layer GPU time of the inference forward (event profiler), for one precision setting.
    usage: prof_infer [P] [B] [iters]   env: UFSM_PREC_POLICY / UFSM_PREC, UFSM_F16, UFSM_DOWN_NORM, UFSM_ACT_MX8 / UFSM_ACT_MX4,
-   UFSM_XIN_MX / UFSM_XIN_PREC, UFSM_GN_STORED, UFSM_SR, UFSM_BF16, UFSM_WIDTHS (e.g. 32,64,96,128,160,192), UFSM_COUT, UFSM_CIN.
+   UFSM_XIN_MX / UFSM_XIN_PREC, UFSM_GN_STORED, UFSM_SR, UFSM_BF16, UFSM_WIDTHS (e.g. 32,64,96,128,160,192), UFSM_COUT, UFSM_CIN,
+   UFSM_FP16_LOGITS=1 (fp16 logits, as predict and train).
    Prints, per conv slot, the minimum over iterations of its forward time, the category totals (min over iterations),
    and the end-to-end forward time (wall clock, min and median). */
 #include "unet.h"
@@ -28,6 +29,7 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_DEC_WIDTHS")) { char *t = strdup(getenv("UFSM_DEC_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.dec_widths[l++] = atoi(q); free(t); }   /* narrower decoder levels */
     cfg.down_norm = getenv("UFSM_DOWN_NORM") ? atoi(getenv("UFSM_DOWN_NORM")) : 0;
     unet *u = unet_create(&cfg); unet_init(u, 1);
+    if (getenv("UFSM_FP16_LOGITS")) unet_set_fp16_logits(u, atoi(getenv("UFSM_FP16_LOGITS")));   /* fp16 logits (as predict and train) */
     shape5 xs = {B, cfg.cin, P, P, P};
     if (getenv("UFSM_MEM_REPORT")) unet_infer_bytes(u, xs);
     float *x = nn_malloc(shape_numel(xs) * 4); nn_zero(x, shape_numel(xs) * 4);

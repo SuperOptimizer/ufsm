@@ -154,6 +154,8 @@ int unet_wide_up_grad(void);
 void unet_set_share_enc_a1(int on);   /* training, recompute 1: encoder blocks above the bottom keep no a1 (backward re-runs conv1 into the same-level decoder's a1) */
 int unet_share_enc_a1(void);
 int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp16 (lean 2 training: the logit gradient fits after them) */
+void unet_set_fp16_logits(unet *u, int on);   /* MX activations: fp16 logits where they get their own buffer (half the head output; the readers
+                                                 follow unet_logits_h16 / nn_set_logits_h16). Not for half-resolution or sheet nets */
 void unet_set_grad_mx4(int on);   /* MX-fp4 activation gradients (with the MX gradient mode; opt-in, env UFSM_GRAD_MX4) */
 int unet_grad_mx4(void);
 void unet_set_a1_offload(int on);   /* shared encoder a1: pinned host copies instead of the conv1 re-run (default on; UFSM_A1_OFFLOAD) */

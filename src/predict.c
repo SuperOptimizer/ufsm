@@ -252,6 +252,7 @@ static void psplit_job(int side, void *arg) {
         nn_h2d(S->dyd, S->rows, 2 * (size_t)Dl * sizeof(float));
         nn_pred_ctmask(S->ctd, l3, S->ctm);   /* the forward overwrites ctd */
         const float *lg = unet_forward_ct(S->u, S->ctd, (float)mean, (float)(1.0 / sd), S->dyd, S->dyd + Dl, J->ax->n > 0 ? J->sign : 0, xs, J->h16);
+        nn_set_logits_h16(unet_logits_h16(S->u));   /* (both halves build alike: the process-wide flag holds the same value) */
         if (J->kss > 1) {   /* every shard of this super-shard from the one window */
             const int64_t SZ = t->shard / (J->nss[1] * J->nss[2]), SY = (t->shard / J->nss[2]) % J->nss[1], SX = t->shard % J->nss[2], k = J->kss;
             for (int64_t qz = SZ * k; qz < SZ * k + k && qz < J->ns[0]; qz++) for (int64_t qy = SY * k; qy < SY * k + k && qy < J->ns[1]; qy++)
@@ -483,6 +484,10 @@ int cmd_predict(int argc, char **argv) {
         if (k) nn_init(gpus[1]);
         if (gnh) unet_gn_freeze(uk, gnh);
         if (ffd || sweep_out) unet_set_head_channels(uk, 0, cfg.cout);   /* every head: the recto channel 0 is written, the others pooled (or swept) */
+        /* fp16 logits (MX activations): the readers below take them as they are (nn_set_logits_h16 after each forward); the 11 heads
+           of --fit-zarr were 44 B per window voxel in fp32, which pushed 640^3 windows past the 16 GB card (paged: 40x slower).
+           UFSM_PRED_LOGITS32=1 keeps fp32 */
+        if (!sheet_task && !half && !sweep_out && !ufsm_env_on("UFSM_PRED_LOGITS32")) unet_set_fp16_logits(uk, 1);
         else if (!sheet_task) unet_set_head_channels(uk, hmode == 2 ? 8 * out_ch : out_ch, hmode == 2 ? 8 : 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
         /* the network takes the uint8 CT window itself (with in-place slabs the stem builds its input per slab: no 16-bit window) */
         if (!sheet_task && !half && !ufsm_env_on("UFSM_PRED_HOSTPATH")) unet_set_ct_input(uk, 1);
@@ -791,6 +796,7 @@ int cmd_predict(int argc, char **argv) {
                 lg = lgf;
             } else lg = ct_stem ? unet_forward_ct(u, ctd, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xs, h16)
                                 : unet_forward_x(u, xd, xs, 0, h16);
+            nn_set_logits_h16(!half && unet_logits_h16(u));   /* the readers of lg below */
             if (gn_save) unet_gn_accumulate(u);
             if (ffd && !ffzm) nn_fit_accum_d(lg, ctd, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, 0, 2, 4, 10, ffds, ffdc, ffacc);
             if (ffzm) {   /* the window interior's whole cells, finalized into the field slab (flushed when the slab is left) */

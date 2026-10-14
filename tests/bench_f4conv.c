@@ -1,7 +1,8 @@
 /* The level-0 fp4 3^3 convolutions of training in their storage formats, timed in isolation (min over repetitions) with an
    FNV hash of the output bytes (equal hashes = identical results across builds / variants):
      fwd   MX-fp4 in -> MX-fp4 out, GN+SiLU of the input in staging, GN statistics of the output (enc0.c2 / dec0.c2, dec0.c1)
-     bdata MX-fp8 gy -> MX-fp8 gx with stochastic rounding of gy (backward-data), 16 -> 16 and 16 -> 32 + 16 (dec0.c1 split)
+     bdata MX-fp8 gy -> MX-fp8 gx with stochastic rounding of gy (backward-data), 16 -> 16 and 16 -> 32 + 16 (dec0.c1 split);
+           MX-fp4 gy -> MX-fp4 gx (SR on both) as the trainer's default MX-fp4 gradients
    usage: bench_f4conv [P] */
 #include "nn.h"
 #include "nn_lp.h"
@@ -32,6 +33,8 @@ static void run(job *j, unsigned it) {
     split_t sp = {0};
     if (j->y2) { sp.y2 = j->y2; sp.o_split = j->osplit; }
     if (j->sr) sp.sr = 0x2545f491u + it;
+    if (j->sr && j->xb == 4) { sp.sr = 0; sp.osr = 0x6a09e667u + it; }   /* MX-fp4 gradients (as nn_bwd.cu): gy already on the e2m1 grid (copy
+                                                                           staging), the output gx stochastically rounded */
     if (j->osum) nn_zero(j->osum, 2 * 64 * sizeof(double));
     lp_conv_fwd_f4(j->x, j->xb, j->xs, j->w, j->b, j->co, j->y, j->xb, j->gp, j->osum, j->Go, sp);
 }
@@ -54,7 +57,8 @@ int main(int argc, char **argv) {
         {"bdata 16 -> 16 (mx8, SR)", 3, 16, 16, 0, 0, 0, 1, 1}, {"bdata 16 -> 32 + 16 (mx8, SR)", 3, 16, 48, 32, 0, 0, 1, 1},
         {"fwd 32 -> 32 (gn+silu, stats)", 4, 32, 32, 0, 1, 1, 0, 1}, {"bdata 32 -> 32 (mx8, SR)", 3, 32, 32, 0, 0, 0, 1, 1}, {"bdata 32 -> 64 + 32 (mx8, SR)", 3, 32, 96, 64, 0, 0, 1, 1},
         {"fwd 64 -> 64 (gn+silu, stats) @P/2", 4, 64, 64, 0, 1, 1, 0, 2}, {"bdata 64 -> 64 (mx8, SR) @P/2", 3, 64, 64, 0, 0, 0, 1, 2},
-        {"bdata 64 -> 96 + 64 (mx8, SR) @P/2", 3, 64, 160, 96, 0, 0, 1, 2}};
+        {"bdata 64 -> 96 + 64 (mx8, SR) @P/2", 3, 64, 160, 96, 0, 0, 1, 2},
+        {"bdata 32 -> 32 (mx4, SR)", 4, 32, 32, 0, 0, 0, 1, 1}, {"bdata 32 -> 64 + 32 (mx4, SR)", 4, 32, 96, 64, 0, 0, 1, 1}};   /* the trainer's MX-fp4 gradients (10, 11) */
     for (int l = 0; l < (int)(sizeof L / sizeof L[0]) && want("fwd"); l++) {
         if (getenv("BENCH_FL") && l != atoi(getenv("BENCH_FL"))) continue;   /* one forward / bdata case */
         const int Pl = P / L[l].dv; const size_t Sl = (size_t)Pl * Pl * Pl;

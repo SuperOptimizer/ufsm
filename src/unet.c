@@ -146,6 +146,7 @@ struct unet {
     void *h_sk[UNET_MAXLEV], *ev_sk[UNET_MAXLEV][4];
     size_t logits_bytes;                     /* lean: logits at the start of A, the 16-bit logit gradient after them */
     int logits_h16;                          /* lean 2: fp16 logits, so the 16-bit logit gradient fits after them in A */
+    int lh16_req;                            /* unet_set_fp16_logits: fp16 logits where the MX head writes them into their own buffer */
     float *rc_extra; size_t rc_extra_bytes;  /* training transient for the upsampled decoder input when B is too small */
     int head_c0, head_nc;                    /* inference builds: only logit channels [c0, c0 + nc) (nc 0: all) */
     int split_side, split_h0;                /* spatial split (unet_set_split): side 0 / 1, level-0 halo planes; h0 0 = off */
@@ -931,15 +932,20 @@ static void build_acts(unet *u, shape5 xs, int train) {
     g_mlab = "encoder a1 / a2 / GN stats + down outputs";
     for (int i = 0; i < L - 1; i++) if (!u->downo[i]) { shape5 ds = u->ls[i + 1]; ds.c = w[i]; u->downo[i] = dalloc_act_s(u, ds); }   /* (deferred, not placed) */
     for (int i = 0; i < L; i++) if (u->enc[i].a2 == SKO_DEFER) u->enc[i].a2 = dalloc_act_s(u, u->enc[i].ys);
-    g_mlab = "logits (fp32) / network input";
+    g_mlab = "logits (fp32 / fp16) / network input";
     if (!train && u->head_nc) os.c = u->head_nc;   /* inference: the requested logit channels only */
+    if (u->lh16_req && !u->logits && act_mx8() && nn_get_tf32()) {   /* fp16 logits (the MX head writes them: lp_conv1_fwd_mx_h16) in their own buffer */
+        u->logits_h16 = 1;
+        if (train) u->logits_bytes = shape_numel(os) * 2;
+    }
+    const size_t lgb = shape_numel(os) * (u->logits_h16 ? 2 : 4);
     const int ialias = share && reuse_skip && infer_alias() && act_mx8();   /* inference aliasing (see unet.xin_inf / lg_t1) */
     u->lg_t1 = u->xin_inf = 0;
-    if (!u->logits && ialias && !u->p3 && shape_numel(os) * 4 <= u->t1_bytes) { u->logits = T1; u->lg_t1 = 1; u->lg_p = T1; u->lg_bytes = u->t1_bytes; }   /* (coarse offload: T1 is in X) */
-    else if (!u->logits && slab1 && shape_numel(os) * 4 <= act_bytes_of(u->enc[1].ys)) {   /* Y: dec[1].a2, dead once dec[0]'s conv1 has upsampled it */
+    if (!u->logits && ialias && !u->p3 && lgb <= u->t1_bytes) { u->logits = T1; u->lg_t1 = 1; u->lg_p = T1; u->lg_bytes = u->t1_bytes; }   /* (coarse offload: T1 is in X) */
+    else if (!u->logits && slab1 && lgb <= act_bytes_of(u->enc[1].ys)) {   /* Y: dec[1].a2, dead once dec[0]'s conv1 has upsampled it */
         u->logits = Y; u->lg_t1 = 1; u->lg_p = Y; u->lg_bytes = act_bytes_of(u->enc[1].ys);
     }
-    if (!u->logits) u->logits = dalloc(u, shape_numel(os));
+    if (!u->logits) u->logits = dalloc(u, (lgb + 3) / 4);
     u->xin = nullptr;
     if (ABF && input_mx()) {   /* include mandatory input storage in the dry planner */
         const int idt = unet_input_prec(); const size_t xb_ = nn_mx_bytes(xs, idt);
@@ -1012,6 +1018,11 @@ void *unet_logit_grad_scratch(unet *u, size_t bytes) {
 }
 int unet_lean_nob(const unet *u) { return u->nob; }
 int unet_logits_h16(const unet *u) { return u->built && u->logits_h16; }
+void unet_set_fp16_logits(unet *u, int on) {   /* takes effect at the next build */
+    if (u->lh16_req == !!on) return;
+    if (u->built && !u->train) free_acts(u);
+    u->lh16_req = !!on;
+}
 void *unet_grad_scratch(unet *u, size_t bytes) { return u->built && u->train && lean() && u->gB[0] && u->gB_bytes >= bytes ? (void *)u->gB[0] : nullptr; }
 /* lean 2: the trainer's batch as [head | tail] in gout[0]; with the fp16 logits at its start (MX-fp4 gradients) at the buffer's
    end, the tail (targets, masks: read by the loss) clear of the logits, the head (the input: read only by the forward's

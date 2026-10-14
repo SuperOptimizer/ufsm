@@ -666,12 +666,15 @@ extern "C" void nn_lowres_grad(const void *g, int g16, shape5 qs, int div, int m
     nn_half_grad(g, g16, t, 1, tmp);
     nn_half_grad(tmp, g16, qs, mode, gh);
 }
-__global__ void pred_out_k(const float *lg, const uint8_t *ct, size_t n, uint8_t *out) {
+/* the logits handed to the prediction readers below and to nn_fit_accum_d: fp32, or fp16 after nn_set_logits_h16(1) (nn_loss.cu;
+   predict sets it after each forward from unet_logits_h16) */
+template <typename LT> __global__ void pred_out_k(const LT *lg, const uint8_t *ct, size_t n, uint8_t *out) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i < n) out[i] = ct[i] ? (uint8_t)(255.f / (1.f + __expf(-lg[i])) + 0.5f) : 0;
+    if (i < n) out[i] = ct[i] ? (uint8_t)(255.f / (1.f + __expf(-lgv(lg, i))) + 0.5f) : 0;
 }
-extern "C" void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out) { pred_out_k<<<nblk(n, 256), 256>>>(lg, ct, n, out); KCHECK(); }
-__global__ void pred_place_k(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+#define LGT(CALL) do { if (g_logits_h16) { const f16 *lgt = (const f16 *)lg; CALL; } else { const float *lgt = lg; CALL; } } while (0)
+extern "C" void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out) { LGT((pred_out_k<<<nblk(n, 256), 256>>>(lgt, ct, n, out))); KCHECK(); }
+template <typename LT> __global__ void pred_place_k(const LT *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     const int I = W - 2 * halo, Iz = D - 2 * hz;   /* a D x W x W window, interior planes [hz, D - hz) */
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)Iz * I * I) return;
@@ -679,11 +682,11 @@ __global__ void pred_place_k(const float *lg, const uint8_t *ct, int D, int W, i
     const int gz = oz + z, gy = oy + y, gx = ox + x;
     if (gz < 0 || gz >= ez || gy < 0 || gy >= ey || gx < 0 || gx >= ex) return;
     const size_t k = ((size_t)z * W + y) * W + x;
-    dsh[((size_t)gz * shard + gy) * shard + gx] = ct[k] ? (uint8_t)(255.f / (1.f + __expf(-lg[k])) + 0.5f) : 0;
+    dsh[((size_t)gz * shard + gy) * shard + gx] = ct[k] ? (uint8_t)(255.f / (1.f + __expf(-lgv(lg, k))) + 0.5f) : 0;
 }
 extern "C" void nn_pred_place_d(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     const size_t I = (size_t)(W - 2 * halo), Iz = (size_t)(D - 2 * hz);
-    pred_place_k<<<nblk(Iz * I * I, 256), 256>>>(lg, ct, D, W, hz, halo, oz, oy, ox, ez, ey, ex, shard, dsh); KCHECK();
+    LGT((pred_place_k<<<nblk(Iz * I * I, 256), 256>>>(lgt, ct, D, W, hz, halo, oz, oy, ox, ez, ey, ex, shard, dsh))); KCHECK();
 }
 extern "C" void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     nn_pred_place_d(lg, ct, W, W, halo, halo, oz, oy, ox, ez, ey, ex, shard, dsh);
@@ -698,7 +701,7 @@ __global__ void pred_ctmask_k(const uint8_t *ct, size_t n, uint32_t *bits) {
     bits[w] = m;
 }
 extern "C" void nn_pred_ctmask(const uint8_t *ct, size_t n, uint32_t *bits) { pred_ctmask_k<<<nblk((n + 31) / 32, 256), 256>>>(ct, n, bits); KCHECK(); }
-__global__ void pred_place_m_k(const float *lg, const uint32_t *bits, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+template <typename LT> __global__ void pred_place_m_k(const LT *lg, const uint32_t *bits, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     const int I = W - 2 * halo, Iz = D - 2 * hz;
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)Iz * I * I) return;
@@ -706,17 +709,17 @@ __global__ void pred_place_m_k(const float *lg, const uint32_t *bits, int D, int
     const int gz = oz + z, gy = oy + y, gx = ox + x;
     if (gz < 0 || gz >= ez || gy < 0 || gy >= ey || gx < 0 || gx >= ex) return;
     const size_t k = ((size_t)z * W + y) * W + x;
-    dsh[((size_t)gz * shard + gy) * shard + gx] = (bits[k >> 5] >> (k & 31)) & 1u ? (uint8_t)(255.f / (1.f + __expf(-lg[k])) + 0.5f) : 0;
+    dsh[((size_t)gz * shard + gy) * shard + gx] = (bits[k >> 5] >> (k & 31)) & 1u ? (uint8_t)(255.f / (1.f + __expf(-lgv(lg, k))) + 0.5f) : 0;
 }
 extern "C" void nn_pred_place_m_d(const float *lg, const uint32_t *bits, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     const size_t I = (size_t)(W - 2 * halo), Iz = (size_t)(D - 2 * hz);
-    pred_place_m_k<<<nblk(Iz * I * I, 256), 256>>>(lg, bits, D, W, hz, halo, oz, oy, ox, ez, ey, ex, shard, dsh); KCHECK();
+    LGT((pred_place_m_k<<<nblk(Iz * I * I, 256), 256>>>(lgt, bits, D, W, hz, halo, oz, oy, ox, ez, ey, ex, shard, dsh))); KCHECK();
 }
 extern "C" void nn_pred_place_m(const float *lg, const uint32_t *bits, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     nn_pred_place_m_d(lg, bits, W, W, halo, halo, oz, oy, ox, ez, ey, ex, shard, dsh);
 }
 /* a window held as planes [zoff, zoff + D) (one half of a split window): its window planes [zlo, zhi) (owned, inside the interior) */
-__global__ void pred_place_mz_k(const float *lg, const uint32_t *bits, int W, int halo, int zlo, int nz, int zoff, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+template <typename LT> __global__ void pred_place_mz_k(const LT *lg, const uint32_t *bits, int W, int halo, int zlo, int nz, int zoff, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     const int I = W - 2 * halo;
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)nz * I * I) return;
@@ -724,14 +727,14 @@ __global__ void pred_place_mz_k(const float *lg, const uint32_t *bits, int W, in
     const int gz = oz + z, gy = oy + y, gx = ox + x;
     if (gz < 0 || gz >= ez || gy < 0 || gy >= ey || gx < 0 || gx >= ex) return;
     const size_t k = ((size_t)(z - zoff) * W + y) * W + x;
-    dsh[((size_t)gz * shard + gy) * shard + gx] = (bits[k >> 5] >> (k & 31)) & 1u ? (uint8_t)(255.f / (1.f + __expf(-lg[k])) + 0.5f) : 0;
+    dsh[((size_t)gz * shard + gy) * shard + gx] = (bits[k >> 5] >> (k & 31)) & 1u ? (uint8_t)(255.f / (1.f + __expf(-lgv(lg, k))) + 0.5f) : 0;
 }
 extern "C" void nn_pred_place_mz(const float *lg, const uint32_t *bits, int W, int halo, int zlo, int zhi, int zoff, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     if (zlo < halo) zlo = halo;
     if (zhi > W - halo) zhi = W - halo;
     if (zhi <= zlo) return;
     const size_t I = (size_t)(W - 2 * halo);
-    pred_place_mz_k<<<nblk((size_t)(zhi - zlo) * I * I, 256), 256>>>(lg, bits, W, halo, zlo, zhi - zlo, zoff, oz, oy, ox, ez, ey, ex, shard, dsh); KCHECK();
+    LGT((pred_place_mz_k<<<nblk((size_t)(zhi - zlo) * I * I, 256), 256>>>(lgt, bits, W, halo, zlo, zhi - zlo, zoff, oz, oy, ox, ez, ey, ex, shard, dsh))); KCHECK();
 }
 __global__ void pred_stats_k(const uint8_t *ct, size_t n, unsigned long long *acc) {
     unsigned long long nz = 0, sm = 0, sq = 0;

@@ -917,6 +917,9 @@ int cmd_train(int argc, char **argv) {
         d->dev = devs[g]; d->side = split ? g : -1;
         if (nn_init(d->dev)) { fprintf(stderr, "cannot select GPU %d\n", d->dev); return 1; }
         d->u = unet_create(&cfg);
+        /* fp16 logits in their own buffer (MX activations; the losses read them as unet_logits_h16 says): 11 unwrap heads at P 384
+           are 2.5 GB in fp32. Not for half-resolution nets (the losses read the fp32 upsampled copy) or sheet nets; UFSM_LOGITS32=1 */
+        unet_set_fp16_logits(d->u, !g_half && !g_sheet && !ufsm_env_on("UFSM_LOGITS32"));
         if (resume) {
             const int grow = atoi(opt(argc, argv, "--grow-head", "0"));   /* band_affinity warm start from a recto checkpoint */
             step0 = grow ? unet_load_grow(d->u, resume, 1, 1.f) : unet_load(d->u, resume);
@@ -1001,7 +1004,7 @@ int cmd_train(int argc, char **argv) {
             lean = 2;
             fprintf(stderr, "memory: MX-fp8 gradients, chunked, lean 2, wide finest-level up gradient (explicit mode)\n");
             { char mp[1400]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp); }
-        } else if ((!strcmp(mm, "auto") || auto16) && nn_get_tf32() && !getenv("UFSM_CHUNK_UP") && !getenv("UFSM_RECOMPUTE") && !getenv("UFSM_GRAD_MX8")) {
+        } else if ((!strcmp(mm, "auto") || !strcmp(mm, "fast") || auto16) && nn_get_tf32() && !getenv("UFSM_CHUNK_UP") && !getenv("UFSM_RECOMPUTE") && !getenv("UFSM_GRAD_MX8")) {
             static const struct { int chunk, rc, gmx, lean, sea; const char *what; } cand[] = {
                 /* by step cost (MX-fp8 gradients passed their 3-seed stair and cost nothing; lean costs ~nothing, the upload is
                    ~3% of a large-window step; recompute 2 ~10%), the 16-bit-gradient modes only for --mem auto16 / 16-bit activations.
@@ -1021,13 +1024,23 @@ int cmd_train(int argc, char **argv) {
                level-0 voxel (desk slab -1.66 GB per GPU); default on, UFSM_RC_ENC_A1=0 off */
             const int sea_force = getenv("UFSM_RC_ENC_A1") ? ufsm_env_on("UFSM_RC_ENC_A1") : 1;
             const int nc = (int)(sizeof cand / sizeof cand[0]);
+            /* the search order: --mem auto takes the smallest recompute-1 mode that fits (lean 2, chunked, shared a1: production
+               P 384 12.75 -> 10.47 GB per GPU for ~2% throughput, the serialised batch upload; the user: RAM savings by default unless
+               they cost massive speed), then the larger recompute-1 ones, then recompute 2 (~10% step for ~0.3 GB more); --mem fast
+               keeps the list order (fastest first) */
+            static const int ord_small[] = {4, 3, 2, 1, 0, 7, 6, 5, 8, 9, 10, 11, 12};   /* (16-bit modes: list order, no recompute-1 lean ones) */
+            const int fastest = !strcmp(mm, "fast");
             size_t fmin = (size_t)-1;
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); size_t f = nn_mem_free(); if (f < fmin) fmin = f; }
             nn_init(G[0].dev);
             const shape5 xs = g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P};   /* split: this GPU's slab of the window */
             const size_t p3 = p3l;
             int pick = -1; size_t need = 0;
-            for (int c = 0; c < nc && pick < 0; c++) {
+            const int pick0 = getenv("UFSM_MEM_PICK") ? atoi(getenv("UFSM_MEM_PICK")) : 0;   /* A/B of the modes: start the search at this candidate */
+            _Static_assert(sizeof ord_small / sizeof ord_small[0] == sizeof cand / sizeof cand[0], "every mode in the search order");
+            for (int oi = 0; oi < nc && pick < 0; oi++) {
+                const int c = pick0 > 0 && pick0 < nc ? (oi ? nc : pick0) : fastest ? oi : ord_small[oi];   /* UFSM_MEM_PICK: that mode only */
+                if (c >= nc) break;
                 if (cand[c].gmx == auto16) continue;   /* auto: MX gradient modes; auto16: the 16-bit ones */
                 if (g_half && cand[c].lean) continue;   /* (the batch buffers are full resolution, the network's half) */
                 unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean); unet_set_share_enc_a1(cand[c].sea || sea_force);
@@ -1045,6 +1058,7 @@ int cmd_train(int argc, char **argv) {
             if (unet_grad_mx4()) fprintf(stderr, "memory: MX gradients stored as MX-fp4 (default; UFSM_GRAD_MX4=0: MX-fp8)\n");
             lean = cand[pick].lean;
             { char mp[1400]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp); }   /* the planner's modes */
+            if (ufsm_env_on("UFSM_MEM_DRY")) { fprintf(stderr, "memory: UFSM_MEM_DRY, exiting after the planner\n"); return 0; }   /* footprints in seconds (with UFSM_MEM_REPORT=1) */
         }
     }
     if (g_half && lean) { fprintf(stderr, "--half-res: not with the lean memory modes\n"); return 2; }
