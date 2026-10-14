@@ -90,14 +90,19 @@ static int sym_is_rotation(sym y) {
         if (y.perm[0] == 0 && y.perm[1] == 1 && !y.flip[0] && !y.flip[1] && !y.flip[2]) { memcpy(out, in, (size_t)D * P * P * sizeof(T)); return; } \
         if (D != P && y.perm[0] != 0) abort();                                                    \
         int64_t stride[3] = {(int64_t)P * P, P, 1}; const int n[3] = {D, P, P};                    \
+        /* the source index is affine along x: a row is a copy, a reversed copy or a fixed-stride gather (was 3 terms per voxel) */ \
+        const int64_t sx = y.flip[2] ? -stride[y.perm[2]] : stride[y.perm[2]];                     \
         for (int z = 0; z < D; z++)                                                               \
-            for (int yy = 0; yy < P; yy++)                                                        \
-                for (int x = 0; x < P; x++) {                                                     \
-                    int i[3] = {z, yy, x};                                                        \
-                    int64_t q = 0;                                                                \
-                    for (int d = 0; d < 3; d++) q += stride[y.perm[d]] * (y.flip[d] ? n[d] - 1 - i[d] : i[d]); \
-                    out[((int64_t)z * P + yy) * P + x] = in[q];                                   \
-                }                                                                                 \
+            for (int yy = 0; yy < P; yy++) {                                                      \
+                const int i[3] = {z, yy, 0};                                                      \
+                int64_t q = 0;                                                                    \
+                for (int d = 0; d < 3; d++) q += stride[y.perm[d]] * (y.flip[d] ? n[d] - 1 - i[d] : i[d]); \
+                T *o = out + ((int64_t)z * P + yy) * P;                                           \
+                const T *src = in + q;                                                            \
+                if (sx == 1) memcpy(o, src, (size_t)P * sizeof(T));                               \
+                else if (sx == -1) for (int x = 0; x < P; x++) o[x] = src[-x];                    \
+                else for (int x = 0; x < P; x++) o[x] = src[(int64_t)x * sx];                     \
+            }                                                                                     \
     }
 APPLY_SYM(uint8_t, sym_u8)
 
@@ -796,6 +801,22 @@ static void warp_phase(const uint8_t *src, uint8_t *dst, int P, sym sy, const sp
     }
     free(table);
 }
+/* per-worker pool of draw()'s window-sized scratch (P^3 bytes, 56 MB at P 384): glibc serves blocks above its mmap threshold
+   (<= 32 MB) with mmap / munmap, so every sample paid ~14k page faults per buffer under the process-wide mmap lock that all
+   workers share. Buffers of an exact size are reused; zero = calloc semantics. */
+#define TP_N 24
+static _Thread_local struct { void *b[TP_N]; size_t n[TP_N]; int k; } tpool;
+static void *tp_get(size_t n, int zero) {
+    for (int i = 0; i < tpool.k; i++)
+        if (tpool.n[i] == n) { void *p = tpool.b[i]; tpool.b[i] = tpool.b[--tpool.k]; tpool.n[i] = tpool.n[tpool.k]; if (zero) memset(p, 0, n); return p; }
+    return zero ? calloc(n, 1) : malloc(n);
+}
+static void tp_put(void *p, size_t n) {
+    if (!p) return;
+    if (tpool.k < TP_N) { tpool.b[tpool.k] = p; tpool.n[tpool.k] = n; tpool.k++; } else free(p);
+}
+static void tp_drain(void) { while (tpool.k) free(tpool.b[--tpool.k]); }
+
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
@@ -912,13 +933,13 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     PROF_MARK(PS_TARGETS);
     uint8_t *near = nullptr;   /* --phase-near-um: voxels within the distance of a labelled wrap voxel (raw labels, before softening) */
     if (c->phase_near_um > 0 && c->side == 2 && w[0]) {
-        const float rn = c->phase_near_um / (float)(s->um * (double)(1 << l)); float *d2 = malloc(p3 * sizeof *d2); uint8_t *feat = malloc(p3); near = malloc(p3);
+        const float rn = c->phase_near_um / (float)(s->um * (double)(1 << l)); float *d2 = tp_get(p3 * sizeof *d2, 0); uint8_t *feat = tp_get(p3, 0); near = tp_get(p3, 0);
         const int64_t en[3] = {Pz, P, P};
-        if (!d2 || !feat || !near) { free(d2); free(feat); free(near); return -1; }
+        if (!d2 || !feat || !near) { tp_put(d2, p3 * sizeof *d2); tp_put(feat, p3); tp_put(near, p3); return -1; }
         for (size_t k = 0; k < p3; k++) feat[k] = ttmp[k] == 254;
-        if (edt_sq(feat, en, d2, 1)) { free(d2); free(feat); free(near); return -1; }
+        if (edt_sq(feat, en, d2, 1)) { tp_put(d2, p3 * sizeof *d2); tp_put(feat, p3); tp_put(near, p3); return -1; }
         for (size_t k = 0; k < p3; k++) near[k] = d2[k] <= rn * rn;
-        free(d2); free(feat);
+        tp_put(d2, p3 * sizeof *d2); tp_put(feat, p3);
     }
     /* curriculum: thicken the surface band by max-filtering the target (hard labels only, pyramid sources) */
     if (c->dilate > 0 && region_ch < 0) {
@@ -1004,11 +1025,11 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     }
     uint8_t *papc = nullptr;   /* --pap-head: the gap labels of the clean CT, 0 void / 1 papyrus / 255 ignored (the symmetry below, with pm) */
     if (c->pap_head) {
-        uint8_t *pt = malloc(p3), *pg = calloc(p3, 1), *pf = malloc(p3); papc = malloc(p3);
-        if (!pt || !pg || !pf || !papc) { free(pt); free(pg); free(pf); free(papc); return -1; }
+        uint8_t *pt = tp_get(p3, 0), *pg = tp_get(p3, 1), *pf = tp_get(p3, 0); papc = tp_get(p3, 0);
+        if (!pt || !pg || !pf || !papc) { tp_put(pt, p3); tp_put(pg, p3); tp_put(pf, p3); tp_put(papc, p3); return -1; }
         papyrus_labels(ctu, P, c->pap_head, 0.f, 0.0, pt, pg, pf, big + p3);   /* (scratch 8 P^3: free until the scanner augmentation) */
         for (size_t k = 0; k < p3; k++) papc[k] = pg[k] ? 255 : pt[k] ? 1 : 0;
-        free(pt); free(pg); free(pf);
+        tp_put(pt, p3); tp_put(pg, p3); tp_put(pf, p3);
     }
     PROF_MARK(PS_ENCODE);
     if (c->sheet) sheet_mask_contacts(c->sheet,o,P,ign);
@@ -1088,31 +1109,31 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     }
     if (c->pap_head) {   /* the gap labels through the same symmetry; warped samples: all ignored */
         if (spatial.active) memset(b->pap + (size_t)i * p3, 255, p3); else sym_u8(papc, b->pap + (size_t)i * p3, Pz, P, y);
-        free(papc);
+        tp_put(papc, p3);
     }
     if (c->band || c->side) {   /* band labels: computed on the source grid, unknown on CT air, then the same symmetry as CT and targets */
         if (!band_sample || (spatial.active && !stored_phase)) {   /* no band labels: affinities (and sides) unsupervised */
             if (c->band) memset(b->band + (size_t)i * p3, BAND_UNKNOWN, p3);
             if (c->side) memset(b->side + (size_t)i * p3, SIDE_UNKNOWN, p3);
         } else if (stored_phase) {   /* the stored phase (ufsm phase-raster, ufsm downsample --mode phase) */
-            uint8_t *sw = malloc(p3);
-            if (!sw || phase_window(s->phase, o, Pz, P, pshift, sw)) { free(sw); return -1; }
+            uint8_t *sw = tp_get(p3, 0);
+            if (!sw || phase_window(s->phase, o, Pz, P, pshift, sw)) { tp_put(sw, p3); return -1; }
             for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) sw[k] = SIDE_UNKNOWN;
             if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
             if (spatial.active) warp_phase(sw, b->side + (size_t)i * p3, P, y, &spatial);   /* (slabs never warp: sampler_start) */
             else sym_u8(sw, b->side + (size_t)i * p3, Pz, P, y);
-            free(sw);
+            tp_put(sw, p3);
         } else {
             if (Pz != P) { fprintf(stderr, "sampler: slab windows take the phase from a stored raster (sources \"phase\" at this level or one coarser)\n"); return -1; }
-            uint8_t *bw = malloc(p3), *sw = c->side ? malloc(p3) : nullptr;
-            if (!bw || (c->side && !sw) || band_window(s, o, P, bw, sw, c->side == 2, c->phase_dense, tile_index ^ c->seed)) { free(bw); free(sw); return -1; }
+            uint8_t *bw = tp_get(p3, 0), *sw = c->side ? tp_get(p3, 0) : nullptr;
+            if (!bw || (c->side && !sw) || band_window(s, o, P, bw, sw, c->side == 2, c->phase_dense, tile_index ^ c->seed)) { tp_put(bw, p3); tp_put(sw, p3); return -1; }
             for (size_t k = 0; k < p3; k++) if (!ctu[k]) bw[k] = BAND_UNKNOWN;
             if (c->band) sym_u8(bw, b->band + (size_t)i * p3, Pz, P, y);
             if (sw) {   /* sides (phases) above CT side_air only: air (CT <= side_air) stays unsupervised */
                 for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) sw[k] = SIDE_UNKNOWN;
                 sym_u8(sw, b->side + (size_t)i * p3, Pz, P, y);
             }
-            free(bw); free(sw);
+            tp_put(bw, p3); tp_put(sw, p3);
         }
     }
     PROF_MARK(PS_AUGMENT);
@@ -1131,26 +1152,26 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H);
     free(params);
     if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
-        uint8_t *aw = calloc(p3, 1), *as = malloc(p3);
-        if (!aw || !as || (s->aux && s->aux_level == l && aux_window(s, o, P, aw))) { free(aw); free(as); return -1; }
+        uint8_t *aw = tp_get(p3, 1), *as = tp_get(p3, 0);
+        if (!aw || !as || (s->aux && s->aux_level == l && aux_window(s, o, P, aw))) { tp_put(aw, p3); tp_put(as, p3); return -1; }
         sym_u8(aw, as, Pz, P, y);
         for (size_t k = 0; k < p3; k++) {
             const float v = as[k] / 127.5f - 1.f;
             if (X) X[4 * p3 + k] = v; else if (c->xfmt == 1) { _Float16 hv = (_Float16)v; memcpy(&H[4 * p3 + k], &hv, 2); } else H[4 * p3 + k] = bf16_rn(v);
         }
-        free(aw); free(as);
+        tp_put(aw, p3); tp_put(as, p3);
     }
-    free(near);
+    tp_put(near, p3);
     if (c->cond) {   /* inputs 4-6 and batch.wind from the source's winding raster (on the stored phase's grid; air unknown like the phase) */
-        uint8_t *ww = malloc(p3), *ws = malloc(p3);
-        if (!ww || !ws) { free(ww); free(ws); return -1; }
+        uint8_t *ww = tp_get(p3, 0), *ws = tp_get(p3, 0);
+        if (!ww || !ws) { tp_put(ww, p3); tp_put(ws, p3); return -1; }
         if (stored_phase && s->wind) {
-            if (phase_window(s->wind, o, Pz, P, pshift, ww)) { free(ww); free(ws); return -1; }
+            if (phase_window(s->wind, o, Pz, P, pshift, ww)) { tp_put(ww, p3); tp_put(ws, p3); return -1; }
             for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) ww[k] = 255;
         } else memset(ww, 255, p3);
         sym_u8(ww, ws, Pz, P, y);
         cond_draw(r, P, ws, b->wind + (size_t)i * p3, X, H, c->xfmt, c->cond_outside);
-        free(ww); free(ws);
+        tp_put(ww, p3); tp_put(ws, p3);
     }
     if (c->sheet) {
         sheet_batch_free(b->sheet[i]);
@@ -1223,7 +1244,7 @@ static void *worker(void *arg) {
         pthread_cond_broadcast(&sp->cv_free);
         pthread_mutex_unlock(&sp->mu);
     }
-    free(xtmp); free(ttmp); free(big); free(noise_state);
+    free(xtmp); free(ttmp); free(big); free(noise_state); tp_drain();
     free(wa);
     return nullptr;
 }

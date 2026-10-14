@@ -478,11 +478,18 @@ static int prefetch_indices(z3 *z, const int64_t *s0, const int64_t *s1, int nth
    The volcomp mask codec is a serial arithmetic coder (~10 ms per 128^3 chunk, the sampler's largest decode for binary
    labels). Decoded mask chunks with two values are kept in memory as bits, process-wide, the least recently used dropped
    past UFSM_Z3_MASK_CACHE_MB (default 1024; 0 = off). Keys: the z3's id, shard and inner chunk. */
-typedef struct mc_entry { uint64_t z, tick; int64_t s[3]; int ci, refs, dead; uint8_t v0, v1; uint8_t *bits; size_t nbytes; struct mc_entry *next; } mc_entry;
+typedef struct mc_entry { uint64_t z, tick; int64_t s[3]; int ci, refs, dead; uint8_t v0, v1; uint8_t *bits; size_t nbytes, h; struct mc_entry *next, *lp, *ln; } mc_entry;
 #define MC_NB 8192
 static pthread_mutex_t g_mc_mu = PTHREAD_MUTEX_INITIALIZER;
 static mc_entry *g_mc_b[MC_NB];
+static mc_entry *g_mc_lh, *g_mc_lt;   /* recency list: head = most recently used (the eviction scanned every bucket under the lock) */
 static size_t g_mc_bytes, g_mc_n; static uint64_t g_mc_tick; static long long g_mc_budget = -1;
+static void mc_lru_unlink(mc_entry *e) {
+    if (e->lp) e->lp->ln = e->ln; else g_mc_lh = e->ln;
+    if (e->ln) e->ln->lp = e->lp; else g_mc_lt = e->lp;
+    e->lp = e->ln = nullptr;
+}
+static void mc_lru_front(mc_entry *e) { e->lp = nullptr; e->ln = g_mc_lh; if (g_mc_lh) g_mc_lh->lp = e; g_mc_lh = e; if (!g_mc_lt) g_mc_lt = e; }
 static long long mc_budget(void) {
     if (g_mc_budget < 0) { const char *e = getenv("UFSM_Z3_MASK_CACHE_MB"); g_mc_budget = (e && *e ? atoll(e) : 1024) << 20; }
     return g_mc_budget;
@@ -500,6 +507,7 @@ static int mc_copy(const job *jb, const work *w) {
     while (e && !(e->z == z->id && e->s[0] == w->sz && e->s[1] == w->sy && e->s[2] == w->sx && e->ci == w->ci)) e = e->next;
     if (!e) { pthread_mutex_unlock(&g_mc_mu); return 0; }
     e->tick = ++g_mc_tick; e->refs++;   /* copied outside the lock; an evicted entry in use is freed by its last reader */
+    mc_lru_unlink(e); mc_lru_front(e);
     pthread_mutex_unlock(&g_mc_mu);
     int64_t c0[3] = {w->sz * m->shard[0] + (int64_t)w->cz * m->chunk[0], w->sy * m->shard[1] + (int64_t)w->cy * m->chunk[1],
                      w->sx * m->shard[2] + (int64_t)w->cx * m->chunk[2]}, lo[3], hi[3];
@@ -538,18 +546,18 @@ static void mc_put(const z3 *z, const work *w, const uint8_t *dec, size_t cv) {
     }
     mc_entry *ne = malloc(sizeof *ne);
     if (!ne) { free(bits); return; }
-    *ne = (mc_entry){z->id, 0, {w->sz, w->sy, w->sx}, w->ci, 0, 0, v0, v1, bits, nb, nullptr};
-    pthread_mutex_lock(&g_mc_mu);
     const size_t h = mc_hash(z->id, w);
+    *ne = (mc_entry){z->id, 0, {w->sz, w->sy, w->sx}, w->ci, 0, 0, v0, v1, bits, nb, h, nullptr, nullptr, nullptr};
+    pthread_mutex_lock(&g_mc_mu);
     for (mc_entry *e = g_mc_b[h]; e; e = e->next)
         if (e->z == z->id && e->s[0] == w->sz && e->s[1] == w->sy && e->s[2] == w->sx && e->ci == w->ci) { pthread_mutex_unlock(&g_mc_mu); free(bits); free(ne); return; }
-    while (g_mc_n && (long long)(g_mc_bytes + nb) > budget) {   /* drop the least recently used */
-        mc_entry **victim = nullptr;
-        for (size_t i = 0; i < MC_NB; i++) for (mc_entry **pe = &g_mc_b[i]; *pe; pe = &(*pe)->next) if (!victim || (*pe)->tick < (*victim)->tick) victim = pe;
-        mc_entry *v = *victim; *victim = v->next; g_mc_bytes -= v->nbytes; g_mc_n--;
+    while (g_mc_n && g_mc_lt && (long long)(g_mc_bytes + nb) > budget) {   /* drop the least recently used: the list's tail */
+        mc_entry *v = g_mc_lt, **pe = &g_mc_b[v->h];
+        while (*pe != v) pe = &(*pe)->next;
+        *pe = v->next; mc_lru_unlink(v); g_mc_bytes -= v->nbytes; g_mc_n--;
         if (v->refs) v->dead = 1; else { free(v->bits); free(v); }
     }
-    ne->tick = ++g_mc_tick; ne->next = g_mc_b[h]; g_mc_b[h] = ne; g_mc_bytes += nb; g_mc_n++;
+    ne->tick = ++g_mc_tick; ne->next = g_mc_b[h]; g_mc_b[h] = ne; mc_lru_front(ne); g_mc_bytes += nb; g_mc_n++;
     pthread_mutex_unlock(&g_mc_mu);
 }
 

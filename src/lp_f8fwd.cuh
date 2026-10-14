@@ -165,7 +165,9 @@ __global__ void prep_w8s_k(const float *__restrict__ w, uint8_t *__restrict__ wq
 template <int MT, int CP, typename T, typename TO = T>   /* TO: output type (an MX output from a 16-bit network input) */
 __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                       const float *__restrict__ b, TO *__restrict__ y,
-                                                      int N, int Ci, int D, int H, int W, int Co, int Cop, gnp_t gp, double *__restrict__ osum, int Go, split_t sp) {
+                                                      int N, int Ci, int D, int H, int W, int Co, int Cop, gnp_t gp, double *__restrict__ osum, int Go, split_t sp,
+                                                      int ZC, unsigned scr_off) {   /* ZC z tiles per block (weights and channel table staged once); scr_off:
+                                                                                     the epilogue scratch, after the resident weights */
     constexpr int BM = MT * 16, TPK = 32 / CP, NKB = (27 + TPK - 1) / TPK, NRX = 2;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sx = smem_raw;                         /* [F8_T pos][CP] */
@@ -176,19 +178,15 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
     const int wz = warp >> 2, wr = (warp & 3) * 2;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * 8;
     int bz = blockIdx.z;
-    const int nzt = (D + 1) / 2;
-    const int oz0 = (bz % nzt) * 2; bz /= nzt;
+    const int nzt = (D + 1) / 2, nzc = (nzt + ZC - 1) / ZC;
+    const int zc = bz % nzc; bz /= nzc;
     const int nmt = Cop / BM;
     const int co0 = (bz % nmt) * BM; const int n = bz / nmt;
-    float acc[MT][2][2][4];
-#pragma unroll
-    for (int m = 0; m < MT; m++) for (int r = 0; r < 2; r++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[m][r][q][k] = 0.f;
     const int zi0 = sp.zi0, Di = sp.Di ? sp.Di : D;   /* z-range (nn_set_zrange): output plane z reads input plane z + zi0 of a depth-Di input */
     const size_t plane = (size_t)Di * H * W;
     const int Cx = sp.x2 ? sp.c_split : Ci;
     chan_t *ctab = (chan_t *)(samax + 4);              /* [16] */
     const bool G = gp.G != 0 || sp.gp2.G != 0;
-    if (threadIdx.x == 0) *samax = 0u;
     if (threadIdx.x < CP) ctab[threadIdx.x] = make_chan(threadIdx.x, Ci, Cx, n, plane, x, sp, gp, N);
     for (int i = threadIdx.x; i < NKB * BM * 2; i += 256) {
         int kb = i / (BM * 2), r = i % (BM * 2), c = r >> 1, h = r & 1;
@@ -196,6 +194,17 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
     }
     for (int i = threadIdx.x; i < NKB * BM; i += 256) { int kb = i / BM, c = i % BM; was[i] = wsc[(size_t)kb * Cop + co0 + c]; }
     __syncthreads();
+    bool row1 = IS_MX8(T) && CP <= 4 && !G && Ci == CP && ctab[0].p && ctab[0].bw >= CP;   /* the CP channels are one MX-fp8 block row (the network
+                                                                                          input): staged with one row and one scale load */
+    for (int k = 1; k < CP && row1; k++) row1 = ctab[k].p == (const void *)((const uint8_t *)ctab[0].p + k) && ctab[k].sp == ctab[0].sp;
+    for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
+    const int oz0 = tz * 2;
+    if (tz > zc * ZC) __syncthreads();   /* the previous tile's MMA (sx) and amax reads are done */
+    if (threadIdx.x == 0) *samax = 0u;
+    __syncthreads();
+    float acc[MT][2][2][4];
+#pragma unroll
+    for (int m = 0; m < MT; m++) for (int r = 0; r < 2; r++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[m][r][q][k] = 0.f;
     float v[3][CP];
     float amax = 0.f;
 #pragma unroll
@@ -205,6 +214,16 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
         int gz = oz0 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
         bool inb = pos < F8_T && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
         size_t off = inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0;
+        if constexpr (IS_MX8(T) && CP <= 4) if (row1) {   /* the same values as ldc per channel: e4m3 bytes of the row times its scale */
+            const chan_t &c0 = ctab[0];
+            unsigned wv = 0u; float sc = 0.f;
+            if (inb) { wv = __ldg((const unsigned *)((const uint8_t *)c0.p + off * c0.rb)); sc = mx_scale(c0.sp[off]); }
+            const float2 lo = dec_e4m3x2((unsigned short)(wv & 0xffffu)), hi = dec_e4m3x2((unsigned short)(wv >> 16));
+            const float d4[4] = {lo.x, lo.y, hi.x, hi.y};
+#pragma unroll
+            for (int k = 0; k < CP; k++) { const float val = inb ? d4[k] * sc : 0.f; v[j][k] = val; amax = fmaxf(amax, fabsf(val)); }
+            continue;
+        }
 #pragma unroll
         for (int k = 0; k < CP; k++) {
             float val = 0.f;
@@ -259,18 +278,27 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
             for (int r = 0; r < 2; r++) { mma_f8(acc[m][r][0], af, bfr[r][0], sa, sb); mma_f8(acc[m][r][1], af, bfr[r][1], sa, sb); }
         }
     }
-    fwd_epilogue<MT, NRX, TO, true>(acc, smem_raw, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N);
+    fwd_epilogue<MT, NRX, TO, true>(acc, smem_raw + scr_off, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N, scr_off);
+    }
 }
 
 
 template <int MT, int CP, typename T, typename TO> void launch_f8s(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, gnp_t gp, double *osum, int Go, split_t sp) {
     constexpr int TPK = 32 / CP, NKB = (27 + TPK - 1) / TPK;
-    size_t smem = (size_t)F8_T * CP + NKB * MT * 16 * 32 + ((NKB * MT * 16 + 15) & ~15) + 16 + 16 * sizeof(chan_t);
-    if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
-    if (IS_MX(TO) && MT % 2 == 0 && smem < FEPI_SCR(16)) smem = FEPI_SCR(16);   /* the transposed MX epilogue's scratch (with 8 KB it fell back to the generic one) */
+    /* the tile, the weights and the channel table, then the epilogue scratch (it used to overlay them: they are resident now) */
+    const size_t base = ((size_t)F8_T * CP + NKB * MT * 16 * 32 + ((NKB * MT * 16 + 15) & ~15) + 16 + 16 * sizeof(chan_t) + 127) & ~(size_t)127;
+    size_t scr = 8 * 256 * sizeof(float);
+    if (IS_MX(TO) && MT % 2 == 0 && scr < FEPI_SCR(16)) scr = FEPI_SCR(16);   /* the transposed MX epilogue's scratch (with 8 KB it fell back to the generic one) */
+    const size_t smem = base + scr;
+    static int zc_env = -2;
+    if (zc_env == -2) zc_env = getenv("UFSM_F8S_ZC") ? atoi(getenv("UFSM_F8S_ZC")) : -1;
+    const int nzt = (xs.d + 1) / 2, rest = (int)(grid.x * grid.y * (grid.z / nzt));   /* blocks per z column */
+    int ZC = zc_env > 0 ? zc_env : 8;   /* z tiles per block, while >= ~480 blocks remain */
+    while (ZC > 1 && (size_t)rest * ((nzt + ZC - 1) / ZC) < 480) ZC--;
+    grid.z = (grid.z / nzt) * ((nzt + ZC - 1) / ZC);
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f8s_k<MT, CP, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    conv_fwd_f8s_k<MT, CP, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp);
+    conv_fwd_f8s_k<MT, CP, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp, ZC, (unsigned)base);
 }
 template <int CP, typename T, typename TO = T> static void small_f8(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp) {
     constexpr int TPK = 32 / CP, NKB = (27 + TPK - 1) / TPK;
