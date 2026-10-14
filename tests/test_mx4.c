@@ -380,6 +380,38 @@ int main(void) {
         mode_ref(); nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, t); nn_conv3d_fwd(t, xs, w, b, 32, 3, 2, yr2);
         mode_mx(); nn_conv3d_fwd_x(xm, &g, nullptr, nullptr, 0, 0, xs, w, b, 32, 3, 2, (float *)ym2, 0, 0.f, nullptr, nullptr);
         cmp("s2 fwd gn+silu input (mx4 -> mx4)", deq4(ym2, ys), yr2, ny, TOL4O);
+        {   /* down0's fp4 kernel (32 channels, output width % 16): the same reference, fp4 vs the fp8 kernel's error */
+            shape5 xb = {N, 32, 32, 32, 32}, yb = {N, 32, 16, 16, 16};
+            const size_t nxb = shape_numel(xb), nyb = shape_numel(yb);
+            float *xx = dev_rand(nxb, 1.f), *tb = dev_zero(nxb), *yrb = dev_zero(nyb); void *xxm = mx4_from(xx, xb); float *xxd = deq4(xxm, xb);
+            mode_ref(); nn_gn_silu_apply(xxd, xb, G, gam, bet, mean, rstd, tb); nn_conv3d_fwd(tb, xb, w, b, 32, 3, 2, yrb);
+            double e[2];
+            for (int f4 = 0; f4 < 2; f4++) {
+                void *yy = mx4_new(yb); lp_set_s2_f4(f4);
+                mode_mx(); nn_conv3d_fwd_x(xxm, &g, nullptr, nullptr, 0, 0, xb, w, b, 32, 3, 2, (float *)yy, 0, 0.f, nullptr, nullptr);
+                e[f4] = cmp(f4 ? "s2 fwd gn+silu 32^3, fp4 kernel" : "s2 fwd gn+silu 32^3, fp8 kernel", deq4(yy, yb), yrb, nyb, f4 ? TOL4 : TOL4O);   /* fp4: e2m1 operands (as the
+                                                                                                                                   stride-1 fp4 convs) */
+                nn_free(yy);
+            }
+            lp_set_s2_f4(-1);
+            check("s2 fp4 kernel taken (its error differs from the fp8 kernel's)", e[1] != e[0]);
+            /* backward-data with MX-fp4 gy and gx (the trainer's down0, accumulating into the skip gradient): fp4 kernel vs bf16 */
+            float *gyb = dev_rand(nyb, 1e-2f), *old = dev_rand(nxb, 1e-2f), *gxr = dev_zero(nxb);
+            float *scr = nn_malloc(nn_conv3d_scratch(xb, 32, 3) * 2 + nxb * 4);
+            void *gym = mx4_from(gyb, yb), *oldm = mx4_from(old, xb); float *gyd = deq4(gym, yb), *oldd = deq4(oldm, xb);
+            mode_ref(); nn_conv3d_bwd_data(gyd, yb, w, xb, 3, 2, gxr, scr); nn_axpy(gxr, 1.f, oldd, nxb);
+            double eb[2];
+            for (int f4 = 0; f4 < 2; f4++) {
+                void *gx4 = mx4_from(old, xb); lp_set_s2b_f4(f4);
+                mode_mx(); nn_conv3d_bwd_data_acc(gym, yb, w, xb, 3, 2, (float *)gx4, scr);
+                eb[f4] = cmp(f4 ? "s2 bwd_data 32^3 mx4 (acc), fp4 kernel" : "s2 bwd_data 32^3 mx4 (acc), bf16 kernel", deq4(gx4, xb), gxr, nxb, TOL4);
+                nn_free(gx4);
+            }
+            lp_set_s2b_f4(-1);
+            check("s2 bwd_data fp4 kernel taken", eb[1] != eb[0]);
+            nn_free(gyb); nn_free(old); nn_free(gxr); nn_free(scr); nn_free(gym); nn_free(oldm); nn_free(gyd); nn_free(oldd);
+            nn_free(xx); nn_free(tb); nn_free(yrb); nn_free(xxm); nn_free(xxd);
+        }
         float *x6 = dev_rand(shape_numel(x16), 1.f), *w6 = dev_rand((size_t)16 * 16 * 27, 0.1f); void *x6m = mx4_from(x6, x16); float *x6d = deq4(x6m, x16);
         float *y6r = dev_zero(shape_numel(y16)); void *y6m = mx4_new(y16);
         mode_ref(); nn_conv3d_fwd(x6d, x16, w6, nullptr, 16, 3, 2, y6r);
@@ -762,12 +794,12 @@ int main(void) {
     }
     {   /* fp8 weight gradient on MX inputs: the cooperative staging (x row decoded once per voxel for all channels, gy per
            voxel for all outputs) must reproduce the per-element staging bit for bit, SR and gn+silu included */
-        const int Gn = 8;
         struct { int ci, co, w; const char *nm; } cs[] = {{32, 32, 16, "32 -> 32, W 16"}, {16, 16, 20, "16 -> 16, W 20"}, {48, 16, 16, "48 -> 16 (NT 3)"}, {80, 80, 12, "80 -> 80, W 12"},
                                                           {4, 16, 16, "4 -> 16 (network input), W 16"}, {4, 32, 16, "4 -> 32 (network input), W 16"},
                                                           {4, 64, 16, "4 -> 64 (half-resolution input), W 16"}, {8, 64, 16, "8 -> 64 (half-resolution input), W 16"},
                                                           {8, 96, 16, "8 -> 96 (quarter-resolution input), W 16"}};
         for (int i = 0; i < 9; i++) {
+            const int Gn = cs[i].ci < 8 ? cs[i].ci : 8;   /* at most one group per channel (8 groups over 4 channels divide by zero in make_chan) */
             shape5 xs = {2, cs[i].ci, 6, 10, cs[i].w}, ys = xs; ys.c = cs[i].co;
             size_t nx = shape_numel(xs), ny = shape_numel(ys), nw = (size_t)cs[i].co * cs[i].ci * 27, NG = (size_t)2 * Gn;
             float *xr = dev_rand(nx, 2.f), *gr = dev_rand(ny, 1e-3f);
