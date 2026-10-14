@@ -7,7 +7,8 @@
    UFSM_BENCH_PAPYRUS=sigma,tau_lo,tau_hi,clean: task papyrus labels (cutoffs U(50, 128), conditioned); UFSM_BENCH_SCAN=P: the
    papyrus recipe's scanner ops (noise cnoise blur lowres sharpen ring slice quant) at probability P;
    UFSM_BENCH_DUMP=prefix: mid-z planes of the first batch (prefix-input.pgm, -target.pgm, -mask.pgm, -phase.pgm with SIDE=2) and its
-   cutoff code; UFSM_BENCH_PZ=N: N x P x P slab windows */
+   cutoff code; UFSM_BENCH_PZ=N: N x P x P slab windows; UFSM_BENCH_NEAR=X: the phase only within X um of a labelled wrap (train
+   --phase-near-um; the known-phase fraction is printed) */
 #include "nn.h"
 #include "sample.h"
 #include "sources.h"
@@ -36,6 +37,7 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_BENCH_SOFT")) c.soft = (float)atof(getenv("UFSM_BENCH_SOFT"));
     if (getenv("UFSM_BENCH_LEVELS")) { char *t = strdup(getenv("UFSM_BENCH_LEVELS")); int l = 0; memset(c.level_p, 0, sizeof c.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) c.level_p[l++] = atof(q); free(t); }   /* as train --levels */
     if (getenv("UFSM_BENCH_SIDE")) c.side = atoi(getenv("UFSM_BENCH_SIDE"));
+    if (getenv("UFSM_BENCH_NEAR")) c.phase_near_um = (float)atof(getenv("UFSM_BENCH_NEAR"));   /* --phase-near-um */
     if (getenv("UFSM_BENCH_PZ")) c.Pz = atoi(getenv("UFSM_BENCH_PZ"));
     const int Pz = c.Pz > 0 ? c.Pz : P;   /* task unwrap's phase (no band affinities): the side array is hashed too */
     if (getenv("UFSM_BENCH_COVER")) {
@@ -73,13 +75,16 @@ int main(int argc, char **argv) {
         free(img); sampler_release(sp, b);
     }
     for (int i = 0; i < 4; i++) { batch *b = sampler_next(sp); if (!b) return 1; if (hashing) { h = hash(h, b->x16, (size_t)c.B * 4 * p3 * 2); h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); } sampler_release(sp, b); }   /* warm-up */
+    size_t side_known = 0, side_all = 0;   /* phase voxels known (UFSM_BENCH_SIDE=2) */
     double t0 = now();
     for (int i = 0; i < NB; i++) {
         batch *b = sampler_next(sp); if (!b) return 1;
+        if (b->side) for (size_t k = 0; k < (size_t)c.B * p3; k++) { side_known += b->side[k] < 252; side_all++; }
         if (hashing) { h = hash(h, b->x16, (size_t)c.B * 4 * p3 * 2); h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); }
         sampler_release(sp, b);
     }
     double dt = now() - t0;
+    if (side_all) printf("phase known in %.4f of the voxels\n", (double)side_known / side_all);
     uint64_t prod, rej; sampler_stats(sp, &prod, &rej);
     printf("%dx%dx%d workers=%d: %.1f samples/s (%d batches of %d in %.1fs; produced %llu rejected %llu)\n", Pz, P, P, W, NB * c.B / dt, NB, c.B, dt, (unsigned long long)prod, (unsigned long long)rej);
     if (hashing) printf("hash %016llx over %d batches\n", (unsigned long long)h, NB + 4);

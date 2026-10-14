@@ -46,6 +46,9 @@ typedef struct {
                                 needs geometry_augment, same sources as the zoom */
     const sheet_dataset *sheet; /* borrowed sparse geometry, native-level B=1 task */
     int band;                /* 1: fill batch.band from each source's band target (task band_affinity, native level, no geometry warp) */
+    float phase_near_um;     /* > 0 (stored phase, side 2): the phase target only within this distance (um) of a labelled wrap voxel
+                                (target channel 0): the stored phase interpolates between published wraps, and across a missing wrap
+                                the interpolated phase is off by up to half a turn */
     int side, side_air;      /* side: 1 fills batch.side (band.h SIDE_*: recto / verso side of the nearest labelled recto) from the same band
                                 field, 2 fills it with the winding phase (band.h PHASE_*); voxels with CT <= side_air (and CT 0) are unknown */
     int aux;                 /* 1: a fifth input channel from the source's aux volume (src/sources.h), symmetry applied like the CT;

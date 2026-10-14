@@ -801,6 +801,12 @@ int cmd_train(int argc, char **argv) {
     sc.phase_dense = atoi(opt(argc, argv, "--phase-dense", "0"));   /* side 2: weigh windings closer than this (label voxels) up */
     if (sc.phase_dense && g_side != 2) { fprintf(stderr, "--phase-dense needs --side 2\n"); return 2; }
     if (sc.phase_dense) fprintf(stderr, "phase: windings wider than %d label voxels supervised at a rate dense / spacing\n", sc.phase_dense);
+    /* --phase-near-um X: the stored phase supervised only within X um of a labelled wrap voxel (sample.h phase_near_um): the phase
+       raster interpolates between published wraps, wrongly across a missing one (on a Paris4 strip 82% of the phase target is
+       interpolated; the network's phase is grossly off in 20% of the cells on labelled wraps, 30% between them) */
+    sc.phase_near_um = (float)atof(opt(argc, argv, "--phase-near-um", "0"));
+    if (sc.phase_near_um < 0 || (sc.phase_near_um > 0 && g_side != 2)) { fprintf(stderr, "--phase-near-um: >= 0, task unwrap (the phase)\n"); return 2; }
+    if (sc.phase_near_um > 0) fprintf(stderr, "phase: supervised within %g um of a labelled wrap voxel\n", sc.phase_near_um);
     sc.ct_augment = atoi(opt(argc, argv, "--ct-aug", "0"));
     sc.symmetry_p = (float)atof(opt(argc, argv, "--symmetry-p", "1"));
     sc.axis_jitter = (float)atof(opt(argc, argv, "--axis-jitter", "0"));
@@ -1183,6 +1189,10 @@ int cmd_train(int argc, char **argv) {
             snprintf(runtime_extra+n-2,sizeof runtime_extra-n+2,",\"papyrus\":{\"version\":1,\"channel\":%d,\"labels\":\"gap\",\"cut\":[%.9g,%.9g],\"sigma\":%.9g,\"band\":%.9g,\"local\":%d,\"local_sigma\":%.9g,\"local_depth\":%.9g,\"local_margin\":%.9g,\"lambda\":%.9g}}}",
                      g_pap_ch,g_paph.t_lo,g_paph.t_hi,g_paph.sigma,g_paph.band,g_paph.local,g_paph.local_sigma,g_paph.local_depth,g_paph.local_margin,g_pap_lambda);
         }
+    }
+    if (sc.phase_near_um > 0) {   /* the phase supervision radius */
+        size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"phase_near_um\":%.9g}",sc.phase_near_um);
     }
     if (g_count_lambda > 0) {   /* the count loss */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;

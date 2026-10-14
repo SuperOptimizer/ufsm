@@ -5,6 +5,7 @@
 #include "nn.h"
 #include "ct_augment.h"
 #include "spatial_augment.h"
+#include "edt.h"
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -909,6 +910,16 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     }
     if (!c->cover && !c->papyrus && tmax == 0 && runif(r) > c->empty_keep) { atomic_fetch_add(&sp->rejected, 1); return 1; }
     PROF_MARK(PS_TARGETS);
+    uint8_t *near = nullptr;   /* --phase-near-um: voxels within the distance of a labelled wrap voxel (raw labels, before softening) */
+    if (c->phase_near_um > 0 && c->side == 2 && w[0]) {
+        const float rn = c->phase_near_um / (float)(s->um * (double)(1 << l)); float *d2 = malloc(p3 * sizeof *d2); uint8_t *feat = malloc(p3); near = malloc(p3);
+        const int64_t en[3] = {Pz, P, P};
+        if (!d2 || !feat || !near) { free(d2); free(feat); free(near); return -1; }
+        for (size_t k = 0; k < p3; k++) feat[k] = ttmp[k] == 254;
+        if (edt_sq(feat, en, d2, 1)) { free(d2); free(feat); free(near); return -1; }
+        for (size_t k = 0; k < p3; k++) near[k] = d2[k] <= rn * rn;
+        free(d2); free(feat);
+    }
     /* curriculum: thicken the surface band by max-filtering the target (hard labels only, pyramid sources) */
     if (c->dilate > 0 && region_ch < 0) {
         int D = c->dilate >> l; if (D < 1) D = 1;
@@ -1087,6 +1098,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             uint8_t *sw = malloc(p3);
             if (!sw || phase_window(s->phase, o, Pz, P, pshift, sw)) { free(sw); return -1; }
             for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) sw[k] = SIDE_UNKNOWN;
+            if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
             if (spatial.active) warp_phase(sw, b->side + (size_t)i * p3, P, y, &spatial);   /* (slabs never warp: sampler_start) */
             else sym_u8(sw, b->side + (size_t)i * p3, Pz, P, y);
             free(sw);
@@ -1128,6 +1140,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         }
         free(aw); free(as);
     }
+    free(near);
     if (c->cond) {   /* inputs 4-6 and batch.wind from the source's winding raster (on the stored phase's grid; air unknown like the phase) */
         uint8_t *ww = malloc(p3), *ws = malloc(p3);
         if (!ww || !ws) { free(ww); free(ws); return -1; }
