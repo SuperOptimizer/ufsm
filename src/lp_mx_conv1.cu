@@ -247,6 +247,119 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
         else if (gb && !blk && co0 + i - CI * 8 < Co) atomicAdd(&gb[co0 + i - CI * 8], s);
     }
 }
+/* the whole head backward in one pass over the 32-channel MX input x and the fp16 logit gradient gy (up to 16 logits):
+   weight and bias gradients as conv_bwd_w1_tc_k (two m16n8k16 column tiles: all outputs at once), and the input gradient
+   gx[ci][v] = sum_co w[co][ci] gy[co][v] (the gradient of act(x), the head's input) on the CUDA cores into an MX row (YB bits,
+   exact SR keyed by sr for fp4), as conv1_to_mx_t_k. The separate kernels read x twice (8 outputs per pass) and gy twice. */
+template <int B, int YB>
+__global__ void __launch_bounds__(256, 2) conv1_bwd_fused_k(const uint8_t *x, const __half *gy, const float *w, float *gw, float *gb, uint8_t *gx, int N, size_t S, gnp_t gp,
+                                                      int nper, int Co, unsigned sr) {
+    constexpr int CI = 32;
+    __shared__ float ca[CI], cb[CI];
+    __shared__ __align__(16) float sw[16][CI];                   /* w[co][ci] (rows >= Co zero) */
+    __shared__ __align__(16) __half sA[8][CI][40], sB[8][16][40];   /* [warp][ci][voxel], [warp][co][voxel] */
+    const int n = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (threadIdx.x < CI) {
+        const int k = threadIdx.x;
+        float a = 1.f, bb = 0.f;
+        if (gp.G) { const int ng = n * gp.G + k / (CI / gp.G); a = gp.rstd[ng] * gp.gamma[k]; bb = gp.beta[k] - gp.mean[ng] * a; }
+        ca[k] = a; cb[k] = bb;
+    }
+    for (int i = threadIdx.x; i < 16 * CI; i += 256) sw[i / CI][i % CI] = i / CI < Co ? w[i] : 0.f;
+    __syncthreads();
+    const uint8_t *sc = mx_sc<B>(x, N, CI, S);
+    uint8_t *gsc = mx_sc<YB>(gx, N, CI, S);
+    float c[3][2][4];   /* m 2: the bias sums, from an A tile whose row 0 is ones (lanes g == 0 hold them) */
+#pragma unroll
+    for (int m = 0; m < 3; m++)
+#pragma unroll
+        for (int q = 0; q < 2; q++) c[m][q][0] = c[m][q][1] = c[m][q][2] = c[m][q][3] = 0.f;
+    const int g = lane >> 2, t4 = lane & 3;
+    const size_t v0 = (size_t)blockIdx.x * nper, v1 = min(S, v0 + nper);
+    for (size_t vb = v0 + warp * 32; vb < v1; vb += 8 * 32) {   /* 32 voxels per warp step: lane = voxel */
+        const size_t v = vb + lane; const bool in = v < v1;
+        {
+            float r[32], gv[16], o[32];
+            if (in) mx_load_row_b<B>(x, sc, (size_t)n * S + v, CI, r);
+#pragma unroll
+            for (int k = 0; k < CI; k++) sA[warp][k][lane] = __float2half_rn(in ? (gp.G ? act_ab(r[k], ca[k], cb[k], true) : r[k]) : 0.f);
+#pragma unroll
+            for (int co = 0; co < 16; co++) {
+                const __half h = in && co < Co ? gy[((size_t)n * Co + co) * S + v] : __float2half_rn(0.f);
+                sB[warp][co][lane] = h; gv[co] = __half2float(h);
+            }
+#pragma unroll
+            for (int k = 0; k < CI; k++) o[k] = 0.f;
+#pragma unroll
+            for (int co = 0; co < 16; co++) {
+                if (co >= Co) break;
+#pragma unroll
+                for (int k4 = 0; k4 < CI / 4; k4++) {
+                    const float4 q = *(const float4 *)&sw[co][4 * k4];
+                    o[4 * k4] = fmaf(q.x, gv[co], o[4 * k4]); o[4 * k4 + 1] = fmaf(q.y, gv[co], o[4 * k4 + 1]);
+                    o[4 * k4 + 2] = fmaf(q.z, gv[co], o[4 * k4 + 2]); o[4 * k4 + 3] = fmaf(q.w, gv[co], o[4 * k4 + 3]);
+                }
+            }
+            if (in) mx_store_row_b<YB>(gx, gsc, (size_t)n * S + v, CI, o, sr);
+        }
+        __syncwarp();
+#pragma unroll
+        for (int ks = 0; ks < 2; ks++) {
+#pragma unroll
+            for (int q = 0; q < 2; q++) {
+                unsigned b[2];
+                b[0] = *(const unsigned *)&sB[warp][8 * q + g][16 * ks + 2 * t4]; b[1] = *(const unsigned *)&sB[warp][8 * q + g][16 * ks + 2 * t4 + 8];
+#pragma unroll
+                for (int m = 0; m < 2; m++) {
+                    unsigned a[4];
+                    a[0] = *(const unsigned *)&sA[warp][16 * m + g][16 * ks + 2 * t4];     a[1] = *(const unsigned *)&sA[warp][16 * m + g + 8][16 * ks + 2 * t4];
+                    a[2] = *(const unsigned *)&sA[warp][16 * m + g][16 * ks + 2 * t4 + 8]; a[3] = *(const unsigned *)&sA[warp][16 * m + g + 8][16 * ks + 2 * t4 + 8];
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                 : "+f"(c[m][q][0]), "+f"(c[m][q][1]), "+f"(c[m][q][2]), "+f"(c[m][q][3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+                }
+                {
+                    const unsigned one = g == 0 ? 0x3c003c00u : 0u;   /* A row 0 = ones (k 2 t4 .. + 1 and + 8 .. + 9) */
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                 : "+f"(c[2][q][0]), "+f"(c[2][q][1]), "+f"(c[2][q][2]), "+f"(c[2][q][3]) : "r"(one), "r"(0u), "r"(one), "r"(0u), "r"(b[0]), "r"(b[1]));
+                }
+            }
+        }
+        __syncwarp();
+    }
+    __syncthreads();   /* the reduction reuses sA: [warp][CI * 16 + 16] floats (8 x 528 x 4 B <= 20 KB) */
+    float (*red)[CI * 16 + 16] = (float (*)[CI * 16 + 16])&sA[0][0][0];
+    /* C[ci][co]: c[m][q][0..1] = C[16 m + g][8 q + 2 t4 .. + 1], c[m][q][2..3] = C[16 m + g + 8][..] */
+#pragma unroll
+    for (int m = 0; m < 2; m++)
+#pragma unroll
+        for (int q = 0; q < 2; q++) {
+            red[warp][(16 * m + g) * 16 + 8 * q + 2 * t4] = c[m][q][0]; red[warp][(16 * m + g) * 16 + 8 * q + 2 * t4 + 1] = c[m][q][1];
+            red[warp][(16 * m + g + 8) * 16 + 8 * q + 2 * t4] = c[m][q][2]; red[warp][(16 * m + g + 8) * 16 + 8 * q + 2 * t4 + 1] = c[m][q][3];
+        }
+    if (g == 0) { red[warp][CI * 16 + 2 * t4] = c[2][0][0]; red[warp][CI * 16 + 2 * t4 + 1] = c[2][0][1]; red[warp][CI * 16 + 8 + 2 * t4] = c[2][1][0]; red[warp][CI * 16 + 8 + 2 * t4 + 1] = c[2][1][1]; }
+    __syncthreads();
+    for (int i = threadIdx.x; i < CI * 16 + 16; i += blockDim.x) {
+        float s2 = 0.f;
+        for (int w2 = 0; w2 < 8; w2++) s2 += red[w2][i];
+        if (i < CI * 16) { const int ci = i / 16, co = i % 16; if (co < Co) atomicAdd(&gw[(size_t)co * CI + ci], s2); }
+        else if (gb && i - CI * 16 < Co) atomicAdd(&gb[i - CI * 16], s2);
+    }
+}
+/* the fused head backward (weight, bias and input gradient in one pass); returns 0 when the shapes / types are not covered (the
+   caller runs the separate kernels) */
+extern "C" int lp_head_bwd_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, const float *w, float *gw, float *gb, void *gx, int gxdt, gnp_t gp, unsigned sr) {
+    static int on = -1; if (on < 0) on = getenv("UFSM_HEAD_FUSED") ? atoi(getenv("UFSM_HEAD_FUSED")) : 1;
+    if (!on || xs.c != 32 || ys.c > 16 || gydt != 2 || (gxdt != 4 && gxdt != 8) || (xdt != 4 && xdt != 8) || (gp.G && 32 % gp.G)) return 0;
+    const size_t S = shape_spatial(xs);
+    const int nper = 8192;
+    const dim3 grid((unsigned)((S + nper - 1) / nper), xs.n);
+#define HBF(B, YB) conv1_bwd_fused_k<B, YB><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, w, gw, gb, (uint8_t *)gx, xs.n, S, gp, nper, ys.c, sr)
+    if (xdt == 4) { if (gxdt == 4) HBF(4, 4); else HBF(4, 8); }
+    else { if (gxdt == 4) HBF(8, 4); else HBF(8, 8); }
+#undef HBF
+    LPCK();
+    return 1;
+}
 /* returns 1 when the bias gradient (gb) was accumulated as well (tensor-core head path), else 0 (the caller adds it) */
 extern "C" int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp) {
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;

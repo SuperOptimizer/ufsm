@@ -317,6 +317,22 @@ int main(void) {
             mode_ref(); nn_gn_silu_bwd(xd, ss, G, gam, bet, mean, rstd, gyd, gxr8, gg1, gb1, scr);
             mode_mx(); nn_gn_silu_bwd(xm, ss, G, gam, bet, mean, rstd, gym, gxm, gg2, gb2, scr);
             snprintf(nm, sizeof nm, "gn+silu bwd gx (mx4 x, mx8 gy/gx, %d ch)", C); cmp(nm, deq8(gxm, ss), gxr8, n, TOL);
+            {   /* MX-fp4 gradients (the trainer default): gy and gx MX-fp4, gx stochastically rounded. One call is within the fp4
+                   tolerance; the mean of 16 calls (fresh SR seeds) must be ~4x closer (unbiased rounding), and the parameter
+                   gradients match the fp32 reference on the same dequantised gy */
+                void *gy4 = mx4_from(gy, ss); float *gy4d = deq4(gy4, ss), *gxr4 = dev_zero(n), *acc = dev_zero(n); void *gx4 = mx4_new(ss);
+                mode_ref(); nn_gn_silu_bwd(xd, ss, G, gam, bet, mean, rstd, gy4d, gxr4, gg1, gb1, scr);
+                mode_mx(); nn_gn_silu_bwd(xm, ss, G, gam, bet, mean, rstd, gy4, gx4, gg2, gb2, scr);
+                snprintf(nm, sizeof nm, "gn+silu bwd gx (mx4 x, mx4 gy/gx, %d ch)", C); const double e1 = cmp(nm, deq4(gx4, ss), gxr4, n, 0.25);   /* one SR draw: ~1.4x the RN error */
+                snprintf(nm, sizeof nm, "gn+silu bwd ggamma (mx4 x, mx4 gy, %d ch)", C); cmp(nm, gg2, gg1, C, 1e-4);
+                snprintf(nm, sizeof nm, "gn+silu bwd gbeta (mx4 x, mx4 gy, %d ch)", C); cmp(nm, gb2, gb1, C, 1e-4);
+                float *h = malloc(n * 4), *ha = calloc(n, 4);
+                for (int r = 0; r < 16; r++) { nn_gn_silu_bwd(xm, ss, G, gam, bet, mean, rstd, gy4, gx4, gg2, gb2, scr); float *d = deq4(gx4, ss); nn_d2h(h, d, n * 4); for (size_t i = 0; i < n; i++) ha[i] += h[i] / 16.f; }
+                nn_h2d(acc, ha, n * 4);
+                snprintf(nm, sizeof nm, "gn+silu bwd gx mean of 16 SR draws (mx4 gy/gx, %d ch)", C); const double e16 = cmp(nm, acc, gxr4, n, TOL4O);
+                if (!(e16 < 0.4 * e1)) { check("gx SR unbiased (mean of 16 draws ~4x closer)", 0); printf("    %.3g vs %.3g\n", e16, e1); }
+                free(h); free(ha);
+            }
         }
     }
     {   /* stride-1 weight gradients with an mx4 x: gn input (fp32 / mx8 gy), split input (dec0.c1 shape, 32 + 16), plain 16 ch */
@@ -849,7 +865,6 @@ int main(void) {
     }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     e = lp_check(); if (e) { printf("cuda (lp): %s\n", e); bad++; }
-    printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);
     (void)mode_ref; (void)mode_mx; (void)TOL4; (void)TOL; (void)G; (void)dev_rand;
     for (int CI = 16; CI <= 96; CI += CI < 32 ? 16 : 32) {   /* wide heads (band affinity outputs, + 2 phase channels): 1^3 weight gradient, 16 / 32 /
                                                  64 / 96 MX inputs (optionally GN+SiLU) x 3..16 outputs, vs fp32 (> 32: low-resolution nets, tensor cores only) */
@@ -916,6 +931,21 @@ int main(void) {
             }
             snprintf(nm, sizeof nm, "head fwd %d -> %d (mx4 x%s, fp16 logits)", CI, co, G ? ", gn+silu" : "");
             cmp(nm, yhf, yr, ny, 2e-3);
+            if (CI == 32) {   /* the fused head backward (fp16 logit gradient, MX-fp4 input gradient with SR): weight / bias gradients
+                                 as the separate tensor-core kernel, input gradient as nn_conv3d_bwd_data */
+                const int f16 = nn_get_f16(); nn_set_f16(1);
+                float *gyf = dev_rand(ny, 1e-2f); void *gyh = nn_malloc(ny * 2); nn_f32_to_h16(gyf, ny, gyh, 1.f);
+                float *gr3 = dev_zero((size_t)co * CI), *gb3 = dev_zero(co), *gw3 = dev_zero((size_t)co * CI), *gbf = dev_zero(co), *gx3r = dev_zero(nx), *scr3 = nn_malloc((size_t)co * CI * 4 + 64);
+                void *gx3 = mx4_new(xs);
+                mode_ref(); w1_ref(xa, xs, gyf, co, gr3, gb3); nn_set_f16(0); nn_conv3d_bwd_data(gyf, ys, w, xs, 1, 1, gx3r, scr3); nn_set_f16(1);
+                mode_mx();
+                const int done = lp_head_bwd_mx(xm, 4, xs, gyh, 2, ys, w, gw3, gbf, gx3, 4, gp, 0x1234567u);
+                snprintf(nm, sizeof nm, "head bwd fused %d -> %d%s: weight grad", CI, co, G ? ", gn+silu" : ""); cmp(nm, gw3, gr3, (size_t)co * CI, 3e-3);
+                snprintf(nm, sizeof nm, "head bwd fused %d -> %d%s: bias grad", CI, co, G ? ", gn+silu" : ""); cmp(nm, gbf, gb3, co, 3e-3);
+                snprintf(nm, sizeof nm, "head bwd fused %d -> %d%s: mx4 input grad (SR)", CI, co, G ? ", gn+silu" : ""); cmp(nm, deq4(gx3, xs), gx3r, nx, 0.25);
+                if (!done) { printf("  head bwd fused: kernel not taken  FAIL\n"); bad++; }
+                nn_set_f16(f16); nn_free(gyf); nn_free(gyh); nn_free(gr3); nn_free(gb3); nn_free(gw3); nn_free(gbf); nn_free(gx3r); nn_free(scr3); nn_free(gx3);
+            }
             nn_free(xa); nn_free(yr); nn_free(ym); nn_free(yh); nn_free(yhf);
         }
         float *gy = dev_rand(ny, 1e-2f), *scr = nn_malloc((size_t)co * CI * 4 + 64), *gxr = dev_zero(nx); void *gxm = mx4_new(xs);
@@ -926,5 +956,6 @@ int main(void) {
         nn_free(x); nn_free(w); nn_free(b); nn_free(xm); nn_free(xd); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd);
         nn_free(gy); nn_free(scr); nn_free(gxr); nn_free(gxm);
     }
+    printf(bad ? "mx4 FAIL (%d)\n" : "mx4 ok\n", bad);   /* after the head sections (their failures counted too) */
     return bad != 0;
 }

@@ -176,6 +176,7 @@ int nn_conv3d_fwd_gn_stats(const float *x, shape5 xs, int G_in, const float *gam
 typedef struct { const float *gamma, *beta, *mean, *rstd; int G; } nn_gn_t;
 int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, int up, shape5 xs,
                     const float *w, const float *b, int cout, int k, int stride, float *y, int G_out, float eps, float *omean, float *orstd);
+int nn_head_bwd_x(const float *x, const nn_gn_t *gx_gn, shape5 xs, const float *gy, shape5 ys, const float *w, float *gw, float *gb, float *gx);   /* fused 1^3 head backward (MX x / gx, fp16 gy); -1 = not covered */
 int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, int up, shape5 xs,
                            const float *gy, shape5 ys, int k, int stride, float *gw, float *gb);   /* gw / gb accumulated */
 int nn_conv3d_fwd_split(const float *x, const float *x2, int c_split, shape5 xs, int G_in, const float *gamma, const float *beta, const float *mean, const float *rstd,

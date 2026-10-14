@@ -15,9 +15,17 @@ template <int B> __device__ __forceinline__ void mx_store_row_b(uint8_t *q, uint
     for (int k = 0; k < 32; k++) if (k < bw) am = amax_u(am, v[k]);
     const int e = mx_exp(__uint_as_float(am), mxf<B>::inv_qmax);
     const float m = exp2i(-e);
-    if (B == 4 && sr) {
+    if (B == 4 && sr) {   /* exact SR with 16-bit uniforms straight to nibbles: one hash + 3 remixes per 8 values, keyed by (sr, row,
+                             8-value group) (a full hash, SR to a float and the e2m1 conversion per value made the GN backward apply
+                             compute-bound) */
+        unsigned w[4];
 #pragma unroll
-        for (int k = 0; k < 32; k++) if (k < bw) v[k] = sr_e2m1(v[k] * m, sr_hash(sr, ri * 32 + k)) / m;
+        for (int j = 0; j < 4; j++) { w[j] = 0u; if (8 * j < bw) { uint32_t hh[4]; sr_hash4(sr, ri * 4 + j, hh); w[j] = sr_e2m1_word(v + 8 * j, m, hh); } }
+        uint8_t *p = q + ri * mx_rb(bw, B);
+        if (bw == 8) *(unsigned *)p = w[0];
+        else { *(uint2 *)p = make_uint2(w[0], w[1]); if (bw == 32) *((uint2 *)p + 1) = make_uint2(w[2], w[3]); }
+        sc[ri] = (uint8_t)(e + 127);
+        return;
     }
     mxf<B>::enc_row(q + ri * mx_rb(bw, B), bw, v, m);
     sc[ri] = (uint8_t)(e + 127);

@@ -101,6 +101,17 @@ extern "C" int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const f
     }
     return -1;
 }
+/* the head's whole backward (1^3 conv on act(x), GN+SiLU applied on the fly): weight / bias gradients into gw / gb (accumulated)
+   and the input gradient into gx (overwritten) in one pass; -1 when the fused kernel does not cover the storage (the caller runs
+   nn_conv3d_bwd_weight_x and nn_conv3d_bwd_data) */
+extern "C" int nn_head_bwd_x(const float *x, const nn_gn_t *gx_gn, shape5 xs, const float *gy, shape5 ys, const float *w, float *gw, float *gb, float *gx) {
+    if (!g_tf32 || !ISMX(x) || !ISMX(gx) || ISMX(gy) || !GBF || !g_h16) return -1;
+    gnp_t gp = to_gnp(gx_gn);
+    if (!lp_head_bwd_mx(x, MXDT(x), xs, gy, 2, ys, w, gw, gb, gx, MXDT(gx), gp, MXDT(gx) == 4 ? sr_seed() : 0u)) return -1;
+    exec_prec(2, 0); exec_prec(1, 0);
+    KCHECK();
+    return 0;
+}
 extern "C" void nn_silu_bwd_gn(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy, float *gx) {
     if (G > s.c) G = s.c;
     size_t n = shape_numel(s);

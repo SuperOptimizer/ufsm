@@ -2,7 +2,7 @@
 """Per-layer roofline of a `UFSM_PROF=layers ufsm train` log: measured ms per conv pass against the hardware floor
 max(FLOPs / MMA peak, bytes / DRAM bandwidth) of the same pass, ranked by the time above the floor.
 
-usage: roofline.py TRAIN_LOG [--P 704] [--split 1] [--steps-per-report 20] [--gpus 2] [--widths 16,32,64,80] [--cout 2]
+usage: roofline.py TRAIN_LOG [--P 704] [--split 1] [--steps-per-report 20] [--gpus 2] [--widths 16,32,64,80] [--dec-widths 0,32] [--cout 2]
 Defaults (RTX 5060 Ti, the --fp4 2 recipe): MMA peak 425 TFLOP/s for fp4 operands (MXFP4, fp32 accumulate),
 213 for fp8, 54 for 16-bit and fp32 accumulate, 23 for fp32 CUDA-core kernels; DRAM 448 GB/s (--peak-fp4 / --peak-fp8 /
 --peak-16 / --peak-fp32 / --bw for other cards); activations stored MX-fp4 (4.25 bits / element), activation gradients
@@ -11,22 +11,23 @@ optimistic. The precision of each pass is the first one the log's executed_compu
 convs, fp16 for the head, when the log has none). Layer slots as in src/unet.c: slot = 2 * layer + conv with, for L
 levels, enc0..enc(L-1) = 0..L-1, down0..down(L-2) = L..2L-2, dec(L-2)..dec0 = 2L-1..3L-3, head = 3L-2.
 Shapes: enc l conv1 W[l-1] (4 inputs at l = 0) -> W[l], conv2 W[l] -> W[l]; down l W[l] -> W[l] at stride 2;
-dec l conv1 W[l + 1] + W[l] -> W[l], conv2 W[l] -> W[l]; head W[0] -> cout (1^3)."""
+dec l conv1 D[l + 1] + W[l] -> W[l], conv2 W[l] -> W[l] (D = --dec-widths, 0 = W; the coarsest level is always W); head W[0] -> cout (1^3)."""
 import argparse, re
 
 B_ACT, B_GRAD = 4.25 / 8, 8.25 / 8
 
 
-def convs(W, cout):
+def convs(W, cout, D=()):
     """slot -> (name, level of the input, cin, cout, k, stride)"""
     L, c = len(W), {}
+    dw = lambda i: W[i] if i >= L - 1 or i >= len(D) or not D[i] else D[i]
     for l in range(L):
         c[2 * l] = ('enc%d.c1' % l, l, 4 if l == 0 else W[l - 1], W[l], 3, 1)
         c[2 * l + 1] = ('enc%d.c2' % l, l, W[l], W[l], 3, 1)
     for l in range(L - 1):
         c[2 * (L + l)] = ('down%d' % l, l, W[l], W[l], 3, 2)
         lid = 3 * L - 3 - l
-        c[2 * lid] = ('dec%d.c1' % l, l, W[l + 1] + W[l], W[l], 3, 1)
+        c[2 * lid] = ('dec%d.c1' % l, l, dw(l + 1) + W[l], W[l], 3, 1)
         c[2 * lid + 1] = ('dec%d.c2' % l, l, W[l], W[l], 3, 1)
     c[2 * (3 * L - 2)] = ('head', 0, W[0], cout, 1, 1)
     return c
@@ -47,7 +48,7 @@ def main():
     a.add_argument('log'); a.add_argument('--P', type=int, default=704); a.add_argument('--split', type=int, default=1)
     a.add_argument('--halo', type=int, default=None, help='split halo planes at level 0 (default 2^(L-1))')
     a.add_argument('--steps-per-report', type=int, default=20); a.add_argument('--gpus', type=int, default=2)
-    a.add_argument('--widths', default='16,32,64,80'); a.add_argument('--cout', type=int, default=2)
+    a.add_argument('--widths', default='16,32,64,80'); a.add_argument('--dec-widths', default=''); a.add_argument('--cout', type=int, default=2)
     a.add_argument('--peak-fp4', type=float, default=425); a.add_argument('--peak-fp8', type=float, default=213)
     a.add_argument('--peak-16', type=float, default=54); a.add_argument('--peak-fp32', type=float, default=23)
     a.add_argument('--bw', type=float, default=448, help='DRAM GB/s')
@@ -55,6 +56,7 @@ def main():
                    'reports, which drops the warm-up and the final validation interval, else the last one)')
     g = a.parse_args()
     W = [int(w) for w in g.widths.split(',')]
+    DW = [int(w) for w in g.dec_widths.split(',')] if g.dec_widths else []
     peak = {'fp4': g.peak_fp4, 'fp8': g.peak_fp8, 'fp16': g.peak_16, 'bf16': g.peak_16, 'fp32': g.peak_fp32}
     halo = g.halo if g.halo is not None else 1 << (len(W) - 1)
     text = open(g.log).read()
@@ -74,7 +76,7 @@ def main():
     norm = g.steps_per_report * g.gpus   # the report sums all GPUs over steps-per-report steps
     D0 = (g.P // 2 + halo) if g.split else g.P   # level-0 depth computed per GPU
     rows = []
-    for s, (name, l, cin, cout, k, st) in convs(W, g.cout).items():
+    for s, (name, l, cin, cout, k, st) in convs(W, g.cout, DW).items():
         if s not in slots: continue
         D, H = max(D0 >> l, 1), max(g.P >> l, 1)
         vin = D * H * H

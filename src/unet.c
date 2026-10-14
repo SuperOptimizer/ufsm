@@ -1676,9 +1676,14 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     block *d0 = &u->dec[0];
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
     nn_set_layer(3 * L - 2);
-    if (recompute()) { nn_gn_t gg = gn_out(u, d0); int r; PROF(2, r = nn_conv3d_bwd_weight_x(d0->a2, &gg, nullptr, nullptr, 0, 0, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b)); if (r) rc_fail("head weight gradient"); }
-    else PROF(2, nn_conv3d_bwd_weight(d0->s2, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b));
-    PROF(1, nn_conv3d_bwd_data(glogits, os, P(u, u->head.w), d0->ys, 1, 1, u->gout[0], u->conv_scratch));
+    int hf = -1;   /* the fused head backward (weight, bias and input gradient in one pass over act(x) and the logit gradient) */
+    if (recompute()) { nn_gn_t gg = gn_out(u, d0); PROF(2, hf = nn_head_bwd_x(d0->a2, &gg, d0->ys, glogits, os, P(u, u->head.w), g + u->head.w, g + u->head.b, u->gout[0])); }
+    else PROF(2, hf = nn_head_bwd_x(d0->s2, nullptr, d0->ys, glogits, os, P(u, u->head.w), g + u->head.w, g + u->head.b, u->gout[0]));
+    if (hf) {
+        if (recompute()) { nn_gn_t gg = gn_out(u, d0); int r; PROF(2, r = nn_conv3d_bwd_weight_x(d0->a2, &gg, nullptr, nullptr, 0, 0, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b)); if (r) rc_fail("head weight gradient"); }
+        else PROF(2, nn_conv3d_bwd_weight(d0->s2, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b));
+        PROF(1, nn_conv3d_bwd_data(glogits, os, P(u, u->head.w), d0->ys, 1, 1, u->gout[0], u->conv_scratch));
+    }
     if (ghide) dstorage(gbuf, gcap, ghide);
     if (u->a0_share) nn_offload_copy(u->enc[0].a2, u->h_a2, act_bytes_of(u->enc[0].ys), 0, u->ev_a2[2], u->ev_a2[3]);   /* the skip back for dec[0]'s conv1 weight gradient */
     FQG(u->gout[0], d0->ys);
