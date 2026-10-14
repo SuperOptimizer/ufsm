@@ -172,7 +172,7 @@ int main(void) {
         void *gym = mx4_from(gy, ys); float *gyd = deq4(gym, ys);
         void *g0m = mx4_from(g0, xs); float *g0d = deq4(g0m, xs);
         mode_ref();   /* the scratch sized for the fp32 reference (it needs the whole output there) */
-        float *wr = C == 32 ? w_s2b_e2m1(w, C) : w;   /* 32 channels: the fp4 kernel (its weights in e2m1) */
+        float *wr = C <= 64 ? w_s2b_e2m1(w, C) : w;   /* 32 / 64 channels: the fp4 kernel (its weights in e2m1) */
         float *gxr = dev_zero(nx), *scr = nn_malloc(nn_conv3d_scratch(xs, C, 3) + 4096); nn_conv3d_bwd_data(gyd, ys, wr, xs, 3, 2, gxr, scr);   /* fp32: no accumulate variant; add the old gradient */
         if (accum) nn_axpy(gxr, 1.f, g0d, nx);
         void *gxm = mx4_new(xs); float *acc = dev_zero(nx), *one = dev_zero(nx), *tmp = dev_zero(nx);

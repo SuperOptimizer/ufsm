@@ -340,6 +340,13 @@ int main(int argc, char **argv) {
             for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1, 3, 3, 0u); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
             nn_free(gx); gx = mx(8, C, Sf, 1e-3f, 73 + l); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1, 3, 3, 0u); nn_sync();
             printf("bdata s2 %s %d -> %d (mx8, acc) @%d %8.3f ms  out %016llx\n", l ? "down1" : "down0", C, C, Pf, best, (unsigned long long)fnv(gx, lp_mx8_bytes(1, C, Sf)));
+            if (l == 2) {   /* MX-fp4 gy / gx as the trainer's down1 (UFSM_S2B_F4=3: the fp4 kernel; 1: bf16) */
+                void *g4 = mx(4, C, Sc, 1e-3f, 141), *x4 = mx(4, C, Sf, 1e-3f, 142);
+                double b4 = 1e9;
+                for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_bwd_data_s2_mx(g4, ys, w, xs, x4, 1, 4, 4, 0x1234u + it); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < b4) b4 = (now() - t0) * 1e3; }
+                printf("bdata s2 down1 %d -> %d (mx4, acc) @%d %8.3f ms\n", C, C, Pf, b4);
+                nn_free(g4); nn_free(x4);
+            }
             if (l == 2) { float *a = nn_malloc(Sf * C * 4); lp_mx8_to_f32(gx, 1, C, Sf, a); float *h = malloc(Sf * C * 4); nn_d2h(h, a, Sf * C * 4); double s1 = 0; for (size_t i = 0; i < Sf * C; i++) s1 += fabs(h[i]); printf("  |gx| %.9g\n", s1); free(h); nn_free(a); }
             nn_free(gy); nn_free(gx); nn_free(w);
         }

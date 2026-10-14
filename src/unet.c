@@ -239,7 +239,10 @@ unet *unet_create(const unet_cfg *cfg) {
 }
 
 static void free_acts(unet *u);
+/* the fp4 kernels memoise prepared weights per conv id, weight pointer and step counter (lp_f4fwd.cuh wmemo): every weight change
+   outside a training step (init, load, free: another unet's weights may land at the same address under the same step) clears it */
 void unet_free(unet *u) {
+    nn_wmemo_clear();
     if (!u) return;
     free_acts(u);
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema);
@@ -269,6 +272,7 @@ static void init_conv(float *h, const convp *c, uint64_t *seed, double bias) {
 static void init_gn(float *h, const gnp *n) { for (int i = 0; i < n->c; i++) { h[n->gamma + i] = 1.f; h[n->beta + i] = 0.f; } }
 
 void unet_init(unet *u, uint64_t seed) {
+    nn_wmemo_clear();
     float *h = calloc(u->np, 4);
     int L = u->cfg.nlev;
     for (int i = 0; i < L; i++) { init_conv(h, &u->enc[i].c1, &seed, 0); init_gn(h, &u->enc[i].n1); init_conv(h, &u->enc[i].c2, &seed, 0); init_gn(h, &u->enc[i].n2); }
@@ -1948,6 +1952,7 @@ void unet_grad_head_only(unet *u, int blocks) {   /* blocks: also train the last
 }
 /* the forward reads live (unet_apply_sparse24 resets fw from it every call), so the swap goes through live */
 void unet_use_params(unet *u, const float *w) {
+    nn_wmemo_clear();
     u->live = w ? (float *)w : u->using_ema ? u->ema : u->p;
     if (!u->sparse24) u->fw = u->live;
 }
@@ -2012,7 +2017,7 @@ void unet_gn_freeze(unet *u, const float *h) {
     u->gn_frz = malloc(u->gn_frz_n * 4);
     memcpy(u->gn_frz, h, u->gn_frz_n * 4);
 }
-void unet_use_ema(unet *u, int on) { u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
+void unet_use_ema(unet *u, int on) { nn_wmemo_clear(); u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
 /* ---- 2:4 structured sparsity: the forward reads a masked copy of the live weights; SR-STE keeps the master weights dense ---- */
 static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg) {
     int L = u->cfg.nlev;
@@ -2209,6 +2214,7 @@ int unet_peek(const char *path, unet_cfg *cfg, int *step) {
 }
 
 int unet_load(unet *u, const char *path) {
+    nn_wmemo_clear();
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     unet_cfg cfg; int step = 0; size_t np = 0;
@@ -2236,6 +2242,7 @@ int unet_load(unet *u, const char *path) {
    copied as is, head rows < keep (and their biases) are kept, new rows get zero weights and bias new_bias (zero optimiser
    state), and the parameters after the head (down_norm GroupNorms) shift. Returns the checkpoint step or -1. */
 int unet_load_grow(unet *u, const char *path, int keep, float new_bias) {
+    nn_wmemo_clear();
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     unet_cfg oc; int step = 0; size_t onp = 0;

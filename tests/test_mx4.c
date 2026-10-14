@@ -409,6 +409,24 @@ int main(void) {
             }
             lp_set_s2b_f4(-1);
             check("s2 bwd_data fp4 kernel taken", eb[1] != eb[0]);
+            {   /* 64 channels (down1): the fp4 kernel's two 32-channel halves of gx against the bf16 kernel, accumulating */
+                shape5 x64 = {N, 64, 32, 32, 32}, y64 = {N, 64, 16, 16, 16};
+                const size_t nx6 = shape_numel(x64), ny6 = shape_numel(y64);
+                float *w64 = dev_rand((size_t)64 * 64 * 27, 0.07f), *gy6 = dev_rand(ny6, 1e-2f), *old6 = dev_rand(nx6, 1e-2f), *gr6 = dev_zero(nx6);
+                float *scr6 = nn_malloc(nn_conv3d_scratch(x64, 64, 3) * 2 + nx6 * 4);
+                void *gy6m = mx4_from(gy6, y64), *old6m = mx4_from(old6, x64); float *gy6d = deq4(gy6m, y64), *old6d = deq4(old6m, x64);
+                mode_ref(); nn_conv3d_bwd_data(gy6d, y64, w64, x64, 3, 2, gr6, scr6); nn_axpy(gr6, 1.f, old6d, nx6);
+                double e6[2];
+                for (int f4 = 0; f4 < 2; f4++) {
+                    void *g6 = mx4_from(old6, x64); lp_set_s2b_f4(f4 ? 3 : 0);
+                    mode_mx(); nn_conv3d_bwd_data_acc(gy6m, y64, w64, x64, 3, 2, (float *)g6, scr6);
+                    e6[f4] = cmp(f4 ? "s2 bwd_data 64 ch mx4 (acc), fp4 kernel" : "s2 bwd_data 64 ch mx4 (acc), bf16 kernel", deq4(g6, x64), gr6, nx6, TOL4);
+                    nn_free(g6);
+                }
+                lp_set_s2b_f4(-1);
+                check("s2 bwd_data 64 ch fp4 kernel taken", e6[1] != e6[0]);
+                nn_free(w64); nn_free(gy6); nn_free(old6); nn_free(gr6); nn_free(scr6); nn_free(gy6m); nn_free(old6m); nn_free(gy6d); nn_free(old6d);
+            }
             nn_free(gyb); nn_free(old); nn_free(gxr); nn_free(scr); nn_free(gym); nn_free(oldm); nn_free(gyd); nn_free(oldd);
             nn_free(xx); nn_free(tb); nn_free(yrb); nn_free(xxm); nn_free(xxd);
         }

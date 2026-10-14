@@ -49,7 +49,7 @@ extern _Thread_local lp_gyrec_t g_gyrec;
 #endif
 int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                              const void *gy, void *gx, const float *AB, unsigned gsr, unsigned rsr);   /* 1: done (gx and the records) */
-void lp_set_s2b_f4(int on);  /* the fp4 stride-2 backward-data (32 channels, MX-fp4 gy): 1 on, 0 bf16 tensor cores, -1 env UFSM_S2B_F4 (default on) */
+void lp_set_s2b_f4(int on);  /* the fp4 stride-2 backward-data (MX-fp4 gy): 3 for 32 and 64 channels, 1 for 32 only, 0 bf16 tensor cores, -1 env UFSM_S2B_F4 (default 3) */
 void lp_set_s2_f4(int on);   /* the fp4 stride-2 forward (MX-fp4 32-channel input, widths % 16): 1 on, 0 fp8, -1 env UFSM_S2_F4 (default on) */
 void lp_set_f4w_gypre_kb(int kb);   /* gy pre-pass of the fp4 weight gradient: slab cap in KiB (0 off, -1 env UFSM_F4W_GYPRE MiB, default 96) */
 int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp);   /* stride 2; gp: input gn+silu; 0, or 3 when the fp4 kernel ran */
