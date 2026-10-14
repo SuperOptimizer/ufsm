@@ -27,7 +27,7 @@ fit_cfg fit_cfg_default(void) {
     memcpy(c.lattice, lat, sizeof lat); memcpy(c.steps, st, sizeof st);
     c.lr = 0.02f; c.lr_knot = 0.005f;
     c.w_phase = 1.f; c.w_normal = 1.f; c.w_density = 1.f; c.w_nondeg = 1.f; c.w_smooth = 0.1f; c.w_decay = 1e-4f;
-    c.phase_ramp = 0.1f; c.core = 3.f; c.unwrap_voxels = 1; c.analytic = 1; c.batch = 2000000;
+    c.phase_ramp = 0.1f; c.core = 3.f; c.unwrap_voxels = 1; c.uw_tile = 256; c.analytic = 1; c.batch = 2000000;
     return c;
 }
 
@@ -334,6 +334,254 @@ static void uw_accum(void *a, int z0_, int z1_, int t) {   /* thread t owns latt
         }
     }
 }
+/* the bucket queue: per confidence level an array of voxel ids, appended at n and popped at h (FIFO; reset when emptied): sequential
+   pushes, and the ids UQ_PD ahead are known, so their records are prefetched long before they are popped */
+typedef struct { uint32_t *a; size_t n, h, cap; } uq_lev;
+typedef struct { uq_lev *Q; int cur; uint64_t occ[UQ_LEVELS / 64], occ1; } uw_queue;   /* non-empty levels: a bit per level, a bit per
+                                                                                          word (the next level down in O(1)) */
+static_assert(UQ_LEVELS / 64 <= 64);
+enum { UQ_PD = 16 };
+static int uq_init(uw_queue *q) { memset(q, 0, sizeof *q); q->Q = calloc(UQ_LEVELS, sizeof *q->Q); return q->Q ? 0 : -1; }
+static void uq_free(uw_queue *q) { if (q->Q) for (int b = 0; b < UQ_LEVELS; b++) free(q->Q[b].a); free(q->Q); q->Q = nullptr; }
+static inline void uq_push(uw_queue *q, uint32_t j, int b) {
+    uq_lev *l = &q->Q[b];
+    if (l->n == l->cap) { l->cap = l->cap ? 2 * l->cap : 4096; l->a = realloc(l->a, l->cap * sizeof *l->a); if (!l->a) abort(); }
+    l->a[l->n++] = j; q->occ[b >> 6] |= 1ull << (b & 63); q->occ1 |= 1ull << (b >> 6); if (b > q->cur) q->cur = b;
+}
+static inline int uq_pop(uw_queue *q, uint32_t *i, uint32_t *ahead) {   /* 0: empty; *ahead: the id UQ_PD pops ahead (UQ_NONE: none) */
+    while (q->Q[q->cur].h == q->Q[q->cur].n) {   /* level emptied: reset it, the highest marked level next (a level a push left behind
+                                                    may be marked yet empty: hence the loop) */
+        const int cur = q->cur; q->Q[cur].h = q->Q[cur].n = 0;
+        q->occ[cur >> 6] &= ~(1ull << (cur & 63)); if (!q->occ[cur >> 6]) q->occ1 &= ~(1ull << (cur >> 6));
+        if (!q->occ1) { q->cur = 0; return 0; }
+        const int w = 63 - __builtin_clzll(q->occ1); q->cur = (w << 6) | (63 - __builtin_clzll(q->occ[w]));
+    }
+    if (q->cur <= 0) return 0;
+    uq_lev *l = &q->Q[q->cur]; *i = l->a[l->h++]; *ahead = l->h + UQ_PD < l->n ? l->a[l->h + UQ_PD] : UQ_NONE;
+    return 1;
+}
+/* the flood's bounds (field voxels, [0 1)), its lowest confidence level, and (comp) the label it writes on the voxels it reaches */
+typedef struct { int z0, z1, y0, y1, x0, x1, minb; uint32_t *comp, cid; } uw_box;
+/* pop until the queue is empty, each popped voxel giving its unreached neighbours (in the box, level >= minb) the integer within half a
+   turn of its own; returns the voxels newly reached */
+static size_t uw_flood(uw_ctx *x, uw_queue *q, const uw_box *bx) {
+    uw_vox *V = x->V; const uw_geo *g = &x->g; size_t reached = 0, over = 0; uint32_t i, pf;
+    while (uq_pop(q, &i, &pf)) {
+        if (pf != UQ_NONE) {   /* a voxel UQ_PD pops ahead: its record and its z / y neighbours' (x ones share its line or the next) */
+            int pz_, py_, px_; ub_zyx(g, pf, &pz_, &py_, &px_);
+            __builtin_prefetch(&V[pf]);
+            if (pz_ > 0) __builtin_prefetch(&V[ub_id(g, pz_ - 1, py_, px_)]);
+            if (pz_ + 1 < g->D) __builtin_prefetch(&V[ub_id(g, pz_ + 1, py_, px_)]);
+            if (py_ > 0) __builtin_prefetch(&V[ub_id(g, pz_, py_ - 1, px_)]);
+            if (py_ + 1 < g->H) __builtin_prefetch(&V[ub_id(g, pz_, py_ + 1, px_)]);
+        }
+        int z, y, xx; ub_zyx(g, i, &z, &y, &xx);
+        const int ok[6] = {z > bx->z0, z + 1 < bx->z1, y > bx->y0, y + 1 < bx->y1, xx > bx->x0, xx + 1 < bx->x1};
+        const int nb3[6][3] = {{z - 1, y, xx}, {z + 1, y, xx}, {z, y - 1, xx}, {z, y + 1, xx}, {z, y, xx - 1}, {z, y, xx + 1}};
+        const double ui = (double)V[i].uw + (x->kb + V[i].k);
+        for (int q6 = 0; q6 < 6; q6++) {
+            if (!ok[q6]) continue;
+            const uint32_t j = ub_id(g, nb3[q6][0], nb3[q6][1], nb3[q6][2]); uw_vox *vj = &V[j];
+            if (!vj->bk || vj->bk < bx->minb || vj->k != UK_UNSET) continue;
+            const int32_t kr = (int32_t)round(ui - vj->uw) - x->kb;
+            if (kr <= INT16_MIN || kr > INT16_MAX) { over++; continue; }
+            vj->k = (int16_t)kr; reached++;
+            if (bx->comp) bx->comp[j] = bx->cid;
+            uq_push(q, j, vj->bk);
+        }
+    }
+    if (over) atomic_fetch_add(&x->over, over);
+    return reached;
+}
+/* the integer (minus the base) that puts the voxel's U nearest the model's; INT32_MIN: out of the 16-bit range */
+static int32_t uw_model_k(const uw_ctx *x, int z, int y, int xx, float uw) {
+    const fit_fields *f = x->f; const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
+    const double th = atan2(py - axis_lerp(f->cy, x->na, pz), px - axis_lerp(f->cx, x->na, pz));
+    const int32_t kr = (int32_t)round(fit_W(x->m, pz, py, px) + x->m->dir * th / (2 * M_PI) - uw) - x->kb;
+    return kr > INT16_MIN && kr <= INT16_MAX ? kr : INT32_MIN;
+}
+
+/* Two-level unwrapping (--uw-split S): the serial flood is bound by memory latency and needs every record in one address space (the
+   whole scroll at 19.2 um is ~100x this slab). (A) Tiles of uw_tile^3 field voxels in parallel: each floods its voxels of confidence
+   >= S into connected pieces, each seeded at its most confident voxel with the integer nearest the model. (B) Pieces in neighbouring
+   tiles are joined by votes over their touching voxel pairs (offset round(U_i - U_j), weight the lower confidence level; a pair of
+   pieces scores its best offset's weight minus the runner-up's), strongest first, into a union-find with integer potentials (a
+   maximum spanning forest; a vote against a joined pair is ignored). The largest tree keeps its integers; the other pieces are reset.
+   (C) The serial flood from that tree's border reaches the rest (low confidence, the reset pieces) in confidence order. A tile commits
+   only confident voxels, so no tile is forced through its low-confidence patches (the earlier tiled floods flooded everything per tile
+   and lost 4-6 points of winding ids). Measured on the 3.9 cm slab with prod19v2 fields (serial: flood 51 s, 38.5% ids): split 0.7
+   39.4% but the main tree holds only 72M of the 323M voxels, so the serial pass still takes 45 s; split 0.5 floods in 27 s but gets
+   29.5% (pieces commit 0.5-0.7 voxels whose integers depend on the path). Off by default. */
+typedef struct { uint32_t a, b; int32_t d; uint32_t w; } uw_edge;
+typedef struct {
+    uw_ctx *x; int T, ntz, nty, ntx, thrb; uint32_t *comp; _Atomic int next;
+    uint32_t *ncomp, **csize;               /* per tile: its pieces (labels 1..n) and their voxel counts */
+    uint32_t *tbase;                        /* per tile: its pieces' first global id */
+    uw_edge *e[64]; size_t ne[64], ce[64];  /* per thread: border votes */
+    int32_t *shift;                         /* per global piece: its integer shift (INT32_MIN: reset) */
+    uint32_t **bnd; size_t *nb;             /* phase C: per z range, the reached voxels next to unreached ones */
+} uw2_ctx;
+static void uw2_tile_box(const uw2_ctx *u, int t, uw_box *b) {
+    const uw_geo *g = &u->x->g; const int tx = t % u->ntx, ty = (t / u->ntx) % u->nty, tz = t / (u->ntx * u->nty);
+    b->z0 = tz * u->T; b->z1 = b->z0 + u->T < g->D ? b->z0 + u->T : g->D;
+    b->y0 = ty * u->T; b->y1 = b->y0 + u->T < g->H ? b->y0 + u->T : g->H;
+    b->x0 = tx * u->T; b->x1 = b->x0 + u->T < g->W ? b->x0 + u->T : g->W;
+}
+static void uw2_pieces(void *a, int z0_, int z1_, int th) {   /* (A): tiles off a shared counter */
+    uw2_ctx *u = a; uw_ctx *x = u->x; const uw_geo *g = &x->g; uw_vox *V = x->V; (void)z0_; (void)z1_; (void)th;
+    const int nt = u->ntz * u->nty * u->ntx; uw_queue q; if (uq_init(&q)) abort();
+    uint32_t *ids = nullptr; size_t cap = 0;
+    for (int t; (t = atomic_fetch_add(&u->next, 1)) < nt;) {
+        uw_box b; uw2_tile_box(u, t, &b);
+        const size_t nv = (size_t)(b.z1 - b.z0) * (b.y1 - b.y0) * (b.x1 - b.x0);
+        if (nv > cap) { cap = nv; free(ids); ids = malloc(cap * sizeof *ids); if (!ids) abort(); }
+        size_t cnt[UQ_LEVELS] = {0}, n = 0;   /* the confident voxels, most confident first (a counting sort by level) */
+        for (int z = b.z0; z < b.z1; z++) for (int y = b.y0; y < b.y1; y++) for (int xx = b.x0; xx < b.x1; xx++) {
+            const int bk = V[ub_id(g, z, y, xx)].bk; if (bk >= u->thrb) cnt[bk]++;
+        }
+        for (int l = UQ_LEVELS - 1; l >= 0; l--) { const size_t c = cnt[l]; cnt[l] = n; n += c; }
+        for (int z = b.z0; z < b.z1; z++) for (int y = b.y0; y < b.y1; y++) for (int xx = b.x0; xx < b.x1; xx++) {
+            const uint32_t id = ub_id(g, z, y, xx); const int bk = V[id].bk; if (bk >= u->thrb) ids[cnt[bk]++] = id;
+        }
+        uint32_t np = 0, capp = 0, *sz = nullptr;
+        b.minb = u->thrb; b.comp = u->comp;
+        for (size_t s = 0; s < n; s++) {
+            const uint32_t id = ids[s]; if (V[id].k != UK_UNSET) continue;
+            int z, y, xx; ub_zyx(g, id, &z, &y, &xx);
+            const int32_t k = uw_model_k(x, z, y, xx, V[id].uw); if (k == INT32_MIN) { atomic_fetch_add(&x->over, 1); continue; }
+            if (np == capp) { capp = capp ? 2 * capp : 256; sz = realloc(sz, capp * sizeof *sz); if (!sz) abort(); }
+            V[id].k = (int16_t)k; u->comp[id] = b.cid = ++np; uq_push(&q, id, V[id].bk);
+            sz[np - 1] = 1 + (uint32_t)uw_flood(x, &q, &b);
+        }
+        u->ncomp[t] = np; u->csize[t] = sz;
+    }
+    free(ids); uq_free(&q);
+}
+static void uw2_votes(void *a, int t0, int t1, int th) {   /* (B): tiles [t0, t1), their +z / +y / +x faces */
+    uw2_ctx *u = a; uw_ctx *x = u->x; const uw_geo *g = &x->g; const uw_vox *V = x->V;
+    for (int t = t0; t < t1; t++) {
+        uw_box b; uw2_tile_box(u, t, &b);
+        const int tx = t % u->ntx, ty = (t / u->ntx) % u->nty, tz = t / (u->ntx * u->nty);
+        for (int ax = 0; ax < 3; ax++) {
+            const int last = ax == 0 ? tz + 1 >= u->ntz : ax == 1 ? ty + 1 >= u->nty : tx + 1 >= u->ntx; if (last) continue;
+            const int t2 = ax == 0 ? t + u->ntx * u->nty : ax == 1 ? t + u->ntx : t + 1;
+            int lo[3] = {b.z0, b.y0, b.x0}, hi[3] = {b.z1, b.y1, b.x1}; lo[ax] = hi[ax] - 1;   /* the tile's last layer along ax */
+            for (int z = lo[0]; z < hi[0]; z++) for (int y = lo[1]; y < hi[1]; y++) for (int xx = lo[2]; xx < hi[2]; xx++) {
+                const uint32_t i = ub_id(g, z, y, xx); if (!u->comp[i]) continue;
+                const uint32_t j = ub_id(g, z + (ax == 0), y + (ax == 1), xx + (ax == 2)); if (!u->comp[j]) continue;
+                uint32_t pa = u->tbase[t] + u->comp[i] - 1, pb = u->tbase[t2] + u->comp[j] - 1;
+                int32_t d = (int32_t)round(((double)V[i].uw + V[i].k) - ((double)V[j].uw + V[j].k));   /* pot_b - pot_a */
+                if (pa > pb) { const uint32_t s = pa; pa = pb; pb = s; d = -d; }
+                if (u->ne[th] == u->ce[th]) { u->ce[th] = u->ce[th] ? 2 * u->ce[th] : 65536; u->e[th] = realloc(u->e[th], u->ce[th] * sizeof *u->e[th]); if (!u->e[th]) abort(); }
+                u->e[th][u->ne[th]++] = (uw_edge){pa, pb, d, (uint32_t)(V[i].bk < V[j].bk ? V[i].bk : V[j].bk)};
+            }
+        }
+    }
+}
+static void uw2_apply(void *a, int t0, int t1, int th) {   /* (B'): the joined pieces shifted, the rest reset */
+    uw2_ctx *u = a; uw_ctx *x = u->x; const uw_geo *g = &x->g; uw_vox *V = x->V; (void)th;
+    for (int t = t0; t < t1; t++) {
+        uw_box b; uw2_tile_box(u, t, &b);
+        for (int z = b.z0; z < b.z1; z++) for (int y = b.y0; y < b.y1; y++) for (int xx = b.x0; xx < b.x1; xx++) {
+            const uint32_t i = ub_id(g, z, y, xx); if (!u->comp[i]) continue;
+            const int32_t s = u->shift[u->tbase[t] + u->comp[i] - 1], k = s == INT32_MIN ? INT32_MIN : V[i].k + s;
+            if (k == INT32_MIN || k <= INT16_MIN || k > INT16_MAX) V[i].k = UK_UNSET; else V[i].k = (int16_t)k;
+        }
+    }
+}
+static void uw2_border(void *a, int z0, int z1, int th) {   /* (C): reached voxels with an unreached floodable neighbour, by z range */
+    uw2_ctx *u = a; uw_ctx *x = u->x; const uw_geo *g = &x->g; const uw_vox *V = x->V; size_t n = 0, cap = 0; uint32_t *o = nullptr;
+    for (int z = z0; z < z1; z++) for (int y = 0; y < g->H; y++) for (int xx = 0; xx < g->W; xx++) {
+        const uint32_t i = ub_id(g, z, y, xx); if (V[i].k == UK_UNSET) continue;
+        const int ok[6] = {z > 0, z + 1 < g->D, y > 0, y + 1 < g->H, xx > 0, xx + 1 < g->W};
+        const int nb3[6][3] = {{z - 1, y, xx}, {z + 1, y, xx}, {z, y - 1, xx}, {z, y + 1, xx}, {z, y, xx - 1}, {z, y, xx + 1}};
+        int open = 0;
+        for (int q6 = 0; q6 < 6 && !open; q6++) if (ok[q6]) { const uw_vox *v = &V[ub_id(g, nb3[q6][0], nb3[q6][1], nb3[q6][2])]; open = v->bk && v->k == UK_UNSET; }
+        if (!open) continue;
+        if (n == cap) { cap = cap ? 2 * cap : 65536; o = realloc(o, cap * sizeof *o); if (!o) abort(); }
+        o[n++] = i;
+    }
+    u->bnd[th] = o; u->nb[th] = n;
+}
+static int uw_edge_cmp(const void *p, const void *q) {
+    const uw_edge *a = p, *b = q;
+    return a->a != b->a ? (a->a < b->a ? -1 : 1) : a->b != b->b ? (a->b < b->b ? -1 : 1) : a->d != b->d ? (a->d < b->d ? -1 : 1) : 0;
+}
+typedef struct { uint32_t a, b; int32_t d; double s; } uw_pair;
+static int uw_pair_cmp(const void *p, const void *q) {   /* strongest first; ties by the pieces */
+    const uw_pair *a = p, *b = q;
+    return a->s != b->s ? (a->s > b->s ? -1 : 1) : a->a != b->a ? (a->a < b->a ? -1 : 1) : a->b != b->b ? (a->b < b->b ? -1 : 1) : 0;
+}
+static uint32_t uf_find(uint32_t *par, int32_t *pot, uint32_t a, int32_t *pa) {   /* root; *pa: a's potential relative to it */
+    uint32_t r = a; int32_t s = 0;
+    while (par[r] != r) { s += pot[r]; r = par[r]; }
+    const int32_t sa = s;
+    for (uint32_t c = a; par[c] != c;) { const uint32_t nx = par[c]; const int32_t p = pot[c]; par[c] = r; pot[c] = s; s -= p; c = nx; }
+    *pa = sa; return r;
+}
+/* (A) - (C) on the records set up by fit_unwrap_voxels (no seed model); returns the voxels reached */
+static size_t uw_two_level(uw_ctx *x, double split, int T, size_t nr, int verbose) {
+    const uw_geo *g = &x->g; const double t0 = nn_wall_seconds();
+    uw2_ctx u = {.x = x, .T = T, .ntz = (g->D + T - 1) / T, .nty = (g->H + T - 1) / T, .ntx = (g->W + T - 1) / T};
+    u.thrb = 1 + (int)(fmin(split, 1.0) * (UQ_LEVELS - 2));
+    const int nt = u.ntz * u.nty * u.ntx;
+    u.comp = calloc(nr, sizeof *u.comp); u.ncomp = calloc(nt, sizeof *u.ncomp); u.csize = calloc(nt, sizeof *u.csize); u.tbase = calloc(nt + 1, sizeof *u.tbase);
+    if (!u.comp || !u.ncomp || !u.csize || !u.tbase) { fprintf(stderr, "fit: out of memory for the two-level unwrapping\n"); abort(); }
+    fit_zpar(x->nt, x->nt, uw2_pieces, &u);   /* one call per thread; tiles off u.next */
+    uint64_t np = 0; for (int t = 0; t < nt; t++) { u.tbase[t] = (uint32_t)np; np += u.ncomp[t]; }
+    if (np >= UINT32_MAX) { fprintf(stderr, "fit: too many unwrapping pieces\n"); abort(); }
+    uint32_t *par = malloc(np * sizeof *par); int32_t *pot = calloc(np, sizeof *pot); uint64_t *sz = malloc(np * sizeof *sz);
+    for (int t = 0; t < nt; t++) for (uint32_t k = 0; k < u.ncomp[t]; k++) { par[u.tbase[t] + k] = u.tbase[t] + k; sz[u.tbase[t] + k] = u.csize[t][k]; }
+    const double t1 = nn_wall_seconds();
+    fit_zpar(nt, x->nt, uw2_votes, &u);
+    size_t ne = 0; for (int t = 0; t < x->nt; t++) ne += u.ne[t];
+    uw_edge *E = malloc((ne ? ne : 1) * sizeof *E); ne = 0;
+    for (int t = 0; t < x->nt; t++) { if (u.ne[t]) memcpy(E + ne, u.e[t], u.ne[t] * sizeof *E); ne += u.ne[t]; free(u.e[t]); }
+    qsort(E, ne, sizeof *E, uw_edge_cmp);
+    size_t npair = 0; uw_pair *P = malloc((ne ? ne : 1) * sizeof *P);
+    for (size_t s = 0; s < ne;) {   /* per piece pair: the offsets' summed weights; best minus runner-up */
+        size_t e = s; double best = 0, second = 0; int32_t bd = 0;
+        while (e < ne && E[e].a == E[s].a && E[e].b == E[s].b) {
+            size_t f2 = e; double w = 0; while (f2 < ne && E[f2].a == E[e].a && E[f2].b == E[e].b && E[f2].d == E[e].d) w += E[f2++].w;
+            if (w > best) { second = best; best = w; bd = E[e].d; } else if (w > second) second = w;
+            e = f2;
+        }
+        P[npair++] = (uw_pair){E[s].a, E[s].b, bd, best - second}; s = e;
+    }
+    free(E); qsort(P, npair, sizeof *P, uw_pair_cmp);
+    size_t joined = 0;
+    for (size_t k = 0; k < npair; k++) {
+        if (P[k].s <= 0) break;
+        int32_t pa, pb; const uint32_t ra = uf_find(par, pot, P[k].a, &pa), rb = uf_find(par, pot, P[k].b, &pb);
+        if (ra == rb) continue;
+        if (sz[ra] >= sz[rb]) { par[rb] = ra; pot[rb] = pa + P[k].d - pb; sz[ra] += sz[rb]; }   /* pot_b(total) = pot_a + d */
+        else { par[ra] = rb; pot[ra] = pb - P[k].d - pa; sz[rb] += sz[ra]; }
+        joined++;
+    }
+    free(P);
+    uint32_t main = UINT32_MAX; uint64_t msz = 0;
+    for (uint32_t k = 0; k < np; k++) if (par[k] == k && sz[k] > msz) { msz = sz[k]; main = k; }
+    u.shift = malloc((np ? np : 1) * sizeof *u.shift);
+    for (uint32_t k = 0; k < np; k++) { int32_t p; u.shift[k] = uf_find(par, pot, k, &p) == main ? p : INT32_MIN; }
+    fit_zpar(nt, x->nt, uw2_apply, &u);
+    const double t2 = nn_wall_seconds();
+    u.bnd = calloc(x->nt, sizeof *u.bnd); u.nb = calloc(x->nt, sizeof *u.nb);
+    fit_zpar(g->D, x->nt, uw2_border, &u);
+    uw_queue q; if (uq_init(&q)) abort();
+    size_t nbd = 0;
+    for (int t = 0; t < x->nt; t++) { for (size_t k = 0; k < u.nb[t]; k++) uq_push(&q, u.bnd[t][k], x->V[u.bnd[t][k]].bk); nbd += u.nb[t]; free(u.bnd[t]); }
+    const size_t serial = uw_flood(x, &q, &(uw_box){0, g->D, 0, g->H, 0, g->W, 1, nullptr, 0});
+    uq_free(&q);
+    size_t reached = 0;   /* (the records are few enough to count serially next to the flood) */
+    for (size_t i = 0; i < nr; i++) reached += x->V[i].k != UK_UNSET;
+    if (verbose) fprintf(stderr, "fit: two-level unwrapping (split %.2f, tiles %d^3 x %d): %llu pieces, %zu joined, main %llu voxels; serial "
+                         "%zu more from %zu border voxels; pieces %.1fs, votes %.1fs, serial %.1fs\n", split, T, nt, (unsigned long long)np,
+                         joined, (unsigned long long)msz, serial, nbd, t1 - t0, t2 - t1, nn_wall_seconds() - t2);
+    for (int t = 0; t < nt; t++) free(u.csize[t]);
+    free(u.comp); free(u.ncomp); free(u.csize); free(u.tbase); free(par); free(pot); free(sz); free(u.shift); free(u.bnd); free(u.nb);
+    return reached;
+}
+
 static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_conf, const fit_cfg *c) {
     const size_t n = (size_t)f->D * f->H * f->W; const int na = (int)(f->D * f->h) + 1;
     const uw_geo g = {f->D, f->H, f->W, (f->H + UB_M) / UB_S, (f->W + UB_M) / UB_S};
@@ -349,16 +597,7 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
     for (int t = 0; t < x.nt; t++) if (x.qb[t] > qbest) { qbest = x.qb[t]; seed = x.sb[t]; }   /* ties: the lowest voxel, as serially */
     const double t1 = nn_wall_seconds();
     size_t reached = 0;
-    /* the bucket queue: per confidence level an array of voxel ids, appended at n and popped at h (FIFO; reset when emptied):
-       sequential pushes, and the ids UQ_PD ahead are known, so their records are prefetched long before they are popped */
-    typedef struct { uint32_t *a; size_t n, h, cap; } uq_lev;
-    uq_lev *Q = calloc(UQ_LEVELS, sizeof *Q); int cur = 0;
-    uint64_t occ[UQ_LEVELS / 64] = {0}, occ1 = 0;   /* non-empty levels: a bit per level, a bit per word (the next level down in O(1)) */
-    static_assert(UQ_LEVELS / 64 <= 64);
-    enum { UQ_PD = 16 };
-#define UQ_PUSH(j) do { const uint32_t j_ = (uint32_t)(j); const int b_ = V[j_].bk; uq_lev *q_ = &Q[b_]; \
-        if (q_->n == q_->cap) { q_->cap = q_->cap ? 2 * q_->cap : 4096; q_->a = realloc(q_->a, q_->cap * sizeof *q_->a); if (!q_->a) abort(); } \
-        q_->a[q_->n++] = j_; occ[b_ >> 6] |= 1ull << (b_ & 63); occ1 |= 1ull << (b_ >> 6); if (b_ > cur) cur = b_; } while (0)
+    uw_queue q; if (uq_init(&q)) { free(V); return 0; }
     if (seed != (size_t)-1) {
         {   /* the integer base: the seed (or seed model's) integer at the most confident voxel */
             const int z = (int)(seed / ((size_t)f->H * f->W)), y = (int)((seed / f->W) % f->H), xx = (int)(seed % f->W);
@@ -367,55 +606,26 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
             const double Ub = (c->seed ? fit_W(c->seed, pz + c->seed_off, py, px) : fit_W(m, pz, py, px)) + m->dir * th / (2 * M_PI);
             x.kb = (int32_t)round(Ub - V[ub_id(&g, z, y, xx)].uw);
         }
-        if (c->seed) {
-            fit_zpar(f->D, x.nt, uw_seedmodel, &x);
-            for (int z = 0; z < f->D; z++) for (int y = 0; y < f->H; y++) for (int xx = 0; xx < f->W; xx++) {   /* linear order, as before */
-                const uint32_t id = ub_id(&g, z, y, xx); if (V[id].bk && V[id].k != UK_UNSET) { reached++; UQ_PUSH(id); }
+        if (c->uw_split > 0 && !c->seed) reached = uw_two_level(&x, c->uw_split, c->uw_tile > 0 ? c->uw_tile : 256, nr, c->verbose);
+        else {
+            if (c->seed) {
+                fit_zpar(f->D, x.nt, uw_seedmodel, &x);
+                for (int z = 0; z < f->D; z++) for (int y = 0; y < f->H; y++) for (int xx = 0; xx < f->W; xx++) {   /* linear order, as before */
+                    const uint32_t id = ub_id(&g, z, y, xx); if (V[id].bk && V[id].k != UK_UNSET) { reached++; uq_push(&q, id, V[id].bk); }
+                }
             }
-        }
-        if (!reached) {
-            const int z = (int)(seed / ((size_t)f->H * f->W)), y = (int)((seed / f->W) % f->H), xx = (int)(seed % f->W);
-            const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
-            const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
-            const double Um = fit_W(m, pz, py, px) + m->dir * th / (2 * M_PI);
-            const uint32_t sid = ub_id(&g, z, y, xx);
-            V[sid].k = (int16_t)((int32_t)round(Um - V[sid].uw) - x.kb); reached = 1; UQ_PUSH(sid);
-        }
-        for (;;) {
-            while (Q[cur].h == Q[cur].n) {   /* level emptied: reset it, the highest marked level next (a level a push left behind may be
-                                                 marked yet empty: hence the loop) */
-                Q[cur].h = Q[cur].n = 0; occ[cur >> 6] &= ~(1ull << (cur & 63)); if (!occ[cur >> 6]) occ1 &= ~(1ull << (cur >> 6));
-                if (!occ1) { cur = 0; break; }
-                const int w = 63 - __builtin_clzll(occ1); cur = (w << 6) | (63 - __builtin_clzll(occ[w]));
+            if (!reached) {
+                const int z = (int)(seed / ((size_t)f->H * f->W)), y = (int)((seed / f->W) % f->H), xx = (int)(seed % f->W);
+                const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
+                const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
+                const double Um = fit_W(m, pz, py, px) + m->dir * th / (2 * M_PI);
+                const uint32_t sid = ub_id(&g, z, y, xx);
+                V[sid].k = (int16_t)((int32_t)round(Um - V[sid].uw) - x.kb); reached = 1; uq_push(&q, sid, V[sid].bk);
             }
-            if (cur <= 0) break;
-            uq_lev *ql = &Q[cur]; const uint32_t i = ql->a[ql->h++];
-            if (ql->h + UQ_PD < ql->n) {   /* a voxel UQ_PD pops ahead: its record and its z / y neighbours' (x ones share its line or the next) */
-                const uint32_t pf = ql->a[ql->h + UQ_PD]; int pz_, py_, px_; ub_zyx(&g, pf, &pz_, &py_, &px_);
-                __builtin_prefetch(&V[pf]);
-                if (pz_ > 0) __builtin_prefetch(&V[ub_id(&g, pz_ - 1, py_, px_)]);
-                if (pz_ + 1 < f->D) __builtin_prefetch(&V[ub_id(&g, pz_ + 1, py_, px_)]);
-                if (py_ > 0) __builtin_prefetch(&V[ub_id(&g, pz_, py_ - 1, px_)]);
-                if (py_ + 1 < f->H) __builtin_prefetch(&V[ub_id(&g, pz_, py_ + 1, px_)]);
-            }
-            int z, y, xx; ub_zyx(&g, i, &z, &y, &xx);
-            const int ok[6] = {z > 0, z + 1 < f->D, y > 0, y + 1 < f->H, xx > 0, xx + 1 < f->W};
-            const int nb3[6][3] = {{z - 1, y, xx}, {z + 1, y, xx}, {z, y - 1, xx}, {z, y + 1, xx}, {z, y, xx - 1}, {z, y, xx + 1}};
-            const double ui = (double)V[i].uw + (x.kb + V[i].k);
-            for (int q = 0; q < 6; q++) {
-                if (!ok[q]) continue;
-                const uint32_t j = ub_id(&g, nb3[q][0], nb3[q][1], nb3[q][2]); uw_vox *vj = &V[j];
-                if (!vj->bk || vj->k != UK_UNSET) continue;
-                const int32_t kr = (int32_t)round(ui - vj->uw) - x.kb;
-                if (kr <= INT16_MIN || kr > INT16_MAX) { x.over++; continue; }
-                vj->k = (int16_t)kr; reached++;
-                UQ_PUSH(j);
-            }
+            reached += uw_flood(&x, &q, &(uw_box){0, f->D, 0, f->H, 0, f->W, 1, nullptr, 0});
         }
     }
-    for (int b = 0; b < UQ_LEVELS; b++) free(Q[b].a);
-    free(Q);
-#undef UQ_PUSH
+    uq_free(&q);
     const double t2 = nn_wall_seconds();
     /* per lattice node: mean of (U_unwrapped - U_model) over the reached voxels nearest to it */
     const size_t nl = (size_t)m->lz * m->ly * m->lx;

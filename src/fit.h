@@ -28,6 +28,9 @@ typedef struct {
                                        integrate the turn count); the phase term (periodic) refines from this stage on */
     float phase_ramp;               /* phase_stage: phase weight from phase_ramp * w_phase to w_phase */
     int unwrap_voxels;              /* phase-stage init: 1 voxel-level quality-guided unwrapping (default), 0 lattice-node unwrapping */
+    double uw_split;                /* > 0: two-level voxel unwrapping: tiles flood their voxels of confidence >= uw_split in parallel,
+                                       the pieces are stitched by border votes, then the serial flood does the rest (0: serial only) */
+    int uw_tile;                    /* its tile edge (field voxels) */
     int analytic;                   /* 1: nn_fit_loss2 (analytic grad W, voxel minibatches; knots fixed after the prior), 0: nn_fit_loss */
     double um;                      /* native voxel size: the slab driver's lattices / pooling are physical (2.4 um: 512 ... 32) */
     double packed_um;               /* > 0: where the fields' sheet spacing is below this (um) the phase is trusted less (weight

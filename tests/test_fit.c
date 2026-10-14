@@ -14,6 +14,7 @@ static int fails;
 
 static int g_dir; static double g_wob = 0.4, g_pack = 0.6, g_dpitch = 10; static int g_hole = 1; static double g_bias = 0;   /* FIT_BIAS: the phase under-counts the packed sector by this fraction (a weak network) */
 static const double H8 = 8, R0 = 384;
+static double g_split = 0; static int g_tile = 256;   /* the two-level unwrapping (fit_cfg uw_split / uw_tile) */
 static double ax_y(double z) { return R0 + 0.02 * z; }
 static double ax_x(double z) { return R0 - 0.01 * z; }
 static double pitch_of(double z) { return 60 + g_dpitch * z / 384; }
@@ -44,7 +45,8 @@ static int run_case(int dir) {
         const int hole = g_hole && hypot(hypot(pz - 200, py - 600), px - 380) < 40;
         w[i] = r >= 3 * 70 && r <= 370 && !hole ? 255 : 0;
         const double Wv = W_phase(pz, py, px), ph = 2 * M_PI * (Wv - floor(Wv));
-        pc[i] = (uint8_t)lround(128 + 127 * cos(ph)); ps[i] = (uint8_t)lround(128 + 127 * sin(ph));
+        const double amp = g_split > 0 && x >= 40 && x < 56 ? 0.4 : 1;   /* two-level: a band under the split, left to the serial pass */
+        pc[i] = (uint8_t)lround(128 + 127 * amp * cos(ph)); ps[i] = (uint8_t)lround(128 + 127 * amp * sin(ph));
         double g[3]; const double e = 0.5;   /* grad W: central differences, the theta part wrapped */
         for (int d = 0; d < 3; d++) {
             double a[3] = {pz, py, px}, b[3] = {pz, py, px}; a[d] += e; b[d] -= e;
@@ -59,7 +61,7 @@ static int run_case(int dir) {
         double s = 8 / (H8 * rho); sp[i] = (uint8_t)(s < 1 ? 1 : s > 255 ? 255 : lround(s));
     }
     fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx};
-    fit_cfg c = fit_cfg_default(); c.verbose = 1;
+    fit_cfg c = fit_cfg_default(); c.verbose = 1; c.uw_split = g_split; c.uw_tile = g_tile;
     fit_model *m = fit_run(&f, &c);
     int bad = 0;
     if (!m) { fprintf(stderr, "FAIL: fit_run\n"); return 1; }
@@ -84,7 +86,7 @@ static int run_case(int dir) {
         right += fabs(d) < 0.5; close += fabs(d) < 0.08;
     }
     const double acc = (double)right / nd, prec = (double)close / nd;
-    printf("dir %+d: gauge %d, winding ids right %.4f, |error| < 0.08 turn %.4f (%zu voxels), loss %.5f\n", dir, k0 - 200, acc, prec, nd, m->loss[0]);
+    printf("dir %+d%s: gauge %d, winding ids right %.4f, |error| < 0.08 turn %.4f (%zu voxels), loss %.5f\n", dir, g_split > 0 ? " two-level" : "", k0 - 200, acc, prec, nd, m->loss[0]);
     if (g_bias == 0) {
         CHECK(acc >= 0.995, "dir %+d: winding ids right %.4f < 0.995", dir, acc);
         CHECK(prec >= 0.99, "dir %+d: |error| < 0.08 at %.4f < 0.99", dir, prec);
@@ -100,6 +102,7 @@ int main(void) {
     if (getenv("FIT_SIMPLE")) { g_wob = atof(getenv("FIT_SIMPLE")); g_pack = 0; g_dpitch = 0; g_hole = 0; }
     run_case(+1);
     run_case(-1);
+    g_split = 0.5; g_tile = 32; run_case(+1);   /* 18 tiles: pieces stitched across tile faces, the hole and the edge by the serial pass */
     if (fails) { fprintf(stderr, "test_fit: %d failure(s)\n", fails); return 1; }
     printf("test_fit: OK\n");
     return 0;
