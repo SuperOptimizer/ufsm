@@ -68,6 +68,11 @@ double fit_W(const fit_model *m, double z, double y, double x) {
     double th; const double U = fit_base(m, z, y, x, &th) + lattice_at(m->delta, m->L, m->lz, m->ly, m->lx, z, y, x);
     return U - m->dir * th / (2 * M_PI);
 }
+/* the same at a point of a ray from the axis: its radius r and angle th (in (-pi, pi]) known, no hypot / atan2 (half of ufsm wraps) */
+static double fit_W_rt(const fit_model *m, double z, double y, double x, double r, double th) {
+    const double U = r / knot_lerp(m->pitch, m->nk, m->knot_dz, z) + knot_lerp(m->offset, m->nk, m->knot_dz, z) + lattice_at(m->delta, m->L, m->lz, m->ly, m->lx, z, y, x);
+    return U - m->dir * th / (2 * M_PI);
+}
 
 static int cmp_f(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
 
@@ -677,9 +682,10 @@ fit_model *fit_load(const char *dir) {
 }
 
 /* the root of W = k along the ray (theta) from the axis nearest r_hint, W evaluated by ev; the axis, box and pitch of m */
-static int ray_root(double (*ev)(const void *, double, double, double), const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double *r) {
+typedef double (*ray_ev)(const void *ctx, double z, double y, double x, double r, double th);
+static int ray_root(ray_ev evr, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double *r) {
     const int na = (int)(m->D * m->h) + 1;
-    const double cy = axis_lerp(m->cy, na, z), cx = axis_lerp(m->cx, na, z), sy = sin(theta), sx = cos(theta);
+    const double cy = axis_lerp(m->cy, na, z), cx = axis_lerp(m->cx, na, z), sy = sin(theta), sx = cos(theta), thw = atan2(sy, sx);
     const double Y = m->H * m->h, X = m->W * m->h;
     double rlo = 0, rhi = 1e9;   /* the part of the ray inside the box */
     const double c0[2] = {cy, cx}, dv[2] = {sy, sx}, ext[2] = {Y, X};
@@ -692,25 +698,35 @@ static int ray_root(double (*ev)(const void *, double, double, double), const vo
     if (rhi <= rlo) return -1;
     const double pit = knot_lerp(m->pitch, m->nk, m->knot_dz, z), dr = pit / 4;
     /* intervals of dr stepping outward from the hint on both sides; the first ring of intervals with a crossing (|jump| < half a
-       turn: not the theta cut of a nearby ray) holds the crossing nearest the hint (to within dr) */
-    const double h0 = fmin(fmax(r_hint, rlo), rhi), f0 = ev(ctx, z, cy + h0 * sy, cx + h0 * sx) - k;
+       turn: not the theta cut of a nearby ray) holds the crossing nearest the hint (to within dr). W grows ~1 turn per pitch along
+       the ray, so a side stops 2 turns past k (W - k > 2 outward, < -2 inward): rays without a crossing (wraps leaving the box) had
+       scanned the whole ray in dr steps, most of ufsm wraps' time */
+#define EVR(R_) evr(ctx, z, cy + (R_) * sy, cx + (R_) * sx, (R_), thw)
+    const double h0 = fmin(fmax(r_hint, rlo), rhi), f0 = EVR(h0) - k;
     double ro = h0, fo = f0, ri = h0, fi = f0, best = -1, bestd = 1e300;
-    while (ro < rhi || ri > rlo) {
+    while ((ro < rhi && fo < 2) || (ri > rlo && fi > -2)) {
         double seg[2][3]; int ns = 0;   /* (a, b, f(a)) of this ring's crossing intervals */
-        if (ro < rhi) {
-            const double rn = fmin(ro + dr, rhi), fn = ev(ctx, z, cy + rn * sy, cx + rn * sx) - k;
+        if (ro < rhi && fo < 2) {
+            const double rn = fmin(ro + dr, rhi), fn = EVR(rn) - k;
             if ((fo < 0) != (fn < 0) && fabs(fo - fn) < 0.5) { seg[ns][0] = ro; seg[ns][1] = rn; seg[ns][2] = fo; ns++; }
             ro = rn; fo = fn;
         }
-        if (ri > rlo) {
-            const double rn = fmax(ri - dr, rlo), fn = ev(ctx, z, cy + rn * sy, cx + rn * sx) - k;
+        if (ri > rlo && fi > -2) {
+            const double rn = fmax(ri - dr, rlo), fn = EVR(rn) - k;
             if ((fi < 0) != (fn < 0) && fabs(fi - fn) < 0.5) { seg[ns][0] = rn; seg[ns][1] = ri; seg[ns][2] = fn; ns++; }
             ri = rn; fi = fn;
         }
         for (int q = 0; q < ns; q++) {
-            double a = seg[q][0], b = seg[q][1], fa = seg[q][2];
-            for (int it = 0; it < 24; it++) { const double mid = 0.5 * (a + b), fm = ev(ctx, z, cy + mid * sy, cx + mid * sx) - k; if ((fa < 0) == (fm < 0)) { a = mid; fa = fm; } else b = mid; }
-            const double root = 0.5 * (a + b);
+            /* Illinois regula falsi to 1e-6 voxel (W is smooth along the ray: ~6 evaluations; the 24 halvings it replaces: dr 2^-24) */
+            double a = seg[q][0], b = seg[q][1], fa = seg[q][2], fb = EVR(b) - k, root = 0.5 * (a + b); int side = 0;
+            for (int it = 0; it < 60 && b - a > 1e-6; it++) {
+                double c = fb != fa ? b - fb * (b - a) / (fb - fa) : 0.5 * (a + b);
+                if (!(c > a && c < b)) c = 0.5 * (a + b);
+                const double fc = EVR(c) - k; root = c;
+                if (fc == 0) { a = b = c; break; }
+                if ((fc < 0) == (fb < 0)) { b = c; fb = fc; if (side == -1) fa *= 0.5; side = -1; }
+                else { a = c; fa = fc; if (side == 1) fb *= 0.5; side = 1; }
+            }
             if (fabs(root - r_hint) < bestd) { bestd = fabs(root - r_hint); best = root; }
         }
         if (ns) break;
@@ -718,8 +734,9 @@ static int ray_root(double (*ev)(const void *, double, double, double), const vo
     if (best < 0) return -1;
     *r = best;
     return 0;
+#undef EVR
 }
-static double ev_model(const void *m, double z, double y, double x) { return fit_W(m, z, y, x); }
+static double ev_model(const void *m, double z, double y, double x, double r, double th) { return fit_W_rt(m, z, y, x, r, th); }
 int fit_ray_root(const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root(ev_model, m, m, z, theta, k, r_hint, r); }
 
 int fit_fields_save(const char *dir, const long long origin[3], const int shape[3], int h, double um, uint8_t *const a[10], const float *cy, const float *cx, int na) {
@@ -821,7 +838,19 @@ double fit_set_W(const fit_set *s, double z, double y, double x) {   /* blended 
     }
     return fit_W(s->global, z, y, x);
 }
-static double ev_set(const void *s, double z, double y, double x) { return fit_set_W(s, z, y, x); }
+static double slab_W_rt(const fit_set *s, int k, double z, double y, double x, double r, double th) {
+    return fit_W_rt(s->slab[k], z - (double)(s->slab[k]->origin[0] - s->global->origin[0]), y, x, r, th);
+}
+static double ev_set(const void *sv, double z, double y, double x, double r, double th) {   /* fit_set_W on a ray (the slabs share the axis) */
+    const fit_set *s = sv;
+    for (int k = 0; k < s->n; k++) {
+        if (z < s->z0[k] || z >= s->z1[k]) continue;
+        if (k > 0 && s->blend > 0 && z < s->z0[k] + s->blend) { const double t = (z - s->z0[k] + s->blend) / (2 * s->blend); return (1 - t) * slab_W_rt(s, k - 1, z, y, x, r, th) + t * slab_W_rt(s, k, z, y, x, r, th); }
+        if (k + 1 < s->n && s->blend > 0 && z >= s->z1[k] - s->blend) { const double t = (z - s->z1[k] + s->blend) / (2 * s->blend); return (1 - t) * slab_W_rt(s, k, z, y, x, r, th) + t * slab_W_rt(s, k + 1, z, y, x, r, th); }
+        return slab_W_rt(s, k, z, y, x, r, th);
+    }
+    return fit_W_rt(s->global, z, y, x, r, th);
+}
 int fit_set_ray_root(const fit_set *s, double z, double theta, double k, double r_hint, double *r) { return ray_root(ev_set, s, s->global, z, theta, k, r_hint, r); }
 int fit_set_save(const fit_set *s, const char *dir) {
     char p[1400]; snprintf(p, sizeof p, "%s/global", dir);

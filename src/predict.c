@@ -107,18 +107,38 @@ static void fit_finalize(const float *acc, size_t nf, int h, uint8_t *const a[10
 static const char *ffz_names[10] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w"};
 static const int ffz_fill[10] = {128, 128, 0, 0, 0, 0, 0, 0, 0, 0};
 /* --fit-zarr: write the slab buffer's field shards (z index fsz) of every array */
-static int ffz_flush(z3w *const zw[10], uint8_t *const sl[10], int64_t fsz, const int F[3], int FS) {
-    uint8_t *sb = malloc((size_t)FS * FS * FS);
-    for (int k = 0; k < 10; k++) for (int64_t fsy = 0; fsy * FS < F[1]; fsy++) for (int64_t fsx = 0; fsx * FS < F[2]; fsx++) {
+/* host field slab slab (FZ cells in z from slab FZ, FZ a multiple of the field shard FS; planes past F[0] not held) -> its rows of
+   shards, the shards compressed and written on threads (a 128^3 field shard is one chunk, so z3w_write_shard alone is one thread:
+   the 10 arrays of a 256 x 2048 x 2048 box took 163 s) */
+typedef struct { z3w *const *zw; uint8_t *const *sl; int64_t slab; const int *F; int FS, FZ, nq, ny, nx; _Atomic int next, fail; } ffz_job;
+static void *ffz_worker(void *a) {
+    ffz_job *J = a; const int FS = J->FS, *F = J->F; uint8_t *sb = malloc((size_t)FS * FS * FS);
+    const int njob = 10 * J->nq * J->ny * J->nx;
+    for (;;) {
+        const int t = atomic_fetch_add(&J->next, 1); if (t >= njob || atomic_load(&J->fail)) break;
+        const int k = t / (J->nq * J->ny * J->nx), q = t / (J->ny * J->nx) % J->nq, fsy = t / J->nx % J->ny, fsx = t % J->nx;
+        const int64_t fsz = J->slab * (J->FZ / FS) + q;
         memset(sb, ffz_fill[k], (size_t)FS * FS * FS);
-        for (int a = 0; a < FS && fsz * FS + a < F[0]; a++) for (int b = 0; b < FS && fsy * FS + b < F[1]; b++) {
-            const int64_t x0 = fsx * FS, nx = F[2] - x0 < FS ? F[2] - x0 : FS;
-            memcpy(sb + ((size_t)a * FS + b) * FS, sl[k] + ((size_t)a * F[1] + fsy * FS + b) * F[2] + x0, (size_t)nx);
+        for (int a2 = 0; a2 < FS && fsz * FS + a2 < F[0]; a2++) for (int b = 0; b < FS && (int64_t)fsy * FS + b < F[1]; b++) {
+            const int64_t x0 = (int64_t)fsx * FS, nx = F[2] - x0 < FS ? F[2] - x0 : FS;
+            memcpy(sb + ((size_t)a2 * FS + b) * FS, J->sl[k] + ((size_t)(q * FS + a2) * F[1] + (size_t)fsy * FS + b) * F[2] + x0, (size_t)nx);
         }
-        if (z3w_write_shard(zw[k], fsz, fsy, fsx, sb, 8)) { free(sb); return -1; }
+        if (z3w_write_shard(J->zw[k], fsz, fsy, fsx, sb, 1)) atomic_store(&J->fail, 1);
     }
-    free(sb);
-    for (int k = 0; k < 10; k++) memset(sl[k], ffz_fill[k], (size_t)FS * F[1] * F[2]);
+    free(sb); return nullptr;
+}
+static int ffz_flush(z3w *const zw[10], uint8_t *const sl[10], int64_t slab, const int F[3], int FS, int FZ) {
+    int nq = 0; for (int q = 0; q < FZ / FS; q++) if ((slab * (FZ / FS) + q) * FS < F[0]) nq = q + 1;
+    ffz_job J = {.zw = zw, .sl = sl, .slab = slab, .F = F, .FS = FS, .FZ = FZ, .nq = nq, .ny = (F[1] + FS - 1) / FS, .nx = (F[2] + FS - 1) / FS};
+    atomic_store(&J.next, 0); atomic_store(&J.fail, 0);
+    long nt = sysconf(_SC_NPROCESSORS_ONLN); if (nt > 64) nt = 64; if (nt < 1) nt = 1;
+    pthread_t th[64]; int up[64] = {0};
+    for (int i = 1; i < nt; i++) up[i] = pthread_create(&th[i], nullptr, ffz_worker, &J) == 0;
+    ffz_worker(&J);
+    for (int i = 1; i < nt; i++) if (up[i]) pthread_join(th[i], nullptr);
+    if (atomic_load(&J.fail)) return -1;
+    const int64_t held = F[0] < FZ ? F[0] : FZ;
+    for (int k = 0; k < 10; k++) memset(sl[k], ffz_fill[k], (size_t)held * F[1] * F[2]);
     return 0;
 }
 
@@ -598,7 +618,7 @@ int cmd_predict(int argc, char **argv) {
     for (int d = 0; d < 3 && kss > 1; d++) { int64_t ph = grid ? (bo[d] - grid_origin[d]) % stride : 0; if (ph < 0) ph += stride; if (ph) kss = 1; }
     int64_t nss[3]; for (int d = 0; d < 3; d++) nss[d] = (ns[d] + kss - 1) / kss;
     float *ffacc = nullptr; int ffbox[3], ffF[3]; size_t ffn = 0;
-    z3w *ffzw[10] = {0}; uint8_t *ffsl[10] = {0}; const int FFS = 128; int64_t ffslab = 0; float *ffacch = nullptr; size_t ffwn = 0; int ffwc = 0;
+    z3w *ffzw[10] = {0}; uint8_t *ffsl[10] = {0}; const int FFS = 128; int FZ = FFS; int64_t ffslab = 0; uint8_t *ff8d = nullptr, *ff8h = nullptr; size_t ffwn = 0; int ffwc = 0;
     if (ffd) {
         if (ct_shared) { fprintf(stderr, "predict: --fit-fields: the CT window is shared with the network (set UFSM_INFER_ALIAS=0)\n"); return 2; }
         for (int d = 0; d < 3; d++) { ffbox[d] = (int)bn[d]; ffF[d] = (int)((bn[d] + ffh - 1) / ffh); }
@@ -606,12 +626,17 @@ int cmd_predict(int argc, char **argv) {
             ffn = (size_t)ffF[0] * ffF[1] * ffF[2]; ffacc = nn_malloc(12 * ffn * 4);
             if (!ffacc) { fprintf(stderr, "predict: no device memory for the fit fields\n"); return 1; }
             nn_zero(ffacc, 12 * ffn * 4);
-        } else {   /* per window: an accumulator of its interior cells; the field slab of FFS cells in z on the host */
-            /* the field slab (FFS cells in z) is flushed once the windows leave it: a window's interior must not straddle two, so its
-               z stride divides the shard (the shard divides FFS h); 288 / 8 (stride 272) wrote past the slab and crashed */
-            if (stride % ffh || strd[0] % ffh || kss > 1 || shard % ffh || (FFS * ffh) % shard || shard % strd[0]) {
-                fprintf(stderr, "predict: --fit-zarr needs the window strides (window - 2 halo; z: %d) divisible by --fit-h, the z stride dividing the shard, "
-                                "the shard dividing --fit-h * %d and by --fit-h (e.g. --window 288 --halo 16 or 544 / 16 with --shard 512)\n", strd[0], FFS);
+        } else {   /* per window: an accumulator of its interior cells; the field slab of FZ cells in z on the host */
+            /* the field slab (FZ cells in z, a multiple of the field shard FFS) is flushed once the windows leave it: a window's
+               interior must not straddle two (288 / 8, stride 272, wrote past the slab and crashed): per-shard windows have z strides
+               dividing the shard, super-shard windows (stride k shard: one window writes k^3 shards, e.g. --window 384 --halo 64 with
+               --shard 128) interiors of k shards, so FZ h is a multiple of the shard (or the super-shard) */
+            const int zsh = kss > 1 ? kss * shard : shard;
+            while ((FZ * ffh) % zsh && FZ < 4096) FZ += FFS;
+            if (stride % ffh || strd[0] % ffh || shard % ffh || (FZ * ffh) % zsh || (kss == 1 && shard % strd[0])) {
+                fprintf(stderr, "predict: --fit-zarr needs the window strides (window - 2 halo; z: %d) divisible by --fit-h and the shard by --fit-h; "
+                                "per-shard windows a z stride dividing the shard (e.g. --window 288 --halo 16 or 544 / 16 with --shard 512), "
+                                "else a stride of k shards (e.g. --window 384 --halo 64 --shard 128)\n", strd[0]);
                 return 2;
             }
             for (int d = 0; d < 3; d++) { const int64_t ph = grid ? (bo[d] - grid_origin[d]) % ffh : 0; if (ph) { fprintf(stderr, "predict: --fit-zarr: the box must be aligned to --fit-h on the tile grid\n"); return 2; } }
@@ -619,14 +644,15 @@ int cmd_predict(int argc, char **argv) {
             const int64_t fsh[3] = {ffF[0], ffF[1], ffF[2]};
             for (int k = 0; k < 10; k++) {
                 char d[1400]; snprintf(d, sizeof d, "%s/%s", ffz, ffz_names[k]);
+                const size_t held = (size_t)(ffF[0] < FZ ? ffF[0] : FZ) * ffF[1] * ffF[2];
                 ffzw[k] = z3w_create(d, fsh, FFS, 0, ffz_fill[k], at);
-                ffsl[k] = malloc((size_t)FFS * ffF[1] * ffF[2]);
+                ffsl[k] = malloc(held);
                 if (!ffzw[k] || !ffsl[k]) { fprintf(stderr, "predict: --fit-zarr: %s\n", z3w_error()); return 1; }
-                memset(ffsl[k], ffz_fill[k], (size_t)FFS * ffF[1] * ffF[2]);
+                memset(ffsl[k], ffz_fill[k], held);
             }
             ffwc = stride / ffh + 1; ffwn = (size_t)(strd[0] / ffh + 1) * ffwc * ffwc;
-            ffacc = nn_malloc(12 * ffwn * 4); ffacch = malloc(12 * ffwn * 4);
-            if (!ffacc || !ffacch) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }
+            ffacc = nn_malloc(12 * ffwn * 4); ff8d = nn_malloc(10 * ffwn); ff8h = nn_host_alloc(10 * ffwn);   /* finalized on the device: 10 B per cell back */
+            if (!ffacc || !ff8d || !ff8h) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }
         }
     }
     if (kss > 1) fprintf(stderr, "predict: one window per %d^3 shards (interior %d)\n", kss, stride);
@@ -775,20 +801,17 @@ int cmd_predict(int argc, char **argv) {
                     nc3[d] = c1[d] - c0[d]; if (nc3[d] <= 0 || nc3[d] > (d ? ffwc : strd[0] / ffh + 1)) ok = 0;
                 }
                 if (ok) {
-                    const int64_t slab = c0[0] / FFS;
-                    while (ffslab < slab) { if (ffz_flush(ffzw, ffsl, ffslab, ffF, FFS)) { fprintf(stderr, "predict: %s\n", z3w_error()); return 1; } ffslab++; }
+                    const int64_t slab = c0[0] / FZ;
+                    while (ffslab < slab) { if (ffz_flush(ffzw, ffsl, ffslab, ffF, FFS, FZ)) { fprintf(stderr, "predict: %s\n", z3w_error()); return 1; } ffslab++; }
                     const size_t nl = (size_t)nc3[0] * nc3[1] * nc3[2];
                     nn_zero(ffacc, 12 * nl * 4);
                     const int lbox[3] = {(int)(bn[0] - (int64_t)c0[0] * ffh < (int64_t)nc3[0] * ffh ? bn[0] - (int64_t)c0[0] * ffh : (int64_t)nc3[0] * ffh),
                                          (int)(bn[1] - (int64_t)c0[1] * ffh < (int64_t)nc3[1] * ffh ? bn[1] - (int64_t)c0[1] * ffh : (int64_t)nc3[1] * ffh),
                                          (int)(bn[2] - (int64_t)c0[2] * ffh < (int64_t)nc3[2] * ffh ? bn[2] - (int64_t)c0[2] * ffh : (int64_t)nc3[2] * ffh)};
                     nn_fit_accum_d(lg, ctd, Wz, W, hz, halo, (int)(tz - (int64_t)c0[0] * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, nc3, 0, 2, 4, 10, ffds, ffdc, ffacc);
-                    nn_d2h(ffacch, ffacc, 12 * nl * 4);
-                    uint8_t *wa[10]; for (int k = 0; k < 10; k++) wa[k] = malloc(nl);
-                    fit_finalize(ffacch, nl, ffh, wa);
+                    nn_fit_finalize(ffacc, nl, ffh, ff8d); nn_d2h(ff8h, ff8d, 10 * nl);
                     for (int a = 0; a < nc3[0]; a++) for (int b = 0; b < nc3[1]; b++) for (int k = 0; k < 10; k++)
-                        memcpy(ffsl[k] + ((size_t)(c0[0] + a - slab * FFS) * ffF[1] + c0[1] + b) * ffF[2] + c0[2], wa[k] + ((size_t)a * nc3[1] + b) * nc3[2], (size_t)nc3[2]);
-                    for (int k = 0; k < 10; k++) free(wa[k]);
+                        memcpy(ffsl[k] + ((size_t)(c0[0] + a - slab * FZ) * ffF[1] + c0[1] + b) * ffF[2] + c0[2], ff8h + k * nl + ((size_t)a * nc3[1] + b) * nc3[2], (size_t)nc3[2]);
                 }
             }
             if (sheet_task) lg += (size_t)out_ch * w3;   /* channel c of the [c][W^3] logits (B = 1); otherwise the only one */
@@ -861,9 +884,9 @@ int cmd_predict(int argc, char **argv) {
     if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
     if (writer_finish(&WR, wth)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     if (ffzm) {   /* the last field slabs, the axis table and fields.json (format zarr) */
-        for (; ffslab * FFS < ffF[0]; ffslab++) if (ffz_flush(ffzw, ffsl, ffslab, ffF, FFS)) { fprintf(stderr, "predict: %s\n", z3w_error()); return 1; }
+        for (; ffslab * FZ < ffF[0]; ffslab++) if (ffz_flush(ffzw, ffsl, ffslab, ffF, FFS, FZ)) { fprintf(stderr, "predict: %s\n", z3w_error()); return 1; }
         for (int k = 0; k < 10; k++) { z3w_close(ffzw[k]); free(ffsl[k]); }
-        nn_free(ffacc); free(ffacch);
+        nn_free(ffacc); nn_free(ff8d); nn_host_free(ff8h);
         char p[1400]; snprintf(p, sizeof p, "%s/fields.json", ffz); FILE *f = fopen(p, "w");
         if (!f) { fprintf(stderr, "predict: cannot write %s\n", p); return 1; }
         fprintf(f, "{\"format\": \"zarr\", \"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.9g, \"axis\": [", (long long)bo[0], (long long)bo[1], (long long)bo[2], ffF[0], ffF[1], ffF[2], ffh, um * (1 << level));

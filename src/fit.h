@@ -99,6 +99,8 @@ void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float w_smooth, f
    (12 planes over F = ceil(box / h), see src/nn_fit.cu); t = the window origin relative to the box */
 void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
                   int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, float *acc);   /* dscale: the checkpoint's density_scale */
+/* the 12 accumulator planes of nf cells -> the 10 uint8 fit-field planes (pc ps t0..t5 sp w, nf apart), on the device */
+void nn_fit_finalize(const float *acc, size_t nf, int h, uint8_t *a);
 /* the same for a D x W x W window with interior planes [hz, D - hz) (predict --window-z slabs); nn_fit_accum = D W, hz halo */
 void nn_fit_accum_d(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
                     int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc);   /* dcode: train --density-code */

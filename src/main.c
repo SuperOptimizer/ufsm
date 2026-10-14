@@ -1628,6 +1628,33 @@ static int cmd_render(int argc, char **argv) {
     char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", argv[3]); if (system(cmd)) return 1;
     DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "render: cannot open %s\n", argv[2]); return 1; }
     struct dirent *de; int nw = 0;
+    /* the wraps' union box (+- depth): when it fits UFSM_RENDER_MEM GB (default 8) the volume (and CT) are read once and every tile samples
+       them (wraps are rings around the axis: per-tile boxes are nearly the whole cross-section, re-decoded per wrap: 127 wraps of a 3.9 cm
+       slab took 226 s) */
+    uint8_t *rvol = nullptr, *rct = nullptr; int64_t ro[3] = {0, 0, 0}, rn[3] = {0, 0, 0};
+    {
+        double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+        while ((de = readdir(dd))) {
+            if (de->d_name[0] != 'w') continue;
+            char p[1400]; int w, h; const char *ax[3] = {"z", "y", "x"};
+            for (int d = 0; d < 3; d++) {
+                snprintf(p, sizeof p, "%s/%s/%s.tif", argv[2], de->d_name, ax[d]); float *A = read_tif_f32(p, &w, &h); if (!A) continue;
+                for (size_t i = 0; i < (size_t)w * h; i++) if (A[i] >= 0) { if (A[i] < lo[d]) lo[d] = A[i]; if (A[i] > hi[d]) hi[d] = A[i]; }
+                free(A);
+            }
+        }
+        rewinddir(dd);
+        const double budget = atof(getenv("UFSM_RENDER_MEM") ? getenv("UFSM_RENDER_MEM") : "8") * (1u << 30);
+        if (lo[0] <= hi[0] && lo[1] <= hi[1] && lo[2] <= hi[2]) {
+            for (int d = 0; d < 3; d++) { ro[d] = (int64_t)floor(lo[d]) - depth - 2; if (ro[d] < 0) ro[d] = 0; rn[d] = (int64_t)ceil(hi[d]) + depth + 3 - ro[d]; }
+            const double nv = (double)rn[0] * rn[1] * rn[2];
+            if (nv * (cz ? 2 : 1) <= budget) {
+                rvol = malloc((size_t)nv); rct = cz ? malloc((size_t)nv) : nullptr;
+                if (!rvol || (cz && !rct) || z3_read(vz, ro, rn, rvol, 32) || (cz && z3_read(cz, ro, rn, rct, 32))) { fprintf(stderr, "render: read failed: %s\n", z3_error()); return 1; }
+                fprintf(stderr, "render: the wraps' box %lldx%lldx%lld read once\n", (long long)rn[0], (long long)rn[1], (long long)rn[2]);
+            }
+        }
+    }
     while ((de = readdir(dd))) {
         if (de->d_name[0] != 'w') continue;
         char p[1400]; int w, h, w2, h2, w3, h3;
@@ -1651,6 +1678,13 @@ static int cmd_render(int argc, char **argv) {
             }
             if (lo[0] > hi[0]) continue;
             render_job J = {X, Y, Z, w, h, gs, nullptr, nullptr, {0, 0, 0}, {0, 0, 0}, depth, img, cimg, ow, tx, px1, ty, py1, 0};
+            if (rvol) {   /* the region read once */
+                J.vol = rvol; J.ct = rct; for (int d = 0; d < 3; d++) { J.o[d] = ro[d]; J.n[d] = rn[d]; }
+                pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
+                for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, render_rows, &J);
+                for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+                continue;
+            }
             for (int d = 0; d < 3; d++) { J.o[d] = (int64_t)floor(lo[d]) - depth - 2; if (J.o[d] < 0) J.o[d] = 0; J.n[d] = (int64_t)ceil(hi[d]) + depth + 3 - J.o[d]; }
             const size_t nv = (size_t)J.n[0] * J.n[1] * J.n[2];
             if (nv > ((size_t)4 << 30)) { fprintf(stderr, "render: %s tile %d,%d spans %lldx%lldx%lld voxels (a fold?): skipped; use a smaller --tile\n", de->d_name, ty, tx, (long long)J.n[0], (long long)J.n[1], (long long)J.n[2]); continue; }
@@ -1667,7 +1701,7 @@ static int cmd_render(int argc, char **argv) {
         if (cimg) { snprintf(p, sizeof p, "%s/%s_ct.tif", argv[3], de->d_name); if (tiffw_write(p, ow, oh, 1, cimg, 1)) return 1; }
         free(X); free(Y); free(Z); free(img); free(cimg); nw++;
     }
-    closedir(dd);
+    closedir(dd); free(rvol); free(rct);
     fprintf(stderr, "render: %d wraps written to %s\n", nw, argv[3]);
     return 0;
 }

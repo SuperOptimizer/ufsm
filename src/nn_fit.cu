@@ -212,6 +212,50 @@ __global__ void fit_accum_k(const float *lg, const uint8_t *ct, int D, int W, in
         atomicMax((int *)&acc[11 * nf + base], __float_as_int(rm[0]));
     }
 }
+/* the same with a thread per field cell (h <= 4: at h 1 a block per cell ran one thread beside 22.5 KB of shared memory, a few
+   threads per SM: ~0.8 s of a 384^3 window whose forward takes 0.25 s); a cell's voxels summed in order (h 1: the same sums) */
+__global__ void fit_accum_cell_k(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, int bz, int by, int bx, int h,
+                                 int fz0, int fy0, int fx0, int nfz, int nfy, int nfx, int F1, int F2, size_t nf, int ch_recto, int ch_phase, int ch_normal,
+                                 int ch_density, float dscale, int dcode, float *acc) {
+    const size_t ci = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (ci >= (size_t)nfz * nfy * nfx) return;
+    const int fz = fz0 + (int)(ci / ((size_t)nfy * nfx)), fy = fy0 + (int)(ci / nfx % nfy), fx = fx0 + (int)(ci % nfx);
+    float v[11] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; float rmax = 0.f;
+    const size_t w3 = (size_t)D * W * W;
+    for (int t = 0; t < h * h * h; t++) {
+        const int lz = t / (h * h), ly = (t / h) % h, lx = t % h;
+        const int gz = fz * h + lz, gy = fy * h + ly, gx = fx * h + lx, wz = gz - tz, wy = gy - ty, wx = gx - tx;
+        if (gz >= bz || gy >= by || gx >= bx || wz < hz || wz >= D - hz || wy < halo || wy >= W - halo || wx < halo || wx >= W - halo) continue;
+        const size_t i = ((size_t)wz * W + wy) * W + wx;
+        v[0] += 1.f;
+        if (!ct[i]) continue;
+        auto sg = [&](int c) { return 1.f / (1.f + __expf(-lg[(size_t)c * w3 + i])); };
+        v[1] += 1.f; v[2] += 2.f * sg(ch_phase) - 1.f; v[3] += 2.f * sg(ch_phase + 1) - 1.f;
+        for (int k = 0; k < 6; k++) v[4 + k] += sg(ch_normal + k) - (k < 3 ? 0.f : 0.5f);
+        { const float sd = sg(ch_density); v[10] += (dcode ? fminf(sd, 0.999f) / (1.f - fminf(sd, 0.999f)) : sd) / dscale; }
+        rmax = fmaxf(rmax, sg(ch_recto));
+    }
+    if (v[0] > 0.f) {
+        const size_t base = ((size_t)fz * F1 + fy) * F2 + fx;
+        for (int k = 0; k < 11; k++) if (v[k] != 0.f) atomicAdd(&acc[k * nf + base], v[k]);
+        atomicMax((int *)&acc[11 * nf + base], __float_as_int(rmax));
+    }
+}
+/* fit-field accumulators (12 planes of nf cells) -> the 10 uint8 fit-field planes (predict's fit_finalize on the device) */
+__global__ void fit_finalize_k(const float *acc, size_t nf, int h, uint8_t *a) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= nf) return;
+    const float cnt = acc[i], mat = acc[nf + i];
+    uint8_t o[10] = {128, 128, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (cnt > 0 && mat > 0) {
+        /* IEEE divisions (__fdiv_rn: the build's fast math would round some cells differently from the host's fit_finalize) */
+        o[9] = (uint8_t)lroundf(255.f * fminf(1.f, __fdiv_rn(mat, cnt)));
+        o[0] = (uint8_t)lroundf(128.f + __fdiv_rn(127.f * acc[2 * nf + i], mat)); o[1] = (uint8_t)lroundf(128.f + __fdiv_rn(127.f * acc[3 * nf + i], mat));
+        for (int k = 0; k < 6; k++) o[2 + k] = (uint8_t)lroundf(255.f * fminf(1.f, fmaxf(0.f, (k < 3 ? 0.f : 0.5f) + __fdiv_rn(acc[(4 + k) * nf + i], mat))));
+        const float rho = __fdiv_rn(acc[10 * nf + i], mat);
+        if (rho > 0) { const float v = __fdiv_rn(8.f, __fmul_rn((float)h, rho)); o[8] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lroundf(v)); }
+    }
+    for (int k = 0; k < 10; k++) a[k * nf + i] = o[k];
+}
+extern "C" void nn_fit_finalize(const float *acc, size_t nf, int h, uint8_t *a) { fit_finalize_k<<<nblk(nf, 256), 256>>>(acc, nf, h, a); KCHECK(); }
 extern "C" void nn_fit_accum_d(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
                                int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc) {
     int f0[3], f1[3];
@@ -224,8 +268,10 @@ extern "C" void nn_fit_accum_d(const float *lg, const uint8_t *ct, int D, int W,
     const int nfz = f1[0] - f0[0], nfy = f1[1] - f0[1], nfx = f1[2] - f0[2];
     const size_t nf = (size_t)F[0] * F[1] * F[2];
     if (h > 32 || nf > 0x7fffffff) { fprintf(stderr, "nn_fit_accum: h %d or field grid too large\n", h); abort(); }
-    fit_accum_k<<<nfz * nfy * nfx, h * h * h < 512 ? h * h * h : 512>>>(lg, ct, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfy, nfx,
-                                                F[1], F[2], nf, ch_recto, ch_phase, ch_normal, ch_density, dscale, dcode, acc);
+    if (h <= 4) fit_accum_cell_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>(lg, ct, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2],
+                                                                             nfz, nfy, nfx, F[1], F[2], nf, ch_recto, ch_phase, ch_normal, ch_density, dscale, dcode, acc);
+    else fit_accum_k<<<nfz * nfy * nfx, h * h * h < 512 ? h * h * h : 512>>>(lg, ct, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfy, nfx,
+                                                     F[1], F[2], nf, ch_recto, ch_phase, ch_normal, ch_density, dscale, dcode, acc);
     KCHECK();
 }
 extern "C" void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
