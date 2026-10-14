@@ -180,7 +180,7 @@ extern "C" void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float 
    density rho = sigma / 32, 11 the max recto probability (float bits, atomicMax as int: non-negative). The window covers box
    voxels [t + halo, t + W - halo) (t: the window origin relative to the box, may be negative), clipped to the box. */
 template <typename LT>
-__global__ void fit_accum_k(const LT *lg, const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, int bz, int by, int bx, int h,
+__global__ void fit_accum_k(const LT *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, int bz, int by, int bx, int h,
                             int fz0, int fy0, int fx0, int nfy, int nfx, int F1, int F2, size_t nf, int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc) {
     __shared__ float red[11][512];
     const int fi = blockIdx.x, fz = fz0 + fi / (nfy * nfx), fy = fy0 + (fi / nfx) % nfy, fx = fx0 + fi % nfx;
@@ -193,7 +193,7 @@ __global__ void fit_accum_k(const LT *lg, const uint8_t *ct, int D, int W, int h
         if (gz >= bz || gy >= by || gx >= bx || wz < hz || wz >= D - hz || wy < halo || wy >= W - halo || wx < halo || wx >= W - halo) continue;
         const size_t i = ((size_t)wz * W + wy) * W + wx;
         v[0] += 1.f;
-        if (!ct[i]) continue;
+        if (!(bits ? (bits[i >> 5] >> (i & 31)) & 1u : ct[i])) continue;   /* material: the uint8 CT window or its bit plane */
         auto sg = [&](int c) { return 1.f / (1.f + __expf(-lgv(lg, (size_t)c * w3 + i))); };
         v[1] += 1.f; v[2] += 2.f * sg(ch_phase) - 1.f; v[3] += 2.f * sg(ch_phase + 1) - 1.f;
         for (int k = 0; k < 6; k++) v[4 + k] += sg(ch_normal + k) - (k < 3 ? 0.f : 0.5f);
@@ -216,7 +216,7 @@ __global__ void fit_accum_k(const LT *lg, const uint8_t *ct, int D, int W, int h
 /* the same with a thread per field cell (h <= 4: at h 1 a block per cell ran one thread beside 22.5 KB of shared memory, a few
    threads per SM: ~0.8 s of a 384^3 window whose forward takes 0.25 s); a cell's voxels summed in order (h 1: the same sums) */
 template <typename LT>
-__global__ void fit_accum_cell_k(const LT *lg, const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, int bz, int by, int bx, int h,
+__global__ void fit_accum_cell_k(const LT *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, int bz, int by, int bx, int h,
                                  int fz0, int fy0, int fx0, int nfz, int nfy, int nfx, int F1, int F2, size_t nf, int ch_recto, int ch_phase, int ch_normal,
                                  int ch_density, float dscale, int dcode, float *acc) {
     const size_t ci = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (ci >= (size_t)nfz * nfy * nfx) return;
@@ -229,7 +229,7 @@ __global__ void fit_accum_cell_k(const LT *lg, const uint8_t *ct, int D, int W, 
         if (gz >= bz || gy >= by || gx >= bx || wz < hz || wz >= D - hz || wy < halo || wy >= W - halo || wx < halo || wx >= W - halo) continue;
         const size_t i = ((size_t)wz * W + wy) * W + wx;
         v[0] += 1.f;
-        if (!ct[i]) continue;
+        if (!(bits ? (bits[i >> 5] >> (i & 31)) & 1u : ct[i])) continue;   /* material: the uint8 CT window or its bit plane */
         auto sg = [&](int c) { return 1.f / (1.f + __expf(-lgv(lg, (size_t)c * w3 + i))); };
         v[1] += 1.f; v[2] += 2.f * sg(ch_phase) - 1.f; v[3] += 2.f * sg(ch_phase + 1) - 1.f;
         for (int k = 0; k < 6; k++) v[4 + k] += sg(ch_normal + k) - (k < 3 ? 0.f : 0.5f);
@@ -260,6 +260,12 @@ __global__ void fit_finalize_k(const float *acc, size_t nf, int h, uint8_t *a) {
 extern "C" void nn_fit_finalize(const float *acc, size_t nf, int h, uint8_t *a) { fit_finalize_k<<<nblk(nf, 256), 256>>>(acc, nf, h, a); KCHECK(); }
 extern "C" void nn_fit_accum_d(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
                                int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc) {
+    nn_fit_accum_dm(lg, ct, nullptr, D, W, hz, halo, tz, ty, tx, box, h, F, ch_recto, ch_phase, ch_normal, ch_density, dscale, dcode, acc);
+}
+/* the same with the material mask as the CT window's bit plane (nn_pred_ctmask; ct unused): predict keeps the uint8 window in the
+   network's skip buffer (inference aliasing), which the forward overwrites */
+extern "C" void nn_fit_accum_dm(const float *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
+                                int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc) {
     int f0[3], f1[3];
     const int t[3] = {tz, ty, tx}, wn[3] = {D, W, W}, hn[3] = {hz, halo, halo};
     for (int d = 0; d < 3; d++) {
@@ -271,13 +277,13 @@ extern "C" void nn_fit_accum_d(const float *lg, const uint8_t *ct, int D, int W,
     const size_t nf = (size_t)F[0] * F[1] * F[2];
     if (h > 32 || nf > 0x7fffffff) { fprintf(stderr, "nn_fit_accum: h %d or field grid too large\n", h); abort(); }
     const f16 *lgh = (const f16 *)lg;   /* nn_set_logits_h16: fp16 logits */
-    if (h <= 4 && g_logits_h16) fit_accum_cell_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>(lgh, ct, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2],
+    if (h <= 4 && g_logits_h16) fit_accum_cell_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>(lgh, ct, bits, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2],
                                                                              nfz, nfy, nfx, F[1], F[2], nf, ch_recto, ch_phase, ch_normal, ch_density, dscale, dcode, acc);
-    else if (h > 4 && g_logits_h16) fit_accum_k<<<nfz * nfy * nfx, h * h * h < 512 ? h * h * h : 512>>>(lgh, ct, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfy, nfx,
+    else if (h > 4 && g_logits_h16) fit_accum_k<<<nfz * nfy * nfx, h * h * h < 512 ? h * h * h : 512>>>(lgh, ct, bits, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfy, nfx,
                                                      F[1], F[2], nf, ch_recto, ch_phase, ch_normal, ch_density, dscale, dcode, acc);
-    else if (h <= 4) fit_accum_cell_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>(lg, ct, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2],
+    else if (h <= 4) fit_accum_cell_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>(lg, ct, bits, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2],
                                                                              nfz, nfy, nfx, F[1], F[2], nf, ch_recto, ch_phase, ch_normal, ch_density, dscale, dcode, acc);
-    else fit_accum_k<<<nfz * nfy * nfx, h * h * h < 512 ? h * h * h : 512>>>(lg, ct, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfy, nfx,
+    else fit_accum_k<<<nfz * nfy * nfx, h * h * h < 512 ? h * h * h : 512>>>(lg, ct, bits, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfy, nfx,
                                                      F[1], F[2], nf, ch_recto, ch_phase, ch_normal, ch_density, dscale, dcode, acc);
     KCHECK();
 }
