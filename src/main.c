@@ -61,6 +61,8 @@ static int usage(void) {
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
+        "  ufsm wrapswitch <wraps-dir> <codes-root> <codes-key>            how often the wraps switch sheets (per cm)\n"
+        "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm papyrus-labels <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx   papyrus / void training labels of a CT box (gap labels, no cutoff)\n"
@@ -446,11 +448,17 @@ static int cmd_band(int argc, char **argv) {
         memset(phs, PHASE_UNKNOWN, PN);
         int64_t ro2[3], rn2[3]; const z3_meta *pm = z3_meta_of(pz);
         for (int d = 0; d < 3; d++) { ro2[d] = po[d] < 0 ? 0 : po[d]; const int64_t e = po[d] + pnn[d] < pm->shape[d] ? po[d] + pnn[d] : pm->shape[d]; rn2[d] = e - ro2[d]; }
-        uint8_t *tmp = malloc((size_t)rn2[0] * rn2[1] * rn2[2]);
-        if (z3_read(pz, ro2, rn2, tmp, 8)) { fprintf(stderr, "band: phase read failed: %s\n", z3_error()); return 1; }
-        for (int64_t zz = 0; zz < rn2[0]; zz++) for (int64_t yy = 0; yy < rn2[1]; yy++)
-            memcpy(phs + ((size_t)(zz + ro2[0] - po[0]) * pnn[1] + (yy + ro2[1] - po[1])) * pnn[2] + (ro2[2] - po[2]), tmp + ((size_t)zz * rn2[1] + yy) * rn2[2], (size_t)rn2[2]);
-        free(tmp); z3_close(pz);
+        if (ro2[0] == po[0] && ro2[1] == po[1] && ro2[2] == po[2] && rn2[0] == pnn[0] && rn2[1] == pnn[1] && rn2[2] == pnn[2]) {
+            /* the haloed box inside the raster: read in place (a staging copy doubled the peak: a 3.9 cm slab needed ~70 GB) */
+            if (z3_read(pz, ro2, rn2, phs, 8)) { fprintf(stderr, "band: phase read failed: %s\n", z3_error()); return 1; }
+        } else {
+            uint8_t *tmp = malloc((size_t)rn2[0] * rn2[1] * rn2[2]);
+            if (z3_read(pz, ro2, rn2, tmp, 8)) { fprintf(stderr, "band: phase read failed: %s\n", z3_error()); return 1; }
+            for (int64_t zz = 0; zz < rn2[0]; zz++) for (int64_t yy = 0; yy < rn2[1]; yy++)
+                memcpy(phs + ((size_t)(zz + ro2[0] - po[0]) * pnn[1] + (yy + ro2[1] - po[1])) * pnn[2] + (ro2[2] - po[2]), tmp + ((size_t)zz * rn2[1] + yy) * rn2[2], (size_t)rn2[2]);
+            free(tmp);
+        }
+        z3_close(pz);
         axis axr = {0};
         if (axis_load(&axr, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "band: cannot load axis\n"); return 1; }
         const double t0p = now();
@@ -714,7 +722,7 @@ static int cmd_wind_score(int argc, char **argv) {
 }
 
 /* ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4] [--threads 16]
-   [--snap ROOT KEY [--snap-range 0.35] [--snap-min 0.5] [--snap-origin z,y,x]] [--out-um U]
+   [--snap ROOT KEY [--snap-range 0.35] [--snap-min 0.5] [--snap-origin z,y,x] | --snap-fields DIR] [--out-um U]
    One tifxyz per wrap of a fitted winding model (ufsm fit --out): wrap k is the level set W = k. Rows every step native voxels in
    z, columns every step / r_k radians of theta over the box's angular range (r_k: the wrap's radius at the box centre), each
    vertex the root of W = k along the ray from the umbilicus (src/fit.h fit_ray_root); vertices outside the box, without a root,
@@ -725,7 +733,8 @@ static float trilin(const uint8_t *v, const int64_t n[3], double z, double y, do
    displacements are median-filtered over 5 x 5 vertices so a stray peak cannot tear the surface. Tiles of rows x columns read
    only their own box (plus the search range); the vertices of a tile run on threads. */
 typedef struct { const fit_model *m; const uint8_t *vol; int64_t o[3], n[3]; const float *px, *py, *pz; float *disp; int cols, r0, r1, c0, c1;
-                 double range, pmin; _Atomic int next; } snap_job;
+                 double range, pmin; _Atomic int next; double ih, sub; int nearest; } snap_job;   /* array index = (native - o) ih - sub;
+                 nearest: the local maximum nearest the vertex (else the highest within the range) */
 static double model_pitch(const fit_model *m, double z) {
     double k = z / m->knot_dz; if (k < 0) k = 0; if (k > m->nk - 1) k = m->nk - 1;
     int k0 = (int)k; if (k0 > m->nk - 2) k0 = m->nk - 2 < 0 ? 0 : m->nk - 2;
@@ -739,21 +748,42 @@ static void *snap_rows(void *arg) {
         const double cy = m->cy[(int)zi] + m->origin[1], cx = m->cx[(int)zi] + m->origin[2];
         double uy = J->py[i] - cy, ux = J->px[i] - cx; const double ul = hypot(uy, ux); if (ul < 1e-6) continue; uy /= ul; ux /= ul;
         const double R = J->range * model_pitch(m, zl);
+#define SNAPV(t_) trilin(J->vol, J->n, (J->pz[i] - J->o[0]) * J->ih - J->sub, (J->py[i] + (t_) * uy - J->o[1]) * J->ih - J->sub, (J->px[i] + (t_) * ux - J->o[2]) * J->ih - J->sub)
+        if (J->nearest) {   /* the local maximum nearest the vertex, >= pmin (the sheet the fit is on, not a brighter neighbour) */
+            const double st = 0.25; double bd = 1e300, bt = 0; float vm = SNAPV(-R - st), v0 = SNAPV(-R);
+            for (double t = -R; t <= R; t += st) {
+                const float vp = SNAPV(t + st);
+                if (v0 >= vm && v0 > vp && v0 >= J->pmin * 255 && fabs(t) < bd) { bd = fabs(t); bt = t; }
+                vm = v0; v0 = vp;
+            }
+            if (bd < 1e300) J->disp[i] = (float)bt;
+            continue;
+        }
         float best = -1; double bt = 0;
         for (double t = -R; t <= R; t += 0.5) {
-            const float v = trilin(J->vol, J->n, J->pz[i] - J->o[0], J->py[i] + t * uy - J->o[1], J->px[i] + t * ux - J->o[2]);
+            const float v = SNAPV(t);
             if (v > best) { best = v; bt = t; }
         }
+#undef SNAPV
         if (best >= J->pmin * 255) J->disp[i] = (float)bt;
     }
     return nullptr;
 }
 static int cmp_fl(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
-static size_t wraps_snap(z3 *rz, const int64_t ro[3], const fit_model *m, int rows, int cols, float *px, float *py, float *pz, double range, double pmin, int nthreads) {
+/* mem (with --snap-fields): an in-memory array of shape mn on a grid of cell mh native voxels from mo (cell centres), searched for
+   the nearest local maximum instead of a zarr read per tile */
+static size_t wraps_snap(z3 *rz, const int64_t ro[3], const fit_model *m, int rows, int cols, float *px, float *py, float *pz, double range, double pmin, int nthreads,
+                         const uint8_t *mem, const int mn[3], const long long mo[3], double mh) {
     const size_t nv = (size_t)rows * cols; float *disp = malloc(nv * 4); for (size_t i = 0; i < nv; i++) disp[i] = NAN;
-    const z3_meta *zm = z3_meta_of(rz); double pmax = 0; for (int k = 0; k < m->nk; k++) if (m->pitch[k] > pmax) pmax = m->pitch[k];
+    if (mem) {
+        snap_job J = {m, mem, {mo[0], mo[1], mo[2]}, {mn[0], mn[1], mn[2]}, px, py, pz, disp, cols, 0, rows, 0, cols, range, pmin, 0, 1 / mh, 0.5, 1};
+        pthread_t th[64]; const int nt = nthreads < 64 ? (nthreads > 0 ? nthreads : 1) : 64;
+        for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, snap_rows, &J);
+        for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+    }
+    const z3_meta *zm = rz ? z3_meta_of(rz) : nullptr; double pmax = 0; for (int k = 0; k < m->nk; k++) if (m->pitch[k] > pmax) pmax = m->pitch[k];
     const int TR = 64, TC = 512; const double mar = range * pmax + 3;
-    for (int r0 = 0; r0 < rows; r0 += TR) for (int c0 = 0; c0 < cols; c0 += TC) {
+    for (int r0 = 0; r0 < (mem ? 0 : rows); r0 += TR) for (int c0 = 0; c0 < cols; c0 += TC) {
         const int r1 = r0 + TR < rows ? r0 + TR : rows, c1 = c0 + TC < cols ? c0 + TC : cols;
         double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
         for (int r = r0; r < r1; r++) for (int c = c0; c < c1; c++) {
@@ -761,7 +791,7 @@ static size_t wraps_snap(z3 *rz, const int64_t ro[3], const fit_model *m, int ro
             const double v[3] = {pz[i], py[i], px[i]}; for (int d = 0; d < 3; d++) { if (v[d] < lo[d]) lo[d] = v[d]; if (v[d] > hi[d]) hi[d] = v[d]; }
         }
         if (lo[0] > hi[0]) continue;
-        snap_job J = {m, nullptr, {0, 0, 0}, {0, 0, 0}, px, py, pz, disp, cols, r0, r1, c0, c1, range, pmin, 0};
+        snap_job J = {m, nullptr, {0, 0, 0}, {0, 0, 0}, px, py, pz, disp, cols, r0, r1, c0, c1, range, pmin, 0, 1, 0, 0};
         int ok = 1;
         for (int d = 0; d < 3; d++) {
             const double g = d ? mar : 2;   /* rays are horizontal: the search moves y / x only */
@@ -850,6 +880,18 @@ static int cmd_wraps(int argc, char **argv) {
             for (int d = 0; d < 3; d++) snapo[d] = v[d];
         }
     }
+    /* --snap-fields DIR: snap to the sheet centres of a fit-field set (its pc = 128 + 127 conf cos(phase) peaks at phase 0, the sheet,
+       weighted by the confidence): each vertex to the nearest local maximum >= --snap-min along its ray (the level set of the fitted
+       W is smoother than the sheets and crosses the gaps between them) */
+    uint8_t *sfa = nullptr; int sfn[3] = {0, 0, 0}; long long sfo[3] = {0, 0, 0}; double sfh = 1;
+    const char *sfd = opt(argc, argv, "--snap-fields", nullptr);
+    if (sfd) {
+        if (snapz) { fprintf(stderr, "wraps: --snap or --snap-fields, not both\n"); return 2; }
+        fit_fields_buf g; if (fit_fields_load(sfd, 0, 0, 0, &g)) { fprintf(stderr, "wraps: cannot read the fields in %s\n", sfd); return 1; }
+        for (int d = 0; d < 3; d++) { sfo[d] = g.origin[d]; }
+        sfh = g.h; fit_fields_free(&g);
+        if (!(sfa = fit_field_array(sfd, "pc", 1, sfn))) { fprintf(stderr, "wraps: cannot read pc in %s\n", sfd); return 1; }
+    }
     const double Z = m->D * m->h, Y = m->H * m->h, X = m->W * m->h;
     uint8_t *wf = nullptr; int wsh[3] = {0, 0, 0}; double wh = 0;   /* optional: the fields' data weight (max-pooled to <= ~1 GB) */
     const char *fd = opt(argc, argv, "--fields", nullptr);
@@ -897,7 +939,7 @@ static int cmd_wraps(int argc, char **argv) {
         for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wraps_rows, &J);
         for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
         const size_t valid = atomic_load(&J.valid);
-        if (snapz && valid) { const size_t mv = wraps_snap(snapz, snapo, m, rows, cols, px, py, pz, snap_range, snap_min, nthreads); if (verbose_snap) fprintf(stderr, "wraps: w%03d: %zu of %zu vertices snapped\n", k, mv, valid); }
+        if ((snapz || sfa) && valid) { const size_t mv = wraps_snap(snapz, snapo, m, rows, cols, px, py, pz, snap_range, snap_min, nthreads, sfa, sfn, sfo, sfh); if (verbose_snap) fprintf(stderr, "wraps: w%03d: %zu of %zu vertices snapped\n", k, mv, valid); }
         if (valid > 16) {
             char wd[1400]; snprintf(wd, sizeof wd, "%s/w%03d", argv[3], k);
             double wstep = step, wum = um;
@@ -912,7 +954,7 @@ static int cmd_wraps(int argc, char **argv) {
         free(px); free(py); free(pz);
     }
     fprintf(stderr, "wraps: %d wraps (%d..%d) with %zu vertices written to %s\n", nwr, k0, k1, nvalid_all, argv[3]);
-    fit_set_free(fs); free(wf); if (snapz) z3_close(snapz);
+    fit_set_free(fs); free(wf); free(sfa); if (snapz) z3_close(snapz);
     return 0;
 }
 
@@ -1155,6 +1197,262 @@ static int cmd_wrapdist(int argc, char **argv) {
     return 0;
 }
 static float *wd_read(const char *path, int *w, int *h) { return read_tif_f32(path, w, h); }
+
+/* ufsm wrapswitch <wraps-dir> <codes-root> <codes-key> [--range 30] [--gap 1] [--min-run 100] [--chunk 64] [--threads 16] [--per-wrap] [--cache DIR]
+   How often the wraps (every <wraps-dir>/wNNN tifxyz) switch sheets. Each vertex takes the code of the nearest labelled voxel along
+   its surface normal within +- --range um (band codes: 1 + round(18 q) mod 252, q the published wrap's unwrapped turn coordinate:
+   continuous along a sheet, one turn apart between neighbouring sheets). Walking each grid row (around the axis) and each column
+   (along z), consecutive coded vertices less than --gap mm apart whose q differ by more than half a turn (mod 14) are a switch to
+   another sheet, once the new sheet holds for --min-run um (shorter runs: a vertex between two sheets flickering between their
+   labels). Being a whole turn off everywhere costs nothing here: only changes count. Reports switches per cm of coded path
+   along theta and z, the coded share of the vertices and the mean switch-free run, over all wraps (and per wrap). The codes are read
+   in z chunks of --chunk label rows over the vertices' bounding box. */
+typedef struct { int w, h, id; float *X, *Y, *Z; uint8_t *code; } ws_wrap;
+typedef struct {
+    ws_wrap *W; int nw; long *rs; long nrows; double sc, R; const uint8_t *lab; int64_t o[3], n[3], z0, z1; _Atomic long next;
+} ws_job;
+static void *ws_rows(void *arg) {
+    ws_job *J = arg;
+    for (long g; (g = atomic_fetch_add(&J->next, 1)) < J->nrows;) {
+        int lo = 0, hi = J->nw - 1; while (lo < hi) { const int mid = (lo + hi + 1) / 2; if (J->rs[mid] <= g) lo = mid; else hi = mid - 1; }
+        ws_wrap *w = &J->W[lo]; const int r = (int)(g - J->rs[lo]), W = w->w, H = w->h;
+        for (int c = 0; c < W; c++) {
+            const size_t i = (size_t)r * W + c; if (w->Z[i] < 0 || w->code[i]) continue;
+            const double P[3] = {w->Z[i] * J->sc, w->Y[i] * J->sc, w->X[i] * J->sc};
+            const int64_t q0 = (int64_t)llround(P[0]); if (q0 < J->z0 || q0 >= J->z1) continue;   /* this chunk's vertices */
+            const int cl = c > 0 && w->Z[i - 1] >= 0 ? c - 1 : c, cr = c + 1 < W && w->Z[i + 1] >= 0 ? c + 1 : c;
+            const int ru = r > 0 && w->Z[i - W] >= 0 ? r - 1 : r, rd = r + 1 < H && w->Z[i + W] >= 0 ? r + 1 : r;
+            if (cl == cr || ru == rd) continue;
+            const size_t a = (size_t)r * W + cl, b = (size_t)r * W + cr, u = (size_t)ru * W + c, d = (size_t)rd * W + c;
+            const double du[3] = {w->Z[b] - w->Z[a], w->Y[b] - w->Y[a], w->X[b] - w->X[a]}, dv[3] = {w->Z[d] - w->Z[u], w->Y[d] - w->Y[u], w->X[d] - w->X[u]};
+            double N[3] = {du[1] * dv[2] - du[2] * dv[1], du[2] * dv[0] - du[0] * dv[2], du[0] * dv[1] - du[1] * dv[0]};
+            const double nl = sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]); if (!(nl > 0)) continue;
+            for (int k = 0; k < 3; k++) N[k] /= nl;
+            for (int s = 0; s <= 4 * (int)ceil(J->R); s++) {   /* t = 0, +.5, -.5, +1, -1, ...: the nearest labelled voxel first */
+                const double t = (s + 1) / 2 * 0.5 * (s % 2 ? 1 : -1); if (fabs(t) > J->R) break;
+                int64_t p[3]; int in = 1;
+                for (int k = 0; k < 3; k++) { p[k] = (int64_t)llround(P[k] + t * N[k]) - J->o[k]; in &= p[k] >= 0 && p[k] < J->n[k]; }
+                if (!in) continue;
+                const uint8_t v = J->lab[((size_t)p[0] * J->n[1] + p[1]) * J->n[2] + p[2]];
+                if (v >= 1 && v <= 252) { w->code[i] = v; break; }
+            }
+        }
+    }
+    return nullptr;
+}
+typedef struct { double path, sw, runs; } ws_stat;
+/* one direction over the grid: per line, coded vertices joined into paths (consecutive ones less than gap_um apart); along a path
+   the sheet index unwraps the codes (s += round(dq), dq the code change mod 14 turns); runs of one sheet shorter than min_um
+   (a vertex between two sheets flickering between their labels) are dropped, and a switch is a change between the remaining runs */
+static void ws_walk(const ws_wrap *w, int along_z, double um, double gap_um, double min_um, ws_stat *s, int *sb, double *lb) {
+    const int L = along_z ? w->w : w->h, M = along_z ? w->h : w->w;
+    for (int l = 0; l < L; l++) {
+        int n = 0, last = -1;
+        for (int m = 0; m <= M; m++) {
+            const size_t i = m < M ? (along_z ? (size_t)m * w->w + l : (size_t)l * w->w + m) : 0;
+            const int coded = m < M && w->code[i];
+            double dl = 0;
+            if (coded && last >= 0) {
+                const size_t j = along_z ? (size_t)last * w->w + l : (size_t)l * w->w + last;
+                const double dz = w->Z[i] - w->Z[j], dy = w->Y[i] - w->Y[j], dx = w->X[i] - w->X[j]; dl = sqrt(dz * dz + dy * dy + dx * dx) * um;
+            }
+            if (n > 0 && (!coded ? m == M : dl > gap_um)) {   /* the path ends: its runs */
+                double run = 0; int cur = 0, have = 0; double path = 0;
+                for (int k = 0; k < n;) {
+                    int e = k; double len = 0; while (e < n && sb[e] == sb[k]) { len += lb[e]; e++; }
+                    path += len;
+                    if (len >= min_um || (k == 0 && e == n)) {
+                        if (have && sb[k] != cur) { s->sw += 1; s->runs += 1; run = 0; }
+                        cur = sb[k]; have = 1; run += len;
+                    } else run += len;
+                    k = e;
+                }
+                s->path += path; if (run > 0) s->runs += 1;
+                n = 0;
+            }
+            if (!coded) continue;
+            if (n == 0) { sb[0] = 0; lb[0] = 0; n = 1; }
+            else { const size_t j = along_z ? (size_t)last * w->w + l : (size_t)l * w->w + last;
+                   double dq = (w->code[i] - w->code[j]) / 18.0; dq = fmod(dq + 7 + 14, 14) - 7;
+                   sb[n] = sb[n - 1] + (int)lround(dq); lb[n] = dl; n++; }
+            last = m;
+        }
+    }
+}
+static int cmd_wrapswitch(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: ufsm wrapswitch <wraps-dir> <codes-root> <codes-key> [--range 30] [--gap 1] [--min-run 100] [--chunk 64] [--threads 16] [--per-wrap] [--cache DIR]\n"); return 2; }
+    const double lum = atof(argv[4]), range_um = atof(opt(argc, argv, "--range", "30")), gap_mm = atof(opt(argc, argv, "--gap", "1")), min_um = atof(opt(argc, argv, "--min-run", "100"));
+    const int C = atoi(opt(argc, argv, "--chunk", "64")), nt = atoi(opt(argc, argv, "--threads", "16")), per = arg_index(argc, argv, "--per-wrap") > 0;
+    if (!(lum > 0) || !(range_um > 0) || !(gap_mm > 0) || C < 1 || nt < 1) { fprintf(stderr, "wrapswitch: the codes key is its voxel size in um (e.g. 4.8); --range, --gap, --chunk > 0\n"); return 2; }
+    z3 *z = z3_open(store_open(argv[3]), argv[4], opt(argc, argv, "--cache", nullptr)); if (!z) { fprintf(stderr, "wrapswitch: %s\n", z3_error()); return 1; }
+    const z3_meta *zm = z3_meta_of(z);
+    int nw = 0, capw = 64; ws_wrap *Wr = calloc(capw, sizeof *Wr); double wum = 0;
+    DIR *dd = opendir(argv[2]); struct dirent *de; if (!dd) { fprintf(stderr, "wrapswitch: cannot open %s\n", argv[2]); return 1; }
+    while ((de = readdir(dd))) {
+        if (de->d_name[0] != 'w') continue;
+        char p[1400]; int w, h, w2, h2, w3, h3; double um = 0;
+        snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
+        { FILE *f = fopen(p, "rb"); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"voxel_size_um\":"); if (q) um = atof(q + 16); } }
+        snprintf(p, sizeof p, "%s/%s/x.tif", argv[2], de->d_name); float *X = wd_read(p, &w, &h);
+        snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = wd_read(p, &w2, &h2);
+        snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = wd_read(p, &w3, &h3);
+        if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || !(um > 0) || (wum > 0 && fabs(um - wum) > 1e-9)) { free(X); free(Y); free(Z); continue; }
+        wum = um;
+        if (nw == capw) { capw *= 2; Wr = realloc(Wr, capw * sizeof *Wr); }
+        Wr[nw++] = (ws_wrap){w, h, atoi(de->d_name + 1), X, Y, Z, calloc((size_t)w * h, 1)};
+    }
+    closedir(dd);
+    if (!nw) { fprintf(stderr, "wrapswitch: no wraps in %s\n", argv[2]); return 1; }
+    const double sc = wum / lum, R = range_um / lum;
+    double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+    for (int k = 0; k < nw; k++) for (size_t i = 0; i < (size_t)Wr[k].w * Wr[k].h; i++) {
+        if (Wr[k].Z[i] < 0) continue;
+        const double v[3] = {Wr[k].Z[i] * sc, Wr[k].Y[i] * sc, Wr[k].X[i] * sc};
+        for (int d = 0; d < 3; d++) { if (v[d] < lo[d]) lo[d] = v[d]; if (v[d] > hi[d]) hi[d] = v[d]; }
+    }
+    const int Ri = (int)ceil(R) + 1; int64_t bo[3], bn[3];
+    for (int d = 0; d < 3; d++) { bo[d] = (int64_t)floor(lo[d]) - Ri; if (bo[d] < 0) bo[d] = 0; int64_t e = (int64_t)ceil(hi[d]) + Ri + 1; if (e > zm->shape[d]) e = zm->shape[d]; bn[d] = e - bo[d]; }
+    long *rs = malloc((nw + 1) * sizeof *rs); rs[0] = 0; for (int k = 0; k < nw; k++) rs[k + 1] = rs[k] + Wr[k].h;
+    const size_t plane = (size_t)bn[1] * bn[2]; uint8_t *lab = malloc((size_t)(C + 2 * Ri) * plane);
+    if (!lab) { fprintf(stderr, "wrapswitch: no memory for %d rows of %zu voxels (lower --chunk)\n", C + 2 * Ri, plane); return 1; }
+    for (int64_t z0 = bo[0]; z0 < bo[0] + bn[0]; z0 += C) {
+        const int64_t a = z0 - Ri < bo[0] ? bo[0] : z0 - Ri, b = z0 + C + Ri > bo[0] + bn[0] ? bo[0] + bn[0] : z0 + C + Ri;
+        ws_job J = {Wr, nw, rs, rs[nw], sc, R, lab, {a, bo[1], bo[2]}, {b - a, bn[1], bn[2]}, z0, z0 + C, 0};
+        if (z3_read(z, J.o, J.n, lab, nt)) { fprintf(stderr, "wrapswitch: %s\n", z3_error()); return 1; }
+        pthread_t th[64]; const int k = nt < 64 ? nt : 64; for (int t = 0; t < k; t++) pthread_create(&th[t], nullptr, ws_rows, &J);
+        for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
+    }
+    free(lab); z3_close(z);
+    ws_stat A[2] = {{0}}; size_t coded = 0, valid = 0;
+    if (per) printf("  wrap   coded   theta: sw/cm  run mm   z: sw/cm  run mm\n");
+    for (int k = 0; k < nw; k++) {
+        ws_stat s[2] = {{0}}; size_t cd = 0, vl = 0;
+        for (size_t i = 0; i < (size_t)Wr[k].w * Wr[k].h; i++) { vl += Wr[k].Z[i] >= 0; cd += Wr[k].code[i] > 0; }
+        const int mx = Wr[k].w > Wr[k].h ? Wr[k].w : Wr[k].h; int *sb = malloc((mx + 1) * sizeof *sb); double *lb = malloc((mx + 1) * sizeof *lb);
+        for (int d = 0; d < 2; d++) { ws_walk(&Wr[k], d, wum, gap_mm * 1000, min_um, &s[d], sb, lb); A[d].path += s[d].path; A[d].sw += s[d].sw; A[d].runs += s[d].runs; }
+        free(sb); free(lb); coded += cd; valid += vl;
+        if (per && s[0].path > 0) printf("  w%03d  %5.3f   %10.2f  %6.2f   %8.2f  %6.2f\n", Wr[k].id, vl ? (double)cd / vl : 0, s[0].sw / (s[0].path * 1e-4),
+                                          s[0].runs ? s[0].path / s[0].runs * 1e-3 : 0, s[1].path > 0 ? s[1].sw / (s[1].path * 1e-4) : 0, s[1].runs ? s[1].path / s[1].runs * 1e-3 : 0);
+        free(Wr[k].X); free(Wr[k].Y); free(Wr[k].Z); free(Wr[k].code);
+    }
+    printf("wrapswitch: %d wraps, %zu vertices, %.3f coded (nearest label within %.0f um along the normal); %.1f cm of coded path around "
+           "the axis, %.0f switches: %.2f per cm, mean switch-free run %.2f mm; along z %.1f cm, %.0f switches: %.2f per cm, run %.2f mm\n",
+           nw, valid, valid ? (double)coded / valid : 0, range_um, A[0].path * 1e-4, A[0].sw, A[0].path > 0 ? A[0].sw / (A[0].path * 1e-4) : 0,
+           A[0].runs ? A[0].path / A[0].runs * 1e-3 : 0, A[1].path * 1e-4, A[1].sw, A[1].path > 0 ? A[1].sw / (A[1].path * 1e-4) : 0, A[1].runs ? A[1].path / A[1].runs * 1e-3 : 0);
+    free(Wr); free(rs);
+    return 0;
+}
+
+/* ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U [--range 40] [--min 100] [--median 2] [--threads 16] [--cache DIR]
+   Refines tifxyz surfaces (every <wraps-in>/wNNN) onto the papyrus. A fitted winding's level set W = k is smooth at the fit's lattice
+   scale (77 um at 19.2 um) and crosses the gaps of wavy sheets: on a 3.9 cm Paris4 slab ~half its 2.4 um render samples were void,
+   for a fit to the ground-truth phase too. Each vertex moves along its surface normal (from the grid) to the nearest local maximum
+   >= --min of a volume (CT, or a recto probability) within +- --range um, sampled trilinearly every half volume voxel; the
+   displacements are median-filtered over (2 median + 1)^2 vertices (a stray peak cannot tear the surface; a vertex without a
+   maximum takes its neighbours' median). Vertices are in the wraps' voxel units (meta.json voxel_size_um), the volume at --vol-um.
+   Tiles of vertices read only their own box. */
+typedef struct { const float *X, *Y, *Z, *N; float *disp; int w, r0, r1, c0, c1; const uint8_t *vol; int64_t o[3], n[3]; double s, R, vmin; _Atomic int next; } ssn_job;
+static void *ssn_rows(void *arg) {
+    ssn_job *J = arg;
+    for (int r; (r = J->r0 + atomic_fetch_add(&J->next, 1)) < J->r1;) for (int c = J->c0; c < J->c1; c++) {
+        const size_t i = (size_t)r * J->w + c; if (J->Z[i] < 0 || isnan(J->N[3 * i])) continue;
+        const double P[3] = {J->Z[i] * J->s - J->o[0], J->Y[i] * J->s - J->o[1], J->X[i] * J->s - J->o[2]}, *nn = nullptr; (void)nn;
+        const float *N = &J->N[3 * i]; const double st = 0.5;
+#define SSV(t_) trilin(J->vol, J->n, P[0] + (t_) * N[0], P[1] + (t_) * N[1], P[2] + (t_) * N[2])
+        double bd = 1e300, bt = 0; float vm = SSV(-J->R - st), v0 = SSV(-J->R);
+        for (double t = -J->R; t <= J->R; t += st) {
+            const float vp = SSV(t + st);
+            if (v0 >= vm && v0 > vp && v0 >= J->vmin && fabs(t) < bd) { bd = fabs(t); bt = t; }
+            vm = v0; v0 = vp;
+        }
+#undef SSV
+        if (bd < 1e300) J->disp[i] = (float)(bt / J->s);   /* in the wraps' voxels */
+    }
+    return nullptr;
+}
+static int cmd_surfsnap(int argc, char **argv) {
+    const int vi = arg_index(argc, argv, "--volume");
+    if (argc < 4 || vi < 0 || vi + 2 >= argc) { fprintf(stderr, "usage: ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U [--range 40] [--min 100] [--median 2] [--threads 16] [--cache DIR]\n"); return 2; }
+    const double vum = atof(opt(argc, argv, "--vol-um", "0")), range_um = atof(opt(argc, argv, "--range", "40")), vmin = atof(opt(argc, argv, "--min", "100"));
+    const int nt = atoi(opt(argc, argv, "--threads", "16")), MR = atoi(opt(argc, argv, "--median", "2"));
+    if (!(vum > 0) || !(range_um > 0) || MR < 0 || MR > 5 || nt < 1) { fprintf(stderr, "surf-snap: --vol-um U (the volume's voxel um) > 0, --range > 0, --median 0..5\n"); return 2; }
+    z3 *vz = z3_open(store_open(argv[vi + 1]), argv[vi + 2], opt(argc, argv, "--cache", nullptr)); if (!vz) { fprintf(stderr, "surf-snap: %s\n", z3_error()); return 1; }
+    const z3_meta *zm = z3_meta_of(vz);
+    char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", argv[3]); if (system(cmd)) return 1;
+    DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "surf-snap: cannot open %s\n", argv[2]); return 1; }
+    struct dirent *de; int nw = 0; size_t nmoved = 0, nvert = 0; double sabs = 0;
+    while ((de = readdir(dd))) {
+        if (de->d_name[0] != 'w') continue;
+        char p[1400]; int w, h, w2, h2, w3, h3; double wum = 0, scale = 0; int winding = 0;
+        snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
+        { FILE *f = fopen(p, "rb"); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); }
+          const char *q = strstr(b, "\"voxel_size_um\":"); if (q) wum = atof(q + 16);
+          q = strstr(b, "\"scale\":"); if (q) { q = strchr(q, '['); if (q) scale = atof(q + 1); }
+          q = strstr(b, "\"winding\":"); if (q) winding = atoi(q + 10); }
+        snprintf(p, sizeof p, "%s/%s/x.tif", argv[2], de->d_name); float *X = read_tif_f32(p, &w, &h);
+        snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = read_tif_f32(p, &w2, &h2);
+        snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = read_tif_f32(p, &w3, &h3);
+        if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || !(wum > 0) || !(scale > 0) || w < 3 || h < 3) { free(X); free(Y); free(Z); continue; }
+        const size_t nv = (size_t)w * h; const double s = wum / vum, R = range_um / vum;
+        float *N = malloc(nv * 3 * sizeof(float)), *disp = malloc(nv * 4), *med = malloc(nv * 4);
+        for (int r = 0; r < h; r++) for (int c = 0; c < w; c++) {   /* unit normals (central differences where the neighbours exist) */
+            const size_t i = (size_t)r * w + c; float *n3 = &N[3 * i]; n3[0] = n3[1] = n3[2] = NAN; disp[i] = NAN; if (Z[i] < 0) continue;
+            const int cl = c > 0 && Z[i - 1] >= 0 ? c - 1 : c, cr = c + 1 < w && Z[i + 1] >= 0 ? c + 1 : c;
+            const int ru = r > 0 && Z[i - w] >= 0 ? r - 1 : r, rd = r + 1 < h && Z[i + w] >= 0 ? r + 1 : r;
+            if (cl == cr || ru == rd) continue;
+            const size_t a = (size_t)r * w + cl, b = (size_t)r * w + cr, u = (size_t)ru * w + c, d = (size_t)rd * w + c;
+            const double du[3] = {Z[b] - Z[a], Y[b] - Y[a], X[b] - X[a]}, dv[3] = {Z[d] - Z[u], Y[d] - Y[u], X[d] - X[u]};
+            const double q[3] = {du[1] * dv[2] - du[2] * dv[1], du[2] * dv[0] - du[0] * dv[2], du[0] * dv[1] - du[1] * dv[0]}, ql = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]);
+            if (ql > 0) for (int k = 0; k < 3; k++) n3[k] = (float)(q[k] / ql);
+        }
+        const int TR = 128, TC = 512;
+        for (int r0 = 0; r0 < h; r0 += TR) for (int c0 = 0; c0 < w; c0 += TC) {
+            const int r1 = r0 + TR < h ? r0 + TR : h, c1 = c0 + TC < w ? c0 + TC : w;
+            double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+            for (int r = r0; r < r1; r++) for (int c = c0; c < c1; c++) {
+                const size_t i = (size_t)r * w + c; if (Z[i] < 0) continue;
+                const double v[3] = {Z[i] * s, Y[i] * s, X[i] * s}; for (int d = 0; d < 3; d++) { if (v[d] < lo[d]) lo[d] = v[d]; if (v[d] > hi[d]) hi[d] = v[d]; }
+            }
+            if (lo[0] > hi[0]) continue;
+            ssn_job J = {X, Y, Z, N, disp, w, r0, r1, c0, c1, nullptr, {0, 0, 0}, {0, 0, 0}, s, R, vmin, 0}; int ok = 1;
+            for (int d = 0; d < 3; d++) {
+                int64_t a = (int64_t)floor(lo[d] - R - 2), b = (int64_t)ceil(hi[d] + R + 2) + 1;
+                if (a < 0) a = 0;
+                if (b > zm->shape[d]) b = zm->shape[d];
+                if (b <= a) ok = 0;
+                J.o[d] = a; J.n[d] = b - a;
+            }
+            const size_t bytes = (size_t)J.n[0] * J.n[1] * J.n[2];
+            if (!ok || bytes > ((size_t)4 << 30)) { if (ok) fprintf(stderr, "surf-snap: %s tile %d,%d spans %lldx%lldx%lld voxels (a fold?): skipped\n", de->d_name, r0, c0, (long long)J.n[0], (long long)J.n[1], (long long)J.n[2]); continue; }
+            uint8_t *vol = malloc(bytes);
+            if (!vol || z3_read(vz, J.o, J.n, vol, nt)) { free(vol); fprintf(stderr, "surf-snap: %s\n", z3_error()); continue; }
+            J.vol = vol;
+            pthread_t th[64]; const int k = nt < 64 ? nt : 64;
+            for (int t = 0; t < k; t++) pthread_create(&th[t], nullptr, ssn_rows, &J);
+            for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
+            free(vol);
+        }
+        float win[121]; size_t moved = 0, valid = 0;
+        for (int r = 0; r < h; r++) for (int c = 0; c < w; c++) {
+            const size_t i = (size_t)r * w + c; med[i] = NAN; if (Z[i] < 0) continue;
+            valid++; int k = 0;
+            for (int a = r - MR; a <= r + MR; a++) for (int b = c - MR; b <= c + MR; b++)
+                if (a >= 0 && a < h && b >= 0 && b < w && !isnan(disp[(size_t)a * w + b])) win[k++] = disp[(size_t)a * w + b];
+            if (k >= (2 * MR + 1) * (2 * MR + 1) / 5 + 1) { qsort(win, k, sizeof(float), cmp_fl); med[i] = win[k / 2]; }
+        }
+        for (size_t i = 0; i < nv; i++) {
+            if (Z[i] < 0 || isnan(med[i]) || isnan(N[3 * i])) continue;
+            Z[i] += med[i] * N[3 * i]; Y[i] += med[i] * N[3 * i + 1]; X[i] += med[i] * N[3 * i + 2]; moved++; sabs += fabs(med[i]) * wum;
+        }
+        snprintf(p, sizeof p, "%s/%s", argv[3], de->d_name);
+        if (tifxyz_write(p, w, h, X, Y, Z, 1 / scale, wum, winding, "ufsm surf-snap (wraps refined onto the papyrus)")) { fprintf(stderr, "surf-snap: cannot write %s\n", p); return 1; }
+        nw++; nmoved += moved; nvert += valid;
+        free(X); free(Y); free(Z); free(N); free(disp); free(med);
+    }
+    closedir(dd); z3_close(vz);
+    fprintf(stderr, "surf-snap: %d wraps, %zu of %zu vertices moved (mean |shift| %.1f um) -> %s\n", nw, nmoved, nvert, nmoved ? sabs / nmoved : 0, argv[3]);
+    return nw ? 0 : 1;
+}
 
 /* ufsm fit-compare <reference-fields> <fields>: how a field set (e.g. a network's, predict --fit-zarr) agrees with a reference
    (e.g. the oracle, band --fit-fields) cell by cell; both must cover the same physical cells (origin x um, h x um equal), at any
@@ -1822,6 +2120,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
     if (!strcmp(cmd, "ct-hist")) return cmd_ct_hist(argc, argv);
     if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);
+    if (!strcmp(cmd, "wrapswitch")) return cmd_wrapswitch(argc, argv);
+    if (!strcmp(cmd, "surf-snap")) return cmd_surfsnap(argc, argv);
     if (!strcmp(cmd, "fit-compare")) return cmd_fit_compare(argc, argv);
     if (!strcmp(cmd, "gap-compare")) return cmd_gap_compare(argc, argv);
     if (!strcmp(cmd, "gap-density")) return cmd_gap_density(argc, argv);

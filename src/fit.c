@@ -893,6 +893,23 @@ fit_model *fit_load(const char *dir) {
 
 /* the root of W = k along the ray (theta) from the axis nearest r_hint, W evaluated by ev; the axis, box and pitch of m */
 typedef double (*ray_ev)(const void *ctx, double z, double y, double x, double r, double th);
+enum { RR_SEG = 16, RR_SUB = 8, RR_DEPTH = 2 };
+/* a sign change of W - k over [a, b]: a crossing interval when W moves by less than half a turn across it (a larger jump is the
+   theta cut of a nearby ray), else the interval in RR_SUB parts, down to RR_DEPTH levels (dr / 64): where sheets are packed tighter
+   than the prior pitch W legitimately moves > 0.5 turn per pitch / 4 step, and those crossings were all dropped (a fit to Paris4
+   network fields lost 37-52% of its wrap vertices so) */
+static int rr_cross(ray_ev evr, const void *ctx, double z, double cy, double cx, double sy, double sx, double thw, double k,
+                    double a, double fa, double b, double fb, int depth, double seg[][3], int ns) {
+    if (fabs(fa - fb) < 0.5) { if (ns < RR_SEG) { seg[ns][0] = a; seg[ns][1] = b; seg[ns][2] = fa; ns++; } return ns; }
+    if (depth >= RR_DEPTH) return ns;
+    double r0 = a, f0 = fa;
+    for (int q = 1; q <= RR_SUB; q++) {
+        const double r1 = q == RR_SUB ? b : a + (b - a) * q / RR_SUB, f1 = q == RR_SUB ? fb : evr(ctx, z, cy + r1 * sy, cx + r1 * sx, r1, thw) - k;
+        if ((f0 < 0) != (f1 < 0)) ns = rr_cross(evr, ctx, z, cy, cx, sy, sx, thw, k, r0, f0, r1, f1, depth + 1, seg, ns);
+        r0 = r1; f0 = f1;
+    }
+    return ns;
+}
 static int ray_root(ray_ev evr, const void *ctx, const fit_model *m, double z, double theta, double k, double r_hint, double *r) {
     const int na = (int)(m->D * m->h) + 1;
     const double cy = axis_lerp(m->cy, na, z), cx = axis_lerp(m->cx, na, z), sy = sin(theta), sx = cos(theta), thw = atan2(sy, sx);
@@ -915,15 +932,15 @@ static int ray_root(ray_ev evr, const void *ctx, const fit_model *m, double z, d
     const double h0 = fmin(fmax(r_hint, rlo), rhi), f0 = EVR(h0) - k;
     double ro = h0, fo = f0, ri = h0, fi = f0, best = -1, bestd = 1e300;
     while ((ro < rhi && fo < 2) || (ri > rlo && fi > -2)) {
-        double seg[2][3]; int ns = 0;   /* (a, b, f(a)) of this ring's crossing intervals */
+        double seg[RR_SEG][3]; int ns = 0;   /* (a, b, f(a)) of this ring's crossing intervals */
         if (ro < rhi && fo < 2) {
             const double rn = fmin(ro + dr, rhi), fn = EVR(rn) - k;
-            if ((fo < 0) != (fn < 0) && fabs(fo - fn) < 0.5) { seg[ns][0] = ro; seg[ns][1] = rn; seg[ns][2] = fo; ns++; }
+            if ((fo < 0) != (fn < 0)) ns = rr_cross(evr, ctx, z, cy, cx, sy, sx, thw, k, ro, fo, rn, fn, 0, seg, ns);
             ro = rn; fo = fn;
         }
         if (ri > rlo && fi > -2) {
             const double rn = fmax(ri - dr, rlo), fn = EVR(rn) - k;
-            if ((fi < 0) != (fn < 0) && fabs(fi - fn) < 0.5) { seg[ns][0] = rn; seg[ns][1] = ri; seg[ns][2] = fn; ns++; }
+            if ((fi < 0) != (fn < 0)) ns = rr_cross(evr, ctx, z, cy, cx, sy, sx, thw, k, rn, fn, ri, fi, 0, seg, ns);
             ri = rn; fi = fn;
         }
         for (int q = 0; q < ns; q++) {
