@@ -37,6 +37,15 @@ enum { PHASE_PERIOD = 252, PHASE_UNKNOWN = 255 };
 int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], const double *cy, const double *cx, band_params p, uint8_t *out, uint8_t *phase,
                      uint8_t *spacing);
 
+/* The same phase from the two nearest labelled sheets of opposite winding parity (consecutive windings alternate parity): a voxel
+   between a sheet of winding k and one of winding k + 1 (the nearest even-winding and nearest odd-winding labelled voxels, on
+   opposite sides of it) sits d_k / (d_k + d_k+1) of the way from k to k + 1; labelled voxels 0. No axis: band_field_phase decides
+   inside / outside radially, which flips wherever a sheet is oblique to the radial direction (wavy, tilted, folded) and then blanks
+   +- span around the false "missing wrap": on a Paris4 radial strip 22% (regular half) / 35% (expanded half) of the block voxels.
+   Unknown beyond rmax label voxels from either sheet, where the two windings are not consecutive (a missing wrap) or the sheets are
+   on one side. spacing (optional) as band_field_phase. */
+int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing);
+
 /* modular difference of band / winding steps in (-126, 126] */
 static inline int band_diff(int a, int b) { int d = ((a - b + 126) % 252 + 252) % 252; return d - 126; }
 

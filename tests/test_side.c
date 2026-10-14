@@ -126,6 +126,37 @@ int main(void) {
     CHECK(phase[((size_t)2 * NY + (int)YC) * NX + xm] == PHASE_UNKNOWN, "a missing wrap must leave the phase unknown");
     for (size_t i = 0; i < N; i++) if (band[i] == BAND_UNKNOWN && phase[i] != PHASE_UNKNOWN) { CHECK(0, "phase known where the band is not"); break; }
     printf("phase: %zu of %zu known between the shells, error mean %.4f max %.4f turns\n", pk, pin, perr / pk, pmax);
+    {   /* band_field_phase_pair (no axis): between consecutive shells the fraction (r - R_j) / PITCH, known nearly everywhere between
+           them; unknown across the missing wrap. Then the axis 60 label voxels off the shells' centre (radial rays cut the sheets
+           obliquely, as in wavy / folded papyrus): the pair rule is unchanged, the radial band field loses coverage */
+        const float rmax = 80.f / 2.f;   /* radius 80 native at gs 2 */
+        size_t qk = 0, qin = 0; double qerr = 0, qmax = 0;
+        shells(codes, turn);
+        CHECK(!band_field_phase_pair(codes, n, rmax, phase, nullptr), "band_field_phase_pair failed");
+        for (int z = 0; z < NZ; z++) for (int y = 0; y < NY; y++) for (int x = 0; x < NX; x++) {
+            const size_t i = ((size_t)z * NY + y) * NX + x; const double r = hypot(y - YC, x - XC);
+            if (r < R0 + 1 || r > R0 + (NSH - 1) * PITCH - 1) continue;
+            qin++;
+            if (phase[i] == PHASE_UNKNOWN) continue;
+            qk++;
+            double t = (r - R0) / PITCH; t -= floor(t);
+            double e = fabs(phase[i] / (double)PHASE_PERIOD - t); if (e > 0.5) e = 1 - e;
+            qerr += e; if (e > qmax) qmax = e;
+        }
+        CHECK(qk > qin * 0.95 && qerr / qk < 0.02 && qmax < 0.12, "pair phase: %zu of %zu known, error mean %.4f max %.4f", qk, qin, qerr / (qk ? qk : 1), qmax);
+        printf("pair phase: %zu of %zu known between the shells, error mean %.4f max %.4f turns\n", qk, qin, qerr / qk, qmax);
+        shells(codes, turn2);
+        CHECK(!band_field_phase_pair(codes, n, rmax, phase, nullptr), "band_field_phase_pair failed (missing wrap)");
+        CHECK(phase[((size_t)2 * NY + (int)YC) * NX + xm] == PHASE_UNKNOWN, "pair: a missing wrap must leave the phase unknown");
+        shells(codes, turn);
+        double cyo[NZ], cxo[NZ]; for (int z = 0; z < NZ; z++) { cyo[z] = cy[z] + 120; cxo[z] = cx[z] - 90; }   /* native: 60 / 45 label voxels off */
+        CHECK(!band_field_phase(codes, n, o, cyo, cxo, bp, band, phase, nullptr), "band_field_phase failed (off axis)");
+        size_t rk = 0; for (int z = 0; z < NZ; z++) for (int y = 0; y < NY; y++) for (int x = 0; x < NX; x++) {
+            const double r = hypot(y - YC, x - XC); if (r < R0 + 1 || r > R0 + (NSH - 1) * PITCH - 1) continue;
+            rk += phase[((size_t)z * NY + y) * NX + x] != PHASE_UNKNOWN; }
+        printf("off-centre axis: the radial band field knows %zu of %zu, the pair rule (axis-free) %zu\n", rk, qin, qk);
+        CHECK(rk < qk, "the off-centre axis should cost the radial band field coverage (%zu vs %zu)", rk, qk);
+    }
     free(codes); free(band); free(band2); free(side); free(phase); free(spacing);
     if (fails) return 1;
     printf("test_side: ok (%zu known voxels between the shells)\n", known);

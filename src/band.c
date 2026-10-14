@@ -177,3 +177,41 @@ int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], c
     free(side); free(mid); free(d2); free(m2); free(idx); free(im);
     return rc ? -1 : 0;
 }
+
+int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing) {
+    const size_t N = (size_t)n[0] * n[1] * n[2], sy = (size_t)n[2], sz = (size_t)n[1] * n[2];
+    uint8_t *se = malloc(N), *so = malloc(N); float *de = malloc(N * 4), *dd = malloc(N * 4); int32_t *ie = malloc(N * 4), *io = malloc(N * 4);
+    int rc = !se || !so || !de || !dd || !ie || !io;
+    if (!rc) {
+        for (size_t i = 0; i < N; i++) {   /* the labelled voxels by the parity of their winding (code 1 + 18 q mod 252: k = (code - 1) / 18) */
+            const int c = codes[i], lab = c > 0 && c < 255;
+            const int k = lab ? (c - 1) / BAND_STEPS : 0;
+            se[i] = lab && !(k & 1); so[i] = lab && (k & 1);
+        }
+        rc = edt_feature(se, n, de, ie) || edt_feature(so, n, dd, io);
+    }
+    if (!rc) {
+        const float r2 = rmax * rmax;
+        for (size_t i = 0; i < N; i++) {
+            phase[i] = PHASE_UNKNOWN; if (spacing) spacing[i] = 0;
+            const int c = codes[i];
+            if (c > 0 && c < 255) { phase[i] = 0; continue; }   /* on a labelled recto */
+            if (ie[i] < 0 || io[i] < 0 || de[i] > r2 || dd[i] > r2) continue;
+            const size_t a = (size_t)ie[i], b = (size_t)io[i];
+            const int ka = (codes[a] - 1) / BAND_STEPS, kb = (codes[b] - 1) / BAND_STEPS;   /* windings mod 14 */
+            int dk = ((kb - ka) % 14 + 14) % 14; if (dk > 7) dk -= 14;
+            if (dk != 1 && dk != -1) continue;   /* not consecutive: a missing wrap between */
+            const long z = (long)(i / sz), y = (long)((i / sy) % n[1]), x = (long)(i % sy);
+            const float az = (float)((long)(a / sz) - z), ay = (float)((long)((a / sy) % n[1]) - y), ax = (float)((long)(a % sy) - x);
+            const float bz = (float)((long)(b / sz) - z), by = (float)((long)((b / sy) % n[1]) - y), bx = (float)((long)(b % sy) - x);
+            const float da = sqrtf(de[i]), db = sqrtf(dd[i]);
+            if (az * bz + ay * by + ax * bx > -0.5f * da * db) continue;   /* both sheets on one side: not between them */
+            const float f = dk == 1 ? da / (da + db) : db / (da + db);   /* the way from the lower winding to the higher */
+            int q = (int)lrintf(f * PHASE_PERIOD); if (q >= PHASE_PERIOD) q -= PHASE_PERIOD;
+            phase[i] = (uint8_t)q;
+            if (spacing) { const long sp = lrintf(da + db); spacing[i] = (uint8_t)(sp < 1 ? 1 : sp > 255 ? 255 : sp); }
+        }
+    }
+    free(se); free(so); free(de); free(dd); free(ie); free(io);
+    return rc ? -1 : 0;
+}
