@@ -38,6 +38,18 @@ int lp_bwd_w_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, sha
 void lp_set_f8w_coop(int c);   /* test hook: cooperative MX staging of lp_bwd_w_f8 (bit 0 x, bit 1 gy; default 1) */
 int lp_bwd_w_f4(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had);   /* fp4 (e2m1, SR on gy when sp.sr); had: bit 0 fixed-sign H32 on both operands, bit 1 SR on x too (diagnostic) */
 void lp_set_f4w_coop(int on);   /* test hook: cooperative MX8 gradient loads for Co <= 16, reusing the decoded-X tile */
+/* the fp4 weight gradient's gy records (gy_pre4_k layout: 136 B per (n, co, z-step, 8-row tile, 16-x tile), the whole layer) written by
+   the GN+SiLU backward apply that produced gy; valid until the next apply on this device, matched by gy pointer and shape (lp_bwd_w_f4
+   then skips its pre-pass); gb: the per-channel sums of gy (the bias gradient) */
+typedef struct { const void *gy; int n, c, d, h, w, valid, dev; uint8_t *rec; size_t cap; float *gb; int gbc; } lp_gyrec_t;
+#ifdef __cplusplus
+extern thread_local lp_gyrec_t g_gyrec;   /* per host thread (a GPU's trainer thread; split halves sharing a GPU), its own buffers */
+#else
+extern _Thread_local lp_gyrec_t g_gyrec;
+#endif
+int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
+                             const void *gy, void *gx, const float *AB, unsigned gsr, unsigned rsr);   /* 1: done (gx and the records) */
+void lp_set_s2_f4(int on);   /* the fp4 stride-2 forward (MX-fp4 32-channel input, widths % 16): 1 on, 0 fp8, -1 env UFSM_S2_F4 (default on) */
 void lp_set_f4w_gypre_kb(int kb);   /* gy pre-pass of the fp4 weight gradient: slab cap in KiB (0 off, -1 env UFSM_F4W_GYPRE MiB, default 96) */
 int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp);   /* stride 2; gp: input gn+silu */
 int lp_bwd_w_s2_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp);   /* stride 2, gw / gb accumulated */

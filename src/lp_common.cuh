@@ -527,6 +527,40 @@ __device__ __forceinline__ void stage_up_smem(const uint8_t *cu, const uint8_t *
                 }
             }
 }
+/* stage_up_smem with half2 arithmetic (the fp4 decoder conv1): the e4m3 pairs convert straight to half2 and the 8 taps blend with
+   HFMA2 (was: each pair widened to fp32, then 32 FFMA per coarse row: ~680 instructions per staged position, now ~290). The
+   result goes to e2m1 next, so the fp16 rounding (~1e-3) is far below the staging's own; not bitwise equal to stage_up_smem. */
+__device__ __forceinline__ void stage_up_smem_h2(const uint8_t *cu, const uint8_t *cus, int cz0, int cy0, int cx0, int gz, int gy, int gx, int D, int H, int W, bool inb, float *v) {
+#pragma unroll
+    for (int k = 0; k < 32; k++) v[k] = 0.f;
+    if (!inb) return;
+    const int Dc = D >> 1, Hc = H >> 1, Wc = W >> 1;
+    const int mz[2] = {gz >> 1, min(max((gz >> 1) + ((gz & 1) ? 1 : -1), 0), Dc - 1)}, my[2] = {gy >> 1, min(max((gy >> 1) + ((gy & 1) ? 1 : -1), 0), Hc - 1)},
+              mx[2] = {gx >> 1, min(max((gx >> 1) + ((gx & 1) ? 1 : -1), 0), Wc - 1)};
+    __half2 acc[16];
+#pragma unroll
+    for (int j = 0; j < 16; j++) acc[j] = __float2half2_rn(0.f);
+#pragma unroll
+    for (int a = 0; a < 2; a++)
+#pragma unroll
+        for (int b = 0; b < 2; b++)
+#pragma unroll
+            for (int c = 0; c < 2; c++) {
+                const int li = ((mz[a] - cz0) * 8 + (my[b] - cy0)) * 12 + (mx[c] - cx0);
+                const __half2 w3 = __float2half2_rn((a ? 0.25f : 0.75f) * (b ? 0.25f : 0.75f) * (c ? 0.25f : 0.75f) * mx_scale(cus[li]));
+                const uint4 h0 = *(const uint4 *)(cu + (size_t)li * 32), h1 = *(const uint4 *)(cu + (size_t)li * 32 + 16);
+                const unsigned w[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    unsigned lo, hi;
+                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(lo) : "h"((unsigned short)(w[j] & 0xffff)));
+                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(hi) : "h"((unsigned short)(w[j] >> 16)));
+                    acc[2 * j] = __hfma2(w3, *(const __half2 *)&lo, acc[2 * j]); acc[2 * j + 1] = __hfma2(w3, *(const __half2 *)&hi, acc[2 * j + 1]);
+                }
+            }
+#pragma unroll
+    for (int j = 0; j < 16; j++) { const float2 f = __half22float2(acc[j]); v[2 * j] = f.x; v[2 * j + 1] = f.y; }
+}
 __device__ __forceinline__ unsigned smem_u32_(const void *p) { return (unsigned)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void ldsm_x4(unsigned *r, const void *row_ptr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32_(row_ptr)));

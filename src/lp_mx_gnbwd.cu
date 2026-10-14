@@ -311,6 +311,149 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_k(const uint8_t *x,
     if (bw == 8) *(unsigned *)p = w[0]; else *(uint2 *)p = make_uint2(w[0], w[1]);
     if (!h) mx_sc<4>(gx, N, C, S)[ri] = (uint8_t)(e + 127);
 }
+/* GN+SiLU backward apply for MX-fp4 gy / gx (32-channel blocks) that also writes the fp4 weight gradient's gy records of the whole
+   layer (the gy_pre4_k pass over the stored gx folded in: it re-read gx, ~10 ms per level-0 layer). The block takes gy_pre4_k's tile
+   (z-step x 8 rows x 16 x: warp = block pb = 4 (z & 1) + (yp & 3), lane = 16 (y & 1) + x): each lane computes its voxel's 32 gx
+   values (the folded coefficients of gn_silu_bwd_apply_mx2_k), stores the SR-rounded row and puts the unrounded values into the
+   transpose buffer (one rounding: gy_pre4_k re-rounded the stored row), and the record words and scales are formed as gy_pre4_k does
+   (SR keyed by the element with rsr). gbsum += the per-channel sums of gy (the bias gradient gy_pre4_k accumulated). */
+#define GREC 136
+template <int B>
+__global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t *__restrict__ x, const uint8_t *__restrict__ gy, const float *gamma, const float *beta,
+                                                            const float *mean, const float *rstd, const float *AB, uint8_t *__restrict__ gx, uint8_t *__restrict__ out,
+                                                            float *__restrict__ gbsum, int N, int C, int G, int D, int H, int W, unsigned gsr, unsigned rsr) {
+    constexpr int BW = 32;
+    __shared__ __align__(16) __nv_bfloat16 v[8][BW][40];   /* bf16 (its 2^-9 rounding far below the fp4 SR that follows): 3 blocks / SM */
+    __shared__ __align__(16) uint8_t recb[BW][GREC];
+    __shared__ float4 cf[32];
+    __shared__ float bred[BW];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nb = C / BW, cb = blockIdx.y % nb, n = blockIdx.y / nb, cpg = C / G;
+    const size_t S = (size_t)D * H * W;
+    const int Wb = (W + 15) / 16, ZT = (D + 1) / 2, TY = (H + 7) / 8;
+    const unsigned ngrp = (unsigned)ZT * TY * Wb;
+    if (threadIdx.x < 32) {
+        const int k = threadIdx.x, c = cb * BW + k, ng = n * G + c / cpg;
+        const float len = (float)cpg * (float)S;
+        const float rs = rstd[ng], mu = mean[ng], ga = gamma[c], be = beta[c];
+        const float ca = AB[2 * ng] / len, cc = AB[2 * ng + 1] / len, A = rs * ga;
+        cf[k] = make_float4(0.5f * A, 0.5f * (be - mu * A), -rs * rs * cc, rs * (mu * rs * cc - ca));
+        bred[k] = 0.f;
+    }
+    __syncthreads();
+    const uint8_t *sx = mx_sc<B>(x, N, C, S), *sg = mx_sc<4>(gy, N, C, S);
+    uint8_t *sgx = mx_sc<4>(gx, N, C, S);
+    const int rbx = mx_rb(BW, B);
+    float bacc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (unsigned grp = blockIdx.x; grp < ngrp; grp += gridDim.x) {
+        const int xb = (int)(grp % Wb), ty = (int)((grp / Wb) % TY), zt = (int)(grp / ((unsigned)Wb * TY));
+        const int z = 2 * zt + (warp >> 2), yp = 4 * ty + (warp & 3), y = 2 * yp + (lane >> 4), xx = 16 * xb + (lane & 15);
+        float q[32];
+#pragma unroll
+        for (int k = 0; k < 32; k++) q[k] = 0.f;
+        if (z < D && y < H && xx < W) {
+            const size_t ri = ((size_t)n * nb + cb) * S + ((size_t)z * H + y) * W + xx;
+            float r[32], g[32];
+            mxf<B>::dec_row(x + ri * rbx, BW, mx_scale(sx[ri]), r);
+            mxf<4>::dec_row(gy + ri * 16, BW, 1.f, g);   /* raw; the scale below */
+            const float fg = mx_scale(sg[ri]);
+            float o[32]; unsigned am = 0u;
+#pragma unroll
+            for (int k = 0; k < 32; k++) {
+                const float4 c4 = cf[k];
+                const float p = fmaf(r[k], c4.x, c4.y);
+                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                const float d2 = (1.f + th) * (fmaf(-p, th, p) + 1.f);
+                o[k] = fmaf(g[k] * d2 * c4.x, fg, fmaf(r[k], c4.z, c4.w));
+                am = amax_u(am, o[k]);
+            }
+            const int e = mx_exp(__uint_as_float(am), mxf<4>::inv_qmax);
+            const float m = exp2i(-e), sc = exp2i(e);
+            unsigned w4[4];
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (gsr) {
+                    uint32_t hh[4]; sr_hash4(gsr, ri * 4 + j, hh);
+                    unsigned wj = 0u;
+#pragma unroll
+                    for (int i = 0; i < 8; i++) wj |= sr_e2m1_nib_fast(o[8 * j + i] * m, (hh[i >> 1] >> (16 * (i & 1))) & 0xffffu) << (4 * i);
+                    w4[j] = wj;
+                } else w4[j] = mxf<4>::enc8x(o + 8 * j, m);
+            }
+            *(uint4 *)(gx + ri * 16) = make_uint4(w4[0], w4[1], w4[2], w4[3]);
+            sgx[ri] = (uint8_t)(e + 127);
+#pragma unroll
+            for (int k = 0; k < 32; k++) q[k] = o[k];   /* the records round the unrounded gy once (gy_pre4_k re-rounded the stored values) */
+            (void)sc;
+        }
+#pragma unroll
+        for (int k = 0; k < 32; k++) v[warp][k][lane] = __float2bfloat16_rn(q[k]);
+        __syncwarp();
+#pragma unroll
+        for (int k = 0; k < 4; k++) {   /* gy_pre4_k's record words (BW 32: 4 tasks per lane) */
+            const int task = k * 32 + lane, c = task >> 2, f = task & 3, co = cb * BW + c;
+            float qq[8];
+            {
+                const uint4 w8 = *(const uint4 *)&v[warp][c][8 * f];
+                const unsigned ww[4] = {w8.x, w8.y, w8.z, w8.w};
+#pragma unroll
+                for (int j = 0; j < 4; j++) { qq[2 * j] = __uint_as_float(ww[j] << 16); qq[2 * j + 1] = __uint_as_float(ww[j] & 0xffff0000u); }
+            }
+            bacc[k] += ((qq[0] + qq[1]) + (qq[2] + qq[3])) + ((qq[4] + qq[5]) + (qq[6] + qq[7]));
+            unsigned amu = 0u;
+#pragma unroll
+            for (int j = 0; j < 8; j++) amu = amax_u(amu, qq[j]);
+            amu = max(amu, __shfl_xor_sync(0xffffffffu, amu, 1)); amu = max(amu, __shfl_xor_sync(0xffffffffu, amu, 2));
+            const int e = mx_exp(__uint_as_float(amu), 1.f / 6.f);
+            const float m = exp2i(-e);
+            const uint64_t vid = ((((uint64_t)n * C + co) * D + z) * H + (2 * yp + (f >> 1))) * (uint64_t)W + 16 * xb + 8 * (f & 1);
+            uint32_t hh[4];
+            sr_hash4(rsr, vid, hh);
+            *(unsigned *)(recb[c] + warp * 16 + 4 * f) = sr_e2m1_word(qq, m, hh);
+            if (f == 0) recb[c][128 + warp] = (uint8_t)(e + 127);
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < BW * (GREC / 8); i += blockDim.x) {
+            const int c = i / (GREC / 8), w8 = i % (GREC / 8), co = cb * BW + c;
+            *(uint2 *)(out + ((((size_t)n * C + co) * ZT + zt) * TY + ty) * Wb * GREC + (size_t)xb * GREC + 8 * w8) = *(const uint2 *)(recb[c] + 8 * w8);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        float a = bacc[k]; a += __shfl_xor_sync(0xffffffffu, a, 1); a += __shfl_xor_sync(0xffffffffu, a, 2);
+        if ((lane & 3) == 0) atomicAdd(&bred[(k * 32 + lane) >> 2], a);
+    }
+    __syncthreads();
+    if (threadIdx.x < BW) atomicAdd(&gbsum[(size_t)n * C + cb * BW + threadIdx.x], bred[threadIdx.x]);
+}
+thread_local lp_gyrec_t g_gyrec;
+extern "C" int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
+                                        const void *gy, void *gx, const float *AB, unsigned gsr, unsigned rsr) {
+    static int on = -1; if (on < 0) on = getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1;
+    lp_gyrec_t *R = &g_gyrec;
+    const int d = cur_dev_();
+    R->valid = 0;
+    if (!on || s.c % 32 || s.n > 1 || (xdt != 4 && xdt != 8)) return 0;
+    if (R->dev != d) { R->rec = nullptr; R->cap = 0; R->gb = nullptr; R->gbc = 0; R->dev = d; }   /* (a thread that changed GPU) */
+    const int Wb = (s.w + 15) / 16, ZT = (s.d + 1) / 2, TY = (s.h + 7) / 8, nb = s.c / 32;
+    const size_t nrec = (size_t)s.n * s.c * ZT * TY * Wb * GREC;
+    if (R->cap < nrec) {   /* this thread's own buffer (the pre-pass's lp_buf slot could be rewritten before the records are read) */
+        if (R->rec) cudaFree(R->rec);
+        if (cudaMalloc((void **)&R->rec, nrec) != cudaSuccess) { R->rec = nullptr; R->cap = 0; cudaGetLastError(); return 0; }
+        R->cap = nrec;
+        if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) > 0) fprintf(stderr, "gy records: %.1f MB (GPU %d)\n", nrec / 1e6, d);
+    }
+    if (R->gbc < s.n * s.c) { if (R->gb) cudaFree(R->gb); cudaMalloc((void **)&R->gb, (size_t)s.n * s.c * 4); R->gbc = s.n * s.c; }
+    cudaMemsetAsync(R->gb, 0, (size_t)s.n * s.c * 4);
+    const unsigned ngrp = (unsigned)ZT * TY * Wb;
+    const dim3 grid(ngrp < 4096 ? ngrp : 4096, (unsigned)(nb * s.n));
+    if (xdt == 4) gn_silu_bwd_apply_rec_k<4><<<grid, 256>>>((const uint8_t *)x, (const uint8_t *)gy, gamma, beta, mean, rstd, AB, (uint8_t *)gx, R->rec, R->gb, s.n, s.c, G, s.d, s.h, s.w, gsr, rsr);
+    else gn_silu_bwd_apply_rec_k<8><<<grid, 256>>>((const uint8_t *)x, (const uint8_t *)gy, gamma, beta, mean, rstd, AB, (uint8_t *)gx, R->rec, R->gb, s.n, s.c, G, s.d, s.h, s.w, gsr, rsr);
+    LPCK();
+    R->gy = gx; R->n = s.n; R->c = s.c; R->d = s.d; R->h = s.h; R->w = s.w; R->valid = 1;
+    return 1;
+}
 extern "C" void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                   const void *gy, void *gx, int gdt, double *ds, float *st, float *AB) {
     /* ds: 2 N C doubles (zeroed here), st: 2 N C floats, AB: 2 N G floats; the caller finishes with the group sums / param grads */

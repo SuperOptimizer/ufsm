@@ -924,6 +924,7 @@ template <int MT, int NT, typename T, typename TG> static void launch_bw4(dim3 g
     else if (lay == 1) conv_bwd_w_f4_k<MT, NT, 1, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1);
     else conv_bwd_w_f4_k<MT, NT, 0, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, had, coop, gpre, zs0, zs1);
 }
+template <int Z = 0> __global__ void gyrec_bias_k(float *gb, const float *s, int n) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) gb[i] += s[i]; }
 template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had) {
     static int nt_env = -2, mt_env = -2, zc_env = -2;
     if (nt_env == -2) { nt_env = getenv("UFSM_F4W_NT") ? atoi(getenv("UFSM_F4W_NT")) : -1; mt_env = getenv("UFSM_F4W_MT") ? atoi(getenv("UFSM_F4W_MT")) : -1; zc_env = getenv("UFSM_F4W_ZC") ? atoi(getenv("UFSM_F4W_ZC")) : -1; }
@@ -956,9 +957,13 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
     if constexpr (IS_MX8(TG)) if (cap_kb && sp.sr && !had && (lay == 1 || lay == 2) && zc_env <= 0) {
         const int Wb = (ys.w + 15) / 16, gbw = mx_bw(ys.c);
         const size_t per_zt = (size_t)ys.n * ys.c * ((ys.h + 7) / 8) * Wb * GP4_REC;   /* one record per (n, co, z-step, 8-row tile, 16-x tile) */
+        /* the records of the whole layer from the GN+SiLU backward apply that produced gy (lp_gn_silu_bwd_apply_rec): no pre-pass, one slab */
+        const lp_gyrec_t &rc = g_gyrec;   /* this thread's (lp_gn_silu_bwd_apply_rec) */
+        const int cached = g_f4w_gy4 && rc.valid && rc.dev == cur_dev_() && rc.gy == (const void *)gy && rc.n == ys.n && rc.c == ys.c && rc.d == ys.d && rc.h == ys.h && rc.w == ys.w && gbw == 32;
         const size_t cap_zt = (cap_kb << 10) / per_zt;
-        const int szt = cap_zt < 1 ? 1 : cap_zt < (size_t)nzt ? (int)cap_zt : nzt;
-        uint8_t *buf = lp_buf<uint8_t>(4, per_zt * szt);
+        const int szt = cached ? nzt : cap_zt < 1 ? 1 : cap_zt < (size_t)nzt ? (int)cap_zt : nzt;
+        uint8_t *buf = cached ? (uint8_t *)rc.rec : lp_buf<uint8_t>(4, per_zt * szt);
+        if (cached && gb) gyrec_bias_k<<<nblk_((size_t)ys.c, 128), 128>>>(gb, rc.gb, ys.c);   /* the bias gradient: the apply's gy sums (N 1) */
         for (int zs0 = 0; zs0 < nzt; zs0 += szt) {
             const int zs1 = zs0 + szt < nzt ? zs0 + szt : nzt, Zs = (2 * zs1 < ys.d ? 2 * zs1 : ys.d) - 2 * zs0;
             const size_t ntile = (size_t)2 * ((Zs + 1) / 2) * 4 * ((ys.h + 7) / 8) * Wb;   /* the padded block grid of the records */
@@ -967,7 +972,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
 #define GP4(GB) do { if (gbw == 8) gy_pre4_k<8, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr); \
                         else if (gbw == 16) gy_pre4_k<16, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr); \
                         else gy_pre4_k<32, GB><<<pg, 256>>>((const uint8_t *)gy, buf, gb, ys.n, ys.c, ys.d, ys.h, ys.w, 2 * zs0, Zs, sp.sr); } while (0)
-            if (g_f4w_gy4) GP4(4); else GP4(8);
+            if (!cached) { if (g_f4w_gy4) GP4(4); else GP4(8); }
 #undef GP4
             int zc_s = zs1 - zs0 < max_zc ? zs1 - zs0 : max_zc;
             while (zc_s > 1 && (size_t)base * nblk_(zs1 - zs0, zc_s) < 72) zc_s--;

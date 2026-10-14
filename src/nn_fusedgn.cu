@@ -149,7 +149,11 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
         const int zsp = zs_on();
         const float f = gn_bwd_reduce(ds, scratch, NC, s.d, ggamma, gbeta, s.n, s.c);
         gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, f);
-        lp_gn_silu_bwd_apply_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, AB, gdt == 4 ? sr_seed() : 0u);   /* MX-fp4 gradients: unbiased SR (always, whatever nn_set_sr) */
+        const unsigned gsr = gdt == 4 ? sr_seed() : 0u;   /* MX-fp4 gradients: unbiased SR (always, whatever nn_set_sr) */
+        /* MX-fp4: the apply also writes the fp4 weight gradient's gy records (its pre-pass skipped); record SR from a seed derived
+           from gsr, so the global seed sequence is unchanged */
+        if (gdt != 4 || !lp_gn_silu_bwd_apply_rec(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, AB, gsr, gsr * 0x9e3779b9u + 0x7f4a7c15u))
+            lp_gn_silu_bwd_apply_mx(x, xdt, s, G, gamma, beta, mean, rstd, gy, gx, gdt, AB, gsr);
         if (!zsp) gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
         KCHECK();
         return;

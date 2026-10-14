@@ -38,6 +38,7 @@ typedef struct {
     batch *pending;              /* host batch whose upload into buffer (cur ^ 1) is in flight */
     int lean;                    /* one batch buffer; logit gradient in the model's gradient buffer B */
     int gl_inside;               /* lean: the logit gradient lives in the model's gradient buffers (setup checked the batch overlap) */
+    int gl_inplace;              /* the logit gradient over the fp16 logits (g_gl_inplace) */
     int64_t cornb[2][3]; int lvlb[2];   /* level-0 corner / level of the batch in each buffer (verso dump) */
     uint8_t *vsoft, *vanch;      /* --verso-ridge: the soft teacher output of the window; --verso-anchor ridge target */
     uint8_t *vmask, *vw; float *vscratch, vout[3]; double verso_loss;   /* verso loss: own mask (every owned voxel), weight byte, scratch, parts */
@@ -83,6 +84,7 @@ static int g_cond, g_cond_ch, g_cond_outside; static float g_cond_lambda = 1.f;
 static int g_pap_head, g_pap_ch; static float g_pap_lambda = 1.f; static papyrus_cfg g_paph;
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_scale = 32.f;
 static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --density-code, --packed-weight, --packed-um (task unwrap) */
+static int g_gl_inplace;   /* the logit gradient over the fp16 logits (set before the memory planner) */
 static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64;   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
    (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */
@@ -358,7 +360,11 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         lg = d->lgf;
     } else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
-    if (d->lean && train) {   /* the logit gradient lives in the model's gradient buffer B (built by the forward above) */
+    if (d->gl_inplace && train) {   /* the losses write each element's gradient over its own logit (read first) */
+        if (!unet_logits_h16(d->u) || !g_g16) { fprintf(stderr, "in-place logit gradient: the logits are not fp16 (UFSM_GL_SEPARATE=1)\n"); abort(); }
+        d->gl = (float *)lg;
+    }
+    if (d->lean && train && !d->gl_inplace) {   /* the logit gradient lives in the model's gradient buffer B (built by the forward above) */
         const size_t gb = (size_t)B * g_cout * xs.d * P * P * (g_g16 ? 2 : 4);
         void *pg = d->gl_inside ? unet_logit_grad_scratch(d->u, gb) : nullptr;
         if (pg) d->gl = pg;   /* (re)built model: its scratch moved; otherwise the separate buffer allocated at setup */
@@ -981,6 +987,10 @@ int cmd_train(int argc, char **argv) {
     }
     {   /* --mem auto (default): the cheapest storage mode whose training buffers fit next to what is already allocated on every
            GPU; an explicit UFSM_CHUNK_UP / UFSM_RECOMPUTE / UFSM_GRAD_MX8 or --mem default keeps the env / built-in modes */
+        /* the logit gradient in place over the fp16 logits: every loss's gradient pass reads an element's logit (and stats of an earlier
+           pass) before writing its gradient there; not with readers of other channels' logits after a loss (count loss, cond accuracy),
+           the tolerance band, affinities, half-resolution or sheet nets. -22 B per voxel at 11 outputs. UFSM_GL_SEPARATE=1: own buffer */
+        g_gl_inplace = !g_half && !g_sheet && !g_aff && !g_cond && g_count_lambda == 0.f && !nn_get_loss_tol() && g_g16 && !ufsm_env_on("UFSM_LOGITS32") && !ufsm_env_on("UFSM_GL_SEPARATE");
         const char *mm = opt(argc, argv, "--mem", "auto");   /* MX-fp8 gradients passed their stair (3 seeds, mean 0.293 vs 0.294) */
         const int auto16 = g_sheet || !strcmp(mm, "auto16") || !unet_act_mx();   /* sheet reference keeps FP16 stem, hence 16-bit gradients */
         /* MX gradient modes store MX-fp4 activation gradients by default (paired 500-step runs: same step time, -2.9 GB per desk GPU,
@@ -1045,10 +1055,13 @@ int cmd_train(int argc, char **argv) {
                 if (g_half && cand[c].lean) continue;   /* (the batch buffers are full resolution, the network's half) */
                 unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean); unet_set_share_enc_a1(cand[c].sea || sea_force);
                 const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
-                size_t trainer = nbuf * ((size_t)B * g_xc * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
+                size_t trainer = nbuf * ((size_t)B * g_xc * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean || g_gl_inplace ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
                 if (cand[c].lean) trainer = (cand[c].gmx ? 0 : (size_t)B * g_xc * p3 * xbytes())   /* batch buffers inside the gradient buffer B (estimate) */
-                                            + (g_cout > NCH ? (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) : 0);   /* > 2 outputs (affinities, verso): the logit gradient may not fit beside the logits */
-                need = tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (size_t)15 * B * p3 : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                                            + (g_cout > NCH && !g_gl_inplace ? (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) : 0);   /* > 2 outputs (affinities, verso): the logit gradient may not fit beside the logits */
+                /* the fp4 weight gradient's gy records of a whole level-0 layer (lp_gn_silu_bwd_apply_rec, MX-fp4 gradients): 136 B per
+                   32 channels x 256 voxels (~0.5 B per voxel and channel), outside the dry build */
+                const size_t grec = unet_grad_mx4() && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1) ? (size_t)B * cfg.widths[0] * p3 * 136 / 256 : 0;
+                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (size_t)15 * B * p3 : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (need <= fmin) pick = c;
             }
             if (pick < 0) { pick = auto16 ? nc - 1 : 7; /* the smallest mode of the list */ fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
@@ -1074,7 +1087,7 @@ int cmd_train(int argc, char **argv) {
         const int xin_b = lean && unet_input_converted() && g_xfmt;
         size_t goff = 0;
         int xin_in = 0;
-        d->gl = nullptr; d->gl_inside = 0;
+        d->gl = nullptr; d->gl_inside = 0; d->gl_inplace = g_gl_inplace;
         if (lean) {
             unet_build(d->u, (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P}, 1);
             goff = unet_lean_nob(d->u) ? 0 : glb;
@@ -1083,7 +1096,7 @@ int cmd_train(int argc, char **argv) {
                 else bs = unet_batch_scratch(d->u, 0, tbb + mbb);
             } else if (xin_b && (bs = unet_grad_scratch(d->u, goff + tbb + mbb + xbb))) xin_in = 1;
             else bs = unet_grad_scratch(d->u, goff + tbb + mbb);
-            d->gl = unet_logit_grad_scratch(d->u, glb);
+            d->gl = d->gl_inplace ? nullptr : unet_logit_grad_scratch(d->u, glb);
             if (d->gl && bs && (char *)d->gl < bs + goff + tbb + mbb + (xin_in ? xbb : 0) && (char *)d->gl + glb > bs) d->gl = nullptr;   /* never over the batch */
             d->gl_inside = d->gl != nullptr;
         }
@@ -1101,7 +1114,7 @@ int cmd_train(int argc, char **argv) {
         if (lean && g == 0) fprintf(stderr, "lean %d: batch buffers %s, logit gradient %s\n", lean, !bs ? "separate" : xin_in ? "and input inside the gradient buffers" : "inside the gradient buffers, input separate", d->gl ? "inside" : "separate");
         for (int i = 0; i < 2; i++) { d->ev_done[i] = nn_event_create(); nn_event_record(d->ev_done[i], 0); }
         d->pending = nullptr; select_buf(d, 0);
-        if (!d->gl) d->gl = nn_malloc((size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
+        if (!d->gl && !d->gl_inplace) d->gl = nn_malloc((size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
         if (g_half) {
             const size_t q3 = p3 / ((size_t)g_hdiv * g_hdiv * g_hdiv), t1 = (size_t)B * (p3 / 8) * (4 * xbytes() > 4 * (size_t)g_cout ? 4 * xbytes() : 4 * (size_t)g_cout);
             d->x2 = nn_malloc((size_t)B * cfg.cin * q3 * xbytes()); d->lgf = nn_malloc((size_t)B * g_cout * p3 * 4);

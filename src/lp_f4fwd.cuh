@@ -84,7 +84,10 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4_k(const T *__restrict__ x,
             bool inb = gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
             size_t off = inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0;
             float v[32];
-            if (upc) stage_up_smem(cu, cus, ((oz0 + zi0) >> 1) - 2, (oy0 >> 1) - 2, (ox0 >> 1) - 2, gz + zi0, gy, gx, Di, H, W, inb, v); else stage_row32<T>(ctab, off, inb, G, v, cab, gmask);
+            if (upc) {
+                if (sp.up == 2) stage_up_smem_h2(cu, cus, ((oz0 + zi0) >> 1) - 2, (oy0 >> 1) - 2, (ox0 >> 1) - 2, gz + zi0, gy, gx, Di, H, W, inb, v);
+                else stage_up_smem(cu, cus, ((oz0 + zi0) >> 1) - 2, (oy0 >> 1) - 2, (ox0 >> 1) - 2, gz + zi0, gy, gx, Di, H, W, inb, v);
+            } else stage_row32<T>(ctab, off, inb, G, v, cab, gmask);
             unsigned amu = 0u;
 #pragma unroll
             for (int k = 0; k < 32; k++) amu = amax_u(amu, v[k]);
@@ -549,6 +552,8 @@ template <typename T, typename TO> static void p16_f4(const void *x, shape5 xs, 
     }
 }
 template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp) {
+    static int uph2 = -1; if (uph2 < 0) uph2 = getenv("UFSM_UP_H2") ? atoi(getenv("UFSM_UP_H2")) : 1;
+    if (sp.up && uph2) sp.up = 2;   /* the fused upsample blends in half2 (stage_up_smem_h2); UFSM_UP_H2=0: fp32 */
     int Cop = (cout + 15) / 16 * 16, Cip = (xs.c + 31) / 32 * 32;
     int Cx = sp.x2 ? sp.c_split : xs.c, CxP = (Cx + 31) / 32 * 32;
     int Ox = sp.y2 ? sp.o_split : cout, OxP = (Ox + 31) / 32 * 32;
