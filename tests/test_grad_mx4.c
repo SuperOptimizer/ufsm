@@ -287,6 +287,32 @@ int main(void) {
             printf("  %-46s rel diff %.3g, repeated %.3g, train bytes %zu -> %zu%s\n", "level-0 A share (skip offload) vs separate", rel, rel2, mem[0], mem[1], ok ? "" : "  FAIL");
             if (!ok) bad++;
             unet_set_a0_share(-1); unet_set_share_enc_a1(0); unet_set_grad_mx4(0); unet_free(v); free(ga); free(gb2); free(gc); free(gr2);
+        }
+        {   /* the same chain with an 11-output head (unwrap): the fp16 logits (22 B per voxel) and their gradient do not fit the level-0
+               buffers, so they keep buffers of their own while A / the skip / the coarse buffers still share and offload */
+            unet_set_grad_mx4(1); unet_set_share_enc_a1(1);
+            unet_cfg c11 = cfg; c11.cout = 11;
+            unet *v = unet_create(&c11); unet_init(v, 29); unet_set_fp16_logits(v, 1);
+            const size_t np11 = unet_nparams(v), no11 = no * 11;
+            float *ga = malloc(np11 * 4), *gb2 = malloc(np11 * 4), *gy11 = dev_rand(no11, 1.f);
+            void *gl11 = nn_malloc(no11 * 2);
+            size_t mem[2];
+            for (int on = 1; on >= 0; on--) {
+                unet_set_a0_share(on);
+                mem[on] = unet_train_bytes(v, xs);
+                nn_set_sr_step(9000); unet_forward(v, x, xs, 1); unet_zero_grad(v);
+                if (!unet_logits_h16(v)) { printf("  11-output head: logits not fp16  FAIL\n"); bad++; }
+                if (unet_logit_grad_scratch(v, no11 * 2)) { printf("  11-output head: logit gradient placed in a level-0 buffer  FAIL\n"); bad++; }
+                nn_f32_to_h16(gy11, no11, gl11, nn_get_grad_scale());
+                nn_set_sr_step(9100); unet_backward_x(v, gl11, 1); unet_grad_d2h(v, on ? ga : gb2);
+            }
+            double d2 = 0, r2 = 0;
+            for (size_t i = 0; i < np11; i++) { double d = (double)ga[i] - gb2[i]; d2 += d * d; r2 += (double)gb2[i] * gb2[i]; }
+            const double rel = sqrt(d2 / r2);
+            const int ok = rel < 1e-6 && mem[1] < mem[0];
+            printf("  %-46s rel diff %.3g, train bytes %zu -> %zu%s\n", "11-output head: level-0 chain vs separate", rel, mem[0], mem[1], ok ? "" : "  FAIL");
+            if (!ok) bad++;
+            unet_set_a0_share(-1); unet_set_share_enc_a1(0); unet_set_grad_mx4(0); unet_free(v); free(ga); free(gb2); nn_free(gy11); nn_free(gl11);
         } free(gr); free(g8); free(g4); free(dm); free(rm); free(d8);
     }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }

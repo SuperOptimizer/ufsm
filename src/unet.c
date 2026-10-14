@@ -756,7 +756,8 @@ static void build_acts(unet *u, shape5 xs, int train) {
     }
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
     u->logits = nullptr; u->logits_h16 = 0;
-    int lg_gout = 0;   /* fp16 logits at the start of gout[0] (MX-fp4 gradients, below) */
+    int lg_gout = 0, lg_fit = 1;   /* fp16 logits at the start of gout[0] (MX-fp4 gradients, below); lg_fit: they and their gradient fit
+                                      the level-0 buffers */
     if (train) {
         if (nn_get_tf32()) {
             /* tensor-core path: A only holds the level width and B the widest of {width, decoder up part, encoder block
@@ -769,8 +770,12 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 const int idt = input_mx() ? unet_input_prec() : 0;
                 const int xin_will = ABF && idt && xin_offload() && act_bytes_of(d0) >= nn_mx_bytes(xs, idt);
                 const int enc0_rerun = recompute_a1() || (share_enc_a1() && !(a1_offload() && (g_dry || u->h_a1[0])));
+                /* the level-0 offload chain (A in dec[0].a2, enc[0].a2 on the host, gco / dno / sko below) no longer needs the fp16
+                   logits and their gradient to fit level-0 buffers (11-channel heads: 22 > 17 B per voxel turned the whole chain off,
+                   ~+28 B per voxel): wider heads keep both in buffers of their own (lg_fit 0) */
                 u->a0_share = a0_share_on() && L > 1 && act_mx4() && grad_mx4() && grad_dt() == act_dt() && lean() >= 2 && chunk
-                              && !(xin_will && enc0_rerun) && act_bytes_of(d0) >= shape_numel(os) * 2 + 4096;
+                              && !(xin_will && enc0_rerun);
+                lg_fit = act_bytes_of(d0) >= shape_numel(os) * 2 + 4096;
                 if (u->a0_share && !g_dry) {
                     u->h_a2 = nn_host_alloc_try(act_bytes_of(d0));
                     if (!u->h_a2) { fprintf(stderr, "unet: cannot pin %.2f GB for the skip offload; level-0 A keeps its own buffer\n", act_bytes_of(d0) / 1e9); u->a0_share = 0; }
@@ -807,7 +812,8 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 /* MX-fp4 gradients (A 17 B / level-0 voxel at 32 ch): fp16 logits at the start of gout[0] (dead before the head's
                    backward-data writes it; the trainer's batch goes to its end), the 16-bit logit gradient in A */
                 lg_gout = lean() && u->nob && grad_mx4() && act_mx8() && ab < l16 + g16 && ab >= g16 && !ufsm_env_on("UFSM_LOGITS32");
-                if (u->a0_share) lg_gout = 1;   /* the logit gradient goes to enc[0].a2's buffer */
+                if (u->a0_share && lg_fit) lg_gout = 1;   /* the logit gradient goes to enc[0].a2's buffer */
+                if (u->a0_share && !lg_fit) lg_gout = 0;   /* (and the logits to a buffer of their own: fp16 with unet_set_fp16_logits) */
                 if (lg_gout) { u->logits = nullptr; u->logits_h16 = 1; }
             }
             u->logits_bytes = shape_numel(os) * (u->logits_h16 ? 2 : 4);

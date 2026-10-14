@@ -142,6 +142,55 @@ static int ffz_flush(z3w *const zw[10], uint8_t *const sl[10], int64_t slab, con
     return 0;
 }
 
+/* --fit-zarr host side off the main thread: per window chunk the device fields (10 B per cell, 1.3 GB for a 512^3 interior at
+   --fit-h 1) go to pinned memory on the offload stream; one thread waits for each copy, scatters it into the slab buffers and
+   flushes slabs in queue order (both used to run on the main thread while the GPU idled). Two staging buffers. */
+typedef struct { int kind, b, c1, c2, nz, ny, nx; int64_t cz, slab; size_t nl; } ffw_job;   /* kind 0: chunk copy, 1: slab flush */
+#define FFW_Q 256
+typedef struct {
+    pthread_mutex_t mu; pthread_cond_t cv; ffw_job q[FFW_Q]; int qh, qn, stop, busy[2]; atomic_int fail;
+    void *evs[2], *evd[2]; uint8_t *h[2];
+    z3w **zw; uint8_t **sl; const int *F; int FS, FZ, gpu;
+} ffw_t;
+static void *ffw_main(void *arg) {
+    ffw_t *W = arg;
+    nn_init(W->gpu);
+    for (;;) {
+        pthread_mutex_lock(&W->mu);
+        while (!W->qn && !W->stop) pthread_cond_wait(&W->cv, &W->mu);
+        if (!W->qn) { pthread_mutex_unlock(&W->mu); break; }
+        const ffw_job j = W->q[W->qh]; W->qh = (W->qh + 1) % FFW_Q; W->qn--;
+        pthread_cond_broadcast(&W->cv);
+        pthread_mutex_unlock(&W->mu);
+        if (j.kind == 1) { if (!atomic_load(&W->fail) && ffz_flush(W->zw, W->sl, j.slab, W->F, W->FS, W->FZ)) atomic_store(&W->fail, 1); continue; }
+        nn_event_sync(W->evd[j.b]);
+        const uint8_t *hb = W->h[j.b];
+        for (int a = 0; a < j.nz; a++) for (int b = 0; b < j.ny; b++) for (int k = 0; k < 10; k++)
+            memcpy(W->sl[k] + ((size_t)(j.cz + a - j.slab * W->FZ) * W->F[1] + j.c1 + b) * W->F[2] + j.c2, hb + k * j.nl + ((size_t)a * j.ny + b) * j.nx, (size_t)j.nx);
+        pthread_mutex_lock(&W->mu); W->busy[j.b] = 0; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
+    }
+    return nullptr;
+}
+static void ffw_push(ffw_t *W, ffw_job j) {
+    pthread_mutex_lock(&W->mu);
+    while (W->qn == FFW_Q) pthread_cond_wait(&W->cv, &W->mu);
+    W->q[(W->qh + W->qn) % FFW_Q] = j; W->qn++;
+    pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
+}
+static int ffw_acquire(ffw_t *W) {   /* a free staging buffer (its previous copy scattered) */
+    pthread_mutex_lock(&W->mu);
+    int b;
+    for (;;) { b = !W->busy[0] ? 0 : !W->busy[1] ? 1 : -1; if (b >= 0) break; pthread_cond_wait(&W->cv, &W->mu); }
+    W->busy[b] = 1;
+    pthread_mutex_unlock(&W->mu);
+    return b;
+}
+static int ffw_finish(ffw_t *W, pthread_t th) {
+    pthread_mutex_lock(&W->mu); W->stop = 1; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
+    pthread_join(th, nullptr);
+    return atomic_load(&W->fail);
+}
+
 static int writer_finish(writer_t *W, pthread_t th) {
     pthread_mutex_lock(&W->mu); while (W->pending[0] || W->pending[1]) pthread_cond_wait(&W->cv, &W->mu); W->stop = 1; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
     pthread_join(th, nullptr); return atomic_load(&W->failed);
@@ -625,6 +674,7 @@ int cmd_predict(int argc, char **argv) {
     int64_t nss[3]; for (int d = 0; d < 3; d++) nss[d] = (ns[d] + kss - 1) / kss;
     float *ffacc = nullptr; int ffbox[3], ffF[3]; size_t ffn = 0;
     z3w *ffzw[10] = {0}; uint8_t *ffsl[10] = {0}; const int FFS = 128; int FZ = FFS; int64_t ffslab = 0; uint8_t *ff8d = nullptr, *ff8h = nullptr; size_t ffwn = 0; int ffwc = 0, ffzc = 1;
+    static ffw_t ffw; pthread_t ffw_th; int ffw_on = 0;
     if (ffd) {
         for (int d = 0; d < 3; d++) { ffbox[d] = (int)bn[d]; ffF[d] = (int)((bn[d] + ffh - 1) / ffh); }
         if (!ffzm) {   /* the whole box on the device */
@@ -660,8 +710,14 @@ int cmd_predict(int argc, char **argv) {
             ffwc = stride / ffh + 1;
             { const size_t pc = (size_t)ffwc * ffwc, nzc = (size_t)(strd[0] / ffh + 1), cap = ((size_t)512 << 20) / (58 * pc);
               ffzc = (int)(nzc < (cap ? cap : 1) ? nzc : (cap ? cap : 1)); ffwn = (size_t)ffzc * pc; }
-            ffacc = nn_malloc(12 * ffwn * 4); ff8d = nn_malloc(10 * ffwn); ff8h = nn_host_alloc(10 * ffwn);   /* finalized on the device: 10 B per cell back */
+            ffacc = nn_malloc(12 * ffwn * 4); ff8d = nn_malloc(2 * 10 * ffwn); ff8h = nn_host_alloc(2 * 10 * ffwn);   /* finalized on the device: 10 B per cell back,
+                                                                                                                  two staging buffers (the fit writer thread) */
             if (!ffacc || !ff8d || !ff8h) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }
+            ffw.zw = ffzw; ffw.sl = ffsl; ffw.F = ffF; ffw.FS = FFS; ffw.FZ = FZ; ffw.gpu = gpu;
+            for (int b = 0; b < 2; b++) { ffw.h[b] = ff8h + (size_t)b * 10 * ffwn; ffw.evs[b] = nn_event_create(); ffw.evd[b] = nn_event_create(); }
+            pthread_mutex_init(&ffw.mu, nullptr); pthread_cond_init(&ffw.cv, nullptr); atomic_store(&ffw.fail, 0);
+            if (pthread_create(&ffw_th, nullptr, ffw_main, &ffw)) { fprintf(stderr, "predict: cannot start the fit writer\n"); return 1; }
+            ffw_on = 1;
         }
     }
     if (kss > 1) fprintf(stderr, "predict: one window per %d^3 shards (interior %d)\n", kss, stride);
@@ -813,7 +869,8 @@ int cmd_predict(int argc, char **argv) {
                 }
                 if (ok) {
                     const int64_t slab = c0[0] / FZ;
-                    while (ffslab < slab) { if (ffz_flush(ffzw, ffsl, ffslab, ffF, FFS, FZ)) { fprintf(stderr, "predict: %s\n", z3w_error()); return 1; } ffslab++; }
+                    while (ffslab < slab) { ffw_push(&ffw, (ffw_job){.kind = 1, .slab = ffslab}); ffslab++; }   /* after the slab's chunk copies (FIFO) */
+                    if (atomic_load(&ffw.fail)) { fprintf(stderr, "predict: %s\n", z3w_error()); return 1; }
                     for (int za = 0; za < nc3[0]; za += ffzc) {   /* z chunks of the window's cells (the accumulator holds ffzc planes) */
                         const int nz = nc3[0] - za < ffzc ? nc3[0] - za : ffzc, ncz[3] = {nz, nc3[1], nc3[2]};
                         const int64_t cz = (int64_t)(c0[0] + za);
@@ -823,9 +880,11 @@ int cmd_predict(int argc, char **argv) {
                                              (int)(bn[1] - (int64_t)c0[1] * ffh < (int64_t)nc3[1] * ffh ? bn[1] - (int64_t)c0[1] * ffh : (int64_t)nc3[1] * ffh),
                                              (int)(bn[2] - (int64_t)c0[2] * ffh < (int64_t)nc3[2] * ffh ? bn[2] - (int64_t)c0[2] * ffh : (int64_t)nc3[2] * ffh)};
                         nn_fit_accum_dm(lg, ctd, ct_shared ? ctm : nullptr, Wz, W, hz, halo, (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz, 0, 2, 4, 10, ffds, ffdc, ffacc);
-                        nn_fit_finalize(ffacc, nl, ffh, ff8d); nn_d2h(ff8h, ff8d, 10 * nl);
-                        for (int a = 0; a < nz; a++) for (int b = 0; b < nc3[1]; b++) for (int k = 0; k < 10; k++)
-                            memcpy(ffsl[k] + ((size_t)(cz + a - slab * FZ) * ffF[1] + c0[1] + b) * ffF[2] + c0[2], ff8h + k * nl + ((size_t)a * nc3[1] + b) * nc3[2], (size_t)nc3[2]);
+                        const int fb = ffw_acquire(&ffw);
+                        uint8_t *fd = ff8d + (size_t)fb * 10 * ffwn;
+                        nn_fit_finalize(ffacc, nl, ffh, fd);
+                        nn_offload_copy(ffw.h[fb], fd, 10 * nl, 1, ffw.evs[fb], ffw.evd[fb]);   /* scattered into the slab by the fit writer */
+                        ffw_push(&ffw, (ffw_job){.kind = 0, .b = fb, .c1 = c0[1], .c2 = c0[2], .nz = nz, .ny = nc3[1], .nx = nc3[2], .cz = cz, .slab = slab, .nl = nl});
                     }
                 }
             }
@@ -899,7 +958,8 @@ int cmd_predict(int argc, char **argv) {
     if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
     if (writer_finish(&WR, wth)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     if (ffzm) {   /* the last field slabs, the axis table and fields.json (format zarr) */
-        for (; ffslab * FZ < ffF[0]; ffslab++) if (ffz_flush(ffzw, ffsl, ffslab, ffF, FFS, FZ)) { fprintf(stderr, "predict: %s\n", z3w_error()); return 1; }
+        for (; ffslab * FZ < ffF[0]; ffslab++) ffw_push(&ffw, (ffw_job){.kind = 1, .slab = ffslab});
+        if (ffw_on && ffw_finish(&ffw, ffw_th)) { fprintf(stderr, "predict: %s\n", z3w_error()); return 1; }
         for (int k = 0; k < 10; k++) { z3w_close(ffzw[k]); free(ffsl[k]); }
         nn_free(ffacc); nn_free(ff8d); nn_host_free(ff8h);
         char p[1400]; snprintf(p, sizeof p, "%s/fields.json", ffz); FILE *f = fopen(p, "w");
