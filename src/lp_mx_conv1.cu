@@ -23,7 +23,8 @@ __global__ void conv1_mx_k(const uint8_t *x, const float *w, const float *b, flo
    Weights [ci][CP] (CP / 4 broadcast float4 loads per input channel) and coefficients float2 [n][ci]: one scalar smem load per
    (co, ci) made the kernel smem-instruction-bound. CO <= 8 (CP 8) or 16 (CP 16: 9..16 outputs, Co at run time). */
 template <int B, int CO, typename YT = float>   /* YT: fp32 or fp16 logits (lean training: the logit gradient fits beside fp16 logits) */
-__global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const float *w, const float *b, YT *y, int N, int Ci, size_t S, gnp_t gp, int Co) {
+__global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const float *w, const float *b, YT *y, int N, int Ci, size_t S, gnp_t gp, int Co,
+                                                    size_t vb, size_t Sy) {   /* voxels [vb, vb + Sy) of x into y planes of Sy voxels (head slabs) */
     constexpr int CP = CO <= 8 ? 8 : 16, C4 = CP / 4;
     extern __shared__ __align__(16) float c1s[];
     float4 *sw = (float4 *)c1s;                       /* [Ci][C4] (co 0..3, 4..7, ..) */
@@ -35,8 +36,8 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
     for (int i = threadIdx.x; i < CP * Ci; i += blockDim.x) { const int ci = i / CP, co = i % CP; c1s[i] = co < Co ? w[co * Ci + ci] : 0.f; }
     __syncthreads();
     const int bw = mx_bw(Ci), nb = mx_nb(Ci);
-    const int n = blockIdx.y; const size_t v = blockIdx.x * (size_t)blockDim.x + threadIdx.x;   /* grid (voxels, sample) */
-    if (v >= S) return;
+    const int n = blockIdx.y; const size_t vl = blockIdx.x * (size_t)blockDim.x + threadIdx.x, v = vb + vl;   /* grid (voxels, sample) */
+    if (vl >= Sy || v >= S) return;
     float acc[CO];
 #pragma unroll
     for (int co = 0; co < CO; co++) acc[co] = b && co < Co ? b[co] : 0.f;
@@ -60,23 +61,27 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
 #pragma unroll
     for (int co = 0; co < CO; co++) {
         if (co >= Co) break;
-        if constexpr (sizeof(YT) == 2) y[((size_t)n * Co + co) * S + v] = __float2half(acc[co]); else y[((size_t)n * Co + co) * S + v] = acc[co];
+        if constexpr (sizeof(YT) == 2) y[((size_t)n * Co + co) * Sy + vl] = __float2half(acc[co]); else y[((size_t)n * Co + co) * Sy + vl] = acc[co];
     }
 }
 static size_t conv1_smem(shape5 xs, int cout) { return (size_t)(2 * xs.n * xs.c + (cout <= 8 ? 8 : 16) * xs.c) * sizeof(float); }
-template <int B, int CO, typename YT = float> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, YT *y, gnp_t gp, int cout) {
-    const size_t S = shape_spatial(xs), sm = conv1_smem(xs, cout);
-    conv1_mx_t_k<B, CO, YT><<<dim3(nblk_(S, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp, cout);
+template <int B, int CO, typename YT = float> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, YT *y, gnp_t gp, int cout, size_t vb = 0, size_t nv = 0) {
+    const size_t S = shape_spatial(xs), sm = conv1_smem(xs, cout), Sy = nv ? nv : S;
+    conv1_mx_t_k<B, CO, YT><<<dim3(nblk_(Sy, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp, cout, vb, Sy);
 }
 /* the same with fp16 logits (unet lean training; the staged path only) */
 extern "C" void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp) {
+    lp_conv1_fwd_mx_h16_r(x, xdt, xs, w, b, cout, y, gp, 0, 0);
+}
+/* voxels [vb, vb + nv) of x (nv 0: all) into fp16 planes of nv voxels: the trainer's head slabs (train.c head_slab) */
+extern "C" void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, size_t vb, size_t nv) {
     if (cout > 16 || conv1_smem(xs, cout) > 32 * 1024) { fprintf(stderr, "lp_conv1_fwd_mx_h16: cout %d / %d inputs unsupported\n", cout, xs.c); abort(); }
     __half *yh = (__half *)y;
-#define C1H(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, yh, gp, cout); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, yh, gp, cout); break; \
-                               case 3: conv1_mx_t<B, 3>(x, xs, w, b, yh, gp, cout); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, yh, gp, cout); break; \
-                               case 5: conv1_mx_t<B, 5>(x, xs, w, b, yh, gp, cout); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, yh, gp, cout); break; \
-                               case 7: conv1_mx_t<B, 7>(x, xs, w, b, yh, gp, cout); break; case 8: conv1_mx_t<B, 8>(x, xs, w, b, yh, gp, cout); break; \
-                               default: conv1_mx_t<B, 16>(x, xs, w, b, yh, gp, cout); } } while (0)
+#define C1H(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, yh, gp, cout, vb, nv); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, yh, gp, cout, vb, nv); break; \
+                               case 3: conv1_mx_t<B, 3>(x, xs, w, b, yh, gp, cout, vb, nv); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, yh, gp, cout, vb, nv); break; \
+                               case 5: conv1_mx_t<B, 5>(x, xs, w, b, yh, gp, cout, vb, nv); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, yh, gp, cout, vb, nv); break; \
+                               case 7: conv1_mx_t<B, 7>(x, xs, w, b, yh, gp, cout, vb, nv); break; case 8: conv1_mx_t<B, 8>(x, xs, w, b, yh, gp, cout, vb, nv); break; \
+                               default: conv1_mx_t<B, 16>(x, xs, w, b, yh, gp, cout, vb, nv); } } while (0)
     if (xdt == 4) C1H(4); else C1H(8);
 #undef C1H
     LPCK();
@@ -253,7 +258,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
    exact SR keyed by sr for fp4), as conv1_to_mx_t_k. The separate kernels read x twice (8 outputs per pass) and gy twice. */
 template <int B, int YB>
 __global__ void __launch_bounds__(256, 2) conv1_bwd_fused_k(const uint8_t *x, const __half *gy, const float *w, float *gw, float *gb, uint8_t *gx, int N, size_t S, gnp_t gp,
-                                                      int nper, int Co, unsigned sr) {
+                                                      int nper, int Co, unsigned sr, size_t v00, size_t Sy) {   /* voxels [v00, v00 + Sy); gy planes of Sy voxels */
     constexpr int CI = 32;
     __shared__ float ca[CI], cb[CI];
     __shared__ __align__(16) float sw[16][CI];                   /* w[co][ci] (rows >= Co zero) */
@@ -275,7 +280,7 @@ __global__ void __launch_bounds__(256, 2) conv1_bwd_fused_k(const uint8_t *x, co
 #pragma unroll
         for (int q = 0; q < 2; q++) c[m][q][0] = c[m][q][1] = c[m][q][2] = c[m][q][3] = 0.f;
     const int g = lane >> 2, t4 = lane & 3;
-    const size_t v0 = (size_t)blockIdx.x * nper, v1 = min(S, v0 + nper);
+    const size_t v0 = v00 + (size_t)blockIdx.x * nper, v1 = min(min(S, v00 + Sy), v0 + nper);
     for (size_t vb = v0 + warp * 32; vb < v1; vb += 8 * 32) {   /* 32 voxels per warp step: lane = voxel */
         const size_t v = vb + lane; const bool in = v < v1;
         {
@@ -285,7 +290,7 @@ __global__ void __launch_bounds__(256, 2) conv1_bwd_fused_k(const uint8_t *x, co
             for (int k = 0; k < CI; k++) sA[warp][k][lane] = __float2half_rn(in ? (gp.G ? act_ab(r[k], ca[k], cb[k], true) : r[k]) : 0.f);
 #pragma unroll
             for (int co = 0; co < 16; co++) {
-                const __half h = in && co < Co ? gy[((size_t)n * Co + co) * S + v] : __float2half_rn(0.f);
+                const __half h = in && co < Co ? gy[((size_t)n * Co + co) * Sy + (v - v00)] : __float2half_rn(0.f);
                 sB[warp][co][lane] = h; gv[co] = __half2float(h);
             }
 #pragma unroll
@@ -348,12 +353,17 @@ __global__ void __launch_bounds__(256, 2) conv1_bwd_fused_k(const uint8_t *x, co
 /* the fused head backward (weight, bias and input gradient in one pass); returns 0 when the shapes / types are not covered (the
    caller runs the separate kernels) */
 extern "C" int lp_head_bwd_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, const float *w, float *gw, float *gb, void *gx, int gxdt, gnp_t gp, unsigned sr) {
+    return lp_head_bwd_mx_r(x, xdt, xs, gy, gydt, ys, w, gw, gb, gx, gxdt, gp, sr, 0, 0);
+}
+/* voxels [vb, vb + nv) (nv 0: all), gy planes of nv voxels; gx rows and their SR keys stay global (head slabs: the same bits) */
+extern "C" int lp_head_bwd_mx_r(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, const float *w, float *gw, float *gb, void *gx, int gxdt, gnp_t gp,
+                                unsigned sr, size_t vb, size_t nv) {
     static int on = -1; if (on < 0) on = getenv("UFSM_HEAD_FUSED") ? atoi(getenv("UFSM_HEAD_FUSED")) : 1;
     if (!on || xs.c != 32 || ys.c > 16 || gydt != 2 || (gxdt != 4 && gxdt != 8) || (xdt != 4 && xdt != 8) || (gp.G && 32 % gp.G)) return 0;
-    const size_t S = shape_spatial(xs);
+    const size_t S = shape_spatial(xs), Sy = nv ? nv : S;
     const int nper = 8192;
-    const dim3 grid((unsigned)((S + nper - 1) / nper), xs.n);
-#define HBF(B, YB) conv1_bwd_fused_k<B, YB><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, w, gw, gb, (uint8_t *)gx, xs.n, S, gp, nper, ys.c, sr)
+    const dim3 grid((unsigned)((Sy + nper - 1) / nper), xs.n);
+#define HBF(B, YB) conv1_bwd_fused_k<B, YB><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, w, gw, gb, (uint8_t *)gx, xs.n, S, gp, nper, ys.c, sr, vb, Sy)
     if (xdt == 4) { if (gxdt == 4) HBF(4, 4); else HBF(4, 8); }
     else { if (gxdt == 4) HBF(8, 4); else HBF(8, 8); }
 #undef HBF

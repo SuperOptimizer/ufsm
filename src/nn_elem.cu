@@ -509,37 +509,45 @@ __device__ __forceinline__ uint8_t packed_wt(float rho, float um, float packed_u
     const float sp = um / rho, f = fminf(1.f, fmaxf(0.f, (packed_um - sp) / (0.5f * packed_um)));
     return (uint8_t)fminf(255.f, rintf(1.f + (packed_w - 1.f) * f));
 }
-__global__ void unwrap_tg_k(const uint8_t *ph, int D, int H, int W, int s, float dscale, int code, float um, float packed_um, float packed_w, uint8_t *t, uint8_t *m) {
-    const size_t n = (size_t)D * H * W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    m[i] = 0;
-    for (int c = 0; c < 7; c++) t[c * n + i] = 0;
+__global__ void unwrap_tg_k(const uint8_t *ph, int D, int H, int W, int s, float dscale, int code, float um, float packed_um, float packed_w, uint8_t *t, uint8_t *m,
+                            size_t i0, size_t n) {   /* window voxels [i0, i0 + n) into planes of n (head slabs; whole window: 0, D H W) */
+    const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x, i = i0 + li;
+    if (li >= n) return;
+    m[li] = 0;
+    for (int c = 0; c < 7; c++) t[c * n + li] = 0;
     float g[3]; if (!phase_grad(ph, i, D, H, W, s, g)) return;
     const float gz = g[0], gy = g[1], gx = g[2];
     const float rho = sqrtf(gz * gz + gy * gy + gx * gx);
     if (rho < 1e-3f) return;
     const float nz = gz / rho, ny = gy / rho, nx = gx / rho, xd = dscale * rho;
     const float c7[7] = {nz * nz, ny * ny, nx * nx, 0.5f + nz * ny, 0.5f + nz * nx, 0.5f + ny * nx, code ? xd / (1.f + xd) : fminf(1.f, xd)};
-    for (int c = 0; c < 7; c++) t[c * n + i] = (uint8_t)__float2int_rn(255.f * fminf(1.f, fmaxf(0.f, c7[c])));
-    m[i] = packed_wt(rho, um, packed_um, packed_w);
+    for (int c = 0; c < 7; c++) t[c * n + li] = (uint8_t)__float2int_rn(255.f * fminf(1.f, fmaxf(0.f, c7[c])));
+    m[li] = packed_wt(rho, um, packed_um, packed_w);
 }
 extern "C" void nn_unwrap_targets2(const uint8_t *phase, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, uint8_t *t, uint8_t *m) {
-    const size_t n = (size_t)d * h * w;
-    unwrap_tg_k<<<nblk(n, 256), 256>>>(phase, d, h, w, s, dscale, code, um, packed_um, packed_w, t, m); KCHECK();
+    nn_unwrap_targets2_z(phase, d, h, w, s, dscale, code, um, packed_um, packed_w, t, m, 0, d);
+}
+extern "C" void nn_unwrap_targets2_z(const uint8_t *phase, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, uint8_t *t, uint8_t *m,
+                                     int z0, int z1) {   /* planes [z0, z1) of the window (the stencil reads the whole phase) into planes of (z1 - z0) h w */
+    const size_t hw = (size_t)h * w, n = (size_t)(z1 - z0) * hw;
+    unwrap_tg_k<<<nblk(n, 256), 256>>>(phase, d, h, w, s, dscale, code, um, packed_um, packed_w, t, m, (size_t)z0 * hw, n); KCHECK();
 }
 extern "C" void nn_unwrap_targets(const uint8_t *phase, int d, int h, int w, int s, float dscale, uint8_t *t, uint8_t *m) {
     nn_unwrap_targets2(phase, d, h, w, s, dscale, 0, 0.f, 0.f, 0.f, t, m);
 }
 /* a 0/1 loss mask times the packed-sheet weight of each voxel (its phase gradient over +-s voxels; unknown gradients keep 1) */
-__global__ void packed_mask_k(const uint8_t *ph, int D, int H, int W, int s, float um, float packed_um, float packed_w, uint8_t *m) {
-    const size_t n = (size_t)D * H * W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= n || !m[i]) return;
+__global__ void packed_mask_k(const uint8_t *ph, int D, int H, int W, int s, float um, float packed_um, float packed_w, uint8_t *m, size_t i0, size_t n) {
+    const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x, i = i0 + li;
+    if (li >= n || !m[li]) return;
     float g[3]; if (!phase_grad(ph, i, D, H, W, s, g)) return;
-    m[i] = packed_wt(sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]), um, packed_um, packed_w);
+    m[li] = packed_wt(sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]), um, packed_um, packed_w);
 }
 extern "C" void nn_packed_mask(const uint8_t *phase, int d, int h, int w, int s, float um, float packed_um, float packed_w, uint8_t *m) {
-    const size_t n = (size_t)d * h * w;
-    packed_mask_k<<<nblk(n, 256), 256>>>(phase, d, h, w, s, um, packed_um, packed_w, m); KCHECK();
+    nn_packed_mask_z(phase, d, h, w, s, um, packed_um, packed_w, m, 0, d);
+}
+extern "C" void nn_packed_mask_z(const uint8_t *phase, int d, int h, int w, int s, float um, float packed_um, float packed_w, uint8_t *m, int z0, int z1) {   /* m: planes [z0, z1) */
+    const size_t hw = (size_t)h * w, n = (size_t)(z1 - z0) * hw;
+    packed_mask_k<<<nblk(n, 256), 256>>>(phase, d, h, w, s, um, packed_um, packed_w, m, (size_t)z0 * hw, n); KCHECK();
 }
 extern "C" void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n) { fill_unl_k<<<nblk(n, 256), 256>>>(t, m, vm, src, n); KCHECK(); }
 extern "C" void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out) {

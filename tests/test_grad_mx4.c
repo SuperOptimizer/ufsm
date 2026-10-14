@@ -56,6 +56,16 @@ static float *w_s2b_e2m1(const float *wd, int C) {
     }
     float *d = nn_malloc(nw * 4); nn_h2d(d, h, nw * 4); free(h); return d;
 }
+/* head-slab test callback: the backward's head step per slab of Z planes, the logit gradient copied from the whole-layout gl */
+typedef struct { unet *v; void *gl; void *sb; size_t S, hw; int D, Z, bad; } hs_ctx;
+static void hs_cb(void *p) {
+    hs_ctx *h = p;
+    for (int z0 = 0; z0 < h->D; z0 += h->Z) {
+        const int z1 = z0 + h->Z < h->D ? z0 + h->Z : h->D; const size_t ns = (size_t)(z1 - z0) * h->hw;
+        for (int c = 0; c < 11; c++) nn_d2d((char *)h->sb + c * ns * 2, (const char *)h->gl + (c * h->S + z0 * h->hw) * 2, ns * 2);
+        if (unet_head_bwd_z(h->v, z0, z1, h->sb, z0 == 0)) h->bad++;
+    }
+}
 static void mode_ref(void) { nn_set_tf32(0); }
 static void mode_mx(void) { nn_set_prec(3); nn_set_tf32(1); }
 int main(void) {
@@ -334,6 +344,41 @@ int main(void) {
             printf("  %-46s rel diff %.3g, train bytes %zu -> %zu%s\n", "11-output head: level-0 chain vs separate", rel, mem[0], mem[1], ok ? "" : "  FAIL");
             if (!ok) bad++;
             unet_set_a0_share(-1); unet_set_share_enc_a1(0); unet_set_grad_mx4(0); unet_free(v); free(ga); free(gb2); nn_free(gy11); nn_free(gl11);
+        }
+        {   /* head slabs (train.c head_slab_pass): the 11-output head per z-slab (3 planes, a partial last slab) through unet_head_fwd_z
+               and, inside the backward, unet_head_bwd_z from the same logit gradient; the slab logits equal the whole head's bit for
+               bit, the parameter gradients up to summation order, and the build holds no whole-window logits */
+            unet_set_grad_mx4(1); unet_set_share_enc_a1(1); unet_set_a0_share(1);
+            unet_cfg c11 = cfg; c11.cout = 11;
+            unet *v = unet_create(&c11); unet_init(v, 31); unet_set_fp16_logits(v, 1);
+            const size_t np11 = unet_nparams(v), no11 = no * 11, S = no, hw = (size_t)xs.h * xs.w;
+            float *ga = malloc(np11 * 4), *gb2 = malloc(np11 * 4), *gy11 = dev_rand(no11, 1.f);
+            void *gl11 = nn_malloc(no11 * 2);
+            uint16_t *lw = malloc(no11 * 2), *ls = malloc(no11 * 2);
+            size_t mem[2];
+            nn_f32_to_h16(gy11, no11, gl11, nn_get_grad_scale());
+            mem[0] = unet_train_bytes(v, xs);
+            nn_set_sr_step(9000); const float *lg = unet_forward(v, x, xs, 1); unet_zero_grad(v);
+            nn_d2h(lw, lg, no11 * 2);
+            nn_set_sr_step(9100); unet_backward_x(v, gl11, 1); unet_grad_d2h(v, ga);
+            hs_ctx hc = {v, gl11, nn_malloc(11 * 3 * hw * 2), S, hw, xs.d, 3, 0};
+            unet_set_head_ext(v, 1); unet_set_head_cb(v, hs_cb, &hc);
+            mem[1] = unet_train_bytes(v, xs);
+            nn_set_sr_step(9000); const float *lg2 = unet_forward(v, x, xs, 1); unet_zero_grad(v);
+            for (int z0 = 0; z0 < xs.d; z0 += 3) {   /* the slab logits, gathered into the whole layout */
+                const int z1 = z0 + 3 < xs.d ? z0 + 3 : xs.d; const size_t ns = (size_t)(z1 - z0) * hw;
+                if (unet_head_fwd_z(v, z0, z1, hc.sb)) { hc.bad++; break; }
+                for (int c = 0; c < 11; c++) nn_d2h(ls + c * S + z0 * hw, (const char *)hc.sb + c * ns * 2, ns * 2);
+            }
+            nn_set_sr_step(9100); unet_backward_x(v, nullptr, 1); unet_grad_d2h(v, gb2);
+            size_t lneq = 0; for (size_t i = 0; i < no11; i++) lneq += lw[i] != ls[i];
+            double d2 = 0, r2 = 0;
+            for (size_t i = 0; i < np11; i++) { double d = (double)ga[i] - gb2[i]; d2 += d * d; r2 += (double)ga[i] * ga[i]; }
+            const double rel = sqrt(d2 / r2);
+            const int ok = !lg2 && !hc.bad && !lneq && rel < 1e-6 && mem[1] + no11 * 2 <= mem[0];
+            printf("  %-46s logits differ %zu, grads rel diff %.3g, train bytes %zu -> %zu%s\n", "11-output head slabs vs whole head", lneq, rel, mem[0], mem[1], ok ? "" : "  FAIL");
+            if (!ok) bad++;
+            unet_set_a0_share(-1); unet_set_share_enc_a1(0); unet_set_grad_mx4(0); unet_free(v); free(ga); free(gb2); free(lw); free(ls); nn_free(gy11); nn_free(gl11); nn_free(hc.sb);
         } free(gr); free(g8); free(g4); free(dm); free(rm); free(d8);
     }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }

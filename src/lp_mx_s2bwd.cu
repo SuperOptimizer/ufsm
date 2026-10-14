@@ -123,7 +123,7 @@ extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, s
 /* returns the compute precision used: 2 (fp8 tensor cores, wide layers), 1 (bf16 tensor cores, 16 / 32 channels) or 0 (fp32) */
 extern "C" int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr) {
     /* the direct tensor-core kernel first (16 / 32 / 64 channels: no fine-level scratch), then the dilated fp8 conv (wider) */
-    if (lp_bwd_data_s2_mx_tc(gy, ys, w, xs, gx, accum, gdt, xdt, osr)) return 1;
+    if (const int r = lp_bwd_data_s2_mx_tc(gy, ys, w, xs, gx, accum, gdt, xdt, osr)) return r == 3 ? 3 : 1;   /* (3: the fp4 kernel) */
     if (gdt == 4 || xdt == 4) {   /* MX-fp4 gradients on the wide (small, coarse) levels: through MX-fp8 copies (gy and the old gx exact,
                                      the result back to fp4 with SR) */
         if (gdt != 4 || xdt != 4) { fprintf(stderr, "lp_bwd_data_s2_mx: gy and gx must share the MX format\n"); abort(); }

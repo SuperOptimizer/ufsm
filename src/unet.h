@@ -154,6 +154,14 @@ int unet_wide_up_grad(void);
 void unet_set_share_enc_a1(int on);   /* training, recompute 1: encoder blocks above the bottom keep no a1 (backward re-runs conv1 into the same-level decoder's a1) */
 int unet_share_enc_a1(void);
 int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp16 (lean 2 training: the logit gradient fits after them) */
+/* head slabs (training): the forward skips the 1^3 head and allocates no whole-window logits; the caller runs it per z-slab
+   (unet_head_fwd_z after the forward), and the backward calls cb(ctx) at the head's step, which runs unet_head_fwd_z, the loss
+   gradient and unet_head_bwd_z per slab (first: the first slab). Takes effect at the next build; MX activations and 16-bit gradients
+   (the fused head backward); -1 from the slab calls: not covered */
+void unet_set_head_ext(unet *u, int on);
+void unet_set_head_cb(unet *u, void (*cb)(void *), void *ctx);
+int unet_head_fwd_z(unet *u, int z0, int z1, void *y16);
+int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first);
 void unet_set_fp16_logits(unet *u, int on);   /* MX activations: fp16 logits where they get their own buffer (half the head output; the readers
                                                  follow unet_logits_h16 / nn_set_logits_h16). Not for half-resolution or sheet nets */
 void unet_set_grad_mx4(int on);   /* MX-fp4 activation gradients (with the MX gradient mode; opt-in, env UFSM_GRAD_MX4) */

@@ -104,6 +104,36 @@ extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const u
     }
     KCHECK();
 }
+/* the loss in parts, for the trainer's head slabs (train.c): nn_loss_stats_acc adds a slab's statistics (logits and targets of that
+   slab, s its shape) to ds (5 doubles per (n, c), zeroed by the caller before the first slab); nn_loss_stats_fin turns them into the
+   scratch nn_loss_async_tol leaves (s: the whole window's shape, for N and C); nn_loss_grad_only writes a slab's logit gradient from
+   that scratch. No tolerance band. Same per-element arithmetic as nn_loss_async_tol (fp64 sums in another order) */
+extern "C" void nn_loss_stats_acc(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds) {
+    const size_t S = shape_spatial(s); const int NC = s.n * s.c, slabs = NC >= 16 ? KSLAB : 512 / NC;
+    if (g_logits_h16) loss_stats_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w);
+    else loss_stats_k<float><<<dim3(NC, slabs), 256>>>((const float *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w);
+    KCHECK();
+}
+extern "C" void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float *scratch) {
+    const int NC = s.n * s.c;
+    zs_reduce(ds, 5 * NC);
+    loss_d2f_k<<<nblk(5 * NC, 128), 128>>>(ds, scratch, 5 * NC);
+    loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, scratch + (size_t)5 * NC);
+    KCHECK();
+}
+extern "C" void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch) {
+    const size_t S = shape_spatial(s), n = shape_numel(s);
+    const float *fin = scratch + (size_t)5 * s.n * s.c;
+    if (g_logits_h16) {
+        const f16 *l16 = (const f16 *)logits;
+        if (!g_loss_g16) loss_grad_k<float, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w);
+        else if (g_h16) loss_grad_k<f16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w);
+        else loss_grad_k<bf16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w);
+    } else if (!g_loss_g16) loss_grad_k<float><<<nblk(n, 256), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w);
+    else if (g_h16) loss_grad_k<f16><<<nblk(n, 256), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w);
+    else loss_grad_k<bf16><<<nblk(n, 256), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w);
+    KCHECK();
+}
 /* ---- count loss (train --count-lambda): turns along sheet-normal segments ----
    K segments per window, each from a random voxel whose ground-truth phase gradient (over +-s voxels) is known, L unit steps along
    that gradient (nearest voxels); a segment counts when every step's phase is known and it crosses at least half a turn. True turns

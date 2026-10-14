@@ -434,7 +434,7 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
         if (ob == 4) S2F4(4); else S2F4(8);
 #undef S2F4
         LPCK();
-        return 0;
+        return 3;   /* fp4 compute (the callers' precision report) */
     }
     static int p16 = -1;
     if (p16 < 0) p16 = getenv("UFSM_S2_PACK16") ? atoi(getenv("UFSM_S2_PACK16")) : 1;

@@ -147,6 +147,8 @@ struct unet {
     size_t logits_bytes;                     /* lean: logits at the start of A, the 16-bit logit gradient after them */
     int logits_h16;                          /* lean 2: fp16 logits, so the 16-bit logit gradient fits after them in A */
     int lh16_req;                            /* unet_set_fp16_logits: fp16 logits where the MX head writes them into their own buffer */
+    int head_ext;                            /* unet_set_head_ext: training runs the head per z-slab outside (no whole-window logits) */
+    void (*head_cb)(void *); void *head_ctx; /* ... and its backward at the head's step (unet_head_fwd_z / unet_head_bwd_z per slab) */
     float *rc_extra; size_t rc_extra_bytes;  /* training transient for the upsampled decoder input when B is too small */
     int head_c0, head_nc;                    /* inference builds: only logit channels [c0, c0 + nc) (nc 0: all) */
     int split_side, split_h0;                /* spatial split (unet_set_split): side 0 / 1, level-0 halo planes; h0 0 = off */
@@ -951,7 +953,8 @@ static void build_acts(unet *u, shape5 xs, int train) {
     else if (!u->logits && slab1 && lgb <= act_bytes_of(u->enc[1].ys)) {   /* Y: dec[1].a2, dead once dec[0]'s conv1 has upsampled it */
         u->logits = Y; u->lg_t1 = 1; u->lg_p = Y; u->lg_bytes = act_bytes_of(u->enc[1].ys);
     }
-    if (!u->logits) u->logits = dalloc(u, (lgb + 3) / 4);
+    if (train && u->head_ext) { u->logits = nullptr; u->lg_t1 = 0; }   /* head slabs: no whole-window logits */
+    else if (!u->logits) u->logits = dalloc(u, (lgb + 3) / 4);
     u->xin = nullptr;
     if (ABF && input_mx()) {   /* include mandatory input storage in the dry planner */
         const int idt = unet_input_prec(); const size_t xb_ = nn_mx_bytes(xs, idt);
@@ -1029,6 +1032,12 @@ void unet_set_fp16_logits(unet *u, int on) {   /* takes effect at the next build
     if (u->built && !u->train) free_acts(u);
     u->lh16_req = !!on;
 }
+void unet_set_head_ext(unet *u, int on) {   /* takes effect at the next build */
+    if (u->head_ext == !!on) return;
+    if (u->built) free_acts(u);
+    u->head_ext = !!on;
+}
+void unet_set_head_cb(unet *u, void (*cb)(void *), void *ctx) { u->head_cb = cb; u->head_ctx = ctx; }
 void *unet_grad_scratch(unet *u, size_t bytes) { return u->built && u->train && lean() && u->gB[0] && u->gB_bytes >= bytes ? (void *)u->gB[0] : nullptr; }
 /* lean 2: the trainer's batch as [head | tail] in gout[0]; with the fp16 logits at its start (MX-fp4 gradients) at the buffer's
    end, the tail (targets, masks: read by the loss) clear of the logits, the head (the input: read only by the forward's
@@ -1487,15 +1496,17 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         cur = u->dec[i].s2;
     }
     nn_set_layer(3 * L - 2);
-    if (u->lg_t1) nn_set_storage(u->logits, u->lg_bytes, 0);   /* plain fp32 plane-major logits over dec[0].a1 (or the level-1 buffer) */
-    nn_set_head_out_h16(u->logits_h16);
-    const int hc0 = !u->train && u->head_nc ? u->head_c0 : 0, hnc = !u->train && u->head_nc ? u->head_nc : u->cfg.cout;   /* rows of the 1^3 head */
-    const float *hw = P(u, u->head.w) + (size_t)hc0 * w[0], *hb = P(u, u->head.b) + hc0;
-    if (recompute()) { nn_gn_t g = gn_out(u, &u->dec[0]); int r; PROF(0, r = nn_conv3d_fwd_x(u->dec[0].a2, &g, nullptr, nullptr, 0, 0, u->dec[0].ys, hw, hb, hnc, 1, 1, u->logits, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("head"); }
-    else PROF(0, nn_conv3d_fwd(cur, u->dec[0].ys, hw, hb, hnc, 1, 1, u->logits));
-    nn_set_head_out_h16(0);
+    if (!(train && u->head_ext)) {   /* (head slabs: the trainer runs the head per z-slab, unet_head_fwd_z) */
+        if (u->lg_t1) nn_set_storage(u->logits, u->lg_bytes, 0);   /* plain fp32 plane-major logits over dec[0].a1 (or the level-1 buffer) */
+        nn_set_head_out_h16(u->logits_h16);
+        const int hc0 = !u->train && u->head_nc ? u->head_c0 : 0, hnc = !u->train && u->head_nc ? u->head_nc : u->cfg.cout;   /* rows of the 1^3 head */
+        const float *hw = P(u, u->head.w) + (size_t)hc0 * w[0], *hb = P(u, u->head.b) + hc0;
+        if (recompute()) { nn_gn_t g = gn_out(u, &u->dec[0]); int r; PROF(0, r = nn_conv3d_fwd_x(u->dec[0].a2, &g, nullptr, nullptr, 0, 0, u->dec[0].ys, hw, hb, hnc, 1, 1, u->logits, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("head"); }
+        else PROF(0, nn_conv3d_fwd(cur, u->dec[0].ys, hw, hb, hnc, 1, 1, u->logits));
+        nn_set_head_out_h16(0);
+    }
     if (u->a0_share && train && u->a2_out) nn_stream_wait(0, u->ev_a2[1]);   /* the loss writes the logit gradient over the skip's buffer next */
-    if (ufsm_env_on("UFSM_DEBUG") && !ABF && !recompute()) {
+    if (ufsm_env_on("UFSM_DEBUG") && !ABF && !recompute() && u->logits) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d a1 %.4g a2 %.4g s2 %.4g%s\n", i, nn_sumsq(u->enc[i].a1, shape_numel(u->enc[i].ys), u->red_scratch), nn_sumsq(u->enc[i].a2, shape_numel(u->enc[i].ys), u->red_scratch), nn_sumsq(u->enc[i].s2, shape_numel(u->enc[i].ys), u->red_scratch), i < L - 1 ? "" : " (bottom)");
         for (int i = L - 2; i >= 0; i--) fprintf(stderr, "dec%d cat %.4g a1 %.4g a2 %.4g s2 %.4g\n", i, nn_sumsq(u->cat[i], shape_numel(u->dec[i].xs), u->red_scratch), nn_sumsq(u->dec[i].a1, shape_numel(u->dec[i].ys), u->red_scratch), nn_sumsq(u->dec[i].a2, shape_numel(u->dec[i].ys), u->red_scratch), nn_sumsq(u->dec[i].s2, shape_numel(u->dec[i].ys), u->red_scratch));
         fprintf(stderr, "logits %.4g\n", nn_sumsq(u->logits, shape_numel(u->ls[0]) / u->ls[0].c * u->cfg.cout, u->red_scratch));
@@ -1505,6 +1516,28 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     u->last_a1_live = train && recompute_a1() && !ufsm_env_on("UFSM_RC_REDO_LAST");
     u->sea_stale = 0;
     return u->logits;
+}
+
+/* head slabs (unet_set_head_ext): the head on output planes [z0, z1) of the window, from dec[0]'s output as the whole-window head
+   reads it (recompute: a2 with its GroupNorm + SiLU on the fly; else s2). fwd: fp16 logits [cout][(z1 - z0) h w] into y16 (after the
+   forward, or inside the head callback); bwd (inside the callback only): from the fp16 logit gradient in the same layout, weight /
+   bias gradients accumulated, the head input's gradient rows of those planes into gout[0]; first: the backward's first slab */
+static int head_src(unet *u, const float **x, nn_gn_t *g) {
+    block *d0 = &u->dec[0];
+    if (recompute()) { *g = gn_out(u, d0); *x = d0->a2; return 1; }
+    *x = d0->s2; return 0;
+}
+int unet_head_fwd_z(unet *u, int z0, int z1, void *y16) {
+    const float *x; nn_gn_t g; const int gn = head_src(u, &x, &g);
+    const size_t hw = (size_t)u->ls[0].h * u->ls[0].w;
+    nn_set_layer(3 * u->cfg.nlev - 2);
+    return nn_head_fwd_z(x, gn ? &g : nullptr, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, y16, (size_t)z0 * hw, (size_t)(z1 - z0) * hw);
+}
+int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first) {
+    const float *x; nn_gn_t g; const int gn = head_src(u, &x, &g);
+    const size_t hw = (size_t)u->ls[0].h * u->ls[0].w;
+    return nn_head_bwd_z(x, gn ? &g : nullptr, u->dec[0].ys, gy16, u->cfg.cout, P(u, u->head.w), u->g + u->head.w, u->g + u->head.b, u->gout[0],
+                         (size_t)z0 * hw, (size_t)(z1 - z0) * hw, first);
 }
 
 /* ---- backward ---- */
@@ -1650,7 +1683,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     const float gscale = GBF ? nn_get_grad_scale() : 1.f;
     sp_cfg(u);
     if (g_h16 && !GBF) { fprintf(stderr, "unet_backward_x: a 16-bit logit gradient needs the 16-bit gradient storage\n"); abort(); }
-    if (GBF && !g_h16) { shape5 os = u->ls[0]; os.c = u->cfg.cout; if (!u->glb) u->glb = dalloc_grad(u, shape_numel(os)); nn_f32_to_h16(glogits, shape_numel(os), u->glb, gscale); glogits = u->glb; }
+    if (GBF && !g_h16 && !u->head_ext) { shape5 os = u->ls[0]; os.c = u->cfg.cout; if (!u->glb) u->glb = dalloc_grad(u, shape_numel(os)); nn_f32_to_h16(glogits, shape_numel(os), u->glb, gscale); glogits = u->glb; }
     const int *w = u->cfg.widths;
     float *g = u->g;
     if ((u->xin_shared || u->a0_share) && u->a2_stale) {   /* repeated backward: dec[0].a2's buffer holds the input, the decoders' a2 were
@@ -1694,7 +1727,11 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
     nn_set_layer(3 * L - 2);
     int hf = -1;   /* the fused head backward (weight, bias and input gradient in one pass over act(x) and the logit gradient) */
-    if (recompute()) { nn_gn_t gg = gn_out(u, d0); PROF(2, hf = nn_head_bwd_x(d0->a2, &gg, d0->ys, glogits, os, P(u, u->head.w), g + u->head.w, g + u->head.b, u->gout[0])); }
+    if (u->head_ext) {   /* head slabs: the trainer's callback runs head, loss gradient and head backward per z-slab (unet_head_*_z) */
+        if (!u->head_cb) { fprintf(stderr, "unet_backward_x: head slabs without a callback\n"); abort(); }
+        u->head_cb(u->head_ctx);
+        hf = 0;
+    } else if (recompute()) { nn_gn_t gg = gn_out(u, d0); PROF(2, hf = nn_head_bwd_x(d0->a2, &gg, d0->ys, glogits, os, P(u, u->head.w), g + u->head.w, g + u->head.b, u->gout[0])); }
     else PROF(2, hf = nn_head_bwd_x(d0->s2, nullptr, d0->ys, glogits, os, P(u, u->head.w), g + u->head.w, g + u->head.b, u->gout[0]));
     if (hf) {
         if (recompute()) { nn_gn_t gg = gn_out(u, d0); int r; PROF(2, r = nn_conv3d_bwd_weight_x(d0->a2, &gg, nullptr, nullptr, 0, 0, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b)); if (r) rc_fail("head weight gradient"); }

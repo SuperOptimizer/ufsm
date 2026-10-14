@@ -90,8 +90,13 @@ int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *
     return g_h16 ? conv_fwd_tc_h<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : VERIFY_ONLY(conv_fwd_tc_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts));
 }
 int conv_fwd_tc_s2(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp) {
-    exec_prec(g_pass, ISMX(x) || ISMX(y) || ((eff_prec() == 2 || eff_prec() == 3) && xbf == ybf) ? 2 : 1);
-    if (ISMX(x) || ISMX(y)) { if (MXDT(x) != MXDT(y)) { fprintf(stderr, "conv s2: MX storage needs MX input and output of one format\n"); abort(); } return lp_conv_fwd_s2_f8(x, MXDT(x), xs, w, b, cout, y, MXDT(y), ys, gp); }
+    if (ISMX(x) || ISMX(y)) {
+        if (MXDT(x) != MXDT(y)) { fprintf(stderr, "conv s2: MX storage needs MX input and output of one format\n"); abort(); }
+        const int r = lp_conv_fwd_s2_f8(x, MXDT(x), xs, w, b, cout, y, MXDT(y), ys, gp);
+        exec_prec(g_pass, r == 3 ? 3 : 2);   /* (3: the fp4 down0 kernel) */
+        return 0;
+    }
+    exec_prec(g_pass, (eff_prec() == 2 || eff_prec() == 3) && xbf == ybf ? 2 : 1);
     if ((eff_prec() == 2 || eff_prec() == 3) && xbf == ybf) return lp_conv_fwd_s2_f8(x, LPDT(xbf), xs, w, b, cout, y, LPDT(ybf), ys, gp);
     return g_h16 ? conv_fwd_tc_s2_h<f16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp) : VERIFY_ONLY(conv_fwd_tc_s2_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, ys, gp));
 }

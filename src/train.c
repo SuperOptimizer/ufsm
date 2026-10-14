@@ -39,6 +39,7 @@ typedef struct {
     int lean;                    /* one batch buffer; logit gradient in the model's gradient buffer B */
     int gl_inside;               /* lean: the logit gradient lives in the model's gradient buffers (setup checked the batch overlap) */
     int gl_inplace;              /* the logit gradient over the fp16 logits (g_gl_inplace) */
+    void *hs_lg; double *hs_ds; float hs_dice; int hs_z, hs_P;   /* head slabs (g_head_slab): fp16 logits of one slab, loss sums, recto dice, planes per slab, window width */
     int64_t cornb[2][3]; int lvlb[2];   /* level-0 corner / level of the batch in each buffer (verso dump) */
     uint8_t *vsoft, *vanch;      /* --verso-ridge: the soft teacher output of the window; --verso-anchor ridge target */
     uint8_t *vmask, *vw; float *vscratch, vout[3]; double verso_loss;   /* verso loss: own mask (every owned voxel), weight byte, scratch, parts */
@@ -85,6 +86,8 @@ static int g_pap_head, g_pap_ch; static float g_pap_lambda = 1.f; static papyrus
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_scale = 32.f;
 static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --density-code, --packed-weight, --packed-um (task unwrap) */
 static int g_gl_inplace;   /* the logit gradient over the fp16 logits (set before the memory planner) */
+static int g_head_slab;    /* unwrap: head, losses and head backward per z-slab (no whole-window logits or derived targets; set before the planner) */
+static int g_hs_z;         /* its planes per slab */
 static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64;   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
    (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */
@@ -214,7 +217,8 @@ static void diagnose_nan(gpu_state *d, int B, int P, int step, const char *out) 
     uint8_t *ht = malloc((size_t)B * NCH * p3), *hm = malloc((size_t)B * p3), *hw = malloc((size_t)B * NCH);
     nn_d2h(ht, d->tb[cb], (size_t)B * NCH * p3); nn_d2h(hm, d->mb[cb], (size_t)B * p3); nn_d2h(hw, d->wb[cb], (size_t)B * NCH);
     float *hl = malloc(nl * 4);
-    if (unet_logits_h16(d->u)) { _Float16 *h16 = malloc(nl * 2); nn_d2h(h16, d->lg, nl * 2); for (size_t k = 0; k < nl; k++) hl[k] = (float)h16[k]; free(h16); }
+    if (!d->lg) memset(hl, 0, nl * 4);   /* head slabs: no whole-window logits (reported as 0) */
+    else if (unet_logits_h16(d->u)) { _Float16 *h16 = malloc(nl * 2); nn_d2h(h16, d->lg, nl * 2); for (size_t k = 0; k < nl; k++) hl[k] = (float)h16[k]; free(h16); }
     else nn_d2h(hl, d->lg, nl * 4);
     double xmax = 0; size_t xnf = 0;
     for (size_t k = 0; k < nx; k++) {
@@ -345,6 +349,52 @@ static void verso_target(gpu_state *d, shape5 xs) {
         nn_h2d(d->t + l3, vt, l3); free(vt);
     }
 }
+/* head slabs (unwrap, B 1, no split; channels 0 recto, 1 ink, 2-3 phase, 4-10 normal / density): the 1^3 head, the targets derived
+   from the phase (sidet / sidem / nt / nm, slab-sized) and the four losses over z-slabs of g_hs_z planes, so neither the window's
+   11 fp16 logit planes (22 B per voxel) nor its derived targets (11 B) exist whole. pass 0 (after the forward): every loss's
+   statistics, summed over the slabs and finished into its scratch (fetch_loss reads them as before); pass 1 (the backward's head
+   step, head_slab_cb): the head again, each loss's gradient in place over the slab's logits, the head backward of the slab. The
+   per-voxel arithmetic is the whole-window path's (fp64 sums in another order; the head backward's SR seed is the backward's) */
+static void head_slab_pass(gpu_state *d, int pass) {
+    const int D = g_Pz, H = d->hs_P, W = d->hs_P, Z = d->hs_z;
+    const size_t hw = (size_t)H * W, l3 = (size_t)D * hw;
+    nn_set_logits_h16(1);
+    if (!pass) nn_zero(d->hs_ds, 64 * sizeof(double));
+    for (int z0 = 0; z0 < D; z0 += Z) {
+        const int z1 = z0 + Z < D ? z0 + Z : D, nz = z1 - z0;
+        const size_t ns = (size_t)nz * hw, vb = (size_t)z0 * hw;
+#define LGC(c) ((char *)d->hs_lg + (size_t)(c) * ns * 2)
+        if (unet_head_fwd_z(d->u, z0, z1, d->hs_lg)) { fprintf(stderr, "head slabs: the head is not covered (MX activations; UFSM_HEAD_SLAB=0)\n"); abort(); }
+        const shape5 one = {1, 1, nz, H, W}, two = {1, 2, nz, H, W}, seven = {1, 7, nz, H, W};
+        nn_phase_targets(d->sdb + vb, ns, d->sidet, d->sidem);
+        if (g_packed_w > 1) nn_packed_mask_z(d->sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem, z0, z1);   /* packed sheets weigh more */
+        nn_unwrap_targets2_z(d->sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1);
+        if (!pass) {
+            nn_loss_stats_acc(LGC(0), d->t + vb, d->m + vb, d->w, one, d->hs_ds);
+            nn_loss_stats_acc(LGC(1), d->t + l3 + vb, d->pm + vb, d->w + 1, one, d->hs_ds + 5);
+            nn_loss_stats_acc(LGC(g_side_ch), d->sidet, d->sidem, d->sidew, two, d->hs_ds + 10);
+            nn_loss_stats_acc(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, d->hs_ds + 20);
+            continue;
+        }
+        nn_loss_grad_only(LGC(0), d->t + vb, d->m + vb, d->w, one, d->hs_dice, LGC(0), d->scratch);
+        nn_loss_grad_only(LGC(1), d->t + l3 + vb, d->pm + vb, d->w + 1, one, g_ink_dice, LGC(1), d->iscratch);
+        if (g_ink_lambda != 1.f) nn_loss_grad_scale(LGC(1), ns, g_ink_lambda);
+        nn_loss_grad_only(LGC(g_side_ch), d->sidet, d->sidem, d->sidew, two, 0.f, LGC(g_side_ch), d->sscratch);
+        if (g_side_lambda != 1.f) nn_loss_grad_scale(LGC(g_side_ch), 2 * ns, g_side_lambda);
+        nn_loss_grad_only(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, 0.f, LGC(g_norm_ch), d->nscratch);
+        if (g_norm_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 7 * ns, g_norm_lambda);
+        if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0)\n"); abort(); }
+#undef LGC
+    }
+    if (!pass) {
+        const shape5 w1 = {1, 1, D, H, W}, w2 = {1, 2, D, H, W}, w7 = {1, 7, D, H, W};
+        nn_loss_stats_fin(d->hs_ds, d->w, w1, d->scratch);
+        nn_loss_stats_fin(d->hs_ds + 5, d->w + 1, w1, d->iscratch);
+        nn_loss_stats_fin(d->hs_ds + 10, d->sidew, w2, d->sscratch);
+        nn_loss_stats_fin(d->hs_ds + 20, d->nw, w7, d->nscratch);
+    }
+}
+static void head_slab_cb(void *ctx) { head_slab_pass((gpu_state *)ctx, 1); }
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 xs = {B, g_xc, d->side >= 0 ? g_Dl : g_Pz, P, P};
     if (unet_cfg_of(d->u)->scale_cond) { if (g_papyrus) unet_set_cond(d->u, d->um); else unet_set_scale(d->u, d->um); }   /* B == 1 (checked at
@@ -360,6 +410,14 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         lg = d->lgf;
     } else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
+    if (g_head_slab) {   /* the head per z-slab: the loss statistics now, the gradients in the backward (head_slab_cb) */
+        int prof = ufsm_env_on("UFSM_PROF");
+        if (prof) nn_prof_begin(6);
+        d->gl = nullptr; d->hs_dice = dice_w;
+        head_slab_pass(d, 0);
+        if (prof) nn_prof_end();
+        return;
+    }
     if (d->gl_inplace && train) {   /* the losses write each element's gradient over its own logit (read first) */
         if (!unet_logits_h16(d->u) || !g_g16) { fprintf(stderr, "in-place logit gradient: the logits are not fp16 (UFSM_GL_SEPARATE=1)\n"); abort(); }
         d->gl = (float *)lg;
@@ -991,6 +1049,15 @@ int cmd_train(int argc, char **argv) {
            pass) before writing its gradient there; not with readers of other channels' logits after a loss (count loss, cond accuracy),
            the tolerance band, affinities, half-resolution or sheet nets. -22 B per voxel at 11 outputs. UFSM_GL_SEPARATE=1: own buffer */
         g_gl_inplace = !g_half && !g_sheet && !g_aff && !g_cond && g_count_lambda == 0.f && !nn_get_loss_tol() && g_g16 && !ufsm_env_on("UFSM_LOGITS32") && !ufsm_env_on("UFSM_GL_SEPARATE");
+        /* head slabs (head_slab_pass): the production unwrap layout (11 outputs, every channel trained by one of its four losses), B 1,
+           whole windows, MX activations; -22 B (logits) - 11 B (derived targets) per voxel. UFSM_HEAD_SLAB=0: whole-window head and losses;
+           UFSM_HEAD_SLAB_Z: planes per slab (32) */
+        g_head_slab = g_gl_inplace && g_unwrap && B == 1 && !split && !g_verso && !g_pap_head && g_side == 2 && g_side_nc == 2 && g_side_ch == 2 && g_norm_ch == 4
+                      && g_cout == 11 && unet_act_mx() && !(getenv("UFSM_HEAD_SLAB") && !atoi(getenv("UFSM_HEAD_SLAB")));
+        g_hs_z = getenv("UFSM_HEAD_SLAB_Z") ? atoi(getenv("UFSM_HEAD_SLAB_Z")) : 32;
+        if (g_hs_z < 1) g_hs_z = 1;
+        if (g_hs_z > g_Pz) g_hs_z = g_Pz;
+        for (int g = 0; g < ng; g++) unet_set_head_ext(G[g].u, g_head_slab);
         const char *mm = opt(argc, argv, "--mem", "auto");   /* MX-fp8 gradients passed their stair (3 seeds, mean 0.293 vs 0.294) */
         const int auto16 = g_sheet || !strcmp(mm, "auto16") || !unet_act_mx();   /* sheet reference keeps FP16 stem, hence 16-bit gradients */
         /* MX gradient modes store MX-fp4 activation gradients by default (paired 500-step runs: same step time, -2.9 GB per desk GPU,
@@ -1057,11 +1124,12 @@ int cmd_train(int argc, char **argv) {
                 const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
                 size_t trainer = nbuf * ((size_t)B * g_xc * p3 * xbytes() + (size_t)B * NCH * p3 + (size_t)B * p3) + (cand[c].lean || g_gl_inplace ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
                 if (cand[c].lean) trainer = (cand[c].gmx ? 0 : (size_t)B * g_xc * p3 * xbytes())   /* batch buffers inside the gradient buffer B (estimate) */
-                                            + (g_cout > NCH && !g_gl_inplace ? (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) : 0);   /* > 2 outputs (affinities, verso): the logit gradient may not fit beside the logits */
+                                            + (g_cout > NCH && !g_gl_inplace ? (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) : 0)
+                                            + (g_head_slab ? (size_t)B * (NCH + 1) * p3 : 0);   /* head slabs: targets and mask outside the gradient buffers */   /* > 2 outputs (affinities, verso): the logit gradient may not fit beside the logits */
                 /* the fp4 weight gradient's gy records of a whole level-0 layer (lp_gn_silu_bwd_apply_rec, MX-fp4 gradients): 136 B per
                    32 channels x 256 voxels (~0.5 B per voxel and channel), outside the dry build */
                 const size_t grec = unet_grad_mx4() && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1) ? (size_t)B * cfg.widths[0] * p3 * 136 / 256 : 0;
-                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (size_t)15 * B * p3 : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (need <= fmin) pick = c;
             }
             if (pick < 0) { pick = auto16 ? nc - 1 : 7; /* the smallest mode of the list */ fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
@@ -1111,6 +1179,11 @@ int cmd_train(int argc, char **argv) {
             else { d->xb[i] = nn_malloc((size_t)B * g_xc * p3 * xbytes()); d->tb[i] = nn_malloc((size_t)B * NCH * p3); d->mb[i] = nn_malloc((size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * NCH); }
             d->ev_up[i] = nn_event_create();
         }
+        if (g_head_slab && bs) {   /* head slabs read the targets and mask in the backward (head_slab_cb), after the head's backward has
+                                      started writing the gradient buffers: their own buffers (+3 B per voxel), the input stays inside */
+            d->tb[0] = d->tb[1] = nn_malloc(tbb); d->mb[0] = d->mb[1] = nn_malloc(mbb);
+            if (!lean) { d->tb[1] = nn_malloc(tbb); d->mb[1] = nn_malloc(mbb); }
+        }
         if (lean && g == 0) fprintf(stderr, "lean %d: batch buffers %s, logit gradient %s\n", lean, !bs ? "separate" : xin_in ? "and input inside the gradient buffers" : "inside the gradient buffers, input separate", d->gl ? "inside" : "separate");
         for (int i = 0; i < 2; i++) { d->ev_done[i] = nn_event_create(); nn_event_record(d->ev_done[i], 0); }
         d->pending = nullptr; select_buf(d, 0);
@@ -1126,13 +1199,22 @@ int cmd_train(int argc, char **argv) {
         }
         if (g_side) {
             d->sideb[0] = nn_malloc((size_t)B * p3); d->sideb[1] = lean ? d->sideb[0] : nn_malloc((size_t)B * p3); d->sdb = d->sideb[d->cur];
-            d->sidet = nn_malloc((size_t)g_side_nc * B * p3); d->sidem = nn_malloc((size_t)B * p3);
+            const size_t tp3 = g_head_slab ? (size_t)g_hs_z * P * P : (size_t)B * p3;   /* derived targets: one head slab, or the window */
+            d->sidet = nn_malloc((size_t)g_side_nc * tp3); d->sidem = nn_malloc(tp3);
             d->sidew = nn_malloc(2); static const uint8_t one_w[2] = {1, 1}; nn_h2d(d->sidew, one_w, 2);
             d->sscratch = nn_malloc(nn_loss_scratch((shape5){1, g_side_nc, g_Pz, P, P}) + 64);
         }
         if (g_unwrap) {
             d->pmb[0] = nn_malloc((size_t)B * p3); d->pmb[1] = lean ? d->pmb[0] : nn_malloc((size_t)B * p3); d->pm = d->pmb[d->cur];
-            d->nt = nn_malloc((size_t)7 * B * p3); d->nm = nn_malloc((size_t)B * p3);
+            const size_t tp3 = g_head_slab ? (size_t)g_hs_z * P * P : (size_t)B * p3;
+            d->nt = nn_malloc((size_t)7 * tp3); d->nm = nn_malloc(tp3);
+            if (g_head_slab) {
+                d->hs_z = g_hs_z; d->hs_P = P;
+                d->hs_lg = nn_malloc((size_t)g_cout * tp3 * 2); d->hs_ds = nn_malloc(64 * sizeof(double));
+                unet_set_head_cb(d->u, head_slab_cb, d);
+                if (g == 0) fprintf(stderr, "head slabs: %d planes per slab (%.0f MB of logits and targets instead of %.2f GB)\n", g_hs_z,
+                                    (double)tp3 * (2 * g_cout + 11) / 1e6, (double)B * p3 * (2 * g_cout + 11) / 1e9);
+            }
             d->nw = nn_malloc(7); static const uint8_t seven_w[7] = {1, 1, 1, 1, 1, 1, 1}; nn_h2d(d->nw, seven_w, 7);
             d->iscratch = nn_malloc(nn_loss_scratch((shape5){1, 1, g_Pz, P, P}) + 64);
             d->nscratch = nn_malloc(nn_loss_scratch((shape5){1, 7, g_Pz, P, P}) + 64);

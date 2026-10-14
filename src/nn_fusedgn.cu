@@ -112,6 +112,27 @@ extern "C" int nn_head_bwd_x(const float *x, const nn_gn_t *gx_gn, shape5 xs, co
     KCHECK();
     return 0;
 }
+/* the head on voxels [vb, vb + nv) of x (the trainer's head slabs, train.c): forward into fp16 planes of nv voxels; backward from
+   fp16 gy planes of nv voxels, weight / bias gradients accumulated, gx rows [vb, vb + nv) written with the SR seed drawn by the
+   first slab (first != 0) and kept for the rest, so the stored bits match one whole-volume call. -1: not MX / not covered */
+extern "C" int nn_head_fwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const float *w, const float *b, int cout, void *y16, size_t vb, size_t nv) {
+    if (!g_tf32 || !ISMX(x)) return -1;
+    exec_prec(0, 0);
+    lp_conv1_fwd_mx_h16_r(x, MXDT(x), xs, w, b, cout, y16, to_gnp(gx_gn), vb, nv);
+    KCHECK();
+    return 0;
+}
+extern "C" int nn_head_bwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx,
+                             size_t vb, size_t nv, int first) {
+    static thread_local unsigned seed;
+    if (!g_tf32 || !ISMX(x) || !ISMX(gx) || !GBF || !g_h16) return -1;
+    if (first) seed = MXDT(gx) == 4 ? sr_seed() : 0u;
+    shape5 ys = xs; ys.c = cout;
+    if (!lp_head_bwd_mx_r(x, MXDT(x), xs, gy16, 2, ys, w, gw, gb, gx, MXDT(gx), to_gnp(gx_gn), seed, vb, nv)) return -1;
+    exec_prec(2, 0); exec_prec(1, 0);
+    KCHECK();
+    return 0;
+}
 extern "C" void nn_silu_bwd_gn(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy, float *gx) {
     if (G > s.c) G = s.c;
     size_t n = shape_numel(s);

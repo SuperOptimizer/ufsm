@@ -334,7 +334,7 @@ static int s2b_f4(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx
 }
 /* the 96 KB dynamic shared memory attribute is per device: set it once on every GPU that launches (split z uses two) */
 extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr) {
-    if (s2b_f4(gy, ys, w, xs, gx, accum, gdt, xdt, osr)) return 1;   /* 32 channels, MX-fp4 gy: the fp4 kernel (UFSM_S2B_F4=0: bf16) */
+    if (s2b_f4(gy, ys, w, xs, gx, accum, gdt, xdt, osr)) return 3;   /* 32 channels, MX-fp4 gy: the fp4 kernel (UFSM_S2B_F4=0: bf16); 3 = fp4 compute */
     static int on = -1; if (on < 0) on = getenv("UFSM_S2B_TC") ? atoi(getenv("UFSM_S2B_TC")) : 1;
     if (!on || xs.c != ys.c || (xs.c != 16 && xs.c != 32 && xs.c != 64)) return 0;
     const int GB = gdt == 4 ? 4 : 8, XB = xdt == 4 ? 4 : 8;

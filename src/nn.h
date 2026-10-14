@@ -176,7 +176,11 @@ int nn_conv3d_fwd_gn_stats(const float *x, shape5 xs, int G_in, const float *gam
 typedef struct { const float *gamma, *beta, *mean, *rstd; int G; } nn_gn_t;
 int nn_conv3d_fwd_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, int up, shape5 xs,
                     const float *w, const float *b, int cout, int k, int stride, float *y, int G_out, float eps, float *omean, float *orstd);
-int nn_head_bwd_x(const float *x, const nn_gn_t *gx_gn, shape5 xs, const float *gy, shape5 ys, const float *w, float *gw, float *gb, float *gx);   /* fused 1^3 head backward (MX x / gx, fp16 gy); -1 = not covered */
+int nn_head_bwd_x(const float *x, const nn_gn_t *gx_gn, shape5 xs, const float *gy, shape5 ys, const float *w, float *gw, float *gb, float *gx);
+/* the head on voxels [vb, vb + nv) of x (trainer head slabs): fp16 logits / logit gradient as planes of nv voxels; bwd: first = the first
+   slab of a backward (draws the SR seed the others reuse). -1: not covered (MX x / gx, 16-bit gradients) */
+int nn_head_fwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const float *w, const float *b, int cout, void *y16, size_t vb, size_t nv);
+int nn_head_bwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx, size_t vb, size_t nv, int first);   /* fused 1^3 head backward (MX x / gx, fp16 gy); -1 = not covered */
 int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, int up, shape5 xs,
                            const float *gy, shape5 ys, int k, int stride, float *gw, float *gb);   /* gw / gb accumulated */
 int nn_conv3d_fwd_split(const float *x, const float *x2, int c_split, shape5 xs, int G_in, const float *gamma, const float *beta, const float *mean, const float *rstd,
@@ -235,6 +239,11 @@ void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, cons
 void nn_set_loss_tol(int r);
 int nn_get_loss_tol(void);
 void nn_loss_async_tol(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch, uint8_t *code);
+/* the same loss in parts (head slabs): statistics added to ds (5 doubles per (n, c), caller-zeroed) per slab, finished into scratch
+   (s: the whole window), then each slab's gradient (gl may be the logits: in place) */
+void nn_loss_stats_acc(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds);
+void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float *scratch);
+void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch);
 /* Affinity loss on band labels (task band_affinity, src/nn_loss.cu): output channels c0 .. c0 + K - 1 are affinities for
    the offsets off (axis 0 z / 1 y / 2 x, distance d); band [n][S] holds band values in 1/18-turn steps mod 252, 255 =
    unknown. Writes those channels of gl (scaled by lambda / K); fin: nn_aff_scratch(K) bytes of per-channel results
@@ -303,6 +312,9 @@ void nn_unwrap_targets(const uint8_t *phase, int d, int h, int w, int s, float d
    loss weight (1 at a spacing um / rho of packed_um or more, up to packed_w at packed_um / 2; um: the batch's voxel size in um) */
 void nn_unwrap_targets2(const uint8_t *phase, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, uint8_t *t, uint8_t *m);
 void nn_packed_mask(const uint8_t *phase, int d, int h, int w, int s, float um, float packed_um, float packed_w, uint8_t *m);   /* 0/1 mask x the weight */
+void nn_packed_mask_z(const uint8_t *phase, int d, int h, int w, int s, float um, float packed_um, float packed_w, uint8_t *m, int z0, int z1);   /* m: planes [z0, z1) */
+void nn_unwrap_targets2_z(const uint8_t *phase, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, uint8_t *t, uint8_t *m,
+                          int z0, int z1);   /* planes [z0, z1) of the window into planes of (z1 - z0) h w */
 /* train --count-lambda: K segments of L voxels along the ground-truth phase gradient; loss |log((sum rho_pred + .05) / (true turns + .05))|
    (rho_pred = exp(logit) / dscale, the x / (1 + x) density code); its gradient times lambda added into dens_grad (the density
    channel of the logit gradient; nullptr: none). acc: d h w floats (zero, left zero); seg: 3 K floats; out2 (device): mean loss,
