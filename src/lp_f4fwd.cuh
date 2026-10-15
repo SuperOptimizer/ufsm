@@ -397,7 +397,19 @@ __global__ void prep_w4p_k(const float *__restrict__ w, uint8_t *__restrict__ wq
 /* the epilogue scratch of conv_fwd_f4p_k: after its ring and tables, so the halo planes survive into the next z tile */
 template <int MT, int TZ> __host__ __device__ constexpr unsigned f4p_scr_off() {
     constexpr int BM = MT * 16, TT = (TZ + 2) * 180;
-    return (unsigned)((TT * 16 + ((TT + 127) & ~127) + 9 * BM * 32 + 9 * BM * 4 + 32 * 32 + 127) & ~127);
+    return (unsigned)((TT * 16 + ((TT * 4 + 127) & ~127) + 9 * BM * 32 + 9 * BM * 4 + 32 * 32 + 127) & ~127);
+}
+/* one staged position of conv_fwd_f4p_k: its 8 bytes into pair[pos] (low half) and pair[pos - 1] (high half), the row's last pair
+   padded with zeros, and its scale into the B scale words of the voxels whose K groups it feeds: byte 0 of word[pos], 1 of
+   word[pos - 1], 2 of word[pos - 2] (byte 3, the kx3 group: 1). The MMA then loads one word per column (was three bytes). */
+__device__ __forceinline__ void p16_put(uint8_t *sx, unsigned *sxw, int pos, int ix, uint2 q, unsigned sc) {
+    *(uint2 *)(sx + pos * 16) = q;
+    if (ix) *(uint2 *)(sx + (pos - 1) * 16 + 8) = q;
+    if (ix == 17) *(uint2 *)(sx + pos * 16 + 8) = make_uint2(0u, 0u);
+    uint8_t *sb = (uint8_t *)sxw;
+    sb[4 * pos] = (uint8_t)sc; sb[4 * pos + 3] = 0x7f;
+    if (ix >= 1) sb[4 * pos - 3] = (uint8_t)sc;
+    if (ix >= 2) sb[4 * pos - 6] = (uint8_t)sc;
 }
 template <int MT, int TZ, typename T, typename TO>
 __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
@@ -406,8 +418,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
     constexpr int BM = MT * 16, RZ = TZ / 2, NR = 2 * RZ, NP = TZ + 2, TT = NP * 180;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sx = smem_raw;                    /* [NP slots x 180 pos][16 B] = [pos | pos + 1]; input plane gz in slot (gz + 1) % NP */
-    uint8_t *sxs = sx + TT * 16;               /* [TT] position scales */
-    uint8_t *wa = sxs + ((TT + 127) & ~127);   /* [9 r][BM co][32 B] swizzled */
+    unsigned *sxw = (unsigned *)(sx + TT * 16);   /* [TT] B scale words: s(p), s(p + 1), s(p + 2), 1 (p16_put) */
+    uint8_t *wa = sx + TT * 16 + ((TT * 4 + 127) & ~127);   /* [9 r][BM co][32 B] swizzled */
     unsigned *was = (unsigned *)(wa + 9 * BM * 32);   /* [9][BM] (byte kx = the kx group's scale) */
     chan_t *ctab = (chan_t *)(was + 9 * BM);   /* [32] */
     unsigned char *scr = smem_raw + f4p_scr_off<MT, TZ>();   /* epilogue scratch */
@@ -444,41 +456,69 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
     const int oz0 = tz * TZ, p0 = tz == zc * ZC ? 0 : 2, npos = (NP - p0) * 180;   /* tile planes p0 .. NP - 1 are new */
     __syncthreads();   /* the previous tile's MMA has read the slots about to be replaced */
     F4RP(0);
+    if constexpr (IS_MX4(T)) {   /* staging, MX-fp4 input: every position's row and scale are loaded first (NIT loads in flight per thread,
+                                    was one), then each position is quantised once with its own scale and written to both pairs it
+                                    belongs to (low half of pair p, high half of pair p - 1) */
+        constexpr int NIT = (TT + 255) / 256;
+        uint2 raw[NIT];
+        unsigned rsc[NIT], okm = 0u;
+#pragma unroll
+        for (int it = 0; it < NIT; it++) {
+            const int li = threadIdx.x + 256 * it, pl = p0 + li / 180, rem = li % 180, row = rem / 18, ix = rem - 18 * row;
+            const int gz = oz0 - 1 + pl, gy = oy0 - 1 + row, gx = ox0 - 1 + ix;
+            const bool ok = li < npos && c0.p && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+            ld_row16(c0, ok ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0, ok, raw[it], rsc[it]);
+            okm |= (unsigned)ok << it;
+        }
+#pragma unroll
+        for (int it = 0; it < NIT; it++) {
+            const int li = threadIdx.x + 256 * it, pl = p0 + li / 180, rem = li % 180, row = rem / 18, ix = rem - 18 * row;
+            if (li >= npos) break;
+            const int gz = oz0 - 1 + pl, gy = oy0 - 1 + row, gx = ox0 - 1 + ix, pos = ((gz + 1) % NP) * 180 + rem;
+            const bool in = (okm >> it) & 1u;
+            uint2 q = raw[it];
+            unsigned sc = in ? rsc[it] : 1u;
+            if (!cpy) {   /* dequantise, GN+SiLU (stage_row16's arithmetic), requantise */
+                float v[16];
+                dec_row16_gn(q, rsc[it], in, Ci, G, gab, v);
+                unsigned am = 0u;
+#pragma unroll
+                for (int k = 0; k < 16; k++) am = amax_u(am, v[k]);
+                const int e = mx_exp(__uint_as_float(am), 1.f / 6.f);
+                const float m = exp2i(-e);
+                if (sp.sr) {   /* gradient operand: exact stochastic rounding keyed by the element (deterministic per call) */
+                    const uint64_t vid = (((uint64_t)n * D + gz) * H + gy) * (uint64_t)W + gx;
+                    uint32_t ha[4], hb[4];
+                    sr_hash4(sp.sr, vid * 2, ha); sr_hash4(sp.sr, vid * 2 + 1, hb);
+                    q = make_uint2(sr_e2m1_word(v, m, ha), sr_e2m1_word(v + 8, m, hb));
+                } else q = make_uint2(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m));
+                sc = (unsigned)(e + 127);
+            }
+            p16_put(sx, sxw, pos, ix, q, sc);
+        }
+    } else
     for (int li = threadIdx.x; li < npos; li += 256) {   /* staging: thread per position, quantised once with its own scale, written
                                                             to both pairs it belongs to (low half of pair p, high half of pair p - 1) */
         const int pl = p0 + li / 180, rem = li % 180, row = rem / 18, ix = rem - 18 * row;
         const int gz = oz0 - 1 + pl, gy = oy0 - 1 + row, gx = ox0 - 1 + ix, pos = ((gz + 1) % NP) * 180 + rem;
         const bool inb = gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
         const size_t off = inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0;
-        uint2 q = make_uint2(0u, 0u);
-        unsigned sc = 1u;
-        if (cpy) {
-            if (inb && c0.p) {
-                const uint8_t *src = (const uint8_t *)c0.p + off * c0.rb;
-                q = c0.bw == 8 ? make_uint2(__ldg((const unsigned *)src), 0u) : __ldg((const uint2 *)src);   /* 8 / 16 channels: 4 / 8 bytes */
-                sc = c0.sp[off];
-            }
-        } else {
-            float v[16];
-            stage_row16<T>(c0, Ci, plane, off, inb, G, gab, v);
-            unsigned am = 0u;
+        uint2 q;
+        float v[16];
+        stage_row16<T>(c0, Ci, plane, off, inb, G, gab, v);
+        unsigned am = 0u;
 #pragma unroll
-            for (int k = 0; k < 16; k++) am = amax_u(am, v[k]);
-            const int e = mx_exp(__uint_as_float(am), 1.f / 6.f);
-            const float m = exp2i(-e);
-            if (sp.sr) {   /* gradient operand: exact stochastic rounding keyed by the element (deterministic per call): one hash and
-                              three remixes per 8 values, the nibbles straight from the rounding */
-                const uint64_t vid = (((uint64_t)n * D + gz) * H + gy) * (uint64_t)W + gx;
-                uint32_t ha[4], hb[4];
-                sr_hash4(sp.sr, vid * 2, ha); sr_hash4(sp.sr, vid * 2 + 1, hb);
-                q = make_uint2(sr_e2m1_word(v, m, ha), sr_e2m1_word(v + 8, m, hb));
-            } else q = make_uint2(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m));
-            sc = (unsigned)(e + 127);
-        }
-        *(uint2 *)(sx + pos * 16) = q;                                   /* low half of pair[pos] */
-        if (ix) *(uint2 *)(sx + (pos - 1) * 16 + 8) = q;                 /* high half of pair[pos - 1] */
-        if (ix == 17) *(uint2 *)(sx + pos * 16 + 8) = make_uint2(0u, 0u);   /* the row's last pair: [17 | 0] */
-        sxs[pos] = (uint8_t)sc;
+        for (int k = 0; k < 16; k++) am = amax_u(am, v[k]);
+        const int e = mx_exp(__uint_as_float(am), 1.f / 6.f);
+        const float m = exp2i(-e);
+        if (sp.sr) {   /* gradient operand: exact stochastic rounding keyed by the element (deterministic per call): one hash and
+                          three remixes per 8 values, the nibbles straight from the rounding */
+            const uint64_t vid = (((uint64_t)n * D + gz) * H + gy) * (uint64_t)W + gx;
+            uint32_t ha[4], hb[4];
+            sr_hash4(sp.sr, vid * 2, ha); sr_hash4(sp.sr, vid * 2 + 1, hb);
+            q = make_uint2(sr_e2m1_word(v, m, ha), sr_e2m1_word(v + 8, m, hb));
+        } else q = make_uint2(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m));
+        p16_put(sx, sxw, pos, ix, q, (unsigned)(e + 127));
     }
     __syncthreads();
     F4RP(1);
@@ -495,10 +535,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
             const int rowi = ((oz0 + wz * RZ + (r >> 1) + kz) % NP) * 10 + wr + (r & 1) + ky;   /* the tile plane's ring slot */
             ldsm_x4(bfr[r], sx + (rowi * 18 + vx + 2 * kb) * 16);   /* K 0..31: [x | x+1], K 32..63: [x+2 | x+3] */
 #pragma unroll
-            for (int q2 = 0; q2 < 2; q2++) {   /* column g: its three positions' scales, kx3 = 1 */
-                const int pc = rowi * 18 + q2 * 8 + g;
-                sb[r][q2] = (unsigned)sxs[pc] | ((unsigned)sxs[pc + 1] << 8) | ((unsigned)sxs[pc + 2] << 16) | 0x7f000000u;
-            }
+            for (int q2 = 0; q2 < 2; q2++) sb[r][q2] = sxw[rowi * 18 + q2 * 8 + g];   /* column g: its three positions' scales, kx3 = 1 */
         }
 #pragma unroll
         for (int m = 0; m < MT; m++) {

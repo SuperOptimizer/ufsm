@@ -10,16 +10,26 @@
    coarse tensor's GN+SiLU and stored as 16 e4m3 + one scale (stage_up_coarse16); each fine position blends 8 of them in half2
    (stage_up_smem16_h2). The staged values, their scales and the weights' nibbles and scales are those of conv_fwd_f4_k (its
    padding channels are zero: the same amax); only the fp32 accumulation order inside the tensor core differs. */
-template <typename T>
+template <int NCZ>   /* CZ <= NCZ coarse planes; blockDim 256 */
 __device__ __forceinline__ void stage_up_coarse16(const chan_t &c0, int Cu, const float2 *gab, bool G, uint8_t *cu, uint8_t *cus, int cz0, int cy0, int cx0, int CZ,
                                                   int D, int H, int W) {
+    constexpr int NIT = (NCZ * 96 + 255) / 256;
     const int Dc = D >> 1, Hc = H >> 1, Wc = W >> 1, n = CZ * 96;
-    const size_t cplane = (size_t)Dc * Hc * Wc;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const int lx = i % 12, ly = (i / 12) % 8, lz = i / 96, cz = cz0 + lz, cy = cy0 + ly, cx = cx0 + lx;
-        const bool ok = cz >= 0 && cz < Dc && cy >= 0 && cy < Hc && cx >= 0 && cx < Wc;
+    uint2 raw[NIT];
+    unsigned rsc[NIT], okm = 0u;
+#pragma unroll
+    for (int it = 0; it < NIT; it++) {   /* every row's load first (NIT in flight per thread), then the decode */
+        const int i = threadIdx.x + 256 * it, lx = i % 12, ly = (i / 12) % 8, lz = i / 96, cz = cz0 + lz, cy = cy0 + ly, cx = cx0 + lx;
+        const bool ok = i < n && c0.p && cz >= 0 && cz < Dc && cy >= 0 && cy < Hc && cx >= 0 && cx < Wc;
+        ld_row16(c0, ok ? ((size_t)cz * Hc + cy) * Wc + cx : 0, ok, raw[it], rsc[it]);
+        okm |= (unsigned)ok << it;
+    }
+#pragma unroll
+    for (int it = 0; it < NIT; it++) {
+        const int i = threadIdx.x + 256 * it;
+        if (i >= n) break;
         float r[16];
-        stage_row16<T>(c0, Cu, cplane, ok ? ((size_t)cz * Hc + cy) * Wc + cx : 0, ok, G, gab, r);
+        dec_row16_gn(raw[it], rsc[it], (okm >> it) & 1u, Cu, G, gab, r);
         unsigned am = 0u;
 #pragma unroll
         for (int k = 0; k < 16; k++) { const unsigned u = __float_as_uint(fabsf(r[k])); am = u <= 0x7f800000u ? max(am, u) : am; }
@@ -81,7 +91,7 @@ __global__ void prep_w4u_k(const float *__restrict__ w, uint8_t *__restrict__ wq
 }
 template <int TZ>
 __host__ __device__ constexpr unsigned f4u_off(int part) {   /* smem: 0 ring, 1 scales, 2 weights, 3 weight scales, 4 tables, 5 coarse rows / epilogue scratch */
-    constexpr unsigned TT = (TZ + 2) * 180, o1 = TT * 16, o2 = (o1 + TT * 2 + 127) & ~127u, o3 = o2 + 14 * 16 * 32, o4 = o3 + 14 * 16 * 4,
+    constexpr unsigned TT = (TZ + 2) * 180, o1 = TT * 16, o2 = (o1 + TT * 4 + 127) & ~127u, o3 = o2 + 14 * 16 * 32, o4 = o3 + 14 * 16 * 4,
                        o5 = (o4 + 32 * 32 + 32 * 8 + 127) & ~127u;
     return part == 0 ? 0u : part == 1 ? o1 : part == 2 ? o2 : part == 3 ? o3 : part == 4 ? o4 : o5;
 }
@@ -94,7 +104,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
     constexpr int RZ = TZ / 2, NR = 2 * RZ, NP = TZ + 2, CZ = TZ / 2 + 4;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sx = smem_raw;                                                   /* [NP slots x 180 pos][16 B] = [up 8 B | skip 8 B] */
-    unsigned short *sxs = (unsigned short *)(smem_raw + f4u_off<TZ>(1));      /* [pos] scale bytes (up, skip) */
+    unsigned *sxw = (unsigned *)(smem_raw + f4u_off<TZ>(1));                  /* [pos] scale bytes (up, skip) of pos | of pos + 1 << 16 */
     uint8_t *wa = smem_raw + f4u_off<TZ>(2);                                  /* [14 pairs][16 co][32 B] swizzled (tapA 16 B | tapB 16 B) */
     unsigned *was = (unsigned *)(smem_raw + f4u_off<TZ>(3));                  /* [14][16]: bytes (tapA up, tapA skip, tapB up, tapB skip) */
     chan_t *ctab = (chan_t *)(smem_raw + f4u_off<TZ>(4));                     /* [32]: up channels 0..15, skip 16..31 */
@@ -124,6 +134,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
     }
     __syncthreads();
     const bool Gu = ctab[0].g != 0, Gs = ctab[16].g != 0;   /* (per-segment GroupNorms, or one over both: make_chan's choice) */
+    const chan_t cs0 = ctab[16];
 #if F4R_PROF
     long long t_prev = clock64();
 #endif
@@ -132,11 +143,27 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
         const int glo = oz0 - 1 + p0n + zi0, ghi = oz0 + TZ + zi0, cz0 = (glo >> 1) - 1, cy0 = (oy0 >> 1) - 2, cx0 = (ox0 >> 1) - 2;
         __syncthreads();   /* the previous tile's MMA and epilogue are done with the ring slots and the scratch */
         F4RP(4);
-        stage_up_coarse16<T>(ctab[0], Cx, cab, Gu, cu, cus, cz0, cy0, cx0, min(CZ, ((ghi >> 1) + 1) - cz0 + 1), Di, H, W);
+        stage_up_coarse16<CZ>(ctab[0], Cx, cab, Gu, cu, cus, cz0, cy0, cx0, min(CZ, ((ghi >> 1) + 1) - cz0 + 1), Di, H, W);
         __syncthreads();
         F4RP(0);
-        for (int li = threadIdx.x; li < npos; li += 256) {   /* stage: up part interpolated, skip dequantised + GN+SiLU, each requantised */
-            const int pl = p0n + li / 180, rem = li % 180, ix = rem % 18, iy = rem / 18;
+        constexpr int NIT = (NP * 180 + 255) / 256;
+        float2 gs[16];   /* the skip's GN coefficients in registers for the staging (were two shared loads per element) */
+#pragma unroll
+        for (int k = 0; k < 16; k++) gs[k] = cab[16 + k];
+        uint2 raw[NIT];
+        unsigned rsc[NIT], okm = 0u;   /* the skip rows, all loads first (NIT in flight per thread) */
+#pragma unroll
+        for (int it = 0; it < NIT; it++) {
+            const int li = threadIdx.x + 256 * it, pl = p0n + li / 180, rem = li % 180, ix = rem % 18, iy = rem / 18;
+            const int gz = oz0 - 1 + pl, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
+            const bool ok = li < npos && cs0.p && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+            ld_row16(cs0, ok ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0, ok, raw[it], rsc[it]);
+            okm |= (unsigned)ok << it;
+        }
+#pragma unroll
+        for (int it = 0; it < NIT; it++) {   /* stage: up part interpolated, skip dequantised + GN+SiLU, each requantised */
+            const int li = threadIdx.x + 256 * it, pl = p0n + li / 180, rem = li % 180, ix = rem % 18, iy = rem / 18;
+            if (li >= npos) break;
             const int gz = oz0 - 1 + pl, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix, pos = ((gz + 1) % NP) * 180 + rem;
             const bool inb = gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
             float v[16];
@@ -148,7 +175,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
             int e = mx_exp(__uint_as_float(am), 1.f / 6.f);
             float m = exp2i(-e);
             q[0] = cvt_e2m1x8(v, m); q[1] = cvt_e2m1x8(v + 8, m); sc = (unsigned)(e + 127);
-            stage_row16<T>(ctab[16], Cs, plane, inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0, inb, Gs, cab + 16, v);
+            dec_row16_gn(raw[it], rsc[it], (okm >> it) & 1u, Cs, Gs, gs, v);
             am = 0u;
 #pragma unroll
             for (int k = 0; k < 16; k++) am = amax_u(am, v[k]);
@@ -156,25 +183,31 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
             m = exp2i(-e);
             q[2] = cvt_e2m1x8(v, m); q[3] = cvt_e2m1x8(v + 8, m); sc |= (unsigned)(e + 127) << 8;
             *(uint4 *)(sx + pos * 16) = make_uint4(q[0], q[1], q[2], q[3]);
-            sxs[pos] = (unsigned short)sc;
+            ((unsigned short *)sxw)[2 * pos] = (unsigned short)sc;                /* low half of word[pos] */
+            if (ix) ((unsigned short *)sxw)[2 * pos - 1] = (unsigned short)sc;   /* high half of word[pos - 1] */
         }
         __syncthreads();
         F4RP(1);
         float acc[1][NR][2][4];
 #pragma unroll
         for (int r = 0; r < NR; r++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[0][r][q][k] = 0.f;
-#pragma unroll 2
+        int slot[RZ + 2];   /* the warp's first row in the ring slot of tile plane wz RZ + j (j = r / 2 + kz) */
+#pragma unroll
+        for (int j = 0; j < RZ + 2; j++) slot[j] = ((oz0 + wz * RZ + j) % NP) * 180 + wr * 18;
+#pragma unroll
         for (int pp = 0; pp < 14; pp++) {
             const int tA = 2 * pp, tB = min(tA + 1, 26);
             unsigned bfr[NR][4], sb[NR][2];
 #pragma unroll
             for (int r = 0; r < NR; r++) {
-                const int sA = (oz0 + wz * RZ + (r >> 1) + tA / 9) % NP, sB = (oz0 + wz * RZ + (r >> 1) + tB / 9) % NP;
-                const int rA = sA * 180 + (wr + (r & 1) + (tA / 3) % 3) * 18 + tA % 3, rB = sB * 180 + (wr + (r & 1) + (tB / 3) % 3) * 18 + tB % 3;
+                const int rA = slot[(r >> 1) + tA / 9] + ((r & 1) + (tA / 3) % 3) * 18 + tA % 3, rB = slot[(r >> 1) + tB / 9] + ((r & 1) + (tB / 3) % 3) * 18 + tB % 3;
                 const int mat = lane >> 3, q = mat >> 1, isB = mat & 1;
                 ldsm_x4(bfr[r], sx + ((isB ? rB : rA) + q * 8 + (lane & 7)) * 16);
 #pragma unroll
-                for (int q2 = 0; q2 < 2; q2++) sb[r][q2] = (unsigned)sxs[rA + q2 * 8 + g] | ((unsigned)sxs[rB + q2 * 8 + g] << 16);
+                for (int q2 = 0; q2 < 2; q2++) {   /* (up, skip) of tap A | of tap B << 16: one word when B is A's x neighbour */
+                    if (tB == tA + 1 && tA % 3 != 2) sb[r][q2] = sxw[rA + q2 * 8 + g];
+                    else sb[r][q2] = (sxw[rA + q2 * 8 + g] & 0xffffu) | (sxw[rB + q2 * 8 + g] << 16);
+                }
             }
             unsigned af[4];
             const int mat = lane >> 3, row = (mat & 1) * 8 + (lane & 7);

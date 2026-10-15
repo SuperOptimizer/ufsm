@@ -194,9 +194,10 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
     }
     for (int i = threadIdx.x; i < NKB * BM; i += 256) { int kb = i / BM, c = i % BM; was[i] = wsc[(size_t)kb * Cop + co0 + c]; }
     __syncthreads();
-    bool row1 = IS_MX8(T) && CP <= 4 && !G && Ci == CP && ctab[0].p && ctab[0].bw >= CP;   /* the CP channels are one MX-fp8 block row (the network
+    bool row1 = IS_MX(T) && CP <= 4 && !G && Ci == CP && ctab[0].p && ctab[0].bw >= CP;   /* the CP channels are one MX block row (the network
                                                                                           input): staged with one row and one scale load */
-    for (int k = 1; k < CP && row1; k++) row1 = ctab[k].p == (const void *)((const uint8_t *)ctab[0].p + k) && ctab[k].sp == ctab[0].sp;
+    for (int k = 1; k < CP && row1; k++)
+        row1 = (IS_MX4(T) ? ctab[k].p == ctab[0].p && ctab[k].nib == k : ctab[k].p == (const void *)((const uint8_t *)ctab[0].p + k)) && ctab[k].sp == ctab[0].sp;
     for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
     const int oz0 = tz * 2;
     if (tz > zc * ZC) __syncthreads();   /* the previous tile's MMA (sx) and amax reads are done */
@@ -207,6 +208,31 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
     for (int m = 0; m < MT; m++) for (int r = 0; r < 2; r++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[m][r][q][k] = 0.f;
     float v[3][CP];
     float amax = 0.f;
+    if constexpr (IS_MX(T) && CP <= 4) if (row1) {   /* the same values as ldc per channel: the row's e4m3 bytes / e2m1 nibbles times its
+                                                       scale; the three positions' row and scale loads all in flight before the first use */
+        const chan_t &c0 = ctab[0];
+        unsigned wv[3], scb[3], okm = 0u;
+#pragma unroll
+        for (int j = 0; j < 3; j++) {
+            const int pos = threadIdx.x + 256 * j, ix = pos % 18, iy = (pos / 18) % 10, iz = pos / 180;
+            const int gz = oz0 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
+            const bool inb = pos < F8_T && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+            wv[j] = 0u; scb[j] = 0u;
+            if (inb) { const size_t off = ((size_t)(gz + zi0) * H + gy) * W + gx; wv[j] = __ldg((const unsigned *)((const uint8_t *)c0.p + off * c0.rb)); scb[j] = c0.sp[off]; }
+            okm |= (unsigned)inb << j;
+        }
+#pragma unroll
+        for (int j = 0; j < 3; j++) {
+            const bool inb = (okm >> j) & 1u;
+            const float sc = mx_scale(scb[j]);
+            float d4[4];
+            if constexpr (IS_MX8(T)) { const float2 lo = dec_e4m3x2((unsigned short)(wv[j] & 0xffffu)), hi = dec_e4m3x2((unsigned short)(wv[j] >> 16)); d4[0] = lo.x; d4[1] = lo.y; d4[2] = hi.x; d4[3] = hi.y; }
+            else { const float2 lo = dec_e2m1x2(wv[j] & 255u), hi = dec_e2m1x2((wv[j] >> 8) & 255u); d4[0] = lo.x; d4[1] = lo.y; d4[2] = hi.x; d4[3] = hi.y; }
+#pragma unroll
+            for (int k = 0; k < CP; k++) { const float val = inb ? d4[k] * sc : 0.f; v[j][k] = val; amax = fmaxf(amax, fabsf(val)); }
+        }
+    }
+    if (!row1)
 #pragma unroll
     for (int j = 0; j < 3; j++) {
         int pos = threadIdx.x + 256 * j;
@@ -214,16 +240,6 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
         int gz = oz0 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
         bool inb = pos < F8_T && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
         size_t off = inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0;
-        if constexpr (IS_MX8(T) && CP <= 4) if (row1) {   /* the same values as ldc per channel: e4m3 bytes of the row times its scale */
-            const chan_t &c0 = ctab[0];
-            unsigned wv = 0u; float sc = 0.f;
-            if (inb) { wv = __ldg((const unsigned *)((const uint8_t *)c0.p + off * c0.rb)); sc = mx_scale(c0.sp[off]); }
-            const float2 lo = dec_e4m3x2((unsigned short)(wv & 0xffffu)), hi = dec_e4m3x2((unsigned short)(wv >> 16));
-            const float d4[4] = {lo.x, lo.y, hi.x, hi.y};
-#pragma unroll
-            for (int k = 0; k < CP; k++) { const float val = inb ? d4[k] * sc : 0.f; v[j][k] = val; amax = fmaxf(amax, fabsf(val)); }
-            continue;
-        }
 #pragma unroll
         for (int k = 0; k < CP; k++) {
             float val = 0.f;
@@ -255,7 +271,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
     __syncthreads();
     /* lane (g, t): b0 holds k = 4t..4t+3 -> local tap 4t / CP, channel 4t % CP; b1 holds k = 16 + 4t.. */
     const int tl0 = (4 * t) / CP, ch0 = (4 * t) % CP, tl1 = (16 + 4 * t) / CP, ch1 = (16 + 4 * t) % CP;
-#pragma unroll 2
+#pragma unroll
     for (int kb = 0; kb < NKB; kb++) {
         int tap0 = min(kb * TPK + tl0, 26), tap1 = min(kb * TPK + tl1, 26);
         int base0 = ((wz + tap0 / 9) * 10 + wr + (tap0 / 3) % 3) * 18 + tap0 % 3 + g;

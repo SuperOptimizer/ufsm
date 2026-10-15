@@ -1123,6 +1123,31 @@ __device__ __forceinline__ void stage_row16(const chan_t &c0, int Ci, size_t pla
         for (int k = 0; k < 16; k++) v[k] = k < Ci ? act_ab(v[k], gab[k].x, gab[k].y, true) : 0.f;
     }
 }
+/* a loaded MX-fp4 row of <= 16 channels (raw, scale byte rsc; in: inside the tensor) dequantised and put through GN+SiLU when
+   G: stage_row16's arithmetic */
+template <typename GAB>
+__device__ __forceinline__ void dec_row16_gn(uint2 raw, unsigned rsc, bool in, int Ci, bool G, const GAB &gab, float *v) {
+    const float s = mx_scale(rsc);
+    const unsigned w[2] = {raw.x, raw.y};
+#pragma unroll
+    for (int j = 0; j < 2; j++)
+#pragma unroll
+        for (int k = 0; k < 4; k++) { const float2 a = dec_e2m1x2(w[j] >> (8 * k)); v[8 * j + 2 * k] = in ? a.x * s : 0.f; v[8 * j + 2 * k + 1] = in ? a.y * s : 0.f; }
+    if (G && in) {
+#pragma unroll
+        for (int k = 0; k < 16; k++) v[k] = k < Ci ? act_ab(v[k], gab[k].x, gab[k].y, true) : 0.f;
+    }
+}
+/* the row at voxel off of the MX-fp4 tensor block c0 (<= 16 channels): raw bytes and scale byte (zeros when !ok). Nothing here
+   uses the loaded values, so a thread's loads of several rows are all in flight before the first use. */
+__device__ __forceinline__ void ld_row16(const chan_t &c0, size_t off, bool ok, uint2 &raw, unsigned &rsc) {
+    raw = make_uint2(0u, 0u); rsc = 0u;
+    if (ok) {
+        const uint8_t *src = (const uint8_t *)c0.p + off * c0.rb;
+        raw = c0.bw == 8 ? make_uint2(__ldg((const unsigned *)src), 0u) : __ldg((const uint2 *)src);   /* 8 / 16 channels: 4 / 8 bytes */
+        rsc = c0.sp[off];
+    }
+}
 static inline int lp_dtype_check(const char *fn, int xbf, int ybf) {
     if (xbf != ybf) { fprintf(stderr, "%s: mixed activation types (x bf16 %d, y bf16 %d) are not instantiated\n", fn, xbf, ybf); abort(); }
     return xbf;
