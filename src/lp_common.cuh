@@ -804,8 +804,25 @@ static inline size_t fepi16_scr(size_t fixed, size_t scr, int cout, const split_
 /* Forward epilogue straight from the accumulators: bias, optional accumulate into y (sp.accum), channel-split
    output (sp.y2), optional GroupNorm statistics of the output (osum, per (n, group) sums reduced in smem). Warp row r
    of NR maps to z = oz0 + wz * NR/2 + r/2, y = oy0 + wr + r%2. */
-template <int MT, int NR, typename T, bool FST = false, bool E16 = (MT == 1)>   /* FST: try the shared-memory MX store paths (they check their own requirements);
-                                                                                E16: compile fwd_epi_mx16 (one-tile kernels; MT 2: register pressure) */
+/* OWN epilogues (below): the block's GN statistics live in the scratch's first 2 BM floats across all its tiles; zeroed once before
+   the first tile (then a barrier) and added to osum once after the last (fwd_stats_flush), instead of a zero, a flush and three
+   barriers per tile */
+template <int BM> __device__ __forceinline__ void fwd_stats_zero(unsigned char *scr) { for (int i = threadIdx.x; i < 2 * BM; i += blockDim.x) ((float *)scr)[i] = 0.f; }
+template <int BM> __device__ __forceinline__ void fwd_stats_flush(const unsigned char *scr, double *osum, int n, int co0, int Co, int Go) {
+    __syncthreads();
+    const float *cs = (const float *)scr;
+    if (threadIdx.x < BM && co0 + (int)threadIdx.x < Co) {
+        const int cpg = Co / Go, ng = n * Go + (co0 + threadIdx.x) / cpg;
+        atomicAdd(&osum[2 * ng], (double)cs[threadIdx.x]);
+        atomicAdd(&osum[2 * ng + 1], (double)cs[BM + threadIdx.x]);
+    }
+}
+template <int MT, int NR, typename T, bool FST = false, bool E16 = (MT == 1), bool OWN = false>   /* FST: try the shared-memory MX store paths (they check
+                                                                                their own requirements); E16: compile fwd_epi_mx16 (one-tile kernels; MT 2:
+                                                                                register pressure); OWN: the scratch is the kernel's own (nothing staged or
+                                                                                read by the MMA under it, no other output tile), the statistics accumulate
+                                                                                across the block's tiles (fwd_stats_zero / fwd_stats_flush), fwd_epi_mx16's
+                                                                                per-warp buffers need no barrier */
 __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigned char *smem_raw, T *y, const float *b, int n, int co0, int Co,
                                              int D, int H, int W, int oz0, int oy0, int ox0, int wz, int wr, double *osum, int Go, const split_t &sp, int N = 0,
                                              unsigned scr_off = 0) {   /* smem_raw: the scratch, scr_off bytes into the dynamic smem */
@@ -813,7 +830,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int zs0 = sp.zlo, zs1 = D - sp.zhi;   /* statistics over the z planes this GPU owns (spatial split) */
     float *cs = (float *)smem_raw;
-    if (osum) { __syncthreads(); for (int i = threadIdx.x; i < 2 * BM; i += blockDim.x) cs[i] = 0.f; __syncthreads(); }
+    if (osum && !OWN) { __syncthreads(); for (int i = threadIdx.x; i < 2 * BM; i += blockDim.x) cs[i] = 0.f; __syncthreads(); }
     bool mx_done = false, st_done = false;
     if constexpr (IS_MX(T) && FST && MT % 2 == 0) {
         unsigned dsm; asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dsm));
@@ -842,7 +859,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
             if (cl < Ct && (cl != 0 || mx_bw(Ct) != 16)) fit = false;
         }
         if (fit) {
-            __syncthreads();   /* every warp is past its MMA loop: the scratch is free */
+            if constexpr (!OWN) __syncthreads();   /* every warp is past its MMA loop: the scratch is free */
             float *tb = (float *)(smem_raw + 512);
             if (dsm >= scr_off + FEPI16_SCR(16)) fwd_epi_mx16<16>(acc, tb, cs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
             else fwd_epi_mx16<8>(acc, tb, cs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
@@ -1057,7 +1074,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                 if (t == 0) { atomicAdd(&cs[m * 16 + g + 8 * h], ps); atomicAdd(&cs[BM + m * 16 + g + 8 * h], pss); }
             }
         }
-    if (osum) {
+    if (osum && !OWN) {
         __syncthreads();
         if (threadIdx.x < BM && co0 + (int)threadIdx.x < Co) {
             int cpg = Co / Go, ng = n * Go + (co0 + threadIdx.x) / cpg;

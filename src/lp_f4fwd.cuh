@@ -440,6 +440,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
     }
     for (int i = threadIdx.x; i < 9 * BM; i += 256) was[i] = __ldg((const unsigned *)wsc + (size_t)(i / BM) * Cop + co0 + i % BM);
     if (threadIdx.x < 32) ctab[threadIdx.x] = make_chan(threadIdx.x < 16 ? (int)threadIdx.x : -1, Ci, Ci, n, plane, x, sp, gp, N);
+    if (osum) fwd_stats_zero<BM>(scr);   /* the block's statistics over all its z tiles (OWN epilogue) */
     __syncthreads();
 #if F4R_PROF
     long long t_prev = clock64();
@@ -551,9 +552,10 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
     __syncthreads();
 #endif
     F4RP(3);
-    fwd_epilogue<MT, NR, TO, true, MT <= 2>(acc, scr, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N, f4p_scr_off<MT, TZ>());
+    fwd_epilogue<MT, NR, TO, true, MT <= 2, true>(acc, scr, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N, f4p_scr_off<MT, TZ>());
     F4RP(5);
     }
+    if (osum) fwd_stats_flush<BM>(scr, osum, n, co0, Co, Go);
 #if F4R_PROF
     if (threadIdx.x == 0) atomicAdd(&g_f4r_prof[7], 1ull);
 #endif
