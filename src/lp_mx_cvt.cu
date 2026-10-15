@@ -67,6 +67,46 @@ extern "C" void lp_h16_to_mx4(const void *x, int dt, int N, int C, size_t S, voi
     else f32_to_mx_k<4, bf16><<<nblk_(n, 256), 256>>>((const bf16 *)x, (uint8_t *)y, N, C, S);
     LPCK();
 }
+/* train --gpu-input (nn.h nn_input_rad): the 4 input channels of sample.c write_x from the 16-bit CT channel and the sample's radial
+   record, each rounded to the 16-bit type, then one MX row of 8 channels (4..7 zero) as f32_to_mx_k. The radial vector with IEEE
+   intrinsics (the build uses -use_fast_math, which would contract dy dy + dx dx and approximate sqrt / division): the host's ISO C
+   float expressions (no contraction), bit for bit. */
+template <typename TI> __device__ __forceinline__ float rnd16(float v);
+template <> __device__ __forceinline__ float rnd16<__half>(float v) { return __half2float(__float2half_rn(v)); }
+template <> __device__ __forceinline__ float rnd16<bf16>(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
+template <int B, typename TI>
+__global__ void input_rad_k(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int D, int P, uint8_t *y) {
+    const size_t S = (size_t)D * P * P, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * S) return;
+    const int n = (int)(i / S); const size_t v = i % S;
+    const int *h = (const int *)(recs + (size_t)n * rec_bytes);
+    const float *cyz = (const float *)(h + 8), *cxz = cyz + h[2];
+    const int o1 = h[0], o2 = h[1], hasax = h[4], pf = h[5];
+    const int io[3] = {(int)(v / ((size_t)P * P)), (int)((v / P) % P), (int)(v % P)}, nd[3] = {D, P, P};
+    int s[3] = {0, 0, 0};
+#pragma unroll
+    for (int d = 0; d < 3; d++) { const int pd = (pf >> (2 * d)) & 3; s[pd] = (pf >> (8 + d)) & 1 ? nd[d] - 1 - io[d] : io[d]; }   /* output axis d reads source axis perm[d] */
+    float comp[3] = {0.f, 0.f, 0.f};
+    if (hasax) {
+        const float dy = __fsub_rn((float)(o1 + s[1]), cyz[s[0]]), dx = __fsub_rn((float)(o2 + s[2]), cxz[s[0]]);
+        const float inv = __fdiv_rn(1.f, __fadd_rn(__fsqrt_rn(__fadd_rn(__fmul_rn(dy, dy), __fmul_rn(dx, dx))), 1e-6f));
+        comp[1] = __fmul_rn(dy, inv); comp[2] = __fmul_rn(dx, inv);
+    }
+    float r[32];
+#pragma unroll
+    for (int k = 0; k < 32; k++) r[k] = 0.f;
+    r[0] = ldx(ct, i);
+#pragma unroll
+    for (int d = 0; d < 3; d++) r[1 + d] = rnd16<TI>(__fmul_rn((pf >> (8 + d)) & 1 ? -1.f : 1.f, comp[(pf >> (2 * d)) & 3]));   /* sign x component (signed zeros as the host) */
+    mx_store_row_b<B>(y, mx_sc<B>(y, N, 4, S), i, 8, r);
+}
+extern "C" void lp_input_rad(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int D, int P, void *y, int bits) {
+    const size_t n = (size_t)N * D * P * P;
+    const uint8_t *rr = (const uint8_t *)rec; uint8_t *yy = (uint8_t *)y;
+    if (bits == 4) { if (dt == 2) input_rad_k<4, __half><<<nblk_(n, 256), 256>>>((const __half *)ct16, rr, rec_bytes, N, D, P, yy); else input_rad_k<4, bf16><<<nblk_(n, 256), 256>>>((const bf16 *)ct16, rr, rec_bytes, N, D, P, yy); }
+    else { if (dt == 2) input_rad_k<8, __half><<<nblk_(n, 256), 256>>>((const __half *)ct16, rr, rec_bytes, N, D, P, yy); else input_rad_k<8, bf16><<<nblk_(n, 256), 256>>>((const bf16 *)ct16, rr, rec_bytes, N, D, P, yy); }
+    LPCK();
+}
 /* MX -> fp32 [n][C][S] (tests) */
 template <int B>
 __global__ void mx_to_f32_k(const uint8_t *x, float *y, int N, int C, size_t S) {

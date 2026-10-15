@@ -82,7 +82,7 @@ int main(void) {
         for (int si = 0; si < 48; si++) {
             sym y = sym_of(si);
             write_x_ref(ct, P, o, 101.5, 37.25, cy, cx, y, 1.1f, -0.05f, A);
-            write_x(ct, P, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.f, &r, nrow, 0, B, nullptr, nullptr, nullptr, nullptr);
+            write_x(ct, P, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.f, &r, nrow, 0, B, nullptr, nullptr, nullptr, nullptr, 0);
             for (size_t k = 0; k < 4 * p3; k++) { double d = fabs((double)A[k] - B[k]); if (d > worst) worst = d; }
         }
         printf("fused input writer vs old path, 48 symmetries: max abs diff %.3g\n", worst);
@@ -105,7 +105,7 @@ int main(void) {
             for (int si = 0; si < 48; si++) for (int fmt = 0; fmt < 2; fmt++) {
                 sym y = sym_of(si); rng r1 = r, r2 = r;
                 write_x_aug(ct, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.02f, &r1, nrow, fmt, A, HA, &ap, ns1, ns1 + P, nullptr, nullptr);
-                write_x(ct, P, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.02f, &r2, nrow, fmt, B, HB, &ap, ns2, ns2 + P);
+                write_x(ct, P, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.02f, &r2, nrow, fmt, B, HB, &ap, ns2, ns2 + P, 0);
                 ndiff += fmt ? (size_t)(memcmp(HA, HB, 4 * p3 * 2) != 0) : (size_t)(memcmp(A, B, 4 * p3 * 4) != 0);
             }
         }

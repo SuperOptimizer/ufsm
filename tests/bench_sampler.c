@@ -40,6 +40,7 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_BENCH_SIDE")) c.side = atoi(getenv("UFSM_BENCH_SIDE"));
     if (getenv("UFSM_BENCH_NEAR")) c.phase_near_um = (float)atof(getenv("UFSM_BENCH_NEAR"));   /* --phase-near-um */
     if (getenv("UFSM_BENCH_PZ")) c.Pz = atoi(getenv("UFSM_BENCH_PZ"));
+    if (getenv("UFSM_BENCH_GPUIN")) c.gpu_input = 1;   /* train --gpu-input: the CT channel and radial records only (hashed as such) */
     const int Pz = c.Pz > 0 ? c.Pz : P;   /* task unwrap's phase (no band affinities): the side array is hashed too */
     if (getenv("UFSM_BENCH_COVER")) {
         cover_plan *plan = cover_load(getenv("UFSM_BENCH_COVER"), S, P); if (!plan) return 1;
@@ -75,13 +76,13 @@ int main(int argc, char **argv) {
         printf("dumped %s-*.pgm: um / cutoff code %g, corner %lld %lld %lld\n", pre, b->um[0], (long long)b->corner[0][0], (long long)b->corner[0][1], (long long)b->corner[0][2]);
         free(img); sampler_release(sp, b);
     }
-    for (int i = 0; i < 4; i++) { batch *b = sampler_next(sp); if (!b) return 1; if (hashing) { h = hash(h, b->x16, (size_t)c.B * 4 * p3 * 2); h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); } sampler_release(sp, b); }   /* warm-up */
+    for (int i = 0; i < 4; i++) { batch *b = sampler_next(sp); if (!b) return 1; if (hashing) { h = hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); } sampler_release(sp, b); }   /* warm-up */
     size_t side_known = 0, side_all = 0;   /* phase voxels known (UFSM_BENCH_SIDE=2) */
     double t0 = now();
     for (int i = 0; i < NB; i++) {
         batch *b = sampler_next(sp); if (!b) return 1;
         if (b->side) for (size_t k = 0; k < (size_t)c.B * p3; k++) { side_known += b->side[k] < 252; side_all++; }
-        if (hashing) { h = hash(h, b->x16, (size_t)c.B * 4 * p3 * 2); h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); }
+        if (hashing) { h = hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); }
         sampler_release(sp, b);
     }
     double dt = now() - t0;

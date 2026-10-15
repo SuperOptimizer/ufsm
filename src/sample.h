@@ -76,7 +76,12 @@ typedef struct {
     const struct papyrus_cfg *papyrus; /* task papyrus (src/papyrus.h; nullptr = off): no target reads; channel 0 = papyrus labels from the
                                 patch's clean CT at a random cutoff (before the scanner augmentation); batch.um then holds that cutoff in
                                 input units ((t - mean) / sd, times the intensity jitter: the conditioning code) instead of a voxel size */
+    int gpu_input;           /* train --gpu-input (needs xfmt and sample_gpu_input_ok): batch.x16 holds the CT channel only and batch.rad
+                                each sample's radial record (nn.h nn_input_rad builds the 4 input channels on the device, bit for bit) */
 } sample_cfg;
+/* the configurations whose every sample takes write_x (no warp, sheet prior, slab appearance plan, aux or condition channels): the
+   radial channels then follow from the window's corner, symmetry and axis centres alone */
+int sample_gpu_input_ok(const sample_cfg *c);
 
 typedef struct {
     float *x;                /* B x 4 x P^3: z-scored CT, radial z (0), radial y, radial x; nullptr when cfg.xfmt */
@@ -94,6 +99,8 @@ typedef struct {
     uint8_t *pm;             /* B x P^3 papyrus mask (1 where CT > 0) when cfg.pmask */
     uint8_t *wind;           /* B x P^3 winding mod 14 + gauge (band.h band_winding encoding, 255 unknown) when cfg.cond */
     uint8_t *pap;            /* B x P^3 papyrus labels when cfg.pap_head: 0 void, 1 papyrus, 255 ignored */
+    void *rad;               /* cfg.gpu_input: B radial records of NN_RAD_REC(Pz) bytes (nn.h), x / x16 then one channel per sample */
+    int xch;                 /* input channels stored per sample in x / x16 (4, 5 with aux, 7 with cond, 1 with gpu_input) */
 } batch;
 
 typedef struct sampler sampler;
@@ -120,3 +127,7 @@ void pool2_u8(const uint8_t *in, int n, uint8_t *out);
 /* --cond: one sample's condition and gauge-shifted winding (src/sample.c cond_draw) with an rng seeded by seed; X: 7 x P^3 floats,
    inputs 4-6 written. Exposed for tests. */
 void sample_cond_draw(uint64_t seed, int P, const uint8_t *w, uint8_t *wout, float *X, int outside);
+/* --gpu-input: write_x of one D x P x P window twice with the same rng seed (jitter on): H4 the four 16-bit channels (4 x D P^2), H1
+   the CT channel alone and rec its radial record (NN_RAD_REC(D) bytes). xfmt 1 fp16, 2 bf16. Exposed for tests (tests/test_gpu_input.c). */
+void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], float mean, float isd, int hasax, const float *cyz,
+                         const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed, uint16_t *H4, uint16_t *H1, void *rec);

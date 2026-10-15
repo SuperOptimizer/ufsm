@@ -156,7 +156,9 @@ static size_t P3(const sampler *sp) { return (size_t)PZ(&sp->cfg) * sp->cfg.P * 
 static batch alloc_batch(const sample_cfg *c) {
     size_t p3 = (size_t)PZ(c) * c->P * c->P;
     batch b;
-    const size_t xc = 4 + (c->aux != 0) + (c->cond ? 3 : 0);   /* input channels per sample */
+    const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0) + (c->cond ? 3 : 0);   /* input channels per sample (--gpu-input: the CT alone) */
+    b.xch = (int)xc;
+    b.rad = c->gpu_input ? nn_host_alloc((size_t)c->B * NN_RAD_REC(PZ(c))) : nullptr;
     b.x = c->xfmt ? nullptr : nn_host_alloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
     b.x16 = c->xfmt ? nn_host_alloc((size_t)c->B * xc * p3 * 2) : nullptr;
     b.t = nn_host_alloc((size_t)c->B * NCH * p3);
@@ -175,7 +177,7 @@ static batch alloc_batch(const sample_cfg *c) {
     return b;
 }
 
-static void free_batch(batch *b) { if (b->pap) nn_host_free(b->pap); if (b->wind) nn_host_free(b->wind); if (b->band) nn_host_free(b->band); if (b->side) nn_host_free(b->side); if (b->pm) nn_host_free(b->pm); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->rad) nn_host_free(b->rad); if (b->pap) nn_host_free(b->pap); if (b->wind) nn_host_free(b->wind); if (b->band) nn_host_free(b->band); if (b->side) nn_host_free(b->side); if (b->pm) nn_host_free(b->pm); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -445,8 +447,10 @@ static void f16_row(const float *v, uint16_t *h, int n) {
 [[gnu::optimize("no-math-errno")]]
 static void write_x(const uint8_t *ctu, int D, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
                     sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H,
-                    const ct_aug_plan *ap, float *noise_row_state, float *noise_plane_state) {   /* ap: the CT appearance plan (cubes, D == P), else nullptr */
+                    const ct_aug_plan *ap, float *noise_row_state, float *noise_plane_state, int ct_only) {   /* ap: the CT appearance plan (cubes, D == P), else nullptr;
+                                                                                                    ct_only (--gpu-input): channel 0 only (the same rng draws) */
     pthread_once(&g_ntab_once, ntab_init);
+    if (ct_only) hasax = 0;   /* (the radial rows are not written) */
     const size_t p3 = (size_t)D * P * P; const int nd[3] = {D, P, P};
     const float sgn[3] = {y.flip[0] ? -1.f : 1.f, y.flip[1] ? -1.f : 1.f, y.flip[2] ? -1.f : 1.f};
     float *a = malloc(9 * (size_t)P * sizeof *a);   /* rows: v0..v3, dy, dx, radial y, radial x, zero */
@@ -483,7 +487,7 @@ static void write_x(const uint8_t *ctu, int D, int P, const int64_t o[3], float 
             }
             for (int d = 0; d < 3; d++) { const float g = sgn[d], *cp = comp[y.perm[d]]; float *vd = v[1 + d]; for (int x = 0; x < P; x++) vd[x] = g * cp[x]; }
             const size_t ko = ((size_t)z * P + yy) * P;
-            for (int ch = 0; ch < 4; ch++) {
+            for (int ch = 0; ch < (ct_only ? 1 : 4); ch++) {
                 const float *vc = v[ch];
                 if (xfmt == 1) f16_row(vc, H + (size_t)ch * p3 + ko, P);
                 else if (xfmt == 2) { uint16_t *hd = H + (size_t)ch * p3 + ko; for (int x = 0; x < P; x++) hd[x] = bf16_rn(vc[x]); }
@@ -491,6 +495,28 @@ static void write_x(const uint8_t *ctu, int D, int P, const int64_t o[3], float 
             }
         }
     free(a);
+}
+/* --gpu-input: the radial record of a write_x window (nn.h NN_RAD_REC: header, then the axis centre per source z) */
+static void rad_record(void *rec, const int64_t o[3], int D, int P, int hasax, sym y, const float *cyz, const float *cxz) {
+    int32_t h[8] = {(int32_t)o[1], (int32_t)o[2], D, P, hasax != 0,
+                    y.perm[0] | y.perm[1] << 2 | y.perm[2] << 4 | (y.flip[0] != 0) << 8 | (y.flip[1] != 0) << 9 | (y.flip[2] != 0) << 10, 0, 0};
+    memcpy(rec, h, sizeof h);
+    memcpy((char *)rec + sizeof h, cyz, (size_t)D * sizeof *cyz);
+    memcpy((char *)rec + sizeof h + (size_t)D * sizeof *cyz, cxz, (size_t)D * sizeof *cxz);
+}
+int sample_gpu_input_ok(const sample_cfg *c) {
+    const int Pz = c->Pz > 0 ? c->Pz : c->P;
+    return c->xfmt != 0 && !c->aux && !c->cond && !c->sheet && !(c->augment && c->geometry_augment) && !(c->augment && c->ct_augment && Pz != c->P);
+}
+void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], float mean, float isd, int hasax, const float *cyz,
+                         const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed, uint16_t *H4, uint16_t *H1, void *rec) {
+    sym y; for (int d = 0; d < 3; d++) { y.perm[d] = perm[d]; y.flip[d] = flip[d]; }
+    float *nrow = malloc((size_t)P * sizeof *nrow);
+    rng r;
+    rseed(&r, seed); write_x(ctu, D, P, o, mean, isd, hasax, cyz, cxz, y, 1, 1.1f, 0.05f, 0.02f, &r, nrow, xfmt, nullptr, H4, nullptr, nullptr, nullptr, 0);
+    rseed(&r, seed); write_x(ctu, D, P, o, mean, isd, hasax, cyz, cxz, y, 1, 1.1f, 0.05f, 0.02f, &r, nrow, xfmt, nullptr, H1, nullptr, nullptr, nullptr, 1);
+    rad_record(rec, o, D, P, hasax, y, cyz, cxz);
+    free(nrow);
 }
 /* Continuous geometry uses source coordinates for CT, labels, q0 and the axis.
    Only valid source voxels are supervised: rotated cube corners are ignored.
@@ -1243,7 +1269,8 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         }
     }
     PROF_MARK(PS_AUGMENT);
-    const size_t xc = 4 + (c->aux != 0);
+    const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0);
+    if (c->gpu_input && (spatial.active || c->sheet || (app && Pz != P))) { fprintf(stderr, "sampler: --gpu-input needs write_x samples (sample_gpu_input_ok)\n"); abort(); }
     float *X = c->xfmt ? nullptr : b->x + (size_t)i * xc * p3;
     uint16_t *H = c->xfmt ? b->x16 + (size_t)i * xc * p3 : nullptr;
     double (*params)[4]=nullptr;
@@ -1256,7 +1283,8 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     else if (c->sheet || (app && Pz != P)) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
             X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);
     else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H,
-                 app, noise_state, noise_state ? noise_state + P : nullptr);   /* the CT appearance plan in the row-vectorised writer (cubes) */
+                 app, noise_state, noise_state ? noise_state + P : nullptr, c->gpu_input);   /* the CT appearance plan in the row-vectorised writer (cubes) */
+    if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, s->ax.n > 0, y, cyz, cxz);   /* the radial channels: on the device */
     free(params);
     if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
         uint8_t *aw = tp_get(p3, 1), *as = tp_get(p3, 0);
@@ -1465,6 +1493,7 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction) {
 }
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
+    if (cfg->gpu_input && !sample_gpu_input_ok(cfg)) { fprintf(stderr, "sampler: --gpu-input needs 16-bit batches and no warps, sheet prior, slab appearance plan, aux or condition inputs\n"); return nullptr; }
     if (cfg->erode < 0 || cfg->erode > 1 || (cfg->erode && (cfg->P < 2 || cfg->dilate || cfg->sheet))) {
         fprintf(stderr, "sampler: erode must be 0 or 1, with P >= 2, no dilation and no winding task\n"); return nullptr;
     }

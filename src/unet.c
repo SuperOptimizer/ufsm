@@ -119,6 +119,8 @@ struct unet {
     int xin_shared, xin_out, a2_stale, fwd_train;       /* training: the network input lives in dec[0].a2's buffer (host copy in between); the
                                                 buffer holds the input since a backward (a repeated backward re-runs dec[0].c2) */
     size_t xin_bytes; void *h_xin, *ev_xin[4];
+    const void *rad;                         /* unet_set_input_rad (train --gpu-input): the 16-bit input is the CT alone, these radial records
+                                                build the 4 MX input channels (nn_input_rad) */
     int a0_share, a2_out;                    /* level-0 A in dec[0].a2's buffer; enc[0].a2 on the host from its forward to dec[0]'s conv1 weight
                                                 gradient, its buffer holding the logit gradient in between (and the input in enc[0]'s backward) */
     void *h_a2, *ev_a2[4];
@@ -1064,6 +1066,7 @@ void *unet_logit_grad_scratch(unet *u, size_t bytes) {
 int unet_lean_nob(const unet *u) { return u->nob; }
 /* the logits sit in the buffer the head's backward-data writes (gout[0]: fp16 logits of the lean 2 MX-fp4 layout) */
 int unet_logits_in_gx(const unet *u) { return u->built && u->train && u->logits && u->logits == u->gout[0]; }
+void unet_set_input_rad(unet *u, const void *rec) { u->rad = rec; }
 int unet_logits_h16(const unet *u) { return u->built && u->logits_h16; }
 void unet_set_fp16_logits(unet *u, int on) {   /* takes effect at the next build */
     if (u->lh16_req == !!on) return;
@@ -1483,7 +1486,18 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     if (u->xin_inf) nn_set_storage(u->xin, u->xin_bytes, unet_input_prec());   /* enc[0].a2's buffer holds the input until enc[0].c2 */
     if (u->ctin.on) cur = nullptr;   /* unet_forward_ct: the stem builds its input per slab from the CT */
     else if (ABF && !x_h16) { if (!u->xin) u->xin = dalloc_input(u, xs); nn_f32_to_act(x, xs, u->xin); cur = u->xin; }
-    else if (x_h16 && act_mx8() && xin_mx) { if (!u->xin) u->xin = dalloc_input(u, xs); nn_h16_to_mx(x, xs, u->xin); cur = u->xin; }
+    else if (x_h16 && act_mx8() && xin_mx) {
+        if (!u->xin) u->xin = dalloc_input(u, xs);
+        if (u->rad) nn_input_rad(x, xs, u->rad, u->xin);   /* --gpu-input: x is the CT channel, the radial channels from the records */
+        else nn_h16_to_mx(x, xs, u->xin);
+        cur = u->xin;
+        if (getenv("UFSM_XIN_HASH")) {   /* diagnostic: FNV-1a of the converted input (the --gpu-input A/B compares these) */
+            const size_t nb = nn_mx_bytes(xs, unet_input_prec()); uint8_t *h = malloc(nb); nn_sync(); nn_d2h(h, u->xin, nb);
+            uint64_t f = 1469598103934665603ull; for (size_t k = 0; k < nb; k++) f = (f ^ h[k]) * 1099511628211ull;
+            fprintf(stderr, "xin hash %016llx (%zu bytes)\n", (unsigned long long)f, nb); free(h);
+        }
+    }
+    if (u->rad && !(x_h16 && act_mx8() && xin_mx && !u->ctin.on)) { fprintf(stderr, "unet_forward_x: radial input records need the 16-bit -> MX input conversion\n"); abort(); }
     for (int i = 0; i < L; i++) {
         if (i == 1 && u->r_out) nn_stream_wait(0, u->ev_r[1]);   /* the coarse levels write R: its copy out done */
         nn_set_layer(i); block_fwd(u, &u->enc[i], i, cur);
