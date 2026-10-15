@@ -1164,6 +1164,10 @@ int cmd_train(int argc, char **argv) {
                 else bs = unet_batch_scratch(d->u, 0, tbb + mbb);
             } else if (xin_b && (bs = unet_grad_scratch(d->u, goff + tbb + mbb + xbb))) xin_in = 1;
             else bs = unet_grad_scratch(d->u, goff + tbb + mbb);
+            if (d->gl_inplace && !unet_logits_h16(d->u)) {   /* the layout kept fp32 logits (narrow nets: A holds them and a 16-bit gradient) */
+                d->gl_inplace = 0;
+                if (g == 0) fprintf(stderr, "logit gradient: fp32 logits in this layout, gradient beside them instead of in place\n");
+            }
             d->gl = d->gl_inplace ? nullptr : unet_logit_grad_scratch(d->u, glb);
             if (d->gl && bs && (char *)d->gl < bs + goff + tbb + mbb + (xin_in ? xbb : 0) && (char *)d->gl + glb > bs) d->gl = nullptr;   /* never over the batch */
             d->gl_inside = d->gl != nullptr;
