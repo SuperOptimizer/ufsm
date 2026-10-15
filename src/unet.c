@@ -1062,6 +1062,8 @@ void *unet_logit_grad_scratch(unet *u, size_t bytes) {
     return u->gB[0] && u->gB_bytes >= bytes ? (void *)u->gB[0] : nullptr;
 }
 int unet_lean_nob(const unet *u) { return u->nob; }
+/* the logits sit in the buffer the head's backward-data writes (gout[0]: fp16 logits of the lean 2 MX-fp4 layout) */
+int unet_logits_in_gx(const unet *u) { return u->built && u->train && u->logits && u->logits == u->gout[0]; }
 int unet_logits_h16(const unet *u) { return u->built && u->logits_h16; }
 void unet_set_fp16_logits(unet *u, int on) {   /* takes effect at the next build */
     if (u->lh16_req == !!on) return;

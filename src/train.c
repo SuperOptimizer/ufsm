@@ -39,6 +39,7 @@ typedef struct {
     batch *pending;              /* host batch whose upload into buffer (cur ^ 1) is in flight */
     int lean;                    /* one batch buffer; logit gradient in the model's gradient buffer B */
     int gl_inside;               /* lean: the logit gradient lives in the model's gradient buffers (setup checked the batch overlap) */
+    char *bat_lo, *bat_hi;       /* lean: the batch's bytes inside the model's buffers (a logit gradient placed later must avoid them) */
     int gl_inplace;              /* the logit gradient over the fp16 logits (g_gl_inplace) */
     void *hs_lg; double *hs_ds; float hs_dice; int hs_z, hs_P;   /* head slabs (g_head_slab): fp16 logits of one slab, loss sums, recto dice, planes per slab, window width */
     int64_t cornb[2][3]; int lvlb[2];   /* level-0 corner / level of the batch in each buffer (verso dump) */
@@ -456,6 +457,17 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         d->gl_inplace = 0;
         if (!d->gl) d->gl = nn_malloc((size_t)B * g_cout * xs.d * P * P * (g_g16 ? 2 : 4));
         fprintf(stderr, "logit gradient: fp32 logits in this layout, separate gradient buffer\n");
+    }
+    if (d->gl_inplace && train && unet_logits_in_gx(d->u)) {   /* the fp16 logits sit at the start of gout[0], which the head's backward-data writes
+                                                              (MX-fp4 gradients, lean 2): an in-place gradient would be overwritten as it is read, and
+                                                              the head would see gout[0] as plain 16-bit storage. The layout's own scratch (the parked
+                                                              skip's buffer with the level-0 A share) or a separate buffer instead */
+        d->gl_inplace = 0;
+        const size_t gb = (size_t)B * g_cout * xs.d * P * P * (g_g16 ? 2 : 4);
+        void *pg = d->lean ? unet_logit_grad_scratch(d->u, gb) : nullptr;
+        if (pg && !(d->bat_lo && (char *)pg < d->bat_hi && (char *)pg + gb > d->bat_lo)) { d->gl = pg; d->gl_inside = 1; }
+        else if (!d->gl) d->gl = nn_malloc(gb);
+        fprintf(stderr, "logit gradient: the logits share the head's input-gradient buffer, gradient %s\n", d->gl_inside ? "in the layout's scratch" : "in a separate buffer");
     }
     if (d->gl_inplace && train) {   /* the losses write each element's gradient over its own logit (read first) */
         if (!g_g16) { fprintf(stderr, "in-place logit gradient: the gradient is not 16-bit (UFSM_GL_SEPARATE=1)\n"); abort(); }
@@ -1291,6 +1303,7 @@ int cmd_train(int argc, char **argv) {
             }
             d->gl = d->gl_inplace ? nullptr : unet_logit_grad_scratch(d->u, glb);
             if (d->gl && bs && (char *)d->gl < bs + goff + tbb + mbb + (xin_in ? xbb : 0) && (char *)d->gl + glb > bs) d->gl = nullptr;   /* never over the batch */
+            d->bat_lo = bs; d->bat_hi = bs ? bs + goff + tbb + mbb + (xin_in ? xbb : 0) : nullptr;
             d->gl_inside = d->gl != nullptr;
         }
         for (int i = 0; i < 2; i++) {

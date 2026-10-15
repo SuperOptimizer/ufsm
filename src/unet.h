@@ -158,6 +158,7 @@ void unet_set_wide_up_grad(int on);   /* optional larger level-0 MX8 up-gradient
 int unet_wide_up_grad(void);
 void unet_set_share_enc_a1(int on);   /* training, recompute 1: encoder blocks above the bottom keep no a1 (backward re-runs conv1 into the same-level decoder's a1) */
 int unet_share_enc_a1(void);
+int unet_logits_in_gx(const unet *u);   /* the logits share the head's input-gradient buffer (no in-place logit gradient) */
 int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp16 (lean 2 training: the logit gradient fits after them) */
 /* head slabs (training): the forward skips the 1^3 head and allocates no whole-window logits; the caller runs it per z-slab
    (unet_head_fwd_z after the forward), and the backward calls cb(ctx) at the head's step, which runs unet_head_fwd_z, the loss
