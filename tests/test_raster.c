@@ -102,6 +102,24 @@ static void volumes(const char *root) {
                 }
                 end_upsample:;
             }
+            /* binary 2 (side labels): raw codes, the pooled cell floor(g / 2^shift) (not rounded) */
+            for (int shift = 1; shift <= 2; shift++) for (int edge = 0; edge < 3; edge++) {
+                int64_t o[3] = {edge == 0 ? -3 : edge == 1 ? 127 : shape[0] * (1 << shift) - 3, 123, 251};
+                int64_t nn[3] = {9, 7, 30}; uint8_t got[9 * 7 * 30];
+                if (z3_read_label_grid(zb, 2, shift, o, nn, got, 1)) { failures++; continue; }
+                for (int z = 0; z < 9; z++) for (int y = 0; y < 7; y++) for (int x = 0; x < 30; x++) {
+                    int64_t g[3] = {o[0] + z, o[1] + y, o[2] + x}, ix[3]; int inside = 1;
+                    for (int d = 0; d < 3; d++) {
+                        inside &= g[d] >= 0 && g[d] < shape[d] * (1 << shift);
+                        ix[d] = (int64_t)floor((double)g[d] / (1 << shift));
+                        if (ix[d] < 0) ix[d] = 0;
+                        if (ix[d] >= shape[d]) ix[d] = shape[d] - 1;
+                    }
+                    uint8_t expected = inside ? b[((size_t)ix[0] * shape[1] + ix[1]) * shape[2] + ix[2]] : 0;
+                    if (got[(z * 7 + y) * 30 + x] != expected) { fprintf(stderr, "side upsample mismatch shift %d\n", shift); failures++; goto end_side; }
+                }
+                end_side:;
+            }
         }
         free(a); free(b); z3_close(za); z3_close(zb); store_close(sa); store_close(sb);
     }

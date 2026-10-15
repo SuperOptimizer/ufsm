@@ -334,6 +334,12 @@ static int64_t mask_nearest(int64_t q, int shift, int64_t size) {
     int64_t v = (q + ((int64_t)1 << (shift - 1))) >> shift;
     return v < 0 ? 0 : v >= size ? size - 1 : v;
 }
+/* the coarse cell containing fine voxel q on a pooled grid (cell a covers fine a 2^shift .. (a + 1) 2^shift - 1): side labels.
+   mask_nearest above rounds instead (cell a centred on fine a 2^shift), half a fine cell up at 2x for the voxels it rounds up */
+static int64_t pooled_cell(int64_t q, int shift, int64_t size) {
+    int64_t v = q >> shift;
+    return v < 0 ? 0 : v >= size ? size - 1 : v;
+}
 
 /* a probability target stored 2^shift coarser: trilinear between the coarse cell centres (cell j's centre sits at fine
    coordinate f j + (f - 1) / 2, a pooled grid's), clamped at the edges; separable, two interpolated coarse planes at a time */
@@ -400,27 +406,28 @@ int z3_read_label_grid(z3 *z, int binary, int shift, const int64_t o[3], const i
         return 0;
     }
     const z3_meta *m = z3_meta_of(z); int64_t f = (int64_t)1 << shift, co[3], cn[3];
+    int64_t (*near)(int64_t, int, int64_t) = binary == 2 ? pooled_cell : mask_nearest;   /* side labels: pooled grids */
     for (int d = 0; d < 3; d++) {
         if (n[d] <= 0 || m->shape[d] <= 0) return -1;
-        co[d] = mask_nearest(o[d], shift, m->shape[d]);
-        cn[d] = mask_nearest(o[d] + n[d] - 1, shift, m->shape[d]) - co[d] + 1;
+        co[d] = near(o[d], shift, m->shape[d]);
+        cn[d] = near(o[d] + n[d] - 1, shift, m->shape[d]) - co[d] + 1;
     }
     uint8_t *low = malloc((size_t)cn[0] * cn[1] * cn[2]);
     int32_t *ixm = malloc((size_t)n[2] * sizeof *ixm);   /* per output x: low-row index, -1 outside the volume */
     if (!low || !ixm) { free(low); free(ixm); return -1; }
     if (z3_read(z, co, cn, low, nthreads)) { free(low); free(ixm); return -1; }
-    for (int64_t x = 0; x < n[2]; x++) { int64_t gx = o[2] + x; ixm[x] = gx >= 0 && gx < m->shape[2] * f ? (int32_t)(mask_nearest(gx, shift, m->shape[2]) - co[2]) : -1; }
+    for (int64_t x = 0; x < n[2]; x++) { int64_t gx = o[2] + x; ixm[x] = gx >= 0 && gx < m->shape[2] * f ? (int32_t)(near(gx, shift, m->shape[2]) - co[2]) : -1; }
     /* consecutive output rows (planes) that read the same low row (plane) are copies: 2^shift of each */
     const size_t rowb = (size_t)n[1] * n[2];
     int64_t pz = -2;
     for (int64_t zc = 0; zc < n[0]; zc++) {
-        int64_t gz = o[0] + zc, iz = gz >= 0 && gz < m->shape[0] * f ? mask_nearest(gz, shift, m->shape[0]) - co[0] : -1;
+        int64_t gz = o[0] + zc, iz = gz >= 0 && gz < m->shape[0] * f ? near(gz, shift, m->shape[0]) - co[0] : -1;
         uint8_t *plane = out + (size_t)zc * rowb;
         if (zc && iz == pz) { memcpy(plane, plane - rowb, rowb); continue; }
         pz = iz;
         int64_t py = -2;
         for (int64_t y = 0; y < n[1]; y++) {
-            int64_t gy = o[1] + y, iy = gy >= 0 && gy < m->shape[1] * f ? mask_nearest(gy, shift, m->shape[1]) - co[1] : -1;
+            int64_t gy = o[1] + y, iy = gy >= 0 && gy < m->shape[1] * f ? near(gy, shift, m->shape[1]) - co[1] : -1;
             uint8_t *dst = plane + (size_t)y * n[2];
             if (y && iy == py) { memcpy(dst, dst - n[2], (size_t)n[2]); continue; }
             py = iy;

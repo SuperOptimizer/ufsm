@@ -316,7 +316,9 @@ static int g_dry = 0;
 /* UFSM_MEM_REPORT=1: unet_train_bytes prints the dry build's bytes per buffer group (g_mlab, set in build_acts) */
 static const char *g_mlab = "other";
 static struct { const char *lab; size_t b; int n; } g_mrep[64]; static int g_nmrep = 0;
+static double g_mrep_nv;   /* UFSM_MEM_REPORT=2: every allocation of the dry build, in bytes per input voxel */
 static void mrep_add(size_t b) {
+    if (g_mrep_nv > 0 && b >= 0.05 * g_mrep_nv) fprintf(stderr, "    alloc %-40s %7.2f B/voxel\n", g_mlab, b / g_mrep_nv);
     int i = 0; while (i < g_nmrep && strcmp(g_mrep[i].lab, g_mlab)) i++;
     if (i == g_nmrep) { if (g_nmrep == 64) return; g_mrep[g_nmrep].lab = g_mlab; g_mrep[g_nmrep].b = 0; g_mrep[g_nmrep].n = 0; g_nmrep++; }
     g_mrep[i].b += b; g_mrep[i].n++;
@@ -1082,7 +1084,9 @@ void *unet_batch_scratch(unet *u, size_t head, size_t tail) {
 static size_t dry_bytes(unet *u, shape5 xs, int train) {
     if (u->built) free_acts(u);
     g_dry = 1; g_nmrep = 0; g_mlab = "other";
+    g_mrep_nv = getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 2 ? (double)xs.n * xs.d * xs.h * xs.w : 0;
     build_acts(u, xs, train);
+    g_mrep_nv = 0;
     const size_t b = u->act_bytes;
     if (ufsm_env_on("UFSM_MEM_REPORT")) {
         const double nv = (double)xs.n * xs.d * xs.h * xs.w;
