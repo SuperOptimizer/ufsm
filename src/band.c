@@ -231,16 +231,19 @@ int band_field_side_pair(const uint8_t *codes, const int n[3], float rmax, int m
             }
             if (best < 0 || dq[best] > r2) continue;
             const int ca = codes[id[best][i]];   /* the nearest wrap: winding k */
-            int bound = 0; float bd = INFINITY;   /* the nearest wrap in the opposite direction: the other end of the voxel's interval */
+            int bm = 0, sm = 0; float bd = INFINITY, sd = INFINITY;   /* the nearest other wrap in the opposite / the same direction, its winding step */
             for (int q = 0; q < 4; q++) {
                 if (q == best || dq[q] > o2) continue;
-                const int dc = band_diff(codes[id[q][i]], ca);
-                const int step = abs(dc - BAND_STEPS) <= 5 ? 1 : abs(dc + BAND_STEPS) <= 5 ? -1 : abs(dc - 2 * BAND_STEPS) <= 5 ? 2 : abs(dc + 2 * BAND_STEPS) <= 5 ? -2 : 0;
-                if (!step) continue;   /* the same sheet (codes across a turn boundary) or not a near winding */
+                const int dc = band_diff(codes[id[q][i]], ca), m = (int)lrintf((float)dc / BAND_STEPS);
+                if (!m || abs(dc - m * BAND_STEPS) > 5) continue;   /* the same sheet (codes across a turn boundary) or off a whole turn */
                 const float dot = v[q][0] * v[best][0] + v[q][1] * v[best][1] + v[q][2] * v[best][2];
-                if (dot < -0.3f * sqrtf(dq[q] * dq[best]) && dq[q] < bd) { bd = dq[q]; bound = step; }
+                if (dot < 0) { if (dq[q] < bd) { bd = dq[q]; bm = m; } }
+                else if (dq[q] < sd) { sd = dq[q]; sm = m; }
             }
-            side[i] = bound == 1 ? RV_RECTO : bound == -1 ? RV_VERSO : RV_UNKNOWN;   /* k .. k + 0.5 recto, k - 0.5 .. k verso; k +- 2: a missing wrap */
+            if (bm) {   /* between k and k + m: the winding position k + m d_k / (d_k + d_b); recto in the first half of every winding */
+                const float da = sqrtf(dq[best]), db = sqrtf(bd), w = (float)bm * da / (da + db);
+                side[i] = w - floorf(w) < 0.5f ? RV_RECTO : RV_VERSO;
+            } else if (sm) side[i] = sm > 0 ? RV_VERSO : RV_RECTO;   /* nothing on its side within reach: the side of k away from its neighbours */
         }
     }
     free(seed); free(d2); for (int q = 0; q < 4; q++) free(id[q]);

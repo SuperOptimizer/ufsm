@@ -49,9 +49,11 @@ int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint
 /* Recto / verso side of every voxel from the labelled recto faces alone (no axis): between consecutive windings k and k + 1 the
    half nearer k is the recto side, the half nearer k + 1 the verso side (each wrap's label leaves it on its outer side only:
    wrap 10 .. 10.5 recto, 10.5 .. 11 verso); labelled voxels recto. The nearest labelled voxel of each winding class mod 4: the
-   nearest overall is wrap k, the nearest of the others in the opposite direction ends the voxel's interval: k + 1 recto, k - 1
-   verso, k +- 2 unknown (a missing wrap between). Codes within 5 steps of k's are k's own sheet (across a turn boundary of the
-   codes), not a neighbour. Also unknown: no bounding wrap within 2 rmax, the nearest wrap over rmax label voxels away. */
+   nearest overall is wrap k; the nearest other wrap in the opposite direction, winding k + m, bounds the voxel: its winding position
+   k + m d_k / (d_k + d_k+m), recto in the first half of each winding (m = +-1 the rule above; |m| >= 2 a gap of missing wraps
+   interpolated). No wrap on the voxel's side within 2 rmax (a hole or an unsegmented sheet in the published meshes): the side of k
+   away from its other neighbours (they are k + 1: verso, k - 1: recto). Codes within 5 steps of k's are k's own sheet (across a turn
+   boundary of the codes). Unknown only with no labelled voxel within rmax, or no neighbouring winding within 2 rmax. */
 enum { RV_UNKNOWN = 0, RV_VERSO = 1, RV_RECTO = 2 };
 int band_field_side_pair(const uint8_t *codes, const int n[3], float rmax, int margin, uint8_t *side);   /* margin: voxels within it of the array edge are left unknown (a caller's halo) */
 
