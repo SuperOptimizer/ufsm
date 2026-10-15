@@ -324,7 +324,6 @@ __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t 
                                                             float *__restrict__ gbsum, int N, int C, int G, int D, int H, int W, unsigned gsr, unsigned rsr) {
     constexpr int BW = 32;
     __shared__ __align__(16) __nv_bfloat16 v[8][BW][40];   /* bf16 (its 2^-9 rounding far below the fp4 SR that follows): 3 blocks / SM */
-    __shared__ __align__(16) uint8_t recb[BW][GREC];
     __shared__ float4 cf[32];
     __shared__ float bred[BW];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -409,15 +408,13 @@ __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t 
             const uint64_t vid = ((((uint64_t)n * C + co) * D + z) * H + (2 * yp + (f >> 1))) * (uint64_t)W + 16 * xb + 8 * (f & 1);
             uint32_t hh[4];
             sr_hash4(rsr, vid, hh);
-            *(unsigned *)(recb[c] + warp * 16 + 4 * f) = sr_e2m1_word(qq, m, hh);
-            if (f == 0) recb[c][128 + warp] = (uint8_t)(e + 127);
+            /* straight to the record (the warp's 16 bytes of channel c, its scale byte): no block gather, no barriers per group
+               (L2 merges the partial sectors of the 8 warps' slices) */
+            uint8_t *rec = out + ((((size_t)n * C + co) * ZT + zt) * TY + ty) * Wb * GREC + (size_t)xb * GREC;
+            *(unsigned *)(rec + warp * 16 + 4 * f) = sr_e2m1_word(qq, m, hh);
+            if (f == 0) rec[128 + warp] = (uint8_t)(e + 127);
         }
-        __syncthreads();
-        for (int i = threadIdx.x; i < BW * (GREC / 8); i += blockDim.x) {
-            const int c = i / (GREC / 8), w8 = i % (GREC / 8), co = cb * BW + c;
-            *(uint2 *)(out + ((((size_t)n * C + co) * ZT + zt) * TY + ty) * Wb * GREC + (size_t)xb * GREC + 8 * w8) = *(const uint2 *)(recb[c] + 8 * w8);
-        }
-        __syncthreads();
+        __syncwarp();   /* v is rewritten by the next group */
     }
 #pragma unroll
     for (int k = 0; k < 4; k++) {

@@ -180,6 +180,27 @@ int main(int argc, char **argv) {
             nn_storage_forget(x); nn_storage_forget(gy); nn_storage_forget(gx);
             nn_free(x); nn_free(gy); nn_free(gx); nn_free(gm); nn_free(bt); nn_free(gg); nn_free(gb2); nn_free(scr);
         }
+        {   /* the training path: MX-fp4 gy / gx, 32 channels at P: statistics + the apply that also writes the fp4 wgrad's gy records
+               (lp_gn_silu_bwd_apply_rec; run with UFSM_SR=1 as the trainer) */
+            const int C = 32; shape5 s = {1, C, P, P, P};
+            void *x = mx(4, C, S, 2.f, 91), *gy = mx(4, C, S, 1e-3f, 92);
+            const size_t b4 = lp_mx4_bytes(1, C, S);
+            void *gx = nn_malloc(b4);
+            nn_set_storage(x, b4, 4); nn_set_storage(gy, b4, 4); nn_set_storage(gx, b4, 4);
+            float *gm = rnd(C, 1.f, 95), *bt = rnd(C, 0.5f, 96), *gg = nn_malloc(C * 4), *gb2 = nn_malloc(C * 4), *scr = nn_malloc(nn_gn_scratch(s) + 4096);
+            nn_set_prec(3);
+            double best = 1e9;
+            for (int it = 0; it < 10; it++) {
+                nn_set_sr_step(77);   /* the same SR draws every call (the hashes compare runs) */
+                nn_sync(); double t0 = now(); nn_gn_silu_bwd(x, s, G, gm, bt, mean, rstd, gy, gx, gg, gb2, scr); nn_sync();
+                if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+            }
+            const size_t nrec = (size_t)C * ((P + 1) / 2) * ((P + 7) / 8) * ((P + 15) / 16) * 136;
+            printf("%-32s @%d %8.3f ms  gx %016llx  records %016llx (%s)\n", "gn+silu bwd 32 ch mx4 + records", P, best, (unsigned long long)fnv(gx, b4),
+                   g_gyrec.valid && g_gyrec.cap >= nrec ? (unsigned long long)fnv(g_gyrec.rec, nrec) : 0ull, g_gyrec.valid ? "rec path" : "NO records");
+            nn_storage_forget(x); nn_storage_forget(gy); nn_storage_forget(gx);
+            nn_free(x); nn_free(gy); nn_free(gx); nn_free(gm); nn_free(bt); nn_free(gg); nn_free(gb2); nn_free(scr);
+        }
     }
     if (want("f8w")) {   /* fp8 weight gradients at level 0: down0 (stride 2, MX-fp4 x level 0 -> MX-fp8 gy level 1, 16 -> 16) and the stem
            (enc0.c1: MX-fp8 4-channel input, MX-fp8 gy, SR) */
