@@ -110,13 +110,13 @@ static const int ffz_fill[10] = {128, 128, 0, 0, 0, 0, 0, 0, 0, 0};
 /* host field slab slab (FZ cells in z from slab FZ, FZ a multiple of the field shard FS; planes past F[0] not held) -> its rows of
    shards, the shards compressed and written on threads (a 128^3 field shard is one chunk, so z3w_write_shard alone is one thread:
    the 10 arrays of a 256 x 2048 x 2048 box took 163 s) */
-typedef struct { z3w *const *zw; uint8_t *const *sl; int64_t slab; const int *F; int FS, FZ, nq, ny, nx; _Atomic int next, fail; } ffz_job;
-static void *ffz_worker(void *a) {
+typedef struct { z3w *const *zw; uint8_t *const *sl; int64_t slab; const int *F; int FS, FZ, nrow, nx; const int *rq, *ry; _Atomic int next, fail; } ffz_job;
+static void *ffz_worker(void *a) {   /* jobs: (array k, field-shard row (q, fsy) of the list, fsx) */
     ffz_job *J = a; const int FS = J->FS, *F = J->F; uint8_t *sb = malloc((size_t)FS * FS * FS);
-    const int njob = 10 * J->nq * J->ny * J->nx;
+    const int njob = 10 * J->nrow * J->nx;
     for (;;) {
         const int t = atomic_fetch_add(&J->next, 1); if (t >= njob || atomic_load(&J->fail)) break;
-        const int k = t / (J->nq * J->ny * J->nx), q = t / (J->ny * J->nx) % J->nq, fsy = t / J->nx % J->ny, fsx = t % J->nx;
+        const int k = t / (J->nrow * J->nx), r = t / J->nx % J->nrow, fsx = t % J->nx, q = J->rq[r], fsy = J->ry[r];
         const int64_t fsz = J->slab * (J->FZ / FS) + q;
         memset(sb, ffz_fill[k], (size_t)FS * FS * FS);
         for (int a2 = 0; a2 < FS && fsz * FS + a2 < F[0]; a2++) for (int b = 0; b < FS && (int64_t)fsy * FS + b < F[1]; b++) {
@@ -127,31 +127,61 @@ static void *ffz_worker(void *a) {
     }
     free(sb); return nullptr;
 }
-static int ffz_flush(z3w *const zw[10], uint8_t *const sl[10], int64_t slab, const int F[3], int FS, int FZ) {
+/* field-shard rows (q, fsy) of the slab in [q0, q1) x [y0, y1) not yet written (done: [FZ / FS][ny] per slab, marked here); reset:
+   the slab is left (its buffers back to the fill values, done cleared) */
+static int ffz_flush(z3w *const zw[10], uint8_t *const sl[10], int64_t slab, const int F[3], int FS, int FZ, int q0, int q1, int y0, int y1, uint8_t *done, int reset,
+                     int ntmax) {   /* ntmax: compression threads (0: every CPU) */
+    const int ny = (F[1] + FS - 1) / FS;
     int nq = 0; for (int q = 0; q < FZ / FS; q++) if ((slab * (FZ / FS) + q) * FS < F[0]) nq = q + 1;
-    ffz_job J = {.zw = zw, .sl = sl, .slab = slab, .F = F, .FS = FS, .FZ = FZ, .nq = nq, .ny = (F[1] + FS - 1) / FS, .nx = (F[2] + FS - 1) / FS};
+    if (q1 > nq) q1 = nq;
+    if (y1 > ny) y1 = ny;
+    int *rq = malloc(sizeof(int) * (size_t)(FZ / FS) * ny * 2), *ry = rq + (size_t)(FZ / FS) * ny, nrow = 0;
+    if (!rq) return -1;
+    for (int q = q0; q < q1; q++) for (int y = y0; y < y1; y++) if (!done[(size_t)q * ny + y]) { done[(size_t)q * ny + y] = 1; rq[nrow] = q; ry[nrow] = y; nrow++; }
+    ffz_job J = {.zw = zw, .sl = sl, .slab = slab, .F = F, .FS = FS, .FZ = FZ, .nrow = nrow, .nx = (F[2] + FS - 1) / FS, .rq = rq, .ry = ry};
     atomic_store(&J.next, 0); atomic_store(&J.fail, 0);
-    long nt = sysconf(_SC_NPROCESSORS_ONLN); if (nt > 64) nt = 64; if (nt < 1) nt = 1;
+    long nt = sysconf(_SC_NPROCESSORS_ONLN); if (ntmax > 0 && nt > ntmax) nt = ntmax; if (nt > 64) nt = 64; if (nt < 1) nt = 1;
     pthread_t th[64]; int up[64] = {0};
     for (int i = 1; i < nt; i++) up[i] = pthread_create(&th[i], nullptr, ffz_worker, &J) == 0;
     ffz_worker(&J);
     for (int i = 1; i < nt; i++) if (up[i]) pthread_join(th[i], nullptr);
+    free(rq);
     if (atomic_load(&J.fail)) return -1;
+    if (!reset) return 0;
     const int64_t held = F[0] < FZ ? F[0] : FZ;
     for (int k = 0; k < 10; k++) memset(sl[k], ffz_fill[k], (size_t)held * F[1] * F[2]);
+    memset(done, 0, (size_t)(FZ / FS) * ny);
     return 0;
 }
 
 /* --fit-zarr host side off the main thread: per window chunk the device fields (10 B per cell, 1.3 GB for a 512^3 interior at
    --fit-h 1) go to pinned memory on the offload stream; one thread waits for each copy, scatters it into the slab buffers and
    flushes slabs in queue order (both used to run on the main thread while the GPU idled). Two staging buffers. */
-typedef struct { int kind, b, c1, c2, nz, ny, nx; int64_t cz, slab; size_t nl; } ffw_job;   /* kind 0: chunk copy, 1: slab flush */
+typedef struct { int kind, b, c1, c2, nz, ny, nx; int64_t cz, slab; size_t nl; int q0, q1, y0, y1; } ffw_job;   /* kind 0: chunk copy, 1: slab flush (the rows
+                                                                                                                   left, then reset), 2: rows q0..q1 x y0..y1 */
 #define FFW_Q 256
 typedef struct {
     pthread_mutex_t mu; pthread_cond_t cv; ffw_job q[FFW_Q]; int qh, qn, stop, busy[2]; atomic_int fail;
     void *evs[2], *evd[2]; uint8_t *h[2];
     z3w **zw; uint8_t **sl; const int *F; int FS, FZ, gpu;
+    uint8_t *done;   /* the current slab's written field-shard rows [FZ / FS][ny] */
+    /* row flushes on their own thread (half the CPUs), so the scatter of window chunks never waits for compression: a queue of
+       kind-2 jobs; the slab flush (kind 1) waits for it to drain */
+    pthread_t rth; ffw_job rq[FFW_Q]; int rqh, rqn, rbusy, rstop, rnt;
 } ffw_t;
+static void *ffw_rows(void *arg) {
+    ffw_t *W = arg;
+    for (;;) {
+        pthread_mutex_lock(&W->mu);
+        while (!W->rqn && !W->rstop) pthread_cond_wait(&W->cv, &W->mu);
+        if (!W->rqn) { pthread_mutex_unlock(&W->mu); break; }
+        const ffw_job j = W->rq[W->rqh]; W->rqh = (W->rqh + 1) % FFW_Q; W->rqn--; W->rbusy = 1;
+        pthread_mutex_unlock(&W->mu);
+        if (!atomic_load(&W->fail) && ffz_flush(W->zw, W->sl, j.slab, W->F, W->FS, W->FZ, j.q0, j.q1, j.y0, j.y1, W->done, 0, W->rnt)) atomic_store(&W->fail, 1);
+        pthread_mutex_lock(&W->mu); W->rbusy = 0; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
+    }
+    return nullptr;
+}
 static void *ffw_main(void *arg) {
     ffw_t *W = arg;
     nn_init(W->gpu);
@@ -162,7 +192,16 @@ static void *ffw_main(void *arg) {
         const ffw_job j = W->q[W->qh]; W->qh = (W->qh + 1) % FFW_Q; W->qn--;
         pthread_cond_broadcast(&W->cv);
         pthread_mutex_unlock(&W->mu);
-        if (j.kind == 1) { if (!atomic_load(&W->fail) && ffz_flush(W->zw, W->sl, j.slab, W->F, W->FS, W->FZ)) atomic_store(&W->fail, 1); continue; }
+        if (j.kind == 1) {   /* the slab is left: the row flusher drained, then the rows left (all CPUs) and the reset */
+            pthread_mutex_lock(&W->mu); while (W->rqn || W->rbusy) pthread_cond_wait(&W->cv, &W->mu); pthread_mutex_unlock(&W->mu);
+            if (!atomic_load(&W->fail) && ffz_flush(W->zw, W->sl, j.slab, W->F, W->FS, W->FZ, 0, W->FZ / W->FS, 0, 1 << 30, W->done, 1, 0)) atomic_store(&W->fail, 1);
+            continue;
+        }
+        if (j.kind == 2) {   /* to the row flusher (its chunks are scattered: FIFO) */
+            pthread_mutex_lock(&W->mu); while (W->rqn == FFW_Q) pthread_cond_wait(&W->cv, &W->mu);
+            W->rq[(W->rqh + W->rqn) % FFW_Q] = j; W->rqn++; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
+            continue;
+        }
         nn_event_sync(W->evd[j.b]);
         const uint8_t *hb = W->h[j.b];
         for (int a = 0; a < j.nz; a++) for (int b = 0; b < j.ny; b++) for (int k = 0; k < 10; k++)
@@ -188,6 +227,8 @@ static int ffw_acquire(ffw_t *W) {   /* a free staging buffer (its previous copy
 static int ffw_finish(ffw_t *W, pthread_t th) {
     pthread_mutex_lock(&W->mu); W->stop = 1; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
     pthread_join(th, nullptr);
+    pthread_mutex_lock(&W->mu); W->rstop = 1; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
+    pthread_join(W->rth, nullptr);
     return atomic_load(&W->fail);
 }
 
@@ -674,7 +715,7 @@ int cmd_predict(int argc, char **argv) {
     int64_t nss[3]; for (int d = 0; d < 3; d++) nss[d] = (ns[d] + kss - 1) / kss;
     float *ffacc = nullptr; int ffbox[3], ffF[3]; size_t ffn = 0;
     z3w *ffzw[10] = {0}; uint8_t *ffsl[10] = {0}; const int FFS = 128; int FZ = FFS; int64_t ffslab = 0; uint8_t *ff8d = nullptr, *ff8h = nullptr; size_t ffwn = 0; int ffwc = 0, ffzc = 1;
-    static ffw_t ffw; pthread_t ffw_th; int ffw_on = 0;
+    static ffw_t ffw; pthread_t ffw_th; int ffw_on = 0, ffrow = 0, ffrk = 0; int64_t ffprow = -1;   /* row flushes: (super-)shard cells, the last row */
     if (ffd) {
         for (int d = 0; d < 3; d++) { ffbox[d] = (int)bn[d]; ffF[d] = (int)((bn[d] + ffh - 1) / ffh); }
         if (!ffzm) {   /* the whole box on the device */
@@ -714,9 +755,17 @@ int cmd_predict(int argc, char **argv) {
                                                                                                                   two staging buffers (the fit writer thread) */
             if (!ffacc || !ff8d || !ff8h) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }
             ffw.zw = ffzw; ffw.sl = ffsl; ffw.F = ffF; ffw.FS = FFS; ffw.FZ = FZ; ffw.gpu = gpu;
+            ffw.done = calloc((size_t)(FZ / FFS) * ((ffF[1] + FFS - 1) / FFS), 1);
+            if (!ffw.done) { fprintf(stderr, "predict: out of memory\n"); return 1; }
+            /* rows of field shards are written as soon as the windows leave their row of (super-)shards (a window writes cells of its own
+               (super-)shard only, tiles run in (super-)shard z-y-x order): only the last row's compression is left after the loop (was
+               the whole last slab: 8 of 24 s for a 256 x 2048^2 box). One worker, a (super-)shard of whole field shards; UFSM_FIT_ROWFLUSH=0 */
+            ffrk = (kss > 1 ? kss * shard : shard) / ffh;
+            ffrow = nwork == 1 && !split && ffrk % FFS == 0 && !(getenv("UFSM_FIT_ROWFLUSH") && !atoi(getenv("UFSM_FIT_ROWFLUSH")));
             for (int b = 0; b < 2; b++) { ffw.h[b] = ff8h + (size_t)b * 10 * ffwn; ffw.evs[b] = nn_event_create(); ffw.evd[b] = nn_event_create(); }
             pthread_mutex_init(&ffw.mu, nullptr); pthread_cond_init(&ffw.cv, nullptr); atomic_store(&ffw.fail, 0);
-            if (pthread_create(&ffw_th, nullptr, ffw_main, &ffw)) { fprintf(stderr, "predict: cannot start the fit writer\n"); return 1; }
+            { long nc = sysconf(_SC_NPROCESSORS_ONLN); ffw.rnt = nc > 2 ? (int)(nc / 2) : 1; }
+            if (pthread_create(&ffw_th, nullptr, ffw_main, &ffw) || pthread_create(&ffw.rth, nullptr, ffw_rows, &ffw)) { fprintf(stderr, "predict: cannot start the fit writer\n"); return 1; }
             ffw_on = 1;
         }
     }
@@ -756,7 +805,7 @@ int cmd_predict(int argc, char **argv) {
     int64_t cur_shard = -1, so[3] = {0, 0, 0}, se[3] = {0, 0, 0}, sz = 0, sy = 0, sx = 0;
     int any = 0;
     const int pprof = ufsm_env_on("UFSM_PRED_PROF");
-    double p_wait = 0, p_h2d = 0, p_gpu = 0, p_copy = 0, p_wr = 0, pt;
+    double p_wait = 0, p_h2d = 0, p_gpu = 0, p_copy = 0, p_wr = 0, p_ffw = 0, pt;
     if (split) {   /* both GPUs on every window */
         J.rd = &rd; J.WR = &WR; J.tiles = rd.tiles; J.ntiles = rd.ntiles;
         J.W = W; J.halo = halo; J.shard = shard; J.Dl = Dl; J.H0 = H0; J.kss = kss; J.h16 = h16; J.sign = (int)radial_sign;
@@ -776,6 +825,15 @@ int cmd_predict(int argc, char **argv) {
         p_wait += now() - pt;
         if (atomic_load(&rd.failed)) { fprintf(stderr, "%s\n", z3_error()); return 1; }
         const tile_t *t = &rd.tiles[i];
+        if (ffrow) {   /* a new row of (super-)shards: the previous row's field shards are final */
+            const int64_t nX = kss > 1 ? nss[2] : ns[2], nY = kss > 1 ? nss[1] : ns[1], row = t->shard / nX;
+            if (ffprow >= 0 && row != ffprow) {
+                const int64_t rz = ffprow / nY, ry = ffprow % nY, cz0 = rz * ffrk, slab = cz0 / FZ;
+                ffw_push(&ffw, (ffw_job){.kind = 2, .slab = slab, .q0 = (int)((cz0 - slab * FZ) / FFS), .q1 = (int)((cz0 - slab * FZ + ffrk) / FFS),
+                                         .y0 = (int)(ry * ffrk / FFS), .y1 = (int)((ry + 1) * ffrk / FFS)});
+            }
+            ffprow = row;
+        }
         if (kss == 1 && t->shard != cur_shard) {   /* new shard: flush the previous one */
             if (cur_shard >= 0) {
                 if (sheet_task && sheet_write_shard(out,sheet_shard,shard,sz,sy,sx)) return 1;
@@ -880,7 +938,9 @@ int cmd_predict(int argc, char **argv) {
                                              (int)(bn[1] - (int64_t)c0[1] * ffh < (int64_t)nc3[1] * ffh ? bn[1] - (int64_t)c0[1] * ffh : (int64_t)nc3[1] * ffh),
                                              (int)(bn[2] - (int64_t)c0[2] * ffh < (int64_t)nc3[2] * ffh ? bn[2] - (int64_t)c0[2] * ffh : (int64_t)nc3[2] * ffh)};
                         nn_fit_accum_dm(lg, ctd, ct_shared ? ctm : nullptr, Wz, W, hz, halo, (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz, 0, 2, 4, 10, ffds, ffdc, ffacc);
+                        const double tfa = pprof ? now() : 0;
                         const int fb = ffw_acquire(&ffw);
+                        if (pprof) p_ffw += now() - tfa;
                         uint8_t *fd = ff8d + (size_t)fb * 10 * ffwn;
                         nn_fit_finalize(ffacc, nl, ffh, fd);
                         nn_offload_copy(ffw.h[fb], fd, 10 * nl, 1, ffw.evs[fb], ffw.evd[fb]);   /* scattered into the slab by the fit writer */
@@ -951,16 +1011,19 @@ int cmd_predict(int argc, char **argv) {
             if (pprof) p_copy += now() - pt;
         }
     }
-    if (pprof) fprintf(stderr, "\npredict profile (s): main: wait-reader %.2f h2d %.2f gpu(fwd+d2h) %.2f interior-copy %.2f writer-wait %.2f | reader: read %.2f stats %.2f slot-wait %.2f | wall %.2f, %ld tiles\n",
-                       p_wait, p_h2d, p_gpu, p_copy, p_wr, rd.t_read, rd.t_stats, rd.t_wait, now() - t0, ntiles);
+    if (pprof) fprintf(stderr, "\npredict profile (s): main: wait-reader %.2f h2d %.2f gpu(fwd+d2h) %.2f interior-copy %.2f writer-wait %.2f fit-writer-wait %.2f | reader: read %.2f stats %.2f slot-wait %.2f | wall %.2f, %ld tiles\n",
+                       p_wait, p_h2d, p_gpu, p_copy, p_wr, p_ffw, rd.t_read, rd.t_stats, rd.t_wait, now() - t0, ntiles);
     if (kss == 1 && cur_shard >= 0 && any) { if (gpath) nn_d2h(sbuf, dsh, WR.bytes); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } }
     if (sheet_task && cur_shard>=0 && sheet_write_shard(out,sheet_shard,shard,sz,sy,sx)) return 1;
     if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
     if (writer_finish(&WR, wth)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     if (ffzm) {   /* the last field slabs, the axis table and fields.json (format zarr) */
         for (; ffslab * FZ < ffF[0]; ffslab++) ffw_push(&ffw, (ffw_job){.kind = 1, .slab = ffslab});
+        const double tfin = now();
         if (ffw_on && ffw_finish(&ffw, ffw_th)) { fprintf(stderr, "predict: %s\n", z3w_error()); return 1; }
+        if (pprof) fprintf(stderr, "predict profile (s): fit writer tail (the last field slabs) %.2f\n", now() - tfin);
         for (int k = 0; k < 10; k++) { z3w_close(ffzw[k]); free(ffsl[k]); }
+        free(ffw.done);
         nn_free(ffacc); nn_free(ff8d); nn_host_free(ff8h);
         char p[1400]; snprintf(p, sizeof p, "%s/fields.json", ffz); FILE *f = fopen(p, "w");
         if (!f) { fprintf(stderr, "predict: cannot write %s\n", p); return 1; }
