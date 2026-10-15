@@ -51,6 +51,7 @@ typedef struct {
     int max_level;    /* ... nor above this (-1: no limit); e.g. a teacher target whose coarser levels are only downsampled copies */
     int geometry;     /* 0: never spatially augmented (zoom / rotation / elastic) */
     int trust_band;   /* > 0: background labels are trusted only within this many level-0 voxels of an annotated surface (partial annotations) */
+    int iso;          /* > 0: the scan's void cutoff (papyrus = CT >= iso) for train --iso-void / --iso-lift (0: --iso's value) */
     z3 *ct[MAXLEV];         /* lazily opened per level */
     int ct_present[MAXLEV]; /* 1 if the level exists in the pyramid */
     int nlev;
@@ -62,6 +63,8 @@ typedef struct {
     int tgt_present[NCH][MAXLEV];
     int tgt_binary[NCH];      /* target bytes are 0/background, 255/surface; no ignore class */
     int tgt_min_level[NCH];   /* finest stored CT rung; binary targets can upsample finer requests */
+    int tgt_erode[NCH], tgt_dilate[NCH];   /* binary targets: "erode" / "dilate" N voxels at the training level (bands of every teacher the same
+                                              thickness: e.g. a thick pseudo-label band eroded to the published labels' width) */
     int tgt_prob[NCH];        /* "encoding": "prob": bytes are round(p * 255) (teacher probabilities, no ignore class); read as
                                  round(p * 254) and passed through without erode / dilate / soft / trust band */
     regions *reg[NCH];

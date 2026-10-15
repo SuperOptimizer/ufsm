@@ -278,7 +278,7 @@ static int sheet_write_shard(const char *out,const float *q,int shard,int64_t z,
    its device shard buffer and copies those planes to the host shard; side 0 hands the shard to the writer. The two job threads take
    turns on the host (split_run) and run the same sequence of collectives: the tile loop, the air decisions and the shard changes
    are identical on both. */
-typedef struct { unet *u; uint8_t *ctd, *dsh, *own; uint32_t *ctm; void *stsc; float *dyd, *rows; double *red; int cuda_bad; } pside_t;
+typedef struct { unet *u; uint8_t *ctd, *dsh, *own; uint32_t *ctm, *ctmi; void *stsc; float *dyd, *rows; double *red; int cuda_bad; } pside_t;
 typedef struct {
     pside_t s[2];
     reader_t *rd; writer_t *WR; const tile_t *tiles; long ntiles;
@@ -351,6 +351,7 @@ static void psplit_job(int side, void *arg) {
         }
         nn_h2d(S->dyd, S->rows, 2 * (size_t)Dl * sizeof(float));
         nn_pred_ctmask(S->ctd, l3, S->ctm);   /* the forward overwrites ctd */
+        if (S->ctmi != S->ctm) nn_pred_ctmask_t(S->ctd, l3, S->ctmi, nn_get_pred_iso());   /* --iso: the outputs' mask */
         const float *lg = unet_forward_ct(S->u, S->ctd, (float)mean, (float)(1.0 / sd), S->dyd, S->dyd + Dl, J->ax->n > 0 ? J->sign : 0, xs, J->h16);
         nn_set_logits_h16(unet_logits_h16(S->u));   /* (both halves build alike: the process-wide flag holds the same value) */
         if (J->kss > 1) {   /* every shard of this super-shard from the one window */
@@ -359,12 +360,12 @@ static void psplit_job(int side, void *arg) {
             for (int64_t qx = SX * k; qx < SX * k + k && qx < J->ns[2]; qx++) {
                 const int64_t qo[3] = {qz * shard, qy * shard, qx * shard}, qe[3] = {qo[0] + shard < J->bn[0] ? qo[0] + shard : J->bn[0], qo[1] + shard < J->bn[1] ? qo[1] + shard : J->bn[1], qo[2] + shard < J->bn[2] ? qo[2] + shard : J->bn[2]};
                 nn_zero(S->dsh, sh3); memset(S->own, 0, (size_t)shard);
-                nn_pred_place_mz(lg, S->ctm, W, halo, olo, ohi, zoff, (int)(t->tz - qo[0]), (int)(t->ty - qo[1]), (int)(t->tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, S->dsh);
+                nn_pred_place_mz(lg, S->ctmi, W, halo, olo, ohi, zoff, (int)(t->tz - qo[0]), (int)(t->ty - qo[1]), (int)(t->tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, S->dsh);
                 psplit_mark(S->own, shard, t->tz - qo[0], qe[0] - qo[0], ilo, ihi);
                 psplit_flush(J, side, qz, qy, qx);
             }
         } else {
-            nn_pred_place_mz(lg, S->ctm, W, halo, olo, ohi, zoff, (int)(t->tz - so[0]), (int)(t->ty - so[1]), (int)(t->tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, S->dsh);
+            nn_pred_place_mz(lg, S->ctmi, W, halo, olo, ohi, zoff, (int)(t->tz - so[0]), (int)(t->ty - so[1]), (int)(t->tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, S->dsh);
             psplit_mark(S->own, shard, t->tz - so[0], se[0] - so[0], ilo, ihi);
             any = 1;
         }
@@ -379,6 +380,7 @@ int cmd_predict(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window W] [--act-mx8 1]\n"
                         "       [--halo H] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
                         "       [--prec 0|1|2|3|4] [--policy enc0=1,...] [--f16 0|1] [--fp4 0|1] [--input-mx 0|1] [--input-prec 0|4|8] [--ema 1]   EMA or current weights (0)\n"
+                        "       [--iso T]   probability outputs 0 where CT < T (the scan's void cutoff; the fit's material mask stays CT > 0)\n"
                         "       [--ema-blend A]   a x final weights + (1 - a) x EMA (tail-average blend, e.g. 0.35)\n"
                         "       [--gn-stats stored|legacy]   defaults to the checkpoint's normalization contract\n"
                         "       [--reference reference.json]   required for a surface_winding checkpoint, native level 0\n"
@@ -435,6 +437,9 @@ int cmd_predict(int argc, char **argv) {
     if (ffz) ffd = ffz;   /* the shared checks and settings below */
     const int ffzm = ffz != nullptr;
     float q = (float)atof(opt(argc, argv, "--q", "8"));
+    const int iso = atoi(opt(argc, argv, "--iso", "0"));   /* the void cutoff: probability outputs 0 where CT < iso (the fit keeps CT > 0) */
+    if (iso < 0 || iso > 255) { fprintf(stderr, "--iso: 0..255\n"); return 2; }
+    nn_set_pred_iso(iso);
     const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
     const char *grid = opt(argc, argv, "--grid-origin", nullptr);
     int64_t grid_origin[3] = {0, 0, 0}; char grid_attrs[128] = "";
@@ -692,7 +697,7 @@ int cmd_predict(int argc, char **argv) {
     /* the 16-bit input in the network's shared a1 scratch when it has one (free until the stem conv, after the input conversion) */
     unet_build(u, xn, 0);
     const int ct_stem = unet_ct_stem(u);   /* unet_forward_ct: no 16-bit input */
-    uint8_t *ctd = nullptr; uint32_t *ctm = nullptr; void *xd = nullptr; int ct_shared = 0, xd_shared = 0;
+    uint8_t *ctd = nullptr; uint32_t *ctm = nullptr, *ctmi = nullptr; void *xd = nullptr; int ct_shared = 0, xd_shared = 0;
     pjob_t J = {0};
     split_ctx *sctx = nullptr;
     if (split) {   /* per GPU: the network on its half, the CT half in its scratch, the mask bits, a device shard */
@@ -704,7 +709,7 @@ int cmd_predict(int argc, char **argv) {
             unet_build(uk, xs, 0);
             S->u = uk; S->ctd = unet_input_scratch2(uk, l3);
             if (!unet_ct_stem(uk) || !S->ctd) { fprintf(stderr, "--split z needs the CT-stem build (UFSM_INFER_SLAB > 0, MX-fp8 stem input)\n"); return 2; }
-            S->ctm = nn_malloc((l3 + 31) / 32 * 4); S->dsh = nn_malloc(WR.bytes); S->stsc = nn_malloc(64); S->red = nn_malloc(4 * sizeof(double));
+            S->ctm = nn_malloc((l3 + 31) / 32 * 4); S->ctmi = iso > 1 ? nn_malloc((l3 + 31) / 32 * 4) : S->ctm; S->dsh = nn_malloc(WR.bytes); S->stsc = nn_malloc(64); S->red = nn_malloc(4 * sizeof(double));
             S->dyd = nn_malloc(2 * (size_t)Dl * sizeof(float)); S->rows = malloc(2 * (size_t)Dl * sizeof(float)); S->own = calloc((size_t)shard, 1);
             if (!S->ctm || !S->dsh || !S->stsc || !S->red || !S->dyd) { fprintf(stderr, "predict: out of device memory on GPU %d\n", gpus[k]); return 1; }
             fprintf(stderr, "predict: GPU %d holds window planes [%d, %d) of %d (%.1f B per voxel held, %.2f GB)\n", gpus[k], k ? W / 2 - H0 : 0, (k ? W / 2 - H0 : 0) + Dl, W, (double)unet_activation_bytes(uk) / l3, unet_activation_bytes(uk) / 1e9);
@@ -718,6 +723,7 @@ int cmd_predict(int argc, char **argv) {
         ct_shared = ctd != nullptr;
         if (!ctd) ctd = nn_malloc(w3);
         ctm = ct_shared ? nn_malloc((w3 + 31) / 32 * 4) : nullptr;
+        ctmi = ct_shared && iso > 1 ? nn_malloc((w3 + 31) / 32 * 4) : ctm;   /* --iso: the outputs' own mask (the fit keeps ctm) */
         xd = ct_stem || half || auxz || cfg.cin == 7 ? nullptr : h16 && !sheet_task ? unet_input_scratch(u, 4 * w3 * 2) : nullptr;
         xd_shared = xd != nullptr;
         if (!xd && !ct_stem) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
@@ -921,6 +927,7 @@ int cmd_predict(int argc, char **argv) {
                 nn_aux_input(auxd, w3, (char *)xd + 4 * w3 * (h16 ? 2 : 4), h16);
             }
             if (ct_shared) nn_pred_ctmask(ctd, w3, ctm);   /* the forward overwrites ctd */
+            if (ct_shared && ctmi != ctm) nn_pred_ctmask_t(ctd, w3, ctmi, iso);
             if (sheet_task) {
                 for (int z=0;z<W;z++) { double a[4]; sheet_parameters(sheet,o[0]+z,a); sheet_rows[4*z]=(float)(o[1]-a[0]); sheet_rows[4*z+1]=(float)(o[2]-a[1]); sheet_rows[4*z+2]=(float)(1/a[2]); sheet_rows[4*z+3]=(float)a[3]; }
                 nn_sheet_input(xd,W,sheet_rows,(float)sheet->center,(float)sheet->scale,h16);
@@ -986,7 +993,7 @@ int cmd_predict(int argc, char **argv) {
                 for (int64_t qx = SX * kss; qx < SX * kss + kss && qx < ns[2]; qx++) {
                     const int64_t qo[3] = {qz * shard, qy * shard, qx * shard}, qe[3] = {qo[0] + shard < bn[0] ? qo[0] + shard : bn[0], qo[1] + shard < bn[1] ? qo[1] + shard : bn[1], qo[2] + shard < bn[2] ? qo[2] + shard : bn[2]};
                     nn_zero(dsh, WR.bytes);
-                    if (ct_shared) nn_pred_place_m(lg, ctm, W, halo, (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
+                    if (ct_shared) nn_pred_place_m(lg, ctmi, W, halo, (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
                     else nn_pred_place(lg, ctd, W, halo, (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
                     writer_d2h(&WR, sb, dsh);
                     if (writer_submit(&WR, sb, qz, qy, qx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
@@ -1000,7 +1007,7 @@ int cmd_predict(int argc, char **argv) {
                 continue;
             }
             if (gpath) {   /* interior straight into the device shard buffer */
-                if (ct_shared) nn_pred_place_m_d(lg, ctm, Wz, W, hz, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
+                if (ct_shared) nn_pred_place_m_d(lg, ctmi, Wz, W, hz, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
                 else nn_pred_place_d(lg, ctd, Wz, W, hz, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
                 const char *e = nn_check();
                 if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }

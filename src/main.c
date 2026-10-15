@@ -2104,6 +2104,7 @@ static int cmd_sample(int argc, char **argv) {
     cfg.nworkers = atoi(opt(argc, argv, "--workers", "4"));
     cfg.augment = !flag(argc, argv, "--noaug");
     cfg.shell = atoi(opt(argc, argv, "--shell", "0"));
+    cfg.iso = atoi(opt(argc, argv, "--iso", "0")); cfg.iso_void = atoi(opt(argc, argv, "--iso-void", "0")); cfg.iso_pap = atoi(opt(argc, argv, "--iso-pap", "2")); cfg.iso_lift = atoi(opt(argc, argv, "--iso-lift", "0"));
     cfg.dist_sigma = (float)atof(opt(argc, argv, "--dist-head", "0"));
     int nb = atoi(opt(argc, argv, "--n", "4"));
     const char *out = opt(argc, argv, "--out", ".");

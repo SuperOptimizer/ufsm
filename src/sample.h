@@ -49,6 +49,12 @@ typedef struct {
     float phase_near_um;     /* > 0 (stored phase, side 2): the phase target only within this distance (um) of a labelled wrap voxel
                                 (target channel 0): the stored phase interpolates between published wraps, and across a missing wrap
                                 the interpolated phase is off by up to half a turn */
+    int iso;                 /* the void cutoff of sources without "iso" (papyrus = CT >= iso; 0: off for them) */
+    int iso_void;            /* 1 (with a cutoff): void (0 < clean CT < cutoff) more than iso_pap voxels from papyrus is background (0) everywhere,
+                                beyond the trust band too (it is never a sheet: the haze between sheets); CT 0 stays ignored */
+    int iso_pap;             /* the void shell around papyrus left to the trust band (an unlabelled sheet's recto lies there), level voxels */
+    int iso_lift;            /* > 0 (with a cutoff): label voxels with no papyrus within this many level voxels are ignored (rows lifted off
+                                the sheets into the void); the trust band is then measured from the labels that remain */
     int shell;               /* > 0: background within this many level-0 voxels of a hard label is ignored (labels a voxel or two off the
                                 sheet are not answered with "background" right beside them); before the soft ridge and the trust band */
     float dist_sigma;        /* > 0: target channel 1 = 254 exp(-(d / sigma)^2 / 2), d the distance to channel 0's hard labels (level-0 voxels,

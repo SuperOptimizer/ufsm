@@ -97,6 +97,7 @@ sources *sources_load(const char *path) {
         s->um = json_num(json_get(e, "um"), 0);
         s->weight = json_num(json_get(e, "weight"), 1.0);
         s->trust_band = (int)json_num(json_get(e, "trust_band"), 0);
+        s->iso = (int)json_num(json_get(e, "iso"), 0);
         s->min_level = (int)json_num(json_get(e, "min_level"), 0);
         s->max_level = (int)json_num(json_get(e, "max_level"), -1);
         s->geometry = (int)json_num(json_get(e, "geometry"), 1);
@@ -112,11 +113,15 @@ sources *sources_load(const char *path) {
             s->tgt_prob[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "prob");
             double target_min = json_num(json_get(t, "min_level"), 0);
             if (!isfinite(target_min) || target_min < 0 || target_min >= MAXLEV || target_min != (int)target_min ||
-                (target_min && !s->tgt_binary[c])) {
-                fprintf(stderr, "sources: %s/%s: invalid binary target min_level\n", s->name, CHNAME[c]);
+                (target_min && !s->tgt_binary[c] && !s->tgt_prob[c])) {
+                fprintf(stderr, "sources: %s/%s: invalid target min_level (binary or prob targets only)\n", s->name, CHNAME[c]);
                 json_free(j); sources_free(S); return nullptr;
             }
             s->tgt_min_level[c] = (int)target_min;
+            s->tgt_erode[c] = (int)json_num(json_get(t, "erode"), 0); s->tgt_dilate[c] = (int)json_num(json_get(t, "dilate"), 0);
+            if (s->tgt_erode[c] < 0 || s->tgt_erode[c] > 84 || s->tgt_dilate[c] < 0 || s->tgt_dilate[c] > 84 || ((s->tgt_erode[c] || s->tgt_dilate[c]) && !s->tgt_binary[c])) {
+                fprintf(stderr, "sources: %s/%s: erode / dilate 0..84 voxels, binary targets only\n", s->name, CHNAME[c]); json_free(j); sources_free(S); return nullptr;
+            }
             const char *troot = json_str(json_get(t, "root"), nullptr);
             if (troot) s->tgt_store[c] = store_open(troot);
             const char *grp = json_str(json_get(t, "group"), nullptr);
@@ -314,7 +319,7 @@ z3 *source_tgt(source *s, int ch, int level) {
 
 z3 *source_tgt_for_level(source *s, int ch, int level, int *stored_level) {
     if (ch < 0 || ch >= NCH || level < 0 || level >= MAXLEV) return nullptr;
-    int actual = s->tgt_binary[ch] && level < s->tgt_min_level[ch] ? s->tgt_min_level[ch] : level;
+    int actual = (s->tgt_binary[ch] || s->tgt_prob[ch]) && level < s->tgt_min_level[ch] ? s->tgt_min_level[ch] : level;   /* coarser: nearest-upsampled */
     if (stored_level) *stored_level = actual;
     return source_tgt(s, ch, actual);
 }
@@ -324,8 +329,63 @@ static int64_t mask_nearest(int64_t q, int shift, int64_t size) {
     return v < 0 ? 0 : v >= size ? size - 1 : v;
 }
 
+/* a probability target stored 2^shift coarser: trilinear between the coarse cell centres (cell j's centre sits at fine
+   coordinate f j + (f - 1) / 2, a pooled grid's), clamped at the edges; separable, two interpolated coarse planes at a time */
+static int read_prob_trilinear(z3 *z, int shift, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
+    const z3_meta *m = z3_meta_of(z); const int64_t f = (int64_t)1 << shift;
+    int64_t lo[3], cnt[3];
+    int32_t *i0[3]; float *wt[3];
+    for (int d = 0; d < 3; d++) {
+        i0[d] = malloc((size_t)n[d] * sizeof **i0); wt[d] = malloc((size_t)n[d] * sizeof **wt);
+        if (!i0[d] || !wt[d]) { for (int e = 0; e <= d; e++) { free(i0[e]); free(wt[e]); } return -1; }
+        int64_t mn = INT64_MAX, mx = INT64_MIN;
+        for (int64_t k = 0; k < n[d]; k++) {
+            const double u = ((double)(o[d] + k) + 0.5) / (double)f - 0.5;   /* coarse coordinate of the fine voxel centre */
+            int64_t a = (int64_t)floor(u); double t = u - (double)a;
+            if (a < 0) { a = 0; t = 0; } if (a >= m->shape[d] - 1) { a = m->shape[d] - 1; t = 0; }
+            i0[d][k] = (int32_t)a; wt[d][k] = (float)t;
+            if (a < mn) mn = a; if (a + (t > 0) > mx) mx = a + (t > 0);
+        }
+        lo[d] = mn; cnt[d] = mx - mn + 1;
+        for (int64_t k = 0; k < n[d]; k++) i0[d][k] -= (int32_t)lo[d];
+    }
+    const size_t cplane = (size_t)cnt[1] * cnt[2], fplane = (size_t)n[1] * n[2];
+    uint8_t *low = malloc((size_t)cnt[0] * cplane); float *rx = malloc((size_t)cnt[1] * n[2] * sizeof *rx), *pl[2] = {malloc(fplane * sizeof(float)), malloc(fplane * sizeof(float))};
+    int rc = -1; int32_t have[2] = {-1, -1};
+    if (!low || !rx || !pl[0] || !pl[1] || z3_read(z, lo, cnt, low, nthreads)) goto done;
+    for (int64_t zc = 0; zc < n[0]; zc++) {
+        const int32_t za = i0[0][zc], zb = za + (wt[0][zc] > 0); const float tz = wt[0][zc];
+        for (int s = 0; s < 2; s++) {   /* the two coarse planes this output plane needs, each interpolated in y and x once */
+            const int32_t want = s ? zb : za; int slot = have[0] == want ? 0 : have[1] == want ? 1 : -1;
+            if (slot >= 0) continue;
+            slot = have[0] == (s ? za : zb) ? 1 : 0;   /* keep the other one */
+            const uint8_t *L = low + (size_t)want * cplane;
+            for (int64_t yl = 0; yl < cnt[1]; yl++) for (int64_t x = 0; x < n[2]; x++) {
+                const int32_t xa = i0[2][x]; const float tx = wt[2][x]; const uint8_t *r = L + (size_t)yl * cnt[2];
+                rx[(size_t)yl * n[2] + x] = tx > 0 ? r[xa] + tx * ((float)r[xa + 1] - r[xa]) : r[xa];
+            }
+            float *P = pl[slot];
+            for (int64_t y = 0; y < n[1]; y++) {
+                const int32_t ya = i0[1][y]; const float ty = wt[1][y]; const float *ra = rx + (size_t)ya * n[2], *rb = ty > 0 ? ra + n[2] : ra;
+                float *q = P + (size_t)y * n[2];
+                for (int64_t x = 0; x < n[2]; x++) q[x] = ra[x] + ty * (rb[x] - ra[x]);
+            }
+            have[slot] = want;
+        }
+        const float *A = pl[have[0] == za ? 0 : 1], *Bp = pl[have[0] == zb ? 0 : 1];
+        uint8_t *dst = out + (size_t)zc * fplane;
+        for (size_t k = 0; k < fplane; k++) { const float v = A[k] + tz * (Bp[k] - A[k]); dst[k] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v + 0.5f); }
+    }
+    rc = 0;
+done:
+    free(low); free(rx); free(pl[0]); free(pl[1]);
+    for (int d = 0; d < 3; d++) { free(i0[d]); free(wt[d]); }
+    return rc;
+}
+
 int z3_read_label_grid(z3 *z, int binary, int shift, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
-    if (!z || shift < 0 || shift >= MAXLEV || (!binary && shift)) return -1;
+    if (!z || shift < 0 || shift >= MAXLEV) return -1;
+    if (!binary && shift) return read_prob_trilinear(z, shift, o, n, out, nthreads);   /* probabilities: trilinear, not nearest */
     for (int d = 0; d < 3; d++) if (n[d] <= 0) return -1;
     size_t nv = (size_t)n[0] * n[1] * n[2];
     if (!shift) {
@@ -360,7 +420,7 @@ int z3_read_label_grid(z3 *z, int binary, int shift, const int64_t o[3], const i
             py = iy;
             if (iz < 0 || iy < 0) { memset(dst, 0, (size_t)n[2]); continue; }
             const uint8_t *row = low + ((size_t)iz * cn[1] + iy) * cn[2];
-            for (int64_t x = 0; x < n[2]; x++) dst[x] = ixm[x] >= 0 && row[ixm[x]] ? 254 : 0;
+            for (int64_t x = 0; x < n[2]; x++) { const uint8_t v = ixm[x] >= 0 ? row[ixm[x]] : 0; dst[x] = binary ? (v ? 254 : 0) : v; }   /* prob: the value */
         }
     }
     free(low); free(ixm); return 0;

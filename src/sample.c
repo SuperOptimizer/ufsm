@@ -923,6 +923,16 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     u8_stats(ctu, p3, &nz, &sum, &sq);
     if (!c->cover && (double)nz / (double)p3 < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); return 1; }
     PROF_MARK(PS_STATS);
+    /* --iso-void / --iso-lift: chamfer distance (3 per voxel, saturated at 255) of every voxel to papyrus (clean CT >= the cutoff) */
+    const int iso_t = s->iso > 0 ? s->iso : c->iso;
+    uint8_t *dpap = nullptr;
+    if (iso_t > 0 && (c->iso_void || c->iso_lift > 0) && region_ch < 0) {
+        uint8_t *pm = tp_get(p3, 0); dpap = tp_get(p3, 0);
+        if (!pm || !dpap) { tp_put(pm, p3); tp_put(dpap, p3); return -1; }
+        for (size_t k = 0; k < p3; k++) pm[k] = ctu[k] >= iso_t;
+        chamfer345_8(pm, dpap, Pz, P);   /* no papyrus: all 255 */
+        tp_put(pm, p3);
+    }
     /* targets */
     uint8_t w[NCH] = {0};
     int tmax = 0;
@@ -952,13 +962,36 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             } else if (source_read_target(s, ch, l, o, n, dst, 1)) return -1;
             w[ch] = 1;
         } else memset(dst, 0, p3);
+        if ((s->tgt_erode[ch] || s->tgt_dilate[ch]) && w[ch] && ch != region_ch) {   /* source band thickness: erode / dilate N voxels (3-4-5 chamfer) */
+            uint8_t *mk = tp_get(p3, 0), *dm2 = tp_get(p3, 0);
+            if (!mk || !dm2) { tp_put(mk, p3); tp_put(dm2, p3); tp_put(dpap, p3); return -1; }
+            if (s->tgt_erode[ch]) {   /* band voxels within N of a non-band voxel (outside the window counts as band) */
+                const int er = 3 * s->tgt_erode[ch] > 255 ? 255 : 3 * s->tgt_erode[ch];
+                for (size_t k = 0; k < p3; k++) mk[k] = dst[k] == 0;
+                if (chamfer345_8(mk, dm2, Pz, P)) for (size_t k = 0; k < p3; k++) if (dst[k] && dst[k] != 255 && dm2[k] <= er) dst[k] = 0;
+            }
+            if (s->tgt_dilate[ch]) {
+                const int dr = 3 * s->tgt_dilate[ch] > 255 ? 255 : 3 * s->tgt_dilate[ch];
+                for (size_t k = 0; k < p3; k++) mk[k] = dst[k] && dst[k] != 255;
+                if (chamfer345_8(mk, dm2, Pz, P)) for (size_t k = 0; k < p3; k++) if (!dst[k] && dm2[k] <= dr) dst[k] = 254;
+            }
+            tp_put(mk, p3); tp_put(dm2, p3);
+        }
+        if (dpap && c->iso_void && w[ch] && s->tgt_prob[ch]) {   /* a teacher's probabilities: deep void is 0 here too (its noise floor) */
+            const int vr = 3 * c->iso_pap > 255 ? 255 : 3 * c->iso_pap;
+            for (size_t k = 0; k < p3; k++) if (ctu[k] && ctu[k] < iso_t && dpap[k] > vr) dst[k] = 0;
+        }
+        if (dpap && c->iso_lift > 0 && w[ch] && !s->tgt_prob[ch]) {   /* labels lifted off the sheets into the void: ignored */
+            const int lr = 3 * c->iso_lift > 255 ? 255 : 3 * c->iso_lift;
+            for (size_t k = 0; k < p3; k++) if (dst[k] && dst[k] != 255 && dpap[k] > lr) dst[k] = 255;
+        }
         if (w[ch] && !c->cover) {   /* largest known target value (only the empty-patch rejection reads it) */
             uint8_t mx = 0;
             for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k] == 255 ? 0 : dst[k]; mx = v > mx ? v : mx; }
             if (mx > tmax) tmax = mx;
         }
     }
-    if (!c->cover && !c->papyrus && tmax == 0 && runif(r) > c->empty_keep) { atomic_fetch_add(&sp->rejected, 1); return 1; }
+    if (!c->cover && !c->papyrus && tmax == 0 && runif(r) > c->empty_keep) { tp_put(dpap, p3); atomic_fetch_add(&sp->rejected, 1); return 1; }
     PROF_MARK(PS_TARGETS);
     uint8_t *near = nullptr;   /* --phase-near-um: voxels within the distance of a labelled wrap voxel (raw labels, before softening) */
     if (c->phase_near_um > 0 && c->side == 2 && w[0]) {
@@ -1050,15 +1083,20 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             else for (size_t k = 0; k < p3; k++) if (dst[k] == 0 && dm[k] <= dcut) { uint8_t t = etab[dm[k]]; if (t) dst[k] = t; }
         }
         if (trust_r > 0) {
+            const int vr = 3 * c->iso_pap > 255 ? 255 : 3 * c->iso_pap;
+            const uint8_t *vp = c->iso_void ? dpap : nullptr;   /* --iso-void: deep void stays background beyond the band */
+#define DEEP_VOID(k) (vp && ctu[k] && ctu[k] < iso_t && vp[k] > vr)
             for (int pass = 0; pass < 1 + (dd != nullptr); pass++) {   /* the distance channel takes channel 0's trust band */
                 uint8_t *t = pass ? dd : dst;
-                if (!dm_any) { for (size_t k = 0; k < p3; k++) if (t[k] == 0) t[k] = 255; continue; }   /* nothing annotated: ignore all background */
+                if (!dm_any) { for (size_t k = 0; k < p3; k++) if (t[k] == 0 && !DEEP_VOID(k)) t[k] = 255; continue; }   /* nothing annotated: ignore the background */
                 const int tr = 3 * trust_r;
-                if (use8) for (size_t k = 0; k < p3; k++) t[k] = t[k] == 0 && dm8[k] > tr ? 255 : t[k];
-                else for (size_t k = 0; k < p3; k++) t[k] = t[k] == 0 && dm[k] > tr ? 255 : t[k];
+                if (use8) for (size_t k = 0; k < p3; k++) t[k] = t[k] == 0 && dm8[k] > tr && !DEEP_VOID(k) ? 255 : t[k];
+                else for (size_t k = 0; k < p3; k++) t[k] = t[k] == 0 && dm[k] > tr && !DEEP_VOID(k) ? 255 : t[k];
             }
+#undef DEEP_VOID
         }
     }
+    tp_put(dpap, p3);
     PROF_MARK(PS_SOFT);
     /* label encoding -> target probability * 255 and the ignore mask (255 = ignore) */
     PROF_MARK(PS_TRUST);

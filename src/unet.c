@@ -53,6 +53,7 @@ typedef struct {
     convp c1, c2;
     gnp n1, n2;
     int keep_a1;                    /* recompute 2 can retain selected smaller activations */
+    int single;                     /* cfg.dec_convs 1: conv1 writes the output a2 (stats m2 / r2, norm n2 = n1); no c2, a1 unused */
     int a1_shared;                  /* shared encoder a1 (training): a1 lives in the same-level decoder block's a1 buffer and backward re-runs conv1 */
     int a1_lent;                    /* decoder whose a1 buffer an encoder shares: re-run conv1 in a repeated backward (no forward between) */
     /* stored activations: conv outputs a1, a2 (GroupNorm inputs), GN stats, and the block output s2.
@@ -200,6 +201,14 @@ static size_t add_conv(unet *u, convp *c, int cin, int cout, int k, int stride, 
     return off;
 }
 static size_t add_gn(unet *u, gnp *n, int c, size_t off) { n->c = c; n->gamma = off; off += (size_t)c; n->beta = off; off += (size_t)c; return off; }
+static size_t add_block(unet *u, block *b, int cin, int cout, size_t off);
+static size_t add_single(unet *u, block *b, int cin, int cout, size_t off) {   /* one-conv decoder block: c1 + n1; c2 / n2 alias them */
+    off = add_conv(u, &b->c1, cin, cout, 3, 1, off);
+    off = add_gn(u, &b->n1, cout, off);
+    b->c2 = b->c1; b->c2.cin = cout; b->n2 = b->n1; b->single = 1;
+    return off;
+}
+static int any_single(const unet *u) { for (int i = 0; i < u->cfg.nlev - 1; i++) if (u->dec[i].single) return 1; return 0; }
 static size_t add_block(unet *u, block *b, int cin, int cout, size_t off) {
     off = add_conv(u, &b->c1, cin, cout, 3, 1, off);
     off = add_gn(u, &b->n1, cout, off);
@@ -220,7 +229,8 @@ unet *unet_create(const unet_cfg *cfg) {
         const int d = dw_of(cfg, i);
         if (d <= 0 || d > w[i] || (i == 0 && d != w[0])) { fprintf(stderr, "unet: decoder width %d at level %d must be in 1..%d and the encoder width at level 0 (MX storage: multiples of 32)\n", d, i, w[i]); abort(); }
     }
-    for (int i = L - 2; i >= 0; i--) off = add_block(u, &u->dec[i], w[i] + dw_of(cfg, i + 1), dw_of(cfg, i), off);
+    for (int i = L - 2; i >= 0; i--) off = cfg->dec_convs[i] == 1 ? add_single(u, &u->dec[i], w[i] + dw_of(cfg, i + 1), dw_of(cfg, i), off)
+                                                                   : add_block(u, &u->dec[i], w[i] + dw_of(cfg, i + 1), dw_of(cfg, i), off);
     off = add_conv(u, &u->head, w[0], cfg->cout, 1, 1, off);
     if (cfg->down_norm) for (int i = 0; i < L - 1; i++) off = add_gn(u, &u->dn[i], w[i], off);
     if (cfg->scale_cond) { u->sc_w = off; off += (size_t)w[0]; }
@@ -286,7 +296,7 @@ void unet_init(unet *u, uint64_t seed) {
     for (int i = 0; i < L; i++) { init_conv(h, &u->enc[i].c1, &seed, 0); init_gn(h, &u->enc[i].n1); init_conv(h, &u->enc[i].c2, &seed, 0); init_gn(h, &u->enc[i].n2); }
     for (int i = 0; i < L - 1; i++) init_conv(h, &u->down[i], &seed, 0);
     if (u->cfg.down_norm) for (int i = 0; i < L - 1; i++) init_gn(h, &u->dn[i]);
-    for (int i = 0; i < L - 1; i++) { init_conv(h, &u->dec[i].c1, &seed, 0); init_gn(h, &u->dec[i].n1); init_conv(h, &u->dec[i].c2, &seed, 0); init_gn(h, &u->dec[i].n2); }
+    for (int i = 0; i < L - 1; i++) { init_conv(h, &u->dec[i].c1, &seed, 0); init_gn(h, &u->dec[i].n1); if (!u->dec[i].single) { init_conv(h, &u->dec[i].c2, &seed, 0); init_gn(h, &u->dec[i].n2); } }
     init_conv(h, &u->head, &seed, -2.0);
     for (int i = 0; i < L; i++) for (int k = 0; k < u->cfg.enc_blocks[i]; k++) {   /* residual blocks: identity at start (conv2 zero) */
         block *b = &u->rb[i][k];
@@ -612,7 +622,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
         T1 = dalloc_act_s(u, m1);
     }
     /* in-place slab convs at level 0 (see unet.slab): X holds every level-0 tensor; T1 only serves the coarser levels */
-    const int slab = share && reuse_skip && infer_alias() && act_mx8() && infer_slab() > 0 && u->cfg.enc_blocks[0] == 0 && w[0] % 32 == 0;
+    const int slab = share && reuse_skip && infer_alias() && act_mx8() && infer_slab() > 0 && u->cfg.enc_blocks[0] == 0 && w[0] % 32 == 0 && !any_single(u);
     const int slab1 = slab && L > 2 && w[1] % 32 == 0 && u->cfg.enc_blocks[1] == 0 && (!getenv("UFSM_INFER_SLAB_L1") || ufsm_env_on("UFSM_INFER_SLAB_L1"));
     float *X = nullptr, *Y = nullptr;
     u->slab = slab; u->slab1 = slab1; u->slab_s = slab ? (infer_slab() + 3) / 4 * 4 : 0;
@@ -765,7 +775,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
            is absent and the next decoder normalizes a2 on the fly. Training keeps separate buffers. */
         build_block_acts(u, &u->dec[i], cin, train, i > 0,
                          slab && i == 0 ? X : slab1 && i == 1 ? Y : sea ? u->enc[i].a1 : train && i > 0 && keep_coarse_a1() ? nullptr : T1,
-                         reuse_skip && i == 0 ? u->enc[0].a2 : slab1 && i == 1 ? Y : T2,
+                         u->dec[i].single ? nullptr : reuse_skip && i == 0 ? u->enc[0].a2 : slab1 && i == 1 ? Y : T2,
                          reuse_skip && i > 0 ? stage_out(u, i)->a2 : nullptr);
         if (sea) u->dec[i].a1_lent = 1;
     }
@@ -788,7 +798,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 /* the level-0 offload chain (A in dec[0].a2, enc[0].a2 on the host, gco / dno / sko below) no longer needs the fp16
                    logits and their gradient to fit level-0 buffers (11-channel heads: 22 > 17 B per voxel turned the whole chain off,
                    ~+28 B per voxel): wider heads keep both in buffers of their own (lg_fit 0) */
-                u->a0_share = a0_share_on() && L > 1 && act_mx4() && grad_mx4() && grad_dt() == act_dt() && lean() >= 2 && chunk
+                u->a0_share = a0_share_on() && L > 1 && act_mx4() && grad_mx4() && grad_dt() == act_dt() && lean() >= 2 && chunk && !any_single(u)
                               && !(xin_will && enc0_rerun);
                 lg_fit = act_bytes_of(d0) >= shape_numel(os) * 2 + 4096;
                 if (u->a0_share && !g_dry) {
@@ -1335,12 +1345,26 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
             nn_d2d(b->pm1, b->m1, (size_t)b->ys.n * G * 4); nn_d2d(b->pr1, b->r1, (size_t)b->ys.n * G * 4); nn_d2d(b->pm2, b->m2, (size_t)b->ys.n * G * 4); nn_d2d(b->pr2, b->r2, (size_t)b->ys.n * G * 4);
         }
         const int inplace = u->slab && (b == &u->enc[0] || b == &u->dec[0] || (u->slab1 && (b == &u->enc[1] || b == &u->dec[1])));   /* a1 == a2 == X (Y): in-place slab convs */
+        const int sg = b->single;   /* one-conv decoder: conv1 writes the block output a2 and its statistics (m2 / r2) */
+        float *o1 = sg ? b->a2 : b->a1, *sm = sg ? om2 : om1, *sr = sg ? or2 : or1;
+        if (sg && b == &u->dec[0]) {   /* the copies out of dec[0].a2's buffer finish before conv1 writes it (two convs: before conv2) */
+            if (u->xin_shared && u->xin_out) nn_stream_wait(0, u->ev_xin[1]);
+            if (u->dno && u->dn_out) for (int k = 0; k < u->cfg.nlev - 1; k++) nn_stream_wait(0, u->ev_dn[k][1]);
+            if (u->sko && u->sk_out) for (int k = 1; k < u->cfg.nlev - 1; k++) nn_stream_wait(0, u->ev_sk[k][1]);
+        }
         if (b->xb && inplace) slab_run(u, b, level, 1, nullptr, G, om1, or1);
         else if (inplace && u->p3 && b == &u->enc[1]) slab_run(u, b, level, 1, x, G, om1, or1);   /* down0's output, in Y */
-        else if (b->xb) { if (dec_conv1(u, b, level, b->a1, G, om1, or1, nullptr, nullptr, nullptr)) rc_fail("decoder conv1"); }   /* [up2(coarse) | silu(gn(skip a2))] */
+        else if (b->xb) { if (dec_conv1(u, b, level, o1, G, sm, sr, nullptr, nullptr, nullptr)) rc_fail("decoder conv1"); }   /* [up2(coarse) | silu(gn(skip a2))] */
         else if (b == &u->enc[0] && u->ctin.on) stem_slab_run(u, b, G, om1, or1);
-        else if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), B1(u, b), b->c1.cout, b->a1, G, 1e-5f, om1, or1));
-        else { nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, b->a1, G, 1e-5f, om1, or1)); }   /* down_norm: gn + silu of the input in staging */
+        else if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), B1(u, b), b->c1.cout, o1, G, 1e-5f, sm, sr));
+        else { nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, o1, G, 1e-5f, sm, sr)); }   /* down_norm: gn + silu of the input in staging */
+        if (sg) {   /* one conv: a2 is the output */
+            FQ(b->a2, b->ys); FQ_AFF(b->a2, b->ys, b->pm2, b->pr2, G);
+            sp_halo(u, b->a2, b->ys, 0);
+            if (b->s2) { PROF(3, nn_gn_silu_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2)); FQ(b->s2, b->ys); FQ_POST(b->s2, b->ys); }
+            nn_set_conv(-1);
+            return;
+        }
         FQ(b->a1, b->ys); FQ_AFF(b->a1, b->ys, b->pm1, b->pr1, G);
         sp_halo(u, b->a1, b->ys, 0);
         if (b == &u->enc[0] && u->xin_inf) nn_set_storage(b->a2, act_bytes_of(b->ys), act_dt());   /* the stem has read the input: conv2 writes a2 over it */
@@ -1364,6 +1388,11 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
         FQ(b->a2, b->ys); FQ_AFF(b->a2, b->ys, b->pm2, b->pr2, G);
         sp_halo(u, b->a2, b->ys, 0);
         if (b->s2) { PROF(3, nn_gn_silu_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2)); FQ(b->s2, b->ys); FQ_POST(b->s2, b->ys); }
+        return;
+    }
+    if (b->single) {   /* one conv: a2 = conv1's output, s2 its silu(gn) */
+        PROF(0, nn_conv3d_fwd(x, b->xs, P(u, b->c1.w), B1(u, b), b->c1.cout, 3, 1, b->a2));
+        PROF(3, nn_gn_fwd_silu(b->a2, b->ys, G, 1e-5f, P(u, b->n2.gamma), P(u, b->n2.beta), b->s2, b->m2, b->r2));
         return;
     }
     PROF(0, nn_conv3d_fwd(x, b->xs, P(u, b->c1.w), B1(u, b), b->c1.cout, 3, 1, b->a1));
@@ -1582,7 +1611,7 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     u->last_a1_live = 0;   /* repeated backward without a new forward must rebuild the shared buffer */
     const int lvl_off = b->a1_shared && level < UNET_MAXLEV && u->a1_out[level];
     if (lvl_off) nn_stream_wait(0, u->ev_a1[level][3]);   /* offloaded encoder a1: back from the host */
-    else if ((recompute_a1() && !b->keep_a1 && !live) || b->a1_shared || (b->a1_lent && u->sea_stale)) {   /* a1 was overwritten by later blocks: re-run conv1 (same kernel and precision as the forward) */
+    else if (!b->single && ((recompute_a1() && !b->keep_a1 && !live) || b->a1_shared || (b->a1_lent && u->sea_stale))) {   /* a1 was overwritten by later blocks: re-run conv1 (same kernel and precision as the forward) */
         nn_set_conv(0);
         int r;
         if (b->xb) r = dec_conv1(u, b, level, b->a1, G, nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -1592,7 +1621,18 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
         sp_halo(u, b->a1, b->ys, 0);
     }
     nn_set_conv(1);   /* precision-policy tag: c2 first, then c1 */
-    if (nn_get_tf32()) {   /* fused: no materialised gn / silu activations */
+    if (nn_get_tf32() && b->single) {   /* one conv: A = d/d a2 (conv1's output) */
+        if (pre || gid || save) { fprintf(stderr, "unet: a one-conv decoder block takes no residual gradient\n"); abort(); }
+        sp_zero(u, gy, b->ys, 1);
+        PROF(3, nn_gn_silu_bwd(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, A, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));
+        FQG(A, b->ys);
+        sp_zero(u, A, b->ys, 1);
+        sp_begin(u, A, b->ys, 1);
+    } else if (!nn_get_tf32() && b->single) {
+        PROF(3, nn_gn_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, t1));            /* t1 = g2 */
+        PROF(4, nn_silu_bwd(t1, gy, n, B));                                                                        /* B = d/d g2 */
+        PROF(3, nn_gn_bwd(b->a2, b->ys, G, P(u, b->n2.gamma), b->m2, b->r2, B, A, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* A = d/d a2 */
+    } else if (nn_get_tf32()) {   /* fused: no materialised gn / silu activations */
         sp_zero(u, gy, b->ys, 1);   /* split: only owned voxels enter the reductions below */
         if (!pre) PROF(3, nn_gn_silu_bwd(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* B = d/d a2 */
         if (gid) nn_add_into(B, gid, b->ys, GBF);
@@ -2076,7 +2116,7 @@ void unet_use_ema(unet *u, int on) { nn_wmemo_clear(); u->live = on ? u->ema : u
 static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg) {
     int L = u->cfg.nlev;
     for (int i = 0; i < L; i++) { fn(u, &u->enc[i].c1, arg); fn(u, &u->enc[i].c2, arg); }
-    for (int i = 0; i < L - 1; i++) { fn(u, &u->down[i], arg); fn(u, &u->dec[i].c1, arg); fn(u, &u->dec[i].c2, arg); }
+    for (int i = 0; i < L - 1; i++) { fn(u, &u->down[i], arg); fn(u, &u->dec[i].c1, arg); if (!u->dec[i].single) fn(u, &u->dec[i].c2, arg); }
     for (int i = 0; i < L; i++) for (int k = 0; k < u->cfg.enc_blocks[i]; k++) { fn(u, &u->rb[i][k].c1, arg); fn(u, &u->rb[i][k].c2, arg); }
 }
 static void mask_conv(unet *u, const convp *c, void *arg) { (void)arg; nn_mask24(u->wm + c->w, u->wm + c->w, c->cout, c->cin, c->k * c->k * c->k); }
@@ -2220,6 +2260,8 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
       if (any) { fputs(",\"enc_blocks\":[", f); for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.enc_blocks[i]); fputc(']', f); } }
     if (u->cfg.half_res) fprintf(f, ",\"half_res\":%d", u->cfg.half_res);
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
+    { int any = 0; for (int i = 0; i < u->cfg.nlev; i++) any |= u->cfg.dec_convs[i] == 1;
+      if (any) { fputs(",\"dec_convs\":[", f); for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.dec_convs[i]); fputc(']', f); } }
     fprintf(f, ",\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"scale_cond\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"muon_mom\":%d,\"extra\":%s}\n", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->cfg.scale_cond, u->np, step, u->sparse24, u->wq, u->muon_mom != nullptr, extra ? extra : "{}");
     float *h = malloc(u->np * 4);
     const float *arrs[4] = {u->p, u->ema, u->m, u->v};
@@ -2252,6 +2294,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"enc_blocks\":["))) { p += 14; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->enc_blocks[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"half_res\":"))) cfg->half_res = atoi(p + 11);
     if ((p = strstr(line, "\"ds_levels\":"))) cfg->ds_levels = atoi(p + 12);
+    if ((p = strstr(line, "\"dec_convs\":["))) { p += 13; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->dec_convs[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"nparams\":"))) *np = (size_t)atoll(p + 10);
     if ((p = strstr(line, "\"step\":"))) *step = atoi(p + 7);
     if ((p = strstr(line, "\"sparse24\":"))) g_loaded_sparse = atoi(p + 11);

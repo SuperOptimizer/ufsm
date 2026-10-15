@@ -682,7 +682,10 @@ template <typename LT> __global__ void pred_out_k(const LT *lg, const uint8_t *c
 }
 #define LGT(CALL) do { if (g_logits_h16) { const f16 *lgt = (const f16 *)lg; CALL; } else { const float *lgt = lg; CALL; } } while (0)
 extern "C" void nn_pred_output(const float *lg, const uint8_t *ct, size_t n, uint8_t *out) { LGT((pred_out_k<<<nblk(n, 256), 256>>>(lgt, ct, n, out))); KCHECK(); }
-template <typename LT> __global__ void pred_place_k(const LT *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
+static int g_pred_iso = 1;   /* predict --iso: outputs only where CT >= this (1: CT > 0) */
+extern "C" void nn_set_pred_iso(int t) { g_pred_iso = t < 1 ? 1 : t; }
+extern "C" int nn_get_pred_iso(void) { return g_pred_iso; }
+template <typename LT> __global__ void pred_place_k(const LT *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh, int iso) {
     const int I = W - 2 * halo, Iz = D - 2 * hz;   /* a D x W x W window, interior planes [hz, D - hz) */
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)Iz * I * I) return;
@@ -690,25 +693,27 @@ template <typename LT> __global__ void pred_place_k(const LT *lg, const uint8_t 
     const int gz = oz + z, gy = oy + y, gx = ox + x;
     if (gz < 0 || gz >= ez || gy < 0 || gy >= ey || gx < 0 || gx >= ex) return;
     const size_t k = ((size_t)z * W + y) * W + x;
-    dsh[((size_t)gz * shard + gy) * shard + gx] = ct[k] ? (uint8_t)(255.f / (1.f + __expf(-lgv(lg, k))) + 0.5f) : 0;
+    dsh[((size_t)gz * shard + gy) * shard + gx] = ct[k] >= iso ? (uint8_t)(255.f / (1.f + __expf(-lgv(lg, k))) + 0.5f) : 0;
 }
 extern "C" void nn_pred_place_d(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     const size_t I = (size_t)(W - 2 * halo), Iz = (size_t)(D - 2 * hz);
-    LGT((pred_place_k<<<nblk(Iz * I * I, 256), 256>>>(lgt, ct, D, W, hz, halo, oz, oy, ox, ez, ey, ex, shard, dsh))); KCHECK();
+    LGT((pred_place_k<<<nblk(Iz * I * I, 256), 256>>>(lgt, ct, D, W, hz, halo, oz, oy, ox, ez, ey, ex, shard, dsh, g_pred_iso))); KCHECK();
 }
 extern "C" void nn_pred_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     nn_pred_place_d(lg, ct, W, W, halo, halo, oz, oy, ox, ez, ey, ex, shard, dsh);
 }
 /* the CT window's nonzero voxels as bits (word k >> 5, bit k & 31): the output mask of pred_place when the uint8 window does not
    survive the forward (predict keeps the CT in the network's level-0 skip buffer) */
-__global__ void pred_ctmask_k(const uint8_t *ct, size_t n, uint32_t *bits) {
+__global__ void pred_ctmask_k(const uint8_t *ct, size_t n, uint32_t *bits, int t) {
     const size_t w = blockIdx.x * (size_t)blockDim.x + threadIdx.x, i0 = w * 32;
     if (i0 >= n) return;
     uint32_t m = 0;
-    for (int j = 0; j < 32 && i0 + j < n; j++) m |= (uint32_t)(ct[i0 + j] != 0) << j;
+    for (int j = 0; j < 32 && i0 + j < n; j++) m |= (uint32_t)(ct[i0 + j] >= t) << j;
     bits[w] = m;
 }
-extern "C" void nn_pred_ctmask(const uint8_t *ct, size_t n, uint32_t *bits) { pred_ctmask_k<<<nblk((n + 31) / 32, 256), 256>>>(ct, n, bits); KCHECK(); }
+extern "C" void nn_pred_ctmask(const uint8_t *ct, size_t n, uint32_t *bits) { pred_ctmask_k<<<nblk((n + 31) / 32, 256), 256>>>(ct, n, bits, 1); KCHECK(); }
+/* predict --iso: the bit plane of CT >= t (the probability outputs' mask; the fit keeps the material mask of nn_pred_ctmask) */
+extern "C" void nn_pred_ctmask_t(const uint8_t *ct, size_t n, uint32_t *bits, int t) { pred_ctmask_k<<<nblk((n + 31) / 32, 256), 256>>>(ct, n, bits, t < 1 ? 1 : t); KCHECK(); }
 template <typename LT> __global__ void pred_place_m_k(const LT *lg, const uint32_t *bits, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
     const int I = W - 2 * halo, Iz = D - 2 * hz;
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;

@@ -63,7 +63,8 @@ int main(void) {
     if (getenv("UFSM_TINY")) { cfg.nlev = 0; char *t = strdup(getenv("UFSM_TINY")); for (char *q = strtok(t, ","); q; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); }
     cfg.scale_cond = getenv("UFSM_SCALE_COND") ? atoi(getenv("UFSM_SCALE_COND")) : 0;   /* voxel-size conditioning: also check its vector */
     if (getenv("UFSM_ENC_BLOCKS")) { char *t = strdup(getenv("UFSM_ENC_BLOCKS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.enc_blocks[l++] = atoi(q); free(t); }
-    cfg.ds_levels = getenv("UFSM_DS") ? atoi(getenv("UFSM_DS")) : 0;   /* deep-supervision heads: their gradient path too */
+    cfg.ds_levels = getenv("UFSM_DS") ? atoi(getenv("UFSM_DS")) : 0;
+    if (getenv("UFSM_DEC_CONVS")) for (int l = 0; l < UNET_MAXLEV; l++) cfg.dec_convs[l] = atoi(getenv("UFSM_DEC_CONVS"));   /* one-conv decoders */   /* deep-supervision heads: their gradient path too */
     if (getenv("UFSM_DEC_WIDTHS")) { char *t = strdup(getenv("UFSM_DEC_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.dec_widths[l++] = atoi(q); free(t); }   /* narrower decoder levels */
     unet *u = unet_create(&cfg);
     unet_init(u, 1);

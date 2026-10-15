@@ -23,6 +23,8 @@ typedef struct {
     int enc_blocks[UNET_MAXLEV];   /* extra pre-activation residual blocks after encoder level i (levels >= 1; 0 = none): x_k = x_{k-1} +
                                       conv2(silu(gn(conv1(silu(gn(x_{k-1})))))), widths[i] -> widths[i]; the last one's output is the level's
                                       skip and down-conv input. Parameters appended last; a fresh block starts as the identity (zero conv2) */
+    int dec_convs[UNET_MAXLEV];   /* convs per decoder level (0 or 2: two; 1: one, nnU-Net / ResEnc style): a one-conv level's output is
+                                     silu(gn1(conv1([up | skip]))), written straight into its a2 buffer (n2 = n1); no a0_share / slab aliasing */
     int ds_levels;         /* deep supervision: a 1^3 head (cout outputs) on each decoder level 1..ds_levels (params appended last); a training
                               forward computes their fp32 logits (unet_ds_logits), the trainer's loss gradients come back through
                               unet_set_ds_grad and join each level's gradient before its decoder backward */
