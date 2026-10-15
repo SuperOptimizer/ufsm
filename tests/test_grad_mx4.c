@@ -605,6 +605,22 @@ int main(void) {
             printf("  %-46s layout %d, logits differ %zu, grads rel diff %.3g / %.3g, seeds %u %u / %u %u, train bytes %zu -> %zu (%.2f B / voxel less), batch tail %s%s\n",
                    nm, l3[1], lneq, rel[0], rel[1], ctr[0][0], ctr[0][1], ctr[1][0], ctr[1][1], mem[0], mem[1], ((double)mem[0] - (double)mem[1]) / S, tail_ok ? "kept" : "CLOBBERED", ok ? "" : "  FAIL");
             if (!ok) bad++;
+            if (wc == 0) {   /* dec[0]'s conv1 weight gradient split around the skip's copy (UFSM_L0_3BUF_SPLIT) and enc[0]'s conv2 backward-data
+                                before its weight gradient off (UFSM_L0_3BUF_REORDER=0): the same gradients and seeds as the default l3b step */
+                for (int var = 0; var < 2; var++) {
+                    unet_set_l0_3buf(1); if (var) unet_set_l0_3buf_reorder(0); else unet_set_l0_3buf_split(1);
+                    void *tp = nullptr; unet_batch_scratch2(v, 2 * S, tailb, &tp);
+                    nn_set_sr_step(9000); const float *lg = unet_forward(v, xi[0], xs, 1); unet_zero_grad(v);
+                    nn_f32_to_h16(gy[0], no, (void *)lg, nn_get_grad_scale());
+                    nn_set_sr_step(9100); unet_backward_x(v, lg, 1);
+                    const unsigned c = nn_sr_ctr(); float *gv = malloc(np * 4); unet_grad_d2h(v, gv);
+                    double d2 = 0, r2 = 0; for (size_t i = 0; i < np; i++) { double d = (double)gv[i] - gg[1][0][i]; d2 += d * d; r2 += (double)gg[1][0][i] * gg[1][0][i]; }
+                    const double r = sqrt(d2 / r2); const int okv = unet_l0_3buf(v) && r < 1e-6 && c == ctr[1][0];
+                    printf("  %-46s grads rel diff %.3g, seeds %u / %u%s\n", var ? "three buffers: enc[0] conv2 in the usual order" : "three buffers: split dec[0] conv1 weight grad.", r, c, ctr[1][0], okv ? "" : "  FAIL");
+                    if (!okv) bad++;
+                    free(gv); unet_set_l0_3buf_split(-1); unet_set_l0_3buf_reorder(-1);
+                }
+            }
             for (int on = 0; on < 2; on++) { for (int k = 0; k < 3; k++) free(lgs[on][k]); for (int st = 0; st < 2; st++) free(gg[on][st]); }
             unet_set_l0_3buf(-1); unet_free(v); nn_free(own); free(pat); free(chk);
             for (int k = 0; k < 2; k++) { nn_free(xi[k]); nn_free(gy[k]); }
