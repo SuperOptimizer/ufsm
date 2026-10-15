@@ -558,6 +558,36 @@ int main(void) {
                     free(gv); unet_set_l0_3buf_split(-1); unet_set_l0_3buf_reorder(-1);
                 }
             }
+            if (wc == 0) {   /* the trainer's GPU-built input (unet_set_input_rad: the fp16 CT in the batch head, radial records): three buffers keep
+                                the CT and rebuild the input from it for the stem's weight gradient; the same logits, gradients and seeds as four */
+                const int D = xs.d, Pp = xs.h; const size_t rb = NN_RAD_REC(D);
+                uint8_t *rec = calloc(1, rb); int32_t hd[8] = {1000, 2000, D, Pp, 1, 0 | 1 << 2 | 2 << 4, 0, 0}; memcpy(rec, hd, sizeof hd);
+                for (int z = 0; z < D; z++) { ((float *)(rec + sizeof hd))[z] = 1000.f + 13.37f + 0.1f * z; ((float *)(rec + sizeof hd))[D + z] = 2000.f + 19.11f - 0.05f * z; }
+                void *drec = nn_malloc(rb); nn_h2d(drec, rec, rb);
+                float *ctf = dev_rand(S, 1.f); void *ct = nn_malloc(S * 2); nn_f32_to_h16(ctf, S, ct, 1.f);
+                uint16_t *lc[2]; float *gc[2]; unsigned cc[2]; int ctm = 0;
+                for (int on = 0; on < 2; on++) {
+                    unet_set_l0_3buf(on); unet_build(v, xs, 1); unet_set_input_rad(v, drec);
+                    void *tp = nullptr; void *hp = on ? unet_batch_scratch2(v, S * 2, tailb, &tp) : nullptr;
+                    void *xin = hp ? hp : ct;
+                    if (hp) nn_d2d(hp, ct, S * 2);
+                    nn_set_sr_step(9400); const float *lg = unet_forward_x(v, xin, xs, 1, 1); unet_zero_grad(v);
+                    if (on) ctm = unet_l0_3buf_ct(v);
+                    lc[on] = malloc(no * 2); nn_sync(); nn_d2h(lc[on], lg, no * 2);
+                    void *gl = on ? (void *)lg : unet_logit_grad_scratch(v, no * 2); if (!gl) gl = own;
+                    nn_f32_to_h16(gy[0], no, gl, nn_get_grad_scale());
+                    nn_set_sr_step(9500); unet_backward_x(v, gl, 1); cc[on] = nn_sr_ctr();
+                    gc[on] = malloc(np * 4); unet_grad_d2h(v, gc[on]);
+                    unet_set_input_rad(v, nullptr);
+                }
+                size_t ln = 0; for (size_t i = 0; i < no; i++) ln += lc[0][i] != lc[1][i];
+                double d2 = 0, r2 = 0; for (size_t i = 0; i < np; i++) { double d = (double)gc[1][i] - gc[0][i]; d2 += d * d; r2 += (double)gc[0][i] * gc[0][i]; }
+                const double r = sqrt(d2 / r2); const int okc = ctm && !ln && r < 1e-6 && cc[0] == cc[1];
+                printf("  %-46s CT kept %d, logits differ %zu, grads rel diff %.3g, seeds %u / %u%s\n", "three buffers, GPU-built input vs four", ctm, ln, r, cc[0], cc[1], okc ? "" : "  FAIL");
+                if (!okc) bad++;
+                for (int k = 0; k < 2; k++) { free(lc[k]); free(gc[k]); }
+                free(rec); nn_free(drec); nn_free(ctf); nn_free(ct);
+            }
             for (int on = 0; on < 2; on++) { for (int k = 0; k < 3; k++) free(lgs[on][k]); for (int st = 0; st < 2; st++) free(gg[on][st]); }
             unet_set_l0_3buf(-1); unet_free(v); nn_free(own); free(pat); free(chk);
             for (int k = 0; k < 2; k++) { nn_free(xi[k]); nn_free(gy[k]); }
