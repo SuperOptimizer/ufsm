@@ -46,6 +46,15 @@ int band_field_phase(const uint8_t *codes, const int n[3], const int64_t o[3], c
    on one side. spacing (optional) as band_field_phase. */
 int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing);
 
+/* Recto / verso side of every voxel from the labelled recto faces alone (no axis): between consecutive windings k and k + 1 the
+   half nearer k is the recto side, the half nearer k + 1 the verso side (each wrap's label leaves it on its outer side only:
+   wrap 10 .. 10.5 recto, 10.5 .. 11 verso); labelled voxels recto. The nearest labelled voxel of each winding class mod 4: the
+   nearest overall is wrap k, the nearest of the others in the opposite direction ends the voxel's interval: k + 1 recto, k - 1
+   verso, k +- 2 unknown (a missing wrap between). Codes within 5 steps of k's are k's own sheet (across a turn boundary of the
+   codes), not a neighbour. Also unknown: no bounding wrap within 2 rmax, the nearest wrap over rmax label voxels away. */
+enum { RV_UNKNOWN = 0, RV_VERSO = 1, RV_RECTO = 2 };
+int band_field_side_pair(const uint8_t *codes, const int n[3], float rmax, int margin, uint8_t *side);   /* margin: voxels within it of the array edge are left unknown (a caller's halo) */
+
 /* modular difference of band / winding steps in (-126, 126] */
 static inline int band_diff(int a, int b) { int d = ((a - b + 126) % 252 + 252) % 252; return d - 126; }
 

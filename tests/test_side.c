@@ -157,6 +157,53 @@ int main(void) {
         printf("off-centre axis: the radial band field knows %zu of %zu, the pair rule (axis-free) %zu\n", rk, qin, qk);
         CHECK(rk < qk, "the off-centre axis should cost the radial band field coverage (%zu vs %zu)", rk, qk);
     }
+    {   /* band_field_side_pair: between shells j and j + 1 the half nearer j recto, the half nearer j + 1 verso; inside the innermost
+           shell and outside the outermost unknown (no wrap bounds them). Uneven radii (pitch 6 then 20: the pair phase leaves strips unknown there), a missing
+           wrap (unknown between its neighbours), and one shell whose codes cross a turn boundary (18 | 19: never its own neighbour) */
+        const float rmax = 40.f;
+        const double radii[2][NSH] = {{R0, R0 + PITCH, R0 + 2 * PITCH, R0 + 3 * PITCH, R0 + 4 * PITCH}, {R0, R0 + 6, R0 + 26, R0 + 32, R0 + 52}};
+        for (int lay = 0; lay < 2; lay++) {
+            const double *R = radii[lay];
+            memset(codes, 0, N);
+            for (int z = 0; z < NZ; z++) for (int y = 0; y < NY; y++) for (int x = 0; x < NX; x++) {
+                const double r = hypot(y - YC, x - XC);
+                for (int k = 0; k < NSH; k++) if (fabs(r - R[k]) < 0.5) codes[((size_t)z * NY + y) * NX + x] = (uint8_t)(1 + (k + 1) * BAND_STEPS);
+            }
+            CHECK(!band_field_side_pair(codes, n, rmax, 0, side), "band_field_side_pair failed");
+            size_t sk = 0, sin_ = 0, sw = 0;
+            for (int z = 0; z < NZ; z++) for (int y = 0; y < NY; y++) for (int x = 0; x < NX; x++) {
+                const size_t i = ((size_t)z * NY + y) * NX + x; const double r = hypot(y - YC, x - XC);
+                if (r < R[0] || r > R[NSH - 1]) continue;   /* between the innermost and outermost wrap (beyond them: no bounding wrap, unknown) */
+                int j = 0; for (int k = 1; k < NSH; k++) if (fabs(r - R[k]) < fabs(r - R[j])) j = k;
+                if (fabs(r - R[j]) < 1.0) continue;   /* on / next to a face: staircase voxels */
+                const int outer = r > R[j];
+                if (outer ? j < NSH - 1 && fabs(r - 0.5 * (R[j] + R[j + 1])) < 1.0 : j > 0 && fabs(r - 0.5 * (R[j - 1] + R[j])) < 1.0) continue;   /* midpoint */
+                sin_++;
+                if (side[i] == RV_UNKNOWN) continue;
+                sk++; sw += side[i] != (outer ? RV_RECTO : RV_VERSO);
+            }
+            CHECK(sk > sin_ * 0.97 && sw == 0, "side pair (layout %d): %zu of %zu known, %zu on the wrong side", lay, sk, sin_, sw);
+            printf("side pair (layout %d): %zu of %zu known, %zu wrong\n", lay, sk, sin_, sw);
+        }
+        shells(codes, turn2);   /* shells 2 and 3 two turns apart: the gap between them unknown */
+        CHECK(!band_field_side_pair(codes, n, rmax, 0, side), "band_field_side_pair failed (missing wrap)");
+        CHECK(side[((size_t)2 * NY + (int)YC) * NX + (int)(XC + R0 + 2.5 * PITCH)] == RV_UNKNOWN, "side pair: a missing wrap must leave the gap unknown");
+        shells(codes, turn);   /* every shell's codes one step apart across x = XC (18 k + 18 | 18 k + 19: a turn boundary of the codes along each sheet) */
+        for (size_t i = 0; i < N; i++) if (codes[i]) {
+            const size_t x = i % NX; const int k = (codes[i] - 1) / BAND_STEPS;
+            codes[i] = (uint8_t)(x < XC ? BAND_STEPS + k * BAND_STEPS : BAND_STEPS + 1 + k * BAND_STEPS);   /* (code - 1) 18 k + 17 | 18 (k + 1) */
+        }
+        CHECK(!band_field_side_pair(codes, n, rmax, 0, side), "band_field_side_pair failed (turn boundary)");
+        size_t tw = 0, tk = 0;
+        for (int y = 0; y < NY; y++) for (int x = 0; x < NX; x++) {
+            const size_t i = ((size_t)2 * NY + y) * NX + x; const double r = hypot(y - YC, x - XC);
+            if (r < R0 + 1 || r > R0 + (NSH - 1) * PITCH - 1 || side[i] == RV_UNKNOWN) continue;
+            double t = (r - R0) / PITCH; t -= floor(t);
+            if (fabs(t - 0.5) < 0.1 || t < 0.1 || t > 0.9) continue;
+            tk++; tw += side[i] != (t < 0.5 ? RV_RECTO : RV_VERSO);
+        }
+        CHECK(tk > 1000 && tw == 0, "side pair across a turn boundary: %zu known, %zu wrong", tk, tw);
+    }
     free(codes); free(band); free(band2); free(side); free(phase); free(spacing);
     if (fails) return 1;
     printf("test_side: ok (%zu known voxels between the shells)\n", known);

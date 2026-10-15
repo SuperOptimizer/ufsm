@@ -6,6 +6,20 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Recto / verso side labels from the published wraps (2026-10-15)
+Every voxel between two consecutive labelled wraps k and k + 1 (windings increase outward) is recto side in the half nearer k and verso
+side in the half nearer k + 1: the published wraps mark recto faces, the label leaves each wrap on its outer side only. band_field_side_pair:
+feature transforms of the labelled voxels by winding mod 4; the nearest wrap is k, the nearest of the other classes in the opposite
+direction ends the voxel's interval (k + 1 recto, k - 1 verso, k +- 2 a missing wrap: unknown); codes within 5 steps of k's are k's own
+sheet across a turn boundary of the codes. The pair-rule phase (fc02990) decided sides by distance alone and left 16-24% of the papyrus
+unknown in strips beside wraps whose neighbouring gaps differ; this rule labels 94-97% of it (crops), 99.6% agreeing with a Python flood.
+phase-raster --pair 2 writes the raster once (lossless volcomp, 0 unknown, 1 verso, 2 recto); downsample --mode max gives the levels the
+sampler places windows with. Sources: "encoding": "side" on the recto target with the source's "iso": channel 0 recto-side papyrus,
+channel 1 verso-side papyrus, void 0 in both, papyrus of unknown side and CT 0 ignored; no erosion, softening or label morphing.
+The feature transform's y / z passes run on tiles of 64 x lines (bit-identical; 1.4x), the x pass by two sweeps, distances past the
+bound limit dropped between passes, classification on the block interior only: 12.9 -> 9.1 s per 384^3 block (one thread). First box
+(12 x 20 x 20 mm around the Paris4 holdout, 4.8 um): 24 min on 16 laptop threads. Void cutoff at 4.8 um: 60 (CT histogram valley 62-66).
+
 ## Several recto teachers at 9.6 um: one head per teacher (2026-10-15)
 Teachers: the published surfaces (labels), the upstream ps256 3D-recto mask and the upstream m7 surface probabilities. At 9.6 um the
 bands are 2.5-2.7 voxels (labels), 4.1-4.7 (ps256), 2.7 (m7 >= 0.5) thick (4 x mean inside EDT - 2, three Paris4 crops); the radial CT

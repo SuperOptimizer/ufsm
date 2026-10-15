@@ -64,6 +64,8 @@ typedef struct {
     int tgt_present[NCH][MAXLEV];
     int tgt_binary[NCH];      /* target bytes are 0/background, 255/surface; no ignore class */
     int tgt_min_level[NCH];   /* finest stored CT rung; binary targets can upsample finer requests */
+    int tgt_side[NCH];        /* recto only, "encoding": "side": recto / verso side labels (src/band.h RV_*: phase-raster --pair 2), nearest-upsampled;
+                                 the sampler turns them into recto-side / verso-side papyrus (channels 0 / 1) with the source's void cutoff */
     int tgt_erode[NCH], tgt_dilate[NCH];   /* binary targets: "erode" / "dilate" N voxels at the training level (bands of every teacher the same
                                               thickness: e.g. a thick pseudo-label band eroded to the published labels' width) */
     int tgt_prob[NCH];        /* "encoding": "prob": bytes are round(p * 255) (teacher probabilities, no ignore class); read as

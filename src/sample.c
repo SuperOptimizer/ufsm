@@ -939,6 +939,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     for (int ch = 0; ch < NCH; ch++) {
         uint8_t *dst = ttmp + (size_t)ch * p3;
         if (c->papyrus) { memset(dst, 0, p3); continue; }   /* task papyrus: labels from the CT below */
+        if (ch == CH_SHEET && s->tgt_side[CH_RECTO]) continue;   /* the verso side: written with the recto side below */
         if (ch == region_ch) {
             z3 *rz = source_region(s, ch, ri);
             if (!rz) return -1;
@@ -954,13 +955,26 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         } else if (s->tgt_key[ch]) {
             z3 *tz = source_tgt_for_level(s, ch, l, nullptr);
             if (!tz) { if (c->cover) return -1; memset(dst, 0, p3); continue; }
-            if (c->erode && !s->tgt_prob[ch] && l == 0) {
+            if (c->erode && !s->tgt_prob[ch] && !s->tgt_side[ch] && l == 0) {
                 int64_t eo[3] = {o[0]-1, o[1]-1, o[2]-1}, en[3] = {P+2, P+2, P+2};
                 uint8_t *haloed = big + p3;   /* existing (2P)^3 scratch, P >= 2 */
                 if (source_read_target(s, ch, l, eo, en, haloed, 1)) return -1;
                 target_erode1(haloed, dst, P);
             } else if (source_read_target(s, ch, l, o, n, dst, 1)) return -1;
             w[ch] = 1;
+            if (s->tgt_side[ch]) {   /* side labels (band.h RV_*) -> channel 0 recto-side papyrus, channel 1 verso-side papyrus (clean CT >= the
+                                        source's cutoff); void 0 in both; papyrus of unknown side ignored in both; CT 0 masked below */
+                uint8_t *vs = ttmp + (size_t)CH_SHEET * p3; int any = 0;
+                for (size_t k = 0; k < p3; k++) {
+                    const uint8_t sv = dst[k];
+                    if (ctu[k] < iso_t) dst[k] = vs[k] = 0;
+                    else if (sv == RV_RECTO) { dst[k] = 254; vs[k] = 0; any = 1; }
+                    else if (sv == RV_VERSO) { dst[k] = 0; vs[k] = 254; any = 1; }
+                    else dst[k] = vs[k] = 255;
+                }
+                w[CH_SHEET] = 1;
+                if (any && !c->cover) tmax = 254;
+            }
         } else memset(dst, 0, p3);
         if ((s->tgt_erode[ch] || s->tgt_dilate[ch]) && w[ch] && ch != region_ch) {   /* source band thickness: erode / dilate N voxels (3-4-5 chamfer) */
             uint8_t *mk = tp_get(p3, 0), *dm2 = tp_get(p3, 0);
@@ -1026,11 +1040,11 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     /* soft ridge target: background voxels near the surface get 254 * exp(-(d / sigma)^2 / 2), d = 3-4-5 chamfer distance / 3 */
     float soft0; { unsigned sb = atomic_load(&sp->soft_bits); memcpy(&soft0, &sb, 4); }
     float morph=0;
-    if (c->augment && c->label_morph>0 && runif(r)<c->label_morph_p) morph=(float)((2*runif(r)-1)*c->label_morph);
+    if (c->augment && c->label_morph>0 && !s->tgt_side[CH_RECTO] && runif(r)<c->label_morph_p) morph=(float)((2*runif(r)-1)*c->label_morph);
     uint16_t *dm = (uint16_t *)(big + 2 * p3);   /* chamfer distance to the annotated surface, per channel (3 per voxel); big has room */
     uint8_t *dm8 = big + 2 * p3;                  /* the same saturated at 255, when every threshold below is under 255 */
     int dm_ch = -1, dm_any = 0;                   /* channel the map currently holds, and whether that channel had any surface */
-    const int soft_on = soft0 > 0 && region_ch < 0;
+    const int soft_on = soft0 > 0 && region_ch < 0 && !s->tgt_side[CH_RECTO];   /* side labels: hard classes */
     float sigma = 0, shift = 0; int dcut = 0;
     if (soft_on) {
         sigma = (c->soft_um ? soft0 / (float)s->um : soft0) / (float)(1 << l); if (sigma < 0.75f) sigma = 0.75f;

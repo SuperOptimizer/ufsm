@@ -113,9 +113,13 @@ sources *sources_load(const char *path) {
             if (t->type == J_STR) { s->tgt_key[c] = strdup(t->str); continue; }
             s->tgt_binary[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "binary");
             s->tgt_prob[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "prob");
+            s->tgt_side[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "side");
+            if (s->tgt_side[c] && (c != CH_RECTO || s->iso <= 0)) {
+                fprintf(stderr, "sources: %s: \"encoding\": \"side\" is a recto target and needs the source's void cutoff \"iso\"\n", s->name); json_free(j); sources_free(S); return nullptr;
+            }
             double target_min = json_num(json_get(t, "min_level"), 0);
             if (!isfinite(target_min) || target_min < 0 || target_min >= MAXLEV || target_min != (int)target_min ||
-                (target_min && !s->tgt_binary[c] && !s->tgt_prob[c])) {
+                (target_min && !s->tgt_binary[c] && !s->tgt_prob[c] && !s->tgt_side[c])) {
                 fprintf(stderr, "sources: %s/%s: invalid target min_level (binary or prob targets only)\n", s->name, CHNAME[c]);
                 json_free(j); sources_free(S); return nullptr;
             }
@@ -321,7 +325,7 @@ z3 *source_tgt(source *s, int ch, int level) {
 
 z3 *source_tgt_for_level(source *s, int ch, int level, int *stored_level) {
     if (ch < 0 || ch >= NCH || level < 0 || level >= MAXLEV) return nullptr;
-    int actual = (s->tgt_binary[ch] || s->tgt_prob[ch]) && level < s->tgt_min_level[ch] ? s->tgt_min_level[ch] : level;   /* coarser: nearest-upsampled */
+    int actual = (s->tgt_binary[ch] || s->tgt_prob[ch] || s->tgt_side[ch]) && level < s->tgt_min_level[ch] ? s->tgt_min_level[ch] : level;   /* coarser: upsampled */
     if (stored_level) *stored_level = actual;
     return source_tgt(s, ch, actual);
 }
@@ -387,12 +391,12 @@ done:
 
 int z3_read_label_grid(z3 *z, int binary, int shift, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     if (!z || shift < 0 || shift >= MAXLEV) return -1;
-    if (!binary && shift) return read_prob_trilinear(z, shift, o, n, out, nthreads);   /* probabilities: trilinear, not nearest */
+    if (!binary && shift) return read_prob_trilinear(z, shift, o, n, out, nthreads);   /* probabilities: trilinear, not nearest (binary 2: raw codes, nearest) */
     for (int d = 0; d < 3; d++) if (n[d] <= 0) return -1;
     size_t nv = (size_t)n[0] * n[1] * n[2];
     if (!shift) {
         if (z3_read(z, o, n, out, nthreads)) return -1;
-        if (binary) for (size_t k = 0; k < nv; k++) out[k] = out[k] ? 254 : 0;
+        if (binary == 1) for (size_t k = 0; k < nv; k++) out[k] = out[k] ? 254 : 0;
         return 0;
     }
     const z3_meta *m = z3_meta_of(z); int64_t f = (int64_t)1 << shift, co[3], cn[3];
@@ -422,7 +426,7 @@ int z3_read_label_grid(z3 *z, int binary, int shift, const int64_t o[3], const i
             py = iy;
             if (iz < 0 || iy < 0) { memset(dst, 0, (size_t)n[2]); continue; }
             const uint8_t *row = low + ((size_t)iz * cn[1] + iy) * cn[2];
-            for (int64_t x = 0; x < n[2]; x++) { const uint8_t v = ixm[x] >= 0 ? row[ixm[x]] : 0; dst[x] = binary ? (v ? 254 : 0) : v; }   /* prob: the value */
+            for (int64_t x = 0; x < n[2]; x++) { const uint8_t v = ixm[x] >= 0 ? row[ixm[x]] : 0; dst[x] = binary == 1 ? (v ? 254 : 0) : v; }   /* prob / side codes: the value */
         }
     }
     free(low); free(ixm); return 0;
@@ -431,7 +435,7 @@ int z3_read_label_grid(z3 *z, int binary, int shift, const int64_t o[3], const i
 int source_read_target(source *s, int ch, int level, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     int actual = level; z3 *z = source_tgt_for_level(s, ch, level, &actual);
     if (!z) return -1;
-    int rc = z3_read_label_grid(z, s->tgt_binary[ch] || (z && z3_meta_of(z)->label_binary), actual - level, o, n, out, nthreads);
+    int rc = z3_read_label_grid(z, s->tgt_side[ch] ? 2 : s->tgt_binary[ch] || (z && z3_meta_of(z)->label_binary), actual - level, o, n, out, nthreads);
     if (!rc && s->tgt_prob[ch]) {   /* p * 255 -> p * 254: 255 is the ignore code downstream */
         size_t nv = (size_t)n[0] * n[1] * n[2];
         for (size_t k = 0; k < nv; k++) out[k] = (uint8_t)((out[k] * 254 + 127) / 255);
