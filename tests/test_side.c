@@ -158,7 +158,7 @@ int main(void) {
         CHECK(rk < qk, "the off-centre axis should cost the radial band field coverage (%zu vs %zu)", rk, qk);
     }
     {   /* band_field_side_pair: between shells j and j + 1 the half nearer j recto, the half nearer j + 1 verso; inside the innermost
-           shell verso, outside the outermost recto (the side of the end wrap away from its neighbours). Uneven radii (pitch 6 then 20: the pair phase leaves strips unknown there), a missing
+           shell verso, outside the outermost recto, within half the end spacing (unknown beyond it). Uneven radii (pitch 6 then 20: the pair phase leaves strips unknown there), a missing
            wrap (the gap interpolated), and one shell whose codes cross a turn boundary (18 | 19: never its own neighbour) */
         const float rmax = 40.f;
         const double radii[2][NSH] = {{R0, R0 + PITCH, R0 + 2 * PITCH, R0 + 3 * PITCH, R0 + 4 * PITCH}, {R0, R0 + 6, R0 + 26, R0 + 32, R0 + 52}};
@@ -170,18 +170,24 @@ int main(void) {
                 for (int k = 0; k < NSH; k++) if (fabs(r - R[k]) < 0.5) codes[((size_t)z * NY + y) * NX + x] = (uint8_t)(1 + (k + 1) * BAND_STEPS);
             }
             CHECK(!band_field_side_pair(codes, n, rmax, 0, side), "band_field_side_pair failed");
-            size_t sk = 0, sin_ = 0, sw = 0;
+            size_t sk = 0, sin_ = 0, sw = 0, far = 0;
             for (int z = 0; z < NZ; z++) for (int y = 0; y < NY; y++) for (int x = 0; x < NX; x++) {
                 const size_t i = ((size_t)z * NY + y) * NX + x; const double r = hypot(y - YC, x - XC);
-                if (r < R[0] - 6 || r > R[NSH - 1] + 6) continue;   /* beyond the innermost / outermost wrap: their inner side verso, outer side recto */
+                if (r < R[0] - 12 || r > R[NSH - 1] + 12) continue;
                 int j = 0; for (int k = 1; k < NSH; k++) if (fabs(r - R[k]) < fabs(r - R[j])) j = k;
                 if (fabs(r - R[j]) < 1.0) continue;   /* on / next to a face: staircase voxels */
                 const int outer = r > R[j];
                 if (outer ? j < NSH - 1 && fabs(r - 0.5 * (R[j] + R[j + 1])) < 1.0 : j > 0 && fabs(r - 0.5 * (R[j - 1] + R[j])) < 1.0) continue;   /* midpoint */
+                if (r < R[0] || r > R[NSH - 1]) {   /* beyond the end shells: labelled within half the end spacing, unknown beyond it */
+                    const double half = r < R[0] ? 0.5 * (R[1] - R[0]) : 0.5 * (R[NSH - 1] - R[NSH - 2]), d = r < R[0] ? R[0] - r : r - R[NSH - 1];
+                    if (d > half + 1.0) { far += side[i] != RV_UNKNOWN; continue; }
+                    if (d > half - 1.0) continue;
+                }
                 sin_++;
                 if (side[i] == RV_UNKNOWN) continue;
                 sk++; sw += side[i] != (outer ? RV_RECTO : RV_VERSO);
             }
+            CHECK(far == 0, "side pair (layout %d): %zu voxels labelled beyond half the end spacing", lay, far);
             CHECK(sk > sin_ * 0.97 && sw == 0, "side pair (layout %d): %zu of %zu known, %zu on the wrong side", lay, sk, sin_, sw);
             printf("side pair (layout %d): %zu of %zu known, %zu wrong\n", lay, sk, sin_, sw);
         }

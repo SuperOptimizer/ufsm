@@ -14,9 +14,11 @@ direction ends the voxel's interval (k + 1 recto, k - 1 verso, k +- 2 a missing 
 sheet across a turn boundary of the codes. The pair-rule phase (fc02990) decided sides by distance alone and left 16-24% of the papyrus
 unknown in strips beside wraps whose neighbouring gaps differ; this rule labels 94-97% of it (crops), 99.6% agreeing with a Python flood. User: every papyrus voxel recto or verso, so the
 unbounded cases fall back: no wrap on the voxel's own side within 2 rmax (holes / unsegmented sheets in the published meshes; ~5% of
-a damaged window's papyrus) takes the side of its nearest wrap away from that wrap's neighbours; a gap of m windings (missing wraps)
-is interpolated (winding position k + m d_k / (d_k + d_b), recto in the first half of each winding). Crops: 98.3-100% of papyrus
-labelled; unknown only with no wrap within rmax (no segmentation nearby). The laptop's q-4p8.zarr was a partial copy (445 shards of
+a damaged window's papyrus) takes the side of its nearest wrap away from that wrap's neighbours, only within half the local spacing (k to that neighbour; farther
+the unseen next wrap may be the nearer one: unknown, user: "if it lies too far from the surface labels we don't want to be randomly
+picking"); a gap of m windings (missing wraps)
+is interpolated (winding position k + m d_k / (d_k + d_b), recto in the first half of each winding). Box crops: 95.2% (damaged) to
+99.99% of papyrus labelled; the scroll centre inside the innermost published wrap (winding 10) stays unknown (74% near the axis). The laptop's q-4p8.zarr was a partial copy (445 shards of
 the desk's 13056): label boxes need the desk's codes over the box plus halo.
 phase-raster --pair 2 writes the raster once (lossless volcomp, 0 unknown, 1 verso, 2 recto); downsample --mode max gives the levels the
 sampler places windows with. Sources: "encoding": "side" on the recto target with the source's "iso": channel 0 recto-side papyrus,
