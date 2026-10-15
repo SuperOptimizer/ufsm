@@ -1223,8 +1223,8 @@ int cmd_train(int argc, char **argv) {
                P / 2^(nlev-1), included; P % 2^nlev let P 320 / 448 through to an abort */
             int g4ok = P % (4 << (cfg.nlev - 1)) == 0 && g_Pz % (4 << (cfg.nlev - 1)) == 0 && fp4 >= 2 && !*opt(argc, argv, "--policy", "");   /* the fp8 weight gradients of --fp4 1
                                                                                                      (or a --policy) take no MX-fp4 gy */
-            /* UFSM_G4_NARROW=1 (until the paired training checks pass): also 16- and 8-channel levels */
-            const int g4n = ufsm_env_on("UFSM_G4_NARROW");
+            /* 16- and 8-channel levels too (paired 2000-step desk check, production recipe: val 0.6506 vs 0.6534 MX-fp8, +3% speed, 5.8 vs 9.7 GB) */
+            const int g4n = getenv("UFSM_G4_NARROW") ? ufsm_env_on("UFSM_G4_NARROW") : 1;   /* default on since the paired check (2026-10-15); =0 keeps MX-fp8 there */
             for (int i = 0; i < cfg.nlev; i++) if (cfg.widths[i] % 32 && !(g4n && (cfg.widths[i] == 16 || cfg.widths[i] == 8))) g4ok = 0;
             for (int i = 0; i < cfg.nlev - 1; i++) if (cfg.dec_widths[i] > 0 && cfg.dec_widths[i] % 32 && !(g4n && (cfg.dec_widths[i] == 16 || cfg.dec_widths[i] == 8))) g4ok = 0;
             const int g4 = getenv("UFSM_GRAD_MX4") ? ufsm_env_on("UFSM_GRAD_MX4") : g4ok;
