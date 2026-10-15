@@ -144,6 +144,8 @@ void *unet_batch_scratch(unet *u, size_t head, size_t tail);   /* lean 2: the ba
    unet_set_batch_bytes before the build sizes X3 for the tail; the logit gradient goes over the fp16 logits (unet_logit_grad_scratch
    gives none). unet_l0_3buf: this build uses them; unet_last_dry_l3b: the last unet_train_bytes did */
 void unet_set_l0_3buf(int on);
+void unet_set_l0_3buf_split(int on);     /* dec[0]'s conv1 weight gradient in an up and a skip part around the skip's copy (UFSM_L0_3BUF_SPLIT, default 0) */
+void unet_set_l0_3buf_reorder(int on);   /* enc[0]'s conv2 backward-data before its weight gradient (UFSM_L0_3BUF_REORDER, default 1) */
 void *unet_batch_scratch2(unet *u, size_t head, size_t tail, void **tailp);
 void unet_set_batch_bytes(unet *u, size_t head, size_t tail);
 int unet_l0_3buf(const unet *u);
