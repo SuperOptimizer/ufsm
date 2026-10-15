@@ -70,18 +70,28 @@ static void *reader_main(void *arg) {
     return nullptr;
 }
 /* shard writer: the main thread hands a filled shard buffer to a writer thread and continues into the other buffer */
-typedef struct { z3w *w; int nthreads; size_t bytes; uint8_t *buf[2]; int64_t sz[2], sy[2], sx[2]; int pending[2]; atomic_int failed; pthread_mutex_t mu; pthread_cond_t cv; int stop; } writer_t;
+typedef struct { z3w *w; int nthreads; size_t bytes; uint8_t *buf[2]; int64_t sz[2], sy[2], sx[2]; int pending[2]; atomic_int failed; pthread_mutex_t mu; pthread_cond_t cv; int stop;
+                 int gpu, async; void *evs[2], *evd[2]; } writer_t;   /* async: buffer k arrives by a copy on the offload stream (evd[k]) */
 static void *writer_main(void *arg) {
     writer_t *W = arg;
+    if (W->async) nn_init(W->gpu);
     for (;;) {
         pthread_mutex_lock(&W->mu);
         int k = -1;
         while (k < 0 && !W->stop) { for (int i = 0; i < 2; i++) if (W->pending[i]) { k = i; break; } if (k < 0) pthread_cond_wait(&W->cv, &W->mu); }
         if (k < 0) { pthread_mutex_unlock(&W->mu); return nullptr; }
         pthread_mutex_unlock(&W->mu);
+        if (W->async) nn_event_sync(W->evd[k]);   /* the shard's device-to-host copy (queued without blocking the main thread) */
         if (z3w_write_shard(W->w, W->sz[k], W->sy[k], W->sx[k], W->buf[k], W->nthreads)) atomic_store(&W->failed, 1);
         pthread_mutex_lock(&W->mu); W->pending[k] = 0; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
     }
+}
+/* the device shard dsh into buffer k: on the offload stream (the main stream waits for it on the device before dsh is reused, the writer
+   thread before it compresses), so the main thread does not block on the copy; else a plain copy */
+static void writer_d2h(writer_t *W, int k, const uint8_t *dsh) {
+    if (!W->async) { nn_d2h(W->buf[k], dsh, W->bytes); return; }
+    nn_offload_copy(W->buf[k], dsh, W->bytes, 1, W->evs[k], W->evd[k]);
+    nn_stream_wait(0, W->evd[k]);
 }
 /* queue buffer k for writing; returns when the OTHER buffer is free to fill */
 static int writer_submit(writer_t *W, int k, int64_t sz, int64_t sy, int64_t sx) {
@@ -575,11 +585,12 @@ int cmd_predict(int argc, char **argv) {
         if (k) nn_init(gpus[1]);
         if (gnh) unet_gn_freeze(uk, gnh);
         if (ffd || sweep_out) unet_set_head_channels(uk, 0, cfg.cout);   /* every head: the recto channel 0 is written, the others pooled (or swept) */
+        else if (!sheet_task) unet_set_head_channels(uk, hmode == 2 ? 8 * out_ch : out_ch, hmode == 2 ? 8 : 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
         /* fp16 logits (MX activations): the readers below take them as they are (nn_set_logits_h16 after each forward); the 11 heads
            of --fit-zarr were 44 B per window voxel in fp32, which pushed 640^3 windows past the 16 GB card (paged: 40x slower).
            UFSM_PRED_LOGITS32=1 keeps fp32 */
-        if (!sheet_task && !half && !sweep_out && !ufsm_env_on("UFSM_PRED_LOGITS32")) unet_set_fp16_logits(uk, 1);
-        else if (!sheet_task) unet_set_head_channels(uk, hmode == 2 ? 8 * out_ch : out_ch, hmode == 2 ? 8 : 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
+        if (!sheet_task && !half && !sweep_out && !ufsm_env_on("UFSM_PRED_LOGITS32")) unet_set_fp16_logits(uk, 1);   /* (separate from the head
+                                     selection above: as the else of that chain it dropped --channel, every channel-N prediction wrote channel 0) */
         /* the network takes the uint8 CT window itself (with in-place slabs the stem builds its input per slab: no 16-bit window) */
         if (!sheet_task && !half && !ufsm_env_on("UFSM_PRED_HOSTPATH")) unet_set_ct_input(uk, 1);
         if (cfg.scale_cond && !(pcut >= 0 && pap_cond == 1)) {   /* voxel-size conditioning: the CT level's voxel size, or --scale-um to override */
@@ -660,6 +671,8 @@ int cmd_predict(int argc, char **argv) {
     const int gpath = !ufsm_env_on("UFSM_PRED_HOSTPATH");
     WR.buf[0] = gpath ? nn_host_alloc(WR.bytes) : malloc(WR.bytes); WR.buf[1] = gpath ? nn_host_alloc(WR.bytes) : malloc(WR.bytes);
     uint8_t *dsh = gpath && !split ? nn_malloc(WR.bytes) : nullptr; void *stsc = nn_malloc(64); pthread_mutex_init(&WR.mu, nullptr); pthread_cond_init(&WR.cv, nullptr);
+    WR.gpu = gpu; WR.async = gpath && !split && !(getenv("UFSM_PRED_SYNC_D2H") && atoi(getenv("UFSM_PRED_SYNC_D2H")));
+    if (WR.async) for (int k = 0; k < 2; k++) { WR.evs[k] = nn_event_create(); WR.evd[k] = nn_event_create(); }
     pthread_t wth; pthread_create(&wth, nullptr, writer_main, &WR);
     int sb = 0; uint8_t *sbuf = WR.buf[0];
     /* the window goes up as uint8; the input channels are built on the device in the network's storage type */
@@ -838,7 +851,7 @@ int cmd_predict(int argc, char **argv) {
             if (cur_shard >= 0) {
                 if (sheet_task && sheet_write_shard(out,sheet_shard,shard,sz,sy,sx)) return 1;
                 pt = now();
-                if (any) { if (gpath) nn_d2h(sbuf, dsh, WR.bytes); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb ^= 1; sbuf = WR.buf[sb]; }
+                if (any) { if (gpath) writer_d2h(&WR, sb, dsh); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb ^= 1; sbuf = WR.buf[sb]; }
                 p_wr += now() - pt;
                 fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   ", (long long)(cur_shard + 1), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
                 if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
@@ -969,7 +982,7 @@ int cmd_predict(int argc, char **argv) {
                     nn_zero(dsh, WR.bytes);
                     if (ct_shared) nn_pred_place_m(lg, ctm, W, halo, (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
                     else nn_pred_place(lg, ctd, W, halo, (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
-                    nn_d2h(sbuf, dsh, WR.bytes);
+                    writer_d2h(&WR, sb, dsh);
                     if (writer_submit(&WR, sb, qz, qy, qx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
                     sb ^= 1; sbuf = WR.buf[sb];
                 }
@@ -1013,7 +1026,7 @@ int cmd_predict(int argc, char **argv) {
     }
     if (pprof) fprintf(stderr, "\npredict profile (s): main: wait-reader %.2f h2d %.2f gpu(fwd+d2h) %.2f interior-copy %.2f writer-wait %.2f fit-writer-wait %.2f | reader: read %.2f stats %.2f slot-wait %.2f | wall %.2f, %ld tiles\n",
                        p_wait, p_h2d, p_gpu, p_copy, p_wr, p_ffw, rd.t_read, rd.t_stats, rd.t_wait, now() - t0, ntiles);
-    if (kss == 1 && cur_shard >= 0 && any) { if (gpath) nn_d2h(sbuf, dsh, WR.bytes); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } }
+    if (kss == 1 && cur_shard >= 0 && any) { if (gpath) writer_d2h(&WR, sb, dsh); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } }
     if (sheet_task && cur_shard>=0 && sheet_write_shard(out,sheet_shard,shard,sz,sy,sx)) return 1;
     if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
     if (writer_finish(&WR, wth)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
