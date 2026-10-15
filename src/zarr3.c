@@ -479,17 +479,21 @@ static int prefetch_indices(z3 *z, const int64_t *s0, const int64_t *s1, int nth
    labels). Decoded mask chunks with two values are kept in memory as bits, process-wide, the least recently used dropped
    past UFSM_Z3_MASK_CACHE_MB (default 1024; 0 = off). Keys: the z3's id, shard and inner chunk. */
 typedef struct mc_entry { uint64_t z, tick; int64_t s[3]; int ci, refs, dead; uint8_t v0, v1; uint8_t *bits; size_t nbytes, h; struct mc_entry *next, *lp, *ln; } mc_entry;
+/* lock striping: MC_SH independent shards by key hash (each its mutex, buckets, recency list and 1 / MC_SH of the budget), so the
+   sampler's workers do not queue on one process-wide lock (one global lock measured 1.3 ms of waiting per 1.7 s at 18 workers) */
 #define MC_NB 8192
-static pthread_mutex_t g_mc_mu = PTHREAD_MUTEX_INITIALIZER;
-static mc_entry *g_mc_b[MC_NB];
-static mc_entry *g_mc_lh, *g_mc_lt;   /* recency list: head = most recently used (the eviction scanned every bucket under the lock) */
-static size_t g_mc_bytes, g_mc_n; static uint64_t g_mc_tick; static long long g_mc_budget = -1;
-static void mc_lru_unlink(mc_entry *e) {
-    if (e->lp) e->lp->ln = e->ln; else g_mc_lh = e->ln;
-    if (e->ln) e->ln->lp = e->lp; else g_mc_lt = e->lp;
+#define MC_SH 16
+typedef struct { pthread_mutex_t mu; mc_entry *b[MC_NB / MC_SH]; mc_entry *lh, *lt; size_t bytes, n; uint64_t tick; } mc_shard;
+static mc_shard g_mc[MC_SH];
+static pthread_once_t g_mc_once = PTHREAD_ONCE_INIT;
+static void mc_init(void) { for (int k = 0; k < MC_SH; k++) pthread_mutex_init(&g_mc[k].mu, nullptr); }
+static long long g_mc_budget = -1;
+static void mc_lru_unlink(mc_shard *c, mc_entry *e) {
+    if (e->lp) e->lp->ln = e->ln; else c->lh = e->ln;
+    if (e->ln) e->ln->lp = e->lp; else c->lt = e->lp;
     e->lp = e->ln = nullptr;
 }
-static void mc_lru_front(mc_entry *e) { e->lp = nullptr; e->ln = g_mc_lh; if (g_mc_lh) g_mc_lh->lp = e; g_mc_lh = e; if (!g_mc_lt) g_mc_lt = e; }
+static void mc_lru_front(mc_shard *c, mc_entry *e) { e->lp = nullptr; e->ln = c->lh; if (c->lh) c->lh->lp = e; c->lh = e; if (!c->lt) c->lt = e; }
 static long long mc_budget(void) {
     if (g_mc_budget < 0) { const char *e = getenv("UFSM_Z3_MASK_CACHE_MB"); g_mc_budget = (e && *e ? atoll(e) : 1024) << 20; }
     return g_mc_budget;
@@ -499,16 +503,19 @@ static size_t mc_hash(uint64_t z, const work *w) {
                  (uint64_t)w->sx * 0x27d4eb2f165667c5ull ^ (uint64_t)(w->ci + 1) * 0x94d049bb133111ebull;
     h ^= h >> 31; return (size_t)(h & (MC_NB - 1));
 }
+static mc_shard *mc_of(size_t h) { pthread_once(&g_mc_once, mc_init); return &g_mc[h % MC_SH]; }
 /* copy the window part of a cached chunk (copy_chunk on the expanded bits) */
 static int mc_copy(const job *jb, const work *w) {
     const z3 *z = jb->z; const z3_meta *m = &z->m;
-    pthread_mutex_lock(&g_mc_mu);
-    mc_entry *e = g_mc_b[mc_hash(z->id, w)];
+    const size_t h = mc_hash(z->id, w);
+    mc_shard *c = mc_of(h);
+    pthread_mutex_lock(&c->mu);
+    mc_entry *e = c->b[h / MC_SH];
     while (e && !(e->z == z->id && e->s[0] == w->sz && e->s[1] == w->sy && e->s[2] == w->sx && e->ci == w->ci)) e = e->next;
-    if (!e) { pthread_mutex_unlock(&g_mc_mu); return 0; }
-    e->tick = ++g_mc_tick; e->refs++;   /* copied outside the lock; an evicted entry in use is freed by its last reader */
-    mc_lru_unlink(e); mc_lru_front(e);
-    pthread_mutex_unlock(&g_mc_mu);
+    if (!e) { pthread_mutex_unlock(&c->mu); return 0; }
+    e->tick = ++c->tick; e->refs++;   /* copied outside the lock; an evicted entry in use is freed by its last reader */
+    mc_lru_unlink(c, e); mc_lru_front(c, e);
+    pthread_mutex_unlock(&c->mu);
     int64_t c0[3] = {w->sz * m->shard[0] + (int64_t)w->cz * m->chunk[0], w->sy * m->shard[1] + (int64_t)w->cy * m->chunk[1],
                      w->sx * m->shard[2] + (int64_t)w->cx * m->chunk[2]}, lo[3], hi[3];
     int empty = 0;
@@ -526,13 +533,13 @@ static int mc_copy(const job *jb, const work *w) {
             uint8_t *dst = jb->out + ((zz - jb->o[0]) * jb->n[1] + (yy - jb->o[1])) * jb->n[2] + (lo[2] - jb->o[2]);
             for (int64_t x = 0; x < hi[2] - lo[2]; x++, b++) dst[x] = bits[b >> 3] >> (b & 7) & 1 ? v1 : v0;
         }
-    pthread_mutex_lock(&g_mc_mu);
+    pthread_mutex_lock(&c->mu);
     if (!--e->refs && e->dead) { free(e->bits); free(e); }
-    pthread_mutex_unlock(&g_mc_mu);
+    pthread_mutex_unlock(&c->mu);
     return 1;
 }
 static void mc_put(const z3 *z, const work *w, const uint8_t *dec, size_t cv) {
-    const long long budget = mc_budget();
+    const long long budget = mc_budget() / MC_SH;   /* each shard its share */
     const size_t nb = (cv + 7) / 8;
     if (budget <= 0 || (long long)nb > budget) return;
     uint8_t v0 = dec[0], v1 = dec[0]; size_t k = 0;
@@ -547,18 +554,19 @@ static void mc_put(const z3 *z, const work *w, const uint8_t *dec, size_t cv) {
     mc_entry *ne = malloc(sizeof *ne);
     if (!ne) { free(bits); return; }
     const size_t h = mc_hash(z->id, w);
+    mc_shard *c = mc_of(h);
     *ne = (mc_entry){z->id, 0, {w->sz, w->sy, w->sx}, w->ci, 0, 0, v0, v1, bits, nb, h, nullptr, nullptr, nullptr};
-    pthread_mutex_lock(&g_mc_mu);
-    for (mc_entry *e = g_mc_b[h]; e; e = e->next)
-        if (e->z == z->id && e->s[0] == w->sz && e->s[1] == w->sy && e->s[2] == w->sx && e->ci == w->ci) { pthread_mutex_unlock(&g_mc_mu); free(bits); free(ne); return; }
-    while (g_mc_n && g_mc_lt && (long long)(g_mc_bytes + nb) > budget) {   /* drop the least recently used: the list's tail */
-        mc_entry *v = g_mc_lt, **pe = &g_mc_b[v->h];
+    pthread_mutex_lock(&c->mu);
+    for (mc_entry *e = c->b[h / MC_SH]; e; e = e->next)
+        if (e->z == z->id && e->s[0] == w->sz && e->s[1] == w->sy && e->s[2] == w->sx && e->ci == w->ci) { pthread_mutex_unlock(&c->mu); free(bits); free(ne); return; }
+    while (c->n && c->lt && (long long)(c->bytes + nb) > budget) {   /* drop the shard's least recently used: its list's tail */
+        mc_entry *v = c->lt, **pe = &c->b[v->h / MC_SH];
         while (*pe != v) pe = &(*pe)->next;
-        *pe = v->next; mc_lru_unlink(v); g_mc_bytes -= v->nbytes; g_mc_n--;
+        *pe = v->next; mc_lru_unlink(c, v); c->bytes -= v->nbytes; c->n--;
         if (v->refs) v->dead = 1; else { free(v->bits); free(v); }
     }
-    ne->tick = ++g_mc_tick; ne->next = g_mc_b[h]; g_mc_b[h] = ne; mc_lru_front(ne); g_mc_bytes += nb; g_mc_n++;
-    pthread_mutex_unlock(&g_mc_mu);
+    ne->tick = ++c->tick; ne->next = c->b[h / MC_SH]; c->b[h / MC_SH] = ne; mc_lru_front(c, ne); c->bytes += nb; c->n++;
+    pthread_mutex_unlock(&c->mu);
 }
 
 static void *worker(void *arg) {
