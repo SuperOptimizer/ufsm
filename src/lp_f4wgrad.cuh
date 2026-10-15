@@ -50,6 +50,7 @@ __device__ unsigned long long g_f4wprof[6];
 #endif
 extern int g_f4w_coop;
 extern int g_f4w_gypre_kb;
+extern int g_f4w_ws;
 static int f4w_coop(void) {   /* read-only initialization for concurrent training on multiple GPUs */
     return g_f4w_coop >= 0 ? g_f4w_coop : getenv("UFSM_F4W_COOP_GY") ? ufsm_env_on("UFSM_F4W_COOP_GY") : 1;
 }
@@ -627,9 +628,13 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
    20-z-step block) happen once per SM. The x planes live in a ring of 8 slots, numbered by a running plane count (an item
    with s z-steps holds 2 s + 2 planes), so the slots a z-step stages were last read three z-steps before, also across an
    item boundary (whose first z-step stages 4 planes); gy in two buffers; named barriers FULL[i & 1] (producers arrive,
-   consumers wait) and EMPTY[i & 1] (consumers arrive after their MMA, producers wait before staging i + 2). One block per
-   SM (~89 KB smem); 672 threads get 80 registers each. Same values as conv_bwd_w_f4_k with gpre; the gw sums group
-   differently (per block over several tiles). ---- */
+   consumers wait) and EMPTY[i & 1] (consumers arrive after their MMA, producers wait before staging i + 2). The producers
+   are a software pipeline over passes (2 new planes each) with one producer barrier per pass: the decode tile is double
+   buffered, pass k + 1 is decoded while the LY 1 lanes of pass k run, and each thread's x row of pass k + 2 is loaded into
+   registers meanwhile (the producers were latency-bound: the exposed x load and a second barrier per pass; 16 outputs
+   at P512, desk: -28% per level-0 layer with the MT 1 instance). One block per SM (MT 1: ~94 KB smem, MT 2: 101248 B of
+   the 101376 limit); 672 threads get 80 registers each (the cap: 21 warps count as 24). Same values as conv_bwd_w_f4_k
+   with gpre; the gw sums group differently (per block over several tiles). ---- */
 #define WS_NC 9            /* consumer (MMA) warps */
 #define WS_NP 12           /* producer warps */
 #define WS_NT ((WS_NC + WS_NP) * 32)
@@ -645,8 +650,36 @@ static int ws_nsm(void) {   /* SMs of the current device */
     if (!n[d]) { int dev = 0; cudaGetDevice(&dev); cudaDeviceGetAttribute(&n[d], cudaDevAttrMultiProcessorCount, dev); if (n[d] < 1) n[d] = 1; }
     return n[d];
 }
-template <int MT, int NT> __host__ __device__ constexpr size_t ws_smem() {
-    return (size_t)8 * NT * WS_CS + (size_t)8 * NT * WS_SCS * 2 + 2 * (size_t)16 * MT * (G4_CS + 8) + 32 * 32 + (size_t)2 * 8 * NT * 240 * 2 + 64;
+#define WS_XTP 200         /* bf16 per (plane, channel) of the decode tile: 10 rows x 20 */
+template <int MT, int NT> __host__ __device__ constexpr size_t ws_smem() {   /* (MT 2: 101248 B of the 101376 per block) */
+    return (size_t)8 * NT * WS_CS + (size_t)8 * NT * WS_SCS * 2 + 2 * (size_t)16 * MT * (G4_CS + 8) + 32 * 32 + (size_t)2 * 2 * 8 * NT * WS_XTP * 2 + 64;
+}
+/* a producer thread's x voxel of the decode tile: the raw stored block row (NW words: the tile's CH channels) and its scale
+   byte, loaded one pass ahead (the load was the producers' longest stall), decoded as mx_rowch does */
+template <int NW> struct ws_xraw { unsigned w[NW]; unsigned s; };
+template <int NW> __device__ __forceinline__ void ws_xload(const uint8_t *row, const uint8_t *sc, bool ok, ws_xraw<NW> &r) {
+#pragma unroll
+    for (int k = 0; k < NW; k++) r.w[k] = 0u;
+    r.s = 0u;
+    if (ok) {   /* word loads: a tile's stored row can be narrower than CH (an 8-channel segment + padding: the words past it are masked) */
+#pragma unroll
+        for (int k = 0; k < NW; k++) r.w[k] = __ldg((const unsigned *)row + k);
+        r.s = __ldg(sc);
+    }
+}
+template <typename T, int NW> __device__ __forceinline__ void ws_xdec(const ws_xraw<NW> &r, float *v) {   /* (+ 0.f: mx_rowch's fmaf(1, d * s, 0)) */
+    const float sc = mx_scale(r.s);
+#pragma unroll
+    for (int i = 0; i < NW; i++) {
+        const unsigned u = r.w[i];
+        if constexpr (IS_MX4(T)) {
+#pragma unroll
+            for (int q = 0; q < 4; q++) { const float2 d = dec_e2m1x2(u >> (8 * q)); v[8 * i + 2 * q] = d.x * sc + 0.f; v[8 * i + 2 * q + 1] = d.y * sc + 0.f; }
+        } else {
+            const float2 d0 = dec_e4m3x2((unsigned short)(u & 0xffffu)), d1 = dec_e4m3x2((unsigned short)(u >> 16));
+            v[4 * i] = d0.x * sc + 0.f; v[4 * i + 1] = d0.y * sc + 0.f; v[4 * i + 2] = d1.x * sc + 0.f; v[4 * i + 3] = d1.y * sc + 0.f;
+        }
+    }
 }
 template <int MT, int NT, typename T>
 __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restrict__ x, float *__restrict__ gw, int N, int Ci, int D, int H, int W, int Co,
@@ -658,7 +691,7 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
     uint8_t *sgb = (uint8_t *)(sxp + CH * WS_SCS);                        /* [2][BMo][G4_CS] then [2][BMo][8] */
     uint8_t *sgsb = sgb + 2 * BMo * G4_CS;
     chan_t *ctab4 = (chan_t *)(smem_raw + (((sgsb + 2 * BMo * 8) - smem_raw + 31) & ~31));   /* [CH] */
-    __nv_bfloat16 *xt = (__nv_bfloat16 *)(ctab4 + 32);                    /* [2 planes][CH][10 rows][24] */
+    __nv_bfloat16 *xt = (__nv_bfloat16 *)(ctab4 + 32);                    /* [2 buffers][2 planes][CH][10 rows][20]: x at 0 .. 17 */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int ci0 = blockIdx.y * CH, co0 = blockIdx.z * BMo;
     const int nxt = (W + 15) / 16, nyt = (H + 7) / 8, nzt = zs1;
@@ -677,61 +710,116 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
         if (!mxu) __trap();   /* the host only sends aligned MX channel tiles */
     }
     if (warp >= WS_NC) {   /* ================= producers ================= */
-        const int pt = threadIdx.x - WS_NC * 32, pw = warp - WS_NC;   /* 0 .. 255, 0 .. 7 */
+        const int pt = threadIdx.x - WS_NC * 32, pw = warp - WS_NC;   /* 0 .. 383, 0 .. 11 */
         const int ZT = (min(2 * nzt, D) - 2 * zs0 + 1) / 2, TY = (H + 7) / 8, TX = (W + 15) / 16;
         const bool Gany = gp.G != 0 || sp.gp2.G != 0;
-        int it = 0, pbase = 0;   /* z-steps and planes of the earlier items */
-        for (int w = w0; w < nitem; w += nper) {
-        const int ox0 = (w % nxt) * 16, oy0 = ((w / nxt) % nyt) * 8, zt_begin = zs0 + (w / (nxt * nyt)) * ZC, nzs = min(nzt, zt_begin + ZC) - zt_begin;
-        const int pz0 = 2 * zt_begin - 1 - pbase;   /* plane gz lives in slot (gz - pz0) % WS_NS */
-        for (int i = 0; i < nzs; i++, it++) {
-            const int zt = zt_begin + i, oz0 = 2 * zt, b = it & 1;
-            if (it >= 2) ws_bar_sync(3 + b, WS_NT);   /* EMPTY[b]: z-step it - 2 is consumed (its gy buffer; the slots staged now were read by it - 3) */
-            /* gy records of z-step i -> buffer b (waited for at the end) */
-            for (int task = pw; task < BMo; task += WS_NP) {
-                const int co = co0 + task;
-                const uint8_t *rec = gpre + (((((size_t)n * Co + (co < Co ? co : 0)) * ZT + (zt - zs0)) * TY + (oy0 >> 3)) * TX + (ox0 >> 4)) * GP4_REC;
-                cp_async<4>(sgb + (b * BMo + task) * G4_CS + 4 * lane, rec + 4 * lane, co < Co);
-                if (lane == 0) cp_async<8>(sgsb + (b * BMo + task) * 8, rec + 128, co < Co);
+        /* decode: thread per voxel of the 2 planes x 10 rows x 18 tile, all CH channels (bf16, x at 0 .. 17 of a 20-element row);
+           its raw row loaded one pass ahead (the load was the producers' longest stall). (Voxel pairs on 6 warps, bf16 pair stores:
+           fewer instructions but those warps then carried the decode and the LY 1 lanes: +4%) */
+        constexpr int NW = IS_MX4(T) ? CH / 8 : CH / 4;
+        const bool dv = pt < 2 * 180;
+        const int dpl = pt / 180, drow = (pt % 180) / 18, dpp = pt % 18;
+        ws_xraw<NW> raw;
+        const uint8_t *xrow = (const uint8_t *)ctab4[0].p + (IS_MX4(T) ? (ctab4[0].nib >> 1) : 0), *xsc = ctab4[0].sp;   /* the tile's block rows */
+        const int xrb = ctab4[0].rb;
+        /* the block's passes (2 new x planes each; an item's first z-step has two) as cursors: item w, its tile (ox0, oy0), first
+           z-step ztb and z-step count nzs, z-step i of the item, plane pair pp0 (divisions only when the item changes) */
+        struct cur_t { int w, ox0, oy0, ztb, nzs, i, pp0; };
+        auto cset = [&](cur_t &c, int w) { c.w = w; c.i = 0; c.pp0 = 0; c.ox0 = c.oy0 = c.ztb = c.nzs = 0;
+                                           if (w < nitem) { c.ox0 = (w % nxt) * 16; c.oy0 = ((w / nxt) % nyt) * 8; c.ztb = zs0 + (w / (nxt * nyt)) * ZC; c.nzs = min(nzt, c.ztb + ZC) - c.ztb; } };
+        auto clast = [](const cur_t &c) { return c.pp0 + 2 >= (c.i == 0 ? 4 : 2); };   /* the z-step's last pass */
+        auto cadv = [&](cur_t &c) { if (!clast(c)) c.pp0 += 2; else if (c.i + 1 < c.nzs) { c.i++; c.pp0 = 0; } else cset(c, c.w + nper); };
+        auto cgz = [](const cur_t &c) { return 2 * (c.ztb + c.i) + (c.i == 0 ? -1 : 1) + c.pp0; };   /* the pass's first plane */
+        auto xload = [&](const cur_t &c) {   /* this thread's raw row of pass c */
+            const int gz = cgz(c) + dpl, gyy = c.oy0 - 1 + drow, gx = c.ox0 - 1 + dpp;
+            const size_t off = ((size_t)gz * H + gyy) * W + gx;
+            ws_xload<NW>(xrow + off * xrb, xsc + off, dv && gz >= 0 && gz < D && gyy >= 0 && gyy < H && gx >= 0 && gx < W, raw);
+        };
+        auto xdec = [&](int buf) {   /* the raw row -> decode tile buffer buf */
+            if (dv) {
+                float v[CH];
+                ws_xdec<T, NW>(raw, v);
+                __nv_bfloat16 *d = xt + (size_t)(2 * buf + dpl) * CH * WS_XTP + drow * 20 + dpp;
+#pragma unroll
+                for (int q = 0; q < CH; q++) d[q * 200] = __float2bfloat16(v[q]);   /* (a channel = 10 rows of 20) */
             }
-            const int np = i == 0 ? 4 : 2, gz_first = i == 0 ? oz0 - 1 : oz0 + 1;
-            for (int pp0 = 0; pp0 < np; pp0 += 2) {   /* two planes per pass (the decode tile holds two) */
-                ws_bar_sync(5, WS_NP * 32);   /* the previous pass's LY 1 lanes have read the tile */
-                for (int idx = pt; idx < 2 * 180; idx += WS_NP * 32) {   /* decode: thread per voxel, all CH channels */
-                    const int pl = idx / 180, rem = idx % 180, row = rem / 18, pp = rem % 18;
-                    const int gz = gz_first + pp0 + pl, gyy = oy0 - 1 + row, gx = ox0 - 1 + pp;
-                    float v[CH];
-#pragma unroll
-                    for (int q = 0; q < CH; q++) v[q] = 0.f;
-                    if (gz >= 0 && gz < D && gyy >= 0 && gyy < H && gx >= 0 && gx < W) mx_rowch<T, CH>(ctab4[0], false, gz, gyy, gx, D, H, W, v);
-                    __nv_bfloat16 *d = xt + (size_t)pl * CH * 240;
-#pragma unroll
-                    for (int q = 0; q < CH; q++) d[(q * 10 + row) * 24 + 3 + pp] = __float2bfloat16(v[q]);
+        };
+        /* gy record copies (16 data words + the scale word, 8 B per lane): task t of a z-step on warp (t + gyw0) % WS_NP, so the
+           second ones go to the warps without LY 1 lanes (all of them on those warps: their copies land later, +2% at 16 channels) */
+        const int gyw0 = min((2 * CH + 2) / 3, WS_NP) % WS_NP, tw = (pw + WS_NP - gyw0) % WS_NP;
+        const size_t rcs = (size_t)ZT * TY * TX * GP4_REC;   /* record stride of an output channel */
+        uint8_t *const gdst = lane < 16 ? sgb + 8 * lane : sgsb;
+        const int gdcs = lane < 16 ? G4_CS : 8;
+        /* software pipeline over the passes, one producer barrier each: pass k + 1 is decoded into tile buffer (k + 1) & 1 (its rows
+           were loaded during pass k - 1) and the rows of pass k + 2 are loaded while the LY 1 lanes of pass k read buffer k & 1 */
+        cur_t cl, cn;   /* pass k (LY 1 lanes), pass k + 1 (decoded now) */
+        cset(cl, w0);
+        if (cl.w < nitem) { xload(cl); xdec(0); }
+        cn = cl; cadv(cn);
+        if (cn.w < nitem) xload(cn);
+        ws_bar_sync(5, WS_NP * 32);
+        int it = 0, pbase = 0, kp = 0;   /* z-steps, planes of the earlier items, passes */
+        for (; cl.w < nitem; kp++) {
+            if (cn.w < nitem) {
+                xdec((kp + 1) & 1);
+                cur_t c2 = cn; cadv(c2);
+                if (c2.w < nitem) xload(c2);
+            }
+            const int b = it & 1, ox0 = cl.ox0, oy0 = cl.oy0;
+            if (cl.pp0 == 0) {   /* the z-step's first pass */
+                if (it >= 2) ws_bar_sync(3 + b, WS_NT);   /* EMPTY[b]: z-step it - 2 is consumed (its gy buffer; the slots staged now were read by it - 3) */
+                if (lane < 17) {   /* gy records of the z-step -> buffer b (waited for at its end) */
+                    const uint8_t *rz = gpre + ((((size_t)n * Co * ZT + (cl.ztb + cl.i - zs0)) * TY + (oy0 >> 3)) * TX + (ox0 >> 4)) * GP4_REC + 8 * lane;
+                    for (int task = tw; task < BMo; task += WS_NP) {
+                        const int co = co0 + task;
+                        cp_async<8>(gdst + (b * BMo + task) * gdcs, co < Co ? rz + (size_t)co * rcs : rz, co < Co);
+                    }
                 }
-                ws_bar_sync(5, WS_NP * 32);
+            }
+            const int pz0 = 2 * cl.ztb - 1 - pbase, gzf = cgz(cl);   /* plane gz lives in slot (gz - pz0) % WS_NS */
+            const bool full = ox0 > 0 && W - ox0 + 1 >= 18;   /* interior x tile: no column outside the volume */
+            const __nv_bfloat16 *xtb = xt + (size_t)2 * (kp & 1) * CH * WS_XTP;
+            {
                 /* LY 1 lanes: (plane, channel) groups of 10 rows, 3 per warp (as conv_bwd_w_f4_k) */
                 for (int grp0 = pw * 3; grp0 < 2 * CH; grp0 += WS_NP * 3) {
                     const unsigned FM = 0xffffffffu;
                     const int gi = lane / 10, r = lane - 10 * gi, grp = grp0 + gi, pl = grp / CH, q = grp % CH;
-                    const int gz = gz_first + pp0 + pl, slot = (gz - pz0) % WS_NS, gyy = oy0 - 1 + r;
+                    const int gz = gzf + pl, slot = (gz - pz0) % WS_NS, gyy = oy0 - 1 + r;
                     const bool act = gi < 3 && grp < 2 * CH;
                     const chan_t &cq = ctab4[act ? q : 0];
                     const bool rok = act && cq.p && gz >= 0 && gz < D && gyy >= 0 && gyy < H, G = Gany && cq.g;
-                    const float ca = cq.a, cb = cq.b;
-                    const int jlo = ox0 == 0 ? 1 : 0, jhi = W - ox0 + 1;
-                    const unsigned *src = (const unsigned *)(xt + (size_t)(act ? pl : 0) * CH * 240 + ((act ? q : 0) * 10 + r) * 24 + 2);
-                    unsigned wv[10];
+                    const float ha = 0.5f * cq.a, hb = 0.5f * cq.b;   /* h = (a x + b) / 2 */
+                    const unsigned *src = (const unsigned *)(xtb + (size_t)(act ? pl : 0) * CH * WS_XTP + ((act ? q : 0) * 10 + r) * 20);
+                    unsigned wv[9];   /* x j: the low (j even) / high half of word j / 2 */
 #pragma unroll
-                    for (int k = 0; k < 10; k++) wv[k] = src[k];
+                    for (int k = 0; k < 9; k++) wv[k] = src[k];
                     float v[18];
                     unsigned am = 0u;
+                    if (full) {   /* (uniform) every column inside: no per-value masks; a row outside (!rok) is zeroed by m = 0 below */
+                        if (G) {
 #pragma unroll
-                    for (int j = 0; j < 18; j++) {
-                        const float xv = __uint_as_float((j & 1) ? wv[(j + 1) >> 1] << 16 : wv[j >> 1] & 0xffff0000u);
-                        const float u = fmaf(xv, ca, cb), h = 0.5f * u;
-                        float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
-                        v[j] = rok && j >= jlo && j < jhi ? (G ? fmaf(h, th, h) : xv) : 0.f;
-                        am = amax_u(am, v[j]);
+                            for (int j = 0; j < 18; j++) {
+                                const float xv = __uint_as_float((j & 1) ? wv[j >> 1] & 0xffff0000u : wv[j >> 1] << 16);
+                                const float h = fmaf(xv, ha, hb);
+                                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+                                v[j] = fmaf(h, th, h);
+                                am = amax_u(am, v[j]);
+                            }
+                        } else {
+#pragma unroll
+                            for (int j = 0; j < 18; j++) { v[j] = __uint_as_float((j & 1) ? wv[j >> 1] & 0xffff0000u : wv[j >> 1] << 16); am = amax_u(am, v[j]); }
+                        }
+                        if (!rok) am = 0u;
+                    } else {
+                        const int jlo = ox0 == 0 ? 1 : 0, jhi = W - ox0 + 1;
+#pragma unroll
+                        for (int j = 0; j < 18; j++) {
+                            const float xv = __uint_as_float((j & 1) ? wv[j >> 1] & 0xffff0000u : wv[j >> 1] << 16);
+                            const float h = fmaf(xv, ha, hb);
+                            float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+                            v[j] = rok && j >= jlo && j < jhi ? (G ? fmaf(h, th, h) : xv) : 0.f;
+                            am = amax_u(am, v[j]);
+                        }
                     }
                     const unsigned amE = max(am, __shfl_xor_sync(FM, am, 1));
                     const unsigned amO = max(am, __shfl_sync(FM, am, (r & 1) ? min(lane + 1, 31) : max(lane - 1, 0)));
@@ -742,7 +830,7 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
                         const int e = mx_exp(__uint_as_float(pz ? amO : amE), 1.f / 6.f);
                         eP[pz] = e;
                         if (!act || (pz && (r < 1 || r > 8))) continue;
-                        const float m = exp2i(-e);
+                        const float m = rok ? exp2i(-e) : 0.f;
                         const int pair = pz ? 5 + ((r - 1) >> 1) : r >> 1, rin = pz ? (r - 1) & 1 : r & 1;
                         uint2 *o = (uint2 *)(dst + pair * 48 + rin * 24);
                         o[0] = make_uint2(((unsigned)cvt_e2m1x2(v[0] * m, 0.f) & 15u) << 28, cvt_e2m1x8(v + 1, m));
@@ -753,10 +841,14 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
                     if (act && r < 9) sxp[q * WS_SCS + slot * 32 + ((r & 1) ? 5 + ((r - 1) >> 1) : r >> 1)] = (unsigned short)(eb | (r < 7 ? up << 8 : 0u));
                 }
             }
-            cp_async_wait();
-            ws_bar_arrive(1 + b, WS_NT);   /* FULL[b]: z-step it is staged */
-        }
-        pbase += 2 * nzs + 2;
+            if (clast(cl)) {   /* the z-step's last pass */
+                cp_async_wait();
+                ws_bar_arrive(1 + b, WS_NT);   /* FULL[b]: z-step it is staged */
+                it++;
+                if (cl.i + 1 >= cl.nzs) pbase += 2 * cl.nzs + 2;
+            }
+            ws_bar_sync(5, WS_NP * 32);   /* buffer kp & 1 read, buffer (kp + 1) & 1 written */
+            cl = cn; cadv(cn);
         }
         return;
     }
@@ -961,7 +1053,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
         const size_t per_zt = (size_t)ys.n * ys.c * ((ys.h + 7) / 8) * Wb * GP4_REC;   /* one record per (n, co, z-step, 8-row tile, 16-x tile) */
         /* the records of the whole layer from the GN+SiLU backward apply that produced gy (lp_gn_silu_bwd_apply_rec): no pre-pass, one slab */
         const lp_gyrec_t &rc = g_gyrec;   /* this thread's (lp_gn_silu_bwd_apply_rec) */
-        const int cached = g_f4w_gy4 && rc.valid && rc.dev == cur_dev_() && rc.gy == (const void *)gy && rc.n == ys.n && rc.c == ys.c && rc.d == ys.d && rc.h == ys.h && rc.w == ys.w && gbw == 32;
+        const int cached = g_f4w_gy4 && rc.valid && rc.dev == cur_dev_() && rc.gy == (const void *)gy && rc.n == ys.n && rc.c == ys.c && rc.d == ys.d && rc.h == ys.h && rc.w == ys.w && gbw == rc.bw;
         const size_t cap_zt = (cap_kb << 10) / per_zt;
         const int szt = cached ? nzt : cap_zt < 1 ? 1 : cap_zt < (size_t)nzt ? (int)cap_zt : nzt;
         uint8_t *buf = cached ? (uint8_t *)rc.rec : lp_buf<uint8_t>(4, per_zt * szt);
@@ -979,13 +1071,22 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
             int zc_s = zs1 - zs0 < max_zc ? zs1 - zs0 : max_zc;
             while (zc_s > 1 && (size_t)base * nblk_(zs1 - zs0, zc_s) < 72) zc_s--;
             const dim3 g((unsigned)(nblk_(ys.w, 16) * nblk_(ys.h, 8) * nblk_(zs1 - zs0, zc_s) * ys.n), (xs.c + 8 * NT - 1) / (8 * NT), (ys.c + 16 * MT - 1) / (16 * MT));
-            static int ws_env = -1;
-            if (ws_env < 0) ws_env = getenv("UFSM_F4W_WS") ? atoi(getenv("UFSM_F4W_WS")) : 1;
-            if constexpr (IS_MX(T)) if (ws_env && lay == 1 && !had && !sp.up && NT == 2 && MT == 2 && (sp.x2 == nullptr || sp.c_split % 16 == 0)) {   /* MT 1 (16 outputs): no gain */
+            static int ws_env0 = -1;
+            if (ws_env0 < 0) ws_env0 = getenv("UFSM_F4W_WS") ? atoi(getenv("UFSM_F4W_WS")) : 1;
+            const int ws_env = g_f4w_ws >= 0 ? g_f4w_ws : ws_env0;   /* (tests: lp_set_f4w_ws) */
+            /* input-channel tile of the warp-specialised kernel: 16 (NT 2), or 8 (NT 1: 8-channel inputs, or a split input whose
+               first part is 8 channels, e.g. an 8-wide skip next to a 16-channel up part) */
+            int NTw = 0;
+            if (NT == 2 && (sp.x2 == nullptr || sp.c_split % 16 == 0)) NTw = 2;
+            else if (xs.c % 8 == 0 && (sp.x2 == nullptr || sp.c_split % 8 == 0)) NTw = 1;
+            if (ws_env == 3 && !(NTw == 2 && MT == 2)) NTw = 0;   /* UFSM_F4W_WS=3: the old selection (>= 32 outputs, 16-channel input tiles), A/B */
+            if constexpr (IS_MX(T)) if (ws_env && lay == 1 && !had && !sp.up && NTw) {
                 /* warp-specialised persistent kernel: the blocks of a channel tile split its (tile, z chunk) items; z chunks
                    short enough for >= 4 items per SM, then the block count with the shortest estimated makespan (waves x
-                   items per block, in z-steps: + 1 per item for its 4-plane first step, + 6 per block for fill and drain) */
-                const int nsm = ws_nsm(), combos = ((xs.c + 15) / 16) * ((ys.c + 16 * MT - 1) / (16 * MT)) * ys.n, ntile = nblk_(ys.w, 16) * nblk_(ys.h, 8);
+                   items per block, in z-steps: + 1 per item for its 4-plane first step, + 6 per block for fill and drain).
+                   16 outputs (MT 1, the 16-channel levels) and 8-channel input tiles (NTw 1) too: -28% per level-0 layer vs
+                   conv_bwd_w_f4_k (desk P512, 16-wide net) */
+                const int nsm = ws_nsm(), combos = ((xs.c + 8 * NTw - 1) / (8 * NTw)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * ys.n, ntile = nblk_(ys.w, 16) * nblk_(ys.h, 8);
                 int zc_w = zs1 - zs0;
                 while (zc_w > 4 && (size_t)combos * ntile * nblk_(zs1 - zs0, zc_w) < (size_t)4 * nsm) zc_w = (zc_w + 1) / 2;
                 const int nitem = ntile * nblk_(zs1 - zs0, zc_w);
@@ -994,16 +1095,16 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
                     const double waves = (double)nblk_(combos * k, nsm), cost = waves * ((double)nblk_(nitem, k) * (zc_w + 1) + 6);
                     if (cost < best - 1e-9) { best = cost; nper = k; }
                 }
-                const dim3 gw3((unsigned)(nper * ys.n), (xs.c + 15) / 16, (ys.c + 16 * MT - 1) / (16 * MT));
-                static int wattr[8][2];
-                const int mi = MT - 1;
-                if (MT == 1) {
-                    if (!wattr[cur_dev_()][mi]) { wattr[cur_dev_()][mi] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4ws_k<1, 2, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ws_smem<1, 2>()); }
-                    conv_bwd_w_f4ws_k<1, 2, T><<<gw3, WS_NT, ws_smem<1, 2>()>>>((const T *)x, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, zc_w, buf, zs0, zs1);
-                } else {
-                    if (!wattr[cur_dev_()][mi]) { wattr[cur_dev_()][mi] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4ws_k<2, 2, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ws_smem<2, 2>()); }
-                    conv_bwd_w_f4ws_k<2, 2, T><<<gw3, WS_NT, ws_smem<2, 2>()>>>((const T *)x, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, zc_w, buf, zs0, zs1);
-                }
+                const dim3 gw3((unsigned)(nper * ys.n), (xs.c + 8 * NTw - 1) / (8 * NTw), (ys.c + 16 * MT - 1) / (16 * MT));
+                static int wattr[8][4];
+                const int mi = (MT - 1) + 2 * (NTw - 1);
+#define WSL(M, NN) do { if (!wattr[cur_dev_()][mi]) { wattr[cur_dev_()][mi] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4ws_k<M, NN, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ws_smem<M, NN>()); } \
+                        conv_bwd_w_f4ws_k<M, NN, T><<<gw3, WS_NT, ws_smem<M, NN>()>>>((const T *)x, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, zc_w, buf, zs0, zs1); } while (0)
+                if (MT == 1 && NTw == 1) WSL(1, 1);
+                else if (MT == 1) WSL(1, 2);
+                else if (NTw == 1) WSL(2, 1);
+                else WSL(2, 2);
+#undef WSL
                 continue;
             }
             switch (MT * 10 + NT) {

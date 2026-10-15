@@ -5,6 +5,8 @@ extern "C" void lp_set_f4w_coop(int on) { g_f4w_coop = on != 0; }
 int g_f4w_coop = -1;
 int g_f4w_gypre_kb = -1;   /* gy pre-pass slab cap in KiB (0 off, -1 env UFSM_F4W_GYPRE in MiB, default 96) */
 extern "C" void lp_set_f4w_gypre_kb(int kb) { g_f4w_gypre_kb = kb; }
+int g_f4w_ws = -1;   /* warp-specialised weight gradient: 0 off, 1 on, 3 the old selection (>= 32 outputs only); -1 env UFSM_F4W_WS (default 1) */
+extern "C" void lp_set_f4w_ws(int m) { g_f4w_ws = m; }
 /* instantiated in lp_f4wgrad_i*.cu */
 extern template void bwd_w_f4_t<mx4_t, mx8_t>(const void *x, shape5 xs, const mx8_t *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had);
 extern template void bwd_w_f4_t<mx4_t, __half>(const void *x, shape5 xs, const __half *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp, int had);
@@ -73,6 +75,18 @@ __global__ void sr_nib_probe_k(float v, size_t n, double *acc) {
 extern "C" double lp_sr_e2m1_nib_mean(float v, size_t n) {
     double *d; cudaMalloc(&d, sizeof(double)); cudaMemset(d, 0, sizeof(double));
     sr_nib_probe_k<<<nblk_(n, 256), 256>>>(v, n, d);
+    double h = 0; cudaMemcpy(&h, d, sizeof(double), cudaMemcpyDeviceToHost); cudaFree(d); LPCK();
+    return h / (double)n;
+}
+/* test probe: mean of n e4m3 stochastic roundings of v (sr_e4m3 then the round-to-nearest conversion, as the fp8 gradient paths) */
+__global__ void sr_e4m3_probe_k(float v, size_t n, double *acc) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    atomicAdd(acc, (double)dec_e4m3x2((unsigned short)cvt_e4m3(sr_e4m3(v, sr_hash(0x7654321u, i)))).x);
+}
+extern "C" double lp_sr_e4m3_mean(float v, size_t n) {
+    double *d; cudaMalloc(&d, sizeof(double)); cudaMemset(d, 0, sizeof(double));
+    sr_e4m3_probe_k<<<nblk_(n, 256), 256>>>(v, n, d);
     double h = 0; cudaMemcpy(&h, d, sizeof(double), cudaMemcpyDeviceToHost); cudaFree(d); LPCK();
     return h / (double)n;
 }

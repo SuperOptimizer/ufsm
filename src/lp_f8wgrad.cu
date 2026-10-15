@@ -2,6 +2,18 @@
 #include "lp_f8wgrad.cuh"
 
 extern "C" void lp_set_f8w_coop(int c) { g_f8w_coop = c; }
+/* test probe: mean of n sr_e4m3x roundings of v (then the round-to-nearest conversion, as the kernels store them) */
+__global__ void sr_e4m3x_probe_k(float v, size_t n, double *acc) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    atomicAdd(acc, (double)dec_e4m3x2((unsigned short)cvt_e4m3(sr_e4m3x(v, 0x7654321u, i))).x);
+}
+extern "C" double lp_sr_e4m3x_mean(float v, size_t n) {
+    double *d; cudaMalloc(&d, sizeof(double)); cudaMemset(d, 0, sizeof(double));
+    sr_e4m3x_probe_k<<<nblk_(n, 256), 256>>>(v, n, d);
+    double h = 0; cudaMemcpy(&h, d, sizeof(double), cudaMemcpyDeviceToHost); cudaFree(d); LPCK();
+    return h / (double)n;
+}
 int g_f8w_coop = 1 | 4;   /* gy (bit 1) measured mixed: -7% at 96->32, +5..14% elsewhere (per-channel work per thread); bit 2 (auto): gy
                              coop for the network input conv only (Ci <= 8, one 16-channel gy block: 16.7 -> 13.1 ms at 384^3) */
 /* instantiated in lp_f8wgrad_i*.cu */

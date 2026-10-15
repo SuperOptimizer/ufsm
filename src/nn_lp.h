@@ -41,7 +41,7 @@ void lp_set_f4w_coop(int on);   /* test hook: cooperative MX8 gradient loads for
 /* the fp4 weight gradient's gy records (gy_pre4_k layout: 136 B per (n, co, z-step, 8-row tile, 16-x tile), the whole layer) written by
    the GN+SiLU backward apply that produced gy; valid until the next apply on this device, matched by gy pointer and shape (lp_bwd_w_f4
    then skips its pre-pass); gb: the per-channel sums of gy (the bias gradient) */
-typedef struct { const void *gy; int n, c, d, h, w, valid, dev; uint8_t *rec; size_t cap; float *gb; int gbc; } lp_gyrec_t;
+typedef struct { const void *gy; int n, c, d, h, w, valid, dev; uint8_t *rec; size_t cap; float *gb; int gbc; int bw; } lp_gyrec_t;   /* bw: the MX block width of the records' gy */
 #ifdef __cplusplus
 extern thread_local lp_gyrec_t g_gyrec;   /* per host thread (a GPU's trainer thread; split halves sharing a GPU), its own buffers */
 #else
@@ -52,6 +52,10 @@ int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G, const floa
 void lp_set_s2b_f4(int on);  /* the fp4 stride-2 backward-data (MX-fp4 gy): 3 for 32 and 64 channels, 1 for 32 only, 0 bf16 tensor cores, -1 env UFSM_S2B_F4 (default 3) */
 void lp_set_s2_f4(int on);   /* the fp4 stride-2 forward (MX-fp4 32-channel input, widths % 16): 1 on, 0 fp8, -1 env UFSM_S2_F4 (default on) */
 void lp_set_f4w_gypre_kb(int kb);   /* gy pre-pass of the fp4 weight gradient: slab cap in KiB (0 off, -1 env UFSM_F4W_GYPRE MiB, default 96) */
+void lp_set_f4w_ws(int m);          /* warp-specialised fp4 weight gradient: 0 off, 1 on (default), 3 only >= 32 outputs; -1 env UFSM_F4W_WS */
+void lp_set_gyrec_narrow(int on);   /* the GN+SiLU backward's gy records also for whole 8 / 16-channel levels (-1: env UFSM_GYREC=2) */
+void lp_set_gyrec_off(int off);     /* test hook: 1 no gy records at all (the plain apply), -1 env */
+int lp_gyrec_narrow(void);
 int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp);   /* stride 2; gp: input gn+silu; 0, or 3 when the fp4 kernel ran */
 int lp_bwd_w_s2_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp);   /* stride 2, gw / gb accumulated */
 /* MX-fp8 activation storage (lp dtype 3), see nn_fp8.cu: channel-blocked e4m3 bytes + ue8m0 scale plane */
@@ -67,6 +71,8 @@ void lp_input_rad(const void *ct16, int dt, const void *rec, size_t rec_bytes, i
 void lp_mx4_to_f32(const void *x, int N, int C, size_t S, float *y);
 double lp_sr_e2m1_mean(float v, size_t n);                        /* test probe: mean of n stochastic e2m1 roundings of v (v in grid units) */
 double lp_sr_e2m1_nib_mean(float v, size_t n);                    /* test probe: the same for the direct-nibble rounding of the fp4 weight gradient (|v| <= 6) */
+double lp_sr_e4m3_mean(float v, size_t n);                        /* test probe: mean of n sr_e4m3 + round-to-nearest e4m3 conversions of v */
+double lp_sr_e4m3x_mean(float v, size_t n);                       /* test probe: the same for the exact sr_e4m3x of the fp8 weight gradient's gy */
 void lp_cvt_e2m1_probe(const float *hv, unsigned char *ho, int n);   /* test probe: raw cvt.rn.satfinite.e2m1x2 nibble of each host value */
 /* MX elementwise ops: xdt / ydt = lp dtype of the operand (3 mx8, 4 mx4; gn_silu_apply also takes a plane-major 0 / 1 / 2 input);
    gradients (gy / gx, gdt) are never mx4 */
