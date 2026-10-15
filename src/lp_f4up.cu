@@ -144,15 +144,9 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
         const int glo = oz0 - 1 + p0n + zi0, ghi = oz0 + TZ + zi0, cz0 = (glo >> 1) - 1, cy0 = (oy0 >> 1) - 2, cx0 = (ox0 >> 1) - 2;
         __syncthreads();   /* the previous tile's MMA and epilogue are done with the ring slots and the scratch */
         F4RP(4);
-        stage_up_coarse16<CZ>(ctab[0], Cx, cab, Gu, cu, cus, cz0, cy0, cx0, min(CZ, ((ghi >> 1) + 1) - cz0 + 1), Di, H, W);
-        __syncthreads();
-        F4RP(0);
         constexpr int NIT = (NP * 180 + 255) / 256;
-        float2 gs[16];   /* the skip's GN coefficients in registers for the staging (were two shared loads per element) */
-#pragma unroll
-        for (int k = 0; k < 16; k++) gs[k] = cab[16 + k];
         uint2 raw[NIT];
-        unsigned rsc[NIT], okm = 0u;   /* the skip rows, all loads first (NIT in flight per thread) */
+        unsigned rsc[NIT], okm = 0u;   /* the skip rows: all loads issued first, in flight through the coarse stage and its barrier */
 #pragma unroll
         for (int it = 0; it < NIT; it++) {
             const int li = threadIdx.x + 256 * it, pl = p0n + li / 180, rem = li % 180, ix = rem % 18, iy = rem / 18;
@@ -161,6 +155,12 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
             ld_row16(cs0, ok ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0, ok, raw[it], rsc[it]);
             okm |= (unsigned)ok << it;
         }
+        stage_up_coarse16<CZ>(ctab[0], Cx, cab, Gu, cu, cus, cz0, cy0, cx0, min(CZ, ((ghi >> 1) + 1) - cz0 + 1), Di, H, W);
+        __syncthreads();
+        F4RP(0);
+        float2 gs[16];   /* the skip's GN coefficients in registers for the staging (were two shared loads per element) */
+#pragma unroll
+        for (int k = 0; k < 16; k++) gs[k] = cab[16 + k];
 #pragma unroll
         for (int it = 0; it < NIT; it++) {   /* stage: up part interpolated, skip dequantised + GN+SiLU, each requantised */
             const int li = threadIdx.x + 256 * it, pl = p0n + li / 180, rem = li % 180, ix = rem % 18, iy = rem / 18;
