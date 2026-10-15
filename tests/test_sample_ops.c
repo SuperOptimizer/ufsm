@@ -137,28 +137,6 @@ int main(void) {
         printf("winding input: %d full cube symmetries, FP32/FP16 scalar reference checked\n",checked);
         free(ct); free(input); free(half);
     }
-    {   /* source iso foreground vs brute force: a papyrus voxel (CT >= iso) within 3-4-5 chamfer distance 3R (any own CT) */
-        const int D = 19, P = 33, iso = 60; const size_t p3 = (size_t)D * P * P;
-        uint8_t *ct = malloc(p3); size_t dif = 0, nfg = 0, tot = 0;
-        for (int R = 1; R <= 4; R++) {
-            for (size_t k = 0; k < p3; k++) { uint64_t u = rnext(&r); ct[k] = (u & 1023) < 6 ? 60 + (u >> 10) % 150 : (u >> 20) % 9 == 0 ? 0 : (uint8_t)(20 + (u >> 30) % 40); }
-            uint8_t *fg = iso_foreground(ct, D, P, iso, R);
-            for (int z = 0; z < D; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
-                size_t k = ((size_t)z * P + y) * P + x; int best = 1 << 30;
-                for (int zz = z - R; zz <= z + R; zz++) for (int yy = y - R; yy <= y + R; yy++) for (int xx = x - R; xx <= x + R; xx++) {
-                    if (zz < 0 || zz >= D || yy < 0 || yy >= P || xx < 0 || xx >= P || ct[((size_t)zz * P + yy) * P + xx] < iso) continue;
-                    int a3[3] = {abs(zz - z), abs(yy - y), abs(xx - x)}, t;
-                    if (a3[0] < a3[1]) { t = a3[0]; a3[0] = a3[1]; a3[1] = t; } if (a3[1] < a3[2]) { t = a3[1]; a3[1] = a3[2]; a3[2] = t; } if (a3[0] < a3[1]) { t = a3[0]; a3[0] = a3[1]; a3[1] = t; }
-                    int dd = 3 * (a3[0] - a3[1]) + 4 * (a3[1] - a3[2]) + 5 * a3[2]; if (dd < best) best = dd;
-                }
-                uint8_t want = best <= 3 * R; dif += fg[k] != want; nfg += want; tot++;
-            }
-            tp_put(fg, p3);
-        }
-        printf("iso foreground vs brute-force chamfer, R 1..4: %zu of %zu differ (%zu foreground)\n", dif, tot, nfg);
-        if (dif || !nfg || nfg == tot) { printf("iso foreground  FAIL\n"); bad++; }
-        free(ct);
-    }
     size_t n = 1 << 24; float *X = calloc(n, 4);
     pthread_once(&g_ntab_once, ntab_init);
     for (size_t k = 0; k < n; k += 4) { uint64_t u = rnext(&r); X[k] = g_ntab[u & 0xffff]; X[k + 1] = g_ntab[(u >> 16) & 0xffff]; X[k + 2] = g_ntab[(u >> 32) & 0xffff]; X[k + 3] = g_ntab[u >> 48]; }

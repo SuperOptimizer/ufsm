@@ -166,7 +166,6 @@ static batch alloc_batch(const sample_cfg *c) {
     b.level = malloc((size_t)c->B * sizeof(int8_t));
     b.um = malloc((size_t)c->B * sizeof(float));
     b.corner = malloc((size_t)c->B * sizeof *b.corner);
-    b.iso = calloc((size_t)c->B, sizeof *b.iso);
     b.sheet = calloc((size_t)c->B, sizeof *b.sheet);
     b.band = c->band ? nn_host_alloc((size_t)c->B * p3) : nullptr;
     b.side = c->side ? nn_host_alloc((size_t)c->B * p3) : nullptr;
@@ -176,7 +175,7 @@ static batch alloc_batch(const sample_cfg *c) {
     return b;
 }
 
-static void free_batch(batch *b) { if (b->pap) nn_host_free(b->pap); if (b->wind) nn_host_free(b->wind); if (b->band) nn_host_free(b->band); if (b->side) nn_host_free(b->side); if (b->pm) nn_host_free(b->pm); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); free(b->iso); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->pap) nn_host_free(b->pap); if (b->wind) nn_host_free(b->wind); if (b->band) nn_host_free(b->band); if (b->side) nn_host_free(b->side); if (b->pm) nn_host_free(b->pm); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -609,19 +608,6 @@ static void tp_put(void *p, size_t n) {
     if (tpool.k < TP_N) { tpool.b[tpool.k] = p; tpool.n[tpool.k] = tp_class(n); tpool.k++; } else free(p);
 }
 static void tp_drain(void) { while (tpool.k) free(tpool.b[--tpool.k]); }
-/* --iso-aug: the foreground of a D x P x P window for a void cutoff iso, 1 within R voxels (3-4-5 chamfer) of papyrus (clean CT >= iso),
-   whatever the voxel's own CT; pooled buffer (tp_put it), nullptr when out of memory. Labels outside it (lifted off the sheets into
-   the void) become ignored, labels inside are always kept, even where they cross void. */
-static uint8_t *iso_foreground(const uint8_t *ctu, int D, int P, int iso, int R) {
-    const size_t p3 = (size_t)D * P * P;
-    uint8_t *fg = tp_get(p3, 0), *pap = tp_get(p3, 0);
-    if (!fg || !pap) { tp_put(fg, p3); tp_put(pap, p3); return nullptr; }
-    for (size_t k = 0; k < p3; k++) pap[k] = ctu[k] >= iso;
-    const int any = chamfer345_8(pap, fg, D, P), tr = 3 * R > 254 ? 254 : 3 * R;
-    for (size_t k = 0; k < p3; k++) fg[k] = any && fg[k] <= tr;
-    tp_put(pap, p3);
-    return fg;
-}
 static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8_t *side, int phase, int dense, uint64_t seed) {
     band_params bp = {s->band_radius, s->band_span, 0};
     const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
@@ -940,13 +926,6 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     /* targets */
     uint8_t w[NCH] = {0};
     int tmax = 0;
-    const int trust_r = s->trust_band > 0 ? (s->trust_band >> l < 1 ? 1 : s->trust_band >> l) : 0;
-    int iso_t = 0, iso_r = trust_r;   /* --iso-aug: this sample's papyrus cutoff (0 = off) and lifted-label radius */
-    if (c->augment && c->iso_hi > 0 && runif(r) < c->iso_p) {
-        iso_t = c->iso_lo + (int)rint_below(r, c->iso_hi - c->iso_lo + 1);
-        if (c->iso_rhi > 0) iso_r = c->iso_rlo + (int)rint_below(r, c->iso_rhi - c->iso_rlo + 1);
-    }
-    uint8_t *fg = nullptr;   /* the foreground for iso_t (iso_foreground), radius iso_r */
     for (int ch = 0; ch < NCH; ch++) {
         uint8_t *dst = ttmp + (size_t)ch * p3;
         if (c->papyrus) { memset(dst, 0, p3); continue; }   /* task papyrus: labels from the CT below */
@@ -973,17 +952,12 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             } else if (source_read_target(s, ch, l, o, n, dst, 1)) return -1;
             w[ch] = 1;
         } else memset(dst, 0, p3);
-        if (iso_t > 0 && w[ch] && !s->tgt_prob[ch]) {   /* lifted labels (farther than iso_r from CT >= iso_t) ignored */
-            if (!fg && !(fg = iso_foreground(ctu, Pz, P, iso_t, iso_r))) return -1;
-            for (size_t k = 0; k < p3; k++) if (dst[k] && dst[k] != 255 && !fg[k]) dst[k] = 255;   /* ignored, not negative: the sheet may be real but faint */
-        }
         if (w[ch] && !c->cover) {   /* largest known target value (only the empty-patch rejection reads it) */
             uint8_t mx = 0;
             for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k] == 255 ? 0 : dst[k]; mx = v > mx ? v : mx; }
             if (mx > tmax) tmax = mx;
         }
     }
-    tp_put(fg, p3);
     if (!c->cover && !c->papyrus && tmax == 0 && runif(r) > c->empty_keep) { atomic_fetch_add(&sp->rejected, 1); return 1; }
     PROF_MARK(PS_TARGETS);
     uint8_t *near = nullptr;   /* --phase-near-um: voxels within the distance of a labelled wrap voxel (raw labels, before softening) */
@@ -1031,6 +1005,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         /* exp(-(d/3)^2 / (2 sigma^2)) tabulated over the chamfer distance (3 per voxel); beyond dcut it rounds to 0 */
         dcut = (int)(3.f * (sigma * 4.5f+fmaxf(0,shift))) + 1; if (dcut > 4000) dcut = 4000;
     }
+    const int trust_r = s->trust_band > 0 ? (s->trust_band >> l < 1 ? 1 : s->trust_band >> l) : 0;
     const int use8 = (!soft_on || dcut <= 254) && 3 * trust_r <= 254;
 #define CHAMFER_FOR(ch_) do { if (dm_ch != (ch_)) { dm_ch = (ch_); dm_any = use8 ? chamfer345_8(ttmp + (size_t)(ch_) * p3, dm8, Pz, P) : chamfer345(ttmp + (size_t)(ch_) * p3, dm, Pz, P); } } while (0)
     if (soft_on) {
@@ -1240,7 +1215,6 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     memcpy(b->w + (size_t)i * NCH, w, NCH);
     b->src[i] = (int16_t)si;
     b->level[i] = (int8_t)l;
-    b->iso[i][0] = (uint8_t)iso_t; b->iso[i][1] = (uint8_t)(iso_t ? (iso_r > 255 ? 255 : iso_r) : 0);
     memcpy(b->corner[i], o, sizeof o);
     for (int d = 0; d < 3; d++) b->corner[i][d] <<= l;
     atomic_fetch_add(&sp->produced, 1);
