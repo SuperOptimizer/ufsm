@@ -692,6 +692,27 @@ emulated on the laptop's one GPU. Two real GPUs not yet run.
   weight gradient (not its backward's start): +10 ms -> +0.6 ms per P 384 step (ABBA medians, 0.08%). Same gradients, fresh
   and repeated backward. Desk mode 83.7 -> 78.5 B per level-0 voxel: 512^3 10.53 GB, desk split slab 5.93 GB.
   `UFSM_SKIP_OFFLOAD=0` off.
+- Three level-0 buffers instead of four (unet.l3b; the planner's first `--mem auto` mode where it applies: MX-fp4 activations and
+  gradients, the chain above, an 8- or 16-channel level 0 the decoder above fits, UPW(1) <= w[0]; `UFSM_L0_3BUF=0` off).
+  X1 = enc[0].a1 = dec[0].a1 = level 0's gout / gskip / B (dec[0]'s up transient; the input in enc[0]'s backward), X2 = enc[0].a2
+  = dec[0].a2 (the batch head; the coarse backward homes; the encoder's a1 in enc[0]'s backward), X3 = level 0's A = the input,
+  then the coarse skips / down outputs (forward homes), the fp16 logits with their in-place gradient, the batch tail at its end,
+  the skip again for down0 / enc[0]'s backward. The head's input gradient is never stored: dec[0]'s GroupNorm backward recomputes
+  it per voxel from the logit gradient (nn_gn_silu_bwd_head: the head backward-data's FMA chain and exact SR row, the same seeds),
+  writing d/d a2 in place. The skip comes back into X2 during GN1's backward and dec[0]'s up transient (the coarse temp's bytes
+  after it), into X3 after the decoders; enc[0]'s conv2 backward-data runs before its weight gradient so the encoder's a1 comes
+  back into X2 meanwhile (seed draw replayed); with the GPU-built input the CT (2 B per voxel) goes to the host instead of the
+  input and nn_input_rad rebuilds the input in X1. Logits bit for bit, gradients at the atomic-sum noise, the same seed sequence
+  (test_grad_mx4: 16- and 8-channel level 0, down_norm, validation forwards, two steps, the GPU-built input). P512 16..256 on the
+  laptop: 39.0 -> 30.0 B per level-0 voxel (5.24 -> 4.03 GB; planner need 6.19 -> 4.89 GB), trainer steps 845.5 -> 852.0 ms
+  (+0.8%: ~16 ms of the skip copy outruns GN1 + the up transient, ~5 ms its second return; copies 28.3 GB/s). Not for the
+  8-wide net (UPW(1) 16 > 8: X1 would hold a 16-channel up transient; ~2 B per voxel at stake). `UFSM_L0_3BUF_SPLIT=1`: dec[0]'s
+  conv1 weight gradient in an up and a skip part around the skip copy (hides it, but the two 16-channel weight gradients cost
+  ~19 ms more on the laptop).
+- Offload copy order (`UFSM_A1_OUT_SPLIT=0` off): level 0's encoder a1 goes out in two halves, the second after the encoders, the
+  down-conv outputs after the encoders, and level 0's a1 comes back after the decoders. The one copy stream had queued the coarse
+  encoders' a1 copies (their decoders' conv1 waits for them) behind the 1.2 GB level-0 one: dec[L-2]'s conv1 waited ~27 ms per
+  P512 forward, enc[1]'s backward ~6 ms. Four buffers, P512 prof_infer: 796 -> 765 ms.
 - test_split runs on one GPU when there is only one (both halves take turns on the host anyway; the halo streams / events,
   the split config and the double-sum scratch are kept per half). New cases with the trainer's defaults (MX-fp4 gradients,
   the a1 / input / skip offloads, the shared gradient buffers): split vs one GPU at the rounding-seed noise, and the memory
