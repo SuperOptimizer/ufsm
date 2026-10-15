@@ -128,6 +128,14 @@ size_t nn_mx4_bytes(shape5 s);
 size_t nn_mx_bytes(shape5 s, int dt);   /* registry dt 8 / 4 */
 void nn_f32_to_act(const float *x, shape5 s, void *y);   /* network input -> activation storage (16-bit or MX) */
 void nn_h16_to_mx(const void *x, shape5 s, void *y);   /* 16-bit storage-type tensor -> the registered MX (fp8 / fp4) tensor y */
+/* train --gpu-input: the network input (z-scored CT, then the radial unit vector through the window's cube symmetry) built on the
+   device, bit for bit sample.c's write_x (16-bit) followed by nn_h16_to_mx. ct16: the CT channel [n][S] in the 16-bit storage type
+   (fp16 / bf16 as nn_set_f16), the jitter and appearance augmentation applied by the sampler; rec: per sample NN_RAD_REC(D) bytes:
+   int32 o1, o2 (the window corner's y / x at its level), D, P, hasax, perm[0] | perm[1] << 2 | perm[2] << 4 | flip[0] << 8 |
+   flip[1] << 9 | flip[2] << 10, 0, 0; then float cyz[D], cxz[D] (the axis centre per source z); xs: {n, 4, D, P, P}; y: the
+   registered MX input (fp8 / fp4). The 16-bit 4-channel window never exists (6 B per voxel less on the host, PCIe and device). */
+#define NN_RAD_REC(D) ((size_t)(8 + 2 * (D)) * 4)
+void nn_input_rad(const void *ct16, shape5 xs, const void *rec, void *y);
 void nn_f32_to_h16(const float *x, size_t n, void *y, float scale);
 /* 16-bit type for activation/gradient storage and MMA operands: 0 bf16 (default), 1 fp16 (8x finer mantissa, same tensor-core rate;
    env UFSM_F16=1). With fp16 gradient storage the activation gradients are kept scaled by nn_get_grad_scale() (env UFSM_GSCALE,

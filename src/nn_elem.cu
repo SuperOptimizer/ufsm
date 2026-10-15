@@ -155,6 +155,11 @@ extern "C" void nn_h16_to_mx(const void *x, shape5 s, void *y) {
     if (ISMX4(y)) lp_h16_to_mx4(x, g_h16 ? 2 : 1, s.n, s.c, shape_spatial(s), y); else lp_h16_to_mx8(x, g_h16 ? 2 : 1, s.n, s.c, shape_spatial(s), y);
     KCHECK();
 }
+extern "C" void nn_input_rad(const void *ct16, shape5 xs, const void *rec, void *y) {
+    if (!ISMX(y) || xs.c != 4 || xs.h != xs.w) { fprintf(stderr, "nn_input_rad: an MX input of 4 channels, square planes\n"); abort(); }
+    lp_input_rad(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(xs.d), xs.n, xs.d, xs.h, y, ISMX4(y) ? 4 : 8);
+    KCHECK();
+}
 extern "C" void nn_f32_to_act(const float *x, shape5 s, void *y) {
     if (ISMX4(y)) { lp_f32_to_mx4(x, s.n, s.c, shape_spatial(s), y); KCHECK(); return; }
     if (ISMX(y)) { lp_f32_to_mx8(x, s.n, s.c, shape_spatial(s), y); KCHECK(); return; }

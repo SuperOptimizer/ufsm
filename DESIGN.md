@@ -6,6 +6,21 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Training input built on the GPU; the planner counts the separate input (2026-10-15)
+The network input is z-scored CT plus the radial unit vector (3 channels, from the window's corner, cube symmetry and the axis centre
+per source z). The sampler wrote all 4 as 16-bit per voxel (8 B: pinned slot, PCIe, a device buffer dead after the forward's MX input
+conversion, and the validation copies). `train --gpu-input 1` (default where possible: 16-bit -> MX input conversion, whole windows,
+the plain 4 inputs, no warps / sheet prior / slab appearance plan; settled after the memory planner because the conversion follows
+the MX-gradient mode): batches carry the CT channel alone (2 B) plus a 32-byte record and the axis centres per sample; nn_input_rad
+(lp_mx_cvt.cu) builds the MX input straight into unet's xin, bit for bit sample.c write_x + nn_h16_to_mx (IEEE intrinsics: the
+build's -use_fast_math would contract / approximate; tests/test_gpu_input.c, 896 cases incl. all 48 symmetries, slabs, axis-on-voxel
+zeros, fp16 / bf16, MX-fp8 / fp4, 2 samples; the trainer's UFSM_XIN_HASH input hashes equal over deterministic runs). The radial
+pass is cheap on the CPU (vectorised), so the sampler's x16 stage only drops ~15%; the gains are memory. Desk 5060 Ti, P512, 7 levels
+16..256, fp4 gradients: peak GPU 6816 -> 5772 MiB (the input now fits gout[0]: "batch buffers and input inside the gradient
+buffers"), trainer host RSS 41.1 -> 24.2 GB (14 slots + 8 validation windows), 1.03 -> 1.06 windows/s. Planner: lean 2 with MX
+gradients now counts the input when it cannot sit in gout[0] (it assumed it inside: 6.19 GB planned vs a 7.15 GB nvidia-smi peak,
+CUDA context included, with the host-built input; now 7.26 GB; 6.19 GB vs 6.05 GB with the GPU-built input).
+
 ## Recto / verso side labels from the published wraps (2026-10-15)
 Every voxel between two consecutive labelled wraps k and k + 1 (windings increase outward) is recto side in the half nearer k and verso
 side in the half nearer k + 1: the published wraps mark recto faces, the label leaves each wrap on its outer side only. band_field_side_pair:

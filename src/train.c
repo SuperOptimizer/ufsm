@@ -35,6 +35,7 @@ typedef struct {
     uint8_t *tb[2], *mb[2], *wb[2], *hwh[2];   /* hwh: --heads, the channel weights in device-row order (pinned) */
     float hl[8]; int hon[8];                    /* --heads: the last batch's loss per head and whether the head had a target */
     float *x; uint8_t *t, *m, *w; /* the buffers of the batch being computed */
+    void *radb[2], *rad;         /* --gpu-input: the batch's radial records on the device (nn.h NN_RAD_REC), per buffer / current */
     void *ev_up[2], *ev_done[2]; /* upload into buffer i finished; the compute that last used buffer i finished */
     batch *pending;              /* host batch whose upload into buffer (cur ^ 1) is in flight */
     int lean;                    /* one batch buffer; logit gradient in the model's gradient buffer B */
@@ -149,7 +150,21 @@ static int g_Pz;   /* window depth: --Pz (a Pz x P x P slab), else P */
 static int g_xfmt = 0, g_g16 = 0;   /* input batches uploaded as 16-bit (1 fp16, 2 bf16); loss gradient written as 16-bit */
 static size_t xbytes(void) { return g_xfmt ? 2 : 4; }
 static const void *bx(const batch *b) { return g_xfmt ? (const void *)b->x16 : (const void *)b->x; }
-static void select_buf(gpu_state *d, int i) { d->cur = i; d->x = d->xb[i]; d->t = d->tb[i]; d->m = d->mb[i]; d->w = d->wb[i]; d->band = d->bandb[i]; d->sdb = d->sideb[i]; d->pm = d->pmb[i]; d->wd = d->wdb[i]; d->pap = d->papb[i]; d->um = d->umb[i]; }
+/* --gpu-input (default when the configuration allows it, sample_gpu_input_ok): batches carry the CT channel only (g_xs 1) and per sample a
+   radial record; the network's 4 MX input channels are built on the device (nn_input_rad). g_xs: input channels per sample in the batches */
+static int g_gpu_in, g_xs = 4, g_gpu_want, g_gpu_asked;
+static size_t rad_bytes(int B) { return g_gpu_in ? (size_t)B * NN_RAD_REC(g_Pz) : 0; }
+/* once the memory mode is set: the GPU-built input needs the 16-bit -> MX input conversion (unet_input_converted: MX activations with
+   MX gradients or an input policy) */
+static void gpu_input_settle(sample_cfg *sc) {
+    g_gpu_in = g_gpu_want && unet_input_converted();
+    g_xs = g_gpu_in ? 1 : g_xc; sc->gpu_input = g_gpu_in;
+    if (g_gpu_in) fprintf(stderr, "input: the CT channel uploaded, the radial channels built on the GPU (--gpu-input 0: host-built)\n");
+    else if (g_gpu_asked) fprintf(stderr, "--gpu-input: not available here (needs the 16-bit -> MX input conversion, whole windows, the 4 plain inputs, no warps / sheet prior); host-built input\n");
+}
+static void select_buf(gpu_state *d, int i) {
+    d->rad = d->radb[i]; if (g_gpu_in) unet_set_input_rad(d->u, d->rad);
+    d->cur = i; d->x = d->xb[i]; d->t = d->tb[i]; d->m = d->mb[i]; d->w = d->wb[i]; d->band = d->bandb[i]; d->sdb = d->sideb[i]; d->pm = d->pmb[i]; d->wd = d->wdb[i]; d->pap = d->papb[i]; d->um = d->umb[i]; }
 /* --heads: the device target row of host row r (n * NCH + c): a sample's recto target trains its source's head (channel 0, or 1 + head),
    the sheet target channel 1; the other heads' rows keep stale bytes under weight 0 */
 static int trow(const batch *b, int r) {
@@ -168,7 +183,7 @@ static void upload_slab(gpu_state *d, const batch *b, int i, int B, int P, int a
     void (*cp)(void *, const void *, size_t) = async ? nn_h2d_copy_stream : nn_h2d;
     const size_t p2 = (size_t)P * P, p3 = p2 * P, l3 = p2 * g_Dl, own = l3 - g_h0 * p2;
     const size_t z0 = d->side ? (size_t)(P / 2 - g_h0) : 0, xb = xbytes();
-    for (int r = 0; r < B * g_xc; r++) cp((char *)d->xb[i] + r * l3 * xb, (const char *)bx(b) + (r * p3 + z0 * p2) * xb, l3 * xb);
+    for (int r = 0; r < B * g_xs; r++) cp((char *)d->xb[i] + r * l3 * xb, (const char *)bx(b) + (r * p3 + z0 * p2) * xb, l3 * xb);   /* (--gpu-input excludes --split) */
     for (int r = 0; r < B * NCH; r++) cp(d->tb[i] + trow(b, r) * l3, b->t + r * p3 + z0 * p2, l3);
     for (int n = 0; n < B; n++) {
         uint8_t *m = d->mb[i] + n * l3;
@@ -193,7 +208,8 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     if (b->corner && b->level) { memcpy(d->cornb[d->cur], b->corner[0], sizeof d->cornb[0]); d->lvlb[d->cur] = b->level[0]; }   /* validation copies carry none */
     if (d->side >= 0) { upload_slab(d, b, d->cur, B, P, 0); return; }
     size_t p3 = (size_t)g_Pz * P * P;
-    nn_h2d(d->x, bx(b), (size_t)B * g_xc * p3 * xbytes());
+    nn_h2d(d->x, bx(b), (size_t)B * g_xs * p3 * xbytes());
+    if (g_gpu_in) nn_h2d(d->rad, b->rad, rad_bytes(B));
     if (!g_heads) nn_h2d(d->t, b->t, (size_t)B * NCH * p3);
     else for (int r = 0; r < B * NCH; r++) nn_h2d(d->t + (size_t)trow(b, r) * p3, b->t + (size_t)r * p3, p3);
     nn_h2d(d->m, b->m, (size_t)B * p3);
@@ -214,7 +230,8 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     if (d->lean) nn_stream_wait(1, d->ev_done[i ^ 1]);   /* lean: one buffer (inside the gradient buffers), free after the current step */
     if (d->side >= 0) upload_slab(d, b, i, B, P, 1);
     else {
-        nn_h2d_copy_stream(d->xb[i], bx(b), (size_t)B * g_xc * p3 * xbytes());
+        nn_h2d_copy_stream(d->xb[i], bx(b), (size_t)B * g_xs * p3 * xbytes());
+        if (g_gpu_in) nn_h2d_copy_stream(d->radb[i], b->rad, rad_bytes(B));
         if (!g_heads) nn_h2d_copy_stream(d->tb[i], b->t, (size_t)B * NCH * p3);
         else for (int r = 0; r < B * NCH; r++) nn_h2d_copy_stream(d->tb[i] + (size_t)trow(b, r) * p3, b->t + (size_t)r * p3, p3);
         nn_h2d_copy_stream(d->mb[i], b->m, (size_t)B * p3);
@@ -232,7 +249,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
    since select_buf already moved on) and a raw dump <out>/nan_step<N>.bin (x16|x32, t, m, w, logits) */
 static void diagnose_nan(gpu_state *d, int B, int P, int step, const char *out) {
     nn_init(d->dev); nn_sync();
-    size_t p3 = (size_t)g_Pz * P * P, nx = (size_t)B * g_xc * p3, nl = (size_t)B * g_tc * p3;
+    size_t p3 = (size_t)g_Pz * P * P, nx = (size_t)B * g_xs * p3, nl = (size_t)B * g_tc * p3;   /* (--gpu-input: the CT channel) */
     int cb = d->cur ^ 1;
     size_t xbytes_ = nx * xbytes();
     void *hx = malloc(xbytes_); nn_d2h(hx, d->xb[cb], xbytes_);
@@ -1043,6 +1060,15 @@ int cmd_train(int argc, char **argv) {
         !isfinite(sc.label_morph) || sc.label_morph<0 || sc.label_morph>1 || !isfinite(sc.label_morph_p) || sc.label_morph_p<0 || sc.label_morph_p>1) {
         fprintf(stderr,"invalid continuous geometry/morphology augmentation bounds\n"); return 2;
     }
+    {   /* --gpu-input 1 (default where possible): the batches carry the CT channel alone plus a radial record per sample, the 4 MX input
+           channels are built on the device (nn_input_rad): 6 B per voxel less per sampler slot, upload and device batch, no CPU x16
+           radial pass. Needs the 16-bit -> MX input conversion, whole windows, the plain 4 inputs and write_x samples; --gpu-input 0 or
+           UFSM_DUMP_BATCH (it shows the 4 channels): the host-built 4 channels as before */
+        const int want = atoi(opt(argc, argv, "--gpu-input", "1"));
+        g_gpu_want = want && g_xfmt && unet_act_mx() && !split && !g_half && g_xc == 4 && sample_gpu_input_ok(&sc) && !getenv("UFSM_DUMP_BATCH");
+        g_gpu_asked = atoi(opt(argc, argv, "--gpu-input", "0"));   /* (an explicit request: say when it cannot apply) */
+        /* the MX input conversion it needs depends on the memory mode (MX gradients): settled after the planner (gpu_input_settle) */
+    }
     cover_plan *plan = nullptr; cover_progress coverage = {0}, prior_cover = {0};
     const char *cover_path = opt(argc, argv, "--cover", nullptr);
     int warm_start=atoi(opt(argc,argv,"--warm-start","0"));
@@ -1254,8 +1280,17 @@ int cmd_train(int argc, char **argv) {
                 if (g_half && cand[c].lean) continue;   /* (the batch buffers are full resolution, the network's half) */
                 unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean); unet_set_share_enc_a1(cand[c].sea || sea_force);
                 const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
-                size_t trainer = nbuf * ((size_t)B * g_xc * p3 * xbytes() + (size_t)B * g_tc * p3 + (size_t)B * p3) + (cand[c].lean || g_gl_inplace ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
-                if (cand[c].lean) trainer = (cand[c].gmx ? 0 : (size_t)B * g_xc * p3 * xbytes())   /* batch buffers inside the gradient buffer B (estimate) */
+                const int gin = g_gpu_want && unet_input_converted();   /* this mode's input layout (gpu_input_settle after the pick) */
+                const size_t xsc = gin ? 1 : (size_t)g_xc, radb = gin ? (size_t)B * NN_RAD_REC(g_Pz) : 0;
+                size_t trainer = nbuf * ((size_t)B * xsc * p3 * xbytes() + (size_t)B * g_tc * p3 + (size_t)B * p3) + (cand[c].lean || g_gl_inplace ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4)) + nbuf * radb;
+                /* lean 2 (no buffer B): [input | targets | mask] at the end of gout[0] when they fit beside its level-0 gradient (at least w0
+                   channels of the MX gradient type; the lean placement below), otherwise the input keeps a buffer of its own ("input separate":
+                   8 B per voxel for the 4 fp16 channels, uncounted before) */
+                const size_t xinb = (size_t)B * xsc * p3 * xbytes(), batb = (size_t)B * g_tc * p3 + (size_t)B * p3;
+                const shape5 g0s = {B, cfg.widths[0], (int)(p3 / ((size_t)P * P)), P, P};
+                const size_t g0b = cand[c].gmx ? nn_mx_bytes(g0s, unet_grad_mx4() ? 4 : 8) : (size_t)B * cfg.widths[0] * p3 * 2;
+                const int xin_sep = cand[c].lean >= 2 && cand[c].gmx && !(unet_input_converted() && g_xfmt && xinb + batb + 8192 <= g0b);
+                if (cand[c].lean) trainer = (cand[c].gmx ? (xin_sep ? xinb : 0) : xinb) + radb   /* batch buffers inside the gradient buffer B / gout[0] (estimate) */
                                             + (g_cout > NCH && !g_gl_inplace ? (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) : 0)
                                             + (g_head_slab ? (size_t)B * (NCH + 1) * p3 : 0);   /* head slabs: targets and mask outside the gradient buffers */   /* > 2 outputs (affinities, verso): the logit gradient may not fit beside the logits */
                 /* the fp4 weight gradient's gy records of a whole level-0 layer (lp_gn_silu_bwd_apply_rec, MX-fp4 gradients): 136 B per
@@ -1276,6 +1311,7 @@ int cmd_train(int argc, char **argv) {
         }
     }
     if (g_half && lean) { fprintf(stderr, "--half-res: not with the lean memory modes\n"); return 2; }
+    gpu_input_settle(&sc);   /* (the memory mode is set: the input layout of the batches) */
     for (int g = 0; g < ng; g++) {   /* per-GPU batch buffers. lean: one, shared by both slots, inside the model's gradient buffers when
                                         they are large enough: [targets | mask | input if the forward copies it] in B (lean 1: after the
                                         logit gradient) or in gout[0] (lean 2); the logit gradient in B (lean 1) or after the logits in A */
@@ -1284,7 +1320,7 @@ int cmd_train(int argc, char **argv) {
         char *bs = nullptr;
         const size_t p3 = p3l;   /* this GPU's voxels of a window */
         const size_t a256 = 255, glb = ((size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) + a256) & ~a256, tbb = ((size_t)B * g_tc * p3 + a256) & ~a256,
-                     mbb = ((size_t)B * p3 + a256) & ~a256, xbb = ((size_t)B * g_xc * p3 * xbytes() + a256) & ~a256;
+                     mbb = ((size_t)B * p3 + a256) & ~a256, xbb = ((size_t)B * g_xs * p3 * xbytes() + a256) & ~a256;
         const int xin_b = lean && unet_input_converted() && g_xfmt;
         size_t goff = 0;
         int xin_in = 0;
@@ -1307,14 +1343,15 @@ int cmd_train(int argc, char **argv) {
             d->gl_inside = d->gl != nullptr;
         }
         for (int i = 0; i < 2; i++) {
-            if (i && lean) { d->xb[1] = d->xb[0]; d->tb[1] = d->tb[0]; d->mb[1] = d->mb[0]; d->wb[1] = d->wb[0]; }
+            if (i && lean) { d->xb[1] = d->xb[0]; d->tb[1] = d->tb[0]; d->mb[1] = d->mb[0]; d->wb[1] = d->wb[0]; d->radb[1] = d->radb[0]; }
             else if (bs) {
                 const size_t toff = goff + (unet_lean_nob(d->u) && xin_in ? xbb : 0), xoff = unet_lean_nob(d->u) ? 0 : goff + tbb + mbb;
                 d->tb[i] = (uint8_t *)(bs + toff); d->mb[i] = (uint8_t *)(bs + toff + tbb);
-                d->xb[i] = xin_in ? (void *)(bs + xoff) : nn_malloc((size_t)B * g_xc * p3 * xbytes());
+                d->xb[i] = xin_in ? (void *)(bs + xoff) : nn_malloc((size_t)B * g_xs * p3 * xbytes());
                 d->wb[i] = nn_malloc((size_t)B * g_tc);
+                d->radb[i] = g_gpu_in ? nn_malloc(rad_bytes(B)) : nullptr;
             }
-            else { d->xb[i] = nn_malloc((size_t)B * g_xc * p3 * xbytes()); d->tb[i] = nn_malloc((size_t)B * g_tc * p3); d->mb[i] = nn_malloc((size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * g_tc); }
+            else { d->xb[i] = nn_malloc((size_t)B * g_xs * p3 * xbytes()); d->tb[i] = nn_malloc((size_t)B * g_tc * p3); d->mb[i] = nn_malloc((size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * g_tc); d->radb[i] = g_gpu_in ? nn_malloc(rad_bytes(B)) : nullptr; }
             d->hwh[i] = g_heads ? nn_host_alloc((size_t)B * g_tc) : nullptr;
             d->ev_up[i] = nn_event_create();
         }
@@ -1515,8 +1552,9 @@ int cmd_train(int argc, char **argv) {
     for (int i = 0; i < nval; i++) {
         batch *b = sampler_next(vs);
         if (!b) { nval = i; break; }
-        if (g_xfmt) { val[i].x16 = malloc((size_t)B * g_xc * p3 * 2); memcpy(val[i].x16, b->x16, (size_t)B * g_xc * p3 * 2); }
-        else { val[i].x = malloc((size_t)B * g_xc * p3 * 4); memcpy(val[i].x, b->x, (size_t)B * g_xc * p3 * 4); }
+        if (g_xfmt) { val[i].x16 = malloc((size_t)B * g_xs * p3 * 2); memcpy(val[i].x16, b->x16, (size_t)B * g_xs * p3 * 2); }
+        else { val[i].x = malloc((size_t)B * g_xs * p3 * 4); memcpy(val[i].x, b->x, (size_t)B * g_xs * p3 * 4); }
+        if (g_gpu_in) { val[i].rad = malloc(rad_bytes(B)); memcpy(val[i].rad, b->rad, rad_bytes(B)); }
         val[i].t = malloc((size_t)B * NCH * p3); memcpy(val[i].t, b->t, (size_t)B * NCH * p3);
         val[i].m = malloc((size_t)B * p3); memcpy(val[i].m, b->m, (size_t)B * p3);
         val[i].w = malloc((size_t)B * NCH); memcpy(val[i].w, b->w, (size_t)B * NCH);
@@ -1606,8 +1644,9 @@ int cmd_train(int argc, char **argv) {
                     double tw = now(); batch *b = sampler_next(sp); wait += now() - tw;
                     if (!b) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; break; }
                     batch *cp = calloc(1, sizeof *cp); size_t p3b = (size_t)g_Pz * P * P;
-                    if (g_xfmt) { cp->x16 = malloc((size_t)B * g_xc * p3b * 2); memcpy(cp->x16, b->x16, (size_t)B * g_xc * p3b * 2); }
-                    else { cp->x = malloc((size_t)B * g_xc * p3b * 4); memcpy(cp->x, b->x, (size_t)B * g_xc * p3b * 4); }
+                    if (g_xfmt) { cp->x16 = malloc((size_t)B * g_xs * p3b * 2); memcpy(cp->x16, b->x16, (size_t)B * g_xs * p3b * 2); }
+                    else { cp->x = malloc((size_t)B * g_xs * p3b * 4); memcpy(cp->x, b->x, (size_t)B * g_xs * p3b * 4); }
+                    if (g_gpu_in) { cp->rad = malloc(rad_bytes(B)); memcpy(cp->rad, b->rad, rad_bytes(B)); }
                     cp->t = malloc((size_t)B * NCH * p3b); memcpy(cp->t, b->t, (size_t)B * NCH * p3b);
                     cp->m = malloc((size_t)B * p3b); memcpy(cp->m, b->m, (size_t)B * p3b);
                     cp->w = malloc((size_t)B * NCH); memcpy(cp->w, b->w, (size_t)B * NCH);
