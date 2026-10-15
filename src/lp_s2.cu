@@ -206,7 +206,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__
                     for (int h = 0; h < 2; h++) {
                         const int m = j + mm, co = co0 + m * 16 + g + 8 * h;
                         float v = 0.f;
-                        if (mm < bw / 16 && m < MT) v = acc[m < MT ? m : 0][2 * h + vv] + (b && co < Co ? b[co] : 0.f);
+                        if (mm * 16 + 8 * h < bw && m < MT) v = acc[m < MT ? m : 0][2 * h + vv] + (b && co < Co ? b[co] : 0.f);
                         val[mm][h] = v; am = fmaxf(am, fabsf(v));
                     }
                 am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 4)); am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 8)); am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 16));
@@ -227,7 +227,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__
 #pragma unroll
                     for (int mm = 0; mm < 2; mm++)
 #pragma unroll
-                        for (int h = 0; h < 2; h++) if (mm < bw / 16) {
+                        for (int h = 0; h < 2; h++) if (mm * 16 + 8 * h < bw) {   /* (a block of 8: channels g only) */
                             if constexpr (B == 8) dst[mm * 16 + g + 8 * h] = cvt_e4m3(val[mm][h] * mult);
                             else if (!(g & 1)) dst[(mm * 16 + g + 8 * h) >> 1] = (uint8_t)(nib >> (8 * (2 * mm + h)));
                         }
@@ -380,7 +380,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__rest
                     for (int h = 0; h < 2; h++) {
                         const int m = j + mm, co = m * 16 + g + 8 * h;
                         float v = 0.f;
-                        if (mm < bw / 16 && m < MT) v = acc[m < MT ? m : 0][q2][2 * h + vv2] + (b && co < Co ? b[co] : 0.f);
+                        if (mm * 16 + 8 * h < bw && m < MT) v = acc[m < MT ? m : 0][q2][2 * h + vv2] + (b && co < Co ? b[co] : 0.f);
                         val[mm][h] = v; am = fmaxf(am, fabsf(v));
                     }
                 am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 4)); am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 8)); am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 16));
@@ -401,7 +401,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__rest
 #pragma unroll
                     for (int mm = 0; mm < 2; mm++)
 #pragma unroll
-                        for (int h = 0; h < 2; h++) if (mm < bw / 16) {
+                        for (int h = 0; h < 2; h++) if (mm * 16 + 8 * h < bw) {   /* (a block of 8: channels g only) */
                             if constexpr (OB == 8) dst[mm * 16 + g + 8 * h] = cvt_e4m3(val[mm][h] * mult);
                             else if (!(g & 1)) dst[(mm * 16 + g + 8 * h) >> 1] = (uint8_t)(nib >> (8 * (2 * mm + h)));
                         }
@@ -566,7 +566,8 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
        conv's FAST path. Same values and scales as the per-element paths (bias: summation order differs). */
     float bacc = 0.f;
     if constexpr (FAST) {
-        if (!uni || (co0 % mx_bw(Co)) + BMo > mx_bw(Co)) __trap();   /* the host only picks FAST for these */
+        if (!uni || ((co0 % mx_bw(Co)) + BMo > mx_bw(Co) && !(co0 == 0 && mx_bw(Co) < BMo && Co <= mx_bw(Co)))) __trap();   /* the host only picks FAST for these
+                                                                                                     (or one block narrower than the tile: 8 channels) */
         uint8_t *graw = smem_raw + (((unsigned char *)(amx + 3 * CH) - smem_raw + 15) & ~15);   /* [256 voxels][BMo] raw gy (e4m3) */
         uint8_t *gscl = graw + 256 * BMo;                                                     /* [256] gy scale bytes */
         constexpr int XW = IS_MX4(T) ? 1 : 2;   /* 32-bit words of the 8-channel x row */
@@ -690,8 +691,14 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
         const size_t Sg = (size_t)Do * Ho * Wo, gri = ((size_t)n * mx_nb(Co) + co0 / gbw) * Sg;
         constexpr int GB = MX_BITS(TG), GRB = BMo * GB / 8, GCB = GRB >= 16 ? 16 : 8;   /* gy bits (MX-fp8 or MX-fp4 gradients), raw row bytes, copy chunk */
         const uint8_t *gq = (const uint8_t *)gy, *gqs = gq + (size_t)N * mx_nb(Co) * Sg * mx_rb(gbw, GB);
+        const int rrb = mx_rb(gbw, GB) < GRB ? mx_rb(gbw, GB) : GRB;   /* the stored row's bytes in the slot (one 8-channel block: 4 / 8, the rest zero) */
         auto gload = [&](int oz0) {   /* cp.async: voxel i = row 16 + xx of the z-step (row = vz 8 + vy) */
-            for (int k = tid; k < 256 * (GRB / GCB); k += 288) {
+            if (rrb < GRB) for (int k = tid; k < 256 * (GRB / 4); k += 288) {   /* narrow rows: 4-byte copies, zero past the row */
+                const int i = k / (GRB / 4), h = k % (GRB / 4), row = i >> 4, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + (i & 15);
+                const bool ok = oz < Do && oy < Ho && ox < Wo && 4 * h < rrb;
+                cp_async<4>(graw + i * GRB + 4 * h, ok ? gq + (gri + ((size_t)oz * Ho + oy) * Wo + ox) * mx_rb(gbw, GB) + 4 * h : gq, ok);
+            }
+            else for (int k = tid; k < 256 * (GRB / GCB); k += 288) {
                 const int i = k / (GRB / GCB), h = k % (GRB / GCB), row = i >> 4, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + (i & 15);
                 const bool ok = oz < Do && oy < Ho && ox < Wo;
                 cp_async<GCB>(graw + i * GRB + GCB * h, ok ? gq + (gri + ((size_t)oz * Ho + oy) * Wo + ox) * mx_rb(gbw, GB) + (co0 % gbw) * GB / 8 + GCB * h : gq, ok);
@@ -953,14 +960,15 @@ template <int MT, int NT, typename T, typename TG> static void launch_bws2(dim3 
     static int fast_env = -1;
     if (fast_env < 0) fast_env = getenv("UFSM_S2W_FAST") ? atoi(getenv("UFSM_S2W_FAST")) : 1;
     if constexpr (NT == 1 && IS_MX(T) && IS_MX(TG)) {   /* conv_bwd_w_s2_f8_k's FAST path (x: one 8-channel block row per voxel; MX-fp8 or MX-fp4 gy) */
-        if (fast_env && x && 16 * MT <= mx_bw(ys.c) && ys.w % 4 == 0) {
+        if (fast_env && x && (16 * MT <= mx_bw(ys.c) || (ys.c <= mx_bw(ys.c) && mx_bw(ys.c) < 16 * MT)) && ys.w % 4 == 0) {
             if (!attr[cur_dev_()][1]) { attr[cur_dev_()][1] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_s2_f8_k<MT, NT, T, TG, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
             smem += 16 + 256 * 16 * MT + 256;   /* raw gy rows and scales */
             conv_bwd_w_s2_f8_k<MT, NT, T, TG, true><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, ZC, gp);
             return;
         }
     }
-    if constexpr (IS_MX4(TG)) { fprintf(stderr, "lp_bwd_w_s2_f8: MX-fp4 gradients only on the FAST path (MX x, Wo %% 4 == 0)\n"); abort(); }
+    if constexpr (IS_MX4(TG)) { fprintf(stderr, "lp_bwd_w_s2_f8: MX-fp4 gradients only on the FAST path (MX x, Wo %% 4 == 0): x %s, %d -> %d channels, out %dx%dx%d, MT %d\n",
+                                        x ? "set" : "null", xs.c, ys.c, ys.d, ys.h, ys.w, MT); abort(); }
     else {
     if (!attr[cur_dev_()][0]) { attr[cur_dev_()][0] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_s2_f8_k<MT, NT, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_bwd_w_s2_f8_k<MT, NT, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, ZC, gp);

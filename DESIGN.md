@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## MX-fp4 gradients for 8- and 16-channel levels (2026-10-15)
+User: as much fp4 as possible across the net; the kernels follow the widths, never the reverse (a 32-wide level costs 4x compute for
+no memory: 32 ch x 4 bit = 16 ch x 8 bit). The MX layout already had 8 / 16-channel blocks; the gradient paths assumed 32:
+- upsample backward: the tiled kernel templated on the block width (BW / 8 threads per voxel); per-voxel kernel with exact SR;
+- stride-2 backward-data: 16 channels on the bf16 tensor-core kernel (4 nibbles per lane); 8 (and any narrow fp4 layer) on the
+  parity-major kernel templated on fp4 rows (it replaced a fallback through two full-size MX-fp8 copies and a double rounding);
+- stride-1 backward-data with <= 16-channel fp4 gy: the 32-padded chunk path (rows copied with their own scale) -- the p16
+  kernel re-rounded paired voxels to their shared scale to nearest and small_f8 used one scale per tile (biased gradients);
+- the shared MX output epilogue (lp_common.cuh, lp_s2.cu): `mm < bw / 16` stored no values for 8-channel blocks -- 8-channel MX
+  outputs (activations too) never worked; now a per-element predicate (bit-identical at 16 / 32: 26 bench_f4conv hashes);
+- 4-byte rows (8-channel fp4) in the fp4 conv staging, GN backward fp8 loads, mx_load16, the FAST stem / stride-2 weight
+  gradients (one narrow block in the tile's slot, zero-filled), split halo block widths (zsegs);
+- planning: up-part chunks start at a whole MX block (mx_chunk_min); no gy-record reserve below 32-channel level 0;
+- trainer: no in-place logit gradient when the fp16 logits share the head's input-gradient buffer (unet_logits_in_gx: the
+  in-place gradient made the head's backward-data write gout[0] as 16-bit, 32 B into a 9 B buffer; latent for any 2-output
+  lean MX-fp4 layout).
+Tests (test_grad_mx4): GN backward 8..64; backward-data with weights exact in every format (8->8, 16->8, 8->16, 16->16, 32->16,
+16->32: the mean of 16 SR runs must reach 1.5 / sqrt(K) of one run -- the old staging failed it); s2 backward-data 8 / 16 (+
+accumulate); up2 backward 8 / 16; end to end {16,32,64}, {16,16,32}, {8,16,32}: unbiased vs 16-bit, fp16 logits, training bytes
+-22..-33%. Opt-in UFSM_G4_NARROW=1 until a paired training check; fp4 gradients also need P % 256 == 0 for 7 levels.
+Measured (P512, 7 levels): 16-wide 69.6 -> 39.0 B/voxel planner, desk 9.7 -> 6.8 GB, 1.01 -> 1.03 windows/s; 8-wide trains
+(laptop P256 smoke) but is NOT faster (desk 913 vs 917 ms per step): 8-channel convs run on the 32-padded fp4 path or the generic
+fp8 small kernel (8->8 forward 58 ms vs 39 for 16->16; down0 backward-data 42 vs 20 ms). Speed at 8 channels needs dedicated
+narrow tensor-core kernels. Level-0 16->16 convs run ~7x above the memory floor (39 ms vs ~5 ms of traffic at 448 GB/s).
+
 ## Recto / verso side labels from the published wraps (2026-10-15)
 Every voxel between two consecutive labelled wraps k and k + 1 (windings increase outward) is recto side in the half nearer k and verso
 side in the half nearer k + 1: the published wraps mark recto faces, the label leaves each wrap on its outer side only. band_field_side_pair:

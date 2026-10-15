@@ -71,7 +71,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4_k(const T *__restrict__ x,
                 if (inb) {
                     size_t off = ((size_t)(gz + zi0) * H + gy) * W + gx;
                     const uint8_t *src = (const uint8_t *)c0.p + off * c0.rb;
-                    if (c0.bw == 32) h0 = __ldg((const uint4 *)src); else { uint2 u = __ldg((const uint2 *)src); h0.x = u.x; h0.y = u.y; }
+                    if (c0.bw == 32) h0 = __ldg((const uint4 *)src); else if (c0.bw == 16) { uint2 u = __ldg((const uint2 *)src); h0.x = u.x; h0.y = u.y; } else h0.x = __ldg((const unsigned *)src);   /* 32 / 16 / 8 channels: 16 / 8 / 4 bytes */
                     sc = c0.sp[off];
                 }
                 *(uint4 *)(sx + pos * 16) = h0;
@@ -235,7 +235,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4r_k(const T *__restrict__ x
                     if (inb) {
                         size_t off = ((size_t)(gz + zi0) * H + gy) * W + gx;
                         const uint8_t *src = (const uint8_t *)c0.p + off * c0.rb;
-                        if (c0.bw == 32) h0 = __ldg((const uint4 *)src); else { uint2 u = __ldg((const uint2 *)src); h0.x = u.x; h0.y = u.y; }
+                        if (c0.bw == 32) h0 = __ldg((const uint4 *)src); else if (c0.bw == 16) { uint2 u = __ldg((const uint2 *)src); h0.x = u.x; h0.y = u.y; } else h0.x = __ldg((const unsigned *)src);   /* 32 / 16 / 8 channels: 16 / 8 / 4 bytes */
                         sc = c0.sp[off];
                     }
                     *(uint4 *)(sx + pos * 16) = h0;

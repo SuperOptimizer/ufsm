@@ -112,6 +112,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_k(const uint8_t *x,
     auto load = [&](size_t v) {
         const size_t ri = rbase + v;
         if constexpr (B == 4) { const uint2 t = bw == 8 ? make_uint2(__ldg((const unsigned *)(x + ri * rbx)), 0u) : __ldg((const uint2 *)(x + ri * rbx + 8 * h)); xw.x = t.x; xw.y = t.y; }
+        else if (bw == 8) { const uint2 t = __ldg((const uint2 *)(x + ri * rbx)); xw.x = t.x; xw.y = t.y; }   /* MX-fp8 8-channel row: 8 bytes */
         else xw = __ldg((const uint4 *)(x + ri * rbx + 16 * h));
         gw = bw == 8 ? make_uint2(__ldg((const unsigned *)(gy + ri * rbg)), 0u) : __ldg((const uint2 *)(gy + ri * rbg + 8 * h));
         xs = __ldg(sx + ri); gs = __ldg(sg + ri);
@@ -255,6 +256,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_k(const uint8_t *x,
     const int rbx = mx_rb(bw, B), rbg = mx_rb(bw, 4);
     uint4 xw = make_uint4(0u, 0u, 0u, 0u);
     if constexpr (B == 4) { const uint2 t = bw == 8 ? make_uint2(__ldg((const unsigned *)(x + ri * rbx)), 0u) : __ldg((const uint2 *)(x + ri * rbx + 8 * h)); xw.x = t.x; xw.y = t.y; }
+    else if (bw == 8) { const uint2 t = __ldg((const uint2 *)(x + ri * rbx)); xw.x = t.x; xw.y = t.y; }   /* MX-fp8 8-channel row: 8 bytes */
     else xw = __ldg((const uint4 *)(x + ri * rbx + 16 * h));
     const uint2 gw = bw == 8 ? make_uint2(__ldg((const unsigned *)(gy + ri * rbg)), 0u) : __ldg((const uint2 *)(gy + ri * rbg + 8 * h));
     const float fx = mx_scale(__ldg(mx_sc<B>(x, N, C, S) + ri)), fg = mx_scale(__ldg(mx_sc<4>(gy, N, C, S) + ri));

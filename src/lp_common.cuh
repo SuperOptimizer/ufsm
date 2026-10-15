@@ -731,7 +731,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
 #pragma unroll
             for (int j = 0; j < MT; j++) {
                 const int cp = co0 + j * 16, sec = sp.y2 && cp >= OxP, Ct = !sp.y2 ? Co : sec ? Co - sp.o_split : sp.o_split;
-                const int cl = sec ? cp - OxP : cp, bwt = mx_bw(Ct), MBt = bwt / 16, rbt = mx_rb(bwt, B);
+                const int cl = sec ? cp - OxP : cp, bwt = mx_bw(Ct), rbt = mx_rb(bwt, B);
                 if (cl % bwt || cl >= Ct) continue;   /* not the first tile of a block, or pure padding (block-uniform) */
                 uint8_t *wsb = wb + NR * 16 * rbt;
 #pragma unroll
@@ -747,7 +747,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
 #pragma unroll
                                 for (int h = 0; h < 2; h++) {
                                     const int m = j + mm;
-                                    const float v = mm < MBt && m < MT ? acc[m < MT ? m : 0][r][q2][2 * h + vv] + bias[m < MT ? m : 0][h] : 0.f;
+                                    const float v = mm * 16 + 8 * h < bwt && m < MT ? acc[m < MT ? m : 0][r][q2][2 * h + vv] + bias[m < MT ? m : 0][h] : 0.f;
                                     val[mm][h] = v; am = fmaxf(am, fabsf(v));
                                 }
                             am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 4)); am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 8)); am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 16));
@@ -769,7 +769,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
 #pragma unroll
                                 for (int mm = 0; mm < 2; mm++)
 #pragma unroll
-                                    for (int h = 0; h < 2; h++) if (mm < MBt) {
+                                    for (int h = 0; h < 2; h++) if (mm * 16 + 8 * h < bwt) {   /* (a block of 8: channels g only) */
                                         if (!(g & 1)) wb[lv * rbt + ((mm * 16 + g + 8 * h) >> 1)] = (uint8_t)(nib >> (8 * (2 * mm + h)));
                                         if (osum && sp.stored_stats && j + mm < MT) acc[j + mm < MT ? j + mm : 0][r][q2][2 * h + vv] = dec_e2m1n(nib >> (8 * (2 * mm + h))) * exp2i(e);
                                     }
@@ -777,7 +777,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
 #pragma unroll
                                 for (int mm = 0; mm < 2; mm++)
 #pragma unroll
-                                    for (int h = 0; h < 2; h++) if (mm < MBt) {
+                                    for (int h = 0; h < 2; h++) if (mm * 16 + 8 * h < bwt) {   /* (a block of 8: channels g only) */
                                         const uint8_t code = cvt_e4m3(val[mm][h] * mult);
                                         wb[lv * rbt + mm * 16 + g + 8 * h] = code;
                                         if (osum && sp.stored_stats && j + mm < MT) acc[j + mm < MT ? j + mm : 0][r][q2][2 * h + vv] = dec_e4m3(code) * exp2i(e);
@@ -822,7 +822,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                         /* the tensor and block of this 16-row tile: split outputs are stored as two MX tensors whose padded
                            channel segments (OxP = pad32(o_split)) start at row 0 and OxP */
                         const int cp = co0 + j * 16, sec = sp.y2 && cp >= OxP, Ct = !sp.y2 ? Co : sec ? Co - sp.o_split : sp.o_split;
-                        const int cl = sec ? cp - OxP : cp, bwt = mx_bw(Ct), MBt = bwt / 16;
+                        const int cl = sec ? cp - OxP : cp, bwt = mx_bw(Ct);
                         if (cl % bwt || cl >= Ct) continue;    /* not the first tile of a block, or pure padding */
                         float val[2][2], am = 0.f;
 #pragma unroll
@@ -831,7 +831,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                             for (int h = 0; h < 2; h++) {
                                 const int m = j + mm, co = co0 + m * 16 + g + 8 * h;
                                 float v = 0.f;
-                                if (mm < MBt && m < MT) v = acc[m < MT ? m : 0][r][q2][2 * h + vv] + (b && !sp.y2 && co < Co ? b[co] : 0.f);
+                                if (mm * 16 + 8 * h < bwt && m < MT) v = acc[m < MT ? m : 0][r][q2][2 * h + vv] + (b && !sp.y2 && co < Co ? b[co] : 0.f);
                                 val[mm][h] = v; am = fmaxf(am, fabsf(v));
                             }
                         am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 4)); am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 8)); am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, 16));
@@ -858,7 +858,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
 #pragma unroll
                             for (int mm = 0; mm < 2; mm++)
 #pragma unroll
-                                for (int h = 0; h < 2; h++) if (mm < MBt) {
+                                for (int h = 0; h < 2; h++) if (mm * 16 + 8 * h < bwt) {   /* (a block of 8: channels g only) */
                                     if constexpr (B == 8) {
                                         const uint8_t code = cvt_e4m3(val[mm][h] * mult);
                                         dst[mm * 16 + g + 8 * h] = code;

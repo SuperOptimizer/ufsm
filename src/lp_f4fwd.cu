@@ -26,7 +26,11 @@ extern template void fwd_f4_t<mx8_t, bf16>(const void *x, shape5 xs, const float
 #endif
 
 extern "C" int lp_conv_fwd_f4(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp) {
-    if (xs.c <= 8) return lp_conv_fwd_f8(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp);   /* the network input (enc0.c1): fp8 tap-packed kernel */
+    /* <= 8 input channels: the fp8 tap-packed kernel (the network input enc0.c1; 8-channel activations). An MX-fp4 gradient's
+       backward-data (fp4 gy, output SR, no staging SR) takes the 32-padded fp4 path instead: small_f8 re-encodes gy with one e4m3
+       scale per tile, flushing values more than ~2^14 below the tile's largest (UFSM_G4_NARROW_F8=1: keep small_f8, A/B) */
+    static int nf8 = -1; if (nf8 < 0) nf8 = getenv("UFSM_G4_NARROW_F8") ? atoi(getenv("UFSM_G4_NARROW_F8")) : 0;
+    if (xs.c <= 8 && !(xbf == 4 && ybf == 4 && sp.osr && !sp.sr && !nf8)) return lp_conv_fwd_f8(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp);
     if (sp.accum && (xbf >= 3 || ybf >= 3)) { fprintf(stderr, "lp_conv_fwd_f4: MX storage with accumulate is not supported\n"); abort(); }
     if (xbf == ybf) {
         if (xbf == 4) fwd_f4_t<mx4_t, mx4_t>(x, xs, w, b, cout, y, gp, osum, Go, sp);

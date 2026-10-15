@@ -72,7 +72,7 @@ int main(void) {
     nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0);
     nn_set_act_bf16(0); nn_set_grad_bf16(0);
     const int N = 2, G = 8, K = 16;
-    for (int C = 16; C <= 64; C *= 2) {   /* GroupNorm + SiLU backward: gy and gx MX-fp4 */
+    for (int C = 8; C <= 64; C *= 2) {   /* GroupNorm + SiLU backward: gy and gx MX-fp4 */
         shape5 s = {N, C, 8, 10, 12};
         size_t n = shape_numel(s), NG = (size_t)N * G;
         float *x = dev_rand(n, 2.f), *gam = dev_rand(C, 1.f), *bet = dev_rand(C, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
@@ -99,8 +99,8 @@ int main(void) {
     {   /* stride-1 backward-data with narrow (16-channel) MX-fp4 gy / gx and weights +-6 * 2^-5 (exact in e2m1 / e4m3 / bf16 under any
            block layout): the fp32 reference is then the exact expectation of the SR'd output, so the mean of K converges to it unless
            the gy staging re-rounds (the p16 kernel re-rounded paired voxels to their shared scale to nearest: a bias floor) */
-        const int cis[4] = {16, 16, 32, 32}, cos_[4] = {16, 32, 16, 32};
-        for (int k4 = 0; k4 < 4; k4++) {
+        const int cis[7] = {16, 16, 32, 32, 8, 8, 16}, cos_[7] = {16, 32, 16, 32, 8, 16, 8};
+        for (int k4 = 0; k4 < 7; k4++) {
             shape5 xs = {1, cis[k4], 8, 16, 32}, ys = xs; ys.c = cos_[k4];
             size_t nx = shape_numel(xs), ny = shape_numel(ys), nw = (size_t)cos_[k4] * cis[k4] * 27;
             float *hw = malloc(nw * 4); for (size_t i = 0; i < nw; i++) hw[i] = (frand() < 0.f ? -6.f : 6.f) / 32.f;
@@ -194,7 +194,7 @@ int main(void) {
         printf("  %-46s gw fp4 vs fp8 gy %.3g, bias %.3g%s\n", which ? "wgrad s2 32 -> 32, gy MX-fp4 (FAST)" : "wgrad stem 4 -> 32, gy MX-fp4 (FAST)", d, db, ok ? "" : "  FAIL");
         if (!ok) bad++;
     }
-    for (int C = 16; C <= 96; C += C == 16 ? 16 : 32) for (int accum = 0; accum < 2; accum++) {   /* stride-2 backward-data, MX-fp4 gy / gx (tensor cores; 96: the dilated fp8 path via MX-fp8 copies) */
+    for (int C = 8; C <= 96; C += C <= 16 ? C : 32) for (int accum = 0; accum < 2; accum++) {   /* stride-2 backward-data, MX-fp4 gy / gx (tensor cores; 96: the dilated fp8 path via MX-fp8 copies) */
         shape5 xs = {1, C, 16, 16, 32}, ys = {1, C, 8, 8, 16};
         size_t nx = shape_numel(xs), ny = shape_numel(ys);
         float *w = dev_rand((size_t)C * C * 27, 0.1f), *gy = dev_rand_wide(ny, 1e-3f), *g0 = dev_rand(nx, 1e-3f);
@@ -236,13 +236,13 @@ int main(void) {
         char nm[96]; snprintf(nm, sizeof nm, "up2 bwd %d ch MX-fp4", C);
         report(nm, relerr(one, gxr, nc), relerr(acc, gxr, nc), K, 0.35);
     }
-    for (int wc = 0; wc < 2; wc++) {   /* end to end, narrow levels (16-channel MX-fp4 gradients): parameter gradients vs 16-bit (the mean of K
+    for (int wc = 0; wc < 3; wc++) {   /* end to end, narrow levels (8 / 16-channel MX-fp4 gradients): parameter gradients vs 16-bit (the mean of K
                                           must approach them), fp16 logits (the level-0 chain engages), fewer training bytes than MX-fp8 */
         nn_set_tf32(1); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1); nn_set_gn_stored(1);
         nn_set_prec(3); if (nn_set_prec_policy("all=fp4:fp4:fp4,enc0.c1=fp16")) bad++;
         setenv("UFSM_F4_WGRAD", "1", 1);
         unet_set_act_mx4(1); unet_set_grad_mx8(1); unet_set_input_prec(8); unet_set_recompute(1); unet_set_chunk_up(2); unet_set_lean(2);
-        unet_cfg cfg = wc == 0 ? (unet_cfg){3, {16, 32, 64}, 4, 2, 8, 1} : (unet_cfg){3, {16, 16, 32}, 4, 2, 8, 1};
+        unet_cfg cfg = wc == 0 ? (unet_cfg){3, {16, 32, 64}, 4, 2, 8, 1} : wc == 1 ? (unet_cfg){3, {16, 16, 32}, 4, 2, 8, 1} : (unet_cfg){3, {8, 16, 32}, 4, 2, 8, 1};
         shape5 xs = {1, 4, 32, 32, 32}; size_t nx = shape_numel(xs), no = nx / 4 * 2;
         float *x = dev_rand(nx, 1.f), *gyo = dev_rand(no, 1.f);
         unet *u = unet_create(&cfg); unet_init(u, 29); size_t np = unet_nparams(u);

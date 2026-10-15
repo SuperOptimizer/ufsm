@@ -97,7 +97,8 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
        Same values, scales and SR keys as the per-element paths (bias: summation order differs). */
     float bacc = 0.f;
     if constexpr (FAST) {
-        const bool fast = uni && !upt && (coop & 3) == 3 && (co0 % mx_bw(Co)) + BMo <= mx_bw(Co);
+        const bool fast = uni && !upt && (coop & 3) == 3 && ((co0 % mx_bw(Co)) + BMo <= mx_bw(Co) || (co0 == 0 && mx_bw(Co) < BMo && Co <= mx_bw(Co)));   /* (or one
+                                                                                                     block narrower than the tile: 8 channels) */
         if (!fast) __trap();   /* the host only picks FAST for these */
         float *mqs = (float *)(amx + 2 * CH);   /* [2][CH] x plane multipliers */
         uint8_t *graw = smem_raw + (((unsigned char *)(mqs + 2 * CH) - smem_raw + 15) & ~15);   /* [256 voxels][BMo] raw gy (e4m3) */
@@ -179,8 +180,14 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
         const size_t Sg = (size_t)D * H * W, gri = ((size_t)n * mx_nb(Co) + co0 / gbw) * Sg;
         constexpr int GB = MX_BITS(TG), GRB = BMo * GB / 8, GCB = GRB >= 16 ? 16 : 8;   /* gy bits (MX-fp8 or MX-fp4 gradients), raw row bytes, copy chunk */
         const uint8_t *gq = (const uint8_t *)gy, *gqs = gq + (size_t)N * mx_nb(Co) * Sg * mx_rb(gbw, GB);
+        const int rrb = mx_rb(gbw, GB) < GRB ? mx_rb(gbw, GB) : GRB;   /* the stored row's bytes in the slot (one 8-channel block: 4 / 8, the rest zero) */
         auto gload = [&](int oz0) {   /* cp.async: voxel i = row 16 + xx of the z-step (row = vz 8 + vy) */
-            for (int k = tid; k < 256 * (GRB / GCB); k += 288) {
+            if (rrb < GRB) for (int k = tid; k < 256 * (GRB / 4); k += 288) {   /* narrow rows: 4-byte copies, zero past the row */
+                const int i = k / (GRB / 4), h = k % (GRB / 4), row = i >> 4, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + (i & 15);
+                const bool ok = oz < D && oy < H && ox < W && 4 * h < rrb;
+                cp_async<4>(graw + i * GRB + 4 * h, ok ? gq + (gri + ((size_t)oz * H + oy) * W + ox) * mx_rb(gbw, GB) + 4 * h : gq, ok);
+            }
+            else for (int k = tid; k < 256 * (GRB / GCB); k += 288) {
                 const int i = k / (GRB / GCB), h = k % (GRB / GCB), row = i >> 4, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + (i & 15);
                 const bool ok = oz < D && oy < H && ox < W;
                 cp_async<GCB>(graw + i * GRB + GCB * h, ok ? gq + (gri + ((size_t)oz * H + oy) * W + ox) * mx_rb(gbw, GB) + (co0 % gbw) * GB / 8 + GCB * h : gq, ok);
@@ -470,7 +477,7 @@ template <int MT, int NT, typename T, typename TG> static void launch_bw8(dim3 g
     const int coop = g_f8w_coop | ((g_f8w_coop & 4) && xs.c <= 8 && (ys.c <= 32 || ys.c % 32 == 0) ? 2 : 0);   /* bit 2: the cooperative gy path for the
                                                                     network input conv (> 32 outputs: half-resolution nets, 32-output tiles) */
     if constexpr (NT == 1 && IS_MX(T) && IS_MX(TG)) {   /* the network input conv: conv_bwd_w_f8_k's FAST path (MX-fp8 or MX-fp4 gy) */
-        if (xs.c <= 8 && !sp.up && !sp.x2 && x && (coop & 3) == 3 && 16 * MT <= mx_bw(ys.c) && ys.w % 4 == 0) {
+        if (xs.c <= 8 && !sp.up && !sp.x2 && x && (coop & 3) == 3 && (16 * MT <= mx_bw(ys.c) || (ys.c <= mx_bw(ys.c) && mx_bw(ys.c) < 16 * MT)) && ys.w % 4 == 0) {
             if (!attr[cur_dev_()][1]) { attr[cur_dev_()][1] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f8_k<MT, NT, T, TG, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
             smem += 2 * 8 * NT * 4 + 16 + 256 * 16 * MT + 256;   /* plane multipliers, raw gy rows and scales */
             conv_bwd_w_f8_k<MT, NT, T, TG, true><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, coop);

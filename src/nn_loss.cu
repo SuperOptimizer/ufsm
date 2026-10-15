@@ -285,7 +285,7 @@ extern "C" void nn_peer_copy(void *dst, int dst_dev, const void *src, int src_de
 int zsegs(const void *p, shape5 s, int esz, zseg_t *sg) {
     const size_t HW = (size_t)s.h * s.w, S = HW * s.d;
     if (esz) { sg[0] = {0, (size_t)s.n * s.c, HW * esz, S * esz}; return 1; }
-    const int dt = nn_storage(p), bw = s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw, rb = dt == 4 ? bw / 2 : bw;
+    const int dt = nn_storage(p), bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw, rb = dt == 4 ? bw / 2 : bw;   /* (mx_bw) */
     if (dt != 4 && dt != 8) { fprintf(stderr, "split: tensor %p has no MX registration\n", p); abort(); }
     sg[0] = {0, (size_t)s.n * nb, HW * rb, S * rb};
     sg[1] = {(size_t)s.n * nb * S * rb, (size_t)s.n * nb, HW, S};

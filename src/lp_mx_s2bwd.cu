@@ -8,8 +8,9 @@
    block]. Thread = one gx voxel of the class and one ci block (all its bwx channels), gy rows of consecutive threads are
    consecutive voxels (coalesced). The former thread-per-voxel kernel mixed parities inside a warp (divergent tap sets, bank
    conflicted weights): down0 3.66 ms vs 0.59 for the 16-bit tensor-core path at 96^3 B2. */
+template <int GB = 8, int XB = 8>   /* MX bits of gy / gx; XB 4: gx with exact SR keyed by osr (the narrow MX-fp4 gradient levels) */
 __global__ void __launch_bounds__(128) bwd_data_s2_mx2_k(const uint8_t *gy, const float *w, uint8_t *gx, int N, int Ci, int Co,
-                                                         int D, int H, int W, int Do, int Ho, int Wo, int accum) {
+                                                         int D, int H, int W, int Do, int Ho, int Wo, int accum, unsigned osr = 0u) {
     extern __shared__ float4 swq[];   /* [ntap][Co][bwx / 4] */
     const int bwx = mx_bw(Ci), nbx = mx_nb(Ci), bwy = mx_bw(Co), nby = mx_nb(Co);
     const int p = blockIdx.y, pz = p >> 2, py = (p >> 1) & 1, px = p & 1;
@@ -32,7 +33,7 @@ __global__ void __launch_bounds__(128) bwd_data_s2_mx2_k(const uint8_t *gy, cons
     const int mx = (int)(mi % Wp), my = (int)((mi / Wp) % Hp), mz = (int)(mi / ((size_t)Wp * Hp));
     const int uz = 2 * mz + pz, uy = 2 * my + py, ux = 2 * mx + px;
     const size_t So = (size_t)Do * Ho * Wo, S = (size_t)D * H * W;
-    const uint8_t *scy = mx_sc<8>(gy, N, Co, So);
+    const uint8_t *scy = mx_sc<GB>(gy, N, Co, So);
     float acc[32];
 #pragma unroll
     for (int k = 0; k < 32; k++) acc[k] = 0.f;
@@ -43,7 +44,7 @@ __global__ void __launch_bounds__(128) bwd_data_s2_mx2_k(const uint8_t *gy, cons
         const size_t vo = ((size_t)oz * Ho + oy) * Wo + ox;
         for (int yb = 0; yb < nby; yb++) {
             float r[32];
-            mx_load_row_b<8>(gy, scy, ((size_t)n * nby + yb) * So + vo, bwy, r);
+            mx_load_row_b<GB>(gy, scy, ((size_t)n * nby + yb) * So + vo, bwy, r);
             const float4 *wt = swq + ((size_t)tl * Co + yb * bwy) * q4;
 #pragma unroll
             for (int k = 0; k < 32; k++) {
@@ -57,14 +58,14 @@ __global__ void __launch_bounds__(128) bwd_data_s2_mx2_k(const uint8_t *gy, cons
         }
     }
     const size_t ri = ((size_t)n * nbx + blk) * S + ((size_t)uz * H + uy) * W + ux;
-    uint8_t *scx = mx_sc<8>(gx, N, Ci, S);
-    if (accum) {
+    uint8_t *scx = mx_sc<XB>(gx, N, Ci, S);
+    if (accum) {   /* the old gx decoded exactly, the sum rounded once */
         float r[32];
-        mx_load_row_b<8>(gx, scx, ri, bwx, r);
+        mx_load_row_b<XB>(gx, scx, ri, bwx, r);
 #pragma unroll
         for (int k = 0; k < 32; k++) acc[k] += r[k];
     }
-    mx_store_row_b<8>(gx, scx, ri, bwx, acc);
+    mx_store_row_b<XB>(gx, scx, ri, bwx, acc, XB == 4 ? osr : 0u);
 }
 extern "C" void lp_bwd_data_s2_mx_wide(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum);   /* lp_mx_s2bwd_wide.cu */
 /* ---- wide layers on the tensor cores: gx = conv_s1(dilate2(gy), flip(w)^T) with the MX-fp8 stride-1 kernel. dilate2 puts gy
@@ -124,9 +125,19 @@ extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, s
 extern "C" int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr) {
     /* the direct tensor-core kernel first (16 / 32 / 64 channels: no fine-level scratch), then the dilated fp8 conv (wider) */
     if (const int r = lp_bwd_data_s2_mx_tc(gy, ys, w, xs, gx, accum, gdt, xdt, osr)) return r == 3 ? 3 : 1;   /* (3: the fp4 kernel) */
+    if ((gdt == 4) != (xdt == 4)) { fprintf(stderr, "lp_bwd_data_s2_mx: gy and gx must share the MX format\n"); abort(); }
+    if (gdt == 4 && xs.c < 32 && (size_t)8 * ys.c * mx_bw(xs.c) * sizeof(float) <= 96 * 1024) {   /* narrow MX-fp4 levels (8 channels; 16 if the tensor-core kernel
+                                     refused): the parity-major kernel on fp4 rows directly (no fine-level fp8 copies, one SR rounding) */
+        static int attr4[8];
+        if (!attr4[cur_dev_()]) { attr4[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)bwd_data_s2_mx2_k<4, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+        const size_t mmax = (size_t)((xs.d + 1) / 2) * ((xs.h + 1) / 2) * ((xs.w + 1) / 2), smem = (size_t)8 * ys.c * mx_bw(xs.c) * sizeof(float);
+        const dim3 grid(nblk_(mmax, 128), 8, (unsigned)(mx_nb(xs.c) * xs.n));
+        bwd_data_s2_mx2_k<4, 4><<<grid, 128, smem>>>((const uint8_t *)gy, w, (uint8_t *)gx, xs.n, xs.c, ys.c, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum, osr);
+        LPCK();
+        return 0;
+    }
     if (gdt == 4 || xdt == 4) {   /* MX-fp4 gradients on the wide (small, coarse) levels: through MX-fp8 copies (gy and the old gx exact,
                                      the result back to fp4 with SR) */
-        if (gdt != 4 || xdt != 4) { fprintf(stderr, "lp_bwd_data_s2_mx: gy and gx must share the MX format\n"); abort(); }
         const size_t Sy = shape_spatial(ys), Sx = shape_spatial(xs), ry = (size_t)ys.n * mx_nb(ys.c) * Sy, rx = (size_t)xs.n * mx_nb(xs.c) * Sx;
         uint8_t *gy8 = lp_buf<uint8_t>(5, lp_mx8_bytes(ys.n, ys.c, Sy)), *gx8 = lp_buf<uint8_t>(4, lp_mx8_bytes(xs.n, xs.c, Sx));   /* slots 4 (the wgrad gy pre-pass, free here) and 5 */
         mx_recode_k<4, 8><<<nblk_(ry, 256), 256>>>((const uint8_t *)gy, gy8, ys.n, ys.c, Sy, 0u);
@@ -142,10 +153,10 @@ extern "C" int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shap
         const size_t smem = (size_t)8 * ys.c * bwx * sizeof(float);
         if (smem > 96 * 1024) { lp_bwd_data_s2_mx_wide(gy, ys, w, xs, gx, accum); return 0; }   /* wide layers: thread-per-voxel kernel */
         static int attr[8];
-        if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)bwd_data_s2_mx2_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+        if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)bwd_data_s2_mx2_k<8, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
         const size_t mmax = (size_t)((xs.d + 1) / 2) * ((xs.h + 1) / 2) * ((xs.w + 1) / 2);
         const dim3 grid(nblk_(mmax, 128), 8, (unsigned)(nbx * xs.n));
-        bwd_data_s2_mx2_k<<<grid, 128, smem>>>((const uint8_t *)gy, w, (uint8_t *)gx, xs.n, xs.c, ys.c, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum);
+        bwd_data_s2_mx2_k<8, 8><<<grid, 128, smem>>>((const uint8_t *)gy, w, (uint8_t *)gx, xs.n, xs.c, ys.c, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum);
         LPCK();
         return 0;
     }

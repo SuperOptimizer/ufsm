@@ -55,16 +55,16 @@ __device__ __forceinline__ void row_gn(float *r, const gnp_t &gp, int n, int blk
 template <int B> __device__ __forceinline__ void mx_load16(const uint8_t *q, const uint8_t *sc, size_t ri, int bw, int h0, float *v) {
     const float s = mx_scale(sc[ri]);
     const uint8_t *p = q + ri * mx_rb(bw, B) + h0 * B / 8;
-    if constexpr (B == 8) {
-        const uint4 u = __ldg((const uint4 *)p);
+    if constexpr (B == 8) {   /* (an 8-channel row: 8 bytes, the rest zero) */
+        const uint4 u = bw == 8 ? make_uint4(__ldg((const unsigned *)p), __ldg((const unsigned *)p + 1), 0u, 0u) : __ldg((const uint4 *)p);
         const unsigned w[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
         for (int j = 0; j < 4; j++) {
             float2 a = dec_e4m3x2((unsigned short)(w[j] & 0xffff)), b = dec_e4m3x2((unsigned short)(w[j] >> 16));
             v[4 * j] = a.x * s; v[4 * j + 1] = a.y * s; v[4 * j + 2] = b.x * s; v[4 * j + 3] = b.y * s;
         }
-    } else {
-        const uint2 u = __ldg((const uint2 *)p);
+    } else {   /* (an 8-channel row: 4 bytes) */
+        const uint2 u = bw == 8 ? make_uint2(__ldg((const unsigned *)p), 0u) : __ldg((const uint2 *)p);
         const unsigned w[2] = {u.x, u.y};
 #pragma unroll
         for (int j = 0; j < 2; j++)
