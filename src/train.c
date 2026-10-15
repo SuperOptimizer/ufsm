@@ -9,6 +9,7 @@
 #include "sources.h"
 #include "split.h"
 #include "unet.h"
+#include "nn_lp.h"
 #include <math.h>
 #include <signal.h>
 #include <stdio.h>
@@ -1294,9 +1295,9 @@ int cmd_train(int argc, char **argv) {
                                             + (g_cout > NCH && !g_gl_inplace ? (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) : 0)
                                             + (g_head_slab ? (size_t)B * (NCH + 1) * p3 : 0);   /* head slabs: targets and mask outside the gradient buffers */   /* > 2 outputs (affinities, verso): the logit gradient may not fit beside the logits */
                 /* the fp4 weight gradient's gy records of a whole level-0 layer (lp_gn_silu_bwd_apply_rec, MX-fp4 gradients): 136 B per
-                   32 channels x 256 voxels (~0.5 B per voxel and channel), outside the dry build */
-                const size_t grec = unet_grad_mx4() && cfg.widths[0] % 32 == 0 && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1) ? (size_t)B * cfg.widths[0] * p3 * 136 / 256 : 0;   /* (the GN kernel
-                                                                                                     writes no records below 32-channel blocks) */
+                   channel x 256 voxels (~0.5 B per voxel and channel), outside the dry build. 8 / 16-channel levels only with UFSM_GYREC=2
+                   (8.5 B per level-0 voxel at 16 channels for ~0 step time there; 8 channels: -2%) */
+                const size_t grec = unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1) ? (size_t)B * cfg.widths[0] * p3 * 136 / 256 : 0;
                 need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (need <= fmin) pick = c;
             }

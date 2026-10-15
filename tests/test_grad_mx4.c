@@ -71,6 +71,17 @@ static void mode_mx(void) { nn_set_prec(3); nn_set_tf32(1); }
 int main(void) {
     nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0);
     nn_set_act_bf16(0); nn_set_grad_bf16(0);
+    {   /* e4m3 stochastic rounding of the fp8 weight gradient's gy (sr_e4m3x): unbiased, grid values exact (sr_e4m3, the dither then
+           round-to-nearest, gives 1 -> 0.98438: -1/64 on powers of two). 4e6 roundings: sigma <= 0.5 ulp / 2000 */
+        const float pv[] = {1.f, 1.5f, 0.25f, 3.f, 0.3f, 1.4f, -1.4f, 1.5f / 512.f, 0.7f / 512.f, 448.f, 430.f};
+        for (int i = 0; i < 11; i++) {
+            const double m = lp_sr_e4m3x_mean(pv[i], 4000000), ulp = ldexp(1.0, (int)fmax(floor(log2(fabs((double)pv[i]))), -6.0) - 3);
+            const int ok = fabs(m - pv[i]) < 1.5e-3 * ulp + 1e-12;
+            printf("  sr_e4m3x mean of 4e6 roundings of %-10.6g %.8g (%+.2g ulp)%s\n", pv[i], m, (m - pv[i]) / ulp, ok ? "" : "  FAIL");
+            if (!ok) bad++;
+            if (getenv("UFSM_SR_E4M3_PROBE")) { const double m0 = lp_sr_e4m3_mean(pv[i], 4000000); printf("    (sr_e4m3: %.8g, %+.2g ulp)\n", m0, (m0 - pv[i]) / ulp); }
+        }
+    }
     const int N = 2, G = 8, K = 16;
     for (int C = 8; C <= 64; C *= 2) {   /* GroupNorm + SiLU backward: gy and gx MX-fp4 */
         shape5 s = {N, C, 8, 10, 12};
@@ -95,6 +106,26 @@ int main(void) {
         snprintf(nm, sizeof nm, "gn+silu bwd gx MX-fp4, %d ch", C); report(nm, relerr(one, gxr, n), relerr(acc, gxr, n), K, 0.35);
         snprintf(nm, sizeof nm, "gn+silu bwd ggamma, %d ch", C);
         { double e = relerr(gg2, gg1, C); printf("  %-46s rel err %.3g%s\n", nm, e, e < 1e-3 ? "" : "  FAIL"); if (!(e < 1e-3)) bad++; }
+    }
+    for (int C = 8; C <= 32; C *= 2) {   /* the apply that also writes the weight gradient's gy records (N 1): its gx bit-identical to the plain apply's
+                                            (same folded coefficients, same SR keys); 8 / 16 channels only with the narrow records on */
+        shape5 s = {1, C, 8, 10, 12};
+        size_t n = shape_numel(s);
+        float *x = dev_rand(n, 2.f), *gam = dev_rand(C, 1.f), *bet = dev_rand(C, 0.5f), *mean = dev_rand(G, 0.2f), *rstd = dev_rand(G, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, G * 4); for (int i = 0; i < G; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, G * 4); }
+        void *xm = mx4_from(x, s); float *gy = dev_rand(n, 1e-3f); void *gym = mx4_from(gy, s);
+        float *gg = dev_zero(C), *gb = dev_zero(C), *scr = nn_malloc(nn_gn_scratch(s) + 4096);
+        void *gxa = mx4_new(s), *gxb = mx4_new(s);
+        const size_t bytes = nn_mx4_bytes(s);
+        mode_mx();
+        lp_set_gyrec_narrow(0); lp_set_gyrec_off(1); nn_set_sr_step(1500); nn_gn_silu_bwd(xm, s, G, gam, bet, mean, rstd, gym, (float *)gxa, gg, gb, scr);
+        lp_set_gyrec_narrow(1); lp_set_gyrec_off(0); nn_set_sr_step(1500); nn_gn_silu_bwd(xm, s, G, gam, bet, mean, rstd, gym, (float *)gxb, gg, gb, scr);
+        lp_set_gyrec_narrow(-1); lp_set_gyrec_off(-1);
+        uint8_t *ha = malloc(bytes), *hb = malloc(bytes); nn_d2h(ha, gxa, bytes); nn_d2h(hb, gxb, bytes);
+        const int same = !memcmp(ha, hb, bytes);
+        printf("  gn+silu bwd with gy records, %d ch: gx bytes %s the plain apply's%s\n", C, same ? "equal" : "DIFFER from", same ? "" : "  FAIL");
+        if (!same) bad++;
+        free(ha); free(hb);
     }
     {   /* stride-1 backward-data with narrow (16-channel) MX-fp4 gy / gx and weights +-6 * 2^-5 (exact in e2m1 / e4m3 / bf16 under any
            block layout): the fp32 reference is then the exact expectation of the SR'd output, so the mean of K converges to it unless
@@ -151,10 +182,12 @@ int main(void) {
             printf("  %-46s rel err %.3g%s\n", "  kernel (fp32 out) vs fp32 reference", ek, ek < 0.15 ? "" : "  FAIL"); if (!(ek < 0.15)) bad++;
         }
     }
-    {   /* stride-1 weight gradient (fp4 kernels, gy pre-pass): MX-fp4 gy vs MX-fp8 gy vs fp32 */
-        const int cis[2] = {32, 64}, cos_[2] = {32, 32};
+    {   /* stride-1 weight gradient (fp4 kernels, gy pre-pass): MX-fp4 gy vs MX-fp8 gy vs fp32; narrow levels (16 / 8 channels in
+           or out) also the warp-specialised kernel vs conv_bwd_w_f4_k (the same records and products: only the gw sums group
+           differently) */
+        const int cis[6] = {32, 64, 16, 32, 16, 8}, cos_[6] = {32, 32, 16, 16, 8, 8};
         nn_set_sr(1); setenv("UFSM_F4_WGRAD", "1", 1);
-        for (int k3 = 0; k3 < 2; k3++) {
+        for (int k3 = 0; k3 < 6; k3++) {
             shape5 xs = {1, cis[k3], 16, 16, 32}, ys = xs; ys.c = cos_[k3];
             size_t nx = shape_numel(xs), ny = shape_numel(ys), nw = (size_t)cos_[k3] * cis[k3] * 27;
             float *x = dev_rand_wide(nx, 2.f), *gy = dev_rand_wide(ny, 1e-3f);
@@ -170,8 +203,38 @@ int main(void) {
             const double e4 = relerr(gw4, gwr, nw), e8 = relerr(gw8, gwr, nw), eb = relerr(gb4, gbr, cos_[k3]), d48 = relerr(gw4, gw8, nw);
             { float *h = malloc(nw * 4); double a = 0, c = 0; nn_d2h(h, gwr, nw * 4); for (size_t i = 0; i < nw; i++) a += fabs(h[i]); nn_d2h(h, gw4, nw * 4); for (size_t i = 0; i < nw; i++) c += fabs(h[i]); free(h);
               printf("  |gw| reference %.6g, fp4 gy %.6g\n", a, c); if (!(a > 0) || !(c > 0)) bad++; }
-            const int ok = e4 < 0.1 && d48 < 1e-6 && eb < 1e-3 && e4 > 0;
+            const double tol4 = cis[k3] >= 32 && cos_[k3] >= 32 ? 0.1 : 0.16;   /* one SR draw of gy (narrow levels: 0.10 .. 0.13) */
+            const int ok = e4 < tol4 && d48 < 1e-6 && eb < 1e-3 && e4 > 0;
             printf("  wgrad %d -> %d: gy MX-fp4 %.3g, gy MX-fp8 (same values) %.3g, fp4 vs fp8 %.3g, bias %.3g%s\n", cis[k3], cos_[k3], e4, e8, d48, eb, ok ? "" : "  FAIL");
+            if (!ok) bad++;
+            {   /* the same call on conv_bwd_w_f4_k (warp-specialised kernel off): equal up to the fp32 grouping of the sums */
+                float *gwp = dev_zero(nw), *gbp = dev_zero(cos_[k3]);
+                lp_set_f4w_ws(0); lp_bwd_w_f4(xm, 4, xs, gy4, 4, ys, gwp, gbp, (gnp_t){0}, sr, 0); lp_set_f4w_ws(-1);
+                const double dws = relerr(gw4, gwp, nw);
+                printf("  wgrad %d -> %d: warp-specialised vs plain kernel rel diff %.3g%s\n", cis[k3], cos_[k3], dws, dws < 1e-6 ? "" : "  FAIL");
+                if (!(dws < 1e-6)) bad++;
+                nn_free(gwp); nn_free(gbp);
+            }
+        }
+        for (int k4 = 0; k4 < 4; k4++) {   /* split inputs (decoder inputs): 8-channel x + 16-channel x2 (8-channel tiles, the warp-specialised
+                                              kernel's NT 1) and 16 + 8 (a 16-channel tile over the 8-channel segment and padding), vs fp32 and
+                                              vs the plain kernel */
+            const int c1 = k4 < 2 ? 8 : 16, c2 = 24 - c1, co = k4 & 1 ? 16 : 8;
+            shape5 x1s = {1, c1, 16, 16, 32}, x2s = x1s, xs = x1s, ys = x1s; x2s.c = c2; xs.c = 24; ys.c = co;
+            const size_t n1 = shape_numel(x1s), n2 = shape_numel(x2s), nw = (size_t)co * 24 * 27;
+            float *x1 = dev_rand_wide(n1, 2.f), *x2 = dev_rand_wide(n2, 2.f), *gy = dev_rand_wide(shape_numel(ys), 1e-3f);
+            void *x1m = mx4_from(x1, x1s), *x2m = mx4_from(x2, x2s); float *x1d = deq4(x1m, x1s), *x2d = deq4(x2m, x2s);
+            float *xd = dev_zero(n1 + n2); nn_d2d(xd, x1d, n1 * 4); nn_d2d(xd + n1, x2d, n2 * 4);   /* N 1: channel concatenation */
+            void *gy4 = mx4_from(gy, ys); float *gyd4 = deq4(gy4, ys);
+            float *gwr = dev_zero(nw), *gbr = dev_zero(co), *gw4 = dev_zero(nw), *gb4 = dev_zero(co), *gwp = dev_zero(nw), *gbp = dev_zero(co);
+            mode_ref(); nn_conv3d_bwd_weight(xd, xs, gyd4, ys, 3, 1, gwr, gbr);
+            mode_mx();
+            split_t sr = {0}; sr.sr = 0x3c6ef372u; sr.x2 = x2m; sr.c_split = c1;
+            lp_bwd_w_f4(x1m, 4, xs, gy4, 4, ys, gw4, gb4, (gnp_t){0}, sr, 0);
+            lp_set_f4w_ws(0); lp_bwd_w_f4(x1m, 4, xs, gy4, 4, ys, gwp, gbp, (gnp_t){0}, sr, 0); lp_set_f4w_ws(-1);
+            const double e4 = relerr(gw4, gwr, nw), dws = relerr(gw4, gwp, nw), eb = relerr(gb4, gbr, co);
+            const int ok = e4 < 0.16 && e4 > 0 && dws < 1e-6 && eb < 1e-3;
+            printf("  wgrad split %d + %d -> %d: gy MX-fp4 %.3g, warp-specialised vs plain %.3g, bias %.3g%s\n", c1, c2, co, e4, dws, eb, ok ? "" : "  FAIL");
             if (!ok) bad++;
         }
     }

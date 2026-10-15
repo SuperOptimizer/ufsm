@@ -2,6 +2,21 @@
 /* kernels and launchers of lp_f8wgrad (instantiated per type in lp_f8wgrad_i*.cu) */
 #include "lp_common.cuh"
 
+/* exact stochastic rounding of the gy operand onto the e4m3 grid (|v| <= 448: block-scaled), keyed by the element. A value on the
+   grid comes back as it is; sr_e4m3's dither then round-to-nearest pulled exact powers of two down (E = v (1 - 1/64): the binade
+   below is twice as fine), which MX-fp4 gradients (half of their magnitudes are powers of two) hit constantly. Off the grid the
+   two bracketing points are chosen with probability proportional to the distance to the other one: inside a binade the grid is
+   uniform, so the floor of the value in grid units plus a uniform. The hash is computed only off the grid (MX-sourced gy: values
+   below 2^-6 after the block scale, rare). */
+__device__ __forceinline__ float sr_e4m3x(float v, uint32_t seed, uint64_t key) {
+    const unsigned b = __float_as_uint(v) & 0x7fffffffu;
+    const int ex = max((int)(b >> 23) - 127, -6);
+    const float t = __uint_as_float(b) * exp2i(3 - ex);   /* grid units: [8, 16) in a normal binade, [0, 8) below 2^-6 */
+    if (t == floorf(t)) return v;   /* on the grid (and 0, inf); NaN goes on and stays NaN */
+    const float u = (float)(sr_hash(seed, key) >> 8) * (1.f / 16777216.f);
+    return copysignf(floorf(t + u) * exp2i(ex - 3), v);
+}
+
 /* ======================= FP8 weight gradient, k=3, stride 1 =======================
    Block = 9 warps; warp w owns the tap row (kz, ky) = (w/3, w%3) and all three kx, so one pair of 32-bit loads of
    an input row feeds the B fragments of kx = 0, 1, 2 through byte funnel shifts. M = 16*MT output channels (GY),
@@ -199,48 +214,46 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
             }
             asm volatile("cp.async.commit_group;\n" ::: "memory");
         };
-        auto gstage = [&](int oz0) {   /* lane = channel c of K block ks (KPW blocks per warp) */
-            constexpr int KPW = 32 / BMo;
-            const int c = lane % BMo, ks = warp * KPW + lane / BMo;
+        auto gstage = [&](int oz0) {   /* warp = K block ks (2 rows x 16 voxels); lane = channel c, and with 16 outputs its row of the block */
+            constexpr int NP = 32 / BMo, NV = 32 / NP;   /* lanes per channel, voxels per lane */
+            const int c = lane % BMo, part = lane / BMo, ks = warp, i0 = part * NV;
             if (ks >= 8) return;
             const bool cok = co0 + c < Co;
-            const uint8_t *rb = graw + ks * 32 * GRB + (GB == 8 ? c : c >> 1), *sb = gscl + ks * 32;
-            float v[32];
+            const uint8_t *rb = graw + (ks * 32 + i0) * GRB + (GB == 8 ? c : c >> 1), *sb = gscl + ks * 32 + i0;
+            float v[NV];
             unsigned am = 0u;
 #pragma unroll
-            for (int i = 0; i < 32; i += 2) {
+            for (int i = 0; i < NV; i += 2) {
                 float2 d;
                 if constexpr (GB == 8) d = dec_e4m3x2((unsigned short)(rb[i * GRB] | (rb[(i + 1) * GRB] << 8)));
                 else { const float2 a = dec_e2m1x2(rb[i * GRB]), b = dec_e2m1x2(rb[(i + 1) * GRB]); d = (c & 1) ? make_float2(a.y, b.y) : make_float2(a.x, b.x); }   /* this lane's nibble of each row */
                 v[i] = cok ? d.x * mx_scale(sb[i]) : 0.f; v[i + 1] = cok ? d.y * mx_scale(sb[i + 1]) : 0.f;
                 am = max(am, max(__float_as_uint(v[i]) & 0x7fffffffu, __float_as_uint(v[i + 1]) & 0x7fffffffu));
             }
+            if constexpr (NP == 2) am = max(am, __shfl_xor_sync(0xffffffffu, am, 16));   /* the block's other row */
             const unsigned u = __float_as_uint(__uint_as_float(am) * (1.f / 448.f));   /* mx_exp without its early return */
             const int e = (u & 0x7fffffffu) > 0x7f800000u ? 128 : max(-126, min(126, (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0)));
             const float m = exp2i(-e);
-            sgs[c * 8 + ks] = (uint8_t)(e + 127);
-            unsigned *dst = (unsigned *)(sg + c * G8_CS + ks * 32);
-            if (sp.sr) {
+            if (part == 0) sgs[c * 8 + ks] = (uint8_t)(e + 127);
+            unsigned *dst = (unsigned *)(sg + c * G8_CS + ks * 32 + i0);
+            float q[NV];
+            unsigned mn = 0xffffffffu;   /* the smallest nonzero |q| (bits) - 1 */
+#pragma unroll
+            for (int i = 0; i < NV; i++) { q[i] = v[i] * m; mn = min(mn, (__float_as_uint(q[i]) & 0x7fffffffu) - 1u); }
+            if (sp.sr && mn < 0x3c7fffffu) {   /* a value below 2^-6 (MX gy: the only ones that can be off the e4m3 grid): sr_e4m3x */
                 const uint64_t id0 = (((uint64_t)n * Co + co0 + c) * D + oz0 + ((2 * ks) >> 3)) * H;   /* element id: ((n Co + co) D + oz) H W + oy W + ox */
 #pragma unroll
-                for (int w = 0; w < 8; w++) {
-                    float q[4];
-#pragma unroll
-                    for (int j = 0; j < 4; j++) {
-                        const int i = 4 * w + j, row = 2 * ks + (i >> 4);
-                        const uint64_t id = (id0 + (uint64_t)(oy0 + (row & 7))) * (uint64_t)W + (uint64_t)(ox0 + (i & 15));
-                        q[j] = sr_e4m3(v[i] * m, sr_hash(sp.sr, id));
-                    }
-                    dst[w] = cvt_e4m3x4(q[0], q[1], q[2], q[3]);
+                for (int i = 0; i < NV; i++) {
+                    const int ii = i0 + i, row = 2 * ks + (ii >> 4);
+                    q[i] = sr_e4m3x(q[i], sp.sr, (id0 + (uint64_t)(oy0 + (row & 7))) * (uint64_t)W + (uint64_t)(ox0 + (ii & 15)));
                 }
-            } else {
-#pragma unroll
-                for (int w = 0; w < 8; w++) dst[w] = cvt_e4m3x4(v[4 * w] * m, v[4 * w + 1] * m, v[4 * w + 2] * m, v[4 * w + 3] * m);
             }
+#pragma unroll
+            for (int w = 0; w < NV / 4; w++) dst[w] = cvt_e4m3x4(q[4 * w], q[4 * w + 1], q[4 * w + 2], q[4 * w + 3]);   /* (on the grid: exact) */
             if (do_bias) {
                 float bs = 0.f;
 #pragma unroll
-                for (int i = 0; i < 32; i++) bs += v[i];
+                for (int i = 0; i < NV; i++) bs += v[i];
                 bacc += bs;
             }
         };
@@ -390,7 +403,7 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
                     if (sp.sr) {
 #pragma unroll
                         for (int c = 0; c < BMo; c++)   /* same key as the per-block path */
-                            sg[c * G8_CS + row * 16 + xx] = cvt_e4m3(sr_e4m3(v[c] * exp2i(-ec[c]), sr_hash(sp.sr, vid0 + (uint64_t)(co0 + c) * Sg)));
+                            sg[c * G8_CS + row * 16 + xx] = cvt_e4m3(sr_e4m3x(v[c] * exp2i(-ec[c]), sp.sr, vid0 + (uint64_t)(co0 + c) * Sg));
                     } else {
 #pragma unroll
                         for (int c = 0; c < BMo; c++) sg[c * G8_CS + row * 16 + xx] = cvt_e4m3(v[c] * exp2i(-ec[c]));
@@ -429,8 +442,8 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
             float4 q = make_float4(v.x * m, v.y * m, v.z * m, v.w * m);
             if (sp.sr) {   /* stochastic rounding of the gradient operand, keyed by the element */
                 const uint64_t vid = ((((uint64_t)n * Co + co) * D + oz) * H + oy) * (uint64_t)W + ox;
-                q.x = sr_e4m3(q.x, sr_hash(sp.sr, vid)); q.y = sr_e4m3(q.y, sr_hash(sp.sr, vid + 1));
-                q.z = sr_e4m3(q.z, sr_hash(sp.sr, vid + 2)); q.w = sr_e4m3(q.w, sr_hash(sp.sr, vid + 3));
+                q.x = sr_e4m3x(q.x, sp.sr, vid); q.y = sr_e4m3x(q.y, sp.sr, vid + 1);
+                q.z = sr_e4m3x(q.z, sp.sr, vid + 2); q.w = sr_e4m3x(q.w, sp.sr, vid + 3);
             }
             *(unsigned *)(sg + c * G8_CS + row * 16 + vx) = cvt_e4m3x4(q.x, q.y, q.z, q.w);
             if (f == 0) { sgs[c * 8 + ks] = (uint8_t)(e + 127); if (do_bias) atomicAdd(&sbias[c], sm); }
@@ -439,7 +452,7 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
         mma_zstep(oz0);
     }
     if (do_bias) {   /* the coop path's register partials (zero otherwise): one warp reduction per channel for the whole block */
-        if constexpr (FAST) { if (warp * (32 / BMo) + lane / BMo < 8 && bacc != 0.f) atomicAdd(&sbias[lane % BMo], bacc); }
+        if constexpr (FAST) { if (warp < 8 && bacc != 0.f) atomicAdd(&sbias[lane % BMo], bacc); }
         else
 #pragma unroll
         for (int c = 0; c < BMo; c++) {
