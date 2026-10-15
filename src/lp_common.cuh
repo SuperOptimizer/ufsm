@@ -742,8 +742,9 @@ __device__ __forceinline__ void fwd_epi_mx16(float (&acc)[MT][NR][2][4], float *
                 uint8_t *dst = qt + ri * RB + (CPL * B / 8) * qd;
                 if constexpr (B == 4) {
                     unsigned w = 0u;
-                    if (sp.osr) {   /* MX-fp4 gradient: exact SR, the uniforms of word (ri, CPL qd / 8) */
-                        uint32_t hh[4]; sr_hash4(sp.osr, (uint64_t)ri * 2 + (CPL * qd) / 8, hh);
+                    if (sp.osr) {   /* MX-fp4 gradient: exact SR, the uniforms of word (ri, CPL qd / 8); a split output's second tensor
+                                       draws past the first's N S rows (the same keys would correlate the two tensors' rounding) */
+                        uint32_t hh[4]; sr_hash4(sp.osr, ((uint64_t)ri + (sec ? (uint64_t)N * S : 0u)) * 2 + (CPL * qd) / 8, hh);
                         const int h0 = CPL == 4 ? 2 * (qd & 1) : 0;
 #pragma unroll
                         for (int k = 0; k < CPL; k++) w |= sr_e2m1_nib(v[k] * mult, (hh[h0 + (k >> 1)] >> (16 * (k & 1))) & 0xffffu) << (4 * k);
