@@ -7,6 +7,14 @@ __device__ __forceinline__ float dsilu(float u) {
     const float sg = fmaf(0.5f, th, 0.5f);
     return sg * (1.f + u * (1.f - sg));
 }
+/* the head's input gradient of one channel from the CI logit-gradient values of its voxel as conv1_to_mx_t_k computes it (its
+   a += w x compiles to this fused multiply-add chain from +0; test_grad_mx4 checks the recomputing GN backward against it bit for bit) */
+template <int CI> __device__ __forceinline__ float head_dot(const float *w, const float *x) {
+    float a = 0.f;
+#pragma unroll
+    for (int ci = 0; ci < CI; ci++) a = fmaf(w[ci], x[ci], a);
+    return a;
+}
 template <int B, typename TG, int V, int HPB>   /* V consecutive voxels per thread step (vector gy loads; 1: any S); HPB 16-channel halves per row */
 __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, const TG *gy, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                                            int N, int C, int G, size_t S, float *part) {
@@ -313,6 +321,168 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_k(const uint8_t *x,
     if (bw == 8) *(unsigned *)p = w[0]; else *(uint2 *)p = make_uint2(w[0], w[1]);
     if (!h) mx_sc<4>(gx, N, C, S)[ri] = (uint8_t)(e + 127);
 }
+/* dec[0]'s GroupNorm+SiLU backward with the head's input gradient recomputed instead of read (unet's three level-0 buffers, where it
+   is never stored): gy of a voxel row is the 1^3 conv of its CI fp16 logit-gradient values with the head weights (wh [CI][C]),
+   stored MX-fp4 with exact SR keyed by (hs, row) as the head's backward-data writes it (conv1_to_mx_t_k: head_dot, mx4_sr_row).
+   The stats and apply passes (the lane-per-row gn_silu_bwd_*_mx2_k<4, 1, FULL> for C 8 / 16, one channel block) see the bits that
+   backward-data would have stored, so gx and the GroupNorm sums equal the two-op path's. The apply writes gx in place over x
+   (plain loads: no read-only cache on x). */
+template <int CI> __device__ __forceinline__ void head_gy_row(const float *sw, const __half *gl, int n, size_t S, size_t v, int bw, size_t ri, unsigned hs,
+                                                              float *g, float &fg) {
+    float xi[CI], r[16];
+#pragma unroll
+    for (int ci = 0; ci < CI; ci++) xi[ci] = __half2float(gl[((size_t)n * CI + ci) * S + v]);
+#pragma unroll
+    for (int k = 0; k < 16; k++) r[k] = head_dot<CI>(sw + k * CI, xi);
+    unsigned w[2];
+    const int e = mx4_sr_row<16>(r, bw, ri, hs, w);
+#pragma unroll
+    for (int j = 0; j < 2; j++)
+#pragma unroll
+        for (int i = 0; i < 4; i++) { const float2 a = dec_e2m1x2(w[j] >> (8 * i)); g[8 * j + 2 * i] = a.x; g[8 * j + 2 * i + 1] = a.y; }   /* raw; fg below */
+    fg = mx_scale((unsigned)(uint8_t)(e + 127));
+}
+/* the head weights as conv1_to_mx_t_k stages them for channel block 0 (its w is the flipped [C][CI] copy: the same values) */
+template <int CI> __device__ __forceinline__ void head_sw(float *sw, const float *wh, int C, int bw) {
+    for (int t = threadIdx.x; t < 16 * CI; t += blockDim.x) { const int k = t / CI, ci = t % CI; sw[t] = k < bw && k < C ? wh[(size_t)ci * C + k] : 0.f; }
+}
+template <int CI, bool FULL>
+__global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_hg_k(const uint8_t *x, const __half *gl, const float *wh, unsigned hs, const float *gamma, const float *beta,
+                                                               const float *mean, const float *rstd, int N, int C, int G, size_t S, float *part) {
+    const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G;
+    const int blk = blockIdx.y, n = blockIdx.z, nsl = gridDim.x;
+    const int h0 = 0, tv = (int)threadIdx.x, nt = 256;
+    const size_t q0 = S * blockIdx.x / nsl, q1 = S * (blockIdx.x + 1) / nsl;
+    __shared__ float4 cf[32];
+    __shared__ float w1[8][32], w2[8][32], sw[16 * CI];
+    if (threadIdx.x < 32) {
+        const int k = threadIdx.x, c = blk * bw + k;
+        const bool ok = k < bw && c < C;
+        const int ng = n * G + (ok ? c / cpg : 0);
+        const float rs = ok ? rstd[ng] : 0.f, mu = ok ? mean[ng] : 0.f, A = ok ? rs * gamma[c] : 0.f, be = ok ? beta[c] : 0.f;
+        cf[k] = make_float4(0.5f * A, 0.5f * (be - mu * A), mu, rs);
+    }
+    head_sw<CI>(sw, wh, C, bw);
+    w1[threadIdx.x >> 5][threadIdx.x & 31] = 0.f; w2[threadIdx.x >> 5][threadIdx.x & 31] = 0.f;
+    __syncthreads();
+    const int kmax = FULL ? 16 : max(0, min(min(bw, C - blk * bw) - h0, 16));
+    const size_t rbase = ((size_t)n * nb + blk) * S;
+    const uint8_t *sx = mx_sc<4>(x, N, C, S);
+    const int rbx = mx_rb(bw, 4);
+    float s1[16], s2[16];
+#pragma unroll
+    for (int k = 0; k < 16; k++) { s1[k] = 0.f; s2[k] = 0.f; }
+    uint2 xw = make_uint2(0u, 0u); unsigned xs = 0u;
+    auto load = [&](size_t v) {
+        const size_t ri = rbase + v;
+        xw = bw == 8 ? make_uint2(__ldg((const unsigned *)(x + ri * rbx)), 0u) : __ldg((const uint2 *)(x + ri * rbx));
+        xs = __ldg(sx + ri);
+    };
+    size_t q = q0 + tv;
+    if (q < q1) load(q);
+    for (; q < q1; q += nt) {
+        const uint2 cx = xw; const float fx = mx_scale(xs);
+        const size_t v = q;
+        if (q + nt < q1) load(q + nt);   /* next row in flight during this one's arithmetic */
+        float r[16], g[16], fg;
+        {
+            const unsigned w4[2] = {cx.x, cx.y};
+#pragma unroll
+            for (int j = 0; j < 2; j++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * i)); r[8 * j + 2 * i] = a.x * fx; r[8 * j + 2 * i + 1] = a.y * fx; }
+        }
+        head_gy_row<CI>(sw, gl, n, S, v, bw, rbase + v, hs, g, fg);
+#pragma unroll
+        for (int k = 0; k < 16; k++) {
+            if (FULL || k < kmax) {
+                const float4 c4 = cf[h0 + k];
+                const float p = fmaf(r[k], c4.x, c4.y);
+                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                const float t = g[k] * ((1.f + th) * (fmaf(-p, th, p) + 1.f)) * fg;   /* gy 2 dsilu(u) */
+                s1[k] += t; s2[k] = fmaf(t, r[k] - c4.z, s2[k]);
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < 16; k++) {
+        float a = s1[k], b2 = s2[k];
+        for (int o = 16; o >= 1; o >>= 1) { a += __shfl_xor_sync(0xffffffff, a, o); b2 += __shfl_xor_sync(0xffffffff, b2, o); }
+        if ((int)(threadIdx.x & 31) < 1 && k < kmax) { w1[threadIdx.x >> 5][h0 + k] = a; w2[threadIdx.x >> 5][h0 + k] = b2; }
+    }
+    __syncthreads();
+    const int kb = min(bw, C - blk * bw);
+    if ((int)threadIdx.x < kb) {
+        float a = 0.f, b2 = 0.f;
+#pragma unroll
+        for (int w = 0; w < 8; w++) { a += w1[w][threadIdx.x]; b2 += w2[w][threadIdx.x]; }
+        const size_t c = (size_t)n * C + blk * bw + threadIdx.x, o = ((size_t)blockIdx.x * N * C + c) * 2;
+        part[o] = 0.5f * a; part[o + 1] = 0.5f * cf[threadIdx.x].w * b2;
+    }
+}
+template <int CI, bool FULL>
+__global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_hg_k(uint8_t *x, const __half *gl, const float *wh, unsigned hs, const float *gamma, const float *beta,
+                                                               const float *mean, const float *rstd, const float *AB, int N, int C, int G, size_t S, unsigned gsr) {
+    const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G, blk = blockIdx.y, n = blockIdx.z;
+    __shared__ float4 cf[32];
+    __shared__ float sw[16 * CI];
+    if (threadIdx.x < 32) {
+        const int k = threadIdx.x, c = blk * bw + k;
+        const bool ok = k < bw && c < C;
+        const int ng = n * G + (ok ? c / cpg : 0);
+        const float len = (float)cpg * (float)S;
+        const float rs = ok ? rstd[ng] : 0.f, mu = ok ? mean[ng] : 0.f, ga = ok ? gamma[c] : 0.f, be = ok ? beta[c] : 0.f;
+        const float ca = ok ? AB[2 * ng] / len : 0.f, cc = ok ? AB[2 * ng + 1] / len : 0.f, A = rs * ga;
+        cf[k] = make_float4(0.5f * A, 0.5f * (be - mu * A), -rs * rs * cc, rs * (mu * rs * cc - ca));
+    }
+    head_sw<CI>(sw, wh, C, bw);
+    __syncthreads();
+    const size_t v = (size_t)blockIdx.x * 256 + threadIdx.x;
+    if (v >= S) return;
+    const int h0 = 0, kmax = FULL ? 16 : max(0, min(min(bw, C - blk * bw) - h0, 16));
+    const size_t ri = ((size_t)n * nb + blk) * S + v;
+    const int rbx = mx_rb(bw, 4);
+    const uint2 xw = bw == 8 ? make_uint2(*(const unsigned *)(x + ri * rbx), 0u) : *(const uint2 *)(x + ri * rbx);
+    const float fx = mx_scale(mx_sc<4>(x, N, C, S)[ri]);
+    float r[16], g[16], out[16], fg;
+    {
+        const unsigned w4[2] = {xw.x, xw.y};
+#pragma unroll
+        for (int j = 0; j < 2; j++)
+#pragma unroll
+            for (int q = 0; q < 4; q++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * q)); r[8 * j + 2 * q] = a.x * fx; r[8 * j + 2 * q + 1] = a.y * fx; }
+    }
+    head_gy_row<CI>(sw, gl, n, S, v, bw, ri, hs, g, fg);
+    unsigned am = 0u;
+#pragma unroll
+    for (int k = 0; k < 16; k++) {
+        out[k] = 0.f;
+        if (FULL || k < kmax) {
+            const float4 c4 = cf[h0 + k];
+            const float p = fmaf(r[k], c4.x, c4.y);
+            float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+            const float d2 = (1.f + th) * (fmaf(-p, th, p) + 1.f);   /* 2 dsilu(2p) */
+            out[k] = fmaf(g[k] * d2 * c4.x, fg, fmaf(r[k], c4.z, c4.w));
+            am = amax_u(am, out[k]);
+        }
+    }
+    const int e = mx_exp(__uint_as_float(am), mxf<4>::inv_qmax);
+    const float m = exp2i(-e);
+    unsigned w[2];
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+        if (gsr) {
+            uint32_t hh[4]; sr_hash4(gsr, ri * 4 + j, hh);
+            unsigned wj = 0u;
+#pragma unroll
+            for (int i = 0; i < 8; i++) wj |= sr_e2m1_nib_fast(out[8 * j + i] * m, (hh[i >> 1] >> (16 * (i & 1))) & 0xffffu) << (4 * i);
+            w[j] = wj;
+        } else w[j] = mxf<4>::enc8x(out + 8 * j, m);
+    }
+    uint8_t *p = x + ri * rbx;
+    if (bw == 8) *(unsigned *)p = w[0]; else *(uint2 *)p = make_uint2(w[0], w[1]);
+    mx_sc<4>(x, N, C, S)[ri] = (uint8_t)(e + 127);
+}
 /* GN+SiLU backward apply for MX-fp4 gy / gx (32-channel blocks) that also writes the fp4 weight gradient's gy records of the whole
    layer (the gy_pre4_k pass over the stored gx folded in: it re-read gx, ~10 ms per level-0 layer). The block takes gy_pre4_k's tile
    (z-step x 8 rows x 16 x: warp = block pb = 4 (z & 1) + (yp & 3), lane = 16 (y & 1) + x): each lane computes its voxel's 32 gx
@@ -527,6 +697,46 @@ extern "C" void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G,
 #undef GBA
     LPCK();
 }
+
+/* dec[0]'s GN+SiLU backward from the recomputed head input gradient (gn_silu_bwd_*_hg_k): the stats into ds (as lp_gn_silu_bwd_mx) and
+   the apply in place over x (as lp_gn_silu_bwd_apply_mx; no gy records below 32 channels: invalidated as lp_gn_silu_bwd_apply_rec
+   does). C 8 or 16 MX-fp4, 1..4 fp16 logit channels, the lane-pair kernels on (UFSM_GN_APPLY2) */
+extern "C" int lp_gn_silu_bwd_head_ok(int C, int ci) {
+    static int a2 = -1; if (a2 < 0) a2 = getenv("UFSM_GN_APPLY2") ? atoi(getenv("UFSM_GN_APPLY2")) : 1;
+    return a2 && (C == 8 || C == 16) && ci >= 1 && ci <= 4;
+}
+#define HGK(K, F, ...) do { switch (ci) { case 1: K<1, F><<<__VA_ARGS__; break; case 2: K<2, F><<<__VA_ARGS__; break; \
+                                          case 3: K<3, F><<<__VA_ARGS__; break; default: K<4, F><<<__VA_ARGS__; } } while (0)
+extern "C" void lp_gn_silu_bwd_head_stats(const void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
+                                          const void *gl, int ci, const float *wh, unsigned hs, double *ds) {
+    size_t S = shape_spatial(s);
+    const int NC = s.n * s.c, nb = mx_nb(s.c), bw = mx_bw(s.c);
+    const size_t ny = (size_t)nb * s.n;   /* the slabs of lp_gn_silu_bwd_mx (the same partial sums) */
+    size_t slabs = S / 4096, want = (160 + ny - 1) / ny, maxs = S / 512 > 0 ? S / 512 : 1;
+    if (slabs < want) slabs = want;
+    if (slabs > maxs) slabs = maxs;
+    if (slabs > 1024) slabs = 1024;
+    const dim3 grid((unsigned)slabs, (unsigned)nb, (unsigned)s.n);
+    float *part = lp_buf<float>(5, slabs * 2 * NC);
+    cudaMemsetAsync(ds, 0, (size_t)2 * NC * sizeof(double));
+    const uint8_t *xq = (const uint8_t *)x; const __half *g = (const __half *)gl;
+    if (bw >= 16 && s.c % bw == 0) HGK(gn_silu_bwd_stats_mx2_hg_k, true, grid, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, s.n, s.c, G, S, part));
+    else HGK(gn_silu_bwd_stats_mx2_hg_k, false, grid, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, s.n, s.c, G, S, part));
+    gn_part_sum_k<<<nblk_((size_t)2 * NC * 32, 256), 256>>>(part, (int)slabs, NC, ds);
+    LPCK();
+}
+extern "C" void lp_gn_silu_bwd_head_apply(void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
+                                          const void *gl, int ci, const float *wh, unsigned hs, const float *AB, unsigned gsr) {
+    g_gyrec.valid = 0;
+    size_t S = shape_spatial(s);
+    const int bw = mx_bw(s.c);
+    const dim3 g2((unsigned)((S + 255) / 256), (unsigned)mx_nb(s.c), (unsigned)s.n);
+    uint8_t *xq = (uint8_t *)x; const __half *g = (const __half *)gl;
+    if (bw >= 16 && s.c % bw == 0) HGK(gn_silu_bwd_apply_mx2_hg_k, true, g2, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s.n, s.c, G, S, gsr));
+    else HGK(gn_silu_bwd_apply_mx2_hg_k, false, g2, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s.n, s.c, G, S, gsr));
+    LPCK();
+}
+#undef HGK
 
 /* 1^3 conv with a plane-major input (dtype gdt) and an MX output (head backward-data: logit gradient -> gout) */
 template <typename TG>

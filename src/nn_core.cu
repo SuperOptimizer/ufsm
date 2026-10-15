@@ -51,6 +51,13 @@ unsigned sr_seed(void) {
 }
 extern "C" void nn_set_sr(int on) { g_sr = on; }
 extern "C" void nn_set_sr_step(unsigned step) { g_sr_step = step; g_sr_ctr = 0; lp_wmemo_step(step); }
+/* the seed sequence of a step, for callers that reorder the ops drawing from it (unet's three level-0 buffers): the draw counter,
+   set back to replay a draw, one draw, and whether the SR of the fp8 / fp4 operands is on */
+extern "C" unsigned nn_sr_ctr(void) { return g_sr_ctr; }
+extern "C" void nn_sr_set_ctr(unsigned c) { g_sr_ctr = c; }
+extern "C" unsigned nn_sr_seed(void) { return sr_seed(); }
+extern "C" int nn_sr_on(void) { return sr_on(); }
+extern "C" void nn_exec_prec_note(int pass, int p) { exec_prec(pass, p); }   /* an op run outside nn (the executed-precision table) */
 extern "C" void nn_wmemo_clear(void) { lp_wmemo_clear(); }
 int g_block = 0;   /* nn_set_block: several convs under one layer id (residual blocks) memoise their weights apart */
 extern "C" void nn_set_block(int blk) { g_block = blk < 0 ? 0 : blk > 15 ? 15 : blk; }
