@@ -1272,6 +1272,10 @@ int cmd_train(int argc, char **argv) {
             const shape5 xs = g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P};   /* split: this GPU's slab of the window */
             const size_t p3 = p3l;
             int pick = -1; size_t need = 0;
+            {   /* the batch tail [targets | mask] the three-level-0-buffer layout holds at X3's end (its dry builds size X3 for it) */
+                const size_t a256 = 255;
+                unet_set_batch_bytes(G[0].u, 0, (((size_t)B * g_tc * p3 + a256) & ~a256) + (((size_t)B * p3 + a256) & ~a256));
+            }
             const int pick0 = getenv("UFSM_MEM_PICK") ? atoi(getenv("UFSM_MEM_PICK")) : 0;   /* A/B of the modes: start the search at this candidate */
             _Static_assert(sizeof ord_small / sizeof ord_small[0] == sizeof cand / sizeof cand[0], "every mode in the search order");
             for (int oi = 0; oi < nc && pick < 0; oi++) {
@@ -1290,7 +1294,8 @@ int cmd_train(int argc, char **argv) {
                 const size_t xinb = (size_t)B * xsc * p3 * xbytes(), batb = (size_t)B * g_tc * p3 + (size_t)B * p3;
                 const shape5 g0s = {B, cfg.widths[0], (int)(p3 / ((size_t)P * P)), P, P};
                 const size_t g0b = cand[c].gmx ? nn_mx_bytes(g0s, unet_grad_mx4() ? 4 : 8) : (size_t)B * cfg.widths[0] * p3 * 2;
-                const int xin_sep = cand[c].lean >= 2 && cand[c].gmx && !(unet_input_converted() && g_xfmt && xinb + batb + 8192 <= g0b);
+                const int l3 = unet_last_dry_l3b();   /* three level-0 buffers: the tail inside X3 (counted), the input in X2 when it fits */
+                const int xin_sep = cand[c].lean >= 2 && cand[c].gmx && (l3 ? xinb > g0b : !(unet_input_converted() && g_xfmt && xinb + batb + 8192 <= g0b));
                 if (cand[c].lean) trainer = (cand[c].gmx ? (xin_sep ? xinb : 0) : xinb) + radb   /* batch buffers inside the gradient buffer B / gout[0] (estimate) */
                                             + (g_cout > NCH && !g_gl_inplace ? (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) : 0)
                                             + (g_head_slab ? (size_t)B * (NCH + 1) * p3 : 0);   /* head slabs: targets and mask outside the gradient buffers */   /* > 2 outputs (affinities, verso): the logit gradient may not fit beside the logits */
@@ -1323,13 +1328,19 @@ int cmd_train(int argc, char **argv) {
         const size_t a256 = 255, glb = ((size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) + a256) & ~a256, tbb = ((size_t)B * g_tc * p3 + a256) & ~a256,
                      mbb = ((size_t)B * p3 + a256) & ~a256, xbb = ((size_t)B * g_xs * p3 * xbytes() + a256) & ~a256;
         const int xin_b = lean && unet_input_converted() && g_xfmt;
+        char *tail = nullptr;   /* three level-0 buffers: [targets | mask] apart from the input */
         size_t goff = 0;
         int xin_in = 0;
         d->gl = nullptr; d->gl_inside = 0; d->gl_inplace = g_gl_inplace;
         if (lean) {
+            unet_set_batch_bytes(d->u, xin_b ? xbb : 0, tbb + mbb);
             unet_build(d->u, (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P}, 1);
             goff = unet_lean_nob(d->u) ? 0 : glb;
-            if (unet_lean_nob(d->u)) {   /* lean 2: [input | targets | mask] (the input may lie over the logits, see unet_batch_scratch) */
+            void *l3t = nullptr;
+            if (unet_l0_3buf(d->u) && (bs = unet_batch_scratch2(d->u, xin_b ? xbb : 0, tbb + mbb, &l3t))) {   /* three level-0 buffers: the input in X2,
+                                                                                                         [targets | mask] at X3's end */
+                xin_in = xin_b; tail = (char *)l3t;
+            } else if (unet_lean_nob(d->u)) {   /* lean 2: [input | targets | mask] (the input may lie over the logits, see unet_batch_scratch) */
                 if (xin_b && (bs = unet_batch_scratch(d->u, xbb, tbb + mbb))) xin_in = 1;
                 else bs = unet_batch_scratch(d->u, 0, tbb + mbb);
             } else if (xin_b && (bs = unet_grad_scratch(d->u, goff + tbb + mbb + xbb))) xin_in = 1;
@@ -1341,13 +1352,15 @@ int cmd_train(int argc, char **argv) {
             d->gl = d->gl_inplace ? nullptr : unet_logit_grad_scratch(d->u, glb);
             if (d->gl && bs && (char *)d->gl < bs + goff + tbb + mbb + (xin_in ? xbb : 0) && (char *)d->gl + glb > bs) d->gl = nullptr;   /* never over the batch */
             d->bat_lo = bs; d->bat_hi = bs ? bs + goff + tbb + mbb + (xin_in ? xbb : 0) : nullptr;
+            if (tail) d->bat_lo = d->bat_hi = nullptr;   /* (three level-0 buffers: no logit gradient scratch to keep off it) */
             d->gl_inside = d->gl != nullptr;
         }
         for (int i = 0; i < 2; i++) {
             if (i && lean) { d->xb[1] = d->xb[0]; d->tb[1] = d->tb[0]; d->mb[1] = d->mb[0]; d->wb[1] = d->wb[0]; d->radb[1] = d->radb[0]; }
             else if (bs) {
                 const size_t toff = goff + (unet_lean_nob(d->u) && xin_in ? xbb : 0), xoff = unet_lean_nob(d->u) ? 0 : goff + tbb + mbb;
-                d->tb[i] = (uint8_t *)(bs + toff); d->mb[i] = (uint8_t *)(bs + toff + tbb);
+                char *tp = tail ? tail : bs + toff;
+                d->tb[i] = (uint8_t *)tp; d->mb[i] = (uint8_t *)(tp + tbb);
                 d->xb[i] = xin_in ? (void *)(bs + xoff) : nn_malloc((size_t)B * g_xs * p3 * xbytes());
                 d->wb[i] = nn_malloc((size_t)B * g_tc);
                 d->radb[i] = g_gpu_in ? nn_malloc(rad_bytes(B)) : nullptr;
@@ -1361,7 +1374,8 @@ int cmd_train(int argc, char **argv) {
             d->tb[0] = d->tb[1] = nn_malloc(tbb); d->mb[0] = d->mb[1] = nn_malloc(mbb);
             if (!lean) { d->tb[1] = nn_malloc(tbb); d->mb[1] = nn_malloc(mbb); }
         }
-        if (lean && g == 0) fprintf(stderr, "lean %d: batch buffers %s, logit gradient %s\n", lean, !bs ? "separate" : xin_in ? "and input inside the gradient buffers" : "inside the gradient buffers, input separate", d->gl ? "inside" : "separate");
+        if (lean && g == 0) fprintf(stderr, "lean %d: batch buffers %s, logit gradient %s\n", lean, !bs ? "separate" : tail ? (xin_in ? "in the three level-0 buffers (input in X2, targets / mask at X3's end)" : "at X3's end (three level-0 buffers), input separate")
+                                       : xin_in ? "and input inside the gradient buffers" : "inside the gradient buffers, input separate", tail && d->gl_inplace ? "over the logits" : d->gl ? "inside" : "separate");
         for (int i = 0; i < 2; i++) { d->ev_done[i] = nn_event_create(); nn_event_record(d->ev_done[i], 0); }
         d->pending = nullptr; select_buf(d, 0);
         if (!d->gl && !d->gl_inplace) d->gl = nn_malloc((size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));

@@ -139,6 +139,15 @@ void unet_set_recompute(int on);
 void unet_set_lean(int on);
 void *unet_grad_scratch(unet *u, size_t bytes);
 void *unet_batch_scratch(unet *u, size_t head, size_t tail);   /* lean 2: the batch as [head (input) | tail (targets, masks)] */
+/* three level-0 buffers (env UFSM_L0_3BUF=1 / unet_set_l0_3buf, -1 the env; training builds of the MX-fp4 production chain with an 8- or
+   16-channel level 0): the batch's head in level-0 buffer X2, its tail at the end of X3 (*tailp), nullptr if not this layout / too large;
+   unet_set_batch_bytes before the build sizes X3 for the tail; the logit gradient goes over the fp16 logits (unet_logit_grad_scratch
+   gives none). unet_l0_3buf: this build uses them; unet_last_dry_l3b: the last unet_train_bytes did */
+void unet_set_l0_3buf(int on);
+void *unet_batch_scratch2(unet *u, size_t head, size_t tail, void **tailp);
+void unet_set_batch_bytes(unet *u, size_t head, size_t tail);
+int unet_l0_3buf(const unet *u);
+int unet_last_dry_l3b(void);
 void *unet_logit_grad_scratch(unet *u, size_t bytes);   /* lean: home of the 16-bit logit gradient (A after the logits under lean 2, else B) */
 int unet_lean_nob(const unet *u);   /* lean 2 build: no gradient buffer B (gout[0] is the batch scratch) */
 void unet_build(unet *u, shape5 xs, int train);   /* build the buffers for xs now (the first forward would) */
