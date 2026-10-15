@@ -27,7 +27,7 @@ extern template void fwd_f4_t<mx8_t, bf16>(const void *x, shape5 xs, const float
 
 extern "C" int lp_conv_fwd_f4(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp) {
     /* <= 8 input channels: the fp8 tap-packed kernel (the network input enc0.c1; 8-channel activations). An MX-fp4 gradient's
-       backward-data (fp4 gy, output SR, no staging SR) takes the 32-padded fp4 path instead: small_f8 re-encodes gy with one e4m3
+       backward-data (fp4 gy, output SR, no staging SR) takes the packed fp4 kernel instead (rows copied): small_f8 re-encodes gy with one e4m3
        scale per tile, flushing values more than ~2^14 below the tile's largest (UFSM_G4_NARROW_F8=1: keep small_f8, A/B) */
     static int nf8 = -1; if (nf8 < 0) nf8 = getenv("UFSM_G4_NARROW_F8") ? atoi(getenv("UFSM_G4_NARROW_F8")) : 0;
     if (xs.c <= 8 && !(xbf == 4 && ybf == 4 && sp.osr && !sp.sr && !nf8)) return lp_conv_fwd_f8(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp);
@@ -79,19 +79,18 @@ __global__ void prep_w4_2d_k(const float *__restrict__ w, uint8_t *__restrict__ 
     ws[((size_t)t * Cop + cop) * nch + ch] = (uint8_t)(e + 127);
 }
 __global__ void prep_w4p_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Ox, int OxP, int Cs, int cofs) {   /* Cs: w channel stride (-1: Ci), cofs: first channel */
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;   /* (r, co, block) */
-    if (i >= (size_t)9 * Cop * 2) return;
-    const int blk = (int)(i & 1), cop = (int)((i >> 1) % Cop), r = (int)((i >> 1) / Cop);
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;   /* (r, co, kx): one 16-K group, its own scale */
+    if (i >= (size_t)9 * Cop * 4) return;
+    const int kx = (int)(i & 3), cop = (int)((i >> 2) % Cop), r = (int)((i >> 2) / Cop);
     const int co = Ox < 0 ? cop : seg_ci(cop, Co, Ox, OxP);
-    float v[32], amax = 0.f;
+    float v[16], amax = 0.f;
 #pragma unroll
-    for (int k = 0; k < 32; k++) {
-        const int kx = 2 * blk + (k >> 4), ci = k & 15;
-        v[k] = (kx < 3 && co >= 0 && co < Co && ci < Ci) ? w[((size_t)co * (Cs < 0 ? Ci : Cs) + cofs + ci) * 27 + r * 3 + kx] : 0.f;
-        amax = fmaxf(amax, fabsf(v[k]));
+    for (int ci = 0; ci < 16; ci++) {
+        v[ci] = (kx < 3 && co >= 0 && co < Co && ci < Ci) ? w[((size_t)co * (Cs < 0 ? Ci : Cs) + cofs + ci) * 27 + r * 3 + kx] : 0.f;
+        amax = fmaxf(amax, fabsf(v[ci]));
     }
-    const int e = mx_exp(amax, 1.f / 6.f);
+    const int e = kx < 3 ? mx_exp(amax, 1.f / 6.f) : 0;   /* kx 3: zero weights, scale 1 */
     const float m = exp2i(-e);
-    *(uint4 *)(wq + ((size_t)r * Cop + cop) * 32 + blk * 16) = make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m));
+    *(uint2 *)(wq + ((size_t)r * Cop + cop) * 32 + kx * 8) = make_uint2(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m));
     ws[i] = (uint8_t)(e + 127);
 }

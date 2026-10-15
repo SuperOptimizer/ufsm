@@ -579,6 +579,13 @@ __device__ __forceinline__ void mma_f4(float *c, const unsigned *a, const unsign
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, 0}, %11, {0, 0};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sa), "r"(sb));
 }
+/* m16n8k64 e2m1 x e2m1 with one ue8m0 scale per 16 K (kind::mxf4nvf4 scale_vec::4X; bytes 0..3 = K 0..15, 16..31, 32..47, 48..63):
+   the MX layout of a <= 16-channel tensor (one scale per position), so 16-channel rows need no padding or shared scales */
+__device__ __forceinline__ void mma_f4x4(float *c, const unsigned *a, const unsigned *b, unsigned sa, unsigned sb) {
+    asm volatile("mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue8m0 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, 0}, %11, {0, 0};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sa), "r"(sb));
+}
 
 /* ======================= weights: wq[tap][Cop][Cip] e4m3, ws[tap][Cop][Cip/32] ue8m0 ======================= */
 __global__ void prep_w8_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx = -1, int CxP = 0, int Ox = -1, int OxP = 0);   /* defined in lp_f8fwd.cu */
@@ -679,10 +686,126 @@ __device__ __forceinline__ void fwd_epi_mxt(float (&acc)[MT][NR][2][4], float *t
 #pragma unroll
         for (int jb = 0; jb < MT / 2; jb++) { atomicAdd(&cs[32 * jb + lane], ps[jb]); atomicAdd(&cs[BM + 32 * jb + lane], pss[jb]); }
 }
+/* MX output of fwd_epilogue when every 16-row tile is one whole stored 16-channel block (the <= 16-channel tensors of a 16-wide
+   level 0): per warp row (HV 16) or half row (HV 8) of 16 output voxels and tile, the [HV voxel][16 ch] accumulators pass through
+   an [HV][20] fp32 buffer (per warp, after 512 bytes of statistics), so lane (voxel lane % HV, quarter lane / HV) holds CPL = HV / 2
+   channels of one voxel: the voxel amax is one or two shuffles away, the voxels go out as contiguous 2 .. 8-byte stores, an fp4
+   SR draw is one hash per 8 values keyed by (voxel row, half) as fwd_epi_mxt (the per-lane paths hash every element; HV 8 and 16
+   draw the same values), and the GN statistics are lane-per-channel sums over the buffer (decoded stored values under
+   stored_stats). Nearest-rounded bytes as the per-lane paths; statistics summed in another order. FEPI16_SCR(HV): its scratch. */
+#define FEPI16_SCR(HV) (512u + 8u * (HV) * 20u * 4u)
+template <int HV, int MT, int NR, typename T>
+__device__ __forceinline__ void fwd_epi_mx16(float (&acc)[MT][NR][2][4], float *tb, float *cs, T *y, const float *b, int n, int co0, int Co, int D, int H, int W,
+                                             int oz0, int oy0, int ox0, int wz, int wr, bool stats, const split_t &sp, int N, int zs0, int zs1) {
+    constexpr int B = MX_BITS(T), RB = 16 * B / 8, LPV = 32 / HV, CPL = 16 / LPV, NW = CPL * B / 32, RZ = NR / 2, BM = MT * 16;
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, vx = lane % HV, qd = lane / HV;
+    const size_t S = (size_t)D * H * W;
+    const bool sst = stats && sp.stored_stats;
+    const int OxP = sp.y2 ? (sp.o_pad ? sp.o_pad : (sp.o_split + 31) / 32 * 32) : Co;
+    const int sv = lane & 15, sh = lane >> 4;   /* statistics: lane = channel sv, voxels sh HV / 2 .. */
+    tb += (threadIdx.x >> 5) * HV * 20;
+    float ps[MT], pss[MT];
+#pragma unroll
+    for (int j = 0; j < MT; j++) { ps[j] = 0.f; pss[j] = 0.f; }
+#pragma unroll
+    for (int j = 0; j < MT; j++) {
+        const int cp = co0 + 16 * j, sec = sp.y2 && cp >= OxP, Ct = !sp.y2 ? Co : sec ? Co - sp.o_split : sp.o_split, cl = sec ? cp - OxP : cp;
+        if (cl >= Ct) continue;   /* pure padding (block-uniform) */
+        float bias[2];
+#pragma unroll
+        for (int h = 0; h < 2; h++) { const int co = cp + g + 8 * h; bias[h] = b && !sp.y2 && co < Co ? b[co] : 0.f; }
+        uint8_t *qt = sec ? (uint8_t *)sp.y2 : (uint8_t *)y, *st = qt + (size_t)N * S * RB;   /* the tensor's one block, its scales */
+#pragma unroll
+        for (int r = 0; r < NR; r++) {
+            const int oz = oz0 + wz * RZ + (r >> 1), oy = oy0 + wr + (r & 1);
+            if (oz >= D || oy >= H) continue;   /* warp-uniform */
+#pragma unroll
+            for (int ps2 = 0; ps2 < 16 / HV; ps2++) {   /* HV 8: voxels 8 ps2 .. 8 ps2 + 7 of the row */
+#pragma unroll
+                for (int q2 = 0; q2 < 2; q2++) {
+                    if (HV == 8 && q2 != ps2) continue;
+#pragma unroll
+                    for (int k = 0; k < 4; k++) tb[((HV == 16 ? 8 * q2 : 0) + 2 * t + (k & 1)) * 20 + g + 8 * (k >> 1)] = acc[j][r][q2][k] + bias[k >> 1];
+                }
+                __syncwarp();
+                float v[CPL], am = 0.f;
+#pragma unroll
+                for (int k = 0; k < CPL / 4; k++) { const float4 f = *(const float4 *)(tb + vx * 20 + CPL * qd + 4 * k); v[4 * k] = f.x; v[4 * k + 1] = f.y; v[4 * k + 2] = f.z; v[4 * k + 3] = f.w; }
+#pragma unroll
+                for (int k = 0; k < CPL; k++) am = fmaxf(am, fabsf(v[k]));
+#pragma unroll
+                for (int o = HV; o < 32; o <<= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+                const int e = mx_exp(am, mxf<B>::inv_qmax);
+                const float mult = exp2i(-e), sc = exp2i(e);
+                const size_t ri = (size_t)n * S + ((size_t)oz * H + oy) * W + ox0 + 8 * ps2 + vx;
+                unsigned wq[NW > 0 ? NW : 1];
+                uint8_t *dst = qt + ri * RB + (CPL * B / 8) * qd;
+                if constexpr (B == 4) {
+                    unsigned w = 0u;
+                    if (sp.osr) {   /* MX-fp4 gradient: exact SR, the uniforms of word (ri, CPL qd / 8) */
+                        uint32_t hh[4]; sr_hash4(sp.osr, (uint64_t)ri * 2 + (CPL * qd) / 8, hh);
+                        const int h0 = CPL == 4 ? 2 * (qd & 1) : 0;
+#pragma unroll
+                        for (int k = 0; k < CPL; k++) w |= sr_e2m1_nib(v[k] * mult, (hh[h0 + (k >> 1)] >> (16 * (k & 1))) & 0xffffu) << (4 * k);
+                    } else {
+#pragma unroll
+                        for (int k = 0; k < CPL; k += 2) w |= (unsigned)cvt_e2m1x2(v[k] * mult, v[k + 1] * mult) << (4 * k);
+                    }
+                    wq[0] = w;
+                    if constexpr (CPL == 8) *(unsigned *)dst = w; else *(unsigned short *)dst = (unsigned short)w;
+                } else {
+#pragma unroll
+                    for (int k = 0; k < NW; k++) wq[k] = mxf<8>::enc8x(v + 4 * k, mult);
+                    if constexpr (NW == 2) *(uint2 *)dst = make_uint2(wq[0], wq[1]); else *(unsigned *)dst = wq[0];
+                }
+                if (!qd) st[ri] = (uint8_t)(e + 127);
+                if (stats && oz >= zs0 && oz < zs1) {
+                    if (sst) {   /* the decoded stored values */
+                        if constexpr (B == 4) {
+#pragma unroll
+                            for (int c = 0; c < CPL / 2; c++) { const float2 d = dec_e2m1x2((wq[0] >> (8 * c)) & 255u); v[2 * c] = d.x * sc; v[2 * c + 1] = d.y * sc; }
+                        } else {
+#pragma unroll
+                            for (int k = 0; k < NW; k++) {
+                                const float2 d0 = dec_e4m3x2((unsigned short)(wq[k] & 0xffffu)), d1 = dec_e4m3x2((unsigned short)(wq[k] >> 16));
+                                v[4 * k] = d0.x * sc; v[4 * k + 1] = d0.y * sc; v[4 * k + 2] = d1.x * sc; v[4 * k + 3] = d1.y * sc;
+                            }
+                        }
+#pragma unroll
+                        for (int k = 0; k < CPL / 4; k++) *(float4 *)(tb + vx * 20 + CPL * qd + 4 * k) = make_float4(v[4 * k], v[4 * k + 1], v[4 * k + 2], v[4 * k + 3]);
+                    }
+                    __syncwarp();
+#pragma unroll
+                    for (int k = 0; k < HV / 2; k++) {   /* (HV 16: the upper half rotated by 4 rows, off the lower half's banks) */
+                        const float x = tb[(HV / 2 * sh + ((k + (HV == 16 ? 4 : 0) * sh) & (HV / 2 - 1))) * 20 + sv];
+                        ps[j] += x; pss[j] += x * x;
+                    }
+                }
+                __syncwarp();   /* the buffer is reused by the next (half) row */
+            }
+        }
+    }
+    if (stats)
+#pragma unroll
+        for (int j = 0; j < MT; j++) {
+            ps[j] += __shfl_xor_sync(0xffffffffu, ps[j], 16); pss[j] += __shfl_xor_sync(0xffffffffu, pss[j], 16);
+            if (!sh) { atomicAdd(&cs[16 * j + sv], ps[j]); atomicAdd(&cs[BM + 16 * j + sv], pss[j]); }
+        }
+}
+/* a launcher's epilogue scratch with fwd_epi_mx16 room when an output tensor of cout (split at sp.o_split) is stored in 16-channel
+   blocks: whole rows (FEPI16_SCR(16)) while the block (fixed + scratch bytes) still fits twice per SM, else half rows */
+static inline size_t fepi16_scr(size_t fixed, size_t scr, int cout, const split_t &sp) {
+    if (!(sp.y2 ? mx_bw(sp.o_split) == 16 || mx_bw(cout - sp.o_split) == 16 : mx_bw(cout) == 16)) return scr;
+    static int smsm[8]; const int d = cur_dev_();
+    if (!smsm[d]) cudaDeviceGetAttribute(&smsm[d], cudaDevAttrMaxSharedMemoryPerMultiprocessor, d);
+    const size_t s16 = scr > FEPI16_SCR(16) ? scr : FEPI16_SCR(16), s8 = scr > FEPI16_SCR(8) ? scr : FEPI16_SCR(8);
+    return 2 * (fixed + s16 + 1024) <= (size_t)smsm[d] ? s16 : s8;
+}
 /* Forward epilogue straight from the accumulators: bias, optional accumulate into y (sp.accum), channel-split
    output (sp.y2), optional GroupNorm statistics of the output (osum, per (n, group) sums reduced in smem). Warp row r
    of NR maps to z = oz0 + wz * NR/2 + r/2, y = oy0 + wr + r%2. */
-template <int MT, int NR, typename T, bool FST = false>   /* FST: try the shared-memory MX store path (checks its own requirements) */
+template <int MT, int NR, typename T, bool FST = false, bool E16 = (MT == 1)>   /* FST: try the shared-memory MX store paths (they check their own requirements);
+                                                                                E16: compile fwd_epi_mx16 (one-tile kernels; MT 2: register pressure) */
 __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigned char *smem_raw, T *y, const float *b, int n, int co0, int Co,
                                              int D, int H, int W, int oz0, int oy0, int ox0, int wz, int wr, double *osum, int Go, const split_t &sp, int N = 0,
                                              unsigned scr_off = 0) {   /* smem_raw: the scratch, scr_off bytes into the dynamic smem */
@@ -706,6 +829,23 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
             float *tb = (float *)(smem_raw + 512);
             if (dsm >= scr_off + FEPI_SCR(16)) fwd_epi_mxt<16>(acc, tb, cs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
             else fwd_epi_mxt<8>(acc, tb, cs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
+            mx_done = st_done = true;
+        }
+    }
+    if constexpr (IS_MX(T) && FST && E16) if (!mx_done) {   /* every 16-row tile a whole 16-channel block (or pure padding): fwd_epi_mx16 */
+        unsigned dsm; asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dsm));
+        const int OxP = sp.y2 ? (sp.o_pad ? sp.o_pad : (sp.o_split + 31) / 32 * 32) : Co;
+        bool fit = (W & 15) == 0 && blockDim.x == 256 && dsm >= scr_off + FEPI16_SCR(8) && !(osum && !sp.stored_stats && sp.y2 && b);
+#pragma unroll
+        for (int j = 0; j < MT; j++) {
+            const int cp = co0 + 16 * j, sec = sp.y2 && cp >= OxP, Ct = !sp.y2 ? Co : sec ? Co - sp.o_split : sp.o_split, cl = sec ? cp - OxP : cp;
+            if (cl < Ct && (cl != 0 || mx_bw(Ct) != 16)) fit = false;
+        }
+        if (fit) {
+            __syncthreads();   /* every warp is past its MMA loop: the scratch is free */
+            float *tb = (float *)(smem_raw + 512);
+            if (dsm >= scr_off + FEPI16_SCR(16)) fwd_epi_mx16<16>(acc, tb, cs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
+            else fwd_epi_mx16<8>(acc, tb, cs, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum != nullptr, sp, N, zs0, zs1);
             mx_done = st_done = true;
         }
     }
