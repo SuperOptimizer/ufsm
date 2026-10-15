@@ -566,6 +566,11 @@ template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const
     const bool g4_exact = IS_MX4(T) && sp.osr && !sp.sr && !g4p16;
     if (IS_MX4(T) && sp.osr && !sp.sr && g4p16 == 1) sp.sr = sp.osr * 0x9e3779b9u + 0x7f4a7c15u;   /* (staging keys derived from the output seed;
                                                                                                      UFSM_G4_P16=2: the old nearest re-rounding, a test of the test) */
+    /* a split MX-fp4 gradient output of two <= 16-channel tensors (dec0.c1's backward-data of a 16-wide level 0: up part | skip):
+       the second tensor at row 16, not 32 -- Cop 32 instead of 64 (tile MT 2 / TZ 4 with resident weights, not MT 4 / TZ 2 with half
+       the rows padding); the output SR keys keep the 32-padded row numbers, so the bits are unchanged. UFSM_F4_OPAD16=0: off */
+    static int opad_env = -1; if (opad_env < 0) opad_env = getenv("UFSM_F4_OPAD16") ? atoi(getenv("UFSM_F4_OPAD16")) : 1;
+    if (opad_env && g4_exact && IS_MX(TO) && sp.y2 && Ox <= 16 && cout - Ox <= 16) { OxP = 16; Cop = 32; sp.o_pad = 16; }
     if (xs.c <= 16 && !sp.x2 && !sp.up && sp.gp2.G == 0 && !g4_exact) { p16_f4<T, TO>(x, xs, w, b, cout, y, Cop, Ox, OxP, gp, osum, Go, sp); return; }   /* K = [kx0 | kx1 | kx2 | 0] */
     const int nch = Cip / 32;
     const size_t nq = (size_t)28 * Cop * Cip / 2, ns = (size_t)28 * Cop * nch;

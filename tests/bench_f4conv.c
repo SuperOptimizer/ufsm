@@ -58,7 +58,8 @@ int main(int argc, char **argv) {
         {"fwd 32 -> 32 (gn+silu, stats)", 4, 32, 32, 0, 1, 1, 0, 1}, {"bdata 32 -> 32 (mx8, SR)", 3, 32, 32, 0, 0, 0, 1, 1}, {"bdata 32 -> 64 + 32 (mx8, SR)", 3, 32, 96, 64, 0, 0, 1, 1},
         {"fwd 64 -> 64 (gn+silu, stats) @P/2", 4, 64, 64, 0, 1, 1, 0, 2}, {"bdata 64 -> 64 (mx8, SR) @P/2", 3, 64, 64, 0, 0, 0, 1, 2},
         {"bdata 64 -> 96 + 64 (mx8, SR) @P/2", 3, 64, 160, 96, 0, 0, 1, 2},
-        {"bdata 32 -> 32 (mx4, SR)", 4, 32, 32, 0, 0, 0, 1, 1}, {"bdata 32 -> 64 + 32 (mx4, SR)", 4, 32, 96, 64, 0, 0, 1, 1}};   /* the trainer's MX-fp4 gradients (10, 11) */
+        {"bdata 32 -> 32 (mx4, SR)", 4, 32, 32, 0, 0, 0, 1, 1}, {"bdata 32 -> 64 + 32 (mx4, SR)", 4, 32, 96, 64, 0, 0, 1, 1},   /* the trainer's MX-fp4 gradients (10, 11) */
+        {"bdata 16 -> 16 (mx4, SR)", 4, 16, 16, 0, 0, 0, 1, 1}, {"bdata 16 -> 16 + 16 (mx4, SR)", 4, 16, 32, 16, 0, 0, 1, 1}};   /* 16-wide level 0 (12, 13) */
     for (int l = 0; l < (int)(sizeof L / sizeof L[0]) && want("fwd"); l++) {
         if (getenv("BENCH_FL") && l != atoi(getenv("BENCH_FL"))) continue;   /* one forward / bdata case */
         const int Pl = P / L[l].dv; const size_t Sl = (size_t)Pl * Pl * Pl;
@@ -85,20 +86,21 @@ int main(int argc, char **argv) {
         printf("\n");
         nn_free((void *)j.x); nn_free(j.y); if (j.y2) nn_free(j.y2); nn_free(w); if (b) nn_free(b);
     }
-    if (want("upfwd")) {   /* decoder conv1 forward as dec0.c1 trains: [up2(silu(gn(coarse a2))) | silu(gn(skip a2))] staged in the kernel,
-                              MX-fp4 out with GN statistics (32 + 16 -> 16 at P) */
+    for (int uc = 32; uc >= 16 && want("upfwd"); uc -= 16) {   /* decoder conv1 forward as dec0.c1 trains: [up2(silu(gn(coarse a2))) |
+                              silu(gn(skip a2))] staged in the kernel, MX-fp4 out with GN statistics (uc + 16 -> 16 at P; uc 16: the 16-wide net) */
         const int Pc = P / 2; const size_t Sc = (size_t)Pc * Pc * Pc;
-        shape5 xs = {1, 48, P, P, P};
-        void *xc = mx(4, 32, Sc, 2.f, 91), *xk = mx(4, 16, S, 2.f, 92), *y = nn_malloc(lp_mx4_bytes(1, 16, S));
-        float *w = rnd((size_t)16 * 48 * 27, 0.1f, 93), *b = rnd(16, 0.1f, 94);
+        shape5 xs = {1, uc + 16, P, P, P};
+        void *xc = mx(4, uc, Sc, 2.f, 91), *xk = mx(4, 16, S, 2.f, 92), *y = nn_malloc(lp_mx4_bytes(1, 16, S));
+        float *w = rnd((size_t)16 * (uc + 16) * 27, 0.1f, 93), *b = rnd(16, 0.1f, 94);
         double best = 1e9;
         for (int it = 0; it < 10; it++) {
-            split_t sp = {0}; sp.up = 1; sp.x2 = xk; sp.c_split = 32; sp.gp2 = (gnp_t){gam, bet, mean, rstd, G}; sp.stored_stats = 1;
+            split_t sp = {0}; sp.up = 1; sp.x2 = xk; sp.c_split = uc; sp.gp2 = (gnp_t){gam, bet, mean, rstd, G}; sp.stored_stats = 1;
             nn_zero(osum, 2 * 64 * sizeof(double));
             nn_sync(); double t0 = now(); lp_conv_fwd_f4(xc, 4, xs, w, b, 16, y, 4, (gnp_t){gam + 64, bet + 64, mean, rstd, G}, osum, G, sp); nn_sync();
             if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
         }
-        printf("%-32s @%d %8.3f ms  out %016llx\n", "fwd up 32 + 16 -> 16 (dec0.c1)", P, best, (unsigned long long)fnv(y, lp_mx4_bytes(1, 16, S)));
+        char nm[64]; snprintf(nm, sizeof nm, "fwd up %d + 16 -> 16 (dec0.c1)", uc);
+        printf("%-32s @%d %8.3f ms  out %016llx\n", nm, P, best, (unsigned long long)fnv(y, lp_mx4_bytes(1, 16, S)));
         nn_free(xc); nn_free(xk); nn_free(y); nn_free(w); nn_free(b);
     }
     if (want("f8fwd")) {   /* the same 16 -> 16 / 48 -> 16 forwards on the fp8 kernel (MX-fp4 storage, fp8 compute) */

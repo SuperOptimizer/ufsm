@@ -597,7 +597,7 @@ __device__ __forceinline__ void fwd_epi_mxt(float (&acc)[MT][NR][2][4], float *t
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, vx = lane / LPV, qd = lane % LPV;
     const size_t S = (size_t)D * H * W;
     const bool sst = stats && sp.stored_stats;
-    const int OxP = sp.y2 ? (sp.o_split + 31) / 32 * 32 : Co;
+    const int OxP = sp.y2 ? (sp.o_pad ? sp.o_pad : (sp.o_split + 31) / 32 * 32) : Co;
     tb += (threadIdx.x >> 5) * HV * 36;
     float bias[MT][2];
 #pragma unroll
@@ -694,7 +694,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
     bool mx_done = false, st_done = false;
     if constexpr (IS_MX(T) && FST && MT % 2 == 0) {
         unsigned dsm; asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dsm));
-        const int OxP = sp.y2 ? (sp.o_split + 31) / 32 * 32 : Co;
+        const int OxP = sp.y2 ? (sp.o_pad ? sp.o_pad : (sp.o_split + 31) / 32 * 32) : Co;
         bool fit = (W & 15) == 0 && blockDim.x == 256 && dsm >= scr_off + FEPI_SCR(8) && (co0 & 31) == 0 && !(osum && !sp.stored_stats && sp.y2 && b);
 #pragma unroll
         for (int jb = 0; jb < MT / 2; jb++) {   /* block-uniform: each 32-channel tile a whole 32-wide block (or pure padding) */
@@ -720,7 +720,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
         if ((W & 15) == 0 && blockDim.x == 256 && dsm >= scr_off + 512u + 8u * WBUF) {
             const int warp = threadIdx.x >> 5;
             const size_t S = (size_t)D * H * W;
-            const int OxP = sp.y2 ? (sp.o_split + 31) / 32 * 32 : Co;
+            const int OxP = sp.y2 ? (sp.o_pad ? sp.o_pad : (sp.o_split + 31) / 32 * 32) : Co;
             __syncthreads();   /* every warp is past its MMA loop: the staging tiles are free */
             uint8_t *wb = smem_raw + 512 + warp * WBUF;
             float bias[MT][2];
@@ -761,7 +761,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                                     for (int h = 0; h < 2; h++) {
                                         const float q = val[mm][h] * mult;
                                         /* MX-fp4 gradient: exact SR keyed by (output channel, voxel) */
-                                        const unsigned c4 = sp.osr ? sr_e2m1_nib(q, sr_hash(sp.osr, ((uint64_t)n * Co + co0 + (j + mm) * 16 + g + 8 * h) * (uint64_t)S + ((size_t)(oz0 + wz * (NR / 2) + (r >> 1)) * H + oy0 + wr + (r & 1)) * W + ox0 + q2 * 8 + 2 * t + vv) & 0xffffu)
+                                        const unsigned c4 = sp.osr ? sr_e2m1_nib(q, sr_hash(sp.osr, ((uint64_t)n * Co + (sec ? cl + ((sp.o_split + 31) & ~31) : cp) + mm * 16 + g + 8 * h) * (uint64_t)S + ((size_t)(oz0 + wz * (NR / 2) + (r >> 1)) * H + oy0 + wr + (r & 1)) * W + ox0 + q2 * 8 + 2 * t + vv) & 0xffffu)
                                                                    : (unsigned)(cvt_e2m1x2(q, 0.f) & 15);
                                         nib |= c4 << (8 * (2 * mm + h));
                                     }
@@ -806,7 +806,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                                    fp4: the nibbles of channels (2k, 2k+1) sit in lanes g, g + 1 -> paired with a shuffle, one byte per even g */
         constexpr int B = MX_BITS(T);
         const size_t S = (size_t)D * H * W;
-        const int OxP = sp.y2 ? (sp.o_split + 31) / 32 * 32 : Co;
+        const int OxP = sp.y2 ? (sp.o_pad ? sp.o_pad : (sp.o_split + 31) / 32 * 32) : Co;
         uint8_t *q = (uint8_t *)y;
 #pragma unroll
         for (int r = 0; r < NR; r++) {
@@ -844,7 +844,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
 #pragma unroll
                                 for (int h = 0; h < 2; h++) {
                                     const float q = val[mm][h] * mult;
-                                    const unsigned c4 = sp.osr ? sr_e2m1_nib(q, sr_hash(sp.osr, ((uint64_t)n * Co + co0 + (j + mm) * 16 + g + 8 * h) * (uint64_t)S + ((size_t)oz * H + oy) * W + ox) & 0xffffu)
+                                    const unsigned c4 = sp.osr ? sr_e2m1_nib(q, sr_hash(sp.osr, ((uint64_t)n * Co + (sec ? cl + ((sp.o_split + 31) & ~31) : cp) + mm * 16 + g + 8 * h) * (uint64_t)S + ((size_t)oz * H + oy) * W + ox) & 0xffffu)
                                                                : (unsigned)(cvt_e2m1x2(q, 0.f) & 15);
                                     nib |= c4 << (8 * (2 * mm + h));
                                 }
