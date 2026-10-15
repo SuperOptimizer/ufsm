@@ -110,7 +110,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
     chan_t *ctab = (chan_t *)(smem_raw + f4u_off<TZ>(4));                     /* [32]: up channels 0..15, skip 16..31 */
     float2 *cab = (float2 *)(ctab + 32);                                      /* [32] GN coefficients */
     unsigned char *scr = smem_raw + f4u_off<TZ>(5);                           /* coarse rows during staging, the epilogue scratch after the MMA */
-    uint8_t *cu = scr, *cus = scr + CZ * 96 * 16;
+    uint8_t *cu = scr + 512, *cus = cu + CZ * 96 * 16;   /* (after the block's GN statistics: OWN epilogue) */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int wz = warp >> 2, wr = (warp & 3) * 2;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * 8;
@@ -132,6 +132,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
         const chan_t c = make_chan(ci, Ci, Cx, n, cp < 16 ? cplane : plane, x, sp, gp, N);
         ctab[cp] = c; cab[cp] = make_float2(c.a, c.b);
     }
+    if (osum) fwd_stats_zero<16>(scr);   /* the block's statistics over all its z tiles */
     __syncthreads();
     const bool Gu = ctab[0].g != 0, Gs = ctab[16].g != 0;   /* (per-segment GroupNorms, or one over both: make_chan's choice) */
     const chan_t cs0 = ctab[16];
@@ -220,9 +221,10 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
         __syncthreads();
 #endif
         F4RP(3);
-        fwd_epilogue<1, NR, TO, true>(acc, scr, y, b, n, 0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N, f4u_off<TZ>(5));
+        fwd_epilogue<1, NR, TO, true, true, true>(acc, scr, y, b, n, 0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N, f4u_off<TZ>(5));
         F4RP(5);
     }
+    if (osum) fwd_stats_flush<16>(scr, osum, n, 0, Co, Go);
 #if F4R_PROF
     if (threadIdx.x == 0) atomicAdd(&g_f4r_prof[7], 1ull);
 #endif
@@ -233,7 +235,7 @@ int lp_f4u_fwd(const void *x, shape5 xs, const float *w, const float *b, int cou
     if (!sp.x2 || Cx > 16 || xs.c - Cx > 16 || cout > 16 || sp.y2 || sp.sr || sp.osr || sp.accum || (xs.d | xs.h | xs.w) & 1) return 0;
     uint8_t *wq, *ws;
     if (!wmemo_get(sp.wkey, w, 16, -32, Cx, 16, -1, 0, (size_t)28 * 16 * 16, (size_t)28 * 16 * 2, &wq, &ws, 2)) prep_w4u_k<<<nblk_(28 * 16 * 2, 128), 128>>>(w, wq, ws, cout, xs.c, Cx);
-    size_t scr = f4u_coarse_bytes<TZ>();
+    size_t scr = 512 + f4u_coarse_bytes<TZ>();
     if (scr < (size_t)8 * 256 * sizeof(float)) scr = (size_t)8 * 256 * sizeof(float);
     if (scr < FEPI16_SCR(16)) scr = FEPI16_SCR(16);
     const size_t smem = f4u_off<TZ>(5) + scr;

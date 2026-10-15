@@ -193,6 +193,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
         *(uint4 *)(wa + kb * BM * 32 + sw16(c, h)) = __ldg((const uint4 *)(wq + ((size_t)kb * Cop + co0 + c) * 32 + h * 16));
     }
     for (int i = threadIdx.x; i < NKB * BM; i += 256) { int kb = i / BM, c = i % BM; was[i] = wsc[(size_t)kb * Cop + co0 + c]; }
+    if (osum) fwd_stats_zero<BM>(smem_raw + scr_off);   /* the block's statistics over all its z tiles (OWN epilogue: the scratch is its own) */
     __syncthreads();
     bool row1 = IS_MX(T) && CP <= 4 && !G && Ci == CP && ctab[0].p && ctab[0].bw >= CP;   /* the CP channels are one MX block row (the network
                                                                                           input): staged with one row and one scale load */
@@ -294,8 +295,9 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
             for (int r = 0; r < 2; r++) { mma_f8(acc[m][r][0], af, bfr[r][0], sa, sb); mma_f8(acc[m][r][1], af, bfr[r][1], sa, sb); }
         }
     }
-    fwd_epilogue<MT, NRX, TO, true>(acc, smem_raw + scr_off, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N, scr_off);
+    fwd_epilogue<MT, NRX, TO, true, MT == 1, true>(acc, smem_raw + scr_off, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N, scr_off);
     }
+    if (osum) fwd_stats_flush<BM>(smem_raw + scr_off, osum, n, co0, Co, Go);
 }
 
 
