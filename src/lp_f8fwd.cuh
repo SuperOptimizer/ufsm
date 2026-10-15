@@ -289,6 +289,7 @@ template <int MT, int CP, typename T, typename TO> void launch_f8s(dim3 grid, co
     const size_t base = ((size_t)F8_T * CP + NKB * MT * 16 * 32 + ((NKB * MT * 16 + 15) & ~15) + 16 + 16 * sizeof(chan_t) + 127) & ~(size_t)127;
     size_t scr = 8 * 256 * sizeof(float);
     if (IS_MX(TO) && MT % 2 == 0 && scr < FEPI_SCR(16)) scr = FEPI_SCR(16);   /* the transposed MX epilogue's scratch (with 8 KB it fell back to the generic one) */
+    if (IS_MX(TO) && MT == 1) scr = fepi16_scr(base, scr, cout, sp);                                  /* the 16-channel-block one (fwd_epi_mx16) */
     const size_t smem = base + scr;
     static int zc_env = -2;
     if (zc_env == -2) zc_env = getenv("UFSM_F8S_ZC") ? atoi(getenv("UFSM_F8S_ZC")) : -1;

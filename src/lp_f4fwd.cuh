@@ -340,7 +340,10 @@ template <int MT, int TZ, int NCH, typename T, typename TO> static void launch_f
     static int wres_env = -1;
     if (wres_env < 0) wres_env = getenv("UFSM_F4R_WRES") ? atoi(getenv("UFSM_F4R_WRES")) : 1;
     const int wres = wres_env && NCH == 1 && Cop == BM && MT <= 2;   /* one output tile, one chunk: the 14 tap pairs (<= 15 KB) resident */
-    const size_t smem = f4r_wa_off<MT, TZ, NCH>() + (wres ? ((size_t)(14 * BM * 32 + 14 * BM * 2 + 127) & ~(size_t)127) + scr : (scr > wst ? scr : wst));
+    const size_t wfix = f4r_wa_off<MT, TZ, NCH>() + (wres ? ((size_t)(14 * BM * 32 + 14 * BM * 2 + 127) & ~(size_t)127) : 0);
+    if (!wres && scr < wst) scr = wst;   /* (the scratch overlays the weight stage) */
+    if (IS_MX(TO) && MT == 1) scr = fepi16_scr(wfix, scr, cout, sp);   /* the 16-channel-block MX epilogue (fwd_epi_mx16) */
+    const size_t smem = wfix + scr;
     const int nzt = nblk_(xs.d, TZ);
     const size_t base = (size_t)nblk_(xs.w, 16) * nblk_(xs.h, 8) * xs.n;
     static int zc_env = -2;
@@ -382,18 +385,19 @@ static int wmemo_get(unsigned key, const float *w, int Cop, int Cip, int Cx, int
     e->key = key; e->w = w; e->Cop = Cop; e->Cip = Cip; e->Cx = Cx; e->CxP = CxP; e->Ox = Ox; e->OxP = OxP; e->step = g_wmemo_step; e->gen = g_wmemo_gen;
     return 0;
 }
-/* ---- 16-channel inputs on the fp4 MMA (m16n8k64 kind::mxf4): one k-step per tap row r = (kz, ky), K = 64 = [kx0 | kx1 | kx2 | 0]
-   x 16 channels, two 32-K scale blocks [kx0 | kx1] and [kx2 | 0] (9 k-steps per n-tile). The staged tile holds, per position p,
-   the 16 bytes [p | p + 1] (8 B = 16 e2m1 channels each; the last position of a row pairs with zeros), so both K blocks of output
-   voxel x are 16-byte-aligned ldmatrix rows: [x | x + 1] and [x + 2 | x + 3] (the kx = 3 half meets zero weights; e2m1 has no
-   NaN encoding and both halves share the pair scale, so it adds nothing). B scale: one ue8m0 per pair (the mma's 32-element
-   block: max over the two positions, so each position is quantised once per pair it belongs to), A scales one per (row, co,
-   32-K block). Weights wq4p[r][Cop][32 B], ws[r][Cop][2]. Staging shared with the fp8 version (stage_row16). */
+/* ---- 16-channel inputs on the fp4 MMA (m16n8k64 kind::mxf4nvf4, scale_vec::4X: one ue8m0 scale per 16 K, mma_f4x4): one k-step
+   per tap row r = (kz, ky), K = 64 = [kx0 | kx1 | kx2 | kx3] x 16 channels, each 16-K group with its own scale (9 k-steps per
+   n-tile; the kx3 group meets zero weights). Every staged position is quantised once, with its own scale over its 16 channels:
+   the stored MX layout of a <= 16-channel tensor, so an MX-fp4 input without a transform (the backward-data of an fp4 gradient)
+   is copied bit-exact. The staged tile holds, per position p, the 16 bytes [p | p + 1] (8 B = 16 e2m1 channels each; the last
+   position of a row pairs with zeros), so both 32-K halves of output voxel x are 16-byte-aligned ldmatrix rows: [x | x + 1] and
+   [x + 2 | x + 3]. B scale bytes: s(x), s(x + 1), s(x + 2) and 1 (kx3: zero weights; e2m1 has no NaN encoding). A scales one
+   per (row, co, kx). Weights wq4p[r][Cop][32 B] (8 B per kx), ws[r][Cop][4]. Staging shared with the fp8 version (stage_row16). */
 __global__ void prep_w4p_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Ox, int OxP, int Cs = -1, int cofs = 0);   /* defined in lp_f4fwd.cu */
 /* the epilogue scratch of conv_fwd_f4p_k: after its ring and tables, so the halo planes survive into the next z tile */
 template <int MT, int TZ> __host__ __device__ constexpr unsigned f4p_scr_off() {
     constexpr int BM = MT * 16, TT = (TZ + 2) * 180;
-    return (unsigned)((TT * 16 + ((TT + 127) & ~127) + 9 * BM * 32 + ((9 * BM * 2 + 15) & ~15) + 32 * 32 + TT * 4 + 127) & ~127);
+    return (unsigned)((TT * 16 + ((TT + 127) & ~127) + 9 * BM * 32 + 9 * BM * 4 + 32 * 32 + 127) & ~127);
 }
 template <int MT, int TZ, typename T, typename TO>
 __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
@@ -402,11 +406,10 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
     constexpr int BM = MT * 16, RZ = TZ / 2, NR = 2 * RZ, NP = TZ + 2, TT = NP * 180;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sx = smem_raw;                    /* [NP slots x 180 pos][16 B] = [pos | pos + 1]; input plane gz in slot (gz + 1) % NP */
-    uint8_t *sxs = sx + TT * 16;               /* [TT] pair scales */
+    uint8_t *sxs = sx + TT * 16;               /* [TT] position scales */
     uint8_t *wa = sxs + ((TT + 127) & ~127);   /* [9 r][BM co][32 B] swizzled */
-    unsigned short *was = (unsigned short *)(wa + 9 * BM * 32);   /* [9][BM] (byte 0 block 0, byte 1 block 1) */
-    chan_t *ctab = (chan_t *)(wa + 9 * BM * 32 + ((9 * BM * 2 + 15) & ~15));   /* [32] */
-    unsigned *pam = (unsigned *)(ctab + 32);    /* [TT] per-position amax (bits) */
+    unsigned *was = (unsigned *)(wa + 9 * BM * 32);   /* [9][BM] (byte kx = the kx group's scale) */
+    chan_t *ctab = (chan_t *)(was + 9 * BM);   /* [32] */
     unsigned char *scr = smem_raw + f4p_scr_off<MT, TZ>();   /* epilogue scratch */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int wz = warp >> 2, wr = (warp & 3) * 2;
@@ -423,64 +426,62 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
         const int r = i / (BM * 2), q = i % (BM * 2), c = q >> 1, h = q & 1;
         *(uint4 *)(wa + r * BM * 32 + sw16(c, h)) = __ldg((const uint4 *)(wq + ((size_t)r * Cop + co0 + c) * 32 + h * 16));
     }
-    for (int i = threadIdx.x; i < 9 * BM; i += 256) { const size_t o = ((size_t)(i / BM) * Cop + co0 + i % BM) * 2; was[i] = (unsigned short)(wsc[o] | (wsc[o + 1] << 8)); }
+    for (int i = threadIdx.x; i < 9 * BM; i += 256) was[i] = __ldg((const unsigned *)wsc + (size_t)(i / BM) * Cop + co0 + i % BM);
     if (threadIdx.x < 32) ctab[threadIdx.x] = make_chan(threadIdx.x < 16 ? (int)threadIdx.x : -1, Ci, Ci, n, plane, x, sp, gp, N);
     __syncthreads();
+#if F4R_PROF
+    long long t_prev = clock64();
+#endif
     const chan_t c0 = ctab[0];
     float2 gab[16];
 #pragma unroll
     for (int k = 0; k < 16; k++) gab[k] = make_float2(ctab[k].a, ctab[k].b);
+    bool cpy = false;   /* mx4 input without transform: the stored row (<= 16 channels, one scale) is the staged row */
+    if constexpr (IS_MX4(T)) cpy = !G && !sp.sr;
     /* z tiles of TZ output planes: the block walks ZC of them; tile oz0 reads input planes oz0 - 1 .. oz0 + TZ, of which the
        first two are the previous tile's last two (kept in the ring), so after the first tile only TZ planes are staged */
     for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
     const int oz0 = tz * TZ, p0 = tz == zc * ZC ? 0 : 2, npos = (NP - p0) * 180;   /* tile planes p0 .. NP - 1 are new */
     __syncthreads();   /* the previous tile's MMA has read the slots about to be replaced */
-    {   /* staging: thread per position, values kept in registers; pair p = [p | p + 1] is quantised with its own scale
-           s_p = amax over both positions (the MX 32-element block of the mma), so every position is quantised twice: low half
-           of pair p with s_p, high half of pair p - 1 with s_(p-1) */
-        constexpr int NIT = (TT + 255) / 256;
-        float v[NIT][16];
-#pragma unroll
-        for (int it = 0; it < NIT; it++) {
-            const int li = threadIdx.x + 256 * it, pl = p0 + li / 180, rem = li % 180, row = rem / 18, ix = rem - 18 * row;
-            const int gz = oz0 - 1 + pl, gy = oy0 - 1 + row, gx = ox0 - 1 + ix, spos = ((gz + 1) % NP) * 180 + rem;
-            const bool inb = li < npos && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
-            stage_row16<T>(c0, Ci, plane, inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0, inb, G, gab, v[it]);
+    F4RP(0);
+    for (int li = threadIdx.x; li < npos; li += 256) {   /* staging: thread per position, quantised once with its own scale, written
+                                                            to both pairs it belongs to (low half of pair p, high half of pair p - 1) */
+        const int pl = p0 + li / 180, rem = li % 180, row = rem / 18, ix = rem - 18 * row;
+        const int gz = oz0 - 1 + pl, gy = oy0 - 1 + row, gx = ox0 - 1 + ix, pos = ((gz + 1) % NP) * 180 + rem;
+        const bool inb = gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+        const size_t off = inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0;
+        uint2 q = make_uint2(0u, 0u);
+        unsigned sc = 1u;
+        if (cpy) {
+            if (inb && c0.p) {
+                const uint8_t *src = (const uint8_t *)c0.p + off * c0.rb;
+                q = c0.bw == 8 ? make_uint2(__ldg((const unsigned *)src), 0u) : __ldg((const uint2 *)src);   /* 8 / 16 channels: 4 / 8 bytes */
+                sc = c0.sp[off];
+            }
+        } else {
+            float v[16];
+            stage_row16<T>(c0, Ci, plane, off, inb, G, gab, v);
             unsigned am = 0u;
 #pragma unroll
-            for (int k = 0; k < 16; k++) am = amax_u(am, v[it][k]);
-            if (li < npos) pam[spos] = am;
-        }
-        __syncthreads();
-#pragma unroll
-        for (int it = 0; it < NIT; it++) {
-            const int li = threadIdx.x + 256 * it, pl = p0 + li / 180, rem = li % 180, row = rem / 18, ix = rem - 18 * row;
-            if (li >= npos) break;
-            const int gz = oz0 - 1 + pl, pos = ((gz + 1) % NP) * 180 + rem;
-            const unsigned a0 = pam[pos], an = ix < 17 ? pam[pos + 1] : 0u, ap = ix ? pam[pos - 1] : 0u;
-            const int e = mx_exp(__uint_as_float(max(a0, an)), 1.f / 6.f), ep = mx_exp(__uint_as_float(max(a0, ap)), 1.f / 6.f);
-            const float m = exp2i(-e), mp = exp2i(-ep);
-            float *w = v[it];
-            uint2 lo, hi;
-            if (sp.sr) {   /* gradient operand: exact stochastic rounding keyed by the element (each copy with its own scale, the same
-                              uniform): one hash and three remixes per 8 values, the nibbles straight from the rounding */
-                const int gy = oy0 - 1 + row, gx = ox0 - 1 + ix;
+            for (int k = 0; k < 16; k++) am = amax_u(am, v[k]);
+            const int e = mx_exp(__uint_as_float(am), 1.f / 6.f);
+            const float m = exp2i(-e);
+            if (sp.sr) {   /* gradient operand: exact stochastic rounding keyed by the element (deterministic per call): one hash and
+                              three remixes per 8 values, the nibbles straight from the rounding */
                 const uint64_t vid = (((uint64_t)n * D + gz) * H + gy) * (uint64_t)W + gx;
                 uint32_t ha[4], hb[4];
                 sr_hash4(sp.sr, vid * 2, ha); sr_hash4(sp.sr, vid * 2 + 1, hb);
-                lo = make_uint2(sr_e2m1_word(w, m, ha), sr_e2m1_word(w + 8, m, hb));
-                hi = make_uint2(sr_e2m1_word(w, mp, ha), sr_e2m1_word(w + 8, mp, hb));
-            } else {
-                lo = make_uint2(cvt_e2m1x8(w, m), cvt_e2m1x8(w + 8, m));
-                hi = make_uint2(cvt_e2m1x8(w, mp), cvt_e2m1x8(w + 8, mp));
-            }
-            *(uint2 *)(sx + pos * 16) = lo;                       /* low half of pair[pos] */
-            if (ix) *(uint2 *)(sx + (pos - 1) * 16 + 8) = hi;     /* high half of pair[pos - 1] */
-            if (ix == 17) *(uint2 *)(sx + pos * 16 + 8) = make_uint2(0u, 0u);                                      /* the row's last pair: [17 | 0] */
-            sxs[pos] = (uint8_t)(e + 127);
+                q = make_uint2(sr_e2m1_word(v, m, ha), sr_e2m1_word(v + 8, m, hb));
+            } else q = make_uint2(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m));
+            sc = (unsigned)(e + 127);
         }
+        *(uint2 *)(sx + pos * 16) = q;                                   /* low half of pair[pos] */
+        if (ix) *(uint2 *)(sx + (pos - 1) * 16 + 8) = q;                 /* high half of pair[pos - 1] */
+        if (ix == 17) *(uint2 *)(sx + pos * 16 + 8) = make_uint2(0u, 0u);   /* the row's last pair: [17 | 0] */
+        sxs[pos] = (uint8_t)sc;
     }
     __syncthreads();
+    F4RP(1);
     float acc[MT][NR][2][4];
 #pragma unroll
     for (int m = 0; m < MT; m++) for (int r = 0; r < NR; r++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[m][r][q][k] = 0.f;
@@ -492,9 +493,12 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
 #pragma unroll
         for (int r = 0; r < NR; r++) {
             const int rowi = ((oz0 + wz * RZ + (r >> 1) + kz) % NP) * 10 + wr + (r & 1) + ky;   /* the tile plane's ring slot */
-            ldsm_x4(bfr[r], sx + (rowi * 18 + vx + 2 * kb) * 16);   /* block 0: [x | x+1], block 1: [x+2 | x+3] */
+            ldsm_x4(bfr[r], sx + (rowi * 18 + vx + 2 * kb) * 16);   /* K 0..31: [x | x+1], K 32..63: [x+2 | x+3] */
 #pragma unroll
-            for (int q2 = 0; q2 < 2; q2++) { const int pc = rowi * 18 + q2 * 8 + g; sb[r][q2] = (unsigned)sxs[pc] | ((unsigned)sxs[pc + 2] << 8); }   /* column g: pair scales */
+            for (int q2 = 0; q2 < 2; q2++) {   /* column g: its three positions' scales, kx3 = 1 */
+                const int pc = rowi * 18 + q2 * 8 + g;
+                sb[r][q2] = (unsigned)sxs[pc] | ((unsigned)sxs[pc + 1] << 8) | ((unsigned)sxs[pc + 2] << 16) | 0x7f000000u;
+            }
         }
 #pragma unroll
         for (int m = 0; m < MT; m++) {
@@ -503,17 +507,26 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
             ldsm_x4(af, wa + tr * BM * 32 + sw16(arow, mat >> 1));
             const unsigned sa = was[tr * BM + m * 16 + g + 8 * (t & 1)];
 #pragma unroll
-            for (int r = 0; r < NR; r++) { mma_f4(acc[m][r][0], af, bfr[r], sa, sb[r][0]); mma_f4(acc[m][r][1], af, bfr[r] + 2, sa, sb[r][1]); }
+            for (int r = 0; r < NR; r++) { mma_f4x4(acc[m][r][0], af, bfr[r], sa, sb[r][0]); mma_f4x4(acc[m][r][1], af, bfr[r] + 2, sa, sb[r][1]); }
         }
     }
-    fwd_epilogue<MT, NR, TO, true>(acc, scr, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N, f4p_scr_off<MT, TZ>());
+#if F4R_PROF
+    __syncthreads();
+#endif
+    F4RP(3);
+    fwd_epilogue<MT, NR, TO, true, MT <= 2>(acc, scr, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N, f4p_scr_off<MT, TZ>());
+    F4RP(5);
     }
+#if F4R_PROF
+    if (threadIdx.x == 0) atomicAdd(&g_f4r_prof[7], 1ull);
+#endif
 }
 template <int MT, int TZ, typename T, typename TO> void launch_f4p(dim3, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, gnp_t gp, double *osum, int Go, split_t sp) {
     constexpr int BM = MT * 16, RZ = TZ / 2, NR = 2 * RZ;
     constexpr int RBM = IS_MX(TO) ? 32 * MX_BITS(TO) / 8 : 0;   /* the epilogue's MX smem store path: 512 + 8 warps x NR x 16 x (RBM + 1) */
     size_t scr = (size_t)8 * 256 * sizeof(float);
     if (IS_MX(TO) && scr < (size_t)512 + 8 * NR * 16 * (RBM + 1)) scr = (size_t)512 + 8 * NR * 16 * (RBM + 1);
+    if (IS_MX(TO) && MT <= 2) scr = fepi16_scr(f4p_scr_off<MT, TZ>(), scr, cout, sp);   /* the 16-channel-block MX epilogue (fwd_epi_mx16) */
     const size_t smem = f4p_scr_off<MT, TZ>() + scr;
     (void)BM;
     /* z tiles per block: the ring saves 2 of TZ + 2 staged planes per tile after the first; keep >= 4 blocks per SM-pair of waves */
@@ -527,10 +540,19 @@ template <int MT, int TZ, typename T, typename TO> void launch_f4p(dim3, const v
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4p_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_fwd_f4p_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp, ZC);
+#if F4R_PROF
+    if (getenv("F4R_PROF")) {
+        unsigned long long h[8]; cudaDeviceSynchronize(); cudaMemcpyFromSymbol(h, g_f4r_prof, sizeof h);
+        const double nb = (double)h[7], tot = (double)(h[0] + h[1] + h[2] + h[3] + h[4] + h[5]);
+        fprintf(stderr, "f4p %d->%d @%dx%dx%d MT %d TZ %d ZC %d: per block %.0f cycles: tile start %.0f%% staging %.0f%% mma %.0f%% epilogue %.0f%%\n",
+                xs.c, cout, xs.d, xs.h, xs.w, MT, TZ, ZC, tot / nb, 100 * h[0] / tot, 100 * h[1] / tot, 100 * h[3] / tot, 100 * h[5] / tot);
+        unsigned long long z[8] = {}; cudaMemcpyToSymbol(g_f4r_prof, z, sizeof z);
+    }
+#endif
 }
 static int wmemo_get(unsigned key, const float *w, int Cop, int Cip, int Cx, int CxP, int Ox, int OxP, size_t nq, size_t ns, uint8_t **wq, uint8_t **ws, int slot = 2);
 template <typename T, typename TO> static void p16_f4(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, int Cop, int Ox, int OxP, gnp_t gp, double *osum, int Go, split_t sp) {
-    const size_t nq = (size_t)9 * Cop * 32, ns = (size_t)9 * Cop * 2;
+    const size_t nq = (size_t)9 * Cop * 32, ns = (size_t)9 * Cop * 4;
     const int pOx = IS_MX(TO) && sp.y2 ? Ox : -1;
     uint8_t *wq, *ws;
     if (!wmemo_get(sp.wkey, w, Cop, -16, -1, 0, pOx, OxP, nq, ns, &wq, &ws)) prep_w4p_k<<<nblk_(ns, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, pOx, OxP);   /* Cip -16: packed layout */
@@ -559,19 +581,15 @@ template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const
     int Ox = sp.y2 ? sp.o_split : cout, OxP = (Ox + 31) / 32 * 32;
     if (IS_MX(TO)) { if (sp.y2) Cop = OxP + (cout - Ox + 31) / 32 * 32; else if (cout > 16) Cop = (cout + 31) / 32 * 32; }   /* 32-row-aligned output blocks */
     if (IS_MX(T)) Cip = CxP + (xs.c - Cx + 31) / 32 * 32;                                                                /* per-tensor 32-channel segments */
-    /* MX-fp4 gradient backward-data (fp4 gy, output SR keyed by osr, no staging SR): the 32-padded chunk path copies each <= 16-channel
-       row with its own scale (exact); p16 would re-round paired voxels to their shared scale to nearest (biased gradients).
-       UFSM_G4_P16=1: p16 with SR staging instead (unbiased, more variance); 2: p16 as before (biased, diagnostic) */
-    static int g4p16 = -1; if (g4p16 < 0) g4p16 = getenv("UFSM_G4_P16") ? atoi(getenv("UFSM_G4_P16")) : 0;
-    const bool g4_exact = IS_MX4(T) && sp.osr && !sp.sr && !g4p16;
-    if (IS_MX4(T) && sp.osr && !sp.sr && g4p16 == 1) sp.sr = sp.osr * 0x9e3779b9u + 0x7f4a7c15u;   /* (staging keys derived from the output seed;
-                                                                                                     UFSM_G4_P16=2: the old nearest re-rounding, a test of the test) */
+    /* MX-fp4 gradient backward-data (fp4 gy, output SR keyed by osr, no staging SR): <= 16-channel gy rows go to the packed kernel,
+       which copies each row with its own scale (one scale per 16 K: exact, no re-rounding) */
+    const bool g4_exact = IS_MX4(T) && sp.osr && !sp.sr;
     /* a split MX-fp4 gradient output of two <= 16-channel tensors (dec0.c1's backward-data of a 16-wide level 0: up part | skip):
        the second tensor at row 16, not 32 -- Cop 32 instead of 64 (tile MT 2 / TZ 4 with resident weights, not MT 4 / TZ 2 with half
        the rows padding); the output SR keys keep the 32-padded row numbers, so the bits are unchanged. UFSM_F4_OPAD16=0: off */
     static int opad_env = -1; if (opad_env < 0) opad_env = getenv("UFSM_F4_OPAD16") ? atoi(getenv("UFSM_F4_OPAD16")) : 1;
     if (opad_env && g4_exact && IS_MX(TO) && sp.y2 && Ox <= 16 && cout - Ox <= 16) { OxP = 16; Cop = 32; sp.o_pad = 16; }
-    if (xs.c <= 16 && !sp.x2 && !sp.up && sp.gp2.G == 0 && !g4_exact) { p16_f4<T, TO>(x, xs, w, b, cout, y, Cop, Ox, OxP, gp, osum, Go, sp); return; }   /* K = [kx0 | kx1 | kx2 | 0] */
+    if (xs.c <= 16 && !sp.x2 && !sp.up && sp.gp2.G == 0) { p16_f4<T, TO>(x, xs, w, b, cout, y, Cop, Ox, OxP, gp, osum, Go, sp); return; }   /* K = [kx0 | kx1 | kx2 | kx3] x 16, a scale per kx */
     const int nch = Cip / 32;
     const size_t nq = (size_t)28 * Cop * Cip / 2, ns = (size_t)28 * Cop * nch;
     const int pCx = IS_MX(T) ? Cx : -1, pOx = IS_MX(TO) && sp.y2 ? Ox : -1;
