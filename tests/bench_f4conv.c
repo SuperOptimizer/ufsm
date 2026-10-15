@@ -276,6 +276,19 @@ int main(int argc, char **argv) {
             printf("%-32s @%d %8.3f ms  out %016llx  osum %.9g %.9g\n", "fwd stem 4 -> 32 (mx8 -> mx4, stats)", P, best, (unsigned long long)fnv(yo, lp_mx4_bytes(1, 32, S)), hs[0], hs[1]);
             nn_free(xi); nn_free(yo); nn_free(w); nn_free(b);
         }
+        if (!wsel || !strcmp(wsel, "stemf16")) {   /* the 16-wide net's stem forward: MX-fp4 network input (UFSM_XIN_PREC=4) -> MX-fp4 16 channels with GN statistics */
+            shape5 x4 = {1, 4, P, P, P};
+            void *xi = mx(4, 4, S, 2.f, 116), *yo = nn_malloc(lp_mx4_bytes(1, 16, S));
+            float *w = rnd((size_t)16 * 4 * 27, 0.1f, 117), *b = rnd(16, 0.1f, 118);
+            best = 1e9;
+            for (int it = 0; it < 8; it++) {
+                nn_zero(osum, 2 * 64 * sizeof(double));
+                nn_sync(); double t0 = now(); lp_conv_fwd_f8(xi, 4, x4, w, b, 16, yo, 4, (gnp_t){0}, osum, G, (split_t){0}); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+            }
+            double hs[16]; nn_d2h(hs, osum, sizeof hs);
+            printf("%-32s @%d %8.3f ms  out %016llx  osum %.9g %.9g\n", "fwd stem 4 -> 16 (mx4 -> mx4, stats)", P, best, (unsigned long long)fnv(yo, lp_mx4_bytes(1, 16, S)), hs[0], hs[1]);
+            nn_free(xi); nn_free(yo); nn_free(w); nn_free(b);
+        }
         if (!wsel || !strcmp(wsel, "s2f")) {   /* down0 forward: GN+SiLU of the MX-fp4 enc0 output staged, MX-fp4 out at P/2 (UFSM_S2_F4=0: fp8 kernel) */
             const int Pc2 = P / 2; const size_t Sc2 = (size_t)Pc2 * Pc2 * Pc2;
             shape5 xs = {1, 32, P, P, P}, ys = {1, 32, Pc2, Pc2, Pc2};
