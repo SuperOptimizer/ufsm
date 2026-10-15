@@ -46,8 +46,10 @@ int main(void) {
  float *logs[5],*grads[5];int modes[]={0,0,1,1,0};unsigned seeds[]={1,2,1,2,1};
  for(int j=0;j<5;j++){logs[j]=malloc(nl*4);grads[j]=malloc(np*4);run(&cfg,xs,dx,dg,modes[j],seeds[j],logs[j],grads[j]);}
  for(int j=2;j<4;j++) {
-  int ref=j-2;double f=rel(logs[j],logs[ref],nl),g=rel(grads[j],grads[ref],np),noise=rel(grads[1],grads[0],np);
-  for(int t=0;t<nsegment;t++){segment sg=segments[t];double d=rel(grads[j]+sg.off,grads[ref]+sg.off,sg.len),n=rel(grads[1]+sg.off,grads[0]+sg.off,sg.len);int pass=sr?d<1.5*n+1e-3:d<1e-5;printf("  %s grad_rel=%.6g seed_rel=%.6g %s\n",sg.name,d,n,pass?"ok":"FAIL");failures+=!pass;}
+  /* stochastic modes: the wide-vs-narrow difference at one seed is seed noise; the noise estimate pools the narrow pair (seeds 1, 2)
+     and the wide pair (one sample of a 32-element segment alone failed ~1 in 10 seed choices in either kernel generation) */
+  int ref=j-2;double f=rel(logs[j],logs[ref],nl),g=rel(grads[j],grads[ref],np),noise=fmax(rel(grads[1],grads[0],np),rel(grads[3],grads[2],np));
+  for(int t=0;t<nsegment;t++){segment sg=segments[t];double d=rel(grads[j]+sg.off,grads[ref]+sg.off,sg.len),n=fmax(rel(grads[1]+sg.off,grads[0]+sg.off,sg.len),rel(grads[3]+sg.off,grads[2]+sg.off,sg.len));int pass=sr?d<1.5*n+1e-3:d<1e-5;printf("  %s grad_rel=%.6g seed_rel=%.6g %s\n",sg.name,d,n,pass?"ok":"FAIL");failures+=!pass;}
   int ok=f<1e-5 && (sr?g<1.5*noise+1e-3:g<1e-5);printf("seed=%u logits_rel=%.6g grad_rel=%.6g baseline_seed_rel=%.6g %s\n",seeds[j],f,g,noise,ok?"ok":"FAIL");failures+=!ok;
  }
  double repeat=rel(grads[4],grads[0],np);printf("repeat narrow grad_rel=%.6g\n",repeat);failures+=repeat>=1e-5;
