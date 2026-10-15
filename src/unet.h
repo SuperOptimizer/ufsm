@@ -149,6 +149,7 @@ void unet_set_l0_3buf_reorder(int on);   /* enc[0]'s conv2 backward-data before 
 void *unet_batch_scratch2(unet *u, size_t head, size_t tail, void **tailp);
 void unet_set_batch_bytes(unet *u, size_t head, size_t tail);
 int unet_l0_3buf(const unet *u);
+int unet_l0_3buf_ct(const unet *u);   /* the last training forward (GPU-built input) keeps the CT, not the input, for enc[0]'s backward */
 int unet_last_dry_l3b(void);
 void *unet_logit_grad_scratch(unet *u, size_t bytes);   /* lean: home of the 16-bit logit gradient (A after the logits under lean 2, else B) */
 int unet_lean_nob(const unet *u);   /* lean 2 build: no gradient buffer B (gout[0] is the batch scratch) */

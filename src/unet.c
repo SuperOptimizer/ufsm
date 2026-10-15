@@ -155,6 +155,8 @@ struct unet {
        twice (after dec[0]'s up transient into X2, after dec[0]'s backward into X3), the encoder's a1 into X2 after down0's backward */
     int l3b, l3_no, l3_skip_in;              /* l3_no: unavailable (a host buffer), the four-buffer layout; l3_skip_in: dec[0]'s conv1 weight gradient
                                                 brings the skip back after building its up transient */
+    int l3_ct;                               /* this training forward's input is rebuilt in enc[0]'s backward from its CT channel (--gpu-input: the 16-bit
+                                                CT in X2 and the radial records), the CT on the host meanwhile (2 B per voxel instead of the 5 B input) */
     float *l3x[4]; size_t l3xb[4], l3_lo;    /* X1..X3 and their bytes; X3's bytes below the batch tail */
     float *skf[UNET_MAXLEV], *skb[UNET_MAXLEV], *dnf[UNET_MAXLEV], *dnb[UNET_MAXLEV];   /* the coarse skips / down-conv outputs: forward homes (X3),
                                                 backward homes (X2) */
@@ -1205,6 +1207,7 @@ void unet_set_batch_bytes(unet *u, size_t head, size_t tail) {
     u->bat_tail = tail;
 }
 int unet_l0_3buf(const unet *u) { return u->built && u->l3b; }
+int unet_l0_3buf_ct(const unet *u) { return u->built && u->l3_ct; }   /* the last training forward kept the CT for the input's rebuild */
 static int g_last_dry_l3b;
 int unet_last_dry_l3b(void) { return g_last_dry_l3b; }   /* the last dry build (unet_train_bytes) used the three level-0 buffers */
 /* device bytes of the training activations / gradients at input shape xs under the current storage modes, without allocating
@@ -1325,6 +1328,17 @@ static void l3_skip_copy(unet *u, size_t lo, size_t hi, int wait) {
    waited ~27 ms per step. dec[0]'s conv1, long after, waits for the level-0 halves; its conv2 / the head for the down outputs. Backward:
    the coarse encoders' a1 queued behind level 0's (enc[1]'s backward waited ~6 ms) */
 static int a1_out_split(void) { static int v = -1; if (v < 0) v = getenv("UFSM_A1_OUT_SPLIT") ? ufsm_env_on("UFSM_A1_OUT_SPLIT") : 1; return v; }
+/* l3b with the GPU-built input (unet_set_input_rad, --gpu-input): the 16-bit CT channel the input was built from goes to the host instead of
+   the MX input and comes back into X1's end for the stem's weight gradient, the input rebuilt below it by nn_input_rad (the forward's
+   bits); env UFSM_L0_3BUF_CT, default on. l3_ct_off: the CT's offset in X1, 0 if it does not fit beside the input */
+static int l3_ct_on(void) { static int v = -1; if (v < 0) v = getenv("UFSM_L0_3BUF_CT") ? ufsm_env_on("UFSM_L0_3BUF_CT") : 1; return v; }
+static size_t l3_ct_bytes(const unet *u) { return (size_t)u->xs.n * u->xs.d * u->xs.h * u->xs.w * 2; }
+static size_t l3_ct_off(const unet *u) {
+    const size_t cb = l3_ct_bytes(u), lo = (u->xin_bytes + 255) & ~(size_t)255;
+    if (cb > u->l3xb[1]) return 0;
+    const size_t off = (u->l3xb[1] - cb) & ~(size_t)255;
+    return off >= lo ? off : 0;
+}
 /* l3b: enc[0]'s conv2 backward-data before its weight gradient (env UFSM_L0_3BUF_REORDER, default on), so the encoder's a1 comes back into
    X2 during its GroupNorm backward and that backward-data instead of exposed */
 static int g_l3_reorder = -1;
@@ -1579,7 +1593,8 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
         FQ(b->a1, b->ys); FQ_AFF(b->a1, b->ys, b->pm1, b->pr1, G);
         sp_halo(u, b->a1, b->ys, 0);
         if (b == &u->enc[0] && u->xin_inf) nn_set_storage(b->a2, act_bytes_of(b->ys), act_dt());   /* the stem has read the input: conv2 writes a2 over it */
-        if (b == &u->enc[0] && u->xin_shared && u->fwd_train && u->h_xin) {   /* the stem has read the input: to the host during conv2 and the coarser levels */
+        if (b == &u->enc[0] && u->l3_ct) nn_stream_wait(0, u->ev_xin[1]);   /* (conv2 writes X2: the CT out) */
+        else if (b == &u->enc[0] && u->xin_shared && u->fwd_train && u->h_xin) {   /* the stem has read the input: to the host during conv2 and the coarser levels */
             nn_offload_copy(u->h_xin, u->xin, u->xin_bytes, 1, u->ev_xin[0], u->ev_xin[1]); u->xin_out = 1;
         }
         if (b == &u->dec[0]) {   /* conv2 writes a2 over what dec[0].a2's buffer held: the input, the down-conv outputs, the coarse skips,
@@ -1699,6 +1714,12 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         }
     }
     if (u->rad && !(x_h16 && act_mx8() && xin_mx && !u->ctin.on)) { fprintf(stderr, "unet_forward_x: radial input records need the 16-bit -> MX input conversion\n"); abort(); }
+    u->l3_ct = u->l3b && train && u->rad && x_h16 && xin_mx && u->h_xin && l3_ct_on() && l3_ct_off(u) && l3_ct_bytes(u) <= u->xin_bytes
+               && (const char *)x >= (const char *)u->l3x[2] && (const char *)x + l3_ct_bytes(u) <= (const char *)u->l3x[2] + u->l3xb[2];
+    if (u->l3_ct) {   /* (l3b, GPU-built input) the CT to the host: enc[0]'s conv2 writes X2 after it */
+        nn_offload_copy(u->h_xin, x, l3_ct_bytes(u), 1, u->ev_xin[0], u->ev_xin[1]);
+        u->xin_out = 1;
+    }
     size_t a1_rest = 0;   /* (a1_out_split: level 0's a1 bytes still to copy out after the encoders) */
     for (int i = 0; i < L; i++) {
         if (i == 1 && u->r_out) nn_stream_wait(0, u->ev_r[1]);   /* the coarse levels write R: its copy out done */
@@ -1913,9 +1934,11 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
             l3_skip_copy(u, 0, l3_skip_lo(u), 0);
             l3_skip_copy(u, l3_skip_hi(u), act_bytes_of(u->enc[0].ys), 0);
         }
-        if (b == &u->enc[0] && u->l3b) {   /* B (X1) read for the last time: the input back into it for the stem's weight gradient */
+        if (b == &u->enc[0] && u->l3b) {   /* B (X1) read for the last time: the input back into it for the stem's weight gradient (l3_ct: its CT
+                                             into X1's end, the input rebuilt below) */
             nn_set_storage(u->l3x[1], u->xin_bytes, unet_input_prec());
-            nn_offload_copy(u->l3x[1], u->h_xin, u->xin_bytes, 0, u->ev_xin[2], u->ev_xin[3]);
+            if (u->l3_ct) nn_offload_copy((char *)u->l3x[1] + l3_ct_off(u), u->h_xin, l3_ct_bytes(u), 0, u->ev_xin[2], u->ev_xin[3]);
+            else nn_offload_copy(u->l3x[1], u->h_xin, u->xin_bytes, 0, u->ev_xin[2], u->ev_xin[3]);
             b->in = u->l3x[1];
         }
         FQG(A, b->ys);
@@ -1995,6 +2018,7 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     }
     const nn_gn_t gi = gn_in(u, b);
     if (b == &u->enc[0] && u->a0_share && u->xin_shared) nn_stream_wait(0, u->ev_xin[3]);
+    if (b == &u->enc[0] && u->l3_ct) PROF(4, nn_input_rad((const char *)u->l3x[1] + l3_ct_off(u), u->xs, u->rad, u->l3x[1]));   /* (the forward's input) */
     if (gi.G && nn_get_tf32()) PROF(2, nn_conv3d_bwd_weight_gn(b->in, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, A, b->ys, g + b->c1.w, g + b->c1.b));
     else PROF(2, nn_conv3d_bwd_weight(b->in, b->xs, A, b->ys, 3, 1, g + b->c1.w, g + b->c1.b));
     if (b != &u->enc[0] || !nn_get_tf32())   /* the network-input gradient of enc0 is never used */
