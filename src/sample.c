@@ -1006,35 +1006,60 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         dcut = (int)(3.f * (sigma * 4.5f+fmaxf(0,shift))) + 1; if (dcut > 4000) dcut = 4000;
     }
     const int trust_r = s->trust_band > 0 ? (s->trust_band >> l < 1 ? 1 : s->trust_band >> l) : 0;
-    const int use8 = (!soft_on || dcut <= 254) && 3 * trust_r <= 254;
+    const int shell_r = c->shell > 0 && region_ch < 0 ? (c->shell >> l < 1 ? 1 : c->shell >> l) : 0;
+    /* --dist-head: channel 1 = 254 exp(-(d / sigma)^2 / 2) of channel 0's hard labels (a wide distance ridge beside the sharp recto) */
+    const int dist_on = c->dist_sigma > 0 && region_ch < 0 && w[0] && !s->tgt_prob[0] && NCH > 1;
+    float dsig = 0; int dcut2 = 0;
+    if (dist_on) {
+        dsig = (c->soft_um ? c->dist_sigma / (float)s->um : c->dist_sigma) / (float)(1 << l); if (dsig < 0.75f) dsig = 0.75f;
+        dcut2 = (int)(3.f * dsig * 4.5f) + 1; if (dcut2 > 4000) dcut2 = 4000;
+    }
+    const int use8 = (!soft_on || dcut <= 254) && 3 * trust_r <= 254 && 3 * shell_r <= 254 && (!dist_on || dcut2 <= 254);
 #define CHAMFER_FOR(ch_) do { if (dm_ch != (ch_)) { dm_ch = (ch_); dm_any = use8 ? chamfer345_8(ttmp + (size_t)(ch_) * p3, dm8, Pz, P) : chamfer345(ttmp + (size_t)(ch_) * p3, dm, Pz, P); } } while (0)
+    uint8_t *etab = big + 4 * p3, *dtab = big + 4 * p3 + 8192;   /* distance -> target tables (indexed by the chamfer distance, 3 per voxel) */
     if (soft_on) {
-        uint8_t *etab = big + 4 * p3;
         for (int d = 0; d <= dcut; d++) { float df = fmaxf(0,d / 3.f-shift); int t = (int)(254.f * expf(-0.5f * df * df / (sigma * sigma)) + 0.5f); etab[d] = (uint8_t)(t > 254 ? 254 : t); }
         if (use8) for (int d = dcut + 1; d < 256; d++) etab[d] = 0;   /* indexed by the saturated distance */
-        for (int ch = 0; ch < NCH; ch++) {
-            if (!w[ch] || s->tgt_prob[ch]) continue;
-            uint8_t *dst = ttmp + (size_t)ch * p3;
-            CHAMFER_FOR(ch);
-            if (!dm_any) continue;   /* no surface in the patch: nothing to soften */
+    }
+    if (dist_on) {
+        for (int d = 0; d <= dcut2; d++) { float df = d / 3.f; int t = (int)(254.f * expf(-0.5f * df * df / (dsig * dsig)) + 0.5f); dtab[d] = (uint8_t)(t > 254 ? 254 : t); }
+        if (use8) for (int d = dcut2 + 1; d < 256; d++) dtab[d] = 0;
+    }
+    /* per channel, all from that channel's hard labels (one distance map, computed before any of these modify the channel):
+       --shell: background within R voxels of a label ignored (labels a voxel or two off the sheet); the soft ridge; the trust band
+       (partial annotations: background trusted only within R voxels of a label, the rest ignored) */
+    const int need_dm = soft_on || trust_r > 0 || shell_r > 0 || dist_on;
+    for (int ch = 0; need_dm && ch < NCH; ch++) {
+        if (dist_on && ch == 1) continue;   /* filled from channel 0 */
+        if (!w[ch] || s->tgt_prob[ch]) continue;
+        uint8_t *dst = ttmp + (size_t)ch * p3, *dd = dist_on && ch == 0 ? ttmp + p3 : nullptr;
+        CHAMFER_FOR(ch);
+        if (dd) {
+            if (!dm_any) memset(dd, 0, p3);
+            else if (use8) for (size_t k = 0; k < p3; k++) dd[k] = dst[k] == 255 ? 255 : dtab[dm8[k]];
+            else for (size_t k = 0; k < p3; k++) dd[k] = dst[k] == 255 ? 255 : dm[k] <= dcut2 ? dtab[dm[k]] : 0;
+            w[1] = 1;
+        }
+        if (dm_any && shell_r > 0) {
+            const int sr = 3 * shell_r;
+            if (use8) for (size_t k = 0; k < p3; k++) dst[k] = dst[k] == 0 && dm8[k] <= sr ? 255 : dst[k];
+            else for (size_t k = 0; k < p3; k++) dst[k] = dst[k] == 0 && dm[k] <= sr ? 255 : dst[k];
+        }
+        if (dm_any && soft_on) {
             if (use8) for (size_t k = 0; k < p3; k++) dst[k] = dst[k] == 0 ? etab[dm8[k]] : dst[k];
             else for (size_t k = 0; k < p3; k++) if (dst[k] == 0 && dm[k] <= dcut) { uint8_t t = etab[dm[k]]; if (t) dst[k] = t; }
         }
-    }
-    PROF_MARK(PS_SOFT);
-    /* partial annotations: trust background only within R voxels of an annotated surface, ignore the rest */
-    if (trust_r > 0) {
-        const int R = trust_r;
-        for (int ch = 0; ch < NCH; ch++) {
-            if (!w[ch] || s->tgt_prob[ch]) continue;
-            uint8_t *dst = ttmp + (size_t)ch * p3;
-            CHAMFER_FOR(ch);   /* measured from the hard surface (the soft values added above are not surface) */
-            if (!dm_any) { for (size_t k = 0; k < p3; k++) if (dst[k] == 0) dst[k] = 255; continue; }   /* nothing annotated: ignore all background */
-            const int tr = 3 * R;
-            if (use8) for (size_t k = 0; k < p3; k++) dst[k] = dst[k] == 0 && dm8[k] > tr ? 255 : dst[k];
-            else for (size_t k = 0; k < p3; k++) dst[k] = dst[k] == 0 && dm[k] > tr ? 255 : dst[k];
+        if (trust_r > 0) {
+            for (int pass = 0; pass < 1 + (dd != nullptr); pass++) {   /* the distance channel takes channel 0's trust band */
+                uint8_t *t = pass ? dd : dst;
+                if (!dm_any) { for (size_t k = 0; k < p3; k++) if (t[k] == 0) t[k] = 255; continue; }   /* nothing annotated: ignore all background */
+                const int tr = 3 * trust_r;
+                if (use8) for (size_t k = 0; k < p3; k++) t[k] = t[k] == 0 && dm8[k] > tr ? 255 : t[k];
+                else for (size_t k = 0; k < p3; k++) t[k] = t[k] == 0 && dm[k] > tr ? 255 : t[k];
+            }
         }
     }
+    PROF_MARK(PS_SOFT);
     /* label encoding -> target probability * 255 and the ignore mask (255 = ignore) */
     PROF_MARK(PS_TRUST);
     uint8_t *ign = big + 9 * p3;

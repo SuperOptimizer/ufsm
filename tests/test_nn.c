@@ -202,6 +202,7 @@ static void test_concat(void) {
 
 /* ---- loss ---- */
 typedef struct { shape5 s; uint8_t *t, *m, *w; float *dl, *dg, *scr; uint8_t *dt, *dm, *dw; } loss_ctx;
+static double g_rec;   /* the --recall weight of the reference (nn_set_recall on the GPU side) */
 static double cpu_loss(const float *l, const loss_ctx *c) {
     size_t S = shape_spatial(c->s); int C = c->s.c; double tot = 0; int active = 0;
     for (int nc = 0; nc < c->s.n * C; nc++) {
@@ -215,7 +216,7 @@ static double cpu_loss(const float *l, const loss_ctx *c) {
         }
         if (nm < 1) continue;
         active++;
-        tot += bce / nm + 0.5 * (1 - (2 * sp + 1) / (ss + spp + 1));
+        tot += bce / nm + 0.5 * (1 - (2 * sp + 1) / (ss + spp + 1)) + (nc % C == 0 ? g_rec * (1 - (sp + 1) / (spp + 1)) : 0);
     }
     return active ? tot / active : 0;
 }
@@ -260,6 +261,17 @@ static void test_loss(void) {
     }
     printf("  weighted mask: grad fd rel err %.3g\n", worst);
     CHECK(worst < 2e-3, "weighted loss grad");
+    /* --recall: the recto channel's soft-recall term (gradient only; the reported loss excludes it) */
+    g_rec = 0.7; nn_set_recall(0.7f);
+    nn_loss(c.dl, c.dt, c.dm, c.dw, s, 0.5f, c.dg, out, c.scr);
+    host(g, c.dg, n); worst = 0; scale = maxabs(g, n);
+    for (size_t i = 0; i < n; i++) {
+        float o = l[i]; l[i] = o + 1e-3f; double lp = cpu_loss(l, &c); l[i] = o - 1e-3f; double lm = cpu_loss(l, &c); l[i] = o;
+        double fd = (lp - lm) / 2e-3, err = fabs(fd - g[i]) / (scale + 1e-9); if (err > worst) worst = err;
+    }
+    printf("  recall term: grad fd rel err %.3g\n", worst);
+    CHECK(worst < 2e-3, "recall loss grad");
+    g_rec = 0; nn_set_recall(0.f);
 }
 
 /* fp16 logits (unet lean 2: the logit gradient beside them in the gradient buffer): the losses read them through

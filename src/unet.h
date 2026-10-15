@@ -159,6 +159,8 @@ int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp1
    gradient and unet_head_bwd_z per slab (first: the first slab). Takes effect at the next build; MX activations and 16-bit gradients
    (the fused head backward); -1 from the slab calls: not covered */
 void unet_set_head_ext(unet *u, int on);
+void unet_set_wd_nonconv(unet *u, float mul);   /* weight decay multiplier for GroupNorm / biases / head under Muon and ANVIL (default 0) */
+void unet_blend_ema(unet *u, float a);          /* EMA weights := a x live + (1 - a) x EMA (inference: the tail-average blend) */
 void unet_set_head_cb(unet *u, void (*cb)(void *), void *ctx);
 int unet_head_fwd_z(unet *u, int z0, int z1, void *y16);
 int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first);

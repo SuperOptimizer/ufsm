@@ -49,6 +49,10 @@ typedef struct {
     float phase_near_um;     /* > 0 (stored phase, side 2): the phase target only within this distance (um) of a labelled wrap voxel
                                 (target channel 0): the stored phase interpolates between published wraps, and across a missing wrap
                                 the interpolated phase is off by up to half a turn */
+    int shell;               /* > 0: background within this many level-0 voxels of a hard label is ignored (labels a voxel or two off the
+                                sheet are not answered with "background" right beside them); before the soft ridge and the trust band */
+    float dist_sigma;        /* > 0: target channel 1 = 254 exp(-(d / sigma)^2 / 2), d the distance to channel 0's hard labels (level-0 voxels,
+                                um with soft_um): a wide distance ridge trained beside the sharp recto (task surface, no channel-1 teacher) */
     int side, side_air;      /* side: 1 fills batch.side (band.h SIDE_*: recto / verso side of the nearest labelled recto) from the same band
                                 field, 2 fills it with the winding phase (band.h PHASE_*); voxels with CT <= side_air (and CT 0) are unknown */
     int aux;                 /* 1: a fifth input channel from the source's aux volume (src/sources.h), symmetry applied like the CT;

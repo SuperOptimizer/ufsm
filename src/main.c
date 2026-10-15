@@ -1934,12 +1934,16 @@ static int png_write_rgb(const char *path, int w, int h, const uint8_t *rgb) {
    its ufsm.origin_zyx): void (0 inside the scroll) tinted blue, ignored (128) yellow, papyrus left grey. Panels left to right in
    --labels order after the plain CT, 4 white pixels apart; --zoom N repeats pixels. */
 static int cmd_overlay(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w [--labels G1,G2,..] [--um 2.4] [--zoom 1] [--cache DIR]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w [--labels G1,G2,..] [--prob G1,G2,..] [--um 2.4] [--zoom 1] [--cache DIR]\n"
+                                  "  --labels: papyrus label groups (void blue, ignored yellow); --prob: uint8 probability groups (predict output, binary\n"
+                                  "  labels), red with alpha p / 255; each group's level is named by --um, its origin_zyx attribute places it\n"); return 2; }
     long long pz[5]; if (sscanf(opt(argc, argv, "--plane", ""), "%lld,%lld,%lld,%lld,%lld", pz, pz + 1, pz + 2, pz + 3, pz + 4) != 5 || pz[3] < 1 || pz[4] < 1) { fprintf(stderr, "overlay: --plane z,y,x,h,w\n"); return 2; }
     const int H = (int)pz[3], W = (int)pz[4], Z = atoi(opt(argc, argv, "--zoom", "1")) < 1 ? 1 : atoi(opt(argc, argv, "--zoom", "1"));
     char lv[32]; z3w_level_name(atof(opt(argc, argv, "--um", "2.4")), lv, sizeof lv);
     char lab[4096]; snprintf(lab, sizeof lab, "%s", opt(argc, argv, "--labels", "")); const char *names[16]; int nl = 0;
     for (char *s = lab, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
+    char prb[4096]; snprintf(prb, sizeof prb, "%s", opt(argc, argv, "--prob", "")); const int nlab = nl;   /* panels [0, nlab) labels, then probabilities */
+    for (char *s = prb, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
     const size_t n2 = (size_t)H * W; uint8_t *ct = malloc(n2), *lb = malloc(n2 * (nl ? nl : 1));
     z3 *cz = z3_open(store_open(argv[3]), argv[4], opt(argc, argv, "--cache", nullptr)); if (!cz || !ct || !lb) { fprintf(stderr, "overlay: %s\n", z3_error()); return 1; }
     const int64_t o[3] = {pz[0], pz[1], pz[2]}, n[3] = {1, H, W};
@@ -1957,7 +1961,9 @@ static int cmd_overlay(int argc, char **argv) {
     memset(img, 255, (size_t)OW * OH * 3);
     for (int p = 0; p <= nl; p++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
         const uint8_t g = ct[(size_t)y * W + x]; int r = g, gg = g, b = g;
-        if (p) { const uint8_t v = lb[n2 * (p - 1) + (size_t)y * W + x];
+        if (p && p - 1 >= nlab) { const int a = lb[n2 * (p - 1) + (size_t)y * W + x];   /* probability: red over the CT */
+                 r = (g * (255 - a) + 255 * a) / 255; gg = (g * (255 - a) + 30 * a) / 255; b = (g * (255 - a) + 20 * a) / 255; }
+        else if (p) { const uint8_t v = lb[n2 * (p - 1) + (size_t)y * W + x];
                  if (g && v == 0) { r = g / 2; gg = g / 2 + 30; b = g / 2 + 120; } else if (v == 128) { r = g / 2 + 120; gg = g / 2 + 100; b = g / 2; } }
         for (int dy = 0; dy < Z; dy++) for (int dx = 0; dx < Z; dx++) {
             uint8_t *px = img + (((size_t)y * Z + dy) * OW + (size_t)p * (W * Z + gap) + (size_t)x * Z + dx) * 3;
@@ -2097,6 +2103,8 @@ static int cmd_sample(int argc, char **argv) {
     cfg.seed = (uint64_t)atoll(opt(argc, argv, "--seed", "0"));
     cfg.nworkers = atoi(opt(argc, argv, "--workers", "4"));
     cfg.augment = !flag(argc, argv, "--noaug");
+    cfg.shell = atoi(opt(argc, argv, "--shell", "0"));
+    cfg.dist_sigma = (float)atof(opt(argc, argv, "--dist-head", "0"));
     int nb = atoi(opt(argc, argv, "--n", "4"));
     const char *out = opt(argc, argv, "--out", ".");
     sources *S = sources_load(path);

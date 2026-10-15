@@ -24,13 +24,13 @@ static void check(const char *name, const float *got, const float *want, size_t 
     int ok = finite && worst <= tol;
     printf("  %-36s max error %.3g %s\n", name, worst, ok ? "ok" : "FAIL"); failures += !ok;
 }
-static void mixed_case(const unet_cfg *cfg, int algorithm, int stale) {
-    unet *u = unet_create(cfg); unet_init(u, 19);
+static void mixed_case(const unet_cfg *cfg, int algorithm, int stale, float wd_nonconv) {
+    unet *u = unet_create(cfg); unet_init(u, 19); unet_set_wd_nonconv(u, wd_nonconv);   /* 1: the old decay of norms / biases / head; 0: the default (none) */
     size_t n = u->np; float *before = malloc(n * 4), *want = calloc(n, 4), *got = malloc(n * 4), *mom = calloc(n, 4);
     unsigned char *owner = owners(u);
     nn_d2h(before, u->p, n * 4);
     const float lm = stale ? 0.f : 0.03f, la = 0.007f, wd = stale ? 0.f : 0.2f;
-    for (size_t i = 0; i < n; i++) { want[i] = before[i] * (1.f - (owner[i] ? lm : la) * wd); mom[i] = stale && owner[i] ? 0.1f : 0.f; }
+    for (size_t i = 0; i < n; i++) { want[i] = before[i] * (1.f - (owner[i] ? lm : la * wd_nonconv) * wd); mom[i] = stale && owner[i] ? 0.1f : 0.f; }
     nn_h2d(u->m, mom, n * 4);
     for (size_t i = 0; i < n; i++) got[i] = stale && owner[i] ? 0.02f : 0.f;
     nn_h2d(u->v, got, n * 4); unet_zero_grad(u);
@@ -39,7 +39,7 @@ static void mixed_case(const unet_cfg *cfg, int algorithm, int stale) {
         if (algorithm) setenv("UFSM_MUON_UNBATCHED", "1", 1); else unsetenv("UFSM_MUON_UNBATCHED");
         unet_muon(u, lm, 0.95f, la, 0.9f, 0.999f, 1e-8f, wd, 1);
     }
-    nn_d2h(got, u->p, n * 4); check(stale ? "stale Adam conv moments ignored" : "decay applied by one owner", got, want, n, 2e-7);
+    nn_d2h(got, u->p, n * 4); check(stale ? "stale Adam conv moments ignored" : wd_nonconv > 0.f ? "decay applied by one owner" : "no decay on norms / biases / head", got, want, n, 2e-7);
     nn_d2h(got, u->m, n * 4); check("conv Adam moments unchanged", got, mom, n, 1e-8);
     free(owner); free(before); free(want); free(got); free(mom); unet_free(u);
 }
@@ -96,7 +96,7 @@ int main(void) {
     for (int c = 0; c < 3; c++) for (int dn = 0; dn <= 1; dn++) {
         unet_cfg cfg = {levels[c], {4, 8, 12, 16}, 4, 2, 2, dn};
         printf("optimizer owners: levels %d down_norm %d\n", cfg.nlev, dn);
-        for (int algorithm = 0; algorithm < 3; algorithm++) for (int stale = 0; stale <= 1; stale++) mixed_case(&cfg, algorithm, stale);
+        for (int algorithm = 0; algorithm < 3; algorithm++) for (int stale = 0; stale <= 1; stale++) for (int wn = 0; wn <= 1; wn++) mixed_case(&cfg, algorithm, stale, (float)wn);
         packed_case(&cfg, 8); packed_case(&cfg, 4);
     }
     unsetenv("UFSM_MUON_UNBATCHED"); input_case(8); input_case(4);

@@ -148,6 +148,8 @@ struct unet {
     int logits_h16;                          /* lean 2: fp16 logits, so the 16-bit logit gradient fits after them in A */
     int lh16_req;                            /* unet_set_fp16_logits: fp16 logits where the MX head writes them into their own buffer */
     int head_ext;                            /* unet_set_head_ext: training runs the head per z-slab outside (no whole-window logits) */
+    float wd_nonconv;                        /* unet_set_wd_nonconv: weight decay multiplier for the non-3^3 parameters (GroupNorm, biases,
+                                                the head) under Muon / ANVIL; 0 (default): only the conv weights decay */
     void (*head_cb)(void *); void *head_ctx; /* ... and its backward at the head's step (unet_head_fwd_z / unet_head_bwd_z per slab) */
     float *rc_extra; size_t rc_extra_bytes;  /* training transient for the upsampled decoder input when B is too small */
     int head_c0, head_nc;                    /* inference builds: only logit channels [c0, c0 + nc) (nc 0: all) */
@@ -1036,6 +1038,7 @@ void unet_set_fp16_logits(unet *u, int on) {   /* takes effect at the next build
     if (u->built && !u->train) free_acts(u);
     u->lh16_req = !!on;
 }
+void unet_set_wd_nonconv(unet *u, float mul) { u->wd_nonconv = mul; }
 void unet_set_head_ext(unet *u, int on) {   /* takes effect at the next build */
     if (u->head_ext == !!on) return;
     if (u->built) free_acts(u);
@@ -1500,7 +1503,8 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         cur = u->dec[i].s2;
     }
     nn_set_layer(3 * L - 2);
-    if (!(train && u->head_ext)) {   /* (head slabs: the trainer runs the head per z-slab, unet_head_fwd_z) */
+    if (!(u->head_ext && !u->logits)) {   /* (head slabs: the trainer runs the head per z-slab, unet_head_fwd_z; a training build has no
+                                            whole-window logits, so its validation forwards (train 0, no rebuild) skip the head too) */
         if (u->lg_t1) nn_set_storage(u->logits, u->lg_bytes, 0);   /* plain fp32 plane-major logits over dec[0].a1 (or the level-1 buffer) */
         nn_set_head_out_h16(u->logits_h16);
         const int hc0 = !u->train && u->head_nc ? u->head_c0 : 0, hnc = !u->train && u->head_nc ? u->head_nc : u->cfg.cout;   /* rows of the 1^3 head */
@@ -1866,7 +1870,7 @@ static void plain_adamw(unet *u, size_t off, size_t n, void *arg) {
     nn_adamw(u->p + off, u->g + off, u->m + off, u->v + off, n, a->lr, a->b1, a->b2, a->eps, a->wd, a->step);
 }
 static void adamw_nonconv(unet *u, float lr, float b1, float b2, float eps, float wd, int step) {
-    adam_arg a = {lr, b1, b2, eps, wd, step}; plain_ranges(u, plain_adamw, &a);
+    adam_arg a = {lr, b1, b2, eps, wd * u->wd_nonconv, step}; plain_ranges(u, plain_adamw, &a);   /* GroupNorm gains decay toward 0, not 1 */
 }
 static void plain_ema(unet *u, size_t off, size_t n, void *arg) { nn_ema(u->ema + off, u->p + off, n, *(float *)arg); }
 /* Muon for the 3^3 conv weights (viewed as [Co][Ci * 27]); biases, GroupNorm parameters and the head stay on AdamW.
@@ -2017,6 +2021,7 @@ void unet_gn_freeze(unet *u, const float *h) {
     u->gn_frz = malloc(u->gn_frz_n * 4);
     memcpy(u->gn_frz, h, u->gn_frz_n * 4);
 }
+void unet_blend_ema(unet *u, float a) { nn_scale(u->ema, 1.f - a, u->np); nn_axpy(u->ema, a, u->p, u->np); nn_wmemo_clear(); }
 void unet_use_ema(unet *u, int on) { nn_wmemo_clear(); u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
 /* ---- 2:4 structured sparsity: the forward reads a masked copy of the live weights; SR-STE keeps the master weights dense ---- */
 static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg) {

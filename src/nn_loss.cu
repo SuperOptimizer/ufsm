@@ -58,6 +58,8 @@ __global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, floa
     fin[2 * C + 1] = active ? 1.f / active : 0.f;
 }
 int g_loss_g16 = 0;
+static float g_recall = 0.f;   /* --recall weight (recto channel): 1 - (sum s p + 1) / (sum p + 1), a skeleton-recall term for thin labels */
+extern "C" void nn_set_recall(float w) { g_recall = w < 0.f ? 0.f : w; }
 extern "C" void nn_set_loss_grad_h16(int on) { g_loss_g16 = on; }
 extern "C" size_t nn_loss_scratch(shape5 s) { return ((size_t)5 * s.n * s.c + 2 * s.c + 2) * sizeof(float); }
 extern "C" void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch) {
@@ -94,13 +96,13 @@ extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const u
         size_t n = shape_numel(s);
         if (g_logits_h16) {
             const f16 *l16 = (const f16 *)logits;
-            if (!g_loss_g16) loss_grad_k<float, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w);
-            else if (g_h16) loss_grad_k<f16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w);
-            else loss_grad_k<bf16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w);
+            if (!g_loss_g16) loss_grad_k<float, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall);
+            else if (g_h16) loss_grad_k<f16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
+            else loss_grad_k<bf16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
         } else
-        if (!g_loss_g16) loss_grad_k<float><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w);
-        else if (g_h16) loss_grad_k<f16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w);
-        else loss_grad_k<bf16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w);
+        if (!g_loss_g16) loss_grad_k<float><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall);
+        else if (g_h16) loss_grad_k<f16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
+        else loss_grad_k<bf16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
     }
     KCHECK();
 }
@@ -126,12 +128,12 @@ extern "C" void nn_loss_grad_only(const void *logits, const uint8_t *t, const ui
     const float *fin = scratch + (size_t)5 * s.n * s.c;
     if (g_logits_h16) {
         const f16 *l16 = (const f16 *)logits;
-        if (!g_loss_g16) loss_grad_k<float, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w);
-        else if (g_h16) loss_grad_k<f16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w);
-        else loss_grad_k<bf16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w);
-    } else if (!g_loss_g16) loss_grad_k<float><<<nblk(n, 256), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w);
-    else if (g_h16) loss_grad_k<f16><<<nblk(n, 256), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w);
-    else loss_grad_k<bf16><<<nblk(n, 256), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w);
+        if (!g_loss_g16) loss_grad_k<float, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall);
+        else if (g_h16) loss_grad_k<f16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
+        else loss_grad_k<bf16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
+    } else if (!g_loss_g16) loss_grad_k<float><<<nblk(n, 256), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall);
+    else if (g_h16) loss_grad_k<f16><<<nblk(n, 256), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
+    else loss_grad_k<bf16><<<nblk(n, 256), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
     KCHECK();
 }
 /* ---- count loss (train --count-lambda): turns along sheet-normal segments ----

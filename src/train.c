@@ -418,8 +418,13 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         if (prof) nn_prof_end();
         return;
     }
+    if (d->gl_inplace && train && !unet_logits_h16(d->u)) {   /* this layout kept fp32 logits (non-lean or narrow nets): a separate gradient */
+        d->gl_inplace = 0;
+        if (!d->gl) d->gl = nn_malloc((size_t)B * g_cout * xs.d * P * P * (g_g16 ? 2 : 4));
+        fprintf(stderr, "logit gradient: fp32 logits in this layout, separate gradient buffer\n");
+    }
     if (d->gl_inplace && train) {   /* the losses write each element's gradient over its own logit (read first) */
-        if (!unet_logits_h16(d->u) || !g_g16) { fprintf(stderr, "in-place logit gradient: the logits are not fp16 (UFSM_GL_SEPARATE=1)\n"); abort(); }
+        if (!g_g16) { fprintf(stderr, "in-place logit gradient: the gradient is not 16-bit (UFSM_GL_SEPARATE=1)\n"); abort(); }
         d->gl = (float *)lg;
     }
     if (d->lean && train && !d->gl_inplace) {   /* the logit gradient lives in the model's gradient buffer B (built by the forward above) */
@@ -578,6 +583,9 @@ int cmd_train(int argc, char **argv) {
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--cover-next-pass 1] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
+                        "       [--lr-floor 0 (the schedule ends at this fraction of the peak; modded-nanogpt 0.3)] [--wd-nonconv 0 (decay multiplier for GroupNorm, biases, head under Muon / ANVIL)]\n"
+                        "       [--recall W (recto: + W (1 - soft recall), gradient only)]\n"
+                        "       [--shell R (level-0 voxels: background beside a label ignored)] [--dist-head SIGMA (channel 1 = distance ridge of channel 0)]\n"
                         "       [--geometry-aug 0|1] [--rotate-deg 5] [--rotate-p 0.2] [--elastic 1] [--elastic-p 0.15] [--label-morph 0] [--label-morph-p 0.2]\n"
                         "       [--aug-strength 1 (0..2)] [--aug-p 0 (default p of every scanner op)] [--aug-OP-p P] [--aug-drop-ignore 1] [--aug-affine-p 0] [--aug-aniso 0.1] [--aug-shear 0.06]\n"
                         "         scanner ops (source grid, z = scan axis): seam air lowres blur sharpen bias ring cupping slice noise cnoise tone quant dropslice cutout chunk\n"
@@ -751,6 +759,8 @@ int cmd_train(int argc, char **argv) {
     }
     if (schedule_start < 0) { fprintf(stderr, "schedule-start must be nonnegative\n"); return 2; }
     float cooldown = (float)atof(opt(argc, argv, "--cooldown", "0.2"));
+    const float lr_floor = (float)atof(opt(argc, argv, "--lr-floor", "0"));   /* the schedule ends at this fraction of the peak lr (modded-nanogpt: 0.3) */
+    if (!(lr_floor >= 0.f && lr_floor < 1.f)) { fprintf(stderr, "--lr-floor: 0 <= F < 1\n"); return 2; }
     int qat = atoi(opt(argc, argv, "--qat", "0"));
     /* Save the requested policy and the compute paths observed after dispatch, alongside storage modes. */
 #define WRITE_MANIFEST(path) do { \
@@ -862,6 +872,9 @@ int cmd_train(int argc, char **argv) {
     sc.aux = g_xc == 5; sc.cond = g_cond; sc.cond_outside = g_cond_outside; sc.pap_head = g_pap_head ? &g_paph : nullptr;
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
     sc.papyrus = g_papyrus ? &g_pap : nullptr;
+    sc.shell = atoi(opt(argc, argv, "--shell", "0"));   /* background within R level-0 voxels of a label ignored */
+    sc.dist_sigma = (float)atof(opt(argc, argv, "--dist-head", "0"));   /* channel 1: a distance ridge of channel 0 (sigma, --soft-unit) */
+    if (sc.shell < 0 || sc.shell > 84 || !(sc.dist_sigma >= 0.f)) { fprintf(stderr, "--shell 0..84, --dist-head >= 0\n"); return 2; }
     sc.phase_dense = atoi(opt(argc, argv, "--phase-dense", "0"));   /* side 2: weigh windings closer than this (label voxels) up */
     if (sc.phase_dense && g_side != 2) { fprintf(stderr, "--phase-dense needs --side 2\n"); return 2; }
     if (sc.phase_dense) fprintf(stderr, "phase: windings wider than %d label voxels supervised at a rate dense / spacing\n", sc.phase_dense);
@@ -951,6 +964,7 @@ int cmd_train(int argc, char **argv) {
     sc.dilate = atoi(opt(argc, argv, "--dilate", "0"));   /* thicken surface targets by D level-0 voxels (curriculum) */
     sc.erode = atoi(opt(argc, argv, "--erode", "0"));
     nn_set_loss_tol(atoi(opt(argc, argv, "--tol", "0")));   /* offset-tolerant positives, radius in output voxels (<= 2) */
+    nn_set_recall((float)atof(opt(argc, argv, "--recall", "0")));   /* skeleton-recall term on the recto (thin labels: the label is its skeleton) */
     if (sc.erode < 0 || sc.erode > 1 || (sc.erode && (sc.dilate || g_sheet))) {
         fprintf(stderr, "--erode requires 0 or 1, no --dilate and no winding task\n"); return 2;
     }
@@ -981,6 +995,7 @@ int cmd_train(int argc, char **argv) {
         d->dev = devs[g]; d->side = split ? g : -1;
         if (nn_init(d->dev)) { fprintf(stderr, "cannot select GPU %d\n", d->dev); return 1; }
         d->u = unet_create(&cfg);
+        unet_set_wd_nonconv(d->u, (float)atof(opt(argc, argv, "--wd-nonconv", "0")));   /* Muon / ANVIL: no decay on GroupNorm, biases, head */
         /* fp16 logits in their own buffer (MX activations; the losses read them as unet_logits_h16 says): 11 unwrap heads at P 384
            are 2.5 GB in fp32. Not for half-resolution nets (the losses read the fp32 upsampled copy) or sheet nets; UFSM_LOGITS32=1 */
         unet_set_fp16_logits(d->u, !g_half && !g_sheet && !ufsm_env_on("UFSM_LOGITS32"));
@@ -1381,6 +1396,11 @@ int cmd_train(int argc, char **argv) {
     if (validation_failed) { fprintf(stderr, "validation sampler failed\n"); return 1; }
     fprintf(stderr, "%d validation batches\n", nval);
 
+    if (!sc.cover && step0 > 0) {   /* resumed: a fresh sample stream (the per-sample seeds count from batch 0 at every sampler start, so a
+                                       resume under --det replayed the windows and augmentations of steps 1, 2, ...); validation keeps its seed */
+        sc.seed = seed + 0x9E3779B97F4A7C15ull * (uint64_t)step0;
+        fprintf(stderr, "resumed at step %d: training sample stream reseeded\n", step0);
+    }
     sampler *sp = sampler_start(S, &sc);
     if (!sp) return 1;
     char logp[1400]; snprintf(logp, sizeof logp, "%s/log.csv", out);
@@ -1527,14 +1547,14 @@ int cmd_train(int argc, char **argv) {
             if (elapsed < warmup_seconds) lr = lr0 * (float)(elapsed / warmup_seconds);
             else if (!strcmp(sched, "wsd")) {
                 double cd0 = time_horizon * (1.0 - cooldown);
-                lr = elapsed < cd0 ? lr0 : lr0 * (float)((time_horizon - elapsed) / (time_horizon - cd0));
-            } else lr = lr0 * 0.5f * (1.f + cosf(3.14159265f * (float)((elapsed - warmup_seconds) / (time_horizon - warmup_seconds))));
+                lr = elapsed < cd0 ? lr0 : lr0 * (lr_floor + (1.f - lr_floor) * (float)((time_horizon - elapsed) / (time_horizon - cd0)));
+            } else lr = lr0 * (lr_floor + (1.f - lr_floor) * 0.5f * (1.f + cosf(3.14159265f * (float)((elapsed - warmup_seconds) / (time_horizon - warmup_seconds)))));
         }
         else {
             int ss = step - schedule_start, total = steps - schedule_start;
             if (ss <= warmup) lr = lr0 * (float)ss / warmup;
-            else if (!strcmp(sched, "wsd")) { int cd0 = (int)(total * (1.f - cooldown)); lr = ss < cd0 ? lr0 : lr0 * (float)(total - ss) / (float)(total - cd0); }
-            else lr = lr0 * 0.5f * (1.f + cosf(3.14159265f * (float)(ss - warmup) / (float)(total - warmup)));
+            else if (!strcmp(sched, "wsd")) { int cd0 = (int)(total * (1.f - cooldown)); lr = ss < cd0 ? lr0 : lr0 * (lr_floor + (1.f - lr_floor) * (float)(total - ss) / (float)(total - cd0 > 0 ? total - cd0 : 1)); }
+            else lr = lr0 * (lr_floor + (1.f - lr_floor) * 0.5f * (1.f + cosf(3.14159265f * (float)(ss - warmup) / (float)(total - warmup))));
         }
         if (soft_end != sc.soft) sampler_set_soft(sp, sc.soft + (soft_end - sc.soft) * (step < steps ? (float)step / (float)steps : 1.f));
         double gn = 0;

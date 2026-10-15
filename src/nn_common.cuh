@@ -2171,7 +2171,7 @@ __global__ void loss_d2f_k(const double *d, float *f, int n);
    layout of fin[]: [0..C) bce, [C..2C) dice, [2C] active, [2C+1] inv_active */
 __global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, float *fin);
 template <typename GT, typename LT = float> __global__ void loss_grad_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N, int C, size_t S, const float *st,
-                            float dice_w, const float *fin, GT *gl, float pw, float gscale, int tol, const uint8_t *code, int D, int H, int W) {
+                            float dice_w, const float *fin, GT *gl, float pw, float gscale, int tol, const uint8_t *code, int D, int H, int W, float rec_w = 0.f) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)N * C * S) return;
     int nc = (int)(i / S), n = nc / C;
@@ -2199,6 +2199,7 @@ template <typename GT, typename LT = float> __global__ void loss_grad_k(const LT
     float g = mw * ((1.f - p) * s - pw * pq * (1.f - s)) / fmaxf(nm, 1.f);
     float ddice_ds = -(2.f * p * den - (2.f * Ssp + 1.f)) / (den * den);   /* dice on the voxel's own value */
     g += dice_w * ddice_ds * s * (1.f - s);
+    if (rec_w > 0.f && nc % C == 0) g -= rec_w * p / (Sp + 1.f) * s * (1.f - s);   /* --recall: 1 - (sum s p + 1) / (sum p + 1) on the recto */
     gl[i] = f2h<GT>(g * fin[2 * C + 1] * gscale);
 }
 extern int g_loss_g16;
