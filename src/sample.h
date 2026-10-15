@@ -49,6 +49,12 @@ typedef struct {
     float phase_near_um;     /* > 0 (stored phase, side 2): the phase target only within this distance (um) of a labelled wrap voxel
                                 (target channel 0): the stored phase interpolates between published wraps, and across a missing wrap
                                 the interpolated phase is off by up to half a turn */
+    int iso_lo, iso_hi;      /* iso_hi > 0 (augment): with probability iso_p a papyrus cutoff T uniform in [iso_lo, iso_hi] and a radius R uniform
+                                in [iso_rlo, iso_rhi] level voxels (0, 0: the source's trust distance) per sample; labels farther than R from
+                                clean CT >= T (lifted off the sheets into the void) become ignored. The input is untouched: void (0 < CT < T) stays
+                                data and trains as background near labels; masked voxels (CT 0) are ignored as always */
+    int iso_rlo, iso_rhi;
+    float iso_p;
     int side, side_air;      /* side: 1 fills batch.side (band.h SIDE_*: recto / verso side of the nearest labelled recto) from the same band
                                 field, 2 fills it with the winding phase (band.h PHASE_*); voxels with CT <= side_air (and CT 0) are unknown */
     int aux;                 /* 1: a fifth input channel from the source's aux volume (src/sources.h), symmetry applied like the CT;
@@ -78,6 +84,7 @@ typedef struct {
     int8_t *level;           /* B: CT level */
     float *um;               /* B: effective voxel size of the input (source um * 2^level * zoom) */
     int64_t (*corner)[3];    /* B: level-0 corner */
+    uint8_t (*iso)[2];       /* B: --iso-aug cutoff T and label radius R (level voxels) of the sample, 0 0 when not applied */
     sheet_batch **sheet;     /* B sparse records; null for legacy task */
     uint8_t *band;           /* B x P^3 band per voxel (src/band.h: 1/18-turn steps mod 252, 255 unknown) when cfg.band */
     uint8_t *side;           /* B x P^3 side (src/band.h SIDE_*) or winding phase (PHASE_*) per voxel when cfg.side */

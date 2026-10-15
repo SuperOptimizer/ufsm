@@ -2096,7 +2096,10 @@ static int cmd_sample(int argc, char **argv) {
     cfg.B = atoi(opt(argc, argv, "--B", "2"));
     cfg.seed = (uint64_t)atoll(opt(argc, argv, "--seed", "0"));
     cfg.nworkers = atoi(opt(argc, argv, "--workers", "4"));
-    cfg.augment = !flag(argc, argv, "--noaug");
+    cfg.augment = flag(argc, argv, "--noaug") ? 0 : atoi(opt(argc, argv, "--aug-mode", "1"));   /* 4: intensity jitter only */
+    if (sscanf(opt(argc, argv, "--iso-aug", "0,0"), "%d,%d", &cfg.iso_lo, &cfg.iso_hi) != 2) cfg.iso_lo = cfg.iso_hi = 0;
+    cfg.iso_p = (float)atof(opt(argc, argv, "--iso-aug-p", "1"));
+    if (sscanf(opt(argc, argv, "--iso-aug-r", "0,0"), "%d,%d", &cfg.iso_rlo, &cfg.iso_rhi) != 2) cfg.iso_rlo = cfg.iso_rhi = 0;
     int nb = atoi(opt(argc, argv, "--n", "4"));
     const char *out = opt(argc, argv, "--out", ".");
     sources *S = sources_load(path);
@@ -2130,8 +2133,8 @@ static int cmd_sample(int argc, char **argv) {
             char fn[1200];
             snprintf(fn, sizeof fn, "%s/patch_%02d_%d.pgm", out, bi, i);
             write_pgm(fn, img, (int64_t)cols * P, P);
-            fprintf(stderr, "%s: src %s level %d corner %lld,%lld,%lld w=[%d,%d]\n", fn, S->src[b->src[i]].name, b->level[i],
-                    (long long)b->corner[i][0], (long long)b->corner[i][1], (long long)b->corner[i][2], b->w[i * NCH], b->w[i * NCH + 1]);
+            fprintf(stderr, "%s: src %s level %d corner %lld,%lld,%lld w=[%d,%d] iso %d r %d\n", fn, S->src[b->src[i]].name, b->level[i],
+                    (long long)b->corner[i][0], (long long)b->corner[i][1], (long long)b->corner[i][2], b->w[i * NCH], b->w[i * NCH + 1], b->iso[i][0], b->iso[i][1]);
         }
         sampler_release(sp, b);
     }

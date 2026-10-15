@@ -578,6 +578,8 @@ int cmd_train(int argc, char **argv) {
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--cover-next-pass 1] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
+                        "       [--iso-aug LO,HI (0,0 off)] [--iso-aug-r LO,HI (0,0: trust distance)] [--iso-aug-p 1]   a random papyrus cutoff T and radius R per sample:\n"
+                        "                                     labels farther than R (level voxels) from CT >= T (lifted into the void) ignored; the input is untouched\n"
                         "       [--geometry-aug 0|1] [--rotate-deg 5] [--rotate-p 0.2] [--elastic 1] [--elastic-p 0.15] [--label-morph 0] [--label-morph-p 0.2]\n"
                         "       [--aug-strength 1 (0..2)] [--aug-p 0 (default p of every scanner op)] [--aug-OP-p P] [--aug-drop-ignore 1] [--aug-affine-p 0] [--aug-aniso 0.1] [--aug-shear 0.06]\n"
                         "         scanner ops (source grid, z = scan axis): seam air lowres blur sharpen bias ring cupping slice noise cnoise tone quant dropslice cutout chunk\n"
@@ -861,6 +863,13 @@ int cmd_train(int argc, char **argv) {
     if (atoi(opt(argc, argv, "--intonly", "0"))) sc.augment = 4;   /* diagnostic: intensity jitter, no symmetry */
     sc.aux = g_xc == 5; sc.cond = g_cond; sc.cond_outside = g_cond_outside; sc.pap_head = g_pap_head ? &g_paph : nullptr;
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
+    if (sscanf(opt(argc, argv, "--iso-aug", "0,0"), "%d,%d", &sc.iso_lo, &sc.iso_hi) != 2 || sc.iso_lo < 0 || sc.iso_hi > 255 || sc.iso_lo > sc.iso_hi) {
+        fprintf(stderr, "--iso-aug LO,HI: a void cutoff range in 0..255\n"); return 1;
+    }
+    sc.iso_p = (float)atof(opt(argc, argv, "--iso-aug-p", "1"));   /* per-sample probability of the cutoff */
+    if (sscanf(opt(argc, argv, "--iso-aug-r", "0,0"), "%d,%d", &sc.iso_rlo, &sc.iso_rhi) != 2 || sc.iso_rlo < 0 || sc.iso_rlo > sc.iso_rhi || sc.iso_rhi > 84) {
+        fprintf(stderr, "--iso-aug-r LO,HI: label radius range in level voxels, 0..84 (0,0: the trust distance)\n"); return 1;
+    }
     sc.papyrus = g_papyrus ? &g_pap : nullptr;
     sc.phase_dense = atoi(opt(argc, argv, "--phase-dense", "0"));   /* side 2: weigh windings closer than this (label voxels) up */
     if (sc.phase_dense && g_side != 2) { fprintf(stderr, "--phase-dense needs --side 2\n"); return 2; }
@@ -1336,6 +1345,10 @@ int cmd_train(int argc, char **argv) {
     }
     fprintf(stderr,"augmentation: mode %d, CT %d, symmetry p %.3g, axis jitter %.3g voxels (p %.3g, <= %.3g degrees), geometry %d (rotation +/-%.3g degrees p %.3g; elastic <=%.3g voxels p %.3g), soft-band dilation/erosion +/-%.3g voxels p %.3g\n",
         sc.augment,sc.ct_augment,sc.symmetry_p,sc.axis_jitter,sc.axis_jitter_p>0?sc.axis_jitter_p:.1,sc.axis_jitter_deg>0?sc.axis_jitter_deg:2,sc.geometry_augment,sc.rotate_degrees,sc.rotate_p,sc.elastic,sc.elastic_p,sc.label_morph,sc.label_morph_p);
+    if (sc.iso_hi > 0) {
+        if (sc.iso_rhi > 0) fprintf(stderr,"lifted labels: papyrus cutoff T uniform in [%d, %d], radius R in [%d, %d] voxels, p %.3g; labels farther than R from CT >= T ignored\n",sc.iso_lo,sc.iso_hi,sc.iso_rlo,sc.iso_rhi,sc.iso_p);
+        else fprintf(stderr,"lifted labels: papyrus cutoff T uniform in [%d, %d], p %.3g; labels farther than the trust distance from CT >= T ignored\n",sc.iso_lo,sc.iso_hi,sc.iso_p);
+    }
     if (schedule_seconds) {
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
         snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"time_schedule\":{\"version\":1,\"seconds\":%.9g,\"elapsed_at_launch\":%.9g,\"warmup_seconds\":%.9g,\"cooldown\":%.9g}}",
