@@ -82,12 +82,36 @@ int main(void) {
         for (int si = 0; si < 48; si++) {
             sym y = sym_of(si);
             write_x_ref(ct, P, o, 101.5, 37.25, cy, cx, y, 1.1f, -0.05f, A);
-            write_x(ct, P, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.f, &r, nrow, 0, B, nullptr);
+            write_x(ct, P, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.f, &r, nrow, 0, B, nullptr, nullptr, nullptr, nullptr);
             for (size_t k = 0; k < 4 * p3; k++) { double d = fabs((double)A[k] - B[k]); if (d > worst) worst = d; }
         }
         printf("fused input writer vs old path, 48 symmetries: max abs diff %.3g\n", worst);
         if (worst > 2e-4) { printf("fused input writer  FAIL\n"); bad++; }
         free(ct); free(A); free(B);
+    }
+    {   /* the CT appearance plan (train --ct-aug) through the row-vectorised writer vs write_x_aug: bit-identical (fp16 and fp32 output,
+           filter, shading, gamma, correlated noise; the same rng draws) for every symmetry and many plans */
+        const int P = 12; size_t p3 = (size_t)P * P * P;
+        uint8_t *ct = malloc(p3); for (size_t k = 0; k < p3; k++) ct[k] = (uint8_t)(rnext(&r) & 0xff);
+        int64_t o[3] = {1000, 2345, 3456}; float cyf[64], cxf[64], nrow[64];
+        for (int z = 0; z < P; z++) { cyf[z] = (float)(2350.25 + z * 0.3); cxf[z] = (float)(3450.75 - z * 0.2); }
+        float *A = malloc(4 * p3 * 4), *B = malloc(4 * p3 * 4), *ns1 = malloc((P + P * P) * 4), *ns2 = malloc((P + P * P) * 4);
+        uint16_t *HA = malloc(4 * p3 * 2), *HB = malloc(4 * p3 * 2);
+        size_t ndiff = 0; int plans = 0;
+        for (int pi = 0; pi < 40; pi++) {
+            ct_aug_plan ap; ct_aug_make(&ap, 0x1234567ull * (pi + 1), 1, 101.5, 37.25, P);
+            if (pi == 0) { ap.filter_mode = 1; ap.filter_strength = 0.5f; ap.shading[0] = 0.03f; ap.noise_rho = 0.4f; }   /* every stage at least once */
+            plans++;
+            for (int si = 0; si < 48; si++) for (int fmt = 0; fmt < 2; fmt++) {
+                sym y = sym_of(si); rng r1 = r, r2 = r;
+                write_x_aug(ct, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.02f, &r1, nrow, fmt, A, HA, &ap, ns1, ns1 + P, nullptr, nullptr);
+                write_x(ct, P, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.02f, &r2, nrow, fmt, B, HB, &ap, ns2, ns2 + P);
+                ndiff += fmt ? (size_t)(memcmp(HA, HB, 4 * p3 * 2) != 0) : (size_t)(memcmp(A, B, 4 * p3 * 4) != 0);
+            }
+        }
+        printf("CT appearance plan, row-vectorised writer vs write_x_aug: %zu of %d plans x 48 symmetries x 2 formats differ\n", ndiff, plans);
+        if (ndiff) { printf("CT appearance writer  FAIL\n"); bad++; }
+        free(ct); free(A); free(B); free(HA); free(HB); free(ns1); free(ns2);
     }
     { /* Scalar winding reference follows spatial augmentation without a sign flip. */
         const int P=12; size_t p3=(size_t)P*P*P; const int64_t o[3]={1000,2345,3456};

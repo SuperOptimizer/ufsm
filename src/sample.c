@@ -92,6 +92,25 @@ static int sym_is_rotation(sym y) {
         int64_t stride[3] = {(int64_t)P * P, P, 1}; const int n[3] = {D, P, P};                    \
         /* the source index is affine along x: a row is a copy, a reversed copy or a fixed-stride gather (was 3 terms per voxel) */ \
         const int64_t sx = y.flip[2] ? -stride[y.perm[2]] : stride[y.perm[2]];                     \
+        if (sx != 1 && sx != -1) {   /* x reads a strided source axis: 64 x 64 tiles over x and the output axis that is      \
+                                        contiguous in the source (one byte per cache line per row otherwise: the costliest   \
+                                        stage of a sample), the third axis outermost; the same copy, tile by tile */          \
+            int64_t sd[3], q0 = 0;                                                                \
+            for (int d = 0; d < 3; d++) { sd[d] = y.flip[d] ? -stride[y.perm[d]] : stride[y.perm[d]]; if (y.flip[d]) q0 += stride[y.perm[d]] * (n[d] - 1); } \
+            const int dc = (sd[0] == 1 || sd[0] == -1) ? 0 : 1, du = 1 - dc;   /* tiled with x; the remaining axis */      \
+            for (int u = 0; u < n[du]; u++)                                                       \
+                for (int c0 = 0; c0 < n[dc]; c0 += 64)                                            \
+                    for (int x0 = 0; x0 < P; x0 += 64) {                                          \
+                        const int c1 = c0 + 64 < n[dc] ? c0 + 64 : n[dc], x1 = x0 + 64 < P ? x0 + 64 : P; \
+                        for (int c = c0; c < c1; c++) {                                           \
+                            const int z = dc ? u : c, yy = dc ? c : u;                            \
+                            const T *src = in + q0 + sd[0] * z + sd[1] * yy;                      \
+                            T *o = out + ((int64_t)z * P + yy) * P;                               \
+                            for (int x = x0; x < x1; x++) o[x] = src[(int64_t)x * sx];            \
+                        }                                                                         \
+                    }                                                                             \
+            return;                                                                               \
+        }                                                                                         \
         for (int z = 0; z < D; z++)                                                               \
             for (int yy = 0; yy < P; yy++) {                                                      \
                 const int i[3] = {z, yy, 0};                                                      \
@@ -425,7 +444,8 @@ static void f16_row(const float *v, uint16_t *h, int n) {
    z-keeping symmetries only). */
 [[gnu::optimize("no-math-errno")]]
 static void write_x(const uint8_t *ctu, int D, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
-                    sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H) {
+                    sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H,
+                    const ct_aug_plan *ap, float *noise_row_state, float *noise_plane_state) {   /* ap: the CT appearance plan (cubes, D == P), else nullptr */
     pthread_once(&g_ntab_once, ntab_init);
     const size_t p3 = (size_t)D * P * P; const int nd[3] = {D, P, P};
     const float sgn[3] = {y.flip[0] ? -1.f : 1.f, y.flip[1] ? -1.f : 1.f, y.flip[2] ? -1.f : 1.f};
@@ -444,11 +464,13 @@ static void write_x(const uint8_t *ctu, int D, int P, const int64_t o[3], float 
             if (jitter) {
                 for (int x = 0; x + 4 <= P; x += 4) { uint64_t u = rnext(r); nrow[x] = g_ntab[u & 0xffff]; nrow[x + 1] = g_ntab[(u >> 16) & 0xffff]; nrow[x + 2] = g_ntab[(u >> 32) & 0xffff]; nrow[x + 3] = g_ntab[u >> 48]; }
                 for (int x = P & ~3; x < P; x++) nrow[x] = g_ntab[rnext(r) & 0xffff];
+                if (ap && ap->noise_rho > 0) ct_aug_noise_row(ap, nrow, noise_row_state, noise_plane_state, P, z, yy);   /* correlated noise (write_x_aug's order) */
             }
             const ptrdiff_t q0 = ((ptrdiff_t)s0[0] * P + s0[1]) * P + s0[2], qs = ((ptrdiff_t)ds[0] * P + ds[1]) * P + ds[2];
             const uint8_t *src = ctu + q0;
             float *v0 = v[0];
-            if (qs == 1) for (int x = 0; x < P; x++) v0[x] = ((float)src[x] - fmean) * fisd;
+            if (ap) for (int x = 0; x < P; x++) v0[x] = ct_aug_value(ap, ctu, P, s0[0] + ds[0] * x, s0[1] + ds[1] * x, s0[2] + ds[2] * x);   /* LUT, filter, shading */
+            else if (qs == 1) for (int x = 0; x < P; x++) v0[x] = ((float)src[x] - fmean) * fisd;
             else for (int x = 0; x < P; x++) v0[x] = ((float)src[qs * x] - fmean) * fisd;
             if (jitter) for (int x = 0; x < P; x++) v0[x] = ia * v0[x] + ib + isg * nrow[x];
             if (hasax) {
@@ -568,6 +590,24 @@ static void warp_sheet_batch(sheet_batch *b,const spatial_aug *a,const uint8_t *
    apart is kept with probability dense / spacing (a hash of its global position and seed, no RNG draws), so the loss weighs
    closely packed windings up, as upstream lasagna's density weight. */
 static uint64_t mix64(uint64_t x) { x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 27; x *= 0x94d049bb133111ebull; return x ^ (x >> 31); }
+/* per-worker pool of the per-sample window-sized scratch (draw()'s P^3 buffers, 56 MB at P 384; the band / phase / aux window
+   builders' label and read buffers, several MB each): glibc serves blocks above its mmap threshold (<= 32 MB) with mmap / munmap,
+   so every sample paid ~14k page faults per buffer under the process-wide mmap lock that all workers share. Sizes of 1 MB and
+   more are rounded up to whole MB (windows clipped at a volume edge reuse the same buffers); zero = calloc semantics over n. */
+#define TP_N 32
+static _Thread_local struct { void *b[TP_N]; size_t n[TP_N]; int k; } tpool;
+static size_t tp_class(size_t n) { return n >= ((size_t)1 << 20) ? (n + ((size_t)1 << 20) - 1) & ~(((size_t)1 << 20) - 1) : n; }
+static void *tp_get(size_t n, int zero) {
+    const size_t c = tp_class(n);
+    for (int i = 0; i < tpool.k; i++)
+        if (tpool.n[i] == c) { void *p = tpool.b[i]; tpool.b[i] = tpool.b[--tpool.k]; tpool.n[i] = tpool.n[tpool.k]; if (zero) memset(p, 0, n); return p; }
+    return zero ? calloc(c, 1) : malloc(c);
+}
+static void tp_put(void *p, size_t n) {
+    if (!p) return;
+    if (tpool.k < TP_N) { tpool.b[tpool.k] = p; tpool.n[tpool.k] = tp_class(n); tpool.k++; } else free(p);
+}
+static void tp_drain(void) { while (tpool.k) free(tpool.b[--tpool.k]); }
 static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8_t *side, int phase, int dense, uint64_t seed) {
     band_params bp = {s->band_radius, s->band_span, 0};
     const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
@@ -578,15 +618,16 @@ static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8
         ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
     }
     const size_t N = (size_t)ln[0] * ln[1] * ln[2];
-    uint8_t *codes = calloc(N, 1), *bl = malloc(N), *sl = side ? malloc(N) : nullptr, *sp = side && phase && dense > 0 ? malloc(N) : nullptr;
+    uint8_t *codes = tp_get(N, 1), *bl = tp_get(N, 0), *sl = side ? tp_get(N, 0) : nullptr, *sp = side && phase && dense > 0 ? tp_get(N, 0) : nullptr;
     double *cy = malloc(ln[0] * sizeof(double)), *cx = malloc(ln[0] * sizeof(double));
     int rc = !codes || !bl || !cy || !cx || (side && !sl) || (side && phase && dense > 0 && !sp);
     if (!rc && rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
-        uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
+        const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
+        uint8_t *tmp = tp_get(rnn, 0);
         rc = !tmp || z3_read(s->band, ro, rn, tmp, 1);
         if (!rc) for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
             memcpy(codes + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
-        free(tmp);
+        tp_put(tmp, rnn);
     }
     if (!rc) {
         for (int64_t z = 0; z < ln[0]; z++) axis_at(&s->ax, 2.0 * (z + lo[0]) + 0.5, &cy[z], &cx[z]);
@@ -608,7 +649,7 @@ static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8
             }
         }
     }
-    free(codes); free(bl); free(sl); free(sp); free(cy); free(cx);
+    tp_put(codes, N); tp_put(bl, N); tp_put(sl, N); tp_put(sp, N); free(cy); free(cx);
     return rc ? -1 : 0;
 }
 
@@ -640,15 +681,16 @@ static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shif
         ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
     }
     const size_t N = (size_t)ln[0] * ln[1] * ln[2];
-    uint8_t *ph = malloc(N); int *j0 = malloc(3 * (size_t)P * sizeof *j0); float *tf = malloc(3 * (size_t)P * sizeof *tf);
-    if (!ph || !j0 || !tf) { free(ph); free(j0); free(tf); return -1; }
+    uint8_t *ph = tp_get(N, 0); int *j0 = malloc(3 * (size_t)P * sizeof *j0); float *tf = malloc(3 * (size_t)P * sizeof *tf);
+    if (!ph || !j0 || !tf) { tp_put(ph, N); free(j0); free(tf); return -1; }
     memset(ph, PHASE_UNKNOWN, N);
     if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
-        uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
-        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { free(tmp); free(ph); free(j0); free(tf); return -1; }
+        const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
+        uint8_t *tmp = tp_get(rnn, 0);
+        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { tp_put(tmp, rnn); tp_put(ph, N); free(j0); free(tf); return -1; }
         for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
             memcpy(ph + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
-        free(tmp);
+        tp_put(tmp, rnn);
     }
     for (int d = 0; d < 3; d++) for (int k = 0; k < wn[d]; k++) {   /* per axis: the lower grid neighbour (in the read region) and the fraction */
         const double u = (o[d] + k - c0) / g; const int64_t j = (int64_t)floor(u);
@@ -671,7 +713,7 @@ static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shif
             const int q = (int)lrintf(t); dst[x] = (uint8_t)(q >= PHASE_PERIOD ? q - PHASE_PERIOD : q);
         }
     }
-    free(ph); free(j0); free(tf);
+    tp_put(ph, N); free(j0); free(tf);
     return 0;
 }
 static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint8_t *side) {   /* a: s->phase, or s->wind (same grid); D x P x P */
@@ -683,22 +725,23 @@ static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint
         ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
     }
     const size_t N = (size_t)ln[0] * ln[1] * ln[2];
-    uint8_t *ph = malloc(N);
+    uint8_t *ph = tp_get(N, 0);
     if (!ph) return -1;
     memset(ph, PHASE_UNKNOWN, N);
     if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
-        uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
-        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { free(tmp); free(ph); return -1; }
+        const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
+        uint8_t *tmp = tp_get(rnn, 0);
+        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { tp_put(tmp, rnn); tp_put(ph, N); return -1; }
         for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
             memcpy(ph + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
-        free(tmp);
+        tp_put(tmp, rnn);
     }
     for (int z = 0; z < D; z++) for (int y = 0; y < P; y++) {
         const uint8_t *row = ph + ((size_t)(((o[0] + z + shift) >> shift) - lo[0]) * ln[1] + (((o[1] + y + shift) >> shift) - lo[1])) * ln[2];
         uint8_t *dst = side + ((size_t)z * P + y) * P;
         for (int x = 0; x < P; x++) dst[x] = row[((o[2] + x + shift) >> shift) - lo[2]];
     }
-    free(ph);
+    tp_put(ph, N);
     return 0;
 }
 
@@ -706,11 +749,12 @@ static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint
 static int aux_window(source *s, const int64_t o[3], int P, uint8_t *dst) {
     const z3_meta *m = z3_meta_of(s->aux); int64_t ro[3], rn[3];
     for (int d = 0; d < 3; d++) { ro[d] = o[d] < 0 ? 0 : o[d]; const int64_t e = o[d] + P < m->shape[d] ? o[d] + P : m->shape[d]; rn[d] = e - ro[d]; if (rn[d] <= 0) return 0; }
-    uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
-    if (!tmp || z3_read(s->aux, ro, rn, tmp, 1)) { free(tmp); return -1; }
+    const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
+    uint8_t *tmp = tp_get(rnn, 0);
+    if (!tmp || z3_read(s->aux, ro, rn, tmp, 1)) { tp_put(tmp, rnn); return -1; }
     for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
         memcpy(dst + ((size_t)(z + ro[0] - o[0]) * P + (y + ro[1] - o[1])) * P + (ro[2] - o[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
-    free(tmp);
+    tp_put(tmp, rnn);
     return 0;
 }
 
@@ -801,21 +845,6 @@ static void warp_phase(const uint8_t *src, uint8_t *dst, int P, sym sy, const sp
     }
     free(table);
 }
-/* per-worker pool of draw()'s window-sized scratch (P^3 bytes, 56 MB at P 384): glibc serves blocks above its mmap threshold
-   (<= 32 MB) with mmap / munmap, so every sample paid ~14k page faults per buffer under the process-wide mmap lock that all
-   workers share. Buffers of an exact size are reused; zero = calloc semantics. */
-#define TP_N 24
-static _Thread_local struct { void *b[TP_N]; size_t n[TP_N]; int k; } tpool;
-static void *tp_get(size_t n, int zero) {
-    for (int i = 0; i < tpool.k; i++)
-        if (tpool.n[i] == n) { void *p = tpool.b[i]; tpool.b[i] = tpool.b[--tpool.k]; tpool.n[i] = tpool.n[tpool.k]; if (zero) memset(p, 0, n); return p; }
-    return zero ? calloc(n, 1) : malloc(n);
-}
-static void tp_put(void *p, size_t n) {
-    if (!p) return;
-    if (tpool.k < TP_N) { tpool.b[tpool.k] = p; tpool.n[tpool.k] = n; tpool.k++; } else free(p);
-}
-static void tp_drain(void) { while (tpool.k) free(tpool.b[--tpool.k]); }
 
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
     double pt = sp->prof ? tnow() : 0;
@@ -1147,9 +1176,10 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     }
     if (spatial.active) write_spatial(ctu,ttmp,mask,T,M,P,o,(float)mean,(float)(1.0/sd),s->ax.n>0,cyz,cxz,y,&spatial,
             ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+5*p3));
-    else if (app || c->sheet) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
+    else if (c->sheet || (app && Pz != P)) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
             X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);
-    else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H);
+    else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H,
+                 app, noise_state, noise_state ? noise_state + P : nullptr);   /* the CT appearance plan in the row-vectorised writer (cubes) */
     free(params);
     if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
         uint8_t *aw = tp_get(p3, 1), *as = tp_get(p3, 0);

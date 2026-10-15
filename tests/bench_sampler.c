@@ -33,6 +33,7 @@ int main(int argc, char **argv) {
     sample_cfg c = sample_cfg_default(); c.P = P; c.B = 2; c.nworkers = W; c.nbuf = 2 * W; c.soft = 3; c.augment = 4; c.xfmt = 1;
     if (getenv("UFSM_BENCH_TRAIN")) { c.B = 1; c.soft = 7; c.soft_um = 1; c.erode = 1; c.augment = 3; c.symmetry_p = 0.5f; c.deterministic = 1; c.seed = 1; }
     if (getenv("UFSM_BENCH_AUG")) c.augment = atoi(getenv("UFSM_BENCH_AUG"));
+    if (getenv("UFSM_BENCH_CTAUG")) c.ct_augment = atoi(getenv("UFSM_BENCH_CTAUG"));   /* train --ct-aug */
     if (getenv("UFSM_BENCH_DET")) { c.deterministic = 1; c.seed = 1; }
     if (getenv("UFSM_BENCH_SOFT")) c.soft = (float)atof(getenv("UFSM_BENCH_SOFT"));
     if (getenv("UFSM_BENCH_LEVELS")) { char *t = strdup(getenv("UFSM_BENCH_LEVELS")); int l = 0; memset(c.level_p, 0, sizeof c.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) c.level_p[l++] = atof(q); free(t); }   /* as train --levels */

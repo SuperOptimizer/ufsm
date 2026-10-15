@@ -836,8 +836,8 @@ extern int g_f4w_gy4;   /* lp_bwd_w_f4: the (mx8_t-typed) gy holds MX-fp4 rows; 
 template <int BW, int GB = 8> __global__ void __launch_bounds__(256) gy_pre4_k(const uint8_t *__restrict__ gy, uint8_t *__restrict__ out, float *__restrict__ gb,
                                                                   int N, int Co, int D, int H, int W, int z0, int Zs, unsigned sr) {   /* GB: gy MX bits */
     constexpr int NTASK = BW / 8;   /* (channel, word) tasks per lane */
-    __shared__ float v[8][BW][33];  /* per warp: [channel][block element k = 16 row + x] */
-    __shared__ __align__(16) uint8_t recb[BW][GP4_REC];   /* the CTA's records (one per channel), written out whole */
+    __shared__ __align__(16) __nv_bfloat16 v[8][BW][40];   /* per warp: [channel][block element k = 16 row + x]; bf16 holds the decoded
+                                                              MX values exactly (e2m1 / e4m3 mantissas, fp32 exponents): 20 KB (fp32: 34) */
     __shared__ float bred[BW];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nb = mx_nb(Co), cb = blockIdx.y % nb, n = blockIdx.y / nb;
@@ -863,15 +863,19 @@ template <int BW, int GB = 8> __global__ void __launch_bounds__(256) gy_pre4_k(c
                 mxf<GB>::dec_row(gy + ri * mx_rb(BW, GB), BW, mx_scale(gsc[ri]), r);
             }
 #pragma unroll
-            for (int j = 0; j < BW; j++) v[warp][j][lane] = r[j];
+            for (int j = 0; j < BW; j++) v[warp][j][lane] = __float2bfloat16_rn(r[j]);
         }
         __syncwarp();
 #pragma unroll
         for (int k = 0; k < NTASK; k++) {
             const int task = k * 32 + lane, c = task >> 2, f = task & 3, co = cb * BW + c;
             float q[8];
+            {   /* the 8 values as one 16-byte row */
+                const uint4 w8 = *(const uint4 *)&v[warp][c][8 * f];
+                const unsigned ww[4] = {w8.x, w8.y, w8.z, w8.w};
 #pragma unroll
-            for (int j = 0; j < 8; j++) q[j] = v[warp][c][8 * f + j];
+                for (int j = 0; j < 4; j++) { q[2 * j] = __uint_as_float(ww[j] << 16); q[2 * j + 1] = __uint_as_float(ww[j] & 0xffff0000u); }
+            }
             bacc[k] += ((q[0] + q[1]) + (q[2] + q[3])) + ((q[4] + q[5]) + (q[6] + q[7]));
             unsigned amu = 0u;
 #pragma unroll
@@ -883,15 +887,13 @@ template <int BW, int GB = 8> __global__ void __launch_bounds__(256) gy_pre4_k(c
             uint32_t hh[4];
             sr_hash4(sr, vid, hh);
             const unsigned word = sr_e2m1_word(q, m, hh);
-            *(unsigned *)(recb[c] + warp * 16 + 4 * f) = word;
-            if (f == 0) recb[c][128 + warp] = (uint8_t)(e + 127);
+            if (co < Co) {   /* straight to the record (the warp's 16 bytes of channel c, its scale byte): no block gather or barriers */
+                uint8_t *rec = out + ((((size_t)n * Co + co) * ZT + zt) * TY + ty) * Wb * GP4_REC + (size_t)xb * GP4_REC;
+                *(unsigned *)(rec + warp * 16 + 4 * f) = word;
+                if (f == 0) rec[128 + warp] = (uint8_t)(e + 127);
+            }
         }
-        __syncthreads();
-        for (int i = threadIdx.x; i < BW * (GP4_REC / 8); i += blockDim.x) {   /* whole records: 8-byte stores, consecutive in a record */
-            const int c = i / (GP4_REC / 8), w8 = i % (GP4_REC / 8), co = cb * BW + c;
-            if (co < Co) *(uint2 *)(out + ((((size_t)n * Co + co) * ZT + zt) * TY + ty) * Wb * GP4_REC + (size_t)xb * GP4_REC + 8 * w8) = *(const uint2 *)(recb[c] + 8 * w8);
-        }
-        __syncthreads();   /* the tile and record buffers are reused */
+        __syncwarp();   /* the warp's tile is rewritten by the next group */
     }
     if (gb) {
         __syncthreads();
