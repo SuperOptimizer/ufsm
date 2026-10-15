@@ -42,6 +42,7 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_MEM_REPORT")) { nn_sync(); fprintf(stderr, "free before the first forward %.3f GB\n", nn_mem_free() / 1e9); STEP(); nn_sync(); fprintf(stderr, "free after it %.3f GB (unet build %.3f GB)\n", nn_mem_free() / 1e9, unet_infer_bytes(u, xs) / 1e9); }
     for (int i = 0; i < 3; i++) STEP();   /* build + warm-up */
     nn_sync();
+    { const char *e = nn_check(); if (e) { fprintf(stderr, "prof_infer: CUDA / kernel error: %s\n", e); return 1; } }   /* a refused kernel otherwise times as a no-op step */
     char slot[UNET_NSLOT][16] = {{0}};   /* layer ids: enc i, down L + i, dec 3L - 3 - i, head 3L - 2; slot 2 id + conv */
     { const int L = cfg.nlev;
       for (int l = 0; l <= 3 * L - 2; l++)

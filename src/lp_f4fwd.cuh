@@ -559,7 +559,14 @@ template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const
     int Ox = sp.y2 ? sp.o_split : cout, OxP = (Ox + 31) / 32 * 32;
     if (IS_MX(TO)) { if (sp.y2) Cop = OxP + (cout - Ox + 31) / 32 * 32; else if (cout > 16) Cop = (cout + 31) / 32 * 32; }   /* 32-row-aligned output blocks */
     if (IS_MX(T)) Cip = CxP + (xs.c - Cx + 31) / 32 * 32;                                                                /* per-tensor 32-channel segments */
-    if (xs.c <= 16 && !sp.x2 && !sp.up && sp.gp2.G == 0) { p16_f4<T, TO>(x, xs, w, b, cout, y, Cop, Ox, OxP, gp, osum, Go, sp); return; }   /* K = [kx0 | kx1 | kx2 | 0] */
+    /* MX-fp4 gradient backward-data (fp4 gy, output SR keyed by osr, no staging SR): the 32-padded chunk path copies each <= 16-channel
+       row with its own scale (exact); p16 would re-round paired voxels to their shared scale to nearest (biased gradients).
+       UFSM_G4_P16=1: p16 with SR staging instead (unbiased, more variance); 2: p16 as before (biased, diagnostic) */
+    static int g4p16 = -1; if (g4p16 < 0) g4p16 = getenv("UFSM_G4_P16") ? atoi(getenv("UFSM_G4_P16")) : 0;
+    const bool g4_exact = IS_MX4(T) && sp.osr && !sp.sr && !g4p16;
+    if (IS_MX4(T) && sp.osr && !sp.sr && g4p16 == 1) sp.sr = sp.osr * 0x9e3779b9u + 0x7f4a7c15u;   /* (staging keys derived from the output seed;
+                                                                                                     UFSM_G4_P16=2: the old nearest re-rounding, a test of the test) */
+    if (xs.c <= 16 && !sp.x2 && !sp.up && sp.gp2.G == 0 && !g4_exact) { p16_f4<T, TO>(x, xs, w, b, cout, y, Cop, Ox, OxP, gp, osum, Go, sp); return; }   /* K = [kx0 | kx1 | kx2 | 0] */
     const int nch = Cip / 32;
     const size_t nq = (size_t)28 * Cop * Cip / 2, ns = (size_t)28 * Cop * nch;
     const int pCx = IS_MX(T) ? Cx : -1, pOx = IS_MX(TO) && sp.y2 ? Ox : -1;

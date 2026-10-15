@@ -27,7 +27,7 @@ __global__ void __launch_bounds__(256) bwd_data_s2_tc_k(const uint8_t *__restric
     constexpr int TMZ = 2, TMY = C > 32 ? 4 : 8, TMX = C == 16 ? 16 : 8;   /* class positions per block */
     constexpr int GZ = TMZ + 1, GY = TMY + 1, GX = TMX + 1, GROW = C + 8;   /* gy tile, rows padded by 8 bf16 (bank spread) */
     constexpr int MT = CB / 16, KS = C / 16, NTW = TMZ * TMY * (TMX / 8) / 8;   /* M tiles, k-steps, n-tiles per warp */
-    static_assert(XB == 8 || CB / 4 == 8, "MX-fp4 gx: 8 channels per lane");
+    static_assert(XB == 8 || CB / 4 == 8 || CB / 4 == 4, "MX-fp4 gx: 8 (32 channels) or 4 (16) channels per lane");
     extern __shared__ __align__(16) unsigned char s2t_smem[];
     __nv_bfloat16 *gyt = (__nv_bfloat16 *)s2t_smem;                       /* [GZ][GY][GX][GROW] */
     __nv_bfloat16 *wt = gyt + GZ * GY * GX * GROW;                          /* [8 taps][CB ci][GROW co] */
@@ -89,7 +89,8 @@ __global__ void __launch_bounds__(256) bwd_data_s2_tc_k(const uint8_t *__restric
             const size_t ri = ok ? ((size_t)n * NB + cb) * S + ((size_t)uz * H + uy) * W + ux : 0;
             unsigned wd[CQ / 4] = {}, osc = 0u;
             if (accum && ok) {
-                if constexpr (XB == 4) wd[0] = *(const unsigned *)(gx + ri * RBX + part * CQ / 2);   /* 8 nibbles */
+                if constexpr (XB == 4 && CQ == 4) wd[0] = *(const unsigned short *)(gx + ri * RBX + part * CQ / 2);   /* 4 nibbles (16 channels) */
+                else if constexpr (XB == 4) wd[0] = *(const unsigned *)(gx + ri * RBX + part * CQ / 2);   /* 8 nibbles */
                 else if constexpr (CQ == 8) { const uint2 u = *(const uint2 *)(gx + ri * RBX + part * CQ); wd[0] = u.x; wd[1] = u.y; }
                 else wd[0] = *(const unsigned *)(gx + ri * RBX + part * CQ);
                 osc = xsc[ri];   /* plain loads: this thread rewrites the row below */
@@ -131,7 +132,7 @@ __global__ void __launch_bounds__(256) bwd_data_s2_tc_k(const uint8_t *__restric
                     const float sc = mx_scale(osc);
                     if constexpr (XB == 4) {
 #pragma unroll
-                        for (int q = 0; q < 4; q++) { const float2 d = dec_e2m1x2(wd[0] >> (8 * q)); v[2 * q] += d.x * sc; v[2 * q + 1] += d.y * sc; }
+                        for (int q = 0; q < CQ / 2; q++) { const float2 d = dec_e2m1x2(wd[0] >> (8 * q)); v[2 * q] += d.x * sc; v[2 * q + 1] += d.y * sc; }
                     } else {
 #pragma unroll
                     for (int q = 0; q < CQ / 4; q++) {
@@ -147,7 +148,15 @@ __global__ void __launch_bounds__(256) bwd_data_s2_tc_k(const uint8_t *__restric
                 const int e = mx_exp(__uint_as_float(am), mxf<XB>::inv_qmax);
                 const float m = exp2i(-e);
                 if (ok) {
-                    if constexpr (XB == 4) {
+                    if constexpr (XB == 4 && CQ == 4) {   /* 16 channels: 4 nibbles per lane, SR keyed as the 32-channel words */
+                        unsigned q4 = 0u;
+                        if (osr) {
+                            uint32_t hh[4]; sr_hash4(osr, (uint64_t)ri * 4 + part, hh);
+#pragma unroll
+                            for (int j = 0; j < 4; j++) q4 |= sr_e2m1_nib(v[j] * m, (hh[j >> 1] >> (16 * (j & 1))) & 0xffffu) << (4 * j);
+                        } else { const float v8[8] = {v[0], v[1], v[2], v[3], 0.f, 0.f, 0.f, 0.f}; q4 = cvt_e2m1x8(v8, m) & 0xffffu; }
+                        *(unsigned short *)(gx + ri * RBX + part * CQ / 2) = (unsigned short)q4;
+                    } else if constexpr (XB == 4) {
                         unsigned q4;
                         if (osr) { uint32_t hh[4]; sr_hash4(osr, (uint64_t)ri * 4 + part, hh); q4 = sr_e2m1_word(v, m, hh); }
                         else q4 = cvt_e2m1x8(v, m);
@@ -376,7 +385,6 @@ extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, s
     static int on = -1; if (on < 0) on = getenv("UFSM_S2B_TC") ? atoi(getenv("UFSM_S2B_TC")) : 1;
     if (!on || xs.c != ys.c || (xs.c != 16 && xs.c != 32 && xs.c != 64)) return 0;
     const int GB = gdt == 4 ? 4 : 8, XB = xdt == 4 ? 4 : 8;
-    if (xs.c == 16 && XB == 4) return 0;   /* MX-fp4 gx: 32-channel blocks only */
     const int C = xs.c, CB = C > 32 ? 32 : C, TMX = C == 16 ? 16 : 8, TMZ = 2, TMY = C > 32 ? 4 : 8;
     const int Mz = (xs.d + 1) / 2, My = (xs.h + 1) / 2, Mx = (xs.w + 1) / 2;
     const unsigned nb = (unsigned)(((Mx + TMX - 1) / TMX) * ((My + TMY - 1) / TMY) * ((Mz + TMZ - 1) / TMZ) * xs.n);
@@ -387,7 +395,7 @@ extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, s
 #define S2TC(CC, G, X) do { static unsigned at_ = 0; int dev_ = 0; cudaGetDevice(&dev_); if (!(at_ >> dev_ & 1u)) { at_ |= 1u << dev_; cudaFuncSetAttribute((const void *)bwd_data_s2_tc_k<CC, G, X>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
                             s2tc_prep_w_k<CC><<<nblk_(27 * CC * (CC + 8), 256), 256>>>(w, wtg); \
                             bwd_data_s2_tc_k<CC, G, X><<<grid, 256, sm>>>(gq, wtg, xq, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum, osr); } while (0)
-    if (C == 16) S2TC(16, 8, 8);
+    if (C == 16) { if (GB == 8 && XB == 8) S2TC(16, 8, 8); else if (GB == 4 && XB == 4) S2TC(16, 4, 4); else return 0; }
     else if (C == 32) { if (GB == 8 && XB == 8) S2TC(32, 8, 8); else if (GB == 4 && XB == 4) S2TC(32, 4, 4); else return 0; }
     else { if (GB == 8 && XB == 8) S2TC(64, 8, 8); else if (GB == 4 && XB == 4) S2TC(64, 4, 4); else return 0; }
 #undef S2TC

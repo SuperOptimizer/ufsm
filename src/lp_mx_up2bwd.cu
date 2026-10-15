@@ -2,14 +2,15 @@
 #include "lp_mxops.cuh"
 /* ---- MX backward of the exact-2x trilinear upsample: gx[m] = sum over fine outputs o in [2m - 1, 2m + 2] (per axis) of
    coef(o, m) gy[o], coef as in the forward (0.75 for in[o/2], 0.25 for the clamped neighbour) ---- */
-__global__ void up2_bwd_mx_k(const uint8_t *gy, uint8_t *gx, int N, int C, int D, int H, int W) {   /* D, H, W: coarse (gx) grid */
+template <int GB = 8, int XB = 8>   /* MX bits of gy / gx; XB 4: gx with exact SR keyed by osr */
+__global__ void up2_bwd_mx_k(const uint8_t *gy, uint8_t *gx, int N, int C, int D, int H, int W, unsigned osr) {   /* D, H, W: coarse (gx) grid */
     const int bw = mx_bw(C), nb = mx_nb(C), Do = 2 * D, Ho = 2 * H, Wo = 2 * W;
     const size_t S = (size_t)D * H * W, So = (size_t)Do * Ho * Wo;
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)N * nb * S) return;
     size_t v = i % S, nbk = i / S;
     int x = (int)(v % W), y = (int)((v / W) % H), z = (int)(v / ((size_t)W * H));
-    const uint8_t *sc = gy + (size_t)N * nb * So * bw;
+    const uint8_t *sc = gy + (size_t)N * nb * So * mx_rb(bw, GB);
     float acc[32] = {};
 #pragma unroll 1
     for (int a = 0; a < 4; a++) {
@@ -21,30 +22,31 @@ __global__ void up2_bwd_mx_k(const uint8_t *gy, uint8_t *gx, int N, int C, int D
             for (int c = 0; c < 4; c++) {
                 int ox = 2 * x - 1 + c; float wx = upc(ox, x, W); if (wx == 0.f) continue;
                 float r[32], w3 = wz * wy * wx;
-                mx_load_row(gy, sc, nbk * So + ((size_t)oz * Ho + oy) * Wo + ox, bw, r);
+                mx_load_row_b<GB>(gy, sc, nbk * So + ((size_t)oz * Ho + oy) * Wo + ox, bw, r);
 #pragma unroll
                 for (int k = 0; k < 32; k++) acc[k] += w3 * r[k];
             }
         }
     }
-    mx_store_row(gx, gx + (size_t)N * nb * S * bw, i, bw, acc);
+    mx_store_row_b<XB>(gx, gx + (size_t)N * nb * S * mx_rb(bw, XB), i, bw, acc, XB == 4 ? osr : 0u);
 }
-/* tiled: block = (16 x 4 coarse columns, z chunk of ZC coarse planes, n, gx block); thread = (coarse x, coarse y, 8 channels).
-   The block walks the fine planes 2 z0 - 1 .. 2 z1, each staged raw (e4m3 rows + scale bytes, 34 x 10 fine positions) into
-   shared memory once with cp.async (double-buffered), and adds w_y w_x gy over its 4 x 4 fine taps into the two coarse planes
-   the fine plane feeds (fine 2k + 1 and 2k + 2 feed coarse k and k + 1; coarse k is complete after fine 2k + 2). The
-   per-voxel kernel read every fine row 8 times (L2-bound). Whole 32-channel blocks of gy and gx; gx written fresh; the
-   sums in another order (then the same e4m3 quantisation). Needs Wo % 4 == 0 (4-byte scale copies). */
+/* tiled: block = (16 x CY coarse columns, z chunk of ZC coarse planes, n, gx block); thread = (coarse x, coarse y, 8 channels):
+   BW / 8 threads per voxel (BW 32: 16 x 4 columns, 16: 16 x 8, 8: 16 x 16; always 256 threads). The block walks the fine
+   planes 2 z0 - 1 .. 2 z1, each staged raw (MX rows + scale bytes, 34 x (2 CY + 2) fine positions) into shared memory once
+   with cp.async (double-buffered), and adds w_y w_x gy over its 4 x 4 fine taps into the two coarse planes the fine plane
+   feeds (fine 2k + 1 and 2k + 2 feed coarse k and k + 1; coarse k is complete after fine 2k + 2). The per-voxel kernel read
+   every fine row 8 times (L2-bound). Whole BW-channel blocks of gy and gx (gy and gx share the block width); gx written
+   fresh; the sums in another order (then the same quantisation). Needs Wo % 4 == 0 (4-byte scale copies). */
 #define U2B_RW 34   /* fine positions per staged row: 2 x 16 + 2 */
-#define U2B_RH 10   /* fine rows: 2 x 4 + 2 */
-#define U2B_BUFB(RB) (U2B_RH * U2B_RW * (RB) + U2B_RH * 40)   /* RB: gy row bytes (32 MX-fp8, 16 MX-fp4) */
-template <int GB = 8, int XB = 8>   /* MX bits of gy / gx (4: MX-fp4 gradients, gx with exact SR keyed by osr) */
+#define U2B_BUFB(RB, RH) ((RH) * U2B_RW * (RB) + (RH) * 40)   /* RB: gy row bytes (BW MX-fp8, BW / 2 MX-fp4), RH staged rows */
+template <int GB = 8, int XB = 8, int BW = 32>   /* MX bits of gy / gx (4: MX-fp4 gradients, gx with exact SR keyed by osr), block width */
 __global__ void __launch_bounds__(256) up2_bwd_mx_tile_k(const uint8_t *__restrict__ gy, uint8_t *__restrict__ gx, int N, int nby, int nbx, int yb0, int ob0, int nob,
                                                          int D, int H, int W, int ZC, unsigned osr) {
-    constexpr int RB = 32 * GB / 8, XRB = 32 * XB / 8, U2B_BUF = U2B_BUFB(RB);
+    constexpr int CPL = BW / 8, CY = 16 / CPL, RH = 2 * CY + 2, RB = BW * GB / 8, XRB = BW * XB / 8, U2B_BUF = U2B_BUFB(RB, RH);
+    constexpr int CB = RB >= 16 ? 16 : RB, NCH = RB / CB;   /* cp.async chunk bytes, chunks per row */
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    const int tid = threadIdx.x, cg = tid & 3, cx = (tid >> 2) & 15, cy = tid >> 6;
-    const int x0 = blockIdx.x * 16, y0 = blockIdx.y * 4, nzc = (D + ZC - 1) / ZC;
+    const int tid = threadIdx.x, cg = tid % CPL, cx = (tid / CPL) & 15, cy = tid / (CPL * 16);
+    const int x0 = blockIdx.x * 16, y0 = blockIdx.y * CY, nzc = (D + ZC - 1) / ZC;
     int bz = blockIdx.z;
     const int zc = bz % nzc; bz /= nzc;
     const int ob = ob0 + bz % nob, n = bz / nob, yb = yb0 + (ob - ob0);
@@ -52,18 +54,17 @@ __global__ void __launch_bounds__(256) up2_bwd_mx_tile_k(const uint8_t *__restri
     const size_t S = (size_t)D * H * W, So = (size_t)Do * Ho * Wo;
     const uint8_t *gyb = gy + ((size_t)n * nby + yb) * So * RB, *gys = gy + (size_t)N * nby * So * RB + ((size_t)n * nby + yb) * So;
     const int fx0 = 2 * x0 - 1, fy0 = 2 * y0 - 1;
-    auto stage = [&](int fz, unsigned char *buf) {   /* raw fine plane fz: rows fy0 .. fy0 + 9, positions fx0 .. fx0 + 33 */
+    auto stage = [&](int fz, unsigned char *buf) {   /* raw fine plane fz: rows fy0 .. fy0 + RH - 1, positions fx0 .. fx0 + 33 */
         const bool zok = fz >= 0 && fz < Do;
-        constexpr int NCH = RB / 16;   /* 16-byte chunks per row */
-        for (int k = tid; k < U2B_RH * U2B_RW * NCH; k += 256) {
+        for (int k = tid; k < RH * U2B_RW * NCH; k += 256) {
             const int h = k % NCH, p = (k / NCH) % U2B_RW, r = (k / NCH) / U2B_RW, oy = fy0 + r, ox = fx0 + p;
             const bool ok = zok && oy >= 0 && oy < Ho && ox >= 0 && ox < Wo;
-            cp_async<16>(buf + (r * U2B_RW + p) * RB + 16 * h, ok ? gyb + (((size_t)fz * Ho + oy) * Wo + ox) * RB + 16 * h : gyb, ok);
+            cp_async<CB>(buf + (r * U2B_RW + p) * RB + CB * h, ok ? gyb + (((size_t)fz * Ho + oy) * Wo + ox) * RB + CB * h : gyb, ok);
         }
-        if (tid < U2B_RH * 10) {   /* scale words: fine x 2 x0 - 4 + 4 j .. + 3 (aligned); byte of position p at p + 3 */
-            const int r = tid / 10, j = tid % 10, oy = fy0 + r, ox = 2 * x0 - 4 + 4 * j;
+        for (int k = tid; k < RH * 10; k += 256) {   /* scale words: fine x 2 x0 - 4 + 4 j .. + 3 (aligned); byte of position p at p + 3 */
+            const int r = k / 10, j = k % 10, oy = fy0 + r, ox = 2 * x0 - 4 + 4 * j;
             const bool ok = zok && oy >= 0 && oy < Ho && ox >= 0 && ox + 3 < Wo;
-            cp_async<4>(buf + U2B_RH * U2B_RW * RB + r * 40 + 4 * j, ok ? gys + ((size_t)fz * Ho + oy) * Wo + ox : gys, ok);
+            cp_async<4>(buf + RH * U2B_RW * RB + r * 40 + 4 * j, ok ? gys + ((size_t)fz * Ho + oy) * Wo + ox : gys, ok);
         }
         asm volatile("cp.async.commit_group;\n" ::: "memory");
     };
@@ -82,7 +83,7 @@ __global__ void __launch_bounds__(256) up2_bwd_mx_tile_k(const uint8_t *__restri
         if (fz < f1) { stage(fz + 1, smem_raw + ((i + 1) & 1) * U2B_BUF); asm volatile("cp.async.wait_group 1;\n" ::: "memory"); }
         else asm volatile("cp.async.wait_group 0;\n" ::: "memory");
         __syncthreads();
-        const unsigned char *buf = smem_raw + (i & 1) * U2B_BUF, *bs = buf + U2B_RH * U2B_RW * RB;
+        const unsigned char *buf = smem_raw + (i & 1) * U2B_BUF, *bs = buf + RH * U2B_RW * RB;
         const int k = (fz - 1) >> 1;   /* the fine plane feeds coarse k and k + 1 */
         const float wz0 = upc(fz, k, D), wz1 = upc(fz, k + 1, D);
         float t[8];
@@ -115,16 +116,18 @@ __global__ void __launch_bounds__(256) up2_bwd_mx_tile_k(const uint8_t *__restri
                 unsigned am = 0u;
 #pragma unroll
                 for (int c = 0; c < 8; c++) am = amax_u(am, acc0[c]);
-                am = max(am, __shfl_xor_sync(0xffffffffu, am, 1)); am = max(am, __shfl_xor_sync(0xffffffffu, am, 2));
+#pragma unroll
+                for (int o = 1; o < CPL; o <<= 1) am = max(am, __shfl_xor_sync(0xffffffffu, am, o));   /* the voxel's CPL lanes */
                 const int e = mx_exp(__uint_as_float(am), mxf<XB>::inv_qmax);
                 const float m = exp2i(-e);
                 const size_t ri = ((size_t)n * nbx + ob) * S + ((size_t)k * H + y) * W + x;
-                if constexpr (XB == 8) *(uint2 *)(gx + ri * 32 + 8 * cg) = make_uint2(cvt_e4m3x4(acc0[0] * m, acc0[1] * m, acc0[2] * m, acc0[3] * m), cvt_e4m3x4(acc0[4] * m, acc0[5] * m, acc0[6] * m, acc0[7] * m));
+                if constexpr (XB == 8) *(uint2 *)(gx + ri * XRB + 8 * cg) = make_uint2(cvt_e4m3x4(acc0[0] * m, acc0[1] * m, acc0[2] * m, acc0[3] * m), cvt_e4m3x4(acc0[4] * m, acc0[5] * m, acc0[6] * m, acc0[7] * m));
                 else { uint32_t hh[4]; sr_hash4(osr, (uint64_t)ri * 4 + cg, hh); *(unsigned *)(gx + ri * XRB + 4 * cg) = sr_e2m1_word(acc0, m, hh); }
                 if (cg == 0) gxs[ri] = (uint8_t)(e + 127);
             } else if (k >= z0) {   /* keep the shuffles convergent (outside lanes) */
                 unsigned am = 0u;
-                am = max(am, __shfl_xor_sync(0xffffffffu, am, 1)); am = max(am, __shfl_xor_sync(0xffffffffu, am, 2));
+#pragma unroll
+                for (int o = 1; o < CPL; o <<= 1) am = max(am, __shfl_xor_sync(0xffffffffu, am, o));
             }
 #pragma unroll
             for (int c = 0; c < 8; c++) { acc0[c] = acc1[c]; acc1[c] = 0.f; }
@@ -133,21 +136,30 @@ __global__ void __launch_bounds__(256) up2_bwd_mx_tile_k(const uint8_t *__restri
     }
 }
 static int up2b_tile_on(void) { static int on = -1; if (on < 0) on = getenv("UFSM_UP2B_TILE") ? atoi(getenv("UFSM_UP2B_TILE")) : 1; return on; }
-static void up2_bwd_tile(const void *gy, int nby, int yb0, shape5 xs, void *gx, int nbx, int ob0, int nob, int gdt, int xdt, unsigned osr) {   /* xs: coarse */
+static void up2_bwd_tile(const void *gy, int nby, int yb0, shape5 xs, void *gx, int nbx, int ob0, int nob, int gdt, int xdt, unsigned osr, int bw) {   /* xs: coarse */
     int ZC = 8;
-    const dim3 grid((unsigned)nblk_(xs.w, 16), (unsigned)nblk_(xs.h, 4), (unsigned)(nblk_(xs.d, ZC) * xs.n * nob));
-#define U2BT(G, X) do { static unsigned at_ = 0; int dev_ = 0; cudaGetDevice(&dev_); const size_t sm_ = 2 * U2B_BUFB(32 * G / 8); \
-                        if (!(at_ >> dev_ & 1u)) { at_ |= 1u << dev_; cudaFuncSetAttribute((const void *)up2_bwd_mx_tile_k<G, X>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_); } \
-                        up2_bwd_mx_tile_k<G, X><<<grid, 256, sm_>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, nby, nbx, yb0, ob0, nob, xs.d, xs.h, xs.w, ZC, osr); } while (0)
-    if (gdt == 4 && xdt == 4) U2BT(4, 4); else if (gdt != 4 && xdt != 4) U2BT(8, 8);
-    else { fprintf(stderr, "up2_bwd: gy and gx must share the MX format\n"); abort(); }
+    const int cy = 16 / (bw / 8);
+    const dim3 grid((unsigned)nblk_(xs.w, 16), (unsigned)nblk_(xs.h, cy), (unsigned)(nblk_(xs.d, ZC) * xs.n * nob));
+#define U2BT(G, X, BWT) do { static unsigned at_ = 0; int dev_ = 0; cudaGetDevice(&dev_); const size_t sm_ = 2 * U2B_BUFB(BWT * G / 8, 2 * (16 / (BWT / 8)) + 2); \
+                        if (!(at_ >> dev_ & 1u)) { at_ |= 1u << dev_; cudaFuncSetAttribute((const void *)up2_bwd_mx_tile_k<G, X, BWT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_); } \
+                        up2_bwd_mx_tile_k<G, X, BWT><<<grid, 256, sm_>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, nby, nbx, yb0, ob0, nob, xs.d, xs.h, xs.w, ZC, osr); } while (0)
+    if ((gdt == 4) != (xdt == 4)) { fprintf(stderr, "up2_bwd: gy and gx must share the MX format\n"); abort(); }
+    if (bw == 32) { if (gdt == 4) U2BT(4, 4, 32); else U2BT(8, 8, 32); }
+    else if (bw == 16) { if (gdt == 4) U2BT(4, 4, 16); else U2BT(8, 8, 16); }
+    else if (bw == 8) { if (gdt == 4) U2BT(4, 4, 8); else U2BT(8, 8, 8); }
+    else { fprintf(stderr, "up2_bwd: block width %d\n", bw); abort(); }
 #undef U2BT
 }
-extern "C" void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx, int gdt, int xdt, unsigned osr) {
-    if ((up2b_tile_on() || gdt == 4) && xs.c % 32 == 0 && xs.w % 2 == 0) { up2_bwd_tile(gy, mx_nb(xs.c), 0, xs, gx, mx_nb(xs.c), 0, mx_nb(xs.c), gdt, xdt, osr); LPCK(); return; }
-    if (gdt == 4 || xdt == 4) { fprintf(stderr, "lp_up2_bwd_mx: MX-fp4 gradients need 32-channel blocks and an even coarse width\n"); abort(); }
+static void up2_bwd_voxel(const void *gy, shape5 xs, void *gx, int gdt, int xdt, unsigned osr) {   /* per-voxel, any block width */
     size_t n = (size_t)xs.n * mx_nb(xs.c) * shape_spatial(xs);
-    up2_bwd_mx_k<<<nblk_(n, 256), 256>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, xs.c, xs.d, xs.h, xs.w); LPCK();
+    if (gdt == 4 && xdt == 4) up2_bwd_mx_k<4, 4><<<nblk_(n, 256), 256>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, xs.c, xs.d, xs.h, xs.w, osr);
+    else if (gdt != 4 && xdt != 4) up2_bwd_mx_k<8, 8><<<nblk_(n, 256), 256>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, xs.c, xs.d, xs.h, xs.w, osr);
+    else { fprintf(stderr, "up2_bwd: gy and gx must share the MX format\n"); abort(); }
+}
+extern "C" void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx, int gdt, int xdt, unsigned osr) {
+    const int bw = mx_bw(xs.c);
+    if ((up2b_tile_on() || gdt == 4) && xs.c % bw == 0 && xs.w % 2 == 0) { up2_bwd_tile(gy, mx_nb(xs.c), 0, xs, gx, mx_nb(xs.c), 0, mx_nb(xs.c), gdt, xdt, osr, bw); LPCK(); return; }
+    up2_bwd_voxel(gy, xs, gx, gdt, xdt, osr); LPCK();   /* (MX-fp4: exact SR per row; partial blocks, odd coarse widths) */
 }
 /* channel slice [c0, c0 + nc) of an MX-fp8 gx with ctot channels from an MX-fp8 gy of nc channels (the chunked up-part gradient
    of the decoder): thread = (n, gx block touched by the slice, coarse voxel). A slice that starts at its block's first channel
@@ -200,10 +212,10 @@ extern "C" void lp_up2_bwd_mx_slice(const void *gy, shape5 xs, void *gx, int cto
     (void)bwy;
     const int ob0 = c0 / bwx, ob1 = (c0 + nc - 1) / bwx, nob = ob1 - ob0 + 1;
     if (nob > 1 && nc <= 16) { fprintf(stderr, "lp_up2_bwd_mx_slice: slice spans blocks\n"); abort(); }
-    if ((up2b_tile_on() || gdt == 4) && bwx == 32 && bwy == 32 && c0 % 32 == 0 && nc % 32 == 0 && xs.w % 2 == 0) {   /* whole 32-channel blocks, written fresh */
-        up2_bwd_tile(gy, mx_nb(nc), 0, xs, gx, mx_nb(ctot), ob0, nob, gdt, xdt, osr); LPCK(); return;
+    if ((up2b_tile_on() || gdt == 4) && bwx == bwy && c0 % bwx == 0 && nc % bwx == 0 && xs.w % 2 == 0) {   /* whole blocks (8, 16 or 32 channels), written fresh */
+        up2_bwd_tile(gy, mx_nb(nc), 0, xs, gx, mx_nb(ctot), ob0, nob, gdt, xdt, osr, bwx); LPCK(); return;
     }
-    if (gdt == 4 || xdt == 4) { fprintf(stderr, "lp_up2_bwd_mx_slice: MX-fp4 gradients need whole 32-channel blocks and an even coarse width\n"); abort(); }
+    if (gdt == 4 || xdt == 4) { fprintf(stderr, "lp_up2_bwd_mx_slice: MX-fp4 gradients need whole MX blocks (c0 %d nc %d of %d) and an even coarse width\n", c0, nc, ctot); abort(); }
     if (nob > 1) {   /* 32-aligned multi-block slice: one gy block per gx block, launch per block */
         for (int ob = ob0; ob <= ob1; ob++) {
             size_t n = (size_t)xs.n * shape_spatial(xs);

@@ -347,6 +347,9 @@ static int grad_mx8(void) { if (g_grad_mx8 < 0) g_grad_mx8 = ufsm_env_on("UFSM_G
 static int g_grad_mx4 = -1;
 static int grad_mx4(void) { if (g_grad_mx4 < 0) g_grad_mx4 = ufsm_env_on("UFSM_GRAD_MX4"); return g_grad_mx4 && grad_mx8(); }
 static int grad_dt(void) { return grad_mx4() ? 4 : 8; }   /* registry dt of the MX gradients */
+/* the smallest up-part chunk the MX gradient kernels take for an up part of c channels: MX-fp4 whole blocks (an 8- or 16-channel
+   up part at once, else 32), MX-fp8 16-channel halves of a block (or the whole up part when it is narrower) */
+static int mx_chunk_min(int c) { return grad_dt() == 4 ? (c <= 16 ? c : 32) : (c < 16 ? c : 16); }
 void unet_set_grad_mx4(int on) { g_grad_mx4 = on; }
 /* decoder conv1 weight gradient with the upsampled part in 32-channel slices: silu(gn(a2)) of the coarse block once into
    gout[level + 1], each slice upsampled into gout[level] and weight-gradiented into a small buffer added into its columns, so
@@ -851,7 +854,11 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 size_t gob = gmx ? nn_mx_bytes(so, grad_dt()) : shape_numel(so) * (GBF ? 2 : 4);
                 if (u->nob && i < L - 1 && !up_wg_chunk()) { shape5 up = u->ls[i]; up.c = UPW(i + 1); if (act_bytes_of(up) > gob) gob = act_bytes_of(up); }   /* also holds the MX up transient (level 1: 34 vs 33 B) */
                 if (up_wg_chunk() && i > 0 && act_bytes_of(so) > gob) gob = act_bytes_of(so);   /* holds the coarse silu(gn(a2)) the level below's weight gradient reads */
-                if (up_wg_chunk() && i < L - 1) { shape5 sl = u->ls[i]; sl.c = 32; if (act_bytes_of(sl) > gob) gob = act_bytes_of(sl); }   /* one upsampled 32-channel slice */
+                if (up_wg_chunk() && i < L - 1) { shape5 sl = u->ls[i]; sl.c = UPW(i + 1) % 32 ? UPW(i + 1) : 32; if (act_bytes_of(sl) > gob) gob = act_bytes_of(sl); }   /* one upsampled 32-channel slice (a narrower or
+                                                                                                     non-32-multiple up part: the whole up part, unsliced) */
+                if (u->nob && gmx && chunk && i < L - 1) {   /* the smallest legal up-part chunk passes through this level's gradient buffer */
+                    shape5 t = u->ls[i]; t.c = mx_chunk_min(UPW(i + 1)); const size_t cb = nn_mx_bytes(t, grad_dt()); if (cb > gob) gob = cb;
+                }
                 if (u->nob && gmx && i == 0 && i < L - 1 && unet_wide_up_grad()) {
                     shape5 up = u->ls[i]; up.c = UPW(i + 1);
                     size_t ub = nn_mx_bytes(up, grad_dt()); if (ub > gob) gob = ub;
@@ -1684,8 +1691,8 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
             const size_t per_c = shape_numel(b->ys) / b->ys.c * (GBF ? 2 : 4);
             const size_t cap = u->gB_cap[level];
             int cs = (int)(cap / per_c); if (cs > b->c_split) cs = b->c_split;
-            if (grad_mx8()) {   /* MX-fp8 chunks: 16 channels or whole 32-channel blocks that fit B */
-                shape5 t = b->xs; cs = 16;
+            if (grad_mx8()) {   /* MX chunks: the smallest legal chunk (mx_chunk_min) or whole 32-channel blocks that fit B */
+                shape5 t = b->xs; cs = mx_chunk_min(b->c_split);
                 for (int c = 32; c <= b->c_split; c += 32) { t.c = c; if (nn_mx_bytes(t, grad_dt()) <= cap) cs = c; }
                 t.c = cs; if (nn_mx_bytes(t, grad_dt()) > cap) rc_fail("MX chunk does not fit the gradient buffer");
             }

@@ -1169,7 +1169,8 @@ int cmd_train(int argc, char **argv) {
            whole windows, MX activations; -22 B (logits) - 11 B (derived targets) per voxel. UFSM_HEAD_SLAB=0: whole-window head and losses;
            UFSM_HEAD_SLAB_Z: planes per slab (32) */
         g_head_slab = g_gl_inplace && g_unwrap && B == 1 && !split && !g_verso && !g_pap_head && g_side == 2 && g_side_nc == 2 && g_side_ch == 2 && g_norm_ch == 4
-                      && g_cout == 11 && unet_act_mx() && !(getenv("UFSM_HEAD_SLAB") && !atoi(getenv("UFSM_HEAD_SLAB")));
+                      && g_cout == 11 && unet_act_mx() && cfg.widths[0] == 32 && !(getenv("UFSM_HEAD_SLAB") && !atoi(getenv("UFSM_HEAD_SLAB")));   /* (the fused
+                                                                                                     slab head backward takes exactly 32 inputs) */
         g_hs_z = getenv("UFSM_HEAD_SLAB_Z") ? atoi(getenv("UFSM_HEAD_SLAB_Z")) : 32;
         if (g_hs_z < 1) g_hs_z = 1;
         if (g_hs_z > g_Pz) g_hs_z = g_Pz;
@@ -1184,7 +1185,10 @@ int cmd_train(int argc, char **argv) {
                P / 2^(nlev-1), included; P % 2^nlev let P 320 / 448 through to an abort */
             int g4ok = P % (4 << (cfg.nlev - 1)) == 0 && g_Pz % (4 << (cfg.nlev - 1)) == 0 && fp4 >= 2 && !*opt(argc, argv, "--policy", "");   /* the fp8 weight gradients of --fp4 1
                                                                                                      (or a --policy) take no MX-fp4 gy */
-            for (int i = 0; i < cfg.nlev; i++) if (cfg.widths[i] % 32) g4ok = 0;
+            /* UFSM_G4_NARROW=1 (until the 8 / 16-channel MX-fp4 gradient kernels are complete): also 16-channel levels */
+            const int g4n = ufsm_env_on("UFSM_G4_NARROW");
+            for (int i = 0; i < cfg.nlev; i++) if (cfg.widths[i] % 32 && !(g4n && cfg.widths[i] == 16)) g4ok = 0;
+            for (int i = 0; i < cfg.nlev - 1; i++) if (cfg.dec_widths[i] > 0 && cfg.dec_widths[i] % 32 && !(g4n && cfg.dec_widths[i] == 16)) g4ok = 0;
             const int g4 = getenv("UFSM_GRAD_MX4") ? ufsm_env_on("UFSM_GRAD_MX4") : g4ok;
             if (g4 && !g4ok) { fprintf(stderr, "UFSM_GRAD_MX4: MX-fp4 gradients need --fp4 2 (fp4 weight gradients), widths that are multiples of 32 and P divisible by %d\n", 4 << (cfg.nlev - 1)); return 2; }
             unet_set_grad_mx4(g4);
@@ -1244,7 +1248,8 @@ int cmd_train(int argc, char **argv) {
                                             + (g_head_slab ? (size_t)B * (NCH + 1) * p3 : 0);   /* head slabs: targets and mask outside the gradient buffers */   /* > 2 outputs (affinities, verso): the logit gradient may not fit beside the logits */
                 /* the fp4 weight gradient's gy records of a whole level-0 layer (lp_gn_silu_bwd_apply_rec, MX-fp4 gradients): 136 B per
                    32 channels x 256 voxels (~0.5 B per voxel and channel), outside the dry build */
-                const size_t grec = unet_grad_mx4() && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1) ? (size_t)B * cfg.widths[0] * p3 * 136 / 256 : 0;
+                const size_t grec = unet_grad_mx4() && cfg.widths[0] % 32 == 0 && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1) ? (size_t)B * cfg.widths[0] * p3 * 136 / 256 : 0;   /* (the GN kernel
+                                                                                                     writes no records below 32-channel blocks) */
                 need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (need <= fmin) pick = c;
             }
