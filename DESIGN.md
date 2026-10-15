@@ -6,6 +6,21 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Several recto teachers at 9.6 um: one head per teacher (2026-10-15)
+Teachers: the published surfaces (labels), the upstream ps256 3D-recto mask and the upstream m7 surface probabilities. At 9.6 um the
+bands are 2.5-2.7 voxels (labels), 4.1-4.7 (ps256), 2.7 (m7 >= 0.5) thick (4 x mean inside EDT - 2, three Paris4 crops); the radial CT
+profile across each band's centre voxels peaks at the same place for all three with papyrus inward, and m7's peak sits at the label
+centre (median offset 0), so m7 is a recto model too. Sources: per-source "erode" / "dilate" (binary targets) equalise widths (ps256
+erode 1); m7 is a probability target on the recto channel, its noise floor zeroed in deep void with --iso-void 1.
+One head would learn the teachers' average where they disagree (partial probabilities: haze). `train --heads H`: the surface net gets H
+recto heads (output channels 0 and 2..H, the sheet channel stays 1) and every source names the head its recto target trains ("head": k).
+The upload writes each sample's recto target into its head's channel (device targets B x cout x P^3) with weight 0 on the other heads, so
+the shared trunk sees every teacher and each 1x1 head only its own; validation prints the loss per head over its own sources' windows;
+the checkpoint records the head channels and sources (extra "heads"); predict --channel picks a head. --tol and --recall act on channel 0.
+Sampler throughput: a worker draws only into a free batch slot, so concurrency is min(workers, slots - the trainer's 1-2). At P 512 a
+slot is ~1.6 GB pinned and a worker's scratch ~1.35 GB: 12 workers with 4 slots drew ~2.5 at a time (0.8 samp/s, 60-75% wait at
+4.2 cpu-s per patch); 7 workers with 8 slots cost the same memory.
+
 ## Sheet extraction: thickness, recto/verso sides, scoring (2026-10-09)
 
 Plan (research by 7 agents + codebase exploration, user-approved): extract SHEETS, not a recto probability. No vision

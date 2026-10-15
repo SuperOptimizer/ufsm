@@ -42,6 +42,18 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     assert old['extra']['runtime']['grad_mx8'] == 1
     assert old['extra']['runtime']['gn_stored'] == 1
     assert "input_prec 8" in (t / "first/precision.txt").read_text()
+    # --heads: a second source trains its own recto head (output channel 2); channel 1 stays the sheet channel.
+    hcfg = t / "heads.json"
+    src = json.loads(cfg.read_text())["sources"][0]
+    hcfg.write_text(json.dumps({"sources": [src, dict(src, name="teacher2", head=1)]}))
+    msg = run("train", hcfg, "--out", t / "nohead", "--steps", "1", "--warmup", "0", *opts, ok=2, extra_env=train_env)
+    assert "trains head 1; train --heads 2" in msg, msg
+    out = run("train", hcfg, "--out", t / "heads", "--steps", "4", "--warmup", "0", "--heads", "2", *opts, extra_env=train_env)
+    assert "head 1 (channel 2): teacher2" in out and "val heads: 0 " in out, out
+    hm, _ = weights(t / "heads/last.ckpt")
+    assert hm["extra"]["heads"] == {"version": 1, "recto_channels": [0, 2], "sources": [["fixture"], ["teacher2"]]}, hm["extra"]
+    run("predict", t / "heads/last.ckpt", t, "ct", t / "heads-pred", "--channel", "2", "--um", "1", "--window", "24", "--halo", "4", "--shard", "128",
+        "--levels", "1", "--box", "0,0,0,16,16,16")
     run("train", cfg, "--out", t / "resume", "--resume", t / "first/last.ckpt", "--steps", "3", "--lr", "0", *opts[:-2], extra_env=train_env)
     new, wr = weights(t / "resume/last.ckpt")
     assert new["step"] == 3 and wp == wr, "normal resume reinitialized or changed zero-LR weights"
