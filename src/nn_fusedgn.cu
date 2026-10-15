@@ -185,3 +185,28 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
     else if (ABF) gn_silu_bwd_t<bf16, float, float>((const bf16 *)x, s, G, gamma, beta, mean, rstd, gy, gx, ggamma, gbeta, scratch);
     else gn_silu_bwd_t<float, float, float>(x, s, G, gamma, beta, mean, rstd, gy, gx, ggamma, gbeta, scratch);
 }
+/* nn_head_bwd_x draws its seed (then declines 16- and 8-channel inputs: the caller's fallback runs) whenever these hold for an MX-fp4 gx:
+   a caller skipping it draws one in its place to keep the step's seed sequence */
+extern "C" int nn_head_bwd_x_draws(void) { return g_tf32 && GBF && g_h16; }
+extern "C" int nn_gn_silu_bwd_head_ok(int C, int cout) { return g_tf32 && GBF && g_h16 && lp_gn_silu_bwd_head_ok(C, cout); }
+/* nn_gn_silu_bwd of dec[0]'s MX-fp4 output x whose gy, the head's input gradient, is recomputed from the fp16 logit gradient gl (cout
+   channels; head weights wh [cout][C]; hs: the SR seed the head's backward-data would have drawn), gx written in place over x: the bits
+   of nn_conv3d_bwd_data (head, k 1) into an MX-fp4 buffer followed by nn_gn_silu_bwd from it, the gradient never stored. -1: not covered */
+extern "C" int nn_gn_silu_bwd_head(float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const void *gl, int cout,
+                                   const float *wh, unsigned hs, float *ggamma, float *gbeta, float *scratch) {
+    if (!nn_gn_silu_bwd_head_ok(s.c, cout) || !ISMX(x) || MXDT(x) != 4) return -1;
+    if (G > s.c) G = s.c;
+    const int NC = s.n * s.c;
+    double *ds = gn_dsums((size_t)2 * NC);
+    float *AB = scratch + 2 * NC;
+    lp_gn_silu_bwd_head_stats(x, s, G, gamma, beta, mean, rstd, gl, cout, wh, hs, ds);
+    d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
+    const int zsp = zs_on();
+    const float f = gn_bwd_reduce(ds, scratch, NC, s.d, ggamma, gbeta, s.n, s.c);
+    gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, f);
+    const unsigned gsr = sr_seed();   /* (nn_gn_silu_bwd's draw) */
+    lp_gn_silu_bwd_head_apply(x, s, G, gamma, beta, mean, rstd, gl, cout, wh, hs, AB, gsr);
+    if (!zsp) gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
+    KCHECK();
+    return 0;
+}

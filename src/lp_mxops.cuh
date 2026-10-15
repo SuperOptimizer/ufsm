@@ -8,6 +8,18 @@
 template <int B> __device__ __forceinline__ void mx_load_row_b(const uint8_t *q, const uint8_t *sc, size_t ri, int bw, float *v) {
     mxf<B>::dec_row(q + ri * mx_rb(bw, B), bw, mx_scale(sc[ri]), v);
 }
+/* the MX-fp4 row of bw <= BW values with exact SR (sr != 0) as mx_store_row_b<4> below stores it (the same operations, kept apart so
+   that function's code stays as it was): words w[0 .. BW / 8) (0 past bw) and the block exponent (scale byte e + 127) */
+template <int BW> __device__ __forceinline__ int mx4_sr_row(const float *v, int bw, size_t ri, uint32_t sr, unsigned *w) {
+    unsigned am = 0u;
+#pragma unroll
+    for (int k = 0; k < BW; k++) if (k < bw) am = amax_u(am, v[k]);
+    const int e = mx_exp(__uint_as_float(am), mxf<4>::inv_qmax);
+    const float m = exp2i(-e);
+#pragma unroll
+    for (int j = 0; j < BW / 8; j++) { w[j] = 0u; if (8 * j < bw) { uint32_t hh[4]; sr_hash4(sr, ri * 4 + j, hh); w[j] = sr_e2m1_word(v + 8 * j, m, hh); } }
+    return e;
+}
 /* sr != 0: exact stochastic rounding keyed by (sr, ri, channel) (fp4 only; fp8 keeps round-to-nearest here) */
 template <int B> __device__ __forceinline__ void mx_store_row_b(uint8_t *q, uint8_t *sc, size_t ri, int bw, float *v, uint32_t sr = 0) {
     unsigned am = 0u;

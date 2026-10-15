@@ -54,6 +54,11 @@ void nn_set_tf32(int on);
 void nn_set_prec(int p);
 void nn_set_sr(int on);              /* stochastic rounding of the fp8 gradient operands: backward-data input, weight-gradient gy (env UFSM_SR=1) */
 void nn_set_sr_step(unsigned step);  /* reseed per training step (deterministic per step) */
+unsigned nn_sr_ctr(void);            /* the step's seed draw counter (reordered ops replay draws: nn_sr_set_ctr) */
+void nn_sr_set_ctr(unsigned c);
+unsigned nn_sr_seed(void);           /* one draw of the step's seed sequence (what an op drawing a seed would get) */
+int nn_sr_on(void);
+void nn_exec_prec_note(int pass, int p);   /* executed precision p of pass (0 fwd, 1 bwd-data, 2 wgrad) of the current layer */
 void nn_wmemo_clear(void);   /* the fp4 kernels memoise prepared weights per conv and step: call after a weight change outside a training step (checkpoint load, EMA swap) */
 int nn_get_prec(void);
 /* per-layer precision: the network tags each conv with a layer id (unet order: enc0..3 = 0..3, down0..2 = 4..6, dec2, dec1,
@@ -200,6 +205,14 @@ void nn_gn_silu_apply(const float *x, shape5 s, int G, const float *gamma, const
 /* Backward through silu(gn(x)) in one go: gx SET (may alias gy), ggamma/gbeta ACCUMULATED. */
 void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *gy,
                     float *gx, float *ggamma, float *gbeta, float *scratch);
+/* the same for the output x (MX-fp4, 8 / 16 channels) of the block the head reads, gy being the head's input gradient: recomputed per
+   voxel from the fp16 logit gradient gl (cout channels, head weights wh [cout][C]) as the head's backward-data with SR seed hs would
+   have stored it, gx written in place over x (the bits of the two-op path, the gradient never stored); -1 not covered
+   (nn_gn_silu_bwd_head_ok). nn_head_bwd_x_draws: nn_head_bwd_x draws an SR seed before declining such inputs */
+int nn_gn_silu_bwd_head_ok(int C, int cout);
+int nn_gn_silu_bwd_head(float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const void *gl, int cout,
+                        const float *wh, unsigned hs, float *ggamma, float *gbeta, float *scratch);
+int nn_head_bwd_x_draws(void);
 /* GroupNorm forward fused with SiLU (y = silu(gn(x))), and recompute of both g = gn(x) and silu(g). */
 int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *mean, float *rstd);   /* stats of the stored fp32, 16-bit or MX tensor; -1 for unsupported groups */
 void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd);

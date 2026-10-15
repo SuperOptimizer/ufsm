@@ -127,6 +127,47 @@ int main(void) {
         if (!same) bad++;
         free(ha); free(hb);
     }
+    /* dec[0]'s GN+SiLU backward with the head's input gradient recomputed from the fp16 logit gradient (unet's three level-0 buffers):
+       the same bits as the head's backward-data into an MX-fp4 buffer followed by the GN backward from it (gx, the GroupNorm parameter
+       gradients, the seed sequence); gx in place over x */
+    const uint64_t rs_hg = rs;   /* (the tests below draw the random inputs they drew before this one was added) */
+    for (int C = 8; C <= 16; C *= 2) for (int co = 1; co <= 3; co++) for (int sh = 0; sh < 2; sh++) {
+        nn_set_tf32(1); nn_set_prec(3); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1);
+        const shape5 s = sh ? (shape5){2, C, 6, 10, 14} : (shape5){1, C, 16, 32, 32}, os = {s.n, co, s.d, s.h, s.w};
+        const int Gh = C / 4;
+        const size_t n = shape_numel(s), no = shape_numel(os), NG = (size_t)s.n * Gh, xb = nn_mx4_bytes(s);
+        float *x = dev_rand_wide(n, 1.f), *gam = dev_rand(C, 1.f), *bet = dev_rand(C, 0.5f), *mean = dev_zero(NG), *rstd = dev_zero(NG), *wh = dev_rand((size_t)co * C, 0.5f);
+        void *xm = mx4_from(x, s);
+        if (nn_gn_stats(xm, s, Gh, 1e-5f, mean, rstd)) { printf("  head-recomputing gn bwd: no MX-fp4 stats  FAIL\n"); bad++; }
+        float *glf = dev_rand_wide(no, 1e-2f); void *gl = nn_malloc(no * 2); nn_f32_to_h16(glf, no, gl, 1024.f);
+        void *gout = mx4_new(s), *xf = mx4_new(s);
+        float *gg1 = dev_zero(C), *gb1 = dev_zero(C), *gg2 = dev_zero(C), *gb2 = dev_zero(C), *scr = nn_malloc(nn_gn_scratch(s) + 4096), *cs = nn_malloc(nn_conv3d_scratch(s, co, 1) + 4096);
+        nn_set_sr_step(4242); nn_set_layer(1);
+        nn_conv3d_bwd_data(gl, os, wh, s, 1, 1, gout, cs);
+        nn_gn_silu_bwd(xm, s, Gh, gam, bet, mean, rstd, gout, gout, gg1, gb1, scr);
+        const unsigned c1 = nn_sr_ctr();
+        nn_set_sr_step(4242);
+        nn_d2d(xf, xm, xb);
+        const unsigned hs = nn_sr_seed();
+        const int rc = nn_gn_silu_bwd_head(xf, s, Gh, gam, bet, mean, rstd, gl, co, wh, hs, gg2, gb2, scr);
+        const unsigned c2 = nn_sr_ctr();
+        nn_set_layer(-1);
+        uint8_t *ha = malloc(xb), *hb = malloc(xb); float hg[4][16];
+        nn_sync(); nn_d2h(ha, gout, xb); nn_d2h(hb, xf, xb);
+        nn_d2h(hg[0], gg1, C * 4); nn_d2h(hg[1], gg2, C * 4); nn_d2h(hg[2], gb1, C * 4); nn_d2h(hg[3], gb2, C * 4);
+        size_t nd = 0; for (size_t i = 0; i < xb; i++) nd += ha[i] != hb[i];
+        const int pe = !memcmp(hg[0], hg[1], C * 4) && !memcmp(hg[2], hg[3], C * 4);
+        const char *e = nn_check();
+        const int ok = !rc && !nd && pe && c1 == c2 && !e;
+        printf("  head-recomputing gn bwd %2d ch, %d logits, %s  %zu of %zu bytes differ, param grads %s, seeds %u / %u%s%s\n", C, co, sh ? "odd" : "even",
+               nd, xb, pe ? "equal" : "DIFFER", c1, c2, e ? e : "", ok ? "" : "  FAIL");
+        if (!ok) bad++;
+        free(ha); free(hb);
+        nn_free(x); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd); nn_free(wh); nn_free(xm); nn_free(glf); nn_free(gl); nn_free(gout); nn_free(xf);
+        nn_free(gg1); nn_free(gb1); nn_free(gg2); nn_free(gb2); nn_free(scr); nn_free(cs);
+        nn_set_act_bf16(0); nn_set_grad_bf16(0); nn_set_f16(0); nn_set_sr(0);
+    }
+    rs = rs_hg;
     {   /* stride-1 backward-data with narrow (16-channel) MX-fp4 gy / gx and weights +-6 * 2^-5 (exact in e2m1 / e4m3 / bf16 under any
            block layout): the fp32 reference is then the exact expectation of the SR'd output, so the mean of K converges to it unless
            the gy staging re-rounds (the p16 kernel re-rounded paired voxels to their shared scale to nearest: a bias floor) */
