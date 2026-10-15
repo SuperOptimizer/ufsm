@@ -24,7 +24,8 @@ typedef struct { const float *gamma, *beta, *mean, *rstd; int G; } gnp_t;   /* G
 /* zlo / zhi (spatial split, nn_split_cfg): the GroupNorm statistics of the output (osum) skip the first zlo and the last zhi
    z planes (halo planes owned by the other GPU); 0 / 0 = every plane */
 /* stored_stats: output statistics use decoded rounded MX values, including bias exactly once. */
-typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; unsigned wkey; int zlo, zhi; int stored_stats; unsigned osr; int zi0, Di; } split_t;   /* osr: exact SR seed of an MX-fp4 output (fp4 gradients); zi0 / Di: z-range (MX forward kernels: output plane z reads input plane
+typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; unsigned wkey; int zlo, zhi; int stored_stats; unsigned osr; int zi0, Di; int o_pad; } split_t;   /* o_pad: the split output's
+                                                                     second tensor starts at padded row o_pad (0: o_split rounded up to 32; 16 for two <= 16-channel MX tensors) */   /* osr: exact SR seed of an MX-fp4 output (fp4 gradients); zi0 / Di: z-range (MX forward kernels: output plane z reads input plane
    z + zi0 of a depth-Di input; Di 0 = off) */
 /* k=3 stride 1 forward / weight gradient with the same semantics as the BF16 tensor-core paths in nn.cu
    (conv_fwd_tc / launch_bwd_w_tc): xbf / ybf = activation (and x2 / y2) storage type, 0 fp32, 1 bf16, 2 fp16; the
