@@ -573,6 +573,8 @@ template <typename T, typename TO> static void p16_f4(const void *x, shape5 xs, 
     default: launch_f4p<4, 2, T, TO>(dim3(), x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     }
 }
+/* the 16-wide decoder conv1 with the fused upsample, MX-fp4 in / out (lp_f4up.cu): 0 = not this shape (the caller's path) */
+int lp_f4u_fwd(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, const split_t &sp);
 template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp) {
     static int uph2 = -1; if (uph2 < 0) uph2 = getenv("UFSM_UP_H2") ? atoi(getenv("UFSM_UP_H2")) : 1;
     if (sp.up && uph2) sp.up = 2;   /* the fused upsample blends in half2 (stage_up_smem_h2); UFSM_UP_H2=0: fp32 */
@@ -590,6 +592,10 @@ template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const
     static int opad_env = -1; if (opad_env < 0) opad_env = getenv("UFSM_F4_OPAD16") ? atoi(getenv("UFSM_F4_OPAD16")) : 1;
     if (opad_env && g4_exact && IS_MX(TO) && sp.y2 && Ox <= 16 && cout - Ox <= 16) { OxP = 16; Cop = 32; sp.o_pad = 16; }
     if (xs.c <= 16 && !sp.x2 && !sp.up && sp.gp2.G == 0) { p16_f4<T, TO>(x, xs, w, b, cout, y, Cop, Ox, OxP, gp, osum, Go, sp); return; }   /* K = [kx0 | kx1 | kx2 | kx3] x 16, a scale per kx */
+    if constexpr (IS_MX4(T) && IS_MX4(TO)) {   /* the 16-wide decoder conv1 with the fused upsample (lp_f4up.cu); UFSM_F4U=0: the chunk kernel */
+        static int f4u = -1; if (f4u < 0) f4u = getenv("UFSM_F4U") ? atoi(getenv("UFSM_F4U")) : 1;
+        if (f4u && sp.up == 2 && lp_f4u_fwd(x, xs, w, b, cout, y, gp, osum, Go, sp)) return;
+    }
     const int nch = Cip / 32;
     const size_t nq = (size_t)28 * Cop * Cip / 2, ns = (size_t)28 * Cop * nch;
     const int pCx = IS_MX(T) ? Cx : -1, pOx = IS_MX(TO) && sp.y2 ? Ox : -1;
