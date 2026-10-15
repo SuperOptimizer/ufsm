@@ -147,7 +147,19 @@ struct unet {
     int sko, sk_out;                         /* the coarse skips enc[1 .. L-2].a2 at the start of dec[0].a2's buffer, on the host from their
                                                 decoder's conv1 to its backward */
     void *h_sk[UNET_MAXLEV], *ev_sk[UNET_MAXLEV][4];
-    size_t logits_bytes;                     /* lean: logits at the start of A, the 16-bit logit gradient after them */
+    /* three level-0 buffers (UFSM_L0_3BUF, the chain above at an 8- or 16-channel level 0; l3_want): X1 = enc[0].a1 = dec[0].a1 = gout[0] =
+       gskip[0] = gB[0] (the input in enc[0]'s backward), X2 = enc[0].a2 = dec[0].a2 (the batch head at the forward's start, the coarse
+       backward homes of gco / dno / sko, enc[0]'s a1 in its backward), X3 = gA[0] = the input in the forward (then the coarse forward homes)
+       = the fp16 logits and their in-place gradient, the batch tail at its end, the skip again from dec[0]'s backward to enc[0]'s. The
+       head's input gradient is never stored (nn_gn_silu_bwd_head recomputes it inside dec[0]'s GroupNorm backward); the skip comes back
+       twice (after dec[0]'s up transient into X2, after dec[0]'s backward into X3), the encoder's a1 into X2 after down0's backward */
+    int l3b, l3_no, l3_skip_in;              /* l3_no: unavailable (a host buffer), the four-buffer layout; l3_skip_in: dec[0]'s conv1 weight gradient
+                                                brings the skip back after building its up transient */
+    float *l3x[4]; size_t l3xb[4], l3_lo;    /* X1..X3 and their bytes; X3's bytes below the batch tail */
+    float *skf[UNET_MAXLEV], *skb[UNET_MAXLEV], *dnf[UNET_MAXLEV], *dnb[UNET_MAXLEV];   /* the coarse skips / down-conv outputs: forward homes (X3),
+                                                backward homes (X2) */
+    size_t bat_head, bat_tail;               /* unet_set_batch_bytes: the trainer's batch [head | tail] (the three-buffer layout sizes X3 for the tail) */
+    size_t logits_bytes;                    /* lean: logits at the start of A, the 16-bit logit gradient after them */
     int logits_h16;                          /* lean 2: fp16 logits, so the 16-bit logit gradient fits after them in A */
     int lh16_req;                            /* unet_set_fp16_logits: fp16 logits where the MX head writes them into their own buffer */
     int head_ext;                            /* unet_set_head_ext: training runs the head per z-slab outside (no whole-window logits) */
@@ -473,7 +485,13 @@ static int sko_on(void) { if (g_sko < 0) g_sko = getenv("UFSM_SKIP_OFFLOAD") ? u
 void unet_set_skip_offload(int on) { g_sko = on; }
 #define SKO_DEFER ((float *)(uintptr_t)1)   /* build: an encoder a2 placed later */
 int unet_share_enc_a1(void) { return share_enc_a1(); }
-#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8) + 16384 * unet_wide_up_grad() + 32768 * keep_coarse_a1() + 65536 * share_enc_a1() + 131072 * grad_mx4() + 262144 * up_wg_chunk() + 524288 * a1_offload() + 1048576 * xin_offload() + 2097152 * a0_share_on() + 4194304 * gco_on() + 8388608 * dno_on() + 16777216 * sko_on() + 33554432 * infer_alias() + 67108864 * (infer_slab() > 0) + 134217728 * infer_offload())
+/* three level-0 buffers instead of four (unet.l3b): -9 B per level-0 voxel at 16 channels (36 -> 27 B at the backward's peak), for
+   three exposed host copies (the skip into X2 in dec[0]'s conv1 weight gradient, the encoder's a1 before enc[0]'s backward, the input
+   before the stem's weight gradient). Opt-in (env UFSM_L0_3BUF=1) until its paired checks pass */
+static int g_l0_3buf = -1;
+static int l0_3buf_on(void) { if (g_l0_3buf < 0) g_l0_3buf = getenv("UFSM_L0_3BUF") ? ufsm_env_on("UFSM_L0_3BUF") : 0; return g_l0_3buf; }
+void unet_set_l0_3buf(int on) { g_l0_3buf = on; }   /* -1: the env / default */
+#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8) + 16384 * unet_wide_up_grad() + 32768 * keep_coarse_a1() + 65536 * share_enc_a1() + 131072 * grad_mx4() + 262144 * up_wg_chunk() + 524288 * a1_offload() + 1048576 * xin_offload() + 2097152 * a0_share_on() + 4194304 * gco_on() + 8388608 * dno_on() + 16777216 * sko_on() + 33554432 * infer_alias() + 67108864 * (infer_slab() > 0) + 134217728 * infer_offload() + 268435456 * l0_3buf_on())
 /* chunk mode (recompute, 16-bit activations and gradients, fused upsample): the decoder's up-part input gradient is
    produced in w[i]-channel chunks, each upsample-backwarded straight into its slice of gout[i + 1], so the shared
    gradient buffer B only needs w[i] channels (env UFSM_CHUNK_UP=0 turns it off) */
@@ -511,6 +529,15 @@ static int interior(const unet *u, const void *p) {
 }
 static void free_acts(unet *u) {
     float *pp[UNET_MAXLEV * 30 + 8]; int np = 0;
+    if (u->l3b) {   /* the level-0 tensors and the coarse homes back where they were allocated / placed first */
+        if (u->a2_out || u->a1_out[0] || u->xin_out) nn_sync();
+        u->enc[0].a1 = u->l3x[1]; u->enc[0].a2 = u->l3x[2];
+        for (int i = 0; i < u->cfg.nlev && !g_dry; i++) {
+            float *q[4] = {u->skf[i], u->skb[i], u->dnf[i], u->dnb[i]};
+            for (int j = 0; j < 4; j++) if (q[j]) nn_storage_forget(q[j]);
+        }
+        for (int i = 0; i < UNET_MAXLEV; i++) u->skf[i] = u->skb[i] = u->dnf[i] = u->dnb[i] = nullptr;
+    }
     for (int i = 0; i < u->cfg.nlev; i++) {
         block *bs[2] = {&u->enc[i], &u->dec[i]};
         for (int k = 0; k < 2; k++) {
@@ -561,6 +588,7 @@ static void free_acts(unet *u) {
     if (u->h_r) { if (u->r_out || u->r_in) nn_sync(); nn_host_free(u->h_r); }
     u->h_r = nullptr; u->p3 = u->r_out = u->r_in = 0; u->R = u->Xp = u->Yp = nullptr; u->r_bytes = u->x_bytes = u->y_bytes = 0; u->zr = 0;
     u->gco = 0; u->gout_x1 = u->gout_home1 = nullptr; u->dno = u->dn_out = 0; u->sko = u->sk_out = 0;
+    u->l3b = u->l3_skip_in = 0; u->l3_lo = 0; for (int k = 0; k < 4; k++) { u->l3x[k] = nullptr; u->l3xb[k] = 0; }
     u->built = 0; u->act_bytes = 0; u->grad_bytes = 0;
     u->last_a1_live = 0;
 }
@@ -608,10 +636,26 @@ static int dc1_next(const unet *u, int z0, int *B) {
     const int sk = s < fy ? s : fy;
     return sk >= 4 ? sk : 0;
 }
+static int fakeq(void);
+static int fakeq_grad(void);
+/* the three level-0 buffers (unet.l3b) apply: a training build of the production chain (MX-fp4 activations and gradients, lean 2 chunked,
+   recompute 1, the shared encoder a1 offloaded, the level-0 A share, the input / coarse gradient / down-output / skip offloads) with an
+   8- or 16-channel level 0 the head and the decoder above it fit (UPW(1) <= w[0]), whole-window logits of <= 4 channels from the recomputing
+   GN backward's kernels, no split / single-conv decoders / residual blocks / deep supervision; build_acts checks the rest (host buffers) */
+static int l3_want(const unet *u, int train) {
+    const int L = u->cfg.nlev, *w = u->cfg.widths;
+    if (!train || !l0_3buf_on() || u->l3_no || L < 3) return 0;
+    if (!(nn_get_tf32() && ABF && GBF && act_mx4() && grad_mx4() && grad_dt() == act_dt() && lean() >= 2 && chunk_up() && recompute() == 1 && !recompute_a1())) return 0;
+    if (!(share_enc_a1() && a1_offload() && a0_share_on() && gco_on() && dno_on() && sko_on() && xin_offload() && input_mx())) return 0;
+    if ((w[0] != 8 && w[0] != 16) || UPW(1) > w[0] || UPW(0) != w[0] || unet_wide_up_grad()) return 0;
+    if (any_single(u) || u->nrb_any || u->head_ext || sp_on(u) || u->cfg.ds_levels || fakeq() || fakeq_grad()) return 0;
+    return nn_gn_silu_bwd_head_ok(w[0], u->cfg.cout);
+}
 static void build_acts(unet *u, shape5 xs, int train) {
     free_acts(u);
     int L = u->cfg.nlev;
     const int *w = u->cfg.widths;
+    u->l3b = l3_want(u, train);
     /* inference on the tensor-core path: conv outputs that die within the forward share two scratch buffers. T1 holds
        every a1 (dead after conv2). T2 holds the down-conv outputs (dead after the next block's conv1) and the a2 that are
        not kept (decoder; encoder too unless recompute mode, where the encoder a2 are the skips); the upsampled decoder
@@ -738,12 +782,22 @@ static void build_acts(unet *u, shape5 xs, int train) {
     for (int i = 0; i < L; i++) {
         shape5 bin = u->ls[i]; bin.c = i == 0 ? u->cfg.cin : w[i - 1];
         float *ea1 = T1;
-        if (sea && i < L - 1) { shape5 y = u->ls[i]; y.c = w[i]; ea1 = dalloc_act_s(u, y); }   /* shared with dec[i].a1 (below) */
+        if (sea && i < L - 1 && u->l3b && i == 0) {   /* X1 (unet.l3b): also the up transient, level 0's B / gskip, the input in enc[0]'s backward */
+            shape5 y = u->ls[0]; y.c = w[0];
+            size_t b = act_bytes_of(y), xb = nn_mx_bytes(xs, unet_input_prec());
+            b = ((xb > b ? xb : b) + 255) & ~(size_t)255;
+            g_mlab = "level-0 X1 (a1 / up transient / gskip / input)";
+            ea1 = dalloc_oom(dmalloc(b), b); u->act_bytes += b; dstorage(ea1, b, act_dt());
+            u->l3x[1] = ea1; u->l3xb[1] = b;
+            g_mlab = "encoder a1 / a2 / GN stats + down outputs";
+        } else if (sea && i < L - 1) { shape5 y = u->ls[i]; y.c = w[i]; ea1 = dalloc_act_s(u, y); }   /* shared with dec[i].a1 (below) */
         if (slab && i == 0) ea1 = X;
         if (slab1 && i == 1) ea1 = Y;
+        if (u->l3b && i == 0) g_mlab = "level-0 X2 (skip / dec[0].a2 / coarse bwd homes)";
         build_block_acts(u, &u->enc[i], bin, train, i == L - 1, ea1,
                          slab && i == 0 ? X : slab1 && i == 1 ? Y : u->p3 ? SK[i] : rc && train && sko_on() && !u->nrb_any && i > 0 && i < L - 1 ? SKO_DEFER : rc || u->cfg.enc_blocks[i] ? nullptr : T2, nullptr);   /* recompute mode keeps the (small) outputs that
                                                                                                                          get upsampled; training: the coarse skips placed later */
+        if (u->l3b && i == 0) { u->l3x[2] = u->enc[0].a2; u->l3xb[2] = act_bytes_of(u->enc[0].ys); g_mlab = "encoder a1 / a2 / GN stats + down outputs"; }
         if (sea && i < L - 1) {
             u->enc[i].a1_shared = 1;
             if (a1_offload() && !g_dry) {
@@ -782,13 +836,13 @@ static void build_acts(unet *u, shape5 xs, int train) {
            is absent and the next decoder normalizes a2 on the fly. Training keeps separate buffers. */
         build_block_acts(u, &u->dec[i], cin, train, i > 0,
                          slab && i == 0 ? X : slab1 && i == 1 ? Y : sea ? u->enc[i].a1 : train && i > 0 && keep_coarse_a1() ? nullptr : T1,
-                         u->dec[i].single ? nullptr : reuse_skip && i == 0 ? u->enc[0].a2 : slab1 && i == 1 ? Y : T2,
+                         u->dec[i].single ? nullptr : (reuse_skip || u->l3b) && i == 0 ? u->enc[0].a2 : slab1 && i == 1 ? Y : T2,   /* (l3b: X2) */
                          reuse_skip && i > 0 ? stage_out(u, i)->a2 : nullptr);
         if (sea) u->dec[i].a1_lent = 1;
     }
     shape5 os = u->ls[0]; os.c = u->cfg.cout;
     u->logits = nullptr; u->logits_h16 = 0;
-    int lg_gout = 0, lg_fit = 1;   /* fp16 logits at the start of gout[0] (MX-fp4 gradients, below); lg_fit: they and their gradient fit
+    int lg_gout = 0, lg_fit = 1, l3_ok = 1;   /* fp16 logits at the start of gout[0] (MX-fp4 gradients, below); lg_fit: they and their gradient fit
                                       the level-0 buffers */
     if (train) {
         if (nn_get_tf32()) {
@@ -847,6 +901,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 if (u->a0_share && lg_fit) lg_gout = 1;   /* the logit gradient goes to enc[0].a2's buffer */
                 if (u->a0_share && !lg_fit) lg_gout = 0;   /* (and the logits to a buffer of their own: fp16 with unet_set_fp16_logits) */
                 if (lg_gout) { u->logits = nullptr; u->logits_h16 = 1; }
+                if (u->l3b) { lg_gout = 0; u->logits = nullptr; u->logits_h16 = 1; }   /* (l3b: the fp16 logits in X3, below) */
             }
             u->logits_bytes = shape_numel(os) * (u->logits_h16 ? 2 : 4);
             g_mlab = "gradient buffers gout / gskip (per level)";
@@ -875,18 +930,40 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 u->gco = gco_on() && gmx && u->nob && u->a0_share && recompute() == 1 && !recompute_a1() && L > 1 && grad_dt() == act_dt()
                          && need <= hb && ((gobs[1] + 255) & ~(size_t)255) + 256 <= act_bytes_of(u->dec[0].ys);
             }
+            if (u->l3b) {   /* X3 (unet.l3b): level 0's A, the input (5 B per voxel), then the coarse forward homes from 256 on, then the fp16 logits
+                               and their gradient: all below the trainer's batch tail at its end (unet_batch_scratch2) */
+                size_t lo = 256;
+                for (int k = 1; k < L - 1; k++) lo += (act_bytes_of(u->enc[k].ys) + 255) & ~(size_t)255;
+                for (int k = 0; k < L - 1; k++) { shape5 ds = u->ls[k + 1]; ds.c = w[k]; lo += (act_bytes_of(ds) + 255) & ~(size_t)255; }
+                const size_t xb = nn_mx_bytes(xs, unet_input_prec()), lb = shape_numel(os) * 2;
+                if (xb > lo) lo = xb;
+                if (lb > lo) lo = lb;
+                lo = (lo + 255) & ~(size_t)255;
+                shape5 d0 = u->ls[0]; d0.c = w[0];
+                size_t b = act_bytes_of(d0);
+                if (lo + ((u->bat_tail + 255) & ~(size_t)255) > b) b = lo + ((u->bat_tail + 255) & ~(size_t)255);
+                b = (b + 255) & ~(size_t)255;
+                if (gobs[0] > u->l3xb[1]) l3_ok = 0;   /* (X1 is level 0's B too) */
+                g_mlab = "level-0 X3 (A / input / logits / batch tail)";
+                u->l3x[3] = dalloc_oom(dmalloc(b), b); u->act_bytes += b; u->grad_bytes += b; dstorage(u->l3x[3], b, grad_dt());
+                u->l3xb[3] = b; u->l3_lo = lo;
+                g_mlab = "gradient buffers gout / gskip (per level)";
+            }
             size_t gco_off = act_bytes_of(u->dec[0].ys) & ~(size_t)255;
             for (int i = 0; i < L; i++) {
-                const size_t gob = gobs[i];
-                u->gA[i] = u->a0_share && i < L - 1 && UPW(i) >= w[i] ? u->dec[i].a2 : A;   /* dead after the first op of dec[i]'s backward */
-                if (u->gco && i > 0) {
+                const size_t gob = u->l3b && i == 0 ? u->l3xb[1] : gobs[i];
+                u->gA[i] = u->l3b && i == 0 ? u->l3x[3] : u->a0_share && i < L - 1 && UPW(i) >= w[i] ? u->dec[i].a2 : A;   /* dead after the first op of dec[i]'s backward */
+                if (u->l3b && i == 0) u->gout[0] = u->l3x[1];   /* (X1: B and gskip of level 0 as well) */
+                else if (u->gco && i > 0) {
                     gco_off -= (gob + 255) & ~(size_t)255;
                     u->gout[i] = (float *)((char *)u->dec[0].a2 + gco_off);
                     dstorage(u->gout[i], gob, grad_dt());
                     if (i == 1) {
                         u->gout_home1 = u->gout[1];
-                        u->gout_x1 = (float *)((char *)u->dec[0].a1 + ((act_bytes_of(u->dec[0].ys) - gob) & ~(size_t)255));
-                        dstorage(u->gout_x1, gob, grad_dt());
+                        if (!u->l3b) {   /* (l3b: X1 takes dec[0]'s up transient; gout[1] stays home, its skip comes back later) */
+                            u->gout_x1 = (float *)((char *)u->dec[0].a1 + ((act_bytes_of(u->dec[0].ys) - gob) & ~(size_t)255));
+                            dstorage(u->gout_x1, gob, grad_dt());
+                        }
                     }
                 } else
                 u->gout[i] = gmx ? dalloc_grad_mx(u, gob) : dalloc_grad(u, gob / (GBF ? 2 : 4) + 1);
@@ -905,7 +982,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 size_t dn = 0;
                 for (int i = 0; i < L - 1; i++) { shape5 ds = u->ls[i + 1]; ds.c = w[i]; dn += (act_bytes_of(ds) + 255) & ~(size_t)255; }
                 const int idt = ABF && input_mx() ? unet_input_prec() : 0;
-                const size_t xlo = idt && xin_offload() ? (nn_mx_bytes(xs, idt) + 255) & ~(size_t)255 : 0;   /* (if the input will share it) */
+                const size_t xlo = idt && xin_offload() && !u->l3b ? (nn_mx_bytes(xs, idt) + 255) & ~(size_t)255 : 0;   /* (if the input will share it; l3b: X3) */
                 u->dno = u->gco && dno_on() && gco_off >= dn + xlo + 256;
                 for (int i = 0; u->dno && !g_dry && i < L - 1; i++) {
                     shape5 ds = u->ls[i + 1]; ds.c = w[i];
@@ -938,10 +1015,16 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 }
                 g_mlab = lab;
             }
+            if (u->l3b && u->dno && u->sko) {   /* the coarse homes: backward as placed above (X2), forward in X3 from 256 on (unet.l3b) */
+                size_t o = 256;
+                for (int k = 1; k < L - 1; k++) { u->skb[k] = u->enc[k].a2; u->skf[k] = (float *)((char *)u->l3x[3] + o); o += (act_bytes_of(u->enc[k].ys) + 255) & ~(size_t)255; }
+                for (int k = 0; k < L - 1; k++) { shape5 ds = u->ls[k + 1]; ds.c = w[k]; u->dnb[k] = u->downo[k]; u->dnf[k] = (float *)((char *)u->l3x[3] + o); o += (act_bytes_of(ds) + 255) & ~(size_t)255; }
+            }
             if (lg_gout) {
                 if (u->gout_cap[0] >= (u->logits_bytes + 255) / 256 * 256) u->logits = u->gout[0];
                 else u->logits = A;   /* fp16 logits in A, the logit gradient separate */
             }
+            if (u->l3b) u->logits = u->l3x[3];
             g_mlab = "decoder up-part transient (rc_extra)";
             if (act_mx8() && recompute() && !up_wg_chunk()) {   /* the MX weight-gradient transient of the decoder up part where it does not fit its level's
                                                  buffer: allocated now so the dry build (memory planner) counts it */
@@ -998,16 +1081,26 @@ static void build_acts(unet *u, shape5 xs, int train) {
         const int idt = unet_input_prec(); const size_t xb_ = nn_mx_bytes(xs, idt);
         if (ialias && !slab && act_bytes_of(u->enc[0].ys) >= xb_) { u->xin = u->enc[0].a2; u->xin_inf = 1; u->xin_bytes = xb_; }   /* (slabs: the stem writes X) */
 
-        if (train && nn_get_tf32() && act_mx8() && xin_offload() && L > 1 && act_bytes_of(u->dec[0].ys) >= xb_) {
+        if (train && nn_get_tf32() && act_mx8() && xin_offload() && L > 1 && (u->l3b || act_bytes_of(u->dec[0].ys) >= xb_)) {
             void *h = g_dry ? nullptr : nn_host_alloc_try(xb_);
             if (g_dry || h) {
-                u->xin = u->dec[0].a2; u->xin_shared = 1; u->h_xin = h; u->xin_bytes = xb_;
+                u->xin = u->l3b ? u->l3x[3] : u->dec[0].a2; u->xin_shared = 1; u->h_xin = h; u->xin_bytes = xb_;
                 if (!g_dry) for (int k = 0; k < 4; k++) if (!u->ev_xin[k]) u->ev_xin[k] = nn_event_create();
             } else fprintf(stderr, "unet: cannot pin %.2f GB for the input offload; a separate input buffer\n", xb_ / 1e9);
         }
         if (!u->xin && !u->ct_stem) u->xin = dalloc_input(u, xs);   /* (CT stem: none; unet_forward_x allocates one on demand) */
     }
     u->glb = nullptr;   /* allocated on first use for a fp32 logit gradient */
+    if (u->l3b && !(l3_ok && u->a0_share && u->gco && u->dno && u->sko && u->xin_shared && u->xin == u->l3x[3] && u->logits == u->l3x[3]
+                    && (g_dry || (u->h_a1[0] && u->h_a2 && u->h_xin)))) {   /* (a size, a host buffer): the four-buffer layout */
+        fprintf(stderr, "unet: three level-0 buffers unavailable (A share %d, coarse shares %d %d %d, input %d, host %d); the four-buffer layout\n",
+                u->a0_share, u->gco, u->dno, u->sko, u->xin_shared, g_dry || (u->h_a1[0] && u->h_a2 && u->h_xin));
+        u->l3_no = 1;
+        free_acts(u);
+        if (g_dry) g_nmrep = 0;
+        build_acts(u, xs, train);
+        return;
+    }
     u->xs = xs; u->built = 1; u->train = train; u->mode = UMODE();
 }
 
@@ -1051,6 +1144,7 @@ int unet_input_converted(void) { return input_mx(); }   /* the 16-bit network in
    writes while reading the logit gradient), lean 1 at the start of B; nullptr if it does not fit */
 void *unet_logit_grad_scratch(unet *u, size_t bytes) {
     if (!(u->built && u->train && lean())) return nullptr;
+    if (u->l3b) return nullptr;   /* (three level-0 buffers: the gradient over the fp16 logits in X3) */
     if (u->nob && u->a0_share) return u->logits == u->gout[0] && act_bytes_of(u->enc[0].ys) >= bytes ? (void *)u->enc[0].a2 : nullptr;
     if (u->nob) {
         const size_t off = (u->logits_bytes + 255) & ~(size_t)255;
@@ -1086,11 +1180,33 @@ void *unet_grad_scratch(unet *u, size_t bytes) { return u->built && u->train && 
    conversion, before the head writes the logits) allowed over them */
 void *unet_batch_scratch(unet *u, size_t head, size_t tail) {
     if (!(u->built && u->train && lean() && u->nob && u->gB[0])) return nullptr;
+    if (u->l3b) return nullptr;   /* (unet_batch_scratch2) */
     if (u->logits != u->gout[0]) return u->gB_bytes >= head + tail ? (void *)u->gB[0] : nullptr;
     if (u->gB_bytes < head + tail) return nullptr;
     const size_t p = (u->gB_bytes - head - tail) & ~(size_t)255, lg = (u->logits_bytes + 255) & ~(size_t)255;
     return p + head >= lg ? (void *)((char *)u->gB[0] + p) : nullptr;
 }
+/* three level-0 buffers (unet.l3b): the batch's head (the input, read by the forward's conversion before enc[0]'s conv2) in X2 (X1 if
+   larger), its tail (targets, masks: read by the loss after the forward) at X3's end, *tailp; nullptr if not this layout or too large.
+   unet_set_batch_bytes before the build sizes X3 for the tail */
+void *unet_batch_scratch2(unet *u, size_t head, size_t tail, void **tailp) {
+    *tailp = nullptr;
+    if (!(u->built && u->train && u->l3b)) return nullptr;
+    const size_t p = u->l3xb[3] >= tail ? (u->l3xb[3] - tail) & ~(size_t)255 : 0;
+    if (!tail || p < u->l3_lo) return nullptr;
+    void *h = head <= u->l3xb[2] ? (void *)u->l3x[2] : head <= u->l3xb[1] ? (void *)u->l3x[1] : nullptr;
+    if (h) *tailp = (char *)u->l3x[3] + p;
+    return h;
+}
+void unet_set_batch_bytes(unet *u, size_t head, size_t tail) {
+    u->bat_head = head;   /* (placed by unet_batch_scratch2; X3's size follows the tail) */
+    if (u->bat_tail == tail) return;
+    if (u->built && u->l3b) free_acts(u);
+    u->bat_tail = tail;
+}
+int unet_l0_3buf(const unet *u) { return u->built && u->l3b; }
+static int g_last_dry_l3b;
+int unet_last_dry_l3b(void) { return g_last_dry_l3b; }   /* the last dry build (unet_train_bytes) used the three level-0 buffers */
 /* device bytes of the training activations / gradients at input shape xs under the current storage modes, without allocating
    (dry build); the model is left unbuilt */
 static size_t dry_bytes(unet *u, shape5 xs, int train) {
@@ -1099,6 +1215,7 @@ static size_t dry_bytes(unet *u, shape5 xs, int train) {
     g_mrep_nv = getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 2 ? (double)xs.n * xs.d * xs.h * xs.w : 0;
     build_acts(u, xs, train);
     g_mrep_nv = 0;
+    g_last_dry_l3b = u->l3b;
     const size_t b = u->act_bytes;
     if (ufsm_env_on("UFSM_MEM_REPORT")) {
         const double nv = (double)xs.n * xs.d * xs.h * xs.w;
@@ -1150,6 +1267,7 @@ static int fakeq_grad(void) {
 static void rc_fail(const char *what) { fprintf(stderr, "unet: recompute mode: %s unsupported\n", what); abort(); }
 /* transient buffer for the upsampled decoder input at level i (shape s), typed as activation storage */
 static int g_in_bwd = 0;   /* inside unet_backward_x (lean mode: B holds the trainer's batch until then) */
+static void l3_skip_return(unet *u);
 static float *rc_tmp(unet *u, int level, shape5 s, int *reg) {
     if (u->train && lean() && !g_in_bwd) rc_fail("lean mode: a forward transient in the gradient buffer (it holds the batch)");
     if (u->train && u->nob && !u->rc_ok) rc_fail("lean 2: a transient while the level's gradient buffer is live");
@@ -1248,6 +1366,7 @@ static int dec_conv1(unet *u, block *b, int level, float *y, int G, float *m, fl
         }
     }
     int reg; float *up = rc_up(u, b, level, &reg);
+    if (gy && u->l3_skip_in && b == &u->dec[0]) l3_skip_return(u);
     if (gy) PROF(2, rv = nn_conv3d_bwd_weight_x(up, nullptr, x2b->a2, &g2, b->c_split, 0, b->xs, gy, b->ys, 3, 1, gw, gbias));
     else PROF(0, rv = nn_conv3d_fwd_x(up, nullptr, x2b->a2, &g2, b->c_split, 0, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, y, G, 1e-5f, m, r));
     rc_done(u, up, reg);
@@ -1348,6 +1467,32 @@ static void slab_run(unet *u, block *b, int level, int conv, const float *x, int
     if (dc1 && u->r_in && !waited) nn_stream_wait(0, u->ev_r[3]);
     if (dc1) u->r_out = u->r_in = 0;
 }
+/* l3b: the coarse skips enc[1 .. L-2].a2 and down-conv outputs downo[0 .. L-2] at their forward homes (X3: fwd 1, the forward's start)
+   or backward homes (X2: fwd 0, after dec[0]'s backward, before their copies back), registered there; the readers' input pointers move
+   with the down-conv outputs (enc[k + 1]'s conv1 weight gradient, its down_norm GroupNorm backward) */
+static void l3_homes(unet *u, int fwd) {
+    const int L = u->cfg.nlev, *w = u->cfg.widths;
+    for (int k = 0; k < L - 1; k++) {
+        shape5 ds = u->ls[k + 1]; ds.c = w[k];
+        nn_storage_forget(fwd ? u->dnb[k] : u->dnf[k]);
+        u->downo[k] = fwd ? u->dnf[k] : u->dnb[k];
+        nn_set_storage(u->downo[k], act_bytes_of(ds), act_dt());
+        if (!fwd) { u->enc[k + 1].in = u->downo[k]; if (u->cfg.down_norm) u->enc[k + 1].inx = u->downo[k]; }   /* (the forward sets them) */
+        if (k >= 1) {
+            nn_storage_forget(fwd ? u->skb[k] : u->skf[k]);
+            u->enc[k].a2 = fwd ? u->skf[k] : u->skb[k];
+            nn_set_storage(u->enc[k].a2, act_bytes_of(u->enc[k].ys), act_dt());
+        }
+    }
+}
+/* l3b, dec[0]'s conv1 weight gradient: its up transient is in X1 (the coarse silu(gn(a2)) it was upsampled from in gout[1]'s home in X2,
+   dead now): the skip back into X2 (exposed) */
+static void l3_skip_return(unet *u) {
+    u->l3_skip_in = 0;
+    nn_set_storage(u->enc[0].a2, act_bytes_of(u->enc[0].ys), act_dt());
+    nn_offload_copy(u->enc[0].a2, u->h_a2, act_bytes_of(u->enc[0].ys), 0, u->ev_a2[2], u->ev_a2[3]);
+    nn_stream_wait(0, u->ev_a2[3]);
+}
 static void block_fwd(unet *u, block *b, int level, const float *x) {
     b->in = x;
     int G = G_of(u, b->c1.cout);
@@ -1392,6 +1537,7 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
             if (u->xin_shared && u->xin_out) nn_stream_wait(0, u->ev_xin[1]);
             if (u->dno && u->dn_out) for (int k = 0; k < u->cfg.nlev - 1; k++) nn_stream_wait(0, u->ev_dn[k][1]);
             if (u->sko && u->sk_out) for (int k = 1; k < u->cfg.nlev - 1; k++) nn_stream_wait(0, u->ev_sk[k][1]);
+            if (u->l3b && u->a2_out) nn_stream_wait(0, u->ev_a2[1]);   /* (l3b: a2 over the skip in X2) */
         }
         if (b == &u->enc[1] && u->sko) {   /* the first coarse skip goes over the input in dec[0].a2's buffer: its copy out done */
             if (u->xin_shared && u->xin_out) nn_stream_wait(0, u->ev_xin[1]);
@@ -1478,6 +1624,11 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     /* Without MX gradients the four-channel input can stay 16-bit; the tap-packed FP8 kernel writes MX a1.
        MX gradients require a packed input for the available weight-gradient kernels (eight-wide MX rows). */
     const int xin_mx = input_mx();   /* MX-fp8 gradients require an MX x for the available weight-gradient kernels */
+    if (u->l3b) {   /* the backward left the input in X1, the encoder's a1 in X2, the skip in X3, the coarse tensors at their backward homes */
+        u->enc[0].a1 = u->l3x[1]; u->enc[0].a2 = u->l3x[2];
+        nn_set_storage(u->l3x[1], u->l3xb[1], act_dt()); nn_set_storage(u->l3x[2], u->l3xb[2], act_dt());
+        l3_homes(u, 1);
+    }
     if (u->xin_shared) { nn_set_storage(u->xin, u->xin_bytes, unet_input_prec()); u->a2_stale = 1; }   /* dec[0].a2's buffer holds the input until the decoder */
     u->fwd_train = train;
     if (u->a0_share) nn_set_storage(u->enc[0].a2, act_bytes_of(u->enc[0].ys), act_dt());   /* a backward left the input in it */
@@ -1519,6 +1670,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         cur = so->s2;
         if (i < L - 1) {
             nn_set_layer(L + i);
+            if (i == 0 && u->l3b && u->xin_out) nn_stream_wait(0, u->ev_xin[1]);   /* (l3b: down0's output over the input in X3: its copy out done) */
             if (recompute()) { nn_gn_t g = gn_out(u, so); int r; PROF(0, r = nn_conv3d_fwd_x(so->a2, &g, nullptr, nullptr, 0, 0, so->ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i], 0, 0.f, nullptr, nullptr)); if (r) rc_fail("down conv"); }
             else PROF(0, nn_conv3d_fwd(cur, so->ys, P(u, u->down[i].w), P(u, u->down[i].b), w[i], 3, 2, u->downo[i]));
             { shape5 ds = u->ls[i + 1]; ds.c = w[i]; sp_halo(u, u->downo[i], ds, 0); }
@@ -1582,6 +1734,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     if (!(u->head_ext && !u->logits)) {   /* (head slabs: the trainer runs the head per z-slab, unet_head_fwd_z; a training build has no
                                             whole-window logits, so its validation forwards (train 0, no rebuild) skip the head too) */
         if (u->lg_t1) nn_set_storage(u->logits, u->lg_bytes, 0);   /* plain fp32 plane-major logits over dec[0].a1 (or the level-1 buffer) */
+        if (u->l3b) nn_storage_forget(u->l3x[3]);   /* fp16 logits over X3 (the coarse forward homes copied out: dec[0]'s conv2 waited) */
         nn_set_head_out_h16(u->logits_h16);
         const int hc0 = !u->train && u->head_nc ? u->head_c0 : 0, hnc = !u->train && u->head_nc ? u->head_nc : u->cfg.cout;   /* rows of the 1^3 head */
         const float *hw = P(u, u->head.w) + (size_t)hc0 * w[0], *hb = P(u, u->head.b) + hc0;
@@ -1664,7 +1817,7 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
         if (!pre) PROF(3, nn_gn_silu_bwd(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* B = d/d a2 */
         if (gid) nn_add_into(B, gid, b->ys, GBF);
         if (save) nn_d2d(save, B, gbytes);
-        if (b == &u->enc[0] && u->a0_share && u->xin_shared) {   /* a2 read for the last time: the input into its buffer for conv1's weight gradient */
+        if (b == &u->enc[0] && u->a0_share && u->xin_shared && !u->l3b) {   /* a2 read for the last time: the input into its buffer for conv1's weight gradient */
             nn_set_storage(b->a2, u->xin_bytes, unet_input_prec());
             nn_offload_copy(b->a2, u->h_xin, u->xin_bytes, 0, u->ev_xin[2], u->ev_xin[3]);
             b->in = b->a2;
@@ -1675,6 +1828,11 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
         PROF(2, nn_conv3d_bwd_weight_gn(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, B, b->ys, g + b->c2.w, g + b->c2.b));
         sp_end(u, B, b->ys, 1);
         PROF(1, nn_conv3d_bwd_data(B, b->ys, P(u, b->c2.w), b->ys, 3, 1, A, u->conv_scratch));                              /* A = d/d s1 */
+        if (b == &u->enc[0] && u->l3b) {   /* B (X1) read for the last time: the input back into it for the stem's weight gradient */
+            nn_set_storage(u->l3x[1], u->xin_bytes, unet_input_prec());
+            nn_offload_copy(u->l3x[1], u->h_xin, u->xin_bytes, 0, u->ev_xin[2], u->ev_xin[3]);
+            b->in = u->l3x[1];
+        }
         FQG(A, b->ys);
         sp_zero(u, A, b->ys, 1);
         PROF(3, nn_gn_silu_bwd(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, A, A, g + b->n1.gamma, g + b->n1.beta, u->gn_scratch));    /* A = d/d a1 (in place) */
@@ -1696,10 +1854,12 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     }
     nn_set_conv(0);
     if (b->xb) {   /* recompute: weight gradient with the upsampled part rebuilt into B (free until backward-data below) */
-        if (b == &u->dec[0] && u->a0_share) nn_stream_wait(0, u->ev_a2[3]);   /* the skip back from the host */
+        if (b == &u->dec[0] && u->a0_share) { if (u->l3b) u->l3_skip_in = 1; else nn_stream_wait(0, u->ev_a2[3]); }   /* the skip back from the host
+                                                                                                 (l3b: dec_conv1 brings it into X2 after its up transient) */
         else if (u->sko && level > 0 && b == &u->dec[level]) nn_stream_wait(0, u->ev_sk[level][3]);   /* a coarse skip back from the host */
         u->rc_ok = 1;   /* gy / B consumed: the level's gradient buffer is free until the skip gradient below */
         if (dec_conv1(u, b, level, nullptr, 0, nullptr, nullptr, A, g + b->c1.w, g + b->c1.b)) rc_fail("decoder conv1 weight gradient");
+        if (u->l3_skip_in) rc_fail("three level-0 buffers: a dec[0] conv1 weight gradient without its up transient");
         u->rc_ok = 0;
         sp_end(u, A, b->ys, 1);
         if (chunk_up()) {   /* skip gradient, then the up-part gradient in chunks through B, upsample-backwarded into gout[level + 1] */
@@ -1719,13 +1879,14 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
                 if (r) rc_fail("skip backward-data");
                 { shape5 s2 = b->xs; s2.c = b->xs.c - b->c_split; FQG(gx2, s2); }
             }
+            float *Bc = u->l3b && b == &u->dec[0] ? u->gB[0] : B;   /* (l3b: gy was dec[0]'s a2; the chunks through X1) */
             for (int c0 = 0; c0 < b->c_split; c0 += cs) {
                 const int nc = b->c_split - c0 < cs ? b->c_split - c0 : cs;
-                PROF(1, r = nn_conv3d_bwd_data_range(A, b->ys, P(u, b->c1.w), b->xs, c0, nc, B, u->conv_scratch));
+                PROF(1, r = nn_conv3d_bwd_data_range(A, b->ys, P(u, b->c1.w), b->xs, c0, nc, Bc, u->conv_scratch));
                 if (r) rc_fail("up-part backward-data");
-                { shape5 fs = b->xs; fs.c = nc; sp_halo(u, B, fs, 1); }
+                { shape5 fs = b->xs; fs.c = nc; sp_halo(u, Bc, fs, 1); }
                 shape5 cs5 = xb->ys; cs5.c = nc;
-                PROF(5, nn_up2_bwd_into(B, cs5, u->gout[level + 1], b->c_split, c0));
+                PROF(5, nn_up2_bwd_into(Bc, cs5, u->gout[level + 1], b->c_split, c0));
             }
             if (u->nob) {
                 PROF(1, r = nn_conv3d_bwd_data_range(A, b->ys, P(u, b->c1.w), b->xs, b->c_split, b->xs.c - b->c_split, gx2, u->conv_scratch));
@@ -1813,6 +1974,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
                                                              their levels' A -> re-run their conv2 (and conv1 where the shared encoder a1
                                                              overwrote it) from the bottom up, the forward's kernels and precision */
         if ((u->xin_shared && !u->xin_out) || (u->a0_share && !u->a2_out)) { fprintf(stderr, "unet: a backward needs a training forward first (the activation offload)\n"); abort(); }
+        if (u->l3b) { fprintf(stderr, "unet: a repeated backward with three level-0 buffers (UFSM_L0_3BUF=0 for one)\n"); abort(); }
         if (u->sko) {   /* the coarse skips (the decoders' conv1 re-runs read them; dec[0]'s conv2 then overwrites them, and they come back again) */
             if (!u->sk_out) { fprintf(stderr, "unet: a backward needs a training forward first (the skip offload)\n"); abort(); }
             for (int k = 1; k < L - 1; k++) { nn_offload_copy(u->enc[k].a2, u->h_sk[k], act_bytes_of(u->enc[k].ys), 0, u->ev_sk[k][2], u->ev_sk[k][3]); nn_stream_wait(0, u->ev_sk[k][3]); }
@@ -1854,6 +2016,22 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         if (!u->head_cb) { fprintf(stderr, "unet_backward_x: head slabs without a callback\n"); abort(); }
         u->head_cb(u->head_ctx);
         hf = 0;
+    } else if (u->l3b) {   /* three level-0 buffers: no buffer for the head's input gradient. The head's weight gradient, then dec[0]'s GroupNorm
+                              backward recomputing that gradient from the logit gradient (nn_gn_silu_bwd_head: the bits of the head's
+                              backward-data into gout[0] followed by block_bwd's GroupNorm backward, the same seeds drawn), d/d a2 in place in X2 */
+        nn_gn_t gg = gn_out(u, d0); int r;
+        PROF(2, r = nn_conv3d_bwd_weight_x(d0->a2, &gg, nullptr, nullptr, 0, 0, d0->ys, glogits, os, 1, 1, g + u->head.w, g + u->head.b));
+        if (r) rc_fail("head weight gradient");
+        if (nn_head_bwd_x_draws()) (void)nn_sr_seed();   /* (nn_head_bwd_x's draw before it declines 8 / 16 inputs) */
+        const unsigned hs = nn_sr_seed();               /* (the head backward-data's) */
+        nn_exec_prec_note(1, 0);
+        nn_set_layer(3 * L - 3); nn_set_conv(1);
+        PROF(3, r = nn_gn_silu_bwd_head(d0->a2, d0->ys, G_of(u, d0->c2.cout), P(u, d0->n2.gamma), P(u, d0->n2.beta), d0->m2, d0->r2, glogits, u->cfg.cout,
+                                        P(u, u->head.w), hs, g + d0->n2.gamma, g + d0->n2.beta, u->gn_scratch));
+        if (r) rc_fail("three level-0 buffers: the head-recomputing GroupNorm backward");
+        nn_set_conv(-1); nn_set_layer(3 * L - 2);
+        nn_set_storage(u->l3x[3], u->l3xb[3], grad_dt());   /* X3: level 0's A from dec[0]'s conv2 backward-data on */
+        hf = 0;
     } else if (recompute()) { nn_gn_t gg = gn_out(u, d0); PROF(2, hf = nn_head_bwd_x(d0->a2, &gg, d0->ys, glogits, os, P(u, u->head.w), g + u->head.w, g + u->head.b, u->gout[0])); }
     else PROF(2, hf = nn_head_bwd_x(d0->s2, nullptr, d0->ys, glogits, os, P(u, u->head.w), g + u->head.w, g + u->head.b, u->gout[0]));
     if (hf) {
@@ -1862,9 +2040,10 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         PROF(1, nn_conv3d_bwd_data(glogits, os, P(u, u->head.w), d0->ys, 1, 1, u->gout[0], u->conv_scratch));
     }
     if (ghide) dstorage(gbuf, gcap, ghide);
-    if (u->a0_share) nn_offload_copy(u->enc[0].a2, u->h_a2, act_bytes_of(u->enc[0].ys), 0, u->ev_a2[2], u->ev_a2[3]);   /* the skip back for dec[0]'s conv1 weight gradient */
-    FQG(u->gout[0], d0->ys);
-    if (u->gco) { u->gout[1] = u->gB[1] = u->gout_x1; if (L > 2) u->gskip[1] = u->gout_x1; }   /* dec[0]'s backward: gout[1] in dec[0].a1's buffer */
+    if (u->a0_share && !u->l3b) nn_offload_copy(u->enc[0].a2, u->h_a2, act_bytes_of(u->enc[0].ys), 0, u->ev_a2[2], u->ev_a2[3]);   /* the skip back for dec[0]'s conv1 weight gradient
+                                                                                                                                (l3b: inside it, l3_skip_return) */
+    if (!u->l3b) FQG(u->gout[0], d0->ys);
+    if (u->gco && !u->l3b) { u->gout[1] = u->gB[1] = u->gout_x1; if (L > 2) u->gskip[1] = u->gout_x1; }   /* dec[0]'s backward: gout[1] in dec[0].a1's buffer */
     /* decoder, bottom-up in the graph = i from 0 to L-2 */
     for (int i = 0; i < L - 1; i++) {
         if (i >= 1 && i <= u->cfg.ds_levels && u->ds_gl[i]) ds_bwd(u, i, g);   /* deep supervision: gout[i] += the level head's input gradient */
@@ -1872,13 +2051,15 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         shape5 src = u->ls[i + 1]; src.c = UPW(i + 1);
         if (nn_get_tf32()) {
             if (i > 0 && u->sko && u->sea_stale) nn_stream_wait(0, u->ev_sk[i][3]);   /* its skip back from the host (a conv1 re-run reads it at once) */
-            nn_set_layer(3 * L - 3 - i); float *gup = block_bwd(u, &u->dec[i], i, u->gout[i], u->gskip[i], 0, nullptr, nullptr);   /* gB[i]: grad wrt the upsampled part; skip grad written in place */
-            if (i == 0 && u->gco) {   /* gout[1] (the up-part gradient) to dec[0].a2's buffer before dec[0].a1's takes the encoder's a1 back */
+            const int l3 = u->l3b && i == 0;   /* (l3b: dec[0]'s d/d a2 already in place in its a2) */
+            nn_set_layer(3 * L - 3 - i); float *gup = block_bwd(u, &u->dec[i], i, l3 ? u->dec[0].a2 : u->gout[i], u->gskip[i], l3, nullptr, nullptr);   /* gB[i]: grad wrt the upsampled part; skip grad written in place */
+            if (i == 0 && u->gco && !u->l3b) {   /* gout[1] (the up-part gradient) to dec[0].a2's buffer before dec[0].a1's takes the encoder's a1 back */
                 if (gup) rc_fail("coarse gradient share: an unchunked up-part gradient");
                 shape5 g1 = u->ls[1]; g1.c = UPW(1);
                 nn_d2d(u->gout_home1, u->gout_x1, nn_mx_bytes(g1, grad_dt()));
                 u->gout[1] = u->gB[1] = u->gout_home1; if (L > 2) u->gskip[1] = u->gout_home1;
             }
+            if (i == 0 && u->l3b) l3_homes(u, 0);   /* (the coarse tensors come back to X2) */
             if (i == 0 && u->sko) {   /* the coarse skips back (the next decoder's first) */
                 if (!u->sk_out) { fprintf(stderr, "unet: a backward needs a training forward first (the skip offload)\n"); abort(); }
                 for (int k = 1; k < L - 1; k++) nn_offload_copy(u->enc[k].a2, u->h_sk[k], act_bytes_of(u->enc[k].ys), 0, u->ev_sk[k][2], u->ev_sk[k][3]);
@@ -1887,7 +2068,13 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
                 if (!u->dn_out) { fprintf(stderr, "unet: a backward needs a training forward first (the down-conv output offload)\n"); abort(); }
                 for (int k = L - 2; k >= 0; k--) { shape5 ds = u->ls[k + 1]; ds.c = w[k]; nn_offload_copy(u->downo[k], u->h_dn[k], act_bytes_of(ds), 0, u->ev_dn[k][2], u->ev_dn[k][3]); }
             }
-            if (u->a1_out[i]) nn_offload_copy(u->enc[i].a1, u->h_a1[i], act_bytes_of(u->enc[i].ys), 0, u->ev_a1[i][2], u->ev_a1[i][3]);   /* the decoder's a1 is dead */
+            if (u->a1_out[i] && !(u->l3b && i == 0)) nn_offload_copy(u->enc[i].a1, u->h_a1[i], act_bytes_of(u->enc[i].ys), 0, u->ev_a1[i][2], u->ev_a1[i][3]);   /* the decoder's a1 is dead
+                                                                                                         (l3b: level 0's into X2 after down0's backward) */
+            if (i == 0 && u->l3b) {   /* the skip again, into X3 (A dead), for down0's weight gradient and enc[0]'s GroupNorm backward */
+                u->enc[0].a2 = u->l3x[3];
+                nn_set_storage(u->l3x[3], act_bytes_of(u->enc[0].ys), act_dt());
+                nn_offload_copy(u->l3x[3], u->h_a2, act_bytes_of(u->enc[0].ys), 0, u->ev_a2[2], u->ev_a2[3]);
+            }
             if (i == 0 && u->xin_shared && !u->a0_share) {   /* and its a2: the input back for the stem's weight gradient */
                 if (!u->xin_out) { fprintf(stderr, "unet: a backward needs a training forward first (the input offload)\n"); abort(); }
                 nn_set_storage(u->xin, u->xin_bytes, unet_input_prec());
@@ -1926,12 +2113,18 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
             nn_set_layer(L + i - 1);
             sp_zero(u, gin, ds, 1);
             sp_begin(u, gin, ds, 1);
+            if (i == 1 && u->l3b) nn_stream_wait(0, u->ev_a2[3]);   /* (l3b: the skip back in X3) */
             if (recompute()) { nn_gn_t gg = gn_out(u, so); int r; PROF(2, r = nn_conv3d_bwd_weight_x(so->a2, &gg, nullptr, nullptr, 0, 0, so->ys, gin, ds, 3, 2, g + u->down[i - 1].w, g + u->down[i - 1].b)); if (r) rc_fail("down weight gradient"); }
             else PROF(2, nn_conv3d_bwd_weight(so->s2, so->ys, gin, ds, 3, 2, g + u->down[i - 1].w, g + u->down[i - 1].b));
             sp_end(u, gin, ds, 1);
             int acc; PROF(1, acc = nn_conv3d_bwd_data_acc(gin, ds, P(u, u->down[i - 1].w), so->ys, 3, 2, u->gskip[i - 1], u->conv_scratch));   /* gskip += */
             if (acc && u->gco && i == 1) rc_fail("coarse gradient share: a down-conv backward without accumulation (gA[0] holds its input)");
             if (acc == 0) FQG(u->gskip[i - 1], so->ys);
+            if (i == 1 && u->l3b) {   /* X2's coarse tensors are dead: the encoder's a1 back into it for enc[0]'s backward (exposed) */
+                u->enc[0].a1 = u->l3x[2];
+                nn_set_storage(u->l3x[2], act_bytes_of(u->enc[0].ys), act_dt());
+                nn_offload_copy(u->l3x[2], u->h_a1[0], act_bytes_of(u->enc[0].ys), 0, u->ev_a1[0][2], u->ev_a1[0][3]);
+            }
             if (acc) {
                 PROF(1, nn_conv3d_bwd_data(gin, ds, P(u, u->down[i - 1].w), so->ys, 3, 2, u->gA[i - 1], u->conv_scratch));
                 PROF(4, nn_axpy(u->gskip[i - 1], 1.f, u->gA[i - 1], shape_numel(so->ys)));

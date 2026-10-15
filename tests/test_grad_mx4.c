@@ -484,6 +484,70 @@ int main(void) {
             unet_set_a0_share(-1); unet_set_share_enc_a1(0); unet_set_grad_mx4(0); unet_free(v); free(ga); free(gb2); free(lw); free(ls); nn_free(gy11); nn_free(gl11); nn_free(hc.sb);
         } free(gr); free(g8); free(g4); free(dm); free(rm); free(d8);
     }
+    {   /* three level-0 buffers (UFSM_L0_3BUF, unet.l3b) against the four-buffer chain, the trainer's way (the logit gradient over the fp16
+           logits / in the skip's buffer): two training steps with a validation forward between them, 16- and 8-channel level 0, down_norm on
+           and off. The logits bit for bit, the parameter gradients up to the weight gradients' summation order, the same seed count, fewer
+           training bytes, the batch tail at X3's end untouched by the forwards */
+        nn_set_tf32(1); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1); nn_set_gn_stored(1);
+        nn_set_prec(3); if (nn_set_prec_policy("all=fp4:fp4:fp4,enc0.c1=fp16")) bad++;
+        setenv("UFSM_F4_WGRAD", "1", 1);
+        unet_set_act_mx4(1); unet_set_grad_mx8(1); unet_set_grad_mx4(1); unet_set_input_prec(4); unet_set_recompute(1); unet_set_chunk_up(2); unet_set_lean(2);
+        unet_set_share_enc_a1(1); unet_set_a0_share(1);
+        for (int wc = 0; wc < 3; wc++) {
+            unet_cfg cfg = wc == 0 ? (unet_cfg){4, {16, 16, 32, 64}, 4, 2, 8, 1} : wc == 1 ? (unet_cfg){4, {16, 16, 32, 64}, 4, 2, 8, 0} : (unet_cfg){4, {8, 8, 16, 32}, 4, 2, 8, 1};
+            const shape5 xs = {1, 4, 32, 32, 32};
+            const size_t nx = shape_numel(xs), S = nx / 4, no = S * 2, tailb = 3 * S;
+            float *xi[2] = {dev_rand(nx, 1.f), dev_rand(nx, 1.f)}, *gy[2] = {dev_rand(no, 1.f), dev_rand(no, 1.f)};
+            unet *v = unet_create(&cfg); unet_init(v, 37); const size_t np = unet_nparams(v);
+            float *gg[2][2]; uint16_t *lgs[2][3]; size_t mem[2]; unsigned ctr[2][2]; int l3[2] = {0, 0}, tail_ok = 1;
+            uint8_t *pat = malloc(tailb), *chk = malloc(tailb);
+            for (size_t i = 0; i < tailb; i++) pat[i] = (uint8_t)(i * 2654435761u >> 13);
+            void *own = nn_malloc(no * 2);
+            for (int on = 0; on < 2; on++) {
+                unet_set_l0_3buf(on);
+                unet_set_batch_bytes(v, 2 * S, tailb);
+                mem[on] = unet_train_bytes(v, xs);
+                unet_build(v, xs, 1);
+                l3[on] = unet_l0_3buf(v);
+                void *tp = nullptr; void *hp = unet_batch_scratch2(v, 2 * S, tailb, &tp);
+                if (on && (!hp || !tp)) tail_ok = 0;
+                for (int st = 0; st < 2; st++) {
+                    if (tp) nn_h2d(tp, pat, tailb);
+                    nn_set_sr_step(9000 + 200 * st); const float *lg = unet_forward(v, xi[st], xs, 1); unet_zero_grad(v);
+                    lgs[on][st] = malloc(no * 2); nn_sync(); nn_d2h(lgs[on][st], lg, no * 2);
+                    if (tp) { nn_d2h(chk, tp, tailb); if (memcmp(chk, pat, tailb)) tail_ok = 0; }
+                    void *gl = on ? (void *)lg : unet_logit_grad_scratch(v, no * 2);
+                    if (!gl) gl = own;
+                    nn_f32_to_h16(gy[st], no, gl, nn_get_grad_scale());
+                    nn_set_sr_step(9100 + 200 * st); unet_backward_x(v, gl, 1); ctr[on][st] = nn_sr_ctr();
+                    gg[on][st] = malloc(np * 4); unet_grad_d2h(v, gg[on][st]);
+                    if (!st) {   /* the trainer's validation forward between steps */
+                        if (tp) nn_h2d(tp, pat, tailb);
+                        nn_set_sr_step(9050); const float *lv = unet_forward(v, xi[1], xs, 0);
+                        lgs[on][2] = malloc(no * 2); nn_sync(); nn_d2h(lgs[on][2], lv, no * 2);
+                        if (tp) { nn_d2h(chk, tp, tailb); if (memcmp(chk, pat, tailb)) tail_ok = 0; }
+                    }
+                }
+            }
+            { const char *e = nn_check(); if (e) { printf("  three level-0 buffers: CUDA error %s  FAIL\n", e); bad++; } }
+            size_t lneq = 0; for (int k = 0; k < 3; k++) for (size_t i = 0; i < no; i++) lneq += lgs[0][k][i] != lgs[1][k][i];
+            double rel[2];
+            for (int st = 0; st < 2; st++) {
+                double d2 = 0, r2 = 0;
+                for (size_t i = 0; i < np; i++) { double d = (double)gg[1][st][i] - gg[0][st][i]; d2 += d * d; r2 += (double)gg[0][st][i] * gg[0][st][i]; }
+                rel[st] = sqrt(d2 / r2);
+            }
+            const int ok = !l3[0] && l3[1] && !lneq && rel[0] < 1e-6 && rel[1] < 1e-6 && ctr[0][0] == ctr[1][0] && ctr[0][1] == ctr[1][1] && mem[1] < mem[0] && tail_ok;
+            char nm[96]; snprintf(nm, sizeof nm, "three level-0 buffers {%d,%d,%d,%d}%s vs four", cfg.widths[0], cfg.widths[1], cfg.widths[2], cfg.widths[3], cfg.down_norm ? " dn" : "");
+            printf("  %-46s layout %d, logits differ %zu, grads rel diff %.3g / %.3g, seeds %u %u / %u %u, train bytes %zu -> %zu (%.2f B / voxel less), batch tail %s%s\n",
+                   nm, l3[1], lneq, rel[0], rel[1], ctr[0][0], ctr[0][1], ctr[1][0], ctr[1][1], mem[0], mem[1], ((double)mem[0] - (double)mem[1]) / S, tail_ok ? "kept" : "CLOBBERED", ok ? "" : "  FAIL");
+            if (!ok) bad++;
+            for (int on = 0; on < 2; on++) { for (int k = 0; k < 3; k++) free(lgs[on][k]); for (int st = 0; st < 2; st++) free(gg[on][st]); }
+            unet_set_l0_3buf(-1); unet_free(v); nn_free(own); free(pat); free(chk);
+            for (int k = 0; k < 2; k++) { nn_free(xi[k]); nn_free(gy[k]); }
+        }
+        unet_set_a0_share(-1); unet_set_share_enc_a1(0); unet_set_grad_mx4(0); unet_set_grad_mx8(0); unet_set_lean(0);
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     printf("gradient MX-fp4: %s\n", bad ? "FAIL" : "ok");
     return bad != 0;
