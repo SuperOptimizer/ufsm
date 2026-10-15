@@ -476,6 +476,9 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
 #if S2W_PROF
 __device__ unsigned long long g_s2wprof[4];
 #endif
+#ifndef S2W_PAIR
+#define S2W_PAIR 1   /* conv_bwd_w_s2_f8_k's FAST x staging two planes per amax barrier */
+#endif
 #define XS2_CS 3088   /* per channel: 5 planes x 17 rows x 36 B = 3060, padded to 772 words == 4 mod 32 */
 #define XS2_PS 612
 template <int MT, int NT, typename T, typename TG, bool FAST = false>
@@ -648,6 +651,41 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
             }
             npass++;
         };
+        /* two planes per pass (one amax reduction and one barrier for both, the scale shared by their two ring slots: e4m3's ~15 binades
+           make a 2-plane scale as precise as a 1-plane one; 4 -> 2 barriers per z-step). UFSM_S2W_PAIR=0: plane by plane */
+        auto xpass2 = [&](const unsigned (&ra_)[2][XW], const unsigned (&sa_)[2], int gz, const unsigned (&rb_)[2][XW], const unsigned (&sb_)[2]) {
+            float va[2][CH], vb[2][CH];
+            xdec(ra_, sa_, va); xdec(rb_, sb_, vb);
+            unsigned *am = amx + (npass % 3) * CH;
+            unsigned rr[CH];
+#pragma unroll
+            for (int q = 0; q < CH; q++)
+                rr[q] = __reduce_max_sync(0xffffffffu, max(max(__float_as_uint(va[0][q]) & 0x7fffffffu, __float_as_uint(va[1][q]) & 0x7fffffffu),
+                                                           max(__float_as_uint(vb[0][q]) & 0x7fffffffu, __float_as_uint(vb[1][q]) & 0x7fffffffu)));
+            if (lane == 0) {
+#pragma unroll
+                for (int q = 0; q < CH; q++) asm volatile("red.shared.max.u32 [%0], %1;" :: "r"((unsigned)__cvta_generic_to_shared(&am[q])), "r"(rr[q]) : "memory");
+            }
+            __syncthreads();
+            const int e = mx_exp(__uint_as_float(am[lane % CH]), 1.f / 448.f);
+            const float ml = exp2i(-e);
+            const int slot = (gz + 1) % 5, slot2 = (gz + 2) % 5;
+            if (warp == 0 && lane < CH) { sxs[lane * 8 + slot] = (uint8_t)(e + 127); sxs[lane * 8 + slot2] = (uint8_t)(e + 127); }
+            if (tid < CH) amx[((npass + 2) % 3) * CH + tid] = 0u;
+            float mq[CH];
+#pragma unroll
+            for (int q = 0; q < CH; q++) mq[q] = __shfl_sync(0xffffffffu, ml, q);
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+                if (tid + 288 * r < 561) {
+                    const int u = pu[r], off = prow[r] * 36 + ((u & 1) ? 20 + (u >> 1) : u >> 1);
+                    uint8_t *da = sxq + slot * XS2_PS + off, *db = sxq + slot2 * XS2_PS + off;
+#pragma unroll
+                    for (int q = 0; q < CH; q++) { da[q * XS2_CS] = cvt_e4m3(va[r][q] * mq[q]); db[q * XS2_CS] = cvt_e4m3(vb[r][q] * mq[q]); }
+                }
+            }
+            npass++;
+        };
         const int gbw = mx_bw(Co);
         const size_t Sg = (size_t)Do * Ho * Wo, gri = ((size_t)n * mx_nb(Co) + co0 / gbw) * Sg;
         constexpr int GB = MX_BITS(TG), GRB = BMo * GB / 8, GCB = GRB >= 16 ? 16 : 8;   /* gy bits (MX-fp8 or MX-fp4 gradients), raw row bytes, copy chunk */
@@ -708,10 +746,15 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
 #if S2W_PROF
             if (threadIdx.x == 0) t0 = clock64();
 #endif
+            if (S2W_PAIR) {
+                xload1(xrb, xsb, gz1 + 1); xpass2(xra, xsa, gz1, xrb, xsb);
+                xload1(xra, xsa, gz1 + 2); xload1(xrb, xsb, gz1 + 3); xpass2(xra, xsa, gz1 + 2, xrb, xsb);
+            } else {
             xload1(xrb, xsb, gz1 + 1); xpass(xra, xsa, gz1);   /* each plane's loads in flight during the previous pass */
             xload1(xra, xsa, gz1 + 2); xpass(xrb, xsb, gz1 + 1);
             xload1(xrb, xsb, gz1 + 3); xpass(xra, xsa, gz1 + 2);
             xpass(xrb, xsb, gz1 + 3);
+            }
 #if S2W_PROF
             __syncthreads();
             if (threadIdx.x == 0) t1 = clock64();
