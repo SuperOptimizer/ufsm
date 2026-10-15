@@ -11,15 +11,21 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 static float frand(void) { return (float)rand() / RAND_MAX * 2.f - 1.f; }
 
 /* L = sum gy * logits */
+static float *g_dsc[UNET_MAXLEV], *g_dsd[UNET_MAXLEV];   /* UFSM_DS: the deep-supervision levels' loss coefficients (host / device) */
 static double loss_of(unet *u, const float *dx, shape5 xs, const float *dgy, size_t nl, float *h) {
     const float *lg = unet_forward(u, dx, xs, 1);
+    double sds = 0;   /* + sum_j c_j . (level j's deep-supervision logits) */
+    for (int j = 1; j < UNET_MAXLEV && g_dsc[j]; j++) {
+        shape5 sj; const float *lj = unet_ds_logits(u, j, &sj); size_t n = shape_numel(sj); float *hj = malloc(n * 4);
+        nn_d2h(hj, lj, n * 4); for (size_t i = 0; i < n; i++) sds += (double)g_dsc[j][i] * hj[i]; free(hj);
+    }
     nn_d2h(h, lg, nl * 4);
     float *gy = malloc(nl * 4);
     nn_d2h(gy, dgy, nl * 4);
     double s = 0;
     for (size_t i = 0; i < nl; i++) s += (double)gy[i] * h[i];
     free(gy);
-    return s;
+    return s + sds;
 }
 
 static char ckpt_path[64];
@@ -57,6 +63,7 @@ int main(void) {
     if (getenv("UFSM_TINY")) { cfg.nlev = 0; char *t = strdup(getenv("UFSM_TINY")); for (char *q = strtok(t, ","); q; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); }
     cfg.scale_cond = getenv("UFSM_SCALE_COND") ? atoi(getenv("UFSM_SCALE_COND")) : 0;   /* voxel-size conditioning: also check its vector */
     if (getenv("UFSM_ENC_BLOCKS")) { char *t = strdup(getenv("UFSM_ENC_BLOCKS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.enc_blocks[l++] = atoi(q); free(t); }
+    cfg.ds_levels = getenv("UFSM_DS") ? atoi(getenv("UFSM_DS")) : 0;   /* deep-supervision heads: their gradient path too */
     if (getenv("UFSM_DEC_WIDTHS")) { char *t = strdup(getenv("UFSM_DEC_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.dec_widths[l++] = atoi(q); free(t); }   /* narrower decoder levels */
     unet *u = unet_create(&cfg);
     unet_init(u, 1);
@@ -74,6 +81,11 @@ int main(void) {
     nn_h2d(dx, x, nx * 4); nn_h2d(dgy, gy, nl * 4);
     /* analytic grads */
     unet_forward(u, dx, xs, 1);
+    for (int j = 1; j <= cfg.ds_levels; j++) {   /* random coefficients per deep-supervision logit = its gradient */
+        shape5 sj; unet_ds_logits(u, j, &sj); size_t n = shape_numel(sj);
+        g_dsc[j] = malloc(n * 4); for (size_t i = 0; i < n; i++) g_dsc[j][i] = frand();
+        g_dsd[j] = nn_malloc(n * 4); nn_h2d(g_dsd[j], g_dsc[j], n * 4); unet_set_ds_grad(u, j, g_dsd[j]);
+    }
     unet_zero_grad(u);
     unet_backward(u, dgy);
     const char *e = nn_check();
@@ -102,7 +114,8 @@ int main(void) {
     fread(p, 4, np, f); fread(g, 4, np, f); fread(g, 4, np, f); fclose(f);   /* third array = m = g */
     double worst = 0, gmax = 0;
     for (size_t i = 0; i < np; i++) if (fabs(g[i]) > gmax) gmax = fabs(g[i]);
-    int K = 60, bad = 0, KS = cfg.scale_cond ? cfg.widths[0] : 0;   /* scale_cond: every entry of the conditioning vector (last in the layout) */
+    int K = getenv("UFSM_DS") ? 120 : 60, bad = 0, KS = cfg.scale_cond ? cfg.widths[0] : 0;
+    for (int j = 1; j <= cfg.ds_levels; j++) KS += (cfg.dec_widths[j] ? cfg.dec_widths[j] : cfg.widths[j]) * cfg.cout + cfg.cout;   /* and every deep-supervision head parameter (last) */   /* scale_cond: every entry of the conditioning vector (last in the layout) */
     for (int k = 0; k < K + KS; k++) {
         size_t i = k < K ? (size_t)rand() % np : np - (size_t)KS + (size_t)(k - K);
         float o = p[i], eps = 1e-2f;

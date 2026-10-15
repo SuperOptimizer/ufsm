@@ -829,3 +829,26 @@ extern "C" void nn_aux_input(const uint8_t *a, size_t n, void *x, int h16) {
     else aux_in_k<bf16><<<nblk(n, 256), 256>>>(a, n, (bf16 *)x);
     KCHECK();
 }
+
+/* deep supervision targets: B x C x D x H x W uint8 targets and B x D x H x W mask pooled by f per axis (dims divisible by f): the target
+   is the maximum over the block's masked voxels, the mask 1 where the block has any */
+__global__ void pool_targets_k(const uint8_t *t, const uint8_t *m, int B, int C, int D, int H, int W, int f, uint8_t *to, uint8_t *mo) {
+    const int Dq = D / f, Hq = H / f, Wq = W / f; const size_t Sq = (size_t)Dq * Hq * Wq, S = (size_t)D * H * W;
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)B * Sq) return;
+    const int b = (int)(i / Sq); const size_t v = i % Sq;
+    const int z = (int)(v / ((size_t)Hq * Wq)), y = (int)((v / Wq) % Hq), x = (int)(v % Wq);
+    uint8_t any = 0, mx[16] = {0};
+    for (int dz = 0; dz < f; dz++) for (int dy = 0; dy < f; dy++) for (int dx = 0; dx < f; dx++) {
+        const size_t k = ((size_t)(z * f + dz) * H + (y * f + dy)) * W + (x * f + dx);
+        if (!m[(size_t)b * S + k]) continue;
+        any = 1;
+        for (int c = 0; c < C && c < 16; c++) { const uint8_t q = t[((size_t)b * C + c) * S + k]; if (q > mx[c]) mx[c] = q; }
+    }
+    mo[i] = any;
+    for (int c = 0; c < C && c < 16; c++) to[((size_t)b * C + c) * Sq + v] = mx[c];
+}
+extern "C" void nn_pool_targets(const uint8_t *t, const uint8_t *m, int B, int C, int D, int H, int W, int f, uint8_t *to, uint8_t *mo) {
+    const size_t n = (size_t)B * (D / f) * (H / f) * (W / f);
+    pool_targets_k<<<nblk(n, 256), 256>>>(t, m, B, C, D, H, W, f, to, mo); KCHECK();
+}

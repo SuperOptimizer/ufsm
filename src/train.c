@@ -58,6 +58,7 @@ typedef struct {
     unsigned long long *cacc, cacc_h[2];   /* --cond: known / right-turn voxel counts of the 14-turn head (device, last batch on the host) */
     uint8_t *papb[2], *pap, *pt1, *pmk1, *pw1; float *pscr, pout3[3]; double pap_loss;   /* --pap-head: labels (double-buffered), target, mask, weight; scratch, parts */
     void *x2, *glh, *lrt; float *lgf;  /* --half-res: the network's input and logit gradient, the intermediate grid (div 4), the full-resolution fp32 logits */
+    uint8_t *ds_t[UNET_MAXLEV], *ds_m[UNET_MAXLEV]; float *ds_gl[UNET_MAXLEV], *ds_scr[UNET_MAXLEV], ds_out[UNET_MAXLEV][2 * NCH + 2]; double ds_loss; int ds_fresh;   /* --deep-sup (fresh: the last batch computed them) */
 } gpu_state;
 /* task band_affinity: output channel 0 = recto (dense loss on target channel 0), channels 1..K = affinities for g_aff_off */
 static int g_half, g_hdiv = 1;   /* --half-res: 1 pool, 2 pack, 3 pool4, 4 pack4 (unet_cfg.half_res), g_hdiv its factor; the losses see g_cout
@@ -88,6 +89,7 @@ static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --den
 static int g_gl_inplace;   /* the logit gradient over the fp16 logits (set before the memory planner) */
 static int g_head_slab;    /* unwrap: head, losses and head backward per z-slab (no whole-window logits or derived targets; set before the planner) */
 static int g_hs_z;         /* its planes per slab */
+static int g_ds; static float g_ds_w = 0.5f, g_ds_frac = 1.f; static int g_ds_anneal = 1;   /* --deep-sup K: decoder levels 1..K, weight w^j x frac */
 static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64;   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
    (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */
@@ -410,6 +412,19 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         lg = d->lgf;
     } else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
+    d->ds_fresh = g_ds && train;   /* validation batches have no deep-supervision losses */
+    if (g_ds && train) {   /* deep supervision: each supervised decoder level's logits against the targets / mask max- / any-pooled to its grid */
+        const int save = nn_get_loss_grad_h16(); nn_set_loss_grad_h16(0);   /* fp32 gradients: unet_backward_x converts them with the gradient scale */
+        for (int j = 1; j <= g_ds; j++) {
+            shape5 sj; const float *lj = unet_ds_logits(d->u, j, &sj);
+            if (!lj) { fprintf(stderr, "deep supervision: no level-%d logits\n", j); abort(); }
+            nn_pool_targets(d->t, d->m, B, NCH, xs.d, P, P, 1 << j, d->ds_t[j], d->ds_m[j]);
+            nn_loss_async(lj, d->ds_t[j], d->ds_m[j], d->w, sj, dice_w, d->ds_gl[j], d->ds_scr[j]);
+            nn_scale(d->ds_gl[j], powf(g_ds_w, (float)j) * g_ds_frac, shape_numel(sj));
+            unet_set_ds_grad(d->u, j, d->ds_gl[j]);
+        }
+        nn_set_loss_grad_h16(save);
+    }
     if (g_head_slab) {   /* the head per z-slab: the loss statistics now, the gradients in the backward (head_slab_cb) */
         int prof = ufsm_env_on("UFSM_PROF");
         if (prof) nn_prof_begin(6);
@@ -527,6 +542,13 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
         float nb = 0; for (int c = 0; c < 7; c++) nb += d->nout[c];
         d->norm_loss = g_norm_lambda * nb / 7;
     }
+    d->ds_loss = 0;
+    if (g_ds && d->ds_fresh) for (int j = 1; j <= g_ds; j++) {   /* weight x mean over the active channels of bce + dice_w dice */
+        shape5 sj; unet_ds_logits(d->u, j, &sj); float *o = d->ds_out[j]; nn_loss_fetch(d->ds_scr[j], sj, o);
+        double s = 0; int nc = 0;
+        for (int c = 0; c < sj.c && c < NCH; c++) if (o[c] != 0.f || o[sj.c + c] != 0.f) { s += o[c] + dice_w * o[sj.c + c]; nc++; }
+        d->ds_loss += powf(g_ds_w, (float)j) * g_ds_frac * (nc ? s / nc : 0);
+    }
     d->count_loss = 0;
     if (g_count_lambda > 0) { nn_d2h(d->cnt_h, d->cnt_out, 3 * sizeof(float)); d->count_loss = g_count_lambda * d->cnt_h[0]; }
     d->cond_loss = 0;
@@ -563,7 +585,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     double loss = 0; int active = 0;
     if (g_aff || g_unwrap) cout = NCH;
     for (int c = 0; c < cout; c++) if (out[c] > 0 || out[cout + c] > 0) { loss += out[c] + dice_w * out[cout + c]; active++; }
-    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss+d->verso_loss+d->side_loss+d->ink_loss+d->norm_loss+d->cond_loss+d->pap_loss+d->count_loss;
+    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss+d->verso_loss+d->side_loss+d->ink_loss+d->norm_loss+d->cond_loss+d->pap_loss+d->count_loss+d->ds_loss;
 }
 
 /* --split z: forward, loss and backward of one window on both GPUs (src/split.h) */
@@ -585,6 +607,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--cover-next-pass 1] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
                         "       [--lr-floor 0 (the schedule ends at this fraction of the peak; modded-nanogpt 0.3)] [--wd-nonconv 0 (decay multiplier for GroupNorm, biases, head under Muon / ANVIL)]\n"
                         "       [--recall W (recto: + W (1 - soft recall), gradient only)]\n"
+                        "       [--deep-sup K (1^3 heads on decoder levels 1..K)] [--ds-weight 0.5 (level j: w^j)] [--ds-anneal 1 (weights -> 0 over the run)]\n"
                         "       [--shell R (level-0 voxels: background beside a label ignored)] [--dist-head SIGMA (channel 1 = distance ridge of channel 0)]\n"
                         "       [--geometry-aug 0|1] [--rotate-deg 5] [--rotate-p 0.2] [--elastic 1] [--elastic-p 0.15] [--label-morph 0] [--label-morph-p 0.2]\n"
                         "       [--aug-strength 1 (0..2)] [--aug-p 0 (default p of every scanner op)] [--aug-OP-p P] [--aug-drop-ignore 1] [--aug-affine-p 0] [--aug-aniso 0.1] [--aug-shear 0.06]\n"
@@ -810,7 +833,7 @@ int cmd_train(int argc, char **argv) {
       if (dw) { char *t = strdup(dw); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.dec_widths[l++] = atoi(q); free(t); } }
     { const char *eb = opt(argc, argv, "--enc-blocks", nullptr);   /* extra residual blocks per encoder level (levels >= 1), e.g. 0,0,2,3,3,3 */
       if (eb) { char *t = strdup(eb); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.enc_blocks[l++] = atoi(q); free(t); } }
-    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.down_norm = pc.down_norm; cfg.scale_cond = pc.scale_cond; memcpy(cfg.dec_widths, pc.dec_widths, sizeof cfg.dec_widths); memcpy(cfg.enc_blocks, pc.enc_blocks, sizeof cfg.enc_blocks); } }   /* the checkpoint decides */
+    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.down_norm = pc.down_norm; cfg.scale_cond = pc.scale_cond; memcpy(cfg.dec_widths, pc.dec_widths, sizeof cfg.dec_widths); cfg.ds_levels = pc.ds_levels; memcpy(cfg.enc_blocks, pc.enc_blocks, sizeof cfg.enc_blocks); } }   /* the checkpoint decides */
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,80")); cfg.nlev = 0; for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "P must be divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
     g_Pz = atoi(opt(argc, argv, "--Pz", "0")); if (g_Pz <= 0) g_Pz = P;   /* --Pz: Pz x P x P slab windows (src/sample.h sample_cfg.Pz) */
@@ -821,6 +844,16 @@ int cmd_train(int argc, char **argv) {
         }
     }
     const int split = !strcmp(opt(argc, argv, "--split", "0"), "z");
+    {   /* --deep-sup K: 1^3 heads on decoder levels 1..K, loss weight w^j, annealed linearly to 0 over the run (--ds-anneal 0: constant) */
+        const char *ds = opt(argc, argv, "--deep-sup", nullptr);
+        g_ds = ds ? atoi(ds) : 0; g_ds_w = (float)atof(opt(argc, argv, "--ds-weight", "0.5")); g_ds_anneal = atoi(opt(argc, argv, "--ds-anneal", "1"));
+        if (ds && !resume) cfg.ds_levels = g_ds;
+        if (g_ds < 0 || g_ds > cfg.nlev - 2 || (resume && g_ds > cfg.ds_levels)) { fprintf(stderr, "--deep-sup: decoder levels 1..%d (a resumed net: at most its %d heads)\n", cfg.nlev - 2, cfg.ds_levels); return 2; }
+        if (g_ds && (g_unwrap || g_aff || g_sheet || g_half || split || g_papyrus || g_verso || g_side || g_cond || g_cout != NCH)) {
+            fprintf(stderr, "--deep-sup: task surface (whole windows, no --half-res / --split / --verso / --side)\n"); return 2;
+        }
+        if (g_ds) fprintf(stderr, "deep supervision: decoder levels 1..%d, weights %g^j%s\n", g_ds, g_ds_w, g_ds_anneal ? ", annealed to 0 over the run" : "");
+    }
     if (split) {
         g_h0 = 1 << (cfg.nlev - 1); g_Dl = P / 2 + g_h0;
         if (ng != 2) { fprintf(stderr, "--split z needs --gpus with two devices\n"); return 2; }
@@ -1207,6 +1240,11 @@ int cmd_train(int argc, char **argv) {
         for (int i = 0; i < 2; i++) { d->ev_done[i] = nn_event_create(); nn_event_record(d->ev_done[i], 0); }
         d->pending = nullptr; select_buf(d, 0);
         if (!d->gl && !d->gl_inplace) d->gl = nn_malloc((size_t)B * g_cout * p3 * (g_g16 ? 2 : 4));
+        for (int j = 1; j <= g_ds; j++) {   /* deep supervision: pooled targets / mask, fp32 logit gradient and loss scratch per level */
+            const shape5 sj = {B, g_cout, g_Pz >> j, P >> j, P >> j}; const size_t sv = (size_t)sj.d * sj.h * sj.w;
+            d->ds_t[j] = nn_malloc((size_t)B * NCH * sv); d->ds_m[j] = nn_malloc((size_t)B * sv);
+            d->ds_gl[j] = nn_malloc(shape_numel(sj) * 4); d->ds_scr[j] = nn_malloc(nn_loss_scratch(sj));
+        }
         if (g_half) {
             const size_t q3 = p3 / ((size_t)g_hdiv * g_hdiv * g_hdiv), t1 = (size_t)B * (p3 / 8) * (4 * xbytes() > 4 * (size_t)g_cout ? 4 * xbytes() : 4 * (size_t)g_cout);
             d->x2 = nn_malloc((size_t)B * cfg.cin * q3 * xbytes()); d->lgf = nn_malloc((size_t)B * g_cout * p3 * 4);
@@ -1422,7 +1460,7 @@ int cmd_train(int argc, char **argv) {
     int committed_step = step0, training_failed = 0;
     double best_val = 1e30; int nskip = 0; (void)nskip;
     float parts[8][2 * NCH + 1];
-    double acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0, acc_pap = 0, acc_cnt = 0, acc_cnr = 0;   /* (acc_cnt / acc_cnr: --count-lambda loss, Tp / Tg) verso channel, side channel; --cond (loss, known / right counts); --pap-head */
+    double acc_ds = 0, acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0, acc_pap = 0, acc_cnt = 0, acc_cnr = 0;   /* (acc_cnt / acc_cnr: --count-lambda loss, Tp / Tg) verso channel, side channel; --cond (loss, known / right counts); --pap-head */
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
         g_verso_on = g_verso && step >= g_verso_start;
         { uint64_t h = (uint64_t)step * 0x9E3779B97F4A7C15ull + (uint64_t)seed; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
@@ -1556,6 +1594,11 @@ int cmd_train(int argc, char **argv) {
             else if (!strcmp(sched, "wsd")) { int cd0 = (int)(total * (1.f - cooldown)); lr = ss < cd0 ? lr0 : lr0 * (lr_floor + (1.f - lr_floor) * (float)(total - ss) / (float)(total - cd0 > 0 ? total - cd0 : 1)); }
             else lr = lr0 * (lr_floor + (1.f - lr_floor) * 0.5f * (1.f + cosf(3.14159265f * (float)(ss - warmup) / (float)(total - warmup))));
         }
+        if (g_ds && g_ds_anneal) {   /* deep supervision weights: linearly to 0 over the run (the time horizon when there is one) */
+            const double pr = time_horizon ? fmin(1.0, (schedule_elapsed + now() - t0) / time_horizon)
+                                           : (double)(step - schedule_start) / (double)(steps - schedule_start > 0 ? steps - schedule_start : 1);
+            g_ds_frac = (float)fmax(0.0, 1.0 - pr);
+        }
         if (soft_end != sc.soft) sampler_set_soft(sp, sc.soft + (soft_end - sc.soft) * (step < steps ? (float)step / (float)steps : 1.f));
         double gn = 0;
         for (int g = 0; g < ng; g++) {
@@ -1596,6 +1639,7 @@ int cmd_train(int argc, char **argv) {
         if (g_verso_on) { acc_vbce += G[0].vout[0]; acc_vdice += G[0].vout[1]; }
         if (g_side) acc_side += G[0].sout[0];
         if (g_unwrap) { acc_ink += G[0].iout[0]; acc_norm += G[0].norm_loss / (g_norm_lambda ? g_norm_lambda : 1.f); }
+        if (g_ds) acc_ds += G[0].ds_loss;
         if (g_cond) { acc_cond += G[0].cond_loss / (g_cond_lambda ? g_cond_lambda : 1.f); acc_ck += (double)G[0].cacc_h[0]; acc_cr += (double)G[0].cacc_h[1]; }
         if (g_pap_head) acc_pap += G[0].pout3[0];
         if (g_count_lambda > 0) { acc_cnt += G[0].cnt_h[0]; acc_cnr += G[0].cnt_h[2]; }
@@ -1634,6 +1678,7 @@ int cmd_train(int argc, char **argv) {
             if (g_verso) snprintf(affs, 64, " verso bce %.4f dice %.4f", acc_vbce / nacc, acc_vdice / nacc);
             if (g_side) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " %s bce %.4f", g_side == 2 ? "phase" : "side", acc_side / nacc); }
             if (g_unwrap) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f normal bce %.4f", acc_ink / nacc, acc_norm / nacc); }
+            if (g_ds) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ds %.4f", acc_ds / nacc); }
             if (g_cond) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " cond bce %.4f acc %.3f", acc_cond / nacc, acc_ck > 0 ? acc_cr / acc_ck : -1.0); }
             if (g_pap_head) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " papyrus bce %.4f", acc_pap / nacc); }
             if (g_count_lambda > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " count %.4f (turns pred/true %.3f)", acc_cnt / nacc, acc_cnr / nacc); }
@@ -1643,7 +1688,7 @@ int cmd_train(int argc, char **argv) {
                     (double)nacc * B * nl / dt, 100 * wait / dt, vl >= 0 ? " val " : "", vl >= 0 ? vstr : "");
             if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, active, acc_g / nacc, vstr, (double)nacc * B * nl / dt, wait); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
-            acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = 0; nacc = 0; tlog = now(); wait = 0;
+            acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = 0; nacc = 0; tlog = now(); wait = 0;
         }
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);

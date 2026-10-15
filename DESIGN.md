@@ -2061,6 +2061,19 @@ parallel (batch 1 each), so the per-GPU limit is the window limit.
   (0.329 vs 0.290-0.307 over three Muon arms). Confirmation: wd 0.01 -> 0.310; seed 1: ANVIL wd 0.1 0.302 vs
   Muon 0.303. The one-seed ANVIL lead was noise; the two are equal within it and Muon stays the default (simpler,
   one fewer state buffer).
+- Efficiency review (2026-10-15; modded-nanogpt, hyperstition.cc, a 3-D segmentation literature survey): ANVIL III is
+  proprietary (no public rule); ANVIL II already equals Muon here. New, all off by default except the decay exemption:
+  `--lr-floor F` (schedules end at F x peak; modded-nanogpt 0.3 with a 0.8 cooldown), `predict --ema-blend A` (A x final +
+  (1 - A) x EMA, their 0.35), no weight decay on GroupNorm / biases / head under Muon and ANVIL (`--wd-nonconv 1` restores
+  it; the gains decayed toward 0), `--recall W` (recto soft-recall term: the skeleton-recall loss of the Vesuvius recto model,
+  whose thin labels are their own skeleton), `--shell R` (background within R level-0 voxels of a label ignored),
+  `--dist-head SIGMA` (target channel 1 = a distance ridge of channel 0), and deep supervision `--deep-sup K` (1^3 heads on
+  decoder levels 1..K, params last, header "ds_levels"; loss on max-pooled targets / any-pooled masks, weight
+  `--ds-weight` w^j annealed to 0 over the run unless `--ds-anneal 0`; the head's input gradient is written in gout[j]'s
+  storage and added before dec[j]'s backward; task surface only; test_unet UFSM_DS=1). Literature verdict: residual CNN
+  U-Nets win compute-matched (nnU-Net Revisited 2024); transformers / Mamba / large kernels do not; the 2025 Vesuvius
+  surface winners were nnU-Net ResEnc ensembles (blocks 1,3,4,6,6,6,6, widths to 320, scSE, skeleton recall, 3.5k+ epochs).
+  Not built: scSE attention (per-voxel gating inside the fused GN + SiLU staging of every conv).
 - Width: widths 32/64/128/160 (4.68M params, 4x the FLOPs) with Muon lr 0.01 scores 0.301 at 6000 steps against
   0.307 for 16/32/64/80: no accuracy per step from width at this length, so the 1.17M network stays.
 - Prefetch and training levels: scans finer than 1.8 um (PHerc0139 1.129 um) get `min_level` 1 from make_sources

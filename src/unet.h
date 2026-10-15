@@ -23,6 +23,9 @@ typedef struct {
     int enc_blocks[UNET_MAXLEV];   /* extra pre-activation residual blocks after encoder level i (levels >= 1; 0 = none): x_k = x_{k-1} +
                                       conv2(silu(gn(conv1(silu(gn(x_{k-1})))))), widths[i] -> widths[i]; the last one's output is the level's
                                       skip and down-conv input. Parameters appended last; a fresh block starts as the identity (zero conv2) */
+    int ds_levels;         /* deep supervision: a 1^3 head (cout outputs) on each decoder level 1..ds_levels (params appended last); a training
+                              forward computes their fp32 logits (unet_ds_logits), the trainer's loss gradients come back through
+                              unet_set_ds_grad and join each level's gradient before its decoder backward */
     int half_res;          /* the caller runs the network on 2x2x2 blocks of its window (nn_half_*): 1 pool (cin 4, the block means; logits
                               upsampled trilinearly), 2 pack (cin 8: the block means, the CT's sub-voxel gradients and contrast;
                               cout 8 per output, one per sub-voxel); 3 pool4, 4 pack4: the network on 4^3 blocks (a 2x pool / trilinear 2x
@@ -159,7 +162,9 @@ int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp1
    gradient and unet_head_bwd_z per slab (first: the first slab). Takes effect at the next build; MX activations and 16-bit gradients
    (the fused head backward); -1 from the slab calls: not covered */
 void unet_set_head_ext(unet *u, int on);
-void unet_set_wd_nonconv(unet *u, float mul);   /* weight decay multiplier for GroupNorm / biases / head under Muon and ANVIL (default 0) */
+void unet_set_wd_nonconv(unet *u, float mul);
+const float *unet_ds_logits(const unet *u, int j, shape5 *s);   /* deep supervision: fp32 logits of decoder level j (1..ds_levels) after a training forward */
+void unet_set_ds_grad(unet *u, int j, const float *gl);         /* their fp32 logit gradient for the next backward (nullptr: none) */   /* weight decay multiplier for GroupNorm / biases / head under Muon and ANVIL (default 0) */
 void unet_blend_ema(unet *u, float a);          /* EMA weights := a x live + (1 - a) x EMA (inference: the tail-average blend) */
 void unet_set_head_cb(unet *u, void (*cb)(void *), void *ctx);
 int unet_head_fwd_z(unet *u, int z0, int z1, void *y16);

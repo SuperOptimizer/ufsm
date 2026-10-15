@@ -148,6 +148,10 @@ struct unet {
     int logits_h16;                          /* lean 2: fp16 logits, so the 16-bit logit gradient fits after them in A */
     int lh16_req;                            /* unet_set_fp16_logits: fp16 logits where the MX head writes them into their own buffer */
     int head_ext;                            /* unet_set_head_ext: training runs the head per z-slab outside (no whole-window logits) */
+    convp ds[UNET_MAXLEV];                   /* cfg.ds_levels: the deep-supervision 1^3 heads of decoder levels 1..ds_levels */
+    float *ds_lg[UNET_MAXLEV];               /* their fp32 logits (training builds) */
+    const float *ds_gl[UNET_MAXLEV];         /* their fp32 logit gradients for the next backward (unet_set_ds_grad) */
+    void *ds_g16, *ds_tmp; size_t ds_g16_n, ds_tmp_n;   /* backward scratch: 16-bit logit gradient, the head's input gradient in gout's storage */
     float wd_nonconv;                        /* unet_set_wd_nonconv: weight decay multiplier for the non-3^3 parameters (GroupNorm, biases,
                                                 the head) under Muon / ANVIL; 0 (default): only the conv weights decay */
     void (*head_cb)(void *); void *head_ctx; /* ... and its backward at the head's step (unet_head_fwd_z / unet_head_bwd_z per slab) */
@@ -225,6 +229,8 @@ unet *unet_create(const unet_cfg *cfg) {
         u->rb[i] = calloc((size_t)cfg->enc_blocks[i], sizeof(block)); u->nrb_any = 1;
         for (int k = 0; k < cfg->enc_blocks[i]; k++) off = add_block(u, &u->rb[i][k], w[i], w[i], off);
     }
+    if (cfg->ds_levels < 0 || (cfg->ds_levels > 0 && cfg->ds_levels > L - 2)) { fprintf(stderr, "unet: deep supervision takes decoder levels 1..%d\n", L - 2); abort(); }
+    for (int j = 1; j <= cfg->ds_levels; j++) off = add_conv(u, &u->ds[j], dw_of(cfg, j), cfg->cout, 1, 1, off);   /* (params last: older layouts unchanged) */
     u->np = off;
     if (ufsm_env_on("UFSM_DEBUG")) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d c1.w %zu c1.b %zu n1 %zu c2.w %zu c2.b %zu n2 %zu\n", i, u->enc[i].c1.w, u->enc[i].c1.b, u->enc[i].n1.gamma, u->enc[i].c2.w, u->enc[i].c2.b, u->enc[i].n2.gamma);
@@ -250,7 +256,7 @@ void unet_free(unet *u) {
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
     nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b); free(u->gn_frz); free(u->gn_acc); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
-    nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs);
+    nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
     nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
     free(u);
@@ -287,6 +293,7 @@ void unet_init(unet *u, uint64_t seed) {
         init_conv(h, &b->c1, &seed, 0); init_gn(h, &b->n1); init_conv(h, &b->c2, &seed, 0); init_gn(h, &b->n2);
         if (!ufsm_env_on("UFSM_RB_NONZERO")) memset(h + b->c2.w, 0, (size_t)b->c2.cout * b->c2.cin * 27 * 4);   /* (tests: random conv2) */
     }
+    for (int j = 1; j <= u->cfg.ds_levels; j++) init_conv(h, &u->ds[j], &seed, -2.0);   /* deep-supervision heads, as the main head */
     nn_h2d(u->p, h, u->np * 4);
     nn_d2d(u->ema, u->p, u->np * 4);
     nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4);
@@ -961,6 +968,10 @@ static void build_acts(unet *u, shape5 xs, int train) {
     }
     if (train && u->head_ext) { u->logits = nullptr; u->lg_t1 = 0; }   /* head slabs: no whole-window logits */
     else if (!u->logits) u->logits = dalloc(u, (lgb + 3) / 4);
+    for (int j = 0; j < UNET_MAXLEV; j++) { u->ds_lg[j] = nullptr; u->ds_gl[j] = nullptr; }
+    if (train) for (int j = 1; j <= u->cfg.ds_levels; j++) {   /* deep supervision: fp32 logits per supervised decoder level */
+        g_mlab = "deep-supervision logits"; shape5 os = u->ls[j]; os.c = u->cfg.cout; u->ds_lg[j] = dalloc(u, shape_numel(os));
+    }
     u->xin = nullptr;
     if (ABF && input_mx()) {   /* include mandatory input storage in the dry planner */
         const int idt = unet_input_prec(); const size_t xb_ = nn_mx_bytes(xs, idt);
@@ -1502,6 +1513,15 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         }
         cur = u->dec[i].s2;
     }
+    if (train && u->train && u->cfg.ds_levels) {   /* deep supervision: each supervised decoder level's own 1^3 head, from its output */
+        if (sp_on(u)) { fprintf(stderr, "unet: deep supervision with the spatial split is not supported\n"); abort(); }
+        nn_set_head_out_h16(0);
+        for (int j = 1; j <= u->cfg.ds_levels; j++) {
+            const block *d = &u->dec[j]; const float *dw = P(u, u->ds[j].w), *db = P(u, u->ds[j].b);
+            if (recompute()) { nn_gn_t g = gn_out(u, d); int r; PROF(0, r = nn_conv3d_fwd_x(d->a2, &g, nullptr, nullptr, 0, 0, d->ys, dw, db, u->cfg.cout, 1, 1, u->ds_lg[j], 0, 0.f, nullptr, nullptr)); if (r) rc_fail("deep-supervision head"); }
+            else PROF(0, nn_conv3d_fwd(d->s2, d->ys, dw, db, u->cfg.cout, 1, 1, u->ds_lg[j]));
+        }
+    }
     nn_set_layer(3 * L - 2);
     if (!(u->head_ext && !u->logits)) {   /* (head slabs: the trainer runs the head per z-slab, unet_head_fwd_z; a training build has no
                                             whole-window logits, so its validation forwards (train 0, no rebuild) skip the head too) */
@@ -1683,6 +1703,34 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
 }
 
 void unet_backward(unet *u, const float *glogits) { unet_backward_x(u, glogits, 0); }
+/* deep supervision, before dec[j]'s backward: the head's weight / bias gradients (accumulating kernels: zeroed first) from the level's
+   output (recompute: a2 with its GroupNorm + SiLU on the fly, else s2) and its input gradient, written in gout[j]'s storage (MX by
+   registration, 16-bit or fp32) and added to the up-path gradient already there */
+static void ds_bwd(unet *u, int j, float *g) {
+    const block *d = &u->dec[j]; const convp *c = &u->ds[j];
+    shape5 xs = d->ys, os = xs; os.c = u->cfg.cout;
+    const size_t no = shape_numel(os), nx = shape_numel(xs);
+    const float *gl = u->ds_gl[j];
+    if (GBF) {   /* the 16-bit logit gradient the 1^3 kernels read, with the gradient scale (unscaled with the rest at the end) */
+        if (u->ds_g16_n < no * 2) { if (u->ds_g16) nn_free(u->ds_g16); u->ds_g16 = nn_malloc(no * 2); u->ds_g16_n = no * 2; }
+        nn_f32_to_h16(u->ds_gl[j], no, u->ds_g16, nn_get_grad_scale()); gl = (const float *)u->ds_g16;
+    }
+    nn_zero(g + c->w, (size_t)c->cout * c->cin * 4); nn_zero(g + c->b, (size_t)c->cout * 4);
+    if (recompute()) { nn_gn_t gg = gn_out(u, d); int r = nn_conv3d_bwd_weight_x(d->a2, &gg, nullptr, nullptr, 0, 0, xs, gl, os, 1, 1, g + c->w, g + c->b); if (r) rc_fail("deep-supervision head weight gradient"); }
+    else nn_conv3d_bwd_weight(d->s2, xs, gl, os, 1, 1, g + c->w, g + c->b);
+    const int dt = nn_storage(u->gout[j]);
+    const size_t tb = dt ? nn_mx_bytes(xs, dt) : nx * (GBF ? 2 : 4);
+    if (u->ds_tmp_n < tb) { if (u->ds_tmp) nn_free(u->ds_tmp); u->ds_tmp = nn_malloc(tb); u->ds_tmp_n = tb; }
+    nn_set_storage(u->ds_tmp, tb, dt);
+    nn_conv3d_bwd_data(gl, os, P(u, c->w), xs, 1, 1, (float *)u->ds_tmp, u->conv_scratch);
+    nn_add_into(u->gout[j], u->ds_tmp, xs, GBF);
+}
+const float *unet_ds_logits(const unet *u, int j, shape5 *s) {
+    if (j < 1 || j > u->cfg.ds_levels || !u->ds_lg[j]) return nullptr;
+    if (s) { *s = u->ls[j]; s->c = u->cfg.cout; }
+    return u->ds_lg[j];
+}
+void unet_set_ds_grad(unet *u, int j, const float *gl) { if (j >= 1 && j <= u->cfg.ds_levels) u->ds_gl[j] = gl; }
 void unet_backward_x(unet *u, const void *gv, int g_h16) {
     const float *glogits = (const float *)gv;
     int L = u->cfg.nlev;
@@ -1752,6 +1800,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     if (u->gco) { u->gout[1] = u->gB[1] = u->gout_x1; if (L > 2) u->gskip[1] = u->gout_x1; }   /* dec[0]'s backward: gout[1] in dec[0].a1's buffer */
     /* decoder, bottom-up in the graph = i from 0 to L-2 */
     for (int i = 0; i < L - 1; i++) {
+        if (i >= 1 && i <= u->cfg.ds_levels && u->ds_gl[i]) ds_bwd(u, i, g);   /* deep supervision: gout[i] += the level head's input gradient */
         shape5 li = u->ls[i];
         shape5 src = u->ls[i + 1]; src.c = UPW(i + 1);
         if (nn_get_tf32()) {
@@ -2170,6 +2219,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     { int any = 0; for (int i = 0; i < u->cfg.nlev; i++) any |= u->cfg.enc_blocks[i] != 0;
       if (any) { fputs(",\"enc_blocks\":[", f); for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.enc_blocks[i]); fputc(']', f); } }
     if (u->cfg.half_res) fprintf(f, ",\"half_res\":%d", u->cfg.half_res);
+    if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
     fprintf(f, ",\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"scale_cond\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"muon_mom\":%d,\"extra\":%s}\n", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->cfg.scale_cond, u->np, step, u->sparse24, u->wq, u->muon_mom != nullptr, extra ? extra : "{}");
     float *h = malloc(u->np * 4);
     const float *arrs[4] = {u->p, u->ema, u->m, u->v};
@@ -2201,6 +2251,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"dec_widths\":["))) { p += 14; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->dec_widths[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"enc_blocks\":["))) { p += 14; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->enc_blocks[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"half_res\":"))) cfg->half_res = atoi(p + 11);
+    if ((p = strstr(line, "\"ds_levels\":"))) cfg->ds_levels = atoi(p + 12);
     if ((p = strstr(line, "\"nparams\":"))) *np = (size_t)atoll(p + 10);
     if ((p = strstr(line, "\"step\":"))) *step = atoi(p + 7);
     if ((p = strstr(line, "\"sparse24\":"))) g_loaded_sparse = atoi(p + 11);

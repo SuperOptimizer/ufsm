@@ -61,6 +61,7 @@ int g_loss_g16 = 0;
 static float g_recall = 0.f;   /* --recall weight (recto channel): 1 - (sum s p + 1) / (sum p + 1), a skeleton-recall term for thin labels */
 extern "C" void nn_set_recall(float w) { g_recall = w < 0.f ? 0.f : w; }
 extern "C" void nn_set_loss_grad_h16(int on) { g_loss_g16 = on; }
+extern "C" int nn_get_loss_grad_h16(void) { return g_loss_g16; }
 extern "C" size_t nn_loss_scratch(shape5 s) { return ((size_t)5 * s.n * s.c + 2 * s.c + 2) * sizeof(float); }
 extern "C" void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch) {
     nn_loss_async_tol(logits, t, m, w, s, dice_w, gl, scratch, nullptr);
