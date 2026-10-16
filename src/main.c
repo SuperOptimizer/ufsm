@@ -3,6 +3,7 @@
 #include "sources.h"
 #include "band.h"
 #include "votes.h"
+#include "wind.h"
 #include "edt.h"
 #include "store.h"
 #include "zarr3.h"
@@ -15,6 +16,8 @@
 #include <zlib.h>
 #include "tiff.h"
 #include <dirent.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -58,6 +61,7 @@ static int usage(void) {
         "  ufsm phase-raster <codes-root> <key> <out-dir> [--box ...]          band phase precomputed for the sampler\n"
         "  ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase|votes  one array halved per axis (labels, phase, side votes)\n"
         "  ufsm side-votes <out-group> <out-um> <root> <key> [<root> <key> ...]   several surface sets' side labels added into one vote array\n"
+        "  ufsm wind-assign <ref-root> <ref-key> <out-dir> <tifxyz>...   other authors' surfaces get winding q in a reference raster's gauge\n"
         "  ufsm ct-hist <out.txt> <root> <key> z,y,x,n [...]  CT histograms of boxes (targets of train --aug-hist, the hist op)\n"
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
@@ -1154,6 +1158,105 @@ static int cmd_side_votes(int argc, char **argv) {
     return 0;
 }
 
+/* ufsm wind-assign <ref-root> <ref-key> <out-dir> <tifxyz>... [--ref-um 4.8] [--vol-um 2.4] [--kind codes|winding] [--tol 6]
+   [--step 4] [--dir 0] [--axis JSON] [--axis-um U] [--drop-duplicates 0]
+   Winding ids for surfaces of other authors / runs (src/wind.h): each tifxyz gets q = K + dir theta / 2 pi per vertex in the gauge of
+   a reference winding raster (codes: raster --value / the published band codes; winding: phase-raster --winding 1, dense), written
+   as <out-dir>/<name> (x / y / z copied, q.tif float32, NaN where dropped or unassigned) for `ufsm raster --value q.tif`; one line
+   per surface on stdout and in <out-dir>/assign.jsonl. --tol: label voxels from the reference that count as on it; --vol-um: the
+   surfaces' scan voxel; --axis-um: the axis JSON's voxel (default --vol-um). */
+typedef struct { z3 *z; int kind; } wa_ref;
+typedef struct { int64_t key; size_t i; } wa_pt;
+static int cmp_wa_pt(const void *a, const void *b) { const int64_t x = ((const wa_pt *)a)->key, y = ((const wa_pt *)b)->key; return x < y ? -1 : x > y; }
+static void wa_lookup(void *ud, const float *pts, size_t n, float tol, float *dist, float *qref) {   /* per 128^3 block of points: one haloed read */
+    const wa_ref *R = ud; const int H = (int)ceilf(tol), B = 128, S = B + 2 * H; const z3_meta *m = z3_meta_of(R->z);
+    wa_pt *ord = malloc(n * sizeof *ord); uint8_t *blk = malloc((size_t)S * S * S);
+    if (!ord || !blk) { free(ord); free(blk); for (size_t i = 0; i < n; i++) { dist[i] = INFINITY; qref[i] = NAN; } return; }
+    for (size_t i = 0; i < n; i++) {
+        const int64_t bz = (int64_t)floorf(pts[3 * i] / B), by = (int64_t)floorf(pts[3 * i + 1] / B), bx = (int64_t)floorf(pts[3 * i + 2] / B);
+        ord[i] = (wa_pt){((bz + 4096) << 40) | ((by + 4096) << 20) | (bx + 4096), i};
+    }
+    qsort(ord, n, sizeof *ord, cmp_wa_pt);
+    for (size_t a = 0; a < n;) {
+        size_t b = a; while (b < n && ord[b].key == ord[a].key) b++;
+        const size_t i0 = ord[a].i;
+        const int64_t o[3] = {(int64_t)floorf(pts[3 * i0] / B) * B - H, (int64_t)floorf(pts[3 * i0 + 1] / B) * B - H, (int64_t)floorf(pts[3 * i0 + 2] / B) * B - H}, nn[3] = {S, S, S};
+        int inside = 1; for (int d = 0; d < 3; d++) inside &= o[d] + S > 0 && o[d] < m->shape[d];
+        const int ok = inside && !z3_read(R->z, o, nn, blk, 1);
+        for (size_t t = a; t < b; t++) {
+            const size_t i = ord[t].i; dist[i] = INFINITY; qref[i] = NAN;
+            if (!ok) continue;
+            const int z0 = (int)lroundf(pts[3 * i]) - (int)o[0], y0 = (int)lroundf(pts[3 * i + 1]) - (int)o[1], x0 = (int)lroundf(pts[3 * i + 2]) - (int)o[2];
+            for (int z = z0 - H; z <= z0 + H; z++) for (int y = y0 - H; y <= y0 + H; y++) for (int x = x0 - H; x <= x0 + H; x++) {
+                if (z < 0 || z >= S || y < 0 || y >= S || x < 0 || x >= S) continue;
+                const float q = wind_code_q(blk[((size_t)z * S + y) * S + x], R->kind);
+                if (isnan(q)) continue;
+                const float dz = z + o[0] - pts[3 * i], dy = y + o[1] - pts[3 * i + 1], dx = x + o[2] - pts[3 * i + 2], d = sqrtf(dz * dz + dy * dy + dx * dx);
+                if (d < dist[i]) { dist[i] = d; qref[i] = q; }
+            }
+        }
+        a = b;
+    }
+    free(ord); free(blk);
+}
+typedef struct { axis ax; double f; } wa_axis;
+static void wa_axis_fn(void *ud, double z, double *cy, double *cx) { const wa_axis *A = ud; axis_at(&A->ax, z / A->f, cy, cx); *cy *= A->f; *cx *= A->f; }
+static float *wa_read_f32(const char *dir, const char *name, int *w, int *h) {
+    char p[1400]; snprintf(p, sizeof p, "%s/%s", dir, name);
+    tiff *t = tiff_open_file(p); tiff_page pg;
+    if (!t || tiff_page_info(t, 0, &pg) || pg.bits != 32 || pg.fmt != 3 || pg.spp != 1 || (*w && (pg.w != *w || pg.h != *h))) { if (t) tiff_close(t); return nullptr; }
+    float *d = malloc((size_t)pg.w * pg.h * 4);
+    if (!d || tiff_read_page(t, 0, d)) { free(d); tiff_close(t); return nullptr; }
+    *w = pg.w; *h = pg.h; tiff_close(t); return d;
+}
+static int cmd_wind_assign(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "usage: ufsm wind-assign <ref-root> <ref-key> <out-dir> <tifxyz>... [--ref-um 4.8] [--vol-um 2.4] [--kind codes|winding] [--tol 6] [--step 4] [--dir 0] [--axis JSON] [--axis-um U] [--drop-duplicates 0]\n"); return 2; }
+    const double ref_um = atof(opt(argc, argv, "--ref-um", "4.8")), vol_um = atof(opt(argc, argv, "--vol-um", "2.4")), axis_um = atof(opt(argc, argv, "--axis-um", opt(argc, argv, "--vol-um", "2.4")));
+    const char *kind = opt(argc, argv, "--kind", "codes");
+    wind_params p = {vol_um / ref_um, (float)atof(opt(argc, argv, "--tol", "6")), atoi(opt(argc, argv, "--step", "4")), atoi(opt(argc, argv, "--dir", "0")),
+                     atoi(opt(argc, argv, "--drop-duplicates", "0")), !strcmp(kind, "winding")};
+    if (!(ref_um > 0 && vol_um > 0 && axis_um > 0) || (strcmp(kind, "codes") && strcmp(kind, "winding")) || !(p.tol >= 0 && p.tol <= 32) || p.step < 1 || (p.dir != 0 && p.dir != 1 && p.dir != -1)) {
+        fprintf(stderr, "wind-assign: --ref-um / --vol-um / --axis-um > 0, --kind codes|winding, --tol 0..32, --step >= 1, --dir -1|0|1\n"); return 2;
+    }
+    wa_ref R = {z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr)), p.dense ? WIND_WINDING : WIND_CODES};
+    if (!R.z) { fprintf(stderr, "wind-assign: %s\n", z3_error()); return 1; }
+    wa_axis A = {.f = axis_um / vol_um};
+    if (axis_load(&A.ax, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "wind-assign: cannot load the axis\n"); return 1; }
+    char lp[1400]; snprintf(lp, sizeof lp, "%s/assign.jsonl", argv[4]);
+    if (mkdir(argv[4], 0755) && errno != EEXIST) { fprintf(stderr, "wind-assign: mkdir %s\n", argv[4]); return 1; }
+    FILE *log = fopen(lp, "a"); if (!log) { fprintf(stderr, "wind-assign: cannot write %s\n", lp); return 1; }
+    int nsurf = 0, rc = 0;
+    for (int a = 5; a < argc; a++) {
+        if (argv[a][0] == '-') { a++; continue; }
+        int w = 0, h = 0; float *X = wa_read_f32(argv[a], "x.tif", &w, &h), *Y = X ? wa_read_f32(argv[a], "y.tif", &w, &h) : nullptr, *Z = Y ? wa_read_f32(argv[a], "z.tif", &w, &h) : nullptr;
+        if (!Z) { fprintf(stderr, "wind-assign: %s: x / y / z.tif must be matching float32 images\n", argv[a]); free(X); free(Y); rc = 1; continue; }
+        const size_t N = (size_t)w * h; float *xyz = malloc(N * 3 * sizeof *xyz); uint8_t *valid = malloc(N);
+        for (size_t i = 0; i < N; i++) {
+            xyz[3 * i] = X[i]; xyz[3 * i + 1] = Y[i]; xyz[3 * i + 2] = Z[i];
+            valid[i] = isfinite(X[i]) && isfinite(Y[i]) && isfinite(Z[i]) && Z[i] > 0 && X[i] >= 0;   /* (load_mesh's rule; -1 = invalid) */
+        }
+        wind_result r;
+        if (wind_assign(xyz, valid, w, h, wa_axis_fn, &A, wa_lookup, &R, p, &r)) { fprintf(stderr, "wind-assign: out of memory\n"); return 1; }
+        const char *base = strrchr(argv[a], '/'); base = base && base[1] ? base + 1 : argv[a];
+        char od[1400], qp[1500]; snprintf(od, sizeof od, "%s/%s", argv[4], base);
+        if (tifxyz_write(od, w, h, X, Y, Z, 1.0, vol_um, -1, "ufsm wind-assign (x / y / z of the input; q.tif: the winding in the reference's gauge)")) { fprintf(stderr, "wind-assign: cannot write %s\n", od); rc = 1; }
+        snprintf(qp, sizeof qp, "%s/q.tif", od);
+        if (tiffw_write(qp, w, h, 3, r.q, 1)) { fprintf(stderr, "wind-assign: cannot write %s\n", qp); rc = 1; }
+        size_t nq = 0, nf[5] = {0}; for (size_t i = 0; i < N; i++) { nq += !isnan(r.q[i]); nf[r.flag[i]]++; }
+        for (int c = 0; c < r.ncomp; c++) {
+            const wind_comp *k = &r.comp[c];
+            printf("%s comp %d (%zu vertices): %s dir %+d K %d (mod 14), %zu of %zu samples on the reference, %zu agree, median dist %.2f, |resid| %.3f turn\n",
+                   base, c, k->nvalid, wind_verdict_name(k->verdict), k->dir, k->K, k->nmatch, k->nsample, k->nagree, k->median_dist, k->mean_abs_resid);
+            fprintf(log, "{\"surface\":\"%s\",\"comp\":%d,\"vertices\":%zu,\"verdict\":\"%s\",\"dir\":%d,\"K\":%d,\"samples\":%zu,\"matched\":%zu,\"agree\":%zu,\"median_dist\":%.3f,\"resid\":%.4f,\"q_vertices\":%zu,\"dropped_conflict\":%zu,\"dropped_duplicate\":%zu,\"unassigned\":%zu}\n",
+                    base, c, k->nvalid, wind_verdict_name(k->verdict), k->dir, k->K, k->nsample, k->nmatch, k->nagree, isfinite(k->median_dist) ? k->median_dist : -1.0, k->mean_abs_resid, nq, nf[2], nf[3], nf[4]);
+        }
+        wind_result_free(&r); free(xyz); free(valid); free(X); free(Y); free(Z); nsurf++;
+    }
+    fclose(log); z3_close(R.z);
+    fprintf(stderr, "wind-assign: %d surfaces -> %s (then: ufsm raster OUT --value q.tif --binary 0 --levels 1 ... %s/*)\n", nsurf, argv[4], argv[4]);
+    return rc;
+}
+
 /* ufsm wrapdist <wraps-dir> <labels-root> <labels-key> [--max 32] [--chunk 128] [--threads 16] [--per-wrap]
    How far the wraps' vertices (every <wraps-dir>/wNNN tifxyz) lie from the nearest labelled sheet voxel (label value != 0) of
    a label array whose key is its voxel size in um (e.g. 4.8; the wraps' voxel_size_um from meta.json scales the vertices onto
@@ -2213,6 +2316,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
     if (!strcmp(cmd, "side-votes")) return cmd_side_votes(argc, argv);
+    if (!strcmp(cmd, "wind-assign")) return cmd_wind_assign(argc, argv);
     if (!strcmp(cmd, "ct-hist")) return cmd_ct_hist(argc, argv);
     if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);
     if (!strcmp(cmd, "wrapswitch")) return cmd_wrapswitch(argc, argv);
