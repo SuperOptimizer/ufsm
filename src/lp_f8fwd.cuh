@@ -1,6 +1,7 @@
 #pragma once
 /* kernels and launchers of lp_f8fwd (instantiated per type in lp_f8fwd_i*.cu) */
 #include "lp_common.cuh"
+#include "lp_sr.cuh"
 
 
 /* ======================= FP8 forward, k=3, stride 1, pad 1 =======================
@@ -88,7 +89,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8_k(const T *__restrict__ x,
             if (!IS_MX(T) && sp.sr) {   /* gradient operand: stochastic rounding, dither keyed by the element (deterministic per call); MX gradients are staged as stored */
                 const uint64_t vid = (((uint64_t)n * Cip + ci0) * D + gz) * (uint64_t)H * W + (uint64_t)gy * W + gx;
 #pragma unroll
-                for (int k = 0; k < 32; k++) v[k] = sr_e4m3(v[k] * m, sr_hash(sp.sr, vid * 32 + k)) / m;
+                for (int k = 0; k < 32; k++) v[k] = sr_e4m3x(v[k] * m, sp.sr, vid * 32 + k) / m;   /* exact SR (sr_e4m3 pulled grid powers of two down) */
             }
             uint4 h0 = make_uint4(cvt_e4m3x4(v[0] * m, v[1] * m, v[2] * m, v[3] * m), cvt_e4m3x4(v[4] * m, v[5] * m, v[6] * m, v[7] * m),
                                   cvt_e4m3x4(v[8] * m, v[9] * m, v[10] * m, v[11] * m), cvt_e4m3x4(v[12] * m, v[13] * m, v[14] * m, v[15] * m));
@@ -417,7 +418,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8p_k(const T *__restrict__ x
                 const int gz = oz0 - 1 + row / 10, gy = oy0 - 1 + row % 10, gx = ox0 - 1 + ix;
                 const uint64_t vid = (((uint64_t)n * D + gz) * H + gy) * (uint64_t)W + gx;
 #pragma unroll
-                for (int k = 0; k < 16; k++) w[k] = sr_e4m3(w[k] * m, sr_hash(sp.sr, vid * 16 + k)) / m;
+                for (int k = 0; k < 16; k++) w[k] = sr_e4m3x(w[k] * m, sp.sr, vid * 16 + k) / m;   /* exact SR */
             }
             *(uint4 *)(sx + pos * 16) = make_uint4(cvt_e4m3x4(w[0] * m, w[1] * m, w[2] * m, w[3] * m), cvt_e4m3x4(w[4] * m, w[5] * m, w[6] * m, w[7] * m),
                                                    cvt_e4m3x4(w[8] * m, w[9] * m, w[10] * m, w[11] * m), cvt_e4m3x4(w[12] * m, w[13] * m, w[14] * m, w[15] * m));

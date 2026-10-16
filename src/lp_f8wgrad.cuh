@@ -2,20 +2,7 @@
 /* kernels and launchers of lp_f8wgrad (instantiated per type in lp_f8wgrad_i*.cu) */
 #include "lp_common.cuh"
 
-/* exact stochastic rounding of the gy operand onto the e4m3 grid (|v| <= 448: block-scaled), keyed by the element. A value on the
-   grid comes back as it is; sr_e4m3's dither then round-to-nearest pulled exact powers of two down (E = v (1 - 1/64): the binade
-   below is twice as fine), which MX-fp4 gradients (half of their magnitudes are powers of two) hit constantly. Off the grid the
-   two bracketing points are chosen with probability proportional to the distance to the other one: inside a binade the grid is
-   uniform, so the floor of the value in grid units plus a uniform. The hash is computed only off the grid (MX-sourced gy: values
-   below 2^-6 after the block scale, rare). */
-__device__ __forceinline__ float sr_e4m3x(float v, uint32_t seed, uint64_t key) {
-    const unsigned b = __float_as_uint(v) & 0x7fffffffu;
-    const int ex = max((int)(b >> 23) - 127, -6);
-    const float t = __uint_as_float(b) * exp2i(3 - ex);   /* grid units: [8, 16) in a normal binade, [0, 8) below 2^-6 */
-    if (t == floorf(t)) return v;   /* on the grid (and 0, inf); NaN goes on and stays NaN */
-    const float u = (float)(sr_hash(seed, key) >> 8) * (1.f / 16777216.f);
-    return copysignf(floorf(t + u) * exp2i(ex - 3), v);
-}
+#include "lp_sr.cuh"   /* sr_e4m3x: the gy operand's exact stochastic rounding (MX-sourced gy: off the grid only below 2^-6 after the block scale, rare) */
 
 /* ======================= FP8 weight gradient, k=3, stride 1 =======================
    Block = 9 warps; warp w owns the tap row (kz, ky) = (w/3, w%3) and all three kx, so one pair of 32-bit loads of

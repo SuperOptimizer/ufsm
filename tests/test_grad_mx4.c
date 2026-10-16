@@ -105,6 +105,31 @@ int main(void) {
         nn_free(a); nn_free(b); nn_free(xm); nn_set_sr(0);
         rs = rs_add;
     }
+    {   /* fp8 backward-data of a non-MX gy with stochastic rounding (lp_f8fwd's staging, sr_e4m3x): gy and the weights on the e4m3 grid,
+           so every staged value is exact and gx equals the fp32 reference up to summation order (sr_e4m3's dither then round-to-nearest
+           moved a quarter of the powers of two one step down: ~1e-2). C 32: conv_fwd_f8_k, C 16: conv_fwd_f8p_k */
+        const uint64_t rs0 = rs;   /* (the tests below draw the random inputs they drew before this one was added) */
+        const int tf0 = nn_get_tf32(), pr0 = nn_get_prec();
+        for (int C = 16; C <= 32; C *= 2) {
+            const shape5 xs = {1, C, 6, 10, 20};
+            const size_t n = shape_numel(xs), nw = (size_t)C * C * 27;
+            float *hg = malloc(n * 4), *hw = malloc(nw * 4);
+            for (size_t i = 0; i < n; i++) { const float a = frand(), b = frand(); hg[i] = copysignf((1.f + floorf(fabsf(a) * 8.f) / 8.f) * exp2f(rintf(2.f * b)), a); }
+            for (size_t i = 0; i < nw; i++) { const float a = frand(); hw[i] = copysignf((1.f + floorf(fabsf(a) * 8.f) / 8.f) * 0x1p-5f, a); }
+            float *gy = nn_malloc(n * 4), *w = nn_malloc(nw * 4), *gxr = dev_zero(n), *gx8 = dev_zero(n), *scr = nn_malloc(nn_conv3d_scratch(xs, C, 3) + 4096);
+            nn_h2d(gy, hg, n * 4); nn_h2d(w, hw, nw * 4);
+            mode_ref(); nn_conv3d_bwd_data(gy, xs, w, xs, 3, 1, gxr, scr);
+            nn_set_tf32(1); nn_set_prec(2); nn_set_sr(1); nn_set_sr_step(77);
+            nn_conv3d_bwd_data(gy, xs, w, xs, 3, 1, gx8, scr);
+            nn_set_sr(0); nn_set_prec(pr0); nn_set_tf32(tf0);
+            const double e = relerr(gx8, gxr, n);
+            const int ok = e < 1e-5;
+            printf("  fp8 backward-data, SR of a grid-valued %2d-channel gy: rel err %.3g vs fp32%s\n", C, e, ok ? "" : "  FAIL");
+            if (!ok) bad++;
+            free(hg); free(hw); nn_free(gy); nn_free(w); nn_free(gxr); nn_free(gx8); nn_free(scr);
+        }
+        rs = rs0;
+    }
     const int N = 2, G = 8, K = 16;
     for (int C = 8; C <= 64; C *= 2) {   /* GroupNorm + SiLU backward: gy and gx MX-fp4 */
         shape5 s = {N, C, 8, 10, 12};
