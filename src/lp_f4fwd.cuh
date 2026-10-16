@@ -445,6 +445,9 @@ template <bool IL> __device__ __forceinline__ void p16_put(uint8_t *sx, unsigned
     if (ix >= 1) sb[4 * w1 + 1] = (uint8_t)sc;
     if (ix >= 2) sb[4 * w2 + 2] = (uint8_t)sc;
 }
+#ifndef F4P_UNR9
+#define F4P_UNR9 2   /* conv_fwd_f4p_k: the tap-row loop fully unrolled for MT <= F4P_UNR9 */
+#endif
 template <int N> struct f4p_nit { static constexpr int value = N; };   /* conv_fwd_f4p_k's row-load count (a compile-time tag) */
 /* NaN-propagating block amax as one instruction per value (FMNMX.NAN with an |v| operand; amax_u needed a mask and an integer max):
    any NaN -> NaN (mx_exp then gives the 0xFF scale byte, as amax_u's NaN bits), otherwise the largest magnitude */
@@ -605,13 +608,18 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
 #pragma unroll
     for (int m = 0; m < MT; m++) for (int r = 0; r < NR; r++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[m][r][q][k] = 0.f;
     const int mat = lane >> 3, kb = mat & 1, vx = (mat >> 1) * 8 + (lane & 7);
-#pragma unroll 3
+    int sl[RZ];   /* ring slots of the warp's output planes (kz = 0): one % NP per tile, the taps' slots by a wrap-around add */
+#pragma unroll
+    for (int rz = 0; rz < RZ; rz++) sl[rz] = (oz0 + wz * RZ + rz) % NP;
+    constexpr int UNR = F4P_UNR9 >= MT ? 9 : 3;   /* the tap-row loop fully unrolled: kz constant */
+#pragma unroll (UNR)
     for (int tr = 0; tr < 9; tr++) {
         const int kz = tr / 3, ky = tr % 3;
         unsigned bfr[NR][4], sb[NR][2];
 #pragma unroll
         for (int r = 0; r < NR; r++) {
-            const int rowi = ((oz0 + wz * RZ + (r >> 1) + kz) % NP) * 10 + wr + (r & 1) + ky;   /* the tile plane's ring slot */
+            const int s0 = sl[r >> 1] + kz, slot = s0 >= NP ? s0 - NP : s0;
+            const int rowi = slot * 10 + wr + (r & 1) + ky;   /* the tile plane's ring slot */
             ldsm_x4(bfr[r], sx + (rowi * 18 + vx + 2 * kb) * 16);   /* K 0..31: [x | x+1], K 32..63: [x+2 | x+3] */
             if constexpr (IL) {   /* columns g, 8 + g: their three positions' scales, kx3 = 1 */
                 const uint2 s2 = *(const uint2 *)(sxw + rowi * 18 + 2 * g);

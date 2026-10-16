@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The two biggest level-0 kernels: conv_fwd_f4p_k and conv_bwd_w_f4ws_k (2026-10-16)
+Desk P512 trainer (P2's profile): conv_fwd_f4p_k (16-channel forward and backward-data) ~149 ms / step over 17 calls,
+conv_bwd_w_f4ws_k (fp4 weight gradient, warp-specialised) ~114 ms over 66, of ~597 ms of kernels.
+- Floors, 16 -> 16 at P512 (134 M voxels, 9 B / voxel in and out): DRAM 2.4 GB = 5.4 ms at 448 GB/s; MMA 1.24 T MAC as issued
+  (9 tap rows of K 64, the kx3 quarter zero) = ~6.5 ms at the dense fp4 rate (0.93 T MAC useful). Measured (bench_f4conv, desk
+  GPU 1): fwd 20.5 ms, bdata 18.3 ms before this work -- ~3.5x either floor; ncu: DRAM ~26% of peak, tensor pipe ~29-36%, 0.6
+  issue / SMSP / cycle, 2 blocks / SM (registers 128 and shared memory both limit), stalls mostly fixed-latency waits.
+- f4p phase split (F4R_PROF, thread 0 of a block): fwd staging 38% / MMA 24% / epilogue 35%; bdata 22 / 30 / 46; the 16 + 16
+  split output 14 / 29 / 55. Instructions (ncu source counters, fwd): staging 41%, epilogue 25% (GN statistics ~9%, the SR
+  quantisation of bdata outputs ~28% of bdata's), MMA loop 12% at only 24% OMMA density (the rest ring-slot % 6, addresses,
+  scale loads).
+- Done (conv_fwd_f4p_k, every output hash unchanged): the ring slots once per tile and the tap-row loop fully unrolled for
+  MT <= 2 (kz constant: OMMA density 24 -> 38%); MT 1 loads a tile's rows right after the previous tile's staging (they
+  arrive during its MMA and epilogue; MT 2 spilled); GN pre-halved (fmaf(v, a / 2, b / 2), same bits); the staging amax as one
+  FMNMX.NAN per value; MT 1 scale words interleaved for one 8-byte load per row; MT > 1 GN pairs in shared memory. fwd 16 -> 16
+  20.5 -> 19.0 ms (-7.3%), bdata 16 -> 16 18.3 -> 17.0 ms (-7.0%), bdata 16 -> 16 + 16 32.3 -> 31.2 ms (-3.3%).
+- Tried and dropped: an 8-slot (power-of-two) ring for MT 1 (+0.8%: the extra shared memory comes out of L1); TZ 2 (+15%).
+- conv_bwd_w_f4ws_k is producer-bound (ncu: the consumers' first load after the FULL barrier holds 23% of the samples), at the
+  80-register cap of 672 threads. Tried, all reverted: the FMNMX.NAN amax in the LY 1 lanes (+0.4%), one cursor advance per pass
+  (spills 16 B), the MX-fp4 decode through a bf16x2 byte table + one fma.rn.bf16x2 per pair with 8-byte LY 1 loads (+6%, a 16 B
+  spill) -- every change that moves its register allocation lost more than its instructions saved.
+- Left: the epilogue (fwd_epi_mx16, lp_common.cuh: 35-55% of f4p) -- GN statistics summed per lane in registers instead of the
+  tb re-read, a cheaper exact SR nibble; the f4p staging index math (li / 180 etc., ~8% of its instructions); f4ws needs a
+  producer restructure that frees registers first.
+
 ## Level-0 kernels outside the 16-channel convs; why test_l3_sched broke under a fused GN-backward sum (2026-10-16)
 Desk 5060 Ti, P512 production net (`tests/bench_l0misc`: per-call times and output hashes; every change below is bit for bit):
 | kernel | before | after | change |
