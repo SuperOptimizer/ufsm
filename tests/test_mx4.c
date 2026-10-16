@@ -457,6 +457,26 @@ int main(void) {
                     lp_set_s2_f4(-1);
                     check("s2 fwd 16 ch fp4 kernel taken", e[1] != e[0]);
                 }
+                if (co == 16) {   /* backward-data, MX-fp4 gy and gx, plain and accumulating: the fp4 kernel (bwd_data_s2_f4q_k) vs bf16 */
+                    float *gyb = dev_rand(nyb, 1e-2f), *old = dev_rand(nxb, 1e-2f), *gxr = dev_zero(nxb);
+                    float *scr = nn_malloc(nn_conv3d_scratch(xb, 16, 3) * 2 + nxb * 4);
+                    void *gym = mx4_from(gyb, yb), *oldm = mx4_from(old, xb); float *gyd = deq4(gym, yb), *oldd = deq4(oldm, xb);
+                    mode_ref(); nn_conv3d_bwd_data(gyd, yb, ww, xb, 3, 2, gxr, scr);
+                    for (int ac = 0; ac < 2; ac++) {
+                        if (ac) nn_axpy(gxr, 1.f, oldd, nxb);
+                        double eb[2];
+                        for (int f4 = 0; f4 < 2; f4++) {
+                            void *gx4 = ac ? mx4_from(old, xb) : mx4_new(xb); lp_set_s2b_f4(f4 ? 3 : 0);
+                            mode_mx(); if (ac) nn_conv3d_bwd_data_acc(gym, yb, ww, xb, 3, 2, (float *)gx4, scr); else nn_conv3d_bwd_data(gym, yb, ww, xb, 3, 2, (float *)gx4, scr);
+                            char nm[96]; snprintf(nm, sizeof nm, "s2 bwd_data 16 ch mx4%s, %s kernel", ac ? " (acc)" : "", f4 ? "fp4" : "bf16");
+                            eb[f4] = cmp(nm, deq4(gx4, xb), gxr, nxb, TOL4);
+                            nn_free(gx4);
+                        }
+                        lp_set_s2b_f4(-1);
+                        check("s2 bwd_data 16 ch fp4 kernel taken", eb[1] != eb[0]);
+                    }
+                    nn_free(gyb); nn_free(old); nn_free(gxr); nn_free(scr); nn_free(gym); nn_free(oldm); nn_free(gyd); nn_free(oldd);
+                }
                 nn_free(xx); nn_free(ww); nn_free(bb); nn_free(tb); nn_free(yr0); nn_free(yr1); nn_free(xxm); nn_free(xxd);
             }
         }

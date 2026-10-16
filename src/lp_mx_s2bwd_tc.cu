@@ -314,11 +314,184 @@ __global__ void __launch_bounds__(256, 2) bwd_data_s2_f4_k(const uint8_t *__rest
         }
     }
 }
+/* ======================= FP4 stride-2 backward-data for 16 channels (MX-fp4 gy and gx: down0 of a 16-wide net) =======================
+   The parity classes on the m16n8k64 kind::mxf4nvf4 MMA (scale_vec::4X: one ue8m0 scale per 16 K, mma_f4x4): a K unit is a quad of
+   class p's taps, K = 4 slots x 16 gy channels, each slot with its gy row's own stored scale, so the MX-fp4 gy rows are staged as stored
+   (exact) and need no pairing in shared memory: lane (g, t) loads its B words straight from the staged rows (slot t / 2, bytes 4 (t & 1)
+   for K 0..31; slot 2 + t / 2 for K 32..63). 9 quads over the 8 classes (27 taps; a class's last quad padded with zero-weight slots
+   that read slot 0's row). The staged gy rows are 24 positions apart (17 used), so the two slots of one load differ by 16 banks or
+   overlap word for word. Block: class positions 2 z x 8 y x 16 x, walked over ZC z tiles; warp (mz, two y rows) = 64 positions. For
+   each (pz, py) a warp accumulates both x parities, then writes its fine rows through a per-warp [32 voxels][20] buffer: lane = one
+   fine voxel of 16 channels (contiguous 256-byte rows), added to the old row (accum, loaded before the MMAs) and stored with exact SR
+   keyed by (osr, row, half) as the 16-channel forward operands. A (M = ci, K = 4 slots x co): prep_w4q_k, scale per (ci, slot). */
+struct s2q4_quads { signed char first[9], tap[9][4]; unsigned char rel[9][4]; };   /* rel: staged-row offset (dz 9 + dy) 24 + dx */
+__global__ void prep_w4q_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, s2q4_quads Q) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;   /* (quad, ci, slot) */
+    if (i >= 9 * 16 * 4) return;
+    const int s = i & 3, ci = (i >> 2) & 15, q = i >> 6, tap = Q.tap[q][s];
+    float v[16], am = 0.f;
+#pragma unroll
+    for (int co = 0; co < 16; co++) { v[co] = tap >= 0 ? w[((size_t)co * 16 + ci) * 27 + tap] : 0.f; am = fmaxf(am, fabsf(v[co])); }
+    const int e = tap >= 0 ? mx_exp(am, 1.f / 6.f) : 0;
+    const float m = exp2i(-e);
+    *(uint2 *)(wq + ((size_t)q * 16 + ci) * 32 + s * 8) = make_uint2(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m));
+    ws[i] = (uint8_t)(e + 127);
+}
+#define S2Q4_GX 24
+#define S2Q4_NG (3 * 9 * S2Q4_GX)
+__global__ void __launch_bounds__(256, 2) bwd_data_s2_f4q_k(const uint8_t *__restrict__ gy, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc, uint8_t *__restrict__ gx,
+                                                         int N, int D, int H, int W, int Do, int Ho, int Wo, int accum, unsigned osr, s2q4_quads Q, int ZC) {
+    constexpr int TMX = 16, GX = S2Q4_GX, GY = 9, NG = S2Q4_NG;
+    extern __shared__ __align__(128) unsigned char s2q_smem[];
+    uint8_t *gyt = s2q_smem;                                    /* [3 z][9 y][24 x][8 B] */
+    uint8_t *gys = gyt + NG * 8;                                /* [NG] */
+    uint8_t *wa = gys + ((NG + 127) & ~127);                    /* [9 quads][16 ci][32 B] swizzled */
+    unsigned *was = (unsigned *)(wa + 9 * 16 * 32);             /* [9][16] */
+    unsigned *rel4 = was + 9 * 16;                              /* [32]: 0..8 the quads' slot rel bytes, 16..24 Q.first[0..7], 9 */
+    float *ob = (float *)(rel4 + 32);                           /* [8 warps][32 voxels][20] */
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int mzw = warp >> 2, myw = (warp & 3) * 2;
+    const int mx0 = blockIdx.x * TMX, my0 = blockIdx.y * 8;
+    const int nzt = (Do + 1) / 2, nzc = (nzt + ZC - 1) / ZC, zc = blockIdx.z % nzc, n = blockIdx.z / nzc;
+    const size_t So = (size_t)Do * Ho * Wo, S = (size_t)D * H * W;
+    const uint8_t *gsc = gy + (size_t)N * So * 8;
+    uint8_t *xsc = gx + (size_t)N * S * 8;
+    for (int i = threadIdx.x; i < 9 * 16 * 2; i += 256) {
+        const int q = i >> 5, c = (i >> 1) & 15, h = i & 1;
+        *(uint4 *)(wa + q * 16 * 32 + sw16(c, h)) = __ldg((const uint4 *)(wq + ((size_t)q * 16 + c) * 32 + h * 16));
+    }
+    for (int i = threadIdx.x; i < 9 * 16; i += 256) was[i] = __ldg((const unsigned *)wsc + i);
+    if (threadIdx.x < 9) rel4[16 + threadIdx.x] = threadIdx.x < 8 ? Q.first[threadIdx.x] : 9;
+    if (threadIdx.x < 9) rel4[threadIdx.x] = Q.rel[threadIdx.x][0] | (Q.rel[threadIdx.x][1] << 8) | (Q.rel[threadIdx.x][2] << 16) | ((unsigned)Q.rel[threadIdx.x][3] << 24);
+    float *wob = ob + warp * 32 * 20;
+    for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
+        const int mz0 = tz * 2;
+        __syncthreads();   /* the weights (first tile) / the previous tile's reads of the gy tile */
+        for (int i = threadIdx.x; i < 3 * 9 * 17; i += 256) {   /* the gy rows as stored (MX-fp4: exact) */
+            const int lx = i % 17, ly = (i / 17) % 9, lz = i / (17 * 9), oz = mz0 + lz, oy = my0 + ly, ox = mx0 + lx;
+            uint2 h0 = make_uint2(0u, 0u); unsigned sc = 127u;
+            if (oz < Do && oy < Ho && ox < Wo) { const size_t ri = (size_t)n * So + ((size_t)oz * Ho + oy) * Wo + ox; h0 = __ldg((const uint2 *)(gy + ri * 8)); sc = gsc[ri]; }
+            const int pi = (lz * GY + ly) * GX + lx;
+            *(uint2 *)(gyt + pi * 8) = h0; gys[pi] = (uint8_t)sc;
+        }
+        __syncthreads();
+#pragma unroll 1
+        for (int pzy = 0; pzy < 4; pzy++) {
+            const int pz = pzy >> 1, py = pzy & 1;
+            const int uz = 2 * (mz0 + mzw) + pz, ux = 2 * mx0 + lane;
+            /* this lane's old fine rows (accumulating), loaded before the MMAs so their latency is hidden */
+            uint2 old[2]; unsigned osc[2];
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+                const int uy = 2 * (my0 + myw + r) + py;
+                old[r] = make_uint2(0u, 0u); osc[r] = 127u;
+                if (accum && uz < D && uy < H && ux < W) { const size_t ri = (size_t)n * S + ((size_t)uz * H + uy) * W + ux; old[r] = *(const uint2 *)(gx + ri * 8); osc[r] = xsc[ri]; }
+            }
+            float acc[2][2][2][4];   /* [px][r][q2][c] */
+#pragma unroll
+            for (int px = 0; px < 2; px++) for (int r = 0; r < 2; r++) for (int q2 = 0; q2 < 2; q2++) for (int k = 0; k < 4; k++) acc[px][r][q2][k] = 0.f;
+#pragma unroll
+            for (int px = 0; px < 2; px++) {
+                const int p = pz * 4 + py * 2 + px;
+                for (int q = (int)rel4[16 + p]; q < (int)rel4[17 + p]; q++) {
+                    unsigned af[4];
+                    const int mat = lane >> 3, arow = (mat & 1) * 8 + (lane & 7);
+                    ldsm_x4(af, wa + q * 16 * 32 + sw16(arow, mat >> 1));
+                    const unsigned sa = was[q * 16 + g + 8 * (t & 1)], rl = rel4[q];
+                    const int r0 = (rl >> (8 * (t >> 1))) & 255, r1 = (rl >> (8 * (2 + (t >> 1)))) & 255, rs = (rl >> (8 * t)) & 255;
+#pragma unroll
+                    for (int r = 0; r < 2; r++)
+#pragma unroll
+                        for (int q2 = 0; q2 < 2; q2++) {
+                            const int base = (mzw * GY + myw + r) * GX + 8 * q2 + g;
+                            const unsigned b[2] = {*(const unsigned *)(gyt + (base + r0) * 8 + (t & 1) * 4), *(const unsigned *)(gyt + (base + r1) * 8 + (t & 1) * 4)};
+                            unsigned sb = (unsigned)gys[base + rs] << (8 * t);   /* slot t's scale; the column's word assembled across t */
+                            sb |= __shfl_xor_sync(0xffffffffu, sb, 1); sb |= __shfl_xor_sync(0xffffffffu, sb, 2);
+                            mma_f4x4(acc[px][r][q2], af, b, sa, sb);
+                        }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+                /* C[ci][class x]: acc[px][r][q2][0, 1] = (ci g, class x 8 q2 + 2 t, + 1), [2, 3] = ci g + 8: fine x = 2 class x + px */
+#pragma unroll
+                for (int px = 0; px < 2; px++)
+#pragma unroll
+                    for (int q2 = 0; q2 < 2; q2++)
+#pragma unroll
+                        for (int k = 0; k < 4; k++) wob[(2 * (8 * q2 + 2 * t + (k & 1)) + px) * 20 + g + 8 * (k >> 1)] = acc[px][r][q2][k];
+                __syncwarp();
+                float v[16];
+#pragma unroll
+                for (int k = 0; k < 4; k++) { const float4 f = *(const float4 *)(wob + lane * 20 + 4 * k); v[4 * k] = f.x; v[4 * k + 1] = f.y; v[4 * k + 2] = f.z; v[4 * k + 3] = f.w; }
+                __syncwarp();   /* the buffer is rewritten for the next row */
+                const int uy = 2 * (my0 + myw + r) + py;
+                if (uz < D && uy < H && ux < W) {
+                    const size_t ri = (size_t)n * S + ((size_t)uz * H + uy) * W + ux;
+                    if (accum) {
+                        const float sc = mx_scale(osc[r]);
+                        const unsigned wd[2] = {old[r].x, old[r].y};
+#pragma unroll
+                        for (int j = 0; j < 2; j++)
+#pragma unroll
+                            for (int k = 0; k < 4; k++) { const float2 d = dec_e2m1x2(wd[j] >> (8 * k)); v[8 * j + 2 * k] += d.x * sc; v[8 * j + 2 * k + 1] += d.y * sc; }
+                    }
+                    unsigned am = 0u;
+#pragma unroll
+                    for (int k = 0; k < 16; k++) am = amax_u(am, v[k]);
+                    const int e = mx_exp(__uint_as_float(am), 1.f / 6.f);
+                    const float m = exp2i(-e);
+                    uint2 qv;
+                    if (osr) { uint32_t ha[4], hb[4]; sr_hash4(osr, (uint64_t)ri * 2, ha); sr_hash4(osr, (uint64_t)ri * 2 + 1, hb); qv = make_uint2(sr_e2m1_word(v, m, ha), sr_e2m1_word(v + 8, m, hb)); }
+                    else qv = make_uint2(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m));
+                    *(uint2 *)(gx + ri * 8) = qv;
+                    xsc[ri] = (uint8_t)(e + 127);
+                }
+            }
+        }
+    }
+}
+static int s2b_f4q(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, unsigned osr) {
+    static s2q4_quads Q; static int built = 0;
+    if (!built) {   /* class p's taps in (z, y, x) order, x fastest (a load's two slots then differ in dx, or in dy / dz alone), in quads */
+        int q = 0;
+        for (int p = 0; p < 8; p++) {
+            Q.first[p] = (signed char)q;
+            const int pa[3] = {p >> 2, (p >> 1) & 1, p & 1};
+            int tk[8], rl[8], nt = 0;
+            for (int a = 0; a < (pa[0] ? 2 : 1); a++) for (int bb = 0; bb < (pa[1] ? 2 : 1); bb++) for (int c = 0; c < (pa[2] ? 2 : 1); c++) {
+                const int sel[3] = {a, bb, c}; int k3[3], d3[3];
+                for (int ax = 0; ax < 3; ax++) { if (!pa[ax]) { k3[ax] = 1; d3[ax] = 0; } else if (!sel[ax]) { k3[ax] = 0; d3[ax] = 1; } else { k3[ax] = 2; d3[ax] = 0; } }
+                tk[nt] = (k3[0] * 3 + k3[1]) * 3 + k3[2]; rl[nt] = (d3[0] * 9 + d3[1]) * S2Q4_GX + d3[2]; nt++;
+            }
+            for (int i = 0; i < nt; i += 4, q++)
+                for (int s = 0; s < 4; s++) {
+                    const bool real = i + s < nt;
+                    Q.tap[q][s] = (signed char)(real ? tk[i + s] : -1); Q.rel[q][s] = (unsigned char)(real ? rl[i + s] : rl[i]);
+                }
+        }
+        if (q != 9) { fprintf(stderr, "s2b_f4q: %d quads\n", q); abort(); }
+        built = 1;
+    }
+    uint8_t *wq = lp_buf<uint8_t>(0, (size_t)9 * 16 * 32), *ws = lp_buf<uint8_t>(1, (size_t)9 * 16 * 4);
+    prep_w4q_k<<<nblk_(9 * 16 * 4, 128), 128>>>(w, wq, ws, Q);
+    const int nzt = (ys.d + 1) / 2, base = ((ys.w + 15) / 16) * ((ys.h + 7) / 8) * xs.n;
+    int ZC = nzt < 8 ? nzt : 8;
+    while (ZC > 1 && (size_t)base * ((nzt + ZC - 1) / ZC) < 480) ZC--;
+    const dim3 grid((unsigned)((ys.w + 15) / 16), (unsigned)((ys.h + 7) / 8), (unsigned)(((nzt + ZC - 1) / ZC) * xs.n));
+    const size_t sm = (size_t)S2Q4_NG * 8 + ((S2Q4_NG + 127) & ~127) + 9 * 16 * 32 + 9 * 16 * 4 + 32 * 4 + 8 * 32 * 20 * 4;
+    static unsigned at = 0; int dev = 0; cudaGetDevice(&dev);
+    if (!(at >> dev & 1u)) { at |= 1u << dev; cudaFuncSetAttribute((const void *)bwd_data_s2_f4q_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    bwd_data_s2_f4q_k<<<grid, 256, sm>>>((const uint8_t *)gy, wq, ws, (uint8_t *)gx, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum, osr, Q, ZC);
+    LPCK();
+    return 1;
+}
 static int g_s2b_f4 = -1;
 extern "C" void lp_set_s2b_f4(int on) { g_s2b_f4 = on; }
 static int s2b_f4(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr) {
     if (g_s2b_f4 < 0) g_s2b_f4 = getenv("UFSM_S2B_F4") ? atoi(getenv("UFSM_S2B_F4")) : 3;
     const int C = xs.c, NCH = C / 32;
+    if (g_s2b_f4 && C == 16 && ys.c == 16 && gdt == 4 && xdt == 4 && xs.d == 2 * ys.d && xs.h == 2 * ys.h && xs.w == 2 * ys.w) return s2b_f4q(gy, ys, w, xs, gx, accum, osr);
     if (!g_s2b_f4 || (C != 32 && C != 64) || ys.c != C || gdt != 4 || (xdt != 4 && xdt != 8) || xs.d != 2 * ys.d || xs.h != 2 * ys.h || xs.w != 2 * ys.w || ys.w % 16 || ys.h % 4) return 0;
     if (C == 64 && (g_s2b_f4 & 2) == 0) return 0;   /* UFSM_S2B_F4=1: 32 channels only (3, the default: also 64) */
     static s2f4_pairs PT, PT2; static int built = 0, built2 = 0;

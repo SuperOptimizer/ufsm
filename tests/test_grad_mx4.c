@@ -36,18 +36,18 @@ static void report(const char *what, double one, double avg, int K, double tol1)
     printf("  %-46s one %.3g, mean of %d %.3g%s\n", what, one, K, avg, ok ? "" : "  FAIL");
     if (!ok) bad++;
 }
-/* the weights as the fp4 stride-2 backward-data kernel sees them (lp_mx_s2bwd_tc.cu s2b_f4: w transposed, prep_w4_k): per (ci, tap)
-   an MX block over the 32 output channels, scale 2^ceil(log2(amax / 6)), e2m1 round-to-nearest-even. Its deterministic error then
+/* the weights as the fp4 stride-2 backward-data kernel sees them (lp_mx_s2bwd_tc.cu s2b_f4 / s2b_f4q: w transposed, prep_w4_k / prep_w4q_k): per (ci, tap)
+   an MX block over the 32 (C 16: 16) output channels, scale 2^ceil(log2(amax / 6)), e2m1 round-to-nearest-even. Its deterministic error then
    drops out of the reference, leaving the stochastic rounding of the stored gradient */
 static float *w_s2b_e2m1(const float *wd, int C) {
     static const float grid[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
     const size_t nw = (size_t)C * C * 27; float *h = malloc(nw * 4); nn_d2h(h, wd, nw * 4);
-    for (int ci = 0; ci < C; ci++) for (int t = 0; t < 27; t++) for (int c0 = 0; c0 < C; c0 += 32) {
+    for (int ci = 0; ci < C; ci++) for (int t = 0; t < 27; t++) for (int c0 = 0, B = C < 32 ? C : 32; c0 < C; c0 += B) {
         float am = 0.f;
-        for (int k = 0; k < 32; k++) am = fmaxf(am, fabsf(h[((size_t)(c0 + k) * C + ci) * 27 + t]));
+        for (int k = 0; k < B; k++) am = fmaxf(am, fabsf(h[((size_t)(c0 + k) * C + ci) * 27 + t]));
         float q = am * (1.f / 6.f); unsigned u; memcpy(&u, &q, 4);
         int e = (int)((u >> 23) & 255) - 127 + ((u & 0x7fffffu) != 0); e = e < -126 ? -126 : e > 126 ? 126 : e;
-        for (int k = 0; k < 32; k++) {
+        for (int k = 0; k < B; k++) {
             float *v = &h[((size_t)(c0 + k) * C + ci) * 27 + t];
             const float a = fminf(fabsf(*v) * ldexpf(1.f, -e), 6.f); int bi = 0;
             for (int j = 1; j < 8; j++) { const float dj = fabsf(a - grid[j]), db = fabsf(a - grid[bi]); if (dj < db || (dj == db && !(j & 1))) bi = j; }
@@ -305,7 +305,7 @@ int main(void) {
         void *gym = mx4_from(gy, ys); float *gyd = deq4(gym, ys);
         void *g0m = mx4_from(g0, xs); float *g0d = deq4(g0m, xs);
         mode_ref();   /* the scratch sized for the fp32 reference (it needs the whole output there) */
-        float *wr = C == 32 || C == 64 ? w_s2b_e2m1(w, C) : w;   /* 32 / 64 channels: the fp4 kernel (its weights in e2m1); 16: bf16 tensor cores */
+        float *wr = C == 16 || C == 32 || C == 64 ? w_s2b_e2m1(w, C) : w;   /* 16 / 32 / 64 channels: the fp4 kernels (their weights in e2m1); 8: bf16 tensor cores */
         float *gxr = dev_zero(nx), *scr = nn_malloc(nn_conv3d_scratch(xs, C, 3) + 4096); nn_conv3d_bwd_data(gyd, ys, wr, xs, 3, 2, gxr, scr);   /* fp32: no accumulate variant; add the old gradient */
         if (accum) nn_axpy(gxr, 1.f, g0d, nx);
         void *gxm = mx4_new(xs); float *acc = dev_zero(nx), *one = dev_zero(nx), *tmp = dev_zero(nx);
