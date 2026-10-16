@@ -1,6 +1,7 @@
 /* FP4 decoder conv1 with the fused 2x upsample for a 16-wide level 0 (dec0.c1: up part <= 16 channels at half resolution,
    skip <= 16 channels, <= 16 outputs; MX-fp4 in / out). */
 #include "lp_f4fwd.cuh"
+#include "lp_slab.cuh"
 
 /* Both segments share one 32-K block per staged position, [up 16 | skip 16] with one ue8m0 scale per 16-K group (mma_f4x4), so a
    tap pair is one m16n8k64 MMA: K = [tapA up | tapA skip | tapB up | tapB skip] (14 k-steps per n-tile; conv_fwd_f4_k ran 28
@@ -161,11 +162,21 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
         float2 gs[16];   /* the skip's GN coefficients in registers for the staging (were two shared loads per element) */
 #pragma unroll
         for (int k = 0; k < 16; k++) gs[k] = cab[16 + k];
+        const bool sslab = Gs && sp.x2 && sp.gp2.G && sp.gp2.ns;   /* slab GroupNorm of the skip: the coefficients of the element's slab */
+        int srow = sslab ? -1 : n;
 #pragma unroll
         for (int it = 0; it < NIT; it++) {   /* stage: up part interpolated, skip dequantised + GN+SiLU, each requantised */
             const int li = threadIdx.x + 256 * it, pl = p0n + li / 180, rem = li % 180, ix = rem % 18, iy = rem / 18;
             if (li >= npos) break;
             const int gz = oz0 - 1 + pl, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix, pos = ((gz + 1) % NP) * 180 + rem;
+            if (sslab) {   /* (the planes of a thread's elements ascend: at most one reload per slab boundary in the tile) */
+                const int rz = gn_row(sp.gp2, n, gz + zi0);
+                if (rz != srow) {
+                    srow = rz;
+#pragma unroll
+                    for (int k = 0; k < 16; k++) if (k < Cs) gs[k] = gn_ab(sp.gp2, rz, k, Cs);
+                }
+            }
             const bool inb = gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
             float v[16];
             unsigned am, q[4], sc;

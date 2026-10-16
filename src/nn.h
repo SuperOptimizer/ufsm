@@ -229,6 +229,10 @@ int nn_head_bwd_x_draws(void);
    nn_gn_const_fill writes constant statistics for N samples (run nullptr: mean 0, rstd 1; else run = [mean G | var G]);
    nn_gn_ema_update moves run toward the batch's statistics (mean, rstd per sample; mom 1: replaced) */
 void nn_set_gn_const(int on);
+/* slab-local GroupNorm (unet cfg.l0_norm slab, kernel path): a statistics array registered here is per (sample, z-slab) [n][ns][G],
+   plane z in slab (z + zo) / zs, zhw voxels per plane; the readers given it (GroupNorm + SiLU in their staging) apply each plane's
+   slab. mean nullptr: clear the registry; ns <= 0: remove mean's entry. (nn_lp.h: gnp_mk / the gnp_t fields) */
+void lp_gn_slab_reg(const float *mean, int zs, int zo, int ns, int zhw);
 int nn_get_gn_const(void);
 void nn_gn_const_fill(float *mean, float *rstd, const float *run, int N, int G, float eps);
 void nn_gn_ema_update(float *run, const float *mean, const float *rstd, int N, int G, float mom, float eps);

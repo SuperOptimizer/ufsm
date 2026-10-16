@@ -64,7 +64,7 @@ extern "C" int nn_conv3d_fwd_gn(const float *x, shape5 xs, int G, const float *g
                                 const float *w, const float *b, int cout, float *y) {
     if (G > xs.c) G = xs.c;   /* GroupNorm uses min(G, C) groups */
     if (!g_tf32) return -1;
-    gnp_t gp = {gamma, beta, mean, rstd, G};
+    gnp_t gp = gnp_mk(gamma, beta, mean, rstd, G);
     split_t ns = {nullptr, 0, nullptr, 0};
     conv_fwd_tc(x, ABF, xs, w, b, cout, y, ABF, gp, nullptr, 0, ns);
     KCHECK();
@@ -74,7 +74,7 @@ extern "C" int nn_conv3d_fwd_gn_stats(const float *x, shape5 xs, int G_in, const
                                       const float *w, const float *b, int cout, float *y, int G_out, float eps, float *omean, float *orstd) {
     if (G_in > xs.c) G_in = xs.c; if (G_out > cout) G_out = cout;
     if (!g_tf32) return -1;
-    gnp_t gp = {gamma, beta, mean, rstd, G_in};
+    gnp_t gp = gnp_mk(gamma, beta, mean, rstd, G_in);
     int NG = xs.n * G_out;
     double *sums = nullptr;
     const int fused = gn_fused_stored(y, cout);
@@ -96,7 +96,7 @@ extern "C" int nn_conv3d_fwd_split(const float *x, const float *x2, int c_split,
                                    const float *w, const float *b, int cout, float *y, int G_out, float eps, float *omean, float *orstd) {
     if (G_in > xs.c) G_in = xs.c; if (G_out > cout) G_out = cout;
     if (!g_tf32) return -1;
-    gnp_t gp = {gamma, beta, mean, rstd, G_in};
+    gnp_t gp = gnp_mk(gamma, beta, mean, rstd, G_in);
     split_t sp = {x2, c_split, nullptr, 0};
     sp = zs_split(sp, xs.d);
     double *sums = nullptr;
@@ -153,7 +153,7 @@ extern "C" int nn_conv3d_bwd_weight_gn(const float *x, shape5 xs, int G, const f
                                        const float *gy, shape5 ys, float *gw, float *gb) {
     if (G > xs.c) G = xs.c;
     if (!g_tf32) return -1;
-    gnp_t gp = {gamma, beta, mean, rstd, G};
+    gnp_t gp = gnp_mk(gamma, beta, mean, rstd, G);
     split_t ns = {nullptr, 0, nullptr, 0};
     launch_bwd_w_tc(x, ABF, xs, gy, GBF, ys, gw, gb, gp, ns);
     KCHECK();
@@ -163,7 +163,7 @@ extern "C" int nn_conv3d_bwd_weight_split(const float *x, const float *x2, int c
                                           const float *gy, shape5 ys, float *gw, float *gb) {
     if (G > xs.c) G = xs.c;
     if (!g_tf32) return -1;
-    gnp_t gp = {gamma, beta, mean, rstd, G};
+    gnp_t gp = gnp_mk(gamma, beta, mean, rstd, G);
     split_t sp = {x2, c_split, nullptr, 0};
     launch_bwd_w_tc(x, ABF, xs, gy, GBF, ys, gw, gb, gp, sp);
     KCHECK();

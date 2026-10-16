@@ -1,7 +1,23 @@
 /* CUDA ops: fwd section of the former nn.cu */
 #include "nn_common.cuh"
 
-gnp_t to_gnp(const nn_gn_t *g) { gnp_t p = {}; if (g && g->G) { p.gamma = g->gamma; p.beta = g->beta; p.mean = g->mean; p.rstd = g->rstd; p.G = g->G; } return p; }
+gnp_t to_gnp(const nn_gn_t *g) { return g && g->G ? gnp_mk(g->gamma, g->beta, g->mean, g->rstd, g->G) : gnp_t{}; }
+/* slab-local GroupNorm registry (nn_lp.h): the statistics arrays that are per (sample, z-slab) and their geometry */
+static struct { const float *mean; int zs, zo, ns, zhw; } g_slab[8];
+static int g_nslab;
+extern "C" void lp_gn_slab_reg(const float *mean, int zs, int zo, int ns, int zhw) {   /* ns <= 0: remove mean's entry */
+    if (!mean) { g_nslab = 0; return; }
+    for (int i = 0; i < g_nslab; i++) if (g_slab[i].mean == mean) { if (ns > 0) g_slab[i] = {mean, zs, zo, ns, zhw}; else g_slab[i] = g_slab[--g_nslab]; return; }
+    if (ns <= 0) return;
+    if (g_nslab == 8) { fprintf(stderr, "lp_gn_slab_reg: more than 8 slab statistics arrays\n"); abort(); }
+    g_slab[g_nslab++] = {mean, zs, zo, ns, zhw};
+}
+extern "C" int lp_gn_slab_any(void) { return g_nslab > 0; }
+extern "C" gnp_t gnp_mk(const float *gamma, const float *beta, const float *mean, const float *rstd, int G) {
+    gnp_t p = {gamma, beta, mean, rstd, G};
+    if (G) for (int i = 0; i < g_nslab; i++) if (g_slab[i].mean == mean) { p.zs = g_slab[i].zs; p.zo = g_slab[i].zo; p.ns = g_slab[i].ns; p.zhw = g_slab[i].zhw; break; }
+    return p;
+}
 __global__ void prep_w16_k(const float *w, __half *wp, float *wsc, int Co, int Ci, int Cop, int Cip) {
     const int co = blockIdx.x;
     float am = 0.f;
