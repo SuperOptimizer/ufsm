@@ -20,7 +20,7 @@ __device__ __forceinline__ int s2pos(int row, int x) { return row * 17 + ((x & 1
 template <int MT, typename T, bool P16 = false>   /* P16: <= 16 input channels, two taps per K block ([kx0 | kx1], [kx2 | 0]) */
 __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                         const float *__restrict__ b, T *__restrict__ y,
-                                                        int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, int Do, int Ho, int Wo, gnp_t gp) {
+                                                        int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, int Do, int Ho, int Wo, gnp_t gp, int2 zw) {   /* zw: z-window tiles (zw_trange) */
     constexpr int BM = MT * 16, TG = 9;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sx = smem_raw;                         /* [S2F8_T pos][32 ci] swizzled */
@@ -34,8 +34,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__
     const bool G = gp.G != 0;
     const split_t nsp = {};
     int bz = blockIdx.z;
-    const int nzt = (Do + 1) / 2;
-    const int oz0 = (bz % nzt) * 2; bz /= nzt;
+    const int tz0 = zw.y ? zw.x : 0, nzt = zw_ntiles(Do, 2, zw);
+    const int oz0 = (tz0 + bz % nzt) * 2; bz /= nzt;
     const int nmt = Cop / BM;
     const int co0 = (bz % nmt) * BM; const int n = bz / nmt;
     const int nch = Cip / 32;
@@ -281,7 +281,7 @@ template <int MT, typename T, bool P16 = false> static void launch_s2f8(dim3 gri
     if (P16) { const size_t sp16 = (size_t)S2F8_T * 16 + 16 + 64 + 256 + 18 * MT * 16 * 33 + 16 + 16 * sizeof(chan_t); if (sp16 > smem) smem = sp16; }
     if (gp.ns) smem += 32 * 8 + 16;   /* (slab GroupNorm: the second coefficient bank, gn_bank2) */
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_s2_f8_k<MT, T, P16>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    conv_fwd_s2_f8_k<MT, T, P16><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (T *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w, gp);
+    conv_fwd_s2_f8_k<MT, T, P16><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (T *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w, gp, zw_trange(ys.d, 2));
 }
 /* ======================= FP4 stride-2 forward (k=3, pad 1): MX-fp4 input of one 32-channel chunk (down0) =======================
    The stride-1 ring kernel's arithmetic for the down conv: m16n8k64 e2m1 MMAs over tap pairs (K = 2 taps x 32 channels, 14 pairs,
@@ -298,7 +298,7 @@ __global__ void prep_w4_k(const float *__restrict__ w, uint8_t *__restrict__ wq,
 template <int MT, int OB, bool GEN = false>   /* OB: MX bits of the output */
 __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                         const float *__restrict__ b, uint8_t *__restrict__ y, int N, int Ci, int D, int H, int W,
-                                                        int Co, int Cop, int Do, int Ho, int Wo, gnp_t gp, int ZC, int Cip = 32) {
+                                                        int Co, int Cop, int Do, int Ho, int Wo, gnp_t gp, int ZC, int Cip = 32, int2 zw = int2{0, 0}) {
     constexpr int BM = MT * 16;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sx = smem_raw;                                     /* [S2F4_T][16 B] */
@@ -310,7 +310,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__rest
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int wz = warp >> 2, wr = warp & 3;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * 4;
-    const int nzt = (Do + 1) / 2, nzc = (nzt + ZC - 1) / ZC;
+    const int tz0 = zw.y ? zw.x : 0, nzt = zw.y ? zw.y : (Do + 1) / 2, nzc = (nzt - tz0 + ZC - 1) / ZC;   /* tiles [tz0, nzt) (z-window) */
     const int zc = blockIdx.z % nzc, n = GEN ? (blockIdx.z / nzc) % N : blockIdx.z / nzc, co0 = GEN ? (int)(blockIdx.z / (nzc * N)) * BM : 0;
     const int nch = GEN ? Cip / 32 : 1;
     const size_t plane = (size_t)D * H * W;
@@ -336,7 +336,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__rest
     __syncthreads();
     float2 *cab2 = gn_bank2(smem_raw, 32);   /* slab GroupNorm: bank 1 (the launcher adds it) */
     int skey = -1;
-    for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
+    for (int tz = tz0 + zc * ZC; tz < nzt && tz < tz0 + (zc + 1) * ZC; tz++) {
         const int oz0 = tz * 2;
         float acc[MT][2][4];
 #pragma unroll
@@ -476,7 +476,7 @@ __global__ void prep_w4p_k(const float *__restrict__ w, uint8_t *__restrict__ wq
 template <int MT, typename TO>
 __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4p_k(const mx4_t *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                          const float *__restrict__ b, TO *__restrict__ y, int N, int Ci, int D, int H, int W,
-                                                         int Co, int Cop, int Do, int Ho, int Wo, gnp_t gp, int ZC) {
+                                                         int Co, int Cop, int Do, int Ho, int Wo, gnp_t gp, int ZC, int2 zw) {
     constexpr int BM = MT * 16, NP = 5, TT = NP * S2P4_PL, NIT = 4;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sx = smem_raw;                                     /* [NP slots][17 rows][17 pairs][16 B]; input plane gz in slot (gz + 1) % NP */
@@ -488,7 +488,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4p_k(const mx4_t *__restr
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int wz = warp >> 2, wr = (warp & 3) * 2;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * 8;
-    const int nzt = (Do + 1) / 2, nzc = (nzt + ZC - 1) / ZC;
+    const int tz0 = zw.y ? zw.x : 0, nzt = zw.y ? zw.y : (Do + 1) / 2, nzc = (nzt - tz0 + ZC - 1) / ZC;   /* tiles [tz0, nzt) (z-window) */
     const int zc = blockIdx.z % nzc, n = blockIdx.z / nzc;
     const size_t plane = (size_t)D * H * W;
     const bool G = gp.G != 0;
@@ -508,8 +508,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4p_k(const mx4_t *__restr
     for (int k = 0; k < 16; k++) gab[k] = make_float2(ctab[k].a, ctab[k].b);
     int srow = gp.ns ? -1 : n;   /* slab-local GroupNorm: the statistics row in gab (each thread's planes ascend: a reload per slab) */
     uint8_t *sb = (uint8_t *)sxw;
-    for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
-        const int oz0 = tz * 2, p0 = tz == zc * ZC ? 0 : 1, npos = (NP - p0) * 17 * 33;   /* tile planes p0 .. 4 are new */
+    for (int tz = tz0 + zc * ZC; tz < nzt && tz < tz0 + (zc + 1) * ZC; tz++) {
+        const int oz0 = tz * 2, p0 = tz == tz0 + zc * ZC ? 0 : 1, npos = (NP - p0) * 17 * 33;   /* tile planes p0 .. 4 are new */
         __syncthreads();   /* the previous tile's MMA has read the slots about to be replaced */
         for (int base = 0; base < npos; base += 256 * NIT) {   /* NIT rows in flight per thread, then each quantised once */
             uint2 raw[NIT];
@@ -591,6 +591,7 @@ static int g_s2_f4g = -1;
 extern "C" void lp_set_s2_f4g(int on) { g_s2_f4g = on; }
 extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp) {
     lp_dtype_check("lp_conv_fwd_s2_f8", xbf, ybf);
+    const int2 zw = zw_trange(ys.d, 2);   /* z-window (nn_set_zwin): the output tiles of 2 planes */
     int Cop = (cout + 15) / 16 * 16, Cip = (xs.c + 31) / 32 * 32, nch = Cip / 32;
     if (xbf >= 3 && cout > 16) Cop = (cout + 31) / 32 * 32;   /* MX output: 32-row-aligned m-tiles */
     if (g_s2_f4 < 0) g_s2_f4 = getenv("UFSM_S2_F4") ? atoi(getenv("UFSM_S2_F4")) : 1;
@@ -599,14 +600,14 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
         uint8_t *wq = lp_buf<uint8_t>(0, (size_t)28 * Cop * 16), *ws = lp_buf<uint8_t>(1, (size_t)28 * Cop);
         prep_w4_k<<<nblk_((size_t)28 * Cop, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, 32, -1, 0, -1, 0);
         const size_t smem = (size_t)S2F4_T * 16 + ((S2F4_T + 127) & ~127) + 14 * 32 * 32 + ((14 * 32 + 7) & ~7) * 2 + 32 * sizeof(chan_t) + 32 * 8 + 16 + (gp.ns ? 32 * 8 + 16 : 0);   /* (slab GroupNorm: bank 1) */
-        const int nzt = (ys.d + 1) / 2, base = ((ys.w + 15) / 16) * ((ys.h + 3) / 4);
+        const int nzt = zw_ntiles(ys.d, 2, zw), base = ((ys.w + 15) / 16) * ((ys.h + 3) / 4);
         int ZC = nzt < 8 ? nzt : 8;
         while (ZC > 1 && (size_t)base * ((nzt + ZC - 1) / ZC) < 480) ZC--;
         const dim3 grid((unsigned)((ys.w + 15) / 16), (unsigned)((ys.h + 3) / 4), (unsigned)(((nzt + ZC - 1) / ZC) * xs.n));
         static int attr[8][2];
         const int ob = ybf == 4 ? 4 : 8;
 #define S2F4(OB_) do { if (!attr[cur_dev_()][OB_ == 4]) { attr[cur_dev_()][OB_ == 4] = 1; cudaFuncSetAttribute((const void *)conv_fwd_s2_f4_k<2, OB_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
-                       conv_fwd_s2_f4_k<2, OB_><<<grid, 256, smem>>>((const uint8_t *)x, wq, ws, b, (uint8_t *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, ys.d, ys.h, ys.w, gp, ZC); } while (0)
+                       conv_fwd_s2_f4_k<2, OB_><<<grid, 256, smem>>>((const uint8_t *)x, wq, ws, b, (uint8_t *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, ys.d, ys.h, ys.w, gp, ZC, 32, zw); } while (0)
         if (ob == 4) S2F4(4); else S2F4(8);
 #undef S2F4
         LPCK();
@@ -620,14 +621,14 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
         uint8_t *wq = lp_buf<uint8_t>(0, (size_t)28 * Cop * (Cip / 2)), *ws = lp_buf<uint8_t>(1, (size_t)28 * Cop * nchk);
         prep_w4_k<<<nblk_((size_t)28 * Cop * nchk, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, Cip, -1, 0, -1, 0);
         const size_t smem = (size_t)S2F4_T * 16 + ((S2F4_T + 127) & ~127) + 14 * 32 * 32 + ((14 * 32 + 7) & ~7) * 2 + 32 * sizeof(chan_t) + 32 * 8 + 16 + (gp.ns ? 32 * 8 + 16 : 0);   /* (slab GroupNorm: bank 1) */
-        const int nzt = (ys.d + 1) / 2, base = ((ys.w + 15) / 16) * ((ys.h + 3) / 4) * ncot * xs.n;
+        const int nzt = zw_ntiles(ys.d, 2, zw), base = ((ys.w + 15) / 16) * ((ys.h + 3) / 4) * ncot * xs.n;
         int ZC = nzt < 8 ? nzt : 8;
         while (ZC > 1 && (size_t)base * ((nzt + ZC - 1) / ZC) < 480) ZC--;
         const dim3 grid((unsigned)((ys.w + 15) / 16), (unsigned)((ys.h + 3) / 4), (unsigned)(((nzt + ZC - 1) / ZC) * xs.n * ncot));
         static int attr[8][2];
         const int ob = ybf == 4 ? 4 : 8;
 #define S2F4G(OB_) do { if (!attr[cur_dev_()][OB_ == 4]) { attr[cur_dev_()][OB_ == 4] = 1; cudaFuncSetAttribute((const void *)conv_fwd_s2_f4_k<2, OB_, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
-                        conv_fwd_s2_f4_k<2, OB_, true><<<grid, 256, smem>>>((const uint8_t *)x, wq, ws, b, (uint8_t *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, ys.d, ys.h, ys.w, gp, ZC, Cip); } while (0)
+                        conv_fwd_s2_f4_k<2, OB_, true><<<grid, 256, smem>>>((const uint8_t *)x, wq, ws, b, (uint8_t *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, ys.d, ys.h, ys.w, gp, ZC, Cip, zw); } while (0)
         if (ob == 4) S2F4G(4); else S2F4G(8);
 #undef S2F4G
         LPCK();
@@ -638,7 +639,7 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
         const int Cq = cout <= 16 ? 16 : 32, MT = Cq / 16;
         uint8_t *wq = lp_buf<uint8_t>(0, (size_t)9 * Cq * 32), *ws = lp_buf<uint8_t>(1, (size_t)9 * Cq * 4);
         prep_w4p_k<<<nblk_((size_t)9 * Cq * 4, 128), 128>>>(w, wq, ws, cout, xs.c, Cq, -1, 0, -1, 0);
-        const int nzt = (ys.d + 1) / 2, base = ((ys.w + 15) / 16) * ((ys.h + 7) / 8);
+        const int nzt = zw_ntiles(ys.d, 2, zw), base = ((ys.w + 15) / 16) * ((ys.h + 7) / 8);
         int ZC = nzt < 16 ? nzt : 16;
         while (ZC > 1 && (size_t)base * ((nzt + ZC - 1) / ZC) * xs.n < 480) ZC--;
         static int zc_env = -2;
@@ -649,7 +650,7 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
         static unsigned attr[8];
         const int ki = (MT - 1) * 2 + (ybf == 4);
 #define S2F4P(MT_, TO_) do { if (!(attr[cur_dev_()] >> ki & 1u)) { attr[cur_dev_()] |= 1u << ki; cudaFuncSetAttribute((const void *)conv_fwd_s2_f4p_k<MT_, TO_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
-                             conv_fwd_s2_f4p_k<MT_, TO_><<<grid, 256, smem>>>((const mx4_t *)x, wq, ws, b, (TO_ *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cq, ys.d, ys.h, ys.w, gp, ZC); } while (0)
+                             conv_fwd_s2_f4p_k<MT_, TO_><<<grid, 256, smem>>>((const mx4_t *)x, wq, ws, b, (TO_ *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cq, ys.d, ys.h, ys.w, gp, ZC, zw); } while (0)
         if (MT == 1) { if (ybf == 4) S2F4P(1, mx4_t); else S2F4P(1, mx8_t); }
         else { if (ybf == 4) S2F4P(2, mx4_t); else S2F4P(2, mx8_t); }
 #undef S2F4P
@@ -662,7 +663,7 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
         uint8_t *wq = lp_buf<uint8_t>(0, (size_t)P16_KS * Cop * 32), *ws = lp_buf<uint8_t>(1, (size_t)P16_KS * Cop);
         prep_w8p_k<<<nblk_((size_t)P16_KS * Cop, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, -1, 0);
         const int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : 1, nmt = Cop / (MT * 16);
-        dim3 grid(nblk_(ys.w, 8), nblk_(ys.h, 4), (unsigned)(nblk_(ys.d, 2) * nmt * xs.n));
+        dim3 grid(nblk_(ys.w, 8), nblk_(ys.h, 4), (unsigned)(zw_ntiles(ys.d, 2, zw) * nmt * xs.n));
 #define S2P(MT_) do { if (xbf == 4) launch_s2f8<MT_, mx4_t, true>(grid, x, xs, wq, ws, b, cout, y, Cop, 32, ys, gp); else if (xbf == 3) launch_s2f8<MT_, mx8_t, true>(grid, x, xs, wq, ws, b, cout, y, Cop, 32, ys, gp); else if (xbf == 2) launch_s2f8<MT_, __half, true>(grid, x, xs, wq, ws, b, cout, y, Cop, 32, ys, gp); else if (xbf) launch_s2f8<MT_, bf16, true>(grid, x, xs, wq, ws, b, cout, y, Cop, 32, ys, gp); else launch_s2f8<MT_, float, true>(grid, x, xs, wq, ws, b, cout, y, Cop, 32, ys, gp); } while (0)
         switch (MT) { case 1: S2P(1); break; case 2: S2P(2); break; default: S2P(4); break; }
 #undef S2P
@@ -674,7 +675,7 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
     prep_w8_k<<<nblk_(nt, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, Cip);
     int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : 1;
     int nmt = Cop / (MT * 16);
-    dim3 grid(nblk_(ys.w, 8), nblk_(ys.h, 4), (unsigned)(nblk_(ys.d, 2) * nmt * xs.n));
+    dim3 grid(nblk_(ys.w, 8), nblk_(ys.h, 4), (unsigned)(zw_ntiles(ys.d, 2, zw) * nmt * xs.n));
 #define S2L(MT_) do { if (xbf == 4) launch_s2f8<MT_, mx4_t>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, ys, gp); else if (xbf == 3) launch_s2f8<MT_, mx8_t>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, ys, gp); else if (xbf == 2) launch_s2f8<MT_, __half>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, ys, gp); else if (xbf) launch_s2f8<MT_, bf16>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, ys, gp); else launch_s2f8<MT_, float>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, ys, gp); } while (0)
     switch (MT) { case 1: S2L(1); break; case 2: S2L(2); break; default: S2L(4); break; }
 #undef S2L
@@ -706,7 +707,7 @@ __device__ unsigned long long g_s2wprof[4];
 #define XS2_PS 612
 template <int MT, int NT, typename T, typename TG, bool FAST = false>
 __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
-                                                          int N, int Ci, int D, int H, int W, int Co, int Do, int Ho, int Wo, int ZC, gnp_t gp) {
+                                                          int N, int Ci, int D, int H, int W, int Co, int Do, int Ho, int Wo, int ZC, gnp_t gp, int2 zw) {   /* zw: z-window tiles of gy */
     constexpr int CH = 8 * NT, BMo = 16 * MT;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sxq = smem_raw;                        /* [CH][XS2_CS] */
@@ -719,10 +720,10 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int ci0 = blockIdx.x * CH, co0 = blockIdx.y * BMo;
     int bz = blockIdx.z;
-    const int nxt = (Wo + 15) / 16, nyt = (Ho + 7) / 8, nzt = (Do + 1) / 2;
+    const int nxt = (Wo + 15) / 16, nyt = (Ho + 7) / 8, tz0 = zw.y ? zw.x : 0, nzt = zw.y ? zw.y : (Do + 1) / 2;   /* z-steps [tz0, nzt) */
     const int ox0 = (bz % nxt) * 16; bz /= nxt;
     const int oy0 = (bz % nyt) * 8; bz /= nyt;
-    const int nzc = (nzt + ZC - 1) / ZC;
+    const int nzc = (nzt - tz0 + ZC - 1) / ZC;
     const int zc = bz % nzc; const int n = bz / nzc;
     const size_t plane = (size_t)D * H * W;
     const int kz = warp / 3, ky = warp % 3;
@@ -745,7 +746,7 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
         for (int q = 1; q < CH; q++) if (ctab[q].p && (ctab[q].sp != ctab[0].sp || ctab[q].nib != ctab[0].nib + q)) uni = false;
     }
     int npass = 0;   /* uni staging passes so far (selects the amax buffer) */
-    const int zt_begin = zc * ZC;
+    const int zt_begin = tz0 + zc * ZC;
 #if S2W_PROF
     unsigned long long pa = 0, pb_ = 0, pc = 0, t0 = 0, t1 = 0, t2 = 0;
 #endif
@@ -981,7 +982,7 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
                 bacc += bs;
             }
         };
-        const int zt_end = min(nzt, (zc + 1) * ZC);
+        const int zt_end = min(nzt, tz0 + (zc + 1) * ZC);
         {   /* the first z-step's leading plane, then its four new ones prefetched */
             const int gz = 2 * (2 * zt_begin) - 1;
             xload1(xra, xsa, gz);
@@ -1030,7 +1031,7 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
 #endif
         }
     } else
-    for (int zt = zc * ZC; zt < nzt && zt < (zc + 1) * ZC; zt++) {
+    for (int zt = tz0 + zc * ZC; zt < nzt && zt < tz0 + (zc + 1) * ZC; zt++) {
         const int oz0 = zt * 2;
         __syncthreads();
 #if S2W_PROF
@@ -1208,6 +1209,7 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
     }
 }
 template <int MT, int NT, typename T, typename TG> static void launch_bws2(dim3 grid, size_t smem, const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, int ZC, gnp_t gp) {
+    const int2 zw = zw_trange(ys.d, 2);   /* z-window: gy's z-steps */
     static int attr[8][2];
     static int fast_env = -1;
     if (fast_env < 0) fast_env = getenv("UFSM_S2W_FAST") ? atoi(getenv("UFSM_S2W_FAST")) : 1;
@@ -1215,7 +1217,7 @@ template <int MT, int NT, typename T, typename TG> static void launch_bws2(dim3 
         if (fast_env && x && (16 * MT <= mx_bw(ys.c) || (ys.c <= mx_bw(ys.c) && mx_bw(ys.c) < 16 * MT)) && (ys.w % 4 == 0 || IS_MX4(TG))) {   /* MX-fp4 gy: any Wo */
             if (!attr[cur_dev_()][1]) { attr[cur_dev_()][1] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_s2_f8_k<MT, NT, T, TG, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
             smem += 16 + 256 * 16 * MT + 256;   /* raw gy rows and scales */
-            conv_bwd_w_s2_f8_k<MT, NT, T, TG, true><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, ZC, gp);
+            conv_bwd_w_s2_f8_k<MT, NT, T, TG, true><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, ZC, gp, zw);
             return;
         }
     }
@@ -1223,7 +1225,7 @@ template <int MT, int NT, typename T, typename TG> static void launch_bws2(dim3 
                                         x ? "set" : "null", xs.c, ys.c, ys.d, ys.h, ys.w, MT); abort(); }
     else {
     if (!attr[cur_dev_()][0]) { attr[cur_dev_()][0] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_s2_f8_k<MT, NT, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    conv_bwd_w_s2_f8_k<MT, NT, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, ZC, gp);
+    conv_bwd_w_s2_f8_k<MT, NT, T, TG><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, ZC, gp, zw);
     }
 }
 template <typename T, typename TG> static void bwd_w_s2_f8_t(const void *x, shape5 xs, const TG *gy, shape5 ys, float *gw, float *gb, gnp_t gp) {
@@ -1231,7 +1233,7 @@ template <typename T, typename TG> static void bwd_w_s2_f8_t(const void *x, shap
     if (getenv("UFSM_S2W_NT")) NT = atoi(getenv("UFSM_S2W_NT"));
     if (getenv("UFSM_S2W_MT")) MT = atoi(getenv("UFSM_S2W_MT"));
     size_t smem = (size_t)8 * NT * XS2_CS + 16 * MT * (G8_CS + 8) + 8 * NT * 8 + 16 * MT * 4 + 32 + (size_t)8 * NT * (sizeof(chan_t) + 3 * 4);
-    int nzt = nblk_(ys.d, 2), base = (int)(((xs.c + 8 * NT - 1) / (8 * NT)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * nblk_(ys.w, 16) * nblk_(ys.h, 8) * ys.n);
+    int nzt = zw_ntiles(ys.d, 2, zw_trange(ys.d, 2)), base = (int)(((xs.c + 8 * NT - 1) / (8 * NT)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * nblk_(ys.w, 16) * nblk_(ys.h, 8) * ys.n);
     const int zcap = xs.c <= 16 ? 32 : 8;   /* 16-wide levels: 32 z-steps per block (down0 P512 13.3 -> 12.6 ms) */
     int ZC = nzt < zcap ? nzt : zcap;
     while (ZC > 1 && (size_t)base * nblk_(nzt, ZC) < 72) ZC--;

@@ -32,9 +32,9 @@ typedef struct { const char *name; size_t nb; void *out; void *out2; size_t nb2;
 static void cmp(const char *what, int S, const res_t *a, const res_t *b) {
     char m[160]; snprintf(m, sizeof m, "%s, %d-plane windows", what, S);
     size_t nd = 0;
-    uint8_t *ha = malloc(a->nb), *hb = malloc(a->nb); nn_d2h(ha, a->out, a->nb); nn_d2h(hb, b->out, a->nb);
-    for (size_t i = 0; i < a->nb; i++) nd += ha[i] != hb[i];
-    free(ha); free(hb);
+    if (a->out) { uint8_t *ha = malloc(a->nb), *hb = malloc(a->nb); nn_d2h(ha, a->out, a->nb); nn_d2h(hb, b->out, a->nb);
+                  for (size_t i = 0; i < a->nb; i++) nd += ha[i] != hb[i];
+                  free(ha); free(hb); }
     if (a->out2) { uint8_t *xa = malloc(a->nb2), *xb = malloc(a->nb2); nn_d2h(xa, a->out2, a->nb2); nn_d2h(xb, b->out2, a->nb2); for (size_t i = 0; i < a->nb2; i++) nd += xa[i] != xb[i]; free(xa); free(xb); }
     double es = 0, eg = 0;
     if (a->st) { float *sa = malloc(a->nst * 4), *sb = malloc(a->nst * 4); nn_d2h(sa, a->st, a->nst * 4); nn_d2h(sb, b->st, a->nst * 4);
@@ -156,12 +156,87 @@ static void test_bwd(int Cy, int Cx, int o_split, int D) {
     mode_off();
 }
 
+/* ---- generic: op(ctx, r) under each window; outputs (byte compare), statistics, weight gradients */
+typedef void (*op_t)(void *ctx, res_t *r);
+static void run_op(op_t op, void *ctx, int z0, int z1, int D, unsigned ctr, res_t *r, int first, int last) {
+    nn_set_zwin(z0, z1, D, first, last); nn_sr_set_ctr(ctr); op(ctx, r); nn_set_zwin(0, 0, 0, 0, 0);
+}
+static res_t res_like(const res_t *a, shape5 so) {   /* fresh zeroed buffers shaped like a's */
+    res_t b = *a;
+    if (a->out) b.out = mx4_new(so);
+    if (a->gw) b.gw = dev_zero(a->ngw);
+    if (a->st) b.st = dev_zero(a->nst);
+    return b;
+}
+static void res_free(res_t *r) { if (r->out) nn_free(r->out); if (r->gw) nn_free(r->gw); if (r->st) nn_free(r->st); }
+/* windows of S level-0 planes (D0 deep) == one window [0, D0); so: the output shape (coverage: a lone window [8, 16) in its planes) */
+static void drive(const char *what, op_t op, void *ctx, int D0, res_t *a, shape5 so, int cover_ok) {
+    nn_set_sr_step(91); const unsigned c0 = nn_sr_ctr();
+    run_op(op, ctx, 0, D0, D0, c0, a, 1, 1);
+    for (int S = 8; S <= 16; S *= 2) {
+        res_t b = res_like(a, so);
+        int z0[64], z1[64]; const int k = windows(D0, S, z0, z1);
+        for (int i = 0; i < k; i++) run_op(op, ctx, z0[i], z1[i], D0, c0, &b, i == 0, i == k - 1);
+        cmp(what, S, a, &b); res_free(&b);
+    }
+    if (cover_ok && a->out) {
+        res_t b = res_like(a, so);
+        run_op(op, ctx, 8, 16, D0, c0, &b, 1, 1);
+        cover(what, a->out, b.out, so, 8 * so.d / D0, 16 * so.d / D0);
+        res_free(&b);
+    }
+}
+/* stem: the 4-channel network input (MX-fp4) -> 16 channels with output statistics (fp8 compute) */
+typedef struct { shape5 xs; int cout, Go; void *x; float *w, *b; } stem_t;
+static void stem_op(void *c, res_t *r) {
+    stem_t *f = c;
+    if (nn_conv3d_fwd_gn_stats((const float *)f->x, f->xs, 0, nullptr, nullptr, nullptr, nullptr, f->w, f->b, f->cout, (float *)r->out, f->Go, 1e-5f, r->st, r->st + f->Go) < 0) { printf("  stem unsupported  FAIL\n"); bad++; }
+}
+static void test_stem(int D) {
+    mode_prod();
+    stem_t f = {{1, 4, D, 12, 20}, 16, 4};
+    float *x = dev_rand(shape_numel(f.xs), 1.5f); f.x = mx4_from(x, f.xs); nn_free(x);
+    f.w = dev_rand((size_t)16 * 4 * 27, 0.2f); f.b = dev_rand(16, 0.1f);
+    const shape5 ys = {1, 16, D, 12, 20};
+    res_t a = {"", nn_mx4_bytes(ys), mx4_new(ys), nullptr, 0, dev_zero(2 * f.Go), (size_t)2 * f.Go};
+    char m[96]; snprintf(m, sizeof m, "stem 4 -> 16 ch, depth %d", D); drive(m, stem_op, &f, D, &a, ys, 1);
+    res_free(&a); nn_free(f.x); nn_free(f.w); nn_free(f.b); mode_off();
+}
+/* down0: stride-2 forward of silu(gn(x)) (level 0 -> level 1) and its weight gradient */
+typedef struct { shape5 xs, ys; nn_gn_t g; void *x, *gy; float *w, *b; } down_t;
+static void down_fwd_op(void *c, res_t *r) {
+    down_t *f = c;
+    if (nn_conv3d_fwd_x((const float *)f->x, &f->g, nullptr, nullptr, 0, 0, f->xs, f->w, f->b, f->ys.c, 3, 2, (float *)r->out, 0, 1e-5f, nullptr, nullptr) < 0) { printf("  down fwd unsupported  FAIL\n"); bad++; }
+}
+static void down_wgrad_op(void *c, res_t *r) {
+    down_t *f = c;
+    if (nn_conv3d_bwd_weight_x((const float *)f->x, &f->g, nullptr, nullptr, 0, 0, f->xs, (const float *)f->gy, f->ys, 3, 2, r->gw, r->gw + (size_t)f->ys.c * f->xs.c * 27) < 0) { printf("  down wgrad unsupported  FAIL\n"); bad++; }
+}
+static void test_down(int C, int Co, int D) {
+    mode_prod();
+    down_t f = {{1, C, D, 12, 32}, {1, Co, D / 2, 6, 16}};
+    float *x = dev_rand(shape_numel(f.xs), 1.5f); f.x = mx4_from(x, f.xs); nn_free(x);
+    float *gy = dev_rand(shape_numel(f.ys), 1e-2f); f.gy = mx4_from(gy, f.ys); nn_free(gy);
+    const int G = C / 4;
+    float *gam = dev_rand(C, 1.f), *bet = dev_rand(C, 0.5f), *mean = dev_rand(G, 0.2f), *rstd = dev_rand(G, 0.3f);
+    { float h[64]; nn_d2h(h, rstd, G * 4); for (int i = 0; i < G; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, G * 4); }
+    f.g = (nn_gn_t){gam, bet, mean, rstd, G};
+    f.w = dev_rand((size_t)Co * C * 27, 0.12f); f.b = dev_rand(Co, 0.1f);
+    char m[96];
+    res_t a = {"", nn_mx4_bytes(f.ys), mx4_new(f.ys)};
+    snprintf(m, sizeof m, "down0 fwd %2d -> %2d ch, depth %d", C, Co, D); drive(m, down_fwd_op, &f, D, &a, f.ys, 1); res_free(&a);
+    res_t w = {"", 0, nullptr, nullptr, 0, nullptr, 0, dev_zero((size_t)Co * C * 27 + Co), (size_t)Co * C * 27 + Co};
+    snprintf(m, sizeof m, "down0 wgrad %2d -> %2d ch, depth %d", C, Co, D); drive(m, down_wgrad_op, &f, D, &w, f.ys, 0); res_free(&w);
+    nn_free(f.x); nn_free(f.gy); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd); nn_free(f.w); nn_free(f.b); mode_off();
+}
+
 int main(void) {
     nn_init(0);
     printf("z-window launches == one launch (MX-fp4, SR):\n");
     for (int D = 32; D <= 36; D += 4) {   /* 36: a partial last window */
         test_fwd(16, 16, D); test_fwd(32, 32, D);
         test_bwd(16, 16, 0, D); test_bwd(32, 32, 0, D); test_bwd(16, 32, 16, D);
+        test_stem(D); test_down(16, 16, D); test_down(32, 32, D);
     }
     const char *e = nn_check(); if (e) { printf("  CUDA: %s  FAIL\n", e); bad++; }
     printf("test_zwin: %s\n", bad ? "FAIL" : "PASS");

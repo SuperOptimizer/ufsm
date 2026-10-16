@@ -36,6 +36,15 @@ extern cudaError_t g_lp_err;
 static inline unsigned nblk_(size_t n, unsigned b) { return (unsigned)((n + b - 1) / b); }
 /* the z tiles of TZ planes a launch covers: all of depth D, or those of the z-window sp.zw0 / zw1 (nn_set_zwin; its bounds on tile
    edges, or the window ends at D: a tile never writes planes outside the window) */
+int zw_win(int D, int *z0, int *z1);   /* nn_bwd.cu: the thread's z-window scaled to a depth-D output (1 when on) */
+/* the thread's z-window as output tiles [x, y) of TZ planes of a depth-D output ({0, 0}: all; launchers without a split_t) */
+static inline int2 zw_trange(int D, int TZ) {
+    int a, b;
+    if (!zw_win(D, &a, &b)) return make_int2(0, 0);
+    if (a % TZ || (b % TZ && b != D)) { fprintf(stderr, "z-window [%d, %d) not on %d-plane tiles of depth %d\n", a, b, TZ, D); abort(); }
+    return make_int2(a / TZ, (b + TZ - 1) / TZ);
+}
+__host__ __device__ static inline int zw_ntiles(int D, int TZ, int2 zw) { return zw.y ? zw.y - zw.x : (D + TZ - 1) / TZ; }
 static inline unsigned zw_tiles(int D, int TZ, const split_t &sp) {
     if (!sp.zw1) return nblk_(D, TZ);
     if (sp.zw0 % TZ || (sp.zw1 % TZ && sp.zw1 != D) || sp.zw1 > D) { fprintf(stderr, "z-window [%d, %d) not on %d-plane tiles of depth %d\n", sp.zw0, sp.zw1, TZ, D); abort(); }

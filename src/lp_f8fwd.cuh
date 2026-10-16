@@ -33,8 +33,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8_k(const T *__restrict__ x,
     const int wz = warp >> 2, wr = (warp & 3) * 2;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * 8;
     int bz = blockIdx.z;
-    const int nzt = (D + TZ - 1) / TZ;
-    const int oz0 = (bz % nzt) * TZ; bz /= nzt;
+    const int tz0 = sp.zw1 ? sp.zw0 / TZ : 0, nzt = sp.zw1 ? (sp.zw1 + TZ - 1) / TZ - tz0 : (D + TZ - 1) / TZ;   /* (z-window: its tiles) */
+    const int oz0 = (tz0 + bz % nzt) * TZ; bz /= nzt;
     const int nmt = Cop / BM;
     const int co0 = (bz % nmt) * BM; const int n = bz / nmt;
     const int nch = Cip / 32;
@@ -192,7 +192,7 @@ __global__ void __launch_bounds__(256, CP <= 4 ? F8S4_MINB : 2) conv_fwd_f8s_k(c
     const int wz = warp >> 2, wr = (warp & 3) * 2;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * 8;
     int bz = blockIdx.z;
-    const int nzt = (D + 1) / 2, nzc = (nzt + ZC - 1) / ZC;
+    const int tz0 = sp.zw1 ? sp.zw0 / 2 : 0, nzt = sp.zw1 ? (sp.zw1 + 1) / 2 : (D + 1) / 2, nzc = (nzt - tz0 + ZC - 1) / ZC;   /* tiles [tz0, nzt) (z-window) */
     const int zc = bz % nzc; bz /= nzc;
     const int nmt = Cop / BM;
     const int co0 = (bz % nmt) * BM; const int n = bz / nmt;
@@ -281,8 +281,8 @@ __global__ void __launch_bounds__(256, CP <= 4 ? F8S4_MINB : 2) conv_fwd_f8s_k(c
                 pok |= (unsigned)inb << j;
             }
         };
-        const int tend = min(nzt, (zc + 1) * ZC);
-        int tz = zc * ZC;
+        const int tend = min(nzt, (tz0 + (zc + 1) * ZC));
+        int tz = (tz0 + zc * ZC);
         if (tz < tend) ld5(tz);
         for (int it = 0; tz < tend; it++, tz += 2) {
             const bool hasB = tz + 1 < tend;
@@ -328,13 +328,13 @@ __global__ void __launch_bounds__(256, CP <= 4 ? F8S4_MINB : 2) conv_fwd_f8s_k(c
         if (osum) fwd_stats_flush<BM>(smem_raw + scr_off, osum, n, co0, Co, Go);
         return;
     }
-    if constexpr (IS_MX(T) && CP <= 4) if (row1 && zc * ZC < nzt) ld3(zc * ZC);
-    for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
-    const int oz0 = tz * 2, db = DB ? (tz - zc * ZC) & 1 : 0;
+    if constexpr (IS_MX(T) && CP <= 4) if (row1 && (tz0 + zc * ZC) < nzt) ld3((tz0 + zc * ZC));
+    for (int tz = (tz0 + zc * ZC); tz < nzt && tz < (tz0 + (zc + 1) * ZC); tz++) {
+    const int oz0 = tz * 2, db = DB ? (tz - (tz0 + zc * ZC)) & 1 : 0;
     uint8_t *sx = sx0 + db * F8_T * CP;
     unsigned *sam = samax + db;
     if (!DB) {
-        if (tz > zc * ZC) __syncthreads();   /* the previous tile's MMA (sx) and amax reads are done */
+        if (tz > (tz0 + zc * ZC)) __syncthreads();   /* the previous tile's MMA (sx) and amax reads are done */
         if (threadIdx.x == 0) *samax = 0u;
         __syncthreads();
     }   /* DB: this tile's buffers were last read by the tile before the previous one, which every warp finished before the previous
@@ -393,7 +393,7 @@ __global__ void __launch_bounds__(256, CP <= 4 ? F8S4_MINB : 2) conv_fwd_f8s_k(c
         }
     }
     __syncthreads();
-    if constexpr (IS_MX(T) && CP <= 4) if (row1 && tz + 1 < nzt && tz + 1 < (zc + 1) * ZC) ld3(tz + 1);   /* the next tile's rows during this MMA */
+    if constexpr (IS_MX(T) && CP <= 4) if (row1 && tz + 1 < nzt && tz + 1 < (tz0 + (zc + 1) * ZC)) ld3(tz + 1);   /* the next tile's rows during this MMA */
     mma_epi(sx, sb, oz0);
     }
     if (osum) fwd_stats_flush<BM>(smem_raw + scr_off, osum, n, co0, Co, Go);
@@ -410,7 +410,7 @@ template <int MT, int CP, typename T, typename TO> void launch_f8s(dim3 grid, co
     const size_t smem = base + scr;
     static int zc_env = -2;
     if (zc_env == -2) zc_env = getenv("UFSM_F8S_ZC") ? atoi(getenv("UFSM_F8S_ZC")) : -1;
-    const int nzt = (xs.d + 1) / 2, rest = (int)(grid.x * grid.y * (grid.z / nzt));   /* blocks per z column */
+    const int nzt = zw_tiles(xs.d, 2, sp), rest = (int)(grid.x * grid.y * (grid.z / nzt));   /* blocks per z column */
     int ZC = zc_env > 0 ? zc_env : CP <= 4 ? 32 : 8;   /* z tiles per block, while >= ~480 blocks remain (the network input: 32, P512 17.3 -> 16.3 ms) */
     while (ZC > 1 && (size_t)rest * ((nzt + ZC - 1) / ZC) < 480) ZC--;
     grid.z = (grid.z / nzt) * ((nzt + ZC - 1) / ZC);
@@ -426,7 +426,7 @@ template <int CP, typename T, typename TO = T> static void small_f8(const void *
     prep_w8s_k<CP><<<nblk_((size_t)NKB * Cop, 128), 128>>>(w, wq, ws, cout, xs.c, Cop);
     int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : 1;   /* BM = 16 MT must divide Cop (Cop = 48 -> MT = 1) */
     int nmt = Cop / (MT * 16);
-    dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(nblk_(xs.d, 2) * nmt * xs.n));
+    dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(zw_tiles(xs.d, 2, sp) * nmt * xs.n));
     switch (MT) {
     case 1: launch_f8s<1, CP, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     case 2: launch_f8s<2, CP, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
@@ -460,8 +460,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8p_k(const T *__restrict__ x
     const int wz = warp >> 2, wr = (warp & 3) * 2;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * 8;
     int bz = blockIdx.z;
-    const int nzt = (D + TZ - 1) / TZ;
-    const int oz0 = (bz % nzt) * TZ; bz /= nzt;
+    const int tz0 = sp.zw1 ? sp.zw0 / TZ : 0, nzt = sp.zw1 ? (sp.zw1 + TZ - 1) / TZ - tz0 : (D + TZ - 1) / TZ;   /* (z-window: its tiles) */
+    const int oz0 = (tz0 + bz % nzt) * TZ; bz /= nzt;
     const int nmt = Cop / BM;
     const int co0 = (bz % nmt) * BM; const int n = bz / nmt;
     const int zi0 = sp.zi0, Di = sp.Di ? sp.Di : D;   /* z-range (nn_set_zrange): output plane z reads input plane z + zi0 of a depth-Di input */
@@ -578,7 +578,7 @@ template <typename T, typename TO> static void p16_f8(const void *x, shape5 xs, 
     if (tz_env < 0) tz_env = getenv("UFSM_F8_TZ") ? atoi(getenv("UFSM_F8_TZ")) : 0;
     int TZ = tz_env ? tz_env : (MT <= 2 && xs.d >= 16 ? 4 : 2);
     if (MT == 4) TZ = 2;
-    dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(nblk_(xs.d, TZ) * nmt * xs.n));
+    dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(zw_tiles(xs.d, TZ, sp) * nmt * xs.n));
     switch (MT * 10 + TZ) {
     case 12: launch_f8p<1, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
     case 14: launch_f8p<1, 4, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); break;
@@ -634,7 +634,7 @@ template <typename T, typename TO = T> void fwd_f8_t(const void *x, shape5 xs, c
     if (tz_env < 0) tz_env = getenv("UFSM_F8_TZ") ? atoi(getenv("UFSM_F8_TZ")) : 0;
     int TZ = tz_env ? tz_env : (MT <= 2 && xs.d >= 16 ? 4 : 2);
     if (MT == 4) TZ = 2;
-    dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(nblk_(xs.d, TZ) * nmt * xs.n));
+    dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(zw_tiles(xs.d, TZ, sp) * nmt * xs.n));
     switch (MT * 10 + TZ) {
     case 12: launch_f8g<1, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp); break;
     case 14: launch_f8g<1, 4, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp); break;
