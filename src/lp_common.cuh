@@ -398,6 +398,11 @@ __device__ __forceinline__ float act_ab(float v, float a, float b, bool G) {
 /* NaN-propagating block amax: unsigned max over the magnitude bits (finite magnitudes order as their bits; NaN bits exceed inf),
    where fmaxf would drop a NaN element and the e2m1 conversion would then store it as a finite 6 */
 __device__ __forceinline__ unsigned amax_u(unsigned a, float v) { return max(a, __float_as_uint(v) & 0x7fffffffu); }
+/* the same as one instruction per value: max(|a|, |v|) with the xor of their signs (FMNMX.NAN.XORSIGN with abs operands; amax_u
+   needed a mask and an integer max, a max.NaN of fabsf(v) a separate FADD for the fabs). Any NaN -> NaN (mx_exp then gives the
+   0xFF scale byte, as amax_u's NaN bits), otherwise the largest magnitude -- with a meaningless sign: only for amaxes whose sign
+   is ignored, as mx_exp's (exponent bits, NaN test on |u|); the warp combines of such amaxes take amax_xs too */
+__device__ __forceinline__ float amax_xs(float a, float v) { float r; asm("max.NaN.xorsign.abs.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(v)); return r; }
 __device__ __forceinline__ int mx_exp(float amax, float inv_qmax) {
     unsigned u = __float_as_uint(amax * inv_qmax);
     if ((u & 0x7fffffffu) > 0x7f800000u) return 128;   /* NaN amax: scale byte 0xFF (decoded as inf) so the non-finite value survives storage */

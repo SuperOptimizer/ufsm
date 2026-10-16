@@ -449,9 +449,6 @@ template <bool IL> __device__ __forceinline__ void p16_put(uint8_t *sx, unsigned
 #define F4P_UNR9 2   /* conv_fwd_f4p_k: the tap-row loop fully unrolled for MT <= F4P_UNR9 */
 #endif
 template <int N> struct f4p_nit { static constexpr int value = N; };   /* conv_fwd_f4p_k's row-load count (a compile-time tag) */
-/* NaN-propagating block amax as one instruction per value (FMNMX.NAN with an |v| operand; amax_u needed a mask and an integer max):
-   any NaN -> NaN (mx_exp then gives the 0xFF scale byte, as amax_u's NaN bits), otherwise the largest magnitude */
-__device__ __forceinline__ float amax_nan(float a, float v) { float r; asm("max.NaN.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(fabsf(v))); return r; }
 /* dec_row16_gn with the GN affine pre-halved (gh = (a / 2, b / 2)): SiLU(u) = h + h tanh(h) with h = fmaf(v, a / 2, b / 2), the
    same bits as act_ab's 0.5 fmaf(v, a, b) (halving commutes with the rounding), one multiply less per value */
 template <typename GAB>
@@ -578,7 +575,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
                 dec_row16_gnh(q, rsc[it], in, Ci, G, gab, v);
                 float am = 0.f;
 #pragma unroll
-                for (int k = 0; k < 16; k++) am = amax_nan(am, v[k]);
+                for (int k = 0; k < 16; k++) am = amax_xs(am, v[k]);   /* (sign bit meaningless: mx_exp ignores it) */
                 const int e = mx_exp(am, 1.f / 6.f);
                 const float m = exp2i(-e);
                 if (sp.sr) {   /* gradient operand: exact stochastic rounding keyed by the element (deterministic per call) */

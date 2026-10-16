@@ -640,7 +640,12 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
    the 101376 limit); 672 threads get 80 registers each (the cap: 21 warps count as 24). Same values as conv_bwd_w_f4_k
    with gpre; the gw sums group differently (per block over several tiles). ---- */
 #define WS_NC 9            /* consumer (MMA) warps */
-#define WS_NP 12           /* producer warps */
+#ifndef WS_NP
+#define WS_NP 12           /* producer warps (15, the 24 warps the register allocation of 21 already counts, measured slower) */
+#endif
+#ifndef WS_DW0
+#define WS_DW0 0           /* the decode threads start at producer warp WS_DW0 (warps 0 .. 10 carry the LY 1 lanes) */
+#endif
 #define WS_NT ((WS_NC + WS_NP) * 32)
 #define WS_PS 432          /* x bytes per (channel, plane slot): LY 1, 9 row pairs x 2 rows x 24 B */
 #define WS_NS 8            /* x plane slots */
@@ -704,8 +709,8 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
     const int n = blockIdx.x / nper, w0 = blockIdx.x % nper;   /* items w0, w0 + nper, ... of batch entry n */
     const size_t plane = (size_t)D * H * W;
     const int Cx = sp.x2 ? sp.c_split : Ci;
-    int ntot = 0;   /* z-steps of this block */
-    for (int w = w0; w < nitem; w += nper) { const int zb = zs0 + (w / (nxt * nyt)) * ZC; ntot += min(nzt, zb + ZC) - zb; }
+    int ntot = 0, npas = 0;   /* z-steps and producer passes of this block (an item: its z-steps + 1) */
+    for (int w = w0; w < nitem; w += nper) { const int zb = zs0 + (w / (nxt * nyt)) * ZC; ntot += min(nzt, zb + ZC) - zb; npas += min(nzt, zb + ZC) - zb + 1; }
     if (threadIdx.x < CH) { const int ci = ci0 + threadIdx.x; ctab4[threadIdx.x] = make_chan(ci < Ci ? ci : Ci, Ci, Cx, n, plane, x, sp, gp, N); }
     __syncthreads();
     {
@@ -718,27 +723,40 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
         const int pt = threadIdx.x - WS_NC * 32, pw = warp - WS_NC;   /* 0 .. 383, 0 .. 11 */
         const int ZT = (min(2 * nzt, D) - 2 * zs0 + 1) / 2, TY = (H + 7) / 8, TX = (W + 15) / 16;
         const bool Gany = gp.G != 0 || sp.gp2.G != 0;
+        /* (the kernel is issue-bound: the per-pass index math below is hoisted to per-thread / per-item constants -- the address,
+           cursor and LY 1 lane setup were ~40% of the producers' instructions) */
         /* decode: thread per voxel of the 2 planes x 10 rows x 18 tile, all CH channels (bf16, x at 0 .. 17 of a 20-element row);
            its raw row loaded one pass ahead (the load was the producers' longest stall). (Voxel pairs on 6 warps, bf16 pair stores:
            fewer instructions but those warps then carried the decode and the LY 1 lanes: +4%) */
         constexpr int NW = IS_MX4(T) ? CH / 8 : CH / 4;
-        const bool dv = pt < 2 * 180;
-        const int dpl = pt / 180, drow = (pt % 180) / 18, dpp = pt % 18;
+        const int dt = pt - 32 * WS_DW0;   /* decode thread */
+        const bool dv = dt >= 0 && dt < 2 * 180;
+        const int dtc = dv ? dt : 0, dpl = dtc / 180, drow = (dtc % 180) / 18, dpp = dtc % 18;
         ws_xraw<NW> raw;
         const uint8_t *xrow = (const uint8_t *)ctab4[0].p + (IS_MX4(T) ? (ctab4[0].nib >> 1) : 0), *xsc = ctab4[0].sp;   /* the tile's block rows */
         const int xrb = ctab4[0].rb;
-        /* the block's passes (2 new x planes each; an item's first z-step has two) as cursors: item w, its tile (ox0, oy0), first
-           z-step ztb and z-step count nzs, z-step i of the item, plane pair pp0 (divisions only when the item changes) */
-        struct cur_t { int w, ox0, oy0, ztb, nzs, i, pp0; };
-        auto cset = [&](cur_t &c, int w) { c.w = w; c.i = 0; c.pp0 = 0; c.ox0 = c.oy0 = c.ztb = c.nzs = 0;
+        const long long HW = (long long)H * W;
+        /* the block's passes (2 new x planes each) as cursors: item w, its tile (ox0, oy0), first z-step ztb and z-step count nzs,
+           pass p of the item (0 .. nzs: z-step 0 takes passes 0 and 1, z-step i >= 1 pass i + 1; the planes of pass p begin at
+           2 ztb - 1 + 2 p). Divisions only when the item changes; the load stage (two passes ahead) and the LY 1 lanes keep a cursor
+           each, the decode stage only the pass count */
+        struct cur_t { int w, p, ox0, oy0, ztb, nzs; };
+        auto cset = [&](cur_t &c, int w) { c.w = w; c.p = 0; c.ox0 = c.oy0 = c.ztb = c.nzs = 0;
                                            if (w < nitem) { c.ox0 = (w % nxt) * 16; c.oy0 = ((w / nxt) % nyt) * 8; c.ztb = zs0 + (w / (nxt * nyt)) * ZC; c.nzs = min(nzt, c.ztb + ZC) - c.ztb; } };
-        auto clast = [](const cur_t &c) { return c.pp0 + 2 >= (c.i == 0 ? 4 : 2); };   /* the z-step's last pass */
-        auto cadv = [&](cur_t &c) { if (!clast(c)) c.pp0 += 2; else if (c.i + 1 < c.nzs) { c.i++; c.pp0 = 0; } else cset(c, c.w + nper); };
-        auto cgz = [](const cur_t &c) { return 2 * (c.ztb + c.i) + (c.i == 0 ? -1 : 1) + c.pp0; };   /* the pass's first plane */
+        auto cadv = [&](cur_t &c) { if (++c.p > c.nzs) cset(c, c.w + nper); };
+        auto cgz = [](const cur_t &c) { return 2 * c.ztb - 1 + 2 * c.p; };   /* the pass's first plane */
+        /* the load stage's per-item constants (its cursor runs two passes ahead of the LY 1 lanes' and changes item on its own) */
+        int lw = -1; bool lyx = false; long long lofs = 0;
         auto xload = [&](const cur_t &c) {   /* this thread's raw row of pass c */
-            const int gz = cgz(c) + dpl, gyy = c.oy0 - 1 + drow, gx = c.ox0 - 1 + dpp;
-            const size_t off = ((size_t)gz * H + gyy) * W + gx;
-            ws_xload<NW>(xrow + off * xrb, xsc + off, dv && gz >= 0 && gz < D && gyy >= 0 && gyy < H && gx >= 0 && gx < W, raw);
+            if (c.w != lw) {
+                lw = c.w;
+                const int gyy = c.oy0 - 1 + drow, gx = c.ox0 - 1 + dpp;
+                lyx = dv && gyy >= 0 && gyy < H && gx >= 0 && gx < W;
+                lofs = (long long)gyy * W + gx;
+            }
+            const int gz = cgz(c) + dpl;
+            const size_t off = (size_t)((long long)gz * HW + lofs);
+            ws_xload<NW>(xrow + off * xrb, xsc + off, lyx && (unsigned)gz < (unsigned)D, raw);
         };
         auto xdec = [&](int buf) {   /* the raw row -> decode tile buffer buf */
             if (dv) {
@@ -750,115 +768,136 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
             }
         };
         /* gy record copies (16 data words + the scale word, 8 B per lane): task t of a z-step on warp (t + gyw0) % WS_NP, so the
-           second ones go to the warps without LY 1 lanes (all of them on those warps: their copies land later, +2% at 16 channels) */
+           second ones go to the warps without LY 1 lanes (all of them on those warps: their copies land later, +2% at 16 channels).
+           The tasks' sources and destinations are per-thread constants; the record row of an item is set when the item changes
+           and advanced by one z-step record row per z-step. */
         const int gyw0 = min((2 * CH + 2) / 3, WS_NP) % WS_NP, tw = (pw + WS_NP - gyw0) % WS_NP;
         const size_t rcs = (size_t)ZT * TY * TX * GP4_REC;   /* record stride of an output channel */
         uint8_t *const gdst = lane < 16 ? sgb + 8 * lane : sgsb;
         const int gdcs = lane < 16 ? G4_CS : 8;
+        constexpr int NTK = (BMo + WS_NP - 1) / WS_NP;   /* tasks per warp (at most) */
+        size_t tso[NTK]; int tdo[NTK]; bool tok[NTK], tin[NTK];
+#pragma unroll
+        for (int k = 0; k < NTK; k++) {
+            const int task = tw + k * WS_NP, co = co0 + task;
+            tin[k] = lane < 17 && task < BMo; tok[k] = co < Co;
+            tso[k] = co < Co ? (size_t)co * rcs : 0; tdo[k] = task * gdcs;
+        }
+        const size_t zrec = (size_t)TY * TX * GP4_REC;   /* one z-step further in an output channel's records */
+        int rw = -1; const uint8_t *rzi = gpre;   /* the record row of item rw's first z-step (this lane's 8 bytes) */
+        /* LY 1 lanes: (plane, channel) groups of 10 rows, 3 per warp (as conv_bwd_w_f4_k); one group triple per warp covers all
+           2 CH groups, so a lane's group, row and channel (and its stores' offsets) are constants */
+        static_assert(2 * CH <= 3 * WS_NP && (WS_NS & (WS_NS - 1)) == 0, "conv_bwd_w_f4ws_k: one LY 1 group triple per warp, a power-of-two ring");
+        const bool lyw = pw * 3 < 2 * CH;   /* warp-uniform */
+        const int gi = lane / 10, r = lane - 10 * gi, grp = pw * 3 + gi, pl = grp / CH, q = grp % CH;
+        const bool act = lyw && gi < 3 && grp < 2 * CH;
+        const chan_t &cq = ctab4[act ? q : 0];
+        const bool cqp = act && cq.p != nullptr, G = Gany && cq.g;
+        const float ha0 = 0.5f * cq.a, hb0 = 0.5f * cq.b;   /* h = (a x + b) / 2 */
+        const unsigned *srcb = (const unsigned *)(xt + (size_t)(act ? pl : 0) * CH * WS_XTP + ((act ? q : 0) * 10 + r) * 20);
+        uint8_t *const dstb = sxq + (act ? q : 0) * WS_CS;
+        const int o0 = (r >> 1) * 48 + (r & 1) * 24, o1 = (5 + ((r - 1) >> 1)) * 48 + ((r - 1) & 1) * 24;   /* the two pairings' row slots */
+        unsigned short *const sxb = sxp + (act ? q : 0) * WS_SCS + ((r & 1) ? 5 + ((r - 1) >> 1) : r >> 1);
+        const int sh_lane = (r & 1) ? min(lane + 1, 31) : max(lane - 1, 0);
+        int yw = -1; bool rowok = false, full = false; int jlo = 0, jhi = 18;   /* per item of the LY 1 cursor */
         /* software pipeline over the passes, one producer barrier each: pass k + 1 is decoded into tile buffer (k + 1) & 1 (its rows
            were loaded during pass k - 1) and the rows of pass k + 2 are loaded while the LY 1 lanes of pass k read buffer k & 1 */
-        cur_t cl, cn;   /* pass k (LY 1 lanes), pass k + 1 (decoded now) */
-        cset(cl, w0);
-        if (cl.w < nitem) { xload(cl); xdec(0); }
-        cn = cl; cadv(cn);
-        if (cn.w < nitem) xload(cn);
+        cur_t cl, cd;   /* pass k (LY 1 lanes), the load stage's pass (k + 2 after the loop's loads) */
+        cset(cl, w0); cset(cd, w0);
+        if (npas > 0) { xload(cd); xdec(0); }
+        cadv(cd);
+        if (npas > 1) xload(cd);
         ws_bar_sync(5, WS_NP * 32);
-        int it = 0, pbase = 0, kp = 0;   /* z-steps, planes of the earlier items, passes */
-        for (; cl.w < nitem; kp++) {
-            if (cn.w < nitem) {
+        int it = 0, pbase = 0;   /* z-steps, planes of the earlier items */
+        for (int kp = 0; kp < npas; kp++) {   /* (passes) */
+            if (kp + 1 < npas) {
                 xdec((kp + 1) & 1);
-                cur_t c2 = cn; cadv(c2);
-                if (c2.w < nitem) xload(c2);
+                cadv(cd);
+                if (kp + 2 < npas) xload(cd);
             }
             const int b = it & 1, ox0 = cl.ox0, oy0 = cl.oy0;
-            if (cl.pp0 == 0) {   /* the z-step's first pass */
+            if (cl.p != 1) {   /* the z-step's first pass */
                 if (it >= 2) ws_bar_sync(3 + b, WS_NT);   /* EMPTY[b]: z-step it - 2 is consumed (its gy buffer; the slots staged now were read by it - 3) */
-                if (lane < 17) {   /* gy records of the z-step -> buffer b (waited for at its end) */
-                    const uint8_t *rz = gpre + ((((size_t)n * Co * ZT + (cl.ztb + cl.i - zs0)) * TY + (oy0 >> 3)) * TX + (ox0 >> 4)) * GP4_REC + 8 * lane;
-                    for (int task = tw; task < BMo; task += WS_NP) {
-                        const int co = co0 + task;
-                        cp_async<8>(gdst + (b * BMo + task) * gdcs, co < Co ? rz + (size_t)co * rcs : rz, co < Co);
-                    }
-                }
+                if (cl.w != rw) { rw = cl.w; rzi = gpre + ((((size_t)n * Co * ZT + (cl.ztb - zs0)) * TY + (oy0 >> 3)) * TX + (ox0 >> 4)) * GP4_REC + 8 * lane; }
+                const uint8_t *rz = rzi + (size_t)(cl.p ? cl.p - 1 : 0) * zrec;   /* gy records of the z-step -> buffer b (waited for at its end) */
+                uint8_t *gd = gdst + b * BMo * gdcs;
+#pragma unroll
+                for (int k = 0; k < NTK; k++) if (tin[k]) cp_async<8>(gd + tdo[k], rz + tso[k], tok[k]);
             }
-            const int pz0 = 2 * cl.ztb - 1 - pbase, gzf = cgz(cl);   /* plane gz lives in slot (gz - pz0) % WS_NS */
-            const bool full = ox0 > 0 && W - ox0 + 1 >= 18;   /* interior x tile: no column outside the volume */
-            const __nv_bfloat16 *xtb = xt + (size_t)2 * (kp & 1) * CH * WS_XTP;
-            {
-                /* LY 1 lanes: (plane, channel) groups of 10 rows, 3 per warp (as conv_bwd_w_f4_k) */
-                for (int grp0 = pw * 3; grp0 < 2 * CH; grp0 += WS_NP * 3) {
-                    const unsigned FM = 0xffffffffu;
-                    const int gi = lane / 10, r = lane - 10 * gi, grp = grp0 + gi, pl = grp / CH, q = grp % CH;
-                    const int gz = gzf + pl, slot = (gz - pz0) % WS_NS, gyy = oy0 - 1 + r;
-                    const bool act = gi < 3 && grp < 2 * CH;
-                    const chan_t &cq = ctab4[act ? q : 0];
-                    const bool rok = act && cq.p && gz >= 0 && gz < D && gyy >= 0 && gyy < H, G = Gany && cq.g;
-                    float ha, hb;   /* h = (a x + b) / 2 */
-                    if constexpr (SL) {   /* slab-local GN: plane gz's slab */
-                        float2 cab = make_float2(cq.a, cq.b);
-                        if ((gp.ns || sp.gp2.ns) && act) { const int ci = ci0 + q; cab = chan_ab(ci < Ci ? ci : Ci, Ci, Cx, n, sp, gp, max(gz, 0)); }
-                        ha = 0.5f * cab.x; hb = 0.5f * cab.y;
-                    } else { ha = 0.5f * cq.a; hb = 0.5f * cq.b; }
-                    const unsigned *src = (const unsigned *)(xtb + (size_t)(act ? pl : 0) * CH * WS_XTP + ((act ? q : 0) * 10 + r) * 20);
-                    unsigned wv[9];   /* x j: the low (j even) / high half of word j / 2 */
+            const int pz0 = 2 * cl.ztb - 1 - pbase, gzf = cgz(cl);   /* plane gz lives in slot (gz - pz0) % WS_NS (gz - pz0 >= 0) */
+            if (cl.w != yw) {   /* the item's rows / columns */
+                yw = cl.w;
+                const int gyy = oy0 - 1 + r;
+                rowok = gyy >= 0 && gyy < H;
+                full = ox0 > 0 && W - ox0 + 1 >= 18;   /* interior x tile: no column outside the volume */
+                jlo = ox0 == 0 ? 1 : 0; jhi = W - ox0 + 1;
+            }
+            if (lyw) {
+                const unsigned FM = 0xffffffffu;
+                const int gz = gzf + pl, slot = (gz - pz0) & (WS_NS - 1);
+                const bool rok = cqp && (unsigned)gz < (unsigned)D && rowok;
+                float ha = ha0, hb = hb0;
+                if constexpr (SL) {   /* slab-local GN: plane gz's slab */
+                    if ((gp.ns || sp.gp2.ns) && act) { const int ci = ci0 + q; const float2 cab = chan_ab(ci < Ci ? ci : Ci, Ci, Cx, n, sp, gp, max(gz, 0)); ha = 0.5f * cab.x; hb = 0.5f * cab.y; }
+                }
+                const unsigned *src = srcb + (size_t)(kp & 1) * CH * WS_XTP;   /* (buffer kp & 1: 2 CH WS_XTP bf16) */
+                unsigned wv[9];   /* x j: the low (j even) / high half of word j / 2 */
 #pragma unroll
-                    for (int k = 0; k < 9; k++) wv[k] = src[k];
-                    float v[18];
-                    unsigned am = 0u;
-                    if (full) {   /* (uniform) every column inside: no per-value masks; a row outside (!rok) is zeroed by m = 0 below */
-                        if (G) {
-#pragma unroll
-                            for (int j = 0; j < 18; j++) {
-                                const float xv = __uint_as_float((j & 1) ? wv[j >> 1] & 0xffff0000u : wv[j >> 1] << 16);
-                                const float h = fmaf(xv, ha, hb);
-                                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
-                                v[j] = fmaf(h, th, h);
-                                am = amax_u(am, v[j]);
-                            }
-                        } else {
-#pragma unroll
-                            for (int j = 0; j < 18; j++) { v[j] = __uint_as_float((j & 1) ? wv[j >> 1] & 0xffff0000u : wv[j >> 1] << 16); am = amax_u(am, v[j]); }
-                        }
-                        if (!rok) am = 0u;
-                    } else {
-                        const int jlo = ox0 == 0 ? 1 : 0, jhi = W - ox0 + 1;
+                for (int k = 0; k < 9; k++) wv[k] = src[k];
+                float v[18];
+                float am = 0.f;   /* NaN-propagating amax (amax_xs: one instruction per value, its sign bit meaningless; mx_exp ignores it
+                                     and maps every NaN alike) */
+                if (full) {   /* (uniform) every column inside: no per-value masks; a row outside (!rok) is zeroed by m = 0 below */
+                    if (G) {
 #pragma unroll
                         for (int j = 0; j < 18; j++) {
                             const float xv = __uint_as_float((j & 1) ? wv[j >> 1] & 0xffff0000u : wv[j >> 1] << 16);
                             const float h = fmaf(xv, ha, hb);
                             float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
-                            v[j] = rok && j >= jlo && j < jhi ? (G ? fmaf(h, th, h) : xv) : 0.f;
-                            am = amax_u(am, v[j]);
+                            v[j] = fmaf(h, th, h);
+                            am = amax_xs(am, v[j]);
                         }
-                    }
-                    const unsigned amE = max(am, __shfl_xor_sync(FM, am, 1));
-                    const unsigned amO = max(am, __shfl_sync(FM, am, (r & 1) ? min(lane + 1, 31) : max(lane - 1, 0)));
-                    int eP[2];
-                    uint8_t *dst = sxq + (act ? q : 0) * WS_CS + slot * WS_PS;
+                    } else {
 #pragma unroll
-                    for (int pz = 0; pz < 2; pz++) {
-                        const int e = mx_exp(__uint_as_float(pz ? amO : amE), 1.f / 6.f);
-                        eP[pz] = e;
-                        if (!act || (pz && (r < 1 || r > 8))) continue;
-                        const float m = rok ? exp2i(-e) : 0.f;
-                        const int pair = pz ? 5 + ((r - 1) >> 1) : r >> 1, rin = pz ? (r - 1) & 1 : r & 1;
-                        uint2 *o = (uint2 *)(dst + pair * 48 + rin * 24);
-                        o[0] = make_uint2(((unsigned)cvt_e2m1x2(v[0] * m, 0.f) & 15u) << 28, cvt_e2m1x8(v + 1, m));
-                        o[1] = make_uint2(cvt_e2m1x8(v + 9, m), (unsigned)cvt_e2m1x2(v[17] * m, 0.f) & 15u);
+                        for (int j = 0; j < 18; j++) { v[j] = __uint_as_float((j & 1) ? wv[j >> 1] & 0xffff0000u : wv[j >> 1] << 16); am = amax_xs(am, v[j]); }
                     }
-                    const unsigned eb = (unsigned)(((r & 1) ? eP[1] : eP[0]) + 127) & 255u;
-                    const unsigned up = __shfl_down_sync(FM, eb, 2);
-                    if (act && r < 9) sxp[q * WS_SCS + slot * 32 + ((r & 1) ? 5 + ((r - 1) >> 1) : r >> 1)] = (unsigned short)(eb | (r < 7 ? up << 8 : 0u));
+                    if (!rok) am = 0.f;
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 18; j++) {
+                        const float xv = __uint_as_float((j & 1) ? wv[j >> 1] & 0xffff0000u : wv[j >> 1] << 16);
+                        const float h = fmaf(xv, ha, hb);
+                        float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+                        v[j] = rok && j >= jlo && j < jhi ? (G ? fmaf(h, th, h) : xv) : 0.f;
+                        am = amax_xs(am, v[j]);
+                    }
                 }
+                const float amE = amax_xs(am, __shfl_xor_sync(FM, am, 1));
+                const float amO = amax_xs(am, __shfl_sync(FM, am, sh_lane));
+                int eP[2];
+                uint8_t *dst = dstb + slot * WS_PS;
+#pragma unroll
+                for (int pz = 0; pz < 2; pz++) {
+                    const int e = mx_exp(pz ? amO : amE, 1.f / 6.f);
+                    eP[pz] = e;
+                    if (!act || (pz && (r < 1 || r > 8))) continue;
+                    const float m = rok ? exp2i(-e) : 0.f;
+                    uint2 *o = (uint2 *)(dst + (pz ? o1 : o0));
+                    o[0] = make_uint2(((unsigned)cvt_e2m1x2(v[0] * m, 0.f) & 15u) << 28, cvt_e2m1x8(v + 1, m));
+                    o[1] = make_uint2(cvt_e2m1x8(v + 9, m), (unsigned)cvt_e2m1x2(v[17] * m, 0.f) & 15u);
+                }
+                const unsigned eb = (unsigned)(((r & 1) ? eP[1] : eP[0]) + 127) & 255u;
+                const unsigned up = __shfl_down_sync(FM, eb, 2);
+                if (act && r < 9) sxb[slot * 32] = (unsigned short)(eb | (r < 7 ? up << 8 : 0u));
             }
-            if (clast(cl)) {   /* the z-step's last pass */
+            if (cl.p >= 1) {   /* the z-step's last pass */
                 cp_async_wait();
                 ws_bar_arrive(1 + b, WS_NT);   /* FULL[b]: z-step it is staged */
                 it++;
-                if (cl.i + 1 >= cl.nzs) pbase += 2 * cl.nzs + 2;
+                if (cl.p == cl.nzs) pbase += 2 * cl.nzs + 2;
             }
             ws_bar_sync(5, WS_NP * 32);   /* buffer kp & 1 read, buffer (kp + 1) & 1 written */
-            cl = cn; cadv(cn);
+            cadv(cl);
         }
         return;
     }
@@ -876,7 +915,7 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
         ws_bar_sync(1 + b, WS_NT);   /* FULL[b] */
 #pragma unroll
         for (int vz = 0; vz < 2; vz++) {
-            const int slot = (s0 + vz + kz) % WS_NS;   /* plane oz0 + vz + kz - 1 */
+            const int slot = (s0 + vz + kz) & (WS_NS - 1);   /* plane oz0 + vz + kz - 1 (s0 >= 0) */
 #pragma unroll
             for (int kk = 0; kk < 2; kk++) {
                 const int ks = vz * 2 + kk, r0 = 4 * kk + ky;
