@@ -1015,6 +1015,7 @@ extern thread_local int g_zr_z0, g_zr_Di, g_zr_first, g_zr_last, g_zr_Do, g_zr_z
 size_t zr_len(size_t len, int D);   /* zs_len, or the whole depth of a z-range */
 int zr_zero(void);                  /* zero the output GroupNorm sums (not a z-range, or its first slab) */
 int zr_final(void);                 /* finalise them (not a z-range, or its last slab) */
+int zw_win(int D, int *z0, int *z1);   /* the z-window scaled to an output of depth D: 1 and [*z0, *z1) when on (nn_set_zwin) */
 int gn_fused_stored(const void *y, int cout);
 /* x-shift packed weights for XP: wp[kz * 3 + ky][co][kx * 4 + c] (kx = 3 and c >= Ci zero), Cop rows */
 template <typename HT>

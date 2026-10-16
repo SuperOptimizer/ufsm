@@ -36,8 +36,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4_k(const T *__restrict__ x,
     const int wz = warp >> 2, wr = (warp & 3) * 2;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * 8;
     int bz = blockIdx.z;
-    const int nzt = (D + TZ - 1) / TZ;
-    const int oz0 = (bz % nzt) * TZ; bz /= nzt;
+    const int tz0 = sp.zw1 ? sp.zw0 / TZ : 0, nzt = sp.zw1 ? (sp.zw1 + TZ - 1) / TZ - tz0 : (D + TZ - 1) / TZ;   /* (z-window: its tiles) */
+    const int oz0 = (tz0 + bz % nzt) * TZ; bz /= nzt;
     /* slab-local GroupNorm: the staged planes oz0 - 1 .. oz0 + TZ in at most two slabs, bank 1 (cab2) from plane zb */
     const int zb = gn_zb(gp, sp.gp2, oz0 - 1 + sp.zi0, oz0 + TZ + sp.zi0), zg0 = max(oz0 - 1 + sp.zi0, 0);
     if (gn_zb3(gp, sp.gp2, oz0 - 1 + sp.zi0, oz0 + TZ + sp.zi0)) __trap();
@@ -195,7 +195,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4r_k(const T *__restrict__ x
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int wz = warp >> 2, wr = (warp & 3) * 2;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * 8;
-    const int nzt = (D + TZ - 1) / TZ, nzc = (nzt + ZC - 1) / ZC;
+    /* tiles [tz0, nzt): all, or the z-window's (chunks of ZC from the window's first tile; ring and staging as for the whole launch) */
+    const int tz0 = sp.zw1 ? sp.zw0 / TZ : 0, nzt = sp.zw1 ? (sp.zw1 + TZ - 1) / TZ : (D + TZ - 1) / TZ, nzc = (nzt - tz0 + ZC - 1) / ZC;
     const int zc = blockIdx.z % nzc, n = blockIdx.z / nzc;
     const int nmt = Cop / BM, nch = NCH;
     const int zi0 = sp.zi0, Di = sp.Di ? sp.Di : D;   /* z-range (nn_set_zrange): output plane z reads input plane z + zi0 of a depth-Di input */
@@ -229,8 +230,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4r_k(const T *__restrict__ x
 #if F4R_PROF
     long long t_prev = clock64();
 #endif
-    for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
-        const int oz0 = tz * TZ, p0n = tz == zc * ZC ? 0 : 2, npos = (NP - p0n) * 180;   /* tile planes p0n .. NP - 1 are new */
+    for (int tz = tz0 + zc * ZC; tz < nzt && tz < tz0 + (zc + 1) * ZC; tz++) {
+        const int oz0 = tz * TZ, p0n = tz == tz0 + zc * ZC ? 0 : 2, npos = (NP - p0n) * 180;   /* tile planes p0n .. NP - 1 are new */
         __syncthreads();   /* the previous tile's MMA (and epilogue scratch use) is done */
         int zb = INT_MAX;
         if (slb) {   /* (block-uniform) */
@@ -374,7 +375,7 @@ template <int MT, int TZ, int NCH, typename T, typename TO> static void launch_f
     if (!wres && scr < wst) scr = wst;   /* (the scratch overlays the weight stage) */
     if (IS_MX(TO) && MT == 1) scr = fepi16_scr(wfix, scr, cout, sp);   /* the 16-channel-block MX epilogue (fwd_epi_mx16) */
     const size_t smem = wfix + scr + (gp.ns || sp.gp2.ns ? (size_t)NCH * 32 * 8 + 16 : 0);   /* (slab GroupNorm: the second coefficient bank) */
-    const int nzt = nblk_(xs.d, TZ);
+    const int nzt = zw_tiles(xs.d, TZ, sp);
     const size_t base = (size_t)nblk_(xs.w, 16) * nblk_(xs.h, 8) * xs.n;
     static int zc_env = -2;
     if (zc_env == -2) zc_env = getenv("UFSM_F4R_ZC") ? atoi(getenv("UFSM_F4R_ZC")) : -1;
@@ -749,10 +750,10 @@ template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const
     static int opad_env = -1; if (opad_env < 0) opad_env = getenv("UFSM_F4_OPAD16") ? atoi(getenv("UFSM_F4_OPAD16")) : 1;
     if (opad_env && g4_exact && IS_MX(TO) && sp.y2 && Ox <= 16 && cout - Ox <= 16) { OxP = 16; Cop = 32; sp.o_pad = 16; }
     /* (slab-local GroupNorm input, gnp_t ns: the chunk kernels below, which apply each staged plane's slab; conv_fwd_f4p_k does not yet) */
-    if (xs.c <= 16 && !sp.x2 && !sp.up && sp.gp2.G == 0 && !(gp.ns && gp.G && Cop > 16)) { p16_f4<T, TO>(x, xs, w, b, cout, y, Cop, Ox, OxP, gp, osum, Go, sp); return; }   /* K = [kx0 | kx1 | kx2 | kx3] x 16, a scale per kx */
+    if (xs.c <= 16 && !sp.x2 && !sp.up && sp.gp2.G == 0 && !(gp.ns && gp.G && Cop > 16) && !sp.zw1) { p16_f4<T, TO>(x, xs, w, b, cout, y, Cop, Ox, OxP, gp, osum, Go, sp); return; }   /* K = [kx0 | kx1 | kx2 | kx3] x 16, a scale per kx */
     if constexpr (IS_MX4(T) && IS_MX4(TO)) {   /* the 16-wide decoder conv1 with the fused upsample (lp_f4up.cu); UFSM_F4U=0: the chunk kernel */
         static int f4u = -1; if (f4u < 0) f4u = getenv("UFSM_F4U") ? atoi(getenv("UFSM_F4U")) : 1;
-        if (f4u && sp.up == 2 && lp_f4u_fwd(x, xs, w, b, cout, y, gp, osum, Go, sp)) return;
+        if (f4u && sp.up == 2 && !sp.zw1 && lp_f4u_fwd(x, xs, w, b, cout, y, gp, osum, Go, sp)) return;
     }
     const int nch = Cip / 32;
     const size_t nq = (size_t)28 * Cop * Cip / 2, ns = (size_t)28 * Cop * nch;
@@ -786,7 +787,7 @@ template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const
         default: break;
         }
     }
-    dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(nblk_(xs.d, TZ) * nmt * xs.n));
+    dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(zw_tiles(xs.d, TZ, sp) * nmt * xs.n));
     switch (MT * 10 + TZ) {
     case 12: launch_f4<1, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp); break;
     case 14: launch_f4<1, 4, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp); break;

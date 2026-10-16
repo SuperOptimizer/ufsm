@@ -34,6 +34,13 @@
 extern cudaError_t g_lp_err;
 #define LPCK() do { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess && g_lp_err == cudaSuccess) g_lp_err = e_; } while (0)
 static inline unsigned nblk_(size_t n, unsigned b) { return (unsigned)((n + b - 1) / b); }
+/* the z tiles of TZ planes a launch covers: all of depth D, or those of the z-window sp.zw0 / zw1 (nn_set_zwin; its bounds on tile
+   edges, or the window ends at D: a tile never writes planes outside the window) */
+static inline unsigned zw_tiles(int D, int TZ, const split_t &sp) {
+    if (!sp.zw1) return nblk_(D, TZ);
+    if (sp.zw0 % TZ || (sp.zw1 % TZ && sp.zw1 != D) || sp.zw1 > D) { fprintf(stderr, "z-window [%d, %d) not on %d-plane tiles of depth %d\n", sp.zw0, sp.zw1, TZ, D); abort(); }
+    return (unsigned)((sp.zw1 + TZ - 1) / TZ - sp.zw0 / TZ);
+}
 static inline int cur_dev_(void) { int d = 0; cudaGetDevice(&d); return d & 7; }
 
 typedef __nv_bfloat16 bf16;
