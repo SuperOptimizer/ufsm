@@ -180,6 +180,26 @@ static const uint8_t *trow_w(const batch *b, int B, uint8_t *hw) {   /* the chan
     for (int r = 0; r < B * NCH; r++) hw[trow(b, r)] = b->w[r];
     return hw;
 }
+/* host memory this process may still take: MemAvailable, or less under a cgroup v2 memory.max (capped.sh's slice / scope); 0 unknown */
+static size_t host_mem_available(void) {
+    size_t avail = 0; char line[512];
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (f) { while (fgets(line, sizeof line, f)) if (!strncmp(line, "MemAvailable:", 13)) { avail = (size_t)strtoull(line + 13, nullptr, 10) << 10; break; } fclose(f); }
+    char cg[400] = "";
+    if ((f = fopen("/proc/self/cgroup", "r"))) { while (fgets(line, sizeof line, f)) if (!strncmp(line, "0::", 3)) { snprintf(cg, sizeof cg, "%s", line + 3); cg[strcspn(cg, "\n")] = 0; } fclose(f); }
+    for (char *e = cg + strlen(cg); *cg; ) {   /* this cgroup and its parents: the tightest memory.max - memory.current */
+        char p[600]; unsigned long long mx = 0, cur = 0; int ok = 1;
+        snprintf(p, sizeof p, "/sys/fs/cgroup%s/memory.max", cg);
+        if ((f = fopen(p, "r"))) { ok = fscanf(f, "%llu", &mx) == 1; fclose(f); } else ok = 0;
+        snprintf(p, sizeof p, "/sys/fs/cgroup%s/memory.current", cg);
+        if (ok && (f = fopen(p, "r"))) { ok = fscanf(f, "%llu", &cur) == 1; fclose(f); } else ok = 0;
+        if (ok && mx > cur && (!avail || mx - cur < avail)) avail = (size_t)(mx - cur);
+        while (e > cg && *e != '/') e--;
+        if (e == cg) break;
+        *e = 0;
+    }
+    return avail;
+}
 /* the host arrays of a batch in this run's layout: the addresses of its members and their sizes (validation copies, --val-store) */
 enum { VAL_DISK, VAL_RAM, VAL_REGEN, VAL_NF = 16 };
 static int val_fields(batch *b, int B, size_t p3, void **f[VAL_NF], size_t sz[VAL_NF]) {
@@ -1684,6 +1704,18 @@ int cmd_train(int argc, char **argv) {
                                        resume under --det replayed the windows and augmentations of steps 1, 2, ...); validation keeps its seed */
         sc.seed = seed + 0x9E3779B97F4A7C15ull * (uint64_t)step0;
         fprintf(stderr, "resumed at step %d: training sample stream reseeded\n", step0);
+    }
+    if (!atoi(opt(argc, argv, "--sampler-slots", "0"))) {   /* the default slot count against the host memory available now */
+        const size_t p3s = (size_t)g_Pz * P * P, slotb = (size_t)B * p3s * ((size_t)g_xs * xbytes() + (g_pack ? 1 : NCH + 1) + (g_aff != 0) + (g_side != 0)
+                           + (g_unwrap != 0) + (g_cond != 0) + (g_pap_head != 0)) + rad_bytes(B), win = slotb + 4 * p3s;   /* + a worker's scratch */
+        const size_t avail = host_mem_available(), budget = avail / 10 * 7;
+        int cap = win ? (int)(budget / win) : sc.nbuf;
+        if (cap < 3) cap = 3;   /* (one uploading, two drawing) */
+        if (avail && cap < sc.nbuf) {
+            fprintf(stderr, "sampler: %d slots (not %d): %.2f GB per window in flight (slot + worker scratch), %.1f GB host memory available; --sampler-slots sets it\n",
+                    cap, sc.nbuf, win / 1e9, avail / 1e9);
+            sc.nbuf = cap;
+        }
     }
     sampler *sp = sampler_start(S, &sc);
     if (!sp) return 1;
