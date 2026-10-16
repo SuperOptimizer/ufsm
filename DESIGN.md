@@ -36,6 +36,29 @@ conv_bwd_w_f4ws_k (fp4 weight gradient, warp-specialised) ~114 ms over 66, of ~5
 - Left: the epilogue (fwd_epi_mx16, lp_common.cuh: 35-55% of f4p) -- GN statistics summed per lane in registers instead of the
   tb re-read, a cheaper exact SR nibble; the f4p staging index math (li / 180 etc., ~8% of its instructions); f4ws needs a
   producer restructure that frees registers first.
+- Follow-up (P6, desk GPU 1, every bench_f4conv output hash unchanged at P384; |gw| / statistics differ only in the 9th digit,
+  as between two base runs):
+  - conv_bwd_w_f4ws_k (16 -> 16, P512, one record slab as the trainer): ncu showed it issue-bound (IPC 2.47 of 4, 5.07e9 warp
+    instructions; even at IPC 4 the instructions alone are 11.4 ms), the producers ~80% of them, ~40% of theirs per-pass index
+    math (load addresses, record rows, cursor copies, LY 1 lane setup). Hoisted to per-thread / per-item constants, the three
+    7-int cursors replaced by pass counters (pass p of an item: planes 2 ztb - 1 + 2 p, z-step max(p - 1, 0)), the ring slot
+    as & 7, the LY 1 amax as one FMNMX.NAN.XORSIGN (amax_xs: max(|a|, |v|); mx_exp ignores the sign; amax_nan's fabs had become
+    a separate FADD): 5.07e9 -> 4.42e9 instructions, 20.6 -> 19.5 ms (-5.5%), still 80 registers, no stack (base: 8 B).
+  - Its time split (diagnostic builds): with the x row loads and the gy record copies off 15.1 ms, with the loads alone off
+    16.3 ms -- the DRAM latency of the rows, loaded one pass ahead, is ~3 ms. Tried and reverted: rows two passes ahead (a
+    second register set: spills, 22.8 ms), the gy records one z-step ahead in a third buffer (cursor registers: spills, 20.3
+    ms), 15 producer warps (24 warps cost the 80-register allocation of 21; IPC fell, 19.8 ms). Every deeper prefetch needs the
+    registers a producer restructure would free (decode and LY 1 lanes on different warps, or the raw rows staged by cp.async
+    into shared memory: MT 1 has ~5 KB left).
+  - conv_fwd_f4p_k staging: 16-channel inputs (block-uniform Ci >= 16) without the k < Ci masks (32 instructions per position),
+    the amax as amax_xs: fwd 16 -> 16 18.45 -> 18.1 ms (-1.9%).
+  - fwd_epi_mx16's exact SR (the bdata outputs): sr_e2m1_nibf rounds on the float bits -- one mantissa bit kept, the uniform
+    added at bits 6..21 of the 22 dropped ones, [0, 1) shifted to [1, 2) by + 1: up exactly when frac + u >= 1, as
+    sr_e2m1_nib's floor(t + u) (which rounds t + u in fp32), without the float sum and conversion (~3 instructions per value);
+    NaN blocks keep sr_e2m1_nib (its 0 keeps the NaN under the 0xFF scale). bdata 16 -> 16 16.8 -> 16.55 ms, 16 + 16 31.9 ->
+    31.4 ms; output hashes unchanged, test_grad_mx4's bdata 16 -> 16 mean of 16 0.0404 (as before).
+  - Tried and reverted: the epilogue's zero-bias FADDs skipped and its row index hoisted (+0.5-1%: register allocation again).
+  - prof_infer P512 (trainer-like: lean 2, three level-0 buffers, interleaved x 3): step min 577.7 -> 568.8 ms (-1.5%).
 
 ## Many surface sets: winding ids, merged codes, side votes (2026-10-16)
 Goal (user): train eventually on every published surface of every scroll. Surfaces of different authors / runs overlap (the same
