@@ -85,14 +85,15 @@ template <typename TI> __device__ __forceinline__ float rnd16(float v);
 template <> __device__ __forceinline__ float rnd16<__half>(float v) { return __half2float(__float2half_rn(v)); }
 template <> __device__ __forceinline__ float rnd16<bf16>(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 template <int B, typename TI>
-__global__ void input_rad_k(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int D, int P, uint8_t *y) {
-    const size_t S = (size_t)D * P * P, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)N * S) return;
-    const int n = (int)(i / S); const size_t v = i % S;
+__global__ void input_rad_k(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int D, int P, uint8_t *y) {   /* grid (x blocks, y, n D) */
+    const int ix = blockIdx.x * blockDim.x + threadIdx.x, iy = blockIdx.y, n = blockIdx.z / D, iz = blockIdx.z - n * D;   /* (the voxel without 64-bit
+                                                                                                                     divisions: they were most of the time) */
+    if (ix >= P) return;
+    const size_t S = (size_t)D * P * P, i = (((size_t)n * D + iz) * P + iy) * P + ix;
     const int *h = (const int *)(recs + (size_t)n * rec_bytes);
     const float *cyz = (const float *)(h + 8), *cxz = cyz + h[2];
     const int o1 = h[0], o2 = h[1], hasax = h[4], pf = h[5];
-    const int io[3] = {(int)(v / ((size_t)P * P)), (int)((v / P) % P), (int)(v % P)}, nd[3] = {D, P, P};
+    const int io[3] = {iz, iy, ix}, nd[3] = {D, P, P};
     int s[3] = {0, 0, 0};
 #pragma unroll
     for (int d = 0; d < 3; d++) { const int pd = (pf >> (2 * d)) & 3; s[pd] = (pf >> (8 + d)) & 1 ? nd[d] - 1 - io[d] : io[d]; }   /* output axis d reads source axis perm[d] */
@@ -238,10 +239,11 @@ extern "C" void lp_input_rad_pack(const void *ct16, int dt, const void *rec, siz
     LPCK();
 }
 extern "C" void lp_input_rad(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int D, int P, void *y, int bits) {
-    const size_t n = (size_t)N * D * P * P;
     const uint8_t *rr = (const uint8_t *)rec; uint8_t *yy = (uint8_t *)y;
-    if (bits == 4) { if (dt == 2) input_rad_k<4, __half><<<nblk_(n, 256), 256>>>((const __half *)ct16, rr, rec_bytes, N, D, P, yy); else input_rad_k<4, bf16><<<nblk_(n, 256), 256>>>((const bf16 *)ct16, rr, rec_bytes, N, D, P, yy); }
-    else { if (dt == 2) input_rad_k<8, __half><<<nblk_(n, 256), 256>>>((const __half *)ct16, rr, rec_bytes, N, D, P, yy); else input_rad_k<8, bf16><<<nblk_(n, 256), 256>>>((const bf16 *)ct16, rr, rec_bytes, N, D, P, yy); }
+    const int bx = P < 128 ? (P + 31) / 32 * 32 : 128;
+    const dim3 grid((unsigned)((P + bx - 1) / bx), (unsigned)P, (unsigned)(N * D));
+    if (bits == 4) { if (dt == 2) input_rad_k<4, __half><<<grid, bx>>>((const __half *)ct16, rr, rec_bytes, N, D, P, yy); else input_rad_k<4, bf16><<<grid, bx>>>((const bf16 *)ct16, rr, rec_bytes, N, D, P, yy); }
+    else { if (dt == 2) input_rad_k<8, __half><<<grid, bx>>>((const __half *)ct16, rr, rec_bytes, N, D, P, yy); else input_rad_k<8, bf16><<<grid, bx>>>((const bf16 *)ct16, rr, rec_bytes, N, D, P, yy); }
     LPCK();
 }
 /* consistent fp4 weights (unet_cfg.w4_2d): w[co][ci][t] rounded in place to MX-fp4 with one ue8m0 scale per B x B (co x ci) block

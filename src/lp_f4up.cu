@@ -7,22 +7,28 @@
    over two 32-channel chunks, each half zero padding, and restaged the z halo and the weights per tile). The block walks ZC z
    tiles with the staged planes in a ring (TZ + 2 slots, plane gz in slot (gz + 1) % NP: after the first tile only TZ new
    planes), the weights resident. Per tile, the coarse rows its new fine planes interpolate from are decoded, put through the
-   coarse tensor's GN+SiLU and stored as 16 e4m3 + one scale (stage_up_coarse16); each fine position blends 8 of them in half2
+   coarse tensor's GN+SiLU and stored as 16 e4m3 + one scale (stage_up_coarse16t); each fine position blends 8 of them in half2
    (stage_up_smem16_h2). The staged values, their scales and the weights' nibbles and scales are those of conv_fwd_f4_k (its
    padding channels are zero: the same amax); only the fp32 accumulation order inside the tensor core differs. */
-template <int NCZ>   /* CZ <= NCZ coarse planes; blockDim 256 */
-__device__ __forceinline__ void stage_up_coarse16(const chan_t &c0, int Cu, const float2 *gab, bool G, uint8_t *cu, uint8_t *cus, int cz0, int cy0, int cx0, int CZ,
-                                                  int D, int H, int W) {
-    constexpr int NIT = (NCZ * 96 + 255) / 256;
-    const int Dc = D >> 1, Hc = H >> 1, Wc = W >> 1, n = CZ * 96;
+/* the coarse rows stage_up_smem16_h2 reads (the tile's in-bounds fine positions and their trilinear neighbours): z planes [cz0, cz0 +
+   nz), rows ly0 .. ly0 + ny - 1 and columns lx0 .. lx0 + nx - 1 of the [8 rows][12 columns] plane layout: GN+SiLU, then 16 e4m3 values
+   and one scale per row. (The whole layout, 6 planes x 96 with up to three planes and two rows and columns nothing reads, made the
+   coarse stage ~35% of the kernel; P512 dec0.c1 40.2 -> 37.2 ms on the desk 5060 Ti, the same bits) */
+template <int NIT>   /* nz ny nx <= 256 NIT; blockDim 256 */
+__device__ __forceinline__ void stage_up_coarse16t(const chan_t &c0, int Cu, const float2 *gab, bool G, uint8_t *cu, uint8_t *cus, int cz0, int cy0, int cx0, int nz,
+                                                   int ly0, int ny, int lx0, int nx, int D, int H, int W) {
+    const int Dc = D >> 1, Hc = H >> 1, Wc = W >> 1, npl = ny * nx, n = nz * npl;
     uint2 raw[NIT];
     unsigned rsc[NIT], okm = 0u;
+    int li[NIT];
 #pragma unroll
     for (int it = 0; it < NIT; it++) {   /* every row's load first (NIT in flight per thread), then the decode */
-        const int i = threadIdx.x + 256 * it, lx = i % 12, ly = (i / 12) % 8, lz = i / 96, cz = cz0 + lz, cy = cy0 + ly, cx = cx0 + lx;
+        const int i = threadIdx.x + 256 * it, lz = i / npl, r = i - lz * npl, ry = r / nx, ly = ly0 + ry, lx = lx0 + r - ry * nx;
+        const int cz = cz0 + lz, cy = cy0 + ly, cx = cx0 + lx;
         const bool ok = i < n && c0.p && cz >= 0 && cz < Dc && cy >= 0 && cy < Hc && cx >= 0 && cx < Wc;
         ld_row16(c0, ok ? ((size_t)cz * Hc + cy) * Wc + cx : 0, ok, raw[it], rsc[it]);
         okm |= (unsigned)ok << it;
+        li[it] = (lz * 8 + ly) * 12 + lx;
     }
 #pragma unroll
     for (int it = 0; it < NIT; it++) {
@@ -35,10 +41,20 @@ __device__ __forceinline__ void stage_up_coarse16(const chan_t &c0, int Cu, cons
         for (int k = 0; k < 16; k++) { const unsigned u = __float_as_uint(fabsf(r[k])); am = u <= 0x7f800000u ? max(am, u) : am; }
         const int e = mx_exp(__uint_as_float(am), 1.f / 448.f);
         const float m = exp2i(-e);
-        *(uint4 *)(cu + (size_t)i * 16) = make_uint4(cvt_e4m3x4(r[0] * m, r[1] * m, r[2] * m, r[3] * m), cvt_e4m3x4(r[4] * m, r[5] * m, r[6] * m, r[7] * m),
-                                                     cvt_e4m3x4(r[8] * m, r[9] * m, r[10] * m, r[11] * m), cvt_e4m3x4(r[12] * m, r[13] * m, r[14] * m, r[15] * m));
-        cus[i] = (uint8_t)(e + 127);
+        *(uint4 *)(cu + (size_t)li[it] * 16) = make_uint4(cvt_e4m3x4(r[0] * m, r[1] * m, r[2] * m, r[3] * m), cvt_e4m3x4(r[4] * m, r[5] * m, r[6] * m, r[7] * m),
+                                                          cvt_e4m3x4(r[8] * m, r[9] * m, r[10] * m, r[11] * m), cvt_e4m3x4(r[12] * m, r[13] * m, r[14] * m, r[15] * m));
+        cus[li[it]] = (uint8_t)(e + 127);
     }
+}
+/* the coarse coordinates stage_up_smem16_h2 reads for the fine coordinates [lo, hi] clipped to [0, n): [*clo, *chi] (empty: *clo > *chi) */
+__device__ __forceinline__ void up_read_range(int lo, int hi, int n, int *clo, int *chi) {
+    const int nc = n >> 1;
+    int a = 1 << 30, b = -(1 << 30);
+    for (int g = max(lo, 0); g <= min(hi, n - 1); g++) {
+        const int m0 = g >> 1, m1 = min(max(m0 + ((g & 1) ? 1 : -1), 0), nc - 1);
+        a = min(a, min(m0, m1)); b = max(b, max(m0, m1));
+    }
+    *clo = a; *chi = b;
 }
 /* stage_up_smem_h2 on 16-channel coarse rows (the same blend: e4m3 pairs straight to half2, 8 taps with HFMA2) */
 __device__ __forceinline__ void stage_up_smem16_h2(const uint8_t *cu, const uint8_t *cus, int cz0, int cy0, int cx0, int gz, int gy, int gx, int D, int H, int W, bool inb, float *v) {
@@ -136,12 +152,14 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
     __syncthreads();
     const bool Gu = ctab[0].g != 0, Gs = ctab[16].g != 0;   /* (per-segment GroupNorms, or one over both: make_chan's choice) */
     const chan_t cs0 = ctab[16];
+    int ly0, ny, lx0, nx;   /* the coarse rows / columns the block's fine rows / columns read (relative to cy0 / cx0 of every tile) */
+    { int a, b; up_read_range(oy0 - 1, oy0 + 8, H, &a, &b); ly0 = a - ((oy0 >> 1) - 2); ny = b - a + 1; up_read_range(ox0 - 1, ox0 + 16, W, &a, &b); lx0 = a - ((ox0 >> 1) - 2); nx = b - a + 1; }
 #if F4R_PROF
     long long t_prev = clock64();
 #endif
     for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
         const int oz0 = tz * TZ, p0n = tz == zc * ZC ? 0 : 2, npos = (NP - p0n) * 180;   /* tile planes p0n .. NP - 1 are new */
-        const int glo = oz0 - 1 + p0n + zi0, ghi = oz0 + TZ + zi0, cz0 = (glo >> 1) - 1, cy0 = (oy0 >> 1) - 2, cx0 = (ox0 >> 1) - 2;
+        const int glo = oz0 - 1 + p0n + zi0, ghi = oz0 + TZ + zi0, cy0 = (oy0 >> 1) - 2, cx0 = (ox0 >> 1) - 2;
         __syncthreads();   /* the previous tile's MMA and epilogue are done with the ring slots and the scratch */
         F4RP(4);
         constexpr int NIT = (NP * 180 + 255) / 256;
@@ -155,7 +173,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
             ld_row16(cs0, ok ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0, ok, raw[it], rsc[it]);
             okm |= (unsigned)ok << it;
         }
-        stage_up_coarse16<CZ>(ctab[0], Cx, cab, Gu, cu, cus, cz0, cy0, cx0, min(CZ, ((ghi >> 1) + 1) - cz0 + 1), Di, H, W);
+        int czl, czh; up_read_range(glo, ghi, Di, &czl, &czh);   /* the coarse planes this tile's new fine planes read */
+        if (czh >= czl) stage_up_coarse16t<2>(ctab[0], Cx, cab, Gu, cu, cus, czl, cy0, cx0, czh - czl + 1, ly0, ny, lx0, nx, Di, H, W);
         __syncthreads();
         F4RP(0);
         float2 gs[16];   /* the skip's GN coefficients in registers for the staging (were two shared loads per element) */
@@ -169,7 +188,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
             const bool inb = gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
             float v[16];
             unsigned am, q[4], sc;
-            stage_up_smem16_h2(cu, cus, cz0, cy0, cx0, gz + zi0, gy, gx, Di, H, W, inb, v);
+            stage_up_smem16_h2(cu, cus, czl, cy0, cx0, gz + zi0, gy, gx, Di, H, W, inb, v);
             am = 0u;
 #pragma unroll
             for (int k = 0; k < 16; k++) am = amax_u(am, v[k]);

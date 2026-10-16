@@ -2171,18 +2171,18 @@ __global__ void loss_d2f_k(const double *d, float *f, int n);
 /* finalize on device: per-channel mean bce / dice, active count, and 1/active for the gradient kernel.
    layout of fin[]: [0..C) bce, [C..2C) dice, [2C] active, [2C+1] inv_active */
 __global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, float *fin);
-template <typename GT, typename LT = float> __global__ void loss_grad_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N, int C, size_t S, const float *st,
-                            float dice_w, const float *fin, GT *gl, float pw, float gscale, int tol, const uint8_t *code, int D, int H, int W, float rec_w = 0.f) {
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= (size_t)N * C * S) return;
-    int nc = (int)(i / S), n = nc / C;
-    if (!w[nc] || !m[(size_t)n * S + i % S]) { gl[i] = f2h<GT>(0.f); return; }
+/* the logit gradient of voxel v of (n, c) = nc, element i = nc S + v, logit x, target byte tb, mask byte mb (loss_grad_k's per-element
+   arithmetic, unchanged) */
+template <typename GT, typename LT> __device__ __forceinline__ GT loss_grad_v(const uint8_t *t, int C, size_t S, const float *st, float dice_w, const float *fin,
+                                                                             float pw, float gscale, int tol, const uint8_t *code, int D, int H, int W, float rec_w,
+                                                                             int nc, int n, size_t v, float x, unsigned tb, unsigned mb) {
+    if (!mb) return f2h<GT>(0.f);
     float nm = st[nc * 5], Ssp = st[nc * 5 + 2], Ss = st[nc * 5 + 3], Sp = st[nc * 5 + 4];
-    float x = lgv(lg, i), p = t[i] * (1.f / 255.f), s = 1.f / (1.f + expf(-x));
+    float p = tb * (1.f / 255.f), s = 1.f / (1.f + expf(-x));
     float den = Ss + Sp + 1.f;
     float pq = p;   /* the target mass whose positive BCE terms this voxel's logit carries */
     if (code && nc % C == 0) {   /* offset-tolerant: gather p of the voxels whose normal-line maximum is this voxel */
-        const size_t v = i % S; const uint8_t *cp = code + (size_t)n * S, *tp = t + (size_t)nc * S;
+        const uint8_t *cp = code + (size_t)n * S, *tp = t + (size_t)nc * S;
         const int z = (int)(v / ((size_t)H * W)), y = (int)((v / W) % H), x0 = (int)(v % W);
         if (cp[v] != 255) pq = 0.f;   /* this voxel's own positive term moved to another voxel of its line */
         for (int d = 0; d < 13; d++) {
@@ -2196,12 +2196,36 @@ template <typename GT, typename LT = float> __global__ void loss_grad_k(const LT
             }
         }
     }
-    const float mw = m[(size_t)n * S + i % S];   /* the mask as a weight (1 = plain); nm is the weight sum */
+    const float mw = (float)mb;   /* the mask as a weight (1 = plain); nm is the weight sum */
     float g = mw * ((1.f - p) * s - pw * pq * (1.f - s)) / fmaxf(nm, 1.f);
     float ddice_ds = -(2.f * p * den - (2.f * Ssp + 1.f)) / (den * den);   /* dice on the voxel's own value */
     g += dice_w * ddice_ds * s * (1.f - s);
     if (rec_w > 0.f && nc % C == 0) g -= rec_w * p / (Sp + 1.f) * s * (1.f - s);   /* --recall: 1 - (sum s p + 1) / (sum p + 1) on the recto */
-    gl[i] = f2h<GT>(g * fin[2 * C + 1] * gscale);
+    return f2h<GT>(g * fin[2 * C + 1] * gscale);
+}
+/* grid lg_grid (S / (256 LG_V) blocks, N C): LG_V voxels of one (n, c) per thread, 256 apart (coalesced); each thread loads its voxels'
+   logit, target and mask before any store (gl may be the logits' buffer: every element is read before its own write). No 64-bit
+   division per element (the one-element-per-thread index split nc = i / S, v = i % S was most of the kernel's time) */
+#define LG_V 4
+static inline dim3 lg_grid(size_t S, int NC) { return dim3((unsigned)((S + 256 * LG_V - 1) / (256 * LG_V)), (unsigned)NC); }
+template <typename GT, typename LT = float> __global__ void __launch_bounds__(256) loss_grad_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N,
+                            int C, size_t S, const float *st, float dice_w, const float *fin, GT *gl, float pw, float gscale, int tol, const uint8_t *code, int D, int H,
+                            int W, float rec_w = 0.f) {
+    const int nc = blockIdx.y, n = nc / C;
+    const size_t v0 = (size_t)blockIdx.x * (256 * LG_V) + threadIdx.x, b0 = (size_t)nc * S;
+    const bool on = w[nc] != 0;
+    float x[LG_V]; unsigned tb[LG_V], mb[LG_V];
+#pragma unroll
+    for (int k = 0; k < LG_V; k++) {
+        const size_t v = v0 + 256 * k;
+        x[k] = 0.f; tb[k] = 0u; mb[k] = 0u;
+        if (v < S && on) { mb[k] = m[(size_t)n * S + v]; if (mb[k]) { x[k] = lgv(lg, b0 + v); tb[k] = t[b0 + v]; } }
+    }
+#pragma unroll
+    for (int k = 0; k < LG_V; k++) {
+        const size_t v = v0 + 256 * k;
+        if (v < S) gl[b0 + v] = loss_grad_v<GT, LT>(t, C, S, st, dice_w, fin, pw, gscale, tol, code, D, H, W, rec_w, nc, n, v, x[k], tb[k], mb[k]);
+    }
 }
 extern int g_loss_g16;
 extern "C" void nn_set_loss_grad_h16(int on);
