@@ -254,6 +254,39 @@ static void test_wgrad(int C, int Co, int D, int use_gn) {
     nn_free(f.x); nn_free(f.gy); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd); mode_off();
 }
 
+/* down0 backward-data: level-1 MX-fp4 gy -> level-0 MX-fp4 gx (exact output SR), set or accumulated (the skip gradient) */
+typedef struct { shape5 ys, xs; float *w; void *gy, *init; int acc; } s2b_t;
+static void s2b_op(void *c, res_t *r) {
+    s2b_t *f = c;
+    float *scr = nn_malloc(nn_conv3d_scratch(f->xs, f->ys.c, 3) + 4096);
+    if (f->acc) { if (nn_conv3d_bwd_data_acc((const float *)f->gy, f->ys, f->w, f->xs, 3, 2, (float *)r->out, scr) < 0) { printf("  s2 bwd-data acc unsupported  FAIL\n"); bad++; } }
+    else nn_conv3d_bwd_data((const float *)f->gy, f->ys, f->w, f->xs, 3, 2, (float *)r->out, scr);
+    nn_free(scr);
+}
+static void test_s2b(int C, int D, int acc) {
+    mode_prod();
+    s2b_t f = {{1, C, D / 2, 8, 16}, {1, C, D, 16, 32}};   /* (the 32-channel fp4 kernel: level-1 heights % 4) */
+    f.acc = acc;
+    float *g = dev_rand(shape_numel(f.ys), 1e-2f); f.gy = mx4_from(g, f.ys); nn_free(g);
+    f.w = dev_rand((size_t)C * C * 27, 0.12f);
+    float *x0 = dev_rand(shape_numel(f.xs), 1e-2f); f.init = mx4_from(x0, f.xs); nn_free(x0);
+    const size_t nb = nn_mx4_bytes(f.xs);
+    res_t a = {"", nb, mx4_new(f.xs)};
+    char m[96]; snprintf(m, sizeof m, "down0 bwd-data%s %2d ch, depth %d", acc ? " (accumulate)" : "", C, D);
+    /* drive() zeroes fresh outputs; for the accumulate case start every output from the same gx */
+    if (acc) {
+        nn_set_sr_step(91); const unsigned c0 = nn_sr_ctr();
+        nn_d2d(a.out, f.init, nb); run_op(s2b_op, &f, 0, D, D, c0, &a, 1, 1);
+        for (int S = 8; S <= 16; S *= 2) {
+            res_t b = res_like(&a, f.xs); nn_d2d(b.out, f.init, nb);
+            int z0[64], z1[64]; const int k = windows(D, S, z0, z1);
+            for (int i = 0; i < k; i++) run_op(s2b_op, &f, z0[i], z1[i], D, c0, &b, i == 0, i == k - 1);
+            cmp(m, S, &a, &b); res_free(&b);
+        }
+    } else drive(m, s2b_op, &f, D, &a, f.xs, 1);
+    res_free(&a); nn_free(f.gy); nn_free(f.w); nn_free(f.init); mode_off();
+}
+
 int main(void) {
     setenv("UFSM_F4_WGRAD", "1", 1);   /* the production fp4 weight gradient (train --fp4 2) */
     nn_init(0);
@@ -263,6 +296,7 @@ int main(void) {
         test_bwd(16, 16, 0, D); test_bwd(32, 32, 0, D); test_bwd(16, 32, 16, D);
         test_stem(D); test_down(16, 16, D); test_down(32, 32, D);
         test_wgrad(16, 16, D, 1); test_wgrad(32, 32, D, 1); test_wgrad(4, 16, D, 0);
+        test_s2b(16, D, 0); test_s2b(16, D, 1); test_s2b(32, D, 0); test_s2b(32, D, 1);
     }
     const char *e = nn_check(); if (e) { printf("  CUDA: %s  FAIL\n", e); bad++; }
     printf("test_zwin: %s\n", bad ? "FAIL" : "PASS");

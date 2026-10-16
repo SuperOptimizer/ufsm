@@ -191,7 +191,7 @@ __global__ void prep_w4_k(const float *__restrict__ w, uint8_t *__restrict__ wq,
    fragments), 27 units; a block computes one 32-channel half hb of gx (blockIdx.z = (n nzc + zc) 2 + hb), i.e. one MX block */
 template <int XB, int NCH = 1>
 __global__ void __launch_bounds__(256, 2) bwd_data_s2_f4_k(const uint8_t *__restrict__ gy, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc, uint8_t *__restrict__ gx,
-                                                        int N, int D, int H, int W, int Do, int Ho, int Wo, int accum, unsigned osr, s2f4_pairs PT, int ZC) {
+                                                        int N, int D, int H, int W, int Do, int Ho, int Wo, int accum, unsigned osr, s2f4_pairs PT, int ZC, int2 zw) {   /* zw: z-window tiles (4 gx planes each) */
     constexpr int TMZ = 2, TMY = 4, TMX = 16, GZ = TMZ + 1, GY = TMY + 1, GX = TMX + 1, NG = GZ * GY * GX, BM = 32, NU = NCH == 1 ? 14 : 27, C = 32 * NCH;
     constexpr int RBX = 32 * XB / 8;
     extern __shared__ __align__(128) unsigned char s2f4_smem[];
@@ -204,7 +204,7 @@ __global__ void __launch_bounds__(256, 2) bwd_data_s2_f4_k(const uint8_t *__rest
     const int mzw = warp >> 2, myw = warp & 3;
     const int mx0 = blockIdx.x * TMX, my0 = blockIdx.y * TMY;
     const int hb = blockIdx.z % NCH, bz = blockIdx.z / NCH;
-    const int nzt = (Do + TMZ - 1) / TMZ, nzc = (nzt + ZC - 1) / ZC, zc = bz % nzc, n = bz / nzc;
+    const int tz0 = zw.y ? zw.x : 0, nzt = zw.y ? zw.y : (Do + TMZ - 1) / TMZ, nzc = (nzt - tz0 + ZC - 1) / ZC, zc = bz % nzc, n = bz / nzc;
     const size_t So = (size_t)Do * Ho * Wo, S = (size_t)D * H * W;
     const uint8_t *gsc = gy + (size_t)N * NCH * So * 16;
     uint8_t *xsc = gx + (size_t)N * NCH * S * RBX;
@@ -219,7 +219,7 @@ __global__ void __launch_bounds__(256, 2) bwd_data_s2_f4_k(const uint8_t *__rest
         else { const size_t k = ((size_t)PT.ta[q] * C + 32 * hb + c) * 2; wps[i] = (unsigned short)(wsc[k] | (wsc[k + 1] << 8)); }
     }
     float *wob = ob + warp * 8 * 36;
-    for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
+    for (int tz = tz0 + zc * ZC; tz < nzt && tz < tz0 + (zc + 1) * ZC; tz++) {
         const int mz0 = tz * TMZ;
         __syncthreads();   /* the weights (first tile) / the previous tile's reads of the gy tile */
         for (int i = threadIdx.x; i < NG; i += 256) {
@@ -343,7 +343,7 @@ __global__ void prep_w4q_k(const float *__restrict__ w, uint8_t *__restrict__ wq
 #define S2Q4_MINB 2
 #endif
 __global__ void __launch_bounds__(256, S2Q4_MINB) bwd_data_s2_f4q_k(const uint8_t *__restrict__ gy, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc, uint8_t *__restrict__ gx,
-                                                         int N, int D, int H, int W, int Do, int Ho, int Wo, int accum, unsigned osr, s2q4_quads Q, int ZC) {
+                                                         int N, int D, int H, int W, int Do, int Ho, int Wo, int accum, unsigned osr, s2q4_quads Q, int ZC, int2 zw) {   /* zw: z-window tiles (4 gx planes each) */
     constexpr int TMX = 16, GX = S2Q4_GX, GY = 9, NG = S2Q4_NG;
     extern __shared__ __align__(128) unsigned char s2q_smem[];
     uint8_t *gyt = s2q_smem;                                    /* [3 z][9 y][24 x][8 B] */
@@ -355,7 +355,7 @@ __global__ void __launch_bounds__(256, S2Q4_MINB) bwd_data_s2_f4q_k(const uint8_
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int mzw = warp >> 2, myw = (warp & 3) * 2;
     const int mx0 = blockIdx.x * TMX, my0 = blockIdx.y * 8;
-    const int nzt = (Do + 1) / 2, nzc = (nzt + ZC - 1) / ZC, zc = blockIdx.z % nzc, n = blockIdx.z / nzc;
+    const int tz0 = zw.y ? zw.x : 0, nzt = zw.y ? zw.y : (Do + 1) / 2, nzc = (nzt - tz0 + ZC - 1) / ZC, zc = blockIdx.z % nzc, n = blockIdx.z / nzc;
     const size_t So = (size_t)Do * Ho * Wo, S = (size_t)D * H * W;
     const uint8_t *gsc = gy + (size_t)N * So * 8;
     uint8_t *xsc = gx + (size_t)N * S * 8;
@@ -367,7 +367,7 @@ __global__ void __launch_bounds__(256, S2Q4_MINB) bwd_data_s2_f4q_k(const uint8_
     if (threadIdx.x < 9) rel4[16 + threadIdx.x] = threadIdx.x < 8 ? Q.first[threadIdx.x] : 9;
     if (threadIdx.x < 9) rel4[threadIdx.x] = Q.rel[threadIdx.x][0] | (Q.rel[threadIdx.x][1] << 8) | (Q.rel[threadIdx.x][2] << 16) | ((unsigned)Q.rel[threadIdx.x][3] << 24);
     float *wob = ob + warp * 32 * 20;
-    for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
+    for (int tz = tz0 + zc * ZC; tz < nzt && tz < tz0 + (zc + 1) * ZC; tz++) {
         const int mz0 = tz * 2;
         __syncthreads();   /* the weights (first tile) / the previous tile's reads of the gy tile */
         for (int i = threadIdx.x; i < 3 * 9 * 17; i += 256) {   /* the gy rows as stored (MX-fp4: exact) */
@@ -478,7 +478,8 @@ static int s2b_f4q(const void *gy, shape5 ys, const float *w, shape5 xs, void *g
     }
     uint8_t *wq = lp_buf<uint8_t>(0, (size_t)9 * 16 * 32), *ws = lp_buf<uint8_t>(1, (size_t)9 * 16 * 4);
     prep_w4q_k<<<nblk_(9 * 16 * 4, 128), 128>>>(w, wq, ws, Q);
-    const int nzt = (ys.d + 1) / 2, base = ((ys.w + 15) / 16) * ((ys.h + 7) / 8) * xs.n;
+    const int2 zw = zw_trange(xs.d, 4);   /* z-window: gx planes in tiles of 4 (2 gy planes) */
+    const int nzt = zw_ntiles(xs.d, 4, zw), base = ((ys.w + 15) / 16) * ((ys.h + 7) / 8) * xs.n;
     int ZC = nzt < 8 ? nzt : 8;
     while (ZC > 1 && (size_t)base * ((nzt + ZC - 1) / ZC) < 480) ZC--;
     static int zc_env = -2;
@@ -488,7 +489,7 @@ static int s2b_f4q(const void *gy, shape5 ys, const float *w, shape5 xs, void *g
     const size_t sm = (size_t)S2Q4_NG * 8 + ((S2Q4_NG + 127) & ~127) + 9 * 16 * 32 + 9 * 16 * 4 + 32 * 4 + 8 * 32 * 20 * 4;
     static unsigned at = 0; int dev = 0; cudaGetDevice(&dev);
     if (!(at >> dev & 1u)) { at |= 1u << dev; cudaFuncSetAttribute((const void *)bwd_data_s2_f4q_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    bwd_data_s2_f4q_k<<<grid, 256, sm>>>((const uint8_t *)gy, wq, ws, (uint8_t *)gx, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum, osr, Q, ZC);
+    bwd_data_s2_f4q_k<<<grid, 256, sm>>>((const uint8_t *)gy, wq, ws, (uint8_t *)gx, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum, osr, Q, ZC, zw);
     LPCK();
     return 1;
 }
@@ -542,7 +543,8 @@ static int s2b_f4(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx
     uint8_t *wq = lp_buf<uint8_t>(0, (size_t)28 * C * C / 2), *ws = lp_buf<uint8_t>(1, (size_t)28 * C * NCH);
     s2f4_wt_k<<<nblk_((size_t)C * C * 27, 256), 256>>>(w, wt, C);
     prep_w4_k<<<nblk_((size_t)28 * C * NCH, 128), 128>>>(wt, wq, ws, C, C, C, C, -1, 0, -1, 0);
-    const int Mz = ys.d, nzt = (Mz + 1) / 2, base = (ys.w / 16) * (ys.h / 4) * NCH;
+    const int2 zw = zw_trange(xs.d, 4);   /* z-window: gx planes in tiles of 4 (2 gy planes) */
+    const int nzt = zw_ntiles(xs.d, 4, zw), base = (ys.w / 16) * (ys.h / 4) * NCH;
     int ZC = nzt < 8 ? nzt : 8;
     while (ZC > 1 && (size_t)base * ((nzt + ZC - 1) / ZC) < 480) ZC--;
     const dim3 grid((unsigned)(ys.w / 16), (unsigned)(ys.h / 4), (unsigned)(((nzt + ZC - 1) / ZC) * xs.n * NCH));
@@ -551,7 +553,7 @@ static int s2b_f4(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx
     static unsigned at = 0; int dev = 0; cudaGetDevice(&dev);
     const unsigned bit = 1u << (4 * dev + 2 * (NCH - 1) + (xdt == 4));
 #define S2BF(XB_, NCH_) do { if (!(at & bit)) { at |= bit; cudaFuncSetAttribute((const void *)bwd_data_s2_f4_k<XB_, NCH_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
-                             bwd_data_s2_f4_k<XB_, NCH_><<<grid, 256, sm>>>((const uint8_t *)gy, wq, ws, (uint8_t *)gx, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum, osr, NCH_ == 1 ? PT : PT2, ZC); } while (0)
+                             bwd_data_s2_f4_k<XB_, NCH_><<<grid, 256, sm>>>((const uint8_t *)gy, wq, ws, (uint8_t *)gx, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum, osr, NCH_ == 1 ? PT : PT2, ZC, zw); } while (0)
     if (NCH == 1) { if (xdt == 4) S2BF(4, 1); else S2BF(8, 1); }
     else { if (xdt == 4) S2BF(4, 2); else S2BF(8, 2); }
 #undef S2BF
@@ -561,6 +563,7 @@ static int s2b_f4(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx
 /* the 96 KB dynamic shared memory attribute is per device: set it once on every GPU that launches (split z uses two) */
 extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr) {
     if (s2b_f4(gy, ys, w, xs, gx, accum, gdt, xdt, osr)) return 3;   /* 32 channels, MX-fp4 gy: the fp4 kernel (UFSM_S2B_F4=0: bf16); 3 = fp4 compute */
+    if (zw_trange(xs.d, 4).y) { fprintf(stderr, "lp_bwd_data_s2_mx: the z-window needs the fp4 kernels (MX-fp4 16 / 32 / 64 channels)\n"); abort(); }
     static int on = -1; if (on < 0) on = getenv("UFSM_S2B_TC") ? atoi(getenv("UFSM_S2B_TC")) : 1;
     if (!on || xs.c != ys.c || (xs.c != 16 && xs.c != 32 && xs.c != 64)) return 0;
     const int GB = gdt == 4 ? 4 : 8, XB = xdt == 4 ? 4 : 8;
