@@ -326,14 +326,24 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_k(const uint8_t *x,
    stored MX-fp4 with exact SR keyed by (hs, row) as the head's backward-data writes it (conv1_to_mx_t_k: head_dot, mx4_sr_row).
    The stats and apply passes (the lane-per-row gn_silu_bwd_*_mx2_k<4, 1, FULL> for C 8 / 16, one channel block) see the bits that
    backward-data would have stored, so gx and the GroupNorm sums equal the two-op path's. The apply writes gx in place over x
-   (plain loads: no read-only cache on x). */
-template <int CI> __device__ __forceinline__ void head_gy_row(const float *sw, const __half *gl, int n, size_t S, size_t v, int bw, size_t ri, unsigned hs,
-                                                              float *g, float &fg) {
+   (plain loads: no read-only cache on x).
+   EX (the default; lp_set_gn_head_exact(0) / UFSM_GN_HEAD_EXACT=0 restores the two-op path's bits): gy is the fp32 head_dot itself,
+   not put through the MX-fp4 SR that only its storage needed. The GN backward is linear in gy and that SR unbiased, so gx keeps its
+   expectation with less variance (only its own SR, the same keys; the seed sequence unchanged). That SR was most of the two kernels'
+   issue slots (P512 desk, 16 channels: stats 10.5 -> 5.9 ms, apply 15.4 -> 10.4 ms per step). */
+template <int CI, bool EX> __device__ __forceinline__ void head_gy_row(const float *sw, const __half *gl, int n, size_t S, size_t v, int bw, size_t ri, unsigned hs,
+                                                                       float *g, float &fg) {
     float xi[CI], r[16];
 #pragma unroll
     for (int ci = 0; ci < CI; ci++) xi[ci] = __half2float(gl[((size_t)n * CI + ci) * S + v]);
 #pragma unroll
     for (int k = 0; k < 16; k++) r[k] = head_dot<CI>(sw + k * CI, xi);
+    if constexpr (EX) {
+#pragma unroll
+        for (int k = 0; k < 16; k++) g[k] = r[k];
+        fg = 1.f;
+        return;
+    }
     unsigned w[2];
     const int e = mx4_sr_row<16>(r, bw, ri, hs, w);
 #pragma unroll
@@ -346,7 +356,7 @@ template <int CI> __device__ __forceinline__ void head_gy_row(const float *sw, c
 template <int CI> __device__ __forceinline__ void head_sw(float *sw, const float *wh, int C, int bw) {
     for (int t = threadIdx.x; t < 16 * CI; t += blockDim.x) { const int k = t / CI, ci = t % CI; sw[t] = k < bw && k < C ? wh[(size_t)ci * C + k] : 0.f; }
 }
-template <int CI, bool FULL>
+template <int CI, bool FULL, bool EX>
 __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_hg_k(const uint8_t *x, const __half *gl, const float *wh, unsigned hs, const float *gamma, const float *beta,
                                                                const float *mean, const float *rstd, int N, int C, int G, size_t S, float *part) {
     const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G;
@@ -392,7 +402,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_hg_k(const uint8_t 
 #pragma unroll
                 for (int i = 0; i < 4; i++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * i)); r[8 * j + 2 * i] = a.x * fx; r[8 * j + 2 * i + 1] = a.y * fx; }
         }
-        head_gy_row<CI>(sw, gl, n, S, v, bw, rbase + v, hs, g, fg);
+        head_gy_row<CI, EX>(sw, gl, n, S, v, bw, rbase + v, hs, g, fg);
 #pragma unroll
         for (int k = 0; k < 16; k++) {
             if (FULL || k < kmax) {
@@ -420,7 +430,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_hg_k(const uint8_t 
         part[o] = 0.5f * a; part[o + 1] = 0.5f * cf[threadIdx.x].w * b2;
     }
 }
-template <int CI, bool FULL>
+template <int CI, bool FULL, bool EX>
 __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_hg_k(uint8_t *x, const __half *gl, const float *wh, unsigned hs, const float *gamma, const float *beta,
                                                                const float *mean, const float *rstd, const float *AB, int N, int C, int G, size_t S, unsigned gsr) {
     const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G, blk = blockIdx.y, n = blockIdx.z;
@@ -452,7 +462,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_hg_k(uint8_t *x, co
 #pragma unroll
             for (int q = 0; q < 4; q++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * q)); r[8 * j + 2 * q] = a.x * fx; r[8 * j + 2 * q + 1] = a.y * fx; }
     }
-    head_gy_row<CI>(sw, gl, n, S, v, bw, ri, hs, g, fg);
+    head_gy_row<CI, EX>(sw, gl, n, S, v, bw, ri, hs, g, fg);
     unsigned am = 0u;
 #pragma unroll
     for (int k = 0; k < 16; k++) {
@@ -719,8 +729,15 @@ extern "C" int lp_gn_silu_bwd_head_ok(int C, int ci) {
     static int a2 = -1; if (a2 < 0) a2 = getenv("UFSM_GN_APPLY2") ? atoi(getenv("UFSM_GN_APPLY2")) : 1;
     return a2 && (C == 8 || C == 16) && ci >= 1 && ci <= 4;
 }
-#define HGK(K, F, ...) do { switch (ci) { case 1: K<1, F><<<__VA_ARGS__; break; case 2: K<2, F><<<__VA_ARGS__; break; \
-                                          case 3: K<3, F><<<__VA_ARGS__; break; default: K<4, F><<<__VA_ARGS__; } } while (0)
+static int g_hg_exact = -1;   /* the recomputed gy: 1 exact fp32 (EX), 0 the two-op path's MX-fp4 bits, -1 env UFSM_GN_HEAD_EXACT (default 1) */
+extern "C" void lp_set_gn_head_exact(int on) { g_hg_exact = on; }
+static int hg_exact(void) {
+    static int env = -1; if (env < 0) env = getenv("UFSM_GN_HEAD_EXACT") ? atoi(getenv("UFSM_GN_HEAD_EXACT")) != 0 : 1;
+    return g_hg_exact >= 0 ? g_hg_exact : env;
+}
+#define HGK1(K, F, EX, ...) do { switch (ci) { case 1: K<1, F, EX><<<__VA_ARGS__; break; case 2: K<2, F, EX><<<__VA_ARGS__; break; \
+                                              case 3: K<3, F, EX><<<__VA_ARGS__; break; default: K<4, F, EX><<<__VA_ARGS__; } } while (0)
+#define HGK(K, F, ...) do { if (hg_exact()) HGK1(K, F, true, __VA_ARGS__); else HGK1(K, F, false, __VA_ARGS__); } while (0)
 extern "C" void lp_gn_silu_bwd_head_stats(const void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                           const void *gl, int ci, const float *wh, unsigned hs, double *ds) {
     size_t S = shape_spatial(s);
@@ -751,6 +768,7 @@ extern "C" void lp_gn_silu_bwd_head_apply(void *x, shape5 s, int G, const float 
     LPCK();
 }
 #undef HGK
+#undef HGK1
 
 /* 1^3 conv with a plane-major input (dtype gdt) and an MX output (head backward-data: logit gradient -> gout) */
 template <typename TG>

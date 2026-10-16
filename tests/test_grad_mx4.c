@@ -129,8 +129,10 @@ int main(void) {
     }
     /* dec[0]'s GN+SiLU backward with the head's input gradient recomputed from the fp16 logit gradient (unet's three level-0 buffers):
        the same bits as the head's backward-data into an MX-fp4 buffer followed by the GN backward from it (gx, the GroupNorm parameter
-       gradients, the seed sequence); gx in place over x */
+       gradients, the seed sequence); gx in place over x. The two-op path's bits are the mode lp_set_gn_head_exact(0); the default exact
+       gy is checked against the fp32 reference after this loop */
     const uint64_t rs_hg = rs;   /* (the tests below draw the random inputs they drew before this one was added) */
+    lp_set_gn_head_exact(0);
     for (int C = 8; C <= 16; C *= 2) for (int co = 1; co <= 3; co++) for (int sh = 0; sh < 2; sh++) {
         nn_set_tf32(1); nn_set_prec(3); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1);
         const shape5 s = sh ? (shape5){2, C, 6, 10, 14} : (shape5){1, C, 16, 32, 32}, os = {s.n, co, s.d, s.h, s.w};
@@ -167,6 +169,60 @@ int main(void) {
         nn_free(gg1); nn_free(gb1); nn_free(gg2); nn_free(gb2); nn_free(scr); nn_free(cs);
         nn_set_act_bf16(0); nn_set_grad_bf16(0); nn_set_f16(0); nn_set_sr(0);
     }
+    lp_set_gn_head_exact(1);
+    for (int C = 8; C <= 16; C *= 2) {   /* the exact gy (default): gx against the fp32 GN+SiLU backward of the dequantised x with gy the fp32 head
+                                            backward-data of the fp16 logit gradient (one SR of tens of percent, the mean of K ~1 / sqrt(K):
+                                            unbiased), the GroupNorm parameter gradients ~fp32 (no stored gradient in between), the seed count */
+        nn_set_tf32(1); nn_set_prec(3); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1);
+        const int co = 2, Kh = 16; const shape5 s = {1, C, 16, 32, 32}, os = {1, co, 16, 32, 32};
+        const int Gh = C / 4;
+        const size_t n = shape_numel(s), no = shape_numel(os), S = shape_spatial(s), xb = nn_mx4_bytes(s);
+        float *x = dev_rand_wide(n, 1.f), *gam = dev_rand(C, 1.f), *bet = dev_rand(C, 0.5f), *mean = dev_zero(Gh), *rstd = dev_zero(Gh), *wh = dev_rand((size_t)co * C, 0.5f);
+        void *xm = mx4_from(x, s); float *xd = deq4(xm, s);
+        if (nn_gn_stats(xm, s, Gh, 1e-5f, mean, rstd)) { printf("  head-recomputing gn bwd, exact gy: no MX-fp4 stats  FAIL\n"); bad++; }
+        float *glf = dev_rand_wide(no, 1e-2f); void *gl = nn_malloc(no * 2); nn_f32_to_h16(glf, no, gl, 1024.f);
+        float *gyr = dev_zero(n), *gxr = dev_zero(n), *gg1 = dev_zero(C), *gb1 = dev_zero(C), *gg2 = dev_zero(C), *gb2 = dev_zero(C), *scr = nn_malloc(nn_gn_scratch(s) + 4096);
+        {   /* gy = sum over the logits of wh x the fp16 values (host, double) */
+            uint16_t *hl = malloc(no * 2); float *hw = malloc((size_t)co * C * 4), *hy = malloc(n * 4);
+            nn_d2h(hl, gl, no * 2); nn_d2h(hw, wh, (size_t)co * C * 4);
+            for (int c = 0; c < C; c++) for (size_t v = 0; v < S; v++) {
+                double a = 0;
+                for (int ci = 0; ci < co; ci++) {
+                    const unsigned hb = hl[ci * S + v], ex = hb >> 10 & 31, mt = hb & 1023;
+                    const double f = ex ? ldexp(1024 + mt, (int)ex - 25) : ldexp(mt, -24);
+                    a += (double)hw[ci * C + c] * (hb >> 15 ? -f : f);
+                }
+                hy[c * S + v] = (float)a;
+            }
+            nn_h2d(gyr, hy, n * 4); free(hl); free(hw); free(hy);
+        }
+        nn_set_act_bf16(0); nn_set_grad_bf16(0); nn_set_f16(0); nn_set_sr(0);
+        mode_ref(); nn_gn_silu_bwd(xd, s, Gh, gam, bet, mean, rstd, gyr, gxr, gg1, gb1, scr);
+        nn_set_tf32(1); nn_set_prec(3); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1);
+        void *xf = mx4_new(s); float *acc = dev_zero(n), *one = dev_zero(n), *tmp = dev_zero(n);
+        int rc = 0; unsigned cd = 0;
+        nn_set_layer(1);
+        for (int k = 0; k < Kh; k++) {
+            nn_set_sr_step(5000 + k); nn_d2d(xf, xm, xb); nn_zero(gg2, C * 4); nn_zero(gb2, C * 4);
+            const unsigned c0 = nn_sr_ctr(), hs = nn_sr_seed();
+            rc |= nn_gn_silu_bwd_head(xf, s, Gh, gam, bet, mean, rstd, gl, co, wh, hs, gg2, gb2, scr) != 0;
+            cd = nn_sr_ctr() - c0;
+            deq4_into(xf, s, tmp);
+            if (!k) nn_d2d(one, tmp, n * 4);
+            nn_axpy(acc, 1.f / Kh, tmp, n);
+        }
+        nn_set_layer(-1);
+        char nm[96];
+        snprintf(nm, sizeof nm, "head-recomputing gn bwd, exact gy, %d ch", C); report(nm, relerr(one, gxr, n), relerr(acc, gxr, n), Kh, 0.35);
+        const double eg = relerr(gg2, gg1, C), eb = relerr(gb2, gb1, C);
+        const int okp = !rc && eg < 1e-3 && eb < 1e-3 && cd == 2 && !nn_check();
+        printf("  %-46s ggamma rel err %.3g, gbeta %.3g, seeds %u%s\n", "  (its parameter gradients, seed count)", eg, eb, cd, okp ? "" : "  FAIL");
+        if (!okp) bad++;
+        nn_free(x); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd); nn_free(wh); nn_free(xm); nn_free(xd); nn_free(glf); nn_free(gl);
+        nn_free(gyr); nn_free(gxr); nn_free(gg1); nn_free(gb1); nn_free(gg2); nn_free(gb2); nn_free(scr); nn_free(xf); nn_free(acc); nn_free(one); nn_free(tmp);
+        nn_set_act_bf16(0); nn_set_grad_bf16(0); nn_set_f16(0); nn_set_sr(0);
+    }
+    lp_set_gn_head_exact(-1);
     rs = rs_hg;
     {   /* stride-1 backward-data with narrow (16-channel) MX-fp4 gy / gx and weights +-6 * 2^-5 (exact in e2m1 / e4m3 / bf16 under any
            block layout): the fp32 reference is then the exact expectation of the SR'd output, so the mean of K converges to it unless
@@ -556,6 +612,7 @@ int main(void) {
         setenv("UFSM_F4_WGRAD", "1", 1);
         unet_set_act_mx4(1); unet_set_grad_mx8(1); unet_set_grad_mx4(1); unet_set_input_prec(4); unet_set_recompute(1); unet_set_chunk_up(2); unet_set_lean(2);
         unet_set_share_enc_a1(1); unet_set_a0_share(1);
+        lp_set_gn_head_exact(0);   /* the bit-for-bit comparisons: the head-recomputing GN backward's two-op bits */
         for (int wc = 0; wc < 3; wc++) {
             unet_cfg cfg = wc == 0 ? (unet_cfg){4, {16, 16, 32, 64}, 4, 2, 8, 1} : wc == 1 ? (unet_cfg){4, {16, 16, 32, 64}, 4, 2, 8, 0} : (unet_cfg){4, {8, 8, 16, 32}, 4, 2, 8, 1};
             const shape5 xs = {1, 4, 32, 32, 32};
@@ -620,6 +677,23 @@ int main(void) {
                     if (!okv) bad++;
                     free(gv); unet_set_l0_3buf_split(-1); unet_set_l0_3buf_reorder(-1);
                 }
+                /* the default exact gy of the head-recomputing GN backward (the bits above: lp_set_gn_head_exact(0)): the same seeds, the
+                   gradients off the four-buffer chain's by less than the backward's own rounding noise (the same step, other SR keys) */
+                double rx[2]; unsigned cx[2];
+                for (int ex = 0; ex < 2; ex++) {
+                    lp_set_gn_head_exact(ex); unet_set_l0_3buf(1);
+                    void *tp = nullptr; unet_batch_scratch2(v, 2 * S, tailb, &tp);
+                    nn_set_sr_step(9000); const float *lg = unet_forward(v, xi[0], xs, 1); unet_zero_grad(v);
+                    nn_f32_to_h16(gy[0], no, (void *)lg, nn_get_grad_scale());
+                    nn_set_sr_step(ex ? 9100 : 9177); unet_backward_x(v, lg, 1);
+                    cx[ex] = nn_sr_ctr(); float *gv = malloc(np * 4); unet_grad_d2h(v, gv);
+                    double d2 = 0, r2 = 0; for (size_t i = 0; i < np; i++) { double d = (double)gv[i] - gg[0][0][i]; d2 += d * d; r2 += (double)gg[0][0][i] * gg[0][0][i]; }
+                    rx[ex] = sqrt(d2 / r2); free(gv);
+                }
+                const int okx = unet_l0_3buf(v) && rx[1] > 0 && rx[1] < rx[0] && cx[1] == ctr[0][0] && !nn_check();
+                printf("  %-46s grads rel diff %.3g (other SR keys: %.3g), seeds %u / %u%s\n", "three buffers, exact head gy vs four", rx[1], rx[0], cx[1], ctr[0][0], okx ? "" : "  FAIL");
+                if (!okx) bad++;
+                lp_set_gn_head_exact(0);
             }
             if (wc == 0) {   /* the trainer's GPU-built input (unet_set_input_rad: the fp16 CT in the batch head, radial records): three buffers keep
                                 the CT and rebuild the input from it for the stem's weight gradient; the same logits, gradients and seeds as four */
@@ -656,6 +730,7 @@ int main(void) {
             for (int k = 0; k < 2; k++) { nn_free(xi[k]); nn_free(gy[k]); }
         }
         unet_set_a0_share(-1); unet_set_share_enc_a1(0); unet_set_grad_mx4(0); unet_set_grad_mx8(0); unet_set_lean(0);
+        lp_set_gn_head_exact(-1);
     }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
     printf("gradient MX-fp4: %s\n", bad ? "FAIL" : "ok");
