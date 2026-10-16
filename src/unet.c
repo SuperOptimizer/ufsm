@@ -1690,7 +1690,7 @@ static void rblock_fwd(unet *u, block *b, int level, block *prev) {
         nn_set_conv(1);
         PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, nullptr, nullptr));
         nn_set_conv(-1);
-        PROF(4, nn_add_into(b->a2, prev->a2, b->ys, ABF));
+        PROF(4, nn_add_into_act(b->a2, prev->a2, b->ys, ABF));
         sp_halo(u, b->a2, b->ys, 0);
         if (!frz && nn_gn_stats(b->a2, b->ys, G, 1e-5f, b->m2, b->r2)) { fprintf(stderr, "unet: residual block GroupNorm statistics unsupported for this storage\n"); abort(); }
         if (b->s2) PROF(3, nn_gn_silu_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2));
@@ -1701,7 +1701,7 @@ static void rblock_fwd(unet *u, block *b, int level, block *prev) {
     PROF(0, nn_conv3d_fwd(prev->s2, b->xs, P(u, b->c1.w), P(u, b->c1.b), b->c1.cout, 3, 1, b->a1));
     PROF(3, nn_gn_fwd_silu(b->a1, b->ys, G, 1e-5f, P(u, b->n1.gamma), P(u, b->n1.beta), t1, b->m1, b->r1));
     PROF(0, nn_conv3d_fwd(t1, b->ys, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, 3, 1, b->a2));
-    nn_add_into(b->a2, prev->a2, b->ys, 0);
+    nn_add_into_act(b->a2, prev->a2, b->ys, 0);
     PROF(3, nn_gn_fwd_silu(b->a2, b->ys, G, 1e-5f, P(u, b->n2.gamma), P(u, b->n2.beta), b->s2, b->m2, b->r2));
 }
 
