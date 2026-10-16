@@ -723,7 +723,7 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
             appearance[((size_t)z*P+y)*P+x]=ct_aug_value(ap,ctu,P,z,y,x);
     }
     const float sign[3]={sy.flip[0]?-1:1,sy.flip[1]?-1:1,sy.flip[2]?-1:1};
-    enum { ZB = 16, TB = 16 };
+    enum { ZB = 16, TB = 32 };   /* (row tiles of 32: the per-row coordinate setup amortised over 4 vectors) */
     const float c=.5f*(a->P-1),sc=(float)a->scale;
     float Rf[3][3],Af[3][3],Aif[3][3];
     for (int i=0;i<3;i++) for (int j=0;j<3;j++) { Rf[i][j]=(float)a->R[i][j]; Af[i][j]=(float)a->A[i][j]; Aif[i][j]=(float)a->Ainv[i][j]; }
@@ -773,7 +773,7 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                 if (fast) {
                     const __m256 one=_mm256_set1_ps(1.f),fP1=_mm256_set1_ps((float)(P-1)),zero=_mm256_setzero_ps(),thr=_mm256_set1_ps(1e-7f),half=_mm256_set1_ps(.5f);
                     const __m256i three=_mm256_set1_epi32(3),bytem=_mm256_set1_epi32(255),iP=_mm256_set1_epi32(P);
-                    for (int h=0;h<TB;h+=8) {
+                    for (int h=0;h<nx;h+=8) {
                         const int xs=x0+h;
                         const __m256 v2=_mm256_loadu_ps(vt+2*P+xs);
                         __m256 U[3],Vv[3],F[3],G[3];
@@ -797,14 +797,16 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                         if (cmf) for (int pr=0;pr<4;pr++) {   /* corners (bz, by, 0) and (bz, by, 1): the per-voxel order cn = 0..7 */
                             const int bz=pr>>1,by=pr&1;
                             const __m256i wd=wdp[pr]=_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)cm,_mm256_add_epi32(b0,_mm256_set1_epi32((bz*P+by)*P)),ini,2);
+                            const __m256 wzy=_mm256_mul_ps(bz?F[0]:G[0],by?F[1]:G[1]);   /* (the weight's first product, shared by the pair) */
+                            const __m256i zm[2]={_mm256_cmpeq_epi32(_mm256_and_si256(wd,_mm256_set1_epi32(0x100)),_mm256_setzero_si256()),
+                                                 _mm256_cmpeq_epi32(_mm256_and_si256(wd,_mm256_set1_epi32(0x1000000)),_mm256_setzero_si256())};   /* mask bit 0 */
                             for (int bx=0;bx<2;bx++) {
-                                const __m256 w=_mm256_mul_ps(_mm256_mul_ps(bz?F[0]:G[0],by?F[1]:G[1]),bx?F[2]:G[2]);
+                                const __m256 w=_mm256_mul_ps(wzy,bx?F[2]:G[2]);
                                 const __m256 use=_mm256_and_ps(in,_mm256_cmp_ps(w,thr,_CMP_GT_OQ));
                                 const __m256i h16=bx?_mm256_srli_epi32(wd,16):wd;
                                 const __m256 val=_mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_and_si256(h16,bytem)),_mm256_set1_ps(mean)),_mm256_set1_ps(isd));
                                 cv=_mm256_add_ps(cv,_mm256_and_ps(_mm256_mul_ps(w,val),use));
-                                const __m256i mb=_mm256_and_si256(_mm256_srli_epi32(h16,8),_mm256_set1_epi32(1));
-                                bad=_mm256_or_si256(bad,_mm256_and_si256(_mm256_cmpeq_epi32(mb,_mm256_setzero_si256()),_mm256_castps_si256(use)));
+                                bad=_mm256_or_si256(bad,_mm256_and_si256(zm[bx],_mm256_castps_si256(use)));
                             }
                         }
                         else for (int cn=0;cn<8;cn++) {
