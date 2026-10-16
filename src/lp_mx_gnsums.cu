@@ -1,47 +1,88 @@
 /* GroupNorm statistics of MX tensors */
 #include "lp_mxops.cuh"
-template <int B>
-__global__ void __launch_bounds__(256) gn_sums_mx_k(const uint8_t *x, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1) {
-    const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G;
-    const int nblk_per = (int)((S + 255) / 256);
-    const int n = blockIdx.x / nblk_per; const size_t v = (size_t)(blockIdx.x % nblk_per) * 256 + threadIdx.x;
-    __shared__ float g1[64], g2[64];
-    if (threadIdx.x < 64) { g1[threadIdx.x] = 0.f; g2[threadIdx.x] = 0.f; }
+/* The group sums (sum x, sum x^2) of an MX tensor (B bits) over the voxels [v0, v1) (a spatial split's own part). Blocks = (voxel slab,
+   channel block, sample) as gn_silu_bwd_stats_mx2_k: each thread accumulates its rows of the slab per channel in registers, the next
+   row's loads in flight (HPB 2: two lanes per 32-channel row, 16 channels each), one reduction per block and a double atomic per
+   channel into its group's sums. (The kernel this replaced, a block per 256 voxels and double atomics per block and group on the same
+   2 N G addresses, took ~14 ms per 8-channel level-0 call at P512 on the desk: 55 ms of an 8-wide net's step.) */
+template <int B, int HPB>
+__global__ void __launch_bounds__(256) gn_sums_mx2_k(const uint8_t *x, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1) {
+    const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G, blk = blockIdx.y, n = blockIdx.z, nsl = gridDim.x;
+    const int h = HPB == 2 ? (int)(threadIdx.x & 1) : 0, h0 = 16 * h, tv = (int)threadIdx.x / HPB, nt = 256 / HPB;
+    size_t q0 = S * blockIdx.x / nsl, q1 = S * (blockIdx.x + 1) / nsl;
+    if (q0 < v0) q0 = v0;
+    if (q1 > v1) q1 = v1;
+    __shared__ float w1[8][32], w2[8][32];
+    w1[threadIdx.x >> 5][threadIdx.x & 31] = 0.f; w2[threadIdx.x >> 5][threadIdx.x & 31] = 0.f;
     __syncthreads();
-    const uint8_t *sc = mx_sc<B>(x, N, C, S);
-    for (int blk = 0; blk < nb; blk++) {
-        float r[32];
-        if (v < S && v >= v0 && v < v1) mx_load_row_b<B>(x, sc, ((size_t)n * nb + blk) * S + v, bw, r);   /* [v0, v1): voxels this GPU owns (spatial split) */
-        else for (int k = 0; k < 32; k++) r[k] = 0.f;
-        /* the block row's channels in order, flushed to their group whenever the group changes (any C / G: a group may
-           straddle two block rows; the group index is warp-uniform, so the reductions are) */
-        int gcur = -1; float a = 0.f, q = 0.f;
-        for (int k = 0; k < bw; k++) {
-            const int c = blk * bw + k; if (c >= C) break;
-            const int gi = c / cpg;
-            if (gi != gcur) {
-                if (gcur >= 0) {
-                    for (int o = 16; o; o >>= 1) { a += __shfl_xor_sync(0xffffffff, a, o); q += __shfl_xor_sync(0xffffffff, q, o); }
-                    if ((threadIdx.x & 31) == 0) { atomicAdd(&g1[gcur], a); atomicAdd(&g2[gcur], q); }
-                }
-                gcur = gi; a = 0.f; q = 0.f;
+    const int kmax = max(0, min(min(bw, C - blk * bw) - h0, 16));
+    const size_t rbase = ((size_t)n * nb + blk) * S;
+    const uint8_t *sx = mx_sc<B>(x, N, C, S);
+    const int rbx = mx_rb(bw, B);
+    float s1[16], s2[16];
+#pragma unroll
+    for (int k = 0; k < 16; k++) { s1[k] = 0.f; s2[k] = 0.f; }
+    uint4 xw = make_uint4(0u, 0u, 0u, 0u); unsigned xs = 0u;
+    auto load = [&](size_t v) {
+        const size_t ri = rbase + v;
+        if constexpr (B == 4) { const uint2 t = bw == 8 ? make_uint2(__ldg((const unsigned *)(x + ri * rbx)), 0u) : __ldg((const uint2 *)(x + ri * rbx + 8 * h)); xw.x = t.x; xw.y = t.y; }
+        else if (bw == 8) { const uint2 t = __ldg((const uint2 *)(x + ri * rbx)); xw.x = t.x; xw.y = t.y; }   /* MX-fp8 8-channel row: 8 bytes */
+        else xw = __ldg((const uint4 *)(x + ri * rbx + 16 * h));
+        xs = __ldg(sx + ri);
+    };
+    size_t q = q0 + tv;
+    if (q < q1) load(q);
+    for (; q < q1; q += nt) {
+        const uint4 cx = xw; const float fx = mx_scale(xs);
+        if (q + nt < q1) load(q + nt);   /* next row in flight during this one's arithmetic */
+        float r[16];
+        if constexpr (B == 4) {
+            const unsigned w4[2] = {cx.x, cx.y};
+#pragma unroll
+            for (int j = 0; j < 2; j++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * i)); r[8 * j + 2 * i] = a.x * fx; r[8 * j + 2 * i + 1] = a.y * fx; }
+        } else {
+            const unsigned w8[4] = {cx.x, cx.y, cx.z, cx.w};
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const float2 a = dec_e4m3x2((unsigned short)(w8[j] & 0xffff)), b2 = dec_e4m3x2((unsigned short)(w8[j] >> 16));
+                r[4 * j] = a.x * fx; r[4 * j + 1] = a.y * fx; r[4 * j + 2] = b2.x * fx; r[4 * j + 3] = b2.y * fx;
             }
-            a += r[k]; q += r[k] * r[k];
         }
-        if (gcur >= 0) {
-            for (int o = 16; o; o >>= 1) { a += __shfl_xor_sync(0xffffffff, a, o); q += __shfl_xor_sync(0xffffffff, q, o); }
-            if ((threadIdx.x & 31) == 0) { atomicAdd(&g1[gcur], a); atomicAdd(&g2[gcur], q); }
-        }
+#pragma unroll
+        for (int k = 0; k < 16; k++) if (k < kmax) { s1[k] += r[k]; s2[k] = fmaf(r[k], r[k], s2[k]); }
+    }
+#pragma unroll
+    for (int k = 0; k < 16; k++) {
+        float a = s1[k], b2 = s2[k];
+        for (int o = 16; o >= HPB; o >>= 1) { a += __shfl_xor_sync(0xffffffff, a, o); b2 += __shfl_xor_sync(0xffffffff, b2, o); }
+        if ((int)(threadIdx.x & 31) < HPB && k < kmax) { w1[threadIdx.x >> 5][h0 + k] = a; w2[threadIdx.x >> 5][h0 + k] = b2; }
     }
     __syncthreads();
-    for (int g = threadIdx.x; g < G; g += 256) { atomicAdd(&sums[2 * ((size_t)n * G + g)], (double)g1[g]); atomicAdd(&sums[2 * ((size_t)n * G + g) + 1], (double)g2[g]); }
+    const int kb = min(bw, C - blk * bw);
+    if ((int)threadIdx.x < kb) {
+        float a = 0.f, b2 = 0.f;
+#pragma unroll
+        for (int w = 0; w < 8; w++) { a += w1[w][threadIdx.x]; b2 += w2[w][threadIdx.x]; }
+        const size_t o = 2 * ((size_t)n * G + (blk * bw + (int)threadIdx.x) / cpg);
+        atomicAdd(&sums[o], (double)a); atomicAdd(&sums[o + 1], (double)b2);
+    }
 }
 extern "C" int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1) {
     const int cpg = C / G;
     if (G > 64 || cpg < 1 || C % G) return -1;
-    const int nblk_per = (int)((S + 255) / 256);
-    if (xdt == 4) gn_sums_mx_k<4><<<N * nblk_per, 256>>>((const uint8_t *)x, N, C, G, S, sums, v0, v1);
-    else gn_sums_mx_k<8><<<N * nblk_per, 256>>>((const uint8_t *)x, N, C, G, S, sums, v0, v1);
+    const int nb = mx_nb(C), hpb = mx_bw(C) == 32 ? 2 : 1;
+    /* slabs as lp_gn_silu_bwd_mx: >= ~16 rows per thread, >= ~160 blocks in all, <= 1024 per (channel block, sample) */
+    const size_t ny = (size_t)nb * N;
+    size_t slabs = S / 4096, want = (160 + ny - 1) / ny, maxs = S / 512 > 0 ? S / 512 : 1;
+    if (slabs < want) slabs = want;
+    if (slabs > maxs) slabs = maxs;
+    if (slabs > 1024) slabs = 1024;
+    const dim3 grid((unsigned)slabs, (unsigned)nb, (unsigned)N);
+    const uint8_t *xq = (const uint8_t *)x;
+    if (xdt == 4) { if (hpb == 2) gn_sums_mx2_k<4, 2><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1); else gn_sums_mx2_k<4, 1><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1); }
+    else { if (hpb == 2) gn_sums_mx2_k<8, 2><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1); else gn_sums_mx2_k<8, 1><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1); }
     LPCK();
     return 0;
 }
