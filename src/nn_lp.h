@@ -48,6 +48,7 @@ extern thread_local lp_gyrec_t g_gyrec;   /* per host thread (a GPU's trainer th
 #else
 extern _Thread_local lp_gyrec_t g_gyrec;
 #endif
+int lp_mx_affine(void *x, int bits, shape5 s, int G, const float *mean, const float *rstd, unsigned sr);   /* src/lp_l0slab.cu */
 int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                              const void *gy, void *gx, const float *AB, unsigned gsr, unsigned rsr);   /* 1: done (gx and the records) */
 void lp_set_s2b_f4(int on);  /* the fp4 stride-2 backward-data (MX-fp4 gy): 3 for 32 and 64 channels, 1 for 32 only, 0 bf16 tensor cores, -1 env UFSM_S2B_F4 (default 3) */

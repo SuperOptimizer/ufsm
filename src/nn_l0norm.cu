@@ -1,6 +1,7 @@
 /* Level-0 normalisation alternatives (unet cfg.l0_norm): GroupNorm statistics held constant -- none (mean 0, rstd 1) or
    BatchNorm-style running statistics (ema) -- and the GroupNorm backwards without the statistics' gradient terms. */
 #include "nn_common.cuh"
+#include "nn_lp.h"
 
 int g_gn_const;   /* nn_gn_bwd / nn_gn_silu_bwd / nn_gn_silu_bwd_head: the group sums (mean and variance terms) scaled by 0 */
 extern "C" void nn_set_gn_const(int on) { g_gn_const = on; }
@@ -71,3 +72,21 @@ __global__ void __launch_bounds__(256) ws_bwd_k(float *g, const float *g0, const
 }
 extern "C" void nn_ws_fwd(float *wh, const float *w, int cout, int n, float gain, float eps) { ws_fwd_k<<<cout, 256>>>(wh, w, n, gain, eps); KCHECK(); }
 extern "C" void nn_ws_bwd(float *g, const float *g0, const float *w, int cout, int n, float gain, float eps) { ws_bwd_k<<<cout, 256>>>(g, g0, w, n, gain, eps); KCHECK(); }
+/* --l0-norm slab: the in-place GroupNorm affine of an MX tensor (lp_mx_affine), and the fp32 reference path's permutation between
+   NCDHW and the pseudo-sample layout (n * D / S + slab, C, S, H, W) (dir 0: to it, 1: back) */
+extern "C" void nn_l0_affine(float *x, shape5 s, int G, const float *mean, const float *rstd, unsigned sr) {
+    if (!ISMX(x) || lp_mx_affine(x, nn_storage(x), s, G, mean, rstd, sr)) { fprintf(stderr, "nn_l0_affine: MX storage only\n"); abort(); }
+}
+__global__ void slab_perm_k(float *dst, const float *src, int C, int D, size_t HW, int Sz, size_t total, int dir) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const size_t v = i % HW, t = i / HW;
+    const int z = (int)(t % D), c = (int)(t / D % C), n = (int)(t / D / C);
+    const size_t j = (((size_t)(n * (D / Sz) + z / Sz) * C + c) * Sz + z % Sz) * HW + v;
+    if (dir == 0) dst[j] = src[i]; else dst[i] = src[j];
+}
+extern "C" void nn_slab_perm(float *dst, const float *src, shape5 s, int Sz, int dir) {
+    const size_t total = shape_numel(s);
+    slab_perm_k<<<nblk(total, 256), 256>>>(dst, src, s.c, s.d, (size_t)s.h * s.w, Sz, total, dir);
+    KCHECK();
+}

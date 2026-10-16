@@ -89,6 +89,9 @@ struct unet {
     long l0_n; float l0_mom; int l0_warm, l0_c, l0_rc;   /* ema: updates so far, momentum, warm-up; l0_c: this forward's level-0 statistics are
                                                           constants; l0_rc: unet_l0_recal's forwards so far (-1 off) */
     float *wsp, ws_gain;          /* cfg.l0_norm 3 (ws): the weights the forward reads (live, the level-0 convs standardised); SiLU's gain */
+    float *l0s_st, *l0s_tmp; size_t l0s_n, l0s_nng, l0s_tmpn; unsigned l0s_seed[4], l0s_fwd;   /* cfg.l0_norm 4 (slab): per site [mean | rstd]
+                                  per (sample, slab, group) (nng each), then zeros, ones (nng), ones, zeros (widths[0]: gamma, beta of the fp32
+                                  path's plain normalisation); the fp32 path's three slab-layout temporaries; the sites' SR seeds */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
@@ -276,7 +279,8 @@ unet *unet_create(const unet_cfg *cfg) {
     u->live = u->p; u->fw = u->p; u->wm = nullptr; u->sparse24 = 0; u->wq = 0; u->wq_q = u->wq_sc = u->wq_qe = u->wq_sce = nullptr; u->wq_r = u->wq_rsc = u->wq_re = u->wq_rsce = nullptr; u->wq_n = 0;
     u->gn_scratch = nn_malloc(1 << 20);
     u->red_scratch = nn_malloc(4096 * 4);
-    if (cfg->l0_norm < 0 || cfg->l0_norm > 3) { fprintf(stderr, "unet: l0_norm %d (0 gn, 1 none, 2 ema, 3 ws)\n", cfg->l0_norm); abort(); }
+    if (cfg->l0_norm < 0 || cfg->l0_norm > 4) { fprintf(stderr, "unet: l0_norm %d (0 gn, 1 none, 2 ema, 3 ws, 4 slab)\n", cfg->l0_norm); abort(); }
+    if (cfg->l0_norm == 4 && u->cfg.l0_slab <= 0) u->cfg.l0_slab = 64;
     if (cfg->l0_norm == 3) {   /* 1 / std(silu(z)), z ~ N(0, 1): the NF-net gain of the convs reading a SiLU output */
         double s1 = 0, s2 = 0;
         for (int i = -24000; i <= 24000; i++) { const double z = i * 5e-4, p = exp(-0.5 * z * z) * 5e-4 / sqrt(2 * M_PI), y = z / (1 + exp(-z)); s1 += p * y; s2 += p * y * y; }
@@ -297,7 +301,7 @@ void unet_free(unet *u) {
     free_acts(u);
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
-    nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b); free(u->gn_frz); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
+    nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b); free(u->gn_frz); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
     nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
@@ -671,7 +675,7 @@ static int l3_want(const unet *u, int train) {
     if (!(nn_get_tf32() && ABF && GBF && act_mx4() && grad_mx4() && grad_dt() == act_dt() && lean() >= 2 && chunk_up() && recompute() == 1 && !recompute_a1())) return 0;
     if (!(share_enc_a1() && a1_offload() && a0_share_on() && gco_on() && dno_on() && sko_on() && xin_offload() && input_mx())) return 0;
     if ((w[0] != 8 && w[0] != 16) || UPW(1) > w[0] || UPW(0) != w[0] || unet_wide_up_grad()) return 0;
-    if (any_single(u) || u->nrb_any || u->head_ext || sp_on(u) || u->cfg.ds_levels || fakeq() || fakeq_grad()) return 0;
+    if (any_single(u) || u->nrb_any || u->head_ext || sp_on(u) || u->cfg.ds_levels || fakeq() || fakeq_grad() || u->cfg.l0_norm == 4) return 0;   /* (slab: no head-recomputing GN backward) */
     return nn_gn_silu_bwd_head_ok(w[0], u->cfg.cout);
 }
 static void build_acts(unet *u, shape5 xs, int train) {
@@ -1491,9 +1495,11 @@ static float *l0_live(unet *u, const block *b, int conv, int r) {   /* where con
     const size_t ng = (size_t)u->xs.n * l0_G(u);
     return u->l0live + ((size_t)(2 * l0_blk(u, b) + conv - 1) * 2 + r) * ng;
 }
+static void l0s_begin(unet *u);
 static void l0_begin(unet *u) {   /* forward start: latch l0_c, the constant statistics into the sites */
     const int md = u->cfg.l0_norm, G = l0_G(u), N = u->xs.n;
-    u->l0_c = md == 1 || md == 3 || (md == 2 && u->l0_n > 0 && u->l0_n >= u->l0_warm && u->l0_rc < 0);   /* (recalibration: the window's own) */
+    if (md == 4) l0s_begin(u);
+    u->l0_c = md == 1 || md == 3 || md == 4 || (md == 2 && u->l0_n > 0 && u->l0_n >= u->l0_warm && u->l0_rc < 0);   /* (recalibration: the window's own) */
     if (!u->l0_c) return;
     if (md == 2 && u->fwd_train && u->l0live_n < (size_t)8 * N * G) { nn_free(u->l0live); u->l0live_n = (size_t)8 * N * G; u->l0live = nn_malloc(u->l0live_n * 4); }
     for (int i = 0; i < (u->cfg.nlev > 1 ? 2 : 1); i++) for (int k = 1; k <= 2; k++) {
@@ -1502,6 +1508,51 @@ static void l0_begin(unet *u) {   /* forward start: latch l0_c, the constant sta
         const float *run = md == 2 ? u->l0run + (u->using_ema ? (size_t)8 * G : 0) + (size_t)(2 * i + k - 1) * 2 * G : nullptr;   /* (EMA weights: their own) */
         nn_gn_const_fill(k == 1 ? b->m1 : b->m2, k == 1 ? b->r1 : b->r2, run, N, G, 1e-5f);
     }
+}
+/* cfg.l0_norm 4 (slab): GroupNorm statistics per z-slab of l0_slab planes. The convs write the raw level-0 tensor (no statistics), then
+   l0_slab_fwd normalises it in place with its slabs' statistics (the readers apply gamma, beta + SiLU with mean 0 / rstd 1, as none);
+   the GroupNorm backwards run over the pseudo-sample shape (one channel block: (sample, slab) is a sample of the same layout) on the
+   normalised tensor with mean 0 / rstd 1 -- the slab's statistics terms -- and d/dx = rstd(slab) d/dx' follows (exact SR for MX-fp4
+   gradients). MX storage (the training default: one MX channel block, <= 32 channels) or the fp32 path (through the slab layout).
+   A prototype: the normalised tensor is rounded to the storage format once more (round to nearest) and the gradient once more */
+static int l0_slab_on(const unet *u, const block *b) { return u->cfg.l0_norm == 4 && l0_blk(u, b) >= 0; }
+static shape5 l0s_shape(const unet *u, const block *b) { shape5 p = b->ys; const int S = u->cfg.l0_slab; p.n *= p.d / S; p.d = S; return p; }
+static void l0s_begin(unet *u) {
+    const int S = u->cfg.l0_slab, D = u->ls[0].d, G = l0_G(u), w0 = u->cfg.widths[0];
+    if (D % S) { fprintf(stderr, "unet: --l0-norm slab: the level-0 depth %d is not a multiple of the slab (%d planes)\n", D, S); abort(); }
+    if (u->cfg.widths[0] > 32 && nn_get_tf32()) { fprintf(stderr, "unet: --l0-norm slab: at most 32 level-0 channels (one MX channel block)\n"); abort(); }
+    const size_t nng = (size_t)u->xs.n * (D / S) * G, need = 10 * nng + 2 * (size_t)w0;
+    if (u->l0s_n < need) { nn_free(u->l0s_st); u->l0s_st = nn_malloc(need * 4); u->l0s_n = need; }
+    u->l0s_nng = nng;
+    nn_gn_const_fill(u->l0s_st + 8 * nng, u->l0s_st + 9 * nng, nullptr, (int)nng, 1, 1e-5f);   /* zeros, ones */
+    nn_gn_const_fill(u->l0s_st + 10 * nng + w0, u->l0s_st + 10 * nng, nullptr, w0, 1, 1e-5f);   /* gamma ones, beta zeros */
+    if (!nn_get_tf32()) {
+        shape5 t = u->ls[0]; t.c = w0; const size_t n3 = 3 * shape_numel(t);
+        if (u->l0s_tmpn < n3) { nn_free(u->l0s_tmp); u->l0s_tmp = nn_malloc(n3 * 4); u->l0s_tmpn = n3; }
+    }
+    u->l0s_fwd++;
+}
+static float *l0s_stat(unet *u, const block *b, int k, int r) { return u->l0s_st + ((size_t)(2 * l0_blk(u, b) + k - 1) * 2 + r) * u->l0s_nng; }
+static void l0s_check(const unet *u, const float *x) {   /* tensor cores: MX level-0 tensors; else the fp32 reference path */
+    (void)u; if (!nn_storage(x) && nn_get_tf32()) { fprintf(stderr, "unet: --l0-norm slab: the tensor-core path needs MX level-0 storage\n"); abort(); }
+}
+static void l0_slab_fwd(unet *u, block *b, int k, float *x, int stats) {   /* x: conv k's raw output; stats 0: the forward's (a recompute) */
+    if (!l0_slab_on(u, b)) return;
+    const int G = l0_G(u), site = 2 * l0_blk(u, b) + k - 1, S = u->cfg.l0_slab;
+    const shape5 ps = l0s_shape(u, b);
+    float *m = l0s_stat(u, b, k, 0), *r = l0s_stat(u, b, k, 1);
+    l0s_check(u, x);
+    if (stats) u->l0s_seed[site] = ((u->l0s_fwd * 0x9e3779b9u) ^ (0x7f4a7c15u + 0x632be5abu * (unsigned)site)) | 1u;
+    if (nn_storage(x)) {
+        if (stats && nn_gn_stats(x, ps, G, 1e-5f, m, r)) { fprintf(stderr, "unet: --l0-norm slab: statistics unsupported for this storage\n"); abort(); }
+        nn_l0_affine(x, ps, G, m, r, 0u);   /* round to nearest, as the convs store activations (a recompute: the same bits) */
+        return;
+    }
+    float *t = u->l0s_tmp, *one = u->l0s_st + 10 * u->l0s_nng, *zero = one + u->cfg.widths[0];
+    nn_slab_perm(t, x, b->ys, S, 0);
+    if (stats) (void)nn_gn_stats(t, ps, G, 1e-5f, m, r);
+    nn_gn_apply(t, ps, G, one, zero, m, r, t);
+    nn_slab_perm(x, t, b->ys, S, 1);
 }
 static void l0_after(unet *u, block *b) {   /* ema, training forward: the block's batch statistics, after dec[0] into the running ones */
     const int i = l0_blk(u, b), G = l0_G(u), N = u->xs.n;
@@ -1659,6 +1710,7 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
         else if (b == &u->enc[0] && u->ctin.on) stem_slab_run(u, b, G, om1, or1);
         else if (b->in2) PROF(0, nn_conv3d_fwd_split(x, b->in2, b->c_split, b->xs, 0, nullptr, nullptr, nullptr, nullptr, P(u, b->c1.w), B1(u, b), b->c1.cout, o1, G, 1e-5f, sm, sr));
         else { nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, o1, G, 1e-5f, sm, sr)); }   /* down_norm: gn + silu of the input in staging */
+        l0_slab_fwd(u, b, sg ? 2 : 1, o1, 1);   /* slab: normalised in place with its slabs' statistics */
         if (sg) {   /* one conv: a2 is the output */
             FQ(b->a2, b->ys); FQ_AFF(b->a2, b->ys, b->pm2, b->pr2, G);
             sp_halo(u, b->a2, b->ys, 0);
@@ -1688,13 +1740,14 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
         if (inplace) slab_run(u, b, level, 2, nullptr, G, om2, or2);
         else PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, om2, or2));
         nn_set_conv(-1);
+        l0_slab_fwd(u, b, 2, b->a2, 1);
         FQ(b->a2, b->ys); FQ_AFF(b->a2, b->ys, b->pm2, b->pr2, G);
         sp_halo(u, b->a2, b->ys, 0);
         if (b->s2) { PROF(3, nn_gn_silu_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2)); FQ(b->s2, b->ys); FQ_POST(b->s2, b->ys); }
         return;
     }
     /* constant level-0 statistics (they sit in m / r): live ones into l0_live for the running update, then the affine + SiLU */
-#define GN_FWD_SILU(a, k, nrm, y, m, r) do { if (!lc) PROF(3, nn_gn_fwd_silu(a, b->ys, G, 1e-5f, P(u, nrm.gamma), P(u, nrm.beta), y, m, r)); \
+#define GN_FWD_SILU(a, k, nrm, y, m, r) do { l0_slab_fwd(u, b, k, a, 1); if (!lc) PROF(3, nn_gn_fwd_silu(a, b->ys, G, 1e-5f, P(u, nrm.gamma), P(u, nrm.beta), y, m, r)); \
         else { if (l0_live(u, b, k, 0)) (void)nn_gn_stats(a, b->ys, G, 1e-5f, l0_live(u, b, k, 0), l0_live(u, b, k, 1)); \
                PROF(3, nn_gn_silu_apply(a, b->ys, G, P(u, nrm.gamma), P(u, nrm.beta), m, r, y)); } } while (0)
     if (b->single) {   /* one conv: a2 = conv1's output, s2 its silu(gn) */
@@ -1948,9 +2001,29 @@ int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first) {
 /* gy: grad wrt block output (s2). Returns gB of the level holding grad wrt block input. */
 /* pre: gy is already d/d a2 (its normalisation was backpropagated by the next residual block's input GroupNorm); gid: added to d/d a2
    (the residual identity gradient, fp32 path); save: receives d/d a2 (the identity gradient for the block before) */
+/* the block's GroupNorm backwards (k: its norm 1 / 2); slab: over the pseudo-sample shape with mean 0 / rstd 1, then the slabs' rstd */
+static void gn_silu_bwd_b(unet *u, const block *b, int k, const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean,
+                          const float *rstd, const float *gy, float *gx, float *gg, float *gb, float *scratch) {
+    if (!l0_slab_on(u, b) || !nn_storage(x)) { if (l0_slab_on(u, b)) l0s_check(u, x); nn_gn_silu_bwd(x, s, G, gamma, beta, mean, rstd, gy, gx, gg, gb, scratch); return; }
+    const shape5 ps = l0s_shape(u, b);
+    if (!nn_storage(gx)) { fprintf(stderr, "unet: --l0-norm slab: MX gradients only\n"); abort(); }
+    nn_gn_silu_bwd(x, ps, G, gamma, beta, u->l0s_st + 8 * u->l0s_nng, u->l0s_st + 9 * u->l0s_nng, gy, gx, gg, gb, scratch);
+    nn_l0_affine(gx, ps, G, nullptr, l0s_stat(u, b, k, 1), (u->l0s_seed[2 * l0_blk(u, b) + k - 1] * 0x2545f491u) | 1u);
+}
+static void gn_bwd_b(unet *u, const block *b, int k, const float *x, shape5 s, int G, const float *gamma, const float *mean, const float *rstd,
+                     const float *gy, float *gx, float *gg, float *gb, float *scratch) {
+    if (!l0_slab_on(u, b)) { nn_gn_bwd(x, s, G, gamma, mean, rstd, gy, gx, gg, gb, scratch); return; }
+    const shape5 ps = l0s_shape(u, b); const int S = u->cfg.l0_slab; const size_t n = shape_numel(s);
+    float *t0 = u->l0s_tmp, *t1 = t0 + n, *t2 = t1 + n, *one = u->l0s_st + 10 * u->l0s_nng, *zero = one + u->cfg.widths[0];
+    nn_slab_perm(t0, x, s, S, 0); nn_slab_perm(t1, gy, s, S, 0);
+    nn_gn_bwd(t0, ps, G, gamma, u->l0s_st + 8 * u->l0s_nng, u->l0s_st + 9 * u->l0s_nng, t1, t2, gg, gb, scratch);
+    nn_gn_apply(t2, ps, G, one, zero, u->l0s_st + 8 * u->l0s_nng, l0s_stat(u, (block *)b, k, 1), t2);   /* d/dx = rstd(slab) d/dx' */
+    nn_slab_perm(gx, t2, s, S, 1);
+}
 static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *gx2, int pre, const float *gid, float *save);
 static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx2, int pre, const float *gid, float *save) {
-    nn_set_gn_const(l0_fixed(u, b));   /* constant level-0 statistics: no mean / variance terms in the block's GroupNorm backwards */
+    nn_set_gn_const(l0_fixed(u, b) && u->cfg.l0_norm != 4);   /* constant level-0 statistics: no mean / variance terms in the block's GroupNorm
+                                                              backwards (slab: the slabs' terms, gn_silu_bwd_b) */
     float *r = block_bwd_(u, b, level, gy, gx2, pre, gid, save);
     nn_set_gn_const(0);
     return r;
@@ -1973,6 +2046,7 @@ static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *g
         if (b->xb) r = dec_conv1(u, b, level, b->a1, G, nullptr, nullptr, nullptr, nullptr, nullptr);
         else { nn_gn_t gi = gn_in(u, b); PROF(0, r = nn_conv3d_fwd_x(b->in, gi.G ? &gi : nullptr, nullptr, nullptr, 0, 0, b->xs, P(u, b->c1.w), B1(u, b), b->c1.cout, 3, 1, b->a1, G, 0.f, nullptr, nullptr)); }
         if (r) rc_fail("conv1 recompute");
+        l0_slab_fwd(u, b, 1, b->a1, 0);   /* (slab: normalised as in the forward) */
         FQ(b->a1, b->ys);
         sp_halo(u, b->a1, b->ys, 0);
     }
@@ -1980,17 +2054,17 @@ static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *g
     if (nn_get_tf32() && b->single) {   /* one conv: A = d/d a2 (conv1's output) */
         if (pre || gid || save) { fprintf(stderr, "unet: a one-conv decoder block takes no residual gradient\n"); abort(); }
         sp_zero(u, gy, b->ys, 1);
-        PROF(3, nn_gn_silu_bwd(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, A, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));
+        PROF(3, gn_silu_bwd_b(u, b, 2, b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, A, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));
         FQG(A, b->ys);
         sp_zero(u, A, b->ys, 1);
         sp_begin(u, A, b->ys, 1);
     } else if (!nn_get_tf32() && b->single) {
         PROF(3, nn_gn_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, t1));            /* t1 = g2 */
         PROF(4, nn_silu_bwd(t1, gy, n, B));                                                                        /* B = d/d g2 */
-        PROF(3, nn_gn_bwd(b->a2, b->ys, G, P(u, b->n2.gamma), b->m2, b->r2, B, A, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* A = d/d a2 */
+        PROF(3, gn_bwd_b(u, b, 2, b->a2, b->ys, G, P(u, b->n2.gamma), b->m2, b->r2, B, A, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* A = d/d a2 */
     } else if (nn_get_tf32()) {   /* fused: no materialised gn / silu activations */
         sp_zero(u, gy, b->ys, 1);   /* split: only owned voxels enter the reductions below */
-        if (!pre) PROF(3, nn_gn_silu_bwd(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* B = d/d a2 */
+        if (!pre) PROF(3, gn_silu_bwd_b(u, b, 2, b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* B = d/d a2 */
         if (gid) nn_add_into(B, gid, b->ys, GBF);
         if (save) nn_d2d(save, B, gbytes);
         if (b == &u->enc[0] && u->a0_share && u->xin_shared && !u->l3b) {   /* a2 read for the last time: the input into its buffer for conv1's weight gradient */
@@ -2032,14 +2106,14 @@ static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *g
         }
         FQG(A, b->ys);
         sp_zero(u, A, b->ys, 1);
-        PROF(3, nn_gn_silu_bwd(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, A, A, g + b->n1.gamma, g + b->n1.beta, u->gn_scratch));    /* A = d/d a1 (in place) */
+        PROF(3, gn_silu_bwd_b(u, b, 1, b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, A, A, g + b->n1.gamma, g + b->n1.beta, u->gn_scratch));    /* A = d/d a1 (in place) */
         FQG(A, b->ys);
         sp_zero(u, A, b->ys, 1);
         if (b != &u->enc[0]) sp_begin(u, A, b->ys, 1);   /* for conv1's backward-data (enc0 has none) */
     } else {
     PROF(3, nn_gn_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, t1));            /* t1 = g2 */
     PROF(4, nn_silu_bwd(t1, gy, n, A));                                                                        /* A = d/d g2 */
-    PROF(3, nn_gn_bwd(b->a2, b->ys, G, P(u, b->n2.gamma), b->m2, b->r2, A, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* B = d/d a2 */
+    PROF(3, gn_bwd_b(u, b, 2, b->a2, b->ys, G, P(u, b->n2.gamma), b->m2, b->r2, A, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* B = d/d a2 */
     if (gid) nn_add_into(B, gid, b->ys, GBF);
     if (save) nn_d2d(save, B, gbytes);
     PROF(3, nn_gn_apply(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, t1));            /* t1 = g1 */
@@ -2047,7 +2121,7 @@ static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *g
     PROF(2, nn_conv3d_bwd_weight(t2, b->ys, B, b->ys, 3, 1, g + b->c2.w, g + b->c2.b));
     PROF(1, nn_conv3d_bwd_data(B, b->ys, P(u, b->c2.w), b->ys, 3, 1, A, u->conv_scratch));                    /* A = d/d s1 */
     PROF(4, nn_silu_bwd(t1, A, n, B));                                                                         /* B = d/d g1 */
-    PROF(3, nn_gn_bwd(b->a1, b->ys, G, P(u, b->n1.gamma), b->m1, b->r1, B, A, g + b->n1.gamma, g + b->n1.beta, u->gn_scratch));   /* A = d/d a1 */
+    PROF(3, gn_bwd_b(u, b, 1, b->a1, b->ys, G, P(u, b->n1.gamma), b->m1, b->r1, B, A, g + b->n1.gamma, g + b->n1.beta, u->gn_scratch));   /* A = d/d a1 */
     }
     nn_set_conv(0);
     if (b->xb) {   /* recompute: weight gradient with the upsampled part rebuilt into B (free until backward-data below) */
@@ -2711,6 +2785,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.half_res) fprintf(f, ",\"half_res\":%d", u->cfg.half_res);
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
     if (u->cfg.l0_norm) fprintf(f, ",\"l0_norm\":%d", u->cfg.l0_norm);
+    if (u->cfg.l0_norm == 4) fprintf(f, ",\"l0_slab\":%d", u->cfg.l0_slab);
     if (u->cfg.l0_norm == 2) {   /* the running statistics (live weights, EMA weights; l0_site order, [mean G | var G] each) and their state */
         const int n = 16 * G_of(u, u->cfg.widths[0]); float *r = malloc((size_t)n * 4); nn_d2h(r, u->l0run, (size_t)n * 4);
         fprintf(f, ",\"l0_n\":%ld,\"l0_warm\":%d,\"l0_mom\":%.9g,\"l0_run\":[", u->l0_n, u->l0_warm, u->l0_mom);
@@ -2758,6 +2833,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"wq\":"))) g_loaded_wq = atoi(p + 5);
     if ((p = strstr(line, "\"muon_mom\":"))) g_loaded_muon = atoi(p + 11);
     if ((p = strstr(line, "\"l0_norm\":"))) cfg->l0_norm = atoi(p + 10);
+    if ((p = strstr(line, "\"l0_slab\":"))) cfg->l0_slab = atoi(p + 10);
     g_loaded_l0_cnt = 0;
     if ((p = strstr(line, "\"l0_n\":"))) g_loaded_l0_n = atol(p + 7);
     if ((p = strstr(line, "\"l0_warm\":"))) g_loaded_l0_warm = atoi(p + 10);
