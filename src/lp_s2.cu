@@ -826,6 +826,8 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
         constexpr int GB = MX_BITS(TG), GRB = BMo * GB / 8, GCB = GRB >= 16 ? 16 : 8;   /* gy bits (MX-fp8 or MX-fp4 gradients), raw row bytes, copy chunk */
         const uint8_t *gq = (const uint8_t *)gy, *gqs = gq + (size_t)N * mx_nb(Co) * Sg * mx_rb(gbw, GB);
         const int rrb = mx_rb(gbw, GB) < GRB ? mx_rb(gbw, GB) : GRB;   /* the stored row's bytes in the slot (one 8-channel block: 4 / 8, the rest zero) */
+        const bool gs4 = (Wo & 3) == 0;
+        unsigned gsr = 0u;   /* !gs4: this thread's gy scale byte of the next z-step (gscl[tid]) */
         auto gload = [&](int oz0) {   /* cp.async: voxel i = row 16 + xx of the z-step (row = vz 8 + vy) */
             if (rrb < GRB) for (int k = tid; k < 256 * (GRB / 4); k += 288) {   /* narrow rows: 4-byte copies, zero past the row */
                 const int i = k / (GRB / 4), h = k % (GRB / 4), row = i >> 4, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + (i & 15);
@@ -837,10 +839,14 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
                 const bool ok = oz < Do && oy < Ho && ox < Wo;
                 cp_async<GCB>(graw + i * GRB + GCB * h, ok ? gq + (gri + ((size_t)oz * Ho + oy) * Wo + ox) * mx_rb(gbw, GB) + (co0 % gbw) * GB / 8 + GCB * h : gq, ok);
             }
-            if (tid < 64) {   /* scale bytes, 4 voxels per copy (host: Wo % 4 == 0) */
+            if (gs4) { if (tid < 64) {   /* scale bytes, 4 voxels per copy (Wo % 4 == 0) */
                 const int row = tid >> 2, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + 4 * (tid & 3);
                 const bool ok = oz < Do && oy < Ho && ox < Wo;
                 cp_async<4>(gscl + 4 * tid, ok ? gqs + gri + ((size_t)oz * Ho + oy) * Wo + ox : gqs, ok);
+            } }
+            else if (tid < 256) {   /* any Wo (the coarsest level of P 640: 10): a byte per thread into a register, stored after the wait */
+                const int row = tid >> 4, oz = oz0 + (row >> 3), oy = oy0 + (row & 7), ox = ox0 + (tid & 15);
+                gsr = oz < Do && oy < Ho && ox < Wo ? __ldg(gqs + gri + ((size_t)oz * Ho + oy) * Wo + ox) : 0u;
             }
             asm volatile("cp.async.commit_group;\n" ::: "memory");
         };
@@ -901,6 +907,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
             if (threadIdx.x == 0) t1 = clock64();
 #endif
             asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+            if (!gs4 && tid < 256) gscl[tid] = (uint8_t)gsr;
             __syncthreads();   /* graw has landed */
             gstage();
             if (zt + 1 < zt_end) xload1(xra, xsa, gz1 + 4);
@@ -1094,14 +1101,14 @@ template <int MT, int NT, typename T, typename TG> static void launch_bws2(dim3 
     static int fast_env = -1;
     if (fast_env < 0) fast_env = getenv("UFSM_S2W_FAST") ? atoi(getenv("UFSM_S2W_FAST")) : 1;
     if constexpr (NT == 1 && IS_MX(T) && IS_MX(TG)) {   /* conv_bwd_w_s2_f8_k's FAST path (x: one 8-channel block row per voxel; MX-fp8 or MX-fp4 gy) */
-        if (fast_env && x && (16 * MT <= mx_bw(ys.c) || (ys.c <= mx_bw(ys.c) && mx_bw(ys.c) < 16 * MT)) && ys.w % 4 == 0) {
+        if (fast_env && x && (16 * MT <= mx_bw(ys.c) || (ys.c <= mx_bw(ys.c) && mx_bw(ys.c) < 16 * MT)) && (ys.w % 4 == 0 || IS_MX4(TG))) {   /* MX-fp4 gy: any Wo */
             if (!attr[cur_dev_()][1]) { attr[cur_dev_()][1] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_s2_f8_k<MT, NT, T, TG, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
             smem += 16 + 256 * 16 * MT + 256;   /* raw gy rows and scales */
             conv_bwd_w_s2_f8_k<MT, NT, T, TG, true><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, ys.d, ys.h, ys.w, ZC, gp);
             return;
         }
     }
-    if constexpr (IS_MX4(TG)) { fprintf(stderr, "lp_bwd_w_s2_f8: MX-fp4 gradients only on the FAST path (MX x, Wo %% 4 == 0): x %s, %d -> %d channels, out %dx%dx%d, MT %d\n",
+    if constexpr (IS_MX4(TG)) { fprintf(stderr, "lp_bwd_w_s2_f8: MX-fp4 gradients only on the FAST path (MX x): x %s, %d -> %d channels, out %dx%dx%d, MT %d\n",
                                         x ? "set" : "null", xs.c, ys.c, ys.d, ys.h, ys.w, MT); abort(); }
     else {
     if (!attr[cur_dev_()][0]) { attr[cur_dev_()][0] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_s2_f8_k<MT, NT, T, TG>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }

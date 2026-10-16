@@ -279,9 +279,12 @@ int main(void) {
             if (!ok) bad++;
         }
     }
-    for (int which = 0; which < 2; which++) {   /* fp8 weight gradients reading gy: the stem 4 -> 32 and the stride-2 down conv 32 -> 32 */
+    for (int w3 = 0; w3 < 3; w3++) {   /* fp8 weight gradients reading gy: the stem 4 -> 32 and the stride-2 down conv 32 -> 32 (2: output width 10, the
+                                          gy scales without 4-voxel copies, against the per-element path MX-fp8 gy takes there) */
+        const int which = w3 > 0;
         const int ci = which ? 32 : 4, co = 32, Pf = 32;
         shape5 xs = {1, ci, Pf, Pf, Pf}, ys = {1, co, which ? Pf / 2 : Pf, which ? Pf / 2 : Pf, which ? Pf / 2 : Pf};
+        if (w3 == 2) { xs = (shape5){1, ci, 20, 24, 20}; ys = (shape5){1, co, 10, 12, 10}; }
         size_t nx = shape_numel(xs), ny = shape_numel(ys), nw = (size_t)co * ci * 27;
         float *x = dev_rand_wide(nx, 2.f), *gy = dev_rand_wide(ny, 1e-3f);
         size_t bx = which ? nn_mx4_bytes(xs) : nn_mx8_bytes(xs); void *xm = nn_malloc(bx); nn_set_storage(xm, bx, which ? 4 : 8);
@@ -295,7 +298,7 @@ int main(void) {
         const double d = relerr(gw4, gw8, nw), db = relerr(gb4, gb8, co);
         float hg[4]; nn_d2h(hg, gw4, 16);
         const int ok = d < 1e-6 && db < 1e-5 && (hg[0] != 0.f || hg[1] != 0.f || hg[2] != 0.f || hg[3] != 0.f);
-        printf("  %-46s gw fp4 vs fp8 gy %.3g, bias %.3g%s\n", which ? "wgrad s2 32 -> 32, gy MX-fp4 (FAST)" : "wgrad stem 4 -> 32, gy MX-fp4 (FAST)", d, db, ok ? "" : "  FAIL");
+        printf("  %-46s gw fp4 vs fp8 gy %.3g, bias %.3g%s\n", w3 == 2 ? "wgrad s2 32 -> 32 Wo 10, gy MX-fp4 (FAST)" : which ? "wgrad s2 32 -> 32, gy MX-fp4 (FAST)" : "wgrad stem 4 -> 32, gy MX-fp4 (FAST)", d, db, ok ? "" : "  FAIL");
         if (!ok) bad++;
     }
     for (int C = 8; C <= 96; C += C <= 16 ? C : 32) for (int accum = 0; accum < 2; accum++) {   /* stride-2 backward-data, MX-fp4 gy / gx (tensor cores; 96: the dilated fp8 path via MX-fp8 copies) */
@@ -339,6 +342,22 @@ int main(void) {
         }
         char nm[96]; snprintf(nm, sizeof nm, "up2 bwd %d ch MX-fp4", C);
         report(nm, relerr(one, gxr, nc), relerr(acc, gxr, nc), K, 0.35);
+    }
+    {   /* odd coarse width (P 704's coarsest: 11): a whole-block MX-fp4 slice of a wider gx (the chunked up-part gradient), per voxel */
+        shape5 cs = {1, 32, 5, 6, 7}, fs = {1, 32, 10, 12, 14}, cw = {1, 64, 5, 6, 7};
+        size_t nc = shape_numel(cs), nf = shape_numel(fs), S = shape_spatial(cs);
+        float *gy = dev_rand_wide(nf, 1e-3f); void *gym = mx4_from(gy, fs); float *gyd = deq4(gym, fs);
+        float *gxr = dev_zero(nc);
+        mode_ref(); nn_up2_bwd(gyd, cs, gxr);
+        void *gxm = mx4_new(cw); float *acc = dev_zero(nc), *one = dev_zero(nc), *tmp = dev_zero(2 * nc);
+        mode_mx();
+        for (int k = 0; k < K; k++) {
+            lp_up2_bwd_mx_slice(gym, cs, gxm, 64, 32, 4, 4, 0x2545f491u * (unsigned)(k + 1));
+            deq4_into(gxm, cw, tmp);
+            if (!k) nn_d2d(one, tmp + 32 * S, nc * 4);
+            nn_axpy(acc, 1.f / K, tmp + 32 * S, nc);
+        }
+        report("up2 bwd slice 32 of 64 ch MX-fp4, odd width", relerr(one, gxr, nc), relerr(acc, gxr, nc), K, 0.35);
     }
     for (int wc = 0; wc < 3; wc++) {   /* end to end, narrow levels (8 / 16-channel MX-fp4 gradients): parameter gradients vs 16-bit (the mean of K
                                           must approach them), fp16 logits (the level-0 chain engages), fewer training bytes than MX-fp8 */
