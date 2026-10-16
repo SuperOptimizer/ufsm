@@ -910,7 +910,19 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
             for (int x=P&~3;x<P;x++) nrow[x]=g_ntab[rnext(r)&65535];
             if (ap && ap->noise_rho>0) ct_aug_noise_row(ap,nrow,noise_row,noise_plane,P,z,y);
             const size_t k0=((size_t)z*P+y)*P, kb0=((size_t)(z-z0)*P+y)*P;
-            for (int x=0;x<P;x++) nrow[x]=inb[kb0+x]?gain*cvb[kb0+x]+offset+noise*nrow[x]:0.f;   /* (the row in place, then one store pass) */
+            int x=0;   /* (the row in place, then one store pass) */
+#ifdef __AVX2__
+            {
+                const __m256 vg=_mm256_set1_ps(gain),vo=_mm256_set1_ps(offset),vn=_mm256_set1_ps(noise);
+                for (;x+8<=P;x+=8) {
+                    uint64_t ib; memcpy(&ib,inb+kb0+x,8);
+                    const __m256 keep=_mm256_castsi256_ps(_mm256_xor_si256(_mm256_cmpeq_epi32(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128((long long)ib)),_mm256_setzero_si256()),_mm256_set1_epi32(-1)));
+                    const __m256 o=_mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(vg,_mm256_loadu_ps(cvb+kb0+x)),vo),_mm256_mul_ps(vn,_mm256_loadu_ps(nrow+x)));
+                    _mm256_storeu_ps(nrow+x,_mm256_and_ps(o,keep));
+                }
+            }
+#endif
+            for (;x<P;x++) nrow[x]=inb[kb0+x]?gain*cvb[kb0+x]+offset+noise*nrow[x]:0.f;
             if (xfmt==1) f16_row(nrow,H+k0,P);
             else if (xfmt==2) for (int x=0;x<P;x++) H[k0+x]=bf16_rn(nrow[x]);
             else memcpy(X+k0,nrow,(size_t)P*sizeof *X);
@@ -1349,7 +1361,25 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (s->tgt_side[ch]) {   /* side labels (band.h RV_*) -> channel 0 recto-side papyrus, channel 1 verso-side papyrus (clean CT >= the
                                         source's cutoff); void 0 in both; papyrus of unknown side ignored in both; CT 0 masked below */
                 uint8_t *vs = ttmp + (size_t)CH_SHEET * p3; int any = 0;
-                for (size_t k = 0; k < p3; k++) {
+                size_t k0 = 0;
+#ifdef __AVX2__
+                {   /* 32 voxels at a time: the same codes (CT below the cutoff first, then recto, then verso, else ignored) */
+                    const __m256i t1 = _mm256_set1_epi8((char)(iso_t > 0 && iso_t <= 256 ? iso_t - 1 : 0)), rc = _mm256_set1_epi8(RV_RECTO), vc = _mm256_set1_epi8(RV_VERSO),
+                                  c254 = _mm256_set1_epi8((char)254), c255 = _mm256_set1_epi8((char)255), z = _mm256_setzero_si256();
+                    __m256i anyv = z;
+                    for (; k0 + 32 <= p3; k0 += 32) {
+                        const __m256i cv = _mm256_loadu_si256((const __m256i *)(ctu + k0)), sv = _mm256_loadu_si256((const __m256i *)(dst + k0));
+                        const __m256i lt = iso_t <= 0 ? z : iso_t > 256 ? c255 : _mm256_cmpeq_epi8(_mm256_min_epu8(cv, t1), cv);   /* ctu < iso_t */
+                        const __m256i re = _mm256_cmpeq_epi8(sv, rc), ve = _mm256_cmpeq_epi8(sv, vc);
+                        const __m256i d = _mm256_blendv_epi8(_mm256_blendv_epi8(_mm256_blendv_epi8(c255, z, ve), c254, re), z, lt);
+                        const __m256i v = _mm256_blendv_epi8(_mm256_blendv_epi8(_mm256_blendv_epi8(c255, c254, ve), z, re), z, lt);
+                        anyv = _mm256_or_si256(anyv, _mm256_andnot_si256(lt, _mm256_or_si256(re, ve)));
+                        _mm256_storeu_si256((__m256i *)(dst + k0), d); _mm256_storeu_si256((__m256i *)(vs + k0), v);
+                    }
+                    any = _mm256_movemask_epi8(anyv) != 0;
+                }
+#endif
+                for (size_t k = k0; k < p3; k++) {
                     const uint8_t sv = dst[k];
                     if (ctu[k] < iso_t) dst[k] = vs[k] = 0;
                     else if (sv == RV_RECTO) { dst[k] = 254; vs[k] = 0; any = 1; }
@@ -1384,8 +1414,15 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             for (size_t k = 0; k < p3; k++) if (dst[k] && dst[k] != 255 && dpap[k] > lr) dst[k] = 255;
         }
         if (w[ch] && !c->cover) {   /* largest known target value (only the empty-patch rejection reads it) */
-            uint8_t mx = 0;
-            for (size_t k = 0; k < p3; k++) { const uint8_t v = dst[k] == 255 ? 0 : dst[k]; mx = v > mx ? v : mx; }
+            uint8_t mx = 0; size_t k0 = 0;
+#ifdef __AVX2__
+            {   /* (an integer maximum: any order) */
+                const __m256i c255 = _mm256_set1_epi8((char)255); __m256i m = _mm256_setzero_si256();
+                for (; k0 + 32 <= p3; k0 += 32) { const __m256i d = _mm256_loadu_si256((const __m256i *)(dst + k0)); m = _mm256_max_epu8(m, _mm256_andnot_si256(_mm256_cmpeq_epi8(d, c255), d)); }
+                uint8_t mb[32]; _mm256_storeu_si256((__m256i *)mb, m); for (int j = 0; j < 32; j++) mx = mb[j] > mx ? mb[j] : mx;
+            }
+#endif
+            for (size_t k = k0; k < p3; k++) { const uint8_t v = dst[k] == 255 ? 0 : dst[k]; mx = v > mx ? v : mx; }
             if (mx > tmax) tmax = mx;
         }
     }
