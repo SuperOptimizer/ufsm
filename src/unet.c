@@ -612,7 +612,7 @@ static void free_acts(unet *u) {
     }
     if (u->l0r_hsk) { nn_sync(); nn_host_free(u->l0r_hsk); u->l0r_hsk = nullptr; u->l0r_hskn = 0; }
     if (u->l0ring) {   /* (stage S4: built here, unlike the lazy stream buffers of S3) */
-        float *q[3] = {u->l0st_g2, u->l0st_up, u->l0r_ups};
+        float *q[3] = {u->l0st_g2, u->l0st_up, u->l0r_upsn ? u->l0r_ups : nullptr};   /* (l0r_upsn 0: gout[1]'s, freed with it) */
         free_once(q, 3);
         u->l0st_g2 = u->l0st_up = u->l0r_ups = nullptr; u->l0st_g2n = u->l0st_upn = u->l0r_upsn = 0;
         u->l0ring = 0;
@@ -681,7 +681,7 @@ static int l0ring_req(void) { if (g_l0ring < 0) { const char *e = getenv("UFSM_L
 static int l0ring_R(int k) {
     static int R[10] = {0}, R10 = 1; static int set = 0;
     if (!set) {
-        const int def[11] = {3, 5, 3, 2, 3, 4, 3, 3, 2, 3, 1};
+        const int def[11] = {3, 5, 3, 1, 3, 3, 3, 3, 1, 3, 1};   /* (the shortest that keep the bits: test_l0_stream with each one shorter fails) */
         for (int i = 0; i < 10; i++) R[i] = def[i];
         R10 = def[10];
         const char *e = getenv("UFSM_L0_RING_R");   /* "a,b,c,...": overrides in index order (the test's too-short controls) */
@@ -1167,8 +1167,9 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 u->l0st_g2 = dalloc_ring(u, a0, grad_dt(), l0ring_R(4), 1); u->l0st_g2n = nn_mx_bytes(a0, grad_dt());
                 u->l0st_up = dalloc_ring(u, b0, act_dt(), l0ring_R(7), 0); u->l0st_upn = act_bytes_of(b0);
                 const block *xb = L == 2 ? stage_out(u, L - 1) : &u->dec[1];   /* (dec[0].xb as the forward sets it) */
-                g_mlab = "level-1 up source (stage S4)";
-                u->l0r_ups = dalloc_act_s(u, xb->ys); u->l0r_upsn = act_bytes_of(xb->ys);
+                if (act_dt() == grad_dt() && u->gout_cap[1] >= act_bytes_of(xb->ys)) { u->l0r_ups = u->gout[1]; u->l0r_upsn = 0; }   /* (gout[1]: free until B1's
+                    upsample backward writes it, top down behind the up windows' reads; one storage type: no re-registration) */
+                else { g_mlab = "level-1 up source (stage S4)"; u->l0r_ups = dalloc_act_s(u, xb->ys); u->l0r_upsn = act_bytes_of(xb->ys); }
                 g_mlab = "gradient buffers gout / gskip (per level)";
             }
             for (int i = 0; i < L; i++) if (u->cfg.enc_blocks[i] > 0) {   /* residual blocks: the identity gradient of the stream */
@@ -2760,7 +2761,7 @@ static void l0st_up_ring(unet *u, block *b, float *up, int s, l0op *o, l0op *nex
     if (o->k < 0) {
         const nn_gn_t g = gn_out(u, xb);
         l0op_go(o);
-        nn_set_storage(u->l0r_ups, u->l0r_upsn, act_dt());
+        if (u->l0r_upsn) nn_set_storage(u->l0r_ups, u->l0r_upsn, act_dt());   /* (else gout[1], registered as the same type) */
         PROF(3, nn_gn_silu_apply(xb->a2, xb->ys, g.G, g.gamma, g.beta, g.mean, g.rstd, u->l0r_ups));
         *kap = nn_sr_ctr() - o->c;
         *lo = ns;
