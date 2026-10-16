@@ -91,11 +91,20 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, 
    raw-word prefetch: accumulates sum t and sum t (x - mean) with t = gy (2 dsilu(u)) and finishes with the factors 1/2 and
    rstd / 2, so part[] holds the same sums (sum a, sum a xhat) as gn_silu_bwd_stats_mx_k. The generic kernel loaded six
    coefficients and decoded through per-element guards (issue-bound, ~2x its traffic floor). */
+
+/* the z-window (nn_set_zwin) as a range of (pseudo-)samples [n0, n0 + cnt): slab-local GroupNorm's backward runs on the [slabs] shape
+   of one real sample (slab = sample), so a window of whole slabs is a sample range; the whole tensor without a window */
+static void gn_nwin(shape5 s, int *n0, int *cnt) {
+    int a, b; *n0 = 0; *cnt = s.n;
+    if (!zw_win(s.n * s.d, &a, &b)) return;
+    if (a % s.d || (b % s.d && b != s.n * s.d)) { fprintf(stderr, "gn backward: z-window [%d, %d) is not whole slabs of %d planes\n", a, b, s.d); abort(); }
+    *n0 = a / s.d; *cnt = (b + s.d - 1) / s.d - *n0;
+}
 template <int B, int HPB, bool FULL, int NK = 16>   /* NK: the channels of a FULL lane (16, or 8: a whole 8-channel tensor) */
 __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_k(const uint8_t *x, const uint8_t *gy, const float *gamma, const float *beta, const float *mean, const float *rstd,
-                                                            int N, int C, int G, size_t S, float *part) {
+                                                            int N, int C, int G, size_t S, float *part, int n0 = 0) {   /* n0: first (pseudo-)sample (z-window) */
     const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G;
-    const int blk = blockIdx.y, n = blockIdx.z, nsl = gridDim.x;
+    const int blk = blockIdx.y, n = n0 + (int)blockIdx.z, nsl = gridDim.x;
     const int h = HPB == 2 ? (int)(threadIdx.x & 1) : 0, h0 = 16 * h, tv = (int)threadIdx.x / HPB, nt = 256 / HPB;
     const size_t q0 = S * blockIdx.x / nsl, q1 = S * (blockIdx.x + 1) / nsl;
     __shared__ float4 cf[32];
@@ -244,8 +253,8 @@ __device__ __forceinline__ unsigned sr_e2m1_nib_fast(float vm, unsigned u16) {  
 }
 template <int B, int HPB, bool FULL, int NK = 16>   /* NK: the channels of a FULL lane (16, or 8: a whole 8-channel tensor) */
 __global__ void __launch_bounds__(256, 5) gn_silu_bwd_apply_mx2_k(const uint8_t *x, const uint8_t *gy, const float *gamma, const float *beta, const float *mean, const float *rstd,
-                                                            const float *AB, uint8_t *gx, int N, int C, int G, size_t S, unsigned gsr) {
-    const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G, blk = blockIdx.y, n = blockIdx.z;
+                                                            const float *AB, uint8_t *gx, int N, int C, int G, size_t S, unsigned gsr, int n0 = 0) {
+    const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G, blk = blockIdx.y, n = n0 + (int)blockIdx.z;
     __shared__ float4 cf[32];
     if (threadIdx.x < 32) {
         const int k = threadIdx.x, c = blk * bw + k;
@@ -380,9 +389,9 @@ template <int CI> __device__ __forceinline__ void head_sw(float *sw, const float
 }
 template <int CI, bool FULL, bool EX>
 __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_hg_k(const uint8_t *x, const __half *gl, const float *wh, unsigned hs, const float *gamma, const float *beta,
-                                                               const float *mean, const float *rstd, int N, int C, int G, size_t S, float *part, int ns) {
+                                                               const float *mean, const float *rstd, int N, int C, int G, size_t S, float *part, int ns, int n0 = 0) {
     const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G;
-    const int blk = blockIdx.y, n = blockIdx.z, nsl = gridDim.x;
+    const int blk = blockIdx.y, n = n0 + (int)blockIdx.z, nsl = gridDim.x;
     const int h0 = 0, tv = (int)threadIdx.x, nt = 256;
     const size_t q0 = S * blockIdx.x / nsl, q1 = S * (blockIdx.x + 1) / nsl;
     __shared__ float4 cf[32];
@@ -454,8 +463,8 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_hg_k(const uint8_t 
 }
 template <int CI, bool FULL, bool EX>
 __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_hg_k(uint8_t *x, const __half *gl, const float *wh, unsigned hs, const float *gamma, const float *beta,
-                                                               const float *mean, const float *rstd, const float *AB, int N, int C, int G, size_t S, unsigned gsr, int ns) {
-    const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G, blk = blockIdx.y, n = blockIdx.z;
+                                                               const float *mean, const float *rstd, const float *AB, int N, int C, int G, size_t S, unsigned gsr, int ns, int n0 = 0) {
+    const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G, blk = blockIdx.y, n = n0 + (int)blockIdx.z;
     __shared__ float4 cf[32];
     __shared__ float sw[16 * CI];
     if (threadIdx.x < 32) {
@@ -685,20 +694,25 @@ extern "C" void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const
     if (slabs < want) slabs = want;
     if (slabs > maxs) slabs = maxs;
     if (slabs > 1024) slabs = 1024;
-    const dim3 grid((unsigned)slabs, (unsigned)nb, (unsigned)s.n);
+    int n0, cnt; gn_nwin(s, &n0, &cnt);   /* z-window: its slabs (the other rows' partial sums zero) */
+    const dim3 grid((unsigned)slabs, (unsigned)nb, (unsigned)cnt);
     float *part = lp_buf<float>(5, slabs * 2 * NC);
     if (s.c > 1024) { fprintf(stderr, "lp_gn_silu_bwd_mx: C %d > 1024\n", s.c); abort(); }
+    if (cnt < s.n) {
+        if (gdt != 4) { fprintf(stderr, "lp_gn_silu_bwd_mx: the z-window needs MX-fp4 gradients\n"); abort(); }
+        cudaMemsetAsync(part, 0, slabs * 2 * NC * sizeof(float));
+    }
     cudaMemsetAsync(ds, 0, (size_t)2 * NC * sizeof(double));
     const uint8_t *xq = (const uint8_t *)x;
     static int s2on = -1; if (s2on < 0) s2on = getenv("UFSM_GN_APPLY2") ? atoi(getenv("UFSM_GN_APPLY2")) : 1;
     if (s2on && gdt == 4) {   /* MX-fp4 gradients: lane-pair kernel */
         const int full = bw >= 16 && s.c % bw == 0, full8 = bw == 8 && s.c == 8 && g_gn_full8 != 0;
         const uint8_t *gyq = (const uint8_t *)gy;
-#define GBS3(B) do { if (bw == 32 && full) gn_silu_bwd_stats_mx2_k<B, 2, true><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
-                     else if (bw == 32) gn_silu_bwd_stats_mx2_k<B, 2, false><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
-                     else if (full) gn_silu_bwd_stats_mx2_k<B, 1, true><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
-                     else if (full8) gn_silu_bwd_stats_mx2_k<B, 1, true, 8><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
-                     else gn_silu_bwd_stats_mx2_k<B, 1, false><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part); } while (0)
+#define GBS3(B) do { if (bw == 32 && full) gn_silu_bwd_stats_mx2_k<B, 2, true><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part, n0); \
+                     else if (bw == 32) gn_silu_bwd_stats_mx2_k<B, 2, false><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part, n0); \
+                     else if (full) gn_silu_bwd_stats_mx2_k<B, 1, true><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part, n0); \
+                     else if (full8) gn_silu_bwd_stats_mx2_k<B, 1, true, 8><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part, n0); \
+                     else gn_silu_bwd_stats_mx2_k<B, 1, false><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part, n0); } while (0)
         if (xdt == 4) GBS3(4); else GBS3(8);
 #undef GBS3
         gn_part_sum_k<<<nblk_((size_t)2 * NC * 32, 256), 256>>>(part, (int)slabs, NC, ds);
@@ -745,8 +759,9 @@ template <int B, int HPB, bool FULL, int NK = 16>
 static void gba2(const uint8_t *xq, const uint8_t *gyq, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *AB, uint8_t *gq,
                  shape5 s, int G, unsigned gsr) {
     const size_t S = shape_spatial(s);
-    const dim3 g2(gn_pgrid((const void *)gn_silu_bwd_apply_mx2_k<B, HPB, FULL, NK>, (S * HPB + 255) / 256, (size_t)mx_nb(s.c) * s.n), (unsigned)mx_nb(s.c), (unsigned)s.n);
-    gn_silu_bwd_apply_mx2_k<B, HPB, FULL, NK><<<g2, 256>>>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s.n, s.c, G, S, gsr);
+    int n0, cnt; gn_nwin(s, &n0, &cnt);
+    const dim3 g2(gn_pgrid((const void *)gn_silu_bwd_apply_mx2_k<B, HPB, FULL, NK>, (S * HPB + 255) / 256, (size_t)mx_nb(s.c) * cnt), (unsigned)mx_nb(s.c), (unsigned)cnt);
+    gn_silu_bwd_apply_mx2_k<B, HPB, FULL, NK><<<g2, 256>>>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s.n, s.c, G, S, gsr, n0);
 }
 extern "C" void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                         const void *gy, void *gx, int gdt, const float *AB, unsigned gsr) {
@@ -802,12 +817,14 @@ extern "C" void lp_gn_silu_bwd_head_stats(const void *x, shape5 s, int G, const 
     if (slabs < want) slabs = want;
     if (slabs > maxs) slabs = maxs;
     if (slabs > 1024) slabs = 1024;
-    const dim3 grid((unsigned)slabs, (unsigned)nb, (unsigned)s.n);
+    int n0, cnt; gn_nwin(s, &n0, &cnt);   /* z-window: its slabs (the other rows' partial sums zero) */
+    const dim3 grid((unsigned)slabs, (unsigned)nb, (unsigned)cnt);
     float *part = lp_buf<float>(5, slabs * 2 * NC);
+    if (cnt < s.n) cudaMemsetAsync(part, 0, slabs * 2 * NC * sizeof(float));
     cudaMemsetAsync(ds, 0, (size_t)2 * NC * sizeof(double));
     const uint8_t *xq = (const uint8_t *)x; const __half *g = (const __half *)gl;
-    if (bw >= 16 && s.c % bw == 0) HGK(gn_silu_bwd_stats_mx2_hg_k, true, grid, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, s.n, s.c, G, S, part, ns));
-    else HGK(gn_silu_bwd_stats_mx2_hg_k, false, grid, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, s.n, s.c, G, S, part, ns));
+    if (bw >= 16 && s.c % bw == 0) HGK(gn_silu_bwd_stats_mx2_hg_k, true, grid, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, s.n, s.c, G, S, part, ns, n0));
+    else HGK(gn_silu_bwd_stats_mx2_hg_k, false, grid, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, s.n, s.c, G, S, part, ns, n0));
     gn_part_sum_k<<<nblk_((size_t)2 * NC * 32, 256), 256>>>(part, (int)slabs, NC, ds);
     LPCK();
 }
@@ -815,8 +832,9 @@ template <int CI, bool F, bool EX>
 static void hga(uint8_t *xq, const __half *g, const float *wh, unsigned hs, const float *gamma, const float *beta, const float *mean, const float *rstd,
                 const float *AB, shape5 s, int G, unsigned gsr, int ns) {
     const size_t S = shape_spatial(s);
-    const dim3 g2((unsigned)((S + 255) / 256), (unsigned)mx_nb(s.c), (unsigned)s.n);   /* a row per thread (a persistent loop hoisted the 48 coefficients: 171 registers, 1.4x slower) */
-    gn_silu_bwd_apply_mx2_hg_k<CI, F, EX><<<g2, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s.n, s.c, G, S, gsr, ns);
+    int n0, cnt; gn_nwin(s, &n0, &cnt);
+    const dim3 g2((unsigned)((S + 255) / 256), (unsigned)mx_nb(s.c), (unsigned)cnt);   /* a row per thread (a persistent loop hoisted the 48 coefficients: 171 registers, 1.4x slower) */
+    gn_silu_bwd_apply_mx2_hg_k<CI, F, EX><<<g2, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s.n, s.c, G, S, gsr, ns, n0);
 }
 extern "C" void lp_gn_silu_bwd_head_apply(void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                           const void *gl, int ci, const float *wh, unsigned hs, const float *AB, unsigned gsr, int ns) {

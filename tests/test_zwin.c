@@ -287,6 +287,43 @@ static void test_s2b(int C, int D, int acc) {
     res_free(&a); nn_free(f.gy); nn_free(f.w); nn_free(f.init); mode_off();
 }
 
+/* slab-local GroupNorm backward (MX-fp4 x and gradients) on the [slabs] pseudo-sample shape of one sample: a window of whole slabs is a
+   range of pseudo-samples; gx bytes, ggamma / gbeta (accumulated over the windows) == one launch. head 1: dec[0]'s variant recomputing
+   gy from the fp16 logit gradient (gx in place over x) */
+typedef struct { shape5 s; int G, head, ns; float *gam, *bet, *mean, *rstd, *wh; void *x0, *gy, *gl; } gnb_t;
+static void gnb_op(void *c, res_t *r) {
+    gnb_t *f = c;
+    float *scr = nn_malloc(nn_gn_scratch(f->s) + 4096);
+    float *gg = r->gw, *gb = r->gw + f->s.c;
+    if (f->head) {
+        if (nn_gn_silu_bwd_head_ns((float *)r->out, f->s, f->G, f->gam, f->bet, f->mean, f->rstd, f->gl, 2, f->wh, 4242u, gg, gb, scr, f->ns) < 0) { printf("  gn bwd head unsupported  FAIL\n"); bad++; }
+    } else nn_gn_silu_bwd((const float *)f->x0, f->s, f->G, f->gam, f->bet, f->mean, f->rstd, (const float *)f->gy, (float *)r->out, gg, gb, scr);
+    nn_free(scr);
+}
+static void test_gnb(int C, int D, int S, int head) {
+    mode_prod();
+    const int ns = D / S, G = C / 4;
+    gnb_t f = {{ns, C, S, 12, 20}, G, head, ns};   /* the pseudo-sample shape of a {1, C, D, 12, 20} tensor */
+    const shape5 real = {1, C, D, 12, 20};
+    float *x = dev_rand(shape_numel(real), 1.5f); f.x0 = mx4_from(x, real); nn_free(x);
+    float *g = dev_rand(shape_numel(real), 1e-2f); f.gy = mx4_from(g, real); nn_free(g);
+    f.gam = dev_rand(C, 1.f); f.bet = dev_rand(C, 0.5f); f.mean = dev_rand(ns * G, 0.2f); f.rstd = dev_rand(ns * G, 0.3f);
+    { float h[256]; nn_d2h(h, f.rstd, ns * G * 4); for (int i = 0; i < ns * G; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(f.rstd, h, ns * G * 4); }
+    f.wh = dev_rand((size_t)2 * C, 0.3f);
+    float *glf = dev_rand((size_t)2 * D * 12 * 20, 1e-2f); f.gl = nn_malloc((size_t)2 * D * 12 * 20 * 2); nn_f32_to_h16(glf, (size_t)2 * D * 12 * 20, f.gl, 1024.f); nn_free(glf);
+    const size_t nb = nn_mx4_bytes(real);
+    res_t a = {"", nb, mx4_new(real), nullptr, 0, nullptr, 0, dev_zero((size_t)2 * C), (size_t)2 * C};
+    if (head) nn_d2d(a.out, f.x0, nb);
+    char m[96]; snprintf(m, sizeof m, "gn bwd%s %2d ch, %d slabs of %d", head ? " (head)" : "", C, ns, S);
+    nn_set_sr_step(91); const unsigned c0 = nn_sr_ctr();
+    run_op(gnb_op, &f, 0, D, D, c0, &a, 1, 1);
+    int z0[64], z1[64]; const int k = windows(D, S, z0, z1);
+    res_t b = res_like(&a, real); if (head) nn_d2d(b.out, f.x0, nb);
+    for (int i = 0; i < k; i++) run_op(gnb_op, &f, z0[i], z1[i], D, c0, &b, i == 0, i == k - 1);
+    cmp(m, S, &a, &b); res_free(&b);
+    res_free(&a); nn_free(f.x0); nn_free(f.gy); nn_free(f.gl); nn_free(f.gam); nn_free(f.bet); nn_free(f.mean); nn_free(f.rstd); nn_free(f.wh); mode_off();
+}
+
 int main(void) {
     setenv("UFSM_F4_WGRAD", "1", 1);   /* the production fp4 weight gradient (train --fp4 2) */
     nn_init(0);
@@ -298,6 +335,7 @@ int main(void) {
         test_wgrad(16, 16, D, 1); test_wgrad(32, 32, D, 1); test_wgrad(4, 16, D, 0);
         test_s2b(16, D, 0); test_s2b(16, D, 1); test_s2b(32, D, 0); test_s2b(32, D, 1);
     }
+    for (int S = 8; S <= 16; S *= 2) { test_gnb(16, 32, S, 0); test_gnb(32, 32, S, 0); test_gnb(16, 32, S, 1); }
     const char *e = nn_check(); if (e) { printf("  CUDA: %s  FAIL\n", e); bad++; }
     printf("test_zwin: %s\n", bad ? "FAIL" : "PASS");
     return bad != 0;
