@@ -942,25 +942,41 @@ template <int BW, int GB = 8> __global__ void __launch_bounds__(256) gy_pre4_k(c
     float bacc[NTASK];
 #pragma unroll
     for (int k = 0; k < NTASK; k++) bacc[k] = 0.f;
-    for (unsigned grp = blockIdx.x; grp < ngrp; grp += gridDim.x) {
-        const int xb = (int)(grp % Wb), ty = (int)((grp / Wb) % TY), zt = (int)(grp / ((unsigned)Wb * TY));
-        const int zz = 2 * zt + (warp >> 2), yp = 4 * ty + (warp & 3), z = z0 + zz;   /* this warp's block: pb = warp */
+    /* the group index in its mixed radix (xb, ty, zt), stepped by the grid with carries (three integer divisions per group), and the
+       64-bit parts of the row, hash-key and record addresses hoisted out of the loop (the launcher keeps Sg < 2^32): the same values */
+    const unsigned gs = gridDim.x, wty = (unsigned)Wb * TY;
+    unsigned xb = blockIdx.x % Wb, ty = (blockIdx.x / Wb) % TY, zt = blockIdx.x / wty;
+    const unsigned dxb = gs % Wb, dty = (gs / Wb) % TY, dzt = gs / wty;
+    const size_t rb0 = ((size_t)n * nb + cb) * Sg;
+    const int f = lane & 3;   /* the 8-value word of each task (task = 32 k + lane) */
+    const unsigned voff = (unsigned)(f >> 1) * W + 8 * (f & 1);
+    uint64_t vch[NTASK]; size_t rch[NTASK];
+#pragma unroll
+    for (int k = 0; k < NTASK; k++) {
+        const int co = cb * BW + ((k * 32 + lane) >> 2);
+        vch[k] = ((uint64_t)n * Co + co) * Sg;
+        rch[k] = ((size_t)n * Co + co) * ZT * TY * Wb * GP4_REC;
+    }
+    for (unsigned grp = blockIdx.x; grp < ngrp; grp += gs) {
+        const int zz = 2 * (int)zt + (warp >> 2), yp = 4 * (int)ty + (warp & 3), z = z0 + zz;   /* this warp's block: pb = warp */
         {
-            const int y = 2 * yp + (lane >> 4), x = 16 * xb + (lane & 15);
+            const int y = 2 * yp + (lane >> 4), x = 16 * (int)xb + (lane & 15);
             float r[32];
 #pragma unroll
             for (int j = 0; j < 32; j++) r[j] = 0.f;
             if (zz < Zs && y < H && x < W) {
-                const size_t ri = ((size_t)n * nb + cb) * Sg + ((size_t)z * H + y) * W + x;
+                const size_t ri = rb0 + ((unsigned)z * H + y) * (unsigned)W + x;
                 mxf<GB>::dec_row(gy + ri * mx_rb(BW, GB), BW, mx_scale(gsc[ri]), r);
             }
 #pragma unroll
             for (int j = 0; j < BW; j++) v[warp][j][lane] = __float2bfloat16_rn(r[j]);
         }
         __syncwarp();
+        const unsigned sp = ((unsigned)z * H + 2 * yp) * (unsigned)W + 16 * xb + voff;   /* the hash key's spatial part */
+        const size_t rg = (((size_t)zt * TY + ty) * Wb + xb) * GP4_REC;
 #pragma unroll
         for (int k = 0; k < NTASK; k++) {
-            const int task = k * 32 + lane, c = task >> 2, f = task & 3, co = cb * BW + c;
+            const int task = k * 32 + lane, c = task >> 2, co = cb * BW + c;
             float q[8];
             {   /* the 8 values as one 16-byte row */
                 const uint4 w8 = *(const uint4 *)&v[warp][c][8 * f];
@@ -975,17 +991,20 @@ template <int BW, int GB = 8> __global__ void __launch_bounds__(256) gy_pre4_k(c
             amu = max(amu, __shfl_xor_sync(0xffffffffu, amu, 1)); amu = max(amu, __shfl_xor_sync(0xffffffffu, amu, 2));
             const int e = mx_exp(__uint_as_float(amu), 1.f / 6.f);
             const float m = exp2i(-e);
-            const uint64_t vid = ((((uint64_t)n * Co + co) * D + z) * H + (2 * yp + (f >> 1))) * (uint64_t)W + 16 * xb + 8 * (f & 1);
+            const uint64_t vid = vch[k] + sp;   /* ((((n Co + co) D + z) H + 2 yp + (f >> 1)) W + 16 xb + 8 (f & 1) */
             uint32_t hh[4];
             sr_hash4(sr, vid, hh);
             const unsigned word = sr_e2m1_word(q, m, hh);
             if (co < Co) {   /* straight to the record (the warp's 16 bytes of channel c, its scale byte): no block gather or barriers */
-                uint8_t *rec = out + ((((size_t)n * Co + co) * ZT + zt) * TY + ty) * Wb * GP4_REC + (size_t)xb * GP4_REC;
+                uint8_t *rec = out + rch[k] + rg;
                 *(unsigned *)(rec + warp * 16 + 4 * f) = word;
                 if (f == 0) rec[128 + warp] = (uint8_t)(e + 127);
             }
         }
         __syncwarp();   /* the warp's tile is rewritten by the next group */
+        xb += dxb; const unsigned cy = xb >= (unsigned)Wb; if (cy) xb -= Wb;   /* grp += gs in the mixed radix */
+        ty += dty + cy; const unsigned cz = ty >= (unsigned)TY; if (cz) ty -= TY;
+        zt += dzt + cz;
     }
     if (gb) {
         __syncthreads();
@@ -1050,6 +1069,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
     if (g_f4w_gy4 && !(IS_MX8(TG) && cap_kb && sp.sr && !had && (lay == 1 || lay == 2) && zc_env <= 0)) { fprintf(stderr, "lp_bwd_w_f4: MX-fp4 gradients need the gy pre-pass (SR on, plain layout)\n"); abort(); }
     if constexpr (IS_MX8(TG)) if (cap_kb && sp.sr && !had && (lay == 1 || lay == 2) && zc_env <= 0) {
         const int Wb = (ys.w + 15) / 16, gbw = mx_bw(ys.c);
+        if ((size_t)ys.d * ys.h * ys.w >= ((size_t)1 << 32)) { fprintf(stderr, "lp_bwd_w_f4: gy pre-pass needs < 2^32 voxels per channel\n"); abort(); }   /* (gy_pre4_k's 32-bit spatial indices) */
         const size_t per_zt = (size_t)ys.n * ys.c * ((ys.h + 7) / 8) * Wb * GP4_REC;   /* one record per (n, co, z-step, 8-row tile, 16-x tile) */
         /* the records of the whole layer from the GN+SiLU backward apply that produced gy (lp_gn_silu_bwd_apply_rec): no pre-pass, one slab */
         const lp_gyrec_t &rc = g_gyrec;   /* this thread's (lp_gn_silu_bwd_apply_rec) */
