@@ -329,9 +329,9 @@ void nn_muon(float *p, const float *g, float *mom, int Co, int K, float lr, floa
 void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta, float wd);
 /* Muon variants over the same table (train --muon-c / --hyperball; see nn_opt.cu). mcd: nullptr (the Muon direction) or a device
    array of nconv {const float *U; float *O; float *EX, *EY; int Co, Ci, k, m, n, tr;} (U = the entry's X, O = its Y; EX, EY:
-   nf 4 m n floats each, nf = 14 for k = 3 (1 for k = 1) frequency blocks, m = min(Co, Ci), n = max(Co, Ci), tr = Co > Ci) with
-   nsd the matching Newton-Schulz table of nconv nf entries, conv-major {.., X = EX + f 4mn, Y = EY + f 4mn, A, B (4 m^2 floats
-   each), Co = 2m, K = 2n}, k the kernel size of every entry (3 or 1), ns_maxm / ns_maxn the largest 2m / 2n. hb: nullptr or
+   nf 2 m n floats each (complex m x n blocks), nf = 14 for k = 3 (1 for k = 1), m = min(Co, Ci), n = max(Co, Ci), tr = Co > Ci)
+   with nsd the matching Newton-Schulz table of nconv nf entries, conv-major {.., X = EX + f 2mn, Y = EY + f 2mn, A, B (2 m^2
+   floats each), Co = m, K = n}, k the kernel size of every entry (3 or 1), ns_maxm / ns_maxn the largest m / n. hb: nullptr or
    nconv device flags (1: the Hyperball step with radius R[i], eta = hb_lr, no decay); r_init: first set R[i] = |W_i|_F where
    R[i] <= 0. part: >= 32 nconv (2 + nf) doubles of scratch. */
 void nn_muon_ext_batch(const void *descs, int nconv, int maxco, int maxk, const void *mcd, const void *nsd, int k, int ns_maxm, int ns_maxn,

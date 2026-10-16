@@ -2464,22 +2464,22 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
         u->mx_hbf = nn_malloc((size_t)n * sizeof(int)); nn_h2d(u->mx_hbf, h.hb, (size_t)n * sizeof(int));
         u->mx_R = nn_malloc((size_t)n * 4); nn_zero(u->mx_R, (size_t)n * 4); u->mx_R_ok = 0;
     }
-    if (u->mx_c && !u->mx_mcd) {   /* Muon-C: per conv its 14 frequency blocks' embeddings, per conv and frequency a Newton-Schulz entry */
+    if (u->mx_c && !u->mx_mcd) {   /* Muon-C: per conv its 14 complex frequency blocks, per conv and frequency a Newton-Schulz entry */
         enum { NF = 14 };
         muonc_desc_t mc[UNET_MAXCONV]; muon_desc_t *ns = calloc((size_t)n * NF, sizeof *ns); size_t pool = 0;
         for (int i = 0; i < n; i++) {
             const muon_desc_t *d = &b->h[i]; const int Ci = d->K / 27, m = d->Co < Ci ? d->Co : Ci, nx = d->Co < Ci ? Ci : d->Co;
             if (Ci * 27 != d->K) { fprintf(stderr, "muon-c: conv %d is not 3^3\n", i); abort(); }
             mc[i] = (muonc_desc_t){.U = nullptr, .O = nullptr, .Co = d->Co, .Ci = Ci, .k = 3, .m = m, .n = nx, .tr = d->Co > Ci};
-            mc[i].EX = (float *)(uintptr_t)pool; pool += (size_t)NF * 4 * m * nx; mc[i].EY = (float *)(uintptr_t)pool; pool += (size_t)NF * 4 * m * nx;
+            mc[i].EX = (float *)(uintptr_t)pool; pool += (size_t)NF * 2 * m * nx; mc[i].EY = (float *)(uintptr_t)pool; pool += (size_t)NF * 2 * m * nx;
             for (int f = 0; f < NF; f++) {
                 muon_desc_t *e = &ns[(size_t)i * NF + f];
-                const uintptr_t fo = (uintptr_t)f * 4 * m * nx;   /* offsets in floats until the pool exists */
-                *e = (muon_desc_t){.X = (float *)((uintptr_t)mc[i].EX + fo), .Y = (float *)((uintptr_t)mc[i].EY + fo), .Co = 2 * m, .K = 2 * nx};
-                e->A = (float *)(uintptr_t)pool; pool += (size_t)4 * m * m; e->B = (float *)(uintptr_t)pool; pool += (size_t)4 * m * m;
+                const uintptr_t fo = (uintptr_t)f * 2 * m * nx;   /* offsets in floats until the pool exists */
+                *e = (muon_desc_t){.X = (float *)((uintptr_t)mc[i].EX + fo), .Y = (float *)((uintptr_t)mc[i].EY + fo), .Co = m, .K = nx};
+                e->A = (float *)(uintptr_t)pool; pool += (size_t)2 * m * m; e->B = (float *)(uintptr_t)pool; pool += (size_t)2 * m * m;
             }
-            if (2 * m > u->mx_ns_maxm) u->mx_ns_maxm = 2 * m;
-            if (2 * nx > u->mx_ns_maxn) u->mx_ns_maxn = 2 * nx;
+            if (m > u->mx_ns_maxm) u->mx_ns_maxm = m;
+            if (nx > u->mx_ns_maxn) u->mx_ns_maxn = nx;
         }
         u->mx_pool = nn_malloc(pool * 4);
         const muon_desc_t *dev = u->muon_descs; muon_desc_t host[UNET_MAXCONV]; nn_d2h(host, dev, sizeof(muon_desc_t) * (size_t)n);

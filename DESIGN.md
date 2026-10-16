@@ -2236,13 +2236,15 @@ parallel (batch 1 each), so the per-GPU limit is the window limit.
     frequency, a bijection on the 27 taps, so the inverse lands exactly on the kernel support); each block is
     polarised on its own by complex Newton-Schulz (5 iterations, Muon's coefficients, X0 = B / (|B|_F + 1e-8), blocks
     with more rows than columns as their conjugate transpose), and the inverse DFT gives a real update. Conjugate
-    symmetry leaves 14 of the 27 frequencies to polarise. A complex block runs as its real embedding [[Xr, -Xi],
-    [Xi, Xr]] through Muon's batched products (exact: a *-homomorphism), every frequency of every conv in one launch per
-    stage (one Newton-Schulz entry per conv and frequency).
+    symmetry leaves 14 of the 27 frequencies to polarise. Blocks are stored as interleaved complex and iterated by complex
+    versions of Muon's tiled products (`gemm_nsc_k`), every frequency of every conv in one launch per stage (one
+    Newton-Schulz entry per conv and frequency).
     Routing as the paper (every kernel larger than 1x1, strided ones included: the stem, the down convs). Scale:
     the paper's matched applied-update RMS against unfolded Muon (the RMS of exact-polar Muon for that conv,
     sqrt(min(Co, K) / (Co K)) for Co <= K), so `--muon-lr` keeps its meaning and the A/B compares geometry only.
-    No new state. Cost: ~6x Muon's orthogonalisation products (embedding doubles both dimensions).
+    No new state. Cost (`bench_muonc`, production net, desk 5060 Ti shared with three P512 trainings): Muon 48 ms per
+    optimizer step, Muon-C 72 ms (the first version, real embedding and one frequency per launch: 145 ms); scratch
+    ~185 MB for 14 complex blocks per conv.
   - Hyperball (Wen, Dang, Lyu, Ma & Liang, arXiv 2606.16899): W <- R Normalize(W - eta R Normalize(u)) with R the
     conv's |W|_F at its first Hyperball step (the initialisation) and u the Muon or Muon-C direction; no weight decay
     on those convs. Applied to the convs whose output goes through a GroupNorm (the paper's scale-invariant
