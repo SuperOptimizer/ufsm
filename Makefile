@@ -139,6 +139,8 @@ $(B)/test_fit: tests/test_fit.c $(B)/fit.o $(B)/json.o $(B)/zarr3.o $(B)/store.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_tiffw: tests/test_tiffw.c $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+$(B)/bench_votes: tests/bench_votes.c src/votes.h $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/bench_votes.c $(B)/zarr3.o $(B)/store.o $(B)/json.o -o $@ $(LDLIBS)
 $(B)/test_volcomp: tests/test_volcomp.c third_party/volcomp.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ -lm
 $(B)/test_edt: tests/test_edt.c $(B)/edt.o
