@@ -664,7 +664,13 @@ template <int MT, int TZ, typename T, typename TO> void launch_f4p(dim3, const v
     const size_t base = (size_t)nblk_(xs.w, 16) * nblk_(xs.h, 8) * nmt * xs.n;
     static int zc_env = -2;
     if (zc_env == -2) zc_env = getenv("UFSM_F4P_ZC") ? atoi(getenv("UFSM_F4P_ZC")) : -1;
-    int ZC = zc_env > 0 ? zc_env : nzt < 8 ? nzt : 8;
+    /* the longest z chunks (64, 32, 16 tiles) that keep >= 2048 blocks: a block's first tile stages 2 extra planes and loads the
+       weights (desk P512: ZC 8 -> 64 fwd 19.1 -> 18.0 ms, bdata 17.0 -> 16.4; P256 is best at 16); else the old rule. (The output
+       GN statistics are summed per block in fp32: their grouping, not the outputs, changes with ZC) */
+    int ZC = 0;
+    if (zc_env > 0) ZC = zc_env;
+    else for (int z = 64; z > 8; z >>= 1) if (z <= nzt && base * nblk_(nzt, z) >= 2048) { ZC = z; break; }
+    if (!ZC) ZC = nzt < 8 ? nzt : 8;
     while (ZC > 1 && base * nblk_(nzt, ZC) < 480) ZC--;
     const dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(nblk_(nzt, ZC) * nmt * xs.n));   /* (the caller's grid argument is unused) */
     static int attr[8];
