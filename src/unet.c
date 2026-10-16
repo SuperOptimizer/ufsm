@@ -86,7 +86,8 @@ struct unet {
                                                  running statistics of the live weights, of the EMA weights (unet_ema blends the last
                                                  batch's in with the weights' decay: first order in the weight change), the last training
                                                  forward's; l0live: the convs' statistics while constant ([mean | rstd] x n G per site) */
-    long l0_n; float l0_mom; int l0_warm, l0_c;   /* ema: updates so far, momentum, warm-up; l0_c: this forward's level-0 statistics are constants */
+    long l0_n; float l0_mom; int l0_warm, l0_c, l0_rc;   /* ema: updates so far, momentum, warm-up; l0_c: this forward's level-0 statistics are
+                                                          constants; l0_rc: unet_l0_recal's forwards so far (-1 off) */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
@@ -275,7 +276,7 @@ unet *unet_create(const unet_cfg *cfg) {
     u->gn_scratch = nn_malloc(1 << 20);
     u->red_scratch = nn_malloc(4096 * 4);
     if (cfg->l0_norm < 0 || cfg->l0_norm > 2) { fprintf(stderr, "unet: l0_norm %d (0 gn, 1 none, 2 ema)\n", cfg->l0_norm); abort(); }
-    u->l0_mom = 0.01f; u->l0_warm = 100;
+    u->l0_mom = 0.01f; u->l0_warm = 100; u->l0_rc = -1;
     if (cfg->l0_norm == 2) { const size_t n = (size_t)24 * G_of(u, w[0]); u->l0run = nn_malloc(n * 4); nn_zero(u->l0run, n * 4); }
     return u;
 }
@@ -1485,7 +1486,7 @@ static float *l0_live(unet *u, const block *b, int conv, int r) {   /* where con
 }
 static void l0_begin(unet *u) {   /* forward start: latch l0_c, the constant statistics into the sites */
     const int md = u->cfg.l0_norm, G = l0_G(u), N = u->xs.n;
-    u->l0_c = md == 1 || (md == 2 && u->l0_n > 0 && u->l0_n >= u->l0_warm);
+    u->l0_c = md == 1 || (md == 2 && u->l0_n > 0 && u->l0_n >= u->l0_warm && u->l0_rc < 0);   /* (recalibration: the window's own) */
     if (!u->l0_c) return;
     if (md == 2 && u->fwd_train && u->l0live_n < (size_t)8 * N * G) { nn_free(u->l0live); u->l0live_n = (size_t)8 * N * G; u->l0live = nn_malloc(u->l0live_n * 4); }
     for (int i = 0; i < (u->cfg.nlev > 1 ? 2 : 1); i++) for (int k = 1; k <= 2; k++) {
@@ -1497,7 +1498,7 @@ static void l0_begin(unet *u) {   /* forward start: latch l0_c, the constant sta
 }
 static void l0_after(unet *u, block *b) {   /* ema, training forward: the block's batch statistics, after dec[0] into the running ones */
     const int i = l0_blk(u, b), G = l0_G(u), N = u->xs.n;
-    if (i < 0 || u->cfg.l0_norm != 2 || !u->fwd_train) return;
+    if (i < 0 || u->cfg.l0_norm != 2 || (!u->fwd_train && u->l0_rc < 0)) return;
     float *run = u->l0run, *rune = run + (size_t)8 * G, *bat = run + (size_t)16 * G;
     for (int k = 1; k <= 2; k++) {
         const float *m = u->l0_c ? l0_live(u, b, k, 0) : k == 1 ? b->m1 : b->m2, *r = u->l0_c ? l0_live(u, b, k, 1) : k == 1 ? b->r1 : b->r2;
@@ -1505,11 +1506,18 @@ static void l0_after(unet *u, block *b) {   /* ema, training forward: the block'
         nn_gn_ema_update(bat + (size_t)(2 * i + k - 1) * 2 * G, m, r, N, G, 1.f, 1e-5f);
     }
     if (i < 1 && u->cfg.nlev > 1) return;   /* (after the last level-0 block) */
+    if (u->l0_rc >= 0) {   /* recalibration: the cumulative mean of the windows' statistics replaces the set of the weights in use */
+        float *t = u->using_ema ? rune : run;
+        if (!u->l0_rc) nn_d2d(t, bat, (size_t)8 * G * 4); else nn_ema(t, bat, (size_t)8 * G, (float)u->l0_rc / (float)(u->l0_rc + 1));
+        u->l0_rc++;
+        return;
+    }
     if (!u->l0_n) { nn_d2d(run, bat, (size_t)8 * G * 4); nn_d2d(rune, bat, (size_t)8 * G * 4); }
     else nn_ema(run, bat, (size_t)8 * G, 1.f - u->l0_mom);
     u->l0_n++;
 }
 void unet_set_l0_ema(unet *u, float mom, int warm) { u->l0_mom = mom; u->l0_warm = warm; }
+void unet_l0_recal(unet *u, int on) { if (u->cfg.l0_norm == 2) u->l0_rc = on ? 0 : -1; }
 long unet_l0_updates(const unet *u) { return u->l0_n; }
 /* MX tensor planes [s0, s0 + n) of src (depth Ds) -> planes [d0, d0 + n) of dst (depth Dd); one sample, s.c channels, s.h x s.w
    planes: per channel block its data rows and its scales are each plane-contiguous */
