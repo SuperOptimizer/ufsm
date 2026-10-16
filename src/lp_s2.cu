@@ -540,7 +540,18 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4p_k(const mx4_t *__restr
                         }
                     }
                     float v[16];
-                    dec_row16_gn(q, rsc[it], in, Ci, G, gab, v);
+                    if (Ci == 16 && in) {   /* (the 16-wide net's down0: dec_row16_gn's arithmetic without its per-element channel / bounds selects) */
+                        const float s = mx_scale(rsc[it]);
+                        const unsigned w[2] = {q.x, q.y};
+#pragma unroll
+                        for (int j = 0; j < 2; j++)
+#pragma unroll
+                            for (int k = 0; k < 4; k++) {
+                                const float2 a = dec_e2m1x2(w[j] >> (8 * k));
+                                v[8 * j + 2 * k] = act_ab(a.x * s, gab[8 * j + 2 * k].x, gab[8 * j + 2 * k].y, true);
+                                v[8 * j + 2 * k + 1] = act_ab(a.y * s, gab[8 * j + 2 * k + 1].x, gab[8 * j + 2 * k + 1].y, true);
+                            }
+                    } else dec_row16_gn(q, rsc[it], in, Ci, G, gab, v);
                     unsigned am = 0u;
 #pragma unroll
                     for (int k = 0; k < 16; k++) am = amax_u(am, v[k]);

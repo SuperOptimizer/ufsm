@@ -15,6 +15,21 @@
    nz), rows ly0 .. ly0 + ny - 1 and columns lx0 .. lx0 + nx - 1 of the [8 rows][12 columns] plane layout: GN+SiLU, then 16 e4m3 values
    and one scale per row. (The whole layout, 6 planes x 96 with up to three planes and two rows and columns nothing reads, made the
    coarse stage ~35% of the kernel; P512 dec0.c1 40.2 -> 37.2 ms on the desk 5060 Ti, the same bits) */
+/* dec_row16_gn for a full 16-channel row inside the tensor with GN: the same arithmetic without its per-element channel / bounds
+   selects (the staging is issue-bound) */
+template <typename GAB>
+__device__ __forceinline__ void dec_row16_gn_full(uint2 raw, unsigned rsc, const GAB &gab, float *v) {
+    const float s = mx_scale(rsc);
+    const unsigned w[2] = {raw.x, raw.y};
+#pragma unroll
+    for (int j = 0; j < 2; j++)
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const float2 a = dec_e2m1x2(w[j] >> (8 * k));
+            v[8 * j + 2 * k] = act_ab(a.x * s, gab[8 * j + 2 * k].x, gab[8 * j + 2 * k].y, true);
+            v[8 * j + 2 * k + 1] = act_ab(a.y * s, gab[8 * j + 2 * k + 1].x, gab[8 * j + 2 * k + 1].y, true);
+        }
+}
 template <int NIT>   /* nz ny nx <= 256 NIT; blockDim 256 */
 __device__ __forceinline__ void stage_up_coarse16t(const chan_t &c0, int Cu, const float2 *gab, bool G, uint8_t *cu, uint8_t *cus, int cz0, int cy0, int cx0, int nz,
                                                    int ly0, int ny, int lx0, int nx, int D, int H, int W) {
@@ -36,7 +51,8 @@ __device__ __forceinline__ void stage_up_coarse16t(const chan_t &c0, int Cu, con
         const int i = threadIdx.x + 256 * it;
         if (i >= n) break;
         float r[16];
-        dec_row16_gn(raw[it], rsc[it], (okm >> it) & 1u, Cu, G, gab, r);
+        if (Cu == 16 && G && ((okm >> it) & 1u)) dec_row16_gn_full(raw[it], rsc[it], gab, r);
+        else dec_row16_gn(raw[it], rsc[it], (okm >> it) & 1u, Cu, G, gab, r);
         unsigned am = 0u;
 #pragma unroll
         for (int k = 0; k < 16; k++) { const unsigned u = __float_as_uint(fabsf(r[k])); am = u <= 0x7f800000u ? max(am, u) : am; }
@@ -206,7 +222,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4u_k(const T *__restrict__ x
             int e = mx_exp(__uint_as_float(am), 1.f / 6.f);
             float m = exp2i(-e);
             q[0] = cvt_e2m1x8(v, m); q[1] = cvt_e2m1x8(v + 8, m); sc = (unsigned)(e + 127);
-            dec_row16_gn(raw[it], rsc[it], (okm >> it) & 1u, Cs, Gs, gs, v);
+            if (Cs == 16 && Gs && ((okm >> it) & 1u)) dec_row16_gn_full(raw[it], rsc[it], gs, v);
+            else dec_row16_gn(raw[it], rsc[it], (okm >> it) & 1u, Cs, Gs, gs, v);
             am = 0u;
 #pragma unroll
             for (int k = 0; k < 16; k++) am = amax_u(am, v[k]);
