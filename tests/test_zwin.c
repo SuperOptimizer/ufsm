@@ -324,6 +324,24 @@ static void test_gnb(int C, int D, int S, int head) {
     res_free(&a); nn_free(f.x0); nn_free(f.gy); nn_free(f.gl); nn_free(f.gam); nn_free(f.bet); nn_free(f.mean); nn_free(f.rstd); nn_free(f.wh); mode_off();
 }
 
+/* the 2x trilinear upsample of level 1 into level 0 (dec[0]'s up transient) and its backward (level-0 gy -> level-1 gx, exact SR):
+   windows of level-0 planes; the backward's window is the coarse planes [zw0 / 2, zw1 / 2) (reading the fine planes around them) */
+typedef struct { shape5 cs, fs; void *x, *gy; } up_t;
+static void upf_op(void *c, res_t *r) { up_t *f = c; nn_up2_fwd((const float *)f->x, f->cs, (float *)r->out); }
+static void upb_op(void *c, res_t *r) { up_t *f = c; nn_up2_bwd((const float *)f->gy, f->cs, (float *)r->out); }
+static void test_up(int C, int D) {
+    mode_prod();
+    up_t f = {{1, C, D / 2, 8, 16}, {1, C, D, 16, 32}};
+    float *x = dev_rand(shape_numel(f.cs), 1.5f); f.x = mx4_from(x, f.cs); nn_free(x);
+    float *g = dev_rand(shape_numel(f.fs), 1e-2f); f.gy = mx4_from(g, f.fs); nn_free(g);
+    char m[96];
+    res_t a = {"", nn_mx4_bytes(f.fs), mx4_new(f.fs)};
+    snprintf(m, sizeof m, "up2 fwd %2d ch, depth %d", C, D); drive(m, upf_op, &f, D, &a, f.fs, 1); res_free(&a);
+    res_t b = {"", nn_mx4_bytes(f.cs), mx4_new(f.cs)};
+    snprintf(m, sizeof m, "up2 bwd %2d ch, depth %d", C, D); drive(m, upb_op, &f, D, &b, f.cs, 1); res_free(&b);
+    nn_free(f.x); nn_free(f.gy); mode_off();
+}
+
 int main(void) {
     setenv("UFSM_F4_WGRAD", "1", 1);   /* the production fp4 weight gradient (train --fp4 2) */
     nn_init(0);
@@ -334,6 +352,7 @@ int main(void) {
         test_stem(D); test_down(16, 16, D); test_down(32, 32, D);
         test_wgrad(16, 16, D, 1); test_wgrad(32, 32, D, 1); test_wgrad(4, 16, D, 0);
         test_s2b(16, D, 0); test_s2b(16, D, 1); test_s2b(32, D, 0); test_s2b(32, D, 1);
+        test_up(16, D); test_up(32, D);
     }
     for (int S = 8; S <= 16; S *= 2) { test_gnb(16, 32, S, 0); test_gnb(32, 32, S, 0); test_gnb(16, 32, S, 1); }
     const char *e = nn_check(); if (e) { printf("  CUDA: %s  FAIL\n", e); bad++; }

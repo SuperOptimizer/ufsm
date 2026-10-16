@@ -44,16 +44,16 @@ __global__ void up2_bwd_mx_k(const uint8_t *gy, uint8_t *gx, int N, int C, int D
 #define U2B_BUFB(RB, RH) ((RH) * U2B_RW * (RB) + (RH) * 40)   /* RB: gy row bytes (BW MX-fp8, BW / 2 MX-fp4), RH staged rows */
 template <int GB = 8, int XB = 8, int BW = 32>   /* MX bits of gy / gx (4: MX-fp4 gradients, gx with exact SR keyed by osr), block width */
 __global__ void __launch_bounds__(256) up2_bwd_mx_tile_k(const uint8_t *__restrict__ gy, uint8_t *__restrict__ gx, int N, int nby, int nbx, int yb0, int ob0, int nob,
-                                                         int D, int H, int W, int ZC, unsigned osr) {
+                                                         int D, int H, int W, int ZC, unsigned osr, int za = 0, int zb = 0) {   /* [za, zb): coarse z-window (zb 0: all) */
     constexpr int CPL = BW / 8, CY = 16 / CPL, RH = 2 * CY + 2, RB = BW * GB / 8, XRB = BW * XB / 8, U2B_BUF = U2B_BUFB(RB, RH);
     constexpr int CB = RB >= 16 ? 16 : RB, NCH = RB / CB;   /* cp.async chunk bytes, chunks per row */
     extern __shared__ __align__(16) unsigned char smem_raw[];
     const int tid = threadIdx.x, cg = tid % CPL, cx = (tid / CPL) & 15, cy = tid / (CPL * 16);
-    const int x0 = blockIdx.x * 16, y0 = blockIdx.y * CY, nzc = (D + ZC - 1) / ZC;
+    const int zend = zb ? zb : D, x0 = blockIdx.x * 16, y0 = blockIdx.y * CY, nzc = (zend - za + ZC - 1) / ZC;
     int bz = blockIdx.z;
     const int zc = bz % nzc; bz /= nzc;
     const int ob = ob0 + bz % nob, n = bz / nob, yb = yb0 + (ob - ob0);
-    const int z0 = zc * ZC, z1 = min(D, z0 + ZC), Do = 2 * D, Ho = 2 * H, Wo = 2 * W;
+    const int z0 = za + zc * ZC, z1 = min(zend, z0 + ZC), Do = 2 * D, Ho = 2 * H, Wo = 2 * W;
     const size_t S = (size_t)D * H * W, So = (size_t)Do * Ho * Wo;
     const uint8_t *gyb = gy + ((size_t)n * nby + yb) * So * RB, *gys = gy + (size_t)N * nby * So * RB + ((size_t)n * nby + yb) * So;
     const int fx0 = 2 * x0 - 1, fy0 = 2 * y0 - 1;
@@ -142,10 +142,11 @@ static int up2b_tile_on(void) { static int on = -1; if (on < 0) on = getenv("UFS
 static void up2_bwd_tile(const void *gy, int nby, int yb0, shape5 xs, void *gx, int nbx, int ob0, int nob, int gdt, int xdt, unsigned osr, int bw) {   /* xs: coarse */
     int ZC = 8;
     const int cy = 16 / (bw / 8);
-    const dim3 grid((unsigned)nblk_(xs.w, 16), (unsigned)nblk_(xs.h, cy), (unsigned)(nblk_(xs.d, ZC) * xs.n * nob));
+    int za = 0, zb = 0; zw_win(xs.d, &za, &zb);   /* z-window: coarse planes [za, zb) (whole tensors: the fine gy planes around it are read) */
+    const dim3 grid((unsigned)nblk_(xs.w, 16), (unsigned)nblk_(xs.h, cy), (unsigned)(nblk_(zb ? zb - za : xs.d, ZC) * xs.n * nob));
 #define U2BT(G, X, BWT) do { static unsigned at_ = 0; int dev_ = 0; cudaGetDevice(&dev_); const size_t sm_ = 2 * U2B_BUFB(BWT * G / 8, 2 * (16 / (BWT / 8)) + 2); \
                         if (!(at_ >> dev_ & 1u)) { at_ |= 1u << dev_; cudaFuncSetAttribute((const void *)up2_bwd_mx_tile_k<G, X, BWT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_); } \
-                        up2_bwd_mx_tile_k<G, X, BWT><<<grid, 256, sm_>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, nby, nbx, yb0, ob0, nob, xs.d, xs.h, xs.w, ZC, osr); } while (0)
+                        up2_bwd_mx_tile_k<G, X, BWT><<<grid, 256, sm_>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, nby, nbx, yb0, ob0, nob, xs.d, xs.h, xs.w, ZC, osr, za, zb); } while (0)
     if ((gdt == 4) != (xdt == 4)) { fprintf(stderr, "up2_bwd: gy and gx must share the MX format\n"); abort(); }
     if (bw == 32) { if (gdt == 4) U2BT(4, 4, 32); else U2BT(8, 8, 32); }
     else if (bw == 16) { if (gdt == 4) U2BT(4, 4, 16); else U2BT(8, 8, 16); }
@@ -162,6 +163,7 @@ static void up2_bwd_voxel(const void *gy, shape5 xs, void *gx, int gdt, int xdt,
 extern "C" void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx, int gdt, int xdt, unsigned osr) {
     const int bw = mx_bw(xs.c);
     if ((up2b_tile_on() || gdt == 4) && xs.c % bw == 0 && xs.w % 2 == 0) { up2_bwd_tile(gy, mx_nb(xs.c), 0, xs, gx, mx_nb(xs.c), 0, mx_nb(xs.c), gdt, xdt, osr, bw); LPCK(); return; }
+    { int a, b; if (zw_win(xs.d, &a, &b)) { fprintf(stderr, "lp_up2_bwd_mx: the z-window needs the tiled kernel\n"); abort(); } }
     up2_bwd_voxel(gy, xs, gx, gdt, xdt, osr); LPCK();   /* (MX-fp4: exact SR per row; partial blocks, odd coarse widths) */
 }
 /* channel slice [c0, c0 + nc) of an MX-fp8 gx with ctot channels from an MX-fp8 gy of nc channels (the chunked up-part gradient
