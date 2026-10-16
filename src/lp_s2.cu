@@ -821,25 +821,25 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
         auto xload1 = [&](unsigned (&r_)[2][XW], unsigned (&s_)[2], int gz) {
 #pragma unroll
             for (int r = 0; r < 2; r++) {
-                s_[r] = 0u;   /* scale byte 0: the position is outside (decoded as 0) */
+                s_[r] = 0u;
 #pragma unroll
                 for (int w = 0; w < XW; w++) r_[r][w] = 0u;
                 if (pin[r] && gz >= 0 && gz < D) {
                     const size_t off = ((size_t)gz * H + 2 * oy0 - 1 + prow[r]) * W + 2 * ox0 - 1 + pu[r];
                     const unsigned *rw = (const unsigned *)((const uint8_t *)c0.p + off * c0.rb + (IS_MX4(T) ? (c0.nib >> 1) : 0));
-                    s_[r] = c0.sp[off] | 0x100u;   /* bit 8: inside */
+                    s_[r] = c0.sp[off];   /* (the raw byte: tagging it here, "| 0x100", waited for the load at once: ~28% of the samples) */
 #pragma unroll
                     for (int w = 0; w < XW; w++) r_[r][w] = __ldg(rw + w);
                 }
             }
         };
-        auto xdec = [&](const unsigned (&r_)[2][XW], const unsigned (&s_)[2], float (&v)[2][CH]) {
+        auto xdec = [&](const unsigned (&r_)[2][XW], const unsigned (&s_)[2], float (&v)[2][CH], int gz) {   /* gz: the plane xload1 read */
 #pragma unroll
             for (int r = 0; r < 2; r++) {
 #pragma unroll
                 for (int q = 0; q < CH; q++) v[r][q] = 0.f;
-                if (s_[r] & 0x100u) {
-                    const float sc = mx_scale(s_[r] & 0xffu);
+                if (pin[r] && gz >= 0 && gz < D) {   /* inside (xload1's condition) */
+                    const float sc = mx_scale(s_[r]);
                     if constexpr (IS_MX4(T)) {
 #pragma unroll
                         for (int q = 0; q < 4; q++) { const float2 d = dec_e2m1x2(r_[r][0] >> (8 * q)); v[r][2 * q] = fmaf(1.f, d.x * sc, 0.f); v[r][2 * q + 1] = fmaf(1.f, d.y * sc, 0.f); }
@@ -870,7 +870,7 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
         auto xpass = [&](const unsigned (&r_)[2][XW], const unsigned (&s_)[2], int gz) {
             xslab(gz);
             float v[2][CH];
-            xdec(r_, s_, v);
+            xdec(r_, s_, v, gz);
             unsigned *am = amx + (npass % 3) * CH;
             unsigned ra[CH];
 #pragma unroll
@@ -903,7 +903,7 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
            make a 2-plane scale as precise as a 1-plane one; 4 -> 2 barriers per z-step). UFSM_S2W_PAIR=0: plane by plane */
         auto xpass2 = [&](const unsigned (&ra_)[2][XW], const unsigned (&sa_)[2], int gz, const unsigned (&rb_)[2][XW], const unsigned (&sb_)[2]) {
             float va[2][CH], vb[2][CH];
-            xslab(gz); xdec(ra_, sa_, va); xslab(gz + 1); xdec(rb_, sb_, vb);
+            xslab(gz); xdec(ra_, sa_, va, gz); xslab(gz + 1); xdec(rb_, sb_, vb, gz + 1);
             unsigned *am = amx + (npass % 3) * CH;
             unsigned rr[CH];
 #pragma unroll
