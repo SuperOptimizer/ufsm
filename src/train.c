@@ -1351,7 +1351,7 @@ int cmd_train(int argc, char **argv) {
             nn_init(G[0].dev);
             const shape5 xs = g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P};   /* split: this GPU's slab of the window */
             const size_t p3 = p3l;
-            int pick = -1, pick_hoff = 1; size_t need = 0, pick_off = 0, pick_need = 0;
+            int pick = -1, pick_hoff = 1, minc = -1, min_hoff = 1; size_t need = 0, pick_off = 0, pick_need = 0, min_need = (size_t)-1;
             {   /* the batch tail [targets | mask] the three-level-0-buffer layout holds at X3's end (its dry builds size X3 for it) */
                 const size_t a256 = 255;
                 unet_set_batch_bytes(G[0].u, 0, (((size_t)B * g_tc * p3 + a256) & ~a256) + (((size_t)B * p3 + a256) & ~a256));
@@ -1389,9 +1389,10 @@ int cmd_train(int argc, char **argv) {
                    (8.5 B per level-0 voxel at 16 channels for ~0 step time there; 8 channels: -2%) */
                 const size_t grec = unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1) ? (size_t)B * cfg.widths[0] * p3 * 136 / 256 : 0;
                 need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                if (need < min_need) { min_need = need; minc = c; min_hoff = pass; }   /* (no fit: the smallest mode evaluated) */
                 if (need <= fmin) { pick = c; pick_hoff = pass; pick_off = unet_last_offload_bytes(); pick_need = need; }
             }
-            if (pick < 0) { pick = auto16 ? nc - 1 : 8; /* the smallest mode of the list */ pick_hoff = 1; fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
+            if (pick < 0) { pick = minc >= 0 ? minc : auto16 ? nc - 1 : 8; pick_hoff = minc >= 0 ? min_hoff : 1; fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, (minc >= 0 ? min_need : need) / 1e9, cand[pick].what); }
             else {   /* the mode, its device bytes per level-0 voxel of the window and its PCIe traffic per step */
                 const size_t vox = (size_t)B * p3, upb = (size_t)B * (g_gpu_want && unet_input_converted() ? 1 : (size_t)g_xc) * p3 * xbytes()
                                    + (g_pack ? (size_t)B * p3 : (size_t)B * (g_tc + 1) * p3) + (g_gpu_want ? (size_t)B * NN_RAD_REC(g_Pz) : 0);

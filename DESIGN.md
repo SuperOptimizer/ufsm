@@ -40,7 +40,7 @@ prints the mode, its device bytes per voxel, the batch upload and the offload by
 | 512 | auto | lean 2, shared a1, three level-0 buffers | 4.89 GB, 36.5 B/voxel | 3.66 GB (27.3 B/voxel) | 4626 MiB, 1.53 samp/s, host VmHWM 12.3 GB |
 | 512 | fast | MX gradients, no offloads | 13.68 GB, 101.9 B/voxel | 0 | 12546 MiB, 1.72 samp/s (+12%), host 6.5 GB |
 | 768 | auto / fast | lean 2, shared a1, three level-0 buffers | 15.13 GB, 33.4 B/voxel | 12.35 GB | 13.8 GB, 0.46 samp/s |
-| 1024 | auto | none fits (85.8 GB smallest: chunked recompute 2 lean 2 lacks the newer layouts) | | | |
+| 1024 | auto | none fits: the smallest (three level-0 buffers) needs 35.05 GB; the no-fit fallback now tries it (it tried recompute 2, 85.8 GB) | | | |
 The batch upload is 0.40 GB per P512 step (CT fp16 + packed targets). At P768 the offloads move ~12 GB each way per ~2.2 s step
 (5.6 GB/s); at the same B / voxel they would bind near 800 Mvox/s, so a faster GPU wants --mem fast where it fits.
 ## Training input built on the GPU; the planner counts the separate input (2026-10-15)
