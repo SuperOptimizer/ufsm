@@ -65,6 +65,7 @@ static int usage(void) {
         "  ufsm codes-merge <out-group> <out-um> <root> <key> ...   winding code rasters united (same wrap within 1/4 turn, else 255)\n"
         "  ufsm ct-hist <out.txt> <root> <key> z,y,x,n [...]  CT histograms of boxes (targets of train --aug-hist, the hist op)\n"
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
+        "  ufsm repack <in-array-dir> <out-array-dir> <shard> [--threads N]   lossless re-sharding of a z3w uint8 zarr (copies the compressed chunks)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
@@ -2299,6 +2300,7 @@ static int cmd_sample(int argc, char **argv) {
     return 0;
 }
 
+int cmd_repack(int argc, char **argv);   /* src/repack.c */
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "train")) return cmd_train(argc, argv);
     if (argc < 3) return usage();
@@ -2320,6 +2322,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "eval")) return cmd_eval(argc, argv);
     if (!strcmp(cmd, "band")) return cmd_band(argc, argv);
     if (!strcmp(cmd, "fit")) return cmd_fit(argc, argv);
+    if (!strcmp(cmd, "repack")) return cmd_repack(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
