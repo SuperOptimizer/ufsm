@@ -26,7 +26,7 @@ __device__ __forceinline__ float sr_e4m3x(float v, uint32_t seed, uint64_t key) 
    Both rows of a K block lie in the same input plane for every tap, so the B scale is per (channel, plane).
    Smem: X ring fp8 [ci][4 planes][10 rows][24 B], position p of a row at byte 3 + p so that x = ox0.. is 4-aligned
          (ci stride 1040 B = 260 words == 4 mod 32 -> conflict-free fragment loads), GY tile fp8 [co][16 rows][16 B] (co stride 272 B, ldmatrix conflict-free) + scales. */
-template <int MT, int NT, typename T, typename TG, bool FAST = false>
+template <int MT, int NT, typename T, typename TG, int FAST = 0>   /* FAST: the network input conv's path, 4 or 8 = the real x channels */
 __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
                                                        int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC, int coop) {
     constexpr int CH = 8 * NT, BMo = 16 * MT;
@@ -141,45 +141,54 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
                 }
             }
         };
+        /* XC: the real x channels (the 4-channel network input fills half of the 8-channel tile): only those are decoded, reduced and
+           staged; the padding channels' ring rows stay zero and their scale bytes 1 (mx_exp of a zero amax: -126), as staging zeros
+           wrote them before */
+        constexpr int XC = FAST < CH ? FAST : CH;
+        if constexpr (XC < CH) {
+            for (int k = threadIdx.x; k < (CH - XC) * X8_CS; k += blockDim.x) sxq[XC * X8_CS + k] = 0;
+            if (threadIdx.x < (CH - XC) * 4) sxs[XC * 4 + threadIdx.x] = (uint8_t)(-126 + 127);
+        }
         auto xstage = [&](int gz0) {   /* planes gz0, gz0 + 1 from xr: decode, transform, plane amax (amx[pl]), e4m3 into the ring */
-            float v[2][CH];
+            float v[2][XC];
 #pragma unroll
             for (int pl = 0; pl < 2; pl++) {
 #pragma unroll
-                for (int q = 0; q < CH; q++) v[pl][q] = 0.f;
+                for (int q = 0; q < XC; q++) v[pl][q] = 0.f;
                 if (xok[pl]) {
                     const float sc = mx_scale(xsb[pl]);
                     if constexpr (IS_MX4(T)) {
 #pragma unroll
-                        for (int q = 0; q < 4; q++) { const float2 d = dec_e2m1x2(xr[pl][0] >> (8 * q)); v[pl][2 * q] = fmaf(1.f, d.x * sc, 0.f); v[pl][2 * q + 1] = fmaf(1.f, d.y * sc, 0.f); }
+                        for (int q = 0; q < XC / 2; q++) { const float2 d = dec_e2m1x2(xr[pl][0] >> (8 * q)); v[pl][2 * q] = fmaf(1.f, d.x * sc, 0.f); v[pl][2 * q + 1] = fmaf(1.f, d.y * sc, 0.f); }
                     } else {
 #pragma unroll
-                        for (int w = 0; w < 2; w++) {
+                        for (int w = 0; w < XC / 4; w++) {
                             const float2 d0 = dec_e4m3x2((unsigned short)(xr[pl][w] & 0xffffu)), d1 = dec_e4m3x2((unsigned short)(xr[pl][w] >> 16));
                             v[pl][4 * w] = fmaf(1.f, d0.x * sc, 0.f); v[pl][4 * w + 1] = fmaf(1.f, d0.y * sc, 0.f);
                             v[pl][4 * w + 2] = fmaf(1.f, d1.x * sc, 0.f); v[pl][4 * w + 3] = fmaf(1.f, d1.y * sc, 0.f);
                         }
                     }
 #pragma unroll
-                    for (int q = 0; q < CH; q++) { const chan_t &cq = ctab8[q]; v[pl][q] = cq.p ? act_ab(v[pl][q], cq.a, cq.b, Gany && cq.g) : 0.f; }
+                    for (int q = 0; q < XC; q++) { const chan_t &cq = ctab8[q]; v[pl][q] = cq.p ? act_ab(v[pl][q], cq.a, cq.b, Gany && cq.g) : 0.f; }
                 }
             }
-            unsigned ra[2][CH];
+            unsigned ra[2][XC];
 #pragma unroll
             for (int pl = 0; pl < 2; pl++)
 #pragma unroll
-                for (int q = 0; q < CH; q++) ra[pl][q] = __reduce_max_sync(0xffffffffu, __float_as_uint(v[pl][q]) & 0x7fffffffu);
+                for (int q = 0; q < XC; q++) ra[pl][q] = __reduce_max_sync(0xffffffffu, __float_as_uint(v[pl][q]) & 0x7fffffffu);
             if (lane == 0) {   /* red.shared directly: atomicMax by one lane still got the compiler's warp-aggregation code */
 #pragma unroll
                 for (int pl = 0; pl < 2; pl++)
 #pragma unroll
-                    for (int q = 0; q < CH; q++) asm volatile("red.shared.max.u32 [%0], %1;" :: "r"((unsigned)__cvta_generic_to_shared(&amx[pl * CH + q])), "r"(ra[pl][q]) : "memory");
+                    for (int q = 0; q < XC; q++) asm volatile("red.shared.max.u32 [%0], %1;" :: "r"((unsigned)__cvta_generic_to_shared(&amx[pl * CH + q])), "r"(ra[pl][q]) : "memory");
             }
             __syncthreads();
-            if (tid < 2 * CH) {
-                const int e = mx_exp(__uint_as_float(amx[tid]), 1.f / 448.f);
-                mqs[tid] = exp2i(-e);
-                sxs[(tid % CH) * 4 + ((gz0 + tid / CH + 1) & 3)] = (uint8_t)(e + 127);
+            if (tid < 2 * XC) {
+                const int pl = tid / XC, q = tid % XC;
+                const int e = mx_exp(__uint_as_float(amx[pl * CH + q]), 1.f / 448.f);
+                mqs[pl * CH + q] = exp2i(-e);
+                sxs[q * 4 + ((gz0 + pl + 1) & 3)] = (uint8_t)(e + 127);
             }
             __syncthreads();
             if (tid < 180) {
@@ -187,7 +196,7 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
                 for (int pl = 0; pl < 2; pl++) {
                     uint8_t *dst = sxq + ((gz0 + pl + 1) & 3) * X8_PS + xrow * 24 + 3 + xp;
 #pragma unroll
-                    for (int q = 0; q < CH; q++) dst[q * X8_CS] = cvt_e4m3(v[pl][q] * mqs[pl * CH + q]);
+                    for (int q = 0; q < XC; q++) dst[q * X8_CS] = cvt_e4m3(v[pl][q] * mqs[pl * CH + q]);
                 }
             }
         };
@@ -491,9 +500,16 @@ template <int MT, int NT, typename T, typename TG> static void launch_bw8(dim3 g
                                                                     network input conv (> 32 outputs: half-resolution nets, 32-output tiles) */
     if constexpr (NT == 1 && IS_MX(T) && IS_MX(TG)) {   /* the network input conv: conv_bwd_w_f8_k's FAST path (MX-fp8 or MX-fp4 gy) */
         if (xs.c <= 8 && !sp.up && !sp.x2 && x && (coop & 3) == 3 && (16 * MT <= mx_bw(ys.c) || (ys.c <= mx_bw(ys.c) && mx_bw(ys.c) < 16 * MT)) && ys.w % 4 == 0) {
-            if (!attr[cur_dev_()][1]) { attr[cur_dev_()][1] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f8_k<MT, NT, T, TG, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
             smem += 2 * 8 * NT * 4 + 16 + 256 * 16 * MT + 256;   /* plane multipliers, raw gy rows and scales */
-            conv_bwd_w_f8_k<MT, NT, T, TG, true><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, coop);
+            static int x4env = -1;
+            if (x4env < 0) x4env = getenv("UFSM_F8W_X4") ? atoi(getenv("UFSM_F8W_X4")) : 1;   /* 0: stage all 8 tile channels (A/B) */
+            if (xs.c <= 4 && x4env) {   /* the 4-channel network input: half the x staging */
+                if (!(attr[cur_dev_()][1] & 1)) { attr[cur_dev_()][1] |= 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f8_k<MT, NT, T, TG, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+                conv_bwd_w_f8_k<MT, NT, T, TG, 4><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, coop);
+                return;
+            }
+            if (!(attr[cur_dev_()][1] & 2)) { attr[cur_dev_()][1] |= 2; cudaFuncSetAttribute((const void *)conv_bwd_w_f8_k<MT, NT, T, TG, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+            conv_bwd_w_f8_k<MT, NT, T, TG, 8><<<grid, 288, smem>>>((const T *)x, gy, gw, gb, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, ZC, coop);
             return;
         }
     }

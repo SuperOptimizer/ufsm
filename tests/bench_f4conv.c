@@ -244,6 +244,23 @@ int main(int argc, char **argv) {
         printf("%-32s @%d %8.3f ms  |gw| %.9g\n", "wgrad stem 4 -> 16 (fp8, SR)", P, best, a);
         nn_free(xi); nn_free(g4); nn_free(gw); nn_free(gb);
     }
+    if (want("f8w4")) {   /* the production stem's weight gradient: MX-fp4 network input (UFSM_XIN_PREC=4), MX-fp4 gy (16 channels), SR;
+                             gw / gb to the atomic-sum noise: |gw|, |gb| and the sums of gw / gb (BENCH_DUMP=file: the raw gw, gb floats) */
+        shape5 x4 = {1, 4, P, P, P}, y4 = {1, 16, P, P, P};
+        void *xi = mx(4, 4, S, 2.f, 53), *g4 = mx(4, 16, S, 1e-3f, 54);
+        float *gw = nn_malloc(16 * 4 * 27 * 4), *gb = nn_malloc(16 * 4);
+        double best = 1e9;
+        for (unsigned it = 0; it < 10; it++) {
+            split_t sp = {0}; sp.sr = 0x6d2b79f5u;
+            nn_zero(gw, 16 * 4 * 27 * 4); nn_zero(gb, 64);
+            nn_sync(); double t0 = now(); lp_bwd_w_f8(xi, 4, x4, g4, 4, y4, gw, gb, (gnp_t){0}, sp); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+        }
+        float h[16 * 4 * 27], hb[16]; nn_d2h(h, gw, sizeof h); nn_d2h(hb, gb, sizeof hb);
+        double a = 0, s = 0, ab = 0, sb = 0; for (int i = 0; i < 16 * 4 * 27; i++) { a += fabs(h[i]); s += h[i]; } for (int i = 0; i < 16; i++) { ab += fabs(hb[i]); sb += hb[i]; }
+        printf("%-32s @%d %8.3f ms  |gw| %.9g sum %.9g  |gb| %.9g sum %.9g\n", "wgrad stem 4 -> 16 (mx4 x, mx4 gy)", P, best, a, s, ab, sb);
+        if (getenv("BENCH_DUMP")) { FILE *f = fopen(getenv("BENCH_DUMP"), "wb"); if (f) { fwrite(h, sizeof h, 1, f); fwrite(hb, sizeof hb, 1, f); fclose(f); } }
+        nn_free(xi); nn_free(g4); nn_free(gw); nn_free(gb);
+    }
     if (want("w32")) {   /* level 0 of the 32,64,... net: stem 4 -> 32 wgrad, down0 32 -> 32 stride-2 wgrad / bdata, head 32 -> 7 wgrad */
         const int Pc = P / 2; const size_t Sc = (size_t)Pc * Pc * Pc;
         const char *wsel = getenv("BENCH_W32");   /* stem, s2 or head: one case only */
