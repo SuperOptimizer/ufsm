@@ -446,11 +446,66 @@ static void f16_row(const float *v, uint16_t *h, int n) {
    sqrtf vectorises); bit-identical to it: the same expressions, rng draws and signed zeros. D x P x P windows (D != P: slabs,
    z-keeping symmetries only). */
 [[gnu::optimize("no-math-errno")]]
+/* write_x's CT channel alone (--gpu-input, no appearance plan), cache-blocked: when the output row runs along a strided source axis
+   (2 of 3 symmetries) the row-by-row gather touched one cache line (and often one page) per voxel, ~2/3 of a P768 window's 7.3 cpu-s.
+   Rows whose source rows are adjacent are gathered together: XB output rows at once when output y runs along source x, XB output
+   planes when output z does (their noise rows buffered as table indices, drawn in write_x's row order). The same rng draws, float
+   operations and rounding as write_x: bit for bit (tests/test_gpu_input.c compares the two over all 48 symmetries). */
+enum { XB = 16 };
+static void write_x_ct(const uint8_t *ctu, int D, int P, float fmean, float fisd, sym y, int jitter, float ia, float ib, float isg, rng *r,
+                       int xfmt, uint16_t *H) {
+    const size_t p2 = (size_t)P * P; const int nd[3] = {D, P, P};
+    const int byz = y.perm[0] == 2, by = !byz && y.perm[1] == 2;   /* output z / output y runs along source x */
+    const int nb = byz ? XB : by ? XB : 1;
+    float *v = malloc((size_t)XB * P * sizeof *v);
+    uint16_t *ni = jitter && byz ? malloc((size_t)XB * p2 * sizeof *ni) : nullptr;   /* byz: the slab's noise as table indices */
+    float *nr = jitter && !byz ? malloc((size_t)XB * P * sizeof *nr) : nullptr;
+    if (!v || (jitter && byz && !ni) || (jitter && !byz && !nr)) abort();
+    const int ztop = byz ? D : D, ystep = by ? XB : 1, zstep = byz ? XB : 1;
+    for (int z0 = 0; z0 < ztop; z0 += zstep) {
+        const int nz = byz ? (D - z0 < XB ? D - z0 : XB) : 1;
+        if (ni) for (int zz = 0; zz < nz; zz++) for (int yy = 0; yy < P; yy++) {   /* write_x's draws, in its row order */
+            uint16_t *q = ni + ((size_t)zz * P + yy) * P;
+            for (int x = 0; x + 4 <= P; x += 4) { const uint64_t u = rnext(r); q[x] = (uint16_t)(u & 0xffff); q[x + 1] = (uint16_t)(u >> 16 & 0xffff); q[x + 2] = (uint16_t)(u >> 32 & 0xffff); q[x + 3] = (uint16_t)(u >> 48); }
+            for (int x = P & ~3; x < P; x++) q[x] = (uint16_t)(rnext(r) & 0xffff);
+        }
+        for (int y0 = 0; y0 < P; y0 += ystep) {
+            const int ny = by ? (P - y0 < XB ? P - y0 : XB) : 1, nrow = byz ? nz : ny;   /* rows gathered together */
+            if (nr) for (int k = 0; k < ny; k++) {   /* (by / plain: the block's rows are consecutive in write_x's order) */
+                float *q = nr + (size_t)k * P;
+                for (int x = 0; x + 4 <= P; x += 4) { const uint64_t u = rnext(r); q[x] = g_ntab[u & 0xffff]; q[x + 1] = g_ntab[(u >> 16) & 0xffff]; q[x + 2] = g_ntab[(u >> 32) & 0xffff]; q[x + 3] = g_ntab[(u >> 48) & 0xffff]; }
+                for (int x = P & ~3; x < P; x++) q[x] = g_ntab[rnext(r) & 0xffff];
+            }
+            /* source offset of row k's voxel x: q0 + k * kstep + x * qs */
+            const int io[3] = {z0, y0, 0}; int s0[3], ds[3] = {0, 0, 0}, dk[3] = {0, 0, 0};
+            for (int d = 0; d < 3; d++) s0[y.perm[d]] = y.flip[d] ? nd[d] - 1 - io[d] : io[d];
+            ds[y.perm[2]] = y.flip[2] ? -1 : 1;
+            const int kd = byz ? 0 : 1; dk[y.perm[kd]] = y.flip[kd] ? -1 : 1;
+            const ptrdiff_t q0 = ((ptrdiff_t)s0[0] * P + s0[1]) * P + s0[2], qs = ((ptrdiff_t)ds[0] * P + ds[1]) * P + ds[2], ks = ((ptrdiff_t)dk[0] * P + dk[1]) * P + dk[2];
+            if (nrow == 1 && qs == 1) { const uint8_t *src = ctu + q0; for (int x = 0; x < P; x++) v[x] = ((float)src[x] - fmean) * fisd; }
+            else if (nrow == 1) { const uint8_t *src = ctu + q0; for (int x = 0; x < P; x++) v[x] = ((float)src[qs * x] - fmean) * fisd; }
+            else if (ks == 1) for (int x = 0; x < P; x++) { const uint8_t *src = ctu + q0 + qs * x; for (int k = 0; k < nrow; k++) v[(size_t)k * P + x] = ((float)src[k] - fmean) * fisd; }
+            else for (int x = 0; x < P; x++) { const uint8_t *src = ctu + q0 + qs * x; for (int k = 0; k < nrow; k++) v[(size_t)k * P + x] = ((float)src[-k] - fmean) * fisd; }
+            for (int k = 0; k < nrow; k++) {
+                float *vk = v + (size_t)k * P;
+                const int z = byz ? z0 + k : z0, yy = byz ? y0 : y0 + k;
+                if (jitter) {
+                    if (ni) { const uint16_t *q = ni + ((size_t)k * P + yy) * P; for (int x = 0; x < P; x++) vk[x] = ia * vk[x] + ib + isg * g_ntab[q[x]]; }
+                    else { const float *q = nr + (size_t)k * P; for (int x = 0; x < P; x++) vk[x] = ia * vk[x] + ib + isg * q[x]; }
+                }
+                uint16_t *hd = H + (size_t)z * p2 + (size_t)yy * P;
+                if (xfmt == 1) f16_row(vk, hd, P); else for (int x = 0; x < P; x++) hd[x] = bf16_rn(vk[x]);
+            }
+        }
+    }
+    free(v); free(ni); free(nr);
+}
 static void write_x(const uint8_t *ctu, int D, int P, const int64_t o[3], float fmean, float fisd, int hasax, const float *cyz, const float *cxz,
                     sym y, int jitter, float ia, float ib, float isg, rng *r, float *nrow, int xfmt, float *X, uint16_t *H,
                     const ct_aug_plan *ap, float *noise_row_state, float *noise_plane_state, int ct_only) {   /* ap: the CT appearance plan (cubes, D == P), else nullptr;
                                                                                                     ct_only (--gpu-input): channel 0 only (the same rng draws) */
     pthread_once(&g_ntab_once, ntab_init);
+    if (ct_only && !ap && xfmt && !getenv("UFSM_WRITE_X_ROWS")) { write_x_ct(ctu, D, P, fmean, fisd, y, jitter, ia, ib, isg, r, xfmt, H); return; }
     if (ct_only) hasax = 0;   /* (the radial rows are not written) */
     const size_t p3 = (size_t)D * P * P; const int nd[3] = {D, P, P};
     const float sgn[3] = {y.flip[0] ? -1.f : 1.f, y.flip[1] ? -1.f : 1.f, y.flip[2] ? -1.f : 1.f};

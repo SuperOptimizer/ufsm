@@ -24,6 +24,11 @@ before its first step (38.3 GB RSS): host RAM, not the GPU, bound the window. Pe
 Laptop RTX 5080, P512: host VmHWM 16.5 -> 12.3 GB, device 4626 MiB (planner 4.89 GB), 1.53 samp/s either way. P768: killed at
 38.3 GB -> runs at 32.9 GB VmHWM (31.5 GB steady), device peak 13.8 GB (planner 15.13 of 15.51 GB), 0.46 samp/s = 208 Mvox/s
 (P512: 205), sampler wait 5-7% with 6 workers (UFSM_SAMPLER_PROF: 7.3 cpu-s per P768 window, 48% of it the x16 CT stage).
+- The x16 stage of --gpu-input (the CT channel alone) gathered each output row along the window's symmetry: for 2 of 3 symmetries a
+  strided source axis, one cache line (often a page) per voxel. write_x_ct gathers 16 rows whose source rows are adjacent at once
+  (16 output planes when output z runs along source x, their noise rows drawn first in write_x's order and kept as table indices),
+  the same draws and float operations: test_gpu_input's 48 symmetries stay bit-identical, bench_sampler hashes unchanged
+  (UFSM_WRITE_X_ROWS=1: the row path). P768: x16 3492 -> 1050 ms per window, the window 7.3 -> 4.6 cpu-s, sampler wait 5% -> 0%.
 ## Planner dial: --mem fast is PCIe-aware; the pick prints B / voxel and copy bytes (2026-10-15)
 `--mem auto` (default) still takes the leanest mode that fits. `--mem fast` takes the fastest and first tries every mode with no
 pinned host offloads (unet_set_host_offloads(0): encoder a1, input, level-0 skip / A share, down outputs, coarse skips) and no
