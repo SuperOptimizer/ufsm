@@ -126,6 +126,9 @@ struct unet {
     void *h_a2, *ev_a2[4];
     void *ev_head;                           /* l3b: recorded in enc[0]'s backward once the batch head (X2) and the radial records are read for the last time */
     int xin_inf, lg_t1; size_t t1_bytes; float *lg_p; size_t lg_bytes;   /* lg_t1: the logits in lg_p (T1, or Y with level-1 slabs), lg_bytes registered */
+    int lg_x;                                /* lg_t1 in X itself (slabs, one fp16 logit channel, a 16-wide level 0 whose Y cannot hold them): the head
+                                                runs per z-slab into the slab temp, each slab copied to the logits' planes at X's start, X data planes
+                                                that slab and the earlier ones have consumed (unet_forward_x) */
     int slab, slab1, slab_s; float *slab_tmp, *slab_carry, *t1p;   /* slab1: level 1 in place too (Y = enc[1].a2's buffer; UFSM_INFER_SLAB_L1=0 off) */
     int ct_mode, ct_stem; float *slab_xin;    /* unet_set_ct_input: the caller passes the uint8 CT window (unet_forward_ct); with slabs and an MX-fp8 stem
                                                  input the stem builds its input per slab from it (no full-window input) */
@@ -587,7 +590,7 @@ static void free_acts(unet *u) {
     u->h_xin = nullptr; u->xin_shared = u->xin_out = u->a2_stale = 0; u->xin_bytes = 0;
     if (u->h_a2) { if (u->a2_out) nn_sync(); nn_host_free(u->h_a2); }
     u->h_a2 = nullptr; u->a0_share = u->a2_out = 0;
-    u->xin_inf = u->lg_t1 = 0; u->t1_bytes = 0; u->lg_p = nullptr; u->lg_bytes = 0;
+    u->xin_inf = u->lg_t1 = u->lg_x = 0; u->t1_bytes = 0; u->lg_p = nullptr; u->lg_bytes = 0;
     {
         float *q[6] = {u->slab_tmp, u->slab_carry, u->slab_xin, u->slab_tmp1, u->slab_carry1, u->slab_tmpd};
         for (int j = 0; j < 6; j++) if (interior(u, q[j])) { if (!g_dry && j == 2) nn_storage_forget(q[j]); q[j] = nullptr; }
@@ -613,17 +616,22 @@ static void build_block_acts(unet *u, block *b, shape5 xs, int train, int keep_s
     b->m1 = dalloc(u, (size_t)xs.n * G); b->r1 = dalloc(u, (size_t)xs.n * G); b->m2 = dalloc(u, (size_t)xs.n * G); b->r2 = dalloc(u, (size_t)xs.n * G);
 }
 static size_t act_bytes_of(shape5 s) { return act_mx8() ? nn_mx_bytes(s, act_dt()) : shape_numel(s) * (ABF ? 2 : 4); }
+/* MX storage: channels per block of a c-channel tensor (nn_mx4_bytes), and the bytes per voxel of one block's data row */
+static int mx_bw_of(int c) { return c <= 8 ? 8 : c <= 16 ? 16 : 32; }
+static int mx_rb_of(int c) { return act_mx4() ? mx_bw_of(c) / 2 : mx_bw_of(c); }
+/* in-place inference slabs at a level of c channels: whole MX blocks (8, 16 or a multiple of 32 channels) */
+static int slab_w_ok(int c) { return c % 32 == 0 || c == 16 || c == 8; }
 
 /* coarse offload: enc[1]'s conv1 reads down0's output (w[0] channels) in place in Y (w[1]): placed at the data rows of Y's last
    w[0] / 32 blocks, so plane z of each of its blocks (data rows, then scales) sits where Y's plane z of a block goes */
-static size_t p3_down_off(const unet *u) {
-    const int bw = 32, nb0 = (u->cfg.widths[0] + bw - 1) / bw, nb1 = (u->cfg.widths[1] + bw - 1) / bw, rb = act_mx4() ? bw / 2 : bw;
+static size_t p3_down_off(const unet *u) {   /* (build_acts: one block width for w[0] and w[1]) */
+    const int bw = mx_bw_of(u->cfg.widths[1]), nb0 = (u->cfg.widths[0] + bw - 1) / bw, nb1 = (u->cfg.widths[1] + bw - 1) / bw, rb = mx_rb_of(u->cfg.widths[1]);
     return (size_t)(nb1 - nb0) * shape_spatial(u->ls[1]) * rb;
 }
 /* dec[0]'s conv1 under the coarse offload: planes of the slab at z0 that fit its temp in Y's consumed coarse planes (block 0's
    data rows below (z0 >> 1) - 3; the up staging reads from (z0 >> 1) - 2 on), from Y + 256, a multiple of 4 */
 static int dc1_fity(const unet *u, int z0) {
-    const int cz = (z0 >> 1) - 3, rb = act_mx4() ? 16 : 32;
+    const int cz = (z0 >> 1) - 3, rb = mx_rb_of(u->cfg.widths[1]);
     if (cz <= 0) return 0;
     const long long avail = (long long)cz * u->ls[1].h * u->ls[1].w * rb - 256;
     shape5 p = u->ls[0]; p.c = u->cfg.widths[0]; p.d = 1;
@@ -684,8 +692,8 @@ static void build_acts(unet *u, shape5 xs, int train) {
         T1 = dalloc_act_s(u, m1);
     }
     /* in-place slab convs at level 0 (see unet.slab): X holds every level-0 tensor; T1 only serves the coarser levels */
-    const int slab = share && reuse_skip && infer_alias() && act_mx8() && infer_slab() > 0 && u->cfg.enc_blocks[0] == 0 && w[0] % 32 == 0 && !any_single(u);
-    const int slab1 = slab && L > 2 && w[1] % 32 == 0 && u->cfg.enc_blocks[1] == 0 && (!getenv("UFSM_INFER_SLAB_L1") || ufsm_env_on("UFSM_INFER_SLAB_L1"));
+    const int slab = share && reuse_skip && infer_alias() && act_mx8() && infer_slab() > 0 && u->cfg.enc_blocks[0] == 0 && slab_w_ok(w[0]) && !any_single(u);
+    const int slab1 = slab && L > 2 && slab_w_ok(w[1]) && u->cfg.enc_blocks[1] == 0 && (!getenv("UFSM_INFER_SLAB_L1") || ufsm_env_on("UFSM_INFER_SLAB_L1"));
     float *X = nullptr, *Y = nullptr;
     u->slab = slab; u->slab1 = slab1; u->slab_s = slab ? (infer_slab() + 3) / 4 * 4 : 0;
     float *SK[UNET_MAXLEV] = {0};   /* coarse offload: the skips below level 1 inside R */
@@ -699,23 +707,23 @@ static void build_acts(unet *u, shape5 xs, int train) {
             m2.c = 0;
             for (int i = slab1 ? 2 : 1; i < L - 1; i++) { shape5 y = u->ls[i]; y.c = w[i]; if (act_bytes_of(y) > act_bytes_of(m2)) m2 = y; }
         }
-        const int off_ok = slab1 && infer_offload() && !u->nrb_any && w[1] >= w[0];   /* (enc[1]'s conv1 in place over the down output in Y) */
+        const int off_ok = slab1 && infer_offload() && !u->nrb_any && w[1] >= w[0] && mx_bw_of(w[0]) == mx_bw_of(w[1]);   /* (enc[1]'s conv1 in place over the down output in Y: its blocks nest in Y's) */
         for (int i = off_ok ? 1 : 0; i < L - 1; i++) { shape5 d = u->ls[i + 1]; d.c = w[i]; if (act_bytes_of(d) > act_bytes_of(m2)) m2 = d; }
         for (int i = 0; i < L - 1; i++) { shape5 c = u->ls[i]; c.c = UPW(i + 1); if (act_bytes_of(c) > act_bytes_of(mc)) mc = c; }
         /* the coarse offload (unet.p3): R's contents, the slab size that fits Y's level-0 temps, the dec[0] conv1 schedule */
         shape5 y0 = u->ls[0]; y0.c = w[0];
         shape5 y1 = u->ls[1]; y1.c = w[1];
-        const int ct_ok = u->ct_mode && input_mx() && unet_input_prec() == 8 && xs.h == xs.w && xs.n == 1 && u->cfg.cin == 4;
+        const int ip = unet_input_prec(), ct_ok = u->ct_mode && input_mx() && (ip == 8 || ip == 4) && xs.h == xs.w && xs.n == 1 && u->cfg.cin == 4;
         int p3 = 0;
         if (off_ok) {
             const size_t xb = act_bytes_of(y0), yb = act_bytes_of(y1), A = 256;
-            const int bw0 = 32, nb0 = (w[0] + bw0 - 1) / bw0, rb0 = act_mx4() ? bw0 / 2 : bw0;
+            const int bw0 = mx_bw_of(w[0]), nb0 = (w[0] + bw0 - 1) / bw0, rb0 = mx_rb_of(w[0]);
             const size_t S0 = shape_spatial(y0), blk_data = S0 * rb0;
             int s = u->slab_s;
             for (; s >= 4; s -= 4) {
                 shape5 t0 = y0; t0.d = s < y0.d ? s : y0.d;
                 shape5 xi = xs; xi.d = t0.d + 2; if (xi.d > xs.d) xi.d = xs.d;
-                if (A + ((act_bytes_of(t0) + 255) & ~(size_t)255) + (ct_ok ? nn_mx_bytes(xi, 8) : 0) <= yb) break;
+                if (A + ((act_bytes_of(t0) + 255) & ~(size_t)255) + (ct_ok ? nn_mx_bytes(xi, ip) : 0) <= yb) break;
             }
             if (s >= 4) {
                 shape5 t0 = y0; t0.d = s < y0.d ? s : y0.d;
@@ -750,7 +758,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
         if (p3) {   /* R = the end of X's data region; every coarse buffer inside it, the level-0 temps inside Y */
             u->Xp = X; u->Yp = Y;
             {   /* (MX layout: data rows of every block, then the scales; R ends where X's data ends) */
-                const int bw0 = 32, nb0 = (w[0] + bw0 - 1) / bw0, rb0 = act_mx4() ? bw0 / 2 : bw0;
+                const int bw0 = mx_bw_of(w[0]), nb0 = (w[0] + bw0 - 1) / bw0, rb0 = mx_rb_of(w[0]);
                 u->R = (float *)((char *)X + (size_t)nb0 * shape_spatial(y0) * rb0 - u->r_bytes);
             }
             char *r = (char *)u->R + 256;
@@ -779,11 +787,11 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 ts.d = 1; u->slab_carry = dalloc_act_s(u, ts);
                 u->slab_tmp1 = u->slab_tmp; u->slab_carry1 = u->slab_carry;
                 u->ct_stem = ct_ok;
-                if (u->ct_stem) {   /* the stem's MX-fp8 input of one slab and its halo planes */
+                if (u->ct_stem) {   /* the stem's MX input (fp8, or fp4: the trainer's --gpu-input precision) of one slab and its halo planes */
                     g_mlab = "logits (fp32) / network input";
                     shape5 xi = xs; xi.d = (u->slab_s < xs.d ? u->slab_s : xs.d) + 2; if (xi.d > xs.d) xi.d = xs.d;
-                    const size_t xb_ = nn_mx_bytes(xi, 8); u->act_bytes += xb_;
-                    u->slab_xin = dalloc_oom(dmalloc(xb_), xb_); dstorage(u->slab_xin, xb_, 8);
+                    const size_t xb_ = nn_mx_bytes(xi, ip); u->act_bytes += xb_;
+                    u->slab_xin = dalloc_oom(dmalloc(xb_), xb_); dstorage(u->slab_xin, xb_, ip);
                 }
             }
         }
@@ -1081,10 +1089,16 @@ static void build_acts(unet *u, shape5 xs, int train) {
     }
     const size_t lgb = shape_numel(os) * (u->logits_h16 ? 2 : 4);
     const int ialias = share && reuse_skip && infer_alias() && act_mx8();   /* inference aliasing (see unet.xin_inf / lg_t1) */
-    u->lg_t1 = u->xin_inf = 0;
+    u->lg_t1 = u->xin_inf = u->lg_x = 0;
     if (!u->logits && ialias && !u->p3 && lgb <= u->t1_bytes) { u->logits = T1; u->lg_t1 = 1; u->lg_p = T1; u->lg_bytes = u->t1_bytes; }   /* (coarse offload: T1 is in X) */
     else if (!u->logits && slab1 && lgb <= act_bytes_of(u->enc[1].ys)) {   /* Y: dec[1].a2, dead once dec[0]'s conv1 has upsampled it */
         u->logits = Y; u->lg_t1 = 1; u->lg_p = Y; u->lg_bytes = act_bytes_of(u->enc[1].ys);
+    } else if (!u->logits && slab && !train && ialias && u->logits_h16 && os.c == 1 && (w[0] + mx_bw_of(w[0]) - 1) / mx_bw_of(w[0]) == 1 && rc
+               && lgb <= shape_spatial(u->ls[0]) * (size_t)mx_rb_of(w[0]) && !(getenv("UFSM_INFER_LGX") && !ufsm_env_on("UFSM_INFER_LGX"))) {
+        /* X (dec[0].a2) itself: the fp16 plane-major logits over its first data rows, written per z-slab after the slab's head has read
+           its planes (lg_x; 16-wide level 0: Y holds 1.1 of the 2 B per voxel; UFSM_INFER_LGX=0: their own buffer) */
+        shape5 y0 = u->ls[0]; y0.c = w[0];
+        u->logits = X; u->lg_t1 = u->lg_x = 1; u->lg_p = X; u->lg_bytes = act_bytes_of(y0);
     }
     if (train && u->head_ext) { u->logits = nullptr; u->lg_t1 = 0; }   /* head slabs: no whole-window logits */
     else if (!u->logits) u->logits = dalloc(u, (lgb + 3) / 4);
@@ -1513,19 +1527,20 @@ static int dec_conv1(unet *u, block *b, int level, float *y, int G, float *m, fl
    the input planes below the next slab's first input plane (its first output plane - 1) are dead; the last waits in the carry plane
    until the next slab is computed. Per voxel the same arithmetic as one launch (tile starts stay multiples of 4); the statistics
    differ only in the summation order. */
-/* the stem of a CT forward (unet_forward_ct, unet.ct_stem): per slab its MX-fp8 input planes (and one halo plane each side) built from
+/* the stem of a CT forward (unet_forward_ct, unet.ct_stem): per slab its MX input planes (fp8 or fp4: unet_input_prec; one halo plane each side) built from
    the CT (nn_pred_input_mx8, bit-identical to the 16-bit input + conversion), the stem through the z-range into slab_tmp, then into X
    as slab_run (the caller's CT may live at the end of X: X's last scale planes, written plane for plane only once dead) */
 static void stem_slab_run(unet *u, block *b, int G, float *om, float *orr) {
     float *X = b->a1;
     const shape5 ys = b->ys; const int D = ys.d, W = ys.w, s = u->slab_s;
-    const size_t xb_ = nn_mx_bytes((shape5){1, 4, s + 2 < D ? s + 2 : D, ys.h, ys.w}, 8);
+    const int ip = unet_input_prec();   /* the stem input's MX format (8 or 4, build_acts ct_ok) */
+    const size_t xb_ = nn_mx_bytes((shape5){1, 4, s + 2 < D ? s + 2 : D, ys.h, ys.w}, ip);
     nn_gn_t gi = gn_in(u, b);
     for (int z0 = 0, k = 0; z0 < D; z0 += s, k++) {
         const int sk = D - z0 < s ? D - z0 : s, last = z0 + sk >= D;
         const int tlo = z0 > 0 ? z0 - 1 : 0, thi = z0 + sk + 1 < D ? z0 + sk + 1 : D, nt = thi - tlo;
-        nn_set_storage(u->slab_xin, xb_, 8);
-        nn_pred_input_mx8(u->ctin.ct, W, u->ctin.mean, u->ctin.isd, u->ctin.dyo, u->ctin.dxo, u->ctin.axis, tlo, nt, u->slab_xin, u->ctin.h16);
+        nn_set_storage(u->slab_xin, xb_, ip);
+        nn_pred_input_mx(u->ctin.ct, W, u->ctin.mean, u->ctin.isd, u->ctin.dyo, u->ctin.dxo, u->ctin.axis, tlo, nt, u->slab_xin, u->ctin.h16, ip);
         nn_set_zrange(z0 - tlo, nt, k == 0, last, D, z0);
         shape5 xs = {1, 4, sk, ys.h, ys.w};
         PROF(0, nn_conv3d_fwd_gn_stats(u->slab_xin, xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, u->slab_tmp, G, 1e-5f, om, orr));
@@ -1710,7 +1725,7 @@ const float *unet_forward(unet *u, const float *x, shape5 xs, int train) { retur
    input): the network input is never materialised for the whole window */
 const float *unet_forward_ct(unet *u, const uint8_t *ct, float mean, float isd, const float *dyo, const float *dxo, int axis, shape5 xs, int h16) {
     unet_build(u, xs, 0);
-    if (!u->ct_stem) { fprintf(stderr, "unet_forward_ct: not a CT-stem build (unet_set_ct_input, UFSM_INFER_SLAB, MX-fp8 stem input)\n"); abort(); }
+    if (!u->ct_stem) { fprintf(stderr, "unet_forward_ct: not a CT-stem build (unet_set_ct_input, UFSM_INFER_SLAB, an MX-fp8 or MX-fp4 stem input)\n"); abort(); }
     u->ctin.ct = ct; u->ctin.mean = mean; u->ctin.isd = isd; u->ctin.dyo = dyo; u->ctin.dxo = dxo; u->ctin.axis = axis; u->ctin.h16 = h16; u->ctin.on = 1;
     const float *lg = unet_forward_x(u, nullptr, xs, 0, h16);
     u->ctin.on = 0;
@@ -1871,7 +1886,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     nn_set_layer(3 * L - 2);
     if (!(u->head_ext && !u->logits)) {   /* (head slabs: the trainer runs the head per z-slab, unet_head_fwd_z; a training build has no
                                             whole-window logits, so its validation forwards (train 0, no rebuild) skip the head too) */
-        if (u->lg_t1) nn_set_storage(u->logits, u->lg_bytes, 0);   /* plain fp32 plane-major logits over dec[0].a1 (or the level-1 buffer) */
+        if (u->lg_t1 && !u->lg_x) nn_set_storage(u->logits, u->lg_bytes, 0);   /* plain fp32 plane-major logits over dec[0].a1 (or the level-1 buffer) */
         if (l3_sched(u)) {   /* (the coarse forward homes and the input in X3 copied out; without l3_sched dec[0]'s conv2 waited) */
             if (u->xin_shared && u->xin_out) nn_stream_wait(0, u->ev_xin[1]);
             if (u->dno && u->dn_out) for (int k = 0; k < L - 1; k++) nn_stream_wait(0, u->ev_dn[k][1]);
@@ -1881,7 +1896,21 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         nn_set_head_out_h16(u->logits_h16);
         const int hc0 = !u->train && u->head_nc ? u->head_c0 : 0, hnc = !u->train && u->head_nc ? u->head_nc : u->cfg.cout;   /* rows of the 1^3 head */
         const float *hw = P(u, u->head.w) + (size_t)hc0 * w[0], *hb = P(u, u->head.b) + hc0;
-        if (recompute()) { nn_gn_t g = gn_out(u, &u->dec[0]); int r; PROF(0, r = nn_conv3d_fwd_x(u->dec[0].a2, &g, nullptr, nullptr, 0, 0, u->dec[0].ys, hw, hb, hnc, 1, 1, u->logits, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("head"); }
+        if (u->lg_x) {   /* the logits over X (dec[0].a2): per z-slab into the slab temp, then to their planes at X's start (data planes
+                            [z0 / 4, (z0 + s) / 4) at 8 B per 16-channel MX-fp4 voxel: read by this slab or before) */
+            nn_gn_t g = gn_out(u, &u->dec[0]);
+            const size_t hwp = (size_t)u->ls[0].h * u->ls[0].w;
+            const int D = u->ls[0].d, s = u->slab_s;
+            void *tmp = u->p3 ? (void *)((char *)u->Yp + 256) : (void *)u->slab_tmp;   /* (p3: Y, free once dec[0]'s conv1 has upsampled dec[1]) */
+            for (int z0 = 0; z0 < D; z0 += s) {
+                const int sk = D - z0 < s ? D - z0 : s;
+                int r; PROF(0, r = nn_head_fwd_z(u->dec[0].a2, &g, u->dec[0].ys, hw, hb, hnc, tmp, (size_t)z0 * hwp, (size_t)sk * hwp));
+                if (r) rc_fail("head (slabs over X)");
+                nn_d2d_async((char *)u->logits + (size_t)z0 * hwp * 2, tmp, (size_t)sk * hwp * 2);
+            }
+            nn_set_storage(u->logits, u->lg_bytes, 0);   /* plain fp16 planes for the readers (re-registered at the next forward) */
+        }
+        else if (recompute()) { nn_gn_t g = gn_out(u, &u->dec[0]); int r; PROF(0, r = nn_conv3d_fwd_x(u->dec[0].a2, &g, nullptr, nullptr, 0, 0, u->dec[0].ys, hw, hb, hnc, 1, 1, u->logits, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("head"); }
         else PROF(0, nn_conv3d_fwd(cur, u->dec[0].ys, hw, hb, hnc, 1, 1, u->logits));
         nn_set_head_out_h16(0);
     }
