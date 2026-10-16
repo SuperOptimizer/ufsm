@@ -251,6 +251,7 @@ void nn_l0_affine(float *x, shape5 s, int G, const float *mean, const float *rst
 void nn_slab_perm(float *dst, const float *src, shape5 s, int Sz, int dir);
 /* GroupNorm forward fused with SiLU (y = silu(gn(x))), and recompute of both g = gn(x) and silu(g). */
 int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *mean, float *rstd);   /* stats of the stored fp32, 16-bit or MX tensor; -1 for unsupported groups */
+int nn_gn_stats_n(const float *x, shape5 s, int G, float eps, float *mean, float *rstd, int n0, int cnt);   /* samples [n0, n0 + cnt) only (MX), nn_gn_stats's bits */
 void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd);
 void nn_gn_apply_silu(const float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, float *g, float *sil);
 /* Recompute y = gn(x) from saved mean/rstd (no statistics pass). */

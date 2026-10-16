@@ -107,6 +107,9 @@ long unet_gn_pooled(unet *u, float *h);     /* pooled statistics (unet_gn_nstats
    Defaults 0.01, 100; unet_l0_updates: training forwards so far (saved in checkpoints with the statistics) */
 void unet_set_l0_ema(unet *u, float mom, int warm);
 void unet_set_l0_slab_kern(int on);   /* --l0-norm slab on the kernel path (readers apply per-slab statistics; 1) or D's prototype (0); -1: env UFSM_L0_SLAB_KERN */
+void unet_set_l0_stream(int on);      /* the level-0 slab stream (stage S3: level-0 ops per slab in a skewed schedule; 1); -1: env UFSM_L0_STREAM */
+void unet_l0_stream_dump(int on);     /* test hook: keep device copies of gout[1] after dec[0]'s backward (0), d/d downo[0] (1), the skip gradient (2) */
+const void *unet_l0_stream_dumped(int k, size_t *bytes);
 /* ema: recalibrate the running statistics of the weights in use (the EMA weights' after unet_use_ema(u, 1)) -- every forward from
    unet_l0_recal(u, 1) to unet_l0_recal(u, 0) normalises with its window's statistics, their cumulative mean replaces that set (the
    standard BatchNorm recalibration of averaged weights; the update count and the other set unchanged) */
