@@ -1328,6 +1328,15 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (s->tgt_side[ch]) {   /* side labels (band.h RV_*) -> channel 0 recto-side papyrus, channel 1 verso-side papyrus (clean CT >= the
                                         source's cutoff); void 0 in both; papyrus of unknown side ignored in both; CT 0 masked below */
                 uint8_t *vs = ttmp + (size_t)CH_SHEET * p3; int any = 0;
+                if (s->tgt_votes_soft[ch]) {   /* side votes kept as codes ("soft": 1): recto-side papyrus r / (r + v), verso the rest */
+                    const uint8_t *lut = s->tgt_vote_lut[ch];
+                    for (size_t k = 0; k < p3; k++) {
+                        const uint8_t p = lut[dst[k]];
+                        if (ctu[k] < iso_t) dst[k] = vs[k] = 0;
+                        else if (p != 255) { dst[k] = p; vs[k] = (uint8_t)(254 - p); any = 1; }
+                        else dst[k] = vs[k] = 255;
+                    }
+                } else
                 for (size_t k = 0; k < p3; k++) {
                     const uint8_t sv = dst[k];
                     if (ctu[k] < iso_t) dst[k] = vs[k] = 0;

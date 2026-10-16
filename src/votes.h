@@ -9,6 +9,7 @@
    (prediction residuals, literal tokens up to 7) stores agreeing overlaps (0,2) / (2,0) about as compactly as single votes; a
    nibble layout (r << 4 | v) puts recto and verso 15 apart and costs bypass bits at every recto / verso face (bench_votes). */
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 enum { VOTE_MAX = 15 };
@@ -46,3 +47,10 @@ static inline void vote_side_lut(int rule, int min, uint8_t lut[256]) {
         lut[c] = s;
     }
 }
+
+/* Several surface sets' side / vote arrays (equal shapes, fill 0) added into one vote array <out_group>/<um> (lossless volcomp,
+   S^3 shards, nt threads), an OME group of that level. stats: voxels with votes, those with both recto and verso votes.
+   Returns 0, or -1 with side_votes_error(). (src/votes.c; needs zarr3.h / z3w.h) */
+typedef struct z3 z3;
+int side_votes_merge(const char *out_group, double um, z3 *const *in, const char *const *names, int nin, int S, int nt, int *nshards, size_t stats[2]);
+const char *side_votes_error(void);

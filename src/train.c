@@ -1218,7 +1218,7 @@ int cmd_train(int argc, char **argv) {
            target rows), --split, the papyrus task, --dist-head, the sheet prior or --overfit (geometry warps: nearest-code targets);
            --pack-targets 0: target and mask bytes */
         int hard = S->n > 0;
-        for (int i = 0; i < S->n; i++) hard &= S->src[i].tgt_side[CH_RECTO];
+        for (int i = 0; i < S->n; i++) hard &= S->src[i].tgt_side[CH_RECTO] && !S->src[i].tgt_votes_soft[CH_RECTO];   /* soft side votes: fractions */
         g_pack = atoi(opt(argc, argv, "--pack-targets", "1")) && hard && !g_heads && !split && !sc.papyrus && sc.dist_sigma <= 0 && !sc.sheet && !overfit;   /* (warped windows take the nearest source voxel's code) */
         sc.pack_tm = g_pack;
         if (g_pack) fprintf(stderr, "targets: packed, one byte per voxel on the host and in the upload (--pack-targets 0: target and mask bytes)\n");

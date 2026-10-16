@@ -66,6 +66,11 @@ typedef struct {
     int tgt_min_level[NCH];   /* finest stored CT rung; binary targets can upsample finer requests */
     int tgt_side[NCH];        /* recto only, "encoding": "side": recto / verso side labels (src/band.h RV_*: phase-raster --pair 2), nearest-upsampled;
                                  the sampler turns them into recto-side / verso-side papyrus (channels 0 / 1) with the source's void cutoff */
+    int tgt_votes[NCH];       /* "encoding": "side-votes" (tgt_side set too): bytes are src/votes.h vote codes, turned into side codes on
+                                 read by tgt_vote_lut ("votes": {"rule": "unanimous" | "majority", "min": 1}); "soft": 1 keeps the codes and
+                                 the sampler writes recto-side papyrus r / (r + v) (soft targets: not packable) */
+    int tgt_votes_soft[NCH];
+    uint8_t tgt_vote_lut[NCH][256];   /* hard: vote code -> RV_*; soft: vote code -> round(254 r / (r + v)), 255 below "min" votes */
     int tgt_erode[NCH], tgt_dilate[NCH];   /* binary targets: "erode" / "dilate" N voxels at the training level (bands of every teacher the same
                                               thickness: e.g. a thick pseudo-label band eroded to the published labels' width) */
     int tgt_prob[NCH];        /* "encoding": "prob": bytes are round(p * 255) (teacher probabilities, no ignore class); read as

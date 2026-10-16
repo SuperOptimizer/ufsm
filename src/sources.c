@@ -1,5 +1,6 @@
 #include "sources.h"
 #include "json.h"
+#include "votes.h"
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -113,7 +114,23 @@ sources *sources_load(const char *path) {
             if (t->type == J_STR) { s->tgt_key[c] = strdup(t->str); continue; }
             s->tgt_binary[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "binary");
             s->tgt_prob[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "prob");
-            s->tgt_side[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "side");
+            s->tgt_votes[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "side-votes");
+            s->tgt_side[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "side") || s->tgt_votes[c];
+            if (s->tgt_votes[c]) {   /* src/votes.h: a side array is a vote array of one set, so either kind of array works here */
+                const json *vj = json_get(t, "votes");
+                const char *rule = json_str(json_get(vj, "rule"), "unanimous");
+                const double vmin = json_num(json_get(vj, "min"), 1), soft = json_num(json_get(vj, "soft"), 0);
+                const int majority = !strcmp(rule, "majority");
+                if ((!majority && strcmp(rule, "unanimous")) || !(vmin >= 1 && vmin <= VOTE_MAX) || vmin != (int)vmin || (soft != 0 && soft != 1)) {
+                    fprintf(stderr, "sources: %s: \"votes\": {\"rule\": \"unanimous\" | \"majority\", \"min\": 1..15, \"soft\": 0 | 1}\n", s->name);
+                    json_free(j); sources_free(S); return nullptr;
+                }
+                s->tgt_votes_soft[c] = soft != 0;
+                if (soft) for (int k = 0; k < 256; k++) {
+                    int r, v; vote_split((uint8_t)k, &r, &v);
+                    s->tgt_vote_lut[c][k] = r + v >= (int)vmin ? (uint8_t)((254 * r + (r + v) / 2) / (r + v)) : 255;
+                } else vote_side_lut(majority ? VOTE_MAJORITY : VOTE_UNANIMOUS, (int)vmin, s->tgt_vote_lut[c]);
+            }
             if (s->tgt_side[c] && (c != CH_RECTO || s->iso <= 0)) {
                 fprintf(stderr, "sources: %s: \"encoding\": \"side\" is a recto target and needs the source's void cutoff \"iso\"\n", s->name); json_free(j); sources_free(S); return nullptr;
             }
@@ -443,6 +460,10 @@ int source_read_target(source *s, int ch, int level, const int64_t o[3], const i
     int actual = level; z3 *z = source_tgt_for_level(s, ch, level, &actual);
     if (!z) return -1;
     int rc = z3_read_label_grid(z, s->tgt_side[ch] ? 2 : s->tgt_binary[ch] || (z && z3_meta_of(z)->label_binary), actual - level, o, n, out, nthreads);
+    if (!rc && s->tgt_votes[ch] && !s->tgt_votes_soft[ch]) {   /* vote codes -> side codes (RV_*): the rest of the sampler sees a side array */
+        const size_t nv = (size_t)n[0] * n[1] * n[2]; const uint8_t *lut = s->tgt_vote_lut[ch];
+        for (size_t k = 0; k < nv; k++) out[k] = lut[out[k]];
+    }
     if (!rc && s->tgt_prob[ch]) {   /* p * 255 -> p * 254: 255 is the ignore code downstream */
         size_t nv = (size_t)n[0] * n[1] * n[2];
         for (size_t k = 0; k < nv; k++) out[k] = (uint8_t)((out[k] * 254 + 127) / 255);

@@ -2,6 +2,7 @@
 #include "sample.h"
 #include "sources.h"
 #include "band.h"
+#include "votes.h"
 #include "edt.h"
 #include "store.h"
 #include "zarr3.h"
@@ -55,7 +56,8 @@ static int usage(void) {
         "  ufsm sample  <sources.json> [--P 128] [--B 2] [--n 4] [--seed S] [--workers W] [--out DIR] [--noaug]\n"
         "  ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1]   warm the CT chunk cache for the labelled cells\n"
         "  ufsm phase-raster <codes-root> <key> <out-dir> [--box ...]          band phase precomputed for the sampler\n"
-        "  ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase  one array halved per axis (labels, phase)\n"
+        "  ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase|votes  one array halved per axis (labels, phase, side votes)\n"
+        "  ufsm side-votes <out-group> <out-um> <root> <key> [<root> <key> ...]   several surface sets' side labels added into one vote array\n"
         "  ufsm ct-hist <out.txt> <root> <key> z,y,x,n [...]  CT histograms of boxes (targets of train --aug-hist, the hist op)\n"
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
@@ -1026,7 +1028,9 @@ static int cmd_ct_hist(int argc, char **argv) {
    mode with cos / sin tables (the same doubles as cos / sin of each code) */
 static double g_ds_cs[PHASE_PERIOD], g_ds_sn[PHASE_PERIOD];
 static void ds_tables(void) { for (int k = 0; k < PHASE_PERIOD; k++) { g_ds_cs[k] = cos(2 * M_PI * k / PHASE_PERIOD); g_ds_sn[k] = sin(2 * M_PI * k / PHASE_PERIOD); } }
-typedef struct { const uint8_t *src; int64_t n[3]; uint8_t *dst; int S; int64_t ny, nx, na; int phase; atomic_long next; } ds_job;
+static uint8_t g_ds_vr[256], g_ds_vv[256];   /* --mode votes: vote code -> recto / verso counts (src/votes.h) */
+static void ds_vote_tables(void) { for (int k = 0; k < 256; k++) { int r, v; vote_split((uint8_t)k, &r, &v); g_ds_vr[k] = (uint8_t)r; g_ds_vv[k] = (uint8_t)v; } }
+typedef struct { const uint8_t *src; int64_t n[3]; uint8_t *dst; int S; int64_t ny, nx, na; int phase; atomic_long next; } ds_job;   /* phase: 1 phase, 2 votes */
 static void *ds_worker(void *arg) {
     ds_job *jb = arg; const int64_t *n = jb->n; const int S = jb->S;
     for (int64_t a; (a = atomic_fetch_add(&jb->next, 1)) < jb->na;) {
@@ -1042,6 +1046,7 @@ static void *ds_worker(void *arg) {
                     if (r && yy >= 0 && xx >= 0) v[nv++] = r[(size_t)yy * n[2] + xx];
                 }
                 if (!jb->phase) { int mx = 0; for (int k = 0; k < nv; k++) mx = v[k] > mx ? v[k] : mx; out[c] = (uint8_t)mx; continue; }
+                if (jb->phase == 2) { int r = 0, vv = 0; for (int k = 0; k < nv; k++) { r += g_ds_vr[v[k]]; vv += g_ds_vv[v[k]]; } out[c] = vote_code(r, vv); continue; }
                 double cs = 0, sn = 0; int known = 0;
                 for (int k = 0; k < nv; k++) if (v[k] < PHASE_PERIOD) { cs += g_ds_cs[v[k]]; sn += g_ds_sn[v[k]]; known++; }
                 uint8_t o = PHASE_UNKNOWN;
@@ -1061,18 +1066,19 @@ static void ds_run(ds_job *jb, int nt) {
     for (int i = 0; i < k; i++) pthread_join(th[i], nullptr);
 }
 static int cmd_downsample(int argc, char **argv) {
-    if (argc < 6) { fprintf(stderr, "usage: ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase [--box z,y,x,nz,ny,nx] [--shard 512] [--cache DIR] [--threads 16]\n"); return 2; }
-    const char *mode = opt(argc, argv, "--mode", "max"); const int phase = !strcmp(mode, "phase");
-    if (!phase && strcmp(mode, "max")) { fprintf(stderr, "downsample: --mode max|phase\n"); return 2; }
+    if (argc < 6) { fprintf(stderr, "usage: ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase|votes [--box z,y,x,nz,ny,nx] [--shard 512] [--cache DIR] [--threads 16]\n"); return 2; }
+    const char *mode = opt(argc, argv, "--mode", "max"); const int votes = !strcmp(mode, "votes"), phase = !strcmp(mode, "phase") ? 1 : votes ? 2 : 0;
+    if (!phase && strcmp(mode, "max")) { fprintf(stderr, "downsample: --mode max|phase|votes\n"); return 2; }
+    if (votes) ds_vote_tables();
     const int S = atoi(opt(argc, argv, "--shard", "512")), nt = atoi(opt(argc, argv, "--threads", "16")); const double um = atof(argv[5]);
     z3 *z = z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr));
     if (!z) { fprintf(stderr, "downsample: %s\n", z3_error()); return 1; }
-    const z3_meta *m = z3_meta_of(z); const int fill = phase ? PHASE_UNKNOWN : m->fill;
+    const z3_meta *m = z3_meta_of(z); const int fill = phase == 1 ? PHASE_UNKNOWN : m->fill;   /* votes: 0 = no votes */
     int64_t bo[3] = {0, 0, 0}, bn[3] = {m->shape[0], m->shape[1], m->shape[2]};
     if (*opt(argc, argv, "--box", "")) { long long v[6]; if (sscanf(opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", v, v + 1, v + 2, v + 3, v + 4, v + 5) != 6) { fprintf(stderr, "downsample: --box z,y,x,nz,ny,nx\n"); return 2; } for (int d = 0; d < 3; d++) { bo[d] = v[d]; bn[d] = v[3 + d]; } }
     const int64_t osh[3] = {(m->shape[0] + 1) / 2, (m->shape[1] + 1) / 2, (m->shape[2] + 1) / 2};
     char lv[32], od[1400], at[400]; z3w_level_name(um, lv, sizeof lv); snprintf(od, sizeof od, "%s/%s", argv[4], lv);
-    snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"%s halved (%s)\"%s}}", argv[3], mode, m->label_binary ? ",\"encoding\":\"binary\"" : "");
+    snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"%s halved (%s)\"%s}}", argv[3], mode, m->label_binary ? ",\"encoding\":\"binary\"" : votes ? ",\"encoding\":\"side-votes\",\"code\":\"src/votes.h: the votes of each 2^3 block added\"" : "");
     z3w *w = z3w_create(od, osh, S, 0, fill, at);
     double lum[16]; int nl = 0;   /* the group lists every level already in it (each a number-named array), sorted, plus this one */
     { DIR *gd = opendir(argv[4]); struct dirent *ge;
@@ -1121,6 +1127,30 @@ static int cmd_downsample(int argc, char **argv) {
     if (nskip) fprintf(stderr, "downsample: %d output shards skipped (no source shard)\n", nskip);
     z3w_close(w); free(sb); free(src); z3_close(z);
     fprintf(stderr, "downsample: %d shards of %s written to %s\n", nsh, lv, od);
+    return 0;
+}
+
+/* ufsm side-votes <out-group> <out-um> <root> <key> [<root> <key> ...] [--shard 512] [--threads 16] [--cache DIR]
+   Recto / verso side labels of several surface sets of one scroll (each phase-raster --pair 2 on one set's codes, or an earlier
+   side-votes array) added into one vote array (src/votes.h: per voxel the sets calling it recto side and verso side, 15 at most),
+   lossless volcomp in <out-group>/<out-um> (an OME group of that level; downsample --mode votes for the coarser ones). All inputs on
+   one grid (equal shapes). Sources read it with "encoding": "side-votes" (unanimous / majority / soft). */
+static int cmd_side_votes(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "usage: ufsm side-votes <out-group> <out-um> <root> <key> [<root> <key> ...] [--shard 512] [--threads 16] [--cache DIR]\n"); return 2; }
+    const int S = atoi(opt(argc, argv, "--shard", "512")), nt = atoi(opt(argc, argv, "--threads", "16")); const double um = atof(argv[3]);
+    if (S < 128 || S % 128 || !(um > 0)) { fprintf(stderr, "side-votes: out-um > 0, --shard a multiple of 128\n"); return 2; }
+    z3 *in[64]; const char *names[64]; char nb[64][1200]; int nin = 0;
+    for (int a = 4; a + 1 < argc && nin < 64; a += 2) {
+        if (argv[a][0] == '-') break;
+        in[nin] = z3_open(store_open(argv[a]), argv[a + 1], opt(argc, argv, "--cache", nullptr));
+        if (!in[nin]) { fprintf(stderr, "side-votes: %s %s: %s\n", argv[a], argv[a + 1], z3_error()); return 1; }
+        snprintf(nb[nin], sizeof nb[nin], "%s/%s", argv[a], argv[a + 1]); names[nin] = nb[nin]; nin++;
+    }
+    size_t st[2] = {0, 0}; int nsh = 0;
+    const int rc = side_votes_merge(argv[2], um, in, names, nin, S, nt, &nsh, st);
+    for (int i = 0; i < nin; i++) z3_close(in[i]);
+    if (rc) { fprintf(stderr, "side-votes: %s\n", side_votes_error()); return 1; }
+    fprintf(stderr, "side-votes: %d inputs, %d shards -> %s; %zu voxels with votes, %.2f%% of them disputed (recto and verso votes)\n", nin, nsh, argv[2], st[0], st[0] ? 100.0 * st[1] / st[0] : 0.0);
     return 0;
 }
 
@@ -2182,6 +2212,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
+    if (!strcmp(cmd, "side-votes")) return cmd_side_votes(argc, argv);
     if (!strcmp(cmd, "ct-hist")) return cmd_ct_hist(argc, argv);
     if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);
     if (!strcmp(cmd, "wrapswitch")) return cmd_wrapswitch(argc, argv);
