@@ -231,6 +231,10 @@ void nn_set_gn_const(int on);
 int nn_get_gn_const(void);
 void nn_gn_const_fill(float *mean, float *rstd, const float *run, int N, int G, float eps);
 void nn_gn_ema_update(float *run, const float *mean, const float *rstd, int N, int G, float mom, float eps);
+/* scaled weight standardisation (cfg.l0_norm 3) of cout output channels with n contiguous fan-in weights each: wh = gain (w - mean) /
+   (std sqrt(n) + eps); nn_ws_bwd: g <- g0 + (the gradient w.r.t. w of the part g - g0 w.r.t. wh) */
+void nn_ws_fwd(float *wh, const float *w, int cout, int n, float gain, float eps);
+void nn_ws_bwd(float *g, const float *g0, const float *w, int cout, int n, float gain, float eps);
 /* GroupNorm forward fused with SiLU (y = silu(gn(x))), and recompute of both g = gn(x) and silu(g). */
 int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *mean, float *rstd);   /* stats of the stored fp32, 16-bit or MX tensor; -1 for unsupported groups */
 void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd);

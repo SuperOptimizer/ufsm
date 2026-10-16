@@ -1,8 +1,10 @@
-/* Level-0 normalisation modes (unet_cfg.l0_norm, train --l0-norm), tensor-core path: none puts mean 0 / rstd 1 at the four level-0
+/* Level-0 normalisation modes (unet_cfg.l0_norm, train --l0-norm), tensor-core path: none (and ws) put mean 0 / rstd 1 at the four level-0
    GroupNorm sites (enc[0] and dec[0]) and leaves the coarser levels' statistics live; ema normalises with the window's statistics
    through its warm-up, then with the running ones (the momentum blend of the earlier windows'), the EMA weights with their own;
-   checkpoints keep the mode, the statistics and the update count (reloaded: the same constants); the backward stays finite.
-   (Finite differences per mode: UFSM_L0_NORM=1 / 2 test_unet; MX-fp4 gradients and three level-0 buffers: test_grad_mx4.) */
+   recalibration replaces the EMA weights' set with the mean of windows' own statistics; ws's forward is invariant to an affine
+   change of a standardised conv's raw weights per output channel (none's is not); checkpoints keep the mode, the statistics and the
+   update count (reloaded: the same constants); the backward stays finite.
+   (Finite differences per mode: UFSM_L0_NORM=1 / 2 / 3 test_unet; MX-fp4 gradients and three level-0 buffers: test_grad_mx4.) */
 #include "unet.h"
 #include <math.h>
 #include <stdio.h>
@@ -29,7 +31,7 @@ int main(void) {
     for (size_t i = 0; i < no; i++) h[i] = frand();
     nn_h2d(gy, h, no * 4);
     char path[64]; snprintf(path, sizeof path, "/tmp/ufsm_test_l0_norm_%d.ckpt", (int)getpid());
-    for (int md = 0; md <= 2; md++) {
+    for (int md = 0; md <= 3; md++) {
         unet_cfg cfg = {3, {16, 32, 64}, 4, 2, 8};
         cfg.l0_norm = md;
         unet *u = unet_create(&cfg); unet_init(u, 5);
@@ -49,10 +51,10 @@ int main(void) {
         if (md == 0) {
             double d = 0; for (size_t i = 0; i < ns; i++) d = fmax(d, fabs((double)s[2][i] - s[0][i]) / (fabs((double)s[0][i]) + 1e-3));
             CHECK(d < 1e-3 && unet_l0_updates(u) == 0, "gn: the same window's statistics again (%g), no running ones (%ld)", d, unet_l0_updates(u));
-        } else if (md == 1) {
+        } else if (md == 1 || md == 3) {
             int c = 1; for (int b = 0; b < 2; b++) for (int k = 0; k < 4 * G; k++) c &= s[0][site[b] + k] == (k / G % 2 ? 1.f : 0.f);
             int live = 0; for (int k = 0; k < G; k++) live |= s[0][4 * G + k] != 0.f;
-            CHECK(c && live, "none: level-0 statistics mean 0 / rstd 1 (%d), enc[1]'s live (%d)", c, live);
+            CHECK(c && live, "none / ws: level-0 statistics mean 0 / rstd 1 (%d), enc[1]'s live (%d)", c, live);
         } else {
             double e = 0, dd = 0;   /* forward 3: 0.75 (window 1's) + 0.25 (window 2's), means and variances */
             for (int b = 0; b < 2; b++) for (int q = 0; q < 2; q++) for (int k = 0; k < G; k++) {
@@ -112,6 +114,28 @@ int main(void) {
             for (int b = 0; b < 2; b++) for (int k = 0; k < 4 * G; k++) same &= t[site[b] + k] == s[4][site[b] + k];
             CHECK(same, "reloaded: the level-0 constants of the live and the EMA weights bit-identical");
             free(t); unet_free(v); remove(path);
+        }
+        if (md == 1 || md == 3) {   /* ws: the forward is invariant to an affine change of a standardised conv's raw weights per output
+                                       channel (the stem's: first in the layout, 3 w + 0.5); none is not */
+            float *l0 = malloc(no * 4), *l1 = malloc(no * 4);
+            nn_set_sr_step(21); nn_d2h(l0, unet_forward(u, x1, xs, 0), no * 4);
+            CHECK(!unet_save(u, path, 7, nullptr), "save");
+            FILE *f = fopen(path, "r+b"); char line[16384];
+            fseek(f, 4, SEEK_SET); if (!fgets(line, sizeof line, f)) bad++;
+            const long p0 = ftell(f); const size_t nw = (size_t)16 * 4 * 27;
+            float *pp = malloc(np * 4);
+            for (int a = 0; a < 2; a++) {   /* live and EMA weights */
+                fseek(f, p0 + (long)(a * np * 4), SEEK_SET); if (fread(pp, 4, np, f) != np) bad++;
+                for (size_t i = 0; i < nw; i++) pp[i] = 3.f * pp[i] + 0.5f;
+                fseek(f, p0 + (long)(a * np * 4), SEEK_SET); fwrite(pp, 4, np, f);
+            }
+            fclose(f);
+            CHECK(unet_load(u, path) == 7, "load the changed stem");
+            nn_set_sr_step(21); nn_d2h(l1, unet_forward(u, x1, xs, 0), no * 4);
+            double d = 0, mx = 0; for (size_t i = 0; i < no; i++) { d = fmax(d, fabs((double)l1[i] - l0[i])); mx = fmax(mx, fabs((double)l0[i])); }
+            if (md == 3) CHECK(d < 0.02 * mx, "ws: logits invariant to the stem's raw-weight scale and shift (max diff %g of %g)", d, mx);
+            else CHECK(d > 0.1 * mx, "none: logits change with the stem's raw weights (max diff %g of %g)", d, mx);
+            free(l0); free(l1); free(pp); remove(path);
         }
         printf("  l0_norm %d: %s\n", md, bad > bad0 ? "FAIL" : "ok");
         for (int k = 0; k < 5; k++) free(s[k]);

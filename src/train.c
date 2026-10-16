@@ -1013,9 +1013,9 @@ int cmd_train(int argc, char **argv) {
     }
     unet_cfg cfg = {4, {16, 32, 64, 80}, 4, g_cout, 8, 0, 0};
     cfg.down_norm = atoi(opt(argc, argv, "--down-norm", "0"));
-    { const char *ln = opt(argc, argv, "--l0-norm", "gn");   /* level-0 normalisation (unet_cfg.l0_norm): gn, none (affine + SiLU), ema (running statistics) */
-      cfg.l0_norm = !strcmp(ln, "none") ? 1 : !strcmp(ln, "ema") ? 2 : 0;
-      if (!cfg.l0_norm && strcmp(ln, "gn")) { fprintf(stderr, "--l0-norm gn|none|ema\n"); return 2; } }
+    { const char *ln = opt(argc, argv, "--l0-norm", "gn");   /* level-0 normalisation (unet_cfg.l0_norm): gn, none (affine + SiLU), ema (running statistics), ws (none + weight standardisation) */
+      cfg.l0_norm = !strcmp(ln, "none") ? 1 : !strcmp(ln, "ema") ? 2 : !strcmp(ln, "ws") ? 3 : 0;
+      if (!cfg.l0_norm && strcmp(ln, "gn")) { fprintf(stderr, "--l0-norm gn|none|ema|ws\n"); return 2; } }
     cfg.scale_cond = atoi(opt(argc, argv, "--scale-cond", "0"));   /* voxel-size conditioning of the stem (unet_set_scale per batch) */
     if (g_papyrus) cfg.scale_cond = g_pap.cond == 1;   /* task papyrus: the stem-bias conditioning carries the cutoff instead */
     if (cfg.scale_cond && B != 1) { fprintf(stderr, "--scale-cond needs --B 1 (one voxel size per forward)\n"); return 2; }
@@ -1744,7 +1744,7 @@ int cmd_train(int argc, char **argv) {
     strcpy(checkpoint_extra, runtime_extra);
     if (plan && cover_checkpoint_extra(runtime_extra, &coverage, checkpoint_extra, sizeof checkpoint_extra)) return 2;
     fprintf(stderr, "model widths"); for (int i = 0; i < cfg.nlev; i++) fprintf(stderr, " %d", cfg.widths[i]);
-    if (cfg.l0_norm) fprintf(stderr, " (level-0 norm %s)", cfg.l0_norm == 1 ? "none" : "ema");
+    if (cfg.l0_norm) fprintf(stderr, " (level-0 norm %s)", cfg.l0_norm == 1 ? "none" : cfg.l0_norm == 2 ? "ema" : "ws");
     if (g_Pz != P) fprintf(stderr, ": %zu params; window %dx%dx%d (slab) B=%d x %d GPU(s) [", np, g_Pz, P, P, B, ng); else fprintf(stderr, ": %zu params; P=%d B=%d x %d GPU(s) [", np, P, B, ng); for (int g = 0; g < ng; g++) fprintf(stderr, "%s%d", g ? "," : "", devs[g]); fprintf(stderr, "] %s%s\n", nn_get_tf32() ? "tensor cores (see precision.txt for compute and storage)" : "fp32", split ? ", each window split along z" : "");
     split_ctx *sctx = split ? split_create(devs[0], devs[1]) : nullptr;
     nn_init(G[0].dev);
