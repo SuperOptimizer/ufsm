@@ -20,6 +20,17 @@ enum { NZ = 200, NY = 256, NX = 320, SH = 128 };
 static uint8_t side_a(int z, int y, int x) { (void)z; return y < 200 ? ((x / 10) % 2 ? RV_VERSO : RV_RECTO) : RV_UNKNOWN; }      /* set A */
 static uint8_t side_b(int z, int y, int x) { return y >= 50 && z < 150 ? (((x + 2) / 10) % 2 ? RV_VERSO : RV_RECTO) : RV_UNKNOWN; }   /* B: shifted, partial */
 
+static uint8_t code_a(int z, int y, int x) { (void)y; return x % 7 == 0 ? (uint8_t)(1 + (x / 7 * 9 + z) % 252) : 0; }   /* winding codes */
+static uint8_t code_b(int z, int y, int x) {   /* agrees within 3 steps (z even) or is 20 steps off (z odd) where A is coded and y >= 100; own codes on x % 11 */
+    if (x % 7 == 0 && y >= 100) { const int a = code_a(z, y, x) - 1; return (uint8_t)(1 + (a + (z % 2 ? 20 : 3)) % 252); }
+    return x % 11 == 0 ? (uint8_t)(1 + (x * 5) % 252) : 0;
+}
+static uint8_t union_ref(uint8_t a, uint8_t b) {
+    if (!a || !b) return a ? a : b;
+    int d = ((int)a - (int)b) % 252; if (d < -126) d += 252; if (d >= 126) d -= 252;
+    return d >= -4 && d <= 4 ? a : 255;
+}
+
 static void write_array(const char *group, uint8_t (*f)(int, int, int)) {
     char d[1200]; snprintf(d, sizeof d, "%s/4.8", group);
     const int64_t shape[3] = {NZ, NY, NX};
@@ -92,6 +103,21 @@ int main(void) {
     }
     CHECK(!bad, "merge (a + b) + a: %zu voxels differ", bad);
 
+    {   /* codes_merge: winding code rasters united (the same wrap within 4 steps keeps the first input's code, else 255) */
+        char gca[1300], gcb[1300], gcm[1300];
+        snprintf(gca, sizeof gca, "%s/ca", root); snprintf(gcb, sizeof gcb, "%s/cb", root); snprintf(gcm, sizeof gcm, "%s/cm", root);
+        write_array(gca, code_a); write_array(gcb, code_b);
+        z3 *ic[2] = {z3_open(st, "ca/4.8", nullptr), z3_open(st, "cb/4.8", nullptr)}; const char *cn[2] = {"ca", "cb"};
+        CHECK(ic[0] && ic[1] && !codes_merge(gcm, 4.8, ic, cn, 2, 256, 2, &nsh, stats), "codes_merge: %s", side_votes_error());
+        uint8_t *C = read_all(root, "cm/4.8"); size_t cbad = 0, ncf = 0;
+        for (int z = 0; z < NZ; z++) for (int y = 0; y < NY; y++) for (int x = 0; x < NX; x++) {
+            const uint8_t e = union_ref(code_a(z, y, x), code_b(z, y, x));
+            cbad += C[((size_t)z * NY + y) * NX + x] != e; ncf += e == 255;
+        }
+        CHECK(!cbad && stats[1] == ncf, "codes_merge: %zu voxels differ from the union rule (conflicts %zu vs %zu)", cbad, stats[1], ncf);
+        printf("codes merge: %zu coded voxels, %zu conflicts (%s)\n", stats[0], stats[1], cbad ? "FAIL" : "exact");
+        free(C); z3_close(ic[0]); z3_close(ic[1]);
+    }
     /* the sampler's reads: a side array as "side" and as "side-votes"; the merged array under each rule */
     char sj[1400]; snprintf(sj, sizeof sj, "%s/sources.json", root);
     FILE *f = fopen(sj, "w");

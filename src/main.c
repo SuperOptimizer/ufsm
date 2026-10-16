@@ -62,6 +62,7 @@ static int usage(void) {
         "  ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase|votes  one array halved per axis (labels, phase, side votes)\n"
         "  ufsm side-votes <out-group> <out-um> <root> <key> [<root> <key> ...]   several surface sets' side labels added into one vote array\n"
         "  ufsm wind-assign <ref-root> <ref-key> <out-dir> <tifxyz>...   other authors' surfaces get winding q in a reference raster's gauge\n"
+        "  ufsm codes-merge <out-group> <out-um> <root> <key> ...   winding code rasters united (same wrap within 1/4 turn, else 255)\n"
         "  ufsm ct-hist <out.txt> <root> <key> z,y,x,n [...]  CT histograms of boxes (targets of train --aug-hist, the hist op)\n"
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
@@ -1138,9 +1139,13 @@ static int cmd_downsample(int argc, char **argv) {
    Recto / verso side labels of several surface sets of one scroll (each phase-raster --pair 2 on one set's codes, or an earlier
    side-votes array) added into one vote array (src/votes.h: per voxel the sets calling it recto side and verso side, 15 at most),
    lossless volcomp in <out-group>/<out-um> (an OME group of that level; downsample --mode votes for the coarser ones). All inputs on
-   one grid (equal shapes). Sources read it with "encoding": "side-votes" (unanimous / majority / soft). */
+   one grid (equal shapes). Sources read it with "encoding": "side-votes" (unanimous / majority / soft).
+   ufsm codes-merge (same arguments): winding_mod14 code rasters (the published band codes, raster --value of wind-assign's q.tif)
+   united instead: codes within 4 steps are the same wrap (the first kept), else 255; phase-raster --pair 2 then labels between
+   wraps from any of them. */
 static int cmd_side_votes(int argc, char **argv) {
-    if (argc < 6) { fprintf(stderr, "usage: ufsm side-votes <out-group> <out-um> <root> <key> [<root> <key> ...] [--shard 512] [--threads 16] [--cache DIR]\n"); return 2; }
+    const int codes = !strcmp(argv[1], "codes-merge");
+    if (argc < 6) { fprintf(stderr, "usage: ufsm %s <out-group> <out-um> <root> <key> [<root> <key> ...] [--shard 512] [--threads 16] [--cache DIR]\n", argv[1]); return 2; }
     const int S = atoi(opt(argc, argv, "--shard", "512")), nt = atoi(opt(argc, argv, "--threads", "16")); const double um = atof(argv[3]);
     if (S < 128 || S % 128 || !(um > 0)) { fprintf(stderr, "side-votes: out-um > 0, --shard a multiple of 128\n"); return 2; }
     z3 *in[64]; const char *names[64]; char nb[64][1200]; int nin = 0;
@@ -1151,10 +1156,11 @@ static int cmd_side_votes(int argc, char **argv) {
         snprintf(nb[nin], sizeof nb[nin], "%s/%s", argv[a], argv[a + 1]); names[nin] = nb[nin]; nin++;
     }
     size_t st[2] = {0, 0}; int nsh = 0;
-    const int rc = side_votes_merge(argv[2], um, in, names, nin, S, nt, &nsh, st);
+    const int rc = (codes ? codes_merge : side_votes_merge)(argv[2], um, in, names, nin, S, nt, &nsh, st);
     for (int i = 0; i < nin; i++) z3_close(in[i]);
-    if (rc) { fprintf(stderr, "side-votes: %s\n", side_votes_error()); return 1; }
-    fprintf(stderr, "side-votes: %d inputs, %d shards -> %s; %zu voxels with votes, %.2f%% of them disputed (recto and verso votes)\n", nin, nsh, argv[2], st[0], st[0] ? 100.0 * st[1] / st[0] : 0.0);
+    if (rc) { fprintf(stderr, "%s: %s\n", argv[1], side_votes_error()); return 1; }
+    if (codes) fprintf(stderr, "codes-merge: %d inputs, %d shards -> %s; %zu coded voxels, %.2f%% of them conflicts (255)\n", nin, nsh, argv[2], st[0], st[0] ? 100.0 * st[1] / st[0] : 0.0);
+    else fprintf(stderr, "side-votes: %d inputs, %d shards -> %s; %zu voxels with votes, %.2f%% of them disputed (recto and verso votes)\n", nin, nsh, argv[2], st[0], st[0] ? 100.0 * st[1] / st[0] : 0.0);
     return 0;
 }
 
@@ -2315,7 +2321,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
-    if (!strcmp(cmd, "side-votes")) return cmd_side_votes(argc, argv);
+    if (!strcmp(cmd, "side-votes") || !strcmp(cmd, "codes-merge")) return cmd_side_votes(argc, argv);
     if (!strcmp(cmd, "wind-assign")) return cmd_wind_assign(argc, argv);
     if (!strcmp(cmd, "ct-hist")) return cmd_ct_hist(argc, argv);
     if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);

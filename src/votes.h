@@ -54,3 +54,10 @@ static inline void vote_side_lut(int rule, int min, uint8_t lut[256]) {
 typedef struct z3 z3;
 int side_votes_merge(const char *out_group, double um, z3 *const *in, const char *const *names, int nin, int S, int nt, int *nshards, size_t stats[2]);
 const char *side_votes_error(void);
+/* The same for winding_mod14 code rasters (raster --value, the published band codes): a voxel coded by several inputs keeps the
+   first code when they agree within 4 steps (1/4 turn: the same wrap), else 255 (a conflict), as raster --value does between its
+   meshes; stats: coded voxels, conflicts. (One raster per surface set, e.g. wind-assign's q.tif through raster --value, merged into
+   the published codes: phase-raster --pair 2 of the result labels between wraps from any of the sets.) */
+int codes_merge(const char *out_group, double um, z3 *const *in, const char *const *names, int nin, int S, int nt, int *nshards, size_t stats[2]);
+enum { MERGE_VOTES = 0, MERGE_CODES = 1 };
+int array_merge(const char *out_group, double um, z3 *const *in, const char *const *names, int nin, int S, int nt, int mode, int *nshards, size_t stats[2]);
