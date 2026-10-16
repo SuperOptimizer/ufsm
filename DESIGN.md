@@ -33,7 +33,11 @@ User: "I want all the augs we can get" (robustness to other scrolls, scanners, r
   tests). Estimated all now ~4.5-5 cpu-s per P512 window: a laptop P512 trainer (~1.5 windows/s) wants 8+ workers; the desk's
   12 are enough at ~1 window/s. P768: x3.4. Left: the scanner ops' common float pass (~0.6 s), the noise pass, AVX2 for the
   other writer cases.
-- In-domain cost of `--aug all` (paired 2000-step run against `none`): pending.
+- In-domain cost (desk GPU 0 beside another run, production recipe: sources-rv24 2.4 um, P512, 2000 steps, --det 1, seed 1, 12
+  sampler workers): holdout val 0.6914 / 0.6807 / 0.6721 / 0.6639 at 500 / 1000 / 1500 / 2000 against 0.6539 at 2000 for the same
+  recipe without augmentation (the same validation windows): +0.010 (+1.5%) at this short length, the price of the harder data;
+  the gain it buys (other scrolls / scanners) needs an evaluation on another scan. 0.64-0.74 samples/s, sampler wait 0% in 88 of 93
+  log lines (<= 9% early): 12 workers keep a desk P512 trainer fed.
 
 ## Trainer host RAM: packed targets, validation windows on disk (2026-10-15)
 At P768 the laptop trainer (production net, 6 workers, 7 slots, 4.8 um rv48 side labels) was OOM-killed by the 37.6 GiB slice cap
