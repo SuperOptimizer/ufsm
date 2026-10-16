@@ -208,7 +208,7 @@ int main(void) {
             for (size_t k = 0; k < q3; k++) { A[k] = (float)(255 * uniform(&st)); Zm[k] = uniform(&st) < .1; }
             for (int axis = 0; axis < 3; axis++) for (int ai = 0; ai < 3; ai++) {
                 const float a = (float)(.2 + .3 * ai);
-                memcpy(B, A, q3 * 4); exp_smooth(B, Q, axis, a, line);
+                memcpy(B, A, q3 * 4); exp_smooth(B, Q, axis, a, line, G2);   /* (G2: the plane scratch; Q 48 takes the transposing axis-2 path) */
                 float *R = G1; memcpy(R, A, q3 * 4); exp_smooth_ref(R, Q, axis, a, line);
                 bad += memcmp(B, R, q3 * 4) != 0;
             }
