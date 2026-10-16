@@ -82,6 +82,27 @@ int main(void) {
             if (getenv("UFSM_SR_E4M3_PROBE")) { const double m0 = lp_sr_e4m3_mean(pv[i], 4000000); printf("    (sr_e4m3: %.8g, %+.2g ulp)\n", m0, (m0 - pv[i]) / ulp); }
         }
     }
+    {   /* the forward's residual sum (nn_add_into_act): MX-fp4 rounded to nearest whatever the SR seed (stochastic rounding is for
+           gradient operands only); the gradient add (nn_add_into) still rounds stochastically with SR on */
+        const uint64_t rs_add = rs;
+        const shape5 s = {1, 32, 6, 10, 14}; const size_t n = shape_numel(s), xb = nn_mx4_bytes(s);
+        float *a = dev_rand_wide(n, 1.f), *b = dev_rand_wide(n, 1.f);
+        void *ya = mx4_from(a, s), *yb = mx4_from(a, s), *yc = mx4_from(a, s), *yd = mx4_from(a, s), *xm = mx4_from(b, s);
+        nn_set_sr(1);
+        nn_set_sr_step(11); nn_add_into_act(ya, xm, s, 0);
+        nn_set_sr_step(12); nn_add_into_act(yb, xm, s, 0);
+        lp_add_mx(yc, xm, s, 4, 0u);                          /* round to nearest */
+        nn_set_sr_step(13); nn_add_into(yd, xm, s, 0);        /* gradient add: SR */
+        uint8_t *h[4]; void *ys[4] = {ya, yb, yc, yd};
+        for (int k = 0; k < 4; k++) { h[k] = malloc(xb); nn_d2h(h[k], ys[k], xb); }
+        const int rn = !memcmp(h[0], h[1], xb) && !memcmp(h[0], h[2], xb), sr = !!memcmp(h[2], h[3], xb);
+        printf("  forward residual add: rounded to nearest (seed-independent) %s, the gradient add stochastic %s%s\n", rn ? "yes" : "NO", sr ? "yes" : "NO",
+               rn && sr ? "" : "  FAIL");
+        if (!(rn && sr)) bad++;
+        for (int k = 0; k < 4; k++) { free(h[k]); nn_free(ys[k]); }
+        nn_free(a); nn_free(b); nn_free(xm); nn_set_sr(0);
+        rs = rs_add;
+    }
     const int N = 2, G = 8, K = 16;
     for (int C = 8; C <= 64; C *= 2) {   /* GroupNorm + SiLU backward: gy and gx MX-fp4 */
         shape5 s = {N, C, 8, 10, 12};
