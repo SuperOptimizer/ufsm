@@ -6,6 +6,35 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Augmentation presets: train --aug all (default) | none (2026-10-16)
+User: "I want all the augs we can get" (robustness to other scrolls, scanners, resolutions and damage from one scroll's labels).
+- `--aug all` is the default for the dense-target tasks on cube windows (recto / side targets); `none` (the old defaults: 48 cube
+  symmetries + intensity jitter) for papyrus, sheet, band, unwrap, condition, aux inputs and slabs, which have their own recipes.
+  The preset only sets fields (sample.c `sample_aug_preset`); every flag still overrides them; `--aug-p-scale X` scales all of the
+  preset's probabilities (the A/B dial); the runtime metadata records `"aug":{"preset":...}`. Resume a run started before the
+  presets with `--aug none` to keep its data.
+- all: the scanner ops of "Generalising to other scrolls" at strength 1 with p seam .05, air .05, lowres .25, blur .3, sharpen .05,
+  bias .15, ring .1, cupping .1, slice .1, noise .15, cnoise .1, tone .25, quant .1, dropslice .05, cutout .1, chunk .05,
+  paganin .15, gin .1, motion .1 (+ hist .15 when `--aug-hist FILE` is given); cutouts and dropped slices keep their labels
+  (`drop_ignore 0`: the net infers occluded papyrus from context; masked air and chunk dropouts stay unsupervised through CT 0);
+  rotation +/-10 deg p .25, elastic p .15, zoom in to 0.8 p .2, zoom out to 1.25 p .15, affine p .1 (aniso .1, shear .06); axis
+  jitter 800 native voxels p .1 (<= 2 deg; an estimated umbilicus). About 1 window in 20 sees no scanner op, 2 in 5 no warp.
+  `--ct-aug` stays off (its ops are scanner ops here).
+- New: `motion` (sample motion during the scan along a source axis: 1-2 ghost echoes or a linear motion blur, in the per-axis
+  operator chain before the coarser sampling grid); zoom-out (`--zoom-max`, `--zoom-out-p`: the next coarser level, of which the
+  window shows the central 1/2 z: the effective voxel size x z from 2x coarser data, i.e. a coarser scan); packed targets with
+  warps (hard targets take the nearest source voxel's code, f > 0.5 per axis: side classes are never blended); `--gpu-input`
+  with warps (the radial record, `NN_RAD_REC` = 8 + 8 D + 32 words, carries the warp; `nn_input_rad` builds write_spatial's
+  transported radial vector with the host's float expressions: test_gpu_input 512 warped cases bit for bit).
+- Sampler cost (cpu-s per P512 window, 4.8 um rv48 data, idle laptop, 6 workers): none 1.6 (4.5 windows/s), all 6.2 before the
+  speed work (0.9 windows/s). Fixed: the warp writer (per-voxel loop: 3.9 s per warped window, 36.8 s on the loaded desk) is
+  cache-blocked and AVX2 for the trainer's case (hard targets, CT-only, P % 16 == 0: 17-38 ns per voxel, ~2x), GIN 12 -> 2.2 s
+  (row-vectorised), paganin 8.6 -> 1.3 s (axes 0 / 1 by rows), all bit for bit (write_spatial_ref, gin / exp_smooth loops in the
+  tests). Estimated all now ~4.5-5 cpu-s per P512 window: a laptop P512 trainer (~1.5 windows/s) wants 8+ workers; the desk's
+  12 are enough at ~1 window/s. P768: x3.4. Left: the scanner ops' common float pass (~0.6 s), the noise pass, AVX2 for the
+  other writer cases.
+- In-domain cost of `--aug all` (paired 2000-step run against `none`): pending.
+
 ## Trainer host RAM: packed targets, validation windows on disk (2026-10-15)
 At P768 the laptop trainer (production net, 6 workers, 7 slots, 4.8 um rv48 side labels) was OOM-killed by the 37.6 GiB slice cap
 before its first step (38.3 GB RSS): host RAM, not the GPU, bound the window. Per voxel the host held 5 B per sampler slot (CT fp16,
