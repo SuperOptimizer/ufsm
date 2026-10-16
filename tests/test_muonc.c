@@ -21,13 +21,13 @@ static unsigned rs = 2024;
 static float frand(void) { rs = rs * 1664525u + 1013904223u; return (rs >> 8) / 16777216.f - 0.5f; }
 
 typedef struct {
-    int n, k, Co[16], Ci[16]; size_t nw[16];
-    muon_desc_t h[16]; muonc_desc_t mc[16]; muon_desc_t ns[16];
+    int n, k, nf, Co[16], Ci[16]; size_t nw[16];
+    muon_desc_t h[16]; muonc_desc_t mc[16]; muon_desc_t ns[16 * 14];   /* ns: conv-major, nf entries per conv */
     void *dd, *dmc, *dns; int maxco, maxk, nsm, nsn;
     int *hbf; float *R; double *part;
 } batch;
 static void batch_new(batch *b, int n, const int *Co, const int *Ci, int k) {
-    memset(b, 0, sizeof *b); b->n = n; b->k = k;
+    memset(b, 0, sizeof *b); b->n = n; b->k = k; b->nf = k == 3 ? 14 : 1;
     for (int i = 0; i < n; i++) {
         const int K = Ci[i] * k * k * k, m = Co[i] < Ci[i] ? Co[i] : Ci[i], nx = Co[i] < Ci[i] ? Ci[i] : Co[i];
         b->Co[i] = Co[i]; b->Ci[i] = Ci[i]; b->nw[i] = (size_t)Co[i] * K;
@@ -39,21 +39,24 @@ static void batch_new(batch *b, int n, const int *Co, const int *Ci, int k) {
         if (K > b->maxk) b->maxk = K;
         muonc_desc_t *c = &b->mc[i];
         *c = (muonc_desc_t){.U = d->X, .O = d->Y, .Co = Co[i], .Ci = Ci[i], .k = k, .m = m, .n = nx, .tr = Co[i] > Ci[i]};
-        c->EX = nn_malloc((size_t)4 * m * nx * 4); c->EY = nn_malloc((size_t)4 * m * nx * 4);
-        b->ns[i] = (muon_desc_t){.X = c->EX, .Y = c->EY, .A = nn_malloc((size_t)16 * m * m), .B = nn_malloc((size_t)16 * m * m), .Co = 2 * m, .K = 2 * nx};
+        const size_t fs = (size_t)4 * m * nx;
+        c->EX = nn_malloc(b->nf * fs * 4); c->EY = nn_malloc(b->nf * fs * 4);
+        for (int f = 0; f < b->nf; f++)
+            b->ns[i * b->nf + f] = (muon_desc_t){.X = c->EX + f * fs, .Y = c->EY + f * fs, .A = nn_malloc((size_t)16 * m * m), .B = nn_malloc((size_t)16 * m * m), .Co = 2 * m, .K = 2 * nx};
         if (2 * m > b->nsm) b->nsm = 2 * m;
         if (2 * nx > b->nsn) b->nsn = 2 * nx;
     }
     b->dd = nn_malloc(sizeof(muon_desc_t) * n); nn_h2d(b->dd, b->h, sizeof(muon_desc_t) * n);
     b->dmc = nn_malloc(sizeof(muonc_desc_t) * n); nn_h2d(b->dmc, b->mc, sizeof(muonc_desc_t) * n);
-    b->dns = nn_malloc(sizeof(muon_desc_t) * n); nn_h2d(b->dns, b->ns, sizeof(muon_desc_t) * n);
-    b->hbf = nn_malloc(4 * n); b->R = nn_malloc(4 * n); nn_zero(b->R, 4 * n); b->part = nn_malloc(64 * n * sizeof(double));
+    b->dns = nn_malloc(sizeof(muon_desc_t) * n * b->nf); nn_h2d(b->dns, b->ns, sizeof(muon_desc_t) * n * b->nf);
+    b->hbf = nn_malloc(4 * n); b->R = nn_malloc(4 * n); nn_zero(b->R, 4 * n); b->part = nn_malloc((size_t)32 * n * (2 + b->nf) * sizeof(double));
 }
 static void batch_free(batch *b) {
     for (int i = 0; i < b->n; i++) {
         muon_desc_t *d = &b->h[i];
         nn_free(d->p); nn_free((void *)d->g); nn_free(d->mom); nn_free(d->X); nn_free(d->Y); nn_free(d->A); nn_free(d->B);
-        nn_free(b->mc[i].EX); nn_free(b->mc[i].EY); nn_free(b->ns[i].A); nn_free(b->ns[i].B);
+        nn_free(b->mc[i].EX); nn_free(b->mc[i].EY);
+        for (int f = 0; f < b->nf; f++) { nn_free(b->ns[i * b->nf + f].A); nn_free(b->ns[i * b->nf + f].B); }
     }
     nn_free(b->dd); nn_free(b->dmc); nn_free(b->dns); nn_free(b->hbf); nn_free(b->R); nn_free(b->part);
 }

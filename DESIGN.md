@@ -2237,7 +2237,8 @@ parallel (batch 1 each), so the per-GPU limit is the window limit.
     polarised on its own by complex Newton-Schulz (5 iterations, Muon's coefficients, X0 = B / (|B|_F + 1e-8), blocks
     with more rows than columns as their conjugate transpose), and the inverse DFT gives a real update. Conjugate
     symmetry leaves 14 of the 27 frequencies to polarise. A complex block runs as its real embedding [[Xr, -Xi],
-    [Xi, Xr]] through Muon's batched products (exact: a *-homomorphism), one frequency at a time over all convs.
+    [Xi, Xr]] through Muon's batched products (exact: a *-homomorphism), every frequency of every conv in one launch per
+    stage (one Newton-Schulz entry per conv and frequency).
     Routing as the paper (every kernel larger than 1x1, strided ones included: the stem, the down convs). Scale:
     the paper's matched applied-update RMS against unfolded Muon (the RMS of exact-polar Muon for that conv,
     sqrt(min(Co, K) / (Co K)) for Co <= K), so `--muon-lr` keeps its meaning and the A/B compares geometry only.
