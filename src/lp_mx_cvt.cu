@@ -110,11 +110,108 @@ __global__ void input_rad_k(const TI *ct, const uint8_t *recs, size_t rec_bytes,
     for (int d = 0; d < 3; d++) r[1 + d] = rnd16<TI>(__fmul_rn((pf >> (8 + d)) & 1 ? -1.f : 1.f, comp[(pf >> (2 * d)) & 3]));   /* sign x component (signed zeros as the host) */
     mx_store_row_b<B>(y, mx_sc<B>(y, N, 4, S), i, 8, r);
 }
+/* --half-res pack with --gpu-input: the network's 8 input channels on the 2x2x2 blocks of the window, straight from the full-resolution
+   16-bit CT channel and the radial records: each sub-voxel's 4 channels as input_rad_k (rounded to the 16-bit type), then nn_half_input
+   mode 2 (the block means of the 4 channels, the CT's Haar details along z, y, x and its mean absolute deviation, each rounded to the
+   16-bit type), then one 8-channel MX row as f32_to_mx_k: bit for bit the host-built chain (sample.c write_x -> nn_half_input ->
+   nn_h16_to_mx) without its full-resolution 4-channel window. One thread per block; d, h (= w): the network grid */
+template <typename TI> __device__ __forceinline__ void rad_voxel(const TI *ct, const int *h, size_t i, int fz, int fy, int fx, const int *nd, float *r4) {
+    const float *cyz = (const float *)(h + 8), *cxz = cyz + h[2];
+    const int o1 = h[0], o2 = h[1], hasax = h[4], pf = h[5];
+    const int io[3] = {fz, fy, fx};
+    int s[3] = {0, 0, 0};
+#pragma unroll
+    for (int d = 0; d < 3; d++) { const int pd = (pf >> (2 * d)) & 3; s[pd] = (pf >> (8 + d)) & 1 ? nd[d] - 1 - io[d] : io[d]; }
+    float comp[3] = {0.f, 0.f, 0.f};
+    if (hasax) {
+        const float dy = __fsub_rn((float)(o1 + s[1]), cyz[s[0]]), dx = __fsub_rn((float)(o2 + s[2]), cxz[s[0]]);
+        const float inv = __fdiv_rn(1.f, __fadd_rn(__fsqrt_rn(__fadd_rn(__fmul_rn(dy, dy), __fmul_rn(dx, dx))), 1e-6f));
+        comp[1] = __fmul_rn(dy, inv); comp[2] = __fmul_rn(dx, inv);
+    }
+    r4[0] = ldx(ct, i);
+#pragma unroll
+    for (int d = 0; d < 3; d++) r4[1 + d] = rnd16<TI>(__fmul_rn((pf >> (8 + d)) & 1 ? -1.f : 1.f, comp[(pf >> (2 * d)) & 3]));
+}
+template <int B, typename TI>
+__global__ void input_rad_pack_k(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int d, int p, uint8_t *y) {
+    const size_t hv = (size_t)d * p * p, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * hv) return;
+    const int n = (int)(i / hv); const size_t v = i % hv;
+    const int z = (int)(v / ((size_t)p * p)), yy = (int)((v / p) % p), xx = (int)(v % p);
+    const int D = 2 * d, P = 2 * p, nd[3] = {D, P, P};
+    const size_t S = (size_t)D * P * P;
+    const int *h = (const int *)(recs + (size_t)n * rec_bytes);
+    float q[4][8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+        const int fz = 2 * z + (k >> 2), fy = 2 * yy + (k >> 1 & 1), fx = 2 * xx + (k & 1);
+        float r4[4];
+        rad_voxel<TI>(ct, h, (size_t)n * S + ((size_t)fz * P + fy) * P + fx, fz, fy, fx, nd, r4);
+#pragma unroll
+        for (int c = 0; c < 4; c++) q[c][k] = r4[c];
+    }
+    float r[32];
+#pragma unroll
+    for (int k = 0; k < 32; k++) r[k] = 0.f;
+    float m0 = 0.f;
+#pragma unroll
+    for (int c = 0; c < 4; c++) {   /* half_in_k: the block mean (fp32 sum in sub-voxel order) */
+        float s = 0.f;
+#pragma unroll
+        for (int k = 0; k < 8; k++) s += q[c][k];
+        const float m = 0.125f * s;
+        if (!c) m0 = m;
+        r[c] = rnd16<TI>(m);
+    }
+    float g[3] = {0.f, 0.f, 0.f}, a = 0.f;
+#pragma unroll
+    for (int k = 0; k < 8; k++) { g[0] += k & 4 ? q[0][k] : -q[0][k]; g[1] += k & 2 ? q[0][k] : -q[0][k]; g[2] += k & 1 ? q[0][k] : -q[0][k]; a += fabsf(q[0][k] - m0); }
+#pragma unroll
+    for (int e = 0; e < 3; e++) r[4 + e] = rnd16<TI>(0.125f * g[e]);
+    r[7] = rnd16<TI>(0.125f * a);
+    mx_store_row_b<B>(y, mx_sc<B>(y, N, 8, hv), i, 8, r);
+}
+extern "C" void lp_input_rad_pack(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, void *y, int bits) {
+    const size_t n = (size_t)N * d * p * p;
+    const uint8_t *rr = (const uint8_t *)rec; uint8_t *yy = (uint8_t *)y;
+#define IRP(B, T) input_rad_pack_k<B, T><<<nblk_(n, 256), 256>>>((const T *)ct16, rr, rec_bytes, N, d, p, yy)
+    if (bits == 4) { if (dt == 2) IRP(4, __half); else IRP(4, bf16); }
+    else { if (dt == 2) IRP(8, __half); else IRP(8, bf16); }
+#undef IRP
+    LPCK();
+}
 extern "C" void lp_input_rad(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int D, int P, void *y, int bits) {
     const size_t n = (size_t)N * D * P * P;
     const uint8_t *rr = (const uint8_t *)rec; uint8_t *yy = (uint8_t *)y;
     if (bits == 4) { if (dt == 2) input_rad_k<4, __half><<<nblk_(n, 256), 256>>>((const __half *)ct16, rr, rec_bytes, N, D, P, yy); else input_rad_k<4, bf16><<<nblk_(n, 256), 256>>>((const bf16 *)ct16, rr, rec_bytes, N, D, P, yy); }
     else { if (dt == 2) input_rad_k<8, __half><<<nblk_(n, 256), 256>>>((const __half *)ct16, rr, rec_bytes, N, D, P, yy); else input_rad_k<8, bf16><<<nblk_(n, 256), 256>>>((const bf16 *)ct16, rr, rec_bytes, N, D, P, yy); }
+    LPCK();
+}
+/* consistent fp4 weights (unet_cfg.w4_2d): w[co][ci][t] rounded in place to MX-fp4 with one ue8m0 scale per B x B (co x ci) block
+   and tap (mx_exp of the block's absolute maximum, round to nearest as the weight preps): every per-input-channel block of the forward
+   preps and per-output-channel block of the backward-data preps inside one such block re-quantises these values exactly (a smaller
+   scale 2^-j only doubles grid values <= 6 / 2^j, which stay on the e2m1 grid). One warp per (tap, block) */
+__global__ void fq_w4_2d_k(float *w, int Co, int Ci, int T, int Bo, int Bi) {   /* (Bo x Bi blocks: 1 x 16 / 32 = the forward preps' own
+                                                                                     blocks, 16 / 32 x 1 backward-data's, for tests) */
+    const int nbo = (Co + Bo - 1) / Bo, nbi = (Ci + Bi - 1) / Bi, lane = threadIdx.x & 31;
+    const size_t wid = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) >> 5;
+    if (wid >= (size_t)T * nbo * nbi) return;
+    const int t = (int)(wid % T), bi = (int)((wid / T) % nbi), bo = (int)(wid / ((size_t)T * nbi));
+    const int o0 = bo * Bo, i0 = bi * Bi, no = min(Bo, Co - o0), ni = min(Bi, Ci - i0);
+    float amax = 0.f;
+    for (int e = lane; e < no * ni; e += 32) amax = fmaxf(amax, fabsf(w[((size_t)(o0 + e / ni) * Ci + i0 + e % ni) * T + t]));
+#pragma unroll
+    for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    const int ex = mx_exp(amax, 1.f / 6.f);
+    const float m = exp2i(-ex), s = exp2i(ex);
+    for (int e = lane; e < no * ni; e += 32) {
+        float *p = w + ((size_t)(o0 + e / ni) * Ci + i0 + e % ni) * T + t;
+        *p = dec_e2m1n(cvt_e2m1x2(*p * m, 0.f) & 15u) * s;
+    }
+}
+extern "C" void lp_fakeq_w4(float *w, int Co, int Ci, int T, int Bo, int Bi) {
+    const size_t nw = (size_t)T * ((Co + Bo - 1) / Bo) * ((Ci + Bi - 1) / Bi);
+    fq_w4_2d_k<<<nblk_(nw * 32, 128), 128>>>(w, Co, Ci, T, Bo, Bi);
     LPCK();
 }
 /* MX -> fp32 [n][C][S] (tests) */

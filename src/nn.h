@@ -141,6 +141,9 @@ void nn_h16_to_mx(const void *x, shape5 s, void *y);   /* 16-bit storage-type te
    registered MX input (fp8 / fp4). The 16-bit 4-channel window never exists (6 B per voxel less on the host, PCIe and device). */
 #define NN_RAD_REC(D) ((size_t)(8 + 2 * (D)) * 4)
 void nn_input_rad(const void *ct16, shape5 xs, const void *rec, void *y);
+/* --half-res pack: the same from the full-resolution CT channel [n][8 d h w] and records of NN_RAD_REC(2 d), into the network's
+   8-channel input on the 2x2x2 blocks (xs {n, 8, d, h, h}): bit for bit write_x -> nn_half_input(mode 2) -> nn_h16_to_mx */
+void nn_input_rad_pack(const void *ct16, shape5 xs, const void *rec, void *y);
 /* packed targets (sample.h SAMPLE_TM_*: bit 0 target 0 = 255, bit 1 target 1 = 255, bit 2 mask) of nb samples of p3 voxels in m ->
    t (nb x 2 x p3: 0 / 255) and the 0 / 1 mask in m, in place; on the copy stream (after an nn_h2d_copy_stream of the codes) or the
    compute stream */
@@ -267,6 +270,11 @@ int nn_get_loss_grad_h16(void);   /* the loss kernels' gradient format (nn_set_l
 void nn_pool_targets(const uint8_t *t, const uint8_t *m, int B, int C, int D, int H, int W, int f, uint8_t *to, uint8_t *mo);   /* deep supervision: max-pool masked targets, any-pool the mask (C <= 16) */   /* recto channel: + w (1 - (sum s p + 1) / (sum p + 1)), gradient only (the logged dice excludes it) */
 int nn_get_loss_tol(void);
 void nn_loss_async_tol(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch, uint8_t *code);
+/* --half-res pack: the loss of the full-resolution window (s, even sides) from the network's packed logits ([n][8 s.c][half grid],
+   fp16 / fp32 as nn_set_logits_h16), the gradient in that layout (gl may be the logits: in place; nullptr: statistics only); bit
+   for bit nn_half_output + nn_loss_async_tol (no tolerance band) + nn_half_grad, without full-resolution logits. t nullptr: m holds
+   the packed target codes (nn_unpack_tm's input; s.c <= 2), read as nn_unpack_tm would unpack them */
+void nn_loss_pack(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, float *scratch);
 /* the same loss in parts (head slabs): statistics added to ds (5 doubles per (n, c), caller-zeroed) per slab, finished into scratch
    (s: the whole window), then each slab's gradient (gl may be the logits: in place) */
 void nn_loss_stats_acc(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds);
@@ -333,6 +341,9 @@ void nn_prob_u8(const float *logits, size_t n, uint8_t *out, float hard);   /* o
 void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out);
 void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n);
 void nn_add_into(void *y, const void *x, shape5 s, int h16);   /* y += x in y's storage (MX by registration, else 16-bit or fp32) */
+void nn_fakeq_w4_2d(float *w, int Co, int Ci, int T, int B);   /* w[Co][Ci][T] in place to MX-fp4 values, a scale per B x B block and tap
+                                                                   (unet_cfg.w4_2d: forward and backward-data then quantise it identically) */
+void nn_fakeq_w4(float *w, int Co, int Ci, int T, int Bo, int Bi);   /* the same with Bo x Bi blocks (tests: 1 x 16 / 32 = the forward's weights) */
 void nn_add_into_act(void *y, const void *x, shape5 s, int h16);   /* the same for a forward activation: MX-fp4 rounded to nearest (no SR) */
 void nn_side_targets(const uint8_t *side, size_t n, uint8_t *t, uint8_t *m);   /* band.h SIDE_* labels -> loss target (recto 255, verso 0) and mask (known) */   /* where m == 0 and vm != 0: t = src, m = 1 */
 void nn_phase_targets(const uint8_t *phase, size_t n, uint8_t *t, uint8_t *m);   /* band.h PHASE_* -> targets t[0..n) = 0.5 + 0.5 cos(2 pi phase), t[n..2n) = 0.5 + 0.5 sin (x255), mask (known) */

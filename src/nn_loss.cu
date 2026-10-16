@@ -107,6 +107,90 @@ extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const u
     }
     KCHECK();
 }
+/* --half-res pack: the losses of the full-resolution window read straight from the network's packed logits (lg [n][8 C][d h w],
+   channel 8 c + k = sub-voxel k = (z & 1) 4 + (y & 1) 2 + (x & 1) of output c), the gradient written in the same layout (in place
+   over the logits allowed): nn_half_output's unpacked fp32 logits, nn_loss_async_tol and nn_half_grad (mode 2) without the
+   full-resolution logits and gradient. Same per-element arithmetic and summation order (bit for bit). s: the full-resolution shape */
+__device__ __forceinline__ size_t pk_lg_index(size_t i, int n, int c, int C, int H, int W, size_t hv) {   /* full-res voxel i of (n, c) -> packed element */
+    const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
+    const int k = (z & 1) * 4 + (y & 1) * 2 + (x & 1);
+    return ((size_t)n * 8 * C + 8 * (size_t)c + k) * hv + ((size_t)(z >> 1) * (H >> 1) + (y >> 1)) * (W >> 1) + (x >> 1);
+}
+/* the target byte and mask weight of voxel i: t / m, or (t == nullptr) m holds the packed codes (sample.h SAMPLE_TM_*: bit c target c
+   = 255, bit 2 mask), the values nn_unpack_tm would write */
+__device__ __forceinline__ void pk_tm(const uint8_t *t, const uint8_t *m, size_t nc, int c, int n, size_t S, size_t i, unsigned *tv, unsigned *mv) {
+    if (t) { *tv = t[nc * S + i]; *mv = m[(size_t)n * S + i]; return; }
+    const unsigned code = m[(size_t)n * S + i];
+    *tv = (code >> c & 1u) * 255u; *mv = code >> 2 & 1u;
+}
+template <typename LT> __global__ void loss_stats_pk_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw, int H, int W) {
+    int nc = blockIdx.x, slab = blockIdx.y, n = nc / C;
+    const size_t hv = S / 8;
+    float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0;
+    if (w[nc]) {
+        size_t per = (S + gridDim.y - 1) / gridDim.y, lo = (size_t)slab * per, hi = lo + per < S ? lo + per : S;
+        for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+            unsigned tv, mv; pk_tm(t, m, nc, nc % C, n, S, i, &tv, &mv);
+            if (!mv) continue;
+            const float mw = mv;
+            float x = lgv(lg, pk_lg_index(i, n, nc % C, C, H, W, hv)), p = tv * (1.f / 255.f);
+            float sg = 1.f / (1.f + __expf(-x));
+            float spp = fmaxf(x, 0.f) + log1pf(__expf(-fabsf(x)));
+            float xq = x, spq = spp;
+            float bce = pw * p * (spq - xq) + (1.f - p) * spp;
+            a0 += mw; a1 += mw * bce; a2 += sg * p; a3 += sg; a4 += p;
+        }
+    }
+    __shared__ double r[5][256];
+    r[0][threadIdx.x] = a0; r[1][threadIdx.x] = a1; r[2][threadIdx.x] = a2; r[3][threadIdx.x] = a3; r[4][threadIdx.x] = a4;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 5; k++) r[k][threadIdx.x] += r[k][threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) for (int k = 0; k < 5; k++) atomicAdd(&ds[nc * 5 + k], r[k][0]);
+}
+template <typename GT, typename LT> __global__ void loss_grad_pk_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N, int C, size_t S, const float *st,
+                                                                  float dice_w, const float *fin, GT *gl, float pw, float gscale, int H, int W, float rec_w) {
+    const size_t j = blockIdx.x * (size_t)blockDim.x + threadIdx.x, hv = S / 8;   /* one thread per packed logit element */
+    if (j >= (size_t)N * C * S) return;
+    const size_t ch = j / hv, hvi = j % hv;
+    const int n = (int)(ch / (8 * (size_t)C)), c8 = (int)(ch % (8 * (size_t)C)), c = c8 >> 3, k = c8 & 7, nc = n * C + c;
+    const int h = H >> 1, w2 = W >> 1;
+    const int z = 2 * (int)(hvi / ((size_t)h * w2)) + (k >> 2), y = 2 * (int)((hvi / w2) % h) + (k >> 1 & 1), x0 = 2 * (int)(hvi % w2) + (k & 1);
+    const size_t i = ((size_t)z * H + y) * W + x0;   /* the full-resolution voxel */
+    unsigned tv, mv; pk_tm(t, m, nc, c, n, S, i, &tv, &mv);
+    if (!w[nc] || !mv) { gl[j] = f2h<GT>(0.f); return; }
+    float nm = st[nc * 5], Ssp = st[nc * 5 + 2], Ss = st[nc * 5 + 3], Sp = st[nc * 5 + 4];
+    float x = lgv(lg, j), p = tv * (1.f / 255.f), s = 1.f / (1.f + expf(-x));
+    float den = Ss + Sp + 1.f;
+    float pq = p;
+    const float mw = mv;
+    float g = mw * ((1.f - p) * s - pw * pq * (1.f - s)) / fmaxf(nm, 1.f);
+    float ddice_ds = -(2.f * p * den - (2.f * Ssp + 1.f)) / (den * den);
+    g += dice_w * ddice_ds * s * (1.f - s);
+    if (rec_w > 0.f && nc % C == 0) g -= rec_w * p / (Sp + 1.f) * s * (1.f - s);
+    gl[j] = f2h<GT>(g * fin[2 * C + 1] * gscale);
+}
+extern "C" void nn_loss_pack(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, float *scratch) {
+    if ((s.d | s.h | s.w) & 1) { fprintf(stderr, "nn_loss_pack: even window sides\n"); abort(); }
+    const size_t S = shape_spatial(s);
+    const int NC = s.n * s.c;
+    float *fin = scratch + (size_t)5 * NC;
+    double *ds = gn_dsums((size_t)5 * NC);
+    cudaMemsetAsync(ds, 0, (size_t)5 * NC * sizeof(double));
+    const int slabs = NC >= 16 ? KSLAB : 512 / NC;
+    if (g_logits_h16) loss_stats_pk_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, s.h, s.w);
+    else loss_stats_pk_k<float><<<dim3(NC, slabs), 256>>>((const float *)logits, t, m, w, s.c, S, ds, g_posw, s.h, s.w);
+    zs_reduce(ds, 5 * NC);
+    loss_d2f_k<<<nblk(5 * NC, 128), 128>>>(ds, scratch, 5 * NC);
+    loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, fin);
+    if (gl) {
+        const size_t n = shape_numel(s);
+#define LGP(GT, LT, gs) loss_grad_pk_k<GT, LT><<<nblk(n, 256), 256>>>((const LT *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (GT *)gl, g_posw, gs, s.h, s.w, g_recall)
+        if (g_logits_h16) { if (!g_loss_g16) LGP(float, f16, 1.f); else if (g_h16) LGP(f16, f16, g_gscale); else LGP(bf16, f16, g_gscale); }
+        else { if (!g_loss_g16) LGP(float, float, 1.f); else if (g_h16) LGP(f16, float, g_gscale); else LGP(bf16, float, g_gscale); }
+#undef LGP
+    }
+    KCHECK();
+}
 /* the loss in parts, for the trainer's head slabs (train.c): nn_loss_stats_acc adds a slab's statistics (logits and targets of that
    slab, s its shape) to ds (5 doubles per (n, c), zeroed by the caller before the first slab); nn_loss_stats_fin turns them into the
    scratch nn_loss_async_tol leaves (s: the whole window's shape, for N and C); nn_loss_grad_only writes a slab's logit gradient from

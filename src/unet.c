@@ -1769,7 +1769,8 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     else if (ABF && !x_h16) { if (!u->xin) u->xin = dalloc_input(u, xs); nn_f32_to_act(x, xs, u->xin); cur = u->xin; }
     else if (x_h16 && act_mx8() && xin_mx) {
         if (!u->xin) u->xin = dalloc_input(u, xs);
-        if (u->rad) nn_input_rad(x, xs, u->rad, u->xin);   /* --gpu-input: x is the CT channel, the radial channels from the records */
+        if (u->rad && u->cfg.half_res == 2) nn_input_rad_pack(x, xs, u->rad, u->xin);   /* --half-res pack: x is the full-resolution CT channel */
+        else if (u->rad) nn_input_rad(x, xs, u->rad, u->xin);   /* --gpu-input: x is the CT channel, the radial channels from the records */
         else nn_h16_to_mx(x, xs, u->xin);
         cur = u->xin;
         if (getenv("UFSM_XIN_HASH")) {   /* diagnostic: FNV-1a of the converted input (the --gpu-input A/B compares these) */
@@ -1779,7 +1780,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         }
     }
     if (u->rad && !(x_h16 && act_mx8() && xin_mx && !u->ctin.on)) { fprintf(stderr, "unet_forward_x: radial input records need the 16-bit -> MX input conversion\n"); abort(); }
-    u->l3_ct = u->l3b && train && u->rad && x_h16 && xin_mx && u->h_xin && l3_ct_on() && l3_ct_off(u) && l3_ct_bytes(u) <= u->xin_bytes
+    u->l3_ct = u->l3b && train && u->rad && u->cfg.half_res != 2 && x_h16 && xin_mx && u->h_xin && l3_ct_on() && l3_ct_off(u) && l3_ct_bytes(u) <= u->xin_bytes
                && (const char *)x >= (const char *)u->l3x[2] && (const char *)x + l3_ct_bytes(u) <= (const char *)u->l3x[2] + u->l3xb[2];
     if (u->l3_ct) {   /* (l3b, GPU-built input) the CT to the host: enc[0]'s conv2 writes X2 after it */
         nn_offload_copy(u->h_xin, x, l3_ct_bytes(u), 1, u->ev_xin[0], u->ev_xin[1]);
@@ -2566,10 +2567,17 @@ void unet_set_sparse24(unet *u, int on) {
     u->fw = on ? u->wm : u->live;
 }
 int unet_get_sparse24(const unet *u) { return u->sparse24; }
-void unet_apply_sparse24(unet *u) {
-    if (!u->sparse24) { u->fw = u->live; return; }
+static void fq2d_conv(unet *u, const convp *c, void *arg) {   /* cfg.w4_2d: the fp4 stride-1 convs (not the stem, not the downs) */
+    (void)arg;
+    if (c == &u->enc[0].c1 || c->stride != 1) return;
+    nn_fakeq_w4_2d(u->wm + c->w, c->cout, c->cin, c->k * c->k * c->k, 32);
+}
+void unet_apply_sparse24(unet *u) {   /* (and cfg.w4_2d: the forward copy of the live weights, transformed every forward) */
+    if (!u->sparse24 && !u->cfg.w4_2d) { u->fw = u->live; return; }
+    if (!u->wm) u->wm = nn_malloc(u->np * 4);
     nn_d2d(u->wm, u->live, u->np * 4);
-    for_each_conv3(u, mask_conv, nullptr);
+    if (u->sparse24) for_each_conv3(u, mask_conv, nullptr);
+    if (u->cfg.w4_2d) for_each_conv3(u, fq2d_conv, nullptr);
     u->fw = u->wm;
 }
 void unet_srste24(unet *u, float lambda) { if (u->sparse24) for_each_conv3(u, srste_conv, &lambda); }
@@ -2698,6 +2706,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     { int any = 0; for (int i = 0; i < u->cfg.nlev; i++) any |= u->cfg.enc_blocks[i] != 0;
       if (any) { fputs(",\"enc_blocks\":[", f); for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.enc_blocks[i]); fputc(']', f); } }
     if (u->cfg.half_res) fprintf(f, ",\"half_res\":%d", u->cfg.half_res);
+    if (u->cfg.w4_2d) fprintf(f, ",\"w4_2d\":%d", u->cfg.w4_2d);
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
     { int any = 0; for (int i = 0; i < u->cfg.nlev; i++) any |= u->cfg.dec_convs[i] == 1;
       if (any) { fputs(",\"dec_convs\":[", f); for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.dec_convs[i]); fputc(']', f); } }
@@ -2732,6 +2741,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"dec_widths\":["))) { p += 14; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->dec_widths[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"enc_blocks\":["))) { p += 14; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->enc_blocks[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"half_res\":"))) cfg->half_res = atoi(p + 11);
+    cfg->w4_2d = (p = strstr(line, "\"w4_2d\":")) ? atoi(p + 8) : 0;
     if ((p = strstr(line, "\"ds_levels\":"))) cfg->ds_levels = atoi(p + 12);
     if ((p = strstr(line, "\"dec_convs\":["))) { p += 13; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->dec_convs[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"nparams\":"))) *np = (size_t)atoll(p + 10);
