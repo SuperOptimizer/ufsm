@@ -229,6 +229,15 @@ ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or
   0.295 vs 0.294 / 0.294 (mean -0.001; the plan's bar was +0.01); FWHM 0.1-0.4 voxels wider; recto-cutoff band VOI lower in
   all four pairs (box 48128 1.255 / 1.265 vs 1.402 / 1.614, box 48512 0.839 / 0.986 vs 0.855 / 1.108: fewer merges);
   3.46 vs 3.75 samples/s (+8.5% step). Not adopted for the recto; the merge reduction is worth re-testing with a longer run.
+- Residual blocks on the 2026-10-15 production chain (MX-fp4 gradients, three level-0 buffers): they had silently turned off the
+  three-buffer layout and the coarse skip offload (both excluded any residual block: ~+9 B per level-0 voxel); the skip offload and
+  the l3b coarse homes now hold each level's stage output (the last block's a2), only level-0 blocks stay excluded. A stale-record
+  bug: the residual backward adds the identity gradient into d/d a2 after the GN backward wrote the fp4 weight gradient's gy records
+  for it (on by default at >= 32 channels since the warp-specialised wgrad), so the next block's conv2 weight gradient missed the
+  identity term (mean-of-16 error 0.91 vs ~0.2); lp_add_mx invalidates the records of its target. The forward sum rounds to nearest
+  (nn_add_into_act; it was the only stochastically rounded forward store). P512, 7 levels 16..256 (trainer planner / device peak):
+  none 12.7M params 36.5 B per voxel 4.56 GB; 0,0,1,1,1,1,1 19.4M 37.6 / 4.92; 0,1,2,3,3,3,3 32.8M 42.2 / 5.90;
+  0,2,3,5,5,5,5 (ResEnc-L counts) 46.1M 45.5 / 6.73.
 - Winding phase (after upstream lasagna's cos target, made signed): `band_field_phase` (src/band.c) gives every voxel between
   two labelled consecutive rectos the fraction of the way outward from the recto it lies outward of to the next one (x252;
   0 on a recto, 126 midway, wrapping to 0 at the next recto). The midpoints are the neighbour pairs on opposite sides whose
