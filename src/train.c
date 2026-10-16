@@ -779,6 +779,7 @@ int cmd_train(int argc, char **argv) {
     if (time_horizon && warmup_seconds >= time_horizon) { fprintf(stderr, "warmup-seconds must be less than time horizon\n"); return 2; }
     int nval = atoi(opt(argc, argv, "--val-batches", "8")), log_every = atoi(opt(argc, argv, "--log-every", "20"));
     int val_every = atoi(opt(argc, argv, "--val-every", "500")), ckpt_every = atoi(opt(argc, argv, "--ckpt-every", "1000"));
+    const int val_live = atoi(opt(argc, argv, "--val-live", "0"));   /* validate the live weights instead of the EMA (e.g. resume a last.ckpt for one lr-0 step) */
     uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "0"));
     const char *resume = opt(argc, argv, "--resume", nullptr);
     const char *geometry=opt(argc,argv,"--geometry",nullptr),*task=opt(argc,argv,"--task",geometry?"surface_winding":"surface");
@@ -1935,7 +1936,7 @@ int cmd_train(int argc, char **argv) {
             char vstr[128] = ",,";
             if (step % val_every == 0 || step == steps || g_stop) {
                 const int nv = split ? 2 : 1;   /* split: validation windows are split too */
-                for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, 1); }
+                for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, !val_live); }   /* (--val-live 1: the live weights) */
                 {   /* validation on the buffer not holding the prefetched batch (its upload has completed: ev_up synced above) */
                     int keep = G[0].cur;
                     for (int g = 0; g < nv; g++) { if (G[g].lean) { nn_init(G[g].dev); nn_event_sync(G[g].ev_up[keep]); } select_buf(&G[g], keep ^ 1); }   /* lean: one buffer, the prefetch must have landed */
