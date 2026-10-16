@@ -108,6 +108,7 @@ long unet_gn_pooled(unet *u, float *h);     /* pooled statistics (unet_gn_nstats
 void unet_set_l0_ema(unet *u, float mom, int warm);
 void unet_set_l0_slab_kern(int on);   /* --l0-norm slab on the kernel path (readers apply per-slab statistics; 1) or D's prototype (0); -1: env UFSM_L0_SLAB_KERN */
 void unet_set_l0_stream(int on);      /* the level-0 slab stream (stage S3: level-0 ops per slab in a skewed schedule; 1); -1: env UFSM_L0_STREAM */
+void unet_set_l0_ring(int on);        /* stage S4: the stream's level-0 tensors in VMM slab rings (with stream 2; a training build input); -1: env UFSM_L0_RING */
 void unet_l0_stream_dump(int on);     /* test hook: keep device copies of gout[1] after dec[0]'s backward (0), d/d downo[0] (1), the skip gradient (2) */
 const void *unet_l0_stream_dumped(int k, size_t *bytes);
 /* ema: recalibrate the running statistics of the weights in use (the EMA weights' after unet_use_ema(u, 1)) -- every forward from

@@ -97,6 +97,8 @@ struct unet {
     float *l0st_poison;           /* UFSM_L0_STREAM_POISON: a NaN plane source */
     int l0st, l0st_dir;           /* this forward / backward runs the level-0 slab stream (2: recomputing); its backward phase's direction (+1 down, -1 up) */
     unsigned l0st_rc[4]; int l0st_rk[4];   /* the forward's level-0 ops (stem, enc[0] conv2, dec[0] conv1, conv2): first seed draw, draws per window */
+    int l0ring;                   /* this training build keeps level-0 tensors in VMM slab rings (stage S4, UFSM_L0_RING with stream 2) */
+    float *l0r_ups; size_t l0r_upsn;   /* ring mode: silu(gn(dec[1].a2)) at level 1, the per-slab up transient's source */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
@@ -535,7 +537,8 @@ size_t unet_last_offload_bytes(void) { return g_hoff; }
 static int g_l0_3buf = -1;
 static int l0_3buf_on(void) { if (g_l0_3buf < 0) g_l0_3buf = getenv("UFSM_L0_3BUF") ? ufsm_env_on("UFSM_L0_3BUF") : 0; return g_l0_3buf; }
 void unet_set_l0_3buf(int on) { g_l0_3buf = on; }   /* -1: the env / default */
-#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8) + 16384 * unet_wide_up_grad() + 32768 * keep_coarse_a1() + 65536 * share_enc_a1() + 131072 * grad_mx4() + 262144 * up_wg_chunk() + 524288 * a1_offload() + 1048576 * xin_offload() + 2097152 * a0_share_on() + 4194304 * gco_on() + 8388608 * dno_on() + 16777216 * sko_on() + 33554432 * infer_alias() + 67108864 * (infer_slab() > 0) + 134217728 * infer_offload() + 268435456 * l0_3buf_on() + 536870912 * l3_sched_on())
+static int l0ring_mode(void);   /* (stage S4: the slab rings requested; a build input) */
+#define UMODE() (nn_get_tf32() * 4 + ABF * 2 + GBF + 8 * act_mx8() + 16 * grad_mx8() + 32 * recompute() + 128 * act_mx4() + 256 * chunk_up() + 1024 * lean() + 4096 * input_mx() + 8192 * (unet_input_prec() == 8) + 16384 * unet_wide_up_grad() + 32768 * keep_coarse_a1() + 65536 * share_enc_a1() + 131072 * grad_mx4() + 262144 * up_wg_chunk() + 524288 * a1_offload() + 1048576 * xin_offload() + 2097152 * a0_share_on() + 4194304 * gco_on() + 8388608 * dno_on() + 16777216 * sko_on() + 33554432 * infer_alias() + 67108864 * (infer_slab() > 0) + 134217728 * infer_offload() + 268435456 * l0_3buf_on() + 536870912 * l3_sched_on() + 1073741824 * l0ring_mode())
 /* chunk mode (recompute, 16-bit activations and gradients, fused upsample): the decoder's up-part input gradient is
    produced in w[i]-channel chunks, each upsample-backwarded straight into its slice of gout[i + 1], so the shared
    gradient buffer B only needs w[i] channels (env UFSM_CHUNK_UP=0 turns it off) */
@@ -601,6 +604,12 @@ static void free_acts(unet *u) {
         u->dm[i] = u->dr[i] = u->downs[i] = nullptr;
         u->downo[i] = u->cat[i] = u->gskip[i] = u->gout[i] = u->gA[i] = u->gB[i] = u->t1[i] = u->t2[i] = nullptr;
     }
+    if (u->l0ring) {   /* (stage S4: built here, unlike the lazy stream buffers of S3) */
+        float *q[3] = {u->l0st_g2, u->l0st_up, u->l0r_ups};
+        free_once(q, 3);
+        u->l0st_g2 = u->l0st_up = u->l0r_ups = nullptr; u->l0st_g2n = u->l0st_upn = u->l0r_upsn = 0;
+        u->l0ring = 0;
+    }
     for (int i = 0; i < u->cfg.nlev; i++) {   /* residual blocks: own buffers */
         float *q[8] = {u->gres[i]}; int nq = 1;
         free_once(q, nq); u->gres[i] = nullptr; u->gres_cap[i] = 0;
@@ -652,6 +661,54 @@ static int l0s_kern(const unet *u) {
     return (g_l0s_kern >= 0 ? g_l0s_kern : k) && u->cfg.l0_norm == 4 && nn_get_tf32();
 }
 static int l0s_nslab(const unet *u, int d) { const int S = u->cfg.l0_slab; return (d + S - 1) / S; }
+/* ---- stage S4: level-0 slab rings (UFSM_L0_RING=1 with UFSM_L0_STREAM=2; plan /home/forrest/.claude/plans/level0-slab-streaming.md).
+   The level-0 tensors of the slab stream become VMM rings (nn_ring_alloc): whole-tensor virtual addresses (S2's windows, S3's schedule
+   unchanged), slab s backed by physical chunk s mod R. R per tensor is the schedule's live span (S3's DESIGN.md table, verified by the
+   bit-for-bit test: a ring too short changes the bits). Indices: 0 enc[0].a1, 1 the skip enc[0].a2, 2 dec[0].a1, 3 dec[0].a2,
+   4 d/d a2 (the stream's B2), 5 level 0's A, 6 the up-part gradient (level 0's B), 7 dec[0]'s up transient, 8 gout[0] */
+static int g_l0ring = -1;
+void unet_set_l0_ring(int on) { g_l0ring = on; }
+static int l0ring_req(void) { if (g_l0ring < 0) { const char *e = getenv("UFSM_L0_RING"); g_l0ring = e ? atoi(e) : 0; } return g_l0ring; }
+static int l0ring_R(int k) {
+    static int R[9] = {0}; static int set = 0;
+    if (!set) {
+        const int def[9] = {3, 5, 3, 2, 3, 4, 3, 3, 2};
+        for (int i = 0; i < 9; i++) R[i] = def[i];
+        const char *e = getenv("UFSM_L0_RING_R");   /* "a,b,c,...": overrides in index order (the test's too-short controls) */
+        for (int i = 0; e && *e && i < 9; i++) { R[i] = atoi(e); const char *c = strchr(e, ','); e = c ? c + 1 : nullptr; }
+        set = 1;
+    }
+    return k >= 0 && k < 9 ? R[k] : 3;
+}
+static int l0st_req(void);
+static int l0ring_mode(void) { return l0ring_req() && l0st_req() >= 2; }
+/* the rings fit this build: stream 2 requested, slab kernel path, uniform slabs whose MX data and scale planes lie on the mapping
+   granularity (16-channel level 0: S h w a multiple of 2 MB, i.e. P a multiple of 256 at 32-plane slabs) */
+static int l0ring_want(const unet *u, int train, shape5 xs) {
+    if (!train || !l0ring_req() || l0st_req() < 2 || !l0s_kern(u) || xs.n != 1 || u->l3b) return 0;
+    const size_t G = g_dry ? (size_t)2 << 20 : nn_ring_gran(), hw = (size_t)xs.h * xs.w, S = (size_t)u->cfg.l0_slab;
+    const char *why = !G ? "CUDA virtual memory management" : xs.d % u->cfg.l0_slab || l0s_nslab(u, xs.d) < 2 ? "several uniform slabs"
+        : (S * hw) % G ? "slabs of l0_slab h w bytes on the 2 MB mapping granularity (P a multiple of 256 at 32-plane slabs)" : nullptr;
+    if (why) { fprintf(stderr, "unet: UFSM_L0_RING needs %s\n", why); abort(); }
+    return 1;
+}
+/* a level-0 tensor of shape s (one sample, depth a multiple of the slab), MX storage dt, as a ring of R slabs */
+static float *dalloc_ring(unet *u, shape5 s, int dt, int R, int grad) {
+    const int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw, rb = dt == 4 ? bw / 2 : bw;
+    const size_t hw = (size_t)s.h * s.w, D = (size_t)s.d, S = (size_t)u->cfg.l0_slab, ns = D / S, rr = (size_t)R < ns ? (size_t)R : ns;
+    size_t reg[16], sl[16], phys = 0; int n = 0;
+    for (int k = 0; k < nb; k++) { reg[n] = D * hw * rb; sl[n] = S * hw * rb; n++; }
+    for (int k = 0; k < nb; k++) { reg[n] = D * hw; sl[n] = S * hw; n++; }
+    for (int k = 0; k < n; k++) phys += rr * sl[k];
+    const size_t tot = nn_mx_bytes(s, dt);
+    u->act_bytes += phys; if (grad) u->grad_bytes += phys;
+    if (g_dry) { mrep_add(phys); return (float *)(uintptr_t)4096; }
+    size_t ph = 0;
+    float *p = (float *)nn_ring_alloc(n, reg, sl, R, &ph);
+    if (!p) { fprintf(stderr, "unet: a level-0 slab ring of %.2f GB (%zu of %zu slabs) failed (VMM, granularity or memory)\n", phys / 1e9, rr, ns); abort(); }
+    dstorage(p, tot, dt);
+    return p;
+}
 /* a1 / a2: nullptr = allocate, else a shared buffer (inference or recompute 2) */
 static void build_block_acts(unet *u, block *b, shape5 xs, int train, int keep_s2, float *a1, float *a2, float *s2) {
     b->xs = xs;
@@ -727,6 +784,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
     const int *w = u->cfg.widths;
     u->l3b = l3_want(u, train);
     u->l3s = u->l3b && l3_sched_on();
+    u->l0ring = l0ring_want(u, train, xs);   /* (stage S4: the level-0 tensors of the slab stream in VMM rings) */
     /* inference on the tensor-core path: conv outputs that die within the forward share two scratch buffers. T1 holds
        every a1 (dead after conv2). T2 holds the down-conv outputs (dead after the next block's conv1) and the a2 that are
        not kept (decoder; encoder too unless recompute mode, where the encoder a2 are the skips); the upsampled decoder
@@ -868,8 +926,15 @@ static void build_acts(unet *u, shape5 xs, int train) {
         if (slab && i == 0) ea1 = X;
         if (slab1 && i == 1) ea1 = Y;
         if (u->l3b && i == 0) g_mlab = "level-0 X2 (skip / dec[0].a2 / coarse bwd homes)";
+        float *ra2 = nullptr;
+        if (u->l0ring && i == 0) {   /* (stage S4: enc[0].a1 and the skip in slab rings) */
+            shape5 y = u->ls[0]; y.c = w[0];
+            g_mlab = "level-0 slab rings (stage S4)";
+            ea1 = dalloc_ring(u, y, act_dt(), l0ring_R(0), 0); ra2 = dalloc_ring(u, y, act_dt(), l0ring_R(1), 0);
+            g_mlab = "encoder a1 / a2 / GN stats + down outputs";
+        }
         build_block_acts(u, &u->enc[i], bin, train, i == L - 1, ea1,
-                         slab && i == 0 ? X : slab1 && i == 1 ? Y : u->p3 ? SK[i] : rc && train && sko_on() && !u->cfg.enc_blocks[i] && i > 0 && i < L - 1 ? SKO_DEFER : rc || u->cfg.enc_blocks[i] ? nullptr : T2, nullptr);   /* recompute mode keeps the (small) outputs that
+                         ra2 ? ra2 : slab && i == 0 ? X : slab1 && i == 1 ? Y : u->p3 ? SK[i] : rc && train && sko_on() && !u->cfg.enc_blocks[i] && i > 0 && i < L - 1 ? SKO_DEFER : rc || u->cfg.enc_blocks[i] ? nullptr : T2, nullptr);   /* recompute mode keeps the (small) outputs that
                                                                                                                          get upsampled; training: the coarse skips placed later */
         if (u->l3b && i == 0) { u->l3x[2] = u->enc[0].a2; u->l3xb[2] = act_bytes_of(u->enc[0].ys); g_mlab = "encoder a1 / a2 / GN stats + down outputs"; }
         if (sea && i < L - 1) {
@@ -911,8 +976,10 @@ static void build_acts(unet *u, shape5 xs, int train) {
         shape5 cin = li; cin.c = w[i] + UPW(i + 1);
         /* A 16-bit decoder's kept SiLU may also use its consumed encoder skip. In MX modes s2
            is absent and the next decoder normalizes a2 on the fly. Training keeps separate buffers. */
+        float *rd1 = nullptr;
+        if (u->l0ring && i == 0) { shape5 y = u->ls[0]; y.c = w[0]; g_mlab = "level-0 slab rings (stage S4)"; rd1 = dalloc_ring(u, y, act_dt(), l0ring_R(2), 0); g_mlab = "decoder a1 / a2 / GN stats"; }
         build_block_acts(u, &u->dec[i], cin, train, i > 0,
-                         slab && i == 0 ? X : slab1 && i == 1 ? Y : sea ? u->enc[i].a1 : train && i > 0 && keep_coarse_a1() ? nullptr : T1,
+                         rd1 ? rd1 : slab && i == 0 ? X : slab1 && i == 1 ? Y : sea ? u->enc[i].a1 : train && i > 0 && keep_coarse_a1() ? nullptr : T1,
                          u->dec[i].single ? nullptr : (reuse_skip || u->l3b) && i == 0 ? u->enc[0].a2 : slab1 && i == 1 ? Y : T2,   /* (l3b: X2) */
                          reuse_skip && i > 0 ? stage_out(u, i)->a2 : nullptr);
         if (sea) u->dec[i].a1_lent = 1;
@@ -947,7 +1014,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 }
             }
             size_t na = 0, nbb = 0;   /* elements (16-bit / fp32) or bytes (MX) */
-            for (int i = 0; i < L; i++) {
+            for (int i = u->l0ring ? 1 : 0; i < L; i++) {   /* (stage S4: level 0's A and B are rings of their own) */
                 /* chunk mode: the up-part gradient goes through B in w[i]-channel chunks, so B needs no w[i+1] */
                 int cb[3] = {w[i], i < L - 1 && !chunk ? UPW(i + 1) : 0, i ? w[i - 1] : u->cfg.cin};
                 for (int k = 0; k < 3; k++) {   /* B holds each of these tensors at this level */
@@ -1051,6 +1118,20 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 else { u->gB[i] = B; u->gB_cap[i] = u->gB_bytes; }
             }
             if (u->nob) u->gB_bytes = u->gB_cap[0];
+            if (u->l0ring) {   /* (stage S4: level 0's A, its B = the up-part gradient, the stream's d/d a2 and dec[0]'s up transient in rings;
+                                  silu(gn(dec[1].a2)) at level 1, the up transient's per-slab source) */
+                shape5 a0 = u->ls[0]; a0.c = w[0];
+                shape5 b0 = u->ls[0]; b0.c = u->dec[0].c_split;
+                g_mlab = "level-0 slab rings (stage S4)";
+                u->gA[0] = dalloc_ring(u, a0, grad_dt(), l0ring_R(5), 1);
+                u->gB[0] = dalloc_ring(u, b0, grad_dt(), l0ring_R(6), 1); u->gB_cap[0] = nn_mx_bytes(b0, grad_dt());
+                u->l0st_g2 = dalloc_ring(u, a0, grad_dt(), l0ring_R(4), 1); u->l0st_g2n = nn_mx_bytes(a0, grad_dt());
+                u->l0st_up = dalloc_ring(u, b0, act_dt(), l0ring_R(7), 0); u->l0st_upn = act_bytes_of(b0);
+                const block *xb = (const block *)u->dec[0].xb;
+                g_mlab = "level-1 up source (stage S4)";
+                u->l0r_ups = dalloc_act_s(u, xb->ys); u->l0r_upsn = act_bytes_of(xb->ys);
+                g_mlab = "gradient buffers gout / gskip (per level)";
+            }
             for (int i = 0; i < L; i++) if (u->cfg.enc_blocks[i] > 0) {   /* residual blocks: the identity gradient of the stream */
                 shape5 sg = u->ls[i]; sg.c = w[i];
                 u->gres_cap[i] = gmx ? nn_mx_bytes(sg, grad_dt()) : shape_numel(sg) * (GBF ? 2 : 4);
@@ -2557,6 +2638,36 @@ static void l0st_up_build(unet *u, block *b, float *up) {
         if (dt0) nn_set_storage(t, u->gout_cap[1], dt0); else nn_storage_forget(t);
     } else PROF(5, nn_up2_fwd_gn_into(xb->a2, xb->ys, &g, up, b->c_split, 0));
 }
+/* ring mode (S4): dec[0]'s up transient per slab -- the up2 windows from silu(gn(dec[1].a2)), computed once into the level-1 buffer
+   (l0r_ups; rc_up's arithmetic as l0st_up_build's first branch: GroupNorm + SiLU stored, then upsampled) -- so that before conv1's
+   weight gradient of slab s the ring holds slabs s - 1 .. s + 1 (its window reads one plane beyond each end). *lo: the lowest slab
+   built. The op's seeds: the apply's draws, then each window replays the whole up2's first draw (o->k = both, as the whole op) */
+static void l0st_up_ring(unet *u, block *b, float *up, int s, l0op *o, l0op *next, int *lo, unsigned *kap) {
+    const block *xb = (const block *)b->xb;
+    const int ns = l0s_nslab(u, b->ys.d);
+    if (u->gout_cap[1] < act_bytes_of(xb->ys)) { fprintf(stderr, "unet: UFSM_L0_RING: dec[0]'s up transient needs the stored-source path (gout[1] holds dec[1]'s output)\n"); abort(); }
+    int kup = -1;
+    if (o->k < 0) {
+        const nn_gn_t g = gn_out(u, xb);
+        l0op_go(o);
+        nn_set_storage(u->l0r_ups, u->l0r_upsn, act_dt());
+        PROF(3, nn_gn_silu_apply(xb->a2, xb->ys, g.G, g.gamma, g.beta, g.mean, g.rstd, u->l0r_ups));
+        *kap = nn_sr_ctr() - o->c;
+        *lo = ns;
+    }
+    for (int k = *lo - 1; k >= s - 1 && k >= 0; k--) {
+        const unsigned c0 = o->c + *kap;
+        nn_sr_set_ctr(c0);
+        l0st_win(u, k, ns - 1 - k, ns);
+        PROF(5, nn_up2_fwd_into(u->l0r_ups, xb->ys, up, b->c_split, 0));
+        l0st_nowin();
+        const int d = (int)(nn_sr_ctr() - c0);
+        if (kup < 0) kup = d; else if (kup != d) rc_fail("level-0 slab rings: an up2 window drew another number of seeds");
+        if (o->k >= 0 && (int)*kap + d != o->k) rc_fail("level-0 slab rings: an up2 window drew another number of seeds");
+        *lo = k;
+    }
+    if (o->k < 0) { o->k = (int)*kap + (kup < 0 ? 0 : kup); if (next) next->c = o->c + (unsigned)o->k; }
+}
 /* B1: dec[0]'s backward from gout[0] (the head's input gradient) and the upsample backward into gout[1], down the slabs */
 static void l0st_bwd_dec(unet *u) {
     block *b = &u->dec[0];
@@ -2571,6 +2682,7 @@ static void l0st_bwd_dec(unet *u) {
     const nn_gn_t g2 = gn_out(u, x2b);
     l0op o_g2 = {nn_sr_ctr(), -1}, o_c2w = {0, -1}, o_c2d = {0, -1}, o_g1 = {0, -1}, o_up = {0, -1}, o_c1w = {0, -1}, o_c1d = {0, -1}, o_u2b = {0, -1};
     int n1 = 0, n2 = 0, n3 = 0;   /* windows run of the ops one, two and three slabs behind */
+    int up_lo = ns; unsigned up_kap = 0;   /* (ring mode: the up transient's lowest built slab, its source's draws) */
     u->l0st_dir = 1;
     /* stream 2: every level-0 activation recomputed ahead of its readers, down the slabs: at tick t enc[0]'s a1 of slab t - 3, the
        skip of t - 2 (dec[0]'s conv1 reads its planes around t - 1), dec[0]'s a1 of t - 1 (conv2's weight gradient at t reads its
@@ -2595,7 +2707,8 @@ static void l0st_bwd_dec(unet *u) {
             PROF(3, gn_silu_bwd_b(u, b, 1, b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, A, A, g + b->n1.gamma, g + b->n1.beta, u->gn_scratch));
             l0op_end(&o_g1, &o_up); l0st_nowin();
             nn_set_conv(0);
-            if (o_up.k < 0) { l0op_go(&o_up); l0st_up_build(u, b, up); l0op_end(&o_up, &o_c1w); }   /* the up transient, once */
+            if (u->l0ring) l0st_up_ring(u, b, up, s1, &o_up, &o_c1w, &up_lo, &up_kap);   /* (ring: per slab, s1 - 1 .. s1 + 1 held) */
+            else if (o_up.k < 0) { l0op_go(&o_up); l0st_up_build(u, b, up); l0op_end(&o_up, &o_c1w); }   /* the up transient, once */
             l0st_win(u, s1, n1, ns); l0op_go(&o_c1w);
             int r; PROF(2, r = nn_conv3d_bwd_weight_x(up, nullptr, x2b->a2, &g2, b->c_split, 0, b->xs, A, b->ys, 3, 1, g + b->c1.w, g + b->c1.b));
             if (r) rc_fail("level-0 slab stream: decoder conv1 weight gradient");

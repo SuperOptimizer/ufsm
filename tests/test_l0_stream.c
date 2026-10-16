@@ -44,9 +44,11 @@ int main(void) {
         for (int k = 0; k < 3; k++) { float *f = dev_rand(nx, 1.f); x[k] = nn_malloc(nx * 2); nn_f32_to_h16(f, nx, x[k], 1.f); nn_free(f); }
         for (int k = 0; k < 2; k++) { float *f = dev_rand(no, 1.f); gl[k] = nn_malloc(no * 2); nn_f32_to_h16(f, no, gl[k], nn_get_grad_scale()); nn_free(f); }
         unet *v = unet_create(&cfg); unet_init(v, 77); const size_t np = unet_nparams(v);
-        uint8_t *lg[3][3]; size_t lgb = 0; uint8_t *dmp[3][2][4]; size_t dmb[4] = {0, 0, 0, 0}; float *gg[3][2]; unsigned ctr[3][2]; double ms[3] = {0, 0, 0};
-        for (int st = 0; st < 3; st++) {   /* unstreamed, streamed, streamed and recomputing */
-            unet_set_l0_stream(st);
+        uint8_t *lg[4][3]; size_t lgb = 0; uint8_t *dmp[4][2][4]; size_t dmb[4] = {0, 0, 0, 0}; float *gg[4][2]; unsigned ctr[4][2]; double ms[4] = {0, 0, 0, 0};
+        /* stage S4: the recomputing stream with the level-0 tensors in VMM slab rings, where the slabs lie on the 2 MB mapping granularity */
+        const int nst = (size_t)S * P * P % ((size_t)2 << 20) == 0 && nn_ring_gran() ? 4 : 3;
+        for (int st = 0; st < nst; st++) {   /* unstreamed, streamed, streamed and recomputing, recomputing in rings */
+            unet_set_l0_stream(st < 3 ? st : 2); unet_set_l0_ring(st == 3);
             unet_build(v, xs, 1);
             for (int k = 0; k < 2; k++) {
                 nn_sync(); const double t0 = now_ms();   /* (the second step's forward + backward: the timing) */
@@ -64,7 +66,7 @@ int main(void) {
             }
         }
         const char *e = nn_check();
-        for (int m = 1; m < 3; m++) {   /* each stream mode against the unstreamed run */
+        for (int m = 1; m < nst; m++) {   /* each stream mode against the unstreamed run */
             size_t lneq = 0; for (int k = 0; k < 3; k++) for (size_t i = 0; i < lgb; i++) lneq += lg[0][k][i] != lg[m][k][i];
             size_t dneq[4] = {0, 0, 0, 0}; for (int k = 0; k < 2; k++) for (int d = 0; d < 4; d++) for (size_t i = 0; i < dmb[d]; i++) dneq[d] += dmp[0][k][d][i] != dmp[m][k][d][i];
             /* parameter gradients per part: enc[0], down0, dec[0], the head, all (unet_create's layout: encoders, downs, decoders, head) */
@@ -81,18 +83,19 @@ int main(void) {
             const int ok = !e && !lneq && !dneq[0] && !dneq[1] && !dneq[2] && !dneq[3] && fin && worst[4] < 1e-5 && ctr[0][0] == ctr[m][0] && ctr[0][1] == ctr[m][1];
             printf("  P %d slab %d down_norm %d, stream %d%s%s: logits %zu of %zu bytes differ, gout[1] %zu, dec[0]'s skip gradient %zu, d/d downo[0] %zu, skip gradient %zu; parameter "
                    "gradients rel enc0 %.2g down0 %.2g dec0 %.2g head %.2g all %.2g%s; seeds %u/%u vs %u/%u; step %.0f vs %.0f ms (with the logits' d2h)%s%s\n",
-                   P, S, dn, m, m == 2 ? " (recomputing)" : "", getenv("UFSM_L0_STREAM_POISON") ? " (poison)" : "",
+                   P, S, dn, m < 3 ? m : 2, m == 2 ? " (recomputing)" : m == 3 ? " (recomputing, slab rings)" : "", getenv("UFSM_L0_STREAM_POISON") ? " (poison)" : "",
                    lneq, 3 * lgb, dneq[0], dneq[3], dneq[1], dneq[2], worst[0], worst[1], worst[2], worst[3], worst[4], fin ? "" : " (non-finite)",
                    ctr[m][0], ctr[m][1], ctr[0][0], ctr[0][1], ms[m], ms[0], e ? e : "", ok ? "" : "  FAIL");
             if (!ok) bad++;
         }
-        for (int st = 0; st < 3; st++) for (int k = 0; k < 3; k++) free(lg[st][k]);
-        for (int st = 0; st < 3; st++) for (int k = 0; k < 2; k++) { free(gg[st][k]); for (int d = 0; d < 4; d++) free(dmp[st][k][d]); }
+        for (int st = 0; st < nst; st++) for (int k = 0; k < 3; k++) free(lg[st][k]);
+        for (int st = 0; st < nst; st++) for (int k = 0; k < 2; k++) { free(gg[st][k]); for (int d = 0; d < 4; d++) free(dmp[st][k][d]); }
+        unet_set_l0_ring(0);
         for (int k = 0; k < 3; k++) nn_free(x[k]);
         for (int k = 0; k < 2; k++) nn_free(gl[k]);
         unet_free(v);
     }
-    unet_set_l0_stream(-1);
+    unet_set_l0_stream(-1); unet_set_l0_ring(-1);
     printf("level-0 slab stream: %s\n", bad ? "FAIL" : "PASS");
     return bad != 0;
 }
