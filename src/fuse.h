@@ -11,8 +11,9 @@
 #include <stdint.h>
 
 /* in[k][i] (k < n): phase codes of len voxels; out: fused codes; stats (optional, 4): voxels known by 1 set, fused (>= 2 agreeing),
-   conflicts (written unknown), unknown everywhere */
-void fuse_phase(const uint8_t *const *in, int n, size_t len, float tol_turns, uint8_t *out, size_t *stats);
+   conflicts (written unknown), unknown everywhere; hist (optional, PHASE_PERIOD / 2 + 1 bins): at voxels known by >= 2 sets, the
+   largest pairwise circular difference in codes (the duplicate-offset statistics that set tol) */
+void fuse_phase(const uint8_t *const *in, int n, size_t len, float tol_turns, uint8_t *out, size_t *stats, size_t *hist);
 
 /* Binary recto rasters in[k] and the CT ct on one grid of d0 x d1 x d2 voxels (z-major); blocks of block^3; out: the chosen
    surface (255) or 0. A surface voxel of a set is dropped when another set has a surface voxel within dup voxels whose block

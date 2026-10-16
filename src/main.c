@@ -1359,7 +1359,7 @@ static int cmd_fuse(int argc, char **argv) {
     const int H = recto ? dup : 0; const int64_t E = S + 2 * H; const size_t L = (size_t)E * E * E;
     uint8_t *buf[16], *cb = recto ? malloc(L) : nullptr, *ob = malloc(L), *sh = malloc((size_t)S * S * S);
     for (int k = 0; k < n; k++) buf[k] = malloc(L);
-    size_t st[4] = {0, 0, 0, 0}; int nsh = 0;
+    size_t st[4] = {0, 0, 0, 0}, hist[PHASE_PERIOD / 2 + 1] = {0}; int nsh = 0;
     for (int64_t sz = 0; sz * S < shape[0]; sz++) for (int64_t sy = 0; sy * S < shape[1]; sy++) for (int64_t sx = 0; sx * S < shape[2]; sx++) {
         int present = 0;
         for (int k = 0; k < n && !present; k++) { const z3_meta *mk = z3_meta_of(in[k]);
@@ -1371,14 +1371,25 @@ static int cmd_fuse(int argc, char **argv) {
         for (int k = 0; k < n; k++) if (z3_read(in[k], o, nn, buf[k], nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3_error()); return 1; }
         if (recto) { if (z3_read(ct, o, nn, cb, nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3_error()); return 1; }
                      fuse_recto((const uint8_t *const *)buf, n, cb, E, E, E, block, dup, ob, st); }
-        else fuse_phase((const uint8_t *const *)buf, n, L, tol, ob, st);
+        else fuse_phase((const uint8_t *const *)buf, n, L, tol, ob, st, hist);
         for (int64_t z = 0; z < S; z++) for (int64_t y = 0; y < S; y++) memcpy(sh + ((size_t)z * S + y) * S, ob + ((size_t)(z + H) * E + y + H) * E + H, (size_t)S);
         if (z3w_write_shard(w, sz, sy, sx, sh, nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3w_error()); return 1; }
         nsh++;
     }
     z3w_close(w);
     if (recto) fprintf(stderr, "recto-fuse: %d shards -> %s; primary voxels %zu, other-sheet voxels added %zu, duplicate voxels dropped %zu (halo voxels counted too)\n", nsh, od, st[0], st[1], st[2]);
-    else fprintf(stderr, "phase-fuse: %d shards -> %s; voxels from one set %zu, fused %zu, conflicts (unknown) %zu\n", nsh, od, st[0], st[1], st[2]);
+    else {
+        fprintf(stderr, "phase-fuse: %d shards -> %s; voxels from one set %zu, fused %zu, conflicts (unknown) %zu\n", nsh, od, st[0], st[1], st[2]);
+        size_t tot = 0, c = 0; for (int k = 0; k <= PHASE_PERIOD / 2; k++) tot += hist[k];
+        if (tot) {   /* the sets' offsets where they overlap: quantiles of the largest pairwise difference, the share within some tolerances */
+            fprintf(stderr, "phase-fuse: overlap %zu voxels, largest pairwise difference (turns):", tot);
+            const double q[] = {.5, .75, .9, .95, .99}; int qi = 0;
+            for (int k = 0; k <= PHASE_PERIOD / 2 && qi < 5; k++) { c += hist[k]; while (qi < 5 && c >= q[qi] * tot) fprintf(stderr, " p%g %.3f", 100 * q[qi++], (double)k / PHASE_PERIOD); }
+            const double t[] = {.025, .05, .1, .15, .2, .3}; fprintf(stderr, "; within");
+            for (int j = 0; j < 6; j++) { c = 0; for (int k = 0; k <= PHASE_PERIOD / 2 && k <= t[j] * PHASE_PERIOD; k++) c += hist[k]; fprintf(stderr, " %g: %.3f", t[j], (double)c / tot); }
+            fprintf(stderr, "\n");
+        }
+    }
     for (int k = 0; k < n; k++) { free(buf[k]); z3_close(in[k]); } free(cb); free(ob); free(sh); if (ct) z3_close(ct);
     return 0;
 }

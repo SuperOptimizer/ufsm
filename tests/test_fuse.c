@@ -14,7 +14,7 @@ int main(void) {
     {   /* phase */
         const uint8_t A[6] = {10, 10, 255, 100, 0, 126}, B[6] = {12, 255, 255, 200, 250, 130}, C[6] = {11, 255, 255, 255, 255, 180};
         const uint8_t *in[3] = {A, B, C}; uint8_t out[6]; size_t st[4] = {0};
-        fuse_phase(in, 3, 6, 0.1f, out, st);
+        fuse_phase(in, 3, 6, 0.1f, out, st, nullptr);
         CHECK(out[0] == 11, "agreeing 10 / 12 / 11 -> 11 (got %d)", out[0]);
         CHECK(out[1] == 10, "one set -> its value (got %d)", out[1]);
         CHECK(out[2] == PHASE_UNKNOWN, "no set -> unknown (got %d)", out[2]);

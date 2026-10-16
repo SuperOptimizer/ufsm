@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-void fuse_phase(const uint8_t *const *in, int n, size_t len, float tol_turns, uint8_t *out, size_t *stats) {
+void fuse_phase(const uint8_t *const *in, int n, size_t len, float tol_turns, uint8_t *out, size_t *stats, size_t *hist) {
     static float cs[PHASE_PERIOD], sn[PHASE_PERIOD]; static int init;
     if (!init) { for (int k = 0; k < PHASE_PERIOD; k++) { cs[k] = cosf(2.f * (float)M_PI * k / PHASE_PERIOD); sn[k] = sinf(2.f * (float)M_PI * k / PHASE_PERIOD); } init = 1; }
     const float tol = tol_turns * PHASE_PERIOD;   /* in codes */
@@ -14,12 +14,13 @@ void fuse_phase(const uint8_t *const *in, int n, size_t len, float tol_turns, ui
         for (int k = 0; k < n && m < 16; k++) { const uint8_t v = in[k][i]; if (v < PHASE_PERIOD) { c[m++] = v; sx += cs[v]; sy += sn[v]; } }
         if (!m) { out[i] = PHASE_UNKNOWN; st[3]++; continue; }
         if (m == 1) { out[i] = (uint8_t)c[0]; st[0]++; continue; }
-        int bad = 0;
-        for (int a = 0; a < m && !bad; a++) for (int b = a + 1; b < m; b++) {
+        int dmax = 0;
+        for (int a = 0; a < m; a++) for (int b = a + 1; b < m; b++) {
             int d = abs(c[a] - c[b]); if (d > PHASE_PERIOD / 2) d = PHASE_PERIOD - d;
-            if ((float)d > tol) { bad = 1; break; }
+            if (d > dmax) dmax = d;
         }
-        if (bad) { out[i] = PHASE_UNKNOWN; st[2]++; continue; }
+        if (hist) hist[dmax]++;
+        if ((float)dmax > tol) { out[i] = PHASE_UNKNOWN; st[2]++; continue; }
         float a = atan2f(sy, sx); if (a < 0) a += 2.f * (float)M_PI;
         int q = (int)lroundf(a * PHASE_PERIOD / (2.f * (float)M_PI)); out[i] = (uint8_t)(q % PHASE_PERIOD); st[1]++;
     }
