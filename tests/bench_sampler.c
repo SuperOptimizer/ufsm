@@ -45,6 +45,16 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_BENCH_GPUIN")) c.gpu_input = 1;   /* train --gpu-input: the CT channel and radial records only (hashed as such) */
     if (getenv("UFSM_BENCH_PRESET") && sample_aug_preset(&c, getenv("UFSM_BENCH_PRESET"))) { fprintf(stderr, "UFSM_BENCH_PRESET: all | none\n"); return 2; }
     if (getenv("UFSM_BENCH_PACK")) c.pack_tm = 1;
+    if (getenv("UFSM_BENCH_OP")) {   /* name[,name..]: only these scanner ops, at p 1 (per-op cost); "geometry": warps every window */
+        memset(c.scan.p, 0, sizeof c.scan.p); c.scan.strength = 1; char *t = strdup(getenv("UFSM_BENCH_OP"));
+        for (char *q = strtok(t, ","); q; q = strtok(nullptr, ",")) {
+            int k = 0; while (k < SA_N && strcmp(q, scan_aug_names[k])) k++;
+            if (k < SA_N) c.scan.p[k] = 1;
+            else if (!strcmp(q, "geometry")) { c.geometry_augment = 1; c.rotate_degrees = 10; c.rotate_p = 1; c.elastic = 1; c.elastic_p = 1; }
+            else { fprintf(stderr, "UFSM_BENCH_OP: unknown op %s\n", q); return 2; }
+        }
+        free(t);
+    }
     const int Pz = c.Pz > 0 ? c.Pz : P;   /* task unwrap's phase (no band affinities): the side array is hashed too */
     if (getenv("UFSM_BENCH_COVER")) {
         cover_plan *plan = cover_load(getenv("UFSM_BENCH_COVER"), S, P); if (!plan) return 1;

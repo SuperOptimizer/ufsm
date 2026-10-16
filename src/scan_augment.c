@@ -27,13 +27,29 @@ int scan_aug_load_hist(const char *path, scan_aug_cfg *c) {
 }
 /* two-sided exponential smoothing along one axis of a P^3 float volume (forward and backward first-order recursions, the kernel
    (1 - a)^2 / (1 - a^2) a^|t| sums to 1), edges replicated; line: P floats */
-static void exp_smooth(float *F, int P, int axis, float a, float *line) {
+[[maybe_unused]] static void exp_smooth_ref(float *F, int P, int axis, float a, float *line) {
     const size_t P2 = (size_t)P * P, st = axis == 0 ? P2 : axis == 1 ? (size_t)P : 1;
     for (int u = 0; u < P; u++) for (int v = 0; v < P; v++) {
         const size_t b = axis == 0 ? (size_t)u * P + v : axis == 1 ? (size_t)u * P2 + v : (size_t)u * P2 + (size_t)v * P;
         float y = F[b];
         for (int i = 0; i < P; i++) { y = (1 - a) * F[b + i * st] + a * y; line[i] = y; }
         for (int i = P - 1; i >= 0; i--) { y = i == P - 1 ? line[i] : (1 - a) * line[i] + a * y; F[b + i * st] = y; }
+    }
+}
+/* exp_smooth_ref with the lines of axes 0 and 1 run side by side (rows of the contiguous axis at a time, the forward pass in place):
+   every element sees the same float operations in the same order, bit for bit; axis 2 (contiguous lines) as before */
+static void exp_smooth(float *F, int P, int axis, float a, float *line) {
+    const size_t P2 = (size_t)P * P;
+    if (axis == 2) { exp_smooth_ref(F, P, axis, a, line); return; }
+    const float b = 1 - a;
+    const size_t st = axis == 0 ? P2 : (size_t)P;   /* along the line */
+    const int outer = P, inner = axis == 0 ? P * P : P;   /* axis 0: one z sweep over whole planes; axis 1: per plane, rows of x */
+    for (int u = 0; u < (axis == 0 ? 1 : outer); u++) {
+        float *base = F + (axis == 0 ? 0 : (size_t)u * P2);
+        float *r0 = base;
+        for (int v = 0; v < inner; v++) r0[v] = b * r0[v] + a * r0[v];   /* (y starts as the first element) */
+        for (int i = 1; i < P; i++) { float *ri = base + i * st; const float *rp = ri - st; for (int v = 0; v < inner; v++) ri[v] = b * ri[v] + a * rp[v]; }
+        for (int i = P - 2; i >= 0; i--) { float *ri = base + i * st; const float *rn = ri + st; for (int v = 0; v < inner; v++) ri[v] = b * ri[v] + a * rn[v]; }
     }
 }
 
@@ -167,6 +183,36 @@ static void shift_planes(void *v, size_t es, int P, int zc, int dy, int dx, cons
             if (sy >= 0 && sy < P && x1 > x0) memcpy(d + x0 * es, (uint8_t *)tmp + sy * row + (x0 - dx) * es, (size_t)(x1 - x0) * es);
         }
     }
+}
+
+/* GIN's random conv net over the float CT F: G = sum_ch w2 leaky(conv_k(normalised F) + b1), and the sums of G over the voxels Z
+   leaves material (g1, g2, gn: z, y, x order). Rows of x with replicated edges, taps outer: each voxel accumulates its taps in the
+   per-voxel loop's order (tests/test_scan_augment.c compares with that loop bit for bit). */
+static void gin_eval(const float *F, const uint8_t *Z, int P, int C, int k, const float w1[4][27], const float b1[4], const float w2[4],
+                     float im, float is, float *G, double *g1p, double *g2p, size_t *gnp) {
+    const size_t P2 = (size_t)P * P; const int r = k / 2, kk = k * k * k;
+    double g1 = 0, g2 = 0; size_t gn = 0;
+    float *nr = malloc((size_t)kk / k * (P + 2) * sizeof *nr), *hr = malloc(4 * (size_t)P * sizeof *hr); if (!nr || !hr) abort();
+    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
+        for (int dz = -r, q = 0; dz <= r; dz++) for (int dy = -r; dy <= r; dy++, q++) {   /* the k^2 normalised source rows, edges replicated */
+            const int zz = z + dz < 0 ? 0 : z + dz >= P ? P - 1 : z + dz, yy = y + dy < 0 ? 0 : y + dy >= P ? P - 1 : y + dy;
+            const float *src = F + zz * P2 + (size_t)yy * P; float *d = nr + (size_t)q * (P + 2) + 1;
+            for (int x = 0; x < P; x++) d[x] = (src[x] - im) * is;
+            d[-1] = d[0]; d[P] = d[P - 1];
+        }
+        for (int ch = 0; ch < C; ch++) { float *h = hr + (size_t)ch * P; for (int x = 0; x < P; x++) h[x] = 0; }
+        for (int dz = -r, q = 0; dz <= r; dz++) for (int dy = -r; dy <= r; dy++, q++) for (int dx = -r; dx <= r; dx++) {
+            const int t = ((dz + r) * k + dy + r) * k + dx + r; const float *v = nr + (size_t)q * (P + 2) + 1 + dx;
+            for (int ch = 0; ch < C; ch++) { float *h = hr + (size_t)ch * P; const float w = w1[ch][t]; for (int x = 0; x < P; x++) h[x] += w * v[x]; }
+        }
+        float *g = G + z * P2 + (size_t)y * P;
+        for (int x = 0; x < P; x++) g[x] = 0;
+        for (int ch = 0; ch < C; ch++) { const float *h = hr + (size_t)ch * P, bb = b1[ch], ww = w2[ch]; for (int x = 0; x < P; x++) { const float u = h[x] + bb; g[x] += ww * (u > 0 ? u : .2f * u); } }
+        const uint8_t *zr = Z + z * P2 + (size_t)y * P;
+        for (int x = 0; x < P; x++) if (!zr[x]) { const float o = g[x]; g1 += o; g2 += (double)o * o; gn++; }
+    }
+    free(nr); free(hr);
+    *g1p = g1; *g2p = g2; *gnp = gn;
 }
 
 unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8_t *tgt, int nch, uint8_t *ign, int P,
@@ -321,17 +367,7 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
         float *G = malloc(p3 * sizeof *G); if (!G) abort();
         const float im = (float)mean, is = (float)(1 / sd);
         double g1 = 0, g2 = 0; size_t gn = 0;
-        for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
-            float h[4] = {0, 0, 0, 0};
-            for (int dz = -r; dz <= r; dz++) for (int dy = -r; dy <= r; dy++) for (int dx = -r; dx <= r; dx++) {
-                const int zz = z + dz < 0 ? 0 : z + dz >= P ? P - 1 : z + dz, yy = y + dy < 0 ? 0 : y + dy >= P ? P - 1 : y + dy, xx = x + dx < 0 ? 0 : x + dx >= P ? P - 1 : x + dx;
-                const float v = (F[zz * P2 + (size_t)yy * P + xx] - im) * is; const int t = ((dz + r) * k + dy + r) * k + dx + r;
-                for (int ch = 0; ch < C; ch++) h[ch] += w1[ch][t] * v;
-            }
-            float o = 0; for (int ch = 0; ch < C; ch++) { const float u = h[ch] + b1[ch]; o += w2[ch] * (u > 0 ? u : .2f * u); }
-            const size_t i = z * P2 + (size_t)y * P + x; G[i] = o;
-            if (!Z[i]) { g1 += o; g2 += (double)o * o; gn++; }
-        }
+        gin_eval(F, Z, P, C, k, w1, b1, w2, im, is, G, &g1, &g2, &gn);
         const double gm = gn ? g1 / gn : 0, gs = gn ? sqrt(fmax(g2 / gn - gm * gm, 1e-12)) : 1;
         for (size_t i = 0; i < p3; i++) F[i] = (float)(alpha * (mean + sd * (G[i] - gm) / gs) + (1 - alpha) * F[i]);
         free(G);
