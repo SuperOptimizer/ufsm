@@ -143,6 +143,7 @@ template <int B> __global__ void add_mx_k(uint8_t *y, const uint8_t *x, int N, i
 }
 extern "C" void lp_add_mx(void *y, const void *x, shape5 s, int dt, unsigned sr) {
     const size_t S = shape_spatial(s), rows = (size_t)s.n * mx_nb(s.c) * S;
+    if (g_gyrec.gy == y) g_gyrec.valid = 0;   /* the GN backward's gy records of y (residual blocks: d/d a2 + the identity gradient) are stale now */
     if (dt == 4) add_mx_k<4><<<nblk_(rows, 256), 256>>>((uint8_t *)y, (const uint8_t *)x, s.n, s.c, S, sr);
     else add_mx_k<8><<<nblk_(rows, 256), 256>>>((uint8_t *)y, (const uint8_t *)x, s.n, s.c, S, sr);
     LPCK();

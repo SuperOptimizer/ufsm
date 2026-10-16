@@ -305,6 +305,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_unet
 	UFSM_SCALE_COND=1 ./$(B)/test_unet
 	UFSM_DS=1 ./$(B)/test_unet
+	UFSM_ENC_BLOCKS=0,1,2 UFSM_RB_NONZERO=1 UFSM_BIG_ENC_BLOCKS=0,1,2,2 UFSM_F16=1 ./$(B)/test_unet
 	UFSM_P=48 UFSM_B=1 ./$(B)/test_unet
 	UFSM_F16=1 ./$(B)/test_unet
 	./$(B)/test_fused

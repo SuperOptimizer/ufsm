@@ -524,16 +524,19 @@ int main(void) {
         }
         report("up2 bwd slice 32 of 64 ch MX-fp4, odd width", relerr(one, gxr, nc), relerr(acc, gxr, nc), K, 0.35);
     }
-    for (int wc = 0; wc < 3; wc++) {   /* end to end, narrow levels (8 / 16-channel MX-fp4 gradients): parameter gradients vs 16-bit (the mean of K
-                                          must approach them), fp16 logits (the level-0 chain engages), fewer training bytes than MX-fp8 */
+    for (int wc = 0; wc < 4; wc++) {   /* end to end, narrow levels (8 / 16-channel MX-fp4 gradients): parameter gradients vs 16-bit (the mean of K
+                                          must approach them), fp16 logits (the level-0 chain engages), fewer training bytes than MX-fp8;
+                                          wc 3: residual blocks at levels 1 (16 channels) and 2 (cfg.enc_blocks, random conv2) */
         nn_set_tf32(1); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1); nn_set_gn_stored(1);
         nn_set_prec(3); if (nn_set_prec_policy("all=fp4:fp4:fp4,enc0.c1=fp16")) bad++;
         setenv("UFSM_F4_WGRAD", "1", 1);
         unet_set_act_mx4(1); unet_set_grad_mx8(1); unet_set_input_prec(8); unet_set_recompute(1); unet_set_chunk_up(2); unet_set_lean(2);
-        unet_cfg cfg = wc == 0 ? (unet_cfg){3, {16, 32, 64}, 4, 2, 8, 1} : wc == 1 ? (unet_cfg){3, {16, 16, 32}, 4, 2, 8, 1} : (unet_cfg){3, {8, 16, 32}, 4, 2, 8, 1};
+        unet_cfg cfg = wc == 0 ? (unet_cfg){3, {16, 32, 64}, 4, 2, 8, 1} : wc == 2 ? (unet_cfg){3, {8, 16, 32}, 4, 2, 8, 1} : (unet_cfg){3, {16, 16, 32}, 4, 2, 8, 1};
+        if (wc == 3) { cfg.enc_blocks[1] = 1; cfg.enc_blocks[2] = 2; setenv("UFSM_RB_NONZERO", "1", 1); }
         shape5 xs = {1, 4, 32, 32, 32}; size_t nx = shape_numel(xs), no = nx / 4 * 2;
         float *x = dev_rand(nx, 1.f), *gyo = dev_rand(no, 1.f);
         unet *u = unet_create(&cfg); unet_init(u, 29); size_t np = unet_nparams(u);
+        unsetenv("UFSM_RB_NONZERO");
         unet_set_grad_mx4(0); const size_t b8 = unet_train_bytes(u, xs);
         unet_set_grad_mx4(1); const size_t b4 = unet_train_bytes(u, xs);
         float *gr = malloc(np * 4), *g4 = malloc(np * 4), *dm = calloc(np, 4), *rm = calloc(np, 4);
@@ -549,10 +552,38 @@ int main(void) {
         double a2 = 0, r2 = 0;
         for (size_t i = 0; i < np; i++) { a2 += (double)dm[i] * dm[i]; r2 += (double)rm[i] * rm[i]; }
         const double avg = sqrt(a2 / r2);
-        char nm[96]; snprintf(nm, sizeof nm, "unet {%d,%d,%d} MX-fp4 act. grads vs 16-bit", cfg.widths[0], cfg.widths[1], cfg.widths[2]);
-        const int ok = isfinite(one) && avg < one * 2.0 / sqrt((double)K) + 0.01;
+        char nm[96]; snprintf(nm, sizeof nm, "unet {%d,%d,%d}%s MX-fp4 act. grads vs 16-bit", cfg.widths[0], cfg.widths[1], cfg.widths[2], wc == 3 ? " res 0,1,2" : "");
+        double rbw = 0;   /* residual blocks: the worst conv weight's mean of K (gy records left stale by the identity gradient's add: 0.91) */
+        {   size_t tot = 0; for (int i = 0; i < cfg.nlev; i++) { const size_t c = cfg.widths[i]; tot += cfg.enc_blocks[i] * (2 * (c * c * 27 + c) + 4 * c); }
+            size_t o = np - tot;
+            for (int i = 0; i < cfg.nlev; i++) for (int k = 0; k < cfg.enc_blocks[i]; k++) {
+                const size_t c = cfg.widths[i], wn = c * c * 27, at[2] = {o, o + wn + c + 2 * c};
+                for (int j = 0; j < 2; j++) { double b2 = 0, c2 = 0; for (size_t q = at[j]; q < at[j] + wn; q++) { b2 += (double)dm[q] * dm[q]; c2 += (double)rm[q] * rm[q]; } if (c2 > 0 && sqrt(b2 / c2) > rbw) rbw = sqrt(b2 / c2); }
+                o += 2 * (wn + c) + 4 * c;
+            } }
+        const int ok = isfinite(one) && avg < one * 2.0 / sqrt((double)K) + 0.01 && rbw < 0.55;
         printf("  %-46s one %.3g, mean of %d %.3g%s\n", nm, one, K, avg, ok ? "" : "  FAIL"); if (!ok) bad++;
-        snprintf(nm, sizeof nm, "unet {%d,%d,%d} train bytes fp8 -> fp4 grads", cfg.widths[0], cfg.widths[1], cfg.widths[2]);
+        if (wc == 3) printf("  %-46s worst residual conv weight, mean of %d %.3g%s\n", "  (its residual blocks)", K, rbw, rbw < 0.55 ? "" : "  FAIL");
+        if (getenv("GM4_DETAIL")) {   /* per tensor (unet_create's layout, residual blocks last): where the mean's residual comes from */
+            const int *w = cfg.widths, L = cfg.nlev; size_t o = 0; char tn[32];
+#define T(n) do { const size_t n_ = (n); double b2 = 0, c2 = 0; for (size_t q_ = o; q_ < o + n_; q_++) { b2 += (double)dm[q_] * dm[q_]; c2 += (double)rm[q_] * rm[q_]; } \
+                  printf("    %-12s %7zu  fp4 mean of %d %.3g\n", tn, n_, K, sqrt(b2 / (c2 > 0 ? c2 : 1))); o += n_; } while (0)
+            for (int i = 0; i < L; i++) { const int ci = i ? w[i - 1] : cfg.cin, co = w[i];
+                snprintf(tn, 32, "enc%d.c1.w", i); T((size_t)co * ci * 27); snprintf(tn, 32, "enc%d.c1.b", i); T(co); snprintf(tn, 32, "enc%d.n1", i); T(2 * co);
+                snprintf(tn, 32, "enc%d.c2.w", i); T((size_t)co * co * 27); snprintf(tn, 32, "enc%d.c2.b", i); T(co); snprintf(tn, 32, "enc%d.n2", i); T(2 * co); }
+            for (int i = 0; i < L - 1; i++) { snprintf(tn, 32, "down%d.w", i); T((size_t)w[i] * w[i] * 27); snprintf(tn, 32, "down%d.b", i); T(w[i]); }
+            for (int i = L - 2; i >= 0; i--) { const int ci = w[i] + w[i + 1], co = w[i];
+                snprintf(tn, 32, "dec%d.c1.w", i); T((size_t)co * ci * 27); snprintf(tn, 32, "dec%d.c1.b", i); T(co); snprintf(tn, 32, "dec%d.n1", i); T(2 * co);
+                snprintf(tn, 32, "dec%d.c2.w", i); T((size_t)co * co * 27); snprintf(tn, 32, "dec%d.c2.b", i); T(co); snprintf(tn, 32, "dec%d.n2", i); T(2 * co); }
+            snprintf(tn, 32, "head.w"); T((size_t)cfg.cout * w[0]); snprintf(tn, 32, "head.b"); T(cfg.cout);
+            if (cfg.down_norm) for (int i = 0; i < L - 1; i++) { snprintf(tn, 32, "dn%d", i); T(2 * w[i]); }
+            for (int i = 0; i < L; i++) for (int k = 0; k < cfg.enc_blocks[i]; k++) { const int c = w[i];
+                snprintf(tn, 32, "rb%d.%d.c1.w", i, k); T((size_t)c * c * 27); snprintf(tn, 32, "rb%d.%d.c1.b", i, k); T(c); snprintf(tn, 32, "rb%d.%d.n1", i, k); T(2 * c);
+                snprintf(tn, 32, "rb%d.%d.c2.w", i, k); T((size_t)c * c * 27); snprintf(tn, 32, "rb%d.%d.c2.b", i, k); T(c); snprintf(tn, 32, "rb%d.%d.n2", i, k); T(2 * c); }
+#undef T
+            if (o != np) printf("    layout mismatch: %zu of %zu\n", o, np);
+        }
+        snprintf(nm, sizeof nm, "unet {%d,%d,%d}%s train bytes fp8 -> fp4 grads", cfg.widths[0], cfg.widths[1], cfg.widths[2], wc == 3 ? " res" : "");
         printf("  %-46s %zu -> %zu, fp16 logits %d%s\n", nm, b8, b4, h16, b4 < b8 && h16 ? "" : "  FAIL"); if (!(b4 < b8 && h16)) bad++;
         unet_set_grad_mx4(0);
         unet_free(u); nn_free(x); nn_free(gyo); free(gr); free(g4); free(dm); free(rm);
@@ -741,12 +772,14 @@ int main(void) {
         unet_set_act_mx4(1); unet_set_grad_mx8(1); unet_set_grad_mx4(1); unet_set_input_prec(4); unet_set_recompute(1); unet_set_chunk_up(2); unet_set_lean(2);
         unet_set_share_enc_a1(1); unet_set_a0_share(1);
         lp_set_gn_head_exact(0);   /* the bit-for-bit comparisons: the head-recomputing GN backward's two-op bits */
-        for (int wc = 0; wc < 3; wc++) {
-            unet_cfg cfg = wc == 0 ? (unet_cfg){4, {16, 16, 32, 64}, 4, 2, 8, 1} : wc == 1 ? (unet_cfg){4, {16, 16, 32, 64}, 4, 2, 8, 0} : (unet_cfg){4, {8, 8, 16, 32}, 4, 2, 8, 1};
+        for (int wc = 0; wc < 4; wc++) {   /* wc 3: residual blocks at levels 1..3 (the coarse skip homes hold the last block's output) */
+            unet_cfg cfg = wc == 1 ? (unet_cfg){4, {16, 16, 32, 64}, 4, 2, 8, 0} : wc == 2 ? (unet_cfg){4, {8, 8, 16, 32}, 4, 2, 8, 1} : (unet_cfg){4, {16, 16, 32, 64}, 4, 2, 8, 1};
+            if (wc == 3) { cfg.enc_blocks[1] = 1; cfg.enc_blocks[2] = 2; cfg.enc_blocks[3] = 1; setenv("UFSM_RB_NONZERO", "1", 1); }
             const shape5 xs = {1, 4, 32, 32, 32};
             const size_t nx = shape_numel(xs), S = nx / 4, no = S * 2, tailb = 3 * S;
             float *xi[2] = {dev_rand(nx, 1.f), dev_rand(nx, 1.f)}, *gy[2] = {dev_rand(no, 1.f), dev_rand(no, 1.f)};
             unet *v = unet_create(&cfg); unet_init(v, 37); const size_t np = unet_nparams(v);
+            unsetenv("UFSM_RB_NONZERO");
             float *gg[2][2]; uint16_t *lgs[2][3]; size_t mem[2]; unsigned ctr[2][2]; int l3[2] = {0, 0}, tail_ok = 1;
             uint8_t *pat = malloc(tailb), *chk = malloc(tailb);
             for (size_t i = 0; i < tailb; i++) pat[i] = (uint8_t)(i * 2654435761u >> 13);
@@ -786,7 +819,7 @@ int main(void) {
                 rel[st] = sqrt(d2 / r2);
             }
             const int ok = !l3[0] && l3[1] && !lneq && rel[0] < 1e-6 && rel[1] < 1e-6 && ctr[0][0] == ctr[1][0] && ctr[0][1] == ctr[1][1] && mem[1] < mem[0] && tail_ok;
-            char nm[96]; snprintf(nm, sizeof nm, "three level-0 buffers {%d,%d,%d,%d}%s vs four", cfg.widths[0], cfg.widths[1], cfg.widths[2], cfg.widths[3], cfg.down_norm ? " dn" : "");
+            char nm[96]; snprintf(nm, sizeof nm, "three level-0 buffers {%d,%d,%d,%d}%s%s vs four", cfg.widths[0], cfg.widths[1], cfg.widths[2], cfg.widths[3], cfg.down_norm ? " dn" : "", wc == 3 ? " res" : "");
             printf("  %-46s layout %d, logits differ %zu, grads rel diff %.3g / %.3g, seeds %u %u / %u %u, train bytes %zu -> %zu (%.2f B / voxel less), batch tail %s%s\n",
                    nm, l3[1], lneq, rel[0], rel[1], ctr[0][0], ctr[0][1], ctr[1][0], ctr[1][1], mem[0], mem[1], ((double)mem[0] - (double)mem[1]) / S, tail_ok ? "kept" : "CLOBBERED", ok ? "" : "  FAIL");
             if (!ok) bad++;
