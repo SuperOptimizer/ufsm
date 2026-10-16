@@ -199,6 +199,22 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
                                                                                           input): staged with one row and one scale load */
     for (int k = 1; k < CP && row1; k++)
         row1 = (IS_MX4(T) ? ctab[k].p == ctab[0].p && ctab[k].nib == k : ctab[k].p == (const void *)((const uint8_t *)ctab[0].p + k)) && ctab[k].sp == ctab[0].sp;
+    unsigned wv[3], scb[3], okm = 0u;   /* row1: this thread's three positions' raw rows and scales, loaded a tile ahead (in flight during the
+                                           previous tile's MMA and epilogue) */
+    auto ld3 = [&](int tz_) {
+        const chan_t &c0 = ctab[0];
+        okm = 0u;
+#pragma unroll
+        for (int j = 0; j < 3; j++) {
+            const int pos = threadIdx.x + 256 * j, ix = pos % 18, iy = (pos / 18) % 10, iz = pos / 180;
+            const int gz = tz_ * 2 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
+            const bool inb = pos < F8_T && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+            wv[j] = 0u; scb[j] = 0u;
+            if (inb) { const size_t off = ((size_t)(gz + zi0) * H + gy) * W + gx; wv[j] = __ldg((const unsigned *)((const uint8_t *)c0.p + off * c0.rb)); scb[j] = c0.sp[off]; }
+            okm |= (unsigned)inb << j;
+        }
+    };
+    if constexpr (IS_MX(T) && CP <= 4) if (row1 && zc * ZC < nzt) ld3(zc * ZC);
     for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
     const int oz0 = tz * 2;
     if (tz > zc * ZC) __syncthreads();   /* the previous tile's MMA (sx) and amax reads are done */
@@ -211,17 +227,6 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
     float amax = 0.f;
     if constexpr (IS_MX(T) && CP <= 4) if (row1) {   /* the same values as ldc per channel: the row's e4m3 bytes / e2m1 nibbles times its
                                                        scale; the three positions' row and scale loads all in flight before the first use */
-        const chan_t &c0 = ctab[0];
-        unsigned wv[3], scb[3], okm = 0u;
-#pragma unroll
-        for (int j = 0; j < 3; j++) {
-            const int pos = threadIdx.x + 256 * j, ix = pos % 18, iy = (pos / 18) % 10, iz = pos / 180;
-            const int gz = oz0 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
-            const bool inb = pos < F8_T && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
-            wv[j] = 0u; scb[j] = 0u;
-            if (inb) { const size_t off = ((size_t)(gz + zi0) * H + gy) * W + gx; wv[j] = __ldg((const unsigned *)((const uint8_t *)c0.p + off * c0.rb)); scb[j] = c0.sp[off]; }
-            okm |= (unsigned)inb << j;
-        }
 #pragma unroll
         for (int j = 0; j < 3; j++) {
             const bool inb = (okm >> j) & 1u;
@@ -270,6 +275,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
         }
     }
     __syncthreads();
+    if constexpr (IS_MX(T) && CP <= 4) if (row1 && tz + 1 < nzt && tz + 1 < (zc + 1) * ZC) ld3(tz + 1);   /* the next tile's rows during this MMA */
     /* lane (g, t): b0 holds k = 4t..4t+3 -> local tap 4t / CP, channel 4t % CP; b1 holds k = 16 + 4t.. */
     const int tl0 = (4 * t) / CP, ch0 = (4 * t) % CP, tl1 = (16 + 4 * t) / CP, ch1 = (16 + 4 * t) % CP;
 #pragma unroll
