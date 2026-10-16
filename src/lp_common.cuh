@@ -476,6 +476,17 @@ __device__ __forceinline__ unsigned sr_e2m1_nib(float v, unsigned u16) {   /* |v
     const float u = __uint_as_float(0x3f800000u | (u16 << 7)) - 1.f;   /* u16 / 65536 exactly, no int -> float conversion */
     return min((unsigned)(tt + u), 7u) | (__float_as_uint(v) >> 28 & 8u);
 }
+/* the same rounding on the float bits (no float sum, no conversion): with one mantissa bit kept, [1, 2), [2, 4) and [4, 8) have the
+   e2m1 spacings 0.5, 1 and 2, so adding the uniform at bits 6..21 of the 22 dropped bits and shifting rounds up exactly when
+   frac + u >= 1 (frac = the dropped bits / 2^22, u = u16 / 65536: floor(t + u) of sr_e2m1_nib in exact arithmetic, which rounds
+   t + u in fp32); [0, 1) is shifted to [1, 2) by + 1 (spacing 0.5: codes 0, 1, 2). r22 = u16 << 6. Finite or infinite x only
+   (a NaN gives 7, sr_e2m1_nib's 0 keeps it NaN under the 0xFF scale: the callers take sr_e2m1_nib for NaN blocks) */
+__device__ __forceinline__ unsigned sr_e2m1_nibf(float x, unsigned r22) {
+    const float a = fminf(fabsf(x), 6.f);
+    const bool lo = a < 1.f;
+    const unsigned c = ((__float_as_uint(lo ? a + 1.f : a) + r22) >> 22) - (lo ? 254u : 252u);
+    return c | (__float_as_uint(x) >> 28 & 8u);
+}
 /* four 32-bit words (eight 16-bit uniforms) from one hash of key and three remixes: the per-8-value SR of the fp4 staging */
 __device__ __forceinline__ void sr_hash4(uint32_t seed, uint64_t key, uint32_t *hh) {
     hh[0] = sr_hash(seed, key);
@@ -767,8 +778,13 @@ __device__ __forceinline__ void fwd_epi_mx16(float (&acc)[MT][NR][2][4], float *
                                        draws past the first's N S rows (the same keys would correlate the two tensors' rounding) */
                         uint32_t hh[4]; sr_hash4(sp.osr, ((uint64_t)ri + (sec ? (uint64_t)N * S : 0u)) * 2 + (CPL * qd) / 8, hh);
                         const int h0 = CPL == 4 ? 2 * (qd & 1) : 0;
+                        if (e != 128) {   /* (finite block: the float-bit rounding, ~3 instructions per value less) */
 #pragma unroll
-                        for (int k = 0; k < CPL; k++) w |= sr_e2m1_nib(v[k] * mult, (hh[h0 + (k >> 1)] >> (16 * (k & 1))) & 0xffffu) << (4 * k);
+                            for (int k = 0; k < CPL; k++) w |= sr_e2m1_nibf(v[k] * mult, (k & 1) ? (hh[h0 + (k >> 1)] >> 10) & 0x3fffc0u : (hh[h0 + (k >> 1)] << 6) & 0x3fffc0u) << (4 * k);
+                        } else {
+#pragma unroll
+                            for (int k = 0; k < CPL; k++) w |= sr_e2m1_nib(v[k] * mult, (hh[h0 + (k >> 1)] >> (16 * (k & 1))) & 0xffffu) << (4 * k);
+                        }
                     } else {
 #pragma unroll
                         for (int k = 0; k < CPL; k += 2) w |= (unsigned)cvt_e2m1x2(v[k] * mult, v[k + 1] * mult) << (4 * k);
