@@ -39,12 +39,12 @@ static void batch_new(batch *b, int n, const int *Co, const int *Ci, int k) {
         if (K > b->maxk) b->maxk = K;
         muonc_desc_t *c = &b->mc[i];
         *c = (muonc_desc_t){.U = d->X, .O = d->Y, .Co = Co[i], .Ci = Ci[i], .k = k, .m = m, .n = nx, .tr = Co[i] > Ci[i]};
-        const size_t fs = (size_t)4 * m * nx;
+        const size_t fs = (size_t)2 * m * nx;   /* one complex m x n block, in floats */
         c->EX = nn_malloc(b->nf * fs * 4); c->EY = nn_malloc(b->nf * fs * 4);
         for (int f = 0; f < b->nf; f++)
-            b->ns[i * b->nf + f] = (muon_desc_t){.X = c->EX + f * fs, .Y = c->EY + f * fs, .A = nn_malloc((size_t)16 * m * m), .B = nn_malloc((size_t)16 * m * m), .Co = 2 * m, .K = 2 * nx};
-        if (2 * m > b->nsm) b->nsm = 2 * m;
-        if (2 * nx > b->nsn) b->nsn = 2 * nx;
+            b->ns[i * b->nf + f] = (muon_desc_t){.X = c->EX + f * fs, .Y = c->EY + f * fs, .A = nn_malloc((size_t)8 * m * m), .B = nn_malloc((size_t)8 * m * m), .Co = m, .K = nx};
+        if (m > b->nsm) b->nsm = m;
+        if (nx > b->nsn) b->nsn = nx;
     }
     b->dd = nn_malloc(sizeof(muon_desc_t) * n); nn_h2d(b->dd, b->h, sizeof(muon_desc_t) * n);
     b->dmc = nn_malloc(sizeof(muonc_desc_t) * n); nn_h2d(b->dmc, b->mc, sizeof(muonc_desc_t) * n);
