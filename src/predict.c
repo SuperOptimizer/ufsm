@@ -75,7 +75,7 @@ static void *reader_main(void *arg) {
 #define WBUF_MAX 32
 typedef struct { z3w *w; int nthreads; size_t bytes; uint8_t *buf[WBUF_MAX]; int64_t sz[WBUF_MAX], sy[WBUF_MAX], sx[WBUF_MAX]; int pending[WBUF_MAX]; int nb, next;
                  atomic_int failed; pthread_mutex_t mu; pthread_cond_t cv; int stop;
-                 int gpu, async; void *evs[WBUF_MAX], *evd[WBUF_MAX]; double t_write; long n_write; } writer_t;   /* (UFSM_PRED_PROF: seconds compressing / writing, shards) */   /* async: buffer k arrives by a copy on the offload stream (evd[k]) */
+                 int gpu, async, skip; void *evs[WBUF_MAX], *evd[WBUF_MAX]; double t_write; long n_write; } writer_t;   /* (UFSM_PRED_PROF: seconds compressing / writing, shards) */   /* async: buffer k arrives by a copy on the offload stream (evd[k]) */
 static void *writer_main(void *arg) {
     writer_t *W = arg;
     if (W->async) nn_init(W->gpu);
@@ -87,7 +87,7 @@ static void *writer_main(void *arg) {
         pthread_mutex_unlock(&W->mu);
         if (W->async) nn_event_sync(W->evd[k]);   /* the shard's device-to-host copy (queued without blocking the main thread) */
         const double tw = now();
-        if (z3w_write_shard(W->w, W->sz[k], W->sy[k], W->sx[k], W->buf[k], W->nthreads)) atomic_store(&W->failed, 1);
+        if (!W->skip && z3w_write_shard(W->w, W->sz[k], W->sy[k], W->sx[k], W->buf[k], W->nthreads)) atomic_store(&W->failed, 1);   /* skip: --no-out 1 */
         W->t_write += now() - tw; W->n_write++;
         pthread_mutex_lock(&W->mu); W->pending[k] = 0; W->next = (k + 1) % W->nb; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
     }
@@ -399,6 +399,8 @@ int cmd_predict(int argc, char **argv) {
                         "       [--channel 0]   output channel written (band_affinity checkpoints: 1..6 = affinities z1 y1 x1 z8 y8 x8)\n"
                         "       [--fit-fields DIR] [--fit-h 8]   task unwrap checkpoints: also the winding fitter's input fields of the box (ufsm fit DIR)\n"
                         "       [--fit-zarr DIR]                 the same fields as zarr arrays, flushed slab by slab (whole volumes)\n"
+                        "       [--no-out 1]                     skip writing the prediction volume's shards (e.g. only the --fit-zarr fields)\n"
+                        "       [--fit-q 0] [--fit-q-phase Q]   volcomp quantiser of the --fit-zarr arrays (0 lossless; the phase planes pc / ps: --fit-q-phase)\n"
                         "       [--radial-sign 1|-1]   -1 reverses the direction input (the CT is unchanged): a recto model then marks the verso face\n"
                         "       [--gn-save FILE]   pool the GroupNorm statistics of every window processed into FILE (calibration)\n"
                         "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n"
@@ -443,6 +445,10 @@ int cmd_predict(int argc, char **argv) {
        box, written to DIR at the end (src/fit.h fit_fields_save). One GPU, the CT window in its own buffer (no aliasing). */
     const char *ffd = opt(argc, argv, "--fit-fields", nullptr); const int ffh = atoi(opt(argc, argv, "--fit-h", "8"));
     const char *ffz = opt(argc, argv, "--fit-zarr", nullptr);   /* the same fields of a whole volume: 10 uint8 zarr arrays, flushed slab by slab */
+    /* --fit-q Q: volcomp quantiser of the --fit-zarr arrays (0 lossless, 1..255 lossy DCT); --fit-q-phase: the phase planes pc / ps
+       (default --fit-q) */
+    const float ffq = (float)atof(opt(argc, argv, "--fit-q", "0")), ffqp = (float)atof(opt(argc, argv, "--fit-q-phase", opt(argc, argv, "--fit-q", "0")));
+    if (!(ffq >= 0 && ffq <= 255 && ffqp >= 0 && ffqp <= 255)) { fprintf(stderr, "predict: --fit-q / --fit-q-phase 0..255\n"); return 2; }
     if (ffd && ffz) { fprintf(stderr, "predict: --fit-fields or --fit-zarr\n"); return 2; }
     if ((ffd || ffz) && (ffh < 1 || ffh > 32)) { fprintf(stderr, "--fit-h 1..32\n"); return 2; }   /* (inference aliasing stays on: the fit pooling reads
                                                                                                        the material mask from the CT bit plane; it was off: ~80 instead of ~45 B per window voxel) */
@@ -697,6 +703,7 @@ int cmd_predict(int argc, char **argv) {
         if (fclose(f)) return 1;
     }
     writer_t WR = {0}; WR.w = w; WR.nthreads = nthreads; WR.bytes = (size_t)shard * shard * shard;
+    WR.skip = atoi(opt(argc, argv, "--no-out", "0")) != 0;   /* --no-out 1: the prediction volume's shards are not written (only its metadata; e.g. with --fit-zarr) */
     /* default path (UFSM_PRED_HOSTPATH=1: the previous host path, for A/B): pinned reader / shard buffers, window statistics
        on the device, the interior probabilities placed into a device shard buffer that is downloaded once per shard */
     const int gpath = !ufsm_env_on("UFSM_PRED_HOSTPATH");
@@ -782,12 +789,12 @@ int cmd_predict(int argc, char **argv) {
                 return 2;
             }
             for (int d = 0; d < 3; d++) { const int64_t ph = grid ? (bo[d] - grid_origin[d]) % ffh : 0; if (ph) { fprintf(stderr, "predict: --fit-zarr: the box must be aligned to --fit-h on the tile grid\n"); return 2; } }
-            char at[512]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"winding fitter fields (src/fit.h)\",\"h\":%d,\"origin_zyx\":[%lld,%lld,%lld],\"checkpoint\":\"%s\"}}", ffh, (long long)bo[0], (long long)bo[1], (long long)bo[2], ckpt);
+            char at[1400]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"winding fitter fields (src/fit.h)\",\"h\":%d,\"origin_zyx\":[%lld,%lld,%lld],\"checkpoint\":\"%s\",\"volcomp_q\":%g,\"volcomp_q_phase\":%g}}", ffh, (long long)bo[0], (long long)bo[1], (long long)bo[2], ckpt, ffq, ffqp);
             const int64_t fsh[3] = {ffF[0], ffF[1], ffF[2]};
             for (int k = 0; k < 10; k++) {
                 char d[1400]; snprintf(d, sizeof d, "%s/%s", ffz, ffz_names[k]);
                 const size_t held = (size_t)(ffF[0] < FZ ? ffF[0] : FZ) * ffF[1] * ffF[2];
-                ffzw[k] = z3w_create(d, fsh, FFS, 0, ffz_fill[k], at);
+                ffzw[k] = z3w_create(d, fsh, FFS, k < 2 ? ffqp : ffq, ffz_fill[k], at);
                 ffsl[k] = malloc(held);
                 if (!ffzw[k] || !ffsl[k]) { fprintf(stderr, "predict: --fit-zarr: %s\n", z3w_error()); return 1; }
                 memset(ffsl[k], ffz_fill[k], held);
