@@ -461,11 +461,20 @@ __device__ __forceinline__ void dec_row16_gnh(uint2 raw, unsigned rsc, bool in, 
         for (int k = 0; k < 4; k++) { const float2 a = dec_e2m1x2(w[j] >> (8 * k)); v[8 * j + 2 * k] = a.x * s; v[8 * j + 2 * k + 1] = a.y * s; }   /* (!in: ld_row16's
                                                                                                                               zero row and scale byte decode to +0) */
     if (G && in) {
+        if (Ci >= 16) {   /* (block-uniform: no channel masks, 32 instructions per position less) */
 #pragma unroll
-        for (int k = 0; k < 16; k++) {
-            const float h = fmaf(v[k], gh[k].x, gh[k].y);
-            float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
-            v[k] = k < Ci ? fmaf(h, th, h) : 0.f;
+            for (int k = 0; k < 16; k++) {
+                const float h = fmaf(v[k], gh[k].x, gh[k].y);
+                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+                v[k] = fmaf(h, th, h);
+            }
+        } else {
+#pragma unroll
+            for (int k = 0; k < 16; k++) {
+                const float h = fmaf(v[k], gh[k].x, gh[k].y);
+                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+                v[k] = k < Ci ? fmaf(h, th, h) : 0.f;
+            }
         }
     }
 }
