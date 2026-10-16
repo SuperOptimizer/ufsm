@@ -127,7 +127,26 @@ static const int ffz_fill[10] = {128, 128, 0, 0, 0, 0, 0, 0, 0, 0};
 /* host field slab slab (FZ cells in z from slab FZ, FZ a multiple of the field shard FS; planes past F[0] not held) -> its rows of
    shards, the shards compressed and written on threads (a 128^3 field shard is one chunk, so z3w_write_shard alone is one thread:
    the 10 arrays of a 256 x 2048 x 2048 box took 163 s) */
-typedef struct { z3w *const *zw; uint8_t *const *sl; int64_t slab; const int *F; int FS, FZ, nrow, nx; const int *rq, *ry; _Atomic int next, fail; } ffz_job;
+/* the slab's layout: y cells in NR ring slots of YR cells (slot (y / YR) % NR), a slot HZ z cells x YR x F[2]; NR 1, YR F[1]: the whole
+   cross-section. With row flushes and FZ = the (super-)shard row height, 3 slots of one (super-)shard row: a slot is taken by the row
+   whose chunks arrive once its previous row is written and reset (own: the slab row held, -1 free), so the slab holds 3 rows instead of
+   the cross-section (PHerc Paris 3 at 9.6 um, window 896: 108 -> 23 GB host, the bound on concurrent jobs) */
+typedef struct { int HZ, YR, NR; int64_t nRR, *own; pthread_mutex_t *mu; pthread_cond_t *cv; } ffring;
+static inline uint8_t *ffz_row(uint8_t *s, const ffring *R, int F2, int zin, int64_t y) {
+    return s + (((size_t)((y / R->YR) % R->NR) * R->HZ + (size_t)zin) * R->YR + (size_t)(y % R->YR)) * F2;
+}
+static int ffring_owned(const ffring *R, int64_t slab, int64_t rr) {   /* the slab's ring row rr holds chunks (ring off: always) */
+    if (R->NR == 1) return 1;
+    pthread_mutex_lock(R->mu); const int o = R->own[rr % R->NR] == slab * R->nRR + rr; pthread_mutex_unlock(R->mu);
+    return o;
+}
+static void ffring_release(const ffring *R, uint8_t *const sl[10], int64_t slab, int64_t rr, int F2) {   /* a written row: fill, slot free */
+    const int s = (int)(rr % R->NR); const size_t n = (size_t)R->HZ * R->YR * F2;
+    if (!ffring_owned(R, slab, rr)) return;
+    for (int k = 0; k < 10; k++) memset(sl[k] + (size_t)s * n, ffz_fill[k], n);
+    pthread_mutex_lock(R->mu); R->own[s] = -1; pthread_cond_broadcast(R->cv); pthread_mutex_unlock(R->mu);
+}
+typedef struct { z3w *const *zw; uint8_t *const *sl; int64_t slab; const int *F; int FS, FZ, nrow, nx; const int *rq, *ry; const ffring *rg; _Atomic int next, fail; } ffz_job;
 static void *ffz_worker(void *a) {   /* jobs: (array k, field-shard row (q, fsy) of the list, fsx) */
     ffz_job *J = a; const int FS = J->FS, *F = J->F; uint8_t *sb = malloc((size_t)FS * FS * FS);
     const int njob = 10 * J->nrow * J->nx;
@@ -138,7 +157,7 @@ static void *ffz_worker(void *a) {   /* jobs: (array k, field-shard row (q, fsy)
         memset(sb, ffz_fill[k], (size_t)FS * FS * FS);
         for (int a2 = 0; a2 < FS && fsz * FS + a2 < F[0]; a2++) for (int b = 0; b < FS && (int64_t)fsy * FS + b < F[1]; b++) {
             const int64_t x0 = (int64_t)fsx * FS, nx = F[2] - x0 < FS ? F[2] - x0 : FS;
-            memcpy(sb + ((size_t)a2 * FS + b) * FS, J->sl[k] + ((size_t)(q * FS + a2) * F[1] + (size_t)fsy * FS + b) * F[2] + x0, (size_t)nx);
+            memcpy(sb + ((size_t)a2 * FS + b) * FS, ffz_row(J->sl[k], J->rg, F[2], q * FS + a2, (int64_t)fsy * FS + b) + x0, (size_t)nx);
         }
         if (z3w_write_shard(J->zw[k], fsz, fsy, fsx, sb, 1)) atomic_store(&J->fail, 1);
     }
@@ -147,15 +166,19 @@ static void *ffz_worker(void *a) {   /* jobs: (array k, field-shard row (q, fsy)
 /* field-shard rows (q, fsy) of the slab in [q0, q1) x [y0, y1) not yet written (done: [FZ / FS][ny] per slab, marked here); reset:
    the slab is left (its buffers back to the fill values, done cleared) */
 static int ffz_flush(z3w *const zw[10], uint8_t *const sl[10], int64_t slab, const int F[3], int FS, int FZ, int q0, int q1, int y0, int y1, uint8_t *done, int reset,
-                     int ntmax) {   /* ntmax: compression threads (0: every CPU) */
+                     int ntmax, const ffring *rg) {   /* ntmax: compression threads (0: every CPU) */
     const int ny = (F[1] + FS - 1) / FS;
     int nq = 0; for (int q = 0; q < FZ / FS; q++) if ((slab * (FZ / FS) + q) * FS < F[0]) nq = q + 1;
     if (q1 > nq) q1 = nq;
     if (y1 > ny) y1 = ny;
     int *rq = malloc(sizeof(int) * (size_t)(FZ / FS) * ny * 2), *ry = rq + (size_t)(FZ / FS) * ny, nrow = 0;
     if (!rq) return -1;
-    for (int q = q0; q < q1; q++) for (int y = y0; y < y1; y++) if (!done[(size_t)q * ny + y]) { done[(size_t)q * ny + y] = 1; rq[nrow] = q; ry[nrow] = y; nrow++; }
-    ffz_job J = {.zw = zw, .sl = sl, .slab = slab, .F = F, .FS = FS, .FZ = FZ, .nrow = nrow, .nx = (F[2] + FS - 1) / FS, .rq = rq, .ry = ry};
+    for (int q = q0; q < q1; q++) for (int y = y0; y < y1; y++) if (!done[(size_t)q * ny + y]) {
+        done[(size_t)q * ny + y] = 1;
+        if (!ffring_owned(rg, slab, (int64_t)y * FS / rg->YR)) continue;   /* a ring row without chunks: fill, nothing to write */
+        rq[nrow] = q; ry[nrow] = y; nrow++;
+    }
+    ffz_job J = {.zw = zw, .sl = sl, .slab = slab, .F = F, .FS = FS, .FZ = FZ, .nrow = nrow, .nx = (F[2] + FS - 1) / FS, .rq = rq, .ry = ry, .rg = rg};
     atomic_store(&J.next, 0); atomic_store(&J.fail, 0);
     long nt = sysconf(_SC_NPROCESSORS_ONLN); if (ntmax > 0 && nt > ntmax) nt = ntmax; if (nt > 64) nt = 64; if (nt < 1) nt = 1;
     pthread_t th[64]; int up[64] = {0};
@@ -165,9 +188,9 @@ static int ffz_flush(z3w *const zw[10], uint8_t *const sl[10], int64_t slab, con
     free(rq);
     if (atomic_load(&J.fail)) return -1;
     if (!reset) return 0;
-    const int64_t held = F[0] < FZ ? F[0] : FZ;
-    for (int k = 0; k < 10; k++) memset(sl[k], ffz_fill[k], (size_t)held * F[1] * F[2]);
+    for (int k = 0; k < 10; k++) memset(sl[k], ffz_fill[k], (size_t)rg->NR * rg->HZ * rg->YR * F[2]);
     memset(done, 0, (size_t)(FZ / FS) * ny);
+    if (rg->NR > 1) { pthread_mutex_lock(rg->mu); for (int s = 0; s < rg->NR; s++) rg->own[s] = -1; pthread_cond_broadcast(rg->cv); pthread_mutex_unlock(rg->mu); }
     return 0;
 }
 
@@ -182,6 +205,7 @@ typedef struct {
     void *evs[2], *evd[2]; uint8_t *h[2];
     z3w **zw; uint8_t **sl; const int *F; int FS, FZ, gpu;
     uint8_t *done;   /* the current slab's written field-shard rows [FZ / FS][ny] */
+    ffring rg;       /* the slab's layout (a ring of rows with row flushes) */
     /* row flushes on their own thread (half the CPUs), so the scatter of window chunks never waits for compression: a queue of
        kind-2 jobs; the slab flush (kind 1) waits for it to drain */
     pthread_t rth; ffw_job rq[FFW_Q]; int rqh, rqn, rbusy, rstop, rnt;
@@ -194,7 +218,8 @@ static void *ffw_rows(void *arg) {
         if (!W->rqn) { pthread_mutex_unlock(&W->mu); break; }
         const ffw_job j = W->rq[W->rqh]; W->rqh = (W->rqh + 1) % FFW_Q; W->rqn--; W->rbusy = 1;
         pthread_mutex_unlock(&W->mu);
-        if (!atomic_load(&W->fail) && ffz_flush(W->zw, W->sl, j.slab, W->F, W->FS, W->FZ, j.q0, j.q1, j.y0, j.y1, W->done, 0, W->rnt)) atomic_store(&W->fail, 1);
+        if (!atomic_load(&W->fail) && ffz_flush(W->zw, W->sl, j.slab, W->F, W->FS, W->FZ, j.q0, j.q1, j.y0, j.y1, W->done, 0, W->rnt, &W->rg)) atomic_store(&W->fail, 1);
+        if (W->rg.NR > 1 && !atomic_load(&W->fail)) ffring_release(&W->rg, W->sl, j.slab, (int64_t)j.y0 * W->FS / W->rg.YR, W->F[2]);   /* (a whole ring row) */
         pthread_mutex_lock(&W->mu); W->rbusy = 0; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
     }
     return nullptr;
@@ -211,7 +236,7 @@ static void *ffw_main(void *arg) {
         pthread_mutex_unlock(&W->mu);
         if (j.kind == 1) {   /* the slab is left: the row flusher drained, then the rows left (all CPUs) and the reset */
             pthread_mutex_lock(&W->mu); while (W->rqn || W->rbusy) pthread_cond_wait(&W->cv, &W->mu); pthread_mutex_unlock(&W->mu);
-            if (!atomic_load(&W->fail) && ffz_flush(W->zw, W->sl, j.slab, W->F, W->FS, W->FZ, 0, W->FZ / W->FS, 0, 1 << 30, W->done, 1, 0)) atomic_store(&W->fail, 1);
+            if (!atomic_load(&W->fail) && ffz_flush(W->zw, W->sl, j.slab, W->F, W->FS, W->FZ, 0, W->FZ / W->FS, 0, 1 << 30, W->done, 1, 0, &W->rg)) atomic_store(&W->fail, 1);
             continue;
         }
         if (j.kind == 2) {   /* to the row flusher (its chunks are scattered: FIFO) */
@@ -219,10 +244,18 @@ static void *ffw_main(void *arg) {
             W->rq[(W->rqh + W->rqn) % FFW_Q] = j; W->rqn++; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
             continue;
         }
+        if (W->rg.NR > 1) {   /* the chunk's ring slot: taken once its previous row is written (that row's flush is queued ahead: FIFO) */
+            const int64_t rr = j.c1 / W->rg.YR, g = j.slab * W->rg.nRR + rr; const int s = (int)(rr % W->rg.NR);
+            if ((j.c1 + j.ny - 1) / W->rg.YR != rr) { fprintf(stderr, "predict: --fit-zarr: a window's cells span two slab rows\n"); atomic_store(&W->fail, 1); }
+            pthread_mutex_lock(&W->mu);
+            while (W->rg.own[s] != g && W->rg.own[s] != -1 && !atomic_load(&W->fail)) pthread_cond_wait(&W->cv, &W->mu);
+            if (W->rg.own[s] == -1) W->rg.own[s] = g;
+            pthread_mutex_unlock(&W->mu);
+        }
         nn_event_sync(W->evd[j.b]);
         const uint8_t *hb = W->h[j.b];
-        for (int a = 0; a < j.nz; a++) for (int b = 0; b < j.ny; b++) for (int k = 0; k < 10; k++)
-            memcpy(W->sl[k] + ((size_t)(j.cz + a - j.slab * W->FZ) * W->F[1] + j.c1 + b) * W->F[2] + j.c2, hb + k * j.nl + ((size_t)a * j.ny + b) * j.nx, (size_t)j.nx);
+        if (!atomic_load(&W->fail)) for (int a = 0; a < j.nz; a++) for (int b = 0; b < j.ny; b++) for (int k = 0; k < 10; k++)
+            memcpy(ffz_row(W->sl[k], &W->rg, W->F[2], (int)(j.cz + a - j.slab * W->FZ), (int64_t)j.c1 + b) + j.c2, hb + k * j.nl + ((size_t)a * j.ny + b) * j.nx, (size_t)j.nx);
         pthread_mutex_lock(&W->mu); W->busy[j.b] = 0; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
     }
     return nullptr;
@@ -790,10 +823,23 @@ int cmd_predict(int argc, char **argv) {
             }
             for (int d = 0; d < 3; d++) { const int64_t ph = grid ? (bo[d] - grid_origin[d]) % ffh : 0; if (ph) { fprintf(stderr, "predict: --fit-zarr: the box must be aligned to --fit-h on the tile grid\n"); return 2; } }
             char at[1400]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"winding fitter fields (src/fit.h)\",\"h\":%d,\"origin_zyx\":[%lld,%lld,%lld],\"checkpoint\":\"%s\",\"volcomp_q\":%g,\"volcomp_q_phase\":%g}}", ffh, (long long)bo[0], (long long)bo[1], (long long)bo[2], ckpt, ffq, ffqp);
+            /* rows of field shards are written as soon as the windows leave their row of (super-)shards (a window writes cells of its own
+               (super-)shard only, tiles run in (super-)shard z-y-x order): only the last row's compression is left after the loop (was
+               the whole last slab: 8 of 24 s for a 256 x 2048^2 box). One worker, a (super-)shard of whole field shards; UFSM_FIT_ROWFLUSH=0.
+               With them the slab is a ring of 3 rows when a row is the slab's height (FZ = ffrk); UFSM_FIT_RING=0: the cross-section */
+            ffrk = (kss > 1 ? kss * shard : shard) / ffh;
+            ffrow = nwork == 1 && !split && ffrk % FFS == 0 && !(getenv("UFSM_FIT_ROWFLUSH") && !atoi(getenv("UFSM_FIT_ROWFLUSH")));
+            const int ring = ffrow && FZ == ffrk && 3 * (int64_t)ffrk < ffF[1] && !(getenv("UFSM_FIT_RING") && !atoi(getenv("UFSM_FIT_RING")));
+            ffw.rg = (ffring){.HZ = ffF[0] < FZ ? ffF[0] : FZ, .YR = ring ? ffrk : ffF[1], .NR = ring ? 3 : 1, .mu = &ffw.mu, .cv = &ffw.cv};
+            ffw.rg.nRR = (ffF[1] + ffw.rg.YR - 1) / ffw.rg.YR; ffw.rg.own = malloc(sizeof(int64_t) * ffw.rg.NR);
+            if (!ffw.rg.own) { fprintf(stderr, "predict: out of memory\n"); return 1; }
+            for (int s = 0; s < ffw.rg.NR; s++) ffw.rg.own[s] = -1;
+            if (ring) fprintf(stderr, "predict: fit field slab: a ring of 3 rows of %d cells, %.1f GB (the cross-section: %.1f GB)\n", ffrk,
+                              10. * ffw.rg.HZ * 3 * ffrk * ffF[2] / 1e9, 10. * ffw.rg.HZ * ffF[1] * ffF[2] / 1e9);
             const int64_t fsh[3] = {ffF[0], ffF[1], ffF[2]};
             for (int k = 0; k < 10; k++) {
                 char d[1400]; snprintf(d, sizeof d, "%s/%s", ffz, ffz_names[k]);
-                const size_t held = (size_t)(ffF[0] < FZ ? ffF[0] : FZ) * ffF[1] * ffF[2];
+                const size_t held = (size_t)ffw.rg.NR * ffw.rg.HZ * ffw.rg.YR * ffF[2];
                 ffzw[k] = z3w_create(d, fsh, FFS, k < 2 ? ffqp : ffq, ffz_fill[k], at);
                 ffsl[k] = malloc(held);
                 if (!ffzw[k] || !ffsl[k]) { fprintf(stderr, "predict: --fit-zarr: %s\n", z3w_error()); return 1; }
@@ -810,11 +856,6 @@ int cmd_predict(int argc, char **argv) {
             ffw.zw = ffzw; ffw.sl = ffsl; ffw.F = ffF; ffw.FS = FFS; ffw.FZ = FZ; ffw.gpu = gpu;
             ffw.done = calloc((size_t)(FZ / FFS) * ((ffF[1] + FFS - 1) / FFS), 1);
             if (!ffw.done) { fprintf(stderr, "predict: out of memory\n"); return 1; }
-            /* rows of field shards are written as soon as the windows leave their row of (super-)shards (a window writes cells of its own
-               (super-)shard only, tiles run in (super-)shard z-y-x order): only the last row's compression is left after the loop (was
-               the whole last slab: 8 of 24 s for a 256 x 2048^2 box). One worker, a (super-)shard of whole field shards; UFSM_FIT_ROWFLUSH=0 */
-            ffrk = (kss > 1 ? kss * shard : shard) / ffh;
-            ffrow = nwork == 1 && !split && ffrk % FFS == 0 && !(getenv("UFSM_FIT_ROWFLUSH") && !atoi(getenv("UFSM_FIT_ROWFLUSH")));
             for (int b = 0; b < 2; b++) { ffw.h[b] = ff8h + (size_t)b * 10 * ffwn; ffw.evs[b] = nn_event_create(); ffw.evd[b] = nn_event_create(); }
             pthread_mutex_init(&ffw.mu, nullptr); pthread_cond_init(&ffw.cv, nullptr); atomic_store(&ffw.fail, 0);
             { long nc = sysconf(_SC_NPROCESSORS_ONLN); ffw.rnt = nc > 2 ? (int)(nc / 2) : 1; }
@@ -1093,7 +1134,7 @@ int cmd_predict(int argc, char **argv) {
         if (ffw_on && ffw_finish(&ffw, ffw_th)) { fprintf(stderr, "predict: %s\n", z3w_error()); return 1; }
         if (pprof) fprintf(stderr, "predict profile (s): fit writer tail (the last field slabs) %.2f\n", now() - tfin);
         for (int k = 0; k < 10; k++) { z3w_close(ffzw[k]); free(ffsl[k]); }
-        free(ffw.done);
+        free(ffw.done); free(ffw.rg.own);
         nn_free(ffacc); nn_free(ff8d); nn_host_free(ff8h);
         char p[1400]; snprintf(p, sizeof p, "%s/fields.json", ffz); FILE *f = fopen(p, "w");
         if (!f) { fprintf(stderr, "predict: cannot write %s\n", p); return 1; }
