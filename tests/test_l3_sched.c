@@ -3,6 +3,7 @@
    gradients, lean 2, the GPU-built input from the batch head's CT, the logit gradient over the fp16 logits), 7 levels
    16,16,32,64,128,192,256: two training steps with a validation forward between them, schedule off and on. The logits bit for bit,
    the parameter gradients up to the weight gradients' atomic summation order, the same seed count, the batch tail untouched.
+   The schedule's device copy of the skip into X3 (UFSM_L3_SKIP_D2D) on and off: the same bits.
    env UFSM_TEST_P: the window (default 128; the trainer's P512 exercises the copies at their real sizes and timing) */
 #include "nn.h"
 #include "nn_lp.h"
@@ -46,9 +47,9 @@ int main(void) {
         uint8_t *pat = malloc(tailb), *chk = malloc(tailb);
         for (size_t i = 0; i < tailb; i++) pat[i] = (uint8_t)(i * 2654435761u >> 13);
         unet *v = unet_create(&cfg); unet_init(v, 41); const size_t np = unet_nparams(v);
-        uint16_t *lg[2][3]; float *gg[2][2]; unsigned ctr[2][2]; int l3[2] = {0, 0}, tail_ok = 1;
-        for (int on = 0; on < 2; on++) {
-            unet_set_l3_sched(on); unet_set_l0_3buf(1);
+        uint16_t *lg[3][3]; float *gg[3][2]; unsigned ctr[3][2]; int l3[3] = {0, 0, 0}, tail_ok = 1;
+        for (int on = 0; on < 3; on++) {   /* schedule off; on; on without the skip's device copy */
+            unet_set_l3_sched(on != 0); unet_set_l3_skip_d2d(on == 2 ? 0 : -1); unet_set_l0_3buf(1);
             unet_set_batch_bytes(v, 2 * S, tailb);
             unet_build(v, xs, 1); unet_set_input_rad(v, drec);
             l3[on] = unet_l0_3buf(v);
@@ -72,8 +73,8 @@ int main(void) {
             unet_set_input_rad(v, nullptr);
         }
         const char *e = nn_check();
-        if (!bad) {
-            size_t lneq = 0; for (int k = 0; k < 3; k++) for (size_t i = 0; i < no; i++) lneq += lg[0][k][i] != lg[1][k][i];
+        if (!bad) for (int vb = 1; vb < 3; vb++) {
+            size_t lneq = 0; for (int k = 0; k < 3; k++) for (size_t i = 0; i < no; i++) lneq += lg[0][k][i] != lg[vb][k][i];
             /* per part, so a level-0 tensor's damage cannot hide in the coarse levels' norm: enc[0], down0, dec[0], the head, all */
             const int *w = cfg.widths, L = cfg.nlev;
             size_t encs = 0; for (int i = 0; i < L; i++) encs += blk(i ? w[i - 1] : cfg.cin, w[i]);
@@ -82,17 +83,17 @@ int main(void) {
             static const char *sn[5] = {"enc0", "down0", "dec0", "head", "all"};
             double worst = 0; char msg[256]; int m = 0;
             for (int s = 0; s < 5; s++) {
-                double r = 0; for (int st = 0; st < 2; st++) { const double x = rel(gg[1][st], gg[0][st], seg[s][0], seg[s][1]); if (x > r) r = x; }
+                double r = 0; for (int st = 0; st < 2; st++) { const double x = rel(gg[vb][st], gg[0][st], seg[s][0], seg[s][1]); if (x > r) r = x; }
                 if (r > worst) worst = r;
                 m += snprintf(msg + m, sizeof msg - m, "%s%s %.2g", s ? ", " : "", sn[s], r);
             }
-            const int ok = l3[0] && l3[1] && !lneq && worst < 1e-5 && ctr[0][0] == ctr[1][0] && ctr[0][1] == ctr[1][1] && tail_ok && !e;
-            printf("  P %d down_norm %d: copy schedule on vs off: layouts %d %d, logits differ %zu, grads rel diff (both steps) %s, seeds %u %u / %u %u, batch tail %s%s%s\n",
-                   P, dn, l3[0], l3[1], lneq, msg, ctr[0][0], ctr[0][1], ctr[1][0], ctr[1][1], tail_ok ? "kept" : "CLOBBERED", e ? e : "", ok ? "" : "  FAIL");
+            const int ok = l3[0] && l3[vb] && !lneq && worst < 1e-5 && ctr[0][0] == ctr[vb][0] && ctr[0][1] == ctr[vb][1] && tail_ok && !e;
+            printf("  P %d down_norm %d: copy schedule on%s vs off: layouts %d %d, logits differ %zu, grads rel diff (both steps) %s, seeds %u %u / %u %u, batch tail %s%s%s\n",
+                   P, dn, vb == 2 ? " (no skip device copy)" : "", l3[0], l3[vb], lneq, msg, ctr[0][0], ctr[0][1], ctr[vb][0], ctr[vb][1], tail_ok ? "kept" : "CLOBBERED", e ? e : "", ok ? "" : "  FAIL");
             if (!ok) bad++;
-            for (int on = 0; on < 2; on++) { for (int k = 0; k < 3; k++) free(lg[on][k]); for (int st = 0; st < 2; st++) free(gg[on][st]); }
         }
-        unet_set_l3_sched(-1); unet_set_l0_3buf(-1); unet_free(v);
+        if (!bad) for (int on = 0; on < 3; on++) { for (int k = 0; k < 3; k++) free(lg[on][k]); for (int st = 0; st < 2; st++) free(gg[on][st]); }
+        unet_set_l3_sched(-1); unet_set_l3_skip_d2d(-1); unet_set_l0_3buf(-1); unet_free(v);
         for (int k = 0; k < 2; k++) { nn_free(ct[k]); nn_free(gy[k]); }
         nn_free(drec); free(rec); free(pat); free(chk);
         if (bad) break;

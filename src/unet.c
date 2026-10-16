@@ -1402,6 +1402,12 @@ static int g_l3_sched = -1;
 static int l3_sched_on(void) { if (g_l3_sched < 0) g_l3_sched = getenv("UFSM_L3_SCHED") ? ufsm_env_on("UFSM_L3_SCHED") : 1; return g_l3_sched; }
 static int l3_sched(const unet *u) { return u->l3s; }
 void unet_set_l3_sched(int on) { g_l3_sched = on; }   /* -1: the env / default (the next build) */
+/* (l3_sched) the skip for down0's weight gradient: the part of it dec[0]'s backward left in X2 copied into X3 on the device, the host
+   copy only for the rest (gout[1]'s bytes): -1.05 GB of host-to-device copy per P512 step for a ~5 ms copy kernel; env
+   UFSM_L3_SKIP_D2D, default on (0: the whole skip from the host). Same bits */
+static int g_l3_skip_d2d = -1;
+static int l3_skip_d2d(void) { if (g_l3_skip_d2d < 0) g_l3_skip_d2d = getenv("UFSM_L3_SKIP_D2D") ? ufsm_env_on("UFSM_L3_SKIP_D2D") : 1; return g_l3_skip_d2d; }
+void unet_set_l3_skip_d2d(int on) { g_l3_skip_d2d = on; }   /* -1: the env / default */
 /* (l3_sched) X2's bytes [*lo, *hi) that no coarse tensor uses in the coarse levels' backward: between the coarse skips' homes at its start
    and the down outputs' and coarse gradients' at its end (the encoder's a1 comes back there early) */
 static void l3_x2_free(const unet *u, size_t *lo, size_t *hi) {
@@ -2429,6 +2435,10 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
                 nn_d2d(u->gout_home1, u->gout_x1, nn_mx_bytes(g1, grad_dt()));
                 u->gout[1] = u->gB[1] = u->gout_home1; if (L > 2) u->gskip[1] = u->gout_home1;
             }
+            /* (l3_sched) the skip below gout[1]'s home is still whole in X2 (dec[0]'s conv1 weight gradient read it): into X3 on the device
+               before anything is copied over it, so the host copy into X3 below brings only the bytes gout[1] took (UFSM_L3_SKIP_D2D) */
+            const size_t skd = i == 0 && l3_sched(u) && l3_skip_d2d() && u->gout_home1 && u->enc[0].a2 == u->l3x[2] ? l3_skip_lo(u) : 0;
+            if (skd) nn_d2d_kernel(u->l3x[3], u->l3x[2], skd);
             if (i == 0 && u->l3b) l3_homes(u, 0);   /* (the coarse tensors come back to X2) */
             if (i == 0 && u->sko) {   /* the coarse skips back (the next decoder's first) */
                 if (!u->sk_out) { fprintf(stderr, "unet: a backward needs a training forward first (the skip offload)\n"); abort(); }
@@ -2442,7 +2452,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
                                        a1 into X2 but for the coarse homes' bytes */
                 u->enc[0].a2 = u->l3x[3];
                 nn_set_storage(u->l3x[3], act_bytes_of(u->enc[0].ys), act_dt());
-                nn_offload_copy(u->l3x[3], u->h_a2, act_bytes_of(u->enc[0].ys), 0, u->ev_a2[2], u->ev_a2[3]);
+                nn_offload_copy((char *)u->l3x[3] + skd, (const char *)u->h_a2 + skd, act_bytes_of(u->enc[0].ys) - skd, 0, u->ev_a2[2], u->ev_a2[3]);
                 size_t flo, fhi; l3_x2_free(u, &flo, &fhi);
                 if (u->a1_out[0] && fhi > flo) nn_offload_copy((char *)u->l3x[2] + flo, (const char *)u->h_a1[0] + flo, fhi - flo, 0, u->ev_a1[0][2], u->ev_a1[0][3]);
             }
