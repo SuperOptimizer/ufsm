@@ -124,6 +124,7 @@ struct unet {
     int a0_share, a2_out;                    /* level-0 A in dec[0].a2's buffer; enc[0].a2 on the host from its forward to dec[0]'s conv1 weight
                                                 gradient, its buffer holding the logit gradient in between (and the input in enc[0]'s backward) */
     void *h_a2, *ev_a2[4];
+    void *ev_head;                           /* l3b: recorded in enc[0]'s backward once the batch head (X2) and the radial records are read for the last time */
     int xin_inf, lg_t1; size_t t1_bytes; float *lg_p; size_t lg_bytes;   /* lg_t1: the logits in lg_p (T1, or Y with level-1 slabs), lg_bytes registered */
     int slab, slab1, slab_s; float *slab_tmp, *slab_carry, *t1p;   /* slab1: level 1 in place too (Y = enc[1].a2's buffer; UFSM_INFER_SLAB_L1=0 off) */
     int ct_mode, ct_stem; float *slab_xin;    /* unet_set_ct_input: the caller passes the uint8 CT window (unet_forward_ct); with slabs and an MX-fp8 stem
@@ -1222,6 +1223,11 @@ void unet_set_batch_bytes(unet *u, size_t head, size_t tail) {
 }
 int unet_l0_3buf(const unet *u) { return u->built && u->l3b; }
 int unet_l0_3buf_ct(const unet *u) { return u->built && u->l3_ct; }   /* the last training forward kept the CT for the input's rebuild */
+void *unet_l0_3buf_head_free(unet *u) {   /* (created here so a copy stream can wait for it before the first backward: a no-op wait) */
+    if (!(u->built && u->l3b)) return nullptr;
+    if (!u->ev_head) u->ev_head = nn_event_create();
+    return u->ev_head;
+}
 static int g_last_dry_l3b;
 int unet_last_dry_l3b(void) { return g_last_dry_l3b; }   /* the last dry build (unet_train_bytes) used the three level-0 buffers */
 /* device bytes of the training activations / gradients at input shape xs under the current storage modes, without allocating
@@ -2072,6 +2078,8 @@ static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx
     const nn_gn_t gi = gn_in(u, b);
     if (b == &u->enc[0] && u->a0_share && u->xin_shared) nn_stream_wait(0, u->ev_xin[3]);
     if (b == &u->enc[0] && u->l3_ct) PROF(4, nn_input_rad((const char *)u->l3x[1] + l3_ct_off(u), u->xs, u->rad, u->l3x[1]));   /* (the forward's input) */
+    if (b == &u->enc[0] && u->l3b) { if (!u->ev_head) u->ev_head = nn_event_create(); nn_event_record(u->ev_head, 0); }   /* X2 (its a1 read by
+                                                                    GN1's backward) and the records are free: the next batch's head may go up */
     if (gi.G && nn_get_tf32()) PROF(2, nn_conv3d_bwd_weight_gn(b->in, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, A, b->ys, g + b->c1.w, g + b->c1.b));
     else PROF(2, nn_conv3d_bwd_weight(b->in, b->xs, A, b->ys, 3, 1, g + b->c1.w, g + b->c1.b));
     if (b != &u->enc[0] || !nn_get_tf32())   /* the network-input gradient of enc0 is never used */

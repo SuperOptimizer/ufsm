@@ -40,6 +40,9 @@ typedef struct {
     void *radb[2], *rad;         /* --gpu-input: the batch's radial records on the device (nn.h NN_RAD_REC), per buffer / current */
     void *ev_up[2], *ev_done[2]; /* upload into buffer i finished; the compute that last used buffer i finished */
     batch *pending;              /* host batch whose upload into buffer (cur ^ 1) is in flight */
+    batch *tail_due;             /* upsplit: the host batch whose tail (targets, mask, weights) goes up after the loss fetch */
+    int upsplit;                 /* lean, three level-0 buffers: the next batch's head goes up in the stem's weight gradient (X2 free), its tail
+                                    after the step's loss fetch (X3 is the stem's gradient until the step's end) */
     int lean;                    /* one batch buffer; logit gradient in the model's gradient buffer B */
     int gl_inside;               /* lean: the logit gradient lives in the model's gradient buffers (setup checked the batch overlap) */
     char *bat_lo, *bat_hi;       /* lean: the batch's bytes inside the model's buffers (a logit gradient placed later must avoid them) */
@@ -260,6 +263,7 @@ static void upload_slab(gpu_state *d, const batch *b, int i, int B, int P, int a
 }
 /* synchronous upload (pageable host memory: validation batches) */
 static void upload(gpu_state *d, const batch *b, int B, int P) {
+    if (d->upsplit) nn_event_sync(d->ev_up[d->cur]);   /* (an asynchronous head / tail into the same buffer may still be in flight) */
     d->sheet=b->sheet?b->sheet[0]:nullptr;
     d->um = d->umb[d->cur] = b->um ? b->um[0] : 0.f;
     if (b->corner && b->level) { memcpy(d->cornb[d->cur], b->corner[0], sizeof d->cornb[0]); d->lvlb[d->cur] = b->level[0]; }   /* validation copies carry none */
@@ -286,6 +290,13 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     d->umb[i] = b->um ? b->um[0] : 0.f;
     if (b->corner && b->level) { memcpy(d->cornb[i], b->corner[0], sizeof d->cornb[0]); d->lvlb[i] = b->level[0]; }
     size_t p3 = (size_t)g_Pz * P * P;
+    if (d->upsplit) {   /* the head now, after the backward's last read of X2 and the records; the tail with upload_tail */
+        nn_stream_wait(1, unet_l0_3buf_head_free(d->u));
+        nn_h2d_copy_stream(d->xb[i], bx(b), (size_t)B * g_xs * p3 * xbytes());
+        if (g_gpu_in) nn_h2d_copy_stream(d->radb[i], b->rad, rad_bytes(B));
+        d->tail_due = b;
+        return;
+    }
     nn_stream_wait(1, d->ev_done[i]);   /* the step two back: this upload overlaps the current step */
     if (d->lean) nn_stream_wait(1, d->ev_done[i ^ 1]);   /* lean: one buffer (inside the gradient buffers), free after the current step */
     if (d->side >= 0) upload_slab(d, b, i, B, P, 1);
@@ -306,6 +317,25 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
         if (g_pap_head) nn_h2d_copy_stream(d->papb[i], b->pap, (size_t)B * p3);
     }
     nn_event_record(d->ev_up[i], 1);
+}
+/* upsplit: the tail of the batch upload_async left (the step's end: the stem's gradient in X3 read; issued with the optimiser, after the
+   loss and gradient-norm fetches, whose small copies would otherwise wait behind it where copies run one at a time); ev_up then covers
+   head and tail */
+static void upload_tail(gpu_state *d, int B, int P) {
+    const batch *b = d->tail_due;
+    if (!b) return;
+    const int i = d->cur;   /* (lean: both buffer indices alias) */
+    const size_t p3 = (size_t)g_Pz * P * P;
+    nn_stream_wait(1, d->ev_done[i]); nn_stream_wait(1, d->ev_done[i ^ 1]);
+    if (g_pack) { nn_h2d_copy_stream(d->mb[i], b->tm, (size_t)B * p3); nn_unpack_tm(d->tb[i], d->mb[i], B, p3, 1); }
+    else {
+        if (!g_heads) nn_h2d_copy_stream(d->tb[i], b->t, (size_t)B * NCH * p3);
+        else for (int r = 0; r < B * NCH; r++) nn_h2d_copy_stream(d->tb[i] + (size_t)trow(b, r) * p3, b->t + (size_t)r * p3, p3);
+        nn_h2d_copy_stream(d->mb[i], b->m, (size_t)B * p3);
+    }
+    nn_h2d_copy_stream(d->wb[i], trow_w(b, B, d->hwh[i]), (size_t)B * g_tc);
+    nn_event_record(d->ev_up[i], 1);
+    d->tail_due = nullptr;
 }
 
 /* a non-finite forward: statistics of the input, targets and logits of the batch just computed (device buffer cur^1,
@@ -1530,6 +1560,9 @@ int cmd_train(int argc, char **argv) {
         d->scratch = nn_malloc(nn_loss_scratch((shape5){B, g_tc, g_Pz, P, P}) + 64);
         d->tolc = nn_get_loss_tol() ? nn_malloc((size_t)B * p3) : nullptr;
         d->lean = lean;
+        d->upsplit = lean && tail && !split && d->side < 0 && !g_head_slab && !g_aff && !g_side && !g_unwrap && !g_cond && !g_pap_head
+                     && (!getenv("UFSM_UPSPLIT") || ufsm_env_on("UFSM_UPSPLIT")) && unet_l0_3buf_head_free(d->u);   /* (env UFSM_UPSPLIT=0 off) */
+        if (d->upsplit && g == 0) fprintf(stderr, "batch upload: the head during the stem's weight gradient, the tail after the loss fetch\n");
         const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
     }
     nn_init(G[0].dev);
@@ -1827,6 +1860,7 @@ int cmd_train(int argc, char **argv) {
                 wait += now() - tw;
                 if (!b) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; break; }
                 upload_async(d, b, d->cur, B, P);
+                upload_tail(d, B, P);                          /* (upsplit: its tail too) */
                 d->pending = b;
             }
             nn_stream_wait(0, d->ev_up[d->cur]);           /* compute waits for the upload */
@@ -1909,6 +1943,8 @@ int cmd_train(int argc, char **argv) {
             unet_wquant(d->u, (unsigned)step);              /* no-op unless --wq */
             if (prof) nn_prof_end();
         }
+        for (int g = 0; g < ng; g++) if (G[g].tail_due) { nn_init(G[g].dev); upload_tail(&G[g], B, P); }   /* (upsplit: after the loss / gradient-norm
+                                                                                                           fetches' small copies, during the optimiser) */
         if (training_failed) break;
         committed_step = step;
         if (plan) { coverage.cursor = (uint64_t)(step - coverage.base_step); if (cover_checkpoint_extra(runtime_extra, &coverage, checkpoint_extra, sizeof checkpoint_extra)) return 2; }
