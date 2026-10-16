@@ -10,8 +10,8 @@ void fuse_phase(const uint8_t *const *in, int n, size_t len, float tol_turns, ui
     const float tol = tol_turns * PHASE_PERIOD;   /* in codes */
     size_t st[4] = {0, 0, 0, 0};
     for (size_t i = 0; i < len; i++) {
-        int m = 0, c[16]; float sx = 0, sy = 0;
-        for (int k = 0; k < n && m < 16; k++) { const uint8_t v = in[k][i]; if (v < PHASE_PERIOD) { c[m++] = v; sx += cs[v]; sy += sn[v]; } }
+        int m = 0, c[FUSE_MAX]; float sx = 0, sy = 0;
+        for (int k = 0; k < n && m < FUSE_MAX; k++) { const uint8_t v = in[k][i]; if (v < PHASE_PERIOD) { c[m++] = v; sx += cs[v]; sy += sn[v]; } }
         if (!m) { out[i] = PHASE_UNKNOWN; st[3]++; continue; }
         if (m == 1) { out[i] = (uint8_t)c[0]; st[0]++; continue; }
         int dmax = 0;
@@ -31,7 +31,7 @@ void fuse_recto(const uint8_t *const *in, int n, const uint8_t *ct, int64_t d0, 
                 uint8_t *out, size_t *stats) {
     /* score[k][b]: the mean CT over set k's surface voxels in block b (its trace's fit to the papyrus ridge there); a surface voxel of
        set k is dropped when another set has a surface voxel within dup whose block score is higher (ties: the lower set index) */
-    const size_t len = (size_t)d0 * d1 * d2; const int nn = n < 16 ? n : 16;
+    const size_t len = (size_t)d0 * d1 * d2; const int nn = n < FUSE_MAX ? n : FUSE_MAX;
     const int64_t b0 = (d0 + block - 1) / block, b1 = (d1 + block - 1) / block, b2 = (d2 + block - 1) / block; const size_t nb = (size_t)b0 * b1 * b2;
     double *sum = calloc(nb * nn, sizeof *sum); size_t *cnt = calloc(nb * nn, sizeof *cnt); float *score = malloc(nb * nn * sizeof *score);
     memset(out, 0, len);

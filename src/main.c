@@ -1329,6 +1329,7 @@ static int cmd_wind_seed(int argc, char **argv) {
 }
 
 /* ufsm phase-fuse <out-group> <out-um> <root> <key> [<root> <key>]... [--tol 0.1] [--shard 512] [--threads 8] [--cache DIR]
+   (up to FUSE_MAX sets; --shard defaults to 256 above 12 sets)
    ufsm recto-fuse <out-group> <out-um> <ct-root> <ct-key> <root> <key> [<root> <key>]... [--block 32] [--dup 3] [--shard 512] [--cache DIR]
    Several surface sets of one scroll, rasterised separately on one grid (src/fuse.h): phase-fuse writes the per-voxel circular mean
    where the sets agree within --tol turns, unknown (255) where they disagree; recto-fuse one recto line per --block, the set on the
@@ -1336,15 +1337,16 @@ static int cmd_wind_seed(int argc, char **argv) {
 static int cmd_fuse(int argc, char **argv) {
     const int recto = !strcmp(argv[1], "recto-fuse"), first = recto ? 6 : 4;
     if (argc < first + 2) { fprintf(stderr, "usage: ufsm %s <out-group> <out-um> %s<root> <key> [<root> <key>]... %s\n", argv[1], recto ? "<ct-root> <ct-key> " : "", recto ? "[--block 32] [--dup 3]" : "[--tol 0.1]"); return 2; }
-    const int S = atoi(opt(argc, argv, "--shard", "512")), nt = atoi(opt(argc, argv, "--threads", "8")); const double um = atof(argv[3]);
+    int S = atoi(opt(argc, argv, "--shard", "0")); const int nt = atoi(opt(argc, argv, "--threads", "8")); const double um = atof(argv[3]);
     const float tol = (float)atof(opt(argc, argv, "--tol", "0.1")); const int block = atoi(opt(argc, argv, "--block", "32")), dup = atoi(opt(argc, argv, "--dup", "3"));
     const char *cache = opt(argc, argv, "--cache", nullptr);
-    z3 *in[16]; int n = 0;
-    for (int a = first; a + 1 < argc && n < 16; a += 2) {
+    z3 *in[FUSE_MAX]; int n = 0;
+    for (int a = first; a + 1 < argc && n < FUSE_MAX; a += 2) {
         if (argv[a][0] == '-') break;
         in[n] = z3_open(store_open(argv[a]), argv[a + 1], cache); if (!in[n]) { fprintf(stderr, "%s: %s %s: %s\n", argv[1], argv[a], argv[a + 1], z3_error()); return 1; }
         n++;
     }
+    if (!S) S = n > 12 ? 256 : 512;   /* one (shard + 2 halo)^3 buffer per set: 134 MB each at 512 */
     z3 *ct = recto ? z3_open(store_open(argv[4]), argv[5], cache) : nullptr;
     if (!n || (recto && !ct) || !(um > 0) || S < 64 || block < 4 || dup < 0 || !(tol >= 0)) { fprintf(stderr, "%s: bad arguments or cannot open the CT\n", argv[1]); return 2; }
     const z3_meta *m0 = z3_meta_of(in[0]); int64_t shape[3] = {m0->shape[0], m0->shape[1], m0->shape[2]};
@@ -1357,7 +1359,7 @@ static int cmd_fuse(int argc, char **argv) {
     z3w *w = recto ? z3w_create_mask(od, shape, S, at) : z3w_create(od, shape, S, 0, PHASE_UNKNOWN, at);
     if (!w || z3w_write_group(argv[2], &um, 1, recto ? "ufsm-recto-fuse" : "ufsm-phase-fuse", nullptr)) { fprintf(stderr, "%s: %s\n", argv[1], z3w_error()); return 1; }
     const int H = recto ? dup : 0; const int64_t E = S + 2 * H; const size_t L = (size_t)E * E * E;
-    uint8_t *buf[16], *cb = recto ? malloc(L) : nullptr, *ob = malloc(L), *sh = malloc((size_t)S * S * S);
+    uint8_t *buf[FUSE_MAX], *cb = recto ? malloc(L) : nullptr, *ob = malloc(L), *sh = malloc((size_t)S * S * S);
     for (int k = 0; k < n; k++) buf[k] = malloc(L);
     size_t st[4] = {0, 0, 0, 0}, hist[PHASE_PERIOD / 2 + 1] = {0}; int nsh = 0;
     for (int64_t sz = 0; sz * S < shape[0]; sz++) for (int64_t sy = 0; sy * S < shape[1]; sy++) for (int64_t sx = 0; sx * S < shape[2]; sx++) {

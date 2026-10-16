@@ -10,6 +10,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+enum { FUSE_MAX = 64 };   /* sets per fusion (in[] beyond it ignored) */
+
 /* in[k][i] (k < n): phase codes of len voxels; out: fused codes; stats (optional, 4): voxels known by 1 set, fused (>= 2 agreeing),
    conflicts (written unknown), unknown everywhere; hist (optional, PHASE_PERIOD / 2 + 1 bins): at voxels known by >= 2 sets, the
    largest pairwise circular difference in codes (the duplicate-offset statistics that set tol) */
