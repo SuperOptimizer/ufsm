@@ -1449,8 +1449,8 @@ static int cmd_fuse(int argc, char **argv) {
         }
         if (!na) continue;
         if (na > maxact) maxact = na;
-        if (recto) { if (z3_read(ct, o, nn, cb, nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3_error()); return 1; }
-                     fuse_recto(act, na, cb, E, E, E, block, dup, ob, st); }
+        if (recto) { if (na > 1 && z3_read(ct, o, nn, cb, nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3_error()); return 1; }   /* one set: no CT needed */
+                     fuse_recto(act, na, na > 1 ? cb : nullptr, E, E, E, block, dup, ob, st); }
         else fuse_phase(act, na, L, tol, ob, st, hist);
         for (int64_t z = 0; z < S; z++) for (int64_t y = 0; y < S; y++) memcpy(sh + ((size_t)z * S + y) * S, ob + ((size_t)(z + H) * E + y + H) * E + H, (size_t)S);
         if (z3w_write_shard(w, sz, sy, sx, sh, nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3w_error()); return 1; }

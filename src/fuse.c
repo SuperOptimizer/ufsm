@@ -35,6 +35,10 @@ void fuse_recto(const uint8_t *const *in, int n, const uint8_t *ct, int64_t d0, 
     const int64_t b0 = (d0 + block - 1) / block, b1 = (d1 + block - 1) / block, b2 = (d2 + block - 1) / block; const size_t nb = (size_t)b0 * b1 * b2;
     double *sum = calloc(nb * nn, sizeof *sum); size_t *cnt = calloc(nb * nn, sizeof *cnt); float *score = malloc(nb * nn * sizeof *score);
     memset(out, 0, len);
+    if (nn == 1) {   /* one set: its surface as it is (ct may be null) */
+        size_t u = 0; for (size_t i = 0; i < len; i++) if (in[0][i]) { out[i] = 255; u++; }
+        free(sum); free(cnt); free(score); if (stats) stats[1] += u; return;
+    }
     if (!sum || !cnt || !score) { free(sum); free(cnt); free(score); return; }
     for (int64_t z = 0; z < d0; z++) for (int64_t y = 0; y < d1; y++) for (int64_t x = 0; x < d2; x++) {
         const size_t i = ((size_t)z * d1 + y) * d2 + x, b = ((size_t)(z / block) * b1 + y / block) * b2 + x / block;
@@ -42,10 +46,29 @@ void fuse_recto(const uint8_t *const *in, int n, const uint8_t *ct, int64_t d0, 
     }
     for (size_t b = 0; b < nb * nn; b++) score[b] = cnt[b] ? (float)(sum[b] / (double)cnt[b]) : -1.f;
     size_t st[3] = {0, 0, 0};
+    /* up to 8 sets: their bit masks OR-dilated by dup (separable, z / y / x): a surface voxel with no other set's bit in its cube is
+       unique coverage without the neighbourhood scan (the scan is for the few voxels where traces come close) */
+    uint8_t *dm = nn > 1 && nn <= 8 ? malloc(len) : nullptr, *tm = dm ? malloc(len) : nullptr;
+    if (dm && !tm) { free(dm); dm = nullptr; }
+    if (dm) {
+        for (size_t i = 0; i < len; i++) { uint8_t v = 0; for (int k = 0; k < nn; k++) v |= (uint8_t)((in[k][i] != 0) << k); dm[i] = v; }
+        const int64_t dims[3] = {d0, d1, d2}, strides[3] = {d1 * d2, d2, 1};
+        for (int ax = 0; ax < 3; ax++) {
+            uint8_t *src = ax & 1 ? tm : dm, *dst = ax & 1 ? dm : tm;   /* z: dm -> tm, y: tm -> dm, x: dm -> tm */
+            const int64_t D = dims[ax], st_ = strides[ax];
+            for (size_t i0 = 0; i0 < len; i0++) {
+                const int64_t c = (int64_t)(i0 / (size_t)st_) % D; uint8_t v = 0;
+                for (int64_t t = c - dup < 0 ? 0 : c - dup, e = c + dup < D ? c + dup : D - 1; t <= e; t++) v |= src[i0 + (size_t)((t - c) * st_)];
+                dst[i0] = v;
+            }
+        }
+    }
+    const uint8_t *dil = dm ? tm : nullptr;
     for (int64_t z = 0; z < d0; z++) for (int64_t y = 0; y < d1; y++) for (int64_t x = 0; x < d2; x++) {
         const size_t i = ((size_t)z * d1 + y) * d2 + x, b = ((size_t)(z / block) * b1 + y / block) * b2 + x / block;
         for (int k = 0; k < nn; k++) {
             if (!in[k][i]) continue;
+            if (nn == 1 || (dil && !(dil[i] & (uint8_t)~(1u << k)))) { if (!out[i]) { out[i] = 255; st[1]++; } continue; }   /* no other set near */
             const float sk = score[b * nn + k]; int beaten = 0, had_other = 0;
             for (int64_t zz = z - dup; zz <= z + dup && !beaten; zz++) { if (zz < 0 || zz >= d0) continue;
                 for (int64_t yy = y - dup; yy <= y + dup && !beaten; yy++) { if (yy < 0 || yy >= d1) continue;
@@ -57,6 +80,6 @@ void fuse_recto(const uint8_t *const *in, int n, const uint8_t *ct, int64_t d0, 
             if (!out[i]) { out[i] = 255; st[had_other ? 0 : 1]++; }
         }
     }
-    free(sum); free(cnt); free(score);
+    free(sum); free(cnt); free(score); free(dm); free(tm);
     if (stats) for (int k = 0; k < 3; k++) stats[k] += st[k];
 }
