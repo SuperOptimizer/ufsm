@@ -685,7 +685,8 @@ template <typename T, int NW> __device__ __forceinline__ void ws_xdec(const ws_x
         }
     }
 }
-template <int MT, int NT, typename T>
+template <int MT, int NT, typename T, bool SL = false>   /* SL: slab-local GroupNorm statistics (their per-plane reload kept out of the usual
+                                                          instance: +2-3% there, registers at the 80 cap) */
 __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restrict__ x, float *__restrict__ gw, int N, int Ci, int D, int H, int W, int Co,
                                                             gnp_t gp, split_t sp, int ZC, const uint8_t *__restrict__ gpre, int zs0, int zs1) {
     constexpr int CH = 8 * NT, BMo = 16 * MT;
@@ -792,7 +793,12 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
                     const bool act = gi < 3 && grp < 2 * CH;
                     const chan_t &cq = ctab4[act ? q : 0];
                     const bool rok = act && cq.p && gz >= 0 && gz < D && gyy >= 0 && gyy < H, G = Gany && cq.g;
-                    const float ha = 0.5f * cq.a, hb = 0.5f * cq.b;   /* h = (a x + b) / 2 */
+                    float ha, hb;   /* h = (a x + b) / 2 */
+                    if constexpr (SL) {   /* slab-local GN: plane gz's slab */
+                        float2 cab = make_float2(cq.a, cq.b);
+                        if ((gp.ns || sp.gp2.ns) && act) { const int ci = ci0 + q; cab = chan_ab(ci < Ci ? ci : Ci, Ci, Cx, n, sp, gp, max(gz, 0)); }
+                        ha = 0.5f * cab.x; hb = 0.5f * cab.y;
+                    } else { ha = 0.5f * cq.a; hb = 0.5f * cq.b; }
                     const unsigned *src = (const unsigned *)(xtb + (size_t)(act ? pl : 0) * CH * WS_XTP + ((act ? q : 0) * 10 + r) * 20);
                     unsigned wv[9];   /* x j: the low (j even) / high half of word j / 2 */
 #pragma unroll
@@ -1105,7 +1111,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
             else if (xs.c % 8 == 0 && (sp.x2 == nullptr || sp.c_split % 8 == 0)) NTw = 1;
             if (ws_env == 3 && !(NTw == 2 && MT == 2)) NTw = 0;   /* UFSM_F4W_WS=3: the old selection (>= 32 outputs, 16-channel input tiles), A/B */
             /* (slab-local GroupNorm x, gnp_t ns: conv_bwd_w_f4_k below, which applies each plane's slab; the warp-specialised one does not yet) */
-            if constexpr (IS_MX(T)) if (ws_env && lay == 1 && !had && !sp.up && NTw && !gp.ns && !sp.gp2.ns) {
+            if constexpr (IS_MX(T)) if (ws_env && lay == 1 && !had && !sp.up && NTw) {
                 /* warp-specialised persistent kernel: the blocks of a channel tile split its (tile, z chunk) items; z chunks
                    short enough for >= 4 items per SM, then the block count with the shortest estimated makespan (waves x
                    items per block, in z-steps: + 1 per item for its 4-plane first step, + 6 per block for fill and drain).
@@ -1121,15 +1127,18 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
                     if (cost < best - 1e-9) { best = cost; nper = k; }
                 }
                 const dim3 gw3((unsigned)(nper * ys.n), (xs.c + 8 * NTw - 1) / (8 * NTw), (ys.c + 16 * MT - 1) / (16 * MT));
-                static int wattr[8][4];
-                const int mi = (MT - 1) + 2 * (NTw - 1);
-#define WSL(M, NN) do { if (!wattr[cur_dev_()][mi]) { wattr[cur_dev_()][mi] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4ws_k<M, NN, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ws_smem<M, NN>()); } \
-                        conv_bwd_w_f4ws_k<M, NN, T><<<gw3, WS_NT, ws_smem<M, NN>()>>>((const T *)x, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, zc_w, buf, zs0, zs1); } while (0)
+                static int wattr[8][8];
+                const bool wsl = gp.ns || sp.gp2.ns;   /* slab-local GroupNorm: the SL instance */
+                const int mi = (MT - 1) + 2 * (NTw - 1) + 4 * wsl;
+#define WSL1(M, NN, S) do { if (!wattr[cur_dev_()][mi]) { wattr[cur_dev_()][mi] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4ws_k<M, NN, T, S>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ws_smem<M, NN>()); } \
+                        conv_bwd_w_f4ws_k<M, NN, T, S><<<gw3, WS_NT, ws_smem<M, NN>()>>>((const T *)x, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, zc_w, buf, zs0, zs1); } while (0)
+#define WSL(M, NN) do { if (wsl) WSL1(M, NN, true); else WSL1(M, NN, false); } while (0)
                 if (MT == 1 && NTw == 1) WSL(1, 1);
                 else if (MT == 1) WSL(1, 2);
                 else if (NTw == 1) WSL(2, 1);
                 else WSL(2, 2);
 #undef WSL
+#undef WSL1
                 continue;
             }
             switch (MT * 10 + NT) {

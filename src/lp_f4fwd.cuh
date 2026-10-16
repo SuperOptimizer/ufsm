@@ -472,7 +472,8 @@ __device__ __forceinline__ void dec_row16_gnh(uint2 raw, unsigned rsc, bool in, 
         }
     }
 }
-template <int MT, int TZ, typename T, typename TO>
+template <int MT, int TZ, typename T, typename TO, bool SL = false>   /* SL: slab-local GroupNorm statistics (MT 1; its reload kept out of the usual
+                                                                          instance, where its registers spilled 108 B) */
 __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                       const float *__restrict__ b, TO *__restrict__ y,
                                                       int N, int Ci, int D, int H, int W, int Co, int Cop, gnp_t gp, double *__restrict__ osum, int Go, split_t sp, int ZC) {
@@ -519,6 +520,18 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
         __syncthreads();
     }
     const float2 *gab = MT == 1 ? gabr : gabs;
+    int srow = gp.ns ? -1 : n;   /* slab-local GroupNorm (MT 1; fwd_f4_t routes MT > 1 around): the statistics row in gabr, reloaded when
+                                    a thread's next position lies in another slab (its planes ascend within a tile) */
+    auto slab_ab = [&](int gz) {
+        if constexpr (MT == 1 && SL) if (G && gp.ns) {
+            const int rz = gn_row(gp, n, max(gz + zi0, 0));
+            if (rz != srow) {
+                srow = rz;
+#pragma unroll
+                for (int k = 0; k < 16; k++) if (k < Ci) { const float2 ab = gn_ab(gp, rz, k, Ci); gabr[k] = IS_MX4(T) ? make_float2(0.5f * ab.x, 0.5f * ab.y) : ab; }
+            }
+        }
+    };
     bool cpy = false;   /* mx4 input without transform: the stored row (<= 16 channels, one scale) is the staged row */
     if constexpr (IS_MX4(T)) cpy = !G && !sp.sr;
     /* MX-fp4 input: the rows of a tile are loaded before it is staged -- the first tile's (NIT per thread) here, every later tile's
@@ -560,6 +573,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
             uint2 q = raw[it];
             unsigned sc = in ? rsc[it] : 1u;
             if (!cpy) {   /* dequantise, GN+SiLU (stage_row16's arithmetic), requantise */
+                slab_ab(gz);
                 float v[16];
                 dec_row16_gnh(q, rsc[it], in, Ci, G, gab, v);
                 float am = 0.f;
@@ -586,6 +600,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
         const size_t off = inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0;
         uint2 q;
         float v[16];
+        slab_ab(gz);
         stage_row16<T>(c0, Ci, plane, off, inb, G, gab, v);
         unsigned am = 0u;
 #pragma unroll
@@ -674,8 +689,14 @@ template <int MT, int TZ, typename T, typename TO> void launch_f4p(dim3, const v
     while (ZC > 1 && base * nblk_(nzt, ZC) < 480) ZC--;
     const dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(nblk_(nzt, ZC) * nmt * xs.n));   /* (the caller's grid argument is unused) */
     static int attr[8];
-    if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4p_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    conv_fwd_f4p_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp, ZC);
+    if (MT == 1 && gp.ns && gp.G) {   /* slab-local GroupNorm statistics: the instance with the per-slab reload */
+        static int attr1[8];
+        if (!attr1[cur_dev_()]) { attr1[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4p_k<MT, TZ, T, TO, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+        conv_fwd_f4p_k<MT, TZ, T, TO, true><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp, ZC);
+    } else {
+        if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4p_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+        conv_fwd_f4p_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, gp, osum, Go, sp, ZC);
+    }
 #if F4R_PROF
     if (getenv("F4R_PROF")) {
         unsigned long long h[8]; cudaDeviceSynchronize(); cudaMemcpyFromSymbol(h, g_f4r_prof, sizeof h);
@@ -728,7 +749,7 @@ template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const
     static int opad_env = -1; if (opad_env < 0) opad_env = getenv("UFSM_F4_OPAD16") ? atoi(getenv("UFSM_F4_OPAD16")) : 1;
     if (opad_env && g4_exact && IS_MX(TO) && sp.y2 && Ox <= 16 && cout - Ox <= 16) { OxP = 16; Cop = 32; sp.o_pad = 16; }
     /* (slab-local GroupNorm input, gnp_t ns: the chunk kernels below, which apply each staged plane's slab; conv_fwd_f4p_k does not yet) */
-    if (xs.c <= 16 && !sp.x2 && !sp.up && sp.gp2.G == 0 && !gp.ns) { p16_f4<T, TO>(x, xs, w, b, cout, y, Cop, Ox, OxP, gp, osum, Go, sp); return; }   /* K = [kx0 | kx1 | kx2 | kx3] x 16, a scale per kx */
+    if (xs.c <= 16 && !sp.x2 && !sp.up && sp.gp2.G == 0 && !(gp.ns && gp.G && Cop > 16)) { p16_f4<T, TO>(x, xs, w, b, cout, y, Cop, Ox, OxP, gp, osum, Go, sp); return; }   /* K = [kx0 | kx1 | kx2 | kx3] x 16, a scale per kx */
     if constexpr (IS_MX4(T) && IS_MX4(TO)) {   /* the 16-wide decoder conv1 with the fused upsample (lp_f4up.cu); UFSM_F4U=0: the chunk kernel */
         static int f4u = -1; if (f4u < 0) f4u = getenv("UFSM_F4U") ? atoi(getenv("UFSM_F4U")) : 1;
         if (f4u && sp.up == 2 && lp_f4u_fwd(x, xs, w, b, cout, y, gp, osum, Go, sp)) return;

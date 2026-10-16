@@ -23,6 +23,12 @@ conv_bwd_w_f4ws_k (fp4 weight gradient, warp-specialised) ~114 ms over 66, of ~5
   FMNMX.NAN per value; MT 1 scale words interleaved for one 8-byte load per row; MT > 1 GN pairs in shared memory. fwd 16 -> 16
   20.5 -> 19.0 ms (-7.3%), bdata 16 -> 16 18.3 -> 17.0 ms (-7.0%), bdata 16 -> 16 + 16 32.3 -> 31.2 ms (-3.3%).
 - Tried and dropped: an 8-slot (power-of-two) ring for MT 1 (+0.8%: the extra shared memory comes out of L1); TZ 2 (+15%).
+- Then z chunks of up to 64 tiles while >= 2048 blocks remain (was 8: a block's first tile stages 2 extra planes and loads the
+  weights): P512 fwd 18.1 ms (-11.9% vs the start), bdata 16.4 (-10.3%), the 16 + 16 split 30.5 (-5.7%); P256 -8 to -10%.
+- Slab-local GroupNorm (--l0-norm slab with the kernel path): both kernels take per-slab statistics -- conv_fwd_f4p_k MT 1 reloads its
+  (pre-halved) register pairs when a staged position lies in another slab (gn_row / gn_ab), MT > 1 with a GN input routes around
+  it (its pairs live in shared memory, shared by threads in different slabs); conv_bwd_w_f4ws_k's LY 1 lanes take chan_ab of
+  their plane.
 - conv_bwd_w_f4ws_k is producer-bound (ncu: the consumers' first load after the FULL barrier holds 23% of the samples), at the
   80-register cap of 672 threads. Tried, all reverted: the FMNMX.NAN amax in the LY 1 lanes (+0.4%), one cursor advance per pass
   (spills 16 B), the MX-fp4 decode through a bf16x2 byte table + one fma.rn.bf16x2 per pair with 8-byte LY 1 loads (+6%, a 16 B
