@@ -160,6 +160,22 @@ extern "C" void nn_input_rad(const void *ct16, shape5 xs, const void *rec, void 
     lp_input_rad(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(xs.d), xs.n, xs.d, xs.h, y, ISMX4(y) ? 4 : 8);
     KCHECK();
 }
+__global__ void unpack_tm_k(uint8_t *t, uint8_t *m, size_t p3, size_t n4) {   /* 4 voxels per thread (p3 % 4 == 0) */
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n4) return;
+    const size_t k = 4 * i, n = k / p3, v = k - n * p3;
+    const uint32_t c = *(const uint32_t *)(m + k);
+    *(uint32_t *)(t + (2 * n) * p3 + v) = (c & 0x01010101u) * 255u;
+    *(uint32_t *)(t + (2 * n + 1) * p3 + v) = (c >> 1 & 0x01010101u) * 255u;
+    *(uint32_t *)(m + k) = c >> 2 & 0x01010101u;
+}
+cudaStream_t copy_stream(void);
+extern "C" void nn_unpack_tm(uint8_t *t, uint8_t *m, int nb, size_t p3, int on_copy_stream) {
+    if (p3 % 4 || ((uintptr_t)t | (uintptr_t)m) % 4) { fprintf(stderr, "nn_unpack_tm: 4-byte aligned buffers, P^3 %% 4 == 0\n"); abort(); }
+    const size_t n4 = (size_t)nb * p3 / 4;
+    unpack_tm_k<<<nblk(n4, 256), 256, 0, on_copy_stream ? copy_stream() : 0>>>(t, m, p3, n4);
+    KCHECK();
+}
 extern "C" void nn_f32_to_act(const float *x, shape5 s, void *y) {
     if (ISMX4(y)) { lp_f32_to_mx4(x, s.n, s.c, shape_spatial(s), y); KCHECK(); return; }
     if (ISMX(y)) { lp_f32_to_mx8(x, s.n, s.c, shape_spatial(s), y); KCHECK(); return; }

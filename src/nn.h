@@ -141,6 +141,10 @@ void nn_h16_to_mx(const void *x, shape5 s, void *y);   /* 16-bit storage-type te
    registered MX input (fp8 / fp4). The 16-bit 4-channel window never exists (6 B per voxel less on the host, PCIe and device). */
 #define NN_RAD_REC(D) ((size_t)(8 + 2 * (D)) * 4)
 void nn_input_rad(const void *ct16, shape5 xs, const void *rec, void *y);
+/* packed targets (sample.h SAMPLE_TM_*: bit 0 target 0 = 255, bit 1 target 1 = 255, bit 2 mask) of nb samples of p3 voxels in m ->
+   t (nb x 2 x p3: 0 / 255) and the 0 / 1 mask in m, in place; on the copy stream (after an nn_h2d_copy_stream of the codes) or the
+   compute stream */
+void nn_unpack_tm(uint8_t *t, uint8_t *m, int nb, size_t p3, int on_copy_stream);
 void nn_f32_to_h16(const float *x, size_t n, void *y, float scale);
 /* 16-bit type for activation/gradient storage and MMA operands: 0 bf16 (default), 1 fp16 (8x finer mantissa, same tensor-core rate;
    env UFSM_F16=1). With fp16 gradient storage the activation gradients are kept scaled by nn_get_grad_scale() (env UFSM_GSCALE,

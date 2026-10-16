@@ -6,6 +6,24 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Trainer host RAM: packed targets, validation windows on disk (2026-10-15)
+At P768 the laptop trainer (production net, 6 workers, 7 slots, 4.8 um rv48 side labels) was OOM-killed by the 37.6 GiB slice cap
+before its first step (38.3 GB RSS): host RAM, not the GPU, bound the window. Per voxel the host held 5 B per sampler slot (CT fp16,
+2 target bytes, the mask), 5 B per stored validation window, ~4 B of scratch per worker and ~19 B of pinned offload buffers.
+- `train --pack-targets 1` (default where it applies): hard two-class targets (every source's recto target side-encoded, no warps,
+  --heads, --split, papyrus task, --dist-head, sheet prior, --overfit) travel as one code byte per voxel (sample.h SAMPLE_TM_*: bit 0
+  target 0, bit 1 target 1, bit 2 mask) through the slots, the validation windows and PCIe; nn_unpack_tm rebuilds the target and mask
+  bytes on the device (copy stream), so every device consumer is unchanged. The sampler refuses (aborts) a soft value.
+  tests/test_pack_tm.c: every code, both streams, the refusals; with a sources.json, deterministic windows with and without packing
+  equal byte for byte after the device unpack (rv48, P128: ok).
+- The validation windows come from a deterministic sampler (same windows every run; they were the first 8 a 4-worker sampler
+  happened to finish). `--val-store disk` (default): written once to an unlinked file in the run directory (space returns at exit)
+  and read back through one host batch at each pass (POSIX_FADV_DONTNEED keeps them out of the page cache; on tmpfs they would be
+  RAM); `ram`: the former copies; `regen`: drawn again at each pass. The three modes and --pack-targets 0 give the same validation
+  loss on a fixed model (P256, --lr 0: 1.11942 in all four).
+Laptop RTX 5080, P512: host VmHWM 16.5 -> 12.3 GB, device 4626 MiB (planner 4.89 GB), 1.53 samp/s either way. P768: killed at
+38.3 GB -> runs at 32.9 GB VmHWM (31.5 GB steady), device peak 13.8 GB (planner 15.13 of 15.51 GB), 0.46 samp/s = 208 Mvox/s
+(P512: 205), sampler wait 5-7% with 6 workers (UFSM_SAMPLER_PROF: 7.3 cpu-s per P768 window, 48% of it the x16 CT stage).
 ## Training input built on the GPU; the planner counts the separate input (2026-10-15)
 The network input is z-scored CT plus the radial unit vector (3 channels, from the window's corner, cube symmetry and the axis centre
 per source z). The sampler wrote all 4 as 16-bit per voxel (8 B: pinned slot, PCIe, a device buffer dead after the forward's MX input

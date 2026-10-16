@@ -17,6 +17,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
@@ -153,7 +154,7 @@ static size_t xbytes(void) { return g_xfmt ? 2 : 4; }
 static const void *bx(const batch *b) { return g_xfmt ? (const void *)b->x16 : (const void *)b->x; }
 /* --gpu-input (default when the configuration allows it, sample_gpu_input_ok): batches carry the CT channel only (g_xs 1) and per sample a
    radial record; the network's 4 MX input channels are built on the device (nn_input_rad). g_xs: input channels per sample in the batches */
-static int g_gpu_in, g_xs = 4, g_gpu_want, g_gpu_asked;
+static int g_gpu_in, g_xs = 4, g_gpu_want, g_gpu_asked, g_pack;   /* g_pack: --pack-targets (batch.tm, nn_unpack_tm on upload) */
 static size_t rad_bytes(int B) { return g_gpu_in ? (size_t)B * NN_RAD_REC(g_Pz) : 0; }
 /* once the memory mode is set: the GPU-built input needs the 16-bit -> MX input conversion (unet_input_converted: MX activations with
    MX gradients or an input policy) */
@@ -178,6 +179,41 @@ static const uint8_t *trow_w(const batch *b, int B, uint8_t *hw) {   /* the chan
     memset(hw, 0, (size_t)B * g_tc);
     for (int r = 0; r < B * NCH; r++) hw[trow(b, r)] = b->w[r];
     return hw;
+}
+/* the host arrays of a batch in this run's layout: the addresses of its members and their sizes (validation copies, --val-store) */
+enum { VAL_DISK, VAL_RAM, VAL_REGEN, VAL_NF = 16 };
+static int val_fields(batch *b, int B, size_t p3, void **f[VAL_NF], size_t sz[VAL_NF]) {
+    int n = 0;
+#define VF(p_, s_) do { f[n] = (void **)&(p_); sz[n++] = (s_); } while (0)
+    if (g_xfmt) VF(b->x16, (size_t)B * g_xs * p3 * 2); else VF(b->x, (size_t)B * g_xs * p3 * 4);
+    if (g_gpu_in) VF(b->rad, rad_bytes(B));
+    if (g_pack) VF(b->tm, (size_t)B * p3); else { VF(b->t, (size_t)B * NCH * p3); VF(b->m, (size_t)B * p3); }
+    VF(b->w, (size_t)B * NCH); VF(b->src, (size_t)B * sizeof *b->src); VF(b->um, (size_t)B * sizeof *b->um);
+    if (g_aff) VF(b->band, (size_t)B * p3);
+    if (g_side) VF(b->side, (size_t)B * p3);
+    if (g_unwrap) VF(b->pm, (size_t)B * p3);
+    if (g_cond) VF(b->wind, (size_t)B * p3);
+    if (g_pap_head) VF(b->pap, (size_t)B * p3);
+#undef VF
+    return n;
+}
+typedef struct { int fd; size_t bytes; batch buf; } valdisk;   /* --val-store disk: the windows back to back in an unlinked file */
+static int pwrite_all(int fd, const void *p, size_t n, size_t off) {
+    for (size_t k = 0; k < n;) { const ssize_t w = pwrite(fd, (const char *)p + k, n - k, (off_t)(off + k)); if (w <= 0) return -1; k += (size_t)w; }
+    return 0;
+}
+static int val_read(valdisk *v, int i, int B, size_t p3) {   /* window i into v->buf (its pages then leave the page cache) */
+    void **f[VAL_NF]; size_t sz[VAL_NF];
+    const int nf = val_fields(&v->buf, B, p3, f, sz);
+    size_t wb = 0;
+    for (int k = 0; k < nf; k++) wb += sz[k];
+    size_t off = (size_t)i * wb;
+    for (int k = 0; k < nf; k++) {
+        for (size_t d = 0; d < sz[k];) { const ssize_t r = pread(v->fd, (char *)*f[k] + d, sz[k] - d, (off_t)(off + d)); if (r <= 0) return -1; d += (size_t)r; }
+        off += sz[k];
+    }
+    posix_fadvise(v->fd, (off_t)((size_t)i * wb), (off_t)wb, POSIX_FADV_DONTNEED);
+    return 0;
 }
 /* this GPU's z slab of a batch: rows of the [rows][P][P][P] arrays, planes [z0, z0 + g_Dl); mask halo planes from zeros */
 static void upload_slab(gpu_state *d, const batch *b, int i, int B, int P, int async) {
@@ -211,9 +247,12 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     size_t p3 = (size_t)g_Pz * P * P;
     nn_h2d(d->x, bx(b), (size_t)B * g_xs * p3 * xbytes());
     if (g_gpu_in) nn_h2d(d->rad, b->rad, rad_bytes(B));
-    if (!g_heads) nn_h2d(d->t, b->t, (size_t)B * NCH * p3);
-    else for (int r = 0; r < B * NCH; r++) nn_h2d(d->t + (size_t)trow(b, r) * p3, b->t + (size_t)r * p3, p3);
-    nn_h2d(d->m, b->m, (size_t)B * p3);
+    if (g_pack) { nn_h2d(d->m, b->tm, (size_t)B * p3); nn_unpack_tm(d->t, d->m, B, p3, 0); }   /* (--pack-targets excludes --heads) */
+    else {
+        if (!g_heads) nn_h2d(d->t, b->t, (size_t)B * NCH * p3);
+        else for (int r = 0; r < B * NCH; r++) nn_h2d(d->t + (size_t)trow(b, r) * p3, b->t + (size_t)r * p3, p3);
+        nn_h2d(d->m, b->m, (size_t)B * p3);
+    }
     nn_h2d(d->w, trow_w(b, B, d->hwh[d->cur]), (size_t)B * g_tc);
     if (g_aff) nn_h2d(d->band, b->band, (size_t)B * p3);
     if (g_side) nn_h2d(d->sdb, b->side, (size_t)B * p3);
@@ -233,9 +272,12 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     else {
         nn_h2d_copy_stream(d->xb[i], bx(b), (size_t)B * g_xs * p3 * xbytes());
         if (g_gpu_in) nn_h2d_copy_stream(d->radb[i], b->rad, rad_bytes(B));
-        if (!g_heads) nn_h2d_copy_stream(d->tb[i], b->t, (size_t)B * NCH * p3);
-        else for (int r = 0; r < B * NCH; r++) nn_h2d_copy_stream(d->tb[i] + (size_t)trow(b, r) * p3, b->t + (size_t)r * p3, p3);
-        nn_h2d_copy_stream(d->mb[i], b->m, (size_t)B * p3);
+        if (g_pack) { nn_h2d_copy_stream(d->mb[i], b->tm, (size_t)B * p3); nn_unpack_tm(d->tb[i], d->mb[i], B, p3, 1); }   /* (copy stream) */
+        else {
+            if (!g_heads) nn_h2d_copy_stream(d->tb[i], b->t, (size_t)B * NCH * p3);
+            else for (int r = 0; r < B * NCH; r++) nn_h2d_copy_stream(d->tb[i] + (size_t)trow(b, r) * p3, b->t + (size_t)r * p3, p3);
+            nn_h2d_copy_stream(d->mb[i], b->m, (size_t)B * p3);
+        }
         nn_h2d_copy_stream(d->wb[i], trow_w(b, B, d->hwh[i]), (size_t)B * g_tc);
         if (g_aff) nn_h2d_copy_stream(d->bandb[i], b->band, (size_t)B * p3);
         if (g_side) nn_h2d_copy_stream(d->sideb[i], b->side, (size_t)B * p3);
@@ -1070,6 +1112,18 @@ int cmd_train(int argc, char **argv) {
         g_gpu_asked = atoi(opt(argc, argv, "--gpu-input", "0"));   /* (an explicit request: say when it cannot apply) */
         /* the MX input conversion it needs depends on the memory mode (MX gradients): settled after the planner (gpu_input_settle) */
     }
+    {   /* --pack-targets 1 (default where it applies): hard two-class targets (every source's recto target side-encoded: 0 / 255 in both
+           channels) travel as one code byte per voxel (sample.h SAMPLE_TM_*) through the sampler slots, the validation batches and the
+           upload, unpacked on the device (nn_unpack_tm): 3 -> 1 B per voxel on the host and over PCIe. Not with --heads (per-source
+           target rows), --split, the papyrus task, --dist-head, the sheet prior, geometry warps (trilinear targets) or --overfit;
+           --pack-targets 0: target and mask bytes */
+        int hard = S->n > 0;
+        for (int i = 0; i < S->n; i++) hard &= S->src[i].tgt_side[CH_RECTO];
+        g_pack = atoi(opt(argc, argv, "--pack-targets", "1")) && hard && !g_heads && !split && !sc.papyrus && sc.dist_sigma <= 0 && !sc.sheet && !sc.geometry_augment && !overfit;
+        sc.pack_tm = g_pack;
+        if (g_pack) fprintf(stderr, "targets: packed, one byte per voxel on the host and in the upload (--pack-targets 0: target and mask bytes)\n");
+        else if (atoi(opt(argc, argv, "--pack-targets", "0"))) fprintf(stderr, "--pack-targets: not available here (needs side-encoded targets in every source, no --heads, --split, papyrus task, --dist-head, sheet prior, geometry warps or --overfit)\n");
+    }
     cover_plan *plan = nullptr; cover_progress coverage = {0}, prior_cover = {0};
     const char *cover_path = opt(argc, argv, "--cover", nullptr);
     int warm_start=atoi(opt(argc,argv,"--warm-start","0"));
@@ -1568,32 +1622,50 @@ int cmd_train(int argc, char **argv) {
     /* validation set: fixed batches from the held-out boxes (unaugmented), scored on GPU 0 */
     sample_cfg vc = sc; vc.cover = nullptr; vc.cover_start = 0; vc.ct_augment = 0; vc.axis_jitter = 0; vc.geometry_augment=0; vc.label_morph=0; vc.scan.strength=0; vc.affine_p=0; vc.seed = seed + 777; vc.augment = 0; vc.nworkers = 4; vc.nbuf = 2; vc.holdout = 1;
     { int any = 0; for (int i = 0; i < S->n; i++) any |= S->src[i].hold_n[0] > 0; if (!any) { vc.holdout = 0; fprintf(stderr, "no holdout boxes in the sources: validation batches come from the training distribution\n"); } }
-    sampler *vs = nval > 0 ? sampler_start(S, &vc) : nullptr;   /* --val-batches 0: no validation (e.g. windows wider than the holdout) */
-    if (nval > 0 && !vs) { fprintf(stderr, "cannot construct validation sampler\n"); return 1; }
+    /* the validation windows are the first nval batches of a deterministic sampler (each window from its own seeded rng: the same
+       windows in every run with this seed), drawn once here. --val-store disk (default): kept in an unlinked file in the run directory
+       (3 B per voxel each with --gpu-input and packed targets; its space returns when the trainer exits) and read back at every pass
+       through one host batch; ram: copies in host RAM (the former layout); regen: drawn again at every pass (no copies; the pass waits
+       for 3 sampler workers). The sheet prior's per-window records keep ram. */
+    vc.deterministic = 1; vc.nworkers = 3; vc.nbuf = 3;
+    const char *vmode_s = opt(argc, argv, "--val-store", "disk");
+    int vmode = !strcmp(vmode_s, "ram") ? VAL_RAM : !strcmp(vmode_s, "regen") ? VAL_REGEN : !strcmp(vmode_s, "disk") ? VAL_DISK : -1;
+    if (vmode < 0) { fprintf(stderr, "--val-store: disk, ram or regen\n"); return 2; }
+    if (vmode == VAL_DISK && sc.sheet) vmode = VAL_RAM;
     batch *val = calloc((size_t)nval, sizeof *val);
-    for (int i = 0; i < nval; i++) {
-        batch *b = sampler_next(vs);
-        if (!b) { nval = i; break; }
-        if (g_xfmt) { val[i].x16 = malloc((size_t)B * g_xs * p3 * 2); memcpy(val[i].x16, b->x16, (size_t)B * g_xs * p3 * 2); }
-        else { val[i].x = malloc((size_t)B * g_xs * p3 * 4); memcpy(val[i].x, b->x, (size_t)B * g_xs * p3 * 4); }
-        if (g_gpu_in) { val[i].rad = malloc(rad_bytes(B)); memcpy(val[i].rad, b->rad, rad_bytes(B)); }
-        val[i].t = malloc((size_t)B * NCH * p3); memcpy(val[i].t, b->t, (size_t)B * NCH * p3);
-        val[i].m = malloc((size_t)B * p3); memcpy(val[i].m, b->m, (size_t)B * p3);
-        val[i].w = malloc((size_t)B * NCH); memcpy(val[i].w, b->w, (size_t)B * NCH);
-        val[i].src = malloc((size_t)B * sizeof *b->src); memcpy(val[i].src, b->src, (size_t)B * sizeof *b->src);
-        val[i].um = malloc((size_t)B * sizeof(float)); memcpy(val[i].um, b->um, (size_t)B * sizeof(float));
-        if (g_aff) { val[i].band = malloc((size_t)B * p3); memcpy(val[i].band, b->band, (size_t)B * p3); }
-        if (g_side) { val[i].side = malloc((size_t)B * p3); memcpy(val[i].side, b->side, (size_t)B * p3); }
-        if (g_unwrap) { val[i].pm = malloc((size_t)B * p3); memcpy(val[i].pm, b->pm, (size_t)B * p3); }
-        if (g_cond) { val[i].wind = malloc((size_t)B * p3); memcpy(val[i].wind, b->wind, (size_t)B * p3); }
-        if (g_pap_head) { val[i].pap = malloc((size_t)B * p3); memcpy(val[i].pap, b->pap, (size_t)B * p3); }
-        val[i].sheet=calloc((size_t)B,sizeof *val[i].sheet); val[i].sheet[0]=sheet_clone(b->sheet?b->sheet[0]:nullptr);
-        sampler_release(vs, b);
-    }
-    int validation_failed = vs && sampler_failed(vs);
-    if (vs) sampler_stop(vs);
-    if (validation_failed) { fprintf(stderr, "validation sampler failed\n"); return 1; }
-    fprintf(stderr, "%d validation batches\n", nval);
+    valdisk vdk = {.fd = -1};
+    if (nval > 0 && vmode != VAL_REGEN) {
+        if (vmode == VAL_DISK) {
+            char vp[1400]; snprintf(vp, sizeof vp, "%s/.val-windows", out);
+            vdk.fd = open(vp, O_RDWR | O_CREAT | O_TRUNC, 0600);
+            if (vdk.fd < 0 || unlink(vp)) { fprintf(stderr, "cannot create %s (--val-store ram or regen avoid it)\n", vp); return 1; }
+        }
+        sampler *vs = sampler_start(S, &vc);   /* --val-batches 0: no validation (e.g. windows wider than the holdout) */
+        if (!vs) { fprintf(stderr, "cannot construct validation sampler\n"); return 1; }
+        for (int i = 0; i < nval; i++) {
+            batch *b = sampler_next(vs);
+            if (!b) { nval = i; break; }
+            void **fb[VAL_NF], **fv[VAL_NF]; size_t sz[VAL_NF];
+            const int nf = val_fields(b, B, p3, fb, sz); val_fields(&val[i], B, p3, fv, sz);
+            for (int k = 0; k < nf; k++)
+                if (vmode == VAL_RAM) { *fv[k] = malloc(sz[k]); memcpy(*fv[k], *fb[k], sz[k]); }
+                else if (pwrite_all(vdk.fd, *fb[k], sz[k], vdk.bytes)) { fprintf(stderr, "cannot write the validation windows\n"); return 1; }
+                else vdk.bytes += sz[k];
+            if (vmode == VAL_RAM) { val[i].sheet=calloc((size_t)B,sizeof *val[i].sheet); val[i].sheet[0]=sheet_clone(b->sheet?b->sheet[0]:nullptr); }
+            sampler_release(vs, b);
+        }
+        int validation_failed = sampler_failed(vs);
+        sampler_stop(vs);
+        if (validation_failed) { fprintf(stderr, "validation sampler failed\n"); return 1; }
+        if (vmode == VAL_DISK) {   /* one host batch to read them back into; the written pages leave the page cache */
+            void **fv[VAL_NF]; size_t sz[VAL_NF];
+            const int nf = val_fields(&vdk.buf, B, p3, fv, sz);
+            for (int k = 0; k < nf; k++) if (!(*fv[k] = malloc(sz[k]))) { fprintf(stderr, "out of host memory (validation batch)\n"); return 1; }
+            fdatasync(vdk.fd); posix_fadvise(vdk.fd, 0, 0, POSIX_FADV_DONTNEED);
+        }
+        fprintf(stderr, "%d validation batches, %s (--val-store %s)\n", nval, vmode == VAL_RAM ? "held in host RAM" : "in an unlinked file in the run directory, read back at each pass", vmode_s);
+    } else if (nval > 0) fprintf(stderr, "%d validation batches, drawn again at every validation pass (--val-store regen)\n", nval);
+    else fprintf(stderr, "0 validation batches\n");
 
     if (!sc.cover && step0 > 0) {   /* resumed: a fresh sample stream (the per-sample seeds count from batch 0 at every sampler start, so a
                                        resume under --det replayed the windows and augmentations of steps 1, 2, ...); validation keeps its seed */
@@ -1817,13 +1889,26 @@ int cmd_train(int argc, char **argv) {
                     int keep = G[0].cur;
                     for (int g = 0; g < nv; g++) { if (G[g].lean) { nn_init(G[g].dev); nn_event_sync(G[g].ev_up[keep]); } select_buf(&G[g], keep ^ 1); }   /* lean: one buffer, the prefetch must have landed */
                     g_verso_flip = 0;   /* validation: the direction as is */
+                    sampler *vq = nval > 0 && vmode == VAL_REGEN ? sampler_start(S, &vc) : nullptr;   /* --val-store regen: the same windows drawn again */
+                    if (nval > 0 && vmode == VAL_REGEN && !vq) { fprintf(stderr, "cannot construct validation sampler\n"); return 1; }
+                    int got = 0;
                     for (int i = 0; i < nval; i++) {
                         float vp[2 * TCMAX + 1];
-                        for (int g = 0; g < nv; g++) { nn_init(G[g].dev); upload(&G[g], &val[i], B, P); }
+                        batch *vbt = vq ? sampler_next(vq) : vmode == VAL_DISK ? (val_read(&vdk, i, B, p3) ? nullptr : &vdk.buf) : &val[i];
+                        if (!vbt) { if (vmode == VAL_DISK) { fprintf(stderr, "cannot read the validation windows\n"); return 1; } break; }
+                        for (int g = 0; g < nv; g++) { nn_init(G[g].dev); upload(&G[g], vbt, B, P); }
                         if (split) { split_arg sa = {G, B, P, 0, dice_w}; split_run(sctx, split_job, &sa); nn_init(G[0].dev); }
                         else run_batch(&G[0], B, P, dice_w, 0);
                         double l = fetch_loss(&G[0], B, P, dice_w, vp); vl = (vl < 0 ? 0 : vl) + l; vb += vp[0]; vd += vp[g_aff || g_unwrap || g_heads ? NCH : g_half ? g_cout : cfg.cout];
                         if (g_heads) for (int h = 0; h < g_heads; h++) if (G[0].hon[h]) { vh[h] += G[0].hl[h]; vhn[h]++; }
+                        if (vq) sampler_release(vq, vbt);
+                        got++;
+                    }
+                    if (vq) {
+                        const int vfail = sampler_failed(vq);
+                        sampler_stop(vq);
+                        if (vfail) { fprintf(stderr, "validation sampler failed\n"); return 1; }
+                        if (got < nval) { fprintf(stderr, "validation: %d of %d batches drawn\n", got, nval); nval = got; }
                     }
                     for (int g = 0; g < nv; g++) {
                         select_buf(&G[g], keep);

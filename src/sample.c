@@ -161,8 +161,9 @@ static batch alloc_batch(const sample_cfg *c) {
     b.rad = c->gpu_input ? nn_host_alloc((size_t)c->B * NN_RAD_REC(PZ(c))) : nullptr;
     b.x = c->xfmt ? nullptr : nn_host_alloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
     b.x16 = c->xfmt ? nn_host_alloc((size_t)c->B * xc * p3 * 2) : nullptr;
-    b.t = nn_host_alloc((size_t)c->B * NCH * p3);
-    b.m = nn_host_alloc((size_t)c->B * p3);
+    b.t = c->pack_tm ? nullptr : nn_host_alloc((size_t)c->B * NCH * p3);
+    b.m = c->pack_tm ? nullptr : nn_host_alloc((size_t)c->B * p3);
+    b.tm = c->pack_tm ? nn_host_alloc((size_t)c->B * p3) : nullptr;   /* one code byte per voxel instead of NCH + 1 */
     b.w = nn_host_alloc((size_t)c->B * NCH);
     b.src = malloc((size_t)c->B * sizeof(int16_t));
     b.level = malloc((size_t)c->B * sizeof(int8_t));
@@ -177,7 +178,7 @@ static batch alloc_batch(const sample_cfg *c) {
     return b;
 }
 
-static void free_batch(batch *b) { if (b->rad) nn_host_free(b->rad); if (b->pap) nn_host_free(b->pap); if (b->wind) nn_host_free(b->wind); if (b->band) nn_host_free(b->band); if (b->side) nn_host_free(b->side); if (b->pm) nn_host_free(b->pm); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); nn_host_free(b->t); nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->tm) nn_host_free(b->tm); if (b->rad) nn_host_free(b->rad); if (b->pap) nn_host_free(b->pap); if (b->wind) nn_host_free(b->wind); if (b->band) nn_host_free(b->band); if (b->side) nn_host_free(b->side); if (b->pm) nn_host_free(b->pm); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); if (b->t) nn_host_free(b->t); if (b->m) nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -1183,7 +1184,9 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
     for (size_t k = 0; k < p3; k++) mask[k] = (ctu[k] != 0) & (mask[k] == 0);
     PROF_MARK(PS_ZSCORE);
-    uint8_t *T = b->t + (size_t)i * NCH * p3, *M = b->m + (size_t)i * p3;
+    /* packed targets (cfg.pack_tm): unwarped samples pack the code in the source frame over the mask (one symmetry copy into the batch);
+       warped ones warp into pooled scratch and pack after */
+    uint8_t *T = c->pack_tm ? nullptr : b->t + (size_t)i * NCH * p3, *M = c->pack_tm ? nullptr : b->m + (size_t)i * p3;
     sym y = sym_of(0);
     float ia = 1.f, ib = 0.f, isg = 0.f;
     if (c->augment) {
@@ -1230,7 +1233,20 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     b->um[i] = (float)(s->um * (double)(1 << l) * (spatial.active ? spatial.scale * cbrt(spatial.det) : 1.0));   /* affine: the volume-preserving voxel size */
     if (c->papyrus) b->um[i] = c->papyrus->cond == 1 ? (float)(ia * ((pap_t - mean) / sd) + ib) : 0.f;   /* the cutoff where the input puts it */
     if (c->papyrus && c->papyrus->cond == 2) { mean = pap_t; ib = 0.f; }   /* the CT channel (ct - t) / sd: the cutoff at zero */
-    if (!spatial.active) {
+    uint8_t *Tw = nullptr;   /* (packed and warped: the warped targets and mask before packing) */
+    if (c->pack_tm && spatial.active) {
+        if (!(Tw = tp_get((NCH + 1) * p3, 0))) return -1;
+        T = Tw; M = Tw + NCH * p3;
+    }
+    if (!spatial.active && c->pack_tm) {
+        size_t bad = 0;
+        if (sample_pack_tm(ttmp, ttmp + p3, mask, p3, mask, &bad)) {
+            fprintf(stderr, "sampler: packed targets need hard 0 / 255 targets and a 0 / 1 mask (voxel %zu: %d %d %d); train --pack-targets 0\n",
+                    bad, ttmp[bad], ttmp[p3 + bad], mask[bad]);
+            abort();
+        }
+        sym_u8(mask, b->tm + (size_t)i * p3, Pz, P, y);
+    } else if (!spatial.active) {
         for (int ch = 0; ch < NCH; ch++) sym_u8(ttmp + (size_t)ch * p3, T + (size_t)ch * p3, Pz, P, y);
         sym_u8(mask, M, Pz, P, y);
     }
@@ -1316,6 +1332,14 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         w[1]=0; /* winding is supervised by the sparse regression objective */
     }
     if (spatial.active && c->pmask) memcpy(b->pm + (size_t)i * p3, M, p3);   /* warped samples: the warped loss mask */
+    if (Tw) {
+        size_t bad = 0;
+        if (sample_pack_tm(Tw, Tw + p3, Tw + NCH * p3, p3, b->tm + (size_t)i * p3, &bad)) {
+            fprintf(stderr, "sampler: packed targets need hard 0 / 255 targets and a 0 / 1 mask after the warp (voxel %zu); train --pack-targets 0\n", bad);
+            abort();
+        }
+        tp_put(Tw, (NCH + 1) * p3);
+    }
     PROF_MARK(PS_X16);
     memcpy(b->w + (size_t)i * NCH, w, NCH);
     b->src[i] = (int16_t)si;
@@ -1328,6 +1352,17 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
 
 typedef struct { sampler *sp; int id; } warg;
 
+int sample_pack_tm(const uint8_t *t0, const uint8_t *t1, const uint8_t *m, size_t n, uint8_t *out, size_t *bad) {
+    uint8_t acc = 0;   /* any value outside the code (checked once after the loop: the loop stays branch-free) */
+    for (size_t k = 0; k < n; k++) {
+        const uint8_t a = t0[k], b = t1[k], mk = m[k];
+        acc |= (uint8_t)((a != 0 && a != 255) | (b != 0 && b != 255) | (mk > 1));
+        out[k] = (uint8_t)((a >> 7 & SAMPLE_TM_T0) | (b >> 6 & SAMPLE_TM_T1) | (mk << 2 & SAMPLE_TM_M));
+    }
+    if (!acc) return 0;
+    for (size_t k = 0; k < n; k++) if ((t0[k] != 0 && t0[k] != 255) || (t1[k] != 0 && t1[k] != 255) || m[k] > 1) { if (bad) *bad = k; break; }
+    return -1;
+}
 static void *worker(void *arg) {
     warg *wa = arg;
     sampler *sp = wa->sp;

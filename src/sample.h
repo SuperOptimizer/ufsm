@@ -78,6 +78,9 @@ typedef struct {
                                 input units ((t - mean) / sd, times the intensity jitter: the conditioning code) instead of a voxel size */
     int gpu_input;           /* train --gpu-input (needs xfmt and sample_gpu_input_ok): batch.x16 holds the CT channel only and batch.rad
                                 each sample's radial record (nn.h nn_input_rad builds the 4 input channels on the device, bit for bit) */
+    int pack_tm;             /* targets and mask as one code byte per voxel (batch.tm: SAMPLE_TM_* bits; t, m nullptr): every target value
+                                0 or 255 and the mask 0 / 1 (hard two-class targets, e.g. the side encoding; a soft value aborts). The
+                                trainer unpacks on the device (nn_unpack_tm): host batches 3 -> 1 byte per voxel */
 } sample_cfg;
 /* the configurations whose every sample takes write_x (no warp, sheet prior, slab appearance plan, aux or condition channels): the
    radial channels then follow from the window's corner, symmetry and axis centres alone */
@@ -100,6 +103,7 @@ typedef struct {
     uint8_t *wind;           /* B x P^3 winding mod 14 + gauge (band.h band_winding encoding, 255 unknown) when cfg.cond */
     uint8_t *pap;            /* B x P^3 papyrus labels when cfg.pap_head: 0 void, 1 papyrus, 255 ignored */
     void *rad;               /* cfg.gpu_input: B radial records of NN_RAD_REC(Pz) bytes (nn.h), x / x16 then one channel per sample */
+    uint8_t *tm;             /* cfg.pack_tm: B x P^3 codes (bit 0: target 0 = 255, bit 1: target 1 = 255, bit 2: mask), t / m nullptr */
     int xch;                 /* input channels stored per sample in x / x16 (4, 5 with aux, 7 with cond, 1 with gpu_input) */
 } batch;
 
@@ -121,6 +125,10 @@ void sampler_prof_print(const sampler *sp);   /* env UFSM_SAMPLER_PROF=1: per-st
 void sampler_set_soft(sampler *sp, float sigma);   /* change the soft-target sigma while running (annealing); patches already drawn keep theirs */
 
 sample_cfg sample_cfg_default(void);
+enum { SAMPLE_TM_T0 = 1, SAMPLE_TM_T1 = 2, SAMPLE_TM_M = 4 };
+/* the packed code of n voxels from two target channels (each 0 or 255) and a 0 / 1 mask; out may be m (in place). -1 at a value
+   that does not fit (a soft target or a mask weight), its index in *bad. Exposed for tests. */
+int sample_pack_tm(const uint8_t *t0, const uint8_t *t1, const uint8_t *m, size_t n, uint8_t *out, size_t *bad);
 
 /* Pool a uint8 cube by 2 (mean); out has edge n/2. Exposed for tests. */
 void pool2_u8(const uint8_t *in, int n, uint8_t *out);
