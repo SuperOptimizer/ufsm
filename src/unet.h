@@ -78,6 +78,9 @@ void unet_grad_h2d(unet *u, const float *host);
 double unet_grad_norm(unet *u);
 void unet_clip_grad(unet *u, double max_norm);          /* scales grads if their norm exceeds max_norm */
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step);   /* Muon on the 3^3 conv weights, AdamW elsewhere */
+/* Muon variants for unet_muon: muonc = Muon-C (per-frequency polarisation of the conv kernels), hyperball = fixed weight and
+   update norms (eta = hb_mult x the Muon lr, replaces the decay); both 0 = Muon. The radii go into checkpoints (hb_R). */
+void unet_set_muon_ext(unet *u, int muonc, int hyperball, float hb_mult);
 void unet_anvil(unet *u, float lr, float wd, int step, int steps, float lr_adam, float b1, float b2, float eps, float wd_adam);   /* ANVIL II on the 3^3 conv weights, AdamW elsewhere */
 void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step);
 void unet_ema(unet *u, float decay);

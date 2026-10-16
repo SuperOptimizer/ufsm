@@ -77,12 +77,10 @@ __global__ void bmuon_apply_k(const muon_desc_t *d, int swap, float lr, float wd
     float scale = sqrtf(fmaxf(1.f, (float)D.Co / (float)D.K));
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.p[i] = D.p[i] * (1.f - lr * wd) - lr * scale * O[i];
 }
-extern "C" void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta, float wd) {
-    const muon_desc_t *d = (const muon_desc_t *)descs;
-    double *ss = gn_dsums((size_t)nconv); cudaMemsetAsync(ss, 0, (size_t)nconv * sizeof(double));
-    dim3 g1(32, 1, nconv), gco(nblk(maxco, 64), nblk(maxco, 64), nconv), gk(nblk(maxk, 64), nblk(maxco, 64), nconv);
-    bmuon_mom_k<<<g1, 256>>>(d, beta, ss);
-    bmuon_scale_k<<<g1, 256>>>(d, ss);
+/* 5 Newton-Schulz iterations (modded-nanogpt coefficients) on every table entry's X (Co x K); returns the buffer flag of the
+   result (1: Y) */
+static int ns5_batch(const muon_desc_t *d, int nconv, int maxco, int maxk) {
+    dim3 gco(nblk(maxco, 64), nblk(maxco, 64), nconv), gk(nblk(maxk, 64), nblk(maxco, 64), nconv);
     const float a = 3.4445f, b = -4.7750f, c = 2.0315f;
     int swap = 0;
     for (int it = 0; it < 5; it++) {
@@ -91,7 +89,152 @@ extern "C" void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk,
         gemm_ns_k<2, muon_desc_t><<<gk, 256>>>(d, swap, a, 0.f);
         swap ^= 1;
     }
+    return swap;
+}
+extern "C" void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta, float wd) {
+    const muon_desc_t *d = (const muon_desc_t *)descs;
+    double *ss = gn_dsums((size_t)nconv); cudaMemsetAsync(ss, 0, (size_t)nconv * sizeof(double));
+    dim3 g1(32, 1, nconv);
+    bmuon_mom_k<<<g1, 256>>>(d, beta, ss);
+    bmuon_scale_k<<<g1, 256>>>(d, ss);
+    const int swap = ns5_batch(d, nconv, maxco, maxk);
     bmuon_apply_k<<<g1, 256>>>(d, swap, lr, wd);
+    KCHECK();
+}
+/* ---- Muon-C (Qing & Li 2026, arXiv 2609.09676) and Hyperball (Wen, Dang, Lyu, Ma & Liang 2026, arXiv 2606.16899) ----
+   Muon-C: the Nesterov momentum of a k^3 kernel [Co][Ci][k^3] goes through the orthonormal DFT over the three kernel axes
+   (the critical Fourier grid: one Co x Ci channel-transfer block per kernel frequency), every block is polarised on its
+   own by complex Newton-Schulz (the paper: 5 iterations with Muon's a, b, c, X0 = B / (|B|_F + 1e-8), a block with more
+   rows than columns polarised as its conjugate transpose), and the inverse DFT returns a real update on the original
+   support. A real kernel has conjugate-symmetric blocks and polar(conj B) = conj polar(B), so a 3^3 kernel polarises 14
+   of its 27 frequencies (0 and one of each conjugate pair). A complex block X = Xr + i Xi is iterated as its real
+   embedding [[Xr, -Xi], [Xi, Xr]] (2m x 2n) with Muon's batched products: the embedding is a *-homomorphism, so the real
+   iteration is the complex one exactly. The applied update is rescaled to the RMS exact-polar unfolded Muon has for the
+   conv (sqrt(max(1, Co/K)) sqrt(min(Co, K) / (Co K)), K = Ci k^3): the paper's matched applied-update RMS, so --muon-lr
+   keeps its meaning. Frequencies run one at a time over all convs, so the embedded scratch is one frequency's.
+   Hyperball: W <- R Normalize(W - eta R Normalize(u)) with R the conv's |W|_F when the wrapper first ran and eta the
+   Hyperball learning rate; it replaces the decay. u is the Muon or Muon-C direction (its scale cancels).
+   Per-conv sums use 32 fixed partials summed in order (deterministic). */
+typedef struct { const float *U; float *O; float *EX, *EY; int Co, Ci, k, m, n, tr; } muonc_desc_t;
+__constant__ float c_mc_cs[2][14][27];   /* cos / sin of 2 pi (f . t) / 3: the 14 polarised frequencies f of a 3^3 grid, taps t */
+__constant__ float c_mc_w[14];           /* 1: the zero frequency, 2: a conjugate pair */
+static void mc_tables(void) {
+    static int done[16];
+    if (done[cur_dev()]) return;
+    float cs[2][14][27], w[14]; int nf = 0;
+    for (int f = 0; f < 27; f++) {
+        const int p = f / 9, q = f / 3 % 3, r = f % 3, neg = (3 - p) % 3 * 9 + (3 - q) % 3 * 3 + (3 - r) % 3;
+        if (f > neg) continue;
+        for (int t = 0; t < 27; t++) {
+            const double ph = 2.0 * M_PI * ((p * (t / 9) + q * (t / 3 % 3) + r * (t % 3)) % 3) / 3.0;
+            cs[0][nf][t] = (float)cos(ph); cs[1][nf][t] = (float)sin(ph);
+        }
+        w[nf++] = f == neg ? 1.f : 2.f;
+    }
+    CK(cudaMemcpyToSymbol(c_mc_cs, cs, sizeof cs)); CK(cudaMemcpyToSymbol(c_mc_w, w, sizeof w));
+    done[cur_dev()] = 1;
+}
+__device__ __forceinline__ void mc_part(double a, double *part) {   /* block sum into part[conv * 32 + block] */
+    __shared__ double r[256];
+    r[threadIdx.x] = a; __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) part[blockIdx.y * 32 + blockIdx.x] = r[0];
+}
+__device__ __forceinline__ double mc_total(const double *part) { double s = 0; for (int j = 0; j < 32; j++) s += part[blockIdx.y * 32 + j]; return s; }
+__global__ void muonc_dft_k(const muonc_desc_t *d, int f, double *part) {   /* the frequency-f block of every conv, embedded */
+    const muonc_desc_t D = d[blockIdx.y];
+    const int T = D.k * D.k * D.k, ld = 2 * D.n; const size_t np = (size_t)D.Co * D.Ci; const float nrm = rsqrtf((float)T);
+    double a = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < np; i += (size_t)gridDim.x * blockDim.x) {
+        const float *u = D.U + i * T; float re = 0.f, im = 0.f;
+        if (T == 1) re = u[0];
+        else for (int t = 0; t < 27; t++) { re += u[t] * c_mc_cs[0][f][t]; im -= u[t] * c_mc_cs[1][f][t]; }
+        re *= nrm; im *= nrm;
+        int r = (int)(i / D.Ci), c = (int)(i % D.Ci);
+        if (D.tr) { const int t = r; r = c; c = t; im = -im; }   /* the conjugate transpose: B~[ci][co] = conj B[co][ci] */
+        D.EX[(size_t)r * ld + c] = re; D.EX[(size_t)r * ld + D.n + c] = -im;
+        D.EX[(size_t)(D.m + r) * ld + c] = im; D.EX[(size_t)(D.m + r) * ld + D.n + c] = re;
+        a += (double)re * re + (double)im * im;
+    }
+    mc_part(a, part);
+}
+__global__ void muonc_norm_k(const muonc_desc_t *d, const double *part) {   /* X0 = B / (|B|_F + 1e-8), the complex norm */
+    const muonc_desc_t D = d[blockIdx.y]; const float inv = (float)(1.0 / (sqrt(mc_total(part)) + 1e-8));
+    const size_t n = (size_t)4 * D.m * D.n;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.EX[i] *= inv;
+}
+__global__ void muonc_idft_k(const muonc_desc_t *d, int f, int swap, int first) {   /* O (+)= the frequency's share of the inverse DFT */
+    const muonc_desc_t D = d[blockIdx.y]; const float *E = swap ? D.EY : D.EX;
+    const int T = D.k * D.k * D.k, ld = 2 * D.n; const size_t np = (size_t)D.Co * D.Ci;
+    const float sc = (T == 1 ? 1.f : c_mc_w[f]) * rsqrtf((float)T);
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < np; i += (size_t)gridDim.x * blockDim.x) {
+        int r = (int)(i / D.Ci), c = (int)(i % D.Ci);
+        if (D.tr) { const int t = r; r = c; c = t; }
+        const float pr = E[(size_t)r * ld + c], pi = D.tr ? -E[(size_t)(D.m + r) * ld + c] : E[(size_t)(D.m + r) * ld + c];
+        float *o = D.O + i * T;
+        if (T == 1) o[0] = (first ? 0.f : o[0]) + sc * pr;
+        else for (int t = 0; t < 27; t++) o[t] = (first ? 0.f : o[t]) + sc * (pr * c_mc_cs[0][f][t] - pi * c_mc_cs[1][f][t]);
+    }
+}
+__global__ void mopt_sumsq_k(const muon_desc_t *d, int which, double *part) {   /* which: 0 X, 1 Y, -1 the weights */
+    const muon_desc_t D = d[blockIdx.y]; const float *x = which < 0 ? D.p : which ? D.Y : D.X; const size_t n = (size_t)D.Co * D.K;
+    double a = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) a += (double)x[i] * x[i];
+    mc_part(a, part);
+}
+__global__ void hb_rinit_k(const int *hb, float *R, const double *part) {   /* R = |W|_F where not yet set; one block per conv */
+    const int c = blockIdx.x; if (threadIdx.x || !hb[c] || R[c] > 0.f) return;
+    double s = 0; for (int j = 0; j < 32; j++) s += part[c * 32 + j];
+    R[c] = (float)sqrt(s);
+}
+__global__ void mopt_apply_k(const muon_desc_t *d, int swap, int mc, const int *hb, const float *R, const double *po, double *pw,
+                             float lr, float wd, float hb_lr) {
+    const muon_desc_t D = d[blockIdx.y]; const float *O = swap ? D.Y : D.X; const size_t n = (size_t)D.Co * D.K;
+    const double so = mc_total(po);
+    double a = 0;
+    if (hb && hb[blockIdx.y]) {   /* trial point W - eta R O / |O|; its norm for the projection */
+        const float st = (float)((double)hb_lr * R[blockIdx.y] / fmax(sqrt(so), 1e-30));
+        for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) { const float w = D.p[i] - st * O[i]; D.p[i] = w; a += (double)w * w; }
+    } else {
+        float scale = sqrtf(fmaxf(1.f, (float)D.Co / (float)D.K));   /* Muon (as bmuon_apply_k) */
+        if (mc) {
+            const double nk = (double)D.Co * D.K, tgt = sqrt(fmax(1.0, (double)D.Co / D.K)) * sqrt(fmin((double)D.Co, (double)D.K) / nk);
+            scale = (float)(tgt / (sqrt(so / nk) + 1e-8));
+        }
+        for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.p[i] = D.p[i] * (1.f - lr * wd) - lr * scale * O[i];
+    }
+    mc_part(a, pw);
+}
+__global__ void hb_proj_k(const muon_desc_t *d, const int *hb, const float *R, const double *pw) {   /* back onto the sphere |W|_F = R */
+    if (!hb[blockIdx.y]) return;
+    const muon_desc_t D = d[blockIdx.y]; const size_t n = (size_t)D.Co * D.K;
+    const float s = (float)(R[blockIdx.y] / fmax(sqrt(mc_total(pw)), 1e-30));
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.p[i] *= s;
+}
+extern "C" void nn_muon_ext_batch(const void *descs, int nconv, int maxco, int maxk, const void *mcd, const void *nsd, int k, int ns_maxm, int ns_maxn,
+                                  const int *hb, float *R, int r_init, double *part, float lr, float beta, float wd, float hb_lr) {
+    const muon_desc_t *d = (const muon_desc_t *)descs;
+    double *pa = part, *pb = part + (size_t)32 * nconv;
+    dim3 g1(32, 1, nconv), g2(32, nconv);
+    int swap;
+    cudaMemsetAsync(pa, 0, (size_t)nconv * sizeof(double));   /* bmuon_mom_k's Frobenius sums (one per conv) */
+    bmuon_mom_k<<<g1, 256>>>(d, beta, pa);   /* X = the Nesterov momentum */
+    if (!mcd) { bmuon_scale_k<<<g1, 256>>>(d, pa); swap = ns5_batch(d, nconv, maxco, maxk); }
+    else {   /* Muon-C: frequency by frequency, the direction accumulates in Y */
+        mc_tables();
+        const muonc_desc_t *m = (const muonc_desc_t *)mcd; const muon_desc_t *s = (const muon_desc_t *)nsd;
+        const int nf = k == 3 ? 14 : 1;   /* one kernel size for the whole table: 3 or 1 */
+        for (int f = 0; f < nf; f++) {
+            muonc_dft_k<<<g2, 256>>>(m, f, pa);
+            muonc_norm_k<<<g2, 256>>>(m, pa);
+            muonc_idft_k<<<g2, 256>>>(m, f, ns5_batch(s, nconv, ns_maxm, ns_maxn), f == 0);
+        }
+        swap = 1;
+    }
+    if (r_init) { mopt_sumsq_k<<<g2, 256>>>(d, -1, pb); hb_rinit_k<<<nconv, 32>>>(hb, R, pb); }
+    mopt_sumsq_k<<<g2, 256>>>(d, swap, pa);
+    mopt_apply_k<<<g2, 256>>>(d, swap, mcd != nullptr, hb, R, pa, pb, lr, wd, hb_lr);
+    if (hb) hb_proj_k<<<g2, 256>>>(d, hb, R, pb);
     KCHECK();
 }
 __constant__ float c_anvil_maps[6][3] = {{3.923798038567f, -6.095026865488f, 3.905234618423f}, {3.278126713798f, -3.328923386476f, 0.989127286973f},

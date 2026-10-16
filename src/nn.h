@@ -327,6 +327,14 @@ void nn_adamw(float *p, const float *g, float *m, float *v, size_t n, float lr, 
 void nn_muon(float *p, const float *g, float *mom, int Co, int K, float lr, float beta, float wd, float *work);
 /* batched Muon over nconv weights: descs is a device array of {float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K;} (X, Y: Co K floats; A, B: Co Co) */
 void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta, float wd);
+/* Muon variants over the same table (train --muon-c / --hyperball; see nn_opt.cu). mcd: nullptr (the Muon direction) or a device
+   array of nconv {const float *U; float *O; float *EX, *EY; int Co, Ci, k, m, n, tr;} (U = the entry's X, O = its Y; EX, EY:
+   4 m n floats each, m = min(Co, Ci), n = max(Co, Ci), tr = Co > Ci) with nsd the matching Newton-Schulz table {.., X = EX,
+   Y = EY, A, B (4 m^2 floats each), Co = 2m, K = 2n}, k the kernel size of every entry (3 or 1), ns_maxm / ns_maxn the largest
+   2m / 2n. hb: nullptr or nconv device flags (1: the Hyperball step with radius R[i], eta = hb_lr, no decay); r_init: first set
+   R[i] = |W_i|_F where R[i] <= 0. part: >= 64 nconv doubles of scratch. */
+void nn_muon_ext_batch(const void *descs, int nconv, int maxco, int maxk, const void *mcd, const void *nsd, int k, int ns_maxm, int ns_maxn,
+                       const int *hb, float *R, int r_init, double *part, float lr, float beta, float wd, float hb_lr);
 /* ANVIL II over nconv weights: descs {float *p; const float *g; float *v0, *X, *Y, *A, *B, *v1, *E, *R; int Co, K;} (E, R: Co floats) */
 void nn_anvil_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta_fast, float beta_slow, float w_fast, float mu, float beta2, float wd);
 void nn_ema(float *ema, const float *p, size_t n, float decay);

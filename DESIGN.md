@@ -2229,6 +2229,28 @@ parallel (batch 1 each), so the per-GPU limit is the window limit.
   done: peak F1 0.307 (lr 0.01), 0.296 (0.02), 0.290 (0.05); validation loss 0.870 / 0.872 / 0.866. Note the AdamW
   arm scored below the agent's earlier AdamW reference (0.262 at 0.5), so seed variance is large at 6000 steps, but
   the Muon margin is far outside it. Step cost: +11-15% at 64^3-96^3 (255 small launches per step), ~5% at 128^3.
+- Muon variants (2026-10-15; `train --opt muon --muon-c 1 --hyperball 1`, either alone or both; `nn_muon_ext_batch`,
+  `tests/test_muonc.c`; both 0 = Muon bit for bit, the old code path):
+  - Muon-C (Qing & Li, arXiv 2609.09676): the Nesterov momentum of each 3^3 kernel goes through the orthonormal 3^3 DFT
+    over the kernel axes (the paper's critical grid, extended to 3D: one Co x Ci channel-transfer block per kernel
+    frequency, a bijection on the 27 taps, so the inverse lands exactly on the kernel support); each block is
+    polarised on its own by complex Newton-Schulz (5 iterations, Muon's coefficients, X0 = B / (|B|_F + 1e-8), blocks
+    with more rows than columns as their conjugate transpose), and the inverse DFT gives a real update. Conjugate
+    symmetry leaves 14 of the 27 frequencies to polarise. A complex block runs as its real embedding [[Xr, -Xi],
+    [Xi, Xr]] through Muon's batched products (exact: a *-homomorphism), one frequency at a time over all convs.
+    Routing as the paper (every kernel larger than 1x1, strided ones included: the stem, the down convs). Scale:
+    the paper's matched applied-update RMS against unfolded Muon (the RMS of exact-polar Muon for that conv,
+    sqrt(min(Co, K) / (Co K)) for Co <= K), so `--muon-lr` keeps its meaning and the A/B compares geometry only.
+    No new state. Cost: ~6x Muon's orthogonalisation products (embedding doubles both dimensions).
+  - Hyperball (Wen, Dang, Lyu, Ma & Liang, arXiv 2606.16899): W <- R Normalize(W - eta R Normalize(u)) with R the
+    conv's |W|_F at its first Hyperball step (the initialisation) and u the Muon or Muon-C direction; no weight decay
+    on those convs. Applied to the convs whose output goes through a GroupNorm (the paper's scale-invariant
+    matrices): all Muon convs except the down convs of a net without down_norm. eta = `--hb-lr-mult` x the
+    scheduled Muon lr; the default 1/sqrt(2) makes the first step Muon's relative length (Kaiming init: |W|_F =
+    sqrt(2 Co), Muon's step lr sqrt(Co) for Co <= K), while Muon's later steps shrink as |W| grows and Hyperball's do
+    not. The radii are checkpointed (`"hb_R"` in the header) so a resumed run continues on the same spheres.
+    With a level-0 norm that is not a live GroupNorm (`--l0-norm none / ema`) the level-0 convs are not scale
+    invariant: exempt them too when that work is merged.
 - r10 (2026-10-01 13:10): configs/all2.json (17 sources, full chunk prefetch, 1.1 um scan from level 2), down_norm,
   Muon lr 0.01, `--sched wsd --cooldown 0.2`, 200k steps at 128^3, effective batch 2 on both GPUs. Scored against
   the r8 baseline on all 17 held-out boxes when done.
