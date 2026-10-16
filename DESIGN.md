@@ -312,6 +312,11 @@ ResEnc-style network changes (residual coarse blocks, lighter decoder, frozen or
   (nn_add_into_act; it was the only stochastically rounded forward store). P512, 7 levels 16..256 (trainer planner / device peak):
   none 12.7M params 36.5 B per voxel 4.56 GB; 0,0,1,1,1,1,1 19.4M 37.6 / 4.92; 0,1,2,3,3,3,3 32.8M 42.2 / 5.90;
   0,2,3,5,5,5,5 (ResEnc-L counts) 46.1M 45.5 / 6.73.
+- ResEnc A/B on that chain (desk, production recipe: 2.4 um side labels, P512, 2000 steps, seed 1, --det 1; EMA validation loss at
+  500 / 1000 / 1500 / 2000): none 0.6944 / 0.6698 / 0.6577 / 0.6505; 0,1,2,3,3,3,3 0.6946 / 0.6704 / 0.6591 / 0.6525;
+  0,2,3,5,5,5,5 0.6917 / 0.6695 / 0.6580 / 0.6527. A tie: the same recipe's baseline run by another worker (identical arguments,
+  the same losses to step 40, apart from step 60: atomic-order reductions) ended at 0.6539, so run-to-run noise alone is ~0.003.
+  Not adopted (+16-25% memory, 2.6-3.6x the parameters).
 - Winding phase (after upstream lasagna's cos target, made signed): `band_field_phase` (src/band.c) gives every voxel between
   two labelled consecutive rectos the fraction of the way outward from the recto it lies outward of to the next one (x252;
   0 on a recto, 126 midway, wrapping to 0 at the next recto). The midpoints are the neighbour pairs on opposite sides whose
