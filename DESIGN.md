@@ -35,6 +35,51 @@ User: "I want all the augs we can get" (robustness to other scrolls, scanners, r
   other writer cases.
 - In-domain cost of `--aug all` (paired 2000-step run against `none`): pending.
 
+## Level-0 normalisation alternatives: train --l0-norm gn|none|ema|ws|slab (2026-10-15)
+Every GroupNorm normalises over the whole window, so each level-0 norm is a whole-window barrier for a z-slab pipeline (level-0 slab
+recompute stops at ~25 B / voxel). `--l0-norm` replaces the four level-0 norms (enc[0] n1 n2, dec[0] n1 n2 = the head's input; down
+norms stay GroupNorm); the mode (and its state) is in the checkpoint header, predict follows it. gn (default) is bit-identical.
+- none: gamma, beta + SiLU, statistics mean 0 / rstd 1 (the convs skip their statistics); the GroupNorm backwards drop the statistics'
+  terms (nn_set_gn_const: the group sums scaled by 0).
+- ema: BatchNorm-style running statistics (--l0-mom 0.01), live GroupNorm through a warm-up (--l0-warm 100), then constants in forward
+  and backward. The EMA weights need their own: unet_ema's first-order blend is not enough (val 0.770 at 2000 vs 0.669 recalibrated),
+  so the trainer recalibrates them before each validation from --l0-recal 4 training windows (own deterministic sampler).
+- ws: none + scaled weight standardisation of the four level-0 3^3 convs per output channel over its fan-in, from the fp32 master
+  weights every forward (into a copy the kernels read; their fp4 / fp8 prep as before), the convs reading SiLU outputs with the
+  NF-net gain 1 / std(silu(z)) = 1.67, the stem 1; the backward maps the gradient through the standardisation.
+- slab: GroupNorm statistics per z-slab of --l0-slab planes (64). A prototype without kernel changes: each level-0 tensor is
+  normalised in place with its slabs' statistics (MX: a pseudo-sample shape, one channel block, so (sample, slab) is a sample of the
+  same layout; lp_mx_affine), the readers apply gamma, beta + SiLU as none; the backward runs over the pseudo shape, then multiplies
+  by the slab's rstd. It costs an extra rounding of each normalised tensor and of its gradient, extra passes, and the three-buffer
+  layout (its head-recomputing GN backward wants per-sample statistics).
+Tests: test_l0_norm; UFSM_L0_NORM=1..4 test_unet (finite differences through each mode), 1..3 test_grad_mx4.
+A/B on the desk (production recipe: 2.4 um side labels, 7 levels 16..256, P512, Muon, 2000 steps, --det 1, the same 8 holdout
+windows: --val-seed 1; val = loss, EMA weights as the trainer reports it / live weights from the checkpoints, resumed for one lr-0 step):
+
+| arm | val 500 / 1000 / 1500 / 2000 (EMA) | live 1000 / 2000 |
+|---|---|---|
+| gn seed 1 | .6909 / .6681 / .6576 / .6502 | .6512 / .6441 |
+| gn seed 2 | .7054 / .6817 / .6631 / .6559 | .6562 / .6471 |
+| none | .8493 / .6944 / .6753 / .6734 | .6708 / .6710 |
+| ema (raw first-order EMA-weight statistics) | .9831 / .9652 / .8612 / .7698 | .6677 / .6625 |
+| ema, recalibrated (4 / 16 windows) | 1000: .6967 / .7081, 2000: .6687 / .6667 | |
+| ws seed 1 | .7818 / .6842 / .6687 / .6634 | .6659 / .6520 |
+| ws seed 2 | .7070 / .6637 / .6734 / .6594 | .6618 / .6600 |
+| slab, 64 planes (prototype) | .6901 / .6707 / .6625 / .6553 | .6519 / .6492 |
+| slabfull, one 512-plane slab (= GroupNorm + the prototype's roundings: the control) | .7014 / .6749 / .6583 / .6540 | .6570 / .6491 |
+Seed spread (gn): 0.006 (EMA) / 0.003 (live) at 2000. Every statistics-free mode loses by several spreads: none +0.023 / +0.027,
+ema +0.017 recalibrated / +0.018 live, ws +0.008 / +0.010 (two seeds each side). Slab statistics cost nothing measurable: slab vs its
+control +0.001 / 0.000; the prototype's extra roundings ~+0.004 / +0.005 vs gn (the control; about one seed spread). Device peak per
+process 4562 MiB (gn, none, ema), 4612 (ws), 5716 (slab: four level-0 buffers, planner 46.1 vs 36.5 B / voxel); samp/s were measured
+two arms per GPU only (gn pair 0.70 each, slab pair 0.62 each).
+Slab-local GroupNorm as a production design (if its arm holds): fold it into the kernels instead of the prototype's extra passes --
+the statistics-producing epilogues (stem fp8, fp4 16-channel convs, the up conv) sum per (sample, group, z / S) (4-plane tiles never
+cross a slab), the readers' staging takes the affine per (channel, input plane) (a tile's 6 input planes span at most 2 slabs: two
+coefficient sets per channel), the GroupNorm backwards (and the head-recomputing one) reduce per slab. With S equal to the pipeline's
+slab, a level-0 slab pipeline needs only a one-slab lag (the halo plane of slab k + 1 is final once that slab's conv1 ran) and the
+backward streams per slab (only parameter gradients reduce over the window): the barrier behind ~25 B / voxel is gone. Seams at slab
+borders (statistics jump) are the risk to watch (a random z-offset of the slab grid per training window would hide the grid).
+
 ## Trainer host RAM: packed targets, validation windows on disk (2026-10-15)
 At P768 the laptop trainer (production net, 6 workers, 7 slots, 4.8 um rv48 side labels) was OOM-killed by the 37.6 GiB slice cap
 before its first step (38.3 GB RSS): host RAM, not the GPU, bound the window. Per voxel the host held 5 B per sampler slot (CT fp16,
