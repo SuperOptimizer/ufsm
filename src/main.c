@@ -1170,7 +1170,8 @@ static int cmd_side_votes(int argc, char **argv) {
    a reference winding raster (codes: raster --value / the published band codes; winding: phase-raster --winding 1, dense), written
    as <out-dir>/<name> (x / y / z copied, q.tif float32, NaN where dropped or unassigned) for `ufsm raster --value q.tif`; one line
    per surface on stdout and in <out-dir>/assign.jsonl. --tol: label voxels from the reference that count as on it; --vol-um: the
-   surfaces' scan voxel; --axis-um: the axis JSON's voxel (default --vol-um). */
+   surfaces' scan voxel; --axis-um: the axis JSON's voxel (default --vol-um); --out-um: the voxel of the written coordinates (default
+   --vol-um; the reference's --ref-um puts them on its grid for raster --value and codes-merge). */
 typedef struct { z3 *z; int kind; } wa_ref;
 typedef struct { int64_t key; size_t i; } wa_pt;
 static int cmp_wa_pt(const void *a, const void *b) { const int64_t x = ((const wa_pt *)a)->key, y = ((const wa_pt *)b)->key; return x < y ? -1 : x > y; }
@@ -1245,7 +1246,9 @@ static int cmd_wind_assign(int argc, char **argv) {
         if (wind_assign(xyz, valid, w, h, wa_axis_fn, &A, wa_lookup, &R, p, &r)) { fprintf(stderr, "wind-assign: out of memory\n"); return 1; }
         const char *base = strrchr(argv[a], '/'); base = base && base[1] ? base + 1 : argv[a];
         char od[1400], qp[1500]; snprintf(od, sizeof od, "%s/%s", argv[4], base);
-        if (tifxyz_write(od, w, h, X, Y, Z, 1.0, vol_um, -1, "ufsm wind-assign (x / y / z of the input; q.tif: the winding in the reference's gauge)")) { fprintf(stderr, "wind-assign: cannot write %s\n", od); rc = 1; }
+        const double out_um = atof(opt(argc, argv, "--out-um", opt(argc, argv, "--vol-um", "2.4"))), f = vol_um / (out_um > 0 ? out_um : vol_um);   /* --out-um: coordinates in that voxel (e.g. the reference grid's, for raster --value) */
+        if (f != 1.0) for (size_t i = 0; i < N; i++) if (valid[i]) { X[i] = (float)(X[i] * f); Y[i] = (float)(Y[i] * f); Z[i] = (float)(Z[i] * f); }
+        if (tifxyz_write(od, w, h, X, Y, Z, 1.0, out_um > 0 ? out_um : vol_um, -1, "ufsm wind-assign (x / y / z of the input; q.tif: the winding in the reference's gauge)")) { fprintf(stderr, "wind-assign: cannot write %s\n", od); rc = 1; }
         snprintf(qp, sizeof qp, "%s/q.tif", od);
         if (tiffw_write(qp, w, h, 3, r.q, 1)) { fprintf(stderr, "wind-assign: cannot write %s\n", qp); rc = 1; }
         size_t nq = 0, nf[5] = {0}; for (size_t i = 0; i < N; i++) { nq += !isnan(r.q[i]); nf[r.flag[i]]++; }
