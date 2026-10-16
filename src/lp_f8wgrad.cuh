@@ -1,8 +1,10 @@
 #pragma once
 /* kernels and launchers of lp_f8wgrad (instantiated per type in lp_f8wgrad_i*.cu) */
 #include "lp_common.cuh"
-
 #include "lp_sr.cuh"   /* sr_e4m3x: the gy operand's exact stochastic rounding (MX-sourced gy: off the grid only below 2^-6 after the block scale, rare) */
+#ifndef BW8F_MINB
+#define BW8F_MINB BW8_MINB   /* blocks per SM of the network input conv's FAST path */
+#endif
 
 /* ======================= FP8 weight gradient, k=3, stride 1 =======================
    Block = 9 warps; warp w owns the tap row (kz, ky) = (w/3, w%3) and all three kx, so one pair of 32-bit loads of
@@ -14,7 +16,7 @@
    Smem: X ring fp8 [ci][4 planes][10 rows][24 B], position p of a row at byte 3 + p so that x = ox0.. is 4-aligned
          (ci stride 1040 B = 260 words == 4 mod 32 -> conflict-free fragment loads), GY tile fp8 [co][16 rows][16 B] (co stride 272 B, ldmatrix conflict-free) + scales. */
 template <int MT, int NT, typename T, typename TG, int FAST = 0>   /* FAST: the network input conv's path, 4 or 8 = the real x channels */
-__global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
+__global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f8_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
                                                        int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp, int ZC, int coop) {
     constexpr int CH = 8 * NT, BMo = 16 * MT;
     extern __shared__ __align__(128) unsigned char smem_raw[];
@@ -102,8 +104,9 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
         const bool fast = uni && !upt && (coop & 3) == 3 && ((co0 % mx_bw(Co)) + BMo <= mx_bw(Co) || (co0 == 0 && mx_bw(Co) < BMo && Co <= mx_bw(Co)));   /* (or one
                                                                                                      block narrower than the tile: 8 channels) */
         if (!fast) __trap();   /* the host only picks FAST for these */
-        float *mqs = (float *)(amx + 2 * CH);   /* [2][CH] x plane multipliers */
-        uint8_t *graw = smem_raw + (((unsigned char *)(mqs + 2 * CH) - smem_raw + 15) & ~15);   /* [256 voxels][BMo] raw gy (e4m3) */
+        /* amx: [2 buffers][2 planes][CH] plane amaxes (the z-steps alternate buffers: a buffer is reset after the barrier that ends its
+           readers and reused two z-steps later, past the next z-step's first barrier) */
+        uint8_t *graw = smem_raw + (((unsigned char *)(amx + 4 * CH) - smem_raw + 15) & ~15);   /* [256 voxels][BMo] raw gy (e4m3) */
         uint8_t *gscl = graw + 256 * BMo;                                                           /* [256] gy scale bytes */
         constexpr int XW = IS_MX4(T) ? 1 : 2;   /* 32-bit words of the 8-channel x row */
         const chan_t c0 = ctab8[0];
@@ -136,8 +139,10 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
             for (int k = threadIdx.x; k < (CH - XC) * X8_CS; k += blockDim.x) sxq[XC * X8_CS + k] = 0;
             if (threadIdx.x < (CH - XC) * 4) sxs[XC * 4 + threadIdx.x] = (uint8_t)(-126 + 127);
         }
-        auto xstage = [&](int gz0) {   /* planes gz0, gz0 + 1 from xr: decode, transform, plane amax (amx[pl]), e4m3 into the ring */
-            float v[2][XC];
+        /* the new planes gz0, gz0 + 1 from xr, in two halves around one barrier: xreduce decodes and transforms them and red.shared's
+           the per-(plane, channel) amaxes into amx buffer b; after the barrier xstore takes the scales (lanes < 2 XC, shuffled to the
+           warp) and writes the e4m3 bytes into the ring */
+        auto xdecode = [&](float (&v)[2][XC]) {
 #pragma unroll
             for (int pl = 0; pl < 2; pl++) {
 #pragma unroll
@@ -159,6 +164,8 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
                     for (int q = 0; q < XC; q++) { const chan_t &cq = ctab8[q]; v[pl][q] = cq.p ? act_ab(v[pl][q], cq.a, cq.b, Gany && cq.g) : 0.f; }
                 }
             }
+        };
+        auto xreduce = [&](const float (&v)[2][XC], int b) {
             unsigned ra[2][XC];
 #pragma unroll
             for (int pl = 0; pl < 2; pl++)
@@ -168,22 +175,25 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
 #pragma unroll
                 for (int pl = 0; pl < 2; pl++)
 #pragma unroll
-                    for (int q = 0; q < XC; q++) asm volatile("red.shared.max.u32 [%0], %1;" :: "r"((unsigned)__cvta_generic_to_shared(&amx[pl * CH + q])), "r"(ra[pl][q]) : "memory");
+                    for (int q = 0; q < XC; q++) asm volatile("red.shared.max.u32 [%0], %1;" :: "r"((unsigned)__cvta_generic_to_shared(&amx[(b * 2 + pl) * CH + q])), "r"(ra[pl][q]) : "memory");
             }
-            __syncthreads();
-            if (tid < 2 * XC) {
-                const int pl = tid / XC, q = tid % XC;
-                const int e = mx_exp(__uint_as_float(amx[pl * CH + q]), 1.f / 448.f);
-                mqs[pl * CH + q] = exp2i(-e);
-                sxs[q * 4 + ((gz0 + pl + 1) & 3)] = (uint8_t)(e + 127);
-            }
-            __syncthreads();
+        };
+        auto xstore = [&](const float (&v)[2][XC], int gz0, int b) {
+            const int lp = lane < 2 * XC ? lane : 0, lpl = lp / XC, lq = lp % XC;
+            const int e = mx_exp(__uint_as_float(amx[(b * 2 + lpl) * CH + lq]), 1.f / 448.f);
+            const float ml = exp2i(-e);
+            if (warp == 0 && lane < 2 * XC) sxs[lq * 4 + ((gz0 + lpl + 1) & 3)] = (uint8_t)(e + 127);
+            float mq[2][XC];
+#pragma unroll
+            for (int pl = 0; pl < 2; pl++)
+#pragma unroll
+                for (int q = 0; q < XC; q++) mq[pl][q] = __shfl_sync(0xffffffffu, ml, pl * XC + q);
             if (tid < 180) {
 #pragma unroll
                 for (int pl = 0; pl < 2; pl++) {
                     uint8_t *dst = sxq + ((gz0 + pl + 1) & 3) * X8_PS + xrow * 24 + 3 + xp;
 #pragma unroll
-                    for (int q = 0; q < XC; q++) dst[q * X8_CS] = cvt_e4m3(v[pl][q] * mqs[pl * CH + q]);
+                    for (int q = 0; q < XC; q++) dst[q * X8_CS] = cvt_e4m3(v[pl][q] * mq[pl][q]);
                 }
             }
         };
@@ -254,20 +264,29 @@ __global__ void __launch_bounds__(288, BW8_MINB) conv_bwd_w_f8_k(const T *__rest
             }
         };
         const int zt_end = min(nzt, (zc + 1) * ZC);
+        /* two barriers per z-step: B2 after the x amax reductions (graw landed, every warp past the previous MMA: the ring slots and
+           the gy tile may be rewritten), B4 after the staging (the MMA's operands complete) */
+        if (tid < 2 * CH) amx[2 * CH + tid] = 0u;   /* buffer 1 (buffer 0 was zeroed with the channel table) */
         xload(2 * zt_begin - 1);   /* the first z-step's two leading planes */
         gload(2 * zt_begin);
-        xstage(2 * zt_begin - 1);
-        __syncthreads();
-        if (tid < 2 * CH) amx[tid] = 0u;
+        {
+            float v[2][XC];
+            xdecode(v); xreduce(v, 0);
+            __syncthreads();
+            xstore(v, 2 * zt_begin - 1, 0);
+        }
         xload(2 * zt_begin + 1);
         for (int zt = zt_begin; zt < zt_end; zt++) {
-            const int oz0 = zt * 2;
+            const int oz0 = zt * 2, b = (zt - zt_begin + 1) & 1;
+            float v[2][XC];
+            xdecode(v); xreduce(v, b);
             asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-            __syncthreads();   /* the previous MMA is done with the ring slots and the gy tile; amx is reset; graw has landed */
-            xstage(oz0 + 1);
+            __syncthreads();   /* B2: amx[b] complete; graw has landed; every warp is past the previous MMA */
+            if (zt == zt_begin && tid < 2 * CH) amx[tid] = 0u;   /* the prologue's buffer 0 (its readers are past B2) */
+            xstore(v, oz0 + 1, b);
             gstage(oz0);
-            __syncthreads();
-            if (tid < 2 * CH) amx[tid] = 0u;
+            __syncthreads();   /* B4 */
+            if (tid < 2 * CH) amx[b * 2 * CH + tid] = 0u;   /* reused two z-steps on, after the next B2 */
             if (zt + 1 < zt_end) { xload(oz0 + 3); gload(oz0 + 2); }
             mma_zstep(oz0);
         }
@@ -514,7 +533,8 @@ template <typename T, typename TG> void bwd_w_f8_t(const void *x, shape5 xs, con
     size_t smem = (size_t)8 * NT * X8_CS + 16 * MT * (G8_CS + 8) + 8 * NT * 4 + 16 * MT * 4 + 16 + 32 + (size_t)8 * NT * (sizeof(chan_t) + 8);   /* + MX x channel table, amax */
     /* z-steps per block: as many as possible (less halo restaging, fewer atomics) while keeping one full wave of blocks */
     int nzt = nblk_(ys.d, 2), base = (int)(((xs.c + 8 * NT - 1) / (8 * NT)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * nblk_(ys.w, 16) * nblk_(ys.h, 8) * ys.n);
-    int ZC = nzt < 12 ? nzt : 12;
+    const int zcap = xs.c <= 8 ? 48 : 12;   /* the network input conv: 48 z-steps (fewer halo restagings and gw atomics: P512 19.5 -> 18.2 ms) */
+    int ZC = nzt < zcap ? nzt : zcap;
     while (ZC > 1 && (size_t)base * nblk_(nzt, ZC) < 72) ZC--;
     if (getenv("UFSM_F8_ZC")) ZC = atoi(getenv("UFSM_F8_ZC"));
     int nzc = (nzt + ZC - 1) / ZC;
