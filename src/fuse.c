@@ -1,4 +1,6 @@
 #include "fuse.h"
+#include <pthread.h>
+#include <stdatomic.h>
 #include "band.h"
 #include <math.h>
 #include <stdlib.h>
@@ -27,8 +29,38 @@ void fuse_phase(const uint8_t *const *in, int n, size_t len, float tol_turns, ui
     if (stats) for (int k = 0; k < 4; k++) stats[k] += st[k];
 }
 
+typedef struct { const uint8_t *const *in; int nn; int64_t d0, d1, d2; int block, dup; int64_t b1, b2; size_t nb; const float *score; const uint64_t *bs, *bd, *beat;
+                 const int (*off)[3]; int no; uint8_t *out; atomic_size_t next; pthread_mutex_t mu; size_t st[3]; } rf_job;
+static void *rf_blocks(void *arg) {   /* blocks taken in turn; a block's voxels are written only by the thread holding it */
+    rf_job *J = arg; const uint8_t *const *in = J->in; const int nn = J->nn, block = J->block, no = J->no; const int64_t d0 = J->d0, d1 = J->d1, d2 = J->d2, b1 = J->b1, b2 = J->b2;
+    const float *score = J->score; const uint64_t *bs = J->bs, *bd = J->bd, *beat = J->beat; const int (*off)[3] = J->off; uint8_t *out = J->out; size_t st[3] = {0, 0, 0};
+    for (size_t b; (b = atomic_fetch_add(&J->next, 1)) < J->nb;) {
+        if (!bs[b]) continue;
+        const int64_t bz = (int64_t)(b / ((size_t)b1 * b2)), by = (int64_t)(b / b2 % b1), bx = (int64_t)(b % b2);
+        const int64_t z1 = (bz + 1) * block < d0 ? (bz + 1) * block : d0, y1 = (by + 1) * block < d1 ? (by + 1) * block : d1, x1 = (bx + 1) * block < d2 ? (bx + 1) * block : d2;
+        for (int64_t z = bz * block; z < z1; z++) for (int64_t y = by * block; y < y1; y++) for (int64_t x = bx * block; x < x1; x++) {
+            const size_t i = ((size_t)z * d1 + y) * d2 + x;
+            for (int k = 0; k < nn; k++) {
+                if (!(bs[b] >> k & 1) || !in[k][i]) continue;
+                if (!(bd[b] & ~(1ull << k))) { if (!out[i]) { out[i] = 255; st[1]++; } continue; }   /* no other set near */
+                const float sk = score[b * nn + k]; const int beatable = (int)(beat[b] >> k & 1); int beaten = 0, had_other = 0;
+                for (int t = 0; t < no && !beaten && !(had_other && !beatable); t++) {
+                    const int64_t zz = z + off[t][0], yy = y + off[t][1], xx = x + off[t][2];
+                    if (zz < 0 || zz >= d0 || yy < 0 || yy >= d1 || xx < 0 || xx >= d2) continue;
+                    const size_t j = ((size_t)zz * d1 + yy) * d2 + xx, bj = ((size_t)(zz / block) * b1 + yy / block) * b2 + xx / block;
+                    for (int o = 0; o < nn; o++) { if (o == k || !in[o][j]) continue; had_other = 1; if (!beatable) break;
+                        const float so = score[bj * nn + o]; if (so > sk || (so == sk && o < k)) { beaten = 1; break; } }
+                }
+                if (beaten) { st[2]++; continue; }
+                if (!out[i]) { out[i] = 255; st[had_other ? 0 : 1]++; }
+            }
+        }
+    }
+    pthread_mutex_lock(&J->mu); for (int k = 0; k < 3; k++) J->st[k] += st[k]; pthread_mutex_unlock(&J->mu);
+    return nullptr;
+}
 void fuse_recto(const uint8_t *const *in, int n, const uint8_t *ct, int64_t d0, int64_t d1, int64_t d2, int block, int dup,
-                uint8_t *out, size_t *stats) {
+                uint8_t *out, size_t *stats, int threads) {
     /* score[k][b]: the mean CT over set k's surface voxels in block b (its trace's fit to the papyrus ridge there); a surface voxel of
        set k is dropped when another set has a surface voxel within dup whose block score is higher (ties: the lower set index).
        Sparse: per block the sets present (bits); only blocks with a surface are visited, and a voxel whose neighbour blocks hold no
@@ -74,27 +106,12 @@ void fuse_recto(const uint8_t *const *in, int n, const uint8_t *ct, int64_t d0, 
                 for (int o = 0; o < nn && !can; o++) { if (o == k || !(bs[bj] >> o & 1)) continue; const float so = score[bj * nn + o]; can = so > sk || (so == sk && o < k); } }
             if (can) beat[b] |= 1ull << k; }
     }
-    for (int64_t bz = 0; bz < b0; bz++) for (int64_t by = 0; by < b1; by++) for (int64_t bx = 0; bx < b2; bx++) {
-        const size_t b = ((size_t)bz * b1 + by) * b2 + bx; if (!bs[b]) continue;
-        const int64_t z1 = (bz + 1) * block < d0 ? (bz + 1) * block : d0, y1 = (by + 1) * block < d1 ? (by + 1) * block : d1, x1 = (bx + 1) * block < d2 ? (bx + 1) * block : d2;
-        for (int64_t z = bz * block; z < z1; z++) for (int64_t y = by * block; y < y1; y++) for (int64_t x = bx * block; x < x1; x++) {
-            const size_t i = ((size_t)z * d1 + y) * d2 + x;
-            for (int k = 0; k < nn; k++) {
-                if (!(bs[b] >> k & 1) || !in[k][i]) continue;
-                if (!(bd[b] & ~(1ull << k))) { if (!out[i]) { out[i] = 255; st[1]++; } continue; }   /* no other set near */
-                const float sk = score[b * nn + k]; const int beatable = (int)(beat[b] >> k & 1); int beaten = 0, had_other = 0;
-                for (int t = 0; t < no && !beaten && !(had_other && !beatable); t++) {
-                    const int64_t zz = z + off[t][0], yy = y + off[t][1], xx = x + off[t][2];
-                    if (zz < 0 || zz >= d0 || yy < 0 || yy >= d1 || xx < 0 || xx >= d2) continue;
-                    const size_t j = ((size_t)zz * d1 + yy) * d2 + xx, bj = ((size_t)(zz / block) * b1 + yy / block) * b2 + xx / block;
-                    for (int o = 0; o < nn; o++) { if (o == k || !in[o][j]) continue; had_other = 1; if (!beatable) break;
-                        const float so = score[bj * nn + o]; if (so > sk || (so == sk && o < k)) { beaten = 1; break; } }
-                }
-                if (beaten) { st[2]++; continue; }
-                if (!out[i]) { out[i] = 255; st[had_other ? 0 : 1]++; }
-            }
-        }
-    }
+    rf_job J = {in, nn, d0, d1, d2, block, dup, b1, b2, nb, score, bs, bd, beat, off, no, out, 0, PTHREAD_MUTEX_INITIALIZER, {0, 0, 0}};
+    pthread_t th[16]; const int nt = threads < 1 ? 1 : threads > 16 ? 16 : threads; int k0 = 0;
+    for (; k0 < nt - 1 && pthread_create(&th[k0], nullptr, rf_blocks, &J) == 0; k0++) {}
+    rf_blocks(&J);
+    for (int t = 0; t < k0; t++) pthread_join(th[t], nullptr);
+    for (int k = 0; k < 3; k++) st[k] += J.st[k];
     free(off); free(beat);
     free(sum); free(cnt); free(score); free(bs); free(bd);
     if (stats) for (int k = 0; k < 3; k++) stats[k] += st[k];

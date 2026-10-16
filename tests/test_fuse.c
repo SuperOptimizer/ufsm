@@ -49,7 +49,7 @@ int main(void) {
             A[((size_t)30 * D + y) * D + x] = 255; Bs[((size_t)32 * D + y) * D + x] = 255; Bs[((size_t)50 * D + y) * D + x] = 255; }
         for (int order = 0; order < 2; order++) {
             const uint8_t *in[2] = {order ? Bs : A, order ? A : Bs}; size_t st[3] = {0};
-            fuse_recto(in, 2, ct, D, D, D, 32, 3, out, st);
+            fuse_recto(in, 2, ct, D, D, D, 32, 3, out, st, 3);
             size_t z30 = 0, z32 = 0, z50 = 0, other = 0;
             for (int z = 0; z < D; z++) for (int y = 0; y < D; y++) for (int x = 0; x < D; x++) { const uint8_t v = out[((size_t)z * D + y) * D + x]; if (!v) continue;
                 if (z == 30) z30++; else if (z == 32) z32++; else if (z == 50) z50++; else other++; }
@@ -66,7 +66,7 @@ int main(void) {
             for (int sheet = 0; sheet < 3; sheet++) { r = r * 6364136223846793005ull + 1; const int x0 = 8 + (int)(r >> 59) * 3 + sheet * 20 + k;   /* planes x ~ x0, some 1 voxel apart across sets */
                 for (int z = 0; z < d; z++) for (int y = (k * 9) % 30; y < d - (k * 7) % 25; y++) { const int x = x0 + ((z + y + k) % 7 == 0); if (x < d) ins[k][((size_t)z * d + y) * d + x] = 1; } } }
         size_t s1[3] = {0, 0, 0}, s2[3] = {0, 0, 0};
-        fuse_recto((const uint8_t *const *)ins, 4, ctr, d, d, d, 16, 3, o1, s1); recto_ref((const uint8_t *const *)ins, 4, ctr, d, 16, 3, o2, s2);
+        fuse_recto((const uint8_t *const *)ins, 4, ctr, d, d, d, 16, 3, o1, s1, 3); recto_ref((const uint8_t *const *)ins, 4, ctr, d, 16, 3, o2, s2);
         CHECK(!memcmp(o1, o2, len) && !memcmp(s1, s2, sizeof s1), "recto-fuse sparse vs dense: voxels %s, stats %zu/%zu/%zu vs %zu/%zu/%zu", memcmp(o1, o2, len) ? "differ" : "same", s1[0], s1[1], s1[2], s2[0], s2[1], s2[2]);
         printf("recto-fuse: sparse == dense reference on 4 random sheet sets (kept near another %zu, unique %zu, dropped %zu)\n", s1[0], s1[1], s1[2]);
         for (int k = 0; k < 4; k++) free(ins[k]);
