@@ -91,7 +91,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx_k(const uint8_t *x, 
    raw-word prefetch: accumulates sum t and sum t (x - mean) with t = gy (2 dsilu(u)) and finishes with the factors 1/2 and
    rstd / 2, so part[] holds the same sums (sum a, sum a xhat) as gn_silu_bwd_stats_mx_k. The generic kernel loaded six
    coefficients and decoded through per-element guards (issue-bound, ~2x its traffic floor). */
-template <int B, int HPB, bool FULL>
+template <int B, int HPB, bool FULL, int NK = 16>   /* NK: the channels of a FULL lane (16, or 8: a whole 8-channel tensor) */
 __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_k(const uint8_t *x, const uint8_t *gy, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                                             int N, int C, int G, size_t S, float *part) {
     const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G;
@@ -109,7 +109,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_k(const uint8_t *x,
     }
     w1[threadIdx.x >> 5][threadIdx.x & 31] = 0.f; w2[threadIdx.x >> 5][threadIdx.x & 31] = 0.f;
     __syncthreads();
-    const int kmax = FULL ? 16 : max(0, min(min(bw, C - blk * bw) - h0, 16));
+    const int kmax = FULL ? NK : max(0, min(min(bw, C - blk * bw) - h0, 16));
     const size_t rbase = ((size_t)n * nb + blk) * S;
     const uint8_t *sx = mx_sc<B>(x, N, C, S), *sg = mx_sc<4>(gy, N, C, S);
     const int rbx = mx_rb(bw, B), rbg = mx_rb(bw, 4);
@@ -134,13 +134,13 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_k(const uint8_t *x,
         if constexpr (B == 4) {
             const unsigned w4[2] = {cx.x, cx.y};
 #pragma unroll
-            for (int j = 0; j < 2; j++)
+            for (int j = 0; j < (FULL ? NK / 8 : 2); j++)
 #pragma unroll
                 for (int i = 0; i < 4; i++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * i)); r[8 * j + 2 * i] = a.x * fx; r[8 * j + 2 * i + 1] = a.y * fx; }
         } else {
             const unsigned w8[4] = {cx.x, cx.y, cx.z, cx.w};
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
+            for (int j = 0; j < (FULL ? NK / 4 : 4); j++) {
                 const float2 a = dec_e4m3x2((unsigned short)(w8[j] & 0xffff)), b2 = dec_e4m3x2((unsigned short)(w8[j] >> 16));
                 r[4 * j] = a.x * fx; r[4 * j + 1] = a.y * fx; r[4 * j + 2] = b2.x * fx; r[4 * j + 3] = b2.y * fx;
             }
@@ -148,13 +148,13 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_k(const uint8_t *x,
         {
             const unsigned w4[2] = {cg.x, cg.y};
 #pragma unroll
-            for (int j = 0; j < 2; j++)
+            for (int j = 0; j < (FULL ? NK / 8 : 2); j++)
 #pragma unroll
                 for (int i = 0; i < 4; i++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * i)); g[8 * j + 2 * i] = a.x; g[8 * j + 2 * i + 1] = a.y; }
         }
 #pragma unroll
         for (int k = 0; k < 16; k++) {
-            if (FULL || k < kmax) {
+            if (FULL ? k < NK : k < kmax) {
                 const float4 c4 = cf[h0 + k];
                 const float p = fmaf(r[k], c4.x, c4.y);
                 float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
@@ -242,7 +242,7 @@ __device__ __forceinline__ unsigned sr_e2m1_nib_fast(float vm, unsigned u16) {  
     const unsigned fl = __float_as_uint(__fadd_rz(tt + u1, 8388608.f));               /* 2^23 + floor(t + u): exact, t + u < 8 */
     return (fl & 7u) | (__float_as_uint(vm) >> 28 & 8u);
 }
-template <int B, int HPB, bool FULL>
+template <int B, int HPB, bool FULL, int NK = 16>   /* NK: the channels of a FULL lane (16, or 8: a whole 8-channel tensor) */
 __global__ void __launch_bounds__(256, 5) gn_silu_bwd_apply_mx2_k(const uint8_t *x, const uint8_t *gy, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                                             const float *AB, uint8_t *gx, int N, int C, int G, size_t S, unsigned gsr) {
     const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G, blk = blockIdx.y, n = blockIdx.z;
@@ -260,7 +260,7 @@ __global__ void __launch_bounds__(256, 5) gn_silu_bwd_apply_mx2_k(const uint8_t 
     /* persistent grid-stride rows (lp_gn_silu_bwd_apply_mx sizes the grid to the resident blocks) with the next row's loads in flight
        during this one's arithmetic (a row per thread left DRAM ~80% busy with ~85% of the issue slots taken); warp-uniform trips for
        the lane-pair shuffle, rows past S computed but not stored. Each row's arithmetic and SR keys as before: the same bits */
-    const int h = HPB == 2 ? (int)(threadIdx.x & 1) : 0, h0 = 16 * h, kmax = FULL ? 16 : max(0, min(min(bw, C - blk * bw) - h0, 16));
+    const int h = HPB == 2 ? (int)(threadIdx.x & 1) : 0, h0 = 16 * h, kmax = FULL ? NK : max(0, min(min(bw, C - blk * bw) - h0, 16));
     const size_t rb0 = ((size_t)n * nb + blk) * S, nv = (size_t)gridDim.x * (256 / HPB), lo = (size_t)((threadIdx.x & 31) / HPB);
     const int rbx = mx_rb(bw, B), rbg = mx_rb(bw, 4);
     const uint8_t *sx = mx_sc<B>(x, N, C, S), *sg = mx_sc<4>(gy, N, C, S);
@@ -284,13 +284,13 @@ __global__ void __launch_bounds__(256, 5) gn_silu_bwd_apply_mx2_k(const uint8_t 
         if constexpr (B == 4) {
             const unsigned w4[2] = {cx.x, cx.y};
 #pragma unroll
-            for (int j = 0; j < 2; j++)
+            for (int j = 0; j < (FULL ? NK / 8 : 2); j++)
 #pragma unroll
                 for (int q = 0; q < 4; q++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * q)); r[8 * j + 2 * q] = a.x * fx; r[8 * j + 2 * q + 1] = a.y * fx; }
         } else {
             const unsigned w8[4] = {cx.x, cx.y, cx.z, cx.w};
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
+            for (int j = 0; j < (FULL ? NK / 4 : 4); j++) {
                 const float2 a = dec_e4m3x2((unsigned short)(w8[j] & 0xffff)), b2 = dec_e4m3x2((unsigned short)(w8[j] >> 16));
                 r[4 * j] = a.x * fx; r[4 * j + 1] = a.y * fx; r[4 * j + 2] = b2.x * fx; r[4 * j + 3] = b2.y * fx;
             }
@@ -298,7 +298,7 @@ __global__ void __launch_bounds__(256, 5) gn_silu_bwd_apply_mx2_k(const uint8_t 
         {
             const unsigned w4[2] = {cg.x, cg.y};
 #pragma unroll
-            for (int j = 0; j < 2; j++)
+            for (int j = 0; j < (FULL ? NK / 8 : 2); j++)
 #pragma unroll
                 for (int q = 0; q < 4; q++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * q)); g[8 * j + 2 * q] = a.x; g[8 * j + 2 * q + 1] = a.y; }   /* raw; fg below */
         }
@@ -306,7 +306,7 @@ __global__ void __launch_bounds__(256, 5) gn_silu_bwd_apply_mx2_k(const uint8_t 
 #pragma unroll
         for (int k = 0; k < 16; k++) {
             out[k] = 0.f;
-            if (FULL || k < kmax) {
+            if (FULL ? k < NK : k < kmax) {
                 const float4 c4 = cf[h0 + k];
                 const float p = fmaf(r[k], c4.x, c4.y);
                 float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
@@ -318,9 +318,9 @@ __global__ void __launch_bounds__(256, 5) gn_silu_bwd_apply_mx2_k(const uint8_t 
         if (HPB == 2) am = max(am, __shfl_xor_sync(0xffffffffu, am, 1));
         const int e = mx_exp(__uint_as_float(am), mxf<4>::inv_qmax);
         const float m = exp2i(-e);
-        unsigned w[2];
+        unsigned w[2] = {0u, 0u};
 #pragma unroll
-        for (int j = 0; j < 2; j++) {
+        for (int j = 0; j < (FULL ? NK / 8 : 2); j++) {
             if (gsr) {
                 uint32_t hh[4]; sr_hash4(gsr, ri * 4 + 2 * h + j, hh);
                 unsigned wj = 0u;
@@ -666,6 +666,10 @@ extern "C" int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G,
     R->gy = gx; R->n = s.n; R->c = s.c; R->d = s.d; R->h = s.h; R->w = s.w; R->bw = bw; R->valid = 1;
     return 1;
 }
+/* 8-channel tensors (bw 8) take the FULL lane-per-row kernels with NK 8: the general ones guarded every channel and computed the
+   second, unstored SR word (P512 desk, 8-wide net level 0: apply 9.4 -> 6.0 ms, stats 4.5 -> 3.5 ms per call). Test hook: 0 the general ones */
+static int g_gn_full8 = 1;
+extern "C" void lp_set_gn_full8(int on) { g_gn_full8 = on; }
 extern "C" void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                   const void *gy, void *gx, int gdt, double *ds, float *st, float *AB) {
     /* ds: 2 N C doubles (zeroed here), st: 2 N C floats, AB: 2 N G floats; the caller finishes with the group sums / param grads */
@@ -685,11 +689,12 @@ extern "C" void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const
     const uint8_t *xq = (const uint8_t *)x;
     static int s2on = -1; if (s2on < 0) s2on = getenv("UFSM_GN_APPLY2") ? atoi(getenv("UFSM_GN_APPLY2")) : 1;
     if (s2on && gdt == 4) {   /* MX-fp4 gradients: lane-pair kernel */
-        const int full = bw >= 16 && s.c % bw == 0;
+        const int full = bw >= 16 && s.c % bw == 0, full8 = bw == 8 && s.c == 8 && g_gn_full8 != 0;
         const uint8_t *gyq = (const uint8_t *)gy;
 #define GBS3(B) do { if (bw == 32 && full) gn_silu_bwd_stats_mx2_k<B, 2, true><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
                      else if (bw == 32) gn_silu_bwd_stats_mx2_k<B, 2, false><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
                      else if (full) gn_silu_bwd_stats_mx2_k<B, 1, true><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
+                     else if (full8) gn_silu_bwd_stats_mx2_k<B, 1, true, 8><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part); \
                      else gn_silu_bwd_stats_mx2_k<B, 1, false><<<grid, 256>>>(xq, gyq, gamma, beta, mean, rstd, s.n, s.c, G, S, part); } while (0)
         if (xdt == 4) GBS3(4); else GBS3(8);
 #undef GBS3
@@ -733,12 +738,12 @@ static unsigned gn_pgrid(const void *k, size_t need, size_t ny) {
     size_t r = (size_t)b / ny; if (r < 1) r = 1;
     return (unsigned)(need < r ? need : r);
 }
-template <int B, int HPB, bool FULL>
+template <int B, int HPB, bool FULL, int NK = 16>
 static void gba2(const uint8_t *xq, const uint8_t *gyq, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *AB, uint8_t *gq,
                  shape5 s, int G, unsigned gsr) {
     const size_t S = shape_spatial(s);
-    const dim3 g2(gn_pgrid((const void *)gn_silu_bwd_apply_mx2_k<B, HPB, FULL>, (S * HPB + 255) / 256, (size_t)mx_nb(s.c) * s.n), (unsigned)mx_nb(s.c), (unsigned)s.n);
-    gn_silu_bwd_apply_mx2_k<B, HPB, FULL><<<g2, 256>>>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s.n, s.c, G, S, gsr);
+    const dim3 g2(gn_pgrid((const void *)gn_silu_bwd_apply_mx2_k<B, HPB, FULL, NK>, (S * HPB + 255) / 256, (size_t)mx_nb(s.c) * s.n), (unsigned)mx_nb(s.c), (unsigned)s.n);
+    gn_silu_bwd_apply_mx2_k<B, HPB, FULL, NK><<<g2, 256>>>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s.n, s.c, G, S, gsr);
 }
 extern "C" void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                         const void *gy, void *gx, int gdt, const float *AB, unsigned gsr) {
@@ -747,11 +752,12 @@ extern "C" void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G,
     const uint8_t *xq = (const uint8_t *)x;
     static int a2 = -1; if (a2 < 0) a2 = getenv("UFSM_GN_APPLY2") ? atoi(getenv("UFSM_GN_APPLY2")) : 1;
     if (a2 && gdt == 4) {   /* MX-fp4 gradients (the trainer default): lane-pair kernel */
-        const int bw = mx_bw(s.c), hpb = bw == 32 ? 2 : 1, full = bw >= 16 && s.c % bw == 0;
+        const int bw = mx_bw(s.c), hpb = bw == 32 ? 2 : 1, full = bw >= 16 && s.c % bw == 0, full8 = bw == 8 && s.c == 8 && g_gn_full8 != 0;
         uint8_t *gq = (uint8_t *)gx; const uint8_t *gyq = (const uint8_t *)gy;
 #define GBA2(B) do { if (hpb == 2 && full) gba2<B, 2, true>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s, G, gsr); \
                      else if (hpb == 2) gba2<B, 2, false>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s, G, gsr); \
                      else if (full) gba2<B, 1, true>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s, G, gsr); \
+                     else if (full8) gba2<B, 1, true, 8>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s, G, gsr); \
                      else gba2<B, 1, false>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s, G, gsr); } while (0)
         if (xdt == 4) GBA2(4); else GBA2(8);
 #undef GBA2
