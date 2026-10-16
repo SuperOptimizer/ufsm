@@ -851,6 +851,10 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
                             v[r][4 * w + 2] = fmaf(1.f, d1.x * sc, 0.f); v[r][4 * w + 3] = fmaf(1.f, d1.y * sc, 0.f);
                         }
                     }
+                    if (xgp == (1u << CH) - 1u && xgg == (1u << CH) - 1u) {   /* every channel present and normalised (production): no per-element selects */
+#pragma unroll
+                        for (int q = 0; q < CH; q++) v[r][q] = act_ab(v[r][q], xga[q], xgb[q], true);
+                    } else
 #pragma unroll
                     for (int q = 0; q < CH; q++) v[r][q] = (xgp >> q & 1u) ? act_ab(v[r][q], xga[q], xgb[q], (xgg >> q & 1u) != 0) : 0.f;
                 }

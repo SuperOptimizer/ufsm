@@ -147,6 +147,11 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
         /* the new planes gz0, gz0 + 1 from xr, in two halves around one barrier: xreduce decodes and transforms them and red.shared's
            the per-(plane, channel) amaxes into amx buffer b; after the barrier xstore takes the scales (lanes < 2 XC, shuffled to the
            warp) and writes the e4m3 bytes into the ring */
+        /* the channels' descriptors in registers (xdecode read p, a, b, g from shared memory per element: the kernel is LSU-bound) */
+        float xga[XC], xgb[XC]; unsigned xpm = 0u, xgm = 0u;
+#pragma unroll
+        for (int q = 0; q < XC; q++) { xga[q] = ctab8[q].a; xgb[q] = ctab8[q].b; xpm |= (ctab8[q].p != nullptr) << q; xgm |= (ctab8[q].g != 0) << q; }
+        const bool xplain = xpm == (1u << XC) - 1u && !Gany;
         auto xdecode = [&](float (&v)[2][XC]) {
 #pragma unroll
             for (int pl = 0; pl < 2; pl++) {
@@ -171,9 +176,9 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                             const chan_t &cq = ctab8[q]; const float2 ab = chan_ab(ci0 + q < Ci ? ci0 + q : Ci, Ci, Cx, n, sp, gp, max(xgz0 + pl, 0));
                             v[pl][q] = cq.p ? act_ab(v[pl][q], ab.x, ab.y, Gany && cq.g) : 0.f;
                         }
-                    } else {
+                    } else if (!xplain) {   /* (xplain: every channel present, no GN (the network input): v as decoded) */
 #pragma unroll
-                    for (int q = 0; q < XC; q++) { const chan_t &cq = ctab8[q]; v[pl][q] = cq.p ? act_ab(v[pl][q], cq.a, cq.b, Gany && cq.g) : 0.f; }
+                    for (int q = 0; q < XC; q++) v[pl][q] = (xpm >> q & 1u) ? act_ab(v[pl][q], xga[q], xgb[q], Gany && (xgm >> q & 1u)) : 0.f;
                     }
                 }
             }
