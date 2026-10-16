@@ -37,6 +37,44 @@ conv_bwd_w_f4ws_k (fp4 weight gradient, warp-specialised) ~114 ms over 66, of ~5
   tb re-read, a cheaper exact SR nibble; the f4p staging index math (li / 180 etc., ~8% of its instructions); f4ws needs a
   producer restructure that frees registers first.
 
+## Many surface sets: winding ids, merged codes, side votes (2026-10-16)
+Goal (user): train eventually on every published surface of every scroll. Surfaces of different authors / runs overlap (the same
+wrap traced twice, a voxel or two apart) and carry no common winding numbering, while side labels need the order of consecutive
+wraps (k .. k + 0.5 recto, k + 0.5 .. k + 1 verso). Three layers, each its own command, all lossless volcomp on one grid:
+1. `ufsm wind-assign <ref-root> <ref-key> <out> <tifxyz>...` (src/wind.h): every surface gets q = K + dir theta / 2 pi per vertex
+   in the gauge of a reference winding raster (the published band codes / any raster --value codes, or a dense phase-raster
+   --winding raster): theta around the umbilicus unwrapped along the mesh grid, one K (mod 14) and dir per connected component,
+   voted by the samples within --tol label voxels of a reference voxel; the dir whose agreeing votes sit nearer integer turns wins
+   (the wrong dir's residuals are uniform). Verdicts per component: duplicate (re-traces the reference), new (agrees where it
+   overlaps), conflict (< 80% of matches agree: a sheet switch; the disagreeing step x step cells are dropped), unassigned
+   (nothing anchors it: needs a dense winding reference, e.g. a fit, or another set first). --drop-duplicates keeps only new
+   coverage (the reference wins where both exist). Output: <out>/<name> tifxyz (--out-um: coordinates on the reference grid) +
+   q.tif, assign.jsonl.
+   Paris4 check (laptop codes box, 9 of our 19.2 um fitted wraps from slab-w-p19v2-w640): every component dir +1; 35% of their
+   area duplicate (86-100% of matches agree, median 1.6-2.4 label voxels from published sheets, K = the wrap's own winding mod
+   14: the fitter's gauge is the codes'), 65% conflict (41-76% agree: the fitted wraps switch between neighbouring windings,
+   as wrapswitch reports).
+2. `ufsm raster OUT --value q.tif --binary 0 --levels 1 <out>/*` writes one codes raster per surface set (codes of surfaces that
+   agree within 4 steps (1/4 turn) are the same wrap, otherwise 255); `ufsm codes-merge <out-group> <um> <root> <key> ...` unites
+   such rasters with the published codes by the same rule. phase-raster --pair 2 of the merged codes labels between wraps from any
+   of the sets (two copies of one wrap a voxel or two apart carry the same code: band_field_side_pair treats them as one sheet, codes
+   within 5 steps). Paris4: 3 assigned fitted wraps rasterised (17 s) and merged into the published codes box: 5.16 G coded voxels,
+   0.03% conflicts.
+3. Side votes (src/votes.h): where sets disagree, or to keep each set's own ordering, every set's side labels (phase-raster --pair 2
+   of its own codes) are ADDED: `ufsm side-votes <out-group> <um> <root> <key> ...` stores per voxel (r recto votes, v verso
+   votes), 0..15 each, in a diagonal code ((0,0) 0 | (0,1) 1, (1,0) 2 | (0,2) 3 ...), so a one-set side array IS its vote array
+   byte for byte; `downsample --mode votes` adds the votes of each 2^3 block. Sources: "encoding": "side-votes" with "votes":
+   {"rule": "unanimous" (default; any disagreement ignored) | "majority", "min": N (votes a label needs), "soft": 1 (recto-side
+   papyrus r / (r + v): soft targets, not packed)}; hard rules decode on read, so warps, packed targets and the rest of the side
+   path are unchanged. Codec (bench_votes, 4 Paris4 cubes of 256^3 at 4.8 um, the labels + two displaced partial copies, 3.85% of
+   labelled voxels disputed): one set 0.151 bits / voxel, votes in the diagonal code 0.343, as nibbles (r << 4 | v) 0.469 (+37%:
+   recto and verso 15 apart cost bypass bits at every face), decode ~800 MB/s; no volcomp change needed.
+What real multi-author data needs: tifxyz (or .sfc) per surface in a known scan's voxel frame (voxel_size_um, which scan / volume
+id), the scroll's umbilicus, provenance (author / run) to form sets; a reference gauge per scroll: the published band codes where
+they exist, else the largest consistent set or our fit's dense winding raster (unassigned surfaces wait for it); per-vertex q from
+authors that publish it can replace wind-assign's (then wind-assign is the consistency check). Open: surfaces of another scan of
+the same scroll must be registered onto the reference scan first (surfcomp re-registrations exist for Paris4's 81 segments).
+
 ## Level-0 kernels outside the 16-channel convs; why test_l3_sched broke under a fused GN-backward sum (2026-10-16)
 Desk 5060 Ti, P512 production net (`tests/bench_l0misc`: per-call times and output hashes; every change below is bit for bit):
 | kernel | before | after | change |
