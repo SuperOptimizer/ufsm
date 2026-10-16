@@ -62,6 +62,9 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
     }
     if (upt && !uni) __trap();   /* the per-channel paths do not upsample: the host only fuses aligned 16-channel tiles */
     auto mma_zstep = [&](int oz0) {   /* the z-step's MMAs from the staged x ring and gy tile */
+        unsigned long long sa8[MT];   /* this lane's 8 K-block scale bytes of the A rows (one 8-byte load, not 8 byte loads: LSU-bound) */
+#pragma unroll
+        for (int m = 0; m < MT; m++) sa8[m] = *(const unsigned long long *)(sgs + (m * 16 + g + 8 * (t & 1)) * 8);
 #pragma unroll
         for (int vz = 0; vz < 2; vz++) {
             const int slot = (oz0 + vz + kz) & 3;
@@ -76,7 +79,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                 for (int m = 0; m < MT; m++) {
                     int mat = lane >> 3, co = m * 16 + (mat & 1) * 8 + (lane & 7), row = 2 * ks + (mat >> 1);
                     ldsm_x4(af[m], sg + co * G8_CS + row * 16);
-                    sa[m] = sgs[(m * 16 + g + 8 * (t & 1)) * 8 + ks];
+                    sa[m] = (unsigned)(sa8[m] >> (8 * ks)) & 0xffu;
                 }
                 const int o0 = slot * X8_PS + (vy0 + ky) * 24;
 #pragma unroll
@@ -236,6 +239,9 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
             if (ks >= 8) return;
             const bool cok = co0 + c < Co;
             const uint8_t *rb = graw + (ks * 32 + i0) * GRB + (GB == 8 ? c : c >> 1), *sb = gscl + ks * 32 + i0;
+            unsigned sw[NV / 4];   /* the NV scale bytes (16-byte aligned): NV / 16 vector loads, not NV byte loads (the kernel is LSU-bound) */
+#pragma unroll
+            for (int j = 0; j < NV / 16; j++) { const uint4 w4 = *(const uint4 *)(sb + 16 * j); sw[4 * j] = w4.x; sw[4 * j + 1] = w4.y; sw[4 * j + 2] = w4.z; sw[4 * j + 3] = w4.w; }
             float v[NV];
             unsigned am = 0u;
 #pragma unroll
@@ -243,7 +249,8 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                 float2 d;
                 if constexpr (GB == 8) d = dec_e4m3x2((unsigned short)(rb[i * GRB] | (rb[(i + 1) * GRB] << 8)));
                 else { const float2 a = dec_e2m1x2(rb[i * GRB]), b = dec_e2m1x2(rb[(i + 1) * GRB]); d = (c & 1) ? make_float2(a.y, b.y) : make_float2(a.x, b.x); }   /* this lane's nibble of each row */
-                v[i] = cok ? d.x * mx_scale(sb[i]) : 0.f; v[i + 1] = cok ? d.y * mx_scale(sb[i + 1]) : 0.f;
+                const unsigned s0 = (sw[i >> 2] >> (8 * (i & 3))) & 0xffu, s1 = (sw[(i + 1) >> 2] >> (8 * ((i + 1) & 3))) & 0xffu;
+                v[i] = cok ? d.x * mx_scale(s0) : 0.f; v[i + 1] = cok ? d.y * mx_scale(s1) : 0.f;
                 am = max(am, max(__float_as_uint(v[i]) & 0x7fffffffu, __float_as_uint(v[i + 1]) & 0x7fffffffu));
             }
             if constexpr (NP == 2) am = max(am, __shfl_xor_sync(0xffffffffu, am, 16));   /* the block's other row */
