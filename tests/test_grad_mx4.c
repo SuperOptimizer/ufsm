@@ -139,14 +139,28 @@ int main(void) {
         void *gxa = mx4_new(s), *gxb = mx4_new(s);
         const size_t bytes = nn_mx4_bytes(s);
         mode_mx();
-        lp_set_gn_persist(0); nn_set_sr_step(1600); nn_gn_silu_bwd(xm, s, G, gam, bet, mean, rstd, gym, (float *)gxa, gg, gb, scr);
+        float hp[2][2][64];
+        lp_set_gn_persist(0); nn_set_sr_step(1600); nn_zero(gg, C * 4); nn_zero(gb, C * 4); nn_gn_silu_bwd(xm, s, G, gam, bet, mean, rstd, gym, (float *)gxa, gg, gb, scr);
+        nn_d2h(hp[0][0], gg, C * 4); nn_d2h(hp[0][1], gb, C * 4);
         lp_set_gn_persist(1); nn_set_sr_step(1600); nn_gn_silu_bwd(xm, s, G, gam, bet, mean, rstd, gym, (float *)gxb, gg, gb, scr);
         lp_set_gn_persist(-1);
         uint8_t *ha = malloc(bytes), *hb = malloc(bytes); nn_d2h(ha, gxa, bytes); nn_d2h(hb, gxb, bytes);
         size_t nd = 0; for (size_t i = 0; i < bytes; i++) nd += ha[i] != hb[i];
-        const int ok = !nd && !nn_check();
+        int ok = !nd && !nn_check();
         printf("  gn+silu bwd persistent apply, %2d ch: %zu of %zu gx bytes differ from a row per thread%s\n", C, nd, bytes, ok ? "" : "  FAIL");
         if (!ok) bad++;
+        if (C == 8) {   /* the 8-channel stats / apply kernels (NK 8) against the general ones (lp_set_gn_full8(0)): gx bytes and the
+                           parameter gradients bit for bit */
+            lp_set_gn_full8(0); nn_set_sr_step(1600); nn_zero(gg, C * 4); nn_zero(gb, C * 4); nn_gn_silu_bwd(xm, s, G, gam, bet, mean, rstd, gym, (float *)gxb, gg, gb, scr);
+            lp_set_gn_full8(1);
+            nn_d2h(hb, gxb, bytes); nn_d2h(hp[1][0], gg, C * 4); nn_d2h(hp[1][1], gb, C * 4);
+            nd = 0; for (size_t i = 0; i < bytes; i++) nd += ha[i] != hb[i];
+            double pd = 0;
+            for (int j = 0; j < 2; j++) for (int c = 0; c < C; c++) pd = fmax(pd, fabs((double)hp[0][j][c] - hp[1][j][c]) / (fabs((double)hp[1][j][c]) + 1e-30));
+            ok = !nd && pd == 0 && !nn_check();
+            printf("  gn+silu bwd 8-channel kernels vs general:   %zu of %zu gx bytes differ, param grads max rel diff %.2g%s\n", nd, bytes, pd, ok ? "" : "  FAIL");
+            if (!ok) bad++;
+        }
         free(ha); free(hb);
         nn_free(x); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd); nn_free(xm); nn_free(gy); nn_free(gym); nn_free(gg); nn_free(gb); nn_free(scr); nn_free(gxa); nn_free(gxb);
         rs = rs0;
