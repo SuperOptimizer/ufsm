@@ -189,6 +189,55 @@ of 8 planes, and with one slab nothing is registered: the statistics are the sam
   forwards and conv_bwd_w_f4_k in place of conv_fwd_f4p_k / conv_bwd_w_f4ws_k, and the producers' statistics pass (S2 folds it into
   the epilogues).
 
+S1 result (2026-10-16, laptop 5080, rv48 sources `--levels 0,1`, P512, 2000 steps, --det 1, --val-seed 1, --aug none; binary 9ae7eea,
+UFSM_L0_SLAB_KERN=1 `--l0-norm slab --l0-slab 32`, two arms sharing the GPU at 0.63 samp/s each): the kernel path equals GroupNorm.
+
+| arm | val 500 | 1000 | 1500 | 2000 |
+|---|---|---|---|---|
+| slab kernel 32, seed 1 | 0.6885 | 0.6622 | 0.6511 | 0.6436 |
+| gn, seed 1 (worker S's arm) | 0.6892 | 0.6635 | 0.6523 | 0.6436 |
+| slab kernel 32, seed 2 | 0.7102 | 0.6730 | 0.6581 | 0.6460 |
+| gn, seed 2 | 0.7099 | 0.6731 | 0.6584 | 0.6481 |
+
+Mean at 2000: 0.6448 vs 0.6458 (the prototype's slab 32 arms: 0.6508, its +0.0049 rounding penalty gone with the extra passes).
+
+Stage S2, z-window launches (2026-10-16): `nn_set_zwin(zw0, zw1, D0, first, last)` (nn_bwd.cu, per host thread) makes the next ops
+compute only output planes [zw0, zw1) of their WHOLE output tensors, the window given in planes of a depth-D0 reference (the level-0
+depth) and scaled to each output (zw_win: zw0 D / D0, so down0's level-1 output gets [zw0 / 2, zw1 / 2)); first / last zero /
+finalise output GroupNorm sums (zr_zero / zr_final). Every kernel keeps its whole-launch tiles, staging, rings and stochastic-rounding
+keys (all already keyed by global voxel position), so windows covering a tensor give one launch's bits, given the same seeds: the op's
+seed counter replayed per window with nn_sr_set_ctr (the test does; the streamed schedule, S3, must draw each level-0 op's seed once).
+Windows lie on the kernels' z tiles (2 or 4 planes; 8 for the stride-2 backward-data's gx), or end at the tensor's depth (partial
+last windows). Covered (default paths unchanged, split_t gets zw0 / zw1, the other kernels take a tile range):
+- conv_fwd_tc (forward and backward-data): conv_fwd_f4_k / conv_fwd_f4r_k (the 16 | 16 split output too), conv_fwd_f8_k /
+  conv_fwd_f8p_k, the stem conv_fwd_f8s_k (its 4-channel MX input and 16-bit inputs);
+- stride 2: conv_fwd_s2_f8_k / s2_f4_k / s2_f4p_k (down0 forward), conv_bwd_w_s2_f8_k (down0 weight gradient), bwd_data_s2_f4q_k /
+  bwd_data_s2_f4_k (down0 backward-data, set or accumulated into the skip gradient);
+- weight gradients: lp_bwd_w_f4 clips its gy pre-pass slabs to the window (conv_bwd_w_f4_k and the warp-specialised kernel already
+  take a z-step range; the GN apply's whole-layer gy records are not used under a window: their layout starts at z-step 0);
+  conv_bwd_w_f8_k (the stem's FAST path);
+- slab-local GroupNorm backward (MX-fp4: stats, the lane-pair apply, the head-recomputing pair): on the [slabs] pseudo-sample shape
+  of one sample a window of whole slabs is a pseudo-sample range (gn_nwin: kernels take a first sample n0; other rows' partial sums
+  zeroed, so ggamma / gbeta accumulate over windows; the records-writing apply is skipped: same gx bits);
+- the 2x upsample (up2_mx_tile_k: dec[0]'s up transient) and its backward (up2_bwd_mx_tile_k: coarse planes [zw0 / 2, zw1 / 2),
+  reading the fine gy planes around them); the GPU-built network input (input_rad_k: planes [zw0, zw1)).
+Under a window the routing avoids conv_fwd_f4p_k (packed 16-channel) and the fused-upsample f4u, which are not window-aware yet
+(the chunk kernels give the same bits for 16 channels: the test's no-window comparison is 0); kernels without window support abort
+with a message (16-bit tensor-core convs, the per-voxel / slice upsample backward, the bf16 stride-2 backward-data, the non-MX-fp4
+GN backward, the fp4 weight gradient without its gy pre-pass). Halos for S3: a 3^3 conv's window reads one plane beyond each end,
+down0's backward-data and the upsample backward read the fine planes around their coarse window, down0 the two level-0 planes
+below / above. tests/test_zwin.c (test-all): every family at 16 / 32 channels, windows of 8 and 16 planes, depths 32 and 36 (a
+partial last window): outputs byte for byte, statistics at double-sum noise, weight / GN-parameter gradients summing to the one
+launch's (accumulated windows: a window ignoring its range would add the whole gradient each time), lone windows writing exactly
+their planes, and no-window launches equal.
+
+CUDA virtual memory management under WSL2 (probed 2026-10-16, laptop 5080): cuMemAddressReserve of 64 GB on the 16 GB card,
+cuMemCreate / cuMemMap / cuMemSetAccess of 256 MB chunks at 2 MB granularity, kernels addressing the mapped ranges correctly;
+map + access + unmap of 256 MB ~2 ms of host time. So S4 can keep whole-window tensor addresses and map physical slab chunks under
+them (MX data and scale planes of 8 planes at P >= 512 sit on 2 MB boundaries), instead of slab buffers with a zkey base in every
+kernel: S2's windows on whole tensors are then all the kernels need. The host map / unmap traffic (hundreds per P1024 step) belongs
+in a helper thread ahead of the compute stream, unmaps after the last reader's event.
+
 ## Trainer host RAM: packed targets, validation windows on disk (2026-10-15)
 At P768 the laptop trainer (production net, 6 workers, 7 slots, 4.8 um rv48 side labels) was OOM-killed by the 37.6 GiB slice cap
 before its first step (38.3 GB RSS): host RAM, not the GPU, bound the window. Per voxel the host held 5 B per sampler slot (CT fp16,

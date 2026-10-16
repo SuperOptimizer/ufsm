@@ -342,6 +342,20 @@ static void test_up(int C, int D) {
     nn_free(f.x); nn_free(f.gy); mode_off();
 }
 
+/* the GPU-built network input (CT fp16 + the radial records -> 4-channel MX-fp4; zeroed records: no axis), windows of planes */
+typedef struct { shape5 xs; void *ct, *rec; } inp_t;
+static void inp_op(void *c, res_t *r) { inp_t *f = c; nn_input_rad(f->ct, f->xs, f->rec, r->out); }
+static void test_input(int P, int D) {
+    mode_prod();
+    inp_t f = {{1, 4, D, P, P}};
+    const size_t n = (size_t)D * P * P;
+    float *ct = dev_rand(n, 2.f); f.ct = nn_malloc(n * 2); nn_f32_to_h16(ct, n, f.ct, 1.f); nn_free(ct);
+    f.rec = nn_malloc((size_t)1 << 20); nn_zero(f.rec, (size_t)1 << 20);
+    res_t a = {"", nn_mx4_bytes(f.xs), mx4_new(f.xs)};
+    char m[96]; snprintf(m, sizeof m, "input build P %d, depth %d", P, D); drive(m, inp_op, &f, D, &a, f.xs, 1);
+    res_free(&a); nn_free(f.ct); nn_free(f.rec); mode_off();
+}
+
 int main(void) {
     setenv("UFSM_F4_WGRAD", "1", 1);   /* the production fp4 weight gradient (train --fp4 2) */
     nn_init(0);
@@ -353,6 +367,7 @@ int main(void) {
         test_wgrad(16, 16, D, 1); test_wgrad(32, 32, D, 1); test_wgrad(4, 16, D, 0);
         test_s2b(16, D, 0); test_s2b(16, D, 1); test_s2b(32, D, 0); test_s2b(32, D, 1);
         test_up(16, D); test_up(32, D);
+        test_input(24, D);
     }
     for (int S = 8; S <= 16; S *= 2) { test_gnb(16, 32, S, 0); test_gnb(32, 32, S, 0); test_gnb(16, 32, S, 1); }
     const char *e = nn_check(); if (e) { printf("  CUDA: %s  FAIL\n", e); bad++; }
