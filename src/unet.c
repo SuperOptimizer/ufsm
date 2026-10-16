@@ -2862,6 +2862,7 @@ void unet_gn_freeze(unet *u, const float *h) {
 }
 void unet_blend_ema(unet *u, float a) { nn_scale(u->ema, 1.f - a, u->np); nn_axpy(u->ema, a, u->p, u->np); nn_wmemo_clear(); }
 void unet_use_ema(unet *u, int on) { nn_wmemo_clear(); u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
+const float *unet_fwd_params(const unet *u) { return u->fw; }
 /* ---- 2:4 structured sparsity: the forward reads a masked copy of the live weights; SR-STE keeps the master weights dense ---- */
 static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg) {
     int L = u->cfg.nlev;
