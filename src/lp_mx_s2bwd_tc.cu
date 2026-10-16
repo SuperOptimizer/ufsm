@@ -367,29 +367,45 @@ __global__ void __launch_bounds__(256, S2Q4_MINB) bwd_data_s2_f4q_k(const uint8_
     if (threadIdx.x < 9) rel4[16 + threadIdx.x] = threadIdx.x < 8 ? Q.first[threadIdx.x] : 9;
     if (threadIdx.x < 9) rel4[threadIdx.x] = Q.rel[threadIdx.x][0] | (Q.rel[threadIdx.x][1] << 8) | (Q.rel[threadIdx.x][2] << 16) | ((unsigned)Q.rel[threadIdx.x][3] << 24);
     float *wob = ob + warp * 32 * 20;
-    for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
+    /* Global loads one pass ahead (the stalls on their first use were ~1/4 of the kernel's samples at P512: a pass's MMAs are too few
+       to cover them): a pass loads the next pass's old fine rows (accum), the last pass of a tile the next tile's first pass's and the
+       next tile's gy rows. Same rows and values: every fine voxel is read and written by one lane of one block. */
+    constexpr int NGI = (3 * 9 * 17 + 255) / 256;   /* gy rows per thread */
+    auto gy_load = [&](int mz0, uint2 (&h)[NGI], unsigned (&sc)[NGI]) {
+#pragma unroll
+        for (int k = 0; k < NGI; k++) {
+            const int i = threadIdx.x + 256 * k, lx = i % 17, ly = (i / 17) % 9, lz = i / (17 * 9), oz = mz0 + lz, oy = my0 + ly, ox = mx0 + lx;
+            h[k] = make_uint2(0u, 0u); sc[k] = 127u;
+            if (i < 3 * 9 * 17 && oz < Do && oy < Ho && ox < Wo) { const size_t ri = (size_t)n * So + ((size_t)oz * Ho + oy) * Wo + ox; h[k] = __ldg((const uint2 *)(gy + ri * 8)); sc[k] = gsc[ri]; }
+        }
+    };
+    auto old_load = [&](int mz0, int pzy, uint2 (&old)[2], unsigned (&osc)[2]) {   /* this lane's old fine rows of pass pzy (accumulating) */
+        const int uz = 2 * (mz0 + mzw) + (pzy >> 1), ux = 2 * mx0 + lane;
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const int uy = 2 * (my0 + myw + r) + (pzy & 1);
+            old[r] = make_uint2(0u, 0u); osc[r] = 127u;
+            if (accum && uz < D && uy < H && ux < W) { const size_t ri = (size_t)n * S + ((size_t)uz * H + uy) * W + ux; old[r] = *(const uint2 *)(gx + ri * 8); osc[r] = xsc[ri]; }
+        }
+    };
+    const int tz_end = min(nzt, (zc + 1) * ZC);
+    uint2 gh[NGI], olda[2], oldb[2];
+    unsigned gsv[NGI], osca[2], oscb[2];
+    if (zc * ZC < tz_end) { gy_load(zc * ZC * 2, gh, gsv); old_load(zc * ZC * 2, 0, olda, osca); }
+    for (int tz = zc * ZC; tz < tz_end; tz++) {
         const int mz0 = tz * 2;
         __syncthreads();   /* the weights (first tile) / the previous tile's reads of the gy tile */
-        for (int i = threadIdx.x; i < 3 * 9 * 17; i += 256) {   /* the gy rows as stored (MX-fp4: exact) */
-            const int lx = i % 17, ly = (i / 17) % 9, lz = i / (17 * 9), oz = mz0 + lz, oy = my0 + ly, ox = mx0 + lx;
-            uint2 h0 = make_uint2(0u, 0u); unsigned sc = 127u;
-            if (oz < Do && oy < Ho && ox < Wo) { const size_t ri = (size_t)n * So + ((size_t)oz * Ho + oy) * Wo + ox; h0 = __ldg((const uint2 *)(gy + ri * 8)); sc = gsc[ri]; }
-            const int pi = (lz * GY + ly) * GX + lx;
-            *(uint2 *)(gyt + pi * 8) = h0; gys[pi] = (uint8_t)sc;
+#pragma unroll
+        for (int k = 0; k < NGI; k++) {   /* the gy rows as stored (MX-fp4: exact) */
+            const int i = threadIdx.x + 256 * k, lx = i % 17, ly = (i / 17) % 9, lz = i / (17 * 9);
+            if (i < 3 * 9 * 17) { const int pi = (lz * GY + ly) * GX + lx; *(uint2 *)(gyt + pi * 8) = gh[k]; gys[pi] = (uint8_t)gsv[k]; }
         }
         __syncthreads();
-#pragma unroll 1
-        for (int pzy = 0; pzy < 4; pzy++) {
+        auto pass = [&](int pzy, const uint2 (&old)[2], const unsigned (&osc)[2], uint2 (&nold)[2], unsigned (&nosc)[2]) {
             const int pz = pzy >> 1, py = pzy & 1;
             const int uz = 2 * (mz0 + mzw) + pz, ux = 2 * mx0 + lane;
-            /* this lane's old fine rows (accumulating), loaded before the MMAs so their latency is hidden */
-            uint2 old[2]; unsigned osc[2];
-#pragma unroll
-            for (int r = 0; r < 2; r++) {
-                const int uy = 2 * (my0 + myw + r) + py;
-                old[r] = make_uint2(0u, 0u); osc[r] = 127u;
-                if (accum && uz < D && uy < H && ux < W) { const size_t ri = (size_t)n * S + ((size_t)uz * H + uy) * W + ux; old[r] = *(const uint2 *)(gx + ri * 8); osc[r] = xsc[ri]; }
-            }
+            if (pzy < 3) old_load(mz0, pzy + 1, nold, nosc);
+            else if (tz + 1 < tz_end) { old_load(mz0 + 2, 0, nold, nosc); gy_load(mz0 + 2, gh, gsv); }
             float acc[2][2][2][4];   /* [px][r][q2][c] */
 #pragma unroll
             for (int px = 0; px < 2; px++) for (int r = 0; r < 2; r++) for (int q2 = 0; q2 < 2; q2++) for (int k = 0; k < 4; k++) acc[px][r][q2][k] = 0.f;
@@ -451,7 +467,8 @@ __global__ void __launch_bounds__(256, S2Q4_MINB) bwd_data_s2_f4q_k(const uint8_
                     xsc[ri] = (uint8_t)(e + 127);
                 }
             }
-        }
+        };
+        pass(0, olda, osca, oldb, oscb); pass(1, oldb, oscb, olda, osca); pass(2, olda, osca, oldb, oscb); pass(3, oldb, oscb, olda, osca);
     }
 }
 static int s2b_f4q(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, unsigned osr) {
