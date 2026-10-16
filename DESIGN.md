@@ -24,6 +24,20 @@ before its first step (38.3 GB RSS): host RAM, not the GPU, bound the window. Pe
 Laptop RTX 5080, P512: host VmHWM 16.5 -> 12.3 GB, device 4626 MiB (planner 4.89 GB), 1.53 samp/s either way. P768: killed at
 38.3 GB -> runs at 32.9 GB VmHWM (31.5 GB steady), device peak 13.8 GB (planner 15.13 of 15.51 GB), 0.46 samp/s = 208 Mvox/s
 (P512: 205), sampler wait 5-7% with 6 workers (UFSM_SAMPLER_PROF: 7.3 cpu-s per P768 window, 48% of it the x16 CT stage).
+## Planner dial: --mem fast is PCIe-aware; the pick prints B / voxel and copy bytes (2026-10-15)
+`--mem auto` (default) still takes the leanest mode that fits. `--mem fast` takes the fastest and first tries every mode with no
+pinned host offloads (unet_set_host_offloads(0): encoder a1, input, level-0 skip / A share, down outputs, coarse skips) and no
+shared encoder a1 unless the mode is one; only if none fits, the modes as auto builds them (the three level-0 buffers only there:
+they rely on their host copies). unet counts the offload bytes of every build, dry included (unet_last_offload_bytes); the planner
+prints the mode, its device bytes per voxel, the batch upload and the offload bytes per step. Production net, laptop RTX 5080:
+| P | --mem | mode | device need | host offloads each way per step | measured |
+|---|---|---|---|---|---|
+| 512 | auto | lean 2, shared a1, three level-0 buffers | 4.89 GB, 36.5 B/voxel | 3.66 GB (27.3 B/voxel) | 4626 MiB, 1.53 samp/s, host VmHWM 12.3 GB |
+| 512 | fast | MX gradients, no offloads | 13.68 GB, 101.9 B/voxel | 0 | 12546 MiB, 1.72 samp/s (+12%), host 6.5 GB |
+| 768 | auto / fast | lean 2, shared a1, three level-0 buffers | 15.13 GB, 33.4 B/voxel | 12.35 GB | 13.8 GB, 0.46 samp/s |
+| 1024 | auto | none fits (85.8 GB smallest: chunked recompute 2 lean 2 lacks the newer layouts) | | | |
+The batch upload is 0.40 GB per P512 step (CT fp16 + packed targets). At P768 the offloads move ~12 GB each way per ~2.2 s step
+(5.6 GB/s); at the same B / voxel they would bind near 800 Mvox/s, so a faster GPU wants --mem fast where it fits.
 ## Training input built on the GPU; the planner counts the separate input (2026-10-15)
 The network input is z-scored CT plus the radial unit vector (3 channels, from the window's corner, cube symmetry and the axis centre
 per source z). The sampler wrote all 4 as 16-bit per voxel (8 B: pinned slot, PCIe, a device buffer dead after the forward's MX input

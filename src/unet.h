@@ -151,6 +151,10 @@ void unet_set_batch_bytes(unet *u, size_t head, size_t tail);
 int unet_l0_3buf(const unet *u);
 int unet_l0_3buf_ct(const unet *u);   /* the last training forward (GPU-built input) keeps the CT, not the input, for enc[0]'s backward */
 int unet_last_dry_l3b(void);
+/* --mem fast: all training host offloads off (0) or at their defaults (1); the pinned host bytes of the last build (dry or real), each
+   copied device -> host and back once per step */
+void unet_set_host_offloads(int on);
+size_t unet_last_offload_bytes(void);
 void *unet_logit_grad_scratch(unet *u, size_t bytes);   /* lean: home of the 16-bit logit gradient (A after the logits under lean 2, else B) */
 int unet_lean_nob(const unet *u);   /* lean 2 build: no gradient buffer B (gout[0] is the batch scratch) */
 void unet_build(unet *u, shape5 xs, int train);   /* build the buffers for xs now (the first forward would) */

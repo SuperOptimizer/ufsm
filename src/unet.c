@@ -329,6 +329,7 @@ void unet_init(unet *u, uint64_t seed) {
 /* ---- activation buffers ---- */
 /* dry run (unet_train_bytes): the activation allocators only count bytes and hand out a dummy pointer */
 static int g_dry = 0;
+static size_t g_hoff;   /* the last build's (dry or real) pinned host offload bytes; each is copied out and back once per step */
 /* UFSM_MEM_REPORT=1: unet_train_bytes prints the dry build's bytes per buffer group (g_mlab, set in build_acts) */
 static const char *g_mlab = "other";
 static struct { const char *lab; size_t b; int n; } g_mrep[64]; static int g_nmrep = 0;
@@ -487,6 +488,10 @@ static int sko_on(void) { if (g_sko < 0) g_sko = getenv("UFSM_SKIP_OFFLOAD") ? u
 void unet_set_skip_offload(int on) { g_sko = on; }
 #define SKO_DEFER ((float *)(uintptr_t)1)   /* build: an encoder a2 placed later */
 int unet_share_enc_a1(void) { return share_enc_a1(); }
+/* the planner's --mem fast: every training host offload (encoder a1, input, level-0 skip / A share, down outputs, coarse skips) off
+   (0), or back to its default / env switch (1) */
+void unet_set_host_offloads(int on) { const int v = on ? -1 : 0; g_a1_offload = v; g_xin_offload = v; g_a0_share = v; g_dno = v; g_sko = v; }
+size_t unet_last_offload_bytes(void) { return g_hoff; }
 /* three level-0 buffers instead of four (unet.l3b): -9 B per level-0 voxel at 16 channels (36 -> 27 B at the backward's peak), for
    three exposed host copies (the skip into X2 in dec[0]'s conv1 weight gradient, the encoder's a1 before enc[0]'s backward, the input
    before the stem's weight gradient). Opt-in (env UFSM_L0_3BUF=1) until its paired checks pass */
@@ -655,6 +660,7 @@ static int l3_want(const unet *u, int train) {
 }
 static void build_acts(unet *u, shape5 xs, int train) {
     free_acts(u);
+    g_hoff = 0;
     int L = u->cfg.nlev;
     const int *w = u->cfg.widths;
     u->l3b = l3_want(u, train);
@@ -802,6 +808,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
         if (u->l3b && i == 0) { u->l3x[2] = u->enc[0].a2; u->l3xb[2] = act_bytes_of(u->enc[0].ys); g_mlab = "encoder a1 / a2 / GN stats + down outputs"; }
         if (sea && i < L - 1) {
             u->enc[i].a1_shared = 1;
+            if (a1_offload()) { shape5 y = u->ls[i]; y.c = w[i]; g_hoff += act_bytes_of(y); }
             if (a1_offload() && !g_dry) {
                 shape5 y = u->ls[i]; y.c = w[i];
                 u->h_a1[i] = nn_host_alloc_try(act_bytes_of(y));   /* nullptr: this level re-runs conv1 */
@@ -864,6 +871,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 u->a0_share = a0_share_on() && L > 1 && act_mx4() && grad_mx4() && grad_dt() == act_dt() && lean() >= 2 && chunk && !any_single(u)
                               && !(xin_will && enc0_rerun);
                 lg_fit = act_bytes_of(d0) >= shape_numel(os) * 2 + 4096;
+                if (u->a0_share) g_hoff += act_bytes_of(d0);
                 if (u->a0_share && !g_dry) {
                     u->h_a2 = nn_host_alloc_try(act_bytes_of(d0));
                     if (!u->h_a2) { fprintf(stderr, "unet: cannot pin %.2f GB for the skip offload; level-0 A keeps its own buffer\n", act_bytes_of(d0) / 1e9); u->a0_share = 0; }
@@ -986,6 +994,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 const int idt = ABF && input_mx() ? unet_input_prec() : 0;
                 const size_t xlo = idt && xin_offload() && !u->l3b ? (nn_mx_bytes(xs, idt) + 255) & ~(size_t)255 : 0;   /* (if the input will share it; l3b: X3) */
                 u->dno = u->gco && dno_on() && gco_off >= dn + xlo + 256;
+                if (u->dno) g_hoff += dn;
                 for (int i = 0; u->dno && !g_dry && i < L - 1; i++) {
                     shape5 ds = u->ls[i + 1]; ds.c = w[i];
                     if (!(u->h_dn[i] = nn_host_alloc_try(act_bytes_of(ds)))) { fprintf(stderr, "unet: cannot pin %.2f GB for the down-conv output offload; own buffers\n", act_bytes_of(ds) / 1e9); u->dno = 0; }
@@ -1003,6 +1012,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 size_t sk = 256;
                 for (int i = 1; i < L - 1; i++) sk += (act_bytes_of(u->enc[i].ys) + 255) & ~(size_t)255;
                 u->sko = u->dno && sko_on() && sk <= gco_off && !u->nrb_any;
+                if (u->sko) g_hoff += sk - 256;
                 for (int i = 1; u->sko && !g_dry && i < L - 1; i++) {
                     if (!(u->h_sk[i] = nn_host_alloc_try(act_bytes_of(u->enc[i].ys)))) { fprintf(stderr, "unet: cannot pin %.2f GB for the skip offload; own buffers\n", act_bytes_of(u->enc[i].ys) / 1e9); u->sko = 0; }
                     for (int k = 0; k < 4; k++) if (!u->ev_sk[i][k]) u->ev_sk[i][k] = nn_event_create();
@@ -1086,6 +1096,7 @@ static void build_acts(unet *u, shape5 xs, int train) {
         if (train && nn_get_tf32() && act_mx8() && xin_offload() && L > 1 && (u->l3b || act_bytes_of(u->dec[0].ys) >= xb_)) {
             void *h = g_dry ? nullptr : nn_host_alloc_try(xb_);
             if (g_dry || h) {
+                g_hoff += xb_;
                 u->xin = u->l3b ? u->l3x[3] : u->dec[0].a2; u->xin_shared = 1; u->h_xin = h; u->xin_bytes = xb_;
                 if (!g_dry) for (int k = 0; k < 4; k++) if (!u->ev_xin[k]) u->ev_xin[k] = nn_event_create();
             } else fprintf(stderr, "unet: cannot pin %.2f GB for the input offload; a separate input buffer\n", xb_ / 1e9);

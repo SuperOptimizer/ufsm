@@ -1319,7 +1319,10 @@ int cmd_train(int argc, char **argv) {
             /* the search order: --mem auto takes the smallest recompute-1 mode that fits (lean 2, chunked, shared a1: production
                P 384 12.75 -> 10.47 GB per GPU for ~2% throughput, the serialised batch upload; the user: RAM savings by default unless
                they cost massive speed), then the larger recompute-1 ones, then recompute 2 (~10% step for ~0.3 GB more); --mem fast
-               keeps the list order (fastest first) */
+               keeps the list order (fastest first) and is PCIe-aware: it first tries every mode with no pinned host offloads (encoder
+               a1, input, level-0 skip / A share, down outputs, coarse skips: ~2 x 19 B per level-0 voxel over PCIe each step with the
+               production net, the bound from ~800 Mvox/s) and no shared encoder a1 (unless the mode is one), then the modes as --mem auto
+               builds them */
             static const int ord_small[] = {5, 4, 3, 2, 1, 0, 8, 7, 6, 9, 10, 11, 12, 13};   /* (16-bit modes: list order, no recompute-1 lean ones) */
             const int l3_off = getenv("UFSM_L0_3BUF") && !ufsm_env_on("UFSM_L0_3BUF");   /* (UFSM_L0_3BUF=0: never the three level-0 buffers) */
             const int fastest = !strcmp(mm, "fast");
@@ -1328,20 +1331,22 @@ int cmd_train(int argc, char **argv) {
             nn_init(G[0].dev);
             const shape5 xs = g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P};   /* split: this GPU's slab of the window */
             const size_t p3 = p3l;
-            int pick = -1; size_t need = 0;
+            int pick = -1, pick_hoff = 1; size_t need = 0, pick_off = 0, pick_need = 0;
             {   /* the batch tail [targets | mask] the three-level-0-buffer layout holds at X3's end (its dry builds size X3 for it) */
                 const size_t a256 = 255;
                 unet_set_batch_bytes(G[0].u, 0, (((size_t)B * g_tc * p3 + a256) & ~a256) + (((size_t)B * p3 + a256) & ~a256));
             }
             const int pick0 = getenv("UFSM_MEM_PICK") ? atoi(getenv("UFSM_MEM_PICK")) : 0;   /* A/B of the modes: start the search at this candidate */
             _Static_assert(sizeof ord_small / sizeof ord_small[0] == sizeof cand / sizeof cand[0], "every mode in the search order");
+            for (int pass = fastest ? 0 : 1; pass < 2 && pick < 0; pass++)   /* pass 0 (--mem fast): no host offloads */
             for (int oi = 0; oi < nc && pick < 0; oi++) {
                 const int c = pick0 > 0 && pick0 < nc ? (oi ? nc : pick0) : fastest ? oi : ord_small[oi];   /* UFSM_MEM_PICK: that mode only */
                 if (c >= nc) break;
                 if (cand[c].gmx == auto16) continue;   /* auto: MX gradient modes; auto16: the 16-bit ones */
                 if (g_half && cand[c].lean) continue;   /* (the batch buffers are full resolution, the network's half) */
-                if (cand[c].l3 && l3_off) continue;
-                unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean); unet_set_share_enc_a1(cand[c].sea || sea_force);
+                if (cand[c].l3 && (l3_off || !pass)) continue;   /* (the three level-0 buffers rely on their host copies) */
+                unet_set_host_offloads(pass);
+                unet_set_chunk_up(cand[c].chunk); unet_set_recompute(cand[c].rc); unet_set_grad_mx8(cand[c].gmx); unet_set_lean(cand[c].lean); unet_set_share_enc_a1(cand[c].sea || (pass && sea_force));
                 unet_set_l0_3buf(cand[c].l3);
                 const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
                 if (cand[c].l3 && !unet_last_dry_l3b()) continue;   /* (not this net: the mode above) */
@@ -1364,11 +1369,19 @@ int cmd_train(int argc, char **argv) {
                    (8.5 B per level-0 voxel at 16 channels for ~0 step time there; 8 channels: -2%) */
                 const size_t grec = unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1) ? (size_t)B * cfg.widths[0] * p3 * 136 / 256 : 0;
                 need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
-                if (need <= fmin) pick = c;
+                if (need <= fmin) { pick = c; pick_hoff = pass; pick_off = unet_last_offload_bytes(); pick_need = need; }
             }
-            if (pick < 0) { pick = auto16 ? nc - 1 : 8; /* the smallest mode of the list */ fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
-            else fprintf(stderr, "memory: %s, %.2f of %.2f GB free per GPU\n", cand[pick].what, need / 1e9, fmin / 1e9);
-            unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean); unet_set_share_enc_a1(cand[pick].sea || sea_force);
+            if (pick < 0) { pick = auto16 ? nc - 1 : 8; /* the smallest mode of the list */ pick_hoff = 1; fprintf(stderr, "memory: no mode fits %.2f GB free (smallest needs %.2f GB); trying %s\n", fmin / 1e9, need / 1e9, cand[pick].what); }
+            else {   /* the mode, its device bytes per level-0 voxel of the window and its PCIe traffic per step */
+                const size_t vox = (size_t)B * p3, upb = (size_t)B * (g_gpu_want && unet_input_converted() ? 1 : (size_t)g_xc) * p3 * xbytes()
+                                   + (g_pack ? (size_t)B * p3 : (size_t)B * (g_tc + 1) * p3) + (g_gpu_want ? (size_t)B * NN_RAD_REC(g_Pz) : 0);
+                fprintf(stderr, "memory: %s%s, %.2f of %.2f GB free per GPU (%.1f B per voxel); per step %.2f GB batch upload, %.2f GB host offloads "
+                        "each way (%.1f B per voxel%s)\n", cand[pick].what, fastest ? (pick_hoff ? " (--mem fast: with host offloads)" : " (--mem fast: no host offloads)") : "",
+                        pick_need / 1e9, fmin / 1e9, (double)pick_need / (double)vox, upb / 1e9, pick_off / 1e9, (double)pick_off / (double)vox,
+                        fastest || !pick_off ? "" : "; --mem fast skips them where the window fits without");
+            }
+            unet_set_host_offloads(pick_hoff);
+            unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean); unet_set_share_enc_a1(cand[pick].sea || (pick_hoff && sea_force));
             unet_set_l0_3buf(cand[pick].l3);
             if (unet_share_enc_a1()) fprintf(stderr, "memory: shared encoder a1, %s (default; UFSM_RC_ENC_A1=0 off)\n", unet_a1_offload() ? "offloaded to pinned host memory between its uses" : "conv1 re-run in the backward");
             if (unet_grad_mx4()) fprintf(stderr, "memory: MX gradients stored as MX-fp4 (default; UFSM_GRAD_MX4=0: MX-fp8)\n");
