@@ -127,6 +127,30 @@ int main(void) {
         if (!same) bad++;
         free(ha); free(hb);
     }
+    for (int C = 8; C <= 64; C *= 2) {   /* the persistent grid-stride apply (several trips per thread, a partial last sweep) writes the bytes
+                                            of a row per thread (lp_set_gn_persist(0)): same arithmetic, same SR keys */
+        const uint64_t rs0 = rs;
+        shape5 s = {2, C, 37, 41, 43};
+        size_t n = shape_numel(s), NG = (size_t)N * G;
+        float *x = dev_rand(n, 2.f), *gam = dev_rand(C, 1.f), *bet = dev_rand(C, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
+        { float h[64]; nn_d2h(h, rstd, NG * 4); for (size_t i = 0; i < NG; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, NG * 4); }
+        void *xm = mx4_from(x, s); float *gy = dev_rand_wide(n, 1e-3f); void *gym = mx4_from(gy, s);
+        float *gg = dev_zero(C), *gb = dev_zero(C), *scr = nn_malloc(nn_gn_scratch(s) + 4096);
+        void *gxa = mx4_new(s), *gxb = mx4_new(s);
+        const size_t bytes = nn_mx4_bytes(s);
+        mode_mx();
+        lp_set_gn_persist(0); nn_set_sr_step(1600); nn_gn_silu_bwd(xm, s, G, gam, bet, mean, rstd, gym, (float *)gxa, gg, gb, scr);
+        lp_set_gn_persist(1); nn_set_sr_step(1600); nn_gn_silu_bwd(xm, s, G, gam, bet, mean, rstd, gym, (float *)gxb, gg, gb, scr);
+        lp_set_gn_persist(-1);
+        uint8_t *ha = malloc(bytes), *hb = malloc(bytes); nn_d2h(ha, gxa, bytes); nn_d2h(hb, gxb, bytes);
+        size_t nd = 0; for (size_t i = 0; i < bytes; i++) nd += ha[i] != hb[i];
+        const int ok = !nd && !nn_check();
+        printf("  gn+silu bwd persistent apply, %2d ch: %zu of %zu gx bytes differ from a row per thread%s\n", C, nd, bytes, ok ? "" : "  FAIL");
+        if (!ok) bad++;
+        free(ha); free(hb);
+        nn_free(x); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd); nn_free(xm); nn_free(gy); nn_free(gym); nn_free(gg); nn_free(gb); nn_free(scr); nn_free(gxa); nn_free(gxb);
+        rs = rs0;
+    }
     /* dec[0]'s GN+SiLU backward with the head's input gradient recomputed from the fp16 logit gradient (unet's three level-0 buffers):
        the same bits as the head's backward-data into an MX-fp4 buffer followed by the GN backward from it (gx, the GroupNorm parameter
        gradients, the seed sequence); gx in place over x. The two-op path's bits are the mode lp_set_gn_head_exact(0); the default exact
@@ -174,7 +198,7 @@ int main(void) {
                                             backward-data of the fp16 logit gradient (one SR of tens of percent, the mean of K ~1 / sqrt(K):
                                             unbiased), the GroupNorm parameter gradients ~fp32 (no stored gradient in between), the seed count */
         nn_set_tf32(1); nn_set_prec(3); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1);
-        const int co = 2, Kh = 16; const shape5 s = {1, C, 16, 32, 32}, os = {1, co, 16, 32, 32};
+        const int co = 2, Kh = 16; const shape5 s = {1, C, 24, 48, 61}, os = {1, co, 24, 48, 61};   /* (several trips of the persistent apply) */
         const int Gh = C / 4;
         const size_t n = shape_numel(s), no = shape_numel(os), S = shape_spatial(s), xb = nn_mx4_bytes(s);
         float *x = dev_rand_wide(n, 1.f), *gam = dev_rand(C, 1.f), *bet = dev_rand(C, 0.5f), *mean = dev_zero(Gh), *rstd = dev_zero(Gh), *wh = dev_rand((size_t)co * C, 0.5f);

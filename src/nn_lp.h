@@ -96,6 +96,7 @@ void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G, const floa
 /* the same for an MX-fp4 x of 8 / 16 channels whose gy is the head's input gradient recomputed from the fp16 logit gradient gl
    (ci channels, head weights wh [ci][C], the head backward-data's SR seed hs); the apply writes gx in place over x */
 int lp_gn_silu_bwd_head_ok(int C, int ci);
+void lp_set_gn_persist(int on);      /* GN backward applies: 1 persistent grid-stride (default), 0 a row per thread (test hook), -1 env */
 void lp_set_gn_head_exact(int on);   /* the head-recomputing GN backward: 1 exact fp32 gy (default), 0 the two-op path's bits, -1 env */
 void lp_gn_silu_bwd_head_stats(const void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                const void *gl, int ci, const float *wh, unsigned hs, double *ds);
