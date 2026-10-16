@@ -76,6 +76,10 @@ static uint64_t next_u64(uint64_t *s) {
     v = (v ^ (v >> 27)) * UINT64_C(0x94d049bb133111eb);
     return v ^ (v >> 31);
 }
+/* fmaxf / fminf against a constant that is not a NaN (glibc's semantics: a NaN x gives the constant), inline: the libm calls
+   were ~5% of an --aug all sampler profile and kept the per-voxel loops scalar */
+static inline float fmax_c(float x, float c) { return x >= c ? x : c; }
+static inline float fmin_c(float x, float c) { return x <= c ? x : c; }
 static double uniform(uint64_t *s) { return (double)(next_u64(s) >> 11) * 0x1.0p-53; }
 static double sym1(uint64_t *s) { return 2 * uniform(s) - 1; }
 /* Irwin-Hall of four bytes: unit variance, |g| < 3.46. Two draws per 64 bits. */
@@ -278,7 +282,16 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
     float *tmp = malloc(2 * P2 * sizeof *tmp), *dense = calloc(P, sizeof *dense), *row = malloc(P * sizeof *row);
     if (!tmp || !dense || !row) abort();
     double sum = 0, sq = 0; size_t nz = 0; size_t hist[256] = {0};
-    for (size_t k = 0; k < p3; k++) { F[k] = ctu[k]; Z[k] = !ctu[k]; }
+    size_t k0 = 0;
+#ifdef __AVX2__
+    for (; k0 + 16 <= p3; k0 += 16) {   /* the bytes as floats, and the air flags */
+        const __m128i b = _mm_loadu_si128((const __m128i *)(ctu + k0));
+        _mm256_storeu_ps(F + k0, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(b)));
+        _mm256_storeu_ps(F + k0 + 8, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(b, 8))));
+        _mm_storeu_si128((__m128i *)(Z + k0), _mm_and_si128(_mm_cmpeq_epi8(b, _mm_setzero_si128()), _mm_set1_epi8(1)));
+    }
+#endif
+    for (size_t k = k0; k < p3; k++) { F[k] = ctu[k]; Z[k] = !ctu[k]; }
     for (size_t k = 0; k < p3; k += 7) hist[ctu[k]]++;   /* magnitudes only need the statistics of a subsample */
     for (int v = 1; v < 256; v++) { nz += hist[v]; sum += (double)v * hist[v]; sq += (double)v * v * hist[v]; }
     const double mean = nz ? sum / nz : 128, sd = nz ? sqrt(fmax(sq / nz - mean * mean, 1)) : 32;   /* of the material (nonzero) voxels */
@@ -405,7 +418,7 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
         const float s0 = (float)((.05 + .2 * uniform(&rs)) * SO(SA_NOISE) * sd), mix = (float)uniform(&rs), im = (float)(1 / mean);
         for (size_t r = 0; r < P2; r++) {
             float *v = F + r * P; gauss_row(&ns, row, P);
-            for (int x = 0; x < P; x++) v[x] += s0 * row[x] * ((1 - mix) + mix * sqrtf(fmaxf(v[x], 0) * im));
+            for (int x = 0; x < P; x++) v[x] += s0 * row[x] * ((1 - mix) + mix * sqrtf(fmax_c(v[x], 0) * im));
         }
     }
     if (on & 1u << SA_CNOISE) {   /* correlated noise: unit-variance AR(1) along x, y, z (ct_augment's generator) */
@@ -489,11 +502,12 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
             for (int z = b0[0]; z < b1[0]; z++) for (int y = b0[1]; y < b1[1]; y++) memset(Z + z * P2 + (size_t)y * P + b0[2], 1, b1[2] - b0[2]);
         }
     }
-    if (tone) for (size_t k = 0; k < p3; k++) { float v = fminf(fmaxf(F[k], 0), 255); int i = (int)v; F[k] = lut[i] + (v - i) * (lut[i + 1] - lut[i]); }
-    if ((on & 1u << SA_HIST) && c->nhist > 0) {   /* the window's material histogram onto a target scan's (quantile mapping), blended */
+    const int hist_on = (on & 1u << SA_HIST) && c->nhist > 0;
+    if (tone && hist_on) for (size_t k = 0; k < p3; k++) { float v = fmin_c(fmax_c(F[k], 0), 255); int i = (int)v; F[k] = lut[i] + (v - i) * (lut[i + 1] - lut[i]); }
+    if (hist_on) {   /* the window's material histogram onto a target scan's (quantile mapping), blended */
         const float *ct = c->hist + (size_t)(uniform(&rs) * c->nhist) * 256; const double alpha = fmin(1, (.5 + .5 * uniform(&rs)) * SO(SA_HIST));
         double hw[257] = {0}, nw = 0;
-        for (size_t k = 0; k < p3; k += 7) if (!Z[k]) { float v = fminf(fmaxf(F[k], 1), 255); hw[(int)v] += 1; nw++; }
+        for (size_t k = 0; k < p3; k += 7) if (!Z[k]) { float v = fmin_c(fmax_c(F[k], 1), 255); hw[(int)v] += 1; nw++; }
         if (nw > 0) {
             float hm[257]; double acc = 0; int t = 1;
             for (int v = 0; v < 256; v++) {
@@ -503,11 +517,46 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
                 hm[v] = (float)(t - 1 + fmin(1, fmax(0, f)));
             }
             hm[256] = hm[255];
-            for (size_t k = 0; k < p3; k++) { float v = fminf(fmaxf(F[k], 0), 255); int i = (int)v; const float m = hm[i] + (v - i) * (hm[i + 1] - hm[i]); F[k] = (float)(alpha * m + (1 - alpha) * F[k]); }
+            for (size_t k = 0; k < p3; k++) { float v = fmin_c(fmax_c(F[k], 0), 255); int i = (int)v; const float m = hm[i] + (v - i) * (hm[i + 1] - hm[i]); F[k] = (float)(alpha * m + (1 - alpha) * F[k]); }
         }
     }
-    if (step > 0) { const float is = 1 / step; for (size_t k = 0; k < p3; k++) F[k] = (floorf(F[k] * is) + .5f) * step; }
-    for (size_t k = 0; k < p3; k++) { float v = fminf(fmaxf(F[k] + .5f, 1), 255.5f); uint8_t q = (uint8_t)(int)v; ctu[k] = Z[k] ? 0 : q; }
+    /* the tone curve (unless the histogram needed it first), the quantisation and the byte conversion: pointwise, in that order,
+       one pass */
+    const int tone_now = tone && !hist_on; const float is = step > 0 ? 1 / step : 0;
+    size_t kf = 0;
+#ifdef __AVX2__
+    {   /* 8 lanes: the clamps as selects with fmax_c / fmin_c's comparisons, the tone table through gathers, floorf as round-down */
+        const __m256 zero = _mm256_setzero_ps(), c255 = _mm256_set1_ps(255), half = _mm256_set1_ps(.5f), one = _mm256_set1_ps(1), top = _mm256_set1_ps(255.5f),
+                     vis = _mm256_set1_ps(is), vstep = _mm256_set1_ps(step);
+        for (; kf + 8 <= p3; kf += 8) {
+            __m256 f = _mm256_loadu_ps(F + kf);
+            if (tone_now) {
+                __m256 v = _mm256_blendv_ps(zero, f, _mm256_cmp_ps(f, zero, _CMP_GE_OQ));
+                v = _mm256_blendv_ps(c255, v, _mm256_cmp_ps(v, c255, _CMP_LE_OQ));
+                const __m256i i = _mm256_cvttps_epi32(v);
+                const __m256 l0 = _mm256_i32gather_ps(lut, i, 4), l1 = _mm256_i32gather_ps(lut + 1, i, 4);
+                f = _mm256_add_ps(l0, _mm256_mul_ps(_mm256_sub_ps(v, _mm256_cvtepi32_ps(i)), _mm256_sub_ps(l1, l0)));
+            }
+            if (step > 0) f = _mm256_mul_ps(_mm256_add_ps(_mm256_floor_ps(_mm256_mul_ps(f, vis)), half), vstep);
+            __m256 v = _mm256_add_ps(f, half);
+            v = _mm256_blendv_ps(one, v, _mm256_cmp_ps(v, one, _CMP_GE_OQ));
+            v = _mm256_blendv_ps(top, v, _mm256_cmp_ps(v, top, _CMP_LE_OQ));
+            __m256i q = _mm256_cvttps_epi32(v);   /* 1 .. 255 */
+            uint64_t zb; memcpy(&zb, Z + kf, 8);
+            const __m256i zm = _mm256_cmpeq_epi32(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128((long long)zb)), _mm256_setzero_si256());
+            q = _mm256_and_si256(q, zm);   /* Z: air 0 */
+            const __m256i p = _mm256_packus_epi16(_mm256_packus_epi32(q, q), _mm256_setzero_si256());
+            const uint64_t qb = (uint64_t)(uint32_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(p)) | (uint64_t)(uint32_t)_mm_cvtsi128_si32(_mm256_extracti128_si256(p, 1)) << 32;
+            memcpy(ctu + kf, &qb, 8);
+        }
+    }
+#endif
+    for (size_t k = kf; k < p3; k++) {
+        float f = F[k];
+        if (tone_now) { const float v = fmin_c(fmax_c(f, 0), 255); const int i = (int)v; f = lut[i] + (v - i) * (lut[i + 1] - lut[i]); }
+        if (step > 0) f = (floorf(f * is) + .5f) * step;
+        const float v = fmin_c(fmax_c(f + .5f, 1), 255.5f); const uint8_t q = (uint8_t)(int)v; ctu[k] = Z[k] ? 0 : q;
+    }
     free(tmp); free(dense); free(row);
     return on;
 }
