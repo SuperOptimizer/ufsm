@@ -1169,33 +1169,27 @@ static int cmd_side_votes(int argc, char **argv) {
 }
 
 /* ufsm wind-assign <ref-root> <ref-key> <out-dir> <tifxyz>... [--ref-um 4.8] [--vol-um 2.4] [--kind codes|winding] [--tol 6]
-   [--step 4] [--dir 0] [--axis JSON] [--axis-um U] [--drop-duplicates 0]
+   [--step 4] [--dir 0] [--axis JSON] [--axis-um U] [--drop-duplicates 0] [--threads 4]
    Winding ids for surfaces of other authors / runs (src/wind.h): each tifxyz gets q = K + dir theta / 2 pi per vertex in the gauge of
    a reference winding raster (codes: raster --value / the published band codes; winding: phase-raster --winding 1, dense), written
    as <out-dir>/<name> (x / y / z copied, q.tif float32, NaN where dropped or unassigned) for `ufsm raster --value q.tif`; one line
    per surface on stdout and in <out-dir>/assign.jsonl. --tol: label voxels from the reference that count as on it; --vol-um: the
    surfaces' scan voxel; --axis-um: the axis JSON's voxel (default --vol-um); --out-um: the voxel of the written coordinates (default
    --vol-um; the reference's --ref-um puts them on its grid for raster --value and codes-merge). */
-typedef struct { z3 *z; int kind; } wa_ref;
+typedef struct { z3 *z; int kind; int nt; } wa_ref;
 typedef struct { int64_t key; size_t i; } wa_pt;
 static int cmp_wa_pt(const void *a, const void *b) { const int64_t x = ((const wa_pt *)a)->key, y = ((const wa_pt *)b)->key; return x < y ? -1 : x > y; }
-static void wa_lookup(void *ud, const float *pts, size_t n, float tol, float *dist, float *qref) {   /* per 128^3 block of points: one haloed read */
-    const wa_ref *R = ud; const int H = (int)ceilf(tol), B = 128, S = B + 2 * H; const z3_meta *m = z3_meta_of(R->z);
-    wa_pt *ord = malloc(n * sizeof *ord); uint8_t *blk = malloc((size_t)S * S * S);
-    if (!ord || !blk) { free(ord); free(blk); for (size_t i = 0; i < n; i++) { dist[i] = INFINITY; qref[i] = NAN; } return; }
-    for (size_t i = 0; i < n; i++) {
-        const int64_t bz = (int64_t)floorf(pts[3 * i] / B), by = (int64_t)floorf(pts[3 * i + 1] / B), bx = (int64_t)floorf(pts[3 * i + 2] / B);
-        ord[i] = (wa_pt){((bz + 4096) << 40) | ((by + 4096) << 20) | (bx + 4096), i};
-    }
-    qsort(ord, n, sizeof *ord, cmp_wa_pt);
-    for (size_t a = 0; a < n;) {
-        size_t b = a; while (b < n && ord[b].key == ord[a].key) b++;
-        const size_t i0 = ord[a].i;
+typedef struct { const wa_ref *R; const float *pts; const wa_pt *ord; const size_t *g; size_t ng; float tol; float *dist, *qref; atomic_size_t next; } wa_job;
+static void *wa_blocks(void *arg) {   /* the point groups (one 128^3 block each) taken in turn: one haloed read per block */
+    wa_job *J = arg; const wa_ref *R = J->R; const float *pts = J->pts; const int H = (int)ceilf(J->tol), B = 128, S = B + 2 * H; const z3_meta *m = z3_meta_of(R->z);
+    uint8_t *blk = malloc((size_t)S * S * S);
+    for (size_t gi; (gi = atomic_fetch_add(&J->next, 1)) < J->ng;) {
+        const size_t a = J->g[gi], b = J->g[gi + 1], i0 = J->ord[a].i;
         const int64_t o[3] = {(int64_t)floorf(pts[3 * i0] / B) * B - H, (int64_t)floorf(pts[3 * i0 + 1] / B) * B - H, (int64_t)floorf(pts[3 * i0 + 2] / B) * B - H}, nn[3] = {S, S, S};
         int inside = 1; for (int d = 0; d < 3; d++) inside &= o[d] + S > 0 && o[d] < m->shape[d];
-        const int ok = inside && !z3_read(R->z, o, nn, blk, 1);
+        const int ok = blk && inside && !z3_read(R->z, o, nn, blk, 1);
         for (size_t t = a; t < b; t++) {
-            const size_t i = ord[t].i; dist[i] = INFINITY; qref[i] = NAN;
+            const size_t i = J->ord[t].i; float *dist = J->dist, *qref = J->qref; dist[i] = INFINITY; qref[i] = NAN;
             if (!ok) continue;
             const int z0 = (int)lroundf(pts[3 * i]) - (int)o[0], y0 = (int)lroundf(pts[3 * i + 1]) - (int)o[1], x0 = (int)lroundf(pts[3 * i + 2]) - (int)o[2];
             for (int z = z0 - H; z <= z0 + H; z++) for (int y = y0 - H; y <= y0 + H; y++) for (int x = x0 - H; x <= x0 + H; x++) {
@@ -1206,9 +1200,26 @@ static void wa_lookup(void *ud, const float *pts, size_t n, float tol, float *di
                 if (d < dist[i]) { dist[i] = d; qref[i] = q; }
             }
         }
-        a = b;
     }
-    free(ord); free(blk);
+    free(blk); return nullptr;
+}
+static void wa_lookup(void *ud, const float *pts, size_t n, float tol, float *dist, float *qref) {   /* per 128^3 block of points: one haloed read, R->nt threads */
+    const wa_ref *R = ud; const int B = 128;
+    wa_pt *ord = malloc(n * sizeof *ord); size_t *g = malloc((n + 1) * sizeof *g);
+    if (!ord || !g) { free(ord); free(g); for (size_t i = 0; i < n; i++) { dist[i] = INFINITY; qref[i] = NAN; } return; }
+    for (size_t i = 0; i < n; i++) {
+        const int64_t bz = (int64_t)floorf(pts[3 * i] / B), by = (int64_t)floorf(pts[3 * i + 1] / B), bx = (int64_t)floorf(pts[3 * i + 2] / B);
+        ord[i] = (wa_pt){((bz + 4096) << 40) | ((by + 4096) << 20) | (bx + 4096), i};
+    }
+    qsort(ord, n, sizeof *ord, cmp_wa_pt);
+    size_t ng = 0; for (size_t a = 0; a < n; a++) if (!a || ord[a].key != ord[a - 1].key) g[ng++] = a;
+    g[ng] = n;
+    wa_job J = {R, pts, ord, g, ng, tol, dist, qref, 0};
+    const int nt = R->nt < 1 ? 1 : R->nt > 64 ? 64 : R->nt; pthread_t th[64]; int k = 0;
+    for (; k < nt - 1 && pthread_create(&th[k], nullptr, wa_blocks, &J) == 0; k++) {}
+    wa_blocks(&J);
+    for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
+    free(ord); free(g);
 }
 typedef struct { axis ax; double f; } wa_axis;
 static void wa_axis_fn(void *ud, double z, double *cy, double *cx) { const wa_axis *A = ud; axis_at(&A->ax, z / A->f, cy, cx); *cy *= A->f; *cx *= A->f; }
@@ -1229,7 +1240,7 @@ static int cmd_wind_assign(int argc, char **argv) {
     if (!(ref_um > 0 && vol_um > 0 && axis_um > 0) || (strcmp(kind, "codes") && strcmp(kind, "winding")) || !(p.tol >= 0 && p.tol <= 32) || p.step < 1 || (p.dir != 0 && p.dir != 1 && p.dir != -1)) {
         fprintf(stderr, "wind-assign: --ref-um / --vol-um / --axis-um > 0, --kind codes|winding, --tol 0..32, --step >= 1, --dir -1|0|1\n"); return 2;
     }
-    wa_ref R = {z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr)), p.dense ? WIND_WINDING : WIND_CODES};
+    wa_ref R = {z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr)), p.dense ? WIND_WINDING : WIND_CODES, atoi(opt(argc, argv, "--threads", "4"))};
     if (!R.z) { fprintf(stderr, "wind-assign: %s\n", z3_error()); return 1; }
     wa_axis A = {.f = axis_um / vol_um};
     if (axis_load(&A.ax, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "wind-assign: cannot load the axis\n"); return 1; }
