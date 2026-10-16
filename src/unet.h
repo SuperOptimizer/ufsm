@@ -106,6 +106,7 @@ long unet_gn_pooled(unet *u, float *h);     /* pooled statistics (unet_gn_nstats
    warm forwards normalise with their own statistics (GroupNorm), later ones with the running statistics from before the forward.
    Defaults 0.01, 100; unet_l0_updates: training forwards so far (saved in checkpoints with the statistics) */
 void unet_set_l0_ema(unet *u, float mom, int warm);
+void unet_set_l0_slab_kern(int on);   /* --l0-norm slab on the kernel path (readers apply per-slab statistics; 1) or D's prototype (0); -1: env UFSM_L0_SLAB_KERN */
 /* ema: recalibrate the running statistics of the weights in use (the EMA weights' after unet_use_ema(u, 1)) -- every forward from
    unet_l0_recal(u, 1) to unet_l0_recal(u, 0) normalises with its window's statistics, their cumulative mean replaces that set (the
    standard BatchNorm recalibration of averaged weights; the update count and the other set unchanged) */

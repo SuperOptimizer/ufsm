@@ -127,11 +127,36 @@ Slab-aware so far: the head (lp_mx_conv1.cu: forward, the weight gradients, the 
 block's voxels capped to one slab so they span <= 2) and the skip half of the 16-wide decoder conv1 (lp_f4up.cu: the bank of each
 staged plane, reloaded at most once per tile). tests/test_l0_slab.c: these against fp32 with the right slab per plane (slabs with
 very different statistics: a reader on another slab's is ~100% off; head 2e-4, f4u at the per-sample kernel's fp4 error), and the
-unet kernel path with one slab = GroupNorm (logits bit for bit, gradients at the run-to-run atomic noise). With more than one slab the
-trainer stops (`UFSM_L0_SLAB_FORCE=1` overrides) until the remaining readers apply slabs: make_chan / stage_row32 / dec_row16_gn
-callers (lp_common.cuh), conv_fwd_f4_k / f4r / f4p (lp_f4fwd.cuh), the down0 s2 forward and weight gradient (lp_s2.cu), the fp4 / fp8
-weight gradients' x staging (lp_f4wgrad.cuh ctab4, lp_f8wgrad.cuh ctab8), the fp8 forward readers (lp_f8fwd.cuh), and the
-head-recomputing GN backward's logit-gradient indexing (lp_mx_gnbwd.cu _hg kernels; the three-buffer layout).
+unet kernel path with one slab = GroupNorm (logits bit for bit, gradients at the run-to-run atomic noise).
+
+S1 continued (2026-10-16): every MX reader applies slabs, so several slabs train (the multi-slab stop is gone; slabs must be multiples
+of 8 planes, and with one slab nothing is registered: the statistics are the sample's and every reader runs its GroupNorm kernel).
+- make_chan takes the plane whose statistics apply (zg; lp_common.cuh chan_ab: the same affine alone). Readers with one coefficient
+  table per staged z range keep two banks: bank 0 = the range's first plane's slab, bank 1 (gn_bank2: at the end of the dynamic
+  shared memory, its bytes added by the launcher only for slab statistics) from plane zb = gn_zb (a range of <= 9 staged planes
+  spans <= 2 slabs of >= 8; gn_zb3 traps otherwise): conv_fwd_f4_k, conv_fwd_f4r_k (rebuilt per z tile when the slab pair changes),
+  conv_fwd_f8_k, conv_fwd_s2_f8_k, conv_fwd_s2_f4_k. Readers with per-thread coefficients reload them when the thread's staged plane
+  changes slab (each thread's planes ascend): conv_fwd_s2_f4p_k (down0), conv_fwd_s2_f8_k P16, conv_fwd_f8p_k, the weight gradients
+  conv_bwd_w_s2_f8_k (FAST: per plane before xdec, incl. the paired passes), conv_bwd_w_f8_k (FAST, tile and per-element paths),
+  conv_bwd_w_f4_k (LY 1 lanes, per-task channels); conv_fwd_f8s_k per element.
+- Not yet slab-aware, and not taken with slab statistics: conv_fwd_f4p_k (the packed 16-channel forward: fwd_f4_t routes a
+  16-channel GN input with gnp_t ns to the chunk kernels f4r / f4) and conv_bwd_w_f4ws_k (bwd_w_f4_t takes conv_bwd_w_f4_k; same
+  values). Both are a few lines (the s2_f4p / conv_bwd_w_f4_k pattern) once their current rewrite lands; until then the slab path
+  runs those layers on the slower kernels. The 16-bit / fp32 readers (nn_common.cuh gn_coef / gn_silu_at) trap on slab statistics
+  (the slab path needs MX tensors anyway).
+- The head-recomputing GN backward (three level-0 buffers) runs over the pseudo-sample shape like the other GN backwards:
+  nn_gn_silu_bwd_head_ns indexes the per-sample fp16 logit gradient from (sample, slab).
+- tests/test_l0_slab.c: every reader family (stride 1 / 2 forward at fp4 / fp8, 16 / 32 channels, the 4-channel input kernel;
+  weight gradients fp4 / fp8, with and without SR, stride 1 / 2) against fp32 with each plane's slab: the error equals the same
+  kernel's against per-sample statistics (its fp4 / fp8 baseline), and ~0.8-0.9 from the per-sample reference; the unet with 4 / 2
+  slabs (MX-fp8, no SR) against the prototype: 0.059 logits / 0.28 gradients, as with one slab (0.063 / 0.31), and 0.24 / 1.0 from
+  GroupNorm. test_grad_mx4 with UFSM_L0_NORM=4 UFSM_L0_SLAB=8 UFSM_L0_SLAB_KERN=1: three level-0 buffers vs four with 4 slabs, logits
+  equal, gradients 1e-9. bench_f4conv at its default P384: every output value and statistic equal to the base.
+- Training smoke (laptop 5080, production net, P512, rv48 sources, 60 steps, `--l0-norm slab --l0-slab 32` = 16 slabs,
+  UFSM_L0_SLAB_KERN=1): runs with the three level-0 buffers at 36.5 B per voxel / 4.89 GB like GroupNorm (the prototype: 46.1 B),
+  losses tracking GroupNorm's (step 60: 0.629 vs 0.621, val 0.741 vs 0.736 on 2 batches); 1.49 vs 1.77 samp/s (-16%): the chunk
+  forwards and conv_bwd_w_f4_k in place of conv_fwd_f4p_k / conv_bwd_w_f4ws_k, and the producers' statistics pass (S2 folds it into
+  the epilogues).
 
 ## Trainer host RAM: packed targets, validation windows on disk (2026-10-15)
 At P768 the laptop trainer (production net, 6 workers, 7 slots, 4.8 um rv48 side labels) was OOM-killed by the 37.6 GiB slice cap

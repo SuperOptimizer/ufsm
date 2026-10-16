@@ -108,10 +108,11 @@ int lp_gn_silu_bwd_head_ok(int C, int ci);
 void lp_set_gn_full8(int on);        /* GN backward: 8-channel tensors on the NK 8 kernels (1, default) or the general ones (0, test hook) */
 void lp_set_gn_persist(int on);      /* GN backward applies: 1 persistent grid-stride (default), 0 a row per thread (test hook), -1 env */
 void lp_set_gn_head_exact(int on);   /* the head-recomputing GN backward: 1 exact fp32 gy (default), 0 the two-op path's bits, -1 env */
+/* ns > 1: s is the pseudo-sample shape of slab-local GroupNorm (s.n = samples x ns slabs of s.d planes; gl stays [sample][ci][ns s.d planes]) */
 void lp_gn_silu_bwd_head_stats(const void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
-                               const void *gl, int ci, const float *wh, unsigned hs, double *ds);
+                               const void *gl, int ci, const float *wh, unsigned hs, double *ds, int ns);
 void lp_gn_silu_bwd_head_apply(void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
-                               const void *gl, int ci, const float *wh, unsigned hs, const float *AB, unsigned gsr);
+                               const void *gl, int ci, const float *wh, unsigned hs, const float *AB, unsigned gsr, int ns);
 void lp_pred_input_mx(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, int z0, int nz, void *y, int hd, int bits);   /* the same, MX-fp4 (bits 4) or MX-fp8 (8) */
 void lp_pred_input_mx8(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, int z0, int nz, void *y, int hd);   /* predict input planes [z0, z0 + nz) -> MX-fp8 (hd: 16-bit rounding 2 fp16 / 1 bf16 / 0 none) */
 void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr);   /* ydt 3 MX-fp8, 4 MX-fp4 (exact SR keyed by sr) */

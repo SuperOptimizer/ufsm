@@ -223,6 +223,10 @@ void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gamma, const f
 int nn_gn_silu_bwd_head_ok(int C, int cout);
 int nn_gn_silu_bwd_head(float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const void *gl, int cout,
                         const float *wh, unsigned hs, float *ggamma, float *gbeta, float *scratch);
+/* the same over the pseudo-sample shape of slab-local GroupNorm (s.n = samples x ns z-slabs of s.d planes, statistics [n][ns][G]; the
+   logit gradient gl stays per sample); ns 1: nn_gn_silu_bwd_head */
+int nn_gn_silu_bwd_head_ns(float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const void *gl, int cout,
+                           const float *wh, unsigned hs, float *ggamma, float *gbeta, float *scratch, int ns);
 int nn_head_bwd_x_draws(void);
 /* level-0 normalisation alternatives (unet cfg.l0_norm, src/nn_l0norm.cu): while nn_set_gn_const is on, the GroupNorm backwards
    (nn_gn_bwd, nn_gn_silu_bwd, nn_gn_silu_bwd_head) treat the statistics as constants (no mean / variance gradient terms);

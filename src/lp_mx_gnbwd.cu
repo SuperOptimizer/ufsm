@@ -364,11 +364,14 @@ template <int CI, bool EX> __device__ __forceinline__ void head_gy_row_x(const f
         for (int i = 0; i < 4; i++) { const float2 a = dec_e2m1x2(w[j] >> (8 * i)); g[8 * j + 2 * i] = a.x; g[8 * j + 2 * i + 1] = a.y; }   /* raw; fg below */
     fg = mx_scale((unsigned)(uint8_t)(e + 127));
 }
+/* ns > 1: n is a pseudo sample (sample n / ns, z-slab n % ns of S voxels: slab-local GroupNorm over the pseudo-sample shape); gl stays
+   [sample][CI][ns S] */
 template <int CI, bool EX> __device__ __forceinline__ void head_gy_row(const float *sw, const __half *gl, int n, size_t S, size_t v, int bw, size_t ri, unsigned hs,
-                                                                       float *g, float &fg) {
+                                                                       float *g, float &fg, int ns) {
     float xi[CI];
+    const size_t gb = ns > 1 ? (size_t)(n / ns) * CI * S * ns + (size_t)(n % ns) * S : (size_t)n * CI * S, gs = ns > 1 ? S * ns : S;
 #pragma unroll
-    for (int ci = 0; ci < CI; ci++) xi[ci] = __half2float(gl[((size_t)n * CI + ci) * S + v]);
+    for (int ci = 0; ci < CI; ci++) xi[ci] = __half2float(gl[gb + (size_t)ci * gs + v]);
     head_gy_row_x<CI, EX>(sw, xi, bw, ri, hs, g, fg);
 }
 /* the head weights as conv1_to_mx_t_k stages them for channel block 0 (its w is the flipped [C][CI] copy: the same values) */
@@ -377,7 +380,7 @@ template <int CI> __device__ __forceinline__ void head_sw(float *sw, const float
 }
 template <int CI, bool FULL, bool EX>
 __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_hg_k(const uint8_t *x, const __half *gl, const float *wh, unsigned hs, const float *gamma, const float *beta,
-                                                               const float *mean, const float *rstd, int N, int C, int G, size_t S, float *part) {
+                                                               const float *mean, const float *rstd, int N, int C, int G, size_t S, float *part, int ns) {
     const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G;
     const int blk = blockIdx.y, n = blockIdx.z, nsl = gridDim.x;
     const int h0 = 0, tv = (int)threadIdx.x, nt = 256;
@@ -421,7 +424,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_hg_k(const uint8_t 
 #pragma unroll
                 for (int i = 0; i < 4; i++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * i)); r[8 * j + 2 * i] = a.x * fx; r[8 * j + 2 * i + 1] = a.y * fx; }
         }
-        head_gy_row<CI, EX>(sw, gl, n, S, v, bw, rbase + v, hs, g, fg);
+        head_gy_row<CI, EX>(sw, gl, n, S, v, bw, rbase + v, hs, g, fg, ns);
 #pragma unroll
         for (int k = 0; k < 16; k++) {
             if (FULL || k < kmax) {
@@ -451,7 +454,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_hg_k(const uint8_t 
 }
 template <int CI, bool FULL, bool EX>
 __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_hg_k(uint8_t *x, const __half *gl, const float *wh, unsigned hs, const float *gamma, const float *beta,
-                                                               const float *mean, const float *rstd, const float *AB, int N, int C, int G, size_t S, unsigned gsr) {
+                                                               const float *mean, const float *rstd, const float *AB, int N, int C, int G, size_t S, unsigned gsr, int ns) {
     const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G, blk = blockIdx.y, n = blockIdx.z;
     __shared__ float4 cf[32];
     __shared__ float sw[16 * CI];
@@ -481,7 +484,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_hg_k(uint8_t *x, co
 #pragma unroll
             for (int q = 0; q < 4; q++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * q)); r[8 * j + 2 * q] = a.x * fx; r[8 * j + 2 * q + 1] = a.y * fx; }
     }
-    head_gy_row<CI, EX>(sw, gl, n, S, v, bw, ri, hs, g, fg);
+    head_gy_row<CI, EX>(sw, gl, n, S, v, bw, ri, hs, g, fg, ns);
     unsigned am = 0u;
 #pragma unroll
     for (int k = 0; k < 16; k++) {
@@ -791,7 +794,7 @@ static int hg_exact(void) {
                                               case 3: K<3, F, EX><<<__VA_ARGS__; break; default: K<4, F, EX><<<__VA_ARGS__; } } while (0)
 #define HGK(K, F, ...) do { if (hg_exact()) HGK1(K, F, true, __VA_ARGS__); else HGK1(K, F, false, __VA_ARGS__); } while (0)
 extern "C" void lp_gn_silu_bwd_head_stats(const void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
-                                          const void *gl, int ci, const float *wh, unsigned hs, double *ds) {
+                                          const void *gl, int ci, const float *wh, unsigned hs, double *ds, int ns) {
     size_t S = shape_spatial(s);
     const int NC = s.n * s.c, nb = mx_nb(s.c), bw = mx_bw(s.c);
     const size_t ny = (size_t)nb * s.n;   /* the slabs of lp_gn_silu_bwd_mx (the same partial sums) */
@@ -803,27 +806,27 @@ extern "C" void lp_gn_silu_bwd_head_stats(const void *x, shape5 s, int G, const 
     float *part = lp_buf<float>(5, slabs * 2 * NC);
     cudaMemsetAsync(ds, 0, (size_t)2 * NC * sizeof(double));
     const uint8_t *xq = (const uint8_t *)x; const __half *g = (const __half *)gl;
-    if (bw >= 16 && s.c % bw == 0) HGK(gn_silu_bwd_stats_mx2_hg_k, true, grid, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, s.n, s.c, G, S, part));
-    else HGK(gn_silu_bwd_stats_mx2_hg_k, false, grid, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, s.n, s.c, G, S, part));
+    if (bw >= 16 && s.c % bw == 0) HGK(gn_silu_bwd_stats_mx2_hg_k, true, grid, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, s.n, s.c, G, S, part, ns));
+    else HGK(gn_silu_bwd_stats_mx2_hg_k, false, grid, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, s.n, s.c, G, S, part, ns));
     gn_part_sum_k<<<nblk_((size_t)2 * NC * 32, 256), 256>>>(part, (int)slabs, NC, ds);
     LPCK();
 }
 template <int CI, bool F, bool EX>
 static void hga(uint8_t *xq, const __half *g, const float *wh, unsigned hs, const float *gamma, const float *beta, const float *mean, const float *rstd,
-                const float *AB, shape5 s, int G, unsigned gsr) {
+                const float *AB, shape5 s, int G, unsigned gsr, int ns) {
     const size_t S = shape_spatial(s);
     const dim3 g2((unsigned)((S + 255) / 256), (unsigned)mx_nb(s.c), (unsigned)s.n);   /* a row per thread (a persistent loop hoisted the 48 coefficients: 171 registers, 1.4x slower) */
-    gn_silu_bwd_apply_mx2_hg_k<CI, F, EX><<<g2, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s.n, s.c, G, S, gsr);
+    gn_silu_bwd_apply_mx2_hg_k<CI, F, EX><<<g2, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s.n, s.c, G, S, gsr, ns);
 }
 extern "C" void lp_gn_silu_bwd_head_apply(void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
-                                          const void *gl, int ci, const float *wh, unsigned hs, const float *AB, unsigned gsr) {
+                                          const void *gl, int ci, const float *wh, unsigned hs, const float *AB, unsigned gsr, int ns) {
     g_gyrec.valid = 0;
     const int bw = mx_bw(s.c), full = bw >= 16 && s.c % bw == 0, ex = hg_exact();
     uint8_t *xq = (uint8_t *)x; const __half *g = (const __half *)gl;
-#define HGA1(F, EX) do { switch (ci) { case 1: hga<1, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr); break; \
-                                       case 2: hga<2, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr); break; \
-                                       case 3: hga<3, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr); break; \
-                                       default: hga<4, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr); } } while (0)
+#define HGA1(F, EX) do { switch (ci) { case 1: hga<1, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr, ns); break; \
+                                       case 2: hga<2, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr, ns); break; \
+                                       case 3: hga<3, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr, ns); break; \
+                                       default: hga<4, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr, ns); } } while (0)
     if (full && ex) HGA1(true, true); else if (full) HGA1(true, false); else if (ex) HGA1(false, true); else HGA1(false, false);
 #undef HGA1
     LPCK();

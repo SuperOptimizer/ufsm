@@ -13,6 +13,7 @@ static uint64_t rs = 12345;
 static float frand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (float)((rs >> 11) * 0x1.0p-53 * 2 - 1); }
 static int bad;
 static int l0e;   /* UFSM_L0_NORM: the end-to-end nets with level-0 norm 1 none / 2 ema (constant statistics) */
+static int l0s;   /* UFSM_L0_SLAB: their slab size (--l0-norm slab; 0: the default; 8: four slabs of the 32-plane windows) */
 static float *dev_rand(size_t n, float scale) { float *h = malloc(n * 4); for (size_t i = 0; i < n; i++) h[i] = frand() * scale; float *d = nn_malloc(n * 4); nn_h2d(d, h, n * 4); free(h); return d; }
 static float *dev_rand_wide(size_t n, float scale) {   /* magnitudes spread over 2^-4 .. 2^4: MX block scales differ per voxel */
     float *h = malloc(n * 4); for (size_t i = 0; i < n; i++) h[i] = frand() * scale * exp2f(rintf(4.f * frand()));
@@ -72,6 +73,7 @@ static void mode_mx(void) { nn_set_prec(3); nn_set_tf32(1); }
 int main(void) {
     nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0);
     l0e = getenv("UFSM_L0_NORM") ? atoi(getenv("UFSM_L0_NORM")) : 0;
+    l0s = getenv("UFSM_L0_SLAB") ? atoi(getenv("UFSM_L0_SLAB")) : 0;
     nn_set_act_bf16(0); nn_set_grad_bf16(0);
     {   /* e4m3 stochastic rounding of the fp8 weight gradient's gy (sr_e4m3x): unbiased, grid values exact (sr_e4m3, the dither then
            round-to-nearest, gives 1 -> 0.98438: -1/64 on powers of two). 4e6 roundings: sigma <= 0.5 ulp / 2000 */
@@ -562,7 +564,7 @@ int main(void) {
         if (wc == 3) { cfg.enc_blocks[1] = 1; cfg.enc_blocks[2] = 2; setenv("UFSM_RB_NONZERO", "1", 1); }
         shape5 xs = {1, 4, 32, 32, 32}; size_t nx = shape_numel(xs), no = nx / 4 * 2;
         float *x = dev_rand(nx, 1.f), *gyo = dev_rand(no, 1.f);
-        cfg.l0_norm = l0e;
+        cfg.l0_norm = l0e;   /* (slab: the default 64-plane slab, one per 32-plane window -- the 16-bit reference gradients have no slab GN backward) */
         unet *u = unet_create(&cfg); unet_init(u, 29); size_t np = unet_nparams(u);
         unsetenv("UFSM_RB_NONZERO");
         if (l0e == 2) { unet_set_l0_ema(u, 0.f, 1); unet_forward(u, x, xs, 1); }   /* (ema: the running statistics, constants from here on) */
@@ -807,7 +809,7 @@ int main(void) {
             const shape5 xs = {1, 4, 32, 32, 32};
             const size_t nx = shape_numel(xs), S = nx / 4, no = S * 2, tailb = 3 * S;
             float *xi[2] = {dev_rand(nx, 1.f), dev_rand(nx, 1.f)}, *gy[2] = {dev_rand(no, 1.f), dev_rand(no, 1.f)};
-            cfg.l0_norm = l0e;
+            cfg.l0_norm = l0e; cfg.l0_slab = l0s;
             unet *v = unet_create(&cfg); unet_init(v, 37); const size_t np = unet_nparams(v);
             unsetenv("UFSM_RB_NONZERO");
             if (l0e == 2) { unet_set_l0_ema(v, 0.f, 1); unet_forward(v, xi[0], xs, 1); }

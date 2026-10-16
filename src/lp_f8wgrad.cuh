@@ -114,7 +114,9 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
         const bool xin = tid < 180 && xgy >= 0 && xgy < H && xgx >= 0 && xgx < W;
         const bool Gany = gp.G != 0 || sp.gp2.G != 0;
         unsigned xr[2][XW], xsb[2]; bool xok[2];
+        int xgz0 = 0;   /* the planes in xr (slab-local GroupNorm: xdecode applies their slabs) */
         auto xload = [&](int gz0) {   /* raw rows of planes gz0, gz0 + 1 */
+            xgz0 = gz0;
 #pragma unroll
             for (int pl = 0; pl < 2; pl++) {
                 const int gz = gz0 + pl;
@@ -160,8 +162,16 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                             v[pl][4 * w + 2] = fmaf(1.f, d1.x * sc, 0.f); v[pl][4 * w + 3] = fmaf(1.f, d1.y * sc, 0.f);
                         }
                     }
+                    if (gp.ns || sp.gp2.ns) {   /* slab-local GroupNorm: plane xgz0 + pl's slab */
+#pragma unroll
+                        for (int q = 0; q < XC; q++) {
+                            const chan_t &cq = ctab8[q]; const float2 ab = chan_ab(ci0 + q < Ci ? ci0 + q : Ci, Ci, Cx, n, sp, gp, max(xgz0 + pl, 0));
+                            v[pl][q] = cq.p ? act_ab(v[pl][q], ab.x, ab.y, Gany && cq.g) : 0.f;
+                        }
+                    } else {
 #pragma unroll
                     for (int q = 0; q < XC; q++) { const chan_t &cq = ctab8[q]; v[pl][q] = cq.p ? act_ab(v[pl][q], cq.a, cq.b, Gany && cq.g) : 0.f; }
+                    }
                 }
             }
         };
@@ -310,7 +320,11 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                 if (inb) {
                     mx_rowch<T, CH>(c0, upt, gz, gyy, gx, D, H, W, v);   /* upt: the tile is the half-resolution x segment of a decoder conv */
 #pragma unroll
-                    for (int q = 0; q < CH; q++) { const chan_t &cq = ctab8[q]; v[q] = cq.p ? act_ab(v[q], cq.a, cq.b, Gany && cq.g) : 0.f; }
+                    for (int q = 0; q < CH; q++) {   /* (slab-local GroupNorm: plane gz's slab) */
+                        const chan_t &cq = ctab8[q];
+                        const float2 ab = gp.ns || sp.gp2.ns ? chan_ab(ci0 + q < Ci ? ci0 + q : Ci, Ci, Cx, n, sp, gp, gz) : make_float2(cq.a, cq.b);
+                        v[q] = cq.p ? act_ab(v[q], ab.x, ab.y, Gany && cq.g) : 0.f;
+                    }
                 }
                 unsigned ra[CH];   /* the channels' warp amaxes first (independent reductions), then lane 0's shared maxima */
 #pragma unroll
@@ -336,7 +350,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
         for (int task = warp; task < CH * np; task += 9) {
             int k = task / np, gz = gz_first + task % np, slot = (gz + 1) & 3, ci = ci0 + k;
             const bool ok = ci < Ci && gz >= 0 && gz < D;
-            chan_t c = make_chan(ok ? ci : Ci, Ci, Cx, n, plane, x, sp, gp, N);
+            chan_t c = make_chan(ok ? ci : Ci, Ci, Cx, n, plane, x, sp, gp, N, ok ? gz : 0);   /* (slab GroupNorm: plane gz's slab) */
             const T *xc = ok && !IS_MX(T) ? (const T *)c.p + (size_t)gz * H * W : x;
             const bool G = (gp.G != 0 || sp.gp2.G != 0) && c.g, el = IS_MX(T);   /* el: per-element access (MX rows) */
             float4 v4[2]; float vs = 0.f, amax = 0.f;

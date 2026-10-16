@@ -276,6 +276,7 @@ template <> __device__ __forceinline__ void stv<f16>(f16 *p, size_t i, float v) 
 typedef struct { int ntap; signed char dz[27], dy[27], dx[27], wt[27]; int pz, py, px, Dx, Hx, Wx; } tapset_t;   /* accum: y += conv instead of y = conv */
 /* per-channel affine form of gn: v' = v * a + b (a = 0 / b = 0 markers unused; caller checks p.G) */
 __device__ __forceinline__ void gn_coef(const gnp_t &p, int n, int ci, int C, float *a, float *b) {
+    if (p.ns) __trap();   /* (slab-local GroupNorm statistics: the 16-bit / fp32 readers do not apply slabs; the MX readers do) */
     int cpg = C / p.G, ng = n * p.G + ci / cpg;
     float sc = p.rstd[ng] * p.gamma[ci];
     *a = sc; *b = p.beta[ci] - p.mean[ng] * sc;
@@ -337,6 +338,7 @@ __device__ __forceinline__ void row18_gn(float *v, float a, float b, int x0, int
 gnp_t to_gnp(const nn_gn_t *g);
 __device__ __forceinline__ float gn_silu_at(float v, const gnp_t &p, int n, int ci, int C) {
     if (!p.G) return v;
+    if (p.ns) __trap();   /* (slab-local GroupNorm: see gn_coef) */
     int cpg = C / p.G, ng = n * p.G + ci / cpg;
     v = (v - p.mean[ng]) * p.rstd[ng] * p.gamma[ci] + p.beta[ci];
     return v / (1.f + expf(-v));

@@ -23,6 +23,7 @@
          y/z tap shifts; the per-channel tile scale is invariant under every shift. */
 #include "nn.h"
 #include "nn_lp.h"
+#include "lp_slab.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -177,8 +178,10 @@ __host__ __device__ __forceinline__ int seg_ci(int cp, int Ci, int Cx, int CxP) 
 /* MX: p = the channel's byte in block row 0 (fp8) or the row's first byte (fp4, nibble index in nib), bw = block width,
    rb = row bytes (element at voxel v: row p + v * rb), sp = the block's scale row */
 typedef struct { const void *p; const uint8_t *sp; float a, b; short bw, rb, g, nib; } chan_t;   /* g: gn+silu applies; 32 B */
+/* zg: a stored plane of the staged range whose GroupNorm statistics apply (slab-local GroupNorm, gnp_t ns > 0: the row of zg's
+   slab; per-sample statistics ignore it) */
 template <typename T>
-__device__ __forceinline__ chan_t make_chan(int ci, int Ci, int Cx, int n, size_t plane, const T *x, const split_t &sp, const gnp_t &gp, int N = 0) {
+__device__ __forceinline__ chan_t make_chan(int ci, int Ci, int Cx, int n, size_t plane, const T *x, const split_t &sp, const gnp_t &gp, int N = 0, int zg = 0) {
     chan_t c; c.p = nullptr; c.sp = nullptr; c.a = 1.f; c.b = 0.f; c.bw = 1; c.g = 0; c.rb = 1; c.nib = 0;
     if (ci >= 0 && ci < Ci) {
         if constexpr (IS_MX(T)) {
@@ -192,9 +195,20 @@ __device__ __forceinline__ chan_t make_chan(int ci, int Ci, int Cx, int n, size_
         const bool s2g = sp.x2 && sp.gp2.G;   /* per-segment GroupNorms */
         const gnp_t &q = s2g && ci >= Cx ? sp.gp2 : gp;
         const int cc = s2g && ci >= Cx ? ci - Cx : ci, Cg = s2g ? (ci >= Cx ? Ci - Cx : Cx) : Ci;
-        if (q.G) { int ng = n * q.G + cc / (Cg / q.G); float a = q.rstd[ng] * q.gamma[cc]; c.a = a; c.b = q.beta[cc] - q.mean[ng] * a; c.g = 1; }
+        if (q.G) { int ng = gn_row(q, n, zg) * q.G + cc / (Cg / q.G); float a = q.rstd[ng] * q.gamma[cc]; c.a = a; c.b = q.beta[cc] - q.mean[ng] * a; c.g = 1; }
     }
     return c;
+}
+/* make_chan's GN+SiLU affine (a, b) of channel ci at stored plane zg alone (per-plane reloads of slab-local GroupNorm readers);
+   (1, 0) where no GroupNorm applies */
+__device__ __forceinline__ float2 chan_ab(int ci, int Ci, int Cx, int n, const split_t &sp, const gnp_t &gp, int zg) {
+    if (ci < 0 || ci >= Ci) return make_float2(1.f, 0.f);
+    const bool s2g = sp.x2 && sp.gp2.G;
+    const gnp_t &q = s2g && ci >= Cx ? sp.gp2 : gp;
+    const int cc = s2g && ci >= Cx ? ci - Cx : ci, Cg = s2g ? (ci >= Cx ? Ci - Cx : Cx) : Ci;
+    if (!q.G) return make_float2(1.f, 0.f);
+    const int ng = gn_row(q, n, zg) * q.G + cc / (Cg / q.G); const float a = q.rstd[ng] * q.gamma[cc];
+    return make_float2(a, q.beta[cc] - q.mean[ng] * a);
 }
 /* voxel offset of (z, y, x) */
 __device__ __forceinline__ size_t cof(const chan_t &, int z, int y, int x, int H, int W) { return ((size_t)z * H + y) * W + x; }

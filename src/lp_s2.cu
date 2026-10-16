@@ -64,12 +64,21 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__
         float2 gab[16];
 #pragma unroll
         for (int k = 0; k < 16; k++) gab[k] = make_float2(pc[k].a, pc[k].b);
+        int srow = gp.ns ? -1 : n;   /* slab-local GroupNorm: the statistics row in gab (a thread's planes ascend) */
         float v[3][16];
 #pragma unroll
         for (int it = 0; it < 3; it++) {
             const int p = threadIdx.x + 256 * it, row = p / 17, c = p - row * 17, ix = c < 9 ? 2 * c : 2 * (c - 9) + 1;
             const int iz = row / 9, iy = row - iz * 9, gz = 2 * oz0 - 1 + iz, gyy = 2 * oy0 - 1 + iy, gx = 2 * ox0 - 1 + ix;
             const bool inb = p < S2F8_T && gz >= 0 && gz < D && gyy >= 0 && gyy < H && gx >= 0 && gx < W;
+            if (G && gp.ns) {
+                const int rz = gn_row(gp, n, max(gz, 0));
+                if (rz != srow) {
+                    srow = rz;
+#pragma unroll
+                    for (int k = 0; k < 16; k++) if (k < Ci) gab[k] = gn_ab(gp, rz, k, Ci);
+                }
+            }
             stage_row16<T>(c0, Ci, plane, inb ? ((size_t)gz * H + gyy) * W + gx : 0, inb, G, gab, v[it]);
             unsigned am = 0u;
 #pragma unroll
@@ -108,10 +117,20 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__
                 }
             }
         }
-    } else
+    } else {
+    /* slab-local GroupNorm: the 5 staged planes 2 oz0 - 1 .. 2 oz0 + 3 in at most two slabs, bank 1 (cab2) from plane zb */
+    const int zb = gn_zb(gp, 2 * oz0 - 1, 2 * oz0 + 3);
+    if (gn_zb3(gp, gp, 2 * oz0 - 1, 2 * oz0 + 3)) __trap();
+    float2 *cab2 = gn_bank2(smem_raw, 32);
     for (int ci0 = 0; ci0 < Cip; ci0 += 32) {
         __syncthreads();
-        if (G) { if (threadIdx.x < 32) ctab[threadIdx.x] = make_chan(ci0 + threadIdx.x, Ci, Ci, n, plane, x, nsp, gp, N); __syncthreads(); }
+        if (G) {
+            if (threadIdx.x < 32) {
+                ctab[threadIdx.x] = make_chan(ci0 + threadIdx.x, Ci, Ci, n, plane, x, nsp, gp, N, max(2 * oz0 - 1, 0));
+                if (zb != INT_MAX) { const chan_t c2 = make_chan(ci0 + threadIdx.x, Ci, Ci, n, plane, x, nsp, gp, N, zb); cab2[threadIdx.x] = make_float2(c2.a, c2.b); }
+            }
+            __syncthreads();
+        }
         for (int p = threadIdx.x; p < S2F8_T; p += 256) {   /* p = row * 17 + parity-split column */
             int row = p / 17, c = p - row * 17, ix = c < 9 ? 2 * c : 2 * (c - 9) + 1;
             int iz = row / 9, iy = row - iz * 9;
@@ -144,8 +163,9 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__
 #pragma unroll
             for (int k = 0; k < 32; k++) {
                 int ci = ci0 + k;
-                if (IS_MX(T)) { const chan_t &c = ctab[k]; v[k] = inb && c.p ? act_ab(v[k], c.a, c.b, true) : 0.f; }
-                else if (G) { const chan_t c = ctab[k]; v[k] = inb && c.p ? act_ab(ldc<T>(c, off), c.a, c.b, true) : 0.f; }
+                const float2 ab = gz >= zb ? cab2[k] : make_float2(ctab[k].a, ctab[k].b);   /* (slab GroupNorm: plane gz's bank) */
+                if (IS_MX(T)) { const chan_t &c = ctab[k]; v[k] = inb && c.p ? act_ab(v[k], ab.x, ab.y, true) : 0.f; }
+                else if (G) { const chan_t c = ctab[k]; v[k] = inb && c.p ? act_ab(ldc<T>(c, off), ab.x, ab.y, true) : 0.f; }
                 else v[k] = inb && ci < Ci ? ldx(x + ((size_t)n * Ci + ci) * plane, off) : 0.f;
                 amax = fmaxf(amax, fabsf(v[k]));
             }
@@ -185,6 +205,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__
                 }
             }
         }
+    }
     }
     if constexpr (IS_MX(T)) {   /* MX output (blocks of 32 / 16 channels per voxel); fp4: nibble pairs across lanes g, g + 1 as fwd_epilogue */
         constexpr int B = MX_BITS(T);
@@ -258,6 +279,7 @@ template <int MT, typename T, bool P16 = false> static void launch_s2f8(dim3 gri
     size_t smem = (size_t)S2F8_T * 32 + 768 + 9 * MT * 16 * 32 + ((9 * MT * 16 + 15) & ~15) + 32 * sizeof(chan_t);
     static int attr[8];
     if (P16) { const size_t sp16 = (size_t)S2F8_T * 16 + 16 + 64 + 256 + 18 * MT * 16 * 33 + 16 + 16 * sizeof(chan_t); if (sp16 > smem) smem = sp16; }
+    if (gp.ns) smem += 32 * 8 + 16;   /* (slab GroupNorm: the second coefficient bank, gn_bank2) */
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_s2_f8_k<MT, T, P16>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     conv_fwd_s2_f8_k<MT, T, P16><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (T *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, ys.d, ys.h, ys.w, gp);
 }
@@ -312,6 +334,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__rest
     };
     if (!GEN) stage_chunk(0);
     __syncthreads();
+    float2 *cab2 = gn_bank2(smem_raw, 32);   /* slab GroupNorm: bank 1 (the launcher adds it) */
+    int skey = -1;
     for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
         const int oz0 = tz * 2;
         float acc[MT][2][4];
@@ -320,6 +344,22 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__rest
         for (int ch = 0; ch < nch; ch++) {
         if (GEN) { __syncthreads(); stage_chunk(ch); }   /* the previous chunk's MMA is done with the weights and the channel table */
         __syncthreads();   /* the previous tile's (chunk's) MMA is done with the staged input */
+        int zb = INT_MAX;
+        if (gp.ns) {   /* slab-local GroupNorm (block-uniform): the 5 staged planes in at most two slabs, bank 1 from plane zb */
+            const int z0 = 2 * oz0 - 1, z1 = 2 * oz0 + 3;
+            if (gn_zb3(gp, gp, z0, z1)) __trap();
+            zb = gn_zb(gp, z0, z1);
+            const int key = 2 * gn_row(gp, 0, max(z0, 0)) + (zb != INT_MAX);
+            if (GEN || key != skey) {
+                skey = key;
+                if (threadIdx.x < 32) {
+                    const chan_t c = make_chan(ch * 32 + (int)threadIdx.x, Ci, Ci, n, plane, (const mx4_t *)x, nsp, gp, N, max(z0, 0));
+                    cab[threadIdx.x] = make_float2(c.a, c.b); ctab[threadIdx.x].a = c.a; ctab[threadIdx.x].b = c.b;
+                    if (zb != INT_MAX) { const chan_t c2 = make_chan(ch * 32 + (int)threadIdx.x, Ci, Ci, n, plane, (const mx4_t *)x, nsp, gp, N, zb); cab2[threadIdx.x] = make_float2(c2.a, c2.b); }
+                }
+                __syncthreads();
+            }
+        }
         const unsigned gmask = *sgm;
         const chan_t c0 = ctab[0];
         const bool cpy = !G && c0.bw == 32;   /* plain MX-fp4 rows: copied (exact) */
@@ -336,7 +376,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__rest
                 continue;
             }
             float v[32];
-            stage_row32<mx4_t>(ctab, off, inb, G, v, cab, gmask);
+            stage_row32<mx4_t>(ctab, off, inb, G, v, gz >= zb ? cab2 : cab, gmask);
             unsigned amu = 0u;
 #pragma unroll
             for (int k = 0; k < 32; k++) amu = amax_u(amu, v[k]);
@@ -466,6 +506,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4p_k(const mx4_t *__restr
     float2 gab[16];
 #pragma unroll
     for (int k = 0; k < 16; k++) gab[k] = make_float2(ctab[k].a, ctab[k].b);
+    int srow = gp.ns ? -1 : n;   /* slab-local GroupNorm: the statistics row in gab (each thread's planes ascend: a reload per slab) */
     uint8_t *sb = (uint8_t *)sxw;
     for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
         const int oz0 = tz * 2, p0 = tz == zc * ZC ? 0 : 1, npos = (NP - p0) * 17 * 33;   /* tile planes p0 .. 4 are new */
@@ -490,6 +531,14 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4p_k(const mx4_t *__restr
                 uint2 q = raw[it];
                 unsigned sc = in ? rsc[it] : 1u;
                 if (G) {   /* dequantise, GN+SiLU (stage_row16's arithmetic), requantise */
+                    if (gp.ns) {
+                        const int rz = gn_row(gp, n, max(gz, 0));
+                        if (rz != srow) {
+                            srow = rz;
+#pragma unroll
+                            for (int k = 0; k < 16; k++) if (k < Ci) gab[k] = gn_ab(gp, rz, k, Ci);
+                        }
+                    }
                     float v[16];
                     dec_row16_gn(q, rsc[it], in, Ci, G, gab, v);
                     unsigned am = 0u;
@@ -549,7 +598,7 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
         /* MX-fp4 input of one 32-channel block (down0): the fp4 kernel (conv_fwd_s2_f4_k); UFSM_S2_F4=0: the fp8 one */
         uint8_t *wq = lp_buf<uint8_t>(0, (size_t)28 * Cop * 16), *ws = lp_buf<uint8_t>(1, (size_t)28 * Cop);
         prep_w4_k<<<nblk_((size_t)28 * Cop, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, 32, -1, 0, -1, 0);
-        const size_t smem = (size_t)S2F4_T * 16 + ((S2F4_T + 127) & ~127) + 14 * 32 * 32 + ((14 * 32 + 7) & ~7) * 2 + 32 * sizeof(chan_t) + 32 * 8 + 16;
+        const size_t smem = (size_t)S2F4_T * 16 + ((S2F4_T + 127) & ~127) + 14 * 32 * 32 + ((14 * 32 + 7) & ~7) * 2 + 32 * sizeof(chan_t) + 32 * 8 + 16 + (gp.ns ? 32 * 8 + 16 : 0);   /* (slab GroupNorm: bank 1) */
         const int nzt = (ys.d + 1) / 2, base = ((ys.w + 15) / 16) * ((ys.h + 3) / 4);
         int ZC = nzt < 8 ? nzt : 8;
         while (ZC > 1 && (size_t)base * ((nzt + ZC - 1) / ZC) < 480) ZC--;
@@ -570,7 +619,7 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
         const int Cip = xs.c, nchk = Cip / 32, ncot = Cop / 32;
         uint8_t *wq = lp_buf<uint8_t>(0, (size_t)28 * Cop * (Cip / 2)), *ws = lp_buf<uint8_t>(1, (size_t)28 * Cop * nchk);
         prep_w4_k<<<nblk_((size_t)28 * Cop * nchk, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, Cip, -1, 0, -1, 0);
-        const size_t smem = (size_t)S2F4_T * 16 + ((S2F4_T + 127) & ~127) + 14 * 32 * 32 + ((14 * 32 + 7) & ~7) * 2 + 32 * sizeof(chan_t) + 32 * 8 + 16;
+        const size_t smem = (size_t)S2F4_T * 16 + ((S2F4_T + 127) & ~127) + 14 * 32 * 32 + ((14 * 32 + 7) & ~7) * 2 + 32 * sizeof(chan_t) + 32 * 8 + 16 + (gp.ns ? 32 * 8 + 16 : 0);   /* (slab GroupNorm: bank 1) */
         const int nzt = (ys.d + 1) / 2, base = ((ys.w + 15) / 16) * ((ys.h + 3) / 4) * ncot * xs.n;
         int ZC = nzt < 8 ? nzt : 8;
         while (ZC > 1 && (size_t)base * ((nzt + ZC - 1) / ZC) < 480) ZC--;
@@ -798,7 +847,17 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
         };
         /* plane gz: amax into the pass's buffer, one barrier, the scales by lanes < CH, e4m3 into the ring (slot (gz + 1) % 5;
            position u: even -> E[u / 2], odd -> O[(u - 1) / 2] at byte 20 + (u - 1) / 2) */
+        int srow = gp.ns ? -1 : n;   /* slab-local GroupNorm: the statistics row in xga / xgb */
+        auto xslab = [&](int gz) {   /* (slab GroupNorm) xga / xgb for plane gz's slab, before xdec decodes the plane (block-uniform) */
+            if (!gp.ns) return;
+            const int rz = gn_row(gp, n, max(gz, 0));
+            if (rz == srow) return;
+            srow = rz;
+#pragma unroll
+            for (int q = 0; q < CH; q++) if (ci0 + q < Ci) { const float2 ab = gn_ab(gp, rz, ci0 + q, Ci); xga[q] = ab.x; xgb[q] = ab.y; }
+        };
         auto xpass = [&](const unsigned (&r_)[2][XW], const unsigned (&s_)[2], int gz) {
+            xslab(gz);
             float v[2][CH];
             xdec(r_, s_, v);
             unsigned *am = amx + (npass % 3) * CH;
@@ -833,7 +892,7 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
            make a 2-plane scale as precise as a 1-plane one; 4 -> 2 barriers per z-step). UFSM_S2W_PAIR=0: plane by plane */
         auto xpass2 = [&](const unsigned (&ra_)[2][XW], const unsigned (&sa_)[2], int gz, const unsigned (&rb_)[2][XW], const unsigned (&sb_)[2]) {
             float va[2][CH], vb[2][CH];
-            xdec(ra_, sa_, va); xdec(rb_, sb_, vb);
+            xslab(gz); xdec(ra_, sa_, va); xslab(gz + 1); xdec(rb_, sb_, vb);
             unsigned *am = amx + (npass % 3) * CH;
             unsigned rr[CH];
 #pragma unroll
@@ -987,6 +1046,10 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
             for (int iz = zt == zt_begin ? 0 : 1; iz < 5; iz++, npass++) {
                 const int gz = 2 * oz0 - 1 + iz, slot = (gz + 1) % 5;
                 unsigned *am = amx + (npass % 3) * CH;
+                float2 sab[CH];   /* the channels' GN+SiLU affine for plane gz (slab-local GroupNorm: its slab's) */
+                const int rz = gn_row(gp, n, max(gz, 0));
+#pragma unroll
+                for (int q = 0; q < CH; q++) sab[q] = gp.ns && ci0 + q < Ci ? gn_ab(gp, rz, ci0 + q, Ci) : make_float2(ctab[q].a, ctab[q].b);
                 float v[2][CH];
 #pragma unroll
                 for (int r = 0; r < 2; r++) {
@@ -996,7 +1059,7 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
                     if (idx < 561 && gz >= 0 && gz < D && gyy >= 0 && gyy < H && gx >= 0 && gx < W) {
                         mx_rowch<T, CH>(c0, false, gz, gyy, gx, D, H, W, v[r]);
 #pragma unroll
-                        for (int q = 0; q < CH; q++) { const chan_t &cq = ctab[q]; v[r][q] = cq.p ? act_ab(v[r][q], cq.a, cq.b, Gany && cq.g) : 0.f; }
+                        for (int q = 0; q < CH; q++) { const chan_t &cq = ctab[q]; v[r][q] = cq.p ? act_ab(v[r][q], sab[q].x, sab[q].y, Gany && cq.g) : 0.f; }
                     }
                 }
 #pragma unroll
@@ -1028,7 +1091,7 @@ __global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(
             const bool ok = ci < Ci && gz >= 0 && gz < D;
             const T *xc = IS_MX(T) ? x : x + ((size_t)n * Ci + (ok ? ci : 0)) * plane + (size_t)(ok ? gz : 0) * H * W;
             const split_t nsp = {};
-            const chan_t cm = make_chan(ok ? ci : Ci, Ci, Ci, n, plane, x, nsp, gp, N);   /* MX element access, gn+silu coefficients */
+            const chan_t cm = make_chan(ok ? ci : Ci, Ci, Ci, n, plane, x, nsp, gp, N, ok ? gz : 0);   /* MX element access, gn+silu coefficients */
             float v[3][8], vh = 0.f, amax = 0.f;
 #pragma unroll
             for (int i = 0; i < 3; i++) {

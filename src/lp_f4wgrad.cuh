@@ -167,7 +167,11 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             const bool act = grp < 3 && q < CH;
             const chan_t &cq = ctab4[act ? q : 0];
             const bool rok = act && cq.p && gz >= 0 && gz < D && gyy >= 0 && gyy < H, G = (gp.G != 0 || sp.gp2.G != 0) && cq.g;
-            const float ca = cq.a, cb = cq.b;
+            float ca = cq.a, cb = cq.b;
+            if ((gp.ns || sp.gp2.ns) && act) {   /* slab-local GroupNorm: plane gz's slab */
+                const int ci = ci0 + q; const chan_t cz = make_chan(ci < Ci ? ci : Ci, Ci, Cx, n, upt ? plane / 8 : plane, x, sp, gp, N, max(gz, 0));
+                ca = cz.a; cb = cz.b;
+            }
             const int jlo = ox0 == 0 ? 1 : 0, jhi = W - ox0 + 1;   /* x = ox0 - 1 + j inside [0, W) */
             const unsigned *src = (const unsigned *)(xt + ((act ? q : 0) * 10 + r) * 24 + 2);   /* words: bf16 2 .. 21 = positions -1 .. 18 */
             unsigned wv[10];
@@ -216,7 +220,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_f4_k(const T *__restrict__ 
             const int task = task0 + 9 * u;
             int k = mxu ? task : task / np, gz = gz_first + (mxu ? pass : task % np), ci = ci0 + k;
             const bool ok = task < NXT && ci < Ci && gz >= 0 && gz < D;
-            chan_t c = make_chan(ok ? ci : Ci, Ci, Cx, n, plane, x, sp, gp, N);
+            chan_t c = make_chan(ok ? ci : Ci, Ci, Cx, n, plane, x, sp, gp, N, ok ? gz : 0);   /* (slab GroupNorm: plane gz's slab) */
             const T *xc = ok && !IS_MX(T) ? (const T *)c.p + (size_t)gz * H * W : x;
             const bool G = (gp.G != 0 || sp.gp2.G != 0) && c.g, el = IS_MX(T);
             __syncwarp();
@@ -1100,7 +1104,8 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
             if (NT == 2 && (sp.x2 == nullptr || sp.c_split % 16 == 0)) NTw = 2;
             else if (xs.c % 8 == 0 && (sp.x2 == nullptr || sp.c_split % 8 == 0)) NTw = 1;
             if (ws_env == 3 && !(NTw == 2 && MT == 2)) NTw = 0;   /* UFSM_F4W_WS=3: the old selection (>= 32 outputs, 16-channel input tiles), A/B */
-            if constexpr (IS_MX(T)) if (ws_env && lay == 1 && !had && !sp.up && NTw) {
+            /* (slab-local GroupNorm x, gnp_t ns: conv_bwd_w_f4_k below, which applies each plane's slab; the warp-specialised one does not yet) */
+            if constexpr (IS_MX(T)) if (ws_env && lay == 1 && !had && !sp.up && NTw && !gp.ns && !sp.gp2.ns) {
                 /* warp-specialised persistent kernel: the blocks of a channel tile split its (tile, z chunk) items; z chunks
                    short enough for >= 4 items per SM, then the block count with the shortest estimated makespan (waves x
                    items per block, in z-steps: + 1 per item for its 4-plane first step, + 6 per block for fill and drain).

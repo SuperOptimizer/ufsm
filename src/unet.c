@@ -640,10 +640,12 @@ static void free_acts(unet *u) {
    the slab geometry and applies the slab of each plane (no normalised copy, no extra rounding: D's prototype is the reference);
    the producer convs' statistics come from a pass over the pseudo-sample shape ((sample, slab) of one MX channel block is a sample
    of the same layout), the GroupNorm backwards run over that shape on the raw tensor with the true statistics. Uniform slabs. */
+static int g_l0s_kern = -1;   /* unet_set_l0_slab_kern; -1: env UFSM_L0_SLAB_KERN */
+void unet_set_l0_slab_kern(int on) { g_l0s_kern = on; }
 static int l0s_kern(const unet *u) {
     static int k = -1;
     if (k < 0) { const char *e = getenv("UFSM_L0_SLAB_KERN"); k = e ? atoi(e) : 0; }
-    return k && u->cfg.l0_norm == 4 && nn_get_tf32();
+    return (g_l0s_kern >= 0 ? g_l0s_kern : k) && u->cfg.l0_norm == 4 && nn_get_tf32();
 }
 static int l0s_nslab(const unet *u, int d) { const int S = u->cfg.l0_slab; return (d + S - 1) / S; }
 /* a1 / a2: nullptr = allocate, else a shared buffer (inference or recompute 2) */
@@ -1580,16 +1582,14 @@ static float *l0_live(unet *u, const block *b, int conv, int r) {   /* where con
 static void l0s_begin(unet *u);
 static void l0s_kern_begin(unet *u) {   /* slab kernel path: the level-0 statistics arrays and their slab geometry into the registry */
     const int S = u->cfg.l0_slab, D = u->ls[0].d, ns = l0s_nslab(u, D), hw = u->ls[0].h * u->ls[0].w;
-    static int force = -1; if (force < 0) force = getenv("UFSM_L0_SLAB_FORCE") ? atoi(getenv("UFSM_L0_SLAB_FORCE")) : 0;
     if (ns > 1 && D % S) { fprintf(stderr, "unet: --l0-norm slab (kernel path): the level-0 depth %d is not a multiple of the slab (%d planes)\n", D, S); abort(); }
     if (ns > 1 && (sp_on(u) || u->gn_frz)) { fprintf(stderr, "unet: --l0-norm slab (kernel path): no split / frozen statistics yet\n"); abort(); }
-    if (ns > 1 && !force) {
-        fprintf(stderr, "unet: --l0-norm slab (kernel path) with %d slabs: the readers in lp_common.cuh (make_chan), lp_f4fwd.cuh, lp_s2.cu, "
-                        "lp_f4wgrad.cuh, lp_f8wgrad.cuh and the head-recomputing GN backward (lp_mx_gnbwd.cu) do not apply per-slab statistics yet "
-                        "(level-0 streaming plan S1); UFSM_L0_SLAB_FORCE=1 runs anyway (wrong results where they are used)\n", ns);
+    if (ns > 1 && S % 8) {   /* (the MX readers stage at most 9 planes per coefficient table: two banks, i.e. two slabs, need S >= 8) */
+        fprintf(stderr, "unet: --l0-norm slab (kernel path): slabs of %d planes; multiples of 8 only\n", S);
         abort();
     }
     for (int i = 0; i < 4; i++) if (u->l0s_reg[i]) { lp_gn_slab_reg(u->l0s_reg[i], 0, 0, 0, 0); u->l0s_reg[i] = nullptr; }
+    if (ns <= 1) return;   /* one slab: the statistics are the sample's ([n][1][G] = [n][G]): every reader as GroupNorm, its usual kernels */
     for (int i = 0; i < (u->cfg.nlev > 1 ? 2 : 1); i++) for (int k = 1; k <= 2; k++) {
         block *b = i ? &u->dec[0] : &u->enc[0];
         if (k == 1 && b->single) continue;
@@ -1619,6 +1619,15 @@ static void l0_begin(unet *u) {   /* forward start: latch l0_c, the constant sta
    A prototype: the normalised tensor is rounded to the storage format once more (round to nearest) and the gradient once more */
 static int l0_slab_on(const unet *u, const block *b) { return u->cfg.l0_norm == 4 && l0_blk(u, b) >= 0; }
 static shape5 l0s_shape(const unet *u, const block *b) { shape5 p = b->ys; const int S = u->cfg.l0_slab; p.n *= p.d / S; p.d = S; return p; }
+/* a per-sample GroupNorm op (nn_gn_silu_apply) on block b's level-0 tensor x (shape s; output y) on the slab kernel path with several
+   slabs: the pseudo-sample shape ((sample, slab) of an MX tensor of one channel block is a sample of the same layout); s otherwise */
+static shape5 l0s_view(const unet *u, const block *b, shape5 s, const void *x, const void *y) {
+    if (!(l0_slab_on(u, b) && l0s_kern(u) && l0s_nslab(u, s.d) > 1)) return s;
+    if (!nn_storage(x) || (y && !nn_storage(y)) || s.c > 32) {
+        fprintf(stderr, "unet: --l0-norm slab (kernel path): a materialised level-0 GN+SiLU needs MX tensors of one channel block\n"); abort();
+    }
+    return l0s_shape(u, b);
+}
 static void l0s_begin(unet *u) {
     const int S = u->cfg.l0_slab, D = u->ls[0].d, G = l0_G(u), w0 = u->cfg.widths[0];
     if (D % S) { fprintf(stderr, "unet: --l0-norm slab: the level-0 depth %d is not a multiple of the slab (%d planes)\n", D, S); abort(); }
@@ -1825,7 +1834,7 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
         if (sg) {   /* one conv: a2 is the output */
             FQ(b->a2, b->ys); FQ_AFF(b->a2, b->ys, b->pm2, b->pr2, G);
             sp_halo(u, b->a2, b->ys, 0);
-            if (b->s2) { PROF(3, nn_gn_silu_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2)); FQ(b->s2, b->ys); FQ_POST(b->s2, b->ys); }
+            if (b->s2) { PROF(3, nn_gn_silu_apply(b->a2, l0s_view(u, b, b->ys, b->a2, b->s2), G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2)); FQ(b->s2, b->ys); FQ_POST(b->s2, b->ys); }
             nn_set_conv(-1);
             return;
         }
@@ -1860,7 +1869,7 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
         l0_slab_fwd(u, b, 2, b->a2, 1);
         FQ(b->a2, b->ys); FQ_AFF(b->a2, b->ys, b->pm2, b->pr2, G);
         sp_halo(u, b->a2, b->ys, 0);
-        if (b->s2) { PROF(3, nn_gn_silu_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2)); FQ(b->s2, b->ys); FQ_POST(b->s2, b->ys); }
+        if (b->s2) { PROF(3, nn_gn_silu_apply(b->a2, l0s_view(u, b, b->ys, b->a2, b->s2), G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2)); FQ(b->s2, b->ys); FQ_POST(b->s2, b->ys); }
         return;
     }
     /* constant level-0 statistics (they sit in m / r): live ones into l0_live for the running update, then the affine + SiLU */
@@ -2449,8 +2458,9 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         nn_exec_prec_note(1, 0);
         nn_set_layer(3 * L - 3); nn_set_conv(1);
         nn_set_gn_const(l0_fixed(u, d0));
-        PROF(3, r = nn_gn_silu_bwd_head(d0->a2, d0->ys, G_of(u, d0->c2.cout), P(u, d0->n2.gamma), P(u, d0->n2.beta), d0->m2, d0->r2, glogits, u->cfg.cout,
-                                        P(u, u->head.w), hs, g + d0->n2.gamma, g + d0->n2.beta, u->gn_scratch));
+        const int hns = l0_slab_on(u, d0) && l0s_kern(u) ? l0s_nslab(u, d0->ys.d) : 1;   /* slab kernel path: over the pseudo-sample shape */
+        PROF(3, r = nn_gn_silu_bwd_head_ns(d0->a2, hns > 1 ? l0s_shape(u, d0) : d0->ys, G_of(u, d0->c2.cout), P(u, d0->n2.gamma), P(u, d0->n2.beta), d0->m2, d0->r2,
+                                           glogits, u->cfg.cout, P(u, u->head.w), hs, g + d0->n2.gamma, g + d0->n2.beta, u->gn_scratch, hns));
         nn_set_gn_const(0);
         if (r) rc_fail("three level-0 buffers: the head-recomputing GroupNorm backward");
         nn_set_conv(-1); nn_set_layer(3 * L - 2);
