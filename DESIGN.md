@@ -684,6 +684,32 @@ plus 32 halo planes each; CT statistics and GroupNorm sums reduced across them):
 needs ~12.2 GB per GPU. Byte-identical to one GPU on the Paris4 box (window 576; 320 with 128 shards, both tilings), halves
 emulated on the laptop's one GPU. Two real GPUs not yet run.
 
+### The 16-wide production net (2026-10-16)
+
+The slabs, the level-1 slabs and the coarse offload were gated to level widths that are multiples of 32, so the production net
+(7 levels 16, 16, 32, 64, 128, 192, 256; MX-fp4) ran the phase-1 layout (20.6 B per window voxel) and predict had no working default
+window (288 and 544 are not multiples of 64). Now: 16- and 8-channel levels take the slabs (whole MX blocks; the offload's layout uses
+each tensor's own block width), the CT stem builds an MX-fp4 input as these nets are trained (UFSM_XIN_PREC=4), and with one fp16
+logit channel the head runs per z-slab with its logits over X's first data rows (lg_x: the 16-wide Y holds 1.1 of their 2 B per voxel).
+10.1 B per window voxel, logits byte-identical to the phase-1 layout (test_infer_mem: fp8 / fp4 stem input, fp32 / fp16 logits,
+offload 0 / 1 / 2, the split).
+
+Laptop RTX 5080 (16 GB), a 1000-step checkpoint, Paris4 2.4 um, the cached 1024^3 box at 49664, 20992, 20992:
+- 576 / 32 (8 windows): 1.66 s of GPU time without slabs, 1.79 s with (the slab plane copies), outputs identical.
+- 1088 / 32, one window per 2^3 shards, now the default on 16 GB cards: 13.8 GB, ~1.5 s of GPU per window in a run of 8 (871 Mvox/s
+  computed, ~700 Mvox/s of interior); the shards compress at ~3.8 GB/s on a ring of 2 k^3 pinned buffers (not a bottleneck); the
+  reader (0.2 s per window) and the CT upload (0.06 s) are minor.
+- GPU time per 1088 window: the 16-channel convs (f4p) 31%, dec[0]'s conv1 with the fused upsample (f4u) 25%, the slab plane copies
+  13% (D2D at ~300 GB/s copy rate, ~60% of the laptop's DRAM bandwidth; a single-launch copy kernel was no faster), the stem 9%,
+  the 64-wide convs 6%, down0 5%, the head 3%.
+- Halo: against a 1088 / 288 reference (interior 512, every voxel 288+ from its window's edge), 1088 / 32 differs by a mean
+  4.9 / 255 (2.2% of 0.5 decisions flip) and 576 / 32 by 7.1 / 255 (3.9%), both nearly flat in the distance to the window edge
+  (5.3 at 0-31, ~4.0 beyond 256): the halo matters little, the window does: per-window GroupNorm statistics make the predictions
+  depend on the window's size and placement (frozen statistics, predict --gn-save / --gn-frozen, remove that).
+- Paris4 level 0 is 75784 x 32693 x 32693 (81 Tvox, 20.8 Tvox nonzero after the mask); 22,505 windows of interior 1024 hold CT:
+  ~10 h on the laptop GPU at 1.57 s per window (GPU-bound; a CT read over HTTP aside); not measured on a 5060 Ti (estimate:
+  ~2x per GPU at half the DRAM bandwidth, so ~10 h with the desk's two, predict --gpus 0,1).
+
 ## Memory and inference defaults (2026-10-08)
 
 - Training stores the MX activation gradients as MX-fp4 with exact stochastic rounding by default when every width is a

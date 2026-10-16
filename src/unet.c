@@ -619,8 +619,9 @@ static size_t act_bytes_of(shape5 s) { return act_mx8() ? nn_mx_bytes(s, act_dt(
 /* MX storage: channels per block of a c-channel tensor (nn_mx4_bytes), and the bytes per voxel of one block's data row */
 static int mx_bw_of(int c) { return c <= 8 ? 8 : c <= 16 ? 16 : 32; }
 static int mx_rb_of(int c) { return act_mx4() ? mx_bw_of(c) / 2 : mx_bw_of(c); }
-/* in-place inference slabs at a level of c channels: whole MX blocks (8, 16 or a multiple of 32 channels) */
-static int slab_w_ok(int c) { return c % 32 == 0 || c == 16 || c == 8; }
+/* in-place inference slabs at a level of c channels: whole MX blocks of 16 or a multiple of 32 channels (8: the z-range needs the
+   fused output statistics, cout >= 16) */
+static int slab_w_ok(int c) { return c % 32 == 0 || c == 16; }
 
 /* coarse offload: enc[1]'s conv1 reads down0's output (w[0] channels) in place in Y (w[1]): placed at the data rows of Y's last
    w[0] / 32 blocks, so plane z of each of its blocks (data rows, then scales) sits where Y's plane z of a block goes */

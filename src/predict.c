@@ -403,10 +403,13 @@ int cmd_predict(int argc, char **argv) {
                         "       [--gn-save FILE]   pool the GroupNorm statistics of every window processed into FILE (calibration)\n"
                         "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n"
                         "       [--papyrus-cut T]   task papyrus nets conditioned on the cutoff: papyrus where the smoothed CT exceeds T (raw CT units)\n");
-        fprintf(stderr, "  Default window: shard + 32 with halo 16 (one window per shard) when it fits the GPU, else 288 with halo 8. For exact shard tiling, window - 2*halo should divide the shard size: 544 with halo 16 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n"
+        fprintf(stderr, "  Default window: k shards + 2 halo (one window per k^3 shards) for the largest k <= 4 the box and the GPU hold, else one per shard,\n"
+                        "  else 288 with halo 8; the halo is 16, or 32 when the window must be a multiple of 64 (7 levels). For exact shard tiling, window - 2*halo should\n"
+                        "  divide the shard size: 544 with halo 16 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n"
                         "  Window - 2*halo = k * shard (k >= 2) with the box on that grid computes one window per k^3 shards (big GPUs: fewer, larger windows).\n"
                         "  Inference memory: UFSM_INFER_SLAB=N (default 64) runs the level-0/1 convs in place in N-plane slabs; UFSM_INFER_OFFLOAD=1 (default) keeps\n"
-                        "  the coarse levels in the level-0 buffer's tail while it waits on the host: ~21.3 B per window voxel (0: ~27; slabs 0: ~43.5).\n");
+                        "  the coarse levels in the level-0 buffer's tail while it waits on the host: ~21.3 B per window voxel with a 32-wide level 0 (0: ~27;\n"
+                        "  slabs 0: ~43.5), ~10.1 with the 16-wide production net (1088^3 on a 16 GB GPU).\n");
         return 2;
     }
     const char *ckpt = argv[2], *root = argv[3], *key = argv[4], *out = argv[5];
