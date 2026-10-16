@@ -108,6 +108,11 @@ long unet_gn_pooled(unet *u, float *h);     /* pooled statistics (unet_gn_nstats
 void unet_set_l0_ema(unet *u, float mom, int warm);
 void unet_set_l0_slab_kern(int on);   /* --l0-norm slab on the kernel path (readers apply per-slab statistics; 1) or D's prototype (0); -1: env UFSM_L0_SLAB_KERN */
 void unet_set_l0_stream(int on);      /* the level-0 slab stream (stage S3: level-0 ops per slab in a skewed schedule; 1); -1: env UFSM_L0_STREAM */
+/* stage S4: the stream runs the head per slab (no whole-window logits; with the rings dec[0].a2 and gout[0] are rings too): fwd(ctx, z0,
+   z1, lg16) after each slab's logits in a forward (fp16 [cout][(z1 - z0) h w], the loss statistics), bwd(ctx, z0, z1, lg16) in the
+   backward's dec[0] step: the slab's logits again, the callback writes the fp16 logit gradient (with the gradient scale) over them.
+   Nonzero returns abort. nullptr: the whole head (the default) */
+void unet_set_l0_head(unet *u, int (*fwd)(void *, int, int, const void *), int (*bwd)(void *, int, int, void *), void *ctx);
 void unet_set_l0_ring(int on);        /* stage S4: the stream's level-0 tensors in VMM slab rings (with stream 2; a training build input); -1: env UFSM_L0_RING */
 void unet_l0_stream_dump(int on);     /* test hook: keep device copies of gout[1] after dec[0]'s backward (0), d/d downo[0] (1), the skip gradient (2) */
 const void *unet_l0_stream_dumped(int k, size_t *bytes);
