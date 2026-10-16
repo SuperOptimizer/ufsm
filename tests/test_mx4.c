@@ -371,6 +371,7 @@ int main(void) {
         void *xm = mx4_from(x, xs); float *xd = deq4(xm, xs);
         float *yr = dev_zero(ny); void *ym = mx4_new(ys);
         mode_ref(); nn_conv3d_fwd(xd, xs, w, b, 32, 3, 2, yr);
+        lp_set_s2_f4(0);   /* (output width 8: the fp4 kernel's chunked variant takes it when on; checked below) */
         mode_mx(); nn_conv3d_fwd(xm, xs, w, b, 32, 3, 2, ym);
         cmp("s2 fwd (mx4 -> mx4, fp8 compute)", deq4(ym, ys), yr, ny, TOL4O);
         float *gam = dev_rand(32, 1.f), *bet = dev_rand(32, 0.5f), *mean = dev_rand(NG, 0.2f), *rstd = dev_rand(NG, 0.3f);
@@ -380,6 +381,45 @@ int main(void) {
         mode_ref(); nn_gn_silu_apply(xd, xs, G, gam, bet, mean, rstd, t); nn_conv3d_fwd(t, xs, w, b, 32, 3, 2, yr2);
         mode_mx(); nn_conv3d_fwd_x(xm, &g, nullptr, nullptr, 0, 0, xs, w, b, 32, 3, 2, (float *)ym2, 0, 0.f, nullptr, nullptr);
         cmp("s2 fwd gn+silu input (mx4 -> mx4)", deq4(ym2, ys), yr2, ny, TOL4O);
+        lp_set_s2_f4(-1);
+        {   /* the coarse down convs on the fp4 kernel's chunked variant (conv_fwd_s2_f4_k GEN): 32 -> 32 at output width 8, and 64 -> 96
+               (two input chunks, three output tiles) at odd output dims (P 704's coarsest width 11), gn+silu input; vs the fp8 kernel */
+            const int cis[2] = {32, 64}, cos_[2] = {32, 96};
+            const uint64_t rs0 = rs;   /* (the tests below draw the random inputs they drew before this one was added) */
+            lp_set_s2_f4g(1);
+            for (int k = 0; k < 2; k++) {
+                const int ci = cis[k], co = cos_[k];
+                shape5 xg = k ? (shape5){N, ci, 22, 18, 22} : xs, yg = k ? (shape5){N, co, 11, 9, 11} : ys;
+                const size_t nxg = shape_numel(xg), nyg = shape_numel(yg), NGg = (size_t)N * G;
+                float *xx = dev_rand(nxg, 1.f), *ww = dev_rand((size_t)co * ci * 27, 0.07f), *bb = dev_rand(co, 0.1f), *tg = dev_zero(nxg), *yrg = dev_zero(nyg);
+                float *gm = dev_rand(ci, 1.f), *bt = dev_rand(ci, 0.5f), *mn = dev_rand(NGg, 0.2f), *rs_ = dev_rand(NGg, 0.3f);
+                { float h[64]; nn_d2h(h, rs_, NGg * 4); for (size_t i = 0; i < NGg; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rs_, h, NGg * 4); }
+                nn_gn_t gg = {gm, bt, mn, rs_, G};
+                void *xxm = mx4_from(xx, xg); float *xxd = deq4(xxm, xg);
+                mode_ref(); nn_gn_silu_apply(xxd, xg, G, gm, bt, mn, rs_, tg); nn_conv3d_fwd(tg, xg, ww, bb, co, 3, 2, yrg);
+                double e[2];
+                for (int f4 = 0; f4 < 2; f4++) {
+                    void *yy = mx4_new(yg); lp_set_s2_f4(f4);
+                    mode_mx(); nn_conv3d_fwd_x(xxm, &gg, nullptr, nullptr, 0, 0, xg, ww, bb, co, 3, 2, (float *)yy, 0, 0.f, nullptr, nullptr);
+                    char nm[96]; snprintf(nm, sizeof nm, "s2 fwd gn+silu %d -> %d (out w %d), %s kernel", ci, co, yg.w, f4 ? "fp4" : "fp8");
+                    e[f4] = cmp(nm, deq4(yy, yg), yrg, nyg, f4 ? TOL4 : TOL4O);
+                    nn_free(yy);
+                }
+                {   /* deterministic: the same bytes on a second run */
+                    const size_t by = nn_mx4_bytes(yg); void *y1 = mx4_new(yg), *y2 = mx4_new(yg); lp_set_s2_f4(1);
+                    mode_mx(); nn_conv3d_fwd_x(xxm, &gg, nullptr, nullptr, 0, 0, xg, ww, bb, co, 3, 2, (float *)y1, 0, 0.f, nullptr, nullptr);
+                    nn_conv3d_fwd_x(xxm, &gg, nullptr, nullptr, 0, 0, xg, ww, bb, co, 3, 2, (float *)y2, 0, 0.f, nullptr, nullptr);
+                    uint8_t *h1 = malloc(by), *h2 = malloc(by); nn_d2h(h1, y1, by); nn_d2h(h2, y2, by);
+                    check("s2 fwd coarse fp4 kernel deterministic", !memcmp(h1, h2, by));
+                    free(h1); free(h2); nn_free(y1); nn_free(y2);
+                }
+                lp_set_s2_f4(-1);
+                check("s2 fwd coarse fp4 kernel taken", e[1] != e[0]);
+                nn_free(xx); nn_free(ww); nn_free(bb); nn_free(tg); nn_free(yrg); nn_free(gm); nn_free(bt); nn_free(mn); nn_free(rs_); nn_free(xxm); nn_free(xxd);
+            }
+            rs = rs0;
+            lp_set_s2_f4g(-1);
+        }
         {   /* down0's fp4 kernel (32 channels, output width % 16): the same reference, fp4 vs the fp8 kernel's error */
             shape5 xb = {N, 32, 32, 32, 32}, yb = {N, 32, 16, 16, 16};
             const size_t nxb = shape_numel(xb), nyb = shape_numel(yb);

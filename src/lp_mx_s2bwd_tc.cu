@@ -339,7 +339,10 @@ __global__ void prep_w4q_k(const float *__restrict__ w, uint8_t *__restrict__ wq
 }
 #define S2Q4_GX 24
 #define S2Q4_NG (3 * 9 * S2Q4_GX)
-__global__ void __launch_bounds__(256, 2) bwd_data_s2_f4q_k(const uint8_t *__restrict__ gy, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc, uint8_t *__restrict__ gx,
+#ifndef S2Q4_MINB
+#define S2Q4_MINB 2
+#endif
+__global__ void __launch_bounds__(256, S2Q4_MINB) bwd_data_s2_f4q_k(const uint8_t *__restrict__ gy, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc, uint8_t *__restrict__ gx,
                                                          int N, int D, int H, int W, int Do, int Ho, int Wo, int accum, unsigned osr, s2q4_quads Q, int ZC) {
     constexpr int TMX = 16, GX = S2Q4_GX, GY = 9, NG = S2Q4_NG;
     extern __shared__ __align__(128) unsigned char s2q_smem[];
@@ -478,6 +481,9 @@ static int s2b_f4q(const void *gy, shape5 ys, const float *w, shape5 xs, void *g
     const int nzt = (ys.d + 1) / 2, base = ((ys.w + 15) / 16) * ((ys.h + 7) / 8) * xs.n;
     int ZC = nzt < 8 ? nzt : 8;
     while (ZC > 1 && (size_t)base * ((nzt + ZC - 1) / ZC) < 480) ZC--;
+    static int zc_env = -2;
+    if (zc_env == -2) zc_env = getenv("UFSM_S2Q4_ZC") ? atoi(getenv("UFSM_S2Q4_ZC")) : -1;
+    if (zc_env > 0) ZC = zc_env < nzt ? zc_env : nzt;
     const dim3 grid((unsigned)((ys.w + 15) / 16), (unsigned)((ys.h + 7) / 8), (unsigned)(((nzt + ZC - 1) / ZC) * xs.n));
     const size_t sm = (size_t)S2Q4_NG * 8 + ((S2Q4_NG + 127) & ~127) + 9 * 16 * 32 + 9 * 16 * 4 + 32 * 4 + 8 * 32 * 20 * 4;
     static unsigned at = 0; int dev = 0; cudaGetDevice(&dev);

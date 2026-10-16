@@ -271,10 +271,12 @@ template <int MT, typename T, bool P16 = false> static void launch_s2f8(dim3 gri
 #define S2F4_E 33
 #define S2F4_T (5 * 9 * S2F4_E)   /* 1485 staged positions */
 __global__ void prep_w4_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx, int CxP, int Ox, int OxP);   /* lp_f4fwd.cu */
-template <int MT, int OB>   /* OB: MX bits of the output */
+/* GEN: any input of NCH = Cip / 32 chunks (each staged and multiplied in turn, its weights staged per chunk: the coarse down convs)
+   and output tiles of BM channels (co0 from blockIdx.z); GEN 0 is the one-chunk, one-tile kernel above */
+template <int MT, int OB, bool GEN = false>   /* OB: MX bits of the output */
 __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                         const float *__restrict__ b, uint8_t *__restrict__ y, int N, int Ci, int D, int H, int W,
-                                                        int Co, int Cop, int Do, int Ho, int Wo, gnp_t gp, int ZC) {
+                                                        int Co, int Cop, int Do, int Ho, int Wo, gnp_t gp, int ZC, int Cip = 32) {
     constexpr int BM = MT * 16;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sx = smem_raw;                                     /* [S2F4_T][16 B] */
@@ -287,31 +289,40 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__rest
     const int wz = warp >> 2, wr = warp & 3;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * 4;
     const int nzt = (Do + 1) / 2, nzc = (nzt + ZC - 1) / ZC;
-    const int zc = blockIdx.z % nzc, n = blockIdx.z / nzc;
+    const int zc = blockIdx.z % nzc, n = GEN ? (blockIdx.z / nzc) % N : blockIdx.z / nzc, co0 = GEN ? (int)(blockIdx.z / (nzc * N)) * BM : 0;
+    const int nch = GEN ? Cip / 32 : 1;
     const size_t plane = (size_t)D * H * W;
     const bool G = gp.G != 0;
     const split_t nsp = {};
-    if (threadIdx.x < 32) {
-        const chan_t c = make_chan((int)threadIdx.x, Ci, Ci, n, plane, (const mx4_t *)x, nsp, gp, N);
-        ctab[threadIdx.x] = c; cab[threadIdx.x] = make_float2(c.a, c.b);
-        const unsigned gm = __ballot_sync(0xffffffffu, c.g != 0);
-        if (threadIdx.x == 0) *sgm = gm;
-    }
-    for (int i = threadIdx.x; i < 14 * BM * 2; i += 256) {
-        const int pp = i / (BM * 2), r = i % (BM * 2), c = r >> 1, h = r & 1, tap = 2 * pp + h;
-        *(uint4 *)(wa + pp * BM * 32 + sw16(c, h)) = __ldg((const uint4 *)(wq + ((size_t)tap * Cop + c) * 16));
-    }
-    for (int i = threadIdx.x; i < 14 * BM; i += 256) {
-        const int pp = i / BM, c = i % BM, tap = 2 * pp;
-        was[i] = (unsigned short)(wsc[(size_t)tap * Cop + c] | (wsc[(size_t)(tap + 1) * Cop + c] << 8));
-    }
+    auto stage_chunk = [&](int ch) {   /* the chunk's channel table and its weights (all of them, GEN 0: once) */
+        if (threadIdx.x < 32) {
+            const chan_t c = make_chan(ch * 32 + (int)threadIdx.x, Ci, Ci, n, plane, (const mx4_t *)x, nsp, gp, N);
+            ctab[threadIdx.x] = c; cab[threadIdx.x] = make_float2(c.a, c.b);
+            const unsigned gm = __ballot_sync(0xffffffffu, c.g != 0);
+            if (threadIdx.x == 0) *sgm = gm;
+        }
+        for (int i = threadIdx.x; i < 14 * BM * 2; i += 256) {
+            const int pp = i / (BM * 2), r = i % (BM * 2), c = r >> 1, h = r & 1, tap = 2 * pp + h;
+            *(uint4 *)(wa + pp * BM * 32 + sw16(c, h)) = __ldg((const uint4 *)(wq + ((size_t)tap * Cop + co0 + c) * (Cip / 2) + ch * 16));
+        }
+        for (int i = threadIdx.x; i < 14 * BM; i += 256) {
+            const int pp = i / BM, c = i % BM, tap = 2 * pp;
+            was[i] = (unsigned short)(wsc[((size_t)tap * Cop + co0 + c) * nch + ch] | (wsc[((size_t)(tap + 1) * Cop + co0 + c) * nch + ch] << 8));
+        }
+    };
+    if (!GEN) stage_chunk(0);
     __syncthreads();
-    const unsigned gmask = *sgm;
-    const chan_t c0 = ctab[0];
-    const bool cpy = !G && c0.bw == 32;   /* plain MX-fp4 rows: copied (exact) */
     for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
         const int oz0 = tz * 2;
-        __syncthreads();   /* the previous tile's MMA is done with the staged input */
+        float acc[MT][2][4];
+#pragma unroll
+        for (int m = 0; m < MT; m++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[m][q][k] = 0.f;
+        for (int ch = 0; ch < nch; ch++) {
+        if (GEN) { __syncthreads(); stage_chunk(ch); }   /* the previous chunk's MMA is done with the weights and the channel table */
+        __syncthreads();   /* the previous tile's (chunk's) MMA is done with the staged input */
+        const unsigned gmask = *sgm;
+        const chan_t c0 = ctab[0];
+        const bool cpy = !G && c0.bw == 32;   /* plain MX-fp4 rows: copied (exact) */
         for (int p = threadIdx.x; p < S2F4_T; p += 256) {
             const int e = p % S2F4_E, row = p / S2F4_E, iy = row % 9, iz = row / 9;
             const int ix = e < 17 ? 2 * e : 2 * (e - 17) + 1;   /* local input x (from 2 ox0 - 1) */
@@ -335,9 +346,6 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__rest
             sxs[p] = (uint8_t)(ee + 127);
         }
         __syncthreads();
-        float acc[MT][2][4];
-#pragma unroll
-        for (int m = 0; m < MT; m++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[m][q][k] = 0.f;
 #pragma unroll 2
         for (int pp = 0; pp < 14; pp++) {
             const int tA = 2 * pp, tB = min(tA + 1, 26);
@@ -359,6 +367,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__rest
                 mma_f4(acc[m][0], af, bfr, sa, sb[0]); mma_f4(acc[m][1], af, bfr + 2, sa, sb[1]);
             }
         }
+        }   /* chunks */
         /* MX output as conv_fwd_s2_f8_k's (32-channel blocks of 2 m-tiles; e2m1 nibble pairs across lanes g, g + 1) */
         const int bw = mx_bw(Co), nb = mx_nb(Co), rb = mx_rb(bw, OB);
         const size_t So = (size_t)Do * Ho * Wo;
@@ -378,7 +387,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__rest
                 for (int mm = 0; mm < 2; mm++)
 #pragma unroll
                     for (int h = 0; h < 2; h++) {
-                        const int m = j + mm, co = m * 16 + g + 8 * h;
+                        const int m = j + mm, co = co0 + m * 16 + g + 8 * h;
                         float v = 0.f;
                         if (mm * 16 + 8 * h < bw && m < MT) v = acc[m < MT ? m : 0][q2][2 * h + vv2] + (b && co < Co ? b[co] : 0.f);
                         val[mm][h] = v; am = fmaxf(am, fabsf(v));
@@ -395,7 +404,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4_k(const uint8_t *__rest
                     nib |= __shfl_down_sync(0xffffffff, nib, 4) << 4;   /* channel g + 1 into the high nibbles */
                 }
                 if (ok) {
-                    const int blk = (j * 16) / bw;
+                    const int blk = (co0 + j * 16) / bw;
                     const size_t v = ((size_t)oz * Ho + oy) * Wo + ox;
                     uint8_t *dst = y + (((size_t)n * nb + blk) * So + v) * rb;
 #pragma unroll
@@ -527,6 +536,10 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4p_k(const mx4_t *__restr
 }
 static int g_s2_f4 = -1;
 extern "C" void lp_set_s2_f4(int on) { g_s2_f4 = on; }   /* tests: the fp4 down0 kernel on / off (-1: env UFSM_S2_F4, default on) */
+/* the coarse down convs on conv_fwd_s2_f4_k GEN (UFSM_S2_F4G=1; default off: with it, test_split's trainer-layout case 34 drifts run to run
+   (split grad rel 0.09-0.27 against ~6e-8 off) although the kernel is bitwise repeatable in isolation (test_mx4); not yet understood) */
+static int g_s2_f4g = -1;
+extern "C" void lp_set_s2_f4g(int on) { g_s2_f4g = on; }
 extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp) {
     lp_dtype_check("lp_conv_fwd_s2_f8", xbf, ybf);
     int Cop = (cout + 15) / 16 * 16, Cip = (xs.c + 31) / 32 * 32, nch = Cip / 32;
@@ -550,6 +563,27 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
         LPCK();
         return 3;   /* fp4 compute (the callers' precision report) */
     }
+    if (g_s2_f4g < 0) g_s2_f4g = getenv("UFSM_S2_F4G") ? atoi(getenv("UFSM_S2_F4G")) : 0;
+    if (g_s2_f4 && g_s2_f4g && xbf == 4 && ybf >= 3 && xs.c % 32 == 0 && Cop % 32 == 0 && ys.d * 2 == xs.d && ys.h * 2 == xs.h && ys.w * 2 == xs.w) {
+        /* the coarse down convs (any multiple of 32 channels in and out, any width: P 704's 11): conv_fwd_s2_f4_k GEN, the input in
+           32-channel chunks, 32-channel output tiles over grid z */
+        const int Cip = xs.c, nchk = Cip / 32, ncot = Cop / 32;
+        uint8_t *wq = lp_buf<uint8_t>(0, (size_t)28 * Cop * (Cip / 2)), *ws = lp_buf<uint8_t>(1, (size_t)28 * Cop * nchk);
+        prep_w4_k<<<nblk_((size_t)28 * Cop * nchk, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, Cip, -1, 0, -1, 0);
+        const size_t smem = (size_t)S2F4_T * 16 + ((S2F4_T + 127) & ~127) + 14 * 32 * 32 + ((14 * 32 + 7) & ~7) * 2 + 32 * sizeof(chan_t) + 32 * 8 + 16;
+        const int nzt = (ys.d + 1) / 2, base = ((ys.w + 15) / 16) * ((ys.h + 3) / 4) * ncot * xs.n;
+        int ZC = nzt < 8 ? nzt : 8;
+        while (ZC > 1 && (size_t)base * ((nzt + ZC - 1) / ZC) < 480) ZC--;
+        const dim3 grid((unsigned)((ys.w + 15) / 16), (unsigned)((ys.h + 3) / 4), (unsigned)(((nzt + ZC - 1) / ZC) * xs.n * ncot));
+        static int attr[8][2];
+        const int ob = ybf == 4 ? 4 : 8;
+#define S2F4G(OB_) do { if (!attr[cur_dev_()][OB_ == 4]) { attr[cur_dev_()][OB_ == 4] = 1; cudaFuncSetAttribute((const void *)conv_fwd_s2_f4_k<2, OB_, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
+                        conv_fwd_s2_f4_k<2, OB_, true><<<grid, 256, smem>>>((const uint8_t *)x, wq, ws, b, (uint8_t *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, ys.d, ys.h, ys.w, gp, ZC, Cip); } while (0)
+        if (ob == 4) S2F4G(4); else S2F4G(8);
+#undef S2F4G
+        LPCK();
+        return 3;
+    }
     if (g_s2_f4 && xbf == 4 && ybf >= 3 && xs.c <= 16 && cout <= 32 && ys.d * 2 == xs.d && ys.h * 2 == xs.h && ys.w * 2 == xs.w) {
         /* <= 16-channel MX-fp4 input (down0 of a 16-wide net): conv_fwd_s2_f4p_k (UFSM_S2_F4=0: the fp8 two-taps-per-K kernel) */
         const int Cq = cout <= 16 ? 16 : 32, MT = Cq / 16;
@@ -558,6 +592,9 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
         const int nzt = (ys.d + 1) / 2, base = ((ys.w + 15) / 16) * ((ys.h + 7) / 8);
         int ZC = nzt < 16 ? nzt : 16;
         while (ZC > 1 && (size_t)base * ((nzt + ZC - 1) / ZC) * xs.n < 480) ZC--;
+        static int zc_env = -2;
+        if (zc_env == -2) zc_env = getenv("UFSM_S2P4_ZC") ? atoi(getenv("UFSM_S2P4_ZC")) : -1;
+        if (zc_env > 0) ZC = zc_env < nzt ? zc_env : nzt;
         const dim3 grid((unsigned)((ys.w + 15) / 16), (unsigned)((ys.h + 7) / 8), (unsigned)(((nzt + ZC - 1) / ZC) * xs.n));
         const size_t smem = (MT == 1 ? s2p4_scr_off<1>() : s2p4_scr_off<2>()) + FEPI16_SCR(16);   /* >= FEPI_SCR(8): two blocks per SM */
         static unsigned attr[8];
@@ -613,10 +650,13 @@ __device__ unsigned long long g_s2wprof[4];
 #ifndef S2W_PAIR
 #define S2W_PAIR 1   /* conv_bwd_w_s2_f8_k's FAST x staging two planes per amax barrier */
 #endif
+#ifndef S2WF_MINB
+#define S2WF_MINB 2   /* blocks per SM of conv_bwd_w_s2_f8_k's FAST path */
+#endif
 #define XS2_CS 3088   /* per channel: 5 planes x 17 rows x 36 B = 3060, padded to 772 words == 4 mod 32 */
 #define XS2_PS 612
 template <int MT, int NT, typename T, typename TG, bool FAST = false>
-__global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
+__global__ void __launch_bounds__(288, FAST ? S2WF_MINB : 2) conv_bwd_w_s2_f8_k(const T *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
                                                           int N, int Ci, int D, int H, int W, int Co, int Do, int Ho, int Wo, int ZC, gnp_t gp) {
     constexpr int CH = 8 * NT, BMo = 16 * MT;
     extern __shared__ __align__(128) unsigned char smem_raw[];
@@ -892,27 +932,31 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
         }
         for (int zt = zt_begin; zt < zt_end; zt++) {
             const int oz0 = zt * 2, gz1 = 2 * oz0;   /* new input planes 2 oz0 .. 2 oz0 + 3 */
-            __syncthreads();   /* the previous MMA is done with the ring slots being overwritten and the gy tile */
 #if S2W_PROF
+            __syncthreads();
             if (threadIdx.x == 0) t0 = clock64();
 #endif
-            if (S2W_PAIR) {
+            if (S2W_PAIR) {   /* three barriers per z-step: the first pair's (every warp is past the previous MMA: its ring slots and gy tile
+                                 may be rewritten), the second pair's (graw / gscl have landed and are visible), the staging's */
                 xload1(xrc, xsc2, gz1 + 2); xload1(xrd, xsd, gz1 + 3);   /* the second pair in flight during the first pair's pass */
                 xpass2(xra, xsa, gz1, xrb, xsb);
+                asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+                if (!gs4 && tid < 256) gscl[tid] = (uint8_t)gsr;
                 xpass2(xrc, xsc2, gz1 + 2, xrd, xsd);
             } else {
+            __syncthreads();   /* the previous MMA is done with the ring slots being overwritten and the gy tile */
             xload1(xrb, xsb, gz1 + 1); xpass(xra, xsa, gz1);   /* each plane's loads in flight during the previous pass */
             xload1(xra, xsa, gz1 + 2); xpass(xrb, xsb, gz1 + 1);
             xload1(xrb, xsb, gz1 + 3); xpass(xra, xsa, gz1 + 2);
             xpass(xrb, xsb, gz1 + 3);
+            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+            if (!gs4 && tid < 256) gscl[tid] = (uint8_t)gsr;
+            __syncthreads();   /* graw has landed */
             }
 #if S2W_PROF
             __syncthreads();
             if (threadIdx.x == 0) t1 = clock64();
 #endif
-            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-            if (!gs4 && tid < 256) gscl[tid] = (uint8_t)gsr;
-            __syncthreads();   /* graw has landed */
             gstage();
             if (zt + 1 < zt_end) { xload1(xra, xsa, gz1 + 4); if (S2W_PAIR) xload1(xrb, xsb, gz1 + 5); }   /* the next z-step's first pair during the gy rounding and the MMA */
             __syncthreads();
@@ -1125,8 +1169,10 @@ template <typename T, typename TG> static void bwd_w_s2_f8_t(const void *x, shap
     if (getenv("UFSM_S2W_MT")) MT = atoi(getenv("UFSM_S2W_MT"));
     size_t smem = (size_t)8 * NT * XS2_CS + 16 * MT * (G8_CS + 8) + 8 * NT * 8 + 16 * MT * 4 + 32 + (size_t)8 * NT * (sizeof(chan_t) + 3 * 4);
     int nzt = nblk_(ys.d, 2), base = (int)(((xs.c + 8 * NT - 1) / (8 * NT)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * nblk_(ys.w, 16) * nblk_(ys.h, 8) * ys.n);
-    int ZC = nzt < 8 ? nzt : 8;
+    const int zcap = xs.c <= 16 ? 32 : 8;   /* 16-wide levels: 32 z-steps per block (down0 P512 13.3 -> 12.6 ms) */
+    int ZC = nzt < zcap ? nzt : zcap;
     while (ZC > 1 && (size_t)base * nblk_(nzt, ZC) < 72) ZC--;
+    if (getenv("UFSM_S2W_ZC")) { ZC = atoi(getenv("UFSM_S2W_ZC")); ZC = ZC < 1 ? 1 : ZC > nzt ? nzt : ZC; }
     dim3 grid((xs.c + 8 * NT - 1) / (8 * NT), (ys.c + 16 * MT - 1) / (16 * MT), (unsigned)(nblk_(ys.w, 16) * nblk_(ys.h, 8) * nblk_(nzt, ZC) * ys.n));
     switch (MT * 10 + NT) {
     case 11: launch_bws2<1, 1, T, TG>(grid, smem, x, xs, gy, ys, gw, gb, ZC, gp); break;
