@@ -714,7 +714,10 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
             const int idx = tid + 288 * r, row = idx / 33, u = idx - 33 * row, gyy = 2 * oy0 - 1 + row, gx = 2 * ox0 - 1 + u;
             prow[r] = row; pu[r] = u; pin[r] = idx < 561 && gyy >= 0 && gyy < H && gx >= 0 && gx < W;
         }
-        unsigned xra[2][XW], xsa[2], xrb[2][XW], xsb[2];   /* raw positions of the next pass's plane and the one after, alternating */
+        unsigned xra[2][XW], xsa[2], xrb[2][XW], xsb[2], xrc[2][XW], xsc2[2], xrd[2][XW], xsd[2];   /* raw positions of the z-step's four planes (S2W_PAIR: all in flight before the first pass) */
+        float xga[CH], xgb[CH]; unsigned xgp = 0u, xgg = 0u;   /* the channels' GN+SiLU affine, present / applied bits (xdec: was read from ctab per value) */
+#pragma unroll
+        for (int q = 0; q < CH; q++) { xga[q] = ctab[q].a; xgb[q] = ctab[q].b; xgp |= (ctab[q].p != nullptr) << q; xgg |= (Gany && ctab[q].g) << q; }
         auto xload1 = [&](unsigned (&r_)[2][XW], unsigned (&s_)[2], int gz) {
 #pragma unroll
             for (int r = 0; r < 2; r++) {
@@ -749,7 +752,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
                         }
                     }
 #pragma unroll
-                    for (int q = 0; q < CH; q++) { const chan_t &cq = ctab[q]; v[r][q] = cq.p ? act_ab(v[r][q], cq.a, cq.b, Gany && cq.g) : 0.f; }
+                    for (int q = 0; q < CH; q++) v[r][q] = (xgp >> q & 1u) ? act_ab(v[r][q], xga[q], xgb[q], (xgg >> q & 1u) != 0) : 0.f;
                 }
             }
         };
@@ -885,7 +888,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
             xload1(xra, xsa, gz);
             gload(2 * zt_begin);
             xpass(xra, xsa, gz);
-            xload1(xra, xsa, gz + 1);
+            xload1(xra, xsa, gz + 1); if (S2W_PAIR) xload1(xrb, xsb, gz + 2);
         }
         for (int zt = zt_begin; zt < zt_end; zt++) {
             const int oz0 = zt * 2, gz1 = 2 * oz0;   /* new input planes 2 oz0 .. 2 oz0 + 3 */
@@ -894,8 +897,9 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
             if (threadIdx.x == 0) t0 = clock64();
 #endif
             if (S2W_PAIR) {
-                xload1(xrb, xsb, gz1 + 1); xpass2(xra, xsa, gz1, xrb, xsb);
-                xload1(xra, xsa, gz1 + 2); xload1(xrb, xsb, gz1 + 3); xpass2(xra, xsa, gz1 + 2, xrb, xsb);
+                xload1(xrc, xsc2, gz1 + 2); xload1(xrd, xsd, gz1 + 3);   /* the second pair in flight during the first pair's pass */
+                xpass2(xra, xsa, gz1, xrb, xsb);
+                xpass2(xrc, xsc2, gz1 + 2, xrd, xsd);
             } else {
             xload1(xrb, xsb, gz1 + 1); xpass(xra, xsa, gz1);   /* each plane's loads in flight during the previous pass */
             xload1(xra, xsa, gz1 + 2); xpass(xrb, xsb, gz1 + 1);
@@ -910,7 +914,7 @@ __global__ void __launch_bounds__(288, 2) conv_bwd_w_s2_f8_k(const T *__restrict
             if (!gs4 && tid < 256) gscl[tid] = (uint8_t)gsr;
             __syncthreads();   /* graw has landed */
             gstage();
-            if (zt + 1 < zt_end) xload1(xra, xsa, gz1 + 4);
+            if (zt + 1 < zt_end) { xload1(xra, xsa, gz1 + 4); if (S2W_PAIR) xload1(xrb, xsb, gz1 + 5); }   /* the next z-step's first pair during the gy rounding and the MMA */
             __syncthreads();
             if (zt + 1 < zt_end) gload(oz0 + 2);
 #if S2W_PROF
