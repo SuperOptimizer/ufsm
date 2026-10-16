@@ -491,7 +491,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
     const int wz = warp >> 2, wr = (warp & 3) * 2;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * 8;
     int bz = blockIdx.z;
-    const int nzt = (D + TZ - 1) / TZ, nzc = (nzt + ZC - 1) / ZC;
+    const int tz0 = sp.zw1 ? sp.zw0 / TZ : 0, nzt = sp.zw1 ? (sp.zw1 + TZ - 1) / TZ : (D + TZ - 1) / TZ, nzc = (nzt - tz0 + ZC - 1) / ZC;   /* tiles [tz0, nzt) (z-window) */
     const int zc = bz % nzc; bz /= nzc;
     const int nmt = Cop / BM;
     const int co0 = (bz % nmt) * BM; const int n = bz / nmt;
@@ -554,11 +554,11 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
     };
     constexpr bool PF = MT == 1;   /* (MT 2: the rows live across the MMA spill its doubled accumulators: +12%, so loaded at the tile) */
     constexpr bool IL = MT == 1;   /* interleaved scale words (p16_put); MT 2: the extra staging index math outweighed the saved loads (+1%) */
-    if constexpr (IS_MX4(T) && PF) if (zc * ZC < nzt) ldrows(zc * ZC * TZ, 0, TT, f4p_nit<NIT>{});
+    if constexpr (IS_MX4(T) && PF) if ((tz0 + zc * ZC) < nzt) ldrows((tz0 + zc * ZC) * TZ, 0, TT, f4p_nit<NIT>{});
     /* z tiles of TZ output planes: the block walks ZC of them; tile oz0 reads input planes oz0 - 1 .. oz0 + TZ, of which the
        first two are the previous tile's last two (kept in the ring), so after the first tile only TZ planes are staged */
-    for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
-    const int oz0 = tz * TZ, p0 = tz == zc * ZC ? 0 : 2, npos = (NP - p0) * 180;   /* tile planes p0 .. NP - 1 are new */
+    for (int tz = (tz0 + zc * ZC); tz < nzt && tz < tz0 + (zc + 1) * ZC; tz++) {
+    const int oz0 = tz * TZ, p0 = tz == (tz0 + zc * ZC) ? 0 : 2, npos = (NP - p0) * 180;   /* tile planes p0 .. NP - 1 are new */
     __syncthreads();   /* the previous tile's MMA has read the slots about to be replaced */
     F4RP(0);
     if constexpr (IS_MX4(T)) {   /* staging, MX-fp4 input: every position's row and scale were loaded ahead (ldrows), each position is
@@ -618,7 +618,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f4p_k(const T *__restrict__ x
         p16_put<IL>(sx, sxw, pos, ix, q, (unsigned)(e + 127));
     }
     __syncthreads();
-    if constexpr (IS_MX4(T) && PF) if (tz + 1 < nzt && tz + 1 < (zc + 1) * ZC) ldrows(oz0 + TZ, 2, TZ * 180, f4p_nit<NIT2>{});   /* the next tile's rows */
+    if constexpr (IS_MX4(T) && PF) if (tz + 1 < nzt && tz + 1 < tz0 + (zc + 1) * ZC) ldrows(oz0 + TZ, 2, TZ * 180, f4p_nit<NIT2>{});   /* the next tile's rows */
     F4RP(1);
     float acc[MT][NR][2][4];
 #pragma unroll
@@ -676,7 +676,7 @@ template <int MT, int TZ, typename T, typename TO> void launch_f4p(dim3, const v
     const size_t smem = f4p_scr_off<MT, TZ>() + scr;
     (void)BM;
     /* z tiles per block: the ring saves 2 of TZ + 2 staged planes per tile after the first; keep >= 4 blocks per SM-pair of waves */
-    const int nzt = nblk_(xs.d, TZ), nmt = Cop / BM;
+    const int nzt = zw_tiles(xs.d, TZ, sp), nmt = Cop / BM;
     const size_t base = (size_t)nblk_(xs.w, 16) * nblk_(xs.h, 8) * nmt * xs.n;
     static int zc_env = -2;
     if (zc_env == -2) zc_env = getenv("UFSM_F4P_ZC") ? atoi(getenv("UFSM_F4P_ZC")) : -1;
@@ -750,7 +750,7 @@ template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const
     static int opad_env = -1; if (opad_env < 0) opad_env = getenv("UFSM_F4_OPAD16") ? atoi(getenv("UFSM_F4_OPAD16")) : 1;
     if (opad_env && g4_exact && IS_MX(TO) && sp.y2 && Ox <= 16 && cout - Ox <= 16) { OxP = 16; Cop = 32; sp.o_pad = 16; }
     /* (slab-local GroupNorm input, gnp_t ns: the chunk kernels below, which apply each staged plane's slab; conv_fwd_f4p_k does not yet) */
-    if (xs.c <= 16 && !sp.x2 && !sp.up && sp.gp2.G == 0 && !(gp.ns && gp.G && Cop > 16) && !sp.zw1) { p16_f4<T, TO>(x, xs, w, b, cout, y, Cop, Ox, OxP, gp, osum, Go, sp); return; }   /* K = [kx0 | kx1 | kx2 | kx3] x 16, a scale per kx */
+    if (xs.c <= 16 && !sp.x2 && !sp.up && sp.gp2.G == 0 && !(gp.ns && gp.G && Cop > 16)) { p16_f4<T, TO>(x, xs, w, b, cout, y, Cop, Ox, OxP, gp, osum, Go, sp); return; }   /* K = [kx0 | kx1 | kx2 | kx3] x 16, a scale per kx */
     if constexpr (IS_MX4(T) && IS_MX4(TO)) {   /* the 16-wide decoder conv1 with the fused upsample (lp_f4up.cu); UFSM_F4U=0: the chunk kernel */
         static int f4u = -1; if (f4u < 0) f4u = getenv("UFSM_F4U") ? atoi(getenv("UFSM_F4U")) : 1;
         if (f4u && sp.up == 2 && !sp.zw1 && lp_f4u_fwd(x, xs, w, b, cout, y, gp, osum, Go, sp)) return;
