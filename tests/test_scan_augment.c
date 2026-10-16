@@ -199,6 +199,43 @@ int main(void) {
             CHECK(dmax - dmin <= 1, "motion: a ramp's interior moves by one constant");
         }
     }
+    {   /* the vectorised paganin smoothing and GIN against their per-line / per-voxel loops, bit for bit (odd and even edges) */
+        int bad = 0;
+        for (int Q = 37; Q <= 48; Q += 11) {
+            const size_t q3 = (size_t)Q * Q * Q;
+            float *A = malloc(q3 * 4), *B = malloc(q3 * 4), *line = malloc(Q * 4), *G1 = malloc(q3 * 4), *G2 = malloc(q3 * 4); uint8_t *Zm = malloc(q3);
+            uint64_t st = 99;
+            for (size_t k = 0; k < q3; k++) { A[k] = (float)(255 * uniform(&st)); Zm[k] = uniform(&st) < .1; }
+            for (int axis = 0; axis < 3; axis++) for (int ai = 0; ai < 3; ai++) {
+                const float a = (float)(.2 + .3 * ai);
+                memcpy(B, A, q3 * 4); exp_smooth(B, Q, axis, a, line);
+                float *R = G1; memcpy(R, A, q3 * 4); exp_smooth_ref(R, Q, axis, a, line);
+                bad += memcmp(B, R, q3 * 4) != 0;
+            }
+            for (int k = 1; k <= 3; k += 2) for (int C = 2; C <= 4; C++) {
+                float w1[4][27], b1[4], w2[4];
+                for (int ch = 0; ch < 4; ch++) { for (int t = 0; t < 27; t++) w1[ch][t] = (float)sym1(&st); b1[ch] = (float)sym1(&st); w2[ch] = (float)(.2 + uniform(&st)); }
+                const float im = 101.5f, is = 1.f / 37.f; const int r = k / 2;
+                double a1, a2, b1s = 0, b2s = 0; size_t an, bn = 0;
+                gin_eval(A, Zm, Q, C, k, w1, b1, w2, im, is, G1, &a1, &a2, &an);
+                const size_t Q2 = (size_t)Q * Q;
+                for (int z = 0; z < Q; z++) for (int y = 0; y < Q; y++) for (int x = 0; x < Q; x++) {   /* the per-voxel loop */
+                    float h[4] = {0, 0, 0, 0};
+                    for (int dz = -r; dz <= r; dz++) for (int dy = -r; dy <= r; dy++) for (int dx = -r; dx <= r; dx++) {
+                        const int zz = z + dz < 0 ? 0 : z + dz >= Q ? Q - 1 : z + dz, yy = y + dy < 0 ? 0 : y + dy >= Q ? Q - 1 : y + dy, xx = x + dx < 0 ? 0 : x + dx >= Q ? Q - 1 : x + dx;
+                        const float v = (A[zz * Q2 + (size_t)yy * Q + xx] - im) * is; const int t = ((dz + r) * k + dy + r) * k + dx + r;
+                        for (int ch = 0; ch < C; ch++) h[ch] += w1[ch][t] * v;
+                    }
+                    float o = 0; for (int ch = 0; ch < C; ch++) { const float u = h[ch] + b1[ch]; o += w2[ch] * (u > 0 ? u : .2f * u); }
+                    const size_t i = z * Q2 + (size_t)y * Q + x; G2[i] = o;
+                    if (!Zm[i]) { b1s += o; b2s += (double)o * o; bn++; }
+                }
+                bad += memcmp(G1, G2, q3 * 4) != 0 || a1 != b1s || a2 != b2s || an != bn;
+            }
+            free(A); free(B); free(line); free(G1); free(G2); free(Zm);
+        }
+        CHECK(!bad, "vectorised paganin / GIN equal the per-line / per-voxel loops");
+    }
     printf("scan augment: identity, determinism, label/ignore consistency of %d ops, seam registration, operators, paganin / gin / hist / per-op strength: ok\n", SA_N);
     return 0;
 }

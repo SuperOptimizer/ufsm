@@ -121,6 +121,41 @@ int main(void) {
         assert(!blends && !mismatch && !ctdiff && checked>10000);
         free(hard); free(T1); free(M1); free(H1);
     }
+    {   /* the cache-blocked writer against the per-voxel reference loop (write_spatial_ref), bit for bit: output formats, CT-only,
+           hard / blended targets, appearance plans (LUT, filter, shading, correlated noise), the sheet prior, warps, odd sizes */
+        int diffs=0,runs=0;
+        for (int Pq=0;Pq<2;Pq++) {
+            const int Q=Pq?37:32; const size_t nq=(size_t)Q*Q*Q;
+            uint8_t *c2=malloc(nq),*t2=malloc(NCH*nq),*m2=malloc(nq),*Ta=malloc(NCH*nq),*Ma=malloc(nq),*Tb=malloc(NCH*nq),*Mb=malloc(nq);
+            float *Xa=malloc(4*nq*4),*Xb=malloc(4*nq*4),*app=malloc(nq*4),*nr=malloc(Q*4),*nrs=malloc(Q*4),*nps=malloc(nq*4),cy2[40],cx2[40],tab2[6*40];
+            uint16_t *Ha=malloc(4*nq*2),*Hb=malloc(4*nq*2); double par[40][4];
+            for (size_t k=0;k<nq;k++) { c2[k]=(uint8_t)(k*2654435761u>>24); t2[k]=k%3?255:0; t2[nq+k]=(uint8_t)(k*40503u>>8); m2[k]=k%13!=0; }
+            for (int z=0;z<Q;z++) { cy2[z]=-30.5f+.3f*z; cx2[z]=70.25f-.2f*z; sheet_parameters(&sheet,z,par[z]); }
+            for (int mode=0;mode<5;mode++) for (int plan=0;plan<3;plan++) for (int fmt=0;fmt<3;fmt++) for (int si=0;si<48;si+=7) {
+                spatial_aug a; spatial_aug_make(&a,90+mode,Q,mode==1?0:9,1,mode==0?0:1,1);
+                if (mode==3) spatial_aug_zoom(&a,.6); if (mode==4) spatial_aug_affine(&a,5,.2,.12);
+                (void)tab2;
+                ct_aug_plan ap; ct_aug_make(&ap,1000+plan*7+mode,plan>0,90,30,Q);
+                if (plan==2) { ap.filter_mode=1; ap.filter_strength=.4f; ap.noise_rho=.4f; ap.noise_sigma=.03f; }
+                const ct_aug_plan *pp=plan?&ap:nullptr;
+                for (int variant=0;variant<4;variant++) {
+                    const int hard=variant&1, cto=fmt&&(variant&2), sh=!cto&&mode==2&&plan==0;
+                    sym sy=sym_of(si); rng r;
+                    memset(nrs,0,Q*4); memset(nps,0,nq*4); rseed(&r,77);
+                    write_spatial_ref(c2,t2,m2,Ta,Ma,Q,origin,85,.031f,1,cy2,cx2,sy,&a,1.05f,.01f,.03f,&r,nr,fmt,Xa,Ha,pp,nrs,nps,sh?&sheet:nullptr,par,app,hard,cto);
+                    memset(nrs,0,Q*4); memset(nps,0,nq*4); rseed(&r,77);
+                    write_spatial(c2,t2,m2,Tb,Mb,Q,origin,85,.031f,1,cy2,cx2,sy,&a,1.05f,.01f,.03f,&r,nr,fmt,Xb,Hb,pp,nrs,nps,sh?&sheet:nullptr,par,app,hard,cto);
+                    const size_t nch=cto?1:4;
+                    int d=memcmp(Ta,Tb,NCH*nq)||memcmp(Ma,Mb,nq)||(fmt?memcmp(Ha,Hb,nch*nq*2):memcmp(Xa,Xb,nch*nq*4));
+                    if (d && diffs<4) fprintf(stderr,"blocked writer differs: P %d mode %d plan %d fmt %d sym %d hard %d ct-only %d\n",Q,mode,plan,fmt,si,hard,cto);
+                    diffs+=d; runs++;
+                }
+            }
+            free(c2); free(t2); free(m2); free(Ta); free(Ma); free(Tb); free(Mb); free(Xa); free(Xb); free(app); free(nr); free(nrs); free(nps); free(Ha); free(Hb);
+        }
+        printf("cache-blocked warp writer vs the per-voxel loop: %d of %d configurations differ\n",diffs,runs);
+        assert(!diffs);
+    }
     free(ct); free(target); free(mask); free(T); free(M); free(X); free(H); free(scratch);
     puts("spatial augmentation registration: ok"); return 0;
 }

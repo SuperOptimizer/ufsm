@@ -627,7 +627,7 @@ int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint
    weight; hard classes such as the side encoding stay 0 / 255, packable).
    ct_only (--gpu-input): channel 0 alone into H (1 channel per sample), the
    same rng draws; the radial vector follows on the device (rad_record). */
-static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t *mask,
+[[maybe_unused]] static void write_spatial_ref(const uint8_t *ctu,const uint8_t *target,const uint8_t *mask,
                          uint8_t *T,uint8_t *M,int P,const int64_t o[3],float mean,float isd,
                          int hasax,const float *cy,const float *cx,sym sy,const spatial_aug *a,
                          float gain,float offset,float noise,rng *r,float *nrow,int xfmt,float *X,uint16_t *H,
@@ -657,7 +657,8 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
             if (inside) {
                 int base[3]; float f[3];
                 for (int d=0;d<3;d++) { base[d]=(int)v[d]; if (base[d]>=P-1) base[d]=P-2; f[d]=v[d]-base[d]; }
-                float tv[NCH]={0},cv=0,bw=-1; int valid=1; size_t bj=0;
+                float tv[NCH]={0},cv=0; int valid=1;
+                const size_t bj=((size_t)(base[0]+(f[0]>.5f))*P+base[1]+(f[1]>.5f))*P+base[2]+(f[2]>.5f);   /* hard: the nearest source voxel */
                 for (int bz=0;bz<2;bz++) for (int by=0;by<2;by++) for (int bx=0;bx<2;bx++) {
                     float weight=(bz?f[0]:1-f[0])*(by?f[1]:1-f[1])*(bx?f[2]:1-f[2]);
                     if (weight<=1e-7f) continue;
@@ -665,8 +666,7 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                     valid &= mask[j]!=0;
                     float val=ap && ap->filter_mode?appearance[j]:ap?ap->lut[ctu[j]]:((float)ctu[j]-mean)*isd;
                     cv+=weight*val;
-                    if (hard) { if (weight>bw) { bw=weight; bj=j; } }
-                    else for (int ch=0;ch<NCH;ch++) tv[ch]+=weight*target[(size_t)ch*p3+j];
+                    if (!hard) for (int ch=0;ch<NCH;ch++) tv[ch]+=weight*target[(size_t)ch*p3+j];
                 }
                 if (ap && !ap->filter_mode && P>1) for (int d=0;d<3;d++) cv+=ap->shading[d]*(2*v[d]/(P-1)-1);
                 out[0]=gain*cv+offset+noise*nrow[x]; M[k]=(uint8_t)valid;
@@ -697,6 +697,117 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
             }
         }
     }
+    free(table);
+}
+static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t *mask,
+                         uint8_t *T,uint8_t *M,int P,const int64_t o[3],float mean,float isd,
+                         int hasax,const float *cy,const float *cx,sym sy,const spatial_aug *a,
+                         float gain,float offset,float noise,rng *r,float *nrow,int xfmt,float *X,uint16_t *H,
+                         const ct_aug_plan *ap,float *noise_row,float *noise_plane,
+                         const sheet_dataset *sheet,const double (*params)[4],float *appearance,int hard,int ct_only) {
+    pthread_once(&g_ntab_once,ntab_init);
+    size_t p3=(size_t)P*P*P; float *table=malloc(6*(size_t)P*sizeof *table);
+    if (!table) abort();
+    spatial_aug_tables(a,table);
+    if (ap && ap->filter_mode) {
+        for (int z=0;z<P;z++) for (int y=0;y<P;y++) for (int x=0;x<P;x++)
+            appearance[((size_t)z*P+y)*P+x]=ct_aug_value(ap,ctu,P,z,y,x);
+    }
+    const float sign[3]={sy.flip[0]?-1:1,sy.flip[1]?-1:1,sy.flip[2]?-1:1};
+    enum { ZB = 16, TB = 16 };
+    const float c=.5f*(a->P-1),sc=(float)a->scale;
+    float Rf[3][3],Af[3][3],Aif[3][3];
+    for (int i=0;i<3;i++) for (int j=0;j<3;j++) { Rf[i][j]=(float)a->R[i][j]; Af[i][j]=(float)a->A[i][j]; Aif[i][j]=(float)a->Ainv[i][j]; }
+    float *vt=malloc(6*(size_t)P*sizeof *vt), *cvb=malloc((size_t)ZB*P*P*sizeof *cvb); uint8_t *inb=malloc((size_t)ZB*P*P);
+    if (!vt || !cvb || !inb) abort();
+    for (int d=0;d<3;d++) for (int u=0;u<P;u++) {   /* spatial_aug_pull's per-axis terms */
+        vt[d*P+u]=u-c-table[d*P+u];
+        vt[(3+d)*P+u]=1.f/(1.f-table[(3+d)*P+u]);
+    }
+    /* ((float)ctu - mean) * isd (or the plan's LUT) tabulated per value: the same floats */
+    float lutv[256]; for (int i=0;i<256;i++) lutv[i]=ap?(ap->filter_mode?0:ap->lut[i]):((float)i-mean)*isd;
+    for (int z0=0;z0<P;z0+=ZB) {
+        const int nz=P-z0<ZB?P-z0:ZB;
+        for (int y0=0;y0<P;y0+=TB) for (int x0=0;x0<P;x0+=TB) {
+            const int ny=P-y0<TB?P-y0:TB, nx=P-x0<TB?P-x0:TB;
+            for (int z=z0;z<z0+nz;z++) for (int y=y0;y<y0+ny;y++) {
+                const float v0=vt[z],v1=vt[P+y],j0=vt[3*P+z],j1=vt[4*P+y];
+                float t01[3];
+                for (int d=0;d<3;d++) t01[d]=Rf[0][d]*v0+Rf[1][d]*v1;   /* (the first two terms of the pull's sum) */
+                for (int x=x0;x<x0+nx;x++) {
+                    const size_t k=((size_t)z*P+y)*P+x, kb=((size_t)(z-z0)*P+y)*P+x;
+                    const float v2=vt[2*P+x];
+                    float u[3],v[3];
+                    if (a->affine) {
+                        float w[3]; for (int d=0;d<3;d++) w[d]=t01[d]+Rf[2][d]*v2;
+                        for (int d=0;d<3;d++) u[d]=c+sc*(Af[d][0]*w[0]+Af[d][1]*w[1]+Af[d][2]*w[2]);
+                    } else for (int d=0;d<3;d++) u[d]=c+sc*(t01[d]+Rf[2][d]*v2);
+                    for (int d=0;d<3;d++) v[sy.perm[d]]=sy.flip[d]?P-1-u[d]:u[d];
+                    int inside=1;
+                    for (int d=0;d<3;d++) if (v[d]<0 || v[d]>P-1) inside=0;
+                    inb[kb]=(uint8_t)inside;
+                    if (!inside) {
+                        for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=0;
+                        M[k]=0;
+                        if (!ct_only) for (int ch=1;ch<4;ch++) { size_t j=(size_t)ch*p3+k; if (xfmt==1) { _Float16 h=(_Float16)0.f; memcpy(H+j,&h,2); } else if (xfmt==2) H[j]=bf16_rn(0.f); else X[j]=0.f; }
+                        continue;
+                    }
+                    int base[3]; float f[3];
+                    for (int d=0;d<3;d++) { base[d]=(int)v[d]; if (base[d]>=P-1) base[d]=P-2; f[d]=v[d]-base[d]; }
+                    float tv[NCH]={0},cv=0; int valid=1;
+                    const size_t b0=((size_t)base[0]*P+base[1])*P+base[2];
+                    for (int bz=0;bz<2;bz++) for (int by=0;by<2;by++) for (int bx=0;bx<2;bx++) {
+                        float weight=(bz?f[0]:1-f[0])*(by?f[1]:1-f[1])*(bx?f[2]:1-f[2]);
+                        if (weight<=1e-7f) continue;
+                        size_t j=b0+((size_t)bz*P+by)*P+bx;
+                        valid &= mask[j]!=0;
+                        float val=ap && ap->filter_mode?appearance[j]:lutv[ctu[j]];
+                        cv+=weight*val;
+                        if (!hard) for (int ch=0;ch<NCH;ch++) tv[ch]+=weight*target[(size_t)ch*p3+j];
+                    }
+                    if (ap && !ap->filter_mode && P>1) for (int d=0;d<3;d++) cv+=ap->shading[d]*(2*v[d]/(P-1)-1);
+                    cvb[kb]=cv; M[k]=(uint8_t)valid;
+                    if (hard) { const size_t bj=b0+((size_t)(f[0]>.5f)*P+(f[1]>.5f))*P+(f[2]>.5f); for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=target[(size_t)ch*p3+bj]; }
+                    else for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=(uint8_t)lroundf(tv[ch]);
+                    if (ct_only) continue;
+                    const float jac[3]={j0,j1,vt[5*P+x]};
+                    float out[4]={0};
+                    float frac=f[0],ayy=cy[base[0]]*(1-frac)+cy[base[0]+1]*frac;
+                    float axx=cx[base[0]]*(1-frac)+cx[base[0]+1]*frac;
+                    float dy=(float)o[1]+v[1]-ayy,dx=(float)o[2]+v[2]-axx;
+                    float radius=sqrtf(dy*dy+dx*dx)+1e-6f;
+                    float radial[3]={0,hasax?dy/radius:0,hasax?dx/radius:0},discrete[3],transported[3];
+                    for (int d=0;d<3;d++) discrete[d]=sign[d]*radial[sy.perm[d]];
+                    if (a->affine) { float q[3]; for (int d=0;d<3;d++) q[d]=Aif[d][0]*discrete[0]+Aif[d][1]*discrete[1]+Aif[d][2]*discrete[2]; memcpy(discrete,q,sizeof q); }
+                    float norm=1e-12f;
+                    for (int d=0;d<3;d++) { transported[d]=jac[d]*(Rf[d][0]*discrete[0]+Rf[d][1]*discrete[1]+Rf[d][2]*discrete[2]); norm+=transported[d]*transported[d]; }
+                    norm=sqrtf(norm); for (int d=0;d<3;d++) out[1+d]=transported[d]/norm;
+                    if (sheet) {
+                        double q[4]; for (int d=0;d<4;d++) q[d]=params[base[0]][d]*(1-(double)frac)+params[base[0]+1][d]*frac;
+                        double prior=hypot(o[1]+(double)v[1]-q[0],o[2]+(double)v[2]-q[1])/q[2]+q[3];
+                        out[1]=(float)((prior-sheet->center)/sheet->scale);
+                    }
+                    for (int ch=1;ch<4;ch++) {
+                        size_t j=(size_t)ch*p3+k;
+                        if (xfmt==1) { _Float16 h=(_Float16)out[ch]; memcpy(H+j,&h,2); }
+                        else if (xfmt==2) H[j]=bf16_rn(out[ch]); else X[j]=out[ch];
+                    }
+                }
+            }
+        }
+        for (int z=z0;z<z0+nz;z++) for (int y=0;y<P;y++) {   /* channel 0: the noise rows in the per-voxel loop's order */
+            for (int x=0;x+4<=P;x+=4) { uint64_t v=rnext(r); for (int j=0;j<4;j++) nrow[x+j]=g_ntab[(v>>(16*j))&65535]; }
+            for (int x=P&~3;x<P;x++) nrow[x]=g_ntab[rnext(r)&65535];
+            if (ap && ap->noise_rho>0) ct_aug_noise_row(ap,nrow,noise_row,noise_plane,P,z,y);
+            const size_t k0=((size_t)z*P+y)*P, kb0=((size_t)(z-z0)*P+y)*P;
+            for (int x=0;x<P;x++) {
+                const float o0=inb[kb0+x]?gain*cvb[kb0+x]+offset+noise*nrow[x]:0.f;
+                if (xfmt==1) { _Float16 h=(_Float16)o0; memcpy(H+k0+x,&h,2); }
+                else if (xfmt==2) H[k0+x]=bf16_rn(o0); else X[k0+x]=o0;
+            }
+        }
+    }
+    free(vt); free(cvb); free(inb);
     free(table);
 }
 int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint8_t *mask, int P, const int64_t o[3], float mean, float isd,
