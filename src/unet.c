@@ -2357,20 +2357,25 @@ static void hb_collect(unet *u, const convp *c, void *arg) {
 static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float wd) {
     const int n = b->n;
     if (!u->mx_part) {
-        u->mx_part = nn_malloc((size_t)64 * n * sizeof(double));
+        u->mx_part = nn_malloc((size_t)32 * n * (2 + 14) * sizeof(double));
         hb_build_t h = {.on = u->mx_hb}; for_each_conv3(u, hb_collect, &h);
         u->mx_hbf = nn_malloc((size_t)n * sizeof(int)); nn_h2d(u->mx_hbf, h.hb, (size_t)n * sizeof(int));
         u->mx_R = nn_malloc((size_t)n * 4); nn_zero(u->mx_R, (size_t)n * 4); u->mx_R_ok = 0;
     }
-    if (u->mx_c && !u->mx_mcd) {   /* Muon-C: per conv the frequency block's embedding (one frequency at a time) */
-        muonc_desc_t mc[UNET_MAXCONV]; muon_desc_t ns[UNET_MAXCONV]; size_t pool = 0;
+    if (u->mx_c && !u->mx_mcd) {   /* Muon-C: per conv its 14 frequency blocks' embeddings, per conv and frequency a Newton-Schulz entry */
+        enum { NF = 14 };
+        muonc_desc_t mc[UNET_MAXCONV]; muon_desc_t *ns = calloc((size_t)n * NF, sizeof *ns); size_t pool = 0;
         for (int i = 0; i < n; i++) {
             const muon_desc_t *d = &b->h[i]; const int Ci = d->K / 27, m = d->Co < Ci ? d->Co : Ci, nx = d->Co < Ci ? Ci : d->Co;
             if (Ci * 27 != d->K) { fprintf(stderr, "muon-c: conv %d is not 3^3\n", i); abort(); }
             mc[i] = (muonc_desc_t){.U = nullptr, .O = nullptr, .Co = d->Co, .Ci = Ci, .k = 3, .m = m, .n = nx, .tr = d->Co > Ci};
-            ns[i] = (muon_desc_t){.Co = 2 * m, .K = 2 * nx};
-            mc[i].EX = (float *)(uintptr_t)pool; pool += (size_t)4 * m * nx; mc[i].EY = (float *)(uintptr_t)pool; pool += (size_t)4 * m * nx;
-            ns[i].A = (float *)(uintptr_t)pool; pool += (size_t)4 * m * m; ns[i].B = (float *)(uintptr_t)pool; pool += (size_t)4 * m * m;
+            mc[i].EX = (float *)(uintptr_t)pool; pool += (size_t)NF * 4 * m * nx; mc[i].EY = (float *)(uintptr_t)pool; pool += (size_t)NF * 4 * m * nx;
+            for (int f = 0; f < NF; f++) {
+                muon_desc_t *e = &ns[(size_t)i * NF + f];
+                const uintptr_t fo = (uintptr_t)f * 4 * m * nx;   /* offsets in floats until the pool exists */
+                *e = (muon_desc_t){.X = (float *)((uintptr_t)mc[i].EX + fo), .Y = (float *)((uintptr_t)mc[i].EY + fo), .Co = 2 * m, .K = 2 * nx};
+                e->A = (float *)(uintptr_t)pool; pool += (size_t)4 * m * m; e->B = (float *)(uintptr_t)pool; pool += (size_t)4 * m * m;
+            }
             if (2 * m > u->mx_ns_maxm) u->mx_ns_maxm = 2 * m;
             if (2 * nx > u->mx_ns_maxn) u->mx_ns_maxn = 2 * nx;
         }
@@ -2378,10 +2383,14 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
         const muon_desc_t *dev = u->muon_descs; muon_desc_t host[UNET_MAXCONV]; nn_d2h(host, dev, sizeof(muon_desc_t) * (size_t)n);
         for (int i = 0; i < n; i++) {
             mc[i].EX = u->mx_pool + (uintptr_t)mc[i].EX; mc[i].EY = u->mx_pool + (uintptr_t)mc[i].EY; mc[i].U = host[i].X; mc[i].O = host[i].Y;
-            ns[i].X = mc[i].EX; ns[i].Y = mc[i].EY; ns[i].A = u->mx_pool + (uintptr_t)ns[i].A; ns[i].B = u->mx_pool + (uintptr_t)ns[i].B;
+            for (int f = 0; f < NF; f++) {
+                muon_desc_t *e = &ns[(size_t)i * NF + f];
+                e->X = u->mx_pool + (uintptr_t)e->X; e->Y = u->mx_pool + (uintptr_t)e->Y; e->A = u->mx_pool + (uintptr_t)e->A; e->B = u->mx_pool + (uintptr_t)e->B;
+            }
         }
         u->mx_mcd = nn_malloc(sizeof(muonc_desc_t) * (size_t)n); nn_h2d(u->mx_mcd, mc, sizeof(muonc_desc_t) * (size_t)n);
-        u->mx_nsd = nn_malloc(sizeof(muon_desc_t) * (size_t)n); nn_h2d(u->mx_nsd, ns, sizeof(muon_desc_t) * (size_t)n);
+        u->mx_nsd = nn_malloc(sizeof(muon_desc_t) * (size_t)n * NF); nn_h2d(u->mx_nsd, ns, sizeof(muon_desc_t) * (size_t)n * NF);
+        free(ns);
     }
     int r_init = 0;
     if (u->mx_hb) {
