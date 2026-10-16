@@ -96,6 +96,10 @@ struct unet {
     float *xin;                              /* bf16 copy of the network input (act-bf16 mode) */
     float *muon_mom, *muon_work; size_t muon_work_n;   /* Muon momentum (np) and Newton-Schulz scratch */
     void *muon_descs; int muon_nconv, muon_maxco, muon_maxk;   /* batched Muon descriptor table (device) */
+    int mx_c, mx_hb; float mx_hb_mult;       /* Muon variants: Muon-C, Hyperball (eta = mx_hb_mult x the Muon lr) */
+    void *mx_mcd, *mx_nsd; float *mx_pool; int mx_ns_maxm, mx_ns_maxn;   /* Muon-C tables and one frequency's scratch */
+    int *mx_hbf; float *mx_R; double *mx_part; int mx_R_ok;   /* Hyperball flags, radii (device), sums; R valid */
+    float mx_R_load[UNET_MAXCONV]; int mx_R_nload;           /* radii read from a checkpoint, uploaded at the next step */
     float *anvil_v1, *anvil_pool; void *anvil_descs; int anvil_nconv;   /* ANVIL slow rail, scratch pool, descriptors */
     float *glb;                              /* bf16 copy of the logit gradient (grad-bf16 mode) */
     int mode;                                /* kernel/storage mode the activations were built for */
@@ -281,7 +285,8 @@ void unet_free(unet *u) {
     free_acts(u);
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
-    nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b); free(u->gn_frz); free(u->gn_acc); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
+    nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b);
+    nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); free(u->gn_frz); free(u->gn_acc); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
     nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
@@ -307,6 +312,7 @@ static void init_gn(float *h, const gnp *n) { for (int i = 0; i < n->c; i++) { h
 
 void unet_init(unet *u, uint64_t seed) {
     nn_wmemo_clear();
+    u->mx_R_nload = 0; u->mx_R_ok = 0;   /* Hyperball radii: the new weights' norms */
     float *h = calloc(u->np, 4);
     int L = u->cfg.nlev;
     for (int i = 0; i < L; i++) { init_conv(h, &u->enc[i].c1, &seed, 0); init_gn(h, &u->enc[i].n1); init_conv(h, &u->enc[i].c2, &seed, 0); init_gn(h, &u->enc[i].n2); }
@@ -2325,21 +2331,81 @@ static void muon_collect(unet *u, const convp *c, void *arg) {
     if (c->cout > b->maxco) b->maxco = c->cout;
     if (K > b->maxk) b->maxk = K;
 }
+static void muon_table(unet *u, muon_build_t *b) {   /* the descriptor table and its scratch pool, built once (offsets first, then pointers) */
+    for_each_conv3(u, muon_collect, b);
+    if (u->muon_descs) return;
+    float *pool = nn_malloc(b->pool * 4);
+    for (int i = 0; i < b->n; i++) { muon_desc_t *d = &b->h[i]; d->X = pool + (uintptr_t)d->X; d->Y = pool + (uintptr_t)d->Y; d->A = pool + (uintptr_t)d->A; d->B = pool + (uintptr_t)d->B; }
+    u->muon_descs = nn_malloc(sizeof(muon_desc_t) * (size_t)b->n); nn_h2d(u->muon_descs, b->h, sizeof(muon_desc_t) * (size_t)b->n);
+    u->muon_nconv = b->n; u->muon_maxco = b->maxco; u->muon_maxk = b->maxk; u->muon_work = pool;
+}
+/* ---- Muon variants (train --muon-c 1 / --hyperball 1; see nn_muon_ext_batch in nn_opt.cu) ----
+   Muon-C covers every Muon conv (all are 3^3; the paper routes every kernel larger than 1x1 through it, strided ones
+   included): the stem's 16 x 4 and an encoder conv1's (2C) x C blocks are polarised as their conjugate transposes.
+   Hyperball covers the convs whose output feeds a GroupNorm (the loss is then nearly invariant to their scale, as for the
+   paper's pre-norm matrices): all but the down convs of a net without down_norm, which keep Muon's decay. Its learning rate
+   is mx_hb_mult x the scheduled Muon lr; the default 1/sqrt(2) gives the first step Muon's relative length: Kaiming-
+   initialised [Co][K] weights have |W|_F = sqrt(2 Co) and a Muon step lr sqrt(Co) (Co <= K for every conv here). */
+typedef struct { const float *U; float *O; float *EX, *EY; int Co, Ci, k, m, n, tr; } muonc_desc_t;   /* mirrors nn_opt.cu */
+void unet_set_muon_ext(unet *u, int muonc, int hyperball, float hb_mult) { u->mx_c = muonc; u->mx_hb = hyperball; u->mx_hb_mult = hb_mult; }
+typedef struct { int i; int hb[UNET_MAXCONV]; int on; } hb_build_t;
+static void hb_collect(unet *u, const convp *c, void *arg) {
+    hb_build_t *b = arg; int is_down = 0;
+    for (int i = 0; i < u->cfg.nlev - 1; i++) is_down |= c == &u->down[i];
+    b->hb[b->i++] = b->on && !(is_down && !u->cfg.down_norm);
+}
+static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float wd) {
+    const int n = b->n;
+    if (!u->mx_part) {
+        u->mx_part = nn_malloc((size_t)64 * n * sizeof(double));
+        hb_build_t h = {.on = u->mx_hb}; for_each_conv3(u, hb_collect, &h);
+        u->mx_hbf = nn_malloc((size_t)n * sizeof(int)); nn_h2d(u->mx_hbf, h.hb, (size_t)n * sizeof(int));
+        u->mx_R = nn_malloc((size_t)n * 4); nn_zero(u->mx_R, (size_t)n * 4); u->mx_R_ok = 0;
+    }
+    if (u->mx_c && !u->mx_mcd) {   /* Muon-C: per conv the frequency block's embedding (one frequency at a time) */
+        muonc_desc_t mc[UNET_MAXCONV]; muon_desc_t ns[UNET_MAXCONV]; size_t pool = 0;
+        for (int i = 0; i < n; i++) {
+            const muon_desc_t *d = &b->h[i]; const int Ci = d->K / 27, m = d->Co < Ci ? d->Co : Ci, nx = d->Co < Ci ? Ci : d->Co;
+            if (Ci * 27 != d->K) { fprintf(stderr, "muon-c: conv %d is not 3^3\n", i); abort(); }
+            mc[i] = (muonc_desc_t){.U = nullptr, .O = nullptr, .Co = d->Co, .Ci = Ci, .k = 3, .m = m, .n = nx, .tr = d->Co > Ci};
+            ns[i] = (muon_desc_t){.Co = 2 * m, .K = 2 * nx};
+            mc[i].EX = (float *)(uintptr_t)pool; pool += (size_t)4 * m * nx; mc[i].EY = (float *)(uintptr_t)pool; pool += (size_t)4 * m * nx;
+            ns[i].A = (float *)(uintptr_t)pool; pool += (size_t)4 * m * m; ns[i].B = (float *)(uintptr_t)pool; pool += (size_t)4 * m * m;
+            if (2 * m > u->mx_ns_maxm) u->mx_ns_maxm = 2 * m;
+            if (2 * nx > u->mx_ns_maxn) u->mx_ns_maxn = 2 * nx;
+        }
+        u->mx_pool = nn_malloc(pool * 4);
+        const muon_desc_t *dev = u->muon_descs; muon_desc_t host[UNET_MAXCONV]; nn_d2h(host, dev, sizeof(muon_desc_t) * (size_t)n);
+        for (int i = 0; i < n; i++) {
+            mc[i].EX = u->mx_pool + (uintptr_t)mc[i].EX; mc[i].EY = u->mx_pool + (uintptr_t)mc[i].EY; mc[i].U = host[i].X; mc[i].O = host[i].Y;
+            ns[i].X = mc[i].EX; ns[i].Y = mc[i].EY; ns[i].A = u->mx_pool + (uintptr_t)ns[i].A; ns[i].B = u->mx_pool + (uintptr_t)ns[i].B;
+        }
+        u->mx_mcd = nn_malloc(sizeof(muonc_desc_t) * (size_t)n); nn_h2d(u->mx_mcd, mc, sizeof(muonc_desc_t) * (size_t)n);
+        u->mx_nsd = nn_malloc(sizeof(muon_desc_t) * (size_t)n); nn_h2d(u->mx_nsd, ns, sizeof(muon_desc_t) * (size_t)n);
+    }
+    int r_init = 0;
+    if (u->mx_hb) {
+        if (u->mx_R_nload) {   /* radii from the checkpoint */
+            if (u->mx_R_nload == n) { nn_h2d(u->mx_R, u->mx_R_load, (size_t)n * 4); u->mx_R_ok = 1; }
+            else fprintf(stderr, "hyperball: the checkpoint has %d radii for %d convs; radii from the current weights\n", u->mx_R_nload, n);
+            u->mx_R_nload = 0;
+        }
+        if (!u->mx_R_ok) { nn_zero(u->mx_R, (size_t)n * 4); r_init = 1; u->mx_R_ok = 1; }
+    }
+    nn_muon_ext_batch(u->muon_descs, n, u->muon_maxco, u->muon_maxk, u->mx_c ? u->mx_mcd : nullptr, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
+                      u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr);
+}
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step) {
     if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd, step); return; }   /* packed weights: AdamW only */
     if (!u->muon_mom) { u->muon_mom = nn_malloc(u->np * 4); nn_zero(u->muon_mom, u->np * 4); }
-    if (ufsm_env_on("UFSM_MUON_UNBATCHED")) {   /* reference path: one conv at a time */
+    if (u->mx_c || u->mx_hb) {
+        muon_build_t b = {0}; muon_table(u, &b);
+        muon_ext(u, &b, lr_muon, beta, wd);
+    } else if (ufsm_env_on("UFSM_MUON_UNBATCHED")) {   /* reference path: one conv at a time */
         muon_arg a = {lr_muon, beta, wd};
         for_each_conv3(u, muon_conv, &a);
     } else {
-        if (!u->muon_descs) {   /* build the descriptor table and the scratch pool once (offsets first, then pointers) */
-            muon_build_t b = {0};
-            for_each_conv3(u, muon_collect, &b);
-            float *pool = nn_malloc(b.pool * 4);
-            for (int i = 0; i < b.n; i++) { muon_desc_t *d = &b.h[i]; d->X = pool + (uintptr_t)d->X; d->Y = pool + (uintptr_t)d->Y; d->A = pool + (uintptr_t)d->A; d->B = pool + (uintptr_t)d->B; }
-            u->muon_descs = nn_malloc(sizeof(muon_desc_t) * (size_t)b.n); nn_h2d(u->muon_descs, b.h, sizeof(muon_desc_t) * (size_t)b.n);
-            u->muon_nconv = b.n; u->muon_maxco = b.maxco; u->muon_maxk = b.maxk; u->muon_work = pool;
-        }
+        if (!u->muon_descs) { muon_build_t b = {0}; muon_table(u, &b); }
         nn_muon_batch(u->muon_descs, u->muon_nconv, u->muon_maxco, u->muon_maxk, lr_muon, beta, wd);
     }
     adamw_nonconv(u, lr_adam, b1, b2, eps, wd, step);
@@ -2536,6 +2602,7 @@ void unet_wquant(unet *u, unsigned seed) { (void)u; (void)seed; }   /* kept for 
 
 /* ---- checkpoints ---- */
 static int g_loaded_sparse = 0, g_loaded_wq = 0, g_loaded_muon = 0;   /* set by the header parser, applied by unet_load */
+static float g_loaded_hbR[UNET_MAXCONV]; static int g_loaded_hbR_n = 0;   /* Hyperball radii of the header */
 /* debug: per block, the GroupNorm statistics of the last forward (mean / rstd of a1 and a2 per sample and group:
    non-finite counts and extremes) and the largest |weight| of each conv. Localises a non-finite forward. */
 void unet_debug_stats(const unet *u) {
@@ -2606,7 +2673,13 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
     { int any = 0; for (int i = 0; i < u->cfg.nlev; i++) any |= u->cfg.dec_convs[i] == 1;
       if (any) { fputs(",\"dec_convs\":[", f); for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.dec_convs[i]); fputc(']', f); } }
-    fprintf(f, ",\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"scale_cond\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"muon_mom\":%d,\"extra\":%s}\n", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->cfg.scale_cond, u->np, step, u->sparse24, u->wq, u->muon_mom != nullptr, extra ? extra : "{}");
+    fprintf(f, ",\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"scale_cond\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"muon_mom\":%d", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->cfg.scale_cond, u->np, step, u->sparse24, u->wq, u->muon_mom != nullptr);
+    if (u->mx_hb && (u->mx_R_nload || (u->mx_R && u->mx_R_ok))) {   /* Hyperball radii (Muon table order): a resumed run keeps its spheres */
+        float r[UNET_MAXCONV]; const int nr = u->mx_R_nload ? u->mx_R_nload : u->muon_nconv;
+        if (u->mx_R_nload) memcpy(r, u->mx_R_load, (size_t)nr * 4); else nn_d2h(r, u->mx_R, (size_t)nr * 4);
+        fputs(",\"hb_R\":[", f); for (int i = 0; i < nr; i++) fprintf(f, "%s%.9g", i ? "," : "", r[i]); fputc(']', f);
+    }
+    fprintf(f, ",\"extra\":%s}\n", extra ? extra : "{}");
     float *h = malloc(u->np * 4);
     const float *arrs[4] = {u->p, u->ema, u->m, u->v};
     for (int a = 0; a < 4; a++) { nn_d2h(h, arrs[a], u->np * 4); if (fwrite(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; } }
@@ -2644,6 +2717,8 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"sparse24\":"))) g_loaded_sparse = atoi(p + 11);
     if ((p = strstr(line, "\"wq\":"))) g_loaded_wq = atoi(p + 5);
     if ((p = strstr(line, "\"muon_mom\":"))) g_loaded_muon = atoi(p + 11);
+    g_loaded_hbR_n = 0;
+    if ((p = strstr(line, "\"hb_R\":["))) { p += 8; while (g_loaded_hbR_n < UNET_MAXCONV && *p && *p != ']') { g_loaded_hbR[g_loaded_hbR_n++] = strtof(p, (char **)&p); if (*p == ',') p++; } }
     return 0;
 }
 
@@ -2676,6 +2751,7 @@ int unet_load(unet *u, const char *path) {
     } else if (u->muon_mom) nn_zero(u->muon_mom, u->np * 4);   /* old checkpoints have no Muon state */
     free(h);
     fclose(f);
+    u->mx_R_nload = g_loaded_hbR_n; memcpy(u->mx_R_load, g_loaded_hbR, (size_t)g_loaded_hbR_n * 4); u->mx_R_ok = 0;   /* none: from the weights */
     if (g_loaded_sparse) unet_set_sparse24(u, 1);
     if (g_loaded_wq) unet_set_wq(u, g_loaded_wq);
     return step;
@@ -2713,6 +2789,7 @@ int unet_load_grow(unet *u, const char *path, int keep, float new_bias) {
         nn_h2d(arrs[a], n, u->np * 4);
     }
     if (!g_loaded_muon && u->muon_mom) nn_zero(u->muon_mom, u->np * 4);
+    u->mx_R_nload = 0; u->mx_R_ok = 0;   /* a grown head: Hyperball radii from the weights */
     free(h); free(n); fclose(f);
     return step;
 }
@@ -2798,6 +2875,7 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
     unet_free(o);
     nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4);
     if (u->muon_mom) nn_zero(u->muon_mom, u->np * 4);
+    u->mx_R_nload = 0; u->mx_R_ok = 0;   /* Hyperball radii from the copied weights */
     return n;
 }
 

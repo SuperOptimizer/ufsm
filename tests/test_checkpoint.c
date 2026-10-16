@@ -77,6 +77,28 @@ int main(void) {
         }
         unet_free(live); unet_free(resumed);
     }
+    for (int var = 1; var <= 3; var++) {   /* Muon variants (1 Muon-C, 2 Hyperball, 3 both): the Hyperball radii travel in the header */
+        unet *live = unet_create(&cfg), *resumed = unet_create(&cfg);
+        unet_set_muon_ext(live, var & 1, var >> 1, 0.7f); unet_set_muon_ext(resumed, var & 1, var >> 1, 0.7f);
+        unet_init(live, 37); unet_init(resumed, 91);
+        gradient(live, 123); update(live, 1, 1);
+        const char *nm[4] = {"", "Muon-C", "Hyperball", "Muon-C + Hyperball"}; char msg[96];
+        check("save trained state", unet_save(live, base, 1, nullptr) == 0);
+        check("load saved step", unet_load(resumed, base) == 1);
+        check("save loaded state", unet_save(resumed, b, 1, nullptr) == 0);
+        snprintf(msg, sizeof msg, "%s state round trip", nm[var]); check(msg, same_file(base, b));
+        gradient(live, 456); gradient(resumed, 456);
+        update(live, 1, 2); update(resumed, 1, 2);
+        check("save uninterrupted next step", unet_save(live, a, 2, nullptr) == 0);
+        check("save resumed next step", unet_save(resumed, b, 2, nullptr) == 0);
+        snprintf(msg, sizeof msg, "%s resumed next update is identical", nm[var]); check(msg, same_file(a, b));
+        if (var >> 1) {
+            FILE *f = fopen(a, "rb"); char line[4096]; const int ok = f && fgets(line, sizeof line, f) && strstr(line, "\"hb_R\":[");
+            if (f) fclose(f);
+            check("Hyperball radii saved", ok);
+        }
+        unet_free(live); unet_free(resumed);
+    }
     {   /* warm start into more inputs and outputs (train --cond: 4 -> 7 inputs, --head-map): the grown net computes the donor's
            outputs on the mapped rows whatever the new inputs hold */
         unet_cfg dc = cfg; dc.cout = 3; unet_cfg gc = dc; gc.cin = 7; gc.cout = 5;
