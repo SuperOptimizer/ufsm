@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -443,7 +444,11 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
             w1[ch][kk / 2] += 1.f; b1[ch] = (float)(.5 * sym1(&rs)); w2[ch] = (float)(.2 + fabs(sym1(&rs)));
         }
         const double alpha = fmin(1, (.3 + .7 * uniform(&rs)) * SO(SA_GIN));
-        float *G = malloc(p3 * sizeof *G); if (!G) abort();
+        float *G = nullptr; const size_t gb = p3 * sizeof *G, H = (size_t)2 << 20;   /* (2 MB aligned, huge pages: P^3 floats faulted per window) */
+        if (posix_memalign((void **)&G, H, gb)) abort();
+#ifdef MADV_HUGEPAGE
+        madvise(G, (gb + H - 1) & ~(H - 1), MADV_HUGEPAGE);
+#endif
         const float im = (float)mean, is = (float)(1 / sd);
         double g1 = 0, g2 = 0; size_t gn = 0;
         gin_eval(F, Z, P, C, k, w1, b1, w2, im, is, G, &g1, &g2, &gn);
