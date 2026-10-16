@@ -722,8 +722,11 @@ static void build_acts(unet *u, shape5 xs, int train) {
         for (int i = 0; i < L; i++) { shape5 y = u->ls[i]; y.c = w[i]; if (act_bytes_of(y) > act_bytes_of(m1)) m1 = y; }
         T1 = dalloc_act_s(u, m1);
     }
-    /* in-place slab convs at level 0 (see unet.slab): X holds every level-0 tensor; T1 only serves the coarser levels */
-    const int slab = share && reuse_skip && infer_alias() && act_mx8() && infer_slab() > 0 && u->cfg.enc_blocks[0] == 0 && slab_w_ok(w[0]) && !any_single(u);
+    /* in-place slab convs at level 0 (see unet.slab): X holds every level-0 tensor; T1 only serves the coarser levels. GroupNorm level 0
+       only: the slab convs reduce whole-window GroupNorm statistics themselves, the cfg.l0_norm modes (none / ema / ws / slab) are not
+       wired into them yet and run the whole-window inference path */
+    const int slab = share && reuse_skip && infer_alias() && act_mx8() && infer_slab() > 0 && u->cfg.enc_blocks[0] == 0 && slab_w_ok(w[0]) && !any_single(u)
+                     && u->cfg.l0_norm == 0;
     const int slab1 = slab && L > 2 && slab_w_ok(w[1]) && u->cfg.enc_blocks[1] == 0 && (!getenv("UFSM_INFER_SLAB_L1") || ufsm_env_on("UFSM_INFER_SLAB_L1"));
     float *X = nullptr, *Y = nullptr;
     u->slab = slab; u->slab1 = slab1; u->slab_s = slab ? (infer_slab() + 3) / 4 * 4 : 0;
