@@ -403,6 +403,18 @@ extern "C" void nn_add_into(void *y, const void *x, shape5 s, int h16) {
     else add_into_k<bf16><<<nblk(n, 256), 256>>>((bf16 *)y, (const bf16 *)x, n);
     KCHECK();
 }
+/* the forward's y += x (a residual block's sum, an activation): round to nearest in MX-fp4 as every other forward store (stochastic
+   rounding only for gradient operands: the NVFP4 pretraining report, arXiv 2509.25149, saw SR on activations diverge);
+   UFSM_FWD_ADD_SR=1: the stochastic rounding nn_add_into applies */
+extern "C" void nn_add_into_act(void *y, const void *x, shape5 s, int h16) {
+    static int fsr = -1; if (fsr < 0) fsr = getenv("UFSM_FWD_ADD_SR") ? atoi(getenv("UFSM_FWD_ADD_SR")) : 0;
+    const int dt = nn_storage(y);
+    if (dt == 4 && !fsr) {
+        if (nn_storage(x) != dt) { fprintf(stderr, "nn_add_into_act: operands in different MX formats (%d, %d)\n", dt, nn_storage(x)); abort(); }
+        lp_add_mx(y, x, s, dt, 0u); KCHECK(); return;
+    }
+    nn_add_into(y, x, s, h16);
+}
 __global__ void side_tg_k(const uint8_t *s, size_t n, uint8_t *t, uint8_t *m) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i < n) { const uint8_t v = s[i]; t[i] = v == 1 ? 255 : 0; m[i] = v <= 1; }
