@@ -243,7 +243,7 @@ __device__ __forceinline__ unsigned sr_e2m1_nib_fast(float vm, unsigned u16) {  
     return (fl & 7u) | (__float_as_uint(vm) >> 28 & 8u);
 }
 template <int B, int HPB, bool FULL>
-__global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_k(const uint8_t *x, const uint8_t *gy, const float *gamma, const float *beta, const float *mean, const float *rstd,
+__global__ void __launch_bounds__(256, 5) gn_silu_bwd_apply_mx2_k(const uint8_t *x, const uint8_t *gy, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                                             const float *AB, uint8_t *gx, int N, int C, int G, size_t S, unsigned gsr) {
     const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G, blk = blockIdx.y, n = blockIdx.z;
     __shared__ float4 cf[32];
@@ -257,69 +257,84 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_k(const uint8_t *x,
         cf[k] = make_float4(0.5f * A, 0.5f * (be - mu * A), -rs * rs * cc, rs * (mu * rs * cc - ca));
     }
     __syncthreads();
-    const size_t v = ((size_t)blockIdx.x * 256 + threadIdx.x) / HPB;
-    if (v >= S) return;
+    /* persistent grid-stride rows (lp_gn_silu_bwd_apply_mx sizes the grid to the resident blocks) with the next row's loads in flight
+       during this one's arithmetic (a row per thread left DRAM ~80% busy with ~85% of the issue slots taken); warp-uniform trips for
+       the lane-pair shuffle, rows past S computed but not stored. Each row's arithmetic and SR keys as before: the same bits */
     const int h = HPB == 2 ? (int)(threadIdx.x & 1) : 0, h0 = 16 * h, kmax = FULL ? 16 : max(0, min(min(bw, C - blk * bw) - h0, 16));
-    const size_t ri = ((size_t)n * nb + blk) * S + v;
+    const size_t rb0 = ((size_t)n * nb + blk) * S, nv = (size_t)gridDim.x * (256 / HPB), lo = (size_t)((threadIdx.x & 31) / HPB);
     const int rbx = mx_rb(bw, B), rbg = mx_rb(bw, 4);
-    uint4 xw = make_uint4(0u, 0u, 0u, 0u);
-    if constexpr (B == 4) { const uint2 t = bw == 8 ? make_uint2(__ldg((const unsigned *)(x + ri * rbx)), 0u) : __ldg((const uint2 *)(x + ri * rbx + 8 * h)); xw.x = t.x; xw.y = t.y; }
-    else if (bw == 8) { const uint2 t = __ldg((const uint2 *)(x + ri * rbx)); xw.x = t.x; xw.y = t.y; }   /* MX-fp8 8-channel row: 8 bytes */
-    else xw = __ldg((const uint4 *)(x + ri * rbx + 16 * h));
-    const uint2 gw = bw == 8 ? make_uint2(__ldg((const unsigned *)(gy + ri * rbg)), 0u) : __ldg((const uint2 *)(gy + ri * rbg + 8 * h));
-    const float fx = mx_scale(__ldg(mx_sc<B>(x, N, C, S) + ri)), fg = mx_scale(__ldg(mx_sc<4>(gy, N, C, S) + ri));
-    float r[16], g[16], out[16];
-    if constexpr (B == 4) {
-        const unsigned w4[2] = {xw.x, xw.y};
+    const uint8_t *sx = mx_sc<B>(x, N, C, S), *sg = mx_sc<4>(gy, N, C, S);
+    uint8_t *sgx = mx_sc<4>(gx, N, C, S);
+    uint4 xw = make_uint4(0u, 0u, 0u, 0u); uint2 gw = make_uint2(0u, 0u); unsigned xs = 0u, gs = 0u;
+    auto load = [&](size_t ri) {
+        if constexpr (B == 4) { const uint2 t = bw == 8 ? make_uint2(__ldg((const unsigned *)(x + ri * rbx)), 0u) : __ldg((const uint2 *)(x + ri * rbx + 8 * h)); xw.x = t.x; xw.y = t.y; }
+        else if (bw == 8) { const uint2 t = __ldg((const uint2 *)(x + ri * rbx)); xw.x = t.x; xw.y = t.y; }   /* MX-fp8 8-channel row: 8 bytes */
+        else xw = __ldg((const uint4 *)(x + ri * rbx + 16 * h));
+        gw = bw == 8 ? make_uint2(__ldg((const unsigned *)(gy + ri * rbg)), 0u) : __ldg((const uint2 *)(gy + ri * rbg + 8 * h));
+        xs = __ldg(sx + ri); gs = __ldg(sg + ri);
+    };
+    size_t v = ((size_t)blockIdx.x * 256 + threadIdx.x) / HPB;
+    if (v < S) load(rb0 + v);
+    for (; v - lo < S; v += nv) {
+        const size_t ri = rb0 + v;
+        const uint4 cx = xw; const uint2 cg = gw;
+        const float fx = mx_scale(xs), fg = mx_scale(gs);
+        if (v + nv < S) load(ri + nv);
+        float r[16], g[16], out[16];
+        if constexpr (B == 4) {
+            const unsigned w4[2] = {cx.x, cx.y};
 #pragma unroll
-        for (int j = 0; j < 2; j++)
+            for (int j = 0; j < 2; j++)
 #pragma unroll
-            for (int q = 0; q < 4; q++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * q)); r[8 * j + 2 * q] = a.x * fx; r[8 * j + 2 * q + 1] = a.y * fx; }
-    } else {
-        const unsigned w8[4] = {xw.x, xw.y, xw.z, xw.w};
+                for (int q = 0; q < 4; q++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * q)); r[8 * j + 2 * q] = a.x * fx; r[8 * j + 2 * q + 1] = a.y * fx; }
+        } else {
+            const unsigned w8[4] = {cx.x, cx.y, cx.z, cx.w};
 #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            const float2 a = dec_e4m3x2((unsigned short)(w8[j] & 0xffff)), b2 = dec_e4m3x2((unsigned short)(w8[j] >> 16));
-            r[4 * j] = a.x * fx; r[4 * j + 1] = a.y * fx; r[4 * j + 2] = b2.x * fx; r[4 * j + 3] = b2.y * fx;
+            for (int j = 0; j < 4; j++) {
+                const float2 a = dec_e4m3x2((unsigned short)(w8[j] & 0xffff)), b2 = dec_e4m3x2((unsigned short)(w8[j] >> 16));
+                r[4 * j] = a.x * fx; r[4 * j + 1] = a.y * fx; r[4 * j + 2] = b2.x * fx; r[4 * j + 3] = b2.y * fx;
+            }
+        }
+        {
+            const unsigned w4[2] = {cg.x, cg.y};
+#pragma unroll
+            for (int j = 0; j < 2; j++)
+#pragma unroll
+                for (int q = 0; q < 4; q++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * q)); g[8 * j + 2 * q] = a.x; g[8 * j + 2 * q + 1] = a.y; }   /* raw; fg below */
+        }
+        unsigned am = 0u;
+#pragma unroll
+        for (int k = 0; k < 16; k++) {
+            out[k] = 0.f;
+            if (FULL || k < kmax) {
+                const float4 c4 = cf[h0 + k];
+                const float p = fmaf(r[k], c4.x, c4.y);
+                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                const float d2 = (1.f + th) * (fmaf(-p, th, p) + 1.f);   /* 2 dsilu(2p) */
+                out[k] = fmaf(g[k] * d2 * c4.x, fg, fmaf(r[k], c4.z, c4.w));
+                am = amax_u(am, out[k]);
+            }
+        }
+        if (HPB == 2) am = max(am, __shfl_xor_sync(0xffffffffu, am, 1));
+        const int e = mx_exp(__uint_as_float(am), mxf<4>::inv_qmax);
+        const float m = exp2i(-e);
+        unsigned w[2];
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            if (gsr) {
+                uint32_t hh[4]; sr_hash4(gsr, ri * 4 + 2 * h + j, hh);
+                unsigned wj = 0u;
+#pragma unroll
+                for (int i = 0; i < 8; i++) wj |= sr_e2m1_nib_fast(out[8 * j + i] * m, (hh[i >> 1] >> (16 * (i & 1))) & 0xffffu) << (4 * i);
+                w[j] = wj;
+            } else w[j] = mxf<4>::enc8x(out + 8 * j, m);
+        }
+        if (v < S) {
+            uint8_t *p = gx + ri * rbg + 8 * h;
+            if (bw == 8) *(unsigned *)p = w[0]; else *(uint2 *)p = make_uint2(w[0], w[1]);
+            if (!h) sgx[ri] = (uint8_t)(e + 127);
         }
     }
-    {
-        const unsigned w4[2] = {gw.x, gw.y};
-#pragma unroll
-        for (int j = 0; j < 2; j++)
-#pragma unroll
-            for (int q = 0; q < 4; q++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * q)); g[8 * j + 2 * q] = a.x; g[8 * j + 2 * q + 1] = a.y; }   /* raw; fg below */
-    }
-    unsigned am = 0u;
-#pragma unroll
-    for (int k = 0; k < 16; k++) {
-        out[k] = 0.f;
-        if (FULL || k < kmax) {
-            const float4 c4 = cf[h0 + k];
-            const float p = fmaf(r[k], c4.x, c4.y);
-            float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
-            const float d2 = (1.f + th) * (fmaf(-p, th, p) + 1.f);   /* 2 dsilu(2p) */
-            out[k] = fmaf(g[k] * d2 * c4.x, fg, fmaf(r[k], c4.z, c4.w));
-            am = amax_u(am, out[k]);
-        }
-    }
-    if (HPB == 2) am = max(am, __shfl_xor_sync(0xffffffffu, am, 1));
-    const int e = mx_exp(__uint_as_float(am), mxf<4>::inv_qmax);
-    const float m = exp2i(-e);
-    unsigned w[2];
-#pragma unroll
-    for (int j = 0; j < 2; j++) {
-        if (gsr) {
-            uint32_t hh[4]; sr_hash4(gsr, ri * 4 + 2 * h + j, hh);
-            unsigned wj = 0u;
-#pragma unroll
-            for (int i = 0; i < 8; i++) wj |= sr_e2m1_nib_fast(out[8 * j + i] * m, (hh[i >> 1] >> (16 * (i & 1))) & 0xffffu) << (4 * i);
-            w[j] = wj;
-        } else w[j] = mxf<4>::enc8x(out + 8 * j, m);
-    }
-    uint8_t *p = gx + ri * rbg + 8 * h;
-    if (bw == 8) *(unsigned *)p = w[0]; else *(uint2 *)p = make_uint2(w[0], w[1]);
-    if (!h) mx_sc<4>(gx, N, C, S)[ri] = (uint8_t)(e + 127);
 }
 /* dec[0]'s GroupNorm+SiLU backward with the head's input gradient recomputed instead of read (unet's three level-0 buffers, where it
    is never stored): gy of a voxel row is the 1^3 conv of its CI fp16 logit-gradient values with the head weights (wh [CI][C]),
@@ -330,12 +345,9 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_k(const uint8_t *x,
    EX (the default; lp_set_gn_head_exact(0) / UFSM_GN_HEAD_EXACT=0 restores the two-op path's bits): gy is the fp32 head_dot itself,
    not put through the MX-fp4 SR that only its storage needed. The GN backward is linear in gy and that SR unbiased, so gx keeps its
    expectation with less variance (only its own SR, the same keys; the seed sequence unchanged). That SR was most of the two kernels'
-   issue slots (P512 desk, 16 channels: stats 10.5 -> 5.9 ms, apply 15.4 -> 10.4 ms per step). */
-template <int CI, bool EX> __device__ __forceinline__ void head_gy_row(const float *sw, const __half *gl, int n, size_t S, size_t v, int bw, size_t ri, unsigned hs,
-                                                                       float *g, float &fg) {
-    float xi[CI], r[16];
-#pragma unroll
-    for (int ci = 0; ci < CI; ci++) xi[ci] = __half2float(gl[((size_t)n * CI + ci) * S + v]);
+   issue slots (P512 desk, 16 channels: stats 10.5 -> 5.2 ms, apply 15.4 -> 10.6 ms per step). */
+template <int CI, bool EX> __device__ __forceinline__ void head_gy_row_x(const float *sw, const float *xi, int bw, size_t ri, unsigned hs, float *g, float &fg) {
+    float r[16];   /* xi: the CI logit-gradient values of the voxel */
 #pragma unroll
     for (int k = 0; k < 16; k++) r[k] = head_dot<CI>(sw + k * CI, xi);
     if constexpr (EX) {
@@ -351,6 +363,13 @@ template <int CI, bool EX> __device__ __forceinline__ void head_gy_row(const flo
 #pragma unroll
         for (int i = 0; i < 4; i++) { const float2 a = dec_e2m1x2(w[j] >> (8 * i)); g[8 * j + 2 * i] = a.x; g[8 * j + 2 * i + 1] = a.y; }   /* raw; fg below */
     fg = mx_scale((unsigned)(uint8_t)(e + 127));
+}
+template <int CI, bool EX> __device__ __forceinline__ void head_gy_row(const float *sw, const __half *gl, int n, size_t S, size_t v, int bw, size_t ri, unsigned hs,
+                                                                       float *g, float &fg) {
+    float xi[CI];
+#pragma unroll
+    for (int ci = 0; ci < CI; ci++) xi[ci] = __half2float(gl[((size_t)n * CI + ci) * S + v]);
+    head_gy_row_x<CI, EX>(sw, xi, bw, ri, hs, g, fg);
 }
 /* the head weights as conv1_to_mx_t_k stages them for channel block 0 (its w is the flipped [C][CI] copy: the same values) */
 template <int CI> __device__ __forceinline__ void head_sw(float *sw, const float *wh, int C, int bw) {
@@ -693,6 +712,34 @@ extern "C" void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const
     (void)st; (void)AB;
     LPCK();
 }
+/* x blocks of a persistent grid-stride kernel (256 threads): those resident on the whole GPU over the ny = channel blocks x batch rows
+   of the grid (cached per kernel and device), at most need */
+static int g_gn_persist = -1;   /* test hook: 0 a row per thread (the grid of need blocks: one trip, the pre-persistent kernels' schedule), -1 env UFSM_GN_PERSIST */
+extern "C" void lp_set_gn_persist(int on) { g_gn_persist = on; }
+static unsigned gn_pgrid(const void *k, size_t need, size_t ny) {
+    static int env = -1; if (env < 0) env = getenv("UFSM_GN_PERSIST") ? atoi(getenv("UFSM_GN_PERSIST")) != 0 : 1;
+    if (!(g_gn_persist >= 0 ? g_gn_persist : env)) return (unsigned)need;
+    thread_local struct { const void *k; int dev, b; } c[16];
+    thread_local int nc = 0;
+    const int d = cur_dev_();
+    int b = 0;
+    for (int i = 0; i < nc; i++) if (c[i].k == k && c[i].dev == d) b = c[i].b;
+    if (!b) {
+        int per = 0, nsm = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, k, 256, 0); cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, d);
+        b = (per > 0 ? per : 1) * (nsm > 0 ? nsm : 1);
+        if (nc < 16) { c[nc].k = k; c[nc].dev = d; c[nc].b = b; nc++; }
+    }
+    size_t r = (size_t)b / ny; if (r < 1) r = 1;
+    return (unsigned)(need < r ? need : r);
+}
+template <int B, int HPB, bool FULL>
+static void gba2(const uint8_t *xq, const uint8_t *gyq, const float *gamma, const float *beta, const float *mean, const float *rstd, const float *AB, uint8_t *gq,
+                 shape5 s, int G, unsigned gsr) {
+    const size_t S = shape_spatial(s);
+    const dim3 g2(gn_pgrid((const void *)gn_silu_bwd_apply_mx2_k<B, HPB, FULL>, (S * HPB + 255) / 256, (size_t)mx_nb(s.c) * s.n), (unsigned)mx_nb(s.c), (unsigned)s.n);
+    gn_silu_bwd_apply_mx2_k<B, HPB, FULL><<<g2, 256>>>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s.n, s.c, G, S, gsr);
+}
 extern "C" void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                         const void *gy, void *gx, int gdt, const float *AB, unsigned gsr) {
     size_t S = shape_spatial(s);
@@ -701,12 +748,11 @@ extern "C" void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G,
     static int a2 = -1; if (a2 < 0) a2 = getenv("UFSM_GN_APPLY2") ? atoi(getenv("UFSM_GN_APPLY2")) : 1;
     if (a2 && gdt == 4) {   /* MX-fp4 gradients (the trainer default): lane-pair kernel */
         const int bw = mx_bw(s.c), hpb = bw == 32 ? 2 : 1, full = bw >= 16 && s.c % bw == 0;
-        const dim3 g2((unsigned)(((size_t)S * hpb + 255) / 256), (unsigned)mx_nb(s.c), (unsigned)s.n);
         uint8_t *gq = (uint8_t *)gx; const uint8_t *gyq = (const uint8_t *)gy;
-#define GBA2(B) do { if (hpb == 2 && full) gn_silu_bwd_apply_mx2_k<B, 2, true><<<g2, 256>>>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s.n, s.c, G, S, gsr); \
-                     else if (hpb == 2) gn_silu_bwd_apply_mx2_k<B, 2, false><<<g2, 256>>>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s.n, s.c, G, S, gsr); \
-                     else if (full) gn_silu_bwd_apply_mx2_k<B, 1, true><<<g2, 256>>>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s.n, s.c, G, S, gsr); \
-                     else gn_silu_bwd_apply_mx2_k<B, 1, false><<<g2, 256>>>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s.n, s.c, G, S, gsr); } while (0)
+#define GBA2(B) do { if (hpb == 2 && full) gba2<B, 2, true>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s, G, gsr); \
+                     else if (hpb == 2) gba2<B, 2, false>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s, G, gsr); \
+                     else if (full) gba2<B, 1, true>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s, G, gsr); \
+                     else gba2<B, 1, false>(xq, gyq, gamma, beta, mean, rstd, AB, gq, s, G, gsr); } while (0)
         if (xdt == 4) GBA2(4); else GBA2(8);
 #undef GBA2
         LPCK();
@@ -756,15 +802,24 @@ extern "C" void lp_gn_silu_bwd_head_stats(const void *x, shape5 s, int G, const 
     gn_part_sum_k<<<nblk_((size_t)2 * NC * 32, 256), 256>>>(part, (int)slabs, NC, ds);
     LPCK();
 }
+template <int CI, bool F, bool EX>
+static void hga(uint8_t *xq, const __half *g, const float *wh, unsigned hs, const float *gamma, const float *beta, const float *mean, const float *rstd,
+                const float *AB, shape5 s, int G, unsigned gsr) {
+    const size_t S = shape_spatial(s);
+    const dim3 g2((unsigned)((S + 255) / 256), (unsigned)mx_nb(s.c), (unsigned)s.n);   /* a row per thread (a persistent loop hoisted the 48 coefficients: 171 registers, 1.4x slower) */
+    gn_silu_bwd_apply_mx2_hg_k<CI, F, EX><<<g2, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s.n, s.c, G, S, gsr);
+}
 extern "C" void lp_gn_silu_bwd_head_apply(void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                           const void *gl, int ci, const float *wh, unsigned hs, const float *AB, unsigned gsr) {
     g_gyrec.valid = 0;
-    size_t S = shape_spatial(s);
-    const int bw = mx_bw(s.c);
-    const dim3 g2((unsigned)((S + 255) / 256), (unsigned)mx_nb(s.c), (unsigned)s.n);
+    const int bw = mx_bw(s.c), full = bw >= 16 && s.c % bw == 0, ex = hg_exact();
     uint8_t *xq = (uint8_t *)x; const __half *g = (const __half *)gl;
-    if (bw >= 16 && s.c % bw == 0) HGK(gn_silu_bwd_apply_mx2_hg_k, true, g2, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s.n, s.c, G, S, gsr));
-    else HGK(gn_silu_bwd_apply_mx2_hg_k, false, g2, 256>>>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s.n, s.c, G, S, gsr));
+#define HGA1(F, EX) do { switch (ci) { case 1: hga<1, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr); break; \
+                                       case 2: hga<2, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr); break; \
+                                       case 3: hga<3, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr); break; \
+                                       default: hga<4, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr); } } while (0)
+    if (full && ex) HGA1(true, true); else if (full) HGA1(true, false); else if (ex) HGA1(false, true); else HGA1(false, false);
+#undef HGA1
     LPCK();
 }
 #undef HGK
