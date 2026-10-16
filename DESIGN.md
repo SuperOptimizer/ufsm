@@ -278,6 +278,51 @@ them (MX data and scale planes of 8 planes at P >= 512 sit on 2 MB boundaries), 
 kernel: S2's windows on whole tensors are then all the kernels need. The host map / unmap traffic (hundreds per P1024 step) belongs
 in a helper thread ahead of the compute stream, unmaps after the last reader's event.
 
+Stage S4, slab rings (2026-10-16; `UFSM_L0_RING=1` with `UFSM_L0_STREAM=2`, unet_set_l0_ring; worker S4):
+- Rings without any map / unmap traffic: nn_ring_alloc (nn_core.cu, the driver's VMM through cudaGetDriverEntryPointByVersion, no
+  -lcuda) reserves a tensor's whole virtual range and maps slab s of each region (an MX tensor's data planes, then its scale planes)
+  onto physical chunk s mod R once, at the build -- one cuMemCreate per slab slot (cuMemMap maps whole allocations: a sub-range of one
+  handle returned CUDA_ERROR_NOT_SUPPORTED under WSL2), the same handles mapped R times apart. Kernels keep the whole-tensor
+  addresses: S2's windows and S3's schedule unchanged; writing slab s + R reuses slab s's memory, so the schedule's liveness is the
+  only contract (verified by the bits: a ring one slab short changes them). Slabs must lie on the 2 MB mapping granularity:
+  l0_slab h w a multiple of 2 MB (16-wide level 0: P a multiple of 256 at 32-plane slabs, P 512 / 1024 at 16).
+- Rings (depth; each one shorter fails test_l0_stream): enc[0].a1 3, the skip 5, dec[0].a1 3, dec[0].a2 1, the stream's d/d a2 3,
+  level 0's A 3, its B (the up-part gradient) 3, dec[0]'s up transient 3 (built per slab by up2 windows from silu(gn(dec[1].a2))
+  computed once into gout[1], free until B1's upsample backward writes it top down), gout[0] 1, the network input 3 (with
+  --gpu-input: rebuilt per slab from the CT channel by input_rad windows before each stem window, recompute and weight gradient),
+  the skip gradient 1 (host mode, below). UFSM_L0_RING_R overrides in that order. The shared A / B are sized for levels >= 1.
+- The stream head (unet_set_l0_head(fwd, bwd, ctx)): no whole-window logits -- F2 runs the 1^3 head on each slab as its statistics
+  close and hands the fp16 slab to fwd (the loss statistics); B1's dec[0] step at slab t computes the slab's logits again, bwd writes
+  the fp16 logit gradient over them, the head's backward writes gout[0]'s rows of the slab before GroupNorm 2's backward. The 16-wide
+  head has no fused kernel: per range as the whole path (nn_head_bwd_x's declined draw, conv_bwd_w1_tc_k over a voxel range,
+  conv1_to_mx_t_k over a row range with its own draw), so gout[0]'s bits and the seed count equal one whole call's.
+- The skip gradient's host mode (UFSM_L0_RING_SKIP=1, default; 0: whole on the device): a 1-slab ring with a pinned host copy, each
+  slab out as dec[0]'s conv1 backward-data completes it (B1) and back before down0's backward-data accumulates into it (B2'), on the
+  compute stream (1.2 GB each way per P512 step; not yet overlapped).
+- Tests: test_l0_stream arms 3 (rings, whole head), 4 (stream head on whole tensors: against the unstreamed run bit for bit but the
+  fp16 logits, within 0.004 of 10), 5 (stream head in rings: against 4), 7 (--gpu-input with the input ring: against 6, the whole
+  input), all bit for bit in logits, gout[1], dec[0]'s skip gradient (the whole 16-channel tensor), d/d downo[0], the final skip
+  gradient, seeds; every parameter-gradient part < 1e-5 (the atomic order). Plain and poison legs, P 128 / 256.
+- Memory (laptop 5080, tests/bench_l0_ring: the production chain in the plain layout the stream needs, --gpu-input; device peak incl.
+  the CT channel, weights, optimizer, context; another process shared the GPU, so the times are rough):
+
+| | dry B / voxel | device peak | step |
+|---|---|---|---|
+| P512 plain (unstreamed) | 85.8 | 12.82 GB | 852 ms |
+| P512 stream 2, whole tensors (S3) | 85.8 | 15.58 GB | 1193 ms |
+| P512 rings, slab 32 | 28.6 | 4.62 GB | 1111 ms |
+| P512 rings, slab 16 | 20.8 | 3.56 GB | 1157 ms |
+| P512 rings, slab 16, skip gradient on the device | 29.5 | 4.73 GB | 1282 ms |
+| P768 rings, slab 32 | 23.3 | 12.36 GB | 4226 ms (107 Mvox/s) |
+| P1024 rings, slab 16 / 32 (dry only) | 16.8 / 20.7 | 18.1 / 22.3 GB | |
+
+  The production three-buffer layout (worker C, same laptop): P512 4.63 GB, P768 13.83 GB at ~231 Mvox/s. The rings at P1024 / slab
+  16 leave the coarse levels as the bulk: at P1024 ~13 B per voxel of the 16.8 (encoder 4.3, decoder 3.0, the shared A / B 3.2 --
+  B holds dec[1]'s unchunked 32-channel up-part gradient, the stream refuses the chunked one --, coarse gout / gskip 2.5), all
+  resident in the plain layout (no coarse skip / down-output offloads). P1024 on 16 GB needs those down to ~7 B (stage S5).
+- Time: the rings cost nothing over the stream on whole tensors (1111 vs 1193 ms); the stream itself (S3's recompute and windowed
+  launches) and the plain layout's paths against the production layout's are the cost (S5 / perf).
+
 ## Trainer host RAM: packed targets, validation windows on disk (2026-10-15)
 At P768 the laptop trainer (production net, 6 workers, 7 slots, 4.8 um rv48 side labels) was OOM-killed by the 37.6 GiB slice cap
 before its first step (38.3 GB RSS): host RAM, not the GPU, bound the window. Per voxel the host held 5 B per sampler slot (CT fp16,
