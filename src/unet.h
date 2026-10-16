@@ -146,6 +146,8 @@ void *unet_batch_scratch(unet *u, size_t head, size_t tail);   /* lean 2: the ba
 void unet_set_l0_3buf(int on);
 void unet_set_l0_3buf_split(int on);     /* dec[0]'s conv1 weight gradient in an up and a skip part around the skip's copy (UFSM_L0_3BUF_SPLIT, default 0) */
 void unet_set_l0_3buf_reorder(int on);   /* enc[0]'s conv2 backward-data before its weight gradient (UFSM_L0_3BUF_REORDER, default 1) */
+void unet_set_l3_sched(int on);          /* the host copies in the order they are due, the coarse encoders' conv1 re-run (UFSM_L3_SCHED, default 1;
+                                            takes effect at the next build) */
 void *unet_batch_scratch2(unet *u, size_t head, size_t tail, void **tailp);
 void unet_set_batch_bytes(unet *u, size_t head, size_t tail);
 int unet_l0_3buf(const unet *u);

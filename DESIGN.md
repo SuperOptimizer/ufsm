@@ -746,6 +746,20 @@ emulated on the laptop's one GPU. Two real GPUs not yet run.
   8-wide net (UPW(1) 16 > 8: X1 would hold a 16-channel up transient; ~2 B per voxel at stake). `UFSM_L0_3BUF_SPLIT=1`: dec[0]'s
   conv1 weight gradient in an up and a skip part around the skip copy (hides it, but the two 16-channel weight gradients cost
   ~19 ms more on the laptop).
+- Three level-0 buffers, the copy schedule (unet l3_sched, `UFSM_L3_SCHED=0` off; latched at the build). The laptop under WSL runs
+  every host copy one at a time, H2D and D2H included, and a small copy on another stream does not pass a big one queued before it
+  (measured: a 20 MB D2H on a second stream finished after a 1.2 GB one; 1.2 GB D2H + 1.2 GB H2D on two streams 89 ms, no
+  overlap), so the order the copies are issued in is the order they run. nsys of a P512 trainer step (628 ms, kernels ~540):
+  ~40 ms of the forward waited on copies (the coarse decoders for their a1 behind level 0's first half, dec[0]'s conv2 for the
+  skip queued after the encoders), ~25 ms of the backward (down0's weight gradient for the skip into X3 issued after the decoders,
+  enc[0]'s for its a1 issued after down0's backward). Now: the encoder's a1 goes out as soon as the stem wrote it, the skip as
+  soon as enc[0] finished, then the down outputs and coarse skips, whose X3 homes only the logits overwrite (the head waits for
+  them, not dec[0]'s conv2); after dec[0]'s backward the coarse tensors come back, then the skip into X3 and the encoder's a1
+  into X2 but for the coarse backward homes' bytes (l3_x2_free: between the coarse skips at X2's start and the down outputs /
+  coarse gradients at its end), the rest after down0's backward. The coarse encoders (levels >= 1, ~0.2 GB at P512) re-run
+  conv1 instead of their a1 copies (the same kernel and rounding keys; ~3 ms). Laptop P512 trainer, interleaved runs: 628.8 ->
+  590.0 ms per step (1.59 -> 1.70 samp/s). test_l3_sched: the production chain at P128 / P512, schedule on vs off, logits bit for
+  bit, enc[0] / down0 / dec[0] / head / all gradients at the atomic-sum noise, the same seeds, the batch tail kept.
 - Offload copy order (`UFSM_A1_OUT_SPLIT=0` off): level 0's encoder a1 goes out in two halves, the second after the encoders, the
   down-conv outputs after the encoders, and level 0's a1 comes back after the decoders. The one copy stream had queued the coarse
   encoders' a1 copies (their decoders' conv1 waits for them) behind the 1.2 GB level-0 one: dec[L-2]'s conv1 waited ~27 ms per

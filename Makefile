@@ -114,6 +114,8 @@ $(B)/test_mx4: tests/test_mx4.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_grad_mx4: tests/test_grad_mx4.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/test_l3_sched: tests/test_l3_sched.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 
 $(B)/test_unet: tests/test_unet.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
@@ -292,6 +294,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_mx
 	./$(B)/test_mx4
 	./$(B)/test_grad_mx4
+	./$(B)/test_l3_sched
 	UFSM_F4W_LAYOUT=1 ./$(B)/test_mx4
 	./$(B)/test_rc
 	./$(B)/test_muon
@@ -336,3 +339,4 @@ $(B)/test_sweep: tests/test_sweep.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 test-all: $(B)/test_sweep
 test-all: $(B)/test_gpu_input
 test-all: $(B)/test_pack_tm
+test-all: $(B)/test_l3_sched
