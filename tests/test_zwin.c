@@ -230,13 +230,39 @@ static void test_down(int C, int Co, int D) {
     nn_free(f.x); nn_free(f.gy); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd); nn_free(f.w); nn_free(f.b); mode_off();
 }
 
+/* stride-1 weight gradients: x (MX-fp4, optionally silu(gn(x))) with an MX-fp4 gy (the fp4 kernel's gy pre-pass; 4-channel stem: fp8) */
+typedef struct { shape5 xs, ys; nn_gn_t g; int use_gn; void *x, *gy; } wg_t;
+static void wg_op(void *c, res_t *r) {
+    wg_t *f = c;
+    if (nn_conv3d_bwd_weight_x((const float *)f->x, f->use_gn ? &f->g : nullptr, nullptr, nullptr, 0, 0, f->xs, (const float *)f->gy, f->ys, 3, 1, r->gw, r->gw + (size_t)f->ys.c * f->xs.c * 27) < 0) {
+        printf("  wgrad unsupported  FAIL\n"); bad++;
+    }
+}
+static void test_wgrad(int C, int Co, int D, int use_gn) {
+    mode_prod();
+    wg_t f = {{1, C, D, 12, 20}, {1, Co, D, 12, 20}};
+    f.use_gn = use_gn;
+    float *x = dev_rand(shape_numel(f.xs), 1.5f); f.x = mx4_from(x, f.xs); nn_free(x);
+    float *gy = dev_rand(shape_numel(f.ys), 1e-2f); f.gy = mx4_from(gy, f.ys); nn_free(gy);
+    const int G = C >= 4 ? C / 4 : 1;
+    float *gam = dev_rand(C, 1.f), *bet = dev_rand(C, 0.5f), *mean = dev_rand(G, 0.2f), *rstd = dev_rand(G, 0.3f);
+    { float h[64]; nn_d2h(h, rstd, G * 4); for (int i = 0; i < G; i++) h[i] = 0.8f + fabsf(h[i]); nn_h2d(rstd, h, G * 4); }
+    f.g = (nn_gn_t){gam, bet, mean, rstd, G};
+    res_t w = {"", 0, nullptr, nullptr, 0, nullptr, 0, dev_zero((size_t)Co * C * 27 + Co), (size_t)Co * C * 27 + Co};
+    char m[96]; snprintf(m, sizeof m, "wgrad%s %2d -> %2d ch, depth %d", use_gn ? " gn" : "", C, Co, D);
+    drive(m, wg_op, &f, D, &w, f.ys, 0); res_free(&w);
+    nn_free(f.x); nn_free(f.gy); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd); mode_off();
+}
+
 int main(void) {
+    setenv("UFSM_F4_WGRAD", "1", 1);   /* the production fp4 weight gradient (train --fp4 2) */
     nn_init(0);
     printf("z-window launches == one launch (MX-fp4, SR):\n");
     for (int D = 32; D <= 36; D += 4) {   /* 36: a partial last window */
         test_fwd(16, 16, D); test_fwd(32, 32, D);
         test_bwd(16, 16, 0, D); test_bwd(32, 32, 0, D); test_bwd(16, 32, 16, D);
         test_stem(D); test_down(16, 16, D); test_down(32, 32, D);
+        test_wgrad(16, 16, D, 1); test_wgrad(32, 32, D, 1); test_wgrad(4, 16, D, 0);
     }
     const char *e = nn_check(); if (e) { printf("  CUDA: %s  FAIL\n", e); bad++; }
     printf("test_zwin: %s\n", bad ? "FAIL" : "PASS");

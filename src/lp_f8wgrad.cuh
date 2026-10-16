@@ -30,10 +30,10 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int ci0 = blockIdx.y * CH, co0 = blockIdx.z * BMo;
     int bz = blockIdx.x;   /* spatial tiles use grid.x: grid.z is limited to 65535 */
-    const int nxt = (W + 15) / 16, nyt = (H + 7) / 8, nzt = (D + 1) / 2;
+    const int nxt = (W + 15) / 16, nyt = (H + 7) / 8, tz0 = sp.zw1 ? sp.zw0 / 2 : 0, nzt = sp.zw1 ? (sp.zw1 + 1) / 2 : (D + 1) / 2;   /* z-steps [tz0, nzt) (z-window) */
     const int ox0 = (bz % nxt) * 16; bz /= nxt;
     const int oy0 = (bz % nyt) * 8; bz /= nyt;
-    const int nzc = (nzt + ZC - 1) / ZC;
+    const int nzc = (nzt - tz0 + ZC - 1) / ZC;
     const int zc = bz % nzc; const int n = bz / nzc;
     const size_t plane = (size_t)D * H * W;
     const int Cx = sp.x2 ? sp.c_split : Ci;
@@ -44,7 +44,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
     for (int a = 0; a < 3; a++) for (int m = 0; m < MT; m++) for (int q = 0; q < NT; q++) for (int k = 0; k < 4; k++) acc[a][m][q][k] = 0.f;
     if (threadIdx.x < BMo) sbias[threadIdx.x] = 0.f;
     const bool vec = (W & 3) == 0;
-    const int zt_begin = zc * ZC;
+    const int zt_begin = tz0 + zc * ZC;
     float bpart[BMo];   /* coop gy path: this thread's gy sums per output channel over the block's z-steps (reduced once at the end) */
 #pragma unroll
     for (int c = 0; c < BMo; c++) bpart[c] = 0.f;
@@ -273,7 +273,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                 bacc += bs;
             }
         };
-        const int zt_end = min(nzt, (zc + 1) * ZC);
+        const int zt_end = min(nzt, tz0 + (zc + 1) * ZC);
         /* two barriers per z-step: B2 after the x amax reductions (graw landed, every warp past the previous MMA: the ring slots and
            the gy tile may be rewritten), B4 after the staging (the MMA's operands complete) */
         if (tid < 2 * CH) amx[2 * CH + tid] = 0u;   /* buffer 1 (buffer 0 was zeroed with the channel table) */
@@ -301,7 +301,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
             mma_zstep(oz0);
         }
     } else
-    for (int zt = zt_begin; zt < nzt && zt < (zc + 1) * ZC; zt++) {
+    for (int zt = zt_begin; zt < nzt && zt < tz0 + (zc + 1) * ZC; zt++) {
         const int oz0 = zt * 2;
         const int np = zt == zt_begin ? 4 : 2, gz_first = zt == zt_begin ? oz0 - 1 : oz0 + 1;
         __syncthreads();
@@ -545,8 +545,11 @@ template <typename T, typename TG> void bwd_w_f8_t(const void *x, shape5 xs, con
     if (getenv("UFSM_F8_NT")) NT = atoi(getenv("UFSM_F8_NT"));
     if (getenv("UFSM_F8_MT")) MT = atoi(getenv("UFSM_F8_MT"));
     size_t smem = (size_t)8 * NT * X8_CS + 16 * MT * (G8_CS + 8) + 8 * NT * 4 + 16 * MT * 4 + 16 + 32 + (size_t)8 * NT * (sizeof(chan_t) + 8);   /* + MX x channel table, amax */
+    { int a, c; if (zw_win(ys.d, &a, &c)) {   /* z-window: gy planes [a, c) (z-steps of 2) */
+        if (a % 2 || (c % 2 && c != ys.d)) { fprintf(stderr, "lp_bwd_w_f8: z-window [%d, %d) not on z-steps\n", a, c); abort(); }
+        sp.zw0 = a; sp.zw1 = c; } }
     /* z-steps per block: as many as possible (less halo restaging, fewer atomics) while keeping one full wave of blocks */
-    int nzt = nblk_(ys.d, 2), base = (int)(((xs.c + 8 * NT - 1) / (8 * NT)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * nblk_(ys.w, 16) * nblk_(ys.h, 8) * ys.n);
+    int nzt = sp.zw1 ? (sp.zw1 + 1) / 2 - sp.zw0 / 2 : nblk_(ys.d, 2), base = (int)(((xs.c + 8 * NT - 1) / (8 * NT)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * nblk_(ys.w, 16) * nblk_(ys.h, 8) * ys.n);
     const int zcap = xs.c <= 8 ? 48 : 12;   /* the network input conv: 48 z-steps (fewer halo restagings and gw atomics: P512 19.5 -> 18.2 ms) */
     int ZC = nzt < zcap ? nzt : zcap;
     while (ZC > 1 && (size_t)base * nblk_(nzt, ZC) < 72) ZC--;
