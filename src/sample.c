@@ -708,12 +708,17 @@ int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint
     }
     free(table);
 }
-static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t *mask,
+static void *tp_get(size_t n, int zero);
+static void tp_put(void *p, size_t n);
+/* TM (packed targets, hard and CT-only only; T, M unused): the code bytes of sample_pack_tm written straight from the warp (no
+   T / M window buffers); when the targets turn out not to be 0 / 255 or the writer's fast path does not apply, T / M go to pooled
+   scratch and are packed after, aborting as draw() did */
+static void write_spatial_tm(const uint8_t *ctu,const uint8_t *target,const uint8_t *mask,
                          uint8_t *T,uint8_t *M,int P,const int64_t o[3],float mean,float isd,
                          int hasax,const float *cy,const float *cx,sym sy,const spatial_aug *a,
                          float gain,float offset,float noise,rng *r,float *nrow,int xfmt,float *X,uint16_t *H,
                          const ct_aug_plan *ap,float *noise_row,float *noise_plane,
-                         const sheet_dataset *sheet,const double (*params)[4],float *appearance,int hard,int ct_only) {
+                         const sheet_dataset *sheet,const double (*params)[4],float *appearance,int hard,int ct_only,uint8_t *TM) {
     pthread_once(&g_ntab_once,ntab_init);
     size_t p3=(size_t)P*P*P; float *table=malloc(6*(size_t)P*sizeof *table);
     if (!table) abort();
@@ -758,9 +763,12 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
         }
         cmt=!odd;
     }
+    const int direct=TM && cmt;   /* (cmt implies hard, CT-only, the fast path) */
 #else
-    const int fast=0;
+    const int fast=0, direct=0;
 #endif
+    uint8_t *Tloc=nullptr;
+    if (TM && !direct) { if (!(Tloc=tp_get((NCH+1)*p3,0))) abort(); T=Tloc; M=Tloc+NCH*p3; }
     for (int z0=0;z0<P;z0+=ZB) {
         const int nz=P-z0<ZB?P-z0:ZB;
         for (int y0=0;y0<P;y0+=TB) for (int x0=0;x0<P;x0+=TB) {
@@ -849,9 +857,16 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                         const size_t k=((size_t)z*P+y)*P+xs, kb=((size_t)(z-z0)*P+y)*P+xs;
                         _mm256_storeu_ps(cvb+kb,cv);
                         /* inside 0 / 1, mask inside and no zero corner, targets (the gathers are 0 outside): 8 bytes each */
-                        const __m256i inv=_mm256_and_si256(ini,_mm256_set1_epi32(1));
-                        const uint64_t q0=pack8_u32(inv),q1=pack8_u32(_mm256_andnot_si256(bad,inv)),q2=pack8_u32(t0),q3=pack8_u32(t1);
-                        memcpy(inb+kb,&q0,8); memcpy(M+k,&q1,8); memcpy(T+k,&q2,8); memcpy(T+p3+k,&q3,8);
+                        const __m256i inv=_mm256_and_si256(ini,_mm256_set1_epi32(1)), mv=_mm256_andnot_si256(bad,inv);
+                        const uint64_t q0=pack8_u32(inv); memcpy(inb+kb,&q0,8);
+                        if (direct) {   /* sample_pack_tm's code: t0 >> 7 & T0 | t1 >> 6 & T1 | m << 2 & M */
+                            const __m256i code=_mm256_or_si256(_mm256_or_si256(_mm256_and_si256(_mm256_srli_epi32(t0,7),_mm256_set1_epi32(SAMPLE_TM_T0)),
+                                _mm256_and_si256(_mm256_srli_epi32(t1,6),_mm256_set1_epi32(SAMPLE_TM_T1))),_mm256_and_si256(_mm256_slli_epi32(mv,2),_mm256_set1_epi32(SAMPLE_TM_M)));
+                            const uint64_t qc=pack8_u32(code); memcpy(TM+k,&qc,8);
+                        } else {
+                            const uint64_t q1=pack8_u32(mv),q2=pack8_u32(t0),q3=pack8_u32(t1);
+                            memcpy(M+k,&q1,8); memcpy(T+k,&q2,8); memcpy(T+p3+k,&q3,8);
+                        }
                     }
                     continue;
                 }
@@ -956,6 +971,22 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
     }
     free(vt); free(cvb); free(inb);
     free(table);
+    if (Tloc) {
+        size_t bad=0;
+        if (sample_pack_tm(T,T+p3,M,p3,TM,&bad)) {
+            fprintf(stderr,"sampler: packed targets need hard 0 / 255 targets and a 0 / 1 mask after the warp (voxel %zu); train --pack-targets 0\n",bad);
+            abort();
+        }
+        tp_put(Tloc,(NCH+1)*p3);
+    }
+}
+static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t *mask,
+                         uint8_t *T,uint8_t *M,int P,const int64_t o[3],float mean,float isd,
+                         int hasax,const float *cy,const float *cx,sym sy,const spatial_aug *a,
+                         float gain,float offset,float noise,rng *r,float *nrow,int xfmt,float *X,uint16_t *H,
+                         const ct_aug_plan *ap,float *noise_row,float *noise_plane,
+                         const sheet_dataset *sheet,const double (*params)[4],float *appearance,int hard,int ct_only) {
+    write_spatial_tm(ctu,target,mask,T,M,P,o,mean,isd,hasax,cy,cx,sy,a,gain,offset,noise,r,nrow,xfmt,X,H,ap,noise_row,noise_plane,sheet,params,appearance,hard,ct_only,nullptr);
 }
 int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint8_t *mask, int P, const int64_t o[3], float mean, float isd,
                               int hasax, const float *cyz, const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed,
@@ -973,7 +1004,15 @@ int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint
                                    nullptr, nullptr, nullptr, nullptr, nullptr, app, hard, 0);
     rseed(&r, seed); write_spatial(ctu, tgt, mask, T, M, P, o, mean, isd, hasax, cyz, cxz, y, &a, 1.1f, .05f, .02f, &r, nrow, xfmt, nullptr, H1,
                                    nullptr, nullptr, nullptr, nullptr, nullptr, app, hard, 1);
-    const int same = !memcmp(T4, T, NCH * p3) && !memcmp(M4, M, p3);
+    int same = !memcmp(T4, T, NCH * p3) && !memcmp(M4, M, p3);
+    if (hard) {   /* the trainer's packed form straight from the warp: sample_pack_tm's codes of T / M, and the same CT channel */
+        uint8_t *tm = malloc(p3), *tp = malloc(p3); uint16_t *h1b = malloc(p3 * 2); size_t bad = 0;
+        if (!tm || !tp || !h1b) abort();
+        rseed(&r, seed); write_spatial_tm(ctu, tgt, mask, nullptr, nullptr, P, o, mean, isd, hasax, cyz, cxz, y, &a, 1.1f, .05f, .02f, &r, nrow, xfmt, nullptr, h1b,
+                                          nullptr, nullptr, nullptr, nullptr, nullptr, app, hard, 1, tm);
+        same = same && !sample_pack_tm(T, T + p3, M, p3, tp, &bad) && !memcmp(tm, tp, p3) && !memcmp(h1b, H1, p3 * 2);
+        free(tm); free(tp); free(h1b);
+    }
     rad_record(rec, o, P, P, hasax, y, cyz, cxz, &a);
     free(nrow); free(app); free(T4); free(M4);
     return same ? a.active : -1;
@@ -1669,7 +1708,9 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     if (c->papyrus) b->um[i] = c->papyrus->cond == 1 ? (float)(ia * ((pap_t - mean) / sd) + ib) : 0.f;   /* the cutoff where the input puts it */
     if (c->papyrus && c->papyrus->cond == 2) { mean = pap_t; ib = 0.f; }   /* the CT channel (ct - t) / sd: the cutoff at zero */
     uint8_t *Tw = nullptr;   /* (packed and warped: the warped targets and mask before packing) */
-    if (c->pack_tm && spatial.active) {
+    uint8_t *TMd = nullptr;   /* packed, warped, CT-only, nothing else reading T / M: the warp writes the codes into the batch */
+    if (c->pack_tm && spatial.active && c->gpu_input && !c->sheet && !c->pmask) TMd = b->tm + (size_t)i * p3;
+    else if (c->pack_tm && spatial.active) {
         if (!(Tw = tp_get((NCH + 1) * p3, 0))) return -1;
         T = Tw; M = Tw + NCH * p3;
     }
@@ -1729,8 +1770,8 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         params=malloc((size_t)P*sizeof *params);
         for (int sz=0;sz<P;sz++) sheet_parameters(c->sheet,o[0]+sz,params[sz]);
     }
-    if (spatial.active) write_spatial(ctu,ttmp,mask,T,M,P,o,(float)mean,(float)(1.0/sd),s->ax.n>0,cyz,cxz,y,&spatial,
-            ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+5*p3),c->pack_tm,c->gpu_input);
+    if (spatial.active) write_spatial_tm(ctu,ttmp,mask,T,M,P,o,(float)mean,(float)(1.0/sd),s->ax.n>0,cyz,cxz,y,&spatial,
+            ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+5*p3),c->pack_tm,c->gpu_input,TMd);
     else if (c->sheet || (app && Pz != P)) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
             X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);
     else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H,
