@@ -32,6 +32,11 @@ typedef struct {
                               upsampled trilinearly), 2 pack (cin 8: the block means, the CT's sub-voxel gradients and contrast;
                               cout 8 per output, one per sub-voxel); 3 pool4, 4 pack4: the network on 4^3 blocks (a 2x pool / trilinear 2x
                               around pool / pack). The network itself does not use it; train / predict apply the transforms (nn_lowres_*) */
+    int w4_2d;             /* consistent fp4 weights (train --w4-2d 1): the stride-1 3^3 conv weights (not the fp8 stem, not the stride-2
+                              downs) round to MX-fp4 with one scale per 32 x 32 (output x input channel) block and tap before every forward
+                              (nn_fakeq_w4_2d into the forward copy), so the forward's per-input-channel blocks and backward-data's per-
+                              output-channel blocks re-quantise them exactly: both passes see the same weights (the NVFP4 report's 2D
+                              weight scaling, arXiv 2509.25149); the weight gradient goes to the fp32 master weights unchanged */
 } unet_cfg;
 static inline int unet_hr_div(int hr) { return hr >= 3 ? 4 : hr ? 2 : 1; }      /* the window voxels per network voxel along each axis */
 static inline int unet_hr_mode(int hr) { return hr == 2 || hr == 4 ? 2 : 1; }   /* the last stage: 1 pool, 2 pack (nn_half_*) */

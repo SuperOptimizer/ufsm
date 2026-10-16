@@ -69,6 +69,8 @@ size_t lp_mx4_bytes(int N, int C, size_t S);
 void lp_f32_to_mx4(const float *x, int N, int C, size_t S, void *y);
 void lp_h16_to_mx4(const void *x, int dt, int N, int C, size_t S, void *y);
 void lp_input_rad(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int D, int P, void *y, int bits);   /* nn_input_rad */
+void lp_fakeq_w4(float *w, int Co, int Ci, int T, int Bo, int Bi);   /* nn_fakeq_w4_2d / nn_fakeq_w4 */
+void lp_input_rad_pack(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, void *y, int bits);   /* nn_input_rad_pack */
 void lp_mx4_to_f32(const void *x, int N, int C, size_t S, float *y);
 double lp_sr_e2m1_mean(float v, size_t n);                        /* test probe: mean of n stochastic e2m1 roundings of v (v in grid units) */
 double lp_sr_e2m1_nib_mean(float v, size_t n);                    /* test probe: the same for the direct-nibble rounding of the fp4 weight gradient (|v| <= 6) */

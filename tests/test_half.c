@@ -102,6 +102,57 @@ int main(void) {
         nn_free(l); nn_free(g); nn_free(x); nn_free(o); nn_free(gl); nn_free(t); nn_free(y); nn_free(y2);
         free(lh); free(gh); free(xh); free(oh); free(glh); free(a1); free(a2);
     }
+    {   /* the pack loss (nn_loss_pack) against nn_half_output + nn_loss_async_tol + nn_half_grad: the loss parts and the packed logit
+           gradient bit for bit, fp32 and fp16 logits, fp32 / fp16 gradients, in place over fp16 logits; 2 samples x 2 outputs */
+        const int N = 2, Co = 2, dd = 6, hh = 4, ww = 8;
+        const shape5 fs = {N, Co, 2 * dd, 2 * hh, 2 * ww}, hs = {N, Co, dd, hh, ww};
+        const size_t nf = shape_numel(fs), S = shape_spatial(fs);
+        uint8_t *th = malloc(nf), *mh = malloc((size_t)N * S), wh[4] = {1, 1, 1, 0};   /* (sample 1's second output off) */
+        for (size_t i = 0; i < nf; i++) th[i] = (uint8_t)((i * 2654435761u >> 7) % 3 == 0 ? 255 : (i * 40503u >> 3) % 7 == 0 ? 128 : 0);
+        for (size_t i = 0; i < (size_t)N * S; i++) mh[i] = (uint8_t)((i * 2246822519u >> 9) % 5 ? 1 : (i % 11 == 0 ? 2 : 0));
+        uint8_t *t = nn_malloc(nf), *m = nn_malloc((size_t)N * S), *wd = nn_malloc(4);
+        nn_h2d(t, th, nf); nn_h2d(m, mh, (size_t)N * S); nn_h2d(wd, wh, 4);
+        float *lh = rnd(nf, 7); for (size_t i = 0; i < nf; i++) lh[i] *= 4.f;
+        float *l32 = dev(lh, nf); void *l16 = nn_malloc(nf * 2); nn_set_f16(1); nn_f32_to_h16(l32, nf, l16, 1.f);
+        const size_t sb = nn_loss_scratch(fs);
+        float *sa = nn_malloc(sb), *sbp = nn_malloc(sb), *lf = nn_malloc(nf * 4), *gf = nn_malloc(nf * 4);
+        void *ga = nn_malloc(nf * 4), *gb = nn_malloc(nf * 4);
+        uint8_t *ha = malloc(nf * 4), *hb = malloc(nf * 4); float *fa = malloc(sb), *fb = malloc(sb);
+        for (int lh16 = 0; lh16 <= 1; lh16++) for (int g16 = 0; g16 <= 1; g16++) for (int inplace = 0; inplace <= lh16 && inplace <= g16; inplace++) {
+            const void *lg = lh16 ? l16 : (const void *)l32;
+            nn_set_loss_grad_h16(g16); nn_set_grad_scale(g16 ? 1024.f : 1.f);
+            nn_half_output(lg, lh16, hs, 2, lf);                                   /* the reference chain */
+            nn_set_logits_h16(0); nn_loss_async_tol(lf, t, m, wd, fs, 0.7f, gf, sa, nullptr);
+            nn_half_grad(gf, g16, (shape5){N, Co, dd, hh, ww}, 2, ga);
+            void *lgp = lg;
+            if (inplace) { nn_d2d(gb, l16, nf * 2); lgp = gb; }                  /* the pack loss, in place over a copy of the logits */
+            nn_set_logits_h16(lh16); nn_loss_pack(lgp, t, m, wd, fs, 0.7f, inplace ? lgp : gb, sbp); nn_set_logits_h16(0);
+            const size_t gbytes = nf * (g16 ? 2 : 4);
+            nn_d2h(ha, ga, gbytes); nn_d2h(hb, gb, gbytes); nn_d2h(fa, sa, sb); nn_d2h(fb, sbp, sb);
+            const int okg = !memcmp(ha, hb, gbytes), oks = !memcmp(fa, fb, sb);
+            CHECK(okg && oks, "pack loss logits fp%d gradient fp%d%s: gradient %s, loss parts %s", lh16 ? 16 : 32, g16 ? 16 : 32, inplace ? " in place" : "",
+                  okg ? "equal" : "DIFFER", oks ? "equal" : "DIFFER");
+            printf("pack loss (logits fp%d, gradient fp%d%s): gradient and loss parts %s\n", lh16 ? 16 : 32, g16 ? 16 : 32, inplace ? ", in place" : "", okg && oks ? "bit-identical" : "DIFFER");
+        }
+        {   /* packed target codes (t nullptr: m holds them) = the targets / mask nn_unpack_tm writes */
+            uint8_t *ch = malloc((size_t)N * S);
+            for (size_t i = 0; i < (size_t)N * S; i++) ch[i] = (uint8_t)((i * 2654435761u >> 11) & 7);
+            uint8_t *cd = nn_malloc((size_t)N * S), *tu = nn_malloc((size_t)N * Co * S), *mu = nn_malloc((size_t)N * S);
+            nn_h2d(cd, ch, (size_t)N * S); nn_h2d(mu, ch, (size_t)N * S); nn_unpack_tm(tu, mu, N, S, 0);
+            nn_set_loss_grad_h16(1); nn_set_grad_scale(1024.f); nn_set_logits_h16(1);
+            nn_loss_pack(l16, tu, mu, wd, fs, 0.7f, ga, sa);
+            nn_loss_pack(l16, nullptr, cd, wd, fs, 0.7f, gb, sbp);
+            nn_set_logits_h16(0);
+            nn_d2h(ha, ga, nf * 2); nn_d2h(hb, gb, nf * 2); nn_d2h(fa, sa, sb); nn_d2h(fb, sbp, sb);
+            const int ok = !memcmp(ha, hb, nf * 2) && !memcmp(fa, fb, sb);
+            CHECK(ok, "pack loss from packed target codes differs from the unpacked targets");
+            printf("pack loss from packed target codes: %s\n", ok ? "bit-identical to the unpacked targets" : "DIFFER");
+            nn_free(cd); nn_free(tu); nn_free(mu); free(ch);
+        }
+        nn_set_loss_grad_h16(0); nn_set_grad_scale(1.f);
+        nn_free(t); nn_free(m); nn_free(wd); nn_free(l32); nn_free(l16); nn_free(sa); nn_free(sbp); nn_free(lf); nn_free(gf); nn_free(ga); nn_free(gb);
+        free(th); free(mh); free(lh); free(ha); free(hb); free(fa); free(fb);
+    }
     {   /* the checkpoint keeps half_res */
         unet_cfg cfg = {3, {32, 64, 96}, 8, 16, 8, 1, 0}; cfg.half_res = 2;
         unet *u = unet_create(&cfg); unet_init(u, 1);

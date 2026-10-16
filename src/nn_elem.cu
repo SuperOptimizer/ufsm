@@ -160,6 +160,13 @@ extern "C" void nn_input_rad(const void *ct16, shape5 xs, const void *rec, void 
     lp_input_rad(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(xs.d), xs.n, xs.d, xs.h, y, ISMX4(y) ? 4 : 8);
     KCHECK();
 }
+extern "C" void nn_fakeq_w4_2d(float *w, int Co, int Ci, int T, int B) { lp_fakeq_w4(w, Co, Ci, T, B, B); KCHECK(); }
+extern "C" void nn_fakeq_w4(float *w, int Co, int Ci, int T, int Bo, int Bi) { lp_fakeq_w4(w, Co, Ci, T, Bo, Bi); KCHECK(); }
+extern "C" void nn_input_rad_pack(const void *ct16, shape5 xs, const void *rec, void *y) {
+    if (!ISMX(y) || xs.c != 8 || xs.h != xs.w) { fprintf(stderr, "nn_input_rad_pack: an MX input of 8 channels, square planes\n"); abort(); }
+    lp_input_rad_pack(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(2 * xs.d), xs.n, xs.d, xs.h, y, ISMX4(y) ? 4 : 8);
+    KCHECK();
+}
 __global__ void unpack_tm_k(uint8_t *t, uint8_t *m, size_t p3, size_t n4) {   /* 4 voxels per thread (p3 % 4 == 0) */
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= n4) return;

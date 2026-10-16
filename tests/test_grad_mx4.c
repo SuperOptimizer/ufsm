@@ -312,6 +312,56 @@ int main(void) {
             nn_free(w); nn_free(gy); nn_free(gym); nn_free(gyd); nn_free(gxr); nn_free(scr); nn_free(gxm); nn_free(acc); nn_free(one); nn_free(tmp);
         }
     }
+    {   /* consistent fp4 weights (unet_cfg.w4_2d, nn_fakeq_w4_2d): the forward rounds w in blocks along the input channels, backward-data
+           along the output channels, so today's input gradient is the derivative of a network with other weights (Wb, not the forward's
+           Wf). The 2D fake-quant (one scale per 32 x 32 block and tap) is re-quantised exactly by both, so the mean of K SR'd gradients
+           must converge to the forward's own derivative. Weights with spread row / column magnitudes (as trained convs have) */
+        const uint64_t rs_c = rs;
+        const int KC = 64;
+        for (int C = 16; C <= 32; C += 16) {
+            const int B1 = C <= 16 ? 16 : 32;   /* the preps' block: p16 (<= 16 inputs) / 32 */
+            shape5 xs = {1, C, 8, 16, 32}, ys = xs;
+            const size_t nx = shape_numel(xs), nw = (size_t)C * C * 27;
+            float *hw = malloc(nw * 4), rg[64], cg[64];
+            for (int c = 0; c < C; c++) { rg[c] = exp2f(1.5f * frand()); cg[c] = exp2f(1.5f * frand()); }
+            for (int co = 0; co < C; co++) for (int ci = 0; ci < C; ci++) for (int t = 0; t < 27; t++) hw[((size_t)co * C + ci) * 27 + t] = 0.1f * frand() * rg[co] * cg[ci];
+            float *w = nn_malloc(nw * 4); nn_h2d(w, hw, nw * 4);
+            float *wf = nn_malloc(nw * 4), *wb = nn_malloc(nw * 4), *w2 = nn_malloc(nw * 4), *wc = nn_malloc(nw * 4);
+            nn_d2d(wf, w, nw * 4); nn_fakeq_w4(wf, C, C, 27, 1, B1);    /* the forward's weights */
+            nn_d2d(wb, w, nw * 4); nn_fakeq_w4(wb, C, C, 27, B1, 1);    /* backward-data's */
+            nn_d2d(w2, w, nw * 4); nn_fakeq_w4_2d(w2, C, C, 27, 32);   /* consistent */
+            int exact = 1; float *h2 = malloc(nw * 4), *hc = malloc(nw * 4); nn_d2h(h2, w2, nw * 4);
+            for (int dir = 0; dir < 2; dir++) {   /* both 1D re-quantisations of the 2D-quantised weights are the identity */
+                nn_d2d(wc, w2, nw * 4); nn_fakeq_w4(wc, C, C, 27, dir ? B1 : 1, dir ? 1 : B1); nn_d2h(hc, wc, nw * 4);
+                exact &= !memcmp(h2, hc, nw * 4);
+            }
+            float *gy = dev_rand_wide(nx, 1e-3f);
+            void *gym = mx4_from(gy, ys); float *gyd = deq4(gym, ys);
+            float *scr = nn_malloc(nn_conv3d_scratch(xs, C, 3) + 4096), *r[4];
+            const float *ws[4] = {wf, wb, w2, w};
+            mode_ref();
+            for (int k = 0; k < 4; k++) { r[k] = dev_zero(nx); nn_conv3d_bwd_data(gyd, ys, ws[k], xs, 3, 1, r[k], scr); }
+            void *gxm = mx4_new(xs); float *acc[2] = {dev_zero(nx), dev_zero(nx)}, *one = dev_zero(nx), *tmp = dev_zero(nx);
+            mode_mx();
+            for (int m = 0; m < 2; m++) for (int k = 0; k < KC; k++) {   /* m 0: today (master weights), 1: the consistent weights */
+                nn_set_sr_step(7000 + k);
+                nn_conv3d_bwd_data(gym, ys, m ? w2 : w, xs, 3, 1, (float *)gxm, scr);
+                deq4_into(gxm, xs, tmp);
+                if (!k && m) nn_d2d(one, tmp, nx * 4);
+                nn_axpy(acc[m], 1.f / KC, tmp, nx);
+            }
+            const double t_f = relerr(acc[0], r[0], nx), t_b = relerr(acc[0], r[1], nx), t_32 = relerr(acc[0], r[3], nx);
+            const double c_2 = relerr(acc[1], r[2], nx), c_32 = relerr(acc[1], r[3], nx), c1 = relerr(one, r[2], nx);
+            const int ok = exact && c_2 < 1.5 * c1 / sqrt((double)KC) && c_2 < t_f && t_b < t_f;
+            printf("  weights %2d ch: today mean of %d vs its forward's derivative %.3g (vs backward-data's own weights %.3g, fp32 weights %.3g); "
+                   "consistent %.3g (one %.3g; fp32 weights %.3g); 2D values re-quantise exactly %s%s\n", C, KC, t_f, t_b, t_32, c_2, c1, c_32, exact ? "yes" : "NO", ok ? "" : "  FAIL");
+            if (!ok) bad++;
+            nn_free(w); nn_free(wf); nn_free(wb); nn_free(w2); nn_free(wc); nn_free(gy); nn_free(gym); nn_free(gyd); nn_free(scr);
+            for (int k = 0; k < 4; k++) nn_free(r[k]);
+            nn_free(gxm); nn_free(acc[0]); nn_free(acc[1]); nn_free(one); nn_free(tmp); free(hw); free(h2); free(hc);
+        }
+        rs = rs_c;
+    }
     {   /* stride-1 backward-data: gy MX-fp4 -> gx MX-fp4 (the fp4 conv kernels; gx with exact SR) */
         const int cis[3] = {32, 64, 32}, cos_[3] = {32, 32, 64};
         for (int k3 = 0; k3 < 3; k3++) {

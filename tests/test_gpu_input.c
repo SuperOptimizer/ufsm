@@ -60,6 +60,26 @@ int main(void) {
                                                    xfmt, bits, shape, sym, ax, k, mxb, ya[k], yb[k]);
                             fails++;
                         }
+                        {   /* --half-res pack: the 8 input channels on the 2x2x2 blocks (nn_input_rad_pack) against the host chain
+                               write_x -> nn_half_input(mode 2) -> nn_h16_to_mx */
+                            const shape5 hs = {N, 8, D / 2, P / 2, P / 2};
+                            const size_t hb = nn_mx_bytes(hs, bits), h8 = (size_t)N * 8 * shape_spatial(hs) * 2;
+                            void *d_h8 = nn_malloc(h8), *d_pa = nn_malloc(hb), *d_pb = nn_malloc(hb);
+                            nn_set_storage(d_pa, hb, bits); nn_set_storage(d_pb, hb, bits);
+                            nn_half_input(d_h4, xs, 2, d_h8, 1);
+                            nn_h16_to_mx(d_h8, hs, d_pa);
+                            nn_input_rad_pack(d_h1, hs, d_rec, d_pb);
+                            uint8_t *pa = malloc(hb), *pb = malloc(hb);
+                            nn_d2h(pa, d_pa, hb); nn_d2h(pb, d_pb, hb);
+                            cases++;
+                            if (memcmp(pa, pb, hb)) {
+                                size_t k = 0; while (k < hb && pa[k] == pb[k]) k++;
+                                if (fails < 5) fprintf(stderr, "FAIL: packed device input differs (xfmt %d MX-fp%d shape %d sym %d axis %d): first byte %zu of %zu (%02x vs %02x)\n",
+                                                       xfmt, bits, shape, sym, ax, k, hb, pa[k], pb[k]);
+                                fails++;
+                            }
+                            free(pa); free(pb); nn_free(d_h8); nn_free(d_pa); nn_free(d_pb);
+                        }
                     }
                 }
                 const char *e = nn_check(); if (e) { fprintf(stderr, "FAIL: CUDA error %s\n", e); fails++; }
@@ -68,6 +88,6 @@ int main(void) {
             }
     }
     if (fails) { printf("test_gpu_input: %d of %d cases FAIL\n", fails, cases); return 1; }
-    printf("test_gpu_input: ok (%d cases bit-identical: symmetries x axis x fp16/bf16 x MX-fp8/fp4 x cube/slab/2 samples)\n", cases);
+    printf("test_gpu_input: ok (%d cases bit-identical: symmetries x axis x fp16/bf16 x MX-fp8/fp4 x cube/slab/2 samples, plain and --half-res pack)\n", cases);
     return 0;
 }
