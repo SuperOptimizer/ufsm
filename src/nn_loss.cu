@@ -18,20 +18,34 @@ template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t 
         const LT *l = lg + (size_t)nc * S; const uint8_t *tp = t + (size_t)nc * S, *mp = m + (size_t)n * S;
         uint8_t *cp = tol && nc % C == 0 ? code + (size_t)n * S : nullptr;
         size_t per = (S + gridDim.y - 1) / gridDim.y, lo = (size_t)slab * per, hi = lo + per < S ? lo + per : S;
-        for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
-            if (!mp[i]) continue;
-            const float mw = mp[i];   /* the mask is a weight (1 = plain; nn_packed_mask / nn_unwrap_targets2 write more) */
-            float x = lgv(l, i), p = tp[i] * (1.f / 255.f);
-            float sg = 1.f / (1.f + __expf(-x));
-            float spp = fmaxf(x, 0.f) + log1pf(__expf(-fabsf(x)));   /* softplus(x) */
-            float xq = x, spq = spp;
-            if (cp && tp[i] >= 128) {   /* offset-tolerant positive term (p >= 0.5): maximum along the sheet normal */
-                const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), xx = (int)(i % W);
-                uint8_t c8; xq = tol_line_max(l, mp, z, y, xx, D, H, W, tol_normal(tp, z, y, xx, D, H, W), tol, &c8); cp[i] = c8;
-                spq = fmaxf(xq, 0.f) + log1pf(__expf(-fabsf(xq)));
+        /* LS_V of the thread's voxels per round, their loads first (the one-voxel loop waited a memory latency per voxel), then
+           each voxel in the thread's order: the same partial sums, bit for bit */
+        constexpr int LS_V = 4;
+        for (size_t i0 = lo + threadIdx.x; i0 < hi; i0 += (size_t)LS_V * blockDim.x) {
+            unsigned mb[LS_V], tb[LS_V]; float xl[LS_V];
+#pragma unroll
+            for (int k = 0; k < LS_V; k++) {
+                const size_t i = i0 + (size_t)k * blockDim.x;
+                mb[k] = i < hi ? mp[i] : 0u; tb[k] = 0u; xl[k] = 0.f;
+                if (mb[k]) { xl[k] = lgv(l, i); tb[k] = tp[i]; }
             }
-            float bce = pw * p * (spq - xq) + (1.f - p) * spp;          /* softplus(-x) = softplus(x) - x */
-            a0 += mw; a1 += mw * bce; a2 += sg * p; a3 += sg; a4 += p;
+#pragma unroll
+            for (int k = 0; k < LS_V; k++) {
+                const size_t i = i0 + (size_t)k * blockDim.x;
+                if (!mb[k]) continue;
+                const float mw = mb[k];   /* the mask is a weight (1 = plain; nn_packed_mask / nn_unwrap_targets2 write more) */
+                float x = xl[k], p = tb[k] * (1.f / 255.f);
+                float sg = 1.f / (1.f + __expf(-x));
+                float spp = fmaxf(x, 0.f) + log1pf(__expf(-fabsf(x)));   /* softplus(x) */
+                float xq = x, spq = spp;
+                if (cp && tp[i] >= 128) {   /* offset-tolerant positive term (p >= 0.5): maximum along the sheet normal */
+                    const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), xx = (int)(i % W);
+                    uint8_t c8; xq = tol_line_max(l, mp, z, y, xx, D, H, W, tol_normal(tp, z, y, xx, D, H, W), tol, &c8); cp[i] = c8;
+                    spq = fmaxf(xq, 0.f) + log1pf(__expf(-fabsf(xq)));
+                }
+                float bce = pw * p * (spq - xq) + (1.f - p) * spp;          /* softplus(-x) = softplus(x) - x */
+                a0 += mw; a1 += mw * bce; a2 += sg * p; a3 += sg; a4 += p;
+            }
         }
     }
     __shared__ double r[5][256];
@@ -97,13 +111,13 @@ extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const u
         size_t n = shape_numel(s);
         if (g_logits_h16) {
             const f16 *l16 = (const f16 *)logits;
-            if (!g_loss_g16) loss_grad_k<float, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall);
-            else if (g_h16) loss_grad_k<f16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
-            else loss_grad_k<bf16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
+            if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall);
+            else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
+            else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
         } else
-        if (!g_loss_g16) loss_grad_k<float><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall);
-        else if (g_h16) loss_grad_k<f16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
-        else loss_grad_k<bf16><<<nblk(n, 256), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
+        if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall);
+        else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
+        else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
     }
     KCHECK();
 }
@@ -213,12 +227,12 @@ extern "C" void nn_loss_grad_only(const void *logits, const uint8_t *t, const ui
     const float *fin = scratch + (size_t)5 * s.n * s.c;
     if (g_logits_h16) {
         const f16 *l16 = (const f16 *)logits;
-        if (!g_loss_g16) loss_grad_k<float, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall);
-        else if (g_h16) loss_grad_k<f16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
-        else loss_grad_k<bf16, f16><<<nblk(n, 256), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
-    } else if (!g_loss_g16) loss_grad_k<float><<<nblk(n, 256), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall);
-    else if (g_h16) loss_grad_k<f16><<<nblk(n, 256), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
-    else loss_grad_k<bf16><<<nblk(n, 256), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
+        if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall);
+        else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
+        else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
+    } else if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall);
+    else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
+    else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
     KCHECK();
 }
 /* ---- count loss (train --count-lambda): turns along sheet-normal segments ----
