@@ -1399,7 +1399,7 @@ static int cmd_wind_seed(int argc, char **argv) {
 }
 
 /* ufsm phase-fuse <out-group> <out-um> <root> <key> [<root> <key>]... [--tol 0.1] [--shard 512] [--threads 8] [--cache DIR]
-   (up to FUSE_MAX sets; --shard defaults to 256 above 12 sets)
+   (up to FUSE_MAX sets; per shard only those with data around it are read)
    ufsm recto-fuse <out-group> <out-um> <ct-root> <ct-key> <root> <key> [<root> <key>]... [--block 32] [--dup 3] [--shard 512] [--cache DIR]
    Several surface sets of one scroll, rasterised separately on one grid (src/fuse.h): phase-fuse writes the per-voxel circular mean
    where the sets agree within --tol turns, unknown (255) where they disagree; recto-fuse one recto line per --block, the set on the
@@ -1416,7 +1416,7 @@ static int cmd_fuse(int argc, char **argv) {
         in[n] = z3_open(store_open(argv[a]), argv[a + 1], cache); if (!in[n]) { fprintf(stderr, "%s: %s %s: %s\n", argv[1], argv[a], argv[a + 1], z3_error()); return 1; }
         n++;
     }
-    if (!S) S = n > 12 ? 256 : 512;   /* one (shard + 2 halo)^3 buffer per set: 134 MB each at 512 */
+    if (!S) S = 512;
     z3 *ct = recto ? z3_open(store_open(argv[4]), argv[5], cache) : nullptr;
     if (!n || (recto && !ct) || !(um > 0) || S < 64 || block < 4 || dup < 0 || !(tol >= 0)) { fprintf(stderr, "%s: bad arguments or cannot open the CT\n", argv[1]); return 2; }
     const z3_meta *m0 = z3_meta_of(in[0]); int64_t shape[3] = {m0->shape[0], m0->shape[1], m0->shape[2]};
@@ -1429,25 +1429,34 @@ static int cmd_fuse(int argc, char **argv) {
     z3w *w = recto ? z3w_create_mask(od, shape, S, at) : z3w_create(od, shape, S, 0, PHASE_UNKNOWN, at);
     if (!w || z3w_write_group(argv[2], &um, 1, recto ? "ufsm-recto-fuse" : "ufsm-phase-fuse", nullptr)) { fprintf(stderr, "%s: %s\n", argv[1], z3w_error()); return 1; }
     const int H = recto ? dup : 0; const int64_t E = S + 2 * H; const size_t L = (size_t)E * E * E;
-    uint8_t *buf[FUSE_MAX], *cb = recto ? malloc(L) : nullptr, *ob = malloc(L), *sh = malloc((size_t)S * S * S);
-    for (int k = 0; k < n; k++) buf[k] = malloc(L);
-    size_t st[4] = {0, 0, 0, 0}, hist[PHASE_PERIOD / 2 + 1] = {0}; int nsh = 0;
+    /* per shard only the sets with data around it are read: one (shard + 2 halo)^3 buffer per set present there (allocated as
+       needed), so many small surface sets fit at 512^3 shards */
+    uint8_t *pool[FUSE_MAX] = {0}, *cb = recto ? malloc(L) : nullptr, *ob = malloc(L), *sh = malloc((size_t)S * S * S); const uint8_t *act[FUSE_MAX]; int npool = 0;
+    if ((recto && !cb) || !ob || !sh) { fprintf(stderr, "%s: out of memory\n", argv[1]); return 1; }
+    size_t st[4] = {0, 0, 0, 0}, hist[PHASE_PERIOD / 2 + 1] = {0}; int nsh = 0, maxact = 0;
     for (int64_t sz = 0; sz * S < shape[0]; sz++) for (int64_t sy = 0; sy * S < shape[1]; sy++) for (int64_t sx = 0; sx * S < shape[2]; sx++) {
-        int present = 0;
-        for (int k = 0; k < n && !present; k++) { const z3_meta *mk = z3_meta_of(in[k]);
-            for (int64_t a = sz * S / mk->shard[0]; a <= ((sz + 1) * S - 1) / mk->shard[0] && !present; a++)
-            for (int64_t b = sy * S / mk->shard[1]; b <= ((sy + 1) * S - 1) / mk->shard[1] && !present; b++)
-            for (int64_t c = sx * S / mk->shard[2]; c <= ((sx + 1) * S - 1) / mk->shard[2] && !present; c++) present = z3_shard_present(in[k], a, b, c) != 0; }
-        if (!present) continue;
         const int64_t o[3] = {sz * S - H, sy * S - H, sx * S - H}, nn[3] = {E, E, E};
-        for (int k = 0; k < n; k++) if (z3_read(in[k], o, nn, buf[k], nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3_error()); return 1; }
+        int na = 0;
+        for (int k = 0; k < n; k++) {
+            const z3_meta *mk = z3_meta_of(in[k]); int64_t lo[3], hi[3]; int present = 0;
+            for (int d = 0; d < 3; d++) { lo[d] = (o[d] < 0 ? 0 : o[d]) / mk->shard[d]; const int64_t e = o[d] + E < shape[d] ? o[d] + E : shape[d]; hi[d] = (e - 1) / mk->shard[d]; }
+            for (int64_t a = lo[0]; a <= hi[0] && !present; a++) for (int64_t b = lo[1]; b <= hi[1] && !present; b++) for (int64_t c = lo[2]; c <= hi[2] && !present; c++)
+                present = z3_shard_present(in[k], a, b, c) != 0;
+            if (!present) continue;
+            if (na == npool) { if (!(pool[npool] = malloc(L))) { fprintf(stderr, "%s: out of memory (%d sets around one shard)\n", argv[1], na + 1); return 1; } npool++; }
+            if (z3_read(in[k], o, nn, pool[na], nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3_error()); return 1; }
+            act[na] = pool[na]; na++;
+        }
+        if (!na) continue;
+        if (na > maxact) maxact = na;
         if (recto) { if (z3_read(ct, o, nn, cb, nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3_error()); return 1; }
-                     fuse_recto((const uint8_t *const *)buf, n, cb, E, E, E, block, dup, ob, st); }
-        else fuse_phase((const uint8_t *const *)buf, n, L, tol, ob, st, hist);
+                     fuse_recto(act, na, cb, E, E, E, block, dup, ob, st); }
+        else fuse_phase(act, na, L, tol, ob, st, hist);
         for (int64_t z = 0; z < S; z++) for (int64_t y = 0; y < S; y++) memcpy(sh + ((size_t)z * S + y) * S, ob + ((size_t)(z + H) * E + y + H) * E + H, (size_t)S);
         if (z3w_write_shard(w, sz, sy, sx, sh, nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3w_error()); return 1; }
         nsh++;
     }
+    fprintf(stderr, "%s: at most %d of %d sets around one shard\n", argv[1], maxact, n);
     z3w_close(w);
     if (recto) fprintf(stderr, "recto-fuse: %d shards -> %s; primary voxels %zu, other-sheet voxels added %zu, duplicate voxels dropped %zu (halo voxels counted too)\n", nsh, od, st[0], st[1], st[2]);
     else {
@@ -1462,7 +1471,7 @@ static int cmd_fuse(int argc, char **argv) {
             fprintf(stderr, "\n");
         }
     }
-    for (int k = 0; k < n; k++) { free(buf[k]); z3_close(in[k]); } free(cb); free(ob); free(sh); if (ct) z3_close(ct);
+    for (int k = 0; k < npool; k++) free(pool[k]); for (int k = 0; k < n; k++) z3_close(in[k]); free(cb); free(ob); free(sh); if (ct) z3_close(ct);
     return 0;
 }
 
