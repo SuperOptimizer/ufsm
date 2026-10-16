@@ -42,7 +42,9 @@ typedef struct {
                               (BatchNorm-style running statistics per group, constants in forward and backward once unet_set_l0_ema's
                               warm-up on live statistics is over; saved in checkpoints), 3 ws (none + scaled weight standardisation of
                               the four level-0 3^3 convs, per output channel over its fan-in, from the master weights every forward;
-                              the convs reading SiLU outputs with the NF-net gain 1 / std(silu(z))). Tensor-core and fp32 paths */
+                              the convs reading SiLU outputs with the NF-net gain 1 / std(silu(z))), 4 slab (GroupNorm statistics per
+                              z-slab of l0_slab planes: no whole-window reduction). Tensor-core and fp32 paths (slab: MX or fp32 storage) */
+    int l0_slab;           /* l0_norm 4: planes per slab (0: 64; the level-0 depth a multiple of it) */
 } unet_cfg;
 static inline int unet_hr_div(int hr) { return hr >= 3 ? 4 : hr ? 2 : 1; }      /* the window voxels per network voxel along each axis */
 static inline int unet_hr_mode(int hr) { return hr == 2 || hr == 4 ? 2 : 1; }   /* the last stage: 1 pool, 2 pack (nn_half_*) */

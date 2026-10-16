@@ -235,6 +235,10 @@ void nn_gn_ema_update(float *run, const float *mean, const float *rstd, int N, i
    (std sqrt(n) + eps); nn_ws_bwd: g <- g0 + (the gradient w.r.t. w of the part g - g0 w.r.t. wh) */
 void nn_ws_fwd(float *wh, const float *w, int cout, int n, float gain, float eps);
 void nn_ws_bwd(float *g, const float *g0, const float *w, int cout, int n, float gain, float eps);
+/* cfg.l0_norm 4 (slab): an MX tensor's GroupNorm affine in place, x <- (x - mean) rstd per (sample, group) (mean nullptr: 0; exact SR
+   keyed by sr for fp4); the fp32 path's permutation NCDHW <-> (n * D / Sz + slab, C, Sz, H, W) (dir 0: to the slab layout, 1: back) */
+void nn_l0_affine(float *x, shape5 s, int G, const float *mean, const float *rstd, unsigned sr);
+void nn_slab_perm(float *dst, const float *src, shape5 s, int Sz, int dir);
 /* GroupNorm forward fused with SiLU (y = silu(gn(x))), and recompute of both g = gn(x) and silu(g). */
 int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *mean, float *rstd);   /* stats of the stored fp32, 16-bit or MX tensor; -1 for unsupported groups */
 void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd);

@@ -60,7 +60,9 @@ int main(void) {
     srand(3);
     unet_cfg cfg = {3, {4, 6, 8}, 4, 2, 2};
     cfg.down_norm = getenv("UFSM_DOWN_NORM") ? atoi(getenv("UFSM_DOWN_NORM")) : 0;
-    cfg.l0_norm = getenv("UFSM_L0_NORM") ? atoi(getenv("UFSM_L0_NORM")) : 0;   /* level-0 norm 1 none, 2 ema (constant statistics: their gradient terms dropped) */
+    cfg.l0_norm = getenv("UFSM_L0_NORM") ? atoi(getenv("UFSM_L0_NORM")) : 0;   /* level-0 norm 1 none, 2 ema (constant statistics: their gradient terms
+                                                                                dropped), 3 ws, 4 slab (UFSM_L0_SLAB planes, default 4: two slabs) */
+    cfg.l0_slab = getenv("UFSM_L0_SLAB") ? atoi(getenv("UFSM_L0_SLAB")) : 4;
     if (getenv("UFSM_TINY")) { cfg.nlev = 0; char *t = strdup(getenv("UFSM_TINY")); for (char *q = strtok(t, ","); q; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); }
     cfg.scale_cond = getenv("UFSM_SCALE_COND") ? atoi(getenv("UFSM_SCALE_COND")) : 0;   /* voxel-size conditioning: also check its vector */
     if (getenv("UFSM_ENC_BLOCKS")) { char *t = strdup(getenv("UFSM_ENC_BLOCKS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.enc_blocks[l++] = atoi(q); free(t); }
@@ -153,7 +155,7 @@ int main(void) {
     nn_set_tf32(getenv("UFSM_FP32") ? 0 : 1);
     unet_cfg big = {4, {16, 32, 64, 80}, 4, 1, 8};
     big.down_norm = cfg.down_norm;
-    big.l0_norm = cfg.l0_norm;
+    big.l0_norm = cfg.l0_norm == 4 ? 0 : cfg.l0_norm;   /* (slab on tensor cores: MX storage only, test_l0_norm) */
     if (getenv("UFSM_BIG_ENC_BLOCKS")) { char *t = strdup(getenv("UFSM_BIG_ENC_BLOCKS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) big.enc_blocks[l++] = atoi(q); free(t); }
     if (getenv("UFSM_BIG_DEC_WIDTHS")) { char *t = strdup(getenv("UFSM_BIG_DEC_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) big.dec_widths[l++] = atoi(q); free(t); }   /* narrower decoder levels */
     unet *b = unet_create(&big);
