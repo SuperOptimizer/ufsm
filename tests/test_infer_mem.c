@@ -13,6 +13,24 @@
 #include <string.h>
 
 static int fails;
+static int g_lh16;   /* the CT helpers below: fp16 logits (predict's unet_set_fp16_logits), 2 B per output voxel */
+static float h2f(uint16_t h) {   /* IEEE half -> float (the test's comparisons) */
+    const uint32_t s = (uint32_t)(h >> 15) << 31, e = (h >> 10) & 31, m = h & 1023;
+    uint32_t f;
+    if (e == 0) { if (!m) f = s; else { int k = -1; uint32_t mm = m; do { k++; mm <<= 1; } while (!(mm & 1024)); f = s | ((uint32_t)(112 - k) << 23) | ((mm & 1023) << 13); } }
+    else if (e == 31) f = s | 0x7f800000u | (m << 13);
+    else f = s | ((e + 112) << 23) | (m << 13);
+    float r; memcpy(&r, &f, 4); return r;
+}
+/* logits a vs b (fp32, or fp16 with g_lh16) over n voxels: the count that differ, the largest difference */
+static size_t out_diff(const void *a, const void *b, size_t n, double *md) {
+    size_t nd = 0; *md = 0;
+    for (size_t i = 0; i < n; i++) {
+        const double x = g_lh16 ? h2f(((const uint16_t *)a)[i]) : ((const float *)a)[i], y = g_lh16 ? h2f(((const uint16_t *)b)[i]) : ((const float *)b)[i];
+        const double d = fabs(x - y); nd += d != 0; if (d > *md) *md = d;
+    }
+    return nd;
+}
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
 
 static void run_s(const unet_cfg *cfg, int P, int nc, int alias, int slab, float *out, size_t *bytes);
@@ -61,16 +79,18 @@ static void ct_ref(const unet_cfg *cfg, int sc, int P, const uint8_t *hct, const
     const size_t p3 = (size_t)P * P * P;
     unet_set_infer_alias(1); unet_set_infer_slab(0);
     unet *u = unet_create(cfg); unet_init(u, 7); if (sc) unet_set_scale(u, 2.4); unet_set_head_channels(u, 0, 1);
+    if (g_lh16) unet_set_fp16_logits(u, 1);
     const shape5 xs = {1, 4, P, P, P}; unet_build(u, xs, 0);
     uint8_t *ct = unet_input_scratch2(u, p3); void *xd = unet_input_scratch(u, 8 * p3);
     float *drow = nn_malloc(2 * (size_t)P * 4); nn_h2d(drow, hrow, 2 * (size_t)P * 4);
     nn_h2d(ct, hct, p3); nn_pred_input(ct, P, 92.f, 1.f / 31.f, drow, drow + P, 1, xd, 1);
-    nn_d2h(out, unet_forward_x(u, xd, xs, 0, 1), p3 * 4); unet_free(u); nn_free(drow);
+    nn_d2h(out, unet_forward_x(u, xd, xs, 0, 1), p3 * (g_lh16 ? 2 : 4)); unet_free(u); nn_free(drow);
 }
 /* a CT-stem window of depth D (planes z0 .. of the whole one) on the current GPU: the network, the CT in its scratch, the axis rows */
 typedef struct { unet *u; uint8_t *ct; float *drow, *out; int z0, D, P; size_t bytes; } half_t;
 static void half_setup(half_t *h, const unet_cfg *cfg, int sc, int P, int z0, int D, const uint8_t *hct, const float *hrow) {
     h->u = unet_create(cfg); unet_init(h->u, 7); if (sc) unet_set_scale(h->u, 2.4); unet_set_head_channels(h->u, 0, 1); unet_set_ct_input(h->u, 1);
+    if (g_lh16) unet_set_fp16_logits(h->u, 1);
     const shape5 xs = {1, 4, D, P, P}; h->bytes = unet_infer_bytes(h->u, xs); unet_build(h->u, xs, 0);
     const size_t pl = (size_t)P * P;
     h->ct = unet_input_scratch2(h->u, D * pl);
@@ -81,14 +101,14 @@ static void half_setup(half_t *h, const unet_cfg *cfg, int sc, int P, int z0, in
 }
 static void half_fwd(half_t *h) {
     const shape5 xs = {1, 4, h->D, h->P, h->P};
-    nn_d2h(h->out, unet_forward_ct(h->u, h->ct, 92.f, 1.f / 31.f, h->drow, h->drow + h->D, 1, xs, 1), (size_t)h->D * h->P * h->P * 4);
+    nn_d2h(h->out, unet_forward_ct(h->u, h->ct, 92.f, 1.f / 31.f, h->drow, h->drow + h->D, 1, xs, 1), (size_t)h->D * h->P * h->P * (g_lh16 ? 2 : 4));
 }
 static void half_free(half_t *h) { unet_free(h->u); nn_free(h->drow); free(h->out); }
 static size_t ct_run(const unet_cfg *cfg, int sc, int P, int slab, int off, const uint8_t *hct, const float *hrow, float *out) {
     unet_set_infer_alias(1); unet_set_infer_slab(slab); unet_set_infer_offload(off);
     half_t h; half_setup(&h, cfg, sc, P, 0, P, hct, hrow);
     CHECK(unet_ct_stem(h.u) && h.ct, "P %d slab %d offload %d: no CT-stem build", P, slab, off);
-    half_fwd(&h); memcpy(out, h.out, (size_t)P * P * P * 4);
+    half_fwd(&h); memcpy(out, h.out, (size_t)P * P * P * (g_lh16 ? 2 : 4));
     const size_t b = h.bytes; half_free(&h); return b;
 }
 static half_t HS[2];
@@ -104,8 +124,9 @@ static size_t split_run_ct(split_ctx *ctx, const unet_cfg *cfg, int sc, int P, i
     }
     split_run(ctx, half_job, nullptr);
     const size_t pl = (size_t)P * P, b = HS[0].bytes;
-    memcpy(out, HS[0].out, (size_t)(P / 2) * pl * 4);                       /* side 0 owns its planes [0, P/2) */
-    memcpy(out + (size_t)(P / 2) * pl, HS[1].out + (size_t)H0 * pl, (size_t)(P / 2) * pl * 4);   /* side 1 its local [H0, Dl) */
+    const size_t ob = g_lh16 ? 2 : 4;
+    memcpy(out, HS[0].out, (size_t)(P / 2) * pl * ob);                       /* side 0 owns its planes [0, P/2) */
+    memcpy((char *)out + (size_t)(P / 2) * pl * ob, (char *)HS[1].out + (size_t)H0 * pl * ob, (size_t)(P / 2) * pl * ob);   /* side 1 its local [H0, Dl) */
     for (int s = 0; s < 2; s++) { nn_init(dev[s]); half_free(&HS[s]); }
     nn_init(0);
     return b;
@@ -218,6 +239,41 @@ int main(void) {
         }
         split_free(ctx); nn_init(0);
         unet_set_infer_offload(1); unet_set_infer_slab(0);
+    }
+    /* the 16-wide production net (7 levels 16, 16, 32, 64, 128, 192, 256; side head: 2 outputs, one written): in-place slabs at levels 0
+       and 1 with 16-channel MX blocks, the coarse offload, the split, the CT stem with an MX-fp8 or an MX-fp4 input (train
+       --gpu-input's UFSM_XIN_PREC=4): logits identical to the phase-1 reference of the same input precision */
+    {
+        int dev1 = 1; if (nn_init(1)) { dev1 = 0; nn_check(); } nn_init(0);
+        split_ctx *ctx = split_create(0, dev1);
+        const unet_cfg cfg = {7, {16, 16, 32, 64, 128, 192, 256}, 4, 2, 8, 0, 0};
+        for (int lh = 0; lh < 2; lh++) for (int ip = 8; ip >= 4; ip -= 4) for (int P = 128; P <= 256; P += 128) {
+            if (lh && ip == 8) continue;   /* (fp16 logits over X: the production input precision) */
+            g_lh16 = lh;
+            if (unet_set_input_prec(ip)) return 2;
+            const size_t p3 = (size_t)P * P * P;
+            uint8_t *hct = malloc(p3); float *hrow = malloc(2 * (size_t)P * 4);
+            for (size_t i = 0; i < p3; i++) { const int z = (int)(i / ((size_t)P * P)), y = (int)((i / P) % P), x = (int)(i % P); hct[i] = (uint8_t)(x < 5 ? 0 : 60 + 50 * sinf(0.21f * x + 0.13f * y) + 30 * cosf(0.17f * z) + (i * 2654435761u) % 23); }
+            for (int z = 0; z < P; z++) { hrow[z] = -300.f + 0.5f * z; hrow[P + z] = 40.f - 0.25f * z; }
+            float *ref = malloc(p3 * 4), *b = malloc(p3 * 4);
+            ct_ref(&cfg, 0, P, hct, hrow, ref);
+            size_t rb; { unet_set_infer_alias(1); unet_set_infer_slab(0); unet *u = unet_create(&cfg); unet_init(u, 7); unet_set_head_channels(u, 0, 1); if (lh) unet_set_fp16_logits(u, 1); rb = unet_infer_bytes(u, (shape5){1, 4, P, P, P}); unet_free(u); }
+            for (int off = 0; off < 3; off++) for (int sl = 0; sl < 2; sl++) {
+                const int slab = sl ? 16 : 64;
+                size_t by = ct_run(&cfg, 0, P, slab, off, hct, hrow, b);
+                double md; size_t nd = out_diff(ref, b, p3, &md);
+                CHECK(nd == 0, "16-wide input fp%d %s logits P %d offload %d slab %d: CT-stem logits differ at %zu voxels (max %.3g)", ip, lh ? "fp16" : "fp32", P, off, slab, nd, md);
+                printf("16-wide input fp%d %s logits P %3d offload %d slab %2d: %.2f -> %.2f B per window voxel, logits %s\n", ip, lh ? "fp16" : "fp32", P, off, slab, rb / (double)p3, by / (double)p3, nd ? "DIFFER" : "identical");
+                size_t sb = split_run_ct(ctx, &cfg, 0, P, slab, off, hct, hrow, b);
+                nd = out_diff(ref, b, p3, &md);
+                CHECK(md < 1e-3, "16-wide input fp%d %s logits P %d offload %d slab %d split: logits differ by up to %.3g (%zu voxels)", ip, lh ? "fp16" : "fp32", P, off, slab, md, nd);
+                printf("16-wide input fp%d %s logits P %3d offload %d slab %2d split (local depth %d): %.2f B per half voxel, %zu voxels differ (max %.2e)\n", ip, lh ? "fp16" : "fp32", P, off, slab, P / 2 + 64, sb / ((double)P * P * (P / 2 + 64)), nd, md);
+            }
+            free(ref); free(b); free(hct); free(hrow);
+        }
+        split_free(ctx); nn_init(0);
+        unet_set_infer_offload(1); unet_set_infer_slab(0); g_lh16 = 0;
+        if (unet_set_input_prec(8)) return 2;
     }
     if (fails) return 1;
     printf("test_infer_mem: ok\n");

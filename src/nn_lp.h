@@ -103,6 +103,7 @@ void lp_gn_silu_bwd_head_stats(const void *x, shape5 s, int G, const float *gamm
                                const void *gl, int ci, const float *wh, unsigned hs, double *ds);
 void lp_gn_silu_bwd_head_apply(void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                const void *gl, int ci, const float *wh, unsigned hs, const float *AB, unsigned gsr);
+void lp_pred_input_mx(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, int z0, int nz, void *y, int hd, int bits);   /* the same, MX-fp4 (bits 4) or MX-fp8 (8) */
 void lp_pred_input_mx8(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, int z0, int nz, void *y, int hd);   /* predict input planes [z0, z0 + nz) -> MX-fp8 (hd: 16-bit rounding 2 fp16 / 1 bf16 / 0 none) */
 void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr);   /* ydt 3 MX-fp8, 4 MX-fp4 (exact SR keyed by sr) */
 void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx, int gdt, int xdt, unsigned osr);   /* gdt / xdt: MX dt 3 (fp8) or 4 (fp4, gx with exact SR keyed by osr) */

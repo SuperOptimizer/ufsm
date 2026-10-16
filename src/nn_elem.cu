@@ -578,6 +578,9 @@ extern "C" void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, in
     else ridge_k<float><<<nblk(n, 256), 256>>>(p, (const float *)x, d, h, w, thr, out);
     KCHECK();
 }
+extern "C" void nn_pred_input_mx(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, int z0, int nz, void *y, int h16, int bits) {
+    lp_pred_input_mx(ct, W, mean, isd, dyo, dxo, axis, z0, nz, y, !h16 ? 0 : g_h16 ? 2 : 1, bits); KCHECK();
+}
 extern "C" void nn_pred_input_mx8(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, int z0, int nz, void *y, int h16) {
     lp_pred_input_mx8(ct, W, mean, isd, dyo, dxo, axis, z0, nz, y, !h16 ? 0 : g_h16 ? 2 : 1); KCHECK();
 }
