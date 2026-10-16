@@ -20,7 +20,8 @@ static void recto_ref(const uint8_t *const *in, int n, const uint8_t *ct, int d,
     for (size_t i = 0; i < len; i++) { const int z = (int)(i / ((size_t)d * d)), y = (int)(i / d % d), x = (int)(i % d); const size_t b = ((size_t)(z / block) * nb1 + y / block) * nb1 + x / block;
         for (int k = 0; k < n; k++) { if (!in[k][i]) continue; const float sk = (float)(sum[b * n + k] / cnt[b * n + k]); int beaten = 0, other = 0;
             for (int zz = z - dup; zz <= z + dup; zz++) for (int yy = y - dup; yy <= y + dup; yy++) for (int xx = x - dup; xx <= x + dup; xx++) {
-                if (zz < 0 || yy < 0 || xx < 0 || zz >= d || yy >= d || xx >= d) continue; const size_t j = ((size_t)zz * d + yy) * d + xx, bj = ((size_t)(zz / block) * nb1 + yy / block) * nb1 + xx / block;
+                if (zz < 0 || yy < 0 || xx < 0 || zz >= d || yy >= d || xx >= d) continue;
+                const size_t j = ((size_t)zz * d + yy) * d + xx, bj = ((size_t)(zz / block) * nb1 + yy / block) * nb1 + xx / block;
                 for (int o = 0; o < n; o++) { if (o == k || !in[o][j]) continue; other = 1; const float so = (float)(sum[bj * n + o] / cnt[bj * n + o]); if (so > sk || (so == sk && o < k)) beaten = 1; } }
             if (beaten) { st[2]++; continue; }
             if (!out[i]) { out[i] = 255; st[other ? 0 : 1]++; } } }

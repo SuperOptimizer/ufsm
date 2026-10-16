@@ -23,3 +23,5 @@ void fuse_phase(const uint8_t *const *in, int n, size_t len, float tol_turns, ui
    kept where another set was near (the better trace), voxels kept with no other set near (unique coverage), voxels dropped. */
 void fuse_recto(const uint8_t *const *in, int n, const uint8_t *ct, int64_t d0, int64_t d1, int64_t d2, int block, int dup,
                 uint8_t *out, size_t *stats);
+/* does any block with a surface have another set's surface within dup (the CT is read only then; fuse_recto takes ct null otherwise) */
+int fuse_recto_overlap(const uint8_t *const *in, int n, int64_t d0, int64_t d1, int64_t d2, int block, int dup);

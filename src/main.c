@@ -1423,7 +1423,7 @@ static int cmd_fuse(int argc, char **argv) {
     for (int k = 1; k < n; k++) { const z3_meta *mk = z3_meta_of(in[k]); for (int d = 0; d < 3; d++) if (mk->shape[d] != shape[d]) { fprintf(stderr, "%s: input %d has another shape\n", argv[1], k); return 2; } }
     if (recto) { const z3_meta *mc = z3_meta_of(ct); for (int d = 0; d < 3; d++) if (mc->shape[d] < shape[d]) shape[d] = mc->shape[d]; }
     char lv[32], od[1400], at[600]; z3w_level_name(um, lv, sizeof lv); snprintf(od, sizeof od, "%s/%s", argv[2], lv);
-    snprintf(at, sizeof at, recto ? "{\"ufsm\":{\"content\":\"recto lines of %d surface sets, one per %d^3 block (the brightest-CT set; others only > %d voxels away)\",\"encoding\":\"binary\"}}"
+    snprintf(at, sizeof at, recto ? "{\"ufsm\":{\"content\":\"recto lines of %d surface sets, one per %g^3 block (the brightest-CT set; others only > %d voxels away)\",\"encoding\":\"binary\"}}"
                                   : "{\"ufsm\":{\"content\":\"band field winding phase (src/band.h PHASE_*) of %d surface sets: circular mean where they agree within %g turn, else 255\"}}", n, recto ? (double)block : (double)tol, dup);
     if (!recto) snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"band field winding phase (src/band.h PHASE_*: 0..251, 255 unknown) of %d surface sets: circular mean where they agree within %g turn, else 255\"}}", n, (double)tol);
     z3w *w = recto ? z3w_create_mask(od, shape, S, at) : z3w_create(od, shape, S, 0, PHASE_UNKNOWN, at);
@@ -1433,7 +1433,7 @@ static int cmd_fuse(int argc, char **argv) {
        needed), so many small surface sets fit at 512^3 shards */
     uint8_t *pool[FUSE_MAX] = {0}, *cb = recto ? malloc(L) : nullptr, *ob = malloc(L), *sh = malloc((size_t)S * S * S); const uint8_t *act[FUSE_MAX]; int npool = 0;
     if ((recto && !cb) || !ob || !sh) { fprintf(stderr, "%s: out of memory\n", argv[1]); return 1; }
-    size_t st[4] = {0, 0, 0, 0}, hist[PHASE_PERIOD / 2 + 1] = {0}; int nsh = 0, maxact = 0;
+    size_t st[4] = {0, 0, 0, 0}, hist[PHASE_PERIOD / 2 + 1] = {0}; int nsh = 0, maxact = 0, nct = 0;
     for (int64_t sz = 0; sz * S < shape[0]; sz++) for (int64_t sy = 0; sy * S < shape[1]; sy++) for (int64_t sx = 0; sx * S < shape[2]; sx++) {
         const int64_t o[3] = {sz * S - H, sy * S - H, sx * S - H}, nn[3] = {E, E, E};
         int na = 0;
@@ -1449,14 +1449,16 @@ static int cmd_fuse(int argc, char **argv) {
         }
         if (!na) continue;
         if (na > maxact) maxact = na;
-        if (recto) { if (na > 1 && z3_read(ct, o, nn, cb, nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3_error()); return 1; }   /* one set: no CT needed */
-                     fuse_recto(act, na, na > 1 ? cb : nullptr, E, E, E, block, dup, ob, st); }
+        if (recto) { const int need = na > 1 && fuse_recto_overlap(act, na, E, E, E, block, dup);   /* the CT only where two sets' traces meet */
+                     if (need && z3_read(ct, o, nn, cb, nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3_error()); return 1; }
+                     nct += need; fuse_recto(act, na, need ? cb : nullptr, E, E, E, block, dup, ob, st); }
         else fuse_phase(act, na, L, tol, ob, st, hist);
         for (int64_t z = 0; z < S; z++) for (int64_t y = 0; y < S; y++) memcpy(sh + ((size_t)z * S + y) * S, ob + ((size_t)(z + H) * E + y + H) * E + H, (size_t)S);
         if (z3w_write_shard(w, sz, sy, sx, sh, nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3w_error()); return 1; }
         nsh++;
     }
-    fprintf(stderr, "%s: at most %d of %d sets around one shard\n", argv[1], maxact, n);
+    fprintf(stderr, "%s: at most %d of %d sets around one shard%s", argv[1], maxact, n, recto ? "" : "\n");
+    if (recto) fprintf(stderr, ", CT read for %d of %d shards (traces of two sets close)\n", nct, nsh);
     z3w_close(w);
     if (recto) fprintf(stderr, "recto-fuse: %d shards -> %s; primary voxels %zu, other-sheet voxels added %zu, duplicate voxels dropped %zu (halo voxels counted too)\n", nsh, od, st[0], st[1], st[2]);
     else {
@@ -1471,7 +1473,9 @@ static int cmd_fuse(int argc, char **argv) {
             fprintf(stderr, "\n");
         }
     }
-    for (int k = 0; k < npool; k++) free(pool[k]); for (int k = 0; k < n; k++) z3_close(in[k]); free(cb); free(ob); free(sh); if (ct) z3_close(ct);
+    for (int k = 0; k < npool; k++) free(pool[k]);
+    for (int k = 0; k < n; k++) z3_close(in[k]);
+    free(cb); free(ob); free(sh); if (ct) z3_close(ct);
     return 0;
 }
 

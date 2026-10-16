@@ -48,7 +48,7 @@ void fuse_recto(const uint8_t *const *in, int n, const uint8_t *ct, int64_t d0, 
     for (int64_t z = 0; z < d0; z++) for (int64_t y = 0; y < d1; y++) {
         const size_t r0 = ((size_t)z * d1 + y) * d2, rb = ((size_t)(z / block) * b1 + y / block) * b2;
         for (int k = 0; k < nn; k++) { const uint8_t *row = in[k] + r0;
-            for (int64_t x = 0; x < d2; x++) if (row[x]) { const size_t b = rb + x / block; sum[b * nn + k] += ct[r0 + x]; cnt[b * nn + k]++; bs[b] |= 1ull << k; } }
+            for (int64_t x = 0; x < d2; x++) if (row[x]) { const size_t b = rb + x / block; sum[b * nn + k] += ct ? ct[r0 + x] : 0; cnt[b * nn + k]++; bs[b] |= 1ull << k; } }
     }
     for (size_t b = 0; b < nb * nn; b++) score[b] = cnt[b] ? (float)(sum[b] / (double)cnt[b]) : -1.f;
     const int64_t R = (dup + block - 1) / block;   /* neighbour blocks a dup cube can reach */
@@ -80,4 +80,23 @@ void fuse_recto(const uint8_t *const *in, int n, const uint8_t *ct, int64_t d0, 
     }
     free(sum); free(cnt); free(score); free(bs); free(bd);
     if (stats) for (int k = 0; k < 3; k++) stats[k] += st[k];
+}
+
+int fuse_recto_overlap(const uint8_t *const *in, int n, int64_t d0, int64_t d1, int64_t d2, int block, int dup) {
+    const int nn = n < FUSE_MAX ? n : FUSE_MAX; if (nn < 2) return 0;
+    const int64_t b0 = (d0 + block - 1) / block, b1 = (d1 + block - 1) / block, b2 = (d2 + block - 1) / block; const size_t nb = (size_t)b0 * b1 * b2;
+    uint64_t *bs = calloc(nb, sizeof *bs); if (!bs) return 1;
+    for (int64_t z = 0; z < d0; z++) for (int64_t y = 0; y < d1; y++) {
+        const size_t r0 = ((size_t)z * d1 + y) * d2, rb = ((size_t)(z / block) * b1 + y / block) * b2;
+        for (int k = 0; k < nn; k++) { const uint8_t *row = in[k] + r0; for (int64_t x = 0; x < d2; x++) if (row[x]) bs[rb + x / block] |= 1ull << k; }
+    }
+    const int64_t R = (dup + block - 1) / block; int hit = 0;
+    for (int64_t bz = 0; bz < b0 && !hit; bz++) for (int64_t by = 0; by < b1 && !hit; by++) for (int64_t bx = 0; bx < b2 && !hit; bx++) {
+        const uint64_t own = bs[((size_t)bz * b1 + by) * b2 + bx]; if (!own) continue;
+        uint64_t v = 0;
+        for (int64_t z = bz - R; z <= bz + R; z++) for (int64_t y = by - R; y <= by + R; y++) for (int64_t x = bx - R; x <= bx + R; x++)
+            if (z >= 0 && z < b0 && y >= 0 && y < b1 && x >= 0 && x < b2) v |= bs[((size_t)z * b1 + y) * b2 + x];
+        hit = (v & (v - 1)) != 0;   /* two sets or more around a block with a surface */
+    }
+    free(bs); return hit;
 }
