@@ -649,9 +649,11 @@ __device__ __forceinline__ void fwd_epi_mxt(float (&acc)[MT][NR][2][4], float *t
                 unsigned wq[NW];
 #pragma unroll
                 for (int k = 0; k < NW; k++) wq[k] = mxf<B>::enc8x(v + (32 / B) * k, mult);
-                if constexpr (B == 4) if (sp.osr) {   /* MX-fp4 gradient: exact SR, a hash per word (8 values) keyed by (row, word) */
+                if constexpr (B == 4) if (sp.osr) {   /* MX-fp4 gradient: exact SR, a hash per word (8 values) keyed by (row, word); a split
+                                                         output's second tensor keys its rows past the first's N nb S (as fwd_epi_mx16) */
+                    const uint64_t rk = (uint64_t)ri + (sec ? (uint64_t)N * mx_nb(sp.o_split) * S : 0u);
 #pragma unroll
-                    for (int k = 0; k < NW; k++) { uint32_t hh[4]; sr_hash4(sp.osr, (uint64_t)ri * 4 + (CPL * qd) / 8 + k, hh); wq[k] = sr_e2m1_word(v + 8 * k, mult, hh); }
+                    for (int k = 0; k < NW; k++) { uint32_t hh[4]; sr_hash4(sp.osr, rk * 4 + (CPL * qd) / 8 + k, hh); wq[k] = sr_e2m1_word(v + 8 * k, mult, hh); }
                 }
                 uint8_t *dst = qt + ri * RBM + (CPL * B / 8) * qd;
                 if constexpr (NW == 4) *(uint4 *)dst = make_uint4(wq[0], wq[1], wq[2], wq[3]);
