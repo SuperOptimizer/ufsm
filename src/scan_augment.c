@@ -243,28 +243,60 @@ static void shift_planes(void *v, size_t es, int P, int zc, int dy, int dx, cons
    per-voxel loop's order (tests/test_scan_augment.c compares with that loop bit for bit). */
 static void gin_eval(const float *F, const uint8_t *Z, int P, int C, int k, const float w1[4][27], const float b1[4], const float w2[4],
                      float im, float is, float *G, double *g1p, double *g2p, size_t *gnp) {
-    const size_t P2 = (size_t)P * P; const int r = k / 2, kk = k * k * k;
+    const size_t P2 = (size_t)P * P, RP = (size_t)P + 2, PL = (size_t)P * RP; const int r = k / 2;
     double g1 = 0, g2 = 0; size_t gn = 0;
-    float *nr = malloc((size_t)kk / k * (P + 2) * sizeof *nr), *hr = malloc(4 * (size_t)P * sizeof *hr); if (!nr || !hr) abort();
-    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
-        for (int dz = -r, q = 0; dz <= r; dz++) for (int dy = -r; dy <= r; dy++, q++) {   /* the k^2 normalised source rows, edges replicated */
-            const int zz = z + dz < 0 ? 0 : z + dz >= P ? P - 1 : z + dz, yy = y + dy < 0 ? 0 : y + dy >= P ? P - 1 : y + dy;
-            const float *src = F + zz * P2 + (size_t)yy * P; float *d = nr + (size_t)q * (P + 2) + 1;
-            for (int x = 0; x < P; x++) d[x] = (src[x] - im) * is;
-            d[-1] = d[0]; d[P] = d[P - 1];
+    /* the normalised planes in a ring of k slots (plane zz in slot zz % k: the k planes a z needs are distinct mod k, or repeat at
+       the clamped edges), each source plane normalised once (was k^2 times, row by row), rows padded with their replicated ends */
+    float *ring = malloc((size_t)k * PL * sizeof *ring); int slot_z[3] = {-1, -1, -1};
+    if (!ring) abort();
+    for (int z = 0; z < P; z++) {
+        for (int dz = -r; dz <= r; dz++) {
+            const int zz = z + dz < 0 ? 0 : z + dz >= P ? P - 1 : z + dz, s = zz % k;
+            if (slot_z[s] == zz) continue;
+            slot_z[s] = zz;
+            for (int yy = 0; yy < P; yy++) {
+                const float *src = F + zz * P2 + (size_t)yy * P; float *d = ring + (size_t)s * PL + (size_t)yy * RP + 1;
+                for (int x = 0; x < P; x++) d[x] = (src[x] - im) * is;
+                d[-1] = d[0]; d[P] = d[P - 1];
+            }
         }
-        for (int ch = 0; ch < C; ch++) { float *h = hr + (size_t)ch * P; for (int x = 0; x < P; x++) h[x] = 0; }
-        for (int dz = -r, q = 0; dz <= r; dz++) for (int dy = -r; dy <= r; dy++, q++) for (int dx = -r; dx <= r; dx++) {
-            const int t = ((dz + r) * k + dy + r) * k + dx + r; const float *v = nr + (size_t)q * (P + 2) + 1 + dx;
-            for (int ch = 0; ch < C; ch++) { float *h = hr + (size_t)ch * P; const float w = w1[ch][t]; for (int x = 0; x < P; x++) h[x] += w * v[x]; }
+        for (int y = 0; y < P; y++) {
+            const float *rowp[9];   /* (dz, dy) -> the padded row's first voxel */
+            for (int dz = -r, q = 0; dz <= r; dz++) for (int dy = -r; dy <= r; dy++, q++) {
+                const int zz = z + dz < 0 ? 0 : z + dz >= P ? P - 1 : z + dz, yy = y + dy < 0 ? 0 : y + dy >= P ? P - 1 : y + dy;
+                rowp[q] = ring + (size_t)(zz % k) * PL + (size_t)yy * RP + 1;
+            }
+            float *g = G + z * P2 + (size_t)y * P;
+            int x0 = 0;
+#ifdef __AVX2__
+            /* 8 voxels: each channel's sum in a register, from +0 through the taps in order; then the leaky sum from +0 (no contraction) */
+            for (; x0 + 8 <= P; x0 += 8) {
+                __m256 h[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()};
+                for (int q = 0, t = 0; q < k * k; q++) for (int dx = -r; dx <= r; dx++, t++) {
+                    const __m256 v = _mm256_loadu_ps(rowp[q] + x0 + dx);
+                    for (int ch = 0; ch < C; ch++) h[ch] = _mm256_add_ps(h[ch], _mm256_mul_ps(_mm256_set1_ps(w1[ch][t]), v));
+                }
+                __m256 o = _mm256_setzero_ps();
+                for (int ch = 0; ch < C; ch++) {
+                    const __m256 u = _mm256_add_ps(h[ch], _mm256_set1_ps(b1[ch]));
+                    const __m256 l = _mm256_blendv_ps(_mm256_mul_ps(_mm256_set1_ps(.2f), u), u, _mm256_cmp_ps(u, _mm256_setzero_ps(), _CMP_GT_OQ));
+                    o = _mm256_add_ps(o, _mm256_mul_ps(_mm256_set1_ps(w2[ch]), l));
+                }
+                _mm256_storeu_ps(g + x0, o);
+            }
+#endif
+            for (int x = x0; x < P; x++) {
+                float h[4] = {0, 0, 0, 0};
+                for (int q = 0, t = 0; q < k * k; q++) for (int dx = -r; dx <= r; dx++, t++) { const float v = rowp[q][x + dx]; for (int ch = 0; ch < C; ch++) h[ch] += w1[ch][t] * v; }
+                float o = 0;
+                for (int ch = 0; ch < C; ch++) { const float u = h[ch] + b1[ch]; o += w2[ch] * (u > 0 ? u : .2f * u); }
+                g[x] = o;
+            }
+            const uint8_t *zr = Z + z * P2 + (size_t)y * P;
+            for (int x = 0; x < P; x++) if (!zr[x]) { const float o = g[x]; g1 += o; g2 += (double)o * o; gn++; }
         }
-        float *g = G + z * P2 + (size_t)y * P;
-        for (int x = 0; x < P; x++) g[x] = 0;
-        for (int ch = 0; ch < C; ch++) { const float *h = hr + (size_t)ch * P, bb = b1[ch], ww = w2[ch]; for (int x = 0; x < P; x++) { const float u = h[x] + bb; g[x] += ww * (u > 0 ? u : .2f * u); } }
-        const uint8_t *zr = Z + z * P2 + (size_t)y * P;
-        for (int x = 0; x < P; x++) if (!zr[x]) { const float o = g[x]; g1 += o; g2 += (double)o * o; gn++; }
     }
-    free(nr); free(hr);
+    free(ring);
     *g1p = g1; *g2p = g2; *gnp = gn;
 }
 
