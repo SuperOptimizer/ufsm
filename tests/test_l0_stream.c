@@ -13,7 +13,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
+static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 static uint64_t rs = 4242;
 static float frand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (float)((rs >> 11) * 0x1.0p-53 * 2 - 1); }
 static float *dev_rand(size_t n, float scale) { float *h = malloc(n * 4); for (size_t i = 0; i < n; i++) h[i] = frand() * scale; float *d = nn_malloc(n * 4); nn_h2d(d, h, n * 4); free(h); return d; }
@@ -42,15 +44,17 @@ int main(void) {
         for (int k = 0; k < 3; k++) { float *f = dev_rand(nx, 1.f); x[k] = nn_malloc(nx * 2); nn_f32_to_h16(f, nx, x[k], 1.f); nn_free(f); }
         for (int k = 0; k < 2; k++) { float *f = dev_rand(no, 1.f); gl[k] = nn_malloc(no * 2); nn_f32_to_h16(f, no, gl[k], nn_get_grad_scale()); nn_free(f); }
         unet *v = unet_create(&cfg); unet_init(v, 77); const size_t np = unet_nparams(v);
-        uint8_t *lg[2][3]; size_t lgb = 0; uint8_t *dmp[2][2][4]; size_t dmb[4] = {0, 0, 0, 0}; float *gg[2][2]; unsigned ctr[2][2];
-        for (int st = 0; st < 2; st++) {   /* unstreamed, streamed */
+        uint8_t *lg[3][3]; size_t lgb = 0; uint8_t *dmp[3][2][4]; size_t dmb[4] = {0, 0, 0, 0}; float *gg[3][2]; unsigned ctr[3][2]; double ms[3] = {0, 0, 0};
+        for (int st = 0; st < 3; st++) {   /* unstreamed, streamed, streamed and recomputing */
             unet_set_l0_stream(st);
             unet_build(v, xs, 1);
             for (int k = 0; k < 2; k++) {
+                nn_sync(); const double t0 = now_ms();   /* (the second step's forward + backward: the timing) */
                 nn_set_sr_step(5000 + 100 * k); const float *l = unet_forward_x(v, x[k], xs, 1, 1); unet_zero_grad(v);
                 lgb = no * (unet_logits_h16(v) ? 2 : 4);
                 lg[st][k] = malloc(lgb); nn_sync(); nn_d2h(lg[st][k], l, lgb);
                 nn_set_sr_step(5050 + 100 * k); unet_backward_x(v, gl[k], 1); ctr[st][k] = nn_sr_ctr();
+                nn_sync(); if (k) ms[st] = now_ms() - t0 - 0.0;
                 gg[st][k] = malloc(np * 4); unet_grad_d2h(v, gg[st][k]);
                 for (int d = 0; d < 4; d++) { const void *p = unet_l0_stream_dumped(d, &dmb[d]); dmp[st][k][d] = malloc(dmb[d]); nn_sync(); nn_d2h(dmp[st][k][d], p, dmb[d]); }
                 if (!k) {   /* a validation forward between the steps */
@@ -60,27 +64,30 @@ int main(void) {
             }
         }
         const char *e = nn_check();
-        size_t lneq = 0; for (int k = 0; k < 3; k++) for (size_t i = 0; i < lgb; i++) lneq += lg[0][k][i] != lg[1][k][i];
-        size_t dneq[4] = {0, 0, 0, 0}; for (int k = 0; k < 2; k++) for (int d = 0; d < 4; d++) for (size_t i = 0; i < dmb[d]; i++) dneq[d] += dmp[0][k][d][i] != dmp[1][k][d][i];
-        /* parameter gradients per part: enc[0], down0, dec[0], the head, all (unet_create's layout: encoders, downs, decoders, head) */
-        const int *w = cfg.widths, L = cfg.nlev;
-        size_t encs = 0; for (int i = 0; i < L; i++) encs += blk(i ? w[i - 1] : cfg.cin, w[i]);
-        const size_t he = np - (dn ? (size_t)2 * (w[0] + w[1] + w[2] + w[3] + w[4] + w[5]) : 0), hs = he - ((size_t)cfg.cout * w[0] + cfg.cout), d0 = hs - blk(w[0] + w[1], w[0]);
-        double worst[5] = {0, 0, 0, 0, 0};
-        for (int k = 0; k < 2; k++) {
-            const double r[5] = {rel(gg[1][k], gg[0][k], 0, blk(cfg.cin, w[0])), rel(gg[1][k], gg[0][k], encs, encs + (size_t)w[0] * w[0] * 27 + w[0]),
-                                 rel(gg[1][k], gg[0][k], d0, hs), rel(gg[1][k], gg[0][k], hs, he), rel(gg[1][k], gg[0][k], 0, np)};
-            for (int j = 0; j < 5; j++) if (r[j] > worst[j]) worst[j] = r[j];
+        for (int m = 1; m < 3; m++) {   /* each stream mode against the unstreamed run */
+            size_t lneq = 0; for (int k = 0; k < 3; k++) for (size_t i = 0; i < lgb; i++) lneq += lg[0][k][i] != lg[m][k][i];
+            size_t dneq[4] = {0, 0, 0, 0}; for (int k = 0; k < 2; k++) for (int d = 0; d < 4; d++) for (size_t i = 0; i < dmb[d]; i++) dneq[d] += dmp[0][k][d][i] != dmp[m][k][d][i];
+            /* parameter gradients per part: enc[0], down0, dec[0], the head, all (unet_create's layout: encoders, downs, decoders, head) */
+            const int *w = cfg.widths, L = cfg.nlev;
+            size_t encs = 0; for (int i = 0; i < L; i++) encs += blk(i ? w[i - 1] : cfg.cin, w[i]);
+            const size_t he = np - (dn ? (size_t)2 * (w[0] + w[1] + w[2] + w[3] + w[4] + w[5]) : 0), hs = he - ((size_t)cfg.cout * w[0] + cfg.cout), d0 = hs - blk(w[0] + w[1], w[0]);
+            double worst[5] = {0, 0, 0, 0, 0};
+            for (int k = 0; k < 2; k++) {
+                const double r[5] = {rel(gg[m][k], gg[0][k], 0, blk(cfg.cin, w[0])), rel(gg[m][k], gg[0][k], encs, encs + (size_t)w[0] * w[0] * 27 + w[0]),
+                                     rel(gg[m][k], gg[0][k], d0, hs), rel(gg[m][k], gg[0][k], hs, he), rel(gg[m][k], gg[0][k], 0, np)};
+                for (int j = 0; j < 5; j++) if (r[j] > worst[j]) worst[j] = r[j];
+            }
+            int fin = 1; for (int k = 0; k < 2; k++) for (size_t i = 0; i < np; i++) if (!isfinite(gg[m][k][i])) { fin = 0; break; }
+            const int ok = !e && !lneq && !dneq[0] && !dneq[1] && !dneq[2] && !dneq[3] && fin && worst[4] < 1e-5 && ctr[0][0] == ctr[m][0] && ctr[0][1] == ctr[m][1];
+            printf("  P %d slab %d down_norm %d, stream %d%s%s: logits %zu of %zu bytes differ, gout[1] %zu, dec[0]'s skip gradient %zu, d/d downo[0] %zu, skip gradient %zu; parameter "
+                   "gradients rel enc0 %.2g down0 %.2g dec0 %.2g head %.2g all %.2g%s; seeds %u/%u vs %u/%u; step %.0f vs %.0f ms (with the logits' d2h)%s%s\n",
+                   P, S, dn, m, m == 2 ? " (recomputing)" : "", getenv("UFSM_L0_STREAM_POISON") ? " (poison)" : "",
+                   lneq, 3 * lgb, dneq[0], dneq[3], dneq[1], dneq[2], worst[0], worst[1], worst[2], worst[3], worst[4], fin ? "" : " (non-finite)",
+                   ctr[m][0], ctr[m][1], ctr[0][0], ctr[0][1], ms[m], ms[0], e ? e : "", ok ? "" : "  FAIL");
+            if (!ok) bad++;
         }
-        int fin = 1; for (int k = 0; k < 2; k++) for (size_t i = 0; i < np; i++) if (!isfinite(gg[1][k][i])) { fin = 0; break; }
-        const int ok = !e && !lneq && !dneq[0] && !dneq[1] && !dneq[2] && !dneq[3] && fin && worst[4] < 1e-5 && ctr[0][0] == ctr[1][0] && ctr[0][1] == ctr[1][1];
-        printf("  P %d slab %d down_norm %d%s: logits %zu of %zu bytes differ, gout[1] %zu, dec[0]'s skip gradient %zu, d/d downo[0] %zu, skip gradient %zu; parameter gradients rel "
-               "enc0 %.2g down0 %.2g dec0 %.2g head %.2g all %.2g%s; seeds %u/%u vs %u/%u%s%s\n", P, S, dn, getenv("UFSM_L0_STREAM_POISON") ? " (poison)" : "",
-               lneq, 3 * lgb, dneq[0], dneq[3], dneq[1], dneq[2], worst[0], worst[1], worst[2], worst[3], worst[4], fin ? "" : " (non-finite)",
-               ctr[1][0], ctr[1][1], ctr[0][0], ctr[0][1], e ? e : "", ok ? "" : "  FAIL");
-        if (!ok) bad++;
-        for (int st = 0; st < 2; st++) for (int k = 0; k < 3; k++) free(lg[st][k]);
-        for (int st = 0; st < 2; st++) for (int k = 0; k < 2; k++) { free(gg[st][k]); for (int d = 0; d < 4; d++) free(dmp[st][k][d]); }
+        for (int st = 0; st < 3; st++) for (int k = 0; k < 3; k++) free(lg[st][k]);
+        for (int st = 0; st < 3; st++) for (int k = 0; k < 2; k++) { free(gg[st][k]); for (int d = 0; d < 4; d++) free(dmp[st][k][d]); }
         for (int k = 0; k < 3; k++) nn_free(x[k]);
         for (int k = 0; k < 2; k++) nn_free(gl[k]);
         unet_free(v);

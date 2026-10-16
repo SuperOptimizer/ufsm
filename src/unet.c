@@ -95,7 +95,8 @@ struct unet {
     const float *l0s_reg[4];      /* slab kernel path: the statistics arrays this net registered (lp_gn_slab_reg) */
     float *l0st_g2, *l0st_up; size_t l0st_g2n, l0st_upn;   /* level-0 slab stream (stage S3): dec[0]'s d/d a2, its up transient */
     float *l0st_poison;           /* UFSM_L0_STREAM_POISON: a NaN plane source */
-    int l0st, l0st_dir;           /* this forward / backward runs the level-0 slab stream; its backward phase's direction (+1 down, -1 up) */
+    int l0st, l0st_dir;           /* this forward / backward runs the level-0 slab stream (2: recomputing); its backward phase's direction (+1 down, -1 up) */
+    unsigned l0st_rc[4]; int l0st_rk[4];   /* the forward's level-0 ops (stem, enc[0] conv2, dec[0] conv1, conv2): first seed draw, draws per window */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
@@ -2405,7 +2406,7 @@ static int l0st_want(const unet *u) {   /* the stream requested, and supported f
         : up_wg_chunk() && d0->c_split % 32 == 0 ? "an unchunked decoder conv1 weight gradient (UFSM_UP_WG_CHUNK=0 or a 16-wide level 1)"
         : !d0->xb ? "the recompute decoder conv1" : nullptr;
     if (why) { fprintf(stderr, "unet: UFSM_L0_STREAM needs %s\n", why); abort(); }
-    return 1;
+    return l0st_req() >= 2 ? 2 : 1;
 }
 /* the z-window of slab s, the i-th of an op's n windows in execution order (the first zeroes, the last finalises output sums) */
 static void l0st_win(const unet *u, int s, int i, int n) {
@@ -2433,14 +2434,39 @@ static void l0st_stats(unet *u, block *b, int k, int s) {
     if (nn_gn_stats_n(x, l0s_shape(u, b), l0_G(u), 1e-5f, m, r, s, 1)) rc_fail("level-0 slab stream: slab statistics (MX level-0 storage)");
 }
 /* UFSM_L0_STREAM_POISON: slab s of the MX level-0 tensor t (shape s5) overwritten with 0xff bytes (NaN scales): dead for the schedule */
-static void l0st_poison(unet *u, void *t, shape5 s5, int s) {
+static void l0st_poison_raw(unet *u, void *t, shape5 s5, int s) {
     const int S = u->cfg.l0_slab, D = s5.d;
-    if (l0st_poison_on() == 2) s -= u->l0st_dir;   /* (control: a slab the schedule still reads) */
     if (!l0st_poison_on() || s < 0 || s * S >= D) return;
     const size_t hw = (size_t)s5.h * s5.w, need = (size_t)2 * S * hw * 33;
     if (!u->l0st_poison) { uint8_t *h = malloc(need); memset(h, 0xff, need); u->l0st_poison = nn_malloc(need); nn_h2d(u->l0st_poison, h, need); free(h); }
     const int n = D - s * S < S ? D - s * S : S;
     mx_copy_planes(t, D, s * S, u->l0st_poison, n, 0, n, s5);
+}
+static void l0st_poison(unet *u, void *t, shape5 s5, int s) {   /* a transient slab after its last reader */
+    if (l0st_poison_on() == 2) s -= u->l0st_dir;   /* (control: a slab the schedule still reads) */
+    l0st_poison_raw(u, t, s5, s);
+}
+/* stream 2 (recomputing): a phase's level-0 activations are dead on entry (S4 keeps none of them whole): poisoned all through */
+static void l0st_poison_all(unet *u, void *t, shape5 s5) { if (u->l0st >= 2) for (int s = 0; s < l0s_nslab(u, s5.d); s++) l0st_poison_raw(u, t, s5, s); }
+/* stream 2: slab s of a forward level-0 op's output recomputed (0 the stem -> enc[0].a1, 1 enc[0]'s conv2 -> a2, 2 dec[0]'s conv1 ->
+   a1, 3 its conv2 -> a2): the forward's seeds (replayed, the draws asserted), its statistics (kept: no statistics pass). The layer and
+   conv tags are the forward's; the caller restores its own and its seed counter is kept */
+static void l0st_re(unet *u, int op, int s) {
+    const int ns = l0s_nslab(u, u->ls[0].d), L = u->cfg.nlev;
+    if (u->l0st < 2 || s < 0 || s >= ns || (l0st_poison_on() == 3 && op == 1)) return;   /* (3: the test's control, no skip recompute) */
+    block *b = op < 2 ? &u->enc[0] : &u->dec[0];
+    const int G = G_of(u, b->c1.cout);
+    const unsigned c0 = nn_sr_ctr();
+    nn_set_layer(op < 2 ? 0 : 3 * L - 3); nn_set_conv(op & 1);
+    l0st_win(u, s, 1, 3);   /* (a middle window: no output sums zeroed or finalised; there are none) */
+    nn_sr_set_ctr(u->l0st_rc[op]);
+    int r = 0;
+    if (op == 0) { const nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(b->in, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, b->a1, G, 1e-5f, nullptr, nullptr)); }
+    else if (op == 2) r = dec_conv1(u, b, 0, b->a1, G, nullptr, nullptr, nullptr, nullptr, nullptr);
+    else PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, nullptr, nullptr));
+    if (r || (int)(nn_sr_ctr() - u->l0st_rc[op]) != u->l0st_rk[op]) rc_fail("level-0 slab stream: a recompute (or its seed draws)");
+    l0st_nowin(); nn_set_conv(-1);
+    nn_sr_set_ctr(c0);
 }
 /* test hook (unet_l0_stream_dump): device copies of gout[1] after dec[0]'s backward (0), d/d downo[0] (1), the skip gradient (2) */
 static int g_l0st_dump; static void *g_l0st_dumped[4]; static size_t g_l0st_dumpn[4];
@@ -2481,6 +2507,7 @@ static const float *l0st_fwd_enc(unet *u, const float *x) {
         }
     }
     l0op_after(&dn);
+    u->l0st_rc[0] = st.c; u->l0st_rk[0] = st.k; u->l0st_rc[1] = c2.c; u->l0st_rk[1] = c2.k;   /* (the recomputes replay them) */
     if (u->cfg.down_norm) {   /* (as unet_forward_x: the statistics now, the transform in enc[1]'s conv1 staging) */
         shape5 ds = u->ls[1]; ds.c = w[0];
         block *nb = &u->enc[1];
@@ -2491,18 +2518,22 @@ static const float *l0st_fwd_enc(unet *u, const float *x) {
 }
 /* F2: dec[0]'s conv1 (the up part from dec[1]'s whole output, the skip enc[0].a2) and conv2 one slab behind */
 static void l0st_fwd_dec(unet *u) {
-    block *b = &u->dec[0];
-    const int ns = l0s_nslab(u, b->ys.d), G = G_of(u, b->c1.cout);
+    block *b = &u->dec[0], *e = &u->enc[0];
+    const int ns = l0s_nslab(u, b->ys.d), G = G_of(u, b->c1.cout), L = u->cfg.nlev, lag = u->l0st >= 2 ? 2 : 0;
     l0op c1 = {nn_sr_ctr(), -1}, c2 = {0, -1};
-    for (int t = 0; t <= ns; t++) {
-        if (t < ns) {
-            nn_set_conv(0); l0st_win(u, t, t, ns); l0op_go(&c1);
+    l0st_poison_all(u, e->a1, e->ys); l0st_poison_all(u, e->a2, e->ys);   /* (stream 2: the skip and enc[0]'s a1 recomputed here) */
+    for (int t = 0; t <= ns + lag; t++) {
+        l0st_re(u, 0, t); l0st_re(u, 1, t - 1);   /* (stream 2: the skip's slab t - 1 for conv1 two slabs behind) */
+        nn_set_layer(3 * L - 3);
+        if (t - lag >= 0 && t - lag < ns) {
+            const int s = t - lag;
+            nn_set_conv(0); l0st_win(u, s, s, ns); l0op_go(&c1);
             if (dec_conv1(u, b, 0, b->a1, G, nullptr, nullptr, nullptr, nullptr, nullptr)) rc_fail("level-0 slab stream: decoder conv1");
             l0op_end(&c1, &c2); l0st_nowin();
-            l0st_stats(u, b, 1, t);
+            l0st_stats(u, b, 1, s);
         }
-        if (t >= 1) {
-            const int s = t - 1;
+        if (t - lag >= 1 && t - lag <= ns) {
+            const int s = t - lag - 1;
             nn_set_conv(1); l0st_win(u, s, s, ns); l0op_go(&c2);
             PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, nullptr, nullptr));
             l0op_end(&c2, nullptr); l0st_nowin();
@@ -2511,6 +2542,7 @@ static void l0st_fwd_dec(unet *u) {
     }
     nn_set_conv(-1);
     l0op_after(&c2);
+    u->l0st_rc[2] = c1.c; u->l0st_rk[2] = c1.k; u->l0st_rc[3] = c2.c; u->l0st_rk[3] = c2.k;
 }
 /* dec[0]'s up transient up2(silu(gn(dec[1].a2))) into up (rc_up's arithmetic, whole: S3 keeps the whole tensors) */
 static void l0st_up_build(unet *u, block *b, float *up) {
@@ -2540,9 +2572,15 @@ static void l0st_bwd_dec(unet *u) {
     l0op o_g2 = {nn_sr_ctr(), -1}, o_c2w = {0, -1}, o_c2d = {0, -1}, o_g1 = {0, -1}, o_up = {0, -1}, o_c1w = {0, -1}, o_c1d = {0, -1}, o_u2b = {0, -1};
     int n1 = 0, n2 = 0, n3 = 0;   /* windows run of the ops one, two and three slabs behind */
     u->l0st_dir = 1;
-    nn_set_layer(3 * L - 3);
-    for (int t = ns - 1; t >= -3; t--) {
-        if (t >= 0) {   /* GN2's backward and conv2's weight gradient, slab t */
+    /* stream 2: every level-0 activation recomputed ahead of its readers, down the slabs: at tick t enc[0]'s a1 of slab t - 3, the
+       skip of t - 2 (dec[0]'s conv1 reads its planes around t - 1), dec[0]'s a1 of t - 1 (conv2's weight gradient at t reads its
+       planes around t), dec[0]'s a2 of t */
+    block *e = &u->enc[0];
+    l0st_poison_all(u, e->a1, e->ys); l0st_poison_all(u, e->a2, e->ys); l0st_poison_all(u, b->a1, b->ys); l0st_poison_all(u, b->a2, b->ys);
+    for (int t = ns - 1 + (u->l0st >= 2 ? 3 : 0); t >= -3; t--) {
+        l0st_re(u, 0, t - 3); l0st_re(u, 1, t - 2); l0st_re(u, 2, t - 1); l0st_re(u, 3, t);
+        nn_set_layer(3 * L - 3);
+        if (t >= 0 && t < ns) {   /* GN2's backward and conv2's weight gradient, slab t */
             nn_set_conv(1); l0st_win(u, t, ns - 1 - t, ns); l0op_go(&o_g2);
             PROF(3, gn_silu_bwd_b(u, b, 2, b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, B2, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));
             l0op_end(&o_g2, &o_c2w); l0op_go(&o_c2w);
@@ -2593,7 +2631,12 @@ static void l0st_bwd_enc(unet *u, float *gin) {
     const nn_gn_t gg = gn_out(u, b);
     l0op o_dw = {nn_sr_ctr(), -1}, o_dd = {0, -1}, o_g2 = {0, -1}, o_c2w = {0, -1}, o_c2d = {0, -1}, o_g1 = {0, -1}, o_sw = {0, -1};
     u->l0st_dir = -1;
+    /* stream 2: enc[0]'s a1 recomputed one slab ahead (conv2's weight gradient at t reads its planes around t), the skip at t (down0's
+       weight gradient reads its planes up to t, GN2 slab t) */
+    l0st_poison_all(u, b->a1, b->ys); l0st_poison_all(u, b->a2, b->ys);
+    l0st_re(u, 0, 0);
     for (int t = 0; t <= ns; t++) {
+        l0st_re(u, 0, t + 1); l0st_re(u, 1, t);
         if (t < ns) {   /* down0 (weight gradient; backward-data into the skip gradient's slab t: complete now), GN2 and conv2's weight gradient */
             nn_set_layer(L); nn_set_conv(-1); l0st_win(u, t, t, ns); l0op_go(&o_dw);
             int r; PROF(2, r = nn_conv3d_bwd_weight_x(b->a2, &gg, nullptr, nullptr, 0, 0, b->ys, gin, ds, 3, 2, g + u->down[0].w, g + u->down[0].b));
