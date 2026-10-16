@@ -2,7 +2,12 @@
 /* kernels and launchers of lp_f8fwd (instantiated per type in lp_f8fwd_i*.cu) */
 #include "lp_common.cuh"
 #include "lp_sr.cuh"
-
+#ifndef F8S_PAIR
+#define F8S_PAIR 1   /* conv_fwd_f8s_k's paired z tiles for the network input (0: tile by tile) */
+#endif
+#ifndef F8S4_MINB
+#define F8S4_MINB 2   /* blocks per SM of the <= 4-channel (network input) conv_fwd_f8s_k */
+#endif
 
 /* ======================= FP8 forward, k=3, stride 1, pad 1 =======================
    Block = 8 warps over a 2 z x 8 y x 16 x output tile (as the BF16 kernel); warp w owns z = w/4, rows 2(w%4)+{0,1}
@@ -164,15 +169,16 @@ __global__ void prep_w8s_k(const float *__restrict__ w, uint8_t *__restrict__ wq
     ws[i] = (uint8_t)(e + 127);
 }
 template <int MT, int CP, typename T, typename TO = T>   /* TO: output type (an MX output from a 16-bit network input) */
-__global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
+__global__ void __launch_bounds__(256, CP <= 4 ? F8S4_MINB : 2) conv_fwd_f8s_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                       const float *__restrict__ b, TO *__restrict__ y,
                                                       int N, int Ci, int D, int H, int W, int Co, int Cop, gnp_t gp, double *__restrict__ osum, int Go, split_t sp,
                                                       int ZC, unsigned scr_off) {   /* ZC z tiles per block (weights and channel table staged once); scr_off:
                                                                                      the epilogue scratch, after the resident weights */
     constexpr int BM = MT * 16, TPK = 32 / CP, NKB = (27 + TPK - 1) / TPK, NRX = 2;
+    constexpr bool DB = CP <= 4;   /* the network input: the staged tile and its amax double-buffered (two barriers per z tile, not four) */
     extern __shared__ __align__(128) unsigned char smem_raw[];
-    uint8_t *sx = smem_raw;                         /* [F8_T pos][CP] */
-    uint8_t *wa = sx + F8_T * CP;                   /* [NKB][BM][32] swizzled */
+    uint8_t *sx0 = smem_raw;                        /* [DB ? 2 : 1][F8_T pos][CP] */
+    uint8_t *wa = sx0 + (DB ? 2 : 1) * F8_T * CP;   /* [NKB][BM][32] swizzled */
     uint8_t *was = wa + NKB * BM * 32;              /* [NKB][BM] */
     unsigned *samax = (unsigned *)(was + ((NKB * BM + 15) & ~15));
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
@@ -195,6 +201,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
     }
     for (int i = threadIdx.x; i < NKB * BM; i += 256) { int kb = i / BM, c = i % BM; was[i] = wsc[(size_t)kb * Cop + co0 + c]; }
     if (osum) fwd_stats_zero<BM>(smem_raw + scr_off);   /* the block's statistics over all its z tiles (OWN epilogue: the scratch is its own) */
+    if (DB && threadIdx.x < 4) samax[threadIdx.x] = 0u;
     __syncthreads();
     bool row1 = IS_MX(T) && CP <= 4 && !G && Ci == CP && ctab[0].p && ctab[0].bw >= CP;   /* the CP channels are one MX block row (the network
                                                                                           input): staged with one row and one scale load */
@@ -215,15 +222,116 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
             okm |= (unsigned)inb << j;
         }
     };
-    if constexpr (IS_MX(T) && CP <= 4) if (row1 && zc * ZC < nzt) ld3(zc * ZC);
-    for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
-    const int oz0 = tz * 2;
-    if (tz > zc * ZC) __syncthreads();   /* the previous tile's MMA (sx) and amax reads are done */
-    if (threadIdx.x == 0) *samax = 0u;
-    __syncthreads();
+    /* the tile's MMAs from the staged tile sxt (block scale byte sbt) and its epilogue (output planes oz0t, oz0t + 1) */
+    auto mma_epi = [&](const uint8_t *sxt, unsigned sbt, int oz0t) {
     float acc[MT][2][2][4];
 #pragma unroll
     for (int m = 0; m < MT; m++) for (int r = 0; r < 2; r++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[m][r][q][k] = 0.f;
+    /* lane (g, t): b0 holds k = 4t..4t+3 -> local tap 4t / CP, channel 4t % CP; b1 holds k = 16 + 4t.. */
+    const int tl0 = (4 * t) / CP, ch0 = (4 * t) % CP, tl1 = (16 + 4 * t) / CP, ch1 = (16 + 4 * t) % CP;
+#pragma unroll
+    for (int kb = 0; kb < NKB; kb++) {
+        int tap0 = min(kb * TPK + tl0, 26), tap1 = min(kb * TPK + tl1, 26);
+        int base0 = ((wz + tap0 / 9) * 10 + wr + (tap0 / 3) % 3) * 18 + tap0 % 3 + g;
+        int base1 = ((wz + tap1 / 9) * 10 + wr + (tap1 / 3) % 3) * 18 + tap1 % 3 + g;
+        unsigned bfr[2][2][2];
+#pragma unroll
+        for (int r = 0; r < 2; r++)
+#pragma unroll
+            for (int q = 0; q < 2; q++) {
+                bfr[r][q][0] = *(const unsigned *)(sxt + (base0 + r * 18 + q * 8) * CP + ch0);
+                bfr[r][q][1] = *(const unsigned *)(sxt + (base1 + r * 18 + q * 8) * CP + ch1);
+            }
+#pragma unroll
+        for (int m = 0; m < MT; m++) {
+            unsigned af[4];
+            int mat = lane >> 3, row = m * 16 + (mat & 1) * 8 + (lane & 7);
+            ldsm_x4(af, wa + kb * BM * 32 + sw16(row, mat >> 1));
+            unsigned sa = was[kb * BM + m * 16 + g + 8 * (t & 1)];
+#pragma unroll
+            for (int r = 0; r < 2; r++) { mma_f8(acc[m][r][0], af, bfr[r][0], sa, sbt); mma_f8(acc[m][r][1], af, bfr[r][1], sa, sbt); }
+        }
+    }
+    fwd_epilogue<MT, NRX, TO, true, MT == 1, true>(acc, smem_raw + scr_off, y, b, n, co0, Co, D, H, W, oz0t, oy0, ox0, wz, wr, osum, Go, sp, N, scr_off);
+    };
+    /* F8S_PAIR (the network input, DB): two z tiles per round, from six input planes loaded once (five positions per thread): each tile
+       keeps its own block scale (the amax of its own four planes; the shared middle planes are converted twice), so the bytes, MMAs
+       and epilogues are the per-tile path's; two barriers per two tiles. The amax pair alternates between two pairs of entries
+       (the other pair reset after this round's amax barrier). */
+    if constexpr (IS_MX(T) && CP <= 4 && DB && F8S_PAIR) if (row1) {
+        constexpr int NJ = 5, PT = 6 * 180;
+        unsigned pw[NJ], ps[NJ], pok = 0u;
+        auto ld5 = [&](int tz_) {
+            const chan_t &c0 = ctab[0];
+            pok = 0u;
+#pragma unroll
+            for (int j = 0; j < NJ; j++) {
+                const int pos = threadIdx.x + 256 * j, ix = pos % 18, iy = (pos / 18) % 10, iz = pos / 180;
+                const int gz = tz_ * 2 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
+                const bool inb = pos < PT && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+                pw[j] = 0u; ps[j] = 0u;
+                if (inb) { const size_t off = ((size_t)(gz + zi0) * H + gy) * W + gx; pw[j] = __ldg((const unsigned *)((const uint8_t *)c0.p + off * c0.rb)); ps[j] = c0.sp[off]; }
+                pok |= (unsigned)inb << j;
+            }
+        };
+        const int tend = min(nzt, (zc + 1) * ZC);
+        int tz = zc * ZC;
+        if (tz < tend) ld5(tz);
+        for (int it = 0; tz < tend; it++, tz += 2) {
+            const bool hasB = tz + 1 < tend;
+            unsigned *samA = samax + 2 * (it & 1);
+            float v[NJ][CP], amA = 0.f, amB = 0.f;
+#pragma unroll
+            for (int j = 0; j < NJ; j++) {
+                const int pos = threadIdx.x + 256 * j, iz = pos / 180;
+                const bool inb = (pok >> j) & 1u;
+                const float sc = mx_scale(ps[j]);
+                float d4[4];
+                if constexpr (IS_MX8(T)) { const float2 lo = dec_e4m3x2((unsigned short)(pw[j] & 0xffffu)), hi = dec_e4m3x2((unsigned short)(pw[j] >> 16)); d4[0] = lo.x; d4[1] = lo.y; d4[2] = hi.x; d4[3] = hi.y; }
+                else { const float2 lo = dec_e2m1x2(pw[j] & 255u), hi = dec_e2m1x2((pw[j] >> 8) & 255u); d4[0] = lo.x; d4[1] = lo.y; d4[2] = hi.x; d4[3] = hi.y; }
+#pragma unroll
+                for (int k = 0; k < CP; k++) {
+                    const float val = inb ? d4[k] * sc : 0.f; v[j][k] = val;
+                    if (iz <= 3) amA = fmaxf(amA, fabsf(val));
+                    if (iz >= 2) amB = fmaxf(amB, fabsf(val));
+                }
+            }
+#pragma unroll
+            for (int o = 16; o; o >>= 1) { amA = fmaxf(amA, __shfl_xor_sync(0xffffffff, amA, o)); amB = fmaxf(amB, __shfl_xor_sync(0xffffffff, amB, o)); }
+            if (lane == 0) { atomicMax(samA, __float_as_uint(amA)); if (hasB) atomicMax(samA + 1, __float_as_uint(amB)); }
+            __syncthreads();
+            const int eA = mx_exp(__uint_as_float(samA[0]), 1.f / 448.f), eB = hasB ? mx_exp(__uint_as_float(samA[1]), 1.f / 448.f) : 0;
+            if (threadIdx.x == 0) { samax[2 * ((it & 1) ^ 1)] = 0u; samax[2 * ((it & 1) ^ 1) + 1] = 0u; }   /* the next round's */
+            {
+                const float mA = exp2i(-eA), mB = exp2i(-eB);
+                uint8_t *sxA = sx0, *sxB = sx0 + F8_T * CP;
+#pragma unroll
+                for (int j = 0; j < NJ; j++) {
+                    const int pos = threadIdx.x + 256 * j, iz = pos / 180;
+                    if (pos >= PT) break;
+                    if (iz <= 3) *(unsigned *)(sxA + pos * 4) = cvt_e4m3x4(v[j][0] * mA, v[j][1] * mA, v[j][2] * mA, v[j][3] * mA);
+                    if (hasB && iz >= 2) *(unsigned *)(sxB + (pos - 360) * 4) = cvt_e4m3x4(v[j][0] * mB, v[j][1] * mB, v[j][2] * mB, v[j][3] * mB);
+                }
+            }
+            __syncthreads();
+            if (tz + 2 < tend) ld5(tz + 2);   /* the next round's rows during these MMAs */
+            mma_epi(sx0, (unsigned)(eA + 127), tz * 2);
+            if (hasB) mma_epi(sx0 + F8_T * CP, (unsigned)(eB + 127), tz * 2 + 2);
+        }
+        if (osum) fwd_stats_flush<BM>(smem_raw + scr_off, osum, n, co0, Co, Go);
+        return;
+    }
+    if constexpr (IS_MX(T) && CP <= 4) if (row1 && zc * ZC < nzt) ld3(zc * ZC);
+    for (int tz = zc * ZC; tz < nzt && tz < (zc + 1) * ZC; tz++) {
+    const int oz0 = tz * 2, db = DB ? (tz - zc * ZC) & 1 : 0;
+    uint8_t *sx = sx0 + db * F8_T * CP;
+    unsigned *sam = samax + db;
+    if (!DB) {
+        if (tz > zc * ZC) __syncthreads();   /* the previous tile's MMA (sx) and amax reads are done */
+        if (threadIdx.x == 0) *samax = 0u;
+        __syncthreads();
+    }   /* DB: this tile's buffers were last read by the tile before the previous one, which every warp finished before the previous
+           tile's last barrier; its amax was reset after the previous tile's amax barrier */
     float v[3][CP];
     float amax = 0.f;
     if constexpr (IS_MX(T) && CP <= 4) if (row1) {   /* the same values as ldc per channel: the row's e4m3 bytes / e2m1 nibbles times its
@@ -257,9 +365,10 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
     }
 #pragma unroll
     for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
-    if (lane == 0) atomicMax(samax, __float_as_uint(amax));
+    if (lane == 0) atomicMax(sam, __float_as_uint(amax));
     __syncthreads();
-    const int e = mx_exp(__uint_as_float(*samax), 1.f / 448.f);
+    const int e = mx_exp(__uint_as_float(*sam), 1.f / 448.f);
+    if (DB && threadIdx.x == 0) samax[db ^ 1] = 0u;   /* the next tile's (its readers, two tiles back, are past this barrier) */
     const unsigned sb = (unsigned)(e + 127);
     {
         float m = exp2i(-e);
@@ -277,32 +386,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
     }
     __syncthreads();
     if constexpr (IS_MX(T) && CP <= 4) if (row1 && tz + 1 < nzt && tz + 1 < (zc + 1) * ZC) ld3(tz + 1);   /* the next tile's rows during this MMA */
-    /* lane (g, t): b0 holds k = 4t..4t+3 -> local tap 4t / CP, channel 4t % CP; b1 holds k = 16 + 4t.. */
-    const int tl0 = (4 * t) / CP, ch0 = (4 * t) % CP, tl1 = (16 + 4 * t) / CP, ch1 = (16 + 4 * t) % CP;
-#pragma unroll
-    for (int kb = 0; kb < NKB; kb++) {
-        int tap0 = min(kb * TPK + tl0, 26), tap1 = min(kb * TPK + tl1, 26);
-        int base0 = ((wz + tap0 / 9) * 10 + wr + (tap0 / 3) % 3) * 18 + tap0 % 3 + g;
-        int base1 = ((wz + tap1 / 9) * 10 + wr + (tap1 / 3) % 3) * 18 + tap1 % 3 + g;
-        unsigned bfr[2][2][2];
-#pragma unroll
-        for (int r = 0; r < 2; r++)
-#pragma unroll
-            for (int q = 0; q < 2; q++) {
-                bfr[r][q][0] = *(const unsigned *)(sx + (base0 + r * 18 + q * 8) * CP + ch0);
-                bfr[r][q][1] = *(const unsigned *)(sx + (base1 + r * 18 + q * 8) * CP + ch1);
-            }
-#pragma unroll
-        for (int m = 0; m < MT; m++) {
-            unsigned af[4];
-            int mat = lane >> 3, row = m * 16 + (mat & 1) * 8 + (lane & 7);
-            ldsm_x4(af, wa + kb * BM * 32 + sw16(row, mat >> 1));
-            unsigned sa = was[kb * BM + m * 16 + g + 8 * (t & 1)];
-#pragma unroll
-            for (int r = 0; r < 2; r++) { mma_f8(acc[m][r][0], af, bfr[r][0], sa, sb); mma_f8(acc[m][r][1], af, bfr[r][1], sa, sb); }
-        }
-    }
-    fwd_epilogue<MT, NRX, TO, true, MT == 1, true>(acc, smem_raw + scr_off, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N, scr_off);
+    mma_epi(sx, sb, oz0);
     }
     if (osum) fwd_stats_flush<BM>(smem_raw + scr_off, osum, n, co0, Co, Go);
 }
@@ -311,7 +395,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_f8s_k(const T *__restrict__ x
 template <int MT, int CP, typename T, typename TO> void launch_f8s(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, gnp_t gp, double *osum, int Go, split_t sp) {
     constexpr int TPK = 32 / CP, NKB = (27 + TPK - 1) / TPK;
     /* the tile, the weights and the channel table, then the epilogue scratch (it used to overlay them: they are resident now) */
-    const size_t base = ((size_t)F8_T * CP + NKB * MT * 16 * 32 + ((NKB * MT * 16 + 15) & ~15) + 16 + 16 * sizeof(chan_t) + 127) & ~(size_t)127;
+    const size_t base = ((size_t)(CP <= 4 ? 2 : 1) * F8_T * CP + NKB * MT * 16 * 32 + ((NKB * MT * 16 + 15) & ~15) + 16 + 16 * sizeof(chan_t) + 127) & ~(size_t)127;   /* (CP <= 4: two tiles) */
     size_t scr = 8 * 256 * sizeof(float);
     if (IS_MX(TO) && MT % 2 == 0 && scr < FEPI_SCR(16)) scr = FEPI_SCR(16);   /* the transposed MX epilogue's scratch (with 8 KB it fell back to the generic one) */
     if (IS_MX(TO) && MT == 1) scr = fepi16_scr(base, scr, cout, sp);                                  /* the 16-channel-block one (fwd_epi_mx16) */
@@ -319,7 +403,7 @@ template <int MT, int CP, typename T, typename TO> void launch_f8s(dim3 grid, co
     static int zc_env = -2;
     if (zc_env == -2) zc_env = getenv("UFSM_F8S_ZC") ? atoi(getenv("UFSM_F8S_ZC")) : -1;
     const int nzt = (xs.d + 1) / 2, rest = (int)(grid.x * grid.y * (grid.z / nzt));   /* blocks per z column */
-    int ZC = zc_env > 0 ? zc_env : 8;   /* z tiles per block, while >= ~480 blocks remain */
+    int ZC = zc_env > 0 ? zc_env : CP <= 4 ? 32 : 8;   /* z tiles per block, while >= ~480 blocks remain (the network input: 32, P512 17.3 -> 16.3 ms) */
     while (ZC > 1 && (size_t)rest * ((nzt + ZC - 1) / ZC) < 480) ZC--;
     grid.z = (grid.z / nzt) * ((nzt + ZC - 1) / ZC);
     static int attr[8];
