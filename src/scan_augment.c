@@ -3,6 +3,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 const char *const scan_aug_names[SA_N] = {"seam", "air", "lowres", "blur", "sharpen", "bias", "ring", "cupping", "slice",
                                           "noise", "cnoise", "tone", "quant", "dropslice", "cutout", "chunk", "paganin", "gin", "hist", "motion"};
@@ -36,11 +39,24 @@ int scan_aug_load_hist(const char *path, scan_aug_cfg *c) {
         for (int i = P - 1; i >= 0; i--) { y = i == P - 1 ? line[i] : (1 - a) * line[i] + a * y; F[b + i * st] = y; }
     }
 }
+static void transpose(const float *a, float *b, int P);
+/* exp_smooth's axis-1 sweep over one P x P plane: along the row index, every column side by side */
+static void exp_smooth_rows(float *base, int P, float a) {
+    const float b = 1 - a;
+    for (int v = 0; v < P; v++) base[v] = b * base[v] + a * base[v];   /* (y starts as the first element) */
+    for (int i = 1; i < P; i++) { float *ri = base + (size_t)i * P; const float *rp = ri - P; for (int v = 0; v < P; v++) ri[v] = b * ri[v] + a * rp[v]; }
+    for (int i = P - 2; i >= 0; i--) { float *ri = base + (size_t)i * P; const float *rn = ri + P; for (int v = 0; v < P; v++) ri[v] = b * ri[v] + a * rn[v]; }
+}
 /* exp_smooth_ref with the lines of axes 0 and 1 run side by side (rows of the contiguous axis at a time, the forward pass in place):
-   every element sees the same float operations in the same order, bit for bit; axis 2 (contiguous lines) as before */
-static void exp_smooth(float *F, int P, int axis, float a, float *line) {
+   every element sees the same float operations in the same order, bit for bit; axis 2 (contiguous lines): with a P^2 plane
+   scratch and P % 8 == 0, each plane transposed, swept as axis 1, transposed back (else the per-line loop) */
+static void exp_smooth(float *F, int P, int axis, float a, float *line, float *plane) {
     const size_t P2 = (size_t)P * P;
-    if (axis == 2) { exp_smooth_ref(F, P, axis, a, line); return; }
+    if (axis == 2) {
+        if (!plane || P % 8) { exp_smooth_ref(F, P, axis, a, line); return; }
+        for (int u = 0; u < P; u++) { transpose(F + (size_t)u * P2, plane, P); exp_smooth_rows(plane, P, a); transpose(plane, F + (size_t)u * P2, P); }
+        return;
+    }
     const float b = 1 - a;
     const size_t st = axis == 0 ? P2 : (size_t)P;   /* along the line */
     const int outer = P, inner = axis == 0 ? P * P : P;   /* axis 0: one z sweep over whole planes; axis 1: per plane, rows of x */
@@ -147,17 +163,49 @@ static void bop_compose(bop *c, const bop *a, const bop *b, float *dense) {
         bop_store(c, i, dense, lo, hi);
     }
 }
+#ifdef __AVX2__
+/* b (stride sb) = the transpose of the 8 x 8 block at a (stride sa) */
+static inline void tr8(const float *a, size_t sa, float *b, size_t sb) {
+    __m256 r[8], t[8], u[8];
+    for (int k = 0; k < 8; k++) r[k] = _mm256_loadu_ps(a + k * sa);
+    for (int k = 0; k < 8; k += 2) { t[k] = _mm256_unpacklo_ps(r[k], r[k + 1]); t[k + 1] = _mm256_unpackhi_ps(r[k], r[k + 1]); }
+    for (int k = 0; k < 8; k += 4) {
+        u[k] = _mm256_shuffle_ps(t[k], t[k + 2], 0x44); u[k + 1] = _mm256_shuffle_ps(t[k], t[k + 2], 0xEE);
+        u[k + 2] = _mm256_shuffle_ps(t[k + 1], t[k + 3], 0x44); u[k + 3] = _mm256_shuffle_ps(t[k + 1], t[k + 3], 0xEE);
+    }
+    for (int k = 0; k < 4; k++) { _mm256_storeu_ps(b + k * sb, _mm256_permute2f128_ps(u[k], u[k + 4], 0x20)); _mm256_storeu_ps(b + (k + 4) * sb, _mm256_permute2f128_ps(u[k], u[k + 4], 0x31)); }
+}
+#endif
 static void transpose(const float *a, float *b, int P) {
+#ifdef __AVX2__
+    if (P % 8 == 0) {
+        for (int i0 = 0; i0 < P; i0 += 32) for (int j0 = 0; j0 < P; j0 += 32)
+            for (int i = i0; i < i0 + 32 && i < P; i += 8) for (int j = j0; j < j0 + 32 && j < P; j += 8) tr8(a + (size_t)i * P + j, P, b + (size_t)j * P + i, P);
+        return;
+    }
+#endif
     for (int i0 = 0; i0 < P; i0 += 32) for (int j0 = 0; j0 < P; j0 += 32)
         for (int i = i0; i < i0 + 32 && i < P; i++) for (int j = j0; j < j0 + 32 && j < P; j++) b[(size_t)j * P + i] = a[(size_t)i * P + j];
 }
-/* rows i of out = sum_t w[i][t] rows (s[i] + t) of in: vector form along the contiguous axis */
+/* rows i of out = sum_t w[i][t] rows (s[i] + t) of in: vector form along the contiguous axis. Each output element is
+   w0 r0, then + w_t r_t for t ascending (no contraction); 8 lanes accumulate all taps in a register before one store (the
+   tap-outer loop read and wrote the output row once per tap) */
 static void bop_rows(const bop *b, const float *in, float *out, size_t ostride, int P) {
     for (int i = 0; i < P; i++) {
         float *o = out + (size_t)i * ostride;
-        const float *r0 = in + (size_t)b->s[i] * P; const float w0 = b->w[i][0];
-        for (int x = 0; x < P; x++) o[x] = w0 * r0[x];
-        for (int t = 1; t < b->n[i]; t++) { const float *r = in + (size_t)(b->s[i] + t) * P, w = b->w[i][t]; for (int x = 0; x < P; x++) o[x] += w * r[x]; }
+        const float *r0 = in + (size_t)b->s[i] * P; const float *wi = b->w[i]; const int n = b->n[i];
+        int x = 0;
+#ifdef __AVX2__
+        for (; x + 16 <= P; x += 16) {
+            __m256 a0 = _mm256_mul_ps(_mm256_set1_ps(wi[0]), _mm256_loadu_ps(r0 + x)), a1 = _mm256_mul_ps(_mm256_set1_ps(wi[0]), _mm256_loadu_ps(r0 + x + 8));
+            for (int t = 1; t < n; t++) {
+                const float *r = r0 + (size_t)t * P; const __m256 w = _mm256_set1_ps(wi[t]);
+                a0 = _mm256_add_ps(a0, _mm256_mul_ps(w, _mm256_loadu_ps(r + x))); a1 = _mm256_add_ps(a1, _mm256_mul_ps(w, _mm256_loadu_ps(r + x + 8)));
+            }
+            _mm256_storeu_ps(o + x, a0); _mm256_storeu_ps(o + x + 8, a1);
+        }
+#endif
+        for (; x < P; x++) { float v = wi[0] * r0[x]; for (int t = 1; t < n; t++) v += wi[t] * r0[(size_t)t * P + x]; o[x] = v; }
     }
 }
 /* tmp: 2 P^2 floats. axis 2 transposes each plane, axis 1 runs on planes, axis 0 on (z, x) slabs. */
@@ -320,7 +368,25 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
         }
         for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
             float *r = F + z * P2 + (size_t)y * P, dy = y - ccy[z];
-            for (int x = 0; x < P; x++) {
+            int x = 0;
+#ifdef __AVX2__
+            {   /* 8 lanes, the same float operations (IEEE sqrt, the clamps as selects) and the table through gathers */
+                const __m256 vdy2 = _mm256_mul_ps(_mm256_set1_ps(dy), _mm256_set1_ps(dy)), vcx = _mm256_set1_ps(ccx[z]), vrmin = _mm256_set1_ps(rmin),
+                             vres = _mm256_set1_ps(res), zero = _mm256_setzero_ps(), top = _mm256_set1_ps((float)(nt - 2));
+                const __m256 step = _mm256_setr_ps(0, 1, 2, 3, 4, 5, 6, 7);
+                for (; x + 8 <= P; x += 8) {
+                    const __m256 dx = _mm256_sub_ps(_mm256_add_ps(_mm256_set1_ps((float)x), step), vcx);
+                    __m256 u = _mm256_mul_ps(_mm256_sub_ps(_mm256_sqrt_ps(_mm256_add_ps(vdy2, _mm256_mul_ps(dx, dx))), vrmin), vres);
+                    u = _mm256_blendv_ps(u, zero, _mm256_cmp_ps(u, zero, _CMP_LT_OQ));
+                    u = _mm256_blendv_ps(u, top, _mm256_cmp_ps(u, top, _CMP_GT_OQ));
+                    const __m256i i = _mm256_cvttps_epi32(u);
+                    const __m256 t0 = _mm256_i32gather_ps(tab, i, 4), t1 = _mm256_i32gather_ps(tab + 1, i, 4);
+                    const __m256 add = _mm256_add_ps(t0, _mm256_mul_ps(_mm256_sub_ps(u, _mm256_cvtepi32_ps(i)), _mm256_sub_ps(t1, t0)));
+                    _mm256_storeu_ps(r + x, _mm256_add_ps(_mm256_loadu_ps(r + x), add));
+                }
+            }
+#endif
+            for (; x < P; x++) {
                 float dx = x - ccx[z], u = (sqrtf(dy * dy + dx * dx) - rmin) * res; if (u < 0) u = 0; if (u > nt - 2) u = nt - 2;
                 int i = (int)u; r[x] += tab[i] + (u - i) * (tab[i + 1] - tab[i]);
             }
@@ -354,7 +420,7 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
     }
     if (on & 1u << SA_PAGANIN) {   /* phase-retrieval-like low-pass after the noise: per axis exp(-|t| / lambda) */
         const double lam = (.4 + 1.2 * uniform(&rs)) * SO(SA_PAGANIN); const float a = (float)exp(-1 / fmax(lam, .05));
-        for (int d = 0; d < 3; d++) exp_smooth(F, P, d, a, row);
+        for (int d = 0; d < 3; d++) exp_smooth(F, P, d, a, row, tmp);
     }
     if (on & 1u << SA_GIN) {   /* random shallow conv net (GIN-style), positive-biased centre taps keep the structure */
         const int C = 2 + (int)(uniform(&rs) * 3), k = uniform(&rs) < .5 ? 1 : 3, r = k / 2, kk = k * k * k;

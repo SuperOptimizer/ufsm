@@ -474,6 +474,13 @@ static void f16_row(const float *v, uint16_t *h, int n) {
 #endif
     for (; x < n; x++) { _Float16 t = (_Float16)v[x]; memcpy(h + x, &t, 2); }
 }
+#ifdef __AVX2__
+/* eight 32-bit lanes holding 0..255 as eight bytes (lane order) */
+static inline uint64_t pack8_u32(__m256i v) {
+    const __m256i p = _mm256_packus_epi16(_mm256_packus_epi32(v, v), _mm256_setzero_si256());
+    return (uint64_t)(uint32_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(p)) | (uint64_t)(uint32_t)_mm_cvtsi128_si32(_mm256_extracti128_si256(p, 1)) << 32;
+}
+#endif
 /* write_x_aug without an appearance plan or sheet prior, one output row at a time in vectorisable loops (no math errno, so
    sqrtf vectorises); bit-identical to it: the same expressions, rng draws and signed zeros. D x P x P windows (D != P: slabs,
    z-keeping symmetries only). */
@@ -732,6 +739,12 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
        same order (no contraction), bit for bit */
     const int fast=hard && ct_only && P%16==0 && NCH==2 && !((uintptr_t)mask&3) && !((uintptr_t)target&3) && !((uintptr_t)ctu&3);
     const int filt_fast=ap && ap->filter_mode;   /* (CT values: the appearance floats; else the CT byte through lutv, L1-resident) */
+    /* no appearance plan (the trainer's default): the CT byte and the mask bit of each voxel as one 16-bit word in the (otherwise
+       unused) appearance scratch, so one 32-bit gather serves an x pair of corners (4 gathers per 8 voxels instead of 24), and the
+       CT value is lutv's float ((float) v - mean) * isd computed in the lanes (the same two float operations) */
+    const int cmf=fast && !ap && appearance;
+    uint16_t *cm=cmf?(uint16_t *)appearance:nullptr;
+    if (cmf) for (size_t k=0;k<p3;k++) cm[k]=(uint16_t)(ctu[k]|(mask[k]?0x100:0));
 #else
     const int fast=0;
 #endif
@@ -768,7 +781,20 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                         }
                         const __m256i b0=_mm256_add_epi32(_mm256_mullo_epi32(_mm256_add_epi32(_mm256_mullo_epi32(Bv[0],iP),Bv[1]),iP),Bv[2]);
                         __m256 cv=zero; __m256i bad=_mm256_setzero_si256();
-                        for (int cn=0;cn<8;cn++) {
+                        if (cmf) for (int pr=0;pr<4;pr++) {   /* corners (bz, by, 0) and (bz, by, 1): the per-voxel order cn = 0..7 */
+                            const int bz=pr>>1,by=pr&1;
+                            const __m256i wd=_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)cm,_mm256_add_epi32(b0,_mm256_set1_epi32((bz*P+by)*P)),ini,2);
+                            for (int bx=0;bx<2;bx++) {
+                                const __m256 w=_mm256_mul_ps(_mm256_mul_ps(bz?F[0]:G[0],by?F[1]:G[1]),bx?F[2]:G[2]);
+                                const __m256 use=_mm256_and_ps(in,_mm256_cmp_ps(w,thr,_CMP_GT_OQ));
+                                const __m256i h16=bx?_mm256_srli_epi32(wd,16):wd;
+                                const __m256 val=_mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_and_si256(h16,bytem)),_mm256_set1_ps(mean)),_mm256_set1_ps(isd));
+                                cv=_mm256_add_ps(cv,_mm256_and_ps(_mm256_mul_ps(w,val),use));
+                                const __m256i mb=_mm256_and_si256(_mm256_srli_epi32(h16,8),_mm256_set1_epi32(1));
+                                bad=_mm256_or_si256(bad,_mm256_and_si256(_mm256_cmpeq_epi32(mb,_mm256_setzero_si256()),_mm256_castps_si256(use)));
+                            }
+                        }
+                        else for (int cn=0;cn<8;cn++) {
                             const int bz=cn>>2,by=cn>>1&1,bx=cn&1;
                             const __m256 w=_mm256_mul_ps(_mm256_mul_ps(bz?F[0]:G[0],by?F[1]:G[1]),bx?F[2]:G[2]);
                             const __m256 use=_mm256_and_ps(in,_mm256_cmp_ps(w,thr,_CMP_GT_OQ));
@@ -794,16 +820,12 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                         const __m256i sh=_mm256_slli_epi32(_mm256_and_si256(jn,three),3), wj=_mm256_srli_epi32(jn,2);
                         const __m256i t0=_mm256_and_si256(_mm256_srlv_epi32(_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)target,wj,ini,4),sh),bytem);
                         const __m256i t1=_mm256_and_si256(_mm256_srlv_epi32(_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)(target+p3),wj,ini,4),sh),bytem);
-                        int ib[8],vb[8],tb0[8],tb1[8];
-                        _mm256_storeu_si256((__m256i *)ib,ini); _mm256_storeu_si256((__m256i *)vb,bad);
-                        _mm256_storeu_si256((__m256i *)tb0,t0); _mm256_storeu_si256((__m256i *)tb1,t1);
                         const size_t k=((size_t)z*P+y)*P+xs, kb=((size_t)(z-z0)*P+y)*P+xs;
                         _mm256_storeu_ps(cvb+kb,cv);
-                        for (int l=0;l<8;l++) {
-                            const int inl=ib[l]!=0;
-                            inb[kb+l]=(uint8_t)inl; M[k+l]=(uint8_t)(inl && !vb[l]);
-                            T[k+l]=inl?(uint8_t)tb0[l]:0; T[p3+k+l]=inl?(uint8_t)tb1[l]:0;
-                        }
+                        /* inside 0 / 1, mask inside and no zero corner, targets (the gathers are 0 outside): 8 bytes each */
+                        const __m256i inv=_mm256_and_si256(ini,_mm256_set1_epi32(1));
+                        const uint64_t q0=pack8_u32(inv),q1=pack8_u32(_mm256_andnot_si256(bad,inv)),q2=pack8_u32(t0),q3=pack8_u32(t1);
+                        memcpy(inb+kb,&q0,8); memcpy(M+k,&q1,8); memcpy(T+k,&q2,8); memcpy(T+p3+k,&q3,8);
                     }
                     continue;
                 }
@@ -888,11 +910,10 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
             for (int x=P&~3;x<P;x++) nrow[x]=g_ntab[rnext(r)&65535];
             if (ap && ap->noise_rho>0) ct_aug_noise_row(ap,nrow,noise_row,noise_plane,P,z,y);
             const size_t k0=((size_t)z*P+y)*P, kb0=((size_t)(z-z0)*P+y)*P;
-            for (int x=0;x<P;x++) {
-                const float o0=inb[kb0+x]?gain*cvb[kb0+x]+offset+noise*nrow[x]:0.f;
-                if (xfmt==1) { _Float16 h=(_Float16)o0; memcpy(H+k0+x,&h,2); }
-                else if (xfmt==2) H[k0+x]=bf16_rn(o0); else X[k0+x]=o0;
-            }
+            for (int x=0;x<P;x++) nrow[x]=inb[kb0+x]?gain*cvb[kb0+x]+offset+noise*nrow[x]:0.f;   /* (the row in place, then one store pass) */
+            if (xfmt==1) f16_row(nrow,H+k0,P);
+            else if (xfmt==2) for (int x=0;x<P;x++) H[k0+x]=bf16_rn(nrow[x]);
+            else memcpy(X+k0,nrow,(size_t)P*sizeof *X);
         }
     }
     free(vt); free(cvb); free(inb);
@@ -1511,8 +1532,8 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     if (c->augment && scan_aug_enabled(&c->scan)) {   /* scanner domains on the source grid; the per-patch z-score follows them, as at inference */
         PROF_MARK(PS_ZSCORE);
         if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {
-            sum = sq = 0;
-            for (size_t k = 0; k < p3; k++) { sum += ctu[k]; sq += (double)ctu[k] * ctu[k]; }
+            size_t nz2;   /* (integer sums: the same doubles as accumulating the bytes in double, exact below 2^53) */
+            u8_stats(ctu, p3, &nz2, &sum, &sq);
             mean = sum / (double)p3; var = sq / (double)p3 - mean * mean; sd = sqrt(var > 0 ? var : 0) + 1e-3;
         }
         PROF_MARK(PS_SCAN);
