@@ -17,11 +17,34 @@ static float *rnd(size_t n, float sc, uint64_t r) {
     for (size_t i = 0; i < n; i++) { r ^= r << 13; r ^= r >> 7; r ^= r << 17; h[i] = ((float)(r >> 40) / 16777216.f - 0.5f) * sc; }
     float *d = nn_malloc(n * 4); nn_h2d(d, h, n * 4); free(h); return d;
 }
+/* an MX tensor [1][C][S] holding the values of rnd(S C, sc, seed) (the same stream, so the same bytes at any P); quantised in voxel
+   chunks of <= 256 MB fp32, so the fp32 tensor never sits on the device whole (P 384 did not fit 16 GB) */
 static void *mx(int bits, int C, size_t S, float sc, uint64_t seed) {
-    float *f = rnd(S * C, sc, seed);
+    const int bw = C <= 8 ? 8 : C <= 16 ? 16 : 32, nb = (C + bw - 1) / bw, rb = bw * bits / 8;   /* lp_common.cuh mx_bw / mx_nb / mx_rb */
     void *q = nn_malloc(bits == 4 ? lp_mx4_bytes(1, C, S) : lp_mx8_bytes(1, C, S));
-    if (bits == 4) lp_f32_to_mx4(f, 1, C, S, q); else lp_f32_to_mx8(f, 1, C, S, q);
-    nn_free(f); return q;
+    size_t L = S;
+    while (L > 1 && (size_t)C * L * 4 > ((size_t)256 << 20)) L = (L + 1) / 2;
+    if (L == S) {
+        float *f = rnd(S * C, sc, seed);
+        if (bits == 4) lp_f32_to_mx4(f, 1, C, S, q); else lp_f32_to_mx8(f, 1, C, S, q);
+        nn_free(f); return q;
+    }
+    float *h = malloc(S * C * 4), *hc = malloc(L * C * 4), *d = nn_malloc(L * C * 4);
+    uint64_t r = seed;
+    for (size_t i = 0; i < S * C; i++) { r ^= r << 13; r ^= r >> 7; r ^= r << 17; h[i] = ((float)(r >> 40) / 16777216.f - 0.5f) * sc; }
+    uint8_t *t = nn_malloc(bits == 4 ? lp_mx4_bytes(1, C, L) : lp_mx8_bytes(1, C, L)), *qb = q;
+    for (size_t s0 = 0; s0 < S; s0 += L) {
+        const size_t l = S - s0 < L ? S - s0 : L;
+        for (int c = 0; c < C; c++) memcpy(hc + (size_t)c * l, h + (size_t)c * S + s0, l * 4);
+        nn_h2d(d, hc, l * C * 4);
+        if (bits == 4) lp_f32_to_mx4(d, 1, C, l, t); else lp_f32_to_mx8(d, 1, C, l, t);
+        for (int b = 0; b < nb; b++) {   /* rows [nb][S][rb], then the scale bytes [nb][S] */
+            nn_d2d(qb + ((size_t)b * S + s0) * rb, t + (size_t)b * l * rb, l * rb);
+            nn_d2d(qb + (size_t)nb * S * rb + (size_t)b * S + s0, t + (size_t)nb * l * rb + (size_t)b * l, l);
+        }
+    }
+    free(h); free(hc); nn_free(d); nn_free(t);
+    return q;
 }
 static uint64_t fnv(const void *d, size_t n) {
     uint8_t *h = malloc(n); nn_d2h(h, d, n);
@@ -260,6 +283,43 @@ int main(int argc, char **argv) {
         printf("%-32s @%d %8.3f ms  |gw| %.9g sum %.9g  |gb| %.9g sum %.9g\n", "wgrad stem 4 -> 16 (mx4 x, mx4 gy)", P, best, a, s, ab, sb);
         if (getenv("BENCH_DUMP")) { FILE *f = fopen(getenv("BENCH_DUMP"), "wb"); if (f) { fwrite(h, sizeof h, 1, f); fwrite(hb, sizeof hb, 1, f); fclose(f); } }
         nn_free(xi); nn_free(g4); nn_free(gw); nn_free(gb);
+    }
+    if (want("p16")) {   /* the 16-wide production net's down0 as trained (MX-fp4 activations and gradients): forward (GN+SiLU of the MX-fp4
+                            enc0 output staged, MX-fp4 out at P / 2), backward-data (MX-fp4 gy -> MX-fp4 gx accumulated, exact SR) and weight
+                            gradient (the GN+SiLU x, MX-fp4 gy); outputs hashed (gw: its sums, atomic order) */
+        const int Pc = P / 2; const size_t Sc = (size_t)Pc * Pc * Pc;
+        shape5 xs = {1, 16, P, P, P}, ys = {1, 16, Pc, Pc, Pc};
+        const gnp_t gp = {gam, bet, mean, rstd, G};
+        float *w = rnd((size_t)16 * 16 * 27, 0.1f, 151), *b = rnd(16, 0.1f, 152);
+        {
+            void *x = mx(4, 16, S, 2.f, 153), *yo = nn_malloc(lp_mx4_bytes(1, 16, Sc));
+            double best = 1e9;
+            for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_conv_fwd_s2_f8(x, 4, xs, w, b, 16, yo, 4, ys, gp); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
+            printf("%-32s @%d %8.3f ms  out %016llx\n", "fwd s2 down0 16 -> 16 (gn+silu)", P, best, (unsigned long long)fnv(yo, lp_mx4_bytes(1, 16, Sc)));
+            nn_free(x); nn_free(yo);
+        }
+        {
+            void *gy = mx(4, 16, Sc, 1e-3f, 154), *gx = mx(4, 16, S, 1e-3f, 155);
+            double best = 1e9;
+            for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1, 4, 4, 0x1234u + it); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
+            nn_free(gx); gx = mx(4, 16, S, 1e-3f, 155); lp_bwd_data_s2_mx(gy, ys, w, xs, gx, 1, 4, 4, 0x1234u); nn_sync();
+            printf("%-32s @%d %8.3f ms  out %016llx\n", "bdata s2 down0 16 -> 16 (mx4, acc)", P, best, (unsigned long long)fnv(gx, lp_mx4_bytes(1, 16, S)));
+            nn_free(gy); nn_free(gx);
+        }
+        {
+            void *x = mx(4, 16, S, 2.f, 156), *gy = mx(4, 16, Sc, 1e-3f, 157);
+            float *gw = nn_malloc(16 * 16 * 27 * 4), *gb = nn_malloc(16 * 4);
+            double best = 1e9;
+            for (int it = 0; it < 8; it++) {
+                nn_zero(gw, 16 * 16 * 27 * 4); nn_zero(gb, 64);
+                nn_sync(); double t0 = now(); lp_bwd_w_s2_f8(x, 4, xs, gy, 4, ys, gw, gb, gp); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+            }
+            float h[16 * 16 * 27], hb[16]; nn_d2h(h, gw, sizeof h); nn_d2h(hb, gb, sizeof hb);
+            double a = 0, s = 0, ab = 0; for (int i = 0; i < 16 * 16 * 27; i++) { a += fabs(h[i]); s += h[i]; } for (int i = 0; i < 16; i++) ab += fabs(hb[i]);
+            printf("%-32s @%d %8.3f ms  |gw| %.9g sum %.9g |gb| %.9g\n", "wgrad s2 down0 16 -> 16 (mx4 gy)", P, best, a, s, ab);
+            nn_free(x); nn_free(gy); nn_free(gw); nn_free(gb);
+        }
+        nn_free(w); nn_free(b);
     }
     if (want("w32")) {   /* level 0 of the 32,64,... net: stem 4 -> 32 wgrad, down0 32 -> 32 stride-2 wgrad / bdata, head 32 -> 7 wgrad */
         const int Pc = P / 2; const size_t Sc = (size_t)Pc * Pc * Pc;
