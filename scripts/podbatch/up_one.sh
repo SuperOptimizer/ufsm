@@ -7,7 +7,8 @@
 set -u; s=$1 scan=$2 um=$3 lv=$4 w=$5 rep=${6:-}; T=${TAG:-up}; cd /workspace; U=/workspace/ufsm/build/ufsm; ST=out/STATUS.md
 R=https://dl.ash2txt.org/community-uploads/forrest/volcomp; name=${scan%%-*}-fitfields-20261016-ufsm-prod96-h2.zarr
 CODEC="zarr v3, sharding_indexed 512^3 shards of 128^3 chunks (losslessly repacked from predict's 128^3 shards by ufsm repack), inner codec volcomp lossy q 8 (all 10 planes)"
-PROD="2026-10-16 on an RTX PRO 6000 (ufsm 7ae7a47 + predict --fit-q / --no-out / slab ring + repack, branch podbatch-fitq 7dafc9e)"
+GPUN=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed -e "s/^NVIDIA //" -e "s/^GeForce //"); RTH=${RTH:-8}
+PROD="$(date -u +%F) on an ${GPUN:-RTX PRO 6000} (ufsm 7ae7a47 + predict --fit-q / --no-out / slab ring + repack, branch podbatch-fitq 7dafc9e)"
 log() { ( flock 8; echo "$(date -u +%Y-%m-%dT%H:%MZ) $T $*" >> $ST ) 8> status.lock; }
 o=out/$s/$name; rp=out/$s/rp/$name; mkdir -p out/$s state
 if [ -d $o ]; then
@@ -35,7 +36,7 @@ EOR
   jq -e . $o/README.json > /dev/null || { log "$s: README.json is not valid JSON"; exit 1; }
   rm -rf $rp; mkdir -p $rp; cp $o/README.json $o/fields.json $rp/; ok=1; nin=0; nch=0
   for a in pc ps t0 t1 t2 t3 t4 t5 sp w; do
-    m=$($U repack $o/$a $rp/$a 512 --threads 32 2>> out/$s/repack.log) || ok=0
+    m=$($U repack $o/$a $rp/$a 512 --threads $RTH 2>> out/$s/repack.log) || ok=0
     nin=$(( nin + $(find $o/$a/c -type f 2>/dev/null | wc -l) )); nch=$(( nch + $(echo "$m" | awk '{for (i = 1; i < NF; i++) if ($(i + 1) == "chunks,") print $i}') ))
   done
   [ $nin = $nch ] || ok=0
