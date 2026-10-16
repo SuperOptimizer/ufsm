@@ -12,7 +12,12 @@ void ufsm_no_verify_types(const char *fn);
 #else
 #define VERIFY_ONLY(...) (ufsm_no_verify_types(__func__), 0)
 #endif
-typedef struct { const float *gamma, *beta, *mean, *rstd; int G; } gnp_t;   /* G == 0: no transform */
+typedef struct { const float *gamma, *beta, *mean, *rstd; int G; int zs, zo, ns, zhw; } gnp_t;   /* G == 0: no transform */
+/* slab-local GroupNorm (ns > 0; unet cfg.l0_norm slab, kernel path): mean / rstd are per (sample, z-slab), [n][ns][G]; plane z of
+   the tensor belongs to slab (z + zo) / zs (0 <= zo < zs), zhw = voxels per z plane (pointwise readers). ns == 0: per sample.
+   Statistics arrays registered with lp_gn_slab_reg carry this geometry into every gnp_t built by to_gnp / gnp_mk. */
+gnp_t gnp_mk(const float *gamma, const float *beta, const float *mean, const float *rstd, int G);
+int lp_gn_slab_any(void);   /* any statistics array registered */
 /* channel split: input channels >= c_split come from x2 (channel ci - c_split); output channels >= o_split go to y2 */
 /* accum: y += conv instead of y = conv. gp2 (G > 0): GroupNorm + SiLU of the x2 segment (its own channel indices / groups);
    the main gnp_t then applies to the x segment alone. gp2.G == 0 keeps the legacy meaning (gnp_t over all channels). */

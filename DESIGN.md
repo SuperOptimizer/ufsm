@@ -84,6 +84,23 @@ slab, a level-0 slab pipeline needs only a one-slab lag (the halo plane of slab 
 backward streams per slab (only parameter gradients reduce over the window): the barrier behind ~25 B / voxel is gone. Seams at slab
 borders (statistics jump) are the risk to watch (a random z-offset of the slab grid per training window would hide the grid).
 
+Kernel path, stage S1 in progress (2026-10-16; plan: /home/forrest/.claude/plans/level0-slab-streaming.md). `UFSM_L0_SLAB_KERN=1` with
+`--l0-norm slab` (MX tensor cores, uniform slabs): the level-0 blocks' m1 / r1 / m2 / r2 hold [n][slab][G] statistics, registered
+with `lp_gn_slab_reg` (nn.h); `gnp_mk` / `to_gnp` give every gnp_t built from a registered array its slab geometry (gnp_t zs, zo,
+ns, zhw; slab of plane z = (z + zo) / zs), and a reader applies each plane's slab (lp_slab.cuh gn_row / gn_ab: the arithmetic of
+make_chan / row_gn, so one slab is GroupNorm bit for bit). No normalised copy, no extra rounding (the prototype stays the default and
+the reference). Producer statistics: one pass of nn_gn_stats over the pseudo-sample shape after the conv (S2 folds them into the
+epilogues); GroupNorm backwards: nn_gn_silu_bwd over the pseudo-sample shape on the raw tensor with the true statistics (exact).
+Slab-aware so far: the head (lp_mx_conv1.cu: forward, the weight gradients, the fused backward; two coefficient banks per block, a
+block's voxels capped to one slab so they span <= 2) and the skip half of the 16-wide decoder conv1 (lp_f4up.cu: the bank of each
+staged plane, reloaded at most once per tile). tests/test_l0_slab.c: these against fp32 with the right slab per plane (slabs with
+very different statistics: a reader on another slab's is ~100% off; head 2e-4, f4u at the per-sample kernel's fp4 error), and the
+unet kernel path with one slab = GroupNorm (logits bit for bit, gradients at the run-to-run atomic noise). With more than one slab the
+trainer stops (`UFSM_L0_SLAB_FORCE=1` overrides) until the remaining readers apply slabs: make_chan / stage_row32 / dec_row16_gn
+callers (lp_common.cuh), conv_fwd_f4_k / f4r / f4p (lp_f4fwd.cuh), the down0 s2 forward and weight gradient (lp_s2.cu), the fp4 / fp8
+weight gradients' x staging (lp_f4wgrad.cuh ctab4, lp_f8wgrad.cuh ctab8), the fp8 forward readers (lp_f8fwd.cuh), and the
+head-recomputing GN backward's logit-gradient indexing (lp_mx_gnbwd.cu _hg kernels; the three-buffer layout).
+
 ## Trainer host RAM: packed targets, validation windows on disk (2026-10-15)
 At P768 the laptop trainer (production net, 6 workers, 7 slots, 4.8 um rv48 side labels) was OOM-killed by the 37.6 GiB slice cap
 before its first step (38.3 GB RSS): host RAM, not the GPU, bound the window. Per voxel the host held 5 B per sampler slot (CT fp16,

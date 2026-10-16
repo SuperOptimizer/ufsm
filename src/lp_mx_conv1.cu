@@ -1,5 +1,6 @@
 /* 1x1 convolution forward and weight gradient on MX tensors */
 #include "lp_mxops.cuh"
+#include "lp_slab.cuh"
 /* 1^3 conv (head) reading an MX tensor (B bits): y[n][co][v] = b[co] + sum_ci w[co][ci] x[ci][v] (fp32 output) */
 template <int B>
 __global__ void conv1_mx_k(const uint8_t *x, const float *w, const float *b, float *y, int N, int Ci, int Co, size_t S, gnp_t gp) {
@@ -13,7 +14,7 @@ __global__ void conv1_mx_k(const uint8_t *x, const float *w, const float *b, flo
     for (int blk = 0; blk < nb; blk++) {
         float r[32];
         mx_load_row_b<B>(x, sc, ((size_t)n * nb + blk) * S + v, bw, r);
-        row_gn(r, gp, n, blk, bw, Ci);
+        row_gn(r, gp, gn_row_v(gp, n, v), blk, bw, Ci);
         for (int k = 0; k < bw; k++) { int ci = blk * bw + k; if (ci < Ci) for (int co = 0; co < Co && co < 8; co++) acc[co] += w[co * Ci + ci] * r[k]; }
     }
     for (int co = 0; co < Co && co < 8; co++) y[((size_t)n * Co + co) * S + v] = acc[co];
@@ -28,10 +29,12 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
     constexpr int CP = CO <= 8 ? 8 : 16, C4 = CP / 4;
     extern __shared__ __align__(16) float c1s[];
     float4 *sw = (float4 *)c1s;                       /* [Ci][C4] (co 0..3, 4..7, ..) */
-    float2 *sab = (float2 *)(sw + C4 * Ci);           /* [N][Ci] (a, b) */
-    for (int i = threadIdx.x; i < N * Ci; i += blockDim.x) {
+    float2 *sab = (float2 *)(sw + C4 * Ci);           /* [N][Ci] (a, b); slab GroupNorm: [2][Ci], the block's first slab and the next */
+    const int nb0 = blockIdx.y;
+    const int r0 = gp.ns ? gn_row_v(gp, nb0, min(vb + (size_t)blockIdx.x * blockDim.x, S - 1)) : 0;
+    for (int i = threadIdx.x; i < (gp.ns ? 2 : N) * Ci; i += blockDim.x) {
         const int n = i / Ci, ci = i % Ci;
-        if (gp.G) { const int ng = n * gp.G + ci / (Ci / gp.G); const float a = gp.rstd[ng] * gp.gamma[ci]; sab[i] = make_float2(a, gp.beta[ci] - gp.mean[ng] * a); }
+        if (gp.G) sab[i] = gn_ab(gp, gp.ns ? min(r0 + n, nb0 * gp.ns + gp.ns - 1) : n, ci, Ci);
     }
     for (int i = threadIdx.x; i < CP * Ci; i += blockDim.x) { const int ci = i / CP, co = i % CP; c1s[i] = co < Co ? w[co * Ci + ci] : 0.f; }
     __syncthreads();
@@ -42,6 +45,7 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
 #pragma unroll
     for (int co = 0; co < CO; co++) acc[co] = b && co < Co ? b[co] : 0.f;
     const uint8_t *sc = mx_sc<B>(x, N, Ci, S);
+    const float2 *sabv = sab + (gp.ns ? (gn_row_v(gp, n, v) - r0) * Ci : n * Ci);   /* (slab GroupNorm: this voxel's bank) */
     for (int blk = 0; blk < nb; blk++) {
         float r[32];
         mx_load_row_b<B>(x, sc, ((size_t)n * nb + blk) * S + v, bw, r);
@@ -50,7 +54,7 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
             const int ci = blk * bw + k;
             if (k >= bw || ci >= Ci) break;
             float xv = r[k];
-            if (gp.G) { const float2 ab = sab[n * Ci + ci]; xv = act_ab(xv, ab.x, ab.y, true); }
+            if (gp.G) { const float2 ab = sabv[ci]; xv = act_ab(xv, ab.x, ab.y, true); }
             float wv[CP];
 #pragma unroll
             for (int j = 0; j < C4; j++) { const float4 q = sw[C4 * ci + j]; wv[4 * j] = q.x; wv[4 * j + 1] = q.y; wv[4 * j + 2] = q.z; wv[4 * j + 3] = q.w; }
@@ -64,7 +68,15 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
         if constexpr (sizeof(YT) == 2) y[((size_t)n * Co + co) * Sy + vl] = __float2half(acc[co]); else y[((size_t)n * Co + co) * Sy + vl] = acc[co];
     }
 }
-static size_t conv1_smem(shape5 xs, int cout) { return (size_t)(2 * xs.n * xs.c + (cout <= 8 ? 8 : 16) * xs.c) * sizeof(float); }
+/* voxels per block of the head's weight-gradient kernels: at most one slab (slab GroupNorm: a block's voxels span <= 2 slabs, its
+   two coefficient banks) */
+static int slab_nper(const gnp_t &gp, int nper) {
+    if (!gp.ns || !gp.G) return nper;
+    const long long sv = (long long)gp.zs * gp.zhw;
+    return sv < nper ? (int)sv : nper;
+}
+static bool slab_small(const gnp_t &gp) { return gp.ns && gp.G && (long long)gp.zs * gp.zhw < 256; }   /* staged forward: >= 256 voxels per slab */
+static size_t conv1_smem(shape5 xs, int cout) { return (size_t)(2 * (xs.n > 2 ? xs.n : 2) * xs.c + (cout <= 8 ? 8 : 16) * xs.c) * sizeof(float); }   /* (>= 2 coefficient rows: slab banks) */
 template <int B, int CO, typename YT = float> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, YT *y, gnp_t gp, int cout, size_t vb = 0, size_t nv = 0) {
     const size_t S = shape_spatial(xs), sm = conv1_smem(xs, cout), Sy = nv ? nv : S;
     conv1_mx_t_k<B, CO, YT><<<dim3(nblk_(Sy, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp, cout, vb, Sy);
@@ -76,6 +88,7 @@ extern "C" void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const flo
 /* voxels [vb, vb + nv) of x (nv 0: all) into fp16 planes of nv voxels: the trainer's head slabs (train.c head_slab) */
 extern "C" void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, size_t vb, size_t nv) {
     if (cout > 16 || conv1_smem(xs, cout) > 32 * 1024) { fprintf(stderr, "lp_conv1_fwd_mx_h16: cout %d / %d inputs unsupported\n", cout, xs.c); abort(); }
+    if (slab_small(gp)) { fprintf(stderr, "lp_conv1_fwd_mx_h16: slab GroupNorm with %d voxels per slab (< 256)\n", gp.zs * gp.zhw); abort(); }
     __half *yh = (__half *)y;
 #define C1H(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, yh, gp, cout, vb, nv); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, yh, gp, cout, vb, nv); break; \
                                case 3: conv1_mx_t<B, 3>(x, xs, w, b, yh, gp, cout, vb, nv); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, yh, gp, cout, vb, nv); break; \
@@ -91,7 +104,7 @@ extern "C" void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *
     size_t S = shape_spatial(xs);
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
     if (cout > 8 && (old || conv1_smem(xs, cout) > 32 * 1024)) { fprintf(stderr, "lp_conv1_fwd_mx: %d outputs need the staged kernel\n", cout); abort(); }
-    if (!old && conv1_smem(xs, cout) <= 32 * 1024) {
+    if (!old && conv1_smem(xs, cout) <= 32 * 1024 && !slab_small(gp)) {
 #define C1T(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, y, gp, cout); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, y, gp, cout); break; \
                                case 3: conv1_mx_t<B, 3>(x, xs, w, b, y, gp, cout); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, y, gp, cout); break; \
                                case 5: conv1_mx_t<B, 5>(x, xs, w, b, y, gp, cout); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, y, gp, cout); break; \
@@ -116,7 +129,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx_k(const uint8_t *x, const 
         for (int blk = 0; blk < nb; blk++) {
             float r[32];
             mx_load_row_b<B>(x, sc, ((size_t)n * nb + blk) * S + v, bw, r);
-            row_gn(r, gp, n, blk, bw, Ci);
+            row_gn(r, gp, gn_row_v(gp, n, v), blk, bw, Ci);
             for (int k = 0; k < bw; k++) { int ci = blk * bw + k; if (ci < Ci) for (int co = 0; co < Co && co < 4; co++) acc[ci * Co + co] += r[k] * gv[co]; }
         }
     }
@@ -137,12 +150,13 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx_k(const uint8_t *x, const 
 template <int B, typename TG, int CO, int KM = 32>   /* outputs co0 .. co0 + CO - 1 of Co (heads wider than CO: one launch per CO outputs) */
 __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const TG *gy, float *gw, int N, int Ci, size_t S, gnp_t gp, int nper, int Co, int co0 = 0) {
     const int bw = mx_bw(Ci), n = blockIdx.y;
-    __shared__ float ca[32], cb[32], red[32 * CO];
-    if (threadIdx.x < 32) {
-        const int k = threadIdx.x;
+    __shared__ float ca[2][32], cb[2][32], red[32 * CO];   /* [bank]: slab GroupNorm, the block's first slab and the next (nper <= a slab) */
+    const int r0 = gp.ns ? gn_row_v(gp, n, min((size_t)blockIdx.x * nper, S - 1)) : 0;
+    if (threadIdx.x < 64) {
+        const int k = threadIdx.x & 31, bk = threadIdx.x >> 5;
         float a = 1.f, bb = 0.f;
-        if (gp.G && k < Ci) { const int ng = n * gp.G + k / (Ci / gp.G); a = gp.rstd[ng] * gp.gamma[k]; bb = gp.beta[k] - gp.mean[ng] * a; }
-        ca[k] = a; cb[k] = bb;
+        if (gp.G && k < Ci) { const float2 ab = gn_ab(gp, gp.ns ? min(r0 + bk, n * gp.ns + gp.ns - 1) : n, k, Ci); a = ab.x; bb = ab.y; }
+        ca[bk][k] = a; cb[bk][k] = bb;
     }
     if (threadIdx.x < 32 * CO) red[threadIdx.x] = 0.f;
     __syncthreads();
@@ -156,12 +170,14 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
     for (size_t v = v0 + threadIdx.x; v < v1; v += 256) {
         float r[32], g[CO];
         mx_load_row_b<B>(x, sc, (size_t)n * S + v, bw, r);
+        const int bk = gp.ns ? gn_row_v(gp, n, v) - r0 : 0;
+        const float *cav = ca[bk], *cbv = cb[bk];
 #pragma unroll
         for (int co = 0; co < CO; co++) g[co] = co0 + co < Co ? ldx(gy, ((size_t)n * Co + co0 + co) * S + v) : 0.f;
 #pragma unroll
         for (int k = 0; k < KM; k++) {
             if (k < Ci) {
-                const float xv = gp.G ? act_ab(r[k], ca[k], cb[k], true) : r[k];
+                const float xv = gp.G ? act_ab(r[k], cav[k], cbv[k], true) : r[k];
 #pragma unroll
                 for (int co = 0; co < CO; co++) acc[k][co] += xv * g[co];
             }
@@ -190,14 +206,15 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
 template <int B, int CI>   /* CI = 16 or 32 input channels (one MX block row, block blk of Ct): CI / 16 MMA row tiles per 16 voxels; outputs co0 .. co0 + 7 */
 __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const __half *gy, float *gw, float *gb, int N, size_t S, gnp_t gp, int nper, int Co, int co0, int Ct, int blk) {
     constexpr int MTI = CI / 16;
-    __shared__ float ca[CI], cb[CI], red[8][CI * 8 + 8];
+    __shared__ float ca[2][CI], cb[2][CI], red[8][CI * 8 + 8];   /* [bank]: slab GroupNorm, the block's first slab and the next */
     __shared__ __align__(16) __half sA[8][CI][40], sB[8][8][40];   /* [warp][ci][voxel], [warp][co][voxel] (32 voxels); rows padded */
     const int n = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if (threadIdx.x < CI) {
-        const int k = threadIdx.x, kc = blk * CI + k;
+    const int r0 = gp.ns ? gn_row_v(gp, n, min((size_t)blockIdx.x * nper, S - 1)) : 0;
+    if (threadIdx.x < 2 * CI) {
+        const int k = threadIdx.x % CI, bk = threadIdx.x / CI, kc = blk * CI + k;
         float a = 1.f, bb = 0.f;
-        if (gp.G) { const int ng = n * gp.G + kc / (Ct / gp.G); a = gp.rstd[ng] * gp.gamma[kc]; bb = gp.beta[kc] - gp.mean[ng] * a; }
-        ca[k] = a; cb[k] = bb;
+        if (gp.G) { const float2 ab = gn_ab(gp, gp.ns ? min(r0 + bk, n * gp.ns + gp.ns - 1) : n, kc, Ct); a = ab.x; bb = ab.y; }
+        ca[bk][k] = a; cb[bk][k] = bb;
     }
     __syncthreads();
     const uint8_t *sc = mx_sc<B>(x, N, Ct, S);
@@ -211,8 +228,10 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
         {
             float r[32];
             if (in) mx_load_row_b<B>(x, sc, ((size_t)n * (Ct / CI) + blk) * S + v, CI, r);
+            const int bk = gp.ns && in ? gn_row_v(gp, n, v) - r0 : 0;
+            const float *cav = ca[bk], *cbv = cb[bk];
 #pragma unroll
-            for (int k = 0; k < CI; k++) sA[warp][k][lane] = __float2half_rn(in ? (gp.G ? act_ab(r[k], ca[k], cb[k], true) : r[k]) : 0.f);
+            for (int k = 0; k < CI; k++) sA[warp][k][lane] = __float2half_rn(in ? (gp.G ? act_ab(r[k], cav[k], cbv[k], true) : r[k]) : 0.f);
 #pragma unroll
             for (int co = 0; co < 8; co++) {
                 const __half h = in && co0 + co < Co ? gy[((size_t)n * Co + co0 + co) * S + v] : __float2half_rn(0.f);
@@ -260,15 +279,16 @@ template <int B, int YB>
 __global__ void __launch_bounds__(256, 2) conv1_bwd_fused_k(const uint8_t *x, const __half *gy, const float *w, float *gw, float *gb, uint8_t *gx, int N, size_t S, gnp_t gp,
                                                       int nper, int Co, unsigned sr, size_t v00, size_t Sy) {   /* voxels [v00, v00 + Sy); gy planes of Sy voxels */
     constexpr int CI = 32;
-    __shared__ float ca[CI], cb[CI];
+    __shared__ float ca[2][CI], cb[2][CI];   /* [bank]: slab GroupNorm, the block's first slab and the next */
     __shared__ __align__(16) float sw[16][CI];                   /* w[co][ci] (rows >= Co zero) */
     __shared__ __align__(16) __half sA[8][CI][40], sB[8][16][40];   /* [warp][ci][voxel], [warp][co][voxel] */
     const int n = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if (threadIdx.x < CI) {
-        const int k = threadIdx.x;
+    const int r0 = gp.ns ? gn_row_v(gp, n, min(v00 + (size_t)blockIdx.x * nper, S - 1)) : 0;
+    if (threadIdx.x < 2 * CI) {
+        const int k = threadIdx.x % CI, bk = threadIdx.x / CI;
         float a = 1.f, bb = 0.f;
-        if (gp.G) { const int ng = n * gp.G + k / (CI / gp.G); a = gp.rstd[ng] * gp.gamma[k]; bb = gp.beta[k] - gp.mean[ng] * a; }
-        ca[k] = a; cb[k] = bb;
+        if (gp.G) { const float2 ab = gn_ab(gp, gp.ns ? min(r0 + bk, n * gp.ns + gp.ns - 1) : n, k, CI); a = ab.x; bb = ab.y; }
+        ca[bk][k] = a; cb[bk][k] = bb;
     }
     for (int i = threadIdx.x; i < 16 * CI; i += 256) sw[i / CI][i % CI] = i / CI < Co ? w[i] : 0.f;
     __syncthreads();
@@ -286,8 +306,10 @@ __global__ void __launch_bounds__(256, 2) conv1_bwd_fused_k(const uint8_t *x, co
         {
             float r[32], gv[16], o[32];
             if (in) mx_load_row_b<B>(x, sc, (size_t)n * S + v, CI, r);
+            const int bk = gp.ns && in ? gn_row_v(gp, n, v) - r0 : 0;
+            const float *cav = ca[bk], *cbv = cb[bk];
 #pragma unroll
-            for (int k = 0; k < CI; k++) sA[warp][k][lane] = __float2half_rn(in ? (gp.G ? act_ab(r[k], ca[k], cb[k], true) : r[k]) : 0.f);
+            for (int k = 0; k < CI; k++) sA[warp][k][lane] = __float2half_rn(in ? (gp.G ? act_ab(r[k], cav[k], cbv[k], true) : r[k]) : 0.f);
 #pragma unroll
             for (int co = 0; co < 16; co++) {
                 const __half h = in && co < Co ? gy[((size_t)n * Co + co) * Sy + (v - v00)] : __float2half_rn(0.f);
@@ -361,7 +383,7 @@ extern "C" int lp_head_bwd_mx_r(const void *x, int xdt, shape5 xs, const void *g
     static int on = -1; if (on < 0) on = getenv("UFSM_HEAD_FUSED") ? atoi(getenv("UFSM_HEAD_FUSED")) : 1;
     if (!on || xs.c != 32 || ys.c > 16 || gydt != 2 || (gxdt != 4 && gxdt != 8) || (xdt != 4 && xdt != 8) || (gp.G && 32 % gp.G)) return 0;
     const size_t S = shape_spatial(xs), Sy = nv ? nv : S;
-    const int nper = 8192;
+    const int nper = slab_nper(gp, 8192);
     const dim3 grid((unsigned)((Sy + nper - 1) / nper), xs.n);
 #define HBF(B, YB) conv1_bwd_fused_k<B, YB><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, w, gw, gb, (uint8_t *)gx, xs.n, S, gp, nper, ys.c, sr, vb, Sy)
     if (xdt == 4) { if (gxdt == 4) HBF(4, 4); else HBF(4, 8); }
@@ -375,7 +397,7 @@ extern "C" int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy,
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
     if (!old && (xs.c == 16 || xs.c % 32 == 0) && ys.c <= 16 && gydt == 2 && (!gp.G || xs.c % gp.G == 0)) {   /* > 32 inputs: one pass per 32-channel block */
         const size_t S = shape_spatial(xs);
-        const int nper = 8192;
+        const int nper = slab_nper(gp, 8192);
         const dim3 grid((unsigned)((S + nper - 1) / nper), xs.n);
         for (int co0 = 0; co0 < ys.c; co0 += 8)   /* 8 outputs per pass (one m16n8k16 column tile) */
             for (int blk = 0; blk < (xs.c == 16 ? 1 : xs.c / 32); blk++) {
@@ -394,7 +416,7 @@ extern "C" int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy,
 extern "C" void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp) {
     if (xs.c <= 32 && ys.c <= 16) {
         const size_t S = shape_spatial(xs);
-        const int nper = 8192, nbx = (int)((S + nper - 1) / nper);
+        const int nper = slab_nper(gp, 8192), nbx = (int)((S + nper - 1) / nper);
         const dim3 grid(nbx, xs.n);
         const uint8_t *xq = (const uint8_t *)x;
         int co0 = 0;
