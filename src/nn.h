@@ -223,6 +223,14 @@ int nn_gn_silu_bwd_head_ok(int C, int cout);
 int nn_gn_silu_bwd_head(float *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd, const void *gl, int cout,
                         const float *wh, unsigned hs, float *ggamma, float *gbeta, float *scratch);
 int nn_head_bwd_x_draws(void);
+/* level-0 normalisation alternatives (unet cfg.l0_norm, src/nn_l0norm.cu): while nn_set_gn_const is on, the GroupNorm backwards
+   (nn_gn_bwd, nn_gn_silu_bwd, nn_gn_silu_bwd_head) treat the statistics as constants (no mean / variance gradient terms);
+   nn_gn_const_fill writes constant statistics for N samples (run nullptr: mean 0, rstd 1; else run = [mean G | var G]);
+   nn_gn_ema_update moves run toward the batch's statistics (mean, rstd per sample; mom 1: replaced) */
+void nn_set_gn_const(int on);
+int nn_get_gn_const(void);
+void nn_gn_const_fill(float *mean, float *rstd, const float *run, int N, int G, float eps);
+void nn_gn_ema_update(float *run, const float *mean, const float *rstd, int N, int G, float mom, float eps);
 /* GroupNorm forward fused with SiLU (y = silu(gn(x))), and recompute of both g = gn(x) and silu(g). */
 int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *mean, float *rstd);   /* stats of the stored fp32, 16-bit or MX tensor; -1 for unsupported groups */
 void nn_gn_fwd_silu(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd);
