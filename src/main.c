@@ -1399,7 +1399,7 @@ static int cmd_wind_seed(int argc, char **argv) {
 }
 
 /* ufsm phase-fuse <out-group> <out-um> <root> <key> [<root> <key>]... [--tol 0.1] [--shard 512] [--threads 8] [--cache DIR]
-   (up to FUSE_MAX sets; per shard only those with data around it are read)
+   (up to FUSE_MAX sets; per shard only those with data around it are read; --box z,y,x,nz,ny,nx in output voxels: only the shards meeting it)
    ufsm recto-fuse <out-group> <out-um> <ct-root> <ct-key> <root> <key> [<root> <key>]... [--block 32] [--dup 3] [--shard 512] [--cache DIR]
    Several surface sets of one scroll, rasterised separately on one grid (src/fuse.h): phase-fuse writes the per-voxel circular mean
    where the sets agree within --tol turns, unknown (255) where they disagree; recto-fuse one recto line per --block, the set on the
@@ -1417,6 +1417,8 @@ static int cmd_fuse(int argc, char **argv) {
         n++;
     }
     if (!S) S = 512;
+    long long bx[6] = {0, 0, 0, 0, 0, 0};   /* --box z,y,x,nz,ny,nx (output grid voxels): only the shards meeting it */
+    if (*opt(argc, argv, "--box", "") && sscanf(opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", bx, bx + 1, bx + 2, bx + 3, bx + 4, bx + 5) != 6) { fprintf(stderr, "%s: --box z,y,x,nz,ny,nx\n", argv[1]); return 2; }
     z3 *ct = recto ? z3_open(store_open(argv[4]), argv[5], cache) : nullptr;
     if (!n || (recto && !ct) || !(um > 0) || S < 64 || block < 4 || dup < 0 || !(tol >= 0)) { fprintf(stderr, "%s: bad arguments or cannot open the CT\n", argv[1]); return 2; }
     const z3_meta *m0 = z3_meta_of(in[0]); int64_t shape[3] = {m0->shape[0], m0->shape[1], m0->shape[2]};
@@ -1436,6 +1438,7 @@ static int cmd_fuse(int argc, char **argv) {
     size_t st[4] = {0, 0, 0, 0}, hist[PHASE_PERIOD / 2 + 1] = {0}; int nsh = 0, maxact = 0, nct = 0;
     for (int64_t sz = 0; sz * S < shape[0]; sz++) for (int64_t sy = 0; sy * S < shape[1]; sy++) for (int64_t sx = 0; sx * S < shape[2]; sx++) {
         const int64_t o[3] = {sz * S - H, sy * S - H, sx * S - H}, nn[3] = {E, E, E};
+        if (bx[3] && ((sz + 1) * S <= bx[0] || sz * S >= bx[0] + bx[3] || (sy + 1) * S <= bx[1] || sy * S >= bx[1] + bx[4] || (sx + 1) * S <= bx[2] || sx * S >= bx[2] + bx[5])) continue;
         int na = 0;
         for (int k = 0; k < n; k++) {
             const z3_meta *mk = z3_meta_of(in[k]); int64_t lo[3], hi[3]; int present = 0;
