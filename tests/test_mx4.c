@@ -434,7 +434,32 @@ int main(void) {
         float *y6r = dev_zero(shape_numel(y16)); void *y6m = mx4_new(y16);
         mode_ref(); nn_conv3d_fwd(x6d, x16, w6, nullptr, 16, 3, 2, y6r);
         mode_mx(); nn_conv3d_fwd(x6m, x16, w6, nullptr, 16, 3, 2, y6m);
-        cmp("s2 fwd 16 ch (mx4 bw 16 -> mx4)", deq4(y6m, y16), y6r, shape_numel(y16), TOL4O);
+        cmp("s2 fwd 16 ch (mx4 bw 16 -> mx4, fp4 kernel, partial x tile)", deq4(y6m, y16), y6r, shape_numel(y16), TOL4);
+        {   /* down0 of a 16-wide net: the fp4 kernel (conv_fwd_s2_f4p_k) vs the fp8 one, plain and gn+silu input; odd output depth,
+               rows past a block's 8; 16 and 32 output channels */
+            for (int co = 16; co <= 32; co += 16) {
+                shape5 xb = {N, 16, 22, 40, 64}, yb = {N, co, 11, 20, 32};
+                const size_t nxb = shape_numel(xb), nyb = shape_numel(yb);
+                float *xx = dev_rand(nxb, 1.f), *ww = dev_rand((size_t)co * 16 * 27, 0.1f), *bb = dev_rand(co, 0.1f), *tb = dev_zero(nxb), *yr0 = dev_zero(nyb), *yr1 = dev_zero(nyb);
+                void *xxm = mx4_from(xx, xb); float *xxd = deq4(xxm, xb);
+                nn_gn_t g16 = {gam, bet, mean, rstd, G};
+                mode_ref(); nn_conv3d_fwd(xxd, xb, ww, bb, co, 3, 2, yr0);
+                nn_gn_silu_apply(xxd, xb, G, gam, bet, mean, rstd, tb); nn_conv3d_fwd(tb, xb, ww, bb, co, 3, 2, yr1);
+                for (int gn = 0; gn < 2; gn++) {
+                    double e[2];
+                    for (int f4 = 0; f4 < 2; f4++) {
+                        void *yy = mx4_new(yb); lp_set_s2_f4(f4);
+                        mode_mx(); nn_conv3d_fwd_x(xxm, gn ? &g16 : nullptr, nullptr, nullptr, 0, 0, xb, ww, bb, co, 3, 2, (float *)yy, 0, 0.f, nullptr, nullptr);
+                        char nm[96]; snprintf(nm, sizeof nm, "s2 fwd 16 ch -> %d%s, %s kernel", co, gn ? " gn+silu" : "", f4 ? "fp4" : "fp8");
+                        e[f4] = cmp(nm, deq4(yy, yb), gn ? yr1 : yr0, nyb, f4 ? TOL4 : TOL4O);
+                        nn_free(yy);
+                    }
+                    lp_set_s2_f4(-1);
+                    check("s2 fwd 16 ch fp4 kernel taken", e[1] != e[0]);
+                }
+                nn_free(xx); nn_free(ww); nn_free(bb); nn_free(tb); nn_free(yr0); nn_free(yr1); nn_free(xxm); nn_free(xxd);
+            }
+        }
         float *gy = dev_rand(ny, 1e-3f), *gw1 = dev_zero((size_t)32 * 32 * 27), *gw2 = dev_zero((size_t)32 * 32 * 27), *gb1 = dev_zero(32), *gb2 = dev_zero(32);
         mode_ref(); nn_conv3d_bwd_weight(xd, xs, gy, ys, 3, 2, gw1, gb1);
         mode_mx(); nn_conv3d_bwd_weight(xm, xs, gy, ys, 3, 2, gw2, gb2);
