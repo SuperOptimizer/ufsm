@@ -138,3 +138,57 @@ int wind_assign(const float *xyz, const uint8_t *valid, int w, int h, void (*axi
     free(pts); free(dist); free(qref); free(sidx); free(hist); free(phi); free(theta); free(comp); free(queue); free(csize);
     return 0;
 }
+
+int wind_seed(const float *xyz, const uint8_t *valid, int w, int h, void (*axis_fn)(void *, double, double *, double *), void *axis_ud,
+              double K, wind_seed_info *info, wind_result *out) {
+    memset(out, 0, sizeof *out); memset(info, 0, sizeof *info);
+    const size_t N = (size_t)w * h;
+    double *phi = malloc(N * sizeof *phi), *theta = malloc(N * sizeof *theta), *rad = malloc(N * sizeof *rad);
+    int32_t *comp = malloc(N * sizeof *comp), *queue = malloc(N * sizeof *queue);
+    out->q = malloc(N * sizeof *out->q); out->flag = calloc(N, 1);
+    if (!phi || !theta || !rad || !comp || !queue || !out->q || !out->flag) { free(phi); free(theta); free(rad); free(comp); free(queue); wind_result_free(out); return -1; }
+    for (size_t i = 0; i < N; i++) {
+        out->q[i] = NAN; comp[i] = -1;
+        if (!valid[i]) continue;
+        double cy, cx; axis_fn(axis_ud, xyz[i * 3 + 2], &cy, &cx);
+        theta[i] = atan2(xyz[i * 3 + 1] - cy, xyz[i * 3] - cx); rad[i] = hypot(xyz[i * 3 + 1] - cy, xyz[i * 3] - cx);
+    }
+    int nc = 0, best = -1; size_t bsize = 0;
+    for (size_t s = 0; s < N; s++) {   /* components and unwrapped phi, as wind_assign */
+        if (!valid[s] || comp[s] >= 0) continue;
+        size_t qh = 0, qt = 0, cs = 0; queue[qt++] = (int32_t)s; comp[s] = nc; phi[s] = theta[s] / (2 * M_PI);
+        while (qh < qt) {
+            const int32_t i = queue[qh++]; const int r = i / w, c = i % w; cs++;
+            const int nb[4][2] = {{r - 1, c}, {r + 1, c}, {r, c - 1}, {r, c + 1}};
+            for (int k = 0; k < 4; k++) {
+                const int rr = nb[k][0], cc = nb[k][1];
+                if (rr < 0 || rr >= h || cc < 0 || cc >= w) continue;
+                const size_t j = (size_t)rr * w + cc;
+                if (!valid[j] || comp[j] >= 0) continue;
+                double d = theta[j] - theta[i]; d -= 2 * M_PI * round(d / (2 * M_PI));
+                phi[j] = phi[i] + d / (2 * M_PI); comp[j] = nc; queue[qt++] = (int32_t)j;
+            }
+        }
+        if (cs > bsize) { bsize = cs; best = nc; }
+        nc++;
+    }
+    if (best < 0) { free(phi); free(theta); free(rad); free(comp); free(queue); return -2; }
+    int c0 = w, c1 = -1;
+    for (size_t i = 0; i < N; i++) if (comp[i] == best) { const int c = (int)(i % w); if (c < c0) c0 = c; if (c > c1) c1 = c; }
+    const int band = (c1 - c0) / 20 + 1;
+    double sr[2] = {0, 0}, sp[2] = {0, 0}; size_t sn[2] = {0, 0}, se[2] = {0, 0};   /* radius: 5% column bands; phi: the extreme columns */
+    for (size_t i = 0; i < N; i++) {
+        if (comp[i] != best) { if (valid[i]) out->flag[i] = 4; continue; }
+        const int c = (int)(i % w), e = c < c0 + band ? 0 : c > c1 - band ? 1 : -1;
+        if (e >= 0) { sr[e] += rad[i]; sn[e]++; }
+        if (c == c0) { sp[0] += phi[i]; se[0]++; } else if (c == c1) { sp[1] += phi[i]; se[1]++; }
+    }
+    for (int e = 0; e < 2; e++) { if (sn[e]) sr[e] /= (double)sn[e]; if (se[e]) sp[e] /= (double)se[e]; }
+    const int st = sr[0] <= sr[1] ? 0 : 1, en = 1 - st;   /* the start: the end nearer the umbilicus */
+    const int dir = sp[en] >= sp[st] ? 1 : -1;
+    for (size_t i = 0; i < N; i++) if (comp[i] == best) { out->q[i] = (float)(K + dir * (phi[i] - sp[st])); out->flag[i] = 1; info->nassigned++; }
+    for (size_t i = 0; i < N; i++) info->nvalid += valid[i] != 0;
+    info->dir = dir; info->r_start = sr[st]; info->r_end = sr[en]; info->span = dir * (sp[en] - sp[st]);
+    free(phi); free(theta); free(rad); free(comp); free(queue);
+    return 0;
+}

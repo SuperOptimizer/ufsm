@@ -105,6 +105,20 @@ int main(void) {
     surf all[5] = {A, B, C, D, E};
     for (int i = 0; i < 5; i++) { free(all[i].xyz); free(all[i].valid); free(all[i].qtrue); }
     free(ref);
+    {   /* wind_seed: one wrap q 5 .. 6 (columns reversed: the grid runs outer -> inner) -> K 5 at the inner end, q rising outward */
+        surf S = make(5.0, 6.0, 10, 50, 0, 0, 0);
+        const int w = S.w, h = S.h; float *xr = malloc((size_t)w * h * 3 * sizeof *xr); uint8_t *vr = malloc((size_t)w * h); double *qt = malloc((size_t)w * h * sizeof *qt);
+        for (int r = 0; r < h; r++) for (int c = 0; c < w; c++) { const size_t a = (size_t)r * w + c, b = (size_t)r * w + (w - 1 - c);
+            memcpy(xr + 3 * a, S.xyz + 3 * b, 3 * sizeof *xr); vr[a] = S.valid[b]; qt[a] = S.qtrue[b]; }
+        wind_result r; wind_seed_info in;
+        CHECK(!wind_seed(xr, vr, w, h, axis_fn, nullptr, 5.0, &in, &r), "wind_seed failed");
+        double emax = 0; size_t nq = 0;
+        for (size_t i = 0; i < (size_t)w * h; i++) if (vr[i] && !isnan(r.q[i])) { const double e = fabs(r.q[i] - qt[i]); if (e > emax) emax = e; nq++; }
+        CHECK(in.r_start < in.r_end && in.span > 0.9 && in.span < 1.1 && emax < 0.06 && nq > 0, "wind_seed: r %.0f -> %.0f, span %.2f, max |q - q_true| %.3f over %zu vertices",
+              in.r_start, in.r_end, in.span, emax, nq);
+        printf("wind-seed: one reversed wrap -> K at its inner end, span %.2f turn, max |q - q_true| %.3f\n", in.span, emax);
+        wind_result_free(&r); free(xr); free(vr); free(qt); free(S.xyz); free(S.valid); free(S.qtrue);
+    }
     printf("winding assignment: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

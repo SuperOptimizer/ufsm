@@ -4,6 +4,7 @@
 #include "band.h"
 #include "votes.h"
 #include "wind.h"
+#include "fuse.h"
 #include "edt.h"
 #include "store.h"
 #include "zarr3.h"
@@ -62,6 +63,9 @@ static int usage(void) {
         "  ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase|votes  one array halved per axis (labels, phase, side votes)\n"
         "  ufsm side-votes <out-group> <out-um> <root> <key> [<root> <key> ...]   several surface sets' side labels added into one vote array\n"
         "  ufsm wind-assign <ref-root> <ref-key> <out-dir> <tifxyz>...   other authors' surfaces get winding q in a reference raster's gauge\n"
+        "  ufsm wind-seed <out-dir> <tifxyz>... [--k K]   a surface set's own winding gauge (K from the wNNN name, dir from the inner end)\n"
+        "  ufsm phase-fuse <out-group> <out-um> <root> <key>...   surface sets' phases fused per voxel (circular mean within --tol, else unknown)\n"
+        "  ufsm recto-fuse <out-group> <out-um> <ct-root> <ct-key> <root> <key>...   one recto line per block (the brightest-CT set)\n"
         "  ufsm codes-merge <out-group> <out-um> <root> <key> ...   winding code rasters united (same wrap within 1/4 turn, else 255)\n"
         "  ufsm ct-hist <out.txt> <root> <key> z,y,x,n [...]  CT histograms of boxes (targets of train --aug-hist, the hist op)\n"
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
@@ -1266,6 +1270,119 @@ static int cmd_wind_assign(int argc, char **argv) {
     return rc;
 }
 
+/* ufsm wind-seed <out-dir> <tifxyz>... [--k K] [--axis JSON] [--axis-um U] [--vol-um 2.4] [--out-um U]
+   A surface set's own winding gauge (src/wind.h wind_seed), for the first set of a scroll (no reference raster): every tifxyz gets
+   q = K + dir (phi - phi_start) on its largest component, K from --k or the segment name in its path (-wNNN_ / -wrapNN / /wNNN),
+   written like wind-assign (<out-dir>/<name>: x / y / z (scaled to --out-um), q.tif) for `ufsm raster --value q.tif`; one line per
+   surface on stdout and in <out-dir>/seed.jsonl (dir, the start / end radii: the start must be the inner end, span in turns). */
+static int seed_k_from_path(const char *path, double *K) {
+    for (const char *p = path; *p; p++) {
+        if ((*p == '-' || *p == '_' || *p == '/') && p[1] == 'w') {
+            const char *d = p + 2; if (!strncmp(d, "rap", 3)) d += 3;
+            if (*d >= '0' && *d <= '9') { *K = atof(d); return 0; }
+        }
+    }
+    return -1;
+}
+static int cmd_wind_seed(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm wind-seed <out-dir> <tifxyz>... [--k K] [--axis JSON] [--axis-um U] [--vol-um 2.4] [--out-um U]\n"); return 2; }
+    const double vol_um = atof(opt(argc, argv, "--vol-um", "2.4")), axis_um = atof(opt(argc, argv, "--axis-um", opt(argc, argv, "--vol-um", "2.4")));
+    const double out_um = atof(opt(argc, argv, "--out-um", opt(argc, argv, "--vol-um", "2.4")));
+    if (!(vol_um > 0 && axis_um > 0 && out_um > 0)) { fprintf(stderr, "wind-seed: --vol-um / --axis-um / --out-um > 0\n"); return 2; }
+    wa_axis A = {.f = axis_um / vol_um};
+    if (axis_load(&A.ax, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "wind-seed: cannot load the axis\n"); return 1; }
+    char lp[1400]; snprintf(lp, sizeof lp, "%s/seed.jsonl", argv[2]);
+    if (mkdir(argv[2], 0755) && errno != EEXIST) { fprintf(stderr, "wind-seed: mkdir %s\n", argv[2]); return 1; }
+    FILE *log = fopen(lp, "a"); if (!log) { fprintf(stderr, "wind-seed: cannot write %s\n", lp); return 1; }
+    const char *kopt = opt(argc, argv, "--k", nullptr);
+    int rc = 0, nsurf = 0;
+    for (int a = 3; a < argc; a++) {
+        if (argv[a][0] == '-') { a++; continue; }
+        double K = 0;
+        if (kopt) K = atof(kopt);
+        else if (seed_k_from_path(argv[a], &K)) { fprintf(stderr, "wind-seed: %s: no wNNN / wrapNN in the path (give --k)\n", argv[a]); rc = 1; continue; }
+        int w = 0, h = 0; float *X = wa_read_f32(argv[a], "x.tif", &w, &h), *Y = X ? wa_read_f32(argv[a], "y.tif", &w, &h) : nullptr, *Z = Y ? wa_read_f32(argv[a], "z.tif", &w, &h) : nullptr;
+        if (!Z) { fprintf(stderr, "wind-seed: %s: x / y / z.tif must be matching float32 images\n", argv[a]); free(X); free(Y); rc = 1; continue; }
+        const size_t N = (size_t)w * h; float *xyz = malloc(N * 3 * sizeof *xyz); uint8_t *valid = malloc(N);
+        for (size_t i = 0; i < N; i++) {
+            xyz[3 * i] = X[i]; xyz[3 * i + 1] = Y[i]; xyz[3 * i + 2] = Z[i];
+            valid[i] = isfinite(X[i]) && isfinite(Y[i]) && isfinite(Z[i]) && Z[i] > 0 && X[i] >= 0;
+        }
+        wind_result r; wind_seed_info in;
+        const int e = wind_seed(xyz, valid, w, h, wa_axis_fn, &A, K, &in, &r);
+        if (e == -1) { fprintf(stderr, "wind-seed: out of memory\n"); return 1; }
+        const char *base = strrchr(argv[a], '/'); base = base && base[1] ? base + 1 : argv[a];
+        if (e == -2) { fprintf(stderr, "wind-seed: %s: no valid vertex\n", base); free(xyz); free(valid); free(X); free(Y); free(Z); continue; }
+        char od[1400], qp[1500]; snprintf(od, sizeof od, "%s/%s", argv[2], base);
+        const double f = vol_um / out_um;
+        if (f != 1.0) for (size_t i = 0; i < N; i++) if (valid[i]) { X[i] = (float)(X[i] * f); Y[i] = (float)(Y[i] * f); Z[i] = (float)(Z[i] * f); }
+        if (tifxyz_write(od, w, h, X, Y, Z, 1.0, out_um, -1, "ufsm wind-seed (x / y / z of the input; q.tif: the set's own winding gauge)")) { fprintf(stderr, "wind-seed: cannot write %s\n", od); rc = 1; }
+        snprintf(qp, sizeof qp, "%s/q.tif", od);
+        if (tiffw_write(qp, w, h, 3, r.q, 1)) { fprintf(stderr, "wind-seed: cannot write %s\n", qp); rc = 1; }
+        printf("%s K %g dir %+d span %.2f turns, r start %.0f end %.0f (scan voxels), %zu of %zu valid vertices assigned\n", base, K, in.dir, in.span, in.r_start, in.r_end, in.nassigned, in.nvalid);
+        fprintf(log, "{\"surface\":\"%s\",\"K\":%g,\"dir\":%d,\"span\":%.4f,\"r_start\":%.2f,\"r_end\":%.2f,\"assigned\":%zu,\"valid\":%zu}\n", base, K, in.dir, in.span, in.r_start, in.r_end, in.nassigned, in.nvalid);
+        wind_result_free(&r); free(xyz); free(valid); free(X); free(Y); free(Z); nsurf++;
+    }
+    fclose(log);
+    fprintf(stderr, "wind-seed: %d surfaces -> %s\n", nsurf, argv[2]);
+    return rc;
+}
+
+/* ufsm phase-fuse <out-group> <out-um> <root> <key> [<root> <key>]... [--tol 0.1] [--shard 512] [--threads 8] [--cache DIR]
+   ufsm recto-fuse <out-group> <out-um> <ct-root> <ct-key> <root> <key> [<root> <key>]... [--block 32] [--dup 3] [--shard 512] [--cache DIR]
+   Several surface sets of one scroll, rasterised separately on one grid (src/fuse.h): phase-fuse writes the per-voxel circular mean
+   where the sets agree within --tol turns, unknown (255) where they disagree; recto-fuse one recto line per --block, the set on the
+   brightest CT (ct on the same grid), plus other sets' voxels farther than --dup voxels from it (other sheets). */
+static int cmd_fuse(int argc, char **argv) {
+    const int recto = !strcmp(argv[1], "recto-fuse"), first = recto ? 6 : 4;
+    if (argc < first + 2) { fprintf(stderr, "usage: ufsm %s <out-group> <out-um> %s<root> <key> [<root> <key>]... %s\n", argv[1], recto ? "<ct-root> <ct-key> " : "", recto ? "[--block 32] [--dup 3]" : "[--tol 0.1]"); return 2; }
+    const int S = atoi(opt(argc, argv, "--shard", "512")), nt = atoi(opt(argc, argv, "--threads", "8")); const double um = atof(argv[3]);
+    const float tol = (float)atof(opt(argc, argv, "--tol", "0.1")); const int block = atoi(opt(argc, argv, "--block", "32")), dup = atoi(opt(argc, argv, "--dup", "3"));
+    const char *cache = opt(argc, argv, "--cache", nullptr);
+    z3 *in[16]; int n = 0;
+    for (int a = first; a + 1 < argc && n < 16; a += 2) {
+        if (argv[a][0] == '-') break;
+        in[n] = z3_open(store_open(argv[a]), argv[a + 1], cache); if (!in[n]) { fprintf(stderr, "%s: %s %s: %s\n", argv[1], argv[a], argv[a + 1], z3_error()); return 1; }
+        n++;
+    }
+    z3 *ct = recto ? z3_open(store_open(argv[4]), argv[5], cache) : nullptr;
+    if (!n || (recto && !ct) || !(um > 0) || S < 64 || block < 4 || dup < 0 || !(tol >= 0)) { fprintf(stderr, "%s: bad arguments or cannot open the CT\n", argv[1]); return 2; }
+    const z3_meta *m0 = z3_meta_of(in[0]); int64_t shape[3] = {m0->shape[0], m0->shape[1], m0->shape[2]};
+    for (int k = 1; k < n; k++) { const z3_meta *mk = z3_meta_of(in[k]); for (int d = 0; d < 3; d++) if (mk->shape[d] != shape[d]) { fprintf(stderr, "%s: input %d has another shape\n", argv[1], k); return 2; } }
+    if (recto) { const z3_meta *mc = z3_meta_of(ct); for (int d = 0; d < 3; d++) if (mc->shape[d] < shape[d]) shape[d] = mc->shape[d]; }
+    char lv[32], od[1400], at[600]; z3w_level_name(um, lv, sizeof lv); snprintf(od, sizeof od, "%s/%s", argv[2], lv);
+    snprintf(at, sizeof at, recto ? "{\"ufsm\":{\"content\":\"recto lines of %d surface sets, one per %d^3 block (the brightest-CT set; others only > %d voxels away)\",\"encoding\":\"binary\"}}"
+                                  : "{\"ufsm\":{\"content\":\"band field winding phase (src/band.h PHASE_*) of %d surface sets: circular mean where they agree within %g turn, else 255\"}}", n, recto ? (double)block : (double)tol, dup);
+    if (!recto) snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"band field winding phase (src/band.h PHASE_*: 0..251, 255 unknown) of %d surface sets: circular mean where they agree within %g turn, else 255\"}}", n, (double)tol);
+    z3w *w = recto ? z3w_create_mask(od, shape, S, at) : z3w_create(od, shape, S, 0, PHASE_UNKNOWN, at);
+    if (!w || z3w_write_group(argv[2], &um, 1, recto ? "ufsm-recto-fuse" : "ufsm-phase-fuse", nullptr)) { fprintf(stderr, "%s: %s\n", argv[1], z3w_error()); return 1; }
+    const int H = recto ? dup : 0; const int64_t E = S + 2 * H; const size_t L = (size_t)E * E * E;
+    uint8_t *buf[16], *cb = recto ? malloc(L) : nullptr, *ob = malloc(L), *sh = malloc((size_t)S * S * S);
+    for (int k = 0; k < n; k++) buf[k] = malloc(L);
+    size_t st[4] = {0, 0, 0, 0}; int nsh = 0;
+    for (int64_t sz = 0; sz * S < shape[0]; sz++) for (int64_t sy = 0; sy * S < shape[1]; sy++) for (int64_t sx = 0; sx * S < shape[2]; sx++) {
+        int present = 0;
+        for (int k = 0; k < n && !present; k++) { const z3_meta *mk = z3_meta_of(in[k]);
+            for (int64_t a = sz * S / mk->shard[0]; a <= ((sz + 1) * S - 1) / mk->shard[0] && !present; a++)
+            for (int64_t b = sy * S / mk->shard[1]; b <= ((sy + 1) * S - 1) / mk->shard[1] && !present; b++)
+            for (int64_t c = sx * S / mk->shard[2]; c <= ((sx + 1) * S - 1) / mk->shard[2] && !present; c++) present = z3_shard_present(in[k], a, b, c) != 0; }
+        if (!present) continue;
+        const int64_t o[3] = {sz * S - H, sy * S - H, sx * S - H}, nn[3] = {E, E, E};
+        for (int k = 0; k < n; k++) if (z3_read(in[k], o, nn, buf[k], nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3_error()); return 1; }
+        if (recto) { if (z3_read(ct, o, nn, cb, nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3_error()); return 1; }
+                     fuse_recto((const uint8_t *const *)buf, n, cb, E, E, E, block, dup, ob, st); }
+        else fuse_phase((const uint8_t *const *)buf, n, L, tol, ob, st);
+        for (int64_t z = 0; z < S; z++) for (int64_t y = 0; y < S; y++) memcpy(sh + ((size_t)z * S + y) * S, ob + ((size_t)(z + H) * E + y + H) * E + H, (size_t)S);
+        if (z3w_write_shard(w, sz, sy, sx, sh, nt)) { fprintf(stderr, "%s: %s\n", argv[1], z3w_error()); return 1; }
+        nsh++;
+    }
+    z3w_close(w);
+    if (recto) fprintf(stderr, "recto-fuse: %d shards -> %s; primary voxels %zu, other-sheet voxels added %zu, duplicate voxels dropped %zu (halo voxels counted too)\n", nsh, od, st[0], st[1], st[2]);
+    else fprintf(stderr, "phase-fuse: %d shards -> %s; voxels from one set %zu, fused %zu, conflicts (unknown) %zu\n", nsh, od, st[0], st[1], st[2]);
+    for (int k = 0; k < n; k++) { free(buf[k]); z3_close(in[k]); } free(cb); free(ob); free(sh); if (ct) z3_close(ct);
+    return 0;
+}
+
 /* ufsm wrapdist <wraps-dir> <labels-root> <labels-key> [--max 32] [--chunk 128] [--threads 16] [--per-wrap]
    How far the wraps' vertices (every <wraps-dir>/wNNN tifxyz) lie from the nearest labelled sheet voxel (label value != 0) of
    a label array whose key is its voxel size in um (e.g. 4.8; the wraps' voxel_size_um from meta.json scales the vertices onto
@@ -2326,6 +2443,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
     if (!strcmp(cmd, "side-votes") || !strcmp(cmd, "codes-merge")) return cmd_side_votes(argc, argv);
     if (!strcmp(cmd, "wind-assign")) return cmd_wind_assign(argc, argv);
+    if (!strcmp(cmd, "wind-seed")) return cmd_wind_seed(argc, argv);
+    if (!strcmp(cmd, "phase-fuse") || !strcmp(cmd, "recto-fuse")) return cmd_fuse(argc, argv);
     if (!strcmp(cmd, "ct-hist")) return cmd_ct_hist(argc, argv);
     if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);
     if (!strcmp(cmd, "wrapswitch")) return cmd_wrapswitch(argc, argv);

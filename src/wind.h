@@ -56,6 +56,16 @@ int wind_assign(const float *xyz, const uint8_t *valid, int w, int h, void (*axi
                 wind_lookup_fn lookup, void *lookup_ud, wind_params p, wind_result *out);
 void wind_result_free(wind_result *r);
 
+/* A surface set's own gauge, without a reference (the first set of a scroll): the largest connected component gets
+   q = K + dir (phi - phi_start), phi = theta / 2 pi unwrapped along the mesh grid as in wind_assign. The start is the end of the
+   grid (first or last 5% of its columns) nearer the umbilicus (the authors' unrollings run along columns: a single-wrap segment
+   wNNN covers one turn from its seam, a merged spiral starts at its innermost wrap), dir the sign that makes q grow away from it.
+   Other components: unassigned (flag 4, NaN). info: r_start / r_end (mean radius of the two column bands, scan voxels), span
+   (q_end - q_start, turns), dir. Returns 0, -1 out of memory, -2 no valid vertex. */
+typedef struct { int dir; double r_start, r_end, span; size_t nvalid, nassigned; } wind_seed_info;
+int wind_seed(const float *xyz, const uint8_t *valid, int w, int h, void (*axis_fn)(void *, double, double *, double *), void *axis_ud,
+              double K, wind_seed_info *info, wind_result *out);
+
 /* code -> q_ref (turns mod 14), NaN without a winding */
 static inline float wind_code_q(uint8_t c, int kind) {
     if (kind == WIND_CODES) return c >= 1 && c <= 252 ? (float)(c - 1) / 18.f : __builtin_nanf("");
