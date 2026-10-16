@@ -207,6 +207,14 @@ extern "C" void nn_h2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n
 extern "C" void nn_d2h(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToHost)); }
 extern "C" void nn_d2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToDevice)); }
 extern "C" void nn_d2d_async(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToDevice, 0)); }   /* ordered with the kernels */
+__global__ void d2d_u4_k(uint4 *__restrict__ d, const uint4 *__restrict__ s, size_t n) {
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) d[i] = s[i];
+}
+extern "C" void nn_d2d_kernel(void *d, const void *s, size_t n) {   /* a kernel on the compute stream: no copy engine taken from the host copies */
+    const size_t n16 = n / 16, nb = (n16 + 255) / 256;
+    if (n16) d2d_u4_k<<<(unsigned)(nb < 4096 ? nb : 4096), 256>>>((uint4 *)d, (const uint4 *)s, n16);
+    if (n % 16) CK(cudaMemcpyAsync((char *)d + n16 * 16, (const char *)s + n16 * 16, n % 16, cudaMemcpyDeviceToDevice, 0));
+}
 extern "C" void nn_sync(void) { CK(cudaDeviceSynchronize()); }
 extern "C" void *nn_host_alloc(size_t n) { void *p = nullptr; CK(cudaMallocHost(&p, n)); return p; }
 extern "C" void *nn_host_alloc_try(size_t n) { void *p = nullptr; if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }

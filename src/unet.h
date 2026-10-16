@@ -148,6 +148,8 @@ void unet_set_l0_3buf_split(int on);     /* dec[0]'s conv1 weight gradient in an
 void unet_set_l0_3buf_reorder(int on);   /* enc[0]'s conv2 backward-data before its weight gradient (UFSM_L0_3BUF_REORDER, default 1) */
 void unet_set_l3_sched(int on);          /* the host copies in the order they are due, the coarse encoders' conv1 re-run (UFSM_L3_SCHED, default 1;
                                             takes effect at the next build) */
+void unet_set_l3_skip_d2d(int on);      /* (l3_sched) the skip left in X2 copied into X3 on the device for down0's weight gradient (UFSM_L3_SKIP_D2D,
+                                            default 1; -1 the env / default) */
 void *unet_batch_scratch2(unet *u, size_t head, size_t tail, void **tailp);
 void unet_set_batch_bytes(unet *u, size_t head, size_t tail);
 int unet_l0_3buf(const unet *u);
