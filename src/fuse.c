@@ -58,6 +58,22 @@ void fuse_recto(const uint8_t *const *in, int n, const uint8_t *ct, int64_t d0, 
             if (z >= 0 && z < b0 && y >= 0 && y < b1 && x >= 0 && x < b2) v |= bs[((size_t)z * b1 + y) * b2 + x];
         bd[((size_t)bz * b1 + by) * b2 + bx] = v;
     }
+    /* the dup^3 offsets nearest first (both scans below stop at their first hit); per block and set: can any other set's block in
+       reach beat it (higher score, or equal and a lower index)? an unbeatable voxel only looks for the nearest other trace (stats) */
+    const int W = 2 * dup + 1, no = W * W * W; int (*off)[3] = malloc((size_t)no * sizeof *off);
+    uint64_t *beat = calloc(nb, sizeof *beat);   /* bit k: set k can be beaten in this block */
+    if (!off || !beat) { free(off); free(beat); free(sum); free(cnt); free(score); free(bs); free(bd); return; }
+    { int m = 0; for (int r2 = 0; r2 <= 3 * dup * dup; r2++) for (int z = -dup; z <= dup; z++) for (int y = -dup; y <= dup; y++) for (int x = -dup; x <= dup; x++)
+          if (z * z + y * y + x * x == r2) { off[m][0] = z; off[m][1] = y; off[m][2] = x; m++; } }
+    for (int64_t bz = 0; bz < b0; bz++) for (int64_t by = 0; by < b1; by++) for (int64_t bx = 0; bx < b2; bx++) {
+        const size_t b = ((size_t)bz * b1 + by) * b2 + bx; if (!bs[b] || !(bd[b] & (bd[b] - 1))) continue;
+        for (int k = 0; k < nn; k++) { if (!(bs[b] >> k & 1)) continue; const float sk = score[b * nn + k]; int can = 0;
+            for (int64_t z = bz - R; z <= bz + R && !can; z++) for (int64_t y = by - R; y <= by + R && !can; y++) for (int64_t x = bx - R; x <= bx + R && !can; x++) {
+                if (z < 0 || z >= b0 || y < 0 || y >= b1 || x < 0 || x >= b2) continue;
+                const size_t bj = ((size_t)z * b1 + y) * b2 + x;
+                for (int o = 0; o < nn && !can; o++) { if (o == k || !(bs[bj] >> o & 1)) continue; const float so = score[bj * nn + o]; can = so > sk || (so == sk && o < k); } }
+            if (can) beat[b] |= 1ull << k; }
+    }
     for (int64_t bz = 0; bz < b0; bz++) for (int64_t by = 0; by < b1; by++) for (int64_t bx = 0; bx < b2; bx++) {
         const size_t b = ((size_t)bz * b1 + by) * b2 + bx; if (!bs[b]) continue;
         const int64_t z1 = (bz + 1) * block < d0 ? (bz + 1) * block : d0, y1 = (by + 1) * block < d1 ? (by + 1) * block : d1, x1 = (bx + 1) * block < d2 ? (bx + 1) * block : d2;
@@ -66,18 +82,20 @@ void fuse_recto(const uint8_t *const *in, int n, const uint8_t *ct, int64_t d0, 
             for (int k = 0; k < nn; k++) {
                 if (!(bs[b] >> k & 1) || !in[k][i]) continue;
                 if (!(bd[b] & ~(1ull << k))) { if (!out[i]) { out[i] = 255; st[1]++; } continue; }   /* no other set near */
-                const float sk = score[b * nn + k]; int beaten = 0, had_other = 0;
-                for (int64_t zz = z - dup; zz <= z + dup && !beaten; zz++) { if (zz < 0 || zz >= d0) continue;
-                    for (int64_t yy = y - dup; yy <= y + dup && !beaten; yy++) { if (yy < 0 || yy >= d1) continue;
-                        for (int64_t xx = x - dup; xx <= x + dup && !beaten; xx++) { if (xx < 0 || xx >= d2) continue;
-                            const size_t j = ((size_t)zz * d1 + yy) * d2 + xx, bj = ((size_t)(zz / block) * b1 + yy / block) * b2 + xx / block;
-                            for (int o = 0; o < nn; o++) { if (o == k || !in[o][j]) continue; had_other = 1;
-                                const float so = score[bj * nn + o]; if (so > sk || (so == sk && o < k)) { beaten = 1; break; } } } } }
+                const float sk = score[b * nn + k]; const int beatable = (int)(beat[b] >> k & 1); int beaten = 0, had_other = 0;
+                for (int t = 0; t < no && !beaten && !(had_other && !beatable); t++) {
+                    const int64_t zz = z + off[t][0], yy = y + off[t][1], xx = x + off[t][2];
+                    if (zz < 0 || zz >= d0 || yy < 0 || yy >= d1 || xx < 0 || xx >= d2) continue;
+                    const size_t j = ((size_t)zz * d1 + yy) * d2 + xx, bj = ((size_t)(zz / block) * b1 + yy / block) * b2 + xx / block;
+                    for (int o = 0; o < nn; o++) { if (o == k || !in[o][j]) continue; had_other = 1; if (!beatable) break;
+                        const float so = score[bj * nn + o]; if (so > sk || (so == sk && o < k)) { beaten = 1; break; } }
+                }
                 if (beaten) { st[2]++; continue; }
                 if (!out[i]) { out[i] = 255; st[had_other ? 0 : 1]++; }
             }
         }
     }
+    free(off); free(beat);
     free(sum); free(cnt); free(score); free(bs); free(bd);
     if (stats) for (int k = 0; k < 3; k++) stats[k] += st[k];
 }
