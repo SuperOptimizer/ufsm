@@ -41,6 +41,34 @@ sample_cfg sample_cfg_default(void) {
     return c;
 }
 
+/* train --aug presets (sample.h). "all": every op at a moderate probability (nnU-Net-like p 0.05 .. 0.3 each, about 1 window in 20
+   untouched by the scanner ops, 2 in 5 unwarped), magnitudes at strength 1 (DESIGN.md "Generalising to other scrolls" used the same
+   ops at up to 1.5 for blur); dropped slices / cutouts keep their labels (drop_ignore 0: the net infers occluded papyrus from context);
+   the hist op needs target histograms (train --aug-hist FILE). pscale multiplies every op probability of the preset. */
+int sample_aug_preset(sample_cfg *c, const char *name) {
+    if (!strcmp(name, "none")) {
+        c->ct_augment = 0; c->geometry_augment = 0; c->zoom_p = c->zoom_out_p = 0; c->affine_p = 0; c->axis_jitter = 0;
+        c->axis_jitter_p = c->axis_jitter_deg = 0; memset(c->scan.p, 0, sizeof c->scan.p); c->scan.strength = 1; c->scan.drop_ignore = 1;
+        c->rotate_degrees = 5; c->rotate_p = .2f; c->elastic = 1; c->elastic_p = .15f; c->zoom_min = .7071f; c->zoom_max = 1;
+        c->affine_aniso = .1f; c->affine_shear = .06f;
+        return 0;
+    }
+    if (strcmp(name, "all")) return -1;
+    c->ct_augment = 0;   /* (its gamma / filter / shading / correlated noise are scanner ops here) */
+    c->geometry_augment = 1; c->rotate_degrees = 10; c->rotate_p = .25f; c->elastic = 1; c->elastic_p = .15f;
+    c->zoom_min = .8f; c->zoom_p = .2f; c->zoom_max = 1.25f; c->zoom_out_p = .15f;
+    c->affine_p = .1f; c->affine_aniso = .1f; c->affine_shear = .06f;
+    c->axis_jitter = 800; c->axis_jitter_p = .1f; c->axis_jitter_deg = 2;   /* native voxels (~2 mm at 2.4 um): an estimated umbilicus */
+    c->scan.strength = 1; c->scan.drop_ignore = 0;
+    static const struct { int op; float p; } P_ALL[] = {
+        {SA_SEAM, .05f}, {SA_AIR, .05f}, {SA_LOWRES, .25f}, {SA_BLUR, .3f}, {SA_SHARPEN, .05f}, {SA_BIAS, .15f}, {SA_RING, .1f},
+        {SA_CUPPING, .1f}, {SA_SLICE, .1f}, {SA_NOISE, .15f}, {SA_CNOISE, .1f}, {SA_TONE, .25f}, {SA_QUANT, .1f}, {SA_DROPSLICE, .05f},
+        {SA_CUTOUT, .1f}, {SA_CHUNK, .05f}, {SA_PAGANIN, .15f}, {SA_GIN, .1f}, {SA_MOTION, .1f}};
+    memset(c->scan.p, 0, sizeof c->scan.p);
+    for (size_t i = 0; i < sizeof P_ALL / sizeof P_ALL[0]; i++) c->scan.p[P_ALL[i].op] = P_ALL[i].p;
+    return 0;
+}
+
 void pool2_u8(const uint8_t *in, int n, uint8_t *out) {
     int h = n / 2;
     for (int z = 0; z < h; z++)
@@ -153,32 +181,36 @@ struct sampler {
 static int PZ(const sample_cfg *c) { return c->Pz > 0 ? c->Pz : c->P; }   /* window depth (z) */
 static size_t P3(const sampler *sp) { return (size_t)PZ(&sp->cfg) * sp->cfg.P * sp->cfg.P; }
 
+/* batch buffers: pinned (the trainer uploads asynchronously), or plain malloc with UFSM_SAMPLER_NOPIN=1 (CPU-only benchmarks) */
+static int nopin(void) { static int v = -1; if (v < 0) { const char *e = getenv("UFSM_SAMPLER_NOPIN"); v = e && atoi(e); } return v; }
+static void *halloc(size_t n) { if (nopin()) { void *p = malloc(n ? n : 1); if (!p) abort(); return p; } return nn_host_alloc(n); }
+static void hfree(void *p) { if (nopin()) free(p); else nn_host_free(p); }
 static batch alloc_batch(const sample_cfg *c) {
     size_t p3 = (size_t)PZ(c) * c->P * c->P;
     batch b;
     const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0) + (c->cond ? 3 : 0);   /* input channels per sample (--gpu-input: the CT alone) */
     b.xch = (int)xc;
-    b.rad = c->gpu_input ? nn_host_alloc((size_t)c->B * NN_RAD_REC(PZ(c))) : nullptr;
-    b.x = c->xfmt ? nullptr : nn_host_alloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
-    b.x16 = c->xfmt ? nn_host_alloc((size_t)c->B * xc * p3 * 2) : nullptr;
-    b.t = c->pack_tm ? nullptr : nn_host_alloc((size_t)c->B * NCH * p3);
-    b.m = c->pack_tm ? nullptr : nn_host_alloc((size_t)c->B * p3);
-    b.tm = c->pack_tm ? nn_host_alloc((size_t)c->B * p3) : nullptr;   /* one code byte per voxel instead of NCH + 1 */
-    b.w = nn_host_alloc((size_t)c->B * NCH);
+    b.rad = c->gpu_input ? halloc((size_t)c->B * NN_RAD_REC(PZ(c))) : nullptr;
+    b.x = c->xfmt ? nullptr : halloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
+    b.x16 = c->xfmt ? halloc((size_t)c->B * xc * p3 * 2) : nullptr;
+    b.t = c->pack_tm ? nullptr : halloc((size_t)c->B * NCH * p3);
+    b.m = c->pack_tm ? nullptr : halloc((size_t)c->B * p3);
+    b.tm = c->pack_tm ? halloc((size_t)c->B * p3) : nullptr;   /* one code byte per voxel instead of NCH + 1 */
+    b.w = halloc((size_t)c->B * NCH);
     b.src = malloc((size_t)c->B * sizeof(int16_t));
     b.level = malloc((size_t)c->B * sizeof(int8_t));
     b.um = malloc((size_t)c->B * sizeof(float));
     b.corner = malloc((size_t)c->B * sizeof *b.corner);
     b.sheet = calloc((size_t)c->B, sizeof *b.sheet);
-    b.band = c->band ? nn_host_alloc((size_t)c->B * p3) : nullptr;
-    b.side = c->side ? nn_host_alloc((size_t)c->B * p3) : nullptr;
-    b.pm = c->pmask ? nn_host_alloc((size_t)c->B * p3) : nullptr;
-    b.wind = c->cond ? nn_host_alloc((size_t)c->B * p3) : nullptr;
-    b.pap = c->pap_head ? nn_host_alloc((size_t)c->B * p3) : nullptr;
+    b.band = c->band ? halloc((size_t)c->B * p3) : nullptr;
+    b.side = c->side ? halloc((size_t)c->B * p3) : nullptr;
+    b.pm = c->pmask ? halloc((size_t)c->B * p3) : nullptr;
+    b.wind = c->cond ? halloc((size_t)c->B * p3) : nullptr;
+    b.pap = c->pap_head ? halloc((size_t)c->B * p3) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b) { if (b->tm) nn_host_free(b->tm); if (b->rad) nn_host_free(b->rad); if (b->pap) nn_host_free(b->pap); if (b->wind) nn_host_free(b->wind); if (b->band) nn_host_free(b->band); if (b->side) nn_host_free(b->side); if (b->pm) nn_host_free(b->pm); if (b->x) nn_host_free(b->x); if (b->x16) nn_host_free(b->x16); if (b->t) nn_host_free(b->t); if (b->m) nn_host_free(b->m); nn_host_free(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -553,16 +585,26 @@ static void write_x(const uint8_t *ctu, int D, int P, const int64_t o[3], float 
     free(a);
 }
 /* --gpu-input: the radial record of a write_x window (nn.h NN_RAD_REC: header, then the axis centre per source z) */
-static void rad_record(void *rec, const int64_t o[3], int D, int P, int hasax, sym y, const float *cyz, const float *cxz) {
+static void rad_record(void *rec, const int64_t o[3], int D, int P, int hasax, sym y, const float *cyz, const float *cxz, const spatial_aug *a) {
+    const int warped = a && a->active;   /* write_spatial windows (cubes): the warp follows the axis centres (nn.h NN_RAD_REC) */
     int32_t h[8] = {(int32_t)o[1], (int32_t)o[2], D, P, hasax != 0,
-                    y.perm[0] | y.perm[1] << 2 | y.perm[2] << 4 | (y.flip[0] != 0) << 8 | (y.flip[1] != 0) << 9 | (y.flip[2] != 0) << 10, 0, 0};
+                    y.perm[0] | y.perm[1] << 2 | y.perm[2] << 4 | (y.flip[0] != 0) << 8 | (y.flip[1] != 0) << 9 | (y.flip[2] != 0) << 10,
+                    warped ? 1 | (a->affine != 0) << 1 : 0, 0};
+    memset(rec, 0, NN_RAD_REC(D));   /* (unused words zero: records hash and upload deterministically) */
     memcpy(rec, h, sizeof h);
     memcpy((char *)rec + sizeof h, cyz, (size_t)D * sizeof *cyz);
     memcpy((char *)rec + sizeof h + (size_t)D * sizeof *cyz, cxz, (size_t)D * sizeof *cxz);
+    if (!warped) return;
+    if (D != P || a->P != P) { fprintf(stderr, "sampler: warped --gpu-input windows are cubes\n"); abort(); }
+    float *w = (float *)((char *)rec + sizeof h + 2 * (size_t)D * sizeof *cyz);
+    spatial_aug_tables(a, w); w += 6 * (size_t)P;
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { w[3 * i + j] = (float)a->R[i][j]; w[9 + 3 * i + j] = (float)a->A[i][j]; w[18 + 3 * i + j] = (float)a->Ainv[i][j]; }
+    w[27] = (float)a->scale;
 }
 int sample_gpu_input_ok(const sample_cfg *c) {
     const int Pz = c->Pz > 0 ? c->Pz : c->P;
-    return c->xfmt != 0 && !c->aux && !c->cond && !c->sheet && !(c->augment && c->geometry_augment) && !(c->augment && c->ct_augment && Pz != c->P);
+    return c->xfmt != 0 && !c->aux && !c->cond && !c->sheet && !(c->augment && c->ct_augment && Pz != c->P);   /* warps: the CT channel of
+                                                                                   write_spatial, the transported radial vector on the device */
 }
 void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], float mean, float isd, int hasax, const float *cyz,
                          const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed, uint16_t *H4, uint16_t *H1, void *rec) {
@@ -571,19 +613,26 @@ void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], f
     rng r;
     rseed(&r, seed); write_x(ctu, D, P, o, mean, isd, hasax, cyz, cxz, y, 1, 1.1f, 0.05f, 0.02f, &r, nrow, xfmt, nullptr, H4, nullptr, nullptr, nullptr, 0);
     rseed(&r, seed); write_x(ctu, D, P, o, mean, isd, hasax, cyz, cxz, y, 1, 1.1f, 0.05f, 0.02f, &r, nrow, xfmt, nullptr, H1, nullptr, nullptr, nullptr, 1);
-    rad_record(rec, o, D, P, hasax, y, cyz, cxz);
+    rad_record(rec, o, D, P, hasax, y, cyz, cxz, nullptr);
     free(nrow);
 }
+int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint8_t *mask, int P, const int64_t o[3], float mean, float isd,
+                              int hasax, const float *cyz, const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed,
+                              uint64_t aug_seed, float zoom, int affine, int hard, uint16_t *H4, uint16_t *H1, void *rec, uint8_t *T, uint8_t *M);
 /* Continuous geometry uses source coordinates for CT, labels, q0 and the axis.
    Only valid source voxels are supervised: rotated cube corners are ignored.
    The four input channels stay unchanged; a winding task uses q0 and the two
-   Y/X projections of the transported radial vector. */
+   Y/X projections of the transported radial vector. hard: every target takes
+   the code of the nearest source voxel (the trilinear corner of largest
+   weight; hard classes such as the side encoding stay 0 / 255, packable).
+   ct_only (--gpu-input): channel 0 alone into H (1 channel per sample), the
+   same rng draws; the radial vector follows on the device (rad_record). */
 static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t *mask,
                          uint8_t *T,uint8_t *M,int P,const int64_t o[3],float mean,float isd,
                          int hasax,const float *cy,const float *cx,sym sy,const spatial_aug *a,
                          float gain,float offset,float noise,rng *r,float *nrow,int xfmt,float *X,uint16_t *H,
                          const ct_aug_plan *ap,float *noise_row,float *noise_plane,
-                         const sheet_dataset *sheet,const double (*params)[4],float *appearance) {
+                         const sheet_dataset *sheet,const double (*params)[4],float *appearance,int hard,int ct_only) {
     pthread_once(&g_ntab_once,ntab_init);
     size_t p3=(size_t)P*P*P; float *table=malloc(6*(size_t)P*sizeof *table);
     if (!table) abort();
@@ -608,7 +657,7 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
             if (inside) {
                 int base[3]; float f[3];
                 for (int d=0;d<3;d++) { base[d]=(int)v[d]; if (base[d]>=P-1) base[d]=P-2; f[d]=v[d]-base[d]; }
-                float tv[NCH]={0},cv=0; int valid=1;
+                float tv[NCH]={0},cv=0,bw=-1; int valid=1; size_t bj=0;
                 for (int bz=0;bz<2;bz++) for (int by=0;by<2;by++) for (int bx=0;bx<2;bx++) {
                     float weight=(bz?f[0]:1-f[0])*(by?f[1]:1-f[1])*(bx?f[2]:1-f[2]);
                     if (weight<=1e-7f) continue;
@@ -616,11 +665,14 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                     valid &= mask[j]!=0;
                     float val=ap && ap->filter_mode?appearance[j]:ap?ap->lut[ctu[j]]:((float)ctu[j]-mean)*isd;
                     cv+=weight*val;
-                    for (int ch=0;ch<NCH;ch++) tv[ch]+=weight*target[(size_t)ch*p3+j];
+                    if (hard) { if (weight>bw) { bw=weight; bj=j; } }
+                    else for (int ch=0;ch<NCH;ch++) tv[ch]+=weight*target[(size_t)ch*p3+j];
                 }
                 if (ap && !ap->filter_mode && P>1) for (int d=0;d<3;d++) cv+=ap->shading[d]*(2*v[d]/(P-1)-1);
                 out[0]=gain*cv+offset+noise*nrow[x]; M[k]=(uint8_t)valid;
-                for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=(uint8_t)lroundf(tv[ch]);
+                if (hard) for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=target[(size_t)ch*p3+bj];
+                else for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=(uint8_t)lroundf(tv[ch]);
+                if (!ct_only) {
                 float frac=f[0],ayy=cy[base[0]]*(1-frac)+cy[base[0]+1]*frac;
                 float axx=cx[base[0]]*(1-frac)+cx[base[0]+1]*frac;
                 float dy=(float)o[1]+v[1]-ayy,dx=(float)o[2]+v[2]-axx;
@@ -636,8 +688,9 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                     double prior=hypot(o[1]+(double)v[1]-q[0],o[2]+(double)v[2]-q[1])/q[2]+q[3];
                     out[1]=(float)((prior-sheet->center)/sheet->scale);
                 }
+                }
             }
-            for (int ch=0;ch<4;ch++) {
+            for (int ch=0;ch<(ct_only?1:4);ch++) {
                 size_t j=(size_t)ch*p3+k;
                 if (xfmt==1) { _Float16 h=(_Float16)out[ch]; memcpy(H+j,&h,2); }
                 else if (xfmt==2) H[j]=bf16_rn(out[ch]); else X[j]=out[ch];
@@ -645,6 +698,27 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
         }
     }
     free(table);
+}
+int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint8_t *mask, int P, const int64_t o[3], float mean, float isd,
+                              int hasax, const float *cyz, const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed,
+                              uint64_t aug_seed, float zoom, int affine, int hard, uint16_t *H4, uint16_t *H1, void *rec, uint8_t *T, uint8_t *M) {
+    sym y; for (int d = 0; d < 3; d++) { y.perm[d] = perm[d]; y.flip[d] = flip[d]; }
+    spatial_aug a; spatial_aug_make(&a, aug_seed, P, 10, 1, 1, 1);
+    if (zoom > 0 && zoom != 1) spatial_aug_zoom(&a, zoom);
+    if (affine) spatial_aug_affine(&a, aug_seed ^ 0x9e37u, .1, .06);
+    const size_t p3 = (size_t)P * P * P;
+    float *nrow = malloc((size_t)P * sizeof *nrow), *app = malloc(p3 * sizeof *app);
+    uint8_t *T4 = malloc(NCH * p3), *M4 = malloc(p3);
+    if (!nrow || !app || !T4 || !M4) abort();
+    rng r;
+    rseed(&r, seed); write_spatial(ctu, tgt, mask, T4, M4, P, o, mean, isd, hasax, cyz, cxz, y, &a, 1.1f, .05f, .02f, &r, nrow, xfmt, nullptr, H4,
+                                   nullptr, nullptr, nullptr, nullptr, nullptr, app, hard, 0);
+    rseed(&r, seed); write_spatial(ctu, tgt, mask, T, M, P, o, mean, isd, hasax, cyz, cxz, y, &a, 1.1f, .05f, .02f, &r, nrow, xfmt, nullptr, H1,
+                                   nullptr, nullptr, nullptr, nullptr, nullptr, app, hard, 1);
+    const int same = !memcmp(T4, T, NCH * p3) && !memcmp(M4, M, p3);
+    rad_record(rec, o, P, P, hasax, y, cyz, cxz, &a);
+    free(nrow); free(app); free(T4); free(M4);
+    return same ? a.active : -1;
 }
 /* Keep complete sparse terms only. q/q0 are material scalar coordinates and
    are invariant under reflection/deformation; coordinates use the same warp
@@ -946,6 +1020,14 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     PROF_MARK(PS_SRC);
     int l = c->cover ? 0 : pick_level(sp, s, r, region_ch);
     if (l < 0) return 1;
+    /* zoom-out: the next coarser level, of which the warp below shows the central 1/2 zoom_out (an effective voxel size of this level's
+       times zoom_out, from 2x coarser data); the dense-target tasks only (no band / phase / sheet / papyrus / condition / aux rasters) */
+    double zoom_out = 0;
+    if (c->augment && c->geometry_augment && c->zoom_out_p > 0 && c->zoom_max > 1 && !c->cover && region_ch < 0 && s->geometry &&
+        !c->band && !c->side && !c->sheet && !c->papyrus && !c->cond && !c->aux && runif(r) < c->zoom_out_p) {
+        const double zf = exp(runif(r) * log(c->zoom_max > 2 ? 2 : c->zoom_max));
+        if (l + 1 < MAXLEV && (s->max_level < 0 || l + 1 <= s->max_level) && level_ok(sp, s, si, l + 1, -1)) { l++; zoom_out = zf; }
+    }
     PROF_MARK(PS_LEVEL);
     z3 *ct = source_ct(s, l);
     const z3_meta *m = z3_meta_of(ct);
@@ -1281,7 +1363,8 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     const int warp_ok = !band_sample || (stored_phase && !c->band && !c->cond);   /* a stored phase warps (warp_phase); band fields do not */
     if (c->augment && c->geometry_augment && s->geometry && warp_ok) {
         spatial_aug_make(&spatial,rnext(r),P,c->rotate_degrees,c->rotate_p,c->elastic,c->elastic_p);
-        if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(r) < c->zoom_p) spatial_aug_zoom(&spatial, exp(runif(r) * log(c->zoom_min)));
+        if (zoom_out > 0) spatial_aug_zoom(&spatial, .5 * zoom_out);   /* (the coarser level read above) */
+        else if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(r) < c->zoom_p) spatial_aug_zoom(&spatial, exp(runif(r) * log(c->zoom_min)));
         if (c->affine_p > 0 && c->scan.strength > 0 && runif(r) < c->affine_p)
             spatial_aug_affine(&spatial, rnext(r), c->affine_aniso * c->scan.strength, c->affine_shear * c->scan.strength);
     }
@@ -1341,7 +1424,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     }
     PROF_MARK(PS_AUGMENT);
     const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0);
-    if (c->gpu_input && (spatial.active || c->sheet || (app && Pz != P))) { fprintf(stderr, "sampler: --gpu-input needs write_x samples (sample_gpu_input_ok)\n"); abort(); }
+    if (c->gpu_input && (c->sheet || (app && Pz != P))) { fprintf(stderr, "sampler: --gpu-input needs write_x / write_spatial samples (sample_gpu_input_ok)\n"); abort(); }
     float *X = c->xfmt ? nullptr : b->x + (size_t)i * xc * p3;
     uint16_t *H = c->xfmt ? b->x16 + (size_t)i * xc * p3 : nullptr;
     double (*params)[4]=nullptr;
@@ -1350,12 +1433,12 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         for (int sz=0;sz<P;sz++) sheet_parameters(c->sheet,o[0]+sz,params[sz]);
     }
     if (spatial.active) write_spatial(ctu,ttmp,mask,T,M,P,o,(float)mean,(float)(1.0/sd),s->ax.n>0,cyz,cxz,y,&spatial,
-            ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+5*p3));
+            ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+5*p3),c->pack_tm,c->gpu_input);
     else if (c->sheet || (app && Pz != P)) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
             X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);
     else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H,
                  app, noise_state, noise_state ? noise_state + P : nullptr, c->gpu_input);   /* the CT appearance plan in the row-vectorised writer (cubes) */
-    if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, s->ax.n > 0, y, cyz, cxz);   /* the radial channels: on the device */
+    if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial);   /* the radial channels: on the device */
     free(params);
     if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
         uint8_t *aw = tp_get(p3, 1), *as = tp_get(p3, 0);

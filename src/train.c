@@ -24,6 +24,8 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
     return dflt;
 }
+static double optd(int argc, char **argv, const char *name, double dflt) { const char *v = opt(argc, argv, name, nullptr); return v ? atof(v) : dflt; }
+static const char *g_aug_name = "none";   /* train --aug preset */
 
 static volatile sig_atomic_t g_stop;
 static void on_sig(int s) { (void)s; g_stop = 1; }
@@ -1130,35 +1132,53 @@ int cmd_train(int argc, char **argv) {
     sc.phase_near_um = (float)atof(opt(argc, argv, "--phase-near-um", "0"));
     if (sc.phase_near_um < 0 || (sc.phase_near_um > 0 && g_side != 2)) { fprintf(stderr, "--phase-near-um: >= 0, task unwrap (the phase)\n"); return 2; }
     if (sc.phase_near_um > 0) fprintf(stderr, "phase: supervised within %g um of a labelled wrap voxel\n", sc.phase_near_um);
-    sc.ct_augment = atoi(opt(argc, argv, "--ct-aug", "0"));
+    /* --aug all|none: the augmentation preset (sample.c sample_aug_preset); the flags below override its fields. Default "all" for the
+       dense-target tasks on cube windows (every scanner op, continuous geometry, zoom in / out, axis jitter: training for other scrolls,
+       scanners and damage), "none" (symmetries + intensity jitter, the recipe before 2026-10-16) for the other tasks and for slabs.
+       --aug-p-scale X multiplies every op probability of the preset (an A/B dial); resume an older run with --aug none to keep its data */
+    const int dense_task = !g_sheet && !g_papyrus && !g_aff && !g_side && !g_cond && !g_unwrap && g_xc == 4 && g_Pz == P;
+    g_aug_name = opt(argc, argv, "--aug", dense_task ? "all" : "none");
+    if (sample_aug_preset(&sc, g_aug_name)) { fprintf(stderr, "--aug: all | none\n"); return 2; }
+    if (!dense_task && !strcmp(g_aug_name, "all")) { fprintf(stderr, "--aug all: the dense-target tasks on cube windows only\n"); return 2; }
+    {
+        const float ps = (float)atof(opt(argc, argv, "--aug-p-scale", "1"));
+        if (!(ps >= 0 && ps <= 4)) { fprintf(stderr, "--aug-p-scale: 0..4\n"); return 2; }
+        for (int i = 0; i < SA_N; i++) sc.scan.p[i] = fminf(1, sc.scan.p[i] * ps);
+        sc.rotate_p = fminf(1, sc.rotate_p * ps); sc.elastic_p = fminf(1, sc.elastic_p * ps); sc.zoom_p = fminf(1, sc.zoom_p * ps);
+        sc.zoom_out_p = fminf(1, sc.zoom_out_p * ps); sc.affine_p = fminf(1, sc.affine_p * ps); sc.axis_jitter_p = fminf(1, sc.axis_jitter_p * ps);
+    }
+    sc.ct_augment = (int)optd(argc, argv, "--ct-aug", sc.ct_augment);
     sc.symmetry_p = (float)atof(opt(argc, argv, "--symmetry-p", "1"));
-    sc.axis_jitter = (float)atof(opt(argc, argv, "--axis-jitter", "0"));
+    sc.axis_jitter = (float)optd(argc, argv, "--axis-jitter", sc.axis_jitter);
     /* --axis-jitter-p P (default 0.1), --axis-jitter-deg D (default 2): how often the axis moves and the cap on the radial input's
        direction change; an estimated umbilicus on another scroll is off by ~1-3 mm (on block B, 3 mm costs phase confidence .65 -> .58) */
-    sc.axis_jitter_p = (float)atof(opt(argc, argv, "--axis-jitter-p", "0")); sc.axis_jitter_deg = (float)atof(opt(argc, argv, "--axis-jitter-deg", "0"));
-    sc.geometry_augment = atoi(opt(argc,argv,"--geometry-aug","0"));
-    sc.rotate_degrees=(float)atof(opt(argc,argv,"--rotate-deg","5"));
-    sc.rotate_p=(float)atof(opt(argc,argv,"--rotate-p","0.2"));
-    sc.elastic=(float)atof(opt(argc,argv,"--elastic","1"));
-    sc.elastic_p=(float)atof(opt(argc,argv,"--elastic-p","0.15"));
-    sc.zoom_min=(float)atof(opt(argc,argv,"--zoom-min","0.7071"));   /* zoom-in down to this scale (needs --geometry-aug 1) */
-    sc.zoom_p=(float)atof(opt(argc,argv,"--zoom-p","0"));
+    sc.axis_jitter_p = (float)optd(argc, argv, "--axis-jitter-p", sc.axis_jitter_p); sc.axis_jitter_deg = (float)optd(argc, argv, "--axis-jitter-deg", sc.axis_jitter_deg);
+    sc.geometry_augment = (int)optd(argc,argv,"--geometry-aug",sc.geometry_augment);
+    sc.rotate_degrees=(float)optd(argc,argv,"--rotate-deg",sc.rotate_degrees);
+    sc.rotate_p=(float)optd(argc,argv,"--rotate-p",sc.rotate_p);
+    sc.elastic=(float)optd(argc,argv,"--elastic",sc.elastic);
+    sc.elastic_p=(float)optd(argc,argv,"--elastic-p",sc.elastic_p);
+    sc.zoom_min=(float)optd(argc,argv,"--zoom-min",sc.zoom_min);   /* zoom-in down to this scale (needs --geometry-aug 1) */
+    sc.zoom_p=(float)optd(argc,argv,"--zoom-p",sc.zoom_p);
+    sc.zoom_max=(float)optd(argc,argv,"--zoom-max",sc.zoom_max);   /* zoom-out up to this factor (1..2: the next coarser level, needs --geometry-aug 1) */
+    sc.zoom_out_p=(float)optd(argc,argv,"--zoom-out-p",sc.zoom_out_p);
     sc.label_morph=(float)atof(opt(argc,argv,"--label-morph","0"));
     sc.label_morph_p=(float)atof(opt(argc,argv,"--label-morph-p","0.2"));
-    sc.scan.strength=(float)atof(opt(argc,argv,"--aug-strength","1"));
-    sc.scan.drop_ignore=atoi(opt(argc,argv,"--aug-drop-ignore","1"));
+    sc.scan.strength=(float)optd(argc,argv,"--aug-strength",sc.scan.strength);
+    sc.scan.drop_ignore=(int)optd(argc,argv,"--aug-drop-ignore",sc.scan.drop_ignore);
     {
-        const char *all=opt(argc,argv,"--aug-p","0");
-        for (int i=0;i<SA_N;i++) { char f[48]; snprintf(f,sizeof f,"--aug-%s-p",scan_aug_names[i]); sc.scan.p[i]=(float)atof(opt(argc,argv,f,all)); }
+        const char *all=opt(argc,argv,"--aug-p",nullptr);   /* every op at this probability (overrides the preset's) */
+        for (int i=0;i<SA_N;i++) { char f[48]; snprintf(f,sizeof f,"--aug-%s-p",scan_aug_names[i]); sc.scan.p[i]=(float)optd(argc,argv,f,all?atof(all):sc.scan.p[i]); }
         for (int i=0;i<SA_N;i++) { char f[48]; snprintf(f,sizeof f,"--aug-%s-s",scan_aug_names[i]); sc.scan.s[i]=(float)atof(opt(argc,argv,f,"0")); }   /* per-op strength (0: --aug-strength) */
         const char *hf=opt(argc,argv,"--aug-hist",nullptr);   /* target histograms for the hist op (ufsm ct-hist) */
         if (hf && scan_aug_load_hist(hf,&sc.scan)) { fprintf(stderr,"--aug-hist: cannot read %s\n",hf); return 2; }
+        if (hf && !strcmp(g_aug_name,"all") && !all && !opt(argc,argv,"--aug-hist-p",nullptr)) sc.scan.p[SA_HIST]=.15f;   /* the preset's, when targets are given */
         if (sc.scan.p[SA_HIST]>0 && !sc.scan.nhist) { fprintf(stderr,"--aug-hist-p needs --aug-hist FILE\n"); return 2; }
         for (int i=0;i<SA_N;i++) if (!isfinite(sc.scan.s[i]) || sc.scan.s[i]<0 || sc.scan.s[i]>3) { fprintf(stderr,"--aug-%s-s: 0..3\n",scan_aug_names[i]); return 2; }
     }
-    sc.affine_p=(float)atof(opt(argc,argv,"--aug-affine-p","0"));
-    sc.affine_aniso=(float)atof(opt(argc,argv,"--aug-aniso","0.1"));
-    sc.affine_shear=(float)atof(opt(argc,argv,"--aug-shear","0.06"));
+    sc.affine_p=(float)optd(argc,argv,"--aug-affine-p",sc.affine_p);
+    sc.affine_aniso=(float)optd(argc,argv,"--aug-aniso",sc.affine_aniso);
+    sc.affine_shear=(float)optd(argc,argv,"--aug-shear",sc.affine_shear);
     {
         int bad=!isfinite(sc.scan.strength) || sc.scan.strength<0 || sc.scan.strength>2 || sc.scan.drop_ignore<0 || sc.scan.drop_ignore>1 ||
                 !isfinite(sc.affine_p) || sc.affine_p<0 || sc.affine_p>1 || !isfinite(sc.affine_aniso) || sc.affine_aniso<0 || sc.affine_aniso>.3f ||
@@ -1173,6 +1193,7 @@ int cmd_train(int argc, char **argv) {
     if (sc.geometry_augment<0 || sc.geometry_augment>1 || !isfinite(sc.rotate_degrees) || sc.rotate_degrees<0 || sc.rotate_degrees>15 || !isfinite(sc.elastic) || sc.elastic<0 || sc.elastic>2 ||
         !isfinite(sc.rotate_p) || sc.rotate_p<0 || sc.rotate_p>1 || !isfinite(sc.elastic_p) || sc.elastic_p<0 || sc.elastic_p>1 ||
         !isfinite(sc.zoom_min) || sc.zoom_min<0.25f || sc.zoom_min>1 || !isfinite(sc.zoom_p) || sc.zoom_p<0 || sc.zoom_p>1 ||
+        !isfinite(sc.zoom_max) || sc.zoom_max<1 || sc.zoom_max>2 || !isfinite(sc.zoom_out_p) || sc.zoom_out_p<0 || sc.zoom_out_p>1 ||
         !isfinite(sc.label_morph) || sc.label_morph<0 || sc.label_morph>1 || !isfinite(sc.label_morph_p) || sc.label_morph_p<0 || sc.label_morph_p>1) {
         fprintf(stderr,"invalid continuous geometry/morphology augmentation bounds\n"); return 2;
     }
@@ -1188,14 +1209,14 @@ int cmd_train(int argc, char **argv) {
     {   /* --pack-targets 1 (default where it applies): hard two-class targets (every source's recto target side-encoded: 0 / 255 in both
            channels) travel as one code byte per voxel (sample.h SAMPLE_TM_*) through the sampler slots, the validation batches and the
            upload, unpacked on the device (nn_unpack_tm): 3 -> 1 B per voxel on the host and over PCIe. Not with --heads (per-source
-           target rows), --split, the papyrus task, --dist-head, the sheet prior, geometry warps (trilinear targets) or --overfit;
+           target rows), --split, the papyrus task, --dist-head, the sheet prior or --overfit (geometry warps: nearest-code targets);
            --pack-targets 0: target and mask bytes */
         int hard = S->n > 0;
         for (int i = 0; i < S->n; i++) hard &= S->src[i].tgt_side[CH_RECTO];
-        g_pack = atoi(opt(argc, argv, "--pack-targets", "1")) && hard && !g_heads && !split && !sc.papyrus && sc.dist_sigma <= 0 && !sc.sheet && !sc.geometry_augment && !overfit;
+        g_pack = atoi(opt(argc, argv, "--pack-targets", "1")) && hard && !g_heads && !split && !sc.papyrus && sc.dist_sigma <= 0 && !sc.sheet && !overfit;   /* (warped windows take the nearest source voxel's code) */
         sc.pack_tm = g_pack;
         if (g_pack) fprintf(stderr, "targets: packed, one byte per voxel on the host and in the upload (--pack-targets 0: target and mask bytes)\n");
-        else if (atoi(opt(argc, argv, "--pack-targets", "0"))) fprintf(stderr, "--pack-targets: not available here (needs side-encoded targets in every source, no --heads, --split, papyrus task, --dist-head, sheet prior, geometry warps or --overfit)\n");
+        else if (atoi(opt(argc, argv, "--pack-targets", "0"))) fprintf(stderr, "--pack-targets: not available here (needs side-encoded targets in every source, no --heads, --split, papyrus task, --dist-head, sheet prior or --overfit)\n");
     }
     cover_plan *plan = nullptr; cover_progress coverage = {0}, prior_cover = {0};
     const char *cover_path = opt(argc, argv, "--cover", nullptr);
@@ -1701,6 +1722,12 @@ int cmd_train(int argc, char **argv) {
         { int any=0; for (int i=0;i<SA_N;i++) if (sc.scan.s[i]>0) { fprintf(stderr,"%s%s %.3g",any?", ":"; strength ",scan_aug_names[i],sc.scan.s[i]); any=1; } }
         fprintf(stderr,"\n");
     }
+    if (strcmp(g_aug_name,"none") || sc.zoom_out_p>0) {   /* recorded when not the old default (older runs keep their metadata) */
+        size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"aug\":{\"preset\":\"%s\",\"zoom_min\":%.9g,\"zoom_p\":%.9g,\"zoom_max\":%.9g,\"zoom_out_p\":%.9g}}",
+                 g_aug_name,sc.zoom_min,sc.zoom_p,sc.zoom_max,sc.zoom_out_p);
+    }
+    fprintf(stderr,"augmentation preset %s: zoom in to %.3g p %.3g, out to %.3g p %.3g\n",g_aug_name,sc.zoom_min,sc.zoom_p,sc.zoom_max,sc.zoom_out_p);
     fprintf(stderr,"augmentation: mode %d, CT %d, symmetry p %.3g, axis jitter %.3g voxels (p %.3g, <= %.3g degrees), geometry %d (rotation +/-%.3g degrees p %.3g; elastic <=%.3g voxels p %.3g), soft-band dilation/erosion +/-%.3g voxels p %.3g\n",
         sc.augment,sc.ct_augment,sc.symmetry_p,sc.axis_jitter,sc.axis_jitter_p>0?sc.axis_jitter_p:.1,sc.axis_jitter_deg>0?sc.axis_jitter_deg:2,sc.geometry_augment,sc.rotate_degrees,sc.rotate_p,sc.elastic,sc.elastic_p,sc.label_morph,sc.label_morph_p);
     if (schedule_seconds) {

@@ -138,8 +138,11 @@ void nn_h16_to_mx(const void *x, shape5 s, void *y);   /* 16-bit storage-type te
    (fp16 / bf16 as nn_set_f16), the jitter and appearance augmentation applied by the sampler; rec: per sample NN_RAD_REC(D) bytes:
    int32 o1, o2 (the window corner's y / x at its level), D, P, hasax, perm[0] | perm[1] << 2 | perm[2] << 4 | flip[0] << 8 |
    flip[1] << 9 | flip[2] << 10, 0, 0; then float cyz[D], cxz[D] (the axis centre per source z); xs: {n, 4, D, P, P}; y: the
-   registered MX input (fp8 / fp4). The 16-bit 4-channel window never exists (6 B per voxel less on the host, PCIe and device). */
-#define NN_RAD_REC(D) ((size_t)(8 + 2 * (D)) * 4)
+   registered MX input (fp8 / fp4). The 16-bit 4-channel window never exists (6 B per voxel less on the host, PCIe and device).
+   Warped windows (sample.c write_spatial, cubes only: D == P): header word 6 = 1 | affine << 1, and after cxz the warp: float
+   table[6 P] (spatial_aug_tables), R[9], A[9], Ainv[9] (row major, as floats), scale; the radial vector is then the transported one
+   of write_spatial (zero outside the source cube), bit for bit. */
+#define NN_RAD_REC(D) ((size_t)(8 + 8 * (D) + 32) * 4)
 void nn_input_rad(const void *ct16, shape5 xs, const void *rec, void *y);
 /* --half-res pack: the same from the full-resolution CT channel [n][8 d h w] and records of NN_RAD_REC(2 d), into the network's
    8-channel input on the 2x2x2 blocks (xs {n, 8, d, h, h}): bit for bit write_x -> nn_half_input(mode 2) -> nn_h16_to_mx */

@@ -40,6 +40,9 @@ typedef struct {
     float zoom_min, zoom_p;  /* zoom-in augmentation: with probability zoom_p the window shows a 1/z of the read cube, z uniform
                                 in log over [zoom_min, 1] (zoom_min < 1), so the effective voxel size is level size * z;
                                 needs geometry_augment; sources with "geometry": 0 and band-labelled native samples are never zoomed */
+    float zoom_max, zoom_out_p; /* zoom-out augmentation: with probability zoom_out_p the window reads the next coarser level and shows
+                                its central 1/2 z of it, z uniform in log over [1, zoom_max] (1 < zoom_max <= 2): an effective voxel size of
+                                level size * z, from data 2x coarser (a coarser scan); needs geometry_augment, the dense-target tasks only */
     float label_morph, label_morph_p; /* signed soft-band distance offset; centreline preserved */
     scan_aug_cfg scan;       /* scanner-domain CT augmentation on the source grid (src/scan_augment.h); every p 0 = off */
     float affine_p, affine_aniso, affine_shear; /* anisotropic scale (log, per axis) + shear, magnitudes x scan.strength;
@@ -125,6 +128,10 @@ void sampler_prof_print(const sampler *sp);   /* env UFSM_SAMPLER_PROF=1: per-st
 void sampler_set_soft(sampler *sp, float sigma);   /* change the soft-target sigma while running (annealing); patches already drawn keep theirs */
 
 sample_cfg sample_cfg_default(void);
+/* augmentation presets for the dense-target tasks (train --aug): "none" (symmetries + intensity jitter only, the old default) or
+   "all" (every scanner-domain op, continuous geometry, zoom in and out, axis jitter; sample.c sample_aug_preset). Sets the fields only
+   (explicit flags override them afterwards); 0 on success, -1 for an unknown name. */
+int sample_aug_preset(sample_cfg *c, const char *name);
 enum { SAMPLE_TM_T0 = 1, SAMPLE_TM_T1 = 2, SAMPLE_TM_M = 4 };
 /* the packed code of n voxels from two target channels (each 0 or 255) and a 0 / 1 mask; out may be m (in place). -1 at a value
    that does not fit (a soft target or a mask weight), its index in *bad. Exposed for tests. */
@@ -139,3 +146,10 @@ void sample_cond_draw(uint64_t seed, int P, const uint8_t *w, uint8_t *wout, flo
    the CT channel alone and rec its radial record (NN_RAD_REC(D) bytes). xfmt 1 fp16, 2 bf16. Exposed for tests (tests/test_gpu_input.c). */
 void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], float mean, float isd, int hasax, const float *cyz,
                          const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed, uint16_t *H4, uint16_t *H1, void *rec);
+/* --gpu-input with a continuous warp: write_spatial of one P^3 window (rotation degrees / elastic / zoom / affine from aug_seed as the
+   sampler draws them) twice with the same rng seed: H4 the four 16-bit channels, H1 the CT channel alone and rec its radial record
+   (NN_RAD_REC(P) bytes, with the warp); also T / M (NCH x P^3 / P^3) from the hard-target warp (nearest code) when hard. Returns the
+   warp's active flag. Exposed for tests (tests/test_gpu_input.c). */
+int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint8_t *mask, int P, const int64_t o[3], float mean, float isd,
+                              int hasax, const float *cyz, const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed,
+                              uint64_t aug_seed, float zoom, int affine, int hard, uint16_t *H4, uint16_t *H1, void *rec, uint8_t *T, uint8_t *M);

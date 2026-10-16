@@ -96,16 +96,73 @@ __global__ void input_rad_k(const TI *ct, const uint8_t *recs, size_t rec_bytes,
     int s[3] = {0, 0, 0};
 #pragma unroll
     for (int d = 0; d < 3; d++) { const int pd = (pf >> (2 * d)) & 3; s[pd] = (pf >> (8 + d)) & 1 ? nd[d] - 1 - io[d] : io[d]; }   /* output axis d reads source axis perm[d] */
+    float r[32];
+#pragma unroll
+    for (int k = 0; k < 32; k++) r[k] = 0.f;
+    r[0] = ldx(ct, i);
+    if (h[6] & 1) {   /* a warped window: sample.c write_spatial's transported radial vector, the host's float expressions in order */
+        const float *tab = cxz + D, *R = tab + 6 * P, *A = R + 9, *Ai = A + 9; const float sc = R[27];   /* R[9], A[9], Ainv[9], scale */
+        const float c = __fmul_rn(.5f, (float)(P - 1)), fP1 = (float)(P - 1);
+        float v[3], jac[3], u[3], src[3];
+#pragma unroll
+        for (int d = 0; d < 3; d++) {
+            v[d] = __fsub_rn(__fsub_rn((float)io[d], c), tab[d * P + io[d]]);
+            jac[d] = __fdiv_rn(1.f, __fsub_rn(1.f, tab[(3 + d) * P + io[d]]));
+        }
+        if (h[6] & 2) {
+            float w[3];
+#pragma unroll
+            for (int d = 0; d < 3; d++) w[d] = __fadd_rn(__fadd_rn(__fmul_rn(R[d], v[0]), __fmul_rn(R[3 + d], v[1])), __fmul_rn(R[6 + d], v[2]));
+#pragma unroll
+            for (int d = 0; d < 3; d++) src[d] = __fadd_rn(c, __fmul_rn(sc, __fadd_rn(__fadd_rn(__fmul_rn(A[3 * d], w[0]), __fmul_rn(A[3 * d + 1], w[1])), __fmul_rn(A[3 * d + 2], w[2]))));
+        } else {
+#pragma unroll
+            for (int d = 0; d < 3; d++) src[d] = __fadd_rn(c, __fmul_rn(sc, __fadd_rn(__fadd_rn(__fmul_rn(R[d], v[0]), __fmul_rn(R[3 + d], v[1])), __fmul_rn(R[6 + d], v[2]))));
+        }
+        int perm[3], flip[3];
+#pragma unroll
+        for (int d = 0; d < 3; d++) { perm[d] = (pf >> (2 * d)) & 3; flip[d] = (pf >> (8 + d)) & 1; }
+        for (int d = 0; d < 3; d++) u[perm[d]] = flip[d] ? __fsub_rn(fP1, src[d]) : src[d];   /* (the source frame: write_spatial's v) */
+        int inside = 1;
+#pragma unroll
+        for (int d = 0; d < 3; d++) if (u[d] < 0.f || u[d] > fP1) inside = 0;
+        if (inside) {
+            int b0 = (int)u[0]; if (b0 >= P - 1) b0 = P - 2;
+            const float frac = __fsub_rn(u[0], (float)b0);
+            const float ayy = __fadd_rn(__fmul_rn(cyz[b0], __fsub_rn(1.f, frac)), __fmul_rn(cyz[b0 + 1], frac));
+            const float axx = __fadd_rn(__fmul_rn(cxz[b0], __fsub_rn(1.f, frac)), __fmul_rn(cxz[b0 + 1], frac));
+            const float dy = __fsub_rn(__fadd_rn((float)o1, u[1]), ayy), dx = __fsub_rn(__fadd_rn((float)o2, u[2]), axx);
+            const float radius = __fadd_rn(__fsqrt_rn(__fadd_rn(__fmul_rn(dy, dy), __fmul_rn(dx, dx))), 1e-6f);
+            const float radial[3] = {0.f, hasax ? __fdiv_rn(dy, radius) : 0.f, hasax ? __fdiv_rn(dx, radius) : 0.f};
+            float disc[3], tr[3];
+#pragma unroll
+            for (int d = 0; d < 3; d++) disc[d] = __fmul_rn(flip[d] ? -1.f : 1.f, radial[perm[d]]);
+            if (h[6] & 2) {
+                float q[3];
+#pragma unroll
+                for (int d = 0; d < 3; d++) q[d] = __fadd_rn(__fadd_rn(__fmul_rn(Ai[3 * d], disc[0]), __fmul_rn(Ai[3 * d + 1], disc[1])), __fmul_rn(Ai[3 * d + 2], disc[2]));
+#pragma unroll
+                for (int d = 0; d < 3; d++) disc[d] = q[d];
+            }
+            float norm = 1e-12f;
+#pragma unroll
+            for (int d = 0; d < 3; d++) {
+                tr[d] = __fmul_rn(jac[d], __fadd_rn(__fadd_rn(__fmul_rn(R[3 * d], disc[0]), __fmul_rn(R[3 * d + 1], disc[1])), __fmul_rn(R[3 * d + 2], disc[2])));
+                norm = __fadd_rn(norm, __fmul_rn(tr[d], tr[d]));
+            }
+            norm = __fsqrt_rn(norm);
+#pragma unroll
+            for (int d = 0; d < 3; d++) r[1 + d] = rnd16<TI>(__fdiv_rn(tr[d], norm));
+        }
+        mx_store_row_b<B>(y, mx_sc<B>(y, N, 4, S), i, 8, r);
+        return;
+    }
     float comp[3] = {0.f, 0.f, 0.f};
     if (hasax) {
         const float dy = __fsub_rn((float)(o1 + s[1]), cyz[s[0]]), dx = __fsub_rn((float)(o2 + s[2]), cxz[s[0]]);
         const float inv = __fdiv_rn(1.f, __fadd_rn(__fsqrt_rn(__fadd_rn(__fmul_rn(dy, dy), __fmul_rn(dx, dx))), 1e-6f));
         comp[1] = __fmul_rn(dy, inv); comp[2] = __fmul_rn(dx, inv);
     }
-    float r[32];
-#pragma unroll
-    for (int k = 0; k < 32; k++) r[k] = 0.f;
-    r[0] = ldx(ct, i);
 #pragma unroll
     for (int d = 0; d < 3; d++) r[1 + d] = rnd16<TI>(__fmul_rn((pf >> (8 + d)) & 1 ? -1.f : 1.f, comp[(pf >> (2 * d)) & 3]));   /* sign x component (signed zeros as the host) */
     mx_store_row_b<B>(y, mx_sc<B>(y, N, 4, S), i, 8, r);

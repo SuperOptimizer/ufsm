@@ -5,7 +5,7 @@
 #include <string.h>
 
 const char *const scan_aug_names[SA_N] = {"seam", "air", "lowres", "blur", "sharpen", "bias", "ring", "cupping", "slice",
-                                          "noise", "cnoise", "tone", "quant", "dropslice", "cutout", "chunk", "paganin", "gin", "hist"};
+                                          "noise", "cnoise", "tone", "quant", "dropslice", "cutout", "chunk", "paganin", "gin", "hist", "motion"};
 #include <stdio.h>
 int scan_aug_load_hist(const char *path, scan_aug_cfg *c) {
     FILE *f = fopen(path, "r"); if (!f) return -1;
@@ -90,6 +90,30 @@ static void bop_lowres(bop *b, int P, double f, double phase, float *dense) {
             for (int k = (int)floor(a); k < (int)ceil(e); k++) {
                 double ov = fmin(e, k + 1) - fmax(a, k);
                 if (ov > 0) bop_add(dense, &lo, &hi, P, k, (float)(wc * ov / f));
+            }
+        }
+        bop_store(b, i, dense, lo, hi);
+    }
+}
+/* sample motion along an axis: ghost echoes (mode 0: (1 - sum w) I + sum w_e shift(t_e), fractional shifts linear) or a linear
+   motion blur (mode 1: the mean of a box of length L, its end voxels weighted by their fraction) */
+static void bop_motion(bop *b, int P, int mode, int ne, const double t[2], const double w[2], double L, float *dense) {
+    b->P = P;
+    for (int i = 0; i < P; i++) {
+        int lo = P, hi = -1;
+        if (mode == 0) {
+            double w0 = 1; for (int e = 0; e < ne; e++) w0 -= w[e];
+            bop_add(dense, &lo, &hi, P, i, (float)w0);
+            for (int e = 0; e < ne; e++) {
+                const double u = i + t[e]; const int j = (int)floor(u); const double f = u - j;
+                if (1 - f > 0) bop_add(dense, &lo, &hi, P, j, (float)(w[e] * (1 - f)));
+                if (f > 0) bop_add(dense, &lo, &hi, P, j + 1, (float)(w[e] * f));
+            }
+        } else {   /* box [i - L / 2, i + L / 2] over unit voxels [k - .5, k + .5) */
+            const double a = i - .5 * L, e = i + .5 * L;
+            for (int k = (int)floor(a + .5); k <= (int)ceil(e - .5); k++) {
+                const double ov = fmin(e, k + .5) - fmax(a, k - .5);
+                if (ov > 0) bop_add(dense, &lo, &hi, P, k, (float)(ov / L));
             }
         }
         bop_store(b, i, dense, lo, hi);
@@ -180,11 +204,21 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
         for (size_t k = 0; k < p3; k++) if (Z[k]) { F[k] = level; Z[k] = 0; ign[k] = 1; }
     }
     /* resolution: PSF blur or phase-contrast sharpening, then a coarser sampling grid, per axis */
-    if (on & (1u << SA_LOWRES | 1u << SA_BLUR | 1u << SA_SHARPEN)) {
+    if (on & (1u << SA_LOWRES | 1u << SA_BLUR | 1u << SA_SHARPEN | 1u << SA_MOTION)) {
         bop *op = malloc(3 * sizeof *op); if (!op) abort();
         int iso = uniform(&rs) < .5;
         const double SL = SO(SA_LOWRES), SB = SO(SA_BLUR), SS = SO(SA_SHARPEN);
         double f0 = 1 + uniform(&rs) * 1.5 * SL, sb0 = .3 + uniform(&rs) * .7 * SB, sa0 = .15 + uniform(&rs) * .3 * SS;
+        int maxis = -1, mmode = 0, mne = 0; double mt[2] = {0, 0}, mw[2] = {0, 0}, mL = 0;   /* motion (drawn after the old ops' draws) */
+        if (on & 1u << SA_MOTION) {
+            const double SM = SO(SA_MOTION);
+            maxis = (int)(uniform(&rs) * 3); if (maxis > 2) maxis = 2;
+            mmode = uniform(&rs) < .5; mne = 1 + (uniform(&rs) < .4);
+            for (int e = 0; e < mne; e++) { mt[e] = (1 + 3 * uniform(&rs)) * SM * (uniform(&rs) < .5 ? -1 : 1); mw[e] = .1 + .25 * uniform(&rs); }
+            mL = (1.5 + 3.5 * uniform(&rs)) * SM;
+            for (int e = 0; e < mne; e++) mt[e] = fmax(-6, fmin(6, mt[e]));
+            mL = fmin(mL, 8);
+        }
         for (int d = 0; d < 3; d++) {
             double f = iso ? f0 : 1 + uniform(&rs) * 1.5 * SL, sb = iso ? sb0 : .3 + uniform(&rs) * .7 * SB, sa = iso ? sa0 : .15 + uniform(&rs) * .3 * SS;
             double ss = .7 + .6 * uniform(&rs), phase = uniform(&rs) * f;
@@ -192,6 +226,7 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
             bop_identity(&op[0], P);
             if (on & 1u << SA_BLUR) { bop_gauss(&op[1], P, sb, -1, dense); bop_compose(&op[2], &op[1], &op[0], dense); op[0] = op[2]; }
             if (on & 1u << SA_SHARPEN) { bop_gauss(&op[1], P, ss, sa, dense); bop_compose(&op[2], &op[1], &op[0], dense); op[0] = op[2]; }
+            if (d == maxis && (mmode || mne)) { bop_motion(&op[1], P, mmode, mne, mt, mw, mL, dense); bop_compose(&op[2], &op[1], &op[0], dense); op[0] = op[2]; }
             if (on & 1u << SA_LOWRES && f > 1.01) { bop_lowres(&op[1], P, f, phase, dense); bop_compose(&op[2], &op[1], &op[0], dense); op[0] = op[2]; }
             if (!bop_is_identity(&op[0])) bop_apply(F, P, d, &op[0], tmp);
         }
