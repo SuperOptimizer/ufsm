@@ -746,7 +746,18 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
        CT value is lutv's float ((float) v - mean) * isd computed in the lanes (the same two float operations) */
     const int cmf=fast && !ap && appearance;
     uint16_t *cm=cmf?(uint16_t *)appearance:nullptr;
-    if (cmf) for (size_t k=0;k<p3;k++) cm[k]=(uint16_t)(ctu[k]|(mask[k]?0x100:0));
+    /* hard 0 / 255 targets (what the packed batch requires) ride along as bits 9 and 10: the nearest corner's targets come from the
+       same pair words (else two more gathers per 8 voxels) */
+    int cmt=cmf;
+    if (cmf) {
+        uint8_t odd=0;
+        for (size_t k=0;k<p3;k++) {
+            const uint8_t t0=target[k],t1=target[p3+k];
+            odd|=(uint8_t)((t0+1)&0xfe)|(uint8_t)((t1+1)&0xfe);   /* (nonzero unless both are 0 or 255) */
+            cm[k]=(uint16_t)(ctu[k]|(mask[k]?0x100:0)|(t0?0x200:0)|(t1?0x400:0));
+        }
+        cmt=!odd;
+    }
 #else
     const int fast=0;
 #endif
@@ -782,10 +793,10 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                             F[d]=_mm256_sub_ps(Vv[d],_mm256_cvtepi32_ps(Bv[d])); G[d]=_mm256_sub_ps(one,F[d]);
                         }
                         const __m256i b0=_mm256_add_epi32(_mm256_mullo_epi32(_mm256_add_epi32(_mm256_mullo_epi32(Bv[0],iP),Bv[1]),iP),Bv[2]);
-                        __m256 cv=zero; __m256i bad=_mm256_setzero_si256();
+                        __m256 cv=zero; __m256i bad=_mm256_setzero_si256(), wdp[4];
                         if (cmf) for (int pr=0;pr<4;pr++) {   /* corners (bz, by, 0) and (bz, by, 1): the per-voxel order cn = 0..7 */
                             const int bz=pr>>1,by=pr&1;
-                            const __m256i wd=_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)cm,_mm256_add_epi32(b0,_mm256_set1_epi32((bz*P+by)*P)),ini,2);
+                            const __m256i wd=wdp[pr]=_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)cm,_mm256_add_epi32(b0,_mm256_set1_epi32((bz*P+by)*P)),ini,2);
                             for (int bx=0;bx<2;bx++) {
                                 const __m256 w=_mm256_mul_ps(_mm256_mul_ps(bz?F[0]:G[0],by?F[1]:G[1]),bx?F[2]:G[2]);
                                 const __m256 use=_mm256_and_ps(in,_mm256_cmp_ps(w,thr,_CMP_GT_OQ));
@@ -815,13 +826,24 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                         }
                         if (ap && !ap->filter_mode) for (int d=0;d<3;d++)
                             cv=_mm256_add_ps(cv,_mm256_mul_ps(_mm256_set1_ps(ap->shading[d]),_mm256_sub_ps(_mm256_div_ps(_mm256_mul_ps(_mm256_set1_ps(2.f),Vv[d]),fP1),one)));
-                        const __m256i jn=_mm256_add_epi32(b0,_mm256_add_epi32(_mm256_add_epi32(
-                            _mm256_and_si256(_mm256_castps_si256(_mm256_cmp_ps(F[0],half,_CMP_GT_OQ)),_mm256_set1_epi32(P*P)),
-                            _mm256_and_si256(_mm256_castps_si256(_mm256_cmp_ps(F[1],half,_CMP_GT_OQ)),iP)),
-                            _mm256_and_si256(_mm256_castps_si256(_mm256_cmp_ps(F[2],half,_CMP_GT_OQ)),_mm256_set1_epi32(1))));
-                        const __m256i sh=_mm256_slli_epi32(_mm256_and_si256(jn,three),3), wj=_mm256_srli_epi32(jn,2);
-                        const __m256i t0=_mm256_and_si256(_mm256_srlv_epi32(_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)target,wj,ini,4),sh),bytem);
-                        const __m256i t1=_mm256_and_si256(_mm256_srlv_epi32(_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)(target+p3),wj,ini,4),sh),bytem);
+                        const __m256 nz_=_mm256_cmp_ps(F[0],half,_CMP_GT_OQ),ny_=_mm256_cmp_ps(F[1],half,_CMP_GT_OQ),nx_=_mm256_cmp_ps(F[2],half,_CMP_GT_OQ);
+                        __m256i t0,t1;
+                        if (cmt) {   /* the nearest corner's pair word (bz, by from the fractions), its half by fx, bits 9 / 10 as 0 / 255 */
+                            const __m256i w0=_mm256_blendv_epi8(wdp[0],wdp[1],_mm256_castps_si256(ny_)),w1=_mm256_blendv_epi8(wdp[2],wdp[3],_mm256_castps_si256(ny_));
+                            const __m256i ws=_mm256_blendv_epi8(w0,w1,_mm256_castps_si256(nz_));
+                            const __m256i hw=_mm256_blendv_epi8(ws,_mm256_srli_epi32(ws,16),_mm256_castps_si256(nx_));
+                            const __m256i one1=_mm256_set1_epi32(1);
+                            t0=_mm256_mullo_epi32(_mm256_and_si256(_mm256_srli_epi32(hw,9),one1),bytem);
+                            t1=_mm256_mullo_epi32(_mm256_and_si256(_mm256_srli_epi32(hw,10),one1),bytem);
+                        } else {
+                            const __m256i jn=_mm256_add_epi32(b0,_mm256_add_epi32(_mm256_add_epi32(
+                                _mm256_and_si256(_mm256_castps_si256(nz_),_mm256_set1_epi32(P*P)),
+                                _mm256_and_si256(_mm256_castps_si256(ny_),iP)),
+                                _mm256_and_si256(_mm256_castps_si256(nx_),_mm256_set1_epi32(1))));
+                            const __m256i sh=_mm256_slli_epi32(_mm256_and_si256(jn,three),3), wj=_mm256_srli_epi32(jn,2);
+                            t0=_mm256_and_si256(_mm256_srlv_epi32(_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)target,wj,ini,4),sh),bytem);
+                            t1=_mm256_and_si256(_mm256_srlv_epi32(_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)(target+p3),wj,ini,4),sh),bytem);
+                        }
                         const size_t k=((size_t)z*P+y)*P+xs, kb=((size_t)(z-z0)*P+y)*P+xs;
                         _mm256_storeu_ps(cvb+kb,cv);
                         /* inside 0 / 1, mask inside and no zero corner, targets (the gathers are 0 outside): 8 bytes each */
