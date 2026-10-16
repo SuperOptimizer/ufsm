@@ -9,7 +9,9 @@
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <unistd.h>
+static void *wbig_alloc(size_t n, int zero);
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -725,7 +727,7 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
     const float c=.5f*(a->P-1),sc=(float)a->scale;
     float Rf[3][3],Af[3][3],Aif[3][3];
     for (int i=0;i<3;i++) for (int j=0;j<3;j++) { Rf[i][j]=(float)a->R[i][j]; Af[i][j]=(float)a->A[i][j]; Aif[i][j]=(float)a->Ainv[i][j]; }
-    float *vt=malloc(6*(size_t)P*sizeof *vt), *cvb=malloc((size_t)ZB*P*P*sizeof *cvb); uint8_t *inb=malloc((size_t)ZB*P*P);
+    float *vt=malloc(6*(size_t)P*sizeof *vt), *cvb=wbig_alloc((size_t)ZB*P*P*sizeof *cvb,0); uint8_t *inb=wbig_alloc((size_t)ZB*P*P,0);
     if (!vt || !cvb || !inb) abort();
     for (int d=0;d<3;d++) for (int u=0;u<P;u++) {   /* spatial_aug_pull's per-axis terms */
         vt[d*P+u]=u-c-table[d*P+u];
@@ -985,11 +987,25 @@ static uint64_t mix64(uint64_t x) { x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x 
 #define TP_N 32
 static _Thread_local struct { void *b[TP_N]; size_t n[TP_N]; int k; } tpool;
 static size_t tp_class(size_t n) { return n >= ((size_t)1 << 20) ? (n + ((size_t)1 << 20) - 1) & ~(((size_t)1 << 20) - 1) : n; }
+/* window-sized worker scratch (>= 4 MB): 2 MB aligned with transparent huge pages requested (the system's THP mode is often
+   "madvise"): the warp writer's gathers and the volume passes otherwise walk 4 KB page tables over hundreds of MB per window. Pages
+   are still only backed when touched. free() releases it as any malloc block. */
+static void *wbig_alloc(size_t n, int zero) {
+    const size_t H = (size_t)2 << 20;
+    if (n < ((size_t)4 << 20)) return zero ? calloc(n ? n : 1, 1) : malloc(n ? n : 1);
+    void *p = nullptr;
+    if (posix_memalign(&p, H, n)) return nullptr;
+#ifdef MADV_HUGEPAGE
+    madvise(p, (n + H - 1) & ~(H - 1), MADV_HUGEPAGE);
+#endif
+    if (zero) memset(p, 0, n);
+    return p;
+}
 static void *tp_get(size_t n, int zero) {
     const size_t c = tp_class(n);
     for (int i = 0; i < tpool.k; i++)
         if (tpool.n[i] == c) { void *p = tpool.b[i]; tpool.b[i] = tpool.b[--tpool.k]; tpool.n[i] = tpool.n[tpool.k]; if (zero) memset(p, 0, n); return p; }
-    return zero ? calloc(c, 1) : malloc(c);
+    return wbig_alloc(c, zero);
 }
 static void tp_put(void *p, size_t n) {
     if (!p) return;
@@ -1775,8 +1791,8 @@ static void *worker(void *arg) {
     rseed(&r, sp->cfg.seed * 1000003ull + (uint64_t)wa->id);
     size_t p3 = P3(sp);
     float *xtmp = malloc(3 * (size_t)sp->cfg.P * sizeof(float));   /* per-z axis centres and a row of noise */
-    uint8_t *ttmp = malloc(NCH * p3);
-    uint8_t *big = malloc(10 * p3);   /* [0,P^3) CT (also the coarse probe), [P^3, 9P^3) (2P)^3 region scratch, [9P^3, 10P^3) mask */
+    uint8_t *ttmp = wbig_alloc(NCH * p3, 0);
+    uint8_t *big = wbig_alloc(10 * p3, 0);   /* [0,P^3) CT (also the coarse probe), [P^3, 9P^3) (2P)^3 region scratch, [9P^3, 10P^3) mask */
     const int det = sp->cfg.deterministic;
     float *noise_state = sp->cfg.ct_augment ? malloc(((size_t)sp->cfg.P * sp->cfg.P + sp->cfg.P) * sizeof(float)) : nullptr;
     if (!xtmp || !ttmp || !big || (sp->cfg.ct_augment && !noise_state)) {
