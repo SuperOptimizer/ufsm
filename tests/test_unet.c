@@ -60,6 +60,7 @@ int main(void) {
     srand(3);
     unet_cfg cfg = {3, {4, 6, 8}, 4, 2, 2};
     cfg.down_norm = getenv("UFSM_DOWN_NORM") ? atoi(getenv("UFSM_DOWN_NORM")) : 0;
+    cfg.l0_norm = getenv("UFSM_L0_NORM") ? atoi(getenv("UFSM_L0_NORM")) : 0;   /* level-0 norm 1 none, 2 ema (constant statistics: their gradient terms dropped) */
     if (getenv("UFSM_TINY")) { cfg.nlev = 0; char *t = strdup(getenv("UFSM_TINY")); for (char *q = strtok(t, ","); q; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); }
     cfg.scale_cond = getenv("UFSM_SCALE_COND") ? atoi(getenv("UFSM_SCALE_COND")) : 0;   /* voxel-size conditioning: also check its vector */
     if (getenv("UFSM_ENC_BLOCKS")) { char *t = strdup(getenv("UFSM_ENC_BLOCKS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.enc_blocks[l++] = atoi(q); free(t); }
@@ -68,6 +69,7 @@ int main(void) {
     if (getenv("UFSM_DEC_WIDTHS")) { char *t = strdup(getenv("UFSM_DEC_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.dec_widths[l++] = atoi(q); free(t); }   /* narrower decoder levels */
     unet *u = unet_create(&cfg);
     unet_init(u, 1);
+    if (cfg.l0_norm == 2) unet_set_l0_ema(u, 0.f, 1);   /* ema: the first forward's statistics, kept (momentum 0), constants from the second on */
     if (cfg.scale_cond) unet_set_scale(u, 9.6);   /* code +1 */
     size_t np = unet_nparams(u);
     printf("tiny unet: %zu params\n", np);
@@ -81,6 +83,7 @@ int main(void) {
     float *dx = nn_malloc(nx * 4), *dgy = nn_malloc(nl * 4);
     nn_h2d(dx, x, nx * 4); nn_h2d(dgy, gy, nl * 4);
     /* analytic grads */
+    if (cfg.l0_norm == 2) unet_forward(u, dx, xs, 1);   /* (ema: the running statistics) */
     unet_forward(u, dx, xs, 1);
     for (int j = 1; j <= cfg.ds_levels; j++) {   /* random coefficients per deep-supervision logit = its gradient */
         shape5 sj; unet_ds_logits(u, j, &sj); size_t n = shape_numel(sj);
@@ -150,10 +153,12 @@ int main(void) {
     nn_set_tf32(getenv("UFSM_FP32") ? 0 : 1);
     unet_cfg big = {4, {16, 32, 64, 80}, 4, 1, 8};
     big.down_norm = cfg.down_norm;
+    big.l0_norm = cfg.l0_norm;
     if (getenv("UFSM_BIG_ENC_BLOCKS")) { char *t = strdup(getenv("UFSM_BIG_ENC_BLOCKS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) big.enc_blocks[l++] = atoi(q); free(t); }
     if (getenv("UFSM_BIG_DEC_WIDTHS")) { char *t = strdup(getenv("UFSM_BIG_DEC_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) big.dec_widths[l++] = atoi(q); free(t); }   /* narrower decoder levels */
     unet *b = unet_create(&big);
     unet_init(b, 2);
+    if (big.l0_norm == 2) unet_set_l0_ema(b, 0.f, 1);
     printf("model (16,32,64,80): %zu params\n", unet_nparams(b));
     int BP = getenv("UFSM_P") ? atoi(getenv("UFSM_P")) : 96, BB = getenv("UFSM_B") ? atoi(getenv("UFSM_B")) : 1;
     shape5 bs = {BB, 4, BP, BP, BP};
@@ -163,6 +168,7 @@ int main(void) {
     /* tensor-core path vs exact fp32 on the full model (random input) */
     {
         float *hx = malloc(bn * 4); for (size_t i = 0; i < bn; i++) hx[i] = frand(); nn_h2d(bx, hx, bn * 4); free(hx);
+        if (big.l0_norm == 2) unet_forward(b, bx, bs, 1);   /* (ema: the running statistics, then constants in both paths) */
         float *l1 = malloc(bl * 4), *l2 = malloc(bl * 4);
         nn_set_tf32(0); nn_d2h(l1, unet_forward(b, bx, bs, 1), bl * 4);
         nn_set_tf32(1); nn_d2h(l2, unet_forward(b, bx, bs, 1), bl * 4);

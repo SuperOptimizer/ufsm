@@ -15,6 +15,7 @@ using namespace nvcuda;
 
 extern int g_tf32;
 extern int g_gn_stored;
+extern int g_gn_const;   /* nn_set_gn_const (src/nn_l0norm.cu) */
 extern "C" void nn_set_gn_stored(int on);
 extern "C" int nn_get_gn_stored(void);
 extern "C" void nn_set_f16(int on);
@@ -1770,7 +1771,7 @@ static void gn_silu_bwd_t(const TI *x, shape5 s, int G, const float *gamma, cons
     float *AB = scratch + 2 * NC;   /* scratch holds 2*NC stats followed by 2*N*G group sums (nn_gn_scratch sized accordingly) */
     const int zsp = zs_on();
     const float f = gn_bwd_reduce(ds, scratch, NC, s.d, ggamma, gbeta, s.n, s.c);   /* spatial split: local param grads, global sums */
-    gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, f);
+    gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, g_gn_const ? 0.f : f);
     gn_silu_bwd_apply_k<<<dim3(NC, nsl), 256>>>(x, gy, gamma, beta, mean, rstd, AB, gx, s.c, G, S);
     if (!zsp) gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
     KCHECK();
@@ -1827,7 +1828,7 @@ __global__ void gn_bwd_stats_k(const float *x, const float *gy, const float *mea
 __global__ void d2f_k(const double *d, float *f, int n);
 
 __global__ void gn_bwd_apply_k(const float *x, const float *gy, const float *gamma, const float *mean, const float *rstd, const float *st,
-                               float *gx, int N, int C, int G, size_t S);
+                               float *gx, int N, int C, int G, size_t S, float f);
 
 __global__ void gn_param_grad_k2(const float *st, float *ggamma, float *gbeta, int N, int C);
 __global__ void gn_param_grad_k(const float *st, float *ggamma, float *gbeta, int N, int C);

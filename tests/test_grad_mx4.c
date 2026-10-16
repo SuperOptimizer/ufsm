@@ -12,6 +12,7 @@
 static uint64_t rs = 12345;
 static float frand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (float)((rs >> 11) * 0x1.0p-53 * 2 - 1); }
 static int bad;
+static int l0e;   /* UFSM_L0_NORM: the end-to-end nets with level-0 norm 1 none / 2 ema (constant statistics) */
 static float *dev_rand(size_t n, float scale) { float *h = malloc(n * 4); for (size_t i = 0; i < n; i++) h[i] = frand() * scale; float *d = nn_malloc(n * 4); nn_h2d(d, h, n * 4); free(h); return d; }
 static float *dev_rand_wide(size_t n, float scale) {   /* magnitudes spread over 2^-4 .. 2^4: MX block scales differ per voxel */
     float *h = malloc(n * 4); for (size_t i = 0; i < n; i++) h[i] = frand() * scale * exp2f(rintf(4.f * frand()));
@@ -70,6 +71,7 @@ static void mode_ref(void) { nn_set_tf32(0); }
 static void mode_mx(void) { nn_set_prec(3); nn_set_tf32(1); }
 int main(void) {
     nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0);
+    l0e = getenv("UFSM_L0_NORM") ? atoi(getenv("UFSM_L0_NORM")) : 0;
     nn_set_act_bf16(0); nn_set_grad_bf16(0);
     {   /* e4m3 stochastic rounding of the fp8 weight gradient's gy (sr_e4m3x): unbiased, grid values exact (sr_e4m3, the dither then
            round-to-nearest, gives 1 -> 0.98438: -1/64 on powers of two). 4e6 roundings: sigma <= 0.5 ulp / 2000 */
@@ -368,7 +370,9 @@ int main(void) {
         unet_cfg cfg = wc == 0 ? (unet_cfg){3, {16, 32, 64}, 4, 2, 8, 1} : wc == 1 ? (unet_cfg){3, {16, 16, 32}, 4, 2, 8, 1} : (unet_cfg){3, {8, 16, 32}, 4, 2, 8, 1};
         shape5 xs = {1, 4, 32, 32, 32}; size_t nx = shape_numel(xs), no = nx / 4 * 2;
         float *x = dev_rand(nx, 1.f), *gyo = dev_rand(no, 1.f);
+        cfg.l0_norm = l0e;
         unet *u = unet_create(&cfg); unet_init(u, 29); size_t np = unet_nparams(u);
+        if (l0e == 2) { unet_set_l0_ema(u, 0.f, 1); unet_forward(u, x, xs, 1); }   /* (ema: the running statistics, constants from here on) */
         unet_set_grad_mx4(0); const size_t b8 = unet_train_bytes(u, xs);
         unet_set_grad_mx4(1); const size_t b4 = unet_train_bytes(u, xs);
         float *gr = malloc(np * 4), *g4 = malloc(np * 4), *dm = calloc(np, 4), *rm = calloc(np, 4);
@@ -580,7 +584,9 @@ int main(void) {
             const shape5 xs = {1, 4, 32, 32, 32};
             const size_t nx = shape_numel(xs), S = nx / 4, no = S * 2, tailb = 3 * S;
             float *xi[2] = {dev_rand(nx, 1.f), dev_rand(nx, 1.f)}, *gy[2] = {dev_rand(no, 1.f), dev_rand(no, 1.f)};
+            cfg.l0_norm = l0e;
             unet *v = unet_create(&cfg); unet_init(v, 37); const size_t np = unet_nparams(v);
+            if (l0e == 2) { unet_set_l0_ema(v, 0.f, 1); unet_forward(v, xi[0], xs, 1); }
             float *gg[2][2]; uint16_t *lgs[2][3]; size_t mem[2]; unsigned ctr[2][2]; int l3[2] = {0, 0}, tail_ok = 1;
             uint8_t *pat = malloc(tailb), *chk = malloc(tailb);
             for (size_t i = 0; i < tailb; i++) pat[i] = (uint8_t)(i * 2654435761u >> 13);

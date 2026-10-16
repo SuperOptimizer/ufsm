@@ -169,7 +169,7 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
         d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
         const int zsp = zs_on();
         const float f = gn_bwd_reduce(ds, scratch, NC, s.d, ggamma, gbeta, s.n, s.c);
-        gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, f);
+        gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, g_gn_const ? 0.f : f);   /* (constant statistics: no group terms) */
         const unsigned gsr = gdt == 4 ? sr_seed() : 0u;   /* MX-fp4 gradients: unbiased SR (always, whatever nn_set_sr) */
         /* MX-fp4: the apply also writes the fp4 weight gradient's gy records (its pre-pass skipped); record SR from a seed derived
            from gsr, so the global seed sequence is unchanged */
@@ -203,7 +203,7 @@ extern "C" int nn_gn_silu_bwd_head(float *x, shape5 s, int G, const float *gamma
     d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
     const int zsp = zs_on();
     const float f = gn_bwd_reduce(ds, scratch, NC, s.d, ggamma, gbeta, s.n, s.c);
-    gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, f);
+    gn_group_sums_k<<<nblk(s.n * G, 128), 128>>>(scratch, gamma, s.n, s.c, G, AB, g_gn_const ? 0.f : f);   /* (constant statistics: no group terms) */
     const unsigned gsr = sr_seed();   /* (nn_gn_silu_bwd's draw) */
     lp_gn_silu_bwd_head_apply(x, s, G, gamma, beta, mean, rstd, gl, cout, wh, hs, AB, gsr);
     if (!zsp) gn_param_grad_k2<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);

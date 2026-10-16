@@ -32,6 +32,10 @@ typedef struct {
                               upsampled trilinearly), 2 pack (cin 8: the block means, the CT's sub-voxel gradients and contrast;
                               cout 8 per output, one per sub-voxel); 3 pool4, 4 pack4: the network on 4^3 blocks (a 2x pool / trilinear 2x
                               around pool / pack). The network itself does not use it; train / predict apply the transforms (nn_lowres_*) */
+    int l0_norm;           /* the level-0 normalisation (enc[0] and dec[0]: their four GroupNorms, the head's input one included; down
+                              norms stay GroupNorm): 0 GroupNorm, 1 none (gamma, beta + SiLU: statistics mean 0, rstd 1), 2 ema
+                              (BatchNorm-style running statistics per group, constants in forward and backward once unet_set_l0_ema's
+                              warm-up on live statistics is over; saved in checkpoints). Tensor-core and fp32 paths */
 } unet_cfg;
 static inline int unet_hr_div(int hr) { return hr >= 3 ? 4 : hr ? 2 : 1; }      /* the window voxels per network voxel along each axis */
 static inline int unet_hr_mode(int hr) { return hr == 2 || hr == 4 ? 2 : 1; }   /* the last stage: 1 pool, 2 pack (nn_half_*) */
@@ -86,6 +90,11 @@ int unet_gn_stats_get(unet *u, float *h);
 void unet_gn_freeze(unet *u, const float *h);
 void unet_gn_accumulate(unet *u);           /* add the last forward's statistics (sample 0) to a running pool */
 long unet_gn_pooled(unet *u, float *h);     /* pooled statistics (unet_gn_nstats floats) of the accumulated forwards; returns their count */
+/* cfg.l0_norm 2 (ema): the running statistics move by mom toward each training forward's (the first one replaces them); the first
+   warm forwards normalise with their own statistics (GroupNorm), later ones with the running statistics from before the forward.
+   Defaults 0.01, 100; unet_l0_updates: training forwards so far (saved in checkpoints with the statistics) */
+void unet_set_l0_ema(unet *u, float mom, int warm);
+long unet_l0_updates(const unet *u);
 /* 2:4 structured sparsity of the 3^3 conv weights (groups of 4 input channels keep 2): the forward reads a masked copy
    of the weights (unet_apply_sparse24 runs inside unet_forward); unet_srste24 adds the SR-STE term lambda * w to the
    gradient of the pruned weights so they keep decaying but can be revisited. The flag is saved in checkpoints. */

@@ -83,7 +83,7 @@ __global__ void gn_bwd_stats_k(const float *x, const float *gy, const float *mea
 }
 __global__ void d2f_k(const double *d, float *f, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) f[i] = (float)d[i]; }
 __global__ void gn_bwd_apply_k(const float *x, const float *gy, const float *gamma, const float *mean, const float *rstd, const float *st,
-                               float *gx, int N, int C, int G, size_t S) {
+                               float *gx, int N, int C, int G, size_t S, float f) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)N * C * S) return;
     int c = (int)((i / S) % C), n = (int)(i / (S * C)), cpg = C / G, g = c / cpg, ng = n * G + g;
@@ -91,6 +91,7 @@ __global__ void gn_bwd_apply_k(const float *x, const float *gy, const float *gam
     float a = 0.f, b = 0.f;
     for (int cc = g * cpg; cc < (g + 1) * cpg; cc++) { a += st[2 * (n * C + cc)] * gamma[cc]; b += st[2 * (n * C + cc) + 1] * gamma[cc]; }
     float len = (float)cpg * (float)S;
+    a *= f; b *= f;   /* f 0: constant statistics (nn_set_gn_const) */
     float xhat = (x[i] - mean[ng]) * rstd[ng];
     float gxhat = gy[i] * gamma[c];
     gx[i] = rstd[ng] * (gxhat - a / len - xhat * b / len);
@@ -128,7 +129,7 @@ extern "C" void nn_gn_bwd(const float *x, shape5 s, int G, const float *gamma, c
     gn_bwd_stats_k<<<dim3(NC, KSLAB), 256>>>(x, gy, mean, rstd, s.c, G, S, ds);
     d2f_k<<<nblk(2 * NC, 128), 128>>>(ds, scratch, 2 * NC);
     size_t n = shape_numel(s);
-    gn_bwd_apply_k<<<nblk(n, 256), 256>>>(x, gy, gamma, mean, rstd, scratch, gx, s.n, s.c, G, S);
+    gn_bwd_apply_k<<<nblk(n, 256), 256>>>(x, gy, gamma, mean, rstd, scratch, gx, s.n, s.c, G, S, g_gn_const ? 0.f : 1.f);
     gn_param_grad_k<<<nblk(s.c, 128), 128>>>(scratch, ggamma, gbeta, s.n, s.c);
     KCHECK();
 }
