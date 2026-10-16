@@ -2325,9 +2325,26 @@ parallel (batch 1 each), so the per-GPU limit is the window limit.
     Routing as the paper (every kernel larger than 1x1, strided ones included: the stem, the down convs). Scale:
     the paper's matched applied-update RMS against unfolded Muon (the RMS of exact-polar Muon for that conv,
     sqrt(min(Co, K) / (Co K)) for Co <= K), so `--muon-lr` keeps its meaning and the A/B compares geometry only.
-    No new state. Cost (`bench_muonc`, production net, desk 5060 Ti shared with three P512 trainings): Muon 48 ms per
-    optimizer step, Muon-C 72 ms (the first version, real embedding and one frequency per launch: 145 ms); scratch
-    ~185 MB for 14 complex blocks per conv.
+    No new state. Cost (`bench_muonc`, production net, idle desk 5060 Ti): Muon 10.8 ms per optimizer step, Muon-C
+    16.9 ms, Hyperball +0.6 ms (shared with three trainings: 48 / 72 ms; the first version, real embedding and one
+    frequency per launch, was 145 ms there); scratch ~185 MB for 14 complex blocks per conv.
+  - A/B (2026-10-15/16, desk, production recipe of l0pair.sh: 2.4 um side labels, P512, 2000 steps, --det 1, Muon lr
+    0.02; val loss at 500 / 1000 / 1500 / 2000; seed 2 arms share seed-2 validation windows):
+
+    | arm | seed | val 500 | 1000 | 1500 | 2000 |
+    |---|---|---|---|---|---|
+    | Muon | 1 | 0.6961 | 0.6744 | 0.6605 | 0.6539 |
+    | Hyperball | 1 | 0.6948 | 0.6753 | 0.6634 | 0.6564 |
+    | Muon-C | 1 | 0.7095 | 0.6674 | 0.6543 | 0.6488 |
+    | Muon-C + Hyperball | 1 | 0.7047 | 0.6771 | 0.6616 | 0.6551 |
+    | Muon-C, lr 0.012 | 1 | 0.7278 | 0.6719 | 0.6554 | 0.6504 |
+    | Muon | 2 | 0.6753 | 0.6467 | 0.6296 | 0.6202 |
+    | Muon-C | 2 | 0.6908 | 0.6457 | 0.6285 | 0.6189 |
+
+    Muon-C is ahead from step 1000 in both seeds (-0.0051 and -0.0013 at 2000) and behind at 500 in both; the margin is
+    under the noise floor (gn vs gn2 0.006; two Muon runs of one recipe on two trees, nondeterministic after step 20:
+    0.0034). The paper's lower Muon-C lr (~0.6x) does not transfer (0.012: +0.0017 vs 0.02). Hyperball does not help
+    at 2000 steps (+0.0025, +0.0063 on Muon-C); the paper's gains grow with run length, untested here. Both stay opt-in.
   - Hyperball (Wen, Dang, Lyu, Ma & Liang, arXiv 2606.16899): W <- R Normalize(W - eta R Normalize(u)) with R the
     conv's |W|_F at its first Hyperball step (the initialisation) and u the Muon or Muon-C direction; no weight decay
     on those convs. Applied to the convs whose output goes through a GroupNorm (the paper's scale-invariant
