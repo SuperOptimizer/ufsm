@@ -77,6 +77,22 @@ int main(void) {
             }
             CHECK(ce && cl && e4 < 1e-4 && unet_l0_updates(u) == 3, "ema: the EMA weights' statistics (the first window's: no unet_ema yet) %d, "
                   "inference the running ones, no update (%d, %ld updates), the third window's update (err %g)", ce, cl, unet_l0_updates(u), e4);
+            /* recalibration of the EMA weights' set: two windows with their own statistics, then their mean as the constants */
+            float *ra = malloc(ns * 4), *rb = malloc(ns * 4);
+            unet_use_ema(u, 1); unet_l0_recal(u, 1);
+            unet_forward(u, x1, xs, 0); unet_gn_stats_get(u, ra);
+            unet_forward(u, x2, xs, 0); unet_gn_stats_get(u, rb);
+            unet_l0_recal(u, 0); unet_forward(u, x1, xs, 0); unet_gn_stats_get(u, t); unet_use_ema(u, 0);
+            double er = 0, dr = 0;
+            for (int b = 0; b < 2; b++) for (int q = 0; q < 2; q++) for (int k = 0; k < G; k++) {
+                const size_t im = site[b] + (size_t)(2 * q) * G + k, ir = im + G;
+                const double m = 0.5 * ra[im] + 0.5 * rb[im], v = 0.5 * var_of(ra[ir]) + 0.5 * var_of(rb[ir]);
+                er = fmax(er, fmax(fabs(t[im] - m) / sqrt(v), fabs(var_of(t[ir]) - v) / v));
+                dr = fmax(dr, fabs((double)ra[im] - s[0][im]) / sqrt(v));   /* (window 1 live under the same weights: as forward 1) */
+            }
+            CHECK(er < 1e-4 && unet_l0_updates(u) == 3, "ema recalibration: the EMA weights' constants = the mean of the windows' statistics (err %g, %ld updates)", er, unet_l0_updates(u));
+            CHECK(dr < 1e-3, "ema recalibration: the forwards normalise with their own statistics (window 1 vs forward 1: %g)", dr);
+            free(ra); free(rb);
             free(t);
         }
         if (md) {   /* checkpoint round trip: the mode, the update count and the constants (bits) */

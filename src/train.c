@@ -824,6 +824,7 @@ int cmd_train(int argc, char **argv) {
     int nval = atoi(opt(argc, argv, "--val-batches", "8")), log_every = atoi(opt(argc, argv, "--log-every", "20"));
     int val_every = atoi(opt(argc, argv, "--val-every", "500")), ckpt_every = atoi(opt(argc, argv, "--ckpt-every", "1000"));
     const int val_live = atoi(opt(argc, argv, "--val-live", "0"));   /* validate the live weights instead of the EMA (e.g. resume a last.ckpt for one lr-0 step) */
+    const int l0_recal = atoi(opt(argc, argv, "--l0-recal", "4"));   /* --l0-norm ema: windows recalibrating the EMA weights' level-0 statistics before each validation */
     uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "0"));
     const char *resume = opt(argc, argv, "--resume", nullptr);
     const char *geometry=opt(argc,argv,"--geometry",nullptr),*task=opt(argc,argv,"--task",geometry?"surface_winding":"surface");
@@ -2034,6 +2035,24 @@ int cmd_train(int argc, char **argv) {
                     int keep = G[0].cur;
                     for (int g = 0; g < nv; g++) { if (G[g].lean) { nn_init(G[g].dev); nn_event_sync(G[g].ev_up[keep]); } select_buf(&G[g], keep ^ 1); }   /* lean: one buffer, the prefetch must have landed */
                     g_verso_flip = 0;   /* validation: the direction as is */
+                    if (cfg.l0_norm == 2 && !val_live && l0_recal > 0 && unet_l0_updates(G[0].u) > 0) {   /* ema: the EMA weights' level-0 statistics from
+                                                         l0_recal training windows (own deterministic sampler: the training sequence unchanged) */
+                        sample_cfg rc = vc; rc.holdout = 0; rc.seed = seed + 999; rc.nworkers = 2;
+                        sampler *rq = sampler_start(S, &rc);
+                        if (!rq) { fprintf(stderr, "cannot construct the recalibration sampler\n"); return 1; }
+                        for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_l0_recal(G[g].u, 1); }
+                        for (int i = 0; i < l0_recal; i++) {
+                            batch *rb = sampler_next(rq);
+                            if (!rb) break;
+                            for (int g = 0; g < nv; g++) { nn_init(G[g].dev); upload(&G[g], rb, B, P); }
+                            if (split) { split_arg sa = {G, B, P, 0, dice_w}; split_run(sctx, split_job, &sa); nn_init(G[0].dev); }
+                            else run_batch(&G[0], B, P, dice_w, 0);
+                            sampler_release(rq, rb);
+                        }
+                        sampler_stop(rq);
+                        for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_l0_recal(G[g].u, 0); }
+                        nn_init(G[0].dev);
+                    }
                     sampler *vq = nval > 0 && vmode == VAL_REGEN ? sampler_start(S, &vc) : nullptr;   /* --val-store regen: the same windows drawn again */
                     if (nval > 0 && vmode == VAL_REGEN && !vq) { fprintf(stderr, "cannot construct validation sampler\n"); return 1; }
                     int got = 0;
