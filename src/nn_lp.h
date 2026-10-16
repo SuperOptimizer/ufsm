@@ -58,6 +58,7 @@ void lp_set_gyrec_narrow(int on);   /* the GN+SiLU backward's gy records also fo
 void lp_set_gyrec_off(int off);     /* test hook: 1 no gy records at all (the plain apply), -1 env */
 int lp_gyrec_narrow(void);
 int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp);   /* stride 2; gp: input gn+silu; 0, or 3 when the fp4 kernel ran */
+void lp_set_s2_f4g(int on);   /* the coarse down convs' fp4 forward (conv_fwd_s2_f4_k GEN): 1 on, 0 off, -1 env UFSM_S2_F4G (default off) */
 int lp_bwd_w_s2_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp);   /* stride 2, gw / gb accumulated */
 /* MX-fp8 activation storage (lp dtype 3), see nn_fp8.cu: channel-blocked e4m3 bytes + ue8m0 scale plane */
 size_t lp_mx8_bytes(int N, int C, size_t S);
