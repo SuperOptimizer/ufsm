@@ -1281,11 +1281,16 @@ static int cmd_wind_assign(int argc, char **argv) {
     return rc;
 }
 
-/* ufsm wind-seed <out-dir> <tifxyz>... [--k K] [--axis JSON] [--axis-um U] [--vol-um 2.4] [--out-um U]
+/* ufsm wind-seed <out-dir> <tifxyz>... [--k K] [--axis JSON] [--axis-um U] [--vol-um 2.4] [--out-um U] [--sense set|surface|+1|-1]
+   [--seam set|start]
    A surface set's own winding gauge (src/wind.h wind_seed), for the first set of a scroll (no reference raster): every tifxyz gets
-   q = K + dir (phi - phi_start) on its largest component, K from --k or the segment name in its path (-wNNN_ / -wrapNN / /wNNN),
-   written like wind-assign (<out-dir>/<name>: x / y / z (scaled to --out-um), q.tif) for `ufsm raster --value q.tif`; one line per
-   surface on stdout and in <out-dir>/seed.jsonl (dir, the start / end radii: the start must be the inner end, span in turns). */
+   q on its largest component, K from --k or the segment name in its path (-wNNN_ / -wrapNN / /wNNN), written like wind-assign
+   (<out-dir>/<name>: x / y / z (scaled to --out-um), q.tif) for `ufsm raster --value q.tif`; one line per surface on stdout and in
+   <out-dir>/seed.jsonl. --sense set (default): one spiral sense for the whole set, the radius rule's votes weighted by the radial
+   gap between each surface's ends (a single wrap's ends can swap under an off-centre axis; the sense cannot); surface: each
+   surface's own radius rule. --seam set (default): the turn boundary at the circular mean of the start azimuths (wraps of one
+   numbering share it), q = K on the turn holding a short surface's median; start: q = K at each surface's start. Reported: surfaces
+   whose radius rule disagrees with the set's sense, names out of radial order (consecutive K whose mean radii decrease), repeated K. */
 static int seed_k_from_path(const char *path, double *K) {
     for (const char *p = path; *p; p++) {
         if ((*p == '-' || *p == '_' || *p == '/') && p[1] == 'w') {
@@ -1295,45 +1300,99 @@ static int seed_k_from_path(const char *path, double *K) {
     }
     return -1;
 }
+typedef struct { float *X, *Y, *Z, *xyz; uint8_t *valid; int w, h; } ws_surf;
+static int ws_read(const char *path, ws_surf *S) {
+    memset(S, 0, sizeof *S);
+    S->X = wa_read_f32(path, "x.tif", &S->w, &S->h); S->Y = S->X ? wa_read_f32(path, "y.tif", &S->w, &S->h) : nullptr; S->Z = S->Y ? wa_read_f32(path, "z.tif", &S->w, &S->h) : nullptr;
+    if (!S->Z) { free(S->X); free(S->Y); return -1; }
+    const size_t N = (size_t)S->w * S->h; S->xyz = malloc(N * 3 * sizeof *S->xyz); S->valid = malloc(N);
+    if (!S->xyz || !S->valid) return -1;
+    for (size_t i = 0; i < N; i++) {
+        S->xyz[3 * i] = S->X[i]; S->xyz[3 * i + 1] = S->Y[i]; S->xyz[3 * i + 2] = S->Z[i];
+        S->valid[i] = isfinite(S->X[i]) && isfinite(S->Y[i]) && isfinite(S->Z[i]) && S->Z[i] > 0 && S->X[i] >= 0;
+    }
+    return 0;
+}
+static void ws_free(ws_surf *S) { free(S->X); free(S->Y); free(S->Z); free(S->xyz); free(S->valid); }
+typedef struct { double K, rmean; int idx; } ws_kr;
+static int cmp_ws_kr(const void *a, const void *b) { const ws_kr *x = a, *y = b; return x->K < y->K ? -1 : x->K > y->K ? 1 : x->idx - y->idx; }
 static int cmd_wind_seed(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm wind-seed <out-dir> <tifxyz>... [--k K] [--axis JSON] [--axis-um U] [--vol-um 2.4] [--out-um U]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm wind-seed <out-dir> <tifxyz>... [--k K] [--axis JSON] [--axis-um U] [--vol-um 2.4] [--out-um U] [--sense set|surface|+1|-1] [--seam set|start]\n"); return 2; }
     const double vol_um = atof(opt(argc, argv, "--vol-um", "2.4")), axis_um = atof(opt(argc, argv, "--axis-um", opt(argc, argv, "--vol-um", "2.4")));
     const double out_um = atof(opt(argc, argv, "--out-um", opt(argc, argv, "--vol-um", "2.4")));
+    const char *sense_o = opt(argc, argv, "--sense", "set"), *seam_o = opt(argc, argv, "--seam", "set");
+    const int sense_set = !strcmp(sense_o, "set"), sense_surf = !strcmp(sense_o, "surface"), seam_set = !strcmp(seam_o, "set");
     if (!(vol_um > 0 && axis_um > 0 && out_um > 0)) { fprintf(stderr, "wind-seed: --vol-um / --axis-um / --out-um > 0\n"); return 2; }
+    if (!sense_set && !sense_surf && strcmp(sense_o, "+1") && strcmp(sense_o, "-1") && strcmp(sense_o, "1")) { fprintf(stderr, "wind-seed: --sense set|surface|+1|-1\n"); return 2; }
+    if (!seam_set && strcmp(seam_o, "start")) { fprintf(stderr, "wind-seed: --seam set|start\n"); return 2; }
     wa_axis A = {.f = axis_um / vol_um};
     if (axis_load(&A.ax, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "wind-seed: cannot load the axis\n"); return 1; }
     char lp[1400]; snprintf(lp, sizeof lp, "%s/seed.jsonl", argv[2]);
     if (mkdir(argv[2], 0755) && errno != EEXIST) { fprintf(stderr, "wind-seed: mkdir %s\n", argv[2]); return 1; }
-    FILE *log = fopen(lp, "a"); if (!log) { fprintf(stderr, "wind-seed: cannot write %s\n", lp); return 1; }
     const char *kopt = opt(argc, argv, "--k", nullptr);
-    int rc = 0, nsurf = 0;
+    /* pass 1: each surface's radius rule (sense 0) -> the set's sense and seam */
+    int ns = 0, *idx = malloc(argc * sizeof *idx); double *Ks = malloc(argc * sizeof *Ks); wind_seed_info *i1 = calloc(argc, sizeof *i1);
+    int rc = 0;
     for (int a = 3; a < argc; a++) {
         if (argv[a][0] == '-') { a++; continue; }
         double K = 0;
         if (kopt) K = atof(kopt);
         else if (seed_k_from_path(argv[a], &K)) { fprintf(stderr, "wind-seed: %s: no wNNN / wrapNN in the path (give --k)\n", argv[a]); rc = 1; continue; }
-        int w = 0, h = 0; float *X = wa_read_f32(argv[a], "x.tif", &w, &h), *Y = X ? wa_read_f32(argv[a], "y.tif", &w, &h) : nullptr, *Z = Y ? wa_read_f32(argv[a], "z.tif", &w, &h) : nullptr;
-        if (!Z) { fprintf(stderr, "wind-seed: %s: x / y / z.tif must be matching float32 images\n", argv[a]); free(X); free(Y); rc = 1; continue; }
-        const size_t N = (size_t)w * h; float *xyz = malloc(N * 3 * sizeof *xyz); uint8_t *valid = malloc(N);
-        for (size_t i = 0; i < N; i++) {
-            xyz[3 * i] = X[i]; xyz[3 * i + 1] = Y[i]; xyz[3 * i + 2] = Z[i];
-            valid[i] = isfinite(X[i]) && isfinite(Y[i]) && isfinite(Z[i]) && Z[i] > 0 && X[i] >= 0;
-        }
+        ws_surf S; if (ws_read(argv[a], &S)) { fprintf(stderr, "wind-seed: %s: x / y / z.tif must be matching float32 images\n", argv[a]); ws_free(&S); rc = 1; continue; }
         wind_result r; wind_seed_info in;
-        const int e = wind_seed(xyz, valid, w, h, wa_axis_fn, &A, K, &in, &r);
+        const int e = wind_seed(S.xyz, S.valid, S.w, S.h, wa_axis_fn, &A, K, 0, NAN, &in, &r);
+        if (e == -1) { fprintf(stderr, "wind-seed: out of memory\n"); return 1; }
+        ws_free(&S); if (e) { fprintf(stderr, "wind-seed: %s: no valid vertex\n", argv[a]); continue; }
+        wind_result_free(&r);
+        idx[ns] = a; Ks[ns] = K; i1[ns++] = in;
+    }
+    int sset = 1; double phi_set = 0, vote[2] = {0, 0}, res = 0; wind_seed_set(i1, ns, &sset, &phi_set, vote, &res);
+    const int sense = sense_surf ? 0 : sense_set ? sset : atoi(sense_o) > 0 ? 1 : -1;
+    double phi0 = NAN;
+    if (sense && seam_set && ns) {
+        if (sense != sset) { int s2; double v2[2]; wind_seed_info *flip = malloc(ns * sizeof *flip);   /* a forced sense: its own starts */
+            for (int k = 0; k < ns; k++) { flip[k] = i1[k]; flip[k].radial_dir = sense; flip[k].r_c[0] = 0; flip[k].r_c[1] = 1; }
+            wind_seed_set(flip, ns, &s2, &phi_set, v2, &res); free(flip); }
+        phi0 = phi_set;
+        fprintf(stderr, "wind-seed: seam at azimuth %.3f turn (start azimuths' resultant length %.2f)\n", phi0, res);
+    }
+    if (sense) fprintf(stderr, "wind-seed: spiral sense %+d (radius-rule votes weighted by the ends' radial gap: + %.0f, - %.0f scan voxels)\n", sense, vote[0], vote[1]);
+    FILE *log = fopen(lp, "a"); if (!log) { fprintf(stderr, "wind-seed: cannot write %s\n", lp); return 1; }
+    int nsurf = 0, ndis = 0; ws_kr *kr = malloc((ns + 1) * sizeof *kr);
+    for (int k = 0; k < ns; k++) {   /* pass 2: the set's sense and seam */
+        const int a = idx[k]; const double K = Ks[k];
+        ws_surf S; if (ws_read(argv[a], &S)) { ws_free(&S); rc = 1; continue; }
+        const int w = S.w, h = S.h; const size_t N = (size_t)w * h;
+        wind_result r; wind_seed_info in;
+        const int e = wind_seed(S.xyz, S.valid, w, h, wa_axis_fn, &A, K, sense, phi0, &in, &r);
         if (e == -1) { fprintf(stderr, "wind-seed: out of memory\n"); return 1; }
         const char *base = strrchr(argv[a], '/'); base = base && base[1] ? base + 1 : argv[a];
-        if (e == -2) { fprintf(stderr, "wind-seed: %s: no valid vertex\n", base); free(xyz); free(valid); free(X); free(Y); free(Z); continue; }
+        if (e == -2) { ws_free(&S); continue; }
         char od[1400], qp[1500]; snprintf(od, sizeof od, "%s/%s", argv[2], base);
-        const double f = vol_um / out_um;
-        if (f != 1.0) for (size_t i = 0; i < N; i++) if (valid[i]) { X[i] = (float)(X[i] * f); Y[i] = (float)(Y[i] * f); Z[i] = (float)(Z[i] * f); }
+        const double f = vol_um / out_um; float *X = S.X, *Y = S.Y, *Z = S.Z;
+        if (f != 1.0) for (size_t i = 0; i < N; i++) if (S.valid[i]) { X[i] = (float)(X[i] * f); Y[i] = (float)(Y[i] * f); Z[i] = (float)(Z[i] * f); }
         if (tifxyz_write(od, w, h, X, Y, Z, 1.0, out_um, -1, "ufsm wind-seed (x / y / z of the input; q.tif: the set's own winding gauge)")) { fprintf(stderr, "wind-seed: cannot write %s\n", od); rc = 1; }
         snprintf(qp, sizeof qp, "%s/q.tif", od);
         if (tiffw_write(qp, w, h, 3, r.q, 1)) { fprintf(stderr, "wind-seed: cannot write %s\n", qp); rc = 1; }
-        printf("%s K %g dir %+d span %.2f turns, r start %.0f end %.0f (scan voxels), %zu of %zu valid vertices assigned\n", base, K, in.dir, in.span, in.r_start, in.r_end, in.nassigned, in.nvalid);
-        fprintf(log, "{\"surface\":\"%s\",\"K\":%g,\"dir\":%d,\"span\":%.4f,\"r_start\":%.2f,\"r_end\":%.2f,\"assigned\":%zu,\"valid\":%zu}\n", base, K, in.dir, in.span, in.r_start, in.r_end, in.nassigned, in.nvalid);
-        wind_result_free(&r); free(xyz); free(valid); free(X); free(Y); free(Z); nsurf++;
+        const int dis = sense && in.radial_dir != sense; ndis += dis;
+        printf("%s K %g dir %+d%s span %.2f turns, q start %.3f, r start %.0f end %.0f mean %.0f (scan voxels), %zu of %zu valid vertices assigned\n", base, K, in.dir,
+               dis ? " (the radius rule says the other end is inner)" : "", in.span, in.q_start, in.r_start, in.r_end, in.r_mean, in.nassigned, in.nvalid);
+        fprintf(log, "{\"surface\":\"%s\",\"K\":%g,\"dir\":%d,\"radial_dir\":%d,\"span\":%.4f,\"q_start\":%.4f,\"r_start\":%.2f,\"r_end\":%.2f,\"r_mean\":%.2f,\"assigned\":%zu,\"valid\":%zu}\n",
+                base, K, in.dir, in.radial_dir, in.span, in.q_start, in.r_start, in.r_end, in.r_mean, in.nassigned, in.nvalid);
+        kr[nsurf] = (ws_kr){K, in.r_mean, a};
+        wind_result_free(&r); ws_free(&S); nsurf++;
     }
+    if (sense) fprintf(stderr, "wind-seed: %d of %d surfaces' radius rule disagrees with the set's sense\n", ndis, nsurf);
+    if (!kopt && nsurf > 1) {   /* the names against the radial order */
+        qsort(kr, nsurf, sizeof *kr, cmp_ws_kr); int inv = 0, rep = 0;
+        for (int k = 1; k < nsurf; k++) {
+            const char *b0 = strrchr(argv[kr[k - 1].idx], '/'), *b1 = strrchr(argv[kr[k].idx], '/');
+            if (kr[k].K == kr[k - 1].K) { rep++; fprintf(stderr, "wind-seed: K %g named twice: %s, %s\n", kr[k].K, b0 ? b0 + 1 : "", b1 ? b1 + 1 : ""); }
+            else if (kr[k].rmean < kr[k - 1].rmean) { inv++; fprintf(stderr, "wind-seed: out of radial order: K %g (mean r %.0f) inside K %g (mean r %.0f)\n", kr[k].K, kr[k].rmean, kr[k - 1].K, kr[k - 1].rmean); }
+        }
+        fprintf(stderr, "wind-seed: names vs radii: %d inversions between consecutive K, %d repeated K\n", inv, rep);
+    }
+    free(kr); free(idx); free(Ks); free(i1);
     fclose(log);
     fprintf(stderr, "wind-seed: %d surfaces -> %s\n", nsurf, argv[2]);
     return rc;

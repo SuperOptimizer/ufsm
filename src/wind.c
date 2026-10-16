@@ -139,8 +139,9 @@ int wind_assign(const float *xyz, const uint8_t *valid, int w, int h, void (*axi
     return 0;
 }
 
+static int cmp_double(const void *a, const void *b) { const double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
 int wind_seed(const float *xyz, const uint8_t *valid, int w, int h, void (*axis_fn)(void *, double, double *, double *), void *axis_ud,
-              double K, wind_seed_info *info, wind_result *out) {
+              double K, int sense, double phi0, wind_seed_info *info, wind_result *out) {
     memset(out, 0, sizeof *out); memset(info, 0, sizeof *info);
     const size_t N = (size_t)w * h;
     double *phi = malloc(N * sizeof *phi), *theta = malloc(N * sizeof *theta), *rad = malloc(N * sizeof *rad);
@@ -176,19 +177,47 @@ int wind_seed(const float *xyz, const uint8_t *valid, int w, int h, void (*axis_
     int c0 = w, c1 = -1;
     for (size_t i = 0; i < N; i++) if (comp[i] == best) { const int c = (int)(i % w); if (c < c0) c0 = c; if (c > c1) c1 = c; }
     const int band = (c1 - c0) / 20 + 1;
-    double sr[2] = {0, 0}, sp[2] = {0, 0}; size_t sn[2] = {0, 0}, se[2] = {0, 0};   /* radius: 5% column bands; phi: the extreme columns */
+    double sr[2] = {0, 0}, sp[2] = {0, 0}, rm = 0; size_t sn[2] = {0, 0}, se[2] = {0, 0}, nb = 0;   /* radius: 5% column bands; phi: the extreme columns */
     for (size_t i = 0; i < N; i++) {
         if (comp[i] != best) { if (valid[i]) out->flag[i] = 4; continue; }
         const int c = (int)(i % w), e = c < c0 + band ? 0 : c > c1 - band ? 1 : -1;
         if (e >= 0) { sr[e] += rad[i]; sn[e]++; }
         if (c == c0) { sp[0] += phi[i]; se[0]++; } else if (c == c1) { sp[1] += phi[i]; se[1]++; }
+        rm += rad[i]; nb++;
     }
     for (int e = 0; e < 2; e++) { if (sn[e]) sr[e] /= (double)sn[e]; if (se[e]) sp[e] /= (double)se[e]; }
-    const int st = sr[0] <= sr[1] ? 0 : 1, en = 1 - st;   /* the start: the end nearer the umbilicus */
-    const int dir = sp[en] >= sp[st] ? 1 : -1;
-    for (size_t i = 0; i < N; i++) if (comp[i] == best) { out->q[i] = (float)(K + dir * (phi[i] - sp[st])); out->flag[i] = 1; info->nassigned++; }
+    const int rst = sr[0] <= sr[1] ? 0 : 1, rdir = sp[1 - rst] >= sp[rst] ? 1 : -1;   /* the radius rule: the start nearer the umbilicus */
+    const int st = sense ? (sense * (sp[1] - sp[0]) >= 0 ? 0 : 1) : rst, en = 1 - st, dir = sense ? sense : rdir;
+    const double span = dir * (sp[en] - sp[st]);
+    double off = K - dir * sp[st];   /* q = off + dir phi */
+    if (!isnan(phi0) && span < 1.2) {   /* the median of dir (phi - phi0) over a subsample of the component: its turn is K */
+        size_t m = 0; const size_t stride = bsize / 4096 + 1; double *v = malloc((bsize / stride + 2) * sizeof *v);
+        if (!v) { free(phi); free(theta); free(rad); free(comp); free(queue); wind_result_free(out); return -1; }
+        size_t k = 0; for (size_t i = 0; i < N; i++) if (comp[i] == best && k++ % stride == 0) v[m++] = dir * (phi[i] - phi0);
+        qsort(v, m, sizeof *v, cmp_double); const double med = v[m / 2]; free(v);
+        off = K - floor(med) - dir * phi0;
+    } else if (!isnan(phi0)) {
+        double wo = dir * (sp[st] - phi0); wo -= floor(wo + 0.5);   /* the start's offset from the seam, in [-0.5, 0.5) */
+        off = K + wo - dir * sp[st];
+    }
+    for (size_t i = 0; i < N; i++) if (comp[i] == best) { out->q[i] = (float)(off + dir * phi[i]); out->flag[i] = 1; info->nassigned++; }
     for (size_t i = 0; i < N; i++) info->nvalid += valid[i] != 0;
-    info->dir = dir; info->r_start = sr[st]; info->r_end = sr[en]; info->span = dir * (sp[en] - sp[st]);
+    info->dir = dir; info->radial_dir = rdir; info->r_start = sr[st]; info->r_end = sr[en]; info->r_mean = nb ? rm / (double)nb : 0; info->span = span;
+    info->q_start = off + dir * sp[st];
+    for (int e = 0; e < 2; e++) { info->phi_c[e] = sp[e]; info->r_c[e] = sr[e]; }
     free(phi); free(theta); free(rad); free(comp); free(queue);
     return 0;
+}
+
+void wind_seed_set(const wind_seed_info *in, int n, int *sense, double *phi0, double vote[2], double *resultant) {
+    vote[0] = vote[1] = 0;
+    for (int k = 0; k < n; k++) vote[in[k].radial_dir > 0 ? 0 : 1] += fabs(in[k].r_c[1] - in[k].r_c[0]);
+    *sense = vote[0] >= vote[1] ? 1 : -1;
+    double cx = 0, cy = 0;
+    for (int k = 0; k < n; k++) {
+        const double ps = *sense * (in[k].phi_c[1] - in[k].phi_c[0]) >= 0 ? in[k].phi_c[0] : in[k].phi_c[1];
+        cx += cos(2 * M_PI * ps); cy += sin(2 * M_PI * ps);
+    }
+    *phi0 = n ? atan2(cy, cx) / (2 * M_PI) : 0; if (*phi0 < 0) *phi0 += 1;
+    *resultant = n ? hypot(cx, cy) / n : 0;
 }

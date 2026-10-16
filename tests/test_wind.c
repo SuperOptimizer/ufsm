@@ -21,6 +21,7 @@ static uint8_t *ref; static int ref_kind;
 
 static uint8_t code_of(double q) { long k = lround(q * 18.0) % 252; if (k < 0) k += 252; return (uint8_t)(1 + k); }
 static void axis_fn(void *ud, double z, double *cy, double *cx) { (void)ud; (void)z; *cy = CY; *cx = CX; }
+static void axis_off(void *ud, double z, double *cy, double *cx) { (void)ud; (void)z; *cy = CY; *cx = CX + 50; }
 static void lookup(void *ud, const float *pts, size_t n, float tol, float *dist, float *qref) {
     (void)ud; const int R = (int)ceilf(tol);
     for (size_t i = 0; i < n; i++) {
@@ -111,13 +112,37 @@ int main(void) {
         for (int r = 0; r < h; r++) for (int c = 0; c < w; c++) { const size_t a = (size_t)r * w + c, b = (size_t)r * w + (w - 1 - c);
             memcpy(xr + 3 * a, S.xyz + 3 * b, 3 * sizeof *xr); vr[a] = S.valid[b]; qt[a] = S.qtrue[b]; }
         wind_result r; wind_seed_info in;
-        CHECK(!wind_seed(xr, vr, w, h, axis_fn, nullptr, 5.0, &in, &r), "wind_seed failed");
+        CHECK(!wind_seed(xr, vr, w, h, axis_fn, nullptr, 5.0, 0, NAN, &in, &r), "wind_seed failed");
         double emax = 0; size_t nq = 0;
         for (size_t i = 0; i < (size_t)w * h; i++) if (vr[i] && !isnan(r.q[i])) { const double e = fabs(r.q[i] - qt[i]); if (e > emax) emax = e; nq++; }
         CHECK(in.r_start < in.r_end && in.span > 0.9 && in.span < 1.1 && emax < 0.06 && nq > 0, "wind_seed: r %.0f -> %.0f, span %.2f, max |q - q_true| %.3f over %zu vertices",
               in.r_start, in.r_end, in.span, emax, nq);
         printf("wind-seed: one reversed wrap -> K at its inner end, span %.2f turn, max |q - q_true| %.3f\n", in.span, emax);
         wind_result_free(&r); free(xr); free(vr); free(qt); free(S.xyz); free(S.valid); free(S.qtrue);
+    }
+    {   /* wind_seed on a named set under an axis 50 voxels off the umbilicus: w5 (q 5 .. 5.95, columns reversed), w6 (6.1 .. 6.95,
+           partial), w7 (6.97 .. 7.92: cut a little before the seam), w8 (8.4 .. 8.98, partial: the off-centre axis swaps its ends'
+           radii, so its own radius rule reverses it). The set's sense and seam put every vertex in its true turn. */
+        const double qa[4] = {5.0, 6.1, 6.97, 8.4}, qb[4] = {5.95, 6.95, 7.92, 8.98}, K[4] = {5, 6, 7, 8};
+        surf S[4]; wind_seed_info i1[4]; double own8 = 0;
+        for (int k = 0; k < 4; k++) {
+            S[k] = make(qa[k], qb[k], 10, 50, 0, 0, k == 0);
+            wind_result r; CHECK(!wind_seed(S[k].xyz, S[k].valid, S[k].w, S[k].h, axis_off, nullptr, K[k], 0, NAN, &i1[k], &r), "wind_seed set pass 1");
+            if (k == 3) for (size_t i = 0; i < (size_t)S[k].w * S[k].h; i++) if (!isnan(r.q[i])) { const double e = fabs(r.q[i] - S[k].qtrue[i]); if (e > own8) own8 = e; }
+            wind_result_free(&r);
+        }
+        int sense; double phi0, vote[2], res; wind_seed_set(i1, 4, &sense, &phi0, vote, &res);
+        double emax = 0;
+        for (int k = 0; k < 4; k++) {
+            wind_result r; wind_seed_info in;
+            CHECK(!wind_seed(S[k].xyz, S[k].valid, S[k].w, S[k].h, axis_off, nullptr, K[k], sense, phi0, &in, &r), "wind_seed set pass 2");
+            for (size_t i = 0; i < (size_t)S[k].w * S[k].h; i++) if (!isnan(r.q[i])) { const double e = fabs(r.q[i] - S[k].qtrue[i]); if (e > emax) emax = e; }
+            wind_result_free(&r); free(S[k].xyz); free(S[k].valid); free(S[k].qtrue);
+        }
+        CHECK(i1[3].radial_dir != 1 && sense == 1 && emax < 0.25 && own8 > 0.4, "wind_seed set: w8's own rule dir %+d (worst %.2f), set sense %+d (votes %.0f / %.0f), seam %.3f, worst |q - q_true| %.3f",
+              i1[3].radial_dir, own8, sense, vote[0], vote[1], phi0, emax);
+        printf("wind-seed set: 4 named wraps, axis 50 voxels off: w8 alone reversed (worst %.2f turn), the set's sense %+d (votes %.0f / %.0f) and seam %.3f: worst |q - q_true| %.3f\n",
+               own8, sense, vote[0], vote[1], phi0, emax);
     }
     printf("winding assignment: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

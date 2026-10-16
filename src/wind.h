@@ -57,14 +57,26 @@ int wind_assign(const float *xyz, const uint8_t *valid, int w, int h, void (*axi
 void wind_result_free(wind_result *r);
 
 /* A surface set's own gauge, without a reference (the first set of a scroll): the largest connected component gets
-   q = K + dir (phi - phi_start), phi = theta / 2 pi unwrapped along the mesh grid as in wind_assign. The start is the end of the
-   grid (first or last 5% of its columns) nearer the umbilicus (the authors' unrollings run along columns: a single-wrap segment
-   wNNN covers one turn from its seam, a merged spiral starts at its innermost wrap), dir the sign that makes q grow away from it.
-   Other components: unassigned (flag 4, NaN). info: r_start / r_end (mean radius of the two column bands, scan voxels), span
-   (q_end - q_start, turns), dir. Returns 0, -1 out of memory, -2 no valid vertex. */
-typedef struct { int dir; double r_start, r_end, span; size_t nvalid, nassigned; } wind_seed_info;
+   q = off + dir phi, phi = theta / 2 pi unwrapped along the mesh grid as in wind_assign. Its two ends are the first and last 5% of
+   the grid's columns (the authors' unrollings run along columns: a single-wrap segment wNNN covers about one turn, a merged spiral
+   starts at its innermost wrap).
+   sense 0: the start is the end nearer the umbilicus, dir the sign that makes q grow away from it (one surface alone);
+   sense +-1: the scroll's spiral sense, common to all its surfaces (q grows outward with sense * phi): dir = sense, the start is the
+   end q grows from (a single wrap's two ends lie about one pitch apart radially: an axis off the umbilicus, or a partial wrap, can
+   swap them, the set's sense cannot).
+   phi0 NaN: q = K at the start. Else phi0 is the set's seam (turns; the circular mean of its surfaces' start azimuths): a surface
+   under 1.2 turns gets the turn [K, K + 1) from the seam around its median (partial wraps and wraps cut a little before or after
+   the seam keep the name's turn), a longer one K at its start's turn (start within half a turn of the seam).
+   Other components: unassigned (flag 4, NaN). info: dir; radial_dir (the dir the radius rule picks); r_start / r_end (mean radius
+   of the two column bands, scan voxels) and r_mean; span (turns); phi_c[2] / r_c[2]: phi and radius at the first / last columns;
+   q_start. Returns 0, -1 out of memory, -2 no valid vertex. */
+typedef struct { int dir, radial_dir; double r_start, r_end, r_mean, span, q_start, phi_c[2], r_c[2]; size_t nvalid, nassigned; } wind_seed_info;
 int wind_seed(const float *xyz, const uint8_t *valid, int w, int h, void (*axis_fn)(void *, double, double *, double *), void *axis_ud,
-              double K, wind_seed_info *info, wind_result *out);
+              double K, int sense, double phi0, wind_seed_info *info, wind_result *out);
+/* A set's spiral sense and seam from its surfaces' wind_seed infos with sense 0: the radius rule's votes weighted by each surface's
+   radial gap between its column ends (vote[0] for +1, vote[1] for -1), then the circular mean of the start azimuths under that
+   sense (turns, [0, 1); *resultant: the mean resultant length, 1 = all starts on one azimuth). */
+void wind_seed_set(const wind_seed_info *in, int n, int *sense, double *phi0, double vote[2], double *resultant);
 
 /* code -> q_ref (turns mod 14), NaN without a winding */
 static inline float wind_code_q(uint8_t c, int kind) {
