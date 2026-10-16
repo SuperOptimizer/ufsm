@@ -26,9 +26,9 @@ int main(void) {
         int cropped=0,checked=0;
         for (int si=0;si<48;si++) {
             sym sy=sym_of(si); rng r; rseed(&r,2);
-            write_spatial(ct,target,mask,T,M,P,origin,0,1,1,cy,cx,sy,&a,1,0,0,&r,row,0,X,nullptr,nullptr,nullptr,nullptr,&sheet,params,scratch);
+            write_spatial(ct,target,mask,T,M,P,origin,0,1,1,cy,cx,sy,&a,1,0,0,&r,row,0,X,nullptr,nullptr,nullptr,nullptr,&sheet,params,scratch,0,0);
             rseed(&r,2);
-            write_spatial(ct,target,mask,T,M,P,origin,0,1,1,cy,cx,sy,&a,1,0,0,&r,row,1,nullptr,H,nullptr,nullptr,nullptr,&sheet,params,scratch);
+            write_spatial(ct,target,mask,T,M,P,origin,0,1,1,cy,cx,sy,&a,1,0,0,&r,row,1,nullptr,H,nullptr,nullptr,nullptr,&sheet,params,scratch,0,0);
             for (int z=0;z<P;z++) for (int y=0;y<P;y++) for (int x=0;x<P;x++) {
                 size_t k=((size_t)z*P+y)*P+x; float pulled[3],jac[3]; spatial_aug_pull(&a,table,z,y,x,pulled,jac);
                 double world[3]; int inside=1;
@@ -88,6 +88,38 @@ int main(void) {
             printf("phase warp mode %d: %d voxels, max error %.4f turn, %d outside the window unknown: ok\n",mode,known,worst,outside);
         }
         free(ph); free(out);
+    }
+    {   /* hard targets (packed side classes): every warped voxel takes the code of its nearest source voxel (0 / 255, never a blend);
+           the CT-only writer (--gpu-input) gives channel 0, targets and mask bit for bit as the 4-channel one */
+        uint8_t *hard=malloc(NCH*n),*T1=malloc(NCH*n),*M1=malloc(n); uint16_t *H1=malloc(n*2);
+        for (size_t k=0;k<n;k++) { int z=(int)(k/(P*P)),y=(int)(k/P%P),x=(int)(k%P); hard[k]=(x+2*y+3*z)%7<3?255:0; hard[n+k]=hard[k]?0:(z+x)%5?255:0; mask[k]=(x*y+z)%11!=0; }
+        int blends=0,mismatch=0,checked=0,ctdiff=0;
+        for (int mode=0;mode<5;mode++) {
+            spatial_aug a; spatial_aug_make(&a,31+mode,P,mode==1?0:8,1,mode==0?0:1,1);
+            if (mode==3) spatial_aug_zoom(&a,.6);   /* (zoom-out's 1.2 of the coarser level) */
+            if (mode==4) spatial_aug_affine(&a,77,.2,.12);
+            spatial_aug_tables(&a,table);
+            for (int si=0;si<48;si+=5) {
+                sym sy=sym_of(si); rng r;
+                rseed(&r,9); write_spatial(ct,hard,mask,T,M,P,origin,80,.03f,1,cy,cx,sy,&a,1,0,.02f,&r,row,1,nullptr,H,nullptr,nullptr,nullptr,nullptr,nullptr,scratch,1,0);
+                rseed(&r,9); write_spatial(ct,hard,mask,T1,M1,P,origin,80,.03f,1,cy,cx,sy,&a,1,0,.02f,&r,row,1,nullptr,H1,nullptr,nullptr,nullptr,nullptr,nullptr,scratch,1,1);
+                ctdiff+=memcmp(H,H1,n*2)!=0 || memcmp(T,T1,NCH*n)!=0 || memcmp(M,M1,n)!=0;
+                for (int z=0;z<P;z++) for (int y=0;y<P;y++) for (int x=0;x<P;x++) {
+                    size_t k=((size_t)z*P+y)*P+x; float pulled[3],jac[3]; spatial_aug_pull(&a,table,z,y,x,pulled,jac);
+                    float v[3]; int inside=1,tie=0;
+                    for (int d=0;d<3;d++) v[sy.perm[d]]=sy.flip[d]?P-1-pulled[d]:pulled[d];
+                    for (int d=0;d<3;d++) { inside&=v[d]>=0 && v[d]<=P-1; float f=v[d]-floorf(v[d]); tie|=fabsf(f-.5f)<1e-3f; }
+                    for (int ch=0;ch<NCH;ch++) blends+=T[(size_t)ch*n+k]!=0 && T[(size_t)ch*n+k]!=255;
+                    if (!inside || tie) continue;
+                    size_t j=((size_t)lroundf(v[0])*P+lroundf(v[1]))*P+lroundf(v[2]);
+                    for (int ch=0;ch<NCH;ch++) mismatch+=T[(size_t)ch*n+k]!=hard[(size_t)ch*n+j];
+                    checked++;
+                }
+            }
+        }
+        printf("hard-target warp: %d voxels checked, %d blends, %d not the nearest source code, CT-only writer differs %d times\n",checked,blends,mismatch,ctdiff);
+        assert(!blends && !mismatch && !ctdiff && checked>10000);
+        free(hard); free(T1); free(M1); free(H1);
     }
     free(ct); free(target); free(mask); free(T); free(M); free(X); free(H); free(scratch);
     puts("spatial augmentation registration: ok"); return 0;

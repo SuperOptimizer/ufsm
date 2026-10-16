@@ -176,6 +176,29 @@ static void test_generalisation_ops(void) {
 int main(void) {
     test_identity(); test_ops(); test_seam(); test_operators(); test_generalisation_ops();
     if (failures) { fprintf(stderr, "scan augment: %d failure(s)\n", failures); return 1; }
+    {   /* the per-axis operator chain at its widest (blur, sharpen, motion, lowres at per-op strength 3) stays within MAXTAP */
+        for (uint64_t seed = 0; seed < 40; seed++) {
+            fill(&v0, 1, 0); v1 = v0;
+            scan_aug_cfg c = one(-1, 2); c.p[SA_BLUR] = c.p[SA_SHARPEN] = c.p[SA_MOTION] = c.p[SA_LOWRES] = 1;
+            c.s[SA_BLUR] = c.s[SA_SHARPEN] = c.s[SA_MOTION] = c.s[SA_LOWRES] = 3;
+            CHECK(run(&c, seed, &v1, 1, 1) == (1u << SA_BLUR | 1u << SA_SHARPEN | 1u << SA_MOTION | 1u << SA_LOWRES), "widest chain fires");
+        }
+        /* motion on a constant volume is the identity; on a ramp along every axis a box blur keeps the interior and a ghost
+           shifts it by a constant (sum of echo weight x offset): one value per interior voxel minus the original */
+        for (uint64_t seed = 0; seed < 12; seed++) {
+            fill(&v0, 0, 1); v1 = v0; scan_aug_cfg c = one(SA_MOTION, 1); run(&c, seed, &v1, 1, 1);
+            CHECK(!memcmp(v0.ct, v1.ct, sizeof v0.ct), "motion keeps a constant volume");
+            for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) v0.ct[((size_t)z * P + y) * P + x] = (uint8_t)(20 + x + y + z);
+            v1 = v0; run(&c, seed, &v1, 1, 1);
+            int dmin = 999, dmax = -999;
+            for (int z = 10; z < P - 10; z++) for (int y = 10; y < P - 10; y++) for (int x = 10; x < P - 10; x++) {
+                const size_t k = ((size_t)z * P + y) * P + x; const int d = (int)v1.ct[k] - (int)v0.ct[k];
+                if (d < dmin) dmin = d;
+                if (d > dmax) dmax = d;
+            }
+            CHECK(dmax - dmin <= 1, "motion: a ramp's interior moves by one constant");
+        }
+    }
     printf("scan augment: identity, determinism, label/ignore consistency of %d ops, seam registration, operators, paganin / gin / hist / per-op strength: ok\n", SA_N);
     return 0;
 }

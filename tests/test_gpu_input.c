@@ -67,7 +67,61 @@ int main(void) {
                 free(ct); free(h4); free(h1); free(t4); free(recs); free(ya); free(yb);
             }
     }
+    /* warped windows (write_spatial: rotation + elastic, zoom in / out, affine): the transported radial vector built on the device from
+       the warp in the record, and the CT-only writer's channel 0 / targets / mask equal to the 4-channel writer's; two samples per batch,
+       the second unwarped (zoom 1, no rotation would still draw an elastic field: zoom 0 = the plain write_x record of a warped writer is
+       not needed, the flag is per sample) */
+    int wcases = 0;
+    for (int xfmt = 1; xfmt <= 2; xfmt++) {
+        nn_set_f16(xfmt == 1);
+        for (int bits = 8; bits >= 4; bits -= 4) {
+            const int P = 40, N = 2; const size_t S = (size_t)P * P * P, rec = NN_RAD_REC(P);
+            const shape5 xs = {N, 4, P, P, P};
+            const size_t mxb = nn_mx_bytes(xs, bits);
+            uint8_t *ct = malloc(S), *tg = malloc(NCH * S), *mk = malloc(S), *T = malloc(NCH * S), *M = malloc(S);
+            uint16_t *h4 = malloc((size_t)N * 4 * S * 2), *h1 = malloc((size_t)N * S * 2), *t4 = malloc(4 * S * 2);
+            uint8_t *recs = malloc((size_t)N * rec), *ya = malloc(mxb), *yb = malloc(mxb);
+            void *d_h4 = nn_malloc((size_t)N * 4 * S * 2), *d_h1 = nn_malloc((size_t)N * S * 2), *d_rec = nn_malloc((size_t)N * rec), *d_ya = nn_malloc(mxb), *d_yb = nn_malloc(mxb);
+            nn_set_storage(d_ya, mxb, bits); nn_set_storage(d_yb, mxb, bits);
+            for (int sym = 0; sym < 48; sym += 3) for (int ax = 0; ax < 2; ax++) for (int mode = 0; mode < 4; mode++) {
+                const float zoom = mode == 1 ? .8f : mode == 2 ? .6f : 1.f; const int affine = mode == 3;
+                for (int n = 0; n < N; n++) {
+                    int perm[3], flip[3];
+                    const int pi = (sym + 2 * n) % 6, fl = (sym / 6) ^ (n ? 3 : 0);
+                    for (int d = 0; d < 3; d++) { perm[d] = perms[pi][d]; flip[d] = (fl >> d) & 1; }
+                    const int64_t o[3] = {(int64_t)(rn() % 4000), (int64_t)(rn() % 30000), (int64_t)(rn() % 30000)};
+                    float cyz[64], cxz[64];
+                    for (int z = 0; z < P; z++) { cyz[z] = (float)o[1] + 150.f * (ru() - 0.5f) + 0.37f; cxz[z] = (float)o[2] + 150.f * (ru() - 0.5f) - 0.11f; }
+                    for (size_t k = 0; k < S; k++) { ct[k] = (uint8_t)(rn() & 255); tg[k] = rn() & 1 ? 255 : 0; tg[S + k] = tg[k] ? 0 : 255; mk[k] = (rn() & 7) != 0; }
+                    if (n == 1) {   /* an unwarped sample beside the warped one */
+                        sample_write_x_test(ct, P, P, o, 87.5f, 1.f / 31.f, ax, cyz, cxz, perm, flip, xfmt, 99 + (uint64_t)sym, t4, h1 + S, recs + rec);
+                    } else {
+                        const int act = sample_write_spatial_test(ct, tg, mk, P, o, 87.5f, 1.f / 31.f, ax, cyz, cxz, perm, flip, xfmt, 4321 + (uint64_t)sym,
+                                                                  77 + (uint64_t)(sym * 4 + mode), zoom, affine, 1, t4, h1, recs, T, M);
+                        if (act != 1) { if (fails < 5) fprintf(stderr, "FAIL: warped writer: CT-only targets / mask differ or the warp is inactive (%d)\n", act); fails++; }
+                    }
+                    for (int c = 0; c < 4; c++) memcpy(h4 + ((size_t)n * 4 + c) * S, t4 + (size_t)c * S, S * 2);
+                    if (memcmp(h1 + (size_t)n * S, t4, S * 2)) { if (fails < 5) fprintf(stderr, "FAIL: warped CT channel differs (sym %d mode %d)\n", sym, mode); fails++; }
+                }
+                nn_h2d(d_h4, h4, (size_t)N * 4 * S * 2); nn_h2d(d_h1, h1, (size_t)N * S * 2); nn_h2d(d_rec, recs, (size_t)N * rec);
+                nn_h16_to_mx(d_h4, xs, d_ya);
+                nn_input_rad(d_h1, xs, d_rec, d_yb);
+                nn_d2h(ya, d_ya, mxb); nn_d2h(yb, d_yb, mxb);
+                wcases++;
+                if (memcmp(ya, yb, mxb)) {
+                    size_t k = 0; while (k < mxb && ya[k] == yb[k]) k++;
+                    if (fails < 5) fprintf(stderr, "FAIL: warped device input differs (xfmt %d MX-fp%d sym %d axis %d mode %d): first byte %zu of %zu (%02x vs %02x)\n",
+                                           xfmt, bits, sym, ax, mode, k, mxb, ya[k], yb[k]);
+                    fails++;
+                }
+            }
+            const char *e = nn_check(); if (e) { fprintf(stderr, "FAIL: CUDA error %s\n", e); fails++; }
+            nn_free(d_h4); nn_free(d_h1); nn_free(d_rec); nn_free(d_ya); nn_free(d_yb);
+            free(ct); free(tg); free(mk); free(T); free(M); free(h4); free(h1); free(t4); free(recs); free(ya); free(yb);
+        }
+    }
+    cases += wcases;
     if (fails) { printf("test_gpu_input: %d of %d cases FAIL\n", fails, cases); return 1; }
-    printf("test_gpu_input: ok (%d cases bit-identical: symmetries x axis x fp16/bf16 x MX-fp8/fp4 x cube/slab/2 samples)\n", cases);
+    printf("test_gpu_input: ok (%d cases bit-identical: symmetries x axis x fp16/bf16 x MX-fp8/fp4 x cube/slab/2 samples; %d of them warped: rotation + elastic, zoom in / out, affine)\n", cases, wcases);
     return 0;
 }

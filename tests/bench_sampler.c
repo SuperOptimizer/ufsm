@@ -8,7 +8,9 @@
    papyrus recipe's scanner ops (noise cnoise blur lowres sharpen ring slice quant) at probability P;
    UFSM_BENCH_DUMP=prefix: mid-z planes of the first batch (prefix-input.pgm, -target.pgm, -mask.pgm, -phase.pgm with SIDE=2) and its
    cutoff code; UFSM_BENCH_PZ=N: N x P x P slab windows; UFSM_BENCH_NEAR=X: the phase only within X um of a labelled wrap (train
-   --phase-near-um; the known-phase fraction is printed) */
+   --phase-near-um; the known-phase fraction is printed); UFSM_BENCH_PRESET=all|none: train --aug's preset (sample_aug_preset);
+   UFSM_BENCH_PACK=1: packed targets (train --pack-targets); UFSM_BENCH_DUMPN=N: dump the first N batches (prefix-NN-*.pgm; the
+   target as recto 255 / verso 128 / void 0, the mask, and the input's mid-z plane) */
 #include "nn.h"
 #include "sample.h"
 #include "sources.h"
@@ -41,6 +43,8 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_BENCH_NEAR")) c.phase_near_um = (float)atof(getenv("UFSM_BENCH_NEAR"));   /* --phase-near-um */
     if (getenv("UFSM_BENCH_PZ")) c.Pz = atoi(getenv("UFSM_BENCH_PZ"));
     if (getenv("UFSM_BENCH_GPUIN")) c.gpu_input = 1;   /* train --gpu-input: the CT channel and radial records only (hashed as such) */
+    if (getenv("UFSM_BENCH_PRESET") && sample_aug_preset(&c, getenv("UFSM_BENCH_PRESET"))) { fprintf(stderr, "UFSM_BENCH_PRESET: all | none\n"); return 2; }
+    if (getenv("UFSM_BENCH_PACK")) c.pack_tm = 1;
     const int Pz = c.Pz > 0 ? c.Pz : P;   /* task unwrap's phase (no band affinities): the side array is hashed too */
     if (getenv("UFSM_BENCH_COVER")) {
         cover_plan *plan = cover_load(getenv("UFSM_BENCH_COVER"), S, P); if (!plan) return 1;
@@ -60,29 +64,40 @@ int main(int argc, char **argv) {
     const size_t p3 = (size_t)Pz * P * P;
     uint64_t h = 0xcbf29ce484222325ull;
     sampler *sp = sampler_start(S, &c); if (!sp) return 1;
-    if (getenv("UFSM_BENCH_DUMP")) {   /* mid-z planes of the first batch: input (z-scored CT x 40 + 128), target, mask */
-        batch *b = sampler_next(sp); if (!b) return 1;
-        const char *pre = getenv("UFSM_BENCH_DUMP"); const size_t pl = (size_t)P * P, z0 = (size_t)(Pz / 2) * pl;
-        uint8_t *img = malloc(pl); char fn[1024];
-        for (int k = 0; k < (b->side ? 4 : 3); k++) {
-            for (size_t j = 0; j < pl; j++) {
-                if (k == 0) { _Float16 h; memcpy(&h, b->x16 + z0 + j, 2); const float v = 128.f + 40.f * (float)h; img[j] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
-                else if (k == 3) img[j] = b->side[z0 + j] < 252 ? (uint8_t)(1 + b->side[z0 + j]) : 0;   /* phase codes 0..251 (0: unknown) */
-                else img[j] = k == 1 ? b->t[z0 + j] : (uint8_t)(b->m[z0 + j] ? 255 : 0);
+    if (getenv("UFSM_BENCH_DUMP")) {   /* mid-z planes of the first batch(es): input (z-scored CT x 40 + 128), target, mask */
+        const int nd = getenv("UFSM_BENCH_DUMPN") ? atoi(getenv("UFSM_BENCH_DUMPN")) : 1;
+        for (int bi = 0; bi < nd; bi++) {
+            batch *b = sampler_next(sp); if (!b) return 1;
+            const char *pre0 = getenv("UFSM_BENCH_DUMP"); char pre[900];
+            if (nd > 1) snprintf(pre, sizeof pre, "%s-%02d", pre0, bi); else snprintf(pre, sizeof pre, "%s", pre0);
+            const size_t pl = (size_t)P * P, z0 = (size_t)(Pz / 2) * pl;
+            uint8_t *img = malloc(pl); char fn[1024];
+            for (int k = 0; k < (b->side ? 4 : 3); k++) {
+                for (size_t j = 0; j < pl; j++) {
+                    const uint8_t code = b->tm ? b->tm[z0 + j] : 0;
+                    const int t0 = b->tm ? (code & SAMPLE_TM_T0) != 0 : b->t[z0 + j] > 127, t1 = b->tm ? (code & SAMPLE_TM_T1) != 0 : b->t[p3 + z0 + j] > 127;
+                    const int mk = b->tm ? (code & SAMPLE_TM_M) != 0 : b->m[z0 + j] != 0;
+                    if (k == 0) { _Float16 h; memcpy(&h, b->x16 + z0 + j, 2); const float v = 128.f + 40.f * (float)h; img[j] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
+                    else if (k == 3) img[j] = b->side[z0 + j] < 252 ? (uint8_t)(1 + b->side[z0 + j]) : 0;   /* phase codes 0..251 (0: unknown) */
+                    else if (k == 1) img[j] = !mk ? 0 : t0 ? 255 : t1 ? 128 : 40;   /* recto 255, verso 128, void 40, unsupervised 0 */
+                    else img[j] = (uint8_t)(mk ? 255 : 0);
+                }
+                snprintf(fn, sizeof fn, "%s-%s.pgm", pre, k == 0 ? "input" : k == 1 ? "target" : k == 2 ? "mask" : "phase");
+                FILE *f = fopen(fn, "wb"); if (f) { fprintf(f, "P5\n%d %d\n255\n", P, P); fwrite(img, 1, pl, f); fclose(f); }
             }
-            snprintf(fn, sizeof fn, "%s-%s.pgm", pre, k == 0 ? "input" : k == 1 ? "target" : k == 2 ? "mask" : "phase");
-            FILE *f = fopen(fn, "wb"); if (f) { fprintf(f, "P5\n%d %d\n255\n", P, P); fwrite(img, 1, pl, f); fclose(f); }
+            int warped = 0; if (b->rad) { int32_t hd[8]; memcpy(hd, b->rad, sizeof hd); warped = hd[6] & 1; }
+            printf("dumped %s-*.pgm: level %d um / cutoff code %g, corner %lld %lld %lld%s\n", pre, b->level[0], b->um[0], (long long)b->corner[0][0],
+                   (long long)b->corner[0][1], (long long)b->corner[0][2], warped ? ", warped" : "");
+            free(img); sampler_release(sp, b);
         }
-        printf("dumped %s-*.pgm: um / cutoff code %g, corner %lld %lld %lld\n", pre, b->um[0], (long long)b->corner[0][0], (long long)b->corner[0][1], (long long)b->corner[0][2]);
-        free(img); sampler_release(sp, b);
     }
-    for (int i = 0; i < 4; i++) { batch *b = sampler_next(sp); if (!b) return 1; if (hashing) { h = hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); } sampler_release(sp, b); }   /* warm-up */
+    for (int i = 0; i < 4; i++) { batch *b = sampler_next(sp); if (!b) return 1; if (hashing) { h = hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); if (b->tm) h = hash(h, b->tm, (size_t)c.B * p3); else { h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); } h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); } sampler_release(sp, b); }   /* warm-up */
     size_t side_known = 0, side_all = 0;   /* phase voxels known (UFSM_BENCH_SIDE=2) */
     double t0 = now();
     for (int i = 0; i < NB; i++) {
         batch *b = sampler_next(sp); if (!b) return 1;
         if (b->side) for (size_t k = 0; k < (size_t)c.B * p3; k++) { side_known += b->side[k] < 252; side_all++; }
-        if (hashing) { h = hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); }
+        if (hashing) { h = hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); if (b->tm) h = hash(h, b->tm, (size_t)c.B * p3); else { h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); } h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); }
         sampler_release(sp, b);
     }
     double dt = now() - t0;
