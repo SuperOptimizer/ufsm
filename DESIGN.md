@@ -6,6 +6,38 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Level-0 kernels outside the 16-channel convs; why test_l3_sched broke under a fused GN-backward sum (2026-10-16)
+Desk 5060 Ti, P512 production net (`tests/bench_l0misc`: per-call times and output hashes; every change below is bit for bit):
+| kernel | before | after | change |
+|---|---|---|---|
+| dec[0] conv1, fused up (`conv_fwd_f4u_k`) | 40.2 ms | 37.2 ms | stage only the coarse rows the blend reads |
+| network input (`input_rad_k`), plain / warped record | 5.0 / 8.0 ms | 3.6 / 7.4 ms | 3-D grid: no 64-bit divisions per voxel |
+| loss statistics (`loss_stats_k`) | 5.9 ms | 2.9 ms | four voxels' loads first, then each in the thread's order |
+| loss gradient (`loss_grad_k`) | 8.0 ms | 5.7 ms | 2-D grid (n c, voxel blocks), four voxels per thread, loads first |
+Per trainer step: dec0.c1 once, the input twice (forward, the stem's weight gradient), the loss once. Real trainer (sources-rv24,
+P512, `--aug none`, two interleaved runs each, steps 60-140): 1.61-1.62 -> 1.63-1.65 windows/s (~619 -> ~607 ms per step).
+- `conv_fwd_f4u_k` staged 6 coarse planes x [8 rows][12 columns] per z tile through GN+SiLU; the blend reads at most 3-5 planes x
+  6 x 10 (`up_read_range`: the in-bounds fine coordinates and their trilinear neighbours). Its coarse stage is still ~25-30% of the
+  kernel: latency (2 blocks of 256 threads per SM at the 128-register cap), not work; prefetching the next tile's coarse rows into
+  registers during the MMA changed nothing (the phases are serialised per block). A warp-specialised producer / consumer split is
+  the next step there.
+- The loss and input kernels were issue-bound on index arithmetic (64-bit `/` and `%` per element) or latency-bound (one dependent
+  byte / half load per loop iteration); the arithmetic of every element and the order of every partial sum are unchanged.
+
+test_l3_sched failed intermittently (~50% of runs, always the same wrong enc0 / down0 gradients) when the GroupNorm backward sums of
+dec[0]'s GN1 were fused into conv2's backward-data epilogue (worker P2's experiment, not merged). Not a race in the three-buffer
+schedule: the wrong result appears with the copy schedule off, with `CUDA_LAUNCH_BLOCKING=1` and every offload copy synchronous,
+under memcheck / initcheck (clean), and only dec[0]'s d/d a1 after GN1 differs between good and bad runs. The fused epilogue added
+its warps' float partials with shared-memory `atomicAdd` (`fwd_epi_mx16`'s `cs[]`): the heavily cancelled GN-backward sums varied
+~1e-5 relative run to run, a GN coefficient occasionally landed one float ulp off, and the MX-fp4 SR chain through the coarse levels
+amplifies one changed fp4 code into O(SR noise) gradients: with the unfused (deterministic) sums, nudging one dec[0] GN1 gamma by one
+ulp moves enc0's gradient L1 norm by 2-15% at P128. Adding the warps' partials in warp order made the sums identical across runs and
+the test pass 30 / 30. Rule: anything feeding a level-0 GroupNorm coefficient must reduce in a fixed order (fp64 atomics of fixed
+per-block partials are fine: their order noise stays below a float ulp); the bit-for-bit schedule tests catch any nondeterminism
+upstream of the coarse levels. The forward GN statistics in the same epilogue (float shared atomics) and the fp32 weight-gradient
+atomics are order-dependent too: the likely reason `--det 1` runs of one recipe drift apart after ~40 steps (workers F / H; not
+traced further).
+
 ## Augmentation presets: train --aug all (default) | none (2026-10-16)
 User: "I want all the augs we can get" (robustness to other scrolls, scanners, resolutions and damage from one scroll's labels).
 - `--aug all` is the default for the dense-target tasks on cube windows (recto / side targets); `none` (the old defaults: 48 cube
