@@ -250,7 +250,7 @@ static void ring_drop(int i) {
 extern "C" void *nn_ring_alloc(int nreg, const size_t *reg, const size_t *slab, int R, size_t *phys) {
     if (phys) *phys = 0;
     if (!vm_init()) { fprintf(stderr, "nn_ring_alloc: no CUDA virtual memory management\n"); return nullptr; }
-    if (nreg < 1 || nreg > NN_RINGREG || g_nring >= NN_MAXRING || R < 1) return nullptr;
+    if (nreg < 1 || nreg > NN_RINGREG || g_nring >= NN_MAXRING || R < 1) { fprintf(stderr, "nn_ring_alloc: %d regions, %d rings live, R %d\n", nreg, g_nring, R); return nullptr; }
     const size_t G = g_vm.gran;
     size_t tot = 0;
     for (int r = 0; r < nreg; r++) {
@@ -303,6 +303,7 @@ extern "C" void nn_zero(void *p, size_t n) { CK(cudaMemset(p, 0, n)); }
 extern "C" void nn_h2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyHostToDevice)); }
 extern "C" void nn_d2h(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToHost)); }
 extern "C" void nn_d2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToDevice)); }
+extern "C" void nn_copy_async(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDefault, 0)); }   /* any direction (pinned host), ordered with the kernels */
 extern "C" void nn_d2d_async(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToDevice, 0)); }   /* ordered with the kernels */
 __global__ void d2d_u4_k(uint4 *__restrict__ d, const uint4 *__restrict__ s, size_t n) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) d[i] = s[i];

@@ -104,6 +104,7 @@ struct unet {
     unsigned l0h_c; int l0h_k;         /* the forward head's first seed draw and draws per slab (the backward's recomputes replay them) */
     int l0hb;                          /* this ring build runs the head per slab: dec[0].a2 and gout[0] in rings, the skip gradient its own */
     int l0rx; const void *l0x_ct; int l0x_held[16];   /* the network input in a ring (--gpu-input: rebuilt per slab from the CT channel); slot -> slab */
+    void *l0r_hsk; size_t l0r_hskn;    /* the skip gradient's pinned host copy (stage S4's host mode: the device holds a ring) */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
@@ -609,6 +610,7 @@ static void free_acts(unet *u) {
         u->dm[i] = u->dr[i] = u->downs[i] = nullptr;
         u->downo[i] = u->cat[i] = u->gskip[i] = u->gout[i] = u->gA[i] = u->gB[i] = u->t1[i] = u->t2[i] = nullptr;
     }
+    if (u->l0r_hsk) { nn_sync(); nn_host_free(u->l0r_hsk); u->l0r_hsk = nullptr; u->l0r_hskn = 0; }
     if (u->l0ring) {   /* (stage S4: built here, unlike the lazy stream buffers of S3) */
         float *q[3] = {u->l0st_g2, u->l0st_up, u->l0r_ups};
         free_once(q, 3);
@@ -670,20 +672,23 @@ static int l0s_nslab(const unet *u, int d) { const int S = u->cfg.l0_slab; retur
    The level-0 tensors of the slab stream become VMM rings (nn_ring_alloc): whole-tensor virtual addresses (S2's windows, S3's schedule
    unchanged), slab s backed by physical chunk s mod R. R per tensor is the schedule's live span (S3's DESIGN.md table, verified by the
    bit-for-bit test: a ring too short changes the bits). Indices: 0 enc[0].a1, 1 the skip enc[0].a2, 2 dec[0].a1, 3 dec[0].a2,
-   4 d/d a2 (the stream's B2), 5 level 0's A, 6 the up-part gradient (level 0's B), 7 dec[0]'s up transient, 8 gout[0], 9 the input */
+   4 d/d a2 (the stream's B2), 5 level 0's A, 6 the up-part gradient (level 0's B), 7 dec[0]'s up transient, 8 gout[0], 9 the input,
+   10 the skip gradient in the host mode (UFSM_L0_RING_SKIP=1, the default; 0: whole on the device) */
+static int l0ring_skip_host(void) { static int v = -1; if (v < 0) { const char *e = getenv("UFSM_L0_RING_SKIP"); v = e ? atoi(e) : 1; } return v; }
 static int g_l0ring = -1;
 void unet_set_l0_ring(int on) { g_l0ring = on; }
 static int l0ring_req(void) { if (g_l0ring < 0) { const char *e = getenv("UFSM_L0_RING"); g_l0ring = e ? atoi(e) : 0; } return g_l0ring; }
 static int l0ring_R(int k) {
-    static int R[10] = {0}; static int set = 0;
+    static int R[10] = {0}, R10 = 1; static int set = 0;
     if (!set) {
-        const int def[10] = {3, 5, 3, 2, 3, 4, 3, 3, 2, 3};
+        const int def[11] = {3, 5, 3, 2, 3, 4, 3, 3, 2, 3, 1};
         for (int i = 0; i < 10; i++) R[i] = def[i];
+        R10 = def[10];
         const char *e = getenv("UFSM_L0_RING_R");   /* "a,b,c,...": overrides in index order (the test's too-short controls) */
-        for (int i = 0; e && *e && i < 10; i++) { R[i] = atoi(e); const char *c = strchr(e, ','); e = c ? c + 1 : nullptr; }
+        for (int i = 0; e && *e && i < 11; i++) { if (i < 10) R[i] = atoi(e); else R10 = atoi(e); const char *c = strchr(e, ','); e = c ? c + 1 : nullptr; }
         set = 1;
     }
-    return k >= 0 && k < 10 ? R[k] : 3;
+    return k >= 0 && k < 10 ? R[k] : k == 10 ? R10 : 3;
 }
 static int l0st_req(void);
 static int l0ring_mode(void) { return l0ring_req() && l0st_req() >= 2; }
@@ -710,7 +715,7 @@ static float *dalloc_ring(unet *u, shape5 s, int dt, int R, int grad) {
     if (g_dry) { mrep_add(phys); return (float *)(uintptr_t)4096; }
     size_t ph = 0;
     float *p = (float *)nn_ring_alloc(n, reg, sl, R, &ph);
-    if (!p) { fprintf(stderr, "unet: a level-0 slab ring of %.2f GB (%zu of %zu slabs) failed (VMM, granularity or memory)\n", phys / 1e9, rr, ns); abort(); }
+    if (!p) { fprintf(stderr, "unet: a level-0 slab ring of %.2f GB (%zu of %zu slabs; shape %d %d %d %d %d, dt %d) failed (VMM, granularity or memory)\n", phys / 1e9, rr, ns, s.n, s.c, s.d, s.h, s.w, dt); abort(); }
     dstorage(p, tot, dt);
     return p;
 }
@@ -1131,11 +1136,21 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 u->gout[i] = gmx ? dalloc_grad_mx(u, gob) : dalloc_grad(u, gob / (GBF ? 2 : 4) + 1);
                 u->gskip[i] = i < L - 1 ? u->gout[i] : nullptr;
                 u->gout_cap[i] = gmx ? gob : (gob / (GBF ? 2 : 4) + 1) * (GBF ? 2 : 4);
-                if (u->l0hb && i == 0) {   /* (the skip gradient: whole from dec[0]'s conv1 backward-data until down0's, stage S4's device mode) */
+                if (u->l0hb && i == 0) {   /* (the skip gradient: from dec[0]'s conv1 backward-data until down0's -- in a ring with each slab copied to the
+                                                 pinned host as dec[0]'s backward completes it and back before down0's accumulates into it (the host mode),
+                                                 or whole on the device) */
                     shape5 a0 = u->ls[0]; a0.c = w[0];
                     u->gout_cap[0] = nn_mx_bytes(a0, grad_dt());
-                    g_mlab = "level-0 skip gradient (whole)";
-                    u->gskip[0] = dalloc_grad_mx(u, u->gout_cap[0]);
+                    if (l0ring_skip_host() && !g_dry) { u->l0r_hsk = nn_host_alloc_try(u->gout_cap[0]); u->l0r_hskn = u->gout_cap[0]; }
+                    if (l0ring_skip_host() && !g_dry && !u->l0r_hsk) fprintf(stderr, "unet: cannot pin %.2f GB for the skip gradient's host copy; it stays whole on the device\n", u->gout_cap[0] / 1e9);
+                    if (l0ring_skip_host() && (g_dry || u->l0r_hsk)) {
+                        g_hoff += u->gout_cap[0];
+                        g_mlab = "level-0 slab rings (stage S4)";
+                        u->gskip[0] = dalloc_ring(u, a0, grad_dt(), l0ring_R(10), 1);
+                    } else {
+                        g_mlab = "level-0 skip gradient (whole)";
+                        u->gskip[0] = dalloc_grad_mx(u, u->gout_cap[0]);
+                    }
                     g_mlab = "gradient buffers gout / gskip (per level)";
                 }
                 if (u->nob) { u->gB[i] = u->gout[i]; u->gB_cap[i] = gob; }   /* no B: the level's own gradient buffer serves as B */
@@ -1145,13 +1160,13 @@ static void build_acts(unet *u, shape5 xs, int train) {
             if (u->l0ring) {   /* (stage S4: level 0's A, its B = the up-part gradient, the stream's d/d a2 and dec[0]'s up transient in rings;
                                   silu(gn(dec[1].a2)) at level 1, the up transient's per-slab source) */
                 shape5 a0 = u->ls[0]; a0.c = w[0];
-                shape5 b0 = u->ls[0]; b0.c = u->dec[0].c_split;
+                shape5 b0 = u->ls[0]; b0.c = UPW(1);   /* (dec[0].c_split as the forward sets it) */
                 g_mlab = "level-0 slab rings (stage S4)";
                 u->gA[0] = dalloc_ring(u, a0, grad_dt(), l0ring_R(5), 1);
                 u->gB[0] = dalloc_ring(u, b0, grad_dt(), l0ring_R(6), 1); u->gB_cap[0] = nn_mx_bytes(b0, grad_dt());
                 u->l0st_g2 = dalloc_ring(u, a0, grad_dt(), l0ring_R(4), 1); u->l0st_g2n = nn_mx_bytes(a0, grad_dt());
                 u->l0st_up = dalloc_ring(u, b0, act_dt(), l0ring_R(7), 0); u->l0st_upn = act_bytes_of(b0);
-                const block *xb = (const block *)u->dec[0].xb;
+                const block *xb = L == 2 ? stage_out(u, L - 1) : &u->dec[1];   /* (dec[0].xb as the forward sets it) */
                 g_mlab = "level-1 up source (stage S4)";
                 u->l0r_ups = dalloc_act_s(u, xb->ys); u->l0r_upsn = act_bytes_of(xb->ys);
                 g_mlab = "gradient buffers gout / gskip (per level)";
@@ -2516,8 +2531,8 @@ static int l0st_want(const unet *u) {   /* the stream requested, and supported f
         : u->ctin.on ? "no CT stem" : chunk_up() ? "no chunked up-part gradient"
         : u->cfg.ds_levels || u->cfg.enc_blocks[0] || e0->single || d0->single || e0->a1_shared || d0->a1_shared || e0->a1_lent || d0->a1_lent
           ? "two-conv level-0 blocks with their own a1, no deep supervision"
-        : up_wg_chunk() && d0->c_split % 32 == 0 ? "an unchunked decoder conv1 weight gradient (UFSM_UP_WG_CHUNK=0 or a 16-wide level 1)"
-        : !d0->xb ? "the recompute decoder conv1" : nullptr;
+        : up_wg_chunk() && UPW(1) % 32 == 0 ? "an unchunked decoder conv1 weight gradient (UFSM_UP_WG_CHUNK=0 or a 16-wide level 1)"
+        : nullptr;   /* (UPW(1): dec[0].c_split, set by the forward after this check on a first forward) */
     if (why) { fprintf(stderr, "unet: UFSM_L0_STREAM needs %s\n", why); abort(); }
     return l0st_req() >= 2 ? 2 : 1;
 }
@@ -2632,6 +2647,25 @@ static void l0h_fwd_slab(unet *u, int s, int replay) {   /* replay: the backward
     if (u->l0h_k < 0) u->l0h_k = k; else if (k != u->l0h_k) rc_fail("level-0 slab stream: a head slab drew another number of seeds");
     if (replay) nn_sr_set_ctr(c0);
     else if (u->l0h_fwd(u->l0h_ctx, z0, z1, lg)) rc_fail("level-0 slab stream: the head's forward callback");
+}
+/* stage S4's host mode: slab s of the skip gradient between its ring and the pinned host copy (MX: each block's data rows, then its
+   scales), on the compute stream -- out as dec[0]'s backward completes it, in before down0's backward-data accumulates into it */
+static void l0r_skip_copy(unet *u, int s, int to_host) {
+    shape5 a0 = u->ls[0]; a0.c = u->cfg.widths[0];
+    const int dt = grad_dt(), bw = a0.c <= 8 ? 8 : a0.c <= 16 ? 16 : 32, nb = (a0.c + bw - 1) / bw, rb = dt == 4 ? bw / 2 : bw;
+    const size_t hw = (size_t)a0.h * a0.w, D = (size_t)a0.d, S = (size_t)u->cfg.l0_slab, z0 = (size_t)s * S, n = (z0 + S < D ? S : D - z0);
+    char *dev = (char *)u->gskip[0], *host = (char *)u->l0r_hsk;
+    for (int k = 0; k < nb; k++) {
+        const size_t od = ((size_t)k * D + z0) * hw * rb, os = (size_t)nb * D * hw * rb + ((size_t)k * D + z0) * hw;
+        if (to_host) { nn_copy_async(host + od, dev + od, n * hw * rb); nn_copy_async(host + os, dev + os, n * hw); }
+        else { nn_copy_async(dev + od, host + od, n * hw * rb); nn_copy_async(dev + os, host + os, n * hw); }
+    }
+}
+static void l0st_dump_host(int k, const void *h, size_t b) {   /* (the test hook, the skip gradient in the host mode) */
+    if (!g_l0st_dump) return;
+    if (g_l0st_dumpn[k] < b) { nn_free(g_l0st_dumped[k]); g_l0st_dumped[k] = nn_malloc(b); }
+    g_l0st_dumpn[k] = b;
+    nn_sync(); nn_h2d(g_l0st_dumped[k], h, b);
 }
 /* F1: the stem, enc[0]'s conv2 and down0 per slab (conv2 and down0 one slab behind the stem); down_norm's level-1 statistics after */
 static const float *l0st_fwd_enc(unet *u, const float *x) {
@@ -2808,6 +2842,7 @@ static void l0st_bwd_dec(unet *u) {
             nn_set_conv(0); l0st_win(u, s2, n2++, ns); l0op_go(&o_c1d);
             PROF(1, nn_conv3d_bwd_data_split(A, b->ys, P(u, b->c1.w), b->xs, Bu, gx2, b->c_split, u->conv_scratch));
             l0op_end(&o_c1d, &o_u2b); l0st_nowin();
+            if (u->l0r_hsk) PROF(4, l0r_skip_copy(u, s2, 1));   /* (host mode: the skip gradient's slab out) */
             l0st_poison(u, A, b->ys, s2 + 1);
         }
         if (s3 >= 0 && s3 < ns) {   /* the upsample backward into gout[1]'s planes of slab t + 3 (reads the up-part gradient's last plane of slab t + 2) */
@@ -2839,6 +2874,7 @@ static void l0st_bwd_enc(unet *u, float *gin) {
     l0st_re(u, 0, 0);
     for (int t = 0; t <= ns; t++) {
         l0st_re(u, 0, t + 1); l0st_re(u, 1, t);
+        if (t < ns && u->l0r_hsk) PROF(4, l0r_skip_copy(u, t, 0));   /* (host mode: the skip gradient's slab in, before down0's backward-data adds to it) */
         if (t < ns) {   /* down0 (weight gradient; backward-data into the skip gradient's slab t: complete now), GN2 and conv2's weight gradient */
             nn_set_layer(L); nn_set_conv(-1); l0st_win(u, t, t, ns); l0op_go(&o_dw);
             int r; PROF(2, r = nn_conv3d_bwd_weight_x(b->a2, &gg, nullptr, nullptr, 0, 0, b->ys, gin, ds, 3, 2, g + u->down[0].w, g + u->down[0].b));
@@ -2849,6 +2885,7 @@ static void l0st_bwd_enc(unet *u, float *gin) {
             l0op_end(&o_dd, &o_g2);
             nn_set_layer(0); nn_set_conv(1); l0op_go(&o_g2);
             PROF(3, gn_silu_bwd_b(u, b, 2, b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gsk, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));
+            if (u->l0r_hsk && g_l0st_dump) l0r_skip_copy(u, t, 1);   /* (the test hook: the accumulated slab, as the device mode's whole tensor ends) */
             l0op_end(&o_g2, &o_c2w); l0op_go(&o_c2w);
             PROF(2, nn_conv3d_bwd_weight_gn(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, B, b->ys, g + b->c2.w, g + b->c2.b));
             l0op_end(&o_c2w, &o_c2d); l0st_nowin();
@@ -2996,7 +3033,12 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         if (i >= 1 && i <= u->cfg.ds_levels && u->ds_gl[i]) ds_bwd(u, i, g);   /* deep supervision: gout[i] += the level head's input gradient */
         shape5 li = u->ls[i];
         shape5 src = u->ls[i + 1]; src.c = UPW(i + 1);
-        if (i == 0 && u->l0st) { l0st_bwd_dec(u); l0st_dump(0, u->gout[1], src); l0st_dump(3, u->gskip[0], li); continue; }   /* (level-0 slab stream: B1) */
+        if (i == 0 && u->l0st) {   /* (level-0 slab stream: B1) */
+            l0st_bwd_dec(u); l0st_dump(0, u->gout[1], src);
+            shape5 g0 = li; g0.c = w[0];   /* (the whole 16-channel tensor: ls[0] carries the input's channels) */
+            if (u->l0r_hsk) l0st_dump_host(3, u->l0r_hsk, u->l0r_hskn); else l0st_dump(3, u->gskip[0], g0);
+            continue;
+        }
         if (nn_get_tf32()) {
             if (i > 0 && u->sko && u->sea_stale) nn_stream_wait(0, u->ev_sk[i][3]);   /* its skip back from the host (a conv1 re-run reads it at once) */
             const int l3 = u->l3b && i == 0;   /* (l3b: dec[0]'s d/d a2 already in place in its a2) */
@@ -3040,7 +3082,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
             if (gup) { shape5 us = li; us.c = UPW(i + 1); sp_halo(u, gup, us, 1); }
             if (gup) PROF(5, nn_up2_bwd(gup, src, u->gout[i + 1]));   /* nullptr: chunk mode wrote gout[i + 1] */
             FQG(u->gout[i + 1], src);
-            if (i == 0) { l0st_dump(0, u->gout[1], src); l0st_dump(3, u->gskip[0], li); }
+            if (i == 0) { shape5 g0 = li; g0.c = w[0]; l0st_dump(0, u->gout[1], src); l0st_dump(3, u->gskip[0], g0); }
         } else {
             nn_set_layer(3 * L - 3 - i); float *gcat = block_bwd(u, &u->dec[i], i, u->gout[i], nullptr, 0, nullptr, nullptr);       /* gB[i]: grad wrt concat */
             PROF(5, nn_concat_bwd(gcat, UPW(i + 1), w[i], li, u->gA[i], u->gskip[i]));
@@ -3105,7 +3147,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
             }
         }
     }
-    l0st_dump(2, u->gskip[0], u->enc[0].ys);
+    if (u->l0r_hsk) l0st_dump_host(2, u->l0r_hsk, u->l0r_hskn); else l0st_dump(2, u->gskip[0], u->enc[0].ys);
     if (gscale != 1.f) nn_scale(g, 1.f / gscale, u->np);   /* activation gradients were scaled for 16-bit storage */
     if (share_enc_a1()) u->sea_stale = 1;   /* the decoders' a1 buffers now hold the encoders' */
     /* d/dv of the stem bias b + c v is c d/db (exact when the gradient was zeroed before this backward: one backward per step) */
