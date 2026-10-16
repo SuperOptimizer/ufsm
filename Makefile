@@ -297,6 +297,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_grad_mx4
 	UFSM_L0_NORM=1 ./$(B)/test_grad_mx4
 	UFSM_L0_NORM=2 ./$(B)/test_grad_mx4
+	UFSM_L0_NORM=3 ./$(B)/test_grad_mx4
 	UFSM_F4W_LAYOUT=1 ./$(B)/test_mx4
 	./$(B)/test_rc
 	./$(B)/test_muon
@@ -309,6 +310,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	UFSM_DS=1 ./$(B)/test_unet
 	UFSM_L0_NORM=1 ./$(B)/test_unet
 	UFSM_L0_NORM=2 ./$(B)/test_unet
+	UFSM_L0_NORM=3 ./$(B)/test_unet
 	UFSM_P=48 UFSM_B=1 ./$(B)/test_unet
 	UFSM_F16=1 ./$(B)/test_unet
 	./$(B)/test_fused

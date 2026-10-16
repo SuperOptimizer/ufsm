@@ -35,7 +35,9 @@ typedef struct {
     int l0_norm;           /* the level-0 normalisation (enc[0] and dec[0]: their four GroupNorms, the head's input one included; down
                               norms stay GroupNorm): 0 GroupNorm, 1 none (gamma, beta + SiLU: statistics mean 0, rstd 1), 2 ema
                               (BatchNorm-style running statistics per group, constants in forward and backward once unet_set_l0_ema's
-                              warm-up on live statistics is over; saved in checkpoints). Tensor-core and fp32 paths */
+                              warm-up on live statistics is over; saved in checkpoints), 3 ws (none + scaled weight standardisation of
+                              the four level-0 3^3 convs, per output channel over its fan-in, from the master weights every forward;
+                              the convs reading SiLU outputs with the NF-net gain 1 / std(silu(z))). Tensor-core and fp32 paths */
 } unet_cfg;
 static inline int unet_hr_div(int hr) { return hr >= 3 ? 4 : hr ? 2 : 1; }      /* the window voxels per network voxel along each axis */
 static inline int unet_hr_mode(int hr) { return hr == 2 || hr == 4 ? 2 : 1; }   /* the last stage: 1 pool, 2 pack (nn_half_*) */

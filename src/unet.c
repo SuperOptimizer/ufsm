@@ -88,6 +88,7 @@ struct unet {
                                                  forward's; l0live: the convs' statistics while constant ([mean | rstd] x n G per site) */
     long l0_n; float l0_mom; int l0_warm, l0_c, l0_rc;   /* ema: updates so far, momentum, warm-up; l0_c: this forward's level-0 statistics are
                                                           constants; l0_rc: unet_l0_recal's forwards so far (-1 off) */
+    float *wsp, ws_gain;          /* cfg.l0_norm 3 (ws): the weights the forward reads (live, the level-0 convs standardised); SiLU's gain */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
@@ -275,7 +276,13 @@ unet *unet_create(const unet_cfg *cfg) {
     u->live = u->p; u->fw = u->p; u->wm = nullptr; u->sparse24 = 0; u->wq = 0; u->wq_q = u->wq_sc = u->wq_qe = u->wq_sce = nullptr; u->wq_r = u->wq_rsc = u->wq_re = u->wq_rsce = nullptr; u->wq_n = 0;
     u->gn_scratch = nn_malloc(1 << 20);
     u->red_scratch = nn_malloc(4096 * 4);
-    if (cfg->l0_norm < 0 || cfg->l0_norm > 2) { fprintf(stderr, "unet: l0_norm %d (0 gn, 1 none, 2 ema)\n", cfg->l0_norm); abort(); }
+    if (cfg->l0_norm < 0 || cfg->l0_norm > 3) { fprintf(stderr, "unet: l0_norm %d (0 gn, 1 none, 2 ema, 3 ws)\n", cfg->l0_norm); abort(); }
+    if (cfg->l0_norm == 3) {   /* 1 / std(silu(z)), z ~ N(0, 1): the NF-net gain of the convs reading a SiLU output */
+        double s1 = 0, s2 = 0;
+        for (int i = -24000; i <= 24000; i++) { const double z = i * 5e-4, p = exp(-0.5 * z * z) * 5e-4 / sqrt(2 * M_PI), y = z / (1 + exp(-z)); s1 += p * y; s2 += p * y * y; }
+        u->ws_gain = (float)(1.0 / sqrt(s2 - s1 * s1));
+        u->wsp = nn_malloc(u->np * 4);
+    }
     u->l0_mom = 0.01f; u->l0_warm = 100; u->l0_rc = -1;
     if (cfg->l0_norm == 2) { const size_t n = (size_t)24 * G_of(u, w[0]); u->l0run = nn_malloc(n * 4); nn_zero(u->l0run, n * 4); }
     return u;
@@ -290,7 +297,7 @@ void unet_free(unet *u) {
     free_acts(u);
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
-    nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b); free(u->gn_frz); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
+    nn_free(u->wm); nn_free(u->muon_mom); nn_free(u->muon_work); nn_free(u->muon_descs); nn_free(u->stem_b); free(u->gn_frz); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
     nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
@@ -1486,7 +1493,7 @@ static float *l0_live(unet *u, const block *b, int conv, int r) {   /* where con
 }
 static void l0_begin(unet *u) {   /* forward start: latch l0_c, the constant statistics into the sites */
     const int md = u->cfg.l0_norm, G = l0_G(u), N = u->xs.n;
-    u->l0_c = md == 1 || (md == 2 && u->l0_n > 0 && u->l0_n >= u->l0_warm && u->l0_rc < 0);   /* (recalibration: the window's own) */
+    u->l0_c = md == 1 || md == 3 || (md == 2 && u->l0_n > 0 && u->l0_n >= u->l0_warm && u->l0_rc < 0);   /* (recalibration: the window's own) */
     if (!u->l0_c) return;
     if (md == 2 && u->fwd_train && u->l0live_n < (size_t)8 * N * G) { nn_free(u->l0live); u->l0live_n = (size_t)8 * N * G; u->l0live = nn_malloc(u->l0live_n * 4); }
     for (int i = 0; i < (u->cfg.nlev > 1 ? 2 : 1); i++) for (int k = 1; k <= 2; k++) {
@@ -1517,6 +1524,7 @@ static void l0_after(unet *u, block *b) {   /* ema, training forward: the block'
     u->l0_n++;
 }
 void unet_set_l0_ema(unet *u, float mom, int warm) { u->l0_mom = mom; u->l0_warm = warm; }
+static void ws_backward(unet *u);
 void unet_l0_recal(unet *u, int on) { if (u->cfg.l0_norm == 2) u->l0_rc = on ? 0 : -1; }
 long unet_l0_updates(const unet *u) { return u->l0_n; }
 /* MX tensor planes [s0, s0 + n) of src (depth Ds) -> planes [d0, d0 + n) of dst (depth Dd); one sample, s.c channels, s.h x s.w
@@ -2331,6 +2339,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     if (share_enc_a1()) u->sea_stale = 1;   /* the decoders' a1 buffers now hold the encoders' */
     /* d/dv of the stem bias b + c v is c d/db (exact when the gradient was zeroed before this backward: one backward per step) */
     if (u->cfg.scale_cond) nn_axpy(g + u->sc_w, u->sc_c, g + u->enc[0].c1.b, (size_t)u->enc[0].c1.cout);
+    if (u->cfg.l0_norm == 3) ws_backward(u);
     g_in_bwd = 0;
 }
 
@@ -2546,7 +2555,28 @@ void unet_set_sparse24(unet *u, int on) {
     u->fw = on ? u->wm : u->live;
 }
 int unet_get_sparse24(const unet *u) { return u->sparse24; }
+/* cfg.l0_norm 3 (ws): the level-0 3^3 convs (the stem; the others read SiLU outputs: NF-net gain) */
+static int ws_convs(const unet *u, const convp **c, float *gain) {
+    int n = 0;
+    c[n] = &u->enc[0].c1; gain[n++] = 1.f;
+    c[n] = &u->enc[0].c2; gain[n++] = u->ws_gain;
+    if (u->cfg.nlev > 1) { c[n] = &u->dec[0].c1; gain[n++] = u->ws_gain; if (!u->dec[0].single) { c[n] = &u->dec[0].c2; gain[n++] = u->ws_gain; } }
+    return n;
+}
+#define WS_EPS 1e-5f
+static void ws_backward(unet *u) {   /* d/dw through the standardisation (the gradient was zeroed before this backward) */
+    const convp *c[4]; float ga[4]; const int n = ws_convs(u, c, ga);
+    for (int i = 0; i < n; i++) nn_ws_bwd(u->g + c[i]->w, nullptr, u->live + c[i]->w, c[i]->cout, c[i]->cin * c[i]->k * c[i]->k * c[i]->k, ga[i], WS_EPS);
+}
 void unet_apply_sparse24(unet *u) {
+    if (u->cfg.l0_norm == 3) {   /* ws: a copy of the live weights with the level-0 convs' standardised (every forward: the live / EMA switch) */
+        if (u->sparse24 || u->wq) { fprintf(stderr, "unet: --l0-norm ws needs dense fp32 master weights (no 2:4 sparsity, no packed weights)\n"); abort(); }
+        nn_d2d(u->wsp, u->live, u->np * 4);
+        const convp *c[4]; float ga[4]; const int n = ws_convs(u, c, ga);
+        for (int i = 0; i < n; i++) nn_ws_fwd(u->wsp + c[i]->w, u->live + c[i]->w, c[i]->cout, c[i]->cin * c[i]->k * c[i]->k * c[i]->k, ga[i], WS_EPS);
+        u->fw = u->wsp;
+        return;
+    }
     if (!u->sparse24) { u->fw = u->live; return; }
     nn_d2d(u->wm, u->live, u->np * 4);
     for_each_conv3(u, mask_conv, nullptr);
