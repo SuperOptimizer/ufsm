@@ -62,20 +62,31 @@ int main(void) {
         for (int k = 0; k < 3; k++) { float *f = dev_rand(nx, 1.f); x[k] = nn_malloc(nx * 2); nn_f32_to_h16(f, nx, x[k], 1.f); nn_free(f); }
         for (int k = 0; k < 2; k++) { float *f = dev_rand(no, 1.f); gl[k] = nn_malloc(no * 2); nn_f32_to_h16(f, no, gl[k], nn_get_grad_scale()); nn_free(f); }
         unet *v = unet_create(&cfg); unet_init(v, 77); const size_t np = unet_nparams(v);
-        uint8_t *lg[6][3]; size_t lgbs[6] = {0}; uint8_t *dmp[6][2][4]; size_t dmb[4] = {0, 0, 0, 0}; float *gg[6][2]; unsigned ctr[6][2]; double ms[6] = {0};
+        uint8_t *lg[8][3]; size_t lgbs[8] = {0}; uint8_t *dmp[8][2][4]; size_t dmb[4] = {0, 0, 0, 0}; float *gg[8][2]; unsigned ctr[8][2]; double ms[8] = {0};
         /* stage S4: the recomputing stream with the level-0 tensors in VMM slab rings (3), where the slabs lie on the 2 MB mapping
            granularity; the stream head per slab (4: whole tensors, 5: in rings with dec[0].a2 and gout[0]) */
-        const int ring = (size_t)S * P * P % ((size_t)2 << 20) == 0 && nn_ring_gran(), nst = 6;
+        const int ring = (size_t)S * P * P % ((size_t)2 << 20) == 0 && nn_ring_gran(), nst = 8;
         headctx hc = {nullptr, nullptr, (size_t)P * P, S3, cfg.cout};
         hc.lgw = nn_malloc(no * 2);
+        /* arms 6 / 7: --gpu-input (the CT channel and radial records, nn_input_rad): the stream head with the whole input, and in rings with
+           the input ring (rebuilt per slab) -- 7 against 6 bit for bit */
+        void *ct[3]; for (int k = 0; k < 3; k++) { float *f = dev_rand(S3, 1.f); ct[k] = nn_malloc(S3 * 2); nn_f32_to_h16(f, S3, ct[k], 1.f); nn_free(f); }
+        void *rec;
+        {
+            const size_t rb = NN_RAD_REC(P); uint8_t *h = calloc(1, rb); int32_t *hi = (int32_t *)h; float *hf = (float *)(h + 32);
+            hi[0] = 3; hi[1] = 5; hi[2] = P; hi[3] = P; hi[4] = 1; hi[5] = 0 | 1 << 2 | 2 << 4 | 1 << 9;
+            for (int z = 0; z < P; z++) { hf[z] = 3 + P / 2 + 0.37f * z / P; hf[P + z] = 5 + P / 3 - 0.21f * z / P; }
+            rec = nn_malloc(rb); nn_h2d(rec, h, rb); free(h);
+        }
         for (int st = 0; st < nst; st++) {   /* unstreamed, streamed, streamed and recomputing, recomputing in rings, the stream head, both */
-            if ((st == 3 || st == 5) && !ring) continue;
-            unet_set_l0_stream(st < 3 ? st : 2); unet_set_l0_ring(st == 3 || st == 5);
+            if ((st == 3 || st == 5 || st >= 6) && !ring) continue;
+            unet_set_l0_stream(st < 3 ? st : 2); unet_set_l0_ring(st == 3 || st == 5 || st == 7);
             unet_set_l0_head(v, st >= 4 ? head_fwd : nullptr, st >= 4 ? head_bwd : nullptr, &hc);
+            unet_set_input_rad(v, st >= 6 ? rec : nullptr);
             unet_build(v, xs, 1);
             for (int k = 0; k < 2; k++) {
                 nn_sync(); const double t0 = now_ms();   /* (the second step's forward + backward: the timing) */
-                nn_set_sr_step(5000 + 100 * k); const float *l = unet_forward_x(v, x[k], xs, 1, 1); unet_zero_grad(v);
+                nn_set_sr_step(5000 + 100 * k); const float *l = unet_forward_x(v, st >= 6 ? ct[k] : x[k], xs, 1, 1); unet_zero_grad(v);
                 const size_t lgb = st >= 4 ? no * 2 : no * (unet_logits_h16(v) ? 2 : 4); lgbs[st] = lgb;
                 lg[st][k] = malloc(lgb); nn_sync(); nn_d2h(lg[st][k], st >= 4 ? (const void *)hc.lgw : (const void *)l, lgb);
                 hc.gl = gl[k];
@@ -84,15 +95,16 @@ int main(void) {
                 gg[st][k] = malloc(np * 4); unet_grad_d2h(v, gg[st][k]);
                 for (int d = 0; d < 4; d++) { const void *p = unet_l0_stream_dumped(d, &dmb[d]); dmp[st][k][d] = malloc(dmb[d]); nn_sync(); nn_d2h(dmp[st][k][d], p, dmb[d]); }
                 if (!k) {   /* a validation forward between the steps */
-                    nn_set_sr_step(5025); const float *lv = unet_forward_x(v, x[2], xs, 0, 1);
+                    nn_set_sr_step(5025); const float *lv = unet_forward_x(v, st >= 6 ? ct[2] : x[2], xs, 0, 1);
                     lg[st][2] = malloc(lgbs[st]); nn_sync(); nn_d2h(lg[st][2], st >= 4 ? (const void *)hc.lgw : (const void *)lv, lgbs[st]);
                 }
             }
         }
         const char *e = nn_check();
         for (int m = 1; m < nst; m++) {   /* each stream mode against the unstreamed run (the stream head in rings: against the stream head) */
-            if ((m == 3 || m == 5) && !ring) continue;
-            const int r0 = m == 5 ? 4 : 0;
+            if ((m == 3 || m == 5 || m >= 6) && !ring) continue;
+            if (m == 6) continue;   /* (another input: the reference of arm 7) */
+            const int r0 = m == 7 ? 6 : m == 5 ? 4 : 0;
             size_t lneq = 0; double lgd = 0, lgm = 0;
             if (lgbs[m] == lgbs[r0]) { for (int k = 0; k < 3; k++) for (size_t i = 0; i < lgbs[m]; i++) lneq += lg[r0][k][i] != lg[m][k][i]; }
             else for (int k = 0; k < 3; k++) for (size_t i = 0; i < no; i++) {   /* (the stream head's fp16 logits against the whole head's fp32) */
@@ -113,7 +125,8 @@ int main(void) {
             }
             int fin = 1; for (int k = 0; k < 2; k++) for (size_t i = 0; i < np; i++) if (!isfinite(gg[m][k][i])) { fin = 0; break; }
             const int ok = !e && !lneq && lgd <= 0.01 * lgm && !dneq[0] && !dneq[1] && !dneq[2] && !dneq[3] && fin && worst[0] < 1e-5 && worst[1] < 1e-5 && worst[2] < 1e-5 && worst[3] < 1e-5 && worst[4] < 1e-5 && ctr[r0][0] == ctr[m][0] && ctr[r0][1] == ctr[m][1];
-            static const char *nm[6] = {"", "", " (recomputing)", " (recomputing, slab rings)", " (recomputing, the stream head)", " (recomputing, the stream head, slab rings: against the stream head)"};
+            static const char *nm[8] = {"", "", " (recomputing)", " (recomputing, slab rings)", " (recomputing, the stream head)", " (recomputing, the stream head, slab rings: against the stream head)",
+                                        "", " (recomputing, the stream head, --gpu-input, slab rings with the input ring: against the whole input)"};
             printf("  P %d slab %d down_norm %d, stream %d%s%s: logits %zu of %zu bytes differ (max |diff| %.3g of %.3g), gout[1] %zu, dec[0]'s skip gradient %zu, d/d downo[0] %zu, skip gradient %zu; parameter "
                    "gradients rel enc0 %.2g down0 %.2g dec0 %.2g head %.2g all %.2g%s; seeds %u/%u vs %u/%u; step %.0f vs %.0f ms (with the logits' d2h)%s%s\n",
                    P, S, dn, m < 3 ? m : 2, nm[m], getenv("UFSM_L0_STREAM_POISON") ? " (poison)" : "",
@@ -121,9 +134,11 @@ int main(void) {
                    ctr[m][0], ctr[m][1], ctr[r0][0], ctr[r0][1], ms[m], ms[r0], e ? e : "", ok ? "" : "  FAIL");
             if (!ok) bad++;
         }
-        for (int st = 0; st < nst; st++) if (!((st == 3 || st == 5) && !ring)) for (int k = 0; k < 3; k++) free(lg[st][k]);
-        for (int st = 0; st < nst; st++) if (!((st == 3 || st == 5) && !ring)) for (int k = 0; k < 2; k++) { free(gg[st][k]); for (int d = 0; d < 4; d++) free(dmp[st][k][d]); }
-        unet_set_l0_ring(0); unet_set_l0_head(v, nullptr, nullptr, nullptr); nn_free(hc.lgw);
+        for (int st = 0; st < nst; st++) if (!((st == 3 || st == 5 || st >= 6) && !ring)) for (int k = 0; k < 3; k++) free(lg[st][k]);
+        for (int st = 0; st < nst; st++) if (!((st == 3 || st == 5 || st >= 6) && !ring)) for (int k = 0; k < 2; k++) { free(gg[st][k]); for (int d = 0; d < 4; d++) free(dmp[st][k][d]); }
+        unet_set_l0_ring(0); unet_set_l0_head(v, nullptr, nullptr, nullptr); unet_set_input_rad(v, nullptr); nn_free(hc.lgw);
+        for (int k = 0; k < 3; k++) nn_free(ct[k]);
+        nn_free(rec);
         for (int k = 0; k < 3; k++) nn_free(x[k]);
         for (int k = 0; k < 2; k++) nn_free(gl[k]);
         unet_free(v);

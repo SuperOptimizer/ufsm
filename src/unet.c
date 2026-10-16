@@ -103,6 +103,7 @@ struct unet {
     void *l0h_lg; size_t l0h_lgn;      /* the stream head: one slab's fp16 logits [cout][planes h w] */
     unsigned l0h_c; int l0h_k;         /* the forward head's first seed draw and draws per slab (the backward's recomputes replay them) */
     int l0hb;                          /* this ring build runs the head per slab: dec[0].a2 and gout[0] in rings, the skip gradient its own */
+    int l0rx; const void *l0x_ct; int l0x_held[16];   /* the network input in a ring (--gpu-input: rebuilt per slab from the CT channel); slot -> slab */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
@@ -669,20 +670,20 @@ static int l0s_nslab(const unet *u, int d) { const int S = u->cfg.l0_slab; retur
    The level-0 tensors of the slab stream become VMM rings (nn_ring_alloc): whole-tensor virtual addresses (S2's windows, S3's schedule
    unchanged), slab s backed by physical chunk s mod R. R per tensor is the schedule's live span (S3's DESIGN.md table, verified by the
    bit-for-bit test: a ring too short changes the bits). Indices: 0 enc[0].a1, 1 the skip enc[0].a2, 2 dec[0].a1, 3 dec[0].a2,
-   4 d/d a2 (the stream's B2), 5 level 0's A, 6 the up-part gradient (level 0's B), 7 dec[0]'s up transient, 8 gout[0] */
+   4 d/d a2 (the stream's B2), 5 level 0's A, 6 the up-part gradient (level 0's B), 7 dec[0]'s up transient, 8 gout[0], 9 the input */
 static int g_l0ring = -1;
 void unet_set_l0_ring(int on) { g_l0ring = on; }
 static int l0ring_req(void) { if (g_l0ring < 0) { const char *e = getenv("UFSM_L0_RING"); g_l0ring = e ? atoi(e) : 0; } return g_l0ring; }
 static int l0ring_R(int k) {
-    static int R[9] = {0}; static int set = 0;
+    static int R[10] = {0}; static int set = 0;
     if (!set) {
-        const int def[9] = {3, 5, 3, 2, 3, 4, 3, 3, 2};
-        for (int i = 0; i < 9; i++) R[i] = def[i];
+        const int def[10] = {3, 5, 3, 2, 3, 4, 3, 3, 2, 3};
+        for (int i = 0; i < 10; i++) R[i] = def[i];
         const char *e = getenv("UFSM_L0_RING_R");   /* "a,b,c,...": overrides in index order (the test's too-short controls) */
-        for (int i = 0; e && *e && i < 9; i++) { R[i] = atoi(e); const char *c = strchr(e, ','); e = c ? c + 1 : nullptr; }
+        for (int i = 0; e && *e && i < 10; i++) { R[i] = atoi(e); const char *c = strchr(e, ','); e = c ? c + 1 : nullptr; }
         set = 1;
     }
-    return k >= 0 && k < 9 ? R[k] : 3;
+    return k >= 0 && k < 10 ? R[k] : 3;
 }
 static int l0st_req(void);
 static int l0ring_mode(void) { return l0ring_req() && l0st_req() >= 2; }
@@ -1279,6 +1280,8 @@ static void build_acts(unet *u, shape5 xs, int train) {
                 if (!g_dry) for (int k = 0; k < 4; k++) if (!u->ev_xin[k]) u->ev_xin[k] = nn_event_create();
             } else fprintf(stderr, "unet: cannot pin %.2f GB for the input offload; a separate input buffer\n", xb_ / 1e9);
         }
+        u->l0rx = u->l0hb && u->rad && unet_input_prec() && !u->cfg.half_res;   /* (stage S4: --gpu-input records set before the build) */
+        if (u->l0rx && !u->xin) { g_mlab = "level-0 slab rings (stage S4)"; u->xin = dalloc_ring(u, xs, unet_input_prec(), l0ring_R(9), 0); }
         if (!u->xin && !u->ct_stem) u->xin = dalloc_input(u, xs);   /* (CT stem: none; unet_forward_x allocates one on demand) */
     }
     u->glb = nullptr;   /* allocated on first use for a fp32 logit gradient */
@@ -2083,6 +2086,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     else if (x_h16 && act_mx8() && xin_mx) {
         if (!u->xin) u->xin = dalloc_input(u, xs);
         if (u->rad && u->cfg.half_res == 2) nn_input_rad_pack(x, xs, u->rad, u->xin);   /* --half-res pack: x is the full-resolution CT channel */
+        else if (u->rad && u->l0rx) { u->l0x_ct = x; for (int k = 0; k < 16; k++) u->l0x_held[k] = -1; }   /* (stage S4: per slab in the stream, l0x_need) */
         else if (u->rad) nn_input_rad(x, xs, u->rad, u->xin);   /* --gpu-input: x is the CT channel, the radial channels from the records */
         else nn_h16_to_mx(x, xs, u->xin);
         cur = u->xin;
@@ -2557,6 +2561,20 @@ static void l0st_poison(unet *u, void *t, shape5 s5, int s) {   /* a transient s
 }
 /* stream 2 (recomputing): a phase's level-0 activations are dead on entry (S4 keeps none of them whole): poisoned all through */
 static void l0st_poison_all(unet *u, void *t, shape5 s5) { if (u->l0st >= 2) for (int s = 0; s < l0s_nslab(u, s5.d); s++) l0st_poison_raw(u, t, s5, s); }
+/* stage S4, the input ring (--gpu-input): slabs [lo, hi] of the network input built from the CT channel and the records (input_rad
+   windows) unless the ring holds them -- the stem's windows read its slab and one plane of each neighbour */
+static void l0x_need(unet *u, int lo, int hi) {
+    if (!u->l0rx) return;
+    const int ns = l0s_nslab(u, u->ls[0].d), R = l0ring_R(9) < 16 ? l0ring_R(9) : 16;
+    if (!u->l0x_ct || !u->rad) rc_fail("level-0 slab rings: the input ring needs the CT channel and its records (unet_set_input_rad before the build)");
+    for (int s = lo < 0 ? 0 : lo; s <= hi && s < ns; s++) {
+        if (u->l0x_held[s % R] == s) continue;
+        l0st_win(u, s, 1, 3);
+        PROF(4, nn_input_rad(u->l0x_ct, u->xs, u->rad, u->xin));
+        l0st_nowin();
+        u->l0x_held[s % R] = s;
+    }
+}
 /* stream 2: slab s of a forward level-0 op's output recomputed (0 the stem -> enc[0].a1, 1 enc[0]'s conv2 -> a2, 2 dec[0]'s conv1 ->
    a1, 3 its conv2 -> a2): the forward's seeds (replayed, the draws asserted), its statistics (kept: no statistics pass). The layer and
    conv tags are the forward's; the caller restores its own and its seed counter is kept */
@@ -2570,7 +2588,8 @@ static void l0st_re(unet *u, int op, int s) {
     l0st_win(u, s, 1, 3);   /* (a middle window: no output sums zeroed or finalised; there are none) */
     nn_sr_set_ctr(u->l0st_rc[op]);
     int r = 0;
-    if (op == 0) { const nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(b->in, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, b->a1, G, 1e-5f, nullptr, nullptr)); }
+    if (op == 0) { l0x_need(u, s - 1, s + 1); l0st_win(u, s, 1, 3); nn_sr_set_ctr(u->l0st_rc[op]);
+                   const nn_gn_t gi = gn_in(u, b); PROF(0, nn_conv3d_fwd_gn_stats(b->in, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, b->a1, G, 1e-5f, nullptr, nullptr)); }
     else if (op == 2) r = dec_conv1(u, b, 0, b->a1, G, nullptr, nullptr, nullptr, nullptr, nullptr);
     else PROF(0, nn_conv3d_fwd_gn_stats(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, P(u, b->c2.w), P(u, b->c2.b), b->c2.cout, b->a2, G, 1e-5f, nullptr, nullptr));
     if (r || (int)(nn_sr_ctr() - u->l0st_rc[op]) != u->l0st_rk[op]) rc_fail("level-0 slab stream: a recompute (or its seed draws)");
@@ -2623,6 +2642,7 @@ static const float *l0st_fwd_enc(unet *u, const float *x) {
     l0op st = {nn_sr_ctr(), -1}, c2 = {0, -1}, dn = {0, -1};
     for (int t = 0; t <= ns; t++) {
         if (t < ns) {   /* the stem, slab t (no output sums: the slab pass gives the statistics) */
+            l0x_need(u, t - 1, t + 1);
             nn_set_layer(0); nn_set_conv(0); l0st_win(u, t, t, ns); l0op_go(&st);
             PROF(0, nn_conv3d_fwd_gn_stats(x, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, P(u, b->c1.w), B1(u, b), b->c1.cout, b->a1, G, 1e-5f, nullptr, nullptr));
             l0op_end(&st, &c2); l0st_nowin();
@@ -2840,7 +2860,9 @@ static void l0st_bwd_enc(unet *u, float *gin) {
             l0op_end(&o_c2d, &o_g1); l0op_go(&o_g1);
             PROF(3, gn_silu_bwd_b(u, b, 1, b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, A, A, g + b->n1.gamma, g + b->n1.beta, u->gn_scratch));
             l0op_end(&o_g1, &o_sw);
-            nn_set_conv(0); l0op_go(&o_sw);
+            nn_set_conv(0);
+            l0x_need(u, s - 1, s + 1); l0st_win(u, s, s, ns);   /* (the input ring: its window rebuilt around slab s) */
+            l0op_go(&o_sw);
             PROF(2, nn_conv3d_bwd_weight(b->in, b->xs, A, b->ys, 3, 1, g + b->c1.w, g + b->c1.b));
             l0op_end(&o_sw, nullptr); l0st_nowin();
             l0st_poison(u, B, b->ys, s - 1);   /* d/d a2 of slab t - 2: its last reader (conv2's backward-data of slab t - 1) ran */
