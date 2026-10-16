@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#ifdef __F16C__
+#if defined(__F16C__) || defined(__AVX2__)
 #include <immintrin.h>
 #endif
 
@@ -726,6 +726,15 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
     }
     /* ((float)ctu - mean) * isd (or the plan's LUT) tabulated per value: the same floats */
     float lutv[256]; for (int i=0;i<256;i++) lutv[i]=ap?(ap->filter_mode?0:ap->lut[i]):((float)i-mean)*isd;
+#ifdef __AVX2__
+    /* the trainer's case (hard targets, CT-only, P a multiple of 16): 8 voxels at a time with AVX2 gathers of the CT values (as floats in
+       the appearance scratch), mask and target bytes (aligned 32-bit words, in bounds: P^3 % 4 == 0); the same float operations in the
+       same order (no contraction), bit for bit */
+    const int fast=hard && ct_only && P%16==0 && NCH==2 && !((uintptr_t)mask&3) && !((uintptr_t)target&3) && !((uintptr_t)ctu&3);
+    const int filt_fast=ap && ap->filter_mode;   /* (CT values: the appearance floats; else the CT byte through lutv, L1-resident) */
+#else
+    const int fast=0;
+#endif
     for (int z0=0;z0<P;z0+=ZB) {
         const int nz=P-z0<ZB?P-z0:ZB;
         for (int y0=0;y0<P;y0+=TB) for (int x0=0;x0<P;x0+=TB) {
@@ -734,17 +743,105 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                 const float v0=vt[z],v1=vt[P+y],j0=vt[3*P+z],j1=vt[4*P+y];
                 float t01[3];
                 for (int d=0;d<3;d++) t01[d]=Rf[0][d]*v0+Rf[1][d]*v1;   /* (the first two terms of the pull's sum) */
-                for (int x=x0;x<x0+nx;x++) {
+#ifdef __AVX2__
+                if (fast) {
+                    const __m256 one=_mm256_set1_ps(1.f),fP1=_mm256_set1_ps((float)(P-1)),zero=_mm256_setzero_ps(),thr=_mm256_set1_ps(1e-7f),half=_mm256_set1_ps(.5f);
+                    const __m256i three=_mm256_set1_epi32(3),bytem=_mm256_set1_epi32(255),iP=_mm256_set1_epi32(P);
+                    for (int h=0;h<TB;h+=8) {
+                        const int xs=x0+h;
+                        const __m256 v2=_mm256_loadu_ps(vt+2*P+xs);
+                        __m256 U[3],Vv[3],F[3],G[3];
+                        if (a->affine) {
+                            __m256 w[3];
+                            for (int d=0;d<3;d++) w[d]=_mm256_add_ps(_mm256_set1_ps(t01[d]),_mm256_mul_ps(_mm256_set1_ps(Rf[2][d]),v2));
+                            for (int d=0;d<3;d++) U[d]=_mm256_add_ps(_mm256_set1_ps(c),_mm256_mul_ps(_mm256_set1_ps(sc),_mm256_add_ps(_mm256_add_ps(
+                                _mm256_mul_ps(_mm256_set1_ps(Af[d][0]),w[0]),_mm256_mul_ps(_mm256_set1_ps(Af[d][1]),w[1])),_mm256_mul_ps(_mm256_set1_ps(Af[d][2]),w[2]))));
+                        } else for (int d=0;d<3;d++) U[d]=_mm256_add_ps(_mm256_set1_ps(c),_mm256_mul_ps(_mm256_set1_ps(sc),_mm256_add_ps(_mm256_set1_ps(t01[d]),_mm256_mul_ps(_mm256_set1_ps(Rf[2][d]),v2))));
+                        for (int d=0;d<3;d++) Vv[sy.perm[d]]=sy.flip[d]?_mm256_sub_ps(fP1,U[d]):U[d];
+                        __m256 in=_mm256_and_ps(_mm256_cmp_ps(Vv[0],zero,_CMP_GE_OQ),_mm256_cmp_ps(Vv[0],fP1,_CMP_LE_OQ));
+                        for (int d=1;d<3;d++) in=_mm256_and_ps(in,_mm256_and_ps(_mm256_cmp_ps(Vv[d],zero,_CMP_GE_OQ),_mm256_cmp_ps(Vv[d],fP1,_CMP_LE_OQ)));
+                        const __m256i ini=_mm256_castps_si256(in);
+                        __m256i Bv[3];
+                        for (int d=0;d<3;d++) {
+                            Bv[d]=_mm256_and_si256(_mm256_min_epi32(_mm256_cvttps_epi32(Vv[d]),_mm256_set1_epi32(P-2)),ini);
+                            F[d]=_mm256_sub_ps(Vv[d],_mm256_cvtepi32_ps(Bv[d])); G[d]=_mm256_sub_ps(one,F[d]);
+                        }
+                        const __m256i b0=_mm256_add_epi32(_mm256_mullo_epi32(_mm256_add_epi32(_mm256_mullo_epi32(Bv[0],iP),Bv[1]),iP),Bv[2]);
+                        __m256 cv=zero; __m256i bad=_mm256_setzero_si256();
+                        for (int cn=0;cn<8;cn++) {
+                            const int bz=cn>>2,by=cn>>1&1,bx=cn&1;
+                            const __m256 w=_mm256_mul_ps(_mm256_mul_ps(bz?F[0]:G[0],by?F[1]:G[1]),bx?F[2]:G[2]);
+                            const __m256 use=_mm256_and_ps(in,_mm256_cmp_ps(w,thr,_CMP_GT_OQ));
+                            const __m256i j=_mm256_add_epi32(b0,_mm256_set1_epi32((bz*P+by)*P+bx));
+                            __m256 val;
+                            if (filt_fast) val=_mm256_mask_i32gather_ps(zero,appearance,j,use,4);
+                            else {
+                                const __m256i cw=_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)ctu,_mm256_srli_epi32(j,2),_mm256_castps_si256(use),4);
+                                const __m256i cb=_mm256_and_si256(_mm256_srlv_epi32(cw,_mm256_slli_epi32(_mm256_and_si256(j,three),3)),bytem);
+                                val=_mm256_mask_i32gather_ps(zero,lutv,cb,use,4);
+                            }
+                            cv=_mm256_add_ps(cv,_mm256_and_ps(_mm256_mul_ps(w,val),use));
+                            const __m256i word=_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)mask,_mm256_srli_epi32(j,2),_mm256_castps_si256(use),4);
+                            const __m256i byte=_mm256_and_si256(_mm256_srlv_epi32(word,_mm256_slli_epi32(_mm256_and_si256(j,three),3)),bytem);
+                            bad=_mm256_or_si256(bad,_mm256_and_si256(_mm256_cmpeq_epi32(byte,_mm256_setzero_si256()),_mm256_castps_si256(use)));
+                        }
+                        if (ap && !ap->filter_mode) for (int d=0;d<3;d++)
+                            cv=_mm256_add_ps(cv,_mm256_mul_ps(_mm256_set1_ps(ap->shading[d]),_mm256_sub_ps(_mm256_div_ps(_mm256_mul_ps(_mm256_set1_ps(2.f),Vv[d]),fP1),one)));
+                        const __m256i jn=_mm256_add_epi32(b0,_mm256_add_epi32(_mm256_add_epi32(
+                            _mm256_and_si256(_mm256_castps_si256(_mm256_cmp_ps(F[0],half,_CMP_GT_OQ)),_mm256_set1_epi32(P*P)),
+                            _mm256_and_si256(_mm256_castps_si256(_mm256_cmp_ps(F[1],half,_CMP_GT_OQ)),iP)),
+                            _mm256_and_si256(_mm256_castps_si256(_mm256_cmp_ps(F[2],half,_CMP_GT_OQ)),_mm256_set1_epi32(1))));
+                        const __m256i sh=_mm256_slli_epi32(_mm256_and_si256(jn,three),3), wj=_mm256_srli_epi32(jn,2);
+                        const __m256i t0=_mm256_and_si256(_mm256_srlv_epi32(_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)target,wj,ini,4),sh),bytem);
+                        const __m256i t1=_mm256_and_si256(_mm256_srlv_epi32(_mm256_mask_i32gather_epi32(_mm256_setzero_si256(),(const int *)(target+p3),wj,ini,4),sh),bytem);
+                        int ib[8],vb[8],tb0[8],tb1[8];
+                        _mm256_storeu_si256((__m256i *)ib,ini); _mm256_storeu_si256((__m256i *)vb,bad);
+                        _mm256_storeu_si256((__m256i *)tb0,t0); _mm256_storeu_si256((__m256i *)tb1,t1);
+                        const size_t k=((size_t)z*P+y)*P+xs, kb=((size_t)(z-z0)*P+y)*P+xs;
+                        _mm256_storeu_ps(cvb+kb,cv);
+                        for (int l=0;l<8;l++) {
+                            const int inl=ib[l]!=0;
+                            inb[kb+l]=(uint8_t)inl; M[k+l]=(uint8_t)(inl && !vb[l]);
+                            T[k+l]=inl?(uint8_t)tb0[l]:0; T[p3+k+l]=inl?(uint8_t)tb1[l]:0;
+                        }
+                    }
+                    continue;
+                }
+#endif
+                /* the row segment in stages: coordinates, corners and weights over its lanes (vectorisable), then the corner
+                   loads corner by corner (each lane accumulates its corners in the per-voxel order), then the outputs */
+                float V[3][TB],Fq[3][TB],W[8][TB],CV[TB],TVc[NCH][TB]; size_t B0[TB]; uint8_t IN[TB],VA[TB];
+                {
+                    float U[3][TB];
+                    if (a->affine) for (int i=0;i<nx;i++) {
+                        const float v2=vt[2*P+x0+i]; float w[3];
+                        for (int d=0;d<3;d++) w[d]=t01[d]+Rf[2][d]*v2;
+                        for (int d=0;d<3;d++) U[d][i]=c+sc*(Af[d][0]*w[0]+Af[d][1]*w[1]+Af[d][2]*w[2]);
+                    } else for (int d=0;d<3;d++) { const float t=t01[d],r2=Rf[2][d]; for (int i=0;i<nx;i++) U[d][i]=c+sc*(t+r2*vt[2*P+x0+i]); }
+                    for (int d=0;d<3;d++) { const int pd=sy.perm[d]; if (sy.flip[d]) for (int i=0;i<nx;i++) V[pd][i]=P-1-U[d][i]; else for (int i=0;i<nx;i++) V[pd][i]=U[d][i]; }
+                    int Bi[3][TB];
+                    for (int i=0;i<nx;i++) IN[i]=V[0][i]>=0 && V[0][i]<=P-1 && V[1][i]>=0 && V[1][i]<=P-1 && V[2][i]>=0 && V[2][i]<=P-1;
+                    for (int d=0;d<3;d++) for (int i=0;i<nx;i++) { int b=IN[i]?(int)V[d][i]:0; if (b>=P-1) b=P-2; Bi[d][i]=b; Fq[d][i]=V[d][i]-b; }
+                    for (int i=0;i<nx;i++) B0[i]=((size_t)Bi[0][i]*P+Bi[1][i])*P+Bi[2][i];
+                    for (int cn=0;cn<8;cn++) { const int bz=cn>>2,by=cn>>1&1,bx=cn&1; for (int i=0;i<nx;i++) W[cn][i]=(bz?Fq[0][i]:1-Fq[0][i])*(by?Fq[1][i]:1-Fq[1][i])*(bx?Fq[2][i]:1-Fq[2][i]); }
+                }
+                for (int i=0;i<nx;i++) { CV[i]=0; VA[i]=1; for (int ch=0;ch<NCH;ch++) TVc[ch][i]=0; }
+                const int filt=ap && ap->filter_mode;
+                for (int cn=0;cn<8;cn++) {
+                    const size_t off=((size_t)(cn>>2)*P+(cn>>1&1))*P+(cn&1);
+                    for (int i=0;i<nx;i++) {
+                        const float weight=W[cn][i];
+                        if (!IN[i] || weight<=1e-7f) continue;
+                        const size_t j=B0[i]+off;
+                        VA[i]&=mask[j]!=0;
+                        CV[i]+=weight*(filt?appearance[j]:lutv[ctu[j]]);
+                        if (!hard) for (int ch=0;ch<NCH;ch++) TVc[ch][i]+=weight*target[(size_t)ch*p3+j];
+                    }
+                }
+                for (int i=0;i<nx;i++) {
+                    const int x=x0+i;
                     const size_t k=((size_t)z*P+y)*P+x, kb=((size_t)(z-z0)*P+y)*P+x;
-                    const float v2=vt[2*P+x];
-                    float u[3],v[3];
-                    if (a->affine) {
-                        float w[3]; for (int d=0;d<3;d++) w[d]=t01[d]+Rf[2][d]*v2;
-                        for (int d=0;d<3;d++) u[d]=c+sc*(Af[d][0]*w[0]+Af[d][1]*w[1]+Af[d][2]*w[2]);
-                    } else for (int d=0;d<3;d++) u[d]=c+sc*(t01[d]+Rf[2][d]*v2);
-                    for (int d=0;d<3;d++) v[sy.perm[d]]=sy.flip[d]?P-1-u[d]:u[d];
-                    int inside=1;
-                    for (int d=0;d<3;d++) if (v[d]<0 || v[d]>P-1) inside=0;
+                    const int inside=IN[i];
                     inb[kb]=(uint8_t)inside;
                     if (!inside) {
                         for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=0;
@@ -752,19 +849,10 @@ static void write_spatial(const uint8_t *ctu,const uint8_t *target,const uint8_t
                         if (!ct_only) for (int ch=1;ch<4;ch++) { size_t j=(size_t)ch*p3+k; if (xfmt==1) { _Float16 h=(_Float16)0.f; memcpy(H+j,&h,2); } else if (xfmt==2) H[j]=bf16_rn(0.f); else X[j]=0.f; }
                         continue;
                     }
-                    int base[3]; float f[3];
-                    for (int d=0;d<3;d++) { base[d]=(int)v[d]; if (base[d]>=P-1) base[d]=P-2; f[d]=v[d]-base[d]; }
-                    float tv[NCH]={0},cv=0; int valid=1;
-                    const size_t b0=((size_t)base[0]*P+base[1])*P+base[2];
-                    for (int bz=0;bz<2;bz++) for (int by=0;by<2;by++) for (int bx=0;bx<2;bx++) {
-                        float weight=(bz?f[0]:1-f[0])*(by?f[1]:1-f[1])*(bx?f[2]:1-f[2]);
-                        if (weight<=1e-7f) continue;
-                        size_t j=b0+((size_t)bz*P+by)*P+bx;
-                        valid &= mask[j]!=0;
-                        float val=ap && ap->filter_mode?appearance[j]:lutv[ctu[j]];
-                        cv+=weight*val;
-                        if (!hard) for (int ch=0;ch<NCH;ch++) tv[ch]+=weight*target[(size_t)ch*p3+j];
-                    }
+                    const float v[3]={V[0][i],V[1][i],V[2][i]},f[3]={Fq[0][i],Fq[1][i],Fq[2][i]};
+                    int base[3]; for (int d=0;d<3;d++) { base[d]=(int)v[d]; if (base[d]>=P-1) base[d]=P-2; }
+                    float cv=CV[i],tv[NCH]; const int valid=VA[i]; for (int ch=0;ch<NCH;ch++) tv[ch]=TVc[ch][i];
+                    const size_t b0=B0[i];
                     if (ap && !ap->filter_mode && P>1) for (int d=0;d<3;d++) cv+=ap->shading[d]*(2*v[d]/(P-1)-1);
                     cvb[kb]=cv; M[k]=(uint8_t)valid;
                     if (hard) { const size_t bj=b0+((size_t)(f[0]>.5f)*P+(f[1]>.5f))*P+(f[2]>.5f); for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=target[(size_t)ch*p3+bj]; }
