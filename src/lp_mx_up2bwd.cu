@@ -3,7 +3,8 @@
 /* ---- MX backward of the exact-2x trilinear upsample: gx[m] = sum over fine outputs o in [2m - 1, 2m + 2] (per axis) of
    coef(o, m) gy[o], coef as in the forward (0.75 for in[o/2], 0.25 for the clamped neighbour) ---- */
 template <int GB = 8, int XB = 8>   /* MX bits of gy / gx; XB 4: gx with exact SR keyed by osr */
-__global__ void up2_bwd_mx_k(const uint8_t *gy, uint8_t *gx, int N, int C, int D, int H, int W, unsigned osr) {   /* D, H, W: coarse (gx) grid */
+__global__ void up2_bwd_mx_k(const uint8_t *gy, uint8_t *gx, int N, int C, int D, int H, int W, unsigned osr, int nbx = 0, int ob0 = 0) {   /* D, H, W: coarse (gx) grid;
+                                                                                                    nbx > 0: gx has nbx blocks, gy's C channels go to blocks ob0 .. (a whole-block slice) */
     const int bw = mx_bw(C), nb = mx_nb(C), Do = 2 * D, Ho = 2 * H, Wo = 2 * W;
     const size_t S = (size_t)D * H * W, So = (size_t)Do * Ho * Wo;
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -11,6 +12,8 @@ __global__ void up2_bwd_mx_k(const uint8_t *gy, uint8_t *gx, int N, int C, int D
     size_t v = i % S, nbk = i / S;
     int x = (int)(v % W), y = (int)((v / W) % H), z = (int)(v / ((size_t)W * H));
     const uint8_t *sc = gy + (size_t)N * nb * So * mx_rb(bw, GB);
+    const size_t ri = nbx ? ((nbk / nb) * nbx + ob0 + nbk % nb) * S + v : i;   /* the gx row */
+    if (!nbx) nbx = nb;
     float acc[32] = {};
 #pragma unroll 1
     for (int a = 0; a < 4; a++) {
@@ -28,7 +31,7 @@ __global__ void up2_bwd_mx_k(const uint8_t *gy, uint8_t *gx, int N, int C, int D
             }
         }
     }
-    mx_store_row_b<XB>(gx, gx + (size_t)N * nb * S * mx_rb(bw, XB), i, bw, acc, XB == 4 ? osr : 0u);
+    mx_store_row_b<XB>(gx, gx + (size_t)N * nbx * S * mx_rb(bw, XB), ri, bw, acc, XB == 4 ? osr : 0u);
 }
 /* tiled: block = (16 x CY coarse columns, z chunk of ZC coarse planes, n, gx block); thread = (coarse x, coarse y, 8 channels):
    BW / 8 threads per voxel (BW 32: 16 x 4 columns, 16: 16 x 8, 8: 16 x 16; always 256 threads). The block walks the fine
@@ -214,6 +217,10 @@ extern "C" void lp_up2_bwd_mx_slice(const void *gy, shape5 xs, void *gx, int cto
     if (nob > 1 && nc <= 16) { fprintf(stderr, "lp_up2_bwd_mx_slice: slice spans blocks\n"); abort(); }
     if ((up2b_tile_on() || gdt == 4) && bwx == bwy && c0 % bwx == 0 && nc % bwx == 0 && xs.w % 2 == 0) {   /* whole blocks (8, 16 or 32 channels), written fresh */
         up2_bwd_tile(gy, mx_nb(nc), 0, xs, gx, mx_nb(ctot), ob0, nob, gdt, xdt, osr, bwx); LPCK(); return;
+    }
+    if (gdt == 4 && xdt == 4 && bwx == bwy && c0 % bwx == 0 && nc % bwx == 0) {   /* whole blocks, odd coarse width (P 704's coarsest: 11): per voxel */
+        size_t n = (size_t)xs.n * mx_nb(nc) * shape_spatial(xs);
+        up2_bwd_mx_k<4, 4><<<nblk_(n, 256), 256>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, nc, xs.d, xs.h, xs.w, osr, mx_nb(ctot), ob0); LPCK(); return;
     }
     if (gdt == 4 || xdt == 4) { fprintf(stderr, "lp_up2_bwd_mx_slice: MX-fp4 gradients need whole MX blocks (c0 %d nc %d of %d) and an even coarse width\n", c0, nc, ctot); abort(); }
     if (nob > 1) {   /* 32-aligned multi-block slice: one gy block per gx block, launch per block */

@@ -1220,16 +1220,16 @@ int cmd_train(int argc, char **argv) {
            validation loss +0.1..0.8%) where the fp4 kernels apply: widths in 32-channel blocks, an even coarsest level;
            UFSM_GRAD_MX4=0 keeps MX-fp8 */
         {
-            /* the stride-2 down convs' MX-fp4 weight gradients need every downsampled width a multiple of 4 (lp_bwd_w_s2_f8): the coarsest,
-               P / 2^(nlev-1), included; P % 2^nlev let P 320 / 448 through to an abort */
-            int g4ok = P % (4 << (cfg.nlev - 1)) == 0 && g_Pz % (4 << (cfg.nlev - 1)) == 0 && fp4 >= 2 && !*opt(argc, argv, "--policy", "");   /* the fp8 weight gradients of --fp4 1
+            /* any P the net takes (a multiple of 2^(nlev-1): P 640 / 704 with 7 levels); the stride-2 weight gradient's gy scales no
+               longer need the coarsest width a multiple of 4 */
+            int g4ok = P % (1 << (cfg.nlev - 1)) == 0 && g_Pz % (1 << (cfg.nlev - 1)) == 0 && fp4 >= 2 && !*opt(argc, argv, "--policy", "");   /* the fp8 weight gradients of --fp4 1
                                                                                                      (or a --policy) take no MX-fp4 gy */
             /* 16- and 8-channel levels too (paired 2000-step desk check, production recipe: val 0.6506 vs 0.6534 MX-fp8, +3% speed, 5.8 vs 9.7 GB) */
             const int g4n = getenv("UFSM_G4_NARROW") ? ufsm_env_on("UFSM_G4_NARROW") : 1;   /* default on since the paired check (2026-10-15); =0 keeps MX-fp8 there */
             for (int i = 0; i < cfg.nlev; i++) if (cfg.widths[i] % 32 && !(g4n && (cfg.widths[i] == 16 || cfg.widths[i] == 8))) g4ok = 0;
             for (int i = 0; i < cfg.nlev - 1; i++) if (cfg.dec_widths[i] > 0 && cfg.dec_widths[i] % 32 && !(g4n && (cfg.dec_widths[i] == 16 || cfg.dec_widths[i] == 8))) g4ok = 0;
             const int g4 = getenv("UFSM_GRAD_MX4") ? ufsm_env_on("UFSM_GRAD_MX4") : g4ok;
-            if (g4 && !g4ok) { fprintf(stderr, "UFSM_GRAD_MX4: MX-fp4 gradients need --fp4 2 (fp4 weight gradients), widths that are multiples of 32 and P divisible by %d\n", 4 << (cfg.nlev - 1)); return 2; }
+            if (g4 && !g4ok) { fprintf(stderr, "UFSM_GRAD_MX4: MX-fp4 gradients need --fp4 2 (fp4 weight gradients), widths that are multiples of 32 and P divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
             unet_set_grad_mx4(g4);
             /* shared encoder a1 (recompute 1) with its host offload by default: ~0.6% step, -22 B per level-0 voxel; UFSM_RC_ENC_A1=0 off */
             unet_set_share_enc_a1(getenv("UFSM_RC_ENC_A1") ? ufsm_env_on("UFSM_RC_ENC_A1") : 1);
