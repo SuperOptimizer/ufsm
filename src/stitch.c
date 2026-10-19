@@ -738,6 +738,16 @@ static int cmp_lev(const void *a, const void *b) {
     if (x->box != y->box) return x->box - y->box;
     return (x->level > y->level) - (x->level < y->level);
 }
+/* vertex (row r, column col) has rows above and below it: of the up to 6 rows within 3 at least min(3, half of them) hold a vertex
+   in that column (a row that ran on alone - along a fault, into a gap - leaves 1-2 row streaks that no surface has) */
+static int supported(const trow *R, int rlo, int rhi, int r, int col) {
+    int have = 0, avail = 0;
+    for (int d = -3; d <= 3; d++) {
+        const int q = r + d; if (!d || q < rlo || q > rhi) continue;
+        avail++; const int i = col - R[q].c0; if (i >= 0 && i < R[q].n && (R[q].fl[i] & 1)) have++;
+    }
+    return have >= (avail / 2 < 3 ? avail / 2 : 3);
+}
 int st_trace(const st_box *b, int nb, int comp, const st_trace_cfg *c, st_sgauge *g, int follow, const double seed[3], st_sheet *s) {
     memset(s, 0, sizeof *s);
     tctx T = {b, nb, comp, follow, c, g, 1.0 / (400.0 * 400.0), 0, 0, 0};   /* F flatter than one turn per 400 native voxels: degenerate */
@@ -772,7 +782,7 @@ int st_trace(const st_box *b, int nb, int comp, const st_trace_cfg *c, st_sgauge
     for (int r = rlo; r <= rhi; r++) {
         const trow *W = &R[r]; const double z = seed[0] + (r - ndn) * st;
         for (int i = 0; i < W->n; i++) {
-            if (!(W->fl[i] & 1)) continue;
+            if (!(W->fl[i] & 1) || !supported(R, rlo, rhi, r, W->c0 + i)) continue;
             const size_t v = (size_t)(r - rlo) * s->cols + (W->c0 + i - cmin);
             s->x[v] = W->x[i]; s->y[v] = W->y[i]; s->z[v] = (float)z; s->nvalid++;
             const int cl = W->cls[i] & 127; s->seam[v] = (uint8_t)cl; s->nunjoined += W->cls[i] >> 7;
