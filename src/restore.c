@@ -12,9 +12,9 @@ void restore_ranges_default(restore_ranges *g) {
     g->mix[RF_IDENTITY] = 0.1f; g->mix[RF_PYRAMID] = 0.45f; g->mix[RF_SCANNER] = 0.45f;
     g->pyr_q = 2.f;
     g->sc_step[0] = 3.4f; g->sc_step[1] = 4.4f;
-    g->sc_psf[0] = 0.35f; g->sc_psf[1] = 0.75f; g->sc_aniso = 0.15f;
-    g->sc_noise[0] = 0.5f; g->sc_noise[1] = 4.f;
-    g->sc_sigvar[0] = 0.f; g->sc_sigvar[1] = 0.03f;
+    g->sc_psf[0] = 0.45f; g->sc_psf[1] = 0.75f;   /* calibrated (DESIGN.md "Task restore"): native 8.64 / 9.36 um scans fit 0.5-0.7 */ g->sc_aniso = 0.15f;
+    g->sc_noise[0] = 0.f; g->sc_noise[1] = 6.f;   /* (the fit is flat in 0-6 DN: the 2.4 um scan carries its own noise) */
+    g->sc_sigvar[0] = 0.f; g->sc_sigvar[1] = 0.02f;
     g->sc_corr[0] = 0.f; g->sc_corr[1] = 0.4f;
     g->sc_edge[0] = -0.1f; g->sc_edge[1] = 0.25f; g->sc_edge_p = 0.3f;
     g->sc_gain = 0.06f; g->sc_gamma = 0.06f; g->sc_bias = 3.f;

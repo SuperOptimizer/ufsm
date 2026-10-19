@@ -1054,13 +1054,15 @@ int cmd_train(int argc, char **argv) {
        Explicit --policy changes the requested precisions; --fp4 0 uses 16-bit storage. */
     int expl = *opt(argc, argv, "--prec", "") || *opt(argc, argv, "--wq", "");
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--fp32")) expl = 1;
-    const int fp4 = atoi(opt(argc, argv, "--fp4", expl ? "0" : "2"));   /* --fp4 2 since 2026-10-01 night: passed the stair (last.ckpt 0.299 / 0.284 vs --fp4 1 0.307 / 0.284) and the 40k confirmation (r11c), 1-4% faster */
+    const int fp8 = atoi(opt(argc, argv, "--fp8", "0"));   /* --fp8 1: MX-fp8 activations and fp8 compute everywhere but the fp16 stem (the fp4 A/B) */
+    const int fp4 = fp8 ? 0 : atoi(opt(argc, argv, "--fp4", expl ? "0" : "2"));   /* --fp4 2 since 2026-10-01 night: passed the stair (last.ckpt 0.299 / 0.284 vs --fp4 1 0.307 / 0.284) and the 40k confirmation (r11c), 1-4% faster */
     { int nl = 1; for (const char *q = opt(argc, argv, "--widths", "16,32,64,80"); *q; q++) nl += *q == ','; nn_set_nlev(nl < UNET_MAXLEV ? nl : UNET_MAXLEV); }   /* layer names of the policy */
     if (fp4) {
         unet_set_act_mx4(1); setenv("UFSM_ACT_MX4", "1", 0); nn_set_sr(1);
         if (nn_set_prec_policy(fp4 >= 2 ? "all=fp4:fp4:fp4,enc0.c1=fp16" : "all=fp4:fp4:fp8,enc0.c1=fp16")) return 2;
         if (fp4 >= 2) setenv("UFSM_F4_WGRAD", "1", 0);
     }
+    if (fp8) { unet_set_act_mx8(1); nn_set_sr(1); if (nn_set_prec_policy("all=fp8:fp8:fp8,enc0.c1=fp16")) return 2; }
     if (*opt(argc, argv, "--policy", "") && nn_set_prec_policy(opt(argc, argv, "--policy", ""))) return 2;
     { char mf[4096]; nn_prec_manifest(mf, sizeof mf); fprintf(stderr, "%s\n", mf); char mp[1400]; snprintf(mp, sizeof mp, "mkdir -p '%s'", out); if (system(mp)) {} snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp); }   /* per-layer: "enc0=1,enc1=2,..." */
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--fp32")) nn_set_tf32(0);
@@ -1539,7 +1541,7 @@ int cmd_train(int argc, char **argv) {
                 const shape5 g0s = {B, cfg.widths[0], (int)(p3 / ((size_t)P * P)), P, P};
                 const size_t g0b = cand[c].gmx ? nn_mx_bytes(g0s, unet_grad_mx4() ? 4 : 8) : (size_t)B * cfg.widths[0] * p3 * 2;
                 const int l3 = unet_last_dry_l3b();   /* three level-0 buffers: the tail inside X3 (counted), the input in X2 when it fits */
-                const int xin_sep = cand[c].lean >= 2 && cand[c].gmx && (l3 ? xinb > g0b : !(unet_input_converted() && g_xfmt && xinb + batb + 8192 <= g0b));
+                const int xin_sep = g_restore || (cand[c].lean >= 2 && cand[c].gmx && (l3 ? xinb > g0b : !(unet_input_converted() && g_xfmt && xinb + batb + 8192 <= g0b)));
                 if (cand[c].lean) trainer = (cand[c].gmx ? (xin_sep ? xinb : 0) : xinb) + radb   /* batch buffers inside the gradient buffer B / gout[0] (estimate) */
                                             + (g_cout > NCH && !g_gl_inplace ? (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) : 0)
                                             + (g_head_slab ? (size_t)B * (NCH + 1) * p3 : 0);   /* head slabs: targets and mask outside the gradient buffers */   /* > 2 outputs (affinities, verso): the logit gradient may not fit beside the logits */
@@ -1550,7 +1552,7 @@ int cmd_train(int argc, char **argv) {
                    channel x 256 voxels (~0.5 B per voxel and channel), outside the dry build. 8 / 16-channel levels only with UFSM_GYREC=2
                    (8.5 B per level-0 voxel at 16 channels for ~0 step time there; 8 channels: -2%) */
                 const size_t grec = unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1) ? (size_t)B * cfg.widths[0] * p3 * 136 / 256 : 0;
-                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (need < min_need) { min_need = need; minc = c; min_hoff = pass; }   /* (no fit: the smallest mode evaluated) */
                 if (need <= fmin) { pick = c; pick_hoff = pass; pick_off = unet_last_offload_bytes(); pick_need = need; }
             }
@@ -1584,12 +1586,13 @@ int cmd_train(int argc, char **argv) {
         const size_t p3 = p3l;   /* this GPU's voxels of a window */
         const size_t a256 = 255, glb = ((size_t)B * g_cout * p3 * (g_g16 ? 2 : 4) + a256) & ~a256, tbb = ((size_t)B * g_tc * p3 + a256) & ~a256,
                      mbb = ((size_t)B * p3 + a256) & ~a256, xbb = ((size_t)B * g_xs * p3 * xbytes() + a256) & ~a256;
-        const int xin_b = lean && unet_input_converted() && g_xfmt;
+        const int xin_b = lean && unet_input_converted() && g_xfmt && !g_restore;   /* (restore: the device-built input in its own buffer) */
         char *tail = nullptr;   /* three level-0 buffers: [targets | mask] apart from the input */
         size_t goff = 0;
         int xin_in = 0;
         d->gl = nullptr; d->gl_inside = 0; d->gl_inplace = g_gl_inplace;
-        if (lean) {
+        if (lean && !g_restore) {   /* (restore: target, mask, input and logit gradient in their own buffers: the MX chunk transient of a
+                                       16-channel level 0 does not fit beside them in the gradient buffer) */
             unet_set_batch_bytes(d->u, xin_b ? xbb : 0, tbb + mbb);
             unet_build(d->u, g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P}, 1);
             goff = unet_lean_nob(d->u) ? 0 : glb;
@@ -1707,7 +1710,7 @@ int cmd_train(int argc, char **argv) {
     checkpoint_runtime runtime = {.version = 1, .train_window = P, .prec = nn_get_prec(), .f16 = nn_get_f16(),
         .act_mx4 = unet_act_mx4(), .act_mx8 = unet_act_mx() && !unet_act_mx4(), .grad_mx8 = unet_grad_mx8(), .input_mx = unet_input_converted(), .input_prec = unet_input_prec(), .gn_stored = nn_get_gn_stored()};
     const char *saved_policy = opt(argc, argv, "--policy", "");
-    if (!*saved_policy) saved_policy = fp4 >= 2 ? "all=fp4:fp4:fp4,enc0.c1=fp16" : fp4 ? "all=fp4:fp4:fp8,enc0.c1=fp16" : "";
+    if (!*saved_policy) saved_policy = fp4 >= 2 ? "all=fp4:fp4:fp4,enc0.c1=fp16" : fp4 ? "all=fp4:fp4:fp8,enc0.c1=fp16" : fp8 ? "all=fp8:fp8:fp8,enc0.c1=fp16" : "";
     if (strlen(saved_policy) >= sizeof runtime.policy || strlen(optname) >= sizeof runtime.optimizer) { fprintf(stderr, "checkpoint settings too long\n"); return 2; }
     strcpy(runtime.policy, saved_policy); strcpy(runtime.optimizer, optname);
     char checkpoint_extra[8192], runtime_extra[8192];

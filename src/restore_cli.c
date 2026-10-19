@@ -210,7 +210,7 @@ static void vol_stats(const uint8_t *v, int D, int H, int W, double out[10]) {
     double s = 0, s2 = 0, n = 0;
     const int lags[6] = {1, 2, 3, 4, 6, 8};
     double dk[6] = {0}, nk[6] = {0};
-    int *hist = calloc(512, sizeof(int)); long nh = 0;
+    int *hist = calloc(3061, sizeof(int)); long nh = 0;
     for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
         const size_t i = ((size_t)z * H + y) * W + x; const int a = v[i];
         if (!a) continue;
@@ -224,14 +224,14 @@ static void vol_stats(const uint8_t *v, int D, int H, int W, double out[10]) {
         if (z > 0 && z < D - 1 && y > 0 && y < H - 1 && x > 0 && x < W - 1) {
             const size_t hw = (size_t)H * W; const int nb[6] = {v[i - 1], v[i + 1], v[i - W], v[i + W], v[i - hw], v[i + hw]};
             int ok = 1, sn = 0; for (int k = 0; k < 6; k++) { ok &= nb[k] != 0; sn += nb[k]; }
-            if (ok) { const int b = (int)lrint((a - sn / 6.0) * 2) + 256; hist[b < 0 ? 0 : b > 511 ? 511 : b]++; nh++; }   /* half-DN bins */
+            if (ok) { const int b = 6 * a - sn + 1530; hist[b]++; nh++; }   /* 6 (v - mean6), integer */
         }
     }
     double mad = 0;
     if (nh) {   /* the median of |v - mean6| (half-DN bins) */
-        long half = nh / 2, acc = 0; int c = 256; acc = hist[256];
-        for (int d = 1; d < 256 && acc < half; d++) { acc += hist[256 + d] + hist[256 - d]; c = 256 + d; }
-        mad = (c - 256) / 2.0;
+        long half = nh / 2, acc = hist[1530]; int c = 0;
+        for (int d = 1; d <= 1530 && acc < half; d++) { acc += hist[1530 + d] + hist[1530 - d]; c = d; }
+        mad = c / 6.0;
     }
     free(hist);
     out[0] = n; out[1] = n ? s / n : 0; out[2] = n ? sqrt(fmax(0, s2 / n - out[1] * out[1])) : 0; out[3] = 1.4826 * mad / sqrt(7.0 / 6.0);
@@ -250,33 +250,45 @@ int cmd_restore_stats(int argc, char **argv) {
     uint8_t *h = malloc(n);
     if (z3_read(ct, o, nn3, h, 16)) { fprintf(stderr, "restore-stats: %s\n", z3_error()); return 1; }
     const char *dg = opt(argc, argv, "--degrade", nullptr);
-    int sd = D, sh = H, sw = W; uint8_t *res = h;
-    restore_recipe r; memset(&r, 0, sizeof r);
-    if (dg) {
-        if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-        const float step = (float)atof(opt(argc, argv, "--step", "4"));
+    if (!dg) {
+        double s[10]; vol_stats(h, D, H, W, s);
+        printf("{\"source\":\"%s\",\"box\":[%lld,%lld,%lld,%lld,%lld,%lld],\"degrade\":\"none\",\"grid\":[%d,%d,%d],\"n\":%.0f,\"mean\":%.3f,\"sd\":%.3f,\"noise_est\":%.3f,\"D\":[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f]}\n",
+               argv[3], v[0], v[1], v[2], v[3], v[4], v[5], D, H, W, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9]);
+        return 0;
+    }
+    /* --psf / --noise / --corr: comma lists, every combination on the same upload */
+    float pl[32], nl[32], cl[32]; int np = 0, nq = 0, nc = 0;
+    { char *t = strdup(opt(argc, argv, "--psf", "0.5")); for (char *q = strtok(t, ","); q && np < 32; q = strtok(nullptr, ",")) pl[np++] = (float)atof(q); free(t); }
+    { char *t = strdup(opt(argc, argv, "--noise", "0")); for (char *q = strtok(t, ","); q && nq < 32; q = strtok(nullptr, ",")) nl[nq++] = (float)atof(q); free(t); }
+    { char *t = strdup(opt(argc, argv, "--corr", "0")); for (char *q = strtok(t, ","); q && nc < 32; q = strtok(nullptr, ",")) cl[nc++] = (float)atof(q); free(t); }
+    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
+    const float step = (float)atof(opt(argc, argv, "--step", "4"));
+    uint8_t *dclean = nn_malloc(n), *dlow = nn_malloc(n);
+    const size_t sb = restore_scratch_bytes(D, H, W, fminf(step, 4.f)); void *scr = nn_malloc(sb);
+    nn_h2d(dclean, h, n);
+    const char *op = opt(argc, argv, "--out", nullptr);
+    for (int a1 = 0; a1 < np; a1++) for (int a2 = 0; a2 < nq; a2++) for (int a3 = 0; a3 < nc; a3++) {
+        restore_recipe r; memset(&r, 0, sizeof r);
         r.family = !strcmp(dg, "pyramid") ? RF_PYRAMID : RF_SCANNER; r.gain = r.gamma = 1.f; r.seed = (unsigned)atoi(opt(argc, argv, "--seed", "1"));
         const int dim[3] = {D, H, W};
         for (int a = 0; a < 3; a++) {
             r.small[a] = r.family == RF_PYRAMID ? dim[a] / 4 : (int)lrintf(dim[a] / step); r.step[a] = (float)dim[a] / r.small[a];
-            r.psf[a] = (float)atof(opt(argc, argv, "--psf", "0.5")) * r.step[a]; r.qphase[a] = (int)(r.seed * (a + 3)) & 15;
+            r.psf[a] = pl[a1] * r.step[a]; r.qphase[a] = (int)(r.seed * (a + 3)) & 15;
         }
         r.box = r.family == RF_PYRAMID; r.q = (float)atof(opt(argc, argv, "--q", r.family == RF_PYRAMID ? "2" : "8"));
-        r.noise = (float)atof(opt(argc, argv, "--noise", "0")); r.sig_var = (float)atof(opt(argc, argv, "--sigvar", "0")); r.corr = (float)atof(opt(argc, argv, "--corr", "0")); r.edge = (float)atof(opt(argc, argv, "--edge", "0"));
-        sd = r.small[0]; sh = r.small[1]; sw = r.small[2];
-        const size_t ns = (size_t)sd * sh * sw, sb = restore_scratch_bytes(D, H, W, fminf(step, 4.f));
-        uint8_t *dclean = nn_malloc(n), *dlow = nn_malloc(n), *dco = nn_malloc(ns); void *scr = nn_malloc(sb);
-        nn_h2d(dclean, h, n);
+        r.noise = nl[a2]; r.sig_var = (float)atof(opt(argc, argv, "--sigvar", "0")); r.corr = cl[a3]; r.edge = (float)atof(opt(argc, argv, "--edge", "0"));
+        const int sd = r.small[0], sh = r.small[1], sw = r.small[2]; const size_t ns = (size_t)sd * sh * sw;
+        uint8_t *dco = nn_malloc(ns), *res = malloc(ns);
         if (nn_restore_degrade(dclean, dlow, D, H, W, &r, scr, sb, dco)) { fprintf(stderr, "restore-stats: scratch\n"); return 1; }
-        res = malloc(ns); nn_d2h(res, dco, ns);
-        nn_free(dclean); nn_free(dlow); nn_free(dco); nn_free(scr);
+        nn_d2h(res, dco, ns);
+        double s[10]; vol_stats(res, sd, sh, sw, s);
+        printf("{\"source\":\"%s\",\"box\":[%lld,%lld,%lld,%lld,%lld,%lld],\"degrade\":\"%s\",\"step\":%.4g,\"psf\":%.4g,\"noise\":%.4g,\"sigvar\":%.4g,\"corr\":%.4g,\"edge\":%.4g,\"q\":%.4g,"
+               "\"grid\":[%d,%d,%d],\"n\":%.0f,\"mean\":%.3f,\"sd\":%.3f,\"noise_est\":%.3f,\"D\":[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f]}\n",
+               argv[3], v[0], v[1], v[2], v[3], v[4], v[5], dg, r.step[0], pl[a1], r.noise, r.sig_var, r.corr, r.edge, r.q, sd, sh, sw, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9]);
+        fflush(stdout);
+        if (op) { FILE *f = fopen(op, "wb"); if (f) { fwrite(res, 1, ns, f); fclose(f); } }
+        nn_free(dco); free(res);
     }
-    double s[10]; vol_stats(res, sd, sh, sw, s);
-    printf("{\"source\":\"%s\",\"box\":[%lld,%lld,%lld,%lld,%lld,%lld],\"degrade\":\"%s\",\"step\":%.4g,\"psf\":%.4g,\"noise\":%.4g,\"sigvar\":%.4g,\"corr\":%.4g,\"edge\":%.4g,\"q\":%.4g,"
-           "\"grid\":[%d,%d,%d],\"n\":%.0f,\"mean\":%.3f,\"sd\":%.3f,\"noise_est\":%.3f,\"D\":[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f]}\n",
-           argv[3], v[0], v[1], v[2], v[3], v[4], v[5], dg ? dg : "none", dg ? r.step[0] : 1.0, dg ? atof(opt(argc, argv, "--psf", "0.5")) : 0.0, r.noise, r.sig_var, r.corr, r.edge, r.q,
-           sd, sh, sw, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9]);
-    const char *op = opt(argc, argv, "--out", nullptr);
-    if (op) { FILE *f = fopen(op, "wb"); if (f) { fwrite(res, 1, (size_t)sd * sh * sw, f); fclose(f); } }
+    nn_free(dclean); nn_free(dlow); nn_free(scr);
     return 0;
 }
