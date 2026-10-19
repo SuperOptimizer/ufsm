@@ -88,6 +88,7 @@ typedef struct {
                                 (src/band.h band_wind4: the stored phase unwrapped over the window before the air test, its components
                                 kept as separate gauges); warped samples pull it through the warp within one component */
     int wind4_step, wind4_min;   /* band_wind4's maxstep (phase codes; 0: 80 = 0.32 turn) and minsize (voxels; 0: 512) */
+    int wind4_tile;          /* band_wind4_tiled's tile edge (at least P / 6: <= 216 tiles, one gauge each); < 0 the whole window */
 } sample_cfg;
 /* the configurations whose every sample takes write_x (no warp, sheet prior, slab appearance plan, aux or condition channels): the
    radial channels then follow from the window's corner, symmetry and axis centres alone */

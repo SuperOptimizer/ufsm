@@ -401,3 +401,38 @@ int band_wind4(const uint8_t *phase, int D, int H, int W, int maxstep, size_t mi
     free(map); free(u.r); free(u.size); free(u.edges); free(u.conf); free(s.rid[0]); free(s.rid[1]); free(s.jj[0]); free(s.jj[1]);
     return rc ? -1 : ncomp;
 }
+/* band_wind4 per tile of tile^3 voxels (the last tiles of an axis smaller), each tile's components their own gauges: a label
+   inconsistency (a loop of joins that gains a turn) then drops only its tile's component. Components numbered over the tiles in
+   raster order, up to 255 (comp 0..254); maxcomp per tile. tile <= 0: the whole volume as one tile. */
+int band_wind4_tiled(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
+    if (tile <= 0 || (tile >= D && tile >= H && tile >= W)) {
+        const int nc = band_wind4(phase, D, H, W, maxstep, minsize, maxcomp, w4, comp, st);
+        return nc;
+    }
+    const size_t T3 = (size_t)tile * tile * tile;
+    uint8_t *tp = malloc(T3), *tw = malloc(T3), *tc = malloc(T3);
+    if (!tp || !tw || !tc) { free(tp); free(tw); free(tc); return -1; }
+    band_wind4_stats acc = {0}; int next = 0, rc = 0;
+    for (int z0 = 0; z0 < D && !rc; z0 += tile) for (int y0 = 0; y0 < H && !rc; y0 += tile) for (int x0 = 0; x0 < W && !rc; x0 += tile) {
+        const int nz = D - z0 < tile ? D - z0 : tile, ny = H - y0 < tile ? H - y0 : tile, nx = W - x0 < tile ? W - x0 : tile;
+        for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) memcpy(tp + ((size_t)z * ny + y) * nx, phase + ((size_t)(z0 + z) * H + y0 + y) * W + x0, (size_t)nx);
+        band_wind4_stats s;
+        const int nc = band_wind4(tp, nz, ny, nx, maxstep, minsize, maxcomp > 15 ? 15 : maxcomp, tw, tc, &s);
+        if (nc < 0) { rc = -1; break; }
+        const int base = next; next += nc;
+        for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) {
+            const size_t so = ((size_t)z * ny + y) * nx, d = ((size_t)(z0 + z) * H + y0 + y) * W + x0;
+            for (int x = 0; x < nx; x++) {
+                const int c = tc[so + x];
+                if (c == 255 || base + c > 254) { w4[d + x] = 255; comp[d + x] = 255; continue; }
+                w4[d + x] = tw[so + x]; comp[d + x] = (uint8_t)(base + c);
+            }
+        }
+        acc.known += s.known; acc.kept += s.kept; acc.dropped_conflict += s.dropped_conflict; acc.runs += s.runs;
+    }
+    if (next > 255) next = 255;
+    acc.ncomp = next;
+    if (st) *st = acc;
+    free(tp); free(tw); free(tc);
+    return rc ? -1 : next;
+}

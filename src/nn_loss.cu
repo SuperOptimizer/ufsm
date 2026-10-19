@@ -600,7 +600,7 @@ extern "C" void nn_aff_loss_fetch(const float *fin, int K, float *out) { CK(cuda
    R_0 = a cos + b sin, R_1 = b cos - a sin, R_2 = -R_0, R_3 = -R_1, so per component only N, S0 = sum m (sp(a) + sp(b)), H = sum m 0.5
    (a + b), X = sum m 0.5 R_0, Y = sum m 0.5 R_1 and the accuracy counts A_k (the predicted angle within 1/8 turn mod 4 of theta + k
    pi / 2) are summed: W4_NS per component. */
-#define W4_NC 15
+#define W4_NC 255   /* components (gauges) per window: comp 0..254, 255 none */
 #define W4_NS 9
 template <typename LT> __global__ void w4_stats_k(const LT *la, const LT *lb, const uint8_t *w4, const uint8_t *cp, const uint8_t *m, size_t n, double *ds) {
     __shared__ float sh[W4_NC * W4_NS];
@@ -658,6 +658,7 @@ template <typename GT, typename LT> __global__ void w4_grad_k(const LT *la, cons
     ga[i] = f2h<GT>(da); gb[i] = f2h<GT>(db);   /* (in place over the logits: each thread reads its two logits first) */
 }
 extern "C" size_t nn_wind4_scratch(void) { return (8 + W4_NC) * sizeof(float); }
+extern "C" size_t nn_wind4_sums(void) { return (size_t)W4_NC * W4_NS * sizeof(double); }
 extern "C" void nn_wind4_stats(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, double *ds) {
     const unsigned nb = (unsigned)(n / 2048 + 1 < 1024 ? n / 2048 + 1 : 1024);
     if (g_logits_h16) w4_stats_k<f16><<<nb, 256>>>((const f16 *)la, (const f16 *)lb, w4, comp, m, n, ds);

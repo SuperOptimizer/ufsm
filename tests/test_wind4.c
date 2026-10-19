@@ -24,12 +24,12 @@ static void phase_of(const double *W, size_t n, uint8_t *ph) {
 }
 /* every kept voxel: (W_true - w4 / 63) mod 4 is one integer per component (|deviation| <= tol turn); returns the kept fraction */
 static double check_targets(const char *name, const double *W, const uint8_t *w4, const uint8_t *cp, size_t n, int ncomp, double tol) {
-    double g[16]; int seen[16] = {0}; size_t kept = 0, known = 0, bad = 0; double worst = 0;
+    double g[256]; int seen[256] = {0}; size_t kept = 0, known = 0, bad = 0; double worst = 0;
     for (size_t i = 0; i < n; i++) {
         if (!isnan(W[i])) known++;
         if (cp[i] == 255) { CHECK(w4[i] == 255, "%s: voxel %zu w4 %d without a component", name, i, w4[i]); continue; }
         CHECK(cp[i] < ncomp && w4[i] < 252, "%s: voxel %zu component %d of %d, w4 %d", name, i, cp[i], ncomp, w4[i]);
-        if (cp[i] >= 16) continue;
+        if (cp[i] >= 255) continue;
         kept++;
         double e = fmod(W[i] - w4[i] / 63.0, 4.0); if (e < 0) e += 4;
         if (!seen[cp[i]]) { seen[cp[i]] = 1; g[cp[i]] = round(e); }
@@ -46,9 +46,9 @@ static double check_targets(const char *name, const double *W, const uint8_t *w4
 static double sp(double x) { return fmax(x, 0) + log1p(exp(-fabs(x))); }
 /* reference: per component min over g of sum m [bce(a, 0.5 + 0.5 cos(t + g pi / 2)) + bce(b, ... sin)], / (2 sum m) */
 static double ref_loss(const float *la, const float *lb, const uint8_t *w4, const uint8_t *cp, const uint8_t *m, size_t n, double *acc) {
-    double L[15][4] = {{0}}, N[15] = {0}, A[15][4] = {{0}}, Nt = 0, Lt = 0, At = 0;
+    double L[255][4] = {{0}}, N[255] = {0}, A[255][4] = {{0}}, Nt = 0, Lt = 0, At = 0;
     for (size_t i = 0; i < n; i++) {
-        if (cp[i] >= 15 || w4[i] >= 252 || !m[i]) continue;
+        if (cp[i] >= 255 || w4[i] >= 252 || !m[i]) continue;
         const double t = 2 * M_PI * w4[i] / 252.0, a = la[i], b = lb[i], w = m[i];
         N[cp[i]] += w;
         const double pa = 2 / (1 + exp(-a)) - 1, pb = 2 / (1 + exp(-b)) - 1, e = atan2(pb * cos(t) - pa * sin(t), pa * cos(t) + pb * sin(t));
@@ -59,7 +59,7 @@ static double ref_loss(const float *la, const float *lb, const uint8_t *w4, cons
             L[cp[i]][g] += w * (sp(a) - pc * a + sp(b) - ps * b);
         }
     }
-    for (int c = 0; c < 15; c++) {
+    for (int c = 0; c < 255; c++) {
         if (N[c] <= 0) continue;
         int gb = 0; for (int g = 1; g < 4; g++) if (L[c][g] < L[c][gb]) gb = g;
         Nt += N[c]; Lt += L[c][gb]; At += A[c][gb];
@@ -69,7 +69,7 @@ static double ref_loss(const float *la, const float *lb, const uint8_t *w4, cons
 }
 typedef struct { float *la, *lb; uint8_t *w4, *cp, *m; double *ds; float *fin, *ga, *gb; size_t n; } dev_t4;
 static dev_t4 dev_alloc(size_t n) {
-    dev_t4 d = {nn_malloc(n * 4), nn_malloc(n * 4), nn_malloc(n), nn_malloc(n), nn_malloc(n), nn_malloc(160 * 8), nn_malloc(nn_wind4_scratch()), nn_malloc(n * 4), nn_malloc(n * 4), n};
+    dev_t4 d = {nn_malloc(n * 4), nn_malloc(n * 4), nn_malloc(n), nn_malloc(n), nn_malloc(n), nn_malloc(nn_wind4_sums()), nn_malloc(nn_wind4_scratch()), nn_malloc(n * 4), nn_malloc(n * 4), n};
     return d;
 }
 static void dev_free(dev_t4 *d) { nn_free(d->la); nn_free(d->lb); nn_free(d->w4); nn_free(d->cp); nn_free(d->m); nn_free(d->ds); nn_free(d->fin); nn_free(d->ga); nn_free(d->gb); }
@@ -128,7 +128,14 @@ int main(void) {
             CHECK(nc == 1, "spiral beside the axis: %d components", nc);
             const double f = check_targets("spiral beside the axis", Wt, w4, cp, n, nc, 1.0 / 63 + 1e-3);
             CHECK(f > 0.999, "spiral beside the axis: kept %.4f", f);
-        } else CHECK(st.dropped_conflict > 0 && st.kept < st.known / 2, "spiral around the axis: the inconsistent loop was not dropped (kept %zu of %zu)", st.kept, st.known);
+        } else {
+            CHECK(st.dropped_conflict > 0 && st.kept < st.known / 2, "spiral around the axis: the inconsistent loop was not dropped (kept %zu of %zu)", st.kept, st.known);
+            /* per tile of 16: only the tiles whose loops enclose the axis are dropped, each kept tile its own gauge */
+            const int nt = band_wind4_tiled(ph, D, H, W, 16, 80, 512, 1, w4, cp, &st);
+            printf("spiral around the axis, tiles of 16: %d components, %zu of %zu kept, %zu dropped\n", nt, st.kept, st.known, st.dropped_conflict);
+            const double f = check_targets("spiral around the axis, tiles of 16", Wt, w4, cp, n, nt, 1.0 / 63 + 1e-3);
+            CHECK(nt >= 24 && f > 0.85, "tiles: %d components, kept %.3f", nt, f);
+        }
         free(Wt); free(ph); free(w4); free(cp);
     }
     /* (3) the loss: value vs the reference, gauge invariance, gradient vs central differences, accuracy, masking */
