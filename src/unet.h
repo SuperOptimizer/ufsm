@@ -65,6 +65,7 @@ const float *unet_live_params(const unet *u);   /* device weights the optimiser 
 void unet_use_params(unet *u, const float *w);  /* forward with these device weights (unet_nparams floats); nullptr restores */
 void unet_grad_head_only(unet *u, int blocks);   /* zero all gradients but the output head's (and the last decoder blocks') */
 void unet_init(unet *u, uint64_t seed);                 /* Kaiming-normal convs, GN gamma 1 / beta 0, head bias -2 */
+void unet_zero_head(unet *u);   /* zero the output head (live / EMA weights, Adam moments): a fresh residual net outputs its input */
 
 /* Forward for one input shape (activation buffers are (re)allocated when the shape changes).
    train = 1 keeps everything needed for backward. Logits: [n][cout][d][h][w] on the device. */

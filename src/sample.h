@@ -84,6 +84,9 @@ typedef struct {
     int pack_tm;             /* targets and mask as one code byte per voxel (batch.tm: SAMPLE_TM_* bits; t, m nullptr): every target value
                                 0 or 255 and the mask 0 / 1 (hard two-class targets, e.g. the side encoding; a soft value aborts). The
                                 trainer unpacks on the device (nn_unpack_tm): host batches 3 -> 1 byte per voxel */
+    int restore;             /* task restore: no target reads; batch.t holds the clean CT window alone (B x P^3, tone LUT and symmetry applied),
+                                batch.x / x16 and batch.m are absent (the trainer degrades the window on the device); training windows lie inside a
+                                source "boxes" entry when the source lists boxes, validation windows inside its holdout box; level = the source's min_level */
 } sample_cfg;
 /* the configurations whose every sample takes write_x (no warp, sheet prior, slab appearance plan, aux or condition channels): the
    radial channels then follow from the window's corner, symmetry and axis centres alone */

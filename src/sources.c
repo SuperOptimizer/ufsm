@@ -209,6 +209,13 @@ sources *sources_load(const char *path) {
         }
         const json *ho = json_get(e, "holdout");
         if (ho && ho->type == J_ARR && ho->n == 6) for (int d = 0; d < 3; d++) { s->hold_o[d] = (int64_t)json_num(json_at(ho, (size_t)d), 0); s->hold_n[d] = (int64_t)json_num(json_at(ho, (size_t)(3 + d)), 0); }
+        const json *bx = json_get(e, "boxes");   /* task restore: level-0 boxes [z, y, x, nz, ny, nx] that hold local CT (training windows lie inside one) */
+        if (bx && bx->type == J_ARR && bx->n) {
+            s->box = calloc(bx->n, sizeof *s->box);
+            for (size_t k = 0; k < bx->n; k++) { const json *b = json_at(bx, k); if (!b || b->type != J_ARR || b->n != 6) continue;
+                for (int d = 0; d < 6; d++) s->box[s->nbox][d] = (int64_t)json_num(json_at(b, (size_t)d), 0);
+                s->nbox++; }
+        }
         const char *ap = json_str(json_get(e, "axis"), nullptr);
         if (ap && axis_load(&s->ax, ap)) fprintf(stderr, "sources: %s: cannot load axis %s\n", s->name, ap);
         if (s->um <= 0) {
@@ -226,7 +233,7 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
-        z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux);
+        z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); free(s->box);
         for (int c = 0; c < NCH; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {

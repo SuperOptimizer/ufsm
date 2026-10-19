@@ -34,6 +34,8 @@ int cmd_ls(int argc, char **argv);
 int cmd_ingest_zip(int argc, char **argv);
 int cmd_raster(int argc, char **argv);
 int cmd_train(int argc, char **argv);
+int cmd_restore_eval(int argc, char **argv);
+int cmd_restore_stats(int argc, char **argv);
 int cmd_predict(int argc, char **argv);
 int cmd_eval(int argc, char **argv);
 
@@ -63,6 +65,8 @@ static int usage(void) {
         "  ufsm side-votes <out-group> <out-um> <root> <key> [<root> <key> ...]   several surface sets' side labels added into one vote array\n"
         "  ufsm wind-assign <ref-root> <ref-key> <out-dir> <tifxyz>...   other authors' surfaces get winding q in a reference raster's gauge\n"
         "  ufsm codes-merge <out-group> <out-um> <root> <key> ...   winding code rasters united (same wrap within 1/4 turn, else 255)\n"
+        "  ufsm restore-eval <ckpt> <clean.npy>... [--family pyramid]   task restore: PSNR on clean crops degraded by one recipe\n"
+        "  ufsm restore-stats <root> <key> --um U --box ... [--degrade scanner ...]   task restore: calibration statistics of a CT box\n"
         "  ufsm ct-hist <out.txt> <root> <key> z,y,x,n [...]  CT histograms of boxes (targets of train --aug-hist, the hist op)\n"
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
@@ -2327,6 +2331,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "side-votes") || !strcmp(cmd, "codes-merge")) return cmd_side_votes(argc, argv);
     if (!strcmp(cmd, "wind-assign")) return cmd_wind_assign(argc, argv);
     if (!strcmp(cmd, "ct-hist")) return cmd_ct_hist(argc, argv);
+    if (!strcmp(cmd, "restore-eval")) return cmd_restore_eval(argc, argv);
+    if (!strcmp(cmd, "restore-stats")) return cmd_restore_stats(argc, argv);
     if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);
     if (!strcmp(cmd, "wrapswitch")) return cmd_wrapswitch(argc, argv);
     if (!strcmp(cmd, "surf-snap")) return cmd_surfsnap(argc, argv);
