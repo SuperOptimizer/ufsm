@@ -9,8 +9,10 @@
    UFSM_BENCH_DUMP=prefix: mid-z planes of the first batch (prefix-input.pgm, -target.pgm, -mask.pgm, -phase.pgm with SIDE=2) and its
    cutoff code; UFSM_BENCH_PZ=N: N x P x P slab windows; UFSM_BENCH_NEAR=X: the phase only within X um of a labelled wrap (train
    --phase-near-um; the known-phase fraction is printed); UFSM_BENCH_PRESET=all|none: train --aug's preset (sample_aug_preset);
-   UFSM_BENCH_PACK=1: packed targets (train --pack-targets); UFSM_BENCH_DUMPN=N: dump the first N batches (prefix-NN-*.pgm; the
-   target as recto 255 / verso 128 / void 0, the mask, and the input's mid-z plane) */
+   UFSM_BENCH_PACK=1: packed targets (train --pack-targets); UFSM_BENCH_WIND4=1: --task unwrap2's winding mod 4 (with SIDE=2; hashed);
+   UFSM_BENCH_GEOM=rotate_p,zoom_p,elastic_p[,zoom_out_p]: geometry augmentation probabilities; UFSM_BENCH_DUMPN=N: dump the first N batches (prefix-NN-*.pgm; the
+   target as recto 255 / verso 128 / void 0, the mask, and the input's mid-z plane); UFSM_BENCH_SLOTS=N: sampler slots. A synthetic band + phase
+   source in the desk's unwrap2 layout: tests/make_wind_fixture.c */
 #include "nn.h"
 #include "sample.h"
 #include "sources.h"
@@ -34,6 +36,7 @@ int main(int argc, char **argv) {
     sources *S = sources_load(argv[1]); if (!S) return 1;
     sample_cfg c = sample_cfg_default(); c.P = P; c.B = 2; c.nworkers = W; c.nbuf = 2 * W; c.soft = 3; c.augment = 4; c.xfmt = 1;
     if (getenv("UFSM_BENCH_TRAIN")) { c.B = 1; c.soft = 7; c.soft_um = 1; c.erode = 1; c.augment = 3; c.symmetry_p = 0.5f; c.deterministic = 1; c.seed = 1; }
+    if (getenv("UFSM_BENCH_SLOTS")) c.nbuf = atoi(getenv("UFSM_BENCH_SLOTS"));   /* slots (default 2 x workers: at P512 ~1 GB pinned each) */
     if (getenv("UFSM_BENCH_AUG")) c.augment = atoi(getenv("UFSM_BENCH_AUG"));
     if (getenv("UFSM_BENCH_CTAUG")) c.ct_augment = atoi(getenv("UFSM_BENCH_CTAUG"));   /* train --ct-aug */
     if (getenv("UFSM_BENCH_DET")) { c.deterministic = 1; c.seed = 1; }
@@ -45,6 +48,13 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_BENCH_GPUIN")) c.gpu_input = 1;   /* train --gpu-input: the CT channel and radial records only (hashed as such) */
     if (getenv("UFSM_BENCH_PRESET") && sample_aug_preset(&c, getenv("UFSM_BENCH_PRESET"))) { fprintf(stderr, "UFSM_BENCH_PRESET: all | none\n"); return 2; }
     if (getenv("UFSM_BENCH_PACK")) c.pack_tm = 1;
+    if (getenv("UFSM_BENCH_WIND4")) c.wind4 = 1;   /* train --task unwrap2 (with UFSM_BENCH_SIDE=2): the winding mod 4 and its component, hashed too */
+    if (getenv("UFSM_BENCH_GEOM")) {   /* rotate_p,zoom_p,elastic_p[,zoom_out_p]: the geometry augmentation's probabilities (train --rotate-p ...) */
+        float q[4] = {0, 0, 0, -1};
+        if (sscanf(getenv("UFSM_BENCH_GEOM"), "%f,%f,%f,%f", &q[0], &q[1], &q[2], &q[3]) < 3) { fprintf(stderr, "UFSM_BENCH_GEOM=rotate_p,zoom_p,elastic_p[,zoom_out_p]\n"); return 2; }
+        c.geometry_augment = 1; if (c.rotate_degrees <= 0) c.rotate_degrees = 10; if (c.elastic <= 0) c.elastic = 1; if (c.zoom_min <= 0 || c.zoom_min >= 1) c.zoom_min = .8f;
+        c.rotate_p = q[0]; c.zoom_p = q[1]; c.elastic_p = q[2]; if (q[3] >= 0) c.zoom_out_p = q[3];
+    }
     if (getenv("UFSM_BENCH_OP")) {   /* name[,name..]: only these scanner ops, at p 1 (per-op cost); "geometry": warps every window */
         memset(c.scan.p, 0, sizeof c.scan.p); c.scan.strength = 1; char *t = strdup(getenv("UFSM_BENCH_OP"));
         for (char *q = strtok(t, ","); q; q = strtok(nullptr, ",")) {
@@ -101,13 +111,13 @@ int main(int argc, char **argv) {
             free(img); sampler_release(sp, b);
         }
     }
-    for (int i = 0; i < 4; i++) { batch *b = sampler_next(sp); if (!b) return 1; if (hashing) { h = hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); if (b->tm) h = hash(h, b->tm, (size_t)c.B * p3); else { h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); } h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); } sampler_release(sp, b); }   /* warm-up */
+    for (int i = 0; i < 4; i++) { batch *b = sampler_next(sp); if (!b) return 1; if (hashing) { h = hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); if (b->tm) h = hash(h, b->tm, (size_t)c.B * p3); else { h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); } h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); if (b->w4) { h = hash(h, b->w4, (size_t)c.B * p3); h = hash(h, b->wcomp, (size_t)c.B * p3); } } sampler_release(sp, b); }   /* warm-up */
     size_t side_known = 0, side_all = 0;   /* phase voxels known (UFSM_BENCH_SIDE=2) */
     double t0 = now();
     for (int i = 0; i < NB; i++) {
         batch *b = sampler_next(sp); if (!b) return 1;
         if (b->side) for (size_t k = 0; k < (size_t)c.B * p3; k++) { side_known += b->side[k] < 252; side_all++; }
-        if (hashing) { h = hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); if (b->tm) h = hash(h, b->tm, (size_t)c.B * p3); else { h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); } h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); }
+        if (hashing) { h = hash(h, b->x16, (size_t)c.B * b->xch * p3 * 2); if (b->rad) h = hash(h, b->rad, (size_t)c.B * NN_RAD_REC(Pz)); if (b->tm) h = hash(h, b->tm, (size_t)c.B * p3); else { h = hash(h, b->t, (size_t)c.B * NCH * p3); h = hash(h, b->m, (size_t)c.B * p3); } h = hash(h, b->w, (size_t)c.B * NCH); if (b->side) h = hash(h, b->side, (size_t)c.B * p3); if (b->w4) { h = hash(h, b->w4, (size_t)c.B * p3); h = hash(h, b->wcomp, (size_t)c.B * p3); } }
         sampler_release(sp, b);
     }
     double dt = now() - t0;
@@ -115,6 +125,8 @@ int main(int argc, char **argv) {
     uint64_t prod, rej; sampler_stats(sp, &prod, &rej);
     printf("%dx%dx%d workers=%d: %.1f samples/s (%d batches of %d in %.1fs; produced %llu rejected %llu)\n", Pz, P, P, W, NB * c.B / dt, NB, c.B, dt, (unsigned long long)prod, (unsigned long long)rej);
     if (hashing) printf("hash %016llx over %d batches\n", (unsigned long long)h, NB + 4);
+    { uint64_t why[4]; sampler_reject_reasons(sp, why); printf("rejected: coarse probe %llu, after the CT read %llu, empty targets %llu; holdout overlaps %llu\n",
+                                                        (unsigned long long)why[0], (unsigned long long)why[1], (unsigned long long)why[2], (unsigned long long)why[3]); }
     sampler_prof_print(sp);
     sampler_stop(sp);
     return 0;

@@ -9,6 +9,8 @@
 #include "store.h"
 #include "zarr3.h"
 #include "fit.h"
+#include "unet.h"
+#include "checkpoint.h"
 #include "json.h"
 #include "nn.h"
 #include "tiffw.h"
@@ -69,6 +71,7 @@ static int usage(void) {
         "  ufsm codes-merge <out-group> <out-um> <root> <key> ...   winding code rasters united (same wrap within 1/4 turn, else 255)\n"
         "  ufsm ct-hist <out.txt> <root> <key> z,y,x,n [...]  CT histograms of boxes (targets of train --aug-hist, the hist op)\n"
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
+        "  ufsm convert-unwrap2 <unwrap.ckpt> <out.ckpt>   a task unwrap checkpoint as task unwrap2 (heads 2-10 -> 0-8, winding mod 4 fresh; no training step)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
@@ -620,6 +623,68 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
 typedef struct { fit_set_dev *gd; const fit_set *fs; } fit_fill_ctx;
 static int fit_fill(void *c, const double og[3], const int64_t n3[3], double step, float *U) { fit_fill_ctx *f = c; return fit_set_grid(f->gd, f->fs, og, n3, step, 1, U); }
 
+/* ufsm convert-unwrap2 IN OUT: a task unwrap checkpoint (recto 0, ink 1, phase 2-3, normal 4-9, density 10) as a task unwrap2 one
+   (phase 0-1, normal 2-7, density 8, winding mod 4 9-10 fresh) without a training step: the live and EMA weights copied, the head rows
+   2-10 moved to 0-8 (unet_init_from_map, as train --task unwrap2 --init-from does), the header's runtime / augmentation extras kept and
+   its "unwrap" / "phase" objects rewritten for the new layout. The winding mod 4 rows are untrained: the result predicts the donor's
+   fit fields byte for byte (predict --fit-fields / --fit-zarr) and is a warm start for train --task unwrap2 --init-from. */
+static int json_obj_end(const char *s) {   /* s at '{': the length through its matching '}' (strings skipped), or -1 */
+    int d = 0, q = 0;
+    for (int i = 0; s[i]; i++) {
+        if (q) { if (s[i] == '\\' && s[i + 1]) i++; else if (s[i] == '"') q = 0; continue; }
+        if (s[i] == '"') q = 1; else if (s[i] == '{') d++; else if (s[i] == '}' && --d == 0) return i + 1;
+    }
+    return -1;
+}
+static int cmd_convert_unwrap2(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm convert-unwrap2 <task-unwrap.ckpt> <out.ckpt> [--gpu 0]\n"); return 2; }
+    const char *in = argv[2], *out = argv[3];
+    unet_cfg cfg; int step = 0;
+    if (unet_peek(in, &cfg, &step) || checkpoint_unwrap_version(in) != 1 || cfg.cout < 11) { fprintf(stderr, "convert-unwrap2: %s is not a task unwrap checkpoint (11+ outputs)\n", in); return 2; }
+    char *hdr = checkpoint_header_line(in);
+    const char *ex = hdr ? strstr(hdr, "\"extra\":{") : nullptr;
+    if (!ex) { fprintf(stderr, "convert-unwrap2: no extra object in %s\n", in); free(hdr); return 1; }
+    ex += 8;
+    const int el = json_obj_end(ex);
+    if (el < 0) { fprintf(stderr, "convert-unwrap2: malformed header\n"); free(hdr); return 1; }
+    /* the extra object without its "unwrap" and "phase" members, then the unwrap2 ones */
+    char *extra = calloc((size_t)el + 4096, 1); size_t n = 0;
+    for (int i = 0; i < el - 1;) {
+        const char *keys[2] = {"\"unwrap\":{", "\"phase\":{"}; int skip = 0;
+        for (int k = 0; k < 2 && !skip; k++) if (!strncmp(ex + i, keys[k], strlen(keys[k])) && (ex[i - 1] == ',' || ex[i - 1] == '{')) {
+            const int ol = json_obj_end(ex + i + strlen(keys[k]) - 1); if (ol < 0) { free(hdr); free(extra); return 1; }
+            skip = (int)strlen(keys[k]) - 1 + ol;
+            if (ex[i + skip] == ',') skip++; else if (n && extra[n - 1] == ',') n--;
+        }
+        if (skip) { i += skip; continue; }
+        extra[n++] = ex[i++];
+    }
+    double ds = 32, nl = 1, pw = 0, pu = 120; int dc = 0, nst = 4, air = 0;
+    { const char *u = strstr(hdr, "\"unwrap\":{"), *q;
+      if ((q = strstr(u, "\"density_scale\":"))) ds = atof(q + 16);
+      if ((q = strstr(u, "\"density_code\":"))) dc = atoi(q + 15);
+      if ((q = strstr(u, "\"packed_weight\":"))) pw = atof(q + 16);
+      if ((q = strstr(u, "\"packed_um\":"))) pu = atof(q + 12);
+      if ((q = strstr(u, "\"normal_lambda\":"))) nl = atof(q + 16);
+      if ((q = strstr(u, "\"normal_step\":"))) nst = atoi(q + 14);
+      const char *p = strstr(hdr, "\"phase\":{\"version\":1"); if (p && (q = strstr(p, "\"air\":"))) air = atoi(q + 6); }
+    n += (size_t)snprintf(extra + n, 4096, "%s\"phase\":{\"version\":1,\"channel\":0,\"channels\":[\"0.5+0.5cos(2pi phase)\",\"0.5+0.5sin(2pi phase)\"],\"phase\":\"fraction of the way outward from a recto to the next\",\"air\":%d,\"lambda\":1,\"dense\":0}"
+                          ",\"unwrap\":{\"version\":2,\"channels\":{\"phase\":[0,1],\"normal\":[2,3,4,5,6,7],\"density\":8,\"wind4\":[9,10]},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"%s, rho = |grad phase| turns per voxel\","
+                          "\"wind4\":\"0.5+0.5cos / sin(2pi W/4), W the stored phase unwrapped over the window, gauge-free\",\"density_scale\":%.9g,\"density_code\":%d,\"packed_weight\":%.9g,\"packed_um\":%.9g,\"normal_lambda\":%.9g,\"normal_step\":%d,"
+                          "\"wind4_lambda\":0,\"converted_from\":\"task unwrap rows 2-10; winding mod 4 untrained\"}}",
+                          n > 1 ? "," : "", air, dc ? "x / (1 + x), x = density_scale rho" : "min(1, density_scale rho)", ds, dc, pw, pu, nl, nst);
+    free(hdr);
+    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) { free(extra); return 1; }
+    cfg.cout = 11;
+    unet *u = unet_create(&cfg); unet_init(u, 1);
+    int rows[11]; for (int c = 0; c < 11; c++) rows[c] = c < 9 ? c + 2 : -1;
+    const int nt = unet_init_from_map(u, in, rows);
+    if (nt < 0 || unet_save(u, out, step, extra)) { fprintf(stderr, "convert-unwrap2: cannot convert %s to %s\n", in, out); unet_free(u); free(extra); return 1; }
+    fprintf(stderr, "convert-unwrap2: %d tensors of %s (step %d) -> %s (task unwrap2: rows 2-10 -> 0-8, winding mod 4 rows fresh)\n", nt, in, step, out);
+    unet_free(u); free(extra);
+    return 0;
+}
+
 static int cmd_fit(int argc, char **argv) {
     const char *dir = argv[2];
     fit_cfg c = fit_cfg_default();
@@ -627,6 +692,7 @@ static int cmd_fit(int argc, char **argv) {
     c.dir = atoi(opt(argc, argv, "--dir", "0")); c.unwrap_voxels = atoi(opt(argc, argv, "--unwrap-voxels", "1"));
     c.uw_split = atof(opt(argc, argv, "--uw-split", "0")); c.uw_tile = atoi(opt(argc, argv, "--uw-tile", "256"));
     c.core = (float)atof(opt(argc, argv, "--core", "3"));   /* no data terms within core x pitch of the axis */
+    c.w_wind4 = (float)atof(opt(argc, argv, "--wind4-weight", "4"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off) */
     c.analytic = atoi(opt(argc, argv, "--analytic", "1")); c.packed_um = atof(opt(argc, argv, "--packed-um", "0")); c.batch = atoi(opt(argc, argv, "--batch", "2000000")); c.knot_dz = atoi(opt(argc, argv, "--knot-dz", "1024")); c.phase_stage = atoi(opt(argc, argv, "--phase-stage", "4"));
     if (*opt(argc, argv, "--lattice", "")) { c.nstage = 0; char *t = strdup(opt(argc, argv, "--lattice", "")); for (char *q = strtok(t, ","); q && c.nstage < 8; q = strtok(nullptr, ",")) c.lattice[c.nstage++] = atoi(q); free(t); }
     if (*opt(argc, argv, "--steps", "")) { int k = 0; char *t = strdup(opt(argc, argv, "--steps", "")); for (char *q = strtok(t, ","); q && k < 8; q = strtok(nullptr, ",")) c.steps[k++] = atoi(q); for (; k < c.nstage; k++) c.steps[k] = c.steps[k - 1]; free(t); }
@@ -2470,6 +2536,12 @@ static int cmd_sample(int argc, char **argv) {
     cfg.dist_sigma = (float)atof(opt(argc, argv, "--dist-head", "0"));
     int nb = atoi(opt(argc, argv, "--n", "4"));
     const char *out = opt(argc, argv, "--out", ".");
+    /* --levels W0,W1,...: level weights as train; --side 2 --wind4 1: the unwrap2 phase / winding mod 4 targets; --dump 1: each
+       window's phase (and w4 / comp) as raw P^3 bytes, <out>/phase_BB_I.raw (w4_BB_I.raw, wcomp_BB_I.raw): e.g. with UFSM_SAMPLE_AT
+       the same corners from two sources files (a stored phase's sign, "phase_sign") */
+    { const char *lv = opt(argc, argv, "--levels", nullptr); if (lv) { char *t = strdup(lv); int l = 0; memset(cfg.level_p, 0, sizeof cfg.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) cfg.level_p[l++] = atof(q); free(t); } }
+    cfg.side = atoi(opt(argc, argv, "--side", "0")); cfg.wind4 = atoi(opt(argc, argv, "--wind4", "0"));
+    const int dump = atoi(opt(argc, argv, "--dump", "0"));
     sources *S = sources_load(path);
     if (!S) return 1;
     fprintf(stderr, "%d sources\n", S->n);
@@ -2501,6 +2573,15 @@ static int cmd_sample(int argc, char **argv) {
             char fn[1200];
             snprintf(fn, sizeof fn, "%s/patch_%02d_%d.pgm", out, bi, i);
             write_pgm(fn, img, (int64_t)cols * P, P);
+            if (dump && cfg.side) {
+                const char *nm[3] = {"phase", "w4", "wcomp"}; uint8_t *bf[3] = {b->side, cfg.wind4 ? b->w4 : nullptr, cfg.wind4 ? b->wcomp : nullptr};
+                for (int k = 0; k < 3; k++) if (bf[k]) {
+                    snprintf(fn, sizeof fn, "%s/%s_%02d_%d.raw", out, nm[k], bi, i); FILE *f = fopen(fn, "wb");
+                    if (!f || fwrite(bf[k] + (size_t)i * p3, 1, p3, f) != p3) { fprintf(stderr, "sample: cannot write %s\n", fn); if (f) fclose(f); return 1; }
+                    fclose(f);
+                }
+                snprintf(fn, sizeof fn, "%s/patch_%02d_%d.pgm", out, bi, i);
+            }
             fprintf(stderr, "%s: src %s level %d corner %lld,%lld,%lld w=[%d,%d]\n", fn, S->src[b->src[i]].name, b->level[i],
                     (long long)b->corner[i][0], (long long)b->corner[i][1], (long long)b->corner[i][2], b->w[i * NCH], b->w[i * NCH + 1]);
         }
@@ -2536,6 +2617,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "eval")) return cmd_eval(argc, argv);
     if (!strcmp(cmd, "band")) return cmd_band(argc, argv);
     if (!strcmp(cmd, "fit")) return cmd_fit(argc, argv);
+    if (!strcmp(cmd, "convert-unwrap2")) return cmd_convert_unwrap2(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);

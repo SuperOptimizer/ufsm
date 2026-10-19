@@ -634,6 +634,18 @@ __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t 
     if (threadIdx.x < BW) atomicAdd(&gbsum[(size_t)n * C + cb * BW + threadIdx.x], bred[threadIdx.x]);
 }
 thread_local lp_gyrec_t g_gyrec;
+/* the record / bias-sum buffers of every GPU this thread drives: data-parallel training runs all GPUs' steps on one host thread, and
+   g_gyrec once forgot (leaked) the other GPU's buffers at every switch - ~nrec of a 128-channel level per GPU per step (P512, 7-level
+   16..256 net: 2.2 MB), until the cards were full and an unchecked workspace allocation faulted (desk wind2-wk1: an illegal memory
+   access 1211 steps after every start). Switching GPU now parks this GPU's buffers and takes the new one's back. */
+static thread_local struct { uint8_t *rec; size_t cap; float *gb; int gbc; } g_gyrec_park[16];
+extern "C" void lp_gyrec_select(int d) {   /* (tests call it to switch devices by hand) */
+    lp_gyrec_t *R = &g_gyrec;
+    if (R->dev == d || d < 0 || d >= 16) return;
+    if (R->dev >= 0 && R->dev < 16) { g_gyrec_park[R->dev].rec = R->rec; g_gyrec_park[R->dev].cap = R->cap; g_gyrec_park[R->dev].gb = R->gb; g_gyrec_park[R->dev].gbc = R->gbc; }
+    R->rec = g_gyrec_park[d].rec; R->cap = g_gyrec_park[d].cap; R->gb = g_gyrec_park[d].gb; R->gbc = g_gyrec_park[d].gbc;
+    R->dev = d; R->valid = 0;
+}
 static int g_gyrec_narrow = -1;   /* records also for whole 8- / 16-channel levels (-1: env UFSM_GYREC=2) */
 extern "C" void lp_set_gyrec_narrow(int on) { g_gyrec_narrow = on; }
 static int g_gyrec_off = -1;   /* test hook: 1 no records at all (the plain apply), -1 env UFSM_GYREC */
@@ -648,7 +660,7 @@ extern "C" int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G,
     const int bw = mx_bw(s.c);   /* 32, or a whole 8- / 16-channel level */
     if (!on || g_gyrec_off == 1 || s.c % bw || s.n > 1 || (xdt != 4 && xdt != 8)) return 0;
     if (bw < 32 && !lp_gyrec_narrow()) return 0;   /* narrow levels: opt-in (records ~8.5 B per level-0 voxel at 16 channels) */
-    if (R->dev != d) { R->rec = nullptr; R->cap = 0; R->gb = nullptr; R->gbc = 0; R->dev = d; }   /* (a thread that changed GPU) */
+    if (R->dev != d) lp_gyrec_select(d);   /* (a thread that changed GPU: its buffers parked, not dropped) */
     const int Wb = (s.w + 15) / 16, ZT = (s.d + 1) / 2, TY = (s.h + 7) / 8, nb = s.c / bw;
     const size_t nrec = (size_t)s.n * s.c * ZT * TY * Wb * GREC;
     if (R->cap < nrec) {   /* this thread's own buffer (the pre-pass's lp_buf slot could be rewritten before the records are read) */
@@ -657,7 +669,11 @@ extern "C" int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G,
         R->cap = nrec;
         if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) > 0) fprintf(stderr, "gy records: %.1f MB (GPU %d)\n", nrec / 1e6, d);
     }
-    if (R->gbc < s.n * s.c) { if (R->gb) cudaFree(R->gb); cudaMalloc((void **)&R->gb, (size_t)s.n * s.c * 4); R->gbc = s.n * s.c; }
+    if (R->gbc < s.n * s.c) {
+        if (R->gb) cudaFree(R->gb);
+        if (cudaMalloc((void **)&R->gb, (size_t)s.n * s.c * 4) != cudaSuccess) { R->gb = nullptr; R->gbc = 0; cudaGetLastError(); return 0; }   /* (was unchecked) */
+        R->gbc = s.n * s.c;
+    }
     cudaMemsetAsync(R->gb, 0, (size_t)s.n * s.c * 4);
     const unsigned ngrp = (unsigned)ZT * TY * Wb;
     const dim3 grid(ngrp < 4096 ? ngrp : 4096, (unsigned)(nb * s.n));

@@ -49,6 +49,7 @@ typedef struct {
                                 needs geometry_augment, same sources as the zoom */
     const sheet_dataset *sheet; /* borrowed sparse geometry, native-level B=1 task */
     int band;                /* 1: fill batch.band from each source's band target (task band_affinity, native level, no geometry warp) */
+    double min_phase;        /* side 2: reject windows whose known phase covers less than this fraction of the voxels (0: keep all) */
     float phase_near_um;     /* > 0 (stored phase, side 2): the phase target only within this distance (um) of a labelled wrap voxel
                                 (target channel 0): the stored phase interpolates between published wraps, and across a missing wrap
                                 the interpolated phase is off by up to half a turn */
@@ -84,6 +85,11 @@ typedef struct {
     int pack_tm;             /* targets and mask as one code byte per voxel (batch.tm: SAMPLE_TM_* bits; t, m nullptr): every target value
                                 0 or 255 and the mask 0 / 1 (hard two-class targets, e.g. the side encoding; a soft value aborts). The
                                 trainer unpacks on the device (nn_unpack_tm): host batches 3 -> 1 byte per voxel */
+    int wind4;               /* train --task unwrap2 (side 2, stored phase): batch.w4 / wcomp, the relative winding mod 4 of each window
+                                (src/band.h band_wind4: the stored phase unwrapped over the window before the air test, its components
+                                kept as separate gauges); warped samples pull it through the warp within one component */
+    int wind4_step, wind4_min;   /* band_wind4's maxstep (phase codes; 0: 80 = 0.32 turn) and minsize (voxels; 0: 512) */
+    int wind4_tile;          /* band_wind4_tiled's tile edge (at least P / 6: <= 216 tiles, one gauge each); < 0 the whole window */
 } sample_cfg;
 /* the configurations whose every sample takes write_x (no warp, sheet prior, slab appearance plan, aux or condition channels): the
    radial channels then follow from the window's corner, symmetry and axis centres alone */
@@ -105,6 +111,7 @@ typedef struct {
     uint8_t *pm;             /* B x P^3 papyrus mask (1 where CT > 0) when cfg.pmask */
     uint8_t *wind;           /* B x P^3 winding mod 14 + gauge (band.h band_winding encoding, 255 unknown) when cfg.cond */
     uint8_t *pap;            /* B x P^3 papyrus labels when cfg.pap_head: 0 void, 1 papyrus, 255 ignored */
+    uint8_t *w4, *wcomp;     /* B x P^3 each when cfg.wind4: winding mod 4 (63 codes per turn, 255 unknown) and its component (0..14, 255 none) */
     void *rad;               /* cfg.gpu_input: B radial records of NN_RAD_REC(Pz) bytes (nn.h), x / x16 then one channel per sample */
     uint8_t *tm;             /* cfg.pack_tm: B x P^3 codes (bit 0: target 0 = 255, bit 1: target 1 = 255, bit 2: mask), t / m nullptr */
     int xch;                 /* input channels stored per sample in x / x16 (4, 5 with aux, 7 with cond, 1 with gpu_input) */
@@ -124,6 +131,9 @@ void sampler_release(sampler *sp, batch *b);
 void sampler_stop(sampler *sp);
 /* Stats: patches rejected / produced since start. */
 void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected);
+/* draws dropped by reason: [0] the coarse CT probe (min_fg, before the CT read), [1] the CT read's min_fg, [2] empty targets
+   (empty_keep), [3] overlapping a holdout box (training; not counted in rejected) */
+void sampler_reject_reasons(const sampler *sp, uint64_t why[4]);
 void sampler_prof_print(const sampler *sp);   /* env UFSM_SAMPLER_PROF=1: per-stage cpu ms per patch */
 void sampler_set_soft(sampler *sp, float sigma);   /* change the soft-target sigma while running (annealing); patches already drawn keep theirs */
 

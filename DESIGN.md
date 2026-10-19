@@ -6,6 +6,82 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Spiral-fit heads only: train --task unwrap2, a gauge-free winding mod 4 head (2026-10-18)
+
+User (10-18): drop the recto and ink heads from the winding model; add only heads whose training data follows from our ground truth.
+Kept: what `ufsm fit` reads, plus one new head for counting turns.
+
+- Layout (11 outputs; `runtime_extra.unwrap` `"version":2`, `checkpoint_unwrap_version()`): 0-1 phase (0.5 + 0.5 cos / sin 2 pi
+  phase, soft BCE, as task unwrap's 2-3), 2-7 n n^T, 8 density (as 4-10: `--normal-*`, `--density-*`, `--packed-*`, count loss),
+  9-10 relative winding mod 4: 0.5 + 0.5 cos / sin (2 pi W / 4). Task unwrap (11 heads with recto / ink) is unchanged; predict
+  and fit read both. `--cond` / `--pap-head` / ink flags are refused with unwrap2.
+- Winding target (src/band.c `band_wind4`, `band_wind4_tiled`). W = k + phase, but the band codes' k is per label set (Paris4 June
+  and July unrolls are separate sources with their own numbering; the ~9 um "each"-mode scrolls seed every segment separately and
+  their codes are the first set only), so the sampler never reads k: it unwraps the window's stored phase. Voxels join their
+  6-neighbours where both phases are known and differ by <= `--wind4-step` (80 of 252 codes); the phase ramps 0 -> 1 between
+  consecutive labelled windings and wraps at each recto, so along joins W = phase + integer is continuous. Runs along x, a
+  union-find over runs with offsets in turns mod 4 (only W mod 4 is needed; W = phase + 252 (j + O) codes). A component whose joins
+  do not close (> 8 + 0.2% inconsistent loops: labels that disagree, or a loop around the umbilicus) is dropped. The phase is read
+  before the air test (gaps join the windings; CT 0 does not); w4 = W mod 4 in 63 codes per turn, comp = its gauge id.
+  Each component's integer is arbitrary: one gauge per component, never compared with another. So every source contributes the
+  same way: wherever its fused stored phase is known and consistent (Paris4 sets, multi-scroll named and each-mode sets), nothing
+  from the codes' numbering enters.
+- Tiles: on PHerc0139 (named mode, 18.72 um phase) whole windows lost nearly all voxels to inconsistent loops (P384 at 9.4 um, 2x
+  upsampled phase: kept 0%; tiles of 64: 80%; on the 18.72 grid tiles of 32 / 64 / 96 kept 90 / 75 / 49%). So the gauge is per tile
+  of `--wind4-tile` 64 window voxels (at least P / 6, <= 216 tiles; the largest component of each; up to 255 gauges per window);
+  `--wind4-tile 0`: per window (15 largest components). The net learns consistency over a tile (~600 um at 9.6 um, several sheets),
+  more than the fitter's offset (`--fit-w4-d` 32 voxels). Warped samples: `warp_w4` pulls w4 as a period-4 phasor within the
+  nearest voxel's component (gauges never mix). Cost: ~0.4 s per P384 window on one sampler thread (run union-find, two passes).
+- Loss (src/nn_loss.cu `nn_wind4_*`): for component c and gauge g (W + g turns = a quarter-turn rotation of the target),
+  bce_g = sum m [sp(a) + sp(b) - 0.5 (a + b) - 0.5 R_g] with R_0 = a cos t + b sin t, R_1 = b cos t - a sin t, R_2 = -R_0, R_3 = -R_1;
+  loss = sum_c min_g bce_g / (2 sum m) times `--wind4-lambda` (mask m = the phase loss mask, incl. packed weights and the split halo).
+  So per component only N, S0, H, X, Y are summed (plus 4 accuracy counts); the gauge g* = argmax of {X, Y, -X, -Y}; the gradient is
+  the soft-BCE gradient against the target rotated by g* (clean: piecewise the phase loss's gradient, no gradient through the
+  argmax). Head slabs: pass 0 sums over the slabs, then the gauges; pass 1 the gradient per slab. Logged: wind4 bce, the worst-gauge
+  bce (a gauge-blind net has both equal) and the turn accuracy (predicted angle within 1/8 turn mod 4 of the target at g*, i.e. the
+  right integer); `val unwrap2:` line per validation. tests/test_wind4: targets on planar / spiral fields (one integer per component,
+  <= 1/63 turn), tiles around the umbilicus, loss vs a double reference (1e-6), whole-turn target shifts per component change
+  neither loss nor gradient (2.6e-9), gradient vs central differences (5e-8 of 2e-3), fp16 gradients.
+- Warm start: `train --task unwrap2 --init-from <task unwrap ckpt>` maps head rows 2-10 -> 0-8 (rows 9-10 fresh), same architecture.
+  `ufsm convert-unwrap2 IN OUT` writes that conversion without a training step (header extras kept, unwrap / phase objects
+  rewritten). wind96-wk1 vs its conversion, predict on a PHerc0139 box (256 x 512 x 512, window 192 / halo 32, fit-h 2):
+  --fit-fields and --fit-zarr pc ps t0..t5 sp w byte-identical (zarr: every shard; only the "checkpoint" attribute differs).
+  (A conversion by one lr-0 training step was not: the step changes the weights.)
+- Fit fields (predict): unwrap2 checkpoints pool phase / normal / density from channels 0 / 2 / 8 (no recto max) into the same 10
+  planes, plus 4: dz dy dx = the predicted W(x + d e_a) - W(x) mod 4 over d = `--fit-w4-d` (32, clamped to the halos) voxels, from
+  the cell's material-voxel sum of p(v + d e_a) conj p(v) (p = 2 sigma - 1 of channels 9-10) inside one window (one gauge), byte b
+  = b / 64 turns; dq = 255 x the mean over the axes of |sum| / pairs. Per-cell cos / sin planes would not do: each window predicts
+  its own gauge, so pooled cells would change gauge at every window seam. fields.json `"w4_d"`; zarr arrays dz dy dx dq beside the
+  10 (128^3 field shards like the others). tests/test_fit_w4: the unwrap and unwrap2 pooling of permuted logits byte-identical,
+  the relative planes vs a host reference (0 byte difference), save / load round trip.
+- Fit term (`ufsm fit`, nn_fit_loss2, `--wind4-weight` 4; on when the planes exist, 10-plane fields unchanged): per field voxel and
+  axis dq (1 - cos(2 pi / 4 (W(x + d e_a) - W(x) - delta_a))), theta difference wrapped, both points' lattice corners get gradient;
+  phase stages only, ramped like the phase; `--analytic 0` ignores it; loss part `wind4` (parts[6]). On test_fit's spiral with the
+  phase (and density) under-counting a packed sector by 40%: winding ids 0.876 -> 1.000 with the term at weight >= 3 and d of 1-2
+  pitches (d 16 voxels = 0.27 pitch: no gain, a sub-sheet offset cannot tell a missing turn from the phase's own drift).
+- Blending (`ufsm blend` of 8 runs): average the 10 planes as now; dz dy dx are angles mod 4 turns: blend as unit vectors weighted
+  by dq (atan2 of the weighted sums), dq as the resultant length. Not implemented (cmd_blend is not on this branch's base 7ae7a47).
+- Smokes (laptop, PHerc0139 at 9.36 um level 0, phase 18.72 upsampled, holdout box, P128): widths 32,32,64,64,96,128 6k steps from
+  scratch (head slabs): val wind4 0.630 -> 0.608, worst gauge ~0.93, turn acc 0.52 -> 0.59 at 1.8k then 0.55 (small holdout);
+  phase 0.684 -> 0.654, normal 0.675 -> 0.486. Widths 16,16,32,64,128 (whole-window head and losses) 3k steps: wind4 0.621 -> 0.610,
+  turn acc 0.563 -> 0.593, normal 0.759 -> 0.621. Widths 16,16,32,64,128,192,256 P192 --mem fast (the desk layout, small): runs,
+  losses fall. Warm start from wind96 (1.5k steps): normal starts at 0.54 (scratch 0.88).
+- Open: Paris4 labels are not on the laptop (consistency / kept fraction there unmeasured); the sampler cost of band_wind4 (one
+  thread); predict's main output for unwrap2 is channel 0 = phase cos; fit-zarr field shards stay 128^3.
+- The desk's 2-GPU wind2-wk1 run (P512, 16..256, --mem fast) died with an illegal memory access (and a non-finite gradient in the
+  same step) ~1211 steps after every start; the logged windows were PHerc0172's (the heaviest source, phase-free windows) but the
+  windows replayed on the laptop (ASan sampler at P512, GPU at P128 / P256 with compute-sanitizer memcheck) were clean. Cause: a
+  device memory leak that only two GPUs on one host thread trigger. The GroupNorm+SiLU backward keeps its fp4 weight-gradient gy
+  records (lp_gn_silu_bwd_apply_rec; levels with a multiple of 32 channels) in one thread_local struct and reset the pointers
+  without freeing them at every GPU switch, so each GPU lost one record buffer per step (level 2 of this net at P512: 35.6 MB) until
+  its card was full; then the records fell back and the unchecked workspace allocations (the records' bias sums, lp_buf, tc_wbuf)
+  failed and their kernels wrote through invalid pointers. Earlier 2-GPU runs (prod96, wind96) probably ran with full cards too
+  (records off after the first steps: slower, but no workspace growth later).
+  Fix: lp_gyrec_select parks each GPU's buffers per device (tests/test_gyrec: 200 switches, no memory lost); the allocations are
+  checked. Also: --min-phase (unwrap2 default 0.001) redraws windows without phase (they supervise nothing); UFSM_SYNC_CHECK=1
+  counts non-finite logits / gradients per step, prints device memory free per GPU and locates a CUDA fault with its window;
+  UFSM_SAMPLE_AT replays given windows; tests/test_unwrap2_sampler (a non-cubic band + phase-only source).
+
 ## The two biggest level-0 kernels: conv_fwd_f4p_k and conv_bwd_w_f4ws_k (2026-10-16)
 Desk P512 trainer (P2's profile): conv_fwd_f4p_k (16-channel forward and backward-data) ~149 ms / step over 17 calls,
 conv_bwd_w_f4ws_k (fp4 weight gradient, warp-specialised) ~114 ms over 66, of ~597 ms of kernels.
