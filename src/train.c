@@ -1870,6 +1870,19 @@ int cmd_train(int argc, char **argv) {
                     cap, sc.nbuf, win / 1e9, avail / 1e9);
             sc.nbuf = cap;
         }
+        /* a worker fills a whole slot, so with fewer free slots than workers the rest park on the slot condition variable (the desk's
+           unwrap2 run: 28 workers, 2 GPUs, B 1 -> 10 slots, the trainer holding some, ~6-10 drawing): by default every worker a slot
+           plus 2 per GPU with the trainer and 2 ready, as far as the memory left beside the workers' own scratch (~16 P^3 bytes each:
+           draw()'s ttmp / big and pooled window buffers) allows */
+        const int want = (workers + B - 1) / B + 2 * ng + 2;
+        if (avail && want > sc.nbuf && sc.nbuf == 4 * ng + 2) {
+            const long long room = (long long)budget - (long long)workers * 16 * (long long)p3s - (long long)sc.nbuf * (long long)win;
+            long long extra = room > 0 && slotb ? room / (long long)slotb : 0;
+            if (extra > want - sc.nbuf) extra = want - sc.nbuf;
+            sc.nbuf += (int)extra;
+            fprintf(stderr, "sampler: %d slots for %d workers (B %d)%s\n", sc.nbuf, workers, B,
+                    sc.nbuf < want ? ": host memory caps them, workers beyond the free slots wait (--sampler-slots sets it)" : "");
+        }
     }
     sampler *sp = sampler_start(S, &sc);
     if (!sp) return 1;

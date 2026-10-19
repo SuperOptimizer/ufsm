@@ -156,6 +156,99 @@ int main(void) {
         printf("cache-blocked warp writer vs the per-voxel loop: %d of %d configurations differ\n",diffs,runs);
         assert(!diffs);
     }
+#ifdef __AVX2__
+    {   /* the vector arctangent: every lane it does not hand to atan2f (need) carries atan2f's code, over random phasors of all sizes
+           and phasors on / next to the rounding boundaries and the wrap */
+        uint64_t s = 12345; long bad = 0, fall = 0, tot = 0, rfall = 0, rtot = 0;
+        for (int it = 0; it < 400000; it++) {
+            float fx[8], fy[8];
+            for (int l = 0; l < 8; l++) {
+                s = s * 6364136223846793005ull + 1442695040888963407ull; const double u = (s >> 11) * 0x1.0p-53;
+                s = s * 6364136223846793005ull + 1442695040888963407ull; const double v = (s >> 11) * 0x1.0p-53;
+                double ang = 2 * M_PI * u, mag = pow(10, -3.9 + 4.5 * v);
+                if (it & 1) { const int k = (int)(u * PHASE_PERIOD); ang = 2 * M_PI * (k + .5 + (v - .5) * 1e-3 * (it & 2 ? 1 : 1e-3)) / PHASE_PERIOD; }
+                if (it % 7 == 0) ang = (v - .5) * 1e-5;   /* (the wrap) */
+                fx[l] = (float)(mag * cos(ang)); fy[l] = (float)(mag * sin(ang));
+            }
+            __m256 need; const __m256i q = warp_code8(_mm256_loadu_ps(fx), _mm256_loadu_ps(fy), &need);
+            int qi[8]; _mm256_storeu_si256((__m256i *)qi, q); const int nm = _mm256_movemask_ps(need);
+            for (int l = 0; l < 8; l++) { tot++; if (nm >> l & 1) fall++; else bad += qi[l] != warp_code_of(fx[l], fy[l]); }
+            if (!(it & 1) && it % 7) { rtot += 8; rfall += __builtin_popcount(nm); }
+        }
+        printf("vector arctangent: %ld phasors (half placed on rounding boundaries), %ld to atan2f (random angles: %.2f %%), %ld codes differ\n", tot, fall, 100.0 * rfall / rtot, bad);
+        assert(!bad);
+    }
+#endif
+    {   /* warp_phase_w4 (vector, fused) against the per-voxel reference loops warp_phase_ref / warp_w4_ref, bytes equal: a spiral phase
+           with unknowns and its winding mod 4 (band_wind4_tiled components), rotation / elastic / both / zoom / affine, symmetries,
+           P 37 (odd: vector lanes and per-voxel tails), 64, 128, 256 and 512 */
+        const int Ps[] = {37, 64, 128, 256, 512};
+        int diffs = 0, runs = 0;
+        for (int pi = 0; pi < 5; pi++) {
+            const int Q = Ps[pi]; const size_t nq = (size_t)Q * Q * Q;
+            uint8_t *pq = malloc(nq + 64), *pw = malloc(nq), *w4 = malloc(nq), *wc = malloc(nq), *o[6]; uint16_t *wq = malloc(nq * 2);
+            for (int i = 0; i < 6; i++) o[i] = malloc(nq);
+            for (int z = 0; z < Q; z++) for (int y = 0; y < Q; y++) for (int x = 0; x < Q; x++) {
+                const size_t k = ((size_t)z * Q + y) * Q + x; const double r = hypot(y + 40.0, x - .3 * Q) / 9.0 + .01 * z, f = r - floor(r);
+                pq[k] = (x * 7 + y * 3 + z) % 53 == 0 ? PHASE_UNKNOWN : (uint8_t)((int)(f * PHASE_PERIOD) % PHASE_PERIOD);
+                pw[k] = (x + 2 * y) % 31 == 0 ? SIDE_UNKNOWN : pq[k];
+            }
+            memset(pq + nq, PHASE_UNKNOWN, 64);
+            if (band_wind4_tiled(pw, Q, Q, Q, (Q + 5) / 6, 80, 64, 1, w4, wc, nullptr) < 0) abort();
+            warp_w4_pack(w4, wc, wq, nq);
+            const int modes = Q == 512 ? 1 : Q == 256 ? 2 : 5;
+            for (int mi = 0; mi < modes; mi++) for (int si = 0; si < 48; si += Q == 512 ? 48 : Q == 256 ? 47 : Q == 128 ? 11 : 5) {
+                const int mode = Q >= 256 ? (mi ? 4 : 3) : mi;
+                spatial_aug a; spatial_aug_make(&a, 400 + mode + Q, Q, mode == 1 ? 0 : 10, 1, mode == 0 ? 0 : 1, 1);
+                if (mode == 3) spatial_aug_zoom(&a, .7); if (mode == 4) spatial_aug_affine(&a, 6 + Q, .2, .12);
+                sym sy = sym_of(si);
+                warp_phase_ref(pq, o[0], Q, sy, &a); warp_w4_ref(w4, wc, o[1], o[2], Q, sy, &a);
+                warp_phase_w4(pq, wq, o[3], o[4], o[5], Q, sy, &a);
+                int d = memcmp(o[0], o[3], nq) || memcmp(o[1], o[4], nq) || memcmp(o[2], o[5], nq);
+                if (Q < 256) {   /* the single-field forms (draw() without --task unwrap2; the tests' warp_phase) */
+                    warp_phase(pq, o[3], Q, sy, &a); warp_w4(w4, wc, o[4], o[5], Q, sy, &a);
+                    d |= memcmp(o[0], o[3], nq) || memcmp(o[1], o[4], nq) || memcmp(o[2], o[5], nq);
+                }
+                size_t known = 0; for (size_t k = 0; k < nq; k++) known += o[1][k] < PHASE_PERIOD;
+                if (d && diffs < 4) fprintf(stderr, "phase / w4 warp differs: P %d mode %d sym %d\n", Q, mode, si);
+                if (known < nq / 4) { fprintf(stderr, "phase / w4 warp: P %d mode %d sym %d only %zu known winding voxels\n", Q, mode, si, known); d = 1; }
+                diffs += d; runs++;
+            }
+            free(pq); free(pw); free(w4); free(wc); free(wq); for (int i = 0; i < 6; i++) free(o[i]);
+        }
+        printf("fused vector phase / winding warp vs the per-voxel loops: %d of %d configurations differ\n", diffs, runs);
+        assert(!diffs);
+    }
+    {   /* the trainer's CT writer (--gpu-input --pack-targets: hard targets, CT-only, packed codes straight from the warp) at P 128, 256
+           and 512 against the per-voxel reference loop + sample_pack_tm, with no appearance plan, the --ct-aug LUT (gamma, shading,
+           correlated noise) and the filter plan: fp16 CT and packed codes equal */
+        int diffs = 0, runs = 0;
+        for (int Q = 128; Q <= 512; Q *= 2) {
+            const size_t nq = (size_t)Q * Q * Q;
+            uint8_t *c2 = malloc(nq), *t2 = malloc(2 * nq), *m2 = malloc(nq), *Ta = malloc(2 * nq), *Ma = malloc(nq), *TMa = malloc(nq), *TMb = malloc(nq);
+            uint16_t *Ha = malloc(nq * 2), *Hb = malloc(nq * 2); float *app = malloc(nq * 4), *nr = malloc(Q * 4), *nrs = malloc(Q * 4), *nps = malloc((size_t)Q * Q * 4), cyq[512], cxq[512];
+            for (size_t k = 0; k < nq; k++) { const int x = (int)(k % Q), y = (int)(k / Q % Q); c2[k] = (x + y) % 41 == 0 ? 0 : (uint8_t)(40 + (k * 2654435761u >> 25)); t2[k] = (x / 5 + y / 7) % 3 == 0 ? 255 : 0; t2[nq + k] = (x / 3 + y / 4) % 4 == 1 ? 255 : 0; m2[k] = c2[k] != 0; }
+            for (int z = 0; z < Q; z++) { cyq[z] = -30.5f + .3f * z; cxq[z] = 70.25f - .2f * z; }
+            for (int plan = 0; plan < 3; plan++) {
+                if (Q == 512 && plan != 1) continue;
+                spatial_aug a; spatial_aug_make(&a, 70 + plan + Q, Q, 10, 1, 1, 1); spatial_aug_zoom(&a, .75);
+                ct_aug_plan ap; ct_aug_make(&ap, 33 + plan, 1, 90, 30, Q);
+                ap.filter_mode = plan == 2; ap.filter_strength = .4f; ap.shading[0] = .03f; ap.shading[2] = -.02f; ap.noise_rho = .35f; ap.noise_sigma = .03f;
+                const ct_aug_plan *pp = plan ? &ap : nullptr; sym sy = sym_of(7 * plan + 3); rng r; const int64_t org[3] = {0, 0, 0};
+                memset(nrs, 0, Q * 4); memset(nps, 0, (size_t)Q * Q * 4); rseed(&r, 5 + plan);
+                write_spatial_ref(c2, t2, m2, Ta, Ma, Q, org, 85, .031f, 1, cyq, cxq, sy, &a, 1.05f, .01f, .03f, &r, nr, 1, nullptr, Ha, pp, nrs, nps, nullptr, nullptr, app, 1, 1);
+                size_t bad = 0; if (sample_pack_tm(Ta, Ta + nq, Ma, nq, TMa, &bad)) abort();
+                memset(nrs, 0, Q * 4); memset(nps, 0, (size_t)Q * Q * 4); rseed(&r, 5 + plan);
+                write_spatial_tm(c2, t2, m2, nullptr, nullptr, Q, org, 85, .031f, 1, cyq, cxq, sy, &a, 1.05f, .01f, .03f, &r, nr, 1, nullptr, Hb, pp, nrs, nps, nullptr, nullptr, app, 1, 1, TMb);
+                const int d = memcmp(TMa, TMb, nq) || memcmp(Ha, Hb, nq * 2);
+                if (d) fprintf(stderr, "trainer CT writer differs: P %d plan %d\n", Q, plan);
+                diffs += d; runs++;
+            }
+            free(c2); free(t2); free(m2); free(Ta); free(Ma); free(TMa); free(TMb); free(Ha); free(Hb); free(app); free(nr); free(nrs); free(nps);
+        }
+        printf("trainer CT writer (packed, fp16, plans none / LUT / filter) vs the per-voxel loop at P 128-512: %d of %d differ\n", diffs, runs);
+        assert(!diffs);
+    }
     free(ct); free(target); free(mask); free(T); free(M); free(X); free(H); free(scratch);
     puts("spatial augmentation registration: ok"); return 0;
 }
