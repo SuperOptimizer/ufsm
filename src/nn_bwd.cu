@@ -51,7 +51,7 @@ int gn_fused_stored(const void *y, int cout) {
     return g_gn_stored && ISMX(y) && cout >= 16 &&
         (!getenv("UFSM_FUSED_STORED_GN") || ufsm_env_on("UFSM_FUSED_STORED_GN"));
 }
-void *tc_wbuf(size_t n) { static void *buf[8]; static size_t cap[8]; int d = cur_dev(); if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); cudaMalloc(&buf[d], n * 2); cap[d] = n; } return buf[d]; }
+void *tc_wbuf(size_t n) { static void *buf[8]; static size_t cap[8]; int d = cur_dev(); if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); if (cudaMalloc(&buf[d], n * 2) != cudaSuccess) { fprintf(stderr, "tc_wbuf: no device memory for %.1f MB (GPU %d)\n", n * 2 / 1e6, d); abort(); } cap[d] = n; } return buf[d]; }
 int fw_tz(int MT) {
     static int e = -2;
     if (e == -2) { const char *v = getenv("UFSM_FW_TZ"); e = v ? atoi(v) : -1; }
@@ -60,7 +60,7 @@ int fw_tz(int MT) {
     return FW_TZ_MT1;
 }
 size_t fw_smem(int MT, int tz) { return (size_t)(TC_CI * (tz + 2) * 180 + (MT <= 2 ? 2 : 1) * 9 * MT * 16 * TC_CI) * 2; }
-float *tc_wscbuf(size_t n) { static float *buf[8]; static size_t cap[8]; int d = cur_dev(); if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); cudaMalloc(&buf[d], n * sizeof(float)); cap[d] = n; } return buf[d]; }
+float *tc_wscbuf(size_t n) { static float *buf[8]; static size_t cap[8]; int d = cur_dev(); if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); if (cudaMalloc(&buf[d], n * sizeof(float)) != cudaSuccess) { fprintf(stderr, "tc_wscbuf: no device memory for %.1f MB (GPU %d)\n", n * 4 / 1e6, d); abort(); } cap[d] = n; } return buf[d]; }
 int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp, const tapset_t *ts) {
     if (g_zr_Di) {   /* z-range: the MX forward kernels (and the tap-packed stem kernel) */
         if (ts || !ISMX(y) || (!ISMX(x) && xs.c > 8) || sp.y2 || sp.accum || g_pass) { fprintf(stderr, "conv: the z-range needs an MX output and input (forward)\n"); abort(); }

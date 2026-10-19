@@ -181,6 +181,8 @@ $(B)/test_gpu_input: tests/test_gpu_input.c $(B)/sample.o $(B)/edt.o $(B)/band.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
 $(B)/test_pack_tm: tests/test_pack_tm.c $(B)/sample.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/cover.o $(B)/sources.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
+$(B)/test_gyrec: tests/test_gyrec.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_wind4: tests/test_wind4.c $(B)/band.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_unwrap2_sampler: tests/test_unwrap2_sampler.c $(B)/sample.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/cover.o $(B)/sources.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
@@ -279,6 +281,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_gpu_input
 	./$(B)/test_pack_tm
 	./$(B)/test_wind4
+	./$(B)/test_gyrec
 	./$(B)/test_unwrap2_sampler $(B)/unwrap2_fixture
 	./$(B)/test_fit_w4
 	$(MAKE) test-sheet
@@ -389,6 +392,7 @@ test-all: $(B)/test_sweep
 test-all: $(B)/test_gpu_input
 test-all: $(B)/test_pack_tm
 test-all: $(B)/test_wind4
+test-all: $(B)/test_gyrec
 test-all: $(B)/test_unwrap2_sampler
 test-all: $(B)/test_fit_w4
 test-all: $(B)/test_l3_sched
