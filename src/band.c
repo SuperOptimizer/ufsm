@@ -2,6 +2,10 @@
    envelopes, separable over x, y, z) carrying the index of the nearest surface voxel. */
 #include "band.h"
 #include <math.h>
+#include <pthread.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -322,7 +326,7 @@ static void w4_union(w4_uf *u, int32_t a, int32_t b, int rel) {
 static inline int w4_step(int a, int b) { int d = ((b - a) % 252 + 252) % 252; return d >= 126 ? d - 252 : d; }   /* phase codes a -> b in [-126, 126) */
 typedef struct { const uint8_t *ph; int D, H, W, maxstep; int32_t *rid[2]; int8_t *jj[2]; } w4_scan;
 /* one pass over the window: runs numbered in scan order; pass 0 creates runs and joins neighbours, pass 1 writes w4 / comp via map */
-static int w4_pass(w4_scan *s, w4_uf *u, int pass, const int16_t *map, uint8_t *w4, uint8_t *comp) {
+static int w4_pass_ref(w4_scan *s, w4_uf *u, int pass, const int16_t *map, uint8_t *w4, uint8_t *comp) {
     const int H = s->H, W = s->W; const size_t pl = (size_t)H * W;
     int32_t nrun = 0;
     for (int z = 0; z < s->D; z++) {
@@ -370,12 +374,12 @@ static int w4_pass(w4_scan *s, w4_uf *u, int pass, const int16_t *map, uint8_t *
     }
     return 0;
 }
-int band_wind4(const uint8_t *phase, int D, int H, int W, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
+int band_wind4_ref(const uint8_t *phase, int D, int H, int W, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
     if (maxcomp > 15) maxcomp = 15;
     const size_t pl = (size_t)H * W;
     w4_scan s = {phase, D, H, W, maxstep, {malloc(pl * 4), malloc(pl * 4)}, {malloc(pl), malloc(pl)}};
     w4_uf u = {0};
-    int rc = !s.rid[0] || !s.rid[1] || !s.jj[0] || !s.jj[1] ? -1 : w4_pass(&s, &u, 0, nullptr, nullptr, nullptr);
+    int rc = !s.rid[0] || !s.rid[1] || !s.jj[0] || !s.jj[1] ? -1 : w4_pass_ref(&s, &u, 0, nullptr, nullptr, nullptr);
     int16_t *map = rc ? nullptr : malloc((u.n ? u.n : 1) * sizeof *map);
     int ncomp = 0; size_t kept = 0, known = 0, dropped_conf = 0;
     if (!rc && !map) rc = -1;
@@ -395,18 +399,179 @@ int band_wind4(const uint8_t *phase, int D, int H, int W, int maxstep, size_t mi
         }
         for (int c = 0; c < nb; c++) { map[best[c]] = (int16_t)c; kept += (size_t)u.size[best[c]]; }
         ncomp = nb;
-        rc = w4_pass(&s, &u, 1, map, w4, comp);
+        rc = w4_pass_ref(&s, &u, 1, map, w4, comp);
     }
     if (st) { st->known = known; st->kept = kept; st->dropped_conflict = dropped_conf; st->ncomp = ncomp; st->runs = u.n; }
     free(map); free(u.r); free(u.size); free(u.edges); free(u.conf); free(s.rid[0]); free(s.rid[1]); free(s.jj[0]); free(s.jj[1]);
     return rc ? -1 : ncomp;
 }
+static int w4_grow(w4_uf *u, int32_t cur) {
+    if ((size_t)cur >= u->cap) {
+        u->cap = u->cap ? 2 * u->cap : 4096;
+        w4_run *r = realloc(u->r, u->cap * sizeof *u->r); if (!r) return -1; u->r = r;
+        int64_t *a = realloc(u->size, u->cap * 8); if (!a) return -1; u->size = a;
+        a = realloc(u->edges, u->cap * 8); if (!a) return -1; u->edges = a;
+        a = realloc(u->conf, u->cap * 8); if (!a) return -1; u->conf = a;
+    }
+    u->r[cur].parent = cur; u->r[cur].off = 0; u->size[cur] = 0; u->edges[cur] = 0; u->conf[cur] = 0; u->n = (size_t)cur + 1;
+    return 0;
+}
+/* per voxel of a row, the join to the voxel before it along x (an) and to the y / z neighbour (ay / az): W4_NJ when the two are not
+   joined (either unknown, or the phase step beyond maxstep), else the turn the step adds ((step - (b - a)) / 252: -1, 0, 1; for the
+   neighbours + its turn count jn, mod 4). Branch-free per voxel (vectorises). */
+enum { W4_NJ = 0x80 };
+static void w4_row_joins(const uint8_t *a, const uint8_t *b, const int8_t *jn, int n, int ms, uint8_t *out) {
+    int x = 0;
+#ifdef __AVX2__
+    {   /* 16 voxels in 16-bit lanes: the same integer expressions */
+        const __m256i c125 = _mm256_set1_epi16(125), cm126 = _mm256_set1_epi16(-126), c252 = _mm256_set1_epi16(252), vms = _mm256_set1_epi16((short)ms),
+                      one = _mm256_set1_epi16(1), three = _mm256_set1_epi16(3), nj = _mm256_set1_epi16(W4_NJ);
+        for (; x + 16 <= n; x += 16) {
+            const __m256i va = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(a + x))), vb = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(b + x)));
+            const __m256i d = _mm256_sub_epi16(vb, va), ge = _mm256_cmpgt_epi16(d, c125), lt = _mm256_cmpgt_epi16(cm126, d);
+            const __m256i st = _mm256_add_epi16(_mm256_sub_epi16(d, _mm256_and_si256(ge, c252)), _mm256_and_si256(lt, c252));
+            __m256i t = _mm256_sub_epi16(_mm256_and_si256(lt, one), _mm256_and_si256(ge, one));
+            if (jn) t = _mm256_add_epi16(t, _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(jn + x))));
+            const __m256i bad = _mm256_or_si256(_mm256_or_si256(_mm256_cmpgt_epi16(va, _mm256_set1_epi16(251)), _mm256_cmpgt_epi16(vb, _mm256_set1_epi16(251))),
+                                                _mm256_cmpgt_epi16(_mm256_abs_epi16(st), vms));
+            const __m256i o = _mm256_blendv_epi8(_mm256_and_si256(t, three), nj, bad);
+            const __m256i pk = _mm256_permute4x64_epi64(_mm256_packus_epi16(o, o), 0xD8);
+            _mm_storeu_si128((__m128i *)(out + x), _mm256_castsi256_si128(pk));
+        }
+    }
+#endif
+    for (; x < n; x++) {
+        const int va = a[x], vb = b[x], d = vb - va;
+        const int st = d >= 126 ? d - 252 : d < -126 ? d + 252 : d, t = (st > d) - (st < d);
+        const int ok = va < 252 && vb < 252 && st <= ms && st >= -ms;
+        out[x] = ok ? (uint8_t)((t + (jn ? jn[x] : 0)) & 3) : (uint8_t)W4_NJ;
+    }
+}
+/* (out of the voxel loop: its locals stay in registers) the pending counts of cur's component onto its root */
+[[gnu::noinline]] static void w4_add(w4_uf *u, int32_t cur, int64_t pn, int64_t pe, int64_t pc) {
+    int o; const int32_t r = w4_find(u, cur, &o); u->size[r] += pn; u->edges[r] += pe; u->conf[r] += pc;
+}
+/* w4_union (the caller has flushed cur's pending counts), returning O_cur - O_rn mod 4 afterwards */
+[[gnu::noinline]] static int w4_join(w4_uf *u, int32_t cur, int32_t rn, int rel) {
+    int oa, ob; const int32_t ra = w4_find(u, cur, &oa), rb = w4_find(u, rn, &ob);
+    if (ra == rb) { u->edges[ra]++; if (((oa - ob - rel) & 3) != 0) u->conf[ra]++; return (oa - ob) & 3; }
+    const int d = (rel - oa + ob) & 3;
+    if (u->size[ra] < u->size[rb]) { u->r[ra].parent = rb; u->r[ra].off = (uint8_t)d; u->size[rb] += u->size[ra]; u->edges[rb] += u->edges[ra] + 1; u->conf[rb] += u->conf[ra]; }
+    else { u->r[rb].parent = ra; u->r[rb].off = (uint8_t)((-d) & 3); u->size[ra] += u->size[rb]; u->edges[ra] += u->edges[rb] + 1; u->conf[ra] += u->conf[rb]; }
+    return rel;
+}
+/* w4_pass_ref's pass 0 with the same unions in the same order and the same outcome (roots, offsets, sizes, edge and conflict counts),
+   cheaper per voxel: the joins of a row precomputed (w4_row_joins); the run's voxel count and the edge / conflict counts of joins inside
+   one component accumulate in the run and are added to its root before any union that can merge (whose size comparison they decide)
+   and at the run's end (sizes, edges and conflicts are only summed, so where they land in between does not matter); a join to the
+   neighbour run of the previous join in the same slot (y or z) needs no finds: both runs are in one component since that join, at the
+   same relative offset. */
+static int w4_pass0(w4_scan *s, w4_uf *u, uint8_t *jx) {
+    const int H = s->H, W = s->W, ms = s->maxstep; const size_t pl = (size_t)H * W;
+    uint8_t *jy = jx + W, *jz = jy + W;
+    int32_t nrun = 0;
+    for (int z = 0; z < s->D; z++) {
+        int32_t *rc = s->rid[z & 1], *rp = s->rid[(z & 1) ^ 1]; int8_t *jc = s->jj[z & 1], *jp = s->jj[(z & 1) ^ 1];
+        for (int y = 0; y < H; y++) {
+            const uint8_t *row = s->ph + (size_t)z * pl + (size_t)y * W;
+            int32_t *rck = rc + (size_t)y * W; int8_t *jck = jc + (size_t)y * W;
+            const int32_t *rny = rck - W, *rnz = rp + (size_t)y * W;
+            jx[0] = W4_NJ; w4_row_joins(row, row + 1, nullptr, W - 1, ms, jx + 1);
+            if (y) w4_row_joins(row - W, row, jck - W, W, ms, jy); else memset(jy, W4_NJ, (size_t)W);
+            if (z) w4_row_joins(row - pl, row, jp + (size_t)y * W, W, ms, jz); else memset(jz, W4_NJ, (size_t)W);
+            int32_t cur = -1, cy = -1, cz = -1; int j = 0, dy = 0, dz = 0;   /* cy / cz: the last joined y / z neighbour run (dy / dz: O_cur - O_it) */
+            int64_t pn = 0, pe = 0, pc = 0;   /* pending voxels, edges, conflicts of cur's component */
+            for (int x = 0; x < W; x++) {
+                if (row[x] >= 252) { if (cur >= 0 && (pn | pe | pc)) w4_add(u, cur, pn, pe, pc); pn = pe = pc = 0; cur = -1; rck[x] = -1; continue; }
+                const int tx = jx[x];
+                if (tx != W4_NJ) j = (j + tx) & 3;   /* (tx = turn mod 4; cur >= 0: the voxel before is known) */
+                else {
+                    if (cur >= 0 && (pn | pe | pc)) w4_add(u, cur, pn, pe, pc);
+                    pn = pe = pc = 0;
+                    cur = nrun++; j = 0; cy = cz = -1;
+                    if (w4_grow(u, cur)) return -1;
+                }
+                rck[x] = cur; jck[x] = (int8_t)j; pn++;
+                if (jy[x] != W4_NJ) {
+                    const int32_t rn = rny[x]; const int rel = (jy[x] - j) & 3;
+                    if (rn == cy) { pe++; pc += ((dy - rel) & 3) != 0; }
+                    else { if (pn | pe | pc) w4_add(u, cur, pn, pe, pc); pn = pe = pc = 0; dy = w4_join(u, cur, rn, rel); cy = rn; }
+                }
+                if (jz[x] != W4_NJ) {
+                    const int32_t rn = rnz[x]; const int rel = (jz[x] - j) & 3;
+                    if (rn == cz) { pe++; pc += ((dz - rel) & 3) != 0; }
+                    else { if (pn | pe | pc) w4_add(u, cur, pn, pe, pc); pn = pe = pc = 0; dz = w4_join(u, cur, rn, rel); cz = rn; }
+                }
+            }
+            if (cur >= 0 && (pn | pe | pc)) w4_add(u, cur, pn, pe, pc);
+        }
+    }
+    return 0;
+}
+/* w4_pass_ref's pass 1: the same runs (the same joins along x), the root offset found once per run, w4 from a table */
+static uint8_t w4_tab[4][252];
+static pthread_once_t w4_tab_once = PTHREAD_ONCE_INIT;
+static void w4_tab_init(void) { for (int t = 0; t < 4; t++) for (int v = 0; v < 252; v++) w4_tab[t][v] = (uint8_t)(((v + 252 * t + 2) / 4) % 252); }
+static int w4_pass1(w4_scan *s, w4_uf *u, const int16_t *map, uint8_t *w4, uint8_t *comp, uint8_t *jx) {
+    const int H = s->H, W = s->W, ms = s->maxstep; const size_t pl = (size_t)H * W;
+    pthread_once(&w4_tab_once, w4_tab_init);
+    int32_t nrun = 0;
+    for (int z = 0; z < s->D; z++) for (int y = 0; y < H; y++) {
+        const size_t g0 = (size_t)z * pl + (size_t)y * W;
+        const uint8_t *row = s->ph + g0; uint8_t *ow = w4 + g0, *oc = comp + g0;
+        jx[0] = W4_NJ; w4_row_joins(row, row + 1, nullptr, W - 1, ms, jx + 1);
+        int j = 0, root_off = 0; int16_t cid = -1;
+        for (int x = 0; x < W; x++) {
+            const int v = row[x];
+            if (v >= 252) { ow[x] = 255; oc[x] = 255; continue; }
+            const int tx = jx[x];
+            if (tx != W4_NJ) j = (j + tx) & 3;
+            else { const int32_t r = w4_find(u, nrun++, &root_off); j = 0; cid = map[r]; }
+            if (cid < 0) { ow[x] = 255; oc[x] = 255; continue; }
+            ow[x] = w4_tab[(j + root_off) & 3][v]; oc[x] = (uint8_t)cid;
+        }
+    }
+    return 0;
+}
+int band_wind4(const uint8_t *phase, int D, int H, int W, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
+    if (maxcomp > 15) maxcomp = 15;
+    const size_t pl = (size_t)H * W;
+    w4_scan s = {phase, D, H, W, maxstep, {malloc(pl * 4), malloc(pl * 4)}, {malloc(pl), malloc(pl)}};
+    w4_uf u = {0};
+    uint8_t *jx = malloc(3 * (size_t)W);   /* (the joins of a row: x, y, z) */
+    int rc = !s.rid[0] || !s.rid[1] || !s.jj[0] || !s.jj[1] || !jx ? -1 : w4_pass0(&s, &u, jx);
+    int16_t *map = rc ? nullptr : malloc((u.n ? u.n : 1) * sizeof *map);
+    int ncomp = 0; size_t kept = 0, known = 0, dropped_conf = 0;
+    if (!rc && !map) rc = -1;
+    if (!rc) {
+        int32_t best[15]; int nb = 0;
+        for (size_t i = 0; i < u.n; i++) {
+            map[i] = -1;
+            if (u.r[i].parent != (int32_t)i) continue;
+            known += (size_t)u.size[i];
+            if ((size_t)u.size[i] < minsize) continue;
+            if (u.conf[i] > 8 + u.edges[i] / 500) { dropped_conf += (size_t)u.size[i]; continue; }   /* inconsistent unwrapping (> 0.2% of its joins) */
+            int p = nb < maxcomp ? nb++ : maxcomp;   /* insertion into the size-sorted list of the largest */
+            if (p == maxcomp && u.size[i] <= u.size[best[maxcomp - 1]]) continue;
+            if (p == maxcomp) p = maxcomp - 1;
+            while (p > 0 && u.size[best[p - 1]] < u.size[i]) { best[p] = best[p - 1]; p--; }
+            best[p] = (int32_t)i;
+        }
+        for (int c = 0; c < nb; c++) { map[best[c]] = (int16_t)c; kept += (size_t)u.size[best[c]]; }
+        ncomp = nb;
+        rc = w4_pass1(&s, &u, map, w4, comp, jx);
+    }
+    if (st) { st->known = known; st->kept = kept; st->dropped_conflict = dropped_conf; st->ncomp = ncomp; st->runs = u.n; }
+    free(map); free(u.r); free(u.size); free(u.edges); free(u.conf); free(s.rid[0]); free(s.rid[1]); free(s.jj[0]); free(s.jj[1]); free(jx);
+    return rc ? -1 : ncomp;
+}
 /* band_wind4 per tile of tile^3 voxels (the last tiles of an axis smaller), each tile's components their own gauges: a label
    inconsistency (a loop of joins that gains a turn) then drops only its tile's component. Components numbered over the tiles in
    raster order, up to 255 (comp 0..254); maxcomp per tile. tile <= 0: the whole volume as one tile. */
-int band_wind4_tiled(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
+typedef int (*w4_fn)(const uint8_t *, int, int, int, int, size_t, int, uint8_t *, uint8_t *, band_wind4_stats *);
+static int w4_tiled(w4_fn fn, const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
     if (tile <= 0 || (tile >= D && tile >= H && tile >= W)) {
-        const int nc = band_wind4(phase, D, H, W, maxstep, minsize, maxcomp, w4, comp, st);
+        const int nc = fn(phase, D, H, W, maxstep, minsize, maxcomp, w4, comp, st);
         return nc;
     }
     const size_t T3 = (size_t)tile * tile * tile;
@@ -417,12 +582,24 @@ int band_wind4_tiled(const uint8_t *phase, int D, int H, int W, int tile, int ma
         const int nz = D - z0 < tile ? D - z0 : tile, ny = H - y0 < tile ? H - y0 : tile, nx = W - x0 < tile ? W - x0 : tile;
         for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) memcpy(tp + ((size_t)z * ny + y) * nx, phase + ((size_t)(z0 + z) * H + y0 + y) * W + x0, (size_t)nx);
         band_wind4_stats s;
-        const int nc = band_wind4(tp, nz, ny, nx, maxstep, minsize, maxcomp > 15 ? 15 : maxcomp, tw, tc, &s);
+        const int nc = fn(tp, nz, ny, nx, maxstep, minsize, maxcomp > 15 ? 15 : maxcomp, tw, tc, &s);
         if (nc < 0) { rc = -1; break; }
         const int base = next; next += nc;
         for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) {
             const size_t so = ((size_t)z * ny + y) * nx, d = ((size_t)(z0 + z) * H + y0 + y) * W + x0;
-            for (int x = 0; x < nx; x++) {
+            int x = 0;
+#ifdef __AVX2__
+            if (base <= 254) {   /* 32 voxels: c == 255 or base + c > 254 (c > 254 - base) -> 255 / 255, else the code and base + c */
+                const __m256i lim = _mm256_set1_epi8((char)(254 - base)), vb = _mm256_set1_epi8((char)base), ff = _mm256_set1_epi8((char)255);
+                for (; x + 32 <= nx; x += 32) {
+                    const __m256i c = _mm256_loadu_si256((const __m256i *)(tc + so + x)), w = _mm256_loadu_si256((const __m256i *)(tw + so + x));
+                    const __m256i bad = _mm256_or_si256(_mm256_cmpeq_epi8(c, ff), _mm256_xor_si256(_mm256_cmpeq_epi8(_mm256_min_epu8(c, lim), c), ff));   /* (c <= lim: min == c) */
+                    _mm256_storeu_si256((__m256i *)(w4 + d + x), _mm256_or_si256(w, bad));
+                    _mm256_storeu_si256((__m256i *)(comp + d + x), _mm256_or_si256(_mm256_add_epi8(c, vb), bad));
+                }
+            }
+#endif
+            for (; x < nx; x++) {
                 const int c = tc[so + x];
                 if (c == 255 || base + c > 254) { w4[d + x] = 255; comp[d + x] = 255; continue; }
                 w4[d + x] = tw[so + x]; comp[d + x] = (uint8_t)(base + c);
@@ -435,4 +612,10 @@ int band_wind4_tiled(const uint8_t *phase, int D, int H, int W, int tile, int ma
     if (st) *st = acc;
     free(tp); free(tw); free(tc);
     return rc ? -1 : next;
+}
+int band_wind4_tiled(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
+    return w4_tiled(band_wind4, phase, D, H, W, tile, maxstep, minsize, maxcomp, w4, comp, st);
+}
+int band_wind4_tiled_ref(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
+    return w4_tiled(band_wind4_ref, phase, D, H, W, tile, maxstep, minsize, maxcomp, w4, comp, st);
 }

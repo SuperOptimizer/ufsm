@@ -249,6 +249,48 @@ int main(void) {
         printf("trainer CT writer (packed, fp16, plans none / LUT / filter) vs the per-voxel loop at P 128-512: %d of %d differ\n", diffs, runs);
         assert(!diffs);
     }
+    {   /* band_wind4 (run-pending union-find) vs band_wind4_ref (per-voxel finds and unions): w4, comp and the stats byte for byte on
+           spiral phases with noise (joins that break or wrap), label conflicts (a sheared wall whose phase jumps), unknown blobs and air,
+           several shapes, step limits, minimum sizes and component counts, whole windows and tiled */
+        int diffs = 0, runs = 0; size_t tot_conf = 0, tot_kept = 0, tot_known = 0;
+        const int shapes[][3] = {{37, 41, 43}, {64, 64, 64}, {96, 80, 112}, {130, 128, 129}};
+        for (int si = 0; si < 4; si++) for (int var = 0; var < 4; var++) {
+            const int D = shapes[si][0], Hh = shapes[si][1], Ww = shapes[si][2]; const size_t nn = (size_t)D * Hh * Ww;
+            uint8_t *ph = malloc(nn), *wa = malloc(nn), *ca = malloc(nn), *wb = malloc(nn), *cb = malloc(nn);
+            const double cy0 = Hh * (var == 3 ? -.8 : .45), cx0 = Ww * .55, pitch = var == 1 ? 5.5 : 9.0;
+            for (int z = 0; z < D; z++) for (int y = 0; y < Hh; y++) for (int x = 0; x < Ww; x++) {
+                const size_t k = ((size_t)z * Hh + y) * Ww + x; const uint64_t h = mix64(k * 0x9e3779b97f4a7c15ull + (uint64_t)var);
+                double w = hypot(y - cy0, x - cx0) / pitch - atan2(y - cy0, x - cx0) / (2 * M_PI) + .01 * z;
+                if (var == 2 && x > Ww / 2 + (y - z) / 3) w += .37;   /* a wall of inconsistent labels */
+                w += (double)((int)(h >> 60) - 8) * (var == 1 ? .02 : .004);   /* noise: some joins exceed the step limit */
+                const double f = w - floor(w); int c = (int)(f * PHASE_PERIOD); if (c >= PHASE_PERIOD) c = PHASE_PERIOD - 1;
+                const int blob = ((x / 11 + 3 * (y / 13) + 5 * (z / 9)) % 7) == 0, air = (h >> 20 & 1023) < (var == 1 ? 60u : 6u);
+                ph[k] = blob || air ? PHASE_UNKNOWN : (uint8_t)c;
+            }
+            const int steps[3] = {80, 30, 125}; const size_t mins[3] = {512, 1, 40}; const int mcs[3] = {15, 1, 4};
+            for (int pv = 0; pv < 3; pv++) {
+                band_wind4_stats sa = {0}, sb = {0};
+                const int na = band_wind4_ref(ph, D, Hh, Ww, steps[pv], mins[pv], mcs[pv], wa, ca, &sa);
+                const int nb = band_wind4(ph, D, Hh, Ww, steps[pv], mins[pv], mcs[pv], wb, cb, &sb);
+                const int d = na != nb || memcmp(wa, wb, nn) || memcmp(ca, cb, nn) || sa.known != sb.known || sa.kept != sb.kept ||
+                              sa.dropped_conflict != sb.dropped_conflict || sa.runs != sb.runs || sa.ncomp != sb.ncomp;
+                if (d) fprintf(stderr, "band_wind4 differs: shape %d var %d params %d (%d vs %d components)\n", si, var, pv, na, nb);
+                diffs += d; runs++; tot_conf += sa.dropped_conflict; tot_kept += sa.kept; tot_known += sa.known;
+                const int tiles[2] = {11 + 5 * pv, 40};   /* tiled (draw()'s form; 11-21: over 255 components, the vector scatter's limit) */
+                for (int ti = 0; ti < 2; ti++) {
+                    const int ta = band_wind4_tiled_ref(ph, D, Hh, Ww, tiles[ti], steps[pv], mins[pv] / 8 + 1, mcs[pv], wa, ca, &sa);
+                    const int tb = band_wind4_tiled(ph, D, Hh, Ww, tiles[ti], steps[pv], mins[pv] / 8 + 1, mcs[pv], wb, cb, &sb);
+                    const int dt = ta != tb || memcmp(wa, wb, nn) || memcmp(ca, cb, nn) || sa.known != sb.known || sa.kept != sb.kept ||
+                                   sa.dropped_conflict != sb.dropped_conflict || sa.runs != sb.runs || sa.ncomp != sb.ncomp;
+                    if (dt) fprintf(stderr, "band_wind4_tiled differs: shape %d var %d params %d tile %d\n", si, var, pv, tiles[ti]);
+                    diffs += dt; runs++;
+                }
+            }
+            free(ph); free(wa); free(ca); free(wb); free(cb);
+        }
+        printf("band_wind4 (whole and tiled) vs the per-voxel reference (4 shapes x 4 phases x 3 parameter sets; %zu known, %zu kept, %zu dropped as inconsistent): %d of %d differ\n", tot_known, tot_kept, tot_conf, diffs, runs);
+        assert(!diffs);
+    }
     free(ct); free(target); free(mask); free(T); free(M); free(X); free(H); free(scratch);
     puts("spatial augmentation registration: ok"); return 0;
 }
