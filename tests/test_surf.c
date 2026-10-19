@@ -2,7 +2,8 @@
    phase 2 pi W (with a wavy offset of the sheets, so the fitted-looking smooth level set is off the sheet by up to 0.12 turn), and a
    tifxyz wrap at a smooth radius 0.2 turn off the sheet (the level set of a too-smooth fit). refine must bring the vertices onto
    W = k (|W - k| mean < 0.03 turn, from ~0.2) and, with a target offset, onto W = k + target (a corner of the box has no phase);
-   surf-stats runs on both sets. */
+   surf-stats runs on both sets. fit_set_gradW on a hand-made model (exact, across theta's cut; a 3-turn step is a fault), and
+   surf-stats --model (faults, the largest clean sheet). */
 #include "fit.h"
 #include "tiff.h"
 #include "tiffw.h"
@@ -90,6 +91,33 @@ int main(void) {
     CHECK(cmd_surf_stats(8, sv) == 0, "surf-stats rc");
     char *sv0[] = {"ufsm", "surf-stats", w0, "--fields", fd, "--threads", "4", nullptr};
     CHECK(cmd_surf_stats(7, sv0) == 0, "surf-stats rc");
+    /* the fit's W by hand (W = r / P - theta / 2 pi, no wiggle): fit_set_gradW = 1 / P everywhere, also across theta's cut (x < CX,
+       y = CY); a model with a 3-turn step in delta over 2 native voxels has |grad W| > 3 x the density there (a fault); surf-stats --model */
+    {
+        fit_model m = {0}; m.dir = 1; m.nk = 2; m.knot_dz = 1024; float pit[2] = {(float)P, (float)P}, off[2] = {0, 0}; m.pitch = pit; m.offset = off;
+        m.L = 8; m.lz = D * HH / 8 + 2; m.ly = H * HH / 8 + 2; m.lx = Wd * HH / 8 + 2; m.delta = calloc((size_t)m.lz * m.ly * m.lx, 4);
+        m.D = D; m.H = H; m.W = Wd; m.h = HH; for (int d = 0; d < 3; d++) m.origin[d] = ORG[d]; m.um = UM; m.cy = cy; m.cx = cx;
+        char md[600]; snprintf(md, sizeof md, "%s/model", base); CHECK(!fit_save(&m, md), "fit_save");
+        fit_set *fs = fit_set_load(md); CHECK(fs != nullptr, "fit_set_load");
+        if (fs) {
+            double g[3], worst = 0; const double pts[4][3] = {{10, CY, CX - 40}, {10, CY + 0.3, CX - 50}, {20, CY - 30, CX + 20}, {5, CY + 50, CX - 50}};
+            for (int k = 0; k < 4; k++) {   /* |grad W| = sqrt(1 / P^2 + 1 / (2 pi r)^2) */
+                const double r = hypot(pts[k][1] - CY, pts[k][2] - CX), ex = sqrt(1 / (P * P) + 1 / (4 * M_PI * M_PI * r * r));
+                worst = fmax(worst, fabs(fit_set_gradW(fs, pts[k][0], pts[k][1], pts[k][2], 1.0, g) / ex - 1));
+            }
+            printf("fit_set_gradW: relative error worst %.2g (the theta cut included)\n", worst);
+            CHECK(worst < 1e-3, "fit_set_gradW: relative error %.3g", worst);
+            fit_set_free(fs);
+        }
+        for (int a = 0; a < m.lz; a++) for (int b = 0; b < m.ly; b++) for (int c = 8; c < m.lx; c++) m.delta[((size_t)a * m.ly + b) * m.lx + c] = 3;   /* x >= 64: +3 turns */
+        char mf[600]; snprintf(mf, sizeof mf, "%s/model-fault", base); CHECK(!fit_save(&m, mf), "fit_save");
+        fs = fit_set_load(mf);
+        if (fs) { double g[3]; const double gl = fit_set_gradW(fs, 10, 40, 60, 1.0, g); printf("fault model: |grad W| %.3f at the step (density %.3f)\n", gl, 1 / P);
+                  CHECK(gl > 3 / P, "the 3-turn step is no fault (%.3f)", gl); fit_set_free(fs); }
+        char *mv[] = {"ufsm", "surf-stats", w1, "--fields", fd, "--model", mf, "--threads", "4", nullptr};
+        CHECK(cmd_surf_stats(9, mv) == 0, "surf-stats --model rc");
+        free(m.delta);
+    }
     char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", base); if (system(cmd)) {}
     for (int k = 0; k < 10; k++) free(a[k]);
     free(cy); free(cx);

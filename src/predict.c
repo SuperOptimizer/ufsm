@@ -121,8 +121,9 @@ static void fit_finalize(const float *acc, size_t nf, int h, uint8_t *const a[10
         if (rho > 0) { const float v = 8.f / (h * rho); a[8][i] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lroundf(v)); }
     }
 }
-static const char *ffz_names[10] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w"};
-static const int ffz_fill[10] = {128, 128, 0, 0, 0, 0, 0, 0, 0, 0};
+enum { FFZ_PLANES = 11 };
+static const char *ffz_names[FFZ_PLANES] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w", "r"};
+static const int ffz_fill[FFZ_PLANES] = {128, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 /* --fit-zarr: write the slab buffer's field shards (z index fsz) of every array */
 /* host field slab slab (FZ cells in z from slab FZ, FZ a multiple of the field shard FS; planes past F[0] not held) -> its rows of
    shards, the shards compressed and written on threads (a 128^3 field shard is one chunk, so z3w_write_shard alone is one thread:
@@ -130,7 +131,7 @@ static const int ffz_fill[10] = {128, 128, 0, 0, 0, 0, 0, 0, 0, 0};
 typedef struct { z3w *const *zw; uint8_t *const *sl; int64_t slab; const int *F; int FS, FZ, nrow, nx; const int *rq, *ry; _Atomic int next, fail; } ffz_job;
 static void *ffz_worker(void *a) {   /* jobs: (array k, field-shard row (q, fsy) of the list, fsx) */
     ffz_job *J = a; const int FS = J->FS, *F = J->F; uint8_t *sb = malloc((size_t)FS * FS * FS);
-    const int njob = 10 * J->nrow * J->nx;
+    const int njob = FFZ_PLANES * J->nrow * J->nx;
     for (;;) {
         const int t = atomic_fetch_add(&J->next, 1); if (t >= njob || atomic_load(&J->fail)) break;
         const int k = t / (J->nrow * J->nx), r = t / J->nx % J->nrow, fsx = t % J->nx, q = J->rq[r], fsy = J->ry[r];
@@ -146,7 +147,7 @@ static void *ffz_worker(void *a) {   /* jobs: (array k, field-shard row (q, fsy)
 }
 /* field-shard rows (q, fsy) of the slab in [q0, q1) x [y0, y1) not yet written (done: [FZ / FS][ny] per slab, marked here); reset:
    the slab is left (its buffers back to the fill values, done cleared) */
-static int ffz_flush(z3w *const zw[10], uint8_t *const sl[10], int64_t slab, const int F[3], int FS, int FZ, int q0, int q1, int y0, int y1, uint8_t *done, int reset,
+static int ffz_flush(z3w *const zw[FFZ_PLANES], uint8_t *const sl[FFZ_PLANES], int64_t slab, const int F[3], int FS, int FZ, int q0, int q1, int y0, int y1, uint8_t *done, int reset,
                      int ntmax) {   /* ntmax: compression threads (0: every CPU) */
     const int ny = (F[1] + FS - 1) / FS;
     int nq = 0; for (int q = 0; q < FZ / FS; q++) if ((slab * (FZ / FS) + q) * FS < F[0]) nq = q + 1;
@@ -166,12 +167,12 @@ static int ffz_flush(z3w *const zw[10], uint8_t *const sl[10], int64_t slab, con
     if (atomic_load(&J.fail)) return -1;
     if (!reset) return 0;
     const int64_t held = F[0] < FZ ? F[0] : FZ;
-    for (int k = 0; k < 10; k++) memset(sl[k], ffz_fill[k], (size_t)held * F[1] * F[2]);
+    for (int k = 0; k < FFZ_PLANES; k++) memset(sl[k], ffz_fill[k], (size_t)held * F[1] * F[2]);
     memset(done, 0, (size_t)(FZ / FS) * ny);
     return 0;
 }
 
-/* --fit-zarr host side off the main thread: per window chunk the device fields (10 B per cell, 1.3 GB for a 512^3 interior at
+/* --fit-zarr host side off the main thread: per window chunk the device fields (11 B per cell, 1.5 GB for a 512^3 interior at
    --fit-h 1) go to pinned memory on the offload stream; one thread waits for each copy, scatters it into the slab buffers and
    flushes slabs in queue order (both used to run on the main thread while the GPU idled). Two staging buffers. */
 typedef struct { int kind, b, c1, c2, nz, ny, nx; int64_t cz, slab; size_t nl; int q0, q1, y0, y1; } ffw_job;   /* kind 0: chunk copy, 1: slab flush (the rows
@@ -221,7 +222,7 @@ static void *ffw_main(void *arg) {
         }
         nn_event_sync(W->evd[j.b]);
         const uint8_t *hb = W->h[j.b];
-        for (int a = 0; a < j.nz; a++) for (int b = 0; b < j.ny; b++) for (int k = 0; k < 10; k++)
+        for (int a = 0; a < j.nz; a++) for (int b = 0; b < j.ny; b++) for (int k = 0; k < FFZ_PLANES; k++)
             memcpy(W->sl[k] + ((size_t)(j.cz + a - j.slab * W->FZ) * W->F[1] + j.c1 + b) * W->F[2] + j.c2, hb + k * j.nl + ((size_t)a * j.ny + b) * j.nx, (size_t)j.nx);
         pthread_mutex_lock(&W->mu); W->busy[j.b] = 0; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
     }
@@ -442,7 +443,7 @@ int cmd_predict(int argc, char **argv) {
        window's interior pooled on the device into the winding fitter's fields (h native voxels per field voxel, --fit-h 8) of the
        box, written to DIR at the end (src/fit.h fit_fields_save). One GPU, the CT window in its own buffer (no aliasing). */
     const char *ffd = opt(argc, argv, "--fit-fields", nullptr); const int ffh = atoi(opt(argc, argv, "--fit-h", "8"));
-    const char *ffz = opt(argc, argv, "--fit-zarr", nullptr);   /* the same fields of a whole volume: 10 uint8 zarr arrays, flushed slab by slab */
+    const char *ffz = opt(argc, argv, "--fit-zarr", nullptr);   /* the same fields of a whole volume: 11 uint8 zarr arrays, flushed slab by slab */
     if (ffd && ffz) { fprintf(stderr, "predict: --fit-fields or --fit-zarr\n"); return 2; }
     if ((ffd || ffz) && (ffh < 1 || ffh > 32)) { fprintf(stderr, "--fit-h 1..32\n"); return 2; }   /* (inference aliasing stays on: the fit pooling reads
                                                                                                        the material mask from the CT bit plane; it was off: ~80 instead of ~45 B per window voxel) */
@@ -760,7 +761,7 @@ int cmd_predict(int argc, char **argv) {
     for (int d = 0; d < 3 && kss > 1; d++) { int64_t ph = grid ? (bo[d] - grid_origin[d]) % stride : 0; if (ph < 0) ph += stride; if (ph) kss = 1; }
     int64_t nss[3]; for (int d = 0; d < 3; d++) nss[d] = (ns[d] + kss - 1) / kss;
     float *ffacc = nullptr; int ffbox[3], ffF[3]; size_t ffn = 0;
-    z3w *ffzw[10] = {0}; uint8_t *ffsl[10] = {0}; const int FFS = 128; int FZ = FFS; int64_t ffslab = 0; uint8_t *ff8d = nullptr, *ff8h = nullptr; size_t ffwn = 0; int ffwc = 0, ffzc = 1;
+    z3w *ffzw[FFZ_PLANES] = {0}; uint8_t *ffsl[FFZ_PLANES] = {0}; const int FFS = 128; int FZ = FFS; int64_t ffslab = 0; uint8_t *ff8d = nullptr, *ff8h = nullptr; size_t ffwn = 0; int ffwc = 0, ffzc = 1;
     static ffw_t ffw; pthread_t ffw_th; int ffw_on = 0, ffrow = 0, ffrk = 0; int64_t ffprow = -1;   /* row flushes: (super-)shard cells, the last row */
     if (ffd) {
         for (int d = 0; d < 3; d++) { ffbox[d] = (int)bn[d]; ffF[d] = (int)((bn[d] + ffh - 1) / ffh); }
@@ -784,7 +785,7 @@ int cmd_predict(int argc, char **argv) {
             for (int d = 0; d < 3; d++) { const int64_t ph = grid ? (bo[d] - grid_origin[d]) % ffh : 0; if (ph) { fprintf(stderr, "predict: --fit-zarr: the box must be aligned to --fit-h on the tile grid\n"); return 2; } }
             char at[512]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"winding fitter fields (src/fit.h)\",\"h\":%d,\"origin_zyx\":[%lld,%lld,%lld],\"checkpoint\":\"%s\"}}", ffh, (long long)bo[0], (long long)bo[1], (long long)bo[2], ckpt);
             const int64_t fsh[3] = {ffF[0], ffF[1], ffF[2]};
-            for (int k = 0; k < 10; k++) {
+            for (int k = 0; k < FFZ_PLANES; k++) {
                 char d[1400]; snprintf(d, sizeof d, "%s/%s", ffz, ffz_names[k]);
                 const size_t held = (size_t)(ffF[0] < FZ ? ffF[0] : FZ) * ffF[1] * ffF[2];
                 ffzw[k] = z3w_create(d, fsh, FFS, 0, ffz_fill[k], at);
@@ -792,12 +793,12 @@ int cmd_predict(int argc, char **argv) {
                 if (!ffzw[k] || !ffsl[k]) { fprintf(stderr, "predict: --fit-zarr: %s\n", z3w_error()); return 1; }
                 memset(ffsl[k], ffz_fill[k], held);
             }
-            /* a window's cells in z chunks of ffzc planes: 58 device bytes per cell (12 fp32 sums + 10 uint8 fields), so at --fit-h 1 a
+            /* a window's cells in z chunks of ffzc planes: 70 device bytes per cell (12 fp32 sums + two 11-byte staging buffers), so at --fit-h 1 a
                whole 512^3 interior took 7.8 GB and pushed 640^3 windows past the 16 GB card (paged); <= ~0.5 GB now */
             ffwc = stride / ffh + 1;
-            { const size_t pc = (size_t)ffwc * ffwc, nzc = (size_t)(strd[0] / ffh + 1), cap = ((size_t)512 << 20) / (58 * pc);
+            { const size_t pc = (size_t)ffwc * ffwc, nzc = (size_t)(strd[0] / ffh + 1), cap = ((size_t)512 << 20) / ((48 + 2 * FFZ_PLANES) * pc);
               ffzc = (int)(nzc < (cap ? cap : 1) ? nzc : (cap ? cap : 1)); ffwn = (size_t)ffzc * pc; }
-            ffacc = nn_malloc(12 * ffwn * 4); ff8d = nn_malloc(2 * 10 * ffwn); ff8h = nn_host_alloc(2 * 10 * ffwn);   /* finalized on the device: 10 B per cell back,
+            ffacc = nn_malloc(12 * ffwn * 4); ff8d = nn_malloc(2 * FFZ_PLANES * ffwn); ff8h = nn_host_alloc(2 * FFZ_PLANES * ffwn);   /* finalized on the device: 11 B per cell back,
                                                                                                                   two staging buffers (the fit writer thread) */
             if (!ffacc || !ff8d || !ff8h) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }
             ffw.zw = ffzw; ffw.sl = ffsl; ffw.F = ffF; ffw.FS = FFS; ffw.FZ = FZ; ffw.gpu = gpu;
@@ -808,7 +809,7 @@ int cmd_predict(int argc, char **argv) {
                the whole last slab: 8 of 24 s for a 256 x 2048^2 box). One worker, a (super-)shard of whole field shards; UFSM_FIT_ROWFLUSH=0 */
             ffrk = (kss > 1 ? kss * shard : shard) / ffh;
             ffrow = nwork == 1 && !split && ffrk % FFS == 0 && !(getenv("UFSM_FIT_ROWFLUSH") && !atoi(getenv("UFSM_FIT_ROWFLUSH")));
-            for (int b = 0; b < 2; b++) { ffw.h[b] = ff8h + (size_t)b * 10 * ffwn; ffw.evs[b] = nn_event_create(); ffw.evd[b] = nn_event_create(); }
+            for (int b = 0; b < 2; b++) { ffw.h[b] = ff8h + (size_t)b * FFZ_PLANES * ffwn; ffw.evs[b] = nn_event_create(); ffw.evd[b] = nn_event_create(); }
             pthread_mutex_init(&ffw.mu, nullptr); pthread_cond_init(&ffw.cv, nullptr); atomic_store(&ffw.fail, 0);
             { long nc = sysconf(_SC_NPROCESSORS_ONLN); ffw.rnt = nc > 2 ? (int)(nc / 2) : 1; }
             if (pthread_create(&ffw_th, nullptr, ffw_main, &ffw) || pthread_create(&ffw.rth, nullptr, ffw_rows, &ffw)) { fprintf(stderr, "predict: cannot start the fit writer\n"); return 1; }
@@ -1001,9 +1002,9 @@ int cmd_predict(int argc, char **argv) {
                         const double tfa = pprof ? now() : 0;
                         const int fb = ffw_acquire(&ffw);
                         if (pprof) p_ffw += now() - tfa;
-                        uint8_t *fd = ff8d + (size_t)fb * 10 * ffwn;
-                        nn_fit_finalize(ffacc, nl, ffh, fd);
-                        nn_offload_copy(ffw.h[fb], fd, 10 * nl, 1, ffw.evs[fb], ffw.evd[fb]);   /* scattered into the slab by the fit writer */
+                        uint8_t *fd = ff8d + (size_t)fb * FFZ_PLANES * ffwn;
+                        nn_fit_finalize(ffacc, nl, ffh, fd); nn_fit_finalize_recto(ffacc, nl, fd + 10 * nl);   /* pc .. w, then r */
+                        nn_offload_copy(ffw.h[fb], fd, FFZ_PLANES * nl, 1, ffw.evs[fb], ffw.evd[fb]);   /* scattered into the slab by the fit writer */
                         ffw_push(&ffw, (ffw_job){.kind = 0, .b = fb, .c1 = c0[1], .c2 = c0[2], .nz = nz, .ny = nc3[1], .nx = nc3[2], .cz = cz, .slab = slab, .nl = nl});
                     }
                 }
@@ -1085,12 +1086,12 @@ int cmd_predict(int argc, char **argv) {
         const double tfin = now();
         if (ffw_on && ffw_finish(&ffw, ffw_th)) { fprintf(stderr, "predict: %s\n", z3w_error()); return 1; }
         if (pprof) fprintf(stderr, "predict profile (s): fit writer tail (the last field slabs) %.2f\n", now() - tfin);
-        for (int k = 0; k < 10; k++) { z3w_close(ffzw[k]); free(ffsl[k]); }
+        for (int k = 0; k < FFZ_PLANES; k++) { z3w_close(ffzw[k]); free(ffsl[k]); }
         free(ffw.done);
         nn_free(ffacc); nn_free(ff8d); nn_host_free(ff8h);
         char p[1400]; snprintf(p, sizeof p, "%s/fields.json", ffz); FILE *f = fopen(p, "w");
         if (!f) { fprintf(stderr, "predict: cannot write %s\n", p); return 1; }
-        fprintf(f, "{\"format\": \"zarr\", \"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.9g, \"axis\": [", (long long)bo[0], (long long)bo[1], (long long)bo[2], ffF[0], ffF[1], ffF[2], ffh, um * (1 << level));
+        fprintf(f, "{\"format\": \"zarr\", \"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.9g, \"recto\": true, \"axis\": [", (long long)bo[0], (long long)bo[1], (long long)bo[2], ffF[0], ffF[1], ffF[2], ffh, um * (1 << level));
         for (int64_t z = 0; z <= bn[0]; z++) { double cy = 0, cx = 0; if (ax.n) axis_at(&ax, (double)(bo[0] + z) * (1 << level), &cy, &cx); fprintf(f, "%s[%.3f, %.3f]", z ? ", " : "", cy / (1 << level) - bo[1], cx / (1 << level) - bo[2]); }
         fprintf(f, "]}\n"); fclose(f);
         fprintf(stderr, "predict: fit fields %dx%dx%d (h %d) written to %s (zarr)\n", ffF[0], ffF[1], ffF[2], ffh, ffz);
@@ -1101,7 +1102,14 @@ int cmd_predict(int argc, char **argv) {
         const int na = (int)bn[0] + 1; float *cyb = malloc(na * sizeof(float)), *cxb = malloc(na * sizeof(float));
         for (int z = 0; z < na; z++) { double cy = 0, cx = 0; if (ax.n) axis_at(&ax, (double)(bo[0] + z) * (1 << level), &cy, &cx); cyb[z] = (float)(cy / (1 << level) - bo[1]); cxb[z] = (float)(cx / (1 << level) - bo[2]); }
         const long long org[3] = {bo[0], bo[1], bo[2]};
-        if (fit_fields_save(ffd, org, ffF, ffh, um * (1 << level), a, cyb, cxb, na)) { fprintf(stderr, "predict: cannot write the fit fields to %s\n", ffd); return 1; }
+        /* Preserve the recto head for local fitting as well as the normal/density/phase heads.
+           acc[11] is already the maximum recto probability over each field cell. */
+        uint8_t *recto = malloc(ffn);
+        if (!recto) return 1;
+        for (size_t i = 0; i < ffn; i++) recto[i] = (uint8_t)lroundf(255.f * fminf(1.f, fmaxf(0.f, acc[11 * ffn + i])));
+        uint8_t *a14[14] = {0}; for (int k = 0; k < 10; k++) a14[k] = a[k];
+        const int saved = fit_fields_save_ex(ffd, org, ffF, ffh, um * (1 << level), a14, 0, recto, cyb, cxb, na); free(recto);
+        if (saved) { fprintf(stderr, "predict: cannot write the fit fields to %s\n", ffd); return 1; }
         fprintf(stderr, "predict: fit fields %dx%dx%d (h %d) written to %s\n", ffF[0], ffF[1], ffF[2], ffh, ffd);
         for (int k = 0; k < 10; k++) free(a[k]);
         free(acc); free(cyb); free(cxb);

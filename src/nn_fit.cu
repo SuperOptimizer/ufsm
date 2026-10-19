@@ -46,12 +46,19 @@ __device__ __forceinline__ float fit_wrap(float a) {   /* into (-pi, pi] */
     return a;
 }
 
+/* a block's per-thread loss parts summed into parts (every FIT_P_* slot but the smoothness, which the lattice kernel owns) */
+__device__ __forceinline__ void fit_reduce_parts(const double *lp, double (*red)[FIT_TPB], double *parts) {
+    for (int k = 0; k < FIT_NPARTS; k++) red[k][threadIdx.x] = lp[k];
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < FIT_NPARTS; k++) red[k][threadIdx.x] += red[k][threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) for (int k = 0; k < FIT_NPARTS; k++) if (k != FIT_P_SMOOTH && red[k][0] != 0.0) atomicAdd(&parts[k], red[k][0]);
+}
 __global__ void fit_loss_k(fit_dev f, double *parts, float *g_delta, float *g_pitch, float *g_offset) {
     __shared__ float sp_pitch[FIT_MAXK], sp_off[FIT_MAXK];
-    __shared__ double red[6][FIT_TPB];
+    __shared__ double red[FIT_NPARTS][FIT_TPB];
     for (int k = threadIdx.x; k < f.nk; k += blockDim.x) { sp_pitch[k] = 0.f; sp_off[k] = 0.f; }
     __syncthreads();
-    double lp[6] = {0, 0, 0, 0, 0, 0};
+    double lp[FIT_NPARTS] = {0};
     const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     const float wv = i < n ? f.w[i] * (1.f / 255.f) : 0.f;
     if (wv > 0.f) {
@@ -68,11 +75,12 @@ __global__ void fit_loss_k(fit_dev f, double *parts, float *g_delta, float *g_pi
             for (int d = 0; d < 3; d++) g[d] = ((q[1 + 2 * d].U - q[2 + 2 * d].U) - sdir * fit_wrap(q[1 + 2 * d].th - q[2 + 2 * d].th) * i2p) / (2.f * e);
             const float W0 = q[0].U - sdir * q[0].th * i2p;
             float dU[7] = {0, 0, 0, 0, 0, 0, 0}, dg[3] = {0, 0, 0};
-            fit_phase_term(&f, i, W0, wv, &lp[1], &dU[0]);
+            fit_phase_term(&f, i, W0, wv, &lp[FIT_P_PHASE], &dU[0]);
+            fit_recto_term(&f, i, W0, wv, &lp[FIT_P_RECTO], &dU[0]);
             fit_grad_terms(&f, i, g, wv, lp, dg);
             fit_pgrad_term(&f, i, g, wv, lp, dg);
             for (int d = 0; d < 3; d++) { dU[1 + 2 * d] += dg[d] / (2.f * e); dU[2 + 2 * d] -= dg[d] / (2.f * e); }
-            lp[0] = lp[1] + lp[2] + lp[3] + lp[4] + lp[5];
+            lp[FIT_P_TOTAL] = lp[FIT_P_PHASE] + lp[FIT_P_NORMAL] + lp[FIT_P_DENSITY] + lp[FIT_P_NONDEG] + lp[FIT_P_PGRAD] + lp[FIT_P_RECTO];
             for (int s = 0; s < 7; s++) {
                 const float du = dU[s];
                 if (du == 0.f) continue;
@@ -88,10 +96,7 @@ __global__ void fit_loss_k(fit_dev f, double *parts, float *g_delta, float *g_pi
             }
         }
     }
-    for (int k = 0; k < 6; k++) red[k][threadIdx.x] = lp[k];
-    __syncthreads();
-    for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 6; k++) red[k][threadIdx.x] += red[k][threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) for (int k = 0; k < 6; k++) atomicAdd(&parts[k], red[k][0]);
+    fit_reduce_parts(lp, red, parts);
     for (int k = threadIdx.x; k < f.nk; k += blockDim.x) {
         if (sp_pitch[k] != 0.f) atomicAdd(&g_pitch[k], sp_pitch[k]);
         if (sp_off[k] != 0.f) atomicAdd(&g_offset[k], sp_off[k]);
@@ -176,7 +181,7 @@ __global__ void fit_accum_k(const LT *lg, const uint8_t *ct, const uint32_t *bit
         v[1] += 1.f; v[2] += 2.f * sg(ch_phase) - 1.f; v[3] += 2.f * sg(ch_phase + 1) - 1.f;
         for (int k = 0; k < 6; k++) v[4 + k] += sg(ch_normal + k) - (k < 3 ? 0.f : 0.5f);
         { const float sd = sg(ch_density); v[10] += (dcode ? fminf(sd, 0.999f) / (1.f - fminf(sd, 0.999f)) : sd) / dscale; }   /* the density code back to rho */
-        rmax = fmaxf(rmax, sg(ch_recto));
+        if (ch_recto >= 0) rmax = fmaxf(rmax, sg(ch_recto));   /* (task unwrap2: no recto head) */
     }
     for (int k = 0; k < 11; k++) red[k][threadIdx.x] = v[k];
     __shared__ float rm[512]; rm[threadIdx.x] = rmax;
@@ -212,7 +217,7 @@ __global__ void fit_accum_cell_k(const LT *lg, const uint8_t *ct, const uint32_t
         v[1] += 1.f; v[2] += 2.f * sg(ch_phase) - 1.f; v[3] += 2.f * sg(ch_phase + 1) - 1.f;
         for (int k = 0; k < 6; k++) v[4 + k] += sg(ch_normal + k) - (k < 3 ? 0.f : 0.5f);
         { const float sd = sg(ch_density); v[10] += (dcode ? fminf(sd, 0.999f) / (1.f - fminf(sd, 0.999f)) : sd) / dscale; }
-        rmax = fmaxf(rmax, sg(ch_recto));
+        if (ch_recto >= 0) rmax = fmaxf(rmax, sg(ch_recto));   /* (task unwrap2: no recto head) */
     }
     if (v[0] > 0.f) {
         const size_t base = ((size_t)fz * F1 + fy) * F2 + fx;
@@ -270,21 +275,87 @@ extern "C" void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo
     nn_fit_accum_d(lg, ct, W, W, halo, halo, tz, ty, tx, box, h, F, ch_recto, ch_phase, ch_normal, ch_density, dscale, 0, acc);
 }
 
+/* the recto plane: accumulator plane 11 (the max recto probability over the cell's material voxels) x255 */
+__global__ void fit_finalize_recto_k(const float *acc, size_t nf, uint8_t *a) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= nf) return;
+    a[i] = (uint8_t)lroundf(255.f * fminf(1.f, fmaxf(0.f, acc[11 * nf + i])));
+}
+extern "C" void nn_fit_finalize_recto(const float *acc, size_t nf, uint8_t *a) { fit_finalize_recto_k<<<nblk(nf, 256), 256>>>(acc, nf, a); KCHECK(); }
+
+/* predict --fit-fields of a task unwrap2 checkpoint: the winding mod 4 head as gauge-free relative planes. Per field cell and axis a
+   (z, y, x) the material-voxel sums of p(v + d e_a) conj p(v), p = (2 sigma - 1) of the cos / sin channels (ch_w4, ch_w4 + 1): the
+   predicted W difference mod 4 over d voxels, inside one window (one gauge). acc: 9 planes of nf cells (re, im, count per axis);
+   needs d <= halo (y, x) and <= hz (z), so v + d e_a stays inside the window. */
+template <typename LT>
+__global__ void fit_accum_w4_k(const LT *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, int bz, int by, int bx, int h,
+                               int fz0, int fy0, int fx0, int nfz, int nfy, int nfx, int F1, int F2, size_t nf, int ch, int dd, float *acc) {
+    const size_t ci = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (ci >= (size_t)nfz * nfy * nfx) return;
+    const int fz = fz0 + (int)(ci / ((size_t)nfy * nfx)), fy = fy0 + (int)(ci / nfx % nfy), fx = fx0 + (int)(ci % nfx);
+    float v[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const size_t w3 = (size_t)D * W * W, st[3] = {(size_t)W * W * dd, (size_t)W * dd, (size_t)dd};
+    auto mat = [&](size_t i) { return bits ? (bits[i >> 5] >> (i & 31)) & 1u : (unsigned)(ct[i] != 0); };
+    for (int t = 0; t < h * h * h; t++) {
+        const int lz = t / (h * h), ly = (t / h) % h, lx = t % h;
+        const int gz = fz * h + lz, gy = fy * h + ly, gx = fx * h + lx, wz = gz - tz, wy = gy - ty, wx = gx - tx;
+        if (gz >= bz || gy >= by || gx >= bx || wz < hz || wz >= D - hz || wy < halo || wy >= W - halo || wx < halo || wx >= W - halo) continue;
+        const size_t i = ((size_t)wz * W + wy) * W + wx;
+        if (!mat(i)) continue;
+        const float pr = 2.f / (1.f + __expf(-lgv(lg, (size_t)ch * w3 + i))) - 1.f, pi = 2.f / (1.f + __expf(-lgv(lg, (size_t)(ch + 1) * w3 + i))) - 1.f;
+        for (int a = 0; a < 3; a++) {
+            const size_t j = i + st[a];
+            if (!mat(j)) continue;
+            const float qr = 2.f / (1.f + __expf(-lgv(lg, (size_t)ch * w3 + j))) - 1.f, qi = 2.f / (1.f + __expf(-lgv(lg, (size_t)(ch + 1) * w3 + j))) - 1.f;
+            v[3 * a] += qr * pr + qi * pi; v[3 * a + 1] += qi * pr - qr * pi; v[3 * a + 2] += 1.f;
+        }
+    }
+    const size_t base = ((size_t)fz * F1 + fy) * F2 + fx;
+    for (int k = 0; k < 9; k++) if (v[k] != 0.f) atomicAdd(&acc[k * nf + base], v[k]);
+}
+extern "C" void nn_fit_accum_w4(const float *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
+                                int ch_w4, int dd, float *acc) {
+    if (dd > halo || dd > hz || dd < 1) { fprintf(stderr, "nn_fit_accum_w4: offset %d outside the halo (%d, z %d)\n", dd, halo, hz); abort(); }
+    int f0[3], f1[3];
+    const int t[3] = {tz, ty, tx}, wn[3] = {D, W, W}, hn[3] = {hz, halo, halo};
+    for (int d = 0; d < 3; d++) {
+        int lo = t[d] + hn[d], hi = t[d] + wn[d] - hn[d]; if (lo < 0) lo = 0; if (hi > box[d]) hi = box[d];
+        f0[d] = lo / h; f1[d] = (hi + h - 1) / h; if (f1[d] > F[d]) f1[d] = F[d];
+        if (f1[d] <= f0[d]) return;
+    }
+    const int nfz = f1[0] - f0[0], nfy = f1[1] - f0[1], nfx = f1[2] - f0[2];
+    const size_t nf = (size_t)F[0] * F[1] * F[2];
+    if (g_logits_h16) fit_accum_w4_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>((const f16 *)lg, ct, bits, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2],
+                                                                                 nfz, nfy, nfx, F[1], F[2], nf, ch_w4, dd, acc);
+    else fit_accum_w4_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>(lg, ct, bits, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2],
+                                                                      nfz, nfy, nfx, F[1], F[2], nf, ch_w4, dd, acc);
+    KCHECK();
+}
+/* the 9 relative planes -> 4 uint8 planes: dz dy dx = the angle of each axis' sum (byte b: W(x + d e_a) - W(x) = b / 64 turns mod 4),
+   dq = 255 x the mean over the axes with pairs of |sum| / pairs (0: no information) */
+__global__ void fit_finalize_w4_k(const float *acc, size_t nf, uint8_t *a) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= nf) return;
+    float q = 0.f; int na = 0;
+    for (int ax = 0; ax < 3; ax++) {
+        const float re = acc[(3 * ax) * nf + i], im = acc[(3 * ax + 1) * nf + i], n = acc[(3 * ax + 2) * nf + i];
+        uint8_t b = 0;
+        if (n > 0.f) { b = (uint8_t)(lrintf(atan2f(im, re) * (256.f / 6.283185307179586f)) & 255); q += fminf(1.f, sqrtf(re * re + im * im) / n); na++; }
+        a[ax * nf + i] = b;
+    }
+    a[3 * nf + i] = na ? (uint8_t)lrintf(255.f * q / na) : 0;
+}
+extern "C" void nn_fit_finalize_w4(const float *acc, size_t nf, uint8_t *a) { fit_finalize_w4_k<<<nblk(nf, 256), 256>>>(acc, nf, a); KCHECK(); }
+
 /* analytic data terms (nn_fit_loss2): one evaluation per voxel (src/fit_terms.h fit_vox2) */
 __global__ void fit_loss2_k(fit_dev f, double *parts, float *g_delta) {
-    __shared__ double red[6][FIT_TPB];
-    double lp[6] = {0, 0, 0, 0, 0, 0};
+    __shared__ double red[FIT_NPARTS][FIT_TPB];
+    double lp[FIT_NPARTS] = {0};
     const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     const float wv = i < n && (f.stride <= 1 || fit_hash((unsigned)i ^ f.salt) % (unsigned)f.stride == 0) ? f.w[i] * (1.f / 255.f) : 0.f;
     if (wv > 0.f) {
-        size_t ic[8]; float gv[8];
-        if (fit_vox2(&f, i, wv, (float)(f.stride > 1 ? f.stride : 1), lp, ic, gv))
-            for (int c = 0; c < 8; c++) if (gv[c] != 0.f) atomicAdd(&g_delta[ic[c]], gv[c]);
+        size_t ic[FIT_VOX2_MAXC]; float gv[FIT_VOX2_MAXC];
+        const int nc = fit_vox2(&f, i, wv, (float)(f.stride > 1 ? f.stride : 1), lp, ic, gv);
+        for (int c = 0; c < nc; c++) if (gv[c] != 0.f) atomicAdd(&g_delta[ic[c]], gv[c]);
     }
-    for (int k = 0; k < 6; k++) red[k][threadIdx.x] = lp[k];
-    __syncthreads();
-    for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 6; k++) red[k][threadIdx.x] += red[k][threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) for (int k = 0; k < 6; k++) atomicAdd(&parts[k], red[k][0]);
+    fit_reduce_parts(lp, red, parts);
 }
 extern "C" void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta) {
     const size_t n = (size_t)f->D * f->H * f->W;

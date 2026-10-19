@@ -61,7 +61,7 @@ static int run_case(int dir) {
         for (int k = 0; k < 6; k++) t[k][i] = (uint8_t)lround(255 * tv[k]);
         double s = 8 / (H8 * rho); sp[i] = (uint8_t)(s < 1 ? 1 : s > 255 ? 255 : lround(s));
     }
-    fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx};
+    fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, {0}, 0, nullptr};
     fit_cfg c = fit_cfg_default(); c.verbose = 1; c.uw_split = g_split; c.uw_tile = g_tile; c.cpu = g_cpu; c.phase_robust = g_robust; c.bend = g_bend; c.w_pgrad = g_pgrad;
     fit_model *m = fit_run(&f, &c);
     int bad = 0;
@@ -94,24 +94,40 @@ static int run_case(int dir) {
         CHECK(acc >= 0.995, "dir %+d: winding ids right %.4f < 0.995", dir, acc);
         CHECK(prec >= 0.99, "dir %+d: |error| < 0.08 at %.4f < 0.99", dir, prec);
     }
-    if (!g_cpu && g_split == 0 && dir > 0) {   /* the CPU and GPU data terms agree (every voxel, the fitted model, the robust phase) */
+    if (!g_cpu && g_split == 0 && dir > 0) {   /* the CPU and GPU data terms agree (every voxel, the fitted model, the robust phase, the
+                                                 winding mod 4 term and the recto anchors on planes made from the true W) */
+        uint8_t *wd = malloc(4 * n), *rc = malloc(n); const int w4d = 24;
+        for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            const size_t i = ((size_t)z * H + y) * W + x; const double pz = (z + 0.5) * H8, py = (y + 0.5) * H8, px = (x + 0.5) * H8, w0 = W_true(pz, py, px);
+            for (int d = 0; d < 3; d++) {
+                double b[3] = {pz, py, px}; b[d] += w4d;
+                double dth = atan2(b[1] - ax_y(b[0]), b[2] - ax_x(b[0])) - atan2(py - ax_y(pz), px - ax_x(pz)); dth -= 2 * M_PI * floor((dth + M_PI) / (2 * M_PI));
+                double q = fmod(U_true(b[0], b[1], b[2]) - U_true(pz, py, px) - dir * dth / (2 * M_PI) + 0.1 * sin(0.3 * i), 4.0); if (q < 0) q += 4;
+                wd[d * n + i] = (uint8_t)(lround(q * 64) & 255);
+            }
+            wd[3 * n + i] = (uint8_t)(128 + (i * 37) % 128);
+            const double fr = w0 - floor(w0 + 0.5); rc[i] = (uint8_t)lround(255 * exp(-fr * fr / (2 * 0.05 * 0.05)));
+        }
         fit_dev fd = {D, H, W, (float)H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, na, m->dir, m->nk, m->knot_dz, m->pitch, m->offset,
-                      m->L, m->lz, m->ly, m->lx, m->delta, 1e-5f, 1e-5f, 1e-5f, 1e-5f, 3.f, 1, 7u, 0.f, 0.f, 0.05f, 1.5f, 1e-5f, 0.25f, nullptr};
-        const size_t nl = (size_t)m->lz * m->ly * m->lx; double ph[7] = {0}, pd[7] = {0}; float *gh = calloc(nl, 4), *gg = malloc(nl * 4);
+                      m->L, m->lz, m->ly, m->lx, m->delta, 1e-5f, 1e-5f, 1e-5f, 1e-5f, 3.f, 1, 7u, 0.f, 0.f, 0.05f, 1.5f, 1e-5f, 0.25f, nullptr,
+                      wd, 1e-5f, (float)w4d, rc, 1e-5f};
+        const size_t nl = (size_t)m->lz * m->ly * m->lx; double ph[FIT_NPARTS] = {0}, pd[FIT_NPARTS] = {0}; float *gh = calloc(nl, 4), *gg = malloc(nl * 4);
         fit_loss2_host(&fd, ph, gh);
-        uint8_t *dv = nn_malloc(10 * n); const uint8_t *hv[10] = {pc, ps, t[0], t[1], t[2], t[3], t[4], t[5], sp, w};
-        for (int k = 0; k < 10; k++) nn_h2d(dv + k * n, hv[k], n);
+        uint8_t *dv = nn_malloc(15 * n); const uint8_t *hv[15] = {pc, ps, t[0], t[1], t[2], t[3], t[4], t[5], sp, w, wd, wd + n, wd + 2 * n, wd + 3 * n, rc};
+        for (int k = 0; k < 15; k++) nn_h2d(dv + k * n, hv[k], n);
         float *dcy = nn_malloc(na * 4), *dcx = nn_malloc(na * 4), *dpi = nn_malloc(m->nk * 4), *dof = nn_malloc(m->nk * 4), *ddl = nn_malloc(nl * 4), *dg = nn_malloc(nl * 4);
-        double *dp = nn_malloc(7 * sizeof(double));
+        double *dp = nn_malloc(FIT_NPARTS * sizeof(double));
         nn_h2d(dcy, cy, na * 4); nn_h2d(dcx, cx, na * 4); nn_h2d(dpi, m->pitch, m->nk * 4); nn_h2d(dof, m->offset, m->nk * 4); nn_h2d(ddl, m->delta, nl * 4);
-        nn_zero(dg, nl * 4); nn_zero(dp, 7 * sizeof(double));
-        fit_dev fg = fd; fg.pc = dv; fg.ps = dv + n; for (int k = 0; k < 6; k++) fg.t[k] = dv + (2 + k) * n; fg.sp = dv + 8 * n; fg.w = dv + 9 * n;
+        nn_zero(dg, nl * 4); nn_zero(dp, FIT_NPARTS * sizeof(double));
+        fit_dev fg = fd; fg.pc = dv; fg.ps = dv + n; for (int k = 0; k < 6; k++) fg.t[k] = dv + (2 + k) * n; fg.sp = dv + 8 * n; fg.w = dv + 9 * n; fg.wd = dv + 10 * n; fg.recto = dv + 14 * n;
         fg.cy = dcy; fg.cx = dcx; fg.pitch = dpi; fg.offset = dof; fg.delta = ddl;
         nn_fit_loss2(&fg, dp, dg); nn_sync(); nn_d2h(pd, dp, sizeof pd); nn_d2h(gg, dg, nl * 4);
         double gmax = 0, dmax = 0; for (size_t k = 0; k < nl; k++) { gmax = fmax(gmax, fabs(gh[k])); dmax = fmax(dmax, fabs(gh[k] - gg[k])); }
-        printf("backends: loss parts cpu %.6g %.6g %.6g %.6g %.6g gpu %.6g %.6g %.6g %.6g %.6g; gradient max |cpu - gpu| %.3g of max %.3g\n",
-               ph[1], ph[2], ph[3], ph[4], ph[5], pd[1], pd[2], pd[3], pd[4], pd[5], dmax, gmax);
-        for (int k = 1; k < 6; k++) CHECK(fabs(ph[k] - pd[k]) <= 1e-3 * fabs(pd[k]) + 1e-9, "loss part %d: cpu %.8g gpu %.8g", k, ph[k], pd[k]);
+        printf("backends: loss parts cpu %.6g %.6g %.6g %.6g %.6g wind4 %.6g recto %.6g gpu %.6g %.6g %.6g %.6g %.6g wind4 %.6g recto %.6g; gradient max |cpu - gpu| %.3g of max %.3g\n",
+               ph[1], ph[2], ph[3], ph[4], ph[5], ph[FIT_P_WIND4], ph[FIT_P_RECTO], pd[1], pd[2], pd[3], pd[4], pd[5], pd[FIT_P_WIND4], pd[FIT_P_RECTO], dmax, gmax);
+        for (int k = 0; k < FIT_NPARTS; k++) if (k != FIT_P_SMOOTH) CHECK(fabs(ph[k] - pd[k]) <= 1e-3 * fabs(pd[k]) + 1e-9, "loss part %d: cpu %.8g gpu %.8g", k, ph[k], pd[k]);
+        CHECK(pd[FIT_P_WIND4] > 0 && pd[FIT_P_RECTO] > 0, "the winding mod 4 / recto terms are inactive (%g %g)", pd[FIT_P_WIND4], pd[FIT_P_RECTO]);
+        free(wd); free(rc);
         CHECK(dmax <= 1e-3 * gmax, "gradient: max |cpu - gpu| %.3g > 1e-3 x %.3g", dmax, gmax);
         nn_free(dv); nn_free(dcy); nn_free(dcx); nn_free(dpi); nn_free(dof); nn_free(ddl); nn_free(dg); nn_free(dp); free(gh); free(gg);
     }

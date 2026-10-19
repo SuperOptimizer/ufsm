@@ -16,7 +16,16 @@ typedef struct {
     const uint8_t *sp;              /* sheet spacing in units of h / 8 (0 = unknown), i.e. 8 / (h rho); native voxels at h = 8 */
     const uint8_t *w;               /* material fraction x255 (0 = no data) */
     const float *cy, *cx;           /* umbilicus per native z of the box, D * h + 1 entries (box-local coordinates) */
+    const uint8_t *wd[4];           /* optional (task unwrap2 fields, nullptr otherwise): the winding mod 4 head as relative planes dz dy dx
+                                       (byte b: W(x + w4_d e_a) - W(x) = b / 64 turns mod 4, measured inside one inference window) and dq
+                                       (x255 confidence, 0 = none) */
+    int w4_d;                       /* their offset d in native voxels */
+    const uint8_t *recto;           /* optional recto probability x255 on the field grid (plane r): high probabilities anchor integer W */
 } fit_fields;
+
+/* loss parts (fit_model loss, the backends' parts arrays): total (data terms + smoothness), phase, normal, density, non-degeneracy,
+   phase gradient, smoothness (lattice), winding mod 4, recto anchors */
+enum { FIT_P_TOTAL, FIT_P_PHASE, FIT_P_NORMAL, FIT_P_DENSITY, FIT_P_NONDEG, FIT_P_PGRAD, FIT_P_SMOOTH, FIT_P_WIND4, FIT_P_RECTO, FIT_NPARTS };
 
 typedef struct {
     int dir;                        /* +1 / -1, 0 = choose the more phase-coherent */
@@ -24,6 +33,8 @@ typedef struct {
     int nstage, lattice[8], steps[8];   /* delta lattice spacing (native voxels) and Adam steps per stage */
     float lr, lr_knot;              /* Adam learning rates for delta and the knots */
     float w_phase, w_normal, w_density, w_nondeg, w_smooth, w_decay;
+    float w_wind4;                  /* the winding mod 4 term (fields with dz dy dx dq planes; analytic loss, phase stages, ramped like the phase) */
+    float w_recto;                  /* recto anchors r^2 (1 - cos 2 pi W) (fields with an r plane; phase stages, ramped like the phase; 0: off) */
     int phase_stage;                /* stages before it fit the gradient terms only (normal, density: no integer ambiguity, they
                                        integrate the turn count); the phase term (periodic) refines from this stage on */
     float phase_ramp;               /* phase_stage: phase weight from phase_ramp * w_phase to w_phase */
@@ -70,7 +81,8 @@ typedef struct fit_model {
     long long origin[3];            /* the box's native origin (set by the caller; saved with the model) */
     double um;                      /* native voxel size (saved; 0 = unknown, read as 2.4) */
     float *cy, *cx;                 /* axis table (D h + 1 entries) */
-    double loss[7];                 /* final loss parts: total, phase, normal, density, nondegeneracy, phase gradient, smoothness */
+    double loss[FIT_NPARTS];        /* final loss parts (FIT_P_*): total, phase, normal, density, nondegeneracy, phase gradient, smoothness,
+                                       winding mod 4, recto */
 } fit_model;
 
 fit_cfg fit_cfg_default(void);
@@ -81,7 +93,13 @@ double fit_W(const fit_model *m, double z, double y, double x);   /* winding coo
 int fit_save(const fit_model *m, const char *dir);
 /* a fit-field directory (the input of ufsm fit): pc ps t0..t5 sp w .raw (shape[0] x shape[1] x shape[2] uint8) and fields.json
    (origin, shape, h, the axis per native z of the box in box-local coordinates, na = shape[0] h + 1 entries) */
-int fit_fields_save(const char *dir, const long long origin[3], const int shape[3], int h, double um, uint8_t *const a[10], const float *cy, const float *cx, int na);   /* um: the native voxel size */   /* dir/model.json, delta.f32 (lattice), axis.f32 (cy then cx) */
+int fit_fields_save(const char *dir, const long long origin[3], const int shape[3], int h, double um, uint8_t *const a[10], const float *cy, const float *cx, int na);   /* um: the native voxel size */
+/* the same plus, with w4_d > 0, the 4 winding mod 4 planes a[10..13] (dz dy dx dq; fields.json "w4_d") */
+int fit_fields_save_w4(const char *dir, const long long origin[3], const int shape[3], int h, double um, uint8_t *const a[14], int w4_d, const float *cy, const float *cx, int na);
+/* the same plus an optional recto plane (r.raw, fields.json "recto": true; nullptr: "recto": false) */
+int fit_fields_save_ex(const char *dir, const long long origin[3], const int shape[3], int h, double um, uint8_t *const a[14], int w4_d, const uint8_t *recto,
+                       const float *cy, const float *cx, int na);
+/* dir/model.json, delta.f32 (lattice), axis.f32 (cy then cx) */
 fit_model *fit_load(const char *dir);
 /* the radius along the ray at box-local z and angle theta from the axis where W = k (bisection between consecutive samples
    with a sign change, the crossing nearest r_hint); returns 0 and sets *r, or -1 when the ray crosses no W = k inside the box */
@@ -103,8 +121,11 @@ typedef struct {
     float w_pgrad, pgrad_delta;
     const float *pg;                        /* pooled fields only: 4 planes Gz Gy Gx c (the phase gradient, turns per native voxel, and its
                                                confidence; null: from pc / ps on the fly) */
+    const uint8_t *wd; float w_w4, w4_d;    /* nn_fit_loss2: the winding mod 4 planes (4 back to back: dz dy dx dq; nullptr none), weight, offset
+                                               (native voxels); its loss in parts[FIT_P_WIND4] */
+    const uint8_t *recto; float w_recto;    /* recto anchors (both kernels; nullptr none); loss in parts[FIT_P_RECTO] */
 } fit_dev;
-/* the data terms over every field voxel: loss parts (double[6]: total, phase, normal, density, nondeg, phase gradient, accumulated)
+/* the data terms over every field voxel: loss parts (double[FIT_NPARTS], FIT_P_*, accumulated; the smoothness slot untouched)
    and the gradients of delta and of the knots (accumulated: zero them first) */
 void nn_fit_loss(const fit_dev *f, double *parts, float *g_delta, float *g_pitch, float *g_offset);
 /* the same data terms with grad W analytic (trilinear delta, the prior's and theta's derivatives, the axis slope) at the voxel
@@ -120,6 +141,14 @@ void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo, int tz, i
                   int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, float *acc);   /* dscale: the checkpoint's density_scale */
 /* the 12 accumulator planes of nf cells -> the 10 uint8 fit-field planes (pc ps t0..t5 sp w, nf apart), on the device */
 void nn_fit_finalize(const float *acc, size_t nf, int h, uint8_t *a);
+/* the recto plane r (x255, the max recto probability per cell: accumulator plane 11) into a (nf bytes), on the device */
+void nn_fit_finalize_recto(const float *acc, size_t nf, uint8_t *a);
+/* task unwrap2 checkpoints: the winding mod 4 head (channels ch_w4, ch_w4 + 1) of a window pooled into 9 relative accumulator planes
+   (per axis the sums of p(v + d e_a) conj p(v) and their count, p the decoded cos / sin; d <= halo, hz), and those into the 4 uint8
+   planes dz dy dx dq (nf apart) */
+void nn_fit_accum_w4(const float *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
+                     int ch_w4, int d, float *acc);
+void nn_fit_finalize_w4(const float *acc, size_t nf, uint8_t *a);
 /* the same for a D x W x W window with interior planes [hz, D - hz) (predict --window-z slabs); nn_fit_accum = D W, hz halo */
 void nn_fit_accum_d(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
                     int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc);
@@ -135,7 +164,8 @@ void nn_fit_grid(const fit_dev *ms, const fit_grid_row *rows, int nz, int ny, in
    rows [fz0, fz1) (fz1 <= 0: to the end), pooled by pool per axis (1: none; pooled phase vectors are left uninformative, so
    pooled fields are for the gradient-only stages; 0: the geometry and the whole axis table only, no arrays). The slab's native origin (box-local) is (fz0 h, 0, 0); f.cy / f.cx are the
    slab's axis table (box-local y, x). */
-typedef struct { fit_fields f; uint8_t *a[10]; float *cy, *cx; long long origin[3]; int shape[3]; int h; double um; } fit_fields_buf;   /* um: native voxel size (fields.json "um", default 2.4) */
+typedef struct { fit_fields f; uint8_t *a[15]; float *cy, *cx; long long origin[3]; int shape[3]; int h; double um; } fit_fields_buf;   /* um: native voxel size (fields.json "um", default 2.4);
+                                                       a: pc ps t0..t5 sp w, then (unpooled loads, when present) dz dy dx dq (w4_d > 0) and r (recto) */
 int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b);
 void fit_fields_free(fit_fields_buf *b);
 
@@ -144,6 +174,9 @@ typedef struct { fit_model *global; int n; fit_model **slab; double *z0, *z1, bl
 const fit_model *fit_set_model(const fit_set *s, double z, double *zoff);   /* the model for box-local z, and its z offset */
 double fit_set_W(const fit_set *s, double z, double y, double x);
 int fit_set_ray_root(const fit_set *s, double z, double theta, double k, double r_hint, double *r);   /* fit_ray_root of the set (global box, axis, pitch) */
+/* grad W of the set at a box-local native point by central differences over +-e (theta continued across its cut, so the gradient
+   is that of the smooth U - dir theta / 2 pi); returns |grad W| (turns per native voxel) */
+double fit_set_gradW(const fit_set *s, double z, double y, double x, double e, double g[3]);
 int fit_set_save(const fit_set *s, const char *dir);   /* dir/global, dir/slabNNN, dir/set.json */
 fit_set *fit_set_load(const char *dir);                 /* a set directory or a single model directory */
 void fit_set_free(fit_set *s);

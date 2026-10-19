@@ -147,6 +147,9 @@ test-all: $(B)/test_stitch
 $(B)/test_coreline: tests/test_coreline.c $(B)/coreline.o $(B)/fit.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_coreline
+$(B)/test_fit_w4: tests/test_fit_w4.c $(B)/fit.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_fit_w4
 
 $(B)/test_tiffw: tests/test_tiffw.c $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
@@ -296,6 +299,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_surf
 	./$(B)/test_stitch
 	./$(B)/test_coreline
+	./$(B)/test_fit_w4
 	./$(B)/test_tiffw
 	./$(B)/test_edt
 	./$(B)/test_volcomp

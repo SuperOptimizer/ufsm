@@ -338,9 +338,54 @@ static void *ss_rows(void *arg) {   /* phase residual and confidence at each ver
     return nullptr;
 }
 static int cmp_f32(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
+/* ---- faults of a fit on the field grid: cells (every stride-th per axis, material, known spacing) where |grad W| > ratio x the
+   fields' sheet density rho = 8 / (h sp): the fit crams turns there (a fault), counted and kept as a mask for the clean-sheet test ---- */
+typedef struct {
+    const sf_fields *F; const uint8_t *w; const fit_set *ms; int st, n[3]; double ratio, off[3];
+    uint8_t *fault; _Atomic int next; _Atomic long long ncell, nfault; float *rs; _Atomic long long nrs; long long caprs;
+} sf_fault_job;
+static void *sf_fault_rows(void *arg) {
+    sf_fault_job *J = arg; const sf_fields *F = J->F; long long nc = 0, nf = 0;
+    for (int a; (a = atomic_fetch_add(&J->next, 1)) < J->n[0];) for (int b = 0; b < J->n[1]; b++) for (int c = 0; c < J->n[2]; c++) {
+        const int z = a * J->st, y = b * J->st, x = c * J->st; const size_t i = ((size_t)z * F->H + y) * F->W + x;
+        if (!J->w[i] || !F->sp[i]) continue;
+        double g[3]; const double rho = 8.0 / (F->h * F->sp[i]);
+        const double gl = fit_set_gradW(J->ms, (z + 0.5) * F->h + J->off[0], (y + 0.5) * F->h + J->off[1], (x + 0.5) * F->h + J->off[2], F->h / 2, g);
+        nc++; const int bad = gl > J->ratio * rho; nf += bad; J->fault[((size_t)a * J->n[1] + b) * J->n[2] + c] = bad ? 2 : 1;
+        const long long k = atomic_fetch_add(&J->nrs, 1); if (k < J->caprs) J->rs[k] = (float)(gl / rho);
+    }
+    atomic_fetch_add(&J->ncell, nc); atomic_fetch_add(&J->nfault, nf);
+    return nullptr;
+}
+/* the largest 4-connected component of clean vertices (mask 1) of a wrap: its area in cm^2 (quads of the grid, um^2 from the vertex
+   coordinates) */
+static double sf_largest_clean(const sf_wrap *s, const uint8_t *clean, double *total) {
+    const int w = s->w, h = s->h; const size_t n = (size_t)w * h; int *lab = malloc(n * sizeof(int)), *stk = malloc(n * sizeof(int));
+    for (size_t i = 0; i < n; i++) lab[i] = -1;
+    double best = 0, tot = 0; const double u2 = s->um * s->um * 1e-8;   /* wrap voxel^2 -> cm^2 */
+    for (size_t i0 = 0; i0 < n; i0++) {
+        if (!clean[i0] || lab[i0] >= 0) continue;
+        int sp = 0; stk[sp++] = (int)i0; lab[i0] = (int)i0; double area = 0;
+        while (sp) {
+            const int i = stk[--sp], r = i / w, c = i % w;
+            if (c + 1 < w && r + 1 < h && clean[i + 1] && clean[i + w]) {   /* the quad to the right and down: |du x dv| */
+                const double du[3] = {s->Z[i + 1] - s->Z[i], s->Y[i + 1] - s->Y[i], s->X[i + 1] - s->X[i]}, dv[3] = {s->Z[i + w] - s->Z[i], s->Y[i + w] - s->Y[i], s->X[i + w] - s->X[i]};
+                const double cx = du[1] * dv[2] - du[2] * dv[1], cy = du[2] * dv[0] - du[0] * dv[2], cz = du[0] * dv[1] - du[1] * dv[0];
+                area += sqrt(cx * cx + cy * cy + cz * cz) * u2;
+            }
+            const int nb[4] = {c > 0 ? i - 1 : -1, c + 1 < w ? i + 1 : -1, r > 0 ? i - w : -1, r + 1 < h ? i + w : -1};
+            for (int k = 0; k < 4; k++) if (nb[k] >= 0 && clean[nb[k]] && lab[nb[k]] < 0) { lab[nb[k]] = (int)i0; stk[sp++] = nb[k]; }
+        }
+        tot += area; if (area > best) best = area;
+    }
+    free(lab); free(stk); *total = tot;
+    return best;
+}
 int cmd_surf_stats(int argc, char **argv) {
     if (argc < 3 || !sopt(argc, argv, "--fields", nullptr)) {
-        fprintf(stderr, "usage: ufsm surf-stats <wraps-dir> --fields DIR [--model FIT] [--min-conf 0.3] [--gap 1] [--min-run 100] [--ct ROOT KEY --ct-um U [--ct-level 80] [--ct-range 15] [--cache DIR]] [--threads 16] [--per-wrap]\n"); return 2;
+        fprintf(stderr, "usage: ufsm surf-stats <wraps-dir> --fields DIR [--model FIT [--fault-ratio 3] [--fault-stride 2]] [--min-conf 0.3] [--gap 1] [--min-run 100] [--ct ROOT KEY --ct-um U [--ct-level 80] [--ct-range 15] [--cache DIR]] [--threads 16] [--per-wrap]\n"
+                        "  with --model: faults (field cells with |grad W| > fault-ratio x the fields' sheet density) and the largest clean sheet: per wrap the largest\n"
+                        "  connected patch of vertices that are clean (outside faults, wrap spacing 0.5..1.5 x the fields', phase residual < 0.25 where confident, on papyrus with --ct)\n"); return 2;
     }
     const double cmin = atof(sopt(argc, argv, "--min-conf", "0.3")), gap_um = atof(sopt(argc, argv, "--gap", "1")) * 1000, min_um = atof(sopt(argc, argv, "--min-run", "100"));
     const int nt = atoi(sopt(argc, argv, "--threads", "16")), per = sflag(argc, argv, "--per-wrap");
@@ -353,6 +398,22 @@ int cmd_surf_stats(int argc, char **argv) {
     fit_set *ms = sopt(argc, argv, "--model", nullptr) ? fit_set_load(sopt(argc, argv, "--model", "")) : nullptr;   /* orients the normals */
     if (sopt(argc, argv, "--model", nullptr) && !ms) { fprintf(stderr, "surf-stats: cannot load the model %s\n", sopt(argc, argv, "--model", "")); return 1; }
     char (*names)[256] = nullptr; const int nn = sf_names(argv[2], &names); if (nn <= 0) { fprintf(stderr, "surf-stats: no wraps in %s\n", argv[2]); return 1; }
+    /* faults on the field grid (with the model) */
+    sf_fault_job FJ; memset(&FJ, 0, sizeof FJ); uint8_t *wfield = nullptr;
+    if (ms) {
+        int shp[3]; wfield = fit_field_array(sopt(argc, argv, "--fields", ""), "w", 1, shp);
+        if (!wfield) { fprintf(stderr, "surf-stats: cannot read the material plane\n"); return 1; }
+        FJ.F = &F; FJ.w = wfield; FJ.ms = ms; FJ.st = atoi(sopt(argc, argv, "--fault-stride", "2")); FJ.ratio = atof(sopt(argc, argv, "--fault-ratio", "3"));
+        if (FJ.st < 1) FJ.st = 1;
+        for (int d = 0; d < 3; d++) FJ.off[d] = (double)(F.org[d] - ms->global->origin[d]);
+        FJ.n[0] = (F.D + FJ.st - 1) / FJ.st; FJ.n[1] = (F.H + FJ.st - 1) / FJ.st; FJ.n[2] = (F.W + FJ.st - 1) / FJ.st;
+        FJ.fault = calloc((size_t)FJ.n[0] * FJ.n[1] * FJ.n[2], 1); FJ.caprs = 1 << 22; FJ.rs = malloc(FJ.caprs * sizeof(float));
+        pthread_t th[64]; const int m = nt < 64 ? nt : 64; for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, sf_fault_rows, &FJ); for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
+        const long long nr = FJ.nrs < FJ.caprs ? FJ.nrs : FJ.caprs; if (nr) qsort(FJ.rs, nr, 4, cmp_f32);
+        printf("surf-stats: faults (field cells every %d with |grad W| > %.1f x the sheet density): %lld of %lld cells, share %.4f; |grad W| / density median %.2f p10 %.2f p90 %.2f\n",
+               FJ.st, FJ.ratio, (long long)FJ.nfault, (long long)FJ.ncell, FJ.ncell ? (double)FJ.nfault / FJ.ncell : 0, nr ? FJ.rs[nr / 2] : 0, nr ? FJ.rs[nr / 10] : 0, nr ? FJ.rs[nr * 9 / 10] : 0);
+    }
+    double clean_best = 0, clean_tot = 0; char clean_name[256] = "";
     /* the CT profile: offsets -30..30 um at the CT voxel (on-papyrus: the max over |t| <= ctR) */
     const double ctstep = ctum > 0 ? ctum : 1; const int nprof = ctum > 0 ? 2 * (int)ceil(30 / ctstep) + 1 : 0;
     double *prof = calloc(nprof + 1, sizeof(double)); size_t *pcount = calloc(nprof + 1, sizeof(size_t)), on = 0, onn = 0, ctn = 0, ctlow = 0;
@@ -389,9 +450,18 @@ int cmd_surf_stats(int argc, char **argv) {
             }
         }
         size_t wv = 0, wc = 0, wb = 0, won = 0, wct = 0; float *we = malloc(n * 4); size_t wne = 0;
+        uint8_t *clean = ms ? calloc(n, 1) : nullptr;   /* clean vertices (the largest clean sheet) */
         for (size_t i = 0; i < n; i++) {
             if (s.Z[i] < 0) continue;
             wv++;
+            int vclean = 1;
+            if (clean) {
+                if (!isnan(sr[i]) && (sr[i] < 0.5f || sr[i] > 1.5f)) vclean = 0;   /* (no next wrap found: unknown, kept) */
+                if (cf[i] >= cmin && fabsf(e[i]) >= 0.25f) vclean = 0;
+                double q[3]; sf_native(&s, &F, i, q, nullptr, 1); int fc[3], inb = 1;
+                for (int d = 0; d < 3; d++) { fc[d] = (int)floor(q[d] / F.h) / FJ.st; if (fc[d] < 0 || fc[d] >= FJ.n[d]) inb = 0; }
+                if (inb && FJ.fault[((size_t)fc[0] * FJ.n[1] + fc[1]) * FJ.n[2] + fc[2]] == 2) vclean = 0;
+            }
             if (sr && !isnan(sr[i])) { nsr++; srlo += sr[i] < 0.5f; srhi += sr[i] > 1.5f; if (i % 7 == 0) { if (nsa == capsa) { capsa *= 2; srall = realloc(srall, capsa * 4); } srall[nsa++] = sr[i]; } }
             if (i % 7 == 0) { if (ncf == capc) { capc *= 2; cfall = realloc(cfall, capc * 4); } cfall[ncf++] = cf[i]; }
             if (cf[i] >= cmin) { wc++; const float a = fabsf(e[i]); we[wne++] = a; wb += a > 0.25f; }
@@ -400,6 +470,7 @@ int cmd_surf_stats(int argc, char **argv) {
                 for (int q = 0; q < nprof; q++) { const float v = ct[i * nprof + q]; if (isnan(v)) continue; prof[q] += v; pcount[q]++; const double t = (q - (nprof - 1) / 2.0) * ctstep; if (fabs(t) <= ctR + 1e-9) { mx = fmax(mx, v); any = 1; } }
                 const float v0 = ct[i * nprof + (nprof - 1) / 2];
                 if (any) { wct++; won += mx >= ctlev; }
+                if (!any || mx < ctlev) vclean = 0;
                 if (!isnan(v0)) { ctsum += v0; ctn++; ctlow += v0 < ctlev; }
             }
             double N0[3], N1[3];   /* the angle to the right and lower neighbours' normals */
@@ -410,6 +481,12 @@ int cmd_surf_stats(int argc, char **argv) {
                 if (na == capa) { capa *= 2; aall = realloc(aall, capa * 4); }
                 aall[na++] = (float)ang; nang++; nang30 += ang > 30;
             }
+            if (clean) clean[i] = (uint8_t)vclean;
+        }
+        if (clean) {
+            double tot; const double best = sf_largest_clean(&s, clean, &tot); clean_tot += tot;
+            if (best > clean_best) { clean_best = best; snprintf(clean_name, sizeof clean_name, "%s", s.name); }
+            free(clean);
         }
         ss_stat S[2] = {{0}}; const int mx = s.w > s.h ? s.w : s.h; int *sb = malloc((mx + 1) * sizeof(int)); double *lb = malloc((mx + 1) * sizeof(double)); float *ub = malloc((mx + 1) * 4);
         for (int d = 0; d < 2; d++) { ss_walk(&s, e, cf, cmin, d, gap_um, min_um, &S[d], sb, lb, ub); A[d].path += S[d].path; A[d].sw += S[d].sw; A[d].runs += S[d].runs; }
@@ -434,6 +511,8 @@ int cmd_surf_stats(int argc, char **argv) {
         printf("surf-stats: spacing to the next wrap outward / the fields' sheet spacing: median %.2f p10 %.2f p90 %.2f; < 0.5 (wraps bunched: a lost turn) %.4f, > 1.5 (a gained turn) %.4f\n",
                srall[nsa / 2], srall[nsa / 10], srall[nsa * 9 / 10], (double)srlo / nsr, (double)srhi / nsr); }
     printf("surf-stats: adjacent normals: angle median %.2f p90 %.2f deg, > 30 deg %.5f\n", na ? aall[na / 2] : 0, na ? aall[na * 9 / 10] : 0, nang ? (double)nang30 / nang : 0);
+    if (ms) printf("surf-stats: clean sheet (outside faults, spacing 0.5..1.5, |e| < 0.25 where confident%s): largest %.3f cm2 (%s), all clean patches %.2f cm2\n",
+                   nprof ? ", on papyrus" : "", clean_best, clean_name, clean_tot);
     if (nprof) {
         printf("surf-stats: CT: on papyrus (max CT within +-%.0f um along the normal >= %.0f) %.3f; at the vertex mean %.1f, below %.0f %.3f\n",
                ctR, ctlev, onn ? (double)on / onn : 0, ctn ? ctsum / ctn : 0, ctlev, ctn ? (double)ctlow / ctn : 0);
@@ -442,5 +521,6 @@ int cmd_surf_stats(int argc, char **argv) {
         printf("\n");
     }
     free(eall); free(aall); free(cfall); free(srall); free(prof); free(pcount); free(names); sff_free(&F); fit_set_free(ms); if (cz) z3_close(cz);
+    free(wfield); free(FJ.fault); free(FJ.rs);
     return 0;
 }
