@@ -1201,6 +1201,8 @@ static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shif
     tp_put(ph, N); free(j0); free(tf);
     return 0;
 }
+/* a stored phase / winding read against the convention (sources "phase_sign": -1): codes 0..251 negated mod 252, unknown kept */
+static void phase_negate(uint8_t *p, size_t n) { for (size_t k = 0; k < n; k++) if (p[k] < PHASE_PERIOD && p[k]) p[k] = (uint8_t)(PHASE_PERIOD - p[k]); }
 static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint8_t *side) {   /* a: s->phase, or s->wind (same grid); D x P x P */
     if (shift >= 2) return phase_window_interp(a, o, D, P, shift, side);
     int64_t lo[3], ln[3], ro[3], rn[3]; const int wn[3] = {D, P, P};
@@ -2033,6 +2035,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             uint8_t *sw = tp_get(p3 + 64, 0);   /* (+ 64: warp_phase_w4 reads byte pairs as 32-bit words) */
             uint16_t *wq = nullptr;   /* warped --task unwrap2: the winding and its component for warp_phase_w4 (one pass with the phase) */
             if (!sw || phase_window(s->phase, o, Pz, P, pshift, sw)) { tp_put(sw, p3 + 64); return -1; }
+            if (s->phase_sign < 0) phase_negate(sw, p3);   /* (before the winding mod 4: it unwraps this phase) */
             if (c->wind4) {   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
                 uint8_t *pw = tp_get(p3, 0), *ww = tp_get(p3, 0), *wc = tp_get(p3, 0);
                 if (!pw || !ww || !wc) { tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1; }
@@ -2111,6 +2114,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         if (!ww || !ws) { tp_put(ww, p3); tp_put(ws, p3); return -1; }
         if (stored_phase && s->wind) {
             if (phase_window(s->wind, o, Pz, P, pshift, ww)) { tp_put(ww, p3); tp_put(ws, p3); return -1; }
+            if (s->phase_sign < 0) phase_negate(ww, p3);   /* the winding mod 14 turns in the same encoding: W -> -W */
             for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) ww[k] = 255;
         } else memset(ww, 255, p3);
         sym_u8(ww, ws, Pz, P, y);
