@@ -592,3 +592,95 @@ extern "C" void nn_aff_loss_async(const float *logits, shape5 s, int c0, const u
 }
 /* host copy of the per-channel [bce, dice, wdiff, ...] (6 floats per channel) */
 extern "C" void nn_aff_loss_fetch(const float *fin, int K, float *out) { CK(cudaMemcpy(out, fin, (size_t)K * 6 * sizeof(float), cudaMemcpyDeviceToHost)); }
+
+/* ---- train --task unwrap2: the gauge-free winding mod 4 loss (nn.h nn_wind4_*) ----
+   Two logits (a, b) per voxel predict 0.5 + 0.5 cos / sin (2 pi W / 4); the target angle is theta = 2 pi w4 / 252 (w4: W mod 4 in 63
+   codes per turn). The gauge (W's integer part) is arbitrary per component, so the loss of component c is the soft BCE against the
+   target rotated by the best of the four quarter turns g (W + g): bce_g = sum m [sp(a) + sp(b) - 0.5 (a + b) - 0.5 R_g], with
+   R_0 = a cos + b sin, R_1 = b cos - a sin, R_2 = -R_0, R_3 = -R_1, so per component only N, S0 = sum m (sp(a) + sp(b)), H = sum m 0.5
+   (a + b), X = sum m 0.5 R_0, Y = sum m 0.5 R_1 and the accuracy counts A_k (the predicted angle within 1/8 turn mod 4 of theta + k
+   pi / 2) are summed: W4_NS per component. */
+#define W4_NC 15
+#define W4_NS 9
+template <typename LT> __global__ void w4_stats_k(const LT *la, const LT *lb, const uint8_t *w4, const uint8_t *cp, const uint8_t *m, size_t n, double *ds) {
+    __shared__ float sh[W4_NC * W4_NS];
+    for (int k = threadIdx.x; k < W4_NC * W4_NS; k += blockDim.x) sh[k] = 0.f;
+    __syncthreads();
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        const unsigned c = cp[i], t = w4[i], mw = m[i];
+        if (c >= W4_NC || t >= 252u || !mw) continue;
+        const float a = lgv(la, i), b = lgv(lb, i), w = (float)mw;
+        float st, ct; sincosf(6.283185307179586f * (float)t * (1.f / 252.f), &st, &ct);
+        const float spa = fmaxf(a, 0.f) + log1pf(__expf(-fabsf(a))), spb = fmaxf(b, 0.f) + log1pf(__expf(-fabsf(b)));
+        float *s = sh + c * W4_NS;
+        atomicAdd(&s[0], w); atomicAdd(&s[1], w * (spa + spb)); atomicAdd(&s[2], w * 0.5f * (a + b));
+        atomicAdd(&s[3], w * 0.5f * (a * ct + b * st)); atomicAdd(&s[4], w * 0.5f * (b * ct - a * st));
+        const float pa = 2.f / (1.f + __expf(-a)) - 1.f, pb = 2.f / (1.f + __expf(-b)) - 1.f;
+        /* the predicted rotation relative to the target in quarter turns, rounded: k = round(4 (phi - theta) / 2 pi) mod 4 */
+        const float e = atan2f(pb * ct - pa * st, pa * ct + pb * st);   /* phi - theta in (-pi, pi] */
+        const int k = ((int)lrintf(e * (2.f / 3.14159265358979f)) % 4 + 4) % 4;
+        atomicAdd(&s[5 + k], w);
+    }
+    __syncthreads();
+    for (int k = threadIdx.x; k < W4_NC * W4_NS; k += blockDim.x) if (sh[k] != 0.f) atomicAdd(&ds[k], (double)sh[k]);
+}
+/* per component the best gauge g* (largest of X, Y, -X, -Y); out: [0] loss (mean per channel of the best-gauge BCE over the
+   supervised voxels), [1] accuracy (fraction with the predicted turn right at g*), [2] N, [3] 1 / N (0 when none), [4] components,
+   [5] the same BCE at the worst gauge (a gauge-blind net has [0] == [5]), [8 + c] g* of component c */
+__global__ void w4_fin_k(const double *ds, float *out) {
+    if (threadIdx.x || blockIdx.x) return;
+    double N = 0, L = 0, Lw = 0, A = 0; int nc = 0;
+    for (int c = 0; c < W4_NC; c++) {
+        const double *s = ds + c * W4_NS;
+        out[8 + c] = 0.f;
+        if (s[0] <= 0) continue;
+        const double R[4] = {s[3], s[4], -s[3], -s[4]};
+        int g = 0, gw = 0; for (int k = 1; k < 4; k++) { if (R[k] > R[g]) g = k; if (R[k] < R[gw]) gw = k; }
+        N += s[0]; L += s[1] - s[2] - R[g]; Lw += s[1] - s[2] - R[gw]; A += s[5 + g]; nc++;
+        out[8 + c] = (float)g;
+    }
+    out[0] = N > 0 ? (float)(L / (2 * N)) : 0.f; out[1] = N > 0 ? (float)(A / N) : 0.f; out[2] = (float)N; out[3] = N > 0 ? (float)(1 / N) : 0.f;
+    out[4] = (float)nc; out[5] = N > 0 ? (float)(Lw / (2 * N)) : 0.f; out[6] = out[7] = 0.f;
+}
+template <typename GT, typename LT> __global__ void w4_grad_k(const LT *la, const LT *lb, const uint8_t *w4, const uint8_t *cp, const uint8_t *m, size_t n,
+                                                             const float *fin, float scale, GT *ga, GT *gb) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const unsigned c = cp[i], t = w4[i], mw = m[i];
+    float da = 0.f, db = 0.f;
+    if (c < W4_NC && t < 252u && mw) {
+        const float a = lgv(la, i), b = lgv(lb, i);
+        const int g = (int)fin[8 + c];
+        float st, ct; sincosf(6.283185307179586f * ((float)t * (1.f / 252.f) + 0.25f * (float)g), &st, &ct);   /* the target rotated by g quarter turns */
+        const float k = (float)mw * 0.5f * fin[3] * scale;   /* mean over the two channels and the supervised voxels */
+        da = k * (1.f / (1.f + __expf(-a)) - (0.5f + 0.5f * ct)); db = k * (1.f / (1.f + __expf(-b)) - (0.5f + 0.5f * st));
+    }
+    ga[i] = f2h<GT>(da); gb[i] = f2h<GT>(db);   /* (in place over the logits: each thread reads its two logits first) */
+}
+extern "C" size_t nn_wind4_scratch(void) { return (8 + W4_NC) * sizeof(float); }
+extern "C" void nn_wind4_stats(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, double *ds) {
+    const unsigned nb = (unsigned)(n / 2048 + 1 < 1024 ? n / 2048 + 1 : 1024);
+    if (g_logits_h16) w4_stats_k<f16><<<nb, 256>>>((const f16 *)la, (const f16 *)lb, w4, comp, m, n, ds);
+    else w4_stats_k<float><<<nb, 256>>>((const float *)la, (const float *)lb, w4, comp, m, n, ds);
+    KCHECK();
+}
+extern "C" void nn_wind4_fin(double *ds, float *out) {
+    zs_reduce(ds, W4_NC * W4_NS);   /* spatial split: both halves' sums (halo planes masked by the caller), the same gauges */
+    w4_fin_k<<<1, 32>>>(ds, out);
+    KCHECK();
+}
+extern "C" void nn_wind4_grad(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, const float *fin, float lambda, void *ga, void *gb) {
+    const unsigned g = nblk(n, 256);
+#define W4G(GT, LT, s) w4_grad_k<GT, LT><<<g, 256>>>((const LT *)la, (const LT *)lb, w4, comp, m, n, fin, (s), (GT *)ga, (GT *)gb)
+    if (g_logits_h16) { if (!g_loss_g16) W4G(float, f16, lambda); else if (g_h16) W4G(f16, f16, lambda * g_gscale); else VERIFY_ONLY(W4G(bf16, f16, lambda * g_gscale)); }
+    else { if (!g_loss_g16) W4G(float, float, lambda); else if (g_h16) W4G(f16, float, lambda * g_gscale); else VERIFY_ONLY(W4G(bf16, float, lambda * g_gscale)); }
+#undef W4G
+    KCHECK();
+}
+/* the whole loss in one call (whole windows): ds (W4_NC * W4_NS doubles) zeroed, stats, gauges, gradient (ga / gb nullptr: none) */
+extern "C" void nn_wind4_loss(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, double *ds, float *fin, float lambda, void *ga, void *gb) {
+    cudaMemsetAsync(ds, 0, W4_NC * W4_NS * sizeof(double));
+    nn_wind4_stats(la, lb, w4, comp, m, n, ds);
+    nn_wind4_fin(ds, fin);
+    if (ga) nn_wind4_grad(la, lb, w4, comp, m, n, fin, lambda, ga, gb);
+}

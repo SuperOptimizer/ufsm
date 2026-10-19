@@ -209,10 +209,12 @@ static batch alloc_batch(const sample_cfg *c) {
     b.pm = c->pmask ? halloc((size_t)c->B * p3) : nullptr;
     b.wind = c->cond ? halloc((size_t)c->B * p3) : nullptr;
     b.pap = c->pap_head ? halloc((size_t)c->B * p3) : nullptr;
+    b.w4 = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
+    b.wcomp = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b) { if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -1313,6 +1315,40 @@ static void warp_phase(const uint8_t *src, uint8_t *dst, int P, sym sy, const sp
     free(table);
 }
 
+/* --task unwrap2: the winding mod 4 (w4, 63 codes per turn) and its component through the warp as warp_phase pulls the phase: each
+   output voxel takes the component of its nearest source voxel and the phasor mean (period 4 turns) of the 8 neighbours in that
+   component (unknown under half the weight), so two gauges never mix */
+static void warp_w4(const uint8_t *w4, const uint8_t *cp, uint8_t *dw, uint8_t *dc, int P, sym sy, const spatial_aug *a) {
+    static float cs[PHASE_PERIOD], sn[PHASE_PERIOD]; static _Atomic int init;
+    if (!atomic_load(&init)) { for (int k = 0; k < PHASE_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); sn[k] = (float)sin(2 * M_PI * k / PHASE_PERIOD); } atomic_store(&init, 1); }
+    float *table = malloc(6 * (size_t)P * sizeof *table); if (!table) abort();
+    spatial_aug_tables(a, table);
+    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
+        const size_t k = ((size_t)z * P + y) * P + x;
+        float u[3], jac[3], v[3]; spatial_aug_pull(a, table, z, y, x, u, jac);
+        for (int d = 0; d < 3; d++) v[sy.perm[d]] = sy.flip[d] ? P - 1 - u[d] : u[d];
+        int inside = 1; for (int d = 0; d < 3; d++) if (v[d] < 0 || v[d] > P - 1) inside = 0;
+        dw[k] = 255; dc[k] = 255;
+        if (!inside) continue;
+        int base[3]; float f[3];
+        for (int d = 0; d < 3; d++) { base[d] = (int)v[d]; if (base[d] >= P - 1) base[d] = P - 2; f[d] = v[d] - base[d]; }
+        const int c0 = cp[((size_t)(base[0] + (f[0] >= .5f)) * P + base[1] + (f[1] >= .5f)) * P + base[2] + (f[2] >= .5f)];
+        if (c0 == 255) continue;
+        float sx = 0.f, s_y = 0.f, wk = 0.f;
+        for (int c = 0; c < 8; c++) {
+            const int bz = c >> 2 & 1, by = c >> 1 & 1, bx = c & 1;
+            const float w = (bz ? f[0] : 1 - f[0]) * (by ? f[1] : 1 - f[1]) * (bx ? f[2] : 1 - f[2]);
+            const size_t j = ((size_t)(base[0] + bz) * P + base[1] + by) * P + base[2] + bx;
+            if (w <= 1e-7f || cp[j] != c0 || w4[j] >= PHASE_PERIOD) continue;
+            sx += w * cs[w4[j]]; s_y += w * sn[w4[j]]; wk += w;
+        }
+        if (wk < .5f || sx * sx + s_y * s_y < 1e-8f) continue;
+        float t = atan2f(s_y, sx) * (float)(PHASE_PERIOD / (2 * M_PI)); if (t < 0) t += PHASE_PERIOD;
+        const int q = (int)lrintf(t); dw[k] = (uint8_t)(q >= PHASE_PERIOD ? q - PHASE_PERIOD : q); dc[k] = (uint8_t)c0;
+    }
+    free(table);
+}
+
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
@@ -1745,6 +1781,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         if (spatial.active) memset(b->pap + (size_t)i * p3, 255, p3); else sym_u8(papc, b->pap + (size_t)i * p3, Pz, P, y);
         tp_put(papc, p3);
     }
+    if (c->wind4) { memset(b->w4 + (size_t)i * p3, 255, p3); memset(b->wcomp + (size_t)i * p3, 255, p3); }   /* (set below from a stored phase) */
     if (c->band || c->side) {   /* band labels: computed on the source grid, unknown on CT air, then the same symmetry as CT and targets */
         if (!band_sample || (spatial.active && !stored_phase)) {   /* no band labels: affinities (and sides) unsupervised */
             if (c->band) memset(b->band + (size_t)i * p3, BAND_UNKNOWN, p3);
@@ -1752,6 +1789,17 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         } else if (stored_phase) {   /* the stored phase (ufsm phase-raster, ufsm downsample --mode phase) */
             uint8_t *sw = tp_get(p3, 0);
             if (!sw || phase_window(s->phase, o, Pz, P, pshift, sw)) { tp_put(sw, p3); return -1; }
+            if (c->wind4) {   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
+                uint8_t *pw = tp_get(p3, 0), *ww = tp_get(p3, 0), *wc = tp_get(p3, 0);
+                if (!pw || !ww || !wc) { tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3); return -1; }
+                for (size_t k = 0; k < p3; k++) pw[k] = ctu[k] ? sw[k] : SIDE_UNKNOWN;
+                if (band_wind4(pw, Pz, P, P, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, 15, ww, wc, nullptr) < 0) {
+                    tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3); return -1;
+                }
+                if (spatial.active) warp_w4(ww, wc, b->w4 + (size_t)i * p3, b->wcomp + (size_t)i * p3, P, y, &spatial);
+                else { sym_u8(ww, b->w4 + (size_t)i * p3, Pz, P, y); sym_u8(wc, b->wcomp + (size_t)i * p3, Pz, P, y); }
+                tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3);
+            }
             for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) sw[k] = SIDE_UNKNOWN;
             if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
             if (spatial.active) warp_phase(sw, b->side + (size_t)i * p3, P, y, &spatial);   /* (slabs never warp: sampler_start) */

@@ -401,6 +401,17 @@ void nn_count_loss(const void *dens_logits, const uint8_t *phase, int d, int h, 
 void nn_cond_targets(const uint8_t *wind, size_t n, uint8_t *t, uint8_t *m);   /* --cond: winding mod 14 (band.h band_winding) -> 4 targets: cos / sin of 2 pi q / 14 and 2 pi q / 2 (x255, 4 planes), mask (known) */
 void nn_cond_acc(const void *lg, int lg_h16, const uint8_t *wind, size_t n, unsigned long long *cnt);   /* --cond: known / right-turn counts of the 14-turn head (cnt: 2 device u64, accumulated) */
 void nn_pap_targets(const uint8_t *pl, const uint8_t *pm, size_t n, uint8_t *t, uint8_t *m);   /* --pap-head: gap labels (0 / 1 / 255 ignored) -> target, mask (not ignored, inside the scroll) */
+/* --task unwrap2: the gauge-free winding mod 4 loss (src/nn_loss.cu). la / lb: the cos / sin logits (fp32, or fp16 under
+   nn_set_logits_h16), n voxels; w4 (W mod 4, 63 codes per turn, 255 unknown), comp (component 0..14, 255 none: one gauge each), m
+   (mask weight). Per component the soft BCE against the target rotated by the best of the four quarter turns (the gauge); ds: 135
+   device doubles of sums (zeroed by the caller, accumulated over slabs by nn_wind4_stats), fin: nn_wind4_scratch() bytes ([0] loss,
+   [1] turn accuracy, [2] voxels, [3] 1 / voxels, [4] components, [5] worst-gauge loss, [8 + c] the gauges). nn_wind4_grad writes
+   lambda x the gradient of fin[0] (zero where unsupervised; ga / gb may be la / lb) */
+size_t nn_wind4_scratch(void);
+void nn_wind4_stats(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, double *ds);
+void nn_wind4_fin(double *ds, float *fin);
+void nn_wind4_grad(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, const float *fin, float lambda, void *ga, void *gb);
+void nn_wind4_loss(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, double *ds, float *fin, float lambda, void *ga, void *gb);
 void nn_cond_gather(const uint8_t *c14, const uint8_t *done, const uint8_t *ct, int W, int oz, int oy, int ox, int bz, int by, int bx, size_t N, void *x, int h16);   /* predict --cond-sweep: condition inputs 4-6 of a window from the box canvas (src/sweep.c) */
 void nn_cond_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int bz, int by, int bx, size_t N, int ch14, uint8_t *c14, uint8_t *p1, uint8_t *recto, uint8_t *done);   /* the window interior into the box canvas where not done */
 /* half-resolution networks (unet_cfg.half_res): the network runs on 2x2x2 blocks of the full-resolution window.

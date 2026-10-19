@@ -291,3 +291,113 @@ int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint
     free(se); free(so); free(de); free(dd); free(ie); free(io);
     return rc ? -1 : 0;
 }
+
+/* ---- relative winding mod 4 (train --task unwrap2, band.h band_wind4) ----
+   Runs along x of joined voxels (known, |phase step| <= maxstep), a union-find over the runs with offsets in turns mod 4, joined
+   across y and z neighbours. Every voxel's winding is phase + 252 (j + O(run)) codes: j its turns since the run's start, O the
+   run's turns relative to its root, both mod 4 (the representation keeps W = phase mod 1 turn exactly, so only the integer part is
+   tracked). Pass 2 replays the same runs in the same order. */
+typedef struct { int32_t parent; uint8_t off; } w4_run;   /* off: turns from this run to its parent, mod 4 */
+typedef struct { w4_run *r; size_t n, cap; int64_t *size, *edges, *conf; } w4_uf;
+static int32_t w4_find(w4_uf *u, int32_t a, int *off) {   /* root of a, *off = turns from a to its root (mod 4); path halving with offsets */
+    int o = 0; int32_t x = a;
+    while (u->r[x].parent != x) { o += u->r[x].off; x = u->r[x].parent; }
+    const int32_t root = x; int acc = o;
+    x = a;
+    while (u->r[x].parent != root && u->r[x].parent != x) {   /* compress: point straight at the root */
+        const int32_t p = u->r[x].parent; const int ox = u->r[x].off;
+        u->r[x].parent = root; u->r[x].off = (uint8_t)(acc & 3); acc -= ox; x = p;
+    }
+    *off = o & 3; return root;
+}
+/* W(a) - W(b) = rel turns (mod 4) in the runs' local representation: O_a - O_b = rel */
+static void w4_union(w4_uf *u, int32_t a, int32_t b, int rel) {
+    int oa, ob; const int32_t ra = w4_find(u, a, &oa), rb = w4_find(u, b, &ob);
+    if (ra == rb) { u->edges[ra]++; if (((oa - ob - rel) & 3) != 0) u->conf[ra]++; return; }
+    /* O_a = oa + O_ra, O_b = ob + O_rb: O_ra - O_rb = rel - oa + ob; attach the smaller under the larger */
+    const int d = (rel - oa + ob) & 3;
+    if (u->size[ra] < u->size[rb]) { u->r[ra].parent = rb; u->r[ra].off = (uint8_t)d; u->size[rb] += u->size[ra]; u->edges[rb] += u->edges[ra] + 1; u->conf[rb] += u->conf[ra]; }
+    else { u->r[rb].parent = ra; u->r[rb].off = (uint8_t)((-d) & 3); u->size[ra] += u->size[rb]; u->edges[ra] += u->edges[rb] + 1; u->conf[ra] += u->conf[rb]; }
+}
+static inline int w4_step(int a, int b) { int d = ((b - a) % 252 + 252) % 252; return d >= 126 ? d - 252 : d; }   /* phase codes a -> b in [-126, 126) */
+typedef struct { const uint8_t *ph; int D, H, W, maxstep; int32_t *rid[2]; int8_t *jj[2]; } w4_scan;
+/* one pass over the window: runs numbered in scan order; pass 0 creates runs and joins neighbours, pass 1 writes w4 / comp via map */
+static int w4_pass(w4_scan *s, w4_uf *u, int pass, const int16_t *map, uint8_t *w4, uint8_t *comp) {
+    const int H = s->H, W = s->W; const size_t pl = (size_t)H * W;
+    int32_t nrun = 0;
+    for (int z = 0; z < s->D; z++) {
+        int32_t *rc = s->rid[z & 1], *rp = s->rid[(z & 1) ^ 1]; int8_t *jc = s->jj[z & 1], *jp = s->jj[(z & 1) ^ 1];
+        for (int y = 0; y < H; y++) {
+            const uint8_t *row = s->ph + (size_t)z * pl + (size_t)y * W;
+            int32_t cur = -1; int j = 0, root_off = 0; int16_t cid = -1;
+            for (int x = 0; x < W; x++) {
+                const size_t k = (size_t)y * W + x, g = (size_t)z * pl + k;
+                const int v = row[x];
+                if (v >= 252) { cur = -1; rc[k] = -1; if (pass) { w4[g] = 255; comp[g] = 255; } continue; }
+                if (cur >= 0 && abs(w4_step(row[x - 1], v)) <= s->maxstep) { const int st = w4_step(row[x - 1], v); j = (j + (st - (v - row[x - 1])) / 252) & 3; }
+                else {   /* a new run */
+                    cur = nrun++; j = 0;
+                    if (!pass) {
+                        if ((size_t)cur >= u->cap) {
+                            u->cap = u->cap ? 2 * u->cap : 4096;
+                            u->r = realloc(u->r, u->cap * sizeof *u->r); u->size = realloc(u->size, u->cap * 8); u->edges = realloc(u->edges, u->cap * 8); u->conf = realloc(u->conf, u->cap * 8);
+                            if (!u->r || !u->size || !u->edges || !u->conf) return -1;
+                        }
+                        u->r[cur].parent = cur; u->r[cur].off = 0; u->size[cur] = 0; u->edges[cur] = 0; u->conf[cur] = 0; u->n = (size_t)nrun;
+                    } else { const int32_t r = w4_find(u, cur, &root_off); cid = map[r]; }
+                }
+                rc[k] = cur; jc[k] = (int8_t)j;
+                if (!pass) {
+                    u->size[w4_find(u, cur, &root_off)]++;
+                    /* neighbours y - 1 (this plane) and z - 1: W(v) - W(n) = step codes; with W = ph + 252 (j + O):
+                       252 (j_v + O_v - j_n - O_n) = step - (ph_v - ph_n) */
+                    for (int q = 0; q < 2; q++) {
+                        int32_t rn; int jn, pn;
+                        if (q == 0) { if (y == 0 || rc[k - W] < 0) continue; rn = rc[k - W]; jn = jc[k - W]; pn = s->ph[g - W]; }
+                        else { if (z == 0 || rp[k] < 0) continue; rn = rp[k]; jn = jp[k]; pn = s->ph[g - pl]; }
+                        const int st = w4_step(pn, v);
+                        if (abs(st) > s->maxstep) continue;
+                        const int t = (st - (v - pn)) / 252;   /* -1, 0 or 1 */
+                        w4_union(u, cur, rn, (t + jn - j) & 3);
+                    }
+                } else {
+                    if (cid < 0) { w4[g] = 255; comp[g] = 255; continue; }
+                    const int tw = (j + root_off) & 3;
+                    w4[g] = (uint8_t)(((v + 252 * tw + 2) / 4) % 252); comp[g] = (uint8_t)cid;
+                }
+            }
+        }
+    }
+    return 0;
+}
+int band_wind4(const uint8_t *phase, int D, int H, int W, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st) {
+    if (maxcomp > 15) maxcomp = 15;
+    const size_t pl = (size_t)H * W;
+    w4_scan s = {phase, D, H, W, maxstep, {malloc(pl * 4), malloc(pl * 4)}, {malloc(pl), malloc(pl)}};
+    w4_uf u = {0};
+    int rc = !s.rid[0] || !s.rid[1] || !s.jj[0] || !s.jj[1] ? -1 : w4_pass(&s, &u, 0, nullptr, nullptr, nullptr);
+    int16_t *map = rc ? nullptr : malloc((u.n ? u.n : 1) * sizeof *map);
+    int ncomp = 0; size_t kept = 0, known = 0, dropped_conf = 0;
+    if (!rc && !map) rc = -1;
+    if (!rc) {
+        int32_t best[15]; int nb = 0;
+        for (size_t i = 0; i < u.n; i++) {
+            map[i] = -1;
+            if (u.r[i].parent != (int32_t)i) continue;
+            known += (size_t)u.size[i];
+            if ((size_t)u.size[i] < minsize) continue;
+            if (u.conf[i] > 8 + u.edges[i] / 500) { dropped_conf += (size_t)u.size[i]; continue; }   /* inconsistent unwrapping (> 0.2% of its joins) */
+            int p = nb < maxcomp ? nb++ : maxcomp;   /* insertion into the size-sorted list of the largest */
+            if (p == maxcomp && u.size[i] <= u.size[best[maxcomp - 1]]) continue;
+            if (p == maxcomp) p = maxcomp - 1;
+            while (p > 0 && u.size[best[p - 1]] < u.size[i]) { best[p] = best[p - 1]; p--; }
+            best[p] = (int32_t)i;
+        }
+        for (int c = 0; c < nb; c++) { map[best[c]] = (int16_t)c; kept += (size_t)u.size[best[c]]; }
+        ncomp = nb;
+        rc = w4_pass(&s, &u, 1, map, w4, comp);
+    }
+    if (st) { st->known = known; st->kept = kept; st->dropped_conflict = dropped_conf; st->ncomp = ncomp; st->runs = u.n; }
+    free(map); free(u.r); free(u.size); free(u.edges); free(u.conf); free(s.rid[0]); free(s.rid[1]); free(s.jj[0]); free(s.jj[1]);
+    return rc ? -1 : ncomp;
+}
