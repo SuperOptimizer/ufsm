@@ -75,8 +75,59 @@ int wind_seed(const float *xyz, const uint8_t *valid, int w, int h, void (*axis_
               double K, int sense, double phi0, wind_seed_info *info, wind_result *out);
 /* A set's spiral sense and seam from its surfaces' wind_seed infos with sense 0: the radius rule's votes weighted by each surface's
    radial gap between its column ends (vote[0] for +1, vote[1] for -1), then the circular mean of the start azimuths under that
-   sense (turns, [0, 1); *resultant: the mean resultant length, 1 = all starts on one azimuth). */
+   sense (turns, [0, 1); *resultant: the mean resultant length, 1 = all starts on one azimuth).
+   NOT a sense decision on real sets (2026-10-19): an axis off the umbilicus or a crushed section moves the end bands' radii by far
+   more than the turns between them (Paris 4 June: 25 short surfaces outvoted the 3 long ones, + 2446 / - 27987, and the set came out
+   reversed). wind_seed_decide decides; this vote is only its tie-break and a report. */
 void wind_seed_set(const wind_seed_info *in, int n, int *sense, double *phi0, double vote[2], double *resultant);
+/* the seam (the circular mean of the start azimuths) of a set under a given sense */
+void wind_seed_seam(const wind_seed_info *in, int n, int sense, double *phi0, double *resultant);
+
+/* The set's spiral sense and the order of its names from its own geometry (wind_seed_decide). Two vertices in one (z, azimuth) bin
+   (WIND_ZBIN scan voxels of z, 1 / WIND_TBIN turn around the axis at that z) lie on one ray from the axis at one height, so the
+   outer one must carry the higher q: one turn per sheet crossed. Points sorted by bin and radius vote in consecutive pairs: agree
+   when the outer q is >= 0.5 turn higher, disagree when >= 0.5 lower (pairs under half a pitch apart, or not a whole number of turns
+   apart within 0.25: no radial vote; partial segments whose phi unwrapping jumps near the axis gave such junk on PHerc0009B). Pairs inside
+   one surface need it to span over a turn (they test the sense); pairs across surfaces (cross: named sets, K from the names) test
+   the names' order and the K, and two surfaces under a quarter pitch apart (one sheet traced twice: where wrap K's end meets wrap
+   K + 1's start at the seam) must agree within half a turn: under the wrong sense single wraps still step one turn per sheet
+   outward, but their q runs backwards around the turn (phase -phi on the sheet instead of phi), and only this seam continuity sees it. An axis off the umbilicus, an elliptical or crushed section and z drift along the grid's rows do not
+   enter: both points of a pair share azimuth and height (the axis only has to lie inside the sheets it is compared across). */
+enum { WIND_ZBIN = 8, WIND_TBIN = 512 };
+typedef struct { int64_t key; float r; float q[2]; int32_t surf; int32_t turn; } wind_pt;   /* q[0]: wind_seed q under sense +1, q[1]: under -1 (names as given);
+                                                                                              turn: the surface's phi range is >= 0.9 turn (else its own pairs
+                                                                                              are phi unwrapping artefacts: no own vote) */
+/* a subsample of about `target` vertices of a surface with q under both senses (qp, qm: wind_seed results, NaN = unassigned); *n
+   points; nullptr on out of memory (*n 0: none) */
+wind_pt *wind_seed_points(const float *xyz, const uint8_t *valid, int w, int h, void (*axis_fn)(void *, double, double *, double *), void *axis_ud,
+                          const float *qp, const float *qm, int32_t surf, size_t target, size_t *n);
+typedef struct {
+    size_t agree, dis;          /* votes of pairs with this surface under the chosen (sense, order) */
+    size_t own_pos, own_neg;    /* pairs inside it: its radius grows with phi (+) / falls (-): its own sense, whatever the set's */
+    int own_dir;                /* +1 / -1 when own_pos + own_neg >= min_pairs and one side has >= 60% of them, else 0 */
+    int dropped;                /* 1: its votes contradict the chosen (sense, order) (more disagree than agree, >= min_pairs) */
+} wind_surf_vote;
+typedef struct {
+    int sense, order;           /* order -1: the names count inward (K -> -K) */
+    double score;               /* agree / (agree + dis) under the choice, the dropped surfaces left out; NaN without votes */
+    size_t agree, dis;
+    double cand[2][2]; size_t cand_n[2][2];   /* [sense +1, -1][order +1, -1]: score and votes of each candidate (final pass) */
+    int ndropped, evidence;     /* evidence 0: no votes at all, the sense is the fallback */
+    double pitch;               /* scan voxels between consecutive sheets (median of pairs one turn apart); 0 unknown */
+    int pitch_ok;               /* 0: the median pitch lies outside wind_pitch_lo .. hi: the votes are discarded (evidence 0) */
+    double sense_margin, order_margin;   /* the choice's score minus the other sense's (other order's): under ~0.02 the geometry cannot
+                                            tell (a set of partial wraps that never meet at the seam has no sense evidence) */
+} wind_choice;
+/* pts are sorted in place. K[surf]: the names (q under order -1 = q - 2 K). force_sense / force_order 0: free, else fixed. fallback_sense:
+   the sense without votes (or on a tie). Surfaces whose votes contradict the choice are dropped one at a time, the worst first, and the
+   choice made again without them. per: nsurf entries. Returns 0, -1 out of memory. */
+int wind_seed_decide(wind_pt *pts, size_t n, const double *K, int nsurf, int cross, int force_sense, int force_order, int fallback_sense,
+                     size_t min_pairs, wind_choice *ch, wind_surf_vote *per);
+/* pitch_lo / pitch_hi (scan voxels; wind-seed: 50 / 1000 um): a median pitch outside them means the pairs are not sheets one turn
+   apart (PHerc0009B: 838 voxels = 7 mm from phi unwrapping jumps of half-turn segments): no evidence at all (ch->evidence 0) */
+extern double wind_pitch_lo, wind_pitch_hi;
+/* a surface is dropped when its votes' agree share is under this (default 0.5: more disagree than agree) */
+extern double wind_min_surface_score;
 
 /* code -> q_ref (turns mod 14), NaN without a winding */
 static inline float wind_code_q(uint8_t c, int kind) {

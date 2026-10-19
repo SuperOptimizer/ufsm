@@ -4,6 +4,7 @@
 #include "band.h"
 #include "votes.h"
 #include "wind.h"
+#include "phase_check.h"
 #include "fuse.h"
 #include "edt.h"
 #include "store.h"
@@ -62,6 +63,7 @@ static int usage(void) {
         "  ufsm sample  <sources.json> [--P 128] [--B 2] [--n 4] [--seed S] [--workers W] [--out DIR] [--noaug]\n"
         "  ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1]   warm the CT chunk cache for the labelled cells\n"
         "  ufsm phase-raster <codes-root> <key> <out-dir> [--box ...]          band phase precomputed for the sampler\n"
+        "  ufsm phase-check <phase-root> <key> --axis A --scan-um U [--count 1] a stored phase: share rising outward, labelled volume\n"
         "  ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase|votes  one array halved per axis (labels, phase, side votes)\n"
         "  ufsm side-votes <out-group> <out-um> <root> <key> [<root> <key> ...]   several surface sets' side labels added into one vote array\n"
         "  ufsm wind-assign <ref-root> <ref-key> <out-dir> <tifxyz>...   other authors' surfaces get winding q in a reference raster's gauge\n"
@@ -243,7 +245,12 @@ static int band_fit_fields(const uint8_t *ph, const uint8_t *spc, const int n[3]
    encoding and pooling: 1/18 turn steps) instead of the 1-turn phase, for targets beyond one turn. --gs 4 computes the field on the
    codes pooled 2x (praster_read: circular mean, conflicts kept) into <out-dir>/9.6: 35x faster (block B 7.5 s vs 4.4 min); against the
    4.8 um phase pooled to 9.6 on B: mean 0.016 turn apart, 1% over 0.1 turn. A source reads it for 2.4 um windows with "phase":
-   {"key": "9.6", "level": 2} (sample.c phase_window_interp: circular trilinear 4x). */
+   {"key": "9.6", "level": 2} (sample.c phase_window_interp: circular trilinear 4x).
+   --codes-grid 1 with --gs 4: the codes were rastered on the output grid itself (raster --level 2: 9.6 um on a 2.4 um scan), read
+   as they are (no 2x pooling): 8x fewer code bytes (Paris 4 June: ~11 GB instead of 43). --mask-ref ROOT KEY [--mask-tol 0.1]:
+   a phase on the output grid (another unroll of the same scroll): where it is known and the computed phase differs by more than
+   --mask-tol turns, the output is unknown (two separate sources, their conflicts masked, nothing fused); the |difference|
+   histogram is reported. The known voxels written are counted (labelled volume, mm^3). */
 typedef struct { z3 *codes; const int64_t *shape; const axis *ax; band_params bp; int halo, blk; int64_t s0[3]; uint8_t *shard; atomic_int next; int nblk[3]; size_t nonempty; pthread_mutex_t mu; int winding; int pf; const int64_t *fshape; int pair; } praster_job;   /* pf 2: the grid is the 4.8 um codes (fshape) pooled 2x */
 /* the codes over the grid box ro / rn: read directly (pf 1), or from the 2x finer codes with every 2^3 block pooled (pf 2): empty when
    all are empty, 255 (conflict) when any is or two lie more than a quarter turn apart, else their circular mean */
@@ -328,10 +335,11 @@ static void phase_pool2(const uint8_t *src, uint8_t *dst) {
 }
 /* phase-raster: shards taken from list in turn, each by nt block threads (praster_worker) into its own buffer, then (pooled) written */
 typedef struct { z3 *z; const int64_t *shape; const axis *ax; band_params bp; int halo, blk, winding, pf, pair; const int64_t *fshape; z3w *w; int pool, nt;
-                 const int64_t (*list)[3]; size_t nlist; atomic_size_t next; size_t nonempty, done; double t0; pthread_mutex_t mu; atomic_int fail; } praster_run;
+                 const int64_t (*list)[3]; size_t nlist; atomic_size_t next; size_t nonempty, done; double t0; pthread_mutex_t mu; atomic_int fail;
+                 z3 *mref; double mtol; size_t mhist[PHASE_AGREE_BINS], mmasked, mboth, known; } praster_run;   /* --mask-ref: a phase on the output grid; known: voxels written known */
 static void *praster_shards(void *arg) {
     praster_run *R = arg;
-    uint8_t *shard = malloc((size_t)512 * 512 * 512), *pooled = R->pool == 2 ? malloc((size_t)256 * 256 * 256) : nullptr;
+    uint8_t *shard = malloc((size_t)512 * 512 * 512), *pooled = R->pool == 2 ? malloc((size_t)256 * 256 * 256) : nullptr, *refbuf = nullptr;
     if (!shard || (R->pool == 2 && !pooled)) { atomic_store(&R->fail, 1); free(shard); free(pooled); return nullptr; }
     for (;;) {
         const size_t t = atomic_fetch_add(&R->next, 1); if (t >= R->nlist || atomic_load(&R->fail)) break;
@@ -343,19 +351,29 @@ static void *praster_shards(void *arg) {
         for (int k = 0; k < R->nt; k++) pthread_create(&th[k], nullptr, praster_worker, &J);
         for (int k = 0; k < R->nt; k++) pthread_join(th[k], nullptr);
         if (J.nonempty && pooled) phase_pool2(shard, pooled);
-        if (J.nonempty && z3w_write_shard(R->w, sz, sy, sx, pooled ? pooled : shard, R->nt)) { fprintf(stderr, "%s\n", z3w_error()); atomic_store(&R->fail, 1); break; }
-        pthread_mutex_lock(&R->mu); R->nonempty += J.nonempty; R->done++;
+        uint8_t *outp = pooled ? pooled : shard; const int64_t S = 512 / R->pool; const size_t S3 = (size_t)S * S * S;
+        size_t mh[PHASE_AGREE_BINS] = {0}, mm = 0, mb = 0, kn = 0;
+        if (J.nonempty && R->mref && R->pair != 2) {   /* --mask-ref: voxels the reference phase knows and disagrees with by > tol: unknown */
+            if (!refbuf && !(refbuf = malloc(S3))) { atomic_store(&R->fail, 1); break; }
+            const int64_t o[3] = {sz * S, sy * S, sx * S}, n[3] = {S, S, S};
+            if (z3_read(R->mref, o, n, refbuf, 1)) { fprintf(stderr, "phase-raster: --mask-ref read failed: %s\n", z3_error()); atomic_store(&R->fail, 1); break; }
+            mb = phase_mask_ref(outp, refbuf, S3, R->mtol, mh, &mm);
+        }
+        if (J.nonempty && R->pair != 2) for (size_t k = 0; k < S3; k++) kn += outp[k] < PHASE_PERIOD;
+        if (J.nonempty && z3w_write_shard(R->w, sz, sy, sx, outp, R->nt)) { fprintf(stderr, "%s\n", z3w_error()); atomic_store(&R->fail, 1); break; }
+        pthread_mutex_lock(&R->mu); R->nonempty += J.nonempty; R->done++; R->known += kn; R->mmasked += mm; R->mboth += mb; for (int b = 0; b < PHASE_AGREE_BINS; b++) R->mhist[b] += mh[b];
         fprintf(stderr, "\rshard %lld,%lld,%lld (%zu of %zu): %zu blocks with codes so far, %.0fs   ", (long long)sz, (long long)sy, (long long)sx, R->done, R->nlist, R->nonempty, now() - R->t0);
         pthread_mutex_unlock(&R->mu);
     }
-    free(shard); free(pooled); return nullptr;
+    free(shard); free(pooled); free(refbuf); return nullptr;
 }
 static int cmd_phase_raster(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm phase-raster <codes-root> <key> <out-dir> [--axis A] [--radius 80] [--span 75] [--box z,y,x,nz,ny,nx] [--threads 4] [--block 256] [--pool 2] [--resume 1] [--winding 1] [--gs 4]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm phase-raster <codes-root> <key> <out-dir> [--axis A] [--radius 80] [--span 75] [--box z,y,x,nz,ny,nx] [--threads 4] [--block 256] [--pool 2] [--resume 1] [--winding 1] [--gs 4] [--codes-grid 1] [--mask-ref ROOT KEY] [--mask-tol 0.1]\n"); return 2; }
     const int pool = atoi(opt(argc, argv, "--pool", "1")), resume = atoi(opt(argc, argv, "--resume", "0"));   /* --pool 2: write only the 9.6 um (2x circular-mean) phase; --resume: skip written shards */
     const int winding = atoi(opt(argc, argv, "--winding", "0"));   /* the winding mod 14 turns (band_winding) instead of the 1-turn phase */
     if (pool != 1 && pool != 2) { fprintf(stderr, "phase-raster: --pool 1|2\n"); return 2; }
-    const int gs = atoi(opt(argc, argv, "--gs", "2")), pf = gs / 2;   /* native voxels per output grid voxel: 2 the codes' own 4.8 um grid, 4 the codes pooled 2x (9.6 um) */
+    const int codes_grid = atoi(opt(argc, argv, "--codes-grid", "0"));   /* 1: the codes are already on the output grid (raster --level 2 for --gs 4: no pooling) */
+    const int gs = atoi(opt(argc, argv, "--gs", "2")), pf = codes_grid ? 1 : gs / 2;   /* native voxels per output grid voxel: 2 the codes' own 4.8 um grid, 4 the codes pooled 2x (9.6 um) */
     if (gs != 2 && gs != 4) { fprintf(stderr, "phase-raster: --gs 2|4\n"); return 2; }
     if (gs == 4 && pool != 1) { fprintf(stderr, "phase-raster: --gs 4 writes the 9.6 um grid itself (no --pool)\n"); return 2; }
     band_params bp = {(float)atof(opt(argc, argv, "--radius", "80")), (float)atof(opt(argc, argv, "--span", "75")), (float)gs};
@@ -394,7 +412,14 @@ static int cmd_phase_raster(int argc, char **argv) {
     /* --pair 1: band_field_phase_pair (the two nearest sheets of opposite winding parity; no radial inside / outside, no span) */
     const int pair = atoi(opt(argc, argv, "--pair", "0"));
     if (pair && winding) { fprintf(stderr, "phase-raster: --pair writes the 1-turn phase (no --winding)\n"); return 2; }
-    praster_run R = {.z = z, .shape = shape, .ax = &ax, .bp = bp, .halo = (int)ceilf((pair == 2 ? 2 * bp.radius : (pair ? 0 : bp.span) + bp.radius) / (float)gs) + 2, .blk = blk, .winding = winding, .pf = pf, .pair = pair,
+    z3 *mref = nullptr; const double mtol = atof(opt(argc, argv, "--mask-tol", "0.1"));
+    { const int mi = arg_index(argc, argv, "--mask-ref");
+      if (mi > 0) {
+          if (mi + 2 >= argc || pool != 1) { fprintf(stderr, "phase-raster: --mask-ref ROOT KEY (a phase on the output grid; no --pool 2)\n"); return 2; }
+          mref = z3_open(store_open(argv[mi + 1]), argv[mi + 2], nullptr);
+          if (!mref || memcmp(z3_meta_of(mref)->shape, shape, sizeof shape)) { fprintf(stderr, "phase-raster: --mask-ref %s %s: cannot open or its shape differs from the output grid\n", argv[mi + 1], argv[mi + 2]); return 1; }
+      } }
+    praster_run R = {.mref = mref, .mtol = mtol, .z = z, .shape = shape, .ax = &ax, .bp = bp, .halo = (int)ceilf((pair == 2 ? 2 * bp.radius : (pair ? 0 : bp.span) + bp.radius) / (float)gs) + 2, .blk = blk, .winding = winding, .pf = pf, .pair = pair,
                      .fshape = fshape, .w = w, .pool = pool, .nt = nth < 1 ? 1 : nth > 64 ? 64 : nth, .list = list, .nlist = nlist, .t0 = now(), .mu = PTHREAD_MUTEX_INITIALIZER};
     pthread_t sth[64];
     for (int k = 1; k < nsh; k++) pthread_create(&sth[k], nullptr, praster_shards, &R);
@@ -405,8 +430,104 @@ static int cmd_phase_raster(int argc, char **argv) {
     const size_t nonempty = R.nonempty, nshards = nlist;
     if (z3w_close(w)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     fprintf(stderr, "\nphase-raster: %zu shards (%zu already written), %zu blocks with codes, %.0fs -> %s\n", nshards, skipped, nonempty, now() - R.t0, dir);
+    if (pair_attr != 2) { const double vu = atof(opt(argc, argv, "--vol-um", "2.4")) * gs * pool;   /* (the key names the grid as if the scan were 2.4 um) */
+        fprintf(stderr, "phase-raster: known %zu voxels written (%.1f mm^3 at %g um voxels, --vol-um; this run's shards only)\n", R.known, (double)R.known * pow(vu * 1e-3, 3), vu); }
+    if (mref) {
+        const double b = R.mboth ? (double)R.mboth : 1;
+        fprintf(stderr, "phase-raster: --mask-ref: %zu voxels known in both, |difference| < 0.05 turn %.3f, 0.05-0.1 %.3f, 0.1-0.2 %.3f, 0.2-0.4 %.3f, >= 0.4 %.3f; %zu (%.3f) over %.2f turn set unknown\n",
+                R.mboth, R.mhist[0] / b, R.mhist[1] / b, R.mhist[2] / b, R.mhist[3] / b, R.mhist[4] / b, R.mmasked, R.mmasked / b, mtol);
+        z3_close(mref);
+    }
     z3_close(z);
     return 0;
+}
+
+/* ufsm phase-check <phase-root> <key> --axis A --scan-um U [--phase-um K] [--boxes 48] [--min 0.9] [--count 1] [--threads 8] [--sign 1]
+   [--min-known 0.05] [--box z,y,x,nz,ny,nx (scan voxels)]
+   The guard of a stored band phase (src/phase_check.h; 2026-10-19: the multi-scroll labels of Paris 4 June / July and PHerc0500P2
+   rose inward and trained that way): over --boxes of its stored 128^3 chunks (with --count: the ones at least --min-known known,
+   spread over the array; sparse labels: any with >= 2000), the share of voxels whose phase gradient points away from the axis (phase_outward_count). --count 1 also
+   decodes every stored chunk and counts the known voxels (the labelled volume, mm^3). The axis is in scan voxels (--scan-um), the
+   phase grid --phase-um (default: the key). --sign -1 reads it negated (a sources "phase_sign": -1). --box: only chunks meeting a box
+   of scan voxels. One line on stdout: "phase-check <root>/<key> outward F boxes B pairs N ... known V voxels M mm3 chunks C densest
+   z,y,x pass|FAIL" (densest: the centre of the chunk with the most known voxels, scan voxels, with --count).
+   Exit 0 when F >= --min, 3 below it, 4 without gradient data. */
+typedef struct { z3 *z; const int64_t *list; size_t n; atomic_size_t next; uint32_t *cnt; atomic_int fail; } pcheck_job;
+static void *pcheck_count(void *arg) {
+    pcheck_job *J = arg; const z3_meta *m = z3_meta_of(J->z); const int c0 = m->chunk[0], c1 = m->chunk[1], c2 = m->chunk[2];
+    int64_t g[3] = {(m->shape[0] + c0 - 1) / c0, (m->shape[1] + c1 - 1) / c1, (m->shape[2] + c2 - 1) / c2};
+    uint8_t *b = malloc((size_t)c0 * c1 * c2); if (!b) { atomic_store(&J->fail, 1); return nullptr; }
+    for (;;) {
+        const size_t t = atomic_fetch_add(&J->next, 1); if (t >= J->n) break;
+        const int64_t k = J->list[t], cz = k / (g[1] * g[2]), cy = (k / g[2]) % g[1], cx = k % g[2];
+        const int64_t o[3] = {cz * c0, cy * c1, cx * c2}, n[3] = {c0, c1, c2};
+        if (z3_read(J->z, o, n, b, 1)) { atomic_store(&J->fail, 1); break; }
+        uint32_t c = 0; for (size_t i = 0; i < (size_t)c0 * c1 * c2; i++) c += b[i] < PHASE_PERIOD;
+        J->cnt[t] = c;
+    }
+    free(b); return nullptr;
+}
+static int cmd_phase_check(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm phase-check <phase-root> <key> --axis A --scan-um U [--phase-um K] [--boxes 48] [--min 0.9] [--count 1] [--threads 8] [--sign 1] [--min-known 0.05] [--box z,y,x,nz,ny,nx]\n"); return 2; }
+    const char *ap = opt(argc, argv, "--axis", nullptr); const double scan_um = atof(opt(argc, argv, "--scan-um", "0")), phase_um = atof(opt(argc, argv, "--phase-um", argv[3]));
+    const int nbox = atoi(opt(argc, argv, "--boxes", "48")), count = atoi(opt(argc, argv, "--count", "1")), nt = atoi(opt(argc, argv, "--threads", "8")), sign = atoi(opt(argc, argv, "--sign", "1"));
+    const double minf = atof(opt(argc, argv, "--min", "0.9")), mink = atof(opt(argc, argv, "--min-known", "0.05"));
+    if (!ap || !(scan_um > 0) || !(phase_um > 0) || nbox < 1 || (sign != 1 && sign != -1)) { fprintf(stderr, "phase-check: --axis, --scan-um > 0, a numeric key or --phase-um, --boxes >= 1, --sign +-1\n"); return 2; }
+    axis ax = {0}; if (axis_load(&ax, ap)) { fprintf(stderr, "phase-check: cannot load the axis %s\n", ap); return 1; }
+    z3 *z = z3_open(store_open(argv[2]), argv[3], nullptr); if (!z) { fprintf(stderr, "phase-check: %s %s: %s\n", argv[2], argv[3], z3_error()); return 1; }
+    const z3_meta *m = z3_meta_of(z); const double f = phase_um / scan_um;   /* scan voxels per phase voxel */
+    int64_t g[3]; uint8_t *bits = nullptr; const int64_t np = z3_chunk_map(z, g, &bits);
+    if (np < 0) { fprintf(stderr, "phase-check: no chunk map (an unsharded array?)\n"); return 1; }
+    long long bx[6]; const char *bs = opt(argc, argv, "--box", nullptr); int hb = 0;
+    if (bs) { if (sscanf(bs, "%lld,%lld,%lld,%lld,%lld,%lld", &bx[0], &bx[1], &bx[2], &bx[3], &bx[4], &bx[5]) != 6) return usage(); hb = 1; }
+    int64_t *list = malloc((size_t)(np ? np : 1) * sizeof *list); size_t nl = 0;
+    for (int64_t k = 0; k < g[0] * g[1] * g[2]; k++) {
+        if (!bits[k]) continue;
+        if (hb) { const int64_t c[3] = {k / (g[1] * g[2]), (k / g[2]) % g[1], k % g[2]}; int in = 1;
+            for (int d = 0; d < 3; d++) { const double lo = c[d] * m->chunk[d] * f, hi = (c[d] + 1) * m->chunk[d] * f; if (hi <= bx[d] || lo >= bx[d] + bx[3 + d]) in = 0; }
+            if (!in) continue; }
+        list[nl++] = k;
+    }
+    free(bits);
+    const size_t c3 = (size_t)m->chunk[0] * m->chunk[1] * m->chunk[2];
+    uint32_t *cnt = calloc(nl ? nl : 1, sizeof *cnt); size_t known = 0;
+    if (count && nl) {
+        pcheck_job J = {.z = z, .list = list, .n = nl, .cnt = cnt}; pthread_t th[64]; const int T = nt < 1 ? 1 : nt > 64 ? 64 : nt;
+        for (int k = 0; k < T; k++) pthread_create(&th[k], nullptr, pcheck_count, &J);
+        for (int k = 0; k < T; k++) pthread_join(th[k], nullptr);
+        if (J.fail) { fprintf(stderr, "phase-check: read failed: %s\n", z3_error()); return 1; }
+        for (size_t i = 0; i < nl; i++) known += cnt[i];
+    }
+    /* the boxes: chunks spread evenly over the stored list (with counts: only those >= --min-known known) */
+    size_t nc = 0; int64_t *cand = malloc((nl ? nl : 1) * sizeof *cand);
+    for (size_t i = 0; i < nl; i++) if (!count || cnt[i] >= mink * (double)c3) cand[nc++] = list[i];
+    if (count && nc < (size_t)nbox) { nc = 0; for (size_t i = 0; i < nl; i++) if (cnt[i] >= 2000) cand[nc++] = list[i]; }   /* sparse labels: any chunk with some phase */
+    uint8_t *b = malloc(c3); double *cy = malloc(m->chunk[0] * sizeof *cy), *cx = malloc(m->chunk[0] * sizeof *cx);
+    size_t up = 0, tot = 0; int used = 0; double fmin = 1, fmax = 0;
+    const size_t want = (size_t)nbox, stride = nc > want ? nc / want : 1;
+    for (size_t i = stride / 2; i < nc && used < nbox; i += stride) {
+        const int64_t k = cand[i], c[3] = {k / (g[1] * g[2]), (k / g[2]) % g[1], k % g[2]};
+        const int64_t o[3] = {c[0] * m->chunk[0], c[1] * m->chunk[1], c[2] * m->chunk[2]}, n[3] = {m->chunk[0], m->chunk[1], m->chunk[2]};
+        if (z3_read(z, o, n, b, 1)) { fprintf(stderr, "phase-check: read failed: %s\n", z3_error()); return 1; }
+        if (sign < 0) for (size_t q = 0; q < c3; q++) if (b[q] < PHASE_PERIOD && b[q]) b[q] = (uint8_t)(PHASE_PERIOD - b[q]);
+        for (int zz = 0; zz < m->chunk[0]; zz++) { double y, x; axis_at(&ax, (o[0] + zz) * f, &y, &x); cy[zz] = y / f; cx[zz] = x / f; }
+        size_t u = 0, t = 0; const int ni[3] = {m->chunk[0], m->chunk[1], m->chunk[2]};
+        phase_outward_count(b, ni, o[1], o[2], cy, cx, &u, &t);
+        if (t < 200) continue;
+        up += u; tot += t; used++; const double fr = (double)u / (double)t; if (fr < fmin) fmin = fr; if (fr > fmax) fmax = fr;
+        if (atoi(opt(argc, argv, "--verbose", "0"))) fprintf(stderr, "phase-check: chunk %lld,%lld,%lld (scan z %.0f, r %.0f): outward %.3f of %zu\n", (long long)c[0], (long long)c[1], (long long)c[2],
+                                                              (o[0] + m->chunk[0] / 2) * f, hypot((double)(o[1] + m->chunk[1] / 2) - cy[m->chunk[0] / 2], (double)(o[2] + m->chunk[2] / 2) - cx[m->chunk[0] / 2]) * f, fr, t);
+    }
+    long long dc[3] = {-1, -1, -1};   /* the densest stored chunk's centre, scan voxels (a holdout spot) */
+    if (count && nl) { size_t bi = 0; for (size_t i = 1; i < nl; i++) if (cnt[i] > cnt[bi]) bi = i;
+        const int64_t k = list[bi], c[3] = {k / (g[1] * g[2]), (k / g[2]) % g[1], k % g[2]};
+        for (int d = 0; d < 3; d++) dc[d] = llround(((double)c[d] + 0.5) * m->chunk[d] * f); }
+    const double F = tot ? (double)up / (double)tot : NAN, mm3 = (double)known * pow(phase_um * 1e-3, 3);
+    const char *verdict = !tot ? "NODATA" : F >= minf ? "pass" : "FAIL";
+    printf("phase-check %s/%s outward %.4f boxes %d pairs %zu box-range %.3f..%.3f known %s%zu voxels %.1f mm3 chunks %zu densest %lld,%lld,%lld %s\n", argv[2], argv[3], F, used, tot, used ? fmin : NAN, used ? fmax : NAN,
+           count ? "" : "(not counted) ", known, mm3, nl, dc[0], dc[1], dc[2], verdict);
+    free(b); free(cy); free(cx); free(cand); free(cnt); free(list); z3_close(z);
+    return !tot ? 4 : F >= minf ? 0 : 3;
 }
 
 /* ufsm band <codes-root> <key> z,y,x,nz,ny,nx <out.raw> [--axis umbilicus.json] [--radius 80] [--span 75] [--threads 8] [--side side.raw]
@@ -1348,15 +1469,27 @@ static int cmd_wind_assign(int argc, char **argv) {
 }
 
 /* ufsm wind-seed <out-dir> <tifxyz>... [--k K] [--axis JSON] [--axis-um U] [--vol-um 2.4] [--out-um U] [--sense set|surface|+1|-1]
-   [--seam set|start]
+   [--order auto|+1|-1] [--seam set|start] [--min-pairs 50] [--min-score 0.75] [--points 400000] [--dry 1] [--pitch-um-lo 50] [--pitch-um-hi 1000]
+   [--min-surface-score 0.5]
    A surface set's own winding gauge (src/wind.h wind_seed), for the first set of a scroll (no reference raster): every tifxyz gets
    q on its largest component, K from --k or the segment name in its path (-wNNN_ / -wrapNN / /wNNN), written like wind-assign
    (<out-dir>/<name>: x / y / z (scaled to --out-um), q.tif) for `ufsm raster --value q.tif`; one line per surface on stdout and in
-   <out-dir>/seed.jsonl. --sense set (default): one spiral sense for the whole set, the radius rule's votes weighted by the radial
-   gap between each surface's ends (a single wrap's ends can swap under an off-centre axis; the sense cannot); surface: each
-   surface's own radius rule. --seam set (default): the turn boundary at the circular mean of the start azimuths (wraps of one
-   numbering share it), q = K on the turn holding a short surface's median; start: q = K at each surface's start. Reported: surfaces
-   whose radius rule disagrees with the set's sense, names out of radial order (consecutive K whose mean radii decrease), repeated K. */
+   <out-dir>/seed.jsonl, the set's choice in <out-dir>/set.json.
+   --sense set (default): one spiral sense for the whole set, and --order auto the order of its names (inward-counting names get
+   K -> -K), both from the set's geometry (wind_seed_decide: vertex pairs on one ray from the axis at one height, the outer one must
+   carry the higher q; pairs inside a surface spanning over a turn and, with names, across surfaces). A surface whose own pairs
+   contradict the choice (agree share under --min-surface-score, default 0.5; >= --min-pairs votes) is DROPPED: reported, not written. surface: each surface its
+   own pairs' sense (the radius rule where it has none); +1 / -1: forced (contradicting surfaces still dropped). The old end-gap
+   radius vote (wind_seed_set) is only the tie-break without any pair. Sets of single wraps: the names fix the phase's radial
+   direction whatever the sense, but a wrong sense runs q backwards around every turn (phase -phi instead of phi on the sheet); only
+   same-sheet pairs where wraps meet at the seam see it. Exit 3 when the set's agreement score is under --min-score (>= 100 votes): its q
+   would not rise outward; exit 4 when the sense is undetermined (margin over the other sense under 0.02: no surface over a turn and
+   no wraps meeting at the seam) and not forced (--allow-undetermined 1 writes anyway); nothing is written either way. --dry 1: the
+   decision and each surface's votes only (set.json). A median pitch of the one-turn pairs outside --pitch-um-lo .. hi means they are
+   not sheets (phi unwrapping jumps of partial segments): no evidence.
+   --seam set (default): the turn boundary at the circular mean of the start azimuths (wraps of one numbering share it), q = K on
+   the turn holding a short surface's median; start: q = K at each surface's start. Reported: names out of radial order (consecutive
+   K whose mean radii decrease), repeated K. */
 static int seed_k_from_path(const char *path, double *K) {
     for (const char *p = path; *p; p++) {
         if ((*p == '-' || *p == '_' || *p == '/') && p[1] == 'w') {
@@ -1383,20 +1516,24 @@ static void ws_free(ws_surf *S) { free(S->X); free(S->Y); free(S->Z); free(S->xy
 typedef struct { double K, rmean; int idx; } ws_kr;
 static int cmp_ws_kr(const void *a, const void *b) { const ws_kr *x = a, *y = b; return x->K < y->K ? -1 : x->K > y->K ? 1 : x->idx - y->idx; }
 static int cmd_wind_seed(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm wind-seed <out-dir> <tifxyz>... [--k K] [--axis JSON] [--axis-um U] [--vol-um 2.4] [--out-um U] [--sense set|surface|+1|-1] [--seam set|start]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm wind-seed <out-dir> <tifxyz>... [--k K] [--axis JSON] [--axis-um U] [--vol-um 2.4] [--out-um U] [--sense set|surface|+1|-1] [--order auto|+1|-1] [--seam set|start] [--min-pairs 50] [--min-score 0.75]\n"); return 2; }
     const double vol_um = atof(opt(argc, argv, "--vol-um", "2.4")), axis_um = atof(opt(argc, argv, "--axis-um", opt(argc, argv, "--vol-um", "2.4")));
     const double out_um = atof(opt(argc, argv, "--out-um", opt(argc, argv, "--vol-um", "2.4")));
-    const char *sense_o = opt(argc, argv, "--sense", "set"), *seam_o = opt(argc, argv, "--seam", "set");
+    const char *sense_o = opt(argc, argv, "--sense", "set"), *seam_o = opt(argc, argv, "--seam", "set"), *order_o = opt(argc, argv, "--order", "auto");
     const int sense_set = !strcmp(sense_o, "set"), sense_surf = !strcmp(sense_o, "surface"), seam_set = !strcmp(seam_o, "set");
+    const size_t min_pairs = (size_t)atol(opt(argc, argv, "--min-pairs", "50")), npts = (size_t)atol(opt(argc, argv, "--points", "400000"));
+    const double min_score = atof(opt(argc, argv, "--min-score", "0.75"));
     if (!(vol_um > 0 && axis_um > 0 && out_um > 0)) { fprintf(stderr, "wind-seed: --vol-um / --axis-um / --out-um > 0\n"); return 2; }
     if (!sense_set && !sense_surf && strcmp(sense_o, "+1") && strcmp(sense_o, "-1") && strcmp(sense_o, "1")) { fprintf(stderr, "wind-seed: --sense set|surface|+1|-1\n"); return 2; }
     if (!seam_set && strcmp(seam_o, "start")) { fprintf(stderr, "wind-seed: --seam set|start\n"); return 2; }
+    if (strcmp(order_o, "auto") && strcmp(order_o, "+1") && strcmp(order_o, "1") && strcmp(order_o, "-1")) { fprintf(stderr, "wind-seed: --order auto|+1|-1\n"); return 2; }
+    const int force_sense = sense_set || sense_surf ? 0 : atoi(sense_o) > 0 ? 1 : -1, force_order = !strcmp(order_o, "auto") ? 0 : atoi(order_o) > 0 ? 1 : -1;
     wa_axis A = {.f = axis_um / vol_um};
     if (axis_load(&A.ax, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "wind-seed: cannot load the axis\n"); return 1; }
     char lp[1400]; snprintf(lp, sizeof lp, "%s/seed.jsonl", argv[2]);
     if (mkdir(argv[2], 0755) && errno != EEXIST) { fprintf(stderr, "wind-seed: mkdir %s\n", argv[2]); return 1; }
     const char *kopt = opt(argc, argv, "--k", nullptr);
-    /* pass 1: each surface's radius rule (sense 0) -> the set's sense and seam */
+    /* pass 1: each surface's geometry (sense 0: its radius rule, start azimuths) */
     int ns = 0, *idx = malloc(argc * sizeof *idx); double *Ks = malloc(argc * sizeof *Ks); wind_seed_info *i1 = calloc(argc, sizeof *i1);
     int rc = 0;
     for (int a = 3; a < argc; a++) {
@@ -1412,27 +1549,68 @@ static int cmd_wind_seed(int argc, char **argv) {
         wind_result_free(&r);
         idx[ns] = a; Ks[ns] = K; i1[ns++] = in;
     }
-    int sset = 1; double phi_set = 0, vote[2] = {0, 0}, res = 0; wind_seed_set(i1, ns, &sset, &phi_set, vote, &res);
-    const int sense = sense_surf ? 0 : sense_set ? sset : atoi(sense_o) > 0 ? 1 : -1;
-    double phi0 = NAN;
-    if (sense && seam_set && ns) {
-        if (sense != sset) { int s2; double v2[2]; wind_seed_info *flip = malloc(ns * sizeof *flip);   /* a forced sense: its own starts */
-            for (int k = 0; k < ns; k++) { flip[k] = i1[k]; flip[k].radial_dir = sense; flip[k].r_c[0] = 0; flip[k].r_c[1] = 1; }
-            wind_seed_set(flip, ns, &s2, &phi_set, v2, &res); free(flip); }
-        phi0 = phi_set;
-        fprintf(stderr, "wind-seed: seam at azimuth %.3f turn (start azimuths' resultant length %.2f)\n", phi0, res);
+    int vsense = 1; double phi_v = 0, vote[2] = {0, 0}, res = 0; wind_seed_set(i1, ns, &vsense, &phi_v, vote, &res);
+    double phis[2] = {NAN, NAN}, ress[2] = {0, 0};   /* the seam under sense +1 / -1 */
+    if (seam_set && ns) for (int si = 0; si < 2; si++) wind_seed_seam(i1, ns, si ? -1 : 1, &phis[si], &ress[si]);
+    /* pass 1b: q under both senses, a subsample of every surface -> the set's sense and order (wind_seed_decide) */
+    wind_pt *pts = nullptr; size_t np = 0;
+    for (int k = 0; k < ns; k++) {
+        ws_surf S; if (ws_read(argv[idx[k]], &S)) { ws_free(&S); rc = 1; continue; }
+        wind_result r[2]; wind_seed_info in;
+        int e = 0; for (int si = 0; si < 2 && !e; si++) e = wind_seed(S.xyz, S.valid, S.w, S.h, wa_axis_fn, &A, Ks[k], si ? -1 : 1, phis[si], &in, &r[si]);
+        if (e) { fprintf(stderr, "wind-seed: out of memory\n"); return 1; }
+        size_t m = 0; wind_pt *p = wind_seed_points(S.xyz, S.valid, S.w, S.h, wa_axis_fn, &A, r[0].q, r[1].q, k, npts, &m);
+        if (m) { wind_pt *t = realloc(pts, (np + m) * sizeof *pts); if (!t) { fprintf(stderr, "wind-seed: out of memory\n"); return 1; } pts = t; memcpy(pts + np, p, m * sizeof *p); np += m; }
+        free(p); wind_result_free(&r[0]); wind_result_free(&r[1]); ws_free(&S);
     }
-    if (sense) fprintf(stderr, "wind-seed: spiral sense %+d (radius-rule votes weighted by the ends' radial gap: + %.0f, - %.0f scan voxels)\n", sense, vote[0], vote[1]);
+    wind_min_surface_score = atof(opt(argc, argv, "--min-surface-score", "0.5"));
+    wind_pitch_lo = atof(opt(argc, argv, "--pitch-um-lo", "50")) / vol_um; wind_pitch_hi = atof(opt(argc, argv, "--pitch-um-hi", "1000")) / vol_um;   /* papyrus sheets: ~150-400 um apart */
+    wind_choice ch; wind_surf_vote *pv = calloc(ns ? ns : 1, sizeof *pv);
+    if (!pv || wind_seed_decide(pts, np, Ks, ns, !kopt, force_sense, force_order, vsense, min_pairs, &ch, pv)) { fprintf(stderr, "wind-seed: out of memory\n"); return 1; }
+    free(pts);
+    const int sense = ch.sense, order = ch.order; const double phi0 = seam_set && ns ? phis[sense > 0 ? 0 : 1] : NAN;
+    fprintf(stderr, "wind-seed: candidates (agree share / votes): sense +1 order +1 %.3f / %zu, +1 -1 %.3f / %zu, -1 +1 %.3f / %zu, -1 -1 %.3f / %zu\n",
+            ch.cand[0][0], ch.cand_n[0][0], ch.cand[0][1], ch.cand_n[0][1], ch.cand[1][0], ch.cand_n[1][0], ch.cand[1][1], ch.cand_n[1][1]);
+    const int undetermined = !force_sense && !sense_surf && !(ch.evidence && ch.sense_margin >= 0.02);
+    fprintf(stderr, "wind-seed: spiral sense %+d, names %s (%s; agree %zu, disagree %zu, score %.3f, margin over the other sense %.3f / the other order %.3f, pitch %.1f scan voxels = %.0f um%s, %d surface(s) dropped; old end-gap radius vote: + %.0f, - %.0f scan voxels)\n",
+            sense, order > 0 ? "counting outward" : "counting inward (K -> -K)", force_sense ? "forced" : undetermined ? "the sense UNDETERMINED by the geometry" : "from vertex pairs on rays from the axis",
+            ch.agree, ch.dis, ch.score, ch.sense_margin, ch.order_margin, ch.pitch, ch.pitch * vol_um, ch.pitch_ok ? "" : " NOT a papyrus pitch: votes discarded", ch.ndropped, vote[0], vote[1]);
+    if (seam_set && ns) fprintf(stderr, "wind-seed: seam at azimuth %.3f turn (start azimuths' resultant length %.2f)\n", phi0, ress[sense > 0 ? 0 : 1]);
+    { char sp[1400]; snprintf(sp, sizeof sp, "%s/set.json", argv[2]); FILE *f = fopen(sp, "w");
+      if (f) { fprintf(f, "{\"sense\":%d,\"order\":%d,\"forced\":%d,\"sense_determined\":%d,\"score\":%.4f,\"sense_margin\":%.4f,\"order_margin\":%.4f,\"pitch\":%.2f,\"agree\":%zu,\"disagree\":%zu,\"evidence\":%d,\"dropped\":%d,\"surfaces\":%d,\"seam\":%.4f,\"endgap_vote\":[%.1f,%.1f]}\n",
+                       sense, order, force_sense != 0, !undetermined, isfinite(ch.score) ? ch.score : -1.0, isfinite(ch.sense_margin) ? ch.sense_margin : -1.0, isfinite(ch.order_margin) ? ch.order_margin : -1.0,
+                       ch.pitch, ch.agree, ch.dis, ch.evidence, ch.ndropped, ns, isfinite(phi0) ? phi0 : -1.0, vote[0], vote[1]); fclose(f); } }
+    if (undetermined && !atoi(opt(argc, argv, "--allow-undetermined", "0"))) {   /* (partial wraps never meeting at the seam: q would run backwards around the turn half the time) */
+        fprintf(stderr, "wind-seed: FAILED: the geometry does not tell the spiral sense (margin %.3f; no surface over a turn, no wraps meeting at the seam): nothing written (--sense +1|-1 from elsewhere, or --allow-undetermined 1)\n", ch.sense_margin);
+        free(pv); free(idx); free(Ks); free(i1); return 4;
+    }
+    if (ch.evidence && ch.agree + ch.dis >= 100 && !(ch.score >= min_score)) {
+        fprintf(stderr, "wind-seed: FAILED: the best (sense, order) puts the higher q outward on only %.3f of %zu pairs (--min-score %.2f): nothing written\n", ch.score, ch.agree + ch.dis, min_score);
+        free(pv); free(idx); free(Ks); free(i1); return 3;
+    }
+    if (atoi(opt(argc, argv, "--dry", "0"))) {   /* --dry 1: the decision and every surface's votes, nothing written but set.json */
+        for (int k = 0; k < ns; k++) { const char *base = strrchr(argv[idx[k]], '/'); base = base && base[1] ? base + 1 : argv[idx[k]];
+            printf("%s K %g%s span %.2f end-gap rule %+d own pairs + %zu - %zu (own %+d) votes agree %zu disagree %zu\n", base, Ks[k], pv[k].dropped ? " DROPPED" : "", i1[k].span, i1[k].radial_dir,
+                   pv[k].own_pos, pv[k].own_neg, pv[k].own_dir, pv[k].agree, pv[k].dis); }
+        free(pv); free(idx); free(Ks); free(i1); return 0;
+    }
     FILE *log = fopen(lp, "a"); if (!log) { fprintf(stderr, "wind-seed: cannot write %s\n", lp); return 1; }
-    int nsurf = 0, ndis = 0; ws_kr *kr = malloc((ns + 1) * sizeof *kr);
-    for (int k = 0; k < ns; k++) {   /* pass 2: the set's sense and seam */
-        const int a = idx[k]; const double K = Ks[k];
+    int nsurf = 0, ndis = 0, nown = 0; ws_kr *kr = malloc((ns + 1) * sizeof *kr);
+    for (int k = 0; k < ns; k++) {   /* pass 2: the set's sense, order and seam */
+        const int a = idx[k]; const double K = order * Ks[k];
+        const char *base = strrchr(argv[a], '/'); base = base && base[1] ? base + 1 : argv[a];
+        const wind_surf_vote *v = &pv[k];
+        if (v->dropped) {
+            printf("%s K %g DROPPED: its pairs contradict the set's sense %+d / order %+d (agree %zu, disagree %zu; own pairs + %zu - %zu)\n", base, Ks[k], sense, order, v->agree, v->dis, v->own_pos, v->own_neg);
+            fprintf(log, "{\"surface\":\"%s\",\"K\":%g,\"dropped\":1,\"agree\":%zu,\"disagree\":%zu,\"own_pos\":%zu,\"own_neg\":%zu,\"own_dir\":%d}\n", base, Ks[k], v->agree, v->dis, v->own_pos, v->own_neg, v->own_dir);
+            continue;
+        }
+        const int sdir = sense_surf ? (v->own_dir ? v->own_dir : i1[k].radial_dir) : sense;
         ws_surf S; if (ws_read(argv[a], &S)) { ws_free(&S); rc = 1; continue; }
         const int w = S.w, h = S.h; const size_t N = (size_t)w * h;
         wind_result r; wind_seed_info in;
-        const int e = wind_seed(S.xyz, S.valid, w, h, wa_axis_fn, &A, K, sense, phi0, &in, &r);
+        const int e = wind_seed(S.xyz, S.valid, w, h, wa_axis_fn, &A, K, sdir, sense_surf ? NAN : phi0, &in, &r);
         if (e == -1) { fprintf(stderr, "wind-seed: out of memory\n"); return 1; }
-        const char *base = strrchr(argv[a], '/'); base = base && base[1] ? base + 1 : argv[a];
         if (e == -2) { ws_free(&S); continue; }
         char od[1400], qp[1500]; snprintf(od, sizeof od, "%s/%s", argv[2], base);
         const double f = vol_um / out_um; float *X = S.X, *Y = S.Y, *Z = S.Z;
@@ -1440,25 +1618,25 @@ static int cmd_wind_seed(int argc, char **argv) {
         if (tifxyz_write(od, w, h, X, Y, Z, 1.0, out_um, -1, "ufsm wind-seed (x / y / z of the input; q.tif: the set's own winding gauge)")) { fprintf(stderr, "wind-seed: cannot write %s\n", od); rc = 1; }
         snprintf(qp, sizeof qp, "%s/q.tif", od);
         if (tiffw_write(qp, w, h, 3, r.q, 1)) { fprintf(stderr, "wind-seed: cannot write %s\n", qp); rc = 1; }
-        const int dis = sense && in.radial_dir != sense; ndis += dis;
-        printf("%s K %g dir %+d%s span %.2f turns, q start %.3f, r start %.0f end %.0f mean %.0f (scan voxels), %zu of %zu valid vertices assigned\n", base, K, in.dir,
-               dis ? " (the radius rule says the other end is inner)" : "", in.span, in.q_start, in.r_start, in.r_end, in.r_mean, in.nassigned, in.nvalid);
-        fprintf(log, "{\"surface\":\"%s\",\"K\":%g,\"dir\":%d,\"radial_dir\":%d,\"span\":%.4f,\"q_start\":%.4f,\"r_start\":%.2f,\"r_end\":%.2f,\"r_mean\":%.2f,\"assigned\":%zu,\"valid\":%zu}\n",
-                base, K, in.dir, in.radial_dir, in.span, in.q_start, in.r_start, in.r_end, in.r_mean, in.nassigned, in.nvalid);
+        const int dis = in.radial_dir != sdir; ndis += dis; nown += v->own_dir && v->own_dir != sdir;
+        printf("%s K %g%s dir %+d%s span %.2f turns, q start %.3f, r start %.0f end %.0f mean %.0f (scan voxels), pairs agree %zu disagree %zu (own + %zu - %zu), %zu of %zu valid vertices assigned\n",
+               base, Ks[k], order < 0 ? " (as -K)" : "", in.dir, dis ? " (end-gap radius rule: other end inner)" : "", in.span, in.q_start, in.r_start, in.r_end, in.r_mean, v->agree, v->dis, v->own_pos, v->own_neg, in.nassigned, in.nvalid);
+        fprintf(log, "{\"surface\":\"%s\",\"K\":%g,\"K_used\":%g,\"dir\":%d,\"radial_dir\":%d,\"own_dir\":%d,\"agree\":%zu,\"disagree\":%zu,\"own_pos\":%zu,\"own_neg\":%zu,\"span\":%.4f,\"q_start\":%.4f,\"r_start\":%.2f,\"r_end\":%.2f,\"r_mean\":%.2f,\"assigned\":%zu,\"valid\":%zu}\n",
+                base, Ks[k], K, in.dir, in.radial_dir, v->own_dir, v->agree, v->dis, v->own_pos, v->own_neg, in.span, in.q_start, in.r_start, in.r_end, in.r_mean, in.nassigned, in.nvalid);
         kr[nsurf] = (ws_kr){K, in.r_mean, a};
         wind_result_free(&r); ws_free(&S); nsurf++;
     }
-    if (sense) fprintf(stderr, "wind-seed: %d of %d surfaces' radius rule disagrees with the set's sense\n", ndis, nsurf);
-    if (!kopt && nsurf > 1) {   /* the names against the radial order */
+    fprintf(stderr, "wind-seed: %d of %d written surfaces' end-gap radius rule disagrees with their sense (not used), %d their own pairs' sense; %d dropped\n", ndis, nsurf, nown, ch.ndropped);
+    if (!kopt && nsurf > 1) {   /* the names (as used) against the radial order */
         qsort(kr, nsurf, sizeof *kr, cmp_ws_kr); int inv = 0, rep = 0;
         for (int k = 1; k < nsurf; k++) {
             const char *b0 = strrchr(argv[kr[k - 1].idx], '/'), *b1 = strrchr(argv[kr[k].idx], '/');
             if (kr[k].K == kr[k - 1].K) { rep++; fprintf(stderr, "wind-seed: K %g named twice: %s, %s\n", kr[k].K, b0 ? b0 + 1 : "", b1 ? b1 + 1 : ""); }
-            else if (kr[k].rmean < kr[k - 1].rmean) { inv++; fprintf(stderr, "wind-seed: out of radial order: K %g (mean r %.0f) inside K %g (mean r %.0f)\n", kr[k].K, kr[k].rmean, kr[k - 1].K, kr[k - 1].rmean); }
+            else if (kr[k].rmean < kr[k - 1].rmean) { inv++; fprintf(stderr, "wind-seed: out of radial order (mean radius, axis-sensitive): K %g (mean r %.0f) inside K %g (mean r %.0f)\n", kr[k].K, kr[k].rmean, kr[k - 1].K, kr[k - 1].rmean); }
         }
-        fprintf(stderr, "wind-seed: names vs radii: %d inversions between consecutive K, %d repeated K\n", inv, rep);
+        fprintf(stderr, "wind-seed: names vs mean radii: %d inversions between consecutive K, %d repeated K\n", inv, rep);
     }
-    free(kr); free(idx); free(Ks); free(i1);
+    free(kr); free(idx); free(Ks); free(i1); free(pv);
     fclose(log);
     fprintf(stderr, "wind-seed: %d surfaces -> %s\n", nsurf, argv[2]);
     return rc;
@@ -2625,6 +2803,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "side-votes") || !strcmp(cmd, "codes-merge")) return cmd_side_votes(argc, argv);
     if (!strcmp(cmd, "wind-assign")) return cmd_wind_assign(argc, argv);
     if (!strcmp(cmd, "wind-seed")) return cmd_wind_seed(argc, argv);
+    if (!strcmp(cmd, "phase-check")) return cmd_phase_check(argc, argv);
     if (!strcmp(cmd, "phase-fuse") || !strcmp(cmd, "recto-fuse")) return cmd_fuse(argc, argv);
     if (!strcmp(cmd, "ct-hist")) return cmd_ct_hist(argc, argv);
     if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);

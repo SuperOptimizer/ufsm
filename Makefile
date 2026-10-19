@@ -22,7 +22,7 @@ CUDA    ?= /usr/local/cuda
 NVFLAGS ?= -O3 -arch=sm_120 -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
 CUDALIBS = -L$(CUDA)/lib64 -lcudart
 
-SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/fuse.c
+SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/fuse.c src/phase_check.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
@@ -141,6 +141,8 @@ $(B)/test_tiffw: tests/test_tiffw.c $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 $(B)/test_wind: tests/test_wind.c src/wind.h $(B)/wind.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_wind.c $(B)/wind.o -o $@ -lm
+$(B)/test_phase_check: tests/test_phase_check.c src/phase_check.h $(B)/phase_check.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_phase_check.c $(B)/phase_check.o -o $@ -lm
 $(B)/test_fuse: tests/test_fuse.c src/fuse.c src/fuse.h src/band.h | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_fuse.c src/fuse.c -o $@ -lm
 $(B)/bench_votes: tests/bench_votes.c src/votes.h $(B)/zarr3.o $(B)/store.o $(B)/json.o
@@ -274,7 +276,7 @@ test-all: $(B)/test_wgrad_grid
 $(B):
 	mkdir -p $(B)
 
-test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/test_votes $(B)/test_wind $(B)/test_fuse $(B)/check_surface_samples $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon $(B)/test_muonc $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_tiffw $(B)/test_edt $(B)/test_volcomp $(B)/test_typed_zarr $(B)/test_aug_preset $(B)/test_l0_norm $(B)/test_l0_slab $(B)/test_wind_sampler
+test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/test_votes $(B)/test_wind $(B)/test_phase_check $(B)/test_fuse $(B)/check_surface_samples $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon $(B)/test_muonc $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_tiffw $(B)/test_edt $(B)/test_volcomp $(B)/test_typed_zarr $(B)/test_aug_preset $(B)/test_l0_norm $(B)/test_l0_slab $(B)/test_wind_sampler
 	./$(B)/test_target_erode
 	./$(B)/test_wind_sampler
 	./$(B)/test_papyrus
@@ -296,6 +298,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_side
 	./$(B)/test_votes
 	./$(B)/test_wind
+	./$(B)/test_phase_check
 	./$(B)/test_fuse
 	./$(B)/test_gn_frozen
 	./$(B)/test_l0_norm
