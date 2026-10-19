@@ -545,7 +545,8 @@ static int cmd_band(int argc, char **argv) {
    local box away from the axis (crushed scrolls): the axis replaced by a vertical line D native voxels from the box centre along the
    mean sheet normal (D < 0: the other side). --cpu: the CPU backend (no GPU; src/fit_terms.h holds the terms both backends fit).
    --phase-robust S: a Cauchy phase residual of scale S turns; --conf-pow P: phase weight conf^P; --bend B: curvature-adaptive
-   smoothness (fit_cfg). */
+   smoothness; --w-pgrad W [--pgrad-delta D]: phase-gradient matching (src/fit_terms.h); --unwrap-voxels 1 / 0 / -1: the phase
+   stage's integer init by voxels / lattice nodes / none (fit_cfg). */
 /* U (the unwrapped radius in turns; sheets where U - dir theta / 2 pi is an integer) for the scorer: fill(ctx, og, n3, step, codes, U)
    writes U at og + i step (native voxels relative to the box origin) over the n3 grid, NaN where unknown (it may skip the points
    whose code is not 1..252); returns nonzero on failure */
@@ -636,12 +637,13 @@ static int cmd_fit(int argc, char **argv) {
     c.cpu = arg_index(argc, argv, "--cpu") > 0; c.threads = atoi(opt(argc, argv, "--threads", "0")); fit_set_threads(c.threads);
     c.phase_robust = (float)atof(opt(argc, argv, "--phase-robust", "0")); c.conf_pow = (float)atof(opt(argc, argv, "--conf-pow", "1"));
     c.bend = (float)atof(opt(argc, argv, "--bend", "0"));
+    c.w_pgrad = (float)atof(opt(argc, argv, "--w-pgrad", "0")); c.pgrad_delta = (float)atof(opt(argc, argv, "--pgrad-delta", "0.25"));
     c.w_phase = (float)atof(opt(argc, argv, "--w-phase", "1")); c.w_normal = (float)atof(opt(argc, argv, "--w-normal", "1"));
     c.w_density = (float)atof(opt(argc, argv, "--w-density", "1")); c.w_smooth = (float)atof(opt(argc, argv, "--w-smooth", "0.1"));
-    if (!(c.phase_robust >= 0) || !(c.conf_pow > 0) || !(c.bend >= 0) || !(c.w_phase >= 0) || !(c.w_normal >= 0) || !(c.w_density >= 0) || !(c.w_smooth >= 0)) {
-        fprintf(stderr, "fit: --phase-robust, --bend and the weights must be >= 0, --conf-pow > 0\n"); return 2;
+    if (!(c.w_pgrad >= 0) || !(c.pgrad_delta > 0) || c.unwrap_voxels < -1 || c.unwrap_voxels > 1 || !(c.phase_robust >= 0) || !(c.conf_pow > 0) || !(c.bend >= 0) || !(c.w_phase >= 0) || !(c.w_normal >= 0) || !(c.w_density >= 0) || !(c.w_smooth >= 0)) {
+        fprintf(stderr, "fit: --phase-robust, --bend and the weights must be >= 0, --conf-pow and --pgrad-delta > 0, --unwrap-voxels -1, 0 or 1\n"); return 2;
     }
-    c.uw_split = atof(opt(argc, argv, "--uw-split", "0")); c.uw_tile = atoi(opt(argc, argv, "--uw-tile", "256"));
+    c.uw_split = atof(opt(argc, argv, "--uw-split", "0")); c.uw_tile = atoi(opt(argc, argv, "--uw-tile", "256")); c.uw_pdv = atof(opt(argc, argv, "--uw-pdv", "0")); c.uw_min_conf = atof(opt(argc, argv, "--uw-min-conf", "0.3"));
     c.core = (float)atof(opt(argc, argv, "--core", "3"));   /* no data terms within core x pitch of the axis */
     c.analytic = atoi(opt(argc, argv, "--analytic", "1")); c.packed_um = atof(opt(argc, argv, "--packed-um", "0")); c.batch = atoi(opt(argc, argv, "--batch", "2000000")); c.knot_dz = atoi(opt(argc, argv, "--knot-dz", "1024")); c.phase_stage = atoi(opt(argc, argv, "--phase-stage", "4"));
     if (*opt(argc, argv, "--lattice", "")) { c.nstage = 0; char *t = strdup(opt(argc, argv, "--lattice", "")); for (char *q = strtok(t, ","); q && c.nstage < 8; q = strtok(nullptr, ",")) c.lattice[c.nstage++] = atoi(q); free(t); }
@@ -1402,6 +1404,7 @@ static float *wd_read(const char *path, int *w, int *h) { return read_tif_f32(pa
 typedef struct { int w, h, id; float *X, *Y, *Z; uint8_t *code; float *dist; } ws_wrap;   /* dist: um along the normal to the code */
 typedef struct {
     ws_wrap *W; int nw; long *rs; long nrows; double sc, R; const uint8_t *lab; int64_t o[3], n[3], z0, z1; _Atomic long next; double lum;
+    const axis *ax; double s0;   /* with --axis: the normals turned away from the axis, dist signed (+: the code lies outward) */
 } ws_job;
 static void *ws_rows(void *arg) {
     ws_job *J = arg;
@@ -1420,13 +1423,17 @@ static void *ws_rows(void *arg) {
             double N[3] = {du[1] * dv[2] - du[2] * dv[1], du[2] * dv[0] - du[0] * dv[2], du[0] * dv[1] - du[1] * dv[0]};
             const double nl = sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]); if (!(nl > 0)) continue;
             for (int k = 0; k < 3; k++) N[k] /= nl;
+            if (J->ax) {   /* outward: away from the axis (the published codes' winding grows outward) */
+                double cy, cx; axis_at(J->ax, w->Z[i] * J->s0, &cy, &cx);
+                if (N[1] * (w->Y[i] * J->s0 - cy) + N[2] * (w->X[i] * J->s0 - cx) < 0) for (int k = 0; k < 3; k++) N[k] = -N[k];
+            }
             for (int s = 0; s <= 4 * (int)ceil(J->R); s++) {   /* t = 0, +.5, -.5, +1, -1, ...: the nearest labelled voxel first */
                 const double t = (s + 1) / 2 * 0.5 * (s % 2 ? 1 : -1); if (fabs(t) > J->R) break;
                 int64_t p[3]; int in = 1;
                 for (int k = 0; k < 3; k++) { p[k] = (int64_t)llround(P[k] + t * N[k]) - J->o[k]; in &= p[k] >= 0 && p[k] < J->n[k]; }
                 if (!in) continue;
                 const uint8_t v = J->lab[((size_t)p[0] * J->n[1] + p[1]) * J->n[2] + p[2]];
-                if (v >= 1 && v <= 252) { w->code[i] = v; w->dist[i] = (float)(fabs(t) * J->lum); break; }
+                if (v >= 1 && v <= 252) { w->code[i] = v; w->dist[i] = (float)((J->ax ? t : fabs(t)) * J->lum); break; }
             }
         }
     }
@@ -1502,6 +1509,9 @@ static int cmd_wrapswitch(int argc, char **argv) {
         const double v[3] = {Wr[k].Z[i] * sc, Wr[k].Y[i] * sc, Wr[k].X[i] * sc};
         for (int d = 0; d < 3; d++) { if (v[d] < lo[d]) lo[d] = v[d]; if (v[d] > hi[d]) hi[d] = v[d]; }
     }
+    axis ax = {0}; const char *axp = opt(argc, argv, "--axis", nullptr); const int dir = atoi(opt(argc, argv, "--dir", "1"));
+    if (axp && axis_load(&ax, axp)) { fprintf(stderr, "wrapswitch: cannot load the axis %s\n", axp); return 1; }
+    const double s0 = wum / 2.4;   /* wrap voxels -> level-0 (axis) voxels */
     const int Ri = (int)ceil(R) + 1; int64_t bo[3], bn[3];
     for (int d = 0; d < 3; d++) { bo[d] = (int64_t)floor(lo[d]) - Ri; if (bo[d] < 0) bo[d] = 0; int64_t e = (int64_t)ceil(hi[d]) + Ri + 1; if (e > zm->shape[d]) e = zm->shape[d]; bn[d] = e - bo[d]; }
     long *rs = malloc((nw + 1) * sizeof *rs); rs[0] = 0; for (int k = 0; k < nw; k++) rs[k + 1] = rs[k] + Wr[k].h;
@@ -1509,7 +1519,7 @@ static int cmd_wrapswitch(int argc, char **argv) {
     if (!lab) { fprintf(stderr, "wrapswitch: no memory for %d rows of %zu voxels (lower --chunk)\n", C + 2 * Ri, plane); return 1; }
     for (int64_t z0 = bo[0]; z0 < bo[0] + bn[0]; z0 += C) {
         const int64_t a = z0 - Ri < bo[0] ? bo[0] : z0 - Ri, b = z0 + C + Ri > bo[0] + bn[0] ? bo[0] + bn[0] : z0 + C + Ri;
-        ws_job J = {Wr, nw, rs, rs[nw], sc, R, lab, {a, bo[1], bo[2]}, {b - a, bn[1], bn[2]}, z0, z0 + C, 0, lum};
+        ws_job J = {Wr, nw, rs, rs[nw], sc, R, lab, {a, bo[1], bo[2]}, {b - a, bn[1], bn[2]}, z0, z0 + C, 0, lum, axp ? &ax : nullptr, s0};
         if (z3_read(z, J.o, J.n, lab, nt)) { fprintf(stderr, "wrapswitch: %s\n", z3_error()); return 1; }
         pthread_t th[64]; const int k = nt < 64 ? nt : 64; for (int t = 0; t < k; t++) pthread_create(&th[t], nullptr, ws_rows, &J);
         for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
@@ -1520,11 +1530,8 @@ static int cmd_wrapswitch(int argc, char **argv) {
        sheet (up to one global gauge), and off by whole turns elsewhere. Gauge: the circular mean of e's fraction, then the most
        common whole turn; right = |e - gauge| < 0.5 turn (mod 14). Over all wraps with one gauge, and per wrap with its own (on its
        majority sheet: coherent though maybe a turn off) */
-    axis ax = {0}; const char *axp = opt(argc, argv, "--axis", nullptr); const int dir = atoi(opt(argc, argv, "--dir", "1"));
-    if (axp && axis_load(&ax, axp)) { fprintf(stderr, "wrapswitch: cannot load the axis %s\n", axp); return 1; }
-    const double s0 = wum / 2.4;   /* wrap voxels -> level-0 (axis) voxels */
     double gre = 0, gim = 0; size_t ghist[14] = {0}, nright = 0, nown = 0, ncod = 0;
-    float *dall = malloc(sizeof(float) * 1024); size_t nd = 0, capd = 1024; size_t d10 = 0, d20 = 0;
+    float *dall = malloc(sizeof(float) * 1024); size_t nd = 0, capd = 1024; size_t d10 = 0, d20 = 0, sdpos = 0, sdneg = 0; double sdsum = 0;
     if (axp) for (int k = 0; k < nw; k++) for (size_t i = 0; i < (size_t)Wr[k].w * Wr[k].h; i++) {   /* the global fraction */
         if (!Wr[k].code[i]) continue;
         double cy, cx; axis_at(&ax, Wr[k].Z[i] * s0, &cy, &cx);
@@ -1547,7 +1554,8 @@ static int cmd_wrapswitch(int argc, char **argv) {
         for (size_t i = 0; i < (size_t)Wr[k].w * Wr[k].h; i++) {
             vl += Wr[k].Z[i] >= 0; cd += Wr[k].code[i] > 0; if (!Wr[k].code[i]) continue;
             if (nd == capd) { capd *= 2; dall = realloc(dall, capd * sizeof *dall); }
-            dall[nd++] = Wr[k].dist[i]; d10 += Wr[k].dist[i] <= 10; d20 += Wr[k].dist[i] <= 20;
+            const float ad = fabsf(Wr[k].dist[i]); sdsum += Wr[k].dist[i]; sdpos += Wr[k].dist[i] > 0; sdneg += Wr[k].dist[i] < 0;
+            dall[nd++] = ad; d10 += ad <= 10; d20 += ad <= 20;
             if (!axp) continue;
             double cy, cx; axis_at(&ax, Wr[k].Z[i] * s0, &cy, &cx);
             const double e = (Wr[k].code[i] - 1) / 18.0 - dir * atan2(Wr[k].Y[i] * s0 - cy, Wr[k].X[i] * s0 - cx) / (2 * M_PI) - Wr[k].id;
@@ -1570,7 +1578,9 @@ static int cmd_wrapswitch(int argc, char **argv) {
            A[0].runs ? A[0].path / A[0].runs * 1e-3 : 0, A[1].path * 1e-4, A[1].sw, A[1].path > 0 ? A[1].sw / (A[1].path * 1e-4) : 0, A[1].runs ? A[1].path / A[1].runs * 1e-3 : 0);
     if (nd) { qsort(dall, nd, sizeof(float), cmp_fl);
         printf("wrapswitch: distance along the normal to the nearest published sheet (coded vertices): median %.1f um, p90 %.1f; of all vertices <= 10 um %.3f, <= 20 um %.3f\n",
-               dall[nd / 2], dall[nd * 9 / 10], valid ? (double)d10 / valid : 0, valid ? (double)d20 / valid : 0); }
+               dall[nd / 2], dall[nd * 9 / 10], valid ? (double)d10 / valid : 0, valid ? (double)d20 / valid : 0);
+        if (axp) printf("wrapswitch: signed (+: the published sheet lies outward of the vertex, away from the axis): mean %+.2f um, outward %.3f, inward %.3f, at 0 %.3f\n",
+                        sdsum / nd, (double)sdpos / nd, (double)sdneg / nd, (double)(nd - sdpos - sdneg) / nd); }
     if (axp && ncod) printf("wrapswitch: on the right sheet (one global gauge %.3f: q = k + dir theta / 2 pi + gauge, mod 14) %.3f of coded vertices; on their wrap's majority sheet %.3f\n", gfr + gm, (double)nright / ncod, (double)nown / ncod);
     free(dall); free(Wr); free(rs);
     return 0;

@@ -27,14 +27,20 @@ typedef struct {
     int phase_stage;                /* stages before it fit the gradient terms only (normal, density: no integer ambiguity, they
                                        integrate the turn count); the phase term (periodic) refines from this stage on */
     float phase_ramp;               /* phase_stage: phase weight from phase_ramp * w_phase to w_phase */
-    int unwrap_voxels;              /* phase-stage init: 1 voxel-level quality-guided unwrapping (default), 0 lattice-node unwrapping */
+    int unwrap_voxels;              /* phase-stage init: 1 voxel-level quality-guided unwrapping (default), 0 lattice nodes, -1 none
+                                       (the phase stages start from the gradient stages' W) */
     double uw_split;                /* > 0: two-level voxel unwrapping: tiles flood their voxels of confidence >= uw_split in parallel,
                                        the pieces are stitched by border votes, then the serial flood does the rest (0: serial only) */
     int uw_tile;                    /* its tile edge (field voxels) */
+    double uw_min_conf;             /* the unwrapping's lowest phase confidence (0: 0.3) */
+    double uw_pdv;                  /* > 0: the unwrapping quality (flood order, node weights) times exp(-pdv / uw_pdv^2), pdv the
+                                       phase derivative variance (turns^2): dislocated / noisy phase is flooded last */
     int analytic;                   /* 1: nn_fit_loss2 (analytic grad W, voxel minibatches; knots fixed after the prior), 0: nn_fit_loss */
     int cpu, threads;               /* cpu: the CPU backend (no GPU; analytic only), threads (0: all cores, UFSM_FIT_THREADS) */
     float phase_robust;             /* > 0: the phase residual's Cauchy scale in turns (src/fit_terms.h); 0: the plain 1 - cos */
     float conf_pow;                 /* the phase weight min(conf, 1)^conf_pow (1: linear, as before) */
+    float w_pgrad, pgrad_delta;     /* phase-gradient matching (src/fit_terms.h fit_pgrad_term): weight (0: off) and Huber scale
+                                       (relative gradient error) */
     float bend;                     /* > 0: curvature-adaptive smoothness: per lattice node w_smooth / (1 + bend x b), b = the
                                        node's normal dispersion 1 - lambda_max(mean n n^T) / tr (0 planar sheets, up to 2/3) x 10 */
     double um;                      /* native voxel size: the slab driver's lattices / pooling are physical (2.4 um: 512 ... 32) */
@@ -64,7 +70,7 @@ typedef struct fit_model {
     long long origin[3];            /* the box's native origin (set by the caller; saved with the model) */
     double um;                      /* native voxel size (saved; 0 = unknown, read as 2.4) */
     float *cy, *cx;                 /* axis table (D h + 1 entries) */
-    double loss[6];                 /* final loss parts: total, phase, normal, density, nondegeneracy, smoothness */
+    double loss[7];                 /* final loss parts: total, phase, normal, density, nondegeneracy, phase gradient, smoothness */
 } fit_model;
 
 fit_cfg fit_cfg_default(void);
@@ -94,16 +100,19 @@ typedef struct {
     int stride; unsigned salt;              /* nn_fit_loss2: voxels with hash(i, salt) % stride == 0 this step, data terms x stride */
     float packed_sp, packed_floor;          /* > 0: the phase weight ramps from 1 at spacing code packed_sp down to packed_floor at 0.6 x it */
     float phase_robust, conf_pow;           /* fit_cfg's (src/fit_terms.h) */
+    float w_pgrad, pgrad_delta;
+    const float *pg;                        /* pooled fields only: 4 planes Gz Gy Gx c (the phase gradient, turns per native voxel, and its
+                                               confidence; null: from pc / ps on the fly) */
 } fit_dev;
-/* the data terms over every field voxel: loss parts (double[5]: total, phase, normal, density, nondeg, accumulated) and the
-   gradients of delta and of the knots (accumulated: zero them first) */
+/* the data terms over every field voxel: loss parts (double[6]: total, phase, normal, density, nondeg, phase gradient, accumulated)
+   and the gradients of delta and of the knots (accumulated: zero them first) */
 void nn_fit_loss(const fit_dev *f, double *parts, float *g_delta, float *g_pitch, float *g_offset);
 /* the same data terms with grad W analytic (trilinear delta, the prior's and theta's derivatives, the axis slope) at the voxel
    centre only, on a random 1 / stride subset of the voxels; the knots get no gradient (delta carries the fit) */
 void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta);
 void fit_loss2_host(const fit_dev *f, double *parts, float *g_delta);   /* the same on the CPU backend (host arrays in f; stratified subsets) */
 /* smoothness w_smooth * sum_n wn_n (laplacian delta)_n^2 + w_decay * sum delta^2 over the lattice (lap: lattice-sized scratch; wn:
-   per-node weights, nullptr = 1): adds to parts[5] and g_delta */
+   per-node weights, nullptr = 1): adds to parts[6] and g_delta */
 void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float w_smooth, float w_decay, const float *wn, float *lap, double *parts, float *g_delta);
 /* predict --fit-fields: pool a window's interior (logits [c][W^3] fp32, the window's CT) into the box's fit-field accumulators
    (12 planes over F = ceil(box / h), see src/nn_fit.cu); t = the window origin relative to the box */

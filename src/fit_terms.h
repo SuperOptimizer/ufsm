@@ -33,7 +33,7 @@ FIT_HD void fit_phase_term(const fit_dev *f, size_t i, float W, float weight, do
     } else { *l += c * res; *dW += c * tp * sa; }
 }
 /* the gradient terms of voxel i at g = grad W: loss parts added to lp[2..4], dL/dg to dg */
-FIT_HD void fit_grad_terms(const fit_dev *f, size_t i, const float g[3], float weight, double lp[5], float dg[3]) {
+FIT_HD void fit_grad_terms(const fit_dev *f, size_t i, const float g[3], float weight, double lp[6], float dg[3]) {
     const float g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2] + 1e-12f, gl = sqrtf(g2);
     const float tzz = f->t[0][i] * (1.f / 255.f), tyy = f->t[1][i] * (1.f / 255.f), txx = f->t[2][i] * (1.f / 255.f);
     const float tzy = f->t[3][i] * (1.f / 255.f) - 0.5f, tzx = f->t[4][i] * (1.f / 255.f) - 0.5f, tyx = f->t[5][i] * (1.f / 255.f) - 0.5f;
@@ -51,11 +51,45 @@ FIT_HD void fit_grad_terms(const fit_dev *f, size_t i, const float g[3], float w
         if (lo > 0.f && f->w_nondeg > 0.f) { const float c = f->w_nondeg * weight; lp[4] += c * lo * lo; for (int d = 0; d < 3; d++) dg[d] += -c * 2.f * lo * g[d] / gl; }
     }
 }
+/* phase-gradient matching (w_pgrad > 0): per axis d the wrapped phase step to the next cell G_d = wrap(phi(i + e_d) - phi(i)) / (2 pi h)
+   (turns per native voxel; pooled stages: f->pg, confidence-weighted means over the pool cell) against g_d = dW / dx_d, as the Huber
+   function of the relative error r = (g_d - G_d) / rho (rho = 1 / spacing, turns per native voxel) at scale pgrad_delta: quadratic
+   below it, L1 above. No integers (it fits in the gradient-only stages too), signed (it knows which way the windings grow, which n n^T
+   and the density do not), robust (a dislocation of the phase costs its length, not its square: the turn count follows the
+   confident phase and cuts through the low-confidence patches, as L1 phase unwrapping does). The loss into lp[5]. */
+FIT_HD void fit_pgrad_term(const fit_dev *f, size_t i, const float g[3], float weight, double lp[6], float dg[3]) {
+    if (!(f->w_pgrad > 0.f) || !f->sp[i]) return;
+    const float rho = 8.f / (f->h * (float)f->sp[i]), dl = f->pgrad_delta > 0.f ? f->pgrad_delta : 0.25f;
+    float G[3] = {0, 0, 0}, c[3] = {0, 0, 0};
+    const size_t HW = (size_t)f->H * f->W, n = HW * f->D;
+    if (f->pg) { for (int d = 0; d < 3; d++) { G[d] = f->pg[d * n + i]; c[d] = f->pg[3 * n + i]; } }
+    else {
+        const float mc = ((int)f->pc[i] - 128) * (1.f / 127.f), ms = ((int)f->ps[i] - 128) * (1.f / 127.f), c0 = sqrtf(mc * mc + ms * ms);
+        if (c0 < 0.05f) return;
+        const float a0 = atan2f(ms, mc);
+        const int pos[3] = {(int)(i / HW), (int)((i / f->W) % f->H), (int)(i % f->W)}, dim[3] = {f->D, f->H, f->W};
+        const size_t st[3] = {HW, (size_t)f->W, 1};
+        for (int d = 0; d < 3; d++) {
+            if (pos[d] + 1 >= dim[d]) continue;
+            const size_t j = i + st[d]; if (!f->w[j]) continue;
+            const float nc = ((int)f->pc[j] - 128) * (1.f / 127.f), ns = ((int)f->ps[j] - 128) * (1.f / 127.f), c1 = sqrtf(nc * nc + ns * ns);
+            if (c1 < 0.05f) continue;
+            float e = (atan2f(ns, nc) - a0) * 0.15915494309189535f; e -= floorf(e + 0.5f);
+            G[d] = e / f->h; c[d] = fminf(fminf(c0, c1), 1.f);
+        }
+    }
+    for (int d = 0; d < 3; d++) {
+        if (!(c[d] > 0.f)) continue;
+        const float r = (g[d] - G[d]) / rho, ar = fabsf(r), cc = f->w_pgrad * weight * c[d];
+        if (ar <= dl) { lp[5] += cc * r * r / (2.f * dl); dg[d] += cc * (r / dl) / rho; }
+        else { lp[5] += cc * (ar - 0.5f * dl); dg[d] += cc * (r > 0.f ? 1.f : -1.f) / rho; }
+    }
+}
 FIT_HD unsigned fit_hash(unsigned x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
 /* nn_fit_loss2's voxel i (weight wv, data terms x sc): W and grad W analytic at the voxel centre (trilinear delta, the knots' and
    theta's derivatives, the axis slope), the data terms into lp[1..4] (lp[0] their sum) and dL/d delta at the 8 lattice corners
    (indices ic, values gv); returns 0 inside the core (no terms) */
-FIT_HD int fit_vox2(const fit_dev *f, size_t i, float wv, float sc, double lp[5], size_t ic[8], float gv[8]) {
+FIT_HD int fit_vox2(const fit_dev *f, size_t i, float wv, float sc, double lp[6], size_t ic[8], float gv[8]) {
     const int z = (int)(i / ((size_t)f->H * f->W)), y = (int)((i / f->W) % f->H), x = (int)(i % f->W);
     const float pz = (z + 0.5f) * f->h, py = (y + 0.5f) * f->h, px = (x + 0.5f) * f->h;
     /* axis and its z slope */
@@ -91,7 +125,8 @@ FIT_HD int fit_vox2(const fit_dev *f, size_t i, float wv, float sc, double lp[5]
     float dW = 0.f, dg[3] = {0, 0, 0};
     fit_phase_term(f, i, W0, wv * sc, &lp[1], &dW);
     fit_grad_terms(f, i, g, wv * sc, lp, dg);
-    lp[0] = lp[1] + lp[2] + lp[3] + lp[4];
+    fit_pgrad_term(f, i, g, wv * sc, lp, dg);
+    lp[0] = lp[1] + lp[2] + lp[3] + lp[4] + lp[5];
     for (int c = 0; c < 8; c++) gv[c] = dW * wc[c] + dg[0] * gw[c][0] + dg[1] * gw[c][1] + dg[2] * gw[c][2];
     return 1;
 }

@@ -48,10 +48,10 @@ __device__ __forceinline__ float fit_wrap(float a) {   /* into (-pi, pi] */
 
 __global__ void fit_loss_k(fit_dev f, double *parts, float *g_delta, float *g_pitch, float *g_offset) {
     __shared__ float sp_pitch[FIT_MAXK], sp_off[FIT_MAXK];
-    __shared__ double red[5][FIT_TPB];
+    __shared__ double red[6][FIT_TPB];
     for (int k = threadIdx.x; k < f.nk; k += blockDim.x) { sp_pitch[k] = 0.f; sp_off[k] = 0.f; }
     __syncthreads();
-    double lp[5] = {0, 0, 0, 0, 0};
+    double lp[6] = {0, 0, 0, 0, 0, 0};
     const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     const float wv = i < n ? f.w[i] * (1.f / 255.f) : 0.f;
     if (wv > 0.f) {
@@ -70,8 +70,9 @@ __global__ void fit_loss_k(fit_dev f, double *parts, float *g_delta, float *g_pi
             float dU[7] = {0, 0, 0, 0, 0, 0, 0}, dg[3] = {0, 0, 0};
             fit_phase_term(&f, i, W0, wv, &lp[1], &dU[0]);
             fit_grad_terms(&f, i, g, wv, lp, dg);
+            fit_pgrad_term(&f, i, g, wv, lp, dg);
             for (int d = 0; d < 3; d++) { dU[1 + 2 * d] += dg[d] / (2.f * e); dU[2 + 2 * d] -= dg[d] / (2.f * e); }
-            lp[0] = lp[1] + lp[2] + lp[3] + lp[4];
+            lp[0] = lp[1] + lp[2] + lp[3] + lp[4] + lp[5];
             for (int s = 0; s < 7; s++) {
                 const float du = dU[s];
                 if (du == 0.f) continue;
@@ -87,10 +88,10 @@ __global__ void fit_loss_k(fit_dev f, double *parts, float *g_delta, float *g_pi
             }
         }
     }
-    for (int k = 0; k < 5; k++) red[k][threadIdx.x] = lp[k];
+    for (int k = 0; k < 6; k++) red[k][threadIdx.x] = lp[k];
     __syncthreads();
-    for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 5; k++) red[k][threadIdx.x] += red[k][threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) for (int k = 0; k < 5; k++) atomicAdd(&parts[k], red[k][0]);
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 6; k++) red[k][threadIdx.x] += red[k][threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) for (int k = 0; k < 6; k++) atomicAdd(&parts[k], red[k][0]);
     for (int k = threadIdx.x; k < f.nk; k += blockDim.x) {
         if (sp_pitch[k] != 0.f) atomicAdd(&g_pitch[k], sp_pitch[k]);
         if (sp_off[k] != 0.f) atomicAdd(&g_offset[k], sp_off[k]);
@@ -142,7 +143,7 @@ __global__ void fit_smooth_k(const float *v, const float *lap, const float *wn, 
     red[threadIdx.x] = l;
     __syncthreads();
     for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) atomicAdd(&parts[5], red[0]);
+    if (threadIdx.x == 0) atomicAdd(&parts[6], red[0]);
 }
 extern "C" void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float w_smooth, float w_decay, const float *wn, float *lap, double *parts, float *g_delta) {
     const size_t n = (size_t)lz * ly * lx;
@@ -271,8 +272,8 @@ extern "C" void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo
 
 /* analytic data terms (nn_fit_loss2): one evaluation per voxel (src/fit_terms.h fit_vox2) */
 __global__ void fit_loss2_k(fit_dev f, double *parts, float *g_delta) {
-    __shared__ double red[5][FIT_TPB];
-    double lp[5] = {0, 0, 0, 0, 0};
+    __shared__ double red[6][FIT_TPB];
+    double lp[6] = {0, 0, 0, 0, 0, 0};
     const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     const float wv = i < n && (f.stride <= 1 || fit_hash((unsigned)i ^ f.salt) % (unsigned)f.stride == 0) ? f.w[i] * (1.f / 255.f) : 0.f;
     if (wv > 0.f) {
@@ -280,10 +281,10 @@ __global__ void fit_loss2_k(fit_dev f, double *parts, float *g_delta) {
         if (fit_vox2(&f, i, wv, (float)(f.stride > 1 ? f.stride : 1), lp, ic, gv))
             for (int c = 0; c < 8; c++) if (gv[c] != 0.f) atomicAdd(&g_delta[ic[c]], gv[c]);
     }
-    for (int k = 0; k < 5; k++) red[k][threadIdx.x] = lp[k];
+    for (int k = 0; k < 6; k++) red[k][threadIdx.x] = lp[k];
     __syncthreads();
-    for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 5; k++) red[k][threadIdx.x] += red[k][threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) for (int k = 0; k < 5; k++) atomicAdd(&parts[k], red[k][0]);
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 6; k++) red[k][threadIdx.x] += red[k][threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) for (int k = 0; k < 6; k++) atomicAdd(&parts[k], red[k][0]);
 }
 extern "C" void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta) {
     const size_t n = (size_t)f->D * f->H * f->W;

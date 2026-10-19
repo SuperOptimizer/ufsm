@@ -123,20 +123,29 @@ static int sf_native(const sf_wrap *s, const sf_fields *F, size_t i, double q[3]
     if (sign < 0) for (int k = 0; k < 3; k++) N[k] = -N[k];
     return 1;
 }
-/* the sign that turns the wrap's grid normals towards increasing W: a wrap of ufsm wraps is a graph r(z, theta) around its axis, so
-   its grid normal keeps one orientation; it is the majority sign of the fields' phase change across the vertex along the normal
-   (the phase is 2 pi W: it grows with W), over confident vertices; the axis of the fields (+1 when no vertex is confident) */
-static int sf_orient(const sf_wrap *s, const sf_fields *F) {
-    long vote = 0, avote = 0; const size_t n = (size_t)s->w * s->h; const double dl = F->h / 2;
+/* the sign that turns the wrap's grid normals towards increasing W: a wrap of ufsm wraps is a graph r(z, theta) around its model's
+   axis, so its grid normal keeps one orientation. With the model (m): the majority sign of the normal's radial component from the
+   model's axis (exact: W grows away from it); else the majority sign of the fields' phase change across the vertex along the normal
+   (the phase is 2 pi W) over confident vertices, else the fields' axis (a local box's fields carry the scroll's axis, not the fit's) */
+static int sf_orient(const sf_wrap *s, const sf_fields *F, const fit_model *m) {
+    long vote = 0, avote = 0, mvote = 0; const size_t n = (size_t)s->w * s->h; const double dl = F->h / 2;
+    const int mna = m ? (int)(m->D * m->h) + 1 : 0;
     for (size_t i = 0; i < n; i += 13) {
         double q[3], N[3]; if (s->Z[i] < 0 || !sf_native(s, F, i, q, N, 1)) continue;
         const double zi = fmin(fmax(q[0], 0), F->na - 1), ry = q[1] - F->cy[(int)zi], rx = q[2] - F->cx[(int)zi];
         avote += N[1] * ry + N[2] * rx > 0 ? 1 : -1;
+        if (m) {   /* the vertex in the model's box */
+            const double g[3] = {q[0] + F->org[0] - m->origin[0], q[1] + F->org[1] - m->origin[1], q[2] + F->org[2] - m->origin[2]};
+            const int mz = (int)fmin(fmax(g[0], 0), mna - 1);
+            mvote += N[1] * (g[1] - m->cy[mz]) + N[2] * (g[2] - m->cx[mz]) > 0 ? 1 : -1;
+            continue;
+        }
         const double a[3] = {q[0] - dl * N[0], q[1] - dl * N[1], q[2] - dl * N[2]}, b[3] = {q[0] + dl * N[0], q[1] + dl * N[1], q[2] + dl * N[2]};
         double ac, as, bc, bs; sff_phase(F, a, &ac, &as); sff_phase(F, b, &bc, &bs);
         if (ac * ac + as * as < 0.09 || bc * bc + bs * bs < 0.09) continue;
         const double d = wrap_turn((atan2(bs, bc) - atan2(as, ac)) / (2 * M_PI)); vote += d > 0 ? 1 : d < 0 ? -1 : 0;
     }
+    if (m) return mvote >= 0 ? 1 : -1;
     return vote ? (vote > 0 ? 1 : -1) : (avote >= 0 ? 1 : -1);
 }
 
@@ -199,18 +208,20 @@ static int rf_solve(const sf_wrap *s, const float *cw, const float *t, double la
 }
 int cmd_refine(int argc, char **argv) {
     if (argc < 4 || !sopt(argc, argv, "--fields", nullptr)) {
-        fprintf(stderr, "usage: ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40] [--target 0] [--min-conf 0.2] [--iters 400] [--threads 16]\n"); return 2;
+        fprintf(stderr, "usage: ufsm refine <wraps-in> <wraps-out> --fields DIR [--model FIT] [--range 0.33] [--smooth-um 40] [--target 0] [--min-conf 0.2] [--iters 400] [--threads 16]\n"); return 2;
     }
     const double range = atof(sopt(argc, argv, "--range", "0.33")), smooth_um = atof(sopt(argc, argv, "--smooth-um", "40")), target = atof(sopt(argc, argv, "--target", "0"));
     const double minconf = atof(sopt(argc, argv, "--min-conf", "0.2")); const int iters = atoi(sopt(argc, argv, "--iters", "400")), nt = atoi(sopt(argc, argv, "--threads", "16"));
     if (!(range > 0) || range > 0.5 || !(smooth_um >= 0) || nt < 1) { fprintf(stderr, "refine: --range in (0, 0.5] sheet spacings, --smooth-um >= 0\n"); return 2; }
     sf_fields F; if (sff_load(sopt(argc, argv, "--fields", ""), &F)) { fprintf(stderr, "refine: cannot read the fields %s\n", sopt(argc, argv, "--fields", "")); return 1; }
+    fit_set *ms = sopt(argc, argv, "--model", nullptr) ? fit_set_load(sopt(argc, argv, "--model", "")) : nullptr;   /* orients the normals */
+    if (sopt(argc, argv, "--model", nullptr) && !ms) { fprintf(stderr, "refine: cannot load the model %s\n", sopt(argc, argv, "--model", "")); return 1; }
     char (*names)[256] = nullptr; const int nn = sf_names(argv[2], &names); if (nn <= 0) { fprintf(stderr, "refine: no wraps in %s\n", argv[2]); return 1; }
     size_t tv = 0, tf = 0; double sabs = 0, sraw = 0; int nw = 0;
     for (int k = 0; k < nn; k++) {
         sf_wrap s; if (sf_load(argv[2], names[k], &s)) continue;
         const size_t n = (size_t)s.w * s.h; float *t = malloc(n * 4), *c = malloc(n * 4), *R = malloc(n * 4), *N = malloc(n * 12); double *d = malloc(n * 8);
-        rf_job J = {&s, &F, range, target, minconf, t, c, R, N, 0, sf_orient(&s, &F)};
+        rf_job J = {&s, &F, range, target, minconf, t, c, R, N, 0, sf_orient(&s, &F, ms ? ms->global : nullptr)};
         pthread_t th[64]; const int m = nt < 64 ? nt : 64;
         for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, rf_rows, &J);
         for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
@@ -236,7 +247,7 @@ int cmd_refine(int argc, char **argv) {
     }
     printf("refine: %d wraps, %zu vertices, %.3f with a target-phase crossing within %.2f spacings (mean |t| %.1f um), mean |move| after smoothing (%.0f um) %.1f um -> %s\n",
            nw, tv, tv ? (double)tf / tv : 0, range, tf ? sraw / tf * F.um : 0, smooth_um, tv ? sabs / tv * F.um : 0, argv[3]);
-    free(names); sff_free(&F);
+    free(names); sff_free(&F); fit_set_free(ms);
     return nw ? 0 : 1;
 }
 
@@ -316,7 +327,7 @@ static void *ss_rows(void *arg) {   /* phase residual and confidence at each ver
 static int cmp_f32(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
 int cmd_surf_stats(int argc, char **argv) {
     if (argc < 3 || !sopt(argc, argv, "--fields", nullptr)) {
-        fprintf(stderr, "usage: ufsm surf-stats <wraps-dir> --fields DIR [--min-conf 0.3] [--gap 1] [--min-run 100] [--ct ROOT KEY --ct-um U [--ct-level 80] [--ct-range 15] [--cache DIR]] [--threads 16] [--per-wrap]\n"); return 2;
+        fprintf(stderr, "usage: ufsm surf-stats <wraps-dir> --fields DIR [--model FIT] [--min-conf 0.3] [--gap 1] [--min-run 100] [--ct ROOT KEY --ct-um U [--ct-level 80] [--ct-range 15] [--cache DIR]] [--threads 16] [--per-wrap]\n"); return 2;
     }
     const double cmin = atof(sopt(argc, argv, "--min-conf", "0.3")), gap_um = atof(sopt(argc, argv, "--gap", "1")) * 1000, min_um = atof(sopt(argc, argv, "--min-run", "100"));
     const int nt = atoi(sopt(argc, argv, "--threads", "16")), per = sflag(argc, argv, "--per-wrap");
@@ -326,18 +337,20 @@ int cmd_surf_stats(int argc, char **argv) {
     z3 *cz = ci > 0 ? z3_open(store_open(argv[ci + 1]), argv[ci + 2], sopt(argc, argv, "--cache", nullptr)) : nullptr;
     if (ci > 0 && !cz) { fprintf(stderr, "surf-stats: %s\n", z3_error()); return 1; }
     sf_fields F; if (sff_load(sopt(argc, argv, "--fields", ""), &F)) { fprintf(stderr, "surf-stats: cannot read the fields\n"); return 1; }
+    fit_set *ms = sopt(argc, argv, "--model", nullptr) ? fit_set_load(sopt(argc, argv, "--model", "")) : nullptr;   /* orients the normals */
+    if (sopt(argc, argv, "--model", nullptr) && !ms) { fprintf(stderr, "surf-stats: cannot load the model %s\n", sopt(argc, argv, "--model", "")); return 1; }
     char (*names)[256] = nullptr; const int nn = sf_names(argv[2], &names); if (nn <= 0) { fprintf(stderr, "surf-stats: no wraps in %s\n", argv[2]); return 1; }
     /* the CT profile: offsets -30..30 um at the CT voxel (on-papyrus: the max over |t| <= ctR) */
     const double ctstep = ctum > 0 ? ctum : 1; const int nprof = ctum > 0 ? 2 * (int)ceil(30 / ctstep) + 1 : 0;
     double *prof = calloc(nprof + 1, sizeof(double)); size_t *pcount = calloc(nprof + 1, sizeof(size_t)), on = 0, onn = 0, ctn = 0, ctlow = 0;
     ss_stat A[2] = {{0}}; size_t nv = 0, nconf = 0, nbad = 0, nang = 0, nang30 = 0; double ctsum = 0;
-    float *eall = malloc(sizeof(float) * 1024), *aall = malloc(sizeof(float) * 1024); size_t ne = 0, cape = 1024, na = 0, capa = 1024;
+    float *eall = malloc(sizeof(float) * 1024), *aall = malloc(sizeof(float) * 1024), *cfall = malloc(sizeof(float) * 1024); size_t ne = 0, cape = 1024, na = 0, capa = 1024, ncf = 0, capc = 1024;
     if (per) printf("  wrap  vertices  conf>=%.1f  |e|med  |e|>0.25  theta sw/cm  z sw/cm%s\n", cmin, cz ? "  on-papyrus" : "");
     for (int k = 0; k < nn; k++) {
         sf_wrap s; if (sf_load(argv[2], names[k], &s)) continue;
         const size_t n = (size_t)s.w * s.h; float *e = calloc(n, 4), *cf = calloc(n, 4), *ct = nprof ? malloc(n * nprof * 4) : nullptr;
         for (size_t i = 0; i < (size_t)n * nprof; i++) ct[i] = NAN;
-        const int sign = sf_orient(&s, &F);
+        const int sign = sf_orient(&s, &F, ms ? ms->global : nullptr);
         { ss_job J = {&s, &F, e, cf, nullptr, 0, 0, 0, 0, nullptr, {0}, {0}, 0, s.h, 0, s.w, 0, 0, sign};
           pthread_t th[64]; const int m = nt < 64 ? nt : 64; for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, ss_rows, &J); for (int q = 0; q < m; q++) pthread_join(th[q], nullptr); }
         if (cz) {   /* CT tiles of 128 x 512 vertices: each reads its own box (+ the profile reach) */
@@ -364,6 +377,7 @@ int cmd_surf_stats(int argc, char **argv) {
         for (size_t i = 0; i < n; i++) {
             if (s.Z[i] < 0) continue;
             wv++;
+            if (i % 7 == 0) { if (ncf == capc) { capc *= 2; cfall = realloc(cfall, capc * 4); } cfall[ncf++] = cf[i]; }
             if (cf[i] >= cmin) { wc++; const float a = fabsf(e[i]); we[wne++] = a; wb += a > 0.25f; }
             if (nprof) {
                 double mx = -1; int any = 0;
@@ -394,6 +408,7 @@ int cmd_surf_stats(int argc, char **argv) {
     }
     if (ne) qsort(eall, ne, 4, cmp_f32);
     if (na) qsort(aall, na, 4, cmp_f32);
+    if (ncf) { qsort(cfall, ncf, 4, cmp_f32); printf("surf-stats: phase confidence at the vertices: p10 %.2f median %.2f p90 %.2f\n", cfall[ncf / 10], cfall[ncf / 2], cfall[ncf * 9 / 10]); }
     printf("surf-stats: %zu vertices, %.3f with phase confidence >= %.2f; phase residual |e| (turns; 0 = on the fields' sheet phase) median %.3f p90 %.3f, > 0.25 %.3f\n",
            nv, nv ? (double)nconf / nv : 0, cmin, ne ? eall[ne / 2] : 0, ne ? eall[ne * 9 / 10] : 0, ne ? (double)nbad / ne : 0);
     printf("surf-stats: sheet switches in the phase: around the axis %.1f cm, %.0f switches, %.2f per cm, run %.2f mm; along z %.1f cm, %.0f, %.2f per cm, run %.2f mm\n",
@@ -407,6 +422,6 @@ int cmd_surf_stats(int argc, char **argv) {
         for (int q = 0; q < nprof; q++) printf(" %+.0f:%.1f", (q - (nprof - 1) / 2.0) * ctstep, pcount[q] ? prof[q] / pcount[q] : 0);
         printf("\n");
     }
-    free(eall); free(aall); free(prof); free(pcount); free(names); sff_free(&F); if (cz) z3_close(cz);
+    free(eall); free(aall); free(cfall); free(prof); free(pcount); free(names); sff_free(&F); fit_set_free(ms); if (cz) z3_close(cz);
     return 0;
 }
