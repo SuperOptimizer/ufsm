@@ -6,14 +6,19 @@
      and the local agreement (|W_b - s W_a - round(.)| < 1/4: the two fits put sheets at the same places, whatever the count).
    - solve: the maximum spanning tree of the box graph by agreement fixes each box's gauge G = s_i W_i + g_i; every other edge is
      checked against it (a cycle whose offsets do not sum to zero = an inconsistent overlap).
+   - quality: per box and block the phase coherence of its W with the network phase (a fit whose W runs against the sheets'
+     recto -> verso direction, e.g. across a crushed scroll's flattened core, has coherence ~0 there and high reversed coherence).
    - blending: a partition of unity over the boxes, smoothstep ramps across each face overlap (the overlap's width), hard at the
-     union's outer faces.
-   - sheets: a sheet is the zero set of F = sum_i phi_i s_i (W_i - off_i) / sum_i phi_i over the boxes that are "on" for it: in
-     gauge mode every box at the level the solved gauge gives (G = k), in follow mode the seed box at one of its own levels and
-     every other box joining where the sheet first reaches it, at its own level nearest the sheet there (sheet identity carried
-     across the seams by continuity: the boxes' integer offsets vary inside an overlap, so no constant gauge per box fits).
-     Traced as contours in z planes (no axis: arc length along the contour from an anchor column carried from row to row),
-     written as tifxyz. All coordinates are global native voxels (the fit fields' native grid). */
+     union's outer faces, times max(q, 0.05)^2 of the quality map.
+   - sheets: a sheet is the zero set of F = sum_i w_i s_i (W_i - off_i) / sum_i w_i over the boxes that are "on" for it: in gauge
+     mode every box at the level the solved gauge gives (G = k); in follow mode the gauge (s_i, off_i per box) is carried from
+     vertex to vertex from the seed box's own level: boxes join where the sheet reaches them (their level nearest it), keep their
+     residual within half a turn of the strongest box's, a box inside a fault of its fit (turns crammed: |grad W| > 1.5 x its
+     median) is down-weighted, and a fault of the blend (> fault_ratio x) is bridged straight from the last calm vertex, every box
+     re-levelling beyond it (sheet identity carried by continuity: the box fits' integer offsets change across their faults and
+     between boxes, so no constant gauge per box fits a crushed scroll). Traced as contours in z planes (no axis: arc length
+     along the contour from an anchor column carried row to row, rows aligned to their neighbours), written as tifxyz. All
+     coordinates are global native voxels (the fit fields' native grid). */
 #pragma once
 #include "fit.h"
 #include <stdint.h>
@@ -64,6 +69,11 @@ double st_box_q(const st_box *b, const double p[3]);
 /* the quality map of box b: per block of qb native voxels the phase coherence |sum w m e^{-2 pi i W}| / sum w |m| of the box's W
    with the network phase vector m (w the material) on a stride of field cells; 1 = the fit's sheets sit on the network's phase */
 int st_quality(st_box *b, const st_fields *F, double qb, int stride, int nthreads);
+/* the same coherence for any field ev (0: undefined at p) over [lo, hi): material-weighted means over blocks of qb, and the shares
+   of the material in coherent (>= 0.5) and in reversed (anti > coherence) blocks */
+typedef int (*st_field_fn)(void *ctx, const double p[3], double *W);
+typedef struct { double coherence, anti, coherent_frac, anti_frac; long long blocks; } st_coh;
+int st_coherence(st_field_fn ev, void *ctx, const st_fields *F, const double lo[3], const double hi[3], double qb, int stride, int nthreads, st_coh *out);
 /* ramp widths from the face overlaps among the boxes with comp >= 0 (by_comp: only between boxes of the same component) */
 void st_tapers(st_box *b, int nb, int by_comp);
 /* G at p over the boxes of component comp (comp < 0: all): returns the number of boxes with weight > 0 (0: not covered) */

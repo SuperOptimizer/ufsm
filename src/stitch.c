@@ -324,6 +324,69 @@ int st_quality(st_box *B, const st_fields *F, double qb, int stride, int nthread
     free(acc);
     return 0;
 }
+/* ---- phase coherence of any field with the network phase over a region ---- */
+typedef struct {
+    st_field_fn ev; void *ctx; const st_fields *F; int stride; const uint8_t *w, *pc, *ps; int64_t o[3], n[3], c0[3];
+    const double *lo; double qb; const int *qn; double *acc; int tid, nt;
+} coh_job;
+static void *coh_worker(void *arg) {
+    coh_job *J = arg; const double h = J->F->h; int64_t row = 0;
+    for (int64_t z = 0; z < J->n[0]; z++) {
+        const int64_t cz = J->o[0] + z; if ((cz - J->c0[0]) % J->stride) continue;
+        for (int64_t y = 0; y < J->n[1]; y++) {
+            const int64_t cy = J->o[1] + y; if ((cy - J->c0[1]) % J->stride) continue;
+            if (row++ % J->nt != J->tid) continue;
+            for (int64_t x = 0; x < J->n[2]; x++) {
+                const int64_t cx = J->o[2] + x; if ((cx - J->c0[2]) % J->stride) continue;
+                const size_t i = ((size_t)z * J->n[1] + y) * J->n[2] + x; if (!J->w[i]) continue;
+                const double p[3] = {J->F->org[0] + (cz + 0.5) * h, J->F->org[1] + (cy + 0.5) * h, J->F->org[2] + (cx + 0.5) * h};
+                int q[3], in = 1;
+                for (int d = 0; d < 3; d++) { q[d] = (int)((p[d] - J->lo[d]) / J->qb); if (q[d] < 0 || q[d] >= J->qn[d]) in = 0; }
+                double W; if (!in || !J->ev(J->ctx, p, &W)) continue;
+                const double mr = (J->pc[i] - 128.0) / 127.0, mi = (J->ps[i] - 128.0) / 127.0, wt = J->w[i] / 255.0, c = cos(2 * M_PI * W), s = sin(2 * M_PI * W);
+                double *a = J->acc + 5 * (((size_t)q[0] * J->qn[1] + q[1]) * J->qn[2] + q[2]);
+                a[0] += wt * (mr * c + mi * s); a[1] += wt * (mi * c - mr * s); a[2] += wt * (mr * c - mi * s); a[3] += wt * (mi * c + mr * s); a[4] += wt * hypot(mr, mi);
+            }
+        }
+    }
+    return nullptr;
+}
+int st_coherence(st_field_fn ev, void *ctx, const st_fields *F, const double lo[3], const double hi[3], double qb, int stride, int nthreads, st_coh *out) {
+    memset(out, 0, sizeof *out);
+    if (nthreads < 1) nthreads = 1;
+    if (nthreads > 64) nthreads = 64;
+    int qn[3]; size_t nq = 1; for (int d = 0; d < 3; d++) { qn[d] = (int)ceil((hi[d] - lo[d]) / qb); nq *= qn[d]; }
+    double *acc = calloc((size_t)nthreads * nq * 5, sizeof(double));
+    int64_t c0[3], c1[3];
+    for (int d = 0; d < 3; d++) { c0[d] = (int64_t)floor((lo[d] - F->org[d]) / F->h); if (c0[d] < 0) c0[d] = 0; c1[d] = (int64_t)ceil((hi[d] - F->org[d]) / F->h); }
+    const int64_t ny = c1[1] - c0[1], nx = c1[2] - c0[2]; uint8_t *buf = malloc((size_t)128 * ny * nx * 3); int rc = buf ? 0 : -1;
+    for (int64_t z0 = c0[0]; z0 < c1[0] && !rc;) {
+        const int64_t z1 = (z0 / 128 + 1) * 128 < c1[0] ? (z0 / 128 + 1) * 128 : c1[0], o[3] = {z0, c0[1], c0[2]}, n[3] = {z1 - z0, ny, nx};
+        const size_t nv = (size_t)n[0] * ny * nx;
+        if (F->read(F->ctx, o, n, buf, buf + nv, buf + 2 * nv)) { rc = -1; break; }
+        coh_job J[64]; pthread_t th[64];
+        for (int t = 0; t < nthreads; t++) {
+            J[t] = (coh_job){ev, ctx, F, stride, buf, buf + nv, buf + 2 * nv, {o[0], o[1], o[2]}, {n[0], n[1], n[2]}, {c0[0], c0[1], c0[2]}, lo, qb, qn, acc + (size_t)t * nq * 5, t, nthreads};
+            pthread_create(&th[t], nullptr, coh_worker, &J[t]);
+        }
+        for (int t = 0; t < nthreads; t++) pthread_join(th[t], nullptr);
+        z0 = z1;
+    }
+    free(buf);
+    if (rc) { free(acc); return -1; }
+    double sa = 0, sb = 0, sw = 0, wg = 0, wa = 0;
+    for (size_t k = 0; k < nq; k++) {
+        double a[5] = {0, 0, 0, 0, 0}; for (int t = 0; t < nthreads; t++) for (int u = 0; u < 5; u++) a[u] += acc[((size_t)t * nq + k) * 5 + u];
+        if (a[4] < 1e-6) continue;
+        const double A = hypot(a[0], a[1]), B = hypot(a[2], a[3]);
+        sa += A; sb += B; sw += a[4]; out->blocks++;
+        if (A >= 0.5 * a[4]) wg += a[4];
+        if (B > A) wa += a[4];
+    }
+    out->coherence = sw > 0 ? sa / sw : 0; out->anti = sw > 0 ? sb / sw : 0; out->coherent_frac = sw > 0 ? wg / sw : 0; out->anti_frac = sw > 0 ? wa / sw : 0;
+    free(acc);
+    return 0;
+}
 static double st_qw(const st_box *b, const double p[3]) { if (!b->q) return 1; const double q = st_box_q(b, p); return q < 0.05 ? 0.0025 : q * q; }
 
 /* ---- gauge files ---- */
@@ -1200,6 +1263,33 @@ static int stitch_quality(int argc, char **argv) {
     zf_close(&zc);
     return st_save(argv[4], b, nb, e, ne, um) ? 1 : 0;
 }
+typedef struct { const st_box *b; int nb, comp; } coh_ctx;
+static int ev_gauge(void *ctx, const double p[3], double *W) { const coh_ctx *c = ctx; return st_G(c->b, c->nb, c->comp, p, W) > 0; }
+static int ev_mosaic(void *ctx, const double p[3], double *W) {   /* the strongest box's own W (no stitching) */
+    const coh_ctx *c = ctx; int ib = -1; double wb = 0;
+    for (int i = 0; i < c->nb; i++) { if (c->comp >= 0 && c->b[i].comp != c->comp) continue; const double w = st_box_phi(&c->b[i], p) * st_qw(&c->b[i], p); if (w > wb) { wb = w; ib = i; } }
+    if (ib < 0) return 0;
+    *W = st_box_W(&c->b[ib], p); return 1;   /* its own orientation: phase coherence is sign sensitive */
+}
+static int stitch_coherence(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm stitch coherence <gauge.json> --fields ZARR [--comp 0] [--block 64] [--stride 4] [--threads 6]\n"); return 2; }
+    st_box *b; st_edge *e; int nb, ne; double um;
+    if (st_load(argv[3], &b, &nb, &e, &ne, &um)) { fprintf(stderr, "stitch: cannot read %s\n", argv[3]); return 1; }
+    const char *fz = sopt(argc, argv, "--fields", nullptr); if (!fz) { fprintf(stderr, "stitch coherence: --fields ZARR\n"); return 2; }
+    const int nt = atoi(sopt(argc, argv, "--threads", "6")), comp = atoi(sopt(argc, argv, "--comp", "0")), stride = atoi(sopt(argc, argv, "--stride", "4"));
+    const double qb = atof(sopt(argc, argv, "--block", "64"));
+    zf_ctx zc; st_fields F; if (zf_open(fz, nt, &zc, &F)) return 1;
+    double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+    for (int i = 0; i < nb; i++) if (b[i].comp == comp) for (int d = 0; d < 3; d++) { lo[d] = fmin(lo[d], b[i].lo[d]); hi[d] = fmax(hi[d], b[i].hi[d]); }
+    coh_ctx c = {b, nb, comp}; st_coh g, m; const double t0 = now_s();
+    if (st_coherence(ev_gauge, &c, &F, lo, hi, qb, stride, nt, &g) || st_coherence(ev_mosaic, &c, &F, lo, hi, qb, stride, nt, &m)) { fprintf(stderr, "stitch: cannot read the fields\n"); return 1; }
+    fprintf(stderr, "stitch coherence (component %d, %lld blocks of %g voxels, %.0fs): phase coherence with the network, mean over blocks (coherent >= 0.5 / anti-aligned blocks, material-weighted)\n"
+                    "  blended gauge field G: %.3f (reversed %.3f), coherent %.3f, anti-aligned %.3f\n"
+                    "  box mosaic (each point the strongest box's own W): %.3f (reversed %.3f), coherent %.3f, anti-aligned %.3f\n",
+            comp, g.blocks, qb, now_s() - t0, g.coherence, g.anti, g.coherent_frac, g.anti_frac, m.coherence, m.anti, m.coherent_frac, m.anti_frac);
+    zf_close(&zc);
+    return 0;
+}
 static int stitch_info(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm stitch info <gauge.json>\n"); return 2; }
     st_box *b; st_edge *e; int nb, ne; double um;
@@ -1216,12 +1306,14 @@ int cmd_stitch(int argc, char **argv) {
     if (!strcmp(sub, "sheets")) return stitch_sheets(argc, argv);
     if (!strcmp(sub, "info")) return stitch_info(argc, argv);
     if (!strcmp(sub, "quality")) return stitch_quality(argc, argv);
-    fprintf(stderr, "usage: ufsm stitch align|solve|quality|field|sheets|info ...\n"
+    if (!strcmp(sub, "coherence")) return stitch_coherence(argc, argv);
+    fprintf(stderr, "usage: ufsm stitch align|solve|quality|coherence|field|sheets|info ...\n"
                     "  align <out.json> --fields ZARR BOXDIR...   pairwise gauge offsets of overlapping box fits + the global gauge\n"
                     "  solve <in.json> <out.json> [--min-agree A] [--exclude NAMES]   the global gauge again (other thresholds)\n"
                     "  field <gauge.json> <out-group> [--step 8]    the blended global winding G (float32 zarr)\n"
                     "  sheets <gauge.json> <out-dir> [--fields ZARR]   level sets G = k as tifxyz across the boxes\n"
                     "  quality <in.json> <out.json> --fields ZARR   per-box maps of the fit's phase coherence with the network (blend weights)\n"
+                    "  coherence <gauge.json> --fields ZARR         phase coherence of the blended field vs the box mosaic\n"
                     "  info <gauge.json>                            the overlap table and the gauges\n");
     return 2;
 }
