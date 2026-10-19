@@ -2320,6 +2320,12 @@ static int cmd_sample(int argc, char **argv) {
     cfg.dist_sigma = (float)atof(opt(argc, argv, "--dist-head", "0"));
     int nb = atoi(opt(argc, argv, "--n", "4"));
     const char *out = opt(argc, argv, "--out", ".");
+    /* --levels W0,W1,...: level weights as train; --side 2 --wind4 1: the unwrap2 phase / winding mod 4 targets; --dump 1: each
+       window's phase (and w4 / comp) as raw P^3 bytes, <out>/phase_BB_I.raw (w4_BB_I.raw, wcomp_BB_I.raw): e.g. with UFSM_SAMPLE_AT
+       the same corners from two sources files (a stored phase's sign, "phase_sign") */
+    { const char *lv = opt(argc, argv, "--levels", nullptr); if (lv) { char *t = strdup(lv); int l = 0; memset(cfg.level_p, 0, sizeof cfg.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) cfg.level_p[l++] = atof(q); free(t); } }
+    cfg.side = atoi(opt(argc, argv, "--side", "0")); cfg.wind4 = atoi(opt(argc, argv, "--wind4", "0"));
+    const int dump = atoi(opt(argc, argv, "--dump", "0"));
     sources *S = sources_load(path);
     if (!S) return 1;
     fprintf(stderr, "%d sources\n", S->n);
@@ -2351,6 +2357,15 @@ static int cmd_sample(int argc, char **argv) {
             char fn[1200];
             snprintf(fn, sizeof fn, "%s/patch_%02d_%d.pgm", out, bi, i);
             write_pgm(fn, img, (int64_t)cols * P, P);
+            if (dump && cfg.side) {
+                const char *nm[3] = {"phase", "w4", "wcomp"}; uint8_t *bf[3] = {b->side, cfg.wind4 ? b->w4 : nullptr, cfg.wind4 ? b->wcomp : nullptr};
+                for (int k = 0; k < 3; k++) if (bf[k]) {
+                    snprintf(fn, sizeof fn, "%s/%s_%02d_%d.raw", out, nm[k], bi, i); FILE *f = fopen(fn, "wb");
+                    if (!f || fwrite(bf[k] + (size_t)i * p3, 1, p3, f) != p3) { fprintf(stderr, "sample: cannot write %s\n", fn); if (f) fclose(f); return 1; }
+                    fclose(f);
+                }
+                snprintf(fn, sizeof fn, "%s/patch_%02d_%d.pgm", out, bi, i);
+            }
             fprintf(stderr, "%s: src %s level %d corner %lld,%lld,%lld w=[%d,%d]\n", fn, S->src[b->src[i]].name, b->level[i],
                     (long long)b->corner[i][0], (long long)b->corner[i][1], (long long)b->corner[i][2], b->w[i * NCH], b->w[i * NCH + 1]);
         }
