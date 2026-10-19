@@ -196,6 +196,44 @@ int main(void) {
         CHECK(nz16 == 0 && rlo > 0 && rhi / rlo < 1.01, "fp16 gradient: ratio %.4g .. %.4g, %zu nonzero where fp32 is 0", rlo, rhi, nz16);
         free(la); free(lb); free(ga); free(gb); free(ga2); free(gb2); free(w4); free(cp); free(m); free(w4s); dev_free(&d);
     }
+    /* (4) degenerate windows (the desk's unwrap2 run draws windows from sources with no recto, often with little or no phase): every
+       phase unknown, one known voxel, a constant phase, unknown-only tiles, a 1-plane slab; then losses with nothing supervised, one
+       voxel, every voxel its own component, saturated logits: finite values, zero / finite gradients, no out-of-range component */
+    {
+        const int D = 9, H = 33, W = 47; const size_t n = (size_t)D * H * W;
+        uint8_t *ph = malloc(n), *w4 = malloc(n), *cp = malloc(n);
+        for (int c = 0; c < 6; c++) {
+            memset(ph, PHASE_UNKNOWN, n);
+            if (c == 1) ph[n / 2] = 17;
+            if (c == 2) memset(ph, 40, n);
+            if (c == 3) for (size_t i = 0; i < n; i += 2) ph[i] = (uint8_t)(i % 252);   /* checkerboard-ish noise: joins rare and inconsistent */
+            if (c == 4) for (size_t i = 0; i < n; i++) ph[i] = (i / ((size_t)H * W)) == 4 ? (uint8_t)((i % W) * 9 % 252) : PHASE_UNKNOWN;
+            band_wind4_stats st;
+            const int t = c == 5 ? 0 : 8, nc = c == 5 ? band_wind4_tiled(ph, 1, H, W, 4, 80, 1, 1, w4, cp, &st) : band_wind4_tiled(ph, D, H, W, t, 80, 512, 1, w4, cp, &st);
+            size_t bad = 0; for (size_t i = 0; i < (c == 5 ? (size_t)H * W : n); i++) bad += (cp[i] == 255) != (w4[i] == 255) || (cp[i] != 255 && (cp[i] >= nc || w4[i] >= 252));
+            printf("degenerate targets case %d: %d components, %zu known, %zu kept, %zu inconsistent voxels\n", c, nc, st.known, st.kept, bad);
+            CHECK(nc >= 0 && bad == 0 && (c != 0 || nc == 0) && (c != 1 || nc == 0), "degenerate targets case %d: %d components, %zu bad voxels", c, nc, bad);
+        }
+        free(ph); free(w4); free(cp);
+        const size_t m = 4096; dev_t4 d = dev_alloc(m);
+        float *la = malloc(m * 4), *lb = malloc(m * 4), *ga = malloc(m * 4), *gb = malloc(m * 4), fin[8];
+        uint8_t *t4 = malloc(m), *c4 = malloc(m), *mk = malloc(m);
+        for (int c = 0; c < 4; c++) {
+            for (size_t i = 0; i < m; i++) {
+                la[i] = c == 3 ? (i & 1 ? 1e4f : -1e4f) : (float)(urand() * 4 - 2); lb[i] = c == 3 ? -la[i] : (float)(urand() * 4 - 2);
+                t4[i] = (uint8_t)(urand() * 252); mk[i] = c == 0 ? 0 : c == 1 ? (i == 77) * 8 : 8;
+                c4[i] = c == 2 ? (uint8_t)(i % 255) : c == 0 ? 255 : 3;
+            }
+            gpu_loss(&d, la, lb, t4, c4, mk, 1.f, fin, ga, gb);
+            int ok = isfinite(fin[0]) && isfinite(fin[1]) && isfinite(fin[5]); double gm = 0;
+            for (size_t i = 0; i < m; i++) { ok &= isfinite(ga[i]) && isfinite(gb[i]); gm = fmax(gm, fmax(fabs(ga[i]), fabs(gb[i]))); }
+            printf("degenerate loss case %d: loss %g worst %g acc %g voxels %g components %g, max |gradient| %.3g\n", c, fin[0], fin[5], fin[1], fin[2], fin[4], gm);
+            CHECK(ok, "degenerate loss case %d: non-finite loss or gradient", c);
+            CHECK(c != 0 || (fin[2] == 0 && gm == 0), "nothing supervised: voxels %g, gradient %g", fin[2], gm);
+            CHECK(c != 1 || gm <= 0.5 + 1e-6, "one voxel: gradient %g > 0.5 (lambda 0.5 / N x |sigma - p| <= 0.5)", gm);
+        }
+        free(la); free(lb); free(ga); free(gb); free(t4); free(c4); free(mk); dev_free(&d);
+    }
     if (fails) { fprintf(stderr, "test_wind4: %d failure(s)\n", fails); return 1; }
     printf("test_wind4: OK\n");
     return 0;

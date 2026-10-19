@@ -51,6 +51,7 @@ typedef struct {
     int gl_inplace;              /* the logit gradient over the fp16 logits (g_gl_inplace) */
     void *hs_lg; double *hs_ds; float hs_dice; int hs_z, hs_P;   /* head slabs (g_head_slab): fp16 logits of one slab, loss sums, recto dice, planes per slab, window width */
     int64_t cornb[2][3]; int lvlb[2];   /* level-0 corner / level of the batch in each buffer (verso dump) */
+    int srcb[2], last;           /* the batch's source in each buffer (-1 unknown); the buffer of the last training step's batch (diagnostics) */
     uint8_t *vsoft, *vanch;      /* --verso-ridge: the soft teacher output of the window; --verso-anchor ridge target */
     uint8_t *vmask, *vw; float *vscratch, vout[3]; double verso_loss;   /* verso loss: own mask (every owned voxel), weight byte, scratch, parts */
     float *teacher;              /* --verso frozen teacher: the starting weights, read by the verso target forward */
@@ -279,6 +280,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     d->sheet=b->sheet?b->sheet[0]:nullptr;
     d->um = d->umb[d->cur] = b->um ? b->um[0] : 0.f;
     if (b->corner && b->level) { memcpy(d->cornb[d->cur], b->corner[0], sizeof d->cornb[0]); d->lvlb[d->cur] = b->level[0]; }   /* validation copies carry none */
+    d->srcb[d->cur] = b->src ? b->src[0] : -1;
     if (d->side >= 0) { upload_slab(d, b, d->cur, B, P, 0); return; }
     size_t p3 = (size_t)g_Pz * P * P;
     nn_h2d(d->x, bx(b), (size_t)B * g_xs * p3 * xbytes());
@@ -303,6 +305,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     d->sheet=b->sheet?b->sheet[0]:nullptr;
     d->umb[i] = b->um ? b->um[0] : 0.f;
     if (b->corner && b->level) { memcpy(d->cornb[i], b->corner[0], sizeof d->cornb[0]); d->lvlb[i] = b->level[0]; }
+    d->srcb[i] = b->src ? b->src[0] : -1;
     size_t p3 = (size_t)g_Pz * P * P;
     if (d->upsplit) {   /* the head now, after the backward's last read of X2 and the records; the tail with upload_tail */
         nn_stream_wait(1, unet_l0_3buf_head_free(d->u));
@@ -548,6 +551,59 @@ static void head_slab_pass(gpu_state *d, int pass) {
     }
 }
 static void head_slab_cb(void *ctx) { head_slab_pass((gpu_state *)ctx, 1); }
+/* tests (env UFSM_TEST_NAN=MODE:STEP[,STEP...]): force a non-finite step on GPU 0 at those steps (where: 0 before the forward, 1 after the
+   forward and loss, 2 after the backward). MODE logit: +inf into the first logit-gradient element before the backward (an overflowing loss
+   gradient through the whole backward); grad: NaN into the first parameter gradient after it (the skip path alone); input: NaN into the
+   first input voxel (a non-finite forward); big: the first 1/8 of the input's CT channel at 60000 (an overflowing forward); zero: every
+   parameter gradient 0 after the backward (a window with nothing supervised) */
+static void test_nan_inject(gpu_state *d, int step, int where, int P) {
+    static int mode = -1; static char steps[256];
+    if (mode < 0) {
+        const char *e = getenv("UFSM_TEST_NAN"), *names[5] = {"logit:", "grad:", "input:", "big:", "zero:"}; mode = 0;
+        for (int k = 0; e && k < 5; k++) if (!strncmp(e, names[k], strlen(names[k]))) { mode = k + 1; snprintf(steps, sizeof steps, ",%s,", e + strlen(names[k])); }
+    }
+    static const int at[6] = {-1, 1, 2, 0, 0, 2};
+    if (!mode || d->dev != 0 || at[mode] != where) return;
+    char k[24]; snprintf(k, sizeof k, ",%d,", step);
+    if (!strstr(steps, k)) return;
+    if (mode == 1) {
+        if (!d->gl) return;   /* (head slabs: no whole-window logit gradient) */
+        const size_t n = getenv("UFSM_TEST_NAN_N") ? (size_t)atoll(getenv("UFSM_TEST_NAN_N")) : 1;   /* elements (a region: many overflowing blocks) */
+        if (g_g16) { uint16_t *h = malloc(2 * n); for (size_t i = 0; i < n; i++) h[i] = g_xfmt == 2 ? 0x7f80 : 0x7c00;   /* (bf16 0x7c00 is still ~5e36) */ nn_h2d(d->gl, h, 2 * n); free(h); }
+        else { float *h = malloc(4 * n); for (size_t i = 0; i < n; i++) h[i] = INFINITY; nn_h2d(d->gl, h, 4 * n); free(h); }
+    } else if (mode == 2) { const float nan = NAN; nn_h2d(unet_grad_ptr(d->u), &nan, 4); }
+    else if (mode == 5) nn_zero(unet_grad_ptr(d->u), unet_nparams(d->u) * 4);
+    else {
+        const size_t n = mode == 3 && !getenv("UFSM_TEST_NAN_N") ? 1 : mode == 3 ? (size_t)atoll(getenv("UFSM_TEST_NAN_N")) : (size_t)g_Pz * P * P / 8 + 1, eb = xbytes();
+        uint8_t *h = malloc(n * eb);
+        for (size_t i = 0; i < n; i++) {
+            if (eb == 4) { const float v = mode == 3 ? NAN : 60000.f; memcpy(h + 4 * i, &v, 4); }
+            else { const uint16_t v = g_xfmt == 2 ? (mode == 3 ? 0x7fc0 : 0x476a) : (mode == 3 ? 0x7e00 : 0x7b53); memcpy(h + 2 * i, &v, 2); }
+        }
+        nn_h2d(d->x, h, n * eb); free(h);
+    }
+    static const char *what[6] = {"", "+inf logit gradient", "NaN parameter gradient", "NaN input voxel", "input CT at 60000", "all-zero parameter gradient"};
+    fprintf(stderr, "test: step %d: %s injected\n", step, what[mode]);
+}
+/* the window of the last training step on this GPU (source, level, level-0 corner): which window of a deterministic stream misbehaved */
+static void window_note(const gpu_state *d, const sources *S, const char *what) {
+    const int b = d->last & 1, si = d->srcb[b];
+    fprintf(stderr, "%s on GPU %d: source %d (%s), level %d, level-0 corner %lld,%lld,%lld\n", what, d->dev, si, S && si >= 0 && si < S->n ? S->src[si].name : "?",
+            d->lvlb[b], (long long)d->cornb[b][0], (long long)d->cornb[b][1], (long long)d->cornb[b][2]);
+}
+/* UFSM_SYNC_CHECK=1: synchronise after the forward / losses and after the backward and report a CUDA error there with the window (slow;
+   for locating an asynchronous fault, e.g. with CUDA_LAUNCH_BLOCKING=1) */
+static const sources *g_Sdiag;
+static int sync_check(gpu_state *d, int step, const char *what) {
+    static int on = -1; if (on < 0) on = ufsm_env_on("UFSM_SYNC_CHECK");
+    if (!on) return 0;
+    nn_sync();
+    const char *e = nn_check();
+    if (!e) return 0;
+    fprintf(stderr, "cuda error at step %d after the %s: %s\n", step, what, e);
+    window_note(d, g_Sdiag, "  window");
+    return 1;
+}
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 xs = {B, g_xc, d->side >= 0 ? g_Dl : g_Pz, P, P};
     if (unet_cfg_of(d->u)->scale_cond) { if (g_papyrus) unet_set_cond(d->u, d->um); else unet_set_scale(d->u, d->um); }   /* B == 1 (checked at
@@ -1125,6 +1181,7 @@ int cmd_train(int argc, char **argv) {
     char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", out); if (system(cmd)) return 1;
 
     sources *S = sources_load(src);
+    g_Sdiag = S;
     if (!S) return 1;
     g_S = S;
     for (int i = 0; i < S->n; i++) {   /* --heads: every source's head exists; sources naming heads need --heads */
@@ -1861,7 +1918,7 @@ int cmd_train(int argc, char **argv) {
     }
     if (!atoi(opt(argc, argv, "--sampler-slots", "0"))) {   /* the default slot count against the host memory available now */
         const size_t p3s = (size_t)g_Pz * P * P, slotb = (size_t)B * p3s * ((size_t)g_xs * xbytes() + (g_pack ? 1 : NCH + 1) + (g_aff != 0) + (g_side != 0)
-                           + (g_unwrap != 0) + (g_cond != 0) + (g_pap_head != 0)) + rad_bytes(B), win = slotb + 4 * p3s;   /* + a worker's scratch */
+                           + (g_unwrap != 0) + 2 * (g_unwrap2 != 0) + (g_cond != 0) + (g_pap_head != 0)) + rad_bytes(B), win = slotb + 4 * p3s;   /* + a worker's scratch */
         const size_t avail = host_mem_available(), budget = avail / 10 * 7;
         int cap = win ? (int)(budget / win) : sc.nbuf;
         if (cap < 3) cap = 3;   /* (one uploading, two drawing) */
@@ -1999,8 +2056,14 @@ int cmd_train(int argc, char **argv) {
             nn_stream_wait(0, d->ev_up[d->cur]);           /* compute waits for the upload */
             if (sparse_at && step >= sparse_at && !unet_get_sparse24(d->u)) { unet_set_sparse24(d->u, 1); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (SR-STE lambda %g)\n", step, srste); }
             unet_zero_grad(d->u);
+            d->last = d->cur;
+            test_nan_inject(d, step, 0, P);   /* tests: UFSM_TEST_NAN */
             run_batch(d, B, P, dice_w, 1);
+            test_nan_inject(d, step, 1, P);
+            if (sync_check(d, step, "forward and losses")) return 1;
             unet_backward_x(d->u, g_half && !g_pkf ? d->glh : d->gl, g_g16);
+            test_nan_inject(d, step, 2, P);
+            if (sync_check(d, step, "backward")) return 1;
             nn_event_record(d->ev_done[d->cur], 0);
             nn_event_sync(d->ev_up[d->cur]);                 /* host buffer of this batch is free again */
             if (overfit) continue;                           /* keep computing on the same device buffer */
@@ -2026,6 +2089,8 @@ int cmd_train(int argc, char **argv) {
         int fwd_nan = 0;   /* non-finite loss parts: the forward itself produced non-finite logits (not a gradient-scale overflow) */
         if (g_sheet && !isfinite(G[0].sheet_loss)) fwd_nan=1;
         for (int g = 0; g < nl; g++) for (int c = 0; c < 2 * NCH; c++) if (!isfinite(parts[g][c])) fwd_nan = 1;
+        for (int g = 0; g < nl; g++)   /* the heads' own losses (task unwrap / unwrap2 have no recto parts in parts[]) */
+            if (!isfinite(G[g].side_loss) || !isfinite(G[g].norm_loss) || !isfinite(G[g].ink_loss) || !isfinite(G[g].w4_loss) || !isfinite(G[g].count_loss)) fwd_nan = 1;
         if (fwd_nan && !overfit && !split) diagnose_nan(&G[0], B, P, step, out);
         float lr;
         if (time_horizon) {
@@ -2062,6 +2127,7 @@ int cmd_train(int argc, char **argv) {
                 if (g == 0) {
                     if (fwd_nan) fprintf(stderr, "step %d: non-finite forward, skipping (grad scale kept at %g)\n", step, nn_get_grad_scale());
                     else { float sc = nn_get_grad_scale(); nn_set_grad_scale(sc > 1.f ? sc * 0.5f : 1.f); fprintf(stderr, "step %d: non-finite gradient norm, skipping; grad scale -> %g\n", step, nn_get_grad_scale()); }
+                    for (int q = 0; q < nl; q++) window_note(&G[q], S, "  window");
                     nskip++;
                 }
                 continue;
@@ -2082,7 +2148,7 @@ int cmd_train(int argc, char **argv) {
         committed_step = step;
         if (plan) { coverage.cursor = (uint64_t)(step - coverage.base_step); if (cover_checkpoint_extra(runtime_extra, &coverage, checkpoint_extra, sizeof checkpoint_extra)) return 2; }
         const char *e = nn_check();
-        if (e) { fprintf(stderr, "cuda error at step %d: %s\n", step, e); return 1; }
+        if (e) { fprintf(stderr, "cuda error at step %d: %s\n", step, e); for (int q = 0; q < nl; q++) window_note(&G[q], S, "  window"); return 1; }
         if ((seconds && now() - t0 >= seconds) || (schedule_seconds && schedule_elapsed+now()-t0>=schedule_seconds) ||
             (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
         acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][g_aff || g_unwrap || g_heads ? NCH : g_half ? g_cout : cfg.cout]; acc_g += gn; nacc++;

@@ -2106,6 +2106,20 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         tp_put(Tw, (NCH + 1) * p3);
     }
     PROF_MARK(PS_X16);
+    {   /* a non-finite input value (an augmentation dividing by a degenerate window's statistics): the window is rejected. The network
+           would not show it (the MX input conversion's amax ignores NaN) but the stem's weight gradient reads the 16-bit CT channel, so
+           the step's gradient goes non-finite (skipped, the gradient scale halved) on every replay of the window */
+        size_t bad = 0, k0 = 0; const size_t nx = xc * p3;
+        if (X) { for (size_t k = 0; k < nx; k++) if (!isfinite(X[k])) { if (!bad) k0 = k; bad++; } }
+        else { const uint16_t e = c->xfmt == 1 ? 0x7c00 : 0x7f80; for (size_t k = 0; k < nx; k++) if ((H[k] & e) == e) { if (!bad) k0 = k; bad++; } }
+        if (bad) {
+            static _Atomic int nwarn;
+            if (atomic_fetch_add(&nwarn, 1) < 20)
+                fprintf(stderr, "sampler: %s level %d corner %lld,%lld,%lld: %zu non-finite input values (first at channel %zu voxel %zu): window rejected\n",
+                        s->name, l, (long long)(o[0] << l), (long long)(o[1] << l), (long long)(o[2] << l), bad, k0 / p3, k0 % p3);
+            return 1;
+        }
+    }
     memcpy(b->w + (size_t)i * NCH, w, NCH);
     b->src[i] = (int16_t)si;
     b->level[i] = (int8_t)l;
