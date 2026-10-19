@@ -22,7 +22,7 @@ CUDA    ?= /usr/local/cuda
 NVFLAGS ?= -O3 -arch=sm_120 -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
 CUDALIBS = -L$(CUDA)/lib64 -lcudart
 
-SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c
+SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/stitch.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
@@ -137,6 +137,11 @@ $(B)/test_unwrap_targets: tests/test_unwrap_targets.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_fit: tests/test_fit.c $(B)/fit.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+$(B)/test_stitch: tests/test_stitch.c $(B)/stitch.o $(B)/fit.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/tiffw.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+
+test-all: $(B)/test_stitch
+
 $(B)/test_tiffw: tests/test_tiffw.c $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 $(B)/test_wind: tests/test_wind.c src/wind.h $(B)/wind.o
@@ -282,6 +287,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_half
 	./$(B)/test_unwrap_targets
 	./$(B)/test_fit
+	./$(B)/test_stitch
 	./$(B)/test_tiffw
 	./$(B)/test_edt
 	./$(B)/test_volcomp
