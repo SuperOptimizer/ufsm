@@ -64,6 +64,37 @@ int main(int argc, char **argv) {
     for (int i = 0; i < NB; i++) det &= !memcmp(d[i].x, b[i].x, p3 * 2) && !memcmp(d[i].tm, b[i].tm, p3) && !memcmp(d[i].w4, b[i].w4, p3) && !memcmp(d[i].side, b[i].side, p3);
     check("deterministic batches: 3 workers / 5 slots = 1 worker / 2 slots", det);
     drop(a); drop(b); drop(d); sources_free(S);
+    {   /* sparse labels: a stored phase known in one of the 8 chunks of a 512 fixture's level-1 grid; windows are drawn around it
+           (the phase-chunk occupancy index), none rejected for lack of CT, most of them labelled */
+        char d2[1500]; snprintf(d2, sizeof d2, "%s/sparse", dir);
+        if (make_wind_fixture(d2, 512, 4.f)) { fprintf(stderr, "fixture failed\n"); return 1; }
+        const int h = 256; uint8_t *ph = malloc((size_t)h * h * h); assert(ph);
+        for (int z = 0; z < h; z++) for (int y = 0; y < h; y++) for (int x = 0; x < h; x++) {
+            const double w = fx_wind(2.0 * z + .5, 2.0 * y + .5, 2.0 * x + .5), f = w - floor(w);
+            const int in = z >= 128 && y < 128 && x >= 128; int cc = (int)(f * PHASE_PERIOD); if (cc >= PHASE_PERIOD) cc = PHASE_PERIOD - 1;
+            ph[((size_t)z * h + y) * h + x] = in ? (uint8_t)cc : PHASE_UNKNOWN;
+        }
+        char pp[1600]; snprintf(pp, sizeof pp, "%s/phase/1", d2); char cmd[1700]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", pp); if (system(cmd)) return 1;
+        const int64_t hs[3] = {h, h, h}; fx_volctx cv = {ph, h};
+        if (fx_write_arr(pp, hs, 0.f, PHASE_UNKNOWN, fx_cut, &cv)) return 1;
+        free(ph);
+        snprintf(path, sizeof path, "%s/sources.json", d2);
+        sources *S2 = sources_load(path); assert(S2);
+        sample_cfg c2 = c; c2.nworkers = 2; c2.nbuf = 4; c2.min_fg = .3; c2.geometry_augment = 0; memset(c2.scan.p, 0, sizeof c2.scan.p);
+        sampler *sq = sampler_start(S2, &c2); assert(sq);
+        int inbox = 1; size_t kn = 0;
+        for (int i = 0; i < NB; i++) {
+            batch *bb = sampler_next(sq); assert(bb);
+            const int64_t *o = bb->corner[0];   /* the window meets the labelled chunk's level-0 extent [256, 512) x [0, 256) x [256, 512) (origins snap to the CT chunks) */
+            if (getenv("WS_DEBUG")) fprintf(stderr, "corner %lld %lld %lld\n", (long long)o[0], (long long)o[1], (long long)o[2]);
+            inbox &= o[0] + PW + 128 > 256 && o[0] < 512 && o[1] < 256 && o[2] + PW + 128 > 256 && o[2] < 512;   /* (+ 128: the snap down) */
+            for (size_t k = 0; k < p3; k++) kn += bb->side[k] < PHASE_PERIOD;
+            sampler_release(sq, bb);
+        }
+        uint64_t pr2, rj2; sampler_stats(sq, &pr2, &rj2); sampler_stop(sq); sources_free(S2);
+        printf("wind sampler: sparse labels: %.3f of the voxels with a known phase, %llu rejected\n", kn / (double)(NB * p3), (unsigned long long)rj2);
+        check("sparse labels: windows drawn around the labelled phase chunks", inbox && kn > NB * p3 / 4);
+    }
     if (argc < 2) { char cmd[1500]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) failed++; }
     return failed != 0;
 }

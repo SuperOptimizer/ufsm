@@ -38,6 +38,10 @@ int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nth
 
 /* Shard-level presence: 1 if the shard object exists in the store, 0 if not, -1 on error. */
 int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx);
+/* Inner-chunk presence of a sharded array from its shard indices alone (no chunk is read or decoded): bits[k] = 1 when chunk k
+   (z-major over the chunk grid ceil(shape / chunk), grid[] filled) is stored; chunks equal to the fill value are not (z3w omits
+   them). Returns the number present, -1 on error or an unsharded array. bits: grid[0] * grid[1] * grid[2] bytes (caller frees). */
+int64_t z3_chunk_map(z3 *z, int64_t grid[3], uint8_t **bits);
 
 /* OME group: list the level array paths and their voxel sizes. Returns count, fills up to max. */
 typedef struct { char path[64]; double um; } z3_level;

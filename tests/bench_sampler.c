@@ -125,6 +125,8 @@ int main(int argc, char **argv) {
     uint64_t prod, rej; sampler_stats(sp, &prod, &rej);
     printf("%dx%dx%d workers=%d: %.1f samples/s (%d batches of %d in %.1fs; produced %llu rejected %llu)\n", Pz, P, P, W, NB * c.B / dt, NB, c.B, dt, (unsigned long long)prod, (unsigned long long)rej);
     if (hashing) printf("hash %016llx over %d batches\n", (unsigned long long)h, NB + 4);
+    { uint64_t why[4]; sampler_reject_reasons(sp, why); printf("rejected: coarse probe %llu, after the CT read %llu, empty targets %llu; holdout overlaps %llu\n",
+                                                        (unsigned long long)why[0], (unsigned long long)why[1], (unsigned long long)why[2], (unsigned long long)why[3]); }
     sampler_prof_print(sp);
     sampler_stop(sp);
     return 0;
