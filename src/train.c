@@ -1310,7 +1310,11 @@ int cmd_train(int argc, char **argv) {
            target rows), --split, the papyrus task, --dist-head, the sheet prior or --overfit (geometry warps: nearest-code targets);
            --pack-targets 0: target and mask bytes */
         int hard = S->n > 0;
-        for (int i = 0; i < S->n; i++) hard &= S->src[i].tgt_side[CH_RECTO] && !S->src[i].tgt_votes_soft[CH_RECTO];   /* soft side votes: fractions */
+        for (int i = 0; i < S->n; i++) {   /* soft side votes: fractions; a source without target channels (band codes + stored phase only, the
+                                              --task unwrap2 sources) has all-zero targets, which pack (warps: the nearest code, also 0) */
+            int none = 1; for (int c = 0; c < NCH; c++) none &= !S->src[i].tgt_key[c] && !S->src[i].reg[c];
+            hard &= (S->src[i].tgt_side[CH_RECTO] && !S->src[i].tgt_votes_soft[CH_RECTO]) || none;
+        }
         g_pack = atoi(opt(argc, argv, "--pack-targets", "1")) && hard && !g_heads && !split && !sc.papyrus && sc.dist_sigma <= 0 && !sc.sheet && !overfit;   /* (warped windows take the nearest source voxel's code) */
         sc.pack_tm = g_pack;
         if (g_pack) fprintf(stderr, "targets: packed, one byte per voxel on the host and in the upload (--pack-targets 0: target and mask bytes)\n");

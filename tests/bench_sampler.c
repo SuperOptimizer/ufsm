@@ -11,7 +11,8 @@
    --phase-near-um; the known-phase fraction is printed); UFSM_BENCH_PRESET=all|none: train --aug's preset (sample_aug_preset);
    UFSM_BENCH_PACK=1: packed targets (train --pack-targets); UFSM_BENCH_WIND4=1: --task unwrap2's winding mod 4 (with SIDE=2; hashed);
    UFSM_BENCH_GEOM=rotate_p,zoom_p,elastic_p[,zoom_out_p]: geometry augmentation probabilities; UFSM_BENCH_DUMPN=N: dump the first N batches (prefix-NN-*.pgm; the
-   target as recto 255 / verso 128 / void 0, the mask, and the input's mid-z plane) */
+   target as recto 255 / verso 128 / void 0, the mask, and the input's mid-z plane); UFSM_BENCH_SLOTS=N: sampler slots. A synthetic band + phase
+   source in the desk's unwrap2 layout: tests/make_wind_fixture.c */
 #include "nn.h"
 #include "sample.h"
 #include "sources.h"
@@ -35,6 +36,7 @@ int main(int argc, char **argv) {
     sources *S = sources_load(argv[1]); if (!S) return 1;
     sample_cfg c = sample_cfg_default(); c.P = P; c.B = 2; c.nworkers = W; c.nbuf = 2 * W; c.soft = 3; c.augment = 4; c.xfmt = 1;
     if (getenv("UFSM_BENCH_TRAIN")) { c.B = 1; c.soft = 7; c.soft_um = 1; c.erode = 1; c.augment = 3; c.symmetry_p = 0.5f; c.deterministic = 1; c.seed = 1; }
+    if (getenv("UFSM_BENCH_SLOTS")) c.nbuf = atoi(getenv("UFSM_BENCH_SLOTS"));   /* slots (default 2 x workers: at P512 ~1 GB pinned each) */
     if (getenv("UFSM_BENCH_AUG")) c.augment = atoi(getenv("UFSM_BENCH_AUG"));
     if (getenv("UFSM_BENCH_CTAUG")) c.ct_augment = atoi(getenv("UFSM_BENCH_CTAUG"));   /* train --ct-aug */
     if (getenv("UFSM_BENCH_DET")) { c.deterministic = 1; c.seed = 1; }

@@ -1774,7 +1774,10 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (mx > tmax) tmax = mx;
         }
     }
-    if (!c->cover && !c->papyrus && tmax == 0 && runif(r) > c->empty_keep) { tp_put(dpap, p3); atomic_fetch_add(&sp->rejected, 1); return 1; }
+    /* empty windows (no target value above 0) kept with p empty_keep; a source without target channels (band codes + stored phase only:
+       the --task unwrap2 sources) has none to test, so its windows are all kept (they took the same coin flip, 4 of 5 draws wasted) */
+    int tgt_any = region_ch >= 0; for (int ch = 0; ch < NCH; ch++) tgt_any |= s->tgt_key[ch] != nullptr;
+    if (!c->cover && !c->papyrus && tgt_any && tmax == 0 && runif(r) > c->empty_keep) { tp_put(dpap, p3); atomic_fetch_add(&sp->rejected, 1); return 1; }
     PROF_MARK(PS_TARGETS);
     uint8_t *near = nullptr;   /* --phase-near-um: voxels within the distance of a labelled wrap voxel (raw labels, before softening) */
     if (c->phase_near_um > 0 && c->side == 2 && w[0]) {
