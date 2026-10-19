@@ -68,6 +68,19 @@ Kept: what `ufsm fit` reads, plus one new head for counting turns.
   losses fall. Warm start from wind96 (1.5k steps): normal starts at 0.54 (scratch 0.88).
 - Open: Paris4 labels are not on the laptop (consistency / kept fraction there unmeasured); the sampler cost of band_wind4 (one
   thread); predict's main output for unwrap2 is channel 0 = phase cos; fit-zarr field shards stay 128^3.
+- The desk's 2-GPU wind2-wk1 run (P512, 16..256, --mem fast) died with an illegal memory access (and a non-finite gradient in the
+  same step) ~1211 steps after every start; the logged windows were PHerc0172's (the heaviest source, phase-free windows) but the
+  windows replayed on the laptop (ASan sampler at P512, GPU at P128 / P256 with compute-sanitizer memcheck) were clean. Cause: a
+  device memory leak that only two GPUs on one host thread trigger. The GroupNorm+SiLU backward keeps its fp4 weight-gradient gy
+  records (lp_gn_silu_bwd_apply_rec; levels with a multiple of 32 channels) in one thread_local struct and reset the pointers
+  without freeing them at every GPU switch, so each GPU lost one record buffer per step (level 2 of this net at P512: 35.6 MB) until
+  its card was full; then the records fell back and the unchecked workspace allocations (the records' bias sums, lp_buf, tc_wbuf)
+  failed and their kernels wrote through invalid pointers. Earlier 2-GPU runs (prod96, wind96) probably ran with full cards too
+  (records off after the first steps: slower, but no workspace growth later).
+  Fix: lp_gyrec_select parks each GPU's buffers per device (tests/test_gyrec: 200 switches, no memory lost); the allocations are
+  checked. Also: --min-phase (unwrap2 default 0.001) redraws windows without phase (they supervise nothing); UFSM_SYNC_CHECK=1
+  counts non-finite logits / gradients per step, prints device memory free per GPU and locates a CUDA fault with its window;
+  UFSM_SAMPLE_AT replays given windows; tests/test_unwrap2_sampler (a non-cubic band + phase-only source).
 
 ## The two biggest level-0 kernels: conv_fwd_f4p_k and conv_bwd_w_f4ws_k (2026-10-16)
 Desk P512 trainer (P2's profile): conv_fwd_f4p_k (16-channel forward and backward-data) ~149 ms / step over 17 calls,
