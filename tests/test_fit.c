@@ -15,6 +15,7 @@ static int fails;
 static int g_dir; static double g_wob = 0.4, g_pack = 0.6, g_dpitch = 10; static int g_hole = 1; static double g_bias = 0;   /* FIT_BIAS: the phase under-counts the packed sector by this fraction (a weak network) */
 static const double H8 = 8, R0 = 384;
 static double g_split = 0; static int g_tile = 256;   /* the two-level unwrapping (fit_cfg uw_split / uw_tile) */
+static int g_cpu = 0; static float g_robust = 0, g_bend = 0;   /* the CPU backend, the Cauchy phase, curvature-adaptive smoothness */
 static double ax_y(double z) { return R0 + 0.02 * z; }
 static double ax_x(double z) { return R0 - 0.01 * z; }
 static double pitch_of(double z) { return 60 + g_dpitch * z / 384; }
@@ -61,7 +62,7 @@ static int run_case(int dir) {
         double s = 8 / (H8 * rho); sp[i] = (uint8_t)(s < 1 ? 1 : s > 255 ? 255 : lround(s));
     }
     fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx};
-    fit_cfg c = fit_cfg_default(); c.verbose = 1; c.uw_split = g_split; c.uw_tile = g_tile;
+    fit_cfg c = fit_cfg_default(); c.verbose = 1; c.uw_split = g_split; c.uw_tile = g_tile; c.cpu = g_cpu; c.phase_robust = g_robust; c.bend = g_bend;
     fit_model *m = fit_run(&f, &c);
     int bad = 0;
     if (!m) { fprintf(stderr, "FAIL: fit_run\n"); return 1; }
@@ -86,10 +87,32 @@ static int run_case(int dir) {
         right += fabs(d) < 0.5; close += fabs(d) < 0.08;
     }
     const double acc = (double)right / nd, prec = (double)close / nd;
-    printf("dir %+d%s: gauge %d, winding ids right %.4f, |error| < 0.08 turn %.4f (%zu voxels), loss %.5f\n", dir, g_split > 0 ? " two-level" : "", k0 - 200, acc, prec, nd, m->loss[0]);
+    printf("dir %+d%s%s%s%s: gauge %d, winding ids right %.4f, |error| < 0.08 turn %.4f (%zu voxels), loss %.5f\n", dir, g_split > 0 ? " two-level" : "", g_cpu ? " cpu" : "",
+           g_robust > 0 ? " robust" : "", g_bend > 0 ? " bend" : "", k0 - 200, acc, prec, nd, m->loss[0]);
     if (g_bias == 0) {
         CHECK(acc >= 0.995, "dir %+d: winding ids right %.4f < 0.995", dir, acc);
         CHECK(prec >= 0.99, "dir %+d: |error| < 0.08 at %.4f < 0.99", dir, prec);
+    }
+    if (!g_cpu && g_split == 0 && dir > 0) {   /* the CPU and GPU data terms agree (every voxel, the fitted model, the robust phase) */
+        fit_dev fd = {D, H, W, (float)H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, na, m->dir, m->nk, m->knot_dz, m->pitch, m->offset,
+                      m->L, m->lz, m->ly, m->lx, m->delta, 1e-5f, 1e-5f, 1e-5f, 1e-5f, 3.f, 1, 7u, 0.f, 0.f, 0.05f, 1.5f};
+        const size_t nl = (size_t)m->lz * m->ly * m->lx; double ph[6] = {0}, pd[6] = {0}; float *gh = calloc(nl, 4), *gg = malloc(nl * 4);
+        fit_loss2_host(&fd, ph, gh);
+        uint8_t *dv = nn_malloc(10 * n); const uint8_t *hv[10] = {pc, ps, t[0], t[1], t[2], t[3], t[4], t[5], sp, w};
+        for (int k = 0; k < 10; k++) nn_h2d(dv + k * n, hv[k], n);
+        float *dcy = nn_malloc(na * 4), *dcx = nn_malloc(na * 4), *dpi = nn_malloc(m->nk * 4), *dof = nn_malloc(m->nk * 4), *ddl = nn_malloc(nl * 4), *dg = nn_malloc(nl * 4);
+        double *dp = nn_malloc(6 * sizeof(double));
+        nn_h2d(dcy, cy, na * 4); nn_h2d(dcx, cx, na * 4); nn_h2d(dpi, m->pitch, m->nk * 4); nn_h2d(dof, m->offset, m->nk * 4); nn_h2d(ddl, m->delta, nl * 4);
+        nn_zero(dg, nl * 4); nn_zero(dp, 6 * sizeof(double));
+        fit_dev fg = fd; fg.pc = dv; fg.ps = dv + n; for (int k = 0; k < 6; k++) fg.t[k] = dv + (2 + k) * n; fg.sp = dv + 8 * n; fg.w = dv + 9 * n;
+        fg.cy = dcy; fg.cx = dcx; fg.pitch = dpi; fg.offset = dof; fg.delta = ddl;
+        nn_fit_loss2(&fg, dp, dg); nn_sync(); nn_d2h(pd, dp, sizeof pd); nn_d2h(gg, dg, nl * 4);
+        double gmax = 0, dmax = 0; for (size_t k = 0; k < nl; k++) { gmax = fmax(gmax, fabs(gh[k])); dmax = fmax(dmax, fabs(gh[k] - gg[k])); }
+        printf("backends: loss parts cpu %.6g %.6g %.6g %.6g gpu %.6g %.6g %.6g %.6g; gradient max |cpu - gpu| %.3g of max %.3g\n",
+               ph[1], ph[2], ph[3], ph[4], pd[1], pd[2], pd[3], pd[4], dmax, gmax);
+        for (int k = 1; k < 5; k++) CHECK(fabs(ph[k] - pd[k]) <= 1e-3 * fabs(pd[k]) + 1e-9, "loss part %d: cpu %.8g gpu %.8g", k, ph[k], pd[k]);
+        CHECK(dmax <= 1e-3 * gmax, "gradient: max |cpu - gpu| %.3g > 1e-3 x %.3g", dmax, gmax);
+        nn_free(dv); nn_free(dcy); nn_free(dcx); nn_free(dpi); nn_free(dof); nn_free(ddl); nn_free(dg); nn_free(dp); free(gh); free(gg);
     }
     fit_free(m);
     free(pc); free(ps); free(sp); free(w); free(cy); free(cx); for (int k = 0; k < 6; k++) free(t[k]);
@@ -103,6 +126,10 @@ int main(void) {
     run_case(+1);
     run_case(-1);
     g_split = 0.5; g_tile = 32; run_case(+1);   /* 18 tiles: pieces stitched across tile faces, the hole and the edge by the serial pass */
+    g_split = 0; g_tile = 256;
+    g_cpu = 1; run_case(+1); run_case(-1);       /* the CPU backend (src/fit_terms.h: the same terms) */
+    g_robust = 0.1f; g_bend = 1.f; run_case(+1); /* the Cauchy phase residual and curvature-adaptive smoothness keep a clean fit */
+    g_cpu = 0; run_case(-1);                     /* ... on the GPU too */
     if (fails) { fprintf(stderr, "test_fit: %d failure(s)\n", fails); return 1; }
     printf("test_fit: OK\n");
     return 0;

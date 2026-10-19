@@ -32,6 +32,11 @@ typedef struct {
                                        the pieces are stitched by border votes, then the serial flood does the rest (0: serial only) */
     int uw_tile;                    /* its tile edge (field voxels) */
     int analytic;                   /* 1: nn_fit_loss2 (analytic grad W, voxel minibatches; knots fixed after the prior), 0: nn_fit_loss */
+    int cpu, threads;               /* cpu: the CPU backend (no GPU; analytic only), threads (0: all cores, UFSM_FIT_THREADS) */
+    float phase_robust;             /* > 0: the phase residual's Cauchy scale in turns (src/fit_terms.h); 0: the plain 1 - cos */
+    float conf_pow;                 /* the phase weight min(conf, 1)^conf_pow (1: linear, as before) */
+    float bend;                     /* > 0: curvature-adaptive smoothness: per lattice node w_smooth / (1 + bend x b), b = the
+                                       node's normal dispersion 1 - lambda_max(mean n n^T) / tr (0 planar sheets, up to 2/3) x 10 */
     double um;                      /* native voxel size: the slab driver's lattices / pooling are physical (2.4 um: 512 ... 32) */
     double packed_um;               /* > 0: where the fields' sheet spacing is below this (um) the phase is trusted less (weight
                                        ramping to 0.1 at 0.6 x it, and those voxels out of the integer unwrapping): the density
@@ -81,13 +86,14 @@ int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m);
 /* GPU side (src/nn_fit.cu) */
 typedef struct {
     int D, H, W; float h;
-    const uint8_t *pc, *ps, *t, *sp, *w;    /* device: t holds the 6 planes back to back */
+    const uint8_t *pc, *ps, *t[6], *sp, *w; /* device (or host: the CPU backend) */
     const float *cy, *cx; int naxis;
     int dir, nk, knot_dz; const float *pitch, *offset;
     int L, lz, ly, lx; const float *delta;
     float w_phase, w_normal, w_density, w_nondeg, core;
     int stride; unsigned salt;              /* nn_fit_loss2: voxels with hash(i, salt) % stride == 0 this step, data terms x stride */
     float packed_sp, packed_floor;          /* > 0: the phase weight ramps from 1 at spacing code packed_sp down to packed_floor at 0.6 x it */
+    float phase_robust, conf_pow;           /* fit_cfg's (src/fit_terms.h) */
 } fit_dev;
 /* the data terms over every field voxel: loss parts (double[5]: total, phase, normal, density, nondeg, accumulated) and the
    gradients of delta and of the knots (accumulated: zero them first) */
@@ -95,9 +101,10 @@ void nn_fit_loss(const fit_dev *f, double *parts, float *g_delta, float *g_pitch
 /* the same data terms with grad W analytic (trilinear delta, the prior's and theta's derivatives, the axis slope) at the voxel
    centre only, on a random 1 / stride subset of the voxels; the knots get no gradient (delta carries the fit) */
 void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta);
-/* smoothness w_smooth * sum (laplacian delta)^2 + w_decay * sum delta^2 over the lattice (lap: lattice-sized scratch): adds to
-   parts[5] and g_delta */
-void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float w_smooth, float w_decay, float *lap, double *parts, float *g_delta);
+void fit_loss2_host(const fit_dev *f, double *parts, float *g_delta);   /* the same on the CPU backend (host arrays in f; stratified subsets) */
+/* smoothness w_smooth * sum_n wn_n (laplacian delta)_n^2 + w_decay * sum delta^2 over the lattice (lap: lattice-sized scratch; wn:
+   per-node weights, nullptr = 1): adds to parts[5] and g_delta */
+void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float w_smooth, float w_decay, const float *wn, float *lap, double *parts, float *g_delta);
 /* predict --fit-fields: pool a window's interior (logits [c][W^3] fp32, the window's CT) into the box's fit-field accumulators
    (12 planes over F = ceil(box / h), see src/nn_fit.cu); t = the window origin relative to the box */
 void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
@@ -140,4 +147,7 @@ void fit_set_dev_free(fit_set_dev *g);
 /* W (with_theta: U) of the set on the grid of n[0] x n[1] x n[2] points at box-local native (o + (i + 0.5) step) per axis, into the
    host float array out (row-major); evaluated on the GPU in z-row batches. Matches fit_set_W up to float rounding. */
 int fit_set_grid(fit_set_dev *g, const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, float *out);
+/* the same on the CPU (no device); mask (optional, laid out as out): only points with a band code 1..252 there are evaluated (others 0) */
+int fit_set_grid_cpu(const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, const uint8_t *mask, float *out);
+void fit_set_threads(int n);   /* the CPU backend's / grid's thread count (0: all cores) */
 uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[3]);   /* one field array, max-pooled (raw or zarr) */

@@ -6,6 +6,7 @@
 extern "C" {
 #include "fit.h"
 }
+#include "fit_terms.h"
 
 #define FIT_MAXK 512
 #define FIT_TPB 256
@@ -39,10 +40,6 @@ __device__ __forceinline__ void fit_eval(const fit_dev &f, float z, float y, flo
     }
     o.U = o.r / o.p + off + del;
 }
-__device__ __forceinline__ float fit_packed(const fit_dev &f, size_t i) {   /* the phase weight factor of packed cells */
-    if (f.packed_sp <= 0.f || !f.sp[i]) return 1.f;
-    return fminf(1.f, fmaxf(f.packed_floor, ((float)f.sp[i] - 0.6f * f.packed_sp) / (0.4f * f.packed_sp)));
-}
 __device__ __forceinline__ float fit_wrap(float a) {   /* into (-pi, pi] */
     const float tp = 6.283185307179586f;
     a -= tp * floorf((a + 3.14159265358979f) / tp);
@@ -71,33 +68,8 @@ __global__ void fit_loss_k(fit_dev f, double *parts, float *g_delta, float *g_pi
             for (int d = 0; d < 3; d++) g[d] = ((q[1 + 2 * d].U - q[2 + 2 * d].U) - sdir * fit_wrap(q[1 + 2 * d].th - q[2 + 2 * d].th) * i2p) / (2.f * e);
             const float W0 = q[0].U - sdir * q[0].th * i2p;
             float dU[7] = {0, 0, 0, 0, 0, 0, 0}, dg[3] = {0, 0, 0};
-            /* phase */
-            const float mc = ((int)f.pc[i] - 128) * (1.f / 127.f), ms = ((int)f.ps[i] - 128) * (1.f / 127.f), conf = sqrtf(mc * mc + ms * ms);
-            if (conf > 0.05f && f.w_phase > 0.f) {
-                const float ph = atan2f(ms, mc), a = 6.283185307179586f * W0 - ph;
-                float sa, ca; sincosf(a, &sa, &ca);
-                const float c = f.w_phase * wv * fminf(conf, 1.f) * fit_packed(f, i);
-                lp[1] += c * (1.f - ca); dU[0] += c * 6.283185307179586f * sa;
-            }
-            const float g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2] + 1e-12f, gl = sqrtf(g2);
-            /* normal: 1 - g^T T g / (|g|^2 tr T) */
-            const size_t pl = n;
-            const float tzz = f.t[i] * (1.f / 255.f), tyy = f.t[pl + i] * (1.f / 255.f), txx = f.t[2 * pl + i] * (1.f / 255.f);
-            const float tzy = f.t[3 * pl + i] * (1.f / 255.f) - 0.5f, tzx = f.t[4 * pl + i] * (1.f / 255.f) - 0.5f, tyx = f.t[5 * pl + i] * (1.f / 255.f) - 0.5f;
-            const float tr = tzz + tyy + txx;
-            if (tr > 0.1f && f.w_normal > 0.f) {
-                const float Tg[3] = {tzz * g[0] + tzy * g[1] + tzx * g[2], tzy * g[0] + tyy * g[1] + tyx * g[2], tzx * g[0] + tyx * g[1] + txx * g[2]};
-                const float gTg = g[0] * Tg[0] + g[1] * Tg[1] + g[2] * Tg[2], c = f.w_normal * wv;
-                lp[2] += c * (1.f - gTg / (g2 * tr));
-                for (int d = 0; d < 3; d++) dg[d] += -c * (2.f * Tg[d] / (g2 * tr) - 2.f * gTg * g[d] / (g2 * g2 * tr));
-            }
-            /* density and non-degeneracy */
-            if (f.sp[i]) {
-                const float rho = 8.f / (f.h * (float)f.sp[i]), lr = logf(gl) - logf(rho);
-                if (f.w_density > 0.f) { const float c = f.w_density * wv; lp[3] += c * lr * lr; for (int d = 0; d < 3; d++) dg[d] += c * 2.f * lr * g[d] / g2; }
-                const float lo = 0.4f * rho - gl;
-                if (lo > 0.f && f.w_nondeg > 0.f) { const float c = f.w_nondeg * wv; lp[4] += c * lo * lo; for (int d = 0; d < 3; d++) dg[d] += -c * 2.f * lo * g[d] / gl; }
-            }
+            fit_phase_term(&f, i, W0, wv, &lp[1], &dU[0]);
+            fit_grad_terms(&f, i, g, wv, lp, dg);
             for (int d = 0; d < 3; d++) { dU[1 + 2 * d] += dg[d] / (2.f * e); dU[2 + 2 * d] -= dg[d] / (2.f * e); }
             lp[0] = lp[1] + lp[2] + lp[3] + lp[4];
             for (int s = 0; s < 7; s++) {
@@ -146,31 +118,36 @@ __global__ void fit_lap_k(const float *v, int lz, int ly, int lx, float *lap) {
     if (c < lx - 1) s += v[i + 1] - x;
     lap[i] = s;
 }
-__global__ void fit_smooth_k(const float *v, const float *lap, int lz, int ly, int lx, float ws, float wd, double *parts, float *g) {
+/* g += 2 ws (sum_{m in nbr(n)} wl_m - deg_n wl_n) + 2 wd v_n with wl = wn lap (the per-node weighted laplacian; wn null: 1); the loss
+   ws wn lap^2 + wd v^2 */
+__global__ void fit_smooth_k(const float *v, const float *lap, const float *wn, int lz, int ly, int lx, float ws, float wd, double *parts, float *g) {
     __shared__ double red[FIT_TPB];
     const size_t n = (size_t)lz * ly * lx, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     double l = 0;
     if (i < n) {
         const int a = (int)(i / ((size_t)ly * lx)), b = (int)((i / lx) % ly), c = (int)(i % lx);
+#define WL(j_) (wn ? wn[j_] * lap[j_] : lap[j_])
         int deg = 0; float s = 0.f;
-        if (a > 0) { s += lap[i - (size_t)ly * lx]; deg++; }
-        if (a < lz - 1) { s += lap[i + (size_t)ly * lx]; deg++; }
-        if (b > 0) { s += lap[i - lx]; deg++; }
-        if (b < ly - 1) { s += lap[i + lx]; deg++; }
-        if (c > 0) { s += lap[i - 1]; deg++; }
-        if (c < lx - 1) { s += lap[i + 1]; deg++; }
-        g[i] += 2.f * ws * (s - deg * lap[i]) + 2.f * wd * v[i];
-        l = (double)ws * lap[i] * lap[i] + (double)wd * v[i] * v[i];
+        if (a > 0) { s += WL(i - (size_t)ly * lx); deg++; }
+        if (a < lz - 1) { s += WL(i + (size_t)ly * lx); deg++; }
+        if (b > 0) { s += WL(i - lx); deg++; }
+        if (b < ly - 1) { s += WL(i + lx); deg++; }
+        if (c > 0) { s += WL(i - 1); deg++; }
+        if (c < lx - 1) { s += WL(i + 1); deg++; }
+        const float wli = WL(i);
+#undef WL
+        g[i] += 2.f * ws * (s - deg * wli) + 2.f * wd * v[i];
+        l = (double)ws * wli * lap[i] + (double)wd * v[i] * v[i];
     }
     red[threadIdx.x] = l;
     __syncthreads();
     for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o]; __syncthreads(); }
     if (threadIdx.x == 0) atomicAdd(&parts[5], red[0]);
 }
-extern "C" void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float w_smooth, float w_decay, float *lap, double *parts, float *g_delta) {
+extern "C" void nn_fit_smooth(const float *delta, int lz, int ly, int lx, float w_smooth, float w_decay, const float *wn, float *lap, double *parts, float *g_delta) {
     const size_t n = (size_t)lz * ly * lx;
     fit_lap_k<<<nblk(n, FIT_TPB), FIT_TPB>>>(delta, lz, ly, lx, lap);
-    fit_smooth_k<<<nblk(n, FIT_TPB), FIT_TPB>>>(delta, lap, lz, ly, lx, w_smooth, w_decay, parts, g_delta);
+    fit_smooth_k<<<nblk(n, FIT_TPB), FIT_TPB>>>(delta, lap, wn, lz, ly, lx, w_smooth, w_decay, parts, g_delta);
     KCHECK();
 }
 
@@ -292,76 +269,16 @@ extern "C" void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo
     nn_fit_accum_d(lg, ct, W, W, halo, halo, tz, ty, tx, box, h, F, ch_recto, ch_phase, ch_normal, ch_density, dscale, 0, acc);
 }
 
-/* analytic data terms (nn_fit_loss2): one evaluation per voxel */
-__device__ __forceinline__ unsigned fit_hash(unsigned x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
+/* analytic data terms (nn_fit_loss2): one evaluation per voxel (src/fit_terms.h fit_vox2) */
 __global__ void fit_loss2_k(fit_dev f, double *parts, float *g_delta) {
     __shared__ double red[5][FIT_TPB];
     double lp[5] = {0, 0, 0, 0, 0};
     const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     const float wv = i < n && (f.stride <= 1 || fit_hash((unsigned)i ^ f.salt) % (unsigned)f.stride == 0) ? f.w[i] * (1.f / 255.f) : 0.f;
     if (wv > 0.f) {
-        const int z = (int)(i / ((size_t)f.H * f.W)), y = (int)((i / f.W) % f.H), x = (int)(i % f.W);
-        const float pz = (z + 0.5f) * f.h, py = (y + 0.5f) * f.h, px = (x + 0.5f) * f.h, sc = (float)(f.stride > 1 ? f.stride : 1);
-        /* axis and its z slope */
-        float az = fminf(fmaxf(pz, 0.f), (float)(f.naxis - 1)); int ai = min((int)az, f.naxis - 2 < 0 ? 0 : f.naxis - 2); const float at = f.naxis > 1 ? az - ai : 0.f;
-        const int ai1 = f.naxis > 1 ? ai + 1 : ai;
-        const float cy = f.cy[ai] + at * (f.cy[ai1] - f.cy[ai]), cx = f.cx[ai] + at * (f.cx[ai1] - f.cx[ai]), cyz = f.cy[ai1] - f.cy[ai], cxz = f.cx[ai1] - f.cx[ai];
-        const float dy = py - cy, dx = px - cx, r2 = dy * dy + dx * dx + 1e-6f, r = sqrtf(r2), th = atan2f(dy, dx);
-        /* knots (fixed): value and z slope */
-        float kz = fminf(fmaxf(pz / (float)f.knot_dz, 0.f), (float)(f.nk - 1)); const int k0 = min((int)kz, f.nk - 2 < 0 ? 0 : f.nk - 2), k1 = f.nk > 1 ? k0 + 1 : k0; const float kt = f.nk > 1 ? kz - k0 : 0.f;
-        const float pit = f.pitch[k0] + kt * (f.pitch[k1] - f.pitch[k0]), off = f.offset[k0] + kt * (f.offset[k1] - f.offset[k0]);
-        const float pitz = (f.pitch[k1] - f.pitch[k0]) / (float)f.knot_dz, offz = (f.offset[k1] - f.offset[k0]) / (float)f.knot_dz;
-        if (r >= f.core * pit) {
-            /* trilinear delta, value and gradient */
-            const float q[3] = {pz / (float)f.L, py / (float)f.L, px / (float)f.L}; const int dim[3] = {f.lz, f.ly, f.lx}; int c0[3]; float ct[3];
-            for (int d = 0; d < 3; d++) { const float a = fminf(fmaxf(q[d], 0.f), (float)(dim[d] - 1)); c0[d] = min((int)a, dim[d] - 2 < 0 ? 0 : dim[d] - 2); ct[d] = dim[d] > 1 ? a - c0[d] : 0.f; }
-            float del = 0.f, gdel[3] = {0, 0, 0}, wc[8], gw[8][3]; size_t ic[8];
-            const float iL = 1.f / (float)f.L;
-            for (int c = 0; c < 8; c++) {
-                const int bz = c >> 2 & 1, by = c >> 1 & 1, bx = c & 1;
-                const float wz = bz ? ct[0] : 1.f - ct[0], wy = by ? ct[1] : 1.f - ct[1], wx = bx ? ct[2] : 1.f - ct[2];
-                wc[c] = wz * wy * wx;
-                gw[c][0] = (bz ? iL : -iL) * wy * wx; gw[c][1] = wz * (by ? iL : -iL) * wx; gw[c][2] = wz * wy * (bx ? iL : -iL);
-                ic[c] = ((size_t)min(c0[0] + bz, f.lz - 1) * f.ly + min(c0[1] + by, f.ly - 1)) * f.lx + min(c0[2] + bx, f.lx - 1);
-                const float v = f.delta[ic[c]];
-                del += wc[c] * v; for (int d = 0; d < 3; d++) gdel[d] += gw[c][d] * v;
-            }
-            const float i2p = 0.15915494309189535f, sdir = (float)f.dir;
-            const float drz = -(dy * cyz + dx * cxz) / r;
-            float g[3] = {drz / pit - r * pitz / (pit * pit) + offz + gdel[0], dy / (r * pit) + gdel[1], dx / (r * pit) + gdel[2]};
-            const float thz = (-dx * cyz + dy * cxz) / r2, thy = dx / r2, thx = -dy / r2;
-            g[0] -= sdir * thz * i2p; g[1] -= sdir * thy * i2p; g[2] -= sdir * thx * i2p;
-            const float W0 = r / pit + off + del - sdir * th * i2p;
-            float dW = 0.f, dg[3] = {0, 0, 0};
-            const float mc = ((int)f.pc[i] - 128) * (1.f / 127.f), ms = ((int)f.ps[i] - 128) * (1.f / 127.f), conf = sqrtf(mc * mc + ms * ms);
-            if (conf > 0.05f && f.w_phase > 0.f) {
-                const float a = 6.283185307179586f * W0 - atan2f(ms, mc); float sa, ca; sincosf(a, &sa, &ca);
-                const float cc = f.w_phase * wv * fminf(conf, 1.f) * sc * fit_packed(f, i);
-                lp[1] += cc * (1.f - ca); dW += cc * 6.283185307179586f * sa;
-            }
-            const float g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2] + 1e-12f, gl = sqrtf(g2);
-            const size_t pl = n;
-            const float tzz = f.t[i] * (1.f / 255.f), tyy = f.t[pl + i] * (1.f / 255.f), txx = f.t[2 * pl + i] * (1.f / 255.f);
-            const float tzy = f.t[3 * pl + i] * (1.f / 255.f) - 0.5f, tzx = f.t[4 * pl + i] * (1.f / 255.f) - 0.5f, tyx = f.t[5 * pl + i] * (1.f / 255.f) - 0.5f;
-            const float tr = tzz + tyy + txx;
-            if (tr > 0.1f && f.w_normal > 0.f) {
-                const float Tg[3] = {tzz * g[0] + tzy * g[1] + tzx * g[2], tzy * g[0] + tyy * g[1] + tyx * g[2], tzx * g[0] + tyx * g[1] + txx * g[2]};
-                const float gTg = g[0] * Tg[0] + g[1] * Tg[1] + g[2] * Tg[2], cc = f.w_normal * wv * sc;
-                lp[2] += cc * (1.f - gTg / (g2 * tr));
-                for (int d = 0; d < 3; d++) dg[d] += -cc * (2.f * Tg[d] / (g2 * tr) - 2.f * gTg * g[d] / (g2 * g2 * tr));
-            }
-            if (f.sp[i]) {
-                const float rho = 8.f / (f.h * (float)f.sp[i]), lr = logf(gl) - logf(rho);
-                if (f.w_density > 0.f) { const float cc = f.w_density * wv * sc; lp[3] += cc * lr * lr; for (int d = 0; d < 3; d++) dg[d] += cc * 2.f * lr * g[d] / g2; }
-                const float lo = 0.4f * rho - gl;
-                if (lo > 0.f && f.w_nondeg > 0.f) { const float cc = f.w_nondeg * wv * sc; lp[4] += cc * lo * lo; for (int d = 0; d < 3; d++) dg[d] += -cc * 2.f * lo * g[d] / gl; }
-            }
-            lp[0] = lp[1] + lp[2] + lp[3] + lp[4];
-            for (int c = 0; c < 8; c++) {
-                const float gv = dW * wc[c] + dg[0] * gw[c][0] + dg[1] * gw[c][1] + dg[2] * gw[c][2];
-                if (gv != 0.f) atomicAdd(&g_delta[ic[c]], gv);
-            }
-        }
+        size_t ic[8]; float gv[8];
+        if (fit_vox2(&f, i, wv, (float)(f.stride > 1 ? f.stride : 1), lp, ic, gv))
+            for (int c = 0; c < 8; c++) if (gv[c] != 0.f) atomicAdd(&g_delta[ic[c]], gv[c]);
     }
     for (int k = 0; k < 5; k++) red[k][threadIdx.x] = lp[k];
     __syncthreads();
