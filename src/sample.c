@@ -290,6 +290,7 @@ static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
                 if (c == region_ch) { any = 1; continue; }
                 if (s->tgt_key[c] && source_tgt_for_level(s, c, l, nullptr)) any = 1;
             }
+            if (s->band && (s->phase || l == 0)) any = 1;   /* band codes (+ stored phase) alone label a source (task unwrap2 sources have no recto / ink) */
             ok = any;
         }
         cache[l] = ok ? 2 : 1;
