@@ -37,6 +37,7 @@ int cmd_train(int argc, char **argv);
 int cmd_predict(int argc, char **argv);
 int cmd_eval(int argc, char **argv);
 int cmd_stitch(int argc, char **argv);   /* src/stitch.c */
+int cmd_coreline(int argc, char **argv);   /* src/coreline.c */
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
@@ -67,6 +68,7 @@ static int usage(void) {
         "  ufsm ct-hist <out.txt> <root> <key> z,y,x,n [...]  CT histograms of boxes (targets of train --aug-hist, the hist op)\n"
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
+        "  ufsm coreline detect|box|sdist ...   a crushed scroll's flattened umbilicus per z (fit fields) and half-box fit dirs behind it\n"
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
@@ -2350,6 +2352,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "stitch")) return cmd_stitch(argc, argv);
+    if (!strcmp(cmd, "coreline")) return cmd_coreline(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
     if (!strcmp(cmd, "side-votes") || !strcmp(cmd, "codes-merge")) return cmd_side_votes(argc, argv);

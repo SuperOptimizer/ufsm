@@ -5,6 +5,7 @@
 #include "json.h"
 #include "zarr3.h"
 #include "store.h"
+#include "coreline.h"
 #include <complex.h>
 #include <math.h>
 #include <stdio.h>
@@ -989,6 +990,13 @@ static json *read_json_file(const char *path) {
     json *j = json_parse(t, n); free(t); return j;
 }
 void fit_fields_free(fit_fields_buf *b) { for (int k = 0; k < 10; k++) free(b->a[k]); free(b->cy); free(b->cx); memset(b, 0, sizeof *b); }
+/* fields.json "core_line" / "core_side": the half-box mask (src/coreline.h); 0 = none */
+static int fields_core(const json *j, coreline *C) {
+    const char *cp = json_str(json_get(j, "core_line"), ""); const int side = (int)json_num(json_get(j, "core_side"), 0);
+    if (!*cp || !side) return 0;
+    if (cl_load(C, cp)) { fprintf(stderr, "fit: cannot load the core line %s\n", cp); return 0; }
+    return side < 0 ? -1 : 1;
+}
 int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b) {
     static const char *nm[10] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w"};
     memset(b, 0, sizeof *b);
@@ -1013,6 +1021,7 @@ int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf 
     }
     if (fz0 >= fz1 || pool < 1) { json_free(j); return -1; }
     const json *axj = json_get(j, "axis"); const int nat = axj ? (int)axj->n : 0;
+    coreline core = {0}; const int cside = fields_core(j, &core);
     const int D = fz1 - fz0, H = shp[1], W = shp[2], Dp = (D + pool - 1) / pool, Hp = (H + pool - 1) / pool, Wp = (W + pool - 1) / pool;
     const int na = (int)((double)Dp * pool * h) + 1;   /* the slab's axis table (native z from fz0 h) */
     b->cy = malloc(na * sizeof(float)); b->cx = malloc(na * sizeof(float));
@@ -1039,6 +1048,7 @@ int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf 
             if (zarr) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read(za[k], o, n, blk[k], 8)) { fprintf(stderr, "fit: %s\n", z3_error()); return -1; } }
             else if (fseek(fr[k], (long)((size_t)z0 * plane), SEEK_SET) || fread(blk[k], 1, (size_t)nz * plane, fr[k]) != (size_t)nz * plane) { fprintf(stderr, "fit: short read\n"); return -1; }
         }
+        if (cside) cl_mask_block(&core, cside, org, h, b->um, z0, nz, H, W, blk[0], blk[1], blk[9]);   /* the other side of the core: no data */
         if (pool == 1) { for (int k = 0; k < 10; k++) memcpy(b->a[k] + (size_t)(z0 - fz0) * plane, blk[k], (size_t)nz * plane); continue; }
         src.D = nz; src.H = H; src.W = W; src.pc = blk[0]; src.ps = blk[1]; for (int t = 0; t < 6; t++) src.t[t] = blk[2 + t]; src.sp = blk[8]; src.w = blk[9];
         fit_pooled pp = fit_pool(&src, pool);   /* one output row */
@@ -1046,6 +1056,7 @@ int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf 
         for (int k = 0; k < 10; k++) { memcpy(b->a[k] + (size_t)zo * Hp * Wp, pp.a[k], (size_t)pp.H * pp.W); free(pp.a[k]); }
     }
     for (int k = 0; k < 10; k++) { free(blk[k]); if (za[k]) z3_close(za[k]); if (fr[k]) fclose(fr[k]); }
+    if (cside) cl_free(&core);
     b->h = h * pool; b->shape[0] = Dp; b->shape[1] = Hp; b->shape[2] = Wp;
     b->origin[0] = org[0] + (long long)fz0 * h; b->origin[1] = org[1]; b->origin[2] = org[2];
     b->f = (fit_fields){Dp, Hp, Wp, (double)b->h, b->a[0], b->a[1], {b->a[2], b->a[3], b->a[4], b->a[5], b->a[6], b->a[7]}, b->a[8], b->a[9], b->cy, b->cx};
@@ -1265,6 +1276,8 @@ uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[
     char p[1400]; snprintf(p, sizeof p, "%s/fields.json", dir); json *j = read_json_file(p);
     const int zarr = j && !strcmp(json_str(json_get(j, "format"), "raw"), "zarr"); long long zoff[3] = {0, 0, 0};
     for (int d = 0; d < 3; d++) zoff[d] = j ? (long long)json_num(json_at(json_get(j, "zarr_offset"), d), 0) : 0;
+    coreline core = {0}; const int ismask = !strcmp(name, "w") || !strcmp(name, "pc") || !strcmp(name, "ps"), cside = j && ismask ? fields_core(j, &core) : 0;
+    const long long gorg[3] = {g.origin[0], g.origin[1], g.origin[2]}; const double gum = g.um, gh = g.h;
     json_free(j); fit_fields_free(&g);
     z3 *za = nullptr; FILE *fr = nullptr;
     if (zarr) za = z3_open(store_open(dir), name, nullptr); else { snprintf(p, sizeof p, "%s/%s.raw", dir, name); fr = fopen(p, "rb"); }
@@ -1274,12 +1287,13 @@ uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[
         const int nz = z0 + pool <= D ? pool : D - z0;
         if (za) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read(za, o, n, blk, 8)) { free(out); out = nullptr; break; } }
         else if (fseek(fr, (long)((size_t)z0 * H * W), SEEK_SET) || fread(blk, 1, (size_t)nz * H * W, fr) != (size_t)nz * H * W) { free(out); out = nullptr; break; }
+        if (cside) cl_mask_block(&core, cside, gorg, gh, gum, z0, nz, H, W, name[0] == 'p' ? blk : nullptr, nullptr, name[0] == 'w' ? blk : nullptr);
         uint8_t *o = out + (size_t)(z0 / pool) * Hp * Wp;
         for (int a = 0; a < nz; a++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
             const uint8_t v = blk[((size_t)a * H + y) * W + x]; uint8_t *d = &o[(size_t)(y / pool) * Wp + x / pool]; if (v > *d) *d = v;
         }
     }
-    free(blk); if (za) z3_close(za); if (fr) fclose(fr);
+    free(blk); if (za) z3_close(za); if (fr) fclose(fr); if (cside) cl_free(&core);
     if (out) { shape[0] = Dp; shape[1] = Hp; shape[2] = Wp; }
     return out;
 }
