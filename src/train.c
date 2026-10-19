@@ -606,6 +606,16 @@ static int sync_check(gpu_state *d, int step, const char *what) {
     window_note(d, g_Sdiag, "  window");
     return 1;
 }
+/* UFSM_SYNC_CHECK=1 also counts non-finite values: the logits right after the forward (a window whose voxels are all unsupervised hides
+   non-finite logits from the losses) and the parameter gradient after the backward */
+static void diag_nonfinite(gpu_state *d, const char *what, const void *p, size_t n, int h16) {
+    static int on = -1; if (on < 0) on = ufsm_env_on("UFSM_SYNC_CHECK");
+    if (!on || !p) return;
+    const unsigned long long c = nn_count_nonfinite(p, n, h16);
+    if (!c) return;
+    fprintf(stderr, "diagnostics: %llu non-finite %s of %zu\n", c, what, n);
+    window_note(d, g_Sdiag, "  window");
+}
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 xs = {B, g_xc, d->side >= 0 ? g_Dl : g_Pz, P, P};
     if (unet_cfg_of(d->u)->scale_cond) { if (g_papyrus) unet_set_cond(d->u, d->um); else unet_set_scale(d->u, d->um); }   /* B == 1 (checked at
@@ -626,6 +636,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         lg = d->lgf;
     } else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
+    if (train && !g_half && !g_head_slab && !g_pkf) diag_nonfinite(d, "logits", lg, (size_t)B * g_cout * xs.d * P * P, unet_logits_h16(d->u) ? 1 : 0);   /* (UFSM_SYNC_CHECK) */
     d->ds_fresh = g_ds && train;   /* validation batches have no deep-supervision losses */
     if (g_ds && train) {   /* deep supervision: each supervised decoder level's logits against the targets / mask max- / any-pooled to its grid */
         const int save = nn_get_loss_grad_h16(); nn_set_loss_grad_h16(0);   /* fp32 gradients: unet_backward_x converts them with the gradient scale */
@@ -2080,6 +2091,7 @@ int cmd_train(int argc, char **argv) {
             unet_backward_x(d->u, g_half && !g_pkf ? d->glh : d->gl, g_g16);
             test_nan_inject(d, step, 2, P);
             if (sync_check(d, step, "backward")) return 1;
+            diag_nonfinite(d, "parameter gradients", unet_grad_ptr(d->u), unet_nparams(d->u), 0);
             nn_event_record(d->ev_done[d->cur], 0);
             nn_event_sync(d->ev_up[d->cur]);                 /* host buffer of this batch is free again */
             if (overfit) continue;                           /* keep computing on the same device buffer */
@@ -2264,6 +2276,8 @@ int cmd_train(int argc, char **argv) {
                                     (a[0] + a[6] + a[12]) / 3, (a[1] + a[7] + a[13]) / 3, (a[18] + a[24] + a[30]) / 3, (a[19] + a[25] + a[31]) / 3); }
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s (wait %.0f%%)%s%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, affs, acc_g / nacc,
                     (double)nacc * B * nl / dt, 100 * wait / dt, vl >= 0 ? " val " : "", vl >= 0 ? vstr : "");
+            { static int memlog = -1; if (memlog < 0) memlog = ufsm_env_on("UFSM_SYNC_CHECK");   /* device memory free per GPU at each log line (a leak) */
+              if (memlog) { fprintf(stderr, "  device memory free:"); for (int g = 0; g < ng; g++) { nn_init(G[g].dev); fprintf(stderr, " GPU %d %.1f MB", G[g].dev, nn_mem_free() / 1e6); } fprintf(stderr, "\n"); nn_init(G[0].dev); } }
             if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, active, acc_g / nacc, vstr, (double)nacc * B * nl / dt, wait); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
             acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = 0; nacc = 0; tlog = now(); wait = 0;
