@@ -33,6 +33,7 @@ typedef struct {
                                        the pieces are stitched by border votes, then the serial flood does the rest (0: serial only) */
     int uw_tile;                    /* its tile edge (field voxels) */
     double uw_min_conf;             /* the unwrapping's lowest phase confidence (0: 0.3) */
+    int uw_seeds;                   /* > 1: consensus of this many voxel floods from seeds spread over the box (src/fit.c uw_consensus) */
     double uw_pdv;                  /* > 0: the unwrapping quality (flood order, node weights) times exp(-pdv / uw_pdv^2), pdv the
                                        phase derivative variance (turns^2): dislocated / noisy phase is flooded last */
     int analytic;                   /* 1: nn_fit_loss2 (analytic grad W, voxel minibatches; knots fixed after the prior), 0: nn_fit_loss */

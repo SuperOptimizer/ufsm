@@ -292,6 +292,7 @@ static void ss_walk(const sf_wrap *s, const float *e, const float *cf, double cm
 typedef struct {
     const sf_wrap *s; const sf_fields *F; float *e, *cf; float *ct; int nprof; double ctum, ctR, ctstep; const uint8_t *vol; int64_t vo[3], vn[3];
     int r0, r1, c0, c1; _Atomic int next; double ctf; int sign;
+    const fit_set *ms; float *sr;   /* with the model: per vertex the distance to the next wrap outward / the fields' spacing */
 } ss_job;
 static double vol_tri(const uint8_t *v, const int64_t n[3], double z, double y, double x) {
     if (z < 0 || y < 0 || x < 0 || z > n[0] - 1 || y > n[1] - 1 || x > n[2] - 1) return NAN;
@@ -311,7 +312,19 @@ static void *ss_rows(void *arg) {   /* phase residual and confidence at each ver
         double q[3], N[3];
         if (!J->vol) {
             sf_native(s, J->F, i, q, nullptr, 1); double vc, vs; sff_phase(J->F, q, &vc, &vs);
-            J->cf[i] = (float)sqrt(vc * vc + vs * vs); J->e[i] = (float)wrap_turn(atan2(vs, vc) / (2 * M_PI)); continue;
+            J->cf[i] = (float)sqrt(vc * vc + vs * vs); J->e[i] = (float)wrap_turn(atan2(vs, vc) / (2 * M_PI));
+            if (J->ms && sf_native(s, J->F, i, q, N, J->sign)) {   /* the wrap spacing along the normal against the fields' spacing */
+                const fit_model *g = J->ms->global; const double sp = sff_spacing(J->F, q);
+                const double p0[3] = {q[0] + J->F->org[0] - g->origin[0], q[1] + J->F->org[1] - g->origin[1], q[2] + J->F->org[2] - g->origin[2]};
+                const double W0 = fit_set_W(J->ms, p0[0], p0[1], p0[2]); double tp = 0, wp = W0; float ratio = 3.f;
+                if (sp > 0) for (double t = sp / 8; t <= 3 * sp + 1e-9; t += sp / 8) {
+                    const double w = fit_set_W(J->ms, p0[0] + t * N[0], p0[1] + t * N[1], p0[2] + t * N[2]);
+                    if (w >= W0 + 1) { ratio = (float)((tp + (W0 + 1 - wp) / (w - wp) * (t - tp)) / sp); break; }
+                    tp = t; wp = w;
+                }
+                J->sr[i] = sp > 0 ? ratio : NAN;
+            }
+            continue;
         }
         if (!sf_native(s, J->F, i, q, N, J->sign)) continue;
         const double f = J->F->um / J->ctum;   /* native -> CT voxels */
@@ -345,13 +358,15 @@ int cmd_surf_stats(int argc, char **argv) {
     double *prof = calloc(nprof + 1, sizeof(double)); size_t *pcount = calloc(nprof + 1, sizeof(size_t)), on = 0, onn = 0, ctn = 0, ctlow = 0;
     ss_stat A[2] = {{0}}; size_t nv = 0, nconf = 0, nbad = 0, nang = 0, nang30 = 0; double ctsum = 0;
     float *eall = malloc(sizeof(float) * 1024), *aall = malloc(sizeof(float) * 1024), *cfall = malloc(sizeof(float) * 1024); size_t ne = 0, cape = 1024, na = 0, capa = 1024, ncf = 0, capc = 1024;
+    float *srall = malloc(sizeof(float) * 1024); size_t nsa = 0, capsa = 1024, nsr = 0, srlo = 0, srhi = 0;
     if (per) printf("  wrap  vertices  conf>=%.1f  |e|med  |e|>0.25  theta sw/cm  z sw/cm%s\n", cmin, cz ? "  on-papyrus" : "");
     for (int k = 0; k < nn; k++) {
         sf_wrap s; if (sf_load(argv[2], names[k], &s)) continue;
         const size_t n = (size_t)s.w * s.h; float *e = calloc(n, 4), *cf = calloc(n, 4), *ct = nprof ? malloc(n * nprof * 4) : nullptr;
         for (size_t i = 0; i < (size_t)n * nprof; i++) ct[i] = NAN;
         const int sign = sf_orient(&s, &F, ms ? ms->global : nullptr);
-        { ss_job J = {&s, &F, e, cf, nullptr, 0, 0, 0, 0, nullptr, {0}, {0}, 0, s.h, 0, s.w, 0, 0, sign};
+        float *sr = ms ? malloc(n * 4) : nullptr; if (sr) for (size_t i = 0; i < n; i++) sr[i] = NAN;
+        { ss_job J = {&s, &F, e, cf, nullptr, 0, 0, 0, 0, nullptr, {0}, {0}, 0, s.h, 0, s.w, 0, 0, sign, ms, sr};
           pthread_t th[64]; const int m = nt < 64 ? nt : 64; for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, ss_rows, &J); for (int q = 0; q < m; q++) pthread_join(th[q], nullptr); }
         if (cz) {   /* CT tiles of 128 x 512 vertices: each reads its own box (+ the profile reach) */
             const z3_meta *zm = z3_meta_of(cz); const double f = F.um / ctum, reach = 30 / ctum + 2;
@@ -363,7 +378,7 @@ int cmd_surf_stats(int argc, char **argv) {
                     for (int d = 0; d < 3; d++) { const double v = (q[d] + F.org[d] + 0.5) * f - 0.5; if (v < lo[d]) lo[d] = v; if (v > hi[d]) hi[d] = v; }
                 }
                 if (lo[0] > hi[0]) continue;
-                ss_job J = {&s, &F, e, cf, ct, nprof, ctum, ctR, ctstep, nullptr, {0}, {0}, r0, r1, c0, c1, 0, f, sign}; int ok = 1;
+                ss_job J = {&s, &F, e, cf, ct, nprof, ctum, ctR, ctstep, nullptr, {0}, {0}, r0, r1, c0, c1, 0, f, sign, nullptr, nullptr}; int ok = 1;
                 for (int d = 0; d < 3; d++) { int64_t a = (int64_t)floor(lo[d] - reach), b = (int64_t)ceil(hi[d] + reach) + 1; if (a < 0) a = 0; if (b > zm->shape[d]) b = zm->shape[d]; if (b <= a) ok = 0; J.vo[d] = a; J.vn[d] = b - a; }
                 if (!ok || (size_t)J.vn[0] * J.vn[1] * J.vn[2] > ((size_t)3 << 30)) continue;
                 uint8_t *vol = malloc((size_t)J.vn[0] * J.vn[1] * J.vn[2]);
@@ -377,6 +392,7 @@ int cmd_surf_stats(int argc, char **argv) {
         for (size_t i = 0; i < n; i++) {
             if (s.Z[i] < 0) continue;
             wv++;
+            if (sr && !isnan(sr[i])) { nsr++; srlo += sr[i] < 0.5f; srhi += sr[i] > 1.5f; if (i % 7 == 0) { if (nsa == capsa) { capsa *= 2; srall = realloc(srall, capsa * 4); } srall[nsa++] = sr[i]; } }
             if (i % 7 == 0) { if (ncf == capc) { capc *= 2; cfall = realloc(cfall, capc * 4); } cfall[ncf++] = cf[i]; }
             if (cf[i] >= cmin) { wc++; const float a = fabsf(e[i]); we[wne++] = a; wb += a > 0.25f; }
             if (nprof) {
@@ -404,7 +420,7 @@ int cmd_surf_stats(int argc, char **argv) {
             printf("\n"); }
         for (size_t q = 0; q < wne; q++) { if (ne == cape) { cape *= 2; eall = realloc(eall, cape * 4); } eall[ne++] = we[q]; }
         nv += wv; nconf += wc; nbad += wb; on += won; onn += wct;
-        free(we); free(sb); free(lb); free(ub); free(e); free(cf); free(ct); sf_free(&s);
+        free(we); free(sb); free(lb); free(ub); free(e); free(cf); free(ct); free(sr); sf_free(&s);
     }
     if (ne) qsort(eall, ne, 4, cmp_f32);
     if (na) qsort(aall, na, 4, cmp_f32);
@@ -414,6 +430,9 @@ int cmd_surf_stats(int argc, char **argv) {
     printf("surf-stats: sheet switches in the phase: around the axis %.1f cm, %.0f switches, %.2f per cm, run %.2f mm; along z %.1f cm, %.0f, %.2f per cm, run %.2f mm\n",
            A[0].path * 1e-4, A[0].sw, A[0].path > 0 ? A[0].sw / (A[0].path * 1e-4) : 0, A[0].runs ? A[0].path / A[0].runs * 1e-3 : 0,
            A[1].path * 1e-4, A[1].sw, A[1].path > 0 ? A[1].sw / (A[1].path * 1e-4) : 0, A[1].runs ? A[1].path / A[1].runs * 1e-3 : 0);
+    if (nsr) { qsort(srall, nsa, 4, cmp_f32);
+        printf("surf-stats: spacing to the next wrap outward / the fields' sheet spacing: median %.2f p10 %.2f p90 %.2f; < 0.5 (wraps bunched: a lost turn) %.4f, > 1.5 (a gained turn) %.4f\n",
+               srall[nsa / 2], srall[nsa / 10], srall[nsa * 9 / 10], (double)srlo / nsr, (double)srhi / nsr); }
     printf("surf-stats: adjacent normals: angle median %.2f p90 %.2f deg, > 30 deg %.5f\n", na ? aall[na / 2] : 0, na ? aall[na * 9 / 10] : 0, nang ? (double)nang30 / nang : 0);
     if (nprof) {
         printf("surf-stats: CT: on papyrus (max CT within +-%.0f um along the normal >= %.0f) %.3f; at the vertex mean %.1f, below %.0f %.3f\n",
@@ -422,6 +441,6 @@ int cmd_surf_stats(int argc, char **argv) {
         for (int q = 0; q < nprof; q++) printf(" %+.0f:%.1f", (q - (nprof - 1) / 2.0) * ctstep, pcount[q] ? prof[q] / pcount[q] : 0);
         printf("\n");
     }
-    free(eall); free(aall); free(cfall); free(prof); free(pcount); free(names); sff_free(&F); fit_set_free(ms); if (cz) z3_close(cz);
+    free(eall); free(aall); free(cfall); free(srall); free(prof); free(pcount); free(names); sff_free(&F); fit_set_free(ms); if (cz) z3_close(cz);
     return 0;
 }
