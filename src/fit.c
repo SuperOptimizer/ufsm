@@ -27,7 +27,7 @@ fit_cfg fit_cfg_default(void) {
     const int lat[6] = {512, 256, 128, 64, 64, 32}, st[6] = {300, 300, 300, 300, 300, 300};
     memcpy(c.lattice, lat, sizeof lat); memcpy(c.steps, st, sizeof st);
     c.lr = 0.02f; c.lr_knot = 0.005f;
-    c.w_phase = 1.f; c.w_normal = 1.f; c.w_density = 1.f; c.w_nondeg = 1.f; c.w_smooth = 0.1f; c.w_decay = 1e-4f;
+    c.w_phase = 1.f; c.w_normal = 3.f; c.w_density = 1.f;   /* w_normal 3: 15-24% fewer sheet switches on 3 Paris 4 crops at equal distance (2026-10-19) */ c.w_nondeg = 1.f; c.w_smooth = 0.1f; c.w_decay = 1e-4f;
     c.phase_ramp = 0.1f; c.core = 3.f; c.unwrap_voxels = 1; c.uw_tile = 256; c.analytic = 1; c.batch = 2000000; c.conf_pow = 1.f; c.pgrad_delta = 0.25f;
     return c;
 }
