@@ -1934,8 +1934,10 @@ int cmd_train(int argc, char **argv) {
         /* a worker fills a whole slot, so with fewer free slots than workers the rest park on the slot condition variable (the desk's
            unwrap2 run: 28 workers, 2 GPUs, B 1 -> 10 slots, the trainer holding some, ~6-10 drawing): by default every worker a slot
            plus 2 per GPU with the trainer and 2 ready, as far as the memory left beside the workers' own scratch (~16 P^3 bytes each:
-           draw()'s ttmp / big and pooled window buffers) allows */
-        const int want = (workers + B - 1) / B + 2 * ng + 2;
+           draw()'s ttmp / big and pooled window buffers) allows. --det 1 hands batches out in order, so a slow window holds every
+           finished one behind it in its slot (head-of-line): with draw times varying 2x (warped or not, scanner ops) a slot per
+           worker kept ~60% of them drawing (a queue simulation reproduces the desk's 15 of 28); 1.5 slots per worker ~90% */
+        const int want = ((sc.deterministic ? 3 * workers / 2 : workers) + B - 1) / B + 2 * ng + 2;
         if (avail && want > sc.nbuf && sc.nbuf == 4 * ng + 2) {
             const long long room = (long long)budget - (long long)workers * 16 * (long long)p3s - (long long)sc.nbuf * (long long)win;
             long long extra = room > 0 && slotb ? room / (long long)slotb : 0;
@@ -1945,6 +1947,11 @@ int cmd_train(int argc, char **argv) {
                     sc.nbuf < want ? ": host memory caps them, workers beyond the free slots wait (--sampler-slots sets it)" : "");
         }
     }
+    if (sc.deterministic && sc.nbuf < (3 * workers / 2 + B - 1) / B + 2 * ng + 2)
+        fprintf(stderr, "sampler: %d slots for %d workers under --det 1: batches leave in order, so finished windows wait in their slots behind "
+                "slower ones and workers without a free slot idle; ~1.5 slots per worker + %d keep them drawing (fewer workers and more slots "
+                "beat more workers: each idle worker holds ~16 P^3 bytes of scratch, a slot %.2f GB)\n", sc.nbuf, workers, 2 * ng + 2,
+                (double)B * g_Pz * P * P * ((size_t)g_xs * xbytes() + (g_pack ? 1 : NCH + 1) + (g_side != 0) + 2 * (g_unwrap2 != 0)) / 1e9);
     sampler *sp = sampler_start(S, &sc);
     if (!sp) return 1;
     char logp[1400]; snprintf(logp, sizeof logp, "%s/log.csv", out);
@@ -1973,7 +1980,7 @@ int cmd_train(int argc, char **argv) {
           g_verso_flip = g_verso_on && g_verso_swap > 0 && (double)(h >> 11) * 0x1p-53 < g_verso_swap; }   /* same on every GPU */
         g_sheet_ramp=fminf(1.f,(float)(step-schedule_start)/500.f);
         nn_set_sr_step((unsigned)step);
-        double loss = 0, active = 0;
+        double loss = 0, active = 0; int want_next[64] = {0};   /* (per GPU: fetch its next batch after all launches) */
         /* forward + backward on every GPU; kernel launches are asynchronous so the GPUs overlap */
         if (split) {   /* one window on both GPUs: upload both slabs of a batch, then one job with the halo exchanges */
             if (!G[0].pending) {
@@ -2004,6 +2011,7 @@ int cmd_train(int argc, char **argv) {
         for (int g = 0; g < ng; g++) {
             gpu_state *d = &G[g];
             nn_init(d->dev);
+            want_next[g] = 0;
             if (overfit > 1) {                              /* diagnostic: cycle through the first N batches (host copies, synchronous upload) */
                 static batch *fixed[256]; static int nfixed = 0;
                 int k = (step - step0 - 1) % overfit;
@@ -2072,13 +2080,17 @@ int cmd_train(int argc, char **argv) {
             nn_event_sync(d->ev_up[d->cur]);                 /* host buffer of this batch is free again */
             if (overfit) continue;                           /* keep computing on the same device buffer */
             sampler_release(sp, d->pending);
-            /* prefetch the next batch into the other buffer while this step computes */
+            /* prefetch the next batch into the other buffer while this step computes; several GPUs: after every GPU's step is
+               launched (waiting here for GPU 0's next batch held GPU 1's launch back whenever the sampler was behind) */
             d->pending = nullptr;
-            if (step < steps && !g_stop) {
-                double tw = now(); batch *nb = sampler_next(sp); wait += now() - tw;
-                if (!nb) { fprintf(stderr, "sampler stopped before final step\n"); training_failed = 1; break; }
-                int nxt = d->cur ^ 1; upload_async(d, nb, nxt, B, P); d->pending = nb; select_buf(d, nxt);
-            }
+            want_next[g] = step < steps && !g_stop;
+        }
+        for (int g = 0; g < ng && !g_stop && !training_failed; g++) {
+            if (!want_next[g]) continue;
+            gpu_state *d = &G[g]; nn_init(d->dev);
+            double tw = now(); batch *nb = sampler_next(sp); wait += now() - tw;
+            if (!nb) { fprintf(stderr, "sampler stopped before final step\n"); training_failed = 1; break; }
+            int nxt = d->cur ^ 1; upload_async(d, nb, nxt, B, P); d->pending = nb; select_buf(d, nxt);
         }
         if (g_stop || training_failed) break;
         /* average gradients across GPUs: sum on GPU 0 (peer copies), scale, broadcast */
