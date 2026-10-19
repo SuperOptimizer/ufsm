@@ -997,6 +997,8 @@ int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf 
     int shp[3]; long long org[3];
     for (int d = 0; d < 3; d++) { org[d] = (long long)json_num(json_at(json_get(j, "origin"), d), 0); shp[d] = (int)json_num(json_at(json_get(j, "shape"), d), 0); }
     const int h = (int)json_num(json_get(j, "h"), 8), zarr = !strcmp(json_str(json_get(j, "format"), "raw"), "zarr");
+    long long zoff[3] = {0, 0, 0};   /* zarr only: "zarr_offset" [z, y, x] cells, the box corner inside the arrays (shape = the box) */
+    for (int d = 0; d < 3; d++) zoff[d] = (long long)json_num(json_at(json_get(j, "zarr_offset"), d), 0);
     b->um = json_num(json_get(j, "um"), 2.4);
     if (fz1 <= 0 || fz1 > shp[0]) fz1 = shp[0];
     if (fz0 < 0) fz0 = 0;
@@ -1034,7 +1036,7 @@ int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf 
     for (int z0 = fz0; z0 < fz1; z0 += zb) {
         const int nz = z0 + zb <= fz1 ? zb : fz1 - z0;
         for (int k = 0; k < 10; k++) {
-            if (zarr) { const int64_t o[3] = {z0, 0, 0}, n[3] = {nz, H, W}; if (z3_read(za[k], o, n, blk[k], 8)) { fprintf(stderr, "fit: %s\n", z3_error()); return -1; } }
+            if (zarr) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read(za[k], o, n, blk[k], 8)) { fprintf(stderr, "fit: %s\n", z3_error()); return -1; } }
             else if (fseek(fr[k], (long)((size_t)z0 * plane), SEEK_SET) || fread(blk[k], 1, (size_t)nz * plane, fr[k]) != (size_t)nz * plane) { fprintf(stderr, "fit: short read\n"); return -1; }
         }
         if (pool == 1) { for (int k = 0; k < 10; k++) memcpy(b->a[k] + (size_t)(z0 - fz0) * plane, blk[k], (size_t)nz * plane); continue; }
@@ -1261,14 +1263,16 @@ uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[
     fit_fields_buf g; if (fit_fields_load(dir, 0, 0, 0, &g)) return nullptr;
     const int D = g.shape[0], H = g.shape[1], W = g.shape[2], Dp = (D + pool - 1) / pool, Hp = (H + pool - 1) / pool, Wp = (W + pool - 1) / pool;
     char p[1400]; snprintf(p, sizeof p, "%s/fields.json", dir); json *j = read_json_file(p);
-    const int zarr = j && !strcmp(json_str(json_get(j, "format"), "raw"), "zarr"); json_free(j); fit_fields_free(&g);
+    const int zarr = j && !strcmp(json_str(json_get(j, "format"), "raw"), "zarr"); long long zoff[3] = {0, 0, 0};
+    for (int d = 0; d < 3; d++) zoff[d] = j ? (long long)json_num(json_at(json_get(j, "zarr_offset"), d), 0) : 0;
+    json_free(j); fit_fields_free(&g);
     z3 *za = nullptr; FILE *fr = nullptr;
     if (zarr) za = z3_open(store_open(dir), name, nullptr); else { snprintf(p, sizeof p, "%s/%s.raw", dir, name); fr = fopen(p, "rb"); }
     if (!za && !fr) return nullptr;
     uint8_t *out = calloc((size_t)Dp * Hp * Wp, 1), *blk = malloc((size_t)pool * H * W);
     for (int z0 = 0; z0 < D; z0 += pool) {
         const int nz = z0 + pool <= D ? pool : D - z0;
-        if (za) { const int64_t o[3] = {z0, 0, 0}, n[3] = {nz, H, W}; if (z3_read(za, o, n, blk, 8)) { free(out); out = nullptr; break; } }
+        if (za) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read(za, o, n, blk, 8)) { free(out); out = nullptr; break; } }
         else if (fseek(fr, (long)((size_t)z0 * H * W), SEEK_SET) || fread(blk, 1, (size_t)nz * H * W, fr) != (size_t)nz * H * W) { free(out); out = nullptr; break; }
         uint8_t *o = out + (size_t)(z0 / pool) * Hp * Wp;
         for (int a = 0; a < nz; a++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {

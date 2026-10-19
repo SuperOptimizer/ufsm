@@ -635,6 +635,31 @@ static int cmd_fit(int argc, char **argv) {
     if (fit_fields_load(dir, 0, 0, min || slab > 0 ? 0 : 1, &fb)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
     clock_gettime(CLOCK_MONOTONIC, &tl1);
     if (c.verbose) fprintf(stderr, "fit: fields %dx%dx%d loaded in %.1fs\n", fb.shape[0], fb.shape[1], fb.shape[2], (double)(tl1.tv_sec - tl0.tv_sec) + (tl1.tv_nsec - tl0.tv_nsec) * 1e-9);   /* (slab runs load per slab; a given model needs the geometry only) */
+    if (*opt(argc, argv, "--axis-normal", "") && !min && !slab) {
+        /* local boxes away from the scroll's axis (crushed scrolls): replace the axis by a vertical line D native voxels from the box centre
+           along the box's mean sheet normal (top eigenvector of the material-weighted mean n n^T), so the spiral term is nearly flat */
+        const double D = atof(opt(argc, argv, "--axis-normal", "0")); const fit_fields *f = &fb.f; const size_t n = (size_t)f->D * f->H * f->W;
+        double T[6] = {0}, sw = 0;   /* zz yy xx zy zx yx */
+        for (size_t i = 0; i < n; i++) if (f->w[i]) {
+            const double w = f->w[i] / 255.0; sw += w;
+            for (int k = 0; k < 3; k++) T[k] += w * f->t[k][i] / 255.0;
+            for (int k = 3; k < 6; k++) T[k] += w * (f->t[k][i] / 255.0 - 0.5);
+        }
+        if (sw <= 0) { fprintf(stderr, "fit: --axis-normal: no material in the box\n"); return 1; }
+        const double M[3][3] = {{T[0], T[3], T[4]}, {T[3], T[1], T[5]}, {T[4], T[5], T[2]}};
+        double v[3] = {0.3, 0.7, 0.6};
+        for (int it = 0; it < 100; it++) {
+            double u[3] = {0, 0, 0}; for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) u[a] += M[a][b] * v[b];
+            const double l = sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]); if (l < 1e-12) break; for (int a = 0; a < 3; a++) v[a] = u[a] / l;
+        }
+        double ny = v[1], nx = v[2]; const double lyx = sqrt(ny * ny + nx * nx);
+        if (lyx < 0.3) fprintf(stderr, "fit: --axis-normal: the mean normal (%.2f %.2f %.2f) is mostly along z\n", v[0], v[1], v[2]);
+        if (lyx > 1e-6) { ny /= lyx; nx /= lyx; } else { ny = 1; nx = 0; }
+        const double cy = f->H * f->h / 2, cx = f->W * f->h / 2; const int na = (int)(f->D * f->h) + 1;
+        for (int z = 0; z < na; z++) { fb.cy[z] = (float)(cy - D * ny); fb.cx[z] = (float)(cx - D * nx); }
+        fprintf(stderr, "fit: --axis-normal: mean normal z %.3f y %.3f x %.3f; axis at box-local (y %.1f, x %.1f), %.0f native voxels away\n",
+                v[0], v[1], v[2], cy - D * ny, cx - D * nx, D);
+    }
     c.um = fb.um;   /* default lattices and knots are physical: given in 2.4 um voxels, scaled to the fields' native voxels */
     if (!*opt(argc, argv, "--knot-dz", "")) c.knot_dz = fit_scale_L(1024, 2.4 / fb.um);
     if (!*opt(argc, argv, "--lattice", "")) for (int k = 0; k < c.nstage; k++) c.lattice[k] = fit_scale_L(c.lattice[k], 2.4 / fb.um);
