@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <time.h>
 
+static double st_qw(const st_box *b, const double p[3]);   /* phi weight factor from the quality map (below) */
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 /* ---- boxes ---- */
@@ -35,15 +36,19 @@ int st_box_load(st_box *b, const char *dir) {
     st_box_range(b);
     return 0;
 }
-void st_box_free(st_box *b) { fit_set_free(b->fs); b->fs = nullptr; }
+void st_box_free(st_box *b) { fit_set_free(b->fs); b->fs = nullptr; free(b->q); free(b->qa); b->q = b->qa = nullptr; }
 double st_box_W(const st_box *b, const double p[3]) { return fit_set_W(b->fs, p[0] - b->lo[0], p[1] - b->lo[1], p[2] - b->lo[2]); }
+static int cmp_dbl(const void *a, const void *b) { const double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
 void st_box_range(st_box *b) {
-    b->wmin = 1e300; b->wmax = -1e300;
+    b->wmin = 1e300; b->wmax = -1e300; double gs[729]; int ng = 0;
     for (int i = 0; i <= 8; i++) for (int j = 0; j <= 8; j++) for (int k = 0; k <= 8; k++) {
         const double p[3] = {b->lo[0] + (b->hi[0] - b->lo[0]) * (0.001 + 0.998 * i / 8), b->lo[1] + (b->hi[1] - b->lo[1]) * (0.001 + 0.998 * j / 8),
                              b->lo[2] + (b->hi[2] - b->lo[2]) * (0.001 + 0.998 * k / 8)};
         const double w = st_box_W(b, p); if (w < b->wmin) b->wmin = w; if (w > b->wmax) b->wmax = w;
+        const double py[3] = {p[0], p[1] + 1, p[2]}, px[3] = {p[0], p[1], p[2] + 1};
+        gs[ng++] = hypot(st_box_W(b, py) - w, st_box_W(b, px) - w);
     }
+    qsort(gs, ng, sizeof(double), cmp_dbl); b->gnom = gs[ng / 2] > 1e-6 ? gs[ng / 2] : 1e-6;   /* the typical |grad W| in a z plane */
 }
 static double ramp(double t) { return t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t); }
 double st_box_phi(const st_box *b, const double p[3]) {
@@ -82,7 +87,8 @@ int st_G(const st_box *b, int nb, int comp, const double p[3], double *G) {
     double sw = 0, sg = 0; int n = 0;
     for (int i = 0; i < nb; i++) {
         if (comp >= 0 && b[i].comp != comp) continue;
-        const double w = st_box_phi(&b[i], p); if (w <= 0) continue;
+        double w = st_box_phi(&b[i], p); if (w <= 0) continue;
+        w *= st_qw(&b[i], p);
         sg += w * (b[i].s * st_box_W(&b[i], p) + b[i].g); sw += w; n++;
     }
     if (sw <= 1e-12) return 0;
@@ -239,13 +245,105 @@ int st_solve(st_box *b, int nb, st_edge *e, int ne, double min_agree, double min
     return bad;
 }
 
+/* ---- local fit quality ---- */
+double st_box_q(const st_box *b, const double p[3]) {
+    if (!b->q) return 1;
+    double t[3]; int i0[3];
+    for (int d = 0; d < 3; d++) {
+        double u = (p[d] - b->lo[d]) / b->qb - 0.5; if (u < 0) u = 0; if (u > b->qn[d] - 1) u = b->qn[d] - 1;
+        i0[d] = (int)u; if (i0[d] > b->qn[d] - 2) i0[d] = b->qn[d] - 2 < 0 ? 0 : b->qn[d] - 2; t[d] = b->qn[d] > 1 ? u - i0[d] : 0;
+    }
+    double s = 0;
+    for (int c = 0; c < 8; c++) {
+        const int a = i0[0] + (c >> 2 & 1), e = i0[1] + (c >> 1 & 1), f = i0[2] + (c & 1);
+        const double w = (c >> 2 & 1 ? t[0] : 1 - t[0]) * (c >> 1 & 1 ? t[1] : 1 - t[1]) * (c & 1 ? t[2] : 1 - t[2]);
+        if (w > 0) s += w * b->q[((size_t)(a < b->qn[0] ? a : b->qn[0] - 1) * b->qn[1] + (e < b->qn[1] ? e : b->qn[1] - 1)) * b->qn[2] + (f < b->qn[2] ? f : b->qn[2] - 1)];
+    }
+    return s;
+}
+typedef struct {
+    const st_box *B; const st_fields *F; int stride; const uint8_t *w, *pc, *ps; int64_t o[3], n[3], c0[3];
+    double *acc; int tid, nt;   /* per block: re A, im A, re B, im B, sum w |m| */
+} q_job;
+static void *q_worker(void *arg) {
+    q_job *J = arg; const double h = J->F->h; const st_box *B = J->B;
+    int64_t row = 0;
+    for (int64_t z = 0; z < J->n[0]; z++) {
+        const int64_t cz = J->o[0] + z; if ((cz - J->c0[0]) % J->stride) continue;
+        for (int64_t y = 0; y < J->n[1]; y++) {
+            const int64_t cy = J->o[1] + y; if ((cy - J->c0[1]) % J->stride) continue;
+            if (row++ % J->nt != J->tid) continue;
+            for (int64_t x = 0; x < J->n[2]; x++) {
+                const int64_t cx = J->o[2] + x; if ((cx - J->c0[2]) % J->stride) continue;
+                const size_t i = ((size_t)z * J->n[1] + y) * J->n[2] + x; if (!J->w[i]) continue;
+                const double mr = (J->pc[i] - 128.0) / 127.0, mi = (J->ps[i] - 128.0) / 127.0, wt = J->w[i] / 255.0;
+                const double p[3] = {J->F->org[0] + (cz + 0.5) * h, J->F->org[1] + (cy + 0.5) * h, J->F->org[2] + (cx + 0.5) * h};
+                int q[3], in = 1; for (int d = 0; d < 3; d++) { q[d] = (int)((p[d] - B->lo[d]) / B->qb); if (p[d] < B->lo[d] || p[d] >= B->hi[d]) in = 0; if (q[d] >= B->qn[d]) q[d] = B->qn[d] - 1; }
+                if (!in) continue;
+                const double W = st_box_W(B, p), c = cos(2 * M_PI * W), s = sin(2 * M_PI * W);
+                double *a = J->acc + 5 * (((size_t)q[0] * B->qn[1] + q[1]) * B->qn[2] + q[2]);
+                a[0] += wt * (mr * c + mi * s); a[1] += wt * (mi * c - mr * s);   /* m e^{-2 pi i W} */
+                a[2] += wt * (mr * c - mi * s); a[3] += wt * (mi * c + mr * s);   /* m e^{+2 pi i W} */
+                a[4] += wt * hypot(mr, mi);
+            }
+        }
+    }
+    return nullptr;
+}
+int st_quality(st_box *B, const st_fields *F, double qb, int stride, int nthreads) {
+    if (nthreads < 1) nthreads = 1;
+    if (nthreads > 64) nthreads = 64;
+    if (stride < 1) stride = 1;
+    B->qb = qb; size_t nq = 1; for (int d = 0; d < 3; d++) { B->qn[d] = (int)ceil((B->hi[d] - B->lo[d]) / qb); nq *= B->qn[d]; }
+    double *acc = calloc((size_t)nthreads * nq * 5, sizeof(double));
+    int64_t c0[3], c1[3];
+    for (int d = 0; d < 3; d++) { c0[d] = (int64_t)floor((B->lo[d] - F->org[d]) / F->h); if (c0[d] < 0) c0[d] = 0; c1[d] = (int64_t)ceil((B->hi[d] - F->org[d]) / F->h); }
+    const int64_t ny = c1[1] - c0[1], nx = c1[2] - c0[2]; uint8_t *buf = malloc((size_t)128 * ny * nx * 3); int rc = buf ? 0 : -1;
+    for (int64_t z0 = c0[0]; z0 < c1[0] && !rc;) {
+        const int64_t z1 = (z0 / 128 + 1) * 128 < c1[0] ? (z0 / 128 + 1) * 128 : c1[0], o[3] = {z0, c0[1], c0[2]}, n[3] = {z1 - z0, ny, nx};
+        const size_t nv = (size_t)n[0] * ny * nx;
+        if (F->read(F->ctx, o, n, buf, buf + nv, buf + 2 * nv)) { rc = -1; break; }
+        q_job J[64]; pthread_t th[64];
+        for (int t = 0; t < nthreads; t++) {
+            J[t] = (q_job){B, F, stride, buf, buf + nv, buf + 2 * nv, {o[0], o[1], o[2]}, {n[0], n[1], n[2]}, {c0[0], c0[1], c0[2]}, acc + (size_t)t * nq * 5, t, nthreads};
+            pthread_create(&th[t], nullptr, q_worker, &J[t]);
+        }
+        for (int t = 0; t < nthreads; t++) pthread_join(th[t], nullptr);
+        z0 = z1;
+    }
+    free(buf);
+    if (rc) { free(acc); return -1; }
+    free(B->q); B->q = malloc(nq * sizeof(float)); B->qa = malloc(nq * sizeof(float));
+    double sa = 0, sb = 0, sw = 0;
+    for (size_t k = 0; k < nq; k++) {
+        double a[5] = {0, 0, 0, 0, 0}; for (int t = 0; t < nthreads; t++) for (int u = 0; u < 5; u++) a[u] += acc[((size_t)t * nq + k) * 5 + u];
+        B->q[k] = a[4] > 1e-9 ? (float)(hypot(a[0], a[1]) / a[4]) : 0.f; B->qa[k] = a[4] > 1e-9 ? (float)(hypot(a[2], a[3]) / a[4]) : 0.f;
+        sa += hypot(a[0], a[1]); sb += hypot(a[2], a[3]); sw += a[4];
+    }
+    B->qmean = sw > 0 ? sa / sw : 0; B->qamean = sw > 0 ? sb / sw : 0;
+    free(acc);
+    return 0;
+}
+static double st_qw(const st_box *b, const double p[3]) { if (!b->q) return 1; const double q = st_box_q(b, p); return q < 0.05 ? 0.0025 : q * q; }
+
 /* ---- gauge files ---- */
 int st_save(const char *path, const st_box *b, int nb, const st_edge *e, int ne, double um) {
-    FILE *f = fopen(path, "w"); if (!f) return -1;
+    char qp[1400]; snprintf(qp, sizeof qp, "%s.q.f32", path); FILE *qf = nullptr; long long qoff = 0;   /* the quality maps (q then qa per box) */
+    for (int i = 0; i < nb; i++) if (b[i].q && !qf && !(qf = fopen(qp, "wb"))) return -1;
+    FILE *f = fopen(path, "w"); if (!f) { if (qf) fclose(qf); return -1; }
     fprintf(f, "{\"um\": %.9g,\n \"boxes\": [\n", um);
-    for (int i = 0; i < nb; i++)
-        fprintf(f, "  {\"name\": \"%s\", \"dir\": \"%s\", \"lo\": [%.3f, %.3f, %.3f], \"hi\": [%.3f, %.3f, %.3f], \"s\": %d, \"g\": %.0f, \"comp\": %d, \"wmin\": %.4f, \"wmax\": %.4f}%s\n",
-                b[i].name, b[i].dir, b[i].lo[0], b[i].lo[1], b[i].lo[2], b[i].hi[0], b[i].hi[1], b[i].hi[2], b[i].s, b[i].g, b[i].comp, b[i].wmin, b[i].wmax, i + 1 < nb ? "," : "");
+    for (int i = 0; i < nb; i++) {
+        const size_t nq = b[i].q ? (size_t)b[i].qn[0] * b[i].qn[1] * b[i].qn[2] : 0;
+        fprintf(f, "  {\"name\": \"%s\", \"dir\": \"%s\", \"lo\": [%.3f, %.3f, %.3f], \"hi\": [%.3f, %.3f, %.3f], \"s\": %d, \"g\": %.0f, \"comp\": %d, \"wmin\": %.4f, \"wmax\": %.4f",
+                b[i].name, b[i].dir, b[i].lo[0], b[i].lo[1], b[i].lo[2], b[i].hi[0], b[i].hi[1], b[i].hi[2], b[i].s, b[i].g, b[i].comp, b[i].wmin, b[i].wmax);
+        if (nq) {
+            fprintf(f, ", \"q\": {\"n\": [%d, %d, %d], \"block\": %.3f, \"offset\": %lld, \"mean\": %.4f, \"mean_anti\": %.4f}", b[i].qn[0], b[i].qn[1], b[i].qn[2], b[i].qb, qoff, b[i].qmean, b[i].qamean);
+            if (fwrite(b[i].q, 4, nq, qf) != nq || fwrite(b[i].qa, 4, nq, qf) != nq) { fclose(f); fclose(qf); return -1; }
+            qoff += 2 * (long long)nq;
+        }
+        fprintf(f, "}%s\n", i + 1 < nb ? "," : "");
+    }
+    if (qf && fclose(qf)) { fclose(f); return -1; }
     fprintf(f, " ],\n \"edges\": [\n");
     for (int i = 0; i < ne; i++)
         fprintf(f, "  {\"a\": %d, \"b\": %d, \"s\": %d, \"k\": %d, \"agree\": %.5f, \"tight\": %.5f, \"k2\": %d, \"agree2\": %.5f, \"other\": %.5f, \"frac\": %.4f, "
@@ -269,6 +367,17 @@ int st_load(const char *path, st_box **bo, int *nbo, st_edge **eo, int *neo, dou
         if (st_box_load(&b[i], json_str(json_get(x, "dir"), ""))) { fprintf(stderr, "stitch: cannot load the model in %s\n", json_str(json_get(x, "dir"), "")); json_free(j); free(b); free(e); return -1; }
         snprintf(b[i].name, sizeof b[i].name, "%s", json_str(json_get(x, "name"), b[i].name));
         b[i].s = (int)json_num(json_get(x, "s"), 1); b[i].g = json_num(json_get(x, "g"), 0); b[i].comp = (int)json_num(json_get(x, "comp"), -1);
+        const json *q = json_get(x, "q");
+        if (q) {   /* the box's quality map from path.q.f32 */
+            for (int d = 0; d < 3; d++) b[i].qn[d] = (int)json_num(json_at(json_get(q, "n"), d), 0);
+            b[i].qb = json_num(json_get(q, "block"), 64); b[i].qmean = json_num(json_get(q, "mean"), 0); b[i].qamean = json_num(json_get(q, "mean_anti"), 0);
+            const size_t nq = (size_t)b[i].qn[0] * b[i].qn[1] * b[i].qn[2]; char qp[1400]; snprintf(qp, sizeof qp, "%s.q.f32", path); FILE *qf = fopen(qp, "rb");
+            b[i].q = malloc(nq * 4); b[i].qa = malloc(nq * 4);
+            if (!qf || fseek(qf, (long)json_num(json_get(q, "offset"), 0) * 4, SEEK_SET) || fread(b[i].q, 4, nq, qf) != nq || fread(b[i].qa, 4, nq, qf) != nq) {
+                fprintf(stderr, "stitch: cannot read the quality map of %s in %s\n", b[i].name, qp); free(b[i].q); free(b[i].qa); b[i].q = b[i].qa = nullptr;
+            }
+            if (qf) fclose(qf);
+        }
     }
     for (int i = 0; i < ne; i++) {
         const json *x = json_at(je, i);
@@ -295,24 +404,72 @@ int st_F(const st_box *b, const st_sgauge *g, const double p[3], double *F) {
     double sw = 0, sf = 0;
     for (int i = 0; i < g->nb; i++) {
         if (!g->on[i]) continue;
-        const double w = st_box_phi(&b[i], p); if (w <= 0) continue;
+        double w = st_box_phi(&b[i], p); if (w <= 0) continue;
+        w *= st_qw(&b[i], p);
         sf += w * g->s[i] * (st_box_W(&b[i], p) - g->off[i]); sw += w;
     }
     if (sw <= 1e-12) return 0;
     *F = sf / sw; return 1;
 }
-typedef struct { const st_box *b; int nb, comp, follow; const st_trace_cfg *c; st_sgauge *g; double gmin2; } tctx;
-static int tF(const tctx *T, double z, double y, double x, double *F) { const double p[3] = {z, y, x}; return st_F(T->b, T->g, p, F); }
+/* The tracer's gauge is per vertex: it starts as the seed's, is copied along each row and from a row's vertex to the next row's
+   anchor, and in follow mode changes on the way (boxes joining, boxes re-gauged against the strongest box, fault bridges). */
+typedef struct {
+    const st_box *b; int nb, comp, follow; const st_trace_cfg *c;
+    st_sgauge *g;                   /* the current gauge (what F reads) */
+    double gmin2;
+    long long regauges, bridges, bridge_steps;
+} tctx;
+/* F and its in-plane gradient (central differences, e = 0.5 native). Follow mode: a box whose own |grad W| exceeds 1.5 x its nominal
+   (a fault of that fit) is down-weighted by (1.5 gnom / |grad W|)^8 against the others, so a seam follows the box without the fault */
 static int tFgrad(const tctx *T, double z, double y, double x, double *F, double *gy, double *gx) {
-    double a, b, c, d; const double e = 0.5;
-    if (!tF(T, z, y, x, F) || !tF(T, z, y + e, x, &a) || !tF(T, z, y - e, x, &b) || !tF(T, z, y, x + e, &c) || !tF(T, z, y, x - e, &d)) return 0;
-    *gy = (a - b) / (2 * e); *gx = (c - d) / (2 * e); return 1;
+    const double e = 0.5, P[5][3] = {{z, y, x}, {z, y + e, x}, {z, y - e, x}, {z, y, x + e}, {z, y, x - e}};
+    double sw = 0, sf[5] = {0, 0, 0, 0, 0};
+    for (int j = 0; j < T->nb; j++) {
+        if (!T->g->on[j]) continue;
+        const double w0 = st_box_phi(&T->b[j], P[0]); if (w0 <= 0) continue;
+        double v[5]; for (int q = 0; q < 5; q++) v[q] = T->g->s[j] * (st_box_W(&T->b[j], P[q]) - T->g->off[j]);
+        double w = w0 * st_qw(&T->b[j], P[0]);
+        if (T->follow) { const double gj = hypot(v[1] - v[2], v[3] - v[4]) / (2 * e), lim = 1.5 * T->b[j].gnom; if (gj > lim) { const double r = lim / gj, r2 = r * r, r4 = r2 * r2; w *= r4 * r4; } }
+        for (int q = 0; q < 5; q++) sf[q] += w * v[q];
+        sw += w;
+    }
+    if (sw <= 1e-12) return 0;
+    *F = sf[0] / sw; *gy = (sf[1] - sf[2]) / (2 * e * sw); *gx = (sf[3] - sf[4]) / (2 * e * sw);
+    return 1;
 }
+static int tF(const tctx *T, double z, double y, double x, double *F) { double gy, gx; return tFgrad(T, z, y, x, F, &gy, &gx); }
 static int mask_ok(const st_trace_cfg *c, double z, double y, double x) {
     if (!c || !c->mask) return 1;
     const double p[3] = {z, y, x}; int64_t q[3];
     for (int d = 0; d < 3; d++) { q[d] = (int64_t)floor((p[d] - c->mo[d]) / c->mh); if (q[d] < 0 || q[d] >= c->mn[d]) return 0; }
     return c->mask[((size_t)q[0] * c->mn[1] + q[1]) * c->mn[2] + q[2]] != 0;
+}
+static void g_store(const st_sgauge *g, double *off, int8_t *so) { for (int j = 0; j < g->nb; j++) { so[j] = g->on[j] ? g->s[j] : 0; off[j] = g->off[j]; } }
+static void g_load(st_sgauge *g, const double *off, const int8_t *so) { for (int j = 0; j < g->nb; j++) { g->on[j] = so[j] != 0; g->s[j] = so[j] ? so[j] : 1; g->off[j] = off[j]; } }
+/* the nominal |grad F| at p: the weighted 1 / pitch of the boxes that are on (a fault is a zone of many times that) */
+static double gnom_at(const tctx *T, const double p[3]) {
+    double sw = 0, sg = 0;
+    for (int j = 0; j < T->nb; j++) { if (!T->g->on[j]) continue; const double w = st_box_phi(&T->b[j], p); if (w <= 0) continue; sw += w; sg += w * T->b[j].gnom; }
+    return sw > 0 ? sg / sw : 0.1;
+}
+/* follow mode: every box that is on keeps its residual s_j (W_j - off_j) within half a turn of the strongest box's at p (its integer
+   offset re-chosen locally: the box fits' offsets change across their faults and from box to box); all: every box to its nearest
+   level (after a fault bridge, or a z step that moved a sheet spacing) */
+static void regauge(tctx *T, const double p[3], int all) {
+    if (!T->follow) return;
+    int jr = -1; double wr = 0, rr = 0;
+    for (int j = 0; j < T->nb; j++) {
+        if (!T->g->on[j]) continue;
+        const double w = st_box_phi(&T->b[j], p) * st_qw(&T->b[j], p); if (w <= 0) continue;
+        if (w > wr) { wr = w; jr = j; rr = T->g->s[j] * (st_box_W(&T->b[j], p) - T->g->off[j]); }
+    }
+    if (jr < 0) return;
+    for (int j = 0; j < T->nb; j++) {
+        if (!T->g->on[j] || (j == jr && !all)) continue;
+        if (st_box_phi(&T->b[j], p) <= 0) continue;
+        const double r = T->g->s[j] * (st_box_W(&T->b[j], p) - T->g->off[j]), d = all ? r : r - rr;
+        if (fabs(d) > 0.5) { T->g->off[j] += T->g->s[j] * round(d); T->regauges++; }
+    }
 }
 /* Newton onto F = 0 in the plane z from (y, x) (steps of at most 0.4 turn, at most one sheet spacing in total); 0 when it fails */
 static int project(const tctx *T, double z, double *y, double *x, double *gyo, double *gxo) {
@@ -332,7 +489,7 @@ static int project(const tctx *T, double z, double *y, double *x, double *gyo, d
 /* follow mode: a box not yet in the sheet joins at an accepted vertex where it has weight, at its level nearest the vertex
    (off = round W), once the vertex sits within 1/4 turn of that level or the box's weight reaches 1/2 (a conflicting contact),
    with the sign that makes its gradient agree with the sheet's */
-static void contact(const tctx *T, double z, double y, double x, double gy, double gx) {
+static void contact(tctx *T, double z, double y, double x, double gy, double gx) {
     if (!T->follow) return;
     const double p[3] = {z, y, x};
     for (int j = 0; j < T->nb; j++) {
@@ -346,15 +503,88 @@ static void contact(const tctx *T, double z, double y, double x, double gy, doub
         T->g->contacts++; if (fabs(r) > 0.25) T->g->contact_conflicts++;
     }
 }
+/* a row's vertices: positions, |grad F|, flags (1 mask ok, 2 bridge), the per-vertex gauge, and what the sheet stats need */
+typedef struct {
+    int c0, n, ca, nok;
+    float *y, *x, *g, *spread; uint8_t *fl, *cls; int16_t *own; int32_t *lev;
+    double *goff; int8_t *gso;      /* n x nb */
+} trow;
+static void trow_alloc(trow *R, int n, int nb) {
+    R->n = n; R->y = malloc(n * 4); R->x = malloc(n * 4); R->g = malloc(n * 4); R->spread = malloc(n * 4); R->fl = malloc(n); R->cls = malloc(n);
+    R->own = malloc(n * 2); R->lev = malloc(n * 4); R->goff = malloc((size_t)n * nb * 8); R->gso = malloc((size_t)n * nb);
+}
+static void trow_free_gauges(trow *r) { free(r->goff); free(r->gso); r->goff = nullptr; r->gso = nullptr; }
+static void trow_free(trow *r) { free(r->y); free(r->x); free(r->g); free(r->spread); free(r->fl); free(r->cls); free(r->own); free(r->lev); trow_free_gauges(r); memset(r, 0, sizeof *r); }
+/* one accepted vertex into slot i of R: seam class from the boxes' own levels near it (first order: s (W - off) / |grad F|), the owner
+   (largest weight among the boxes that are on) and its level, the current gauge */
+static void put_vertex(const tctx *T, trow *R, int i, double z, double y, double x, double gn, int flags) {
+    R->y[i] = (float)y; R->x[i] = (float)x; R->g[i] = (float)gn; R->fl[i] = (uint8_t)flags;
+    const double p[3] = {z, y, x}; double emin = 1e300, emax = -1e300, wbest = 0; int nbx = 0, ib = -1, unj = 0;
+    for (int j = 0; j < T->nb; j++) {
+        if (T->comp >= 0 && T->b[j].comp != T->comp) continue;
+        const double w = st_box_phi(&T->b[j], p); if (w <= 0.02) continue;
+        if (!T->g->on[j]) { if (w >= 0.5) unj = 1; continue; }
+        const double ev = T->g->s[j] * (st_box_W(&T->b[j], p) - T->g->off[j]); nbx++;
+        if (ev < emin) emin = ev;
+        if (ev > emax) emax = ev;
+        const double wq = w * st_qw(&T->b[j], p); if (wq > wbest) { wbest = wq; ib = j; }
+    }
+    const double dw = nbx >= 2 ? emax - emin : 0;
+    const int lowq = ib >= 0 && T->b[ib].q && st_box_q(&T->b[ib], p) < 0.2;
+    R->cls[i] = (uint8_t)((flags & 2) ? 5 : lowq ? 6 : nbx < 2 ? 1 : dw < 0.25 ? 2 : dw < 0.5 ? 3 : 4) | (uint8_t)(unj << 7);
+    R->spread[i] = nbx >= 2 ? (float)(dw / fmax(gn, 1e-6)) : -1.f;
+    R->own[i] = (int16_t)ib; R->lev[i] = ib >= 0 ? (int32_t)lround(T->g->off[ib]) : 0;
+    g_store(T->g, R->goff + (size_t)i * T->nb, R->gso + (size_t)i * T->nb);
+}
 /* along the contour from the projected point (y, x) (gradient gy, gx): column direction sgn (+1: (gx, -gy), the wraps' increasing
-   theta when F grows outward), up to maxn points every tstep; stops at a failed projection, a step off its length, a turn of more
-   than 60 degrees per step, closing on the start, or more than max_gap unmasked steps; trailing unmasked points are dropped */
-static int trace_dir(const tctx *T, double z, double y, double x, double gy, double gx, int sgn, float *oy, float *ox, float *og, uint8_t *ook, int maxn) {
+   theta when F grows outward), up to maxn vertices every tstep into slots base + sgn (1..maxn) of R (scratch rows); stops at a
+   failed projection, a step off its length, a turn of more than 60 degrees per step, closing on the start, or more than max_gap
+   unmasked steps (trailing unmasked vertices dropped). Follow mode: before each step the boxes are re-gauged; at a fault (|grad F|
+   > fault_ratio x nominal) the trace backs up to its last calm vertex (|grad F| < 1.5 x nominal: the level set bends towards the
+   fault before it gets that steep) and bridges in a straight line from there until |grad F| is calm again for two steps (at most
+   bridge_max), where every box takes its nearest level */
+static int trace_dir(tctx *T, double z, double y, double x, double gy, double gx, int sgn, trow *S, int maxn) {
     double ty = sgn * gx, tx = -sgn * gy; const double tl = hypot(ty, tx); if (tl <= 0) return 0;
     ty /= tl; tx /= tl;
     const double y0 = y, x0 = x, st = T->c->tstep; int n = 0, gap = 0;
+    const int bridging = T->follow && T->c->bridge_max > 0, nb = T->nb;
+    double *e_off = malloc(nb * 8); int8_t *e_so = malloc(nb); g_store(T->g, e_off, e_so);   /* the gauge at the start */
+    int lc_n = 0; double lc_y = y, lc_x = x, lc_ty = ty, lc_tx = tx;                         /* the last calm vertex */
     while (n < maxn) {
         double ny = y + st * ty, nx = x + st * tx, ngy, ngx;
+        { const double pp[3] = {z, ny, nx}; regauge(T, pp, 0); }
+        if (bridging) {
+            double F0, gy0, gx0; const double pp[3] = {z, ny, nx};
+            if (!tFgrad(T, z, ny, nx, &F0, &gy0, &gx0)) break;
+            const double gnm = gnom_at(T, pp);
+            if (hypot(gy0, gx0) > T->c->fault_ratio * gnm) {   /* a fault: back to the last calm vertex, then straight on, flagged vertices */
+                n = lc_n; y = lc_y; x = lc_x; ty = lc_ty; tx = lc_tx;
+                if (lc_n > 4) {   /* the direction of the chord over the last calm stretch (the tangent bends towards the fault) */
+                    const double cy = y - S->y[lc_n - 5], cx = x - S->x[lc_n - 5], cl = hypot(cy, cx);
+                    if (cl > 0 && (cy * ty + cx * tx) / cl > 0.8) { ty = cy / cl; tx = cx / cl; }
+                }
+                if (lc_n > 0) g_load(T->g, S->goff + (size_t)(lc_n - 1) * nb, S->gso + (size_t)(lc_n - 1) * nb); else g_load(T->g, e_off, e_so);
+                const int n0 = n, maxs = (int)(T->c->bridge_max / st); int calm = 0, ok = 0, k = 0; double by = y, bx = x;
+                for (; k < maxs && n < maxn; k++) {
+                    by += st * ty; bx += st * tx; double Fb, gyb, gxb;
+                    if (!tFgrad(T, z, by, bx, &Fb, &gyb, &gxb)) break;
+                    const double pb[3] = {z, by, bx};
+                    if (hypot(gyb, gxb) < 1.5 * gnom_at(T, pb)) { if (++calm >= 2) { ok = 1; break; } } else calm = 0;
+                    put_vertex(T, S, n, z, by, bx, hypot(gyb, gxb), 2 | mask_ok(T->c, z, by, bx)); n++;
+                }
+                if (!ok) { n = n0; break; }
+                const double pb[3] = {z, by, bx}; regauge(T, pb, 1);
+                if (!project(T, z, &by, &bx, &ngy, &ngx)) { n = n0; break; }
+                double uy = sgn * ngx, ux = -sgn * ngy; const double ul = hypot(uy, ux); uy /= ul; ux /= ul;
+                if (uy * ty + ux * tx < 0.5) { n = n0; break; }
+                T->bridges++; T->bridge_steps += k;
+                contact(T, z, by, bx, ngy, ngx);
+                put_vertex(T, S, n, z, by, bx, hypot(ngy, ngx), mask_ok(T->c, z, by, bx)); n++;
+                y = by; x = bx; ty = uy; tx = ux; gap = 0;
+                lc_n = n; lc_y = y; lc_x = x; lc_ty = ty; lc_tx = tx;
+                continue;
+            }
+        }
         if (!project(T, z, &ny, &nx, &ngy, &ngx)) break;
         const double mv = hypot(ny - y, nx - x); if (mv < 0.3 * st || mv > 2 * st) break;
         double uy = sgn * ngx, ux = -sgn * ngy; const double ul = hypot(uy, ux); uy /= ul; ux /= ul;
@@ -363,104 +593,154 @@ static int trace_dir(const tctx *T, double z, double y, double x, double gy, dou
         const int ok = mask_ok(T->c, z, ny, nx); gap = ok ? 0 : gap + 1;
         if (gap > T->c->max_gap) break;
         contact(T, z, ny, nx, ngy, ngx);
-        oy[n] = (float)ny; ox[n] = (float)nx; og[n] = (float)hypot(ngy, ngx); ook[n] = (uint8_t)ok; n++;
+        put_vertex(T, S, n, z, ny, nx, hypot(ngy, ngx), ok); n++;
         y = ny; x = nx; ty = uy; tx = ux;
+        if (bridging) { const double pp[3] = {z, ny, nx}; if (hypot(ngy, ngx) < 1.3 * gnom_at(T, pp)) { lc_n = n; lc_y = y; lc_x = x; lc_ty = ty; lc_tx = tx; } }
     }
-    while (n > 0 && !ook[n - 1]) n--;
+    while (n > 0 && !(S->fl[n - 1] & 1)) n--;
+    free(e_off); free(e_so);
     return n;
 }
-typedef struct { int c0, n, ca; float *y, *x, *g; uint8_t *ok; int nok; } trow;
-static void trow_free(trow *r) { free(r->y); free(r->x); free(r->g); free(r->ok); memset(r, 0, sizeof *r); }
-/* a whole row from its anchor (column ca at (y, x), already on the contour) */
-static int trace_row(const tctx *T, double z, double y, double x, double gy, double gx, int ca, trow *R, float *tmp) {
-    const int M = T->c->max_cols; float *ly = tmp, *lx = tmp + M, *lg = tmp + 2 * M, *ry = tmp + 3 * M, *rx = tmp + 4 * M, *rg = tmp + 5 * M;
-    uint8_t *lo = (uint8_t *)(tmp + 6 * M), *ro = lo + M;
+/* a whole row from its anchor (column ca at (y, x), on the contour, the current gauge being the anchor's); L / Rr scratch rows */
+static int trace_row(tctx *T, double z, double y, double x, double gy, double gx, int ca, trow *R, trow *L, trow *Rr) {
+    const int nb = T->nb; double *a_off = malloc(nb * 8); int8_t *a_so = malloc(nb);
     contact(T, z, y, x, gy, gx);
-    const int nr = trace_dir(T, z, y, x, gy, gx, +1, ry, rx, rg, ro, M), nl = trace_dir(T, z, y, x, gy, gx, -1, ly, lx, lg, lo, M);
-    R->n = nl + 1 + nr; R->c0 = ca - nl; R->ca = ca;
-    R->y = malloc(R->n * 4); R->x = malloc(R->n * 4); R->g = malloc(R->n * 4); R->ok = malloc(R->n);
-    for (int i = 0; i < nl; i++) { R->y[nl - 1 - i] = ly[i]; R->x[nl - 1 - i] = lx[i]; R->g[nl - 1 - i] = lg[i]; R->ok[nl - 1 - i] = lo[i]; }
-    R->y[nl] = (float)y; R->x[nl] = (float)x; R->g[nl] = (float)hypot(gy, gx); R->ok[nl] = (uint8_t)mask_ok(T->c, z, y, x);
-    for (int i = 0; i < nr; i++) { R->y[nl + 1 + i] = ry[i]; R->x[nl + 1 + i] = rx[i]; R->g[nl + 1 + i] = rg[i]; R->ok[nl + 1 + i] = ro[i]; }
-    R->nok = 0; for (int i = 0; i < R->n; i++) R->nok += R->ok[i];
+    g_store(T->g, a_off, a_so);
+    trow A; trow_alloc(&A, 1, nb); put_vertex(T, &A, 0, z, y, x, hypot(gy, gx), mask_ok(T->c, z, y, x));
+    const int nr = trace_dir(T, z, y, x, gy, gx, +1, Rr, T->c->max_cols);
+    g_load(T->g, a_off, a_so);
+    const int nl = trace_dir(T, z, y, x, gy, gx, -1, L, T->c->max_cols);
+    g_load(T->g, a_off, a_so);
+    trow_alloc(R, nl + 1 + nr, nb); R->c0 = ca - nl; R->ca = ca;
+    #define CP(dst, di, src, si) do { (dst)->y[di] = (src)->y[si]; (dst)->x[di] = (src)->x[si]; (dst)->g[di] = (src)->g[si]; (dst)->spread[di] = (src)->spread[si]; \
+        (dst)->fl[di] = (src)->fl[si]; (dst)->cls[di] = (src)->cls[si]; (dst)->own[di] = (src)->own[si]; (dst)->lev[di] = (src)->lev[si]; \
+        memcpy((dst)->goff + (size_t)(di) * nb, (src)->goff + (size_t)(si) * nb, nb * 8); memcpy((dst)->gso + (size_t)(di) * nb, (src)->gso + (size_t)(si) * nb, nb); } while (0)
+    for (int i = 0; i < nl; i++) CP(R, nl - 1 - i, L, i);
+    CP(R, nl, &A, 0);
+    for (int i = 0; i < nr; i++) CP(R, nl + 1 + i, Rr, i);
+    #undef CP
+    trow_free(&A); free(a_off); free(a_so);
+    R->nok = 0; for (int i = 0; i < R->n; i++) R->nok += R->fl[i] & 1;
     return R->nok;
 }
-/* the next row (plane z) from the previous one: its vertices projected into the new plane, nearest the previous anchor column
-   first (every column within 16, then every 8th), the first that lands on the contour anchors the new row at its column */
-static int next_row(const tctx *T, double z, const trow *P, trow *R, float *tmp) {
+/* a new row's columns shifted by the median offset to the previous row's nearest vertex (within 48 columns and 3 steps) over every
+   4th vertex: the row stays aligned with its neighbour as a whole, not only at its anchor (whose column random-walks otherwise) */
+static void align_row(const trow *P, trow *R, double tstep) {
+    int *off = malloc((R->n / 4 + 1) * sizeof(int)), no = 0;
+    for (int i = 0; i < R->n; i += 4) {
+        if (!(R->fl[i] & 1)) continue;
+        const int c = R->c0 + i; int best = -1; double bd = 9 * tstep * tstep;
+        for (int j = c - 48 - P->c0; j <= c + 48 - P->c0; j++) {
+            if (j < 0 || j >= P->n || !(P->fl[j] & 1)) continue;
+            const double dy = P->y[j] - R->y[i], dx = P->x[j] - R->x[i], d = dy * dy + dx * dx;
+            if (d < bd) { bd = d; best = j; }
+        }
+        if (best >= 0) off[no++] = P->c0 + best - c;
+    }
+    if (no >= 8) {
+        for (int a = 1; a < no; a++) { const int v = off[a]; int b = a - 1; while (b >= 0 && off[b] > v) { off[b + 1] = off[b]; b--; } off[b + 1] = v; }
+        const int m = off[no / 2]; R->c0 += m; R->ca += m;
+    }
+    free(off);
+}
+/* the next row (plane z) from the previous one: its vertices (with their gauges) projected into the new plane, nearest the
+   previous anchor column first (every column within 16, then every 8th); the first that lands on the contour anchors the new row.
+   Follow mode: the candidate is re-gauged first (a z step cannot move a sheet by a spacing), candidates inside a fault are skipped */
+static int next_row(tctx *T, double z, const trow *P, trow *R, trow *L, trow *Rr) {
     const int a = P->ca - P->c0;
     for (int d = 0, tries = 0; d < P->n && tries < 256; d += d < 16 ? 1 : 8) {
         for (int sgn = 0; sgn < 2; sgn++) {
             if (d == 0 && sgn) continue;
-            const int i = sgn ? a - d : a + d; if (i < 0 || i >= P->n || !P->ok[i]) continue;
+            const int i = sgn ? a - d : a + d; if (i < 0 || i >= P->n || !(P->fl[i] & 1) || (P->fl[i] & 2)) continue;
             tries++;
-            double y = P->y[i], x = P->x[i], gy, gx;
+            g_load(T->g, P->goff + (size_t)i * T->nb, P->gso + (size_t)i * T->nb);
+            double y = P->y[i], x = P->x[i], gy, gx; const double p[3] = {z, y, x};
+            if (T->follow) {
+                regauge(T, p, 0);
+                double F; if (tF(T, z, y, x, &F) && fabs(F) > 0.5) regauge(T, p, 1);
+                if (T->c->bridge_max > 0) { double F0, gy0, gx0; if (!tFgrad(T, z, y, x, &F0, &gy0, &gx0) || hypot(gy0, gx0) > 1.5 * gnom_at(T, p)) continue; }   /* calm anchors only */
+            }
             if (!project(T, z, &y, &x, &gy, &gx)) continue;
             if (hypot(y - P->y[i], x - P->x[i]) > 4 * T->c->tstep) continue;   /* the sheet moved too far between two rows */
-            if (trace_row(T, z, y, x, gy, gx, P->c0 + i, R, tmp) > 0) return 1;
+            if (trace_row(T, z, y, x, gy, gx, P->c0 + i, R, L, Rr) > 0) { align_row(P, R, T->c->tstep); return 1; }
             trow_free(R);
         }
     }
     return 0;
 }
-void st_sheet_free(st_sheet *s) { free(s->x); free(s->y); free(s->z); free(s->seam); free(s->spreads); free(s->own); memset(s, 0, sizeof *s); }
+void st_sheet_free(st_sheet *s) { free(s->x); free(s->y); free(s->z); free(s->seam); free(s->spreads); free(s->own); free(s->lev); memset(s, 0, sizeof *s); }
 static int cmp_float(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
+static int cmp_lev(const void *a, const void *b) {
+    const st_boxlevel *x = a, *y = b;
+    if (x->box != y->box) return x->box - y->box;
+    return (x->level > y->level) - (x->level < y->level);
+}
 int st_trace(const st_box *b, int nb, int comp, const st_trace_cfg *c, st_sgauge *g, int follow, const double seed[3], st_sheet *s) {
     memset(s, 0, sizeof *s);
-    tctx T = {b, nb, comp, follow, c, g, 1.0 / (400.0 * 400.0)};   /* F flatter than one turn per 400 native voxels: degenerate */
+    tctx T = {b, nb, comp, follow, c, g, 1.0 / (400.0 * 400.0), 0, 0, 0};   /* F flatter than one turn per 400 native voxels: degenerate */
     double zlo = 1e300, zhi = -1e300;
     for (int i = 0; i < nb; i++) if (comp < 0 || b[i].comp == comp) { zlo = fmin(zlo, b[i].lo[0]); zhi = fmax(zhi, b[i].hi[0]); }
     if (zlo >= zhi) return -1;
     const double st = c->tstep;
     const int ndn = (int)floor((seed[0] - zlo) / st), nup = (int)floor((zhi - 1e-6 - seed[0]) / st), nr = ndn + nup + 1;
-    trow *R = calloc(nr, sizeof *R); float *tmp = malloc((size_t)c->max_cols * 8 * 4);
+    trow *R = calloc(nr, sizeof *R), L, Rr; trow_alloc(&L, c->max_cols, nb); trow_alloc(&Rr, c->max_cols, nb);
     double y = seed[1], x = seed[2], gy, gx;
-    if (!project(&T, seed[0], &y, &x, &gy, &gx) || trace_row(&T, seed[0], y, x, gy, gx, 0, &R[ndn], tmp) <= 0) { trow_free(&R[ndn]); free(R); free(tmp); return -1; }
+    double *s_off = malloc(nb * 8); int8_t *s_so = malloc(nb); g_store(g, s_off, s_so);   /* the seed gauge (g ends as the last vertex's) */
+    if (!project(&T, seed[0], &y, &x, &gy, &gx) || trace_row(&T, seed[0], y, x, gy, gx, 0, &R[ndn], &L, &Rr) <= 0) {
+        trow_free(&R[ndn]); free(R); trow_free(&L); trow_free(&Rr); free(s_off); free(s_so); return -1;
+    }
     int rlo = ndn, rhi = ndn;
-    for (int r = ndn + 1; r < nr; r++) { if (!next_row(&T, seed[0] + (r - ndn) * st, &R[r - 1], &R[r], tmp)) break; rhi = r; }
-    for (int r = ndn - 1; r >= 0; r--) { if (!next_row(&T, seed[0] + (r - ndn) * st, &R[r + 1], &R[r], tmp)) break; rlo = r; }
-    free(tmp);
+    for (int r = ndn + 1; r < nr; r++) {
+        if (!next_row(&T, seed[0] + (r - ndn) * st, &R[r - 1], &R[r], &L, &Rr)) break;
+        rhi = r; if (r - 1 != ndn) trow_free_gauges(&R[r - 1]);
+    }
+    for (int r = ndn - 1; r >= 0; r--) {
+        if (!next_row(&T, seed[0] + (r - ndn) * st, &R[r + 1], &R[r], &L, &Rr)) break;
+        rlo = r; trow_free_gauges(&R[r + 1]);
+    }
+    trow_free(&L); trow_free(&Rr);
     int cmin = 1 << 30, cmax = -(1 << 30);
     for (int r = rlo; r <= rhi; r++) { if (R[r].c0 < cmin) cmin = R[r].c0; if (R[r].c0 + R[r].n > cmax) cmax = R[r].c0 + R[r].n; }
     s->rows = rhi - rlo + 1; s->cols = cmax - cmin; s->z0 = seed[0] + (rlo - ndn) * st;
     const size_t nv = (size_t)s->rows * s->cols;
     s->x = malloc(nv * 4); s->y = malloc(nv * 4); s->z = malloc(nv * 4); s->seam = calloc(nv, 1); s->own = calloc(nb, sizeof(long long));
     for (size_t i = 0; i < nv; i++) s->x[i] = s->y[i] = s->z[i] = -1;
-    size_t cap = 1 << 16; s->spreads = malloc(cap * 4);
+    size_t cap = 1 << 16, lcap = 64; s->spreads = malloc(cap * 4); s->lev = malloc(lcap * sizeof *s->lev);
     for (int r = rlo; r <= rhi; r++) {
         const trow *W = &R[r]; const double z = seed[0] + (r - ndn) * st;
         for (int i = 0; i < W->n; i++) {
-            if (!W->ok[i]) continue;
+            if (!(W->fl[i] & 1)) continue;
             const size_t v = (size_t)(r - rlo) * s->cols + (W->c0 + i - cmin);
             s->x[v] = W->x[i]; s->y[v] = W->y[i]; s->z[v] = (float)z; s->nvalid++;
-            /* seam class: the joined boxes' own level sets near the vertex (first order: s (W - off) / |grad F|) */
-            const double p[3] = {z, W->y[i], W->x[i]}; double emin = 1e300, emax = -1e300, wbest = 0; int nbx = 0, ib = -1, unj = 0;
-            for (int j = 0; j < nb; j++) {
-                if (comp >= 0 && b[j].comp != comp) continue;
-                const double w = st_box_phi(&b[j], p); if (w <= 0.02) continue;
-                if (!g->on[j]) { if (w >= 0.5) unj = 1; continue; }
-                const double ev = g->s[j] * (st_box_W(&b[j], p) - g->off[j]); nbx++;
-                if (ev < emin) emin = ev;
-                if (ev > emax) emax = ev;
-                if (w > wbest) { wbest = w; ib = j; }
+            const int cl = W->cls[i] & 127; s->seam[v] = (uint8_t)cl; s->nunjoined += W->cls[i] >> 7;
+            if (cl == 5) s->nbridge++;
+            if (cl == 6) s->nlowq++;
+            if (W->own[i] >= 0) {
+                s->own[W->own[i]]++;
+                int q = 0; for (; q < s->nlev; q++) if (s->lev[q].box == W->own[i] && s->lev[q].level == W->lev[i]) break;
+                if (q == s->nlev) { if ((size_t)s->nlev == lcap) { lcap *= 2; s->lev = realloc(s->lev, lcap * sizeof *s->lev); } s->lev[q] = (st_boxlevel){W->own[i], W->lev[i], 0}; s->nlev++; }
+                s->lev[q].n++;
             }
-            if (ib >= 0) s->own[ib]++;
-            s->nunjoined += unj;
-            if (nbx < 2) { s->seam[v] = 1; continue; }
-            const double dw = emax - emin; s->nseam++;
-            s->seam[v] = dw < 0.25 ? 2 : dw < 0.5 ? 3 : 4;
-            if (dw >= 0.25 && dw < 0.5) s->nspread++;
-            if (dw >= 0.5) s->nconflict++;
+            if (cl < 2 || cl >= 5) continue;
+            s->nseam++;
+            if (cl == 3) s->nspread++;
+            if (cl == 4) s->nconflict++;
             if ((size_t)s->nspreads == cap) { cap *= 2; s->spreads = realloc(s->spreads, cap * 4); }
-            const float sp = (float)(dw / fmax(W->g[i], 1e-6)); s->spreads[s->nspreads++] = sp; s->spread_sum += sp;
+            s->spreads[s->nspreads++] = W->spread[i]; s->spread_sum += W->spread[i];
         }
     }
     for (int j = 0; j < nb; j++) s->nboxes += s->own[j] > 0;
     if (s->nspreads) qsort(s->spreads, s->nspreads, 4, cmp_float);
+    if (s->nlev) qsort(s->lev, s->nlev, sizeof *s->lev, cmp_lev);
+    s->regauges = T.regauges; s->bridges = T.bridges;
     for (int r = 0; r < nr; r++) trow_free(&R[r]);
     free(R);
+    /* g: the boxes that joined anywhere (on), each at the level it held at the seed side; the per-vertex levels are in s->lev */
+    for (int j = 0; j < nb; j++) if (g->on[j] && !s_so[j]) { s_so[j] = g->s[j]; s_off[j] = g->off[j]; }
+    g_load(g, s_off, s_so); free(s_off); free(s_so);
     return s->nvalid ? 0 : -1;
 }
+
 int st_seed(const st_box *b, int i, double zf, const st_sgauge *g, const st_trace_cfg *c, double p[3]) {
     const st_box *B = &b[i]; const fit_model *m = B->fs->global; const int na = (int)(m->D * m->h) + 1;
     const double z = B->lo[0] + zf * (B->hi[0] - B->lo[0]); int zi = (int)(z - B->lo[0]); if (zi < 0) zi = 0; if (zi >= na) zi = na - 1;
@@ -479,7 +759,10 @@ int st_seed(const st_box *b, int i, double zf, const st_sgauge *g, const st_trac
                 if ((Fm < 0) == (fa < 0)) { a = mid; fa = Fm; } else bb = mid;
             }
             const double tm = 0.5 * (a + bb);
-            if (fabs(tm) < fabs(best) && mask_ok(c, z, cy + tm * uy, cx + tm * ux)) best = tm;
+            const double qy = cy + tm * uy, qx = cx + tm * ux, q1[3] = {z, qy + 0.5, qx}, q2[3] = {z, qy - 0.5, qx}, q3[3] = {z, qy, qx + 0.5}, q4[3] = {z, qy, qx - 0.5};
+            double f1, f2, f3, f4; const int calm = st_F(b, g, q1, &f1) && st_F(b, g, q2, &f2) && st_F(b, g, q3, &f3) && st_F(b, g, q4, &f4) && hypot(f1 - f2, f3 - f4) < 1.5 * B->gnom;
+            const int good = !B->q || !c || st_box_q(B, (const double[]){z, qy, qx}) >= c->min_seed_q;
+            if (calm && good && fabs(tm) < fabs(best) && mask_ok(c, z, qy, qx)) best = tm;   /* not inside a fault of the fit, where it follows the phase */
         }
         hp = ok; tp = t; fp = ok ? F : 0;
     }
@@ -642,12 +925,17 @@ static uint8_t *load_mask(const char *fz, const char *outdir, const double lo[3]
     char p[1400]; snprintf(p, sizeof p, "%s/mask_%lld_%lld_%lld_%lldx%lldx%lld_p%d.raw", outdir, (long long)c0[0], (long long)c0[1], (long long)c0[2], (long long)mn[0], (long long)mn[1], (long long)mn[2], pool);
     uint8_t *m = calloc(nm, 1); FILE *f = fopen(p, "rb");
     if (f) { const size_t got = fread(m, 1, nm, f); fclose(f); if (got == nm) { zf_close(&zc); fprintf(stderr, "stitch: mask %s\n", p); return m; } }
-    const double t0 = now_s(); const int64_t ny = mn[1] * pool, nx = mn[2] * pool; uint8_t *blk = malloc((size_t)pool * ny * nx);
-    for (int64_t a = 0; a < mn[0]; a++) {
-        const int64_t o[3] = {c0[0] + a * pool, c0[1], c0[2]}, n[3] = {pool, ny, nx};
+    const double t0 = now_s(); const int64_t ny = mn[1] * pool, nx = mn[2] * pool, z1 = c0[0] + mn[0] * pool;
+    uint8_t *blk = malloc((size_t)128 * ny * nx);
+    for (int64_t z0 = c0[0]; z0 < z1;) {   /* blocks on the 128-cell chunk grid: each chunk decoded once */
+        const int64_t ze = (z0 / 128 + 1) * 128 < z1 ? (z0 / 128 + 1) * 128 : z1, o[3] = {z0, c0[1], c0[2]}, n[3] = {ze - z0, ny, nx};
         if (z3_read(zc.w, o, n, blk, nt)) { fprintf(stderr, "stitch: %s\n", z3_error()); free(m); free(blk); zf_close(&zc); return nullptr; }
-        for (int64_t z = 0; z < pool; z++) for (int64_t y = 0; y < ny; y++) for (int64_t x = 0; x < nx; x++)
-            if (blk[((size_t)z * ny + y) * nx + x]) m[((size_t)a * mn[1] + y / pool) * mn[2] + x / pool] = 1;
+        for (int64_t z = 0; z < n[0]; z++) {
+            const int64_t a = (z0 + z - c0[0]) / pool;
+            for (int64_t y = 0; y < ny; y++) for (int64_t x = 0; x < nx; x++)
+                if (blk[((size_t)z * ny + y) * nx + x]) m[((size_t)a * mn[1] + y / pool) * mn[2] + x / pool] = 1;
+        }
+        z0 = ze;
     }
     free(blk); zf_close(&zc);
     f = fopen(p, "wb"); if (f) { if (fwrite(m, 1, nm, f) != nm) fprintf(stderr, "stitch: short write %s\n", p); fclose(f); }
@@ -677,7 +965,7 @@ typedef struct {
     int k0, k1;                                          /* gauge mode: the levels G = k */
     int nitems, *item_box, *item_k; uint8_t **used; int *ubase, *ucount;   /* follow mode: seeds (box, own level), levels done */
     _Atomic int next;
-    const char *out; double um, out_um, step; double min_cm2; double zf[8]; int nzf;
+    const char *out; double um, out_um, step; double min_cm2; double zf[8]; int nzf; long long min_used;
     const char *rdir; int rrows; double rum[4]; int nrum;
     pthread_mutex_t mu; FILE *tsv; _Atomic long long nsheets, nverts; double t0;
 } sh_job;
@@ -732,12 +1020,12 @@ static int write_sheet(sh_job *J, const st_sheet *s, const st_sgauge *g, const c
         snprintf(p, sizeof p, "%s/sheet.json", d); FILE *jf = rc ? nullptr : fopen(p, "w");
         if (jf) {
             fprintf(jf, "{\"name\": \"%s\", \"mode\": \"%s\", \"seed\": {\"box\": \"%s\", \"level\": %.0f, \"zyx_native\": [%.1f, %.1f, %.1f]}, \"area_cm2\": %.4f, \"native_um\": %.9g,\n"
-                        " \"contacts\": %lld, \"contact_conflicts\": %lld, \"seam_vertices\": %lld, \"spread_vertices\": %lld, \"conflict_vertices\": %lld, \"unjoined_vertices\": %lld,\n \"boxes\": [",
-                    name, J->follow ? "follow" : "gauge", J->b[seedbox].name, level, seed[0], seed[1], seed[2], *cm2, J->um, g->contacts, g->contact_conflicts, s->nseam, s->nspread,
-                    s->nconflict, s->nunjoined);
-            int first = 1;
-            for (int j = 0; j < J->nb; j++) if (g->on[j] && s->own[j])
-                { fprintf(jf, "%s\n  {\"box\": \"%s\", \"w\": %.0f, \"s\": %d, \"vertices\": %lld}", first ? "" : ",", J->b[j].name, g->off[j], g->s[j], s->own[j]); first = 0; }
+                        " \"trace_vertices\": %lld, \"contacts\": %lld, \"contact_conflicts\": %lld, \"regauges\": %lld, \"bridges\": %lld, \"bridge_vertices\": %lld, \"seam_vertices\": %lld,"
+                        " \"spread_vertices\": %lld, \"conflict_vertices\": %lld, \"unjoined_vertices\": %lld, \"low_quality_vertices\": %lld,\n \"levels\": [",
+                    name, J->follow ? "follow" : "gauge", J->b[seedbox].name, level, seed[0], seed[1], seed[2], *cm2, J->um, s->nvalid, g->contacts, g->contact_conflicts, s->regauges,
+                    s->bridges, s->nbridge, s->nseam, s->nspread, s->nconflict, s->nunjoined, s->nlowq);
+            for (int q = 0; q < s->nlev; q++)   /* the strongest box's (box, own level) at the trace vertices: the box tifxyz wNNN they come from */
+                fprintf(jf, "%s\n  {\"box\": \"%s\", \"w\": %d, \"s\": %d, \"vertices\": %lld}", q ? "," : "", J->b[s->lev[q].box].name, s->lev[q].level, g->s[s->lev[q].box], s->lev[q].n);
             fprintf(jf, "]}\n"); if (fclose(jf)) rc = -1;
         }
         for (int u = 0; u < J->nrum && !rc && J->rdir; u++) {   /* render copies: row bands in other voxel units, columns cropped to the band */
@@ -749,7 +1037,7 @@ static int write_sheet(sh_job *J, const st_sheet *s, const st_sgauge *g, const c
                 const size_t bn = (size_t)(r1 - r0) * (c1 - c0); float *bx = malloc(bn * 4), *by = malloc(bn * 4), *bz = malloc(bn * 4);
                 const size_t bv = upsample(s, f, qr, r0, r1, c0, c1, bx, by, bz, nullptr);
                 if (bv >= 1000) {
-                    char bd[1600]; snprintf(bd, sizeof bd, "%s/%g/%s_r%05d_c%05d", J->rdir, J->rum[u], name, r0, c0);
+                    char bd[1600]; snprintf(bd, sizeof bd, "%s/%g/w%s_r%05d_c%05d", J->rdir, J->rum[u], name, r0, c0);
                     rc = tifxyz_write(bd, c1 - c0, r1 - r0, bx, by, bz, stepn * qr, J->rum[u], (int)level, src);
                 }
                 free(bx); free(by); free(bz);
@@ -769,17 +1057,20 @@ static int do_sheet(sh_job *J, st_sgauge *g, int seedbox, double level, const do
     double cm2 = 0; int wrote = 0;
     if (write_sheet(J, &s, g, name, seedbox, level, p, &cm2)) fprintf(stderr, "stitch: cannot write %s\n", name);
     pthread_mutex_lock(&J->mu);
-    if (J->follow) for (int j = 0; j < J->nb; j++) if (g->on[j] && s.own[j]) used_set(J, j, g->off[j]);
+    if (J->follow) for (int q = 0; q < s.nlev; q++) if (s.lev[q].n >= J->min_used) used_set(J, s.lev[q].box, s.lev[q].level);   /* box levels this sheet covered */
     if (cm2 >= J->min_cm2) {
-        int joined = 0; for (int j = 0; j < J->nb; j++) joined += g->on[j] && s.own[j] > 0;
+        const int joined = s.nboxes;
         const double p50 = s.nspreads ? s.spreads[s.nspreads / 2] * J->um : 0, p90 = s.nspreads ? s.spreads[(long long)(0.9 * (s.nspreads - 1))] * J->um : 0;
-        fprintf(J->tsv, "%s\t%s\t%.0f\t%d\t%d\t%lld\t%.3f\t%d\t%lld\t%lld\t%lld\t%.4f\t%.4f\t%.4f\t%.4f\t%.1f\t%.1f\t%.0f,%.0f,%.0f\t%.1f\n", name, J->b[seedbox].name, level,
-                s.rows, s.cols, s.nvalid, cm2, joined, g->contacts, g->contact_conflicts, s.nseam, s.nvalid ? (double)s.nseam / s.nvalid : 0, s.nseam ? (double)s.nspread / s.nseam : 0,
-                s.nseam ? (double)s.nconflict / s.nseam : 0, s.nvalid ? (double)s.nunjoined / s.nvalid : 0, p50, p90, p[0], p[1], p[2], now_s() - t0);
+        fprintf(J->tsv, "%s\t%s\t%.0f\t%d\t%d\t%lld\t%.3f\t%d\t%d\t%lld\t%lld\t%lld\t%lld\t%.4f\t%lld\t%.4f\t%.4f\t%.4f\t%.4f\t%.1f\t%.1f\t%.0f,%.0f,%.0f\t%.1f\t%.4f\n", name,
+                J->b[seedbox].name, level, s.rows, s.cols, s.nvalid, cm2, joined, s.nlev, g->contacts, g->contact_conflicts, s.regauges, s.bridges,
+                s.nvalid ? (double)s.nbridge / s.nvalid : 0, s.nseam, s.nvalid ? (double)s.nseam / s.nvalid : 0, s.nseam ? (double)s.nspread / s.nseam : 0,
+                s.nseam ? (double)s.nconflict / s.nseam : 0, s.nvalid ? (double)s.nunjoined / s.nvalid : 0, p50, p90, p[0], p[1], p[2], now_s() - t0,
+                s.nvalid ? (double)s.nlowq / s.nvalid : 0);
         fflush(J->tsv);
-        fprintf(stderr, "stitch: %s %.2f cm2 (%dx%d trace grid, %d boxes, contacts %lld (%lld conflicting), seam vertices %lld: spread %.3f conflict %.3f, p50 %.1f um p90 %.1f um; unjoined %.3f) %.0fs [%.0fs]\n",
-                name, cm2, s.rows, s.cols, joined, g->contacts, g->contact_conflicts, s.nseam, s.nseam ? (double)s.nspread / s.nseam : 0, s.nseam ? (double)s.nconflict / s.nseam : 0,
-                p50, p90, s.nvalid ? (double)s.nunjoined / s.nvalid : 0, now_s() - t0, now_s() - J->t0);
+        fprintf(stderr, "stitch: %s %.2f cm2 (%dx%d trace grid, %d boxes / %d box levels, %lld re-gauges, %lld bridges (%.3f of the vertices), seam vertices %lld: spread %.3f conflict %.3f, "
+                        "p50 %.1f um p90 %.1f um; unjoined %.3f, low quality %.3f) %.0fs [%.0fs]\n",
+                name, cm2, s.rows, s.cols, joined, s.nlev, s.regauges, s.bridges, s.nvalid ? (double)s.nbridge / s.nvalid : 0, s.nseam, s.nseam ? (double)s.nspread / s.nseam : 0,
+                s.nseam ? (double)s.nconflict / s.nseam : 0, p50, p90, s.nvalid ? (double)s.nunjoined / s.nvalid : 0, s.nvalid ? (double)s.nlowq / s.nvalid : 0, now_s() - t0, now_s() - J->t0);
         atomic_fetch_add(&J->nsheets, 1); atomic_fetch_add(&J->nverts, s.nvalid); wrote = 1;
     }
     pthread_mutex_unlock(&J->mu);
@@ -822,6 +1113,7 @@ static int stitch_sheets(int argc, char **argv) {
     if (argc < 5) {
         fprintf(stderr, "usage: ufsm stitch sheets <gauge.json> <out-dir> [--mode follow|gauge] [--comp C] [--first K] [--last K] [--boxes NAME,...] [--tstep 2] [--step 1]\n"
                         "       [--out-um 2.399] [--fields ZARR [--mask-pool 8]] [--threads 4] [--min-cm2 0.5] [--max-cols 4000] [--max-gap 50] [--seeds 0.5,0.25,0.75]\n"
+                        "       [--bridge 150 (native voxels, 0: stop at faults)] [--fault-ratio 3] [--min-used 2000] [--min-seed-q 0.3]\n"
                         "       [--render-dir D --render-rows 1042 --render-um 4.798,9.596]\n"
                         "  follow (default): every box level is a seed; a sheet joins the other boxes where it reaches them (all boxes, --comp -1)\n"
                         "  gauge: the levels G = k of the solved gauge of component --comp (0); --first / --last limit k, follow: the seed levels\n");
@@ -835,6 +1127,9 @@ static int stitch_sheets(int argc, char **argv) {
     if (J->follow && J->comp < 0) { for (int i = 0; i < J->nb; i++) J->b[i].comp = 0; J->comp = -1; st_tapers(J->b, J->nb, 0); }
     J->cfg.tstep = atof(sopt(argc, argv, "--tstep", "2")); J->step = atof(sopt(argc, argv, "--step", "1")); J->out_um = atof(sopt(argc, argv, "--out-um", "2.399"));
     J->cfg.max_cols = atoi(sopt(argc, argv, "--max-cols", "4000")); J->cfg.max_gap = atoi(sopt(argc, argv, "--max-gap", "50")); J->min_cm2 = atof(sopt(argc, argv, "--min-cm2", "0.5"));
+    J->cfg.bridge_max = atof(sopt(argc, argv, "--bridge", "150")); J->cfg.fault_ratio = atof(sopt(argc, argv, "--fault-ratio", "3"));
+    J->cfg.min_seed_q = atof(sopt(argc, argv, "--min-seed-q", "0.3"));   /* with quality maps: seeds where the seed box follows the network phase */
+    J->min_used = atoll(sopt(argc, argv, "--min-used", "2000"));   /* trace vertices of a box level that mark it as traced (no seed of its own) */
     const int nt = atoi(sopt(argc, argv, "--threads", "4"));
     { char *t = strdup(sopt(argc, argv, "--seeds", "0.5,0.25,0.75")), *sv = nullptr; for (char *q = strtok_r(t, ",", &sv); q && J->nzf < 8; q = strtok_r(nullptr, ",", &sv)) J->zf[J->nzf++] = atof(q); free(t); }
     J->rdir = sopt(argc, argv, "--render-dir", nullptr); J->rrows = atoi(sopt(argc, argv, "--render-rows", "1042"));
@@ -875,8 +1170,8 @@ static int stitch_sheets(int argc, char **argv) {
         J->cfg.mask = mask;
     }
     snprintf(p, sizeof p, "%s/sheets.tsv", J->out); J->tsv = fopen(p, "a"); if (!J->tsv) return 1;
-    fprintf(J->tsv, "#name\tseed_box\tlevel\trows\tcols\tvertices\tarea_cm2\tboxes\tcontacts\tcontact_conflicts\tseam_vertices\tseam_frac\tspread_frac\tconflict_frac\tunjoined_frac"
-                    "\tspread_p50_um\tspread_p90_um\tseed_zyx\tseconds\n");
+    fprintf(J->tsv, "#name\tseed_box\tlevel\trows\tcols\tvertices\tarea_cm2\tboxes\tbox_levels\tcontacts\tcontact_conflicts\tregauges\tbridges\tbridge_frac\tseam_vertices"
+                    "\tseam_frac\tspread_frac\tconflict_frac\tunjoined_frac\tspread_p50_um\tspread_p90_um\tseed_zyx\tseconds\tlowq_frac\n");
     pthread_mutex_init(&J->mu, nullptr); J->t0 = now_s();
     if (J->follow) fprintf(stderr, "stitch sheets: follow mode, %d seed levels, trace step %g, out %g um%s\n", J->nitems, J->cfg.tstep, J->out_um, mask ? ", material mask" : "");
     else fprintf(stderr, "stitch sheets: gauge mode, component %d, k %d..%d, trace step %g, out %g um%s\n", J->comp, J->k0, J->k1, J->cfg.tstep, J->out_um, mask ? ", material mask" : "");
@@ -887,6 +1182,23 @@ static int stitch_sheets(int argc, char **argv) {
     fprintf(stderr, "stitch sheets: %lld sheets, %lld trace vertices in %.0fs -> %s\n", (long long)atomic_load(&J->nsheets), (long long)atomic_load(&J->nverts), now_s() - J->t0, J->out);
     free(mask);
     return 0;
+}
+static int stitch_quality(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: ufsm stitch quality <in.json> <out.json> --fields ZARR [--block 64] [--stride 2] [--threads 8]\n"); return 2; }
+    st_box *b; st_edge *e; int nb, ne; double um;
+    if (st_load(argv[3], &b, &nb, &e, &ne, &um)) { fprintf(stderr, "stitch: cannot read %s\n", argv[3]); return 1; }
+    const char *fz = sopt(argc, argv, "--fields", nullptr); if (!fz) { fprintf(stderr, "stitch quality: --fields ZARR\n"); return 2; }
+    const int nt = atoi(sopt(argc, argv, "--threads", "8")); zf_ctx zc; st_fields F; if (zf_open(fz, nt, &zc, &F)) return 1;
+    const double qb = atof(sopt(argc, argv, "--block", "64")), t0 = now_s(); const int stride = atoi(sopt(argc, argv, "--stride", "2"));
+    for (int i = 0; i < nb; i++) {
+        if (st_quality(&b[i], &F, qb, stride, nt)) { fprintf(stderr, "stitch: cannot read the fields\n"); return 1; }
+        size_t nq = (size_t)b[i].qn[0] * b[i].qn[1] * b[i].qn[2], good = 0, anti = 0, seen = 0;
+        for (size_t k = 0; k < nq; k++) if (b[i].q[k] > 0 || b[i].qa[k] > 0) { seen++; good += b[i].q[k] >= 0.5; anti += b[i].qa[k] > b[i].q[k]; }
+        fprintf(stderr, "stitch quality: %s phase coherence %.3f (anti-aligned %.3f); blocks with material %zu: coherent (>= 0.5) %.3f, anti-aligned %.3f  [%.0fs]\n", b[i].name,
+                b[i].qmean, b[i].qamean, seen, seen ? (double)good / seen : 0, seen ? (double)anti / seen : 0, now_s() - t0);
+    }
+    zf_close(&zc);
+    return st_save(argv[4], b, nb, e, ne, um) ? 1 : 0;
 }
 static int stitch_info(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm stitch info <gauge.json>\n"); return 2; }
@@ -903,11 +1215,13 @@ int cmd_stitch(int argc, char **argv) {
     if (!strcmp(sub, "field")) return stitch_field(argc, argv);
     if (!strcmp(sub, "sheets")) return stitch_sheets(argc, argv);
     if (!strcmp(sub, "info")) return stitch_info(argc, argv);
-    fprintf(stderr, "usage: ufsm stitch align|solve|field|sheets|info ...\n"
+    if (!strcmp(sub, "quality")) return stitch_quality(argc, argv);
+    fprintf(stderr, "usage: ufsm stitch align|solve|quality|field|sheets|info ...\n"
                     "  align <out.json> --fields ZARR BOXDIR...   pairwise gauge offsets of overlapping box fits + the global gauge\n"
                     "  solve <in.json> <out.json> [--min-agree A] [--exclude NAMES]   the global gauge again (other thresholds)\n"
                     "  field <gauge.json> <out-group> [--step 8]    the blended global winding G (float32 zarr)\n"
                     "  sheets <gauge.json> <out-dir> [--fields ZARR]   level sets G = k as tifxyz across the boxes\n"
+                    "  quality <in.json> <out.json> --fields ZARR   per-box maps of the fit's phase coherence with the network (blend weights)\n"
                     "  info <gauge.json>                            the overlap table and the gauges\n");
     return 2;
 }

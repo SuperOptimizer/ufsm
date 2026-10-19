@@ -20,6 +20,7 @@ static double T_true(double z, double y, double x) {
 }
 static int g_switch = -1;   /* box index whose W jumps by one turn for box-local x > EXT / 2 (a sheet switch inside the box) */
 static int g_slip = -1; static double g_T0;   /* box index that counts one sheet more beyond T = g_T0 (a slip between two sheets) */
+static int g_fault = -1;   /* box index whose W climbs 3 turns across box-local x 20..26 (a fault: the fit crams turns into a thin zone) */
 static fit_model *make_model(int bi, const double org[3], int s, int c) {
     fit_model *m = calloc(1, sizeof *m);
     m->dir = 1; m->nk = 2; m->knot_dz = EXT; m->pitch = malloc(8); m->offset = malloc(8);
@@ -34,6 +35,7 @@ static fit_model *make_model(int bi, const double org[3], int s, int c) {
         double target = s * (T_true(z + org[0], y + org[1], x + org[2]) - c);
         if (bi == g_switch && x > EXT / 2) target += 1;
         if (bi == g_slip && T_true(z + org[0], y + org[1], x + org[2]) > g_T0) target += s;
+        if (bi == g_fault) { const double t = fmin(1, fmax(0, (x - 20) / 6.0)); target += s * 3 * t * t * (3 - 2 * t); }
         const size_t i = ((size_t)a * m->ly + b) * m->lx + e;
         m->delta[i] = 0;
         m->delta[i] = (float)(target - fit_W(m, z, y, x));   /* W = prior + delta: the prior read with delta 0 at this node */
@@ -44,6 +46,15 @@ static int rd_fields(void *ctx, const int64_t o[3], const int64_t n[3], uint8_t 
     (void)ctx; const size_t nv = (size_t)n[0] * n[1] * n[2];
     memset(w, 255, nv); if (pc) memset(pc, 255, nv); if (ps) memset(ps, 128, nv);
     (void)o; return 0;
+}
+/* the network phase of the true sheets: m = e^{2 pi i T} at the cell centres (confidence 1) */
+static int rd_phase(void *ctx, const int64_t o[3], const int64_t n[3], uint8_t *w, uint8_t *pc, uint8_t *ps) {
+    (void)ctx;
+    for (int64_t a = 0; a < n[0]; a++) for (int64_t b = 0; b < n[1]; b++) for (int64_t c = 0; c < n[2]; c++) {
+        const size_t i = ((size_t)a * n[1] + b) * n[2] + c; const double T = T_true((o[0] + a + 0.5) * HF, (o[1] + b + 0.5) * HF, (o[2] + c + 0.5) * HF);
+        w[i] = 255; if (pc) pc[i] = (uint8_t)lround(128 + 127 * cos(2 * M_PI * T)); if (ps) ps[i] = (uint8_t)lround(128 + 127 * sin(2 * M_PI * T));
+    }
+    return 0;
 }
 static void build(st_box *b, const int *s, const int *c) {
     for (int i = 0; i < 8; i++) {
@@ -80,6 +91,16 @@ int main(void) {
         CHECK(b[i].s * s[i] == sig, "box %d: solved sign %d, true %d (global sign %d)", i, b[i].s, s[i], sig);
         CHECK(fabs(b[i].g - sig * c[i] - k0) < 1e-9, "box %d: gauge %g inconsistent (%g vs %g)", i, b[i].g, b[i].g - sig * c[i], k0);
     }
+    /* quality maps: a box whose W grows with the network phase is coherent with it, a reversed box with the reversed phase */
+    { const st_fields Fp = {HF, {0, 0, 0}, rd_phase, nullptr};
+      for (int i = 0; i < 8; i++) {
+          CHECK(!st_quality(&b[i], &Fp, 32, 1, 2), "st_quality box %d", i);
+          const double want = s[i] > 0 ? b[i].qmean : b[i].qamean, other = s[i] > 0 ? b[i].qamean : b[i].qmean;
+          CHECK(want > 0.95 && other < 0.3, "box %d (sign %d): coherence %.3f, reversed %.3f", i, s[i], b[i].qmean, b[i].qamean);
+          const double pq[3] = {b[i].lo[0] + 40, b[i].lo[1] + 50, b[i].lo[2] + 60}, qv = st_box_q(&b[i], pq);
+          CHECK(fabs(qv - (s[i] > 0 ? 1 : 0)) < 0.2, "box %d: q %.3f at a point", i, qv);
+          free(b[i].q); free(b[i].qa); b[i].q = b[i].qa = nullptr;
+      } }
     int ntree = 0; for (int i = 0; i < ne; i++) ntree += e[i].tree;
     CHECK(ntree == 7, "%d tree edges (want 7)", ntree);
     /* the tapers: interior faces ramp over the overlap, outer faces are hard */
@@ -128,7 +149,7 @@ int main(void) {
     }
     /* a level set across the boxes */
     const double kk = floor(sig * T_true(80, 80, 80) + k0);
-    st_trace_cfg tc = {1.0, 400, 10, nullptr, {0, 0, 0}, {0, 0, 0}, 1};
+    st_trace_cfg tc = {.tstep = 1.0, .max_cols = 400, .max_gap = 10, .bridge_max = 30, .fault_ratio = 3, .mask = nullptr, .mh = 1};
     st_sgauge gg = st_sgauge_new(8); st_sgauge_global(&gg, b, 0, kk);
     double seed[3]; CHECK(!st_seed(b, 0, 0.5, &gg, &tc, seed), "no seed of k %g in box 0", kk);
     st_sheet sh; CHECK(!st_trace(b, 8, 0, &tc, &gg, 0, seed, &sh), "trace failed");
@@ -191,6 +212,32 @@ int main(void) {
     }
     fprintf(stderr, "slip: gauge mode %lld seam spread/conflict vertices (%d sheets through box 7), follow mode %lld (%d sheets)\n", cg, ngau, cf, nfol);
     CHECK(nfol >= 3 && cf == 0 && cg > 0, "slip: follow %d sheets %lld bad seam vertices, gauge %lld", nfol, cf, cg);
+    st_sgauge_free(&gg);
+    for (int i = 0; i < 8; i++) st_box_free(&b[i]);
+    /* a fault in box 0 (3 turns crammed into 6 voxels across the sheets): follow mode bridges it and stays on the sheet beyond it */
+    g_slip = -1; g_fault = 0; build(b, s, c);
+    { const int nf = align_all(b, e3); st_solve(b, 8, e3, nf, 0.3, 1, nullptr); }
+    for (int i = 0; i < 8; i++) b[i].comp = 0;
+    st_tapers(b, 8, 0);
+    gg = st_sgauge_new(8); int nfs = 0; long long nbeyond_all = 0;
+    for (int dk = 0; dk < 2; dk++) {   /* the two sheets that cross the fault inside box 0 */
+        const double tk = floor(T_true(48, 48, 48)) - 2 + dk;
+        const double p0[3] = {48, 48, 48}; const double lv = round(st_box_W(&b[0], p0) - s[0] * (T_true(48, 48, 48) - tk));
+        st_sgauge_seed(&gg, 0, lv);
+        int sd = 1; for (int q = 0; q < 3 && sd; q++) sd = st_seed(b, 0, (const double[]){0.5, 0.25, 0.75}[q], &gg, &tc, seed);   /* calm seeds only */
+        if (sd || st_trace(b, 8, -1, &tc, &gg, 1, seed, &sh)) continue;
+        double te = 0; long long nbeyond = 0, nv2 = 0, nunsure = 0;
+        for (size_t v = 0; v < (size_t)sh.rows * sh.cols; v++) {
+            if (sh.z[v] < 0 || sh.seam[v] == 5) continue;
+            if (sh.seam[v] >= 3) { nunsure++; continue; }   /* flagged: the boxes disagree there */
+            nv2++; te = fmax(te, fabs(T_true(sh.z[v], sh.y[v], sh.x[v]) - tk)); if (sh.x[v] < 18 && sh.y[v] < 60 && sh.z[v] < 60) nbeyond++;
+        }
+        fprintf(stderr, "fault: sheet T %g: %lld vertices, %lld beyond the fault, %lld bridges (%lld bridge vertices), %lld re-gauges, max |T - k| %.4f\n", tk, nv2, nbeyond,
+                sh.bridges, sh.nbridge, sh.regauges, te);
+        CHECK(te < 0.25 && sh.bridges > 0 && nunsure < nv2 / 20, "fault: sheet T %g error %.3f, %lld bridges, %lld flagged", tk, te, sh.bridges, nunsure);
+        nfs++; nbeyond_all += nbeyond; st_sheet_free(&sh);
+    }
+    CHECK(nfs == 2 && nbeyond_all > 300, "fault: %d sheets traced, %lld vertices beyond the fault", nfs, nbeyond_all);
     st_sgauge_free(&gg);
     for (int i = 0; i < 8; i++) st_box_free(&b[i]);
     char rm[300]; snprintf(rm, sizeof rm, "rm -rf '%s'", dir); if (system(rm)) fprintf(stderr, "cannot remove %s\n", dir);

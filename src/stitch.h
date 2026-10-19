@@ -26,6 +26,10 @@ typedef struct {
     int s; double g;                /* gauge: G = s W + g (g an integer) */
     int comp;                       /* component of the box graph (-1: unset) */
     double wmin, wmax;              /* W range over the box (9^3 samples) */
+    double gnom;                    /* median |grad W| in z planes over those samples (turns per native voxel: 1 / sheet spacing) */
+    int qn[3]; double qb;           /* local fit quality map (st_quality): blocks of qb native voxels from lo */
+    float *q, *qa;                  /* per block: phase coherence of the fit with the network (|mean m e^{-2 pi i W}|), and with W reversed */
+    double qmean, qamean;           /* their material-weighted means over the box */
 } st_box;
 
 typedef struct {
@@ -55,6 +59,11 @@ void st_box_free(st_box *b);
 double st_box_W(const st_box *b, const double p[3]);      /* the box model's W at a global native point */
 void st_box_range(st_box *b);                              /* wmin / wmax */
 double st_box_phi(const st_box *b, const double p[3]);    /* blending weight (0 outside the box) */
+/* the box's local fit quality at p (trilinear over its block map; 1 without one): the blends weight each box by phi max(q, 0.05)^2 */
+double st_box_q(const st_box *b, const double p[3]);
+/* the quality map of box b: per block of qb native voxels the phase coherence |sum w m e^{-2 pi i W}| / sum w |m| of the box's W
+   with the network phase vector m (w the material) on a stride of field cells; 1 = the fit's sheets sit on the network's phase */
+int st_quality(st_box *b, const st_fields *F, double qb, int stride, int nthreads);
 /* ramp widths from the face overlaps among the boxes with comp >= 0 (by_comp: only between boxes of the same component) */
 void st_tapers(st_box *b, int nb, int by_comp);
 /* G at p over the boxes of component comp (comp < 0: all): returns the number of boxes with weight > 0 (0: not covered) */
@@ -85,20 +94,30 @@ typedef struct {
     double tstep;                   /* trace step (native voxels): rows every tstep in z, columns every ~tstep along the contour */
     int max_cols;                   /* per side of the anchor */
     int max_gap;                    /* trace steps through unmasked (no material) cells before a row side stops */
+    double bridge_max;              /* follow mode: fault zones (|grad F| > fault_ratio x the boxes' gnom: a fit cramming turns) are
+                                       crossed in a straight line up to this length (native voxels); 0: a row side stops at a fault */
+    double fault_ratio;
+    double min_seed_q;              /* st_seed: with quality maps, the seed box's quality at the seed at least this */
     const uint8_t *mask; int64_t mn[3]; double mo[3], mh;   /* optional material mask: cells of mh native from mo, mn cells */
 } st_trace_cfg;
+typedef struct { int box, level; long long n; } st_boxlevel;
 typedef struct {
     int rows, cols;                 /* trace grid; vertex (r, c) at z0 + r tstep */
     double z0;
     float *x, *y, *z;               /* rows x cols, -1 where invalid (global native) */
-    uint8_t *seam;                  /* per vertex: 0 invalid, 1 one box, 2 seam (joined boxes within 1/4 turn), 3 spread 1/4..1/2, 4 conflict (> 1/2) */
-    long long nvalid, nseam, nspread, nconflict, nunjoined;   /* nunjoined: vertices inside a box (weight >= 1/2) that never joined */
+    uint8_t *seam;                  /* per vertex: 0 invalid, 1 one box, 2 seam (joined boxes within 1/4 turn), 3 spread 1/4..1/2, 4 conflict (> 1/2),
+                                       5 fault bridge, 6 the strongest box's quality < 0.2 */
+    long long nvalid, nseam, nspread, nconflict, nunjoined;   /* nunjoined: vertices inside a box (weight >= 1/2) that is not on there */
+    long long nbridge, bridges, regauges;   /* bridge vertices, fault bridges, box re-gauges (follow mode) */
+    long long nlowq;                /* vertices of class 6 */
+    st_boxlevel *lev; int nlev;     /* the (box, level) of the strongest box at each vertex, with vertex counts (sorted) */
     double spread_sum; float *spreads; long long nspreads;   /* seam vertices: level-set spread in native voxels (sorted) */
     long long *own;                 /* per box: vertices where it has the largest weight among the joined boxes */
     int nboxes;                     /* boxes owning vertices */
 } st_sheet;
-/* traces the sheet F = 0 of the levels g from the seed (global native; projected onto the contour in its z plane first); follow:
-   boxes join on contact (g is updated); boxes outside comp (comp >= 0) never join. 0 on success */
+/* traces the sheet F = 0 of the levels g from the seed (global native; projected onto the contour in its z plane first). The gauge
+   is carried per vertex; follow: boxes join on contact, are re-gauged against the strongest box, faults are bridged; boxes outside
+   comp (comp >= 0) never join. On return g is the seed gauge plus every box that joined. 0 on success */
 int st_trace(const st_box *b, int nb, int comp, const st_trace_cfg *c, st_sgauge *g, int follow, const double seed[3], st_sheet *s);
 void st_sheet_free(st_sheet *s);
 /* a seed of F = 0 in box i: along the line through the box centre (at z = lo + zf (hi - lo)) towards its axis, the crossing
