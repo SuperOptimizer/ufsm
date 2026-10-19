@@ -49,6 +49,7 @@ typedef struct {
                                 needs geometry_augment, same sources as the zoom */
     const sheet_dataset *sheet; /* borrowed sparse geometry, native-level B=1 task */
     int band;                /* 1: fill batch.band from each source's band target (task band_affinity, native level, no geometry warp) */
+    double min_phase;        /* side 2: reject windows whose known phase covers less than this fraction of the voxels (0: keep all) */
     float phase_near_um;     /* > 0 (stored phase, side 2): the phase target only within this distance (um) of a labelled wrap voxel
                                 (target channel 0): the stored phase interpolates between published wraps, and across a missing wrap
                                 the interpolated phase is off by up to half a turn */

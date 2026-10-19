@@ -1641,6 +1641,14 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (o[d] < 0) o[d] = 0;
         }
     }
+    {   /* debugging / tests: UFSM_SAMPLE_AT="z,y,x[;z,y,x...]" (this level's voxels, cycled): replay given windows of the drawn source */
+        static const char *at; static _Atomic unsigned nat; static int nc = -1; static int64_t ac[16][3];
+        if (nc < 0) { at = getenv("UFSM_SAMPLE_AT"); int k = 0; for (const char *q = at; q && *q && k < 16; k++) {
+                          long long a, b2, c2; if (sscanf(q, "%lld,%lld,%lld", &a, &b2, &c2) != 3) break; ac[k][0] = a; ac[k][1] = b2; ac[k][2] = c2;
+                          q = strchr(q, ';'); if (q) q++; } nc = k; }
+        if (nc > 0) { const unsigned k = atomic_fetch_add(&nat, 1) % (unsigned)nc;
+                      for (int d = 0; d < 3; d++) { o[d] = ac[k][d]; if (o[d] > m->shape[d] - n[d]) o[d] = m->shape[d] - n[d]; if (o[d] < 0) o[d] = 0; } }
+    }
     if (!c->holdout && training_hits_holdout(sp, s, o, l)) { atomic_fetch_add(&sp->rej_why[3], 1); return 1; }
     PROF_MARK(PS_PICK);
     /* cheap occupancy test on a coarse level before fetching the fine cube */
@@ -2092,6 +2100,12 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         tp_put(aw, p3); tp_put(as, p3);
     }
     tp_put(near, p3);
+    if (c->side == 2 && c->min_phase > 0) {   /* --min-phase: windows with (almost) no known phase supervise nothing (sources with band / phase
+                                                 targets only draw anywhere in the scroll): rejected */
+        const uint8_t *sd = b->side + (size_t)i * p3; size_t kn = 0;
+        for (size_t k = 0; k < p3; k++) kn += sd[k] < PHASE_PERIOD;
+        if ((double)kn < c->min_phase * (double)p3) { if (Tw) tp_put(Tw, (NCH + 1) * p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); return 1; }   /* (counted as empty targets) */
+    }
     if (c->cond) {   /* inputs 4-6 and batch.wind from the source's winding raster (on the stored phase's grid; air unknown like the phase) */
         uint8_t *ww = tp_get(p3, 0), *ws = tp_get(p3, 0);
         if (!ww || !ws) { tp_put(ww, p3); tp_put(ws, p3); return -1; }

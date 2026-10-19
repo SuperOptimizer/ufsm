@@ -559,10 +559,10 @@ static void head_slab_cb(void *ctx) { head_slab_pass((gpu_state *)ctx, 1); }
 static void test_nan_inject(gpu_state *d, int step, int where, int P) {
     static int mode = -1; static char steps[256];
     if (mode < 0) {
-        const char *e = getenv("UFSM_TEST_NAN"), *names[5] = {"logit:", "grad:", "input:", "big:", "zero:"}; mode = 0;
-        for (int k = 0; e && k < 5; k++) if (!strncmp(e, names[k], strlen(names[k]))) { mode = k + 1; snprintf(steps, sizeof steps, ",%s,", e + strlen(names[k])); }
+        const char *e = getenv("UFSM_TEST_NAN"), *names[7] = {"logit:", "grad:", "input:", "big:", "zero:", "zerologit:", "weight:"}; mode = 0;
+        for (int k = 0; e && k < 7; k++) if (!strncmp(e, names[k], strlen(names[k]))) { mode = k + 1; snprintf(steps, sizeof steps, ",%s,", e + strlen(names[k])); }
     }
-    static const int at[6] = {-1, 1, 2, 0, 0, 2};
+    static const int at[8] = {-1, 1, 2, 0, 0, 2, 1, 0};
     if (!mode || d->dev != 0 || at[mode] != where) return;
     char k[24]; snprintf(k, sizeof k, ",%d,", step);
     if (!strstr(steps, k)) return;
@@ -573,6 +573,8 @@ static void test_nan_inject(gpu_state *d, int step, int where, int P) {
         else { float *h = malloc(4 * n); for (size_t i = 0; i < n; i++) h[i] = INFINITY; nn_h2d(d->gl, h, 4 * n); free(h); }
     } else if (mode == 2) { const float nan = NAN; nn_h2d(unet_grad_ptr(d->u), &nan, 4); }
     else if (mode == 5) nn_zero(unet_grad_ptr(d->u), unet_nparams(d->u) * 4);
+    else if (mode == 6) { if (!d->gl) return; nn_zero(d->gl, (size_t)g_cout * g_Pz * P * P * (g_g16 ? 2 : 4)); }
+    else if (mode == 7) { const float nan = NAN; const size_t at_ = getenv("UFSM_TEST_NAN_N") ? (size_t)atoll(getenv("UFSM_TEST_NAN_N")) : unet_nparams(d->u) / 2; nn_h2d((float *)unet_live_params(d->u) + at_, &nan, 4); }
     else {
         const size_t n = mode == 3 && !getenv("UFSM_TEST_NAN_N") ? 1 : mode == 3 ? (size_t)atoll(getenv("UFSM_TEST_NAN_N")) : (size_t)g_Pz * P * P / 8 + 1, eb = xbytes();
         uint8_t *h = malloc(n * eb);
@@ -582,7 +584,7 @@ static void test_nan_inject(gpu_state *d, int step, int where, int P) {
         }
         nn_h2d(d->x, h, n * eb); free(h);
     }
-    static const char *what[6] = {"", "+inf logit gradient", "NaN parameter gradient", "NaN input voxel", "input CT at 60000", "all-zero parameter gradient"};
+    static const char *what[8] = {"", "+inf logit gradient", "NaN parameter gradient", "NaN input voxel", "input CT at 60000", "all-zero parameter gradient", "all-zero logit gradient (nothing supervised)", "NaN weight (UFSM_TEST_NAN_N: its index)"};
     fprintf(stderr, "test: step %d: %s injected\n", step, what[mode]);
 }
 /* the window of the last training step on this GPU (source, level, level-0 corner): which window of a deterministic stream misbehaved */
@@ -1206,6 +1208,8 @@ int cmd_train(int argc, char **argv) {
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
     sc.wind4 = g_unwrap2; sc.wind4_step = atoi(opt(argc, argv, "--wind4-step", "80")); sc.wind4_min = atoi(opt(argc, argv, "--wind4-min", "512"));   /* unwrap2: band_wind4's join limit (phase codes) and smallest component */
     { const int t = atoi(opt(argc, argv, "--wind4-tile", "64")); sc.wind4_tile = t > 0 ? t : -1; }   /* unwrap2: one gauge per tile of T voxels (>= P / 6), 0 = per window */
+    sc.min_phase = atof(opt(argc, argv, "--min-phase", g_unwrap2 ? "0.001" : "0"));   /* side 2: windows with less known phase than this fraction are redrawn (unwrap2: 0.1%: band / phase-only sources draw anywhere) */
+    if (!(sc.min_phase >= 0 && sc.min_phase < 1) || (sc.min_phase > 0 && g_side != 2)) { fprintf(stderr, "--min-phase: 0 .. 1, with the phase head (task unwrap / unwrap2)\n"); return 2; }
     if (g_unwrap2 && (sc.wind4_step < 1 || sc.wind4_step > 125 || sc.wind4_min < 1)) { fprintf(stderr, "--wind4-step 1..125 (phase codes, 252 per turn), --wind4-min >= 1\n"); return 2; }
     sc.papyrus = g_papyrus ? &g_pap : nullptr;
     sc.shell = atoi(opt(argc, argv, "--shell", "0"));   /* background within R level-0 voxels of a label ignored */
