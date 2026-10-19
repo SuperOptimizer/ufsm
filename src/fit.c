@@ -245,7 +245,9 @@ static void fit_zpar(int D, int nt, fit_zfn fn, void *ctx) {
    pops ahead is known and its record and z / y neighbours are prefetched (none: 57 s; 8 / 32 ahead: 36 / 33 s). The result is
    the original's (same voxels, same integers). Tiled floods stitched by votes were 30x faster but got 14-16% of the winding ids
    against 19.6% (each tile commits its own low-confidence bridges). The voxel loops run on threads. Returns the number of voxels
-   reached. */
+   reached. The integers do not depend on the seed (up to the gauge): the quality-ordered flood is Prim's maximum spanning tree of
+   the voxel-quality graph, whatever its root (2026-10-19: 5 floods from seeds spread over a Paris 4 crop differed on 0 voxels), so
+   consensus over seeds gains nothing; only the quality order (uw_q) shapes where the flood crosses dislocations. */
 enum { UQ_LEVELS = 4096 };
 #define UQ_NONE UINT32_MAX
 #define UK_UNSET INT16_MIN
@@ -603,51 +605,6 @@ static size_t uw_two_level(uw_ctx *x, double split, int T, size_t nr, int verbos
     return reached;
 }
 
-/* consensus unwrapping (fit_cfg uw_seeds K > 1): a flood's integers depend on its path where the phase has dislocations (it commits
-   whichever side reaches a patch first); K - 1 more floods from the most confident voxels of a grid of y-x blocks, each aligned to
-   the first by the mode of their integer difference, and per voxel the majority integer (ties: the first flood's) */
-static void uw_consensus(uw_ctx *x, uw_queue *q, size_t nr, int K, int verbose) {
-    const fit_fields *f = x->f; const uw_geo *g = &x->g; uw_vox *V = x->V; const int na = (int)(f->D * f->h) + 1;
-    int16_t *ks = malloc(nr * (size_t)K * sizeof(int16_t)); if (!ks) { fprintf(stderr, "fit: no memory for the consensus unwrapping\n"); return; }
-    for (size_t r = 0; r < nr; r++) ks[r] = V[r].k;
-    const int ga = (int)ceil(sqrt(K - 1.0)), gb = (K - 1 + ga - 1) / ga;
-    for (int s = 1; s < K; s++) {
-        const int by = (s - 1) / gb, bx = (s - 1) % gb, y0 = f->H * by / ga, y1 = f->H * (by + 1) / ga, x0 = f->W * bx / gb, x1 = f->W * (bx + 1) / gb;
-        uint32_t sid = UQ_NONE; int bk = 0, sz = 0, sy = 0, sx = 0;   /* the most confident voxel of the block (bucket level) */
-        for (int z = 0; z < f->D; z += 2) for (int y = y0; y < y1; y += 2) for (int xx = x0; xx < x1; xx += 2) {
-            const uint32_t id = ub_id(g, z, y, xx); if (V[id].bk > bk) { bk = V[id].bk; sid = id; sz = z; sy = y; sx = xx; }
-        }
-        for (size_t r = 0; r < nr; r++) V[r].k = UK_UNSET;
-        if (sid == UQ_NONE) { for (size_t r = 0; r < nr; r++) ks[(size_t)s * nr + r] = UK_UNSET; continue; }
-        const double pz = (sz + 0.5) * f->h, py = (sy + 0.5) * f->h, px = (sx + 0.5) * f->h;
-        const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
-        const double Um = fit_W(x->m, pz, py, px) + x->m->dir * th / (2 * M_PI);
-        V[sid].k = (int16_t)((int32_t)round(Um - V[sid].uw) - x->kb); uq_push(q, sid, V[sid].bk);
-        uw_flood(x, q, &(uw_box){0, f->D, 0, f->H, 0, f->W, 1, nullptr, 0});
-        int hist[33] = {0};
-        for (size_t r = 0; r < nr; r++) {
-            ks[(size_t)s * nr + r] = V[r].k;
-            if (V[r].k != UK_UNSET && ks[r] != UK_UNSET) { const int d = V[r].k - ks[r]; if (d >= -16 && d <= 16) hist[d + 16]++; }
-        }
-        int mo = 16; for (int d = 0; d < 33; d++) if (hist[d] > hist[mo]) mo = d;
-        for (size_t r = 0; r < nr; r++) if (ks[(size_t)s * nr + r] != UK_UNSET) ks[(size_t)s * nr + r] -= (int16_t)(mo - 16);
-    }
-    size_t changed = 0, split = 0, set = 0;
-    for (size_t r = 0; r < nr; r++) {
-        if (ks[r] == UK_UNSET) { V[r].k = UK_UNSET; continue; }
-        int best = ks[r], bc = 0, all = 1; set++;
-        for (int a = 0; a < K; a++) {
-            const int v = ks[(size_t)a * nr + r]; if (v == UK_UNSET) continue;
-            if (v != ks[r]) all = 0;
-            int cnt = 0; for (int b = 0; b < K; b++) cnt += ks[(size_t)b * nr + r] == v;
-            if (cnt > bc) { bc = cnt; best = v; }
-        }
-        V[r].k = (int16_t)best; changed += best != ks[r]; split += !all;
-    }
-    if (verbose) fprintf(stderr, "fit: consensus unwrapping over %d floods: %.4f of the voxels disagree somewhere, %.4f changed from the first flood\n",
-                         K, set ? (double)split / set : 0, set ? (double)changed / set : 0);
-    free(ks);
-}
 static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_conf, const fit_cfg *c) {
     const size_t n = (size_t)f->D * f->H * f->W; const int na = (int)(f->D * f->h) + 1;
     const uw_geo g = {f->D, f->H, f->W, (f->H + UB_M) / UB_S, (f->W + UB_M) / UB_S};
@@ -689,7 +646,6 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
                 V[sid].k = (int16_t)((int32_t)round(Um - V[sid].uw) - x.kb); reached = 1; uq_push(&q, sid, V[sid].bk);
             }
             reached += uw_flood(&x, &q, &(uw_box){0, f->D, 0, f->H, 0, f->W, 1, nullptr, 0});
-            if (c->uw_seeds > 1 && !c->seed && reached) uw_consensus(&x, &q, nr, c->uw_seeds, c->verbose);
         }
     }
     uq_free(&q);
