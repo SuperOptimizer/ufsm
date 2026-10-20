@@ -23,7 +23,7 @@ NVFLAGS ?= -O3 -arch=sm_120 -use_fast_math -Xcompiler -fno-threadsafe-statics -I
 CUDALIBS = -L$(CUDA)/lib64 -lcudart
 
 SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c
-SRC += src/surf.c src/stitch.c src/coreline.c
+SRC += src/surf.c src/stitch.c src/coreline.c src/fit_ct.c
 SRC += src/fblend.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
@@ -137,27 +137,27 @@ $(B)/test_half: tests/test_half.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_unwrap_targets: tests/test_unwrap_targets.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-$(B)/test_fit: tests/test_fit.c $(B)/fit.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_fit: tests/test_fit.c $(B)/fit.o $(B)/fit_ct.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
-$(B)/test_surf: tests/test_surf.c $(B)/surf.o $(B)/fit.o $(B)/coreline.o $(B)/tiffw.o $(B)/tiff.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_surf: tests/test_surf.c $(B)/surf.o $(B)/fit.o $(B)/fit_ct.o $(B)/coreline.o $(B)/tiffw.o $(B)/tiff.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
-$(B)/test_predict_unwrap2: tests/test_predict_unwrap2.c $(B)/unet.o $(B)/fit.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
+$(B)/test_predict_unwrap2: tests/test_predict_unwrap2.c $(B)/unet.o $(B)/fit.o $(B)/fit_ct.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_predict_unwrap2
 $(B)/test_tta: tests/test_tta.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_tta
-$(B)/test_fblend: tests/test_fblend.c $(B)/fblend.o $(B)/fit.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_fblend: tests/test_fblend.c $(B)/fblend.o $(B)/fit.o $(B)/fit_ct.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_fblend
-$(B)/test_stitch: tests/test_stitch.c $(B)/stitch.o $(B)/fit.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/tiffw.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_stitch: tests/test_stitch.c $(B)/stitch.o $(B)/fit.o $(B)/fit_ct.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/tiffw.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 
 test-all: $(B)/test_stitch
-$(B)/test_coreline: tests/test_coreline.c $(B)/coreline.o $(B)/fit.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_coreline: tests/test_coreline.c $(B)/coreline.o $(B)/fit.o $(B)/fit_ct.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_coreline
-$(B)/test_fit_w4: tests/test_fit_w4.c $(B)/fit.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_fit_w4: tests/test_fit_w4.c $(B)/fit.o $(B)/fit_ct.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_fit_w4
 

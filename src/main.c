@@ -79,6 +79,7 @@ static int usage(void) {
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40]   vertices onto the fields' sheet phase\n"
         "  ufsm surf-stats <wraps-dir> --fields DIR [--ct ROOT KEY --ct-um U]   label-free surface quality (phase, switches, CT)\n"
+        "  ufsm ct-fields <ct-root> <key> <fields-dir> --ct-um U   CT planes ct / cs of a fit-field directory (fit --w-ct / --w-cspacing)\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..]  several models' fit fields averaged (phase: confidence-weighted complex mean)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
@@ -554,7 +555,11 @@ static int cmd_band(int argc, char **argv) {
    smoothness; --w-pgrad W [--pgrad-delta D]: phase-gradient matching (src/fit_terms.h); --unwrap-voxels 1 / 0 / -1: the phase
    stage's integer init by voxels / lattice nodes / none (fit_cfg). --wind4-weight W (default 4): the winding mod 4 term when the fields
    carry dz dy dx dq planes (task unwrap2; 0 off). --w-recto W (default 0): recto anchors r^2 (1 - cos 2 pi W) from the fields' r plane
-   (predict --fit-fields / --fit-zarr write it). --out also writes MODEL/fit-config.json (the weights and options of the fit). */
+   (predict --fit-fields / --fit-zarr write it). --out also writes MODEL/fit-config.json (the weights and options of the fit).
+   CT (fields with ct / cs planes, ufsm ct-fields / predict --fit-ct): --w-ct W papyrus / void parity c m (1 - cos 2 pi (W - --ct-phi)) weighted
+   (1 - phase confidence)^--ct-pow (>= --ct-floor), the parity m the cell's CT contrast to its +---ct-radius-um neighbourhood; with it
+   --ct-flood 1 (default) lets low-confidence voxels join the voxel unwrapping with the CT's own phase. --w-cspacing W: the density term
+   against the CT sheet spacing where the network's is unknown or differs by more than --cs-tol in log. */
 /* U (the unwrapped radius in turns; sheets where U - dir theta / 2 pi is an integer) for the scorer: fill(ctx, og, n3, step, codes, U)
    writes U at og + i step (native voxels relative to the box origin) over the n3 grid, NaN where unknown (it may skip the points
    whose code is not 1..252); returns nonzero on failure */
@@ -651,6 +656,12 @@ static int cmd_fit(int argc, char **argv) {
     c.w_wind4 = (float)atof(opt(argc, argv, "--wind4-weight", "4"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off) */
     c.w_recto = (float)atof(opt(argc, argv, "--w-recto", "0"));        /* recto anchors (fields with an r plane; 0 off) */
     if (!(c.w_wind4 >= 0) || !(c.w_recto >= 0)) { fprintf(stderr, "fit: --wind4-weight and --w-recto must be >= 0\n"); return 2; }
+    /* CT in the fitter (fields with ct / cs planes: ufsm ct-fields, predict --fit-ct): papyrus / void parity and the CT sheet spacing */
+    c.w_ct = (float)atof(opt(argc, argv, "--w-ct", "0")); c.ct_pow = (float)atof(opt(argc, argv, "--ct-pow", "1")); c.ct_phi = (float)atof(opt(argc, argv, "--ct-phi", "0"));
+    c.ct_floor = (float)atof(opt(argc, argv, "--ct-floor", "0")); c.ct_radius_um = atof(opt(argc, argv, "--ct-radius-um", "150")); c.ct_flood = atoi(opt(argc, argv, "--ct-flood", "0"));
+    c.w_cspacing = (float)atof(opt(argc, argv, "--w-cspacing", "0")); c.cs_tol = (float)atof(opt(argc, argv, "--cs-tol", "0.25"));
+    fit_fields_ct_planes((c.w_ct > 0 ? 1 : 0) | (c.w_cspacing > 0 ? 2 : 0));   /* load only the CT planes the terms read */
+    if (!(c.w_ct >= 0) || !(c.ct_pow >= 0) || !(c.ct_floor >= 0) || !(c.ct_radius_um > 0) || !(c.w_cspacing >= 0) || !(c.cs_tol > 0)) { fprintf(stderr, "fit: --w-ct, --ct-pow, --ct-floor, --w-cspacing >= 0, --ct-radius-um and --cs-tol > 0\n"); return 2; }
     if (!(c.w_pgrad >= 0) || !(c.pgrad_delta > 0) || c.unwrap_voxels < -1 || c.unwrap_voxels > 1 || !(c.phase_robust >= 0) || !(c.conf_pow > 0) || !(c.bend >= 0) || !(c.w_phase >= 0) || !(c.w_normal >= 0) || !(c.w_density >= 0) || !(c.w_smooth >= 0)) {
         fprintf(stderr, "fit: --phase-robust, --bend and the weights must be >= 0, --conf-pow and --pgrad-delta > 0, --unwrap-voxels -1, 0 or 1\n"); return 2;
     }
@@ -713,8 +724,10 @@ static int cmd_fit(int argc, char **argv) {
         char cp[1400]; snprintf(cp, sizeof cp, "%s/fit-config.json", mout); FILE *cf = fopen(cp, "w");
         if (!cf) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
         fprintf(cf, "{\"version\":1,\"w_phase\":%.9g,\"w_normal\":%.9g,\"w_density\":%.9g,\"w_smooth\":%.9g,\"w_pgrad\":%.9g,\"pgrad_delta\":%.9g,\"w_wind4\":%.9g,\"w_recto\":%.9g,"
+                    "\"w_ct\":%.9g,\"ct_pow\":%.9g,\"ct_phi\":%.9g,\"ct_floor\":%.9g,\"ct_radius_um\":%.9g,\"ct_flood\":%d,\"w_cspacing\":%.9g,\"cs_tol\":%.9g,"
                     "\"phase_robust_turns\":%.9g,\"conf_pow\":%.9g,\"bend\":%.9g,\"unwrap_voxels\":%d,\"uw_min_conf\":%.9g,\"phase_stage\":%d,\"slab\":%d,\"cpu\":%d,\"native_um\":%.9g,\"lattice\":[",
-                c.w_phase, c.w_normal, c.w_density, c.w_smooth, c.w_pgrad, c.pgrad_delta, c.w_wind4, c.w_recto, c.phase_robust, c.conf_pow, c.bend, c.unwrap_voxels, c.uw_min_conf,
+                c.w_phase, c.w_normal, c.w_density, c.w_smooth, c.w_pgrad, c.pgrad_delta, c.w_wind4, c.w_recto,
+                c.w_ct, c.ct_pow, c.ct_phi, c.ct_floor, c.ct_radius_um, c.ct_flood, c.w_cspacing, c.cs_tol, c.phase_robust, c.conf_pow, c.bend, c.unwrap_voxels, c.uw_min_conf,
                 c.phase_stage, slab, c.cpu, c.um);
         for (int k = 0; k < c.nstage; k++) fprintf(cf, "%s%d", k ? "," : "", c.lattice[k]);
         fprintf(cf, "]}\n"); if (fclose(cf)) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
@@ -2429,6 +2442,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "surf-snap")) return cmd_surfsnap(argc, argv);
     if (!strcmp(cmd, "refine")) return cmd_refine(argc, argv);
     if (!strcmp(cmd, "surf-stats")) return cmd_surf_stats(argc, argv);
+    if (!strcmp(cmd, "ct-fields")) return cmd_ct_fields(argc, argv);
     if (!strcmp(cmd, "fit-compare")) return cmd_fit_compare(argc, argv);
     if (!strcmp(cmd, "field-blend")) return cmd_field_blend(argc, argv);
     if (!strcmp(cmd, "gap-compare")) return cmd_gap_compare(argc, argv);

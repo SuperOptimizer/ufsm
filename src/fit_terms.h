@@ -7,6 +7,13 @@
    normal: 1 - g^T T g / (|g|^2 tr T); density: (log |g| - log rho)^2; non-degeneracy: max(0, 0.4 rho - |g|)^2 (g = grad W)
    recto anchors (fields with an r plane, w_recto > 0): w_recto x weight x r^2 (1 - cos 2 pi W): a confident recto probability puts an
           integer level set there, independently of the phase head
+   CT parity (fields with a ct plane, w_ct > 0): c m (1 - cos 2 pi (W - phi_pap)), m in [-1, 1] the cell's papyrus / void parity
+          (fit_ct_parity: local CT contrast), c = w_ct x weight x max(ct_floor, 1 - min(conf, 1))^ct_pow: papyrus cells pull frac W to the
+          papyrus phase, void cells to its opposite, most where the network phase is weak (it holds the sheets on the CT where the phase
+          head cannot)
+   CT spacing (fields with a cs plane, w_cs > 0): w_cs x weight x a x (log |g| - log rho_cs)^2 with rho_cs from the CT's own sheet
+          spacing, a = 1 where sp is unknown, else ramping from 0 at |log(sp / cs)| = cs_tol to 1 at 2 cs_tol (the network density is
+          kept where the two agree)
    winding mod 4 (task unwrap2 fields, nn_fit_loss2 only): per axis a, w_w4 x weight x dq (1 - cos(pi / 2 (W(x + d e_a) - W(x) - delta_a))),
           delta_a the network's W difference over d native voxels mod 4 (dz dy dx planes): counts turns where the phase cannot
    Loss parts: the FIT_P_* slots of src/fit.h (lp[FIT_P_TOTAL] the sum of the data terms; the smoothness slot unused per voxel). */
@@ -43,6 +50,28 @@ FIT_HD void fit_recto_term(const fit_dev *f, size_t i, float W, float weight, do
     const float tp = 6.283185307179586f, r = f->recto[i] * (1.f / 255.f), c = f->w_recto * weight * r * r;
     float sa, ca; sincosf(tp * W, &sa, &ca);
     *l += c * (1.f - ca); *dW += c * tp * sa;
+}
+/* the CT papyrus / void parity of voxel i at winding W */
+FIT_HD void fit_ct_term(const fit_dev *f, size_t i, float W, float weight, double *l, float *dW) {
+    if (!f->ctm || !(f->w_ct > 0.f) || f->ctm[i] == 128) return;
+    const float tp = 6.283185307179586f, m = ((int)f->ctm[i] - 128) * (1.f / 127.f);
+    const float mc = ((int)f->pc[i] - 128) * (1.f / 127.f), ms = ((int)f->ps[i] - 128) * (1.f / 127.f), conf = sqrtf(mc * mc + ms * ms);
+    float u = 1.f - fminf(conf, 1.f); u = f->ct_pow == 1.f ? u : f->ct_pow <= 0.f ? 1.f : powf(u, f->ct_pow); u = fmaxf(u, f->ct_floor);
+    const float c = f->w_ct * weight * u * m;
+    float sa, ca; sincosf(tp * (W - f->ct_phi), &sa, &ca);
+    *l += c * (1.f - ca); *dW += c * tp * sa;
+}
+/* the density term against the CT sheet spacing of voxel i at g = grad W (into lp[FIT_P_CSPACE], dL/dg to dg) */
+FIT_HD void fit_cspace_term(const fit_dev *f, size_t i, const float g[3], float weight, double lp[FIT_NPARTS], float dg[3]) {
+    if (!f->cs || !(f->w_cs > 0.f) || !f->cs[i]) return;
+    float a = 1.f;
+    if (f->sp[i]) {
+        const float d = fabsf(logf((float)f->sp[i] / (float)f->cs[i])), t = f->cs_tol > 0.f ? f->cs_tol : 0.25f;
+        a = fminf(1.f, fmaxf(0.f, (d - t) / t)); if (!(a > 0.f)) return;
+    }
+    const float g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2] + 1e-12f, gl = sqrtf(g2);
+    const float rho = 8.f / (f->h * (float)f->cs[i]), lr = logf(gl) - logf(rho), c = f->w_cs * weight * a;
+    lp[FIT_P_CSPACE] += c * lr * lr; for (int d = 0; d < 3; d++) dg[d] += c * 2.f * lr * g[d] / g2;
 }
 /* the gradient terms of voxel i at g = grad W: loss parts added to lp[2..4], dL/dg to dg */
 FIT_HD void fit_grad_terms(const fit_dev *f, size_t i, const float g[3], float weight, double lp[FIT_NPARTS], float dg[3]) {
@@ -96,6 +125,22 @@ FIT_HD void fit_pgrad_term(const fit_dev *f, size_t i, const float g[3], float w
         if (ar <= dl) { lp[5] += cc * r * r / (2.f * dl); dg[d] += cc * (r / dl) / rho; }
         else { lp[5] += cc * (ar - 0.5f * dl); dg[d] += cc * (r > 0.f ? 1.f : -1.f) / rho; }
     }
+}
+/* the sheet spacing of a CT profile p[0..n) (n <= 1024, smoothed in place by [1 2 1] / 4), samples step native voxels apart along a
+   normal: papyrus peaks are the runs above the profile's mean that start and end with a dip below it inside the profile and reach
+   mean + prom sd, each at its maximum; spacing = (last - first) / (peaks - 1) x step, 0 below 2 peaks or for a flat profile (sd < 2) */
+FIT_HD float fit_ct_spacing(float *p, int n, float step, float prom) {
+    if (n < 5) return 0.f;
+    float prev = p[0], mu = 0.f;
+    for (int k = 0; k < n; k++) { const float c = p[k], v = 0.25f * prev + 0.5f * c + 0.25f * p[k + 1 < n ? k + 1 : k]; prev = c; p[k] = v; mu += v; }
+    mu /= n; float s2 = 0.f; for (int k = 0; k < n; k++) s2 += (p[k] - mu) * (p[k] - mu);
+    const float sd = sqrtf(s2 / n); if (sd < 2.f) return 0.f;
+    int armed = 0, inrun = 0, first = -1, last = -1, np = 0, am = 0; float mx = 0.f;
+    for (int k = 0; k < n; k++) {
+        if (p[k] < mu) { if (inrun && armed && mx >= mu + prom * sd) { if (first < 0) first = am; last = am; np++; } inrun = 0; armed = 1; continue; }
+        if (!inrun) { inrun = 1; mx = p[k]; am = k; } else if (p[k] > mx) { mx = p[k]; am = k; }
+    }
+    return np >= 2 ? (float)(last - first) / (float)(np - 1) * step : 0.f;
 }
 FIT_HD float fit_wrap_pi(float a) {   /* into (-pi, pi] */
     const float tp = 6.283185307179586f;
@@ -163,8 +208,10 @@ FIT_HD int fit_vox2(const fit_dev *f, size_t i, float wv, float sc, double lp[FI
     float dW = 0.f, dg[3] = {0, 0, 0};
     fit_phase_term(f, i, W0, wv * sc, &lp[FIT_P_PHASE], &dW);
     fit_recto_term(f, i, W0, wv * sc, &lp[FIT_P_RECTO], &dW);
+    fit_ct_term(f, i, W0, wv * sc, &lp[FIT_P_CT], &dW);
     fit_grad_terms(f, i, g, wv * sc, lp, dg);
     fit_pgrad_term(f, i, g, wv * sc, lp, dg);
+    fit_cspace_term(f, i, g, wv * sc, lp, dg);
     int nc = 8;
     const size_t n = (size_t)f->D * f->H * f->W;
     if (f->wd && f->w_w4 > 0.f && f->wd[3 * n + i]) {   /* winding mod 4: per axis 1 - cos(pi / 2 (W(x + d e_a) - W(x) - delta_a)) */
@@ -181,7 +228,8 @@ FIT_HD int fit_vox2(const fit_dev *f, size_t i, float wv, float sc, double lp[FI
             nc += 8;
         }
     }
-    lp[FIT_P_TOTAL] = lp[FIT_P_PHASE] + lp[FIT_P_NORMAL] + lp[FIT_P_DENSITY] + lp[FIT_P_NONDEG] + lp[FIT_P_PGRAD] + lp[FIT_P_WIND4] + lp[FIT_P_RECTO];
+    lp[FIT_P_TOTAL] = lp[FIT_P_PHASE] + lp[FIT_P_NORMAL] + lp[FIT_P_DENSITY] + lp[FIT_P_NONDEG] + lp[FIT_P_PGRAD] + lp[FIT_P_WIND4] + lp[FIT_P_RECTO]
+                    + lp[FIT_P_CT] + lp[FIT_P_CSPACE];
     for (int c = 0; c < 8; c++) gv[c] = dW * wc[c] + dg[0] * gw[c][0] + dg[1] * gw[c][1] + dg[2] * gw[c][2];
     return nc;
 }

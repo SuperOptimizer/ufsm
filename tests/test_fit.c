@@ -61,7 +61,7 @@ static int run_case(int dir) {
         for (int k = 0; k < 6; k++) t[k][i] = (uint8_t)lround(255 * tv[k]);
         double s = 8 / (H8 * rho); sp[i] = (uint8_t)(s < 1 ? 1 : s > 255 ? 255 : lround(s));
     }
-    fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, {0}, 0, nullptr};
+    fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, {0}, 0, nullptr, nullptr, nullptr};
     fit_cfg c = fit_cfg_default(); c.verbose = 1; c.uw_split = g_split; c.uw_tile = g_tile; c.cpu = g_cpu; c.phase_robust = g_robust; c.bend = g_bend; c.w_pgrad = g_pgrad;
     fit_model *m = fit_run(&f, &c);
     int bad = 0;
@@ -110,24 +110,34 @@ static int run_case(int dir) {
         }
         fit_dev fd = {D, H, W, (float)H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, na, m->dir, m->nk, m->knot_dz, m->pitch, m->offset,
                       m->L, m->lz, m->ly, m->lx, m->delta, 1e-5f, 1e-5f, 1e-5f, 1e-5f, 3.f, 1, 7u, 0.f, 0.f, 0.05f, 1.5f, 1e-5f, 0.25f, nullptr,
-                      wd, 1e-5f, (float)w4d, rc, 1e-5f};
+                      wd, 1e-5f, (float)w4d, rc, 1e-5f, nullptr, 1e-5f, 1.5f, 0.3f, 0.05f, nullptr, 1e-5f, 0.2f};
+        uint8_t *ctm = malloc(n), *csp = malloc(n);   /* CT parity and spacing from the true W (the spacing off by a z-dependent factor: the
+                                                         sp / cs ramp sees agreeing, partly and fully disagreeing cells) */
+        for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            const size_t i = ((size_t)z * H + y) * W + x; const double w0 = W_true((z + 0.5) * H8, (y + 0.5) * H8, (x + 0.5) * H8);
+            ctm[i] = (uint8_t)lround(128 + 127 * 0.8 * cos(2 * M_PI * (w0 - 0.3)) * (x % 7 ? 1 : -0.5));
+            const double cv = sp[i] * (1 + 0.8 * z / D); csp[i] = (uint8_t)(cv > 255 ? 255 : lround(cv));
+        }
+        fd.ctm = ctm; fd.cs = csp;
         const size_t nl = (size_t)m->lz * m->ly * m->lx; double ph[FIT_NPARTS] = {0}, pd[FIT_NPARTS] = {0}; float *gh = calloc(nl, 4), *gg = malloc(nl * 4);
         fit_loss2_host(&fd, ph, gh);
-        uint8_t *dv = nn_malloc(15 * n); const uint8_t *hv[15] = {pc, ps, t[0], t[1], t[2], t[3], t[4], t[5], sp, w, wd, wd + n, wd + 2 * n, wd + 3 * n, rc};
-        for (int k = 0; k < 15; k++) nn_h2d(dv + k * n, hv[k], n);
+        uint8_t *dv = nn_malloc(17 * n); const uint8_t *hv[17] = {pc, ps, t[0], t[1], t[2], t[3], t[4], t[5], sp, w, wd, wd + n, wd + 2 * n, wd + 3 * n, rc, ctm, csp};
+        for (int k = 0; k < 17; k++) nn_h2d(dv + k * n, hv[k], n);
         float *dcy = nn_malloc(na * 4), *dcx = nn_malloc(na * 4), *dpi = nn_malloc(m->nk * 4), *dof = nn_malloc(m->nk * 4), *ddl = nn_malloc(nl * 4), *dg = nn_malloc(nl * 4);
         double *dp = nn_malloc(FIT_NPARTS * sizeof(double));
         nn_h2d(dcy, cy, na * 4); nn_h2d(dcx, cx, na * 4); nn_h2d(dpi, m->pitch, m->nk * 4); nn_h2d(dof, m->offset, m->nk * 4); nn_h2d(ddl, m->delta, nl * 4);
         nn_zero(dg, nl * 4); nn_zero(dp, FIT_NPARTS * sizeof(double));
-        fit_dev fg = fd; fg.pc = dv; fg.ps = dv + n; for (int k = 0; k < 6; k++) fg.t[k] = dv + (2 + k) * n; fg.sp = dv + 8 * n; fg.w = dv + 9 * n; fg.wd = dv + 10 * n; fg.recto = dv + 14 * n;
+        fit_dev fg = fd; fg.pc = dv; fg.ps = dv + n; for (int k = 0; k < 6; k++) fg.t[k] = dv + (2 + k) * n; fg.sp = dv + 8 * n; fg.w = dv + 9 * n; fg.wd = dv + 10 * n; fg.recto = dv + 14 * n; fg.ctm = dv + 15 * n; fg.cs = dv + 16 * n;
         fg.cy = dcy; fg.cx = dcx; fg.pitch = dpi; fg.offset = dof; fg.delta = ddl;
         nn_fit_loss2(&fg, dp, dg); nn_sync(); nn_d2h(pd, dp, sizeof pd); nn_d2h(gg, dg, nl * 4);
         double gmax = 0, dmax = 0; for (size_t k = 0; k < nl; k++) { gmax = fmax(gmax, fabs(gh[k])); dmax = fmax(dmax, fabs(gh[k] - gg[k])); }
-        printf("backends: loss parts cpu %.6g %.6g %.6g %.6g %.6g wind4 %.6g recto %.6g gpu %.6g %.6g %.6g %.6g %.6g wind4 %.6g recto %.6g; gradient max |cpu - gpu| %.3g of max %.3g\n",
-               ph[1], ph[2], ph[3], ph[4], ph[5], ph[FIT_P_WIND4], ph[FIT_P_RECTO], pd[1], pd[2], pd[3], pd[4], pd[5], pd[FIT_P_WIND4], pd[FIT_P_RECTO], dmax, gmax);
+        printf("backends: loss parts cpu %.6g %.6g %.6g %.6g %.6g wind4 %.6g recto %.6g ct %.6g cspace %.6g gpu %.6g %.6g %.6g %.6g %.6g wind4 %.6g recto %.6g ct %.6g cspace %.6g; "
+               "gradient max |cpu - gpu| %.3g of max %.3g\n", ph[1], ph[2], ph[3], ph[4], ph[5], ph[FIT_P_WIND4], ph[FIT_P_RECTO], ph[FIT_P_CT], ph[FIT_P_CSPACE],
+               pd[1], pd[2], pd[3], pd[4], pd[5], pd[FIT_P_WIND4], pd[FIT_P_RECTO], pd[FIT_P_CT], pd[FIT_P_CSPACE], dmax, gmax);
         for (int k = 0; k < FIT_NPARTS; k++) if (k != FIT_P_SMOOTH) CHECK(fabs(ph[k] - pd[k]) <= 1e-3 * fabs(pd[k]) + 1e-9, "loss part %d: cpu %.8g gpu %.8g", k, ph[k], pd[k]);
         CHECK(pd[FIT_P_WIND4] > 0 && pd[FIT_P_RECTO] > 0, "the winding mod 4 / recto terms are inactive (%g %g)", pd[FIT_P_WIND4], pd[FIT_P_RECTO]);
-        free(wd); free(rc);
+        CHECK(pd[FIT_P_CT] != 0 && pd[FIT_P_CSPACE] > 0, "the CT parity / spacing terms are inactive (%g %g)", pd[FIT_P_CT], pd[FIT_P_CSPACE]);
+        free(wd); free(rc); free(ctm); free(csp);
         CHECK(dmax <= 1e-3 * gmax, "gradient: max |cpu - gpu| %.3g > 1e-3 x %.3g", dmax, gmax);
         nn_free(dv); nn_free(dcy); nn_free(dcx); nn_free(dpi); nn_free(dof); nn_free(ddl); nn_free(dg); nn_free(dp); free(gh); free(gg);
     }
@@ -136,10 +146,88 @@ static int run_case(int dir) {
     return bad;
 }
 
+/* CT in the fitter: the packed sector's network phase is weak (confidence 0.2, below the unwrapping's 0.3) and wrong (it and the network
+   spacing under-count the sector's extra turns by g_ctbias), as on a crushed scroll; the ct plane is the true sheets' mean CT (papyrus at
+   frac W_true = 0.2, noise), cs the true spacing. Without CT the fit follows the network into the slip; with --w-ct and --w-cspacing it
+   must recover the ids and the sheet placement. Returns the fraction of ids right in the sector (and *all, *prec overall). */
+static double g_ctbias = 0.5; static int g_ctflood = 0;   /* fit_cfg ct_flood (the CT phase in the voxel unwrapping) */
+static double ct_sector(double z, double y, double x) {   /* the packed sector's weight */
+    double dth = atan2(y - ax_y(z), x - ax_x(z)) - 1.0; dth -= 2 * M_PI * floor((dth + M_PI) / (2 * M_PI));
+    return exp(-dth * dth / (2 * 0.3 * 0.3));
+}
+static double W_ctnet(double z, double y, double x) {   /* the weak network's W: the sector's extra turns scaled by 1 - g_ctbias */
+    const double r = hypot(y - ax_y(z), x - ax_x(z));
+    const double sw = ct_sector(z, y, x), bw = sw > 0.3 ? (sw - 0.3) / 0.7 : 0;   /* wrong only inside the weak sector */
+    return W_true(z, y, x) - g_ctbias * g_pack / 60 * r * bw;
+}
+static double run_ct_case(int cpu, float w_ct, float w_cs, double *all, double *prec_out) {
+    g_dir = 1;
+    const int D = 48, H = 96, W = 96; const size_t n = (size_t)D * H * W;
+    uint8_t *pc = malloc(n), *ps = malloc(n), *t[6], *sp = malloc(n), *w = malloc(n), *ct = malloc(n), *cs = malloc(n), *sec = malloc(n);
+    for (int k = 0; k < 6; k++) t[k] = malloc(n);
+    const int na = (int)(D * H8) + 1;
+    float *cy = malloc(na * sizeof(float)), *cx = malloc(na * sizeof(float));
+    for (int z = 0; z < na; z++) { cy[z] = (float)ax_y(z); cx[z] = (float)ax_x(z); }
+    unsigned rs = 12345u;
+    for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        const size_t i = ((size_t)z * H + y) * W + x;
+        const double pz = (z + 0.5) * H8, py = (y + 0.5) * H8, px = (x + 0.5) * H8, r = hypot(py - ax_y(pz), px - ax_x(pz));
+        w[i] = r >= 3 * 70 && r <= 370 ? 255 : 0;
+        const double sw = ct_sector(pz, py, px); sec[i] = sw > 0.3;
+        const double Wn = W_ctnet(pz, py, px), ph = 2 * M_PI * (Wn - floor(Wn)), amp = sw > 0.3 ? 0.2 : 1;
+        pc[i] = (uint8_t)lround(128 + 127 * amp * cos(ph)); ps[i] = (uint8_t)lround(128 + 127 * amp * sin(ph));
+        double gn[3], gt[3]; const double e = 0.5;
+        for (int d = 0; d < 3; d++) {
+            double a[3] = {pz, py, px}, b[3] = {pz, py, px}; a[d] += e; b[d] -= e;
+            double dn = W_ctnet(a[0], a[1], a[2]) - W_ctnet(b[0], b[1], b[2]), dt = W_true(a[0], a[1], a[2]) - W_true(b[0], b[1], b[2]);
+            gn[d] = (dn - round(dn)) / (2 * e); gt[d] = (dt - round(dt)) / (2 * e);
+        }
+        const double rn = sqrt(gn[0] * gn[0] + gn[1] * gn[1] + gn[2] * gn[2]), rt = sqrt(gt[0] * gt[0] + gt[1] * gt[1] + gt[2] * gt[2]);
+        const double nz = gt[0] / rt, ny = gt[1] / rt, nx = gt[2] / rt;   /* the normals are right (n n^T knows no turn count) */
+        const double tv[6] = {nz * nz, ny * ny, nx * nx, 0.5 + nz * ny, 0.5 + nz * nx, 0.5 + ny * nx};
+        for (int k = 0; k < 6; k++) t[k][i] = (uint8_t)lround(255 * tv[k]);
+        double s1 = 8 / (H8 * rn), s2 = 8 / (H8 * rt);
+        sp[i] = (uint8_t)(s1 < 1 ? 1 : s1 > 255 ? 255 : lround(s1)); cs[i] = (uint8_t)(s2 < 1 ? 1 : s2 > 255 ? 255 : lround(s2));
+        rs = rs * 1664525u + 1013904223u; const double noise = ((rs >> 8) / 16777216.0 - 0.5) * 30;
+        const double cv = 95 + 50 * cos(2 * M_PI * (W_true(pz, py, px) - 0.2)) + noise;
+        ct[i] = w[i] ? (uint8_t)lround(cv < 1 ? 1 : cv > 255 ? 255 : cv) : 0;
+    }
+    fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, {0}, 0, nullptr, ct, cs};
+    fit_cfg c = fit_cfg_default(); c.verbose = getenv("FIT_CTV") != nullptr; c.cpu = cpu; c.dir = 1;
+    c.w_ct = w_ct; c.ct_phi = 0.2f; c.w_cspacing = w_cs; c.ct_flood = g_ctflood;
+    fit_model *m = fit_run(&f, &c);
+    if (!m) { fprintf(stderr, "FAIL: fit_run (ct)\n"); fails++; return 0; }
+    int hist[401] = {0};
+    for (size_t i = 0; i < n; i++) {
+        if (!w[i] || sec[i]) continue;
+        const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
+        const double pz = (z + 0.5) * H8, py = (y + 0.5) * H8, px = (x + 0.5) * H8; const long k = lround(fit_W(m, pz, py, px) - W_true(pz, py, px));
+        if (k >= -200 && k <= 200) hist[k + 200]++;
+    }
+    int k0 = 0; for (int k = 1; k < 401; k++) if (hist[k] > hist[k0]) k0 = k;   /* the gauge from outside the sector */
+    size_t nd = 0, right = 0, close = 0, ns = 0, sright = 0, sclose = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!w[i]) continue;
+        const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
+        const double pz = (z + 0.5) * H8, py = (y + 0.5) * H8, px = (x + 0.5) * H8;
+        const double d = fit_W(m, pz, py, px) - W_true(pz, py, px) - (k0 - 200);
+        nd++; right += fabs(d) < 0.5; close += fabs(d) < 0.08;
+        if (sec[i]) { ns++; sright += fabs(d) < 0.5; sclose += fabs(d) < 0.08; }
+    }
+    *all = (double)right / nd; *prec_out = (double)close / nd;
+    printf("ct case%s%s, w_ct %g, w_cspacing %g: ids right %.4f (sector %.4f), |error| < 0.08 turn %.4f (sector %.4f)\n", cpu ? " cpu" : "", g_ctflood ? " flood" : "", w_ct, w_cs,
+           *all, ns ? (double)sright / ns : 0, *prec_out, ns ? (double)sclose / ns : 0);
+    const double r = ns ? (double)sright / ns : 0;
+    fit_free(m);
+    free(pc); free(ps); free(sp); free(w); free(ct); free(cs); free(sec); free(cy); free(cx); for (int k = 0; k < 6; k++) free(t[k]);
+    return r;
+}
+
 int main(void) {
     nn_init(0);
     if (getenv("FIT_BIAS")) g_bias = atof(getenv("FIT_BIAS"));
     if (getenv("FIT_SIMPLE")) { g_wob = atof(getenv("FIT_SIMPLE")); g_pack = 0; g_dpitch = 0; g_hole = 0; }
+    if (!getenv("FIT_CTONLY")) {   /* (FIT_CTONLY: the CT cases alone) */
     run_case(+1);
     run_case(-1);
     g_split = 0.5; g_tile = 32; run_case(+1);   /* 18 tiles: pieces stitched across tile faces, the hole and the edge by the serial pass */
@@ -148,6 +236,34 @@ int main(void) {
     g_robust = 0.1f; g_bend = 1.f; run_case(+1); /* the Cauchy phase residual and curvature-adaptive smoothness keep a clean fit */
     g_cpu = 0; run_case(-1);                     /* ... on the GPU too */
     g_robust = 0; g_bend = 0; g_pgrad = 1.f; run_case(+1); g_cpu = 1; run_case(-1);   /* phase-gradient matching, both backends */
+    }
+    g_pgrad = 0; g_cpu = 0;
+    {   /* the CT sheet spacing of a profile: papyrus peaks of period 12.5 samples (0.5 native voxels apart) with noise; 2 peaks at least */
+        float pr[160]; unsigned rs = 7u;
+        for (int k = 0; k < 160; k++) { rs = rs * 1664525u + 1013904223u; pr[k] = (float)(90 + 40 * cos(2 * M_PI * (k - 3.3) / 12.5) + ((rs >> 8) / 16777216.0 - 0.5) * 20); }
+        const double sp1 = fit_ct_profile_spacing(pr, 160, 0.5, 0.3), sp0 = fit_ct_profile_spacing(pr, 16, 0.5, 0.3);
+        printf("CT profile spacing %.3f native voxels (true 6.25); one period: %.3f\n", sp1, sp0);
+        CHECK(fabs(sp1 - 6.25) < 0.15, "CT profile spacing %.3f, not 6.25", sp1);
+        CHECK(sp0 == 0, "a profile with fewer than 2 whole peaks gave spacing %.3f", sp0);
+        /* the parity: local contrast, sign and the no-CT code */
+        const int D = 8, H = 8, W = 64; uint8_t ct[8 * 8 * 64], pm[8 * 8 * 64];
+        for (int i = 0; i < D * H * W; i++) { const int x = i % W; ct[i] = x < 4 ? 0 : (uint8_t)((x < 32 ? 60 : 140) + (x % 8 < 3 ? 40 : 0)); }
+        fit_ct_parity(ct, D, H, W, 4, pm);
+        int ok = 1; for (int i = 0; i < D * H * W; i++) { const int x = i % W; if (x < 4) ok &= pm[i] == 128; else if (x >= 8 && x < 28) ok &= (x % 8 < 3) == (pm[i] > 128); }
+        CHECK(ok, "CT parity: papyrus above / void below the local mean, 128 without CT");
+    }
+    {   /* CT: a weak, wrong packed sector recovered by the CT parity and spacing, on both backends */
+        double a0, p0, a1, p1, a2, p2;
+        const double s0 = run_ct_case(1, 0.f, 0.f, &a0, &p0);
+        const double s1 = run_ct_case(1, 2.f, 1.f, &a1, &p1);
+        const double s2 = run_ct_case(0, 2.f, 1.f, &a2, &p2);
+        CHECK(s0 < 0.95, "the weak sector should break the network-only fit (sector ids %.4f)", s0);
+        if (getenv("FIT_CTONLY")) { run_ct_case(1, 2.f, 0.f, &a0, &p0); run_ct_case(1, 0.f, 1.f, &a0, &p0); run_ct_case(0, 0.5f, 0.f, &a0, &p0); }   /* the terms alone */
+        CHECK(s1 >= 0.98 && a1 >= 0.99 && p1 >= 0.9, "cpu: CT terms: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s1, a1, p1);
+        CHECK(s2 >= 0.98 && a2 >= 0.99 && p2 >= 0.9, "gpu: CT terms: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s2, a2, p2);
+        g_ctflood = 1; const double s3 = run_ct_case(1, 2.f, 0.f, &a1, &p1); g_ctflood = 0;   /* with the CT phase in the voxel unwrapping */
+        CHECK(s3 >= 0.98 && a1 >= 0.99 && p1 >= 0.9, "cpu, CT flood: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s3, a1, p1);
+    }
     if (fails) { fprintf(stderr, "test_fit: %d failure(s)\n", fails); return 1; }
     printf("test_fit: OK\n");
     return 0;
