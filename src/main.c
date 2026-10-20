@@ -563,7 +563,9 @@ static int cmd_band(int argc, char **argv) {
    Local slip repair (fit_cfg uw_repair, src/l1pot.h): --uw-repair T splits the flooded voxels of each T^3 tile into pieces whose integers
    agree and re-solves their integer shifts as the least-cost (weighted L1) assignment of all their votes; evidence --uw-rep-w4 W (the
    winding mod 4 planes), --uw-rep-geo W (the gradient stages' W over --uw-rep-gd field voxels), --uw-rep-cs W (the CT sheet spacing);
-   --uw-rep-dump PREFIX writes the per-voxel shifts and seams. */
+   --uw-rep-dump PREFIX writes the per-voxel shifts and seams. Vote weights (lower confidence)^--uw-rep-qpow (3) x the phase-stretch
+   factor --uw-rep-stretch (0.5; 0 off) over a (2 --uw-rep-sr + 1)^3 box (1). Recommended: --uw-repair 8 (Paris 4 hold box, wind96
+   fields over 9 predict windows: mean ids 0.827 -> 0.893). */
 /* U (the unwrapped radius in turns; sheets where U - dir theta / 2 pi is an integer) for the scorer: fill(ctx, og, n3, step, codes, U)
    writes U at og + i step (native voxels relative to the box origin) over the n3 grid, NaN where unknown (it may skip the points
    whose code is not 1..252); returns nonzero on failure */
@@ -674,7 +676,7 @@ static int cmd_fit(int argc, char **argv) {
     c.uw_repair = atoi(opt(argc, argv, "--uw-repair", "0")); c.uw_rep_w4 = (float)atof(opt(argc, argv, "--uw-rep-w4", "0"));
     c.uw_rep_geo = (float)atof(opt(argc, argv, "--uw-rep-geo", "0")); c.uw_rep_gd = atoi(opt(argc, argv, "--uw-rep-gd", "8"));
     c.uw_rep_cs = (float)atof(opt(argc, argv, "--uw-rep-cs", "0")); c.uw_rep_dump = opt(argc, argv, "--uw-rep-dump", nullptr);
-    c.uw_rep_qpow = (float)atof(opt(argc, argv, "--uw-rep-qpow", "1")); c.uw_rep_stretch = (float)atof(opt(argc, argv, "--uw-rep-stretch", "0"));
+    c.uw_rep_qpow = (float)atof(opt(argc, argv, "--uw-rep-qpow", "3")); c.uw_rep_stretch = (float)atof(opt(argc, argv, "--uw-rep-stretch", "0.5"));
     c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1"));
     if (c.uw_repair < 0 || !(c.uw_rep_w4 >= 0) || !(c.uw_rep_geo >= 0) || !(c.uw_rep_cs >= 0) || c.uw_rep_gd < 1 || !(c.uw_rep_qpow > 0) || !(c.uw_rep_stretch >= 0) || c.uw_rep_sr < 0 || c.uw_rep_sr > 4) { fprintf(stderr, "fit: --uw-repair >= 0, --uw-rep-* weights >= 0, --uw-rep-gd >= 1\n"); return 2; }
     c.core = (float)atof(opt(argc, argv, "--core", "3"));   /* no data terms within core x pitch of the axis */
