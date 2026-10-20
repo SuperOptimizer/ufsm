@@ -97,7 +97,7 @@ static double run_spiral(int repair, int steps, double *flood_ids) {
     }
     fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, {0}, 0, nullptr, nullptr, nullptr};
     fit_cfg c = fit_cfg_default(); c.verbose = 1; c.cpu = 1; c.dir = 1; c.core = 0;
-    if (repair) { c.uw_repair = 4; c.uw_rep_stretch = 0.5f; }
+    c.uw_repair = repair ? 4 : 0; c.uw_rep_qpow = 1.f; c.uw_rep_stretch = repair ? 0.5f : 0.f;   /* (the default is on: the flood alone needs 0) */
     if (steps) c.steps[4] = c.steps[5] = steps;   /* 1: the phase stages barely move: W is the unwrapping's (its integers) */
     fit_model *m = fit_run(&f, &c);
     if (!m) { fprintf(stderr, "FAIL: fit_run\n"); fails++; return 0; }
@@ -127,6 +127,8 @@ static double run_spiral(int repair, int steps, double *flood_ids) {
 }
 
 int main(void) {
+    { const fit_cfg d = fit_cfg_default();   /* the repair is on by default (fit --uw-repair 8, 10-20), with the CLI's vote weights */
+      CHECK(d.uw_repair == 8 && d.uw_rep_qpow == 3.f && d.uw_rep_stretch == 0.5f && d.uw_rep_sr == 1, "fit_cfg_default: uw_repair %d qpow %g stretch %g sr %d (want 8 / 3 / 0.5 / 1)", d.uw_repair, d.uw_rep_qpow, d.uw_rep_stretch, d.uw_rep_sr); }
     test_l1();
     fit_set_threads(4);
     for (g_ring = 0; g_ring <= 1; g_ring++) {   /* the unwrapping's integers (phase stages of 1 step), then the full fit */

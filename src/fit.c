@@ -35,7 +35,7 @@ fit_cfg fit_cfg_default(void) {
     c.w_recto = 0.f;    /* recto anchors off by default */
     c.w_ct = 0.f; c.ct_pow = 1.f; c.ct_phi = 0.f; c.ct_radius_um = 150; c.ct_floor = 0.f;   /* CT parity off by default */
     c.w_cspacing = 0.f; c.cs_tol = 0.25f; c.ct_flood = 0;
-    c.uw_repair = 0; c.uw_rep_qpow = 1.f; c.uw_rep_sr = 1; c.uw_rep_gd = 8;   /* local slip repair off by default */
+    c.uw_repair = 8; c.uw_rep_qpow = 3.f; c.uw_rep_stretch = 0.5f; c.uw_rep_sr = 1; c.uw_rep_gd = 8;   /* local slip repair on (as fit --uw-repair 8, 10-20) */
     return c;
 }
 

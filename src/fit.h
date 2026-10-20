@@ -50,7 +50,7 @@ typedef struct {
     double uw_min_conf;             /* the unwrapping's lowest phase confidence (0: 0.3) */
     double uw_pdv;                  /* > 0: the unwrapping quality (flood order, node weights) times exp(-pdv / uw_pdv^2), pdv the
                                        phase derivative variance (turns^2): dislocated / noisy phase is flooded last */
-    int uw_repair;                  /* > 0: local slip repair after the voxel flood (tile edge in field voxels; 0 off): the flooded voxels
+    int uw_repair;                  /* > 0: local slip repair after the voxel flood (tile edge in field voxels; default 8, 0 off): the flooded voxels
                                        of each tile split into pieces whose integers agree, every touching voxel pair of two pieces votes
                                        for their integer offset (weight the lower confidence), and the pieces' integer shifts minimise the
                                        summed weighted L1 disagreement (src/l1pot.h: loops that do not close are cut where cheapest,

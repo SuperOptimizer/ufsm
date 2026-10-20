@@ -86,7 +86,7 @@ static int usage(void) {
         "  ufsm restore-eval <ckpt> <clean.npy>... [--family pyramid]   task restore: PSNR on clean crops degraded by one recipe\n"
         "  ufsm restore-stats <root> <key> --um U --box ... [--degrade scanner ...]   task restore: calibration statistics of a CT box\n"
         "  ufsm ct-hist <out.txt> <root> <key> z,y,x,n [...]  CT histograms of boxes (targets of train --aug-hist, the hist op)\n"
-        "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
+        "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY] [--uw-repair 8]   winding fitter (src/fit.h; slip repair on, 0 off)\n"
         "  ufsm convert-unwrap2 <unwrap.ckpt> <out.ckpt>   a task unwrap checkpoint as task unwrap2 (heads 2-10 -> 0-8, winding mod 4 fresh; no training step)\n"
         "  ufsm repack <in-array-dir> <out-array-dir> <shard> [--threads N]   lossless re-sharding of a z3w uint8 zarr (copies the compressed chunks)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
@@ -701,14 +701,14 @@ static int cmd_band(int argc, char **argv) {
    (predict --fit-fields / --fit-zarr write it). --out also writes MODEL/fit-config.json (the weights and options of the fit).
    CT (fields with ct / cs planes, ufsm ct-fields / predict --fit-ct): --w-ct W papyrus / void parity c m (1 - cos 2 pi (W - --ct-phi)) weighted
    (1 - phase confidence)^--ct-pow (>= --ct-floor), the parity m the cell's CT contrast to its +---ct-radius-um neighbourhood; with it
-   --ct-flood 1 (default) lets low-confidence voxels join the voxel unwrapping with the CT's own phase. --w-cspacing W: the density term
+   --ct-flood 1 (default 0: the CT flood loses turns on PHerc1299) lets low-confidence voxels join the voxel unwrapping with the CT's own phase. --w-cspacing W: the density term
    against the CT sheet spacing where the network's is unknown or differs by more than --cs-tol in log.
    Local slip repair (fit_cfg uw_repair, src/l1pot.h): --uw-repair T splits the flooded voxels of each T^3 tile into pieces whose integers
    agree and re-solves their integer shifts as the least-cost (weighted L1) assignment of all their votes; evidence --uw-rep-w4 W (the
    winding mod 4 planes), --uw-rep-geo W (the gradient stages' W over --uw-rep-gd field voxels), --uw-rep-cs W (the CT sheet spacing);
    --uw-rep-dump PREFIX writes the per-voxel shifts and seams. Vote weights (lower confidence)^--uw-rep-qpow (3) x the phase-stretch
-   factor --uw-rep-stretch (0.5; 0 off) over a (2 --uw-rep-sr + 1)^3 box (1). Recommended: --uw-repair 8 (Paris 4 hold box, wind96
-   fields over 9 predict windows: mean ids 0.827 -> 0.893). */
+   factor --uw-rep-stretch (0.5; 0 off) over a (2 --uw-rep-sr + 1)^3 box (1). Default --uw-repair 8 (Paris 4 hold box, wind96 fields
+   over 9 predict windows: mean ids 0.827 -> 0.893; neutral for wind2-ft3 and the PHerc1299 boxes); --uw-repair 0 turns it off. */
 /* U (the unwrapped radius in turns; sheets where U - dir theta / 2 pi is an integer) for the scorer: fill(ctx, og, n3, step, codes, U)
    writes U at og + i step (native voxels relative to the box origin) over the n3 grid, NaN where unknown (it may skip the points
    whose code is not 1..252); returns nonzero on failure */
@@ -925,7 +925,7 @@ static int cmd_fit(int argc, char **argv) {
     }
     c.uw_split = atof(opt(argc, argv, "--uw-split", "0")); c.uw_tile = atoi(opt(argc, argv, "--uw-tile", "256")); c.uw_pdv = atof(opt(argc, argv, "--uw-pdv", "0")); c.uw_min_conf = atof(opt(argc, argv, "--uw-min-conf", "0.3"));
     /* local slip repair (fit_cfg uw_repair): pieces of uw_repair^3 tiles, least-cost integer shifts from their votes and the evidence */
-    c.uw_repair = atoi(opt(argc, argv, "--uw-repair", "0")); c.uw_rep_w4 = (float)atof(opt(argc, argv, "--uw-rep-w4", "0"));
+    c.uw_repair = atoi(opt(argc, argv, "--uw-repair", "8"));   /* on by default (10-20: wind96 hold 0.827 -> 0.893; neutral elsewhere) */ c.uw_rep_w4 = (float)atof(opt(argc, argv, "--uw-rep-w4", "0"));
     c.uw_rep_geo = (float)atof(opt(argc, argv, "--uw-rep-geo", "0")); c.uw_rep_gd = atoi(opt(argc, argv, "--uw-rep-gd", "8"));
     c.uw_rep_cs = (float)atof(opt(argc, argv, "--uw-rep-cs", "0")); c.uw_rep_dump = opt(argc, argv, "--uw-rep-dump", nullptr);
     c.uw_rep_qpow = (float)atof(opt(argc, argv, "--uw-rep-qpow", "3")); c.uw_rep_stretch = (float)atof(opt(argc, argv, "--uw-rep-stretch", "0.5"));
