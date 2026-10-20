@@ -54,4 +54,9 @@ void cl_accum_row(const uint8_t *pc, const uint8_t *ps, const uint8_t *w, int H,
    them may be null). Returns the number of cells blanked. */
 size_t cl_mask_block(const coreline *c, int side, const long long org[3], double h, double um_native, int z0, int nz, int H, int W,
                      uint8_t *pc, uint8_t *ps, uint8_t *w);
+/* the smoothed core frame of a box (ufsm coreline box --axis const): the mean over the box's z rows (na native rows from org, every
+   16th) of the core point nearest the box centre (cyg, cxg: global native) and of the normal of a straight line fitted to the
+   nearest slab's polyline points within R core-line voxels of it (oriented as the polyline's normal there); f = native um / core um.
+   q, n: core-line voxels / unit (y, x). */
+void cl_box_frame(const coreline *c, const long long org[3], int na, double cyg, double cxg, double f, double R, double q[2], double n[2]);
 int cmd_coreline(int argc, char **argv);
