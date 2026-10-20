@@ -47,6 +47,10 @@ int cmd_refine(int argc, char **argv);       /* src/surf.c */
 int cmd_surf_stats(int argc, char **argv);
 int cmd_stitch(int argc, char **argv);   /* src/stitch.c */
 int cmd_coreline(int argc, char **argv);   /* src/coreline.c */
+int cmd_render_sheets(int argc, char **argv);   /* src/render.c */
+int cmd_overlay_red(int argc, char **argv);
+int cmd_tifxyz_scale(int argc, char **argv);
+int cmd_png2jpg(int argc, char **argv);
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
@@ -85,6 +89,10 @@ static int usage(void) {
         "  ufsm convert-unwrap2 <unwrap.ckpt> <out.ckpt>   a task unwrap checkpoint as task unwrap2 (heads 2-10 -> 0-8, winding mod 4 fresh; no training step)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
         "  ufsm coreline detect|box|sdist ...   a crushed scroll's flattened umbilicus per z (fit fields) and half-box fit dirs behind it\n"
+        "  ufsm render-sheets <tifxyz-dir> <out-dir> --ct ROOT KEY --ink ROOT KEY ...   every sheet -> CT + red ink 5-panel JPEGs, one batch\n"
+        "  ufsm overlay-red <ct-dir> <ink-dir> <out-dir> [ink2 [ink3]]   the 5-panel overlay of existing renders\n"
+        "  ufsm tifxyz-scale <src> <dst> <div> [--offset z,y,x]   tifxyz coordinates / div (e.g. 2.4 -> 9.6 um: 4)\n"
+        "  ufsm png2jpg <in.png> <out.jpg> [--half]   PNG -> JPEG q90 (half: Pillow BOX halved)\n"
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
@@ -3065,6 +3073,10 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "stitch")) return cmd_stitch(argc, argv);
     if (!strcmp(cmd, "coreline")) return cmd_coreline(argc, argv);
+    if (!strcmp(cmd, "render-sheets")) return cmd_render_sheets(argc, argv);
+    if (!strcmp(cmd, "overlay-red")) return cmd_overlay_red(argc, argv);
+    if (!strcmp(cmd, "tifxyz-scale")) return cmd_tifxyz_scale(argc, argv);
+    if (!strcmp(cmd, "png2jpg")) return cmd_png2jpg(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
     if (!strcmp(cmd, "side-votes") || !strcmp(cmd, "codes-merge")) return cmd_side_votes(argc, argv);
