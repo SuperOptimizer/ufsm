@@ -49,6 +49,26 @@ typedef struct {
     double uw_min_conf;             /* the unwrapping's lowest phase confidence (0: 0.3) */
     double uw_pdv;                  /* > 0: the unwrapping quality (flood order, node weights) times exp(-pdv / uw_pdv^2), pdv the
                                        phase derivative variance (turns^2): dislocated / noisy phase is flooded last */
+    int uw_repair;                  /* > 0: local slip repair after the voxel flood (tile edge in field voxels; 0 off): the flooded voxels
+                                       of each tile split into pieces whose integers agree, every touching voxel pair of two pieces votes
+                                       for their integer offset (weight the lower confidence), and the pieces' integer shifts minimise the
+                                       summed weighted L1 disagreement (src/l1pot.h: loops that do not close are cut where cheapest,
+                                       instead of where the flood's spanning tree closed them) */
+    float uw_rep_w4;                /* its evidence: the winding mod 4 planes (unwrap2 fields) as offset votes between voxels w4_d apart,
+                                       weight x the lower confidence x dq (0 off) */
+    float uw_rep_geo;               /* the gradient stages' W as offset votes between voxels uw_rep_gd field voxels apart (the
+                                       density / normal integration across low-confidence bands), weight x the lower confidence (0 off) */
+    int uw_rep_gd;                  /* their distance (field voxels) */
+    float uw_rep_cs;                /* the CT sheet spacing cs (fields with a cs plane) as offset votes like uw_rep_geo: the turns between
+                                       the voxels counted from cs along the model normal (0 off) */
+    float uw_rep_qpow;              /* the repair's vote weight: (lower confidence)^uw_rep_qpow (1: linear) */
+    float uw_rep_stretch;           /* > 0: votes x exp(-(log2 s)^2 / (2 uw_rep_stretch^2)) at both voxels, s = |grad phase| x sp (turns per
+                                       sheet): a phase that lost a sheet is stretched (s ~0.5-0.7 where it disagrees with the published wraps
+                                       on Paris 4, 1.05 where it agrees), so the cut prefers it (0 off) */
+    int uw_rep_sr;                  /* the stretch's box radius (field voxels: (2r+1)^3; 0 the voxel's own central differences) */
+    const char *uw_rep_dump;        /* write PREFIX.shift.raw (the repair's integer shift + 128 per field voxel, 0 not flooded) and
+                                       PREFIX.seam.raw (per field voxel the neighbours whose integers disagree, before | after << 4, | 8 where
+                                       the phase is stretched: uw_rep_stretch's weight < 1/2) */
     int analytic;                   /* 1: nn_fit_loss2 (analytic grad W, voxel minibatches; knots fixed after the prior), 0: nn_fit_loss */
     int cpu, threads;               /* cpu: the CPU backend (no GPU; analytic only), threads (0: all cores, UFSM_FIT_THREADS) */
     float phase_robust;             /* > 0: the phase residual's Cauchy scale in turns (src/fit_terms.h); 0: the plain 1 - cos */

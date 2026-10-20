@@ -7,6 +7,7 @@
 #include "zarr3.h"
 #include "store.h"
 #include "coreline.h"
+#include "l1pot.h"
 #include <complex.h>
 #include <math.h>
 #include <stdio.h>
@@ -34,6 +35,7 @@ fit_cfg fit_cfg_default(void) {
     c.w_recto = 0.f;    /* recto anchors off by default */
     c.w_ct = 0.f; c.ct_pow = 1.f; c.ct_phi = 0.f; c.ct_radius_um = 150; c.ct_floor = 0.f;   /* CT parity off by default */
     c.w_cspacing = 0.f; c.cs_tol = 0.25f; c.ct_flood = 0;
+    c.uw_repair = 0; c.uw_rep_qpow = 1.f; c.uw_rep_sr = 1; c.uw_rep_gd = 8;   /* local slip repair off by default */
     return c;
 }
 
@@ -618,6 +620,245 @@ static size_t uw_two_level(uw_ctx *x, double split, int T, size_t nr, int verbos
     return reached;
 }
 
+/* Local slip repair (fit_cfg uw_repair, fitter Phase 4). The quality-ordered flood is a maximum spanning tree: where the phase has a
+   dislocation (a loop whose wrapped differences do not sum to zero, e.g. two sheets merged over a patch) the tree closes the loop
+   wherever its order happens to, and a whole region beyond can come out a turn off (a "slip": on the held-out Paris 4 box half the
+   box in some predict windows, ring-shaped regions 6-10 mm from the axis). Here the flooded voxels of each tile (uw_repair^3 field
+   voxels) split into pieces whose integers agree (connected through neighbours within half a turn); every touching voxel pair of two
+   pieces votes for their integer offset with the lower confidence as weight, optional evidence adds longer-range votes (the winding
+   mod 4 planes; the gradient stages' W, i.e. the normal / density integration; the CT sheet spacing), and the pieces' shifts minimise
+   the summed weighted L1 disagreement (src/l1pot.h, exact). A dislocation is then cut along its cheapest (least confident, least
+   evidenced) surface. The shifted integers seed the phase stage's delta like the flood's. */
+typedef struct {
+    uw_ctx *x; const fit_cfg *c; int T, ntz, nty, ntx; _Atomic int next;
+    uint32_t *comp;                         /* per record: its piece within its tile (1..), 0 not flooded */
+    uint32_t *npc, *tbase;                  /* per tile: pieces, the first global id */
+    l1_vote *v[64]; size_t nv[64], cv[64];  /* per thread: merged votes */
+    int pass;                               /* 0 pieces, 1 votes */
+    const int32_t *shift;                   /* apply / seams: per global piece */
+    uint8_t *seam; int seam_shift;          /* per field voxel: disagreeing neighbours (seam_shift 0 / 4: the low / high nibble) */
+    size_t nseam[64];
+    int gd; double wgeo, ww4, wcs; int w4c; /* the evidence: distances (field voxels) and weights */
+    double qpow, sst;                       /* vote weight: confidence power, stretch scale (0 off) */
+    uint8_t *bad;                           /* per record (sst > 0): the stretch weight < 1/2 (pieces do not join such voxels to others) */
+    float *lst; int sr;                     /* per record (sst > 0): log2 of the phase stretch; its box radius */
+} uwr_ctx;
+static inline uint32_t uwr_gid(const uwr_ctx *u, int z, int y, int xx, uint32_t id) {
+    const int t = ((z / u->T) * u->nty + y / u->T) * u->ntx + xx / u->T; return u->tbase[t] + u->comp[id] - 1;
+}
+static inline double uw_U(const uw_ctx *x, uint32_t id) { return (double)x->V[id].uw + x->V[id].k; }   /* (the base kb cancels in differences) */
+static void uwr_vote(uwr_ctx *u, int th, uint32_t a, uint32_t b, int32_t d, int64_t w) {
+    if (a == b || w <= 0) return;
+    if (u->nv[th] == u->cv[th]) { u->cv[th] = u->cv[th] ? 2 * u->cv[th] : 65536; u->v[th] = realloc(u->v[th], u->cv[th] * sizeof *u->v[th]); if (!u->v[th]) abort(); }
+    u->v[th][u->nv[th]++] = (l1_vote){a, b, d, w};
+}
+/* the model's U - dir theta / 2 pi = W and theta at a field voxel */
+static double uwr_Wm(const uw_ctx *x, int z, int y, int xx, double *th) {
+    const fit_fields *f = x->f; const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
+    *th = atan2(py - axis_lerp(f->cy, x->na, pz), px - axis_lerp(f->cx, x->na, pz));
+    return fit_W(x->m, pz, py, px);
+}
+/* the phase stretch at a field voxel: |grad phase| (turns per field voxel) x the spacing (field voxels per turn), both over the (2r+1)^3
+   box around it (the gradient per axis from the summed phasor products z(+e) conj(z(-e)), i.e. confidence-weighted; the mean spacing):
+   ~1 where the phase counts every sheet, < 1 where it skipped one, > 1 where it added one; 1 when unknown. r 1 flags 4% of the cells
+   whose phase agrees with the published wraps on the Paris 4 hold box against 8% at r 0 (and 36% vs 41% of those > 1/4 turn off). */
+static double uwr_stretch(const fit_fields *f, int z, int y, int xx, int r) {
+    const size_t HW = (size_t)f->H * f->W; const size_t st[3] = {HW, (size_t)f->W, 1}; const int dim[3] = {f->D, f->H, f->W};
+    double pr[3] = {0}, pi[3] = {0}, ssp = 0; int nsp = 0;
+    for (int a = z - r; a <= z + r; a++) for (int b = y - r; b <= y + r; b++) for (int c = xx - r; c <= xx + r; c++) {
+        if (a < 0 || b < 0 || c < 0 || a >= f->D || b >= f->H || c >= f->W) continue;
+        const size_t i = (size_t)a * HW + (size_t)b * f->W + c; const int pos[3] = {a, b, c};
+        if (f->sp[i]) { ssp += f->sp[i]; nsp++; }
+        for (int d = 0; d < 3; d++) {
+            if (pos[d] <= 0 || pos[d] >= dim[d] - 1) continue;
+            const size_t im = i - st[d], ip = i + st[d];
+            const double cm = f->pc[im] - 128, sm = f->ps[im] - 128, cp = f->pc[ip] - 128, sq = f->ps[ip] - 128;
+            pr[d] += cp * cm + sq * sm; pi[d] += sq * cm - cp * sm;   /* z(+) conj z(-) */
+        }
+    }
+    if (!nsp) return 1;
+    double g2 = 0; int n = 0;
+    for (int d = 0; d < 3; d++) if (pr[d] != 0 || pi[d] != 0) { const double e = atan2(pi[d], pr[d]) / (4 * M_PI); g2 += e * e; n++; }
+    if (!n) return 1;
+    return sqrt(g2 * 3.0 / n) * ssp / nsp / 8.0;   /* (missing axes: the mean square of the others) */
+}
+static double wrap_pi(double a) { return a - 2 * M_PI * floor((a + M_PI) / (2 * M_PI)); }
+static int64_t uwr_w(const uwr_ctx *u, int bk, int z, int y, int xx, int zn, int yn, int xn) {   /* a phase vote's weight */
+    double w = u->qpow == 1 ? bk : (UQ_LEVELS - 2) * pow(bk / (double)(UQ_LEVELS - 2), u->qpow);
+    if (u->sst > 0) {
+        const uw_geo *g = &u->x->g; const float a = u->lst[ub_id(g, z, y, xx)], b = u->lst[ub_id(g, zn, yn, xn)];
+        w *= exp(-(a * a + b * b) / (2 * u->sst * u->sst));
+    }
+    return w < 1 ? 1 : (int64_t)lround(w);
+}
+static void uwr_tiles(void *a, int z0_, int z1_, int th) {
+    uwr_ctx *u = a; uw_ctx *x = u->x; const uw_geo *g = &x->g; const uw_vox *V = x->V; (void)z0_; (void)z1_;
+    const int nt = u->ntz * u->nty * u->ntx; uint32_t *q = nullptr; size_t qcap = 0;
+    for (int t; (t = atomic_fetch_add(&u->next, 1)) < nt;) {
+        const int tx = t % u->ntx, ty = (t / u->ntx) % u->nty, tz = t / (u->ntx * u->nty);
+        const int z0 = tz * u->T, y0 = ty * u->T, x0 = tx * u->T;
+        const int z1 = z0 + u->T < g->D ? z0 + u->T : g->D, y1 = y0 + u->T < g->H ? y0 + u->T : g->H, x1 = x0 + u->T < g->W ? x0 + u->T : g->W;
+        if (u->pass == 0) {   /* pieces: flooded voxels connected through neighbours whose integers agree */
+            const size_t nv = (size_t)(z1 - z0) * (y1 - y0) * (x1 - x0);
+            if (nv > qcap) { qcap = nv; free(q); q = malloc(qcap * sizeof *q); if (!q) abort(); }
+            uint32_t np = 0;
+            for (int z = z0; z < z1; z++) for (int y = y0; y < y1; y++) for (int xx = x0; xx < x1; xx++) {
+                const uint32_t id = ub_id(g, z, y, xx); if (V[id].k == UK_UNSET || u->comp[id]) continue;
+                u->comp[id] = ++np; size_t qh = 0, qt = 0; q[qt++] = id;
+                while (qh < qt) {
+                    const uint32_t i = q[qh++]; int zz, yy, xq; ub_zyx(g, i, &zz, &yy, &xq); const double ui = uw_U(x, i);
+                    const int ok[6] = {zz > z0, zz + 1 < z1, yy > y0, yy + 1 < y1, xq > x0, xq + 1 < x1};
+                    const int nb3[6][3] = {{zz - 1, yy, xq}, {zz + 1, yy, xq}, {zz, yy - 1, xq}, {zz, yy + 1, xq}, {zz, yy, xq - 1}, {zz, yy, xq + 1}};
+                    for (int k = 0; k < 6; k++) {
+                        if (!ok[k]) continue;
+                        const uint32_t j = ub_id(g, nb3[k][0], nb3[k][1], nb3[k][2]);
+                        if (V[j].k == UK_UNSET || u->comp[j] || fabs(ui - uw_U(x, j)) >= 0.5 || (u->bad && u->bad[i] != u->bad[j])) continue;
+                        u->comp[j] = np; q[qt++] = j;
+                    }
+                }
+            }
+            u->npc[t] = np;
+        } else if (u->pass == 1) {   /* votes: touching pairs (+z +y +x neighbours) of two pieces, then the evidence */
+            const size_t n0 = u->nv[th];
+            for (int z = z0; z < z1; z++) for (int y = y0; y < y1; y++) for (int xx = x0; xx < x1; xx++) {
+                const uint32_t i = ub_id(g, z, y, xx); if (V[i].k == UK_UNSET) continue;
+                const uint32_t ga = uwr_gid(u, z, y, xx, i); const double ui = uw_U(x, i);
+                for (int ax = 0; ax < 3; ax++) {
+                    const int zn = z + (ax == 0), yn = y + (ax == 1), xn = xx + (ax == 2);
+                    if (zn >= g->D || yn >= g->H || xn >= g->W) continue;
+                    const uint32_t j = ub_id(g, zn, yn, xn); if (V[j].k == UK_UNSET) continue;
+                    const uint32_t gb = uwr_gid(u, zn, yn, xn, j); if (ga == gb) continue;
+                    uwr_vote(u, th, ga, gb, (int32_t)lround(ui - uw_U(x, j)), uwr_w(u, V[i].bk < V[j].bk ? V[i].bk : V[j].bk, z, y, xx, zn, yn, xn));
+                }
+                /* evidence: votes between voxels farther apart (every other voxel per axis) */
+                if ((z | y | xx) & 1) continue;
+                const fit_fields *f = x->f; const size_t fi = ((size_t)z * f->H + y) * f->W + xx;
+                for (int ev = 0; ev < 3; ev++) {
+                    const double wt = ev == 0 ? u->ww4 : ev == 1 ? u->wgeo : u->wcs; if (wt <= 0) continue;
+                    if (ev == 0 && !f->wd[3][fi]) continue;
+                    if (ev == 2 && !f->cs[fi]) continue;
+                    const int D = ev == 0 ? u->w4c : u->gd; if (D < 1) continue;
+                    for (int ax = 0; ax < 3; ax++) {
+                        const int zn = z + (ax == 0) * D, yn = y + (ax == 1) * D, xn = xx + (ax == 2) * D;
+                        if (zn >= g->D || yn >= g->H || xn >= g->W) continue;
+                        const uint32_t j = ub_id(g, zn, yn, xn); if (V[j].k == UK_UNSET) continue;
+                        const uint32_t gb = uwr_gid(u, zn, yn, xn, j); if (ga == gb) continue;
+                        double th0, th1; const double Wm0 = uwr_Wm(x, z, y, xx, &th0), Wm1 = uwr_Wm(x, zn, yn, xn, &th1);
+                        const double dth = wrap_pi(th1 - th0) / (2 * M_PI), dWc = (uw_U(x, j) - ui) - x->m->dir * dth;   /* the flooded W difference */
+                        double want;   /* the evidence's W(j) - W(i) */
+                        if (ev == 0) {   /* mod 4: the candidate nearest the model's difference */
+                            const double dl = f->wd[ax][fi] / 64.0, dm = Wm1 - Wm0; want = dl + 4 * round((dm - dl) / 4);
+                        } else if (ev == 1) want = Wm1 - Wm0;
+                        else {   /* turns along the model's gradient from the CT spacing (mean of the two ends' spacings) */
+                            const size_t fj = ((size_t)zn * f->H + yn) * f->W + xn; if (!f->cs[fj]) continue;
+                            const double spn = 0.5 * (f->cs[fi] + f->cs[fj]) * f->h / 8.0;   /* native voxels per turn */
+                            double gv[3]; const double e = f->h, pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
+                            gv[0] = fit_W(x->m, pz + e, py, px) - fit_W(x->m, pz - e, py, px); gv[1] = fit_W(x->m, pz, py + e, px) - fit_W(x->m, pz, py - e, px);
+                            gv[2] = fit_W(x->m, pz, py, px + e) - fit_W(x->m, pz, py, px - e);
+                            const double gl = sqrt(gv[0] * gv[0] + gv[1] * gv[1] + gv[2] * gv[2]); if (gl < 1e-9) continue;
+                            want = gv[ax] / gl * D * f->h / spn;
+                        }
+                        const double r = want - dWc, rr = round(r);
+                        if (fabs(r - rr) > 0.3) continue;   /* the evidence disagrees with the phase by a fraction: no integer vote */
+                        const int bq = V[i].bk < V[j].bk ? V[i].bk : V[j].bk;
+                        const double wv = wt * bq * (ev == 0 ? f->wd[3][fi] / 255.0 : 1.0);
+                        if (wv >= 1) uwr_vote(u, th, ga, gb, (int32_t)rr, (int64_t)lround(wv));
+                    }
+                }
+            }
+            /* merge this tile's votes in place (few distinct pairs per tile) */
+            const size_t m = l1_votes_merge(u->v[th] + n0, u->nv[th] - n0); u->nv[th] = n0 + m;
+        }
+    }
+    free(q);
+}
+static void uwr_badness(void *a, int z0, int z1, int th) {   /* the stretched / compressed voxels (sst > 0) */
+    uwr_ctx *u = a; uw_ctx *x = u->x; const uw_geo *g = &x->g;
+    for (int z = z0; z < z1; z++) for (int y = 0; y < g->H; y++) for (int xx = 0; xx < g->W; xx++) {
+        const uint32_t i = ub_id(g, z, y, xx); if (x->V[i].k == UK_UNSET) continue;
+        const double l = log2(fmax(uwr_stretch(x->f, z, y, xx, u->sr), 1e-3)); u->lst[i] = (float)l; u->bad[i] = exp(-l * l / (2 * u->sst * u->sst)) < 0.5;
+    }
+}
+static void uwr_apply(void *a, int z0, int z1, int th) {   /* the shifts, and the seams (disagreeing neighbour pairs) */
+    uwr_ctx *u = a; uw_ctx *x = u->x; const uw_geo *g = &x->g; uw_vox *V = x->V; size_t ns = 0;
+    for (int z = z0; z < z1; z++) for (int y = 0; y < g->H; y++) for (int xx = 0; xx < g->W; xx++) {
+        const uint32_t i = ub_id(g, z, y, xx); if (V[i].k == UK_UNSET) continue;
+        if (u->shift) {
+            const int32_t k = V[i].k + u->shift[uwr_gid(u, z, y, xx, i)];
+            V[i].k = (int16_t)(k <= INT16_MIN ? INT16_MIN + 1 : k > INT16_MAX ? INT16_MAX : k);
+        }
+    }
+    /* the seams (shift null: a separate pass, as the neighbours of other z ranges must be shifted first) */
+    if (!u->shift) for (int z = z0; z < z1; z++) for (int y = 0; y < g->H; y++) for (int xx = 0; xx < g->W; xx++) {
+        const uint32_t i = ub_id(g, z, y, xx); if (V[i].k == UK_UNSET) continue;
+        const double ui = uw_U(x, i); int cnt = 0;
+        const int ok[6] = {z > 0, z + 1 < g->D, y > 0, y + 1 < g->H, xx > 0, xx + 1 < g->W};
+        const int nb3[6][3] = {{z - 1, y, xx}, {z + 1, y, xx}, {z, y - 1, xx}, {z, y + 1, xx}, {z, y, xx - 1}, {z, y, xx + 1}};
+        for (int k = 0; k < 6; k++) if (ok[k]) { const uint32_t j = ub_id(g, nb3[k][0], nb3[k][1], nb3[k][2]); if (V[j].k != UK_UNSET && fabs(ui - uw_U(x, j)) >= 0.5) cnt++; }
+        ns += cnt;
+        if (u->seam) u->seam[((size_t)z * g->H + y) * g->W + xx] |= (uint8_t)(cnt << u->seam_shift | (u->bad && u->bad[i] && !u->seam_shift ? 8 : 0));
+    }
+    u->nseam[th] = ns;
+}
+static void uw_repair(uw_ctx *x, size_t nr, const fit_cfg *c) {
+    const uw_geo *g = &x->g; const double t0 = nn_wall_seconds(); const fit_fields *f = x->f;
+    const int T = c->uw_repair;
+    uwr_ctx u = {.x = x, .c = c, .T = T, .ntz = (g->D + T - 1) / T, .nty = (g->H + T - 1) / T, .ntx = (g->W + T - 1) / T};
+    const int nt = u.ntz * u.nty * u.ntx;
+    u.comp = calloc(nr, sizeof *u.comp); u.npc = calloc(nt, sizeof *u.npc); u.tbase = calloc(nt + 1, sizeof *u.tbase);
+    if (!u.comp || !u.npc || !u.tbase) { fprintf(stderr, "fit: out of memory for the slip repair (skipped)\n"); free(u.comp); free(u.npc); free(u.tbase); return; }
+    const size_t nf = (size_t)g->D * g->H * g->W;
+    if (c->uw_rep_dump) u.seam = calloc(nf, 1);
+    u.qpow = c->uw_rep_qpow > 0 ? c->uw_rep_qpow : 1; u.sst = c->uw_rep_stretch;
+    u.sr = c->uw_rep_sr;
+    if (u.sst > 0) {
+        u.bad = calloc(nr, 1); u.lst = calloc(nr, sizeof *u.lst);
+        if (!u.bad || !u.lst) { free(u.bad); free(u.lst); u.bad = nullptr; u.lst = nullptr; u.sst = 0; fprintf(stderr, "fit: no memory for the repair's stretch (off)\n"); }
+        else fit_zpar(g->D, x->nt, uwr_badness, &u);
+    }
+    fit_zpar(g->D, x->nt, uwr_apply, &u);   /* the flood's seams (shift null: count only) */
+    size_t seam0 = 0; for (int t = 0; t < x->nt; t++) seam0 += u.nseam[t];
+    u.pass = 0; fit_zpar(x->nt, x->nt, uwr_tiles, &u);
+    uint64_t np = 0; for (int t = 0; t < nt; t++) { u.tbase[t] = (uint32_t)np; np += u.npc[t]; }
+    if (np >= UINT32_MAX) { fprintf(stderr, "fit: too many repair pieces (skipped)\n"); free(u.comp); free(u.npc); free(u.tbase); free(u.seam); free(u.bad); free(u.lst); return; }
+    u.gd = c->uw_rep_gd > 0 ? c->uw_rep_gd : 8; u.wgeo = c->uw_rep_geo; u.wcs = f->cs ? c->uw_rep_cs : 0;
+    u.ww4 = f->wd[0] && f->wd[1] && f->wd[2] && f->wd[3] && f->w4_d > 0 ? c->uw_rep_w4 : 0; u.w4c = (int)lround(f->w4_d / f->h);
+    u.pass = 1; atomic_store(&u.next, 0); fit_zpar(x->nt, x->nt, uwr_tiles, &u);
+    size_t nv = 0; for (int t = 0; t < x->nt; t++) nv += u.nv[t];
+    l1_vote *v = malloc((nv ? nv : 1) * sizeof *v); nv = 0;
+    for (int t = 0; t < x->nt; t++) { if (u.nv[t]) memcpy(v + nv, u.v[t], u.nv[t] * sizeof *v); nv += u.nv[t]; free(u.v[t]); }
+    nv = l1_votes_merge(v, nv);
+    const double t1 = nn_wall_seconds();
+    int32_t *s = calloc(np ? np : 1, sizeof *s); l1_stats st = {0};
+    if (l1_solve((uint32_t)np, v, nv, s, 256, &st)) fprintf(stderr, "fit: out of memory for the slip repair's solve (skipped)\n");
+    const double t2 = nn_wall_seconds();
+    size_t pm = 0, vm = 0;
+    for (uint64_t k = 0; k < np; k++) pm += s[k] != 0;
+    if (pm) {   /* the shifts (by z range), then the seams again */
+        u.shift = s; fit_zpar(g->D, x->nt, uwr_apply, &u); u.shift = nullptr;
+    }
+    if (u.seam) { u.seam_shift = 4; }
+    fit_zpar(g->D, x->nt, uwr_apply, &u);
+    size_t seam1 = 0; for (int t = 0; t < x->nt; t++) seam1 += u.nseam[t];
+    if (c->uw_rep_dump) {   /* PREFIX.shift.raw, PREFIX.seam.raw */
+        uint8_t *sh = calloc(nf, 1);
+        for (int z = 0; z < g->D; z++) for (int y = 0; y < g->H; y++) for (int xx = 0; xx < g->W; xx++) {
+            const uint32_t i = ub_id(g, z, y, xx); if (!u.comp[i]) continue;
+            const int32_t d = s[uwr_gid(&u, z, y, xx, i)]; sh[((size_t)z * g->H + y) * g->W + xx] = (uint8_t)(128 + (d < -127 ? -127 : d > 127 ? 127 : d));
+        }
+        char p[1200]; int bad = 0;
+        snprintf(p, sizeof p, "%s.shift.raw", c->uw_rep_dump); FILE *fo = fopen(p, "wb"); bad |= !fo || fwrite(sh, 1, nf, fo) != nf; if (fo) bad |= fclose(fo) != 0;
+        snprintf(p, sizeof p, "%s.seam.raw", c->uw_rep_dump); fo = fopen(p, "wb"); bad |= !fo || fwrite(u.seam, 1, nf, fo) != nf; if (fo) bad |= fclose(fo) != 0;
+        if (bad) fprintf(stderr, "fit: cannot write the repair dump %s.*\n", c->uw_rep_dump);
+        free(sh);
+    }
+    for (int z = 0; z < g->D; z++) for (int y = 0; y < g->H; y++) for (int xx = 0; xx < g->W; xx++) { const uint32_t i = ub_id(g, z, y, xx); if (u.comp[i] && s[uwr_gid(&u, z, y, xx, i)]) vm++; }
+    if (c->verbose) fprintf(stderr, "fit: slip repair (tiles %d^3): %llu pieces, %zu edges (%zu votes), L1 disagreement %lld -> %lld in %d moves (%d max flows, %.1fs); "
+                            "%zu pieces / %zu voxels shifted; seam pairs %zu -> %zu; pieces + votes %.1fs\n",
+                            T, (unsigned long long)np, st.nedge, nv, (long long)st.e0, (long long)st.e1, st.moves, st.iters, t2 - t1, pm, vm, seam0 / 2, seam1 / 2, t1 - t0);
+    free(v); free(s); free(u.comp); free(u.npc); free(u.tbase); free(u.seam); free(u.bad); free(u.lst);
+}
+
 static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_conf, const fit_cfg *c) {
     const size_t n = (size_t)f->D * f->H * f->W; const int na = (int)(f->D * f->h) + 1;
     const uw_geo g = {f->D, f->H, f->W, (f->H + UB_M) / UB_S, (f->W + UB_M) / UB_S};
@@ -662,6 +903,7 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
         }
     }
     uq_free(&q);
+    if (c->uw_repair > 0 && reached) uw_repair(&x, nr, c);
     const double t2 = nn_wall_seconds();
     /* per lattice node: mean of (U_unwrapped - U_model) over the reached voxels nearest to it */
     const size_t nl = (size_t)m->lz * m->ly * m->lx;

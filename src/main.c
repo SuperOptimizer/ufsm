@@ -559,7 +559,11 @@ static int cmd_band(int argc, char **argv) {
    CT (fields with ct / cs planes, ufsm ct-fields / predict --fit-ct): --w-ct W papyrus / void parity c m (1 - cos 2 pi (W - --ct-phi)) weighted
    (1 - phase confidence)^--ct-pow (>= --ct-floor), the parity m the cell's CT contrast to its +---ct-radius-um neighbourhood; with it
    --ct-flood 1 (default) lets low-confidence voxels join the voxel unwrapping with the CT's own phase. --w-cspacing W: the density term
-   against the CT sheet spacing where the network's is unknown or differs by more than --cs-tol in log. */
+   against the CT sheet spacing where the network's is unknown or differs by more than --cs-tol in log.
+   Local slip repair (fit_cfg uw_repair, src/l1pot.h): --uw-repair T splits the flooded voxels of each T^3 tile into pieces whose integers
+   agree and re-solves their integer shifts as the least-cost (weighted L1) assignment of all their votes; evidence --uw-rep-w4 W (the
+   winding mod 4 planes), --uw-rep-geo W (the gradient stages' W over --uw-rep-gd field voxels), --uw-rep-cs W (the CT sheet spacing);
+   --uw-rep-dump PREFIX writes the per-voxel shifts and seams. */
 /* U (the unwrapped radius in turns; sheets where U - dir theta / 2 pi is an integer) for the scorer: fill(ctx, og, n3, step, codes, U)
    writes U at og + i step (native voxels relative to the box origin) over the n3 grid, NaN where unknown (it may skip the points
    whose code is not 1..252); returns nonzero on failure */
@@ -666,6 +670,13 @@ static int cmd_fit(int argc, char **argv) {
         fprintf(stderr, "fit: --phase-robust, --bend and the weights must be >= 0, --conf-pow and --pgrad-delta > 0, --unwrap-voxels -1, 0 or 1\n"); return 2;
     }
     c.uw_split = atof(opt(argc, argv, "--uw-split", "0")); c.uw_tile = atoi(opt(argc, argv, "--uw-tile", "256")); c.uw_pdv = atof(opt(argc, argv, "--uw-pdv", "0")); c.uw_min_conf = atof(opt(argc, argv, "--uw-min-conf", "0.3"));
+    /* local slip repair (fit_cfg uw_repair): pieces of uw_repair^3 tiles, least-cost integer shifts from their votes and the evidence */
+    c.uw_repair = atoi(opt(argc, argv, "--uw-repair", "0")); c.uw_rep_w4 = (float)atof(opt(argc, argv, "--uw-rep-w4", "0"));
+    c.uw_rep_geo = (float)atof(opt(argc, argv, "--uw-rep-geo", "0")); c.uw_rep_gd = atoi(opt(argc, argv, "--uw-rep-gd", "8"));
+    c.uw_rep_cs = (float)atof(opt(argc, argv, "--uw-rep-cs", "0")); c.uw_rep_dump = opt(argc, argv, "--uw-rep-dump", nullptr);
+    c.uw_rep_qpow = (float)atof(opt(argc, argv, "--uw-rep-qpow", "1")); c.uw_rep_stretch = (float)atof(opt(argc, argv, "--uw-rep-stretch", "0"));
+    c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1"));
+    if (c.uw_repair < 0 || !(c.uw_rep_w4 >= 0) || !(c.uw_rep_geo >= 0) || !(c.uw_rep_cs >= 0) || c.uw_rep_gd < 1 || !(c.uw_rep_qpow > 0) || !(c.uw_rep_stretch >= 0) || c.uw_rep_sr < 0 || c.uw_rep_sr > 4) { fprintf(stderr, "fit: --uw-repair >= 0, --uw-rep-* weights >= 0, --uw-rep-gd >= 1\n"); return 2; }
     c.core = (float)atof(opt(argc, argv, "--core", "3"));   /* no data terms within core x pitch of the axis */
     c.analytic = atoi(opt(argc, argv, "--analytic", "1")); c.packed_um = atof(opt(argc, argv, "--packed-um", "0")); c.batch = atoi(opt(argc, argv, "--batch", "2000000")); c.knot_dz = atoi(opt(argc, argv, "--knot-dz", "1024")); c.phase_stage = atoi(opt(argc, argv, "--phase-stage", "4"));
     if (*opt(argc, argv, "--lattice", "")) { c.nstage = 0; char *t = strdup(opt(argc, argv, "--lattice", "")); for (char *q = strtok(t, ","); q && c.nstage < 8; q = strtok(nullptr, ",")) c.lattice[c.nstage++] = atoi(q); free(t); }
@@ -725,10 +736,10 @@ static int cmd_fit(int argc, char **argv) {
         if (!cf) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
         fprintf(cf, "{\"version\":1,\"w_phase\":%.9g,\"w_normal\":%.9g,\"w_density\":%.9g,\"w_smooth\":%.9g,\"w_pgrad\":%.9g,\"pgrad_delta\":%.9g,\"w_wind4\":%.9g,\"w_recto\":%.9g,"
                     "\"w_ct\":%.9g,\"ct_pow\":%.9g,\"ct_phi\":%.9g,\"ct_floor\":%.9g,\"ct_radius_um\":%.9g,\"ct_flood\":%d,\"w_cspacing\":%.9g,\"cs_tol\":%.9g,"
-                    "\"phase_robust_turns\":%.9g,\"conf_pow\":%.9g,\"bend\":%.9g,\"unwrap_voxels\":%d,\"uw_min_conf\":%.9g,\"phase_stage\":%d,\"slab\":%d,\"cpu\":%d,\"native_um\":%.9g,\"lattice\":[",
+                    "\"phase_robust_turns\":%.9g,\"conf_pow\":%.9g,\"bend\":%.9g,\"unwrap_voxels\":%d,\"uw_min_conf\":%.9g,\"uw_repair\":%d,\"uw_rep_w4\":%.9g,\"uw_rep_geo\":%.9g,\"uw_rep_gd\":%d,\"uw_rep_cs\":%.9g,\"uw_rep_qpow\":%.9g,\"uw_rep_stretch\":%.9g,\"uw_rep_sr\":%d,\"phase_stage\":%d,\"slab\":%d,\"cpu\":%d,\"native_um\":%.9g,\"lattice\":[",
                 c.w_phase, c.w_normal, c.w_density, c.w_smooth, c.w_pgrad, c.pgrad_delta, c.w_wind4, c.w_recto,
                 c.w_ct, c.ct_pow, c.ct_phi, c.ct_floor, c.ct_radius_um, c.ct_flood, c.w_cspacing, c.cs_tol, c.phase_robust, c.conf_pow, c.bend, c.unwrap_voxels, c.uw_min_conf,
-                c.phase_stage, slab, c.cpu, c.um);
+                c.uw_repair, c.uw_rep_w4, c.uw_rep_geo, c.uw_rep_gd, c.uw_rep_cs, c.uw_rep_qpow, c.uw_rep_stretch, c.uw_rep_sr, c.phase_stage, slab, c.cpu, c.um);
         for (int k = 0; k < c.nstage; k++) fprintf(cf, "%s%d", k ? "," : "", c.lattice[k]);
         fprintf(cf, "]}\n"); if (fclose(cf)) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
     }
