@@ -19,6 +19,7 @@
 #include "tiff.h"
 #include <dirent.h>
 #include <errno.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -58,7 +59,7 @@ static int usage(void) {
         "  ufsm train  <sources.json> --out DIR [--P 512 --B 1 --steps N --gpus 0 ...]   train the recto model\n"
         "  ufsm predict <ckpt> <root> <ct-group> <out-dir> --um U [--box ...]      sliding-window inference -> volcomp pyramid\n"
         "  ufsm eval <pred-root> <pred-group> <label-root> <label-group> --um U [--box ...]   precision/recall/dice\n"
-        "  ufsm sample  <sources.json> [--P 128] [--B 2] [--n 4] [--seed S] [--workers W] [--out DIR] [--noaug]\n"
+        "  ufsm sample  <sources.json> [--P 128] [--B 2] [--n 4] [--seed S] [--workers W] [--out DIR] [--noaug] [--bench N (loader throughput, train-like formats)]\n"
         "  ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1]   warm the CT chunk cache for the labelled cells\n"
         "  ufsm phase-raster <codes-root> <key> <out-dir> [--box ...]          band phase precomputed for the sampler\n"
         "  ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase|votes  one array halved per axis (labels, phase, side votes)\n"
@@ -2326,12 +2327,49 @@ static int cmd_sample(int argc, char **argv) {
     { const char *lv = opt(argc, argv, "--levels", nullptr); if (lv) { char *t = strdup(lv); int l = 0; memset(cfg.level_p, 0, sizeof cfg.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) cfg.level_p[l++] = atof(q); free(t); } }
     cfg.side = atoi(opt(argc, argv, "--side", "0")); cfg.wind4 = atoi(opt(argc, argv, "--wind4", "0"));
     const int dump = atoi(opt(argc, argv, "--dump", "0"));
+    /* --bench N: the trainer's batch formats for a CPU-only loader throughput test (no images; with UFSM_SAMPLER_NOPIN=1 no CUDA at all):
+       N batches after a warm-up of --warm W, samples/s, cpu time and peak RSS. Train-like knobs: --Pz, --zfix 1, --x16 1 (fp16 batches),
+       --gpu-input 1, --pack 1, --slots, --det, --min-phase, --wind4-tile / -min / -step, --symmetry-p, --axis-jitter */
+    const int bench = atoi(opt(argc, argv, "--bench", "0"));
+    if (bench > 0) {
+        cfg.Pz = atoi(opt(argc, argv, "--Pz", "0")); if (cfg.Pz == cfg.P) cfg.Pz = 0;
+        if (atoi(opt(argc, argv, "--zfix", "0"))) cfg.augment = 3;
+        if (sample_aug_preset(&cfg, "none")) return 2;
+        cfg.xfmt = atoi(opt(argc, argv, "--x16", "1")); cfg.gpu_input = atoi(opt(argc, argv, "--gpu-input", "1")); cfg.pack_tm = atoi(opt(argc, argv, "--pack", "1"));
+        cfg.nbuf = atoi(opt(argc, argv, "--slots", "0")) > 0 ? atoi(opt(argc, argv, "--slots", "0")) : cfg.nworkers + 2;
+        cfg.deterministic = atoi(opt(argc, argv, "--det", "1")); cfg.pmask = cfg.side == 2;
+        cfg.min_phase = atof(opt(argc, argv, "--min-phase", cfg.wind4 ? "0.001" : "0"));
+        cfg.wind4_step = atoi(opt(argc, argv, "--wind4-step", "80")); cfg.wind4_min = atoi(opt(argc, argv, "--wind4-min", "512"));
+        { const int t = atoi(opt(argc, argv, "--wind4-tile", "64")); cfg.wind4_tile = t > 0 ? t : -1; }
+        cfg.symmetry_p = (float)atof(opt(argc, argv, "--symmetry-p", "1")); cfg.axis_jitter = (float)atof(opt(argc, argv, "--axis-jitter", "0"));
+        if (cfg.gpu_input && !sample_gpu_input_ok(&cfg)) { fprintf(stderr, "sample --bench: --gpu-input not available with these settings\n"); return 2; }
+    }
     sources *S = sources_load(path);
     if (!S) return 1;
     fprintf(stderr, "%d sources\n", S->n);
     double t0 = now();
     sampler *sp = sampler_start(S, &cfg);
     if (!sp) return 1;
+    if (bench > 0) {
+        const int warm = atoi(opt(argc, argv, "--warm", "4"));
+        struct rusage ru0, ru1; double ta = 0; size_t nv = (size_t)(cfg.Pz ? cfg.Pz : cfg.P) * cfg.P * cfg.P * cfg.B;
+        for (int bi = 0; bi < warm + bench; bi++) {
+            if (bi == warm) { ta = now(); getrusage(RUSAGE_SELF, &ru0); }
+            batch *b = sampler_next(sp);
+            if (!b) { fprintf(stderr, "sampler stopped\n"); return 1; }
+            sampler_release(sp, b);
+        }
+        const double dt = now() - ta; getrusage(RUSAGE_SELF, &ru1);
+        const double cpu = (ru1.ru_utime.tv_sec - ru0.ru_utime.tv_sec) + (ru1.ru_stime.tv_sec - ru0.ru_stime.tv_sec) + 1e-6 * ((ru1.ru_utime.tv_usec - ru0.ru_utime.tv_usec) + (ru1.ru_stime.tv_usec - ru0.ru_stime.tv_usec));
+        uint64_t prod, rej; sampler_stats(sp, &prod, &rej);
+        fprintf(stderr, "bench: %d batches of %d x %dx%dx%d in %.1f s: %.3f samples/s (%.0f Mvox/s), %.1f cpu s per sample, %d workers; "
+                "%llu produced, %llu rejected; peak RSS %.2f GB; start %.1f s\n", bench, cfg.B, cfg.Pz ? cfg.Pz : cfg.P, cfg.P, cfg.P, dt,
+                bench * cfg.B / dt, bench * (double)nv / dt / 1e6, cpu / (bench * cfg.B), cfg.nworkers, (unsigned long long)prod, (unsigned long long)rej,
+                ru1.ru_maxrss / 1e6, ta - t0);
+        sampler_prof_print(sp);
+        sampler_stop(sp); sources_free(S);
+        return 0;
+    }
     int P = cfg.P;
     size_t p3 = (size_t)P * P * P;
     /* montage: one row per patch: CT | recto | sheet | mask | radial-y | radial-x (mid z slice) */

@@ -161,6 +161,7 @@ static int g_sheet_variant=2;
 /* --split z: both GPUs work on the same window, each on its z half plus g_h0 halo planes (depth g_Dl); the mask is zeroed on
    the halo planes (from a pinned zero buffer) so each voxel counts once */
 static int g_Dl, g_h0; static uint8_t *g_zeros;
+static int g_bench_same;   /* UFSM_BENCH_SAME */
 static int g_Pz;   /* window depth: --Pz (a Pz x P x P slab), else P */
 
 static int g_xfmt = 0, g_g16 = 0;   /* input batches uploaded as 16-bit (1 fp16, 2 bf16); loss gradient written as 16-bit */
@@ -1079,6 +1080,7 @@ int cmd_train(int argc, char **argv) {
     float srste = (float)atof(opt(argc, argv, "--srste", "2e-4"));
     nn_set_pos_weight((float)atof(opt(argc, argv, "--pos-weight", "1")));   /* BCE weight of surface voxels */
     int overfit = atoi(opt(argc, argv, "--overfit", "0"));   /* diagnostic: train on the first batch forever */
+    g_bench_same = ufsm_env_on("UFSM_BENCH_SAME");   /* benchmark: every step on the first batch (step time without the loader or the upload) */
     int noaug = atoi(opt(argc, argv, "--noaug", "0"));       /* diagnostic: no augmentation */
     /* --fp4 1: packed fp4 activations, fp4 stride-1 compute, fp8 weight gradients and stochastic rounding.
        --fp4 2: fp4 stride-1 weight gradients as well. Small inputs and stride-2 operations have FP8 / FP32
@@ -1551,6 +1553,9 @@ int cmd_train(int argc, char **argv) {
             size_t fmin = (size_t)-1;
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); size_t f = nn_mem_free(); if (f < fmin) fmin = f; }
             nn_init(G[0].dev);
+            if (getenv("UFSM_MEM_FREE_GB") && atof(getenv("UFSM_MEM_FREE_GB")) > 0) {   /* plan for another card's free memory (UFSM_MEM_DRY sizing for a busy GPU) */
+                fmin = (size_t)(atof(getenv("UFSM_MEM_FREE_GB")) * 1e9); fprintf(stderr, "memory: UFSM_MEM_FREE_GB: planning for %.2f GB free\n", fmin / 1e9);
+            }
             const shape5 xs = g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P};   /* split: this GPU's slab of the window */
             const size_t p3 = p3l;
             int pick = -1, pick_hoff = 1, minc = -1, min_hoff = 1; size_t need = 0, pick_off = 0, pick_need = 0, min_need = (size_t)-1;
@@ -2094,7 +2099,7 @@ int cmd_train(int argc, char **argv) {
             diag_nonfinite(d, "parameter gradients", unet_grad_ptr(d->u), unet_nparams(d->u), 0);
             nn_event_record(d->ev_done[d->cur], 0);
             nn_event_sync(d->ev_up[d->cur]);                 /* host buffer of this batch is free again */
-            if (overfit) continue;                           /* keep computing on the same device buffer */
+            if (overfit || g_bench_same) continue;           /* keep computing on the same device buffer (UFSM_BENCH_SAME: GPU step time without the loader) */
             sampler_release(sp, d->pending);
             /* prefetch the next batch into the other buffer while this step computes; several GPUs: after every GPU's step is
                launched (waiting here for GPU 0's next batch held GPU 1's launch back whenever the sampler was behind) */
