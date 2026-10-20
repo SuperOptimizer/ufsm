@@ -274,7 +274,7 @@ static void hann2(float *k, int T, float floor_) {   /* torch.hann_window(T, per
 static const char ell7[7][8] = {"0001000", "0111110", "1111111", "1111111", "1111111", "0111110", "0001000"};
 
 typedef struct {
-    int kind; ie_net *net; const ie_spec *sp; int stride, batch, nth, reverse; size_t ct_mem; double px_um;
+    int kind; ie_net *net; const ie_spec *sp; int stride, batch, nth, reverse, blend_norm; size_t ct_mem; double px_um;
     ctlev lev[6]; int nlev; double lev_um[6];
 } irun;
 
@@ -301,7 +301,7 @@ static void *gpu_worker(void *a) {
             const int ph = G->ty[k] + T <= Hm ? T : Hm - G->ty[k], pw = G->tx[k] + T <= Wm ? T : Wm - G->tx[k];
             for (int y = 0; y < ph; y++) for (int x = 0; x < pw; x++) {
                 const size_t g = (size_t)(G->ty[k] + y) * Wm + G->tx[k] + x; const float w = G->win[y * T + x];
-                if (X->kind == IE_V8IN) { G->num[g] += o[y * T + x] * w; G->den[g] += 1; }
+                if (X->kind == IE_V8IN) { G->num[g] += o[y * T + x] * w; G->den[g] += X->blend_norm ? w : 1.f; }
                 else if (X->kind == IE_READER3) { G->num[g] += o[y * T + x] * w; G->den[g] += w; }
                 else {   /* Hecate: probability x support (column has data) x window; den is the renderer's */
                     int sup = 0; for (int i = 0; i < D && !sup; i++) sup = tl[((size_t)i * T + y) * T + x] != 0;
@@ -495,6 +495,7 @@ int cmd_ink_ext(int argc, char **argv) {
     const char *outdir = iopt(argc, argv, "--out", nullptr), *cache = iopt(argc, argv, "--cache", nullptr), *suffix = iopt(argc, argv, "--suffix", "");
     if (ci < 0 || !outdir) { fprintf(stderr, "ink-ext: need --ct ROOT KEY and --out DIR\n"); return 2; }
     irun X = {0}; X.kind = kind; X.net = net; X.sp = &ie_specs[kind]; X.stride = atoi(iopt(argc, argv, "--stride", "0")); X.reverse = iflag(argc, argv, "--reverse");
+    X.blend_norm = !strcmp(iopt(argc, argv, "--blend", "official"), "norm");   /* v8in: sum(p g) / sum(g) instead of inference.py sum(p g) / count (its stride grid) */
     X.nth = atoi(iopt(argc, argv, "--threads", "16")); X.px_um = atof(iopt(argc, argv, "--px-um", "0")); if (!(X.px_um > 0)) X.px_um = X.sp->px_um;
     X.ct_mem = (size_t)(atof(iopt(argc, argv, "--ct-mem", "3")) * (1 << 30));
     X.batch = atoi(iopt(argc, argv, "--batch", "0"));

@@ -443,7 +443,7 @@ int cmd_phase_score(int argc, char **argv) {
 int cmd_ink_compare(int argc, char **argv) {
     const int ci = rarg(argc, argv, "--ct");
     if (argc < 5 || ci < 0 || ci + 1 >= argc || rarg(argc, argv, "--ink") < 0) {
-        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h] [--threads 16]\n"); return 2;
+        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h] [--stretch] [--threads 16]\n"); return 2;
     }
     const double px = atof(ropt(argc, argv, "--px-um", "2.4")), rsu = atof(ropt(argc, argv, "--rs-um", "25")), rlu = atof(ropt(argc, argv, "--rl-um", "500"));
     const int nthreads = atoi(ropt(argc, argv, "--threads", "16"));
@@ -460,7 +460,13 @@ int cmd_ink_compare(int argc, char **argv) {
         if (!im || w != W || h != H) { fprintf(stderr, "ink-compare: cannot read %s as a %d x %d render\n", eq + 1, W, H); free(im); return 1; }
         lab[n] = strndup(argv[a + 1], (size_t)(eq - argv[a + 1])); isct[n] = 0; img[n++] = im;
     }
-    const char *cr = ropt(argc, argv, "--crop", nullptr);
+    const char *cr = ropt(argc, argv, "--crop", nullptr), *cf = ropt(argc, argv, "--crop-frac", nullptr);
+    char crb[96];
+    if (!cr && cf) {   /* --crop-frac fx,fy,w,h: the crop's corner at fractions of the render */
+        double fx, fy; int cw0, ch0;
+        if (sscanf(cf, "%lf,%lf,%d,%d", &fx, &fy, &cw0, &ch0) != 4) { fprintf(stderr, "ink-compare: --crop-frac fx,fy,w,h\n"); return 2; }
+        snprintf(crb, sizeof crb, "%d,%d,%d,%d", (int)(fx * W), (int)(fy * H), cw0, ch0); cr = crb;
+    }
     if (cr) {   /* --crop x,y,w,h: every render cut to the rectangle (clipped to the image) before the statistics and the panels */
         int cx, cy, cw, ch;
         if (sscanf(cr, "%d,%d,%d,%d", &cx, &cy, &cw, &ch) != 4 || cx < 0 || cy < 0 || cw < 2 || ch < 2 || cx >= W || cy >= H) { fprintf(stderr, "ink-compare: --crop x,y,w,h inside the %d x %d render\n", W, H); return 2; }
@@ -483,6 +489,18 @@ int cmd_ink_compare(int argc, char **argv) {
         printf("ink %s: n %lld mean %.4f frac50 %.4f p50 %.3f p95 %.3f p99 %.3f band %.4f\n", lab[k], st.n, st.mean, st.frac50, st.p50, st.p95, st.p99, st.band);
     }
     for (int a = 1; a < n; a++) for (int b = a + 1; b < n; b++) printf("corr %s %s: %.4f\n", lab[a], lab[b], ink_corr(img[a], img[b], mask, np));
+    if (rflag(argc, argv, "--stretch")) {   /* display only: each ink stretched from its p1 to its p99 over the CT > 0 pixels */
+        for (int k = 1; k < n; k++) {
+            uint64_t h[256] = {0}, m = 0; for (size_t i = 0; i < np; i++) if (mask[i]) { h[img[k][i]]++; m++; }
+            int lo = 0, hi = 255; uint64_t c = 0; int gl = 0;
+            for (int v = 0; v < 256; v++) { c += h[v]; if (!gl && c >= m / 100) { lo = v; gl = 1; } if (c >= m - m / 100) { hi = v; break; } }
+            if (hi <= lo) hi = lo + 1;
+            uint8_t *s = malloc(np); if (!s) return 1;
+            for (size_t i = 0; i < np; i++) { const int v = (img[k][i] - lo) * 255 / (hi - lo); s[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
+            fprintf(stderr, "ink-compare: %s stretched %d .. %d\n", lab[k], lo, hi);
+            free((void *)img[k]); img[k] = s;
+        }
+    }
     if (overlay_red_skip(ct, np)) { fprintf(stderr, "ink-compare: under 5%% of the CT pixels have data: no %s\n", argv[2]); rc = 3; }
     else {
         int ow, oh; uint8_t *rgb = ink_panels_half(img, isct, n, W, H, lab, &ow, &oh, nthreads);
