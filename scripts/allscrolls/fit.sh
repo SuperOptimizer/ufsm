@@ -171,7 +171,7 @@ for d in $S/boxes/*/kept; do b=$(basename $(dirname $d)); [ -d $d/tifxyz ] || co
   done
 done
 if [ -d $S/sheets ]; then for w in $(ls $S/sheets); do [ -e $S/sheets/$w/meta.json ] || continue; a=$(jq -r '.area_cm2 // 0' $S/sheets/$w/meta.json)
-  mkdir -p $S/surf/one; ln -sfn $S/sheets/$w $S/surf/one/$w
+  mkdir -p $S/surf/one; ln -sfn $S/sheets/$w $S/surf/one/w_$w   # (surf-stats reads the w* entries)
   op=$(C $U surf-stats $S/surf/one --fields $F "${CTA[@]}" 2> /dev/null | grep -oE 'on papyrus \(max CT[^)]*\) [0-9.]+' | awk '{print $NF}')
   rm -rf $S/surf/one; mkdir -p $S/surf/stitched; cp -r $S/sheets/$w $S/surf/stitched/
   printf 'stitched/%s\tstitched\t%s\t%s\n' $w $a ${op:-na} >> $S/surf/list.tsv; done; fi
