@@ -6,6 +6,7 @@
    Vertex coordinates are in the wraps' voxels (meta.json voxel_size_um); point p there is native ((p + 0.5) wum / um - 0.5) for
    fields of native voxel um (ufsm wraps --out-um maps voxel centres to voxel centres). */
 #include "fit.h"
+#include "stitch.h"
 #include "tiff.h"
 #include "tiffw.h"
 #include "zarr3.h"
@@ -631,5 +632,198 @@ int cmd_surf_stats(int argc, char **argv) {
     }
     free(eall); free(aall); free(cfall); free(srall); free(prof); free(pcount); free(names); sff_free(&F); fit_set_free(ms); if (cz) { ctc_free(&ctc); z3_close(cz); }
     free(wfield); free(FJ.fault); free(FJ.rs);
+    return 0;
+}
+
+/* ---- ufsm self-gate: the strict stretches of a box fit's wraps (fitter Phase 5, self-training labels) ----
+   Per vertex of each wrap (after surf-snap), a gate mask:
+     conf   the network phase confidence >= --min-conf and the phase residual |e| < --max-e turns (the wrap sits on the network's sheet)
+     pap    with --ct: on papyrus (max CT within +-ct-range um along the normal >= ct-level, as surf-stats)
+     fault  the model's |grad W| <= fault-ratio x the fields' sheet density at the vertex, and the spacing to the next wrap outward
+            0.5..1.5 x the fields' (no crammed or lost turn)
+     back   with --quality (stitch quality output of this box): the block's coherence q >= --min-q and q >= the reversed coherence
+     nb     every neighbour fit (--nb FITDIR, repeatable) whose box covers the vertex: W_nb - W within --nb-tol turns of the pair's
+            integer offset (the most common rounded difference over all covered vertices); a neighbour that agrees on less than
+            --nb-min of its overlap fails every vertex it covers
+     excl   inside an --exclude box (global native z0,y0,x0,z1,y1,x1; repeatable: held-out regions)
+     small  after --erode passes (a vertex with an invalid / gated 4-neighbour is dropped), 4-connected stretches under --min-area cm2
+   The passing vertices are written as tifxyz (the rest -1) with q.tif = the wrap's winding id (ufsm raster --value q.tif) into
+   <out-dir>/wNNN (wraps without any passing vertex are skipped). Prints the share of vertices and area failing each gate and the
+   gated (kept) share and area; per wrap with --per-wrap. */
+enum { SG_CONF = 1, SG_PAP = 2, SG_FAULT = 4, SG_BACK = 8, SG_NB = 16, SG_EXCL = 32, SG_SMALL = 64 };
+#define SG_MAXNB 16
+typedef struct {
+    const sf_wrap *s; const sf_fields *F; const fit_set *ms; const st_box *qb; int sign; double ratio, cmin, emax;
+    const float *e, *cf; uint8_t *gate; _Atomic int next;
+    int nnb; fit_set *const *nb; const int *nbk; long long *nbhist; double nbtol; const uint8_t *nbbad;   /* nbhist: per nb 64 bins of round(d) + 32 */
+    int nex; const double *ex; int pass;   /* pass 0: histograms only */
+} sg_job;
+static double sg_Wat(const fit_set *f, const double g[3], int *inside) {   /* W of a fit set at global native g; inside: in its box */
+    const fit_model *m = f->global; const double l[3] = {g[0] - m->origin[0], g[1] - m->origin[1], g[2] - m->origin[2]};
+    *inside = l[0] >= 0 && l[1] >= 0 && l[2] >= 0 && l[0] < m->D * m->h && l[1] < m->H * m->h && l[2] < m->W * m->h;
+    return *inside ? fit_set_W(f, l[0], l[1], l[2]) : 0;
+}
+static void *sg_rows(void *arg) {
+    sg_job *J = arg; const sf_wrap *s = J->s; const sf_fields *F = J->F; const fit_model *g0 = J->ms->global;
+    for (int r; (r = atomic_fetch_add(&J->next, 1)) < s->h;) for (int c = 0; c < s->w; c++) {
+        const size_t i = (size_t)r * s->w + c; if (s->Z[i] < 0) continue;
+        double q[3], N[3]; sf_native(s, F, i, q, nullptr, 1);
+        const double gp[3] = {q[0] + F->org[0], q[1] + F->org[1], q[2] + F->org[2]};
+        int in0; const double W0 = sg_Wat(J->ms, gp, &in0);
+        uint8_t gt = J->gate[i];
+        for (int k = 0; k < J->nnb; k++) {   /* the neighbours: the difference to the pair's offset */
+            int in; const double d = sg_Wat(J->nb[k], gp, &in) - W0; if (!in || !in0) continue;
+            if (J->pass == 0) { const long b = lround(d) + 32; if (b >= 0 && b < 64) __atomic_fetch_add(&J->nbhist[k * 64 + b], 1, __ATOMIC_RELAXED); continue; }
+            if (J->nbbad[k] || fabs(d - J->nbk[k]) >= J->nbtol) gt |= SG_NB;
+        }
+        if (J->pass == 0) continue;
+        if (!(J->cf[i] >= J->cmin) || !(fabs(J->e[i]) < J->emax)) gt |= SG_CONF;
+        for (int k = 0; k < J->nex; k++) { const double *b = J->ex + 6 * k;
+            if (gp[0] >= b[0] && gp[1] >= b[1] && gp[2] >= b[2] && gp[0] < b[3] && gp[1] < b[4] && gp[2] < b[5]) gt |= SG_EXCL; }
+        if (J->qb && J->qb->q) { int qi[3], ok = 1;
+            for (int d = 0; d < 3; d++) { qi[d] = (int)floor((gp[d] - J->qb->lo[d]) / J->qb->qb); if (qi[d] < 0 || qi[d] >= J->qb->qn[d]) ok = 0; }
+            const size_t k = ok ? ((size_t)qi[0] * J->qb->qn[1] + qi[1]) * J->qb->qn[2] + qi[2] : 0;
+            if (!ok || J->qb->q[k] < (float)J->qb->g || J->qb->qa[k] > J->qb->q[k]) gt |= SG_BACK; }
+        if (in0 && sf_native(s, F, i, q, N, J->sign)) {   /* fault: |grad W| against the density; the spacing to the next wrap */
+            const double sp = sff_spacing(F, q), lg[3] = {gp[0] - g0->origin[0], gp[1] - g0->origin[1], gp[2] - g0->origin[2]};
+            double gr[3]; const double gl = fit_set_gradW(J->ms, lg[0], lg[1], lg[2], F->h / 2, gr);
+            if (sp > 0 && gl > J->ratio / sp) gt |= SG_FAULT;
+            if (sp > 0) { double tp = 0, wp = W0, ratio = 3;
+                for (double t = sp / 8; t <= 3 * sp + 1e-9; t += sp / 8) {
+                    const double w = fit_set_W(J->ms, lg[0] + t * N[0], lg[1] + t * N[1], lg[2] + t * N[2]);
+                    if (w >= W0 + 1) { ratio = (tp + (W0 + 1 - wp) / (w - wp) * (t - tp)) / sp; break; }
+                    tp = t; wp = w; }
+                if (ratio < 0.5 || ratio > 1.5) gt |= SG_FAULT; }
+        }
+        J->gate[i] = gt;
+    }
+    return nullptr;
+}
+static double sg_quad_area(const sf_wrap *s, const uint8_t *ok, size_t i) {   /* the quad right / down of vertex i when its corners are ok */
+    const int w = s->w, r = (int)(i / w), c = (int)(i % w);
+    if (c + 1 >= w || r + 1 >= s->h || !ok[i] || !ok[i + 1] || !ok[i + w]) return 0;
+    const double du[3] = {s->Z[i + 1] - s->Z[i], s->Y[i + 1] - s->Y[i], s->X[i + 1] - s->X[i]}, dv[3] = {s->Z[i + w] - s->Z[i], s->Y[i + w] - s->Y[i], s->X[i + w] - s->X[i]};
+    const double cx = du[1] * dv[2] - du[2] * dv[1], cy = du[2] * dv[0] - du[0] * dv[2], cz = du[0] * dv[1] - du[1] * dv[0];
+    return sqrt(cx * cx + cy * cy + cz * cz) * s->um * s->um * 1e-8;
+}
+int cmd_self_gate(int argc, char **argv) {
+    if (argc < 4 || !sopt(argc, argv, "--fields", nullptr) || !sopt(argc, argv, "--model", nullptr)) {
+        fprintf(stderr, "usage: ufsm self-gate <wraps-dir> <out-dir> --fields DIR --model FIT [--ct ROOT KEY --ct-um U [--ct-level 80] [--ct-range 15]] [--min-conf 0.3]\n"
+                        "         [--max-e 0.15] [--fault-ratio 3] [--quality Q.json [--min-q 0.5]] [--nb FIT]... [--nb-tol 0.15] [--nb-min 0.6] [--exclude z0,y0,x0,z1,y1,x1]...\n"
+                        "         [--min-area 0.02] [--erode 1] [--threads 16] [--per-wrap]\n"
+                        "  the strict stretches of a box fit's wraps: on the network's sheet, on papyrus, no fault, not reversed, neighbours agreeing, outside\n"
+                        "  excluded boxes -> tifxyz with q.tif = the winding id (training labels: ufsm raster --value q.tif)\n"); return 2;
+    }
+    const double cmin = atof(sopt(argc, argv, "--min-conf", "0.3")), emax = atof(sopt(argc, argv, "--max-e", "0.15")), ratio = atof(sopt(argc, argv, "--fault-ratio", "3"));
+    const double minq = atof(sopt(argc, argv, "--min-q", "0.5")), nbtol = atof(sopt(argc, argv, "--nb-tol", "0.15")), nbmin = atof(sopt(argc, argv, "--nb-min", "0.6"));
+    const double minarea = atof(sopt(argc, argv, "--min-area", "0.02")); const int erode = atoi(sopt(argc, argv, "--erode", "1")), nt = atoi(sopt(argc, argv, "--threads", "16")), per = sflag(argc, argv, "--per-wrap");
+    fit_set_threads(nt);
+    int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) ci = i;
+    const double ctum = atof(sopt(argc, argv, "--ct-um", "0")), ctlev = atof(sopt(argc, argv, "--ct-level", "80")), ctR = atof(sopt(argc, argv, "--ct-range", "15"));
+    if (ci > 0 && !(ctum > 0)) { fprintf(stderr, "self-gate: --ct needs --ct-um\n"); return 2; }
+    z3 *cz = ci > 0 ? z3_open(store_open(argv[ci + 1]), argv[ci + 2], sopt(argc, argv, "--cache", nullptr)) : nullptr;
+    if (ci > 0 && !cz) { fprintf(stderr, "self-gate: %s\n", z3_error()); return 1; }
+    ct_cache ctc; memset(&ctc, 0, sizeof ctc); if (cz && ctc_init(&ctc, cz, nt)) { fprintf(stderr, "self-gate: out of memory\n"); return 1; }
+    sf_fields F; if (sff_load(sopt(argc, argv, "--fields", ""), &F)) { fprintf(stderr, "self-gate: cannot read the fields\n"); return 1; }
+    fit_set *ms = fit_set_load(sopt(argc, argv, "--model", "")); if (!ms) { fprintf(stderr, "self-gate: cannot load the model\n"); return 1; }
+    st_box *qbx = nullptr; int nqb = 0; st_edge *qe = nullptr; int nqe = 0; double qum;
+    if (sopt(argc, argv, "--quality", nullptr)) {
+        if (st_load(sopt(argc, argv, "--quality", ""), &qbx, &nqb, &qe, &nqe, &qum) || nqb < 1 || !qbx[0].q) { fprintf(stderr, "self-gate: cannot read the quality map %s\n", sopt(argc, argv, "--quality", "")); return 1; }
+        qbx[0].g = minq;   /* (the threshold travels in the box's gauge slot: sg_rows reads it) */
+    }
+    fit_set *nb[SG_MAXNB]; int nnb = 0; double ex[6 * 64]; int nex = 0;
+    for (int i = 2; i + 1 < argc; i++) {
+        if (!strcmp(argv[i], "--nb")) { if (nnb == SG_MAXNB || !(nb[nnb] = fit_set_load(argv[i + 1]))) { fprintf(stderr, "self-gate: cannot load the neighbour %s (at most %d)\n", argv[i + 1], SG_MAXNB); return 1; } nnb++; }
+        if (!strcmp(argv[i], "--exclude")) { double *b = ex + 6 * nex;
+            if (nex == 64 || sscanf(argv[i + 1], "%lf,%lf,%lf,%lf,%lf,%lf", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "self-gate: --exclude z0,y0,x0,z1,y1,x1 (at most 64)\n"); return 2; } nex++; }
+    }
+    char (*names)[256] = nullptr; const int nn = sf_names(argv[2], &names); if (nn <= 0) { fprintf(stderr, "self-gate: no wraps in %s\n", argv[2]); return 1; }
+    char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", argv[3]); if (system(cmd)) return 1;
+    /* pass 0: the neighbours' integer offsets */
+    long long nbhist[SG_MAXNB * 64] = {0}; int nbk[SG_MAXNB] = {0}; uint8_t nbbad[SG_MAXNB] = {0};
+    if (nnb) {
+        for (int k = 0; k < nn; k++) {
+            sf_wrap s; if (sf_load(argv[2], names[k], &s)) continue;
+            uint8_t *gate = calloc((size_t)s.w * s.h, 1);
+            sg_job J = {.s = &s, .F = &F, .ms = ms, .gate = gate, .nnb = nnb, .nb = nb, .nbhist = nbhist, .pass = 0};
+            pthread_t th[64]; const int m = nt < 64 ? (nt > 0 ? nt : 1) : 64;
+            for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, sg_rows, &J);
+            for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
+            free(gate); sf_free(&s);
+        }
+        for (int k = 0; k < nnb; k++) {
+            long long tot = 0, best = -1; for (int b = 0; b < 64; b++) { tot += nbhist[k * 64 + b]; if (best < 0 || nbhist[k * 64 + b] > nbhist[k * 64 + best]) best = b; }
+            nbk[k] = (int)best - 32; const double share = tot ? (double)nbhist[k * 64 + best] / tot : 0; nbbad[k] = tot > 0 && share < nbmin;
+            printf("self-gate: neighbour %d: %lld covered vertices, offset %+d holds %.3f%s\n", k, tot, nbk[k], share, nbbad[k] ? " (< --nb-min: every covered vertex fails)" : "");
+        }
+    }
+    const double ctstep = ctum > 0 ? ctum : 1; const int nprof = ctum > 0 ? 2 * (int)ceil(30 / ctstep) + 1 : 0;
+    for (int k = 0; cz && k < nn; k++) {   /* the CT chunks' last wraps */
+        sf_wrap s; if (sf_load(argv[2], names[k], &s)) continue;
+        ct_wrap(&ctc, cz, &s, &F, nullptr, nullptr, nullptr, nprof, ctum, ctR, ctstep, sf_orient(&s, &F, ms->global), nt, k, 1);
+        sf_free(&s);
+    }
+    double area_all = 0, area_keep = 0, area_g[7] = {0}; size_t nv_all = 0, nv_keep = 0, nv_g[7] = {0}; int nwr = 0;
+    if (per) printf("  wrap  vertices  kept   area_cm2  kept_cm2\n");
+    for (int k = 0; k < nn; k++) {
+        sf_wrap s; if (sf_load(argv[2], names[k], &s)) continue;
+        const size_t n = (size_t)s.w * s.h; float *e = calloc(n, 4), *cf = calloc(n, 4), *ct = nprof ? malloc(n * nprof * 4) : nullptr;
+        for (size_t i = 0; i < n * nprof; i++) ct[i] = NAN;
+        const int sign = sf_orient(&s, &F, ms->global);
+        { ss_job J = {&s, &F, e, cf, nullptr, 0, 0, 0, 0, nullptr, {0}, {0}, 0, s.h, 0, s.w, 0, 0, sign, nullptr, nullptr, nullptr, 0};
+          pthread_t th[64]; const int m = nt < 64 ? (nt > 0 ? nt : 1) : 64; for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, ss_rows, &J); for (int q = 0; q < m; q++) pthread_join(th[q], nullptr); }
+        if (cz && ct_wrap(&ctc, cz, &s, &F, e, cf, ct, nprof, ctum, ctR, ctstep, sign, nt, k, 0)) fprintf(stderr, "self-gate: %s\n", z3_error());
+        uint8_t *gate = calloc(n, 1), *ok = malloc(n), *valid = malloc(n);
+        for (size_t i = 0; i < n; i++) valid[i] = s.Z[i] >= 0;
+        if (nprof) for (size_t i = 0; i < n; i++) { if (!valid[i]) continue; double mx = -1; int any = 0;
+            for (int q = 0; q < nprof; q++) { const float v = ct[i * nprof + q]; const double t = (q - (nprof - 1) / 2.0) * ctstep; if (!isnan(v) && fabs(t) <= ctR + 1e-9) { mx = fmax(mx, v); any = 1; } }
+            if (!any || mx < ctlev) gate[i] |= SG_PAP; }
+        { sg_job J = {.s = &s, .F = &F, .ms = ms, .qb = qbx, .sign = sign, .ratio = ratio, .cmin = cmin, .emax = emax, .e = e, .cf = cf, .gate = gate,
+                      .nnb = nnb, .nb = nb, .nbk = nbk, .nbtol = nbtol, .nbbad = nbbad, .nex = nex, .ex = ex, .pass = 1};
+          pthread_t th[64]; const int m = nt < 64 ? (nt > 0 ? nt : 1) : 64; for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, sg_rows, &J); for (int q = 0; q < m; q++) pthread_join(th[q], nullptr); }
+        for (size_t i = 0; i < n; i++) ok[i] = valid[i] && !gate[i];
+        for (int it = 0; it < erode; it++) {   /* drop vertices at a gated / invalid 4-neighbour */
+            uint8_t *o2 = malloc(n); memcpy(o2, ok, n);
+            for (size_t i = 0; i < n; i++) if (ok[i]) { const int r = (int)(i / s.w), c = (int)(i % s.w);
+                if (c == 0 || c + 1 == s.w || r == 0 || r + 1 == s.h || !ok[i - 1] || !ok[i + 1] || !ok[i - s.w] || !ok[i + s.w]) o2[i] = 0; }
+            for (size_t i = 0; i < n; i++) if (ok[i] && !o2[i]) gate[i] |= SG_SMALL;
+            free(o2); for (size_t i = 0; i < n; i++) ok[i] = valid[i] && !gate[i];
+        }
+        { int *lab = malloc(n * sizeof(int)), *stk = malloc(n * sizeof(int)); for (size_t i = 0; i < n; i++) lab[i] = -1;
+          for (size_t i0 = 0; i0 < n; i0++) {   /* 4-connected stretches; small ones gated */
+              if (!ok[i0] || lab[i0] >= 0) continue;
+              int sp = 0, ncomp = 0; stk[sp++] = (int)i0; lab[i0] = (int)i0; double area = 0;
+              while (sp) { const int i = stk[--sp], r = i / s.w, c = i % s.w; area += sg_quad_area(&s, ok, (size_t)i); stk[n - 1 - ncomp++] = i;
+                  const int nbr[4] = {c > 0 ? i - 1 : -1, c + 1 < s.w ? i + 1 : -1, r > 0 ? i - s.w : -1, r + 1 < s.h ? i + s.w : -1};
+                  for (int q = 0; q < 4; q++) if (nbr[q] >= 0 && ok[nbr[q]] && lab[nbr[q]] < 0) { lab[nbr[q]] = (int)i0; stk[sp++] = nbr[q]; } }
+              if (area < minarea) for (int q = 0; q < ncomp; q++) gate[stk[n - 1 - q]] |= SG_SMALL;
+          }
+          free(lab); free(stk); }
+        /* areas: a quad belongs to its top-left vertex (all corners valid); kept when all corners pass */
+        double aw = 0, ak = 0; size_t vw = 0, vk = 0;
+        for (size_t i = 0; i < n; i++) ok[i] = valid[i] && !gate[i];
+        for (size_t i = 0; i < n; i++) { if (!valid[i]) continue; vw++; vk += ok[i];
+            const double a = sg_quad_area(&s, valid, i); aw += a; if (ok[i]) ak += sg_quad_area(&s, ok, i);
+            for (int b = 0; b < 7; b++) if (gate[i] & (1 << b)) { nv_g[b]++; area_g[b] += a; } }
+        nv_all += vw; nv_keep += vk; area_all += aw; area_keep += ak;
+        if (per) printf("  w%03d %9zu  %.3f  %8.3f  %8.3f\n", s.id, vw, vw ? (double)vk / vw : 0, aw, ak);
+        if (vk > 0) {
+            float *X = malloc(n * 4), *Y = malloc(n * 4), *Z = malloc(n * 4), *Q = malloc(n * 4);
+            for (size_t i = 0; i < n; i++) { X[i] = ok[i] ? s.X[i] : -1; Y[i] = ok[i] ? s.Y[i] : -1; Z[i] = ok[i] ? s.Z[i] : -1; Q[i] = ok[i] ? (float)s.id : NAN; }
+            char wd[1400], qp[1500]; snprintf(wd, sizeof wd, "%s/%s", argv[3], s.name); snprintf(qp, sizeof qp, "%s/q.tif", wd);
+            if (tifxyz_write(wd, s.w, s.h, X, Y, Z, s.step, s.um, s.id, "ufsm self-gate (gated fit wrap)") || tiffw_write(qp, s.w, s.h, 3, Q, 1)) { fprintf(stderr, "self-gate: cannot write %s\n", wd); return 1; }
+            nwr++; free(X); free(Y); free(Z); free(Q);
+        }
+        free(gate); free(ok); free(valid); free(e); free(cf); free(ct); sf_free(&s);
+    }
+    static const char *gn[7] = {"conf/phase", "papyrus", "fault", "backwards", "neighbours", "excluded", "small/edge"};
+    printf("self-gate: failing (vertex share / area cm2, a vertex may fail several):");
+    for (int b = 0; b < 7; b++) printf(" %s %.3f / %.3f;", gn[b], nv_all ? (double)nv_g[b] / nv_all : 0, area_g[b]);
+    printf("\nself-gate: kept %zu of %zu vertices (%.3f), area %.3f of %.3f cm2 (%.3f), %d wraps written to %s\n", nv_keep, nv_all, nv_all ? (double)nv_keep / nv_all : 0,
+           area_keep, area_all, area_all > 0 ? area_keep / area_all : 0, nwr, argv[3]);
+    for (int k = 0; k < nnb; k++) fit_set_free(nb[k]);
+    for (int i = 0; i < nqb; i++) st_box_free(&qbx[i]);
+    free(qbx); free(qe);
+    free(names); sff_free(&F); fit_set_free(ms); if (cz) { ctc_free(&ctc); z3_close(cz); }
     return 0;
 }

@@ -2,6 +2,7 @@
    racetracks around a core segment, tilted), half-box masks through fit_fields_load / fit_field_array. */
 #include "coreline.h"
 #include "fit.h"
+#include "z3w.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -238,6 +239,49 @@ static void test_mask_cache(void) {
     free(C.s); free(rpc); free(rps); free(rw); free(rpc0); free(rps0);
 }
 
+/* ufsm coreline box on a box-shaped field zarr (predict --box: fields.json origin = the box corner) and on the whole-scan zarr
+   (origin 0) it was cut from: the same half-box dir (zarr_offset relative to each zarr), the same masked w cells; a box outside the
+   box-shaped zarr is refused; the optional CT planes are linked */
+int cmd_coreline(int argc, char **argv);
+static void zplanes(const char *dir, const uint8_t *src, int n, int o0, int m, int ct) {   /* cells [o0, o0 + m)^3 of an n^3 field set */
+    static const char *nm[12] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w", "ct", "cs"}; char p[700]; mkdir(dir, 0755);
+    const int64_t sh[3] = {m, m, m}; uint8_t *sb = calloc(128 * 128 * 128, 1);
+    for (int k = 0; k < (ct ? 12 : 10); k++) {
+        snprintf(p, sizeof p, "%s/%s", dir, nm[k]); z3w *z = z3w_create(p, sh, 128, 0, k < 2 ? 128 : 0, nullptr); CHECK(z != nullptr, "z3w %s", p);
+        for (int a = 0; a < m; a++) for (int b = 0; b < m; b++) for (int c = 0; c < m; c++) sb[((size_t)a * 128 + b) * 128 + c] = (uint8_t)(src[(((size_t)(a + o0) * n + b + o0) * n + c + o0)] + 17 * k);
+        CHECK(z && z3w_write_shard(z, 0, 0, 0, sb, 1) == 0, "shard %s", p); if (z) z3w_close(z);
+    }
+    free(sb);
+    snprintf(p, sizeof p, "%s/fields.json", dir); FILE *f = fopen(p, "w");
+    fprintf(f, "{\"format\": \"zarr\", \"origin\": [%d, %d, %d], \"shape\": [%d, %d, %d], \"h\": 2, \"um\": 9.596, \"axis\": [[0, 0]]}\n", 2 * o0, 2 * o0, 2 * o0, m, m, m); fclose(f);
+}
+static void test_box_zarr(void) {
+    char dir[] = "/tmp/test_coreline_box_XXXXXX"; if (!mkdtemp(dir)) { CHECK(0, "mkdtemp"); return; }
+    coreline C = {0}; C.um = 2.399; C.ns = 1; C.s = calloc(1, sizeof(cl_slab));   /* along x at native y 100 (core-line voxels 400) */
+    double y0[2] = {400, 400}, x0[2] = {-1000, 2000}; C.s[0] = (cl_slab){0, 4000, 2000, 2, y0, x0};
+    char p[600], zs[600], zb[600], hs[600], hb[600], hx[600]; snprintf(p, sizeof p, "%s/core.json", dir); CHECK(cl_save(&C, p, nullptr) == 0, "save"); free(C.s);
+    enum { N = 96 }; uint8_t *src = malloc((size_t)N * N * N); srand(11); for (size_t i = 0; i < (size_t)N * N * N; i++) src[i] = (uint8_t)(1 + rand() % 250);
+    snprintf(zs, sizeof zs, "%s/scan.zarr", dir); snprintf(zb, sizeof zb, "%s/box.zarr", dir); zplanes(zs, src, N, 0, N, 0); zplanes(zb, src, N, 32, 48, 1);
+    snprintf(hs, sizeof hs, "%s/hs", dir); snprintf(hb, sizeof hb, "%s/hb", dir); snprintf(hx, sizeof hx, "%s/hx", dir);
+    char *as[] = {"ufsm", "coreline", "box", p, "--fields", zs, "--box", "40", "36", "38", "24", "40", "32", "--side", "1", "--out", hs, nullptr};
+    char *ab[] = {"ufsm", "coreline", "box", p, "--fields", zb, "--box", "40", "36", "38", "24", "40", "32", "--side", "1", "--out", hb, nullptr};
+    char *ax[] = {"ufsm", "coreline", "box", p, "--fields", zb, "--box", "40", "36", "60", "24", "40", "32", "--side", "1", "--out", hx, nullptr};
+    CHECK(cmd_coreline(17, as) == 0, "coreline box on the scan zarr"); CHECK(cmd_coreline(17, ab) == 0, "coreline box on the box zarr");
+    CHECK(cmd_coreline(17, ax) != 0, "coreline box beyond the box zarr must fail");
+    int s1[3], s2[3]; uint8_t *w1 = fit_field_array(hs, "w", 1, s1), *w2 = fit_field_array(hb, "w", 1, s2), *p2 = fit_field_array(hb, "t3", 1, s2);
+    size_t diff = 0, kept = 0, n = (size_t)24 * 40 * 32, bad3 = 0;
+    for (size_t i = 0; w1 && w2 && i < n; i++) { diff += w1[i] != w2[i]; kept += w1[i] != 0; }
+    for (int a = 0; p2 && a < 24; a++) for (int b = 0; b < 40; b++) for (int c = 0; c < 32; c++) bad3 += p2[((size_t)a * 40 + b) * 32 + c] != (uint8_t)(src[(((size_t)(a + 40) * N + b + 36) * N + c + 38)] + 17 * 5);
+    CHECK(w1 && w2 && s1[0] == 24 && s2[2] == 32 && diff == 0, "the half boxes' w differ in %zu cells", diff);
+    CHECK(kept > n / 10 && kept < n * 9 / 10, "the core line must cut the box (%zu of %zu kept)", kept, n);
+    CHECK(p2 && bad3 == 0, "the box zarr's t3 read at the wrong offset (%zu cells)", bad3);
+    struct stat sb; snprintf(p, sizeof p, "%s/ct", hb); CHECK(lstat(p, &sb) == 0, "the box zarr's ct plane must be linked");
+    snprintf(p, sizeof p, "%s/ct", hs); CHECK(lstat(p, &sb) != 0, "no ct link without a ct plane");
+    fprintf(stderr, "coreline box: box-shaped zarr: %zu of %zu cells kept, identical to the scan zarr\n", kept, n);
+    free(w1); free(w2); free(p2); free(src);
+    char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
+}
+
 int main(void) {
     test_sdist();
     test_frame();
@@ -247,6 +291,7 @@ int main(void) {
     synth_detect(0.6, 0);
     synth_detect(-1.1, 1);
     test_mask();
+    test_box_zarr();
     if (fails) { fprintf(stderr, "test_coreline: %d failure(s)\n", fails); return 1; }
     fprintf(stderr, "test_coreline: ok\n");
     return 0;

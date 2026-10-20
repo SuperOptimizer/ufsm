@@ -15,6 +15,7 @@
 
 int cmd_refine(int argc, char **argv);
 int cmd_surf_stats(int argc, char **argv);
+int cmd_self_gate(int argc, char **argv);
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
 
@@ -58,6 +59,25 @@ static double wrap_err(const char *dir, int k, double target, size_t *nv) {
     }
     free(X); free(Y); free(Z);
     return *nv ? s / *nv : 1;
+}
+/* the kept vertices of a self-gate output: count, how many lie in the no-phase corner (x, y > 156: clear of the cells next to it) or at native x < xmax, and whether
+   every q.tif value equals its wrap's id */
+static size_t gate_count(const char *dir, size_t *corner, size_t *lowx, double xmax, int *qok) {
+    size_t n = 0; *corner = *lowx = 0; *qok = 1;
+    for (int k = 0; k < 8; k++) {
+        char p[700]; int w, h, w2, h2, w3, h3, w4, h4; snprintf(p, sizeof p, "%s/w%03d/x.tif", dir, k); float *X = tif(p, &w, &h); if (!X) continue;
+        snprintf(p, sizeof p, "%s/w%03d/y.tif", dir, k); float *Y = tif(p, &w2, &h2); snprintf(p, sizeof p, "%s/w%03d/z.tif", dir, k); float *Z = tif(p, &w3, &h3);
+        snprintf(p, sizeof p, "%s/w%03d/q.tif", dir, k); float *Q = tif(p, &w4, &h4);
+        if (!Y || !Z || !Q || w4 != w || h4 != h) *qok = 0;
+        else for (size_t i = 0; i < (size_t)w * h; i++) {
+            if (Z[i] < 0) { if (!isnan(Q[i])) *qok = 0; continue; }
+            n++; if (Q[i] != (float)k) *qok = 0;
+            const double y = (Y[i] + 0.5) * WUM / UM - 0.5 - ORG[1], x = (X[i] + 0.5) * WUM / UM - 0.5 - ORG[2];
+            *corner += x > 156 && y > 156; *lowx += x < xmax;
+        }
+        free(X); free(Y); free(Z); free(Q);
+    }
+    return n;
 }
 int main(void) {
     char base[] = "/tmp/test_surf_XXXXXX"; if (!mkdtemp(base)) return 1;
@@ -116,6 +136,33 @@ int main(void) {
                   CHECK(gl > 3 / P, "the 3-turn step is no fault (%.3f)", gl); fit_set_free(fs); }
         char *mv[] = {"ufsm", "surf-stats", w1, "--fields", fd, "--model", mf, "--threads", "4", nullptr};
         CHECK(cmd_surf_stats(9, mv) == 0, "surf-stats --model rc");
+        /* self-gate: the refined wraps sit on the phase (conf / residual pass) except in the no-phase corner; the fault model gates the
+           vertices around its 3-turn step; a neighbour equal to the model agrees everywhere, the fault model as neighbour disagrees on
+           one side of its step; --exclude drops a slab of x */
+        char g1[600], g2[600], g3[600], g4[600], g5[600], ex[128];
+        snprintf(g1, sizeof g1, "%s/gate1", base); snprintf(g2, sizeof g2, "%s/gate2", base); snprintf(g3, sizeof g3, "%s/gate3", base);
+        snprintf(g4, sizeof g4, "%s/gate4", base); snprintf(g5, sizeof g5, "%s/gate5", base);
+        snprintf(ex, sizeof ex, "0,0,0,1000,1000,%lld", ORG[2] + 100);   /* global native x < ORG + 100 */
+        char *gv1[] = {"ufsm", "self-gate", w1, g1, "--fields", fd, "--model", md, "--min-area", "0", "--erode", "0", "--threads", "4", "--per-wrap", nullptr};
+        char *gv2[] = {"ufsm", "self-gate", w1, g2, "--fields", fd, "--model", mf, "--min-area", "0", "--erode", "0", "--threads", "4", nullptr};
+        char *gv3[] = {"ufsm", "self-gate", w1, g3, "--fields", fd, "--model", md, "--nb", md, "--min-area", "0", "--erode", "0", "--threads", "4", nullptr};
+        char *gv4[] = {"ufsm", "self-gate", w1, g4, "--fields", fd, "--model", md, "--nb", mf, "--nb-min", "0", "--min-area", "0", "--erode", "0", "--threads", "4", nullptr};
+        char *gv5[] = {"ufsm", "self-gate", w1, g5, "--fields", fd, "--model", md, "--exclude", ex, "--min-area", "0", "--threads", "4", nullptr};
+        CHECK(cmd_self_gate(15, gv1) == 0, "self-gate rc"); CHECK(cmd_self_gate(14, gv2) == 0, "self-gate fault rc");
+        CHECK(cmd_self_gate(16, gv3) == 0, "self-gate --nb rc"); CHECK(cmd_self_gate(18, gv4) == 0, "self-gate --nb fault rc");
+        CHECK(cmd_self_gate(14, gv5) == 0, "self-gate --exclude rc");
+        size_t c1, l1, c2, l2, c3, l3, c4, l4, c5, l5, all = 0; int q1, q2, q3, q4, q5;
+        for (int k = 2; k <= 5; k++) { size_t v; wrap_err(w1, k, 0, &v); all += v; }   /* (vertices outside the x, y > 140 corner) */
+        const size_t n1 = gate_count(g1, &c1, &l1, 100, &q1), n2 = gate_count(g2, &c2, &l2, 100, &q2), n3 = gate_count(g3, &c3, &l3, 100, &q3);
+        const size_t n4 = gate_count(g4, &c4, &l4, 100, &q4), n5 = gate_count(g5, &c5, &l5, 100, &q5);
+        printf("self-gate: kept %zu (of %zu outside the corner), fault model %zu, nb = model %zu, nb = fault model %zu, excluded x < 100: %zu (%zu there)\n", n1, all, n2, n3, n4, n5, l5);
+        CHECK(q1 && q2 && q3 && q4 && q5, "self-gate: q.tif must hold the wrap id at kept vertices, NaN elsewhere");
+        CHECK(c1 == 0 && c3 == 0 && c5 == 0, "self-gate: %zu / %zu / %zu kept vertices in the no-phase corner", c1, c3, c5);
+        CHECK(n1 > all * 0.9 && n1 < all * 1.2, "self-gate: kept %zu of %zu on-phase vertices", n1, all);
+        CHECK(n2 < n1 * 0.95, "self-gate: the fault model keeps %zu (no fault gated, plain %zu)", n2, n1);
+        CHECK(n3 == n1, "self-gate: a neighbour equal to the model changed the kept count (%zu vs %zu)", n3, n1);
+        CHECK(n4 < n1 * 0.9 && n4 > 0, "self-gate: the fault neighbour keeps %zu of %zu", n4, n1);
+        CHECK(l5 == 0 && n5 > 0 && l1 > 0, "self-gate --exclude: %zu kept vertices at x < 100 (%zu without it)", l5, l1);
         free(m.delta);
     }
     char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", base); if (system(cmd)) {}

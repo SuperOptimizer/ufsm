@@ -270,12 +270,14 @@ static const char *copt(int argc, char **argv, const char *name, const char *dfl
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
     return dflt;
 }
-static int fields_meta(const char *zarr, double *um, int *h, int64_t shp[3]) {
+static int fields_meta_o(const char *zarr, double *um, int *h, int64_t shp[3], int64_t org[3]) {
     char p[1400]; snprintf(p, sizeof p, "%s/fields.json", zarr); json *j = cl_read_json(p); if (!j) return -1;
     *um = json_num(json_get(j, "um"), 2.4); *h = (int)json_num(json_get(j, "h"), 1);
     for (int d = 0; d < 3; d++) shp[d] = (int64_t)json_num(json_at(json_get(j, "shape"), d), 0);
+    for (int d = 0; d < 3; d++) org[d] = (int64_t)json_num(json_at(json_get(j, "origin"), d), 0);
     json_free(j); return 0;
 }
+static int fields_meta(const char *zarr, double *um, int *h, int64_t shp[3]) { int64_t o[3]; return fields_meta_o(zarr, um, h, shp, o); }
 
 /* ufsm coreline detect ZARR OUT.json [--slab 64] [--bin 4] [--z0 0] [--z1 D] [--um 2.399] [--threads 8] */
 static int cl_cmd_detect(int argc, char **argv) {
@@ -364,18 +366,25 @@ static int cl_cmd_box(int argc, char **argv) {
     const int side = atoi(copt(argc, argv, "--side", "1")) < 0 ? -1 : 1; const double D = atof(copt(argc, argv, "--dist", "2000"));
     const int perz = !strcmp(copt(argc, argv, "--axis", "const"), "perz"); const double FR = atof(copt(argc, argv, "--frame-r", "2400"));
     coreline C; if (cl_load(&C, cp)) { fprintf(stderr, "coreline: cannot load %s\n", cp); return 1; }
-    double um; int h; int64_t shp[3]; if (fields_meta(zr, &um, &h, shp)) { fprintf(stderr, "coreline: cannot read %s/fields.json\n", zr); return 1; }
+    double um; int h; int64_t shp[3], zo[3]; if (fields_meta_o(zr, &um, &h, shp, zo)) { fprintf(stderr, "coreline: cannot read %s/fields.json\n", zr); return 1; }
     const double f = um / C.um;   /* native -> core-line voxels */
+    /* a box-shaped field zarr (predict --box: fields.json origin, native voxels): its cells start at origin / h, so the box reads at
+       --box minus that (the whole-scan zarr: origin 0) */
+    int64_t zc[3]; for (int d = 0; d < 3; d++) { zc[d] = zo[d] / (h > 0 ? h : 1);
+        if (zo[d] % (h > 0 ? h : 1) || bo[d] < zc[d] || bo[d] + bn[d] > zc[d] + shp[d]) { fprintf(stderr, "coreline box: the box is not inside the field zarr (cells %lld..%lld on axis %d)\n", (long long)zc[d], (long long)(zc[d] + shp[d]), d); return 1; } }
     mkdir(od, 0755);
     char rz[PATH_MAX], rc_[PATH_MAX]; if (!realpath(zr, rz) || !realpath(cp, rc_)) { fprintf(stderr, "coreline: bad path\n"); return 1; }
     static const char *nm[10] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w"};
     char p[PATH_MAX + 64], t[PATH_MAX + 64];
     for (int k = 0; k < 10; k++) { snprintf(p, sizeof p, "%s/%s", od, nm[k]); snprintf(t, sizeof t, "%s/%s", rz, nm[k]); unlink(p); if (symlink(t, p)) { fprintf(stderr, "coreline: cannot link %s\n", p); return 1; } }
+    static const char *opt_nm[3] = {"r", "ct", "cs"};   /* optional planes (recto; predict --fit-ct CT planes) when the zarr has them */
+    for (int k = 0; k < 3; k++) { struct stat sb; snprintf(p, sizeof p, "%s/%s", od, opt_nm[k]); snprintf(t, sizeof t, "%s/%s", rz, opt_nm[k]); unlink(p);
+        if (stat(t, &sb) == 0 && symlink(t, p)) { fprintf(stderr, "coreline: cannot link %s\n", p); return 1; } }
     const long long org[3] = {bo[0] * h, bo[1] * h, bo[2] * h};
     const int na = bn[0] * h + 1;
     snprintf(p, sizeof p, "%s/fields.json", od); FILE *fo = fopen(p, "w"); if (!fo) { fprintf(stderr, "coreline: cannot write %s\n", p); return 1; }
     fprintf(fo, "{\"format\": \"zarr\", \"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.4f, \"zarr_offset\": [%lld, %lld, %lld],\n \"core_line\": \"%s\", \"core_side\": %d, \"core_dist\": %.1f, \"core_axis\": \"%s\",\n \"axis\": [",
-            org[0], org[1], org[2], bn[0], bn[1], bn[2], h, um, bo[0], bo[1], bo[2], rc_, side, D, perz ? "perz" : "const");
+            org[0], org[1], org[2], bn[0], bn[1], bn[2], h, um, (long long)(bo[0] - zc[0]), (long long)(bo[1] - zc[1]), (long long)(bo[2] - zc[2]), rc_, side, D, perz ? "perz" : "const");
     const double cyg = org[1] + bn[1] * h / 2.0, cxg = org[2] + bn[2] * h / 2.0;   /* the box centre (global native) */
     double a0[2] = {0, 0}, a1[2] = {0, 0}, fq[2] = {0, 0}, fn[2] = {1, 0};
     if (!perz) cl_box_frame(&C, org, na, cyg, cxg, f, FR, fq, fn);
@@ -391,7 +400,7 @@ static int cl_cmd_box(int argc, char **argv) {
     z3 *zw = z3_open(store_open(rz), "w", nullptr); if (!zw) { fprintf(stderr, "coreline: %s\n", z3_error()); return 1; }
     uint8_t *row = malloc((size_t)bn[1] * bn[2]); size_t all = 0, kept = 0, cells = 0;
     for (int z = 0; z < bn[0]; z += 4) {
-        const int64_t o[3] = {bo[0] + z, bo[1], bo[2]}, n[3] = {1, bn[1], bn[2]};
+        const int64_t o[3] = {bo[0] - zc[0] + z, bo[1] - zc[1], bo[2] - zc[2]}, n[3] = {1, bn[1], bn[2]};
         if (z3_read(zw, o, n, row, 8)) { fprintf(stderr, "coreline: %s\n", z3_error()); return 1; }
         size_t a = 0; for (size_t i = 0; i < (size_t)bn[1] * bn[2]; i++) a += row[i] != 0;
         all += a; cells += (size_t)bn[1] * bn[2];
