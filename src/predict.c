@@ -447,6 +447,7 @@ int cmd_predict(int argc, char **argv) {
                         "       [--gn-stats stored|legacy]   defaults to the checkpoint's normalization contract\n"
                         "       [--reference reference.json]   required for a surface_winding checkpoint, native level 0\n"
                         "       [--grid-origin z,y,x]   anchor tile interiors in selected-level CT voxels, independent of the output box\n"
+                        "       [--input-gain G] [--input-bias B]   CT = G * zscore(CT) + B; radial inputs and material mask unchanged\n"
                         "       [--gpus 0,1]   one worker per GPU over the shards of the same output (needs --box)\n"
                         "       [--split z --gpus 0,1]   both GPUs on every window, one z half each (window a multiple of 2^levels; default window shard + 128, halo 64)\n"
                         "       [--channel 0]   output channel written (band_affinity checkpoints: 1..6 = affinities z1 y1 x1 z8 y8 x8)\n"
@@ -474,6 +475,11 @@ int cmd_predict(int argc, char **argv) {
     double um = atof(opt(argc, argv, "--um", "0"));
     int level = atoi(opt(argc, argv, "--level", "0")), W = atoi(opt(argc, argv, "--window", "288")), halo = atoi(opt(argc, argv, "--halo", "8"));
     int shard = atoi(opt(argc, argv, "--shard", "512")), gpu = atoi(opt(argc, argv, "--gpu", "0")), nlev = atoi(opt(argc, argv, "--levels", "4"));
+    const double input_gain = atof(opt(argc, argv, "--input-gain", "1")), input_bias = atof(opt(argc, argv, "--input-bias", "0"));
+    if (!isfinite(input_gain) || input_gain <= 0 || !isfinite(input_bias)) { fprintf(stderr, "predict: --input-gain must be finite and positive; --input-bias finite\n"); return 2; }
+    const int input_affine = input_gain != 1 || input_bias != 0;
+    char input_attrs[128] = "";
+    if (input_affine) snprintf(input_attrs, sizeof input_attrs, ",\"input_gain\":%.9g,\"input_bias\":%.9g", input_gain, input_bias);
     const int win_given = *opt(argc, argv, "--window", "") || *opt(argc, argv, "--halo", "");
     /* --window-z WZ [--halo-z HZ]: slab windows WZ x W x W (train --Pz nets; HZ default WZ / 4), the plain GPU path only */
     int Wz = atoi(opt(argc, argv, "--window-z", "0")), hz = atoi(opt(argc, argv, "--halo-z", "-1"));
@@ -617,6 +623,9 @@ int cmd_predict(int argc, char **argv) {
     if (ngpu <= 1) { if (ngpu == 1) gpu = gpus[0]; ngpu = 1; }
     /* --split z --gpus a,b: both GPUs on every window, each on one z half (see psplit_job); a and b may be one GPU (a test) */
     const int split = !strcmp(opt(argc, argv, "--split", "0"), "z");
+    if (input_affine && (split || sheet_task || sweep_out || pcut >= 0)) {
+        fprintf(stderr, "predict: input gain/bias is unsupported for --split, surface winding, conditioned sweeps or papyrus cutoffs\n"); return 2;
+    }
     if (split && (ngpu != 2 || sheet_task || ufsm_env_on("UFSM_PRED_HOSTPATH"))) { fprintf(stderr, "--split z needs --gpus with two devices (recto / affinity checkpoints, the device path)\n"); return 2; }
     if (split) gpu = gpus[0];
     if (half && (split || sheet_task || ufsm_env_on("UFSM_PRED_HOSTPATH"))) { fprintf(stderr, "predict: half-resolution checkpoints run on one GPU per window, the device path\n"); return 2; }
@@ -646,7 +655,7 @@ int cmd_predict(int argc, char **argv) {
             if (bad) { fprintf(stderr, "a predict worker failed\n"); return 1; }
             double um_l = um * (1 << level);
             int64_t bn[3]; { long long v[6] = {0, 0, 0, 0, 0, 0}; const char *b = opt(argc, argv, "--box", nullptr); if (!b || sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) { fprintf(stderr, "--gpus needs --box\n"); return 1; } for (int d = 0; d < 3; d++) bn[d] = v[3 + d]; }
-            char attrs[2000]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"gpus\":%d,\"ema\":%d%s}}", content, ckpt, ngpu, use_ema, grid_attrs);
+            char attrs[2000]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"gpus\":%d,\"ema\":%d%s%s}}", content, ckpt, ngpu, use_ema, grid_attrs, input_attrs);
             for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
             if (pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs)) return 1;
             fprintf(stderr, "wrote %s (%d GPUs)\n", out, ngpu);
@@ -756,8 +765,8 @@ int cmd_predict(int argc, char **argv) {
     char lv[32], ldir[1400], attrs[1024];
     z3w_level_name(um_l, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
-    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"window_z\":%d,\"halo_z\":%d,\"ema\":%d%s}}",
-             content, ckpt, step, root, ak, (long long)bo[0], (long long)bo[1], (long long)bo[2], W, halo, Wz, hz, use_ema, grid_attrs);
+    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"window_z\":%d,\"halo_z\":%d,\"ema\":%d%s%s}}",
+             content, ckpt, step, root, ak, (long long)bo[0], (long long)bo[1], (long long)bo[2], W, halo, Wz, hz, use_ema, grid_attrs, input_attrs);
     z3w *w = z3w_create(ldir, bn, shard, q, 0, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     int stride = W - 2 * halo;
@@ -1036,6 +1045,9 @@ int cmd_predict(int argc, char **argv) {
             double mean = sum / (double)w3, var = sq / (double)w3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
             if (pcut >= 0 && pap_cond == 1) unet_set_cond(u, (float)((pcut - mean) / sd));   /* papyrus: the cutoff in this window's input units */
             if (pcut >= 0 && pap_cond == 2) mean = pcut;                                         /* (or the input's zero) */
+            /* G * ((CT - mean) / sd) + B in both explicit-input and fused-stem paths (predict --input-gain / --input-bias): the original CT
+               bytes stay for masking, only the CT input channel changes */
+            if (input_affine) { mean -= input_bias * sd / input_gain; sd /= input_gain; }
             for (int z = 0; z < Wz; z++) {   /* window origin relative to the axis at this slice (double on the host, small in float) */
                 double cy, cx;
                 axis_at(&ax, (double)(o[0] + z) * scale, &cy, &cx);

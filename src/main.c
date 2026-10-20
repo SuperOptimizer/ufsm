@@ -97,6 +97,7 @@ static int usage(void) {
         "  ufsm png2jpg <in.png> <out.jpg> [--half]   PNG -> JPEG q90 (half: Pillow BOX halved)\n"
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
+        "  ufsm blend <out-group> <out-um> --shape Z,Y,X --interior S <root> <key> <oz,oy,ox>...   shifted predict runs -> one seamless sin^2-weighted logit average\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
         "  ufsm wrapswitch <wraps-dir> <codes-root> <codes-key>            how often the wraps switch sheets (per cm)\n"
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
@@ -2886,6 +2887,88 @@ static void *render_rows(void *arg) {
     }
     return nullptr;
 }
+/* ufsm blend: several predict runs of one volume whose tile grids are shifted against each other (each run a --box with its own origin,
+   interiors anchored at that origin, period = window - 2 halo) -> one probability array: per voxel the logits averaged with weights
+   prod_d sin^2(pi (q_d + 0.5) / S), q = the voxel's offset inside its run's tile interior, S the interior size. Runs shifted by S / 2
+   on each axis (2^3 runs) give weights summing to 1 (sin^2 + cos^2), so every voxel is a smooth average over 8 windows that gives
+   each window's interior edges ~0 weight (no seams); elsewhere the weights are normalised. Output: uint8 round(p 255), 512^3 shards. */
+typedef struct {
+    int n; z3 **in; int64_t (*org)[3]; int64_t (*shp)[3]; int S, sh; int64_t shape[3]; z3w *w; int nthreads;
+    _Atomic int64_t next; int64_t nsh[3]; _Atomic int fail; _Atomic int64_t written;
+} blend_job;
+static void *blend_worker(void *arg) {
+    blend_job *J = arg; const int sh = J->sh; const size_t n3 = (size_t)sh * sh * sh;
+    uint8_t *buf = malloc(n3), *out = malloc(n3); float *acc = malloc(n3 * 4), *ws = malloc(n3 * 4);
+    float lut[256]; for (int u = 0; u < 256; u++) { const double p = (u + 0.5) / 256.0; lut[u] = (float)log(p / (1 - p)); }
+    float *wt[3]; for (int d = 0; d < 3; d++) wt[d] = malloc((size_t)J->S * 4);
+    for (int d = 0; d < 3; d++) for (int q = 0; q < J->S; q++) { const double s = sin(M_PI * (q + 0.5) / J->S); wt[d][q] = (float)(s * s); }
+    const int64_t tot = J->nsh[0] * J->nsh[1] * J->nsh[2];
+    for (int64_t t; (t = atomic_fetch_add(&J->next, 1)) < tot && !atomic_load(&J->fail);) {
+        const int64_t sz = t / (J->nsh[1] * J->nsh[2]), sy = t / J->nsh[2] % J->nsh[1], sx = t % J->nsh[2];
+        const int64_t o[3] = {sz * sh, sy * sh, sx * sh};
+        int64_t e[3]; for (int d = 0; d < 3; d++) e[d] = o[d] + sh < J->shape[d] ? sh : J->shape[d] - o[d];
+        memset(acc, 0, n3 * 4); memset(ws, 0, n3 * 4); int any = 0;
+        for (int k = 0; k < J->n; k++) {
+            int64_t lo[3], hi[3], skip = 0;   /* the part of this shard the run covers, in volume coordinates */
+            for (int d = 0; d < 3; d++) { lo[d] = o[d] > J->org[k][d] ? o[d] : J->org[k][d]; hi[d] = o[d] + e[d] < J->org[k][d] + J->shp[k][d] ? o[d] + e[d] : J->org[k][d] + J->shp[k][d]; if (hi[d] <= lo[d]) skip = 1; }
+            if (skip) continue;
+            const int64_t ro[3] = {lo[0] - J->org[k][0], lo[1] - J->org[k][1], lo[2] - J->org[k][2]}, rn[3] = {hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]};
+            if (z3_read(J->in[k], ro, rn, buf, 1)) { fprintf(stderr, "blend: %s\n", z3_error()); atomic_store(&J->fail, 1); break; }
+            for (int64_t z = 0; z < rn[0]; z++) {
+                const float wz = wt[0][(ro[0] + z) % J->S];
+                for (int64_t y = 0; y < rn[1]; y++) {
+                    const float wzy = wz * wt[1][(ro[1] + y) % J->S];
+                    const uint8_t *b = buf + ((size_t)z * rn[1] + y) * rn[2];
+                    const size_t ob = ((size_t)(lo[0] - o[0] + z) * sh + (lo[1] - o[1] + y)) * sh + (lo[2] - o[2]);
+                    for (int64_t x = 0; x < rn[2]; x++) {
+                        const float w = wzy * wt[2][(ro[2] + x) % J->S];
+                        if (b[x]) any = 1;
+                        acc[ob + x] += w * lut[b[x]]; ws[ob + x] += w;
+                    }
+                }
+            }
+        }
+        if (atomic_load(&J->fail)) break;
+        if (!any) continue;   /* all runs 0 here: the output fill */
+        for (size_t i = 0; i < n3; i++) { const float l = ws[i] > 0 ? acc[i] / ws[i] : -30.f; const int v = (int)lrintf(255.f / (1.f + expf(-l)));
+                                          out[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
+        if (z3w_write_shard(J->w, sz, sy, sx, out, 1)) { fprintf(stderr, "blend: %s\n", z3w_error()); atomic_store(&J->fail, 1); break; }
+        atomic_fetch_add(&J->written, 1);
+    }
+    free(buf); free(out); free(acc); free(ws); for (int d = 0; d < 3; d++) free(wt[d]);
+    return nullptr;
+}
+static int cmd_blend(int argc, char **argv) {
+    /* ufsm blend <out-group> <out-um> --shape Z,Y,X --interior S [--q 8] [--threads 8] <root> <key> <oz,oy,ox> [<root> <key> <oz,oy,ox> ...] */
+    if (argc < 9) { fprintf(stderr, "usage: ufsm blend <out-group> <out-um> --shape Z,Y,X --interior S [--q 8] [--threads 8] <root> <key> <oz,oy,ox> ...\n"); return 2; }
+    blend_job J; memset(&J, 0, sizeof J);
+    long long s3[3]; if (sscanf(opt(argc, argv, "--shape", ""), "%lld,%lld,%lld", s3, s3 + 1, s3 + 2) != 3) { fprintf(stderr, "blend: --shape Z,Y,X\n"); return 2; }
+    for (int d = 0; d < 3; d++) J.shape[d] = s3[d];
+    J.S = atoi(opt(argc, argv, "--interior", "0")); J.sh = 512; J.nthreads = atoi(opt(argc, argv, "--threads", "8"));
+    const float q = (float)atof(opt(argc, argv, "--q", "8"));
+    if (J.S <= 0) { fprintf(stderr, "blend: --interior S (window - 2 halo of the runs)\n"); return 2; }
+    J.in = calloc(argc, sizeof *J.in); J.org = calloc(argc, sizeof *J.org); J.shp = calloc(argc, sizeof *J.shp);
+    for (int i = 4; i + 2 < argc; i++) {
+        if (argv[i][0] == '-') { i++; continue; }
+        long long v[3]; if (sscanf(argv[i + 2], "%lld,%lld,%lld", v, v + 1, v + 2) != 3) { fprintf(stderr, "blend: bad origin %s\n", argv[i + 2]); return 2; }
+        z3 *z = z3_open(store_open(argv[i]), argv[i + 1], nullptr); if (!z) { fprintf(stderr, "blend: %s\n", z3_error()); return 1; }
+        J.in[J.n] = z; for (int d = 0; d < 3; d++) { J.org[J.n][d] = v[d]; J.shp[J.n][d] = z3_meta_of(z)->shape[d]; }
+        fprintf(stderr, "blend: run %d %s/%s origin %lld,%lld,%lld shape %lldx%lldx%lld\n", J.n, argv[i], argv[i + 1], v[0], v[1], v[2],
+                (long long)J.shp[J.n][0], (long long)J.shp[J.n][1], (long long)J.shp[J.n][2]);
+        J.n++; i += 2;
+    }
+    if (!J.n) { fprintf(stderr, "blend: no runs\n"); return 2; }
+    char lv[32], dir[1400], at[512]; z3w_level_name(atof(argv[3]), lv, sizeof lv); snprintf(dir, sizeof dir, "%s/%s", argv[2], lv);
+    snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"blend of %d shifted predict runs (sin^2 weights over tile interiors of %d, logit average; uint8 = round(p*255))\"}}", J.n, J.S);
+    J.w = z3w_create(dir, J.shape, J.sh, q, 0, at); if (!J.w) { fprintf(stderr, "blend: %s\n", z3w_error()); return 1; }
+    for (int d = 0; d < 3; d++) J.nsh[d] = (J.shape[d] + J.sh - 1) / J.sh;
+    const double t0 = now(); pthread_t th[64]; const int nt = J.nthreads < 1 ? 1 : J.nthreads > 64 ? 64 : J.nthreads;
+    for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, blend_worker, &J);
+    for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+    if (z3w_close(J.w) || atomic_load(&J.fail)) { fprintf(stderr, "blend: failed\n"); return 1; }
+    fprintf(stderr, "blend: %lld of %lld shards written to %s in %.1fs\n", (long long)atomic_load(&J.written), (long long)(J.nsh[0] * J.nsh[1] * J.nsh[2]), dir, now() - t0);
+    return 0;
+}
 static int cmd_render(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16]\n"); return 2; }
     const int vi = arg_index(argc, argv, "--volume"), ci = arg_index(argc, argv, "--ct");
@@ -3119,6 +3202,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "tifxyz-scale")) return cmd_tifxyz_scale(argc, argv);
     if (!strcmp(cmd, "png2jpg")) return cmd_png2jpg(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
+    if (!strcmp(cmd, "blend")) return cmd_blend(argc, argv);
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
     if (!strcmp(cmd, "side-votes") || !strcmp(cmd, "codes-merge")) return cmd_side_votes(argc, argv);
     if (!strcmp(cmd, "wind-assign")) return cmd_wind_assign(argc, argv);

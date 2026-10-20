@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
@@ -244,6 +245,82 @@ static double run_ct_case(int cpu, float w_ct, float w_cs, double *all, double *
     return r;
 }
 
+/* (from the main checkout, 2026-10-20) a local stack with smooth sheet curvature, a confident 0.35-turn phase error, a missing recto
+   patch and a small false recto patch: recto anchors (fit --w-recto, --phase-robust, --unwrap-voxels -1) must bring the geometry back,
+   compared against the analytic surfaces rather than the corrupted prediction */
+static double local_W(double z, double y, double x) {
+    return (x + 3) / 12 + 0.12 * sin(2 * M_PI * z / 32) * sin(2 * M_PI * y / 32);
+}
+static int compare_error(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
+static void local_errors(const fit_model *m, double *mean, double *p90, double *min_dx) {
+    const int D = 32, H = 32, W = 160; size_t n = 0; float *err = malloc((size_t)D * H * W * sizeof(float));
+    double sm = 0; *min_dx = 1e9;
+    const double gauge = round(fit_W(m, 16.5, 16.5, 16.5) - local_W(16.5, 16.5, 16.5));
+    for (int z = 2; z < D - 2; z++) for (int y = 2; y < H - 2; y++) for (int x = 4; x < W - 4; x++) {
+        const double w = fit_W(m, z + .5, y + .5, x + .5), e = fabs(w - local_W(z + .5, y + .5, x + .5) - gauge);
+        err[n++] = (float)e; sm += e;
+        const double dx = fit_W(m, z + .5, y + .5, x + 1.5) - w; if (dx < *min_dx) *min_dx = dx;
+    }
+    qsort(err, n, sizeof(float), compare_error);
+    *mean = sm / n; *p90 = err[n * 9 / 10]; free(err);
+}
+static void run_local_surface_case(void) {
+    const int D = 32, H = 32, W = 160; const size_t n = (size_t)D * H * W;
+    uint8_t *a = malloc(11 * n); float cy[33], cx[33];
+    for (int z = 0; z <= D; z++) { cy[z] = 16; cx[z] = -1200; }
+    fit_fields f = {.D = D, .H = H, .W = W, .h = 1, .pc = a, .ps = a + n, .t = {a + 2 * n, a + 3 * n, a + 4 * n, a + 5 * n, a + 6 * n, a + 7 * n},
+                    .sp = a + 8 * n, .w = a + 9 * n, .cy = cy, .cx = cx, .recto = a + 10 * n};
+    for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        const size_t i = ((size_t)z * H + y) * W + x; const double zz = z + .5, yy = y + .5, xx = x + .5, w = local_W(zz, yy, xx);
+        const double bad = x >= 48 && x < 112 ? .35 : 0;
+        a[i] = (uint8_t)lround(128 + 127 * cos(2 * M_PI * (w + bad))); a[n + i] = (uint8_t)lround(128 + 127 * sin(2 * M_PI * (w + bad)));
+        double g[3] = {.12 * (2 * M_PI / 32) * cos(2 * M_PI * zz / 32) * sin(2 * M_PI * yy / 32), .12 * (2 * M_PI / 32) * sin(2 * M_PI * zz / 32) * cos(2 * M_PI * yy / 32), 1. / 12};
+        const double rho = sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]); for (int k = 0; k < 3; k++) g[k] /= rho;
+        const double t[6] = {g[0] * g[0], g[1] * g[1], g[2] * g[2], .5 + g[0] * g[1], .5 + g[0] * g[2], .5 + g[1] * g[2]};
+        for (int k = 0; k < 6; k++) a[(2 + k) * n + i] = (uint8_t)lround(255 * t[k]);
+        a[8 * n + i] = (uint8_t)lround(8 / rho); a[9 * n + i] = 255;
+        const double d = w - round(w); double r = exp(-.5 * d * d / (.07 * .07));
+        if (x >= 64 && x < 88 && y >= 12 && y < 20) r = 0;                       /* missing recto: density / normals must bridge it */
+        if (x >= 40 && x < 42 && y >= 12 && y < 16 && z >= 12 && z < 16) r = 1;   /* a small false positive */
+        a[10 * n + i] = (uint8_t)lround(255 * r);
+    }
+    fit_cfg c = fit_cfg_default(); c.dir = 1; c.core = 0; c.verbose = 0; c.knot_dz = 128; c.nstage = 4; c.phase_stage = 2;
+    const int L[4] = {32, 16, 8, 4}; for (int k = 0; k < 4; k++) { c.lattice[k] = L[k]; c.steps[k] = 250; }
+    double old_mean = 0, old_p90 = 0, old_dx = 0;
+    fit_model *baseline = fit_run(&f, &c); CHECK(baseline, "local baseline fit");
+    if (baseline) { local_errors(baseline, &old_mean, &old_p90, &old_dx); fit_free(baseline); }
+    for (int mode = 0; mode < 2; mode++) {
+        c.w_recto = 8; c.phase_robust = .10f; c.w_phase = mode ? 0.f : .25f; c.unwrap_voxels = -1;
+        fit_model *m = fit_run(&f, &c); CHECK(m, "recto local fit mode %d", mode); if (!m) continue;
+        double mean, p90, dx; local_errors(m, &mean, &p90, &dx);
+        printf("local recto mode %d: mean %.4f p90 %.4f turn min dW/dx %.4f; baseline %.4f / %.4f\n", mode, mean, p90, dx, old_mean, old_p90);
+        CHECK(mean < .04 && p90 < .08, "local recto mode %d geometry error %.4f / %.4f", mode, mean, p90);
+        CHECK(mean < .5 * old_mean, "local recto mode %d did not halve the corrupted-phase error", mode);
+        CHECK(dx > .025, "local recto mode %d collapsed / reversed sheet spacing %.4f", mode, dx);
+        fit_free(m);
+    }
+    free(a);
+}
+/* the optional r plane: saved, cropped in z on load, ignored when fields.json says "recto": false, an error when declared but missing */
+static void check_recto_fields(void) {
+    char dir[] = "/tmp/ufsm-fit-recto-XXXXXX"; if (!mkdtemp(dir)) { CHECK(0, "recto field fixture directory"); return; }
+    const int shape[3] = {3, 2, 2}; const long long org[3] = {10, 20, 30}; uint8_t data[10][12], recto[12], *a[14] = {0}; float cy[7] = {0}, cx[7] = {0};
+    for (int k = 0; k < 10; k++) { memset(data[k], k < 2 ? 128 : 255, 12); a[k] = data[k]; }
+    for (int i = 0; i < 12; i++) recto[i] = (uint8_t)(20 * i);
+    CHECK(!fit_fields_save_ex(dir, org, shape, 2, 9.6, a, 0, recto, cy, cx, 7), "save optional recto");
+    fit_fields_buf b;
+    int rc = fit_fields_load(dir, 1, 3, 1, &b); CHECK(!rc, "load recto z crop");
+    if (!rc) { CHECK(b.f.recto && !memcmp(b.f.recto, recto + 4, 8), "recto crop coordinates"); CHECK(b.origin[0] == 12, "recto cropped origin"); fit_fields_free(&b); }
+    CHECK(!fit_fields_save(dir, org, shape, 2, 9.6, a, cy, cx, 7), "save legacy fields over recto fields");
+    rc = fit_fields_load(dir, 0, 0, 1, &b); CHECK(!rc, "load fields without declared recto");
+    if (!rc) { CHECK(!b.f.recto, "stale recto must be ignored"); fit_fields_free(&b); }
+    CHECK(!fit_fields_save_ex(dir, org, shape, 2, 9.6, a, 0, recto, cy, cx, 7), "save declared recto");
+    char p[256]; snprintf(p, sizeof p, "%s/r.raw", dir); unlink(p);
+    rc = fit_fields_load(dir, 0, 0, 1, &b); CHECK(rc != 0, "missing declared recto must fail"); if (!rc) fit_fields_free(&b);
+    const char *names[11] = {"pc.raw", "ps.raw", "t0.raw", "t1.raw", "t2.raw", "t3.raw", "t4.raw", "t5.raw", "sp.raw", "w.raw", "fields.json"};
+    for (int k = 0; k < 11; k++) { snprintf(p, sizeof p, "%s/%s", dir, names[k]); unlink(p); } rmdir(dir);
+}
+
 int main(void) {
     nn_init(0);
     if (getenv("FIT_BIAS")) g_bias = atof(getenv("FIT_BIAS"));
@@ -259,6 +336,8 @@ int main(void) {
     g_robust = 0; g_bend = 0; g_pgrad = 1.f; run_case(+1); g_cpu = 1; run_case(-1);   /* phase-gradient matching, both backends */
     }
     g_pgrad = 0; g_cpu = 0;
+    run_local_surface_case();   /* recto anchors on a corrupted phase (main checkout) */
+    check_recto_fields();
     {   /* the CT sheet spacing of a profile: papyrus peaks of period 12.5 samples (0.5 native voxels apart) with noise; 2 peaks at least */
         float pr[160]; unsigned rs = 7u;
         for (int k = 0; k < 160; k++) { rs = rs * 1664525u + 1013904223u; pr[k] = (float)(90 + 40 * cos(2 * M_PI * (k - 3.3) / 12.5) + ((rs >> 8) / 16777216.0 - 0.5) * 20); }
