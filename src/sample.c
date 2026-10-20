@@ -1155,32 +1155,26 @@ static void u8_stats(const uint8_t *a, size_t n, size_t *nz, double *sum, double
 /* shift >= 2 (a 9.6 um phase for 2.4 um windows): circular trilinear interpolation. Grid voxel j of g = 2^shift native voxels sits at
    g j + (g - 1) / 2 (src/band.c); each window voxel gets the weighted mean phasor of its 8 grid neighbours with a known phase,
    unknown when they hold under half the weight. Between two rectos the phase is a linear ramp, which this reproduces; the 1 -> 0
-   wrap at a recto is continuous on the circle. */
-static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shift, uint8_t *side) {   /* a D x P x P window, D <= P */
-    static float cs[PHASE_PERIOD], sn[PHASE_PERIOD]; static _Atomic int init;
-    if (!atomic_load(&init)) { for (int k = 0; k < PHASE_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); sn[k] = (float)sin(2 * M_PI * k / PHASE_PERIOD); } atomic_store(&init, 1); }
+   wrap at a recto is continuous on the circle.
+   ph: the grid region read (ln[0] x ln[1] x ln[2] codes, PHASE_UNKNOWN outside the array), its first voxel lo; o: the window corner. */
+static void phase_interp_axes(const int64_t o[3], const int64_t lo[3], int D, int P, int shift, int *j0, float *tf) {   /* per axis: the lower grid neighbour, the fraction */
     const int g = 1 << shift; const double c0 = 0.5 * (g - 1); const int wn[3] = {D, P, P};
-    int64_t lo[3], ln[3], ro[3], rn[3]; const z3_meta *m = z3_meta_of(a);
-    for (int d = 0; d < 3; d++) {
-        lo[d] = (int64_t)floor((o[d] - c0) / g); ln[d] = (int64_t)floor((o[d] + wn[d] - 1 - c0) / g) + 2 - lo[d];
-        ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
-    }
-    const size_t N = (size_t)ln[0] * ln[1] * ln[2];
-    uint8_t *ph = tp_get(N, 0); int *j0 = malloc(3 * (size_t)P * sizeof *j0); float *tf = malloc(3 * (size_t)P * sizeof *tf);
-    if (!ph || !j0 || !tf) { tp_put(ph, N); free(j0); free(tf); return -1; }
-    memset(ph, PHASE_UNKNOWN, N);
-    if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
-        const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
-        uint8_t *tmp = tp_get(rnn, 0);
-        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { tp_put(tmp, rnn); tp_put(ph, N); free(j0); free(tf); return -1; }
-        for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
-            memcpy(ph + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
-        tp_put(tmp, rnn);
-    }
-    for (int d = 0; d < 3; d++) for (int k = 0; k < wn[d]; k++) {   /* per axis: the lower grid neighbour (in the read region) and the fraction */
+    for (int d = 0; d < 3; d++) for (int k = 0; k < wn[d]; k++) {
         const double u = (o[d] + k - c0) / g; const int64_t j = (int64_t)floor(u);
         j0[d * P + k] = (int)(j - lo[d]); tf[d * P + k] = (float)(u - j);
     }
+}
+static float ph_cs[PHASE_PERIOD], ph_sn[PHASE_PERIOD]; static _Atomic int ph_init;
+static void ph_tables(void) {
+    if (atomic_load(&ph_init)) return;
+    for (int k = 0; k < PHASE_PERIOD; k++) { ph_cs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); ph_sn[k] = (float)sin(2 * M_PI * k / PHASE_PERIOD); }
+    atomic_store(&ph_init, 1);
+}
+/* the reference: 8 neighbours per window voxel, atan2f (sample_phase_interp_ref; the test's yardstick for the separable path) */
+void sample_phase_interp_ref(const uint8_t *ph, const int64_t ln[3], const int64_t lo[3], const int64_t o[3], int D, int P, int shift, uint8_t *side) {
+    ph_tables();
+    int *j0 = malloc(3 * (size_t)P * sizeof *j0); float *tf = malloc(3 * (size_t)P * sizeof *tf); if (!j0 || !tf) abort();
+    phase_interp_axes(o, lo, D, P, shift, j0, tf);
     for (int z = 0; z < D; z++) for (int y = 0; y < P; y++) {
         const int az = j0[z], ay = j0[P + y]; const float tz = tf[z], ty = tf[P + y];
         uint8_t *dst = side + ((size_t)z * P + y) * P;
@@ -1191,14 +1185,107 @@ static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shif
                 const int v = ph[((size_t)(az + (c >> 2 & 1)) * ln[1] + ay + (c >> 1 & 1)) * ln[2] + ax + (c & 1)];
                 if (v >= PHASE_PERIOD) continue;
                 const float wv = (c & 4 ? tz : 1.f - tz) * (c & 2 ? ty : 1.f - ty) * (c & 1 ? tx : 1.f - tx);
-                sx += wv * cs[v]; sy += wv * sn[v]; wk += wv;
+                sx += wv * ph_cs[v]; sy += wv * ph_sn[v]; wk += wv;
             }
             if (wk < 0.5f || sx * sx + sy * sy < 1e-8f) { dst[x] = PHASE_UNKNOWN; continue; }
             float t = atan2f(sy, sx) * (float)(PHASE_PERIOD / (2 * M_PI)); if (t < 0) t += PHASE_PERIOD;
             const int q = (int)lrintf(t); dst[x] = (uint8_t)(q >= PHASE_PERIOD ? q - PHASE_PERIOD : q);
         }
     }
-    tp_put(ph, N); free(j0); free(tf);
+    free(j0); free(tf);
+}
+/* atan2(y, x) in turns, [0, 1): octant reduction + a degree-11 odd minimax atan on [0, 1] (|error| < 2e-6 rad; a phase code is 0.025 rad),
+   branch-free so the voxel loop vectorises */
+static inline float atan2_turns(float y, float x) {
+    const float ax = fabsf(x), ay = fabsf(y), m0 = ax > ay ? ax : ay, mx = m0 > 1e-30f ? m0 : 1e-30f, mn = ax < ay ? ax : ay;   /* (not fmaxf: it does not vectorise) */
+    const float a = mn / mx, s = a * a;
+    float r = a * (0.99997726f + s * (-0.33262347f + s * (0.19354346f + s * (-0.11643287f + s * (0.05265332f + s * -0.01172120f)))));
+    const float sw = (float)(ay > ax), nx = (float)(x < 0.f), ny = (float)(y < 0.f);   /* (arithmetic selects: the loop vectorises) */
+    r += sw * (1.57079633f - 2.f * r);
+    r += nx * (3.14159265f - 2.f * r);
+    r += ny * (6.28318531f - 2.f * r);
+    return r * 0.159154943f;
+}
+/* one window plane: the z blend of two cached grid planes (C, S, W each n floats) and the code */
+static void phase_blend_row(const float *restrict A, const float *restrict Bp, size_t n, float t, uint8_t *restrict dst) {
+    const float u = 1.f - t;
+    for (size_t k = 0; k < n; k++) {
+        const float c = u * A[k] + t * Bp[k], sn = u * A[n + k] + t * Bp[n + k], w = u * A[2 * n + k] + t * Bp[2 * n + k];
+        const float q = atan2_turns(sn, c) * (float)PHASE_PERIOD;
+        int qi = (int)(q + 0.5f); qi -= (qi >= PHASE_PERIOD) * PHASE_PERIOD;
+        const int bad = (w < 0.5f) | (c * c + sn * sn < 1e-8f);
+        dst[k] = (uint8_t)(qi | bad * 255);   /* (qi < 252: OR 255 = PHASE_UNKNOWN) */
+    }
+}
+/* the same interpolation, separable (trilinear = x, then y, then z): the x-interpolated phasor and weight sums of the grid z planes in use
+   (two cached), then per run of window z planes sharing their grid neighbours and per window row the y-interpolated rows of both planes
+   (in L1) blended in z for each plane of the run, and a polynomial atan2. Codes equal the reference's but for float rounding at a code's
+   half-way point (+-1 code, rare) and the 0.5-weight / zero-phasor cut. */
+void sample_phase_interp(const uint8_t *ph, const int64_t ln[3], const int64_t lo[3], const int64_t o[3], int D, int P, int shift, uint8_t *side) {
+    ph_tables();
+    const size_t PP = (size_t)P * P, RX = 3 * (size_t)ln[1] * P;
+    int *j0 = malloc(3 * (size_t)P * sizeof *j0); float *tf = malloc(3 * (size_t)P * sizeof *tf);
+    float *rx = malloc(2 * RX * sizeof *rx), *rows = malloc(6 * (size_t)P * sizeof *rows);
+    if (!j0 || !tf || !rx || !rows) abort();
+    phase_interp_axes(o, lo, D, P, shift, j0, tf);
+    const int *jy = j0 + P, *jx = j0 + 2 * P; const float *ty = tf + P, *tx = tf + 2 * P;
+    int have[2] = {-1, -1};   /* the grid z plane whose x stage each rx slot holds */
+    const int y0 = jy[0], y1 = jy[P - 1] + 1;   /* the grid rows any window row reads */
+    for (int z = 0; z < D;) {
+        const int az = j0[z]; int ze = z + 1; while (ze < D && j0[ze] == az) ze++;   /* window planes z..ze-1 blend grid planes az, az + 1 */
+        int slot[2];
+        for (int e = 0; e < 2; e++) {
+            const int gz = az + e;
+            if (have[0] == gz) { slot[e] = 0; continue; }
+            if (have[1] == gz) { slot[e] = 1; continue; }
+            const int sl = e == 0 ? (have[0] == az + 1 ? 1 : 0) : (slot[0] == 0 ? 1 : 0);
+            for (int gy = y0; gy <= y1; gy++) {   /* x stage: rows of grid plane gz */
+                const uint8_t *row = ph + ((size_t)gz * ln[1] + gy) * ln[2];
+                float *rc = rx + sl * RX + (size_t)3 * gy * P, *rs = rc + P, *rw = rs + P;
+                for (int x = 0; x < P; x++) {
+                    const int v0 = row[jx[x]], v1 = row[jx[x] + 1]; const float t = tx[x];
+                    const float w0 = v0 < PHASE_PERIOD ? 1.f - t : 0.f, w1 = v1 < PHASE_PERIOD ? t : 0.f;
+                    const int k0 = v0 < PHASE_PERIOD ? v0 : 0, k1 = v1 < PHASE_PERIOD ? v1 : 0;
+                    rc[x] = w0 * ph_cs[k0] + w1 * ph_cs[k1]; rs[x] = w0 * ph_sn[k0] + w1 * ph_sn[k1]; rw[x] = w0 + w1;
+                }
+            }
+            have[sl] = gz; slot[e] = sl;
+        }
+        for (int y = 0; y < P; y++) {   /* y stage of both planes for this row, then the z blend of each window plane of the run */
+            const float t = ty[y], u = 1.f - t;
+            for (int e = 0; e < 2; e++) {
+                const float *ra = rx + slot[e] * RX + (size_t)3 * jy[y] * P, *rb = ra + (size_t)3 * P;
+                float *r = rows + (size_t)e * 3 * P;
+                for (int x = 0; x < 3 * P; x++) r[x] = u * ra[x] + t * rb[x];
+            }
+            for (int zz = z; zz < ze; zz++) phase_blend_row(rows, rows + (size_t)3 * P, (size_t)P, tf[zz], side + (size_t)zz * PP + (size_t)y * P);
+        }
+        z = ze;
+    }
+    free(j0); free(tf); free(rx); free(rows);
+}
+static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shift, uint8_t *side) {   /* a D x P x P window, D <= P */
+    const int g = 1 << shift; const double c0 = 0.5 * (g - 1); const int wn[3] = {D, P, P};
+    int64_t lo[3], ln[3], ro[3], rn[3]; const z3_meta *m = z3_meta_of(a);
+    for (int d = 0; d < 3; d++) {
+        lo[d] = (int64_t)floor((o[d] - c0) / g); ln[d] = (int64_t)floor((o[d] + wn[d] - 1 - c0) / g) + 2 - lo[d];
+        ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
+    }
+    const size_t N = (size_t)ln[0] * ln[1] * ln[2];
+    uint8_t *ph = tp_get(N, 0);
+    if (!ph) return -1;
+    memset(ph, PHASE_UNKNOWN, N);
+    if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
+        const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
+        uint8_t *tmp = tp_get(rnn, 0);
+        if (!tmp || z3_read(a, ro, rn, tmp, 1)) { tp_put(tmp, rnn); tp_put(ph, N); return -1; }
+        for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
+            memcpy(ph + ((size_t)(z + ro[0] - lo[0]) * ln[1] + (y + ro[1] - lo[1])) * ln[2] + (ro[2] - lo[2]), tmp + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
+        tp_put(tmp, rnn);
+    }
+    if (ufsm_env_on("UFSM_PHASE_INTERP_REF")) sample_phase_interp_ref(ph, ln, lo, o, D, P, shift, side);   /* (A/B: the 8-neighbour atan2f path) */
+    else sample_phase_interp(ph, ln, lo, o, D, P, shift, side);
+    tp_put(ph, N);
     return 0;
 }
 /* a stored phase / winding read against the convention (sources "phase_sign": -1): codes 0..251 negated mod 252, unknown kept */
