@@ -7,6 +7,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include "coreline.h"
 
 typedef struct {
     int D, H, W;                    /* field grid */
@@ -219,6 +220,8 @@ typedef struct { fit_model *global; int n; fit_model **slab; double *z0, *z1, bl
 const fit_model *fit_set_model(const fit_set *s, double z, double *zoff);   /* the model for box-local z, and its z offset */
 double fit_set_W(const fit_set *s, double z, double y, double x);
 int fit_set_ray_root(const fit_set *s, double z, double theta, double k, double r_hint, double *r);   /* fit_ray_root of the set (global box, axis, pitch) */
+/* the same where only roots with ua <= r <= ub are wanted (others: -1, possibly without their search; a kept root is the same) */
+int fit_set_ray_root_b(const fit_set *s, double z, double theta, double k, double r_hint, double ua, double ub, double *r);
 /* grad W of the set at a box-local native point by central differences over +-e (theta continued across its cut, so the gradient
    is that of the smooth U - dir theta / 2 pi); returns |grad W| (turns per native voxel) */
 double fit_set_gradW(const fit_set *s, double z, double y, double x, double e, double g[3]);
@@ -237,6 +240,15 @@ int fit_set_grid(fit_set_dev *g, const fit_set *s, const double o[3], const int6
 /* the same on the CPU (no device); mask (optional, laid out as out): only points with a band code 1..252 there are evaluated (others 0) */
 int fit_set_grid_cpu(const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, const uint8_t *mask, float *out);
 void fit_set_threads(int n);   /* the CPU backend's / grid's thread count (0: all cores) */
+/* fit_fields_load plus: noread (the arrays allocated, nothing read: a pooled box to fill through `also`); also (pool 1 loads, rows
+   [fz0, fz1) starting on a multiple of also_pool and ending on one or at the box end): each block of also_pool rows, masked, pooled into
+   `also` (a noread pooled box of the whole box) exactly as its own pooled load would (fit --slab: the prior's loads fill the global fit's
+   pooled fields) */
+int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b, int noread, fit_fields_buf *also, int also_pool, fit_fields_buf *prev);
+/*   prev (pool 1, may be null; always consumed: freed): a previous pool-1 load of the same directory whose rows overlap the start of
+     [fz0, fz1) (fit --slab: consecutive slabs share 2 x overlap rows): those rows are moved, not read again */
+/* cl_mask_block (src/coreline.h) over rows [z0, z0 + nz) on fit_set_threads threads (one row per task; the same arrays) */
+void fit_core_mask(const coreline *C, int side, const long long org[3], double h, double um, int z0, int nz, int H, int W, uint8_t *pc, uint8_t *ps, uint8_t *w);
 uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[3]);   /* one field array, max-pooled (raw or zarr) */
 
 /* CT in the fitter (src/fit_ct.c). The papyrus / void parity of the mean CT per cell: m = tanh((ct - mu) / sd), mu and sd over a cube of

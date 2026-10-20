@@ -3,6 +3,7 @@
    (phase vector, n n^T, spacing, material weight) computed from the true winding coordinate W. Checks: the fitted direction,
    and W_fit - W_true = one integer gauge everywhere (winding ids >= 99.5% right, |error| < 0.08 turn at 99% of voxels). */
 #include "fit.h"
+#include "fit_terms.h"
 #include "nn.h"
 #include <math.h>
 #include <stdio.h>
@@ -137,8 +138,28 @@ static int run_case(int dir) {
         for (int k = 0; k < FIT_NPARTS; k++) if (k != FIT_P_SMOOTH) CHECK(fabs(ph[k] - pd[k]) <= 1e-3 * fabs(pd[k]) + 1e-9, "loss part %d: cpu %.8g gpu %.8g", k, ph[k], pd[k]);
         CHECK(pd[FIT_P_WIND4] > 0 && pd[FIT_P_RECTO] > 0, "the winding mod 4 / recto terms are inactive (%g %g)", pd[FIT_P_WIND4], pd[FIT_P_RECTO]);
         CHECK(pd[FIT_P_CT] != 0 && pd[FIT_P_CSPACE] > 0, "the CT parity / spacing terms are inactive (%g %g)", pd[FIT_P_CT], pd[FIT_P_CSPACE]);
-        free(wd); free(rc); free(ctm); free(csp);
         CHECK(dmax <= 1e-3 * gmax, "gradient: max |cpu - gpu| %.3g > 1e-3 x %.3g", dmax, gmax);
+        /* minibatch steps (stride > 1: the GPU lists the step's voxels, then evaluates the list): the same voxels (hash(i ^ salt) %
+           stride == 0, material) and terms x stride as a host loop over fit_vox2 */
+        for (int st = 3; st <= 37; st += 34) {
+            fit_dev fs = fd, gs = fg; fs.stride = gs.stride = st; fs.salt = gs.salt = 2654435761u * (unsigned)st + 12345u;
+            double ps_h[FIT_NPARTS] = {0}, ps_d[FIT_NPARTS] = {0}; float *gr = calloc(nl, 4); size_t nsel = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (fit_hash((unsigned)i ^ fs.salt) % (unsigned)st || !w[i]) continue;
+                double lp[FIT_NPARTS] = {0}; size_t ic[FIT_VOX2_MAXC]; float gv[FIT_VOX2_MAXC];
+                const int nc = fit_vox2(&fs, i, w[i] * (1.f / 255.f), (float)st, lp, ic, gv); nsel++;
+                for (int q = 0; q < FIT_NPARTS; q++) ps_h[q] += lp[q];
+                for (int q = 0; q < nc; q++) gr[ic[q]] += gv[q];
+            }
+            nn_zero(dg, nl * 4); nn_zero(dp, FIT_NPARTS * sizeof(double));
+            nn_fit_loss2(&gs, dp, dg); nn_sync(); nn_d2h(ps_d, dp, sizeof ps_d); nn_d2h(gg, dg, nl * 4);
+            double gm = 0, dm = 0; for (size_t k = 0; k < nl; k++) { gm = fmax(gm, fabs(gr[k])); dm = fmax(dm, fabs(gr[k] - gg[k])); }
+            printf("minibatch stride %d: %zu voxels, loss host %.8g gpu %.8g, gradient max |host - gpu| %.3g of max %.3g\n", st, nsel, ps_h[0], ps_d[0], dm, gm);
+            for (int k = 0; k < FIT_NPARTS; k++) if (k != FIT_P_SMOOTH) CHECK(fabs(ps_h[k] - ps_d[k]) <= 1e-3 * fabs(ps_h[k]) + 1e-9, "stride %d loss part %d: host %.12g gpu %.12g", st, k, ps_h[k], ps_d[k]);
+            CHECK(nsel > n / st / 4 && dm <= 1e-3 * gm, "stride %d: gradient max |host - gpu| %.3g > 1e-3 x %.3g (%zu voxels)", st, dm, gm, nsel);
+            free(gr);
+        }
+        free(wd); free(rc); free(ctm); free(csp);
         nn_free(dv); nn_free(dcy); nn_free(dcx); nn_free(dpi); nn_free(dof); nn_free(ddl); nn_free(dg); nn_free(dp); free(gh); free(gg);
     }
     fit_free(m);

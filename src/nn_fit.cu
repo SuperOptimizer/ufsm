@@ -453,9 +453,54 @@ __global__ void fit_loss2_k(fit_dev f, double *parts, float *g_delta) {
     }
     fit_reduce_parts(lp, red, parts);
 }
+/* Minibatch steps (stride > 1): the step's voxels (hash(i ^ salt) % stride == 0, material) are first listed (one thread per voxel:
+   a hash and, for the 1 / stride selected, the weight byte; warp-aggregated appends), then evaluated by a grid-stride kernel over
+   the list. fit_loss2_k ran a thread, a block-wide reduction of FIT_NPARTS doubles and a launch slot per voxel of the slab for the
+   ~1 / stride of them that do work: 60-100 ms per step on a 1024^2 x 256 slab (2 M voxels a step), ~2 ms so. The same voxels
+   and per-voxel terms (fit_vox2); the float gradient sums are atomic in either form, so their order (the last bits) varies run to
+   run as before. */
+__global__ void fit_select_k(fit_dev f, unsigned *list, unsigned *count, unsigned cap) {
+    const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    const bool sel = i < n && fit_hash((unsigned)i ^ f.salt) % (unsigned)f.stride == 0 && f.w[i] != 0;
+    const unsigned m = __ballot_sync(0xffffffffu, sel);
+    if (!m) return;
+    const int lane = threadIdx.x & 31, leader = __ffs(m) - 1;
+    unsigned base = 0;
+    if (lane == leader) base = atomicAdd(count, (unsigned)__popc(m));
+    base = __shfl_sync(0xffffffffu, base, leader);
+    if (sel) { const unsigned k = base + __popc(m & ((1u << lane) - 1u)); if (k < cap) list[k] = (unsigned)i; }
+}
+__global__ void fit_loss2_list_k(fit_dev f, const unsigned *list, const unsigned *count, unsigned cap, double *parts, float *g_delta) {
+    __shared__ double red[FIT_NPARTS][FIT_TPB];
+    double lp[FIT_NPARTS] = {0};
+    const unsigned nc = min(*count, cap);
+    const float sc = (float)f.stride;
+    for (unsigned k = blockIdx.x * blockDim.x + threadIdx.x; k < nc; k += gridDim.x * blockDim.x) {
+        const size_t i = list[k];
+        const float wv = f.w[i] * (1.f / 255.f);
+        double vp[FIT_NPARTS] = {0};
+        size_t ic[FIT_VOX2_MAXC]; float gv[FIT_VOX2_MAXC];
+        const int ncr = fit_vox2(&f, i, wv, sc, vp, ic, gv);
+        for (int c = 0; c < ncr; c++) if (gv[c] != 0.f) atomicAdd(&g_delta[ic[c]], gv[c]);
+        for (int q = 0; q < FIT_NPARTS; q++) lp[q] += vp[q];
+    }
+    fit_reduce_parts(lp, red, parts);
+}
+static unsigned *g_sel_list, *g_sel_count; static unsigned g_sel_cap;
 extern "C" void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta) {
     const size_t n = (size_t)f->D * f->H * f->W;
-    fit_loss2_k<<<nblk(n, FIT_TPB), FIT_TPB>>>(*f, parts, g_delta);
+    if (f->stride <= 1 || n >= 0xffffffffull) { fit_loss2_k<<<nblk(n, FIT_TPB), FIT_TPB>>>(*f, parts, g_delta); KCHECK(); return; }
+    /* capacity: the expected n / stride plus a quarter (the count is binomial: sd ~ sqrt(n / stride), ~0.07% of it at 2 M) */
+    const size_t want = n / (size_t)f->stride + n / (size_t)f->stride / 4 + 65536;
+    if (want > g_sel_cap) {
+        if (g_sel_list) CK(cudaFree(g_sel_list));
+        if (!g_sel_count) CK(cudaMalloc(&g_sel_count, sizeof(unsigned)));
+        CK(cudaMalloc(&g_sel_list, want * sizeof(unsigned))); g_sel_cap = (unsigned)want;
+    }
+    CK(cudaMemsetAsync(g_sel_count, 0, sizeof(unsigned)));
+    fit_select_k<<<nblk(n, 256), 256>>>(*f, g_sel_list, g_sel_count, g_sel_cap);
+    const unsigned nb = nblk(want, FIT_TPB) < 1024 ? nblk(want, FIT_TPB) : 1024;
+    fit_loss2_list_k<<<nb, FIT_TPB>>>(*f, g_sel_list, g_sel_count, g_sel_cap, parts, g_delta);
     KCHECK();
 }
 

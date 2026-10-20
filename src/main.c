@@ -706,11 +706,41 @@ typedef int (*score_fill_fn)(void *ctx, const double og[3], const int64_t n3[3],
    fraction of winding ids right (|e| < 0.5 turn), |e| < 0.08 turn, median / p90 |e|; detail: integer errors by z octile and by radius
    (cy, cx: the axis per native z, box-local, (int)(shp[0] h) + 1 entries; um: the native voxel size); dump: box-local z y x and U - q
    per voxel. cf: a label voxel in native voxels. Returns 0, or 1 on a read failure. */
+/* score_codes' per-voxel tally of one block over threads (contiguous z ranges; counts summed and the detail records concatenated in
+   thread order: the same totals and record order as one pass) */
+typedef struct { float d; uint8_t z, r; } score_rec;
+typedef struct {
+    const uint8_t *codes; const float *U; int64_t n3[3], o3[3]; double cf, h, um; const long long *org; const int *shp; const float *cy, *cx; int na_ax, detail;
+    size_t *hist[64], *fine[64], nd[64], nan[64]; score_rec *dd[64]; size_t ndet[64], dcap[64]; int nt;
+} score_job;
+enum { SC_NB = 14 * 72, SC_NF = 14 * 1024 };
+static void *score_rows(void *arg) {
+    score_job *J = ((void **)arg)[0]; const int t = (int)(intptr_t)((void **)arg)[1];
+    const int64_t z0 = J->n3[0] * t / J->nt, z1 = J->n3[0] * (t + 1) / J->nt; const double cf = J->cf, h = J->h; const long long *org = J->org; const int *shp = J->shp;
+    size_t *hist = J->hist[t], *fine = J->fine[t], nd = 0, nan = 0;
+    for (int64_t zz = z0; zz < z1; zz++) for (int64_t yy = 0; yy < J->n3[1]; yy++) for (int64_t xx = 0; xx < J->n3[2]; xx++) {
+        const size_t i = ((size_t)zz * J->n3[1] + yy) * J->n3[2] + xx; const uint8_t cd = J->codes[i];
+        if (cd < 1 || cd > 252) continue;
+        const double pz = cf * (zz + J->o3[0] + 0.25) - org[0], py = cf * (yy + J->o3[1] + 0.25) - org[1], px = cf * (xx + J->o3[2] + 0.25) - org[2];
+        if (pz < 0 || py < 0 || px < 0 || pz > shp[0] * h || py > shp[1] * h || px > shp[2] * h) continue;
+        if (!(J->U[i] == J->U[i])) { nan++; continue; }
+        double d = fmod(J->U[i] - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14; if (d >= 14) d = 0;
+        hist[(int)(d / 14 * SC_NB) % SC_NB]++; fine[(int)(d / 14 * SC_NF) % SC_NF]++; nd++;
+        if (J->detail) {
+            if (J->ndet[t] == J->dcap[t]) { J->dcap[t] = J->dcap[t] ? 2 * J->dcap[t] : 1 << 16; J->dd[t] = realloc(J->dd[t], J->dcap[t] * sizeof(score_rec)); }
+            const int zi = (int)fmin(7, fmax(0, pz / (shp[0] * h) * 8));
+            const int ai = (int)fmin(J->na_ax - 1, fmax(0, pz)); const double rr = hypot(py - J->cy[ai], px - J->cx[ai]) * J->um;
+            J->dd[t][J->ndet[t]++] = (score_rec){(float)d, (uint8_t)zi, (uint8_t)fmin(255, rr / 250)};
+        }
+    }
+    J->nd[t] = nd; J->nan[t] = nan;
+    return nullptr;
+}
 static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3], double h, double um, const float *cy, const float *cx, int detail, FILE *dump,
                        score_fill_fn fill, void *ctx) {
     int64_t lo[3], ln[3]; for (int d = 0; d < 3; d++) { lo[d] = (int64_t)floor(org[d] / cf); ln[d] = (int64_t)(shp[d] * h / cf); }
-    enum { NB = 14 * 72, NF = 14 * 1024 }; size_t *hist = calloc(NB, sizeof(size_t)), *fine = calloc(NF, sizeof(size_t)), nd = 0, nan = 0;   /* d = U - q mod 14: 1/72 and 1/1024 turn bins */
-    typedef struct { float d; uint8_t z, r; } score_rec; score_rec *dd = nullptr; size_t ndet = 0, dcap = 0;
+    enum { NB = SC_NB, NF = SC_NF }; size_t *hist = calloc(NB, sizeof(size_t)), *fine = calloc(NF, sizeof(size_t)), nd = 0, nan = 0;   /* d = U - q mod 14: 1/72 and 1/1024 turn bins */
+    score_rec *dd = nullptr; size_t ndet = 0, dcap = 0;
     const int na_ax = (int)(shp[0] * h) + 1;
     /* blocks of up to 128 x 1024 x 1024 label voxels aligned to the codes' 128^3 chunks (z planes one at a time decoded every chunk
        128 times: minutes on a 3.9 cm slab) */
@@ -728,6 +758,23 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
         if (!any) continue;
         const double og[3] = {cf * o3[0] - 0.25 * cf - org[0], cf * o3[1] - 0.25 * cf - org[1], cf * o3[2] - 0.25 * cf - org[2]};   /* label voxel i at cf (i + lo + 1 / 4) - org */
         if (fill(ctx, og, n3, cf, codes, U)) { fprintf(stderr, "score: cannot evaluate U on the score grid\n"); free(codes); free(U); free(hist); free(fine); free(dd); return 1; }
+        if (!dump) {   /* threads (the dump keeps the serial voxel order) */
+            score_job J = {codes, U, {n3[0], n3[1], n3[2]}, {o3[0], o3[1], o3[2]}, cf, h, um, org, shp, cy, cx, na_ax, detail, {0}, {0}, {0}, {0}, {0}, {0}, {0}, 0};
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN); const char *te = getenv("UFSM_FIT_THREADS"); if (te && atoi(te) > 0) ncpu = atoi(te);   /* (the fit's threads) */
+            J.nt = (int)(ncpu < 1 ? 1 : ncpu > 16 ? 16 : ncpu); if (J.nt > n3[0]) J.nt = (int)n3[0];
+            pthread_t th[64]; void *args[64][2];
+            for (int t = 0; t < J.nt; t++) { J.hist[t] = calloc(NB, sizeof(size_t)); J.fine[t] = calloc(NF, sizeof(size_t)); args[t][0] = &J; args[t][1] = (void *)(intptr_t)t; pthread_create(&th[t], nullptr, score_rows, args[t]); }
+            for (int t = 0; t < J.nt; t++) pthread_join(th[t], nullptr);
+            for (int t = 0; t < J.nt; t++) {
+                for (int k = 0; k < NB; k++) hist[k] += J.hist[t][k];
+                for (int k = 0; k < NF; k++) fine[k] += J.fine[t][k];
+                nd += J.nd[t]; nan += J.nan[t];
+                if (J.ndet[t]) { if (ndet + J.ndet[t] > dcap) { dcap = ndet + J.ndet[t] > 2 * dcap ? ndet + J.ndet[t] : 2 * dcap; dd = realloc(dd, dcap * sizeof *dd); }
+                                 memcpy(dd + ndet, J.dd[t], J.ndet[t] * sizeof *dd); ndet += J.ndet[t]; }
+                free(J.hist[t]); free(J.fine[t]); free(J.dd[t]);
+            }
+            continue;
+        }
         for (int64_t zz = 0; zz < n3[0]; zz++) for (int64_t yy = 0; yy < n3[1]; yy++) for (int64_t xx = 0; xx < n3[2]; xx++) {
             const size_t i = ((size_t)zz * n3[1] + yy) * n3[2] + xx; const uint8_t cd = codes[i];
             if (cd < 1 || cd > 252) continue;
@@ -1131,10 +1178,61 @@ static size_t wraps_snap(z3 *rz, const int64_t ro[3], const fit_model *m, int ro
     free(disp); free(med);
     return moved;
 }
+/* ufsm wraps --fields: per vertex row (z) and angle bin, the radius range [rmin, rmax] of the points around the row's axis point
+   whose data-weight cell can be non-zero (4 x 4 cell blocks with a non-zero cell or neighbour, padded by a native voxel; the bin
+   and its neighbours). A vertex outside it is dropped anyway, so ray roots outside are not searched for (fit_set_ray_root_b): on a
+   2 cm half box ~93% of the rays found no kept vertex (in the masked half, in the void, or off the wrap) at ~30-180 W evaluations
+   each. The kept vertices are the same. */
+typedef struct { int rows, nb; double t0, bw; float *rmin, *rmax; } wr_polar;
+typedef struct { wr_polar *P; const fit_model *m; const uint8_t *wf; int wsh[3]; double wh, step, Z; int na; _Atomic int next; } wr_polar_job;
+static void *wr_polar_rows(void *arg) {
+    wr_polar_job *J = arg; wr_polar *P = J->P; const fit_model *m = J->m; const int B = 4, H = J->wsh[1], W = J->wsh[2];
+    const int Hb = (H + B - 1) / B, Wb = (W + B - 1) / B; uint8_t *blk = malloc((size_t)Hb * Wb);
+    for (int r; (r = atomic_fetch_add(&J->next, 1)) < P->rows;) {
+        const double z = fmin(r * J->step, J->Z), cy = m->cy[(int)fmin(z, J->na - 1)], cx = m->cx[(int)fmin(z, J->na - 1)];
+        const int fz = (int)fmin(z / J->wh, J->wsh[0] - 1); const uint8_t *pl = J->wf + (size_t)fz * H * W;
+        float *rn = P->rmin + (size_t)r * P->nb, *rx = P->rmax + (size_t)r * P->nb;
+        for (int q = 0; q < P->nb; q++) { rn[q] = 1e30f; rx[q] = -1e30f; }
+        memset(blk, 0, (size_t)Hb * Wb);
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) if (pl[(size_t)y * W + x])   /* the cell and its neighbours' blocks */
+            for (int a = y - 1; a <= y + 1; a++) for (int b = x - 1; b <= x + 1; b++) if (a >= 0 && b >= 0 && a < H && b < W) blk[(size_t)(a / B) * Wb + b / B] = 1;
+        for (int by = 0; by < Hb; by++) for (int bx = 0; bx < Wb; bx++) {
+            if (!blk[(size_t)by * Wb + bx]) continue;
+            const double y0 = by * B * J->wh - 1 - cy, y1 = (by + 1) * B * J->wh + 1 - cy, x0 = bx * B * J->wh - 1 - cx, x1 = (bx + 1) * B * J->wh + 1 - cx;
+            const double ny = y0 > 0 ? y0 : y1 < 0 ? -y1 : 0, nx = x0 > 0 ? x0 : x1 < 0 ? -x1 : 0;
+            const double rlo = sqrt(ny * ny + nx * nx) - 1, rhi = sqrt(fmax(y0 * y0, y1 * y1) + fmax(x0 * x0, x1 * x1)) + 1;
+            int q0 = 0, q1 = P->nb - 1, full = rlo <= 2;
+            double alo = 0, ahi = 0;
+            if (!full) {   /* the block's angles around the axis point: its corners' relative to its centre's */
+                const double ac = atan2(0.5 * (y0 + y1), 0.5 * (x0 + x1)); double dmin = 0, dmax = 0;
+                const double cyv[2] = {y0, y1}, cxv[2] = {x0, x1};
+                for (int c = 0; c < 4; c++) { double d = atan2(cyv[c >> 1], cxv[c & 1]) - ac; d -= 2 * M_PI * floor((d + M_PI) / (2 * M_PI)); if (d < dmin) dmin = d; if (d > dmax) dmax = d; }
+                alo = ac + dmin; ahi = ac + dmax;
+            }
+            for (int sh = -1; sh <= 1; sh++) {
+                if (!full) {
+                    const double lo = (alo + 2 * M_PI * sh - P->t0) / P->bw, hi = (ahi + 2 * M_PI * sh - P->t0) / P->bw;
+                    if (hi < 0 || lo > P->nb - 1) continue;
+                    q0 = lo < 0 ? 0 : (int)floor(lo); q1 = hi > P->nb - 1 ? P->nb - 1 : (int)floor(hi);
+                } else if (sh) continue;
+                for (int q = q0; q <= q1; q++) { if (rlo < rn[q]) rn[q] = (float)fmax(rlo, 0); if (rhi > rx[q]) rx[q] = (float)rhi; }
+            }
+        }
+    }
+    free(blk);
+    return nullptr;
+}
+static void wr_polar_bounds(const wr_polar *P, int r, double th, double *ua, double *ub) {   /* the bins at th and their neighbours */
+    *ua = -1e300; *ub = 1e300; if (!P) return;
+    const double t = (th - P->t0) / P->bw; if (!(t >= 1) || t >= P->nb - 1) return;   /* (outside the table: unbounded) */
+    const int q = (int)floor(t); double a = 1e300, b = -1e300;
+    for (int k = q - 1; k <= q + 1; k++) { const float lo = P->rmin[(size_t)r * P->nb + k], hi = P->rmax[(size_t)r * P->nb + k]; if (lo <= hi) { if (lo < a) a = lo; if (hi > b) b = hi; } }
+    *ua = a; *ub = b;   /* (no block: a > b, no root wanted) */
+}
 typedef struct {   /* ufsm wraps: one wrap's rows over threads */
     const fit_set *fs; const fit_model *m; const uint8_t *wf; int wsh[3]; double wh;
     double step, Z; int na; double th0, dth; int rows, cols, k; double rk;
-    float *px, *py, *pz; _Atomic int next; _Atomic size_t valid;
+    float *px, *py, *pz; _Atomic int next; _Atomic size_t valid; const wr_polar *P;
 } wraps_job;
 static void *wraps_rows(void *arg) {
     wraps_job *J = arg; const fit_model *m = J->m;
@@ -1145,7 +1243,8 @@ static void *wraps_rows(void *arg) {
             const size_t i = (size_t)r * J->cols + (J->cols - 1 - c);   /* column 0 = the largest theta side (upstream: outermost first) */
             const double th = J->th0 + c * J->dth; double rr;
             J->px[i] = J->py[i] = J->pz[i] = -1;
-            if (fit_set_ray_root(J->fs, z, th, J->k, rprev, &rr)) continue;
+            double ua, ub; wr_polar_bounds(J->P, r, th, &ua, &ub);
+            if (fit_set_ray_root_b(J->fs, z, th, J->k, rprev, ua, ub, &rr)) continue;
             const double y = cy + rr * sin(th), x = cx + rr * cos(th);
             if (J->wf) {
                 const int fz = (int)fmin(z / J->wh, J->wsh[0] - 1), fy = (int)fmin(y / J->wh, J->wsh[1] - 1), fx = (int)fmin(x / J->wh, J->wsh[2] - 1);
@@ -1157,12 +1256,55 @@ static void *wraps_rows(void *arg) {
     }
     return nullptr;
 }
+typedef struct {
+    const fit_set *fs; const fit_model *m; const uint8_t *wf; int wsh[3]; double wh, step, Z; int na; double th0, th1; int rows, k0, k1, nthreads; double um, out_um;
+    const char *out; z3 *snapz; const int64_t *snapo; double snap_range, snap_min; const uint8_t *sfa; int sfn[3]; long long sfo[3]; double sfh; int verbose_snap; double Y, X;
+    const wr_polar *P; _Atomic int next; _Atomic int nwr; _Atomic size_t nvalid; _Atomic int fail;
+} wraps_all;
+static int wrap_one(wraps_all *A, int k, int nthreads) {   /* wrap k: its rows on nthreads threads, snapped, written */
+    const fit_model *m = A->m; const double Z = A->Z, Y = A->Y, X = A->X, step = A->step; const int na = A->na, rows = A->rows;
+    /* the wrap's radius at the box centre: the root along the central ray */
+    const double zc = Z / 2, cyc = m->cy[(int)fmin(zc, na - 1)], cxc = m->cx[(int)fmin(zc, na - 1)];
+    const double thc = atan2(Y / 2 - cyc, X / 2 - cxc); double rk;
+    if (fit_set_ray_root(A->fs, zc, thc, k, hypot(Y / 2 - cyc, X / 2 - cxc), &rk)) rk = hypot(Y / 2 - cyc, X / 2 - cxc);
+    const double dth = step / fmax(rk, step);
+    const int cols = (int)ceil((A->th1 - A->th0) / dth) + 1;
+    const size_t nv = (size_t)rows * cols;
+    float *px = malloc(nv * 4), *py = malloc(nv * 4), *pz = malloc(nv * 4);
+    wraps_job J = {A->fs, m, A->wf, {A->wsh[0], A->wsh[1], A->wsh[2]}, A->wh, step, Z, na, A->th0, dth, rows, cols, k, rk, px, py, pz, 0, 0, A->P};
+    if (nthreads > 1) {
+        pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
+        for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wraps_rows, &J);
+        for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+    } else wraps_rows(&J);
+    const size_t valid = atomic_load(&J.valid);
+    if ((A->snapz || A->sfa) && valid) { const size_t mv = wraps_snap(A->snapz, A->snapo, m, rows, cols, px, py, pz, A->snap_range, A->snap_min, nthreads, A->sfa, A->sfn, A->sfo, A->sfh); if (A->verbose_snap) fprintf(stderr, "wraps: w%03d: %zu of %zu vertices snapped\n", k, mv, valid); }
+    int rc = 0;
+    if (valid > 16) {
+        char wd[1400]; snprintf(wd, sizeof wd, "%s/w%03d", A->out, k);
+        double wstep = step, wum = A->um;
+        if (A->out_um > 0 && fabs(A->out_um - A->um) > 1e-9) {   /* --out-um: coordinates on another grid of the same scan (voxel centres to voxel centres) */
+            const double f = A->um / A->out_um;
+            for (size_t i = 0; i < nv; i++) if (pz[i] >= 0) { px[i] = (float)((px[i] + 0.5) * f - 0.5); py[i] = (float)((py[i] + 0.5) * f - 0.5); pz[i] = (float)((pz[i] + 0.5) * f - 0.5); }
+            wstep = step * f; wum = A->out_um;
+        }
+        if (tifxyz_write(wd, cols, rows, px, py, pz, wstep, wum, k, "ufsm wraps (fitted winding level set)")) { fprintf(stderr, "wraps: cannot write %s\n", wd); rc = -1; }
+        else { atomic_fetch_add(&A->nwr, 1); atomic_fetch_add(&A->nvalid, valid); }
+    }
+    free(px); free(py); free(pz);
+    return rc;
+}
+static void *wraps_worker(void *arg) {
+    wraps_all *A = arg;
+    for (int k; (k = A->k0 + atomic_fetch_add(&A->next, 1)) <= A->k1;) if (wrap_one(A, k, 1)) atomic_store(&A->fail, 1);
+    return nullptr;
+}
 static int cmd_wraps(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4] [--threads 16]\n"); return 2; }
     fit_set *fs = fit_set_load(argv[2]); if (!fs) { fprintf(stderr, "wraps: cannot load %s\n", argv[2]); return 1; }
     const fit_model *m = fs->global;   /* the box, the axis; rows dispatch to the slab model of their z */
     const double step = atof(opt(argc, argv, "--step", "8")), um = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : fs->global->um;
-    const int nthreads = atoi(opt(argc, argv, "--threads", "16"));
+    const int nthreads = atoi(opt(argc, argv, "--threads", "16")); fit_set_threads(nthreads);   /* (the field loads' core masks) */
     const double out_um = atof(opt(argc, argv, "--out-um", "0"));   /* e.g. 2.4: a 9.6 um fit's wraps on the 2.4 um grid (renders with 2.4 um ink) */
     const int si = arg_index(argc, argv, "--snap");   /* --snap ROOT KEY: a recto probability array on the model's grid (predict output) */
     z3 *snapz = nullptr; int64_t snapo[3] = {0, 0, 0}; const double snap_range = atof(opt(argc, argv, "--snap-range", "0.35")), snap_min = atof(opt(argc, argv, "--snap-min", "0.5"));
@@ -1225,35 +1367,29 @@ static int cmd_wraps(int argc, char **argv) {
     }
     if (full) { th0 = -M_PI; th1 = M_PI; }
     const int rows = (int)floor(Z / step) + 1;
-    int nwr = 0; size_t nvalid_all = 0;
-    for (int k = k0; k <= k1; k++) {
-        /* the wrap's radius at the box centre: the root along the central ray */
-        const double zc = Z / 2, cyc = m->cy[(int)fmin(zc, na - 1)], cxc = m->cx[(int)fmin(zc, na - 1)];
-        const double thc = atan2(Y / 2 - cyc, X / 2 - cxc); double rk;
-        if (fit_set_ray_root(fs, zc, thc, k, hypot(Y / 2 - cyc, X / 2 - cxc), &rk)) rk = hypot(Y / 2 - cyc, X / 2 - cxc);
-        const double dth = step / fmax(rk, step);
-        const int cols = (int)ceil((th1 - th0) / dth) + 1;
-        const size_t nv = (size_t)rows * cols;
-        float *px = malloc(nv * 4), *py = malloc(nv * 4), *pz = malloc(nv * 4);
-        wraps_job J = {fs, m, wf, {wsh[0], wsh[1], wsh[2]}, wh, step, Z, na, th0, dth, rows, cols, k, rk, px, py, pz, 0, 0};
-        pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
-        for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wraps_rows, &J);
+    /* the wraps on threads, each wrap's rows on one (a wrap's rows on all threads ran ~1.7 of 6 cores on a small box: per-wrap thread
+       start-up, the serial tifxyz write); with snapping, one wrap at a time over all threads as before. Each wrap is computed as before. */
+    wraps_all A = {fs, m, wf, {wsh[0], wsh[1], wsh[2]}, wh, step, Z, na, th0, th1, rows, k0, k1, nthreads, um, out_um, argv[3], snapz, snapo, snap_range, snap_min, sfa,
+                   {sfn[0], sfn[1], sfn[2]}, {sfo[0], sfo[1], sfo[2]}, sfh, verbose_snap, Y, X, nullptr, 0, 0, 0, 0};
+    wr_polar P = {0};
+    if (wf && !getenv("UFSM_WRAPS_NOBOUND")) {   /* the rays' radius bounds (the table spans the box's angles, bins ~1e-3 rad) */
+        P.rows = rows; P.t0 = th0 - 0.01; P.nb = (int)fmin(8192, fmax(64, ceil((th1 - th0 + 0.02) / 1e-3))); P.bw = (th1 - th0 + 0.02) / P.nb;
+        P.rmin = malloc((size_t)rows * P.nb * sizeof(float)); P.rmax = malloc((size_t)rows * P.nb * sizeof(float));
+        wr_polar_job PJ = {&P, m, wf, {wsh[0], wsh[1], wsh[2]}, wh, step, Z, na, 0};
+        pthread_t th[64]; const int nt = nthreads < 64 ? (nthreads > 0 ? nthreads : 1) : 64;
+        for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wr_polar_rows, &PJ);
         for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
-        const size_t valid = atomic_load(&J.valid);
-        if ((snapz || sfa) && valid) { const size_t mv = wraps_snap(snapz, snapo, m, rows, cols, px, py, pz, snap_range, snap_min, nthreads, sfa, sfn, sfo, sfh); if (verbose_snap) fprintf(stderr, "wraps: w%03d: %zu of %zu vertices snapped\n", k, mv, valid); }
-        if (valid > 16) {
-            char wd[1400]; snprintf(wd, sizeof wd, "%s/w%03d", argv[3], k);
-            double wstep = step, wum = um;
-            if (out_um > 0 && fabs(out_um - um) > 1e-9) {   /* --out-um: coordinates on another grid of the same scan (voxel centres to voxel centres) */
-                const double f = um / out_um;
-                for (size_t i = 0; i < nv; i++) if (pz[i] >= 0) { px[i] = (float)((px[i] + 0.5) * f - 0.5); py[i] = (float)((py[i] + 0.5) * f - 0.5); pz[i] = (float)((pz[i] + 0.5) * f - 0.5); }
-                wstep = step * f; wum = out_um;
-            }
-            if (tifxyz_write(wd, cols, rows, px, py, pz, wstep, wum, k, "ufsm wraps (fitted winding level set)")) { fprintf(stderr, "wraps: cannot write %s\n", wd); return 1; }
-            nwr++; nvalid_all += valid;
-        }
-        free(px); free(py); free(pz);
+        A.P = &P;
     }
+    const int par = !(snapz || sfa) && nthreads > 1;
+    if (par) {
+        pthread_t th[64]; const int nt = nthreads < 64 ? nthreads : 64;
+        for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, wraps_worker, &A);
+        for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+    } else for (int k = k0; k <= k1; k++) if (wrap_one(&A, k, nthreads)) A.fail = 1;
+    free(P.rmin); free(P.rmax);
+    if (A.fail) return 1;
+    const int nwr = A.nwr; const size_t nvalid_all = A.nvalid;
     fprintf(stderr, "wraps: %d wraps (%d..%d) with %zu vertices written to %s\n", nwr, k0, k1, nvalid_all, argv[3]);
     fit_set_free(fs); free(wf); free(sfa); if (snapz) z3_close(snapz);
     return 0;

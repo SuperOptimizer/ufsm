@@ -54,19 +54,48 @@ void cl_free(coreline *c) { for (int k = 0; k < c->ns; k++) { free(c->s[k].y); f
 
 double cl_poly_sdist(const double *Y, const double *X, int n, double py, double px, double q[2], double nrm[2]) {
     double best = 1e300, qy = Y[0], qx = X[0], ty = 0, tx = 1;
+    int bi = -1; double bt = 0;   /* the nearest segment and its parameter: its tangent once, after the scan (the same values as
+                                     computing it at every improvement, which took ~60% of the masks' time in hypot) */
+    /* Groups of CL_G segments whose bounding box is farther than an upper bound B of the nearest distance (the nearest segment of
+       the nearest box) are skipped: their segments cannot be the first nearest one, so the ordered scan of the rest finds the same
+       segment, distance and point (the margin covers rounding). */
+    enum { CL_G = 8, CL_MAXG = 512 };
+    const int ns = n - 1, ng = (ns + CL_G - 1) / CL_G;
+    double lb[CL_MAXG]; double B = 1e300;
+    if (ns > 2 * CL_G && ng <= CL_MAXG) {
+        int gb = 0;
+        for (int g = 0; g < ng; g++) {
+            const int a = g * CL_G, e = a + CL_G < ns ? a + CL_G : ns;   /* segments [a, e): points a..e */
+            double ylo = Y[a], yhi = Y[a], xlo = X[a], xhi = X[a];
+            for (int k = a + 1; k <= e; k++) { ylo = Y[k] < ylo ? Y[k] : ylo; yhi = Y[k] > yhi ? Y[k] : yhi; xlo = X[k] < xlo ? X[k] : xlo; xhi = X[k] > xhi ? X[k] : xhi; }
+            const double dy = py < ylo ? ylo - py : py > yhi ? py - yhi : 0, dx = px < xlo ? xlo - px : px > xhi ? px - xhi : 0;
+            lb[g] = dy * dy + dx * dx; if (lb[g] < lb[gb]) gb = g;
+        }
+        for (int i = gb * CL_G; i < (gb + 1) * CL_G && i < ns; i++) {
+            const double ey = Y[i + 1] - Y[i], ex = X[i + 1] - X[i], l2 = ey * ey + ex * ex; if (l2 <= 0) continue;
+            double t = ((py - Y[i]) * ey + (px - X[i]) * ex) / l2; t = t < 0 ? 0 : t > 1 ? 1 : t;
+            const double cy = Y[i] + t * ey, cx = X[i] + t * ex, d2 = (py - cy) * (py - cy) + (px - cx) * (px - cx);
+            if (d2 < B) B = d2;
+        }
+        B = B * (1 + 1e-9) + 1e-9;
+    }
     for (int i = 0; i + 1 < n; i++) {
+        if (B < 1e300 && i % CL_G == 0 && lb[i / CL_G] > B) { i += CL_G - 1; continue; }
         const double ey = Y[i + 1] - Y[i], ex = X[i + 1] - X[i], l2 = ey * ey + ex * ex; if (l2 <= 0) continue;
         double t = ((py - Y[i]) * ey + (px - X[i]) * ex) / l2; t = t < 0 ? 0 : t > 1 ? 1 : t;
         const double cy = Y[i] + t * ey, cx = X[i] + t * ex, d2 = (py - cy) * (py - cy) + (px - cx) * (px - cx);
-        if (d2 < best) {
-            best = d2; qy = cy; qx = cx; const double l = sqrt(l2); ty = ey / l; tx = ex / l;
-            /* at an interior vertex the tangent is the mean of the two segments' (the sign of a point beyond a corner) */
-            const int v = t <= 0 ? i : t >= 1 ? i + 1 : -1;
-            if (v > 0 && v < n - 1) {
-                const double ay = Y[v] - Y[v - 1], ax = X[v] - X[v - 1], by = Y[v + 1] - Y[v], bx = X[v + 1] - X[v];
-                const double la = hypot(ay, ax), lb = hypot(by, bx);
-                if (la > 0 && lb > 0) { double my = ay / la + by / lb, mx = ax / la + bx / lb, lm = hypot(my, mx); if (lm > 1e-9) { ty = my / lm; tx = mx / lm; } }
-            }
+        if (d2 < best) { best = d2; qy = cy; qx = cx; bi = i; bt = t; }
+    }
+    if (bi >= 0) {
+        const int i = bi; const double t = bt;
+        const double ey = Y[i + 1] - Y[i], ex = X[i + 1] - X[i], l2 = ey * ey + ex * ex;
+        const double l = sqrt(l2); ty = ey / l; tx = ex / l;
+        /* at an interior vertex the tangent is the mean of the two segments' (the sign of a point beyond a corner) */
+        const int v = t <= 0 ? i : t >= 1 ? i + 1 : -1;
+        if (v > 0 && v < n - 1) {
+            const double ay = Y[v] - Y[v - 1], ax = X[v] - X[v - 1], by = Y[v + 1] - Y[v], bx = X[v + 1] - X[v];
+            const double la = hypot(ay, ax), lb = hypot(by, bx);
+            if (la > 0 && lb > 0) { double my = ay / la + by / lb, mx = ax / la + bx / lb, lm = hypot(my, mx); if (lm > 1e-9) { ty = my / lm; tx = mx / lm; } }
         }
     }
     const double ny = tx, nx = -ty;   /* left normal: n . d = cross(t, d) */

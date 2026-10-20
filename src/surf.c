@@ -293,6 +293,7 @@ typedef struct {
     const sf_wrap *s; const sf_fields *F; float *e, *cf; float *ct; int nprof; double ctum, ctR, ctstep; const uint8_t *vol; int64_t vo[3], vn[3];
     int r0, r1, c0, c1; _Atomic int next; double ctf; int sign;
     const fit_set *ms; float *sr;   /* with the model: per vertex the distance to the next wrap outward / the fields' spacing */
+    struct ct_cache_ *cc; int mark;  /* the CT from the chunk cache (vol null): mark its chunks (mark 1) or sample */
 } ss_job;
 static double vol_tri(const uint8_t *v, const int64_t n[3], double z, double y, double x) {
     if (z < 0 || y < 0 || x < 0 || z > n[0] - 1 || y > n[1] - 1 || x > n[2] - 1) return NAN;
@@ -305,12 +306,99 @@ static double vol_tri(const uint8_t *v, const int64_t n[3], double z, double y, 
     }
     return s;
 }
+/* The CT profiles' voxels from a cache of decoded inner chunks (surf-stats --ct). Each tile of vertices used to read (decode) its
+   whole bounding box: a curved strip of a wrap spans a box many times its own volume, and the next wrap (~30 CT voxels outward)
+   decoded the same chunks again, ~most of a 2 cm half box's surf-stats. Now a tile first marks the chunks its samples touch,
+   the missing ones are decoded on threads (z3_read of the chunk-aligned box: the same voxels), and the samples read them; the
+   chunks stay cached for the next tiles and wraps until the last wrap that reads them is done (ct_wrap; the least recently used
+   evicted beyond UFSM_CT_CACHE_MB, default 2048: a 2 cm half box holds at most ~810 chunks). The tile
+   box (its bounds make samples outside NaN, a box over 3 GB is skipped) is kept as before: the same profiles, bit for bit. */
+typedef struct ct_cache_ { z3 *z; int64_t shape[3]; int cs[3]; int64_t g[3]; uint8_t **ch; uint32_t *stamp; _Atomic uint8_t *need; size_t nres, cap; uint32_t clock; int nt;
+                 int32_t *last; size_t maxres; } ct_cache;   /* last: per chunk the last wrap that reads it (-1: none known; the premark pass) */
+static _Atomic size_t g_ctc_decoded;   /* chunks decoded (UFSM_CT_CACHE_STATS=1 prints it) */
+static int ctc_init(ct_cache *c, z3 *z, int nt) {
+    memset(c, 0, sizeof *c); const z3_meta *m = z3_meta_of(z); c->z = z; c->nt = nt < 1 ? 1 : nt;
+    for (int d = 0; d < 3; d++) { c->shape[d] = m->shape[d]; c->cs[d] = m->chunk[d] > 0 ? m->chunk[d] : 128; c->g[d] = (m->shape[d] + c->cs[d] - 1) / c->cs[d]; }
+    const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2];
+    c->ch = calloc(ng, sizeof *c->ch); c->stamp = calloc(ng, sizeof *c->stamp); c->need = calloc(ng, 1); c->last = malloc(ng * sizeof *c->last);
+    if (c->last) for (size_t k = 0; k < ng; k++) c->last[k] = -1;
+    const char *e = getenv("UFSM_CT_CACHE_MB"); const double mb = e && atof(e) > 0 ? atof(e) : 2048;
+    c->cap = (size_t)(mb * 1048576.0 / ((double)c->cs[0] * c->cs[1] * c->cs[2])); if (c->cap < 8) c->cap = 8;
+    return c->ch && c->stamp && c->need && c->last ? 0 : -1;
+}
+static void ctc_free(ct_cache *c) {
+    const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2];
+    if (getenv("UFSM_CT_CACHE_STATS")) { size_t u = 0; for (size_t k = 0; c->stamp && k < ng; k++) u += c->stamp[k] != 0; fprintf(stderr, "surf-stats: CT chunks decoded %zu, distinct %zu, cache %zu chunks (at most %zu held)\n", (size_t)g_ctc_decoded, u, c->cap, c->maxres); }
+    for (size_t k = 0; c->ch && k < ng; k++) free(c->ch[k]);
+    free(c->ch); free((void *)c->need); free(c->stamp); free(c->last); memset(c, 0, sizeof *c);
+}
+static inline size_t ctc_idx(const ct_cache *c, int64_t z, int64_t y, int64_t x) { return ((size_t)(z / c->cs[0]) * c->g[1] + (size_t)(y / c->cs[1])) * c->g[2] + (size_t)(x / c->cs[2]); }
+static inline uint8_t ctc_at(const ct_cache *c, int64_t z, int64_t y, int64_t x) {
+    const uint8_t *b = c->ch[ctc_idx(c, z, y, x)];
+    return b[((size_t)(z % c->cs[0]) * c->cs[1] + (size_t)(y % c->cs[1])) * c->cs[2] + (size_t)(x % c->cs[2])];
+}
+/* vol_tri of the tile box at o (shape n) over the cache: mark (the chunks of the corners it reads) or sample */
+static double vol_tri_cc(ct_cache *cc, const int64_t o[3], const int64_t n[3], double z, double y, double x, int mark) {
+    if (z < 0 || y < 0 || x < 0 || z > n[0] - 1 || y > n[1] - 1 || x > n[2] - 1) return NAN;
+    int a = (int)z, b = (int)y, c = (int)x; if (a > n[0] - 2) a = (int)n[0] - 2; if (b > n[1] - 2) b = (int)n[1] - 2; if (c > n[2] - 2) c = (int)n[2] - 2;
+    a = a < 0 ? 0 : a; b = b < 0 ? 0 : b; c = c < 0 ? 0 : c;
+    const double fz = z - a, fy = y - b, fx = x - c; double s = 0;
+    for (int k = 0; k < 8; k++) {
+        const int p = a + (k >> 2 & 1), q = b + (k >> 1 & 1), r = c + (k & 1); if (p >= n[0] || q >= n[1] || r >= n[2]) continue;
+        if (mark) { atomic_store_explicit(&cc->need[ctc_idx(cc, o[0] + p, o[1] + q, o[2] + r)], 1, memory_order_relaxed); continue; }
+        s += (k >> 2 & 1 ? fz : 1 - fz) * (k >> 1 & 1 ? fy : 1 - fy) * (k & 1 ? fx : 1 - fx) * ctc_at(cc, o[0] + p, o[1] + q, o[2] + r);
+    }
+    return s;
+}
+typedef struct { ct_cache *c; const int64_t *todo; size_t n; _Atomic size_t next; _Atomic int err; } ctc_job;
+static void *ctc_decode(void *arg) {
+    ctc_job *J = arg; ct_cache *c = J->c;
+    for (size_t k; (k = atomic_fetch_add(&J->next, 1)) < J->n;) {
+        const int64_t id = J->todo[k], cz = id / (c->g[1] * c->g[2]), cy = id / c->g[2] % c->g[1], cx = id % c->g[2];
+        const int64_t o[3] = {cz * c->cs[0], cy * c->cs[1], cx * c->cs[2]}, nn[3] = {c->cs[0], c->cs[1], c->cs[2]};
+        uint8_t *b = malloc((size_t)nn[0] * nn[1] * nn[2]);
+        if (!b || z3_read(c->z, o, nn, b, 1)) { free(b); atomic_store(&J->err, 1); continue; }
+        c->ch[id] = b; atomic_fetch_add(&g_ctc_decoded, 1);
+    }
+    return nullptr;
+}
+/* the marked chunks: decode the missing ones (threads), stamp them, evict the least recently used beyond the cap; clears the marks */
+static int ctc_fill(ct_cache *c) {
+    const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2]; c->clock++;
+    int64_t *todo = nullptr; size_t ntodo = 0, captodo = 0;
+    for (size_t k = 0; k < ng; k++) if (c->need[k]) {
+        c->need[k] = 0; c->stamp[k] = c->clock;
+        if (c->ch[k]) continue;
+        if (ntodo == captodo) { captodo = captodo ? 2 * captodo : 256; todo = realloc(todo, captodo * sizeof *todo); }
+        todo[ntodo++] = (int64_t)k;
+    }
+    ctc_job J = {c, todo, ntodo, 0, 0};
+    pthread_t th[64]; const int m = c->nt < 64 ? c->nt : 64;
+    for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, ctc_decode, &J);
+    for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
+    free(todo); c->nres += ntodo; if (c->nres > c->maxres) c->maxres = c->nres;
+    if (atomic_load(&J.err)) return -1;
+    while (c->nres > c->cap) {   /* evict: the oldest stamps first, never this tile's */
+        uint32_t old = c->clock; for (size_t k = 0; k < ng; k++) if (c->ch[k] && c->stamp[k] < old) old = c->stamp[k];
+        if (old == c->clock) break;
+        for (size_t k = 0; k < ng && c->nres > c->cap; k++) if (c->ch[k] && c->stamp[k] == old) { free(c->ch[k]); c->ch[k] = nullptr; c->nres--; }
+    }
+    return 0;
+}
+static void ctc_last(ct_cache *c, int k) {   /* the premark pass: the marked chunks' last wrap is k (wraps in order) */
+    const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2];
+    for (size_t q = 0; q < ng; q++) if (c->need[q]) { c->need[q] = 0; c->last[q] = k; }
+}
+static void ctc_done(ct_cache *c, int k) {   /* wrap k done: drop the chunks no later wrap reads */
+    const size_t ng = (size_t)c->g[0] * c->g[1] * c->g[2];
+    for (size_t q = 0; q < ng; q++) if (c->ch[q] && c->last[q] >= 0 && c->last[q] <= k) { free(c->ch[q]); c->ch[q] = nullptr; c->nres--; }
+}
 static void *ss_rows(void *arg) {   /* phase residual and confidence at each vertex; with a CT tile, the CT profile along the normal */
     ss_job *J = arg; const sf_wrap *s = J->s;
     for (int r; (r = J->r0 + atomic_fetch_add(&J->next, 1)) < J->r1;) for (int c = J->c0; c < J->c1; c++) {
         const size_t i = (size_t)r * s->w + c; if (s->Z[i] < 0) continue;
         double q[3], N[3];
-        if (!J->vol) {
+        if (!J->vol && !J->cc) {
             sf_native(s, J->F, i, q, nullptr, 1); double vc, vs; sff_phase(J->F, q, &vc, &vs);
             J->cf[i] = (float)sqrt(vc * vc + vs * vs); J->e[i] = (float)wrap_turn(atan2(vs, vc) / (2 * M_PI));
             if (J->ms && sf_native(s, J->F, i, q, N, J->sign)) {   /* the wrap spacing along the normal against the fields' spacing */
@@ -332,7 +420,8 @@ static void *ss_rows(void *arg) {   /* phase residual and confidence at each ver
             const double t = (k - (J->nprof - 1) / 2.0) * J->ctstep;   /* um along the normal (outward = +) */
             const double p[3] = {(q[0] + J->F->org[0] + 0.5) * f - 0.5 + t / J->ctum * N[0] - J->vo[0], (q[1] + J->F->org[1] + 0.5) * f - 0.5 + t / J->ctum * N[1] - J->vo[1],
                                  (q[2] + J->F->org[2] + 0.5) * f - 0.5 + t / J->ctum * N[2] - J->vo[2]};
-            J->ct[i * J->nprof + k] = (float)vol_tri(J->vol, J->vn, p[0], p[1], p[2]);
+            if (J->cc) { const double v = vol_tri_cc(J->cc, J->vo, J->vn, p[0], p[1], p[2], J->mark); if (!J->mark) J->ct[i * J->nprof + k] = (float)v; }
+            else J->ct[i * J->nprof + k] = (float)vol_tri(J->vol, J->vn, p[0], p[1], p[2]);
         }
     }
     return nullptr;
@@ -381,6 +470,37 @@ static double sf_largest_clean(const sf_wrap *s, const uint8_t *clean, double *t
     free(lab); free(stk); *total = tot;
     return best;
 }
+/* the CT profiles of one wrap (k: its index) in tiles of 128 x 512 vertices, each with its own box (+ the profile reach) as when each
+   tile decoded its box. premark: only record the last wrap whose samples touch each chunk (ct_cache last), so that the main pass drops
+   a chunk once its last wrap is done: each chunk decoded once (consecutive wraps ~30 CT voxels apart share most of their chunks; an
+   LRU of 384 chunks decoded each ~5 times on a 2 cm half box) */
+static int ct_wrap(ct_cache *ctc, z3 *cz, const sf_wrap *s, const sf_fields *F, float *e, float *cf, float *ct, int nprof, double ctum, double ctR, double ctstep,
+                   int sign, int nt, int k, int premark) {
+    const z3_meta *zm = z3_meta_of(cz); const double f = F->um / ctum, reach = 30 / ctum + 2; int rc = 0;
+    for (int r0 = 0; r0 < s->h; r0 += 128) for (int c0 = 0; c0 < s->w; c0 += 512) {
+        const int r1 = r0 + 128 < s->h ? r0 + 128 : s->h, c1 = c0 + 512 < s->w ? c0 + 512 : s->w;
+        double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+        for (int r = r0; r < r1; r++) for (int c = c0; c < c1; c++) {
+            const size_t i = (size_t)r * s->w + c; if (s->Z[i] < 0) continue; double q[3]; sf_native(s, F, i, q, nullptr, 1);
+            for (int d = 0; d < 3; d++) { const double v = (q[d] + F->org[d] + 0.5) * f - 0.5; if (v < lo[d]) lo[d] = v; if (v > hi[d]) hi[d] = v; }
+        }
+        if (lo[0] > hi[0]) continue;
+        ss_job J = {s, F, e, cf, ct, nprof, ctum, ctR, ctstep, nullptr, {0}, {0}, r0, r1, c0, c1, 0, f, sign, nullptr, nullptr, nullptr, 0}; int ok = 1;
+        for (int d = 0; d < 3; d++) { int64_t a = (int64_t)floor(lo[d] - reach), b = (int64_t)ceil(hi[d] + reach) + 1; if (a < 0) a = 0; if (b > zm->shape[d]) b = zm->shape[d]; if (b <= a) ok = 0; J.vo[d] = a; J.vn[d] = b - a; }
+        if (!ok || (size_t)J.vn[0] * J.vn[1] * J.vn[2] > ((size_t)3 << 30)) continue;
+        J.cc = ctc; J.mark = 1;   /* the chunks the tile's samples read, then the samples */
+        pthread_t th[64]; const int m = nt < 64 ? nt : 64;
+        for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, ss_rows, &J);
+        for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
+        if (premark) { ctc_last(ctc, k); continue; }
+        if (ctc_fill(ctc)) { rc = -1; continue; }
+        J.mark = 0; atomic_store(&J.next, 0);
+        for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, ss_rows, &J);
+        for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
+    }
+    if (!premark) ctc_done(ctc, k);
+    return rc;
+}
 int cmd_surf_stats(int argc, char **argv) {
     if (argc < 3 || !sopt(argc, argv, "--fields", nullptr)) {
         fprintf(stderr, "usage: ufsm surf-stats <wraps-dir> --fields DIR [--model FIT [--fault-ratio 3] [--fault-stride 2]] [--min-conf 0.3] [--gap 1] [--min-run 100] [--ct ROOT KEY --ct-um U [--ct-level 80] [--ct-range 15] [--cache DIR]] [--threads 16] [--per-wrap]\n"
@@ -389,11 +509,13 @@ int cmd_surf_stats(int argc, char **argv) {
     }
     const double cmin = atof(sopt(argc, argv, "--min-conf", "0.3")), gap_um = atof(sopt(argc, argv, "--gap", "1")) * 1000, min_um = atof(sopt(argc, argv, "--min-run", "100"));
     const int nt = atoi(sopt(argc, argv, "--threads", "16")), per = sflag(argc, argv, "--per-wrap");
+    fit_set_threads(nt);   /* the field loads' core masks */
     int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) ci = i;
     const double ctum = atof(sopt(argc, argv, "--ct-um", "0")), ctlev = atof(sopt(argc, argv, "--ct-level", "80")), ctR = atof(sopt(argc, argv, "--ct-range", "15"));
     if (ci > 0 && !(ctum > 0)) { fprintf(stderr, "surf-stats: --ct needs --ct-um (the CT array's voxel um)\n"); return 2; }
     z3 *cz = ci > 0 ? z3_open(store_open(argv[ci + 1]), argv[ci + 2], sopt(argc, argv, "--cache", nullptr)) : nullptr;
     if (ci > 0 && !cz) { fprintf(stderr, "surf-stats: %s\n", z3_error()); return 1; }
+    ct_cache ctc; memset(&ctc, 0, sizeof ctc); if (cz && ctc_init(&ctc, cz, nt)) { fprintf(stderr, "surf-stats: out of memory for the CT chunk table\n"); return 1; }
     sf_fields F; if (sff_load(sopt(argc, argv, "--fields", ""), &F)) { fprintf(stderr, "surf-stats: cannot read the fields\n"); return 1; }
     fit_set *ms = sopt(argc, argv, "--model", nullptr) ? fit_set_load(sopt(argc, argv, "--model", "")) : nullptr;   /* orients the normals */
     if (sopt(argc, argv, "--model", nullptr) && !ms) { fprintf(stderr, "surf-stats: cannot load the model %s\n", sopt(argc, argv, "--model", "")); return 1; }
@@ -409,6 +531,7 @@ int cmd_surf_stats(int argc, char **argv) {
         FJ.n[0] = (F.D + FJ.st - 1) / FJ.st; FJ.n[1] = (F.H + FJ.st - 1) / FJ.st; FJ.n[2] = (F.W + FJ.st - 1) / FJ.st;
         FJ.fault = calloc((size_t)FJ.n[0] * FJ.n[1] * FJ.n[2], 1); FJ.caprs = 1 << 22; FJ.rs = malloc(FJ.caprs * sizeof(float));
         pthread_t th[64]; const int m = nt < 64 ? nt : 64; for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, sf_fault_rows, &FJ); for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
+        free(wfield); wfield = nullptr; FJ.w = nullptr;   /* (only the faults read it: 1 GB of a 2 cm box freed for the CT chunk cache) */
         const long long nr = FJ.nrs < FJ.caprs ? FJ.nrs : FJ.caprs; if (nr) qsort(FJ.rs, nr, 4, cmp_f32);
         printf("surf-stats: faults (field cells every %d with |grad W| > %.1f x the sheet density): %lld of %lld cells, share %.4f; |grad W| / density median %.2f p10 %.2f p90 %.2f\n",
                FJ.st, FJ.ratio, (long long)FJ.nfault, (long long)FJ.ncell, FJ.ncell ? (double)FJ.nfault / FJ.ncell : 0, nr ? FJ.rs[nr / 2] : 0, nr ? FJ.rs[nr / 10] : 0, nr ? FJ.rs[nr * 9 / 10] : 0);
@@ -421,34 +544,20 @@ int cmd_surf_stats(int argc, char **argv) {
     float *eall = malloc(sizeof(float) * 1024), *aall = malloc(sizeof(float) * 1024), *cfall = malloc(sizeof(float) * 1024); size_t ne = 0, cape = 1024, na = 0, capa = 1024, ncf = 0, capc = 1024;
     float *srall = malloc(sizeof(float) * 1024); size_t nsa = 0, capsa = 1024, nsr = 0, srlo = 0, srhi = 0;
     if (per) printf("  wrap  vertices  conf>=%.1f  |e|med  |e|>0.25  theta sw/cm  z sw/cm%s\n", cmin, cz ? "  on-papyrus" : "");
+    for (int k = 0; cz && k < nn; k++) {   /* the CT chunks' last wraps */
+        sf_wrap s; if (sf_load(argv[2], names[k], &s)) continue;
+        ct_wrap(&ctc, cz, &s, &F, nullptr, nullptr, nullptr, nprof, ctum, ctR, ctstep, sf_orient(&s, &F, ms ? ms->global : nullptr), nt, k, 1);
+        sf_free(&s);
+    }
     for (int k = 0; k < nn; k++) {
         sf_wrap s; if (sf_load(argv[2], names[k], &s)) continue;
         const size_t n = (size_t)s.w * s.h; float *e = calloc(n, 4), *cf = calloc(n, 4), *ct = nprof ? malloc(n * nprof * 4) : nullptr;
         for (size_t i = 0; i < (size_t)n * nprof; i++) ct[i] = NAN;
         const int sign = sf_orient(&s, &F, ms ? ms->global : nullptr);
         float *sr = ms ? malloc(n * 4) : nullptr; if (sr) for (size_t i = 0; i < n; i++) sr[i] = NAN;
-        { ss_job J = {&s, &F, e, cf, nullptr, 0, 0, 0, 0, nullptr, {0}, {0}, 0, s.h, 0, s.w, 0, 0, sign, ms, sr};
+        { ss_job J = {&s, &F, e, cf, nullptr, 0, 0, 0, 0, nullptr, {0}, {0}, 0, s.h, 0, s.w, 0, 0, sign, ms, sr, nullptr, 0};
           pthread_t th[64]; const int m = nt < 64 ? nt : 64; for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, ss_rows, &J); for (int q = 0; q < m; q++) pthread_join(th[q], nullptr); }
-        if (cz) {   /* CT tiles of 128 x 512 vertices: each reads its own box (+ the profile reach) */
-            const z3_meta *zm = z3_meta_of(cz); const double f = F.um / ctum, reach = 30 / ctum + 2;
-            for (int r0 = 0; r0 < s.h; r0 += 128) for (int c0 = 0; c0 < s.w; c0 += 512) {
-                const int r1 = r0 + 128 < s.h ? r0 + 128 : s.h, c1 = c0 + 512 < s.w ? c0 + 512 : s.w;
-                double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
-                for (int r = r0; r < r1; r++) for (int c = c0; c < c1; c++) {
-                    const size_t i = (size_t)r * s.w + c; if (s.Z[i] < 0) continue; double q[3]; sf_native(&s, &F, i, q, nullptr, 1);
-                    for (int d = 0; d < 3; d++) { const double v = (q[d] + F.org[d] + 0.5) * f - 0.5; if (v < lo[d]) lo[d] = v; if (v > hi[d]) hi[d] = v; }
-                }
-                if (lo[0] > hi[0]) continue;
-                ss_job J = {&s, &F, e, cf, ct, nprof, ctum, ctR, ctstep, nullptr, {0}, {0}, r0, r1, c0, c1, 0, f, sign, nullptr, nullptr}; int ok = 1;
-                for (int d = 0; d < 3; d++) { int64_t a = (int64_t)floor(lo[d] - reach), b = (int64_t)ceil(hi[d] + reach) + 1; if (a < 0) a = 0; if (b > zm->shape[d]) b = zm->shape[d]; if (b <= a) ok = 0; J.vo[d] = a; J.vn[d] = b - a; }
-                if (!ok || (size_t)J.vn[0] * J.vn[1] * J.vn[2] > ((size_t)3 << 30)) continue;
-                uint8_t *vol = malloc((size_t)J.vn[0] * J.vn[1] * J.vn[2]);
-                if (!vol || z3_read(cz, J.vo, J.vn, vol, nt)) { free(vol); fprintf(stderr, "surf-stats: %s\n", z3_error()); continue; }
-                J.vol = vol;
-                pthread_t th[64]; const int m = nt < 64 ? nt : 64; for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, ss_rows, &J); for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
-                free(vol);
-            }
-        }
+        if (cz && ct_wrap(&ctc, cz, &s, &F, e, cf, ct, nprof, ctum, ctR, ctstep, sign, nt, k, 0)) { fprintf(stderr, "surf-stats: %s\n", z3_error()); }
         size_t wv = 0, wc = 0, wb = 0, won = 0, wct = 0; float *we = malloc(n * 4); size_t wne = 0;
         uint8_t *clean = ms ? calloc(n, 1) : nullptr;   /* clean vertices (the largest clean sheet) */
         for (size_t i = 0; i < n; i++) {
@@ -520,7 +629,7 @@ int cmd_surf_stats(int argc, char **argv) {
         for (int q = 0; q < nprof; q++) printf(" %+.0f:%.1f", (q - (nprof - 1) / 2.0) * ctstep, pcount[q] ? prof[q] / pcount[q] : 0);
         printf("\n");
     }
-    free(eall); free(aall); free(cfall); free(srall); free(prof); free(pcount); free(names); sff_free(&F); fit_set_free(ms); if (cz) z3_close(cz);
+    free(eall); free(aall); free(cfall); free(srall); free(prof); free(pcount); free(names); sff_free(&F); fit_set_free(ms); if (cz) { ctc_free(&ctc); z3_close(cz); }
     free(wfield); free(FJ.fault); free(FJ.rs);
     return 0;
 }
