@@ -43,8 +43,22 @@ split_t zs_split(split_t sp, int D) {
     return sp;
 }
 size_t zr_len(size_t len, int D) { return g_zr_Di ? len / D * zs_len((size_t)g_zr_Do, g_zr_Do) : zs_len(len, D); }   /* the statistics cover all Do output planes (split: of the window) */
-int zr_zero(void) { return !g_zr_Di || g_zr_first; }
-int zr_final(void) { return !g_zr_Di || g_zr_last; }
+/* z-window (level-0 slab streaming, stage S2): the next ops compute only the output planes [zw0, zw1) of their WHOLE output tensors
+   (the window in planes of a depth-D0 reference, the level-0 depth, scaled to each output's depth: zw0 D / D0). Tiles, staging and
+   stochastic-rounding keys are the whole launch's, so windows covering a tensor give the bits of one launch over all of it (given
+   the same seeds: nn_sr_set_ctr). first / last: the window that zeroes / finalises output GroupNorm sums. D0 0 = off. Per host thread. */
+thread_local int g_zw0, g_zw1, g_zwD0, g_zw_first, g_zw_last;
+extern "C" void nn_set_zwin(int zw0, int zw1, int D0, int first, int last) { g_zw0 = zw0; g_zw1 = zw1; g_zwD0 = D0; g_zw_first = first; g_zw_last = last; }
+int zw_win(int D, int *z0, int *z1) {
+    if (!g_zwD0) return 0;
+    if ((long)g_zw0 * D % g_zwD0 || (long)g_zw1 * D % g_zwD0 || g_zw1 <= g_zw0 || g_zw1 > g_zwD0) {
+        fprintf(stderr, "z-window [%d, %d) of depth %d does not scale to depth %d\n", g_zw0, g_zw1, g_zwD0, D); abort();
+    }
+    *z0 = (int)((long)g_zw0 * D / g_zwD0); *z1 = (int)((long)g_zw1 * D / g_zwD0);
+    return 1;
+}
+int zr_zero(void) { return (!g_zr_Di || g_zr_first) && (!g_zwD0 || g_zw_first); }
+int zr_final(void) { return (!g_zr_Di || g_zr_last) && (!g_zwD0 || g_zw_last); }
 int gn_fused_stored(const void *y, int cout) {
     /* MX epilogues can reduce their rounded outputs directly. Ordinary outputs retain
        the independent FP64 pass; the environment switch preserves the reference path. */
@@ -65,6 +79,9 @@ int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *
     if (g_zr_Di) {   /* z-range: the MX forward kernels (and the tap-packed stem kernel) */
         if (ts || !ISMX(y) || (!ISMX(x) && xs.c > 8) || sp.y2 || sp.accum || g_pass) { fprintf(stderr, "conv: the z-range needs an MX output and input (forward)\n"); abort(); }
         sp.zi0 = g_zr_z0; sp.Di = g_zr_Di;
+    }
+    if (zw_win(xs.d, &sp.zw0, &sp.zw1) && (ts || !ISMX(y) || sp.up && !ISMX(x) || g_zr_Di)) {   /* z-window: the MX kernels (forward and backward-data) */
+        fprintf(stderr, "conv: the z-window needs MX storage (no tap packing, no z-range)\n"); abort();
     }
     const int pr = eff_prec();
     const int mx = ISMX(x) || ISMX(y);
@@ -90,6 +107,7 @@ int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *
     return g_h16 ? conv_fwd_tc_h<f16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts) : VERIFY_ONLY(conv_fwd_tc_h<bf16>(x, xbf, xs, w, b, cout, y, ybf, gp, osum, Go, sp, ts));
 }
 int conv_fwd_tc_s2(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp) {
+    { int a, c; if (zw_win(ys.d, &a, &c) && !(ISMX(x) && ISMX(y))) { fprintf(stderr, "conv s2: the z-window needs MX storage\n"); abort(); } }
     if (ISMX(x) || ISMX(y)) {
         if (MXDT(x) != MXDT(y)) { fprintf(stderr, "conv s2: MX storage needs MX input and output of one format\n"); abort(); }
         const int r = lp_conv_fwd_s2_f8(x, MXDT(x), xs, w, b, cout, y, MXDT(y), ys, gp);

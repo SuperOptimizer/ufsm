@@ -75,7 +75,7 @@ __global__ void up2_mx_k(const uint8_t *x, uint8_t *y, int N, int C, int D, int 
    edge-clamped coordinates) once into smem as bf16 (decoded MX values are exact in bf16) and every fine voxel interpolates from
    it with the weights and order of up2_mx_k (identical output); up2_mx_k decoded each coarse row 8 times from global memory */
 template <int BX, int BY>
-__global__ void __launch_bounds__(256) up2_mx_tile_k(const uint8_t *x, uint8_t *y, int N, int C, int D, int H, int W, int Cx, int xb0) {   /* C: y channels;
+__global__ void __launch_bounds__(256) up2_mx_tile_k(const uint8_t *x, uint8_t *y, int N, int C, int D, int H, int W, int Cx, int xb0, int tz0 = 0) {   /* tz0: first fine z tile (z-window); C: y channels;
                                                                                     x: Cx channels, its blocks xb0.. (32-wide when Cx != C) */
     /* block = 4 x 4 x 32 fine voxels (thread: x lane, y (tid >> 5) & 3, two z); the coarse rows they read decoded once into an fp32
        tile (exact: the stored values), so the 8 x 32 trilinear terms of a voxel are plain loads + FMAs (no bf16 unpacking) */
@@ -89,7 +89,7 @@ __global__ void __launch_bounds__(256) up2_mx_tile_k(const uint8_t *x, uint8_t *
     int bt = blockIdx.x;
     const int ox0 = (bt % ntx) * 32; bt /= ntx;
     const int oy0 = (bt % nty) * 4; bt /= nty;
-    const int oz0 = bt * 4;
+    const int oz0 = (tz0 + bt) * 4;
     const int cz0 = (oz0 >> 1) - 1, cy0 = (oy0 >> 1) - 1, cx0 = (ox0 >> 1) - 1;
     const uint8_t *sc = mx_sc<BX>(x, N, Cx, S);
     for (int i = threadIdx.x; i < CZ * CY * CX; i += 256) {
@@ -155,14 +155,16 @@ extern "C" void lp_up2_fwd_mx(const void *x, int xdt, shape5 xs, void *y, int yd
     static int tiled = -1; if (tiled < 0) tiled = getenv("UFSM_UP2_TILE") ? atoi(getenv("UFSM_UP2_TILE")) : 1;
     if (tiled && !gp.G) {
         const size_t sm = (size_t)4 * 4 * 18 * 36 * 4;
-        const dim3 gt((unsigned)(((2 * xs.w + 31) / 32) * ((2 * xs.h + 3) / 4) * ((2 * xs.d + 3) / 4)), (unsigned)(xs.n * mx_nb(xs.c)));
-#define U2T(BX, BY) up2_mx_tile_k<BX, BY><<<gt, 256, sm>>>(xq, yq, xs.n, xs.c, xs.d, xs.h, xs.w, xs.c, 0)
+        const int2 zw = zw_trange(2 * xs.d, 4);   /* z-window: fine tiles of 4 planes */
+        const dim3 gt((unsigned)(((2 * xs.w + 31) / 32) * ((2 * xs.h + 3) / 4) * zw_ntiles(2 * xs.d, 4, zw)), (unsigned)(xs.n * mx_nb(xs.c)));
+#define U2T(BX, BY) up2_mx_tile_k<BX, BY><<<gt, 256, sm>>>(xq, yq, xs.n, xs.c, xs.d, xs.h, xs.w, xs.c, 0, zw.x)
         if (xdt == 4) { if (ydt == 4) U2T(4, 4); else U2T(4, 8); }
         else { if (ydt == 4) U2T(8, 4); else U2T(8, 8); }
 #undef U2T
         LPCK();
         return;
     }
+    if (zw_trange(2 * xs.d, 4).y) { fprintf(stderr, "lp_up2_fwd_mx: the z-window needs the tiled upsample (no GroupNorm)\n"); abort(); }
 #define U2(BX, BY) up2_mx_k<BX, BY><<<grid, 256>>>(xq, yq, xs.n, xs.c, xs.d, xs.h, xs.w, gp)
     if (xdt == 4) { if (ydt == 4) U2(4, 4); else U2(4, 8); }
     else { if (ydt == 4) U2(8, 4); else U2(8, 8); }
@@ -173,9 +175,10 @@ extern "C" void lp_up2_fwd_mx(const void *x, int xdt, shape5 xs, void *y, int yd
 extern "C" void lp_up2_fwd_mx_blocks(const void *x, int xdt, shape5 xs, int b0, int nbk, void *y, int ydt) {
     if (mx_bw(xs.c) != 32 || b0 < 0 || b0 + nbk > mx_nb(xs.c)) { fprintf(stderr, "lp_up2_fwd_mx_blocks: blocks %d + %d of %d channels\n", b0, nbk, xs.c); abort(); }
     const size_t sm = (size_t)4 * 4 * 18 * 36 * 4;
-    const dim3 gt((unsigned)(((2 * xs.w + 31) / 32) * ((2 * xs.h + 3) / 4) * ((2 * xs.d + 3) / 4)), (unsigned)(xs.n * nbk));
+    const int2 zw = zw_trange(2 * xs.d, 4);   /* z-window: fine tiles of 4 planes */
+    const dim3 gt((unsigned)(((2 * xs.w + 31) / 32) * ((2 * xs.h + 3) / 4) * zw_ntiles(2 * xs.d, 4, zw)), (unsigned)(xs.n * nbk));
     const uint8_t *xq = (const uint8_t *)x; uint8_t *yq = (uint8_t *)y;
-#define U2T(BX, BY) up2_mx_tile_k<BX, BY><<<gt, 256, sm>>>(xq, yq, xs.n, 32 * nbk, xs.d, xs.h, xs.w, xs.c, b0)
+#define U2T(BX, BY) up2_mx_tile_k<BX, BY><<<gt, 256, sm>>>(xq, yq, xs.n, 32 * nbk, xs.d, xs.h, xs.w, xs.c, b0, zw.x)
     if (xdt == 4) { if (ydt == 4) U2T(4, 4); else U2T(4, 8); }
     else { if (ydt == 4) U2T(8, 4); else U2T(8, 8); }
 #undef U2T

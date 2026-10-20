@@ -29,6 +29,7 @@ void nn_d2d(void *dst, const void *src, size_t bytes);
 void nn_d2d_async(void *dst, const void *src, size_t bytes);   /* on the default stream, no host sync */
 void nn_d2d_kernel(void *dst, const void *src, size_t bytes);  /* the same as a copy kernel (16-byte aligned dst, src): no copy engine */
 void nn_set_zrange(int zi0, int Di, int first, int last, int Do, int zo);   /* z-range of the next MX forward convs (see nn_bwd.cu): output planes zo + .. of Do, reading input planes zi0 + .. of a depth-Di input; Di 0 = off */
+void nn_set_zwin(int zw0, int zw1, int D0, int first, int last);   /* z-window of the next level-0 ops (see nn_bwd.cu): output planes [zw0, zw1) of their whole tensors, in planes of depth D0 (scaled per tensor); D0 0 = off; first / last zero / finalise GroupNorm sums */
 void nn_sync(void);
 void *nn_host_alloc(size_t bytes);       /* pinned host memory */
 void *nn_host_alloc_try(size_t bytes);   /* the same, nullptr when the host cannot pin that much */

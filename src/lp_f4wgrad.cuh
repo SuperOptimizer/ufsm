@@ -1122,13 +1122,15 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
         const size_t per_zt = (size_t)ys.n * ys.c * ((ys.h + 7) / 8) * Wb * GP4_REC;   /* one record per (n, co, z-step, 8-row tile, 16-x tile) */
         /* the records of the whole layer from the GN+SiLU backward apply that produced gy (lp_gn_silu_bwd_apply_rec): no pre-pass, one slab */
         const lp_gyrec_t &rc = g_gyrec;   /* this thread's (lp_gn_silu_bwd_apply_rec) */
-        const int cached = g_f4w_gy4 && rc.valid && rc.dev == cur_dev_() && rc.gy == (const void *)gy && rc.n == ys.n && rc.c == ys.c && rc.d == ys.d && rc.h == ys.h && rc.w == ys.w && gbw == rc.bw;
+        const int2 zw = zw_trange(ys.d, 2);   /* z-window: gy's z-steps [zt0, zt1) */
+        const int zt0 = zw.y ? zw.x : 0, zt1 = zw.y ? zw.y : nzt;
+        const int cached = !zw.y && g_f4w_gy4 && rc.valid && rc.dev == cur_dev_() && rc.gy == (const void *)gy && rc.n == ys.n && rc.c == ys.c && rc.d == ys.d && rc.h == ys.h && rc.w == ys.w && gbw == rc.bw;
         const size_t cap_zt = (cap_kb << 10) / per_zt;
         const int szt = cached ? nzt : cap_zt < 1 ? 1 : cap_zt < (size_t)nzt ? (int)cap_zt : nzt;
         uint8_t *buf = cached ? (uint8_t *)rc.rec : lp_buf<uint8_t>(4, per_zt * szt);
         if (cached && gb) gyrec_bias_k<<<nblk_((size_t)ys.c, 128), 128>>>(gb, rc.gb, ys.c);   /* the bias gradient: the apply's gy sums (N 1) */
-        for (int zs0 = 0; zs0 < nzt; zs0 += szt) {
-            const int zs1 = zs0 + szt < nzt ? zs0 + szt : nzt, Zs = (2 * zs1 < ys.d ? 2 * zs1 : ys.d) - 2 * zs0;
+        for (int zs0 = zt0; zs0 < zt1; zs0 += szt) {
+            const int zs1 = zs0 + szt < zt1 ? zs0 + szt : zt1, Zs = (2 * zs1 < ys.d ? 2 * zs1 : ys.d) - 2 * zs0;
             const size_t ntile = (size_t)2 * ((Zs + 1) / 2) * 4 * ((ys.h + 7) / 8) * Wb;   /* the padded block grid of the records */
             const size_t nwb = (ntile + 7) / 8;   /* CTAs of 8 warps, a few tiles per warp */
             const dim3 pg((unsigned)(nwb < 4096 ? nwb : 4096), (unsigned)(ys.n * mx_nb(ys.c)));
@@ -1194,6 +1196,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
 #endif
         return;
     }
+    if (zw_trange(ys.d, 2).y) { fprintf(stderr, "lp_bwd_w_f4: the z-window needs the gy pre-pass path\n"); abort(); }
     int nzc = (nzt + ZC - 1) / ZC;
     dim3 grid((unsigned)(nblk_(ys.w, 16) * nblk_(ys.h, 8) * nzc * ys.n), (xs.c + 8 * NT - 1) / (8 * NT), (ys.c + 16 * MT - 1) / (16 * MT));
     switch (MT * 10 + NT) {
