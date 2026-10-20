@@ -434,3 +434,64 @@ int cmd_phase_score(int argc, char **argv) {
     if (phase_score_dirs(argv[2], argv[3], argc > 4 ? argv[4] : nullptr, stdout)) { fprintf(stderr, "phase-score: cannot open %s\n", argv[2]); return 1; }
     return 0;
 }
+
+/* ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500]
+   [--crop x,y,w,h] [--threads 16]: renders of one surface on one pixel grid (ufsm render: <wrap>_ct.tif and the ink <wrap>.tif of each ink volume)
+   -> CT | ink 1 | ink 2 .. half-resolution JPEG (q90; none when under 5% of the CT pixels have data), and per ink over the CT > 0
+   pixels one line "ink LABEL: n .. mean .. frac50 .. p50 .. p95 .. p99 .. band .." (ink_stats: band = the contrast between the
+   --rs-um and --rl-um box scales) and "corr A B: r" for each pair. Exit 0, 3 when skipped (too little CT). */
+int cmd_ink_compare(int argc, char **argv) {
+    const int ci = rarg(argc, argv, "--ct");
+    if (argc < 5 || ci < 0 || ci + 1 >= argc || rarg(argc, argv, "--ink") < 0) {
+        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h] [--threads 16]\n"); return 2;
+    }
+    const double px = atof(ropt(argc, argv, "--px-um", "2.4")), rsu = atof(ropt(argc, argv, "--rs-um", "25")), rlu = atof(ropt(argc, argv, "--rl-um", "500"));
+    const int nthreads = atoi(ropt(argc, argv, "--threads", "16"));
+    if (!(px > 0) || !(rsu > 0) || !(rlu > rsu)) { fprintf(stderr, "ink-compare: need --px-um > 0 and 0 < --rs-um < --rl-um\n"); return 2; }
+    enum { MAXI = 8 }; const uint8_t *img[MAXI + 1] = {0}; int isct[MAXI + 1] = {1}; const char *lab[MAXI + 1] = {"ct"}; int n = 1, W, H, rc = 0;
+    uint8_t *ct = img_read_u8(argv[ci + 1], &W, &H);
+    if (!ct) { fprintf(stderr, "ink-compare: cannot read %s\n", argv[ci + 1]); return 1; }
+    img[0] = ct;
+    for (int a = 2; a + 1 < argc; a++) {
+        if (strcmp(argv[a], "--ink")) continue;
+        const char *eq = strchr(argv[a + 1], '=');
+        if (!eq || n > MAXI) { fprintf(stderr, "ink-compare: --ink LABEL=PATH (at most %d)\n", MAXI); return 2; }
+        int w, h; uint8_t *im = img_read_u8(eq + 1, &w, &h);
+        if (!im || w != W || h != H) { fprintf(stderr, "ink-compare: cannot read %s as a %d x %d render\n", eq + 1, W, H); free(im); return 1; }
+        lab[n] = strndup(argv[a + 1], (size_t)(eq - argv[a + 1])); isct[n] = 0; img[n++] = im;
+    }
+    const char *cr = ropt(argc, argv, "--crop", nullptr);
+    if (cr) {   /* --crop x,y,w,h: every render cut to the rectangle (clipped to the image) before the statistics and the panels */
+        int cx, cy, cw, ch;
+        if (sscanf(cr, "%d,%d,%d,%d", &cx, &cy, &cw, &ch) != 4 || cx < 0 || cy < 0 || cw < 2 || ch < 2 || cx >= W || cy >= H) { fprintf(stderr, "ink-compare: --crop x,y,w,h inside the %d x %d render\n", W, H); return 2; }
+        if (cx + cw > W) cw = W - cx;
+        if (cy + ch > H) ch = H - cy;
+        for (int k = 0; k < n; k++) {
+            uint8_t *c = malloc((size_t)cw * ch); if (!c) return 1;
+            for (int y = 0; y < ch; y++) memcpy(c + (size_t)y * cw, img[k] + (size_t)(cy + y) * W + cx, (size_t)cw);
+            free((void *)img[k]); img[k] = c;
+        }
+        ct = (uint8_t *)img[0]; W = cw; H = ch;
+    }
+    const size_t np = (size_t)W * H; uint8_t *mask = malloc(np);
+    if (!mask) return 1;
+    for (size_t i = 0; i < np; i++) mask[i] = ct[i] > 0;
+    const int rs = (int)lround(rsu / px), rl = (int)lround(rlu / px);
+    for (int k = 1; k < n; k++) {
+        ink_stats_t st;
+        if (ink_stats(img[k], mask, W, H, rs < 1 ? 1 : rs, rl < 2 ? 2 : rl, &st)) { fprintf(stderr, "ink-compare: out of memory\n"); return 1; }
+        printf("ink %s: n %lld mean %.4f frac50 %.4f p50 %.3f p95 %.3f p99 %.3f band %.4f\n", lab[k], st.n, st.mean, st.frac50, st.p50, st.p95, st.p99, st.band);
+    }
+    for (int a = 1; a < n; a++) for (int b = a + 1; b < n; b++) printf("corr %s %s: %.4f\n", lab[a], lab[b], ink_corr(img[a], img[b], mask, np));
+    if (overlay_red_skip(ct, np)) { fprintf(stderr, "ink-compare: under 5%% of the CT pixels have data: no %s\n", argv[2]); rc = 3; }
+    else {
+        int ow, oh; uint8_t *rgb = ink_panels_half(img, isct, n, W, H, lab, &ow, &oh, nthreads);
+        if (!rgb || jpeg_write_rgb(argv[2], ow, oh, rgb, 90)) { fprintf(stderr, "ink-compare: cannot write %s\n", argv[2]); rc = 1; }
+        free(rgb);
+    }
+    fflush(stdout);
+    for (int k = 0; k < n; k++) free((void *)img[k]);
+    for (int k = 1; k < n; k++) free((void *)lab[k]);
+    free(mask);
+    return rc;
+}

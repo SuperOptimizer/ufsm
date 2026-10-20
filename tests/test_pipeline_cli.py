@@ -114,6 +114,32 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
             run(*pred, destination, *grid_opts, '--shard', '128', '--box', ','.join(map(str, origin + shape)),
                 extra_env={'UFSM_PRED_HOSTPATH': str(host)})
             assert read_bytes(destination, [0, 0, 0], shape) == expected, (origin, shape, host)
+    # --full-grid: one output on the CT's whole grid, a box selecting (shard-rounded) shards; --resume skips written shards
+    # (predict-done-<level>.txt); --occupancy L skips shards that are all zero on CT level L. z < 128 of ctair is air.
+    air = ['predict', t / 'moved.ckpt', t, 'ctair']
+    air_opts = ['--um', '1', '--window', '32', '--halo', '0', '--shard', '128', '--levels', '1', '--q', '0', '--threads', '1']
+    run(*air, t / 'air-box', *air_opts, '--box', '128,0,0,128,128,128')
+    out = run(*air, t / 'air-full', *air_opts, '--full-grid', '1', '--resume', '1', '--box', '130,5,5,10,10,10')
+    assert 'box rounded to shards: origin 128,0,0 size 128,128,128' in out, out
+    assert json.loads((t / 'air-full/1/zarr.json').read_text())['shape'] == [256, 128, 128]
+    assert json.loads((t / 'air-full/1/zarr.json').read_text())['attributes']['ufsm']['origin_zyx'] == [0, 0, 0]
+    assert (t / 'air-full/predict-done-1.txt').read_text() == '1 0 0\n'
+    full = read_bytes(t / 'air-full', [128, 0, 0], [128, 128, 128])
+    assert any(full) and full == read_bytes(t / 'air-box', [0, 0, 0], [128, 128, 128]), 'full-grid shard differs from the box run'
+    before = chunks(t / 'air-full')
+    out = run(*air, t / 'air-full', *air_opts, '--full-grid', '1', '--resume', '1', '--occupancy', '1')
+    assert '2 shards in the box: 1 already written (--resume), 1 air on CT level 1 (--occupancy), 0 to compute' in out, out
+    assert chunks(t / 'air-full') == before and (t / 'air-full/predict-done-1.txt').read_text() == '1 0 0\n'
+    out = run(*air, t / 'air-occ', *air_opts, '--full-grid', '1', '--resume', '1', '--occupancy', '1')
+    assert '0 already written (--resume), 1 air on CT level 1 (--occupancy), 1 to compute' in out, out
+    assert read_bytes(t / 'air-occ', [128, 0, 0], [128, 128, 128]) == full
+    assert (t / 'air-occ/predict-done-1.txt').read_text() == '1 0 0\n'
+    if gpu_count() >= 2:
+        run(*air, t / 'air-gpus', *air_opts, '--full-grid', '1', '--resume', '1', '--gpus', '0,1', '--box', '0,0,0,256,128,128')
+        assert read_bytes(t / 'air-gpus', [128, 0, 0], [128, 128, 128]) == full
+        assert sorted((t / 'air-gpus/predict-done-1.txt').read_text().splitlines()) == ['0 0 0', '1 0 0']
+    run(*air, t / 'invalid', *air_opts, '--occupancy', '0', ok=2)
+    run(*air, t / 'invalid', *air_opts, '--full-grid', '1', '--box', '512,0,0,8,8,8', ok=2)
     # Version-1 models without a normalization field keep the historical graph.
     header, payload = (t / 'moved.ckpt').read_bytes().split(b'\n', 1)
     legacy = json.loads(header[4:]); del legacy['extra']['runtime']['gn_stored']

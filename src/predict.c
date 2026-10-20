@@ -18,6 +18,7 @@
 #include "z3w.h"
 #include "zarr3.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <sys/wait.h>
@@ -76,7 +77,8 @@ static void *reader_main(void *arg) {
 #define WBUF_MAX 32
 typedef struct { z3w *w; int nthreads; size_t bytes; uint8_t *buf[WBUF_MAX]; int64_t sz[WBUF_MAX], sy[WBUF_MAX], sx[WBUF_MAX]; int pending[WBUF_MAX]; int nb, next;
                  atomic_int failed; pthread_mutex_t mu; pthread_cond_t cv; int stop;
-                 int gpu, async, skip; void *evs[WBUF_MAX], *evd[WBUF_MAX]; double t_write; long n_write; } writer_t;   /* (UFSM_PRED_PROF: seconds compressing / writing, shards) */   /* async: buffer k arrives by a copy on the offload stream (evd[k]) */
+                 int gpu, async, skip; void *evs[WBUF_MAX], *evd[WBUF_MAX]; double t_write; long n_write;
+                 int64_t off[3]; int donefd; } writer_t;   /* off: shard index offset (--full-grid); donefd: the --resume log (-1 none) */   /* (UFSM_PRED_PROF: seconds compressing / writing, shards) */   /* async: buffer k arrives by a copy on the offload stream (evd[k]) */
 static void *writer_main(void *arg) {
     writer_t *W = arg;
     if (W->async) nn_init(W->gpu);
@@ -88,7 +90,8 @@ static void *writer_main(void *arg) {
         pthread_mutex_unlock(&W->mu);
         if (W->async) nn_event_sync(W->evd[k]);   /* the shard's device-to-host copy (queued without blocking the main thread) */
         const double tw = now();
-        if (!W->skip && z3w_write_shard(W->w, W->sz[k], W->sy[k], W->sx[k], W->buf[k], W->nthreads)) atomic_store(&W->failed, 1);   /* skip: --no-out 1 */
+        if (!W->skip && z3w_write_shard(W->w, W->sz[k] + W->off[0], W->sy[k] + W->off[1], W->sx[k] + W->off[2], W->buf[k], W->nthreads)) atomic_store(&W->failed, 1);   /* skip: --no-out 1 */
+        else if (W->donefd >= 0) dprintf(W->donefd, "%lld %lld %lld\n", (long long)(W->sz[k] + W->off[0]), (long long)(W->sy[k] + W->off[1]), (long long)(W->sx[k] + W->off[2]));   /* (O_APPEND: whole lines across GPU workers) */
         W->t_write += now() - tw; W->n_write++;
         pthread_mutex_lock(&W->mu); W->pending[k] = 0; W->next = (k + 1) % W->nb; pthread_cond_broadcast(&W->cv); pthread_mutex_unlock(&W->mu);
     }
@@ -461,7 +464,10 @@ int cmd_predict(int argc, char **argv) {
                         "       [--radial-sign 1|-1]   -1 reverses the direction input (the CT is unchanged): a recto model then marks the verso face\n"
                         "       [--gn-save FILE]   pool the GroupNorm statistics of every window processed into FILE (calibration)\n"
                         "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n"
-                        "       [--papyrus-cut T]   task papyrus nets conditioned on the cutoff: papyrus where the smoothed CT exceeds T (raw CT units)\n");
+                        "       [--papyrus-cut T]   task papyrus nets conditioned on the cutoff: papyrus where the smoothed CT exceeds T (raw CT units)\n"
+                        "       [--full-grid 1]   the output spans the CT level's whole grid; --box (rounded out to shards) selects the shards computed\n"
+                        "       [--resume 1]   skip the shards listed in <out>/predict-done-<level>.txt (appended as shards are written)\n"
+                        "       [--occupancy L]   skip shards that are all zero (air) on the coarser CT level L, e.g. 5\n");
         fprintf(stderr, "  Default window: k shards + 2 halo (one window per k^3 shards) for the largest k <= 4 the box and the GPU hold, else one per shard,\n"
                         "  else 288 with halo 8; the halo is 16, or 32 when the window must be a multiple of 64 (7 levels). For exact shard tiling, window - 2*halo should\n"
                         "  divide the shard size: 544 with halo 16 gives 512; 288 with halo 16 gives 256. Validate window and halo with the checkpoint.\n"
@@ -655,6 +661,12 @@ int cmd_predict(int argc, char **argv) {
             if (bad) { fprintf(stderr, "a predict worker failed\n"); return 1; }
             double um_l = um * (1 << level);
             int64_t bn[3]; { long long v[6] = {0, 0, 0, 0, 0, 0}; const char *b = opt(argc, argv, "--box", nullptr); if (!b || sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) { fprintf(stderr, "--gpus needs --box\n"); return 1; } for (int d = 0; d < 3; d++) bn[d] = v[3 + d]; }
+            if (atoi(opt(argc, argv, "--full-grid", "0"))) {   /* the pyramid of the whole grid */
+                store *ps = store_open(root); z3 *pz = ps ? pyramid_open_level(ps, key, level, um, opt(argc, argv, "--cache", nullptr)) : nullptr;
+                if (!pz) { fprintf(stderr, "cannot open level %d of %s: %s\n", level, key, z3_error()); return 1; }
+                for (int d = 0; d < 3; d++) bn[d] = z3_meta_of(pz)->shape[d];
+                z3_close(pz); store_close(ps);
+            }
             char attrs[2000]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"gpus\":%d,\"ema\":%d%s%s}}", content, ckpt, ngpu, use_ema, grid_attrs, input_attrs);
             for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
             if (pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs)) return 1;
@@ -716,6 +728,25 @@ int cmd_predict(int argc, char **argv) {
     const z3_meta *m = z3_meta_of(ct);
     int64_t bo[3] = {0, 0, 0}, bn[3] = {m->shape[0], m->shape[1], m->shape[2]};
     { const char *b = opt(argc, argv, "--box", nullptr); long long v[6]; if (b && sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) { for (int d = 0; d < 3; d++) { bo[d] = v[d]; bn[d] = v[3 + d]; } } }
+    /* --full-grid 1: the output array spans the CT level's whole grid (origin 0) and --box only selects the shards computed (rounded
+       out to the shard grid), so several boxes and a later whole-volume run fill one zarr. --resume 1 skips the shards listed in
+       <out>/predict-done-<level>.txt (one "z y x" line per shard, appended as each is written). --occupancy L skips shards whose
+       window footprint is all zero on CT level L (> --level, e.g. 5: the scroll's air outside the mask) */
+    const int fullg = atoi(opt(argc, argv, "--full-grid", "0")) != 0, resume = atoi(opt(argc, argv, "--resume", "0")) != 0;
+    const int occl = atoi(opt(argc, argv, "--occupancy", "-1"));
+    int64_t ash[3] = {bn[0], bn[1], bn[2]}, soff[3] = {0, 0, 0};
+    if (fullg) {
+        if (sheet_task || ffd || ffz || sweep_out) { fprintf(stderr, "predict: --full-grid writes plain probability volumes only (no --fit-fields / --fit-zarr / sweeps / winding)\n"); return 2; }
+        for (int d = 0; d < 3; d++) {
+            int64_t lo = bo[d] / shard * shard, hi = (bo[d] + bn[d] + shard - 1) / shard * shard;
+            if (hi > m->shape[d]) hi = m->shape[d];
+            if (hi <= lo) { fprintf(stderr, "predict: the box lies outside the CT level (%lld x %lld x %lld)\n", (long long)m->shape[0], (long long)m->shape[1], (long long)m->shape[2]); return 2; }
+            bo[d] = lo; bn[d] = hi - lo; ash[d] = m->shape[d]; soff[d] = lo / shard;
+        }
+        fprintf(stderr, "predict: full grid %lld x %lld x %lld, box rounded to shards: origin %lld,%lld,%lld size %lld,%lld,%lld\n", (long long)ash[0], (long long)ash[1], (long long)ash[2],
+                (long long)bo[0], (long long)bo[1], (long long)bo[2], (long long)bn[0], (long long)bn[1], (long long)bn[2]);
+    }
+    if (occl >= 0 && (occl <= level || occl > 20)) { fprintf(stderr, "predict: --occupancy L needs a coarser CT level than --level (%d)\n", level); return 2; }
     const int H0 = 1 << (cfg.nlev - 1);   /* --split: halo planes of each half */
     if (split && !win_given) { W = shard + 128; halo = 64; fprintf(stderr, "predict: window %d, halo %d (split default; --window / --halo set them; window - 2 halo = k * shard computes one window per k^3 shards)\n", W, halo); }
     if (split && W % (2 * H0)) { fprintf(stderr, "--split z: the window must be a multiple of %d\n", 2 * H0); return 2; }
@@ -766,8 +797,8 @@ int cmd_predict(int argc, char **argv) {
     z3w_level_name(um_l, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
     snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"window_z\":%d,\"halo_z\":%d,\"ema\":%d%s%s}}",
-             content, ckpt, step, root, ak, (long long)bo[0], (long long)bo[1], (long long)bo[2], W, halo, Wz, hz, use_ema, grid_attrs, input_attrs);
-    z3w *w = z3w_create(ldir, bn, shard, q, 0, attrs);
+             content, ckpt, step, root, ak, (long long)(fullg ? 0 : bo[0]), (long long)(fullg ? 0 : bo[1]), (long long)(fullg ? 0 : bo[2]), W, halo, Wz, hz, use_ema, grid_attrs, input_attrs);
+    z3w *w = z3w_create(ldir, ash, shard, q, 0, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     int stride = W - 2 * halo;
     const int strd[3] = {Wz - 2 * hz, stride, stride}, hal[3] = {hz, halo, halo}, wn[3] = {Wz, W, W};   /* per axis (slabs: z differs) */
@@ -783,6 +814,10 @@ int cmd_predict(int argc, char **argv) {
     }
     writer_t WR = {0}; WR.w = w; WR.nthreads = nthreads; WR.bytes = (size_t)shard * shard * shard;
     WR.skip = atoi(opt(argc, argv, "--no-out", "0")) != 0;   /* --no-out 1: the prediction volume's shards are not written (only its metadata; e.g. with --fit-zarr) */
+    for (int d = 0; d < 3; d++) WR.off[d] = soff[d];
+    WR.donefd = -1;
+    char donep[1500]; snprintf(donep, sizeof donep, "%s/predict-done-%s.txt", out, lv);
+    if (resume && !WR.skip && (WR.donefd = open(donep, O_WRONLY | O_CREAT | O_APPEND, 0644)) < 0) { fprintf(stderr, "predict: cannot open %s: %s\n", donep, strerror(errno)); return 1; }
     /* default path (UFSM_PRED_HOSTPATH=1: the previous host path, for A/B): pinned reader / shard buffers, window statistics
        on the device, the interior probabilities placed into a device shard buffer that is downloaded once per shard */
     const int gpath = !ufsm_env_on("UFSM_PRED_HOSTPATH");
@@ -842,6 +877,56 @@ int cmd_predict(int argc, char **argv) {
     }
     int64_t ns[3];
     for (int d = 0; d < 3; d++) ns[d] = (bn[d] + shard - 1) / shard;
+    /* --resume / --occupancy: the box's shards not to compute (1 = already written, 2 = air: the outputs are masked to CT > 0, so a shard
+       whose own region is zero on the coarse level, one coarse voxel of margin, predicts nothing) */
+    uint8_t *sskip = nullptr; long nresumed = 0, nocc = 0;
+    if (resume || occl >= 0) {
+        sskip = calloc((size_t)(ns[0] * ns[1] * ns[2]), 1);
+        if (!sskip) { fprintf(stderr, "predict: out of memory\n"); return 1; }
+        FILE *df = resume ? fopen(donep, "r") : nullptr;
+        long long gz, gy, gx;
+        if (df) {
+            while (fscanf(df, "%lld %lld %lld", &gz, &gy, &gx) == 3) {
+                const int64_t lz = gz - soff[0], ly = gy - soff[1], lx = gx - soff[2];
+                if (lz < 0 || ly < 0 || lx < 0 || lz >= ns[0] || ly >= ns[1] || lx >= ns[2]) continue;
+                uint8_t *e = &sskip[(lz * ns[1] + ly) * ns[2] + lx]; if (!*e) { *e = 1; nresumed++; }
+            }
+            fclose(df);
+        }
+        if (occl >= 0) {
+            z3 *oc = pyramid_open_level(s, key, occl, um, cache);
+            if (!oc) { fprintf(stderr, "predict: --occupancy: cannot open CT level %d: %s\n", occl, z3_error()); return 1; }
+            const z3_meta *om = z3_meta_of(oc); const int f = 1 << (occl - level);
+            int64_t o0[3], n0[3];
+            for (int d = 0; d < 3; d++) {
+                int64_t lo = bo[d] / f - 1, hi = (bo[d] + bn[d] + f - 1) / f + 1;
+                if (lo < 0) lo = 0;
+                if (hi > om->shape[d]) hi = om->shape[d];
+                o0[d] = lo; n0[d] = hi > lo ? hi - lo : 0;
+            }
+            uint8_t *ob = n0[0] && n0[1] && n0[2] ? malloc((size_t)(n0[0] * n0[1] * n0[2])) : nullptr;
+            if (n0[0] && n0[1] && n0[2] && (!ob || z3_read(oc, o0, n0, ob, nthreads))) { fprintf(stderr, "predict: --occupancy: cannot read CT level %d: %s\n", occl, z3_error()); return 1; }
+            for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
+                uint8_t *e = &sskip[(sz * ns[1] + sy) * ns[2] + sx];
+                if (*e) continue;
+                const int64_t ss[3] = {sz, sy, sx}; int64_t a[3], b[3]; int hit = 0;
+                for (int d = 0; d < 3; d++) {
+                    const int64_t g0 = bo[d] + ss[d] * shard, g1 = g0 + shard < bo[d] + bn[d] ? g0 + shard : bo[d] + bn[d];
+                    a[d] = g0 / f - 1 - o0[d]; b[d] = (g1 + f - 1) / f + 1 - o0[d];
+                    if (a[d] < 0) a[d] = 0;
+                    if (b[d] > n0[d]) b[d] = n0[d];
+                }
+                for (int64_t z = a[0]; z < b[0] && !hit; z++) for (int64_t y = a[1]; y < b[1] && !hit; y++) {
+                    const uint8_t *r = ob + ((size_t)z * n0[1] + y) * n0[2];
+                    for (int64_t x = a[2]; x < b[2]; x++) if (r[x]) { hit = 1; break; }
+                }
+                if (!hit) { *e = 2; nocc++; }
+            }
+            free(ob); z3_close(oc);
+        }
+        fprintf(stderr, "predict: %lld shards in the box: %ld already written (--resume), %ld air on CT level %d (--occupancy), %lld to compute\n",
+                (long long)(ns[0] * ns[1] * ns[2]), nresumed, nocc, occl, (long long)(ns[0] * ns[1] * ns[2]) - nresumed - nocc);
+    }
     /* interior = k whole shards (k >= 2, the tile grid on the shard grid): one window per k^3 shards, each shard placed from it and
        written (INFERENCE_MEMORY_PLAN.md, memory into speed); otherwise one or more windows per shard, clipped to it */
     int kss = !slab && !sheet_task && gpath && stride % shard == 0 && stride / shard >= 2 ? stride / shard : 1;
@@ -945,14 +1030,22 @@ int cmd_predict(int argc, char **argv) {
     /* enumerate the tiles in shard order, then let the reader run ahead */
     reader_t rd = {0}; rd.ct = ct; rd.bo = bo; rd.W = W; rd.Wz = Wz; rd.nthreads = nthreads;
     long cap = 0;
+    long nwq = 0;   /* the computed (super-)shards dealt round-robin to the GPU workers (skipped ones dealt to none) */
     if (kss > 1) for (int64_t sz = 0; sz < nss[0]; sz++) for (int64_t sy = 0; sy < nss[1]; sy++) for (int64_t sx = 0; sx < nss[2]; sx++) {   /* super-shards */
-        if (nwork > 1 && (((sz * nss[1] + sy) * nss[2] + sx) % ngpu) != part) continue;
+        if (sskip) {   /* skipped when every shard of it is */
+            int all = 1;
+            for (int64_t a = sz * kss; a < (sz + 1) * kss && a < ns[0] && all; a++) for (int64_t b = sy * kss; b < (sy + 1) * kss && b < ns[1] && all; b++)
+                for (int64_t c = sx * kss; c < (sx + 1) * kss && c < ns[2]; c++) if (!sskip[(a * ns[1] + b) * ns[2] + c]) { all = 0; break; }
+            if (all) continue;
+        }
+        if (nwork > 1 && (nwq++ % ngpu) != part) continue;
         if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
         rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx};
     }
     if (kss == 1) for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
         int64_t so[3] = {sz * shard, sy * shard, sx * shard}, se[3], first[3];
-        if (nwork > 1 && (((sz * ns[1] + sy) * ns[2] + sx) % ngpu) != part) continue;   /* another worker's shard */
+        if (sskip && sskip[(sz * ns[1] + sy) * ns[2] + sx]) continue;   /* --resume: written; --occupancy: air */
+        if (nwork > 1 && (nwq++ % ngpu) != part) continue;   /* another worker's shard */
         for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
         for (int d = 0; d < 3; d++) {
             int64_t phase = grid ? (bo[d] + so[d] - grid_origin[d]) % strd[d] : 0;
@@ -1010,6 +1103,7 @@ int cmd_predict(int argc, char **argv) {
                 if (sheet_task && sheet_write_shard(out,sheet_shard,shard,sz,sy,sx)) return 1;
                 pt = now();
                 if (any) { if (gpath) writer_d2h(&WR, sb, dsh); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb = writer_next(&WR, sb); sbuf = WR.buf[sb]; }
+                else if (WR.donefd >= 0) dprintf(WR.donefd, "%lld %lld %lld\n", (long long)(sz + soff[0]), (long long)(sy + soff[1]), (long long)(sx + soff[2]));   /* all air: done */
                 p_wr += now() - pt;
                 fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   ", (long long)(cur_shard + 1), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
                 if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
@@ -1219,6 +1313,7 @@ int cmd_predict(int argc, char **argv) {
     if (pprof) fprintf(stderr, "\npredict profile (s): main: wait-reader %.2f h2d %.2f gpu(fwd+d2h) %.2f interior-copy %.2f writer-wait %.2f fit-writer-wait %.2f | reader: read %.2f stats %.2f slot-wait %.2f | wall %.2f, %ld tiles\n",
                        p_wait, p_h2d, p_gpu, p_copy, p_wr, p_ffw, rd.t_read, rd.t_stats, rd.t_wait, now() - t0, ntiles);
     if (kss == 1 && cur_shard >= 0 && any) { if (gpath) writer_d2h(&WR, sb, dsh); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } }
+    else if (kss == 1 && cur_shard >= 0 && WR.donefd >= 0) dprintf(WR.donefd, "%lld %lld %lld\n", (long long)(sz + soff[0]), (long long)(sy + soff[1]), (long long)(sx + soff[2]));
     if (sheet_task && cur_shard>=0 && sheet_write_shard(out,sheet_shard,shard,sz,sy,sx)) return 1;
     if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
     { const double tf = now();
@@ -1285,6 +1380,8 @@ int cmd_predict(int argc, char **argv) {
     free(rd.tiles);
     fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   \n", (long long)(ns[0] * ns[1] * ns[2]), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
     z3w_close(w);
+    if (WR.donefd >= 0) close(WR.donefd);
+    free(sskip);
     if (gn_save) {
         const size_t ns = unet_gn_nstats(u); float *h = malloc(ns * 4); const long nw = unet_gn_pooled(u, h);
         FILE *f = fopen(gn_save, "wb");
@@ -1298,7 +1395,7 @@ int cmd_predict(int argc, char **argv) {
         nn_init(gpus[1]); unet_free(u1); nn_init(gpu); split_free(sctx);
     }
     if (nwork > 1) { fprintf(stderr, "gpu %d: %ld tiles in %.0fs\n", gpu, ntiles, now() - t0); z3_close(ct); store_close(s); unet_free(u); return 0; }   /* worker: the parent builds the pyramid */
-    for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
+    for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, ash, shard, q, 0, nthreads, attrs)) return 1;
     if (pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs)) return 1;
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs)\n", out, ntiles, now() - t0);
     z3_close(ct); store_close(s); unet_free(u);

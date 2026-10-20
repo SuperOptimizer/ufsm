@@ -76,8 +76,29 @@ static void test_tifxyz_scale(void) {
     free(X); free(Z);
     snprintf(p, sizeof p, "rm -rf %s %s", s, d); CHECK(!system(p), "cleanup");
 }
+static void test_ink_compare(void) {   /* ink_stats / ink_corr / ink_panels_half (ufsm ink-compare) */
+    enum { W = 64, H = 48 }; static uint8_t a[W * H], b[W * H], m[W * H], ct[W * H], flat[W * H];
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) { const int i = y * W + x; a[i] = x < W / 2 ? 255 : 0; b[i] = 255 - a[i]; m[i] = 1; ct[i] = 100; flat[i] = 77; }
+    ink_stats_t st;
+    CHECK(!ink_stats(a, m, W, H, 1, 8, &st), "ink_stats");
+    CHECK(st.n == W * H && fabs(st.mean - 0.5) < 1e-9 && fabs(st.frac50 - 0.5) < 1e-9, "ink_stats mean %g frac50 %g", st.mean, st.frac50);
+    CHECK(st.p50 == 0 && st.p95 == 1 && st.p99 == 1 && st.band > 0.05, "ink_stats percentiles %g %g %g band %g", st.p50, st.p95, st.p99, st.band);
+    CHECK(!ink_stats(flat, m, W, H, 1, 8, &st) && st.band < 1e-9 && st.frac50 == 0 && fabs(st.p50 - 77 / 255.0) < 1e-9, "flat ink band %g", st.band);
+    for (int i = 0; i < W * H; i++) m[i] = i % W >= W / 2;   /* only the zero half */
+    CHECK(!ink_stats(a, m, W, H, 1, 8, &st) && st.n == W * H / 2 && st.mean == 0 && st.frac50 == 0, "masked ink_stats");
+    for (int i = 0; i < W * H; i++) m[i] = 1;
+    CHECK(fabs(ink_corr(a, a, m, W * H) - 1) < 1e-9 && fabs(ink_corr(a, b, m, W * H) + 1) < 1e-9, "ink_corr");
+    const uint8_t *im[3] = {ct, a, b}; const int isct[3] = {1, 0, 0}; const char *lab[3] = {"ct", "ink 9.6um", "ink 2.4um"}; int ow, oh;
+    uint8_t *rgb = ink_panels_half(im, isct, 3, W, H, lab, &ow, &oh, 2);
+    CHECK(rgb && ow == (3 * W + 16) / 2 && oh == H / 2, "panels %dx%d", ow, oh);
+    if (rgb) {   /* CT (100 - 40) x 2.2 = 132 in the middle of panel 0; ink a: white left half, black right half of panel 1 */
+        const uint8_t *p = rgb + ((size_t)(oh - 2) * ow + W / 4) * 3, *q = rgb + ((size_t)(oh - 2) * ow + (W + 8 + 8) / 2) * 3, *r = rgb + ((size_t)(oh - 2) * ow + (2 * W + 8 - 8) / 2) * 3;
+        CHECK(p[0] == 132 && p[1] == 132 && q[0] == 255 && r[0] == 0, "panel pixels %d %d %d", p[0], q[0], r[0]);
+    }
+    free(rgb);
+}
 int main(void) {
-    test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_tifxyz_scale();
+    test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_tifxyz_scale(); test_ink_compare();
     if (fails) { fprintf(stderr, "test_imgops: %d failures\n", fails); return 1; }
     printf("test_imgops: ok\n");
     return 0;

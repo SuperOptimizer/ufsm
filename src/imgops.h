@@ -65,3 +65,16 @@ int phase_score_dirs(const char *pcd, const char *psd, const char *sd, FILE *out
    parallelogram p0, p1, p1 + (round(dy / L), -round(dx / L)), p0 + (..) filled; a point when p0 == p1) */
 void img_text(uint8_t *rgb, int w, int h, int x, int y, const char *s, const uint8_t col[3]);
 void img_line2(uint8_t *rgb, int w, int h, int x0, int y0, int x1, int y1, const uint8_t col[3]);
+
+/* ufsm ink-compare: renders of one surface (same pixel grid) side by side and their ink statistics.
+   img_text at an integer scale sc (each font pixel an sc x sc block). */
+void img_text_scaled(uint8_t *rgb, int w, int h, int x, int y, const char *s, int sc, const uint8_t col[3]);
+/* over the pixels with mask != 0: n, the mean probability, the fraction with ink >= 128 (p > 0.5), the 50th / 95th / 99th
+   percentiles (lowest value whose cumulative count reaches q n, / 255) and band: the standard deviation of (masked box mean of
+   radius rs - masked box mean of radius rl) / 255, the ink contrast at scales between the two radii (letter strokes .. letters) */
+typedef struct { long long n; double mean, frac50, p50, p95, p99, band; } ink_stats_t;
+int ink_stats(const uint8_t *ink, const uint8_t *mask, int w, int h, int rs, int rl, ink_stats_t *st);   /* 0 on success */
+double ink_corr(const uint8_t *a, const uint8_t *b, const uint8_t *mask, size_t n);   /* Pearson correlation over mask != 0 */
+/* nimg w x h renders side by side, 8 white columns apart (is_ct[k]: the overlay's CT contrast (v - 40) x 2.2, else as is), labels
+   in yellow at the top-left of each panel, the whole Pillow-BOX halved: RGB *ow x *oh (malloc'd; nullptr on failure) */
+uint8_t *ink_panels_half(const uint8_t *const *img, const int *is_ct, int nimg, int w, int h, const char *const *labels, int *ow, int *oh, int nthreads);

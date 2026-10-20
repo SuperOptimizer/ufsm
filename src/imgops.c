@@ -447,3 +447,89 @@ void img_line2(uint8_t *rgb, int w, int h, int x0, int y0, int x1, int y1, const
             if (!pos || !neg) put_px(rgb, w, h, x, y, col);
         }
 }
+
+/* ---- ufsm ink-compare: side-by-side panels and statistics of surface renders ---- */
+void img_text_scaled(uint8_t *rgb, int w, int h, int x, int y, const char *s, int sc, const uint8_t col[3]) {
+    if (sc < 1) sc = 1;
+    for (; *s; s++, x += 6 * sc) {
+        const uint8_t *g = nullptr;
+        for (size_t k = 0; k < sizeof font5x7 / sizeof font5x7[0]; k++) if (font5x7[k][0] == (uint8_t)*s) g = font5x7[k] + 1;
+        if (g) for (int r = 0; r < 7; r++) for (int c = 0; c < 5; c++) if (g[r] >> (4 - c) & 1)
+            for (int a = 0; a < sc; a++) for (int b = 0; b < sc; b++) put_px(rgb, w, h, x + c * sc + b, y + r * sc + a, col);
+    }
+}
+/* masked box mean of radius r (window (2r + 1)^2 clipped to the image, over mask != 0 pixels only) via integral images; out
+   is the mean where the window holds a masked pixel, 0 elsewhere */
+static int masked_box_mean(const uint8_t *img, const uint8_t *mask, int w, int h, int r, float *out) {
+    const size_t W1 = (size_t)w + 1; double *S = calloc(W1 * (h + 1), sizeof *S), *C = calloc(W1 * (h + 1), sizeof *C);
+    if (!S || !C) { free(S); free(C); return -1; }
+    for (int y = 0; y < h; y++) {
+        double rs = 0, rc = 0;
+        for (int x = 0; x < w; x++) {
+            const size_t i = (size_t)y * w + x; const int m = mask[i] != 0;
+            rs += m ? img[i] : 0; rc += m;
+            S[(y + 1) * W1 + x + 1] = S[y * W1 + x + 1] + rs; C[(y + 1) * W1 + x + 1] = C[y * W1 + x + 1] + rc;
+        }
+    }
+    for (int y = 0; y < h; y++) {
+        const int y0 = y - r < 0 ? 0 : y - r, y1 = y + r + 1 > h ? h : y + r + 1;
+        for (int x = 0; x < w; x++) {
+            const int x0 = x - r < 0 ? 0 : x - r, x1 = x + r + 1 > w ? w : x + r + 1;
+            const double s = S[y1 * W1 + x1] - S[y0 * W1 + x1] - S[y1 * W1 + x0] + S[y0 * W1 + x0];
+            const double c = C[y1 * W1 + x1] - C[y0 * W1 + x1] - C[y1 * W1 + x0] + C[y0 * W1 + x0];
+            out[(size_t)y * w + x] = c > 0 ? (float)(s / c) : 0.f;
+        }
+    }
+    free(S); free(C);
+    return 0;
+}
+int ink_stats(const uint8_t *ink, const uint8_t *mask, int w, int h, int rs, int rl, ink_stats_t *st) {
+    memset(st, 0, sizeof *st);
+    const size_t n = (size_t)w * h; long long hist[256] = {0}; double sum = 0;
+    for (size_t i = 0; i < n; i++) if (mask[i]) { hist[ink[i]]++; sum += ink[i]; st->n++; }
+    if (!st->n) return 0;
+    st->mean = sum / st->n / 255.0;
+    long long hi = 0; for (int v = 128; v < 256; v++) hi += hist[v];
+    st->frac50 = (double)hi / st->n;
+    const double q[3] = {0.50, 0.95, 0.99}; double *qo[3] = {&st->p50, &st->p95, &st->p99};
+    for (int k = 0; k < 3; k++) {   /* the lowest value whose cumulative count reaches q n */
+        long long c = 0; const double t = q[k] * st->n; int v = 0;
+        for (; v < 255; v++) { c += hist[v]; if (c >= t) break; }
+        *qo[k] = v / 255.0;
+    }
+    float *bs = malloc(n * sizeof *bs), *bl = malloc(n * sizeof *bl);
+    if (!bs || !bl || masked_box_mean(ink, mask, w, h, rs, bs) || masked_box_mean(ink, mask, w, h, rl, bl)) { free(bs); free(bl); return -1; }
+    double m1 = 0, m2 = 0;
+    for (size_t i = 0; i < n; i++) if (mask[i]) { const double d = (bs[i] - bl[i]) / 255.0; m1 += d; m2 += d * d; }
+    m1 /= st->n; m2 /= st->n; st->band = sqrt(m2 - m1 * m1 > 0 ? m2 - m1 * m1 : 0);
+    free(bs); free(bl);
+    return 0;
+}
+double ink_corr(const uint8_t *a, const uint8_t *b, const uint8_t *mask, size_t n) {
+    double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0; long long k = 0;
+    for (size_t i = 0; i < n; i++) if (mask[i]) { const double x = a[i], y = b[i]; sa += x; sb += y; saa += x * x; sbb += y * y; sab += x * y; k++; }
+    if (k < 2) return 0;
+    const double va = saa - sa * sa / k, vb = sbb - sb * sb / k;
+    return va > 0 && vb > 0 ? (sab - sa * sb / k) / sqrt(va * vb) : 0;
+}
+uint8_t *ink_panels_half(const uint8_t *const *img, const int *is_ct, int nimg, int w, int h, const char *const *labels, int *ow, int *oh, int nthreads) {
+    const int TW = nimg * w + 8 * (nimg - 1);
+    uint8_t *full = malloc((size_t)TW * h * 3);
+    if (!full || nimg < 1) { free(full); return nullptr; }
+    memset(full, 255, (size_t)TW * h * 3);
+    for (int k = 0; k < nimg; k++) for (int y = 0; y < h; y++) {
+        const uint8_t *s = img[k] + (size_t)y * w; uint8_t *o = full + ((size_t)y * TW + (size_t)k * (w + 8)) * 3;
+        for (int x = 0; x < w; x++) {
+            float g = is_ct[k] ? ((float)s[x] - 40.f) * 2.2f : (float)s[x];
+            g = g < 0.f ? 0.f : g > 255.f ? 255.f : g;
+            o[3 * x] = o[3 * x + 1] = o[3 * x + 2] = (uint8_t)g;
+        }
+    }
+    const int sc = h / 200 > 1 ? h / 200 : 2; const uint8_t yel[3] = {255, 220, 0};
+    for (int k = 0; k < nimg; k++) if (labels && labels[k]) img_text_scaled(full, TW, h, k * (w + 8) + 2 * sc, 2 * sc, labels[k], sc, yel);
+    *ow = TW / 2; *oh = h / 2;
+    uint8_t *half = *ow > 0 && *oh > 0 ? malloc((size_t)*ow * *oh * 3) : nullptr;
+    if (!half || pil_resize(full, TW, h, 3, half, *ow, *oh, PIL_BOX, nthreads)) { free(half); half = nullptr; }
+    free(full);
+    return half;
+}

@@ -53,6 +53,7 @@ int cmd_coreline_check(int argc, char **argv);   /* src/coreline_check.c */
 int cmd_render_sheets(int argc, char **argv);   /* src/render.c */
 int cmd_overlay_red(int argc, char **argv);
 int cmd_tifxyz_scale(int argc, char **argv);
+int cmd_ink_compare(int argc, char **argv);
 int cmd_png2jpg(int argc, char **argv);
 int cmd_phase_score(int argc, char **argv);
 
@@ -97,6 +98,7 @@ static int usage(void) {
         "  ufsm render-sheets <tifxyz-dir> <out-dir> --ct ROOT KEY --ink ROOT KEY ...   every sheet -> CT + red ink 5-panel JPEGs, one batch\n"
         "  ufsm overlay-red <ct-dir> <ink-dir> <out-dir> [ink2 [ink3]]   the 5-panel overlay of existing renders\n"
         "  ufsm tifxyz-scale <src> <dst> <div> [--offset z,y,x]   tifxyz coordinates / div (e.g. 2.4 -> 9.6 um: 4)\n"
+        "  ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif ..   CT | ink panels (half-res JPEG) + ink statistics per render\n"
         "  ufsm png2jpg <in.png> <out.jpg> [--half]   PNG -> JPEG q90 (half: Pillow BOX halved)\n"
         "  ufsm phase-score <pc-dir> <ps-dir> [<sheets-dir>]   on-recto score of pc / ps renders on surfaces (per seam class with sheets)\n"
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
@@ -3206,6 +3208,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "render-sheets")) return cmd_render_sheets(argc, argv);
     if (!strcmp(cmd, "overlay-red")) return cmd_overlay_red(argc, argv);
     if (!strcmp(cmd, "tifxyz-scale")) return cmd_tifxyz_scale(argc, argv);
+    if (!strcmp(cmd, "ink-compare")) return cmd_ink_compare(argc, argv);
     if (!strcmp(cmd, "png2jpg")) return cmd_png2jpg(argc, argv);
     if (!strcmp(cmd, "phase-score")) return cmd_phase_score(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
