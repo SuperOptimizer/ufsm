@@ -17,7 +17,7 @@ CC      := $(CCACHE) gcc
 NVCC    ?= $(CCACHE) nvcc
 CFLAGS  ?= -std=c23 -O3 -march=native -g -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -pthread
 CPPFLAGS = -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp $(shell pkg-config --cflags libcurl libzstd blosc zlib libcrypto)
-LDLIBS   = $(shell pkg-config --libs libcurl libzstd blosc zlib libcrypto) -lm -lpthread
+LDLIBS   = $(shell pkg-config --libs libcurl libzstd blosc zlib libcrypto) -ljpeg -lm -lpthread
 CUDA    ?= /usr/local/cuda
 NVFLAGS ?= -O3 -arch=sm_120 -use_fast_math -Xcompiler -fno-threadsafe-statics -Isrc   # fast math: +4% step time, FD tests still pass
 CUDALIBS = -L$(CUDA)/lib64 -lcudart
@@ -25,6 +25,7 @@ CUDALIBS = -L$(CUDA)/lib64 -lcudart
 SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c
 SRC += src/surf.c src/stitch.c src/coreline.c
 SRC += src/fblend.c
+SRC += src/render.c src/imgops.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
@@ -161,6 +162,9 @@ $(B)/test_fit_w4: tests/test_fit_w4.c $(B)/fit.o $(B)/coreline.o $(B)/json.o $(B
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_fit_w4
 
+$(B)/test_imgops: tests/test_imgops.c tests/test_imgops_expected.h $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_imgops.c $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o -o $@ $(LDLIBS)
+test-all: $(B)/test_imgops
 $(B)/test_tiffw: tests/test_tiffw.c $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 $(B)/test_wind: tests/test_wind.c src/wind.h $(B)/wind.o
@@ -314,6 +318,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_coreline
 	./$(B)/test_fit_w4
 	./$(B)/test_tiffw
+	./$(B)/test_imgops
 	./$(B)/test_edt
 	./$(B)/test_volcomp
 	./$(B)/test_typed_zarr
