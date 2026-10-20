@@ -77,10 +77,12 @@ __global__ void fit_loss_k(fit_dev f, double *parts, float *g_delta, float *g_pi
             float dU[7] = {0, 0, 0, 0, 0, 0, 0}, dg[3] = {0, 0, 0};
             fit_phase_term(&f, i, W0, wv, &lp[FIT_P_PHASE], &dU[0]);
             fit_recto_term(&f, i, W0, wv, &lp[FIT_P_RECTO], &dU[0]);
+            fit_ct_term(&f, i, W0, wv, &lp[FIT_P_CT], &dU[0]);
             fit_grad_terms(&f, i, g, wv, lp, dg);
             fit_pgrad_term(&f, i, g, wv, lp, dg);
+            fit_cspace_term(&f, i, g, wv, lp, dg);
             for (int d = 0; d < 3; d++) { dU[1 + 2 * d] += dg[d] / (2.f * e); dU[2 + 2 * d] -= dg[d] / (2.f * e); }
-            lp[FIT_P_TOTAL] = lp[FIT_P_PHASE] + lp[FIT_P_NORMAL] + lp[FIT_P_DENSITY] + lp[FIT_P_NONDEG] + lp[FIT_P_PGRAD] + lp[FIT_P_RECTO];
+            lp[FIT_P_TOTAL] = lp[FIT_P_PHASE] + lp[FIT_P_NORMAL] + lp[FIT_P_DENSITY] + lp[FIT_P_NONDEG] + lp[FIT_P_PGRAD] + lp[FIT_P_RECTO] + lp[FIT_P_CT] + lp[FIT_P_CSPACE];
             for (int s = 0; s < 7; s++) {
                 const float du = dU[s];
                 if (du == 0.f) continue;
@@ -281,6 +283,100 @@ __global__ void fit_finalize_recto_k(const float *acc, size_t nf, uint8_t *a) {
     a[i] = (uint8_t)lroundf(255.f * fminf(1.f, fmaxf(0.f, acc[11 * nf + i])));
 }
 extern "C" void nn_fit_finalize_recto(const float *acc, size_t nf, uint8_t *a) { fit_finalize_recto_k<<<nblk(nf, 256), 256>>>(acc, nf, a); KCHECK(); }
+
+/* predict --fit-ct: the CT planes of the fit fields. (a) nn_fit_accum_ct: per cell the sum of the window's uint8 CT over the cell's voxels
+   in the window interior (the same voxels as nn_fit_accum's count plane 0), into acc_ct; call it while the CT window is intact. (b)
+   nn_fit_accum_cs: per cell whose centre voxel lies in this window's interior, the CT sampled along the network normal there (the top
+   eigenvector of the decoded n n^T) over +-2.5 x the network spacing (60..400 um, clipped to the window), its papyrus peaks counted
+   (src/fit_terms.h fit_ct_spacing, prominence 1 sd): the spacing in native voxels stored into acc_cs (0: none). */
+__global__ void fit_accum_ct_k(const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, int bz, int by, int bx, int h,
+                               int fz0, int fy0, int fx0, int nfz, int nfy, int nfx, int F1, int F2, float *acc) {
+    const size_t ci = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (ci >= (size_t)nfz * nfy * nfx) return;
+    const int fz = fz0 + (int)(ci / ((size_t)nfy * nfx)), fy = fy0 + (int)(ci / nfx % nfy), fx = fx0 + (int)(ci % nfx);
+    float v = 0.f;
+    for (int t = 0; t < h * h * h; t++) {
+        const int lz = t / (h * h), ly = (t / h) % h, lx = t % h;
+        const int gz = fz * h + lz, gy = fy * h + ly, gx = fx * h + lx, wz = gz - tz, wy = gy - ty, wx = gx - tx;
+        if (gz >= bz || gy >= by || gx >= bx || wz < hz || wz >= D - hz || wy < halo || wy >= W - halo || wx < halo || wx >= W - halo) continue;
+        v += (float)ct[((size_t)wz * W + wy) * W + wx];
+    }
+    if (v != 0.f) atomicAdd(&acc[((size_t)fz * F1 + fy) * F2 + fx], v);
+}
+template <typename LT>
+__global__ void fit_accum_cs_k(const LT *lg, const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, int bz, int by, int bx, int h,
+                               int fz0, int fy0, int fx0, int nfz, int nfy, int nfx, int F1, int F2, int ch_normal, int ch_density, float dscale, int dcode, float um, float *acc) {
+    const size_t ci = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (ci >= (size_t)nfz * nfy * nfx) return;
+    const int fz = fz0 + (int)(ci / ((size_t)nfy * nfx)), fy = fy0 + (int)(ci / nfx % nfy), fx = fx0 + (int)(ci % nfx);
+    const int gz = fz * h + h / 2, gy = fy * h + h / 2, gx = fx * h + h / 2, wz = gz - tz, wy = gy - ty, wx = gx - tx;
+    if (gz >= bz || gy >= by || gx >= bx || wz < hz || wz >= D - hz || wy < halo || wy >= W - halo || wx < halo || wx >= W - halo) return;
+    const size_t w3 = (size_t)D * W * W, i = ((size_t)wz * W + wy) * W + wx;
+    auto sg = [&](int c) { return 1.f / (1.f + __expf(-lgv(lg, (size_t)c * w3 + i))); };
+    const float tzz = sg(ch_normal), tyy = sg(ch_normal + 1), txx = sg(ch_normal + 2), tzy = sg(ch_normal + 3) - 0.5f, tzx = sg(ch_normal + 4) - 0.5f, tyx = sg(ch_normal + 5) - 0.5f;
+    float out = 0.f;
+    if (ct[i] && tzz + tyy + txx > 0.1f) {
+        float v0 = 0.31f, v1 = 0.57f, v2 = 0.76f;
+        for (int it = 0; it < 30; it++) {
+            const float u0 = tzz * v0 + tzy * v1 + tzx * v2, u1 = tzy * v0 + tyy * v1 + tyx * v2, u2 = tzx * v0 + tyx * v1 + txx * v2, l = sqrtf(u0 * u0 + u1 * u1 + u2 * u2);
+            if (l < 1e-9f) break; v0 = u0 / l; v1 = u1 / l; v2 = u2 / l;
+        }
+        const float sd = sg(ch_density), rho = (dcode ? fminf(sd, 0.999f) / (1.f - fminf(sd, 0.999f)) : sd) / dscale;   /* turns per native voxel */
+        float R = rho > 0.f ? 2.5f / rho * um : 200.f; R = fminf(fmaxf(R, 60.f), 400.f); R /= um;   /* native voxels */
+        /* clip the ray to the window: the largest symmetric extent along +-v inside [0, D - 1] x [0, W - 1]^2 */
+        const float pc[3] = {(float)wz, (float)wy, (float)wx}, vv[3] = {v0, v1, v2}, hi[3] = {(float)(D - 1), (float)(W - 1), (float)(W - 1)};
+        for (int d = 0; d < 3; d++) if (fabsf(vv[d]) > 1e-6f) { const float a = fminf(pc[d], hi[d] - pc[d]) / fabsf(vv[d]); R = fminf(R, a); }
+        float p[256]; const float stp = fmaxf(1.f, 2.f * R / 255.f); const int n = 2 * (int)(R / stp) + 1;
+        for (int k = 0; k < n; k++) {
+            const float t = (k - n / 2) * stp, q[3] = {pc[0] + t * v0, pc[1] + t * v1, pc[2] + t * v2};
+            int i0[3]; float tt[3];
+            for (int d = 0; d < 3; d++) { const float a = fminf(fmaxf(q[d], 0.f), hi[d]); i0[d] = min((int)a, (int)hi[d] - 1 < 0 ? 0 : (int)hi[d] - 1); tt[d] = a - i0[d]; }
+            float s = 0.f;
+            for (int c = 0; c < 8; c++) {
+                const int a = i0[0] + (c >> 2 & 1), b = i0[1] + (c >> 1 & 1), e = i0[2] + (c & 1);
+                const float w = (c >> 2 & 1 ? tt[0] : 1.f - tt[0]) * (c >> 1 & 1 ? tt[1] : 1.f - tt[1]) * (c & 1 ? tt[2] : 1.f - tt[2]);
+                if (w != 0.f) s += w * (float)ct[((size_t)a * W + b) * W + e];
+            }
+            p[k] = s;
+        }
+        out = fit_ct_spacing(p, n, stp, 1.f);
+    }
+    acc[((size_t)fz * F1 + fy) * F2 + fx] = out;
+}
+static int fit_ct_range(int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3], int f0[3], int f1[3]) {
+    const int t[3] = {tz, ty, tx}, wn[3] = {D, W, W}, hn[3] = {hz, halo, halo};
+    for (int d = 0; d < 3; d++) {
+        int lo = t[d] + hn[d], hi = t[d] + wn[d] - hn[d]; if (lo < 0) lo = 0; if (hi > box[d]) hi = box[d];
+        f0[d] = lo / h; f1[d] = (hi + h - 1) / h; if (f1[d] > F[d]) f1[d] = F[d];
+        if (f1[d] <= f0[d]) return 0;
+    }
+    return 1;
+}
+extern "C" void nn_fit_accum_ct(const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3], float *acc_ct) {
+    int f0[3], f1[3]; if (!fit_ct_range(D, W, hz, halo, tz, ty, tx, box, h, F, f0, f1)) return;
+    const int nfz = f1[0] - f0[0], nfy = f1[1] - f0[1], nfx = f1[2] - f0[2];
+    fit_accum_ct_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>(ct, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfz, nfy, nfx, F[1], F[2], acc_ct);
+    KCHECK();
+}
+extern "C" void nn_fit_accum_cs(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
+                                int ch_normal, int ch_density, float dscale, int dcode, float um, float *acc_cs) {
+    int f0[3], f1[3]; if (!fit_ct_range(D, W, hz, halo, tz, ty, tx, box, h, F, f0, f1)) return;
+    const int nfz = f1[0] - f0[0], nfy = f1[1] - f0[1], nfx = f1[2] - f0[2];
+    if (g_logits_h16) fit_accum_cs_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>((const f16 *)lg, ct, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2],
+                                                                                 nfz, nfy, nfx, F[1], F[2], ch_normal, ch_density, dscale, dcode, um, acc_cs);
+    else fit_accum_cs_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>(lg, ct, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2],
+                                                                      nfz, nfy, nfx, F[1], F[2], ch_normal, ch_density, dscale, dcode, um, acc_cs);
+    KCHECK();
+}
+/* the CT planes from the count plane (cnt, accumulator plane 0), the CT sums and the spacings: ct = round(sum / count), cs = the spacing
+   in sp units (h / 8 native voxels; 0 unknown) */
+__global__ void fit_finalize_ct_k(const float *cnt, const float *sum, const float *spc, size_t nf, int h, uint8_t *oct, uint8_t *ocs) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= nf) return;
+    oct[i] = cnt[i] > 0.f ? (uint8_t)fminf(255.f, lroundf(__fdiv_rn(sum[i], cnt[i]))) : 0;
+    const float v = spc[i] > 0.f ? spc[i] * 8.f / (float)h : 0.f;
+    ocs[i] = v <= 0.f ? 0 : v < 1.f ? 1 : v > 255.f ? 255 : (uint8_t)lroundf(v);
+}
+extern "C" void nn_fit_finalize_ct(const float *acc, size_t nf, int h, uint8_t *oct, uint8_t *ocs) {
+    fit_finalize_ct_k<<<nblk(nf, 256), 256>>>(acc, acc + 12 * nf, acc + 13 * nf, nf, h, oct, ocs); KCHECK();
+}
 
 /* predict --fit-fields of a task unwrap2 checkpoint: the winding mod 4 head as gauge-free relative planes. Per field cell and axis a
    (z, y, x) the material-voxel sums of p(v + d e_a) conj p(v), p = (2 sigma - 1) of the cos / sin channels (ch_w4, ch_w4 + 1): the
