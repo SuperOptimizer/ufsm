@@ -8,6 +8,7 @@
 #include "store.h"
 #include "zarr3.h"
 #include "fit.h"
+#include "fblend.h"
 #include "json.h"
 #include "nn.h"
 #include "tiffw.h"
@@ -79,6 +80,7 @@ static int usage(void) {
         "  ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40]   vertices onto the fields' sheet phase\n"
         "  ufsm surf-stats <wraps-dir> --fields DIR [--ct ROOT KEY --ct-um U]   label-free surface quality (phase, switches, CT)\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
+        "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..]  several models' fit fields averaged (phase: confidence-weighted complex mean)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm papyrus-labels <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx   papyrus / void training labels of a CT box (gap labels, no cutoff)\n"
         "  ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w --labels G1,G2   a CT plane beside label panels (void blue, ignored yellow)\n"
@@ -1725,6 +1727,25 @@ static int cmd_surfsnap(int argc, char **argv) {
     return nw ? 0 : 1;
 }
 
+/* ufsm field-blend OUT IN1 IN2 ... [--weights a,b,...] [--threads N]: fit-field sets of several models on one grid blended into
+   OUT (src/fblend.h: the phase as the confidence-weighted complex mean, its length the new confidence) */
+static int cmd_field_blend(int argc, char **argv) {
+    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr; int nt = 8;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--weights") && i + 1 < argc) { ws = argv[++i]; continue; }
+        if (!strcmp(argv[i], "--threads") && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
+        if (!strncmp(argv[i], "--", 2)) { fprintf(stderr, "field-blend: unknown option %s\n", argv[i]); return 2; }
+        if (!out) out = argv[i]; else if (n < 32) in[n++] = argv[i]; else { fprintf(stderr, "field-blend: at most 32 inputs\n"); return 2; }
+    }
+    if (!out || n < 1) { fprintf(stderr, "usage: ufsm field-blend <out> <fields1> [<fields2> ...] [--weights a,b,...] [--threads N]\n"); return 2; }
+    if (ws) {
+        int k = 0; char *t = strdup(ws);
+        for (char *q = strtok(t, ","); q; q = strtok(nullptr, ",")) { if (k < 32) w[k] = (float)atof(q); k++; }
+        free(t);
+        if (k != n) { fprintf(stderr, "field-blend: %d weights for %d inputs\n", k, n); return 2; }
+    }
+    return fblend_run(out, n, in, ws ? w : nullptr, nt < 1 ? 1 : nt);
+}
 /* ufsm fit-compare <reference-fields> <fields>: how a field set (e.g. a network's, predict --fit-zarr) agrees with a reference
    (e.g. the oracle, band --fit-fields) cell by cell; both must cover the same physical cells (origin x um, h x um equal), at any
    native voxel sizes. Over cells where the reference phase confidence is > 0.3 and both have material: phase |error| (turns),
@@ -2409,6 +2430,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "refine")) return cmd_refine(argc, argv);
     if (!strcmp(cmd, "surf-stats")) return cmd_surf_stats(argc, argv);
     if (!strcmp(cmd, "fit-compare")) return cmd_fit_compare(argc, argv);
+    if (!strcmp(cmd, "field-blend")) return cmd_field_blend(argc, argv);
     if (!strcmp(cmd, "gap-compare")) return cmd_gap_compare(argc, argv);
     if (!strcmp(cmd, "gap-density")) return cmd_gap_density(argc, argv);
     if (!strcmp(cmd, "void-pool")) return cmd_void_pool(argc, argv);

@@ -2,7 +2,21 @@
 #include "json.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+char *checkpoint_header_line(const char *path) {
+    FILE *f = fopen(path, "rb"); if (!f) return nullptr;
+    char *line = malloc(1 << 16); if (!line) { fclose(f); return nullptr; }
+    const size_t n = fread(line, 1, (1 << 16) - 1, f); fclose(f); line[n] = 0;
+    char *e = memchr(line, '\n', n); if (e) *e = 0;
+    return line;
+}
+int checkpoint_unwrap_version(const char *path) {
+    char *h = checkpoint_header_line(path); if (!h) return 0;
+    const int v = strstr(h, "\"unwrap\":{\"version\":2") ? 2 : strstr(h, "\"unwrap\":{\"version\":1") ? 1 : 0;
+    free(h); return v;
+}
 
 static int valid(const checkpoint_runtime *r) {
     return r->version == 1 && r->train_window > 0 && r->prec >= 0 && r->prec <= 4 &&
