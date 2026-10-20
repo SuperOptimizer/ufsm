@@ -11,7 +11,8 @@ import tempfile
 def gpu_count():
     """GPUs nvidia-smi lists (the two-worker grid check needs two)"""
     try:
-        return subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True).stdout.count('GPU ')
+        lines = subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True).stdout.splitlines()
+        return sum(line.startswith('GPU ') for line in lines)
     except OSError:
         return 0
 
