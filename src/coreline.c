@@ -209,15 +209,19 @@ void cl_accum_row(const uint8_t *pc, const uint8_t *ps, const uint8_t *w, int H,
 size_t cl_mask_block(const coreline *c, int side, const long long org[3], double h, double um, int z0, int nz, int H, int W,
                      uint8_t *pc, uint8_t *ps, uint8_t *w) {
     const double f = um / c->um;   /* native -> core-line voxels */
-    const int B = 4, Hb = (H + B - 1) / B, Wb = (W + B - 1) / B; const double thr = 3.0 * h * f;   /* > the block's half diagonal (2.83 cells) */
+    const int B = 4, G = 16, Hg = (H + G - 1) / G, Wg = (W + G - 1) / G; const double thr = 3.0 * h * f, thrg = 12.0 * h * f;   /* > the half diagonals (2.83 / 11.3 cells) */
     size_t nb = 0;
     for (int a = 0; a < nz; a++) {
         const double zg = (org[0] + (z0 + a + 0.5) * h) * f; const size_t ro = (size_t)a * H * W;
-        for (int by = 0; by < Hb; by++) for (int bx = 0; bx < Wb; bx++) {
-            const int ylo = by * B, xlo = bx * B, yhi = ylo + B < H ? ylo + B : H, xhi = xlo + B < W ? xlo + B : W;
+        for (int gy = 0; gy < Hg; gy++) for (int gx = 0; gx < Wg; gx++) {   /* 16 x 16 cell groups far from the line: one side */
+          const int gylo = gy * G, gxlo = gx * G, gyhi = gylo + G < H ? gylo + G : H, gxhi = gxlo + G < W ? gxlo + G : W;
+          const double sg = cl_sdist(c, zg, (org[1] + (gylo + G / 2.0) * h) * f, (org[2] + (gxlo + G / 2.0) * h) * f, nullptr, nullptr);
+          if (fabs(sg) > thrg && side * sg >= 0) continue;   /* the kept side: nothing to blank */
+          for (int ylo = gylo; ylo < gyhi; ylo += B) for (int xlo = gxlo; xlo < gxhi; xlo += B) {
+            const int yhi = ylo + B < H ? ylo + B : H, xhi = xlo + B < W ? xlo + B : W;
             if (w) { int any = 0; for (int y = ylo; y < yhi && !any; y++) for (int x = xlo; x < xhi; x++) if (w[ro + (size_t)y * W + x]) { any = 1; break; } if (!any) continue; }
-            const double sd = cl_sdist(c, zg, (org[1] + (ylo + B / 2.0) * h) * f, (org[2] + (xlo + B / 2.0) * h) * f, nullptr, nullptr);
-            const int uniform = fabs(sd) > thr;
+            const double sd = fabs(sg) > thrg ? sg : cl_sdist(c, zg, (org[1] + (ylo + B / 2.0) * h) * f, (org[2] + (xlo + B / 2.0) * h) * f, nullptr, nullptr);
+            const int uniform = fabs(sg) > thrg || fabs(sd) > thr;
             for (int y = ylo; y < yhi; y++) for (int x = xlo; x < xhi; x++) {
                 const double s = uniform ? sd : cl_sdist(c, zg, (org[1] + (y + 0.5) * h) * f, (org[2] + (x + 0.5) * h) * f, nullptr, nullptr);
                 if (side * s >= 0) continue;
@@ -226,6 +230,7 @@ size_t cl_mask_block(const coreline *c, int side, const long long org[3], double
                 if (pc) pc[i] = 128;
                 if (ps) ps[i] = 128;
             }
+          }
         }
     }
     return nb;
