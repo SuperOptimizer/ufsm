@@ -124,10 +124,10 @@ __device__ __forceinline__ void mma16816(float *c, const unsigned *a, const unsi
 /* shared tile [rows][BK halfs]: 16-byte chunk q of a row stored at q ^ f(row) (conflict-free ldmatrix of 8 rows) */
 template <int BK> __device__ __forceinline__ int swz(int row, int q) { return row * BK + ((q ^ (BK == 32 ? (row >> 1) & 3 : row & 7)) << 3); }
 
-enum { BM = 128, KPAD = 64, NTH = 256 };
-template <int BN, int BK, int NST>
-__global__ void __launch_bounds__(NTH) conv_igemm(ConvP p) {
-    constexpr int WARPS_N = BN == 128 ? 4 : 2, WARPS_M = 8 / WARPS_N, WM = BM / WARPS_M, WN = BN / WARPS_N, MI = WM / 16, NI = WN / 8;
+enum { KPAD = 64 };
+template <int BM, int BN, int WARPS_M, int WARPS_N, int BK, int NST>
+__global__ void __launch_bounds__(WARPS_M * WARPS_N * 32) conv_igemm(ConvP p) {
+    constexpr int NTH = WARPS_M * WARPS_N * 32, WM = BM / WARPS_M, WN = BN / WARPS_N, MI = WM / 16, NI = WN / 8;
     constexpr int QC = BK / 8, RS = NTH / QC, AP = BM / RS, BP = BN / RS;   /* chunks per row, rows per pass, passes */
     extern __shared__ __align__(128) unsigned char smem[];
     __half *sA = (__half *)smem, *sB = sA + NST * BM * BK;
@@ -135,6 +135,7 @@ __global__ void __launch_bounds__(NTH) conv_igemm(ConvP p) {
     const int wm0 = (warp / WARPS_N) * WM, wn0 = (warp % WARPS_N) * WN;
     const long long m_base = (long long)blockIdx.x * BM; const int n_base = blockIdx.y * BN;
     const int q = tid % QC, r0 = tid / QC; int zb[AP], yb[AP], xb[AP]; long long nb[AP];
+#pragma unroll
     for (int i = 0; i < AP; i++) {
         const long long m = m_base + r0 + i * RS;
         if (m < p.M) {
@@ -142,12 +143,14 @@ __global__ void __launch_bounds__(NTH) conv_igemm(ConvP p) {
             zb[i] = zo * p.sd - p.pd; yb[i] = yo * p.sh - p.ph; xb[i] = xo * p.sw - p.pw; nb[i] = t * p.Di;
         } else { zb[i] = -(1 << 28); yb[i] = xb[i] = 0; nb[i] = 0; }
     }
-    const int nk = p.Kp / BK, khw = p.kh * p.kw;
+    const int nk = p.Kp / BK;
+    /* this thread's K position (tap tz, ty, tx and channel ci of k = ks BK + q 8), advanced by BK per loaded stage (loads go in ks order) */
+    int ci = q * 8, tx = 0, ty = 0, tz = 0;
+    while (ci >= p.Ci) { ci -= p.Ci; if (++tx == p.kw) { tx = 0; if (++ty == p.kh) { ty = 0; tz++; } } }
     auto load = [&](int slot, int ks) {
-        const int k = ks * BK + q * 8;
-        int tz = 0, ty = 0, tx = 0, ci = 0; const bool kin = k < p.K;
-        if (kin) { const int tap = k / p.Ci; ci = k - tap * p.Ci; tz = tap / khw; const int r = tap - tz * khw; ty = r / p.kw; tx = r - ty * p.kw; }
+        const int k = ks * BK + q * 8; const bool kin = k < p.K;
         __half *A = sA + slot * BM * BK, *B = sB + slot * BN * BK;
+#pragma unroll
         for (int i = 0; i < AP; i++) {
             const int row = r0 + i * RS;
             const int zi = zb[i] + tz, yi = yb[i] + ty, xi = xb[i] + tx;
@@ -155,13 +158,21 @@ __global__ void __launch_bounds__(NTH) conv_igemm(ConvP p) {
             const __half *src = ok ? p.x + ((((nb[i] + zi) * p.Hi + yi) * (long long)p.Wi + xi) * p.Ci + ci) : p.x;
             cp_async16(A + swz<BK>(row, q), src, ok ? 16 : 0);
         }
+#pragma unroll
         for (int i = 0; i < BP; i++) {
             const int row = r0 + i * RS;
             cp_async16(B + swz<BK>(row, q), p.w + (size_t)(n_base + row) * p.Kp + ks * BK + q * 8, 16);
         }
+        ci += BK;
+        while (ci >= p.Ci) { ci -= p.Ci; if (++tx == p.kw) { tx = 0; if (++ty == p.kh) { ty = 0; tz++; } } }
     };
     float acc[MI][NI][4];
-    for (int a = 0; a < MI; a++) for (int b = 0; b < NI; b++) for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
+#pragma unroll
+    for (int a = 0; a < MI; a++)
+#pragma unroll
+        for (int b = 0; b < NI; b++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
     for (int s = 0; s < NST - 1; s++) { if (s < nk) load(s, s); cp_commit(); }
     for (int ks = 0; ks < nk; ks++) {
         cp_wait<NST - 2>(); __syncthreads();
@@ -172,20 +183,29 @@ __global__ void __launch_bounds__(NTH) conv_igemm(ConvP p) {
 #pragma unroll
         for (int kk = 0; kk < BK / 16; kk++) {
             unsigned af[MI][4], bf[NI][2];
+#pragma unroll
             for (int mi = 0; mi < MI; mi++) { const int row = wm0 + mi * 16 + (lane & 15); ldsm_x4(af[mi], A + swz<BK>(row, kk * 2 + (lane >> 4))); }
+#pragma unroll
             for (int nj = 0; nj < NI / 2; nj++) {
                 const int row = wn0 + nj * 16 + (lane & 7) + ((lane >> 4) << 3); unsigned r[4];
                 ldsm_x4(r, B + swz<BK>(row, kk * 2 + ((lane >> 3) & 1)));
                 bf[2 * nj][0] = r[0]; bf[2 * nj][1] = r[1]; bf[2 * nj + 1][0] = r[2]; bf[2 * nj + 1][1] = r[3];
             }
-            for (int mi = 0; mi < MI; mi++) for (int ni = 0; ni < NI; ni++) mma16816(acc[mi][ni], af[mi], bf[ni]);
+#pragma unroll
+            for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+                for (int ni = 0; ni < NI; ni++) mma16816(acc[mi][ni], af[mi], bf[ni]);
         }
     }
     cp_wait<0>();
     const int g = lane >> 2, t4 = lane & 3;
-    for (int mi = 0; mi < MI; mi++) for (int ni = 0; ni < NI; ni++) {
+#pragma unroll
+    for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+    for (int ni = 0; ni < NI; ni++) {
         const int co = n_base + wn0 + ni * 8 + t4 * 2; if (co >= p.Co) continue;
         const float s0 = p.scale[co], s1 = p.scale[co + 1], b0 = p.bias[co], b1 = p.bias[co + 1];
+#pragma unroll
         for (int h = 0; h < 2; h++) {
             const long long m = m_base + wm0 + mi * 16 + g + h * 8; if (m >= p.M) continue;
             float v0 = acc[mi][ni][2 * h] * s0 + b0, v1 = acc[mi][ni][2 * h + 1] * s1 + b1;
@@ -204,7 +224,7 @@ extern "C" void xbn_fold(int co, const float *g, const float *b, const float *m,
 }
 
 static int conv_upload(xconv *c, const float *wk /* [co][K] in GEMM order */, int co, const float *scale, const float *bias) {
-    c->Kp = (c->K + KPAD - 1) / KPAD * KPAD; c->Cop = (co + 127) / 128 * 128;
+    c->Kp = (c->K + KPAD - 1) / KPAD * KPAD; c->Cop = (co + 255) / 256 * 256;
     __half *hw = (__half *)calloc((size_t)c->Cop * c->Kp, sizeof(__half)); float *sc = (float *)malloc(co * sizeof(float)), *bi = (float *)malloc(co * sizeof(float));
     if (!hw || !sc || !bi) { free(hw); free(sc); free(bi); return -1; }
     float wmax = 0;
@@ -265,22 +285,27 @@ __global__ void k_tshuffle(const __half *g, const float *bias, __half *y, int n,
     }
 }
 
-/* kernel variant: BK 32 / 64, stages; UFSM_XNET_CFG = 0 (BK 32, 3 stages), 1 (BK 32, 4), 2 (BK 64, 3), 3 (BK 64, 2) */
-template <int BN, int BK, int NST> static void launch1(const ConvP &p, int co) {
+/* tile shapes: UFSM_XNET_CFG selects (default 0); per variant the tile follows the output channels (64 / 128 / >= 256) */
+template <int BM, int BN, int WMn, int WNn, int BK, int NST> static void launch1(const ConvP &p, int co) {
     const size_t sm = (size_t)NST * (BM + BN) * BK * 2;
-    static int attr = 0; if (!attr) { cudaFuncSetAttribute(conv_igemm<BN, BK, NST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); attr = 1; }
+    static int attr = 0; if (!attr) { cudaFuncSetAttribute(conv_igemm<BM, BN, WMn, WNn, BK, NST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); attr = 1; }
     dim3 g((unsigned)((p.M + BM - 1) / BM), (unsigned)((co + BN - 1) / BN));
-    conv_igemm<BN, BK, NST><<<g, NTH, sm, g_st>>>(p);
+    conv_igemm<BM, BN, WMn, WNn, BK, NST><<<g, WMn * WNn * 32, sm, g_st>>>(p);
 }
 static int g_cfg = -1;
 static void conv_launch(const ConvP &p, int co) {
     if (g_cfg < 0) g_cfg = getenv("UFSM_XNET_CFG") ? atoi(getenv("UFSM_XNET_CFG")) : 0;
-    const bool n64 = co <= 64;
     switch (g_cfg) {
-    case 1: if (n64) launch1<64, 32, 4>(p, co); else launch1<128, 32, 4>(p, co); break;
-    case 2: if (n64) launch1<64, 64, 3>(p, co); else launch1<128, 64, 3>(p, co); break;
-    case 3: if (n64) launch1<64, 64, 2>(p, co); else launch1<128, 64, 2>(p, co); break;
-    default: if (n64) launch1<64, 32, 3>(p, co); else launch1<128, 32, 3>(p, co); break;
+    case 1:   /* 4 warps of 64 x 64 / 64 x 32 */
+        if (co <= 64) launch1<128, 64, 2, 2, 32, 3>(p, co); else launch1<128, 128, 2, 2, 32, 3>(p, co); break;
+    case 2:   /* 128 x 256 tiles of 8 warps 64 x 64 for wide outputs */
+        if (co <= 64) launch1<128, 64, 2, 2, 32, 3>(p, co); else if (co <= 128) launch1<128, 128, 2, 2, 32, 3>(p, co); else launch1<128, 256, 2, 4, 32, 3>(p, co); break;
+    case 3:   /* 256 x 128 tiles of 8 warps 64 x 64 */
+        if (co <= 64) launch1<256, 64, 4, 2, 32, 3>(p, co); else launch1<256, 128, 4, 2, 32, 3>(p, co); break;
+    case 4:
+        if (co <= 64) launch1<128, 64, 2, 2, 32, 4>(p, co); else if (co <= 128) launch1<128, 128, 2, 2, 32, 4>(p, co); else launch1<128, 256, 2, 4, 32, 4>(p, co); break;
+    default:  /* 8 warps of 32 x 32 / 64 x 32 */
+        if (co <= 64) launch1<128, 64, 4, 2, 32, 3>(p, co); else launch1<128, 128, 2, 4, 32, 3>(p, co); break;
     }
 }
 static xt conv_run(const xconv *c, xt x, const xt *res, int act) {
