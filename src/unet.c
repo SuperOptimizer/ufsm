@@ -3284,3 +3284,10 @@ int unet_start_sheet(unet *u) {
     }
     return 0;
 }
+
+/* task restore: a zero output head (live, EMA and optimiser state), so a fresh residual net outputs its input */
+void unet_zero_head(unet *u) {
+    nn_wmemo_clear();
+    float *arr[] = {u->p, u->ema, u->m, u->v};
+    for (int i = 0; i < 4; i++) { nn_zero(arr[i] + u->head.w, (size_t)u->head.cin * u->head.cout * u->head.k * u->head.k * u->head.k * sizeof(float)); nn_zero(arr[i] + u->head.b, (size_t)u->head.cout * sizeof(float)); }
+}

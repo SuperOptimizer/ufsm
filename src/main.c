@@ -38,6 +38,8 @@ int cmd_ls(int argc, char **argv);
 int cmd_ingest_zip(int argc, char **argv);
 int cmd_raster(int argc, char **argv);
 int cmd_train(int argc, char **argv);
+int cmd_restore_eval(int argc, char **argv);
+int cmd_restore_stats(int argc, char **argv);
 int cmd_predict(int argc, char **argv);
 int cmd_eval(int argc, char **argv);
 
@@ -71,6 +73,8 @@ static int usage(void) {
         "  ufsm phase-fuse <out-group> <out-um> <root> <key>...   surface sets' phases fused per voxel (circular mean within --tol, else unknown)\n"
         "  ufsm recto-fuse <out-group> <out-um> <ct-root> <ct-key> <root> <key>...   one recto line per block (the brightest-CT set)\n"
         "  ufsm codes-merge <out-group> <out-um> <root> <key> ...   winding code rasters united (same wrap within 1/4 turn, else 255)\n"
+        "  ufsm restore-eval <ckpt> <clean.npy>... [--family pyramid]   task restore: PSNR on clean crops degraded by one recipe\n"
+        "  ufsm restore-stats <root> <key> --um U --box ... [--degrade scanner ...]   task restore: calibration statistics of a CT box\n"
         "  ufsm ct-hist <out.txt> <root> <key> z,y,x,n [...]  CT histograms of boxes (targets of train --aug-hist, the hist op)\n"
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
         "  ufsm convert-unwrap2 <unwrap.ckpt> <out.ckpt>   a task unwrap checkpoint as task unwrap2 (heads 2-10 -> 0-8, winding mod 4 fresh; no training step)\n"
@@ -2810,6 +2814,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "phase-check")) return cmd_phase_check(argc, argv);
     if (!strcmp(cmd, "phase-fuse") || !strcmp(cmd, "recto-fuse")) return cmd_fuse(argc, argv);
     if (!strcmp(cmd, "ct-hist")) return cmd_ct_hist(argc, argv);
+    if (!strcmp(cmd, "restore-eval")) return cmd_restore_eval(argc, argv);
+    if (!strcmp(cmd, "restore-stats")) return cmd_restore_stats(argc, argv);
     if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);
     if (!strcmp(cmd, "wrapswitch")) return cmd_wrapswitch(argc, argv);
     if (!strcmp(cmd, "surf-snap")) return cmd_surfsnap(argc, argv);

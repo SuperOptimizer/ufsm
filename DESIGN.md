@@ -81,6 +81,66 @@ Kept: what `ufsm fit` reads, plus one new head for counting turns.
   checked. Also: --min-phase (unwrap2 default 0.001) redraws windows without phase (they supervise nothing); UFSM_SYNC_CHECK=1
   counts non-finite logits / gradients per step, prints device memory free per GPU and locates a CUDA fault with its window;
   UFSM_SAMPLE_AT replays given windows; tests/test_unwrap2_sampler (a non-cubic band + phase-only source).
+## Task restore: CT super-resolution in `ufsm train --task restore` (2026-10-19)
+
+One residual net restores coarse CT onto the 2.4 um grid (x4): the 9.6 um pyramid rung of 2.4 um scans and native 8.64 / 9.36 um
+scans. Replaces the Python orchestration (`tools/restoration*.py` + `ufsm restore-worker`, uncommitted in the main checkout); the
+GPU loss and degradation ideas of `src/nn_restore.cu` were kept and rewritten (`src/restore.h`, `src/nn_restore.cu`, `src/restore.c`,
+`src/restore_cli.c`).
+
+- **Pairing.** The sampler (`sample_cfg.restore`, `draw_restore`) reads one clean window at the source's min_level (2.4 um / 2.215 um
+  scans only) inside a source `"boxes"` entry (the locally present 1024^3 shards) or, for validation, inside the `"holdout"` box;
+  tone LUT `255 gain (v / 255)^gamma` (gain, gamma `exp(U(+-0.18))`, 0 kept) and a cube symmetry; `batch.t` = the clean window, no
+  host input, no mask (mask = clean > 0). The trainer uploads 1 B per voxel.
+- **Degradation on the GPU** (`nn_restore_degrade`, recipe drawn per step from `(seed, step, GPU)`): separable per-axis resampling
+  (exact 4x block mean, or a Gaussian PSF sampled at the coarse centres `(i + 0.5 - phase) step - 0.5`), the coarse grid as stored
+  (scanner: edge term, tone, correlated signal-dependent noise; uint8 rounding), the volcomp codec round trip on the coarse grid
+  (`nn_codec_roundtrip`: 16^3 orthonormal DCT, the encoder's dead zone and the decoder's reconstruction offsets; = volcomp to +-1 DN,
+  >99.9% exact, tests/test_restore_task.c), trilinear back onto the fine grid masked by clean > 0. Scratch ~1.5 B per fine voxel.
+  Families (`--restore-mix`, default identity 0.1 / pyramid 0.45 / scanner 0.45):
+  - *pyramid*: 4x block mean + volcomp **q 2**. The published pyramids store level 0 at q 8, level 1 at q 4, level 2 (9.6 um) at q 2,
+    level 3 at q 1 (every volume checked), so the 9.6 um rung is q 2, not q 8. On a PHerc1299 1024^3 box the 4x mean of the stored
+    level 0 differs from the stored level 2 by 4.27 DN rmse (one- vs two-stage rounding: 4.273 / 4.276; from the stored level 1:
+    4.24): the codec noise of the published levels, which no emulation removes.
+  - *scanner*: coarse step U(3.4, 4.4) fine voxels, PSF sigma U(0.45, 0.75) coarse voxels (x step; per-axis factor exp(U(+-0.15))),
+    random sub-voxel phase, gain / gamma exp(U(+-0.06)), bias U(+-3) DN, noise U(0, 6) DN, signal variance U(0, 0.02) DN^2/DN, 6-neighbour
+    correlation U(0, 0.4), edge term U(-0.1, 0.25) with p 0.3, volcomp **q 8** (native level 0).
+- **Calibration** (`ufsm restore-stats`, ~/ufsm-data/sr/calib, calib_native.sh / calib_fit.py): six scrolls with both a native ~9 um
+  and a 2.4 um scan (PHerc0009B, 0814, 0841, 0846A, 1203, 1451); shape statistics only (the scans differ in energy and contrast):
+  structure function ratios D(k) / D(8) (k = 1, 2, 3, 4, 6 coarse voxels; spectrum and edge width) and noise / sd. Native D1/D8
+  0.091-0.108, D2/D8 0.28-0.35, noise / sd 0.04-0.11. Best fits per scroll: PSF 0.7 / 0.6 / 0.6 / 0.5 / 0.7 / 0.5 coarse voxels; the
+  noise term is nearly flat over 0-6 DN (the 2.4 um scan's own noise, pooled, already matches; fits 1-6 DN), correlation weakly
+  preferred at 0.3. Range used: PSF 0.45-0.75, noise 0-6. (The other session's validation-scanner-v4 / quality-20261018-codec held
+  no calibration: RESTORATION.md says the ranges were never calibrated.)
+- **Network / loss.** Input `(x - 128) / 64` split exactly into two channels `hi = k / 4`, `lo = (x - 128 - 16 k) / 16`
+  (`k = round((x - 128) / 16)`), both exact in MX-fp8 e4m3, so the MX-fp8 stem input (forced `--input-prec 8`) loses nothing (one
+  channel would round to 3 mantissa bits, up to +-4 DN); `--restore-input plain` keeps one channel. Residual head `out = input + 64 logit`,
+  zero-initialised (`unet_zero_head`: output == input at step 0). Loss over clean > 0: Charbonnier (eps 0.01) + 0.5 edge
+  (Charbonnier of face-neighbour error differences) + 0.1 MSE; fp16 logits, separate 16-bit logit gradient (the edge term reads
+  neighbours: never in place). Checkpoint `"task":"restore"` with the input layout, normalisation, `fine_um` and the recipe ranges.
+- **Validation.** The trainer's holdout windows (PHerc1299: two boxes incl. the sr512-highres-v3 crops; Paris 4 2.4 um: a 2048^3 block),
+  each under every family with fixed recipes: PSNR of output and input, gain per family, `restore_val.csv`; `best.ckpt` on the mean
+  gain of the degraded families.
+- **Predict.** `ufsm predict <restore ckpt> <root> <ct-group> <out> --um U [--level L]`: the CT level upsampled trilinear onto
+  `--out-um` (default the checkpoint's fine grid) with the training geometry, window = shard + 2 halo (512 + 64), uint8 CT in 512^3
+  shards (volcomp `--q 2` default), optional pyramid. `ufsm restore-eval` scores a checkpoint on .npy crops under one recipe.
+- **Data** (~/ufsm-data/sr/make_sources.sh -> sources-sr.json): 20 training scans (2.4 / 2.215 um, 600 level-0 shards hard-linked
+  from the old restoration whole-shard mirror into ~/ufsm-data/vol: no new disk), holdouts fetched: PHerc1299 5 shards (67 MB),
+  Paris 4 8 shards (129 MB).
+- **Window / widths (laptop 5080, `--mem fast`, MX-fp4).** Planner: P384 [32,48,64,96,128,192] lean, 15.4 / 15.6 GB, 75 Mvox/s;
+  P512 [16,32,64,96,128,192] lean 2, 14.4 GB, **184 Mvox/s (1.37 steps/s)**; P256 [48,..,192] 32 Mvox/s; P448 [32,48,..] recompute 2,
+  71 Mvox/s; P512 with 32 at level 0 and P640 do not fit. The 48-channel levels miss the fp4 kernels (multiples of 32 / 8 / 16 only).
+  Chosen: **P512, 16,32,64,96,128,192**, the largest and fastest.
+- **MX-fp4 vs MX-fp8 activations** (2000 steps, P384 16..192, same seed; fp8 does not fit P512): mean gain +1.555 vs +1.623 dB
+  (pyramid +2.191 / +2.274, scanner +0.919 / +0.971), 177 vs 94 Mvox/s: within 0.1 dB, so fp4.
+- **500-step smoke** (chosen config): validation gain pyramid +1.31 / 1.40 / 1.42 / 1.50 / 1.60 dB, scanner +0.66 / 0.67 / 0.68 /
+  0.71 / 0.73 dB at steps 100..500. Identity output PSNR ~34 dB early (the net still perturbs sharp input by ~5 DN rmse; 55-57 dB by
+  step 2000 in the A/B runs).
+- **Against sr512-highres-v3** (its frozen crops, 4x block mean without codec; restore-eval of the 2000-step P384 fp4 A/B checkpoint):
+  output MSE crop 0 111.9 / crop 2 53.0 (PHerc1299 2.4 um) vs 155.7 / 80.9 for the old best (x4_nearest, step 8400): +1.4 / +1.8 dB
+  absolute; the Paris 4 1.129 um crops 1 / 3: 287 / 251 vs 394 / 365. Gain over the trilinear input +2.31 dB overall (+2.03 with q 2).
+- **Long run**: ~/ufsm-data/sr/sr100k.sh (100k steps, Muon 0.01 / AdamW 1e-3, WSD cooldown 0.2, warmup 500, EMA 0.999, ckpt / val
+  every 2000, restart-safe `--resume last.ckpt`): ~20.5 h at 1.37 steps/s.
 
 ## The two biggest level-0 kernels: conv_fwd_f4p_k and conv_bwd_w_f4ws_k (2026-10-16)
 Desk P512 trainer (P2's profile): conv_fwd_f4p_k (16-channel forward and backward-data) ~149 ms / step over 17 calls,

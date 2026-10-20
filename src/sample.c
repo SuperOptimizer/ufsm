@@ -194,10 +194,10 @@ static batch alloc_batch(const sample_cfg *c) {
     const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0) + (c->cond ? 3 : 0);   /* input channels per sample (--gpu-input: the CT alone) */
     b.xch = (int)xc;
     b.rad = c->gpu_input ? halloc((size_t)c->B * NN_RAD_REC(PZ(c))) : nullptr;
-    b.x = c->xfmt ? nullptr : halloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
-    b.x16 = c->xfmt ? halloc((size_t)c->B * xc * p3 * 2) : nullptr;
-    b.t = c->pack_tm ? nullptr : halloc((size_t)c->B * NCH * p3);
-    b.m = c->pack_tm ? nullptr : halloc((size_t)c->B * p3);
+    b.x = c->xfmt || c->restore ? nullptr : halloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
+    b.x16 = c->xfmt && !c->restore ? halloc((size_t)c->B * xc * p3 * 2) : nullptr;
+    b.t = c->pack_tm ? nullptr : halloc((size_t)c->B * (c->restore ? 1 : NCH) * p3);   /* (task restore: the clean CT alone) */
+    b.m = c->pack_tm || c->restore ? nullptr : halloc((size_t)c->B * p3);
     b.tm = c->pack_tm ? halloc((size_t)c->B * p3) : nullptr;   /* one code byte per voxel instead of NCH + 1 */
     b.w = halloc((size_t)c->B * NCH);
     b.src = malloc((size_t)c->B * sizeof(int16_t));
@@ -285,7 +285,7 @@ static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
                 (sp->cfg.holdout || training_corner_exists(sp, s, l, lo, hi))) { fits = 1; break; }
             ok = fits;
         }
-        if (ok) {
+        if (ok && !sp->cfg.restore) {   /* (task restore: no targets) */
             int any = 0;
             for (int c = 0; c < NCH; c++) {
                 if (c == region_ch) { any = 1; continue; }
@@ -1581,7 +1581,63 @@ static void warp_w4_pack(const uint8_t *w4, const uint8_t *cp, uint16_t *wq, siz
     free(wq);
 }
 
+/* task restore: one clean CT window (the source's min_level) inside a "boxes" entry (training) or the holdout box (validation), the tone
+   LUT 255 gain (v / 255)^gamma (gain, gamma exp(U(-0.18, 0.18)), 0 kept) and a cube symmetry, into batch.t */
+static int draw_restore(sampler *sp, batch *b, int i, rng *r, uint8_t *big) {
+    const sample_cfg *c = &sp->cfg;
+    const int P = c->P, Pz = PZ(c);
+    const size_t p3 = P3(sp);
+    double u = runif(r) * sp->cum[sp->S->n - 1];
+    int si = 0; while (si < sp->S->n - 1 && sp->cum[si] < u) si++;
+    source *s = &sp->S->src[si];
+    if (c->holdout ? !s->hold_n[0] : s->hold_n[0] && !s->nbox) return 1;   /* (a holdout source without boxes is validation only) */
+    const int l = s->min_level > 0 ? s->min_level : 0;
+    if (!level_ok(sp, s, si, l, -1)) return 1;
+    z3 *ct = source_ct(s, l);
+    const z3_meta *m = z3_meta_of(ct);
+    int64_t o[3], n[3] = {Pz, P, P}, lo[3], hi[3];
+    if (c->holdout) { if (!patch_bounds(s, m, n, l, nullptr, 0, 1, lo, hi)) return 1; }
+    else if (s->nbox) {   /* a box by volume, the window inside it (level-l voxels) */
+        double tot = 0; for (int k = 0; k < s->nbox; k++) tot += (double)s->box[k][3] * s->box[k][4] * s->box[k][5];
+        double v = runif(r) * tot; int k = 0;
+        for (; k < s->nbox - 1; k++) { v -= (double)s->box[k][3] * s->box[k][4] * s->box[k][5]; if (v < 0) break; }
+        for (int d = 0; d < 3; d++) {
+            lo[d] = (s->box[k][d] + ((int64_t)1 << l) - 1) >> l; hi[d] = ((s->box[k][d] + s->box[k][3 + d]) >> l) - n[d];
+            if (hi[d] > m->shape[d] - n[d]) hi[d] = m->shape[d] - n[d];
+            if (lo[d] < 0) lo[d] = 0;
+            if (hi[d] < lo[d]) return 1;
+        }
+    } else for (int d = 0; d < 3; d++) { lo[d] = 0; hi[d] = m->shape[d] - n[d]; if (hi[d] < 0) return 1; }
+    for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
+    if (!c->holdout && training_hits_holdout(sp, s, o, l)) return 1;
+    z3 *cct = l + 3 < MAXLEV ? source_ct(s, l + 3) : nullptr;   /* coarse occupancy probe */
+    if (cct && Pz >= 8) {
+        const int pc = P >> 3; int64_t oc[3] = {o[0] >> 3, o[1] >> 3, o[2] >> 3}, nc[3] = {Pz >> 3, pc, pc};
+        if (z3_read(cct, oc, nc, big, 1)) return -1;
+        size_t nz = 0, tot = (size_t)nc[0] * pc * pc; for (size_t k = 0; k < tot; k++) nz += big[k] != 0;
+        if ((double)nz / (double)tot < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); return 1; }
+    }
+    if (z3_read(ct, o, n, big, 1)) return -1;
+    size_t nz = 0; for (size_t k = 0; k < p3; k++) nz += big[k] != 0;
+    if ((double)nz / (double)p3 < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); return 1; }
+    sym y = sym_of(0);
+    if (c->augment) {
+        y = sym_of((int)rint_below(r, 48));
+        const double gain = exp((runif(r) * 2 - 1) * 0.18), gam = exp((runif(r) * 2 - 1) * 0.18);
+        uint8_t lut[256]; lut[0] = 0;
+        for (int v = 1; v < 256; v++) { const double t = 255 * gain * pow(v / 255.0, gam); lut[v] = (uint8_t)(t < 1 ? 1 : t > 255 ? 255 : lrint(t)); }
+        for (size_t k = 0; k < p3; k++) big[k] = lut[big[k]];
+        if (Pz != P && y.perm[0] != 0) y = sym_of(0);
+    }
+    sym_u8(big, b->t + (size_t)i * p3, Pz, P, y);
+    memset(b->w + (size_t)i * NCH, 0, NCH); b->w[(size_t)i * NCH] = 1;
+    b->src[i] = (int16_t)si; b->level[i] = (int8_t)l; b->um[i] = (float)(s->um * (double)(1 << l));
+    for (int d = 0; d < 3; d++) b->corner[i][d] = o[d] << l;
+    atomic_fetch_add(&sp->produced, 1);
+    return 0;
+}
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
+    if (sp->cfg.restore) return draw_restore(sp, b, i, r, big);
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
     const int P = c->P, Pz = PZ(c);   /* window Pz x P x P (Pz < P: a slab) */
