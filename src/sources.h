@@ -92,6 +92,10 @@ typedef struct {
                     level 2): samples of level L read it directly, of level L - 1 upsampled 2x */
     int phase_level, phase_direct;   /* the CT level whose grid the stored phase is on (1: the 4.8 um label grid of 2.4 um scans);
                                         phase_direct: "level" given, so samples of that level read it directly */
+    int phase_sign;   /* "phase": {..., "phase_sign": -1}: the stored phase (and "winding") rise inward, against the convention (phase
+                         rising outward from the axis, fit.h W): windows read p -> (252 - p) mod 252 (unknown stays unknown); the
+                         winding mod 4 targets unwrap the negated phase, so they follow. Default +1. (2026-10-19: the 10-16 multi-scroll
+                         wind-seed sets with a wrongly voted spiral sense, e.g. Paris 4 June / July, 0500P2) */
     z3 *wind;    /* optional, with a stored phase: the winding mod 14 turns on the same grid (ufsm phase-raster --winding; band.h
                     band_winding), {"band": {..., "phase": {...}, "winding": {"root": ..., "key": ...}}}: the --cond targets / condition */
 } source;

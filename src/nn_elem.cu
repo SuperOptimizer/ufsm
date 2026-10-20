@@ -11,7 +11,7 @@ __global__ void gn_finalize_k(const double *sums, int NG, size_t len, float eps,
 double *gn_dsums(size_t n) {   /* small persistent device scratch for the double sums, per device */
     static double *buf[10]; static size_t cap[10];
     int d = zs_slot();   /* (both split halves on one GPU: per half) */
-    if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); cudaMalloc(&buf[d], n * sizeof(double)); cap[d] = n; }
+    if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); if (cudaMalloc(&buf[d], n * sizeof(double)) != cudaSuccess) { fprintf(stderr, "gn_dsums: no device memory (slot %d)\n", d); abort(); } cap[d] = n; }
     return buf[d];
 }
 extern "C" void nn_gn_fwd(const float *x, shape5 s, int G, float eps, const float *gamma, const float *beta, float *y, float *mean, float *rstd) {
@@ -591,6 +591,23 @@ extern "C" void nn_packed_mask_z(const uint8_t *phase, int d, int h, int w, int 
     packed_mask_k<<<nblk(n, 256), 256>>>(phase, d, h, w, s, um, packed_um, packed_w, m, (size_t)z0 * hw, n); KCHECK();
 }
 extern "C" void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n) { fill_unl_k<<<nblk(n, 256), 256>>>(t, m, vm, src, n); KCHECK(); }
+/* diagnostics: non-finite elements of n fp32 / 16-bit values (h16 1 fp16, 2 bf16), added to *cnt (device) */
+__global__ void count_nonfinite_k(const void *p, size_t n, int h16, unsigned long long *cnt) {
+    unsigned long long c = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        if (h16) { const unsigned short v = ((const unsigned short *)p)[i], e = h16 == 1 ? 0x7c00 : 0x7f80; c += (v & e) == e; }
+        else c += !isfinite(((const float *)p)[i]);
+    }
+    if (c) atomicAdd(cnt, c);
+}
+extern "C" unsigned long long nn_count_nonfinite(const void *p, size_t n, int h16) {
+    static unsigned long long *d[16]; int dev = 0; cudaGetDevice(&dev);
+    if (!d[dev]) CK(cudaMalloc(&d[dev], sizeof **d));
+    cudaMemsetAsync(d[dev], 0, sizeof **d);
+    count_nonfinite_k<<<1024, 256>>>(p, n, h16, d[dev]); KCHECK();
+    unsigned long long h = 0; CK(cudaMemcpy(&h, d[dev], sizeof h, cudaMemcpyDeviceToHost));
+    return h;
+}
 extern "C" void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out) {
     const size_t n = (size_t)d * h * w;
     if (xfmt == 1) ridge_k<__half><<<nblk(n, 256), 256>>>(p, (const __half *)x, d, h, w, thr, out);

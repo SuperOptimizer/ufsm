@@ -170,6 +170,7 @@ struct sampler {
     pthread_t *th;
     atomic_int stop, failed;
     atomic_uint_fast64_t produced, rejected;
+    atomic_uint_fast64_t rej_why[4];   /* draws dropped: coarse CT probe, CT read (min_fg), empty targets, holdout overlap (not in rejected) */
     atomic_uint soft_bits;   /* current soft-target sigma (float bits), set by sampler_set_soft */
     int64_t *slot_j;         /* deterministic mode: batch index held by each slot */
     int64_t next_claim, next_take;   /* deterministic mode: next batch index to fill / to hand out (under mu) */
@@ -209,10 +210,12 @@ static batch alloc_batch(const sample_cfg *c) {
     b.pm = c->pmask ? halloc((size_t)c->B * p3) : nullptr;
     b.wind = c->cond ? halloc((size_t)c->B * p3) : nullptr;
     b.pap = c->pap_head ? halloc((size_t)c->B * p3) : nullptr;
+    b.w4 = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
+    b.wcomp = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b) { if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -288,6 +291,7 @@ static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
                 if (c == region_ch) { any = 1; continue; }
                 if (s->tgt_key[c] && source_tgt_for_level(s, c, l, nullptr)) any = 1;
             }
+            if (s->band && (s->phase || l == 0)) any = 1;   /* band codes (+ stored phase) alone label a source (task unwrap2 sources have no recto / ink) */
             ok = any;
         }
         cache[l] = ok ? 2 : 1;
@@ -732,7 +736,8 @@ static void write_spatial_tm(const uint8_t *ctu,const uint8_t *target,const uint
     const float c=.5f*(a->P-1),sc=(float)a->scale;
     float Rf[3][3],Af[3][3],Aif[3][3];
     for (int i=0;i<3;i++) for (int j=0;j<3;j++) { Rf[i][j]=(float)a->R[i][j]; Af[i][j]=(float)a->A[i][j]; Aif[i][j]=(float)a->Ainv[i][j]; }
-    float *vt=malloc(6*(size_t)P*sizeof *vt), *cvb=wbig_alloc((size_t)ZB*P*P*sizeof *cvb,0); uint8_t *inb=wbig_alloc((size_t)ZB*P*P,0);
+    /* (the z-block scratch pooled per worker: a fresh 16 + 4 MB per window was an mmap / munmap pair and a TLB shootdown) */
+    float *vt=malloc(6*(size_t)P*sizeof *vt), *cvb=tp_get((size_t)ZB*P*P*sizeof *cvb,0); uint8_t *inb=tp_get((size_t)ZB*P*P,0);
     if (!vt || !cvb || !inb) abort();
     for (int d=0;d<3;d++) for (int u=0;u<P;u++) {   /* spatial_aug_pull's per-axis terms */
         vt[d*P+u]=u-c-table[d*P+u];
@@ -749,8 +754,11 @@ static void write_spatial_tm(const uint8_t *ctu,const uint8_t *target,const uint
     /* no appearance plan (the trainer's default): the CT byte and the mask bit of each voxel as one 16-bit word in the (otherwise
        unused) appearance scratch, so one 32-bit gather serves an x pair of corners (4 gathers per 8 voxels instead of 24), and the
        CT value is lutv's float ((float) v - mean) * isd computed in the lanes (the same two float operations) */
-    const int cmf=fast && !ap && appearance;
-    uint16_t *cm=cmf?(uint16_t *)appearance:nullptr;
+    /* with an appearance plan (--ct-aug) the same words: the CT value is its LUT entry (a gather from lutv, L1-resident) or, with a
+       filter, the appearance float (the words then in pooled scratch beside it) */
+    const int cmf=fast && appearance;
+    uint16_t *cm=cmf?(filt_fast?tp_get(2*p3,0):(uint16_t *)appearance):nullptr;
+    if (cmf && !cm) abort();
     /* hard 0 / 255 targets (what the packed batch requires) ride along as bits 9 and 10: the nearest corner's targets come from the
        same pair words (else two more gathers per 8 voxels) */
     int cmt=cmf;
@@ -812,7 +820,9 @@ static void write_spatial_tm(const uint8_t *ctu,const uint8_t *target,const uint
                                 const __m256 w=_mm256_mul_ps(wzy,bx?F[2]:G[2]);
                                 const __m256 use=_mm256_and_ps(in,_mm256_cmp_ps(w,thr,_CMP_GT_OQ));
                                 const __m256i h16=bx?_mm256_srli_epi32(wd,16):wd;
-                                const __m256 val=_mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_and_si256(h16,bytem)),_mm256_set1_ps(mean)),_mm256_set1_ps(isd));
+                                const __m256 val=filt_fast?_mm256_mask_i32gather_ps(zero,appearance,_mm256_add_epi32(b0,_mm256_set1_epi32((bz*P+by)*P+bx)),use,4)
+                                                :ap?_mm256_mask_i32gather_ps(zero,lutv,_mm256_and_si256(h16,bytem),use,4)
+                                                :_mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_and_si256(h16,bytem)),_mm256_set1_ps(mean)),_mm256_set1_ps(isd));
                                 cv=_mm256_add_ps(cv,_mm256_and_ps(_mm256_mul_ps(w,val),use));
                                 bad=_mm256_or_si256(bad,_mm256_and_si256(zm[bx],_mm256_castps_si256(use)));
                             }
@@ -969,7 +979,10 @@ static void write_spatial_tm(const uint8_t *ctu,const uint8_t *target,const uint
             else memcpy(X+k0,nrow,(size_t)P*sizeof *X);
         }
     }
-    free(vt); free(cvb); free(inb);
+    free(vt); tp_put(cvb,(size_t)ZB*P*P*sizeof *cvb); tp_put(inb,(size_t)ZB*P*P);
+#ifdef __AVX2__
+    if (cmf && filt_fast) tp_put(cm,2*p3);
+#endif
     free(table);
     if (Tloc) {
         size_t bad=0;
@@ -1064,10 +1077,15 @@ static void *wbig_alloc(size_t n, int zero) {
     if (zero) memset(p, 0, n);
     return p;
 }
-static void *tp_get(size_t n, int zero) {
-    const size_t c = tp_class(n);
-    for (int i = 0; i < tpool.k; i++)
-        if (tpool.n[i] == c) { void *p = tpool.b[i]; tpool.b[i] = tpool.b[--tpool.k]; tpool.n[i] = tpool.n[tpool.k]; if (zero) memset(p, 0, n); return p; }
+static void *tp_get(size_t n, int zero) {   /* the smallest pooled buffer of n's class up to 1.25 times it (window sizes vary by a few MB) */
+    const size_t c = tp_class(n), cmax = c >= ((size_t)1 << 20) ? c + c / 4 : c;
+    int best = -1;
+    for (int i = 0; i < tpool.k; i++) if (tpool.n[i] >= c && tpool.n[i] <= cmax && (best < 0 || tpool.n[i] < tpool.n[best])) best = i;
+    if (best >= 0) {   /* (put back under n's class later: a pooled size never exceeds the block's) */
+        void *p = tpool.b[best]; tpool.k--; tpool.b[best] = tpool.b[tpool.k]; tpool.n[best] = tpool.n[tpool.k];
+        if (zero) memset(p, 0, n);
+        return p;
+    }
     return wbig_alloc(c, zero);
 }
 static void tp_put(void *p, size_t n) {
@@ -1183,6 +1201,8 @@ static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shif
     tp_put(ph, N); free(j0); free(tf);
     return 0;
 }
+/* a stored phase / winding read against the convention (sources "phase_sign": -1): codes 0..251 negated mod 252, unknown kept */
+static void phase_negate(uint8_t *p, size_t n) { for (size_t k = 0; k < n; k++) if (p[k] < PHASE_PERIOD && p[k]) p[k] = (uint8_t)(PHASE_PERIOD - p[k]); }
 static int phase_window(z3 *a, const int64_t o[3], int D, int P, int shift, uint8_t *side) {   /* a: s->phase, or s->wind (same grid); D x P x P */
     if (shift >= 2) return phase_window_interp(a, o, D, P, shift, side);
     int64_t lo[3], ln[3], ro[3], rn[3]; const int wn[3] = {D, P, P};
@@ -1284,7 +1304,7 @@ void sample_cond_draw(uint64_t seed, int P, const uint8_t *w, uint8_t *wout, flo
 /* a stored-phase window (source grid, PHASE codes) through the sample's continuous warp and cube symmetry, as write_spatial pulls the CT:
    each output voxel the phasor mean of its 8 source neighbours with a known phase (trilinear weights), unknown outside the window or
    where the known neighbours hold under half the weight. The normal / density targets follow from the warped phase on the GPU. */
-static void warp_phase(const uint8_t *src, uint8_t *dst, int P, sym sy, const spatial_aug *a) {
+[[maybe_unused]] static void warp_phase_ref(const uint8_t *src, uint8_t *dst, int P, sym sy, const spatial_aug *a) {
     static float cs[PHASE_PERIOD], sn[PHASE_PERIOD]; static _Atomic int init;
     if (!atomic_load(&init)) { for (int k = 0; k < PHASE_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); sn[k] = (float)sin(2 * M_PI * k / PHASE_PERIOD); } atomic_store(&init, 1); }
     float *table = malloc(6 * (size_t)P * sizeof *table); if (!table) abort();
@@ -1311,6 +1331,254 @@ static void warp_phase(const uint8_t *src, uint8_t *dst, int P, sym sy, const sp
         const int q = (int)lrintf(t); dst[k] = (uint8_t)(q >= PHASE_PERIOD ? q - PHASE_PERIOD : q);
     }
     free(table);
+}
+
+/* --task unwrap2: the winding mod 4 (w4, 63 codes per turn) and its component through the warp as warp_phase pulls the phase: each
+   output voxel takes the component of its nearest source voxel and the phasor mean (period 4 turns) of the 8 neighbours in that
+   component (unknown under half the weight), so two gauges never mix */
+[[maybe_unused]] static void warp_w4_ref(const uint8_t *w4, const uint8_t *cp, uint8_t *dw, uint8_t *dc, int P, sym sy, const spatial_aug *a) {
+    static float cs[PHASE_PERIOD], sn[PHASE_PERIOD]; static _Atomic int init;
+    if (!atomic_load(&init)) { for (int k = 0; k < PHASE_PERIOD; k++) { cs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); sn[k] = (float)sin(2 * M_PI * k / PHASE_PERIOD); } atomic_store(&init, 1); }
+    float *table = malloc(6 * (size_t)P * sizeof *table); if (!table) abort();
+    spatial_aug_tables(a, table);
+    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
+        const size_t k = ((size_t)z * P + y) * P + x;
+        float u[3], jac[3], v[3]; spatial_aug_pull(a, table, z, y, x, u, jac);
+        for (int d = 0; d < 3; d++) v[sy.perm[d]] = sy.flip[d] ? P - 1 - u[d] : u[d];
+        int inside = 1; for (int d = 0; d < 3; d++) if (v[d] < 0 || v[d] > P - 1) inside = 0;
+        dw[k] = 255; dc[k] = 255;
+        if (!inside) continue;
+        int base[3]; float f[3];
+        for (int d = 0; d < 3; d++) { base[d] = (int)v[d]; if (base[d] >= P - 1) base[d] = P - 2; f[d] = v[d] - base[d]; }
+        const int c0 = cp[((size_t)(base[0] + (f[0] >= .5f)) * P + base[1] + (f[1] >= .5f)) * P + base[2] + (f[2] >= .5f)];
+        if (c0 == 255) continue;
+        float sx = 0.f, s_y = 0.f, wk = 0.f;
+        for (int c = 0; c < 8; c++) {
+            const int bz = c >> 2 & 1, by = c >> 1 & 1, bx = c & 1;
+            const float w = (bz ? f[0] : 1 - f[0]) * (by ? f[1] : 1 - f[1]) * (bx ? f[2] : 1 - f[2]);
+            const size_t j = ((size_t)(base[0] + bz) * P + base[1] + by) * P + base[2] + bx;
+            if (w <= 1e-7f || cp[j] != c0 || w4[j] >= PHASE_PERIOD) continue;
+            sx += w * cs[w4[j]]; s_y += w * sn[w4[j]]; wk += w;
+        }
+        if (wk < .5f || sx * sx + s_y * s_y < 1e-8f) continue;
+        float t = atan2f(s_y, sx) * (float)(PHASE_PERIOD / (2 * M_PI)); if (t < 0) t += PHASE_PERIOD;
+        const int q = (int)lrintf(t); dw[k] = (uint8_t)(q >= PHASE_PERIOD ? q - PHASE_PERIOD : q); dc[k] = (uint8_t)c0;
+    }
+    free(table);
+}
+
+/* warp_phase_ref and warp_w4_ref in one pass, vectorised (draw() and the tests call this): the pull coordinates, corners and trilinear
+   weights computed once for the phase and the winding, cache-blocked tiles, AVX2 lanes of 8 voxels along x. Bit for bit the
+   reference: the same float operations in the same order per lane (no contraction; a skipped corner adds +0, which changes no sum
+   that survives the unknown tests), the corner order c = 0..7, and the code atan2f gives: a vector arctangent (Cephes atanf
+   reduction, ~2e-7 rad) decides each voxel's rounded code unless the scaled angle lies within 1e-3 code of a rounding boundary or
+   of the wrap, where the voxel falls back to atan2f (~0.2 % of random phasors).
+   ph: the phase window, PHASE codes, P^3 + 3 readable bytes (byte pairs along x are gathered as 32-bit words); wq (nullable): the
+   winding mod 4 and its component per voxel as w4 | comp << 8 (P^3 words). dph / dw / dc (each nullable): the warped phase, winding
+   and component. P^3 cubes (slabs never warp). */
+static inline uint8_t warp_code_of(float sx, float sy) {
+    float t = atan2f(sy, sx) * (float)(PHASE_PERIOD / (2 * M_PI)); if (t < 0) t += PHASE_PERIOD;
+    const int q = (int)lrintf(t); return (uint8_t)(q >= PHASE_PERIOD ? q - PHASE_PERIOD : q);
+}
+static void warp_pw_voxel(const uint8_t *ph, const uint16_t *wq, uint8_t *dph, uint8_t *dw, uint8_t *dc, int P, sym sy, const spatial_aug *a,
+                          const float *table, const float *cs, const float *sn, int z, int y, int x) {
+    const size_t k = ((size_t)z * P + y) * P + x;
+    float u[3], jac[3], v[3]; spatial_aug_pull(a, table, z, y, x, u, jac);
+    for (int d = 0; d < 3; d++) v[sy.perm[d]] = sy.flip[d] ? P - 1 - u[d] : u[d];
+    int inside = 1; for (int d = 0; d < 3; d++) if (v[d] < 0 || v[d] > P - 1) inside = 0;
+    if (dph) dph[k] = PHASE_UNKNOWN;
+    if (dw) { dw[k] = 255; dc[k] = 255; }
+    if (!inside) return;
+    int base[3]; float f[3];
+    for (int d = 0; d < 3; d++) { base[d] = (int)v[d]; if (base[d] >= P - 1) base[d] = P - 2; f[d] = v[d] - base[d]; }
+    if (dph) {
+        float sx = 0.f, s_y = 0.f, wk = 0.f;
+        for (int c = 0; c < 8; c++) {
+            const int bz = c >> 2 & 1, by = c >> 1 & 1, bx = c & 1;
+            const float w = (bz ? f[0] : 1 - f[0]) * (by ? f[1] : 1 - f[1]) * (bx ? f[2] : 1 - f[2]);
+            const int p = ph[((size_t)(base[0] + bz) * P + base[1] + by) * P + base[2] + bx];
+            if (w <= 1e-7f || p >= PHASE_PERIOD) continue;
+            sx += w * cs[p]; s_y += w * sn[p]; wk += w;
+        }
+        if (!(wk < .5f || sx * sx + s_y * s_y < 1e-8f)) dph[k] = warp_code_of(sx, s_y);
+    }
+    if (dw) {
+        const int c0 = wq[((size_t)(base[0] + (f[0] >= .5f)) * P + base[1] + (f[1] >= .5f)) * P + base[2] + (f[2] >= .5f)] >> 8;
+        if (c0 == 255) return;
+        float sx = 0.f, s_y = 0.f, wk = 0.f;
+        for (int c = 0; c < 8; c++) {
+            const int bz = c >> 2 & 1, by = c >> 1 & 1, bx = c & 1;
+            const float w = (bz ? f[0] : 1 - f[0]) * (by ? f[1] : 1 - f[1]) * (bx ? f[2] : 1 - f[2]);
+            const int q = wq[((size_t)(base[0] + bz) * P + base[1] + by) * P + base[2] + bx], qw = q & 255;
+            if (w <= 1e-7f || q >> 8 != c0 || qw >= PHASE_PERIOD) continue;
+            sx += w * cs[qw]; s_y += w * sn[qw]; wk += w;
+        }
+        if (wk < .5f || sx * sx + s_y * s_y < 1e-8f) return;
+        dw[k] = warp_code_of(sx, s_y); dc[k] = (uint8_t)c0;
+    }
+}
+static float g_wcs[PHASE_PERIOD], g_wsn[PHASE_PERIOD];
+static pthread_once_t g_wtab_once = PTHREAD_ONCE_INIT;
+static float g_wcssn[512] __attribute__((aligned(64)));   /* (cos, sin) pairs of the 256 codes, 0 above PHASE_PERIOD (vector gathers) */
+static void wtab_init(void) {
+    for (int k = 0; k < PHASE_PERIOD; k++) { g_wcs[k] = (float)cos(2 * M_PI * k / PHASE_PERIOD); g_wsn[k] = (float)sin(2 * M_PI * k / PHASE_PERIOD); g_wcssn[2 * k] = g_wcs[k]; g_wcssn[2 * k + 1] = g_wsn[k]; }
+}
+#ifdef __AVX2__
+/* cos and sin of 8 codes (0..255) from the pair table: two 4 x 64-bit gathers (half the loads of two 8 x 32-bit ones); lanes
+   0, 1, 4, 5 go to the first, 2, 3, 6, 7 to the second, so the even / odd shuffles come out in lane order */
+static inline void warp_cssn8(__m256i code, __m256 *c, __m256 *s) {
+    const __m256i q = _mm256_permutevar8x32_epi32(code, _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7));
+    const __m256 g0 = _mm256_castpd_ps(_mm256_i32gather_pd((const double *)g_wcssn, _mm256_castsi256_si128(q), 8));
+    const __m256 g1 = _mm256_castpd_ps(_mm256_i32gather_pd((const double *)g_wcssn, _mm256_extracti128_si256(q, 1), 8));
+    *c = _mm256_shuffle_ps(g0, g1, 0x88); *s = _mm256_shuffle_ps(g0, g1, 0xdd);
+}
+/* the rounded code of 8 phasors (sx, sy) as 32-bit lanes; *need: lanes within 1e-3 code of a rounding boundary (caller: atan2f) */
+static inline __m256i warp_code8(__m256 sx, __m256 sy, __m256 *need) {
+    const __m256 sgn = _mm256_set1_ps(-0.f), ax = _mm256_andnot_ps(sgn, sx), ay = _mm256_andnot_ps(sgn, sy);
+    const __m256 mn = _mm256_min_ps(ax, ay), mx = _mm256_max_ps(ax, ay);
+    __m256 t = _mm256_div_ps(mn, _mm256_max_ps(mx, _mm256_set1_ps(1e-30f)));   /* [0, 1] */
+    const __m256 big = _mm256_cmp_ps(t, _mm256_set1_ps(.4142135623730950f), _CMP_GT_OQ);   /* tan(pi / 8): t -> (t - 1) / (t + 1), + pi / 4 */
+    t = _mm256_blendv_ps(t, _mm256_div_ps(_mm256_sub_ps(t, _mm256_set1_ps(1.f)), _mm256_add_ps(t, _mm256_set1_ps(1.f))), big);
+    const __m256 z = _mm256_mul_ps(t, t);
+    __m256 p = _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(8.05374449538e-2f), z), _mm256_set1_ps(-1.38776856032e-1f));
+    p = _mm256_add_ps(_mm256_mul_ps(p, z), _mm256_set1_ps(1.99777106478e-1f));
+    p = _mm256_add_ps(_mm256_mul_ps(p, z), _mm256_set1_ps(-3.33329491539e-1f));
+    __m256 r = _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(p, z), t), t);
+    r = _mm256_add_ps(r, _mm256_and_ps(big, _mm256_set1_ps((float)(M_PI / 4))));
+    r = _mm256_blendv_ps(r, _mm256_sub_ps(_mm256_set1_ps((float)(M_PI / 2)), r), _mm256_cmp_ps(ay, ax, _CMP_GT_OQ));
+    r = _mm256_blendv_ps(r, _mm256_sub_ps(_mm256_set1_ps((float)M_PI), r), sx);   /* (sign bit of sx) */
+    r = _mm256_xor_ps(r, _mm256_and_ps(sy, sgn));
+    __m256 c = _mm256_mul_ps(r, _mm256_set1_ps((float)(PHASE_PERIOD / (2 * M_PI))));
+    c = _mm256_add_ps(c, _mm256_and_ps(_mm256_cmp_ps(c, _mm256_setzero_ps(), _CMP_LT_OQ), _mm256_set1_ps((float)PHASE_PERIOD)));
+    const __m256 rd = _mm256_round_ps(c, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    const __m256 d = _mm256_andnot_ps(sgn, _mm256_sub_ps(c, rd));
+    /* near .5 (rounding) or near the wrap at 0 / PHASE_PERIOD (where the reference's t < 0 test and our sign may disagree) */
+    *need = _mm256_or_ps(_mm256_cmp_ps(d, _mm256_set1_ps(.5f - 1e-3f), _CMP_GT_OQ),
+                         _mm256_cmp_ps(_mm256_andnot_ps(sgn, c), _mm256_set1_ps(1e-3f), _CMP_LT_OQ));
+    __m256i q = _mm256_cvtps_epi32(rd);
+    q = _mm256_sub_epi32(q, _mm256_and_si256(_mm256_cmpgt_epi32(q, _mm256_set1_epi32(PHASE_PERIOD - 1)), _mm256_set1_epi32(PHASE_PERIOD)));
+    return q;
+}
+#endif
+static void warp_phase_w4(const uint8_t *ph, const uint16_t *wq, uint8_t *dph, uint8_t *dw, uint8_t *dc, int P, sym sy, const spatial_aug *a) {
+    pthread_once(&g_wtab_once, wtab_init);
+    const float *cs = g_wcs, *sn = g_wsn;
+    float *table = malloc(6 * (size_t)P * sizeof *table); if (!table) abort();
+    spatial_aug_tables(a, table);
+#ifdef __AVX2__
+    const float c = .5f * (a->P - 1), sc = (float)a->scale;
+    float Rf[3][3], Af[3][3], *vt = malloc(3 * (size_t)P * sizeof *vt); if (!vt) abort();
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { Rf[i][j] = (float)a->R[i][j]; Af[i][j] = (float)a->A[i][j]; }
+    for (int d = 0; d < 3; d++) for (int u = 0; u < P; u++) vt[d * P + u] = u - c - table[d * P + u];   /* spatial_aug_pull's per-axis terms */
+    enum { ZB = 8, YB = 16, XB = 64 };
+    const __m256 one = _mm256_set1_ps(1.f), fP1 = _mm256_set1_ps((float)(P - 1)), zero = _mm256_setzero_ps(), thr = _mm256_set1_ps(1e-7f), half = _mm256_set1_ps(.5f);
+    const __m256i iP = _mm256_set1_epi32(P), b255 = _mm256_set1_epi32(255), per = _mm256_set1_epi32(PHASE_PERIOD);
+    const int xv = P & ~7;   /* vector lanes; the rest per voxel */
+    for (int z0 = 0; z0 < P; z0 += ZB) for (int y0 = 0; y0 < P; y0 += YB) for (int x0 = 0; x0 < P; x0 += XB)
+    for (int z = z0; z < z0 + ZB && z < P; z++) for (int y = y0; y < y0 + YB && y < P; y++) {
+        const float v0 = vt[z], v1 = vt[P + y]; float t01[3];
+        for (int d = 0; d < 3; d++) t01[d] = Rf[0][d] * v0 + Rf[1][d] * v1;
+        const int xe = x0 + XB < xv ? x0 + XB : xv;
+        for (int xs = x0; xs < xe; xs += 8) {
+            const __m256 v2 = _mm256_loadu_ps(vt + 2 * P + xs);
+            __m256 U[3], Vv[3], F[3], G[3];
+            if (a->affine) {
+                __m256 w[3];
+                for (int d = 0; d < 3; d++) w[d] = _mm256_add_ps(_mm256_set1_ps(t01[d]), _mm256_mul_ps(_mm256_set1_ps(Rf[2][d]), v2));
+                for (int d = 0; d < 3; d++) U[d] = _mm256_add_ps(_mm256_set1_ps(c), _mm256_mul_ps(_mm256_set1_ps(sc), _mm256_add_ps(_mm256_add_ps(
+                    _mm256_mul_ps(_mm256_set1_ps(Af[d][0]), w[0]), _mm256_mul_ps(_mm256_set1_ps(Af[d][1]), w[1])), _mm256_mul_ps(_mm256_set1_ps(Af[d][2]), w[2]))));
+            } else for (int d = 0; d < 3; d++) U[d] = _mm256_add_ps(_mm256_set1_ps(c), _mm256_mul_ps(_mm256_set1_ps(sc), _mm256_add_ps(_mm256_set1_ps(t01[d]), _mm256_mul_ps(_mm256_set1_ps(Rf[2][d]), v2))));
+            for (int d = 0; d < 3; d++) Vv[sy.perm[d]] = sy.flip[d] ? _mm256_sub_ps(fP1, U[d]) : U[d];
+            __m256 in = _mm256_and_ps(_mm256_cmp_ps(Vv[0], zero, _CMP_GE_OQ), _mm256_cmp_ps(Vv[0], fP1, _CMP_LE_OQ));
+            for (int d = 1; d < 3; d++) in = _mm256_and_ps(in, _mm256_and_ps(_mm256_cmp_ps(Vv[d], zero, _CMP_GE_OQ), _mm256_cmp_ps(Vv[d], fP1, _CMP_LE_OQ)));
+            const size_t k = ((size_t)z * P + y) * P + xs;
+            const __m256i ini = _mm256_castps_si256(in);
+            if (_mm256_testz_si256(ini, ini)) {
+                if (dph) memset(dph + k, PHASE_UNKNOWN, 8);
+                if (dw) { memset(dw + k, 255, 8); memset(dc + k, 255, 8); }
+                continue;
+            }
+            __m256i Bv[3];
+            for (int d = 0; d < 3; d++) {
+                Bv[d] = _mm256_and_si256(_mm256_min_epi32(_mm256_cvttps_epi32(Vv[d]), _mm256_set1_epi32(P - 2)), ini);
+                F[d] = _mm256_sub_ps(Vv[d], _mm256_cvtepi32_ps(Bv[d])); G[d] = _mm256_sub_ps(one, F[d]);
+            }
+            const __m256i b0 = _mm256_add_epi32(_mm256_mullo_epi32(_mm256_add_epi32(_mm256_mullo_epi32(Bv[0], iP), Bv[1]), iP), Bv[2]);
+            /* per corner (the reference's order c = 0..7) its weight ((wz * wy) * wx), shared by the phase and the winding sums */
+            __m256 sxp = zero, syp = zero, wkp = zero, sxw = zero, syw = zero, wkw = zero, cok = zero;
+            __m256i c0 = b255, wdp[4] = {}, pdp[4] = {};
+            for (int pr = 0; pr < 4; pr++) {
+                const __m256i ix = _mm256_add_epi32(b0, _mm256_set1_epi32(((pr >> 1) * P + (pr & 1)) * P));   /* (in bounds: outside lanes index 0) */
+                if (dph) pdp[pr] = _mm256_i32gather_epi32((const int *)ph, ix, 1);
+                if (dw) wdp[pr] = _mm256_i32gather_epi32((const int *)wq, ix, 2);
+            }
+            if (dw) {   /* the nearest corner (fraction >= .5: the upper one) and its component */
+                const __m256 nz_ = _mm256_cmp_ps(F[0], half, _CMP_GE_OQ), ny_ = _mm256_cmp_ps(F[1], half, _CMP_GE_OQ), nx_ = _mm256_cmp_ps(F[2], half, _CMP_GE_OQ);
+                const __m256i w0 = _mm256_blendv_epi8(wdp[0], wdp[1], _mm256_castps_si256(ny_)), w1 = _mm256_blendv_epi8(wdp[2], wdp[3], _mm256_castps_si256(ny_));
+                const __m256i ws = _mm256_blendv_epi8(w0, w1, _mm256_castps_si256(nz_));
+                c0 = _mm256_and_si256(_mm256_srli_epi32(_mm256_blendv_epi8(ws, _mm256_srli_epi32(ws, 16), _mm256_castps_si256(nx_)), 8), b255);
+                cok = _mm256_andnot_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(c0, b255)), in);
+            }
+            for (int pr = 0; pr < 4; pr++) {
+                const __m256 wzy = _mm256_mul_ps(pr >> 1 ? F[0] : G[0], pr & 1 ? F[1] : G[1]);
+                for (int bx = 0; bx < 2; bx++) {
+                    const __m256 w = _mm256_mul_ps(wzy, bx ? F[2] : G[2]), wg = _mm256_cmp_ps(w, thr, _CMP_GT_OQ);
+                    if (dph) {
+                        const __m256i code = _mm256_and_si256(bx ? _mm256_srli_epi32(pdp[pr], 8) : pdp[pr], b255);
+                        const __m256 use = _mm256_and_ps(_mm256_and_ps(in, wg), _mm256_castsi256_ps(_mm256_cmpgt_epi32(per, code)));
+                        __m256 cv, sv; warp_cssn8(code, &cv, &sv);
+                        sxp = _mm256_add_ps(sxp, _mm256_and_ps(_mm256_mul_ps(w, cv), use));
+                        syp = _mm256_add_ps(syp, _mm256_and_ps(_mm256_mul_ps(w, sv), use));
+                        wkp = _mm256_add_ps(wkp, _mm256_and_ps(w, use));
+                    }
+                    if (dw) {
+                        const __m256i h = bx ? _mm256_srli_epi32(wdp[pr], 16) : wdp[pr];
+                        const __m256i code = _mm256_and_si256(h, b255), comp = _mm256_and_si256(_mm256_srli_epi32(h, 8), b255);
+                        const __m256 use = _mm256_and_ps(_mm256_and_ps(cok, wg), _mm256_castsi256_ps(_mm256_and_si256(_mm256_cmpgt_epi32(per, code), _mm256_cmpeq_epi32(comp, c0))));
+                        __m256 cv, sv; warp_cssn8(code, &cv, &sv);
+                        sxw = _mm256_add_ps(sxw, _mm256_and_ps(_mm256_mul_ps(w, cv), use));
+                        syw = _mm256_add_ps(syw, _mm256_and_ps(_mm256_mul_ps(w, sv), use));
+                        wkw = _mm256_add_ps(wkw, _mm256_and_ps(w, use));
+                    }
+                }
+            }
+            for (int f = 0; f < 2; f++) {
+                if (!(f ? dw != nullptr : dph != nullptr)) continue;
+                const __m256 sx = f ? sxw : sxp, s_y = f ? syw : syp, wk = f ? wkw : wkp;
+                const __m256 ok = _mm256_andnot_ps(_mm256_or_ps(_mm256_cmp_ps(wk, half, _CMP_LT_OQ),
+                    _mm256_cmp_ps(_mm256_add_ps(_mm256_mul_ps(sx, sx), _mm256_mul_ps(s_y, s_y)), _mm256_set1_ps(1e-8f), _CMP_LT_OQ)), f ? cok : in);
+                __m256 need; const __m256i q = warp_code8(sx, s_y, &need), oki = _mm256_castps_si256(ok);
+                uint64_t qb = pack8_u32(_mm256_blendv_epi8(b255, q, oki));
+                const int nm = _mm256_movemask_ps(_mm256_and_ps(need, ok));
+                if (nm) {
+                    float fx[8], fy[8]; _mm256_storeu_ps(fx, sx); _mm256_storeu_ps(fy, s_y);
+                    for (int l = 0; l < 8; l++) if (nm >> l & 1) { qb &= ~((uint64_t)255 << 8 * l); qb |= (uint64_t)warp_code_of(fx[l], fy[l]) << 8 * l; }
+                }
+                if (f) { const uint64_t cb = pack8_u32(_mm256_blendv_epi8(b255, c0, oki)); memcpy(dw + k, &qb, 8); memcpy(dc + k, &cb, 8); }
+                else memcpy(dph + k, &qb, 8);
+            }
+        }
+        if (x0 + XB >= P) for (int x = xv; x < P; x++) warp_pw_voxel(ph, wq, dph, dw, dc, P, sy, a, table, cs, sn, z, y, x);
+    }
+    free(vt);
+#else
+    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) warp_pw_voxel(ph, wq, dph, dw, dc, P, sy, a, table, cs, sn, z, y, x);
+#endif
+    free(table);
+}
+/* the phase alone / the winding alone through warp_phase_w4 (tests; draw() calls it directly on padded / interleaved scratch) */
+[[maybe_unused]] static void warp_phase(const uint8_t *src, uint8_t *dst, int P, sym sy, const spatial_aug *a) {
+    const size_t p3 = (size_t)P * P * P; uint8_t *pp = malloc(p3 + 64); if (!pp) abort();
+    memcpy(pp, src, p3); memset(pp + p3, PHASE_UNKNOWN, 64);
+    warp_phase_w4(pp, nullptr, dst, nullptr, nullptr, P, sy, a);
+    free(pp);
+}
+static void warp_w4_pack(const uint8_t *w4, const uint8_t *cp, uint16_t *wq, size_t n) { for (size_t k = 0; k < n; k++) wq[k] = (uint16_t)(w4[k] | cp[k] << 8); }
+[[maybe_unused]] static void warp_w4(const uint8_t *w4, const uint8_t *cp, uint8_t *dw, uint8_t *dc, int P, sym sy, const spatial_aug *a) {
+    const size_t p3 = (size_t)P * P * P; uint16_t *wq = malloc(p3 * 2); if (!wq) abort();
+    warp_w4_pack(w4, cp, wq, p3);
+    warp_phase_w4(nullptr, wq, nullptr, dw, dc, P, sy, a);
+    free(wq);
 }
 
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
@@ -1375,7 +1643,15 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (o[d] < 0) o[d] = 0;
         }
     }
-    if (!c->holdout && training_hits_holdout(sp, s, o, l)) return 1;
+    {   /* debugging / tests: UFSM_SAMPLE_AT="z,y,x[;z,y,x...]" (this level's voxels, cycled): replay given windows of the drawn source */
+        static const char *at; static _Atomic unsigned nat; static int nc = -1; static int64_t ac[16][3];
+        if (nc < 0) { at = getenv("UFSM_SAMPLE_AT"); int k = 0; for (const char *q = at; q && *q && k < 16; k++) {
+                          long long a, b2, c2; if (sscanf(q, "%lld,%lld,%lld", &a, &b2, &c2) != 3) break; ac[k][0] = a; ac[k][1] = b2; ac[k][2] = c2;
+                          q = strchr(q, ';'); if (q) q++; } nc = k; }
+        if (nc > 0) { const unsigned k = atomic_fetch_add(&nat, 1) % (unsigned)nc;
+                      for (int d = 0; d < 3; d++) { o[d] = ac[k][d]; if (o[d] > m->shape[d] - n[d]) o[d] = m->shape[d] - n[d]; if (o[d] < 0) o[d] = 0; } }
+    }
+    if (!c->holdout && training_hits_holdout(sp, s, o, l)) { atomic_fetch_add(&sp->rej_why[3], 1); return 1; }
     PROF_MARK(PS_PICK);
     /* cheap occupancy test on a coarse level before fetching the fine cube */
     int lc = l + 3;
@@ -1386,7 +1662,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         if (z3_read(cct, oc, nc, big, 1)) return -1;
         size_t nz = 0, tot = (size_t)nc[0] * pc * pc;
         for (size_t k = 0; k < tot; k++) nz += big[k] != 0;
-        if ((double)nz / (double)tot < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); return 1; }
+        if ((double)nz / (double)tot < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[0], 1); return 1; }
     }
     PROF_MARK(PS_PROBE);
     /* CT */
@@ -1396,7 +1672,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     size_t nz = 0;
     double sum = 0, sq = 0;
     u8_stats(ctu, p3, &nz, &sum, &sq);
-    if (!c->cover && (double)nz / (double)p3 < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); return 1; }
+    if (!c->cover && (double)nz / (double)p3 < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[1], 1); return 1; }
     PROF_MARK(PS_STATS);
     /* --iso-void / --iso-lift: chamfer distance (3 per voxel, saturated at 255) of every voxel to papyrus (clean CT >= the cutoff) */
     const int iso_t = s->iso > 0 ? s->iso : c->iso;
@@ -1515,7 +1791,10 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             if (mx > tmax) tmax = mx;
         }
     }
-    if (!c->cover && !c->papyrus && tmax == 0 && runif(r) > c->empty_keep) { tp_put(dpap, p3); atomic_fetch_add(&sp->rejected, 1); return 1; }
+    /* empty windows (no target value above 0) kept with p empty_keep; a source without target channels (band codes + stored phase only:
+       the --task unwrap2 sources) has none to test, so its windows are all kept (they took the same coin flip, 4 of 5 draws wasted) */
+    int tgt_any = region_ch >= 0; for (int ch = 0; ch < NCH; ch++) tgt_any |= s->tgt_key[ch] != nullptr;
+    if (!c->cover && !c->papyrus && tgt_any && tmax == 0 && runif(r) > c->empty_keep) { tp_put(dpap, p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); return 1; }
     PROF_MARK(PS_TARGETS);
     uint8_t *near = nullptr;   /* --phase-near-um: voxels within the distance of a labelled wrap voxel (raw labels, before softening) */
     if (c->phase_near_um > 0 && c->side == 2 && w[0]) {
@@ -1745,18 +2024,42 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         if (spatial.active) memset(b->pap + (size_t)i * p3, 255, p3); else sym_u8(papc, b->pap + (size_t)i * p3, Pz, P, y);
         tp_put(papc, p3);
     }
+    /* --task unwrap2: the winding mod 4 and its component come from a stored phase below (warped or through the symmetry: every
+       voxel written); else unknown (255) */
+    int w4_set = 0;
     if (c->band || c->side) {   /* band labels: computed on the source grid, unknown on CT air, then the same symmetry as CT and targets */
         if (!band_sample || (spatial.active && !stored_phase)) {   /* no band labels: affinities (and sides) unsupervised */
             if (c->band) memset(b->band + (size_t)i * p3, BAND_UNKNOWN, p3);
             if (c->side) memset(b->side + (size_t)i * p3, SIDE_UNKNOWN, p3);
         } else if (stored_phase) {   /* the stored phase (ufsm phase-raster, ufsm downsample --mode phase) */
-            uint8_t *sw = tp_get(p3, 0);
-            if (!sw || phase_window(s->phase, o, Pz, P, pshift, sw)) { tp_put(sw, p3); return -1; }
+            uint8_t *sw = tp_get(p3 + 64, 0);   /* (+ 64: warp_phase_w4 reads byte pairs as 32-bit words) */
+            uint16_t *wq = nullptr;   /* warped --task unwrap2: the winding and its component for warp_phase_w4 (one pass with the phase) */
+            if (!sw || phase_window(s->phase, o, Pz, P, pshift, sw)) { tp_put(sw, p3 + 64); return -1; }
+            if (s->phase_sign < 0) phase_negate(sw, p3);   /* (before the winding mod 4: it unwraps this phase) */
+            if (c->wind4) {   /* the winding mod 4: the phase unwrapped before the air test (gaps join the windings), outside the scroll (CT 0) not */
+                uint8_t *pw = tp_get(p3, 0), *ww = tp_get(p3, 0), *wc = tp_get(p3, 0);
+                if (!pw || !ww || !wc) { tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1; }
+                for (size_t k = 0; k < p3; k++) pw[k] = ctu[k] ? sw[k] : SIDE_UNKNOWN;
+                const int wt = c->wind4_tile < 0 ? 0 : c->wind4_tile > (P + 5) / 6 ? c->wind4_tile : (P + 5) / 6;   /* (<= 6^3 tiles: one gauge each fits the loss's 255) */
+                if (band_wind4_tiled(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, ww, wc, nullptr) < 0) {
+                    tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1;
+                }
+                if (spatial.active) {
+                    if (!(wq = tp_get(2 * p3, 0))) { tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1; }
+                    warp_w4_pack(ww, wc, wq, p3);
+                }
+                else { sym_u8(ww, b->w4 + (size_t)i * p3, Pz, P, y); sym_u8(wc, b->wcomp + (size_t)i * p3, Pz, P, y); }
+                w4_set = 1;   /* (warped: warp_phase_w4 below writes every voxel) */
+                tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3);
+            }
             for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) sw[k] = SIDE_UNKNOWN;
             if (c->phase_near_um > 0) for (size_t k = 0; k < p3; k++) if (!near || !near[k]) sw[k] = SIDE_UNKNOWN;   /* no labelled wrap: none */
-            if (spatial.active) warp_phase(sw, b->side + (size_t)i * p3, P, y, &spatial);   /* (slabs never warp: sampler_start) */
-            else sym_u8(sw, b->side + (size_t)i * p3, Pz, P, y);
-            tp_put(sw, p3);
+            if (spatial.active) {   /* (slabs never warp: sampler_start) */
+                memset(sw + p3, PHASE_UNKNOWN, 64);
+                warp_phase_w4(sw, wq, b->side + (size_t)i * p3, wq ? b->w4 + (size_t)i * p3 : nullptr, wq ? b->wcomp + (size_t)i * p3 : nullptr, P, y, &spatial);
+                tp_put(wq, 2 * p3);
+            } else sym_u8(sw, b->side + (size_t)i * p3, Pz, P, y);
+            tp_put(sw, p3 + 64);
         } else {
             if (Pz != P) { fprintf(stderr, "sampler: slab windows take the phase from a stored raster (sources \"phase\" at this level or one coarser)\n"); return -1; }
             uint8_t *bw = tp_get(p3, 0), *sw = c->side ? tp_get(p3, 0) : nullptr;
@@ -1770,6 +2073,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
             tp_put(bw, p3); tp_put(sw, p3);
         }
     }
+    if (c->wind4 && !w4_set) { memset(b->w4 + (size_t)i * p3, 255, p3); memset(b->wcomp + (size_t)i * p3, 255, p3); }
     PROF_MARK(PS_AUGMENT);
     const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0);
     if (c->gpu_input && (c->sheet || (app && Pz != P))) { fprintf(stderr, "sampler: --gpu-input needs write_x / write_spatial samples (sample_gpu_input_ok)\n"); abort(); }
@@ -1799,11 +2103,18 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         tp_put(aw, p3); tp_put(as, p3);
     }
     tp_put(near, p3);
+    if (c->side == 2 && c->min_phase > 0) {   /* --min-phase: windows with (almost) no known phase supervise nothing (sources with band / phase
+                                                 targets only draw anywhere in the scroll): rejected */
+        const uint8_t *sd = b->side + (size_t)i * p3; size_t kn = 0;
+        for (size_t k = 0; k < p3; k++) kn += sd[k] < PHASE_PERIOD;
+        if ((double)kn < c->min_phase * (double)p3) { if (Tw) tp_put(Tw, (NCH + 1) * p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); return 1; }   /* (counted as empty targets) */
+    }
     if (c->cond) {   /* inputs 4-6 and batch.wind from the source's winding raster (on the stored phase's grid; air unknown like the phase) */
         uint8_t *ww = tp_get(p3, 0), *ws = tp_get(p3, 0);
         if (!ww || !ws) { tp_put(ww, p3); tp_put(ws, p3); return -1; }
         if (stored_phase && s->wind) {
             if (phase_window(s->wind, o, Pz, P, pshift, ww)) { tp_put(ww, p3); tp_put(ws, p3); return -1; }
+            if (s->phase_sign < 0) phase_negate(ww, p3);   /* the winding mod 14 turns in the same encoding: W -> -W */
             for (size_t k = 0; k < p3; k++) if (ctu[k] <= c->side_air || !ctu[k]) ww[k] = 255;
         } else memset(ww, 255, p3);
         sym_u8(ww, ws, Pz, P, y);
@@ -1827,6 +2138,20 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         tp_put(Tw, (NCH + 1) * p3);
     }
     PROF_MARK(PS_X16);
+    {   /* a non-finite input value (an augmentation dividing by a degenerate window's statistics): the window is rejected. The network
+           would not show it (the MX input conversion's amax ignores NaN) but the stem's weight gradient reads the 16-bit CT channel, so
+           the step's gradient goes non-finite (skipped, the gradient scale halved) on every replay of the window */
+        size_t bad = 0, k0 = 0; const size_t nx = xc * p3;
+        if (X) { for (size_t k = 0; k < nx; k++) if (!isfinite(X[k])) { if (!bad) k0 = k; bad++; } }
+        else { const uint16_t e = c->xfmt == 1 ? 0x7c00 : 0x7f80; for (size_t k = 0; k < nx; k++) if ((H[k] & e) == e) { if (!bad) k0 = k; bad++; } }
+        if (bad) {
+            static _Atomic int nwarn;
+            if (atomic_fetch_add(&nwarn, 1) < 20)
+                fprintf(stderr, "sampler: %s level %d corner %lld,%lld,%lld: %zu non-finite input values (first at channel %zu voxel %zu): window rejected\n",
+                        s->name, l, (long long)(o[0] << l), (long long)(o[1] << l), (long long)(o[2] << l), bad, k0 / p3, k0 % p3);
+            return 1;
+        }
+    }
     memcpy(b->w + (size_t)i * NCH, w, NCH);
     b->src[i] = (int16_t)si;
     b->level[i] = (int8_t)l;
@@ -1905,6 +2230,25 @@ static void *worker(void *arg) {
     return nullptr;
 }
 
+/* band codes + stored phase sources (no recto target; the --task unwrap2 sources): the stored phase's chunks that hold any known
+   phase, from its shard indices (all-unknown chunks are not stored); a cell is one chunk, i.e. a voxel of level phase_level +
+   log2(chunk). Windows are then drawn around labelled chunks instead of uniformly over the scan (on the desk's sparsely labelled
+   scrolls ~93% of uniform draws were rejected, many after the CT read), and ufsm prefetch covers these sources. */
+static occ_index phase_occupancy(source *s) {
+    occ_index o = {nullptr, 0, -1, {0, 0, 0}};
+    const z3_meta *m = z3_meta_of(s->phase); const int64_t c = m->chunk[0]; int e = 0;
+    while (((int64_t)1 << e) < c) e++;
+    if (c < 1 || ((int64_t)1 << e) != c || m->chunk[1] != c || m->chunk[2] != c) return o;
+    int64_t g[3]; uint8_t *bits = nullptr; const int64_t np = z3_chunk_map(s->phase, g, &bits);
+    if (np <= 0 || (double)g[0] * g[1] * g[2] >= 4.29e9) { free(bits); return o; }
+    uint32_t *idx = malloc((size_t)np * sizeof *idx); size_t n = 0;
+    if (!idx) { free(bits); return o; }
+    for (int64_t k = 0; k < g[0] * g[1] * g[2]; k++) if (bits[k]) idx[n++] = (uint32_t)k;
+    free(bits);
+    o.idx = idx; o.n = n; o.lev = s->phase_level + e; for (int d = 0; d < 3; d++) o.shape[d] = g[d];
+    fprintf(stderr, "sampler: %s: %zu of %lld stored-phase chunks (level %d cells) hold labels\n", s->name, n, (long long)(g[0] * g[1] * g[2]), o.lev);
+    return o;
+}
 /* coarsest recto level that fits in memory: the cells containing any surface fraction (fallback: any labelled cell) */
 occ_index source_occupancy(source *s) {
     occ_index o = {nullptr, 0, -1, {0, 0, 0}};
@@ -1914,6 +2258,7 @@ occ_index source_occupancy(source *s) {
        sampled uniformly over the whole volume) */
     int lc = -1; z3 *tz = nullptr;
     for (int l = MAXLEV - 1; l >= 3; l--) { z3 *t = source_tgt(s, 0, l); if (t) { const z3_meta *m = z3_meta_of(t); if ((double)m->shape[0] * m->shape[1] * m->shape[2] < 4.29e9) { lc = l; tz = t; break; } } }
+    if (!tz && s->band && s->phase) return phase_occupancy(s);
     if (!tz) return o;
     const z3_meta *m = z3_meta_of(tz);
     const int binary = s->tgt_binary[0] || m->label_binary;
@@ -2141,6 +2486,7 @@ void sampler_prof_print(const sampler *sp) {
     { uint64_t h, r; z3_io_stats(&h, &r); fprintf(stderr, " | chunk reads: %llu cached, %llu from the store", (unsigned long long)h, (unsigned long long)r); }
     fprintf(stderr, "\n");
 }
+void sampler_reject_reasons(const sampler *sp, uint64_t why[4]) { for (int k = 0; k < 4; k++) why[k] = atomic_load(&sp->rej_why[k]); }
 void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected) {
     *produced = atomic_load(&sp->produced);
     *rejected = atomic_load(&sp->rejected);

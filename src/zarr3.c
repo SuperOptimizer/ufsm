@@ -569,14 +569,31 @@ static void mc_put(const z3 *z, const work *w, const uint8_t *dec, size_t cv) {
     pthread_mutex_unlock(&c->mu);
 }
 
+/* the decode buffers and zstd context of a thread, kept between reads (the sampler's workers read a window per draw: a fresh
+   2 + 14 MB per read was an mmap / munmap pair, page faults and a TLB shootdown across the process); freed at thread exit */
+typedef struct { uint8_t *dec, *scratch; size_t ndec, nscr; ZSTD_DCtx *dctx; } z3_tls;
+static pthread_key_t z3_tls_key;
+static pthread_once_t z3_tls_once = PTHREAD_ONCE_INIT;
+static void z3_tls_free(void *p) { z3_tls *t = p; free(t->dec); free(t->scratch); if (t->dctx) ZSTD_freeDCtx(t->dctx); free(t); }
+static void z3_tls_init(void) { pthread_key_create(&z3_tls_key, z3_tls_free); }
+static z3_tls *z3_tls_get(size_t ndec, size_t nscr) {
+    pthread_once(&z3_tls_once, z3_tls_init);
+    z3_tls *t = pthread_getspecific(z3_tls_key);
+    if (!t) { if (!(t = calloc(1, sizeof *t))) return nullptr; if (pthread_setspecific(z3_tls_key, t)) { free(t); return nullptr; } }
+    if (t->ndec < ndec) { free(t->dec); t->dec = malloc(ndec); t->ndec = t->dec ? ndec : 0; }
+    if (t->nscr < nscr) { free(t->scratch); t->scratch = malloc(nscr); t->nscr = t->scratch ? nscr : 0; }
+    if (!t->dctx) t->dctx = ZSTD_createDCtx();
+    return t->dec && t->scratch && t->dctx ? t : nullptr;
+}
 static void *worker(void *arg) {
     job *jb = arg;
     z3 *z = jb->z;
     size_t cv = (size_t)z->m.chunk[0] * z->m.chunk[1] * z->m.chunk[2];
     const size_t es = (size_t)z->m.esize, cvb = cv * es, sb = es > 1 ? (VOLCOMP_TYPED_ENCODE_BOUND > cvb ? VOLCOMP_TYPED_ENCODE_BOUND : cvb) : (VOLCOMP_ENCODE_BOUND > cv ? VOLCOMP_ENCODE_BOUND : cv);
-    uint8_t *dec = malloc(cvb);
-    uint8_t *scratch = malloc(sb);
-    ZSTD_DCtx *dctx = ZSTD_createDCtx();
+    z3_tls *tl = z3_tls_get(cvb, sb);
+    uint8_t *dec = tl ? tl->dec : nullptr;
+    uint8_t *scratch = tl ? tl->scratch : nullptr;
+    ZSTD_DCtx *dctx = tl ? tl->dctx : nullptr;
     const int mc_on = mc_budget() > 0 && es == 1;
     if (!dec || !scratch || !dctx) { FAIL("chunk decode allocation"); job_failed(jb); }
     for (;;) {
@@ -636,12 +653,33 @@ static void *worker(void *arg) {
         if (msk && mc_on) mc_put(z, w, dec, cv);
         copy_chunk(jb, w, dec);
     }
-    ZSTD_freeDCtx(dctx);
-    free(dec);
-    free(scratch);
     return nullptr;
 }
 
+int64_t z3_chunk_map(z3 *z, int64_t grid[3], uint8_t **bits) {
+    const z3_meta *m = &z->m; *bits = nullptr;
+    if (!m->sharded) return FAIL("chunk map: not a sharded array");
+    int64_t ns[3];
+    for (int i = 0; i < 3; i++) { grid[i] = (m->shape[i] + m->chunk[i] - 1) / m->chunk[i]; ns[i] = (m->shape[i] + m->shard[i] - 1) / m->shard[i]; }
+    uint8_t *b = calloc((size_t)(grid[0] * grid[1] * grid[2]), 1); ientry *idx = malloc((size_t)z->nc * sizeof *idx);
+    if (!b || !idx) { free(b); free(idx); return FAIL("chunk map allocation"); }
+    int64_t n = 0;
+    for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
+        char skey[1200]; shard_key(z, sz, sy, sx, skey, sizeof skey);
+        const int pr = load_index(z, skey, idx);
+        if (pr < 0) { free(b); free(idx); return -1; }
+        if (!pr) continue;
+        for (int cz = 0; cz < z->cgrid[0]; cz++) for (int cy = 0; cy < z->cgrid[1]; cy++) for (int cx = 0; cx < z->cgrid[2]; cx++) {
+            const int64_t gz = sz * z->cgrid[0] + cz, gy = sy * z->cgrid[1] + cy, gx = sx * z->cgrid[2] + cx;
+            if (gz >= grid[0] || gy >= grid[1] || gx >= grid[2]) continue;
+            const ientry e = idx[(cz * z->cgrid[1] + cy) * z->cgrid[2] + cx];
+            if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) continue;
+            b[(gz * grid[1] + gy) * grid[2] + gx] = 1; n++;
+        }
+    }
+    free(idx); *bits = b;
+    return n;
+}
 int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx) {
     char skey[1200];
     shard_key(z, sz, sy, sx, skey, sizeof skey);
@@ -656,9 +694,8 @@ int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx) {
     return s == -2 ? 0 : s < 0 ? -1 : 1;
 }
 
-int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
-    const z3_meta *m = &z->m;
-    const size_t nv = (size_t)n[0] * n[1] * n[2];
+/* the fill value over the whole output box */
+static void z3_fill(const z3_meta *m, uint8_t *out, size_t nv) {
     if (m->esize == 1) memset(out, m->fill, nv);
     else {   /* typed fill: one element, then copied */
         uint8_t e[4] = {0}; const double f = m->fillv;
@@ -671,6 +708,15 @@ int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nth
         }
         for (size_t i = 0; i < nv; i++) memcpy(out + i * m->esize, e, (size_t)m->esize);
     }
+}
+int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
+    const z3_meta *m = &z->m;
+    const size_t nv = (size_t)n[0] * n[1] * n[2];
+    /* a box inside the array whose chunks are all present (sharded) is overwritten entirely by the chunk copies: no fill pass (the
+       sampler's P512 CT window: a 128 MB memset per read) */
+    int inside = m->sharded;
+    for (int i = 0; i < 3; i++) inside &= o[i] >= 0 && o[i] + n[i] <= m->shape[i];
+    if (!inside) z3_fill(m, out, nv);
     int64_t lo[3], hi[3];
     for (int i = 0; i < 3; i++) {
         lo[i] = o[i] < 0 ? 0 : o[i];
@@ -695,7 +741,7 @@ int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nth
                 if (m->sharded) {
                     present = load_index(z, skey, idx);
                     if (present < 0) { rc = -1; break; }
-                    if (!present) continue;
+                    if (!present) { if (inside) { z3_fill(m, out, nv); inside = 0; } continue; }   /* (a missing shard: filled) */
                 }
                 /* inner chunk range within this shard that intersects the box */
                 int c0[3], c1[3];
@@ -727,6 +773,7 @@ int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nth
             }
     free(idx);
     if (rc) { free(items); return -1; }
+    if (inside) for (int i = 0; i < nitems; i++) if (!items[i].present) { z3_fill(m, out, nv); inside = 0; break; }   /* (an absent chunk: filled) */
     range_work *ranges = nullptr; int nranges = 0;
     if (option_on("UFSM_Z3_COALESCE") && m->sharded && !store_is_local(z->s)) {
         /* Absent chunks are already filled. They have no byte range and must not split nearby payloads. */

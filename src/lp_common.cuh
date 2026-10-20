@@ -1132,7 +1132,10 @@ template <typename T> T *lp_buf(int slot, size_t n) {
     int d = cur_dev_();
     if (n * sizeof(T) > cap[d][slot]) {
         if (buf[d][slot]) cudaFree(buf[d][slot]);
-        cudaMalloc(&buf[d][slot], n * sizeof(T)); cap[d][slot] = n * sizeof(T);
+        if (cudaMalloc(&buf[d][slot], n * sizeof(T)) != cudaSuccess) {   /* (was unchecked: a full card then faulted in the kernel) */
+            fprintf(stderr, "lp_buf: no device memory for a %.1f MB kernel workspace (slot %d, GPU %d)\n", n * sizeof(T) / 1e6, slot, d); abort();
+        }
+        cap[d][slot] = n * sizeof(T);
         static int rep = -1; if (rep < 0) rep = getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) > 0;
         if (rep) fprintf(stderr, "lp_buf: %zu-byte elements, slot %d -> %.1f MB (GPU %d)\n", sizeof(T), slot, cap[d][slot] / 1e6, d);   /* kernel workspaces (outside the planner's dry build) */
     }

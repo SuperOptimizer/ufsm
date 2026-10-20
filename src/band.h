@@ -69,3 +69,21 @@ static inline uint8_t band_winding(uint8_t band, uint8_t phase) {
     const int w = (int)band - BAND_HALF + ((int)phase * BAND_STEPS + PHASE_PERIOD / 2) / PHASE_PERIOD;
     return (uint8_t)(((w % BAND_PERIOD) + BAND_PERIOD) % BAND_PERIOD);
 }
+
+/* Relative winding mod 4 turns of a window (train --task unwrap2): the phase (PHASE_* codes) unwrapped over the window. Voxels are
+   joined to their 6-neighbours where both phases are known and differ by at most maxstep codes (the phase ramps 0 -> 1 between
+   consecutive labelled windings k, k + 1 and wraps at each recto, so the unwrapped phase is the winding W = k + phase up to one
+   integer per connected component: its gauge). Components with more than 8 + 0.2% inconsistent joins (a closed loop of joins whose
+   turns do not add up: labels that disagree) are dropped, and of the rest the maxcomp (<= 15) largest with >= minsize voxels kept:
+   comp = their index by size (0 the largest), w4 = round(4 * 63 * (W mod 4) / 4) = W mod 4 turns in 63 codes per turn (0..251);
+   255 / 255 elsewhere. The gauge (the integer part of W) is arbitrary per component and never compared across components. Only the
+   stored phase is read: the band codes' numbering (per label set, per segment for "each"-mode scrolls) never enters. Returns the
+   number of components kept, -1 out of memory. */
+typedef struct { size_t known, kept, dropped_conflict, runs; int ncomp; } band_wind4_stats;
+int band_wind4(const uint8_t *phase, int D, int H, int W, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st);
+/* the original per-voxel union-find (tests: band_wind4 must match it byte for byte) */
+int band_wind4_ref(const uint8_t *phase, int D, int H, int W, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st);
+/* the same per tile of tile^3 voxels (tile <= 0: the whole volume), each tile's components (at most maxcomp, <= 15) their own
+   gauges, numbered over the tiles up to comp 254 (the loss's limit): a label inconsistency drops only its tile's component */
+int band_wind4_tiled(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st);
+int band_wind4_tiled_ref(const uint8_t *phase, int D, int H, int W, int tile, int maxstep, size_t minsize, int maxcomp, uint8_t *w4, uint8_t *comp, band_wind4_stats *st);   /* (band_wind4_ref per tile) */

@@ -181,6 +181,9 @@ sources *sources_load(const char *path) {
                 store *ps = proot ? store_open(proot) : nullptr;
                 s->phase = ps ? z3_open(ps, pkey, nullptr) : nullptr;
                 s->phase_level = (int)json_num(json_get(pt, "level"), 1); s->phase_direct = json_get(pt, "level") != nullptr;
+                const double sg = json_num(json_get(pt, "phase_sign"), 1);
+                if (sg != 1 && sg != -1) { fprintf(stderr, "sources: %s: \"phase_sign\" must be 1 or -1\n", s->name); json_free(j); sources_free(S); return nullptr; }
+                s->phase_sign = (int)sg;
                 const z3_meta *bm = z3_meta_of(s->band), *pm = s->phase ? z3_meta_of(s->phase) : nullptr;
                 const int sh = s->phase_level - 1;   /* the label grid is level 1: shapes halve per level above it */
                 if (!pm || sh < 0 || sh > 4 || pm->shape[0] != (bm->shape[0] + (1 << sh) - 1) >> sh || pm->shape[1] != (bm->shape[1] + (1 << sh) - 1) >> sh || pm->shape[2] != (bm->shape[2] + (1 << sh) - 1) >> sh) {

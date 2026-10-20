@@ -198,7 +198,7 @@ __global__ void fit_accum_k(const LT *lg, const uint8_t *ct, const uint32_t *bit
         v[1] += 1.f; v[2] += 2.f * sg(ch_phase) - 1.f; v[3] += 2.f * sg(ch_phase + 1) - 1.f;
         for (int k = 0; k < 6; k++) v[4 + k] += sg(ch_normal + k) - (k < 3 ? 0.f : 0.5f);
         { const float sd = sg(ch_density); v[10] += (dcode ? fminf(sd, 0.999f) / (1.f - fminf(sd, 0.999f)) : sd) / dscale; }   /* the density code back to rho */
-        rmax = fmaxf(rmax, sg(ch_recto));
+        if (ch_recto >= 0) rmax = fmaxf(rmax, sg(ch_recto));   /* (task unwrap2: no recto head) */
     }
     for (int k = 0; k < 11; k++) red[k][threadIdx.x] = v[k];
     __shared__ float rm[512]; rm[threadIdx.x] = rmax;
@@ -234,7 +234,7 @@ __global__ void fit_accum_cell_k(const LT *lg, const uint8_t *ct, const uint32_t
         v[1] += 1.f; v[2] += 2.f * sg(ch_phase) - 1.f; v[3] += 2.f * sg(ch_phase + 1) - 1.f;
         for (int k = 0; k < 6; k++) v[4 + k] += sg(ch_normal + k) - (k < 3 ? 0.f : 0.5f);
         { const float sd = sg(ch_density); v[10] += (dcode ? fminf(sd, 0.999f) / (1.f - fminf(sd, 0.999f)) : sd) / dscale; }
-        rmax = fmaxf(rmax, sg(ch_recto));
+        if (ch_recto >= 0) rmax = fmaxf(rmax, sg(ch_recto));   /* (task unwrap2: no recto head) */
     }
     if (v[0] > 0.f) {
         const size_t base = ((size_t)fz * F1 + fy) * F2 + fx;
@@ -292,11 +292,93 @@ extern "C" void nn_fit_accum(const float *lg, const uint8_t *ct, int W, int halo
     nn_fit_accum_d(lg, ct, W, W, halo, halo, tz, ty, tx, box, h, F, ch_recto, ch_phase, ch_normal, ch_density, dscale, 0, acc);
 }
 
+/* predict --fit-fields of a task unwrap2 checkpoint: the winding mod 4 head as gauge-free relative planes. Per field cell and axis a
+   (z, y, x) the material-voxel sums of p(v + d e_a) conj p(v), p = (2 sigma - 1) of the cos / sin channels (ch_w4, ch_w4 + 1): the
+   predicted W difference mod 4 over d voxels, inside one window (one gauge). acc: 9 planes of nf cells (re, im, count per axis);
+   needs d <= halo (y, x) and <= hz (z), so v + d e_a stays inside the window. */
+template <typename LT>
+__global__ void fit_accum_w4_k(const LT *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, int bz, int by, int bx, int h,
+                               int fz0, int fy0, int fx0, int nfz, int nfy, int nfx, int F1, int F2, size_t nf, int ch, int dd, float *acc) {
+    const size_t ci = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (ci >= (size_t)nfz * nfy * nfx) return;
+    const int fz = fz0 + (int)(ci / ((size_t)nfy * nfx)), fy = fy0 + (int)(ci / nfx % nfy), fx = fx0 + (int)(ci % nfx);
+    float v[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const size_t w3 = (size_t)D * W * W, st[3] = {(size_t)W * W * dd, (size_t)W * dd, (size_t)dd};
+    auto mat = [&](size_t i) { return bits ? (bits[i >> 5] >> (i & 31)) & 1u : (unsigned)(ct[i] != 0); };
+    for (int t = 0; t < h * h * h; t++) {
+        const int lz = t / (h * h), ly = (t / h) % h, lx = t % h;
+        const int gz = fz * h + lz, gy = fy * h + ly, gx = fx * h + lx, wz = gz - tz, wy = gy - ty, wx = gx - tx;
+        if (gz >= bz || gy >= by || gx >= bx || wz < hz || wz >= D - hz || wy < halo || wy >= W - halo || wx < halo || wx >= W - halo) continue;
+        const size_t i = ((size_t)wz * W + wy) * W + wx;
+        if (!mat(i)) continue;
+        const float pr = 2.f / (1.f + __expf(-lgv(lg, (size_t)ch * w3 + i))) - 1.f, pi = 2.f / (1.f + __expf(-lgv(lg, (size_t)(ch + 1) * w3 + i))) - 1.f;
+        for (int a = 0; a < 3; a++) {
+            const size_t j = i + st[a];
+            if (!mat(j)) continue;
+            const float qr = 2.f / (1.f + __expf(-lgv(lg, (size_t)ch * w3 + j))) - 1.f, qi = 2.f / (1.f + __expf(-lgv(lg, (size_t)(ch + 1) * w3 + j))) - 1.f;
+            v[3 * a] += qr * pr + qi * pi; v[3 * a + 1] += qi * pr - qr * pi; v[3 * a + 2] += 1.f;
+        }
+    }
+    const size_t base = ((size_t)fz * F1 + fy) * F2 + fx;
+    for (int k = 0; k < 9; k++) if (v[k] != 0.f) atomicAdd(&acc[k * nf + base], v[k]);
+}
+extern "C" void nn_fit_accum_w4(const float *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
+                                int ch_w4, int dd, float *acc) {
+    if (dd > halo || dd > hz || dd < 1) { fprintf(stderr, "nn_fit_accum_w4: offset %d outside the halo (%d, z %d)\n", dd, halo, hz); abort(); }
+    int f0[3], f1[3];
+    const int t[3] = {tz, ty, tx}, wn[3] = {D, W, W}, hn[3] = {hz, halo, halo};
+    for (int d = 0; d < 3; d++) {
+        int lo = t[d] + hn[d], hi = t[d] + wn[d] - hn[d]; if (lo < 0) lo = 0; if (hi > box[d]) hi = box[d];
+        f0[d] = lo / h; f1[d] = (hi + h - 1) / h; if (f1[d] > F[d]) f1[d] = F[d];
+        if (f1[d] <= f0[d]) return;
+    }
+    const int nfz = f1[0] - f0[0], nfy = f1[1] - f0[1], nfx = f1[2] - f0[2];
+    const size_t nf = (size_t)F[0] * F[1] * F[2];
+    if (g_logits_h16) fit_accum_w4_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>((const f16 *)lg, ct, bits, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2],
+                                                                                 nfz, nfy, nfx, F[1], F[2], nf, ch_w4, dd, acc);
+    else fit_accum_w4_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>(lg, ct, bits, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2],
+                                                                      nfz, nfy, nfx, F[1], F[2], nf, ch_w4, dd, acc);
+    KCHECK();
+}
+/* the 9 relative planes -> 4 uint8 planes: dz dy dx = the angle of each axis' sum (byte b: W(x + d e_a) - W(x) = b / 64 turns mod 4),
+   dq = 255 x the mean over the axes with pairs of |sum| / pairs (0: no information) */
+__global__ void fit_finalize_w4_k(const float *acc, size_t nf, uint8_t *a) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= nf) return;
+    float q = 0.f; int na = 0;
+    for (int ax = 0; ax < 3; ax++) {
+        const float re = acc[(3 * ax) * nf + i], im = acc[(3 * ax + 1) * nf + i], n = acc[(3 * ax + 2) * nf + i];
+        uint8_t b = 0;
+        if (n > 0.f) { b = (uint8_t)(lrintf(atan2f(im, re) * (256.f / 6.283185307179586f)) & 255); q += fminf(1.f, sqrtf(re * re + im * im) / n); na++; }
+        a[ax * nf + i] = b;
+    }
+    a[3 * nf + i] = na ? (uint8_t)lrintf(255.f * q / na) : 0;
+}
+extern "C" void nn_fit_finalize_w4(const float *acc, size_t nf, uint8_t *a) { fit_finalize_w4_k<<<nblk(nf, 256), 256>>>(acc, nf, a); KCHECK(); }
+
 /* analytic data terms (nn_fit_loss2): one evaluation per voxel */
+/* U (fixed knots, trilinear delta) and theta at a box-local point, with the 8 lattice corners and weights (the winding mod 4 term's
+   second point) */
+__device__ __forceinline__ float fit_U_at(const fit_dev &f, float pz, float py, float px, float *th, size_t ic[8], float wc[8]) {
+    float az = fminf(fmaxf(pz, 0.f), (float)(f.naxis - 1)); const int ai = min((int)az, f.naxis - 2 < 0 ? 0 : f.naxis - 2); const float at = f.naxis > 1 ? az - ai : 0.f;
+    const int ai1 = f.naxis > 1 ? ai + 1 : ai;
+    const float cy = f.cy[ai] + at * (f.cy[ai1] - f.cy[ai]), cx = f.cx[ai] + at * (f.cx[ai1] - f.cx[ai]);
+    const float dy = py - cy, dx = px - cx, r = sqrtf(dy * dy + dx * dx + 1e-6f); *th = atan2f(dy, dx);
+    float kz = fminf(fmaxf(pz / (float)f.knot_dz, 0.f), (float)(f.nk - 1)); const int k0 = min((int)kz, f.nk - 2 < 0 ? 0 : f.nk - 2), k1 = f.nk > 1 ? k0 + 1 : k0; const float kt = f.nk > 1 ? kz - k0 : 0.f;
+    const float pit = f.pitch[k0] + kt * (f.pitch[k1] - f.pitch[k0]), off = f.offset[k0] + kt * (f.offset[k1] - f.offset[k0]);
+    const float q[3] = {pz / (float)f.L, py / (float)f.L, px / (float)f.L}; const int dim[3] = {f.lz, f.ly, f.lx}; int c0[3]; float ct[3];
+    for (int d = 0; d < 3; d++) { const float a = fminf(fmaxf(q[d], 0.f), (float)(dim[d] - 1)); c0[d] = min((int)a, dim[d] - 2 < 0 ? 0 : dim[d] - 2); ct[d] = dim[d] > 1 ? a - c0[d] : 0.f; }
+    float del = 0.f;
+    for (int c = 0; c < 8; c++) {
+        const int bz = c >> 2 & 1, by = c >> 1 & 1, bx = c & 1;
+        wc[c] = (bz ? ct[0] : 1.f - ct[0]) * (by ? ct[1] : 1.f - ct[1]) * (bx ? ct[2] : 1.f - ct[2]);
+        ic[c] = ((size_t)min(c0[0] + bz, f.lz - 1) * f.ly + min(c0[1] + by, f.ly - 1)) * f.lx + min(c0[2] + bx, f.lx - 1);
+        del += wc[c] * f.delta[ic[c]];
+    }
+    return r / pit + off + del;
+}
 __device__ __forceinline__ unsigned fit_hash(unsigned x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
 __global__ void fit_loss2_k(fit_dev f, double *parts, float *g_delta) {
-    __shared__ double red[5][FIT_TPB];
-    double lp[5] = {0, 0, 0, 0, 0};
+    __shared__ double red[6][FIT_TPB];
+    double lp[6] = {0, 0, 0, 0, 0, 0};   /* total, phase, normal, density, nondeg, winding mod 4 (parts[6]) */
     const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     const float wv = i < n && (f.stride <= 1 || fit_hash((unsigned)i ^ f.salt) % (unsigned)f.stride == 0) ? f.w[i] * (1.f / 255.f) : 0.f;
     if (wv > 0.f) {
@@ -356,17 +438,30 @@ __global__ void fit_loss2_k(fit_dev f, double *parts, float *g_delta) {
                 const float lo = 0.4f * rho - gl;
                 if (lo > 0.f && f.w_nondeg > 0.f) { const float cc = f.w_nondeg * wv * sc; lp[4] += cc * lo * lo; for (int d = 0; d < 3; d++) dg[d] += -cc * 2.f * lo * g[d] / gl; }
             }
-            lp[0] = lp[1] + lp[2] + lp[3] + lp[4];
+            if (f.wd && f.w_w4 > 0.f && f.wd[3 * n + i]) {   /* winding mod 4 (task unwrap2 fields): per axis 1 - cos(2 pi / 4 (W(x + d e_a) - W(x) - delta_a)) */
+                const float q = f.wd[3 * n + i] * (1.f / 255.f), cc = f.w_w4 * wv * q * sc, U0 = r / pit + off + del, kq = 1.5707963267948966f;
+                for (int a = 0; a < 3; a++) {
+                    float th1; size_t ic1[8]; float wc1[8];
+                    const float U1 = fit_U_at(f, pz + (a == 0 ? f.w4_d : 0.f), py + (a == 1 ? f.w4_d : 0.f), px + (a == 2 ? f.w4_d : 0.f), &th1, ic1, wc1);
+                    const float dWm = (U1 - U0) - sdir * fit_wrap(th1 - th) * i2p, dl = (float)f.wd[a * n + i] * (1.f / 64.f);
+                    float sa, ca; sincosf(kq * (dWm - dl), &sa, &ca);
+                    lp[5] += cc * (1.f - ca);
+                    const float gW = cc * kq * sa;   /* dL / dW(x + d e_a); dL / dW(x) = -gW */
+                    dW -= gW;
+                    for (int c = 0; c < 8; c++) if (wc1[c] != 0.f) atomicAdd(&g_delta[ic1[c]], gW * wc1[c]);
+                }
+            }
+            lp[0] = lp[1] + lp[2] + lp[3] + lp[4] + lp[5];
             for (int c = 0; c < 8; c++) {
                 const float gv = dW * wc[c] + dg[0] * gw[c][0] + dg[1] * gw[c][1] + dg[2] * gw[c][2];
                 if (gv != 0.f) atomicAdd(&g_delta[ic[c]], gv);
             }
         }
     }
-    for (int k = 0; k < 5; k++) red[k][threadIdx.x] = lp[k];
+    for (int k = 0; k < 6; k++) red[k][threadIdx.x] = lp[k];
     __syncthreads();
-    for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 5; k++) red[k][threadIdx.x] += red[k][threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) for (int k = 0; k < 5; k++) atomicAdd(&parts[k], red[k][0]);
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 6; k++) red[k][threadIdx.x] += red[k][threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) for (int k = 0; k < (f.wd ? 6 : 5); k++) atomicAdd(&parts[k < 5 ? k : 6], red[k][0]);   /* (parts[6]: callers passing winding-mod-4 planes hold 7) */
 }
 extern "C" void nn_fit_loss2(const fit_dev *f, double *parts, float *g_delta) {
     const size_t n = (size_t)f->D * f->H * f->W;

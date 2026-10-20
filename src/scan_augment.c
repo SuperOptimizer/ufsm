@@ -1,6 +1,7 @@
 #include "scan_augment.h"
 #include "ct_augment.h"
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -300,6 +301,27 @@ static void gin_eval(const float *F, const uint8_t *Z, int P, int C, int k, cons
     *g1p = g1; *g2p = g2; *gnp = gn;
 }
 
+/* SA_GIN's output volume, one per thread (2 MB aligned, huge pages requested), freed at thread exit */
+typedef struct { float *g; size_t n; } gin_tls;
+static pthread_key_t gin_key;
+static pthread_once_t gin_once = PTHREAD_ONCE_INIT;
+static void gin_free(void *p) { gin_tls *t = p; free(t->g); free(t); }
+static void gin_init(void) { pthread_key_create(&gin_key, gin_free); }
+static float *gin_buf(size_t n) {
+    pthread_once(&gin_once, gin_init);
+    gin_tls *t = pthread_getspecific(gin_key);
+    if (!t) { if (!(t = calloc(1, sizeof *t)) || pthread_setspecific(gin_key, t)) abort(); }
+    if (t->n < n) {
+        const size_t gb = n * sizeof *t->g, H = (size_t)2 << 20;
+        free(t->g); t->g = nullptr; t->n = 0;
+        if (posix_memalign((void **)&t->g, H, gb)) abort();
+#ifdef MADV_HUGEPAGE
+        madvise(t->g, (gb + H - 1) & ~(H - 1), MADV_HUGEPAGE);
+#endif
+        t->n = n;
+    }
+    return t->g;
+}
 unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8_t *tgt, int nch, uint8_t *ign, int P,
                         const int64_t o[3], float *cy, float *cx, int hasax, const int chunk[3], int allow_seam, void *scratch) {
     if (!scan_aug_enabled(c) || P < 4 || P > 1024) return 0;
@@ -476,17 +498,12 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
             w1[ch][kk / 2] += 1.f; b1[ch] = (float)(.5 * sym1(&rs)); w2[ch] = (float)(.2 + fabs(sym1(&rs)));
         }
         const double alpha = fmin(1, (.3 + .7 * uniform(&rs)) * SO(SA_GIN));
-        float *G = nullptr; const size_t gb = p3 * sizeof *G, H = (size_t)2 << 20;   /* (2 MB aligned, huge pages: P^3 floats faulted per window) */
-        if (posix_memalign((void **)&G, H, gb)) abort();
-#ifdef MADV_HUGEPAGE
-        madvise(G, (gb + H - 1) & ~(H - 1), MADV_HUGEPAGE);
-#endif
+        float *G = gin_buf(p3);   /* (P^3 floats kept per thread: a fresh 512 MB at P512 was faulted in and unmapped per use) */
         const float im = (float)mean, is = (float)(1 / sd);
         double g1 = 0, g2 = 0; size_t gn = 0;
         gin_eval(F, Z, P, C, k, w1, b1, w2, im, is, G, &g1, &g2, &gn);
         const double gm = gn ? g1 / gn : 0, gs = gn ? sqrt(fmax(g2 / gn - gm * gm, 1e-12)) : 1;
         for (size_t i = 0; i < p3; i++) F[i] = (float)(alpha * (mean + sd * (G[i] - gm) / gs) + (1 - alpha) * F[i]);
-        free(G);
     }
     float lut[257]; int tone = 0;
     for (int i = 0; i < 257; i++) lut[i] = (float)(i < 256 ? i : 255);
