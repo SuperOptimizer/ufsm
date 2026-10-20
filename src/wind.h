@@ -91,7 +91,8 @@ void wind_seed_seam(const wind_seed_info *in, int n, int sense, double *phi0, do
    one surface need it to span over a turn (they test the sense); pairs across surfaces (cross: named sets, K from the names) test
    the names' order and the K, and two surfaces under a quarter pitch apart (one sheet traced twice: where wrap K's end meets wrap
    K + 1's start at the seam) must agree within half a turn: under the wrong sense single wraps still step one turn per sheet
-   outward, but their q runs backwards around the turn (phase -phi on the sheet instead of phi), and only this seam continuity sees it. An axis off the umbilicus, an elliptical or crushed section and z drift along the grid's rows do not
+   outward and only their q within the turn runs backwards (harmless to the pair-rule phase); this seam continuity is the only
+   evidence of their sense. An axis off the umbilicus, an elliptical or crushed section and z drift along the grid's rows do not
    enter: both points of a pair share azimuth and height (the axis only has to lie inside the sheets it is compared across). */
 enum { WIND_ZBIN = 8, WIND_TBIN = 512 };
 typedef struct { int64_t key; float r; float q[2]; int32_t surf; int32_t turn; } wind_pt;   /* q[0]: wind_seed q under sense +1, q[1]: under -1 (names as given);

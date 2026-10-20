@@ -1480,11 +1480,13 @@ static int cmd_wind_assign(int argc, char **argv) {
    carry the higher q; pairs inside a surface spanning over a turn and, with names, across surfaces). A surface whose own pairs
    contradict the choice (agree share under --min-surface-score, default 0.5; >= --min-pairs votes) is DROPPED: reported, not written. surface: each surface its
    own pairs' sense (the radius rule where it has none); +1 / -1: forced (contradicting surfaces still dropped). The old end-gap
-   radius vote (wind_seed_set) is only the tie-break without any pair. Sets of single wraps: the names fix the phase's radial
-   direction whatever the sense, but a wrong sense runs q backwards around every turn (phase -phi instead of phi on the sheet); only
-   same-sheet pairs where wraps meet at the seam see it. Exit 3 when the set's agreement score is under --min-score (>= 100 votes): its q
-   would not rise outward; exit 4 when the sense is undetermined (margin over the other sense under 0.02: no surface over a turn and
-   no wraps meeting at the seam) and not forced (--allow-undetermined 1 writes anyway); nothing is written either way. --dry 1: the
+   radius vote (wind_seed_set) is only the tie-break without any pair. Sets of single wraps: the sense only moves q within each
+   wrap's turn [K, K + 1) (the seam rule), which neither the pair-rule phase (the radial position between the nearest sheets of
+   opposite parity, rising toward the higher winding) nor the winding mod 4 unwrapped from it sees (PHerc0172 seeded -1 and +1:
+   identical stored phase); there the names' order alone sets the phase's direction. Exit 3 when the set's agreement score is under
+   --min-score (>= 100 votes): its q would not rise outward; exit 4 when the sense is undetermined (margin over the other sense under
+   0.02) while a surface spans >= 1.2 turns (its integer windings, hence the phase, follow the sense) and not forced
+   (--allow-undetermined 1 writes anyway); nothing is written either way. --dry 1: the
    decision and each surface's votes only (set.json). A median pitch of the one-turn pairs outside --pitch-um-lo .. hi means they are
    not sheets (phi unwrapping jumps of partial segments): no evidence.
    --seam set (default): the turn boundary at the circular mean of the start azimuths (wraps of one numbering share it), q = K on
@@ -1580,8 +1582,10 @@ static int cmd_wind_seed(int argc, char **argv) {
       if (f) { fprintf(f, "{\"sense\":%d,\"order\":%d,\"forced\":%d,\"sense_determined\":%d,\"score\":%.4f,\"sense_margin\":%.4f,\"order_margin\":%.4f,\"pitch\":%.2f,\"agree\":%zu,\"disagree\":%zu,\"evidence\":%d,\"dropped\":%d,\"surfaces\":%d,\"seam\":%.4f,\"endgap_vote\":[%.1f,%.1f]}\n",
                        sense, order, force_sense != 0, !undetermined, isfinite(ch.score) ? ch.score : -1.0, isfinite(ch.sense_margin) ? ch.sense_margin : -1.0, isfinite(ch.order_margin) ? ch.order_margin : -1.0,
                        ch.pitch, ch.agree, ch.dis, ch.evidence, ch.ndropped, ns, isfinite(phi0) ? phi0 : -1.0, vote[0], vote[1]); fclose(f); } }
-    if (undetermined && !atoi(opt(argc, argv, "--allow-undetermined", "0"))) {   /* (partial wraps never meeting at the seam: q would run backwards around the turn half the time) */
-        fprintf(stderr, "wind-seed: FAILED: the geometry does not tell the spiral sense (margin %.3f; no surface over a turn, no wraps meeting at the seam): nothing written (--sense +1|-1 from elsewhere, or --allow-undetermined 1)\n", ch.sense_margin);
+    double maxspan = 0; for (int k = 0; k < ns; k++) if (!pv[k].dropped && i1[k].span > maxspan) maxspan = i1[k].span;
+    if (undetermined && maxspan < 1.2) fprintf(stderr, "wind-seed: the sense is undetermined but every surface spans under 1.2 turns (%.2f): it moves q only within each turn, not the phase\n", maxspan);
+    else if (undetermined && !atoi(opt(argc, argv, "--allow-undetermined", "0"))) {
+        fprintf(stderr, "wind-seed: FAILED: the geometry does not tell the spiral sense (margin %.3f) and a surface spans %.2f turns (its windings follow the sense): nothing written (--sense +1|-1 from elsewhere, or --allow-undetermined 1)\n", ch.sense_margin, maxspan);
         free(pv); free(idx); free(Ks); free(i1); return 4;
     }
     if (ch.evidence && ch.agree + ch.dis >= 100 && !(ch.score >= min_score)) {
