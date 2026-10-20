@@ -59,4 +59,19 @@ size_t cl_mask_block(const coreline *c, int side, const long long org[3], double
    nearest slab's polyline points within R core-line voxels of it (oriented as the polyline's normal there); f = native um / core um.
    q, n: core-line voxels / unit (y, x). */
 void cl_box_frame(const coreline *c, const long long org[3], int na, double cyg, double cxg, double f, double R, double q[2], double n[2]);
+/* ufsm coreline check (the former core/check/check.py): the core-line sanity render of one field-cell z row zc. Inputs: ct the
+   CT slice at 9.6 um (ctw x cth, shown 2 x 2 averaged = the 19.2 um cells), pc / ps / w the 8 field rows zc .. zc + 7 (8 x N x N
+   cells). The phase gradient g = sum over the rows of Im(conj(m) grad m) (m = (pc - 128 + i (ps - 128)) / 127, numpy.gradient),
+   scipy-Gaussian smoothed (sigma 3 cells; the material mean / 255 sigma 2, > 0.15 = material), against the gradient of the
+   distance to the core line of the slab whose z is nearest zc + 4 (in cells: the line's points / 8): a = g . grad |d|, > 0 where W
+   grows away from the core. Over the material's bounding box + 20 cells: pos / neg the material cells with a > 0 / < 0, pn / nn
+   those within 26 cells (0.5 mm) of the line; rgb (w x h) CT | away-ness (green away, red towards), the slab's line yellow, its
+   neighbours' cyan, a caption. numpy float32 / float64 arithmetic as check.py's. ks the slab index; y1 / x1 as check.py printed
+   them (the arrays clipped to N). 0 on success (-1: no material, -2: allocation). */
+typedef struct { int ks, y0, y1, x0, x1; long long pos, neg, pn, nn; int w, h; uint8_t *rgb; } cl_check_res;
+int cl_check(const coreline *c, int zc, const uint8_t *ct, int ctw, int cth, const uint8_t *pc, const uint8_t *ps, const uint8_t *w, int N,
+             int nthreads, cl_check_res *o);
+/* scipy.ndimage.gaussian_filter(a, sigma) of a float32 H x W image (truncate 4, mode reflect, axis 0 then 1), in place */
+void scipy_gaussian_f32(float *a, int H, int W, double sigma);
+int cmd_coreline_check(int argc, char **argv);   /* src/coreline_check.c (dispatched by main.c) */
 int cmd_coreline(int argc, char **argv);

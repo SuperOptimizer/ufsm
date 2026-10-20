@@ -5,6 +5,7 @@
    minimal PNG reading, and the tifxyz rescale of the former xform_wraps.py. */
 #pragma once
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 
 enum { PIL_BOX = 0, PIL_BILINEAR = 1 };
@@ -42,3 +43,25 @@ static inline float tifxyz_scaled(float v, float z, float divf, float offf) { re
 
 float *img_read_f32(const char *path, int *w, int *h);     /* a float32 single-sample TIFF, nullptr on failure */
 uint8_t *img_read_u8(const char *path, int *w, int *h);    /* a uint8 single-sample TIFF */
+
+/* numpy.percentile(v, q) (method linear, numpy 2's _lerp) of n values; v is reordered. The float32 version is numpy's on float32
+   data (q / 100, the virtual index and the interpolation all float32). n > 0. */
+double np_percentile_f64(double *v, size_t n, double q);
+float np_percentile_f32(float *v, size_t n, float q);
+
+/* the former phase_score.py (ufsm phase-score): the network phase rendered on a surface (ufsm render of the fit-field arrays
+   pc / ps at depth 0): over the pixels with pc != 0 (rendered) and |(pc - 128, ps - 128)| > 13 (some confidence) the sums
+   num = sum (pc - 128) and den = sum |(pc - 128, ps - 128)|: the on-recto score num / den. With a stitched sheet's seam.tif
+   (sw x sh, 2 grid steps per pixel from row r0, column c0): cls[1..6] the same per seam class (one box, seam ok, spread,
+   conflict, bridge, low q), only the classes with >= 200 pixels (the others left zero). Returns the masked pixel count. */
+typedef struct { double num, den; long long n; } phs_acc;
+long long phase_score_surface(const uint8_t *pc, const uint8_t *ps, int w, int h, const uint8_t *seam, int sw, int sh, int r0, int c0,
+                              phs_acc *acc, phs_acc cls[7]);
+/* the whole report of phase_score.py PC_DIR PS_DIR [SHEETS_DIR] on out (the same lines); 0 on success */
+int phase_score_dirs(const char *pcd, const char *psd, const char *sd, FILE *out);
+
+/* drawing on RGB images (w x h): a 5 x 7 bitmap font (6 pixel advance; printable ASCII digits, lower case letters, ( ) , . - :
+   others blank) at top-left (x, y), and Pillow's ImageDraw line of width 2 between integer points (ImagingDrawWideLine: the
+   parallelogram p0, p1, p1 + (round(dy / L), -round(dx / L)), p0 + (..) filled; a point when p0 == p1) */
+void img_text(uint8_t *rgb, int w, int h, int x, int y, const char *s, const uint8_t col[3]);
+void img_line2(uint8_t *rgb, int w, int h, int x0, int y0, int x1, int y1, const uint8_t col[3]);

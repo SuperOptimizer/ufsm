@@ -135,7 +135,9 @@ static double run_spiral(int with_w4, double bias, double *w4loss) {
     }
     fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, {0}, 0, nullptr, nullptr, nullptr};
     if (with_w4) { for (int k = 0; k < 4; k++) f.wd[k] = wd[k]; f.w4_d = dd; }
-    fit_cfg c = fit_cfg_default(); c.verbose = getenv("FITW4_V") != nullptr; c.dir = 1; if (getenv("FITW4_W")) c.w_wind4 = (float)atof(getenv("FITW4_W"));
+    fit_cfg c = fit_cfg_default(); c.verbose = getenv("FITW4_V") != nullptr; c.dir = 1;
+    c.w_wind4 = 4.f;   /* the term's own test: weight 4 (the fitter default is 0 since 2026-10-20) */
+    if (getenv("FITW4_W")) c.w_wind4 = (float)atof(getenv("FITW4_W"));
     fit_model *m = fit_run(&f, &c);
     if (!m) { fprintf(stderr, "FAIL: fit_run\n"); fails++; return 0; }
     int hist[401] = {0}; size_t nd = 0, right = 0;

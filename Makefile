@@ -23,7 +23,7 @@ NVFLAGS ?= -O3 -arch=sm_120 -use_fast_math -Xcompiler -fno-threadsafe-statics -I
 CUDALIBS = -L$(CUDA)/lib64 -lcudart
 
 SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/restore.c src/restore_cli.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/fuse.c src/phase_check.c
-SRC += src/surf.c src/stitch.c src/coreline.c src/fit_ct.c src/l1pot.c
+SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c src/l1pot.c
 SRC += src/fblend.c
 SRC += src/render.c src/imgops.c
 SRC += src/repack.c
@@ -165,6 +165,9 @@ test-all: $(B)/test_stitch
 $(B)/test_coreline: tests/test_coreline.c $(B)/coreline.o $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_coreline
+$(B)/test_pyports: tests/test_pyports.c tests/test_pyports_expected.h $(B)/coreline_check.o $(B)/coreline.o $(B)/imgops.o $(B)/tiff.o $(B)/tiffw.o $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pyports.c $(filter %.o,$^) -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_pyports
 $(B)/test_fit_w4: tests/test_fit_w4.c $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_fit_w4
@@ -359,6 +362,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_repair
 	./$(B)/test_tiffw
 	./$(B)/test_imgops
+	./$(B)/test_pyports
 	./$(B)/test_edt
 	./$(B)/test_volcomp
 	./$(B)/test_typed_zarr

@@ -414,9 +414,10 @@ int cmd_coreline(int argc, char **argv) {
         double q[2], n[2]; const double d = cl_sdist(&C, atof(argv[4]), atof(argv[5]), atof(argv[6]), q, n);
         printf("sdist %.2f nearest (y %.2f, x %.2f) normal (%.4f, %.4f)\n", d, q[0], q[1], n[0], n[1]); cl_free(&C); return 0;
     }
-    fprintf(stderr, "usage: ufsm coreline detect|box|sdist ...\n"
+    fprintf(stderr, "usage: ufsm coreline detect|box|sdist|check ...\n"
                     "  detect <fit-field zarr> <out.json> [--slab 64] [--bin 4]   the flattened umbilicus per z-slab from the phase gradient\n"
                     "  box <core.json> --fields ZARR --box Z Y X NZ NY NX --side S [--dist 2000] [--axis const|perz] --out DIR   a half-box fit-field dir\n"
-                    "  sdist <core.json> Z Y X   signed distance to the core line\n");
+                    "  sdist <core.json> Z Y X   signed distance to the core line\n"
+                    "  check <core.json> <scratch-dir> <out-dir> ZCELL... [--n 2573]   core-line sanity renders (check.sh's ct / pc / ps / w files)\n");
     return 2;
 }

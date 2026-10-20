@@ -48,10 +48,12 @@ int cmd_refine(int argc, char **argv);       /* src/surf.c */
 int cmd_surf_stats(int argc, char **argv);
 int cmd_stitch(int argc, char **argv);   /* src/stitch.c */
 int cmd_coreline(int argc, char **argv);   /* src/coreline.c */
+int cmd_coreline_check(int argc, char **argv);   /* src/coreline_check.c */
 int cmd_render_sheets(int argc, char **argv);   /* src/render.c */
 int cmd_overlay_red(int argc, char **argv);
 int cmd_tifxyz_scale(int argc, char **argv);
 int cmd_png2jpg(int argc, char **argv);
+int cmd_phase_score(int argc, char **argv);
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
@@ -90,11 +92,12 @@ static int usage(void) {
         "  ufsm convert-unwrap2 <unwrap.ckpt> <out.ckpt>   a task unwrap checkpoint as task unwrap2 (heads 2-10 -> 0-8, winding mod 4 fresh; no training step)\n"
         "  ufsm repack <in-array-dir> <out-array-dir> <shard> [--threads N]   lossless re-sharding of a z3w uint8 zarr (copies the compressed chunks)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
-        "  ufsm coreline detect|box|sdist ...   a crushed scroll's flattened umbilicus per z (fit fields) and half-box fit dirs behind it\n"
+        "  ufsm coreline detect|box|sdist|check ...   a crushed scroll's flattened umbilicus per z (fit fields), half-box fit dirs behind it, check renders\n"
         "  ufsm render-sheets <tifxyz-dir> <out-dir> --ct ROOT KEY --ink ROOT KEY ...   every sheet -> CT + red ink 5-panel JPEGs, one batch\n"
         "  ufsm overlay-red <ct-dir> <ink-dir> <out-dir> [ink2 [ink3]]   the 5-panel overlay of existing renders\n"
         "  ufsm tifxyz-scale <src> <dst> <div> [--offset z,y,x]   tifxyz coordinates / div (e.g. 2.4 -> 9.6 um: 4)\n"
         "  ufsm png2jpg <in.png> <out.jpg> [--half]   PNG -> JPEG q90 (half: Pillow BOX halved)\n"
+        "  ufsm phase-score <pc-dir> <ps-dir> [<sheets-dir>]   on-recto score of pc / ps renders on surfaces (per seam class with sheets)\n"
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
         "  ufsm blend <out-group> <out-um> --shape Z,Y,X --interior S <root> <key> <oz,oy,ox>...   shifted predict runs -> one seamless sin^2-weighted logit average\n"
@@ -696,7 +699,7 @@ static int cmd_band(int argc, char **argv) {
    mean sheet normal (D < 0: the other side). --cpu: the CPU backend (no GPU; src/fit_terms.h holds the terms both backends fit).
    --phase-robust S: a Cauchy phase residual of scale S turns; --conf-pow P: phase weight conf^P; --bend B: curvature-adaptive
    smoothness; --w-pgrad W [--pgrad-delta D]: phase-gradient matching (src/fit_terms.h); --unwrap-voxels 1 / 0 / -1: the phase
-   stage's integer init by voxels / lattice nodes / none (fit_cfg). --wind4-weight W (default 4): the winding mod 4 term when the fields
+   stage's integer init by voxels / lattice nodes / none (fit_cfg). --wind4-weight W (default 0): the winding mod 4 term when the fields
    carry dz dy dx dq planes (task unwrap2; 0 off). --w-recto W (default 0): recto anchors r^2 (1 - cos 2 pi W) from the fields' r plane
    (predict --fit-fields / --fit-zarr write it). --out also writes MODEL/fit-config.json (the weights and options of the fit).
    CT (fields with ct / cs planes, ufsm ct-fields / predict --fit-ct): --w-ct W papyrus / void parity c m (1 - cos 2 pi (W - --ct-phi)) weighted
@@ -911,7 +914,7 @@ static int cmd_fit(int argc, char **argv) {
     c.w_pgrad = (float)atof(opt(argc, argv, "--w-pgrad", "0")); c.pgrad_delta = (float)atof(opt(argc, argv, "--pgrad-delta", "0.25"));
     c.w_phase = (float)atof(opt(argc, argv, "--w-phase", "1")); c.w_normal = (float)atof(opt(argc, argv, "--w-normal", "3"));
     c.w_density = (float)atof(opt(argc, argv, "--w-density", "1")); c.w_smooth = (float)atof(opt(argc, argv, "--w-smooth", "0.1"));
-    c.w_wind4 = (float)atof(opt(argc, argv, "--wind4-weight", "4"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off) */
+    c.w_wind4 = (float)atof(opt(argc, argv, "--wind4-weight", "0"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off: weight 4 cost fit-val, 0.5-1 neutral) */
     c.w_recto = (float)atof(opt(argc, argv, "--w-recto", "0"));        /* recto anchors (fields with an r plane; 0 off) */
     if (!(c.w_wind4 >= 0) || !(c.w_recto >= 0)) { fprintf(stderr, "fit: --wind4-weight and --w-recto must be >= 0\n"); return 2; }
     /* CT in the fitter (fields with ct / cs planes: ufsm ct-fields, predict --fit-ct): papyrus / void parity and the CT sheet spacing */
@@ -932,7 +935,7 @@ static int cmd_fit(int argc, char **argv) {
     c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1"));
     if (c.uw_repair < 0 || !(c.uw_rep_w4 >= 0) || !(c.uw_rep_geo >= 0) || !(c.uw_rep_cs >= 0) || c.uw_rep_gd < 1 || !(c.uw_rep_qpow > 0) || !(c.uw_rep_stretch >= 0) || c.uw_rep_sr < 0 || c.uw_rep_sr > 4) { fprintf(stderr, "fit: --uw-repair >= 0, --uw-rep-* weights >= 0, --uw-rep-gd >= 1\n"); return 2; }
     c.core = (float)atof(opt(argc, argv, "--core", "3"));   /* no data terms within core x pitch of the axis */
-    c.w_wind4 = (float)atof(opt(argc, argv, "--wind4-weight", "4"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off) */
+    c.w_wind4 = (float)atof(opt(argc, argv, "--wind4-weight", "0"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off: weight 4 cost fit-val, 0.5-1 neutral) */
     c.analytic = atoi(opt(argc, argv, "--analytic", "1")); c.packed_um = atof(opt(argc, argv, "--packed-um", "0")); c.batch = atoi(opt(argc, argv, "--batch", "2000000")); c.knot_dz = atoi(opt(argc, argv, "--knot-dz", "1024")); c.phase_stage = atoi(opt(argc, argv, "--phase-stage", "4"));
     if (*opt(argc, argv, "--lattice", "")) { c.nstage = 0; char *t = strdup(opt(argc, argv, "--lattice", "")); for (char *q = strtok(t, ","); q && c.nstage < 8; q = strtok(nullptr, ",")) c.lattice[c.nstage++] = atoi(q); free(t); }
     if (*opt(argc, argv, "--steps", "")) { int k = 0; char *t = strdup(opt(argc, argv, "--steps", "")); for (char *q = strtok(t, ","); q && k < 8; q = strtok(nullptr, ",")) c.steps[k++] = atoi(q); for (; k < c.nstage; k++) c.steps[k] = c.steps[k - 1]; free(t); }
@@ -3196,11 +3199,13 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "stitch")) return cmd_stitch(argc, argv);
+    if (!strcmp(cmd, "coreline") && argc > 2 && !strcmp(argv[2], "check")) return cmd_coreline_check(argc, argv);
     if (!strcmp(cmd, "coreline")) return cmd_coreline(argc, argv);
     if (!strcmp(cmd, "render-sheets")) return cmd_render_sheets(argc, argv);
     if (!strcmp(cmd, "overlay-red")) return cmd_overlay_red(argc, argv);
     if (!strcmp(cmd, "tifxyz-scale")) return cmd_tifxyz_scale(argc, argv);
     if (!strcmp(cmd, "png2jpg")) return cmd_png2jpg(argc, argv);
+    if (!strcmp(cmd, "phase-score")) return cmd_phase_score(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
     if (!strcmp(cmd, "blend")) return cmd_blend(argc, argv);
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);

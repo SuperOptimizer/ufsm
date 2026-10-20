@@ -424,3 +424,13 @@ int cmd_png2jpg(int argc, char **argv) {
     if (rc) fprintf(stderr, "png2jpg: cannot write %s\n", argv[3]);
     return rc ? 1 : 0;
 }
+
+/* ufsm phase-score <pc-dir> <ps-dir> [<sheets-dir>]: the former phase_score.py (phase_eval.sh / phase_eval2.sh): per render pair
+   <pc-dir>/X.tif, <ps-dir>/X.tif (ufsm render of the fit-field arrays pc / ps at depth 0) the on-recto score (1 = every vertex
+   on a recto face, 0 = unrelated, -1 = on the gaps / verso side; imgops.h phase_score_surface), with <sheets-dir> (stitched
+   sheets with seam.tif, render copies named w<sheet>_rR_cC) the same per seam class; then the totals. Analysis only. */
+int cmd_phase_score(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm phase-score <pc-dir> <ps-dir> [<sheets-dir>]\n"); return 2; }
+    if (phase_score_dirs(argv[2], argv[3], argc > 4 ? argv[4] : nullptr, stdout)) { fprintf(stderr, "phase-score: cannot open %s\n", argv[2]); return 1; }
+    return 0;
+}

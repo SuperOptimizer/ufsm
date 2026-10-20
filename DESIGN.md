@@ -92,7 +92,7 @@ Kept: what `ufsm fit` reads, plus one new head for counting turns.
   its own gauge, so pooled cells would change gauge at every window seam. fields.json `"w4_d"`; zarr arrays dz dy dx dq beside the
   10 (128^3 field shards like the others). tests/test_fit_w4: the unwrap and unwrap2 pooling of permuted logits byte-identical,
   the relative planes vs a host reference (0 byte difference), save / load round trip.
-- Fit term (`ufsm fit`, nn_fit_loss2, `--wind4-weight` 4; on when the planes exist, 10-plane fields unchanged): per field voxel and
+- Fit term (`ufsm fit`, nn_fit_loss2, `--wind4-weight` default 0 since 2026-10-20 (4 cost fit-val, 0.5-1 neutral); on when the planes exist and the weight > 0, 10-plane fields unchanged): per field voxel and
   axis dq (1 - cos(2 pi / 4 (W(x + d e_a) - W(x) - delta_a))), theta difference wrapped, both points' lattice corners get gradient;
   phase stages only, ramped like the phase; `--analytic 0` ignores it; loss part `wind4` (parts[6]). On test_fit's spiral with the
   phase (and density) under-counting a packed sector by 40%: winding ids 0.876 -> 1.000 with the term at weight >= 3 and d of 1-2

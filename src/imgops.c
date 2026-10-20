@@ -3,6 +3,7 @@
 #include "tiff.h"
 #include "tiffw.h"
 
+#include <dirent.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -10,6 +11,7 @@
 #include <jpeglib.h>   /* after stdio.h: it needs FILE */
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <zlib.h>
 
 /* ---- Pillow resampling (libImaging/Resample.c, 8 bits per channel) ---- */
@@ -300,4 +302,148 @@ int tifxyz_scale(const char *src, const char *dst, double div, const double off[
 out:
     for (int k = 0; k < 3; k++) free(A[k]);
     return rc;
+}
+
+/* ---- numpy.percentile (method linear) ---- */
+static int cmp_f64(const void *a, const void *b) { const double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+static int cmp_f32(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
+double np_percentile_f64(double *v, size_t n, double q) {
+    qsort(v, n, sizeof *v, cmp_f64);
+    const double vi = (double)(n - 1) * (q / 100); double pf = floor(vi); size_t p, nx;
+    if (vi >= (double)(n - 1)) p = nx = n - 1; else if (vi < 0) p = nx = 0; else { p = (size_t)pf; nx = p + 1; }
+    const double g = vi - (vi >= (double)(n - 1) ? -1.0 : pf), a = v[p], b = v[nx], d = b - a;   /* gamma as numpy's (beyond the end: vs index -1) */
+    return g >= 0.5 ? b - d * (1 - g) : a + d * g;
+}
+float np_percentile_f32(float *v, size_t n, float q) {
+    qsort(v, n, sizeof *v, cmp_f32);
+    const float vi = (float)(n - 1) * (q / 100.f), pf = floorf(vi); size_t p, nx;
+    if (vi >= (float)(n - 1)) p = nx = n - 1; else if (vi < 0) p = nx = 0; else { p = (size_t)pf; nx = p + 1; }
+    const float g = vi - (vi >= (float)(n - 1) ? -1.f : pf), a = v[p], b = v[nx], d = b - a;
+    return g >= 0.5f ? b - d * (1.f - g) : a + d * g;
+}
+
+/* ---- phase_score.py ---- */
+long long phase_score_surface(const uint8_t *pc, const uint8_t *ps, int w, int h, const uint8_t *seam, int sw, int sh, int r0, int c0,
+                              phs_acc *acc, phs_acc cls[7]) {
+    phs_acc A = {0, 0, 0}, C[7] = {0};
+    const int kh = seam && r0 < sh ? ((sh - r0 + 1) / 2 < h ? (sh - r0 + 1) / 2 : h) : 0;   /* S[r0:r0 + 2 h:2, c0:c0 + 2 w:2] */
+    const int kw = seam && c0 < sw ? ((sw - c0 + 1) / 2 < w ? (sw - c0 + 1) / 2 : w) : 0;
+    for (int r = 0; r < h; r++)
+        for (int c = 0; c < w; c++) {
+            const size_t i = (size_t)r * w + c; const int a = pc[i] - 128, b = ps[i] - 128;
+            if (pc[i] == 0 || a * a + b * b <= 169) continue;   /* not rendered, or |(c, s)| <= 13 */
+            const double m = hypotf((float)a, (float)b);
+            A.num += a; A.den += m; A.n++;
+            if (r < kh && c < kw) { const int k = seam[(size_t)(r0 + 2 * r) * sw + c0 + 2 * c]; if (k >= 1 && k <= 6) { C[k].num += a; C[k].den += m; C[k].n++; } }
+        }
+    *acc = A;
+    if (cls) for (int k = 0; k < 7; k++) cls[k] = k >= 1 && C[k].n >= 200 ? C[k] : (phs_acc){0, 0, 0};
+    return A.n;
+}
+static int cmp_str(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+/* name ~ w(.+)_r(\d+)_c(\d+)$: the sheet name (into sheet), r0, c0; 0 on a match */
+static int phs_render_name(const char *nm, char *sheet, size_t cap, int *r0, int *c0) {
+    const size_t L = strlen(nm); if (L < 2 || nm[0] != 'w') return -1;
+    size_t e = L; while (e > 0 && nm[e - 1] >= '0' && nm[e - 1] <= '9') e--;
+    if (e == L || e < 2 || nm[e - 1] != 'c' || nm[e - 2] != '_') return -1;
+    const size_t ce = e - 2; size_t s = ce; while (s > 0 && nm[s - 1] >= '0' && nm[s - 1] <= '9') s--;
+    if (s == ce || s < 3 || nm[s - 1] != 'r' || nm[s - 2] != '_' || s - 2 <= 1 || s - 2 - 1 >= cap) return -1;
+    memcpy(sheet, nm + 1, s - 3); sheet[s - 3] = 0; *r0 = atoi(nm + s); *c0 = atoi(nm + e); return 0;
+}
+int phase_score_dirs(const char *pcd, const char *psd, const char *sd, FILE *out) {
+    static const char *names[7] = {"", "one box", "seam ok", "spread", "conflict", "bridge", "low q"};
+    DIR *dd = opendir(pcd); if (!dd) return -1;
+    char **fl = nullptr; int nf = 0, cap = 0; struct dirent *de;
+    while ((de = readdir(dd))) {
+        const size_t L = strlen(de->d_name); if (L < 4 || strcmp(de->d_name + L - 4, ".tif")) continue;
+        if (nf == cap) { cap = cap ? 2 * cap : 256; fl = realloc(fl, cap * sizeof *fl); }
+        fl[nf++] = strdup(de->d_name);
+    }
+    closedir(dd); qsort(fl, nf, sizeof *fl, cmp_str);
+    double tn = 0, td = 0, *rows = malloc((nf ? nf : 1) * sizeof *rows); int nr = 0; phs_acc all[7] = {0};
+    for (int f = 0; f < nf; f++) {
+        char p[2048], q[2048]; snprintf(p, sizeof p, "%s/%s", pcd, fl[f]); snprintf(q, sizeof q, "%s/%s", psd, fl[f]);
+        struct stat st; if (stat(q, &st)) continue;
+        int w, h, w2, h2; uint8_t *pc = img_read_u8(p, &w, &h), *ps = img_read_u8(q, &w2, &h2);
+        if (!pc || !ps || w != w2 || h != h2) { fprintf(stderr, "phase-score: cannot read %s / %s\n", p, q); free(pc); free(ps); continue; }
+        char stem[1024]; snprintf(stem, sizeof stem, "%.*s", (int)strlen(fl[f]) - 4, fl[f]);
+        char sheet[1024]; int r0 = 0, c0 = 0, sw = 0, sh = 0; uint8_t *seam = nullptr;
+        if (sd && !phs_render_name(stem, sheet, sizeof sheet, &r0, &c0)) {
+            snprintf(p, sizeof p, "%s/%s/seam.tif", sd, sheet);
+            if (!stat(p, &st) && !(seam = img_read_u8(p, &sw, &sh))) fprintf(stderr, "phase-score: cannot read %s\n", p);
+        }
+        phs_acc A, C[7]; const long long n = phase_score_surface(pc, ps, w, h, seam, sw, sh, r0, c0, &A, C);
+        free(pc); free(ps);
+        if (n < 1000) { free(seam); continue; }
+        tn += A.num; td += A.den;
+        fprintf(out, "%s: on-recto %+.3f (%lld px)", stem, A.num / A.den, n);
+        if (seam) {
+            fprintf(out, " | "); int np = 0;
+            for (int k = 1; k <= 6; k++) {
+                if (!C[k].n) continue;
+                all[k].num += C[k].num; all[k].den += C[k].den; all[k].n += C[k].n;
+                fprintf(out, "%s%s %+.3f", np++ ? ", " : "", names[k], C[k].num / C[k].den);
+            }
+        }
+        fputc('\n', out); fflush(out); free(seam);
+        rows[nr++] = A.num / A.den;
+    }
+    if (nr) {
+        double *t = malloc(nr * sizeof *t); memcpy(t, rows, nr * sizeof *t); qsort(t, nr, sizeof *t, cmp_f64);
+        const double med = nr % 2 ? t[nr / 2] : (t[nr / 2 - 1] + t[nr / 2]) / 2;
+        memcpy(t, rows, nr * sizeof *t); const double p10 = np_percentile_f64(t, nr, 10);
+        memcpy(t, rows, nr * sizeof *t); const double p90 = np_percentile_f64(t, nr, 90); free(t);
+        fprintf(out, "all: on-recto %+.3f over %d surfaces (median per surface %+.3f, p10 %+.3f, p90 %+.3f)\n", tn / td, nr, med, p10, p90);
+    }
+    for (int k = 1; k <= 6; k++) if (all[k].n) fprintf(out, "  %s: %+.3f (%lld px)\n", names[k], all[k].num / all[k].den, all[k].n);
+    for (int f = 0; f < nf; f++) free(fl[f]);
+    free(fl); free(rows);
+    return 0;
+}
+
+/* ---- drawing ---- */
+static const uint8_t font5x7[][8] = {   /* character, then 7 rows of 5 bits (bit 4 = left column) */
+    {'0', 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}, {'1', 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}, {'2', 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F},
+    {'3', 0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E}, {'4', 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}, {'5', 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E},
+    {'6', 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}, {'7', 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}, {'8', 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E},
+    {'9', 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}, {'a', 0x00, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F}, {'b', 0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x1E},
+    {'c', 0x00, 0x00, 0x0E, 0x10, 0x10, 0x11, 0x0E}, {'d', 0x01, 0x01, 0x0D, 0x13, 0x11, 0x11, 0x0F}, {'e', 0x00, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0E},
+    {'f', 0x06, 0x09, 0x08, 0x1C, 0x08, 0x08, 0x08}, {'g', 0x00, 0x0F, 0x11, 0x11, 0x0F, 0x01, 0x0E}, {'h', 0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x11},
+    {'i', 0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x0E}, {'j', 0x02, 0x00, 0x06, 0x02, 0x02, 0x12, 0x0C}, {'k', 0x10, 0x10, 0x12, 0x14, 0x18, 0x14, 0x12},
+    {'l', 0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}, {'m', 0x00, 0x00, 0x1A, 0x15, 0x15, 0x11, 0x11}, {'n', 0x00, 0x00, 0x16, 0x19, 0x11, 0x11, 0x11},
+    {'o', 0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E}, {'p', 0x00, 0x00, 0x1E, 0x11, 0x1E, 0x10, 0x10}, {'q', 0x00, 0x00, 0x0D, 0x13, 0x0F, 0x01, 0x01},
+    {'r', 0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10}, {'s', 0x00, 0x00, 0x0E, 0x10, 0x0E, 0x01, 0x1E}, {'t', 0x08, 0x08, 0x1C, 0x08, 0x08, 0x09, 0x06},
+    {'u', 0x00, 0x00, 0x11, 0x11, 0x11, 0x13, 0x0D}, {'v', 0x00, 0x00, 0x11, 0x11, 0x11, 0x0A, 0x04}, {'w', 0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0A},
+    {'x', 0x00, 0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11}, {'y', 0x00, 0x00, 0x11, 0x11, 0x0F, 0x01, 0x0E}, {'z', 0x00, 0x00, 0x1F, 0x02, 0x04, 0x08, 0x1F},
+    {'(', 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02}, {')', 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08}, {',', 0x00, 0x00, 0x00, 0x00, 0x0C, 0x04, 0x08},
+    {'.', 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C}, {'-', 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}, {':', 0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00},
+};
+static void put_px(uint8_t *rgb, int w, int h, int x, int y, const uint8_t col[3]) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    uint8_t *p = rgb + ((size_t)y * w + x) * 3; p[0] = col[0]; p[1] = col[1]; p[2] = col[2];
+}
+void img_text(uint8_t *rgb, int w, int h, int x, int y, const char *s, const uint8_t col[3]) {
+    for (; *s; s++, x += 6) {
+        const uint8_t *g = nullptr;
+        for (size_t k = 0; k < sizeof font5x7 / sizeof font5x7[0]; k++) if (font5x7[k][0] == (uint8_t)*s) g = font5x7[k] + 1;
+        if (g) for (int r = 0; r < 7; r++) for (int c = 0; c < 5; c++) if (g[r] >> (4 - c) & 1) put_px(rgb, w, h, x + c, y + r, col);
+    }
+}
+static int pil_round_up(double f) { return (int)(f >= 0.0 ? floor(f + 0.5F) : -floor(fabs(f) + 0.5F)); }
+void img_line2(uint8_t *rgb, int w, int h, int x0, int y0, int x1, int y1, const uint8_t col[3]) {
+    const int dx = x1 - x0, dy = y1 - y0;
+    if (!dx && !dy) { put_px(rgb, w, h, x0, y0, col); return; }
+    const double L = hypot(dx, dy); const int mx = pil_round_up(dy / L), my = pil_round_up(dx / L);   /* width 2: ratio_max 1 / L, ratio_min 0 */
+    const double V[4][2] = {{x0, y0}, {x1, y1}, {x1 + mx, y1 - my}, {x0 + mx, y0 - my}};
+    int xl = x0, xh = x0, yl = y0, yh = y0;
+    for (int k = 0; k < 4; k++) { const int vx = (int)V[k][0], vy = (int)V[k][1]; xl = vx < xl ? vx : xl; xh = vx > xh ? vx : xh; yl = vy < yl ? vy : yl; yh = vy > yh ? vy : yh; }
+    for (int y = yl; y <= yh; y++)
+        for (int x = xl; x <= xh; x++) {   /* inside the convex quad, edges included */
+            int pos = 0, neg = 0;
+            for (int k = 0; k < 4; k++) {
+                const double *a = V[k], *b = V[(k + 1) % 4], cr = (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]);
+                pos += cr > 1e-9; neg += cr < -1e-9;
+            }
+            if (!pos || !neg) put_px(rgb, w, h, x, y, col);
+        }
 }
