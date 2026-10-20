@@ -1,6 +1,7 @@
 /* Box stitching: gauge alignment of overlapping local winding fits, the global gauge, the blended global winding field and
    level-set sheets traced across the boxes (src/stitch.h). */
 #include "stitch.h"
+#include "coreline.h"
 #include "json.h"
 #include "store.h"
 #include "tiffw.h"
@@ -897,8 +898,28 @@ static void report_solve(const st_box *b, int nb, const st_edge *e, int ne, int 
     for (int i = 0; i < ne; i++) if (e[i].used && !e[i].tree && e[i].resid)
         fprintf(stderr, "  %s - %s: k %d, the tree path says %d (%s)\n", b[e[i].a].name, b[e[i].b].name, e[i].k, e[i].k - e[i].resid, e[i].resid == 9999 ? "sign" : "offset");
 }
+/* stitch quality / align --mask DIR: a half-box field dir (fields.json core_line / core_side / um, ufsm coreline box): the other side's cells
+   are no material (as the fit and the field loaders see them) */
+typedef struct { st_fields in; coreline core; int side; double um; } cm_ctx;
+static int cm_read(void *ctx, const int64_t o[3], const int64_t n[3], uint8_t *w, uint8_t *pc, uint8_t *ps) {
+    cm_ctx *c = ctx; if (c->in.read(c->in.ctx, o, n, w, pc, ps)) return -1;
+    const long long org[3] = {llround(c->in.org[0] + o[0] * c->in.h), llround(c->in.org[1] + o[1] * c->in.h), llround(c->in.org[2] + o[2] * c->in.h)};
+    cl_mask_block(&c->core, c->side, org, c->in.h, c->um, 0, (int)n[0], (int)n[1], (int)n[2], pc, ps, w);
+    return 0;
+}
+static int cm_open(const char *dir, st_fields *F, cm_ctx *c) {
+    char p[1400]; snprintf(p, sizeof p, "%s/fields.json", dir); FILE *f = fopen(p, "rb"); if (!f) return -1;
+    fseek(f, 0, SEEK_END); const size_t n = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
+    char *t = malloc(n + 1); const size_t got = fread(t, 1, n, f); fclose(f); t[got] = 0; json *j = json_parse(t, got); free(t);
+    if (!j) return -1;
+    const char *cp = json_str(json_get(j, "core_line"), ""); c->side = (int)json_num(json_get(j, "core_side"), 0); c->um = json_num(json_get(j, "um"), 0);
+    const int rc = !*cp || !c->side || c->um <= 0 || cl_load(&c->core, cp) ? -1 : 0; json_free(j);
+    if (rc) { fprintf(stderr, "stitch quality: %s has no usable core_line / core_side / um\n", p); return -1; }
+    c->side = c->side < 0 ? -1 : 1; c->in = *F; F->read = cm_read; F->ctx = c;
+    return 0;
+}
 static int stitch_align(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm stitch align <out.json> --fields ZARR [--stride 2] [--min-w 0.05] [--min-agree 0.5] [--min-wsum 50] [--threads 8] BOXDIR...\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm stitch align <out.json> --fields ZARR [--stride 2] [--min-w 0.05] [--min-agree 0.5] [--min-wsum 50] [--mask HALFBOX_DIR] [--threads 8] BOXDIR...\n"); return 2; }
     const char *out = argv[3], *fz = sopt(argc, argv, "--fields", nullptr);
     const int stride = atoi(sopt(argc, argv, "--stride", "2")), nt = atoi(sopt(argc, argv, "--threads", "8"));
     const double min_w = atof(sopt(argc, argv, "--min-w", "0.05")), min_agree = atof(sopt(argc, argv, "--min-agree", "0.5")), min_wsum = atof(sopt(argc, argv, "--min-wsum", "50"));
@@ -911,6 +932,7 @@ static int stitch_align(int argc, char **argv) {
     }
     if (nb < 2) { fprintf(stderr, "stitch align: fewer than 2 boxes\n"); return 1; }
     zf_ctx zc; st_fields F; if (zf_open(fz, nt, &zc, &F)) return 1;
+    const char *md = sopt(argc, argv, "--mask", nullptr); cm_ctx cm = {0}; if (md && cm_open(md, &F, &cm)) return 1;   /* boxes of one side of the core */
     const double um = b[0].fs->global->um;
     st_edge *e = calloc((size_t)nb * nb, sizeof *e); int ne = 0; const double t0 = now_s();
     for (int i = 0; i < nb; i++) for (int j = i + 1; j < nb; j++) {
@@ -922,7 +944,7 @@ static int stitch_align(int argc, char **argv) {
                 b[i].name, b[j].name, x->s, x->k, x->agree, x->tight, x->local, x->k2, x->agree2, x->other, x->frac, x->n, now_s() - t0);
         ne++;
     }
-    zf_close(&zc);
+    zf_close(&zc); if (md) cl_free(&cm.core);
     const int bad = st_solve(b, nb, e, ne, min_agree, min_wsum, nullptr);
     print_edges(b, e, ne); print_boxes(b, nb); report_solve(b, nb, e, ne, bad);
     if (st_save(out, b, nb, e, ne, um)) { fprintf(stderr, "stitch: cannot write %s\n", out); return 1; }
@@ -1257,11 +1279,12 @@ static int stitch_sheets(int argc, char **argv) {
     return 0;
 }
 static int stitch_quality(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm stitch quality <in.json> <out.json> --fields ZARR [--block 64] [--stride 2] [--threads 8]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm stitch quality <in.json> <out.json> --fields ZARR [--mask HALFBOX_DIR] [--block 64] [--stride 2] [--threads 8]\n"); return 2; }
     st_box *b; st_edge *e; int nb, ne; double um;
     if (st_load(argv[3], &b, &nb, &e, &ne, &um)) { fprintf(stderr, "stitch: cannot read %s\n", argv[3]); return 1; }
     const char *fz = sopt(argc, argv, "--fields", nullptr); if (!fz) { fprintf(stderr, "stitch quality: --fields ZARR\n"); return 2; }
     const int nt = atoi(sopt(argc, argv, "--threads", "8")); zf_ctx zc; st_fields F; if (zf_open(fz, nt, &zc, &F)) return 1;
+    const char *md = sopt(argc, argv, "--mask", nullptr); cm_ctx cm = {0}; if (md && cm_open(md, &F, &cm)) return 1;
     const double qb = atof(sopt(argc, argv, "--block", "64")), t0 = now_s(); const int stride = atoi(sopt(argc, argv, "--stride", "2"));
     for (int i = 0; i < nb; i++) {
         if (st_quality(&b[i], &F, qb, stride, nt)) { fprintf(stderr, "stitch: cannot read the fields\n"); return 1; }
@@ -1270,7 +1293,7 @@ static int stitch_quality(int argc, char **argv) {
         fprintf(stderr, "stitch quality: %s phase coherence %.3f (anti-aligned %.3f); blocks with material %zu: coherent (>= 0.5) %.3f, anti-aligned %.3f  [%.0fs]\n", b[i].name,
                 b[i].qmean, b[i].qamean, seen, seen ? (double)good / seen : 0, seen ? (double)anti / seen : 0, now_s() - t0);
     }
-    zf_close(&zc);
+    zf_close(&zc); if (md) cl_free(&cm.core);
     return st_save(argv[4], b, nb, e, ne, um) ? 1 : 0;
 }
 typedef struct { const st_box *b; int nb, comp; } coh_ctx;
@@ -1322,7 +1345,7 @@ int cmd_stitch(int argc, char **argv) {
                     "  solve <in.json> <out.json> [--min-agree A] [--exclude NAMES]   the global gauge again (other thresholds)\n"
                     "  field <gauge.json> <out-group> [--step 8]    the blended global winding G (float32 zarr)\n"
                     "  sheets <gauge.json> <out-dir> [--fields ZARR]   level sets G = k as tifxyz across the boxes\n"
-                    "  quality <in.json> <out.json> --fields ZARR   per-box maps of the fit's phase coherence with the network (blend weights)\n"
+                    "  quality <in.json> <out.json> --fields ZARR [--mask HALFBOX_DIR]   per-box maps of the fit's phase coherence with the network (blend weights)\n"
                     "  coherence <gauge.json> --fields ZARR         phase coherence of the blended field vs the box mosaic\n"
                     "  info <gauge.json>                            the overlap table and the gauges\n");
     return 2;

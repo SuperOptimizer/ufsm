@@ -115,8 +115,25 @@ static void test_mask(void) {
     snprintf(p, sizeof p, "%s/fields.json", dir); unlink(p); snprintf(p, sizeof p, "%s/core.json", dir); unlink(p); rmdir(dir); free(a);
 }
 
+/* the box frame of a zigzag core line: the raw nearest-point normal swings by +-45 degrees, the fitted line's normal does not */
+static void test_frame(void) {
+    enum { NP = 41 }; coreline C = {0}; C.um = 1; C.ns = 2; C.s = calloc(2, sizeof(cl_slab));
+    for (int k = 0; k < 2; k++) {
+        cl_slab *s = &C.s[k]; s->z0 = k * 100; s->z1 = s->z0 + 100; s->zc = s->z0 + 50; s->n = NP; s->y = malloc(NP * sizeof(double)); s->x = malloc(NP * sizeof(double));
+        for (int i = 0; i < NP; i++) { s->y[i] = 500 + (i % 2 ? 10 : -10); s->x[i] = 100 + 20 * i; }   /* along x at y 500, zigzag +-10 */
+    }
+    double q[2], n[2]; const long long org[3] = {0, 0, 0};
+    for (int cx = 300; cx <= 700; cx += 37) {
+        double rq[2], rn[2]; cl_sdist(&C, 50, 450, cx, rq, rn);
+        cl_box_frame(&C, org, 200, 450, cx, 1.0, 200, q, n);
+        CHECK(fabs(fabs(n[0]) - 1) < 1e-3 && n[0] * rn[0] + n[1] * rn[1] > 0, "frame normal (%.3f, %.3f) at x %d (raw (%.3f, %.3f))", n[0], n[1], cx, rn[0], rn[1]);
+        CHECK(fabs(q[0] - 500) <= 10 && fabs(q[1] - cx) < 25, "frame point (%.1f, %.1f) at x %d", q[0], q[1], cx);
+    }
+    cl_free(&C);
+}
 int main(void) {
     test_sdist();
+    test_frame();
     synth_detect(0.0, 0);
     synth_detect(0.6, 0);
     synth_detect(-1.1, 1);

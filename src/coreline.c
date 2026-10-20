@@ -209,15 +209,19 @@ void cl_accum_row(const uint8_t *pc, const uint8_t *ps, const uint8_t *w, int H,
 size_t cl_mask_block(const coreline *c, int side, const long long org[3], double h, double um, int z0, int nz, int H, int W,
                      uint8_t *pc, uint8_t *ps, uint8_t *w) {
     const double f = um / c->um;   /* native -> core-line voxels */
-    const int B = 4, Hb = (H + B - 1) / B, Wb = (W + B - 1) / B; const double thr = 3.0 * h * f;   /* > the block's half diagonal (2.83 cells) */
+    const int B = 4, G = 16, Hg = (H + G - 1) / G, Wg = (W + G - 1) / G; const double thr = 3.0 * h * f, thrg = 12.0 * h * f;   /* > the half diagonals (2.83 / 11.3 cells) */
     size_t nb = 0;
     for (int a = 0; a < nz; a++) {
         const double zg = (org[0] + (z0 + a + 0.5) * h) * f; const size_t ro = (size_t)a * H * W;
-        for (int by = 0; by < Hb; by++) for (int bx = 0; bx < Wb; bx++) {
-            const int ylo = by * B, xlo = bx * B, yhi = ylo + B < H ? ylo + B : H, xhi = xlo + B < W ? xlo + B : W;
+        for (int gy = 0; gy < Hg; gy++) for (int gx = 0; gx < Wg; gx++) {   /* 16 x 16 cell groups far from the line: one side */
+          const int gylo = gy * G, gxlo = gx * G, gyhi = gylo + G < H ? gylo + G : H, gxhi = gxlo + G < W ? gxlo + G : W;
+          const double sg = cl_sdist(c, zg, (org[1] + (gylo + G / 2.0) * h) * f, (org[2] + (gxlo + G / 2.0) * h) * f, nullptr, nullptr);
+          if (fabs(sg) > thrg && side * sg >= 0) continue;   /* the kept side: nothing to blank */
+          for (int ylo = gylo; ylo < gyhi; ylo += B) for (int xlo = gxlo; xlo < gxhi; xlo += B) {
+            const int yhi = ylo + B < H ? ylo + B : H, xhi = xlo + B < W ? xlo + B : W;
             if (w) { int any = 0; for (int y = ylo; y < yhi && !any; y++) for (int x = xlo; x < xhi; x++) if (w[ro + (size_t)y * W + x]) { any = 1; break; } if (!any) continue; }
-            const double sd = cl_sdist(c, zg, (org[1] + (ylo + B / 2.0) * h) * f, (org[2] + (xlo + B / 2.0) * h) * f, nullptr, nullptr);
-            const int uniform = fabs(sd) > thr;
+            const double sd = fabs(sg) > thrg ? sg : cl_sdist(c, zg, (org[1] + (ylo + B / 2.0) * h) * f, (org[2] + (xlo + B / 2.0) * h) * f, nullptr, nullptr);
+            const int uniform = fabs(sg) > thrg || fabs(sd) > thr;
             for (int y = ylo; y < yhi; y++) for (int x = xlo; x < xhi; x++) {
                 const double s = uniform ? sd : cl_sdist(c, zg, (org[1] + (y + 0.5) * h) * f, (org[2] + (x + 0.5) * h) * f, nullptr, nullptr);
                 if (side * s >= 0) continue;
@@ -226,6 +230,7 @@ size_t cl_mask_block(const coreline *c, int side, const long long org[3], double
                 if (pc) pc[i] = 128;
                 if (ps) ps[i] = 128;
             }
+          }
         }
     }
     return nb;
@@ -293,16 +298,42 @@ static int cl_cmd_detect(int argc, char **argv) {
     return rc ? 1 : 0;
 }
 
-/* ufsm coreline box CORE.json --fields ZARR --box Z Y X NZ NY NX --side S [--dist 2000] --out DIR: a half-box fit-field directory
-   (the zarr arrays linked, zarr_offset = the box corner, core_line / core_side for the masks) whose axis per native z sits dist
-   native voxels behind the core point nearest the box centre, on the far side of the core: W grows away from the core. Prints
+/* the smoothed core frame of a box: over z rows every 16 native voxels, the core point nearest the box centre and the normal of a
+   straight line fitted (principal direction) to the nearest slab's polyline points within R core-line voxels of it, oriented as
+   the local polyline normal; both averaged over the rows. (The raw nearest-point normal swings with every zigzag of the detected
+   polyline: 2000 native voxels behind the core that moved the axis by up to ~2.5 cm within one box.) */
+void cl_box_frame(const coreline *C, const long long org[3], int na, double cyg, double cxg, double f, double R, double q[2], double n[2]) {
+    double sq[2] = {0, 0}, sn[2] = {0, 0}; int cnt = 0;
+    for (int z = 0; z < na; z += 16) {
+        const double zg = (org[0] + z) * f; double qq[2], nn[2]; cl_sdist(C, zg, cyg * f, cxg * f, qq, nn);
+        int k = 0; for (int i = 1; i < C->ns; i++) if (fabs(C->s[i].zc - zg) < fabs(C->s[k].zc - zg)) k = i;
+        const cl_slab *S = &C->s[k]; double my = 0, mx = 0, syy = 0, sxx = 0, syx = 0; int m = 0;
+        for (int i = 0; i < S->n; i++) if (hypot(S->y[i] - qq[0], S->x[i] - qq[1]) <= R) { my += S->y[i]; mx += S->x[i]; m++; }
+        double ny = nn[0], nx = nn[1];
+        if (m >= 3) {
+            my /= m; mx /= m;
+            for (int i = 0; i < S->n; i++) if (hypot(S->y[i] - qq[0], S->x[i] - qq[1]) <= R) { const double dy = S->y[i] - my, dx = S->x[i] - mx; syy += dy * dy; sxx += dx * dx; syx += dy * dx; }
+            const double th = 0.5 * atan2(2 * syx, syy - sxx), ty = cos(th), tx = sin(th);   /* principal direction (angle from the y axis) */
+            ny = tx; nx = -ty; if (ny * nn[0] + nx * nn[1] < 0) { ny = -ny; nx = -nx; }
+        }
+        sq[0] += qq[0]; sq[1] += qq[1]; sn[0] += ny; sn[1] += nx; cnt++;
+    }
+    q[0] = sq[0] / cnt; q[1] = sq[1] / cnt; const double l = hypot(sn[0], sn[1]); n[0] = l > 0 ? sn[0] / l : 1; n[1] = l > 0 ? sn[1] / l : 0;
+}
+
+/* ufsm coreline box CORE.json --fields ZARR --box Z Y X NZ NY NX --side S [--dist 2000] [--axis const|perz] [--frame-r 2400] --out DIR:
+   a half-box fit-field directory (the zarr arrays linked, zarr_offset = the box corner, core_line / core_side for the masks) whose
+   axis sits dist native voxels behind the core, on the far side of it (W grows away from the core). --axis const (default): one
+   axis for the box, behind the mean nearest core point along the smoothed core normal (cl_box_frame: line fits within frame-r
+   core-line voxels, 2400 = 5.8 mm); perz: per native z, behind that z's nearest core point along its raw polyline normal. Prints
    the material share of the box on that side. */
 static int cl_cmd_box(int argc, char **argv) {
     const char *cp = argv[3], *zr = copt(argc, argv, "--fields", nullptr), *od = copt(argc, argv, "--out", nullptr);
     int bi = -1; for (int i = 3; i < argc; i++) if (!strcmp(argv[i], "--box")) bi = i;
-    if (argc < 4 || !zr || !od || bi < 0 || bi + 6 >= argc) { fprintf(stderr, "usage: ufsm coreline box <core.json> --fields ZARR --box Z Y X NZ NY NX --side +1|-1 [--dist 2000] --out DIR\n"); return 2; }
+    if (argc < 4 || !zr || !od || bi < 0 || bi + 6 >= argc) { fprintf(stderr, "usage: ufsm coreline box <core.json> --fields ZARR --box Z Y X NZ NY NX --side +1|-1 [--dist 2000] [--axis const|perz] [--frame-r 2400] --out DIR\n"); return 2; }
     long long bo[3]; int bn[3]; for (int d = 0; d < 3; d++) { bo[d] = atoll(argv[bi + 1 + d]); bn[d] = atoi(argv[bi + 4 + d]); }
     const int side = atoi(copt(argc, argv, "--side", "1")) < 0 ? -1 : 1; const double D = atof(copt(argc, argv, "--dist", "2000"));
+    const int perz = !strcmp(copt(argc, argv, "--axis", "const"), "perz"); const double FR = atof(copt(argc, argv, "--frame-r", "2400"));
     coreline C; if (cl_load(&C, cp)) { fprintf(stderr, "coreline: cannot load %s\n", cp); return 1; }
     double um; int h; int64_t shp[3]; if (fields_meta(zr, &um, &h, shp)) { fprintf(stderr, "coreline: cannot read %s/fields.json\n", zr); return 1; }
     const double f = um / C.um;   /* native -> core-line voxels */
@@ -314,12 +345,14 @@ static int cl_cmd_box(int argc, char **argv) {
     const long long org[3] = {bo[0] * h, bo[1] * h, bo[2] * h};
     const int na = bn[0] * h + 1;
     snprintf(p, sizeof p, "%s/fields.json", od); FILE *fo = fopen(p, "w"); if (!fo) { fprintf(stderr, "coreline: cannot write %s\n", p); return 1; }
-    fprintf(fo, "{\"format\": \"zarr\", \"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.4f, \"zarr_offset\": [%lld, %lld, %lld],\n \"core_line\": \"%s\", \"core_side\": %d, \"core_dist\": %.1f,\n \"axis\": [",
-            org[0], org[1], org[2], bn[0], bn[1], bn[2], h, um, bo[0], bo[1], bo[2], rc_, side, D);
+    fprintf(fo, "{\"format\": \"zarr\", \"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.4f, \"zarr_offset\": [%lld, %lld, %lld],\n \"core_line\": \"%s\", \"core_side\": %d, \"core_dist\": %.1f, \"core_axis\": \"%s\",\n \"axis\": [",
+            org[0], org[1], org[2], bn[0], bn[1], bn[2], h, um, bo[0], bo[1], bo[2], rc_, side, D, perz ? "perz" : "const");
     const double cyg = org[1] + bn[1] * h / 2.0, cxg = org[2] + bn[2] * h / 2.0;   /* the box centre (global native) */
-    double a0[2] = {0, 0}, a1[2] = {0, 0};
+    double a0[2] = {0, 0}, a1[2] = {0, 0}, fq[2] = {0, 0}, fn[2] = {1, 0};
+    if (!perz) cl_box_frame(&C, org, na, cyg, cxg, f, FR, fq, fn);
     for (int z = 0; z < na; z++) {
-        double q[2], n[2]; cl_sdist(&C, (org[0] + z) * f, cyg * f, cxg * f, q, n);
+        double q[2], n[2];
+        if (perz) cl_sdist(&C, (org[0] + z) * f, cyg * f, cxg * f, q, n); else { q[0] = fq[0]; q[1] = fq[1]; n[0] = fn[0]; n[1] = fn[1]; }
         const double ay = q[0] / f - side * D * n[0] - org[1], ax = q[1] / f - side * D * n[1] - org[2];
         fprintf(fo, "%s[%.2f, %.2f]", z ? ", " : "", ay, ax);
         if (z == 0) { a0[0] = ay; a0[1] = ax; } a1[0] = ay; a1[1] = ax;
@@ -354,7 +387,7 @@ int cmd_coreline(int argc, char **argv) {
     }
     fprintf(stderr, "usage: ufsm coreline detect|box|sdist ...\n"
                     "  detect <fit-field zarr> <out.json> [--slab 64] [--bin 4]   the flattened umbilicus per z-slab from the phase gradient\n"
-                    "  box <core.json> --fields ZARR --box Z Y X NZ NY NX --side S [--dist 2000] --out DIR   a half-box fit-field dir\n"
+                    "  box <core.json> --fields ZARR --box Z Y X NZ NY NX --side S [--dist 2000] [--axis const|perz] --out DIR   a half-box fit-field dir\n"
                     "  sdist <core.json> Z Y X   signed distance to the core line\n");
     return 2;
 }
