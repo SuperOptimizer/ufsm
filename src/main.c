@@ -12,6 +12,7 @@
 #include "fit.h"
 #include "unet.h"
 #include "checkpoint.h"
+#include "fblend.h"
 #include "json.h"
 #include "nn.h"
 #include "tiffw.h"
@@ -42,6 +43,10 @@ int cmd_restore_eval(int argc, char **argv);
 int cmd_restore_stats(int argc, char **argv);
 int cmd_predict(int argc, char **argv);
 int cmd_eval(int argc, char **argv);
+int cmd_refine(int argc, char **argv);       /* src/surf.c */
+int cmd_surf_stats(int argc, char **argv);
+int cmd_stitch(int argc, char **argv);   /* src/stitch.c */
+int cmd_coreline(int argc, char **argv);   /* src/coreline.c */
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
@@ -79,11 +84,17 @@ static int usage(void) {
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
         "  ufsm convert-unwrap2 <unwrap.ckpt> <out.ckpt>   a task unwrap checkpoint as task unwrap2 (heads 2-10 -> 0-8, winding mod 4 fresh; no training step)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
+        "  ufsm coreline detect|box|sdist ...   a crushed scroll's flattened umbilicus per z (fit fields) and half-box fit dirs behind it\n"
+        "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
         "  ufsm wrapdist <wraps-dir> <labels-root> <labels-key>              wrap vertices vs the nearest labelled sheet\n"
         "  ufsm wrapswitch <wraps-dir> <codes-root> <codes-key>            how often the wraps switch sheets (per cm)\n"
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
+        "  ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40]   vertices onto the fields' sheet phase\n"
+        "  ufsm surf-stats <wraps-dir> --fields DIR [--ct ROOT KEY --ct-um U]   label-free surface quality (phase, switches, CT)\n"
+        "  ufsm ct-fields <ct-root> <key> <fields-dir> --ct-um U   CT planes ct / cs of a fit-field directory (fit --w-ct / --w-cspacing)\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
+        "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..]  several models' fit fields averaged (phase: confidence-weighted complex mean)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm papyrus-labels <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx   papyrus / void training labels of a CT box (gap labels, no cutoff)\n"
         "  ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w --labels G1,G2   a CT plane beside label panels (void blue, ignored yellow)\n"
@@ -664,14 +675,33 @@ static int cmd_band(int argc, char **argv) {
 
 /* ufsm fit <fields-dir> [--codes ROOT KEY] [--dir 0|1|-1] [--lattice 512,256,128,64,64,32] [--steps 300,...] [--phase-stage 4]
    [--knot-dz 1024] [--quiet] [--out MODEL-DIR] [--winding ZARR-DIR [--winding-step 4] [--um 2.4]] [--slab Z [--overlap 256]]
-   [--model MODEL-DIR]
+   [--model MODEL-DIR] [--axis-normal D] [--cpu [--threads N]] [--phase-robust S] [--conf-pow P] [--bend B] [--w-phase W --w-normal W
+   --w-density W --w-smooth W]
    The winding fitter (src/fit.h) on a directory of fit fields (ufsm band --fit-fields, predict --fit-fields / --fit-zarr). --slab:
    a global coarse fit plus z-slabs of Z native voxels (a fit set; --out writes it, --model reads a set or a model). --codes: score
    against a winding_mod14 band raster (label grid, 2 native voxels per label voxel, code = 1 + round(18 q) mod 252 with q the mesh
-   coordinate, q = U for dir +1): on every labelled voxel of the box U_fit - q must be one constant mod 14 turns. */
-/* U (the unwrapped radius in turns; sheets where U - dir theta / 2 pi is an integer) for the scorer: fill(ctx, og, n3, step, U) writes U
-   at og + i step (native voxels relative to the box origin) over the n3 grid, NaN where unknown; returns nonzero on failure */
-typedef int (*score_fill_fn)(void *ctx, const double og[3], const int64_t n3[3], double step, float *U);
+   coordinate, q = U for dir +1): on every labelled voxel of the box U_fit - q must be one constant mod 14 turns. --axis-normal D: a
+   local box away from the axis (crushed scrolls): the axis replaced by a vertical line D native voxels from the box centre along the
+   mean sheet normal (D < 0: the other side). --cpu: the CPU backend (no GPU; src/fit_terms.h holds the terms both backends fit).
+   --phase-robust S: a Cauchy phase residual of scale S turns; --conf-pow P: phase weight conf^P; --bend B: curvature-adaptive
+   smoothness; --w-pgrad W [--pgrad-delta D]: phase-gradient matching (src/fit_terms.h); --unwrap-voxels 1 / 0 / -1: the phase
+   stage's integer init by voxels / lattice nodes / none (fit_cfg). --wind4-weight W (default 4): the winding mod 4 term when the fields
+   carry dz dy dx dq planes (task unwrap2; 0 off). --w-recto W (default 0): recto anchors r^2 (1 - cos 2 pi W) from the fields' r plane
+   (predict --fit-fields / --fit-zarr write it). --out also writes MODEL/fit-config.json (the weights and options of the fit).
+   CT (fields with ct / cs planes, ufsm ct-fields / predict --fit-ct): --w-ct W papyrus / void parity c m (1 - cos 2 pi (W - --ct-phi)) weighted
+   (1 - phase confidence)^--ct-pow (>= --ct-floor), the parity m the cell's CT contrast to its +---ct-radius-um neighbourhood; with it
+   --ct-flood 1 (default) lets low-confidence voxels join the voxel unwrapping with the CT's own phase. --w-cspacing W: the density term
+   against the CT sheet spacing where the network's is unknown or differs by more than --cs-tol in log.
+   Local slip repair (fit_cfg uw_repair, src/l1pot.h): --uw-repair T splits the flooded voxels of each T^3 tile into pieces whose integers
+   agree and re-solves their integer shifts as the least-cost (weighted L1) assignment of all their votes; evidence --uw-rep-w4 W (the
+   winding mod 4 planes), --uw-rep-geo W (the gradient stages' W over --uw-rep-gd field voxels), --uw-rep-cs W (the CT sheet spacing);
+   --uw-rep-dump PREFIX writes the per-voxel shifts and seams. Vote weights (lower confidence)^--uw-rep-qpow (3) x the phase-stretch
+   factor --uw-rep-stretch (0.5; 0 off) over a (2 --uw-rep-sr + 1)^3 box (1). Recommended: --uw-repair 8 (Paris 4 hold box, wind96
+   fields over 9 predict windows: mean ids 0.827 -> 0.893). */
+/* U (the unwrapped radius in turns; sheets where U - dir theta / 2 pi is an integer) for the scorer: fill(ctx, og, n3, step, codes, U)
+   writes U at og + i step (native voxels relative to the box origin) over the n3 grid, NaN where unknown (it may skip the points
+   whose code is not 1..252); returns nonzero on failure */
+typedef int (*score_fill_fn)(void *ctx, const double og[3], const int64_t n3[3], double step, const uint8_t *codes, float *U);
 /* Score U against the band codes (winding_mod14) of a box, streamed in label z-chunks: the gauge (the mode of U - q mod 14), the
    fraction of winding ids right (|e| < 0.5 turn), |e| < 0.08 turn, median / p90 |e|; detail: integer errors by z octile and by radius
    (cy, cx: the axis per native z, box-local, (int)(shp[0] h) + 1 entries; um: the native voxel size); dump: box-local z y x and U - q
@@ -697,7 +727,7 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
         size_t any = 0; for (size_t i = 0; i < nb3 && !any; i++) any = codes[i] >= 1 && codes[i] <= 252;
         if (!any) continue;
         const double og[3] = {cf * o3[0] - 0.25 * cf - org[0], cf * o3[1] - 0.25 * cf - org[1], cf * o3[2] - 0.25 * cf - org[2]};   /* label voxel i at cf (i + lo + 1 / 4) - org */
-        if (fill(ctx, og, n3, cf, U)) { fprintf(stderr, "score: cannot evaluate U on the score grid\n"); free(codes); free(U); free(hist); free(fine); free(dd); return 1; }
+        if (fill(ctx, og, n3, cf, codes, U)) { fprintf(stderr, "score: cannot evaluate U on the score grid\n"); free(codes); free(U); free(hist); free(fine); free(dd); return 1; }
         for (int64_t zz = 0; zz < n3[0]; zz++) for (int64_t yy = 0; yy < n3[1]; yy++) for (int64_t xx = 0; xx < n3[2]; xx++) {
             const size_t i = ((size_t)zz * n3[1] + yy) * n3[2] + xx; const uint8_t cd = codes[i];
             if (cd < 1 || cd > 252) continue;
@@ -745,8 +775,10 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
     free(dd); free(ah); free(hist); free(fine);
     return 0;
 }
-typedef struct { fit_set_dev *gd; const fit_set *fs; } fit_fill_ctx;
-static int fit_fill(void *c, const double og[3], const int64_t n3[3], double step, float *U) { fit_fill_ctx *f = c; return fit_set_grid(f->gd, f->fs, og, n3, step, 1, U); }
+typedef struct { fit_set_dev *gd; const fit_set *fs; } fit_fill_ctx;   /* gd null: the CPU */
+static int fit_fill(void *c, const double og[3], const int64_t n3[3], double step, const uint8_t *codes, float *U) {
+    fit_fill_ctx *f = c; return f->gd ? fit_set_grid(f->gd, f->fs, og, n3, step, 1, U) : fit_set_grid_cpu(f->fs, og, n3, step, 1, codes, U);
+}
 
 /* ufsm convert-unwrap2 IN OUT: a task unwrap checkpoint (recto 0, ink 1, phase 2-3, normal 4-9, density 10) as a task unwrap2 one
    (phase 0-1, normal 2-7, density 8, winding mod 4 9-10 fresh) without a training step: the live and EMA weights copied, the head rows
@@ -815,13 +847,38 @@ static int cmd_fit(int argc, char **argv) {
     fit_cfg c = fit_cfg_default();
     c.verbose = arg_index(argc, argv, "--quiet") < 0;
     c.dir = atoi(opt(argc, argv, "--dir", "0")); c.unwrap_voxels = atoi(opt(argc, argv, "--unwrap-voxels", "1"));
-    c.uw_split = atof(opt(argc, argv, "--uw-split", "0")); c.uw_tile = atoi(opt(argc, argv, "--uw-tile", "256"));
+    c.cpu = arg_index(argc, argv, "--cpu") > 0; c.threads = atoi(opt(argc, argv, "--threads", "0")); fit_set_threads(c.threads);
+    c.phase_robust = (float)atof(opt(argc, argv, "--phase-robust", "0")); c.conf_pow = (float)atof(opt(argc, argv, "--conf-pow", "1"));
+    c.bend = (float)atof(opt(argc, argv, "--bend", "0"));
+    c.w_pgrad = (float)atof(opt(argc, argv, "--w-pgrad", "0")); c.pgrad_delta = (float)atof(opt(argc, argv, "--pgrad-delta", "0.25"));
+    c.w_phase = (float)atof(opt(argc, argv, "--w-phase", "1")); c.w_normal = (float)atof(opt(argc, argv, "--w-normal", "3"));
+    c.w_density = (float)atof(opt(argc, argv, "--w-density", "1")); c.w_smooth = (float)atof(opt(argc, argv, "--w-smooth", "0.1"));
+    c.w_wind4 = (float)atof(opt(argc, argv, "--wind4-weight", "4"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off) */
+    c.w_recto = (float)atof(opt(argc, argv, "--w-recto", "0"));        /* recto anchors (fields with an r plane; 0 off) */
+    if (!(c.w_wind4 >= 0) || !(c.w_recto >= 0)) { fprintf(stderr, "fit: --wind4-weight and --w-recto must be >= 0\n"); return 2; }
+    /* CT in the fitter (fields with ct / cs planes: ufsm ct-fields, predict --fit-ct): papyrus / void parity and the CT sheet spacing */
+    c.w_ct = (float)atof(opt(argc, argv, "--w-ct", "0")); c.ct_pow = (float)atof(opt(argc, argv, "--ct-pow", "1")); c.ct_phi = (float)atof(opt(argc, argv, "--ct-phi", "0"));
+    c.ct_floor = (float)atof(opt(argc, argv, "--ct-floor", "0")); c.ct_radius_um = atof(opt(argc, argv, "--ct-radius-um", "150")); c.ct_flood = atoi(opt(argc, argv, "--ct-flood", "0"));
+    c.w_cspacing = (float)atof(opt(argc, argv, "--w-cspacing", "0")); c.cs_tol = (float)atof(opt(argc, argv, "--cs-tol", "0.25"));
+    fit_fields_ct_planes((c.w_ct > 0 ? 1 : 0) | (c.w_cspacing > 0 ? 2 : 0));   /* load only the CT planes the terms read */
+    if (!(c.w_ct >= 0) || !(c.ct_pow >= 0) || !(c.ct_floor >= 0) || !(c.ct_radius_um > 0) || !(c.w_cspacing >= 0) || !(c.cs_tol > 0)) { fprintf(stderr, "fit: --w-ct, --ct-pow, --ct-floor, --w-cspacing >= 0, --ct-radius-um and --cs-tol > 0\n"); return 2; }
+    if (!(c.w_pgrad >= 0) || !(c.pgrad_delta > 0) || c.unwrap_voxels < -1 || c.unwrap_voxels > 1 || !(c.phase_robust >= 0) || !(c.conf_pow > 0) || !(c.bend >= 0) || !(c.w_phase >= 0) || !(c.w_normal >= 0) || !(c.w_density >= 0) || !(c.w_smooth >= 0)) {
+        fprintf(stderr, "fit: --phase-robust, --bend and the weights must be >= 0, --conf-pow and --pgrad-delta > 0, --unwrap-voxels -1, 0 or 1\n"); return 2;
+    }
+    c.uw_split = atof(opt(argc, argv, "--uw-split", "0")); c.uw_tile = atoi(opt(argc, argv, "--uw-tile", "256")); c.uw_pdv = atof(opt(argc, argv, "--uw-pdv", "0")); c.uw_min_conf = atof(opt(argc, argv, "--uw-min-conf", "0.3"));
+    /* local slip repair (fit_cfg uw_repair): pieces of uw_repair^3 tiles, least-cost integer shifts from their votes and the evidence */
+    c.uw_repair = atoi(opt(argc, argv, "--uw-repair", "0")); c.uw_rep_w4 = (float)atof(opt(argc, argv, "--uw-rep-w4", "0"));
+    c.uw_rep_geo = (float)atof(opt(argc, argv, "--uw-rep-geo", "0")); c.uw_rep_gd = atoi(opt(argc, argv, "--uw-rep-gd", "8"));
+    c.uw_rep_cs = (float)atof(opt(argc, argv, "--uw-rep-cs", "0")); c.uw_rep_dump = opt(argc, argv, "--uw-rep-dump", nullptr);
+    c.uw_rep_qpow = (float)atof(opt(argc, argv, "--uw-rep-qpow", "3")); c.uw_rep_stretch = (float)atof(opt(argc, argv, "--uw-rep-stretch", "0.5"));
+    c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1"));
+    if (c.uw_repair < 0 || !(c.uw_rep_w4 >= 0) || !(c.uw_rep_geo >= 0) || !(c.uw_rep_cs >= 0) || c.uw_rep_gd < 1 || !(c.uw_rep_qpow > 0) || !(c.uw_rep_stretch >= 0) || c.uw_rep_sr < 0 || c.uw_rep_sr > 4) { fprintf(stderr, "fit: --uw-repair >= 0, --uw-rep-* weights >= 0, --uw-rep-gd >= 1\n"); return 2; }
     c.core = (float)atof(opt(argc, argv, "--core", "3"));   /* no data terms within core x pitch of the axis */
     c.w_wind4 = (float)atof(opt(argc, argv, "--wind4-weight", "4"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off) */
     c.analytic = atoi(opt(argc, argv, "--analytic", "1")); c.packed_um = atof(opt(argc, argv, "--packed-um", "0")); c.batch = atoi(opt(argc, argv, "--batch", "2000000")); c.knot_dz = atoi(opt(argc, argv, "--knot-dz", "1024")); c.phase_stage = atoi(opt(argc, argv, "--phase-stage", "4"));
     if (*opt(argc, argv, "--lattice", "")) { c.nstage = 0; char *t = strdup(opt(argc, argv, "--lattice", "")); for (char *q = strtok(t, ","); q && c.nstage < 8; q = strtok(nullptr, ",")) c.lattice[c.nstage++] = atoi(q); free(t); }
     if (*opt(argc, argv, "--steps", "")) { int k = 0; char *t = strdup(opt(argc, argv, "--steps", "")); for (char *q = strtok(t, ","); q && k < 8; q = strtok(nullptr, ",")) c.steps[k++] = atoi(q); for (; k < c.nstage; k++) c.steps[k] = c.steps[k - 1]; free(t); }
-    nn_init(atoi(opt(argc, argv, "--gpu", "0")));
+    if (!c.cpu) nn_init(atoi(opt(argc, argv, "--gpu", "0")));
     const double t0 = now();
     const char *min = opt(argc, argv, "--model", nullptr);   /* score / export a saved model or set instead of fitting */
     const int slab = atoi(opt(argc, argv, "--slab", "0")), overlap = atoi(opt(argc, argv, "--overlap", "256"));
@@ -830,6 +887,31 @@ static int cmd_fit(int argc, char **argv) {
     if (fit_fields_load(dir, 0, 0, min || slab > 0 ? 0 : 1, &fb)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
     clock_gettime(CLOCK_MONOTONIC, &tl1);
     if (c.verbose) fprintf(stderr, "fit: fields %dx%dx%d loaded in %.1fs\n", fb.shape[0], fb.shape[1], fb.shape[2], (double)(tl1.tv_sec - tl0.tv_sec) + (tl1.tv_nsec - tl0.tv_nsec) * 1e-9);   /* (slab runs load per slab; a given model needs the geometry only) */
+    if (*opt(argc, argv, "--axis-normal", "") && !min && !slab) {
+        /* local boxes away from the scroll's axis (crushed scrolls): replace the axis by a vertical line D native voxels from the box centre
+           along the box's mean sheet normal (top eigenvector of the material-weighted mean n n^T), so the spiral term is nearly flat */
+        const double D = atof(opt(argc, argv, "--axis-normal", "0")); const fit_fields *f = &fb.f; const size_t n = (size_t)f->D * f->H * f->W;
+        double T[6] = {0}, sw = 0;   /* zz yy xx zy zx yx */
+        for (size_t i = 0; i < n; i++) if (f->w[i]) {
+            const double w = f->w[i] / 255.0; sw += w;
+            for (int k = 0; k < 3; k++) T[k] += w * f->t[k][i] / 255.0;
+            for (int k = 3; k < 6; k++) T[k] += w * (f->t[k][i] / 255.0 - 0.5);
+        }
+        if (sw <= 0) { fprintf(stderr, "fit: --axis-normal: no material in the box\n"); return 1; }
+        const double M[3][3] = {{T[0], T[3], T[4]}, {T[3], T[1], T[5]}, {T[4], T[5], T[2]}};
+        double v[3] = {0.3, 0.7, 0.6};
+        for (int it = 0; it < 100; it++) {
+            double u[3] = {0, 0, 0}; for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) u[a] += M[a][b] * v[b];
+            const double l = sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]); if (l < 1e-12) break; for (int a = 0; a < 3; a++) v[a] = u[a] / l;
+        }
+        double ny = v[1], nx = v[2]; const double lyx = sqrt(ny * ny + nx * nx);
+        if (lyx < 0.3) fprintf(stderr, "fit: --axis-normal: the mean normal (%.2f %.2f %.2f) is mostly along z\n", v[0], v[1], v[2]);
+        if (lyx > 1e-6) { ny /= lyx; nx /= lyx; } else { ny = 1; nx = 0; }
+        const double cy = f->H * f->h / 2, cx = f->W * f->h / 2; const int na = (int)(f->D * f->h) + 1;
+        for (int z = 0; z < na; z++) { fb.cy[z] = (float)(cy - D * ny); fb.cx[z] = (float)(cx - D * nx); }
+        fprintf(stderr, "fit: --axis-normal: mean normal z %.3f y %.3f x %.3f; axis at box-local (y %.1f, x %.1f), %.0f native voxels away\n",
+                v[0], v[1], v[2], cy - D * ny, cx - D * nx, D);
+    }
     c.um = fb.um;   /* default lattices and knots are physical: given in 2.4 um voxels, scaled to the fields' native voxels */
     if (!*opt(argc, argv, "--knot-dz", "")) c.knot_dz = fit_scale_L(1024, 2.4 / fb.um);
     if (!*opt(argc, argv, "--lattice", "")) for (int k = 0; k < c.nstage; k++) c.lattice[k] = fit_scale_L(c.lattice[k], 2.4 / fb.um);
@@ -846,6 +928,18 @@ static int cmd_fit(int argc, char **argv) {
     fprintf(stderr, "fit: dir %+d, %d slab model(s), global lattice %d (%dx%dx%d), loss %.5f in %.1fs\n", m->dir, fs->n, m->L, m->lz, m->ly, m->lx, m->loss[0], now() - t0);
     const char *mout = opt(argc, argv, "--out", nullptr);
     if (mout && (fs->n ? fit_set_save(fs, mout) : fit_save(fs->global, mout))) { fprintf(stderr, "fit: cannot save %s\n", mout); return 1; }
+    if (mout && !min) {   /* the fit's options beside the model (reproducibility) */
+        char cp[1400]; snprintf(cp, sizeof cp, "%s/fit-config.json", mout); FILE *cf = fopen(cp, "w");
+        if (!cf) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
+        fprintf(cf, "{\"version\":1,\"w_phase\":%.9g,\"w_normal\":%.9g,\"w_density\":%.9g,\"w_smooth\":%.9g,\"w_pgrad\":%.9g,\"pgrad_delta\":%.9g,\"w_wind4\":%.9g,\"w_recto\":%.9g,"
+                    "\"w_ct\":%.9g,\"ct_pow\":%.9g,\"ct_phi\":%.9g,\"ct_floor\":%.9g,\"ct_radius_um\":%.9g,\"ct_flood\":%d,\"w_cspacing\":%.9g,\"cs_tol\":%.9g,"
+                    "\"phase_robust_turns\":%.9g,\"conf_pow\":%.9g,\"bend\":%.9g,\"unwrap_voxels\":%d,\"uw_min_conf\":%.9g,\"uw_repair\":%d,\"uw_rep_w4\":%.9g,\"uw_rep_geo\":%.9g,\"uw_rep_gd\":%d,\"uw_rep_cs\":%.9g,\"uw_rep_qpow\":%.9g,\"uw_rep_stretch\":%.9g,\"uw_rep_sr\":%d,\"phase_stage\":%d,\"slab\":%d,\"cpu\":%d,\"native_um\":%.9g,\"lattice\":[",
+                c.w_phase, c.w_normal, c.w_density, c.w_smooth, c.w_pgrad, c.pgrad_delta, c.w_wind4, c.w_recto,
+                c.w_ct, c.ct_pow, c.ct_phi, c.ct_floor, c.ct_radius_um, c.ct_flood, c.w_cspacing, c.cs_tol, c.phase_robust, c.conf_pow, c.bend, c.unwrap_voxels, c.uw_min_conf,
+                c.uw_repair, c.uw_rep_w4, c.uw_rep_geo, c.uw_rep_gd, c.uw_rep_cs, c.uw_rep_qpow, c.uw_rep_stretch, c.uw_rep_sr, c.phase_stage, slab, c.cpu, c.um);
+        for (int k = 0; k < c.nstage; k++) fprintf(cf, "%s%d", k ? "," : "", c.lattice[k]);
+        fprintf(cf, "]}\n"); if (fclose(cf)) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
+    }
     const char *wout = opt(argc, argv, "--winding", nullptr);
     if (wout) {   /* the per-voxel winding number W * 256 (uint16, exact volcomp typed chunks) on a grid of --winding-step native voxels */
         const int ws = atoi(opt(argc, argv, "--winding-step", "4")); const double um = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : fb.um;
@@ -856,11 +950,11 @@ static int cmd_fit(int argc, char **argv) {
         z3w *zw = z3w_create_typed(ld, gs, 128, 1, 0.f, 0.0, at);
         if (!zw || z3w_write_group(wout, (const double[]){um * ws}, 1, "ufsm-winding", at)) { fprintf(stderr, "fit: %s\n", z3w_error()); return 1; }
         uint16_t *sb = malloc((size_t)128 * 128 * 128 * 2); float *wv = malloc((size_t)128 * 128 * 128 * 4);
-        fit_set_dev *gd = fit_set_upload(fs); if (!gd) return 1;
+        fit_set_dev *gd = nullptr; if (!c.cpu && !(gd = fit_set_upload(fs))) return 1;
         for (int64_t sz = 0; sz * 128 < gs[0]; sz++) for (int64_t sy = 0; sy * 128 < gs[1]; sy++) for (int64_t sx = 0; sx * 128 < gs[2]; sx++) {
             const int64_t n3[3] = {gs[0] - sz * 128 < 128 ? gs[0] - sz * 128 : 128, gs[1] - sy * 128 < 128 ? gs[1] - sy * 128 : 128, gs[2] - sx * 128 < 128 ? gs[2] - sx * 128 : 128};
             const double o3[3] = {(double)sz * 128 * ws, (double)sy * 128 * ws, (double)sx * 128 * ws};
-            if (fit_set_grid(gd, fs, o3, n3, ws, 0, wv)) { fprintf(stderr, "fit: no device memory for the winding grid\n"); return 1; }
+            if (gd ? fit_set_grid(gd, fs, o3, n3, ws, 0, wv) : fit_set_grid_cpu(fs, o3, n3, ws, 0, nullptr, wv)) { fprintf(stderr, "fit: no device memory for the winding grid\n"); return 1; }
             memset(sb, 0, (size_t)128 * 128 * 128 * 2);
             for (int64_t a = 0; a < n3[0]; a++) for (int64_t b = 0; b < n3[1]; b++) for (int64_t c2 = 0; c2 < n3[2]; c2++) {
                 const double v = (double)wv[((size_t)a * n3[1] + b) * n3[2] + c2] * 256; sb[((size_t)a * 128 + b) * 128 + c2] = (uint16_t)(v < 0 ? 0 : v > 65535 ? 65535 : lround(v));
@@ -877,7 +971,7 @@ static int cmd_fit(int argc, char **argv) {
         if (!z) { fprintf(stderr, "%s\n", z3_error()); return 1; }
         const double cf = atof(argv[ci + 2]) > 0 ? atof(argv[ci + 2]) / fb.um : 2;   /* label voxel in native voxels (the codes' key is its um: 4.8) */
         FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;   /* box-local z y x, U - q mod 14 per voxel */
-        fit_set_dev *gd = fit_set_upload(fs); if (!gd) return 1;
+        fit_set_dev *gd = nullptr; if (!c.cpu && !(gd = fit_set_upload(fs))) return 1;
         fit_fill_ctx fc = {gd, fs};
         const int rc = score_codes(z, cf, org, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, &fc);
         fit_set_dev_free(gd); z3_close(z); if (dump) fclose(dump);
@@ -893,7 +987,7 @@ static int cmd_fit(int argc, char **argv) {
    voxels per native 2.4 um voxel, axis). U is read at the voxel holding each label voxel; the same gauge, ids-right, |error| and
    by-z / by-radius integer errors as fit --codes, plus the labelled voxels the sweep did not reach. */
 typedef struct { const float *U; int64_t n[3]; } raster_fill_ctx;
-static int raster_fill(void *c, const double og[3], const int64_t n3[3], double step, float *U) {
+static int raster_fill(void *c, const double og[3], const int64_t n3[3], double step, const uint8_t *codes, float *U) {
     const raster_fill_ctx *r = c;
     for (int64_t a = 0; a < n3[0]; a++) for (int64_t b = 0; b < n3[1]; b++) for (int64_t x = 0; x < n3[2]; x++) {
         const int64_t iz = (int64_t)floor(og[0] + a * step), iy = (int64_t)floor(og[1] + b * step), ix = (int64_t)floor(og[2] + x * step);
@@ -1825,6 +1919,7 @@ static float *wd_read(const char *path, int *w, int *h) { return read_tif_f32(pa
 typedef struct { int w, h, id; float *X, *Y, *Z; uint8_t *code; float *dist; } ws_wrap;   /* dist: um along the normal to the code */
 typedef struct {
     ws_wrap *W; int nw; long *rs; long nrows; double sc, R; const uint8_t *lab; int64_t o[3], n[3], z0, z1; _Atomic long next; double lum;
+    const axis *ax; double s0;   /* with --axis: the normals turned away from the axis, dist signed (+: the code lies outward) */
 } ws_job;
 static void *ws_rows(void *arg) {
     ws_job *J = arg;
@@ -1843,13 +1938,17 @@ static void *ws_rows(void *arg) {
             double N[3] = {du[1] * dv[2] - du[2] * dv[1], du[2] * dv[0] - du[0] * dv[2], du[0] * dv[1] - du[1] * dv[0]};
             const double nl = sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]); if (!(nl > 0)) continue;
             for (int k = 0; k < 3; k++) N[k] /= nl;
+            if (J->ax) {   /* outward: away from the axis (the published codes' winding grows outward) */
+                double cy, cx; axis_at(J->ax, w->Z[i] * J->s0, &cy, &cx);
+                if (N[1] * (w->Y[i] * J->s0 - cy) + N[2] * (w->X[i] * J->s0 - cx) < 0) for (int k = 0; k < 3; k++) N[k] = -N[k];
+            }
             for (int s = 0; s <= 4 * (int)ceil(J->R); s++) {   /* t = 0, +.5, -.5, +1, -1, ...: the nearest labelled voxel first */
                 const double t = (s + 1) / 2 * 0.5 * (s % 2 ? 1 : -1); if (fabs(t) > J->R) break;
                 int64_t p[3]; int in = 1;
                 for (int k = 0; k < 3; k++) { p[k] = (int64_t)llround(P[k] + t * N[k]) - J->o[k]; in &= p[k] >= 0 && p[k] < J->n[k]; }
                 if (!in) continue;
                 const uint8_t v = J->lab[((size_t)p[0] * J->n[1] + p[1]) * J->n[2] + p[2]];
-                if (v >= 1 && v <= 252) { w->code[i] = v; w->dist[i] = (float)(fabs(t) * J->lum); break; }
+                if (v >= 1 && v <= 252) { w->code[i] = v; w->dist[i] = (float)((J->ax ? t : fabs(t)) * J->lum); break; }
             }
         }
     }
@@ -1925,6 +2024,9 @@ static int cmd_wrapswitch(int argc, char **argv) {
         const double v[3] = {Wr[k].Z[i] * sc, Wr[k].Y[i] * sc, Wr[k].X[i] * sc};
         for (int d = 0; d < 3; d++) { if (v[d] < lo[d]) lo[d] = v[d]; if (v[d] > hi[d]) hi[d] = v[d]; }
     }
+    axis ax = {0}; const char *axp = opt(argc, argv, "--axis", nullptr); const int dir = atoi(opt(argc, argv, "--dir", "1"));
+    if (axp && axis_load(&ax, axp)) { fprintf(stderr, "wrapswitch: cannot load the axis %s\n", axp); return 1; }
+    const double s0 = wum / 2.4;   /* wrap voxels -> level-0 (axis) voxels */
     const int Ri = (int)ceil(R) + 1; int64_t bo[3], bn[3];
     for (int d = 0; d < 3; d++) { bo[d] = (int64_t)floor(lo[d]) - Ri; if (bo[d] < 0) bo[d] = 0; int64_t e = (int64_t)ceil(hi[d]) + Ri + 1; if (e > zm->shape[d]) e = zm->shape[d]; bn[d] = e - bo[d]; }
     long *rs = malloc((nw + 1) * sizeof *rs); rs[0] = 0; for (int k = 0; k < nw; k++) rs[k + 1] = rs[k] + Wr[k].h;
@@ -1932,7 +2034,7 @@ static int cmd_wrapswitch(int argc, char **argv) {
     if (!lab) { fprintf(stderr, "wrapswitch: no memory for %d rows of %zu voxels (lower --chunk)\n", C + 2 * Ri, plane); return 1; }
     for (int64_t z0 = bo[0]; z0 < bo[0] + bn[0]; z0 += C) {
         const int64_t a = z0 - Ri < bo[0] ? bo[0] : z0 - Ri, b = z0 + C + Ri > bo[0] + bn[0] ? bo[0] + bn[0] : z0 + C + Ri;
-        ws_job J = {Wr, nw, rs, rs[nw], sc, R, lab, {a, bo[1], bo[2]}, {b - a, bn[1], bn[2]}, z0, z0 + C, 0, lum};
+        ws_job J = {Wr, nw, rs, rs[nw], sc, R, lab, {a, bo[1], bo[2]}, {b - a, bn[1], bn[2]}, z0, z0 + C, 0, lum, axp ? &ax : nullptr, s0};
         if (z3_read(z, J.o, J.n, lab, nt)) { fprintf(stderr, "wrapswitch: %s\n", z3_error()); return 1; }
         pthread_t th[64]; const int k = nt < 64 ? nt : 64; for (int t = 0; t < k; t++) pthread_create(&th[t], nullptr, ws_rows, &J);
         for (int t = 0; t < k; t++) pthread_join(th[t], nullptr);
@@ -1943,11 +2045,8 @@ static int cmd_wrapswitch(int argc, char **argv) {
        sheet (up to one global gauge), and off by whole turns elsewhere. Gauge: the circular mean of e's fraction, then the most
        common whole turn; right = |e - gauge| < 0.5 turn (mod 14). Over all wraps with one gauge, and per wrap with its own (on its
        majority sheet: coherent though maybe a turn off) */
-    axis ax = {0}; const char *axp = opt(argc, argv, "--axis", nullptr); const int dir = atoi(opt(argc, argv, "--dir", "1"));
-    if (axp && axis_load(&ax, axp)) { fprintf(stderr, "wrapswitch: cannot load the axis %s\n", axp); return 1; }
-    const double s0 = wum / 2.4;   /* wrap voxels -> level-0 (axis) voxels */
     double gre = 0, gim = 0; size_t ghist[14] = {0}, nright = 0, nown = 0, ncod = 0;
-    float *dall = malloc(sizeof(float) * 1024); size_t nd = 0, capd = 1024; size_t d10 = 0, d20 = 0;
+    float *dall = malloc(sizeof(float) * 1024); size_t nd = 0, capd = 1024; size_t d10 = 0, d20 = 0, sdpos = 0, sdneg = 0; double sdsum = 0;
     if (axp) for (int k = 0; k < nw; k++) for (size_t i = 0; i < (size_t)Wr[k].w * Wr[k].h; i++) {   /* the global fraction */
         if (!Wr[k].code[i]) continue;
         double cy, cx; axis_at(&ax, Wr[k].Z[i] * s0, &cy, &cx);
@@ -1970,7 +2069,8 @@ static int cmd_wrapswitch(int argc, char **argv) {
         for (size_t i = 0; i < (size_t)Wr[k].w * Wr[k].h; i++) {
             vl += Wr[k].Z[i] >= 0; cd += Wr[k].code[i] > 0; if (!Wr[k].code[i]) continue;
             if (nd == capd) { capd *= 2; dall = realloc(dall, capd * sizeof *dall); }
-            dall[nd++] = Wr[k].dist[i]; d10 += Wr[k].dist[i] <= 10; d20 += Wr[k].dist[i] <= 20;
+            const float ad = fabsf(Wr[k].dist[i]); sdsum += Wr[k].dist[i]; sdpos += Wr[k].dist[i] > 0; sdneg += Wr[k].dist[i] < 0;
+            dall[nd++] = ad; d10 += ad <= 10; d20 += ad <= 20;
             if (!axp) continue;
             double cy, cx; axis_at(&ax, Wr[k].Z[i] * s0, &cy, &cx);
             const double e = (Wr[k].code[i] - 1) / 18.0 - dir * atan2(Wr[k].Y[i] * s0 - cy, Wr[k].X[i] * s0 - cx) / (2 * M_PI) - Wr[k].id;
@@ -1993,7 +2093,9 @@ static int cmd_wrapswitch(int argc, char **argv) {
            A[0].runs ? A[0].path / A[0].runs * 1e-3 : 0, A[1].path * 1e-4, A[1].sw, A[1].path > 0 ? A[1].sw / (A[1].path * 1e-4) : 0, A[1].runs ? A[1].path / A[1].runs * 1e-3 : 0);
     if (nd) { qsort(dall, nd, sizeof(float), cmp_fl);
         printf("wrapswitch: distance along the normal to the nearest published sheet (coded vertices): median %.1f um, p90 %.1f; of all vertices <= 10 um %.3f, <= 20 um %.3f\n",
-               dall[nd / 2], dall[nd * 9 / 10], valid ? (double)d10 / valid : 0, valid ? (double)d20 / valid : 0); }
+               dall[nd / 2], dall[nd * 9 / 10], valid ? (double)d10 / valid : 0, valid ? (double)d20 / valid : 0);
+        if (axp) printf("wrapswitch: signed (+: the published sheet lies outward of the vertex, away from the axis): mean %+.2f um, outward %.3f, inward %.3f, at 0 %.3f\n",
+                        sdsum / nd, (double)sdpos / nd, (double)sdneg / nd, (double)(nd - sdpos - sdneg) / nd); }
     if (axp && ncod) printf("wrapswitch: on the right sheet (one global gauge %.3f: q = k + dir theta / 2 pi + gauge, mod 14) %.3f of coded vertices; on their wrap's majority sheet %.3f\n", gfr + gm, (double)nright / ncod, (double)nown / ncod);
     free(dall); free(Wr); free(rs);
     return 0;
@@ -2119,6 +2221,25 @@ static int cmd_surfsnap(int argc, char **argv) {
     return nw ? 0 : 1;
 }
 
+/* ufsm field-blend OUT IN1 IN2 ... [--weights a,b,...] [--threads N]: fit-field sets of several models on one grid blended into
+   OUT (src/fblend.h: the phase as the confidence-weighted complex mean, its length the new confidence) */
+static int cmd_field_blend(int argc, char **argv) {
+    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr; int nt = 8;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--weights") && i + 1 < argc) { ws = argv[++i]; continue; }
+        if (!strcmp(argv[i], "--threads") && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
+        if (!strncmp(argv[i], "--", 2)) { fprintf(stderr, "field-blend: unknown option %s\n", argv[i]); return 2; }
+        if (!out) out = argv[i]; else if (n < 32) in[n++] = argv[i]; else { fprintf(stderr, "field-blend: at most 32 inputs\n"); return 2; }
+    }
+    if (!out || n < 1) { fprintf(stderr, "usage: ufsm field-blend <out> <fields1> [<fields2> ...] [--weights a,b,...] [--threads N]\n"); return 2; }
+    if (ws) {
+        int k = 0; char *t = strdup(ws);
+        for (char *q = strtok(t, ","); q; q = strtok(nullptr, ",")) { if (k < 32) w[k] = (float)atof(q); k++; }
+        free(t);
+        if (k != n) { fprintf(stderr, "field-blend: %d weights for %d inputs\n", k, n); return 2; }
+    }
+    return fblend_run(out, n, in, ws ? w : nullptr, nt < 1 ? 1 : nt);
+}
 /* ufsm fit-compare <reference-fields> <fields>: how a field set (e.g. a network's, predict --fit-zarr) agrees with a reference
    (e.g. the oracle, band --fit-fields) cell by cell; both must cover the same physical cells (origin x um, h x um equal), at any
    native voxel sizes. Over cells where the reference phase confidence is > 0.3 and both have material: phase |error| (turns),
@@ -2806,6 +2927,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "convert-unwrap2")) return cmd_convert_unwrap2(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
+    if (!strcmp(cmd, "stitch")) return cmd_stitch(argc, argv);
+    if (!strcmp(cmd, "coreline")) return cmd_coreline(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
     if (!strcmp(cmd, "downsample")) return cmd_downsample(argc, argv);
     if (!strcmp(cmd, "side-votes") || !strcmp(cmd, "codes-merge")) return cmd_side_votes(argc, argv);
@@ -2819,7 +2942,11 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);
     if (!strcmp(cmd, "wrapswitch")) return cmd_wrapswitch(argc, argv);
     if (!strcmp(cmd, "surf-snap")) return cmd_surfsnap(argc, argv);
+    if (!strcmp(cmd, "refine")) return cmd_refine(argc, argv);
+    if (!strcmp(cmd, "surf-stats")) return cmd_surf_stats(argc, argv);
+    if (!strcmp(cmd, "ct-fields")) return cmd_ct_fields(argc, argv);
     if (!strcmp(cmd, "fit-compare")) return cmd_fit_compare(argc, argv);
+    if (!strcmp(cmd, "field-blend")) return cmd_field_blend(argc, argv);
     if (!strcmp(cmd, "gap-compare")) return cmd_gap_compare(argc, argv);
     if (!strcmp(cmd, "gap-density")) return cmd_gap_density(argc, argv);
     if (!strcmp(cmd, "void-pool")) return cmd_void_pool(argc, argv);

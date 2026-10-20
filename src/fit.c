@@ -1,10 +1,13 @@
 /* Winding fitter host side (src/fit.h): label-free prior per z knot (pitch from the spacing field, refined by the phase
    coherence of r / pitch - dir theta / 2 pi; offset = its argument), then Adam on delta (coarse to fine) and the knots. */
 #include "fit.h"
+#include "fit_terms.h"
 #include "nn.h"
 #include "json.h"
 #include "zarr3.h"
 #include "store.h"
+#include "coreline.h"
+#include "l1pot.h"
 #include <complex.h>
 #include <math.h>
 #include <stdio.h>
@@ -26,8 +29,13 @@ fit_cfg fit_cfg_default(void) {
     const int lat[6] = {512, 256, 128, 64, 64, 32}, st[6] = {300, 300, 300, 300, 300, 300};
     memcpy(c.lattice, lat, sizeof lat); memcpy(c.steps, st, sizeof st);
     c.lr = 0.02f; c.lr_knot = 0.005f;
-    c.w_phase = 1.f; c.w_normal = 1.f; c.w_density = 1.f; c.w_nondeg = 1.f; c.w_smooth = 0.1f; c.w_decay = 1e-4f; c.w_wind4 = 4.f;
-    c.phase_ramp = 0.1f; c.core = 3.f; c.unwrap_voxels = 1; c.uw_tile = 256; c.analytic = 1; c.batch = 2000000;
+    c.w_phase = 1.f; c.w_normal = 3.f; c.w_density = 1.f;   /* w_normal 3: 15-24% fewer sheet switches on 3 Paris 4 crops at equal distance (2026-10-19) */ c.w_nondeg = 1.f; c.w_smooth = 0.1f; c.w_decay = 1e-4f;
+    c.phase_ramp = 0.1f; c.core = 3.f; c.unwrap_voxels = 1; c.uw_tile = 256; c.analytic = 1; c.batch = 2000000; c.conf_pow = 1.f; c.pgrad_delta = 0.25f;
+    c.w_wind4 = 4.f;    /* the winding mod 4 term, active only with dz dy dx dq planes (task unwrap2 fields) */
+    c.w_recto = 0.f;    /* recto anchors off by default */
+    c.w_ct = 0.f; c.ct_pow = 1.f; c.ct_phi = 0.f; c.ct_radius_um = 150; c.ct_floor = 0.f;   /* CT parity off by default */
+    c.w_cspacing = 0.f; c.cs_tol = 0.25f; c.ct_flood = 0;
+    c.uw_repair = 0; c.uw_rep_qpow = 1.f; c.uw_rep_sr = 1; c.uw_rep_gd = 8;   /* local slip repair off by default */
     return c;
 }
 
@@ -119,6 +127,14 @@ static int ring_winding(const fit_sample *v, size_t ns, double p, double ring, d
     return nt;
 }
 static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+/* the prior's phase vector of voxel i: the network phase, plus with recto anchors (w_recto > 0, an r plane) w_recto r^2 at phase zero
+   (recto peaks sit on integer W, independently of the phase head) */
+static double complex prior_phasor(const fit_fields *f, const fit_cfg *c, size_t i) {
+    const double complex phase = (f->pc[i] - 128) / 127.0 + I * ((f->ps[i] - 128) / 127.0);
+    if (!f->recto || !(c->w_recto > 0)) return phase;
+    const double r = f->recto[i] / 255.0;
+    return c->w_phase * phase + c->w_recto * r * r;
+}
 int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
     const double h = f->h; const size_t n = (size_t)f->D * f->H * f->W;
     const int na = (int)(f->D * h) + 1;
@@ -136,7 +152,7 @@ int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
             const int z = (int)(i / ((size_t)f->H * f->W)), y = (int)((i / f->W) % f->H), x = (int)(i % f->W); const double pz = (z + 0.5) * h;
             if (pz < zlo || pz > zhi || !f->w[i]) continue;
             if (f->sp[i]) sps[nsp++] = f->sp[i] * (float)h / 8.f;
-            const double mc = (f->pc[i] - 128) / 127.0, ms = (f->ps[i] - 128) / 127.0;
+            const double complex phasor = prior_phasor(f, c, i); const double mc = creal(phasor), ms = cimag(phasor);
             if (mc * mc + ms * ms < 0.01) continue;
             const double cy = axis_lerp(f->cy, na, pz), cx = axis_lerp(f->cx, na, pz), py = (y + 0.5) * h, px = (x + 0.5) * h;
             v[ns++] = (fit_sample){hypot(py - cy, px - cx), atan2(py - cy, px - cx), f->w[i] / 255.0, mc + I * ms};
@@ -160,7 +176,7 @@ int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
         for (size_t i = 0; i < n; i += stride) {
             const int z = (int)(i / ((size_t)f->H * f->W)), y = (int)((i / f->W) % f->H), x = (int)(i % f->W); const double pz = (z + 0.5) * h;
             if (pz < zlo || pz > zhi || !f->w[i]) continue;
-            const double mc = (f->pc[i] - 128) / 127.0, ms = (f->ps[i] - 128) / 127.0;
+            const double complex phasor = prior_phasor(f, c, i); const double mc = creal(phasor), ms = cimag(phasor);
             const double cy = axis_lerp(f->cy, na, pz), cx = axis_lerp(f->cx, na, pz), py = (y + 0.5) * h, px = (x + 0.5) * h;
             const double r = hypot(py - cy, px - cx), th = atan2(py - cy, px - cx);
             acc += f->w[i] / 255.0 * (mc + I * ms) * cexp(-I * 2 * M_PI * (r / pk[k] - m->dir * th / (2 * M_PI)));
@@ -215,8 +231,11 @@ static fit_heap_e heap_pop(fit_heap_e *h, int *n) {
 typedef void (*fit_zfn)(void *ctx, int z0, int z1, int t);
 typedef struct { fit_zfn fn; void *ctx; int z0, z1, t; } fit_zjob;
 static void *fit_zrun(void *a) { fit_zjob *j = a; j->fn(j->ctx, j->z0, j->z1, j->t); return nullptr; }
+static int g_fit_threads;   /* fit_cfg threads of the current fit (0: the core count) */
+void fit_set_threads(int n) { g_fit_threads = n; }
 static int fit_nthreads(int D) {
     long n = sysconf(_SC_NPROCESSORS_ONLN); const char *e = getenv("UFSM_FIT_THREADS"); if (e && atoi(e) > 0) n = atoi(e);
+    if (g_fit_threads > 0) n = g_fit_threads;
     if (n > 64) n = 64;
     if (n > D) n = D;
     return n < 1 ? 1 : (int)n;
@@ -241,7 +260,9 @@ static void fit_zpar(int D, int nt, fit_zfn fn, void *ctx) {
    pops ahead is known and its record and z / y neighbours are prefetched (none: 57 s; 8 / 32 ahead: 36 / 33 s). The result is
    the original's (same voxels, same integers). Tiled floods stitched by votes were 30x faster but got 14-16% of the winding ids
    against 19.6% (each tile commits its own low-confidence bridges). The voxel loops run on threads. Returns the number of voxels
-   reached. */
+   reached. The integers do not depend on the seed (up to the gauge): the quality-ordered flood is Prim's maximum spanning tree of
+   the voxel-quality graph, whatever its root (2026-10-19: 5 floods from seeds spread over a Paris 4 crop differed on 0 voxels), so
+   consensus over seeds gains nothing; only the quality order (uw_q) shapes where the flood crosses dislocations. */
 enum { UQ_LEVELS = 4096 };
 #define UQ_NONE UINT32_MAX
 #define UK_UNSET INT16_MIN
@@ -272,14 +293,31 @@ static void *uw_alloc_huge(size_t bytes) {   /* 2 MB aligned and advised onto tr
     const size_t A = (size_t)2 << 20; bytes = (bytes + A - 1) / A * A;
     void *p = aligned_alloc(A, bytes); if (p) madvise(p, bytes, MADV_HUGEPAGE); return p;
 }
-/* the voxel's confidence (0: excluded) and its phase angle */
+/* phase derivative variance of voxel i (turns^2): the mean square of the wrapped second differences of the phase along z, y and x
+   (over the axes whose two neighbours carry a phase); ~0 where the phase is locally linear, large at dislocations and noise */
+static double uw_pdv(const fit_fields *f, size_t i, double a0) {
+    const size_t HW = (size_t)f->H * f->W, st[3] = {HW, (size_t)f->W, 1};
+    const int pos[3] = {(int)(i / HW), (int)((i / f->W) % f->H), (int)(i % f->W)}, dim[3] = {f->D, f->H, f->W};
+    double s = 0; int n = 0;
+    for (int d = 0; d < 3; d++) {
+        if (pos[d] <= 0 || pos[d] >= dim[d] - 1) continue;
+        const size_t im = i - st[d], ip = i + st[d];
+        const int cm = f->pc[im] - 128, sm = f->ps[im] - 128, cp = f->pc[ip] - 128, sp = f->ps[ip] - 128;
+        if (!f->w[im] || !f->w[ip] || cm * cm + sm * sm < 40 || cp * cp + sp * sp < 40) continue;   /* conf < 0.05 */
+        double e = (atan2(sp, cp) - 2 * a0 + atan2(sm, cm)) / (2 * M_PI); e -= round(e); s += e * e; n++;
+    }
+    return n ? s / n : 0;
+}
+/* the voxel's confidence (0: excluded) and its phase angle; fit_cfg uw_pdv > 0: times exp(-pdv / uw_pdv^2) */
 static float uw_q(const fit_fields *f, size_t i, double min_conf, const fit_cfg *c, double *ang) {
     if (!f->w[i]) return 0;
     const double mc = (f->pc[i] - 128) / 127.0, ms = (f->ps[i] - 128) / 127.0, conf = sqrt(mc * mc + ms * ms);
     if (conf < min_conf) return 0;
     if (c->packed_um > 0 && f->sp[i] && f->sp[i] * f->h / 8.0 * (c->um > 0 ? c->um : 2.4) < 0.6 * c->packed_um) return 0;   /* packed: no phase integers */
     *ang = atan2(ms, mc);
-    return (float)(conf * f->w[i] / 255.0);
+    double q = conf * f->w[i] / 255.0;
+    if (c->uw_pdv > 0) q *= exp(-uw_pdv(f, i, *ang) / (c->uw_pdv * c->uw_pdv));
+    return (float)q;
 }
 static void uw_zero(void *a, int b0, int b1, int t) {   /* brick layers [b0, b1) (first touch of the huge pages, on threads) */
     uw_ctx *x = a; const size_t L = (size_t)x->g.bH * x->g.bW << (3 * UB); memset(x->V + (size_t)b0 * L, 0, (size_t)(b1 - b0) * L * sizeof *x->V);
@@ -582,6 +620,245 @@ static size_t uw_two_level(uw_ctx *x, double split, int T, size_t nr, int verbos
     return reached;
 }
 
+/* Local slip repair (fit_cfg uw_repair, fitter Phase 4). The quality-ordered flood is a maximum spanning tree: where the phase has a
+   dislocation (a loop whose wrapped differences do not sum to zero, e.g. two sheets merged over a patch) the tree closes the loop
+   wherever its order happens to, and a whole region beyond can come out a turn off (a "slip": on the held-out Paris 4 box half the
+   box in some predict windows, ring-shaped regions 6-10 mm from the axis). Here the flooded voxels of each tile (uw_repair^3 field
+   voxels) split into pieces whose integers agree (connected through neighbours within half a turn); every touching voxel pair of two
+   pieces votes for their integer offset with the lower confidence as weight, optional evidence adds longer-range votes (the winding
+   mod 4 planes; the gradient stages' W, i.e. the normal / density integration; the CT sheet spacing), and the pieces' shifts minimise
+   the summed weighted L1 disagreement (src/l1pot.h, exact). A dislocation is then cut along its cheapest (least confident, least
+   evidenced) surface. The shifted integers seed the phase stage's delta like the flood's. */
+typedef struct {
+    uw_ctx *x; const fit_cfg *c; int T, ntz, nty, ntx; _Atomic int next;
+    uint32_t *comp;                         /* per record: its piece within its tile (1..), 0 not flooded */
+    uint32_t *npc, *tbase;                  /* per tile: pieces, the first global id */
+    l1_vote *v[64]; size_t nv[64], cv[64];  /* per thread: merged votes */
+    int pass;                               /* 0 pieces, 1 votes */
+    const int32_t *shift;                   /* apply / seams: per global piece */
+    uint8_t *seam; int seam_shift;          /* per field voxel: disagreeing neighbours (seam_shift 0 / 4: the low / high nibble) */
+    size_t nseam[64];
+    int gd; double wgeo, ww4, wcs; int w4c; /* the evidence: distances (field voxels) and weights */
+    double qpow, sst;                       /* vote weight: confidence power, stretch scale (0 off) */
+    uint8_t *bad;                           /* per record (sst > 0): the stretch weight < 1/2 (pieces do not join such voxels to others) */
+    float *lst; int sr;                     /* per record (sst > 0): log2 of the phase stretch; its box radius */
+} uwr_ctx;
+static inline uint32_t uwr_gid(const uwr_ctx *u, int z, int y, int xx, uint32_t id) {
+    const int t = ((z / u->T) * u->nty + y / u->T) * u->ntx + xx / u->T; return u->tbase[t] + u->comp[id] - 1;
+}
+static inline double uw_U(const uw_ctx *x, uint32_t id) { return (double)x->V[id].uw + x->V[id].k; }   /* (the base kb cancels in differences) */
+static void uwr_vote(uwr_ctx *u, int th, uint32_t a, uint32_t b, int32_t d, int64_t w) {
+    if (a == b || w <= 0) return;
+    if (u->nv[th] == u->cv[th]) { u->cv[th] = u->cv[th] ? 2 * u->cv[th] : 65536; u->v[th] = realloc(u->v[th], u->cv[th] * sizeof *u->v[th]); if (!u->v[th]) abort(); }
+    u->v[th][u->nv[th]++] = (l1_vote){a, b, d, w};
+}
+/* the model's U - dir theta / 2 pi = W and theta at a field voxel */
+static double uwr_Wm(const uw_ctx *x, int z, int y, int xx, double *th) {
+    const fit_fields *f = x->f; const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
+    *th = atan2(py - axis_lerp(f->cy, x->na, pz), px - axis_lerp(f->cx, x->na, pz));
+    return fit_W(x->m, pz, py, px);
+}
+/* the phase stretch at a field voxel: |grad phase| (turns per field voxel) x the spacing (field voxels per turn), both over the (2r+1)^3
+   box around it (the gradient per axis from the summed phasor products z(+e) conj(z(-e)), i.e. confidence-weighted; the mean spacing):
+   ~1 where the phase counts every sheet, < 1 where it skipped one, > 1 where it added one; 1 when unknown. r 1 flags 4% of the cells
+   whose phase agrees with the published wraps on the Paris 4 hold box against 8% at r 0 (and 36% vs 41% of those > 1/4 turn off). */
+static double uwr_stretch(const fit_fields *f, int z, int y, int xx, int r) {
+    const size_t HW = (size_t)f->H * f->W; const size_t st[3] = {HW, (size_t)f->W, 1}; const int dim[3] = {f->D, f->H, f->W};
+    double pr[3] = {0}, pi[3] = {0}, ssp = 0; int nsp = 0;
+    for (int a = z - r; a <= z + r; a++) for (int b = y - r; b <= y + r; b++) for (int c = xx - r; c <= xx + r; c++) {
+        if (a < 0 || b < 0 || c < 0 || a >= f->D || b >= f->H || c >= f->W) continue;
+        const size_t i = (size_t)a * HW + (size_t)b * f->W + c; const int pos[3] = {a, b, c};
+        if (f->sp[i]) { ssp += f->sp[i]; nsp++; }
+        for (int d = 0; d < 3; d++) {
+            if (pos[d] <= 0 || pos[d] >= dim[d] - 1) continue;
+            const size_t im = i - st[d], ip = i + st[d];
+            const double cm = f->pc[im] - 128, sm = f->ps[im] - 128, cp = f->pc[ip] - 128, sq = f->ps[ip] - 128;
+            pr[d] += cp * cm + sq * sm; pi[d] += sq * cm - cp * sm;   /* z(+) conj z(-) */
+        }
+    }
+    if (!nsp) return 1;
+    double g2 = 0; int n = 0;
+    for (int d = 0; d < 3; d++) if (pr[d] != 0 || pi[d] != 0) { const double e = atan2(pi[d], pr[d]) / (4 * M_PI); g2 += e * e; n++; }
+    if (!n) return 1;
+    return sqrt(g2 * 3.0 / n) * ssp / nsp / 8.0;   /* (missing axes: the mean square of the others) */
+}
+static double wrap_pi(double a) { return a - 2 * M_PI * floor((a + M_PI) / (2 * M_PI)); }
+static int64_t uwr_w(const uwr_ctx *u, int bk, int z, int y, int xx, int zn, int yn, int xn) {   /* a phase vote's weight */
+    double w = u->qpow == 1 ? bk : (UQ_LEVELS - 2) * pow(bk / (double)(UQ_LEVELS - 2), u->qpow);
+    if (u->sst > 0) {
+        const uw_geo *g = &u->x->g; const float a = u->lst[ub_id(g, z, y, xx)], b = u->lst[ub_id(g, zn, yn, xn)];
+        w *= exp(-(a * a + b * b) / (2 * u->sst * u->sst));
+    }
+    return w < 1 ? 1 : (int64_t)lround(w);
+}
+static void uwr_tiles(void *a, int z0_, int z1_, int th) {
+    uwr_ctx *u = a; uw_ctx *x = u->x; const uw_geo *g = &x->g; const uw_vox *V = x->V; (void)z0_; (void)z1_;
+    const int nt = u->ntz * u->nty * u->ntx; uint32_t *q = nullptr; size_t qcap = 0;
+    for (int t; (t = atomic_fetch_add(&u->next, 1)) < nt;) {
+        const int tx = t % u->ntx, ty = (t / u->ntx) % u->nty, tz = t / (u->ntx * u->nty);
+        const int z0 = tz * u->T, y0 = ty * u->T, x0 = tx * u->T;
+        const int z1 = z0 + u->T < g->D ? z0 + u->T : g->D, y1 = y0 + u->T < g->H ? y0 + u->T : g->H, x1 = x0 + u->T < g->W ? x0 + u->T : g->W;
+        if (u->pass == 0) {   /* pieces: flooded voxels connected through neighbours whose integers agree */
+            const size_t nv = (size_t)(z1 - z0) * (y1 - y0) * (x1 - x0);
+            if (nv > qcap) { qcap = nv; free(q); q = malloc(qcap * sizeof *q); if (!q) abort(); }
+            uint32_t np = 0;
+            for (int z = z0; z < z1; z++) for (int y = y0; y < y1; y++) for (int xx = x0; xx < x1; xx++) {
+                const uint32_t id = ub_id(g, z, y, xx); if (V[id].k == UK_UNSET || u->comp[id]) continue;
+                u->comp[id] = ++np; size_t qh = 0, qt = 0; q[qt++] = id;
+                while (qh < qt) {
+                    const uint32_t i = q[qh++]; int zz, yy, xq; ub_zyx(g, i, &zz, &yy, &xq); const double ui = uw_U(x, i);
+                    const int ok[6] = {zz > z0, zz + 1 < z1, yy > y0, yy + 1 < y1, xq > x0, xq + 1 < x1};
+                    const int nb3[6][3] = {{zz - 1, yy, xq}, {zz + 1, yy, xq}, {zz, yy - 1, xq}, {zz, yy + 1, xq}, {zz, yy, xq - 1}, {zz, yy, xq + 1}};
+                    for (int k = 0; k < 6; k++) {
+                        if (!ok[k]) continue;
+                        const uint32_t j = ub_id(g, nb3[k][0], nb3[k][1], nb3[k][2]);
+                        if (V[j].k == UK_UNSET || u->comp[j] || fabs(ui - uw_U(x, j)) >= 0.5 || (u->bad && u->bad[i] != u->bad[j])) continue;
+                        u->comp[j] = np; q[qt++] = j;
+                    }
+                }
+            }
+            u->npc[t] = np;
+        } else if (u->pass == 1) {   /* votes: touching pairs (+z +y +x neighbours) of two pieces, then the evidence */
+            const size_t n0 = u->nv[th];
+            for (int z = z0; z < z1; z++) for (int y = y0; y < y1; y++) for (int xx = x0; xx < x1; xx++) {
+                const uint32_t i = ub_id(g, z, y, xx); if (V[i].k == UK_UNSET) continue;
+                const uint32_t ga = uwr_gid(u, z, y, xx, i); const double ui = uw_U(x, i);
+                for (int ax = 0; ax < 3; ax++) {
+                    const int zn = z + (ax == 0), yn = y + (ax == 1), xn = xx + (ax == 2);
+                    if (zn >= g->D || yn >= g->H || xn >= g->W) continue;
+                    const uint32_t j = ub_id(g, zn, yn, xn); if (V[j].k == UK_UNSET) continue;
+                    const uint32_t gb = uwr_gid(u, zn, yn, xn, j); if (ga == gb) continue;
+                    uwr_vote(u, th, ga, gb, (int32_t)lround(ui - uw_U(x, j)), uwr_w(u, V[i].bk < V[j].bk ? V[i].bk : V[j].bk, z, y, xx, zn, yn, xn));
+                }
+                /* evidence: votes between voxels farther apart (every other voxel per axis) */
+                if ((z | y | xx) & 1) continue;
+                const fit_fields *f = x->f; const size_t fi = ((size_t)z * f->H + y) * f->W + xx;
+                for (int ev = 0; ev < 3; ev++) {
+                    const double wt = ev == 0 ? u->ww4 : ev == 1 ? u->wgeo : u->wcs; if (wt <= 0) continue;
+                    if (ev == 0 && !f->wd[3][fi]) continue;
+                    if (ev == 2 && !f->cs[fi]) continue;
+                    const int D = ev == 0 ? u->w4c : u->gd; if (D < 1) continue;
+                    for (int ax = 0; ax < 3; ax++) {
+                        const int zn = z + (ax == 0) * D, yn = y + (ax == 1) * D, xn = xx + (ax == 2) * D;
+                        if (zn >= g->D || yn >= g->H || xn >= g->W) continue;
+                        const uint32_t j = ub_id(g, zn, yn, xn); if (V[j].k == UK_UNSET) continue;
+                        const uint32_t gb = uwr_gid(u, zn, yn, xn, j); if (ga == gb) continue;
+                        double th0, th1; const double Wm0 = uwr_Wm(x, z, y, xx, &th0), Wm1 = uwr_Wm(x, zn, yn, xn, &th1);
+                        const double dth = wrap_pi(th1 - th0) / (2 * M_PI), dWc = (uw_U(x, j) - ui) - x->m->dir * dth;   /* the flooded W difference */
+                        double want;   /* the evidence's W(j) - W(i) */
+                        if (ev == 0) {   /* mod 4: the candidate nearest the model's difference */
+                            const double dl = f->wd[ax][fi] / 64.0, dm = Wm1 - Wm0; want = dl + 4 * round((dm - dl) / 4);
+                        } else if (ev == 1) want = Wm1 - Wm0;
+                        else {   /* turns along the model's gradient from the CT spacing (mean of the two ends' spacings) */
+                            const size_t fj = ((size_t)zn * f->H + yn) * f->W + xn; if (!f->cs[fj]) continue;
+                            const double spn = 0.5 * (f->cs[fi] + f->cs[fj]) * f->h / 8.0;   /* native voxels per turn */
+                            double gv[3]; const double e = f->h, pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
+                            gv[0] = fit_W(x->m, pz + e, py, px) - fit_W(x->m, pz - e, py, px); gv[1] = fit_W(x->m, pz, py + e, px) - fit_W(x->m, pz, py - e, px);
+                            gv[2] = fit_W(x->m, pz, py, px + e) - fit_W(x->m, pz, py, px - e);
+                            const double gl = sqrt(gv[0] * gv[0] + gv[1] * gv[1] + gv[2] * gv[2]); if (gl < 1e-9) continue;
+                            want = gv[ax] / gl * D * f->h / spn;
+                        }
+                        const double r = want - dWc, rr = round(r);
+                        if (fabs(r - rr) > 0.3) continue;   /* the evidence disagrees with the phase by a fraction: no integer vote */
+                        const int bq = V[i].bk < V[j].bk ? V[i].bk : V[j].bk;
+                        const double wv = wt * bq * (ev == 0 ? f->wd[3][fi] / 255.0 : 1.0);
+                        if (wv >= 1) uwr_vote(u, th, ga, gb, (int32_t)rr, (int64_t)lround(wv));
+                    }
+                }
+            }
+            /* merge this tile's votes in place (few distinct pairs per tile) */
+            const size_t m = l1_votes_merge(u->v[th] + n0, u->nv[th] - n0); u->nv[th] = n0 + m;
+        }
+    }
+    free(q);
+}
+static void uwr_badness(void *a, int z0, int z1, int th) {   /* the stretched / compressed voxels (sst > 0) */
+    uwr_ctx *u = a; uw_ctx *x = u->x; const uw_geo *g = &x->g;
+    for (int z = z0; z < z1; z++) for (int y = 0; y < g->H; y++) for (int xx = 0; xx < g->W; xx++) {
+        const uint32_t i = ub_id(g, z, y, xx); if (x->V[i].k == UK_UNSET) continue;
+        const double l = log2(fmax(uwr_stretch(x->f, z, y, xx, u->sr), 1e-3)); u->lst[i] = (float)l; u->bad[i] = exp(-l * l / (2 * u->sst * u->sst)) < 0.5;
+    }
+}
+static void uwr_apply(void *a, int z0, int z1, int th) {   /* the shifts, and the seams (disagreeing neighbour pairs) */
+    uwr_ctx *u = a; uw_ctx *x = u->x; const uw_geo *g = &x->g; uw_vox *V = x->V; size_t ns = 0;
+    for (int z = z0; z < z1; z++) for (int y = 0; y < g->H; y++) for (int xx = 0; xx < g->W; xx++) {
+        const uint32_t i = ub_id(g, z, y, xx); if (V[i].k == UK_UNSET) continue;
+        if (u->shift) {
+            const int32_t k = V[i].k + u->shift[uwr_gid(u, z, y, xx, i)];
+            V[i].k = (int16_t)(k <= INT16_MIN ? INT16_MIN + 1 : k > INT16_MAX ? INT16_MAX : k);
+        }
+    }
+    /* the seams (shift null: a separate pass, as the neighbours of other z ranges must be shifted first) */
+    if (!u->shift) for (int z = z0; z < z1; z++) for (int y = 0; y < g->H; y++) for (int xx = 0; xx < g->W; xx++) {
+        const uint32_t i = ub_id(g, z, y, xx); if (V[i].k == UK_UNSET) continue;
+        const double ui = uw_U(x, i); int cnt = 0;
+        const int ok[6] = {z > 0, z + 1 < g->D, y > 0, y + 1 < g->H, xx > 0, xx + 1 < g->W};
+        const int nb3[6][3] = {{z - 1, y, xx}, {z + 1, y, xx}, {z, y - 1, xx}, {z, y + 1, xx}, {z, y, xx - 1}, {z, y, xx + 1}};
+        for (int k = 0; k < 6; k++) if (ok[k]) { const uint32_t j = ub_id(g, nb3[k][0], nb3[k][1], nb3[k][2]); if (V[j].k != UK_UNSET && fabs(ui - uw_U(x, j)) >= 0.5) cnt++; }
+        ns += cnt;
+        if (u->seam) u->seam[((size_t)z * g->H + y) * g->W + xx] |= (uint8_t)(cnt << u->seam_shift | (u->bad && u->bad[i] && !u->seam_shift ? 8 : 0));
+    }
+    u->nseam[th] = ns;
+}
+static void uw_repair(uw_ctx *x, size_t nr, const fit_cfg *c) {
+    const uw_geo *g = &x->g; const double t0 = nn_wall_seconds(); const fit_fields *f = x->f;
+    const int T = c->uw_repair;
+    uwr_ctx u = {.x = x, .c = c, .T = T, .ntz = (g->D + T - 1) / T, .nty = (g->H + T - 1) / T, .ntx = (g->W + T - 1) / T};
+    const int nt = u.ntz * u.nty * u.ntx;
+    u.comp = calloc(nr, sizeof *u.comp); u.npc = calloc(nt, sizeof *u.npc); u.tbase = calloc(nt + 1, sizeof *u.tbase);
+    if (!u.comp || !u.npc || !u.tbase) { fprintf(stderr, "fit: out of memory for the slip repair (skipped)\n"); free(u.comp); free(u.npc); free(u.tbase); return; }
+    const size_t nf = (size_t)g->D * g->H * g->W;
+    if (c->uw_rep_dump) u.seam = calloc(nf, 1);
+    u.qpow = c->uw_rep_qpow > 0 ? c->uw_rep_qpow : 1; u.sst = c->uw_rep_stretch;
+    u.sr = c->uw_rep_sr;
+    if (u.sst > 0) {
+        u.bad = calloc(nr, 1); u.lst = calloc(nr, sizeof *u.lst);
+        if (!u.bad || !u.lst) { free(u.bad); free(u.lst); u.bad = nullptr; u.lst = nullptr; u.sst = 0; fprintf(stderr, "fit: no memory for the repair's stretch (off)\n"); }
+        else fit_zpar(g->D, x->nt, uwr_badness, &u);
+    }
+    fit_zpar(g->D, x->nt, uwr_apply, &u);   /* the flood's seams (shift null: count only) */
+    size_t seam0 = 0; for (int t = 0; t < x->nt; t++) seam0 += u.nseam[t];
+    u.pass = 0; fit_zpar(x->nt, x->nt, uwr_tiles, &u);
+    uint64_t np = 0; for (int t = 0; t < nt; t++) { u.tbase[t] = (uint32_t)np; np += u.npc[t]; }
+    if (np >= UINT32_MAX) { fprintf(stderr, "fit: too many repair pieces (skipped)\n"); free(u.comp); free(u.npc); free(u.tbase); free(u.seam); free(u.bad); free(u.lst); return; }
+    u.gd = c->uw_rep_gd > 0 ? c->uw_rep_gd : 8; u.wgeo = c->uw_rep_geo; u.wcs = f->cs ? c->uw_rep_cs : 0;
+    u.ww4 = f->wd[0] && f->wd[1] && f->wd[2] && f->wd[3] && f->w4_d > 0 ? c->uw_rep_w4 : 0; u.w4c = (int)lround(f->w4_d / f->h);
+    u.pass = 1; atomic_store(&u.next, 0); fit_zpar(x->nt, x->nt, uwr_tiles, &u);
+    size_t nv = 0; for (int t = 0; t < x->nt; t++) nv += u.nv[t];
+    l1_vote *v = malloc((nv ? nv : 1) * sizeof *v); nv = 0;
+    for (int t = 0; t < x->nt; t++) { if (u.nv[t]) memcpy(v + nv, u.v[t], u.nv[t] * sizeof *v); nv += u.nv[t]; free(u.v[t]); }
+    nv = l1_votes_merge(v, nv);
+    const double t1 = nn_wall_seconds();
+    int32_t *s = calloc(np ? np : 1, sizeof *s); l1_stats st = {0};
+    if (l1_solve((uint32_t)np, v, nv, s, 256, &st)) fprintf(stderr, "fit: out of memory for the slip repair's solve (skipped)\n");
+    const double t2 = nn_wall_seconds();
+    size_t pm = 0, vm = 0;
+    for (uint64_t k = 0; k < np; k++) pm += s[k] != 0;
+    if (pm) {   /* the shifts (by z range), then the seams again */
+        u.shift = s; fit_zpar(g->D, x->nt, uwr_apply, &u); u.shift = nullptr;
+    }
+    if (u.seam) { u.seam_shift = 4; }
+    fit_zpar(g->D, x->nt, uwr_apply, &u);
+    size_t seam1 = 0; for (int t = 0; t < x->nt; t++) seam1 += u.nseam[t];
+    if (c->uw_rep_dump) {   /* PREFIX.shift.raw, PREFIX.seam.raw */
+        uint8_t *sh = calloc(nf, 1);
+        for (int z = 0; z < g->D; z++) for (int y = 0; y < g->H; y++) for (int xx = 0; xx < g->W; xx++) {
+            const uint32_t i = ub_id(g, z, y, xx); if (!u.comp[i]) continue;
+            const int32_t d = s[uwr_gid(&u, z, y, xx, i)]; sh[((size_t)z * g->H + y) * g->W + xx] = (uint8_t)(128 + (d < -127 ? -127 : d > 127 ? 127 : d));
+        }
+        char p[1200]; int bad = 0;
+        snprintf(p, sizeof p, "%s.shift.raw", c->uw_rep_dump); FILE *fo = fopen(p, "wb"); bad |= !fo || fwrite(sh, 1, nf, fo) != nf; if (fo) bad |= fclose(fo) != 0;
+        snprintf(p, sizeof p, "%s.seam.raw", c->uw_rep_dump); fo = fopen(p, "wb"); bad |= !fo || fwrite(u.seam, 1, nf, fo) != nf; if (fo) bad |= fclose(fo) != 0;
+        if (bad) fprintf(stderr, "fit: cannot write the repair dump %s.*\n", c->uw_rep_dump);
+        free(sh);
+    }
+    for (int z = 0; z < g->D; z++) for (int y = 0; y < g->H; y++) for (int xx = 0; xx < g->W; xx++) { const uint32_t i = ub_id(g, z, y, xx); if (u.comp[i] && s[uwr_gid(&u, z, y, xx, i)]) vm++; }
+    if (c->verbose) fprintf(stderr, "fit: slip repair (tiles %d^3): %llu pieces, %zu edges (%zu votes), L1 disagreement %lld -> %lld in %d moves (%d max flows, %.1fs); "
+                            "%zu pieces / %zu voxels shifted; seam pairs %zu -> %zu; pieces + votes %.1fs\n",
+                            T, (unsigned long long)np, st.nedge, nv, (long long)st.e0, (long long)st.e1, st.moves, st.iters, t2 - t1, pm, vm, seam0 / 2, seam1 / 2, t1 - t0);
+    free(v); free(s); free(u.comp); free(u.npc); free(u.tbase); free(u.seam); free(u.bad); free(u.lst);
+}
+
 static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_conf, const fit_cfg *c) {
     const size_t n = (size_t)f->D * f->H * f->W; const int na = (int)(f->D * f->h) + 1;
     const uw_geo g = {f->D, f->H, f->W, (f->H + UB_M) / UB_S, (f->W + UB_M) / UB_S};
@@ -626,6 +903,7 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
         }
     }
     uq_free(&q);
+    if (c->uw_repair > 0 && reached) uw_repair(&x, nr, c);
     const double t2 = nn_wall_seconds();
     /* per lattice node: mean of (U_unwrapped - U_model) over the reached voxels nearest to it */
     const size_t nl = (size_t)m->lz * m->ly * m->lx;
@@ -709,31 +987,207 @@ static void fit_unwrap_init(fit_model *m, const fit_fields *f, double min_coh) {
 
 /* fields pooled by f per axis for the gradient-only stages (no phase): material-weighted means of n n^T and of the density
    rho (spacing re-encoded for the coarser h), the material fraction; the phase vector is not pooled (pc = ps = 128). */
-typedef struct { int D, H, W; uint8_t *a[10]; } fit_pooled;
-static fit_pooled fit_pool(const fit_fields *f, int fp) {
-    fit_pooled p = {(f->D + fp - 1) / fp, (f->H + fp - 1) / fp, (f->W + fp - 1) / fp, {0}};
+typedef struct { int D, H, W; uint8_t *a[10]; float *pg; uint8_t *cs; } fit_pooled;   /* pg (with_pg): Gz Gy Gx c planes, src/fit_terms.h;
+                                                                                       cs: the CT sheet spacing pooled as sp (fields with cs) */
+static fit_pooled fit_pool(const fit_fields *f, int fp, int with_pg) {
+    fit_pooled p = {(f->D + fp - 1) / fp, (f->H + fp - 1) / fp, (f->W + fp - 1) / fp, {0}, nullptr, nullptr};
     const size_t np = (size_t)p.D * p.H * p.W;
     for (int k = 0; k < 10; k++) p.a[k] = calloc(np, 1);
+    if (f->cs) p.cs = calloc(np, 1);
+    if (with_pg) p.pg = calloc(4 * np, sizeof(float));
+    const size_t HWf = (size_t)f->H * f->W;
     for (int z = 0; z < p.D; z++) for (int y = 0; y < p.H; y++) for (int x = 0; x < p.W; x++) {
-        double sw = 0, st[6] = {0}, srho = 0, swr = 0; int cnt = 0;
+        double sw = 0, st[6] = {0}, srho = 0, swr = 0, gs[3] = {0, 0, 0}, gc[3] = {0, 0, 0}, crho = 0, cwr = 0; int cnt = 0;
         for (int a = 0; a < fp && z * fp + a < f->D; a++) for (int b = 0; b < fp && y * fp + b < f->H; b++) for (int e = 0; e < fp && x * fp + e < f->W; e++) {
             const size_t i = ((size_t)(z * fp + a) * f->H + y * fp + b) * f->W + x * fp + e; cnt++;
             if (!f->w[i]) continue;
+            if (p.pg) {   /* the wrapped phase steps to the next cells, confidence-weighted (as fit_pgrad_term at full resolution) */
+                const double mc = (f->pc[i] - 128) / 127.0, ms = (f->ps[i] - 128) / 127.0, c0 = sqrt(mc * mc + ms * ms);
+                const int pos[3] = {z * fp + a, y * fp + b, x * fp + e}, dim[3] = {f->D, f->H, f->W}; const size_t sd[3] = {HWf, (size_t)f->W, 1};
+                if (c0 >= 0.05) for (int d = 0; d < 3; d++) {
+                    if (pos[d] + 1 >= dim[d] || !f->w[i + sd[d]]) continue;
+                    const double nc = (f->pc[i + sd[d]] - 128) / 127.0, ns = (f->ps[i + sd[d]] - 128) / 127.0, c1 = sqrt(nc * nc + ns * ns);
+                    if (c1 < 0.05) continue;
+                    double ph = (atan2(ns, nc) - atan2(ms, mc)) / (2 * M_PI); ph -= floor(ph + 0.5);
+                    const double cw = fmin(fmin(c0, c1), 1.0); gs[d] += cw * ph / f->h; gc[d] += cw;
+                }
+            }
             const double w = f->w[i] / 255.0; sw += w;
             for (int k = 0; k < 6; k++) st[k] += w * f->t[k][i];
             if (f->sp[i]) { srho += w * 8.0 / (f->h * f->sp[i]); swr += w; }
+            if (p.cs && f->cs[i]) { crho += w * 8.0 / (f->h * f->cs[i]); cwr += w; }
         }
         const size_t o = ((size_t)z * p.H + y) * p.W + x;
         p.a[0][o] = p.a[1][o] = 128;
+        if (p.pg && cnt) {
+            double cs = 0; for (int d = 0; d < 3; d++) { p.pg[d * np + o] = gc[d] > 0 ? (float)(gs[d] / gc[d]) : 0.f; cs += gc[d]; }
+            p.pg[3 * np + o] = (float)(gc[0] > 0 && gc[1] > 0 && gc[2] > 0 ? cs / (3.0 * cnt) : 0);
+        }
         if (sw <= 0) continue;
         p.a[9][o] = (uint8_t)lround(255.0 * sw / cnt);
         for (int k = 0; k < 6; k++) p.a[2 + k][o] = (uint8_t)lround(st[k] / sw);
         if (swr > 0) { const double v = 8.0 / (f->h * fp * (srho / swr)); p.a[8][o] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lround(v)); }
+        if (cwr > 0) { const double v = 8.0 / (f->h * fp * (crho / cwr)); p.cs[o] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lround(v)); }
     }
     return p;
 }
 
+/* ---- the CPU backend (fit_cfg cpu): nn_fit_loss2 / nn_fit_smooth / nn_adamw on host arrays (src/fit_terms.h: the same per-voxel
+   terms as the CUDA kernels). Minibatches are stratified: one voxel per run of stride voxels (hash of the run and the step's salt),
+   so a step touches n / stride voxels, not n hashes. Threads own contiguous voxel ranges, hence a few lattice z planes each: per
+   thread a private gradient over its planes, summed into g_delta plane by plane in thread order (deterministic results). ---- */
+typedef struct {
+    const fit_dev *f; float *g; int nt; size_t nb, stride; double part[64][FIT_NPARTS];
+    float *pg[64]; int a0[64], a1[64]; size_t plane;   /* per thread: private gradient over lattice planes [a0, a1] */
+} cpu_loss;
+static int cpu_plane_of(const fit_dev *f, int z) {   /* the lower lattice plane of field row z (fit_vox2's c0[0]) */
+    const float a = fminf(fmaxf((z + 0.5f) * f->h / (float)f->L, 0.f), (float)(f->lz - 1));
+    return FIT_IMIN((int)a, f->lz - 2 < 0 ? 0 : f->lz - 2);
+}
+static int cpu_plane_at(const fit_dev *f, float pz) {   /* the lower lattice plane of box-local native z (fit_U_at's c0[0]) */
+    const float a = fminf(fmaxf(pz / (float)f->L, 0.f), (float)(f->lz - 1));
+    return FIT_IMIN((int)a, f->lz - 2 < 0 ? 0 : f->lz - 2);
+}
+static void cpu_loss_setup(cpu_loss *J, const fit_dev *f, int nt) {   /* the threads' ranges and gradient buffers (per stage) */
+    memset(J, 0, sizeof *J); J->f = f; J->nt = nt < 1 ? 1 : nt > 64 ? 64 : nt;
+    const size_t n = (size_t)f->D * f->H * f->W, HW = (size_t)f->H * f->W; J->stride = f->stride > 1 ? (size_t)f->stride : 1; J->nb = (n + J->stride - 1) / J->stride;
+    J->plane = (size_t)f->ly * f->lx;
+    for (int t = 0; t < J->nt; t++) {
+        const size_t b0 = J->nb * t / J->nt, b1 = J->nb * (t + 1) / J->nt;
+        if (b1 <= b0) { J->a0[t] = 0; J->a1[t] = -1; continue; }
+        const size_t v0 = b0 * J->stride, v1 = b1 * J->stride < n ? b1 * J->stride : n;
+        const int zl = (int)((v1 - 1) / HW);   /* the winding mod 4 term also reaches w4_d native voxels up in z */
+        const int pl = f->wd ? FIT_IMIN(cpu_plane_at(f, (zl + 0.5f) * f->h + f->w4_d), f->lz - 1) : cpu_plane_of(f, zl);
+        J->a0[t] = cpu_plane_of(f, (int)(v0 / HW)); J->a1[t] = FIT_IMIN((pl > cpu_plane_of(f, zl) ? pl : cpu_plane_of(f, zl)) + 1, f->lz - 1);
+        J->pg[t] = malloc((size_t)(J->a1[t] - J->a0[t] + 1) * J->plane * sizeof(float));
+    }
+}
+static void cpu_loss_free(cpu_loss *J) { for (int t = 0; t < J->nt; t++) free(J->pg[t]); }
+static void cpu_loss_run(void *ctx, int t0_, int t1_, int t) {
+    cpu_loss *J = ctx; const fit_dev *f = J->f; const size_t n = (size_t)f->D * f->H * f->W;
+    double lp[FIT_NPARTS] = {0};
+    if (J->a1[t] >= J->a0[t]) {
+        float *pg = J->pg[t]; const size_t base = (size_t)J->a0[t] * J->plane, np = (size_t)(J->a1[t] - J->a0[t] + 1) * J->plane;
+        memset(pg, 0, np * sizeof(float));
+        const size_t b0 = J->nb * t / J->nt, b1 = J->nb * (t + 1) / J->nt; const float sc = (float)J->stride;
+        for (size_t b = b0; b < b1; b++) {
+            const size_t i = J->stride > 1 ? b * J->stride + fit_hash((unsigned)b ^ f->salt) % (unsigned)J->stride : b;
+            if (i >= n || !f->w[i]) continue;
+            size_t ic[FIT_VOX2_MAXC]; float gv[FIT_VOX2_MAXC];
+            const int nc = fit_vox2(f, i, f->w[i] * (1.f / 255.f), sc, lp, ic, gv);
+            for (int c = 0; c < nc; c++) pg[ic[c] - base] += gv[c];
+        }
+    }
+    for (int k = 0; k < FIT_NPARTS; k++) J->part[t][k] = lp[k];
+}
+static void cpu_loss_reduce(void *ctx, int a0, int a1, int t_) {   /* lattice planes [a0, a1): the threads' gradients in thread order */
+    cpu_loss *J = ctx;
+    for (int a = a0; a < a1; a++) {
+        float *g = J->g + (size_t)a * J->plane;
+        for (int t = 0; t < J->nt; t++) {
+            if (a < J->a0[t] || a > J->a1[t]) continue;
+            const float *p = J->pg[t] + (size_t)(a - J->a0[t]) * J->plane;
+            for (size_t k = 0; k < J->plane; k++) g[k] += p[k];
+        }
+    }
+}
+static void fit_loss2_cpu(cpu_loss *J, double *parts, float *g_delta) {
+    J->g = g_delta;
+    fit_zpar(J->nt, J->nt, cpu_loss_run, J);
+    fit_zpar(J->f->lz, fit_nthreads(J->f->lz), cpu_loss_reduce, J);
+    for (int t = 0; t < J->nt; t++) for (int k = 0; k < FIT_NPARTS; k++) if (k != FIT_P_SMOOTH) parts[k] += J->part[t][k];
+}
+void fit_loss2_host(const fit_dev *f, double *parts, float *g_delta) { cpu_loss J; cpu_loss_setup(&J, f, fit_nthreads(1 << 30)); fit_loss2_cpu(&J, parts, g_delta); cpu_loss_free(&J); }
+typedef struct { const float *v, *wn; float *lap, *g; int lz, ly, lx; float ws, wd; double part[64]; int pass; } cpu_smooth;
+static void cpu_smooth_run(void *ctx, int a0, int a1, int t) {   /* pass 0: the laplacian; pass 1: the gradient and the loss */
+    cpu_smooth *S = ctx; const int ly = S->ly, lx = S->lx; const size_t pl = (size_t)ly * lx; double l = 0;
+    for (int a = a0; a < a1; a++) for (int b = 0; b < ly; b++) for (int c = 0; c < lx; c++) {
+        const size_t i = (size_t)a * pl + (size_t)b * lx + c;
+        if (S->pass == 0) {
+            const float *v = S->v; const float x = v[i]; float s = 0.f;
+            if (a > 0) s += v[i - pl] - x;
+            if (a < S->lz - 1) s += v[i + pl] - x;
+            if (b > 0) s += v[i - lx] - x;
+            if (b < ly - 1) s += v[i + lx] - x;
+            if (c > 0) s += v[i - 1] - x;
+            if (c < lx - 1) s += v[i + 1] - x;
+            S->lap[i] = s; continue;
+        }
+        const float *lap = S->lap, *wn = S->wn;
+#define WL(j_) (wn ? wn[j_] * lap[j_] : lap[j_])
+        int deg = 0; float s = 0.f;
+        if (a > 0) { s += WL(i - pl); deg++; }
+        if (a < S->lz - 1) { s += WL(i + pl); deg++; }
+        if (b > 0) { s += WL(i - lx); deg++; }
+        if (b < ly - 1) { s += WL(i + lx); deg++; }
+        if (c > 0) { s += WL(i - 1); deg++; }
+        if (c < lx - 1) { s += WL(i + 1); deg++; }
+        const float wli = WL(i);
+#undef WL
+        S->g[i] += 2.f * S->ws * (s - deg * wli) + 2.f * S->wd * S->v[i];
+        l += (double)S->ws * wli * lap[i] + (double)S->wd * S->v[i] * S->v[i];
+    }
+    if (S->pass) S->part[t] = l;
+}
+static void fit_smooth_cpu(const float *delta, int lz, int ly, int lx, float ws, float wd, const float *wn, float *lap, double *parts, float *g) {
+    cpu_smooth S = {delta, wn, lap, g, lz, ly, lx, ws, wd, {0}, 0}; const int nt = fit_nthreads(lz);
+    fit_zpar(lz, nt, cpu_smooth_run, &S); S.pass = 1; fit_zpar(lz, nt, cpu_smooth_run, &S);
+    for (int t = 0; t < nt; t++) parts[FIT_P_SMOOTH] += S.part[t];
+}
+typedef struct { float *p, *m, *v; const float *g; size_t n; float lr, b1, b2, eps, c1, c2; } cpu_adam;
+static void cpu_adam_run(void *ctx, int t0, int t1, int t_) {
+    cpu_adam *A = ctx; const size_t i0 = A->n * (size_t)t0 / 64, i1 = A->n * (size_t)t1 / 64;
+    for (size_t i = i0; i < i1; i++) {
+        const float gi = A->g[i], mi = A->m[i] = A->b1 * A->m[i] + (1.f - A->b1) * gi, vi = A->v[i] = A->b2 * A->v[i] + (1.f - A->b2) * gi * gi;
+        A->p[i] -= A->lr * ((mi / A->c1) / (sqrtf(vi / A->c2) + A->eps));
+    }
+}
+static void fit_adam_cpu(float *p, const float *g, float *m, float *v, size_t n, float lr, int step) {   /* nn_adamw, weight decay 0 */
+    cpu_adam A = {p, m, v, g, n, lr, 0.9f, 0.999f, 1e-8f, 1.f - powf(0.9f, (float)step), 1.f - powf(0.999f, (float)step)};
+    fit_zpar(64, fit_nthreads(64), cpu_adam_run, &A);
+}
+/* curvature-adaptive smoothness (fit_cfg bend): per lattice node the dispersion of the sheet normals around it, b = 1 - lambda_max /
+   tr of the material-weighted mean n n^T over the field voxels nearest the node (0 for a plane, larger where the sheets bend or
+   fold within the node's cell), and the node's smoothness weight 1 / (1 + bend 10 b) */
+static float *fit_bend_weights(const fit_fields *f, int L, int lz, int ly, int lx, double bend, int verbose) {
+    const size_t nl = (size_t)lz * ly * lx; double *T = calloc(nl * 7, sizeof(double)); float *wn = malloc(nl * sizeof(float));
+    for (int z = 0; z < f->D; z++) for (int y = 0; y < f->H; y++) for (int x = 0; x < f->W; x++) {
+        const size_t i = ((size_t)z * f->H + y) * f->W + x; if (!f->w[i]) continue;
+        const int a = FIT_IMIN((int)lround((z + 0.5) * f->h / L), lz - 1), b = FIT_IMIN((int)lround((y + 0.5) * f->h / L), ly - 1), c = FIT_IMIN((int)lround((x + 0.5) * f->h / L), lx - 1);
+        double *t = T + 7 * (((size_t)a * ly + b) * lx + c); const double w = f->w[i] / 255.0;
+        for (int k = 0; k < 6; k++) t[k] += w * (f->t[k][i] / 255.0 - (k < 3 ? 0 : 0.5));
+        t[6] += w;
+    }
+    double sb = 0; size_t nb = 0;
+    for (size_t k = 0; k < nl; k++) {
+        const double *t = T + 7 * k; wn[k] = 1.f;
+        if (t[6] <= 0) continue;
+        const double M[3][3] = {{t[0], t[3], t[4]}, {t[3], t[1], t[5]}, {t[4], t[5], t[2]}}, tr = t[0] + t[1] + t[2];
+        if (tr <= 0) continue;
+        double v[3] = {0.577, 0.577, 0.577}, lam = 0;
+        for (int it = 0; it < 32; it++) {
+            double u[3] = {0, 0, 0}; for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) u[a] += M[a][b] * v[b];
+            lam = sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]); if (lam < 1e-12) break; for (int a = 0; a < 3; a++) v[a] = u[a] / lam;
+        }
+        const double bd = fmax(0, 1 - lam / tr); sb += bd; nb++;
+        wn[k] = (float)(1 / (1 + bend * 10 * bd));
+    }
+    if (verbose) fprintf(stderr, "fit: curvature-adaptive smoothness at lattice %d: mean normal dispersion %.4f over %zu nodes\n", L, nb ? sb / nb : 0, nb);
+    free(T);
+    return wn;
+}
+
+/* buffers of the device (GPU) or of the host (CPU backend) */
+static void *fb_alloc(int cpu, size_t n) { return cpu ? calloc(1, n ? n : 4) : nn_malloc(n ? n : 4); }
+static void fb_free(int cpu, void *p) { if (cpu) free(p); else nn_free(p); }
+static void fb_put(int cpu, void *d, const void *s, size_t n) { if (cpu) memcpy(d, s, n); else nn_h2d(d, s, n); }
+static void fb_get(int cpu, void *d, const void *s, size_t n) { if (cpu) memcpy(d, s, n); else nn_d2h(d, s, n); }
+static void fb_zero(int cpu, void *d, size_t n) { if (cpu) memset(d, 0, n); else nn_zero(d, n); }
+
 static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
+    const int cpu = c->cpu;
+    if (cpu && !c->analytic) { fprintf(stderr, "fit: the CPU backend fits the analytic terms only (--analytic 1)\n"); return nullptr; }
+    g_fit_threads = c->threads;
     fit_model *m = calloc(1, sizeof *m);
     m->D = f->D; m->H = f->H; m->W = f->W; m->h = f->h;
     const int na = (int)(f->D * f->h) + 1;
@@ -751,21 +1205,43 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
     } else if (fit_init_prior(f, c, m)) { fit_free(m); return nullptr; }
     const size_t n = (size_t)f->D * f->H * f->W;
     size_t ndata = 0; for (size_t i = 0; i < n; i++) ndata += f->w[i] != 0;
-    uint8_t *dpc = nn_malloc(n), *dps = nn_malloc(n), *dt = nn_malloc(6 * n), *dsp = nn_malloc(n), *dw = nn_malloc(n);
-    nn_h2d(dpc, f->pc, n); nn_h2d(dps, f->ps, n); nn_h2d(dsp, f->sp, n); nn_h2d(dw, f->w, n);
-    for (int k = 0; k < 6; k++) nn_h2d(dt + k * n, f->t[k], n);
-    float *dcy = nn_malloc(na * 4), *dcx = nn_malloc(na * 4);
-    nn_h2d(dcy, f->cy, na * 4); nn_h2d(dcx, f->cx, na * 4);
+    const uint8_t *dpc = f->pc, *dps = f->ps, *dt[6], *dsp = f->sp, *dw = f->w; uint8_t *dfield = nullptr;   /* CPU: the host fields as they are */
+    for (int k = 0; k < 6; k++) dt[k] = f->t[k];
+    if (!cpu) {
+        dfield = nn_malloc(10 * n);
+        nn_h2d(dfield, f->pc, n); nn_h2d(dfield + n, f->ps, n); nn_h2d(dfield + 8 * n, f->sp, n); nn_h2d(dfield + 9 * n, f->w, n);
+        for (int k = 0; k < 6; k++) nn_h2d(dfield + (2 + k) * n, f->t[k], n);
+        dpc = dfield; dps = dfield + n; dsp = dfield + 8 * n; dw = dfield + 9 * n; for (int k = 0; k < 6; k++) dt[k] = dfield + (2 + k) * n;
+    }
+    float *dcy = fb_alloc(cpu, na * 4), *dcx = fb_alloc(cpu, na * 4);
+    fb_put(cpu, dcy, f->cy, na * 4); fb_put(cpu, dcx, f->cx, na * 4);
     const int nk = m->nk;
-    float *dpi = nn_malloc(nk * 4), *dof = nn_malloc(nk * 4), *gpi = nn_malloc(nk * 4), *gof = nn_malloc(nk * 4);
-    float *mpi = nn_malloc(nk * 4), *vpi = nn_malloc(nk * 4), *mof = nn_malloc(nk * 4), *vof = nn_malloc(nk * 4);
-    nn_h2d(dpi, m->pitch, nk * 4); nn_h2d(dof, m->offset, nk * 4);
-    nn_zero(mpi, nk * 4); nn_zero(vpi, nk * 4); nn_zero(mof, nk * 4); nn_zero(vof, nk * 4);
-    double *dparts = (double *)nn_malloc(8 * sizeof(double));   /* total, phase, normal, density, nondeg, smooth, winding mod 4 */
-    uint8_t *dwd = nullptr;   /* the winding mod 4 planes (task unwrap2 fields) */
-    if (f->wd[0] && f->wd[3] && f->w4_d > 0 && c->w_wind4 > 0) {
-        dwd = nn_malloc(4 * n); for (int k = 0; k < 4; k++) nn_h2d(dwd + k * n, f->wd[k], n);
+    float *dpi = fb_alloc(cpu, nk * 4), *dof = fb_alloc(cpu, nk * 4), *gpi = fb_alloc(cpu, nk * 4), *gof = fb_alloc(cpu, nk * 4);
+    float *mpi = fb_alloc(cpu, nk * 4), *vpi = fb_alloc(cpu, nk * 4), *mof = fb_alloc(cpu, nk * 4), *vof = fb_alloc(cpu, nk * 4);
+    fb_put(cpu, dpi, m->pitch, nk * 4); fb_put(cpu, dof, m->offset, nk * 4);
+    fb_zero(cpu, mpi, nk * 4); fb_zero(cpu, vpi, nk * 4); fb_zero(cpu, mof, nk * 4); fb_zero(cpu, vof, nk * 4);
+    double *dparts = fb_alloc(cpu, FIT_NPARTS * sizeof(double));
+    uint8_t *dwd = nullptr, *drec = nullptr;   /* the winding mod 4 planes (dz dy dx dq back to back) and the recto plane, full resolution */
+    if (f->wd[0] && f->wd[1] && f->wd[2] && f->wd[3] && f->w4_d > 0 && c->w_wind4 > 0 && c->analytic) {
+        dwd = fb_alloc(cpu, 4 * n); for (int k = 0; k < 4; k++) fb_put(cpu, dwd + k * n, f->wd[k], n);
         if (c->verbose) fprintf(stderr, "fit: winding mod 4 term (offset %d native voxels, weight %g)\n", f->w4_d, c->w_wind4);
+    }
+    if (f->recto && c->w_recto > 0) {
+        drec = fb_alloc(cpu, n); fb_put(cpu, drec, f->recto, n);
+        if (c->verbose) fprintf(stderr, "fit: recto anchors (weight %g)\n", c->w_recto);
+    }
+    uint8_t *hctm = nullptr, *dctm = nullptr, *dcs = nullptr;   /* the CT parity (host for the flood, device / host for the terms), the CT spacing */
+    if (f->ct && c->w_ct > 0) {
+        const int pr = (int)lround(c->ct_radius_um / (f->h * (c->um > 0 ? c->um : 2.4)));
+        hctm = malloc(n); fit_ct_parity(f->ct, f->D, f->H, f->W, pr, hctm);
+        if (cpu) dctm = hctm; else { dctm = nn_malloc(n); nn_h2d(dctm, hctm, n); }
+        if (c->verbose) { size_t np = 0, nv = 0; for (size_t i = 0; i < n; i++) if (f->w[i] && hctm[i] != 128) { np += hctm[i] > 128; nv += hctm[i] < 128; }
+                          fprintf(stderr, "fit: CT parity (weight %g, (1 - conf)^%g >= %g, papyrus phase %.3f, radius %d cells): %zu papyrus / %zu void cells\n", c->w_ct, c->ct_pow, c->ct_floor, c->ct_phi, pr, np, nv); }
+        if (!cpu && !c->ct_flood) { free(hctm); hctm = nullptr; }   /* on the device only (the flood reads it on the host) */
+    }
+    if (f->cs && c->w_cspacing > 0) {
+        dcs = fb_alloc(cpu, n); fb_put(cpu, dcs, f->cs, n);
+        if (c->verbose) fprintf(stderr, "fit: CT sheet spacing term (weight %g, tolerance %g)\n", c->w_cspacing, c->cs_tol);
     }
     const double norm = ndata ? 1.0 / ndata : 1;
     int kstep = 0;
@@ -775,68 +1251,123 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
         const size_t nl = (size_t)lz * ly * lx;
         float *hd = prolong(m, L, lz, ly, lx, c);
         free(m->delta); m->delta = hd; m->L = L; m->lz = lz; m->ly = ly; m->lx = lx;
-        if (st == c->phase_stage) {   /* the current knots too: W reads them */
-            nn_d2h(m->pitch, dpi, nk * 4); nn_d2h(m->offset, dof, nk * 4);
-            if (c->unwrap_voxels) { const size_t rch = fit_unwrap_voxels(m, f, 0.3, c); if (c->verbose) fprintf(stderr, "fit: voxel unwrapping reached %zu field voxels\n", rch); }
-            else fit_unwrap_init(m, f, 0.3);
+        if (st == c->phase_stage && c->w_phase > 0) {   /* the current knots too: W reads them */
+            fb_get(cpu, m->pitch, dpi, nk * 4); fb_get(cpu, m->offset, dof, nk * 4);
+            const double umc = c->uw_min_conf > 0 ? c->uw_min_conf : 0.3;
+            if (c->unwrap_voxels > 0) {
+                const fit_fields *fu = f; fit_fields fm; uint8_t *mpc = nullptr, *mps = nullptr; double um2 = umc;
+                if (hctm && c->ct_flood) {   /* voxels below the network's floor flood with the CT's phase, after every network voxel */
+                    const double tq = nn_wall_seconds(), qmin = 0.3; size_t nadd = 0;
+                    mpc = malloc(n); mps = malloc(n); fit_ct_phasor(m, f, hctm, c->ct_phi, mpc, mps);
+                    for (size_t i = 0; i < n; i++) {
+                        const double mc = (f->pc[i] - 128) / 127.0, ms = (f->ps[i] - 128) / 127.0;
+                        if (sqrt(mc * mc + ms * ms) >= umc) { mpc[i] = f->pc[i]; mps[i] = f->ps[i]; continue; }
+                        const double cc = (mpc[i] - 128) / 127.0, cs_ = (mps[i] - 128) / 127.0, q = sqrt(cc * cc + cs_ * cs_);
+                        if (q < qmin) { mpc[i] = mps[i] = 128; continue; }
+                        const double sc = 0.999 * umc;   /* below every network voxel: confidence umc x q (q in qmin .. 1) */
+                        mpc[i] = (uint8_t)lround(128 + 127 * cc * sc); mps[i] = (uint8_t)lround(128 + 127 * cs_ * sc); nadd++;
+                    }
+                    fm = *f; fm.pc = mpc; fm.ps = mps; fu = &fm; um2 = umc * qmin * 0.95;
+                    if (c->verbose) fprintf(stderr, "fit: CT phase joins the voxel unwrapping on %zu low-confidence voxels (%.1fs)\n", nadd, nn_wall_seconds() - tq);
+                }
+                const size_t rch = fit_unwrap_voxels(m, fu, um2, c); if (c->verbose) fprintf(stderr, "fit: voxel unwrapping reached %zu field voxels\n", rch);
+                free(mpc); free(mps);
+            }
+            else if (c->unwrap_voxels == 0) fit_unwrap_init(m, f, umc);
         }
-        float *dd = nn_malloc(nl * 4), *gd = nn_malloc(nl * 4), *md = nn_malloc(nl * 4), *vd = nn_malloc(nl * 4), *lap = nn_malloc(nl * 4);
-        nn_h2d(dd, hd, nl * 4); nn_zero(md, nl * 4); nn_zero(vd, nl * 4);
+        float *dd = fb_alloc(cpu, nl * 4), *gd = fb_alloc(cpu, nl * 4), *md = fb_alloc(cpu, nl * 4), *vd = fb_alloc(cpu, nl * 4), *lap = fb_alloc(cpu, nl * 4);
+        fb_put(cpu, dd, hd, nl * 4); fb_zero(cpu, md, nl * 4); fb_zero(cpu, vd, nl * 4);
+        float *dwn = nullptr;   /* curvature-adaptive smoothness weights per lattice node */
+        if (c->bend > 0) { float *hw = fit_bend_weights(f, L, lz, ly, lx, c->bend, c->verbose); dwn = fb_alloc(cpu, nl * 4); fb_put(cpu, dwn, hw, nl * 4); free(hw); }
         int fp = 1; while (st < c->phase_stage && 2 * fp * f->h <= L / 4.0) fp *= 2;   /* gradient-only stages: pooled fields (~4 field voxels per lattice cell) */
-        fit_dev fd = {f->D, f->H, f->W, (float)f->h, dpc, dps, dt, dsp, dw, dcy, dcx, na, m->dir, nk, m->knot_dz, dpi, dof, L, lz, ly, lx, dd,
-                      0, (float)(c->w_normal * norm), (float)(c->w_density * norm), (float)(c->w_nondeg * norm), c->core};
-        uint8_t *pdev = nullptr;
+        fit_dev fd = {f->D, f->H, f->W, (float)f->h, dpc, dps, {dt[0], dt[1], dt[2], dt[3], dt[4], dt[5]}, dsp, dw, dcy, dcx, na, m->dir, nk, m->knot_dz, dpi, dof, L, lz, ly, lx, dd,
+                      0, (float)(c->w_normal * norm), (float)(c->w_density * norm), (float)(c->w_nondeg * norm), c->core, 0, 0u, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, nullptr, nullptr, 0.f, 0.f, nullptr, 0.f, nullptr, 0.f, 1.f, 0.f, 0.f, nullptr, 0.f, 0.25f};
+        fd.phase_robust = c->phase_robust; fd.conf_pow = c->conf_pow > 0 ? c->conf_pow : 1.f;
+        fd.w_pgrad = (float)(c->w_pgrad * norm); fd.pgrad_delta = c->pgrad_delta; fd.pg = nullptr;
+        fd.wd = fp == 1 ? dwd : nullptr; fd.w4_d = (float)f->w4_d; fd.recto = fp == 1 ? drec : nullptr;   /* (pooled stages: neither; their ramp is 0 there anyway) */
+        fd.ctm = fp == 1 ? dctm : nullptr; fd.ct_pow = c->ct_pow; fd.ct_phi = c->ct_phi; fd.ct_floor = c->ct_floor;
+        fd.cs = fp == 1 ? dcs : nullptr; fd.w_cs = (float)(c->w_cspacing * norm); fd.cs_tol = c->cs_tol;
+        uint8_t *pcs = nullptr;   /* the pooled CT spacing (device or host) */
+        float *pgd = nullptr;   /* pooled phase gradients (device or host) */
+        uint8_t *pdev = nullptr, *phost[10] = {0};
         if (fp > 1) {
-            fit_pooled pp = fit_pool(f, fp); const size_t np = (size_t)pp.D * pp.H * pp.W;
+            fit_pooled pp = fit_pool(f, fp, c->w_pgrad > 0); const size_t np = (size_t)pp.D * pp.H * pp.W;
             size_t pdata = 0; for (size_t i = 0; i < np; i++) pdata += pp.a[9][i] != 0;
-            pdev = nn_malloc(10 * np);
-            for (int k = 0; k < 10; k++) nn_h2d(pdev + k * np, pp.a[k], np);
-            for (int k = 0; k < 10; k++) free(pp.a[k]);
+            const uint8_t *pa[10];
+            if (cpu) { for (int k = 0; k < 10; k++) pa[k] = phost[k] = pp.a[k]; }
+            else {
+                pdev = nn_malloc(10 * np);
+                for (int k = 0; k < 10; k++) { nn_h2d(pdev + k * np, pp.a[k], np); pa[k] = pdev + k * np; free(pp.a[k]); }
+            }
             fd.D = pp.D; fd.H = pp.H; fd.W = pp.W; fd.h = (float)(f->h * fp);
-            fd.pc = pdev; fd.ps = pdev + np; fd.t = pdev + 2 * np; fd.sp = pdev + 8 * np; fd.w = pdev + 9 * np;
+            fd.pc = pa[0]; fd.ps = pa[1]; for (int k = 0; k < 6; k++) fd.t[k] = pa[2 + k]; fd.sp = pa[8]; fd.w = pa[9];
             const double pn = pdata ? 1.0 / pdata : 1;
-            fd.w_normal = (float)(c->w_normal * pn); fd.w_density = (float)(c->w_density * pn); fd.w_nondeg = (float)(c->w_nondeg * pn);
+            fd.w_normal = (float)(c->w_normal * pn); fd.w_density = (float)(c->w_density * pn); fd.w_nondeg = (float)(c->w_nondeg * pn); fd.w_pgrad = (float)(c->w_pgrad * pn);
+            if (pp.pg) { pgd = fb_alloc(cpu, 4 * np * sizeof(float)); fb_put(cpu, pgd, pp.pg, 4 * np * sizeof(float)); free(pp.pg); fd.pg = pgd; }
+            if (pp.cs && dcs) { pcs = fb_alloc(cpu, np); fb_put(cpu, pcs, pp.cs, np); fd.cs = pcs; fd.w_cs = (float)(c->w_cspacing * pn); }
+            free(pp.cs);
             if (c->verbose) fprintf(stderr, "fit stage %d: fields pooled by %d (%dx%dx%d)\n", st, fp, pp.D, pp.H, pp.W);
         }
         const float ws = (float)(c->w_smooth / nl), wdec = (float)(c->w_decay / nl);
+        const size_t nvox = (size_t)fd.D * fd.H * fd.W;
+        fd.stride = c->batch > 0 && nvox > (size_t)c->batch ? (int)(nvox / c->batch) : 1;
+        cpu_loss cl; if (cpu) cpu_loss_setup(&cl, &fd, fit_nthreads(1 << 30));
         for (int it = 0; it < c->steps[st]; it++) {
             const double ramp = st < c->phase_stage ? 0 : st == c->phase_stage ? c->phase_ramp + (1 - c->phase_ramp) * (double)it / (c->steps[st] > 1 ? c->steps[st] - 1 : 1) : 1;
             fd.w_phase = (float)(c->w_phase * ramp * norm);
-            fd.wd = fp == 1 && c->analytic ? dwd : nullptr; fd.w_w4 = (float)(c->w_wind4 * ramp * norm); fd.w4_d = (float)f->w4_d;
+            fd.w_w4 = (float)(c->w_wind4 * ramp * norm); fd.w_recto = (float)(c->w_recto * ramp * norm); fd.w_ct = (float)(c->w_ct * ramp * norm);
             fd.packed_sp = c->packed_um > 0 ? (float)(c->packed_um / (c->um > 0 ? c->um : 2.4) * 8.0 / f->h) : 0.f; fd.packed_floor = 0.1f;
-            nn_zero(gd, nl * 4); nn_zero(gpi, nk * 4); nn_zero(gof, nk * 4); nn_zero(dparts, 8 * sizeof(double));
-            if (c->analytic) {   /* random voxel subsets of ~batch per step */
-                const size_t nvox = (size_t)fd.D * fd.H * fd.W;
-                fd.stride = c->batch > 0 && nvox > (size_t)c->batch ? (int)(nvox / c->batch) : 1;
-                fd.salt = (unsigned)(kstep * 2654435761u + 12345u);
-                nn_fit_loss2(&fd, dparts, gd);
-            } else nn_fit_loss(&fd, dparts, gd, gpi, gof);
-            nn_fit_smooth(dd, lz, ly, lx, ws, wdec, lap, dparts, gd);
-            nn_adamw(dd, gd, md, vd, nl, c->lr, 0.9f, 0.999f, 1e-8f, 0.f, it + 1);
-            ++kstep;
-            nn_adamw(dof, gof, mof, vof, nk, c->lr_knot, 0.9f, 0.999f, 1e-8f, 0.f, kstep);
-            nn_adamw(dpi, gpi, mpi, vpi, nk, c->lr_knot * 20.f, 0.9f, 0.999f, 1e-8f, 0.f, kstep);
+            fb_zero(cpu, gd, nl * 4); fb_zero(cpu, gpi, nk * 4); fb_zero(cpu, gof, nk * 4); fb_zero(cpu, dparts, FIT_NPARTS * sizeof(double));
+            fd.salt = (unsigned)(kstep * 2654435761u + 12345u);
+            if (cpu) {
+                fit_loss2_cpu(&cl, dparts, gd);
+                fit_smooth_cpu(dd, lz, ly, lx, ws, wdec, dwn, lap, dparts, gd);
+                fit_adam_cpu(dd, gd, md, vd, nl, c->lr, it + 1);
+                ++kstep;   /* the knots are fixed (analytic terms) */
+            } else {
+                if (c->analytic) nn_fit_loss2(&fd, dparts, gd);   /* random voxel subsets of ~batch per step */
+                else nn_fit_loss(&fd, dparts, gd, gpi, gof);
+                nn_fit_smooth(dd, lz, ly, lx, ws, wdec, dwn, lap, dparts, gd);
+                nn_adamw(dd, gd, md, vd, nl, c->lr, 0.9f, 0.999f, 1e-8f, 0.f, it + 1);
+                ++kstep;
+                nn_adamw(dof, gof, mof, vof, nk, c->lr_knot, 0.9f, 0.999f, 1e-8f, 0.f, kstep);
+                nn_adamw(dpi, gpi, mpi, vpi, nk, c->lr_knot * 20.f, 0.9f, 0.999f, 1e-8f, 0.f, kstep);
+            }
             if (c->verbose && (it == c->steps[st] - 1 || (it + 1) % 100 == 0)) {
-                double p[8]; nn_sync(); nn_d2h(p, dparts, sizeof p);
-                fprintf(stderr, "fit stage %d (lattice %d, %zu nodes) step %d: loss %.5f phase %.5f normal %.5f density %.5f nondeg %.5f smooth %.6f%s",
-                        st, L, nl, it + 1, p[0] + p[5], p[1], p[2], p[3], p[4], p[5], dwd ? "" : "\n");
-                if (dwd) fprintf(stderr, " wind4 %.5f\n", p[6]);
+                double p[FIT_NPARTS]; if (!cpu) nn_sync(); fb_get(cpu, p, dparts, sizeof p);
+                fprintf(stderr, "fit stage %d (lattice %d, %zu nodes) step %d: loss %.5f phase %.5f normal %.5f density %.5f nondeg %.5f pgrad %.5f smooth %.6f",
+                        st, L, nl, it + 1, p[0] + p[6], p[1], p[2], p[3], p[4], p[5], p[6]);
+                if (dwd) fprintf(stderr, " wind4 %.5f", p[FIT_P_WIND4]);
+                if (drec) fprintf(stderr, " recto %.5f", p[FIT_P_RECTO]);
+                if (dctm) fprintf(stderr, " ct %.5f", p[FIT_P_CT]);
+                if (dcs) fprintf(stderr, " cspace %.5f", p[FIT_P_CSPACE]);
+                fprintf(stderr, "\n");
             }
         }
-        nn_sync(); nn_d2h(hd, dd, nl * 4);
-        nn_d2h(m->loss, dparts, 6 * sizeof(double)); m->loss[0] += m->loss[5];
+        if (cpu) cpu_loss_free(&cl); else nn_sync();
+        fb_get(cpu, hd, dd, nl * 4);
+        fb_get(cpu, m->loss, dparts, FIT_NPARTS * sizeof(double)); m->loss[FIT_P_TOTAL] += m->loss[FIT_P_SMOOTH];
         if (c->verbose) fprintf(stderr, "fit stage %d: %.1fs\n", st, nn_wall_seconds() - tst);
-        nn_free(dd); nn_free(gd); nn_free(md); nn_free(vd); nn_free(lap); nn_free(pdev);
+        fb_free(cpu, dd); fb_free(cpu, gd); fb_free(cpu, md); fb_free(cpu, vd); fb_free(cpu, lap); if (dwn) fb_free(cpu, dwn); if (pdev) nn_free(pdev); if (pgd) fb_free(cpu, pgd); if (pcs) fb_free(cpu, pcs);
+        for (int k = 0; k < 10; k++) free(phost[k]);
     }
-    nn_d2h(m->pitch, dpi, nk * 4); nn_d2h(m->offset, dof, nk * 4);
-    nn_free(dpc); nn_free(dps); nn_free(dt); nn_free(dsp); nn_free(dw); nn_free(dcy); nn_free(dcx);
-    nn_free(dpi); nn_free(dof); nn_free(gpi); nn_free(gof); nn_free(mpi); nn_free(vpi); nn_free(mof); nn_free(vof); nn_free(dparts); nn_free(dwd);
+    fb_get(cpu, m->pitch, dpi, nk * 4); fb_get(cpu, m->offset, dof, nk * 4);
+    if (dfield) nn_free(dfield);
+    fb_free(cpu, dcy); fb_free(cpu, dcx);
+    fb_free(cpu, dpi); fb_free(cpu, dof); fb_free(cpu, gpi); fb_free(cpu, gof); fb_free(cpu, mpi); fb_free(cpu, vpi); fb_free(cpu, mof); fb_free(cpu, vof); fb_free(cpu, dparts);
+    if (dwd) fb_free(cpu, dwd);
+    if (drec) fb_free(cpu, drec);
+    if (dctm && !cpu) nn_free(dctm);
+    free(hctm); if (dcs) fb_free(cpu, dcs);
     return m;
 }
 
 /* the direction from the prior's ring vote; when it is ambiguous (|median winding per ring| < 0.5 or too few rings) both
    directions are fitted and the lower final loss wins (a wrong direction cannot fit the phase around the circle) */
 fit_model *fit_run(const fit_fields *f, const fit_cfg *c) {
+    if (c->w_recto > 0 && c->phase_stage < c->nstage && !f->recto) { fprintf(stderr, "fit: --w-recto needs an r plane (r.raw or an r zarr array) on the fit-field grid\n"); return nullptr; }
+    if (c->w_ct > 0 && c->phase_stage < c->nstage && !f->ct) { fprintf(stderr, "fit: --w-ct needs a ct plane (ufsm ct-fields, predict --fit-ct)\n"); return nullptr; }
+    if (c->w_cspacing > 0 && !f->cs && c->verbose) fprintf(stderr, "fit: --w-cspacing: the fields carry no cs plane (term off)\n");
     fit_model *m = fit_run_dir(f, c);
     if (!m || c->dir || m->dir_vote >= 0.5) return m;
     fit_cfg c2 = *c; c2.dir = -m->dir;
@@ -973,36 +1504,73 @@ static int ray_root(ray_ev evr, const void *ctx, const fit_model *m, double z, d
 static double ev_model(const void *m, double z, double y, double x, double r, double th) { return fit_W_rt(m, z, y, x, r, th); }
 int fit_ray_root(const fit_model *m, double z, double theta, double k, double r_hint, double *r) { return ray_root(ev_model, m, m, z, theta, k, r_hint, r); }
 
-static const char *fit_plane_names[14] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w", "dz", "dy", "dx", "dq"};
+/* plane names of fit_fields_buf a[]: the 10 base planes, the winding mod 4 planes, the recto plane */
+static const char *fit_plane_names[17] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w", "dz", "dy", "dx", "dq", "r", "ct", "cs"};
 int fit_fields_save(const char *dir, const long long origin[3], const int shape[3], int h, double um, uint8_t *const a[10], const float *cy, const float *cx, int na) {
     uint8_t *b[14] = {0}; for (int k = 0; k < 10; k++) b[k] = a[k];
-    return fit_fields_save_w4(dir, origin, shape, h, um, b, 0, cy, cx, na);
+    return fit_fields_save_ex(dir, origin, shape, h, um, b, 0, nullptr, cy, cx, na);
 }
 int fit_fields_save_w4(const char *dir, const long long origin[3], const int shape[3], int h, double um, uint8_t *const a[14], int w4_d, const float *cy, const float *cx, int na) {
-    const char *const *nm = fit_plane_names;
+    return fit_fields_save_ex(dir, origin, shape, h, um, a, w4_d, nullptr, cy, cx, na);
+}
+int fit_fields_save_ex(const char *dir, const long long origin[3], const int shape[3], int h, double um, uint8_t *const a[14], int w4_d, const uint8_t *recto,
+                       const float *cy, const float *cx, int na) {
     char path[1400]; snprintf(path, sizeof path, "mkdir -p '%s'", dir); if (system(path)) return -1;
     const size_t nf = (size_t)shape[0] * shape[1] * shape[2];
-    for (int k = 0; k < (w4_d > 0 ? 14 : 10); k++) {
-        snprintf(path, sizeof path, "%s/%s.raw", dir, nm[k]);
-        FILE *f = fopen(path, "wb"); if (!f || fwrite(a[k], 1, nf, f) != nf) { if (f) fclose(f); return -1; } fclose(f);
+    for (int k = 0; k < 15; k++) {
+        const uint8_t *src = k < 14 ? a[k] : recto;
+        if (k >= 10 && k < 14 && w4_d <= 0) continue;
+        if (!src) { if (k < 10 || k == 14) { if (k < 10) return -1; continue; } return -1; }
+        snprintf(path, sizeof path, "%s/%s.raw", dir, fit_plane_names[k]);
+        FILE *f = fopen(path, "wb"); if (!f) return -1;
+        const int bad = fwrite(src, 1, nf, f) != nf, closed = fclose(f); if (bad || closed) return -1;
     }
     snprintf(path, sizeof path, "%s/fields.json", dir);
     FILE *f = fopen(path, "w"); if (!f) return -1;
     fprintf(f, "{\"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.9g, ", origin[0], origin[1], origin[2], shape[0], shape[1], shape[2], h, um);
     if (w4_d > 0) fprintf(f, "\"w4_d\": %d, ", w4_d);
-    fprintf(f, "\"axis\": [");
+    fprintf(f, "\"recto\": %s, \"axis\": [", recto ? "true" : "false");
     for (int z = 0; z < na; z++) fprintf(f, "%s[%.3f, %.3f]", z ? ", " : "", cy[z], cx[z]);
     fprintf(f, "]}\n");
     return fclose(f) ? -1 : 0;
 }
 
+/* a box of a raw uint8 array of shape rs (z y x) at o, n voxels per axis, row by row; 0 on success */
+static int raw_read_box(FILE *f, const long long rs[3], const long long o[3], const int64_t n[3], uint8_t *out) {
+    if (o[1] == 0 && o[2] == 0 && n[1] == rs[1] && n[2] == rs[2]) {   /* whole planes */
+        const size_t plane = (size_t)rs[1] * rs[2];
+        return fseeko(f, (off_t)((size_t)o[0] * plane), SEEK_SET) || fread(out, 1, (size_t)n[0] * plane, f) != (size_t)n[0] * plane;
+    }
+    for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) {
+        const off_t at = (off_t)((((size_t)(o[0] + z) * rs[1]) + (size_t)(o[1] + y)) * rs[2] + (size_t)o[2]);
+        if (fseeko(f, at, SEEK_SET) || fread(out + ((size_t)z * n[1] + y) * n[2], 1, (size_t)n[2], f) != (size_t)n[2]) return -1;
+    }
+    return 0;
+}
+/* the array box of a fields.json: "zarr_offset" (zarr) or "raw_offset" + "raw_shape" (raw arrays larger than the box; absent: the
+   arrays are the box) */
+static void fields_crop(const json *j, int zarr, const int shp[3], long long off[3], long long ashape[3]) {
+    for (int d = 0; d < 3; d++) {
+        off[d] = (long long)json_num(json_at(json_get(j, zarr ? "zarr_offset" : "raw_offset"), d), 0);
+        ashape[d] = zarr ? shp[d] : (long long)json_num(json_at(json_get(j, "raw_shape"), d), shp[d]);
+    }
+}
 static json *read_json_file(const char *path) {
     FILE *f = fopen(path, "rb"); if (!f) return nullptr;
     fseek(f, 0, SEEK_END); const size_t n = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
     char *t = malloc(n + 1); if (fread(t, 1, n, f) != n) { fclose(f); free(t); return nullptr; } fclose(f); t[n] = 0;
     json *j = json_parse(t, n); free(t); return j;
 }
-void fit_fields_free(fit_fields_buf *b) { for (int k = 0; k < 14; k++) free(b->a[k]); free(b->cy); free(b->cx); memset(b, 0, sizeof *b); }
+void fit_fields_free(fit_fields_buf *b) { for (int k = 0; k < 17; k++) free(b->a[k]); free(b->cy); free(b->cx); memset(b, 0, sizeof *b); }
+/* fields.json "core_line" / "core_side": the half-box mask (src/coreline.h); 0 = none */
+static int fields_core(const json *j, coreline *C) {
+    const char *cp = json_str(json_get(j, "core_line"), ""); const int side = (int)json_num(json_get(j, "core_side"), 0);
+    if (!*cp || !side) return 0;
+    if (cl_load(C, cp)) { fprintf(stderr, "fit: cannot load the core line %s\n", cp); return 0; }
+    return side < 0 ? -1 : 1;
+}
+static int g_ct_planes = 3;   /* the CT planes fit_fields_load reads: bit 0 ct, bit 1 cs */
+void fit_fields_ct_planes(int mask) { g_ct_planes = mask; }
 int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b) {
     const char *const *nm = fit_plane_names;
     memset(b, 0, sizeof *b);
@@ -1011,8 +1579,29 @@ int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf 
     int shp[3]; long long org[3];
     for (int d = 0; d < 3; d++) { org[d] = (long long)json_num(json_at(json_get(j, "origin"), d), 0); shp[d] = (int)json_num(json_at(json_get(j, "shape"), d), 0); }
     const int h = (int)json_num(json_get(j, "h"), 8), zarr = !strcmp(json_str(json_get(j, "format"), "raw"), "zarr");
+    long long zoff[3], rsh[3];   /* "zarr_offset" / "raw_offset" [z, y, x] cells: the box corner inside larger arrays (shape = the box) */
+    fields_crop(j, zarr, shp, zoff, rsh);
     b->um = json_num(json_get(j, "um"), 2.4);
-    const int w4_d = (int)json_num(json_get(j, "w4_d"), 0), NK = w4_d > 0 && pool == 1 ? 14 : 10;   /* the winding mod 4 planes: unpooled reads only */
+    /* the optional planes, unpooled loads only: winding mod 4 (fields.json "w4_d" > 0) and recto ("recto": true requires the r plane,
+       false ignores a stale one, absent: used when present) */
+    const int w4_d = (int)json_num(json_get(j, "w4_d"), 0);
+    const json *jr = json_get(j, "recto"); const int want_recto = !jr ? -1 : (jr->type == J_BOOL || jr->type == J_NUM) ? (jr->num != 0) : -1;
+    int act[17], nact = 0, boxraw[17] = {0}; for (int k = 0; k < 10; k++) act[nact++] = k;
+    if (pool == 1 && w4_d > 0) for (int k = 10; k < 14; k++) act[nact++] = k;
+    if (pool == 1 && want_recto != 0) {
+        snprintf(path, sizeof path, zarr ? "%s/r/zarr.json" : "%s/r.raw", dir);
+        const int exists = access(path, F_OK) == 0;
+        if (want_recto > 0 && !exists) { fprintf(stderr, "fit: missing declared recto field %s\n", path); json_free(j); return -1; }
+        if (exists) act[nact++] = 14;
+    }
+    for (int k = 15; k < 17 && pool == 1; k++) {
+        if (!(g_ct_planes >> (k - 15) & 1)) continue;   /* (fit_fields_ct_planes: not wanted) */   /* the CT planes: zarr arrays beside the others (predict --fit-zarr --fit-ct), else box-shaped raw
+                                                     files (ufsm ct-fields, predict --fit-fields --fit-ct) */
+        snprintf(path, sizeof path, "%s/%s/zarr.json", dir, nm[k]);
+        if (zarr && access(path, F_OK) == 0) { act[nact++] = k; continue; }
+        snprintf(path, sizeof path, "%s/%s.raw", dir, nm[k]);
+        if (access(path, F_OK) == 0) { act[nact++] = k; boxraw[k] = 1; }
+    }
     if (fz1 <= 0 || fz1 > shp[0]) fz1 = shp[0];
     if (fz0 < 0) fz0 = 0;
     if (pool == 0) {   /* the geometry and the whole axis table only */
@@ -1021,11 +1610,12 @@ int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf 
         for (int z = 0; z < na; z++) { const int zi = z < nat ? z : nat - 1; b->cy[z] = (float)json_num(json_at(json_at(axj, zi), 0), 0); b->cx[z] = (float)json_num(json_at(json_at(axj, zi), 1), 0); }
         json_free(j);
         b->h = h; for (int d = 0; d < 3; d++) { b->shape[d] = shp[d]; b->origin[d] = org[d]; }
-        b->f = (fit_fields){shp[0], shp[1], shp[2], (double)h, nullptr, nullptr, {0}, nullptr, nullptr, b->cy, b->cx};
+        b->f = (fit_fields){shp[0], shp[1], shp[2], (double)h, nullptr, nullptr, {0}, nullptr, nullptr, b->cy, b->cx, {0}, 0, nullptr, nullptr, nullptr};
         return 0;
     }
     if (fz0 >= fz1 || pool < 1) { json_free(j); return -1; }
     const json *axj = json_get(j, "axis"); const int nat = axj ? (int)axj->n : 0;
+    coreline core = {0}; const int cside = fields_core(j, &core);
     const int D = fz1 - fz0, H = shp[1], W = shp[2], Dp = (D + pool - 1) / pool, Hp = (H + pool - 1) / pool, Wp = (W + pool - 1) / pool;
     const int na = (int)((double)Dp * pool * h) + 1;   /* the slab's axis table (native z from fz0 h) */
     b->cy = malloc(na * sizeof(float)); b->cx = malloc(na * sizeof(float));
@@ -1035,34 +1625,43 @@ int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf 
     }
     json_free(j);
     const size_t np = (size_t)Dp * Hp * Wp, plane = (size_t)H * W;
-    for (int k = 0; k < NK; k++) b->a[k] = calloc(np, 1);
+    for (int q = 0; q < nact; q++) b->a[act[q]] = calloc(np, 1);
     /* read in z-blocks of `pool` rows (or 64 when not pooling), pool each block into the output rows */
     const int zb = pool > 1 ? pool : 64;
-    uint8_t *blk[14] = {0}; for (int k = 0; k < NK; k++) blk[k] = malloc((size_t)zb * plane);
-    z3 *za[14] = {0}; FILE *fr[14] = {0};
-    for (int k = 0; k < NK; k++) {
-        if (zarr) { snprintf(path, sizeof path, "%s/%s", dir, nm[k]); za[k] = z3_open(store_open(dir), nm[k], nullptr); }
+    uint8_t *blk[17] = {0}; for (int q = 0; q < nact; q++) blk[act[q]] = malloc((size_t)zb * plane);
+    z3 *za[17] = {0}; FILE *fr[17] = {0};
+    for (int q = 0; q < nact; q++) {
+        const int k = act[q];
+        if (zarr && !boxraw[k]) { snprintf(path, sizeof path, "%s/%s", dir, nm[k]); za[k] = z3_open(store_open(dir), nm[k], nullptr); }
         else { snprintf(path, sizeof path, "%s/%s.raw", dir, nm[k]); fr[k] = fopen(path, "rb"); }
-        if ((zarr && !za[k]) || (!zarr && !fr[k])) { fprintf(stderr, "fit: cannot open %s\n", path); return -1; }
+        if (!za[k] && !fr[k]) { fprintf(stderr, "fit: cannot open %s\n", path); return -1; }
     }
     fit_fields src = {0}; src.h = h;
     for (int z0 = fz0; z0 < fz1; z0 += zb) {
         const int nz = z0 + zb <= fz1 ? zb : fz1 - z0;
-        for (int k = 0; k < NK; k++) {
-            if (zarr) { const int64_t o[3] = {z0, 0, 0}, n[3] = {nz, H, W}; if (z3_read(za[k], o, n, blk[k], 8)) { fprintf(stderr, "fit: %s\n", z3_error()); return -1; } }
-            else if (fseek(fr[k], (long)((size_t)z0 * plane), SEEK_SET) || fread(blk[k], 1, (size_t)nz * plane, fr[k]) != (size_t)nz * plane) { fprintf(stderr, "fit: short read\n"); return -1; }
+        for (int q = 0; q < nact; q++) {
+            const int k = act[q];
+            if (za[k]) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read(za[k], o, n, blk[k], 8)) { fprintf(stderr, "fit: %s\n", z3_error()); return -1; } }
+            else if (boxraw[k]) { const long long bs[3] = {shp[0], shp[1], shp[2]}, o[3] = {z0, 0, 0}; const int64_t n[3] = {nz, H, W};
+                   if (raw_read_box(fr[k], bs, o, n, blk[k])) { fprintf(stderr, "fit: short read of %s\n", nm[k]); return -1; } }
+            else { const long long o[3] = {z0 + zoff[0], zoff[1], zoff[2]}; const int64_t n[3] = {nz, H, W};
+                   if (raw_read_box(fr[k], rsh, o, n, blk[k])) { fprintf(stderr, "fit: short read\n"); return -1; } }
         }
-        if (pool == 1) { for (int k = 0; k < NK; k++) memcpy(b->a[k] + (size_t)(z0 - fz0) * plane, blk[k], (size_t)nz * plane); continue; }
+        if (cside) cl_mask_block(&core, cside, org, h, b->um, z0, nz, H, W, blk[0], blk[1], blk[9]);   /* the other side of the core: no data */
+        if (pool == 1) { for (int q = 0; q < nact; q++) memcpy(b->a[act[q]] + (size_t)(z0 - fz0) * plane, blk[act[q]], (size_t)nz * plane); continue; }
         src.D = nz; src.H = H; src.W = W; src.pc = blk[0]; src.ps = blk[1]; for (int t = 0; t < 6; t++) src.t[t] = blk[2 + t]; src.sp = blk[8]; src.w = blk[9];
-        fit_pooled pp = fit_pool(&src, pool);   /* one output row */
+        fit_pooled pp = fit_pool(&src, pool, 0);   /* one output row */
         const int zo = (z0 - fz0) / pool;
         for (int k = 0; k < 10; k++) { memcpy(b->a[k] + (size_t)zo * Hp * Wp, pp.a[k], (size_t)pp.H * pp.W); free(pp.a[k]); }
+        free(pp.cs); free(pp.pg);
     }
-    for (int k = 0; k < NK; k++) { free(blk[k]); if (za[k]) z3_close(za[k]); if (fr[k]) fclose(fr[k]); }
+    for (int k = 0; k < 17; k++) { free(blk[k]); if (za[k]) z3_close(za[k]); if (fr[k]) fclose(fr[k]); }
+    if (cside) cl_free(&core);
     b->h = h * pool; b->shape[0] = Dp; b->shape[1] = Hp; b->shape[2] = Wp;
     b->origin[0] = org[0] + (long long)fz0 * h; b->origin[1] = org[1]; b->origin[2] = org[2];
-    b->f = (fit_fields){Dp, Hp, Wp, (double)b->h, b->a[0], b->a[1], {b->a[2], b->a[3], b->a[4], b->a[5], b->a[6], b->a[7]}, b->a[8], b->a[9], b->cy, b->cx};
-    if (NK == 14) { for (int k = 0; k < 4; k++) b->f.wd[k] = b->a[10 + k]; b->f.w4_d = w4_d; }
+    b->f = (fit_fields){Dp, Hp, Wp, (double)b->h, b->a[0], b->a[1], {b->a[2], b->a[3], b->a[4], b->a[5], b->a[6], b->a[7]}, b->a[8], b->a[9], b->cy, b->cx, {0}, 0, nullptr, nullptr, nullptr};
+    if (b->a[10]) { for (int k = 0; k < 4; k++) b->f.wd[k] = b->a[10 + k]; b->f.w4_d = w4_d; }
+    b->f.recto = b->a[14]; b->f.ct = b->a[15]; b->f.cs = b->a[16];
     return 0;
 }
 
@@ -1093,6 +1692,22 @@ static double ev_set(const void *sv, double z, double y, double x, double r, dou
         return slab_W_rt(s, k, z, y, x, r, th);
     }
     return fit_W_rt(s->global, z, y, x, r, th);
+}
+double fit_set_gradW(const fit_set *s, double z, double y, double x, double e, double g[3]) {
+    const fit_model *m = s->global; const int na = (int)(m->D * m->h) + 1;
+    const double th0 = atan2(y - axis_lerp(m->cy, na, z), x - axis_lerp(m->cx, na, z));
+    double l2 = 0;
+    for (int d = 0; d < 3; d++) {
+        double Wv[2];
+        for (int k = 0; k < 2; k++) {
+            const double sg = k ? e : -e, pz = z + (d == 0 ? sg : 0), py = y + (d == 1 ? sg : 0), px = x + (d == 2 ? sg : 0);
+            const double dy = py - axis_lerp(m->cy, na, pz), dx = px - axis_lerp(m->cx, na, pz);
+            double th = atan2(dy, dx) - th0; th -= 2 * M_PI * floor((th + M_PI) / (2 * M_PI));
+            Wv[k] = ev_set(s, pz, py, px, hypot(dy, dx), th0 + th);
+        }
+        g[d] = (Wv[1] - Wv[0]) / (2 * e); l2 += g[d] * g[d];
+    }
+    return sqrt(l2);
 }
 int fit_set_ray_root(const fit_set *s, double z, double theta, double k, double r_hint, double *r) { return ray_root(ev_set, s, s->global, z, theta, k, r_hint, r); }
 int fit_set_save(const fit_set *s, const char *dir) {
@@ -1177,6 +1792,8 @@ fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap)
     if (c->verbose) fprintf(stderr, "fit slabs: prior dir %+d (vote %.2f), pitch %.1f..%.1f over %d knots\n", P.dir, vote, P.pitch[0], P.pitch[P.nk - 1], P.nk);
     fit_cfg cg = *c; cg.nstage = 3; cg.lattice[0] = fit_scale_L(512, fu); cg.lattice[1] = fit_scale_L(256, fu); cg.lattice[2] = fit_scale_L(128, fu); cg.phase_stage = 3; cg.init = &P; cg.init_off[0] = cg.init_off[1] = cg.init_off[2] = 0; cg.dir = P.dir;
     for (int k = 0; k < 3; k++) cg.steps[k] = c->steps[0];
+    cg.w_recto = 0;   /* pooled fields carry no recto plane (the slabs fit the anchors) */
+    cg.w_ct = 0;      /* nor CT planes (the slabs fit them) */
     if (c->verbose) fprintf(stderr, "fit slabs: global coarse fit on fields pooled by %d (%dx%dx%d, h %d)\n", pool, all.shape[0], all.shape[1], all.shape[2], all.h);
     fit_set *s = calloc(1, sizeof *s); s->blend = overlap / 2.0;
     s->global = fit_run(&all.f, &cg);
@@ -1272,26 +1889,55 @@ int fit_set_grid(fit_set_dev *g, const fit_set *s, const double o[3], const int6
     return 0;
 }
 
+/* fit_set_grid on the CPU: threads over the z rows; mask (optional, laid out as out): only points whose mask value is 1..252 (a band
+   code) are evaluated, the others are left 0 */
+typedef struct { const fit_set *s; const double *o; const int64_t *n; double step; int with_theta; const uint8_t *mask; float *out; } grid_cpu_job;
+static void grid_cpu_rows(void *ctx, int z0, int z1, int t_) {
+    const grid_cpu_job *J = ctx; const fit_model *g = J->s->global; const int na = (int)(g->D * g->h) + 1;
+    for (int a = z0; a < z1; a++) {
+        const double z = J->o[0] + (a + 0.5) * J->step, cy = axis_lerp(g->cy, na, z), cx = axis_lerp(g->cx, na, z);
+        for (int64_t b = 0; b < J->n[1]; b++) for (int64_t c = 0; c < J->n[2]; c++) {
+            const size_t i = ((size_t)a * J->n[1] + b) * J->n[2] + c;
+            if (J->mask && (J->mask[i] < 1 || J->mask[i] > 252)) { J->out[i] = 0; continue; }
+            const double y = J->o[1] + (b + 0.5) * J->step, x = J->o[2] + (c + 0.5) * J->step;
+            double W = fit_set_W(J->s, z, y, x);
+            if (J->with_theta) W += g->dir * atan2(y - cy, x - cx) / (2 * M_PI);
+            J->out[i] = (float)W;
+        }
+    }
+}
+int fit_set_grid_cpu(const fit_set *s, const double o[3], const int64_t n[3], double step, int with_theta, const uint8_t *mask, float *out) {
+    if (n[0] <= 0 || n[1] <= 0 || n[2] <= 0) return 0;
+    grid_cpu_job J = {s, o, n, step, with_theta, mask, out};
+    fit_zpar((int)n[0], fit_nthreads((int)n[0]), grid_cpu_rows, &J);
+    return 0;
+}
+
 /* one field array (name: pc ps t0..t5 sp w) of a fit-field directory, max-pooled by pool per axis (raw or zarr; read in z-blocks) */
 uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[3]) {
     fit_fields_buf g; if (fit_fields_load(dir, 0, 0, 0, &g)) return nullptr;
     const int D = g.shape[0], H = g.shape[1], W = g.shape[2], Dp = (D + pool - 1) / pool, Hp = (H + pool - 1) / pool, Wp = (W + pool - 1) / pool;
     char p[1400]; snprintf(p, sizeof p, "%s/fields.json", dir); json *j = read_json_file(p);
-    const int zarr = j && !strcmp(json_str(json_get(j, "format"), "raw"), "zarr"); json_free(j); fit_fields_free(&g);
+    const int zarr = j && !strcmp(json_str(json_get(j, "format"), "raw"), "zarr"); long long zoff[3] = {0, 0, 0}, rsh[3] = {D, H, W};
+    if (j) fields_crop(j, zarr, (const int[3]){D, H, W}, zoff, rsh);
+    coreline core = {0}; const int ismask = !strcmp(name, "w") || !strcmp(name, "pc") || !strcmp(name, "ps"), cside = j && ismask ? fields_core(j, &core) : 0;
+    const long long gorg[3] = {g.origin[0], g.origin[1], g.origin[2]}; const double gum = g.um, gh = g.h;
+    json_free(j); fit_fields_free(&g);
     z3 *za = nullptr; FILE *fr = nullptr;
     if (zarr) za = z3_open(store_open(dir), name, nullptr); else { snprintf(p, sizeof p, "%s/%s.raw", dir, name); fr = fopen(p, "rb"); }
     if (!za && !fr) return nullptr;
     uint8_t *out = calloc((size_t)Dp * Hp * Wp, 1), *blk = malloc((size_t)pool * H * W);
     for (int z0 = 0; z0 < D; z0 += pool) {
         const int nz = z0 + pool <= D ? pool : D - z0;
-        if (za) { const int64_t o[3] = {z0, 0, 0}, n[3] = {nz, H, W}; if (z3_read(za, o, n, blk, 8)) { free(out); out = nullptr; break; } }
-        else if (fseek(fr, (long)((size_t)z0 * H * W), SEEK_SET) || fread(blk, 1, (size_t)nz * H * W, fr) != (size_t)nz * H * W) { free(out); out = nullptr; break; }
+        if (za) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read(za, o, n, blk, 8)) { free(out); out = nullptr; break; } }
+        else { const long long o[3] = {z0 + zoff[0], zoff[1], zoff[2]}; const int64_t n[3] = {nz, H, W}; if (raw_read_box(fr, rsh, o, n, blk)) { free(out); out = nullptr; break; } }
+        if (cside) cl_mask_block(&core, cside, gorg, gh, gum, z0, nz, H, W, name[0] == 'p' ? blk : nullptr, nullptr, name[0] == 'w' ? blk : nullptr);
         uint8_t *o = out + (size_t)(z0 / pool) * Hp * Wp;
         for (int a = 0; a < nz; a++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
             const uint8_t v = blk[((size_t)a * H + y) * W + x]; uint8_t *d = &o[(size_t)(y / pool) * Wp + x / pool]; if (v > *d) *d = v;
         }
     }
-    free(blk); if (za) z3_close(za); if (fr) fclose(fr);
+    free(blk); if (za) z3_close(za); if (fr) fclose(fr); if (cside) cl_free(&core);
     if (out) { shape[0] = Dp; shape[1] = Hp; shape[2] = Wp; }
     return out;
 }

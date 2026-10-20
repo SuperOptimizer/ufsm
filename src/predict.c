@@ -13,6 +13,7 @@
 #include "store.h"
 #include "unet.h"
 #include "fit.h"
+#include "tta.h"
 #include "sweep.h"
 #include "z3w.h"
 #include "zarr3.h"
@@ -121,9 +122,13 @@ static void fit_finalize(const float *acc, size_t nf, int h, uint8_t *const a[10
         if (rho > 0) { const float v = 8.f / (h * rho); a[8][i] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lroundf(v)); }
     }
 }
-static const char *ffz_names[14] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w", "dz", "dy", "dx", "dq"};
-static const int ffz_fill[14] = {128, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-static int ffz_np = 10;   /* fit-field planes written: 10, 14 with the winding mod 4 planes of a task unwrap2 checkpoint (src/fit.h fit_fields.wd) */
+/* --fit-zarr planes: task unwrap 11 (pc .. w, then the recto plane r), task unwrap2 14 (pc .. w, then the winding mod 4 planes dz dy
+   dx dq: no recto head); with --fit-ct the CT planes ct and cs after them (the fitter loads planes by name) */
+enum { FFZ_MAXP = 16 };
+static const char *ffz_names[FFZ_MAXP] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w", "r"};
+static int ffz_np = 11;   /* the planes written */
+static int ffz_nb = 11;   /* the planes before ct / cs */
+static const int ffz_fill[FFZ_MAXP] = {128, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 /* --fit-zarr: write the slab buffer's field shards (z index fsz) of every array */
 /* host field slab slab (FZ cells in z from slab FZ, FZ a multiple of the field shard FS; planes past F[0] not held) -> its rows of
    shards, the shards compressed and written on threads (a 128^3 field shard is one chunk, so z3w_write_shard alone is one thread:
@@ -147,7 +152,7 @@ static void *ffz_worker(void *a) {   /* jobs: (array k, field-shard row (q, fsy)
 }
 /* field-shard rows (q, fsy) of the slab in [q0, q1) x [y0, y1) not yet written (done: [FZ / FS][ny] per slab, marked here); reset:
    the slab is left (its buffers back to the fill values, done cleared) */
-static int ffz_flush(z3w *const zw[10], uint8_t *const sl[10], int64_t slab, const int F[3], int FS, int FZ, int q0, int q1, int y0, int y1, uint8_t *done, int reset,
+static int ffz_flush(z3w *const zw[FFZ_MAXP], uint8_t *const sl[FFZ_MAXP], int64_t slab, const int F[3], int FS, int FZ, int q0, int q1, int y0, int y1, uint8_t *done, int reset,
                      int ntmax) {   /* ntmax: compression threads (0: every CPU) */
     const int ny = (F[1] + FS - 1) / FS;
     int nq = 0; for (int q = 0; q < FZ / FS; q++) if ((slab * (FZ / FS) + q) * FS < F[0]) nq = q + 1;
@@ -172,7 +177,7 @@ static int ffz_flush(z3w *const zw[10], uint8_t *const sl[10], int64_t slab, con
     return 0;
 }
 
-/* --fit-zarr host side off the main thread: per window chunk the device fields (10 B per cell, 1.3 GB for a 512^3 interior at
+/* --fit-zarr host side off the main thread: per window chunk the device fields (11 B per cell, 1.5 GB for a 512^3 interior at
    --fit-h 1) go to pinned memory on the offload stream; one thread waits for each copy, scatters it into the slab buffers and
    flushes slabs in queue order (both used to run on the main thread while the GPU idled). Two staging buffers. */
 typedef struct { int kind, b, c1, c2, nz, ny, nx; int64_t cz, slab; size_t nl; int q0, q1, y0, y1; } ffw_job;   /* kind 0: chunk copy, 1: slab flush (the rows
@@ -385,6 +390,20 @@ static void psplit_job(int side, void *arg) {
     if (J->kss == 1 && cur >= 0 && any) psplit_flush(J, side, sz, sy, sx);
 }
 
+/* predict --tta: one augmented pass of a window (src/tta.h): the saved CT window through T into the network's input buffer, the
+   mirrored axis rows, the forward, the logits back through T (in place); returns them */
+typedef struct { unet *u; uint8_t *ctd; const uint8_t *ctsave; float mean, isd; const float *dyo, *dxo; float *dyt, *dyd; int axis; shape5 xs; int h16, D, W, nch, ch_normal; } tta_ctx;
+static const float *tta_pass(const tta_ctx *T, int code) {
+    nn_tta_ct(T->ctsave, T->ctd, T->D, T->W, code);
+    tta_axis(code, T->D, T->W, T->dyo, T->dxo, T->dyt, T->dyt + T->W);
+    nn_h2d(T->dyd, T->dyt, 2 * (size_t)T->W * sizeof(float));
+    const float *lg = unet_forward_ct(T->u, T->ctd, T->mean, T->isd, T->dyd, T->dyd + T->W, T->axis, T->xs, T->h16);
+    const int lh = unet_logits_h16(T->u); nn_set_logits_h16(lh);
+    int src[32], sgn[32]; tta_channels(code, T->ch_normal, T->nch, src, sgn);
+    nn_tta_logits((void *)lg, lh, T->D, T->W, code, T->nch, src, sgn);
+    return lg;
+}
+
 int cmd_predict(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window W] [--act-mx8 1]\n"
@@ -399,8 +418,10 @@ int cmd_predict(int argc, char **argv) {
                         "       [--split z --gpus 0,1]   both GPUs on every window, one z half each (window a multiple of 2^levels; default window shard + 128, halo 64)\n"
                         "       [--channel 0]   output channel written (band_affinity checkpoints: 1..6 = affinities z1 y1 x1 z8 y8 x8)\n"
                         "       [--fit-fields DIR] [--fit-h 8]   task unwrap checkpoints: also the winding fitter's input fields of the box (ufsm fit DIR)\n"
-                        "       [--fit-w4-d 32]   task unwrap2 checkpoints: the winding mod 4 relative planes dz dy dx dq over this many voxels (<= the halos)\n"
                         "       [--fit-zarr DIR]                 the same fields as zarr arrays, flushed slab by slab (whole volumes)\n"
+                        "       [--tta K]   the fit fields averaged over K window symmetries (z / y / x flips, y <-> x swap; 1..12, src/tta.h)\n"
+                        "       [--fit-w4-d 32]   task unwrap2 checkpoints: the winding mod 4 relative planes dz dy dx dq over this many voxels (<= the halos)\n"
+                        "       [--fit-ct 1]                     with them the CT planes ct / cs (fit --w-ct / --w-cspacing; ufsm ct-fields adds them later)\n"
                         "       [--radial-sign 1|-1]   -1 reverses the direction input (the CT is unchanged): a recto model then marks the verso face\n"
                         "       [--gn-save FILE]   pool the GroupNorm statistics of every window processed into FILE (calibration)\n"
                         "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n"
@@ -415,8 +436,6 @@ int cmd_predict(int argc, char **argv) {
         return 2;
     }
     const char *ckpt = argv[2], *root = argv[3], *key = argv[4], *out = argv[5];
-    { int restore_checkpoint(const char *path, int *split, double *fine_um); int restore_predict(int argc, char **argv);   /* src/restore_cli.c */
-      if (restore_checkpoint(ckpt, nullptr, nullptr)) return restore_predict(argc, argv); }   /* task restore: the SR path */
     double um = atof(opt(argc, argv, "--um", "0"));
     int level = atoi(opt(argc, argv, "--level", "0")), W = atoi(opt(argc, argv, "--window", "288")), halo = atoi(opt(argc, argv, "--halo", "8"));
     int shard = atoi(opt(argc, argv, "--shard", "512")), gpu = atoi(opt(argc, argv, "--gpu", "0")), nlev = atoi(opt(argc, argv, "--levels", "4"));
@@ -446,12 +465,21 @@ int cmd_predict(int argc, char **argv) {
        window's interior pooled on the device into the winding fitter's fields (h native voxels per field voxel, --fit-h 8) of the
        box, written to DIR at the end (src/fit.h fit_fields_save). One GPU, the CT window in its own buffer (no aliasing). */
     const char *ffd = opt(argc, argv, "--fit-fields", nullptr); const int ffh = atoi(opt(argc, argv, "--fit-h", "8"));
-    const char *ffz = opt(argc, argv, "--fit-zarr", nullptr);   /* the same fields of a whole volume: 10 uint8 zarr arrays, flushed slab by slab */
+    const char *ffz = opt(argc, argv, "--fit-zarr", nullptr);   /* the same fields of a whole volume: 11 uint8 zarr arrays, flushed slab by slab */
     if (ffd && ffz) { fprintf(stderr, "predict: --fit-fields or --fit-zarr\n"); return 2; }
     if ((ffd || ffz) && (ffh < 1 || ffh > 32)) { fprintf(stderr, "--fit-h 1..32\n"); return 2; }   /* (inference aliasing stays on: the fit pooling reads
                                                                                                        the material mask from the CT bit plane; it was off: ~80 instead of ~45 B per window voxel) */
     if (ffz) ffd = ffz;   /* the shared checks and settings below */
+    /* --fit-ct 1: also the CT planes ct (mean CT per cell) and cs (CT sheet spacing: papyrus peaks along the network normal, src/fit_terms.h
+       fit_ct_spacing) for fit --w-ct / --w-cspacing; the CT window is copied before the forward when the network aliases it */
+    const int ffct = atoi(opt(argc, argv, "--fit-ct", "0")) != 0;
+    if (ffct && !ffd) { fprintf(stderr, "predict: --fit-ct needs --fit-fields or --fit-zarr\n"); return 2; }
+    const int ffna = ffct ? 14 : 12;   /* accumulator planes */
     const int ffzm = ffz != nullptr;
+    /* --tta K: the fit fields averaged over K window symmetries (src/tta.h; identity first); the probability output is the last pass */
+    const int tta = atoi(opt(argc, argv, "--tta", "1"));
+    if (tta < 1 || tta > TTA_MAX || (tta > 1 && !ffd)) { fprintf(stderr, "predict: --tta 1..%d, with --fit-fields / --fit-zarr\n", TTA_MAX); return 2; }
+    if (tta > 1 && ffct) { fprintf(stderr, "predict: --tta with --fit-ct is not supported (the CT planes pool one pass); add them later with ufsm ct-fields\n"); return 2; }
     float q = (float)atof(opt(argc, argv, "--q", "8"));
     const int iso = atoi(opt(argc, argv, "--iso", "0"));   /* the void cutoff: probability outputs 0 where CT < iso (the fit keeps CT > 0) */
     if (iso < 0 || iso > 255) { fprintf(stderr, "--iso: 0..255\n"); return 2; }
@@ -493,12 +521,12 @@ int cmd_predict(int argc, char **argv) {
     const char *sweep_out = opt(argc, argv, "--cond-sweep", nullptr);   /* train --cond checkpoints: conditioned inference (src/sweep.h) */
     if (sweep_out && (cfg.cin != 7 || cfg.cout < 15 || half || sheet_task || ffd)) { fprintf(stderr, "predict: --cond-sweep needs a train --cond checkpoint (7 inputs, 15 outputs), no --fit-fields\n"); return 2; }
     if (ffd && (cfg.cout < 11 || half || sheet_task)) { fprintf(stderr, "predict: --fit-fields needs a task unwrap checkpoint (11+ outputs) at full resolution\n"); return 2; }
-    float ffds = 32.f; int ffdc = 0;   /* the checkpoint's density code: min(1, density_scale rho), or x / (1 + x) (density_code 1) */
     /* the head layout: task unwrap (recto 0, ink 1, phase 2-3, normal 4-9, density 10) or unwrap2 (phase 0-1, normal 2-7, density 8,
        winding mod 4 9-10: no recto; the winding mod 4 pooled into the relative planes dz dy dx dq over --fit-w4-d voxels) */
     const int ffu2 = ffd && checkpoint_unwrap_version(ckpt) == 2;
     const int ff_rec = ffu2 ? -1 : 0, ff_ph = ffu2 ? 0 : 2, ff_nrm = ffu2 ? 2 : 4, ff_den = ffu2 ? 8 : 10, ff_w4 = ffu2 ? 9 : -1;
     int ffw4d = ffu2 ? atoi(opt(argc, argv, "--fit-w4-d", "32")) : 0;
+    float ffds = 32.f; int ffdc = 0;   /* the checkpoint's density code: min(1, density_scale rho), or x / (1 + x) (density_code 1) */
     if (ffd) { FILE *cf = fopen(ckpt, "rb"); char *hb = malloc(1 << 16); size_t nr = cf ? fread(hb, 1, (1 << 16) - 1, cf) : 0; if (cf) fclose(cf); hb[nr] = 0;
                char *e = memchr(hb, '\n', nr); if (e) *e = 0; const char *q = strstr(hb, "\"density_scale\":"); if (q) ffds = (float)atof(q + 16);
                q = strstr(hb, "\"density_code\":"); if (q) ffdc = atoi(q + 15); free(hb); }
@@ -727,7 +755,7 @@ int cmd_predict(int argc, char **argv) {
     /* the 16-bit input in the network's shared a1 scratch when it has one (free until the stem conv, after the input conversion) */
     unet_build(u, xn, 0);
     const int ct_stem = unet_ct_stem(u);   /* unet_forward_ct: no 16-bit input */
-    uint8_t *ctd = nullptr; uint32_t *ctm = nullptr, *ctmi = nullptr; void *xd = nullptr; int ct_shared = 0, xd_shared = 0;
+    uint8_t *ctd = nullptr, *ctcp = nullptr; uint32_t *ctm = nullptr, *ctmi = nullptr; void *xd = nullptr; int ct_shared = 0, xd_shared = 0;
     pjob_t J = {0};
     split_ctx *sctx = nullptr;
     if (split) {   /* per GPU: the network on its half, the CT half in its scratch, the mask bits, a device shard */
@@ -752,6 +780,7 @@ int cmd_predict(int argc, char **argv) {
         ctd = gpath && !sheet_task ? unet_input_scratch2(u, w3) : nullptr;
         ct_shared = ctd != nullptr;
         if (!ctd) ctd = nn_malloc(w3);
+        if (ffct && ct_shared && !(ctcp = nn_malloc(w3))) { fprintf(stderr, "predict: no device memory for the --fit-ct CT copy\n"); return 1; }
         ctm = ct_shared ? nn_malloc((w3 + 31) / 32 * 4) : nullptr;
         ctmi = ct_shared && iso > 1 ? nn_malloc((w3 + 31) / 32 * 4) : ctm;   /* --iso: the outputs' own mask (the fit keeps ctm) */
         xd = ct_stem || half || auxz || cfg.cin == 7 ? nullptr : h16 && !sheet_task ? unet_input_scratch(u, 4 * w3 * 2) : nullptr;
@@ -760,6 +789,7 @@ int cmd_predict(int argc, char **argv) {
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
         if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4)); lgf = nn_malloc(w3 * 4); if (hdiv > 2) lrt = nn_malloc(w3 / 8 * 16); }
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
+        if (tta > 1 && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) { fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs)\n"); return 2; }
     }
     int64_t ns[3];
     for (int d = 0; d < 3; d++) ns[d] = (bn[d] + shard - 1) / shard;
@@ -775,15 +805,20 @@ int cmd_predict(int argc, char **argv) {
         if (ffw4d < 2) { fprintf(stderr, "predict: the winding mod 4 planes need a halo of >= 2 voxels (--fit-w4-d %d): not written\n", ffw4d); ffw4d = 0; }
         else fprintf(stderr, "predict: task unwrap2 checkpoint: fit fields from channels 0-1 phase, 2-7 normal, 8 density; winding mod 4 planes dz dy dx dq over %d voxels\n", ffw4d);
     }
-    if (ffw4d > 0) ffz_np = 14;
-    z3w *ffzw[14] = {0}; uint8_t *ffsl[14] = {0}; const int FFS = 128; int FZ = FFS; int64_t ffslab = 0; uint8_t *ff8d = nullptr, *ff8h = nullptr; size_t ffwn = 0; int ffwc = 0, ffzc = 1;
+    if (ffu2) {   /* (no recto plane) */
+        static const char *const w4n[4] = {"dz", "dy", "dx", "dq"};
+        ffz_np = 10; if (ffw4d) for (int k = 0; k < 4; k++) ffz_names[ffz_np++] = w4n[k];
+    }
+    ffz_nb = ffz_np;
+    if (ffct) { ffz_names[ffz_np++] = "ct"; ffz_names[ffz_np++] = "cs"; }
+    z3w *ffzw[FFZ_MAXP] = {0}; uint8_t *ffsl[FFZ_MAXP] = {0}; const int FFS = 128; int FZ = FFS; int64_t ffslab = 0; uint8_t *ff8d = nullptr, *ff8h = nullptr; size_t ffwn = 0; int ffwc = 0, ffzc = 1;
     static ffw_t ffw; pthread_t ffw_th; int ffw_on = 0, ffrow = 0, ffrk = 0; int64_t ffprow = -1;   /* row flushes: (super-)shard cells, the last row */
     if (ffd) {
         for (int d = 0; d < 3; d++) { ffbox[d] = (int)bn[d]; ffF[d] = (int)((bn[d] + ffh - 1) / ffh); }
         if (!ffzm) {   /* the whole box on the device */
-            ffn = (size_t)ffF[0] * ffF[1] * ffF[2]; ffacc = nn_malloc(12 * ffn * 4);
+            ffn = (size_t)ffF[0] * ffF[1] * ffF[2]; ffacc = nn_malloc(ffna * ffn * 4);
             if (!ffacc) { fprintf(stderr, "predict: no device memory for the fit fields\n"); return 1; }
-            nn_zero(ffacc, 12 * ffn * 4);
+            nn_zero(ffacc, ffna * ffn * 4);
             if (ffw4d) { ffacc4 = nn_malloc(9 * ffn * 4); if (!ffacc4) { fprintf(stderr, "predict: no device memory for the fit fields\n"); return 1; } nn_zero(ffacc4, 9 * ffn * 4); }
         } else {   /* per window: an accumulator of its interior cells; the field slab of FZ cells in z on the host */
             /* the field slab (FZ cells in z, a multiple of the field shard FFS) is flushed once the windows leave it: a window's
@@ -809,13 +844,15 @@ int cmd_predict(int argc, char **argv) {
                 if (!ffzw[k] || !ffsl[k]) { fprintf(stderr, "predict: --fit-zarr: %s\n", z3w_error()); return 1; }
                 memset(ffsl[k], ffz_fill[k], held);
             }
-            /* a window's cells in z chunks of ffzc planes: 58 device bytes per cell (12 fp32 sums + 10 uint8 fields), so at --fit-h 1 a
+            /* a window's cells in z chunks of ffzc planes: 70 device bytes per cell (12 fp32 sums + two 11-byte staging buffers), so at --fit-h 1 a
                whole 512^3 interior took 7.8 GB and pushed 640^3 windows past the 16 GB card (paged); <= ~0.5 GB now */
             ffwc = stride / ffh + 1;
-            { const size_t pc = (size_t)ffwc * ffwc, nzc = (size_t)(strd[0] / ffh + 1), cap = ((size_t)512 << 20) / (58 * pc);
-              ffzc = (int)(nzc < (cap ? cap : 1) ? nzc : (cap ? cap : 1)); ffwn = (size_t)ffzc * pc; }
-            ffacc = nn_malloc(12 * ffwn * 4); ff8d = nn_malloc(2 * (size_t)ffz_np * ffwn); ff8h = nn_host_alloc(2 * (size_t)ffz_np * ffwn);
-            if (ffw4d && !(ffacc4 = nn_malloc(9 * ffwn * 4))) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }   /* finalized on the device: 10 B per cell back,
+            { const size_t pc = (size_t)ffwc * ffwc, nzc = (size_t)(strd[0] / ffh + 1), cap = ((size_t)512 << 20) / ((48 + (ffw4d ? 36 : 0) + 2 * FFZ_MAXP) * pc);
+              ffzc = (int)(nzc < (cap ? cap : 1) ? nzc : (cap ? cap : 1));
+              if (tta > 1) ffzc = (int)nzc;   /* every pass pools into one accumulator of the whole interior */
+              ffwn = (size_t)ffzc * pc; }
+            ffacc = nn_malloc(ffna * ffwn * 4); ff8d = nn_malloc(2 * (size_t)FFZ_MAXP * ffwn); ff8h = nn_host_alloc(2 * (size_t)FFZ_MAXP * ffwn);
+            if (ffw4d && !(ffacc4 = nn_malloc(9 * ffwn * 4))) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }   /* finalized on the device: 11 B per cell back,
                                                                                                                   two staging buffers (the fit writer thread) */
             if (!ffacc || !ff8d || !ff8h) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }
             ffw.zw = ffzw; ffw.sl = ffsl; ffw.F = ffF; ffw.FS = FFS; ffw.FZ = FZ; ffw.gpu = gpu;
@@ -826,7 +863,7 @@ int cmd_predict(int argc, char **argv) {
                the whole last slab: 8 of 24 s for a 256 x 2048^2 box). One worker, a (super-)shard of whole field shards; UFSM_FIT_ROWFLUSH=0 */
             ffrk = (kss > 1 ? kss * shard : shard) / ffh;
             ffrow = nwork == 1 && !split && ffrk % FFS == 0 && !(getenv("UFSM_FIT_ROWFLUSH") && !atoi(getenv("UFSM_FIT_ROWFLUSH")));
-            for (int b = 0; b < 2; b++) { ffw.h[b] = ff8h + (size_t)b * ffz_np * ffwn; ffw.evs[b] = nn_event_create(); ffw.evd[b] = nn_event_create(); }
+            for (int b = 0; b < 2; b++) { ffw.h[b] = ff8h + (size_t)b * FFZ_MAXP * ffwn; ffw.evs[b] = nn_event_create(); ffw.evd[b] = nn_event_create(); }
             pthread_mutex_init(&ffw.mu, nullptr); pthread_cond_init(&ffw.cv, nullptr); atomic_store(&ffw.fail, 0);
             { long nc = sysconf(_SC_NPROCESSORS_ONLN); ffw.rnt = nc > 2 ? (int)(nc / 2) : 1; }
             if (pthread_create(&ffw_th, nullptr, ffw_main, &ffw) || pthread_create(&ffw.rth, nullptr, ffw_rows, &ffw)) { fprintf(stderr, "predict: cannot start the fit writer\n"); return 1; }
@@ -979,7 +1016,13 @@ int cmd_predict(int argc, char **argv) {
                 nn_aux_input(auxd, w3, (char *)xd + 4 * w3 * (h16 ? 2 : 4), h16);
             }
             if (ct_shared) nn_pred_ctmask(ctd, w3, ctm);   /* the forward overwrites ctd */
+            static uint8_t *ctsave; static float *dyt;   /* --tta: the CT window kept for the augmented passes */
+            if (tta > 1 && !ctsave) { ctsave = nn_malloc(w3); dyt = malloc(2 * (size_t)W * sizeof(float)); if (!ctsave || !dyt) { fprintf(stderr, "predict: no memory for --tta\n"); return 1; } }
+            if (tta > 1) nn_d2d(ctsave, ctd, w3);
+            const tta_ctx TC = {.u = u, .ctd = ctd, .ctsave = ctsave, .mean = (float)mean, .isd = (float)(1.0 / sd), .dyo = dyo, .dxo = dxo, .dyt = dyt, .dyd = dyd,
+                                .axis = ax.n > 0 ? (int)radial_sign : 0, .xs = xs, .h16 = h16, .D = Wz, .W = W, .nch = cfg.cout, .ch_normal = ff_nrm};
             if (ct_shared && ctmi != ctm) nn_pred_ctmask_t(ctd, w3, ctmi, iso);
+            if (ffct && ct_shared) nn_d2d_async(ctcp, ctd, w3);   /* --fit-ct reads the CT after the forward */
             if (sheet_task) {
                 for (int z=0;z<W;z++) { double a[4]; sheet_parameters(sheet,o[0]+z,a); sheet_rows[4*z]=(float)(o[1]-a[0]); sheet_rows[4*z+1]=(float)(o[2]-a[1]); sheet_rows[4*z+2]=(float)(1/a[2]); sheet_rows[4*z+3]=(float)a[3]; }
                 nn_sheet_input(xd,W,sheet_rows,(float)sheet->center,(float)sheet->scale,h16);
@@ -993,10 +1036,20 @@ int cmd_predict(int argc, char **argv) {
             } else lg = ct_stem ? unet_forward_ct(u, ctd, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xs, h16)
                                 : unet_forward_x(u, xd, xs, 0, h16);
             nn_set_logits_h16(!half && unet_logits_h16(u));   /* the readers of lg below */
+            const uint8_t *ctk = ct_shared && ctcp ? ctcp : ctd; (void)ctk;   /* --fit-ct: the CT window as it was before the forward */
             { static int memi = -1; if (memi < 0) memi = ufsm_env_on("UFSM_PRED_MEMINFO"); if (memi == 1) { nn_sync(); fprintf(stderr, "\npredict: GPU free after the first window %.2f GB\n", nn_mem_free() / 1e9); memi = 2; } }
             if (gn_save) unet_gn_accumulate(u);
             if (ffd && !ffzm) nn_fit_accum_dm(lg, ctd, ct_shared ? ctm : nullptr, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, ff_rec, ff_ph, ff_nrm, ff_den, ffds, ffdc, ffacc);
             if (ffd && !ffzm && ffw4d) nn_fit_accum_w4(lg, ctd, ct_shared ? ctm : nullptr, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, ff_w4, ffw4d, ffacc4);
+            if (ffct && !ffzm) {
+                nn_fit_accum_ct(ctk, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, ffacc + 12 * ffn);
+                nn_fit_accum_cs(lg, ctk, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, ff_nrm, ff_den, ffds, ffdc, (float)(um * (1 << level)), ffacc + 13 * ffn);
+            }
+            if (ffd && !ffzm) for (int p = 1; p < tta; p++) {   /* --tta: the other passes into the same accumulators */
+                lg = tta_pass(&TC, tta_order[p]);
+                nn_fit_accum_dm(lg, ctd, ctm, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, ff_rec, ff_ph, ff_nrm, ff_den, ffds, ffdc, ffacc);
+                if (ffw4d) nn_fit_accum_w4(lg, ctd, ctm, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, ff_w4, ffw4d, ffacc4);
+            }
             if (ffzm) {   /* the window interior's whole cells, finalized into the field slab (flushed when the slab is left) */
                 int c0[3], c1[3], nc3[3], ok = 1; const int64_t tw[3] = {tz, ty, tx};
                 for (int d = 0; d < 3; d++) {
@@ -1012,18 +1065,29 @@ int cmd_predict(int argc, char **argv) {
                         const int nz = nc3[0] - za < ffzc ? nc3[0] - za : ffzc, ncz[3] = {nz, nc3[1], nc3[2]};
                         const int64_t cz = (int64_t)(c0[0] + za);
                         const size_t nl = (size_t)nz * nc3[1] * nc3[2];
-                        nn_zero(ffacc, 12 * nl * 4); if (ffw4d) nn_zero(ffacc4, 9 * nl * 4);
+                        nn_zero(ffacc, ffna * nl * 4); if (ffw4d) nn_zero(ffacc4, 9 * nl * 4);
                         const int lbox[3] = {(int)(bn[0] - cz * ffh < (int64_t)nz * ffh ? bn[0] - cz * ffh : (int64_t)nz * ffh),
                                              (int)(bn[1] - (int64_t)c0[1] * ffh < (int64_t)nc3[1] * ffh ? bn[1] - (int64_t)c0[1] * ffh : (int64_t)nc3[1] * ffh),
                                              (int)(bn[2] - (int64_t)c0[2] * ffh < (int64_t)nc3[2] * ffh ? bn[2] - (int64_t)c0[2] * ffh : (int64_t)nc3[2] * ffh)};
                         nn_fit_accum_dm(lg, ctd, ct_shared ? ctm : nullptr, Wz, W, hz, halo, (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz, ff_rec, ff_ph, ff_nrm, ff_den, ffds, ffdc, ffacc);
                         if (ffw4d) nn_fit_accum_w4(lg, ctd, ct_shared ? ctm : nullptr, Wz, W, hz, halo, (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz, ff_w4, ffw4d, ffacc4);
+                        if (ffct) {
+                            nn_fit_accum_ct(ctk, Wz, W, hz, halo, (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz, ffacc + 12 * nl);
+                            nn_fit_accum_cs(lg, ctk, Wz, W, hz, halo, (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz, ff_nrm, ff_den, ffds, ffdc,
+                                            (float)(um * (1 << level)), ffacc + 13 * nl);
+                        }
+                        for (int p = 1; p < tta; p++) {   /* --tta: the other passes (one chunk: the whole interior) */
+                            lg = tta_pass(&TC, tta_order[p]);
+                            nn_fit_accum_dm(lg, ctd, ctm, Wz, W, hz, halo, (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz, ff_rec, ff_ph, ff_nrm, ff_den, ffds, ffdc, ffacc);
+                            if (ffw4d) nn_fit_accum_w4(lg, ctd, ctm, Wz, W, hz, halo, (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz, ff_w4, ffw4d, ffacc4);
+                        }
                         const double tfa = pprof ? now() : 0;
                         const int fb = ffw_acquire(&ffw);
                         if (pprof) p_ffw += now() - tfa;
-                        uint8_t *fd = ff8d + (size_t)fb * ffz_np * ffwn;
-                        nn_fit_finalize(ffacc, nl, ffh, fd);
-                        if (ffw4d) nn_fit_finalize_w4(ffacc4, nl, fd + 10 * nl);
+                        uint8_t *fd = ff8d + (size_t)fb * FFZ_MAXP * ffwn;
+                        nn_fit_finalize(ffacc, nl, ffh, fd);   /* pc .. w, then r (unwrap) or dz dy dx dq (unwrap2) */
+                        if (!ffu2) nn_fit_finalize_recto(ffacc, nl, fd + 10 * nl); else if (ffw4d) nn_fit_finalize_w4(ffacc4, nl, fd + 10 * nl);
+                        if (ffct) nn_fit_finalize_ct(ffacc, nl, ffh, fd + (size_t)ffz_nb * nl, fd + (size_t)(ffz_nb + 1) * nl);   /* then ct, cs */
                         nn_offload_copy(ffw.h[fb], fd, (size_t)ffz_np * nl, 1, ffw.evs[fb], ffw.evd[fb]);   /* scattered into the slab by the fit writer */
                         ffw_push(&ffw, (ffw_job){.kind = 0, .b = fb, .c1 = c0[1], .c2 = c0[2], .nz = nz, .ny = nc3[1], .nx = nc3[2], .cz = cz, .slab = slab, .nl = nl});
                     }
@@ -1112,27 +1176,46 @@ int cmd_predict(int argc, char **argv) {
         char p[1400]; snprintf(p, sizeof p, "%s/fields.json", ffz); FILE *f = fopen(p, "w");
         if (!f) { fprintf(stderr, "predict: cannot write %s\n", p); return 1; }
         fprintf(f, "{\"format\": \"zarr\", \"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.9g, ", (long long)bo[0], (long long)bo[1], (long long)bo[2], ffF[0], ffF[1], ffF[2], ffh, um * (1 << level));
-        if (ffw4d) fprintf(f, "\"w4_d\": %d, ", ffw4d);
+        if (ffu2) { if (ffw4d) fprintf(f, "\"w4_d\": %d, ", ffw4d); } else fprintf(f, "\"recto\": true, ");
         fprintf(f, "\"axis\": [");
         for (int64_t z = 0; z <= bn[0]; z++) { double cy = 0, cx = 0; if (ax.n) axis_at(&ax, (double)(bo[0] + z) * (1 << level), &cy, &cx); fprintf(f, "%s[%.3f, %.3f]", z ? ", " : "", cy / (1 << level) - bo[1], cx / (1 << level) - bo[2]); }
         fprintf(f, "]}\n"); fclose(f);
         fprintf(stderr, "predict: fit fields %dx%dx%d (h %d) written to %s (zarr)\n", ffF[0], ffF[1], ffF[2], ffh, ffz);
     } else if (ffd) {   /* the fit fields: means over material (CT > 0) of the pooled heads, material fraction, max recto */
-        float *acc = malloc(12 * ffn * 4); nn_sync(); nn_d2h(acc, ffacc, 12 * ffn * 4); nn_free(ffacc);
-        uint8_t *a[14] = {0}; for (int k = 0; k < ffz_np; k++) a[k] = calloc(ffn, 1);
+        float *acc = malloc(ffna * ffn * 4); nn_sync(); nn_d2h(acc, ffacc, ffna * ffn * 4); nn_free(ffacc);
+        uint8_t *a[10]; for (int k = 0; k < 10; k++) a[k] = calloc(ffn, 1);
         fit_finalize(acc, ffn, ffh, a);
-        if (ffw4d) {   /* the relative planes, finalized on the device */
-            uint8_t *d4 = nn_malloc(4 * ffn), *h4 = malloc(4 * ffn);
-            nn_fit_finalize_w4(ffacc4, ffn, d4); nn_sync(); nn_d2h(h4, d4, 4 * ffn);
-            for (int k = 0; k < 4; k++) memcpy(a[10 + k], h4 + k * ffn, ffn);
-            nn_free(d4); free(h4); nn_free(ffacc4);
-        }
         const int na = (int)bn[0] + 1; float *cyb = malloc(na * sizeof(float)), *cxb = malloc(na * sizeof(float));
         for (int z = 0; z < na; z++) { double cy = 0, cx = 0; if (ax.n) axis_at(&ax, (double)(bo[0] + z) * (1 << level), &cy, &cx); cyb[z] = (float)(cy / (1 << level) - bo[1]); cxb[z] = (float)(cx / (1 << level) - bo[2]); }
         const long long org[3] = {bo[0], bo[1], bo[2]};
-        if (fit_fields_save_w4(ffd, org, ffF, ffh, um * (1 << level), a, ffw4d, cyb, cxb, na)) { fprintf(stderr, "predict: cannot write the fit fields to %s\n", ffd); return 1; }
+        /* Preserve the recto head for local fitting as well as the normal/density/phase heads.
+           acc[11] is already the maximum recto probability over each field cell. */
+        uint8_t *recto = ffu2 ? nullptr : malloc(ffn);
+        if (!ffu2 && !recto) return 1;
+        if (recto) for (size_t i = 0; i < ffn; i++) recto[i] = (uint8_t)lroundf(255.f * fminf(1.f, fmaxf(0.f, acc[11 * ffn + i])));
+        uint8_t *a14[14] = {0}; for (int k = 0; k < 10; k++) a14[k] = a[k];
+        if (ffw4d) {   /* task unwrap2: the relative winding mod 4 planes, finalized on the device */
+            uint8_t *d4 = nn_malloc(4 * ffn); for (int k = 0; k < 4; k++) a14[10 + k] = malloc(ffn);
+            nn_fit_finalize_w4(ffacc4, ffn, d4); nn_sync(); for (int k = 0; k < 4; k++) nn_d2h(a14[10 + k], d4 + k * ffn, ffn);
+            nn_free(d4); nn_free(ffacc4);
+        }
+        const int saved = fit_fields_save_ex(ffd, org, ffF, ffh, um * (1 << level), a14, ffw4d, recto, cyb, cxb, na); free(recto);
+        for (int k = 10; k < 14; k++) free(a14[k]);
+        if (saved) { fprintf(stderr, "predict: cannot write the fit fields to %s\n", ffd); return 1; }
+        if (ffct) {   /* ct.raw / cs.raw (box-shaped, as ufsm ct-fields writes them) */
+            uint8_t *pl = malloc(ffn); int bad = !pl;
+            for (int q = 0; q < 2 && !bad; q++) {
+                for (size_t i = 0; i < ffn; i++) {
+                    const float cnt = acc[i], v = q == 0 ? (cnt > 0 ? acc[12 * ffn + i] / cnt : 0.f) : (acc[13 * ffn + i] > 0 ? acc[13 * ffn + i] * 8.f / ffh : 0.f);
+                    pl[i] = v <= 0 ? 0 : q == 1 && v < 1 ? 1 : v > 255 ? 255 : (uint8_t)lroundf(v);
+                }
+                char p[1400]; snprintf(p, sizeof p, "%s/%s.raw", ffd, q ? "cs" : "ct"); FILE *f = fopen(p, "wb");
+                bad = !f || fwrite(pl, 1, ffn, f) != ffn; if (f && fclose(f)) bad = 1;
+            }
+            free(pl); if (bad) { fprintf(stderr, "predict: cannot write the CT planes to %s\n", ffd); return 1; }
+        }
         fprintf(stderr, "predict: fit fields %dx%dx%d (h %d) written to %s\n", ffF[0], ffF[1], ffF[2], ffh, ffd);
-        for (int k = 0; k < ffz_np; k++) free(a[k]);
+        for (int k = 0; k < 10; k++) free(a[k]);
         free(acc); free(cyb); free(cxb);
     }
     if (gpath) { for (int k = 0; k < WR.nb; k++) nn_host_free(WR.buf[k]); nn_free(dsh); } else for (int k = 0; k < WR.nb; k++) free(WR.buf[k]);

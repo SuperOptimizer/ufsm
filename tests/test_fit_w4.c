@@ -133,7 +133,7 @@ static double run_spiral(int with_w4, double bias, double *w4loss) {
         }
         wd[3][i] = 255;
     }
-    fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, {0}, 0};
+    fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, {0}, 0, nullptr, nullptr, nullptr};
     if (with_w4) { for (int k = 0; k < 4; k++) f.wd[k] = wd[k]; f.w4_d = dd; }
     fit_cfg c = fit_cfg_default(); c.verbose = getenv("FITW4_V") != nullptr; c.dir = 1; if (getenv("FITW4_W")) c.w_wind4 = (float)atof(getenv("FITW4_W"));
     fit_model *m = fit_run(&f, &c);
@@ -174,6 +174,14 @@ int main(void) {
         CHECK(!fit_fields_save(dir, org, shp, 4, 9.6, a, cy, cx, na), "fit_fields_save");
         CHECK(!fit_fields_load(dir, 0, 0, 1, &b) && !b.f.wd[0] && b.f.w4_d == 0, "10-plane fields loaded with winding mod 4 planes"); fit_fields_free(&b);
         if (system(cmd)) {}
+        /* the recto plane: saved with "recto": true, loaded unpooled only; "recto": false ignores a stale r.raw */
+        uint8_t *rr = malloc(nf); for (size_t i = 0; i < nf; i++) rr[i] = (uint8_t)(200 - i);
+        CHECK(!fit_fields_save_ex(dir, org, shp, 4, 9.6, a, 12, rr, cy, cx, na), "fit_fields_save_ex");
+        CHECK(!fit_fields_load(dir, 0, 0, 1, &b) && b.f.recto && !memcmp(b.f.recto, rr, nf) && b.f.wd[3] && !memcmp(b.f.wd[3], a[13], nf), "the recto plane did not round-trip"); fit_fields_free(&b);
+        CHECK(!fit_fields_load(dir, 0, 0, 2, &b) && !b.f.recto, "pooled loads carry no recto plane"); fit_fields_free(&b);
+        { char fj[300]; snprintf(fj, sizeof fj, "sed -i 's/\"recto\": true/\"recto\": false/' %s/fields.json", dir); if (system(fj)) {} }
+        CHECK(!fit_fields_load(dir, 0, 0, 1, &b) && !b.f.recto, "\"recto\": false loaded an r plane"); fit_fields_free(&b);
+        free(rr); if (system(cmd)) {}
         printf("save / load round trip: ok\n");
         for (int k = 0; k < 14; k++) { free(a[k]); } free(cy); free(cx);
     }

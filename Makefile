@@ -23,6 +23,8 @@ NVFLAGS ?= -O3 -arch=sm_120 -use_fast_math -Xcompiler -fno-threadsafe-statics -I
 CUDALIBS = -L$(CUDA)/lib64 -lcudart
 
 SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sources.c src/sample.c src/band.c src/ct_augment.c src/scan_augment.c src/spatial_augment.c src/cover.c src/zarr2.c src/tiff.c src/z3w.c src/hf.c src/ingest.c src/zipr.c src/train.c src/restore.c src/restore_cli.c src/unet.c src/split.c src/predict.c src/sweep.c src/eval.c src/fit.c src/tiffw.c src/edt.c src/votes.c src/wind.c src/fuse.c src/phase_check.c
+SRC += src/surf.c src/stitch.c src/coreline.c src/fit_ct.c src/l1pot.c
+SRC += src/fblend.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
@@ -135,8 +137,33 @@ $(B)/test_half: tests/test_half.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_unwrap_targets: tests/test_unwrap_targets.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-$(B)/test_fit: tests/test_fit.c $(B)/fit.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_fit: tests/test_fit.c $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+$(B)/test_surf: tests/test_surf.c $(B)/surf.o $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/tiffw.o $(B)/tiff.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+$(B)/test_predict_unwrap2: tests/test_predict_unwrap2.c $(B)/unet.o $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o | $(B)/ufsm
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_predict_unwrap2
+$(B)/test_tta: tests/test_tta.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_tta
+$(B)/test_fblend: tests/test_fblend.c $(B)/fblend.o $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_fblend
+$(B)/test_stitch: tests/test_stitch.c $(B)/stitch.o $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/z3w.o $(B)/tiffw.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+
+test-all: $(B)/test_stitch
+$(B)/test_coreline: tests/test_coreline.c $(B)/coreline.o $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_coreline
+$(B)/test_fit_w4: tests/test_fit_w4.c $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_fit_w4
+$(B)/test_repair: tests/test_repair.c $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_repair
+
 $(B)/test_tiffw: tests/test_tiffw.c $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 $(B)/test_wind: tests/test_wind.c src/wind.h $(B)/wind.o
@@ -191,8 +218,6 @@ $(B)/test_wind4: tests/test_wind4.c $(B)/band.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_unwrap2_sampler: tests/test_unwrap2_sampler.c $(B)/sample.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/cover.o $(B)/sources.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-$(B)/test_fit_w4: tests/test_fit_w4.c $(B)/fit.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/bench_read: tests/bench_read.c $(B)/sample.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/cover.o $(B)/sources.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
 $(B)/fwd_nan: tests/fwd_nan.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
@@ -276,7 +301,7 @@ test-all: $(B)/test_wgrad_grid
 $(B):
 	mkdir -p $(B)
 
-test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/test_votes $(B)/test_wind $(B)/test_phase_check $(B)/test_fuse $(B)/check_surface_samples $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon $(B)/test_muonc $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_tiffw $(B)/test_edt $(B)/test_volcomp $(B)/test_typed_zarr $(B)/test_aug_preset $(B)/test_l0_norm $(B)/test_l0_slab $(B)/test_wind_sampler
+test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/test_votes $(B)/test_wind $(B)/test_phase_check $(B)/test_fuse $(B)/check_surface_samples $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon $(B)/test_muonc $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_surf $(B)/test_tiffw $(B)/test_edt $(B)/test_volcomp $(B)/test_typed_zarr $(B)/test_aug_preset $(B)/test_l0_norm $(B)/test_l0_slab $(B)/test_wind_sampler
 	./$(B)/test_target_erode
 	./$(B)/test_wind_sampler
 	./$(B)/test_papyrus
@@ -287,7 +312,6 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_wind4
 	./$(B)/test_gyrec
 	./$(B)/test_unwrap2_sampler $(B)/unwrap2_fixture
-	./$(B)/test_fit_w4
 	./$(B)/test_restore_task
 	$(MAKE) test-sheet
 	./$(B)/test_wgrad_grid
@@ -308,6 +332,14 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_half
 	./$(B)/test_unwrap_targets
 	./$(B)/test_fit
+	./$(B)/test_surf
+	./$(B)/test_stitch
+	./$(B)/test_fblend
+	./$(B)/test_tta
+	./$(B)/test_predict_unwrap2 ./$(B)/ufsm
+	./$(B)/test_coreline
+	./$(B)/test_fit_w4
+	./$(B)/test_repair
 	./$(B)/test_tiffw
 	./$(B)/test_edt
 	./$(B)/test_volcomp
@@ -404,5 +436,4 @@ test-all: $(B)/test_pack_tm
 test-all: $(B)/test_wind4
 test-all: $(B)/test_gyrec
 test-all: $(B)/test_unwrap2_sampler
-test-all: $(B)/test_fit_w4
 test-all: $(B)/test_l3_sched

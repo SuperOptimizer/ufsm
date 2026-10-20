@@ -321,6 +321,7 @@ void unet_free(unet *u) {
 
 static void free_acts(unet *u);
 const unet_cfg *unet_cfg_of(const unet *u) { return &u->cfg; }
+void unet_head_offsets(const unet *u, size_t *w, size_t *b) { *w = u->head.w; *b = u->head.b; }
 size_t unet_nparams(const unet *u) { return u->np; }
 
 /* ---- init ---- */

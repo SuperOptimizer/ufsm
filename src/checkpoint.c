@@ -17,6 +17,7 @@ int checkpoint_unwrap_version(const char *path) {
     const int v = strstr(h, "\"unwrap\":{\"version\":2") ? 2 : strstr(h, "\"unwrap\":{\"version\":1") ? 1 : 0;
     free(h); return v;
 }
+
 static int valid(const checkpoint_runtime *r) {
     return r->version == 1 && r->train_window > 0 && r->prec >= 0 && r->prec <= 4 &&
         (r->f16 == 0 || r->f16 == 1) && (r->act_mx4 == 0 || r->act_mx4 == 1) &&
