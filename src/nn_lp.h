@@ -29,10 +29,14 @@ int lp_gn_slab_any(void);   /* any statistics array registered */
 /* zlo / zhi (spatial split, nn_split_cfg): the GroupNorm statistics of the output (osum) skip the first zlo and the last zhi
    z planes (halo planes owned by the other GPU); 0 / 0 = every plane */
 /* stored_stats: output statistics use decoded rounded MX values, including bias exactly once. */
-typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; unsigned wkey; int zlo, zhi; int stored_stats; unsigned osr; int zi0, Di; int o_pad; int zw0, zw1; } split_t;   /* zw0 / zw1: z-window (nn_set_zwin):
+typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; gnp_t gp2; int up; unsigned sr; unsigned wkey; int zlo, zhi; int stored_stats; unsigned osr; int16_t zi0, Di, o_pad, zw0, zw1; } split_t;   /* zw0 / zw1: z-window (nn_set_zwin):
                                                                      only output planes [zw0, zw1) of the whole output (zw1 0: all); o_pad: the split output's
                                                                      second tensor starts at padded row o_pad (0: o_split rounded up to 32; 16 for two <= 16-channel MX tensors) */   /* osr: exact SR seed of an MX-fp4 output (fp4 gradients); zi0 / Di: z-range (MX forward kernels: output plane z reads input plane
    z + zi0 of a depth-Di input; Di 0 = off) */
+/* split_t stays within 128 bytes (the z fields int16: depths <= 32767 planes): at 136 bytes (S2's two int z-window fields)
+   test_share_enc_a1 (MX-fp8) failed 8 of 12 runs, the same with the pre-S2 code and 8 padding bytes: the launches' timing
+   moves the order of float atomic sums the run-to-run comparison is sensitive to (Phase B of the RAM / compute plan) */
+static_assert(sizeof(split_t) <= 128, "split_t grew past 128 bytes");
 /* k=3 stride 1 forward / weight gradient with the same semantics as the BF16 tensor-core paths in nn.cu
    (conv_fwd_tc / launch_bwd_w_tc): xbf / ybf = activation (and x2 / y2) storage type, 0 fp32, 1 bf16, 2 fp16; the
    forward needs xbf == ybf. Weights, biases and GroupNorm parameters are fp32; the weight gradient accepts fp32 or (with xbf) bf16 gy. */

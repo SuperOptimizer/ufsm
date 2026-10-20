@@ -80,7 +80,8 @@ int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *
         if (ts || !ISMX(y) || (!ISMX(x) && xs.c > 8) || sp.y2 || sp.accum || g_pass) { fprintf(stderr, "conv: the z-range needs an MX output and input (forward)\n"); abort(); }
         sp.zi0 = g_zr_z0; sp.Di = g_zr_Di;
     }
-    if (zw_win(xs.d, &sp.zw0, &sp.zw1) && (ts || !ISMX(y) || sp.up && !ISMX(x) || g_zr_Di)) {   /* z-window: the MX kernels (forward and backward-data) */
+    int zwa = 0, zwb = 0; const int zwon = zw_win(xs.d, &zwa, &zwb); if (zwon) { sp.zw0 = (int16_t)zwa; sp.zw1 = (int16_t)zwb; }
+    if (zwon && (ts || !ISMX(y) || sp.up && !ISMX(x) || g_zr_Di)) {   /* z-window: the MX kernels (forward and backward-data) */
         fprintf(stderr, "conv: the z-window needs MX storage (no tap packing, no z-range)\n"); abort();
     }
     const int pr = eff_prec();

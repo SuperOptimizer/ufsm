@@ -6,6 +6,44 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Integration 2026-10-20: every local branch on master
+
+origin/master was 7ae7a47 (10-16); everything since lived on local branches. Merged in this order (first-parent chain of master):
+1. training chain `wind-sense-20261019` (contains warp-speed / wind2-run, loader2, the unwrap2 worktree with the 2-GPU leak fix,
+   phase-sign, multi-scroll-20261016); 2. SR `train --task restore`; 3. `fitter-p4` (fitter, fitter-p2 / p3, coreline-1299 and the
+   stitch workers), `fitter-p1`; 4. the stopped WIP branches `fitter-speed`, `render-speed`, `wind24-20261020`; 5. `podbatch-fitq`;
+   6. worker D, X (`--val-P`), K1 + R, S2, S3, S4; 7. the other 10-15 / 10-16 worker branches; 8. the main checkout's C work.
+D, K1, R and the remaining 10-15 / 10-16 workers had been cherry-picked into master before 7ae7a47 (patch-equivalent, or their added
+lines present; the rest later edited in place): recorded with `merge -s ours` (no tree change) so no branch holds unmerged history.
+
+Non-trivial resolutions:
+- `fit.c` / `fit.h` / `nn_fit.cu` / `predict.c` / `checkpoint.c` / `tests/test_fit_w4.c` (training chain vs fitter): the fitter
+  versions. The training chain's only change to them (9a3d51e: unwrap2 fit planes and the winding mod 4 term) had already been
+  ported by the fitter into `fit_terms.h` and the variable plane list (`FFZ_MAXP`; r, dz dy dx dq, ct cs).
+- `train.c` (unwrap2 vs restore vs `--val-P`): one task flag block (unwrap2 implies unwrap; restore beside it), the loss dispatch
+  `restore -> unwrap2 -> unwrap`, planner bytes with both the unwrap2 and the restore terms, the step launch keeps the NaN hooks /
+  sync checks around `restore_train_recipe(), run_batch()`; validation runs the `--val-P` copy, else the existing path with the
+  restore per-family pass and the unwrap2 metrics; `--val-P` also refuses task restore; the planner keeps both
+  `UFSM_MEM_FREE_GB` and the `--val-P` reserve.
+- `sample.c` / `sample.h`: `draw_restore` beside the wind4 warps.
+- `fit.c` (fitter-speed vs fitter-p2): the threaded row pooler keeps the pooled CT spacing `cs`; `fit_fields_load_ex` keeps
+  `fit_fields_ct_planes`; the slab-to-slab row reuse compares all 17 planes (was 15: ct / cs postdate fitter-speed's base).
+- `predict.c` (podbatch vs fitter): the ring of 3 field-slab rows and `--fit-q` / `--fit-q-phase` / `--no-out` on the variable
+  plane list (`ffz_np` planes, `FFZ_MAXP` staging, `ffacc4` freed).
+- `lp_mx_s2bwd_tc.cu` (S2 vs K1-era one-pass-ahead loads): the prefetching loop starts at the z window,
+  `tz_beg = tz0 + zc ZC`, `tz_end = min(nzt, tz0 + (zc + 1) ZC)`.
+- Makefile: one SRC list, the union of the test-all prerequisites and runs; duplicate `test_fit_w4` rules dropped.
+- Main checkout (uncommitted on 7ae7a47): kept `ufsm blend`, `predict --input-gain / --input-bias`, README sections and two of its
+  test_fit cases (ported to the fitter API); its recto term, r plane, flags and fit-config.json were already in the fitter.
+  Dropped the old Python restoration / winding-ensemble / ink-TTA code (never tracked; `train --task restore` replaces it).
+
+Determinism / `test_share_enc_a1`: with S2 merged it failed 8 of 10 runs (MX-fp8 mode 1, "fresh" / "repeated" gradients 1e-4..7e-4
+apart instead of ~1e-7). The cause is the size of `split_t` alone: the pre-S2 tree with 8 padding bytes in `split_t` (136 bytes)
+fails 8 of 12, without them 0 of 12. Fixed-order GroupNorm partial sums in the forward epilogues (warps committing in turn, Phase B1)
+did not change it (7 of 12) and were not kept. The kept fix: the int z fields of `split_t` (zi0, Di, o_pad, zw0, zw1) are int16 and
+a `static_assert` holds `split_t` to 128 bytes. The underlying run-to-run sensitivity (float atomic sums in weight gradients / GN
+backward, Phase B2 / B3) remains; `~/ufsm-perf-det` holds an uncommitted, unverified attempt at B1-B3 by the stopped perf agent.
+
 ## Spiral-fit heads only: train --task unwrap2, a gauge-free winding mod 4 head (2026-10-18)
 
 User (10-18): drop the recto and ink heads from the winding model; add only heads whose training data follows from our ground truth.
