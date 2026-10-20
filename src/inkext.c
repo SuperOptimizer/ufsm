@@ -529,6 +529,7 @@ int cmd_ink_ext(int argc, char **argv) {
     for (int a = 2; a + 1 < argc; a++) {
         if (strcmp(argv[a], "--surface")) continue;
         isurf S; if (isurf_load(&S, argv[a + 1])) { fprintf(stderr, "ink-ext: cannot read tifxyz %s\n", argv[a + 1]); rc = 1; continue; }
+        { const double su = atof(iopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* tifxyz voxel size when its meta has none (default 2.399) */
         const char *gc = iopt(argc, argv, "--grid-crop", nullptr); int cc[4];   /* c0,r0,cols,rows of the tifxyz grid */
         if (gc && (sscanf(gc, "%d,%d,%d,%d", cc, cc + 1, cc + 2, cc + 3) != 4 || isurf_crop(&S, cc[0], cc[1], cc[2], cc[3]))) { fprintf(stderr, "ink-ext: bad --grid-crop\n"); return 2; }
         const char *pre = iopt(argc, argv, "--prefix", ""); char nm[600]; snprintf(nm, sizeof nm, "%s%s", pre, S.name);
@@ -595,6 +596,27 @@ int cmd_ink_ensemble(int argc, char **argv) {
         for (size_t i = 0; i < np; i++) if (mask[i]) acc[i] += (float)(wt[k] / wsum) * lut[im[k][i]];
     }
     uint8_t *o = malloc(np); for (size_t i = 0; i < np; i++) o[i] = mask[i] ? (uint8_t)lroundf(acc[i] * 255) : 0;
+    const int npk = atoi(iopt(argc, argv, "--peaks", "0")), pw = atoi(iopt(argc, argv, "--peak-win", "1024"));
+    if (npk > 0 && pw > 0 && pw <= W && pw <= H) {   /* the npk non-overlapping pw x pw windows of highest mean ensemble (>= half covered) */
+        double *I = calloc((size_t)(W + 1) * (H + 1), sizeof *I), *C = calloc((size_t)(W + 1) * (H + 1), sizeof *C);
+        for (int y = 0; y < H; y++) { double r = 0, c = 0; for (int x = 0; x < W; x++) { r += o[(size_t)y * W + x]; c += mask[(size_t)y * W + x];
+            I[(size_t)(y + 1) * (W + 1) + x + 1] = I[(size_t)y * (W + 1) + x + 1] + r; C[(size_t)(y + 1) * (W + 1) + x + 1] = C[(size_t)y * (W + 1) + x + 1] + c; } }
+        int px[64], py[64], got = 0; const int st = pw / 8 > 0 ? pw / 8 : 1;
+        for (int k = 0; k < npk && k < 64; k++) {
+            double best = -1; int bx = -1, by = -1;
+            for (int y = 0; y + pw <= H; y += st) for (int x = 0; x + pw <= W; x += st) {
+                int ov = 0; for (int q = 0; q < got && !ov; q++) ov = abs(x - px[q]) < pw && abs(y - py[q]) < pw;
+                if (ov) continue;
+                const size_t a = (size_t)y * (W + 1) + x, b = a + pw, c = a + (size_t)pw * (W + 1), d = c + pw;
+                const double cnt = C[d] - C[b] - C[c] + C[a]; if (cnt < 0.5 * pw * pw) continue;
+                const double m = (I[d] - I[b] - I[c] + I[a]) / cnt; if (m > best) { best = m; bx = x; by = y; }
+            }
+            if (bx < 0) break;
+            px[got] = bx; py[got] = by; got++;
+            printf("peak %d,%d,%d,%d %.4f\n", bx, by, pw, pw, best / 255);
+        }
+        free(I); free(C);
+    }
     int rc = tiffw_write(argv[2], W, H, 1, o, 1) ? 1 : 0;
     const char *jp = iopt(argc, argv, "--jpeg", nullptr); if (jp && write_gray_jpeg_half(jp, o, W, H)) rc = 1;
     if (rc) fprintf(stderr, "ink-ensemble: cannot write %s\n", argv[2]);
