@@ -124,6 +124,7 @@ const char *lp_check(void);
 void lp_f32_to_bf16(const float *x, size_t n, void *y);   /* test helpers */
 void lp_bf16_to_f32(const void *x, size_t n, float *y);
 int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1);   /* GroupNorm (sum, sum sq) per (n, group) of an MX tensor over voxels [v0, v1), accumulated; -1 unsupported */
+int lp_gn_sums_mx_n(const void *x, int xdt, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1, int n0, int cnt);   /* samples [n0, n0 + cnt) only, the whole launch's partition */
 #ifdef __cplusplus
 }
 #endif

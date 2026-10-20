@@ -6,8 +6,8 @@
    channel into its group's sums. (The kernel this replaced, a block per 256 voxels and double atomics per block and group on the same
    2 N G addresses, took ~14 ms per 8-channel level-0 call at P512 on the desk: 55 ms of an 8-wide net's step.) */
 template <int B, int HPB>
-__global__ void __launch_bounds__(256) gn_sums_mx2_k(const uint8_t *x, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1) {
-    const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G, blk = blockIdx.y, n = blockIdx.z, nsl = gridDim.x;
+__global__ void __launch_bounds__(256) gn_sums_mx2_k(const uint8_t *x, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1, int n0 = 0) {   /* n0: first sample */
+    const int bw = mx_bw(C), nb = mx_nb(C), cpg = C / G, blk = blockIdx.y, n = n0 + (int)blockIdx.z, nsl = gridDim.x;
     const int h = HPB == 2 ? (int)(threadIdx.x & 1) : 0, h0 = 16 * h, tv = (int)threadIdx.x / HPB, nt = 256 / HPB;
     size_t q0 = S * blockIdx.x / nsl, q1 = S * (blockIdx.x + 1) / nsl;
     if (q0 < v0) q0 = v0;
@@ -69,7 +69,10 @@ __global__ void __launch_bounds__(256) gn_sums_mx2_k(const uint8_t *x, int N, in
         atomicAdd(&sums[o], (double)a); atomicAdd(&sums[o + 1], (double)b2);
     }
 }
-extern "C" int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1) {
+extern "C" int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1) { return lp_gn_sums_mx_n(x, xdt, N, C, G, S, sums, v0, v1, 0, N); }
+/* samples [n0, n0 + cnt) of an N-sample tensor only, with the slab partition of the whole launch (the same per-block float sums: the
+   level-0 slab stream's per-slab statistics equal the whole tensor's pass on the pseudo-sample shape) */
+extern "C" int lp_gn_sums_mx_n(const void *x, int xdt, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1, int n0, int cnt) {
     const int cpg = C / G;
     if (G > 64 || cpg < 1 || C % G) return -1;
     const int nb = mx_nb(C), hpb = mx_bw(C) == 32 ? 2 : 1;
@@ -79,10 +82,11 @@ extern "C" int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t
     if (slabs < want) slabs = want;
     if (slabs > maxs) slabs = maxs;
     if (slabs > 1024) slabs = 1024;
-    const dim3 grid((unsigned)slabs, (unsigned)nb, (unsigned)N);
+    if (cnt <= 0) return 0;
+    const dim3 grid((unsigned)slabs, (unsigned)nb, (unsigned)cnt);
     const uint8_t *xq = (const uint8_t *)x;
-    if (xdt == 4) { if (hpb == 2) gn_sums_mx2_k<4, 2><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1); else gn_sums_mx2_k<4, 1><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1); }
-    else { if (hpb == 2) gn_sums_mx2_k<8, 2><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1); else gn_sums_mx2_k<8, 1><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1); }
+    if (xdt == 4) { if (hpb == 2) gn_sums_mx2_k<4, 2><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1, n0); else gn_sums_mx2_k<4, 1><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1, n0); }
+    else { if (hpb == 2) gn_sums_mx2_k<8, 2><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1, n0); else gn_sums_mx2_k<8, 1><<<grid, 256>>>(xq, N, C, G, S, sums, v0, v1, n0); }
     LPCK();
     return 0;
 }

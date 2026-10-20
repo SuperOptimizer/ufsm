@@ -451,6 +451,46 @@ partial last window): outputs byte for byte, statistics at double-sum noise, wei
 launch's (accumulated windows: a window ignoring its range would add the whole gradient each time), lone windows writing exactly
 their planes, and no-window launches equal.
 
+Stage S3, the streamed schedule (2026-10-16; `UFSM_L0_STREAM=1|2` or `unet_set_l0_stream`, unet.c `l0st_*`): on the slab kernel
+path with several slabs the level-0 ops run per slab through S2's windows on the WHOLE tensors, in a skewed schedule.
+- F1 (ascending): the stem at slab t (its statistics by `nn_gn_stats_n`: one slab of the pseudo-sample shape with the whole
+  launch's block partition, so the slab pass's bits), enc[0]'s conv2 and down0 at t - 1 (conv2's window reads a1's first plane
+  of slab t, whose statistics have just closed); down_norm's level-1 statistics after. Coarse levels unchanged.
+- F2: dec[0]'s conv1 at t, conv2 at t - 1 (stream 2: enc[0]'s a1 at t and the skip at t - 1 recomputed first, conv1 at t - 2).
+  The head stays whole (S3).
+- B1 (descending, after the whole head backward): GN2 + conv2's weight gradient at slab t; conv2's backward-data, GN1 and conv1's
+  weight gradient at t + 1; conv1's backward-data (up part | skip part) at t + 2; the upsample backward into gout[1] at t + 3
+  (its coarse window reads the fine up-part gradient's planes around it). dec[0]'s up transient is built once (whole), at
+  the first conv1 weight gradient. Stream 2 recomputes enc[0]'s a1, the skip, dec[0]'s a1 and a2 three, two, one and zero
+  slabs ahead.
+- B2' (ascending, from d/d downo[0] after enc[1]'s backward): down0's weight gradient and its backward-data into the skip
+  gradient at slab t, enc[0]'s GN2 and conv2's weight gradient at t, conv2's backward-data, GN1 and the stem's weight gradient
+  at t - 1 (stream 2: enc[0]'s a1 one slab ahead, the skip at t).
+- Seeds: each op's first draw in the unstreamed order is replayed for each of its windows (`nn_sr_set_ctr`), the draws per
+  window asserted equal; recomputes replay the forward op's record (`l0st_rc / l0st_rk`) and keep the forward's statistics.
+- Buffers: the levels share one A and one B, and d/d downo[0] is level 1's B, so dec[0]'s and enc[0]'s d/d a2 (and dec[0]'s
+  up transient) get the stream's own buffers (unstreamed, down0's backward finishes before enc[0]'s writes B).
+- Supported: one sample, the plain layout (no spatial split / three level-0 buffers / offloads / lean 2 / head slabs /
+  chunked up part), recompute 1, MX activations and gradients, two-conv level-0 blocks (the stream aborts with the reason).
+tests/test_l0_stream (test-all, plain and UFSM_L0_STREAM_POISON=1): the production chain, 7 levels 16..256, slabs 16 / 32,
+down_norm 0 / 1, two training steps and a validation forward, unstreamed vs stream 1 vs stream 2: logits, gout[1], dec[0]'s
+skip gradient, d/d downo[0] and the final skip gradient bit for bit, parameter gradients <= 4e-7 relative (6e-7 at P256: the
+weight gradients' atomic order), the same seed counts, at P128 and P256. Poison: dead transient slabs (dec[0]'s d/d a2, A,
+the up-part gradient; enc[0]'s d/d a2, A) are overwritten with NaN scales after their last reader, and in stream 2 every
+forward activation (enc[0]'s a1 / a2, dec[0]'s a1 / a2) at each phase's entry: still bit for bit. Controls fail as they must:
+POISON=2 (a transient one slab early), POISON=3 (no skip recompute). Laptop 5080 P256 step (forward + backward, shared GPU,
+noisy): unstreamed 141-151 ms, stream 1 157-177 (more, smaller launches; slabs of 16 cost most), stream 2 183-201 (+21-42%:
+the plan's +32% recompute estimate).
+What S4 (rings / mapped chunks) still needs, given this schedule (live slabs per tensor, whole = W):
+- level-0 activations: F1 a1 3 slabs, the skip 2; F2 (stream 2) a1 3, the skip 3, dec[0]'s a1 3, a2 1; B1 enc[0]'s a1 3,
+  the skip 5 (recomputed at t - 2, read by conv1's weight gradient around t + 1), dec[0]'s a1 3, a2 1; B2' a1 3, the skip 2;
+- level-0 gradients: B1 d/d a2 3, A 3-4, the up-part gradient 3; the skip gradient W from B1's conv1 backward-data until B2'
+  (the plan's device / host / replay dial); B2' d/d a2 3, A 1;
+- still whole in S3 and to be streamed: the network input X (rebuild per slab from the CT: input_rad's window, S2 part 7, for
+  the stem's forward, its recomputes and its weight gradient), the head and loss (F2 head per slab with the loss's first pass,
+  B1's head backward per slab before GN2 of the same slab: train.c head_slab_pass), gout[0], dec[0]'s up transient (per-slab up2
+  windows); level 1 (downo[0], gout[1], d/d downo[0], dec[1]'s output) stays whole.
+
 CUDA virtual memory management under WSL2 (probed 2026-10-16, laptop 5080): cuMemAddressReserve of 64 GB on the 16 GB card,
 cuMemCreate / cuMemMap / cuMemSetAccess of 256 MB chunks at 2 MB granularity, kernels addressing the mapped ranges correctly;
 map + access + unmap of 256 MB ~2 ms of host time. So S4 can keep whole-window tensor addresses and map physical slab chunks under

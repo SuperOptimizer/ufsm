@@ -26,6 +26,21 @@ extern "C" void nn_gn_fwd(const float *x, shape5 s, int G, float eps, const floa
     if (y) gn_apply_k<0, float, float><<<dim3(s.n * s.c, KSLAB), 256>>>(x, gamma, beta, mean, rstd, y, s.c, G, S);   /* y == nullptr: statistics only */
     KCHECK();
 }
+/* the statistics of samples [n0, n0 + cnt) only (MX storage), bit for bit those of one nn_gn_stats over all s.n samples (the same
+   blocks and per-block float sums): the level-0 slab stream computes each slab's statistics -- a pseudo-sample of the [slabs] shape --
+   as soon as its planes are written */
+extern "C" int nn_gn_stats_n(const float *x, shape5 s, int G, float eps, float *mean, float *rstd, int n0, int cnt) {
+    if (G > s.c) G = s.c;
+    if (!ISMX(x) || zs_on() || n0 < 0 || cnt < 1 || n0 + cnt > s.n) return -1;
+    const size_t S = shape_spatial(s);
+    const int NG = cnt * G;
+    double *sums = gn_dsums((size_t)2 * s.n * G);
+    cudaMemsetAsync(sums + (size_t)2 * n0 * G, 0, (size_t)2 * NG * sizeof(double));
+    if (lp_gn_sums_mx_n(x, MXDT(x), s.n, s.c, G, S, sums, 0, S, n0, cnt)) return -1;
+    gn_finalize_k<<<nblk(NG, 128), 128>>>(sums + (size_t)2 * n0 * G, NG, (size_t)(s.c / G) * S, eps, mean + (size_t)n0 * G, rstd + (size_t)n0 * G);
+    KCHECK();
+    return 0;
+}
 extern "C" int nn_gn_stats(const float *x, shape5 s, int G, float eps, float *mean, float *rstd) {
     if (G > s.c) G = s.c;
     size_t S = shape_spatial(s);
