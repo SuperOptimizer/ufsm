@@ -29,6 +29,7 @@ double xnet_macs(void);                 /* multiply-adds issued by the convoluti
 size_t xnet_mem_cached(void);           /* bytes held by the cache (free blocks) */
 size_t xnet_mem_used(void);             /* bytes handed out */
 void xnet_trim(void);                   /* free the cached blocks */
+void xnet_set_budget(size_t bytes);     /* device bytes (in use + cached) before the cache is dropped; default: free at init - 1 GB */
 void xnet_mem_info(size_t *free_b, size_t *total_b);   /* device memory free / total (cudaMemGetInfo) */
 
 void *xmalloc_dev(size_t bytes);        /* cached device memory (nullptr on failure) */

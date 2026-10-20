@@ -10,6 +10,7 @@
 
 static cudaStream_t g_st = nullptr;
 static int g_dev_ok = 0, g_verbose = 0;
+static size_t g_budget = (size_t)1 << 62;   /* device bytes in use + cached before the cache is dropped */
 static double g_macs = 0;
 extern "C" double xnet_macs(void) { return g_macs; }
 
@@ -17,6 +18,8 @@ extern "C" int xnet_init(int gpu) {
     if (g_dev_ok) return 0;
     if (cudaSetDevice(gpu) != cudaSuccess) { fprintf(stderr, "xnet: no GPU %d\n", gpu); return -1; }
     if (cudaStreamCreateWithFlags(&g_st, cudaStreamNonBlocking) != cudaSuccess) return -1;
+    size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
+    g_budget = fr > ((size_t)1 << 30) ? fr - ((size_t)1 << 30) : fr / 2;   /* free memory at start minus 1 GB headroom */
     g_dev_ok = 1; g_verbose = getenv("UFSM_XNET_VERBOSE") ? atoi(getenv("UFSM_XNET_VERBOSE")) : 0;
     return 0;
 }
@@ -32,7 +35,8 @@ extern "C" int xnet_check(const char *where) {
 struct blk { void *p; size_t n; };
 typedef struct { blk *b; size_t n, cap; } blist;
 static blist g_free, g_used;
-static size_t g_cached = 0, g_inuse = 0;
+static size_t g_cached = 0, g_inuse = 0; static int g_warned = 0;
+extern "C" void xnet_set_budget(size_t bytes) { g_budget = bytes; }
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static size_t round_up(size_t n) { const size_t q = n < (1 << 20) ? 4096 : (1 << 20); return (n + q - 1) / q * q; }
 static void bl_push(blist *l, blk b) {
@@ -48,6 +52,12 @@ extern "C" void *xmalloc_dev(size_t bytes) {
         pthread_mutex_unlock(&g_mu); return b.p;
     }
     void *p = nullptr;
+    if (g_inuse + g_cached + n > g_budget && g_cached) {   /* over budget: drop the cached blocks (WDDM pages instead of failing) */
+        cudaStreamSynchronize(g_st);
+        for (size_t i = 0; i < g_free.n; i++) cudaFree(g_free.b[i].p);
+        g_free.n = 0; g_cached = 0;
+    }
+    if (g_inuse + n > g_budget && !g_warned) { g_warned = 1; fprintf(stderr, "xnet: %zu MB in use exceeds the %zu MB device budget (lower the batch)\n", (g_inuse + n) >> 20, g_budget >> 20); }
     if (cudaMalloc(&p, n) != cudaSuccess) {   /* free the cache and retry once */
         cudaGetLastError(); cudaStreamSynchronize(g_st);
         for (size_t i = 0; i < g_free.n; i++) cudaFree(g_free.b[i].p);
@@ -111,22 +121,22 @@ __device__ __forceinline__ void mma16816(float *c, const unsigned *a, const unsi
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
-/* shared tile [rows][32 halfs]: 16-byte chunk q of a row stored at q ^ ((row >> 1) & 3) (conflict-free ldmatrix) */
-__device__ __forceinline__ int swz(int row, int q) { return row * 32 + ((q ^ ((row >> 1) & 3)) << 3); }
+/* shared tile [rows][BK halfs]: 16-byte chunk q of a row stored at q ^ f(row) (conflict-free ldmatrix of 8 rows) */
+template <int BK> __device__ __forceinline__ int swz(int row, int q) { return row * BK + ((q ^ (BK == 32 ? (row >> 1) & 3 : row & 7)) << 3); }
 
-enum { BM = 128, BK = 32, NST = 3, NTH = 256 };
-template <int BN>
+enum { BM = 128, KPAD = 64, NTH = 256 };
+template <int BN, int BK, int NST>
 __global__ void __launch_bounds__(NTH) conv_igemm(ConvP p) {
     constexpr int WARPS_N = BN == 128 ? 4 : 2, WARPS_M = 8 / WARPS_N, WM = BM / WARPS_M, WN = BN / WARPS_N, MI = WM / 16, NI = WN / 8;
-    __shared__ __align__(128) __half sA[NST][BM * BK];
-    __shared__ __align__(128) __half sB[NST][BN * BK];
+    constexpr int QC = BK / 8, RS = NTH / QC, AP = BM / RS, BP = BN / RS;   /* chunks per row, rows per pass, passes */
+    extern __shared__ __align__(128) unsigned char smem[];
+    __half *sA = (__half *)smem, *sB = sA + NST * BM * BK;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm0 = (warp / WARPS_N) * WM, wn0 = (warp % WARPS_N) * WN;
     const long long m_base = (long long)blockIdx.x * BM; const int n_base = blockIdx.y * BN;
-    /* A rows of this thread: r0 = tid / 4 and r0 + 64, chunk q = tid % 4 */
-    const int q = tid & 3; int zb[2], yb[2], xb[2]; long long nb[2];
-    for (int i = 0; i < 2; i++) {
-        const long long m = m_base + (tid >> 2) + i * 64;
+    const int q = tid % QC, r0 = tid / QC; int zb[AP], yb[AP], xb[AP]; long long nb[AP];
+    for (int i = 0; i < AP; i++) {
+        const long long m = m_base + r0 + i * RS;
         if (m < p.M) {
             long long t = m; const int xo = (int)(t % p.Wo); t /= p.Wo; const int yo = (int)(t % p.Ho); t /= p.Ho; const int zo = (int)(t % p.Do); t /= p.Do;
             zb[i] = zo * p.sd - p.pd; yb[i] = yo * p.sh - p.ph; xb[i] = xo * p.sw - p.pw; nb[i] = t * p.Di;
@@ -137,16 +147,17 @@ __global__ void __launch_bounds__(NTH) conv_igemm(ConvP p) {
         const int k = ks * BK + q * 8;
         int tz = 0, ty = 0, tx = 0, ci = 0; const bool kin = k < p.K;
         if (kin) { const int tap = k / p.Ci; ci = k - tap * p.Ci; tz = tap / khw; const int r = tap - tz * khw; ty = r / p.kw; tx = r - ty * p.kw; }
-        for (int i = 0; i < 2; i++) {
-            const int row = (tid >> 2) + i * 64;
+        __half *A = sA + slot * BM * BK, *B = sB + slot * BN * BK;
+        for (int i = 0; i < AP; i++) {
+            const int row = r0 + i * RS;
             const int zi = zb[i] + tz, yi = yb[i] + ty, xi = xb[i] + tx;
             const bool ok = kin && zi >= 0 && zi < p.Di && yi >= 0 && yi < p.Hi && xi >= 0 && xi < p.Wi;
             const __half *src = ok ? p.x + ((((nb[i] + zi) * p.Hi + yi) * (long long)p.Wi + xi) * p.Ci + ci) : p.x;
-            cp_async16(&sA[slot][swz(row, q)], src, ok ? 16 : 0);
+            cp_async16(A + swz<BK>(row, q), src, ok ? 16 : 0);
         }
-        for (int i = 0; i < BN / 64; i++) {
-            const int row = (tid >> 2) + i * 64;
-            cp_async16(&sB[slot][swz(row, q)], p.w + (size_t)(n_base + row) * p.Kp + ks * BK + q * 8, 16);
+        for (int i = 0; i < BP; i++) {
+            const int row = r0 + i * RS;
+            cp_async16(B + swz<BK>(row, q), p.w + (size_t)(n_base + row) * p.Kp + ks * BK + q * 8, 16);
         }
     };
     float acc[MI][NI][4];
@@ -157,13 +168,14 @@ __global__ void __launch_bounds__(NTH) conv_igemm(ConvP p) {
         const int slot = ks % NST;
         if (ks + NST - 1 < nk) load((ks + NST - 1) % NST, ks + NST - 1);
         cp_commit();
-        const __half *A = sA[slot], *B = sB[slot];
-        for (int kk = 0; kk < 2; kk++) {
+        const __half *A = sA + slot * BM * BK, *B = sB + slot * BN * BK;
+#pragma unroll
+        for (int kk = 0; kk < BK / 16; kk++) {
             unsigned af[MI][4], bf[NI][2];
-            for (int mi = 0; mi < MI; mi++) { const int row = wm0 + mi * 16 + (lane & 15); ldsm_x4(af[mi], A + swz(row, kk * 2 + (lane >> 4))); }
+            for (int mi = 0; mi < MI; mi++) { const int row = wm0 + mi * 16 + (lane & 15); ldsm_x4(af[mi], A + swz<BK>(row, kk * 2 + (lane >> 4))); }
             for (int nj = 0; nj < NI / 2; nj++) {
                 const int row = wn0 + nj * 16 + (lane & 7) + ((lane >> 4) << 3); unsigned r[4];
-                ldsm_x4(r, B + swz(row, kk * 2 + ((lane >> 3) & 1)));
+                ldsm_x4(r, B + swz<BK>(row, kk * 2 + ((lane >> 3) & 1)));
                 bf[2 * nj][0] = r[0]; bf[2 * nj][1] = r[1]; bf[2 * nj + 1][0] = r[2]; bf[2 * nj + 1][1] = r[3];
             }
             for (int mi = 0; mi < MI; mi++) for (int ni = 0; ni < NI; ni++) mma16816(acc[mi][ni], af[mi], bf[ni]);
@@ -192,7 +204,7 @@ extern "C" void xbn_fold(int co, const float *g, const float *b, const float *m,
 }
 
 static int conv_upload(xconv *c, const float *wk /* [co][K] in GEMM order */, int co, const float *scale, const float *bias) {
-    c->Kp = (c->K + BK - 1) / BK * BK; c->Cop = (co + 127) / 128 * 128;
+    c->Kp = (c->K + KPAD - 1) / KPAD * KPAD; c->Cop = (co + 127) / 128 * 128;
     __half *hw = (__half *)calloc((size_t)c->Cop * c->Kp, sizeof(__half)); float *sc = (float *)malloc(co * sizeof(float)), *bi = (float *)malloc(co * sizeof(float));
     if (!hw || !sc || !bi) { free(hw); free(sc); free(bi); return -1; }
     float wmax = 0;
@@ -253,6 +265,24 @@ __global__ void k_tshuffle(const __half *g, const float *bias, __half *y, int n,
     }
 }
 
+/* kernel variant: BK 32 / 64, stages; UFSM_XNET_CFG = 0 (BK 32, 3 stages), 1 (BK 32, 4), 2 (BK 64, 3), 3 (BK 64, 2) */
+template <int BN, int BK, int NST> static void launch1(const ConvP &p, int co) {
+    const size_t sm = (size_t)NST * (BM + BN) * BK * 2;
+    static int attr = 0; if (!attr) { cudaFuncSetAttribute(conv_igemm<BN, BK, NST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); attr = 1; }
+    dim3 g((unsigned)((p.M + BM - 1) / BM), (unsigned)((co + BN - 1) / BN));
+    conv_igemm<BN, BK, NST><<<g, NTH, sm, g_st>>>(p);
+}
+static int g_cfg = -1;
+static void conv_launch(const ConvP &p, int co) {
+    if (g_cfg < 0) g_cfg = getenv("UFSM_XNET_CFG") ? atoi(getenv("UFSM_XNET_CFG")) : 0;
+    const bool n64 = co <= 64;
+    switch (g_cfg) {
+    case 1: if (n64) launch1<64, 32, 4>(p, co); else launch1<128, 32, 4>(p, co); break;
+    case 2: if (n64) launch1<64, 64, 3>(p, co); else launch1<128, 64, 3>(p, co); break;
+    case 3: if (n64) launch1<64, 64, 2>(p, co); else launch1<128, 64, 2>(p, co); break;
+    default: if (n64) launch1<64, 32, 3>(p, co); else launch1<128, 32, 3>(p, co); break;
+    }
+}
 static xt conv_run(const xconv *c, xt x, const xt *res, int act) {
     xt in = x;
     if (c->unfold) in = xunfold(x, c->kw0, c->pw0);
@@ -266,10 +296,7 @@ static xt conv_run(const xconv *c, xt x, const xt *res, int act) {
     p.K = c->K; p.Kp = c->Kp; p.M = (long long)in.n * Do * Ho * Wo; p.act = act;
     g_macs += (double)p.M * c->co * c->K;
     if (g_verbose) fprintf(stderr, "xnet conv %dx%dx%d s%d%d%d ci %d co %d: in %dx%dx%dx%d out %dx%dx%d M %lld\n", c->kd, c->kh, c->kw, c->sd, c->sh, c->sw, c->ci, c->co, in.n, in.d, in.h, in.w, Do, Ho, Wo, p.M);
-    if (p.M > 0) {
-        if (c->co <= 64) { dim3 g((unsigned)((p.M + BM - 1) / BM), (unsigned)((c->co + 63) / 64)); conv_igemm<64><<<g, NTH, 0, g_st>>>(p); }
-        else { dim3 g((unsigned)((p.M + BM - 1) / BM), (unsigned)((c->co + 127) / 128)); conv_igemm<128><<<g, NTH, 0, g_st>>>(p); }
-    }
+    if (p.M > 0) conv_launch(p, c->co);
     if (c->unfold) xt_free(&in);
     return y;
 }
