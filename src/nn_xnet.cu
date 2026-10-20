@@ -9,13 +9,15 @@
 #include <string.h>
 
 static cudaStream_t g_st = nullptr;
-static int g_dev_ok = 0;
+static int g_dev_ok = 0, g_verbose = 0;
+static double g_macs = 0;
+extern "C" double xnet_macs(void) { return g_macs; }
 
 extern "C" int xnet_init(int gpu) {
     if (g_dev_ok) return 0;
     if (cudaSetDevice(gpu) != cudaSuccess) { fprintf(stderr, "xnet: no GPU %d\n", gpu); return -1; }
     if (cudaStreamCreateWithFlags(&g_st, cudaStreamNonBlocking) != cudaSuccess) return -1;
-    g_dev_ok = 1;
+    g_dev_ok = 1; g_verbose = getenv("UFSM_XNET_VERBOSE") ? atoi(getenv("UFSM_XNET_VERBOSE")) : 0;
     return 0;
 }
 extern "C" void *xnet_stream(void) { return (void *)g_st; }
@@ -262,6 +264,8 @@ static xt conv_run(const xconv *c, xt x, const xt *res, int act) {
     p.Di = in.d; p.Hi = in.h; p.Wi = in.w; p.Ci = in.c; p.Do = Do; p.Ho = Ho; p.Wo = Wo; p.Co = c->co;
     p.kd = c->kd; p.kh = c->kh; p.kw = c->kw; p.sd = c->sd; p.sh = c->sh; p.sw = c->sw; p.pd = c->pd; p.ph = c->ph; p.pw = c->pw;
     p.K = c->K; p.Kp = c->Kp; p.M = (long long)in.n * Do * Ho * Wo; p.act = act;
+    g_macs += (double)p.M * c->co * c->K;
+    if (g_verbose) fprintf(stderr, "xnet conv %dx%dx%d s%d%d%d ci %d co %d: in %dx%dx%dx%d out %dx%dx%d M %lld\n", c->kd, c->kh, c->kw, c->sd, c->sh, c->sw, c->ci, c->co, in.n, in.d, in.h, in.w, Do, Ho, Wo, p.M);
     if (p.M > 0) {
         if (c->co <= 64) { dim3 g((unsigned)((p.M + BM - 1) / BM), (unsigned)((c->co + 63) / 64)); conv_igemm<64><<<g, NTH, 0, g_st>>>(p); }
         else { dim3 g((unsigned)((p.M + BM - 1) / BM), (unsigned)((c->co + 127) / 128)); conv_igemm<128><<<g, NTH, 0, g_st>>>(p); }

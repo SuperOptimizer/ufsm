@@ -415,7 +415,8 @@ static int raw_mode(int argc, char **argv, ie_net *net, int kind) {
     const int B = atoi(iopt(argc, argv, "--batch", "2")); float *o = malloc((size_t)n * sp->T * sp->T * sizeof *o);
     const double t0 = inow();
     for (int i = 0; i < n; i += B) { const int b = n - i < B ? n - i : B; if (ie_forward(net, t + (size_t)i * per, b, o + (size_t)i * sp->T * sp->T, 1)) { free(t); free(o); return 1; } }
-    xnet_sync(); fprintf(stderr, "ink-ext: %d %s tiles in %.2fs\n", n, sp->name, inow() - t0);
+    xnet_sync(); const double dt = inow() - t0;
+    fprintf(stderr, "ink-ext: %d %s tiles in %.2fs (%.1f ms / tile, %.1f TFLOP conv, %.1f TFLOP/s)\n", n, sp->name, dt, 1e3 * dt / n, 2e-12 * xnet_macs(), 2e-12 * xnet_macs() / dt);
     f = fopen(outp, "wb"); const size_t wn = f ? fwrite(o, sizeof *o, (size_t)n * sp->T * sp->T, f) : 0; if (f) fclose(f);
     free(t); free(o);
     return wn == (size_t)n * sp->T * sp->T ? 0 : 1;

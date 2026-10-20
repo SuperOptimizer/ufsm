@@ -25,6 +25,7 @@ int xnet_init(int gpu);                 /* select the device, create the stream;
 void *xnet_stream(void);                /* the cudaStream_t of every xnet call */
 void xnet_sync(void);
 int xnet_check(const char *where);      /* 0, or prints the pending CUDA error and returns -1 */
+double xnet_macs(void);                 /* multiply-adds issued by the convolutions so far (UFSM_XNET_VERBOSE=1: each conv's shape) */
 size_t xnet_mem_cached(void);           /* bytes held by the cache (free blocks) */
 size_t xnet_mem_used(void);             /* bytes handed out */
 void xnet_trim(void);                   /* free the cached blocks */
