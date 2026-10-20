@@ -655,9 +655,10 @@ static int cmd_fit(int argc, char **argv) {
     c.w_recto = (float)atof(opt(argc, argv, "--w-recto", "0"));        /* recto anchors (fields with an r plane; 0 off) */
     if (!(c.w_wind4 >= 0) || !(c.w_recto >= 0)) { fprintf(stderr, "fit: --wind4-weight and --w-recto must be >= 0\n"); return 2; }
     /* CT in the fitter (fields with ct / cs planes: ufsm ct-fields, predict --fit-ct): papyrus / void parity and the CT sheet spacing */
-    c.w_ct = (float)atof(opt(argc, argv, "--w-ct", "0")); c.ct_pow = (float)atof(opt(argc, argv, "--ct-pow", "1")); c.ct_phi = (float)atof(opt(argc, argv, "--ct-phi", "0.15"));
-    c.ct_floor = (float)atof(opt(argc, argv, "--ct-floor", "0")); c.ct_radius_um = atof(opt(argc, argv, "--ct-radius-um", "150")); c.ct_flood = atoi(opt(argc, argv, "--ct-flood", "1"));
+    c.w_ct = (float)atof(opt(argc, argv, "--w-ct", "0")); c.ct_pow = (float)atof(opt(argc, argv, "--ct-pow", "1")); c.ct_phi = (float)atof(opt(argc, argv, "--ct-phi", "0"));
+    c.ct_floor = (float)atof(opt(argc, argv, "--ct-floor", "0")); c.ct_radius_um = atof(opt(argc, argv, "--ct-radius-um", "150")); c.ct_flood = atoi(opt(argc, argv, "--ct-flood", "0"));
     c.w_cspacing = (float)atof(opt(argc, argv, "--w-cspacing", "0")); c.cs_tol = (float)atof(opt(argc, argv, "--cs-tol", "0.25"));
+    fit_fields_ct_planes((c.w_ct > 0 ? 1 : 0) | (c.w_cspacing > 0 ? 2 : 0));   /* load only the CT planes the terms read */
     if (!(c.w_ct >= 0) || !(c.ct_pow >= 0) || !(c.ct_floor >= 0) || !(c.ct_radius_um > 0) || !(c.w_cspacing >= 0) || !(c.cs_tol > 0)) { fprintf(stderr, "fit: --w-ct, --ct-pow, --ct-floor, --w-cspacing >= 0, --ct-radius-um and --cs-tol > 0\n"); return 2; }
     if (!(c.w_pgrad >= 0) || !(c.pgrad_delta > 0) || c.unwrap_voxels < -1 || c.unwrap_voxels > 1 || !(c.phase_robust >= 0) || !(c.conf_pow > 0) || !(c.bend >= 0) || !(c.w_phase >= 0) || !(c.w_normal >= 0) || !(c.w_density >= 0) || !(c.w_smooth >= 0)) {
         fprintf(stderr, "fit: --phase-robust, --bend and the weights must be >= 0, --conf-pow and --pgrad-delta > 0, --unwrap-voxels -1, 0 or 1\n"); return 2;

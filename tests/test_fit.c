@@ -150,7 +150,7 @@ static int run_case(int dir) {
    spacing under-count the sector's extra turns by g_ctbias), as on a crushed scroll; the ct plane is the true sheets' mean CT (papyrus at
    frac W_true = 0.2, noise), cs the true spacing. Without CT the fit follows the network into the slip; with --w-ct and --w-cspacing it
    must recover the ids and the sheet placement. Returns the fraction of ids right in the sector (and *all, *prec overall). */
-static double g_ctbias = 0.5;
+static double g_ctbias = 0.5; static int g_ctflood = 0;   /* fit_cfg ct_flood (the CT phase in the voxel unwrapping) */
 static double ct_sector(double z, double y, double x) {   /* the packed sector's weight */
     double dth = atan2(y - ax_y(z), x - ax_x(z)) - 1.0; dth -= 2 * M_PI * floor((dth + M_PI) / (2 * M_PI));
     return exp(-dth * dth / (2 * 0.3 * 0.3));
@@ -194,7 +194,7 @@ static double run_ct_case(int cpu, float w_ct, float w_cs, double *all, double *
     }
     fit_fields f = {D, H, W, H8, pc, ps, {t[0], t[1], t[2], t[3], t[4], t[5]}, sp, w, cy, cx, {0}, 0, nullptr, ct, cs};
     fit_cfg c = fit_cfg_default(); c.verbose = getenv("FIT_CTV") != nullptr; c.cpu = cpu; c.dir = 1;
-    c.w_ct = w_ct; c.ct_phi = 0.2f; c.w_cspacing = w_cs;
+    c.w_ct = w_ct; c.ct_phi = 0.2f; c.w_cspacing = w_cs; c.ct_flood = g_ctflood;
     fit_model *m = fit_run(&f, &c);
     if (!m) { fprintf(stderr, "FAIL: fit_run (ct)\n"); fails++; return 0; }
     int hist[401] = {0};
@@ -215,7 +215,7 @@ static double run_ct_case(int cpu, float w_ct, float w_cs, double *all, double *
         if (sec[i]) { ns++; sright += fabs(d) < 0.5; sclose += fabs(d) < 0.08; }
     }
     *all = (double)right / nd; *prec_out = (double)close / nd;
-    printf("ct case%s, w_ct %g, w_cspacing %g: ids right %.4f (sector %.4f), |error| < 0.08 turn %.4f (sector %.4f)\n", cpu ? " cpu" : "", w_ct, w_cs,
+    printf("ct case%s%s, w_ct %g, w_cspacing %g: ids right %.4f (sector %.4f), |error| < 0.08 turn %.4f (sector %.4f)\n", cpu ? " cpu" : "", g_ctflood ? " flood" : "", w_ct, w_cs,
            *all, ns ? (double)sright / ns : 0, *prec_out, ns ? (double)sclose / ns : 0);
     const double r = ns ? (double)sright / ns : 0;
     fit_free(m);
@@ -261,6 +261,8 @@ int main(void) {
         if (getenv("FIT_CTONLY")) { run_ct_case(1, 2.f, 0.f, &a0, &p0); run_ct_case(1, 0.f, 1.f, &a0, &p0); run_ct_case(0, 0.5f, 0.f, &a0, &p0); }   /* the terms alone */
         CHECK(s1 >= 0.98 && a1 >= 0.99 && p1 >= 0.9, "cpu: CT terms: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s1, a1, p1);
         CHECK(s2 >= 0.98 && a2 >= 0.99 && p2 >= 0.9, "gpu: CT terms: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s2, a2, p2);
+        g_ctflood = 1; const double s3 = run_ct_case(1, 2.f, 0.f, &a1, &p1); g_ctflood = 0;   /* with the CT phase in the voxel unwrapping */
+        CHECK(s3 >= 0.98 && a1 >= 0.99 && p1 >= 0.9, "cpu, CT flood: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s3, a1, p1);
     }
     if (fails) { fprintf(stderr, "test_fit: %d failure(s)\n", fails); return 1; }
     printf("test_fit: OK\n");

@@ -192,6 +192,7 @@ typedef struct { fit_fields f; uint8_t *a[17]; float *cy, *cx; long long origin[
                                                        ct cs (CT planes: zarr arrays beside the others, or box-shaped ct.raw / cs.raw of ufsm ct-fields) */
 int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b);
 void fit_fields_free(fit_fields_buf *b);
+void fit_fields_ct_planes(int mask);   /* which CT planes later fit_fields_load calls read (bit 0 ct, bit 1 cs; default both) */
 
 /* a fit set: the global model plus z-slab models whose interiors [z0, z1) (box-local native z of the global box) partition it */
 typedef struct { fit_model *global; int n; fit_model **slab; double *z0, *z1, blend; } fit_set;   /* blend: W blended linearly over +-blend around slab boundaries */

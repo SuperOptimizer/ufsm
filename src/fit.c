@@ -32,8 +32,8 @@ fit_cfg fit_cfg_default(void) {
     c.phase_ramp = 0.1f; c.core = 3.f; c.unwrap_voxels = 1; c.uw_tile = 256; c.analytic = 1; c.batch = 2000000; c.conf_pow = 1.f; c.pgrad_delta = 0.25f;
     c.w_wind4 = 4.f;    /* the winding mod 4 term, active only with dz dy dx dq planes (task unwrap2 fields) */
     c.w_recto = 0.f;    /* recto anchors off by default */
-    c.w_ct = 0.f; c.ct_pow = 1.f; c.ct_phi = 0.15f; c.ct_radius_um = 150; c.ct_floor = 0.f;   /* CT parity off by default */
-    c.w_cspacing = 0.f; c.cs_tol = 0.25f; c.ct_flood = 1;
+    c.w_ct = 0.f; c.ct_pow = 1.f; c.ct_phi = 0.f; c.ct_radius_um = 150; c.ct_floor = 0.f;   /* CT parity off by default */
+    c.w_cspacing = 0.f; c.cs_tol = 0.25f; c.ct_flood = 0;
     return c;
 }
 
@@ -995,6 +995,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
         if (cpu) dctm = hctm; else { dctm = nn_malloc(n); nn_h2d(dctm, hctm, n); }
         if (c->verbose) { size_t np = 0, nv = 0; for (size_t i = 0; i < n; i++) if (f->w[i] && hctm[i] != 128) { np += hctm[i] > 128; nv += hctm[i] < 128; }
                           fprintf(stderr, "fit: CT parity (weight %g, (1 - conf)^%g >= %g, papyrus phase %.3f, radius %d cells): %zu papyrus / %zu void cells\n", c->w_ct, c->ct_pow, c->ct_floor, c->ct_phi, pr, np, nv); }
+        if (!cpu && !c->ct_flood) { free(hctm); hctm = nullptr; }   /* on the device only (the flood reads it on the host) */
     }
     if (f->cs && c->w_cspacing > 0) {
         dcs = fb_alloc(cpu, n); fb_put(cpu, dcs, f->cs, n);
@@ -1326,6 +1327,8 @@ static int fields_core(const json *j, coreline *C) {
     if (cl_load(C, cp)) { fprintf(stderr, "fit: cannot load the core line %s\n", cp); return 0; }
     return side < 0 ? -1 : 1;
 }
+static int g_ct_planes = 3;   /* the CT planes fit_fields_load reads: bit 0 ct, bit 1 cs */
+void fit_fields_ct_planes(int mask) { g_ct_planes = mask; }
 int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf *b) {
     const char *const *nm = fit_plane_names;
     memset(b, 0, sizeof *b);
@@ -1349,7 +1352,8 @@ int fit_fields_load(const char *dir, int fz0, int fz1, int pool, fit_fields_buf 
         if (want_recto > 0 && !exists) { fprintf(stderr, "fit: missing declared recto field %s\n", path); json_free(j); return -1; }
         if (exists) act[nact++] = 14;
     }
-    for (int k = 15; k < 17 && pool == 1; k++) {   /* the CT planes: zarr arrays beside the others (predict --fit-zarr --fit-ct), else box-shaped raw
+    for (int k = 15; k < 17 && pool == 1; k++) {
+        if (!(g_ct_planes >> (k - 15) & 1)) continue;   /* (fit_fields_ct_planes: not wanted) */   /* the CT planes: zarr arrays beside the others (predict --fit-zarr --fit-ct), else box-shaped raw
                                                      files (ufsm ct-fields, predict --fit-fields --fit-ct) */
         snprintf(path, sizeof path, "%s/%s/zarr.json", dir, nm[k]);
         if (zarr && access(path, F_OK) == 0) { act[nact++] = k; continue; }
