@@ -278,6 +278,51 @@ typedef struct {
     ctlev lev[6]; int nlev; double lev_um[6];
 } irun;
 
+/* the network side of run_surface in its own thread: batches handed over by the renderer (double buffered), forward,
+   blend into num / den, so the CPU render of the next rows overlaps the GPU */
+typedef struct {
+    pthread_mutex_t mu; pthread_cond_t cv; int has, quit, fail;
+    uint8_t *tiles; int *tx, *ty, nb;            /* the submitted batch */
+    irun *X; int D, T, Wm, Hm; const float *win; float *num, *den, *out;
+    double tg; long long ntiles;
+} gworker;
+static void *gpu_worker(void *a) {
+    gworker *G = a; irun *X = G->X; const int D = G->D, T = G->T, Wm = G->Wm, Hm = G->Hm;
+    for (;;) {
+        pthread_mutex_lock(&G->mu);
+        while (!G->has && !G->quit) pthread_cond_wait(&G->cv, &G->mu);
+        if (!G->has && G->quit) { pthread_mutex_unlock(&G->mu); break; }
+        pthread_mutex_unlock(&G->mu);
+        const int nb = G->nb; const double t0 = inow();
+        if (!G->fail && ie_forward(X->net, G->tiles, nb, G->out, 0)) G->fail = 1;
+        G->tg += inow() - t0; G->ntiles += nb;
+        if (!G->fail) for (int k = 0; k < nb; k++) {
+            const float *o = G->out + (size_t)k * T * T; const uint8_t *tl = G->tiles + (size_t)k * D * T * T;
+            const int ph = G->ty[k] + T <= Hm ? T : Hm - G->ty[k], pw = G->tx[k] + T <= Wm ? T : Wm - G->tx[k];
+            for (int y = 0; y < ph; y++) for (int x = 0; x < pw; x++) {
+                const size_t g = (size_t)(G->ty[k] + y) * Wm + G->tx[k] + x; const float w = G->win[y * T + x];
+                if (X->kind == IE_V8IN) { G->num[g] += o[y * T + x] * w; G->den[g] += 1; }
+                else if (X->kind == IE_READER3) { G->num[g] += o[y * T + x] * w; G->den[g] += w; }
+                else {   /* Hecate: probability x support (column has data) x window; den is the renderer's */
+                    int sup = 0; for (int i = 0; i < D && !sup; i++) sup = tl[((size_t)i * T + y) * T + x] != 0;
+                    G->num[g] += sup ? o[y * T + x] * w : 0.f;
+                }
+            }
+        }
+        pthread_mutex_lock(&G->mu); G->has = 0; pthread_cond_broadcast(&G->cv); pthread_mutex_unlock(&G->mu);
+    }
+    return nullptr;
+}
+/* hand the batch over (waits for the previous one); the caller gets the worker's previous buffers back */
+static void gpu_submit(gworker *G, uint8_t **tiles, int **tx, int **ty, int nb) {
+    pthread_mutex_lock(&G->mu);
+    while (G->has) pthread_cond_wait(&G->cv, &G->mu);
+    uint8_t *t = G->tiles; int *a = G->tx, *b = G->ty;
+    G->tiles = *tiles; G->tx = *tx; G->ty = *ty; G->nb = nb; G->has = 1;
+    *tiles = t; *tx = a; *ty = b;
+    pthread_cond_broadcast(&G->cv); pthread_mutex_unlock(&G->mu);
+}
+
 /* the probability map (model grid Wm x Hm) of one surface */
 static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *pdu, float **pctl) {
     const ie_spec *sp = X->sp; const int D = sp->D, T = sp->T;
@@ -304,6 +349,10 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     int rb0 = 0, rb1 = 0;
     const int B = X->batch; uint8_t *tiles = malloc((size_t)B * D * T * T); int *tx = malloc(B * sizeof *tx), *ty = malloc(B * sizeof *ty); int nb = 0;
     float *out = malloc((size_t)B * T * T * sizeof *out);
+    gworker G = {0}; pthread_mutex_init(&G.mu, nullptr); pthread_cond_init(&G.cv, nullptr);
+    G.X = X; G.D = D; G.T = T; G.Wm = Wm; G.Hm = Hm; G.win = win; G.num = num; G.den = den; G.out = out;
+    G.tiles = malloc((size_t)B * D * T * T); G.tx = malloc(B * sizeof *tx); G.ty = malloc(B * sizeof *ty);
+    pthread_t gth; pthread_create(&gth, nullptr, gpu_worker, &G);
     uint8_t *closed = cov ? calloc((size_t)Wm * Hm, 1) : nullptr; int closed_to = 0;   /* v8in: closed coverage valid for rows < closed_to */
     long long ntiles = 0, nskip = 0; double tr = 0, tg = 0; int fail = 0;
     #define ROW(r) ring[(r) % RB]
@@ -363,28 +412,18 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
                 tx[nb] = x0; ty[nb] = y0; nb++;
             }
             if (nb == B || (ix == nx && iy == ny - 1 && nb)) {
-                const double t0 = inow();
-                if (ie_forward(X->net, tiles, nb, out, 0)) { fail = 1; break; }
-                tg += inow() - t0; ntiles += nb;
-                for (int k = 0; k < nb; k++) {
-                    const float *o = out + (size_t)k * T * T; const uint8_t *tl = tiles + (size_t)k * D * T * T;
-                    const int ph = ty[k] + T <= Hm ? T : Hm - ty[k], pw = tx[k] + T <= Wm ? T : Wm - tx[k];
-                    for (int y = 0; y < ph; y++) for (int x = 0; x < pw; x++) {
-                        const size_t g = (size_t)(ty[k] + y) * Wm + tx[k] + x; const float w = win[y * T + x];
-                        if (X->kind == IE_V8IN) { num[g] += o[y * T + x] * w; den[g] += 1; }
-                        else if (X->kind == IE_READER3) { num[g] += o[y * T + x] * w; den[g] += w; }
-                        else {   /* Hecate: probability x support (column has data) x window */
-                            int sup = 0; for (int i = 0; i < D && !sup; i++) sup = tl[((size_t)i * T + y) * T + x] != 0;
-                            num[g] += sup ? o[y * T + x] * w : 0.f;
-                        }
-                    }
-                }
-                nb = 0;
+                if (G.fail) { fail = 1; break; }
+                gpu_submit(&G, &tiles, &tx, &ty, nb); nb = 0;
             }
         }
-        if (iy % 8 == 0) fprintf(stderr, "\rink-ext: %s row %d/%d: %lld tiles (%lld empty), render %.0fs, net %.0fs   ", sp->name, iy + 1, ny, ntiles, nskip, tr, tg);
+        if (iy % 8 == 0) fprintf(stderr, "\rink-ext: %s row %d/%d: %lld tiles (%lld empty), render %.0fs, net %.0fs   ", sp->name, iy + 1, ny, G.ntiles, nskip, tr, G.tg);
     }
     #undef ROW
+    pthread_mutex_lock(&G.mu); G.quit = 1; pthread_cond_broadcast(&G.cv); pthread_mutex_unlock(&G.mu);
+    pthread_join(gth, nullptr);
+    if (G.fail) fail = 1;
+    tg = G.tg; ntiles = G.ntiles;
+    free(G.tiles); free(G.tx); free(G.ty); pthread_mutex_destroy(&G.mu); pthread_cond_destroy(&G.cv);
     fprintf(stderr, "\rink-ext: %s %s: %lld tiles (%lld empty skipped), render %.1fs, net %.1fs (%.1f tiles/s), CT chunks decoded %llu\n", S->name, sp->name, ntiles, nskip, tr, tg, tg > 0 ? ntiles / tg : 0, (unsigned long long)X->lev[L].ndec);
     for (size_t i = 0; i < (size_t)Wm * Hm; i++) {
         const float d = den[i]; float p = X->kind == IE_READER3 ? (d > 1e-6f ? num[i] / d : 0.f) : (d != 0 ? num[i] / d : 0.f);
