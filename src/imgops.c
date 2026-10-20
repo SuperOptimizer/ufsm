@@ -512,7 +512,40 @@ double ink_corr(const uint8_t *a, const uint8_t *b, const uint8_t *mask, size_t 
     const double va = saa - sa * sa / k, vb = sbb - sb * sb / k;
     return va > 0 && vb > 0 ? (sab - sa * sb / k) / sqrt(va * vb) : 0;
 }
+void img_stretch(uint8_t *im, const uint8_t *mask, size_t n, double plo, double phi) {
+    long long hist[256] = {0}, cnt = 0;
+    for (size_t i = 0; i < n; i++) if (mask[i]) { hist[im[i]]++; cnt++; }
+    if (!cnt) return;
+    int lo = 0, hi = 255; long long c = 0;
+    for (lo = 0; lo < 255; lo++) { c += hist[lo]; if (c >= plo * cnt) break; }
+    c = 0; for (hi = 0; hi < 255; hi++) { c += hist[hi]; if (c >= phi * cnt) break; }
+    if (hi <= lo) hi = lo + 1;
+    uint8_t lut[256]; for (int v = 0; v < 256; v++) { const double g = (v - lo) * 255.0 / (hi - lo); lut[v] = (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : lround(g)); }
+    for (size_t i = 0; i < n; i++) im[i] = mask[i] ? lut[im[i]] : 0;
+}
+int img_best_window(const uint8_t *im, const uint8_t *mask, int w, int h, int win, int *x0, int *y0) {
+    if (win > w) win = w;
+    if (win > h) win = h;
+    if (win < 1) return -1;
+    const size_t W1 = (size_t)w + 1; double *S = calloc(W1 * (h + 1), sizeof *S); long long *M = calloc(W1 * (h + 1), sizeof *M);
+    if (!S || !M) { free(S); free(M); return -1; }
+    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {   /* integral images of the masked ink and of the mask */
+        const size_t i = (size_t)y * w + x, o = (size_t)(y + 1) * W1 + x + 1;
+        S[o] = (mask[i] ? im[i] : 0) + S[o - 1] + S[o - W1] - S[o - W1 - 1]; M[o] = (mask[i] != 0) + M[o - 1] + M[o - W1] - M[o - W1 - 1];
+    }
+    const int st = win / 4 > 0 ? win / 4 : 1; double best = -1; *x0 = *y0 = 0;
+    for (int y = 0; y + win <= h; y += st) for (int x = 0; x + win <= w; x += st) {
+        const size_t a = (size_t)y * W1 + x, b = a + win, c = a + (size_t)win * W1, d = c + win;
+        const long long m = M[d] - M[b] - M[c] + M[a]; if (m * 2 < (long long)win * win) continue;   /* at least half on the surface */
+        const double s = S[d] - S[b] - S[c] + S[a]; if (s > best) { best = s; *x0 = x; *y0 = y; }
+    }
+    free(S); free(M);
+    return best < 0 ? -1 : 0;
+}
 uint8_t *ink_panels_half(const uint8_t *const *img, const int *is_ct, int nimg, int w, int h, const char *const *labels, int *ow, int *oh, int nthreads) {
+    return ink_panels(img, is_ct, nimg, w, h, labels, 1, ow, oh, nthreads);
+}
+uint8_t *ink_panels(const uint8_t *const *img, const int *is_ct, int nimg, int w, int h, const char *const *labels, int half_res, int *ow, int *oh, int nthreads) {
     const int TW = nimg * w + 8 * (nimg - 1);
     uint8_t *full = malloc((size_t)TW * h * 3);
     if (!full || nimg < 1) { free(full); return nullptr; }
@@ -527,6 +560,7 @@ uint8_t *ink_panels_half(const uint8_t *const *img, const int *is_ct, int nimg, 
     }
     const int sc = h / 200 > 1 ? h / 200 : 2; const uint8_t yel[3] = {255, 220, 0};
     for (int k = 0; k < nimg; k++) if (labels && labels[k]) img_text_scaled(full, TW, h, k * (w + 8) + 2 * sc, 2 * sc, labels[k], sc, yel);
+    if (!half_res) { *ow = TW; *oh = h; return full; }
     *ow = TW / 2; *oh = h / 2;
     uint8_t *half = *ow > 0 && *oh > 0 ? malloc((size_t)*ow * *oh * 3) : nullptr;
     if (!half || pil_resize(full, TW, h, 3, half, *ow, *oh, PIL_BOX, nthreads)) { free(half); half = nullptr; }

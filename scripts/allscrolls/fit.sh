@@ -1,33 +1,38 @@
 #!/usr/bin/env bash
-# fit.sh S [BOX...]: spiral fits of scroll S (laptop) from its published prod96 fit fields, resumable (A/<S>/state, per-box FITDONE).
+# fit.sh S [BOX...]: LOCAL spiral fits of scroll S in boxes, from its published prod96 fit fields; resumable (A/<S>/state, per-box FITDONE).
+# User (10-20): local fits only (global spiral fits failed on 1299 and got ~20% ids on a Paris 4 cross-section), fastest path to
+# rendered cm2: the best boxes first, the cleanest sheets of each box exported for rendering as soon as the box is done.
 #  1 fields: the fit-field zarr copied to A/<S>/fields (whole 512^3 shard files, curl --parallel; absent shards = air)
-#  2 boxes: N^3 field cells (N 768: 1536 native voxels, 1.3-1.4 cm; 1024 needs > 6 GB in ct-fields / fit), stride N - 128, material share from CT level 5; the boxes with
-#    >= 10% material in the order: middle z first, then outward (A/<S>/boxes.tsv). MAXBOX (default all) caps the boxes of this pass.
-#  3 per box: CT planes (ufsm ct-fields, CT level 1), GLOBAL fit (the scroll's axis from fields.json, box-local) with the best measured
-#    settings (--w-ct 1 --ct-phi 0 --ct-flood 0 --uw-repair 8 --w-normal 3, z-slabs) -> wraps (tifxyz at the native um) -> gate
-#    (ufsm stitch quality: phase coherence >= COH (0.45), anti-aligned <= ANTI (0.15)). A failing box is refitted LOCALLY (the axis
-#    2000 native voxels from the box centre along its mean sheet normal, the better side by a probe fit of the centre, --core 0) and the
-#    better of the two by coherence is kept. Per-box stats: surf-stats (clean sheet, spacing errors, phase residual).
-#  4 stitch: ufsm stitch align / quality / solve / sheets over the kept box fits -> A/<S>/sheets (connected sheets across boxes, >= 1 cm2)
-#  5 A/<S>/surf: per box tifxyz + stitched sheets + list.tsv (surface, kind, area cm2) for the desk (render.sh)
-# Every heavy command runs under capped.sh (MEM 6G) on the laptop; one box at a time; the GPU part of each fit under ~/ufsm-data/gpu.lock.
+#  2 boxes: N^3 field cells (desk N 1024 = 2048 native voxels, 1.8-1.9 cm; laptop N 512 = 0.9 cm: its 6 GB job cap OOMs larger
+#    boxes), stride N - 128, >= 10% material on CT level 5; order (A/<S>/boxes-N.tsv): high material, mid radius (0.55 of the outermost
+#    material box's radius from the scroll axis), middle z: score = material - 2 |r / rmax - 0.55| - |z - zmid| / Z
+#  3 per box (MAXBOX of them this pass, default 2): CT planes (ct-fields, CT level 1), probe fits of the centre sub-box with the axis
+#    2000 native voxels away along its mean sheet normal on both sides (the lower loss wins; or CORE=1 with A/<S>/core-line.json: the
+#    core-line half box of that side, ufsm coreline box), the box fit (--core 0, --w-ct 1 --ct-phi 0 --ct-flood 0 --uw-repair 8
+#    --w-normal 3, wind4 off = default), wraps at the native um, surf-stats --per-wrap --ct (on papyrus) -> the TOPW (3) best sheets
+#    (area x on-papyrus x (1 - phase-residual share), >= 0.5 cm2, on papyrus >= MINPAP 0.5) -> A/<S>/SURF/<box>/<wrap> and a row in
+#    A/<S>/SURF/list.tsv (surface, kind, area cm2, on papyrus); SURF = surf (desk) or surf-l (laptop; pushed to the desk for render.sh)
+#  4 STITCH=1: ufsm stitch align / quality / solve / sheets over the fitted boxes (only the agreeing neighbours join: --min-agree 0.5)
+#  5 GTCHECK=1 (desk): the published segments of this scan (AWS "-on-<scan id>-" tifxyz) vs a raster of the fitted wraps (ufsm wrapdist)
 D=$(cd "$(dirname "$0")" && pwd); . $D/common.sh
 s=$1; shift; read -r scan um fz <<< "$(scan_of $s)"; [ -n "${fz:-}" ] || { echo "fit.sh: $s not in $A/scrolls.tsv"; exit 2; }
-S=$A/$s; F=$S/fields/$fz; mkdir -p $S/state $S/boxes $S/surf; CK=$s/volumes/$scan.zarr
-if [ $HOST = desk ]; then N=${N:-1024}; TH=${TH:-12}; else N=${N:-768}; TH=${TH:-8}; fi; ST=$((N - 128)); COH=${COH:-0.45}; ANTI=${ANTI:-0.15}
-FITA=(--w-ct 1 --ct-phi 0 --ct-flood 0 --uw-repair 8 --w-normal 3 --threads $TH --quiet)   # (whole box; --slab must be a multiple of the knot spacing)
-[ -n "${SLAB:-}" ] && FITA+=(--slab $SLAB --overlap 128)
-# FIT ARGS..: ufsm fit; laptop: under the shared GPU lock (ink-model porting agent) and capped.sh MEM; desk: GPU FITGPU (1) or FITCPU=1
+S=$A/$s; F=$S/fields/$fz; CK=$s/volumes/$scan.zarr
+if [ $HOST = desk ]; then N=${N:-1024}; TH=${TH:-12}; SURF=surf; else N=${N:-512}; TH=${TH:-8}; SURF=surf-l; fi
+ST=$((N - 128)); BX=$S/boxes-$N; mkdir -p $S/state $BX $S/$SURF
+FITA=(--w-ct 1 --ct-phi 0 --ct-flood 0 --uw-repair 8 --w-normal 3 --core 0 --threads $TH --quiet)   # (whole box; --slab must be a multiple of the knot spacing)
+# FIT ARGS..: ufsm fit; laptop: under the shared GPU lock (ink-model porting agent) and capped.sh MEM; desk: FITCPU=1 --cpu, else the emptier GPU
 FIT() { if [ $HOST = laptop ]; then flock $HOME/ufsm-data/gpu.lock env MEM=${MEM:-6G} UFSM_FIT_THREADS=$TH $HOME/ufsm-data/capped.sh $U fit "$@"
         elif [ "${FITCPU:-0}" = 1 ]; then UFSM_FIT_THREADS=$TH nice -n 5 $U fit "$@" --cpu
-        else local g=${FITGPU:-$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | sort -t, -k2 -n | head -1 | cut -d, -f1)}   # the emptier GPU
+        else local g=${FITGPU:-$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | sort -t, -k2 -n | head -1 | cut -d, -f1)}
              UFSM_FIT_THREADS=$TH nice -n 5 $U fit "$@" --gpu $g; fi; }
 g1() { grep -oE "$1" "$2" 2> /dev/null | tail -1 | grep -oE '[0-9.]+$'; }
+CT1=(--ct $R $CK/1 --ct-um $(awk -v u=$um 'BEGIN { print 2 * u }') --ct-level 80 --ct-range 15 --cache $S/ctcache-$HOST)
 
+exec 9> $BX.lock; flock 9   # (steps 1-2: one fetcher / list builder; the other fit.sh of the scroll waits)
 # ---- 1 fields
-if ! done_ $s fields; then
+if ! done_ $s fields || [ ! -s $F/fields.json ]; then
   mkdir -p $F; P=48
-  for f in fields.json README.json zarr.json; do curl -sf --retry 5 $R/$s/representations/predictions/fit-fields/$fz/$f -o $F/$f || [ $f = zarr.json ]; done
+  for f in fields.json README.json; do curl -sf --retry 5 $R/$s/representations/predictions/fit-fields/$fz/$f -o $F/$f; done
   [ -s $F/fields.json ] || { echo "fit.sh: no fields.json for $s"; exit 1; }
   for p in pc ps t0 t1 t2 t3 t4 t5 sp w; do
     base=$R/$s/representations/predictions/fit-fields/$fz/$p; dst=$F/$p; mkdir -p $dst
@@ -54,132 +59,106 @@ if ! done_ $s fields; then
   mark $s fields "$(du -sh $F | cut -f1)"
 fi
 read -r SZ SY SX <<< "$(jq -r '.shape | map(tostring) | join(" ")' $F/fields.json)"; H=$(jq -r .h $F/fields.json)
+[ -s $S/axis.tsv ] || jq -r '.axis[] | @tsv' $F/fields.json > $S/axis.tsv   # line z + 1: the axis y x at native z
 
-# ---- 2 box list: corner (cells), material % (CT level 5: 32 native voxels; box = 2N/32 = N/16 voxels), middle z first
-if [ ! -s $S/boxes.tsv ]; then
-  t=$S/boxes.tsv.tmp; : > $t; n5=$((N * H / 32))
+# ---- 2 box list (corner in cells, material % from CT level 5 = 32 native voxels, radius share), best boxes first
+if [ ! -s $BX.tsv ]; then
+  t=$BX.tsv.tmp; : > $t; n5=$((N * H / 32))
   for ((z = 0; z + 256 <= SZ; z += ST)); do for ((y = 0; y + 256 <= SY; y += ST)); do for ((x = 0; x + 256 <= SX; x += ST)); do
     pct=$($U read $R $CK/5 $((z * H / 32)) $((y * H / 32)) $((x * H / 32)) $n5 $n5 $n5 /dev/null 2>&1 | grep -oE 'nonzero [0-9.]+' | awk '{print $2}')
     [ -n "$pct" ] || { echo "fit.sh: CT level 5 read failed at $z $y $x"; exit 1; }
-    awk -v p=$pct 'BEGIN { exit !(p >= 10) }' && printf 'b%05d_%04d_%04d\t%d\t%d\t%d\t%s\n' $z $y $x $z $y $x $pct >> $t
+    awk -v p=$pct 'BEGIN { exit !(p >= 10) }' || continue
+    zc=$(( (z + N / 2) * H )); read -r ay ax <<< "$(sed -n "$((zc < SZ * H ? zc + 1 : SZ * H))p" $S/axis.tsv)"
+    r=$(awk -v y=$(( (y + N / 2) * H )) -v x=$(( (x + N / 2) * H )) -v ay=$ay -v ax=$ax 'BEGIN { printf "%.0f", sqrt((y - ay) ^ 2 + (x - ax) ^ 2) }')
+    printf 'b%05d_%04d_%04d\t%d\t%d\t%d\t%s\t%s\n' $z $y $x $z $y $x $pct $r >> $t
   done; done; done
-  awk -v m=$((SZ / 2)) -v n=$N -F'\t' '{ d = $2 + n / 2 - m; print (d < 0 ? -d : d) "\t" (100 - $5) "\t" $0 }' $t | sort -n -k1,1 -k2,2 | cut -f3- > $S/boxes.tsv; rm -f $t
-  echo "$s: $(wc -l < $S/boxes.tsv) boxes with >= 10% material (grid $N cells, stride $ST)"
+  rmax=$(awk -F'\t' '$5 >= 50 && $6 > m { m = $6 } END { print m + 1 }' $t)
+  awk -F'\t' -v OFS='\t' -v rmax=$rmax -v zm=$((SZ / 2)) -v Z=$SZ -v n=$N '{ rn = $6 / rmax; d = rn - 0.55; dz = $2 + n / 2 - zm;
+      sc = $5 / 100 - 2 * (d < 0 ? -d : d) - (dz < 0 ? -dz : dz) / Z; printf "%.4f\t%s\t%s\t%s\t%s\t%s\t%.2f\n", sc, $1, $2, $3, $4, $5, rn }' $t |
+    sort -t$'\t' -k1,1 -gr | cut -f2- > $BX.tsv; rm -f $t
+  echo "$s: $(wc -l < $BX.tsv) boxes of $N cells with >= 10% material; best $(head -1 $BX.tsv | tr '\t' ' ')"
 fi
+exec 9>&-
 
-# fj DIR Z Y X NZ NY NX [AY AX]: a zarr-backed fields dir for the box (corner Z Y X cells, size NZ NY NX): the planes linked to F, the
-# scroll's axis made box-local (or the constant box-local axis AY AX, native voxels)
+# fj DIR Z Y X NZ NY NX AY AX: a zarr-backed fields dir for the box (corner Z Y X cells, size NZ NY NX; planes linked to F) with the
+# constant box-local axis AY AX (native voxels)
 fj() {
   local d=$1 z=$2 y=$3 x=$4 nz=$5 ny=$6 nx=$7; mkdir -p $d
   for p in pc ps t0 t1 t2 t3 t4 t5 sp w; do ln -sfn $F/$p $d/$p; done
-  if [ $# -ge 9 ]; then
-    jq -c --argjson z $z --argjson y $y --argjson x $x --argjson nz $nz --argjson ny $ny --argjson nx $nx --argjson h $H --argjson ay $8 --argjson ax $9 \
-      '{format: "zarr", origin: [$z * $h, $y * $h, $x * $h], shape: [$nz, $ny, $nx], h: $h, um: .um, zarr_offset: [$z, $y, $x],
-        axis: [range(0; $nz * $h + 1) | [$ay, $ax]]}' $F/fields.json > $d/fields.json
-  else
-    jq -c --argjson z $z --argjson y $y --argjson x $x --argjson nz $nz --argjson ny $ny --argjson nx $nx --argjson h $H \
-      '{format: "zarr", origin: [$z * $h, $y * $h, $x * $h], shape: [$nz, $ny, $nx], h: $h, um: .um, zarr_offset: [$z, $y, $x],
-        axis: [.axis[$z * $h : ($z + $nz) * $h + 1][] | [.[0] - $y * $h, .[1] - $x * $h]]}' $F/fields.json > $d/fields.json
-  fi
+  jq -c --argjson z $z --argjson y $y --argjson x $x --argjson nz $nz --argjson ny $ny --argjson nx $nx --argjson h $H --argjson ay $8 --argjson ax $9 \
+    '{format: "zarr", origin: [$z * $h, $y * $h, $x * $h], shape: [$nz, $ny, $nx], h: $h, um: .um, zarr_offset: [$z, $y, $x],
+      axis: [range(0; $nz * $h + 1) | [$ay, $ax]]}' $F/fields.json > $d/fields.json
 }
-# quality DIR: the box's phase coherence / anti-aligned share vs the network (ufsm stitch quality) -> DIR/quality.log; prints "coh anti"
-quality() {
-  printf '{"um": %s, "boxes": [{"name": "%s", "dir": "%s"}], "edges": []}\n' $um $(basename $1) $1 > $1/box.json
-  C $U stitch quality $1/box.json $1/box_q.json --fields $F --threads $TH > $1/quality.log 2>&1
-  echo "$(grep -oE 'phase coherence [0-9.]+' $1/quality.log | tail -1 | awk '{print $3}') $(g1 'coherent \(>= 0.5\) [0-9.]+, anti-aligned [0-9.]+' $1/quality.log)"
-}
-# fitone DIR FIELDDIR [extra fit args]: fit + wraps + quality + surf-stats in DIR
-fitone() {
-  local o=$1 f=$2; shift 2; rm -rf $o/fit $o/tifxyz
-  local t=$(date +%s); FIT $f --out $o/fit "${FITA[@]}" "$@" > $o/fit.log 2>&1 || return 1; echo "fit wall $(( $(date +%s) - t ))s" >> $o/fit.log
-  C $U wraps $o/fit $o/tifxyz --step 1 --out-um $um --fields $f --threads $TH > $o/wraps.log 2>&1 || return 1
-  C $U surf-stats $o/tifxyz --fields $f --model $o/fit --threads $TH > $o/stats.log 2>&1 || true
-}
-
-# ---- 3 box fits
-ls_boxes() { if [ $# -gt 0 ]; then printf '%s\n' "$@"; else head -n ${MAXBOX:-100000} $S/boxes.tsv | cut -f1; fi; }
-# several fit.sh of one scroll share the boxes (claims: boxes/<b>.claim = host pid; a dead claimant's claim is taken over)
-claim() { local c=$S/boxes/$1.claim; mkdir -p $S/boxes
+# several fit.sh of one scroll share the boxes (claims: <box>.claim = host pid; a dead claimant's claim is taken over)
+claim() { local c=$BX/$1.claim
   if ! mkdir $c 2> /dev/null; then read -r h p < $c/who 2> /dev/null; [ "${h:-}" = $HOST ] && ! kill -0 ${p:-0} 2> /dev/null || return 1; fi
   echo "$HOST $$" > $c/who; }
+
+# ---- 3 box fits, best boxes first
+ls_boxes() { if [ $# -gt 0 ]; then printf '%s\n' "$@"; else head -n ${MAXBOX:-2} $BX.tsv | cut -f1; fi; }
 for b in $(ls_boxes "$@"); do
-  d=$S/boxes/$b; [ -e $d/FITDONE ] || [ -e $d/FITDONE.failed ] && continue; claim $b || continue
-  read -r z y x pct <<< "$(awk -v b=$b '$1 == b {print $2, $3, $4, $5}' $S/boxes.tsv)"
+  d=$BX/$b; [ -e $d/FITDONE ] || [ -e $d/FITDONE.failed ] && continue; claim $b || continue
+  read -r z y x pct rn <<< "$(awk -v b=$b '$1 == b {print $2, $3, $4, $5, $6}' $BX.tsv)"
   nz=$((SZ - z < N ? SZ - z : N)) ny=$((SY - y < N ? SY - y : N)) nx=$((SX - x < N ? SX - x : N)); t0=$(date +%s)
-  rm -rf $d; mkdir -p $d/g; fj $d/f $z $y $x $nz $ny $nx
-  C $U ct-fields $R $CK/1 $d/f --ct-um $(awk -v u=$um 'BEGIN { print 2 * u }') --threads $TH --cache $S/ctcache > $d/ct.log 2>&1 || { echo "FAILED ct-fields" > $d/FITDONE.failed; continue; }
-  # global
-  if fitone $d/g $d/f; then read -r gc ga <<< "$(quality $d/g)"; else gc=0 ga=1; fi
-  kind=global; kc=${gc:-0}; ka=${ga:-1}
-  if ! awk -v c=${gc:-0} -v a=${ga:-1} -v C=$COH -v A=$ANTI 'BEGIN { exit !(c >= C && a <= A) }'; then
-    # local: probe the centre sub-box on both sides, mean normal + side, then the box with the axis there
-    pz=$((z + nz / 4)) py=$((y + ny / 2 - 192)) px=$((x + nx / 2 - 192)); [ $py -lt $y ] && py=$y; [ $px -lt $x ] && px=$x
-    mkdir -p $d/p; fj $d/pf $pz $py $px $((nz / 2)) $((ny < 384 ? ny : 384)) $((nx < 384 ? nx : 384)) 0 0
-    for sd in p m; do Dn=2000; [ $sd = m ] && Dn=-2000; FIT $d/pf --out $d/p/$sd --core 0 --axis-normal $Dn --quiet > $d/p/$sd.log 2>&1; done
-    lp=$(g1 'loss [0-9.]+ in' $d/p/p.log | head -1); lm=$(g1 'loss [0-9.]+ in' $d/p/m.log | head -1)
-    sd=p; sg=-1; awk -v a="${lp:-9e9}" -v b="${lm:-9e9}" 'BEGIN { exit !(b < a) }' && { sd=m; sg=1; }
-    read -r ny_ nx_ <<< "$(grep -m1 'mean normal' $d/p/$sd.log | sed -E 's/.*mean normal z [-0-9.]+ y ([-0-9.]+) x ([-0-9.]+);.*/\1 \2/')"
-    if [ -n "${nx_:-}" ] && [ -n "${lp:-}${lm:-}" ]; then
-      read -r ay ax <<< "$(awk -v ny=$ny_ -v nx=$nx_ -v g=$sg -v cy=$((ny * H / 2)) -v cx=$((nx * H / 2)) 'BEGIN { l = sqrt(ny * ny + nx * nx); printf "%.1f %.1f", cy + g * 2000 * ny / l, cx + g * 2000 * nx / l }')"
-      mkdir -p $d/l; fj $d/lf $z $y $x $nz $ny $nx $ay $ax; cp $d/f/ct.raw $d/f/cs.raw $d/f/ct.json $d/lf/ 2> /dev/null
-      if fitone $d/l $d/lf --core 0; then
-        read -r lc la <<< "$(quality $d/l)"
-        awk -v l=${lc:-0} -v g=${gc:-0} 'BEGIN { exit !(l > g) }' && { kind=local; kc=$lc; ka=${la:-1}; }
-      fi
-    fi
-    rm -rf $d/p $d/pf
+  rm -rf $d; mkdir -p $d/p; fail() { echo "FAILED $1" > $d/FITDONE.failed; rm -f $d/*/*.raw; }
+  # probe: the centre sub-box (half the box in z, 3/8 in y / x), both sides; mean sheet normal + the better side
+  pn=$((N * 3 / 8)); pz=$((z + nz / 4)) py=$((y + (ny - pn) / 2)) px=$((x + (nx - pn) / 2))
+  fj $d/pf $pz $py $px $((nz / 2)) $((ny < pn ? ny : pn)) $((nx < pn ? nx : pn)) 0 0
+  for sd in p m; do Dn=2000; [ $sd = m ] && Dn=-2000; FIT $d/pf --out $d/p/$sd --core 0 --axis-normal $Dn --quiet > $d/p/$sd.log 2>&1; done
+  lp=$(g1 'loss [0-9.]+' $d/p/p.log); lm=$(g1 'loss [0-9.]+' $d/p/m.log)
+  [ -n "${lp:-}${lm:-}" ] || { fail "both probe fits"; continue; }
+  sd=p; sg=-1; awk -v a="${lp:-9e9}" -v b="${lm:-9e9}" 'BEGIN { exit !(b < a) }' && { sd=m; sg=1; }
+  read -r ny_ nx_ <<< "$(grep -m1 'mean normal' $d/p/$sd.log | sed -E 's/.*mean normal z [-0-9.]+ y ([-0-9.]+) x ([-0-9.]+);.*/\1 \2/')"
+  [ -n "${nx_:-}" ] || { fail "probe normal"; continue; }
+  if [ "${CORE:-0}" = 1 ] && [ -s $S/core-line.json ]; then   # core-line half box on the probe's side
+    C $U coreline box $S/core-line.json --fields $F --box $z $y $x $nz $ny $nx --side $sg --out $d/f > $d/core.log 2>&1 || { fail "coreline box"; continue; }
+    kind=core
+  else
+    read -r ay ax <<< "$(awk -v ny=$ny_ -v nx=$nx_ -v g=$sg -v cy=$((ny * H / 2)) -v cx=$((nx * H / 2)) 'BEGIN { l = sqrt(ny * ny + nx * nx); printf "%.1f %.1f", cy + g * 2000 * ny / l, cx + g * 2000 * nx / l }')"
+    fj $d/f $z $y $x $nz $ny $nx $ay $ax; kind=local
   fi
-  k=$d/g; [ $kind = local ] && k=$d/l
-  [ -d $k/tifxyz ] || { echo "FAILED fits (global coh ${gc:-na})" > $d/FITDONE.failed; continue; }
-  ln -sfn $(basename $k) $d/kept; rm -f $d/f/*.raw $d/lf/*.raw
-  cl=$(g1 'largest [0-9.]+' $k/stats.log); nw=$(ls $k/tifxyz | wc -l)
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' $b $pct $kind ${kc:-na} ${ka:-na} ${gc:-na} ${cl:-na} $nw $(( $(date +%s) - t0 )) | tee $d/FITDONE >> $S/fits.tsv
+  rm -rf $d/pf
+  C $U ct-fields $R $CK/1 $d/f --ct-um $(awk -v u=$um 'BEGIN { print 2 * u }') --threads $TH --cache $S/ctcache-$HOST > $d/ct.log 2>&1 || { fail ct-fields; continue; }
+  tf=$(date +%s); FIT $d/f --out $d/fit "${FITA[@]}" > $d/fit.log 2>&1 || { fail fit; continue; }; echo "fit wall $(( $(date +%s) - tf ))s" >> $d/fit.log
+  rm -f $d/f/*.raw
+  C $U wraps $d/fit $d/tifxyz --step 1 --out-um $um --fields $d/f --threads $TH > $d/wraps.log 2>&1 || { fail wraps; continue; }
+  C $U surf-stats $d/tifxyz --fields $d/f --model $d/fit --per-wrap "${CT1[@]}" --threads $TH > $d/stats.log 2>&1
+  # the best sheets: per-wrap rows "  wNNN vertices conf |e|med |e|>0.25 theta-sw z-sw on-papyrus"
+  : > $d/best.tsv
+  awk '$1 ~ /^w[0-9]+$/ && NF >= 8 {print $1, $5, $NF}' $d/stats.log | while read -r w bad op; do
+    a=$(jq -r '.area_cm2 // 0' $d/tifxyz/$w/meta.json 2> /dev/null)
+    awk -v a=${a:-0} -v op=$op -v bad=$bad -v w=$w -v m=${MINPAP:-0.5} 'BEGIN { if (a >= 0.5 && op >= m) printf "%.4f\t%s\t%.3f\t%.3f\t%.3f\n", a * op * (1 - bad), w, a, op, bad }' >> $d/best.tsv
+  done
+  sort -t$'\t' -k1,1 -gr $d/best.tsv | head -n ${TOPW:-3} | while IFS=$'\t' read -r sc w a op bad; do
+    mkdir -p $S/$SURF/$b; cp -r $d/tifxyz/$w $S/$SURF/$b/
+    printf '%s/%s\t%s-%s\t%s\t%s\n' $b $w $kind $N $a $op >> $S/$SURF/list.tsv
+  done
+  cl=$(g1 'largest [0-9.]+' $d/stats.log); nw=$(ls $d/tifxyz | wc -l); opall=$(grep -oE 'on papyrus \(max CT[^)]*\) [0-9.]+' $d/stats.log | awk '{print $NF}')
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' $b $pct $rn $kind$sd ${cl:-na} ${opall:-na} $nw $(sort -t$'\t' -k1,1 -gr $d/best.tsv | head -1 | cut -f2,3 | tr '\t' :) $(g1 'fit wall [0-9]+' $d/fit.log) $(( $(date +%s) - t0 )) |
+    tee $d/FITDONE >> $S/fits-$HOST.tsv
+  rm -rf $d/p
 done
-# all listed boxes fitted (FITDONE) or failed (FITDONE.failed, not retried)? Else another fit.sh still works on them: done here (exit 4)
-left=0; for b in $(ls_boxes "$@"); do [ -e $S/boxes/$b/FITDONE ] || [ -e $S/boxes/$b/FITDONE.failed ] || left=$((left + 1)); done
+rm -rf $S/ctcache-$HOST
+# all listed boxes fitted (FITDONE) or failed (FITDONE.failed, not retried)? Else another fit.sh still works on them (exit 4)
+left=0; for b in $(ls_boxes "$@"); do [ -e $BX/$b/FITDONE ] || [ -e $BX/$b/FITDONE.failed ] || left=$((left + 1)); done
 [ $left = 0 ] || { echo "fit.sh: $s: $left boxes still being fitted elsewhere"; exit 4; }
 [ $# -gt 0 ] && exit 0
-claim finish || { echo "fit.sh: $s: another fit.sh finishes it"; exit 4; }
 
-# ---- 4 stitch the kept box fits into connected sheets
-if ! done_ $s stitch; then
-  O=$S/stitch; rm -rf $O; mkdir -p $O; bx=$(for d in $S/boxes/*/kept; do [ -d $d/fit ] && dirname $d; done)
-  if [ $(echo "$bx" | grep -c .) -ge 2 ]; then
-    # stitch reads BOXDIR/fit: a dir per box with fit -> kept/fit
-    for d in $bx; do mkdir -p $O/b/$(basename $d); ln -sfn $d/kept/fit $O/b/$(basename $d)/fit; done
-    C $U stitch align $O/gauge.json --fields $F --threads $TH $O/b/* > $O/align.log 2>&1 &&
+# ---- 4 STITCH=1: connected sheets across the fitted boxes that agree with their neighbours
+if [ "${STITCH:-0}" = 1 ]; then
+  O=$S/stitch-$N; rm -rf $O; mkdir -p $O/b
+  for d in $BX/*/fit; do b=$(basename $(dirname $d)); mkdir -p $O/b/$b; ln -sfn $d $O/b/$b/fit; done
+  if [ $(ls $O/b | wc -l) -ge 2 ]; then
+    C $U stitch align $O/gauge.json --fields $F --min-agree 0.5 --threads $TH $O/b/* > $O/align.log 2>&1 &&
     C $U stitch quality $O/gauge.json $O/gauge_q.json --fields $F --threads $TH > $O/quality.log 2>&1 &&
-    C $U stitch solve $O/gauge_q.json $O/gauge_tree.json --min-agree 0.1 > $O/solve.log 2>&1 &&
-    C $U stitch sheets $O/gauge_q.json $S/sheets.tmp --fields $F --threads 4 --min-cm2 1 --out-um $um > $O/sheets.log 2>&1 && { rm -rf $S/sheets; mv $S/sheets.tmp $S/sheets; } ||
-      echo "fit.sh: $s stitch failed (see $O)"
+    C $U stitch sheets $O/gauge_q.json $O/sheets --fields $F --threads 4 --min-cm2 2 --out-um $um > $O/sheets.log 2>&1 &&
+      for w in $(ls $O/sheets); do a=$(jq -r '.area_cm2 // 0' $O/sheets/$w/meta.json); mkdir -p $S/$SURF/stitched; rm -rf $S/$SURF/stitched/$w; cp -r $O/sheets/$w $S/$SURF/stitched/
+        printf 'stitched/%s\tstitched\t%s\tna\n' $w $a >> $S/$SURF/list.tsv; done
   fi
-  mark $s stitch "$(ls $S/sheets 2> /dev/null | wc -l) sheets"
 fi
 
-# ---- 5 the surfaces for the desk -> A/<S>/surf: the TOPBOX (5) largest wraps (>= 0.5 cm2) of each box, every stitched sheet (>= 1 cm2);
-# list.tsv: surface, kind (box-global / box-local / stitched), area cm2, on papyrus (surf-stats --ct: max CT level 1 within +-15 um
-# along the normal >= 80); boxes.tsv: the fitted boxes (name z y x n, field cells) for ink.sh's first phase
-CTA=(--ct $R $CK/1 --ct-um $(awk -v u=$um 'BEGIN { print 2 * u }') --ct-level 80 --ct-range 15 --cache $S/ctcache --threads $TH)
-rm -rf $S/surf; mkdir -p $S/surf; : > $S/surf/list.tsv; : > $S/surf/boxes.tsv
-for d in $S/boxes/*/kept; do b=$(basename $(dirname $d)); [ -d $d/tifxyz ] || continue; fd=$(dirname $d)/f; [ $(readlink $d) = l ] && fd=$(dirname $d)/lf
-  awk -v b=$b -v n=$N '$1 == b {print $1, $2, $3, $4, n}' $S/boxes.tsv >> $S/surf/boxes.tsv
-  [ -s $d/onpap.log ] || C $U surf-stats $d/tifxyz --fields $fd --per-wrap "${CTA[@]}" > $d/onpap.log 2>&1
-  for w in $(for m in $d/tifxyz/*/meta.json; do echo "$(jq -r '.area_cm2 // 0' $m) $(basename $(dirname $m))"; done | sort -gr | awk '$1 >= 0.5' | head -n ${TOPBOX:-5} | awk '{print $2}'); do
-    a=$(jq -r '.area_cm2' $d/tifxyz/$w/meta.json); op=$(awk -v w=$w '$1 == w {print $NF}' $d/onpap.log)
-    mkdir -p $S/surf/$b; cp -r $d/tifxyz/$w $S/surf/$b/
-    printf '%s/%s\tbox-%s\t%s\t%s\n' $b $w $(readlink $d | sed 's/^g$/global/; s/^l$/local/') $a ${op:-na} >> $S/surf/list.tsv
-  done
-done
-if [ -d $S/sheets ]; then for w in $(ls $S/sheets); do [ -e $S/sheets/$w/meta.json ] || continue; a=$(jq -r '.area_cm2 // 0' $S/sheets/$w/meta.json)
-  mkdir -p $S/surf/one; ln -sfn $S/sheets/$w $S/surf/one/w_$w   # (surf-stats reads the w* entries)
-  op=$(C $U surf-stats $S/surf/one --fields $F "${CTA[@]}" 2> /dev/null | grep -oE 'on papyrus \(max CT[^)]*\) [0-9.]+' | awk '{print $NF}')
-  rm -rf $S/surf/one; mkdir -p $S/surf/stitched; cp -r $S/sheets/$w $S/surf/stitched/
-  printf 'stitched/%s\tstitched\t%s\t%s\n' $w $a ${op:-na} >> $S/surf/list.tsv; done; fi
-sort -t$'\t' -k3,3 -gr $S/surf/list.tsv -o $S/surf/list.tsv; rm -rf $S/ctcache
-# ---- 6 check against the published segments of this scan (AWS open data <S>/segments/*/mesh/*-on-<scan id>-*.tifxyz, desk only:
-# the raster needs ~30 GB): every kept box wrap rasterised (binary band, native voxels), ufsm wrapdist of the published segments to it
-# -> gtcheck.txt (share of segment vertices within 9.6 / 19.2 um of a fitted sheet; vertices outside the fitted boxes count as far)
-if [ $HOST = desk ] && ! done_ $s gtcheck; then
+# ---- 5 GTCHECK=1 (desk): the published segments of this scan vs the fitted wraps
+if [ "${GTCHECK:-0}" = 1 ] && [ $HOST = desk ]; then
   B=https://vesuvius-challenge-open-data.s3.amazonaws.com; GW=$A/gt/$s/w; id=${scan%%-*}
   if [ ! -d $GW ]; then i=0; mkdir -p $GW
     for p in $(curl -s "$B/?list-type=2&prefix=$s/segments/&delimiter=/" | grep -oE "<Prefix>$s/segments/[^<]+" | sed 's/<Prefix>//' | grep -vE '/raw/$|segments/$'); do
@@ -189,11 +168,9 @@ if [ $HOST = desk ] && ! done_ $s gtcheck; then
     done; fi
   if [ -n "$(ls $GW 2> /dev/null)" ]; then
     read -r NZ NY NX <<< "$($U info $R $CK 2> /dev/null | awk '$1 == "0" {print $5, $7, $9}')"
-    rm -rf $S/gtras; C $U raster $S/gtras --shape $NZ,$NY,$NX --um $um --binary 1 --levels 1 --threads $TH $S/boxes/*/kept/tifxyz/w* > $S/gtcheck.log 2>&1 &&
-    C $U wrapdist $GW $S/gtras $(ls $S/gtras | grep -v json) --max 16 --threads $TH --per-wrap >> $S/gtcheck.log 2>&1 &&
-      grep -A100 'wrapdist:' $S/gtcheck.log > $S/gtcheck.txt; rm -rf $S/gtras
+    rm -rf $S/gtras; C $U raster $S/gtras --shape $NZ,$NY,$NX --um $um --binary 1 --levels 1 --threads $TH $BX/*/tifxyz/w* > $S/gtcheck.log 2>&1 &&
+    C $U wrapdist $GW $S/gtras $(ls $S/gtras | grep -v json) --max 16 --threads $TH --per-wrap >> $S/gtcheck.log 2>&1
+    grep -A100 'wrapdist:' $S/gtcheck.log > $S/gtcheck.txt; rm -rf $S/gtras
   fi
-  mark $s gtcheck "$(grep -m1 ' all ' $S/gtcheck.txt 2> /dev/null)"
 fi
-mark $s fit "$(wc -l < $S/surf/list.tsv) surfaces, largest $(head -1 $S/surf/list.tsv | cut -f1,3)"
-if [ $HOST = desk ]; then mark $s surf "fitted on the desk"; rm -rf $F $S/state/fields.done; fi   # (the fields are refetched for a later pass)
+mark $s fit-$HOST-$N-${MAXBOX:-2} "$(cat $S/$SURF/list.tsv 2> /dev/null | wc -l) surfaces"

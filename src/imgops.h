@@ -78,3 +78,11 @@ double ink_corr(const uint8_t *a, const uint8_t *b, const uint8_t *mask, size_t 
 /* nimg w x h renders side by side, 8 white columns apart (is_ct[k]: the overlay's CT contrast (v - 40) x 2.2, else as is), labels
    in yellow at the top-left of each panel, the whole Pillow-BOX halved: RGB *ow x *oh (malloc'd; nullptr on failure) */
 uint8_t *ink_panels_half(const uint8_t *const *img, const int *is_ct, int nimg, int w, int h, const char *const *labels, int *ow, int *oh, int nthreads);
+/* the same at full resolution (half_res 0) or halved (1) */
+uint8_t *ink_panels(const uint8_t *const *img, const int *is_ct, int nimg, int w, int h, const char *const *labels, int half_res, int *ow, int *oh, int nthreads);
+/* contrast stretch in place over mask != 0: the plo / phi quantiles (e.g. 0.01 / 0.99) -> 0 / 255, linear between, clipped; pixels
+   outside the mask -> 0 */
+void img_stretch(uint8_t *im, const uint8_t *mask, size_t n, double plo, double phi);
+/* the win x win window (clipped to the image, stride win / 4) with the largest masked sum of im among those at least half inside
+   the mask: its corner in *x0 / *y0; -1 when there is none */
+int img_best_window(const uint8_t *im, const uint8_t *mask, int w, int h, int win, int *x0, int *y0);

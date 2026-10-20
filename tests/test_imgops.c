@@ -96,6 +96,23 @@ static void test_ink_compare(void) {   /* ink_stats / ink_corr / ink_panels_half
         CHECK(p[0] == 132 && p[1] == 132 && q[0] == 255 && r[0] == 0, "panel pixels %d %d %d", p[0], q[0], r[0]);
     }
     free(rgb);
+    /* full-resolution panels: no halving */
+    rgb = ink_panels(im, isct, 3, W, H, lab, 0, &ow, &oh, 2);
+    CHECK(rgb && ow == 3 * W + 16 && oh == H && rgb[((size_t)(H - 1) * ow + W + 8) * 3] == 255 && rgb[((size_t)(H - 1) * ow + 2 * W + 7) * 3] == 0, "full panels %dx%d", ow, oh);
+    free(rgb);
+    /* img_stretch: a ramp 50..149 over the mask -> p1 .. p99 to 0 .. 255; outside the mask 0 */
+    static uint8_t ramp[100], rm[100];
+    for (int i = 0; i < 100; i++) { ramp[i] = (uint8_t)(50 + i); rm[i] = i < 90; }
+    img_stretch(ramp, rm, 100, 0.01, 0.99);
+    CHECK(ramp[0] == 0 && ramp[89] == 255 && ramp[44] > 100 && ramp[44] < 160 && ramp[95] == 0, "stretch %d %d %d %d", ramp[0], ramp[44], ramp[89], ramp[95]);
+    /* img_best_window: a bright 8 x 8 square at (40, 20) in a dim image; windows must lie half on the mask */
+    static uint8_t dim[W * H], mk[W * H];
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) { dim[y * W + x] = 10; mk[y * W + x] = 1; }
+    for (int y = 20; y < 28; y++) for (int x = 40; x < 48; x++) dim[y * W + x] = 250;
+    int bx = -1, by = -1;
+    CHECK(!img_best_window(dim, mk, W, H, 8, &bx, &by) && bx == 40 && by == 20, "best window at %d,%d", bx, by);
+    for (int i = 0; i < W * H; i++) mk[i] = 0;
+    CHECK(img_best_window(dim, mk, W, H, 8, &bx, &by) == -1, "best window without mask");
 }
 int main(void) {
     test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_tifxyz_scale(); test_ink_compare();

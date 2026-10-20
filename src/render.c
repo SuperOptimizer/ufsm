@@ -439,11 +439,13 @@ int cmd_phase_score(int argc, char **argv) {
    [--crop x,y,w,h] [--threads 16]: renders of one surface on one pixel grid (ufsm render: <wrap>_ct.tif and the ink <wrap>.tif of each ink volume)
    -> CT | ink 1 | ink 2 .. half-resolution JPEG (q90; none when under 5% of the CT pixels have data), and per ink over the CT > 0
    pixels one line "ink LABEL: n .. mean .. frac50 .. p50 .. p95 .. p99 .. band .." (ink_stats: band = the contrast between the
-   --rs-um and --rl-um box scales) and "corr A B: r" for each pair. Exit 0, 3 when skipped (too little CT). */
+   --rs-um and --rl-um box scales) and "corr A B: r" for each pair. Exit 0, 3 when skipped (too little CT).
+   --best-crop N: the crop is the N x N window with the most first-ink signal (img_best_window; printed as "crop x,y,w,h");
+   --stretch: each ink panel p1 .. p99 contrast stretched over CT > 0 (display only); --full: full-resolution panels. */
 int cmd_ink_compare(int argc, char **argv) {
     const int ci = rarg(argc, argv, "--ct");
     if (argc < 5 || ci < 0 || ci + 1 >= argc || rarg(argc, argv, "--ink") < 0) {
-        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h] [--stretch] [--threads 16]\n"); return 2;
+        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch] [--full] [--threads 16]\n"); return 2;
     }
     const double px = atof(ropt(argc, argv, "--px-um", "2.4")), rsu = atof(ropt(argc, argv, "--rs-um", "25")), rlu = atof(ropt(argc, argv, "--rl-um", "500"));
     const int nthreads = atoi(ropt(argc, argv, "--threads", "16"));
@@ -466,6 +468,14 @@ int cmd_ink_compare(int argc, char **argv) {
         double fx, fy; int cw0, ch0;
         if (sscanf(cf, "%lf,%lf,%d,%d", &fx, &fy, &cw0, &ch0) != 4) { fprintf(stderr, "ink-compare: --crop-frac fx,fy,w,h\n"); return 2; }
         snprintf(crb, sizeof crb, "%d,%d,%d,%d", (int)(fx * W), (int)(fy * H), cw0, ch0); cr = crb;
+    }
+    const int bwin = atoi(ropt(argc, argv, "--best-crop", "0"));
+    if (!cr && bwin > 0 && n > 1) {   /* --best-crop N: the N x N window richest in the first ink (over CT > 0), as --crop */
+        uint8_t *mk = malloc((size_t)W * H); if (!mk) return 1;
+        for (size_t i = 0; i < (size_t)W * H; i++) mk[i] = ct[i] > 0;
+        int bx, by; const int r = img_best_window(img[1], mk, W, H, bwin, &bx, &by); free(mk);
+        if (r) { fprintf(stderr, "ink-compare: no %d px window at least half on the surface\n", bwin); return 3; }
+        snprintf(crb, sizeof crb, "%d,%d,%d,%d", bx, by, bwin, bwin); cr = crb; printf("crop %s\n", crb);
     }
     if (cr) {   /* --crop x,y,w,h: every render cut to the rectangle (clipped to the image) before the statistics and the panels */
         int cx, cy, cw, ch;
@@ -503,7 +513,7 @@ int cmd_ink_compare(int argc, char **argv) {
     }
     if (overlay_red_skip(ct, np)) { fprintf(stderr, "ink-compare: under 5%% of the CT pixels have data: no %s\n", argv[2]); rc = 3; }
     else {
-        int ow, oh; uint8_t *rgb = ink_panels_half(img, isct, n, W, H, lab, &ow, &oh, nthreads);
+        int ow, oh; uint8_t *rgb = ink_panels(img, isct, n, W, H, lab, !rflag(argc, argv, "--full"), &ow, &oh, nthreads);
         if (!rgb || jpeg_write_rgb(argv[2], ow, oh, rgb, 90)) { fprintf(stderr, "ink-compare: cannot write %s\n", argv[2]); rc = 1; }
         free(rgb);
     }
