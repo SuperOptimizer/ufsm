@@ -2,7 +2,7 @@
    winding (in 1/18-turn steps mod 252) of the nearest labelled recto surface plus or minus half a turn (outside / inside
    that surface relative to the umbilicus). Between consecutive wraps both bounding rectos give the same value, so the band
    is constant inside a wrap and jumps by one turn exactly at each recto. 255 = unknown. Shared by the sampler (task
-   band_affinity) and `ufsm band` (boxes for evaluation and previews). See tools/band_field.py for the python version. */
+   band_affinity) and `ufsm band` (boxes for evaluation and previews). (The python version, tools/band_field.py, was removed 2026-10-20.) */
 #pragma once
 #include <stdint.h>
 #include <stddef.h>

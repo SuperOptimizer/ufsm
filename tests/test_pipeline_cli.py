@@ -7,6 +7,14 @@ import shutil
 import subprocess
 import tempfile
 
+
+def gpu_count():
+    """GPUs nvidia-smi lists (the two-worker grid check needs two)"""
+    try:
+        return subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True).stdout.count('GPU ')
+    except OSError:
+        return 0
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BIN = ROOT / "build/ufsm"
 
@@ -94,7 +102,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     base = read_bytes(t / 'grid-base', [0, 0, 0], grid_shape)
     assert any(base), 'grid fixture has no nonzero predictions'
     for name, placement in [('grid-shard256', ['--shard', '256']),
-                            ('grid-workers', ['--shard', '128', '--gpus', '0,1'])]:
+                            *([('grid-workers', ['--shard', '128', '--gpus', '0,1'])] if gpu_count() >= 2 else [])]:
         run(*pred, t / name, *grid_opts, *placement, '--box', '0,0,0,144,40,40')
         assert read_bytes(t / name, [0, 0, 0], grid_shape) == base, name
         assert json.loads((t / name / 'zarr.json').read_text())['attributes']['ufsm']['grid_origin_zyx'] == [3, 5, 7]

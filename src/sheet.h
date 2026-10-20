@@ -1,6 +1,6 @@
 /* Experimental surface confidence + continuous winding coordinate task.
    Geometry files are little-endian native-voxel ZYX records written by
-   tools/build_sheet_geometry.py. No dense floating-point teachers. */
+   the former tools/build_sheet_geometry.py (removed 2026-10-20). No dense floating-point teachers. */
 #pragma once
 #include <stddef.h>
 #include <stdint.h>

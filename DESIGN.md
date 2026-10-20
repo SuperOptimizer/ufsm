@@ -6,6 +6,20 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Cleanup 2026-10-20: the dead Python tools removed
+
+Removed (in git history before this commit): every Python tool in `tools/` (the sheet / surface-store / finite-cover
+pipeline: band_field, build_*, sheet_*, score_*, surface tools, production.py, eval_holdouts, make_sources, label_grid,
+papyrus_eval, torch_bench, roofline, killdl, gen_lp_launch (its src/lp_*.cu output is committed; the Makefile never ran it)),
+the shell helpers that drove them (confirm_run.sh, train_r1.sh, perf_baseline.sh), tools/surface_dedup.c and
+tools/check_surface_samples.c, their tests (test_production*, test_sheet_{cli,geometry,native,pipeline,watch},
+test_surface_store, test_training_cover, test_score_sheets, test_eval_holdouts, test_evaluation_plan, test_gpu_leases,
+test_extend_surface_training, torch_compare.py), SHEET_PIPELINE.md, requirements-sheet.txt, the production / sheet / cover
+recipes in configs/, and scripts/podbatch (the 2026-10-16 RunPod fit-field batch). The dated sections below are history:
+their references to these files point into git history. The C side of the sheet / surface-winding task and the finite
+cover (src/sheet.c, src/cover.c, train --geometry / --cover) stays: it is wired into train / sample / predict.
+Two-GPU tests (test_sheet_gpu, test_cover_training.py, test_pipeline_cli.py) skip their second-GPU parts on one GPU.
+
 ## Integration 2026-10-20: every local branch on master
 
 origin/master was 7ae7a47 (10-16); everything since lived on local branches. Merged in this order (first-parent chain of master):
@@ -1394,19 +1408,6 @@ Laptop RTX 5080 (16 GB), a 1000-step checkpoint, Paris4 2.4 um, the cached 1024^
   (inference 80.5 -> ~57 B per window voxel). Boxes of whole shards default to one window per shard (shard + 32,
   halo 16) when it fits the GPU, else 288 / halo 8: laptop, 8 shards of 512, 16% less GPU time (5.20 vs 6.21 s),
   9.4 GB peak, and twice the halo. `--window` / `--halo` override.
-
-## Continuous winding experiment (2026-10-03)
-
-The experimental surface/winding pipeline is implemented without changing the
-1,172,050-parameter backbone. It adds sparse coordinate, continuity, relative
-ordering, path-support and gap losses; floating winding output; constrained sheet
-reconstruction; and matched development/final-test evaluation. See
-[SHEET_PIPELINE.md](SHEET_PIPELINE.md) for commands, precision contracts and limits.
-The complete selected Paris4 geometry dataset is built and four 2,000-update
-ablations are prepared. Small native single-/split-GPU integration tests pass;
-large-window capacity, throughput and quality remain unmeasured for this task.
-The existing selected-surface coverage production run continues with its frozen
-binary. Its recipe is not replaced by the experimental winding task.
 
 ## Earlier production audit (2026-10-02)
 

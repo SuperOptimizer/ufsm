@@ -7,6 +7,14 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+
+def gpu_count():
+    """GPUs nvidia-smi lists (the split-z half needs two)"""
+    try:
+        return subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True).stdout.count('GPU ')
+    except OSError:
+        return 0
+
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get('UFSM_TEST_BINARY', ROOT / 'build/ufsm'))
 help_result = subprocess.run([BINARY,'train'],capture_output=True,text=True)
@@ -32,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix='ufsm-cover-cli-') as tmp:
             '--down-norm', '1', '--zfix', '1', '--symmetry-p', '.5', '--ct-aug', '1', '--soft', '3',
             '--opt', 'muon', '--input-prec', '8', '--gn-stats', 'stored']
     for mode, gpu in [('single', os.environ.get('UFSM_TEST_GPU', '0')), ('split', '0,1')]:
-        if mode == 'split' and os.environ.get('UFSM_TEST_SINGLE_ONLY'):
+        if mode == 'split' and (os.environ.get('UFSM_TEST_SINGLE_ONLY') or gpu_count() < 2):
             continue
         command = base + ['--gpus', gpu] + (['--split', 'z'] if mode == 'split' else [])
         def train(name, extra=()):
