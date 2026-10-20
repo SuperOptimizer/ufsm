@@ -126,8 +126,27 @@ extern "C" int nn_head_bwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, co
                              size_t vb, size_t nv, int first) {
     static thread_local unsigned seed;
     if (!g_tf32 || !ISMX(x) || !ISMX(gx) || !GBF || !g_h16) return -1;
-    if (first) seed = MXDT(gx) == 4 ? sr_seed() : 0u;
     shape5 ys = xs; ys.c = cout;
+    if (xs.c != 32) {   /* no fused kernel (16-channel input): the whole path's steps per range -- nn_head_bwd_x's declined draw, the weight /
+                           bias gradients (nn_conv3d_bwd_weight_x's 1^3 kernel), the backward-data into MX gx (bwd_data_impl's: the
+                           transposed weights, its draw) -- so gx's bits and the seed count equal one whole call's */
+        static thread_local unsigned seed2; static thread_local float *wt; static thread_local int wtn;
+        if (first) seed = MXDT(gx) == 4 ? sr_seed() : 0u;
+        (void)seed;
+        exec_prec(2, 0);
+        if (!lp_bwd_w1_mx_b_r(x, MXDT(x), xs, gy16, 2, ys, gw, gb, to_gnp(gx_gn), vb, nv)) return -1;
+        if (first) {
+            seed2 = MXDT(gx) == 4 ? sr_seed() : 0u;
+            if (wtn < cout * xs.c) { if (wt) cudaFree(wt); CK(cudaMalloc(&wt, (size_t)cout * xs.c * 4)); wtn = cout * xs.c; }
+            const size_t nw = (size_t)cout * xs.c;
+            flip_w_k<<<nblk(nw, 256), 256>>>(w, wt, cout, xs.c, 1);
+        }
+        exec_prec(1, 0);
+        lp_conv1_to_mx_r(gy16, 2, xs.n, cout, shape_spatial(xs), wt, xs.c, gx, MXDT(gx), seed2, vb, nv);
+        KCHECK();
+        return 0;
+    }
+    if (first) seed = MXDT(gx) == 4 ? sr_seed() : 0u;
     if (!lp_head_bwd_mx_r(x, MXDT(x), xs, gy16, 2, ys, w, gw, gb, gx, MXDT(gx), to_gnp(gx_gn), seed, vb, nv)) return -1;
     exec_prec(2, 0); exec_prec(1, 0);
     KCHECK();

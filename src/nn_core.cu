@@ -201,11 +201,109 @@ extern "C" int nn_storage(const void *p) {
 extern "C" size_t nn_mx8_bytes(shape5 s) { int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw + 1); }   /* = lp_mx8_bytes */
 extern "C" size_t nn_mx4_bytes(shape5 s) { int bw = s.c <= 8 ? 8 : s.c <= 16 ? 16 : 32, nb = (s.c + bw - 1) / bw; return (size_t)s.n * nb * shape_spatial(s) * (bw / 2 + 1); }   /* = lp_mx4_bytes */
 extern "C" size_t nn_mx_bytes(shape5 s, int dt) { return dt == 4 ? nn_mx4_bytes(s) : nn_mx8_bytes(s); }   /* registry dt */
-extern "C" void nn_free(void *p) { if (p) { if (g_nreg) nn_storage_forget(p); CK(cudaFree(p)); } }
+/* ---- virtual-memory rings (CUDA VMM through the runtime's driver entry points: no -lcuda). A ring is one tensor's whole virtual range
+   of consecutive regions (an MX tensor: each block's data planes, then each block's scale planes), each a run of slabs; slab s of a
+   region is backed by physical chunk s mod R of that region, so a kernel addressing the whole tensor reads and writes a ring of R slabs
+   (a slab is the schedule's: it must be dead when slab s + R is written). Probed under WSL2 by worker S2 (2 MB granularity). */
+#include <cuda.h>
+static struct {
+    int tried, ok; size_t gran; int dev;
+    CUresult (*gran_f)(size_t *, const CUmemAllocationProp *, CUmemAllocationGranularity_flags);
+    CUresult (*reserve)(CUdeviceptr *, size_t, size_t, CUdeviceptr, unsigned long long);
+    CUresult (*afree)(CUdeviceptr, size_t);
+    CUresult (*create)(CUmemGenericAllocationHandle *, size_t, const CUmemAllocationProp *, unsigned long long);
+    CUresult (*release)(CUmemGenericAllocationHandle);
+    CUresult (*map)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long);
+    CUresult (*unmap)(CUdeviceptr, size_t);
+    CUresult (*access)(CUdeviceptr, size_t, const CUmemAccessDesc *, size_t);
+} g_vm;
+static int vm_init(void) {
+    if (g_vm.tried) return g_vm.ok;
+    g_vm.tried = 1;
+    cudaDriverEntryPointQueryResult q;
+#define VMGET(f, name) if (cudaGetDriverEntryPointByVersion(name, (void **)&g_vm.f, 12000, cudaEnableDefault, &q) != cudaSuccess || q != cudaDriverEntryPointSuccess) { cudaGetLastError(); return 0; }
+    VMGET(gran_f, "cuMemGetAllocationGranularity") VMGET(reserve, "cuMemAddressReserve") VMGET(afree, "cuMemAddressFree") VMGET(create, "cuMemCreate")
+    VMGET(release, "cuMemRelease") VMGET(map, "cuMemMap") VMGET(unmap, "cuMemUnmap") VMGET(access, "cuMemSetAccess")
+#undef VMGET
+    if (cudaGetDevice(&g_vm.dev) != cudaSuccess) { cudaGetLastError(); return 0; }
+    CUmemAllocationProp pr; memset(&pr, 0, sizeof pr);
+    pr.type = CU_MEM_ALLOCATION_TYPE_PINNED; pr.location.type = CU_MEM_LOCATION_TYPE_DEVICE; pr.location.id = g_vm.dev;
+    if (g_vm.gran_f(&g_vm.gran, &pr, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS || !g_vm.gran) return 0;
+    g_vm.ok = 1;
+    return 1;
+}
+#define NN_MAXRING 64
+#define NN_RINGREG 16
+#define NN_RINGH 128   /* physical chunks per ring: cuMemMap maps whole allocations (offset 0), so one handle per slab slot */
+static struct { CUdeviceptr va; size_t vbytes, pbytes; int nh; CUmemGenericAllocationHandle h[NN_RINGH]; } g_ring[NN_MAXRING];
+static int g_nring;
+extern "C" size_t nn_ring_gran(void) { return vm_init() ? g_vm.gran : 0; }
+extern "C" size_t nn_ring_bytes(void) { size_t b = 0; for (int i = 0; i < g_nring; i++) b += g_ring[i].pbytes; return b; }   /* physical bytes of the live rings */
+static void ring_drop(int i) {
+    if (g_ring[i].vbytes) g_vm.unmap(g_ring[i].va, g_ring[i].vbytes);
+    for (int k = 0; k < g_ring[i].nh; k++) g_vm.release(g_ring[i].h[k]);
+    g_vm.afree(g_ring[i].va, g_ring[i].vbytes);
+    g_ring[i] = g_ring[--g_nring];
+}
+/* nreg regions of reg[r] bytes (consecutive), slabs of slab[r] bytes, R slabs backed per region (fewer if a region has fewer): the
+   virtual address of the whole range, or nullptr (no VMM, sizes not on the mapping granularity, out of memory). *phys: bytes backed */
+extern "C" void *nn_ring_alloc(int nreg, const size_t *reg, const size_t *slab, int R, size_t *phys) {
+    if (phys) *phys = 0;
+    if (!vm_init()) { fprintf(stderr, "nn_ring_alloc: no CUDA virtual memory management\n"); return nullptr; }
+    if (nreg < 1 || nreg > NN_RINGREG || g_nring >= NN_MAXRING || R < 1) { fprintf(stderr, "nn_ring_alloc: %d regions, %d rings live, R %d\n", nreg, g_nring, R); return nullptr; }
+    const size_t G = g_vm.gran;
+    size_t tot = 0;
+    for (int r = 0; r < nreg; r++) {
+        if (!reg[r] || !slab[r] || reg[r] % G || slab[r] % G || reg[r] % slab[r]) { fprintf(stderr, "nn_ring_alloc: region %d of %zu bytes, slabs of %zu: not on the %zu-byte granularity\n", r, reg[r], slab[r], G); return nullptr; }
+        tot += reg[r];
+    }
+    const int i = g_nring++;
+    memset(&g_ring[i], 0, sizeof g_ring[i]);
+    CUresult e = g_vm.reserve(&g_ring[i].va, tot, G, 0, 0);
+    if (e != CUDA_SUCCESS) { fprintf(stderr, "nn_ring_alloc: cuMemAddressReserve(%zu) = %d\n", tot, (int)e); g_nring--; return nullptr; }
+    CUmemAllocationProp pr; memset(&pr, 0, sizeof pr);
+    pr.type = CU_MEM_ALLOCATION_TYPE_PINNED; pr.location.type = CU_MEM_LOCATION_TYPE_DEVICE; pr.location.id = g_vm.dev;
+    size_t off = 0, mapped = 0;
+    int bad = 0;
+    for (int r = 0; r < nreg && !bad; r++) {
+        const size_t n = reg[r] / slab[r], rr = (size_t)R < n ? (size_t)R : n;
+        const int h0 = g_ring[i].nh;
+        if (h0 + (int)rr > NN_RINGH) { fprintf(stderr, "nn_ring_alloc: more than %d slab slots\n", NN_RINGH); bad = 1; break; }
+        for (size_t k = 0; k < rr; k++) {
+            if ((e = g_vm.create(&g_ring[i].h[h0 + k], slab[r], &pr, 0)) != CUDA_SUCCESS) { fprintf(stderr, "nn_ring_alloc: cuMemCreate(%zu) = %d\n", slab[r], (int)e); bad = 1; break; }
+            g_ring[i].nh = h0 + (int)k + 1; g_ring[i].pbytes += slab[r];
+        }
+        for (size_t s = 0; s < n && !bad; s++) {
+            if ((e = g_vm.map(g_ring[i].va + off + s * slab[r], slab[r], 0, g_ring[i].h[h0 + s % rr], 0)) != CUDA_SUCCESS) { fprintf(stderr, "nn_ring_alloc: cuMemMap(+%zu, %zu) = %d\n", off + s * slab[r], slab[r], (int)e); bad = 1; break; }
+            mapped = off + (s + 1) * slab[r];
+        }
+        off += reg[r];
+    }
+    CUmemAccessDesc ad; memset(&ad, 0, sizeof ad);
+    ad.location.type = CU_MEM_LOCATION_TYPE_DEVICE; ad.location.id = g_vm.dev; ad.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (!bad && (e = g_vm.access(g_ring[i].va, tot, &ad, 1)) != CUDA_SUCCESS) { fprintf(stderr, "nn_ring_alloc: cuMemSetAccess(%zu) = %d\n", tot, (int)e); bad = 1; }
+    if (bad) {   /* (the mapped prefix: whole mappings) */
+        g_ring[i].vbytes = mapped; ring_drop(i);
+        cudaGetLastError();
+        return nullptr;
+    }
+    g_ring[i].vbytes = tot;
+    if (phys) *phys = g_ring[i].pbytes;
+    return (void *)g_ring[i].va;
+}
+static int ring_find(const void *p) { for (int i = 0; i < g_nring; i++) if (g_ring[i].va == (CUdeviceptr)p) return i; return -1; }
+extern "C" void nn_free(void *p) {
+    if (!p) return;
+    if (g_nreg) nn_storage_forget(p);
+    const int i = ring_find(p);
+    if (i >= 0) { CK(cudaDeviceSynchronize()); ring_drop(i); return; }
+    CK(cudaFree(p));
+}
 extern "C" void nn_zero(void *p, size_t n) { CK(cudaMemset(p, 0, n)); }
 extern "C" void nn_h2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyHostToDevice)); }
 extern "C" void nn_d2h(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToHost)); }
 extern "C" void nn_d2d(void *d, const void *s, size_t n) { CK(cudaMemcpy(d, s, n, cudaMemcpyDeviceToDevice)); }
+extern "C" void nn_copy_async(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDefault, 0)); }   /* any direction (pinned host), ordered with the kernels */
 extern "C" void nn_d2d_async(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToDevice, 0)); }   /* ordered with the kernels */
 __global__ void d2d_u4_k(uint4 *__restrict__ d, const uint4 *__restrict__ s, size_t n) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) d[i] = s[i];

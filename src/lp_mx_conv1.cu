@@ -204,12 +204,14 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
    lanes 16-31 copy that voxel's gy into B[co][voxel] (and sum it for the bias); one m16n8k16 MMA with fp32 accumulation.
    The fp16 rounding of act(x) is the only numerical difference from conv_bwd_w1_mx1_k. */
 template <int B, int CI>   /* CI = 16 or 32 input channels (one MX block row, block blk of Ct): CI / 16 MMA row tiles per 16 voxels; outputs co0 .. co0 + 7 */
-__global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const __half *gy, float *gw, float *gb, int N, size_t S, gnp_t gp, int nper, int Co, int co0, int Ct, int blk) {
+__global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const __half *gy, float *gw, float *gb, int N, size_t S, gnp_t gp, int nper, int Co, int co0, int Ct, int blk,
+                                                         size_t vbase = 0, size_t vn = 0) {   /* (vn: voxels [vbase, vbase + vn) of x, gy holding vn per channel; 0: all) */
     constexpr int MTI = CI / 16;
     __shared__ float ca[2][CI], cb[2][CI], red[8][CI * 8 + 8];   /* [bank]: slab GroupNorm, the block's first slab and the next */
     __shared__ __align__(16) __half sA[8][CI][40], sB[8][8][40];   /* [warp][ci][voxel], [warp][co][voxel] (32 voxels); rows padded */
     const int n = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int r0 = gp.ns ? gn_row_v(gp, n, min((size_t)blockIdx.x * nper, S - 1)) : 0;
+    if (!vn) vn = S;
+    const int r0 = gp.ns ? gn_row_v(gp, n, min(vbase + (size_t)blockIdx.x * nper, S - 1)) : 0;
     if (threadIdx.x < 2 * CI) {
         const int k = threadIdx.x % CI, bk = threadIdx.x / CI, kc = blk * CI + k;
         float a = 1.f, bb = 0.f;
@@ -222,7 +224,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
 #pragma unroll
     for (int m = 0; m < MTI; m++) c[m][0] = c[m][1] = c[m][2] = c[m][3] = 0.f;
     const int g = lane >> 2, t4 = lane & 3;
-    const size_t v0 = (size_t)blockIdx.x * nper, v1 = min(S, v0 + nper);
+    const size_t v0 = vbase + (size_t)blockIdx.x * nper, v1 = min(vbase + vn, v0 + nper);
     for (size_t vb = v0 + warp * 32; vb < v1; vb += 8 * 32) {   /* 32 voxels per warp step: lane = voxel (its x row and its gy) */
         const size_t v = vb + lane; const bool in = v < v1;
         {
@@ -234,7 +236,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
             for (int k = 0; k < CI; k++) sA[warp][k][lane] = __float2half_rn(in ? (gp.G ? act_ab(r[k], cav[k], cbv[k], true) : r[k]) : 0.f);
 #pragma unroll
             for (int co = 0; co < 8; co++) {
-                const __half h = in && co0 + co < Co ? gy[((size_t)n * Co + co0 + co) * S + v] : __float2half_rn(0.f);
+                const __half h = in && co0 + co < Co ? gy[((size_t)n * Co + co0 + co) * vn + (v - vbase)] : __float2half_rn(0.f);
                 sB[warp][co][lane] = h; bs[co] += __half2float(h);
             }
         }
@@ -412,6 +414,24 @@ extern "C" int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy,
     }
     lp_bwd_w1_mx(x, xdt, xs, gy, gydt, ys, gw, gp);
     return 0;
+}
+/* the same over voxels [vb, vb + vn) of x with gy holding those vn voxels per channel (the level-0 slab stream's head, stage S4):
+   16- or 32-channel MX x, fp16 gy, <= 16 outputs; weight and bias gradients accumulated; 0: not covered */
+extern "C" int lp_bwd_w1_mx_b_r(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp, size_t vb, size_t vn) {
+    if (!((xs.c == 16 || xs.c % 32 == 0) && ys.c <= 16 && gydt == 2 && (!gp.G || xs.c % gp.G == 0) && (xdt == 4 || xdt == 8))) return 0;
+    const size_t S = shape_spatial(xs);
+    const int nper = slab_nper(gp, 8192);
+    const dim3 grid((unsigned)((vn + nper - 1) / nper), xs.n);
+    for (int co0 = 0; co0 < ys.c; co0 += 8)
+        for (int blk = 0; blk < (xs.c == 16 ? 1 : xs.c / 32); blk++) {
+            if (xs.c >= 32) {
+                if (xdt == 4) conv_bwd_w1_tc_k<4, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0, xs.c, blk, vb, vn);
+                else conv_bwd_w1_tc_k<8, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0, xs.c, blk, vb, vn);
+            } else if (xdt == 4) conv_bwd_w1_tc_k<4, 16><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0, 16, 0, vb, vn);
+            else conv_bwd_w1_tc_k<8, 16><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, co0, 16, 0, vb, vn);
+        }
+    LPCK();
+    return 1;
 }
 extern "C" void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp) {
     if (xs.c <= 32 && ys.c <= 16) {

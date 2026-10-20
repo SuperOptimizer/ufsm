@@ -95,7 +95,8 @@ void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const fl
 void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp);   /* fp16 output */
 void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, size_t vb, size_t nv);   /* voxels [vb, vb + nv) into planes of nv */
 void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp);
-int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp);   /* also gb when it returns 1 */
+int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp);
+int lp_bwd_w1_mx_b_r(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp, size_t vb, size_t vn);   /* voxels [vb, vb + vn) */   /* also gb when it returns 1 */
 int lp_head_bwd_mx_r(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, const float *w, float *gw, float *gb, void *gx, int gxdt, gnp_t gp, unsigned sr,
                      size_t vb, size_t nv);   /* voxels [vb, vb + nv), gy planes of nv voxels */
 int lp_head_bwd_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, const float *w, float *gw, float *gb, void *gx, int gxdt, gnp_t gp, unsigned sr);   /* fused head backward: 1 = done, 0 = not covered */
@@ -116,7 +117,8 @@ void lp_gn_silu_bwd_head_apply(void *x, shape5 s, int G, const float *gamma, con
                                const void *gl, int ci, const float *wh, unsigned hs, const float *AB, unsigned gsr, int ns);
 void lp_pred_input_mx(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, int z0, int nz, void *y, int hd, int bits);   /* the same, MX-fp4 (bits 4) or MX-fp8 (8) */
 void lp_pred_input_mx8(const uint8_t *ct, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, int z0, int nz, void *y, int hd);   /* predict input planes [z0, z0 + nz) -> MX-fp8 (hd: 16-bit rounding 2 fp16 / 1 bf16 / 0 none) */
-void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr);   /* ydt 3 MX-fp8, 4 MX-fp4 (exact SR keyed by sr) */
+void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr);
+void lp_conv1_to_mx_r(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr, size_t vb, size_t vn);   /* rows [vb, vb + vn) */   /* ydt 3 MX-fp8, 4 MX-fp4 (exact SR keyed by sr) */
 void lp_up2_bwd_mx(const void *gy, shape5 xs, void *gx, int gdt, int xdt, unsigned osr);   /* gdt / xdt: MX dt 3 (fp8) or 4 (fp4, gx with exact SR keyed by osr) */
 void lp_up2_bwd_mx_slice(const void *gy, shape5 xs, void *gx, int ctot, int c0, int gdt, int xdt, unsigned osr);   /* channels [c0, c0 + xs.c) of an MX-fp8 gx (ctot ch) */
 int lp_bwd_data_s2_mx(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr);   /* returns the compute precision (3 fp4, 2 fp8, 1 bf16, 0 fp32) */

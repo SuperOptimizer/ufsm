@@ -26,6 +26,7 @@ void nn_zero(void *p, size_t bytes);
 void nn_h2d(void *dst, const void *src, size_t bytes);
 void nn_d2h(void *dst, const void *src, size_t bytes);
 void nn_d2d(void *dst, const void *src, size_t bytes);
+void nn_copy_async(void *dst, const void *src, size_t bytes);   /* device / pinned host in any direction, on the compute stream */
 void nn_d2d_async(void *dst, const void *src, size_t bytes);   /* on the default stream, no host sync */
 void nn_d2d_kernel(void *dst, const void *src, size_t bytes);  /* the same as a copy kernel (16-byte aligned dst, src): no copy engine */
 void nn_set_zrange(int zi0, int Di, int first, int last, int Do, int zo);   /* z-range of the next MX forward convs (see nn_bwd.cu): output planes zo + .. of Do, reading input planes zi0 + .. of a depth-Di input; Di 0 = off */
@@ -44,6 +45,12 @@ void nn_event_sync(void *ev);
    ev_done completes with the copy (nn_stream_wait(0, ev_done) before the compute stream touches dst / src again) */
 void nn_offload_copy(void *dst, const void *src, size_t n, int to_host, void *ev_start, void *ev_done);
 size_t nn_mem_free(void);
+/* virtual-memory rings (CUDA VMM): one tensor's whole address range of nreg consecutive regions (reg[r] bytes, slabs of slab[r]), slab
+   s of a region backed by physical chunk s mod R of it (kernels address the whole tensor; the schedule keeps fewer than R slabs live).
+   nullptr: no VMM, or sizes off the mapping granularity (nn_ring_gran). nn_free releases it; *phys: bytes backed */
+void *nn_ring_alloc(int nreg, const size_t *reg, const size_t *slab, int R, size_t *phys);
+size_t nn_ring_gran(void);
+size_t nn_ring_bytes(void);
 /* event profiler (no host syncs): bracket ops, then collect per-category GPU milliseconds */
 void nn_prof_begin(int k);
 void nn_prof_end(void);
