@@ -26,6 +26,7 @@ SRC  = src/json.c src/checkpoint.c src/sheet.c src/store.c src/zarr3.c src/sourc
 SRC += src/surf.c src/stitch.c src/coreline.c src/fit_ct.c src/l1pot.c
 SRC += src/fblend.c
 SRC += src/render.c src/imgops.c
+SRC += src/repack.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
