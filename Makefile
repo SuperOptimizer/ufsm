@@ -27,6 +27,7 @@ SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c 
 SRC += src/fblend.c
 SRC += src/render.c src/imgops.c
 SRC += src/repack.c
+SRC += src/wload.c src/inkext.c src/inkext_net.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm

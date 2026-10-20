@@ -54,6 +54,9 @@ int cmd_render_sheets(int argc, char **argv);   /* src/render.c */
 int cmd_overlay_red(int argc, char **argv);
 int cmd_tifxyz_scale(int argc, char **argv);
 int cmd_ink_compare(int argc, char **argv);
+int cmd_ink_ext(int argc, char **argv);   /* src/inkext.c */
+int cmd_ink_ensemble(int argc, char **argv);
+int cmd_wl_dump(int argc, char **argv);
 int cmd_png2jpg(int argc, char **argv);
 int cmd_phase_score(int argc, char **argv);
 
@@ -99,6 +102,9 @@ static int usage(void) {
         "  ufsm overlay-red <ct-dir> <ink-dir> <out-dir> [ink2 [ink3]]   the 5-panel overlay of existing renders\n"
         "  ufsm tifxyz-scale <src> <dst> <div> [--offset z,y,x]   tifxyz coordinates / div (e.g. 2.4 -> 9.6 um: 4)\n"
         "  ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif ..   CT | ink panels (half-res JPEG) + ink statistics per render\n"
+        "  ufsm ink-ext --model v8in|hecate24|hecate96|reader3 --weights W --surface TIFXYZ --ct ROOT KEY --out DIR   external ink networks on a surface\n"
+        "  ufsm ink-ensemble <out.tif> --ink [W:]INK.tif ..   per-model percentile-stretched weighted mean of ink renders\n"
+        "  ufsm wl-dump <weights> [key]   the tensors of a safetensors / torch zip weight file\n"
         "  ufsm png2jpg <in.png> <out.jpg> [--half]   PNG -> JPEG q90 (half: Pillow BOX halved)\n"
         "  ufsm phase-score <pc-dir> <ps-dir> [<sheets-dir>]   on-recto score of pc / ps renders on surfaces (per seam class with sheets)\n"
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
@@ -3215,6 +3221,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "overlay-red")) return cmd_overlay_red(argc, argv);
     if (!strcmp(cmd, "tifxyz-scale")) return cmd_tifxyz_scale(argc, argv);
     if (!strcmp(cmd, "ink-compare")) return cmd_ink_compare(argc, argv);
+    if (!strcmp(cmd, "ink-ext")) return cmd_ink_ext(argc, argv);
+    if (!strcmp(cmd, "ink-ensemble")) return cmd_ink_ensemble(argc, argv);
+    if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);
     if (!strcmp(cmd, "png2jpg")) return cmd_png2jpg(argc, argv);
     if (!strcmp(cmd, "phase-score")) return cmd_phase_score(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
