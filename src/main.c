@@ -1006,23 +1006,29 @@ static int cmd_fit(int argc, char **argv) {
         fprintf(cf, "]}\n"); if (fclose(cf)) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
     }
     const char *wout = opt(argc, argv, "--winding", nullptr);
-    if (wout) {   /* the per-voxel winding number W * 256 (uint16, exact volcomp typed chunks) on a grid of --winding-step native voxels */
+    if (wout) {   /* the per-voxel winding number W * 256 (uint16, exact volcomp typed chunks) on a grid of --winding-step native voxels;
+                     --winding-mod14 1: instead uint8 round(18 U) mod 252 (U = W + dir theta / 2 pi, the codes' q; 255 unknown), the dense winding raster kind of
+                     phase-raster --winding that wind-assign --kind winding reads (a fit as the reference for other surfaces: fit QA) */
         const int ws = atoi(opt(argc, argv, "--winding-step", "4")); const double um = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : fb.um;
+        const int m14 = atoi(opt(argc, argv, "--winding-mod14", "0")) != 0;
         const int64_t gs[3] = {(int64_t)ceil(shp[0] * h / ws), (int64_t)ceil(shp[1] * h / ws), (int64_t)ceil(shp[2] * h / ws)};
         char lv[32], ld[1400], at[600]; z3w_level_name(um * ws, lv, sizeof lv); snprintf(ld, sizeof ld, "%s/%s", wout, lv);
-        snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"winding coordinate W * 256 (uint16; W = U - dir theta / 2 pi, sheets at integer W)\",\"dir\":%d,\"origin_zyx\":[%lld,%lld,%lld],\"step\":%d}}",
+        snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"%s\",\"dir\":%d,\"origin_zyx\":[%lld,%lld,%lld],\"step\":%d}}",
+                 m14 ? "winding q mod 14: round(18 U) mod 252 (uint8; 255 unknown; U = W + dir theta / 2 pi, the band codes' q)" : "winding coordinate W * 256 (uint16; W = U - dir theta / 2 pi, sheets at integer W)",
                  m->dir, org[0], org[1], org[2], ws);
-        z3w *zw = z3w_create_typed(ld, gs, 128, 1, 0.f, 0.0, at);
+        z3w *zw = m14 ? z3w_create(ld, gs, 128, 0.f, 255, at) : z3w_create_typed(ld, gs, 128, 1, 0.f, 0.0, at);
         if (!zw || z3w_write_group(wout, (const double[]){um * ws}, 1, "ufsm-winding", at)) { fprintf(stderr, "fit: %s\n", z3w_error()); return 1; }
         uint16_t *sb = malloc((size_t)128 * 128 * 128 * 2); float *wv = malloc((size_t)128 * 128 * 128 * 4);
         fit_set_dev *gd = nullptr; if (!c.cpu && !(gd = fit_set_upload(fs))) return 1;
         for (int64_t sz = 0; sz * 128 < gs[0]; sz++) for (int64_t sy = 0; sy * 128 < gs[1]; sy++) for (int64_t sx = 0; sx * 128 < gs[2]; sx++) {
             const int64_t n3[3] = {gs[0] - sz * 128 < 128 ? gs[0] - sz * 128 : 128, gs[1] - sy * 128 < 128 ? gs[1] - sy * 128 : 128, gs[2] - sx * 128 < 128 ? gs[2] - sx * 128 : 128};
             const double o3[3] = {(double)sz * 128 * ws, (double)sy * 128 * ws, (double)sx * 128 * ws};
-            if (gd ? fit_set_grid(gd, fs, o3, n3, ws, 0, wv) : fit_set_grid_cpu(fs, o3, n3, ws, 0, nullptr, wv)) { fprintf(stderr, "fit: no device memory for the winding grid\n"); return 1; }
-            memset(sb, 0, (size_t)128 * 128 * 128 * 2);
+            if (gd ? fit_set_grid(gd, fs, o3, n3, ws, m14, wv) : fit_set_grid_cpu(fs, o3, n3, ws, m14, nullptr, wv)) { fprintf(stderr, "fit: no device memory for the winding grid\n"); return 1; }
+            memset(sb, m14 ? 255 : 0, (size_t)128 * 128 * 128 * 2);
             for (int64_t a = 0; a < n3[0]; a++) for (int64_t b = 0; b < n3[1]; b++) for (int64_t c2 = 0; c2 < n3[2]; c2++) {
-                const double v = (double)wv[((size_t)a * n3[1] + b) * n3[2] + c2] * 256; sb[((size_t)a * 128 + b) * 128 + c2] = (uint16_t)(v < 0 ? 0 : v > 65535 ? 65535 : lround(v));
+                const double W = (double)wv[((size_t)a * n3[1] + b) * n3[2] + c2]; const size_t o = ((size_t)a * 128 + b) * 128 + c2;
+                if (m14) { ((uint8_t *)sb)[o] = wind_dense_code(W); continue; }
+                const double v = W * 256; sb[o] = (uint16_t)(v < 0 ? 0 : v > 65535 ? 65535 : lround(v));
             }
             if (z3w_write_shard(zw, sz, sy, sx, (const uint8_t *)sb, 8)) { fprintf(stderr, "fit: %s\n", z3w_error()); return 1; }
         }

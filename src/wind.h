@@ -17,6 +17,7 @@
    With drop_dup the vertices of cells that match the reference are dropped too (pick the reference where both exist, add only new
    coverage). */
 #pragma once
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -130,6 +131,11 @@ extern double wind_pitch_lo, wind_pitch_hi;
 /* a surface is dropped when its votes' agree share is under this (default 0.5: more disagree than agree) */
 extern double wind_min_surface_score;
 
+/* a winding q (turns) -> the dense winding raster byte (WIND_WINDING: round(18 W) mod 252, 255 unknown; fit --winding-mod14) */
+static inline uint8_t wind_dense_code(double W) {
+    if (!(W == W) || W > 1e15 || W < -1e15) return 255;
+    long long k = llround(W * 18) % 252; if (k < 0) k += 252; return (uint8_t)k;
+}
 /* code -> q_ref (turns mod 14), NaN without a winding */
 static inline float wind_code_q(uint8_t c, int kind) {
     if (kind == WIND_CODES) return c >= 1 && c <= 252 ? (float)(c - 1) / 18.f : __builtin_nanf("");

@@ -111,6 +111,16 @@ static wind_result run(const surf *s, int drop_dup, const char *name, int expect
 }
 
 int main(void) {
+    {   /* fit --winding-mod14: W -> dense winding byte -> wind_code_q (WIND_WINDING) gives W mod 14 to 1/36 turn; unknown -> 255 -> NaN */
+        int bad = 0;
+        for (double W = -40; W <= 40; W += 0.013) {
+            const uint8_t c = wind_dense_code(W); const float q = wind_code_q(c, WIND_WINDING);
+            double d = fmod(q - W, 14.0); if (d < -7) d += 14; if (d > 7) d -= 14;
+            bad += c > 251 || !(fabs(d) <= 1.0 / 36 + 1e-6);
+        }
+        CHECK(!bad && wind_dense_code(NAN) == 255 && wind_code_q(255, WIND_WINDING) != wind_code_q(255, WIND_WINDING) && wind_dense_code(14) == 0 && wind_dense_code(-1.0 / 18) == 251,
+              "wind_dense_code: %d codes off", bad);
+    }
     ref = calloc((size_t)LZ * LY * LX, 1);
     for (int z = 0; z < LZ; z++) for (double q = 1.0; q <= 5.0; q += 0.0005) {   /* the reference wraps, rasterised on the label grid */
         const double rho = R0 + P * q, th = 2 * M_PI * q;
