@@ -17,6 +17,7 @@
 #include "wload.h"
 #include "store.h"
 #include "tiffw.h"
+#include <unistd.h>
 #include "xnet.h"
 #include "zarr3.h"
 #include <dirent.h>
@@ -39,7 +40,7 @@ static int isurf_load(isurf *s, const char *dir) {
     memset(s, 0, sizeof *s);
     const char *b = strrchr(dir, '/'); snprintf(s->name, sizeof s->name, "%s", b && b[1] ? b + 1 : dir);
     { size_t l = strlen(s->name); while (l && s->name[l - 1] == '/') s->name[--l] = 0; }
-    char p[1400]; snprintf(p, sizeof p, "%s/meta.json", dir); FILE *f = fopen(p, "rb"); if (!f) return -1;
+    char p[1400]; snprintf(p, sizeof p, "%s/meta.json", dir); FILE *f = tfx_meta_fopen(p); if (!f) return -1;
     char m[16384] = {0}; const size_t mn = fread(m, 1, sizeof m - 1, f); (void)mn; fclose(f);
     const char *q = strstr(m, "\"scale\""); if (!q || !(q = strchr(q, '['))) return -1;
     s->scale = atof(q + 1); q = strstr(m, "\"voxel_size_um\""); s->vox_um = q ? atof(strchr(q, ':') + 1) : 2.399;

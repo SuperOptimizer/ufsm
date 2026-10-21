@@ -18,11 +18,11 @@
 D=$(cd "$(dirname "$0")" && pwd); . $D/common.sh
 s=$1; shift; read -r scan um fz <<< "$(scan_of $s)"; [ -n "${fz:-}" ] || { echo "fit.sh: $s not in $A/scrolls.tsv"; exit 2; }
 S=$A/$s; F=$S/fields/$fz; CK=$s/volumes/$scan.zarr
-# disk (10-21: 485 GB of box tifxyz filled /vesuvius to 96%): no new box below MINFREE GB free (exit 4: the lanes wait); after a box is
-# picked its full-res tifxyz / gated copies go (slim; the picked sheets live in SURF, the fit model stays) unless KEEPTIF=1 or it is a
-# priority box (control checks)
+# disk (10-21: 485 GB of full-res box tifxyz filled /vesuvius to 96%): no new box below MINFREE GB free (exit 4: the lanes wait). User
+# 10-21: every wrap of every box is kept, written at scale 0.25 (one vertex per 4 voxels) as surface-compressor .sfc (wraps --sfc;
+# all ufsm readers take .sfc wraps); after a box is picked only its gated copies go (slim).
 if [ $HOST = desk ]; then fr=$(df -BG --output=avail /vesuvius | tail -n 1 | tr -dc 0-9); [ $fr -ge ${MINFREE:-120} ] || { echo "fit.sh: only ${fr} GB free on /vesuvius"; exit 4; }; fi
-slim() { [ "${KEEPTIF:-0}" = 1 ] || grep -qx $1 $S/priority-$N.txt 2> /dev/null || rm -rf $BX/$1/tifxyz $BX/$1/gated $BX/$1/gated-loose; }
+slim() { rm -rf $BX/$1/gated $BX/$1/gated-loose; }   # (the picked copies live in SURF; all wraps stay, as .sfc at scale 0.25)
 if [ $HOST = desk ]; then N=${N:-1024}; TH=${TH:-12}; SURF=surf; else N=${N:-512}; TH=${TH:-8}; SURF=surf-l; fi
 ST=$((N - 128)); BX=$S/boxes-$N; mkdir -p $S/state $BX $S/$SURF
 FITA=(--w-ct 1 --ct-phi 0 --ct-flood 0 --uw-repair 8 --w-normal 3 --core 0 --threads $TH --quiet)   # (whole box; --slab must be a multiple of the knot spacing)
@@ -193,7 +193,7 @@ for b in $(ls_boxes "$@"); do
   C $U ct-fields $R $CK/1 $d/f --ct-um $(awk -v u=$um 'BEGIN { print 2 * u }') --threads $TH --cache $S/ctcache-$HOST > $d/ct.log 2>&1 || { fail ct-fields; continue; }
   tf=$(date +%s); FIT $d/f --out $d/fit "${FITA[@]}" > $d/fit.log 2>&1 || { fail fit; continue; }; echo "fit wall $(( $(date +%s) - tf ))s" >> $d/fit.log
   rm -f $d/f/*.raw
-  C $U wraps $d/fit $d/tifxyz --step 1 --out-um $um --fields $d/f --threads $TH > $d/wraps.log 2>&1 || { fail wraps; continue; }
+  C $U wraps $d/fit $d/tifxyz --step 4 --out-um $um --sfc ${SFCERR:-0.25} --fields $d/f --threads $TH > $d/wraps.log 2>&1 || { fail wraps; continue; }
   C $U surf-stats $d/tifxyz --fields $d/f --model $d/fit --per-wrap "${CT1[@]}" --threads $TH > $d/stats.log 2>&1
   pick $b $kind
   cl=$(g1 'largest [0-9.]+' $d/stats.log); nw=$(ls $d/tifxyz | wc -l); opall=$(grep -oE 'on papyrus \(max CT[^)]*\) [0-9.]+' $d/stats.log | awk '{print $NF}')

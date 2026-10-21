@@ -30,8 +30,11 @@ for L in surf surf-l; do
   [ -s $S/$L/list.tsv ] || continue
   while IFS=$'\t' read -r sf kind area onp masked; do
     grep -q "^$L/$sf	" $O/index.tsv && continue
-    n=w_${s}_$(echo $sf | tr / _)$([ $L = surf-l ] && echo _1cm); a2=$(printf '%.1f' $area); nn=${n}_${a2}cm2   # (w*: the C tools read w* entries)
-    g=$T/$n; rm -rf $g; mkdir -p $g/in; cp -r $S/$L/$sf $g/in/$n
+    n=w_${s}_$(echo ${sf%.sfc} | tr / _)$([ $L = surf-l ] && echo _1cm); a2=$(printf '%.1f' $area); nn=${n}_${a2}cm2   # (w*: the C tools read w* entries)
+    g=$T/$n; rm -rf $g; mkdir -p $g/in
+    if [ -f $S/$L/$sf ]; then   # a .sfc wrap: decoded into the scratch copy only (tifxyz-scale reads .sfc)
+      C $U tifxyz-scale $(dirname $S/$L/$sf) $g/dec 1 --wraps $(basename ${sf%.sfc}) > /dev/null 2>&1 && mv $g/dec/$(basename ${sf%.sfc}) $g/in/$n || { echo "render.sh: cannot decode $sf"; rm -rf $g; continue; }
+    else cp -r $S/$L/$sf $g/in/$n; fi
     C $U surf-snap $g/in $g/snap --volume $R $K/0 --vol-um $um --range 40 --threads $TH > $g/snap.log 2>&1 || { rm -rf $g/snap; cp -r $g/in $g/snap; }
     UFSM_RENDER_MEM=8 C $U render $g/snap $g/rc --volume $I $IK --ct $R $K/0 --depth 1 --scale 1 --threads $TH > $g/render.log 2>&1 ||
       { echo "render.sh: $s $sf render failed"; tail -n 2 $g/render.log; rm -rf $g; continue; }

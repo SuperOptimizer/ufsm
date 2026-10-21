@@ -9,6 +9,7 @@
 #include "stitch.h"
 #include "tiff.h"
 #include "tiffw.h"
+#include <unistd.h>
 #include "zarr3.h"
 #include "store.h"
 #include <dirent.h>
@@ -25,6 +26,7 @@ static const char *sopt(int argc, char **argv, const char *name, const char *dfl
 }
 static int sflag(int argc, char **argv, const char *name) { for (int i = 1; i < argc; i++) if (!strcmp(argv[i], name)) return 1; return 0; }
 static float *tif_f32(const char *path, int *w, int *h) {
+    if (tfx_axis_hook && access(path, F_OK)) return tfx_axis_hook(path, w, h);   /* a .sfc-backed wrap (src/tfx.c) */
     tiff *t = tiff_open_file(path); tiff_page pg;
     if (!t || tiff_page_info(t, 0, &pg) || pg.fmt != 3 || pg.bits != 32 || pg.spp != 1) { if (t) tiff_close(t); return nullptr; }
     float *d = malloc((size_t)pg.w * pg.h * 4);
@@ -38,7 +40,7 @@ static void sf_free(sf_wrap *s) { free(s->X); free(s->Y); free(s->Z); memset(s, 
 static int sf_load(const char *dir, const char *name, sf_wrap *s) {
     memset(s, 0, sizeof *s); snprintf(s->name, sizeof s->name, "%s", name);
     char p[1400]; snprintf(p, sizeof p, "%s/%s/meta.json", dir, name);
-    FILE *f = fopen(p, "rb"); char b[4096] = {0}; if (f) { const size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); }
+    FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { const size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); }
     const char *q = strstr(b, "\"voxel_size_um\":"); if (q) s->um = atof(q + 16);
     q = strstr(b, "\"scale\":"); if (q && (q = strchr(q, '['))) { const double sc = atof(q + 1); s->step = sc > 0 ? 1 / sc : 0; }
     q = strstr(b, "\"winding\":"); s->id = q ? atoi(q + 10) : atoi(name + 1);

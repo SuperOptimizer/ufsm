@@ -61,6 +61,7 @@ int cmd_wl_dump(int argc, char **argv);
 int cmd_tifxyz_map(int argc, char **argv);
 int cmd_tifxyz_orient(int argc, char **argv);
 int cmd_png2jpg(int argc, char **argv);
+int cmd_tifxyz_sfc(int argc, char **argv);
 int cmd_phase_score(int argc, char **argv);
 int cmd_ink_splat(int argc, char **argv);   /* src/inksplat.c */
 
@@ -106,6 +107,7 @@ static int usage(void) {
         "  ufsm overlay-red <ct-dir> <ink-dir> <out-dir> [ink2 [ink3]]   the 5-panel overlay of existing renders\n"
         "  ufsm tifxyz-scale <src> <dst> <div> [--offset z,y,x]   tifxyz coordinates / div (e.g. 2.4 -> 9.6 um: 4)\n"
         "  ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif ..   CT | ink panels (half-res JPEG) + ink statistics per render\n"
+        "  ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K]   tifxyz wraps -> surface-compressor .sfc (readers take .sfc wraps directly)\n"
         "  ufsm ink-ext --model v8in|hecate24|hecate96|reader3 --weights W --surface TIFXYZ --ct ROOT KEY --out DIR   external ink networks on a surface\n"
         "  ufsm ink-ensemble <out.tif> --ink [W:]INK.tif ..   per-model percentile-stretched weighted mean of ink renders\n"
         "  ufsm ink-splat <out-group> --surface TIFXYZ --labels L [--mask M] --ct ROOT KEY --ct-um U --iso I [--band -4,4] ..   published 2D ink labels -> sparse 3D label zarr\n"
@@ -1335,7 +1337,9 @@ static void *wraps_worker(void *arg) {
     return nullptr;
 }
 static int cmd_wraps(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4] [--threads 16]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm wraps <model-dir> <out-dir> [--step 8] [--first K] [--last K] [--fields DIR] [--um 2.4] [--threads 16] [--sfc ERR]\n"
+                                    "  --sfc ERR: each wrap as <out-dir>/wNNN.sfc (surface-compressor, joint XYZ within ERR voxels, meta.json inside) instead of a tifxyz dir\n"); return 2; }
+    if (atof(opt(argc, argv, "--sfc", "0")) > 0) tifxyz_set_sfc(atof(opt(argc, argv, "--sfc", "0")));
     fit_set *fs = fit_set_load(argv[2]); if (!fs) { fprintf(stderr, "wraps: cannot load %s\n", argv[2]); return 1; }
     const fit_model *m = fs->global;   /* the box, the axis; rows dispatch to the slab model of their z */
     const double step = atof(opt(argc, argv, "--step", "8")), um = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : fs->global->um;
@@ -1452,6 +1456,7 @@ static float trilin(const uint8_t *v, const int64_t n[3], double z, double y, do
     return (float)s;
 }
 static float *read_tif_f32(const char *path, int *w, int *h) {
+    if (tfx_axis_hook && access(path, F_OK)) return tfx_axis_hook(path, w, h);   /* a .sfc-backed wrap (src/tfx.c) */
     tiff *t = tiff_open_file(path); tiff_page pg;
     if (!t || tiff_page_info(t, 0, &pg) || pg.fmt != 3 || pg.bits != 32 || pg.spp != 1) { if (t) tiff_close(t); return nullptr; }
     float *d = malloc((size_t)pg.w * pg.h * 4);
@@ -1681,6 +1686,12 @@ typedef struct { axis ax; double f; } wa_axis;
 static void wa_axis_fn(void *ud, double z, double *cy, double *cx) { const wa_axis *A = ud; axis_at(&A->ax, z / A->f, cy, cx); *cy *= A->f; *cx *= A->f; }
 static float *wa_read_f32(const char *dir, const char *name, int *w, int *h) {
     char p[1400]; snprintf(p, sizeof p, "%s/%s", dir, name);
+    if (tfx_axis_hook && access(p, F_OK)) {   /* a .sfc-backed wrap (src/tfx.c) */
+        int w2 = 0, h2 = 0; float *a = tfx_axis_hook(p, &w2, &h2);
+        if (a && *w && (w2 != *w || h2 != *h)) { free(a); return nullptr; }
+        if (a) { *w = w2; *h = h2; }
+        return a;
+    }
     tiff *t = tiff_open_file(p); tiff_page pg;
     if (!t || tiff_page_info(t, 0, &pg) || pg.bits != 32 || pg.fmt != 3 || pg.spp != 1 || (*w && (pg.w != *w || pg.h != *h))) { if (t) tiff_close(t); return nullptr; }
     float *d = malloc((size_t)pg.w * pg.h * 4);
@@ -2023,7 +2034,7 @@ static int cmd_wrapdist(int argc, char **argv) {
         snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = wd_read(p, &w2, &h2);
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = wd_read(p, &w3, &h3);
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name); double wum = 0;
-        { FILE *f = fopen(p, "rb"); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"voxel_size_um\":"); if (q) wum = atof(q + 16); } }
+        { FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"voxel_size_um\":"); if (q) wum = atof(q + 16); } }
         if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || !(wum > 0)) { free(X); free(Y); free(Z); continue; }
         const double sc = wum / lum;
         for (size_t i = 0; i < (size_t)w * h; i++) {
@@ -2177,7 +2188,7 @@ static int cmd_wrapswitch(int argc, char **argv) {
         if (de->d_name[0] != 'w') continue;
         char p[1400]; int w, h, w2, h2, w3, h3; double um = 0;
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
-        { FILE *f = fopen(p, "rb"); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"voxel_size_um\":"); if (q) um = atof(q + 16); } }
+        { FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"voxel_size_um\":"); if (q) um = atof(q + 16); } }
         snprintf(p, sizeof p, "%s/%s/x.tif", argv[2], de->d_name); float *X = wd_read(p, &w, &h);
         snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = wd_read(p, &w2, &h2);
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = wd_read(p, &w3, &h3);
@@ -2318,7 +2329,7 @@ static int cmd_surfsnap(int argc, char **argv) {
         if (de->d_name[0] != 'w') continue;
         char p[1400]; int w, h, w2, h2, w3, h3; double wum = 0, scale = 0; int winding = 0;
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
-        { FILE *f = fopen(p, "rb"); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); }
+        { FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); }
           const char *q = strstr(b, "\"voxel_size_um\":"); if (q) wum = atof(q + 16);
           q = strstr(b, "\"scale\":"); if (q) { q = strchr(q, '['); if (q) scale = atof(q + 1); }
           q = strstr(b, "\"winding\":"); if (q) winding = atoi(q + 10); }
@@ -3043,7 +3054,7 @@ static int cmd_render(int argc, char **argv) {
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = read_tif_f32(p, &w3, &h3);
         if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || w < 2 || h < 2) { free(X); free(Y); free(Z); continue; }
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
-        double step = 1; { FILE *f = fopen(p, "rb"); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"scale\": ["); if (q) step = 1 / atof(q + 10); } }
+        double step = 1; { FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"scale\": ["); if (q) step = 1 / atof(q + 10); } }
         const double gs = step * scale;   /* output pixels per grid step */
         const int ow = (int)((w - 1) * gs) + 1, oh = (int)((h - 1) * gs) + 1;
         uint8_t *img = calloc((size_t)ow * oh, 1), *cimg = cz ? calloc((size_t)ow * oh, 1) : nullptr;
@@ -3256,6 +3267,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "tifxyz-map")) return cmd_tifxyz_map(argc, argv);
     if (!strcmp(cmd, "tifxyz-orient")) return cmd_tifxyz_orient(argc, argv);
     if (!strcmp(cmd, "png2jpg")) return cmd_png2jpg(argc, argv);
+    if (!strcmp(cmd, "tifxyz-sfc")) return cmd_tifxyz_sfc(argc, argv);
     if (!strcmp(cmd, "phase-score")) return cmd_phase_score(argc, argv);
     if (!strcmp(cmd, "render")) return cmd_render(argc, argv);
     if (!strcmp(cmd, "blend")) return cmd_blend(argc, argv);

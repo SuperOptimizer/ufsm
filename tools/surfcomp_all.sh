@@ -10,13 +10,8 @@ MAN=/vesuvius/usrm/surfcomp-manifest.json
 DL=/vesuvius/ufsm/gt/surfcomp
 OUT=/vesuvius/ufsm/gt/raster
 T=${T:-3}
-python3 - "$MAN" > /vesuvius/ufsm/surfcomp.txt <<'PY'
-import json, sys, re
-m = json.load(open(sys.argv[1]))
-for s in m["surfaces"]:
-    r = re.search(r"-on-(\d+)-([0-9.]+)um$", s["name"])
-    if r: print(s["scroll"], r.group(1), r.group(2), s["path"])
-PY
+# the manifest's surfaces registered on a scan: scroll, volume id, voxel um, path (jq; was an inline Python block)
+jq -r '.surfaces[] | (.name | capture("-on-(?<v>[0-9]+)-(?<u>[0-9.]+)um$")?) as $r | select($r != null) | "\(.scroll) \($r.v) \($r.u) \(.path)"' "$MAN" > /vesuvius/ufsm/surfcomp.txt
 # download
 while read -r scroll vol um path; do
   f="$DL/$path"; [ -f "$f" ] && continue

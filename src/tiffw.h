@@ -14,3 +14,20 @@ int tiffw_write(const char *path, int w, int h, int fmt, const void *data, int d
    area_vx2 (valid quads x step^2), area_cm2, voxel_size_um, winding, source. */
 int tifxyz_write(const char *dir, int w, int h, const float *x, const float *y, const float *z, double step, double voxel_um, int winding,
                  const char *source);
+
+/* Surface-compressor (.sfc) wraps (user 10-21: per-box wraps stored as .sfc, read directly). src/tfx.c installs the hooks when it is
+   linked (the ufsm binary); without it they stay null and only plain tifxyz directories exist.
+   A wrap path P is sfc-backed when P names a .sfc file, or P.sfc exists (P itself absent): then <P>/x.tif, y.tif, z.tif and meta.json
+   read from it (decoded on the fly, invalid vertices -1, no decoded copy on disk).
+   tifxyz_set_sfc(err): tifxyz_write writes <dir>.sfc instead of the directory (joint XYZ, Euclidean tolerance err voxels; 0 = off). */
+extern float *(*tfx_axis_hook)(const char *tifpath, int *w, int *h);
+extern char *(*tfx_meta_hook)(const char *metapath);
+extern int (*tfx_write_hook)(const char *sfcpath, int w, int h, const float *x, const float *y, const float *z, const char *meta, double err);
+void tifxyz_set_sfc(double err);
+/* an axis image <wrap>/{x,y,z}.tif: the file, else from the wrap's .sfc (null when neither) */
+float *tfx_axis_read(const char *tifpath, int *w, int *h, float *(*plain)(const char *, int *, int *));
+/* <wrap>/meta.json opened for reading: the file, else the .sfc's metadata (fmemopen) */
+#include <stdio.h>
+FILE *tfx_meta_fopen(const char *metapath);
+/* a wrap's meta.json or x.tif path exists (plain or sfc-backed) */
+int tfx_exists(const char *path);

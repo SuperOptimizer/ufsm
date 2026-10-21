@@ -40,7 +40,7 @@ typedef struct {
 } rsheet;
 
 static int meta_scale_area(const char *dir, double *scale, double *area) {
-    char p[1400]; snprintf(p, sizeof p, "%s/meta.json", dir); FILE *f = fopen(p, "rb"); if (!f) return -1;
+    char p[1400]; snprintf(p, sizeof p, "%s/meta.json", dir); FILE *f = tfx_meta_fopen(p); if (!f) return -1;
     char b[16384] = {0}; const size_t n = fread(b, 1, sizeof b - 1, f); (void)n; fclose(f);
     const char *q = strstr(b, "\"scale\": ["); if (!q) return -1;
     *scale = atof(q + 10);
@@ -400,10 +400,10 @@ int cmd_tifxyz_scale(int argc, char **argv) {
     struct dirent *de; int n = 0, rc = 0;
     while ((de = readdir(dd))) {
         if (de->d_name[0] == '.') continue;
-        if (want) { char k[300]; snprintf(k, sizeof k, ",%s,", de->d_name); if (!strstr(want, k)) continue; }
+        if (want) { char k[300]; snprintf(k, sizeof k, ",%s,", de->d_name); const size_t kl = strlen(k); if (kl > 5 && !strcmp(k + kl - 5, ".sfc,")) strcpy(k + kl - 5, ","); if (!strstr(want, k)) continue; }
         char s[1400], d[1400], m[1500]; snprintf(s, sizeof s, "%s/%s", argv[2], de->d_name); snprintf(m, sizeof m, "%s/meta.json", s);
-        struct stat st; if (stat(m, &st)) continue;
-        snprintf(d, sizeof d, "%s/%s", argv[3], de->d_name);
+        if (!tfx_exists(m)) continue;   /* (a tifxyz dir or a .sfc wrap) */
+        snprintf(d, sizeof d, "%s/%s", argv[3], de->d_name); { const size_t dl = strlen(d); if (dl > 4 && !strcmp(d + dl - 4, ".sfc")) d[dl - 4] = 0; }   /* (w.sfc -> w) */
         const char *nd = ropt(argc, argv, "--normal", nullptr);
         double tw[2]; const int htw = sscanf(ropt(argc, argv, "--toward", ""), "%lf,%lf", tw, tw + 1) == 2;
         if (nd ? tifxyz_shift(s, d, atof(nd), htw ? tw : nullptr) : tifxyz_scale(s, d, div, off)) { fprintf(stderr, "tifxyz-scale: %s failed\n", s); rc = 1; } else n++;
@@ -415,6 +415,57 @@ int cmd_tifxyz_scale(int argc, char **argv) {
 
 /* ufsm png2jpg <in.png> <out.jpg> [--half] [--quality 90]: a PNG (8-bit) as JPEG, --half Pillow-BOX halved (png2jpg_half.py,
    sync_big.sh's PNG -> JPEG copies) */
+/* ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K] [--wraps a,b,..]: every tifxyz wrap of <src-dir> (directories or
+   .sfc) as <dst-dir>/<w>.sfc (surface-compressor, joint XYZ within --error voxels, meta.json inside), keeping every K-th vertex in both
+   grid directions (K 4 turns a scale-1 wrap into scale 0.25; meta rewritten: scale, area, bbox). Prints the bytes before / after. */
+int cmd_tifxyz_sfc(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K] [--wraps a,b,..]\n"); return 2; }
+    const double err = atof(ropt(argc, argv, "--error", "0.25")); const int K = atoi(ropt(argc, argv, "--every", "1"));
+    if (!(err > 0) || K < 1 || !tfx_write_hook) { fprintf(stderr, "tifxyz-sfc: --error > 0, --every >= 1 (and a binary with src/tfx.c)\n"); return 2; }
+    const char *wl = ropt(argc, argv, "--wraps", nullptr); char *want = nullptr; if (wl) { want = malloc(strlen(wl) + 3); sprintf(want, ",%s,", wl); }
+    DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "tifxyz-sfc: cannot open %s\n", argv[2]); return 1; }
+    tifxyz_set_sfc(err);
+    struct dirent *de; int n = 0, rc = 0; long long before = 0, after = 0;
+    while ((de = readdir(dd))) {
+        if (de->d_name[0] == '.') continue;
+        char nm[300]; snprintf(nm, sizeof nm, "%s", de->d_name); { const size_t l = strlen(nm); if (l > 4 && !strcmp(nm + l - 4, ".sfc")) nm[l - 4] = 0; }
+        if (want) { char k[310]; snprintf(k, sizeof k, ",%s,", nm); if (!strstr(want, k)) continue; }
+        char s[1400], p[1500]; snprintf(s, sizeof s, "%s/%s", argv[2], de->d_name); snprintf(p, sizeof p, "%s/meta.json", s);
+        if (!tfx_exists(p)) continue;
+        FILE *f = tfx_meta_fopen(p); char mb[16384] = {0}; if (f) { const size_t mr = fread(mb, 1, sizeof mb - 1, f); (void)mr; fclose(f); }
+        const char *q = strstr(mb, "\"scale\": ["); const double sc = q ? atof(q + 10) : 1; q = strstr(mb, "\"voxel_size_um\":"); const double vum = q ? atof(q + 16) : 1;
+        q = strstr(mb, "\"winding\":"); const int wid = q ? atoi(q + 10) : -1;
+        static const char *ax[3] = {"x", "y", "z"}; float *A[3] = {0}; int w = 0, h = 0, ok = 1;
+        for (int k = 0; k < 3 && ok; k++) { int w2, h2; snprintf(p, sizeof p, "%s/%s.tif", s, ax[k]); A[k] = img_read_f32(p, &w2, &h2); ok = A[k] && (!k || (w2 == w && h2 == h)); w = w2; h = h2; }
+        if (ok) {
+            const int ow = (w + K - 1) / K, oh = (h + K - 1) / K; float *O[3];
+            for (int k = 0; k < 3; k++) { O[k] = malloc((size_t)ow * oh * 4); for (int r = 0; r < oh; r++) for (int c = 0; c < ow; c++) O[k][(size_t)r * ow + c] = A[k][(size_t)r * K * w + (size_t)c * K]; }
+            snprintf(p, sizeof p, "%s/%s", argv[3], nm);
+            if (tifxyz_write(p, ow, oh, O[0], O[1], O[2], K / (sc > 0 ? sc : 1), vum, wid, "ufsm tifxyz-sfc")) { fprintf(stderr, "tifxyz-sfc: cannot write %s.sfc\n", p); rc = 1; }
+            else {
+                struct stat st; char sp[1500]; snprintf(sp, sizeof sp, "%s.sfc", p); if (!stat(sp, &st)) after += st.st_size;
+                { float *B[3]; int bw = 0, bh = 0; double em = 0; long long bad = 0; static const char *bx[3] = {"x", "y", "z"};   /* read back: the error budget */
+                  for (int k = 0; k < 3; k++) { char bp[1600]; snprintf(bp, sizeof bp, "%s/%s.tif", sp, bx[k]); B[k] = img_read_f32(bp, &bw, &bh); }
+                  if (B[0] && B[1] && B[2] && bw == ow && bh == oh) for (size_t i = 0; i < (size_t)ow * oh; i++) {
+                      if (!(O[2][i] > 0)) { bad += B[2][i] != -1.f; continue; }
+                      const double e = sqrt((double)(B[0][i] - O[0][i]) * (B[0][i] - O[0][i]) + (double)(B[1][i] - O[1][i]) * (B[1][i] - O[1][i]) + (double)(B[2][i] - O[2][i]) * (B[2][i] - O[2][i]));
+                      if (e > em) em = e; }
+                  else bad = -1;
+                  printf("%s: %dx%d, max |xyz error| %.4f voxels (budget %g)%s\n", nm, ow, oh, em, err, bad ? " READBACK MISMATCH" : "");
+                  if (bad || em > err * 1.0001) rc = 1;
+                  for (int k = 0; k < 3; k++) free(B[k]); }
+                if (!stat(s, &st) && S_ISREG(st.st_mode)) before += st.st_size;
+                else for (int k = 0; k < 4; k++) { snprintf(sp, sizeof sp, "%s/%s", s, k < 3 ? (const char *[]){"x.tif", "y.tif", "z.tif"}[k] : "meta.json"); if (!stat(sp, &st)) before += st.st_size; }
+                n++;
+            }
+            for (int k = 0; k < 3; k++) free(O[k]);
+        } else { fprintf(stderr, "tifxyz-sfc: cannot read %s\n", s); rc = 1; }
+        for (int k = 0; k < 3; k++) free(A[k]);
+    }
+    closedir(dd); free(want); tifxyz_set_sfc(0);
+    fprintf(stderr, "tifxyz-sfc: %d wraps -> %s: %lld -> %lld bytes (%.1fx)\n", n, argv[3], before, after, after ? (double)before / after : 0);
+    return rc;
+}
 int cmd_png2jpg(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm png2jpg <in.png> <out.jpg> [--half] [--quality 90]\n"); return 2; }
     int w, h; uint8_t *rgb = png_read_rgb(argv[2], &w, &h); if (!rgb) { fprintf(stderr, "png2jpg: cannot read %s\n", argv[2]); return 1; }

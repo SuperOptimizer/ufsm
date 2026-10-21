@@ -2,6 +2,7 @@
    prediction along the labelled surface. */
 #include "inksplat.h"
 #include "imgops.h"
+#include "tiffw.h"
 #include "json.h"
 #include "sources.h"
 #include "store.h"
@@ -30,7 +31,7 @@ static int ssurf_load(ssurf *s, const char *dir) {
     const char *b = strrchr(dir, '/'); snprintf(s->name, sizeof s->name, "%s", b && b[1] ? b + 1 : dir);
     { size_t l = strlen(s->name); while (l && s->name[l - 1] == '/') s->name[--l] = 0; }
     char p[1400]; snprintf(p, sizeof p, "%s/meta.json", dir);
-    FILE *f = fopen(p, "rb"); if (!f) { fprintf(stderr, "ink-splat: cannot read %s\n", p); return -1; }
+    FILE *f = tfx_meta_fopen(p); if (!f) { fprintf(stderr, "ink-splat: cannot read %s\n", p); return -1; }
     char m[65536] = {0}; const size_t mn = fread(m, 1, sizeof m - 1, f); fclose(f);
     json *j = json_parse(m, mn); if (!j) { fprintf(stderr, "ink-splat: bad %s\n", p); return -1; }
     s->scale = json_num(json_at(json_get(j, "scale"), 0), 0); s->vox_um = json_num(json_get(j, "voxel_size_um"), 0);
