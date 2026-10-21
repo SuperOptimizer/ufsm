@@ -9,7 +9,7 @@
 #   renders/<name>_<area>cm2_ink.jpg    half-res CT | neg face | pos face | centre, each ink panel p1-p99 stretched per sheet
 #   renders/<name>_<area>cm2_fixed.jpg  the same on ONE fixed ink scale (bytes 0..FIXHI = p 0..0.5) for every sheet: blank sheets stay dark
 #   renders/<name>_<area>cm2_crop.jpg   full-res 1024 px crop of the richer face's most ink-rich window, fixed scale
-#  -> renders/index.tsv (surface, kind, area, on papyrus, ink mean neg / pos / centre, richer face, its frac50 / p95 / band, jpeg);
+#  -> renders/index.tsv (surface, kind, kept area, on papyrus, masked share (fit.sh self-gate), ink mean neg / pos / centre, richer face, its frac50 / p95 / band, jpeg);
 #  the snapped tifxyz -> sheets/<name> + a row in sheets.tsv (sheet, box, area cm2, on papyrus, tifxyz path on the laptop, scan um).
 D=$(cd "$(dirname "$0")" && pwd); . $D/common.sh
 s=$1; read -r scan um fz <<< "$(scan_of $s)"; [ -n "${fz:-}" ] || { echo "render.sh: $s not in $A/scrolls.tsv"; exit 2; }
@@ -17,12 +17,12 @@ S=$A/$s; I=$S/ink/${scan%-masked}-ink96.zarr; K=$s/volumes/$scan.zarr; O=$S/${RD
 LA=/home/forrest/ufsm-data/allscrolls/$s   # the laptop copy (queue.sh laptop pulls renders/, sheets/, sheets.tsv)
 [ -d $I ] || { echo "render.sh: $s has no ink $I"; exit 1; }
 IK=$(ls $I | grep -E '^[0-9.]+$' | sort -g | head -1); mkdir -p $O $T $S/sheets
-[ -s $O/index.tsv ] || printf 'surface\tkind\tarea_cm2\ton_papyrus\tink_neg\tink_pos\tink_centre\tricher\tfrac50\tp95\tband\tjpeg\n' > $O/index.tsv
+[ -s $O/index.tsv ] || printf 'surface\tkind\tarea_cm2\ton_papyrus\tmasked\tink_neg\tink_pos\tink_centre\tricher\tfrac50\tp95\tband\tjpeg\n' > $O/index.tsv
 [ -s $S/sheets.tsv ] || printf 'sheet\tbox\tarea_cm2\ton_papyrus\ttifxyz\tscan_um\n' > $S/sheets.tsv
 st1() { echo "$1" | grep "^ink $2:" | sed -E 's/.*mean ([0-9.]+) frac50 ([0-9.]+) p50 [0-9.]+ p95 ([0-9.]+) p99 [0-9.]+ band ([0-9.]+).*/\1 \2 \3 \4/'; }
 for L in surf surf-l; do
   [ -s $S/$L/list.tsv ] || continue
-  while IFS=$'\t' read -r sf kind area onp; do
+  while IFS=$'\t' read -r sf kind area onp masked; do
     grep -q "^$L/$sf	" $O/index.tsv && continue
     n=w_${s}_$(echo $sf | tr / _)$([ $L = surf-l ] && echo _1cm); a2=$(printf '%.1f' $area); nn=${n}_${a2}cm2   # (w*: surf-snap reads w* entries)
     g=$T/$n; rm -rf $g; mkdir -p $g/in; cp -r $S/$L/$sf $g/in/$n
@@ -41,7 +41,7 @@ for L in surf surf-l; do
     rich=neg; awk -v a=${mp:-0} -v b=${mn:-0} 'BEGIN { exit !(a > b) }' && rich=pos
     read -r _ f50 p95 band <<< "$(st1 "$st" "$rich face")"
     $U ink-compare $O/${nn}_crop.jpg --ct $g/k/ct/$n.tif --ink "$rich face=$g/r$([ $rich = neg ] && echo m || echo p)/$n.tif" --ink "centre=$g/k/ink1/$n.tif" --px-um $um --fixed 0,$FIXHI --stretch-ct --full --best-crop 1024 > /dev/null 2>> $g/cmp.log
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' $L/$sf $kind $area ${onp:-na} ${mn:-na} ${mp:-na} ${mc:-na} $rich ${f50:-na} ${p95:-na} ${band:-na} $nn.jpg >> $O/index.tsv
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' $L/$sf $kind $area ${onp:-na} ${masked:-na} ${mn:-na} ${mp:-na} ${mc:-na} $rich ${f50:-na} ${p95:-na} ${band:-na} $nn.jpg >> $O/index.tsv
     [ -n "${RDIR:-}" ] && { rm -rf $g; continue; }
     rm -rf $S/sheets/$nn; mv $g/snap/$n $S/sheets/$nn
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' $nn ${sf%%/*} $area ${onp:-na} $LA/sheets/$nn $um >> $S/sheets.tsv

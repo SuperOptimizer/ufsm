@@ -9,7 +9,8 @@
 #  3 per box (MAXBOX of them this pass, default 2): CT planes (ct-fields, CT level 1), probe fits of the centre sub-box with the axis
 #    2000 native voxels away along its mean sheet normal on both sides (the lower loss wins; or CORE=1 with A/<S>/core-line.json: the
 #    core-line half box of that side, ufsm coreline box), the box fit (--core 0, --w-ct 1 --ct-phi 0 --ct-flood 0 --uw-repair 8
-#    --w-normal 3, wind4 off = default), wraps at the native um, surf-stats --per-wrap --ct (on papyrus) -> the TOPW (3) best sheets
+#    --w-normal 3, wind4 off = default), wraps at the native um, surf-stats --per-wrap --ct (on papyrus), self-gate (pick: the coherent
+#    part of each wrap; REPICK=1 gates boxes fitted before the gate) -> the TOPW (3) best sheets
 #    (area x on-papyrus x (1 - phase-residual share), >= 0.5 cm2, on papyrus >= MINPAP 0.5) -> A/<S>/SURF/<box>/<wrap> and a row in
 #    A/<S>/SURF/list.tsv (surface, kind, area cm2, on papyrus); SURF = surf (desk) or surf-l (laptop; pushed to the desk for render.sh)
 #  4 STITCH=1: ufsm stitch align / quality / solve / sheets over the fitted boxes (only the agreeing neighbours join: --min-agree 0.5)
@@ -94,6 +95,41 @@ claim() { local c=$BX/$1.claim
   if ! mkdir $c 2> /dev/null; then read -r h p < $c/who 2> /dev/null; [ "${h:-}" = $HOST ] && ! kill -0 ${p:-0} 2> /dev/null || return 1; fi
   echo "$HOST $$" > $c/who; }
 
+# pick BOX KIND: gate the box's wraps to their coherent part (ufsm self-gate: on the network's sheet (conf >= 0.1, |e| < 0.25 turn),
+# on papyrus (CT level 1), no fault (|grad W| <= 3 x the sheet density, spacing to the next wrap 0.5..1.5), the box's phase coherence
+# vs the network >= 0.5 and not reversed (stitch quality), eroded 2, stretches >= 0.1 cm2: surfaces crossing crumpled layers drop out)
+# -> boxes-N/<b>/gated; the TOPW (3) wraps with the most kept area x on papyrus (>= 0.5 cm2 kept, on papyrus >= MINPAP) -> SURF/<b>/<w>
+# and SURF/list.tsv rows: surface, kind, kept cm2, on papyrus, masked share (1 - kept / area)
+pick() {
+  local b=$1 kind=$2 d=$BX/$1 fd=$BX/$1/f
+  printf '{"um": %s, "boxes": [{"name": "%s", "dir": "%s"}], "edges": []}\n' $um $b $d > $d/box.json
+  C $U stitch quality $d/box.json $d/box_q.json --fields $F --threads $TH > $d/quality.log 2>&1
+  rm -rf $d/gated; C $U self-gate $d/tifxyz $d/gated --fields $fd --model $d/fit "${CT1[@]}" $([ -s $d/box_q.json ] && echo --quality $d/box_q.json) \
+    --min-conf 0.1 --max-e 0.25 --erode 2 --min-area 0.1 --per-wrap --threads $TH > $d/gate.log 2>&1 || { echo "pick: $b self-gate failed"; return 1; }
+  : > $d/best.tsv
+  awk '$1 ~ /^w[0-9]+$/ && NF >= 5 {print $1, $4, $5}' $d/gate.log | while read -r w a ka; do   # wrap, area, kept area
+    op=$(awk -v w=$w '$1 == w && NF >= 8 {print $NF}' $d/stats.log)
+    awk -v a=${a:-0} -v ka=${ka:-0} -v op=${op:-0} -v w=$w -v m=${MINPAP:-0.5} 'BEGIN { if (ka >= 0.5 && op >= m) printf "%.4f\t%s\t%.3f\t%.3f\t%.3f\n", ka * op, w, ka, op, (a > 0 ? 1 - ka / a : 1) }' >> $d/best.tsv
+  done
+  sort -t$'\t' -k1,1 -gr $d/best.tsv | head -n ${TOPW:-3} | while IFS=$'\t' read -r sc w ka op ms; do
+    [ -d $d/gated/$w ] || continue; mkdir -p $S/$SURF/$b; rm -rf $S/$SURF/$b/$w; cp -r $d/gated/$w $S/$SURF/$b/
+    printf '%s/%s\t%s-%s\t%s\t%s\t%s\n' $b $w $kind $N $ka $op $ms >> $S/$SURF/list.tsv
+  done
+  touch $d/PICKED
+}
+# boxes fitted before the gate (no PICKED): their ungated sheets leave the list, the gated ones join it (REPICK=1)
+if [ "${REPICK:-0}" = 1 ]; then
+  for d in $BX/*/FITDONE; do d=$(dirname $d); b=$(basename $d); [ -e $d/PICKED ] && continue
+    [ -s $S/$SURF/list.tsv ] && grep -v "^$b/" $S/$SURF/list.tsv > $S/$SURF/list.tmp; mv $S/$SURF/list.tmp $S/$SURF/list.tsv 2> /dev/null
+    if [ -s $S/renders/index.tsv ]; then   # the box's ungated renders go (render.sh redoes the gated sheets)
+      rm -f $S/renders/w_${s}_${b}_*; rm -rf $S/sheets/w_${s}_${b}_*
+      grep -v "^$SURF/$b/" $S/renders/index.tsv > $S/renders/index.tmp; mv $S/renders/index.tmp $S/renders/index.tsv
+      [ -s $S/sheets.tsv ] && { grep -v "	$b	" $S/sheets.tsv > $S/sheets.tmp; mv $S/sheets.tmp $S/sheets.tsv; }
+    fi
+    k=$(cut -f4 $d/FITDONE | sed 's/[pm]$//'); pick $b ${k:-local}
+  done
+fi
+
 # ---- 3 box fits, best boxes first
 ls_boxes() { if [ $# -gt 0 ]; then printf '%s\n' "$@"; else head -n ${MAXBOX:-2} $BX.tsv | cut -f1; fi; }
 for b in $(ls_boxes "$@"); do
@@ -123,16 +159,7 @@ for b in $(ls_boxes "$@"); do
   rm -f $d/f/*.raw
   C $U wraps $d/fit $d/tifxyz --step 1 --out-um $um --fields $d/f --threads $TH > $d/wraps.log 2>&1 || { fail wraps; continue; }
   C $U surf-stats $d/tifxyz --fields $d/f --model $d/fit --per-wrap "${CT1[@]}" --threads $TH > $d/stats.log 2>&1
-  # the best sheets: per-wrap rows "  wNNN vertices conf |e|med |e|>0.25 theta-sw z-sw on-papyrus"
-  : > $d/best.tsv
-  awk '$1 ~ /^w[0-9]+$/ && NF >= 8 {print $1, $5, $NF}' $d/stats.log | while read -r w bad op; do
-    a=$(jq -r '.area_cm2 // 0' $d/tifxyz/$w/meta.json 2> /dev/null)
-    awk -v a=${a:-0} -v op=$op -v bad=$bad -v w=$w -v m=${MINPAP:-0.5} 'BEGIN { if (a >= 0.5 && op >= m) printf "%.4f\t%s\t%.3f\t%.3f\t%.3f\n", a * op * (1 - bad), w, a, op, bad }' >> $d/best.tsv
-  done
-  sort -t$'\t' -k1,1 -gr $d/best.tsv | head -n ${TOPW:-3} | while IFS=$'\t' read -r sc w a op bad; do
-    mkdir -p $S/$SURF/$b; cp -r $d/tifxyz/$w $S/$SURF/$b/
-    printf '%s/%s\t%s-%s\t%s\t%s\n' $b $w $kind $N $a $op >> $S/$SURF/list.tsv
-  done
+  pick $b $kind
   cl=$(g1 'largest [0-9.]+' $d/stats.log); nw=$(ls $d/tifxyz | wc -l); opall=$(grep -oE 'on papyrus \(max CT[^)]*\) [0-9.]+' $d/stats.log | awk '{print $NF}')
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' $b $pct $rn $kind$sd ${cl:-na} ${opall:-na} $nw $(sort -t$'\t' -k1,1 -gr $d/best.tsv | head -1 | cut -f2,3 | tr '\t' :) $(g1 'fit wall [0-9]+' $d/fit.log) $(( $(date +%s) - t0 )) |
     tee $d/FITDONE >> $S/fits-$HOST.tsv

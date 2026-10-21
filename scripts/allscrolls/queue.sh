@@ -38,7 +38,7 @@ desk-fit)
       for s in $( { for s in $(order); do done_ $s ink && echo $s; done; for s in $(order); do done_ $s ink || echo $s; done; } ); do
         stop && break; done_ $s fit-desk-1024-$mb && continue; [ $(nfail $s fit-$mb) -ge 3 ] && continue; left=1
         mkdir -p $A/$s; [ -e $A/ink.alldone ] && unset FITCPU || export FITCPU=1   # the GPUs belong to the ink lane until it is done
-        MAXBOX=$mb $D/fit.sh $s >> $A/$s/fit-lane$$.log 2>&1; rc=$?
+        REPICK=1 MAXBOX=$mb $D/fit.sh $s >> $A/$s/fit-lane$$.log 2>&1; rc=$?
         case $rc in 0) log "$s fit pass $mb done ($(cat $A/$s/state/fit-desk-1024-$mb.done))"; did=1;; 4) ;; *) fail $s fit-$mb "rc $rc"; did=1;; esac
       done
       [ $left = 0 ] && break; [ $did = 0 ] && sleep 120
