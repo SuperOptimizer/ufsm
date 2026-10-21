@@ -119,7 +119,7 @@ pick() {
 }
 # boxes fitted before the gate (no PICKED): their ungated sheets leave the list, the gated ones join it (REPICK=1)
 if [ "${REPICK:-0}" = 1 ]; then
-  for d in $BX/*/FITDONE; do d=$(dirname $d); b=$(basename $d); [ -e $d/PICKED ] && continue
+  for d in $BX/*/FITDONE; do [ -e "$d" ] || continue; d=$(dirname "$d"); b=$(basename "$d"); [ -e $d/PICKED ] && continue
     [ -s $S/$SURF/list.tsv ] && grep -v "^$b/" $S/$SURF/list.tsv > $S/$SURF/list.tmp; mv $S/$SURF/list.tmp $S/$SURF/list.tsv 2> /dev/null
     if [ -s $S/renders/index.tsv ]; then   # the box's ungated renders go (render.sh redoes the gated sheets)
       rm -f $S/renders/w_${s}_${b}_*; rm -rf $S/sheets/w_${s}_${b}_*
@@ -145,7 +145,7 @@ for b in $(ls_boxes "$@"); do
   [ -n "${lp:-}${lm:-}" ] || { fail "both probe fits"; continue; }
   sd=p; sg=-1; awk -v a="${lp:-9e9}" -v b="${lm:-9e9}" 'BEGIN { exit !(b < a) }' && { sd=m; sg=1; }
   read -r ny_ nx_ <<< "$(grep -m1 'mean normal' $d/p/$sd.log | sed -E 's/.*mean normal z [-0-9.]+ y ([-0-9.]+) x ([-0-9.]+);.*/\1 \2/')"
-  [ -n "${nx_:-}" ] || { fail "probe normal"; continue; }
+  [[ "${ny_:-}" =~ ^-?[0-9.]+$ && "${nx_:-}" =~ ^-?[0-9.]+$ ]] || { fail "probe normal (${ny_:-} ${nx_:-})"; continue; }
   if [ "${CORE:-0}" = 1 ] && [ -s $S/core-line.json ]; then   # core-line half box on the probe's side
     C $U coreline box $S/core-line.json --fields $F --box $z $y $x $nz $ny $nx --side $sg --out $d/f > $d/core.log 2>&1 || { fail "coreline box"; continue; }
     kind=core
