@@ -18,6 +18,11 @@
 D=$(cd "$(dirname "$0")" && pwd); . $D/common.sh
 s=$1; shift; read -r scan um fz <<< "$(scan_of $s)"; [ -n "${fz:-}" ] || { echo "fit.sh: $s not in $A/scrolls.tsv"; exit 2; }
 S=$A/$s; F=$S/fields/$fz; CK=$s/volumes/$scan.zarr
+# disk (10-21: 485 GB of box tifxyz filled /vesuvius to 96%): no new box below MINFREE GB free (exit 4: the lanes wait); after a box is
+# picked its full-res tifxyz / gated copies go (slim; the picked sheets live in SURF, the fit model stays) unless KEEPTIF=1 or it is a
+# priority box (control checks)
+if [ $HOST = desk ]; then fr=$(df -BG --output=avail /vesuvius | tail -n 1 | tr -dc 0-9); [ $fr -ge ${MINFREE:-120} ] || { echo "fit.sh: only ${fr} GB free on /vesuvius"; exit 4; }; fi
+slim() { [ "${KEEPTIF:-0}" = 1 ] || grep -qx $1 $S/priority-$N.txt 2> /dev/null || rm -rf $BX/$1/tifxyz $BX/$1/gated $BX/$1/gated-loose; }
 if [ $HOST = desk ]; then N=${N:-1024}; TH=${TH:-12}; SURF=surf; else N=${N:-512}; TH=${TH:-8}; SURF=surf-l; fi
 ST=$((N - 128)); BX=$S/boxes-$N; mkdir -p $S/state $BX $S/$SURF
 FITA=(--w-ct 1 --ct-phi 0 --ct-flood 0 --uw-repair 8 --w-normal 3 --core 0 --threads $TH --quiet)   # (whole box; --slab must be a multiple of the knot spacing)
@@ -135,7 +140,7 @@ pick_loose() {
 # LOOSE=1: boxes picked before the loose fallback existed whose strict pick found nothing
 if [ "${LOOSE:-0}" = 1 ]; then
   for d in $BX/*/PICKED; do [ -e "$d" ] || continue; d=$(dirname "$d"); b=$(basename "$d")
-    [ -s $d/best.tsv ] || [ -e $d/LOOSE ] || pick_loose $b $(cut -f4 $d/FITDONE | sed 's/[pm]$//')
+    [ -s $d/best.tsv ] || [ -e $d/LOOSE ] || { pick_loose $b $(cut -f4 $d/FITDONE | sed 's/[pm]$//'); slim $b; }
   done
 fi
 # boxes fitted before the gate (no PICKED): their ungated sheets leave the list, the gated ones join it (REPICK=1)
@@ -194,7 +199,7 @@ for b in $(ls_boxes "$@"); do
   cl=$(g1 'largest [0-9.]+' $d/stats.log); nw=$(ls $d/tifxyz | wc -l); opall=$(grep -oE 'on papyrus \(max CT[^)]*\) [0-9.]+' $d/stats.log | awk '{print $NF}')
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' $b $pct $rn $kind$sd ${cl:-na} ${opall:-na} $nw $(sort -t$'\t' -k1,1 -gr $d/best.tsv | head -1 | cut -f2,3 | tr '\t' :) $(g1 'fit wall [0-9]+' $d/fit.log) $(( $(date +%s) - t0 )) |
     tee $d/FITDONE >> $S/fits-$HOST.tsv
-  rm -rf $d/p
+  rm -rf $d/p; slim $b
 done
 rm -rf $S/ctcache-$HOST
 # all listed boxes fitted (FITDONE) or failed (FITDONE.failed, not retried)? Else another fit.sh still works on them (exit 4)
