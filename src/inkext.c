@@ -589,6 +589,18 @@ surfaces:;
         const char *gc = iopt(argc, argv, "--grid-crop", nullptr); int cc[4];   /* c0,r0,cols,rows of the tifxyz grid */
         if (gc && (sscanf(gc, "%d,%d,%d,%d", cc, cc + 1, cc + 2, cc + 3) != 4 || isurf_crop(&S, cc[0], cc[1], cc[2], cc[3]))) { fprintf(stderr, "ink-ext: bad --grid-crop\n"); return 2; }
         const char *pre = iopt(argc, argv, "--prefix", ""); char nm[600]; snprintf(nm, sizeof nm, "%s%s", pre, S.name);
+        if (iflag(argc, argv, "--inward") && !lonly) {   /* the layer order whose read runs radially inward (the published PHerc1447 renders' order, the w058 control) */
+            const char *oc = iopt(argc, argv, "--center", nullptr); double cx = X.lev[0].shape[2] * 0.5, cy = X.lev[0].shape[1] * 0.5;
+            if (oc) sscanf(oc, "%lf,%lf", &cx, &cy);
+            double sum = 0; long cnt = 0;
+            for (int r = 0; r + 1 < S.h; r += 4) for (int q = 0; q + 1 < S.w; q += 4) {
+                double P[3], N[3], du[3], dv[3]; if (surf_pn(&S, q + 0.5, r + 0.5, P, N, du, dv)) continue;
+                const double ry = P[1] - cy, rx = P[2] - cx, rl = sqrt(rx * rx + ry * ry); if (rl < 1) continue;
+                sum += (N[1] * ry + N[2] * rx) / rl; cnt++;
+            }
+            const int outward = cnt && sum / cnt > 0; X.reverse = outward ^ iflag(argc, argv, "--reverse");
+            fprintf(stderr, "ink-ext: %s: normal %s (mean radial %.2f about %.0f,%.0f) -> %s layer order\n", S.name, outward ? "outward" : "inward", cnt ? sum / cnt : 0, cx, cy, X.reverse ? "reversed" : "forward");
+        }
         const double t0 = inow(); int Wm, Hm; double du;
         float *ctl = nullptr; const int want_ct = iflag(argc, argv, "--ct-tif");
         float *pm = run_surface(&X, &S, &Wm, &Hm, &du, want_ct ? &ctl : nullptr);
@@ -689,6 +701,85 @@ int cmd_ink_ensemble(int argc, char **argv) {
     for (int k = 0; k < n; k++) free(im[k]);
     free(mask); free(acc); free(o);
     return rc;
+}
+
+/* ufsm tifxyz-map <src-tifxyz> <src-image.tif> <dst-tifxyz> <out.tif> [--max-dist 1.16] [--mask OUT_MASK.tif]
+   An image on one surface's render grid (src: ufsm render --scale 1 / published layers, pixel (x, y) = grid (x scale, y scale))
+   carried onto another surface's render grid: per dst pixel its 3D point, the nearest src grid vertex within --max-dist voxels
+   (default 1.16 = 10 um at 8.64 um), the src image at that vertex's pixel. Unmatched pixels 0; --mask: 255 where matched. */
+typedef struct { int64_t key; int32_t i; } vkey;
+static int vk_cmp(const void *a, const void *b) { const int64_t p = ((const vkey *)a)->key, q = ((const vkey *)b)->key; return (p > q) - (p < q); }
+static inline int64_t bkey(int64_t z, int64_t y, int64_t x) { return (z << 42) | ((y & 0x1fffff) << 21) | (x & 0x1fffff); }
+int cmd_tifxyz_map(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "usage: ufsm tifxyz-map <src-tifxyz> <src-image.tif> <dst-tifxyz> <out.tif> [--max-dist 1.16] [--mask MASK.tif]\n"); return 2; }
+    isurf A, Bs; if (isurf_load(&A, argv[2]) || isurf_load(&Bs, argv[4])) { fprintf(stderr, "tifxyz-map: cannot read the tifxyz\n"); return 1; }
+    int iw, ih; uint8_t *img = img_read_u8(argv[3], &iw, &ih); if (!img) { fprintf(stderr, "tifxyz-map: cannot read %s\n", argv[3]); return 1; }
+    const double md = atof(iopt(argc, argv, "--max-dist", "1.16"));
+    double sr = 0; for (size_t i = 0; i + 1 < (size_t)A.w * A.h; i++) if (A.Z[i] >= 0 && A.Z[i + 1] >= 0) { const double a0 = A.Z[i + 1] - A.Z[i], a1 = A.Y[i + 1] - A.Y[i], a2 = A.X[i + 1] - A.X[i]; sr = fmax(sr, 0); sr = sqrt(a0 * a0 + a1 * a1 + a2 * a2); break; }
+    sr = fmax(sr * 0.75 + md, md);   /* vertex search radius: ~ the src grid spacing (in-plane) plus the normal tolerance */
+    const double bs = sr;
+    const size_t nv = (size_t)A.w * A.h; vkey *V = malloc(nv * sizeof *V); size_t n = 0;
+    for (size_t i = 0; i < nv; i++) if (A.Z[i] >= 0) V[n++] = (vkey){bkey((int64_t)floor(A.Z[i] / bs), (int64_t)floor(A.Y[i] / bs), (int64_t)floor(A.X[i] / bs)), (int32_t)i};
+    qsort(V, n, sizeof *V, vk_cmp);
+    const double gs = 1 / Bs.scale; const int ow = (int)((Bs.w - 1) * gs) + 1, oh = (int)((Bs.h - 1) * gs) + 1;
+    uint8_t *o = calloc((size_t)ow * oh, 1), *mk = calloc((size_t)ow * oh, 1); size_t matched = 0, valid = 0;
+    for (int py = 0; py < oh; py++) for (int px = 0; px < ow; px++) {
+        double P[3], N[3], a[3], b[3]; if (surf_pn(&Bs, px / gs, py / gs, P, N, a, b)) continue;
+        valid++;
+        const int64_t c0 = (int64_t)floor(P[0] / bs), c1 = (int64_t)floor(P[1] / bs), c2 = (int64_t)floor(P[2] / bs);
+        double best = sr * sr; int32_t bi = -1;   /* the nearest src vertex within the search radius; the normal distance is tested below */
+        for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+            const vkey k = {bkey(c0 + dz, c1 + dy, c2 + dx), 0}; vkey *f = bsearch(&k, V, n, sizeof *V, vk_cmp); if (!f) continue;
+            while (f > V && f[-1].key == k.key) f--;
+            for (; f < V + n && f->key == k.key; f++) {
+                const double d0 = A.Z[f->i] - P[0], d1 = A.Y[f->i] - P[1], d2 = A.X[f->i] - P[2], d = d0 * d0 + d1 * d1 + d2 * d2;
+                if (d <= best) { best = d; bi = f->i; }
+            }
+        }
+        if (bi < 0) continue;
+        /* the point in the src vertex's tangent frame: P - V = a du + b dv + h n (du, dv one grid step), |h| <= max-dist, the src
+           image at the projected position (grid c + a, r + b) */
+        const int c = bi % A.w, r = bi / A.w; if (c + 1 >= A.w || r + 1 >= A.h) continue;
+        const size_t i1 = (size_t)bi + 1, i2 = (size_t)bi + A.w; if (A.Z[i1] < 0 || A.Z[i2] < 0) continue;
+        const double du[3] = {A.Z[i1] - A.Z[bi], A.Y[i1] - A.Y[bi], A.X[i1] - A.X[bi]}, dv[3] = {A.Z[i2] - A.Z[bi], A.Y[i2] - A.Y[bi], A.X[i2] - A.X[bi]};
+        const double d[3] = {P[0] - A.Z[bi], P[1] - A.Y[bi], P[2] - A.X[bi]};
+        double nn[3] = {du[1] * dv[2] - du[2] * dv[1], du[2] * dv[0] - du[0] * dv[2], du[0] * dv[1] - du[1] * dv[0]};
+        const double nl = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]); if (nl < 1e-9) continue;
+        const double h = (d[0] * nn[0] + d[1] * nn[1] + d[2] * nn[2]) / nl; if (fabs(h) > md) continue;
+        const double uu = du[0] * du[0] + du[1] * du[1] + du[2] * du[2], vv = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2], uv = du[0] * dv[0] + du[1] * dv[1] + du[2] * dv[2];
+        const double du_d = du[0] * d[0] + du[1] * d[1] + du[2] * d[2], dv_d = dv[0] * d[0] + dv[1] * d[1] + dv[2] * d[2], det = uu * vv - uv * uv;
+        if (fabs(det) < 1e-12) continue;
+        const double ga = (vv * du_d - uv * dv_d) / det, gb = (uu * dv_d - uv * du_d) / det;
+        if (fabs(ga) > 1.5 || fabs(gb) > 1.5) continue;
+        const int sx = (int)lround((c + ga) / A.scale), sy = (int)lround((r + gb) / A.scale);
+        if (sx < 0 || sy < 0) continue;
+        if (sx < iw && sy < ih) { o[(size_t)py * ow + px] = img[(size_t)sy * iw + sx]; mk[(size_t)py * ow + px] = 255; matched++; }
+    }
+    fprintf(stderr, "tifxyz-map: %zu of %zu pixels within %.2f voxels of %s (%.1f%%)\n", matched, valid, md, argv[2], valid ? 100.0 * matched / valid : 0);
+    int rc = tiffw_write(argv[5], ow, oh, 1, o, 1) ? 1 : 0;
+    const char *mp = iopt(argc, argv, "--mask", nullptr); if (mp && tiffw_write(mp, ow, oh, 1, mk, 1)) rc = 1;
+    free(V); free(o); free(mk); free(img); isurf_free(&A); isurf_free(&Bs);
+    return rc;
+}
+
+/* ufsm tifxyz-orient <tifxyz>.. --center x,y: per surface the share of its vertices whose unit normal du x dv (ink-ext's forward
+   layer direction) points away from the vertical axis through (x, y) (radially outward), and the mean radial component */
+int cmd_tifxyz_orient(int argc, char **argv) {
+    double cx = 0, cy = 0; const char *c = iopt(argc, argv, "--center", nullptr);
+    if (argc < 3 || !c || sscanf(c, "%lf,%lf", &cx, &cy) != 2) { fprintf(stderr, "usage: ufsm tifxyz-orient <tifxyz>.. --center x,y\n"); return 2; }
+    for (int a = 2; a < argc; a++) {
+        if (!strcmp(argv[a], "--center")) { a++; continue; }
+        isurf S; if (isurf_load(&S, argv[a])) { fprintf(stderr, "tifxyz-orient: cannot read %s\n", argv[a]); continue; }
+        long n = 0, out = 0; double sum = 0;
+        for (int r = 0; r + 1 < S.h; r += 2) for (int q = 0; q + 1 < S.w; q += 2) {
+            double P[3], N[3], du[3], dv[3]; if (surf_pn(&S, q + 0.5, r + 0.5, P, N, du, dv)) continue;
+            const double ry = P[1] - cy, rx = P[2] - cx, rl = sqrt(rx * rx + ry * ry); if (rl < 1) continue;
+            const double rad = (N[1] * ry + N[2] * rx) / rl; sum += rad; n++; out += rad > 0;
+        }
+        printf("%s: %ld samples, normal outward %.1f%%, mean radial %.3f\n", argv[a], n, n ? 100.0 * out / n : 0, n ? sum / n : 0);
+        isurf_free(&S);
+    }
+    return 0;
 }
 
 /* ufsm wl-dump <weights> [sub]: the tensors of a safetensors / torch zip file (name, shape, mean |v|) */
