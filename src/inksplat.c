@@ -403,6 +403,27 @@ static int mkdir_p(const char *path) {
     return mkdir(tmp, 0755) && errno != EEXIST ? -1 : 0;
 }
 
+static const char *g_attrs = "{\"ufsm\":{\"content\":\"ink-splat\",\"encoding\":\"prob254: p*254, 254 = ink, 0 = no ink, 255 = unknown\"}}";
+/* the coarse levels (known-max pooling, L + 1 .. top) of <out> and its OME group (levels L .. top) */
+static int splat_pyramid(const inksplat_cfg *c, const int64_t shape0[3]) {
+    const int L = c->level; int top = c->coarse >= 0 ? L + c->coarse : (L < 5 ? 5 : L);
+    if (top > 9) top = 9;
+    double ums[16]; int nl = 0;
+    for (int l = L; l <= top; l++) {
+        if (l > L && pyramid_build_level(c->out, c->ct_um, l, shape0, SH, 0, 3, 4 * (c->threads > 0 ? c->threads : 1), g_attrs)) { fprintf(stderr, "ink-splat: level %d failed\n", l); return -1; }
+        ums[nl++] = c->ct_um * (1 << l);
+    }
+    if (z3w_write_group(c->out, ums, nl, "ink-splat", g_attrs)) { fprintf(stderr, "ink-splat: group: %s\n", z3w_error()); return -1; }
+    return 0;
+}
+/* --pyramid-only: rebuild the coarse levels and the group of an existing splat (after merging many segments with --coarse 0) */
+static int splat_pyramid_only(const inksplat_cfg *c) {
+    store *cts = store_open(c->ct_root); z3 *ct0 = cts ? pyramid_open_level(cts, c->ct_key, 0, c->ct_um, c->cache) : nullptr;
+    if (!ct0 || !c->out) { fprintf(stderr, "ink-splat: --pyramid-only needs <out> and the CT: %s\n", z3_error()); return 1; }
+    int64_t shape0[3]; memcpy(shape0, z3_meta_of(ct0)->shape, sizeof shape0); z3_close(ct0);
+    return splat_pyramid(c, shape0) ? 1 : 0;
+}
+
 int inksplat_run(const inksplat_cfg *c) {
     const double t0 = snow();
     if (!c->surface || !c->labels || !c->ct_root || !c->ct_key || !(c->ct_um > 0) || c->level < 0 || c->level > 6 || !(c->band_b >= c->band_a) ||
@@ -600,14 +621,7 @@ int inksplat_run(const inksplat_cfg *c) {
             fflush(stdout);
         }
         /* coarse levels (known-max pooling) and the group */
-        int top = c->coarse >= 0 ? L + c->coarse : (L < 5 ? 5 : L);
-        if (top > 9) top = 9;
-        double ums[16]; int nl = 0;
-        for (int l = L; l <= top; l++) {
-            if (l > L && pyramid_build_level(c->out, c->ct_um, l, shape0, SH, 0, 3, c->threads, attrs)) { fprintf(stderr, "ink-splat: level %d failed\n", l); goto out2; }
-            ums[nl++] = c->ct_um * (1 << l);
-        }
-        if (z3w_write_group(c->out, ums, nl, "ink-splat", attrs)) { fprintf(stderr, "ink-splat: group: %s\n", z3w_error()); goto out2; }
+        if (splat_pyramid(c, shape0)) goto out2;
         /* summary */
         char sp[1400]; if (c->summary) snprintf(sp, sizeof sp, "%s", c->summary); else { snprintf(sp, sizeof sp, "%s/segments", c->out); mkdir_p(sp); snprintf(sp, sizeof sp, "%s/segments/%s.json", c->out, name); }
         FILE *f = fopen(sp, "w");
@@ -654,6 +668,78 @@ out0:
     return rc;
 }
 
+/* --points JSON: 3D point labels (a VC3D point-collection file: collections named "ink" / "noink", points "p": [x, y, z] in level-0
+   voxels, integer = voxel centre) rasterised as balls of --radius-um on CT level L: ink 254, no ink 0 (ink wins where balls of both
+   meet), CT < iso unknown; merged into <out> like a segment splat. */
+typedef struct { int64_t key; uint32_t idx; uint8_t v; } pent;
+static int pent_cmp(const void *a, const void *b) { const pent *p = a, *q = b; return p->key != q->key ? (p->key < q->key ? -1 : 1) : p->idx != q->idx ? (p->idx < q->idx ? -1 : 1) : (int)p->v - (int)q->v; }
+static int splat_points(const inksplat_cfg *c, const char *path, double radius_um) {
+    if (!c->out || !(c->ct_um > 0) || !(radius_um > 0)) { fprintf(stderr, "ink-splat --points: need <out>, --ct-um and --radius-um > 0\n"); return 2; }
+    FILE *f = fopen(path, "rb"); if (!f) { fprintf(stderr, "ink-splat: cannot read %s\n", path); return 1; }
+    fseek(f, 0, SEEK_END); const long fl = ftell(f); fseek(f, 0, SEEK_SET);
+    char *txt = malloc((size_t)fl + 1); const size_t got = fread(txt, 1, (size_t)fl, f); fclose(f); txt[got] = 0;
+    json *j = json_parse(txt, got); free(txt);
+    if (!j) { fprintf(stderr, "ink-splat: bad JSON %s\n", path); return 1; }
+    store *cts = store_open(c->ct_root); const int L = c->level; const double V = (double)(1 << L), off = (V - 1) / 2, rr = fmax(0.5, radius_um / (c->ct_um * V));
+    z3 *ct = pyramid_open_level(cts, c->ct_key, L, c->ct_um, c->cache), *ct0 = pyramid_open_level(cts, c->ct_key, 0, c->ct_um, c->cache);
+    if (!ct || !ct0) { fprintf(stderr, "ink-splat: CT: %s\n", z3_error()); json_free(j); return 1; }
+    int64_t oshape[3], shape0[3], ns[3]; memcpy(oshape, z3_meta_of(ct)->shape, sizeof oshape); memcpy(shape0, z3_meta_of(ct0)->shape, sizeof shape0);
+    for (int d = 0; d < 3; d++) ns[d] = (oshape[d] + SH - 1) / SH;
+    size_t cap = 1 << 16, n = 0; pent *E = malloc(cap * sizeof *E); long npt[2] = {0, 0};
+    const json *cols = json_get(j, "collections");
+    for (size_t ci = 0; cols && ci < cols->n; ci++) {
+        const json *col = cols->items[ci]; const char *nm = json_str(json_get(col, "name"), "");
+        const int v = strstr(nm, "noink") || strstr(nm, "no_ink") || strstr(nm, "no-ink") ? 0 : strstr(nm, "ink") ? 254 : -1;
+        if (v < 0) { fprintf(stderr, "ink-splat: collection \"%s\" skipped\n", nm); continue; }
+        const json *pts = json_get(col, "points");
+        for (size_t pi = 0; pts && pi < pts->n; pi++) {
+            const json *p = json_get(pts->items[pi], "p"); if (!p || p->n != 3) continue;
+            const double q[3] = {(json_num(json_at(p, 2), 0) - off) / V, (json_num(json_at(p, 1), 0) - off) / V, (json_num(json_at(p, 0), 0) - off) / V};
+            npt[v ? 1 : 0]++;
+            for (int64_t z = (int64_t)ceil(q[0] - rr); z <= (int64_t)floor(q[0] + rr); z++) for (int64_t y = (int64_t)ceil(q[1] - rr); y <= (int64_t)floor(q[1] + rr); y++)
+                for (int64_t x = (int64_t)ceil(q[2] - rr); x <= (int64_t)floor(q[2] + rr); x++) {
+                    const double dz = z - q[0], dy = y - q[1], dx = x - q[2];
+                    if (dz * dz + dy * dy + dx * dx > rr * rr + 1e-9 || z < 0 || y < 0 || x < 0 || z >= oshape[0] || y >= oshape[1] || x >= oshape[2]) continue;
+                    if (n == cap) { cap *= 2; E = realloc(E, cap * sizeof *E); }
+                    E[n++] = (pent){((z / SH) * ns[1] + y / SH) * ns[2] + x / SH, (uint32_t)(((z % SH) * SH + y % SH) * SH + x % SH), (uint8_t)v};
+                }
+        }
+    }
+    json_free(j);
+    qsort(E, n, sizeof *E, pent_cmp);
+    char lv[64], adir[1400], zj[1500]; z3w_level_name(c->ct_um * V, lv, sizeof lv); snprintf(adir, sizeof adir, "%s/%s", c->out, lv); snprintf(zj, sizeof zj, "%s/zarr.json", adir);
+    struct stat sst; const int exists = !stat(zj, &sst);
+    if (exists && !c->merge) { fprintf(stderr, "ink-splat: %s exists (use --merge)\n", adir); free(E); return 1; }
+    mkdir_p(c->out);
+    z3w *w = z3w_create(adir, oshape, SH, 0, 255, g_attrs); store *os = store_open(c->out); z3 *old = exists ? z3_open(os, lv, nullptr) : nullptr;
+    uint8_t *buf = malloc((size_t)SH * SH * SH), *ctc[NCS * NCS * NCS] = {0};
+    long nink = 0, nno = 0, nrej = 0; int rc = 0, nsh = 0;
+    for (size_t i = 0; i < n && !rc;) {
+        size_t e = i; while (e < n && E[e].key == E[i].key) e++;
+        const int64_t key = E[i].key, so[3] = {key / (ns[1] * ns[2]) * SH, key / ns[2] % ns[1] * SH, key % ns[2] * SH}, sn[3] = {SH, SH, SH};
+        if (old && z3_shard_present(old, so[0] / SH, so[1] / SH, so[2] / SH) == 1) { if (z3_read(old, so, sn, buf, 4)) rc = 1; } else memset(buf, 255, (size_t)SH * SH * SH);
+        for (size_t k = i; k < e && !rc; k++) {
+            if (k + 1 < e && E[k + 1].idx == E[k].idx) continue;   /* the largest value of a voxel is last */
+            const uint32_t id = E[k].idx; const int z = (int)(id / (SH * SH)), y = (int)(id / SH % SH), x = (int)(id % SH);
+            const int cc = ((z >> 7) * NCS + (y >> 7)) * NCS + (x >> 7);
+            if (!ctc[cc]) { ctc[cc] = malloc((size_t)CH * CH * CH); const int64_t co[3] = {so[0] + (z >> 7) * CH, so[1] + (y >> 7) * CH, so[2] + (x >> 7) * CH}, cn[3] = {CH, CH, CH};
+                            if (z3_read(ct, co, cn, ctc[cc], 4)) { rc = 1; break; } }
+            const uint8_t cv = ctc[cc][(((size_t)(z & 127) * CH) + (y & 127)) * CH + (x & 127)];
+            if (!cv || cv < c->iso) { nrej++; continue; }
+            buf[id] = buf[id] == 255 ? E[k].v : (buf[id] > E[k].v ? buf[id] : E[k].v);
+            if (E[k].v) nink++; else nno++;
+        }
+        for (int cc = 0; cc < NCS * NCS * NCS; cc++) { free(ctc[cc]); ctc[cc] = nullptr; }
+        if (!rc && z3w_write_shard(w, so[0] / SH, so[1] / SH, so[2] / SH, buf, 4)) rc = 1;
+        nsh++; i = e;
+    }
+    z3w_close(w); if (old) z3_close(old); free(buf); free(E); z3_close(ct); z3_close(ct0);
+    fprintf(stderr, "ink-splat --points: %ld ink + %ld no-ink points (ball radius %.2f voxels at level %d): %ld ink + %ld no-ink voxels, %ld below iso, %d shards\n",
+            npt[1], npt[0], rr, L, nink, nno, nrej, nsh);
+    if (rc) { fprintf(stderr, "ink-splat --points: failed: %s %s\n", z3_error(), z3w_error()); return 1; }
+    return splat_pyramid(c, shape0) ? 1 : 0;
+}
+
 static const char *sopt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
 static int sflag(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return 1; return 0; }
 static int sidx(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
@@ -664,7 +750,7 @@ int cmd_ink_splat(int argc, char **argv) {
     if (argc < 3 || ci < 0 || ci + 2 >= argc) {
         fprintf(stderr, "usage: ufsm ink-splat <out-group|-> --surface TIFXYZ --labels L [--mask M] --ct ROOT KEY --ct-um U [--level 0] --iso I\n"
                         "         [--band A,B (layers, -4,4)] [--layer-vox 1] [--flip] [--thr 0.5] [--label-z Z] [--label-scale F] [--label-offset r,c] [--crop c0,r0,w,h]\n"
-                        "         [--merge] [--coarse N] [--name NAME] [--summary JSON] [--preview JPG] [--threads 6] [--cache DIR]\n"
+                        "         [--merge] [--coarse N] [--name NAME] [--summary JSON] [--preview JPG] [--pyramid-only]\n         ufsm ink-splat <out-group> --points VC3D.json --radius-um 5 --ct ROOT KEY --ct-um U [--level 0] --iso I [--merge]   (3D point labels) [--threads 6] [--cache DIR]\n"
                         "         [--pred ROOT KEY [--pred-level L] [--pred-thr 128] [--pred-skip V] [--profile T] [--stride 4]]\n"
                         "  L / M: a .tif / .png, or a zarr array dir (v3 2-D, v2 3-D at --label-z), local or https; '-' as out: profile only\n");
         return 2;
@@ -684,7 +770,10 @@ int cmd_ink_splat(int argc, char **argv) {
     if (pi >= 0) { if (pi + 2 >= argc) { fprintf(stderr, "ink-splat: --pred ROOT KEY\n"); return 2; } c.pred_root = argv[pi + 1]; c.pred_key = argv[pi + 2]; }
     c.pred_level = atoi(sopt(argc, argv, "--pred-level", "-1")); c.pred_thr = atoi(sopt(argc, argv, "--pred-thr", "128")); c.pred_skip = atoi(sopt(argc, argv, "--pred-skip", "-1"));
     c.profile = atoi(sopt(argc, argv, "--profile", "0")); c.stride = atoi(sopt(argc, argv, "--stride", "4"));
-    if (!c.surface || !c.labels) { fprintf(stderr, "ink-splat: need --surface and --labels\n"); return 2; }
     store_global_init();
+    if (sflag(argc, argv, "--pyramid-only")) return splat_pyramid_only(&c);
+    const char *pts = sopt(argc, argv, "--points", nullptr);
+    if (pts) return splat_points(&c, pts, atof(sopt(argc, argv, "--radius-um", "5")));
+    if (!c.surface || !c.labels) { fprintf(stderr, "ink-splat: need --surface and --labels (or --points / --pyramid-only)\n"); return 2; }
     return inksplat_run(&c);
 }

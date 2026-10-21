@@ -134,6 +134,24 @@ int main(void) {
         CHECK(n0 == 0, "merged no-ink voxels left: %ld", n0);
         z3_close(z);
     }
+    /* 3D point labels: an ink ball on papyrus, a no-ink ball on papyrus, an ink ball in void (unknown) */
+    {
+        double P[3]; surf_at(10, 10, P); double Q[3]; surf_at(20, 12, Q);
+        char js[512], pj[512], o4[512]; snprintf(pj, sizeof pj, "%s/pts.json", dir); snprintf(o4, sizeof o4, "%s/pts.zarr", dir);
+        snprintf(js, sizeof js, "{\"collections\": {\"1\": {\"name\": \"ink\", \"points\": {\"1\": {\"p\": [%g, %g, %g]}, \"2\": {\"p\": [200, 200, 20]}}},"
+                 " \"2\": {\"name\": \"noink\", \"points\": {\"1\": {\"p\": [%g, %g, %g]}}}}}", P[2], P[1], P[0], Q[2], Q[1], Q[0]);
+        FILE *f = fopen(pj, "w"); fputs(js, f); fclose(f);
+        char *av[] = {"ufsm", "ink-splat", o4, "--points", pj, "--radius-um", "2", "--ct", dir, "ct.zarr", "--ct-um", "1", "--iso", "100", "--coarse", "0"};
+        CHECK(cmd_ink_splat(16, av) == 0, "points");
+        store *s4 = store_open(o4); z3 *z = z3_open(s4, "1", nullptr); CHECK(z && !z3_read(z, z0, nn, ob, 4), "read points");
+        const int64_t a = (int64_t)floor(P[0] + 0.5), b = (int64_t)floor(Q[0] + 0.5);
+        CHECK(ob[(a * NV + (int64_t)floor(P[1] + 0.5)) * NV + (int64_t)floor(P[2] + 0.5)] == 254, "ink point");
+        CHECK(ob[(b * NV + (int64_t)floor(Q[1] + 0.5)) * NV + (int64_t)floor(Q[2] + 0.5)] == 0, "no-ink point");
+        CHECK(ob[(20 * NV + 200) * NV + 200] == 255, "void point unknown");
+        long k254 = 0; for (size_t k = 0; k < (size_t)NV * NV * NV; k++) k254 += ob[k] == 254;
+        CHECK(k254 >= 20 && k254 <= 40, "ink ball voxels %ld (radius 2: 33)", k254);
+        if (z) z3_close(z);
+    }
     snprintf(p, sizeof p, "%s/out.zarr/segments/seg.tifxyz.json", dir);
     CHECK(access(p, R_OK) == 0, "summary %s", p);
     snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) {}
