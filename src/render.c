@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <jpeglib.h>   /* after stdio.h: it needs FILE */
 
 static const char *ropt(int argc, char **argv, const char *name, const char *def) {
     for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
@@ -466,9 +467,29 @@ int cmd_tifxyz_sfc(int argc, char **argv) {
     fprintf(stderr, "tifxyz-sfc: %d wraps -> %s: %lld -> %lld bytes (%.1fx)\n", n, argv[3], before, after, after ? (double)before / after : 0);
     return rc;
 }
+
+/* a JPEG (gray or RGB) as RGB, nullptr on failure */
+static uint8_t *jpeg_read_rgb(const char *path, int *w, int *h) {
+    FILE *f = fopen(path, "rb"); if (!f) return nullptr;
+    struct jpeg_decompress_struct ci; struct jpeg_error_mgr je; ci.err = jpeg_std_error(&je);
+    jpeg_create_decompress(&ci); jpeg_stdio_src(&ci, f); jpeg_read_header(&ci, TRUE);
+    ci.out_color_space = JCS_RGB; jpeg_start_decompress(&ci);
+    *w = (int)ci.output_width; *h = (int)ci.output_height; uint8_t *o = malloc((size_t)*w * *h * 3);
+    while (o && ci.output_scanline < ci.output_height) { JSAMPROW row = o + (size_t)ci.output_scanline * *w * 3; jpeg_read_scanlines(&ci, &row, 1); }
+    jpeg_finish_decompress(&ci); jpeg_destroy_decompress(&ci); fclose(f);
+    return o;
+}
 int cmd_png2jpg(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm png2jpg <in.png> <out.jpg> [--half] [--quality 90]\n"); return 2; }
-    int w, h; uint8_t *rgb = png_read_rgb(argv[2], &w, &h); if (!rgb) { fprintf(stderr, "png2jpg: cannot read %s\n", argv[2]); return 1; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm png2jpg <in.png|in.jpg> <out.jpg|out.tif> [--half] [--quality 90] [--size W,H (tif: bilinear resize)] [--crop x,y,w,h (tif)]\n"); return 2; }
+    const size_t il = strlen(argv[2]); const int injpg = il > 4 && (!strcmp(argv[2] + il - 4, ".jpg") || !strcmp(argv[2] + il - 5, ".jpeg"));
+    int w, h; uint8_t *rgb = injpg ? jpeg_read_rgb(argv[2], &w, &h) : png_read_rgb(argv[2], &w, &h); if (!rgb) { fprintf(stderr, "png2jpg: cannot read %s\n", argv[2]); return 1; }
+    const char *sz = ropt(argc, argv, "--size", nullptr), *sl = ropt(argc, argv, "--size-like", nullptr); int nw = 0, nh = 0;   /* --size W,H / --size-like REF.tif: resampled (Pillow bilinear) to that size first */
+    if (sl) { uint8_t *r = img_read_u8(sl, &nw, &nh); if (!r) { fprintf(stderr, "png2jpg: cannot read %s\n", sl); free(rgb); return 1; } free(r); }
+    if ((sl && nw > 0) || (sz && sscanf(sz, "%d,%d", &nw, &nh) == 2 && nw > 0 && nh > 0)) {
+        uint8_t *o = malloc((size_t)nw * nh * 3);
+        if (!o || pil_resize(rgb, w, h, 3, o, nw, nh, PIL_BILINEAR, 8)) { free(o); free(rgb); return 1; }
+        free(rgb); rgb = o; w = nw; h = nh;
+    }
     const int q = atoi(ropt(argc, argv, "--quality", "90"));
     const size_t ol = strlen(argv[3]);
     if (ol > 4 && !strcmp(argv[3] + ol - 4, ".tif")) {   /* <out>.tif: the first channel as a uint8 TIFF (gray PNGs for ink-compare); --crop x,y,w,h */
@@ -559,6 +580,18 @@ int cmd_ink_compare(int argc, char **argv) {
     const size_t np = (size_t)W * H; uint8_t *mask = malloc(np);
     if (!mask) return 1;
     for (size_t i = 0; i < np; i++) mask[i] = ct[i] > 0;
+    const char *mp = ropt(argc, argv, "--mask", nullptr);
+    if (mp) {   /* --mask M.tif (the renders' size before --crop): statistics and panels only where M > 0 (inks zeroed elsewhere) */
+        int mw, mh; uint8_t *m = img_read_u8(mp, &mw, &mh);
+        if (!m) { fprintf(stderr, "ink-compare: cannot read %s\n", mp); return 1; }
+        int cx = 0, cy = 0, cw0, ch0; if (cr) sscanf(cr, "%d,%d,%d,%d", &cx, &cy, &cw0, &ch0);
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            const int sx = x + cx, sy = y + cy; const size_t i = (size_t)y * W + x;
+            if (sx < mw && sy < mh && m[(size_t)sy * mw + sx]) continue;
+            mask[i] = 0; for (int k = 1; k < n; k++) ((uint8_t *)img[k])[i] = 0;
+        }
+        free(m);
+    }
     const int rs = (int)lround(rsu / px), rl = (int)lround(rlu / px);
     for (int k = 1; k < n; k++) {
         ink_stats_t st;
