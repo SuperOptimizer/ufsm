@@ -115,8 +115,29 @@ pick() {
     [ -d $d/gated/$w ] || continue; mkdir -p $S/$SURF/$b; rm -rf $S/$SURF/$b/$w; cp -r $d/gated/$w $S/$SURF/$b/
     printf '%s/%s\t%s-%s\t%s\t%s\t%s\n' $b $w $kind $N $ka $op $ms >> $S/$SURF/list.tsv
   done
+  [ -s $d/best.tsv ] || pick_loose $b $kind
   touch $d/PICKED
 }
+# pick_loose BOX KIND (user 10-21: cm2 for every box): when the strict gate keeps no sheet, a looser one (no phase-confidence floor,
+# |e| < 0.5 turn, no coherence map, erode 1, stretches >= 0.05 cm2) -> boxes-N/<b>/gated-loose; its LOOSEW (2) wraps with the most kept
+# area (>= 0.2 cm2) join the list as kind "loose-..."
+pick_loose() {
+  local b=$1 kind=$2 d=$BX/$1 fd=$BX/$1/f
+  rm -rf $d/gated-loose; C $U self-gate $d/tifxyz $d/gated-loose --fields $fd --model $d/fit "${CT1[@]}" \
+    --min-conf 0 --max-e 0.5 --erode 1 --min-area 0.05 --per-wrap --threads $TH > $d/gate-loose.log 2>&1 || { echo "pick_loose: $b self-gate failed"; return 1; }
+  awk '$1 ~ /^w[0-9]+$/ && NF >= 5 && $5 >= 0.2 {print $5, $1, $4}' $d/gate-loose.log | sort -gr | head -n ${LOOSEW:-2} | while read -r ka w a; do
+    [ -d $d/gated-loose/$w ] || continue; op=$(awk -v w=$w '$1 == w && NF >= 8 {print $NF}' $d/stats.log)
+    mkdir -p $S/$SURF/$b; rm -rf $S/$SURF/$b/${w}l; cp -r $d/gated-loose/$w $S/$SURF/$b/${w}l
+    printf '%s/%sl\tloose-%s-%s\t%s\t%s\t%s\n' $b $w $kind $N $ka ${op:-na} $(awk -v a=$a -v k=$ka 'BEGIN { printf "%.3f", a > 0 ? 1 - k / a : 1 }') >> $S/$SURF/list.tsv
+  done
+  touch $d/LOOSE
+}
+# LOOSE=1: boxes picked before the loose fallback existed whose strict pick found nothing
+if [ "${LOOSE:-0}" = 1 ]; then
+  for d in $BX/*/PICKED; do [ -e "$d" ] || continue; d=$(dirname "$d"); b=$(basename "$d")
+    [ -s $d/best.tsv ] || [ -e $d/LOOSE ] || pick_loose $b $(cut -f4 $d/FITDONE | sed 's/[pm]$//')
+  done
+fi
 # boxes fitted before the gate (no PICKED): their ungated sheets leave the list, the gated ones join it (REPICK=1)
 if [ "${REPICK:-0}" = 1 ]; then
   for d in $BX/*/FITDONE; do [ -e "$d" ] || continue; d=$(dirname "$d"); b=$(basename "$d"); [ -e $d/PICKED ] && continue

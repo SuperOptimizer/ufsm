@@ -39,8 +39,9 @@ uint8_t *png_read_rgb(const char *path, int *w, int *h);
    meta.json copied with scale x div and voxel_size_um x div. Grids written deflate float32 TIFFs. 0 on success. */
 int tifxyz_scale(const char *src, const char *dst, double div, const double off[3]);
 /* the tifxyz src copied to dst with every vertex moved d (its own units) along the vertex normal +n = (d/d column) x (d/d row)
-   (central differences over valid neighbours; vertices without a normal stay); meta.json copied. 0 on success */
-int tifxyz_shift(const char *src, const char *dst, double d);
+   (central differences over valid neighbours; vertices without a normal stay); meta.json copied. toward = {y, x} (a vertical line, the
+   scroll axis): +n is first flipped when most vertex normals face away from it, so D > 0 moves the sheet INWARD. 0 on success */
+int tifxyz_shift(const char *src, const char *dst, double d, const double *toward);   /* toward (y, x) or nullptr: see above */
 /* the scaled coordinate of one vertex value v (z the vertex's z): numpy float32 v / div - off, or -1 for an invalid vertex */
 static inline float tifxyz_scaled(float v, float z, float divf, float offf) { return z < 0 ? -1.f : v / divf - offf; }
 

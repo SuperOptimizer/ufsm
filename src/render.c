@@ -386,12 +386,13 @@ int cmd_overlay_red(int argc, char **argv) {
     return rc;
 }
 
-/* ufsm tifxyz-scale <src-dir> <dst-dir> <div> [--offset z,y,x] [--wraps a,b,..] [--normal D]
+/* ufsm tifxyz-scale <src-dir> <dst-dir> <div> [--offset z,y,x] [--wraps a,b,..] [--normal D [--toward Y,X]]
    xform_wraps.py: the tifxyz <src-dir>/<w> (every subdirectory, or --wraps) copied to <dst-dir>/<w> with coordinates divided
    by div (float32) minus the offset; invalid vertices (z < 0) stay -1; meta scale x div, voxel_size_um x div. --normal D (div 1, no
-   offset): instead every vertex moved D voxels along its normal +n = (d/d column) x (d/d row) (tifxyz_shift; one face of a sheet). */
+   offset): instead every vertex moved D voxels along its normal +n = (d/d column) x (d/d row) (tifxyz_shift; one face of a sheet);
+   --toward Y,X (the scroll axis at the sheet, native voxels): +n oriented inward first (D > 0 = the inward face). */
 int cmd_tifxyz_scale(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm tifxyz-scale <src-dir> <dst-dir> <div> [--offset z,y,x] [--wraps a,b,..] [--normal D]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm tifxyz-scale <src-dir> <dst-dir> <div> [--offset z,y,x] [--wraps a,b,..] [--normal D [--toward Y,X]]\n"); return 2; }
     const double div = atof(argv[4]); double off[3] = {0, 0, 0};
     if (!(div > 0) || sscanf(ropt(argc, argv, "--offset", "0,0,0"), "%lf,%lf,%lf", off, off + 1, off + 2) != 3) { fprintf(stderr, "tifxyz-scale: bad div / --offset\n"); return 2; }
     const char *wl = ropt(argc, argv, "--wraps", nullptr); char *want = nullptr; if (wl) { want = malloc(strlen(wl) + 3); sprintf(want, ",%s,", wl); }
@@ -404,7 +405,8 @@ int cmd_tifxyz_scale(int argc, char **argv) {
         struct stat st; if (stat(m, &st)) continue;
         snprintf(d, sizeof d, "%s/%s", argv[3], de->d_name);
         const char *nd = ropt(argc, argv, "--normal", nullptr);
-        if (nd ? tifxyz_shift(s, d, atof(nd)) : tifxyz_scale(s, d, div, off)) { fprintf(stderr, "tifxyz-scale: %s failed\n", s); rc = 1; } else n++;
+        double tw[2]; const int htw = sscanf(ropt(argc, argv, "--toward", ""), "%lf,%lf", tw, tw + 1) == 2;
+        if (nd ? tifxyz_shift(s, d, atof(nd), htw ? tw : nullptr) : tifxyz_scale(s, d, div, off)) { fprintf(stderr, "tifxyz-scale: %s failed\n", s); rc = 1; } else n++;
     }
     closedir(dd); free(want);
     fprintf(stderr, "tifxyz-scale: %d tifxyz written to %s\n", n, argv[3]);
