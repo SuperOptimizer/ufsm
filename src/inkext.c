@@ -175,7 +175,7 @@ static inline float ct_tri(const ctlev *L, double z, double y, double x, const u
 /* ---- the surface-volume renderer ---- */
 typedef struct {
     const isurf *S; ctlev *L; double lscale;   /* level coordinate = level-0 voxel / lscale */
-    int D, center, reverse, ss; double du;     /* grid units per model pixel */
+    int D, reverse, ss; double center, du;  /* center = (D - 1) / 2: layer i at offset i - center (half-integer for even D, as the published renders) */     /* grid units per model pixel */
     double step_vox;                           /* layer / pixel step in level-0 voxels */
     int Wm, Hm;
 } irender;
@@ -276,6 +276,8 @@ static const char ell7[7][8] = {"0001000", "0111110", "1111111", "1111111", "111
 typedef struct {
     int kind; ie_net *net; const ie_spec *sp; int stride, batch, nth, reverse, blend_norm; size_t ct_mem; double px_um;
     ctlev lev[6]; int nlev; double lev_um[6];
+    uint8_t **stk; int stk_n, stk_w, stk_h;   /* --layers: a pre-rendered stack (ascending normal offsets) instead of the renderer */
+    uint8_t *dump; int dump_req, render_only;  /* --dump-layers: the rendered model-grid stack [D][Hm][Wm] (run_surface allocates) */
 } irun;
 
 /* the network side of run_surface in its own thread: batches handed over by the renderer (double buffered), forward,
@@ -328,13 +330,17 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     const ie_spec *sp = X->sp; const int D = sp->D, T = sp->T;
     /* CT level: the coarsest not coarser than the spacing (5% slack) */
     int L = 0; for (int l = 0; l < X->nlev; l++) if (X->lev_um[l] <= X->px_um * 1.05) L = l;
-    irender R = {0}; R.S = S; R.L = &X->lev[L]; R.lscale = X->lev_um[L] / X->lev_um[0]; R.D = D; R.center = sp->center; R.reverse = X->reverse;
+    irender R = {0}; R.S = S; R.L = &X->lev[L]; R.lscale = X->lev_um[L] / X->lev_um[0]; R.D = D; R.center = (D - 1) * 0.5; R.reverse = X->reverse;
     R.ss = (int)lround(X->px_um / X->lev_um[L]); if (R.ss < 1) R.ss = 1;
     R.du = X->px_um / (S->vox_um / S->scale); R.step_vox = X->px_um / X->lev_um[0];
     R.Wm = (int)((S->w - 1) / R.du) + 1; R.Hm = (int)((S->h - 1) / R.du) + 1;
+    if (X->stk) { R.Wm = X->stk_w; R.Hm = X->stk_h; }   /* --layers: the stack's own pixel grid */
+    const int stk0 = X->stk ? X->stk_n / 2 - D / 2 : 0;   /* the D central layers (koine / hecate rule) */
+    if (X->stk && (stk0 < 0 || stk0 + D > X->stk_n)) { fprintf(stderr, "ink-ext: --layers has %d layers, %s needs %d\n", X->stk_n, sp->name, D); return nullptr; }
     const int Wm = R.Wm, Hm = R.Hm; *pWm = Wm; *pHm = Hm; *pdu = R.du;
     fprintf(stderr, "ink-ext: %s %s: %d x %d px at %.3f um, %d layers, CT level %d (%.3f um, %d^3 sub-samples)%s\n", S->name, sp->name, Wm, Hm, X->px_um, D, L, X->lev_um[L], R.ss, X->reverse ? ", reversed" : "");
     float *num = calloc((size_t)Wm * Hm, sizeof *num), *den = calloc((size_t)Wm * Hm, sizeof *den);
+    free(X->dump); X->dump = X->dump_req ? calloc((size_t)D * Wm * Hm, 1) : nullptr;
     float *ctl = pctl ? calloc((size_t)Wm * Hm, sizeof *ctl) : nullptr; if (pctl) *pctl = ctl;   /* the surface layer (CT / 255) */
     uint8_t *cov = X->kind == IE_V8IN ? calloc((size_t)Wm * Hm, 1) : nullptr;   /* v8in: max over depth > 0 */
     float *win = malloc((size_t)T * T * sizeof *win);
@@ -366,7 +372,11 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
             if (need1 - rb0 > RB) rb0 = need1 - RB;
             if (rb1 < rb0) rb1 = rb0;
             const double t0 = inow(); uint8_t *rp[RB]; for (int r = rb1; r < need1; r++) rp[r - rb1] = ROW(r);
-            if (render_rows(&R, rb1, need1, rp, X->nth)) fail = 1;
+            if (X->stk) {   /* model layer i = stack layer stk0 + i (reversed: stk0 + D - 1 - i), as the official readers select */
+                for (int r = rb1; r < need1; r++) for (int i = 0; i < D; i++)
+                    memcpy(ROW(r) + (size_t)i * Wm, X->stk[stk0 + (X->reverse ? D - 1 - i : i)] + (size_t)r * Wm, (size_t)Wm);
+            } else if (render_rows(&R, rb1, need1, rp, X->nth)) fail = 1;
+            if (X->dump) for (int r = rb1; r < need1; r++) for (int i = 0; i < D; i++) memcpy(X->dump + ((size_t)i * Hm + r) * Wm, ROW(r) + (size_t)i * Wm, (size_t)Wm);
             if (ctl) for (int r = rb1; r < need1; r++) for (int x = 0; x < Wm; x++) ctl[(size_t)r * Wm + x] = ROW(r)[(size_t)sp->center * Wm + x] / 255.f;
             if (cov) for (int r = rb1; r < need1; r++) for (int x = 0; x < Wm; x++) {
                 uint8_t m = 0; for (int i = 0; i < D; i++) m |= ROW(r)[(size_t)i * Wm + x];
@@ -396,6 +406,7 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
         for (int ix = 0; ix <= nx && !fail; ix++) {
             if (ix < nx) {
                 const int x0 = xs[ix];
+                if (X->render_only) continue;
                 if (X->kind == IE_V8IN) {   /* the tile must lie fully inside the closed coverage */
                     int in = 1; for (int y = y0; y < y0 + T && in; y++) for (int x = x0; x < x0 + T; x++) if (!closed[(size_t)y * Wm + x]) { in = 0; break; }
                     if (!in) continue;
@@ -493,8 +504,30 @@ int cmd_ink_ext(int argc, char **argv) {
     if (iopt(argc, argv, "--raw-in", nullptr)) return raw_mode(argc, argv, net, kind);
     int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) ci = i;
     const char *outdir = iopt(argc, argv, "--out", nullptr), *cache = iopt(argc, argv, "--cache", nullptr), *suffix = iopt(argc, argv, "--suffix", "");
-    if (ci < 0 || !outdir) { fprintf(stderr, "ink-ext: need --ct ROOT KEY and --out DIR\n"); return 2; }
-    irun X = {0}; X.kind = kind; X.net = net; X.sp = &ie_specs[kind]; X.stride = atoi(iopt(argc, argv, "--stride", "0")); X.reverse = iflag(argc, argv, "--reverse");
+    const char *ldir = iopt(argc, argv, "--layers", nullptr);   /* a published surface volume (NN.tif, ascending normal offsets) instead of our render */
+    if ((ci < 0 && !ldir) || !outdir) { fprintf(stderr, "ink-ext: need --ct ROOT KEY (or --layers DIR) and --out DIR\n"); return 2; }
+    irun X = {0};
+    if (ldir) {
+        for (;; X.stk_n++) {
+            char lp[1200]; snprintf(lp, sizeof lp, "%s/%02d.tif", ldir, X.stk_n); int w, h; uint8_t *im = img_read_u8(lp, &w, &h);
+            if (!im) break;
+            if (X.stk_n && (w != X.stk_w || h != X.stk_h)) { fprintf(stderr, "ink-ext: %s: size differs\n", lp); return 1; }
+            X.stk = realloc(X.stk, (size_t)(X.stk_n + 1) * sizeof *X.stk); X.stk[X.stk_n] = im; X.stk_w = w; X.stk_h = h;
+        }
+        if (!X.stk_n) { fprintf(stderr, "ink-ext: no %s/00.tif\n", ldir); return 1; }
+        const char *pc = iopt(argc, argv, "--px-crop", nullptr); int c[4];   /* x,y,w,h of the layer images */
+        if (pc) {
+            if (sscanf(pc, "%d,%d,%d,%d", c, c + 1, c + 2, c + 3) != 4 || c[0] < 0 || c[1] < 0 || c[0] + c[2] > X.stk_w || c[1] + c[3] > X.stk_h) { fprintf(stderr, "ink-ext: bad --px-crop\n"); return 2; }
+            for (int i = 0; i < X.stk_n; i++) {
+                uint8_t *o = malloc((size_t)c[2] * c[3]);
+                for (int y = 0; y < c[3]; y++) memcpy(o + (size_t)y * c[2], X.stk[i] + (size_t)(c[1] + y) * X.stk_w + c[0], (size_t)c[2]);
+                free(X.stk[i]); X.stk[i] = o;
+            }
+            X.stk_w = c[2]; X.stk_h = c[3];
+        }
+        fprintf(stderr, "ink-ext: --layers %s: %d layers of %d x %d\n", ldir, X.stk_n, X.stk_w, X.stk_h);
+    }
+    X.dump_req = iopt(argc, argv, "--dump-layers", nullptr) != nullptr; X.render_only = iflag(argc, argv, "--render-only"); X.kind = kind; X.net = net; X.sp = &ie_specs[kind]; X.stride = atoi(iopt(argc, argv, "--stride", "0")); X.reverse = iflag(argc, argv, "--reverse");
     X.blend_norm = !strcmp(iopt(argc, argv, "--blend", "official"), "norm");   /* v8in: sum(p g) / sum(g) instead of inference.py sum(p g) / count (its stride grid) */
     X.nth = atoi(iopt(argc, argv, "--threads", "16")); X.px_um = atof(iopt(argc, argv, "--px-um", "0")); if (!(X.px_um > 0)) X.px_um = X.sp->px_um;
     X.ct_mem = (size_t)(atof(iopt(argc, argv, "--ct-mem", "3")) * (1 << 30));
@@ -506,6 +539,7 @@ int cmd_ink_ext(int argc, char **argv) {
         X.batch = (int)(fr / 2 / ie_tile_bytes_gpu(kind)); if (X.batch < 1) X.batch = 1; if (X.batch > 32) X.batch = 32;
     }
     const double ct_um = atof(iopt(argc, argv, "--ct-um", "2.399"));
+    if (ci < 0) { X.nlev = 1; X.lev_um[0] = ct_um; goto surfaces; }   /* --layers without CT */
     store *st = store_open(argv[ci + 1]); if (!st) { fprintf(stderr, "ink-ext: cannot open %s\n", argv[ci + 1]); return 1; }
     /* --ct-local ROOT --local-levels 1,2: those levels read from a complete local copy (missing chunks there would read as 0) */
     const char *lroot = iopt(argc, argv, "--ct-local", nullptr), *llev = iopt(argc, argv, "--local-levels", "");
@@ -523,8 +557,9 @@ int cmd_ink_ext(int argc, char **argv) {
         X.lev_um[l] = ct_um * (1 << l);   /* OME scales are relative (1, 2, 4 ..): the level-0 voxel size is --ct-um */
     }
     if (!X.nlev) { fprintf(stderr, "ink-ext: no CT levels under %s %s: %s\n", argv[ci + 1], argv[ci + 2], z3_error()); return 1; }
-    char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", outdir); if (system(p)) return 1;
     fprintf(stderr, "ink-ext: batch %d, CT %s %s (%d levels, %.3f um), stride %d\n", X.batch, argv[ci + 1], argv[ci + 2], X.nlev, X.lev_um[0], X.stride > 0 ? X.stride : X.sp->stride);
+surfaces:;
+    char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", outdir); if (system(p)) return 1;
     int rc = 0, ns = 0;
     for (int a = 2; a + 1 < argc; a++) {
         if (strcmp(argv[a], "--surface")) continue;
@@ -548,7 +583,15 @@ int cmd_ink_ext(int argc, char **argv) {
             snprintf(p, sizeof p, "%s/%s_%s%s_native.tif", outdir, nm, mname, suffix); if (tiffw_write(p, Wm, Hm, 1, g, 1)) rc = 1;
             free(g);
         }
-        int ow, oh; uint8_t *g = to_ref_grid(&S, pm, Wm, Hm, du, &ow, &oh);
+        if (X.dump) {   /* --dump-layers DIR: the model's input stack (model layer order) as DIR/NN.tif */
+            const char *dd = iopt(argc, argv, "--dump-layers", "."); snprintf(p, sizeof p, "mkdir -p '%s'", dd); if (system(p)) rc = 1;
+            for (int i = 0; i < X.sp->D; i++) { snprintf(p, sizeof p, "%s/%02d.tif", dd, i); if (tiffw_write(p, Wm, Hm, 1, X.dump + (size_t)i * Wm * Hm, 1)) rc = 1; }
+            free(X.dump); X.dump = nullptr;
+        }
+        int ow, oh; uint8_t *g;
+        if (X.stk) {   /* --layers: the stack's pixel grid is the output grid */
+            ow = Wm; oh = Hm; g = malloc((size_t)Wm * Hm); for (size_t i = 0; i < (size_t)Wm * Hm; i++) g[i] = (uint8_t)lroundf(pm[i] * 255);
+        } else g = to_ref_grid(&S, pm, Wm, Hm, du, &ow, &oh);
         snprintf(p, sizeof p, "%s/%s_%s%s.tif", outdir, nm, mname, suffix);
         if (!g || tiffw_write(p, ow, oh, 1, g, 1)) { fprintf(stderr, "ink-ext: cannot write %s\n", p); rc = 1; }
         snprintf(p, sizeof p, "%s/%s_%s%s.jpg", outdir, nm, mname, suffix);

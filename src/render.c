@@ -417,6 +417,15 @@ int cmd_png2jpg(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm png2jpg <in.png> <out.jpg> [--half] [--quality 90]\n"); return 2; }
     int w, h; uint8_t *rgb = png_read_rgb(argv[2], &w, &h); if (!rgb) { fprintf(stderr, "png2jpg: cannot read %s\n", argv[2]); return 1; }
     const int q = atoi(ropt(argc, argv, "--quality", "90"));
+    const size_t ol = strlen(argv[3]);
+    if (ol > 4 && !strcmp(argv[3] + ol - 4, ".tif")) {   /* <out>.tif: the first channel as a uint8 TIFF (gray PNGs for ink-compare); --crop x,y,w,h */
+        int c[4] = {0, 0, w, h}; const char *cr = ropt(argc, argv, "--crop", nullptr);
+        if (cr && (sscanf(cr, "%d,%d,%d,%d", c, c + 1, c + 2, c + 3) != 4 || c[0] < 0 || c[1] < 0 || c[0] + c[2] > w || c[1] + c[3] > h)) { free(rgb); return 2; }
+        uint8_t *g = malloc((size_t)c[2] * c[3]);
+        for (int y = 0; y < c[3]; y++) for (int x = 0; x < c[2]; x++) g[(size_t)y * c[2] + x] = rgb[(((size_t)(c[1] + y)) * w + c[0] + x) * 3];
+        const int rc = tiffw_write(argv[3], c[2], c[3], 1, g, 1); free(g); free(rgb);
+        return rc ? 1 : 0;
+    }
     if (rflag(argc, argv, "--half")) {
         const int ow = w / 2, oh = h / 2; uint8_t *o = ow > 0 && oh > 0 ? malloc((size_t)ow * oh * 3) : nullptr;
         if (!o || pil_resize(rgb, w, h, 3, o, ow, oh, PIL_BOX, 8)) { free(o); free(rgb); return 1; }
