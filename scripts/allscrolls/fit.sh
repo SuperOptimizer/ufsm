@@ -131,7 +131,17 @@ if [ "${REPICK:-0}" = 1 ]; then
 fi
 
 # ---- 3 box fits, best boxes first
-ls_boxes() { if [ $# -gt 0 ]; then printf '%s\n' "$@"; else head -n ${MAXBOX:-2} $BX.tsv | cut -f1; fi; }
+# the box order (user 10-20, "likely text"): priority boxes first (A/<S>/priority-N.txt, one box name per line: e.g. the boxes over a
+# published segment with known letters), then the boxes ranked for text: material, the middle / outer wraps (radius share near 0.65),
+# round robin over the z rows (each row's best box, the rows from the middle outward, then each row's second ...) so a pass of
+# MAXBOX boxes spreads over the whole height. PRIO_ONLY=1: the priority boxes only.
+ranked() { awk -F'\t' -v OFS='\t' -v zm=$((SZ / 2)) -v n=$N '{ d = $6 - 0.65; sc = $5 / 100 - 2 * (d < 0 ? -d : d); dz = $2 + n / 2 - zm; print $2, sc, (dz < 0 ? -dz : dz), $1 }' $BX.tsv |
+  sort -t$'\t' -k1,1n -k2,2gr | awk -F'\t' -v OFS='\t' '{ r = ($1 == z) ? r + 1 : 1; z = $1; print r, $3, $4 }' | sort -t$'\t' -k1,1n -k2,2n | cut -f3; }
+ls_boxes() {
+  if [ $# -gt 0 ]; then printf '%s\n' "$@"; return; fi
+  [ -s $S/priority-$N.txt ] && cat $S/priority-$N.txt
+  [ "${PRIO_ONLY:-0}" = 1 ] || ranked | head -n ${MAXBOX:-2}
+}
 for b in $(ls_boxes "$@"); do
   d=$BX/$b; [ -e $d/FITDONE ] || [ -e $d/FITDONE.failed ] && continue; claim $b || continue
   read -r z y x pct rn <<< "$(awk -v b=$b '$1 == b {print $2, $3, $4, $5, $6}' $BX.tsv)"
@@ -200,4 +210,4 @@ if [ "${GTCHECK:-0}" = 1 ] && [ $HOST = desk ]; then
     grep -A100 'wrapdist:' $S/gtcheck.log > $S/gtcheck.txt; rm -rf $S/gtras
   fi
 fi
-mark $s fit-$HOST-$N-${MAXBOX:-2} "$(cat $S/$SURF/list.tsv 2> /dev/null | wc -l) surfaces"
+if [ "${PRIO_ONLY:-0}" = 1 ]; then mark $s prio-$HOST-$N "$(cat $S/priority-$N.txt | wc -l) priority boxes"; else mark $s fit-$HOST-$N-${MAXBOX:-2} "$(cat $S/$SURF/list.tsv 2> /dev/null | wc -l) surfaces"; fi

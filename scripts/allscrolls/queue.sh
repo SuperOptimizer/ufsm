@@ -6,6 +6,7 @@
 #                scroll before widening); scrolls whose ink is done first. Run 2 lanes (they share a scroll's boxes by claims).
 #                CPU fits (FITCPU=1) until desk-ink is done (A/ink.alldone), then a GPU (FITGPU, else the emptier one); LANE_CPU=1
 #                lanes stay on the CPU. After the ink: one lane per GPU (FITGPU=0 / 1) + LANE_CPU=1 lanes (TH 8), RAM ~1 GB per fit.
+#                A/<S>/priority-1024.txt boxes (e.g. over a published segment with letters) go first, in every lane, any pass.
 #   desk-ink     ink.sh per scroll once no other process holds a GPU (scrolls with surfaces first), both GPUs
 #   desk-render  render.sh for every scroll with ink and new surfaces (incremental), every minute
 #   laptop       local 1 cm box fits (fit.sh, N 512, 6 GB cap) from the END of the scroll order (passes "2 6"), surfaces pushed to the desk
@@ -37,8 +38,14 @@ desk-fit)
     while ! stop; do
       left=0; did=0
       for s in $( { for s in $(order); do done_ $s ink && echo $s; done; for s in $(order); do done_ $s ink || echo $s; done; } ); do
-        stop && break; done_ $s fit-desk-1024-$mb && continue; [ $(nfail $s fit-$mb) -ge 3 ] && continue; left=1
-        mkdir -p $A/$s; [ -e $A/ink.alldone ] && [ "${LANE_CPU:-0}" != 1 ] && unset FITCPU || export FITCPU=1   # GPUs: the ink lane's until it is done; LANE_CPU=1 lanes stay on the CPU
+        stop && break
+        [ -e $A/ink.alldone ] && [ "${LANE_CPU:-0}" != 1 ] && unset FITCPU || export FITCPU=1   # GPUs: the ink lane's until it is done; LANE_CPU=1 lanes stay on the CPU
+        for p in $A/*/priority-1024.txt; do   # priority boxes (A/<S>/priority-1024.txt) before anything else, whatever the pass
+          [ -e "$p" ] || continue; ps=$(basename $(dirname $p)); [ $A/$ps/state/prio-desk-1024.done -nt $p ] && continue
+          PRIO_ONLY=1 $D/fit.sh $ps >> $A/$ps/fit-lane$$.log 2>&1 && log "$ps priority boxes done"
+        done
+        done_ $s fit-desk-1024-$mb && continue; [ $(nfail $s fit-$mb) -ge 3 ] && continue; left=1
+        mkdir -p $A/$s
         REPICK=1 MAXBOX=$mb $D/fit.sh $s >> $A/$s/fit-lane$$.log 2>&1; rc=$?
         case $rc in 0) log "$s fit pass $mb done ($(cat $A/$s/state/fit-desk-1024-$mb.done))"; did=1;; 4) ;; *) fail $s fit-$mb "rc $rc"; did=1;; esac
       done
