@@ -90,3 +90,5 @@ void img_stretch(uint8_t *im, const uint8_t *mask, size_t n, double plo, double 
 /* the win x win window (clipped to the image, stride win / 4) with the largest masked sum of im among those at least half inside
    the mask: its corner in *x0 / *y0; -1 when there is none */
 int img_best_window(const uint8_t *im, const uint8_t *mask, int w, int h, int win, int *x0, int *y0);
+/* the rectangle x, y, cw, ch (may reach outside the image: 0 there) of a w x h image as a new cw x ch image (render --crop) */
+uint8_t *img_crop_u8(const uint8_t *im, int w, int h, int x, int y, int cw, int ch);

@@ -20,6 +20,7 @@
 #include "papyrus.h"
 #include <zlib.h>
 #include "tiff.h"
+#include "imgops.h"
 #include <dirent.h>
 #include <errno.h>
 #include <sys/resource.h>
@@ -2993,8 +2994,11 @@ static int cmd_blend(int argc, char **argv) {
     return 0;
 }
 static int cmd_render(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h]\n"
+                                     "  --crop: only that rectangle of each wrap's output pixels is rendered and written (e.g. a labelled region)\n"); return 2; }
     const int vi = arg_index(argc, argv, "--volume"), ci = arg_index(argc, argv, "--ct");
+    int crop[4] = {0, 0, 0, 0}; const char *crs = opt(argc, argv, "--crop", nullptr);
+    if (crs && (sscanf(crs, "%d,%d,%d,%d", &crop[0], &crop[1], &crop[2], &crop[3]) != 4 || crop[0] < 0 || crop[1] < 0 || crop[2] < 1 || crop[3] < 1)) { fprintf(stderr, "render: --crop x,y,w,h\n"); return 2; }
     if (vi < 0 || vi + 2 >= argc) { fprintf(stderr, "render: --volume ROOT KEY\n"); return 2; }
     const double scale = atof(opt(argc, argv, "--scale", "1")); const int depth = atoi(opt(argc, argv, "--depth", "8"));
     const int tile = atoi(opt(argc, argv, "--tile", "512")), nthreads = atoi(opt(argc, argv, "--threads", "16"));
@@ -3046,6 +3050,7 @@ static int cmd_render(int argc, char **argv) {
         /* output tiles: each reads only the volume around its own vertices (+- depth), so a wrap of any size renders in bounded memory */
         for (int ty = 0; ty < oh; ty += tile) for (int tx = 0; tx < ow; tx += tile) {
             const int py1 = ty + tile < oh ? ty + tile : oh, px1 = tx + tile < ow ? tx + tile : ow;
+            if (crs && (px1 <= crop[0] || tx >= crop[0] + crop[2] || py1 <= crop[1] || ty >= crop[1] + crop[3])) continue;   /* outside --crop */
             const int r0 = (int)(ty / gs), r1 = (int)fmin(h - 1, ceil(py1 / gs) + 1), c0 = (int)(tx / gs), c1 = (int)fmin(w - 1, ceil(px1 / gs) + 1);
             double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
             for (int r = r0; r <= r1; r++) for (int c = c0; c <= c1; c++) {
@@ -3072,9 +3077,15 @@ static int cmd_render(int argc, char **argv) {
             for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
             free(vol); free(ct);
         }
+        int fw = ow, fh = oh;
+        if (crs) {   /* --crop: the rectangle only (0 where it reaches outside the render) */
+            uint8_t *ci2 = img_crop_u8(img, ow, oh, crop[0], crop[1], crop[2], crop[3]), *cc2 = cimg ? img_crop_u8(cimg, ow, oh, crop[0], crop[1], crop[2], crop[3]) : nullptr;
+            if (!ci2 || (cimg && !cc2)) { fprintf(stderr, "render: out of memory\n"); return 1; }
+            free(img); free(cimg); img = ci2; cimg = cc2; fw = crop[2]; fh = crop[3];
+        }
         snprintf(p, sizeof p, "%s/%s.tif", argv[3], de->d_name);
-        if (tiffw_write(p, ow, oh, 1, img, 1)) { fprintf(stderr, "render: cannot write %s\n", p); return 1; }
-        if (cimg) { snprintf(p, sizeof p, "%s/%s_ct.tif", argv[3], de->d_name); if (tiffw_write(p, ow, oh, 1, cimg, 1)) return 1; }
+        if (tiffw_write(p, fw, fh, 1, img, 1)) { fprintf(stderr, "render: cannot write %s\n", p); return 1; }
+        if (cimg) { snprintf(p, sizeof p, "%s/%s_ct.tif", argv[3], de->d_name); if (tiffw_write(p, fw, fh, 1, cimg, 1)) return 1; }
         free(X); free(Y); free(Z); free(img); free(cimg); nw++;
     }
     closedir(dd); free(rvol); free(rct);
@@ -3180,6 +3191,19 @@ static int cmd_sample(int argc, char **argv) {
             }
             fprintf(stderr, "%s: src %s level %d corner %lld,%lld,%lld w=[%d,%d]\n", fn, S->src[b->src[i]].name, b->level[i],
                     (long long)b->corner[i][0], (long long)b->corner[i][1], (long long)b->corner[i][2], b->w[i * NCH], b->w[i * NCH + 1]);
+            if (dump) {   /* label check: the montage as JPEG, and the input CT (z-scored) under the recto / ink target's classes over the
+                             whole window: a misplaced or rescaled label set puts its positives on void (CT near the window's low end) */
+                uint8_t *rgb = malloc((size_t)cols * P * P * 3);
+                if (rgb) { for (size_t k = 0; k < (size_t)cols * P * P; k++) rgb[3 * k] = rgb[3 * k + 1] = rgb[3 * k + 2] = img[k];
+                           char jn[1200]; snprintf(jn, sizeof jn, "%s/patch_%02d_%d.jpg", out, bi, i);
+                           if (jpeg_write_rgb(jn, cols * P, P, rgb, 90)) fprintf(stderr, "sample: cannot write %s\n", jn);
+                           free(rgb); }
+                const float *x0 = b->x + (size_t)i * 4 * p3; const uint8_t *t0 = b->t + (size_t)i * NCH * p3, *m0 = b->m + (size_t)i * p3;
+                double s[3] = {0, 0, 0}, all = 0; size_t c[3] = {0, 0, 0};   /* (t = p * 255; m = 0: ignored) */
+                for (size_t k = 0; k < p3; k++) { const int cl = !m0[k] ? 2 : t0[k] >= 128 ? 0 : 1; s[cl] += x0[k]; c[cl]++; all += x0[k]; }
+                fprintf(stderr, "  label check: ink %zu (CT z %.2f), no-ink %zu (CT z %.2f), unknown %zu (CT z %.2f), window CT z %.2f\n",
+                        c[0], c[0] ? s[0] / c[0] : 0., c[1], c[1] ? s[1] / c[1] : 0., c[2], c[2] ? s[2] / c[2] : 0., all / p3);
+            }
         }
         sampler_release(sp, b);
     }

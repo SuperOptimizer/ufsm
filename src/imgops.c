@@ -603,3 +603,11 @@ uint8_t *ink_panels(const uint8_t *const *img, const int *is_ct, int nimg, int w
     free(full);
     return half;
 }
+/* the rectangle x, y, cw, ch of a w x h image as a new cw x ch image; pixels outside the source are 0; nullptr on bad sizes */
+uint8_t *img_crop_u8(const uint8_t *im, int w, int h, int x, int y, int cw, int ch) {
+    if (!im || w < 1 || h < 1 || cw < 1 || ch < 1) return nullptr;
+    uint8_t *o = calloc((size_t)cw * ch, 1); if (!o) return nullptr;
+    const int x0 = x < 0 ? 0 : x, x1 = x + cw < w ? x + cw : w;
+    if (x1 > x0) for (int r = 0; r < ch; r++) { const int sy = y + r; if (sy < 0 || sy >= h) continue; memcpy(o + (size_t)r * cw + (x0 - x), im + (size_t)sy * w + x0, (size_t)(x1 - x0)); }
+    return o;
+}

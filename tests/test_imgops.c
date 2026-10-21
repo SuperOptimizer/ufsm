@@ -138,6 +138,14 @@ static void test_ink_compare(void) {   /* ink_stats / ink_corr / ink_panels_half
     CHECK(!img_best_window(dim, mk, W, H, 8, &bx, &by) && bx == 40 && by == 20, "best window at %d,%d", bx, by);
     for (int i = 0; i < W * H; i++) mk[i] = 0;
     CHECK(img_best_window(dim, mk, W, H, 8, &bx, &by) == -1, "best window without mask");
+    /* img_crop_u8 (render --crop): inside, and reaching past the right / bottom edge (0 there) */
+    uint8_t *cr = img_crop_u8(dim, W, H, 38, 18, 4, 4);
+    CHECK(cr && cr[0] == 10 && cr[2] == 10 && cr[2 * 4 + 1] == 10 && cr[2 * 4 + 2] == 250 && cr[3 * 4 + 3] == 250 && cr[1 * 4 + 3] == 10, "crop inside");
+    free(cr);
+    cr = img_crop_u8(dim, W, H, W - 2, H - 1, 3, 2);
+    CHECK(cr && cr[0] == 10 && cr[1] == 10 && cr[2] == 0 && cr[3] == 0 && cr[5] == 0, "crop past the edge");
+    free(cr);
+    CHECK(img_crop_u8(dim, W, H, 0, 0, 0, 4) == nullptr, "crop of width 0");
 }
 int main(void) {
     test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_tifxyz_scale(); test_tifxyz_shift(); test_ink_compare();
