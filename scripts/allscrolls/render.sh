@@ -40,7 +40,7 @@ for L in surf surf-l; do
     read -r mn _ <<< "$(st1 "$st" 'neg face')"; read -r mp _ <<< "$(st1 "$st" 'pos face')"; read -r mc _ <<< "$(st1 "$st" centre)"
     rich=neg; awk -v a=${mp:-0} -v b=${mn:-0} 'BEGIN { exit !(a > b) }' && rich=pos
     read -r _ f50 p95 band <<< "$(st1 "$st" "$rich face")"
-    $U ink-compare $O/${nn}_crop.jpg --ct $g/k/ct/$n.tif --ink "$rich face=$g/r${rich:0:1}/$n.tif" --ink "centre=$g/k/ink1/$n.tif" --px-um $um --fixed 0,$FIXHI --stretch-ct --full --best-crop 1024 > /dev/null 2>> $g/cmp.log
+    $U ink-compare $O/${nn}_crop.jpg --ct $g/k/ct/$n.tif --ink "$rich face=$g/r$([ $rich = neg ] && echo m || echo p)/$n.tif" --ink "centre=$g/k/ink1/$n.tif" --px-um $um --fixed 0,$FIXHI --stretch-ct --full --best-crop 1024 > /dev/null 2>> $g/cmp.log
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' $L/$sf $kind $area ${onp:-na} ${mn:-na} ${mp:-na} ${mc:-na} $rich ${f50:-na} ${p95:-na} ${band:-na} $nn.jpg >> $O/index.tsv
     [ -n "${RDIR:-}" ] && { rm -rf $g; continue; }
     rm -rf $S/sheets/$nn; mv $g/snap/$n $S/sheets/$nn
