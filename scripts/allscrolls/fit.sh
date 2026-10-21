@@ -128,7 +128,7 @@ pick_loose() {
   awk '$1 ~ /^w[0-9]+$/ && NF >= 5 && $5 >= 0.2 {print $5, $1, $4}' $d/gate-loose.log | sort -gr | head -n ${LOOSEW:-2} | while read -r ka w a; do
     [ -d $d/gated-loose/$w ] || continue; op=$(awk -v w=$w '$1 == w && NF >= 8 {print $NF}' $d/stats.log)
     mkdir -p $S/$SURF/$b; rm -rf $S/$SURF/$b/${w}l; cp -r $d/gated-loose/$w $S/$SURF/$b/${w}l
-    printf '%s/%sl\tloose-%s-%s\t%s\t%s\t%s\n' $b $w $kind $N $ka ${op:-na} $(awk -v a=$a -v k=$ka 'BEGIN { printf "%.3f", a > 0 ? 1 - k / a : 1 }') >> $S/$SURF/list.tsv
+    printf '%s/%sl\tloose-%s-%s\t%s\t%s\t%s\n' $b $w $kind $N $ka ${op:-na} $(awk -v a=$a -v k=$ka 'BEGIN { printf "%.3f", (a > 0 ? 1 - k / a : 1) }') >> $S/$SURF/list.tsv
   done
   touch $d/LOOSE
 }
