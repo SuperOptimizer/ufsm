@@ -60,6 +60,7 @@ int cmd_ink_ensemble(int argc, char **argv);
 int cmd_wl_dump(int argc, char **argv);
 int cmd_tifxyz_map(int argc, char **argv);
 int cmd_tifxyz_orient(int argc, char **argv);
+int cmd_tifxyz_bbox(int argc, char **argv);
 int cmd_png2jpg(int argc, char **argv);
 int cmd_tifxyz_sfc(int argc, char **argv);
 int cmd_phase_score(int argc, char **argv);
@@ -3266,6 +3267,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);
     if (!strcmp(cmd, "tifxyz-map")) return cmd_tifxyz_map(argc, argv);
     if (!strcmp(cmd, "tifxyz-orient")) return cmd_tifxyz_orient(argc, argv);
+    if (!strcmp(cmd, "tifxyz-bbox")) return cmd_tifxyz_bbox(argc, argv);
     if (!strcmp(cmd, "png2jpg")) return cmd_png2jpg(argc, argv);
     if (!strcmp(cmd, "tifxyz-sfc")) return cmd_tifxyz_sfc(argc, argv);
     if (!strcmp(cmd, "phase-score")) return cmd_phase_score(argc, argv);

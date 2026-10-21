@@ -783,6 +783,27 @@ int cmd_tifxyz_orient(int argc, char **argv) {
     return 0;
 }
 
+/* ufsm tifxyz-bbox <tifxyz> <image.tif> [--thresh 0] [--margin 0]: the 3D bounding box (native voxels, "z0 z1 y0 y1 x0 x1") of the
+   surface points whose render-grid pixel (x, y) = grid (x scale, y scale) has image > thresh, grown by --margin voxels */
+int cmd_tifxyz_bbox(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm tifxyz-bbox <tifxyz> <image.tif> [--thresh 0] [--margin 0]\n"); return 2; }
+    isurf S; if (isurf_load(&S, argv[2])) { fprintf(stderr, "tifxyz-bbox: cannot read %s\n", argv[2]); return 1; }
+    int iw, ih; uint8_t *img = img_read_u8(argv[3], &iw, &ih); if (!img) { fprintf(stderr, "tifxyz-bbox: cannot read %s\n", argv[3]); return 1; }
+    const int th = atoi(iopt(argc, argv, "--thresh", "0")); const double mg = atof(iopt(argc, argv, "--margin", "0"));
+    double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300}; long n = 0;
+    for (int y = 0; y < ih; y++) for (int x = 0; x < iw; x++) {
+        if (img[(size_t)y * iw + x] <= th) continue;
+        double P[3], N[3], a[3], b[3]; if (surf_pn(&S, x * S.scale, y * S.scale, P, N, a, b)) continue;
+        for (int d = 0; d < 3; d++) { if (P[d] < lo[d]) lo[d] = P[d]; if (P[d] > hi[d]) hi[d] = P[d]; }
+        n++;
+    }
+    if (!n) { fprintf(stderr, "tifxyz-bbox: no pixel above %d\n", th); return 1; }
+    printf("%.0f %.0f %.0f %.0f %.0f %.0f\n", floor(lo[0] - mg), ceil(hi[0] + mg), floor(lo[1] - mg), ceil(hi[1] + mg), floor(lo[2] - mg), ceil(hi[2] + mg));
+    fprintf(stderr, "tifxyz-bbox: %ld pixels above %d\n", n, th);
+    free(img); isurf_free(&S);
+    return 0;
+}
+
 /* ufsm wl-dump <weights> [sub]: the tensors of a safetensors / torch zip file (name, shape, mean |v|) */
 int cmd_wl_dump(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: ufsm wl-dump <weights> [state-dict key]\n"); return 2; }
