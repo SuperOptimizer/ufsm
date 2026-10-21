@@ -2019,7 +2019,7 @@ static int cmd_fuse(int argc, char **argv) {
    one chunk. */
 static float *wd_read(const char *path, int *w, int *h);
 static int cmd_wrapdist(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm wrapdist <wraps-dir> <labels-root> <labels-key> [--max 32] [--chunk 128] [--threads 16] [--per-wrap] [--cache DIR]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm wrapdist <wraps-dir> <labels-root> <labels-key> [--max 32] [--chunk 128] [--threads 16] [--per-wrap] [--at T1,T2..] [--cache DIR]\n"); return 2; }
     const int M = atoi(opt(argc, argv, "--max", "32")), C = atoi(opt(argc, argv, "--chunk", "128")), nt = atoi(opt(argc, argv, "--threads", "16"));
     const int per = arg_index(argc, argv, "--per-wrap") > 0; const double lum = atof(argv[4]);
     if (!(lum > 0) || M < 1 || C < 1) { fprintf(stderr, "wrapdist: the labels key must be its voxel size in um (e.g. 4.8); --max, --chunk >= 1\n"); return 2; }
@@ -2080,8 +2080,14 @@ static int cmd_wrapdist(int argc, char **argv) {
             size_t c1 = 0, c2 = 0, c4 = 0, cm = 0; for (size_t i = 0; i < k; i++) { c1 += a[i] * lum <= 9.6; c2 += a[i] * lum <= 19.2; c4 += a[i] * lum > 38.4; cm += a[i] > M; }
             if (w < 0) printf("wrapdist: %zu vertices of %d wraps (%zu outside the labels' extent); distance to the nearest labelled voxel (label voxel %.3g um):\n", k, nw, nv - k, lum);
             char tag[16]; if (w < 0) snprintf(tag, sizeof tag, "all"); else snprintf(tag, sizeof tag, "w%03d", ids[w]);
-            printf("  %-5s %8zu vertices: median %.1f um, p75 %.1f, p90 %.1f; <= 9.6 um %.3f, <= 19.2 um %.3f, > 38.4 um %.3f, beyond --max (%.0f um) %.3f\n",
+            printf("  %-5s %8zu vertices: median %.1f um, p75 %.1f, p90 %.1f; <= 9.6 um %.3f, <= 19.2 um %.3f, > 38.4 um %.3f, beyond --max (%.0f um) %.3f",
                    tag, k, a[k / 2] * lum, a[k * 3 / 4] * lum, a[k * 9 / 10] * lum, (double)c1 / k, (double)c2 / k, (double)c4 / k, M * lum, (double)cm / k);
+            {   /* --at T1,T2,..: the share within each distance (um) too (a finer label grid resolves smaller ones) */
+                const char *at = opt(argc, argv, "--at", ""); char *t = strdup(at), *sv = nullptr;
+                for (char *q = strtok_r(t, ",", &sv); q; q = strtok_r(nullptr, ",", &sv)) { const double th = atof(q); size_t c = 0; for (size_t i = 0; i < k; i++) c += a[i] * lum <= th; printf("; <= %g um %.3f", th, (double)c / k); }
+                free(t);
+            }
+            printf("\n");
         }
         free(a);
     }

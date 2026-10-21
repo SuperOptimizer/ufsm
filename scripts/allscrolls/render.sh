@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # render.sh S: renders of scroll S's new surfaces (desk, C only), for reading letters. Incremental: every row of A/<S>/surf/list.tsv
 # (desk box fits, self-gated) and A/<S>/surf-l/list.tsv (laptop box fits, pushed) not yet in renders/index.tsv.
-# Per sheet one folder A/<S>/sheets/<sheet>/ (the laptop pulls it to ~/ufsm-data/allscrolls/<S>/sheets/<sheet>/): the surf-snapped
-# tifxyz (CT ridges, level 0, +-40 um) and every panel as its own half-res JPEG on one pixel grid, no labels (user 10-20):
+# Per sheet one folder A/<S>/sheets/<sheet>/ (the laptop pulls it to ~/ufsm-data/allscrolls/<S>/sheets/<sheet>/): the
+# tifxyz as fitted (no CT snap) and every panel as its own half-res JPEG on one pixel grid, no labels (user 10-20):
 #   <sheet>_ct.jpg                          CT (+-1 voxel), p1-p99 stretched
 #   <sheet>_3dink.jpg                       ink, centre band (+-1 voxel)
 #   <sheet>_3dink_in.jpg / _3dink_out.jpg   ink on the INWARD face (toward the scroll axis; the published segments' / ink-ext --inward
@@ -35,7 +35,10 @@ for L in surf surf-l; do
     if [ -f $S/$L/$sf ]; then   # a .sfc wrap: decoded into the scratch copy only (tifxyz-scale reads .sfc)
       C $U tifxyz-scale $(dirname $S/$L/$sf) $g/dec 1 --wraps $(basename ${sf%.sfc}) > /dev/null 2>&1 && mv $g/dec/$(basename ${sf%.sfc}) $g/in/$n || { echo "render.sh: cannot decode $sf"; rm -rf $g; continue; }
     else cp -r $S/$L/$sf $g/in/$n; fi
-    C $U surf-snap $g/in $g/snap --volume $R $K/0 --vol-um $um --range 40 --threads $TH > $g/snap.log 2>&1 || { rm -rf $g/snap; cp -r $g/in $g/snap; }
+    if [ "${SNAP:-0}" = 1 ]; then   # surf-snap onto CT ridges: OFF by default (10-21 placement test vs published w058 / w060: it moves the sheet
+      # away from the published surface, <= 5 um 0.51 -> 0.35, <= 10 um 0.68 -> 0.50; refine ~equal to none)
+      C $U surf-snap $g/in $g/snap --volume $R $K/0 --vol-um $um --range 40 --threads $TH > $g/snap.log 2>&1 || { rm -rf $g/snap; cp -r $g/in $g/snap; }
+    else mv $g/in $g/snap; fi
     UFSM_RENDER_MEM=8 C $U render $g/snap $g/rc --volume $I $IK --ct $R $K/0 --depth 1 --scale 1 --threads $TH > $g/render.log 2>&1 ||
       { echo "render.sh: $s $sf render failed"; tail -n 2 $g/render.log; rm -rf $g; continue; }
     zc=$(jq -r '(.bbox[0][2] + .bbox[1][2]) / 2 | floor' $g/snap/$n/meta.json); read -r ay ax <<< "$(sed -n "$((zc + 1))p" $AX)"   # the axis at the sheet
