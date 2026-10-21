@@ -2,8 +2,9 @@
 # queue.sh table|desk-fit|desk-ink|desk-render|laptop|status: the all-scrolls job driver (common.sh has the layout). Restart-safe:
 # each step leaves A/<S>/state/<step>.done (a failed step <step>.failed, retried while fewer than 3 failures).
 #   table        A/scrolls.tsv from the mirror listing (2025/2026 ESRF 8.64 / 9.36 um scans with prod96 fit fields)
-#   desk-fit     local 2 cm box fits (fit.sh), in passes of MAXBOX boxes per scroll (PASSES "2 6 24": the best boxes first, every
+#   desk-fit     local 2 cm box fits (fit.sh), in passes of MAXBOX boxes per scroll (PASSES "4 8 16 32 64 100000" = all: a contiguous blob from the best box, every
 #                scroll before widening); scrolls whose ink is done first. Run 2 lanes (they share a scroll's boxes by claims).
+#                STITCH=1 (default): after each completed pass the scroll's agreeing boxes are stitched (A/<S>/stitched-1024.txt).
 #                CPU fits (FITCPU=1) until desk-ink is done (A/ink.alldone), then a GPU (FITGPU, else the emptier one); LANE_CPU=1
 #                lanes stay on the CPU. After the ink: one lane per GPU (FITGPU=0 / 1) + LANE_CPU=1 lanes (TH 8), RAM ~1 GB per fit.
 #                A/<S>/priority-1024.txt boxes (e.g. over a published segment with letters) go first, in every lane, any pass.
@@ -34,7 +35,7 @@ table)
   mv $t $A/scrolls.tsv; wc -l < $A/scrolls.tsv;;
 desk-fit)
   desk_only
-  for mb in ${PASSES:-2 6 24}; do
+  for mb in ${PASSES:-4 8 16 32 64 100000}; do
     while ! stop; do
       left=0; did=0
       for s in $( { for s in $(order); do done_ $s ink && echo $s; done; for s in $(order); do done_ $s ink || echo $s; done; } ); do
@@ -46,12 +47,12 @@ desk-fit)
         done
         done_ $s fit-desk-1024-$mb && continue; [ $(nfail $s fit-$mb) -ge 3 ] && continue; left=1
         mkdir -p $A/$s
-        LOOSE=1 REPICK=1 MAXBOX=$mb $D/fit.sh $s >> $A/$s/fit-lane$$.log 2>&1; rc=$?
+        STITCH=${STITCH:-1} LOOSE=1 REPICK=1 MAXBOX=$mb $D/fit.sh $s >> $A/$s/fit-lane$$.log 2>&1; rc=$?
         case $rc in 0) log "$s fit pass $mb done ($(cat $A/$s/state/fit-desk-1024-$mb.done))"; did=1;; 4) ;; *) fail $s fit-$mb "rc $rc"; did=1;; esac
       done
       [ $left = 0 ] && break; [ $did = 0 ] && sleep 120
     done
-  done; log "desk-fit: passes ${PASSES:-2 6 24} done";;
+  done; log "desk-fit: passes ${PASSES:-4 8 16 32 64 100000} done";;
 desk-ink)
   desk_only
   while ! stop; do
@@ -89,12 +90,14 @@ laptop)
   while ! stop; do pull; sleep 600; done;;
 status)
   [ $HOST = laptop ] && { ssh $DESK "$DA/scripts/queue.sh status"; exit; }
-  printf '%-12s %6s %6s %6s  %-5s %8s  %s\n' scroll um boxes boxes1 ink rendered "largest rendered sheet (cm2, on papyrus)"
+  # boxes fitted / in the scroll, cm2 of picked per-box sheets, stitched sheets (count, largest, flagged seams, total), rendered sheets
+  printf '%-12s %6s %5s %5s %7s  %8s %8s %5s %9s  %s\n' scroll um boxes ofall box_cm2 stitched largest flagd total_cm2 rendered
   for s in $(order); do um=$(awk -v s=$s '$1 == s {print $3}' $A/scrolls.tsv)
-    nb=$(cat $A/$s/fits-desk.tsv 2> /dev/null | wc -l); nl=$(ls -d $A/$s/boxes-512/*/FITDONE 2> /dev/null | wc -l)
+    nb=$(ls -d $A/$s/boxes-1024/*/FITDONE 2> /dev/null | wc -l); na=$(cat $A/$s/boxes-1024.tsv 2> /dev/null | wc -l)
+    bc=$(awk -F'\t' '$1 !~ /^stitched/ { t += $3 } END { printf "%.1f", t }' $A/$s/surf/list.tsv 2> /dev/null)
+    read -r ns big nf tot <<< "$(awk -F'\t' '{ n++; t += $1; if ($1 > m) m = $1; if ($6 != "ok") f++ } END { printf "%d %.1f %d %.1f", n, m, f, t }' $A/$s/stitched-1024.txt 2> /dev/null)"
     nr=$(( $(cat $A/$s/renders/index.tsv 2> /dev/null | wc -l) - 1 )); [ $nr -lt 0 ] && nr=0
-    big=$(tail -n +2 $A/$s/renders/index.tsv 2> /dev/null | sort -t$'\t' -k3,3 -gr | head -1 | awk -F'\t' '{print $1, $3, $4}')
-    printf '%-12s %6s %6s %6s  %-5s %8s  %s\n' $s $um $nb $nl $(done_ $s ink && echo done || echo -) $nr "${big:--}"
+    printf '%-12s %6s %5s %5s %7s  %8s %8s %5s %9s  %s\n' $s $um $nb $na ${bc:-0} ${ns:-0} ${big:-0} ${nf:-0} ${tot:-0} $nr
   done;;
 *) echo "usage: queue.sh table|desk-fit|desk-ink|desk-render|laptop|status"; exit 2;;
 esac

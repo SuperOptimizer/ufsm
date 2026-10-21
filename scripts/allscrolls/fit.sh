@@ -157,12 +157,15 @@ if [ "${REPICK:-0}" = 1 ]; then
 fi
 
 # ---- 3 box fits, best boxes first
-# the box order (user 10-20, "likely text"): priority boxes first (A/<S>/priority-N.txt, one box name per line: e.g. the boxes over a
-# published segment with known letters), then the boxes ranked for text: material, the middle / outer wraps (radius share near 0.65),
-# round robin over the z rows (each row's best box, the rows from the middle outward, then each row's second ...) so a pass of
-# MAXBOX boxes spreads over the whole height. PRIO_ONLY=1: the priority boxes only.
-ranked() { awk -F'\t' -v OFS='\t' -v zm=$((SZ / 2)) -v n=$N '{ d = $6 - 0.65; sc = $5 / 100 - 2 * (d < 0 ? -d : d); dz = $2 + n / 2 - zm; print $2, sc, (dz < 0 ? -dz : dz), $1 }' $BX.tsv |
-  sort -t$'\t' -k1,1n -k2,2gr | awk -F'\t' -v OFS='\t' '{ r = ($1 == z) ? r + 1 : 1; z = $1; print r, $3, $4 }' | sort -t$'\t' -k1,1n -k2,2n | cut -f3; }
+# the box order (user 10-21: large stitched sheets): priority boxes first (A/<S>/priority-N.txt, one box name per line: e.g. the
+# boxes over a published segment with known letters), then ONE contiguous blob growing outward from the seed (the box with the best
+# text score: material, the middle / outer wraps, radius share near 0.65): by grid distance from it (max over z / y / x in strides,
+# so each ring of overlapping neighbours completes before the next), ties by score. Neighbours overlap by 128 cells, which stitch
+# aligns. PRIO_ONLY=1: the priority boxes only.
+ranked() { awk -F'\t' -v st=$ST '{ d = $6 - 0.65; sc[NR] = $5 / 100 - 2 * (d < 0 ? -d : d); z[NR] = $2; y[NR] = $3; x[NR] = $4; b[NR] = $1
+    if (NR == 1 || sc[NR] > sc[best]) best = NR }
+  END { for (i = 1; i <= NR; i++) { dz = z[i] - z[best]; dy = y[i] - y[best]; dx = x[i] - x[best]; dz = dz < 0 ? -dz : dz; dy = dy < 0 ? -dy : dy; dx = dx < 0 ? -dx : dx
+          m = dz > dy ? dz : dy; m = m > dx ? m : dx; print int(m / st + 0.5), -sc[i], b[i] } }' $BX.tsv | sort -k1,1n -k2,2g | awk '{print $3}'; }
 ls_boxes() {
   if [ $# -gt 0 ]; then printf '%s\n' "$@"; return; fi
   [ -s $S/priority-$N.txt ] && cat $S/priority-$N.txt
@@ -208,15 +211,26 @@ left=0; for b in $(ls_boxes "$@"); do [ -e $BX/$b/FITDONE ] || [ -e $BX/$b/FITDO
 [ $# -gt 0 ] && exit 0
 
 # ---- 4 STITCH=1: connected sheets across the fitted boxes that agree with their neighbours
-if [ "${STITCH:-0}" = 1 ]; then
+if [ "${STITCH:-0}" = 1 ] && exec 8> $S/stitch-$N.lock && flock -n 8; then   # (one stitch per scroll at a time; a busy one is skipped)
   O=$S/stitch-$N; rm -rf $O; mkdir -p $O/b
   for d in $BX/*/fit; do b=$(basename $(dirname $d)); mkdir -p $O/b/$b; ln -sfn $d $O/b/$b/fit; done
   if [ $(ls $O/b | wc -l) -ge 2 ]; then
     C $U stitch align $O/gauge.json --fields $F --min-agree 0.5 --threads $TH $O/b/* > $O/align.log 2>&1 &&
     C $U stitch quality $O/gauge.json $O/gauge_q.json --fields $F --threads $TH > $O/quality.log 2>&1 &&
-    C $U stitch sheets $O/gauge_q.json $O/sheets --fields $F --threads 4 --min-cm2 2 --out-um $um > $O/sheets.log 2>&1 &&
-      for w in $(ls $O/sheets); do a=$(jq -r '.area_cm2 // 0' $O/sheets/$w/meta.json); mkdir -p $S/$SURF/stitched; rm -rf $S/$SURF/stitched/$w; cp -r $O/sheets/$w $S/$SURF/stitched/
-        printf 'stitched/%s\tstitched\t%s\tna\n' $w $a >> $S/$SURF/list.tsv; done
+    C $U stitch sheets $O/gauge_q.json $O/sheets --fields $F --threads 4 --min-cm2 2 --out-um $um --tstep 4 --step 4 > $O/sheets.log 2>&1 && {   # (scale 0.25)
+      grep -v '^stitched/' $S/$SURF/list.tsv > $S/$SURF/list.tmp 2> /dev/null; mv $S/$SURF/list.tmp $S/$SURF/list.tsv; rm -rf $S/$SURF/stitched   # (the previous pass's sheets)
+      # per sheet: area and the seam QC of stitch sheets ("seam vertices N: spread S conflict C ...; unjoined U, low quality L");
+      # flagged (possible sheet switch at a seam) when conflict > 0.02 or spread > 0.25 -> stitched-N.txt (largest first)
+      for m in $O/sheets/*/meta.json; do [ -e $m ] || continue; w=$(basename $(dirname $m))
+        q=$(grep -m1 "stitch: $w " $O/sheets.log | grep -oE 'spread [0-9.]+ conflict [0-9.]+|low quality [0-9.]+' | tr '\n' ' ')
+        read -r sp cf lq <<< "$(echo "$q" | awk '{ for (i = 1; i <= NF; i++) { if ($i == "spread") s = $(i + 1); if ($i == "conflict") c = $(i + 1); if ($i == "quality") l = $(i + 1) } } END { print s + 0, c + 0, l + 0 }')"
+        fl=ok; awk -v c=$cf -v s=$sp 'BEGIN { exit !(c > 0.02 || s > 0.25) }' && fl=seam-switch?
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' $(jq -r '.area_cm2' $m) $w $sp $cf $lq $fl
+      done | sort -t$'\t' -k1,1 -gr > $S/stitched-$N.txt
+      # the TOPSTITCH (10) largest unflagged sheets join the list (rendered); kind stitched
+      awk -F'\t' '$6 == "ok"' $S/stitched-$N.txt | head -n ${TOPSTITCH:-10} | while IFS=$'\t' read -r a w sp cf lq fl; do
+        mkdir -p $S/$SURF/stitched; cp -r $O/sheets/$w $S/$SURF/stitched/; printf 'stitched/%s\tstitched\t%s\tna\n' $w $a >> $S/$SURF/list.tsv; done
+    }
   fi
 fi
 
