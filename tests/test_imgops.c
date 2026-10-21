@@ -76,6 +76,16 @@ static void test_tifxyz_scale(void) {
     free(X); free(Z);
     snprintf(p, sizeof p, "rm -rf %s %s", s, d); CHECK(!system(p), "cleanup");
 }
+static void test_tifxyz_shift(void) {   /* a plane z = 10 (x = column, y = row): +n = x-step x y-step = +z; the invalid corner vertex stays */
+    enum { W = 6, H = 4 }; float x[W * H], y[W * H], z[W * H];
+    for (int r = 0; r < H; r++) for (int c = 0; c < W; c++) { const int i = r * W + c; x[i] = c; y[i] = r; z[i] = i == 0 ? -1.f : 10.f; }
+    const char *s = "/tmp/ufsm_test_shift_src", *d = "/tmp/ufsm_test_shift_dst"; char p[256];
+    CHECK(!tifxyz_write(s, W, H, x, y, z, 1, 8.64, 1, "test") && !tifxyz_shift(s, d, 2.5), "tifxyz shift");
+    int w, h; snprintf(p, sizeof p, "%s/z.tif", d); float *Z = img_read_f32(p, &w, &h); snprintf(p, sizeof p, "%s/x.tif", d); float *X = img_read_f32(p, &w, &h);
+    int bad = !Z || !X; for (int i = 0; !bad && i < W * H; i++) bad += i == 0 ? Z[i] != -1.f : fabsf(Z[i] - 12.5f) > 1e-5f || fabsf(X[i] - x[i]) > 1e-5f;
+    CHECK(!bad, "tifxyz shift moves the plane along +z");
+    free(Z); free(X); snprintf(p, sizeof p, "rm -rf %s %s", s, d); CHECK(!system(p), "cleanup");
+}
 static void test_ink_compare(void) {   /* ink_stats / ink_corr / ink_panels_half (ufsm ink-compare) */
     enum { W = 64, H = 48 }; static uint8_t a[W * H], b[W * H], m[W * H], ct[W * H], flat[W * H];
     for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) { const int i = y * W + x; a[i] = x < W / 2 ? 255 : 0; b[i] = 255 - a[i]; m[i] = 1; ct[i] = 100; flat[i] = 77; }
@@ -115,7 +125,7 @@ static void test_ink_compare(void) {   /* ink_stats / ink_corr / ink_panels_half
     CHECK(img_best_window(dim, mk, W, H, 8, &bx, &by) == -1, "best window without mask");
 }
 int main(void) {
-    test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_tifxyz_scale(); test_ink_compare();
+    test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_tifxyz_scale(); test_tifxyz_shift(); test_ink_compare();
     if (fails) { fprintf(stderr, "test_imgops: %d failures\n", fails); return 1; }
     printf("test_imgops: ok\n");
     return 0;

@@ -386,11 +386,12 @@ int cmd_overlay_red(int argc, char **argv) {
     return rc;
 }
 
-/* ufsm tifxyz-scale <src-dir> <dst-dir> <div> [--offset z,y,x] [--wraps a,b,..]
+/* ufsm tifxyz-scale <src-dir> <dst-dir> <div> [--offset z,y,x] [--wraps a,b,..] [--normal D]
    xform_wraps.py: the tifxyz <src-dir>/<w> (every subdirectory, or --wraps) copied to <dst-dir>/<w> with coordinates divided
-   by div (float32) minus the offset; invalid vertices (z < 0) stay -1; meta scale x div, voxel_size_um x div. */
+   by div (float32) minus the offset; invalid vertices (z < 0) stay -1; meta scale x div, voxel_size_um x div. --normal D (div 1, no
+   offset): instead every vertex moved D voxels along its normal +n = (d/d column) x (d/d row) (tifxyz_shift; one face of a sheet). */
 int cmd_tifxyz_scale(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm tifxyz-scale <src-dir> <dst-dir> <div> [--offset z,y,x] [--wraps a,b,..]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm tifxyz-scale <src-dir> <dst-dir> <div> [--offset z,y,x] [--wraps a,b,..] [--normal D]\n"); return 2; }
     const double div = atof(argv[4]); double off[3] = {0, 0, 0};
     if (!(div > 0) || sscanf(ropt(argc, argv, "--offset", "0,0,0"), "%lf,%lf,%lf", off, off + 1, off + 2) != 3) { fprintf(stderr, "tifxyz-scale: bad div / --offset\n"); return 2; }
     const char *wl = ropt(argc, argv, "--wraps", nullptr); char *want = nullptr; if (wl) { want = malloc(strlen(wl) + 3); sprintf(want, ",%s,", wl); }
@@ -402,7 +403,8 @@ int cmd_tifxyz_scale(int argc, char **argv) {
         char s[1400], d[1400], m[1500]; snprintf(s, sizeof s, "%s/%s", argv[2], de->d_name); snprintf(m, sizeof m, "%s/meta.json", s);
         struct stat st; if (stat(m, &st)) continue;
         snprintf(d, sizeof d, "%s/%s", argv[3], de->d_name);
-        if (tifxyz_scale(s, d, div, off)) { fprintf(stderr, "tifxyz-scale: %s failed\n", s); rc = 1; } else n++;
+        const char *nd = ropt(argc, argv, "--normal", nullptr);
+        if (nd ? tifxyz_shift(s, d, atof(nd)) : tifxyz_scale(s, d, div, off)) { fprintf(stderr, "tifxyz-scale: %s failed\n", s); rc = 1; } else n++;
     }
     closedir(dd); free(want);
     fprintf(stderr, "tifxyz-scale: %d tifxyz written to %s\n", n, argv[3]);
@@ -441,11 +443,13 @@ int cmd_phase_score(int argc, char **argv) {
    pixels one line "ink LABEL: n .. mean .. frac50 .. p50 .. p95 .. p99 .. band .." (ink_stats: band = the contrast between the
    --rs-um and --rl-um box scales) and "corr A B: r" for each pair. Exit 0, 3 when skipped (too little CT).
    --best-crop N: the crop is the N x N window with the most first-ink signal (img_best_window; printed as "crop x,y,w,h");
-   --stretch: each ink panel p1 .. p99 contrast stretched over CT > 0 (display only); --full: full-resolution panels. */
+   --stretch: each ink panel p1 .. p99 contrast stretched over CT > 0 (display only); --full: full-resolution panels;
+   --stretch-ct: the CT panel p1 .. p99 stretched as well (img_stretch); --fixed LO,HI: every ink panel on one fixed scale (bytes LO .. HI
+   -> 0 .. 255), the same for all sheets, instead of --stretch. */
 int cmd_ink_compare(int argc, char **argv) {
     const int ci = rarg(argc, argv, "--ct");
     if (argc < 5 || ci < 0 || ci + 1 >= argc || rarg(argc, argv, "--ink") < 0) {
-        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch] [--full] [--threads 16]\n"); return 2;
+        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch | --fixed LO,HI] [--stretch-ct] [--full] [--threads 16]\n"); return 2;
     }
     const double px = atof(ropt(argc, argv, "--px-um", "2.4")), rsu = atof(ropt(argc, argv, "--rs-um", "25")), rlu = atof(ropt(argc, argv, "--rl-um", "500"));
     const int nthreads = atoi(ropt(argc, argv, "--threads", "16"));
@@ -499,7 +503,11 @@ int cmd_ink_compare(int argc, char **argv) {
         printf("ink %s: n %lld mean %.4f frac50 %.4f p50 %.3f p95 %.3f p99 %.3f band %.4f\n", lab[k], st.n, st.mean, st.frac50, st.p50, st.p95, st.p99, st.band);
     }
     for (int a = 1; a < n; a++) for (int b = a + 1; b < n; b++) printf("corr %s %s: %.4f\n", lab[a], lab[b], ink_corr(img[a], img[b], mask, np));
-    if (rflag(argc, argv, "--stretch")) {   /* display only: each ink stretched from its p1 to its p99 over the CT > 0 pixels */
+    int flo = 0, fhi = 0;
+    if (*ropt(argc, argv, "--fixed", "") && (sscanf(ropt(argc, argv, "--fixed", ""), "%d,%d", &flo, &fhi) != 2 || fhi <= flo)) { fprintf(stderr, "ink-compare: --fixed LO,HI (ink bytes, LO < HI)\n"); return 2; }
+    if (fhi > flo) for (int k = 1; k < n; k++)   /* display only: one fixed ink scale LO .. HI -> 0 .. 255 for every sheet (no per-sheet stretch) */
+        for (size_t i = 0; i < np; i++) { const int v = (img[k][i] - flo) * 255 / (fhi - flo); ((uint8_t *)img[k])[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
+    else if (rflag(argc, argv, "--stretch")) {   /* display only: each ink stretched from its p1 to its p99 over the CT > 0 pixels */
         for (int k = 1; k < n; k++) {
             uint64_t h[256] = {0}, m = 0; for (size_t i = 0; i < np; i++) if (mask[i]) { h[img[k][i]]++; m++; }
             int lo = 0, hi = 255; uint64_t c = 0; int gl = 0;
@@ -513,6 +521,7 @@ int cmd_ink_compare(int argc, char **argv) {
     }
     if (overlay_red_skip(ct, np)) { fprintf(stderr, "ink-compare: under 5%% of the CT pixels have data: no %s\n", argv[2]); rc = 3; }
     else {
+        if (rflag(argc, argv, "--stretch-ct")) { img_stretch(ct, mask, np, 0.01, 0.99); isct[0] = 0; }   /* the CT panel p1 .. p99 too (scans brighter than the fixed CT contrast) */
         int ow, oh; uint8_t *rgb = ink_panels(img, isct, n, W, H, lab, !rflag(argc, argv, "--full"), &ow, &oh, nthreads);
         if (!rgb || jpeg_write_rgb(argv[2], ow, oh, rgb, 90)) { fprintf(stderr, "ink-compare: cannot write %s\n", argv[2]); rc = 1; }
         free(rgb);

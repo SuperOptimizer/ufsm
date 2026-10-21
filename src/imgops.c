@@ -278,6 +278,35 @@ static char *meta_scaled(const char *m, double div) {
     }
     o[k] = 0; return o;
 }
+int tifxyz_shift(const char *src, const char *dst, double d) {
+    char p[1400]; static const char *nm[3] = {"x", "y", "z"}; float *A[3] = {0}, *O[3] = {0}; int w = 0, h = 0, rc = -1;
+    for (int k = 0; k < 3; k++) {
+        int w2, h2; snprintf(p, sizeof p, "%s/%s.tif", src, nm[k]); A[k] = img_read_f32(p, &w2, &h2);
+        if (!A[k] || (k && (w2 != w || h2 != h))) goto out;
+        w = w2; h = h2;
+    }
+    const size_t n = (size_t)w * h;
+    for (int k = 0; k < 3; k++) { if (!(O[k] = malloc(n * 4))) goto out; memcpy(O[k], A[k], n * 4); }
+    for (int r = 0; r < h; r++) for (int c = 0; c < w; c++) {
+        const size_t i = (size_t)r * w + c; if (!(A[2][i] >= 0)) continue;
+        /* central (or one-sided) differences along the columns (u) and the rows (v) over valid neighbours; +n = u x v */
+        const int c0 = c > 0 && A[2][i - 1] >= 0 ? c - 1 : c, c1 = c + 1 < w && A[2][i + 1] >= 0 ? c + 1 : c;
+        const int r0 = r > 0 && A[2][i - w] >= 0 ? r - 1 : r, r1 = r + 1 < h && A[2][i + w] >= 0 ? r + 1 : r;
+        if (c0 == c1 || r0 == r1) continue;
+        double u[3], v[3];
+        for (int k = 0; k < 3; k++) { u[k] = A[k][(size_t)r * w + c1] - A[k][(size_t)r * w + c0]; v[k] = A[k][(size_t)r1 * w + c] - A[k][(size_t)r0 * w + c]; }
+        const double nx = u[1] * v[2] - u[2] * v[1], ny = u[2] * v[0] - u[0] * v[2], nz = u[0] * v[1] - u[1] * v[0], l = sqrt(nx * nx + ny * ny + nz * nz);
+        if (!(l > 0)) continue;
+        O[0][i] = (float)(A[0][i] + d * nx / l); O[1][i] = (float)(A[1][i] + d * ny / l); O[2][i] = (float)(A[2][i] + d * nz / l);
+        if (O[2][i] < 0) O[2][i] = 0;   /* (stays a valid vertex) */
+    }
+    snprintf(p, sizeof p, "mkdir -p '%s'", dst); if (system(p)) goto out;
+    for (int k = 0; k < 3; k++) { snprintf(p, sizeof p, "%s/%s.tif", dst, nm[k]); if (tiffw_write(p, w, h, 3, O[k], 1)) goto out; }
+    snprintf(p, sizeof p, "cp '%s/meta.json' '%s/meta.json'", src, dst); rc = system(p) ? -1 : 0;
+out:
+    for (int k = 0; k < 3; k++) { free(A[k]); free(O[k]); }
+    return rc;
+}
 int tifxyz_scale(const char *src, const char *dst, double div, const double off[3]) {
     char p[1400]; static const char *nm[3] = {"x", "y", "z"}; float *A[3] = {0}; int w = 0, h = 0, rc = -1;
     for (int k = 0; k < 3; k++) {
