@@ -110,6 +110,10 @@ static void test_ink_compare(void) {   /* ink_stats / ink_corr / ink_panels_half
     rgb = ink_panels(im, isct, 3, W, H, lab, 0, &ow, &oh, 2);
     CHECK(rgb && ow == 3 * W + 16 && oh == H && rgb[((size_t)(H - 1) * ow + W + 8) * 3] == 255 && rgb[((size_t)(H - 1) * ow + 2 * W + 7) * 3] == 0, "full panels %dx%d", ow, oh);
     free(rgb);
+    /* one unlabelled panel (ink-compare --each): the image alone, halved, no text pixels */
+    rgb = ink_panels(&im[1], &isct[1], 1, W, H, nullptr, 1, &ow, &oh, 2);
+    CHECK(rgb && ow == W / 2 && oh == H / 2 && rgb[0] == 255 && rgb[1] == 255 && rgb[2] == 255 && rgb[((size_t)(oh - 1) * ow + ow - 1) * 3] == 0, "single panel %dx%d", ow, oh);
+    free(rgb);
     /* img_stretch: a ramp 50..149 over the mask -> p1 .. p99 to 0 .. 255; outside the mask 0 */
     static uint8_t ramp[100], rm[100];
     for (int i = 0; i < 100; i++) { ramp[i] = (uint8_t)(50 + i); rm[i] = i < 90; }

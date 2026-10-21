@@ -454,11 +454,12 @@ int cmd_phase_score(int argc, char **argv) {
    --best-crop N: the crop is the N x N window with the most first-ink signal (img_best_window; printed as "crop x,y,w,h");
    --stretch: each ink panel p1 .. p99 contrast stretched over CT > 0 (display only); --full: full-resolution panels;
    --stretch-ct: the CT panel p1 .. p99 stretched as well (img_stretch); --fixed LO,HI: every ink panel on one fixed scale (bytes LO .. HI
-   -> 0 .. 255), the same for all sheets, instead of --stretch. */
+   -> 0 .. 255), the same for all sheets, instead of --stretch; --each PREFIX: instead of the combined JPEG every panel alone, unlabelled,
+   as PREFIX<label><--each-suffix>.jpg (the CT panel only with --each-ct; <out.jpg> unused). */
 int cmd_ink_compare(int argc, char **argv) {
     const int ci = rarg(argc, argv, "--ct");
     if (argc < 5 || ci < 0 || ci + 1 >= argc || rarg(argc, argv, "--ink") < 0) {
-        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch | --fixed LO,HI] [--stretch-ct] [--full] [--threads 16]\n"); return 2;
+        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch | --fixed LO,HI] [--stretch-ct] [--full] [--each PREFIX [--each-suffix S] [--each-ct]] [--threads 16]\n"); return 2;
     }
     const double px = atof(ropt(argc, argv, "--px-um", "2.4")), rsu = atof(ropt(argc, argv, "--rs-um", "25")), rlu = atof(ropt(argc, argv, "--rl-um", "500"));
     const int nthreads = atoi(ropt(argc, argv, "--threads", "16"));
@@ -531,9 +532,20 @@ int cmd_ink_compare(int argc, char **argv) {
     if (overlay_red_skip(ct, np)) { fprintf(stderr, "ink-compare: under 5%% of the CT pixels have data: no %s\n", argv[2]); rc = 3; }
     else {
         if (rflag(argc, argv, "--stretch-ct")) { img_stretch(ct, mask, np, 0.01, 0.99); isct[0] = 0; }   /* the CT panel p1 .. p99 too (scans brighter than the fixed CT contrast) */
-        int ow, oh; uint8_t *rgb = ink_panels(img, isct, n, W, H, lab, !rflag(argc, argv, "--full"), &ow, &oh, nthreads);
-        if (!rgb || jpeg_write_rgb(argv[2], ow, oh, rgb, 90)) { fprintf(stderr, "ink-compare: cannot write %s\n", argv[2]); rc = 1; }
-        free(rgb);
+        const char *each = ropt(argc, argv, "--each", nullptr);
+        if (each) {   /* --each PREFIX: every panel its own unlabelled JPEG PREFIX<label><--each-suffix>.jpg (the CT only with --each-ct) */
+            const char *suf = ropt(argc, argv, "--each-suffix", ""); const int ect = rflag(argc, argv, "--each-ct");
+            for (int k = ect ? 0 : 1; k < n; k++) {
+                char p[1400]; snprintf(p, sizeof p, "%s%s%s.jpg", each, lab[k], suf);
+                int ow, oh; uint8_t *rgb = ink_panels(&img[k], &isct[k], 1, W, H, nullptr, !rflag(argc, argv, "--full"), &ow, &oh, nthreads);
+                if (!rgb || jpeg_write_rgb(p, ow, oh, rgb, 90)) { fprintf(stderr, "ink-compare: cannot write %s\n", p); rc = 1; }
+                free(rgb);
+            }
+        } else {
+            int ow, oh; uint8_t *rgb = ink_panels(img, isct, n, W, H, lab, !rflag(argc, argv, "--full"), &ow, &oh, nthreads);
+            if (!rgb || jpeg_write_rgb(argv[2], ow, oh, rgb, 90)) { fprintf(stderr, "ink-compare: cannot write %s\n", argv[2]); rc = 1; }
+            free(rgb);
+        }
     }
     fflush(stdout);
     for (int k = 0; k < n; k++) free((void *)img[k]);
