@@ -274,7 +274,7 @@ static void hann2(float *k, int T, float floor_) {   /* torch.hann_window(T, per
 static const char ell7[7][8] = {"0001000", "0111110", "1111111", "1111111", "1111111", "0111110", "0001000"};
 
 typedef struct {
-    int kind; ie_net *net; const ie_spec *sp; int stride, batch, nth, reverse, blend_norm; size_t ct_mem; double px_um;
+    int kind; ie_net *net; const ie_spec *sp; int stride, batch, nth, reverse, blend_norm, no_overlap; size_t ct_mem; double px_um;
     ctlev lev[6]; int nlev; double lev_um[6];
     uint8_t **stk; int stk_n, stk_w, stk_h;   /* --layers: a pre-rendered stack (ascending normal offsets) instead of the renderer */
     uint8_t *dump; int dump_req, render_only;  /* --dump-layers: the rendered model-grid stack [D][Hm][Wm] (run_surface allocates) */
@@ -344,10 +344,12 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     float *ctl = pctl ? calloc((size_t)Wm * Hm, sizeof *ctl) : nullptr; if (pctl) *pctl = ctl;   /* the surface layer (CT / 255) */
     uint8_t *cov = X->kind == IE_V8IN ? calloc((size_t)Wm * Hm, 1) : nullptr;   /* v8in: max over depth > 0 */
     float *win = malloc((size_t)T * T * sizeof *win);
-    if (X->kind == IE_V8IN) gkern64(win, T); else hann2(win, T, 0.001f);
+    if (X->no_overlap) for (int i = 0; i < T * T; i++) win[i] = 1.f;   /* --no-overlap: stride = tile, blend off */
+    else if (X->kind == IE_V8IN) gkern64(win, T); else hann2(win, T, 0.001f);
     int nx, ny; int *xs, *ys;
-    const int stride = X->stride > 0 ? X->stride : sp->stride;
-    if (X->kind == IE_V8IN) { xs = axis_starts_v8(Wm, T, stride, &nx); ys = axis_starts_v8(Hm, T, stride, &ny); }
+    const int stride = X->no_overlap ? T : X->stride > 0 ? X->stride : sp->stride;
+    if (X->no_overlap) { xs = axis_starts_koine(Wm, T, stride, &nx); ys = axis_starts_koine(Hm, T, stride, &ny); }   /* tiles at 0, T, 2T .. and the last at L - T */
+    else if (X->kind == IE_V8IN) { xs = axis_starts_v8(Wm, T, stride, &nx); ys = axis_starts_v8(Hm, T, stride, &ny); }
     else if (X->kind == IE_READER3) { xs = axis_starts_koine(Wm, T, stride, &nx); ys = axis_starts_koine(Hm, T, stride, &ny); }
     else { xs = axis_starts_hecate(Wm, T, stride, &nx); ys = axis_starts_hecate(Hm, T, stride, &ny); }
     /* rolling row buffer: rows [rb0, rb1) */
@@ -407,7 +409,7 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
             if (ix < nx) {
                 const int x0 = xs[ix];
                 if (X->render_only) continue;
-                if (X->kind == IE_V8IN) {   /* the tile must lie fully inside the closed coverage */
+                if (X->kind == IE_V8IN && !X->no_overlap) {   /* the tile must lie fully inside the closed coverage */
                     int in = 1; for (int y = y0; y < y0 + T && in; y++) for (int x = x0; x < x0 + T; x++) if (!closed[(size_t)y * Wm + x]) { in = 0; break; }
                     if (!in) continue;
                 }
@@ -419,7 +421,7 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
                     const uint8_t *src = ROW(y0 + y) + (size_t)i * Wm + x0; uint8_t *dst = t + ((size_t)i * T + y) * T;
                     memcpy(dst, src, (size_t)pw); if (!anyv) for (int x = 0; x < pw; x++) if (src[x]) { anyv = 1; break; }
                 }
-                if (!anyv && X->kind != IE_V8IN) { nskip++; continue; }
+                if (!anyv && (X->kind != IE_V8IN || X->no_overlap)) { nskip++; continue; }
                 tx[nb] = x0; ty[nb] = y0; nb++;
             }
             if (nb == B || (ix == nx && iy == ny - 1 && nb)) {
@@ -460,6 +462,19 @@ static uint8_t *to_ref_grid(const isurf *S, const float *p, int Wm, int Hm, doub
     }
     return o;
 }
+static int write_gray_jpeg_half(const char *path, const uint8_t *g, int w, int h);
+/* the image stretched from its p1 to its p99 over the pixels > 0 (the surface), then as write_gray_jpeg_half */
+static int write_gray_jpeg_half_stretch(const char *path, const uint8_t *g, int w, int h) {
+    const size_t n = (size_t)w * h; uint64_t hist[256] = {0}, m = 0;
+    for (size_t i = 0; i < n; i++) if (g[i]) { hist[g[i]]++; m++; }
+    int lo = 0, hi = 255; uint64_t c = 0; int gl = 0;
+    for (int v = 0; v < 256; v++) { c += hist[v]; if (!gl && c >= m / 100) { lo = v; gl = 1; } if (c >= m - m / 100) { hi = v; break; } }
+    if (hi <= lo) hi = lo + 1;
+    uint8_t *s = malloc(n); if (!s) return -1;
+    for (size_t i = 0; i < n; i++) { const int v = g[i] ? (g[i] - lo) * 255 / (hi - lo) : 0; s[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
+    const int rc = write_gray_jpeg_half(path, s, w, h); free(s);
+    return rc;
+}
 static int write_gray_jpeg_half(const char *path, const uint8_t *g, int w, int h) {
     const int ow = w / 2 > 0 ? w / 2 : 1, oh = h / 2 > 0 ? h / 2 : 1;
     uint8_t *half = malloc((size_t)ow * oh), *rgb = malloc((size_t)ow * oh * 3);
@@ -494,7 +509,8 @@ int cmd_ink_ext(int argc, char **argv) {
     if (!mname || !weights) {
         fprintf(stderr, "usage: ufsm ink-ext --model v8in|hecate24|hecate96|reader3 --weights W --surface TIFXYZ [--surface ..] --ct ROOT KEY --out DIR\n"
                         "         [--reverse] [--stride S] [--px-um U] [--batch B] [--gpu 0] [--threads 16] [--ct-mem 3] [--cache DIR] [--native] [--suffix S] [--prefix P]\n"
-                        "         [--ct-local ROOT --local-levels 1,2]\n"
+                        "         [--ct-local ROOT --local-levels 1,2] [--ct-um 2.399] [--surf-um U] [--no-overlap] [--blend official|norm] [--grid-crop c,r,w,h]\n"
+                        "         [--ct-tif] [--jpeg PATH] [--jpeg-stretch] [--layers DIR [--px-crop x,y,w,h]] [--dump-layers DIR] [--render-only]\n"
                         "       ufsm ink-ext --model M --weights W --raw-in TILES.u8 --raw-out LOGITS.f32 [--batch 2]   (parity: native tiles -> logits)\n"); return 2;
     }
     const int kind = ie_model_kind(mname); if (kind < 0) { fprintf(stderr, "ink-ext: unknown model %s\n", mname); return 2; }
@@ -529,6 +545,7 @@ int cmd_ink_ext(int argc, char **argv) {
     }
     X.dump_req = iopt(argc, argv, "--dump-layers", nullptr) != nullptr; X.render_only = iflag(argc, argv, "--render-only"); X.kind = kind; X.net = net; X.sp = &ie_specs[kind]; X.stride = atoi(iopt(argc, argv, "--stride", "0")); X.reverse = iflag(argc, argv, "--reverse");
     X.blend_norm = !strcmp(iopt(argc, argv, "--blend", "official"), "norm");   /* v8in: sum(p g) / sum(g) instead of inference.py sum(p g) / count (its stride grid) */
+    X.no_overlap = iflag(argc, argv, "--no-overlap");   /* stride = the tile, uniform weights (no blending), empty tiles skipped, v8in without its coverage-mask rule */
     X.nth = atoi(iopt(argc, argv, "--threads", "16")); X.px_um = atof(iopt(argc, argv, "--px-um", "0")); if (!(X.px_um > 0)) X.px_um = X.sp->px_um;
     X.ct_mem = (size_t)(atof(iopt(argc, argv, "--ct-mem", "3")) * (1 << 30));
     X.batch = atoi(iopt(argc, argv, "--batch", "0"));
@@ -560,10 +577,14 @@ int cmd_ink_ext(int argc, char **argv) {
     fprintf(stderr, "ink-ext: batch %d, CT %s %s (%d levels, %.3f um), stride %d\n", X.batch, argv[ci + 1], argv[ci + 2], X.nlev, X.lev_um[0], X.stride > 0 ? X.stride : X.sp->stride);
 surfaces:;
     char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", outdir); if (system(p)) return 1;
-    int rc = 0, ns = 0;
-    for (int a = 2; a + 1 < argc; a++) {
-        if (strcmp(argv[a], "--surface")) continue;
-        isurf S; if (isurf_load(&S, argv[a + 1])) { fprintf(stderr, "ink-ext: cannot read tifxyz %s\n", argv[a + 1]); rc = 1; continue; }
+    int rc = 0, ns = 0, nsurf = 0;
+    for (int a = 2; a + 1 < argc; a++) nsurf += !strcmp(argv[a], "--surface");
+    for (int a = 2; a < argc; a++) {
+        const int lonly = X.stk && !nsurf && a == 2;   /* --layers without --surface: one pass named --name (default "layers") */
+        if (!lonly && (a + 1 >= argc || strcmp(argv[a], "--surface"))) continue;
+        isurf S;
+        if (lonly) { memset(&S, 0, sizeof S); snprintf(S.name, sizeof S.name, "%s", iopt(argc, argv, "--name", "layers")); S.scale = 1; S.vox_um = X.px_um; S.w = S.h = 2; }
+        else if (isurf_load(&S, argv[a + 1])) { fprintf(stderr, "ink-ext: cannot read tifxyz %s\n", argv[a + 1]); rc = 1; continue; }
         { const double su = atof(iopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* tifxyz voxel size when its meta has none (default 2.399) */
         const char *gc = iopt(argc, argv, "--grid-crop", nullptr); int cc[4];   /* c0,r0,cols,rows of the tifxyz grid */
         if (gc && (sscanf(gc, "%d,%d,%d,%d", cc, cc + 1, cc + 2, cc + 3) != 4 || isurf_crop(&S, cc[0], cc[1], cc[2], cc[3]))) { fprintf(stderr, "ink-ext: bad --grid-crop\n"); return 2; }
@@ -594,8 +615,10 @@ surfaces:;
         } else g = to_ref_grid(&S, pm, Wm, Hm, du, &ow, &oh);
         snprintf(p, sizeof p, "%s/%s_%s%s.tif", outdir, nm, mname, suffix);
         if (!g || tiffw_write(p, ow, oh, 1, g, 1)) { fprintf(stderr, "ink-ext: cannot write %s\n", p); rc = 1; }
-        snprintf(p, sizeof p, "%s/%s_%s%s.jpg", outdir, nm, mname, suffix);
-        if (g && write_gray_jpeg_half(p, g, ow, oh)) { fprintf(stderr, "ink-ext: cannot write %s\n", p); rc = 1; }
+        /* --jpeg PATH: the half-res JPEG there (default <out>/<name>_<model><suffix>.jpg); --jpeg-stretch: p1-p99 over the surface */
+        const char *jo = iopt(argc, argv, "--jpeg", nullptr);
+        if (jo) snprintf(p, sizeof p, "%s", jo); else snprintf(p, sizeof p, "%s/%s_%s%s.jpg", outdir, nm, mname, suffix);
+        if (g && (iflag(argc, argv, "--jpeg-stretch") ? write_gray_jpeg_half_stretch(p, g, ow, oh) : write_gray_jpeg_half(p, g, ow, oh))) { fprintf(stderr, "ink-ext: cannot write %s\n", p); rc = 1; }
         double mean = 0; size_t cnt = 0; for (size_t i = 0; i < (size_t)ow * oh; i++) if (g && g[i]) { mean += g[i]; cnt++; }
         fprintf(stderr, "ink-ext: %s -> %s/%s_%s%s.tif (%d x %d, mean %.3f over %zu px), %.1fs\n", S.name, outdir, nm, mname, suffix, ow, oh, cnt ? mean / cnt / 255 : 0, cnt, inow() - t0);
         free(g); free(pm); isurf_free(&S); ns++;
@@ -661,7 +684,7 @@ int cmd_ink_ensemble(int argc, char **argv) {
         free(I); free(C);
     }
     int rc = tiffw_write(argv[2], W, H, 1, o, 1) ? 1 : 0;
-    const char *jp = iopt(argc, argv, "--jpeg", nullptr); if (jp && write_gray_jpeg_half(jp, o, W, H)) rc = 1;
+    const char *jp = iopt(argc, argv, "--jpeg", nullptr); if (jp && (iflag(argc, argv, "--jpeg-stretch") ? write_gray_jpeg_half_stretch(jp, o, W, H) : write_gray_jpeg_half(jp, o, W, H))) rc = 1;
     if (rc) fprintf(stderr, "ink-ensemble: cannot write %s\n", argv[2]);
     for (int k = 0; k < n; k++) free(im[k]);
     free(mask); free(acc); free(o);

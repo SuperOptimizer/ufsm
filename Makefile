@@ -380,6 +380,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	python3 tests/test_ink_ext_v8in.py
 	python3 tests/test_ink_ext_hecate.py
 	python3 tests/test_ink_ext_reader3.py
+	python3 tests/test_ink_ext_tiling.py
 	./$(B)/test_mx
 	./$(B)/test_mx4
 	./$(B)/test_grad_mx4
