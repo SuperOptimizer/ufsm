@@ -204,7 +204,7 @@ static int usage(void) {
         "  ufsm dino-train --sources S.json --out DIR   our dense embedding net from scratch (GT sheet identity + DINO-style SSL)\n"
         "  ufsm dino-embed CKPT ROOT KEY OUT --box ... --norm c,s   a dino-train net over a box (dinovol-eval format)\n"
         "  ufsm halves ROOT KEY-L0 OUT --box ...   two 4x-pooled views of a fine scan from disjoint sub-voxel halves\n"
-        "  ufsm png2jpg <in.png|in.jpg> <out.jpg> [--half] [--max-px N]   PNG / JPEG -> JPEG q90 (half: Pillow BOX halved; max-px: longest side)\n"
+        "  ufsm png2jpg <in.png|in.jpg> <out.jpg|out.tif> [--half] [--max-px N] [--size W,H]   PNG / JPEG -> JPEG q90 (half: Pillow BOX halved; max-px: longest side) or uint8 TIFF\n"
         "  ufsm phase-score <pc-dir> <ps-dir> [<sheets-dir>]   on-recto score of pc / ps renders on surfaces (per seam class with sheets)\n"
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"

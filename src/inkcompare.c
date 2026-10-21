@@ -1,6 +1,6 @@
 /* ufsm ink-compare, streamed: the renders are read strip by strip (tiff_open_lazy / tiff_read_strip) and never held whole, so a
    whole wrap (1.5 Gpixel renders) runs in a few hundred MB instead of ~24 GB. The bytes out are those of the in-memory version
-   (ink_compare_mem in render.c, still used for --best-crop, non-strip TIFFs and UFSM_INKCMP_MEM=1):
+   (ink_compare_mem in render.c, still used for --best-crop, --mask, non-strip TIFFs and UFSM_INKCMP_MEM=1):
    - pass 1 (strips on threads): the masked histograms (CT > 0) and the integer sums of every pair (corr); means, percentiles, the
      stretch ranges and the 5% rule all come from these exact integer counts;
    - pass 2 (band): the masked box means of radius rs and rl as running integer sums (columns over a ring of rows, then along the
@@ -399,7 +399,7 @@ static int stats_from_hist(const uint64_t *hist, ink_stats_t *st) {   /* ink_sta
 
 int cmd_ink_compare(int argc, char **argv) {
     const int ci = icarg(argc, argv, "--ct");
-    if (argc < 5 || ci < 0 || ci + 1 >= argc || icarg(argc, argv, "--ink") < 0 || icarg(argc, argv, "--best-crop") >= 0 || getenv("UFSM_INKCMP_MEM"))
+    if (argc < 5 || ci < 0 || ci + 1 >= argc || icarg(argc, argv, "--ink") < 0 || icarg(argc, argv, "--best-crop") >= 0 || icarg(argc, argv, "--mask") >= 0 || getenv("UFSM_INKCMP_MEM"))
         return ink_compare_mem(argc, argv);
     const double px = atof(icopt(argc, argv, "--px-um", "2.4")), rsu = atof(icopt(argc, argv, "--rs-um", "25")), rlu = atof(icopt(argc, argv, "--rl-um", "500"));
     if (!(px > 0) || !(rsu > 0) || !(rlu > rsu)) { fprintf(stderr, "ink-compare: need --px-um > 0 and 0 < --rs-um < --rl-um\n"); return 2; }

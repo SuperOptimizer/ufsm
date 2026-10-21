@@ -772,7 +772,8 @@ surfaces:;
    model's median .. 99.5th percentile, Reader's 0.25 .. 0.75 compression and the models' different ink fractions removed),
    rank = the value's percentile; then the weighted mean (weights W, default 1) as uint8. */
 int cmd_ink_ensemble(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm ink-ensemble <out.tif> --ink [W:]PATH.tif .. [--norm stretch|rank|none] [--lo-pct 50] [--hi-pct 99.5] [--jpeg OUT.jpg]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm ink-ensemble <out.tif> --ink [W:]PATH.tif .. [--norm stretch|rank|none] [--lo-pct 50] [--hi-pct 99.5] [--jpeg OUT.jpg] [--peaks N [--peak-win 1024] [--peak-cover 0.5]]\n"
+                              "  --peaks N: prints the N non-overlapping --peak-win windows of highest mean ensemble with at least --peak-cover of their pixels covered (peak x,y,w,h mean)\n"); return 2; }
     const char *norm = iopt(argc, argv, "--norm", "stretch"); const double plo = atof(iopt(argc, argv, "--lo-pct", "50")), phi = atof(iopt(argc, argv, "--hi-pct", "99.5"));
     enum { MAXI = 16 }; uint8_t *im[MAXI]; double wt[MAXI]; int n = 0, W = 0, H = 0;
     for (int a = 2; a + 1 < argc; a++) {
@@ -803,6 +804,7 @@ int cmd_ink_ensemble(int argc, char **argv) {
     }
     uint8_t *o = malloc(np); for (size_t i = 0; i < np; i++) o[i] = mask[i] ? (uint8_t)lroundf(acc[i] * 255) : 0;
     const int npk = atoi(iopt(argc, argv, "--peaks", "0")), pw = atoi(iopt(argc, argv, "--peak-win", "1024"));
+    const double pcov = atof(iopt(argc, argv, "--peak-cover", "0.5"));   /* least share of the window with data */
     if (npk > 0 && pw > 0 && pw <= W && pw <= H) {   /* the npk non-overlapping pw x pw windows of highest mean ensemble (>= half covered) */
         double *I = calloc((size_t)(W + 1) * (H + 1), sizeof *I), *C = calloc((size_t)(W + 1) * (H + 1), sizeof *C);
         for (int y = 0; y < H; y++) { double r = 0, c = 0; for (int x = 0; x < W; x++) { r += o[(size_t)y * W + x]; c += mask[(size_t)y * W + x];
@@ -814,7 +816,7 @@ int cmd_ink_ensemble(int argc, char **argv) {
                 int ov = 0; for (int q = 0; q < got && !ov; q++) ov = abs(x - px[q]) < pw && abs(y - py[q]) < pw;
                 if (ov) continue;
                 const size_t a = (size_t)y * (W + 1) + x, b = a + pw, c = a + (size_t)pw * (W + 1), d = c + pw;
-                const double cnt = C[d] - C[b] - C[c] + C[a]; if (cnt < 0.5 * pw * pw) continue;
+                const double cnt = C[d] - C[b] - C[c] + C[a]; if (cnt < pcov * pw * pw) continue;
                 const double m = (I[d] - I[b] - I[c] + I[a]) / cnt; if (m > best) { best = m; bx = x; by = y; }
             }
             if (bx < 0) break;
