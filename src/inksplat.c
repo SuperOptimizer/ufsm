@@ -456,6 +456,14 @@ int inksplat_run(const inksplat_cfg *c) {
     G.lab = malloc((size_t)G.lw * G.lh); G.msk = has_mask ? malloc((size_t)G.lw * G.lh) : nullptr;
     if (!G.lab || (has_mask && !G.msk)) goto out0;
     if (lsrc_read(&LL, G.lr0, G.lc0, G.lh, G.lw, G.lab, c->threads) || (has_mask && lsrc_read(&LM, G.lr0, G.lc0, G.lh, G.lw, G.msk, c->threads))) goto out1;
+    {   /* 0/1 rasters (e.g. scrollprize ink_9um labels and masks) -> 0/255 */
+        uint8_t *R[2] = {G.lab, G.msk}; const size_t np = (size_t)G.lw * G.lh;
+        for (int k = 0; k < 2; k++) { if (!R[k]) continue; uint8_t mx = 0; for (size_t i = 0; i < np; i++) if (R[k][i] > mx) mx = R[k][i];
+            uint64_t h[256] = {0}; for (size_t i = 0; i < np; i++) h[R[k][i]]++;
+            char hs[512]; int o = 0, nv = 0; for (int v = 0; v < 256 && o < 400; v++) if (h[v]) { nv++; if (nv <= 8) o += snprintf(hs + o, sizeof hs - o, " %d:%llu", v, (unsigned long long)h[v]); }
+            fprintf(stderr, "ink-splat: %s values (%d distinct):%s%s\n", k ? "mask" : "labels", nv, o ? hs : "", nv > 8 ? " .." : "");
+            if (mx == 1) { for (size_t i = 0; i < np; i++) R[k][i] *= 255; fprintf(stderr, "ink-splat: %s is 0/1, read as 0/255\n", k ? "mask" : "labels"); } }
+    }
     uint64_t nsup = 0, nink = 0;
     for (size_t k = 0; k < (size_t)G.lw * G.lh; k++) if (!G.msk || G.msk[k] >= 128) { nsup++; nink += G.lab[k] >= 128; }
     const double px_um = F * (S.vox_um > 0 ? S.vox_um : c->ct_um), cm2 = 1e-8 * px_um * px_um;
