@@ -17,7 +17,7 @@
 
    A pyramid target has levels named by voxel size in um; level l of the CT (2^l x um) is matched to the
    target level with that voxel size. Optional per source: "min_level" / "max_level" (levels drawn), "geometry": 0 (no spatial
-   augmentation), and per target "encoding": "binary" | "prob". A regions target is a set of single-level arrays at CT level 0,
+   augmentation), and per target "encoding": "binary" | "prob" | "prob254" (p * 254, 255 = unknown). A regions target is a set of single-level arrays at CT level 0,
    each covering [origin, origin + size). Channels: 0 = recto, 1 = sheet (m7 whole-sheet band). */
 #pragma once
 #include "store.h"
@@ -75,6 +75,8 @@ typedef struct {
                                               thickness: e.g. a thick pseudo-label band eroded to the published labels' width) */
     int tgt_prob[NCH];        /* "encoding": "prob": bytes are round(p * 255) (teacher probabilities, no ignore class); read as
                                  round(p * 254) and passed through without erode / dilate / soft / trust band */
+    int tgt_prob254[NCH];     /* "encoding": "prob254" (tgt_prob set too): bytes already p * 254 with 255 = unknown (ufsm ink-splat), read as
+                                 stored, so unknown stays ignored */
     regions *reg[NCH];
     z3 **reg_z[NCH];        /* lazily opened region arrays */
     z3 *reg_shared[NCH];    /* the shared array when reg[ch]->array is set */

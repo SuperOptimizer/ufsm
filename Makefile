@@ -28,6 +28,7 @@ SRC += src/fblend.c
 SRC += src/render.c src/imgops.c
 SRC += src/repack.c
 SRC += src/wload.c src/inkext.c src/inkext_net.c
+SRC += src/inksplat.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
@@ -175,6 +176,10 @@ test-all: $(B)/test_fit_w4
 $(B)/test_repair: tests/test_repair.c $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_repair
+
+$(B)/test_ink_splat: tests/test_ink_splat.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_ink_splat
 
 $(B)/test_imgops: tests/test_imgops.c tests/test_imgops_expected.h $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_imgops.c $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o -o $@ $(LDLIBS)
@@ -353,6 +358,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_repair
 	./$(B)/test_tiffw
 	./$(B)/test_imgops
+	./$(B)/test_ink_splat
 	./$(B)/test_pyports
 	./$(B)/test_edt
 	./$(B)/test_volcomp

@@ -61,6 +61,7 @@ int cmd_tifxyz_map(int argc, char **argv);
 int cmd_tifxyz_orient(int argc, char **argv);
 int cmd_png2jpg(int argc, char **argv);
 int cmd_phase_score(int argc, char **argv);
+int cmd_ink_splat(int argc, char **argv);   /* src/inksplat.c */
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
@@ -106,6 +107,7 @@ static int usage(void) {
         "  ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif ..   CT | ink panels (half-res JPEG) + ink statistics per render\n"
         "  ufsm ink-ext --model v8in|hecate24|hecate96|reader3 --weights W --surface TIFXYZ --ct ROOT KEY --out DIR   external ink networks on a surface\n"
         "  ufsm ink-ensemble <out.tif> --ink [W:]INK.tif ..   per-model percentile-stretched weighted mean of ink renders\n"
+        "  ufsm ink-splat <out-group> --surface TIFXYZ --labels L [--mask M] --ct ROOT KEY --ct-um U --iso I [--band -4,4] ..   published 2D ink labels -> sparse 3D label zarr\n"
         "  ufsm wl-dump <weights> [key]   the tensors of a safetensors / torch zip weight file\n"
         "  ufsm png2jpg <in.png> <out.jpg> [--half]   PNG -> JPEG q90 (half: Pillow BOX halved)\n"
         "  ufsm phase-score <pc-dir> <ps-dir> [<sheets-dir>]   on-recto score of pc / ps renders on surfaces (per seam class with sheets)\n"
@@ -3224,6 +3226,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "tifxyz-scale")) return cmd_tifxyz_scale(argc, argv);
     if (!strcmp(cmd, "ink-compare")) return cmd_ink_compare(argc, argv);
     if (!strcmp(cmd, "ink-ext")) return cmd_ink_ext(argc, argv);
+    if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
     if (!strcmp(cmd, "ink-ensemble")) return cmd_ink_ensemble(argc, argv);
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);
     if (!strcmp(cmd, "tifxyz-map")) return cmd_tifxyz_map(argc, argv);

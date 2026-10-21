@@ -113,7 +113,8 @@ sources *sources_load(const char *path) {
             if (!t) continue;
             if (t->type == J_STR) { s->tgt_key[c] = strdup(t->str); continue; }
             s->tgt_binary[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "binary");
-            s->tgt_prob[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "prob");
+            s->tgt_prob254[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "prob254");   /* p * 254, 255 = unknown: read as stored */
+            s->tgt_prob[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "prob") || s->tgt_prob254[c];
             s->tgt_votes[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "side-votes");
             s->tgt_side[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "side") || s->tgt_votes[c];
             if (s->tgt_votes[c]) {   /* src/votes.h: a side array is a vote array of one set, so either kind of array works here */
@@ -474,7 +475,7 @@ int source_read_target(source *s, int ch, int level, const int64_t o[3], const i
         const size_t nv = (size_t)n[0] * n[1] * n[2]; const uint8_t *lut = s->tgt_vote_lut[ch];
         for (size_t k = 0; k < nv; k++) out[k] = lut[out[k]];
     }
-    if (!rc && s->tgt_prob[ch]) {   /* p * 255 -> p * 254: 255 is the ignore code downstream */
+    if (!rc && s->tgt_prob[ch] && !s->tgt_prob254[ch]) {   /* p * 255 -> p * 254: 255 is the ignore code downstream */
         size_t nv = (size_t)n[0] * n[1] * n[2];
         for (size_t k = 0; k < nv; k++) out[k] = (uint8_t)((out[k] * 254 + 127) / 255);
     }

@@ -73,6 +73,18 @@ static void pool2_mean(const uint8_t *in, int n, uint8_t *out) {
     }
 }
 
+/* known-max (ink-splat): the largest known value of the cell, 255 (unknown) only when all eight are unknown, so thin sparse
+   label bands survive at coarse levels (the sampler's occupancy index reads the coarsest one) */
+static void pool2_knownmax(const uint8_t *in, int n, uint8_t *out) {
+    int h = n / 2; size_t plane = (size_t)n * n;
+    for (int z = 0; z < h; z++) for (int y = 0; y < h; y++) for (int x = 0; x < h; x++) {
+        const uint8_t *p = in + ((size_t)(2 * z) * n + 2 * y) * n + 2 * x;
+        const uint8_t v[8] = {p[0], p[1], p[n], p[n + 1], p[plane], p[plane + 1], p[plane + n], p[plane + n + 1]};
+        int m = -1; for (int i = 0; i < 8; i++) if (v[i] != 255 && v[i] > m) m = v[i];
+        out[((size_t)z * h + y) * h + x] = m < 0 ? 255 : (uint8_t)m;
+    }
+}
+
 /* Preserve every surface touched by a 2x2x2 cell. All pyramid levels stay binary. */
 static void pool2_mask(const uint8_t *in, int n, uint8_t *out) {
     int h = n / 2; size_t plane = (size_t)n * n;
@@ -90,7 +102,7 @@ static void bl_shard(int si, int tid, void *ud) {
     int shard = j->shard;
     int64_t sx = si % j->ns[2], sy = (si / j->ns[2]) % j->ns[1], sz = si / (j->ns[2] * j->ns[1]);
     size_t sv = (size_t)shard * shard * shard;
-    const int fill = j->labels == 1 ? 255 : 0;
+    const int fill = j->labels == 1 || j->labels == 3 ? 255 : 0;
     uint8_t *out = malloc(sv), *in = malloc(sv), *piece = malloc(sv / 8);
     memset(out, fill, sv);
     int any = 0;
@@ -103,7 +115,7 @@ static void bl_shard(int si, int tid, void *ud) {
         if (!pres) continue;
         if (z3_read(j->zp, o, n, in, j->nthreads)) { fprintf(stderr, "build_level: read: %s\n", z3_error()); atomic_store(&j->failed, 1); break; }
         if (j->labels == 2) pool2_mask(in, shard, piece);
-        else if (j->labels == 1) pool2_labels(in, shard, piece); else pool2_mean(in, shard, piece);
+        else if (j->labels == 1) pool2_labels(in, shard, piece); else if (j->labels == 3) pool2_knownmax(in, shard, piece); else pool2_mean(in, shard, piece);
         int h = shard / 2;
         for (int z = 0; z < h; z++) for (int y = 0; y < h; y++)
             memcpy(out + ((size_t)(oz * h + z) * shard + (oy * h + y)) * shard + ox * h, piece + ((size_t)z * h + y) * h, (size_t)h);
@@ -115,7 +127,7 @@ static void bl_shard(int si, int tid, void *ud) {
 }
 
 int pyramid_build_level(const char *group_dir, double um0, int l, const int64_t shape0[3], int shard, float q, int labels, int nthreads, const char *attrs) {
-    const int fill = labels == 1 ? 255 : 0;
+    const int fill = labels == 1 || labels == 3 ? 255 : 0;
     char cur[1400], lv[32];
     z3w_level_name(um0 * (1 << l), lv, sizeof lv);
     snprintf(cur, sizeof cur, "%s/%s", group_dir, lv);
