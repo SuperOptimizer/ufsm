@@ -2027,11 +2027,11 @@ fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap)
 }
 
 /* ---- grid evaluation of a fit set on the GPU ---- */
-struct fit_set_dev { int nm; fit_dev *hm, *dm; void *buf[5 * 65]; int nb; float *out; size_t outn; fit_grid_row *rows; int nrows; };
+struct fit_set_dev { int nm; fit_dev *hm, *dm; void **buf; int nb; float *out; size_t outn; fit_grid_row *rows; int nrows; };
 static void *dev_copy(fit_set_dev *g, const void *src, size_t n) { void *d = nn_malloc(n ? n : 4); if (n) nn_h2d(d, src, n); g->buf[g->nb++] = d; return d; }
 fit_set_dev *fit_set_upload(const fit_set *s) {
-    if (s->n + 1 > 64) { fprintf(stderr, "fit_set_upload: at most 63 slabs\n"); return nullptr; }
-    fit_set_dev *g = calloc(1, sizeof *g); g->nm = s->n + 1; g->hm = calloc(g->nm, sizeof(fit_dev));
+    if (s->n + 1 > 4096) { fprintf(stderr, "fit_set_upload: at most 4095 slabs\n"); return nullptr; }
+    fit_set_dev *g = calloc(1, sizeof *g); g->nm = s->n + 1; g->hm = calloc(g->nm, sizeof(fit_dev)); g->buf = calloc((size_t)5 * g->nm + 1, sizeof *g->buf);   /* (5 arrays per model, the model table) */
     for (int k = 0; k < g->nm; k++) {
         const fit_model *m = k < s->n ? s->slab[k] : s->global; fit_dev *d = &g->hm[k];
         const int na = (int)(m->D * m->h) + 1;
@@ -2048,7 +2048,7 @@ void fit_set_dev_free(fit_set_dev *g) {
     for (int k = 0; k < g->nb; k++) nn_free(g->buf[k]);
     if (g->out) nn_free(g->out);
     if (g->rows) nn_free(g->rows);
-    free(g->hm); free(g);
+    free(g->hm); free(g->buf); free(g);
 }
 static fit_grid_row set_row(const fit_set *s, double z) {   /* the models of box-local z, as fit_set_W */
     fit_grid_row r = {s->n, s->n, (float)z, 0.f, 0.f, 0.f};

@@ -125,6 +125,7 @@ static int usage(void) {
         "  ufsm surf-stats <wraps-dir> --fields DIR [--ct ROOT KEY --ct-um U]   label-free surface quality (phase, switches, CT)\n"
         "  ufsm self-gate <wraps-dir> <out-dir> --fields DIR --model FIT [--ct ..] [--nb FIT].. [--exclude ..]   strict stretches of a box fit -> label tifxyz + q.tif\n"
         "  ufsm ct-fields <ct-root> <key> <fields-dir> --ct-um U   CT planes ct / cs of a fit-field directory (fit --w-ct / --w-cspacing)\n"
+        "  ufsm fit-join <out-set> <fields-dir> <slab-model> <z0> <z1> ...   independent z-slab fits -> one fit set, gauges matched on the overlaps\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..]  several models' fit fields averaged (phase: confidence-weighted complex mean)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
@@ -839,16 +840,16 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
            nd ? (double)right / nd : 0, nd ? (double)close / nd : 0, na2 ? med : 0, na2 ? p90 : 0);
     if (nan) printf("  %zu labelled voxels without U (%.4f of those in the box), not scored\n", nan, (double)nan / (nan + nd));
     if (detail && ndet) {
-        size_t ie[8][9] = {{0}}, re[64][9] = {{0}};   /* integer error -4..4 by z octile / by 250 um radius bin (up to 16 mm) */
+        size_t ie[8][9] = {{0}}, re[256][9] = {{0}};   /* integer error -4..4 by z octile / by 250 um radius bin (up to 64 mm) */
         for (size_t i = 0; i < ndet; i++) {
             double e = dd[i].d - mode - mean; e -= 14 * round(e / 14); const int k = (int)lround(e);
             if (k < -4 || k > 4) continue;
-            ie[dd[i].z][k + 4]++; if (dd[i].r < 64) re[dd[i].r][k + 4]++;
+            ie[dd[i].z][k + 4]++; re[dd[i].r][k + 4]++;
         }
         printf("  integer error -2 -1 0 +1 +2 (fractions):\n");
         for (int zb = 0; zb < 8; zb++) { size_t t = 0; for (int k = 0; k < 9; k++) t += ie[zb][k]; if (!t) continue;
             printf("    z octile %d %9zu voxels: %.3f %.3f %.3f %.3f %.3f\n", zb, t, (double)ie[zb][2] / t, (double)ie[zb][3] / t, (double)ie[zb][4] / t, (double)ie[zb][5] / t, (double)ie[zb][6] / t); }
-        for (int rb = 0; rb < 64; rb += 2) { size_t t = 0, c[9] = {0}; for (int k = 0; k < 9; k++) { c[k] = re[rb][k] + (rb + 1 < 64 ? re[rb + 1][k] : 0); t += c[k]; } if (t < 1000) continue;
+        for (int rb = 0; rb < 256; rb += 2) { size_t t = 0, c[9] = {0}; for (int k = 0; k < 9; k++) { c[k] = re[rb][k] + (rb + 1 < 256 ? re[rb + 1][k] : 0); t += c[k]; } if (t < 1000) continue;
             printf("    radius %5.1f-%4.1f mm %9zu voxels: %.3f %.3f %.3f %.3f %.3f\n", rb * 0.25, rb * 0.25 + 0.5, t, (double)c[2] / t, (double)c[3] / t, (double)c[4] / t, (double)c[5] / t, (double)c[6] / t); }
     }
     free(dd); free(ah); free(hist); free(fine);
@@ -3235,6 +3236,7 @@ static int cmd_sample(int argc, char **argv) {
 }
 
 int cmd_repack(int argc, char **argv);   /* src/repack.c */
+int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "train")) return cmd_train(argc, argv);
     if (argc < 3) return usage();
@@ -3256,6 +3258,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "eval")) return cmd_eval(argc, argv);
     if (!strcmp(cmd, "band")) return cmd_band(argc, argv);
     if (!strcmp(cmd, "fit")) return cmd_fit(argc, argv);
+    if (!strcmp(cmd, "fit-join")) return cmd_fit_join(argc, argv);
     if (!strcmp(cmd, "convert-unwrap2")) return cmd_convert_unwrap2(argc, argv);
     if (!strcmp(cmd, "repack")) return cmd_repack(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
