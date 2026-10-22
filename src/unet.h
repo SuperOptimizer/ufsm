@@ -7,7 +7,8 @@
 #include <stdint.h>
 
 #define UNET_MAXLEV 8
-#define UNET_MAXCONV 160   /* 3^3 convs (encoder, down, decoder, residual blocks) */
+#define UNET_MAXCONV 160   /* 3^3 convs (encoder, down, decoder, residual blocks) + the attention stage's linear layers */
+#define UNET_MAXTB 16      /* cfg.attn_blocks */
 
 typedef struct {
     int nlev;
@@ -45,6 +46,14 @@ typedef struct {
                               the convs reading SiLU outputs with the NF-net gain 1 / std(silu(z))), 4 slab (GroupNorm statistics per
                               z-slab of l0_slab planes: no whole-window reduction). Tensor-core and fp32 paths (slab: MX or fp32 storage) */
     int l0_slab;           /* l0_norm 4: planes per slab (0: 64; the level-0 depth a multiple of it) */
+    int attn_blocks;       /* transformer blocks on the bottleneck level's output (src/attn.h; 0 = none, the default): its raw output x (the
+                              conv / residual-block a2) becomes x + PE(x) -> attn_blocks pre-LN blocks (MHSA with QK-norm, heads of 48, SwiGLU,
+                              fp32 residual, zero-initialised out projections: a fresh stage is the identity) -> the stage's a2, whose
+                              GroupNorm (the bottleneck's n2 parameters, statistics of the new a2) feeds the decoder. Width % 48 == 0.
+                              Parameters appended last (older layouts unchanged); the linear weights train with Muon */
+    int attn_pe;           /* 0 PEG (zero-initialised depthwise 3^3 conv on the token grid before the first block), 1 axial 3D RoPE, 2 none */
+    int attn_reg;          /* register tokens per sample (learned, prepended; outputs dropped) */
+    int attn_mlp;          /* SwiGLU hidden width (0: 8/3 width rounded up to 32) */
 } unet_cfg;
 static inline int unet_hr_div(int hr) { return hr >= 3 ? 4 : hr ? 2 : 1; }      /* the window voxels per network voxel along each axis */
 static inline int unet_hr_mode(int hr) { return hr == 2 || hr == 4 ? 2 : 1; }   /* the last stage: 1 pool, 2 pack (nn_half_*) */

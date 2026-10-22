@@ -22,6 +22,36 @@ No teacher models, no distillation. All upstream data is re-exported once into t
   `ufsm dino-embed` writes the dinovol-eval format; `dino-boxes` picks labelled (codes) or papyrus-rich (coarse CT) training boxes.
   tests/test_dino_loss.c checks the loss gradients against double CPU references (D 16 and 32).
 
+## Hybrid conv + attention U-Net: the bottleneck transformer stage (2026-10-22)
+- `unet_cfg.attn_blocks` (train / dino-train `--attn-blocks N --attn-pe peg|rope|none --attn-reg K --attn-mlp F`; default 0 = the
+  plain U-Net, bit for bit). The bottleneck level's raw output x (its last conv / residual block a2, before the GroupNorm the decoder
+  applies) goes to fp32 token rows [n][registers + D H W][C], then x + PEG(x) (a zero-initialised depthwise 3^3 conv on the token grid;
+  `rope`: axial 3D RoPE on q / k instead, 8 frequency pairs per axis, base 100; `none`), then N pre-LN blocks: LayerNorm -> fused QKV ->
+  QK-norm (RMS over each head's 48 dims, a gain per channel) -> softmax attention (heads of 48, all tokens of the window) -> out
+  projection; LayerNorm -> SwiGLU (hidden 8/3 C) -> projection; fp32 residual stream, zero-initialised out projections (a fresh stage is
+  the identity). The result is written back as a new a2 in the activation storage (MX-fp4 in production) with its own GroupNorm
+  statistics; the GroupNorm parameters stay the bottleneck's n2 (stage_out() returns the stage's output block). Width % 48 == 0
+  (dino-train's 192: 4 heads). Parameters appended last (older checkpoints load unchanged); the four linears per block are Muon
+  matrices (for_each_mat: the 3^3 convs + the linears), norms / biases / PEG / registers AdamW; Muon-C / Hyperball refuse the stage.
+- Kernels src/nn_attn.cu (src/attn.h): fp32 throughout. Linears are cuBLASLt fp32 GEMMs (UFSM_ATTN_TF32=1: TF32); attention is a
+  flash-style SIMT kernel (64 queries per block, 32-key shared tiles, online softmax in log2 units) that stores only the per-row
+  log-sum-exp; the backward recomputes the probabilities tile by tile in two kernels (dK / dV per key, dQ per query: no atomics, no
+  S x S matrix). Per-block recomputation: the stage keeps one [T][C] row set per block input; a block's backward re-runs its forward
+  into one shared scratch. Bottleneck tokens: P 256 -> 512, P 384 -> 1728, P 512 -> 4096, P 768 -> 13824 per window (6 levels).
+- Backward hook: d/d(silu(gn(stage a2))) -> the stage's GroupNorm backward -> fp32 -> blocks -> PEG -> d/d x in the gradient storage,
+  handed to the bottleneck block's backward as an already-normalised gradient (block_bwd pre = 1). Gradients stay in the backward's
+  scaled domain (the flat parameter gradient is divided by the gradient scale at the end).
+- Tests: tests/test_attn.c (block input / every parameter gradient vs central differences of a double CPU forward at 66 and 512
+  tokens, 2 and 4 heads, with / without RoPE and registers; attention alone at 4100 tokens vs the double analytic backward; PEG and the
+  layouts), tests/test_hybrid_identity.c (production MX storage: a fresh stage on a conv net's trunk reproduces its logits / trunk
+  gradients up to re-quantisation; a random stage: every stage tensor gets a gradient; checkpoint round trip).
+- dino-train for large windows: `--head-slab Z` runs the 1^3 head per z-slab of Z planes (unet head slabs): no whole-window logits
+  (P 512 at D 32: 8.6 GB of fp16 logits) and no dense fp32 logit gradient (17 GB) -- the points' embeddings are gathered per slab, and
+  in the backward's head step their gradients are scattered into each slab's fp16 logit gradient. `--mem lean` sets train's smallest
+  recompute-1 mode (chunked MX gradients, lean 2, shared encoder a1); `UFSM_MEM_DRY=1` prints the dry-build bytes and exits.
+  `--minutes M` sets the step count from the speed of steps 21..200 (matched wall-time A/Bs). dino-embed `--norm auto`: the box's
+  median / IQR statistics as dino-train computes them for a source.
+
 ## Cleanup 2026-10-20: the dead Python tools removed
 
 Removed (in git history before this commit): every Python tool in `tools/` (the sheet / surface-store / finite-cover

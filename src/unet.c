@@ -1,5 +1,7 @@
 #include "unet.h"
+#include "attn.h"
 #include "checkpoint.h"
+#include "nn_lp.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -207,6 +209,12 @@ struct unet {
     int head_c0, head_nc;                    /* inference builds: only logit channels [c0, c0 + nc) (nc 0: all) */
     int split_side, split_h0;                /* spatial split (unet_set_split): side 0 / 1, level-0 halo planes; h0 0 = off */
     unet_halo_fn split_halo, split_begin, split_end;
+    /* cfg.attn_blocks: the bottleneck transformer stage (src/attn.h). tb is the stage's output block (a2 = the new raw output, m2 / r2 its
+       GroupNorm statistics, n2 = the bottleneck's n2 parameters; no convs of its own); the token rows: tok slot 0 the converted input,
+       slot 1 after the PE (block 0's input), slot k + 1 block k's input, slot tbn + 1 the output */
+    int tbn; at_dims tbd; at_bp tbp[UNET_MAXTB]; convp tbm[UNET_MAXTB][4]; size_t peg_w, peg_b, reg_off;
+    block tb; at_ws tbw; at_geom tbg;
+    float *tb_cs, *tb_tok, *tb_wsb, *tb_g, *tb_gx, *tb_dt, *tb_dt2, *tb_zero;
 };
 
 static int G_of(const unet *u, int c) { return u->cfg.G < c ? u->cfg.G : c; }
@@ -215,7 +223,9 @@ static int G_of(const unet *u, int c) { return u->cfg.G < c ? u->cfg.G : c; }
 static int dw_of(const unet_cfg *c, int i) { return i >= c->nlev - 1 || !c->dec_widths[i] ? c->widths[i] : c->dec_widths[i]; }
 #define UPW(i) dw_of(&u->cfg, (i))
 /* the block whose output is level i's encoder output (skip, down-conv input, bottom): the last residual block, else enc[i] */
-static block *stage_out(unet *u, int i) { return u->cfg.enc_blocks[i] > 0 ? &u->rb[i][u->cfg.enc_blocks[i] - 1] : &u->enc[i]; }
+static block *stage_out0(unet *u, int i) { return u->cfg.enc_blocks[i] > 0 ? &u->rb[i][u->cfg.enc_blocks[i] - 1] : &u->enc[i]; }
+/* (with the attention stage: its output block at the bottom level) */
+static block *stage_out(unet *u, int i) { return u->tbn && i == u->cfg.nlev - 1 ? &u->tb : stage_out0(u, i); }
 
 /* ---- spatial split along z (unet_set_split): this GPU's tensors are its z planes plus 2^(L-1-l) halo planes at level l on the
    side facing the other GPU (h0 = 2^(L-1) at level 0, so every level keeps the stride-2 parity and the shapes the U-Net needs).
@@ -288,6 +298,25 @@ unet *unet_create(const unet_cfg *cfg) {
     }
     if (cfg->ds_levels < 0 || (cfg->ds_levels > 0 && cfg->ds_levels > L - 2)) { fprintf(stderr, "unet: deep supervision takes decoder levels 1..%d\n", L - 2); abort(); }
     for (int j = 1; j <= cfg->ds_levels; j++) off = add_conv(u, &u->ds[j], dw_of(cfg, j), cfg->cout, 1, 1, off);   /* (params last: older layouts unchanged) */
+    if (cfg->attn_blocks > 0) {   /* the bottleneck transformer stage (params last) */
+        const int C = w[L - 1];
+        if (C % AT_HD || cfg->attn_blocks > UNET_MAXTB || cfg->attn_pe < 0 || cfg->attn_pe > 2 || cfg->attn_reg < 0) {
+            fprintf(stderr, "unet: attention blocks need a bottleneck width that is a multiple of %d (got %d), at most %d blocks, --attn-pe peg|rope|none\n", AT_HD, C, UNET_MAXTB); abort(); }
+        const int F = cfg->attn_mlp > 0 ? cfg->attn_mlp : (8 * C / 3 + 31) / 32 * 32;
+        u->tbd = (at_dims){C, C / AT_HD, F, cfg->attn_pe == 1, cfg->attn_reg, 100.f};
+        if (cfg->attn_pe == 0) { u->peg_w = off; off += (size_t)C * 27; u->peg_b = off; off += (size_t)C; }
+        u->reg_off = off; off += (size_t)cfg->attn_reg * C;
+        for (int k = 0; k < cfg->attn_blocks; k++) {
+            at_bp *bp = &u->tbp[k];
+            off = at_block_layout(&u->tbd, bp, off);
+            u->tbm[k][0] = (convp){C, 3 * C, 1, 1, bp->wqkv, bp->bqkv}; u->tbm[k][1] = (convp){C, C, 1, 1, bp->wo, bp->bo};
+            u->tbm[k][2] = (convp){C, 2 * F, 1, 1, bp->w1, bp->b1}; u->tbm[k][3] = (convp){F, C, 1, 1, bp->w2, bp->b2};
+        }
+        u->tbn = cfg->attn_blocks;
+        block *so = stage_out0(u, L - 1);
+        u->tb.c1 = u->tb.c2 = (convp){C, C, 3, 1, 0, 0};   /* (shapes only: no convs) */
+        u->tb.n1 = u->tb.n2 = so->n2;                      /* the level's output normalisation moves after the stage */
+    }
     u->np = off;
     if (ufsm_env_on("UFSM_DEBUG")) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d c1.w %zu c1.b %zu n1 %zu c2.w %zu c2.b %zu n2 %zu\n", i, u->enc[i].c1.w, u->enc[i].c1.b, u->enc[i].n1.gamma, u->enc[i].c2.w, u->enc[i].c2.b, u->enc[i].n2.gamma);
@@ -365,6 +394,22 @@ void unet_init(unet *u, uint64_t seed) {
         if (!ufsm_env_on("UFSM_RB_NONZERO")) memset(h + b->c2.w, 0, (size_t)b->c2.cout * b->c2.cin * 27 * 4);   /* (tests: random conv2) */
     }
     for (int j = 1; j <= u->cfg.ds_levels; j++) init_conv(h, &u->ds[j], &seed, -2.0);   /* deep-supervision heads, as the main head */
+    if (u->tbn) {   /* attention stage: LN gains / QK-norm gains 1, QKV and MLP-in N(0, 1 / C), out projections, PEG and biases 0 (identity) */
+        const int C = u->tbd.C, F = u->tbd.F;
+        for (int k = 0; k < u->tbn; k++) {
+            const at_bp *bp = &u->tbp[k];
+            for (int c = 0; c < C; c++) h[bp->ln1g + c] = h[bp->ln2g + c] = h[bp->qg + c] = h[bp->kg + c] = 1.f;
+            const double sd = 1.0 / sqrt((double)C);
+            for (size_t i = 0; i < (size_t)3 * C * C; i++) h[bp->wqkv + i] = (float)(sd * gauss(&seed));
+            for (size_t i = 0; i < (size_t)2 * F * C; i++) h[bp->w1 + i] = (float)(sd * gauss(&seed));
+            if (ufsm_env_on("UFSM_ATTN_NONZERO")) {   /* (tests: random out projections) */
+                for (size_t i = 0; i < (size_t)C * C; i++) h[bp->wo + i] = (float)(sd * gauss(&seed));
+                for (size_t i = 0; i < (size_t)C * F; i++) h[bp->w2 + i] = (float)(gauss(&seed) / sqrt((double)F));
+            }
+        }
+        for (size_t i = 0; i < (size_t)u->cfg.attn_reg * C; i++) h[u->reg_off + i] = (float)(0.02 * gauss(&seed));
+        if (u->cfg.attn_pe == 0 && ufsm_env_on("UFSM_ATTN_NONZERO")) for (size_t i = 0; i < (size_t)C * 27; i++) h[u->peg_w + i] = (float)(0.1 * gauss(&seed));
+    }
     nn_h2d(u->p, h, u->np * 4);
     nn_d2d(u->ema, u->p, u->np * 4);
     nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4);
@@ -627,6 +672,13 @@ static void free_acts(unet *u) {
             float *r[7] = {b->a1, b->a2, b->s2, b->m1, b->r1, b->m2, b->r2};
             free_once(r, 7); b->a1 = b->a2 = b->s2 = b->m1 = b->r1 = b->m2 = b->r2 = nullptr;
         }
+    }
+    if (u->tbn) {   /* attention stage */
+        block *b = &u->tb;
+        float *r[15] = {b->a1, b->a2, b->s2, b->m1, b->r1, b->m2, b->r2, u->tb_cs, u->tb_tok, u->tb_wsb, u->tb_zero, u->tb_g, u->tb_gx, u->tb_dt, u->tb_dt2};
+        free_once(r, 15);
+        b->a1 = b->a2 = b->s2 = b->m1 = b->r1 = b->m2 = b->r2 = nullptr;
+        u->tb_cs = u->tb_tok = u->tb_wsb = u->tb_zero = u->tb_g = u->tb_gx = u->tb_dt = u->tb_dt2 = nullptr;
     }
     pp[np++] = u->logits; pp[np++] = u->conv_scratch; pp[np++] = u->rc_extra;
     if (u->rc_extra && !g_dry) nn_storage_forget(u->rc_extra);
@@ -978,6 +1030,30 @@ static void build_acts(unet *u, shape5 xs, int train) {
         const int last = k == u->cfg.enc_blocks[i] - 1;   /* the stage output: a coarse skip placed with the skip offload */
         build_block_acts(u, b, y, train, i == L - 1 && last, nullptr, last && rc && train && sko_on() && i > 0 && i < L - 1 ? SKO_DEFER : nullptr, nullptr);
         b->inx = prev->a2; b->ing = nn_get_tf32() ? &prev->n2 : nullptr; b->inm = prev->m2; b->inr = prev->r2;
+    }
+    if (u->tbn) {   /* attention stage: its output block, fp32 token rows (one set per block input), one block's scratch, gradients */
+        g_mlab = "attention stage";
+        if (!nn_get_tf32() || sp_on(u)) { fprintf(stderr, "unet: attention blocks need the tensor-core path and no spatial split\n"); abort(); }
+        shape5 y = u->ls[L - 1]; y.c = w[L - 1];
+        build_block_acts(u, &u->tb, y, train, 1, nullptr, nullptr, nullptr);
+        const long Sg = (long)shape_spatial(y), T = (long)y.n * (Sg + u->cfg.attn_reg); const int C = w[L - 1];
+        u->tbg = (at_geom){y.n, (int)(Sg + u->cfg.attn_reg), y.d, y.h, y.w};
+        u->tb_cs = dalloc(u, (size_t)y.n * C * Sg);
+        u->tb_tok = dalloc(u, (size_t)(u->tbn + 2) * T * C);
+        const size_t wsb = at_ws_bytes(&u->tbd, T);
+        u->tb_wsb = dalloc(u, wsb / 4 + 1);
+        if (!g_dry) at_ws_carve(&u->tbw, &u->tbd, T, u->tb_wsb);
+        u->tb_zero = dalloc(u, (size_t)(u->cfg.attn_reg + 1) * C);
+        if (!g_dry) nn_zero(u->tb_zero, (size_t)(u->cfg.attn_reg + 1) * C * 4);
+        if (train) {
+            const int gmx = grad_mx8();
+            u->tb_g = gmx ? dalloc_grad_mx(u, nn_mx_bytes(y, grad_dt())) : dalloc_grad(u, shape_numel(y));
+            shape5 yi = y; yi.c = L > 1 ? w[L - 2] : u->cfg.cin;   /* (the bottleneck block's backward leaves d/d its input in this buffer too) */
+            const size_t bx = gmx ? (nn_mx_bytes(y, grad_dt()) > nn_mx_bytes(yi, grad_dt()) ? nn_mx_bytes(y, grad_dt()) : nn_mx_bytes(yi, grad_dt())) : 0,
+                         nx = shape_numel(y) > shape_numel(yi) ? shape_numel(y) : shape_numel(yi);
+            u->tb_gx = gmx ? dalloc_grad_mx(u, bx) : dalloc_grad(u, nx);
+            u->tb_dt = dalloc(u, (size_t)T * C); u->tb_dt2 = dalloc(u, (size_t)T * C);
+        }
     }
     g_mlab = "decoder a1 / a2 / GN stats";
     for (int i = L - 2; i >= 0; i--) {
@@ -2048,6 +2124,42 @@ static void rblock_fwd(unet *u, block *b, int level, block *prev) {
     PROF(3, nn_gn_fwd_silu(b->a2, b->ys, G, 1e-5f, P(u, b->n2.gamma), P(u, b->n2.beta), b->s2, b->m2, b->r2));
 }
 
+/* ---- the attention stage (cfg.attn_blocks, src/attn.h): stored tensors <-> fp32 (grad: the gradient storage), forward, backward ---- */
+static void tb_to_f32(const void *x, shape5 s, int grad, float *y) {
+    const int dt = nn_storage(x); const size_t S = shape_spatial(s);
+    if (dt == 8) lp_mx8_to_f32(x, s.n, s.c, S, y);
+    else if (dt == 4) lp_mx4_to_f32(x, s.n, s.c, S, y);
+    else if (grad ? GBF : ABF) at_h16_to_f32(x, (long long)shape_numel(s), nn_get_f16(), y);
+    else nn_d2d(y, x, shape_numel(s) * 4);
+}
+static void tb_from_f32(const float *x, shape5 s, int grad, void *y) {
+    const int dt = nn_storage(y); const size_t S = shape_spatial(s);
+    if (dt == 8) lp_f32_to_mx8(x, s.n, s.c, S, y);
+    else if (dt == 4) lp_f32_to_mx4(x, s.n, s.c, S, y);
+    else if (grad ? GBF : ABF) nn_f32_to_h16(x, shape_numel(s), y, 1.f);
+    else nn_d2d(y, x, shape_numel(s) * 4);
+}
+#define TB_TOK(u, k) ((u)->tb_tok + (size_t)(k) * (size_t)(u)->tbg.nseq * (u)->tbg.S * (u)->tbd.C)
+/* the bottleneck's raw output x -> PE -> blocks -> tb.a2 (the level's output; GroupNorm statistics of the new tensor) */
+static void tb_fwd(unet *u) {
+    const int C = u->tbd.C, nr = u->cfg.attn_reg;
+    block *x = stage_out0(u, u->cfg.nlev - 1), *b = &u->tb;
+    const shape5 ys = b->ys; const long Sg = (long)shape_spatial(ys), T = (long)ys.n * (Sg + nr);
+    PROF(4, tb_to_f32(x->a2, ys, 0, u->tb_cs));
+    at_cs_to_tok(u->tb_cs, TB_TOK(u, 0), P(u, u->reg_off), ys.n, C, Sg, nr);
+    if (u->cfg.attn_pe == 0) at_peg_fwd(TB_TOK(u, 0), TB_TOK(u, 1), P(u, u->peg_w), P(u, u->peg_b), &u->tbg, nr, C);
+    else nn_d2d(TB_TOK(u, 1), TB_TOK(u, 0), (size_t)T * C * 4);
+    for (int k = 0; k < u->tbn; k++) {
+        int r; PROF(0, r = at_block_fwd(&u->tbd, u->fw, &u->tbp[k], TB_TOK(u, k + 1), TB_TOK(u, k + 2), &u->tbg, &u->tbw));
+        if (r) { fprintf(stderr, "unet: attention block forward failed\n"); abort(); }
+    }
+    at_tok_to_cs(TB_TOK(u, u->tbn + 1), u->tb_cs, ys.n, C, Sg, nr);
+    PROF(4, tb_from_f32(u->tb_cs, ys, 0, b->a2));
+    const int G = G_of(u, C);
+    if (!gn_frozen(u) && nn_gn_stats(b->a2, ys, G, 1e-5f, b->m2, b->r2)) { fprintf(stderr, "unet: attention stage GroupNorm statistics unsupported for this storage\n"); abort(); }
+    if (b->s2) PROF(3, nn_gn_silu_apply(b->a2, ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2));
+}
+
 static int l0st_want(const unet *u);   /* the level-0 slab stream (stage S3; after the backward) */
 static int l0h_on(const unet *u);     /* its head per slab (stage S4) */
 static const float *l0st_fwd_enc(unet *u, const float *x);
@@ -2146,6 +2258,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
             u->dn_out = 1;
         }
         for (int k = 0; k < u->cfg.enc_blocks[i]; k++) { nn_set_layer(i); nn_set_block(1 + k); rblock_fwd(u, &u->rb[i][k], i, k ? &u->rb[i][k - 1] : &u->enc[i]); nn_set_block(0); }
+        if (i == L - 1 && u->tbn) tb_fwd(u);
         block *so = stage_out(u, i);
         cur = so->s2;
         if (i < L - 1) {
@@ -2317,6 +2430,25 @@ static void gn_bwd_b(unet *u, const block *b, int k, const float *x, shape5 s, i
     nn_gn_bwd(t0, ps, G, gamma, u->l0s_st + 8 * u->l0s_nng, u->l0s_st + 9 * u->l0s_nng, t1, t2, gg, gb, scratch);
     nn_gn_apply(t2, ps, G, one, zero, u->l0s_st + 8 * u->l0s_nng, l0s_stat(u, (block *)b, k, 1), t2);   /* d/dx = rstd(slab) d/dx' */
     nn_slab_perm(gx, t2, s, S, 1);
+}
+/* d/d (the level output silu(gn(tb.a2))) -> d/d (the bottleneck's raw output x), in the gradient storage (block_bwd's pre = 1 input) */
+static float *tb_bwd(unet *u, const float *gy) {
+    const int C = u->tbd.C, nr = u->cfg.attn_reg, G = G_of(u, C);
+    block *b = &u->tb; float *g = u->g;
+    const shape5 ys = b->ys; const long Sg = (long)shape_spatial(ys);
+    PROF(3, gn_silu_bwd_b(u, b, 2, b->a2, ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, u->tb_g, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));
+    PROF(4, tb_to_f32(u->tb_g, ys, 1, u->tb_cs));
+    at_cs_to_tok(u->tb_cs, u->tb_dt, u->tb_zero, ys.n, C, Sg, nr);
+    for (int k = u->tbn - 1; k >= 0; k--) {
+        int r; PROF(1, r = at_block_bwd(&u->tbd, u->fw, g, &u->tbp[k], TB_TOK(u, k + 1), u->tb_dt, &u->tbg, &u->tbw));
+        if (r) { fprintf(stderr, "unet: attention block backward failed\n"); abort(); }
+    }
+    float *d = u->tb_dt;
+    if (u->cfg.attn_pe == 0) { at_peg_bwd(TB_TOK(u, 0), u->tb_dt, u->tb_dt2, P(u, u->peg_w), g + u->peg_w, g + u->peg_b, &u->tbg, nr, C); d = u->tb_dt2; }
+    at_reg_grad(d, g + u->reg_off, ys.n, C, Sg, nr);
+    at_tok_to_cs(d, u->tb_cs, ys.n, C, Sg, nr);
+    PROF(4, tb_from_f32(u->tb_cs, ys, 1, u->tb_gx));
+    return u->tb_gx;
 }
 static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *gx2, int pre, const float *gid, float *save);
 static float *block_bwd(unet *u, block *b, int level, const float *gy, float *gx2, int pre, const float *gid, float *save) {
@@ -3105,6 +3237,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
         if (i == 0 && u->xin_shared && !u->a0_share) nn_stream_wait(0, u->ev_xin[3]);
         if (i > 0 && u->dno) nn_stream_wait(0, u->ev_dn[i - 1][3]);   /* its input back from the host */
         int pre = 0; const float *gid = nullptr;
+        if (i == L - 1 && u->tbn) { nn_set_layer(i); nn_set_conv(1); gy = tb_bwd(u, gy); pre = 1; }   /* the attention stage: gy = d/d (the bottleneck's raw output) */
         if (u->cfg.enc_blocks[i] > 0) {   /* back through the residual blocks (last first); each saves d/d x_k, the identity gradient of x_{k-1} */
             shape5 ys = u->ls[i]; ys.c = w[i];
             for (int k = u->cfg.enc_blocks[i] - 1; k >= 0; k--) {
@@ -3171,6 +3304,7 @@ static void wq_adamw(unet *u, float lr, float b1, float b2, float eps, float wd,
 static void wq_ema(unet *u, float decay);
 void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step) { if (u->wq) wq_adamw(u, lr, b1, b2, eps, wd, step); else nn_adamw(u->p, u->g, u->m, u->v, u->np, lr, b1, b2, eps, wd, step); }
 static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg);
+static void for_each_mat(unet *u, void (*fn)(unet *, const convp *, void *), void *arg);   /* the Muon matrices: the 3^3 convs + the attention linears */
 /* Conv traversal follows graph order, not parameter offsets. Sort weight intervals before
    updating the complementary biases, norms and head, so each parameter has one owner. */
 typedef struct { const convp *c[UNET_MAXCONV]; int n; } conv_list;
@@ -3178,7 +3312,7 @@ static void collect_conv(unet *u, const convp *c, void *arg) {
     (void)u; conv_list *a = arg; a->c[a->n++] = c;
 }
 static void plain_ranges(unet *u, void (*fn)(unet *, size_t, size_t, void *), void *arg) {
-    conv_list a = {0}; for_each_conv3(u, collect_conv, &a);
+    conv_list a = {0}; if (u->wq) for_each_conv3(u, collect_conv, &a); else for_each_mat(u, collect_conv, &a);   /* (packed weights: the 3^3 convs only) */
     for (int i = 1; i < a.n; i++) {
         const convp *c = a.c[i]; int j = i;
         while (j && a.c[j - 1]->w > c->w) { a.c[j] = a.c[j - 1]; j--; }
@@ -3222,7 +3356,7 @@ static void muon_collect(unet *u, const convp *c, void *arg) {
     if (K > b->maxk) b->maxk = K;
 }
 static void muon_table(unet *u, muon_build_t *b) {   /* the descriptor table and its scratch pool, built once (offsets first, then pointers) */
-    for_each_conv3(u, muon_collect, b);
+    for_each_mat(u, muon_collect, b);
     if (u->muon_descs) return;
     float *pool = nn_malloc(b->pool * 4);
     for (int i = 0; i < b->n; i++) { muon_desc_t *d = &b->h[i]; d->X = pool + (uintptr_t)d->X; d->Y = pool + (uintptr_t)d->Y; d->A = pool + (uintptr_t)d->A; d->B = pool + (uintptr_t)d->B; }
@@ -3297,12 +3431,13 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step) {
     if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd, step); return; }   /* packed weights: AdamW only */
     if (!u->muon_mom) { u->muon_mom = nn_malloc(u->np * 4); nn_zero(u->muon_mom, u->np * 4); }
+    if (u->tbn && (u->mx_c || u->mx_hb)) { fprintf(stderr, "unet: Muon-C / Hyperball do not cover the attention blocks' linear layers\n"); abort(); }
     if (u->mx_c || u->mx_hb) {
         muon_build_t b = {0}; muon_table(u, &b);
         muon_ext(u, &b, lr_muon, beta, wd);
     } else if (ufsm_env_on("UFSM_MUON_UNBATCHED")) {   /* reference path: one conv at a time */
         muon_arg a = {lr_muon, beta, wd};
-        for_each_conv3(u, muon_conv, &a);
+        for_each_mat(u, muon_conv, &a);
     } else {
         if (!u->muon_descs) { muon_build_t b = {0}; muon_table(u, &b); }
         nn_muon_batch(u->muon_descs, u->muon_nconv, u->muon_maxco, u->muon_maxk, lr_muon, beta, wd);
@@ -3327,7 +3462,7 @@ void unet_anvil(unet *u, float lr, float wd, int step, int steps, float lr_adam,
     if (!u->anvil_v1) { u->anvil_v1 = nn_malloc(u->np * 4); nn_zero(u->anvil_v1, u->np * 4); }
     if (!u->anvil_descs) {
         anvil_build_t b = {0};
-        for_each_conv3(u, anvil_collect, &b);
+        for_each_mat(u, anvil_collect, &b);
         float *pool = nn_malloc(b.pool * 4); nn_zero(pool, b.pool * 4);
         for (int i = 0; i < b.n; i++) { anvil_desc_t *d = &b.h[i]; d->X = pool + (uintptr_t)d->X; d->Y = pool + (uintptr_t)d->Y; d->A = pool + (uintptr_t)d->A; d->B = pool + (uintptr_t)d->B; d->E = pool + (uintptr_t)d->E; d->R = pool + (uintptr_t)d->R; }
         u->anvil_descs = nn_malloc(sizeof(anvil_desc_t) * (size_t)b.n); nn_h2d(u->anvil_descs, b.h, sizeof(anvil_desc_t) * (size_t)b.n);
@@ -3370,6 +3505,7 @@ static size_t gn_sites(unet *u, void (*fn)(unet *, float *, int, size_t, void *)
     if (u->cfg.down_norm) for (int i = 0; i < L - 1; i++) { GN_SITE(u->dm[i], G_of(u, u->cfg.widths[i])); GN_SITE(u->dr[i], G_of(u, u->cfg.widths[i])); }
     for (int i = L - 2; i >= 0; i--) { block *b = &u->dec[i]; GN_SITE(b->m1, G_of(u, b->c1.cout)); GN_SITE(b->r1, G_of(u, b->c1.cout)); GN_SITE(b->m2, G_of(u, b->c2.cout)); GN_SITE(b->r2, G_of(u, b->c2.cout)); }
     for (int i = 0; i < L; i++) for (int k = 0; k < u->cfg.enc_blocks[i]; k++) { block *b = &u->rb[i][k]; GN_SITE(b->m1, G_of(u, b->c1.cout)); GN_SITE(b->r1, G_of(u, b->c1.cout)); GN_SITE(b->m2, G_of(u, b->c2.cout)); GN_SITE(b->r2, G_of(u, b->c2.cout)); }
+    if (u->tbn) { GN_SITE(u->tb.m2, G_of(u, u->tbd.C)); GN_SITE(u->tb.r2, G_of(u, u->tbd.C)); }   /* (the attention stage's output) */
 #undef GN_SITE
     return off;
 }
@@ -3431,6 +3567,10 @@ static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), v
     for (int i = 0; i < L; i++) { fn(u, &u->enc[i].c1, arg); fn(u, &u->enc[i].c2, arg); }
     for (int i = 0; i < L - 1; i++) { fn(u, &u->down[i], arg); fn(u, &u->dec[i].c1, arg); if (!u->dec[i].single) fn(u, &u->dec[i].c2, arg); }
     for (int i = 0; i < L; i++) for (int k = 0; k < u->cfg.enc_blocks[i]; k++) { fn(u, &u->rb[i][k].c1, arg); fn(u, &u->rb[i][k].c2, arg); }
+}
+static void for_each_mat(unet *u, void (*fn)(unet *, const convp *, void *), void *arg) {
+    for_each_conv3(u, fn, arg);
+    for (int k = 0; k < u->tbn; k++) for (int j = 0; j < 4; j++) fn(u, &u->tbm[k][j], arg);
 }
 static void mask_conv(unet *u, const convp *c, void *arg) { (void)arg; nn_mask24(u->wm + c->w, u->wm + c->w, c->cout, c->cin, c->k * c->k * c->k); }
 static void srste_conv(unet *u, const convp *c, void *arg) { nn_srste24(u->g + c->w, u->live + c->w, c->cout, c->cin, c->k * c->k * c->k, *(float *)arg); }
@@ -3605,6 +3745,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.half_res) fprintf(f, ",\"half_res\":%d", u->cfg.half_res);
     if (u->cfg.w4_2d) fprintf(f, ",\"w4_2d\":%d", u->cfg.w4_2d);
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
+    if (u->cfg.attn_blocks) fprintf(f, ",\"attn_blocks\":%d,\"attn_pe\":%d,\"attn_reg\":%d,\"attn_mlp\":%d", u->cfg.attn_blocks, u->cfg.attn_pe, u->cfg.attn_reg, u->tbd.F);
     if (u->cfg.l0_norm) fprintf(f, ",\"l0_norm\":%d", u->cfg.l0_norm);
     if (u->cfg.l0_norm == 4) fprintf(f, ",\"l0_slab\":%d", u->cfg.l0_slab);
     if (u->cfg.l0_norm == 2) {   /* the running statistics (live weights, EMA weights; l0_site order, [mean G | var G] each) and their state */
@@ -3654,6 +3795,10 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"half_res\":"))) cfg->half_res = atoi(p + 11);
     cfg->w4_2d = (p = strstr(line, "\"w4_2d\":")) ? atoi(p + 8) : 0;
     if ((p = strstr(line, "\"ds_levels\":"))) cfg->ds_levels = atoi(p + 12);
+    if ((p = strstr(line, "\"attn_blocks\":"))) cfg->attn_blocks = atoi(p + 14);
+    if ((p = strstr(line, "\"attn_pe\":"))) cfg->attn_pe = atoi(p + 10);
+    if ((p = strstr(line, "\"attn_reg\":"))) cfg->attn_reg = atoi(p + 11);
+    if ((p = strstr(line, "\"attn_mlp\":"))) cfg->attn_mlp = atoi(p + 11);
     if ((p = strstr(line, "\"dec_convs\":["))) { p += 13; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->dec_convs[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"nparams\":"))) *np = (size_t)atoll(p + 10);
     if ((p = strstr(line, "\"step\":"))) *step = atoi(p + 7);

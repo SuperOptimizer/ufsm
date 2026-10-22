@@ -192,6 +192,12 @@ test-all: $(B)/test_head32
 $(B)/test_dino_loss: tests/test_dino_loss.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dino_loss.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_dino_loss
+$(B)/test_attn: tests/test_attn.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_attn.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_attn
+$(B)/test_hybrid_identity: tests/test_hybrid_identity.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_hybrid_identity.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_hybrid_identity
 $(B)/test_tfx: tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o -o $@ $(LDLIBS)
 test-all: $(B)/test_tfx
@@ -382,6 +388,8 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_dino_loss
 	UFSM_TEST_D=16 ./$(B)/test_dino_loss
 	./$(B)/test_head32
+	./$(B)/test_attn
+	./$(B)/test_hybrid_identity
 	./$(B)/test_ink_splat
 	./$(B)/test_pyports
 	./$(B)/test_edt

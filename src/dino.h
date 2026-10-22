@@ -51,6 +51,14 @@ void dn_emb_std(const float *e, int N, int D, float *out);
 void dn_tile_out(const void *logits, int h16, int P, int D, const uint8_t *ct, int z0, int z1, int y0, int y1, int x0, int x1,
                  int8_t *out, int onz, int ony, int onx, int ooz, int ooy, int oox);
 
+/* head slabs (dino-train --head-slab Z: unet_set_head_ext, no whole-window logits): fp16 slab logits [D][ns] of voxels [vb, vb + ns).
+   dn_gather_z writes only the points inside the slab; dn_scatter_z adds w gscale (ge_i - e_i (e_i . ge_i)) / nrm_i into the fp16 slab
+   logit gradient (half atomics); dn_tile_out_z: dn_tile_out over the slab's planes (z0..z1 in tile planes inside it) */
+void dn_gather_z(const void *lg16, size_t ns, size_t vb, int D, const int *idx, int N, float *e, float *nrm);
+void dn_scatter_z(const float *e, const float *ge, const float *nrm, const int *idx, int N, int D, size_t ns, size_t vb, float w, void *gy16);
+void dn_tile_out_z(const void *lg16, size_t ns, size_t vb, int P, int D, const uint8_t *ct, int z0, int z1, int y0, int y1, int x0, int x1,
+                   int8_t *out, int onz, int ony, int onx, int ooz, int ooy, int oox);
+
 #ifdef __cplusplus
 }
 #endif

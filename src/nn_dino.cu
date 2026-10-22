@@ -376,3 +376,60 @@ __global__ void k_input_axis(float *x, int P, dn_geom g, const float *ayx, float
 extern "C" void dn_input_axis(float *x, int P, dn_geom g, const float *ayx, float rs) {
     k_input_axis<<<nb_of((long long)P * P * P, 256), 256>>>(x, P, g, ayx, rs);
 }
+
+/* ---- head slabs ---- */
+__global__ void k_gather_z(const __half *__restrict__ lg, size_t ns, size_t vb, int D, const int *__restrict__ idx, int N, float *__restrict__ e, float *__restrict__ nrm) {
+    const int i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (i >= N) return;
+    const size_t v = (size_t)idx[i];
+    if (v < vb || v >= vb + ns) return;
+    float y[4]; float s = 0.f; int n = 0;
+    for (int c = lane; c < D; c += 32, n++) { y[n] = __half2float(lg[(size_t)c * ns + v - vb]); s += y[n] * y[n]; }
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    const float r = sqrtf(s), inv = 1.f / fmaxf(r, 1e-6f);
+    n = 0;
+    for (int c = lane; c < D; c += 32, n++) e[(size_t)i * D + c] = y[n] * inv;
+    if (lane == 0) nrm[i] = fmaxf(r, 1e-6f);
+}
+extern "C" void dn_gather_z(const void *lg16, size_t ns, size_t vb, int D, const int *idx, int N, float *e, float *nrm) {
+    if (D > 128) { fprintf(stderr, "dn_gather_z: D %d > 128\n", D); return; }
+    if (N > 0) k_gather_z<<<nb_of((long long)N * 32, 256), 256>>>((const __half *)lg16, ns, vb, D, idx, N, e, nrm);
+}
+__global__ void k_scatter_z(const float *e, const float *ge, const float *nrm, const int *idx, int N, int D, size_t ns, size_t vb, float w, __half *gy) {
+    const int i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (i >= N) return;
+    const size_t v = (size_t)idx[i];
+    if (v < vb || v >= vb + ns) return;
+    float d = 0.f; for (int c = lane; c < D; c += 32) d += e[(size_t)i * D + c] * ge[(size_t)i * D + c];
+    for (int o = 16; o; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+    const float inv = w / nrm[i];
+    for (int c = lane; c < D; c += 32) atomicAdd(&gy[(size_t)c * ns + v - vb], __float2half_rn((ge[(size_t)i * D + c] - e[(size_t)i * D + c] * d) * inv));
+}
+extern "C" void dn_scatter_z(const float *e, const float *ge, const float *nrm, const int *idx, int N, int D, size_t ns, size_t vb, float w, void *gy16) {
+    if (N > 0) k_scatter_z<<<nb_of((long long)N * 32, 256), 256>>>(e, ge, nrm, idx, N, D, ns, vb, w, (__half *)gy16);
+}
+__global__ void k_tile_out_z(const __half *lg, size_t ns, size_t vb, int P, int D, const uint8_t *ct, int z0, int z1, int y0, int y1, int x0, int x1,
+                             int8_t *out, int onz, int ony, int onx, int ooz, int ooy, int oox, int zs) {
+    const long long n = (long long)(z1 - z0) * (y1 - y0) * (x1 - x0);
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        const int x = x0 + (int)(i % (x1 - x0)), y = y0 + (int)((i / (x1 - x0)) % (y1 - y0)), z = z0 + (int)(i / ((long long)(x1 - x0) * (y1 - y0)));
+        const int oz = ooz + z - zs, oy = ooy + y - y0, ox = oox + x - x0;
+        if (oz < 0 || oy < 0 || ox < 0 || oz >= onz || oy >= ony || ox >= onx) continue;
+        const size_t v = ((size_t)z * P + y) * P + x, sv = v - vb;
+        int8_t *o = out + (((size_t)oz * ony + oy) * onx + ox) * D;
+        if (!ct[v]) { for (int c = 0; c < D; c++) o[c] = 0; continue; }
+        float s = 0.f;
+        for (int c = 0; c < D; c++) { const float a = __half2float(lg[c * ns + sv]); s += a * a; }
+        const float inv = 127.f / fmaxf(sqrtf(s), 1e-6f);
+        for (int c = 0; c < D; c++) o[c] = (int8_t)fminf(fmaxf(rintf(__half2float(lg[c * ns + sv]) * inv), -127.f), 127.f);
+    }
+}
+/* the tile's interior planes [z0, z1) of dn_tile_out clipped to the slab: zs (= the interior's first plane z0 of the whole tile) keeps the
+   output offsets of the whole-tile call */
+extern "C" void dn_tile_out_z(const void *lg16, size_t ns, size_t vb, int P, int D, const uint8_t *ct, int z0, int z1, int y0, int y1, int x0, int x1,
+                              int8_t *out, int onz, int ony, int onx, int ooz, int ooy, int oox) {
+    const size_t hw = (size_t)P * P; const int sz0 = (int)(vb / hw), sz1 = (int)((vb + ns) / hw);
+    const int a = z0 > sz0 ? z0 : sz0, b = z1 < sz1 ? z1 : sz1;
+    const long long n = (long long)(b - a) * (y1 - y0) * (x1 - x0);
+    if (n > 0) k_tile_out_z<<<nb_of(n, 256), 256>>>((const __half *)lg16, ns, vb, P, D, ct, a, b, y0, y1, x0, x1, out, onz, ony, onx, ooz, ooy, oox, z0);
+}
