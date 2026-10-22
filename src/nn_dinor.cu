@@ -152,26 +152,30 @@ extern "C" int dr_head_bwd(const dr_head *h, const float *P, float *G, const flo
 }
 
 /* ---- teacher targets ---- */
-extern "C" size_t dr_sk_scratch(int R, int K) { return (al((size_t)K) + al((size_t)R) + 64) * 4; }
+extern "C" size_t dr_sk_scratch(int R, int K) { return (al((size_t)K) + al((size_t)R) + 64) * 4; }   /* (the first 64 bytes: the reductions) */
 __global__ void k_tq(const float *l, float *q, long long n, float tt) {   /* q = exp((l - 1) / tt): cosine-bounded logits (|l| <= g) */
     const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i < n) q[i] = expf((l[i] - 1.f) / tt);
 }
-__global__ void k_maxrow(const float *l, long long n, float *mx) {   /* one block: the global max into mx[0] */
+__device__ __forceinline__ void atomic_max_f(float *a, float v) {   /* (any sign) */
+    if (v >= 0.f) atomicMax((int *)a, __float_as_int(v)); else atomicMin((unsigned *)a, __float_as_uint(v));
+}
+__global__ void k_maxrow(const float *l, long long n, float *mx) {   /* grid-stride blocks, atomic max into mx[0] (set to -inf first) */
     __shared__ float sh[256]; float m = -INFINITY;
-    for (long long i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, l[i]);
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) m = fmaxf(m, l[i]);
     sh[threadIdx.x] = m; __syncthreads();
     for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + k]); __syncthreads(); }
-    if (!threadIdx.x) mx[0] = sh[0];
+    if (!threadIdx.x) atomic_max_f(mx, sh[0]);
 }
+__global__ void k_setf(float *p, float v) { p[0] = v; }
 __global__ void k_tq_m(const float *l, float *q, long long n, float tt, const float *mx) { const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i < n) q[i] = expf((l[i] - mx[0]) / tt); }
-__global__ void k_sum_all(const float *q, long long n, float *out) {   /* one block */
-    __shared__ double sh[256]; double s = 0;
-    for (long long i = threadIdx.x; i < n; i += blockDim.x) s += q[i];
-    sh[threadIdx.x] = s; __syncthreads();
+__global__ void k_sum_all(const float *q, long long n, double *out) {   /* grid-stride, atomic double sum into out[0] (zeroed first) */
+    __shared__ double sh[256]; double v = 0;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) v += q[i];
+    sh[threadIdx.x] = v; __syncthreads();
     for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
-    if (!threadIdx.x) out[0] = (float)sh[0];
+    if (!threadIdx.x) atomicAdd(out, sh[0]);
 }
-__global__ void k_scale_all(float *q, long long n, const float *s) { const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i < n) q[i] /= s[0]; }
+__global__ void k_scale_all(float *q, long long n, const double *s) { const float inv = (float)(1.0 / s[0]); const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i < n) q[i] *= inv; }
 /* per prototype k: sum over the R rows -> q[r][k] /= (sum K) */
 __global__ void k_sk_proto(float *q, int R, int K) {
     const int k = blockIdx.x * blockDim.x + threadIdx.x; if (k >= K) return;
@@ -202,10 +206,13 @@ __global__ void k_softmax_c(const float *l, const float *c, float *q, int K, flo
 extern "C" void dr_teacher_probs(const float *l, int R, int K, float tt, int iters, const float *center, float *q, void *scratch) {
     const long long n = (long long)R * K;
     if (iters <= 0) { k_softmax_c<<<R, 256>>>(l, center, q, K, tt); return; }
-    float *s = (float *)scratch;
-    k_maxrow<<<1, 256>>>(l, n, s + 1);   /* (the global max: exp stays finite for any logit scale; the normalisation removes it) */
-    k_tq_m<<<nbk(n, 256), 256>>>(l, q, n, tt, s + 1);
-    k_sum_all<<<1, 256>>>(q, n, s); k_scale_all<<<nbk(n, 256), 256>>>(q, n, s);
+    double *ds = (double *)scratch; float *mx = (float *)scratch + 4;
+    const unsigned gr = nbk(n, 256) < 1024 ? nbk(n, 256) : 1024;
+    k_setf<<<1, 1>>>(mx, -INFINITY);
+    k_maxrow<<<gr, 256>>>(l, n, mx);   /* (the global max: exp stays finite for any logit scale; the normalisation removes it) */
+    k_tq_m<<<nbk(n, 256), 256>>>(l, q, n, tt, mx);
+    cudaMemsetAsync(ds, 0, 8, 0);
+    k_sum_all<<<gr, 256>>>(q, n, ds); k_scale_all<<<nbk(n, 256), 256>>>(q, n, ds);
     for (int it = 0; it < iters; it++) {
         k_sk_proto<<<nbk(K, 256), 256>>>(q, R, K);
         k_sk_row<<<R, 256>>>(q, R, K, it == iters - 1);

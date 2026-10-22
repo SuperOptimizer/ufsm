@@ -97,14 +97,16 @@ int cmd_dino_halves(int argc, char **argv) {
 #include <unistd.h>
 #include <signal.h>
 
-enum { DN_MAXSRC = 64, DN_MAXBOX = 256, DN_SLOTS = 6 };
+enum { DN_MAXSRC = 128, DN_MAXBOX = 256, DN_SLOTS = 6 };
 typedef struct {
     char name[64]; z3 *ca, *cb, *codes, *ink; int halves; int cscale; float *axz;   /* scroll axis (y, x) per CT plane (sources "axis" + "axis_scale"), or nullptr */   /* CT voxels per code voxel (codes on a coarser grid; 1: the same grid) */
     int64_t org[3];                              /* added to window corners (ct array coordinates) to address the codes (global grid) */
     int nbox; int64_t box[DN_MAXBOX][6]; int nho; int64_t ho[DN_MAXBOX][6];
     double weight, bvol; float center, scale, pap; int64_t shape[3];
+    int ct_only;                                 /* unlabelled (U0): SSL terms only (sampled by the ct_only share) */
+    int32_t *mcell; int64_t nmcell; int mcs;     /* "mask": {"map": RAW, "min": m} (ufsm scanprep): the cells with code >= m (window centres), cell edge */
 } dn_src;
-typedef struct { int P, ngt, nssl, nair, margin; int nsrc; dn_src src[DN_MAXSRC]; double wsum; int ident; int nink; } dn_data;   /* nink: ink points per sample (half ink, half no-ink) */   /* ident: no window geometry (the recipe draws its own views) */
+typedef struct { int P, ngt, nssl, nair, margin; int nsrc; dn_src src[DN_MAXSRC]; double wsum; int ident; int nink; double wsum_l, wsum_u, share_u; char excl[8][64]; int nexcl; } dn_data;   /* share_u: the unlabelled sources' share of the draws (0: by weight over all) */   /* nink: ink points per sample (half ink, half no-ink) */   /* ident: no window geometry (the recipe draws its own views) */
 typedef struct {   /* one sample: two CT views, the geometry, the points (output-space voxel indices) */
     uint8_t *ca, *cb; int si; int64_t corner[3]; dn_geom g; int halves; float *ayx;   /* the axis (y, x) per window plane (window coords; --axis-input) */
     int ngt, nssl; int *gidx, *gcode, *gxyz, *sidx;
@@ -128,13 +130,29 @@ static void geom_map(const dn_geom *g, int P, const int s[3], int o[3]) { for (i
 static int sample_fill(dn_data *D, dn_sample *S, uint64_t *rs, int nthreads, uint8_t *codes_buf) {
     const int P = D->P; const size_t p3 = (size_t)P * P * P;
     for (int tries = 0; tries < 200; tries++) {
-        double r = rng_u(rs) * D->wsum; int si = 0;
-        for (; si < D->nsrc - 1; si++) { r -= D->src[si].weight; if (r < 0) break; }
+        int si = 0;
+        if (D->share_u > 0 && D->wsum_u > 0 && D->wsum_l > 0) {   /* the unlabelled group with probability share_u, then by weight inside the group */
+            const int want_u = rng_u(rs) < D->share_u; double r = rng_u(rs) * (want_u ? D->wsum_u : D->wsum_l); int last = -1;
+            for (si = 0; si < D->nsrc; si++) { if (D->src[si].ct_only != want_u) continue; last = si; r -= D->src[si].weight; if (r < 0) break; }
+            if (si >= D->nsrc) si = last;
+        } else {
+            double r = rng_u(rs) * D->wsum;
+            for (; si < D->nsrc - 1; si++) { r -= D->src[si].weight; if (r < 0) break; }
+        }
         dn_src *s = &D->src[si];
-        double rb = rng_u(rs) * s->bvol; int bi = 0;
-        for (; bi < s->nbox - 1; bi++) { const int64_t *b = s->box[bi]; rb -= (double)b[3] * b[4] * b[5]; if (rb < 0) break; }
-        const int64_t *b = s->box[bi]; int64_t o[3];
-        for (int d = 0; d < 3; d++) o[d] = b[d] + (b[3 + d] > P ? (int64_t)(rng_u(rs) * (double)(b[3 + d] - P + 1)) : 0);
+        int64_t o[3];
+        if (s->mcell) {   /* a mask cell (window centre), jittered inside the cell; the window clamped into the volume */
+            const int64_t c = (int64_t)(rng_u(rs) * (double)s->nmcell) % s->nmcell;
+            for (int d = 0; d < 3; d++) {
+                const int64_t ctr = (int64_t)s->mcell[3 * c + d] * s->mcs + (int64_t)(rng_u(rs) * s->mcs);
+                int64_t v = ctr - P / 2; if (v > s->shape[d] - P) v = s->shape[d] - P; if (v < 0) v = 0; o[d] = v;
+            }
+        } else {
+            double rb = rng_u(rs) * s->bvol; int bi = 0;
+            for (; bi < s->nbox - 1; bi++) { const int64_t *b = s->box[bi]; rb -= (double)b[3] * b[4] * b[5]; if (rb < 0) break; }
+            const int64_t *b = s->box[bi];
+            for (int d = 0; d < 3; d++) o[d] = b[d] + (b[3 + d] > P ? (int64_t)(rng_u(rs) * (double)(b[3 + d] - P + 1)) : 0);
+        }
         int bad = 0; for (int h = 0; h < s->nho && !bad; h++) bad = box_hit(s->ho[h], o, P);
         if (bad) continue;
         const int64_t n[3] = {P, P, P};
@@ -316,10 +334,15 @@ static int load_sources(const char *path, dn_data *D, int nthreads) {
     for (size_t i = 0; i < arr->n && D->nsrc < DN_MAXSRC; i++) {
         const json *s = json_at(arr, i); dn_src *S = &D->src[D->nsrc]; memset(S, 0, sizeof *S);
         snprintf(S->name, sizeof S->name, "%s", json_str(json_get(s, "name"), "?"));
+        { int skip = 0; for (int e = 0; e < D->nexcl; e++) skip |= strstr(S->name, D->excl[e]) != nullptr || strstr(json_str(json_get(s, "ct"), ""), D->excl[e]) != nullptr;
+          if (skip) { fprintf(stderr, "dino-train: source %s excluded\n", S->name); continue; } }
         const char *root = json_str(json_get(s, "root"), nullptr), *ct = json_str(json_get(s, "ct"), nullptr), *ctb = json_str(json_get(s, "ct_b"), nullptr);
         const char *cache = json_str(json_get(s, "cache"), nullptr);
         if (!root || !ct) { fprintf(stderr, "dino-train: source %zu: root / ct missing\n", i); return -1; }
         store *st = store_open(root);
+        char ctk[1024]; snprintf(ctk, sizeof ctk, "%s", ct);
+        if (json_get(s, "min_level")) snprintf(ctk, sizeof ctk, "%s/%d", ct, (int)json_num(json_get(s, "min_level"), 0));   /* (train's sources: the group + its level) */
+        ct = ctk;
         S->ca = st ? z3_open(st, ct, cache) : nullptr; if (!S->ca) { fprintf(stderr, "dino-train: %s: cannot open %s %s: %s\n", S->name, root, ct, z3_error()); return -1; }
         if (ctb) { S->cb = z3_open(st, ctb, cache); if (!S->cb) { fprintf(stderr, "dino-train: %s: cannot open %s\n", S->name, ctb); return -1; } S->halves = 1; }
         memcpy(S->shape, z3_meta_of(S->ca)->shape, sizeof S->shape);
@@ -343,12 +366,33 @@ static int load_sources(const char *path, dn_data *D, int nthreads) {
         if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n && S->nho < DN_MAXBOX; k++) if (!parse_box(json_at(ho, k), S->ho[S->nho])) S->nho++;
         if (json_get(s, "axis")) { S->axz = load_axis(json_str(json_get(s, "axis"), ""), json_num(json_get(s, "axis_scale"), 1.0), S->shape[0]); if (!S->axz) { fprintf(stderr, "dino-train: %s: cannot read the axis\n", S->name); return -1; } }
         S->weight = json_num(json_get(s, "weight"), 1.0);
+        S->ct_only = (int)json_num(json_get(s, "ct_only"), 0) || !S->codes;
+        const json *mk = json_get(s, "mask");
+        if (mk) {   /* scanprep cell mask: RAW (u8 per cell) + RAW.json {"grid": [z,y,x], "cell": c} */
+            const char *mp = json_str(json_get(mk, "map"), ""); const int mmin = (int)json_num(json_get(mk, "min"), 2);
+            char jp[1100]; snprintf(jp, sizeof jp, "%s.json", mp); FILE *jf = fopen(jp, "rb");
+            if (!jf) { fprintf(stderr, "dino-train: %s: cannot read %s\n", S->name, jp); return -1; }
+            char jb[4096]; const size_t jn = fread(jb, 1, sizeof jb - 1, jf); fclose(jf); jb[jn] = 0;
+            json *mj = json_parse(jb, jn); if (!mj) { fprintf(stderr, "dino-train: %s: bad %s\n", S->name, jp); return -1; }
+            int64_t gd[3]; for (int d = 0; d < 3; d++) gd[d] = (int64_t)json_num(json_at(json_get(mj, "grid"), d), 0);
+            S->mcs = (int)json_num(json_get(mj, "cell"), 32); json_free(mj);
+            const size_t nc = (size_t)gd[0] * gd[1] * gd[2]; uint8_t *m = malloc(nc); FILE *mf = fopen(mp, "rb");
+            if (!mf || fread(m, 1, nc, mf) != nc) { fprintf(stderr, "dino-train: %s: cannot read %s\n", S->name, mp); return -1; }
+            fclose(mf);
+            S->nmcell = 0; for (size_t c = 0; c < nc; c++) S->nmcell += m[c] >= mmin;
+            S->mcell = malloc((size_t)(S->nmcell > 0 ? S->nmcell : 1) * 3 * 4); int64_t k = 0;
+            for (int64_t z = 0; z < gd[0]; z++) for (int64_t y = 0; y < gd[1]; y++) for (int64_t x = 0; x < gd[2]; x++)
+                if (m[(z * gd[1] + y) * gd[2] + x] >= mmin) { S->mcell[3 * k] = (int32_t)z; S->mcell[3 * k + 1] = (int32_t)y; S->mcell[3 * k + 2] = (int32_t)x; k++; }
+            free(m);
+            if (!S->nmcell) { fprintf(stderr, "dino-train: %s: no mask cells\n", S->name); return -1; }
+        }
         S->bvol = 0; for (int k = 0; k < S->nbox; k++) S->bvol += (double)S->box[k][3] * S->box[k][4] * S->box[k][5];
         const json *nm = json_get(s, "norm");
-        if (nm) { S->center = (float)json_num(json_at(nm, 0), 100); S->scale = (float)json_num(json_at(nm, 1), 50); }
+        if (nm && nm->type == J_ARR) { S->center = (float)json_num(json_at(nm, 0), 100); S->scale = (float)json_num(json_at(nm, 1), 50); }
+        else if (nm) { S->center = (float)json_num(json_get(nm, "center"), 100); S->scale = (float)json_num(json_get(nm, "scale"), 50); }   /* (train's form) */
         else box_norm(S->ca, (const int64_t (*)[6])S->box, S->nbox, 12345 + i, nthreads, &S->center, &S->scale);
         S->pap = (float)json_num(json_get(s, "papyrus"), S->center);
-        D->wsum += S->weight;
+        D->wsum += S->weight; if (S->ct_only) D->wsum_u += S->weight; else D->wsum_l += S->weight;
         fprintf(stderr, "dino-train: source %s: %d boxes (%.2f Gvox), %d holdouts, %s, codes %s, weight %g, norm %.1f / %.1f, papyrus > %.0f\n", S->name, S->nbox, S->bvol / 1e9,
                 S->nho, S->halves ? "two views (ct / ct_b)" : "one CT (views by noise)", S->codes ? "yes" : "no", S->weight, S->center, S->scale, S->pap);
         D->nsrc++;
@@ -651,6 +695,31 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     void *hsl = nn_malloc((size_t)ED * HZ * P * P * 2);
     dn_hs HS = {.u = u, .hs = hsl, .Z = HZ, .P = P, .D = ED};
     nn_set_logits_h16(1); unet_set_head_ext(u, 1); unet_set_head_cb(u, dn_head_cb, &HS);
+    /* resume (--resume CKPT, the watchdog relaunch): the network (weights, EMA teacher, optimiser state) from CKPT, the heads from CKPT.heads
+       when their sizes match (a head whose shape changed, or a new one, starts fresh: trunk carried over); queues refill */
+    int step0 = 0;
+    { const char *rp_ = opt(argc, argv, "--resume", nullptr);
+      if (rp_) {
+          step0 = unet_load(u, rp_);
+          if (step0 < 0) { fprintf(stderr, "dino-train --recipe: cannot resume %s (another network configuration?)\n", rp_); return 1; }
+          char hp_[1300]; snprintf(hp_, sizeof hp_, "%s.heads", rp_); FILE *hf = fopen(hp_, "rb");
+          struct { float *p; size_t n; const char *nm; } hs[6] = {{D.p, D.H.n, "dino"}, {D.pt, D.H.n, "dino teacher"}, {wib > 0 ? I.p : nullptr, wib > 0 ? I.H.n : 0, "ibot"}, {wib > 0 ? I.pt : nullptr, wib > 0 ? I.H.n : 0, "ibot teacher"}, {rp, RH.n, "region"}, {ip, IH.n, "ink"}};
+          long fsz = 0; if (hf) { fseek(hf, 0, SEEK_END); fsz = ftell(hf); fseek(hf, 0, SEEK_SET); }
+          size_t want = 0; for (int k = 0; k < 4; k++) want += hs[k].n;
+          if (hf && (size_t)fsz >= want * 4) {
+              for (int k = 0; k < 4; k++) { if (!hs[k].p) continue; float *h = malloc(hs[k].n * 4); if (fread(h, 4, hs[k].n, hf) == hs[k].n) nn_h2d(hs[k].p, h, hs[k].n * 4); free(h); }
+              if ((size_t)fsz >= (want + RH.n * 2 + IH.n * 2) * 4) {   /* region and ink heads (student, teacher) */
+                  float *h = malloc((RH.n > IH.n ? RH.n : IH.n) * 4);
+                  if (fread(h, 4, RH.n, hf) == RH.n) { nn_h2d(rp, h, RH.n * 4); }
+                  if (fread(h, 4, RH.n, hf) == RH.n) { nn_h2d(rpt, h, RH.n * 4); }
+                  if (fread(h, 4, IH.n, hf) == IH.n) { nn_h2d(ip, h, IH.n * 4); }
+                  if (fread(h, 4, IH.n, hf) == IH.n) { nn_h2d(ipt, h, IH.n * 4); }
+                  free(h);
+              }
+              fprintf(stderr, "dino-train --recipe: resumed %s at step %d (heads restored)\n", rp_, step0);
+          } else fprintf(stderr, "dino-train --recipe: resumed %s at step %d; heads file missing or of another shape: heads start fresh\n", rp_, step0);
+          if (hf) fclose(hf);
+      } }
     const shape5 xsg = {1, cfg->cin, P, P, P}, xsl = {1, cfg->cin, PL, PL, PL};
     unet_build(u, xsg, 1); unet_build(ul, xsl, 1);
     /* data ring (sources at the source window, identity geometry) */
@@ -670,8 +739,8 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     const int terms = 2 + 2 * nloc;
     const int prof = getenv("UFSM_REC_PROF") && ufsm_env_on("UFSM_REC_PROF"); double pt[10] = {0}, pt0 = 0;   /* per-phase seconds (synchronising) */
 #define RP(k) do { if (prof) { nn_sync(); const double t_ = dn_now(); if (pt0 > 0) pt[k] += t_ - pt0; pt0 = t_; } } while (0)
-    for (int step = 1; step <= steps && !g_dn_stop; step++) {
-        if (minutes > 0) {
+    for (int step = step0 + 1; step <= steps && !g_dn_stop; step++) {
+        if (minutes > 0 && !step0) {
             if (step == 21) { nn_sync(); t_meas0 = dn_now(); }
             if (step == 201) { nn_sync(); const double ms = (dn_now() - t_meas0) / 180, left = minutes * 60 - (dn_now() - t_loop); steps = 200 + (int)(left / ms); if (steps < 201) steps = 201;
                 fprintf(stderr, "dino-train: %.0f ms/step over steps 21..200 -> %d steps for %.1f minutes\n", ms * 1e3, steps, minutes); if (lf) { fprintf(lf, "budget: %.1f ms/step -> %d steps (%.1f min)\n", ms * 1e3, steps, minutes); fflush(lf); } }
@@ -959,8 +1028,14 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             FILE *hf = fopen(hpth, "wb");
             if (hf) { for (int k = 0; k < (wib > 0 ? 2 : 1); k++) { dn_head *hh = k ? &I : &D; float *h = malloc(hh->H.n * 4);
                           nn_d2h(h, hh->p, hh->H.n * 4); fwrite(h, 4, hh->H.n, hf); nn_d2h(h, hh->pt, hh->H.n * 4); fwrite(h, 4, hh->H.n, hf); free(h); }
+                      if (wib > 0) { float *h = malloc((RH.n > IH.n ? RH.n : IH.n) * 4);   /* then the region and ink heads (student, teacher) */
+                          nn_d2h(h, rp, RH.n * 4); fwrite(h, 4, RH.n, hf); nn_d2h(h, rpt, RH.n * 4); fwrite(h, 4, RH.n, hf);
+                          nn_d2h(h, ip, IH.n * 4); fwrite(h, 4, IH.n, hf); nn_d2h(h, ipt, IH.n * 4); fwrite(h, 4, IH.n, hf); free(h); }
                       fclose(hf); }
-            char lp[1200]; snprintf(lp, sizeof lp, "%s/last.ckpt", outd); unlink(lp); if (symlink(cp + strlen(outd) + 1, lp)) {}
+            char lp[1200]; snprintf(lp, sizeof lp, "%s/last.ckpt", outd);
+            { char prev[1300]; const ssize_t pl = readlink(lp, prev, sizeof prev - 1); const int keep = atoi(opt(argc, argv, "--keep-every", "0"));   /* rotation: the previous checkpoint goes unless a milestone */
+              if (pl > 0 && keep > 0) { prev[pl] = 0; int ps_ = 0; if (sscanf(prev, "step%d.ckpt", &ps_) == 1 && ps_ != step && ps_ % keep) { char a1[2600], a2[2600], a3[2600]; snprintf(a1, sizeof a1, "%s/%s", outd, prev); snprintf(a2, sizeof a2, "%s.heads", a1); snprintf(a3, sizeof a3, "%s.protos", a1); unlink(a1); unlink(a2); unlink(a3); } } }
+            unlink(lp); if (symlink(cp + strlen(outd) + 1, lp)) {}
         }
         if (opt(argc, argv, "--eval", nullptr) && (step % eval_every == 0 || step == steps)) { dn_run_eval(u, argc, argv, step, P, ED, nthreads, 0, 0.f, outd, lf); t_last = dn_now(); }
     }
@@ -1004,6 +1079,8 @@ int cmd_dino_train(int argc, char **argv) {
     const int eval_every = atoi(opt(argc, argv, "--eval-every", "2000")), nthreads = atoi(opt(argc, argv, "--threads", "4")), nwork = atoi(opt(argc, argv, "--workers", "4"));
     const uint64_t seed = strtoull(opt(argc, argv, "--seed", "1"), nullptr, 10);
     dn_data *Dd = calloc(1, sizeof *Dd); Dd->P = P; Dd->ngt = atoi(opt(argc, argv, "--gt-points", "2048")); Dd->nssl = atoi(opt(argc, argv, "--ssl-points", "2048")); Dd->margin = 8; Dd->nair = atoi(opt(argc, argv, "--air-points", "0"));
+    { char *t = strdup(opt(argc, argv, "--exclude-src", "")); for (char *q = strtok(t, ","); q && Dd->nexcl < 8; q = strtok(nullptr, ",")) snprintf(Dd->excl[Dd->nexcl++], 64, "%s", q); free(t); }
+    Dd->share_u = atof(opt(argc, argv, "--unlabelled-share", "0"));   /* the ct_only sources' share of the draws (0: by weight) */
     const int recipe = atoi(opt(argc, argv, "--recipe", "0"));   /* the upstream dinovol recipe (dn_recipe): the sampler reads source windows */
     if (recipe) { Dd->P = atoi(opt(argc, argv, "--source-P", "384")); Dd->ident = 1; Dd->nssl = 0; Dd->nink = atof(opt(argc, argv, "--ink", "0.1")) > 0 ? atoi(opt(argc, argv, "--ink-points", "512")) : 0; }
     if (mkdir(outd, 0755) && errno != EEXIST) { fprintf(stderr, "dino-train: cannot create %s\n", outd); return 1; }

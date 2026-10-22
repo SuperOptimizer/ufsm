@@ -259,8 +259,7 @@ static void mxq_rows(const double *X, int rows, int K, int bits, double *Q) {   
         for (int k = k0; k < k0 + 32 && k < K; k++) { const float v = (float)X[(size_t)r * K + k] * m; Q[(size_t)r * K + k] = ldexp(bits == 4 ? q_e2m1(v) : q_e4m3(v), e); }
     }
 }
-static int test_mx_gemm(int bits, int ta, int tb) {
-    const int M = 70, N = 45, K = 100;
+static int test_mx_gemm(int bits, int ta, int tb, int M, int N, int K) {
     double *A = malloc((size_t)M * K * 8), *B = malloc((size_t)N * K * 8), *Aq = malloc((size_t)M * K * 8), *Bq = malloc((size_t)N * K * 8), *ref = malloc((size_t)M * N * 8), *rf32 = malloc((size_t)M * N * 8);
     for (int i = 0; i < M * K; i++) A[i] = rf(nrand());   /* logical A [M][K], B [N][K] */
     for (int i = 0; i < N * K; i++) B[i] = rf(nrand() * 0.1);
@@ -272,7 +271,7 @@ static int test_mx_gemm(int bits, int ta, int tb) {
     for (int j = 0; j < N; j++) for (int k = 0; k < K; k++) Bs[tb ? (size_t)j * K + k : (size_t)k * N + j] = B[(size_t)j * K + k];
     float *Ad = dev(As, (size_t)M * K), *Bd = dev(Bs, (size_t)N * K), *Cd = nn_malloc((size_t)M * N * 4); nn_zero(Cd, (size_t)M * N * 4);
     int bad = lp_mx_gemm(bits, ta, tb, M, N, K, Ad, Bd, Cd, 0.f) != 0;
-    double *c = host(Cd, (size_t)M * N); char nm[64]; snprintf(nm, sizeof nm, "fp%d %d%d", bits, ta, tb);
+    double *c = host(Cd, (size_t)M * N); char nm[64]; snprintf(nm, sizeof nm, "fp%d %d%d %dx%dx%d%s", bits, ta, tb, M, N, K, M > 256 || N > 256 ? " (packed)" : "");
     printf("mx gemm %s:\n", nm); bad += report("vs quant", c, ref, M * N);
     double e2 = 0, r2 = 0; for (int i = 0; i < M * N; i++) { e2 += (c[i] - rf32[i]) * (c[i] - rf32[i]); r2 += rf32[i] * rf32[i]; }
     printf("    (vs the fp32 product: rel L2 %.3f)\n", sqrt(e2 / r2));
@@ -312,7 +311,7 @@ int main(void) {
     bad += test_block(1, 8, 8, 8, 0, 96, 128, 1, 6);
     bad += test_attn_large(1, 4, 16, 96);
     bad += test_peg();
-    for (int b = 4; b <= 8; b += 4) for (int ta = 0; ta < 2; ta++) for (int tb = 0; tb < 2; tb++) bad += test_mx_gemm(b, ta, tb);
+    for (int b = 4; b <= 8; b += 4) for (int ta = 0; ta < 2; ta++) for (int tb = 0; tb < 2; tb++) { bad += test_mx_gemm(b, ta, tb, 70, 45, 100); bad += test_mx_gemm(b, ta, tb, 300, 520, 100); }
     bad += test_block_mx(8, 0.1); bad += test_block_mx(4, 0.35);
     printf(bad ? "test_attn: %d FAILED\n" : "test_attn: all passed\n", bad);
     return bad != 0;
