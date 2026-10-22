@@ -33,8 +33,44 @@ __global__ void k_lnrow(const __half *__restrict__ x, const float *__restrict__ 
         y[row * C + c] = __float2half_rn(o);
     }
 }
+/* rows of C = 8 G channels: G threads per row (G 4..32), 16-byte loads */
+template <int G> __global__ void k_lnrow_v(const __half *__restrict__ x, const float *__restrict__ w, const float *__restrict__ b, float eps,
+                                          const __half *__restrict__ res, int relu, __half *__restrict__ y, long long M) {
+    constexpr int C = 8 * G;
+    const long long t = blockIdx.x * (long long)blockDim.x + threadIdx.x, row = t / G; const int q = (int)(t % G);
+    const bool ok = row < M;
+    float v[8]; float s = 0.f;
+    if (ok) { const uint4 u = *(const uint4 *)(x + row * C + q * 8); const __half *h = (const __half *)&u; for (int k = 0; k < 8; k++) { v[k] = __half2float(h[k]); s += v[k]; } }
+    else for (int k = 0; k < 8; k++) v[k] = 0.f;
+#pragma unroll
+    for (int o = G / 2; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    const float mean = s / C; float qq = 0.f;
+    for (int k = 0; k < 8; k++) { const float d = v[k] - mean; qq += d * d; }
+#pragma unroll
+    for (int o = G / 2; o; o >>= 1) qq += __shfl_xor_sync(0xffffffffu, qq, o);
+    if (!ok) return;
+    const float rs = rsqrtf(qq / C + eps);
+    __align__(16) __half out[8]; __align__(16) __half rr[8];
+    if (res) *(uint4 *)rr = *(const uint4 *)(res + row * C + q * 8);
+    for (int k = 0; k < 8; k++) {
+        const int c = q * 8 + k;
+        float o = __half2float(__float2half_rn((v[k] - mean) * rs * w[c] + b[c]));
+        if (res) o += __half2float(rr[k]);
+        if (relu) o = fmaxf(o, 0.f);
+        out[k] = __float2half_rn(o);
+    }
+    *(uint4 *)(y + row * C + q * 8) = *(const uint4 *)out;
+}
 extern "C" void dv_layernorm(const void *x, const float *w, const float *b, float eps, const void *res, int relu, void *y, long long M, int C) {
     if (C > 512) { fprintf(stderr, "dv_layernorm: C %d > 512\n", C); return; }
+    const unsigned nb = nb_of(M * (C / 8), 256);
+    switch (C) {
+    case 32: k_lnrow_v<4><<<nb, 256, 0, ST>>>((const __half *)x, w, b, eps, (const __half *)res, relu, (__half *)y, M); return;
+    case 64: k_lnrow_v<8><<<nb, 256, 0, ST>>>((const __half *)x, w, b, eps, (const __half *)res, relu, (__half *)y, M); return;
+    case 128: k_lnrow_v<16><<<nb, 256, 0, ST>>>((const __half *)x, w, b, eps, (const __half *)res, relu, (__half *)y, M); return;
+    case 256: k_lnrow_v<32><<<nb, 256, 0, ST>>>((const __half *)x, w, b, eps, (const __half *)res, relu, (__half *)y, M); return;
+    default: break;
+    }
     k_lnrow<<<nb_of(M * 32, 256), 256, 0, ST>>>((const __half *)x, w, b, eps, (const __half *)res, relu, (__half *)y, M, C);
 }
 
@@ -55,20 +91,19 @@ extern "C" void dv_avgpool2(const void *x, void *y, int D, int H, int W, int C) 
 
 /* ---- mixed 3D RoPE on the q and k parts of qkv [N][3 H 48] (patch tokens n >= P, grid g^3 in z y x order): pair p < 24 of head
    h rotates dims p and p + 24 by 2 pi sum_d coord_d mix[h][p][d], coord = 2 (i + 0.5) / g - 1 (normalize_coords "separate").
-   The angle and its sine / cosine in double (the fast-math sinf is inexact past pi). ---- */
+   Whole turns are removed before the sine / cosine (the fast-math sinf is inexact past pi). ---- */
 __global__ void k_rope(__half *__restrict__ qkv, const float *__restrict__ mix /* [H][24][3] */, int N, int P, int g, int H) {
     const long long total = (long long)(N - P) * H * 24;
     const int ld = 3 * H * 48;
     for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < total; i += (long long)gridDim.x * blockDim.x) {
         const int p = (int)(i % 24); long long t = i / 24; const int h = (int)(t % H); const long long tok = t / H;
         const int ix = (int)(tok % g), iy = (int)((tok / g) % g), iz = (int)(tok / ((long long)g * g));
-        const double cz = 2.0 * ((iz + 0.5) / g) - 1.0, cy = 2.0 * ((iy + 0.5) / g) - 1.0, cx = 2.0 * ((ix + 0.5) / g) - 1.0;
+        const float cz = 2.f * ((iz + 0.5f) / g) - 1.f, cy = 2.f * ((iy + 0.5f) / g) - 1.f, cx = 2.f * ((ix + 0.5f) / g) - 1.f;
         const float *m = mix + ((size_t)h * 24 + p) * 3;
         /* the reference einsum runs in fp32: angle = 2 pi (c . f) with fp32 products */
-        const float af = (float)cz * m[0] + (float)cy * m[1] + (float)cx * m[2];
-        const double ang = 2.0 * 3.14159265358979323846 * (double)af;
-        double sn, cs; sincos(ang, &sn, &cs);
-        const float s = (float)sn, c = (float)cs;
+        const float af = cz * m[0] + cy * m[1] + cx * m[2];
+        const float red = af - rintf(af);   /* whole turns removed: the fast sincos is accurate on [-pi, pi] */
+        float s, c; __sincosf(6.28318530717958648f * red, &s, &c);
         __half *row = qkv + (size_t)(P + tok) * ld + h * 48;
         for (int part = 0; part < 2; part++) {
             __half *r = row + part * H * 48;

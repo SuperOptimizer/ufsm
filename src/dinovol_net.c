@@ -106,7 +106,19 @@ dv_net *dv_load(const char *ckpt) {
         float sb[DV_E];
         for (int i = 0; i < DV_E; i++) sb[i] = g1->data[i] * pb->data[i];
         rc |= conv_of(d, &V->proj, BN("attn.proj.weight"), nullptr, 1, 0, g1->data, sb);
-        { char wq[256]; snprintf(wq, sizeof wq, "backbone.blocks.%d.mlp.fc1.weight", b); rc |= conv_of(d, &V->fc1, wq, BN("mlp.fc1.bias"), 1, 0, nullptr, nullptr); }
+        {   /* fc1 rows interleaved (x1_j, x2_j) for the fused SwiGLU epilogue (XA_GLU) */
+            char wq[256]; snprintf(wq, sizeof wq, "backbone.blocks.%d.mlp.fc1.weight", b);
+            const wl_tensor *w1 = need(d, wq), *b1 = need(d, BN("mlp.fc1.bias"));
+            if (!w1 || !b1) { rc = -1; break; }
+            const int F2 = (int)w1->shape[0], Fh = F2 / 2, K1 = (int)w1->shape[1];
+            float *wi = malloc((size_t)F2 * K1 * 4), *bi = malloc((size_t)F2 * 4);
+            for (int jj = 0; jj < Fh; jj++) {
+                memcpy(wi + (size_t)(2 * jj) * K1, w1->data + (size_t)jj * K1, (size_t)K1 * 4); memcpy(wi + (size_t)(2 * jj + 1) * K1, w1->data + (size_t)(Fh + jj) * K1, (size_t)K1 * 4);
+                bi[2 * jj] = b1->data[jj]; bi[2 * jj + 1] = b1->data[Fh + jj];
+            }
+            rc |= xconv_init(&V->fc1, wi, F2, K1, 1, 1, 1, 1, 1, 1, 0, 0, 0, nullptr, bi);
+            free(wi); free(bi);
+        }
         for (int i = 0; i < DV_E; i++) sb[i] = g2->data[i] * f2b->data[i];
         rc |= conv_of(d, &V->fc2, BN("mlp.fc2.weight"), nullptr, 1, 0, g2->data, sb);
         const wl_tensor *f1 = wl_get(d, BN("mlp.fc1.weight")); if (f1) n->F = (int)f1->shape[0] / 2;
@@ -216,8 +228,7 @@ int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scal
         xt_free(&qkv);
         xt u = xconv_fwd(&V->proj, o, nullptr, XA_NONE); dv_add_half(X, u.p, N * DV_E); xt_free(&u);
         dv_layernorm32(X, V->ln2w, V->ln2b, 1e-5f, h.p, N, DV_E);
-        xt A = xconv_fwd(&V->fc1, h, nullptr, XA_NONE);
-        xt G = xt_new(1, 1, 1, (int)N, n->F); dv_glu(A.p, G.p, N, n->F); xt_free(&A);
+        xt G = xconv_fwd(&V->fc1, h, nullptr, XA_GLU);   /* [N][F]: silu(x1) x2 fused */
         u = xconv_fwd(&V->fc2, G, nullptr, XA_NONE); xt_free(&G); dv_add_half(X, u.p, N * DV_E); xt_free(&u);
     }
     dv_layernorm32(X, n->nw, n->nb, 1e-5f, h.p, N, DV_E);

@@ -213,6 +213,10 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32) conv_igemm(ConvP p) {
         for (int h = 0; h < 2; h++) {
             const long long m = m_base + wm0 + mi * 16 + g + h * 8; if (m >= p.M) continue;
             float v0 = acc[mi][ni][2 * h] * s0 + b0, v1 = acc[mi][ni][2 * h + 1] * s1 + b1;
+            if (p.act & XA_GLU) {   /* channel pair (co, co + 1) = (gate x1_j, value x2_j): y[m][co / 2] = silu(x1) x2 */
+                p.y[(size_t)m * (p.Co / 2) + co / 2] = __float2half_rn(v0 / (1.f + expf(-v0)) * v1);
+                continue;
+            }
             const size_t o = (size_t)m * p.Co + co;
             if (p.act & XA_POSTRES) { v0 = act_f(v0, p.act); v1 = act_f(v1, p.act); }
             if (p.res) { const __half2 r = *(const __half2 *)(p.res + o); v0 += __low2float(r); v1 += __high2float(r); }
@@ -310,15 +314,16 @@ static void conv_launch(const ConvP &p, int co) {
         if (co <= 64) launch1<256, 64, 4, 2, 32, 3>(p, co); else launch1<256, 128, 4, 2, 32, 3>(p, co); break;
     case 4:
         if (co <= 64) launch1<128, 64, 2, 2, 32, 4>(p, co); else if (co <= 128) launch1<128, 128, 2, 2, 32, 4>(p, co); else launch1<128, 256, 2, 4, 32, 4>(p, co); break;
-    default:  /* 8 warps of 32 x 32 / 64 x 32 */
-        if (co <= 64) launch1<128, 64, 4, 2, 32, 3>(p, co); else launch1<128, 128, 2, 4, 32, 3>(p, co); break;
+    default:  /* 8 warps of 32 x 32 / 64 x 32; 4 warps of 32 x 32 for <= 32 outputs (no padded half tile) */
+        if (co <= 32) launch1<128, 32, 4, 1, 32, 3>(p, co);
+        else if (co <= 64) launch1<128, 64, 4, 2, 32, 3>(p, co); else launch1<128, 128, 2, 4, 32, 3>(p, co); break;
     }
 }
 static xt conv_run(const xconv *c, xt x, const xt *res, int act) {
     xt in = x;
     if (c->unfold) in = xunfold(x, c->kw0, c->pw0);
     const int Do = (in.d + 2 * c->pd - c->kd) / c->sd + 1, Ho = (in.h + 2 * c->ph - c->kh) / c->sh + 1, Wo = (in.w + 2 * c->pw - c->kw) / c->sw + 1;
-    xt y = xt_new(in.n, Do, Ho, Wo, c->co);
+    xt y = xt_new(in.n, Do, Ho, Wo, act & XA_GLU ? c->co / 2 : c->co);
     if (in.c != c->ci) fprintf(stderr, "xnet: conv input has %d channels, expected %d\n", in.c, c->ci);
     ConvP p;
     p.x = (const __half *)in.p; p.w = (const __half *)c->w; p.res = res ? (const __half *)res->p : nullptr; p.scale = c->scale; p.bias = c->bias; p.y = (__half *)y.p;

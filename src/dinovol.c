@@ -6,9 +6,11 @@
 #include "zarr3.h"
 #include "z3w.h"
 #include "json.h"
+#include "tiff.h"
 #include <pthread.h>
 #include <sys/stat.h>
 #include <zstd.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
@@ -201,26 +203,50 @@ static zw_shard *zw_get(zw *w, int64_t sz, int64_t sy, int64_t sx) {
     w->nopen++;
     return s;
 }
-/* data [nz][ny][nx](C) at output cell (oz, oy, ox), chunk aligned, nz / ny / nx multiples of the chunk */
-static int zw_put(zw *w, int64_t oz, int64_t oy, int64_t ox, int nz, int ny, int nx, const void *data) {
-    const int c = w->chunk; const size_t vb = (size_t)(w->C ? w->C : 1) * w->esize;
-    for (int az = 0; az < nz; az += c) for (int ay = 0; ay < ny; ay += c) for (int ax = 0; ax < nx; ax += c) {
-        const int64_t gz = oz + az, gy = oy + ay, gx = ox + ax;
-        if (gz >= w->shape[0] || gy >= w->shape[1] || gx >= w->shape[2]) continue;
-        int any = 0;
+/* data [nz][ny][nx](C) at output cell (oz, oy, ox), chunk aligned, nz / ny / nx multiples of the chunk; chunks compressed by worker threads */
+typedef struct { const zw *w; const uint8_t *data; int ny, nx, nch, *co; void **zb; size_t *zn; atomic_int next; } zwjob;
+static void *zw_worker(void *a) {
+    zwjob *J = a; const zw *w = J->w; const int c = w->chunk; const size_t vb = (size_t)(w->C ? w->C : 1) * w->esize;
+    uint8_t *cb = malloc(w->chunk_bytes);
+    for (int k; (k = atomic_fetch_add(&J->next, 1)) < J->nch;) {
+        const int az = J->co[3 * k], ay = J->co[3 * k + 1], ax = J->co[3 * k + 2]; int any = 0;
         for (int z = 0; z < c; z++) for (int y = 0; y < c; y++) {
-            const uint8_t *src = (const uint8_t *)data + ((((size_t)(az + z) * ny) + ay + y) * nx + ax) * vb; uint8_t *dst = w->cbuf + (((size_t)z * c) + y) * c * vb;
+            const uint8_t *src = J->data + ((((size_t)(az + z) * J->ny) + ay + y) * J->nx + ax) * vb; uint8_t *dst = cb + (((size_t)z * c) + y) * c * vb;
             memcpy(dst, src, (size_t)c * vb);
             for (size_t i = 0; i < (size_t)c * vb && !any; i++) any = dst[i] != 0;
         }
+        J->zn[k] = 0; J->zb[k] = nullptr;
         if (!any) continue;
-        zw_shard *s = zw_get(w, gz / w->shard, gy / w->shard, gx / w->shard); if (!s) return -1;
-        const size_t n = ZSTD_compress(w->zbuf, w->zcap, w->cbuf, w->chunk_bytes, 3);
-        if (ZSTD_isError(n) || fwrite(w->zbuf, 1, n, s->f) != n) { fprintf(stderr, "dinovol: chunk write failed\n"); return -1; }
+        J->zb[k] = malloc(w->zcap);
+        const size_t n = ZSTD_compress(J->zb[k], w->zcap, cb, w->chunk_bytes, 3);
+        J->zn[k] = ZSTD_isError(n) ? (size_t)-1 : n;
+    }
+    free(cb); return nullptr;
+}
+static int zw_nthreads = 8;
+static int zw_put(zw *w, int64_t oz, int64_t oy, int64_t ox, int nz, int ny, int nx, const void *data) {
+    const int c = w->chunk; int nch = 0;
+    int *co = malloc((size_t)(nz / c + 1) * (ny / c + 1) * (nx / c + 1) * 3 * sizeof *co);
+    for (int az = 0; az < nz; az += c) for (int ay = 0; ay < ny; ay += c) for (int ax = 0; ax < nx; ax += c)
+        if (oz + az < w->shape[0] && oy + ay < w->shape[1] && ox + ax < w->shape[2]) { co[3 * nch] = az; co[3 * nch + 1] = ay; co[3 * nch + 2] = ax; nch++; }
+    zwjob J = {.w = w, .data = data, .ny = ny, .nx = nx, .nch = nch, .co = co, .zb = calloc(nch + 1, sizeof(void *)), .zn = calloc(nch + 1, sizeof(size_t))};
+    atomic_init(&J.next, 0);
+    const int nt = nch < zw_nthreads ? nch : zw_nthreads; pthread_t th[64];
+    for (int i = 0; i < nt; i++) pthread_create(&th[i], nullptr, zw_worker, &J);
+    for (int i = 0; i < nt; i++) pthread_join(th[i], nullptr);
+    int rc = 0;
+    for (int k = 0; k < nch && !rc; k++) {
+        if (!J.zb[k]) continue;
+        const int64_t gz = oz + co[3 * k], gy = oy + co[3 * k + 1], gx = ox + co[3 * k + 2];
+        zw_shard *s = zw_get(w, gz / w->shard, gy / w->shard, gx / w->shard);
+        const size_t n = J.zn[k];
+        if (!s || n == (size_t)-1 || fwrite(J.zb[k], 1, n, s->f) != n) { fprintf(stderr, "dinovol: chunk write failed\n"); rc = -1; break; }
         const int ci = (int)((((gz % w->shard) / c) * w->nc1 + (gy % w->shard) / c) * w->nc1 + (gx % w->shard) / c);
         s->idx[2 * ci] = s->off; s->idx[2 * ci + 1] = n; s->off += n;
     }
-    return 0;
+    for (int k = 0; k < nch; k++) free(J.zb[k]);
+    free(J.zb); free(J.zn); free(co);
+    return rc;
 }
 static void zw_free(zw *w) { free(w->open); free(w->cbuf); free(w->zbuf); }
 
@@ -258,7 +284,8 @@ int cmd_dinovol_embed(int argc, char **argv) {
         const int rc = raw_mode(net, argc, argv); dv_free(net); return rc;
     }
     const char *root = argv[2], *key = argv[3], *out = argv[4];
-    const int nthreads = atoi(opt(argc, argv, "--threads", "8")), T = atoi(opt(argc, argv, "--tile", "192")), ds = atoi(opt(argc, argv, "--dense-stride", "1"));
+    const int nthreads = atoi(opt(argc, argv, "--threads", "8")); zw_nthreads = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads;
+    const int T = atoi(opt(argc, argv, "--tile", "192")), ds = atoi(opt(argc, argv, "--dense-stride", "1"));
     const int dtype = !strcmp(opt(argc, argv, "--dtype", "int8"), "float16") ? 1 : 0;
     const int overlap = 8 > T / 6 / 8 * 8 ? 8 : T / 6 / 8 * 8;
     const int margin = atoi(opt(argc, argv, "--margin", "-1")) >= 0 ? atoi(opt(argc, argv, "--margin", "0")) : overlap;
@@ -459,7 +486,7 @@ int cmd_dinovol_embed(int argc, char **argv) {
                 dv_mask_crop(mask_t, nyt, nyt, cmask_t, nzt, syt, syt);
                 if (need_den) dv_mask_crop(mask_d, nyd, nyd, cmask_d, nzd, syd, syd);
             }
-            ncells++;
+            ncells += (long)(czb - cza);   /* lattice cells finished (the slab depth) */
             for (int o = 0; o < O_N && !rc; o++) {
                 if (!want[o]) continue;
                 const int isd = o >= O_DENSE, s = isd ? ds : ps, nz = isd ? nzd : nzt, sy = isd ? syd : syt, CA = isd ? CAd : CAt, C = o <= O_TOKU ? E : o == O_DENSE ? nd : ni;
@@ -474,7 +501,7 @@ int cmd_dinovol_embed(int argc, char **argv) {
             /* shard row done (last row of the shard in y, or of the box) at the row's last column */
             if (kx == c1[2] - 1 && (ky == c1[1] - 1 || (ky + 1) % K == 0))
                 for (int o = 0; o < O_N; o++) if (want[o]) { rc |= zw_flush(&W[o]); if (has_sc[o]) rc |= zw_flush(&Wsc[o]); }
-            if (ncells % 4 == 0 || ci == ncol - 1) {
+            if (ci % 4 == 3 || ci == ncol - 1) {
                 const double el = dv_now() - t_start;
                 fprintf(stderr, "\rdinovol-embed: slab %lld cells %ld tiles %ld (+%ld skipped) %.1f s: net %.1f head %.1f read wait %.1f, %.2f Mvox/s   ", (long long)zs, ncells, ntiles, nskip,
                         el, t_net, t_head, t_read, (double)ncells * stride * stride * stride / el / 1e6);
@@ -585,4 +612,200 @@ int cmd_dinovol_read(int argc, char **argv) {
     free(out); emb_close(&e);
     return rc;
 }
-int cmd_dinovol_eval(int argc, char **argv) { (void)argc; (void)argv; fprintf(stderr, "dinovol-eval: not built yet\\n"); return 2; }
+
+/* ---- dinovol-eval: sheet identity along published surfaces ---- */
+typedef struct { int64_t key; uint8_t *data; uint64_t used; } cslot;
+typedef struct { zr *r; cslot *s; int n; uint64_t tick; size_t cb; } ccache;   /* LRU of decoded chunks */
+static const uint8_t *cc_get(ccache *c, int64_t z, int64_t y, int64_t x) {
+    zr *r = c->r; const int ch = r->chunk;
+    if (z < 0 || y < 0 || x < 0 || z >= r->shape[0] || y >= r->shape[1] || x >= r->shape[2]) return nullptr;
+    const int64_t key = ((z / ch) * ((r->shape[1] + ch - 1) / ch) + y / ch) * ((r->shape[2] + ch - 1) / ch) + x / ch;
+    int lru = 0;
+    for (int i = 0; i < c->n; i++) {
+        if (c->s[i].key == key) { c->s[i].used = ++c->tick; return c->s[i].data; }
+        if (c->s[i].used < c->s[lru].used) lru = i;
+    }
+    const uint8_t *d = zr_chunk(r, z, y, x);
+    cslot *s = &c->s[lru]; s->key = key; s->used = ++c->tick;
+    if (!d) { free(s->data); s->data = nullptr; return nullptr; }
+    if (!s->data) s->data = malloc(c->cb);
+    memcpy(s->data, d, c->cb);
+    return s->data;
+}
+/* trilinear vector at a continuous voxel position p (z, y, x) of the volume; the output cell i covers voxels [i s, (i + 1) s) */
+static int cc_vec(ccache *c, int step, const double p[3], float *v) {
+    zr *r = c->r; const int C = r->C, ch = r->chunk;
+    double u[3]; int64_t i0[3]; double f[3];
+    for (int d = 0; d < 3; d++) { u[d] = (p[d] - (step - 1) * 0.5) / step; i0[d] = (int64_t)floor(u[d]); f[d] = u[d] - (double)i0[d]; }
+    for (int k = 0; k < C; k++) v[k] = 0.f;
+    int ok = 0;
+    for (int a = 0; a < 8; a++) {
+        const int64_t z = i0[0] + (a >> 2), y = i0[1] + ((a >> 1) & 1), x = i0[2] + (a & 1);
+        const double w = ((a >> 2) ? f[0] : 1 - f[0]) * (((a >> 1) & 1) ? f[1] : 1 - f[1]) * ((a & 1) ? f[2] : 1 - f[2]);
+        if (w <= 0) continue;
+        const uint8_t *d = cc_get(c, z, y, x); if (!d) continue;
+        const size_t e = ((size_t)((z % ch) * ch + y % ch) * ch + x % ch) * C;
+        float nn = 0; for (int k = 0; k < C; k++) { const float t = r->dt == 0 ? ((const int8_t *)d)[e + k] : 0; nn += t * t; }
+        if (r->dt == 0) { if (nn == 0) continue; for (int k = 0; k < C; k++) v[k] += (float)(w * ((const int8_t *)d)[e + k]); }
+        else { for (int k = 0; k < C; k++) { uint16_t h; memcpy(&h, d + (e + k) * 2, 2); v[k] += (float)(w * h2f(h)); } }
+        ok = 1;
+    }
+    return ok;
+}
+static float vcos(const float *a, const float *b, int C) {
+    double ab = 0, aa = 0, bb = 0; for (int k = 0; k < C; k++) { ab += (double)a[k] * b[k]; aa += (double)a[k] * a[k]; bb += (double)b[k] * b[k]; }
+    return aa > 0 && bb > 0 ? (float)(ab / sqrt(aa * bb)) : -2.f;
+}
+static float *read_tif_f32(const char *path, int *w, int *h) {
+    tiff *t = tiff_open_file(path); if (!t) return nullptr;
+    tiff_page pi; float *o = nullptr;
+    if (!tiff_page_info(t, 0, &pi) && pi.fmt == 3 && pi.bits == 32 && pi.spp == 1) { o = malloc((size_t)pi.w * pi.h * 4); if (tiff_read_page(t, 0, o)) { free(o); o = nullptr; } else { *w = pi.w; *h = pi.h; } }
+    tiff_close(t); return o;
+}
+typedef struct { int w, h; float *x, *y, *z; double sc; } surf_t;   /* positions scaled to the embedding volume's voxels */
+static int surf_pos(const surf_t *S, double u, double v, double p[3]) {   /* bilinear at grid (u = column, v = row); 0 if any corner invalid */
+    const int c = (int)floor(u), r = (int)floor(v); if (c < 0 || r < 0 || c + 1 >= S->w || r + 1 >= S->h) return 0;
+    const double fu = u - c, fv = v - r; double q[3] = {0, 0, 0};
+    for (int a = 0; a < 4; a++) {
+        const size_t i = (size_t)(r + (a >> 1)) * S->w + c + (a & 1);
+        if (S->z[i] < 0 || S->x[i] < 0 || S->y[i] < 0) return 0;
+        const double wgt = ((a >> 1) ? fv : 1 - fv) * ((a & 1) ? fu : 1 - fu);
+        q[0] += wgt * S->z[i]; q[1] += wgt * S->y[i]; q[2] += wgt * S->x[i];
+    }
+    for (int d = 0; d < 3; d++) p[d] = q[d] * S->sc;
+    return 1;
+}
+static int surf_normal(const surf_t *S, double u, double v, double n[3]) {
+    double a[3], b[3], c[3], d[3];
+    if (!surf_pos(S, u - 0.5, v, a) || !surf_pos(S, u + 0.5, v, b) || !surf_pos(S, u, v - 0.5, c) || !surf_pos(S, u, v + 0.5, d)) return 0;
+    const double du[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, dv[3] = {d[0] - c[0], d[1] - c[1], d[2] - c[2]};
+    n[0] = du[1] * dv[2] - du[2] * dv[1]; n[1] = du[2] * dv[0] - du[0] * dv[2]; n[2] = du[0] * dv[1] - du[1] * dv[0];
+    const double l = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]); if (l < 1e-9) return 0;
+    for (int k = 0; k < 3; k++) n[k] /= l;
+    return 1;
+}
+static uint64_t ev_rng(uint64_t *s) { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; return *s; }
+static double ev_unif(uint64_t *s) { return (ev_rng(s) >> 11) * (1.0 / 9007199254740992.0); }
+
+int cmd_dinovol_eval(int argc, char **argv) {
+    if (argc < 4) {
+        fprintf(stderr, "usage: ufsm dinovol-eval <emb-group> <surface.tifxyz>... [--output dense|ink|tokens_unit] [--surf-scale 0.25] [--n-ref 300] [--dirs 8]\n"
+                        "         [--dists 0,10,20,40,80,160] [--range 24] [--tols 2,6] [--edge 4] [--seed 1] [--cache-chunks 512]\n"
+                        "  Sheet identity of an embedding (the dinovol coworker check): from a reference vertex on a published surface, walk along the\n"
+                        "  surface (uv lines, 3D path length in embedding voxels) to each distance, sample the embedding along the surface normal at\n"
+                        "  -range..+range voxels, and count the reference's most similar sample (cosine) within tol voxels of the surface.\n");
+        return 2;
+    }
+    const char *group = argv[2], *oname = opt(argc, argv, "--output", "dense");
+    if (opt(argc, argv, "--suggest-box", nullptr)) {   /* a cube of N voxels centred on the surface vertex nearest its grid centre (embedding voxels) */
+        const int N = atoi(opt(argc, argv, "--suggest-box", "384")); const double s0 = atof(opt(argc, argv, "--surf-scale", "0.25"));
+        char q[1300]; int w, h, w2, h2, w3, h3; snprintf(q, sizeof q, "%s/x.tif", argv[2]); float *x = read_tif_f32(q, &w, &h);
+        snprintf(q, sizeof q, "%s/y.tif", argv[2]); float *y = read_tif_f32(q, &w2, &h2); snprintf(q, sizeof q, "%s/z.tif", argv[2]); float *z = read_tif_f32(q, &w3, &h3);
+        if (!x || !y || !z) { fprintf(stderr, "dinovol-eval: cannot read %s\n", argv[2]); return 1; }
+        const double fu = atof(opt(argc, argv, "--at-u", "0.5")), fv = atof(opt(argc, argv, "--at-v", "0.5"));
+        long best = -1; double bd = 1e300;
+        for (long i = 0; i < (long)w * h; i++) if (z[i] >= 0) { const double du = (double)(i % w) - fu * w, dv = (double)(i / w) - fv * h, d = du * du + dv * dv; if (d < bd) { bd = d; best = i; } }
+        if (best < 0) return 1;
+        printf("%lld,%lld,%lld,%d,%d,%d\n", (long long)(z[best] * s0) - N / 2, (long long)(y[best] * s0) - N / 2, (long long)(x[best] * s0) - N / 2, N, N, N);
+        free(x); free(y); free(z); return 0;
+    }
+    const double sc = atof(opt(argc, argv, "--surf-scale", "0.25")); const int nref = atoi(opt(argc, argv, "--n-ref", "300")), ndir = atoi(opt(argc, argv, "--dirs", "8"));
+    const int R = atoi(opt(argc, argv, "--range", "24")), edge = atoi(opt(argc, argv, "--edge", "4"));
+    double dists[32]; int nd = 0; { char *s = strdup(opt(argc, argv, "--dists", "0,10,20,40,80,160")); for (char *t = strtok(s, ","); t && nd < 32; t = strtok(nullptr, ",")) dists[nd++] = atof(t); free(s); }
+    int tols[8], nt = 0; { char *s = strdup(opt(argc, argv, "--tols", "2,6")); for (char *t = strtok(s, ","); t && nt < 8; t = strtok(nullptr, ",")) tols[nt++] = atoi(t); free(s); }
+    uint64_t seed = strtoull(opt(argc, argv, "--seed", "1"), nullptr, 10) * 0x9E3779B97F4A7C15ull + 1;
+    /* the embedding: step and the embedded box (voxels) from the group attributes */
+    char p[1200]; snprintf(p, sizeof p, "%s/zarr.json", group); size_t n = 0; char *t = read_file(p, &n);
+    if (!t) { fprintf(stderr, "dinovol-eval: cannot read %s\n", p); return 1; }
+    json *j = json_parse(t, n); free(t); if (!j) { fprintf(stderr, "dinovol-eval: bad %s\n", p); return 1; }
+    int64_t box[6]; const json *bj = json_path(j, "attributes.box_zyx");
+    for (int d = 0; d < 6; d++) box[d] = (int64_t)json_num(json_at(bj, d), 0);
+    const int stride = (int)json_num(json_path(j, "attributes.lattice.stride"), 0), ds = (int)json_num(json_path(j, "attributes.dense_stride"), 1);
+    json_free(j);
+    const int step = !strncmp(oname, "tokens", 6) ? 8 : ds;
+    int64_t lo[3], hi[3];   /* computed cells: the lattice cells overlapping the box */
+    for (int d = 0; d < 3; d++) { lo[d] = box[d] / stride * stride; hi[d] = ((box[d] + box[3 + d] - 1) / stride + 1) * stride; }
+    emb e; if (emb_open(&e, group, oname)) return 1;
+    if (e.has_s) { fprintf(stderr, "dinovol-eval: %s has a per-vector scale array; use a unit output (dense, ink, tokens_unit)\n", oname); return 2; }
+    const int C = e.a.C; ccache cc = {.r = &e.a, .n = atoi(opt(argc, argv, "--cache-chunks", "512")), .cb = (size_t)e.a.chunk * e.a.chunk * e.a.chunk * C * e.a.esize};
+    cc.s = calloc(cc.n, sizeof *cc.s); for (int i = 0; i < cc.n; i++) cc.s[i].key = -1;
+    /* results [dist][tol] and |t*| histogram */
+    long tot[32] = {0}, hit[32][8] = {{0}}; double sum_abs[32] = {0}; long nskip_ref = 0;
+    float *e0 = malloc(C * 4), *ev = malloc(C * 4);
+    int nsurf = 0;
+    for (int ai = 3; ai < argc; ai++) {
+        if (argv[ai][0] == '-' && argv[ai][1] == '-') { ai++; continue; }
+        surf_t S = {.sc = sc}; int w2, h2, w3, h3;
+        char q[1300];
+        snprintf(q, sizeof q, "%s/x.tif", argv[ai]); S.x = read_tif_f32(q, &S.w, &S.h);
+        snprintf(q, sizeof q, "%s/y.tif", argv[ai]); S.y = read_tif_f32(q, &w2, &h2);
+        snprintf(q, sizeof q, "%s/z.tif", argv[ai]); S.z = read_tif_f32(q, &w3, &h3);
+        if (!S.x || !S.y || !S.z || w2 != S.w || w3 != S.w || h2 != S.h || h3 != S.h) { fprintf(stderr, "dinovol-eval: cannot read the tifxyz %s\n", argv[ai]); return 1; }
+        nsurf++;
+        /* candidate reference vertices: inside the computed cells with room for the normal range */
+        long *cand = malloc((size_t)S.w * S.h * sizeof *cand); long nc = 0;
+        const double room = R + edge;
+        for (long i = 0; i < (long)S.w * S.h; i++) {
+            if (S.z[i] < 0) continue;
+            const double pv[3] = {S.z[i] * sc, S.y[i] * sc, S.x[i] * sc}; int in = 1;
+            for (int d = 0; d < 3; d++) in &= pv[d] >= lo[d] + room && pv[d] < hi[d] - room;
+            if (in) cand[nc++] = i;
+        }
+        fprintf(stderr, "dinovol-eval: %s: %d x %d grid, %ld vertices inside the embedded cells\n", argv[ai], S.w, S.h, nc);
+        for (int r = 0; r < nref && nc; r++) {
+            const long i = cand[ev_rng(&seed) % (unsigned long)nc];
+            const double u0 = (double)(i % S.w), v0 = (double)(i / S.w);
+            double p0[3]; if (!surf_pos(&S, u0, v0, p0) || !cc_vec(&cc, step, p0, e0)) { nskip_ref++; continue; }
+            for (int dj = 0; dj < ndir; dj++) {
+                const double ang = 2 * M_PI * ev_unif(&seed), cu = cos(ang), sv = sin(ang);
+                double u = u0, v = v0, len = 0, prev[3] = {p0[0], p0[1], p0[2]}; int di = 0;
+                while (di < nd) {
+                    double q3[3], nn[3]; int at = 0;
+                    if (dists[di] <= len) { at = 1; }
+                    else {
+                        const double un = u + 0.25 * cu, vn = v + 0.25 * sv; double pn[3];
+                        if (!surf_pos(&S, un, vn, pn)) break;
+                        len += sqrt((pn[0] - prev[0]) * (pn[0] - prev[0]) + (pn[1] - prev[1]) * (pn[1] - prev[1]) + (pn[2] - prev[2]) * (pn[2] - prev[2]));
+                        u = un; v = vn; memcpy(prev, pn, sizeof pn);
+                        if (len > dists[nd - 1] + 1) break;
+                        continue;
+                    }
+                    if (at) {
+                        if (!surf_pos(&S, u, v, q3) || !surf_normal(&S, u, v, nn)) break;
+                        int inside = 1; for (int d = 0; d < 3; d++) inside &= q3[d] >= lo[d] + room && q3[d] < hi[d] - room;
+                        if (inside) {
+                            float best = -3.f; int bt = 0;
+                            for (int tt = -R; tt <= R; tt++) {
+                                const double s3[3] = {q3[0] + tt * nn[0], q3[1] + tt * nn[1], q3[2] + tt * nn[2]};
+                                if (!cc_vec(&cc, step, s3, ev)) continue;
+                                const float cs = vcos(e0, ev, C);
+                                if (cs > best || (cs == best && abs(tt) < abs(bt))) { best = cs; bt = tt; }
+                            }
+                            if (best > -2.f) {
+                                tot[di]++; sum_abs[di] += abs(bt);
+                                for (int k = 0; k < nt; k++) hit[di][k] += abs(bt) <= tols[k];
+                            }
+                        }
+                        di++;
+                    }
+                }
+            }
+        }
+        free(cand); free(S.x); free(S.y); free(S.z);
+    }
+    printf("dinovol-eval %s (%s, step %d), %d surface(s), %d reference vertices x %d directions, normal range +-%d voxels\n", group, oname, step, nsurf, nref, ndir, R);
+    printf("| distance (vx) | n |");
+    for (int k = 0; k < nt; k++) printf(" within %d vx |", tols[k]);
+    printf(" mean abs offset |\n|---|---|");
+    for (int k = 0; k < nt; k++) printf("---|");
+    printf("---|\n");
+    for (int di = 0; di < nd; di++) {
+        printf("| %g | %ld |", dists[di], tot[di]);
+        for (int k = 0; k < nt; k++) printf(" %.1f%% |", tot[di] ? 100.0 * hit[di][k] / tot[di] : 0.0);
+        printf(" %.2f |\n", tot[di] ? sum_abs[di] / tot[di] : 0.0);
+    }
+    if (nskip_ref) printf("(%ld reference vertices without an embedding skipped)\n", nskip_ref);
+    for (int i = 0; i < cc.n; i++) free(cc.s[i].data);
+    free(cc.s); free(e0); free(ev); emb_close(&e);
+    return 0;
+}

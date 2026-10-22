@@ -40,7 +40,8 @@ void xh2d(void *dst, const void *src, size_t bytes);   /* synchronous copies on 
 void xd2h(void *dst, const void *src, size_t bytes);
 
 enum { XA_NONE = 0, XA_RELU = 1, XA_LRELU = 2, XA_GELU = 3, XA_SILU = 4,   /* LeakyReLU slope 0.01; GELU exact (erf) */
-       XA_POSTRES = 16 };                                      /* flag: y = act(acc scale + bias) + res (default: act(.. + res)) */
+       XA_POSTRES = 16,                                       /* flag: y = act(acc scale + bias) + res (default: act(.. + res)) */
+       XA_GLU = 32 };                                         /* flag: output co / 2 channels silu(v[2j]) v[2j + 1] (no res) */
 
 typedef struct {
     int ci, co, kd, kh, kw, sd, sh, sw, pd, ph, pw;      /* the GEMM conv (after unfolding) */
