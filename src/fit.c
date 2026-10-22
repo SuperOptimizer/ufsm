@@ -1227,7 +1227,14 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
     const uint8_t *dpc = f->pc, *dps = f->ps, *dt[6], *dsp = f->sp, *dw = f->w; uint8_t *dfield = nullptr;   /* CPU: the host fields as they are */
     for (int k = 0; k < 6; k++) dt[k] = f->t[k];
     if (!cpu) {
-        dfield = nn_malloc(10 * n);
+        /* the fields on the device; when they do not fit (or UFSM_FIT_MANAGED=1), in CUDA managed memory: pages migrate on demand, so boxes
+           larger than the GPU (e.g. 9.6 um cells over a full cross-section) still fit, slower */
+        const int force_managed = ufsm_env_on("UFSM_FIT_MANAGED");
+        dfield = force_managed ? nullptr : nn_malloc_try(10 * n);
+        if (!dfield) {
+            dfield = nn_managed_alloc(10 * n);
+            if (dfield && c->verbose) fprintf(stderr, "fit: fields in managed memory (%.1f GB, %s)\n", 10.0 * n / 1e9, force_managed ? "UFSM_FIT_MANAGED" : "over the free device memory");
+        }
         if (!dfield) { fprintf(stderr, "fit: no device memory for the fields (%.1f GB: 10 B per cell of %dx%dx%d); use a smaller box or --slab\n", 10.0 * n / 1e9, f->D, f->H, f->W); fit_free(m); return nullptr; }
         nn_h2d(dfield, f->pc, n); nn_h2d(dfield + n, f->ps, n); nn_h2d(dfield + 8 * n, f->sp, n); nn_h2d(dfield + 9 * n, f->w, n);
         for (int k = 0; k < 6; k++) nn_h2d(dfield + (2 + k) * n, f->t[k], n);

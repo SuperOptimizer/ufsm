@@ -2566,6 +2566,23 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sp->occ = calloc((size_t)S->n, sizeof *sp->occ);
     for (int i = 0; !cfg->cover && i < S->n; i++) {
         occ_index o = source_occupancy(&S->src[i]);
+        const source *fs = &S->src[i];
+        if (o.n && fs->focus && fs->focus_w > 0) {   /* "focus": cell k drawn 1 + w x packed share times as often (repeated in the index) */
+            if (fs->focus_grid[0] != o.shape[0] || fs->focus_grid[1] != o.shape[1] || fs->focus_grid[2] != o.shape[2])
+                fprintf(stderr, "sampler: %s: the focus map grid %lldx%lldx%lld differs from the occupancy grid %lldx%lldx%lld: focus off\n", fs->name,
+                        (long long)fs->focus_grid[0], (long long)fs->focus_grid[1], (long long)fs->focus_grid[2], (long long)o.shape[0], (long long)o.shape[1], (long long)o.shape[2]);
+            else {
+                size_t nn = 0; int *rep = malloc(o.n * sizeof *rep);
+                for (size_t k = 0; k < o.n; k++) { const uint8_t v = fs->focus[o.idx[k]]; rep[k] = 1 + (v ? (int)lround(fs->focus_w * (v - 1) / 254.0) : 0); nn += (size_t)rep[k]; }
+                uint32_t *ix = malloc(nn * sizeof *ix); size_t q = 0;
+                if (ix && rep) {
+                    for (size_t k = 0; k < o.n; k++) for (int t = 0; t < rep[k]; t++) ix[q++] = o.idx[k];
+                    fprintf(stderr, "sampler: %s: focus w %g: %zu cells -> %zu draws (x%.2f)\n", fs->name, fs->focus_w, o.n, nn, (double)nn / o.n);
+                    free(o.idx); o.idx = ix; o.n = nn;
+                } else free(ix);
+                free(rep);
+            }
+        }
         sp->occ[i].idx = o.idx; sp->occ[i].n = o.n; sp->occ[i].lev = o.lev; for (int d = 0; d < 3; d++) sp->occ[i].shape[d] = o.shape[d];
     }
     sp->th = calloc((size_t)cfg->nworkers, sizeof(pthread_t));

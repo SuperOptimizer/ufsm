@@ -211,6 +211,22 @@ sources *sources_load(const char *path) {
             s->aux = as ? z3_open(as, ak, nullptr) : nullptr; s->aux_level = (int)json_num(json_get(aj, "level"), 2);
             if (!s->aux) { fprintf(stderr, "sources: %s: cannot open the aux volume %s/%s\n", s->name, ar ? ar : "?", ak); json_free(j); sources_free(S); return nullptr; }
         }
+        const json *fj = json_get(e, "focus");   /* {"map": RAW, "w": K}: the sampler's packing focus (map grid in RAW.json) */
+        if (fj) {
+            const char *fp = json_str(json_get(fj, "map"), nullptr); s->focus_w = (float)json_num(json_get(fj, "w"), 0);
+            char jp[1200]; snprintf(jp, sizeof jp, "%s.json", fp ? fp : "");
+            FILE *jf = fp ? fopen(jp, "rb") : nullptr; char jb[4096] = {0}; size_t jn = jf ? fread(jb, 1, sizeof jb - 1, jf) : 0; if (jf) fclose(jf);
+            json *g = jn ? json_parse(jb, jn) : nullptr; size_t tot = 1;
+            for (int d = 0; d < 3; d++) { s->focus_grid[d] = g ? (int64_t)json_num(json_at(json_get(g, "grid"), (size_t)d), 0) : 0; tot *= (size_t)(s->focus_grid[d] > 0 ? s->focus_grid[d] : 0); }
+            json_free(g);
+            FILE *mf = tot && fp ? fopen(fp, "rb") : nullptr;
+            s->focus = mf ? malloc(tot) : nullptr;
+            if (!s->focus || fread(s->focus, 1, tot, mf) != tot || !(s->focus_w >= 0)) {
+                fprintf(stderr, "sources: %s: cannot read the focus map %s (and %s with its grid), or w < 0\n", s->name, fp ? fp : "?", jp);
+                if (mf) { fclose(mf); } json_free(j); sources_free(S); return nullptr;
+            }
+            fclose(mf);
+        }
         const json *ho = json_get(e, "holdout");
         if (ho && ho->type == J_ARR && ho->n == 6) for (int d = 0; d < 3; d++) { s->hold_o[d] = (int64_t)json_num(json_at(ho, (size_t)d), 0); s->hold_n[d] = (int64_t)json_num(json_at(ho, (size_t)(3 + d)), 0); }
         const json *bx = json_get(e, "boxes");   /* task restore: level-0 boxes [z, y, x, nz, ny, nx] that hold local CT (training windows lie inside one) */
@@ -237,7 +253,7 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
-        z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); free(s->box);
+        z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); free(s->box); free(s->focus);
         for (int c = 0; c < NCH; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {

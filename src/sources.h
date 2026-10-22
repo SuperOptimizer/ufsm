@@ -99,6 +99,8 @@ typedef struct {
                          rising outward from the axis, fit.h W): windows read p -> (252 - p) mod 252 (unknown stays unknown); the
                          winding mod 4 targets unwrap the negated phase, so they follow. Default +1. (2026-10-19: the 10-16 multi-scroll
                          wind-seed sets with a wrongly voted spiral sense, e.g. Paris 4 June / July, 0500P2) */
+    uint8_t *focus; int64_t focus_grid[3]; float focus_w;   /* optional "focus": {"map": RAW, "w": K} (ufsm phase-packing --map: per coarse occupancy cell 0 none, else
+                                                              1 + 254 x packed share): the position draw takes a cell 1 + K x share times as often */
     z3 *wind;    /* optional, with a stored phase: the winding mod 14 turns on the same grid (ufsm phase-raster --winding; band.h
                     band_winding), {"band": {..., "phase": {...}, "winding": {"root": ..., "key": ...}}}: the --cond targets / condition */
 } source;

@@ -315,6 +315,8 @@ extern "C" void nn_d2d_kernel(void *d, const void *s, size_t n) {   /* a kernel 
 }
 extern "C" void nn_sync(void) { CK(cudaDeviceSynchronize()); }
 extern "C" void *nn_host_alloc(size_t n) { void *p = nullptr; CK(cudaMallocHost(&p, n)); return p; }
+extern "C" void *nn_managed_alloc(size_t n) { void *p = nullptr; if (cudaMallocManaged(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
+extern "C" void *nn_malloc_try(size_t n) { void *p = nullptr; if (cudaMalloc(&p, n ? n : 4) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
 extern "C" void *nn_host_alloc_try(size_t n) { void *p = nullptr; if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); return nullptr; } return p; }
 extern "C" void nn_host_free(void *p) { if (p) CK(cudaFreeHost(p)); }
 cudaStream_t copy_stream(void) {

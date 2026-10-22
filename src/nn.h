@@ -33,6 +33,8 @@ void nn_set_zrange(int zi0, int Di, int first, int last, int Do, int zo);   /* z
 void nn_set_zwin(int zw0, int zw1, int D0, int first, int last);   /* z-window of the next level-0 ops (see nn_bwd.cu): output planes [zw0, zw1) of their whole tensors, in planes of depth D0 (scaled per tensor); D0 0 = off; first / last zero / finalise GroupNorm sums */
 void nn_sync(void);
 void *nn_host_alloc(size_t bytes);       /* pinned host memory */
+void *nn_managed_alloc(size_t bytes);    /* CUDA managed memory (may exceed the device: pages migrate on demand); nn_free frees it */
+void *nn_malloc_try(size_t bytes);       /* device memory, nullptr (no sticky error) when it does not fit */
 void *nn_host_alloc_try(size_t bytes);   /* the same, nullptr when the host cannot pin that much */
 void nn_host_free(void *p);
 /* pipelined uploads: an async copy on a per-device copy stream (pinned source), events to order it against the compute stream */
