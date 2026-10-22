@@ -21,8 +21,16 @@ static int tf32_on(void) { static int v = -1; if (v < 0) { const char *e = geten
 static atplan *at_plan(int M, int N, int K, int ta, int tb) {
     for (int i = 0; i < g_nap; i++) { atplan *p = &g_ap[i]; if (p->M == M && p->N == N && p->K == K && p->ta == ta && p->tb == tb) return p; }
     if (!g_alt) { if (cublasLtCreate(&g_alt) != CUBLAS_STATUS_SUCCESS) return nullptr; if (cudaMalloc(&g_altws, ALTWS) != cudaSuccess) return nullptr; }
-    if (g_nap == 256) { fprintf(stderr, "at_gemm: plan table full\n"); return nullptr; }
-    atplan *p = &g_ap[g_nap++]; memset(p, 0, sizeof *p);
+    static int next = 0; atplan *p;
+    if (g_nap < 256) p = &g_ap[g_nap++];
+    else {   /* full (row counts vary per step): recycle the slots round-robin */
+        p = &g_ap[next]; next = (next + 1) % 256;
+        if (p->op) cublasLtMatmulDescDestroy(p->op);
+        if (p->a) cublasLtMatrixLayoutDestroy(p->a);
+        if (p->b) cublasLtMatrixLayoutDestroy(p->b);
+        if (p->c) cublasLtMatrixLayoutDestroy(p->c);
+    }
+    memset(p, 0, sizeof *p);
     p->M = M; p->N = N; p->K = K; p->ta = ta; p->tb = tb;
     cublasLtMatmulDescCreate(&p->op, tf32_on() ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F, CUDA_R_32F);
     const cublasOperation_t oX = tb ? CUBLAS_OP_T : CUBLAS_OP_N, oY = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
@@ -39,7 +47,16 @@ static atplan *at_plan(int M, int N, int K, int ta, int tb) {
     if (!p->ok) fprintf(stderr, "at_gemm: no cuBLASLt algorithm for M %d N %d K %d ta %d tb %d\n", M, N, K, ta, tb);
     return p;
 }
+static int g_at_mx = -1;   /* the linear layers' GEMM precision: 0 fp32 (cuBLASLt), 4 / 8 MX-fp4 / MX-fp8 (lp_mx_gemm); env UFSM_LINEAR_MX */
+extern "C" void at_set_mx(int bits) { g_at_mx = bits; }
+extern "C" int at_get_mx(void) { if (g_at_mx < 0) { const char *e = getenv("UFSM_LINEAR_MX"); g_at_mx = e ? atoi(e) : 0; } return g_at_mx; }
+extern "C" int at_gemm_f32(int ta, int tb, int M, int N, int K, const float *A, const float *B, float *Cm, float beta);
 extern "C" int at_gemm(int ta, int tb, int M, int N, int K, const float *A, const float *B, float *Cm, float beta) {
+    const int mx = at_get_mx();
+    if (mx == 4 || mx == 8) { if (M <= 0 || N <= 0) return 0; if (K <= 0) { if (beta == 0.f) cudaMemsetAsync(Cm, 0, (size_t)M * N * 4, 0); return 0; } return lp_mx_gemm(mx, ta, tb, M, N, K, A, B, Cm, beta); }
+    return at_gemm_f32(ta, tb, M, N, K, A, B, Cm, beta);
+}
+extern "C" int at_gemm_f32(int ta, int tb, int M, int N, int K, const float *A, const float *B, float *Cm, float beta) {
     if (M <= 0 || N <= 0) return 0;
     if (K <= 0) { if (beta == 0.f) cudaMemsetAsync(Cm, 0, (size_t)M * N * 4, 0); return 0; }
     atplan *p = at_plan(M, N, K, ta, tb);

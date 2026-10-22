@@ -246,6 +246,124 @@ static int test_muon(int Co, int K) {   /* dr_muon (GEMM Newton-Schulz on the sm
     free(p); free(g); free(m); free(a); free(b); nn_free(p1); nn_free(g1); nn_free(m1); nn_free(p2); nn_free(m2); nn_free(w1); nn_free(w2);
     return bad;
 }
+/* double reference of the Muon step (nesterov momentum, Frobenius normalisation, 5 quintic Newton-Schulz iterations on X X^T, the
+   sqrt(max(1, Co / K)) scale): the update direction O for a tall [Co][K] matrix (the prototype layer's shape) */
+static int test_muon_ref(int Co, int K) {
+    printf("muon double reference: [%d][%d]\n", Co, K);
+    const size_t n = (size_t)Co * K; double *g = malloc(n * 8), *m = malloc(n * 8), *X = malloc(n * 8), *Y = malloc(n * 8), *A = malloc((size_t)Co * Co * 8), *B = malloc((size_t)Co * Co * 8);
+    for (size_t i = 0; i < n; i++) { g[i] = rf(nrand()); m[i] = rf(0.3 * nrand()); }
+    double ss = 0; for (size_t i = 0; i < n; i++) { const double mm = 0.95 * m[i] + g[i]; X[i] = g[i] + 0.95 * mm; ss += X[i] * X[i]; }
+    for (size_t i = 0; i < n; i++) X[i] /= sqrt(ss) + 1e-7;
+    for (int it = 0; it < 5; it++) {
+        for (int i = 0; i < Co; i++) for (int j = 0; j < Co; j++) { double a = 0; for (int k = 0; k < K; k++) a += X[(size_t)i * K + k] * X[(size_t)j * K + k]; A[(size_t)i * Co + j] = a; }
+        for (int i = 0; i < Co; i++) for (int j = 0; j < Co; j++) { double a = 0; for (int k = 0; k < Co; k++) a += A[(size_t)i * Co + k] * A[(size_t)k * Co + j]; B[(size_t)i * Co + j] = -4.7750 * A[(size_t)i * Co + j] + 2.0315 * a; }
+        for (int i = 0; i < Co; i++) for (int k = 0; k < K; k++) { double a = 3.4445 * X[(size_t)i * K + k]; for (int j = 0; j < Co; j++) a += B[(size_t)i * Co + j] * X[(size_t)j * K + k]; Y[(size_t)i * K + k] = a; }
+        double *t = X; X = Y; Y = t;
+    }
+    const double sc = sqrt(fmax(1.0, (double)Co / K)), lr = 0.02;
+    double *z = calloc(n, 8); float *pd = dev(z, n), *gd = dev(g, n), *md = dev(m, n), *w = nn_malloc(dr_muon_work(Co, K));
+    dr_muon(pd, gd, md, Co, K, (float)lr, 0.95f, 0.f, w);
+    double *got = host(pd, n); for (size_t i = 0; i < n; i++) { got[i] /= -lr * sc; }
+    int bad = report("direction", got, X, (int)n, 2e-3);
+    free(g); free(m); free(X); free(Y); free(A); free(B); free(z); free(got); nn_free(pd); nn_free(gd); nn_free(md); nn_free(w);
+    return bad;
+}
+/* ---- object term ---- */
+static double sp(double x) { return x > 30 ? x : log1p(exp(x)); }
+static double ref_obj(const double *S, const double *T, const int *obj, const uint8_t *vs, const uint8_t *vt, int N, int D, double t, double mg, double w) {
+    double L = 0; int na = 0;
+    for (int i = 0; i < N; i++) {
+        if (!vs[i] || obj[i] <= 0) continue;
+        double s[64]; int np = 0, nps = 0, nn = 0; double m = -1e300;
+        for (int j = 0; j < N; j++) { double a = 0; for (int c = 0; c < D; c++) a += S[i * D + c] * T[j * D + c]; s[j] = a; }
+        for (int j = 0; j < N; j++) { if (!vt[j] || obj[j] <= 0) continue; if (obj[j] == obj[i]) { np++; if (j != i) nps++; } else { nn++; m = fmax(m, s[j] / t); } }
+        if (!np || !nn) continue;
+        double z = 0; for (int j = 0; j < N; j++) if (vt[j] && obj[j] > 0 && obj[j] != obj[i]) z += exp(s[j] / t - m);
+        const double lse = m + log(z); const int ex = nps > 0; double a = 0; int k = 0;
+        for (int j = 0; j < N; j++) { if (!vt[j] || obj[j] != obj[i] || (ex && j == i)) continue; a += sp(lse - fmin(s[j], mg) / t); k++; }
+        L += a / k; na++;
+    }
+    return na ? w * L / na : 0;
+}
+static int test_obj(void) {
+    const int N = 40, D = 16; const double t = 0.15, mg = 0.75, w = 0.1; printf("object term: %d points, D %d\n", N, D);
+    double *S = malloc(N * D * 8), *T = malloc(N * D * 8); int obj[40]; uint8_t vs[40], vt[40];
+    for (int i = 0; i < N; i++) { obj[i] = i < 36 ? 1 + i % 5 : 0; vs[i] = urand() < 0.9; vt[i] = urand() < 0.9;
+        double a = 0, b = 0; for (int c = 0; c < D; c++) { S[i * D + c] = nrand() + (c == obj[i] ? 2 : 0); T[i * D + c] = nrand() + (c == obj[i] ? 2 : 0); a += S[i * D + c] * S[i * D + c]; b += T[i * D + c] * T[i * D + c]; }
+        for (int c = 0; c < D; c++) { S[i * D + c] = rf(S[i * D + c] / sqrt(a)); T[i * D + c] = rf(T[i * D + c] / sqrt(b)); } }
+    float *Sd = dev(S, N * D), *Td = dev(T, N * D), *gS = nn_malloc(N * D * 4), *out = nn_malloc(8); nn_zero(gS, N * D * 4); nn_zero(out, 8);
+    int *od = nn_malloc(N * 4); nn_h2d(od, obj, N * 4); uint8_t *vsd = nn_malloc(N), *vtd = nn_malloc(N); nn_h2d(vsd, vs, N); nn_h2d(vtd, vt, N);
+    dr_obj(Sd, Td, od, vsd, vtd, N, D, (float)t, (float)mg, (float)w, gS, out);
+    float o[2]; nn_d2h(o, out, 8); double a1 = o[0], r1 = ref_obj(S, T, obj, vs, vt, N, D, t, mg, w); int bad = report("loss", &a1, &r1, 1, 1e-4);
+    double *g = host(gS, N * D), *r = malloc(N * D * 8);
+    for (int j = 0; j < N * D; j++) { double v0 = S[j], e = 1e-6; S[j] = v0 + e; double lp = ref_obj(S, T, obj, vs, vt, N, D, t, mg, w); S[j] = v0 - e; double lm = ref_obj(S, T, obj, vs, vt, N, D, t, mg, w); S[j] = v0; r[j] = (lp - lm) / (2 * e); }
+    bad += report("d S", g, r, N * D, 2e-3);
+    free(S); free(T); free(g); free(r); nn_free(Sd); nn_free(Td); nn_free(gS); nn_free(out); nn_free(od); nn_free(vsd); nn_free(vtd);
+    return bad;
+}
+static double ref_ink(const double *A, const int *aid, int Na, const double *Kp, const int *kid, int np, const double *Kn, int nn, int D, double T, double mg, double w) {
+    double L = 0;
+    for (int i = 0; i < Na; i++) {
+        double sn[64], spv[64], mx = -1e300, mn = 0;
+        for (int j = 0; j < nn; j++) { double a = 0; for (int c = 0; c < D; c++) a += A[i * D + c] * Kn[j * D + c]; sn[j] = a; mx = fmax(mx, a); mn += a / T; }
+        mn /= nn; double z = 0; for (int j = 0; j < nn; j++) z += exp(sn[j] / T - mx / T);
+        const double lmen = mx / T + log(z) - log((double)nn), cap = fmax(mg, mx + T);
+        int other = 0; for (int j = 0; j < np; j++) other += !(kid[j] == aid[i] && aid[i] >= 0);
+        int cnt = 0; double pm = 0, pmx = -1e300;
+        for (int j = 0; j < np; j++) { double a = 0; for (int c = 0; c < D; c++) a += A[i * D + c] * Kp[j * D + c]; spv[j] = fmin(a, cap) / T; }
+        for (int j = 0; j < np; j++) { if (other && kid[j] == aid[i] && aid[i] >= 0) continue; pm += spv[j]; pmx = fmax(pmx, spv[j]); cnt++; }
+        pm /= cnt; double zp = 0; for (int j = 0; j < np; j++) { if (other && kid[j] == aid[i] && aid[i] >= 0) continue; zp += exp(spv[j] - pmx); }
+        const double lmep = pmx + log(zp) - log((double)cnt);
+        L += 0.5 * (sp(mn - pm) + sp(lmen - lmep));
+    }
+    return w * L / Na;
+}
+static int test_ink(void) {
+    const int Na = 6, np = 20, nn = 24, D = 12; const double T = 0.15, mg = 0.75, w = 0.1; printf("ink term: %d anchors, %d pull / %d push keys, D %d\n", Na, np, nn, D);
+    double *A = malloc(Na * D * 8), *Kp = malloc(np * D * 8), *Kn = malloc(nn * D * 8); int aid[6], kid[20];
+#define UNIT(X, n) for (int i_ = 0; i_ < (n); i_++) { double s_ = 0; for (int c = 0; c < D; c++) { X[i_ * D + c] = nrand() + (c == 0 ? 1.5 : 0); s_ += X[i_ * D + c] * X[i_ * D + c]; } for (int c = 0; c < D; c++) X[i_ * D + c] = rf(X[i_ * D + c] / sqrt(s_)); }
+    UNIT(A, Na) UNIT(Kp, np) UNIT(Kn, nn)
+#undef UNIT
+    for (int i = 0; i < Na; i++) aid[i] = i;
+    for (int j = 0; j < np; j++) kid[j] = j < 8 ? j : -1;
+    float *Ad = dev(A, Na * D), *Kpd = dev(Kp, np * D), *Knd = dev(Kn, nn * D), *gA = nn_malloc(Na * D * 4), *out = nn_malloc(4); nn_zero(gA, Na * D * 4); nn_zero(out, 4);
+    int *aidd = nn_malloc(Na * 4), *kidd = nn_malloc(np * 4); nn_h2d(aidd, aid, Na * 4); nn_h2d(kidd, kid, np * 4);
+    dr_ink(Ad, aidd, Na, Kpd, kidd, np, Knd, nn, D, (float)T, (float)mg, (float)w, gA, out);
+    float lo; nn_d2h(&lo, out, 4); double a1 = lo, r1 = ref_ink(A, aid, Na, Kp, kid, np, Kn, nn, D, T, mg, w); int bad = report("loss", &a1, &r1, 1, 1e-4);
+    double *g = host(gA, Na * D), *r = malloc(Na * D * 8);
+    for (int j = 0; j < Na * D; j++) { double v0 = A[j], e = 1e-6; A[j] = v0 + e; double lp = ref_ink(A, aid, Na, Kp, kid, np, Kn, nn, D, T, mg, w); A[j] = v0 - e; double lm = ref_ink(A, aid, Na, Kp, kid, np, Kn, nn, D, T, mg, w); A[j] = v0; r[j] = (lp - lm) / (2 * e); }
+    bad += report("d A", g, r, Na * D, 2e-3);
+    free(A); free(Kp); free(Kn); free(g); free(r); nn_free(Ad); nn_free(Kpd); nn_free(Knd); nn_free(gA); nn_free(out); nn_free(aidd); nn_free(kidd);
+    return bad;
+}
+static void ref_mlp2(const dr_mlp2 *m, const double *P, const double *x, int R, double *y) {
+    double *h = malloc((size_t)m->H * 8), *z = malloc((size_t)m->O * 8);
+    for (int r = 0; r < R; r++) {
+        for (int j = 0; j < m->H; j++) { double a = P[m->b1 + j]; for (int c = 0; c < m->Cin; c++) a += x[r * m->Cin + c] * P[m->w1 + (size_t)j * m->Cin + c]; h[j] = gelu(a); }
+        double s = 0; for (int j = 0; j < m->O; j++) { double a = P[m->b2 + j]; for (int c = 0; c < m->H; c++) a += h[c] * P[m->w2 + (size_t)j * m->H + c]; z[j] = a; s += a * a; }
+        for (int j = 0; j < m->O; j++) y[r * m->O + j] = z[j] / sqrt(s);
+    }
+    free(h); free(z);
+}
+static int test_mlp2(void) {
+    dr_mlp2 m; dr_mlp2_layout(&m, 12, 20, 8); const int R = 4; printf("region head: %d -> %d -> %d, %d rows\n", m.Cin, m.H, m.O, R);
+    double *P = malloc(m.n * 8), *x = malloc(R * m.Cin * 8), *Rm = malloc(R * m.O * 8), *y = malloc(R * m.O * 8);
+    for (size_t i = 0; i < m.n; i++) P[i] = rf(0.3 * nrand());
+    for (int i = 0; i < R * m.Cin; i++) x[i] = rf(nrand());
+    for (int i = 0; i < R * m.O; i++) Rm[i] = rf(nrand());
+    float *Pd = dev(P, m.n), *xd = dev(x, R * m.Cin), *Rd = dev(Rm, R * m.O), *yd = nn_malloc(R * m.O * 4), *G = nn_malloc(m.n * 4), *dx = nn_malloc(R * m.Cin * 4); void *ws = nn_malloc(dr_mlp2_ws(&m, R));
+    nn_zero(G, m.n * 4); nn_zero(dx, R * m.Cin * 4);
+    dr_mlp2_fwd(&m, Pd, xd, R, yd, ws); dr_mlp2_bwd(&m, Pd, G, xd, yd, Rd, R, dx, ws);
+    double *yg = host(yd, R * m.O); ref_mlp2(&m, P, x, R, y); int bad = report("forward", yg, y, R * m.O, 2e-3);
+    double *gx = host(dx, R * m.Cin), *gP = host(G, m.n), a[16], r[16];
+    struct { const char *nm; size_t off, n; } ts[] = {{"x", 0, (size_t)R * m.Cin}, {"w1", m.w1, (size_t)m.H * m.Cin}, {"b1", m.b1, m.H}, {"w2", m.w2, (size_t)m.O * m.H}, {"b2", m.b2, m.O}};
+    for (int k = 0; k < 5; k++) { for (int i = 0; i < 16; i++) { size_t j = (size_t)(urand() * ts[k].n) % ts[k].n; double *v = k == 0 ? x + j : P + ts[k].off + j, v0 = *v, e = 1e-5, lp = 0, lm = 0;
+            *v = v0 + e; ref_mlp2(&m, P, x, R, y); for (int q = 0; q < R * m.O; q++) lp += y[q] * Rm[q]; *v = v0 - e; ref_mlp2(&m, P, x, R, y); for (int q = 0; q < R * m.O; q++) lm += y[q] * Rm[q]; *v = v0;
+            r[i] = (lp - lm) / (2 * e); a[i] = k == 0 ? gx[j] : gP[ts[k].off + j]; }
+        bad += report(ts[k].nm, a, r, 16, 2e-3); }
+    free(P); free(x); free(Rm); free(y); free(yg); free(gx); free(gP); nn_free(Pd); nn_free(xd); nn_free(Rd); nn_free(yd); nn_free(G); nn_free(dx); nn_free(ws);
+    return bad;
+}
 static int test_pool(void) {
     const int n = 2, S = 11, C = 5, r0 = 3; printf("pool: %d x %d tokens (%d registers), C %d\n", n, S, r0, C);
     double *t = malloc(n * S * C * 8), *g = malloc(n * C * 8); for (int i = 0; i < n * S * C; i++) t[i] = rf(nrand()); for (int i = 0; i < n * C; i++) g[i] = rf(nrand());
@@ -261,7 +379,7 @@ static int test_pool(void) {
 
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
-    int bad = test_views() + test_head() + test_targets() + test_ce() + test_koleo() + test_koleo_q() + test_muon(64, 24) + test_muon(24, 64) + test_pool();
+    int bad = test_views() + test_head() + test_targets() + test_ce() + test_koleo() + test_koleo_q() + test_muon(64, 24) + test_muon(24, 64) + test_muon_ref(160, 24) + test_obj() + test_ink() + test_mlp2() + test_pool();
     printf(bad ? "test_dinor: %d FAILED\n" : "test_dinor: all passed\n", bad);
     return bad != 0;
 }

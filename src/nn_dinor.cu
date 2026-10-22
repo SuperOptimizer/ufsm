@@ -394,15 +394,214 @@ extern "C" void dr_muon(float *p, const float *g, float *mom, int Co, int K, flo
     k_mu_scale<<<nb, 256>>>(X, n, ss);
     const float a = 3.4445f, b = -4.7750f, c = 2.0315f;
     for (int it = 0; it < 5; it++) {
-        if (tall) at_gemm(1, 0, (int)m, (int)m, Co, X, X, A, 0.f);   /* A = X^T X */
-        else at_gemm(0, 1, (int)m, (int)m, K, X, X, A, 0.f);         /* A = X X^T */
-        at_gemm(0, 0, (int)m, (int)m, (int)m, A, A, B, 0.f);         /* B = A^2 */
+        if (tall) at_gemm_f32(1, 0, (int)m, (int)m, Co, X, X, A, 0.f);   /* A = X^T X */
+        else at_gemm_f32(0, 1, (int)m, (int)m, K, X, X, A, 0.f);         /* A = X X^T */
+        at_gemm_f32(0, 0, (int)m, (int)m, (int)m, A, A, B, 0.f);         /* B = A^2 */
         k_mu_lin<<<nm, 256>>>(B, A, m * m, c, b);                     /* B = c A^2 + b A */
         cudaMemcpyAsync(Y, X, n * 4, cudaMemcpyDeviceToDevice, 0);
-        if (tall) at_gemm(0, 0, Co, K, K, X, B, Y, 1.f);   /* Y = X + X B ... */
-        else at_gemm(0, 0, Co, K, Co, B, X, Y, 1.f);                        /* Y = X + B X ... */
+        if (tall) at_gemm_f32(0, 0, Co, K, K, X, B, Y, 1.f);   /* Y = X + X B ... */
+        else at_gemm_f32(0, 0, Co, K, Co, B, X, Y, 1.f);                        /* Y = X + B X ... */
         k_mu_lin<<<nb, 256>>>(Y, X, n, 1.f, a - 1.f);                 /* ... + (a - 1) X = a X + (B) X */
         float *t = X; X = Y; Y = t;
     }
     k_mu_apply<<<nb, 256>>>(p, X, n, lr, sqrtf(fmaxf(1.f, (float)Co / (float)K)), wd);
+}
+
+/* ---- iBOT input masking: the voxels of masked token cells (edge ps; mask [G^3], G = n / ps) set to val ---- */
+__global__ void k_mask_cells(float *x, int n, int ps, const uint8_t *mask, float val) {
+    const long long n3 = (long long)n * n * n;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n3; i += (long long)gridDim.x * blockDim.x) {
+        const int z = (int)(i / ((long long)n * n)), y = (int)((i / n) % n), xx = (int)(i % n), G = n / ps;
+        if (mask[((size_t)(z / ps) * G + y / ps) * G + xx / ps]) x[i] = val;
+    }
+}
+extern "C" void dr_mask_cells(float *x, int n, int ps, const uint8_t *mask, float val) { k_mask_cells<<<nbk((long long)n * n * n, 256), 256>>>(x, n, ps, mask, val); }
+
+/* ---- per-row argmax (prototype usage monitor) ---- */
+__global__ void k_argmax_rows(const float *q, int K, int *out) {
+    __shared__ float bv[256]; __shared__ int bi[256];
+    const int r = blockIdx.x; float best = -INFINITY; int b = 0;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) { const float v = q[(size_t)r * K + k]; if (v > best) { best = v; b = k; } }
+    bv[threadIdx.x] = best; bi[threadIdx.x] = b; __syncthreads();
+    for (int s = blockDim.x / 2; s; s >>= 1) { if (threadIdx.x < s && bv[threadIdx.x + s] > bv[threadIdx.x]) { bv[threadIdx.x] = bv[threadIdx.x + s]; bi[threadIdx.x] = bi[threadIdx.x + s]; } __syncthreads(); }
+    if (!threadIdx.x) out[r] = bi[0];
+}
+extern "C" void dr_argmax_rows(const float *q, int R, int K, int *out) { if (R > 0) k_argmax_rows<<<R, 256>>>(q, K, out); }
+/* unit rows in place (the weight-normed prototype directions after a Muon step) */
+extern "C" void dr_unit_rows(float *v, int R, int N) { static float *r = nullptr; static int rn = 0; if (rn < R) { if (r) cudaFree(r); cudaMalloc(&r, (size_t)R * 4); rn = R; } k_rownorm<<<nbk((long long)R * 32, 256), 256>>>(v, v, r, R, N, 1e-12f, nullptr); }
+
+/* ---- object / region terms (upstream ObjectLoss): margin-capped SupCon L_out between student anchors S [N][D] and teacher keys T [N][D]
+   (the same points in the other view; unit vectors), objects obj [N] (> 0 labelled), validity vs / vt [N] (u8). One block per anchor ---- */
+__global__ void k_obj(const float *S, const float *T, const int *obj, const uint8_t *vs, const uint8_t *vt, int N, int D, float temp, float margin,
+                      float *gs, float *lossv, float *wv) {
+    extern __shared__ float sh[];   /* [N] similarities, then 256 reduction slots */
+    float *sim = sh, *red = sh + N;
+    const int i = blockIdx.x, oi = obj[i];
+    if (!vs[i] || oi <= 0) { if (!threadIdx.x) { lossv[i] = 0.f; wv[i] = 0.f; } return; }
+    int npos = 0, npns = 0, nneg = 0;
+    for (int j = threadIdx.x; j < N; j += blockDim.x) {
+        float a = 0.f; for (int c = 0; c < D; c++) a += S[(size_t)i * D + c] * T[(size_t)j * D + c];
+        sim[j] = a;
+    }
+    __syncthreads();
+    /* counts (serial over N by thread 0: N small) */
+    __shared__ int cnt[3]; __shared__ float nlse;
+    if (!threadIdx.x) {
+        int p = 0, q = 0, n = 0; float m = -INFINITY;
+        for (int j = 0; j < N; j++) { if (!vt[j] || obj[j] <= 0) continue; if (obj[j] == oi) { p++; if (j != i) q++; } else { n++; m = fmaxf(m, sim[j] / temp); } }
+        cnt[0] = p; cnt[1] = q; cnt[2] = n;
+        float z = 0.f; for (int j = 0; j < N; j++) if (vt[j] && obj[j] > 0 && obj[j] != oi) z += expf(sim[j] / temp - m);
+        nlse = n ? m + logf(z) : 0.f;
+    }
+    __syncthreads();
+    npos = cnt[0]; npns = cnt[1]; nneg = cnt[2];
+    if (!nneg || !npos) { if (!threadIdx.x) { lossv[i] = 0.f; wv[i] = 0.f; } return; }
+    const int excl = npns > 0;   /* exclude the self point when another positive exists */
+    const int np_ = excl ? npns : npos;
+    /* loss = 1/np sum_pos softplus(nlse - min(s, m) / t); d/ds_pos = -sig / np / t (s < m); d nlse = sum_pos sig / np -> softmax over negatives / t */
+    float L = 0.f, sg = 0.f;
+    for (int j = threadIdx.x; j < N; j += blockDim.x) {
+        if (!vt[j] || obj[j] != oi || (excl && j == i)) continue;
+        const float pl = fminf(sim[j], margin) / temp, x = nlse - pl;
+        L += x > 20.f ? x : log1pf(expf(x)); sg += 1.f / (1.f + expf(-x));
+    }
+    red[threadIdx.x] = L; __syncthreads();
+    for (int s = blockDim.x / 2; s; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s]; __syncthreads(); }
+    const float Lt = red[0]; __syncthreads();
+    red[threadIdx.x] = sg; __syncthreads();
+    for (int s = blockDim.x / 2; s; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s]; __syncthreads(); }
+    const float sgt = red[0] / np_; __syncthreads();
+    /* ds_j into sim (reused as the coefficient row) */
+    for (int j = threadIdx.x; j < N; j += blockDim.x) {
+        float c = 0.f;
+        if (vt[j] && obj[j] > 0) {
+            if (obj[j] == oi) { if (!(excl && j == i) && sim[j] < margin) { const float x = nlse - sim[j] / temp; c = -1.f / (1.f + expf(-x)) / np_ / temp; } }
+            else c = sgt * expf(sim[j] / temp - nlse) / temp;
+        }
+        sim[j] = c;
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < D; c += blockDim.x) { float a = 0.f; for (int j = 0; j < N; j++) a += sim[j] * T[(size_t)j * D + c]; gs[(size_t)i * D + c] = a; }
+    if (!threadIdx.x) { lossv[i] = Lt / np_; wv[i] = 1.f; }
+}
+/* the anchors' mean: loss -> out[0] (+=), the per-anchor gradients scaled by w / count into gS (+=); returns via out[1] the anchor count */
+__global__ void k_obj_fin(const float *lossv, const float *wv, const float *gtmp, int N, int D, float w, float cnt_extra, float *gS, float *out) {
+    __shared__ float red[256], cr[256];
+    float a = 0.f, c = 0.f; for (int i = threadIdx.x; i < N; i += blockDim.x) { a += lossv[i]; c += wv[i]; }
+    red[threadIdx.x] = a; cr[threadIdx.x] = c; __syncthreads();
+    for (int s = blockDim.x / 2; s; s >>= 1) { if (threadIdx.x < s) { red[threadIdx.x] += red[threadIdx.x + s]; cr[threadIdx.x] += cr[threadIdx.x + s]; } __syncthreads(); }
+    const float n = cr[0] + cnt_extra, inv = n > 0.f ? w / n : 0.f;
+    for (int k = threadIdx.x; k < N * D; k += blockDim.x) if (wv[k / D] > 0.f) gS[k] += gtmp[k] * inv;
+    if (!threadIdx.x) { out[0] += red[0] * inv; out[1] += cr[0]; }
+}
+extern "C" void dr_obj(const float *S, const float *T, const int *obj, const uint8_t *vs, const uint8_t *vt, int N, int D, float temp, float margin, float w, float *gS, float *out) {
+    static float *buf = nullptr; static size_t cap = 0;
+    const size_t need = ((size_t)N * D + 2 * (size_t)N) * 4;
+    if (need > cap) { if (buf) cudaFree(buf); cudaMalloc(&buf, need); cap = need; }
+    if (N <= 0) return;
+    float *gt = buf, *lv = gt + (size_t)N * D, *wv = lv + N;
+    k_obj<<<N, 128, ((size_t)N + 256) * 4>>>(S, T, obj, vs, vt, N, D, temp, margin, gt, lv, wv);
+    k_obj_fin<<<1, 256>>>(lv, wv, gt, N, D, w, 0.f, gS, out);
+}
+
+/* ---- per-object means of point rows: x [N][D], grp [N] (-1: none) -> m [M][D], cnt [M]; backward: gm [M][D] / cnt into gx (+=) ---- */
+__global__ void k_gmean(const float *x, const int *grp, int N, int D, int M, float *m, float *cnt) {
+    const int g = blockIdx.x; if (g >= M) return;
+    for (int c = threadIdx.x; c < D; c += blockDim.x) { float a = 0.f; int n = 0; for (int i = 0; i < N; i++) if (grp[i] == g) { a += x[(size_t)i * D + c]; n++; } m[(size_t)g * D + c] = n ? a / n : 0.f; if (!c) cnt[g] = (float)n; }
+}
+__global__ void k_gmean_bwd(const float *gm, const float *cnt, const int *grp, int N, int D, float *gx) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= N * D) return;
+    const int g = grp[i / D]; if (g < 0 || cnt[g] <= 0.f) return;
+    gx[i] += gm[(size_t)g * D + i % D] / cnt[g];
+}
+extern "C" void dr_gmean(const float *x, const int *grp, int N, int D, int M, float *m, float *cnt) { if (M > 0) k_gmean<<<M, 64>>>(x, grp, N, D, M, m, cnt); }
+extern "C" void dr_gmean_bwd(const float *gm, const float *cnt, const int *grp, int N, int D, float *gx) { if (N > 0) k_gmean_bwd<<<nbk((long long)N * D, 256), 256>>>(gm, cnt, grp, N, D, gx); }
+
+/* ---- two-layer MLP (Linear -> GELU -> Linear) + L2 normalisation: the region head ---- */
+extern "C" void dr_mlp2_layout(dr_mlp2 *m, int Cin, int H, int O) { m->Cin = Cin; m->H = H; m->O = O; size_t o = 0; m->w1 = o; o += (size_t)H * Cin; m->b1 = o; o += H; m->w2 = o; o += (size_t)O * H; m->b2 = o; o += O; m->n = o; }
+extern "C" size_t dr_mlp2_ws(const dr_mlp2 *m, int R) { return (al((size_t)R * m->H) * 3 + al((size_t)R * m->O) * 3 + al((size_t)R)) * 4; }
+extern "C" int dr_mlp2_fwd(const dr_mlp2 *m, const float *P, const float *x, int R, float *y, void *ws) {
+    float *a = (float *)ws, *h = a + al((size_t)R * m->H), *z = h + al((size_t)R * m->H) * 2, *r = z + al((size_t)R * m->O) * 3;
+    CK(at_gemm(0, 1, R, m->H, m->Cin, x, P + m->w1, a, 0.f)); k_bias_gelu<<<nbk((long long)R * m->H, 256), 256>>>(a, P + m->b1, h, R, m->H);
+    CK(at_gemm(0, 1, R, m->O, m->H, h, P + m->w2, z, 0.f)); k_bias<<<nbk((long long)R * m->O, 256), 256>>>(z, P + m->b2, R, m->O);
+    k_rownorm<<<nbk((long long)R * 32, 256), 256>>>(z, y, r, R, m->O, 1e-12f, nullptr);
+    return 0;
+}
+extern "C" int dr_mlp2_bwd(const dr_mlp2 *m, const float *P, float *G, const float *x, const float *y, const float *dy, int R, float *dx, void *ws) {
+    float *a = (float *)ws, *h = a + al((size_t)R * m->H), *dh = h + al((size_t)R * m->H), *z = dh + al((size_t)R * m->H), *dz = z + al((size_t)R * m->O), *r = dz + al((size_t)R * m->O) * 2;
+    (void)z;
+    k_rownorm_bwd<<<nbk((long long)R * 32, 256), 256>>>(y, r, dy, dz, R, m->O, 1e-12f, 0);
+    CK(at_gemm(1, 0, m->O, m->H, R, dz, h, G + m->w2, 1.f)); colsum2(dz, R, m->O, G + m->b2);
+    CK(at_gemm(0, 0, R, m->H, m->O, dz, P + m->w2, dh, 0.f));
+    k_gelu_bwd<<<nbk((long long)R * m->H, 256), 256>>>(dh, a, (long long)R * m->H);
+    CK(at_gemm(1, 0, m->H, m->Cin, R, dh, x, G + m->w1, 1.f)); colsum2(dh, R, m->H, G + m->b1);
+    if (dx) CK(at_gemm(0, 0, R, m->Cin, m->H, dh, P + m->w1, dx, 1.f));   /* (accumulated) */
+    return 0;
+}
+
+/* ---- ink term (upstream ObjectLoss._ink_loss, one anchor family): anchors A [Na][D] (unit) pulled toward keys Kp [np][D] and pushed from
+   Kn [nn][D] (unit; teacher points of the other view + the FIFO queues). Pull keys whose point id equals the anchor's are left out while
+   another pull key exists. Per anchor, with logits l = s / T: push mean m_n and lme_n = lse(l_n) - log nn; pull logits capped at
+   max(margin, max(s_n) + T) / T (cap detached): mean m_p and lme_p over the kept keys; loss 0.5 (softplus(m_n - m_p) + softplus(lme_n -
+   lme_p)). The mean over anchors times w -> out[0] (+=); d / d A (w / Na) added into gA. One block per anchor ---- */
+__global__ void k_ink(const float *A, const int *aid, const float *Kp, const int *kid, int np, const float *Kn, int nn, int D, float T, float margin,
+                      float *lv, float *gt) {
+    extern __shared__ float sh[];
+    float *sp_ = sh, *sn = sh + np, *red = sn + nn;
+    const int i = blockIdx.x, me = aid ? aid[i] : -1;
+    for (int j = threadIdx.x; j < np + nn; j += blockDim.x) {
+        const float *k = j < np ? Kp + (size_t)j * D : Kn + (size_t)(j - np) * D; float a = 0.f;
+        for (int c = 0; c < D; c++) a += A[(size_t)i * D + c] * k[c];
+        sh[j] = a;
+    }
+    __syncthreads();
+    __shared__ float st[8]; __shared__ int nkeep;
+    if (!threadIdx.x) {
+        float mx = -INFINITY, mn = 0.f; for (int j = 0; j < nn; j++) { mx = fmaxf(mx, sn[j]); mn += sn[j] / T; } mn /= nn;
+        float z = 0.f; for (int j = 0; j < nn; j++) z += expf(sn[j] / T - mx / T);
+        const float lmen = mx / T + logf(z) - logf((float)nn), cap = fmaxf(margin, mx + T);
+        int other = 0; for (int j = 0; j < np; j++) other += !(kid && kid[j] == me && me >= 0);
+        const int excl = other > 0; int cnt = 0; float pm = 0.f, pmx = -INFINITY;
+        for (int j = 0; j < np; j++) { if (excl && kid && kid[j] == me && me >= 0) continue; const float pl = fminf(sp_[j], cap) / T; pm += pl; pmx = fmaxf(pmx, pl); cnt++; }
+        pm /= cnt; float zp = 0.f;
+        for (int j = 0; j < np; j++) { if (excl && kid && kid[j] == me && me >= 0) continue; zp += expf(fminf(sp_[j], cap) / T - pmx); }
+        const float lmep = pmx + logf(zp) - logf((float)cnt);
+        const float x1 = mn - pm, x2 = lmen - lmep;
+        lv[i] = 0.5f * ((x1 > 20.f ? x1 : log1pf(expf(x1))) + (x2 > 20.f ? x2 : log1pf(expf(x2))));
+        st[0] = 0.5f / (1.f + expf(-x1)); st[1] = 0.5f / (1.f + expf(-x2)); st[2] = mx / T + logf(z); st[3] = pmx + logf(zp); st[4] = cap; st[5] = (float)excl; nkeep = cnt;
+    }
+    __syncthreads();
+    const float Aa = st[0], Bc = st[1], lsen = st[2], lsep = st[3], cap = st[4]; const int excl = st[5] > 0.f, cnt = nkeep;
+    for (int j = threadIdx.x; j < np + nn; j += blockDim.x) {
+        float c;
+        if (j < np) {
+            if ((excl && kid && kid[j] == me && me >= 0) || sp_[j] >= cap) c = 0.f;
+            else c = -(Aa / (cnt * T) + Bc * expf(sp_[j] / T - lsep) / T);
+        } else c = Aa / (nn * T) + Bc * expf(sn[j - np] / T - lsen) / T;
+        red[j] = c;
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < D; c += blockDim.x) {
+        float a = 0.f;
+        for (int j = 0; j < np; j++) a += red[j] * Kp[(size_t)j * D + c];
+        for (int j = 0; j < nn; j++) a += red[np + j] * Kn[(size_t)j * D + c];
+        gt[(size_t)i * D + c] = a;
+    }
+}
+__global__ void k_ink_fin(const float *lv, const float *gt, int Na, int D, float w, float *gA, float *out) {
+    __shared__ float red[256]; float a = 0.f;
+    for (int i = threadIdx.x; i < Na; i += blockDim.x) a += lv[i];
+    red[threadIdx.x] = a; __syncthreads();
+    for (int s = blockDim.x / 2; s; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s]; __syncthreads(); }
+    for (int k = threadIdx.x; k < Na * D; k += blockDim.x) gA[k] += gt[k] * w / Na;
+    if (!threadIdx.x) out[0] += red[0] * w / Na;
+}
+extern "C" void dr_ink(const float *A, const int *aid, int Na, const float *Kp, const int *kid, int np, const float *Kn, int nn, int D, float T, float margin, float w, float *gA, float *out) {
+    if (Na <= 0 || np <= 0 || nn <= 0) return;
+    static float *buf = nullptr; static size_t cap = 0;
+    const size_t need = ((size_t)Na * D + Na) * 4;
+    if (need > cap) { if (buf) cudaFree(buf); cudaMalloc(&buf, need); cap = need; }
+    float *gt = buf, *lv = buf + (size_t)Na * D;
+    k_ink<<<Na, 128, (size_t)2 * (np + nn) * 4>>>(A, aid, Kp, kid, np, Kn, nn, D, T, margin, lv, gt);
+    k_ink_fin<<<1, 256>>>(lv, gt, Na, D, w, gA, out);
 }

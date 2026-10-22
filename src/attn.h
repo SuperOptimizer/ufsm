@@ -45,6 +45,15 @@ void at_tok_to_cs(const float *t, float *x, int n, int C, long Sg, int nreg);
 void at_reg_grad(const float *gt, float *greg, int n, int C, long Sg, int nreg);   /* greg[r][c] += sum over sequences */
 void at_h16_to_f32(const void *x, long long n, int f16, float *y);   /* 16-bit storage (fp16 / bf16) -> fp32 */
 
+/* MX GEMM (src/lp_mxgemm.cu): at_gemm's operands and result, both operands quantised along K to MX-fp4 (bits 4) or MX-fp8 (bits 8)
+   with one ue8m0 scale per 32 K (round to nearest), block-scaled tensor-core products, fp32 accumulation; -1 unsupported */
+int lp_mx_gemm(int bits, int ta, int tb, int M, int N, int K, const float *A, const float *B, float *Cm, float beta);
+/* at_gemm's precision for the linear layers (attention stage, DINO / iBOT / region heads): 0 fp32 (default), 4 / 8 MX (env UFSM_LINEAR_MX);
+   at_gemm_f32 always fp32 (Muon's Newton-Schulz, tests) */
+void at_set_mx(int bits);
+int at_get_mx(void);
+int at_gemm_f32(int ta, int tb, int M, int N, int K, const float *A, const float *B, float *Cm, float beta);
+
 /* single ops (tests) */
 int at_gemm(int ta, int tb, int M, int N, int K, const float *A, const float *B, float *Cm, float beta);   /* C[M][N] = op(A) op(B) + beta C */
 void at_ln_fwd(const float *x, const float *g, const float *b, float *y, float *mean, float *rstd, long T, int C);

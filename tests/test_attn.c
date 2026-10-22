@@ -237,6 +237,73 @@ static int test_peg(void) {
     return bad;
 }
 
+/* ---- MX GEMM: against an exact double product of the operands quantised as the kernel does (MX blocks of 32 along K, RN) ---- */
+static float q_e2m1(float v) {   /* round to nearest even on the e2m1 grid, saturating */
+    const float a = fabsf(v); static const float g[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6}; float best = 6; int bi = 7;
+    if (a >= 6) return v < 0 ? -6.f : 6.f;
+    for (int i = 0; i < 7; i++) if (a >= g[i] && a <= g[i + 1]) { const float d0 = a - g[i], d1 = g[i + 1] - a; if (d0 < d1 || (d0 == d1 && !(i & 1))) { best = g[i]; bi = i; } else { best = g[i + 1]; bi = i + 1; } break; }
+    (void)bi; return v < 0 ? -best : best;
+}
+static float q_e4m3(float v) {
+    const float a = fabsf(v); if (a == 0) return 0; if (a >= 448) return v < 0 ? -448.f : 448.f;
+    int e; frexpf(a, &e); e -= 1; if (e < -6) e = -6;   /* (subnormals below 2^-6: step 2^-9) */
+    const float step = ldexpf(1.f, e - 3); float r = nearbyintf(a / step) * step;   /* (ties to even by the default rounding mode) */
+    if (r > 448) r = 448;
+    return v < 0 ? -r : r;
+}
+static int mx_e(float amax, float iq) { float x = amax * iq; uint32_t u; memcpy(&u, &x, 4); int e = (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0); return e < -126 ? -126 : e > 126 ? 126 : e; }
+static void mxq_rows(const double *X, int rows, int K, int bits, double *Q) {   /* X [rows][K] -> quantised values */
+    for (int r = 0; r < rows; r++) for (int k0 = 0; k0 < K; k0 += 32) {
+        float am = 0; for (int k = k0; k < k0 + 32 && k < K; k++) am = fmaxf(am, fabsf((float)X[(size_t)r * K + k]));
+        const int e = mx_e(am, bits == 4 ? 1.f / 6.f : 1.f / 448.f); const float m = ldexpf(1.f, -e);
+        for (int k = k0; k < k0 + 32 && k < K; k++) { const float v = (float)X[(size_t)r * K + k] * m; Q[(size_t)r * K + k] = ldexp(bits == 4 ? q_e2m1(v) : q_e4m3(v), e); }
+    }
+}
+static int test_mx_gemm(int bits, int ta, int tb) {
+    const int M = 70, N = 45, K = 100;
+    double *A = malloc((size_t)M * K * 8), *B = malloc((size_t)N * K * 8), *Aq = malloc((size_t)M * K * 8), *Bq = malloc((size_t)N * K * 8), *ref = malloc((size_t)M * N * 8), *rf32 = malloc((size_t)M * N * 8);
+    for (int i = 0; i < M * K; i++) A[i] = rf(nrand());   /* logical A [M][K], B [N][K] */
+    for (int i = 0; i < N * K; i++) B[i] = rf(nrand() * 0.1);
+    mxq_rows(A, M, K, bits, Aq); mxq_rows(B, N, K, bits, Bq);
+    for (int i = 0; i < M; i++) for (int j = 0; j < N; j++) { double a = 0, b = 0; for (int k = 0; k < K; k++) { a += Aq[(size_t)i * K + k] * Bq[(size_t)j * K + k]; b += A[(size_t)i * K + k] * B[(size_t)j * K + k]; } ref[i * N + j] = a; rf32[i * N + j] = b; }
+    /* storage per transpose flag */
+    double *As = malloc((size_t)M * K * 8), *Bs = malloc((size_t)N * K * 8);
+    for (int i = 0; i < M; i++) for (int k = 0; k < K; k++) As[ta ? (size_t)k * M + i : (size_t)i * K + k] = A[(size_t)i * K + k];
+    for (int j = 0; j < N; j++) for (int k = 0; k < K; k++) Bs[tb ? (size_t)j * K + k : (size_t)k * N + j] = B[(size_t)j * K + k];
+    float *Ad = dev(As, (size_t)M * K), *Bd = dev(Bs, (size_t)N * K), *Cd = nn_malloc((size_t)M * N * 4); nn_zero(Cd, (size_t)M * N * 4);
+    int bad = lp_mx_gemm(bits, ta, tb, M, N, K, Ad, Bd, Cd, 0.f) != 0;
+    double *c = host(Cd, (size_t)M * N); char nm[64]; snprintf(nm, sizeof nm, "fp%d %d%d", bits, ta, tb);
+    printf("mx gemm %s:\n", nm); bad += report("vs quant", c, ref, M * N);
+    double e2 = 0, r2 = 0; for (int i = 0; i < M * N; i++) { e2 += (c[i] - rf32[i]) * (c[i] - rf32[i]); r2 += rf32[i] * rf32[i]; }
+    printf("    (vs the fp32 product: rel L2 %.3f)\n", sqrt(e2 / r2));
+    free(A); free(B); free(Aq); free(Bq); free(ref); free(rf32); free(As); free(Bs); free(c); nn_free(Ad); nn_free(Bd); nn_free(Cd);
+    return bad;
+}
+
+/* the block's output / gradients with MX linears against fp32 (relative L2; fp4 is coarse by design: the gate is a loose bound) */
+static int test_block_mx(int bits, double tol) {
+    blk B = {0}; B.d.C = 192; B.d.H = 4; B.d.F = 512; B.d.rope = 0; B.d.nreg = 0; B.d.rope_base = 100.f; B.g = (at_geom){1, 512, 8, 8, 8};
+    const size_t np = at_block_layout(&B.d, &B.bp, 0); const long T = 512; const int C = 192;
+    double *P = malloc(np * 8), *x = malloc(T * C * 8), *R = malloc(T * C * 8);
+    for (size_t i = 0; i < np; i++) P[i] = rf(0.05 * nrand());
+    for (int c = 0; c < C; c++) { P[B.bp.ln1g + c] = P[B.bp.ln2g + c] = P[B.bp.qg + c] = P[B.bp.kg + c] = 1; }
+    for (long i = 0; i < T * C; i++) { x[i] = rf(nrand()); R[i] = rf(nrand()); }
+    float *Pd = dev(P, np), *xd = dev(x, T * C), *y[2], *G[2], *gx[2]; at_ws w; void *wb = nn_malloc(at_ws_bytes(&B.d, T)); at_ws_carve(&w, &B.d, T, wb);
+    for (int k = 0; k < 2; k++) {
+        at_set_mx(k ? bits : 0);
+        y[k] = nn_malloc(T * C * 4); G[k] = nn_malloc(np * 4); nn_zero(G[k], np * 4); gx[k] = dev(R, T * C);
+        at_block_fwd(&B.d, Pd, &B.bp, xd, y[k], &B.g, &w); at_block_bwd(&B.d, Pd, G[k], &B.bp, xd, gx[k], &B.g, &w);
+    }
+    at_set_mx(0);
+    double *a = host(y[1], T * C), *b = host(y[0], T * C), *ga = host(G[1], np), *gb = host(G[0], np), *xa = host(gx[1], T * C), *xb = host(gx[0], T * C);
+    double e[3] = {0}, r[3] = {0};
+    for (long i = 0; i < T * C; i++) { e[0] += (a[i] - b[i]) * (a[i] - b[i]); r[0] += b[i] * b[i]; e[2] += (xa[i] - xb[i]) * (xa[i] - xb[i]); r[2] += xb[i] * xb[i]; }
+    for (size_t i = 0; i < np; i++) { e[1] += (ga[i] - gb[i]) * (ga[i] - gb[i]); r[1] += gb[i] * gb[i]; }
+    const double ry = sqrt(e[0] / r[0]), rp = sqrt(e[1] / r[1]), rx = sqrt(e[2] / r[2]); const int bad = !(ry < tol && rp < tol && rx < tol);
+    printf("block, fp%d linears vs fp32: output rel L2 %.3f, parameter gradient %.3f, input gradient %.3f%s\n", bits, ry, rp, rx, bad ? "  FAIL" : "");
+    return bad;
+}
+
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
     int bad = 0;
@@ -245,6 +312,8 @@ int main(void) {
     bad += test_block(1, 8, 8, 8, 0, 96, 128, 1, 6);
     bad += test_attn_large(1, 4, 16, 96);
     bad += test_peg();
+    for (int b = 4; b <= 8; b += 4) for (int ta = 0; ta < 2; ta++) for (int tb = 0; tb < 2; tb++) bad += test_mx_gemm(b, ta, tb);
+    bad += test_block_mx(8, 0.1); bad += test_block_mx(4, 0.35);
     printf(bad ? "test_attn: %d FAILED\n" : "test_attn: all passed\n", bad);
     return bad != 0;
 }
