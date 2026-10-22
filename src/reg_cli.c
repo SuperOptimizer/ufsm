@@ -403,13 +403,43 @@ static int cmd_fit(int argc, char **argv) {
 #undef MODEL_FIT
 }
 
+/* ---------- reg map: points / boxes between the two volumes ---------- */
+static int cmd_map(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: ufsm reg map <map.json> [--f2c] [--um] x,y,z [x,y,z ...]   (coarse L0 voxels -> fine L0 voxels; --f2c the other way)\n"
+        "       ufsm reg map <map.json> [--f2c] --box z,y,x,nz,ny,nx   (the bounding box of the mapped box, zyx like --box elsewhere)\n"); return 2; }
+    rctx x; if (ctx_open(&x, argv[3], nullptr, 0)) return 1;
+    const int f2c = has(argc, argv, "--f2c");
+    const char *bx = opt(argc, argv, "--box", nullptr);
+    if (bx) {
+        double v[6]; if (sscanf(bx, "%lf,%lf,%lf,%lf,%lf,%lf", v, v + 1, v + 2, v + 3, v + 4, v + 5) != 6) { fprintf(stderr, "reg map: --box z,y,x,nz,ny,nx\n"); return 2; }
+        double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+        for (int a = 0; a <= 8; a++) for (int b = 0; b <= 8; b++) for (int c = 0; c <= 8; c++) {   /* 9^3 points: the field is not affine */
+            const double p[3] = {v[2] + v[5] * c / 8, v[1] + v[4] * b / 8, v[0] + v[3] * a / 8}; double q[3];
+            if (f2c) rmap_f2c(&x.m, p, q); else rmap_c2f(&x.m, p, q);
+            for (int d = 0; d < 3; d++) { lo[d] = fmin(lo[d], q[d]); hi[d] = fmax(hi[d], q[d]); }
+        }
+        printf("%lld,%lld,%lld,%lld,%lld,%lld\n", (long long)floor(lo[2]), (long long)floor(lo[1]), (long long)floor(lo[0]),
+               (long long)(ceil(hi[2]) - floor(lo[2]) + 1), (long long)(ceil(hi[1]) - floor(lo[1]) + 1), (long long)(ceil(hi[0]) - floor(lo[0]) + 1));
+    }
+    for (int i = 3; i < argc; i++) {
+        double p[3], q[3];
+        if (sscanf(argv[i], "%lf,%lf,%lf", p, p + 1, p + 2) != 3 || argv[i][0] == '-') continue;
+        if (i > 3 && !strcmp(argv[i - 1], "--box")) continue;
+        if (f2c) rmap_f2c(&x.m, p, q); else rmap_c2f(&x.m, p, q);
+        printf("%.4f,%.4f,%.4f\n", q[0], q[1], q[2]);
+    }
+    ctx_close(&x);
+    return 0;
+}
+
 int cmd_reg_overlay(int argc, char **argv);
 int cmd_reg_init(int argc, char **argv);
 int cmd_reg(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: ufsm reg <pair|boxes|fit|stats|overlay|init> ...\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: ufsm reg <pair|map|boxes|fit|stats|overlay|init> ...\n"); return 2; }
     store_global_init();
     const char *s = argv[2];
     if (!strcmp(s, "pair")) return cmd_pair(argc, argv);
+    if (!strcmp(s, "map")) return cmd_map(argc, argv);
     if (!strcmp(s, "boxes")) return cmd_boxes(argc, argv);
     if (!strcmp(s, "fit")) return cmd_fit(argc, argv);
     if (!strcmp(s, "stats")) return cmd_stats(argc, argv);
