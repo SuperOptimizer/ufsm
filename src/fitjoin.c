@@ -23,6 +23,8 @@ static double fj_knot(const float *v, int nk, int dz, double z) {   /* (fit.c kn
     return v[k0] + t * (v[nk > 1 ? k0 + 1 : k0] - v[k0]);
 }
 
+static int cmp_long(const void *a, const void *b) { const long x = *(const long *)a, y = *(const long *)b; return (x > y) - (x < y); }
+
 int cmd_fit_join(int argc, char **argv) {
     if (argc < 7) {
         fprintf(stderr, "usage: ufsm fit-join <out-set> <fields-dir> [--blend 16] [--min-conf 0.3] [--samples 4000000] <slab-model> <z0> <z1> ...\n"
@@ -74,8 +76,8 @@ int cmd_fit_join(int argc, char **argv) {
         const size_t HW = (size_t)f.shape[1] * f.shape[2], n = (size_t)(fz1 - fz0) * HW;
         size_t cand = 0; for (size_t i = 0; i < n; i++) cand += f.f.w[i] != 0;
         const size_t stride = cand > (size_t)nsamp ? cand / (size_t)nsamp : 1;
-        long long hist[41] = {0}, used = 0, near = 0; size_t seen = 0;
-        double *dv = malloc(sizeof(double) * (cand / stride + 2)); size_t nd = 0;
+        long long used = 0, near = 0; size_t seen = 0;   /* (slab gauges are arbitrary: the rounded differences can be any integer) */
+        double *dv = malloc(sizeof(double) * (cand / stride + 2)); long *rv = malloc(sizeof(long) * (cand / stride + 2)); size_t nd = 0;
         for (size_t i = 0; i < n; i++) {
             if (!f.f.w[i]) continue;
             if (seen++ % stride) continue;
@@ -85,17 +87,16 @@ int cmd_fit_join(int argc, char **argv) {
             const double z = (fz0 + zz + 0.5) * h, y = (yy + 0.5) * h, x = (xx + 0.5) * h;
             const double d = fit_W(b, z - zb, y, x) - fit_W(a, z - za, y, x);
             if (!isfinite(d)) continue;
-            const long r = lround(d);
-            if (r >= -20 && r <= 20) hist[r + 20]++;
-            dv[nd++] = d; used++;
+            rv[nd] = lround(d); dv[nd++] = d; used++;
         }
-        int best = 20; for (int q = 0; q < 41; q++) if (hist[q] > hist[best]) best = q;
-        const int shift = best - 20;
+        qsort(rv, nd, sizeof(long), cmp_long);   /* the mode of the rounded differences */
+        long shift = 0; size_t bestn = 0;
+        for (size_t i = 0; i < nd;) { size_t j = i; while (j < nd && rv[j] == rv[i]) j++; if (j - i > bestn) { bestn = j - i; shift = rv[i]; } i = j; }
         for (size_t i = 0; i < nd; i++) near += fabs(dv[i] - shift) < 0.25;
-        free(dv); fit_fields_free(&f);
+        free(dv); free(rv); fit_fields_free(&f);
         if (shift) for (int q = 0; q < b->nk; q++) b->offset[q] -= (float)shift;
-        const double share = used ? (double)hist[best] / used : 0;
-        printf("  %3d|%-3d %10.0f %14lld %+6d  %10.4f  %10.4f\n", k - 1, k, s->z0[k], used, shift, share, used ? (double)near / used : 0);
+        const double share = used ? (double)bestn / used : 0;
+        printf("  %3d|%-3d %10.0f %14lld %+6ld  %10.4f  %10.4f\n", k - 1, k, s->z0[k], used, shift, share, used ? (double)near / used : 0);
         tot_n += used; tot_share += share * used;
     }
     if (ns > 1) printf("  mean share(mode) over the boundaries, overlap-cell weighted: %.4f\n", tot_n ? tot_share / tot_n : 0);

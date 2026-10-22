@@ -7,6 +7,7 @@
 #include "z3w.h"
 #include "json.h"
 #include "tiff.h"
+#include "fit.h"
 #include <pthread.h>
 #include <sys/stat.h>
 #include <zstd.h>
@@ -815,6 +816,15 @@ int cmd_dinovol_eval(int argc, char **argv) {
         z3_close(cz); store_close(cs);
     }
     float *e0 = malloc(C * 4), *ev = malloc(C * 4);
+    /* --fit MODEL: the same walk scored by a winding fit instead of the embedding (the fit's same sheet: the normal sample whose W is
+       nearest the reference's W; MODEL a fit / fit-set directory on the embedding's voxel grid): the fit's sheet following, comparable */
+    fit_set *fsm = nullptr; double fo[3] = {0, 0, 0}, W0 = 0;
+    if (opt(argc, argv, "--fit", nullptr)) {
+        fsm = fit_set_load(opt(argc, argv, "--fit", nullptr));
+        if (!fsm) { fprintf(stderr, "dinovol-eval: cannot load the fit %s\n", opt(argc, argv, "--fit", nullptr)); return 1; }
+        for (int d = 0; d < 3; d++) fo[d] = (double)fsm->global->origin[d];
+    }
+#define FIT_AT(p_) fit_set_W(fsm, (p_)[0] - fo[0], (p_)[1] - fo[1], (p_)[2] - fo[2])
     int nsurf = 0;
     for (int ai = 3; ai < argc; ai++) {
         if (argv[ai][0] == '-' && argv[ai][1] == '-') { ai += strcmp(argv[ai], "--codes") ? 1 : 2; continue; }
@@ -839,6 +849,7 @@ int cmd_dinovol_eval(int argc, char **argv) {
             const long i = cand[ev_rng(&seed) % (unsigned long)nc];
             const double u0 = (double)(i % S.w), v0 = (double)(i / S.w);
             double p0[3]; if (!surf_pos(&S, u0, v0, p0) || !cc_vec(&cc, step, p0, e0)) { nskip_ref++; continue; }
+            if (fsm) W0 = FIT_AT(p0);
             for (int dj = 0; dj < ndir; dj++) {
                 const double ang = 2 * M_PI * ev_unif(&seed), cu = cos(ang), sv = sin(ang);
                 double u = u0, v = v0, len = 0, prev[3] = {p0[0], p0[1], p0[2]}; int di = 0;
@@ -861,7 +872,7 @@ int cmd_dinovol_eval(int argc, char **argv) {
                             for (int tt = -R; tt <= R; tt++) {
                                 const double s3[3] = {q3[0] + tt * nn[0], q3[1] + tt * nn[1], q3[2] + tt * nn[2]};
                                 if (!cc_vec(&cc, step, s3, ev)) continue;
-                                const float cs = vcos(e0, ev, C);
+                                const float cs = fsm ? (float)-fabs(FIT_AT(s3) - W0) : vcos(e0, ev, C);
                                 if (cs > best || (cs == best && abs(tt) < abs(bt))) { best = cs; bt = tt; }
                             }
                             if (best > -2.f) {
@@ -886,6 +897,7 @@ int cmd_dinovol_eval(int argc, char **argv) {
         }
         free(cand); free(S.x); free(S.y); free(S.z);
     }
+    if (fsm) printf("(scored by the fit %s: per sample the W nearest the reference W, not the embedding)\n", opt(argc, argv, "--fit", ""));
     printf("dinovol-eval %s (%s, step %d), %d surface(s), %d reference vertices x %d directions, normal range +-%d voxels\n", group, oname, step, nsurf, nref, ndir, R);
     printf("| distance (vx) | n |");
     for (int k = 0; k < nt; k++) printf(" within %d vx |", tols[k]);
@@ -908,6 +920,7 @@ int cmd_dinovol_eval(int argc, char **argv) {
         free(cbuf);
     }
     for (int i = 0; i < cc.n; i++) free(cc.s[i].data);
-    free(cc.s); free(e0); free(ev); emb_close(&e);
+    free(cc.s); free(e0); free(ev); emb_close(&e); fit_set_free(fsm);
+#undef FIT_AT
     return 0;
 }

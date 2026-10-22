@@ -30,7 +30,7 @@ SRC += src/repack.c
 SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c
 SRC += src/inksplat.c
 SRC += src/tfx.c
-SRC += src/fitjoin.c
+SRC += src/fitjoin.c src/fieldsoracle.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm

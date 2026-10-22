@@ -132,6 +132,7 @@ static int usage(void) {
         "  ufsm self-gate <wraps-dir> <out-dir> --fields DIR --model FIT [--ct ..] [--nb FIT].. [--exclude ..]   strict stretches of a box fit -> label tifxyz + q.tif\n"
         "  ufsm ct-fields <ct-root> <key> <fields-dir> --ct-um U   CT planes ct / cs of a fit-field directory (fit --w-ct / --w-cspacing)\n"
         "  ufsm fit-join <out-set> <fields-dir> <slab-model> <z0> <z1> ...   independent z-slab fits -> one fit set, gauges matched on the overlaps\n"
+        "  ufsm fields-oracle <fields-dir> <phase-root> <phase-key> <out-dir>   fit fields with the phase planes from a label phase raster (oracle / swap)\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..]  several models' fit fields averaged (phase: confidence-weighted complex mean)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
@@ -3243,6 +3244,7 @@ static int cmd_sample(int argc, char **argv) {
 
 int cmd_repack(int argc, char **argv);   /* src/repack.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
+int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "train")) return cmd_train(argc, argv);
     if (argc < 3) return usage();
@@ -3265,6 +3267,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "band")) return cmd_band(argc, argv);
     if (!strcmp(cmd, "fit")) return cmd_fit(argc, argv);
     if (!strcmp(cmd, "fit-join")) return cmd_fit_join(argc, argv);
+    if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
     if (!strcmp(cmd, "convert-unwrap2")) return cmd_convert_unwrap2(argc, argv);
     if (!strcmp(cmd, "repack")) return cmd_repack(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);

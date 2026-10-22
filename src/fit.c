@@ -1228,6 +1228,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
     for (int k = 0; k < 6; k++) dt[k] = f->t[k];
     if (!cpu) {
         dfield = nn_malloc(10 * n);
+        if (!dfield) { fprintf(stderr, "fit: no device memory for the fields (%.1f GB: 10 B per cell of %dx%dx%d); use a smaller box or --slab\n", 10.0 * n / 1e9, f->D, f->H, f->W); fit_free(m); return nullptr; }
         nn_h2d(dfield, f->pc, n); nn_h2d(dfield + n, f->ps, n); nn_h2d(dfield + 8 * n, f->sp, n); nn_h2d(dfield + 9 * n, f->w, n);
         for (int k = 0; k < 6; k++) nn_h2d(dfield + (2 + k) * n, f->t[k], n);
         dpc = dfield; dps = dfield + n; dsp = dfield + 8 * n; dw = dfield + 9 * n; for (int k = 0; k < 6; k++) dt[k] = dfield + (2 + k) * n;
