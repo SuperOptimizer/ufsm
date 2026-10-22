@@ -372,6 +372,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_imgops
 	./$(B)/test_tfx
 	./$(B)/test_dino_loss
+	UFSM_TEST_D=16 ./$(B)/test_dino_loss
 	./$(B)/test_ink_splat
 	./$(B)/test_pyports
 	./$(B)/test_edt

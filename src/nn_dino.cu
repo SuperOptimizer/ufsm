@@ -55,7 +55,6 @@ extern "C" void dn_gather(const void *logits, int h16, size_t p3, int D, const i
 /* ---- SupCon: keys = the N anchors (student) + N2 teacher keys. Three passes over the N x (N + N2) similarities (D = 32): per-anchor
    statistics (lse, positives), the anchors' gradient sum_j g_ij k_j, the student keys' gradient sum_i g_ij a_i, with
    g_ij = (w_ij exp(s_ij / tau - lse_i) - [pos_ij] / np_i) / tau ---- */
-enum { SD = 32 };
 __device__ __forceinline__ int wrap_dk(int ci, int cj) {   /* winding difference in turns from codes 1 + round(18 q) mod 252 */
     int d = ((cj - ci) % 252 + 252) % 252; if (d >= 126) d -= 252;
     return (int)lrintf(d / 18.f);
@@ -79,7 +78,7 @@ __device__ __forceinline__ float blk_max(float v, float *sh) {
     return t;
 }
 /* the block-wide sum of a per-thread SD-vector into out[SD] (overwritten) */
-__device__ __forceinline__ void blk_vec_sum(float (&v)[SD], float *out, float (*sh)[SD]) {
+template <int SD> __device__ __forceinline__ void blk_vec_sum(float (&v)[SD], float *out, float (*sh)[SD]) {
 #pragma unroll
     for (int c = 0; c < SD; c++) for (int o = 16; o; o >>= 1) v[c] += __shfl_xor_sync(0xffffffffu, v[c], o);
     if ((threadIdx.x & 31) == 0) for (int c = 0; c < SD; c++) sh[threadIdx.x >> 5][c] = v[c];
@@ -88,7 +87,7 @@ __device__ __forceinline__ void blk_vec_sum(float (&v)[SD], float *out, float (*
     __syncthreads();
 }
 struct sc_args { const float *a, *t; const int *code, *xyz, *tcode, *txyz; int N, N2; float tau, hw, hr2; };
-__device__ __forceinline__ const float *sc_key(const sc_args &A, int j) { return j < A.N ? A.a + (size_t)j * SD : A.t + (size_t)(j - A.N) * SD; }
+template <int SD> __device__ __forceinline__ const float *sc_key(const sc_args &A, int j) { return j < A.N ? A.a + (size_t)j * SD : A.t + (size_t)(j - A.N) * SD; }
 __device__ __forceinline__ float sc_w(const sc_args &A, int i, int j, int dk) {
     if (abs(dk) != 1 || A.hw == 1.f) return 1.f;
     const int *pi = A.xyz + 3 * i, *pj = j < A.N ? A.xyz + 3 * j : A.txyz + 3 * (j - A.N);
@@ -96,7 +95,7 @@ __device__ __forceinline__ float sc_w(const sc_args &A, int i, int j, int dk) {
     return dx * dx + dy * dy + dz * dz <= A.hr2 ? A.hw : 1.f;
 }
 __device__ __forceinline__ int sc_code(const sc_args &A, int j) { return j < A.N ? A.code[j] : A.tcode[j - A.N]; }
-__global__ void __launch_bounds__(256) k_sc_stats(sc_args A, float *lse, float *npos, float *acc) {
+template <int SD> __global__ void __launch_bounds__(256) k_sc_stats(sc_args A, float *lse, float *npos, float *acc) {
     __shared__ float sh[8]; __shared__ float ai[SD];
     const int i = blockIdx.x, M = A.N + A.N2, ci = A.code[i];
     if (threadIdx.x < SD) ai[threadIdx.x] = A.a[(size_t)i * SD + threadIdx.x];
@@ -104,7 +103,7 @@ __global__ void __launch_bounds__(256) k_sc_stats(sc_args A, float *lse, float *
     float mx = -INFINITY, np = 0.f;
     for (int j = threadIdx.x; j < M; j += blockDim.x) {
         if (j == i) continue;
-        const float *k = sc_key(A, j); float s = 0.f;
+        const float *k = sc_key<SD>(A, j); float s = 0.f;
 #pragma unroll
         for (int c = 0; c < SD; c++) s += ai[c] * k[c];
         mx = fmaxf(mx, s / A.tau); np += wrap_dk(ci, sc_code(A, j)) == 0;
@@ -113,7 +112,7 @@ __global__ void __launch_bounds__(256) k_sc_stats(sc_args A, float *lse, float *
     float den = 0.f, psum = 0.f, pcos = 0.f, ncos = 0.f, nneg = 0.f;
     for (int j = threadIdx.x; j < M; j += blockDim.x) {
         if (j == i) continue;
-        const float *k = sc_key(A, j); float s = 0.f;
+        const float *k = sc_key<SD>(A, j); float s = 0.f;
 #pragma unroll
         for (int c = 0; c < SD; c++) s += ai[c] * k[c];
         const int dk = wrap_dk(ci, sc_code(A, j));
@@ -127,7 +126,7 @@ __global__ void __launch_bounds__(256) k_sc_stats(sc_args A, float *lse, float *
         atomicAdd(&acc[4], ncos); atomicAdd(&acc[5], nneg);
     }
 }
-__global__ void __launch_bounds__(256) k_sc_ganchor(sc_args A, const float *lse, const float *npos, float *ga) {
+template <int SD> __global__ void __launch_bounds__(256) k_sc_ganchor(sc_args A, const float *lse, const float *npos, float *ga) {
     __shared__ float sh[8][SD]; __shared__ float ai[SD], res[SD];
     const int i = blockIdx.x, M = A.N + A.N2, ci = A.code[i];
     if (npos[i] <= 0.f) { if (threadIdx.x < SD) ga[(size_t)i * SD + threadIdx.x] = 0.f; return; }
@@ -138,7 +137,7 @@ __global__ void __launch_bounds__(256) k_sc_ganchor(sc_args A, const float *lse,
     for (int c = 0; c < SD; c++) g[c] = 0.f;
     for (int j = threadIdx.x; j < M; j += blockDim.x) {
         if (j == i) continue;
-        const float *k = sc_key(A, j); float s = 0.f;
+        const float *k = sc_key<SD>(A, j); float s = 0.f;
 #pragma unroll
         for (int c = 0; c < SD; c++) s += ai[c] * k[c];
         const int dk = wrap_dk(ci, sc_code(A, j));
@@ -149,7 +148,7 @@ __global__ void __launch_bounds__(256) k_sc_ganchor(sc_args A, const float *lse,
     blk_vec_sum(g, res, sh);
     if (threadIdx.x < SD) ga[(size_t)i * SD + threadIdx.x] = res[threadIdx.x];
 }
-__global__ void __launch_bounds__(256) k_sc_gkey(sc_args A, const float *lse, const float *npos, float *ga) {   /* keys j < N (student anchors) */
+template <int SD> __global__ void __launch_bounds__(256) k_sc_gkey(sc_args A, const float *lse, const float *npos, float *ga) {   /* keys j < N (student anchors) */
     __shared__ float sh[8][SD]; __shared__ float kj[SD], res[SD];
     const int j = blockIdx.x, cj = A.code[j];
     if (threadIdx.x < SD) kj[threadIdx.x] = A.a[(size_t)j * SD + threadIdx.x];
@@ -175,17 +174,23 @@ __global__ void k_sc_fin(float *ga, int n, const float *acc, float *out) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) ga[i] /= na;
     if (blockIdx.x == 0 && threadIdx.x == 0) { out[0] = acc[0] / na; out[1] = acc[2] / fmaxf(acc[3], 1.f); out[2] = acc[4] / fmaxf(acc[5], 1.f); out[3] = acc[1]; }
 }
-extern "C" void dn_supcon(const float *a, const int *code, const int *xyz, int N, const float *t, const int *tcode, const int *txyz, int N2,
-                          float tau, float hw, float hr, float *ga, float *out, float *scratch) {
+template <int SD> static void supcon_t(const float *a, const int *code, const int *xyz, int N, const float *t, const int *tcode, const int *txyz, int N2,
+                                       float tau, float hw, float hr, float *ga, float *out, float *scratch) {
     /* scratch: lse [N], npos [N], acc [8] */
     float *lse = scratch, *npos = lse + N, *acc = npos + N;
     cudaMemsetAsync(acc, 0, 8 * 4);
     if (N <= 0) { cudaMemsetAsync(out, 0, 16); return; }
     sc_args A = {a, t, code, xyz, tcode, txyz, N, N2, tau, hw, hr * hr};
-    k_sc_stats<<<N, 256>>>(A, lse, npos, acc);
-    k_sc_ganchor<<<N, 256>>>(A, lse, npos, ga);
-    k_sc_gkey<<<N, 256>>>(A, lse, npos, ga);
+    k_sc_stats<SD><<<N, 256>>>(A, lse, npos, acc);
+    k_sc_ganchor<SD><<<N, 256>>>(A, lse, npos, ga);
+    k_sc_gkey<SD><<<N, 256>>>(A, lse, npos, ga);
     k_sc_fin<<<nb_of((long long)N * SD, 256), 256>>>(ga, N * SD, acc, out);
+}
+extern "C" void dn_supcon(const float *a, const int *code, const int *xyz, int N, const float *t, const int *tcode, const int *txyz, int N2, int D,
+                          float tau, float hw, float hr, float *ga, float *out, float *scratch) {
+    if (D == 16) supcon_t<16>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, ga, out, scratch);
+    else if (D == 32) supcon_t<32>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, ga, out, scratch);
+    else fprintf(stderr, "dn_supcon: D %d (16 or 32)\n", D);
 }
 
 /* ---- DINO prototypes: logits matrices in scratch; the gradients as two small matrix products ---- */
@@ -196,7 +201,7 @@ __global__ void k_normrows(const float *W, float *C, float *Wn, int K, int D) { 
     for (int c = 0; c < D; c++) C[(size_t)k * D + c] = W[(size_t)k * D + c] / r;
 }
 /* one block per point: G[i][k] = (softmax_s - softmax_t) / ts / N, teacher statistics */
-__global__ void __launch_bounds__(256) k_dino_rows(const float *s, const float *t, int N, const float *C, const float *Ct, const float *center, int K,
+template <int SD> __global__ void __launch_bounds__(256) k_dino_rows(const float *s, const float *t, int N, const float *C, const float *Ct, const float *center, int K,
                                                    float ts, float tt, float *G, float *tmean, float *pbar, float *acc) {
     __shared__ float sh[8]; __shared__ float si[SD], ti[SD];
     const int i = blockIdx.x; float *zs = G + (size_t)i * K;   /* zs, then G, in place */
@@ -226,7 +231,7 @@ __global__ void __launch_bounds__(256) k_dino_rows(const float *s, const float *
     loss = blk_sum(loss, sh); ent = blk_sum(ent, sh);
     if (threadIdx.x == 0) { atomicAdd(&acc[0], loss / N); atomicAdd(&acc[2], ent / N); }
 }
-__global__ void __launch_bounds__(256) k_dino_gs(const float *G, const float *C, int N, int K, float *gs) {   /* gs[i] = sum_k G[i][k] C[k] */
+template <int SD> __global__ void __launch_bounds__(256) k_dino_gs(const float *G, const float *C, int N, int K, float *gs) {   /* gs[i] = sum_k G[i][k] C[k] */
     __shared__ float sh[8][SD]; __shared__ float res[SD];
     const int i = blockIdx.x; float g[SD];
 #pragma unroll
@@ -237,7 +242,7 @@ __global__ void __launch_bounds__(256) k_dino_gs(const float *G, const float *C,
     blk_vec_sum(g, res, sh);
     if (threadIdx.x < SD) gs[(size_t)i * SD + threadIdx.x] = res[threadIdx.x];
 }
-__global__ void __launch_bounds__(256) k_dino_gc(const float *G, const float *s, int N, int K, float *gC) {   /* gC[k] = sum_i G[i][k] s[i] */
+template <int SD> __global__ void __launch_bounds__(256) k_dino_gc(const float *G, const float *s, int N, int K, float *gC) {   /* gC[k] = sum_i G[i][k] s[i] */
     __shared__ float sh[8][SD]; __shared__ float res[SD];
     const int k = blockIdx.x; float g[SD];
 #pragma unroll
@@ -248,7 +253,7 @@ __global__ void __launch_bounds__(256) k_dino_gc(const float *G, const float *s,
     blk_vec_sum(g, res, sh);
     if (threadIdx.x < SD) gC[(size_t)k * SD + threadIdx.x] = res[threadIdx.x];
 }
-__global__ void k_dino_fin(const float *gC, const float *C, const float *Wn, float *gW, int K, const float *pbar, float *acc) {
+template <int SD> __global__ void k_dino_fin(const float *gC, const float *C, const float *Wn, float *gW, int K, const float *pbar, float *acc) {
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k < K) {   /* back through c = W / |W| */
         float dot = 0.f; for (int c = 0; c < SD; c++) dot += gC[(size_t)k * SD + c] * C[(size_t)k * SD + c];
@@ -257,20 +262,25 @@ __global__ void k_dino_fin(const float *gC, const float *C, const float *Wn, flo
     }
 }
 __global__ void k_copy3(const float *acc, float *out) { out[0] = acc[0]; out[1] = acc[1]; out[2] = acc[2]; }
-extern "C" size_t dn_dino_scratch(int N, int K) { return ((size_t)N * K + (size_t)4 * K * SD + 3 * (size_t)K + 8) * 4; }
-extern "C" void dn_dino(const float *s, const float *t, int N, const float *W, const float *Wt, const float *center, int K, int D, float ts, float tt,
-                        float *gs, float *gW, float *tmean, float *out, float *scratch) {
-    if (D != SD) { fprintf(stderr, "dn_dino: D %d (32 only)\n", D); return; }
+extern "C" size_t dn_dino_scratch(int N, int K) { return ((size_t)N * K + (size_t)4 * K * 32 + 3 * (size_t)K + 8) * 4; }
+template <int SD> static void dino_t(const float *s, const float *t, int N, const float *W, const float *Wt, const float *center, int K, float ts, float tt,
+                                     float *gs, float *gW, float *tmean, float *out, float *scratch) {
     float *G = scratch, *C = G + (size_t)N * K, *Ct = C + (size_t)K * SD, *gC = Ct + (size_t)K * SD, *Wn = gC + (size_t)K * SD, *Wtn = Wn + K, *pbar = Wtn + K, *acc = pbar + K;
     k_normrows<<<nb_of(K, 128), 128>>>(W, C, Wn, K, SD); k_normrows<<<nb_of(K, 128), 128>>>(Wt, Ct, Wtn, K, SD);
     cudaMemsetAsync(pbar, 0, (size_t)K * 4); cudaMemsetAsync(acc, 0, 16); cudaMemsetAsync(tmean, 0, (size_t)K * 4);
     if (N > 0) {
-        k_dino_rows<<<N, 256, (size_t)K * 4>>>(s, t, N, C, Ct, center, K, ts, tt, G, tmean, pbar, acc);
-        k_dino_gs<<<N, 256>>>(G, C, N, K, gs);
-        k_dino_gc<<<K, 256>>>(G, s, N, K, gC);
+        k_dino_rows<SD><<<N, 256, (size_t)K * 4>>>(s, t, N, C, Ct, center, K, ts, tt, G, tmean, pbar, acc);
+        k_dino_gs<SD><<<N, 256>>>(G, C, N, K, gs);
+        k_dino_gc<SD><<<K, 256>>>(G, s, N, K, gC);
     } else cudaMemsetAsync(gC, 0, (size_t)K * SD * 4);
-    k_dino_fin<<<nb_of(K, 128), 128>>>(gC, C, Wn, gW, K, pbar, acc);
+    k_dino_fin<SD><<<nb_of(K, 128), 128>>>(gC, C, Wn, gW, K, pbar, acc);
     k_copy3<<<1, 1>>>(acc, out);
+}
+extern "C" void dn_dino(const float *s, const float *t, int N, const float *W, const float *Wt, const float *center, int K, int D, float ts, float tt,
+                        float *gs, float *gW, float *tmean, float *out, float *scratch) {
+    if (D == 16) dino_t<16>(s, t, N, W, Wt, center, K, ts, tt, gs, gW, tmean, out, scratch);
+    else if (D == 32) dino_t<32>(s, t, N, W, Wt, center, K, ts, tt, gs, gW, tmean, out, scratch);
+    else fprintf(stderr, "dn_dino: D %d (16 or 32)\n", D);
 }
 
 __global__ void k_scatter(const float *e, const float *ge, const float *nrm, const int *idx, int N, int D, size_t p3, float w, float *gl) {

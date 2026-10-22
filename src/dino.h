@@ -25,7 +25,7 @@ void dn_gather(const void *logits, int h16, size_t p3, int D, const int *idx, in
    code (winding code 1..254) and voxel coordinates xyz [N][3] (keys the same, t's after the anchors'); tau temperature; hard negatives
    (|dk| == 1 within hr voxels) weigh hw. Writes ga [N][D] (d loss / d a, mean over anchors with a positive) and returns the loss via
    out[0], positives' / negatives' mean cosine out[1], out[2], anchors with positives out[3] (device float[4]); scratch (2 N + 8) floats */
-void dn_supcon(const float *a, const int *code, const int *xyz, int N, const float *t, const int *tcode, const int *txyz, int N2,
+void dn_supcon(const float *a, const int *code, const int *xyz, int N, const float *t, const int *tcode, const int *txyz, int N2, int D,
                float tau, float hw, float hr, float *ga, float *out, float *scratch);
 /* DINO prototype loss: student s [N][D] unit, teacher t [N][D] unit, prototypes W [K][D] (student, raw) and Wt [K][D] (teacher), center [K];
    loss mean_i sum_k -softmax((t_i.ct_k - center_k) / tt) log softmax(s_i.c_k / ts) (c = W / |W|). Writes gs [N][D], gW [K][D], the batch

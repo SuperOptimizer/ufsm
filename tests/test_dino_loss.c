@@ -54,7 +54,7 @@ static void check(const char *what, double fd, double an, double scale) {
 }
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
-    const int D = 32, N = 96, N2 = 96;
+    const int D = getenv("UFSM_TEST_D") ? atoi(getenv("UFSM_TEST_D")) : 32, N = 96, N2 = 96;   /* embedding width 16 or 32 */
     /* ---- SupCon ---- */
     float *a = malloc(N * D * 4), *t = malloc(N2 * D * 4); int *code = malloc(N * 4), *xyz = malloc(N * 12);
     for (int i = 0; i < N * D; i++) a[i] = (float)rn();
@@ -65,7 +65,7 @@ int main(void) {
     float *dga = nn_malloc(N * D * 4), *dout = nn_malloc(16), *scr = nn_malloc((2 * N + 16) * 4), *ga = malloc(N * D * 4), out[4];
     const float tau = 0.2f, hw = 3.f, hr = 60.f;
     float *da = up(a, N * D * 4);
-    dn_supcon(da, dc, dx, N, dt, dc, dx, N2, tau, hw, hr, dga, dout, scr);
+    dn_supcon(da, dc, dx, N, dt, dc, dx, N2, D, tau, hw, hr, dga, dout, scr);
     nn_d2h(ga, dga, N * D * 4); nn_d2h(out, dout, 16);
     printf("supcon: loss %.5f, pos cos %.3f, neg cos %.3f, anchors %.0f\n", out[0], out[1], out[2], out[3]);
     for (int r = 0; r < 24; r++) {

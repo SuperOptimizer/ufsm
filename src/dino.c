@@ -5,6 +5,7 @@
 #include "store.h"
 #include "zarr3.h"
 #include "z3w.h"
+#include "zarr2.h"
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
@@ -26,15 +27,17 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
 int cmd_dino_halves(int argc, char **argv) {
     long long bv[6];
     if (argc < 5 || !opt(argc, argv, "--box", nullptr) || sscanf(opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", &bv[0], &bv[1], &bv[2], &bv[3], &bv[4], &bv[5]) != 6) {
-        fprintf(stderr, "usage: ufsm halves <root> <level-0-array-key> <out-dir> --box z,y,x,nz,ny,nx (4x-level voxels) [--threads 8] [--slab 16]\n"
+        fprintf(stderr, "usage: ufsm halves <root> <level-0-array-key> <out-dir> --box z,y,x,nz,ny,nx (4x-level voxels) [--zarr2 1 (raw upstream zarr v2)] [--threads 8] [--slab 16]\n"
                         "  out-dir/{a,b,full}: uint8 arrays of the box (a / b: the even / odd (dz + dy + dx) halves of every 4^3 block, 32 voxels each;\n"
                         "  full: all 64). Attributes record the box origin. Two views of the same tissue with independent scan noise.\n");
         return 2;
     }
     const char *root = argv[2], *key = argv[3], *out = argv[4];
     const int nthreads = atoi(opt(argc, argv, "--threads", "8")), slab = atoi(opt(argc, argv, "--slab", "16"));
-    store *st = store_open(root); z3 *ct = st ? z3_open(st, key, opt(argc, argv, "--cache", nullptr)) : nullptr;
-    if (!ct) { fprintf(stderr, "halves: cannot open %s %s: %s\n", root, key, z3_error()); return 1; }
+    store *st = store_open(root); const int v2 = atoi(opt(argc, argv, "--zarr2", "0"));   /* the raw upstream zarr v2 (uncompressed: the lossy volcomp levels are denoised) */
+    z3 *ct = st && !v2 ? z3_open(st, key, opt(argc, argv, "--cache", nullptr)) : nullptr; z2 *ct2 = st && v2 ? z2_open(st, key, nullptr) : nullptr;
+    if (!ct && !ct2) { fprintf(stderr, "halves: cannot open %s %s: %s\n", root, key, v2 ? z2_error() : z3_error()); return 1; }
+    if (ct2) z2_assume_present(ct2, 1);
     const int64_t nz = bv[3], ny = bv[4], nx = bv[5];
     uint8_t *A = calloc((size_t)nz * ny * nx, 1), *B = calloc((size_t)nz * ny * nx, 1), *F = calloc((size_t)nz * ny * nx, 1);
     uint8_t *buf = malloc((size_t)slab * 4 * ny * 4 * nx * 4);
@@ -43,7 +46,7 @@ int cmd_dino_halves(int argc, char **argv) {
     for (int64_t z0 = 0; z0 < nz; z0 += slab) {
         const int sz = (int)(nz - z0 < slab ? nz - z0 : slab);
         const int64_t o[3] = {(bv[0] + z0) * 4, bv[1] * 4, bv[2] * 4}, n[3] = {(int64_t)sz * 4, ny * 4, nx * 4};
-        if (z3_read(ct, o, n, buf, nthreads)) { fprintf(stderr, "halves: read failed: %s\n", z3_error()); return 1; }
+        if (ct2 ? z2_read(ct2, o, n, buf, nthreads) : z3_read(ct, o, n, buf, nthreads)) { fprintf(stderr, "halves: read failed: %s\n", ct2 ? z2_error() : z3_error()); return 1; }
         for (int z = 0; z < sz; z++)
             for (int64_t y = 0; y < ny; y++)
                 for (int64_t x = 0; x < nx; x++) {
@@ -80,7 +83,7 @@ int cmd_dino_halves(int argc, char **argv) {
     for (size_t i = 0; i < nv; i++) if (F[i]) { const double d = (double)A[i] - B[i]; s += F[i]; s2 += (double)F[i] * F[i]; d2 += d * d; cnt++; }
     if (cnt) fprintf(stderr, "halves: %zu nonzero voxels, full mean %.2f std %.2f, (a - b) rms %.2f -> per-half noise ~%.2f\n", cnt, s / cnt,
                      sqrt(fmax(s2 / cnt - (s / cnt) * (s / cnt), 0)), sqrt(d2 / cnt), sqrt(d2 / cnt / 2));
-    free(A); free(B); free(F); free(buf); free(sh); z3_close(ct); store_close(st);
+    free(A); free(B); free(F); free(buf); free(sh); if (ct) z3_close(ct); if (ct2) z2_close(ct2); store_close(st);
     return 0;
 }
 
@@ -92,7 +95,7 @@ int cmd_dino_halves(int argc, char **argv) {
 #include <unistd.h>
 #include <signal.h>
 
-enum { DN_D = 32, DN_MAXSRC = 64, DN_MAXBOX = 256, DN_SLOTS = 6 };
+enum { DN_D = 16, DN_MAXSRC = 64, DN_MAXBOX = 256, DN_SLOTS = 6 };
 typedef struct {
     char name[64]; z3 *ca, *cb, *codes; int halves;
     int64_t org[3];                              /* added to window corners (ct array coordinates) to address the codes (global grid) */
@@ -351,7 +354,7 @@ int cmd_dino_train(int argc, char **argv) {
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,96,128,192")); for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "dino-train: P must be a multiple of %d\n", 1 << (cfg.nlev - 1)); return 2; }
     unet *u = unet_create(&cfg); unet_init(u, seed);
-    if (!fp32) unet_set_fp16_logits(u, 1);
+    if (!fp32 && DN_D <= 16) unet_set_fp16_logits(u, 1);   /* (the MX fp16-logit head takes <= 16 outputs) */
     int step0 = 0;
     const char *resume = opt(argc, argv, "--resume", nullptr);
     if (resume) { step0 = unet_load(u, resume); if (step0 < 0) { fprintf(stderr, "dino-train: cannot resume %s\n", resume); return 1; } }
@@ -418,7 +421,7 @@ int cmd_dino_train(int argc, char **argv) {
         nn_zero(gl, p3 * DN_D * 4);
         nn_zero(outs, 64 * 4);
         if (ngt) {
-            dn_supcon(es_g, d_gcode, d_gxyz, ngt, et_g, d_gcode, d_gxyz, ngt, tau, hw, hr, ga_g, outs, scr_sc);
+            dn_supcon(es_g, d_gcode, d_gxyz, ngt, et_g, d_gcode, d_gxyz, ngt, DN_D, tau, hw, hr, ga_g, outs, scr_sc);
             dn_scatter_grad(es_g, ga_g, ns_g, d_gidx, ngt, DN_D, p3, 1.f, gl);
             dn_emb_std(es_g, ngt, DN_D, outs + 8);
         }
@@ -519,7 +522,7 @@ int cmd_dino_embed(int argc, char **argv) {
     unet_cfg cfg; int step = 0;
     if (unet_peek(argv[2], &cfg, &step)) { fprintf(stderr, "dino-embed: cannot read %s\n", argv[2]); return 1; }
     unet *u = unet_create(&cfg); if (unet_load(u, argv[2]) < 0) return 1;
-    if (!fp32) unet_set_fp16_logits(u, 1);
+    if (!fp32 && cfg.cout <= 16) unet_set_fp16_logits(u, 1);
     store *st = store_open(argv[3]); z3 *ct = st ? z3_open(st, argv[4], opt(argc, argv, "--cache", nullptr)) : nullptr;
     if (!ct) { fprintf(stderr, "dino-embed: %s\n", z3_error()); return 1; }
     const int64_t box[6] = {b[0], b[1], b[2], b[3], b[4], b[5]};
@@ -536,6 +539,36 @@ int cmd_dino_embed(int argc, char **argv) {
 /* ufsm dino-boxes <codes-root> <codes-key> [--block 512] [--min 200000] [--exclude z,y,x,nz,ny,nx]... : block-aligned boxes holding at least
    --min labelled voxels (codes 1..254), as a JSON list for dino-train sources; blocks touching an --exclude box are left out */
 int cmd_dino_boxes(int argc, char **argv) {
+    if (opt(argc, argv, "--ct-coarse", nullptr)) {   /* papyrus-rich blocks of a CT (no labels): a coarse level read whole */
+        store *cs = store_open(argv[2]); z3 *c = cs ? z3_open(cs, opt(argc, argv, "--ct-coarse", ""), opt(argc, argv, "--cache", nullptr)) : nullptr;
+        if (!c) { fprintf(stderr, "dino-boxes: %s\n", z3_error()); return 1; }
+        const int f = atoi(opt(argc, argv, "--factor", "8")), B = atoi(opt(argc, argv, "--block", "512")), top = atoi(opt(argc, argv, "--top", "8")), b = B / f;
+        const z3_meta *m = z3_meta_of(c); const size_t nv = (size_t)m->shape[0] * m->shape[1] * m->shape[2];
+        uint8_t *v = malloc(nv); const int64_t o[3] = {0, 0, 0};
+        if (!v || z3_read(c, o, m->shape, v, 8)) { fprintf(stderr, "dino-boxes: coarse read: %s\n", z3_error()); return 1; }
+        int64_t h[256] = {0}, tot = 0; for (size_t i = 0; i < nv; i++) h[v[i]]++;
+        h[0] = 0; for (int i = 1; i < 256; i++) tot += h[i];
+        int med = 1; { int64_t a = 0; for (int i = 1; i < 256; i++) { a += h[i]; if (a >= tot / 2) { med = i; break; } } }
+        const int thr = atoi(opt(argc, argv, "--thresh", "0")) > 0 ? atoi(opt(argc, argv, "--thresh", "0")) : med;
+        typedef struct { double fr; int64_t o[3]; } cand; cand *cd = malloc(sizeof *cd * 100000); int nc = 0;
+        uint64_t rs = 99;
+        for (int64_t z = 0; z + b <= m->shape[0]; z += b / 2) for (int64_t y = 0; y + b <= m->shape[1]; y += b / 2) for (int64_t x = 0; x + b <= m->shape[2]; x += b / 2) {
+            size_t cnt = 0, s = 0;
+            for (int64_t a = 0; a < b; a += 2) for (int64_t e = 0; e < b; e += 2) for (int64_t g = 0; g < b; g += 2) { cnt += v[((size_t)(z + a) * m->shape[1] + y + e) * m->shape[2] + x + g] > thr; s++; }
+            if (nc < 100000) { cd[nc].fr = (double)cnt / s + 1e-9 * (double)(rng_next(&rs) % 1000); cd[nc].o[0] = z * f; cd[nc].o[1] = y * f; cd[nc].o[2] = x * f; nc++; }
+        }
+        int first = 1; printf("[");
+        for (int k = 0; k < top; k++) {   /* greedy: the richest block not overlapping a chosen one */
+            int bi = -1; for (int i = 0; i < nc; i++) if (cd[i].fr >= 0 && (bi < 0 || cd[i].fr > cd[bi].fr)) bi = i;
+            if (bi < 0 || cd[bi].fr < 0.2) break;
+            printf("%s\n  [%lld,%lld,%lld,%d,%d,%d]", first ? "" : ",", (long long)cd[bi].o[0], (long long)cd[bi].o[1], (long long)cd[bi].o[2], B, B, B); first = 0;
+            fprintf(stderr, "block %lld,%lld,%lld: papyrus fraction %.2f\n", (long long)cd[bi].o[0], (long long)cd[bi].o[1], (long long)cd[bi].o[2], cd[bi].fr);
+            const int64_t *q = cd[bi].o;
+            for (int i = 0; i < nc; i++) { int ov = 1; for (int d = 0; d < 3; d++) ov &= llabs(cd[i].o[d] - q[d]) < B; if (ov) cd[i].fr = -1; }
+        }
+        printf("\n]\n"); free(v); free(cd); z3_close(c); store_close(cs);
+        return 0;
+    }
     if (argc < 4) { fprintf(stderr, "usage: ufsm dino-boxes <codes-root> <codes-key> [--block 512] [--min 200000] [--exclude z,y,x,nz,ny,nx]...\n"); return 2; }
     store *st = store_open(argv[2]); z3 *z = st ? z3_open(st, argv[3], nullptr) : nullptr;
     if (!z) { fprintf(stderr, "dino-boxes: %s\n", z3_error()); return 1; }
