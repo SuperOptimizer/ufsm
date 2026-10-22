@@ -505,7 +505,7 @@ int cmd_dino_train(int argc, char **argv) {
     float *scr_sc = nn_malloc(((size_t)2 * NG + 16) * 4), *scr_dn = nn_malloc(dn_dino_scratch(NS, K)), *outs = nn_malloc(64 * 4);
     if (!gl || !x || !scr_dn || (HZ && !hsl)) { fprintf(stderr, "dino-train: device allocation failed\n"); return 1; }
     dn_hs HS = {.u = u, .hs = hsl, .Z = HZ, .P = P, .D = ED};
-    if (HZ) { unet_set_head_ext(u, 1); unet_set_head_cb(u, dn_head_cb, &HS); unet_build(u, (shape5){1, cfg.cin, P, P, P}, 1); }
+    if (HZ) { nn_set_logits_h16(1); unet_set_head_ext(u, 1); unet_set_head_cb(u, dn_head_cb, &HS); unet_build(u, (shape5){1, cfg.cin, P, P, P}, 1); }
     /* data ring */
     dn_ring *R = calloc(1, sizeof *R); R->D = Dd; R->seed = seed; R->nthreads = nthreads; pthread_mutex_init(&R->mu, nullptr); pthread_cond_init(&R->cv, nullptr);
     for (int i = 0; i < DN_SLOTS; i++) {
@@ -689,7 +689,7 @@ int cmd_dino_embed(int argc, char **argv) {
     if (atoi(opt(argc, argv, "--head-slab", "0"))) {   /* large windows: a training build with head slabs (no whole-window logits), optionally lean */
         if (fp32) { fprintf(stderr, "dino-embed: --head-slab needs MX storage\n"); return 2; }
         if (!strcmp(opt(argc, argv, "--mem", "default"), "lean")) { unet_set_chunk_up(2); unet_set_recompute(1); unet_set_grad_mx8(1); unet_set_lean(2); unet_set_share_enc_a1(1); }
-        unet_set_head_ext(u, 1); unet_build(u, (shape5){1, cfg.cin, P, P, P}, 1);
+        nn_set_logits_h16(1); unet_set_head_ext(u, 1); unet_build(u, (shape5){1, cfg.cin, P, P, P}, 1);
     }
     store *st = store_open(argv[3]); z3 *ct = st ? z3_open(st, argv[4], opt(argc, argv, "--cache", nullptr)) : nullptr;
     if (!ct) { fprintf(stderr, "dino-embed: %s\n", z3_error()); return 1; }
