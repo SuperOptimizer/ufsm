@@ -10,11 +10,12 @@
      whole shard files they lie in. Exit 0 when every shard is present and verified.
 
    ufsm scanprep <root> <group-key> --level L --out PREFIX [--um U] [--cell 16] [--close-mm 2] [--window 128] [--min-inside 0.25]
-                 [--keep-frac 0.1] [--fill2d 1] [--stats-chunks 256] [--threads 16] [--seed 1]
+                 [--keep-frac 0.1] [--zrange z0,z1] [--fill2d 1] [--stats-chunks 256] [--threads 16] [--seed 1]
      Level L of a CT pyramid group (the ~9.6 um level the sampler draws). The cell grid has cells of --cell level-L voxels; each cell's
      mean over its NONZERO voxels and its nonzero count come from the finest of levels L+2, L+3, L+4 present (else L itself). Object
      mask: Otsu threshold of the cell means (cells with any nonzero voxel), morphological closing with a ball of --close-mm, 6-connected
-     components smaller than --keep-frac x the largest dropped (sample mounts / holder bits at the z ends; 0 keeps all), holes
+     components smaller than --keep-frac x the largest dropped (0 keeps all), cells outside --zrange (level-L voxels: a sample mount
+     at the z ends that touches the fragment) dropped, holes
      filled (3-D from the grid border, then per z plane with --fill2d), intersected with the cells holding nonzero voxels (the scan's
      own mask). Valid window centres: object cells whose --window^3 (level-L voxels) box around the cell centre is at least
      --min-inside object cells (lower it for thin fragments). Intensity statistics over the nonzero voxels of object cells, from up to

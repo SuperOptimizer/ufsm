@@ -346,6 +346,8 @@ int cmd_scanprep(int argc, char **argv) {
     const int fill2d = atoi(sopt(argc, argv, "--fill2d", "1")), nstat = atoi(sopt(argc, argv, "--stats-chunks", "256")), nt = atoi(sopt(argc, argv, "--threads", "16"));
     const double close_mm = atof(sopt(argc, argv, "--close-mm", "2")), min_inside = atof(sopt(argc, argv, "--min-inside", "0.25"));
     const double keep_frac = atof(sopt(argc, argv, "--keep-frac", "0.1"));
+    double zr[2] = {-1e18, 1e18};
+    if (sopt(argc, argv, "--zrange", nullptr) && sscanf(sopt(argc, argv, "--zrange", ""), "%lf,%lf", zr, zr + 1) != 2) { fprintf(stderr, "scanprep: --zrange z0,z1 (level-L voxels)\n"); return 2; }
     uint64_t seed = (uint64_t)atoll(sopt(argc, argv, "--seed", "1"));
     double um0 = atof(sopt(argc, argv, "--um", "0")); if (um0 <= 0) um0 = um_from_name(group);
     if (um0 <= 0 || cell < 1 || (cell & (cell - 1)) || cell > 128 || L < 0 || L >= MAXLEV) { fprintf(stderr, "scanprep: need --um (not in the name), --cell a power of 2 <= 128, 0 <= --level < %d\n", MAXLEV); return 2; }
@@ -390,6 +392,10 @@ int cmd_scanprep(int argc, char **argv) {
     const float rc = (float)(close_mm * 1000.0 / (um0 * (1 << L) * cell));
     int64_t ncomp = 0, nkept = 0;
     if (sp_close(mk, G, rc, nt) || (keep_frac > 0 && (nkept = sp_keep_components(mk, G, keep_frac, &ncomp)) < 0) || sp_fill_holes(mk, G, fill2d)) { fprintf(stderr, "scanprep: out of memory (closing / components / hole fill)\n"); return 1; }
+    for (int64_t gz = 0; gz < G[0]; gz++) {   /* --zrange: cells whose centre lies outside [z0, z1) (level-L voxels) are dropped (sample mounts at the z ends) */
+        const double zc = (gz + 0.5) * cell; if (zc >= zr[0] && zc < zr[1]) continue;
+        memset(mk + (size_t)gz * plane, 0, plane);
+    }
     int64_t nobj = 0; for (size_t k = 0; k < NG; k++) { mk[k] = mk[k] && cm[k]; nobj += mk[k]; }
     const int wc = (win + cell - 1) / cell;
     const int64_t nvalid = sp_valid_centres(mk, G, wc, min_inside, val);
