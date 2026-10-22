@@ -31,6 +31,7 @@ SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c
 SRC += src/inksplat.c
 SRC += src/tfx.c
 SRC += src/fitjoin.c src/fieldsoracle.c src/packmap.c src/scanprep.c
+SRC += src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
@@ -374,6 +375,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_fit
 	./$(B)/test_fit_join
 	./$(B)/test_robust
+	./$(B)/test_reg
 	./$(B)/test_surf
 	./$(B)/test_stitch
 	./$(B)/test_fblend
@@ -491,3 +493,6 @@ test-all: $(B)/test_gyrec
 test-all: $(B)/test_unwrap2_sampler
 test-all: $(B)/test_phase_interp
 test-all: $(B)/test_l3_sched
+$(B)/test_reg: tests/test_reg.c $(B)/reg.o $(B)/reg_init.o $(B)/zarr3.o $(B)/store.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+test-all: $(B)/test_reg

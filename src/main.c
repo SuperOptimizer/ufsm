@@ -3259,6 +3259,7 @@ int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
 int cmd_phase_conflict(int argc, char **argv);   /* src/packmap.c */
+int cmd_reg(int argc, char **argv);   /* src/reg_cli.c */
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "train")) return cmd_train(argc, argv);
     if (argc < 3) return usage();
@@ -3286,6 +3287,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
     if (!strcmp(cmd, "phase-conflict")) return cmd_phase_conflict(argc, argv);
+    if (!strcmp(cmd, "reg")) return cmd_reg(argc, argv);
     if (!strcmp(cmd, "convert-unwrap2")) return cmd_convert_unwrap2(argc, argv);
     if (!strcmp(cmd, "repack")) return cmd_repack(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
