@@ -17,6 +17,7 @@ while IFS=$'\t' read -r scroll id volume um kev dist level lum shape lgb cgb sha
     *) continue;;
   esac
   [ -e $A/state/$tag.prep.done ] && continue
+  while [ -e $A/pause ] && [ ! -e $A/STOP ]; do sleep 30; done   # watch.sh: the desk trainers are slowing down
   MI=${MINSIDE:-0.25}
   extra=$(awk -v t=$tag '$1 == t {$1 = ""; print}' $A/scripts/prep-overrides.tsv 2>/dev/null)   # per-scan scanprep options (e.g. --zrange)
   if nice -n 19 $U scanprep $root $key --level $level --um $um --out $A/prep/$tag --min-inside $MI --threads $TH $extra > $A/logs/$tag-prep.log 2>&1; then

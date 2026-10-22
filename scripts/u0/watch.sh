@@ -2,7 +2,8 @@
 # scripts/u0/watch.sh RUN_DIR...: keeps the desk trainers' speed while copy.sh downloads. Every 30 s it looks for NEW rows of each
 # RUN_DIR/log.csv (ufsm train; a row per ~50 steps); baseline = the median samples_per_s of the last 12 rows at start. A new row below
 # 0.97 x baseline or waiting on data (wait_s > 0.05) halves the copy rate cap in A/mbps (floor 5 MB/s); 6 healthy new rows in a row
-# raise it 1.5x (up to MAX). Logs every change; exits with the STOP file or when copy.sh (A/copy.pid) is gone.
+# raise it 1.5x (up to MAX). A slow row also creates A/pause (prep.sh waits before each scan) until 3 healthy rows. Logs every change;
+# exits with the STOP file or when the watched job (A/copy.pid: copy.sh or the prep run) is gone.
 set -u
 A=${A:-/vesuvius/ufsm/u0}; MAX=${MAX:-150}
 declare -A base last
@@ -23,8 +24,9 @@ while [ ! -e $A/STOP ]; do
   done
   cur=$(cat $A/mbps)
   if [ -n "$slow" ]; then good=0; new=$(awk -v c=$cur 'BEGIN{n = c / 2; if (n < 5) n = 5; printf "%d", n}')
-    echo $new > $A/mbps; echo "$(date '+%m-%d %H:%M') slow:$slow -> cap $new MB/s"
+    echo $new > $A/mbps; touch $A/pause; echo "$(date '+%m-%d %H:%M') slow:$slow -> cap $new MB/s, prep paused"
   elif [ $fresh = 1 ]; then good=$((good + 1))
+    [ $good -ge 3 ] && [ -e $A/pause ] && { rm -f $A/pause; echo "$(date '+%m-%d %H:%M') 3 healthy rows: prep resumed"; }
     if [ $good -ge 6 ] && [ $cur -lt $MAX ]; then new=$(awk -v c=$cur -v m=$MAX 'BEGIN{n = c * 1.5; if (n > m) n = m; printf "%d", n}'); echo $new > $A/mbps; good=0
       echo "$(date '+%m-%d %H:%M') 6 healthy rows -> cap $new MB/s"; fi
   fi
