@@ -281,7 +281,7 @@ int cmd_dinovol_embed(int argc, char **argv) {
         return 2;
     }
     if (xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-    xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "10")) * 1e9));
+    xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "9")) * 1e9));
     if (opt(argc, argv, "--raw-in", nullptr)) {
         dv_net *net = dv_load(ck); if (!net) return 1;
         const int rc = raw_mode(net, argc, argv); dv_free(net); return rc;
@@ -330,14 +330,25 @@ int cmd_dinovol_embed(int argc, char **argv) {
     int64_t c0[3], c1[3];
     for (int d = 0; d < 3; d++) { c0[d] = bv[d] / stride; c1[d] = (bv[d] + bv[3 + d] - 1) / stride + 1; }
     const int ncy = (int)(c1[1] - c0[1]), ncx = (int)(c1[2] - c0[2]);
-    int K = atoi(opt(argc, argv, "--shard-cells", "0"));
-    if (K <= 0) {   /* ~512-voxel shards, fewer when the dense accumulators + strips would not fit ~4 GB */
-        K = (512 + stride / 2) / stride; if (K < 1) K = 1;
-        for (; K > 1; K--) {
-            const double zc = (double)K * stride, accb = need_den ? zc / ds * (support / ds) * (support / ds) * CD * 4.0 : 0;
-            const double strips = need_den ? 2.0 * (ncx + 2) * zc / ds * (ramp / ds) * (stride / ds) * CD * 4.0 : 0;
-            if (accb + strips < 4e9) break;
+    int K = atoi(opt(argc, argv, "--shard-cells", "0")), Wx = atoi(opt(argc, argv, "--band-cells", "0"));
+    const double gbud = atof(opt(argc, argv, "--gpu-mem", "9")) * 1e9 - 5.2e9;   /* the forward (192^3 tile + head chunk + caches) takes ~5 GB */
+    {   /* slab depth K (cells per shard edge) and x band width Wx (cells; bands recompute one tile column each) with the fewest tiles per
+           cell, (K + 1) / K x (Wx + 1) / Wx, whose accumulators + fp16 strips fit the device budget */
+        const int kmax = (512 + stride / 2) / stride > 0 ? (512 + stride / 2) / stride : 1;
+        double best = 1e30; int bk = 1, bw = 1;
+        for (int k = 1; k <= kmax; k++) for (int w = k; w < ncx + k; w += k) {
+            if ((K > 0 && k != K) || (Wx > 0 && w != Wx)) continue;
+            const int we = w < ncx ? w : ncx;
+            double bytes = 0;
+            for (int pass = 0; pass < 2; pass++) {
+                if (pass ? !need_den : !need_tok) continue;
+                const int s = pass ? ds : 8; const double CA = pass ? CD : E + 1, nz = (double)k * stride / s, NS = support / s, sy = stride / s, r = ramp / s;
+                bytes += nz * NS * NS * CA * 4 + nz * sy * r * CA * 2 + (we + 2) * 2.0 * (nz * r * sy * CA * 2 + nz * r * r * CA * 2);
+            }
+            const double cost = (k + 1.0) / k * (we + 1.0) / we;
+            if (bytes <= gbud && cost < best - 1e-9) { best = cost; bk = k; bw = w; }
         }
+        K = bk; Wx = bw;
     }
     const int ps = dv_patch(net), es_t = stride / ps, es_d = stride / ds;   /* cell edge in output units */
     int ck_t = es_t, ck_d = es_d;
@@ -370,7 +381,7 @@ int cmd_dinovol_embed(int argc, char **argv) {
         if (!dtype && !unit) { snprintf(d, sizeof d, "%s/%s_scale", out, o_names[o]); has_sc[o] = 1; if (zw_create(&Wsc[o], d, shp, 0, "float16", 2, K * es, cks, "{}")) return 1; }
     }
     /* device buffers */
-    const int nz_slab_max = K * stride, Dcol = nz_slab_max + T;
+    const int nz_slab_max = K * stride, Dcol = nz_slab_max + T, nslot = Wx + 2;
     const int nyt = support / ps, syt = stride / ps, ryt = ramp / ps, nyd = support / ds, syd = stride / ds, ryd = ramp / ds;
     const int CAt = E + 1, CAd = CD;
     uint8_t *colh[2] = {malloc((size_t)Dcol * T * T), malloc((size_t)Dcol * T * T)};
@@ -380,51 +391,63 @@ int cmd_dinovol_embed(int argc, char **argv) {
     uint8_t *mask_t = xmalloc_dev((size_t)(nz_slab_max / ps) * nyt * nyt), *mask_d = need_den ? xmalloc_dev((size_t)(nz_slab_max / ds) * nyd * nyd) : nullptr;
     const size_t npt_max = (size_t)(support / ds) * nyd * nyd;
     float *coords = need_den ? xmalloc_dev(npt_max * 12) : nullptr, *wgt = need_den ? xmalloc_dev(npt_max * 4) : nullptr; int *rows = need_den ? xmalloc_dev(npt_max * 4) : nullptr, *cnt = xmalloc_dev(4);
-    /* strips: top (this row, read) / next (written) per column index kx - c0x + 1 in [0, ncx + 1], left per output */
-    const size_t st_t = (size_t)(nz_slab_max / ps) * ryt * syt * CAt, st_d = (size_t)(nz_slab_max / ds) * ryd * syd * CAd;
-    const size_t lf_t = (size_t)(nz_slab_max / ps) * syt * ryt * CAt, lf_d = (size_t)(nz_slab_max / ds) * syd * ryd * CAd;
-    float **top_t = calloc(ncx + 2, sizeof *top_t), **nxt_t = calloc(ncx + 2, sizeof *nxt_t), **top_d = calloc(ncx + 2, sizeof *top_d), **nxt_d = calloc(ncx + 2, sizeof *nxt_d);
-    uint8_t *has_top = calloc(ncx + 2, 1), *has_nxt = calloc(ncx + 2, 1);
-    for (int i = 0; i < ncx + 2; i++) {
-        if (need_tok) { top_t[i] = xmalloc_dev(st_t * 4); nxt_t[i] = xmalloc_dev(st_t * 4); }
-        if (need_den) { top_d[i] = xmalloc_dev(st_d * 4); nxt_d[i] = xmalloc_dev(st_d * 4); }
+    /* fp16 strips per band column slot xi = kx - (band start - 1) in [0, Wx + 1]: below (the column's y ramp into the next row, r x sy) and corner
+       (its yx ramp into the next row's next column, r x r), for this row (top) and the next; the left strip (sy x r) into the next column */
+    const size_t bl_t = (size_t)(nz_slab_max / ps) * ryt * syt * CAt, bl_d = (size_t)(nz_slab_max / ds) * ryd * syd * CAd;
+    const size_t cr_t = (size_t)(nz_slab_max / ps) * ryt * ryt * CAt, cr_d = (size_t)(nz_slab_max / ds) * ryd * ryd * CAd;
+    void **stp[2][2][2];   /* [row: 0 top, 1 next][kind: 0 below, 1 corner][pass: 0 tokens, 1 dense] -> per slot */
+    uint8_t *has[2][2];    /* [row][kind] per slot */
+    for (int a = 0; a < 2; a++) for (int k = 0; k < 2; k++) {
+        has[a][k] = calloc(nslot, 1);
+        for (int p = 0; p < 2; p++) {
+            stp[a][k][p] = calloc(nslot, sizeof(void *));
+            if (p ? !need_den : !need_tok) continue;
+            for (int i = 0; i < nslot; i++) stp[a][k][p][i] = xmalloc_dev((p ? (k ? cr_d : bl_d) : (k ? cr_t : bl_t)) * 2);
+        }
     }
-    float *left_t = need_tok ? xmalloc_dev(lf_t * 4) : nullptr, *left_d = need_den ? xmalloc_dev(lf_d * 4) : nullptr; int has_left = 0;
-    float *cell_t = need_tok ? xmalloc_dev((size_t)(nz_slab_max / ps) * syt * syt * CAt * 4) : nullptr, *cell_d = need_den ? xmalloc_dev((size_t)(nz_slab_max / ds) * syd * syd * CAd * 4) : nullptr;
-    uint8_t *cmask_t = xmalloc_dev((size_t)(nz_slab_max / ps) * syt * syt), *cmask_d = need_den ? xmalloc_dev((size_t)(nz_slab_max / ds) * syd * syd) : nullptr;
+    void *left[2] = {need_tok ? xmalloc_dev((size_t)(nz_slab_max / ps) * syt * ryt * CAt * 2) : nullptr, need_den ? xmalloc_dev((size_t)(nz_slab_max / ds) * syd * ryd * CAd * 2) : nullptr};
+    int has_left = 0;
     const size_t ob_max = (size_t)(nz_slab_max / ds < nz_slab_max / ps ? nz_slab_max / ps : nz_slab_max / ds) * (syd > syt ? syd : syt) * (syd > syt ? syd : syt) * (E > nd ? E : nd) * 2;
     void *obuf_d = xmalloc_dev(ob_max), *osc_d = xmalloc_dev(ob_max / 2 + 64); uint8_t *obuf_h = malloc(ob_max), *osc_h = malloc(ob_max / 2 + 64);
-    if (!colh[0] || !colh[1] || !cold || !mask_t || !cnt || !obuf_d || !osc_d || (need_tok && (!acc_t || !left_t || !cell_t)) || (need_den && (!acc_d || !mask_d || !coords || !left_d || !cell_d))) {
-        fprintf(stderr, "dinovol-embed: device memory allocation failed (lower --shard-cells)\n"); return 1; }
-    size_t fr = 0, tot = 0; xnet_mem_info(&fr, &tot);
-    fprintf(stderr, "dinovol-embed: box %lld,%lld,%lld +%lld,%lld,%lld: cells z %lld..%lld y %lld..%lld x %lld..%lld (stride %d, tile %d, margin %d, ramp %d), %d cells per shard edge, "
-                    "dense stride %d, device %.2f GB in use\n", bv[0], bv[1], bv[2], bv[3], bv[4], bv[5], (long long)c0[0], (long long)c1[0], (long long)c0[1], (long long)c1[1],
-            (long long)c0[2], (long long)c1[2], stride, T, margin, ramp, K, ds, xnet_mem_used() / 1e9);
-    const double t_start = dv_now(); double t_net = 0, t_head = 0, t_read = 0; long ntiles = 0, nskip = 0, ncells = 0, npoints = 0;
+    if (!colh[0] || !colh[1] || !cold || !mask_t || !cnt || !obuf_d || !osc_d || (need_tok && (!acc_t || !left[0])) || (need_den && (!acc_d || !mask_d || !coords || !left[1]))) {
+        fprintf(stderr, "dinovol-embed: device memory allocation failed (lower --gpu-mem / --shard-cells / --band-cells)\n"); return 1; }
+    fprintf(stderr, "dinovol-embed: box %lld,%lld,%lld +%lld,%lld,%lld: cells z %lld..%lld y %lld..%lld x %lld..%lld (stride %d, tile %d, margin %d, ramp %d), %d cells per shard edge "
+                    "(z slab), x bands of %d cells, dense stride %d, device %.2f GB in use\n", bv[0], bv[1], bv[2], bv[3], bv[4], bv[5], (long long)c0[0], (long long)c1[0], (long long)c0[1],
+            (long long)c1[1], (long long)c0[2], (long long)c1[2], stride, T, margin, ramp, K, Wx, ds, xnet_mem_used() / 1e9);
+    const double t_start = dv_now(); double t_net = 0, t_head = 0, t_read = 0, t_fin = 0; long ntiles = 0, nskip = 0, ncells = 0, npoints = 0;
     int rc = 0;
-    /* slabs of K cells along z, aligned to the shard grid */
+    extern void dv_zero_dev(void *p, size_t bytes);
+    /* x bands of Wx cells (aligned to the shard grid), then slabs of K cells along z */
+    int64_t bx1 = c0[2];
+    for (int64_t xb = 0; bx1 < c1[2] && !rc; xb++) {
+    const int64_t bx0 = bx1;   /* bands end on shard boundaries (multiples of K cells), one band when Wx covers the box */
+    bx1 = Wx >= ncx ? c1[2] : bx0 / K * K + Wx; if (bx1 > c1[2]) bx1 = c1[2];
+    const int nbx = (int)(bx1 - bx0);
     for (int64_t zs = c0[0] / K; zs * K < c1[0] && !rc; zs++) {
         const int64_t cza = zs * K > c0[0] ? zs * K : c0[0], czb = (zs + 1) * K < c1[0] ? (zs + 1) * K : c1[0];
         const int64_t Z0 = cza * stride, Z1 = czb * stride; const int nzv = (int)(Z1 - Z0);
         const int64_t bandz0 = (cza - 1) * stride - margin; const int Dband = (int)(czb - cza) * stride + T;
         const int nzt = nzv / ps, nzd = nzv / ds;
-        memset(has_top, 0, ncx + 2); memset(has_nxt, 0, ncx + 2);
+        for (int a = 0; a < 2; a++) for (int k = 0; k < 2; k++) memset(has[a][k], 0, nslot);
         /* columns in raster order; prefetch the next column's CT */
-        const int ky0 = (int)c0[1] - 1, kx0 = (int)c0[2] - 1, ncol = (ncy + 1) * (ncx + 1);
+        const int ky0 = (int)c0[1] - 1, kx0 = (int)bx0 - 1, ncol = (ncy + 1) * (nbx + 1);
         colread R = {.ct = ct, .nthreads = nthreads}; int cur = 0;
         colread_start(&R, ky0, kx0, bandz0, Dband, T, stride, margin, colh[0]);
         for (int ci = 0; ci < ncol && !rc; ci++) {
-            const int ky = ky0 + ci / (ncx + 1), kx = kx0 + ci % (ncx + 1), xi = kx - kx0;   /* xi: strip slot */
+            const int ky = ky0 + ci / (nbx + 1), kx = kx0 + ci % (nbx + 1), xi = kx - kx0;   /* xi: strip slot */
             if (kx == kx0) {   /* new row: next -> top */
-                float **t; t = top_t; top_t = nxt_t; nxt_t = t; t = top_d; top_d = nxt_d; nxt_d = t;
-                uint8_t *h = has_top; has_top = has_nxt; has_nxt = h; memset(has_nxt, 0, ncx + 2); has_left = 0;
+                for (int k = 0; k < 2; k++) {
+                    for (int p = 0; p < 2; p++) { void **t = stp[0][k][p]; stp[0][k][p] = stp[1][k][p]; stp[1][k][p] = t; }
+                    uint8_t *h = has[0][k]; has[0][k] = has[1][k]; has[1][k] = h; memset(has[1][k], 0, nslot);
+                }
+                has_left = 0;
             }
             double tr = dv_now(); pthread_join(R.th, nullptr); R.busy = 0; t_read += dv_now() - tr;
             if (R.rc) { fprintf(stderr, "dinovol-embed: CT read failed: %s\n", z3_error()); rc = 1; break; }
             const uint8_t *col = colh[cur];
-            if (ci + 1 < ncol) { cur ^= 1; colread_start(&R, ky0 + (ci + 1) / (ncx + 1), kx0 + (ci + 1) % (ncx + 1), bandz0, Dband, T, stride, margin, colh[cur]); }
-            const int in_y = ky >= c0[1] && ky < c1[1], in_x = kx >= c0[2] && kx < c1[2];
-            const int ylo = ky < c0[1] ? stride : 0, yhi = ky == c1[1] - 1 ? stride : support, xlo = kx < c0[2] ? stride : 0, xhi = kx == c1[2] - 1 ? stride : support;
+            if (ci + 1 < ncol) { cur ^= 1; colread_start(&R, ky0 + (ci + 1) / (nbx + 1), kx0 + (ci + 1) % (nbx + 1), bandz0, Dband, T, stride, margin, colh[cur]); }
+            const int in_y = ky >= c0[1] && ky < c1[1], in_x = kx >= bx0 && kx < bx1;
+            const int ylo = ky < c0[1] ? stride : 0, yhi = ky == c1[1] - 1 ? stride : support, xlo = kx < bx0 ? stride : 0, xhi = kx == bx1 - 1 ? stride : support;
             /* any nonzero voxel in the needed region? */
             int anyv = 0;
             for (int z = (int)(Z0 - bandz0); z < (int)(Z1 - bandz0) && !anyv; z++)
@@ -434,11 +457,8 @@ int cmd_dinovol_embed(int argc, char **argv) {
             dv_blockmask(cold, Dband, T, T, (int)(Z0 - bandz0), margin, margin, ps, nzt, nyt, nyt, ylo / ps, yhi / ps, xlo / ps, xhi / ps, mask_t);
             if (need_den) dv_blockmask(cold, Dband, T, T, (int)(Z0 - bandz0), margin, margin, ds, nzd, nyd, nyd, ylo / ds, yhi / ds, xlo / ds, xhi / ds, mask_d);
             uint8_t *mt = malloc((size_t)nzt * nyt * nyt); xd2h(mt, mask_t, (size_t)nzt * nyt * nyt);
-            {
-                extern void dv_zero_dev(void *p, size_t bytes);
-                if (need_tok) dv_zero_dev(acc_t, (size_t)nzt * nyt * nyt * CAt * 4);
-                if (need_den) dv_zero_dev(acc_d, (size_t)nzd * nyd * nyd * CAd * 4);
-            }
+            if (need_tok) dv_zero_dev(acc_t, (size_t)nzt * nyt * nyt * CAt * 4);
+            if (need_den) dv_zero_dev(acc_d, (size_t)nzd * nyd * nyd * CAd * 4);
             int any_tile = 0;
             for (int64_t kz = cza - 1; kz < czb && !rc; kz++) {
                 const int64_t az = kz * stride - margin, lo = kz * stride > Z0 ? kz * stride : Z0, hi = kz * stride + support < Z1 ? kz * stride + support : Z1;
@@ -460,63 +480,54 @@ int cmd_dinovol_embed(int argc, char **argv) {
             free(mt);
             if (rc) break;
             if (!any_tile) { has_left = 0; continue; }
-            /* finish: strips to the next row (below kx, corner kx + 1), the cell (ky, kx), the left strip for kx + 1 */
+            const double tf = dv_now();
+            /* finish: the strips this column passes on (below / corner to the next row, left to the next column) are saved, then the cell
+               (ky, kx) = A[:, :sy, :sy] + the strips it received, added in place (the saved regions lie outside it) */
             for (int pass = 0; pass < 2; pass++) {
                 const int isd = pass == 1; if (isd ? !need_den : !need_tok) continue;
-                const int s = isd ? ds : ps, nz = isd ? nzd : nzt, NS = isd ? nyd : nyt, sy = isd ? syd : syt, r = isd ? ryd : ryt, CA = isd ? CAd : CAt;
-                float *A = isd ? acc_d : acc_t, **nx_ = isd ? nxt_d : nxt_t, **tp = isd ? top_d : top_t, *L = isd ? left_d : left_t, *cell = isd ? cell_d : cell_t;
-                (void)s;
-                /* below: A[:, sy:, :sy] -> next[xi] (added onto a corner already there) */
-                dv_region(nx_[xi], r, sy, 0, 0, A, NS, NS, sy, 0, nz, r, sy, CA, has_nxt[xi]);
-                /* corner: next[xi + 1] = 0 with [:, :, :r] = A[:, sy:, sy:] */
-                {
-                    extern void dv_zero_dev(void *p, size_t bytes);
-                    dv_zero_dev(nx_[xi + 1], (size_t)nz * r * sy * CA * 4);
-                    dv_region(nx_[xi + 1], r, sy, 0, 0, A, NS, NS, sy, sy, nz, r, r, CA, 0);
-                }
+                const int nz = isd ? nzd : nzt, NS = isd ? nyd : nyt, sy = isd ? syd : syt, r = isd ? ryd : ryt, CA = isd ? CAd : CAt;
+                float *A = isd ? acc_d : acc_t;
+                dv_region2(stp[1][0][pass][xi], 1, r, sy, 0, 0, A, 0, NS, NS, sy, 0, nz, r, sy, CA, 0);        /* below -> next row, this slot */
+                dv_region2(stp[1][1][pass][xi + 1], 1, r, r, 0, 0, A, 0, NS, NS, sy, sy, nz, r, r, CA, 0);   /* corner -> next row, next slot */
                 if (in_y && in_x) {
-                    dv_region(cell, sy, sy, 0, 0, A, NS, NS, 0, 0, nz, sy, sy, CA, 0);
-                    if (has_top[xi]) dv_region(cell, sy, sy, 0, 0, tp[xi], r, sy, 0, 0, nz, r, sy, CA, 1);
-                    if (has_left) dv_region(cell, sy, sy, 0, 0, L, sy, r, 0, 0, nz, sy, r, CA, 1);
+                    if (has[0][0][xi]) dv_region2(A, 0, NS, NS, 0, 0, stp[0][0][pass][xi], 1, r, sy, 0, 0, nz, r, sy, CA, 1);
+                    if (has[0][1][xi]) dv_region2(A, 0, NS, NS, 0, 0, stp[0][1][pass][xi], 1, r, r, 0, 0, nz, r, r, CA, 1);
+                    if (has_left) dv_region2(A, 0, NS, NS, 0, 0, left[pass], 1, sy, r, 0, 0, nz, sy, r, CA, 1);
                 }
-                dv_region(L, sy, r, 0, 0, A, NS, NS, 0, sy, nz, sy, r, CA, 0);
+                dv_region2(left[pass], 1, sy, r, 0, 0, A, 0, NS, NS, 0, sy, nz, sy, r, CA, 0);              /* left -> next column (after the adds: x >= sy untouched) */
             }
-            has_nxt[xi] = 1; has_nxt[xi + 1] = 1; has_left = 1;
-            if (!(in_y && in_x)) continue;
-            /* masks of the cell region */
-            {
-                extern void dv_mask_crop(const uint8_t *src, int sny, int snx, uint8_t *dst, int nz, int ny, int nx);
-                dv_mask_crop(mask_t, nyt, nyt, cmask_t, nzt, syt, syt);
-                if (need_den) dv_mask_crop(mask_d, nyd, nyd, cmask_d, nzd, syd, syd);
-            }
+            has[1][0][xi] = 1; has[1][1][xi + 1] = 1; has_left = 1;
+            if (!(in_y && in_x)) { t_fin += dv_now() - tf; continue; }
             ncells += (long)(czb - cza);   /* lattice cells finished (the slab depth) */
             for (int o = 0; o < O_N && !rc; o++) {
                 if (!want[o]) continue;
-                const int isd = o >= O_DENSE, s = isd ? ds : ps, nz = isd ? nzd : nzt, sy = isd ? syd : syt, CA = isd ? CAd : CAt, C = o <= O_TOKU ? E : o == O_DENSE ? nd : ni;
+                const int isd = o >= O_DENSE, s = isd ? ds : ps, nz = isd ? nzd : nzt, NS = isd ? nyd : nyt, sy = isd ? syd : syt, CA = isd ? CAd : CAt, C = o <= O_TOKU ? E : o == O_DENSE ? nd : ni;
                 const int c0c = o == O_INK ? nd : 0, wch = isd ? -1 : E, unit = o != O_TOK, unit8 = unit && !dtype;
-                dv_finish(isd ? cell_d : cell_t, sy, sy, CA, 0, 0, nz, sy, sy, c0c, C, wch, unit, isd ? cmask_d : cmask_t, dtype, obuf_d, osc_d, unit8);
+                dv_finish(isd ? acc_d : acc_t, NS, NS, CA, 0, 0, nz, sy, sy, c0c, C, wch, unit, isd ? mask_d : mask_t, dtype, obuf_d, osc_d, unit8);
                 const size_t ob = (size_t)nz * sy * sy * C * (dtype ? 2 : 1);
                 xd2h(obuf_h, obuf_d, ob);
                 const int64_t oz = Z0 / s, oy = (int64_t)ky * stride / s, ox = (int64_t)kx * stride / s;
                 if (zw_put(&W[o], oz, oy, ox, nz, sy, sy, obuf_h)) { rc = 1; break; }
                 if (has_sc[o]) { xd2h(osc_h, osc_d, (size_t)nz * sy * sy * 2); if (zw_put(&Wsc[o], oz, oy, ox, nz, sy, sy, osc_h)) { rc = 1; break; } }
             }
-            /* shard row done (last row of the shard in y, or of the box) at the row's last column */
-            if (kx == c1[2] - 1 && (ky == c1[1] - 1 || (ky + 1) % K == 0))
+            /* shard row done (last row of the shard in y, or of the box) at the band row's last column */
+            if (kx == bx1 - 1 && (ky == c1[1] - 1 || (ky + 1) % K == 0))
                 for (int o = 0; o < O_N; o++) if (want[o]) { rc |= zw_flush(&W[o]); if (has_sc[o]) rc |= zw_flush(&Wsc[o]); }
+            t_fin += dv_now() - tf;
             if (ci % 4 == 3 || ci == ncol - 1) {
                 const double el = dv_now() - t_start;
-                fprintf(stderr, "\rdinovol-embed: slab %lld cells %ld tiles %ld (+%ld skipped) %.1f s: net %.1f head %.1f read wait %.1f, %.2f Mvox/s   ", (long long)zs, ncells, ntiles, nskip,
-                        el, t_net, t_head, t_read, (double)ncells * stride * stride * stride / el / 1e6);
+                fprintf(stderr, "\rdinovol-embed: band %lld slab %lld cells %ld tiles %ld (+%ld skipped) %.1f s: net %.1f head %.1f finish %.1f read wait %.1f, %.2f Mvox/s   ",
+                        (long long)xb, (long long)zs, ncells, ntiles, nskip, el, t_net, t_head, t_fin, t_read, (double)ncells * stride * stride * stride / el / 1e6);
             }
         }
         if (R.busy) pthread_join(R.th, nullptr);
         for (int o = 0; o < O_N; o++) if (want[o]) { rc |= zw_flush(&W[o]); if (has_sc[o]) rc |= zw_flush(&Wsc[o]); }
     }
+    }
     const double el = dv_now() - t_start;
-    fprintf(stderr, "\ndinovol-embed: %ld cells (%.1f Mvox) in %.1f s = %.2f Mvox/s; %ld tiles (%.0f ms each: net %.0f, head %.0f), %ld dense points, %ld tiles skipped; peak device %.2f GB\n",
+    fprintf(stderr, "\ndinovol-embed: %ld cells (%.1f Mvox) in %.1f s = %.2f Mvox/s; %ld tiles (%.0f ms each: net %.0f, head %.0f, finish %.0f), %ld dense points, %ld tiles skipped; peak device %.2f GB\n",
             ncells, ncells * (double)stride * stride * stride / 1e6, el, ncells * (double)stride * stride * stride / el / 1e6, ntiles, ntiles ? el / ntiles * 1e3 : 0,
-            ntiles ? t_net / ntiles * 1e3 : 0, ntiles ? t_head / ntiles * 1e3 : 0, npoints, nskip, (xnet_mem_used() + xnet_mem_cached()) / 1e9);
+            ntiles ? t_net / ntiles * 1e3 : 0, ntiles ? t_head / ntiles * 1e3 : 0, ntiles ? t_fin / ntiles * 1e3 : 0, npoints, nskip, (xnet_mem_used() + xnet_mem_cached()) / 1e9);
     for (int o = 0; o < O_N; o++) if (want[o]) { zw_free(&W[o]); if (has_sc[o]) zw_free(&Wsc[o]); }
     dv_free(net); z3_close(ct); store_close(st);
     return rc;

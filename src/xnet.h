@@ -41,7 +41,8 @@ void xd2h(void *dst, const void *src, size_t bytes);
 
 enum { XA_NONE = 0, XA_RELU = 1, XA_LRELU = 2, XA_GELU = 3, XA_SILU = 4,   /* LeakyReLU slope 0.01; GELU exact (erf) */
        XA_POSTRES = 16,                                       /* flag: y = act(acc scale + bias) + res (default: act(.. + res)) */
-       XA_GLU = 32 };                                         /* flag: output co / 2 channels silu(v[2j]) v[2j + 1] (no res) */
+       XA_GLU = 32,                                           /* flag: output co / 2 channels silu(v[2j]) v[2j + 1] (no res) */
+       XA_LN = 64 };                                          /* flag (xconv_fwd_ln): channel LayerNorm before res / act, co 32 or 64 */
 
 typedef struct {
     int ci, co, kd, kh, kw, sd, sh, sw, pd, ph, pw;      /* the GEMM conv (after unfolding) */
@@ -60,6 +61,8 @@ int xtconv_init(xconv *c, const float *w, int ci, int co, const float *bias);
 void xconv_free(xconv *c);
 /* y = act(conv(x) * scale + bias (+ res)); allocates y. res (optional) has y's shape. */
 xt xconv_fwd(const xconv *c, xt x, const xt *res, int act);
+/* y = act(LN_c(conv(x) scale + bias) lnw + lnb (+ res)) with the LayerNorm in the conv epilogue (co 32 or 64; the default tile config) */
+xt xconv_fwd_ln(const xconv *c, xt x, const xt *res, int act, const float *lnw, const float *lnb, float eps);
 /* fold BatchNorm (gamma, beta, mean, var, eps) into per-channel scale / bias, plus a conv bias cb (nullptr: none) */
 void xbn_fold(int co, const float *g, const float *b, const float *m, const float *v, float eps, const float *cb, float *scale, float *bias);
 

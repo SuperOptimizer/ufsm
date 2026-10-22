@@ -116,6 +116,23 @@ def main():
                 print(f"{name} block {ref.shape}: {live.sum()} vectors, zero sets equal {bool((za == zb).all())}, cos mean {c.mean():.6f} min {c.min():.6f}, "
                       f"|d| max {np.abs(a - b).max():.4f}")
                 fails += (za != zb).any() or c.mean() < 0.9999 or c.min() < 0.999
+        # x bands of one cell and one-cell z slabs (recomputed boundary tile columns) must give the same bytes
+        out2 = pathlib.Path(td) / "emb2"
+        r = subprocess.run([str(UFSM), "dinovol-embed", str(CT_ROOT), CT_KEY, str(out2), "--ckpt", str(R.CKPT), "--box", ",".join(map(str, BOX)), "--tile", str(T),
+                            "--margin", str(MARGIN), "--ramp", str(RAMP), "--dense-stride", str(DS), "--dtype", "float16", "--norm", f"{CENTER},{SCALE},{HI}",
+                            "--band-cells", "1", "--shard-cells", "1"], capture_output=True, text=True)
+        if r.returncode:
+            print(r.stderr[-2000:]); print("FAIL: banded run"); return 1
+        for name, step in [("tokens", 8), ("dense", DS), ("ink", DS)]:
+            o = (z0 // step, y0 // step, x0 // step); n = (nz // step, ny // step, nx // step)
+            got = []
+            for d in (out, out2):
+                f = pathlib.Path(td) / "b.f32"
+                subprocess.run([str(UFSM), "dinovol-read", str(d), name, ",".join(map(str, o + n)), str(f)], check=True)
+                got.append(np.fromfile(f, np.float32))
+            same = np.array_equal(got[0], got[1])
+            print(f"{name}: banded (1-cell bands and slabs) == default: {same}")
+            fails += not same
     print("FAIL" if fails else "PASS")
     return 1 if fails else 0
 

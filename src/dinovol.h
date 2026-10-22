@@ -36,6 +36,14 @@ void dv_tok_acc(float *acc, int b0, int b1, int ny, int nx, int C, const void *t
                 const uint8_t *mask);
 void dv_blockmask(const uint8_t *ct, int D, int H, int W, int z0, int y0, int x0, int s, int nz, int ny, int nx, int ylo, int yhi, int xlo, int xhi, uint8_t *mask);
 void dv_region(float *dst, int dny, int dnx, int dy0, int dx0, const float *src, int sny, int snx, int sy0, int sx0, int nz, int ny, int nx, int C, int add);
+void dv_region2(void *dst, int dh, int dny, int dnx, int dy0, int dx0, const void *src, int sh, int sny, int snx, int sy0, int sx0, int nz, int ny, int nx, int C, int add);   /* dh / sh: fp16 */
+/* cuBLASLt fp16 GEMM, fp32 accumulation (UFSM_DV_CUBLAS: 1 QKV + fc2 (default), 2 every linear layer, 0 the xnet path): D[m][n] = sum_k A[m][k] W[n][k] (+ bias[n]) (+ D if beta; D fp32 or fp16) */
+int dv_gemm(const void *A, int M, int K, const void *W, int ldw, int N, const float *bias, void *D, int d_fp32, int beta);
+int dv_gemm_on(void);
+void dv_glu_il(const void *a, void *g, long long n);   /* g[i] = silu(a[2i]) a[2i + 1] */
+void dv_gelu(void *x, long long n);
+void dv_gelu_add_ln(const void *x, const void *res, const float *w, const float *b, float eps, void *y, long long M, int C);   /* y = LN(gelu(x) + res) */
+void dv_gemm_set(int on);
 void dv_finish(const float *acc, int any, int anx, int CA, int y0, int x0, int nz, int ny, int nx, int c0, int C, int wch, int unit,
                const uint8_t *mask, int dtype, void *out, void *scale, int unit8);
 

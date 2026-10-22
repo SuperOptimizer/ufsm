@@ -111,6 +111,7 @@ struct ConvP {
     int Di, Hi, Wi, Ci, Do, Ho, Wo, Co;
     int kd, kh, kw, sd, sh, sw, pd, ph, pw, K, Kp;
     long long M; int act;
+    const float *lnw, *lnb; float lneps;   /* XA_LN: channel LayerNorm of the whole output row (one block holds every channel) */
 };
 __device__ __forceinline__ unsigned smem_u32(const void *p) { return (unsigned)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void cp_async16(void *dst, const void *src, int bytes) {
@@ -203,6 +204,32 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32) conv_igemm(ConvP p) {
     }
     cp_wait<0>();
     const int g = lane >> 2, t4 = lane & 3;
+    if constexpr (WARPS_N == 1) if (p.act & XA_LN) {   /* rows complete in this warp: v = conv + bias, LN over the Co channels, + res, act */
+#pragma unroll
+        for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const long long m = m_base + wm0 + mi * 16 + g + h * 8;
+            float v[NI][2], s = 0.f;
+#pragma unroll
+            for (int ni = 0; ni < NI; ni++) { const int co = ni * 8 + t4 * 2; v[ni][0] = acc[mi][ni][2 * h] * p.scale[co] + p.bias[co]; v[ni][1] = acc[mi][ni][2 * h + 1] * p.scale[co + 1] + p.bias[co + 1]; s += v[ni][0] + v[ni][1]; }
+            s += __shfl_xor_sync(0xffffffffu, s, 1); s += __shfl_xor_sync(0xffffffffu, s, 2);
+            const float mean = s / (NI * 8); float q = 0.f;
+#pragma unroll
+            for (int ni = 0; ni < NI; ni++) { const float a = v[ni][0] - mean, b = v[ni][1] - mean; q += a * a + b * b; }
+            q += __shfl_xor_sync(0xffffffffu, q, 1); q += __shfl_xor_sync(0xffffffffu, q, 2);
+            const float rs = rsqrtf(q / (NI * 8) + p.lneps);
+            if (m >= p.M) continue;
+#pragma unroll
+            for (int ni = 0; ni < NI; ni++) {
+                const int co = ni * 8 + t4 * 2; const size_t o = (size_t)m * p.Co + co;
+                float a = __half2float(__float2half_rn((v[ni][0] - mean) * rs * p.lnw[co] + p.lnb[co])), b = __half2float(__float2half_rn((v[ni][1] - mean) * rs * p.lnw[co + 1] + p.lnb[co + 1]));
+                if (p.res) { const __half2 r = *(const __half2 *)(p.res + o); a += __low2float(r); b += __high2float(r); }
+                *(__half2 *)(p.y + o) = __floats2half2_rn(act_f(a, p.act), act_f(b, p.act));
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int mi = 0; mi < MI; mi++)
 #pragma unroll
@@ -315,11 +342,16 @@ static void conv_launch(const ConvP &p, int co) {
     case 4:
         if (co <= 64) launch1<128, 64, 2, 2, 32, 4>(p, co); else if (co <= 128) launch1<128, 128, 2, 2, 32, 4>(p, co); else launch1<128, 256, 2, 4, 32, 4>(p, co); break;
     default:  /* 8 warps of 32 x 32 / 64 x 32; 4 warps of 32 x 32 for <= 32 outputs (no padded half tile) */
+        if (p.act & XA_LN) {   /* one warp column holds all channels */
+            if (co == 32) launch1<128, 32, 4, 1, 32, 3>(p, co); else if (co == 64) launch1<128, 64, 4, 1, 32, 3>(p, co);   /* (BK 64, 64-row and 4-stage variants measured slower) */
+            else fprintf(stderr, "xnet: fused LayerNorm needs 32 or 64 outputs (%d)\n", co);
+            break;
+        }
         if (co <= 32) launch1<128, 32, 4, 1, 32, 3>(p, co);
         else if (co <= 64) launch1<128, 64, 4, 2, 32, 3>(p, co); else launch1<128, 128, 2, 4, 32, 3>(p, co); break;
     }
 }
-static xt conv_run(const xconv *c, xt x, const xt *res, int act) {
+static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *lnw = nullptr, const float *lnb = nullptr, float lneps = 0.f) {
     xt in = x;
     if (c->unfold) in = xunfold(x, c->kw0, c->pw0);
     const int Do = (in.d + 2 * c->pd - c->kd) / c->sd + 1, Ho = (in.h + 2 * c->ph - c->kh) / c->sh + 1, Wo = (in.w + 2 * c->pw - c->kw) / c->sw + 1;
@@ -329,12 +361,15 @@ static xt conv_run(const xconv *c, xt x, const xt *res, int act) {
     p.x = (const __half *)in.p; p.w = (const __half *)c->w; p.res = res ? (const __half *)res->p : nullptr; p.scale = c->scale; p.bias = c->bias; p.y = (__half *)y.p;
     p.Di = in.d; p.Hi = in.h; p.Wi = in.w; p.Ci = in.c; p.Do = Do; p.Ho = Ho; p.Wo = Wo; p.Co = c->co;
     p.kd = c->kd; p.kh = c->kh; p.kw = c->kw; p.sd = c->sd; p.sh = c->sh; p.sw = c->sw; p.pd = c->pd; p.ph = c->ph; p.pw = c->pw;
-    p.K = c->K; p.Kp = c->Kp; p.M = (long long)in.n * Do * Ho * Wo; p.act = act;
+    p.K = c->K; p.Kp = c->Kp; p.M = (long long)in.n * Do * Ho * Wo; p.act = act; p.lnw = lnw; p.lnb = lnb; p.lneps = lneps;
     g_macs += (double)p.M * c->co * c->K;
     if (g_verbose) fprintf(stderr, "xnet conv %dx%dx%d s%d%d%d ci %d co %d: in %dx%dx%dx%d out %dx%dx%d M %lld\n", c->kd, c->kh, c->kw, c->sd, c->sh, c->sw, c->ci, c->co, in.n, in.d, in.h, in.w, Do, Ho, Wo, p.M);
     if (p.M > 0) conv_launch(p, c->co);
     if (c->unfold) xt_free(&in);
     return y;
+}
+extern "C" xt xconv_fwd_ln(const xconv *c, xt x, const xt *res, int act, const float *lnw, const float *lnb, float eps) {
+    return conv_run(c, x, res, act | XA_LN, lnw, lnb, eps);
 }
 extern "C" xt xconv_fwd(const xconv *c, xt x, const xt *res, int act) {
     if (!c->tconv) return conv_run(c, x, res, act);
