@@ -39,6 +39,11 @@ void dv_region(float *dst, int dny, int dnx, int dy0, int dx0, const float *src,
 void dv_finish(const float *acc, int any, int anx, int CA, int y0, int x0, int nz, int ny, int nx, int c0, int C, int wch, int unit,
                const uint8_t *mask, int dtype, void *out, void *scale, int unit8);
 
+enum { DVP_CNN, DVP_TOK, DVP_LN, DVP_QKV, DVP_ROPE, DVP_ATTN, DVP_PROJ, DVP_FC1, DVP_FC2, DVP_FINAL, DVP_FPN, DVP_HGATHER, DVP_HGEMM, DVP_HOUT, DVP_OTHER, DV_NSTAGE };
+int dv_prof_on(void);                       /* UFSM_DV_PROF=1: per-stage device times (synchronising) */
+void dv_prof(int stage);                    /* the time since the previous mark goes to stage */
+void dv_prof_report(double per);            /* print (divided by per) and reset */
+
 /* the network (src/dinovol_net.c) */
 typedef struct dv_net dv_net;
 dv_net *dv_load(const char *ckpt);          /* nullptr on failure (message printed); needs xnet_init first */

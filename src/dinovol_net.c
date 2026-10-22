@@ -204,6 +204,7 @@ int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scal
     xt_free(&n->tok); for (int k = 0; k < 3; k++) xt_free(&n->sk[k]); xt_free(&n->fpng);
     n->T = T;
     const float lo = -1e30f, a = 1.f / scale, b = -center / scale;
+    dv_prof(DVP_OTHER);
     xt in = xinput_u8(u8_dev, 1, T, T, T, &lo, &hi, &a, &b);
     xt x = cln_fwd(&n->stem, in, nullptr, 1); xt_free(&in);
     int bi = 0, owned = 1;   /* owned: x is not one of the kept skips */
@@ -212,6 +213,7 @@ int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scal
         if (s < 3) { n->sk[s] = x; owned = 0; }   /* the stage output is both a skip and the next input */
     }
     xt tk = xconv_fwd(&n->fproj, x, nullptr, XA_NONE); xt_free(&x);
+    dv_prof(DVP_CNN);
     const int g = T / DV_PATCH; const long long Np = (long long)g * g * g, N = Np + DV_PRE;
     /* token sequence X [N][480] (fp32 residual stream, as under autocast): prefix then patches */
     float *X = xmalloc_dev((size_t)N * DV_E * 4);
@@ -219,17 +221,26 @@ int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scal
     dv_half_to_float(X + (size_t)DV_PRE * DV_E, tk.p, Np * DV_E);
     xt_free(&tk);
     xt h = xt_new(1, 1, 1, (int)N, DV_E), o = xt_new(1, 1, 1, (int)N, DV_E);
+    dv_prof(DVP_TOK);
     for (int b = 0; b < n->depth; b++) {
         const vblock *V = &n->vb[b];
         dv_layernorm32(X, V->ln1w, V->ln1b, 1e-5f, h.p, N, DV_E);
+        dv_prof(DVP_LN);
         xt qkv = xconv_fwd(&V->qkv, h, nullptr, XA_NONE);
+        dv_prof(DVP_QKV);
         dv_rope(qkv.p, V->mix, (int)N, DV_PRE, g, DV_H);
+        dv_prof(DVP_ROPE);
         dv_attention48(qkv.p, o.p, (int)N, DV_H);
+        dv_prof(DVP_ATTN);
         xt_free(&qkv);
         xt u = xconv_fwd(&V->proj, o, nullptr, XA_NONE); dv_add_half(X, u.p, N * DV_E); xt_free(&u);
+        dv_prof(DVP_PROJ);
         dv_layernorm32(X, V->ln2w, V->ln2b, 1e-5f, h.p, N, DV_E);
+        dv_prof(DVP_LN);
         xt G = xconv_fwd(&V->fc1, h, nullptr, XA_GLU);   /* [N][F]: silu(x1) x2 fused */
+        dv_prof(DVP_FC1);
         u = xconv_fwd(&V->fc2, G, nullptr, XA_NONE); xt_free(&G); dv_add_half(X, u.p, N * DV_E); xt_free(&u);
+        dv_prof(DVP_FC2);
     }
     dv_layernorm32(X, n->nw, n->nb, 1e-5f, h.p, N, DV_E);
     n->tok = xt_new(1, g, g, g, DV_E);
@@ -238,6 +249,7 @@ int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scal
         dv_copy_dev(n->tok.p, (const char *)h.p + (size_t)DV_PRE * DV_E * 2, (size_t)Np * DV_E * 2);
     }
     xt_free(&h); xt_free(&o); xfree_dev(X);
+    dv_prof(DVP_FINAL);
     /* FPN grid at the 128-channel skip's resolution */
     xt f = xconv_fwd(&n->fpn_in, n->tok, nullptr, XA_NONE);
     const xt s2 = n->sk[2];
@@ -245,6 +257,7 @@ int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scal
     xt f2 = xconv_fwd(&n->lat, s2, &up, XA_NONE); xt_free(&up);
     xt r = xt_new(1, f2.d, f2.h, f2.w, f2.c); dv_gconv8_gelu(f2.p, n->refw, n->refb, r.p, f2.d, f2.c);
     n->fpng = xconv_fwd(&n->ref2, r, &f2, XA_NONE); xt_free(&r); xt_free(&f2);
+    dv_prof(DVP_FPN);
     return xnet_check("dinovol forward");
 }
 
@@ -256,14 +269,18 @@ int dv_net_points(dv_net *n, const float *coords_dev, const float *wgt_dev, cons
         dv_gather_grid G[5] = {{n->tok.p, n->tok.d, DV_E, nullptr, nullptr},
                                {n->sk[0].p, n->sk[0].d, n->sk[0].c, n->skw[0], n->skb[0]}, {n->sk[1].p, n->sk[1].d, n->sk[1].c, n->skw[1], n->skb[1]},
                                {n->sk[2].p, n->sk[2].d, n->sk[2].c, n->skw[2], n->skb[2]}, {n->fpng.p, n->fpng.d, n->fpng.c, n->fnw, n->fnb}};
+        dv_prof(DVP_OTHER);
         dv_gather(G, 5, n->T, 1e-5f, coords_dev + (size_t)p0 * 3, np, tok.p, feat.p, Ft);
+        dv_prof(DVP_HGATHER);
         xt S = xconv_fwd(&n->shortcut, tok, nullptr, XA_NONE); xt_free(&tok);
         xt h1 = xconv_fwd(&n->mlp0, feat, nullptr, XA_GELU); xt_free(&feat);
         xt h2 = xconv_fwd(&n->mlp2, h1, &S, XA_GELU | XA_POSTRES); xt_free(&h1); xt_free(&S);
         dv_layernorm(h2.p, n->tw, n->tb, 1e-5f, nullptr, 0, h2.p, np, n->hid);
         xt pr = xconv_fwd(&n->proj, h2, nullptr, XA_NONE); xt_free(&h2);
+        dv_prof(DVP_HGEMM);
         dv_head_out(pr.p, wgt_dev ? wgt_dev + p0 : nullptr, rows_dev ? rows_dev + p0 : nullptr, np, wgt_dev ? acc_dev : acc_dev + (size_t)p0 * C, n->nd, n->ni);
         xt_free(&pr);
+        dv_prof(DVP_HOUT);
     }
     return xnet_check("dinovol points");
 }

@@ -64,8 +64,10 @@ static int raw_mode(dv_net *net, int argc, char **argv) {
         xnet_sync(); t0 = dv_now();
         if (dv_forward(net, ud, T, c, s, hi)) return 1;
         xnet_sync(); t1 = dv_now();
+        if (r == 0 && reps > 1) dv_prof_report(0);   /* the first (cold) forward is not counted */
     }
     fprintf(stderr, "dinovol: tile %d^3 forward %.1f ms\n", T, (t1 - t0) * 1e3);
+    dv_prof_report(reps > 1 ? reps - 1 : 1);
     const int g = T / 8;
     if (dump_dev_half(out, "tokens.f32", dv_tokens(net), (size_t)g * g * g * 480)) return 1;
     for (int k = 0; k < 3; k++) { int e, ch; const void *p = dv_skip(net, k, &e, &ch); char nm[32]; snprintf(nm, sizeof nm, "skip%d.f32", k);
@@ -78,6 +80,7 @@ static int raw_mode(dv_net *net, int argc, char **argv) {
         xnet_sync(); const double t2 = dv_now();
         if (dv_net_points(net, pd, nullptr, nullptr, P, acc)) return 1;
         xnet_sync(); fprintf(stderr, "dinovol: dense head %d points %.1f ms\n", P, (dv_now() - t2) * 1e3);
+        dv_prof_report(1);
         float *o = malloc((size_t)P * C * 4); xd2h(o, acc, (size_t)P * C * 4);
         if (write_file(out, "dense_ink.f32", o, (size_t)P * C * 4)) return 1;
         free(o); free(ph); xfree_dev(pd); xfree_dev(acc);

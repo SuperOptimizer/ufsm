@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define ST ((cudaStream_t)xnet_stream())
 static inline unsigned nb_of(long long n, int t) { long long b = (n + t - 1) / t; return (unsigned)(b > 2147483647LL ? 2147483647LL : b); }
@@ -476,4 +477,24 @@ extern "C" void dv_zero_dev(void *p, size_t bytes) { cudaMemsetAsync(p, 0, bytes
 extern "C" void dv_mask_crop(const uint8_t *src, int sny, int snx, uint8_t *dst, int nz, int ny, int nx) {
     cudaMemcpy2DAsync(dst, (size_t)nx, src, (size_t)snx, (size_t)nx, (size_t)ny, cudaMemcpyDeviceToDevice, ST);   /* plane 0 */
     for (int z = 1; z < nz; z++) cudaMemcpy2DAsync(dst + (size_t)z * ny * nx, (size_t)nx, src + (size_t)z * sny * snx, (size_t)snx, (size_t)nx, (size_t)ny, cudaMemcpyDeviceToDevice, ST);
+}
+/* ---- stage profiler (UFSM_DV_PROF=1): device time between consecutive marks, attributed to the stage that just ended ---- */
+static int g_prof = -1; static cudaEvent_t g_pe[2]; static int g_pc = 0; static double g_pacc[DV_NSTAGE]; static long g_pn[DV_NSTAGE];
+extern "C" int dv_prof_on(void) { if (g_prof < 0) { const char *e = getenv("UFSM_DV_PROF"); g_prof = e && atoi(e); if (g_prof) { cudaEventCreate(&g_pe[0]); cudaEventCreate(&g_pe[1]); cudaEventRecord(g_pe[0], ST); } } return g_prof; }
+extern "C" void dv_prof(int stage) {
+    if (!dv_prof_on()) return;
+    cudaEventRecord(g_pe[g_pc ^ 1], ST); cudaEventSynchronize(g_pe[g_pc ^ 1]);
+    float ms = 0; cudaEventElapsedTime(&ms, g_pe[g_pc], g_pe[g_pc ^ 1]); g_pc ^= 1;
+    if (stage >= 0 && stage < DV_NSTAGE) { g_pacc[stage] += ms; g_pn[stage]++; }
+}
+extern "C" void dv_prof_report(double per) {
+    if (!dv_prof_on()) return;
+    if (per <= 0) { for (int i = 0; i < DV_NSTAGE; i++) { g_pacc[i] = 0; g_pn[i] = 0; } return; }
+    static const char *nm[DV_NSTAGE] = {"input+CNN", "token assembly", "LayerNorms", "QKV GEMM", "RoPE", "attention", "proj GEMM", "fc1+SwiGLU GEMM", "fc2 GEMM",
+                                        "final LN+copy", "FPN", "head gather", "head GEMMs+LN", "head out", "other"};
+    double t = 0; for (int i = 0; i < DV_NSTAGE; i++) t += g_pacc[i];
+    fprintf(stderr, "dinovol stage times (ms per %s):\n", per > 1 ? "tile" : "call");
+    for (int i = 0; i < DV_NSTAGE; i++) if (g_pn[i]) fprintf(stderr, "  %-18s %8.2f\n", nm[i], g_pacc[i] / per);
+    fprintf(stderr, "  %-18s %8.2f\n", "total", t / per);
+    for (int i = 0; i < DV_NSTAGE; i++) { g_pacc[i] = 0; g_pn[i] = 0; }
 }
