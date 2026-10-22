@@ -924,3 +924,30 @@ int cmd_dinovol_eval(int argc, char **argv) {
 #undef FIT_AT
     return 0;
 }
+
+/* a box of unit int8 embeddings [nz][ny][nx][C] (box-local) as a dinovol-format group (array "dense", step 1, value_scale 1/127) readable
+   by dinovol-eval / dinovol-read; the array spans the volume's grid, shards of 128 cells hold the box */
+int dv_write_dense_box(const char *group, const int64_t vol_shape[3], const int64_t box[6], int C, const int8_t *data) {
+    if (mkdirs(group)) { fprintf(stderr, "dinovol: cannot create %s\n", group); return -1; }
+    char p[1200]; snprintf(p, sizeof p, "%s/zarr.json", group); FILE *f = fopen(p, "w"); if (!f) return -1;
+    fprintf(f, "{\"zarr_format\":3,\"node_type\":\"group\",\"attributes\":{\"format\":\"ufsm dense embeddings\",\"box_zyx\":[%lld,%lld,%lld,%lld,%lld,%lld],"
+               "\"lattice\":{\"stride\":1},\"dense_stride\":1}}\n", (long long)box[0], (long long)box[1], (long long)box[2], (long long)box[3], (long long)box[4], (long long)box[5]);
+    fclose(f);
+    zw w; snprintf(p, sizeof p, "%s/dense", group);
+    if (zw_create(&w, p, vol_shape, C, "int8", 1, 128, 32, "{\"value_scale\":0.007874015748031496,\"values\":\"unit-norm embedding\"}")) return -1;
+    const int S = 128; int8_t *blk = malloc((size_t)S * S * S * C); int rc = 0;
+    for (int64_t bz = box[0] / S * S; bz < box[0] + box[3] && !rc; bz += S)
+        for (int64_t by = box[1] / S * S; by < box[1] + box[4] && !rc; by += S)
+            for (int64_t bx = box[2] / S * S; bx < box[2] + box[5] && !rc; bx += S) {
+                memset(blk, 0, (size_t)S * S * S * C);
+                for (int64_t z = 0; z < S; z++) for (int64_t y = 0; y < S; y++) {
+                    const int64_t gz = bz + z, gy = by + y, lz = gz - box[0], ly = gy - box[1];
+                    if (lz < 0 || ly < 0 || lz >= box[3] || ly >= box[4]) continue;
+                    const int64_t x0 = bx > box[2] ? bx : box[2], x1 = bx + S < box[2] + box[5] ? bx + S : box[2] + box[5];
+                    if (x1 > x0) memcpy(blk + ((z * S + y) * S + (x0 - bx)) * C, data + (((size_t)lz * box[4] + ly) * box[5] + (x0 - box[2])) * C, (size_t)(x1 - x0) * C);
+                }
+                rc = zw_put(&w, bz, by, bx, S, S, S, blk);
+            }
+    rc |= zw_flush(&w); zw_free(&w); free(blk);
+    return rc;
+}

@@ -27,7 +27,7 @@ SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c 
 SRC += src/fblend.c
 SRC += src/render.c src/imgops.c
 SRC += src/repack.c
-SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c
+SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c src/dino.c
 SRC += src/inksplat.c
 SRC += src/tfx.c
 SRC += src/fitjoin.c src/fieldsoracle.c
@@ -186,6 +186,9 @@ test-all: $(B)/test_ink_splat
 $(B)/test_imgops: tests/test_imgops.c tests/test_imgops_expected.h $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_imgops.c $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o -o $@ $(LDLIBS)
 test-all: $(B)/test_imgops
+$(B)/test_dino_loss: tests/test_dino_loss.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dino_loss.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_dino_loss
 $(B)/test_tfx: tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o -o $@ $(LDLIBS)
 test-all: $(B)/test_tfx
@@ -368,6 +371,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_tiffw
 	./$(B)/test_imgops
 	./$(B)/test_tfx
+	./$(B)/test_dino_loss
 	./$(B)/test_ink_splat
 	./$(B)/test_pyports
 	./$(B)/test_edt

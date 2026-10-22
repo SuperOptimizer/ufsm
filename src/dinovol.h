@@ -52,6 +52,9 @@ int dv_prof_on(void);                       /* UFSM_DV_PROF=1: per-stage device 
 void dv_prof(int stage);                    /* the time since the previous mark goes to stage */
 void dv_prof_report(double per);            /* print (divided by per) and reset */
 
+int dv_write_dense_box(const char *group, const int64_t vol_shape[3], const int64_t box[6], int C, const int8_t *data);   /* src/dinovol.c */
+int cmd_dinovol_eval(int argc, char **argv);
+
 /* the network (src/dinovol_net.c) */
 typedef struct dv_net dv_net;
 dv_net *dv_load(const char *ckpt);          /* nullptr on failure (message printed); needs xnet_init first */
