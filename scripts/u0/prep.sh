@@ -12,7 +12,7 @@ while IFS=$'\t' read -r scroll id volume um kev dist level lum shape lgb cgb sha
   [ -e $A/STOP ] && { log "STOP file: exiting"; exit 0; }
   tag=$scroll-$id
   case "$status" in
-    copy|link-old-copy) [ -e $A/state/$tag.copy.done ] || continue; root=$A/vol; key=$scroll/$volume;;
+    copy|link-old-copy) [ -e $A/state/$tag.copy.done ] || continue; root=$(cat $A/state/$tag.loc 2>/dev/null || echo $A/vol); key=$scroll/$volume;;
     use-*) root=$OLD/$scroll; key=$volume;;
     *) continue;;
   esac

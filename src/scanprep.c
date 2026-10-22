@@ -5,6 +5,7 @@
 #include "store.h"
 #include "zarr3.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -30,7 +31,10 @@ static int smkdirs(const char *path) {
 static int write_file(const char *path, const void *buf, size_t n) {   /* tmp + rename: never a partial file under the final name */
     char tmp[1500]; snprintf(tmp, sizeof tmp, "%s.part", path);
     FILE *f = fopen(tmp, "wb"); if (!f) return -1;
-    const int ok = fwrite(buf, 1, n, f) == n; if (fclose(f) || !ok) { unlink(tmp); return -1; }
+    int ok = fwrite(buf, 1, n, f) == n && !fflush(f);
+    /* written, then out of the page cache: a bulk copy must not evict the cached data of jobs running beside it */
+    if (ok && n > 65536) { const int fd = fileno(f); ok = !fdatasync(fd); posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); }
+    if (fclose(f) || !ok) { unlink(tmp); return -1; }
     return rename(tmp, path) ? -1 : 0;
 }
 static int64_t file_size(const char *p) { struct stat st; return stat(p, &st) ? -1 : (int64_t)st.st_size; }
@@ -39,7 +43,7 @@ static int64_t file_size(const char *p) { struct stat st; return stat(p, &st) ? 
 
 typedef struct {
     store *s; const char *key, *out, *link; const z3_meta *m; int64_t g[3]; int64_t total;
-    double rate, t_avail; pthread_mutex_t mu;   /* bytes / s (0: unlimited), the token bucket's next free time */
+    double rate, t_avail, t_file; const char *rate_file; pthread_mutex_t mu;   /* bytes / s (0: unlimited), the token bucket's next free time */
     atomic_long next, have, linked, got, missing, failed, bytes; double t0; atomic_long last_print;
     uint8_t *present;   /* per shard: 1 present after the copy */
 } mir_t;
@@ -49,9 +53,14 @@ static void shard_rel(const z3_meta *m, int64_t k, const int64_t g[3], char *buf
     snprintf(buf, n, "c%c%lld%c%lld%c%lld", sep, (long long)z, sep, (long long)y, sep, (long long)x);
 }
 static void mir_throttle(mir_t *M, int64_t bytes) {
-    if (M->rate <= 0) return;
     pthread_mutex_lock(&M->mu);
-    const double t = snow(); if (M->t_avail < t) M->t_avail = t;
+    const double t = snow();
+    if (M->rate_file && t - M->t_file >= 10) {   /* --mbps-file: re-read the cap every 10 s (a watchdog lowers it while trainers slow down) */
+        M->t_file = t; FILE *f = fopen(M->rate_file, "r"); double v;
+        if (f) { if (fscanf(f, "%lf", &v) == 1 && v >= 0 && v * 1e6 != M->rate) { fprintf(stderr, "mirror: rate cap %.0f MB/s (%s)\n", v, M->rate_file); M->rate = v * 1e6; } fclose(f); }
+    }
+    if (M->rate <= 0) { pthread_mutex_unlock(&M->mu); return; }
+    if (M->t_avail < t) M->t_avail = t;
     M->t_avail += (double)bytes / M->rate; const double wait = M->t_avail - t - 1.0;   /* (one second of burst) */
     pthread_mutex_unlock(&M->mu);
     if (wait > 0) { struct timespec ts = {(time_t)wait, (long)((wait - floor(wait)) * 1e9)}; nanosleep(&ts, nullptr); }
@@ -91,11 +100,11 @@ static void *mir_worker(void *arg) {
 static uint64_t rng_next(uint64_t *s) { uint64_t z = (*s += 0x9e3779b97f4a7c15ull); z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull; z = (z ^ (z >> 27)) * 0x94d049bb133111ebull; return z ^ (z >> 31); }
 
 int cmd_mirror(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm mirror <root> <array-key> <out-dir> [--threads 4] [--mbps 0] [--link-from DIR] [--verify N] [--seed 1]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm mirror <root> <array-key> <out-dir> [--threads 4] [--mbps 0] [--mbps-file F] [--link-from DIR] [--verify N] [--seed 1]\n"); return 2; }
     mir_t M = {0};
     M.key = argv[3]; M.out = argv[4]; M.link = sopt(argc, argv, "--link-from", nullptr);
     const int nt = atoi(sopt(argc, argv, "--threads", "4")), nver = atoi(sopt(argc, argv, "--verify", "0"));
-    M.rate = atof(sopt(argc, argv, "--mbps", "0")) * 1e6; uint64_t seed = (uint64_t)atoll(sopt(argc, argv, "--seed", "1"));
+    M.rate = atof(sopt(argc, argv, "--mbps", "0")) * 1e6; M.rate_file = sopt(argc, argv, "--mbps-file", nullptr); M.t_file = -1e9; uint64_t seed = (uint64_t)atoll(sopt(argc, argv, "--seed", "1"));
     store_global_init();
     M.s = store_open(argv[2]);
     z3 *z = M.s ? z3_open(M.s, M.key, nullptr) : nullptr;
