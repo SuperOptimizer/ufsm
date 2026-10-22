@@ -292,6 +292,7 @@ static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
                 if (s->tgt_key[c] && source_tgt_for_level(s, c, l, nullptr)) any = 1;
             }
             if (s->band && (s->phase || l == 0)) any = 1;   /* band codes (+ stored phase) alone label a source (task unwrap2 sources have no recto / ink) */
+            if (s->ct_only) any = 1;   /* an unlabelled scan ("ct_only": 1): windows with no target, for label-free terms */
             ok = any;
         }
         cache[l] = ok ? 2 : 1;
@@ -2086,6 +2087,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         }
         PROF_MARK(PS_SCAN);
     }
+    if (s->norm_s > 0) { mean = s->norm_c; sd = s->norm_s; }   /* "norm": the scan's fixed normalisation (ufsm scanprep median / scale) instead of the window z-score */
     uint8_t *mask = big + 9 * p3;   /* ign lives here: fold CT > 0 into it */
     for (size_t k = 0; k < p3; k++) mask[k] = (ctu[k] != 0) & (mask[k] == 0);
     PROF_MARK(PS_ZSCORE);
@@ -2393,7 +2395,7 @@ static occ_index phase_occupancy(source *s) {
     return o;
 }
 /* coarsest recto level that fits in memory: the cells containing any surface fraction (fallback: any labelled cell) */
-occ_index source_occupancy(source *s) {
+static occ_index label_occupancy(source *s) {
     occ_index o = {nullptr, 0, -1, {0, 0, 0}};
     if (s->reg[0] && s->reg[0]->n) return o;
     /* the coarsest label level that exists (level >= 3); large scans (Paris 4: 2.5e9 cells at level 5) are read in z slabs,
@@ -2429,6 +2431,22 @@ occ_index source_occupancy(source *s) {
     if (!n) { free(idx); return o; }
     o.idx = idx; o.n = n; o.lev = lc; for (int d = 0; d < 3; d++) o.shape[d] = m->shape[d];
     fprintf(stderr, "sampler: %s: %zu of %zu level-%d cells %s\n", s->name, n, tot, lc, surf ? "contain surface" : "are labelled");
+    return o;
+}
+/* an unlabelled scan's ufsm scanprep mask: the cells with code >= mask_min (2: valid window centres) */
+static occ_index mask_occupancy(source *s) {
+    occ_index o = {nullptr, 0, -1, {0, 0, 0}};
+    const size_t tot = (size_t)s->mask_grid[0] * s->mask_grid[1] * s->mask_grid[2];
+    size_t n = 0; for (size_t k = 0; k < tot; k++) n += s->mask[k] >= s->mask_min;
+    if (!n || !(o.idx = malloc(n * sizeof *o.idx))) return o;
+    for (size_t k = 0; k < tot; k++) if (s->mask[k] >= s->mask_min) o.idx[o.n++] = (uint32_t)k;
+    o.lev = s->mask_lev; for (int d = 0; d < 3; d++) o.shape[d] = s->mask_grid[d];
+    fprintf(stderr, "sampler: %s: %zu of %zu mask cells (level-%d cells) with code >= %d\n", s->name, n, tot, o.lev, s->mask_min);
+    return o;
+}
+occ_index source_occupancy(source *s) {
+    occ_index o = label_occupancy(s);
+    if (!o.n && s->mask) { free(o.idx); o = mask_occupancy(s); }
     return o;
 }
 /* Pull the CT of every occupied cell at levels 0..maxlev through the chunk cache (training then reads from local disk).

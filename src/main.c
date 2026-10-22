@@ -21,6 +21,7 @@
 #include <zlib.h>
 #include "tiff.h"
 #include "imgops.h"
+#include "scanprep.h"
 #include <dirent.h>
 #include <errno.h>
 #include <sys/resource.h>
@@ -83,6 +84,8 @@ static int usage(void) {
         "  ufsm read    <root> <array-key> z y x nz ny nx <out.raw> [--cache DIR] [--threads N]\n"
         "  ufsm slice   <root> <array-key> z <out.pgm> [--cache DIR] [--threads N]     (whole z slice)\n"
         "  ufsm regions <root> <regions-dir-key>                 -> JSON list of region origins\n"
+        "  ufsm mirror  <root> <array-key> <out-dir> [--threads 4] [--mbps 0] [--link-from DIR] [--verify N]  local copy of one array's shard files\n"
+        "  ufsm scanprep <root> <group-key> --level L --out PREFIX [...]   per-scan object mask + CT statistics (src/scanprep.h)\n"
         "  ufsm axis    <root> <ct-group-key> <out.json> [--cache DIR]  -> per-z centroid axis (umbilicus stand-in)\n"
         "  ufsm ingest-labels <root> <zarr-key> <out-dir> --um U   HF/S3 zarr v2 labels -> volcomp pyramid\n"
         "  ufsm ingest-zip <labels.zip> <zarr-name> <out-dir> --um U  label zarr from the HF archive -> volcomp pyramid\n"
@@ -3268,6 +3271,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "ingest-kaggle")) return cmd_ingest_kaggle(argc, argv);
     if (!strcmp(cmd, "ingest-mesh")) return cmd_ingest_mesh(argc, argv);
     if (!strcmp(cmd, "ls")) return cmd_ls(argc, argv);
+    if (!strcmp(cmd, "mirror")) return cmd_mirror(argc, argv);     /* src/scanprep.c */
+    if (!strcmp(cmd, "scanprep")) return cmd_scanprep(argc, argv);
     if (!strcmp(cmd, "ingest-zip")) return cmd_ingest_zip(argc, argv);
     if (!strcmp(cmd, "raster")) return cmd_raster(argc, argv);
     if (!strcmp(cmd, "train")) return cmd_train(argc, argv);

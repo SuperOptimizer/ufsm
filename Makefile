@@ -30,7 +30,7 @@ SRC += src/repack.c
 SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c src/dino.c
 SRC += src/inksplat.c
 SRC += src/tfx.c
-SRC += src/fitjoin.c src/fieldsoracle.c src/packmap.c
+SRC += src/fitjoin.c src/fieldsoracle.c src/packmap.c src/scanprep.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
@@ -333,6 +333,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_wind_sampler
 	./$(B)/test_papyrus
 	./$(B)/test_cond
+	./$(B)/test_scanprep
 	./$(B)/test_sweep
 	./$(B)/test_gpu_input
 	./$(B)/test_pack_tm
@@ -459,6 +460,10 @@ $(B)/test_cond: tests/test_cond.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_cond.c $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
 
 test-all: $(B)/test_cond
+
+$(B)/test_scanprep: tests/test_scanprep.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/scanprep.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_scanprep.c $(SAMPLE_TEST_OBJ) $(B)/scanprep.o -o $@ $(LDLIBS)
+test-all: $(B)/test_scanprep
 
 $(B)/test_sweep: tests/test_sweep.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)

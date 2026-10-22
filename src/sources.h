@@ -103,6 +103,13 @@ typedef struct {
                                                               1 + 254 x packed share): the position draw takes a cell 1 + K x share times as often */
     z3 *wind;    /* optional, with a stored phase: the winding mod 14 turns on the same grid (ufsm phase-raster --winding; band.h
                     band_winding), {"band": {..., "phase": {...}, "winding": {"root": ..., "key": ...}}}: the --cond targets / condition */
+    /* unlabelled scans (Phase U0, ufsm scanprep): */
+    uint8_t *mask; int64_t mask_grid[3]; int mask_lev, mask_min;   /* optional "mask": {"map": RAW, "min": 2} (scanprep PREFIX.mask.raw, grid and "lev" in
+                                                                     RAW.json): a source without a label occupancy index draws its windows around
+                                                                     cells with code >= min (2: valid window centres, 1: any object cell) */
+    int ct_only;      /* "ct_only": 1: the source is drawn without any target (every channel's w = 0, mask = CT > 0): label-free terms */
+    float norm_c, norm_s;   /* optional "norm": {"center": c, "scale": s} (scanprep stats: median, scale): the CT input is (v - c) / s for this
+                               source instead of the window's own z-score (norm_s 0: off, the default) */
 } source;
 
 typedef struct {
