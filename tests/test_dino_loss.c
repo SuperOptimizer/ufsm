@@ -15,7 +15,7 @@ static void unit(float *v, int n, int D) { for (int i = 0; i < n; i++) { double 
 static float *up(const void *h, size_t b) { float *d = nn_malloc(b); nn_h2d(d, h, b); return d; }
 static int fails = 0;
 /* double-precision CPU references of the losses (the finite differences run on them) */
-static int wrap_dk(int ci, int cj) { int d = ((cj - ci) % 252 + 252) % 252; if (d >= 126) d -= 252; return (int)lrint(d / 18.0); }
+static int wrap_dk(int ci, int cj) { if (ci >= 256 || cj >= 256) return ci == cj ? 0 : 99; int d = ((cj - ci) % 252 + 252) % 252; if (d >= 126) d -= 252; return (int)lrint(d / 18.0); }
 static double supcon_ref(const float *a, const int *code, const int *xyz, int N, const float *t, int N2, int D, double tau, double hw, double hr) {
     double L = 0; int na = 0;
     for (int i = 0; i < N; i++) {

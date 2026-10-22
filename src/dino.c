@@ -102,7 +102,7 @@ typedef struct {
     int nbox; int64_t box[DN_MAXBOX][6]; int nho; int64_t ho[DN_MAXBOX][6];
     double weight, bvol; float center, scale, pap; int64_t shape[3];
 } dn_src;
-typedef struct { int P, ngt, nssl, margin; int nsrc; dn_src src[DN_MAXSRC]; double wsum; } dn_data;
+typedef struct { int P, ngt, nssl, nair, margin; int nsrc; dn_src src[DN_MAXSRC]; double wsum; } dn_data;
 typedef struct {   /* one sample: two CT views, the geometry, the points (output-space voxel indices) */
     uint8_t *ca, *cb; int si; int64_t corner[3]; dn_geom g; int halves;
     int ngt, nssl; int *gidx, *gcode, *gxyz, *sidx;
@@ -163,6 +163,20 @@ static int sample_fill(dn_data *D, dn_sample *S, uint64_t *rs, int nthreads, uin
             }
             S->ngt = (int)(seen < D->ngt ? seen : D->ngt);
             if (S->ngt < 64) S->ngt = 0;
+            if (S->ngt && D->nair) {   /* air voxels (unlabelled, below the papyrus level, inside the scan) as one extra class (code 256) */
+                long sa = 0; const float lo = s->center - 0.5f * s->scale;
+                for (int z = m; z < P - m; z++) for (int y = m; y < P - m; y++) {
+                    const uint8_t *row = S->ca + ((size_t)z * P + y) * P, *crow = codes_buf + ((size_t)z * P + y) * P;
+                    for (int x = m; x < P - m; x++) {
+                        if (crow[x] || !row[x] || row[x] >= lo) continue;
+                        long k = sa++;
+                        if (k >= D->nair) { k = (long)(rng_next(rs) % (uint64_t)sa); if (k >= D->nair) continue; }
+                        const int sv[3] = {z, y, x}; int ov[3]; geom_map(&S->g, P, sv, ov); const long q = S->ngt + k;
+                        S->gidx[q] = (ov[0] * P + ov[1]) * P + ov[2]; S->gcode[q] = 256; S->gxyz[3 * q] = ov[0]; S->gxyz[3 * q + 1] = ov[1]; S->gxyz[3 * q + 2] = ov[2];
+                    }
+                }
+                S->ngt += (int)(sa < D->nair ? sa : D->nair);
+            }
         }
         /* SSL points: papyrus voxels (view A above the source's papyrus level) */
         long seen = 0; const int m = D->margin;
@@ -347,7 +361,7 @@ int cmd_dino_train(int argc, char **argv) {
     const int K = atoi(opt(argc, argv, "--protos", "1024")), log_every = atoi(opt(argc, argv, "--log-every", "20")), save_every = atoi(opt(argc, argv, "--save-every", "2000"));
     const int eval_every = atoi(opt(argc, argv, "--eval-every", "2000")), nthreads = atoi(opt(argc, argv, "--threads", "4")), nwork = atoi(opt(argc, argv, "--workers", "4"));
     const uint64_t seed = strtoull(opt(argc, argv, "--seed", "1"), nullptr, 10);
-    dn_data *Dd = calloc(1, sizeof *Dd); Dd->P = P; Dd->ngt = atoi(opt(argc, argv, "--gt-points", "2048")); Dd->nssl = atoi(opt(argc, argv, "--ssl-points", "2048")); Dd->margin = 8;
+    dn_data *Dd = calloc(1, sizeof *Dd); Dd->P = P; Dd->ngt = atoi(opt(argc, argv, "--gt-points", "2048")); Dd->nssl = atoi(opt(argc, argv, "--ssl-points", "2048")); Dd->margin = 8; Dd->nair = atoi(opt(argc, argv, "--air-points", "0"));
     if (mkdir(outd, 0755) && errno != EEXIST) { fprintf(stderr, "dino-train: cannot create %s\n", outd); return 1; }
     dn_precision(fp32);
     if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
@@ -374,7 +388,7 @@ int cmd_dino_train(int argc, char **argv) {
         nn_zero(Wm, kd * 4); nn_zero(Wv, kd * 4); nn_zero(cen, (size_t)K * 4);
     }
     /* device buffers */
-    const size_t p3 = (size_t)P * P * P; const int NG = Dd->ngt, NS = Dd->nssl;
+    const size_t p3 = (size_t)P * P * P; const int NG = Dd->ngt + Dd->nair, NS = Dd->nssl;
     uint8_t *cta = nn_malloc(p3), *ctb = nn_malloc(p3); float *x = nn_malloc(p3 * 4), *gl = nn_malloc(p3 * DN_D * 4);
     int *d_gidx = nn_malloc((size_t)NG * 4), *d_gcode = nn_malloc((size_t)NG * 4), *d_gxyz = nn_malloc((size_t)NG * 12), *d_sidx = nn_malloc((size_t)NS * 4);
     float *es_g = nn_malloc((size_t)NG * DN_D * 4), *et_g = nn_malloc((size_t)NG * DN_D * 4), *ns_g = nn_malloc((size_t)NG * 4), *nt_g = nn_malloc((size_t)NG * 4), *ga_g = nn_malloc((size_t)NG * DN_D * 4);
@@ -385,7 +399,7 @@ int cmd_dino_train(int argc, char **argv) {
     dn_ring *R = calloc(1, sizeof *R); R->D = Dd; R->seed = seed; R->nthreads = nthreads; pthread_mutex_init(&R->mu, nullptr); pthread_cond_init(&R->cv, nullptr);
     for (int i = 0; i < DN_SLOTS; i++) {
         dn_sample *S = &R->slot[i]; S->ca = malloc(p3); S->cb = malloc(p3);
-        S->gidx = malloc((size_t)NG * 4); S->gcode = malloc((size_t)NG * 4); S->gxyz = malloc((size_t)NG * 12); S->sidx = malloc((size_t)NS * 4);
+        S->gidx = malloc((size_t)NG * 4); S->gcode = malloc((size_t)NG * 4); S->gxyz = malloc((size_t)NG * 12);   /* labelled + air */ S->sidx = malloc((size_t)NS * 4);
     }
     R->nworkers = nwork > 8 ? 8 : nwork;
     for (int i = 0; i < R->nworkers; i++) pthread_create(&R->th[i], nullptr, ring_worker, R);

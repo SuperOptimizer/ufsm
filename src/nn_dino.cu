@@ -55,7 +55,8 @@ extern "C" void dn_gather(const void *logits, int h16, size_t p3, int D, const i
 /* ---- SupCon: keys = the N anchors (student) + N2 teacher keys. Three passes over the N x (N + N2) similarities (D = 32): per-anchor
    statistics (lse, positives), the anchors' gradient sum_j g_ij k_j, the student keys' gradient sum_i g_ij a_i, with
    g_ij = (w_ij exp(s_ij / tau - lse_i) - [pos_ij] / np_i) / tau ---- */
-__device__ __forceinline__ int wrap_dk(int ci, int cj) {   /* winding difference in turns from codes 1 + round(18 q) mod 252 */
+__device__ __forceinline__ int wrap_dk(int ci, int cj) {   /* winding difference in turns from codes 1 + round(18 q) mod 252; classes >= 256 (e.g. 256 = air): same class 0, else far */
+    if (ci >= 256 || cj >= 256) return ci == cj ? 0 : 99;
     int d = ((cj - ci) % 252 + 252) % 252; if (d >= 126) d -= 252;
     return (int)lrintf(d / 18.f);
 }
