@@ -58,6 +58,8 @@ int cmd_ink_compare(int argc, char **argv);
 int cmd_ink_ext(int argc, char **argv);   /* src/inkext.c */
 int cmd_ink_ensemble(int argc, char **argv);
 int cmd_wl_dump(int argc, char **argv);
+int cmd_dinovol_embed(int argc, char **argv);   /* src/dinovol.c */
+int cmd_dinovol_eval(int argc, char **argv);
 int cmd_tifxyz_map(int argc, char **argv);
 int cmd_tifxyz_orient(int argc, char **argv);
 int cmd_tifxyz_bbox(int argc, char **argv);
@@ -113,6 +115,8 @@ static int usage(void) {
         "  ufsm ink-ensemble <out.tif> --ink [W:]INK.tif ..   per-model percentile-stretched weighted mean of ink renders\n"
         "  ufsm ink-splat <out-group> --surface TIFXYZ --labels L [--mask M] --ct ROOT KEY --ct-um U --iso I [--band -4,4] ..   published 2D ink labels -> sparse 3D label zarr\n"
         "  ufsm wl-dump <weights> [key]   the tensors of a safetensors / torch zip weight file\n"
+        "  ufsm dinovol-embed --ckpt PT ROOT KEY OUT --box z,y,x,nz,ny,nx   scrollprize dinovol tokens / dense / ink embeddings (int8 zarr v3)\n"
+        "  ufsm dinovol-eval EMB SURF.tifxyz ...   sheet-identity check of the dense embedding along surfaces\n"
         "  ufsm png2jpg <in.png> <out.jpg> [--half]   PNG -> JPEG q90 (half: Pillow BOX halved)\n"
         "  ufsm phase-score <pc-dir> <ps-dir> [<sheets-dir>]   on-recto score of pc / ps renders on surfaces (per seam class with sheets)\n"
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
@@ -3274,6 +3278,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
     if (!strcmp(cmd, "ink-ensemble")) return cmd_ink_ensemble(argc, argv);
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);
+    if (!strcmp(cmd, "dinovol-embed")) return cmd_dinovol_embed(argc, argv);
+    if (!strcmp(cmd, "dinovol-eval")) return cmd_dinovol_eval(argc, argv);
     if (!strcmp(cmd, "tifxyz-map")) return cmd_tifxyz_map(argc, argv);
     if (!strcmp(cmd, "tifxyz-orient")) return cmd_tifxyz_orient(argc, argv);
     if (!strcmp(cmd, "tifxyz-bbox")) return cmd_tifxyz_bbox(argc, argv);

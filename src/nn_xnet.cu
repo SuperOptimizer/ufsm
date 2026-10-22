@@ -99,7 +99,11 @@ extern "C" float *xdev_floats(const float *host, size_t n) {
 }
 
 static inline unsigned nblk(size_t n, int t) { return (unsigned)((n + t - 1) / t); }
-__device__ __forceinline__ float act_f(float v, int act) { return act == XA_RELU ? fmaxf(v, 0.f) : act == XA_LRELU ? (v < 0.f ? 0.01f * v : v) : v; }
+__device__ __forceinline__ float act_f(float v, int act) {
+    act &= 15;
+    return act == XA_RELU ? fmaxf(v, 0.f) : act == XA_LRELU ? (v < 0.f ? 0.01f * v : v) : act == XA_GELU ? 0.5f * v * (1.f + erff(v * 0.70710678118654752f))
+         : act == XA_SILU ? v / (1.f + expf(-v)) : v;
+}
 
 /* ---- implicit-GEMM convolution ---- */
 struct ConvP {
@@ -210,8 +214,10 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32) conv_igemm(ConvP p) {
             const long long m = m_base + wm0 + mi * 16 + g + h * 8; if (m >= p.M) continue;
             float v0 = acc[mi][ni][2 * h] * s0 + b0, v1 = acc[mi][ni][2 * h + 1] * s1 + b1;
             const size_t o = (size_t)m * p.Co + co;
+            if (p.act & XA_POSTRES) { v0 = act_f(v0, p.act); v1 = act_f(v1, p.act); }
             if (p.res) { const __half2 r = *(const __half2 *)(p.res + o); v0 += __low2float(r); v1 += __high2float(r); }
-            *(__half2 *)(p.y + o) = __floats2half2_rn(act_f(v0, p.act), act_f(v1, p.act));
+            if (!(p.act & XA_POSTRES)) { v0 = act_f(v0, p.act); v1 = act_f(v1, p.act); }
+            *(__half2 *)(p.y + o) = __floats2half2_rn(v0, v1);
         }
     }
 }

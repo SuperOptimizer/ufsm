@@ -39,7 +39,8 @@ void xt_free(xt *t);
 void xh2d(void *dst, const void *src, size_t bytes);   /* synchronous copies on the stream */
 void xd2h(void *dst, const void *src, size_t bytes);
 
-enum { XA_NONE = 0, XA_RELU = 1, XA_LRELU = 2 };       /* LeakyReLU slope 0.01 */
+enum { XA_NONE = 0, XA_RELU = 1, XA_LRELU = 2, XA_GELU = 3, XA_SILU = 4,   /* LeakyReLU slope 0.01; GELU exact (erf) */
+       XA_POSTRES = 16 };                                      /* flag: y = act(acc scale + bias) + res (default: act(.. + res)) */
 
 typedef struct {
     int ci, co, kd, kh, kw, sd, sh, sw, pd, ph, pw;      /* the GEMM conv (after unfolding) */
