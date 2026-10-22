@@ -278,14 +278,14 @@ static int load_sources(const char *path, dn_data *D, int nthreads) {
     return D->nsrc ? 0 : -1;
 }
 
-/* precision / storage settings of the production trainer (tests/prof_infer.c with ~/ufsm-data/pi_prod.sh's environment) unless --fp32 1 */
+/* precision / storage settings of the production trainer (tests/prof_infer.c with ~/ufsm-data/pi_prod.sh's environment) unless --mx 0 */
 static void dn_precision(int fp32) {
-    if (fp32) { nn_set_tf32(0); return; }
+    if (fp32) return;   /* --mx 0: the bf16 tensor-core path without MX storage */
     setenv("UFSM_ACT_MX4", "1", 0); setenv("UFSM_XIN_PREC", "8", 0); setenv("UFSM_GRAD_MX8", "1", 0); setenv("UFSM_GRAD_MX4", "1", 0);
     setenv("UFSM_F4_WGRAD", "1", 0); setenv("UFSM_DOWN_NORM", "1", 0);
 }
 static void dn_precision_after_init(int fp32) {
-    if (fp32) return;
+    if (fp32) { nn_set_tf32(1); return; }
     nn_set_tf32(1); nn_set_f16(1);
     nn_set_prec_policy(getenv("UFSM_PREC_POLICY") ? getenv("UFSM_PREC_POLICY") : "all=fp4:fp4:fp4,enc0.c1=fp16");
     nn_set_gn_stored(1); nn_set_sr(1);
@@ -328,18 +328,21 @@ int cmd_dino_train(int argc, char **argv) {
                         "         [--ssl 0.3 (weight; 0 = GT contrastive only)] [--protos 1024] [--ts 0.1] [--tt 0.04] [--center-m 0.9]\n"
                         "         [--noise 0.15] [--gain-jit 0.15] [--mask-frac 0] [--mask-cube 16] [--seed 1] [--workers 4] [--threads 4]\n"
                         "         [--eval SURF-LIST --eval-root R --eval-key K --eval-box z,y,x,nz,ny,nx --eval-every 2000 --eval-codes ROOT KEY --eval-norm c,s]\n"
-                        "         [--log-every 20] [--save-every 2000] [--resume CKPT] [--fp32 1] [--gpu 0]\n"
+                        "         [--log-every 20] [--save-every 2000] [--resume CKPT] [--mx 0 (bf16, no MX)] [--var 30] [--var-gamma 0.8 / sqrt(D)] [--gpu 0]\n"
                         "  Our dense embedding net from scratch (src/dino.h): the U-Net with D = 32 unit embedding channels; GT sheet-identity SupCon on\n"
                         "  labelled voxels (primary) + DINO prototype cross-view term on papyrus voxels (EMA teacher on the other view). STOP file in --out stops.\n");
         return 2;
     }
-    const int P = atoi(opt(argc, argv, "--P", "256")), steps = atoi(opt(argc, argv, "--steps", "20000")), fp32 = atoi(opt(argc, argv, "--fp32", "0"));
+    const int P = atoi(opt(argc, argv, "--P", "256")), steps = atoi(opt(argc, argv, "--steps", "20000")), fp32 = !atoi(opt(argc, argv, "--mx", "1"));
     const float lr0 = (float)atof(opt(argc, argv, "--lr", "1e-3")), mlr0 = (float)atof(opt(argc, argv, "--muon-lr", "0.02")), wd = (float)atof(opt(argc, argv, "--wd", "0.01"));
     const float ema = (float)atof(opt(argc, argv, "--ema", "0.996")), clip = (float)atof(opt(argc, argv, "--clip", "5"));
     const int warm = atoi(opt(argc, argv, "--warmup", "500"));
     const float tau = (float)atof(opt(argc, argv, "--tau", "0.1")), hw = (float)atof(opt(argc, argv, "--hard-w", "4")), hr = (float)atof(opt(argc, argv, "--hard-r", "48"));
     const float wssl = (float)atof(opt(argc, argv, "--ssl", "0.3")), ts = (float)atof(opt(argc, argv, "--ts", "0.1")), tt = (float)atof(opt(argc, argv, "--tt", "0.04"));
     const float cm = (float)atof(opt(argc, argv, "--center-m", "0.9")), noise = (float)atof(opt(argc, argv, "--noise", "0.15")), gj = (float)atof(opt(argc, argv, "--gain-jit", "0.15"));
+    const float wgt = (float)atof(opt(argc, argv, "--gt", "1"));   /* the GT contrastive term's weight */
+    const int use_teacher = atoi(opt(argc, argv, "--teacher", "1"));   /* 0: no EMA teacher forward (debug; GT term over the student points only) */
+    const float wvar = (float)atof(opt(argc, argv, "--var", "30")), vgam = (float)atof(opt(argc, argv, "--var-gamma", "0")) > 0 ? (float)atof(opt(argc, argv, "--var-gamma", "0")) : 0.8f / sqrtf((float)DN_D);
     const float mfrac = (float)atof(opt(argc, argv, "--mask-frac", "0")); const int mcube = atoi(opt(argc, argv, "--mask-cube", "16"));
     const int K = atoi(opt(argc, argv, "--protos", "1024")), log_every = atoi(opt(argc, argv, "--log-every", "20")), save_every = atoi(opt(argc, argv, "--save-every", "2000"));
     const int eval_every = atoi(opt(argc, argv, "--eval-every", "2000")), nthreads = atoi(opt(argc, argv, "--threads", "4")), nwork = atoi(opt(argc, argv, "--workers", "4"));
@@ -353,8 +356,8 @@ int cmd_dino_train(int argc, char **argv) {
     unet_cfg cfg = {0}; cfg.cin = 1; cfg.cout = DN_D; cfg.G = 8; cfg.down_norm = fp32 ? 0 : 1;
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,96,128,192")); for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "dino-train: P must be a multiple of %d\n", 1 << (cfg.nlev - 1)); return 2; }
-    unet *u = unet_create(&cfg); unet_init(u, seed);
-    if (!fp32 && DN_D <= 16) unet_set_fp16_logits(u, 1);   /* (the MX fp16-logit head takes <= 16 outputs) */
+    unet *u = unet_create(&cfg); unet_init(u, seed); unet_head_bias_zero(u);   /* (no shared -2 bias direction in the embeddings) */
+    if (!fp32 && DN_D <= 16 && atoi(opt(argc, argv, "--fp16-logits", "0"))) unet_set_fp16_logits(u, 1);   /* (the MX fp16-logit head takes <= 16 outputs) */
     int step0 = 0;
     const char *resume = opt(argc, argv, "--resume", nullptr);
     if (resume) { step0 = unet_load(u, resume); if (step0 < 0) { fprintf(stderr, "dino-train: cannot resume %s\n", resume); return 1; } }
@@ -389,9 +392,9 @@ int cmd_dino_train(int argc, char **argv) {
     signal(SIGTERM, dn_sig); signal(SIGINT, dn_sig);
     char logp[1200]; snprintf(logp, sizeof logp, "%s/train.log", outd); FILE *lf = fopen(logp, "a");
     fprintf(stderr, "dino-train: P %d, widths", P); for (int l = 0; l < cfg.nlev; l++) fprintf(stderr, " %d", cfg.widths[l]);
-    fprintf(stderr, ", %zu params, D %d, GT %d + SSL %d points (weight %g), %d prototypes, %s\n", unet_nparams(u), DN_D, NG, NS, wssl, K, fp32 ? "fp32" : "fp4 / MX storage");
+    fprintf(stderr, ", %zu params, D %d, GT %d + SSL %d points (weight %g), %d prototypes, %s\n", unet_nparams(u), DN_D, NG, NS, wssl, K, fp32 ? "bf16 (--mx 0)" : "fp4 / MX storage");
     const shape5 xs = {1, 1, P, P, P};
-    double t_last = dn_now(), sums[12] = {0}; int nsum = 0; uint64_t arng = seed * 1000003 + 17;
+    double t_last = dn_now(), sums[13] = {0}; int nsum = 0; uint64_t arng = seed * 1000003 + 17;
     const char *stopf_name = "STOP"; char stopf[1200]; snprintf(stopf, sizeof stopf, "%s/%s", outd, stopf_name);
     float *hout = malloc(64 * 4);
     for (int step = step0 + 1; step <= steps && !g_dn_stop; step++) {
@@ -406,26 +409,31 @@ int cmd_dino_train(int argc, char **argv) {
         const float ga1 = 1.f + gj * (2.f * (float)rng_u(&arng) - 1.f), gb1 = gj * (2.f * (float)rng_u(&arng) - 1.f);
         const float ga2 = 1.f + gj * (2.f * (float)rng_u(&arng) - 1.f), gb2 = gj * (2.f * (float)rng_u(&arng) - 1.f);
         const float sg1 = noise * (float)rng_u(&arng), sg2 = noise * (float)rng_u(&arng);
+        const void *lg = nullptr; int h16 = 0;
+        if (use_teacher) {
         /* teacher (EMA weights), forward only */
         dn_input(ctt, x, P, S->g, src->center, src->scale, ga2, gb2, sg2, (uint32_t)(step * 2 + 1), 0, 0.f, 0, 0.f);
         unet_use_ema(u, 1);
-        const void *lg = unet_forward(u, x, xs, 0); const int h16 = unet_logits_h16(u);
+        lg = unet_forward(u, x, xs, 0); h16 = unet_logits_h16(u);
         if (ngt) dn_gather(lg, h16, p3, DN_D, d_gidx, ngt, et_g, nt_g);
         if (nssl) dn_gather(lg, h16, p3, DN_D, d_sidx, nssl, et_s, nt_s);
         unet_use_ema(u, 0);
+        }
         /* student */
         dn_input(cs, x, P, S->g, src->center, src->scale, ga1, gb1, sg1, (uint32_t)(step * 2), mcube, mfrac, (uint32_t)step, 0.f);
-        lg = unet_forward(u, x, xs, 1);
+        lg = unet_forward(u, x, xs, 1); h16 = unet_logits_h16(u);
         if (ngt) dn_gather(lg, h16, p3, DN_D, d_gidx, ngt, es_g, ns_g);
         if (nssl) dn_gather(lg, h16, p3, DN_D, d_sidx, nssl, es_s, ns_s);
         nn_zero(gl, p3 * DN_D * 4);
         nn_zero(outs, 64 * 4);
         if (ngt) {
-            dn_supcon(es_g, d_gcode, d_gxyz, ngt, et_g, d_gcode, d_gxyz, ngt, DN_D, tau, hw, hr, ga_g, outs, scr_sc);
+            dn_supcon(es_g, d_gcode, d_gxyz, ngt, et_g, d_gcode, d_gxyz, use_teacher ? ngt : 0, DN_D, tau, hw, hr, ga_g, outs, scr_sc);
+            if (wgt != 1.f) dn_axpby(ga_g, ga_g, (size_t)ngt * DN_D, wgt, 0.f);
+            if (wvar > 0) dn_varreg(es_g, ngt, DN_D, vgam, wvar, ga_g, outs + 12);   /* anti-collapse: per-dimension spread */
             dn_scatter_grad(es_g, ga_g, ns_g, d_gidx, ngt, DN_D, p3, 1.f, gl);
             dn_emb_std(es_g, ngt, DN_D, outs + 8);
         }
-        if (nssl && wssl > 0) {
+        if (nssl && wssl > 0 && use_teacher) {
             dn_dino(es_s, et_s, nssl, W, Wt, cen, K, DN_D, ts, tt, ga_s, gW, tmean, outs + 4, scr_dn);
             dn_scatter_grad(es_s, ga_s, ns_s, d_sidx, nssl, DN_D, p3, wssl, gl);
             dn_axpby(gW, gW, kd, 0.f, wssl);
@@ -438,22 +446,22 @@ int cmd_dino_train(int argc, char **argv) {
         const float sched = step <= warm ? (float)step / warm : 0.5f * (1.f + cosf((float)M_PI * (float)(step - warm) / (float)(steps - warm > 1 ? steps - warm : 1)));
         unet_muon(u, mlr0 * sched, 0.95f, lr0 * sched, 0.9f, 0.999f, 1e-8f, wd, step);
         unet_ema(u, step < 100 ? 0.9f : ema);
-        if (nssl && wssl > 0) {
+        if (nssl && wssl > 0 && use_teacher) {
             dn_adam(W, gW, Wm, Wv, kd, lr0 * sched, 0.9f, 0.999f, 1e-8f, 0.f, step);
             dn_ema(Wt, W, kd, step < 100 ? 0.9f : ema);
             dn_axpby(cen, tmean, (size_t)K, cm, 1.f - cm);
         }
         nn_d2h(hout, outs, 64 * 4);
         /* 0 supcon loss, 1 pos cos, 2 neg cos, 3 anchors, 4 dino loss, 5 batch-mean teacher entropy, 6 mean teacher entropy, 8 std gt, 9 std ssl */
-        const double v[12] = {hout[0], hout[1], hout[2], hout[3], hout[4], hout[5], hout[6], hout[8], hout[9], gn, (double)ngt, (double)nssl};
-        for (int k = 0; k < 12; k++) sums[k] += v[k];
+        const double v[13] = {hout[0], hout[1], hout[2], hout[3], hout[4], hout[5], hout[6], hout[8], hout[9], gn, (double)ngt, (double)nssl, hout[12]};
+        for (int k = 0; k < 13; k++) sums[k] += v[k];
         nsum++;
         if (!isfinite(hout[0]) || !isfinite(hout[4]) || !isfinite(gn)) { fprintf(stderr, "dino-train: non-finite loss / gradient at step %d\n", step); return 1; }
         if (step % log_every == 0) {
             const double now = dn_now(), dt = (now - t_last) / nsum;
             char line[512];
-            snprintf(line, sizeof line, "step %d gt %.4f pos %.3f neg %.3f anchors %.0f | ssl %.4f H(mean) %.2f H %.2f | std gt %.4f ssl %.4f | gnorm %.3f | lr %.2e | %.0f ms/step %.1f Mvox/s",
-                     step, sums[0] / nsum, sums[1] / nsum, sums[2] / nsum, sums[3] / nsum, sums[4] / nsum, sums[5] / nsum, sums[6] / nsum, sums[7] / nsum, sums[8] / nsum,
+            snprintf(line, sizeof line, "step %d gt %.4f var %.4f pos %.3f neg %.3f anchors %.0f | ssl %.4f H(mean) %.2f H %.2f | std gt %.4f ssl %.4f | gnorm %.3f | lr %.2e | %.0f ms/step %.1f Mvox/s",
+                     step, sums[0] / nsum, sums[12] / nsum, sums[1] / nsum, sums[2] / nsum, sums[3] / nsum, sums[4] / nsum, sums[5] / nsum, sums[6] / nsum, sums[7] / nsum, sums[8] / nsum,
                      sums[9] / nsum, lr0 * sched, dt * 1e3, (double)p3 / dt / 1e6);
             fprintf(stderr, "%s\n", line); if (lf) { fprintf(lf, "%s\n", line); fflush(lf); }
             memset(sums, 0, sizeof sums); nsum = 0; t_last = dn_now();
@@ -514,8 +522,8 @@ int cmd_dino_train(int argc, char **argv) {
 int cmd_dino_embed(int argc, char **argv) {
     long long b[6]; float c = 0, s = 0;
     if (argc < 6 || sscanf(opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6 || sscanf(opt(argc, argv, "--norm", ""), "%f,%f", &c, &s) != 2) {
-        fprintf(stderr, "usage: ufsm dino-embed <ckpt> <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx --norm center,scale [--P 256] [--halo 32] [--ema 1] [--cache DIR] [--fp32 1]\n"); return 2; }
-    const int P = atoi(opt(argc, argv, "--P", "256")), fp32 = atoi(opt(argc, argv, "--fp32", "0"));
+        fprintf(stderr, "usage: ufsm dino-embed <ckpt> <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx --norm center,scale [--P 256] [--halo 32] [--ema 1] [--cache DIR] [--mx 0]\n"); return 2; }
+    const int P = atoi(opt(argc, argv, "--P", "256")), fp32 = !atoi(opt(argc, argv, "--mx", "1"));
     dn_precision(fp32);
     if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
     dn_precision_after_init(fp32);

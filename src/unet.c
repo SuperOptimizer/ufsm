@@ -3854,3 +3854,8 @@ void unet_zero_head(unet *u) {
     float *arr[] = {u->p, u->ema, u->m, u->v};
     for (int i = 0; i < 4; i++) { nn_zero(arr[i] + u->head.w, (size_t)u->head.cin * u->head.cout * u->head.k * u->head.k * u->head.k * sizeof(float)); nn_zero(arr[i] + u->head.b, (size_t)u->head.cout * sizeof(float)); }
 }
+void unet_head_bias_zero(unet *u) {   /* the head bias (live, EMA, moments) to 0: embedding heads (unet_init's -2 bias would align every output) */
+    nn_wmemo_clear();
+    float *arr[] = {u->p, u->ema, u->m, u->v};
+    for (int i = 0; i < 4; i++) nn_zero(arr[i] + u->head.b, (size_t)u->head.cout * sizeof(float));
+}

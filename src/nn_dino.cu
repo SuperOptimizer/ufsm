@@ -343,3 +343,21 @@ extern "C" void dn_tile_out(const void *logits, int h16, int P, int D, const uin
     const long long n = (long long)(z1 - z0) * (y1 - y0) * (x1 - x0);
     if (n > 0) k_tile_out<<<nb_of(n, 256), 256>>>(logits, h16, P, D, ct, z0, z1, y0, y1, x0, x1, out, onz, ony, onx, ooz, ooy, oox);
 }
+/* variance hinge (VICReg): L = lambda / D sum_c relu(gamma - std_c) over N points of e [N][D]; adds d L / d e into ge; loss -> out[0] */
+__global__ void k_varreg(const float *e, int N, int D, float gamma, float lambda, float *ge, float *out) {
+    __shared__ float sh[8];
+    float L = 0.f;
+    for (int c = 0; c < D; c++) {
+        float s = 0.f, s2 = 0.f;
+        for (int i = threadIdx.x; i < N; i += blockDim.x) { const float v = e[(size_t)i * D + c]; s += v; s2 += v * v; }
+        s = blk_sum(s, sh); s2 = blk_sum(s2, sh);
+        const float mean = s / N, var = fmaxf(s2 / N - mean * mean, 0.f), sd = sqrtf(var + 1e-6f);
+        if (sd < gamma) {
+            L += (gamma - sd) * lambda / D;
+            const float g = -lambda / D / (N * sd);
+            for (int i = threadIdx.x; i < N; i += blockDim.x) ge[(size_t)i * D + c] += g * (e[(size_t)i * D + c] - mean);
+        }
+    }
+    if (threadIdx.x == 0) out[0] = L;
+}
+extern "C" void dn_varreg(const float *e, int N, int D, float gamma, float lambda, float *ge, float *out) { if (N > 1) k_varreg<<<1, 256>>>(e, N, D, gamma, lambda, ge, out); }

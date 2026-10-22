@@ -36,6 +36,8 @@ void dn_dino(const float *s, const float *t, int N, const float *W, const float 
              float *gs, float *gW, float *tmean, float *out, float *scratch);
 /* back through e = y / |y| and into the dense fp32 logit gradient: gl[c][idx[i]] += w (ge_i - e_i (e_i . ge_i)) / nrm_i */
 void dn_scatter_grad(const float *e, const float *ge, const float *nrm, const int *idx, int N, int D, size_t p3, float w, float *gl);
+/* variance hinge (VICReg): lambda / D sum_c relu(gamma - std_c) over the points, its gradient added into ge [N][D]; the loss -> out[0] */
+void dn_varreg(const float *e, int N, int D, float gamma, float lambda, float *ge, float *out);
 /* Adam on a small flat parameter array (prototypes) + EMA copy */
 void dn_adam(float *p, const float *g, float *m, float *v, size_t n, float lr, float b1, float b2, float eps, float wd, int step);
 void dn_ema(float *pt, const float *p, size_t n, float decay);
