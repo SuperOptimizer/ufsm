@@ -12,6 +12,11 @@ jq '.sources |= map(
       elif (.ct | test("PHerc0814/20250804134230")) then . + {holdout: [[2448, 2448, 2960, 736, 736, 736]]}
       elif (.ct | test("PHerc1447/20250521151220")) then . + {holdout: [[12280, 2820, 4890, 480, 480, 480]]}
       else . end)' $T/u0.json > $T/u0h.json
-jq -s '{sources: (.[0].sources + .[1].sources)}' $D/labelled-desk.json $T/u0h.json > $OUT
+# only scans whose local copy (ROOT/CT/LEVEL/zarr.json) exists: inventory rows U0 skipped (duplicates, 45 um, DLS) are never copied
+jq -c '.sources[]' $T/u0h.json | while IFS= read -r e; do
+  f=$(jq -r '"\(.root)/\(.ct)/\(.min_level)/zarr.json"' <<< "$e")
+  if [ -e "$f" ]; then echo "$e"; else echo "mksources: skipped (no local copy): $f" >&2; fi
+done | jq -s '{sources: .}' > $T/u0ok.json
+jq -s '{sources: (.[0].sources + .[1].sources)}' $D/labelled-desk.json $T/u0ok.json > $OUT
 echo "$(jq '[.sources[] | select(.ct_only != 1)] | length' $OUT) labelled + $(jq '[.sources[] | select(.ct_only == 1)] | length' $OUT) U0 sources -> $OUT"
 rm -rf $T

@@ -343,7 +343,8 @@ static int load_sources(const char *path, dn_data *D, int nthreads) {
         char ctk[1024]; snprintf(ctk, sizeof ctk, "%s", ct);
         if (json_get(s, "min_level")) snprintf(ctk, sizeof ctk, "%s/%d", ct, (int)json_num(json_get(s, "min_level"), 0));   /* (train's sources: the group + its level) */
         ct = ctk;
-        S->ca = st ? z3_open(st, ct, cache) : nullptr; if (!S->ca) { fprintf(stderr, "dino-train: %s: cannot open %s %s: %s\n", S->name, root, ct, z3_error()); return -1; }
+        S->ca = st ? z3_open(st, ct, cache) : nullptr;
+        if (!S->ca) { fprintf(stderr, "dino-train: WARNING: source %s skipped: cannot open %s %s: %s\n", S->name, root, ct, z3_error()); if (st) store_close(st); continue; }   /* (one unreadable scan does not stop a long run) */
         if (ctb) { S->cb = z3_open(st, ctb, cache); if (!S->cb) { fprintf(stderr, "dino-train: %s: cannot open %s\n", S->name, ctb); return -1; } S->halves = 1; }
         memcpy(S->shape, z3_meta_of(S->ca)->shape, sizeof S->shape);
         const json *cj = json_get(s, "codes");
