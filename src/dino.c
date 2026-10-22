@@ -97,14 +97,14 @@ int cmd_dino_halves(int argc, char **argv) {
 
 enum { DN_MAXSRC = 64, DN_MAXBOX = 256, DN_SLOTS = 6 };
 typedef struct {
-    char name[64]; z3 *ca, *cb, *codes; int halves;
+    char name[64]; z3 *ca, *cb, *codes; int halves; int cscale; float *axz;   /* scroll axis (y, x) per CT plane (sources "axis" + "axis_scale"), or nullptr */   /* CT voxels per code voxel (codes on a coarser grid; 1: the same grid) */
     int64_t org[3];                              /* added to window corners (ct array coordinates) to address the codes (global grid) */
     int nbox; int64_t box[DN_MAXBOX][6]; int nho; int64_t ho[DN_MAXBOX][6];
     double weight, bvol; float center, scale, pap; int64_t shape[3];
 } dn_src;
 typedef struct { int P, ngt, nssl, nair, margin; int nsrc; dn_src src[DN_MAXSRC]; double wsum; } dn_data;
 typedef struct {   /* one sample: two CT views, the geometry, the points (output-space voxel indices) */
-    uint8_t *ca, *cb; int si; int64_t corner[3]; dn_geom g; int halves;
+    uint8_t *ca, *cb; int si; int64_t corner[3]; dn_geom g; int halves; float *ayx;   /* the axis (y, x) per window plane (window coords; --axis-input) */
     int ngt, nssl; int *gidx, *gcode, *gxyz, *sidx;
     int ready;
 } dn_sample;
@@ -142,6 +142,7 @@ static int sample_fill(dn_data *D, dn_sample *S, uint64_t *rs, int nthreads, uin
         size_t pap = 0; for (size_t i = 0; i < p3; i += 7) pap += S->ca[i] > s->pap;
         if (pap * 7 < p3 / 50) continue;   /* < 2% papyrus: mostly air */
         S->si = si; memcpy(S->corner, o, sizeof o); S->halves = s->halves;
+        if (s->axz) for (int z = 0; z < P; z++) { const int64_t gz = o[0] + z < 0 ? 0 : o[0] + z >= s->shape[0] ? s->shape[0] - 1 : o[0] + z; S->ayx[2 * z] = s->axz[2 * gz] - (float)o[1]; S->ayx[2 * z + 1] = s->axz[2 * gz + 1] - (float)o[2]; }
         /* geometry: a random axis permutation and flips */
         int perm[3] = {0, 1, 2}; for (int k = 2; k > 0; k--) { const int j = (int)(rng_next(rs) % (uint64_t)(k + 1)); const int t = perm[k]; perm[k] = perm[j]; perm[j] = t; }
         for (int d = 0; d < 3; d++) { S->g.perm[d] = perm[d]; S->g.flip[d] = (int)(rng_next(rs) & 1); }
@@ -149,7 +150,18 @@ static int sample_fill(dn_data *D, dn_sample *S, uint64_t *rs, int nthreads, uin
         S->ngt = 0;
         if (s->codes) {
             const int64_t oc[3] = {o[0] + s->org[0], o[1] + s->org[1], o[2] + s->org[2]};
-            if (z3_read(s->codes, oc, n, codes_buf, nthreads)) return -1;
+            if (s->cscale <= 1) { if (z3_read(s->codes, oc, n, codes_buf, nthreads)) return -1; }
+            else {   /* codes on a k x coarser grid: read the covering block, nearest-neighbour up */
+                const int k = s->cscale; int64_t c0[3], cn[3];
+                for (int d = 0; d < 3; d++) { c0[d] = oc[d] / k; cn[d] = (oc[d] + P - 1) / k - c0[d] + 1; }
+                uint8_t *cb = malloc((size_t)cn[0] * cn[1] * cn[2]);
+                if (z3_read(s->codes, c0, cn, cb, nthreads)) { free(cb); return -1; }
+                for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
+                    const uint8_t *src = cb + (((size_t)((oc[0] + z) / k - c0[0]) * cn[1]) + (oc[1] + y) / k - c0[1]) * cn[2]; uint8_t *dst = codes_buf + ((size_t)z * P + y) * P;
+                    for (int x = 0; x < P; x++) dst[x] = src[(oc[2] + x) / k - c0[2]];
+                }
+                free(cb);
+            }
             long seen = 0; const int m = D->margin;
             for (int z = m; z < P - m; z++) for (int y = m; y < P - m; y++) {
                 const uint8_t *row = codes_buf + ((size_t)z * P + y) * P;
@@ -225,6 +237,28 @@ static dn_sample *ring_get(dn_ring *R) {
 }
 static void ring_put(dn_ring *R, dn_sample *S) { pthread_mutex_lock(&R->mu); S->ready = 0; pthread_cond_broadcast(&R->cv); pthread_mutex_unlock(&R->mu); }
 
+/* an umbilicus / axis file ({"control_points":[{"x","y","z"},...]}, coordinates x scale = CT voxels) -> (y, x) per CT plane z in [0, nz):
+   linear between control points sorted by z, constant beyond the ends */
+static float *load_axis(const char *path, double scale, int64_t nz) {
+    FILE *f = fopen(path, "rb"); if (!f) return nullptr;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); char *t = malloc(n + 1); if (fread(t, 1, n, f) != (size_t)n) { fclose(f); free(t); return nullptr; } fclose(f); t[n] = 0;
+    json *j = json_parse(t, n); free(t); if (!j) return nullptr;
+    const json *cp = json_get(j, "control_points"); if (!cp || cp->type != J_ARR || cp->n < 1) { json_free(j); return nullptr; }
+    const size_t m = cp->n; double *pz = malloc(m * 8), *py = malloc(m * 8), *px = malloc(m * 8);
+    for (size_t i = 0; i < m; i++) { const json *q = json_at(cp, i); pz[i] = json_num(json_get(q, "z"), 0) * scale; py[i] = json_num(json_get(q, "y"), 0) * scale; px[i] = json_num(json_get(q, "x"), 0) * scale; }
+    json_free(j);
+    for (size_t i = 1; i < m; i++) for (size_t k = i; k > 0 && pz[k - 1] > pz[k]; k--) { double a; a = pz[k]; pz[k] = pz[k - 1]; pz[k - 1] = a; a = py[k]; py[k] = py[k - 1]; py[k - 1] = a; a = px[k]; px[k] = px[k - 1]; px[k - 1] = a; }
+    float *axz = malloc((size_t)nz * 2 * sizeof(float)); size_t s = 0;
+    for (int64_t z = 0; z < nz; z++) {
+        while (s + 1 < m && pz[s + 1] < z) s++;
+        double y, x;
+        if (z <= pz[0]) { y = py[0]; x = px[0]; } else if (s + 1 >= m) { y = py[m - 1]; x = px[m - 1]; }
+        else { const double t2 = (z - pz[s]) / (pz[s + 1] - pz[s] > 1e-9 ? pz[s + 1] - pz[s] : 1); y = py[s] + t2 * (py[s + 1] - py[s]); x = px[s] + t2 * (px[s + 1] - px[s]); }
+        axz[2 * z] = (float)y; axz[2 * z + 1] = (float)x;
+    }
+    free(pz); free(py); free(px);
+    return axz;
+}
 static int parse_box(const json *a, int64_t b[6]) {
     if (!a || a->type != J_ARR || a->n != 6) return -1;
     for (int d = 0; d < 6; d++) b[d] = (int64_t)json_num(json_at(a, d), 0);
@@ -254,6 +288,7 @@ static int load_sources(const char *path, dn_data *D, int nthreads) {
             store *cs = store_open(json_str(json_get(cj, "root"), "")); S->codes = cs ? z3_open(cs, json_str(json_get(cj, "key"), ""), nullptr) : nullptr;
             if (!S->codes) { fprintf(stderr, "dino-train: %s: cannot open the codes\n", S->name); return -1; }
         }
+        S->cscale = (int)json_num(json_get(cj, "scale"), 1);
         const json *org = json_get(s, "origin"); for (int d = 0; d < 3; d++) S->org[d] = org ? (int64_t)json_num(json_at(org, d), 0) : 0;
         const json *bx = json_get(s, "boxes");
         if (bx && bx->type == J_ARR) for (size_t k = 0; k < bx->n && S->nbox < DN_MAXBOX; k++) if (!parse_box(json_at(bx, k), S->box[S->nbox])) S->nbox++;
@@ -261,6 +296,7 @@ static int load_sources(const char *path, dn_data *D, int nthreads) {
         for (int k = 0; k < S->nbox; k++) for (int d = 0; d < 3; d++) if (S->box[k][3 + d] < D->P) { fprintf(stderr, "dino-train: %s box %d is smaller than the window\n", S->name, k); return -1; }
         const json *ho = json_get(s, "holdout");
         if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n && S->nho < DN_MAXBOX; k++) if (!parse_box(json_at(ho, k), S->ho[S->nho])) S->nho++;
+        if (json_get(s, "axis")) { S->axz = load_axis(json_str(json_get(s, "axis"), ""), json_num(json_get(s, "axis_scale"), 1.0), S->shape[0]); if (!S->axz) { fprintf(stderr, "dino-train: %s: cannot read the axis\n", S->name); return -1; } }
         S->weight = json_num(json_get(s, "weight"), 1.0);
         S->bvol = 0; for (int k = 0; k < S->nbox; k++) S->bvol += (double)S->box[k][3] * S->box[k][4] * S->box[k][5];
         const json *nm = json_get(s, "norm");
@@ -306,19 +342,25 @@ static void dn_precision_after_init(int fp32) {
 }
 
 /* the EMA network over a box (CT array coords) -> unit int8 embeddings [nz][ny][nx][D] (host), tiles of P with halo h */
-static int8_t *dn_embed_box(unet *u, z3 *ct, const int64_t box[6], int P, int h, float center, float scale, int nthreads, int ema) {
+static int8_t *dn_embed_box(unet *u, z3 *ct, const int64_t box[6], int P, int h, float center, float scale, int nthreads, int ema, const float *axz, float ars) {
     const int D = unet_cfg_of(u)->cout, in = P - 2 * h; const size_t p3 = (size_t)P * P * P;
     int8_t *out = calloc((size_t)box[3] * box[4] * box[5] * D, 1);
-    uint8_t *cth = malloc(p3), *ctd = nn_malloc(p3); float *x = nn_malloc(p3 * 4);
+    const int cin = unet_cfg_of(u)->cin; float *ayh = malloc((size_t)P * 8), *ayd = nn_malloc((size_t)P * 8);
+    uint8_t *cth = malloc(p3), *ctd = nn_malloc(p3); float *x = nn_malloc(p3 * 4 * cin);
     int8_t *td = nn_malloc((size_t)in * in * in * D), *th = malloc((size_t)in * in * in * D);
     if (!out || !cth || !ctd || !x || !td || !th) { fprintf(stderr, "dino: embed buffers\n"); return nullptr; }
     if (ema) unet_use_ema(u, 1);
-    const dn_geom g0 = {{0, 1, 2}, {0, 0, 0}}; const shape5 xs = {1, 1, P, P, P};
+    const dn_geom g0 = {{0, 1, 2}, {0, 0, 0}}; const shape5 xs = {1, cin, P, P, P};
     for (int64_t tz = 0; tz < box[3]; tz += in) for (int64_t ty = 0; ty < box[4]; ty += in) for (int64_t tx = 0; tx < box[5]; tx += in) {
         const int64_t o[3] = {box[0] + tz - h, box[1] + ty - h, box[2] + tx - h}, nn[3] = {P, P, P};
         if (z3_read(ct, o, nn, cth, nthreads)) { fprintf(stderr, "dino: embed read: %s\n", z3_error()); return nullptr; }
         nn_h2d(ctd, cth, p3);
         dn_input(ctd, x, P, g0, center, scale, 1.f, 0.f, 0.f, 0, 0, 0.f, 0, 0.f);
+        if (cin == 2 && axz) {
+            const int64_t nzv = z3_meta_of(ct)->shape[0];
+            for (int z = 0; z < P; z++) { int64_t gz = o[0] + z; gz = gz < 0 ? 0 : gz >= nzv ? nzv - 1 : gz; ayh[2 * z] = axz[2 * gz] - (float)o[1]; ayh[2 * z + 1] = axz[2 * gz + 1] - (float)o[2]; }
+            nn_h2d(ayd, ayh, (size_t)P * 8); dn_input_axis(x + p3, P, g0, ayd, ars);
+        }
         const void *lg = unet_forward(u, x, xs, 0);
         const int nz = (int)(box[3] - tz < in ? box[3] - tz : in), ny = (int)(box[4] - ty < in ? box[4] - ty : in), nx = (int)(box[5] - tx < in ? box[5] - tx : in);
         dn_tile_out(lg, unet_logits_h16(u), P, D, ctd, h, h + nz, h, h + ny, h, h + nx, td, nz, ny, nx, 0, 0, 0);
@@ -327,7 +369,7 @@ static int8_t *dn_embed_box(unet *u, z3 *ct, const int64_t box[6], int P, int h,
             memcpy(out + ((((size_t)(tz + z) * box[4]) + ty + y) * box[5] + tx) * D, th + (((size_t)z * ny) + y) * nx * D, (size_t)nx * D);
     }
     if (ema) unet_use_ema(u, 0);
-    free(cth); free(th); nn_free(ctd); nn_free(x); nn_free(td);
+    free(cth); free(th); free(ayh); nn_free(ctd); nn_free(x); nn_free(td); nn_free(ayd);
     return out;
 }
 
@@ -369,7 +411,9 @@ int cmd_dino_train(int argc, char **argv) {
     if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
     dn_precision_after_init(fp32);
     if (load_sources(srcf, Dd, nthreads)) return 1;
-    unet_cfg cfg = {0}; cfg.cin = 1; cfg.cout = ED; cfg.G = 8; cfg.down_norm = fp32 ? 0 : 1;
+    const int axis_in = atoi(opt(argc, argv, "--axis-input", "0")); const float ars = (float)atof(opt(argc, argv, "--axis-rs", "0.001"));   /* the axis-distance channel and its scale */
+    if (axis_in) for (int i = 0; i < Dd->nsrc; i++) if (!Dd->src[i].axz) { fprintf(stderr, "dino-train: --axis-input needs \"axis\" in every source (%s)\n", Dd->src[i].name); return 2; }
+    unet_cfg cfg = {0}; cfg.cin = axis_in ? 2 : 1; cfg.cout = ED; cfg.G = 8; cfg.down_norm = fp32 ? 0 : 1;
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,96,128,192")); for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "dino-train: P must be a multiple of %d\n", 1 << (cfg.nlev - 1)); return 2; }
     unet *u = unet_create(&cfg); unet_init(u, seed); unet_head_bias_zero(u);   /* (no shared -2 bias direction in the embeddings) */
@@ -391,7 +435,7 @@ int cmd_dino_train(int argc, char **argv) {
     }
     /* device buffers */
     const size_t p3 = (size_t)P * P * P; const int NG = Dd->ngt + Dd->nair, NS = Dd->nssl;
-    uint8_t *cta = nn_malloc(p3), *ctb = nn_malloc(p3); float *x = nn_malloc(p3 * 4), *gl = nn_malloc(p3 * ED * 4);
+    uint8_t *cta = nn_malloc(p3), *ctb = nn_malloc(p3); float *x = nn_malloc(p3 * 4 * cfg.cin), *gl = nn_malloc(p3 * ED * 4), *d_ayx = nn_malloc((size_t)P * 8);
     int *d_gidx = nn_malloc((size_t)NG * 4), *d_gcode = nn_malloc((size_t)NG * 4), *d_gxyz = nn_malloc((size_t)NG * 12), *d_sidx = nn_malloc((size_t)NS * 4);
     float *es_g = nn_malloc((size_t)NG * ED * 4), *et_g = nn_malloc((size_t)NG * ED * 4), *ns_g = nn_malloc((size_t)NG * 4), *nt_g = nn_malloc((size_t)NG * 4), *ga_g = nn_malloc((size_t)NG * ED * 4);
     float *es_s = nn_malloc((size_t)NS * ED * 4), *et_s = nn_malloc((size_t)NS * ED * 4), *ns_s = nn_malloc((size_t)NS * 4), *nt_s = nn_malloc((size_t)NS * 4), *ga_s = nn_malloc((size_t)NS * ED * 4);
@@ -401,7 +445,7 @@ int cmd_dino_train(int argc, char **argv) {
     dn_ring *R = calloc(1, sizeof *R); R->D = Dd; R->seed = seed; R->nthreads = nthreads; pthread_mutex_init(&R->mu, nullptr); pthread_cond_init(&R->cv, nullptr);
     for (int i = 0; i < DN_SLOTS; i++) {
         dn_sample *S = &R->slot[i]; S->ca = malloc(p3); S->cb = malloc(p3);
-        S->gidx = malloc((size_t)NG * 4); S->gcode = malloc((size_t)NG * 4); S->gxyz = malloc((size_t)NG * 12);   /* labelled + air */ S->sidx = malloc((size_t)NS * 4);
+        S->gidx = malloc((size_t)NG * 4); S->gcode = malloc((size_t)NG * 4); S->gxyz = malloc((size_t)NG * 12);   /* labelled + air */ S->sidx = malloc((size_t)NS * 4); S->ayx = malloc((size_t)P * 8);
     }
     R->nworkers = nwork > 8 ? 8 : nwork;
     for (int i = 0; i < R->nworkers; i++) pthread_create(&R->th[i], nullptr, ring_worker, R);
@@ -409,7 +453,7 @@ int cmd_dino_train(int argc, char **argv) {
     char logp[1200]; snprintf(logp, sizeof logp, "%s/train.log", outd); FILE *lf = fopen(logp, "a");
     fprintf(stderr, "dino-train: P %d, widths", P); for (int l = 0; l < cfg.nlev; l++) fprintf(stderr, " %d", cfg.widths[l]);
     fprintf(stderr, ", %zu params, D %d, GT %d + SSL %d points (weight %g), %d prototypes, %s\n", unet_nparams(u), ED, NG, NS, wssl, K, fp32 ? "bf16 (--mx 0)" : "fp4 / MX storage");
-    const shape5 xs = {1, 1, P, P, P};
+    const shape5 xs = {1, cfg.cin, P, P, P};
     double t_last = dn_now(), sums[13] = {0}; int nsum = 0; uint64_t arng = seed * 1000003 + 17;
     const char *stopf_name = "STOP"; char stopf[1200]; snprintf(stopf, sizeof stopf, "%s/%s", outd, stopf_name);
     float *hout = malloc(64 * 4);
@@ -420,6 +464,7 @@ int cmd_dino_train(int argc, char **argv) {
         if (S->ngt) { nn_h2d(d_gidx, S->gidx, (size_t)S->ngt * 4); nn_h2d(d_gcode, S->gcode, (size_t)S->ngt * 4); nn_h2d(d_gxyz, S->gxyz, (size_t)S->ngt * 12); }
         if (S->nssl) nn_h2d(d_sidx, S->sidx, (size_t)S->nssl * 4);
         const int ngt = S->ngt, nssl = S->nssl;
+        if (axis_in) nn_h2d(d_ayx, S->ayx, (size_t)P * 8);
         ring_put(R, S);   /* (its host buffers are copied) */
         const uint8_t *cs = step & 1 ? ctb : cta, *ctt = step & 1 ? cta : ctb;   /* student / teacher views alternate */
         const float ga1 = 1.f + gj * (2.f * (float)rng_u(&arng) - 1.f), gb1 = gj * (2.f * (float)rng_u(&arng) - 1.f);
@@ -429,6 +474,7 @@ int cmd_dino_train(int argc, char **argv) {
         if (use_teacher) {
         /* teacher (EMA weights), forward only */
         dn_input(ctt, x, P, S->g, src->center, src->scale, ga2, gb2, sg2, (uint32_t)(step * 2 + 1), 0, 0.f, 0, 0.f);
+        if (axis_in) dn_input_axis(x + p3, P, S->g, d_ayx, ars);
         unet_use_ema(u, 1);
         lg = unet_forward(u, x, xs, 0); h16 = unet_logits_h16(u);
         if (ngt) dn_gather(lg, h16, p3, ED, d_gidx, ngt, et_g, nt_g);
@@ -437,6 +483,7 @@ int cmd_dino_train(int argc, char **argv) {
         }
         /* student */
         dn_input(cs, x, P, S->g, src->center, src->scale, ga1, gb1, sg1, (uint32_t)(step * 2), mcube, mfrac, (uint32_t)step, 0.f);
+        if (axis_in) dn_input_axis(x + p3, P, S->g, d_ayx, ars);
         lg = unet_forward(u, x, xs, 1); h16 = unet_logits_h16(u);
         if (ngt) dn_gather(lg, h16, p3, ED, d_gidx, ngt, es_g, ns_g);
         if (nssl) dn_gather(lg, h16, p3, ED, d_sidx, nssl, es_s, ns_s);
@@ -501,7 +548,10 @@ int cmd_dino_train(int argc, char **argv) {
                 if (!ez) fprintf(stderr, "dino-train: eval CT: %s\n", z3_error());
                 else {
                     const int64_t box[6] = {eb[0], eb[1], eb[2], eb[3], eb[4], eb[5]};
-                    int8_t *emb = dn_embed_box(u, ez, box, P, 32, ec, es, nthreads, 1);
+                    float *eax = nullptr;
+                    if (axis_in) eax = load_axis(opt(argc, argv, "--eval-axis", ""), atof(opt(argc, argv, "--eval-axis-scale", "1")), z3_meta_of(ez)->shape[0]);
+                    int8_t *emb = (axis_in && !eax) ? nullptr : dn_embed_box(u, ez, box, P, 32, ec, es, nthreads, 1, eax, ars);
+                    free(eax);
                     char gdir[1200]; snprintf(gdir, sizeof gdir, "%s/eval-emb", outd);
                     if (emb && !dv_write_dense_box(gdir, z3_meta_of(ez)->shape, box, ED, emb)) {
                         const double te2 = dn_now();
@@ -551,7 +601,9 @@ int cmd_dino_embed(int argc, char **argv) {
     if (!ct) { fprintf(stderr, "dino-embed: %s\n", z3_error()); return 1; }
     const int64_t box[6] = {b[0], b[1], b[2], b[3], b[4], b[5]};
     const double t0 = dn_now();
-    int8_t *e = dn_embed_box(u, ct, box, P, atoi(opt(argc, argv, "--halo", "32")), c, s, 8, atoi(opt(argc, argv, "--ema", "1")));
+    float *axz = nullptr;
+    if (cfg.cin == 2) { axz = load_axis(opt(argc, argv, "--axis", ""), atof(opt(argc, argv, "--axis-scale", "1")), z3_meta_of(ct)->shape[0]); if (!axz) { fprintf(stderr, "dino-embed: this net takes the axis-distance channel: --axis FILE [--axis-scale S]\n"); return 2; } }
+    int8_t *e = dn_embed_box(u, ct, box, P, atoi(opt(argc, argv, "--halo", "32")), c, s, 8, atoi(opt(argc, argv, "--ema", "1")), axz, (float)atof(opt(argc, argv, "--axis-rs", "0.001")));
     if (!e) return 1;
     const double t1 = dn_now();
     if (dv_write_dense_box(argv[5], z3_meta_of(ct)->shape, box, cfg.cout, e)) return 1;

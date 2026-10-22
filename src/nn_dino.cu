@@ -362,3 +362,17 @@ __global__ void k_varreg(const float *e, int N, int D, float gamma, float lambda
     if (threadIdx.x == 0) out[0] = L;
 }
 extern "C" void dn_varreg(const float *e, int N, int D, float gamma, float lambda, float *ge, float *out) { if (N > 1) k_varreg<<<1, 256>>>(e, N, D, gamma, lambda, ge, out); }
+/* the axis-distance input channel: x[o] = rs * |(sy, sx) - axis(sz)| with the window's axis (y, x) per source plane ayx [P][2] (window coords) */
+__global__ void k_input_axis(float *x, int P, dn_geom g, const float *ayx, float rs) {
+    const long long n = (long long)P * P * P;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        const int o[3] = {(int)(i / ((long long)P * P)), (int)((i / P) % P), (int)(i % P)};
+        int s[3];
+        for (int d = 0; d < 3; d++) s[g.perm[d]] = g.flip[d] ? P - 1 - o[d] : o[d];
+        const float dy = s[1] - ayx[2 * s[0]], dx = s[2] - ayx[2 * s[0] + 1];
+        x[i] = rs * sqrtf(dy * dy + dx * dx);
+    }
+}
+extern "C" void dn_input_axis(float *x, int P, dn_geom g, const float *ayx, float rs) {
+    k_input_axis<<<nb_of((long long)P * P * P, 256), 256>>>(x, P, g, ayx, rs);
+}

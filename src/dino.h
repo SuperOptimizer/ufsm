@@ -19,6 +19,8 @@ typedef struct { int perm[3], flip[3]; } dn_geom;   /* output axis d reads sourc
    (edge mcube, masked when hash(cube, mseed) < mfrac) set to mval; ct u8 [P^3] on the device, x float [P^3] */
 void dn_input(const uint8_t *ct, float *x, int P, dn_geom g, float center, float scale, float gain, float bias, float sigma, uint32_t seed,
               int mcube, float mfrac, uint32_t mseed, float mval);
+/* the scroll-axis distance channel: x[o] = rs * |(y, x) - axis(z)| in source coordinates (ayx [P][2], window coords per source plane) */
+void dn_input_axis(float *x, int P, dn_geom g, const float *ayx, float rs);
 /* embeddings at points: logits [D][P^3] (fp16 if h16 else fp32), idx [N] voxel indices -> e [N][D] unit vectors, nrm [N] the norms */
 void dn_gather(const void *logits, int h16, size_t p3, int D, const int *idx, int N, float *e, float *nrm);
 /* SupCon over anchors a (N x D unit, student) with keys = the anchors and N2 extra detached keys t (teacher, may be 0): per-anchor labels
