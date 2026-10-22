@@ -933,3 +933,37 @@ extern "C" void nn_pool_targets(const uint8_t *t, const uint8_t *m, int B, int C
     const size_t n = (size_t)B * (D / f) * (H / f) * (W / f);
     pool_targets_k<<<nblk(n, 256), 256>>>(t, m, B, C, D, H, W, f, to, mo); KCHECK();
 }
+/* --phase-trunc (robust phase loss): the phase mask m (head slab, the fp16 cos / sin logits lc, ls and the targets t of nn_phase_targets)
+   loses every voxel where the network is confident (|predicted phasor| >= kappa) and disagrees with its label by more than tau turns:
+   a truncated loss (cf. truncated Lq, Zhang & Sabuncu 2018): a wrong label on packed sheets contributes nothing instead of the largest
+   gradient, while every voxel the network is unsure about or agrees with keeps the full BCE. cnt[0] += labelled voxels, cnt[1] += dropped */
+__global__ void phase_trunc_k(const __half *lc, const __half *ls, const uint8_t *t, uint8_t *m, size_t n, float tau, float kappa, unsigned long long *cnt) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    int known = 0, drop = 0;
+    if (i < n && m[i]) {
+        known = 1;
+        const float pc = 2.f / (1.f + __expf(-__half2float(lc[i]))) - 1.f, ps = 2.f / (1.f + __expf(-__half2float(ls[i]))) - 1.f;
+        if (pc * pc + ps * ps >= kappa * kappa) {
+            const float tc = t[i] / 127.5f - 1.f, ts = t[n + i] / 127.5f - 1.f;
+            const float d = atan2f(pc * ts - ps * tc, pc * tc + ps * ts) * 0.15915494f;
+            if (fabsf(d) > tau) { m[i] = 0; drop = 1; }
+        }
+    }
+    const unsigned bk = __ballot_sync(0xffffffffu, known), bd = __ballot_sync(0xffffffffu, drop);
+    if ((threadIdx.x & 31) == 0) { if (bk) atomicAdd(&cnt[0], (unsigned long long)__popc(bk)); if (bd) atomicAdd(&cnt[1], (unsigned long long)__popc(bd)); }
+}
+static unsigned long long *g_ptrunc_cnt[64];   /* per device */
+extern "C" void nn_phase_trunc(const void *lc, const void *ls, const uint8_t *t, uint8_t *m, size_t n, float tau, float kappa) {
+    int dev = 0; cudaGetDevice(&dev); if (dev < 0 || dev >= 64) dev = 0;
+    if (!g_ptrunc_cnt[dev]) { CK(cudaMalloc(&g_ptrunc_cnt[dev], 2 * sizeof(unsigned long long))); CK(cudaMemset(g_ptrunc_cnt[dev], 0, 2 * sizeof(unsigned long long))); }
+    phase_trunc_k<<<nblk(n, 256), 256>>>((const __half *)lc, (const __half *)ls, t, m, n, tau, kappa, g_ptrunc_cnt[dev]); KCHECK();
+}
+extern "C" void nn_phase_trunc_counts(unsigned long long out[2]) {   /* every device's, since the last call (then reset); zeros before the first use */
+    out[0] = out[1] = 0; int cur = 0; cudaGetDevice(&cur);
+    for (int dev = 0; dev < 64; dev++) {
+        if (!g_ptrunc_cnt[dev]) continue;
+        unsigned long long c[2]; cudaSetDevice(dev);
+        CK(cudaMemcpy(c, g_ptrunc_cnt[dev], sizeof c, cudaMemcpyDeviceToHost)); CK(cudaMemset(g_ptrunc_cnt[dev], 0, sizeof c)); out[0] += c[0]; out[1] += c[1];
+    }
+    cudaSetDevice(cur);
+}

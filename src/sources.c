@@ -191,6 +191,16 @@ sources *sources_load(const char *path) {
                     fprintf(stderr, "sources: %s: cannot open the stored phase %s/%s or its shape differs from the band codes'\n", s->name, proot ? proot : "?", pkey);
                     json_free(j); sources_free(S); return nullptr;
                 }
+                const json *ig = json_get(pt, "ignore");   /* a mask on the stored phase's grid: nonzero = not trained on */
+                if (ig) {
+                    const char *ir = json_str(json_get(ig, "root"), nullptr), *ik = json_str(json_get(ig, "key"), "");
+                    store *is = ir ? store_open(ir) : nullptr; s->phase_ign = is ? z3_open(is, ik, nullptr) : nullptr;
+                    const z3_meta *im = s->phase_ign ? z3_meta_of(s->phase_ign) : nullptr;
+                    if (!im || memcmp(im->shape, pm->shape, sizeof im->shape)) {
+                        fprintf(stderr, "sources: %s: cannot open the phase ignore mask %s/%s or its shape differs from the stored phase's\n", s->name, ir ? ir : "?", ik);
+                        json_free(j); sources_free(S); return nullptr;
+                    }
+                }
                 const json *wt = json_get(bt, "winding");   /* the winding mod 14 on the stored phase's grid */
                 if (wt) {
                     const char *wroot = json_str(json_get(wt, "root"), nullptr), *wkey = json_str(json_get(wt, "key"), pkey);
@@ -276,7 +286,7 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
-        z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); free(s->box); free(s->focus); free(s->mask);
+        z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); free(s->box); free(s->focus); free(s->mask);
         for (int c = 0; c < NCH; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {

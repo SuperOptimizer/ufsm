@@ -13,6 +13,7 @@
 #include <string.h>
 #include "store.h"
 #include "zarr3.h"
+#include "z3w.h"
 
 static const char *pk_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
 static inline double pk_wrap(int a, int b) { double d = (b - a) / 252.0; return d - round(d); }
@@ -78,5 +79,47 @@ int cmd_phase_packing(int argc, char **argv) {
         free(J.map); free(bits);
     }
     z3_close(z);
+    return 0;
+}
+
+/* ufsm phase-conflict <a-root> <a-key> <b-root> <b-key> <out-array-dir> [--tol 0.25] [--threads 16]
+   Where two label phase rasters of one scan (e.g. the Paris 4 June / July published-wrap sets, same grid) disagree: a uint8 zarr on their
+   grid (512^3 shards), 1 where both are known and their wrapped difference exceeds --tol turns, else 0. Detection only (no repair): the
+   sampler's "phase": {..., "ignore": {"root", "key"}} makes those voxels unknown, so neither set's phase there is trained on. */
+int cmd_phase_conflict(int argc, char **argv) {
+    if (argc < 7) { fprintf(stderr, "usage: ufsm phase-conflict <a-root> <a-key> <b-root> <b-key> <out-array-dir> [--tol 0.25] [--threads 16]\n"); return 2; }
+    z3 *a = z3_open(store_open(argv[2]), argv[3], nullptr), *b = z3_open(store_open(argv[4]), argv[5], nullptr);
+    if (!a || !b) { fprintf(stderr, "phase-conflict: %s\n", z3_error()); return 1; }
+    const z3_meta *ma = z3_meta_of(a), *mb = z3_meta_of(b);
+    if (memcmp(ma->shape, mb->shape, sizeof ma->shape)) { fprintf(stderr, "phase-conflict: the rasters differ in shape\n"); return 1; }
+    const double tol = atof(pk_opt(argc, argv, "--tol", "0.25")); const int nt = atoi(pk_opt(argc, argv, "--threads", "16")), S = 512;
+    if (!(tol > 0 && tol < 0.5)) { fprintf(stderr, "phase-conflict: --tol in (0, 0.5)\n"); return 2; }
+    char at[256]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"1 where two label phase rasters are both known and differ by more than %g turn\"}}", tol);
+    z3w *w = z3w_create(argv[6], ma->shape, S, 0.f, 0, at); if (!w) { fprintf(stderr, "phase-conflict: %s\n", z3w_error()); return 1; }
+    int64_t ga[3], gb[3]; uint8_t *ba = nullptr, *bb = nullptr;
+    if (z3_chunk_map(a, ga, &ba) <= 0 || z3_chunk_map(b, gb, &bb) <= 0 || ma->chunk[0] != mb->chunk[0] || S % ma->chunk[0]) { fprintf(stderr, "phase-conflict: no chunk maps\n"); return 1; }
+    const int64_t C = ma->chunk[0], k = S / C, ns[3] = {(ma->shape[0] + S - 1) / S, (ma->shape[1] + S - 1) / S, (ma->shape[2] + S - 1) / S};
+    uint8_t *pa = malloc((size_t)S * S * S), *pb = malloc((size_t)S * S * S), *out = malloc((size_t)S * S * S);
+    long long nboth = 0, nconf = 0; int nsh = 0; const int lim = (int)lround(tol * 252);
+    for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
+        int both = 0;   /* a shard needs a stored chunk in both rasters */
+        for (int64_t cz = sz * k; cz < (sz + 1) * k && cz < ga[0] && !both; cz++) for (int64_t cy = sy * k; cy < (sy + 1) * k && cy < ga[1] && !both; cy++)
+            for (int64_t cx = sx * k; cx < (sx + 1) * k && cx < ga[2]; cx++) { const int64_t q = (cz * ga[1] + cy) * ga[2] + cx; if (ba[q] && bb[q]) { both = 1; break; } }
+        if (!both) continue;
+        const int64_t o[3] = {sz * S, sy * S, sx * S}; int64_t n[3];
+        for (int d = 0; d < 3; d++) n[d] = o[d] + S < ma->shape[d] ? S : ma->shape[d] - o[d];
+        if (z3_read(a, o, n, pa, nt) || z3_read(b, o, n, pb, nt)) { fprintf(stderr, "phase-conflict: read failed: %s\n", z3_error()); return 1; }
+        memset(out, 0, (size_t)S * S * S); long long nc = 0, nb = 0;
+        for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {
+            const size_t i = ((size_t)z * n[1] + y) * n[2] + x; const int p = pa[i], q = pb[i];
+            if (p > 251 || q > 251) continue;
+            nb++; int dd = abs(p - q); if (dd > 126) dd = 252 - dd;
+            if (dd > lim) { out[((size_t)z * S + y) * S + x] = 1; nc++; }
+        }
+        nboth += nb; nconf += nc; nsh++;
+        if (nc && z3w_write_shard(w, sz, sy, sx, out, nt)) { fprintf(stderr, "phase-conflict: %s\n", z3w_error()); return 1; }
+    }
+    z3w_close(w); free(pa); free(pb); free(out); free(ba); free(bb); z3_close(a); z3_close(b);
+    printf("phase-conflict: %d shards with both sets, %lld voxels known in both, %lld (%.4f) differ by more than %g turn -> %s\n", nsh, nboth, nconf, nboth ? (double)nconf / nboth : 0, tol, argv[6]);
     return 0;
 }
