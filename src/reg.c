@@ -376,6 +376,20 @@ static void crop(const float *in, const int ni[3], int p, const int no[3], float
         memcpy(out + ((size_t)z * no[1] + y) * no[2], in + ((size_t)(z + p) * ni[1] + y + p) * ni[2] + p, no[2] * sizeof *out);
 }
 
+/* 2x mean pooling of the cube v (n^3) from offset o: out m^3 */
+static void pool2(const float *v, int n, int o, int m, float *out) {
+    for (int z = 0; z < m; z++) for (int y = 0; y < m; y++) for (int x = 0; x < m; x++) {
+        float s = 0;
+        for (int k = 0; k < 8; k++) { const int zz = o + 2 * z + (k >> 2), yy = o + 2 * y + (k >> 1 & 1), xx = o + 2 * x + (k & 1); s += v[((size_t)zz * n + yy) * n + xx]; }
+        out[((size_t)z * m + y) * m + x] = s * 0.125f;
+    }
+}
+/* window of the cube v (n^3) at offset o (z y x), dims nw */
+static void crop3(const float *v, int n, const int o[3], const int nw[3], float *out) {
+    for (int z = 0; z < nw[0]; z++) for (int y = 0; y < nw[1]; y++)
+        memcpy(out + ((size_t)z * nw[1] + y) * nw[2], v + ((size_t)(z + o[0]) * n + y + o[1]) * n + o[2], nw[2] * sizeof *out);
+}
+
 /* fine block covering the coarse level-lc points org - 1 .. org + n (xyz) shifted by up to |smax| (level-lc voxels) */
 uint8_t *reg_read_fine(rvol *fv, int lf, const rmap *m, int lc, const double org[3], const int n[3], double smax, rblk *fb, int *err) {
     const double fc = (double)(1 << lc), ff = (double)(1 << lf);
@@ -431,7 +445,28 @@ int reg_measure(const rmeas *q, rbox *b) {
     { const int nI[3] = {B, B, B}; float *t = malloc(NB * sizeof *t); crop(G, nE, R, nI, t); b->gstd = (float)stdev(t, NB); free(t); }
     if (b->cstd < 1e-3 || b->gstd < 1e-3) { st = 3; goto done; }
     const int w = 2 * R + 1; map = malloc((size_t)w * w * w * sizeof *map);
-    reg_ncc_map(C, nB, G, R, map);
+    for (int i = 0; i < w * w * w; i++) map[i] = -2;
+    if (R <= 3 || B % 2) reg_ncc_map(C, nB, G, R, map);
+    else {
+        /* two levels: the 2x-pooled pair over +-ceil(R / 2), then +-2 at full resolution around twice that peak (and 0 for ncc0) */
+        const int R2 = (R + 1) / 2, B2 = B / 2, E2 = B2 + 2 * R2, w2 = 2 * R2 + 1, nB2[3] = {B2, B2, B2};
+        float *C2 = malloc((size_t)B2 * B2 * B2 * sizeof *C2), *G2 = malloc((size_t)E2 * E2 * E2 * sizeof *G2), *m2 = malloc((size_t)w2 * w2 * w2 * sizeof *m2);
+        pool2(C, B, 0, B2, C2); pool2(G, E, R - 2 * R2, E2, G2);
+        reg_ncc_map(C2, nB2, G2, R2, m2);
+        int k2 = 0; for (int i = 1; i < w2 * w2 * w2; i++) if (m2[i] > m2[k2]) k2 = i;
+        const int c2[3] = {2 * (k2 % w2 - R2), 2 * (k2 / w2 % w2 - R2), 2 * (k2 / (w2 * w2) - R2)};   /* x y z */
+        free(C2); free(G2); free(m2);
+        float sub[125]; float *Gw = malloc((size_t)(B + 4) * (B + 4) * (B + 4) * sizeof *Gw);
+        for (int pass = 0; pass < 2; pass++) {
+            int c[3]; for (int d = 0; d < 3; d++) { c[d] = pass ? 0 : c2[d]; if (c[d] < -R + 2) c[d] = -R + 2; if (c[d] > R - 2) c[d] = R - 2; }
+            const int off[3] = {R + c[2] - 2, R + c[1] - 2, R + c[0] - 2}, nw[3] = {B + 4, B + 4, B + 4};   /* z y x */
+            crop3(G, E, off, nw, Gw);
+            reg_ncc_map(C, nB, Gw, 2, sub);
+            for (int z = 0; z < 5; z++) for (int y = 0; y < 5; y++) for (int x = 0; x < 5; x++)
+                map[((size_t)(R + c[2] + z - 2) * w + R + c[1] + y - 2) * w + R + c[0] + x - 2] = sub[(z * 5 + y) * 5 + x];
+        }
+        free(Gw);
+    }
     int pk = 0; for (int i = 1; i < w * w * w; i++) if (map[i] > map[pk]) pk = i;
     b->ncc0 = map[((size_t)R * w + R) * w + R];
     const int pz = pk / (w * w), py = pk / w % w, px = pk % w;

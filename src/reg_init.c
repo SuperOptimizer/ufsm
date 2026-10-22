@@ -33,7 +33,7 @@ static void fft2(double complex *a, int n0, int n1, int inv, double complex *col
 }
 
 /* ---------- a volume in memory at ~W um ---------- */
-typedef struct { uint8_t *v; int64_t n[3]; double f, um0; double a0[3], d[3], e1[3], e2[3]; double hlo, hhi, rmax; } mvol;   /* f: L0 voxels per voxel */
+typedef struct { uint8_t *v; int64_t n[3]; double f, um0; double *cx, *cy; double hlo, hhi, rmax; } mvol;   /* f: L0 voxels per voxel; cx, cy: smoothed mask centroid per slice (level coords) */
 static int mvol_load(rvol *rv, double W, int nt, mvol *m) {
     const int l = rvol_level_for(rv, W); const int64_t *s = rv->shape[l];
     if ((double)s[0] * s[1] * s[2] > 2.5e9) { fprintf(stderr, "reg init: level %d of %s too large\n", l, rv->name); return -1; }
@@ -59,46 +59,45 @@ static int mvol_load(rvol *rv, double W, int nt, mvol *m) {
 /* level voxel coords -> physical um (L0 voxel * um0) and back */
 static inline double l2p(const mvol *m, double x) { return ((x + 0.5) * m->f - 0.5) * m->um0; }
 static inline double p2l(const mvol *m, double p) { return (p / m->um0 + 0.5) / m->f - 0.5; }
-static void cross(const double a[3], const double b[3], double c[3]) { c[0] = a[1] * b[2] - a[2] * b[1]; c[1] = a[2] * b[0] - a[0] * b[2]; c[2] = a[0] * b[1] - a[1] * b[0]; }
-static void norm3(double a[3]) { const double n = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]); for (int i = 0; i < 3; i++) a[i] /= n; }
 
+/* the scroll's centre line: per-slice mask centroids, smoothed over +-1 mm, slices with >= 30% of the largest mask area; scrolls bend and are
+   crushed, so each volume keeps its own centre curve (no global axis line / tilt) and z is the cylinder axis */
 static void mvol_axis(mvol *m) {
     const int64_t nz = m->n[0], ny = m->n[1], nx = m->n[2];
-    double *A = calloc(nz, sizeof *A), *cx = calloc(nz, sizeof *cx), *cy = calloc(nz, sizeof *cy); double amax = 0;
+    double *A = calloc(nz, sizeof *A), *sx = calloc(nz, sizeof *sx), *sy = calloc(nz, sizeof *sy); double amax = 0;
     for (int64_t z = 0; z < nz; z++) {
-        double s = 0, sx = 0, sy = 0;
-        for (int64_t y = 0; y < ny; y++) for (int64_t x = 0; x < nx; x++) if (m->v[((size_t)z * ny + y) * nx + x]) { s++; sx += x; sy += y; }
-        A[z] = s; if (s) { cx[z] = sx / s; cy[z] = sy / s; } amax = fmax(amax, s);
+        double s = 0, ax = 0, ay = 0;
+        for (int64_t y = 0; y < ny; y++) for (int64_t x = 0; x < nx; x++) if (m->v[((size_t)z * ny + y) * nx + x]) { s++; ax += x; ay += y; }
+        A[z] = s; sx[z] = ax; sy[z] = ay; amax = fmax(amax, s);
     }
-    /* weighted line fits x(z), y(z) over slices with >= 30% of the largest area */
-    double S = 0, Sz = 0, Szz = 0, Sx = 0, Szx = 0, Sy = 0, Szy = 0; int64_t zl = -1, zh = -1;
-    for (int64_t z = 0; z < nz; z++) if (A[z] >= 0.3 * amax) {
-        const double w = A[z]; S += w; Sz += w * z; Szz += w * z * z; Sx += w * cx[z]; Szx += w * z * cx[z]; Sy += w * cy[z]; Szy += w * z * cy[z];
-        if (zl < 0) zl = z;
-        zh = z;
+    int64_t zl = -1, zh = -1;
+    for (int64_t z = 0; z < nz; z++) if (A[z] >= 0.3 * amax) { if (zl < 0) zl = z; zh = z; }
+    m->cx = calloc(nz, sizeof *m->cx); m->cy = calloc(nz, sizeof *m->cy);
+    const int k = (int)fmax(1, 1000 / (m->um0 * m->f));
+    for (int64_t z = 0; z < nz; z++) {
+        double s = 0, ax = 0, ay = 0;
+        for (int64_t q = z - k; q <= z + k; q++) { const int64_t c = q < zl ? zl : q > zh ? zh : q; s += A[c]; ax += sx[c]; ay += sy[c]; }
+        m->cx[z] = s > 0 ? ax / s : nx / 2.0; m->cy[z] = s > 0 ? ay / s : ny / 2.0;
     }
-    const double den = S * Szz - Sz * Sz;
-    const double bx = den > 0 ? (S * Szx - Sz * Sx) / den : 0, by = den > 0 ? (S * Szy - Sz * Sy) / den : 0;
-    const double zm = Sz / S, xm = Sx / S, ym = Sy / S;
-    m->a0[0] = l2p(m, xm); m->a0[1] = l2p(m, ym); m->a0[2] = l2p(m, zm);
-    m->d[0] = bx; m->d[1] = by; m->d[2] = 1; norm3(m->d);
-    const double xh[3] = {1, 0, 0}; const double dd = m->d[0];
-    for (int i = 0; i < 3; i++) m->e1[i] = xh[i] - dd * m->d[i];
-    norm3(m->e1); cross(m->d, m->e1, m->e2);
-    /* h range of the used slices and the 98th percentile radius (subsampled) */
-    m->hlo = (l2p(m, zl) - m->a0[2]) * m->d[2]; m->hhi = (l2p(m, zh) - m->a0[2]) * m->d[2];
-    int64_t cnt = 0, hist[4096] = {0}; const double rs = 20;   /* 20 um bins */
-    for (int64_t z = zl; z <= zh; z += 4) for (int64_t y = 0; y < ny; y += 2) for (int64_t x = 0; x < nx; x += 2) if (m->v[((size_t)z * ny + y) * nx + x]) {
-        const double p[3] = {l2p(m, x) - m->a0[0], l2p(m, y) - m->a0[1], l2p(m, z) - m->a0[2]};
-        const double h = p[0] * m->d[0] + p[1] * m->d[1] + p[2] * m->d[2];
-        const double r = sqrt(fmax(0, p[0] * p[0] + p[1] * p[1] + p[2] * p[2] - h * h));
-        int b = (int)(r / rs); if (b > 4095) b = 4095;
+    m->hlo = l2p(m, zl); m->hhi = l2p(m, zh);
+    int64_t cnt = 0, hist[4096] = {0}; const double rs = 20;   /* 98th percentile radius about the centre curve (20 um bins) */
+    for (int64_t z = zl; z <= zh; z += 2) for (int64_t y = 0; y < ny; y++) for (int64_t x = 0; x < nx; x++) if (m->v[((size_t)z * ny + y) * nx + x]) {
+        const double dx = (x - m->cx[z]) * m->um0 * m->f, dy = (y - m->cy[z]) * m->um0 * m->f;
+        int b = (int)(sqrt(dx * dx + dy * dy) / rs); if (b > 4095) b = 4095;
         hist[b]++; cnt++;
     }
     int64_t acc = 0; int b = 0; for (; b < 4096 && acc < 0.98 * cnt; b++) acc += hist[b];
     m->rmax = b * rs;
-    fprintf(stderr, "  axis point (%.0f, %.0f, %.0f) um, direction (%.4f, %.4f, %.4f), h %.0f .. %.0f um, r98 %.0f um\n", m->a0[0], m->a0[1], m->a0[2], m->d[0], m->d[1], m->d[2], m->hlo, m->hhi, m->rmax);
-    free(A); free(cx); free(cy);
+    fprintf(stderr, "  centre line: z %.0f .. %.0f um, centre (%.0f, %.0f) .. (%.0f, %.0f) um, r98 %.0f um\n", m->hlo, m->hhi, l2p(m, m->cx[zl]), l2p(m, m->cy[zl]), l2p(m, m->cx[zh]), l2p(m, m->cy[zh]), m->rmax);
+    free(A); free(sx); free(sy);
+}
+/* cylinder frame: physical point at radius r, angle phi about the centre curve, height h (physical z) */
+static void frame(const mvol *m, double r, double phi, double h, double P[3]) {
+    double z = p2l(m, h); if (z < 0) z = 0;
+    if (z > m->n[0] - 1) z = m->n[0] - 1;
+    const int64_t z0 = (int64_t)floor(z), z1 = z0 + 1 < m->n[0] ? z0 + 1 : z0; const double u = z - z0;
+    const double cx = m->cx[z0] + u * (m->cx[z1] - m->cx[z0]), cy = m->cy[z0] + u * (m->cy[z1] - m->cy[z0]);
+    P[0] = l2p(m, cx) + r * cos(phi); P[1] = l2p(m, cy) + r * sin(phi); P[2] = h;
 }
 static float mvol_at(const mvol *m, const double P[3]) {   /* trilinear at physical P; < 0 if any corner is outside the mask */
     const double x = p2l(m, P[0]), y = p2l(m, P[1]), z = p2l(m, P[2]);
@@ -129,15 +128,13 @@ static void *ring_worker(void *arg) {
         for (int i = 0; i < j->nphi; i++) {
             const double ph = 2 * M_PI * i / j->nphi;
             for (int h = 0; h < j->Hc; h++) {   /* coarse at (r, ph, hlo + h W) */
-                const double hh = j->c->hlo + h * j->W, cs = cos(ph), sn = sin(ph); double P[3];
-                for (int a = 0; a < 3; a++) P[a] = j->c->a0[a] + hh * j->c->d[a] + r * (cs * j->c->e1[a] + sn * j->c->e2[a]);
+                double P[3]; frame(j->c, r, ph, j->c->hlo + h * j->W, P);
                 const float v = mvol_at(j->c, P);
                 if (v >= 0) { b[0][(size_t)i * j->nh + h] = v; b[1][(size_t)i * j->nh + h] = (double)v * v; b[2][(size_t)i * j->nh + h] = 1; nc++; }
             }
-            const double phf = j->sp * ph, cs = cos(phf), sn = sin(phf);
+            const double phf = j->sp * ph;
             for (int h = 0; h < j->Hf; h++) {   /* fine at (r, sp ph, hb + sh h W) */
-                const double hh = (j->sh > 0 ? j->f->hlo : j->f->hhi) + j->sh * h * j->W; double P[3];
-                for (int a = 0; a < 3; a++) P[a] = j->f->a0[a] + hh * j->f->d[a] + r * (cs * j->f->e1[a] + sn * j->f->e2[a]);
+                double P[3]; frame(j->f, r, phf, (j->sh > 0 ? j->f->hlo : j->f->hhi) + j->sh * h * j->W, P);
                 const float v = mvol_at(j->f, P);
                 if (v >= 0) { b[3][(size_t)i * j->nh + h] = v; b[4][(size_t)i * j->nh + h] = (double)v * v; b[5][(size_t)i * j->nh + h] = 1; nf++; }
             }
@@ -206,25 +203,29 @@ int reg_init_affine(rvol *cv, rvol *fv, double W, double rmin, int nt, int all, 
         if (c0 > best.ncc) best = p;
         free(ncc);
     }
-    /* affine: fine local (u v h) = Bf^T (P_f - a0f); coarse local = (Rot(theta) diag(1, sp) (u, v), hc) with hc = hlo_c + uh W + sh (h - hb) */
-    const double th = 2 * M_PI * best.uphi / j.nphi, hb = best.sh > 0 ? mf.hlo : mf.hhi, t3 = mc.hlo + best.uh * W - best.sh * hb;
-    double L[3][3] = {{cos(th), -sin(th) * best.sp, 0}, {sin(th), cos(th) * best.sp, 0}, {0, 0, (double)best.sh}};
-    double Bc[3][3], Bf[3][3];
-    for (int a = 0; a < 3; a++) { Bc[a][0] = mc.e1[a]; Bc[a][1] = mc.e2[a]; Bc[a][2] = mc.d[a]; Bf[a][0] = mf.e1[a]; Bf[a][1] = mf.e2[a]; Bf[a][2] = mf.d[a]; }
-    /* P_c = a0c + Bc (L Bf^T (P_f - a0f) + (0, 0, t3)) ; P = um x */
-    double G[3][3] = {{0}};   /* Bc L Bf^T */
-    for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) for (int k = 0; k < 3; k++) for (int l = 0; l < 3; l++) G[a][b] += Bc[a][k] * L[k][l] * Bf[b][l];
-    raff A;
-    for (int a = 0; a < 3; a++) {
-        double t = mc.a0[a] + Bc[a][2] * t3;
-        for (int b = 0; b < 3; b++) { A.m[a][b] = G[a][b] * fv->um / cv->um; t -= G[a][b] * mf.a0[b]; }
-        A.m[a][3] = t / cv->um;
+    /* affine: least squares over cylinder correspondences at the peak: fine (r, sp phi_i, hb + sh j W) <-> coarse (r, phi_{i + uphi}, hlo_c + (j + uh) W) */
+    const double th = 2 * M_PI * best.uphi / j.nphi, hb = best.sh > 0 ? mf.hlo : mf.hhi, dphi = 2 * M_PI / j.nphi;
+    int np = 0; const int ni = 64, nj = j.Hf < 24 ? j.Hf : 24, nrr = 8;
+    double *cp = malloc((size_t)ni * nj * nrr * 3 * sizeof *cp), *vp = malloc((size_t)ni * nj * nrr * 3 * sizeof *vp), *wp = malloc((size_t)ni * nj * nrr * sizeof *wp);
+    for (int a = 0; a < ni; a++) for (int b = 0; b < nj; b++) for (int k = 0; k < nrr; k++) {
+        const double ph = a * 2 * M_PI / ni, hj = (double)b * (j.Hf - 1) / fmax(1, nj - 1), r = rmin + (k + 0.5) * (rmax - rmin) / nrr;
+        double Pf[3], Pc[3];
+        frame(&mf, r, best.sp * ph, hb + best.sh * hj * W, Pf);
+        frame(&mc, r, ph + th, mc.hlo + (hj + best.uh) * W, Pc);
+        if (mvol_at(&mf, Pf) < 0 || mvol_at(&mc, Pc) < 0) continue;
+        for (int d = 0; d < 3; d++) { cp[3 * np + d] = Pf[d] / fv->um; vp[3 * np + d] = Pc[d] / cv->um; }
+        wp[np++] = 1;
     }
+    (void)dphi;
+    double M[3][4]; raff A = raff_ident();
+    if (np < 20 || reg_fit_affine(np, cp, vp, wp, 0, M)) { fprintf(stderr, "reg init: too few correspondences (%d)\n", np); free(cp); free(vp); free(wp); free(mc.v); free(mf.v); return -1; }
+    memcpy(A.m, M, sizeof M);
+    free(cp); free(vp); free(wp);
     *Aout = A;
     if (info) { info->ncc = best.ncc; info->rot_deg = th * 180 / M_PI; info->hflip = best.sh < 0; info->pflip = best.sp < 0; info->n = nl; for (int k = 0; k < nl; k++) info->orient_ncc[k] = list[k].ncc; }
     fprintf(stderr, "reg init: best orientation h %+d phi %+d, NCC %.4f, rotation %.2f deg; det %.6g (expected %+.6g)\n", best.sh, best.sp, best.ncc, th * 180 / M_PI, raff_det(&A), pow(fv->um / cv->um, 3));
     for (int k = 0; k < 6; k++) free(j.acc[k]);
-    free(col); free(mc.v); free(mf.v);
+    free(col); free(mc.v); free(mf.v); free(mc.cx); free(mc.cy); free(mf.cx); free(mf.cy);
     return 0;
 }
 

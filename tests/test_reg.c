@@ -150,6 +150,20 @@ int main(void) {
         CHECK(fe / k < 0.5 * ae / k, "the field should beat the affine (%.3f vs %.3f)", fe / k, ae / k);
         free(r); free(F.d);
     }
+    {   /* the two-level search (R > 3): a prior 3.4 / -2.2 / 1.6 voxels off */
+        raff Ab = Ap; Ab.m[0][3] += 3.4; Ab.m[1][3] -= 2.2; Ab.m[2][3] += 1.6;
+        rmap mb = {Ab, raff_inv(Ab), nullptr};
+        rmeas q = {.cv = cv, .fv = fv, .m = &mb, .lc = 0, .lf = 1, .B = 20, .R = 6, .ss = 1, .metric = REG_DOG, .iters = 5, .hp = 3, .lp = 0.7, .minfrac = 0.9};
+        int n = 0; double emax = 0;
+        for (double z = 28; z <= 52; z += 12) for (double y = 28; y <= 52; y += 12) for (double x = 28; x <= 52; x += 12) {
+            rbox b = {.c = {x, y, z}}; reg_measure(&q, &b);
+            double ft[3], ce[3]; true_c2f(b.c, ft); raff_apply(&Ab, ft, ce);
+            double e = 0; for (int a = 0; a < 3; a++) e += (b.s[a] - (ce[a] - b.c[a])) * (b.s[a] - (ce[a] - b.c[a]));
+            if (b.status == 0) { n++; emax = fmax(emax, sqrt(e)); }
+        }
+        printf("two-level search (R 6, prior ~4.4 voxels off): %d / 27 ok, max error %.3f\n", n, emax);
+        CHECK(n == 27 && emax < 0.1, "two-level search: %d ok, max error %.3f", n, emax);
+    }
     rvol_close(fv); rvol_close(cv);
     { const int k = test_init(); (void)k; }
     printf(fails ? "test_reg: %d FAILED\n" : "test_reg: all passed\n", fails);
