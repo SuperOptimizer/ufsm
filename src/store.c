@@ -172,6 +172,9 @@ static int64_t local_read(const store *s, const char *key, int64_t off, int64_t 
         if (r <= 0) break;
         got += r;
     }
+    static int nocache = -1;   /* UFSM_STORE_NOCACHE=1: drop the pages read (a bulk pass over local data, e.g. ufsm scanprep, must not evict the page cache of jobs beside it) */
+    if (nocache < 0) { const char *v = getenv("UFSM_STORE_NOCACHE"); nocache = v && *v == '1'; }
+    if (nocache && got > 0) posix_fadvise(fd, off, got, POSIX_FADV_DONTNEED);
     close(fd);
     return got == len ? got : -1;
 }
