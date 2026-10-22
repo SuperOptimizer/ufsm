@@ -174,7 +174,7 @@ static int zw_create(zw *w, const char *dir, const int64_t shape[3], int C, cons
     fprintf(f, "{\"zarr_format\":3,\"node_type\":\"array\",\"shape\":%s,\"data_type\":\"%s\",\"chunk_grid\":{\"name\":\"regular\",\"configuration\":{\"chunk_shape\":%s}},"
                "\"chunk_key_encoding\":{\"name\":\"default\",\"configuration\":{\"separator\":\"/\"}},\"fill_value\":0,"
                "\"codecs\":[{\"name\":\"sharding_indexed\",\"configuration\":{\"chunk_shape\":%s,\"codecs\":[{\"name\":\"bytes\",\"configuration\":{\"endian\":\"little\"}},"
-               "{\"name\":\"zstd\",\"configuration\":{\"level\":3,\"checksum\":false}}],\"index_codecs\":[{\"name\":\"bytes\",\"configuration\":{\"endian\":\"little\"}},"
+               "{\"name\":\"zstd\",\"configuration\":{\"level\":1,\"checksum\":false}}],\"index_codecs\":[{\"name\":\"bytes\",\"configuration\":{\"endian\":\"little\"}},"
                "{\"name\":\"crc32c\"}],\"index_location\":\"end\"}}],\"dimension_names\":%s,\"attributes\":%s}\n",
             shp, dtype, csh, ich, C ? "[\"z\",\"y\",\"x\",\"c\"]" : "[\"z\",\"y\",\"x\"]", attrs ? attrs : "{}");
     return fclose(f) ? -1 : 0;
@@ -221,7 +221,7 @@ static void *zw_worker(void *a) {
         J->zn[k] = 0; J->zb[k] = nullptr;
         if (!any) continue;
         J->zb[k] = malloc(w->zcap);
-        const size_t n = ZSTD_compress(J->zb[k], w->zcap, cb, w->chunk_bytes, 3);
+        const size_t n = ZSTD_compress(J->zb[k], w->zcap, cb, w->chunk_bytes, 1);   /* level 1: int8 embeddings barely compress further at 3 */
         J->zn[k] = ZSTD_isError(n) ? (size_t)-1 : n;
     }
     free(cb); return nullptr;
@@ -252,6 +252,45 @@ static int zw_put(zw *w, int64_t oz, int64_t oy, int64_t ox, int nz, int ny, int
     return rc;
 }
 static void zw_free(zw *w) { free(w->open); free(w->cbuf); free(w->zbuf); }
+/* background writer: puts (owning their buffer) and shard flushes run in submission order on one thread (each put compresses its chunks
+   on zw_nthreads workers), so finishing a column overlaps the next column's network; pending bytes are bounded */
+typedef struct aq_job { zw *w; int flush; int64_t oz, oy, ox; int nz, ny, nx; void *data; size_t bytes; struct aq_job *next; } aq_job;
+typedef struct { pthread_t th; pthread_mutex_t mu; pthread_cond_t cv; aq_job *head, *tail; size_t pending, cap; int stop, failed, running; } aqueue;
+static void *aq_main(void *a) {
+    aqueue *q = a;
+    for (;;) {
+        pthread_mutex_lock(&q->mu);
+        while (!q->head && !q->stop) pthread_cond_wait(&q->cv, &q->mu);
+        aq_job *j = q->head; if (!j) { pthread_mutex_unlock(&q->mu); break; }
+        q->head = j->next; if (!q->head) q->tail = nullptr; q->running = 1;
+        pthread_mutex_unlock(&q->mu);
+        const int rc = j->flush ? zw_flush(j->w) : zw_put(j->w, j->oz, j->oy, j->ox, j->nz, j->ny, j->nx, j->data);
+        free(j->data);
+        pthread_mutex_lock(&q->mu); q->pending -= j->bytes; q->failed |= rc != 0; q->running = 0; pthread_cond_broadcast(&q->cv); pthread_mutex_unlock(&q->mu);
+        free(j);
+    }
+    return nullptr;
+}
+static void aq_start(aqueue *q, size_t cap) { memset(q, 0, sizeof *q); pthread_mutex_init(&q->mu, nullptr); pthread_cond_init(&q->cv, nullptr); q->cap = cap; pthread_create(&q->th, nullptr, aq_main, q); }
+static void aq_push(aqueue *q, aq_job *j) {
+    pthread_mutex_lock(&q->mu);
+    while (q->pending && q->pending + j->bytes > q->cap) pthread_cond_wait(&q->cv, &q->mu);
+    q->pending += j->bytes; j->next = nullptr;
+    if (q->tail) q->tail->next = j; else q->head = j;
+    q->tail = j; pthread_cond_broadcast(&q->cv); pthread_mutex_unlock(&q->mu);
+}
+/* a put of nz x ny x nx cells whose bytes are copied from the device buffer now */
+static void aq_put_dev(aqueue *q, zw *w, int64_t oz, int64_t oy, int64_t ox, int nz, int ny, int nx, const void *dev, size_t bytes) {
+    aq_job *j = calloc(1, sizeof *j); j->w = w; j->oz = oz; j->oy = oy; j->ox = ox; j->nz = nz; j->ny = ny; j->nx = nx; j->bytes = bytes;
+    j->data = malloc(bytes); xd2h(j->data, dev, bytes);
+    aq_push(q, j);
+}
+static void aq_flush(aqueue *q, zw *w) { aq_job *j = calloc(1, sizeof *j); j->w = w; j->flush = 1; aq_push(q, j); }
+static int aq_finish(aqueue *q) {   /* drain and stop; nonzero if any write failed */
+    pthread_mutex_lock(&q->mu); q->stop = 1; pthread_cond_broadcast(&q->cv); pthread_mutex_unlock(&q->mu);
+    pthread_join(q->th, nullptr);
+    return q->failed;
+}
 
 /* ---- the embedding run ---- */
 enum { O_TOK, O_TOKU, O_DENSE, O_INK, O_N };
@@ -408,12 +447,13 @@ int cmd_dinovol_embed(int argc, char **argv) {
     void *left[2] = {need_tok ? xmalloc_dev((size_t)(nz_slab_max / ps) * syt * ryt * CAt * 2) : nullptr, need_den ? xmalloc_dev((size_t)(nz_slab_max / ds) * syd * ryd * CAd * 2) : nullptr};
     int has_left = 0;
     const size_t ob_max = (size_t)(nz_slab_max / ds < nz_slab_max / ps ? nz_slab_max / ps : nz_slab_max / ds) * (syd > syt ? syd : syt) * (syd > syt ? syd : syt) * (E > nd ? E : nd) * 2;
-    void *obuf_d = xmalloc_dev(ob_max), *osc_d = xmalloc_dev(ob_max / 2 + 64); uint8_t *obuf_h = malloc(ob_max), *osc_h = malloc(ob_max / 2 + 64);
+    void *obuf_d = xmalloc_dev(ob_max), *osc_d = xmalloc_dev(ob_max / 2 + 64);
     if (!colh[0] || !colh[1] || !cold || !mask_t || !cnt || !obuf_d || !osc_d || (need_tok && (!acc_t || !left[0])) || (need_den && (!acc_d || !mask_d || !coords || !left[1]))) {
         fprintf(stderr, "dinovol-embed: device memory allocation failed (lower --gpu-mem / --shard-cells / --band-cells)\n"); return 1; }
     fprintf(stderr, "dinovol-embed: box %lld,%lld,%lld +%lld,%lld,%lld: cells z %lld..%lld y %lld..%lld x %lld..%lld (stride %d, tile %d, margin %d, ramp %d), %d cells per shard edge "
                     "(z slab), x bands of %d cells, dense stride %d, device %.2f GB in use\n", bv[0], bv[1], bv[2], bv[3], bv[4], bv[5], (long long)c0[0], (long long)c1[0], (long long)c0[1],
             (long long)c1[1], (long long)c0[2], (long long)c1[2], stride, T, margin, ramp, K, Wx, ds, xnet_mem_used() / 1e9);
+    aqueue AQ; aq_start(&AQ, (size_t)(atof(opt(argc, argv, "--write-buffer-gb", "1.5")) * 1e9));
     const double t_start = dv_now(); double t_net = 0, t_head = 0, t_read = 0, t_fin = 0; long ntiles = 0, nskip = 0, ncells = 0, npoints = 0;
     int rc = 0;
     extern void dv_zero_dev(void *p, size_t bytes);
@@ -505,14 +545,14 @@ int cmd_dinovol_embed(int argc, char **argv) {
                 const int c0c = o == O_INK ? nd : 0, wch = isd ? -1 : E, unit = o != O_TOK, unit8 = unit && !dtype;
                 dv_finish(isd ? acc_d : acc_t, NS, NS, CA, 0, 0, nz, sy, sy, c0c, C, wch, unit, isd ? mask_d : mask_t, dtype, obuf_d, osc_d, unit8);
                 const size_t ob = (size_t)nz * sy * sy * C * (dtype ? 2 : 1);
-                xd2h(obuf_h, obuf_d, ob);
                 const int64_t oz = Z0 / s, oy = (int64_t)ky * stride / s, ox = (int64_t)kx * stride / s;
-                if (zw_put(&W[o], oz, oy, ox, nz, sy, sy, obuf_h)) { rc = 1; break; }
-                if (has_sc[o]) { xd2h(osc_h, osc_d, (size_t)nz * sy * sy * 2); if (zw_put(&Wsc[o], oz, oy, ox, nz, sy, sy, osc_h)) { rc = 1; break; } }
+                aq_put_dev(&AQ, &W[o], oz, oy, ox, nz, sy, sy, obuf_d, ob);
+                if (has_sc[o]) aq_put_dev(&AQ, &Wsc[o], oz, oy, ox, nz, sy, sy, osc_d, (size_t)nz * sy * sy * 2);
             }
             /* shard row done (last row of the shard in y, or of the box) at the band row's last column */
             if (kx == bx1 - 1 && (ky == c1[1] - 1 || (ky + 1) % K == 0))
-                for (int o = 0; o < O_N; o++) if (want[o]) { rc |= zw_flush(&W[o]); if (has_sc[o]) rc |= zw_flush(&Wsc[o]); }
+                for (int o = 0; o < O_N; o++) if (want[o]) { aq_flush(&AQ, &W[o]); if (has_sc[o]) aq_flush(&AQ, &Wsc[o]); }
+            if (AQ.failed) rc = 1;
             t_fin += dv_now() - tf;
             if (ci % 4 == 3 || ci == ncol - 1) {
                 const double el = dv_now() - t_start;
@@ -521,9 +561,10 @@ int cmd_dinovol_embed(int argc, char **argv) {
             }
         }
         if (R.busy) pthread_join(R.th, nullptr);
-        for (int o = 0; o < O_N; o++) if (want[o]) { rc |= zw_flush(&W[o]); if (has_sc[o]) rc |= zw_flush(&Wsc[o]); }
+        for (int o = 0; o < O_N; o++) if (want[o]) { aq_flush(&AQ, &W[o]); if (has_sc[o]) aq_flush(&AQ, &Wsc[o]); }
     }
     }
+    rc |= aq_finish(&AQ);
     const double el = dv_now() - t_start;
     fprintf(stderr, "\ndinovol-embed: %ld cells (%.1f Mvox) in %.1f s = %.2f Mvox/s; %ld tiles (%.0f ms each: net %.0f, head %.0f, finish %.0f), %ld dense points, %ld tiles skipped; peak device %.2f GB\n",
             ncells, ncells * (double)stride * stride * stride / 1e6, el, ncells * (double)stride * stride * stride / el / 1e6, ntiles, ntiles ? el / ntiles * 1e3 : 0,
