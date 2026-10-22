@@ -6,6 +6,22 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Own dense embedding net (dino-train) and the dinovol port (2026-10-21/22)
+- `ufsm dinovol-embed` runs the scrollprize dinovol ViT (HF scrollprize/dinovol_8um_ps192_102126) in C/CUDA with embed_volume.py's
+  lattice / blending / normalisation; `dinovol-read`, `dinovol-eval` (the sheet-identity check; `--codes` classifies misses by the winding
+  code raster: same wrap off-surface / adjacent wrap / farther / unlabelled). Parity: tests/test_dinovol.py (one tile vs the official
+  PyTorch model), tests/test_dinovol_embed.py (the whole tool vs the official RegionEmbedder).
+- `ufsm dino-train` (src/dino.c, kernels src/nn_dino.cu): our U-Net from scratch with D = 16 unit embedding channels at full resolution
+  (the MX head takes <= 16 outputs). Losses on sampled voxels only: GT sheet-identity SupCon over labelled voxels (winding codes,
+  positives round(dq) == 0 anywhere in the window, k +- 1 within --hard-r weighted --hard-w), keys = the student's points plus the EMA
+  teacher's at the same voxels of the other view; a variance hinge (--var) against the collapse SupCon falls into while features cannot yet
+  tell wraps apart (collapse is a stationary point: positives' mean = all keys' mean); optional DINO prototype cross-view term (--ssl) on
+  papyrus voxels with teacher centring / sharpening. Views: the same window with independent noise / gain / bias (ct_b: a second scan or
+  sub-voxel halves). `ufsm halves` builds 4x-pooled views from disjoint 2.4 um sub-voxel halves, but on Paris 4 the halves differ by
+  only ~0.3 grey levels rms (both our lossy volcomp level 0 and the raw S3 zarr are smooth at 2.4 um): no independent noise there.
+  `ufsm dino-embed` writes the dinovol-eval format; `dino-boxes` picks labelled (codes) or papyrus-rich (coarse CT) training boxes.
+  tests/test_dino_loss.c checks the loss gradients against double CPU references (D 16 and 32).
+
 ## Cleanup 2026-10-20: the dead Python tools removed
 
 Removed (in git history before this commit): every Python tool in `tools/` (the sheet / surface-store / finite-cover
