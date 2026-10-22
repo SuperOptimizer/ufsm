@@ -215,6 +215,7 @@ struct unet {
     int tbn; at_dims tbd; at_bp tbp[UNET_MAXTB]; convp tbm[UNET_MAXTB][4]; size_t peg_w, peg_b, reg_off;
     block tb; at_ws tbw; at_geom tbg;
     float *tb_cs, *tb_tok, *tb_wsb, *tb_g, *tb_gx, *tb_dt, *tb_dt2, *tb_zero;
+    const float *tb_xg;                      /* unet_set_token_grad: extra gradient at the stage output tokens */
 };
 
 static int G_of(const unet *u, int c) { return u->cfg.G < c ? u->cfg.G : c; }
@@ -2431,6 +2432,15 @@ static void gn_bwd_b(unet *u, const block *b, int k, const float *x, shape5 s, i
     nn_gn_apply(t2, ps, G, one, zero, u->l0s_st + 8 * u->l0s_nng, l0s_stat(u, (block *)b, k, 1), t2);   /* d/dx = rstd(slab) d/dx' */
     nn_slab_perm(gx, t2, s, S, 1);
 }
+const float *unet_tokens(const unet *u, int *nseq, int *S, int *C, int *nreg) {
+    if (!u->tbn || !u->built || !u->tb_tok) return nullptr;
+    if (nseq) { *nseq = u->tbg.nseq; }
+    if (S) { *S = u->tbg.S; }
+    if (C) { *C = u->tbd.C; }
+    if (nreg) { *nreg = u->cfg.attn_reg; }
+    return TB_TOK(u, u->tbn + 1);
+}
+void unet_set_token_grad(unet *u, const float *g) { u->tb_xg = g; }
 /* d/d (the level output silu(gn(tb.a2))) -> d/d (the bottleneck's raw output x), in the gradient storage (block_bwd's pre = 1 input) */
 static float *tb_bwd(unet *u, const float *gy) {
     const int C = u->tbd.C, nr = u->cfg.attn_reg, G = G_of(u, C);
@@ -2439,6 +2449,7 @@ static float *tb_bwd(unet *u, const float *gy) {
     PROF(3, gn_silu_bwd_b(u, b, 2, b->a2, ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, gy, u->tb_g, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));
     PROF(4, tb_to_f32(u->tb_g, ys, 1, u->tb_cs));
     at_cs_to_tok(u->tb_cs, u->tb_dt, u->tb_zero, ys.n, C, Sg, nr);
+    if (u->tb_xg) nn_axpy(u->tb_dt, 1.f, u->tb_xg, (size_t)ys.n * (Sg + nr) * C);   /* (unet_set_token_grad: e.g. a pooled CLS loss) */
     for (int k = u->tbn - 1; k >= 0; k--) {
         int r; PROF(1, r = at_block_bwd(&u->tbd, u->fw, g, &u->tbp[k], TB_TOK(u, k + 1), u->tb_dt, &u->tbg, &u->tbw));
         if (r) { fprintf(stderr, "unet: attention block backward failed\n"); abort(); }

@@ -240,6 +240,11 @@ int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp1
    gradient and unet_head_bwd_z per slab (first: the first slab). Takes effect at the next build; MX activations and 16-bit gradients
    (the fused head backward); -1 from the slab calls: not covered */
 void unet_set_head_ext(unet *u, int on);
+/* the attention stage's output tokens (cfg.attn_blocks > 0) after a forward: fp32 rows [nseq][S][C], S = attn_reg registers + the bottleneck
+   grid (z y x); nullptr without the stage. unet_set_token_grad: an extra d loss / d tokens (same layout, the backward's scaled domain:
+   multiply by nn_get_grad_scale() for 16-bit gradient storage) added at the stage output in the next backward (nullptr: none) */
+const float *unet_tokens(const unet *u, int *nseq, int *S, int *C, int *nreg);
+void unet_set_token_grad(unet *u, const float *g);
 void unet_set_wd_nonconv(unet *u, float mul);
 const float *unet_ds_logits(const unet *u, int j, shape5 *s);   /* deep supervision: fp32 logits of decoder level j (1..ds_levels) after a training forward */
 void unet_set_ds_grad(unet *u, int j, const float *gl);         /* their fp32 logit gradient for the next backward (nullptr: none) */   /* weight decay multiplier for GroupNorm / biases / head under Muon and ANVIL (default 0) */
