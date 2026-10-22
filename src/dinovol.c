@@ -742,6 +742,19 @@ static int surf_normal(const surf_t *S, double u, double v, double n[3]) {
 static uint64_t ev_rng(uint64_t *s) { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; return *s; }
 static double ev_unif(uint64_t *s) { return (ev_rng(s) >> 11) * (1.0 / 9007199254740992.0); }
 
+/* the winding code nearest to p (embedding voxels) within g_crad code voxels (L1 nearest), 0 if none (or a conflict) */
+static int g_crad = 1;
+static int code_near(const uint8_t *cb, const int64_t org[3], const int64_t n[3], double sc, const double p[3]) {
+    int64_t c[3]; for (int d = 0; d < 3; d++) c[d] = (int64_t)floor((p[d] + 0.5) * sc) - org[d];
+    int best = 0, bd = 99;
+    for (int a = -g_crad; a <= g_crad; a++) for (int b = -g_crad; b <= g_crad; b++) for (int e = -g_crad; e <= g_crad; e++) {
+        const int64_t z = c[0] + a, y = c[1] + b, x = c[2] + e;
+        if (z < 0 || y < 0 || x < 0 || z >= n[0] || y >= n[1] || x >= n[2]) continue;
+        const int v = cb[((size_t)z * n[1] + y) * n[2] + x], dd = abs(a) + abs(b) + abs(e);
+        if (v && v != 255 && dd < bd) { bd = dd; best = v; }
+    }
+    return best;
+}
 int cmd_dinovol_eval(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm dinovol-eval <emb-group> <surface.tifxyz>... [--output dense|ink|tokens_unit] [--surf-scale 0.25] [--n-ref 300] [--dirs 8]\n"
@@ -786,10 +799,25 @@ int cmd_dinovol_eval(int argc, char **argv) {
     cc.s = calloc(cc.n, sizeof *cc.s); for (int i = 0; i < cc.n; i++) cc.s[i].key = -1;
     /* results [dist][tol] and |t*| histogram */
     long tot[32] = {0}, hit[32][8] = {{0}}; double sum_abs[32] = {0}; long nskip_ref = 0;
+    /* --codes ROOT KEY: a winding code raster (1 + round(18 q) mod 252, 0 empty, 255 conflict; --codes-scale code voxels per embedding voxel, default 2)
+       classifies every miss: same wrap but off the surface, the adjacent wrap (+-1 turn), farther wraps, or no label at the best match */
+    g_crad = atoi(opt(argc, argv, "--codes-radius", "2"));   /* code voxels searched around a point (the labels are thin sheets) */
+    const char *cr = opt(argc, argv, "--codes", nullptr); const double csc = atof(opt(argc, argv, "--codes-scale", "2"));
+    uint8_t *cbuf = nullptr; int64_t corg[3] = {0, 0, 0}, cn[3] = {0, 0, 0};
+    long cls[32][6] = {{0}};   /* 0 hit (<= first tol), 1 same wrap off, 2 adjacent, 3 farther, 4 unlabelled at the match, 5 no code at the surface point */
+    if (cr) {
+        const char *ck = nullptr; for (int k = 3; k + 2 < argc; k++) if (!strcmp(argv[k], "--codes")) ck = argv[k + 2];
+        store *cs = store_open(cr); z3 *cz = cs && ck ? z3_open(cs, ck, nullptr) : nullptr;
+        if (!cz) { fprintf(stderr, "dinovol-eval: cannot open the codes %s %s\n", cr, ck ? ck : "(key missing)"); return 1; }
+        for (int d = 0; d < 3; d++) { corg[d] = (int64_t)floor(lo[d] * csc); cn[d] = (int64_t)ceil((hi[d] - lo[d]) * csc); }
+        cbuf = malloc((size_t)cn[0] * cn[1] * cn[2]);
+        if (!cbuf || z3_read(cz, corg, cn, cbuf, 8)) { fprintf(stderr, "dinovol-eval: codes read failed\n"); return 1; }
+        z3_close(cz); store_close(cs);
+    }
     float *e0 = malloc(C * 4), *ev = malloc(C * 4);
     int nsurf = 0;
     for (int ai = 3; ai < argc; ai++) {
-        if (argv[ai][0] == '-' && argv[ai][1] == '-') { ai++; continue; }
+        if (argv[ai][0] == '-' && argv[ai][1] == '-') { ai += strcmp(argv[ai], "--codes") ? 1 : 2; continue; }
         surf_t S = {.sc = sc}; int w2, h2, w3, h3;
         char q[1300];
         snprintf(q, sizeof q, "%s/x.tif", argv[ai]); S.x = read_tif_f32(q, &S.w, &S.h);
@@ -838,6 +866,16 @@ int cmd_dinovol_eval(int argc, char **argv) {
                             }
                             if (best > -2.f) {
                                 tot[di]++; sum_abs[di] += abs(bt);
+                                if (cbuf) {
+                                    const double sb[3] = {q3[0] + bt * nn[0], q3[1] + bt * nn[1], q3[2] + bt * nn[2]};
+                                    const int c0v = code_near(cbuf, corg, cn, csc, q3), c1v = code_near(cbuf, corg, cn, csc, sb);
+                                    int k;
+                                    if (abs(bt) <= tols[0]) k = 0;
+                                    else if (!c0v) k = 5;
+                                    else if (!c1v) k = 4;
+                                    else { int dq = ((c1v - c0v) % 252 + 252) % 252; if (dq >= 126) dq -= 252; const int turns = (int)lround(dq / 18.0); k = turns == 0 ? 1 : abs(turns) == 1 ? 2 : 3; }
+                                    cls[di][k]++;
+                                }
                                 for (int k = 0; k < nt; k++) hit[di][k] += abs(bt) <= tols[k];
                             }
                         }
@@ -860,6 +898,15 @@ int cmd_dinovol_eval(int argc, char **argv) {
         printf(" %.2f |\n", tot[di] ? sum_abs[di] / tot[di] : 0.0);
     }
     if (nskip_ref) printf("(%ld reference vertices without an embedding skipped)\n", nskip_ref);
+    if (cbuf) {
+        printf("\nmisses of the within-%d-vx check by the winding code at the best match (share of all samples):\n", tols[0]);
+        printf("| distance (vx) | hit | same wrap, off | adjacent wrap (+-1) | farther wraps | unlabelled at match | no code at surface |\n|---|---|---|---|---|---|---|\n");
+        for (int di = 0; di < nd; di++) {
+            long s = 0; for (int k = 0; k < 6; k++) s += cls[di][k];
+            printf("| %g |", dists[di]); for (int k = 0; k < 6; k++) printf(" %.1f%% |", s ? 100.0 * cls[di][k] / s : 0.0); printf("\n");
+        }
+        free(cbuf);
+    }
     for (int i = 0; i < cc.n; i++) free(cc.s[i].data);
     free(cc.s); free(e0); free(ev); emb_close(&e);
     return 0;
