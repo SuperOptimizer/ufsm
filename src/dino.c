@@ -95,7 +95,7 @@ int cmd_dino_halves(int argc, char **argv) {
 #include <unistd.h>
 #include <signal.h>
 
-enum { DN_D = 16, DN_MAXSRC = 64, DN_MAXBOX = 256, DN_SLOTS = 6 };
+enum { DN_MAXSRC = 64, DN_MAXBOX = 256, DN_SLOTS = 6 };
 typedef struct {
     char name[64]; z3 *ca, *cb, *codes; int halves;
     int64_t org[3];                              /* added to window corners (ct array coordinates) to address the codes (global grid) */
@@ -342,7 +342,7 @@ int cmd_dino_train(int argc, char **argv) {
                         "         [--ssl 0.3 (weight; 0 = GT contrastive only)] [--protos 1024] [--ts 0.1] [--tt 0.04] [--center-m 0.9]\n"
                         "         [--noise 0.15] [--gain-jit 0.15] [--mask-frac 0] [--mask-cube 16] [--seed 1] [--workers 4] [--threads 4]\n"
                         "         [--eval SURF-LIST --eval-root R --eval-key K --eval-box z,y,x,nz,ny,nx --eval-every 2000 --eval-codes ROOT KEY --eval-norm c,s]\n"
-                        "         [--log-every 20] [--save-every 2000] [--resume CKPT] [--mx 0 (bf16, no MX)] [--var 30] [--var-gamma 0.8 / sqrt(D)] [--gpu 0]\n"
+                        "         [--log-every 20] [--save-every 2000] [--resume CKPT] [--dim 32] [--mx 0 (bf16, no MX)] [--var 30] [--var-gamma 0.8 / sqrt(D)] [--gpu 0]\n"
                         "  Our dense embedding net from scratch (src/dino.h): the U-Net with D = 32 unit embedding channels; GT sheet-identity SupCon on\n"
                         "  labelled voxels (primary) + DINO prototype cross-view term on papyrus voxels (EMA teacher on the other view). STOP file in --out stops.\n");
         return 2;
@@ -356,7 +356,9 @@ int cmd_dino_train(int argc, char **argv) {
     const float cm = (float)atof(opt(argc, argv, "--center-m", "0.9")), noise = (float)atof(opt(argc, argv, "--noise", "0.15")), gj = (float)atof(opt(argc, argv, "--gain-jit", "0.15"));
     const float wgt = (float)atof(opt(argc, argv, "--gt", "1"));   /* the GT contrastive term's weight */
     const int use_teacher = atoi(opt(argc, argv, "--teacher", "1"));   /* 0: no EMA teacher forward (debug; GT term over the student points only) */
-    const float wvar = (float)atof(opt(argc, argv, "--var", "30")), vgam = (float)atof(opt(argc, argv, "--var-gamma", "0")) > 0 ? (float)atof(opt(argc, argv, "--var-gamma", "0")) : 0.8f / sqrtf((float)DN_D);
+    const int ED = atoi(opt(argc, argv, "--dim", "32"));   /* embedding channels (16 or 32) */
+    if (ED != 16 && ED != 32) { fprintf(stderr, "dino-train: --dim 16 or 32\n"); return 2; }
+    const float wvar = (float)atof(opt(argc, argv, "--var", "30")), vgam = (float)atof(opt(argc, argv, "--var-gamma", "0")) > 0 ? (float)atof(opt(argc, argv, "--var-gamma", "0")) : 0.8f / sqrtf((float)ED);
     const float mfrac = (float)atof(opt(argc, argv, "--mask-frac", "0")); const int mcube = atoi(opt(argc, argv, "--mask-cube", "16"));
     const int K = atoi(opt(argc, argv, "--protos", "1024")), log_every = atoi(opt(argc, argv, "--log-every", "20")), save_every = atoi(opt(argc, argv, "--save-every", "2000"));
     const int eval_every = atoi(opt(argc, argv, "--eval-every", "2000")), nthreads = atoi(opt(argc, argv, "--threads", "4")), nwork = atoi(opt(argc, argv, "--workers", "4"));
@@ -367,16 +369,16 @@ int cmd_dino_train(int argc, char **argv) {
     if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
     dn_precision_after_init(fp32);
     if (load_sources(srcf, Dd, nthreads)) return 1;
-    unet_cfg cfg = {0}; cfg.cin = 1; cfg.cout = DN_D; cfg.G = 8; cfg.down_norm = fp32 ? 0 : 1;
+    unet_cfg cfg = {0}; cfg.cin = 1; cfg.cout = ED; cfg.G = 8; cfg.down_norm = fp32 ? 0 : 1;
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,96,128,192")); for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "dino-train: P must be a multiple of %d\n", 1 << (cfg.nlev - 1)); return 2; }
     unet *u = unet_create(&cfg); unet_init(u, seed); unet_head_bias_zero(u);   /* (no shared -2 bias direction in the embeddings) */
-    if (!fp32 && DN_D <= 16 && atoi(opt(argc, argv, "--fp16-logits", "0"))) unet_set_fp16_logits(u, 1);   /* (the MX fp16-logit head takes <= 16 outputs) */
+    if (!fp32 && ED <= 16 && atoi(opt(argc, argv, "--fp16-logits", "0"))) unet_set_fp16_logits(u, 1);   /* (the MX fp16-logit head takes <= 16 outputs) */
     int step0 = 0;
     const char *resume = opt(argc, argv, "--resume", nullptr);
     if (resume) { step0 = unet_load(u, resume); if (step0 < 0) { fprintf(stderr, "dino-train: cannot resume %s\n", resume); return 1; } }
     /* prototypes */
-    const size_t kd = (size_t)K * DN_D;
+    const size_t kd = (size_t)K * ED;
     float *W = nn_malloc(kd * 4), *Wt = nn_malloc(kd * 4), *gW = nn_malloc(kd * 4), *Wm = nn_malloc(kd * 4), *Wv = nn_malloc(kd * 4), *cen = nn_malloc((size_t)K * 4), *tmean = nn_malloc((size_t)K * 4);
     {
         float *h = malloc(kd * 4); uint64_t rs = seed * 7919 + 3;
@@ -389,10 +391,10 @@ int cmd_dino_train(int argc, char **argv) {
     }
     /* device buffers */
     const size_t p3 = (size_t)P * P * P; const int NG = Dd->ngt + Dd->nair, NS = Dd->nssl;
-    uint8_t *cta = nn_malloc(p3), *ctb = nn_malloc(p3); float *x = nn_malloc(p3 * 4), *gl = nn_malloc(p3 * DN_D * 4);
+    uint8_t *cta = nn_malloc(p3), *ctb = nn_malloc(p3); float *x = nn_malloc(p3 * 4), *gl = nn_malloc(p3 * ED * 4);
     int *d_gidx = nn_malloc((size_t)NG * 4), *d_gcode = nn_malloc((size_t)NG * 4), *d_gxyz = nn_malloc((size_t)NG * 12), *d_sidx = nn_malloc((size_t)NS * 4);
-    float *es_g = nn_malloc((size_t)NG * DN_D * 4), *et_g = nn_malloc((size_t)NG * DN_D * 4), *ns_g = nn_malloc((size_t)NG * 4), *nt_g = nn_malloc((size_t)NG * 4), *ga_g = nn_malloc((size_t)NG * DN_D * 4);
-    float *es_s = nn_malloc((size_t)NS * DN_D * 4), *et_s = nn_malloc((size_t)NS * DN_D * 4), *ns_s = nn_malloc((size_t)NS * 4), *nt_s = nn_malloc((size_t)NS * 4), *ga_s = nn_malloc((size_t)NS * DN_D * 4);
+    float *es_g = nn_malloc((size_t)NG * ED * 4), *et_g = nn_malloc((size_t)NG * ED * 4), *ns_g = nn_malloc((size_t)NG * 4), *nt_g = nn_malloc((size_t)NG * 4), *ga_g = nn_malloc((size_t)NG * ED * 4);
+    float *es_s = nn_malloc((size_t)NS * ED * 4), *et_s = nn_malloc((size_t)NS * ED * 4), *ns_s = nn_malloc((size_t)NS * 4), *nt_s = nn_malloc((size_t)NS * 4), *ga_s = nn_malloc((size_t)NS * ED * 4);
     float *scr_sc = nn_malloc(((size_t)2 * NG + 16) * 4), *scr_dn = nn_malloc(dn_dino_scratch(NS, K)), *outs = nn_malloc(64 * 4);
     if (!gl || !x || !scr_dn) { fprintf(stderr, "dino-train: device allocation failed\n"); return 1; }
     /* data ring */
@@ -406,7 +408,7 @@ int cmd_dino_train(int argc, char **argv) {
     signal(SIGTERM, dn_sig); signal(SIGINT, dn_sig);
     char logp[1200]; snprintf(logp, sizeof logp, "%s/train.log", outd); FILE *lf = fopen(logp, "a");
     fprintf(stderr, "dino-train: P %d, widths", P); for (int l = 0; l < cfg.nlev; l++) fprintf(stderr, " %d", cfg.widths[l]);
-    fprintf(stderr, ", %zu params, D %d, GT %d + SSL %d points (weight %g), %d prototypes, %s\n", unet_nparams(u), DN_D, NG, NS, wssl, K, fp32 ? "bf16 (--mx 0)" : "fp4 / MX storage");
+    fprintf(stderr, ", %zu params, D %d, GT %d + SSL %d points (weight %g), %d prototypes, %s\n", unet_nparams(u), ED, NG, NS, wssl, K, fp32 ? "bf16 (--mx 0)" : "fp4 / MX storage");
     const shape5 xs = {1, 1, P, P, P};
     double t_last = dn_now(), sums[13] = {0}; int nsum = 0; uint64_t arng = seed * 1000003 + 17;
     const char *stopf_name = "STOP"; char stopf[1200]; snprintf(stopf, sizeof stopf, "%s/%s", outd, stopf_name);
@@ -429,30 +431,30 @@ int cmd_dino_train(int argc, char **argv) {
         dn_input(ctt, x, P, S->g, src->center, src->scale, ga2, gb2, sg2, (uint32_t)(step * 2 + 1), 0, 0.f, 0, 0.f);
         unet_use_ema(u, 1);
         lg = unet_forward(u, x, xs, 0); h16 = unet_logits_h16(u);
-        if (ngt) dn_gather(lg, h16, p3, DN_D, d_gidx, ngt, et_g, nt_g);
-        if (nssl) dn_gather(lg, h16, p3, DN_D, d_sidx, nssl, et_s, nt_s);
+        if (ngt) dn_gather(lg, h16, p3, ED, d_gidx, ngt, et_g, nt_g);
+        if (nssl) dn_gather(lg, h16, p3, ED, d_sidx, nssl, et_s, nt_s);
         unet_use_ema(u, 0);
         }
         /* student */
         dn_input(cs, x, P, S->g, src->center, src->scale, ga1, gb1, sg1, (uint32_t)(step * 2), mcube, mfrac, (uint32_t)step, 0.f);
         lg = unet_forward(u, x, xs, 1); h16 = unet_logits_h16(u);
-        if (ngt) dn_gather(lg, h16, p3, DN_D, d_gidx, ngt, es_g, ns_g);
-        if (nssl) dn_gather(lg, h16, p3, DN_D, d_sidx, nssl, es_s, ns_s);
-        nn_zero(gl, p3 * DN_D * 4);
+        if (ngt) dn_gather(lg, h16, p3, ED, d_gidx, ngt, es_g, ns_g);
+        if (nssl) dn_gather(lg, h16, p3, ED, d_sidx, nssl, es_s, ns_s);
+        nn_zero(gl, p3 * ED * 4);
         nn_zero(outs, 64 * 4);
         if (ngt) {
-            dn_supcon(es_g, d_gcode, d_gxyz, ngt, et_g, d_gcode, d_gxyz, use_teacher ? ngt : 0, DN_D, tau, hw, hr, ga_g, outs, scr_sc);
-            if (wgt != 1.f) dn_axpby(ga_g, ga_g, (size_t)ngt * DN_D, wgt, 0.f);
-            if (wvar > 0) dn_varreg(es_g, ngt, DN_D, vgam, wvar, ga_g, outs + 12);   /* anti-collapse: per-dimension spread */
-            dn_scatter_grad(es_g, ga_g, ns_g, d_gidx, ngt, DN_D, p3, 1.f, gl);
-            dn_emb_std(es_g, ngt, DN_D, outs + 8);
+            dn_supcon(es_g, d_gcode, d_gxyz, ngt, et_g, d_gcode, d_gxyz, use_teacher ? ngt : 0, ED, tau, hw, hr, ga_g, outs, scr_sc);
+            if (wgt != 1.f) dn_axpby(ga_g, ga_g, (size_t)ngt * ED, wgt, 0.f);
+            if (wvar > 0) dn_varreg(es_g, ngt, ED, vgam, wvar, ga_g, outs + 12);   /* anti-collapse: per-dimension spread */
+            dn_scatter_grad(es_g, ga_g, ns_g, d_gidx, ngt, ED, p3, 1.f, gl);
+            dn_emb_std(es_g, ngt, ED, outs + 8);
         }
         if (nssl && wssl > 0 && use_teacher) {
-            dn_dino(es_s, et_s, nssl, W, Wt, cen, K, DN_D, ts, tt, ga_s, gW, tmean, outs + 4, scr_dn);
-            dn_scatter_grad(es_s, ga_s, ns_s, d_sidx, nssl, DN_D, p3, wssl, gl);
+            dn_dino(es_s, et_s, nssl, W, Wt, cen, K, ED, ts, tt, ga_s, gW, tmean, outs + 4, scr_dn);
+            dn_scatter_grad(es_s, ga_s, ns_s, d_sidx, nssl, ED, p3, wssl, gl);
             dn_axpby(gW, gW, kd, 0.f, wssl);
         }
-        if (nssl) dn_emb_std(es_s, nssl, DN_D, outs + 9);
+        if (nssl) dn_emb_std(es_s, nssl, ED, outs + 9);
         unet_zero_grad(u);
         unet_backward(u, gl);
         const double gn = unet_grad_norm(u);
@@ -483,7 +485,7 @@ int cmd_dino_train(int argc, char **argv) {
         }
         if (step % save_every == 0 || step == steps || g_dn_stop) {
             char cp[1200], ex[256]; snprintf(cp, sizeof cp, "%s/step%06d.ckpt", outd, step);
-            snprintf(ex, sizeof ex, "\"task\":\"dino\",\"embed_dim\":%d,\"protos\":%d", DN_D, K);
+            snprintf(ex, sizeof ex, "\"task\":\"dino\",\"embed_dim\":%d,\"protos\":%d", ED, K);
             if (unet_save(u, cp, step, ex)) fprintf(stderr, "dino-train: cannot save %s\n", cp);
             char pp[1300]; snprintf(pp, sizeof pp, "%s.protos", cp); float *h = malloc(kd * 4); nn_d2h(h, W, kd * 4);
             FILE *pf = fopen(pp, "wb"); if (pf) { fwrite(h, 4, kd, pf); fclose(pf); } free(h);
@@ -501,7 +503,7 @@ int cmd_dino_train(int argc, char **argv) {
                     const int64_t box[6] = {eb[0], eb[1], eb[2], eb[3], eb[4], eb[5]};
                     int8_t *emb = dn_embed_box(u, ez, box, P, 32, ec, es, nthreads, 1);
                     char gdir[1200]; snprintf(gdir, sizeof gdir, "%s/eval-emb", outd);
-                    if (emb && !dv_write_dense_box(gdir, z3_meta_of(ez)->shape, box, DN_D, emb)) {
+                    if (emb && !dv_write_dense_box(gdir, z3_meta_of(ez)->shape, box, ED, emb)) {
                         const double te2 = dn_now();
                         /* dinovol-eval argv: group, surfaces from the list file, options */
                         char *av[96]; int ac = 0; av[ac++] = "ufsm"; av[ac++] = "dinovol-eval"; av[ac++] = gdir;

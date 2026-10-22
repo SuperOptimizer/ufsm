@@ -186,6 +186,9 @@ test-all: $(B)/test_ink_splat
 $(B)/test_imgops: tests/test_imgops.c tests/test_imgops_expected.h $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_imgops.c $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o -o $@ $(LDLIBS)
 test-all: $(B)/test_imgops
+$(B)/test_head32: tests/test_head32.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+test-all: $(B)/test_head32
 $(B)/test_dino_loss: tests/test_dino_loss.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dino_loss.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_dino_loss
@@ -373,6 +376,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_tfx
 	./$(B)/test_dino_loss
 	UFSM_TEST_D=16 ./$(B)/test_dino_loss
+	./$(B)/test_head32
 	./$(B)/test_ink_splat
 	./$(B)/test_pyports
 	./$(B)/test_edt

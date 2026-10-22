@@ -87,6 +87,11 @@ extern "C" void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const flo
 }
 /* voxels [vb, vb + nv) of x (nv 0: all) into fp16 planes of nv voxels: the trainer's head slabs (train.c head_slab) */
 extern "C" void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, size_t vb, size_t nv) {
+    if (cout > 16 && cout % 16 == 0 && xs.n == 1) {   /* more outputs: passes of 16 (channel planes of one sample are contiguous) */
+        const size_t Sy = nv ? nv : shape_spatial(xs);
+        for (int c0 = 0; c0 < cout; c0 += 16) lp_conv1_fwd_mx_h16_r(x, xdt, xs, w + (size_t)c0 * xs.c, b ? b + c0 : nullptr, 16, (__half *)y + (size_t)c0 * Sy, gp, vb, nv);
+        return;
+    }
     if (cout > 16 || conv1_smem(xs, cout) > 32 * 1024) { fprintf(stderr, "lp_conv1_fwd_mx_h16: cout %d / %d inputs unsupported\n", cout, xs.c); abort(); }
     if (slab_small(gp)) { fprintf(stderr, "lp_conv1_fwd_mx_h16: slab GroupNorm with %d voxels per slab (< 256)\n", gp.zs * gp.zhw); abort(); }
     __half *yh = (__half *)y;
@@ -100,6 +105,11 @@ extern "C" void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const f
     LPCK();
 }
 extern "C" void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp) {
+    if (cout > 16 && cout % 16 == 0 && xs.n == 1) {   /* more outputs: passes of 16 */
+        const size_t S = shape_spatial(xs);
+        for (int c0 = 0; c0 < cout; c0 += 16) lp_conv1_fwd_mx(x, xdt, xs, w + (size_t)c0 * xs.c, b ? b + c0 : nullptr, 16, y + (size_t)c0 * S, gp);
+        return;
+    }
     if (cout > 16) { fprintf(stderr, "lp_conv1_fwd_mx: cout %d > 16\n", cout); abort(); }
     size_t S = shape_spatial(xs);
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
@@ -397,7 +407,7 @@ extern "C" int lp_head_bwd_mx_r(const void *x, int xdt, shape5 xs, const void *g
 /* returns 1 when the bias gradient (gb) was accumulated as well (tensor-core head path), else 0 (the caller adds it) */
 extern "C" int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp) {
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
-    if (!old && (xs.c == 16 || xs.c % 32 == 0) && ys.c <= 16 && gydt == 2 && (!gp.G || xs.c % gp.G == 0)) {   /* > 32 inputs: one pass per 32-channel block */
+    if (!old && (xs.c == 16 || xs.c % 32 == 0) && (ys.c <= 16 || ys.c % 8 == 0) && gydt == 2 && (!gp.G || xs.c % gp.G == 0)) {   /* > 32 inputs: one pass per 32-channel block; > 16 outputs: passes of 8 */
         const size_t S = shape_spatial(xs);
         const int nper = slab_nper(gp, 8192);
         const dim3 grid((unsigned)((S + nper - 1) / nper), xs.n);
