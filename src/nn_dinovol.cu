@@ -436,3 +436,9 @@ __global__ void k_h2f(float *__restrict__ x, const __half *__restrict__ u, long 
     for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) x[i] = __half2float(u[i]);
 }
 extern "C" void dv_half_to_float(float *x, const void *u, long long n) { k_h2f<<<nb_of(n, 256), 256, 0, ST>>>(x, (const __half *)u, n); }
+extern "C" void dv_zero_dev(void *p, size_t bytes) { cudaMemsetAsync(p, 0, bytes, ST); }
+/* dst[z][y][x] = src[z][y][x] for y < ny, x < nx (src rows of snx, planes of sny x snx) */
+extern "C" void dv_mask_crop(const uint8_t *src, int sny, int snx, uint8_t *dst, int nz, int ny, int nx) {
+    cudaMemcpy2DAsync(dst, (size_t)nx, src, (size_t)snx, (size_t)nx, (size_t)ny, cudaMemcpyDeviceToDevice, ST);   /* plane 0 */
+    for (int z = 1; z < nz; z++) cudaMemcpy2DAsync(dst + (size_t)z * ny * nx, (size_t)nx, src + (size_t)z * sny * snx, (size_t)snx, (size_t)nx, (size_t)ny, cudaMemcpyDeviceToDevice, ST);
+}

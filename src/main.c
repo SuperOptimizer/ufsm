@@ -60,6 +60,7 @@ int cmd_ink_ensemble(int argc, char **argv);
 int cmd_wl_dump(int argc, char **argv);
 int cmd_dinovol_embed(int argc, char **argv);   /* src/dinovol.c */
 int cmd_dinovol_eval(int argc, char **argv);
+int cmd_dinovol_read(int argc, char **argv);
 int cmd_tifxyz_map(int argc, char **argv);
 int cmd_tifxyz_orient(int argc, char **argv);
 int cmd_tifxyz_bbox(int argc, char **argv);
@@ -3280,6 +3281,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "wl-dump")) return cmd_wl_dump(argc, argv);
     if (!strcmp(cmd, "dinovol-embed")) return cmd_dinovol_embed(argc, argv);
     if (!strcmp(cmd, "dinovol-eval")) return cmd_dinovol_eval(argc, argv);
+    if (!strcmp(cmd, "dinovol-read")) return cmd_dinovol_read(argc, argv);
     if (!strcmp(cmd, "tifxyz-map")) return cmd_tifxyz_map(argc, argv);
     if (!strcmp(cmd, "tifxyz-orient")) return cmd_tifxyz_orient(argc, argv);
     if (!strcmp(cmd, "tifxyz-bbox")) return cmd_tifxyz_bbox(argc, argv);
