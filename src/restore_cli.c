@@ -90,7 +90,7 @@ int restore_predict(int argc, char **argv) {
     const int nlev = atoi(opt(argc, argv, "--levels", "1")), nthreads = atoi(opt(argc, argv, "--threads", "16")), use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
     if (!(um > 0) || S < 128 || S % 128 || H < 0 || nlev < 1 || nlev > 10 || !(q >= 0)) {
         fprintf(stderr, "usage: ufsm predict <restore ckpt> <root> <ct-group> <out-dir> --um U (the CT's level-0 voxel) [--level L] [--out-um %g] [--box z,y,x,nz,ny,nx (output voxels)]\n"
-                        "       [--shard 512] [--halo 32] [--q 2] [--levels 1] [--ema 1] [--gpu 0] [--cache DIR]\n"
+                        "       [--shard 512] [--halo 32] [--q 2] [--levels 1] [--ema 1] [--gpu 0] [--cache DIR] [--shards FILE (\"sz sy sx\" lines: only these)]\n"
                         "  restores level L of the CT onto the --out-um grid (trilinear input, residual net), uint8 CT in 512^3 shards\n", fine_um);
         return 2;
     }
@@ -123,9 +123,18 @@ int restore_predict(int argc, char **argv) {
     uint8_t *dc = nn_malloc(c3), *dlow = nn_malloc(w3), *dout = nn_malloc(w3); void *dx = nn_malloc(w3 * 2 * cfg.cin);
     if (!hc || !hr || !ho || !shard || !dc || !dlow || !dout || !dx) { fprintf(stderr, "restore: out of memory\n"); return 1; }
     int64_t ns[3]; for (int d = 0; d < 3; d++) ns[d] = (bn[d] + S - 1) / S;
+    /* --shards FILE: only the listed output shards ("sz sy sx" lines, e.g. ufsm reg render "touch"); the rest stay empty */
+    uint8_t *want = nullptr; const char *shf = opt(argc, argv, "--shards", nullptr);
+    if (shf) {
+        FILE *f = fopen(shf, "r"); if (!f) { fprintf(stderr, "restore: cannot read %s\n", shf); return 1; }
+        want = calloc((size_t)ns[0] * ns[1] * ns[2], 1); long long a, b, c; long nw = 0;
+        while (fscanf(f, "%lld %lld %lld", &a, &b, &c) == 3) if (a >= 0 && b >= 0 && c >= 0 && a < ns[0] && b < ns[1] && c < ns[2]) { want[((size_t)a * ns[1] + b) * ns[2] + c] = 1; nw++; }
+        fclose(f); fprintf(stderr, "restore: %ld listed shards\n", nw);
+    }
     const double t0 = now(); long done = 0, air = 0, tot = ns[0] * ns[1] * ns[2];
     for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
         const int64_t sh[3] = {sz, sy, sx};
+        if (want && !want[((size_t)sz * ns[1] + sy) * ns[2] + sx]) { air++; done++; continue; }
         int64_t c0[3], ws[3]; float ph[3];
         for (int d = 0; d < 3; d++) { ws[d] = bo[d] + sh[d] * S - H; c0[d] = (int64_t)floor((ws[d] + 0.5) / step - 0.5) - 1; ph[d] = (float)(ws[d] / (double)step - (double)c0[d]); }
         /* the coarse window, zero outside the volume */

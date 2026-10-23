@@ -186,9 +186,9 @@ static float tri(cmemo *m, double x, double y, double z) {
 }
 
 /* ---------- config ---------- */
-enum { MAXS = 8, MAXCH = 4 };
+enum { MAXS = 8, MAXCH = 4, TOUCH_M = 64 };
 typedef struct { rmap m; rfield D; int f2c; rcover cov; } rstep;
-typedef struct { char name[64]; rvol *v; int nch; rstep st[MAXCH]; int ln, lm, lsn; ccache cn, cm, cs; double scale, org[3]; } rscan;   /* scale, org: see map_point */
+typedef struct { char name[64]; rvol *v; int nch; rstep st[MAXCH]; int ln, lm, lsn; ccache cn, cm, cs; double scale, org[3]; _Atomic uint8_t *touch; int64_t tn[3]; } rscan;   /* scale, org: see map_point */
 /* base L0 -> scan L0 through the chain. Returns 1, or 2 when every step's pair also certifies the point (cover: a good fit box near,
    no failing evaluation box near). Images use every mapped point with data; only reg inkstat restricts to certified points. */
 static int map_point(const rscan *s, const double p[3], double q[3]) {
@@ -202,6 +202,12 @@ static int map_point(const rscan *s, const double p[3], double q[3]) {
     /* "scale" k / "origin" [z, y, x]: a volume on a k-times finer grid of the chain's last frame, cropped at origin (e.g. a super-resolved
        box of the native scan, ufsm predict --box): voxel = (q + 0.5) k - 0.5 - origin */
     for (int d = 0; d < 3; d++) q[d] = s->scale != 1 || s->org[2 - d] ? (a[d] + 0.5) * s->scale - 0.5 - s->org[2 - d] : a[d];
+    if (s->touch)   /* "touch": the 512^3 shards of this scan's grid within TOUCH_M voxels of a mapped point */
+        for (int k = 0; k < 8; k++) {
+            int64_t c[3]; int ok = 1;
+            for (int d = 0; d < 3; d++) { c[2 - d] = (int64_t)floor((q[d] + ((k >> d & 1) ? TOUCH_M : -TOUCH_M)) / 512); ok &= c[2 - d] >= 0 && c[2 - d] < s->tn[2 - d]; }
+            if (ok) atomic_store_explicit(&s->touch[(c[0] * s->tn[1] + c[1]) * s->tn[2] + c[2]], 1, memory_order_relaxed);
+        }
     return 1 + cert;
 }
 
@@ -414,6 +420,10 @@ int cmd_reg_render(int argc, char **argv) {
         sc->scale = json_num(json_get(e, "scale"), 1);
         for (int d = 0; d < 3; d++) sc->org[d] = json_num(json_at(json_get(e, "origin"), (size_t)d), 0);
         if (!(sc->scale > 0)) { fprintf(stderr, "reg render: %s: scale > 0\n", sc->name); return 1; }
+        if (json_str(json_get(e, "touch"), nullptr)) {   /* record the 512^3 shards of the scale-times grid that the render reaches (ufsm predict --shards) */
+            size_t nt = 1; for (int d = 0; d < 3; d++) { sc->tn[d] = (int64_t)ceil(sc->v->shape[0][d] * sc->scale / 512); nt *= (size_t)sc->tn[d]; }
+            sc->touch = calloc(nt, 1);
+        }
         if (!sc->nch) base_um = sc->v->um;
         sc->ln = 0; sc->lm = rvol_level_for(sc->v, j->match_um);
         j->ns++;
@@ -494,6 +504,14 @@ int cmd_reg_render(int argc, char **argv) {
         fwrite(hdr, 1, hl, sf); fwrite(sv, rec, nsm, sf); fclose(sf);
         fprintf(stderr, "reg render: %zu depth samples (%d layers) -> %s\n", nsm, nl, sp2);
         free(sv); free(sx);
+    }
+    for (int s2 = 0; s2 < j->ns; s2++) if (j->sc[s2].touch) {   /* touched shards: "sz sy sx" lines */
+        const rscan *sc = &j->sc[s2]; const json *e = json_at(json_get(cfg, "scans"), (size_t)s2);
+        FILE *tf = fopen(json_str(json_get(e, "touch"), ""), "w"); size_t nt = 0;
+        for (int64_t a = 0; a < sc->tn[0]; a++) for (int64_t b = 0; b < sc->tn[1]; b++) for (int64_t c = 0; c < sc->tn[2]; c++)
+            if (sc->touch[(a * sc->tn[1] + b) * sc->tn[2] + c]) { if (tf) fprintf(tf, "%lld %lld %lld\n", (long long)a, (long long)b, (long long)c); nt++; }
+        if (tf) fclose(tf);
+        fprintf(stderr, "reg render: %s: %zu 512^3 shards touched -> %s\n", sc->name, nt, json_str(json_get(e, "touch"), ""));
     }
     /* normalisation, products */
     char p[2300]; FILE *st; snprintf(p, sizeof p, "%s/stats.json", od); st = fopen(p, "w");
