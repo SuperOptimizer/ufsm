@@ -29,6 +29,7 @@ static int fail(const char *fmt, ...) {
 /* Defaults are enabled; either path can be disabled for comparisons. */
 static int option_on(const char *name) { const char *v = getenv(name); return !v || (*v && strcmp(v, "0")); }
 
+typedef struct { uint64_t off, len; } ientry_t;
 struct z3 {
     store *s;
     char *key;
@@ -37,6 +38,10 @@ struct z3 {
     int nc;        /* inner chunks per shard */
     int cgrid[3];  /* inner chunk grid within a shard */
     uint64_t id;   /* process-unique: keys the decoded-mask cache */
+    /* shard indices in memory (key -> nc entries, or absent): an HTTP shard index is fetched once per process */
+    pthread_mutex_t imu;
+    struct ient_slot { char *key; ientry_t *idx; int present; } *itab;
+    size_t icap, icount;
 };
 
 /* ---------- metadata ---------- */
@@ -94,6 +99,7 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
     z->key = strdup(key);
     { static atomic_uint_fast64_t next_id = 1; z->id = atomic_fetch_add(&next_id, 1); }
     z->cache = cache_dir && !store_is_local(s) ? strdup(cache_dir) : nullptr;
+    pthread_mutex_init(&z->imu, nullptr);
     z3_meta *m = &z->m;
     m->sep = '/';
     const json *shape = json_get(j, "shape");
@@ -146,6 +152,9 @@ void z3_close(z3 *z) {
     if (!z) return;
     free(z->key);
     free(z->cache);
+    for (size_t i = 0; i < z->icap; i++) { free(z->itab[i].key); free(z->itab[i].idx); }
+    free(z->itab);
+    pthread_mutex_destroy(&z->imu);
     free(z);
 }
 
@@ -239,7 +248,7 @@ static void cache_put(const z3 *z, const char *skey, const char *item, const uin
 
 /* ---------- shard index ---------- */
 
-typedef struct { uint64_t off, len; } ientry;
+typedef ientry_t ientry;
 
 static uint32_t index_crc_table[256];
 static pthread_once_t index_crc_once = PTHREAD_ONCE_INIT;
@@ -257,26 +266,74 @@ static uint32_t index_crc(const uint8_t *b, size_t n) {
     return ~crc;
 }
 
+/* in-memory index table (open addressing on the shard key; UFSM_Z3_INDEX_MEM=0 disables it) */
+static size_t key_hash(const char *k) { size_t h = 1469598103934665603ull; for (; *k; k++) h = (h ^ (uint8_t)*k) * 1099511628211ull; return h; }
+static int imem_on(void) { static int on = -1; if (on < 0) on = option_on("UFSM_Z3_INDEX_MEM"); return on; }
+static int imem_get(z3 *z, const char *skey, ientry *idx) {   /* -1 not cached, else present (0/1) with idx filled */
+    if (!imem_on()) return -1;
+    int r = -1;
+    pthread_mutex_lock(&z->imu);
+    if (z->icap)
+        for (size_t i = key_hash(skey) & (z->icap - 1); z->itab[i].key; i = (i + 1) & (z->icap - 1))
+            if (!strcmp(z->itab[i].key, skey)) { r = z->itab[i].present; if (r) memcpy(idx, z->itab[i].idx, (size_t)z->nc * sizeof *idx); break; }
+    pthread_mutex_unlock(&z->imu);
+    return r;
+}
+static int imem_known(z3 *z, const char *skey) {
+    if (!imem_on()) return 0;
+    int r = 0;
+    pthread_mutex_lock(&z->imu);
+    if (z->icap)
+        for (size_t i = key_hash(skey) & (z->icap - 1); z->itab[i].key; i = (i + 1) & (z->icap - 1))
+            if (!strcmp(z->itab[i].key, skey)) { r = 1; break; }
+    pthread_mutex_unlock(&z->imu);
+    return r;
+}
+static void imem_put(z3 *z, const char *skey, const ientry *idx, int present) {
+    if (!imem_on()) return;
+    pthread_mutex_lock(&z->imu);
+    if ((z->icount + 1) * 2 > z->icap) {   /* grow (bounded: 1M shards) */
+        size_t nc = z->icap ? z->icap * 2 : 256;
+        struct ient_slot *t = nc <= (1u << 21) ? calloc(nc, sizeof *t) : nullptr;
+        if (!t) { pthread_mutex_unlock(&z->imu); return; }
+        for (size_t i = 0; i < z->icap; i++) if (z->itab[i].key) {
+            size_t j = key_hash(z->itab[i].key) & (nc - 1);
+            while (t[j].key) j = (j + 1) & (nc - 1);
+            t[j] = z->itab[i];
+        }
+        free(z->itab); z->itab = t; z->icap = nc;
+    }
+    size_t i = key_hash(skey) & (z->icap - 1);
+    while (z->itab[i].key && strcmp(z->itab[i].key, skey)) i = (i + 1) & (z->icap - 1);
+    if (!z->itab[i].key) {
+        ientry *c = present ? malloc((size_t)z->nc * sizeof *c) : nullptr;
+        char *k = strdup(skey);
+        if (k && (!present || c)) {
+            if (c) memcpy(c, idx, (size_t)z->nc * sizeof *c);
+            z->itab[i] = (struct ient_slot){k, c, present}; z->icount++;
+        } else { free(k); free(c); }
+    }
+    pthread_mutex_unlock(&z->imu);
+}
+
 /* Returns 1 with index filled, 0 if the shard is missing, -1 on error. */
-static int load_index(const z3 *z, const char *skey, ientry *idx) {
+static int load_index(z3 *z, const char *skey, ientry *idx) {
+    const int mem = imem_get(z, skey, idx);
+    if (mem >= 0) return mem;
     size_t ilen = (size_t)z->nc * 16 + 4, n = 0;
     int fetched = 0;
     uint64_t payload_size = UINT64_MAX;
     uint8_t *b = cache_get(z, skey, "idx", &n);
     if (!b) {
         uint8_t *missing = cache_get(z, skey, "missing", &n);
-        if (missing) { free(missing); return 0; }
-        int64_t size = store_size(z->s, skey);
-        if (size == -2) { cache_put(z, skey, "missing", (const uint8_t *)"", 0); return 0; }
-        if (size < 0) return FAIL("size of %s (HTTP %ld)", skey, store_last_status());
-        if ((uint64_t)size < ilen) return FAIL("%s: shorter than its index", skey);
-        payload_size = (uint64_t)size - ilen;
+        if (missing) { free(missing); imem_put(z, skey, nullptr, 0); return 0; }
         b = malloc(ilen);
         if (!b) return FAIL("index allocation for %s", skey);
-        if (store_read(z->s, skey, (int64_t)payload_size, (int64_t)ilen, b) != (int64_t)ilen) {
-            free(b);
-            return FAIL("read index of %s", skey);
-        }
+        int64_t size = -1, got = store_read_tail(z->s, skey, (int64_t)ilen, b, &size);   /* one suffix-range GET */
+        if (got == -2) { free(b); cache_put(z, skey, "missing", (const uint8_t *)"", 0); imem_put(z, skey, nullptr, 0); return 0; }
+        if (size >= 0 && (uint64_t)size < ilen) { free(b); return FAIL("%s: shorter than its index", skey); }
+        if (got != (int64_t)ilen) { free(b); return FAIL("read index of %s (HTTP %ld)", skey, store_last_status()); }
+        payload_size = (uint64_t)size - ilen;
         n = ilen; fetched = 1;
     }
     if (n != ilen) { free(b); return FAIL("%s: bad index size", skey); }
@@ -295,6 +352,7 @@ static int load_index(const z3 *z, const char *skey, ientry *idx) {
     }
     if (fetched) cache_put(z, skey, "idx", b, n);
     free(b);
+    imem_put(z, skey, idx, 1);
     return 1;
 }
 
@@ -320,6 +378,11 @@ typedef struct {
     atomic_int next;
     atomic_int failed;
     char error[256];
+    /* batch mode: tasks become ready as the main thread's multi fetch completes them; fetched[task] = bytes of the range */
+    int batch;
+    uint8_t **fetched;
+    int *ready, rq_head, rq_tail, rq_closed;
+    pthread_mutex_t rq_mu; pthread_cond_t rq_cv;
 } job;
 
 static void job_failed(job *jb) {
@@ -456,7 +519,7 @@ static int prefetch_indices(z3 *z, const int64_t *s0, const int64_t *s1, int nth
     if (!j.cold) return FAIL("index work allocation");
     for (int i = 0; i < count; i++) {
         char key[1200]; index_key(&j, i, key, sizeof key);
-        if (!cache_has(z, key, "idx") && !cache_has(z, key, "missing")) j.cold[j.total++] = i;
+        if (!imem_known(z, key) && !cache_has(z, key, "idx") && !cache_has(z, key, "missing")) j.cold[j.total++] = i;
     }
     if (!j.total) { free(j.cold); return 0; }
     int nt = nthreads > 0 ? nthreads : 16;
@@ -538,6 +601,15 @@ static int mc_copy(const job *jb, const work *w) {
     pthread_mutex_unlock(&c->mu);
     return 1;
 }
+static int mc_has(const z3 *z, const work *w) {
+    const size_t h = mc_hash(z->id, w);
+    mc_shard *c = mc_of(h);
+    pthread_mutex_lock(&c->mu);
+    mc_entry *e = c->b[h / MC_SH];
+    while (e && !(e->z == z->id && e->s[0] == w->sz && e->s[1] == w->sy && e->s[2] == w->sx && e->ci == w->ci)) e = e->next;
+    pthread_mutex_unlock(&c->mu);
+    return e != nullptr;
+}
 static void mc_put(const z3 *z, const work *w, const uint8_t *dec, size_t cv) {
     const long long budget = mc_budget() / MC_SH;   /* each shard its share */
     const size_t nb = (cv + 7) / 8;
@@ -585,6 +657,80 @@ static z3_tls *z3_tls_get(size_t ndec, size_t nscr) {
     if (!t->dctx) t->dctx = ZSTD_createDCtx();
     return t->dec && t->scratch && t->dctx ? t : nullptr;
 }
+/* one task: a coalesced range (fetched: its bytes, or nullptr to read it here) or a single chunk */
+static int run_task(job *jb, int task, uint8_t *fetched, uint8_t *dec, uint8_t *scratch, ZSTD_DCtx *dctx, int mc_on) {
+    z3 *z = jb->z;
+    const size_t cv = (size_t)z->m.chunk[0] * z->m.chunk[1] * z->m.chunk[2];
+    int i = jb->ranges ? jb->ranges[task].first : task;
+    const range_work *rg = jb->ranges ? &jb->ranges[task] : nullptr;
+    if (rg && (rg->count > 1 || fetched)) {
+        work *w0 = &jb->items[i]; char skey[1200];
+        shard_key(z, w0->sz, w0->sy, w0->sx, skey, sizeof skey);
+        uint8_t *group = fetched ? fetched : malloc((size_t)rg->len);
+        if (!fetched && (!group || store_read(z->s, skey, (int64_t)rg->off, (int64_t)rg->len, group) != (int64_t)rg->len)) {
+            free(group); FAIL("read grouped chunks of %s", skey); return -1;
+        }
+        int rc = 0;
+        for (int j = 0; j < rg->count && !rc; j++) {
+            work *w = &jb->items[i + j]; char item[16]; snprintf(item, sizeof item, "%d", w->ci);
+            const uint8_t *enc = group + (size_t)(w->off - rg->off); size_t n = (size_t)w->len;
+            cache_put(z, skey, item, enc, n); atomic_fetch_add(&g_z3_store_reads, 1);
+            int msk;
+            if (decode_into(z, enc, n, dec, dctx, scratch, &msk)) { rc = -1; break; }
+            if (msk) mc_put(z, w, dec, cv);
+            copy_chunk(jb, w, dec);
+        }
+        free(group);
+        return rc;
+    }
+    work *w = &jb->items[i];
+    if (!w->present) return 0;
+    if (mc_on && mc_copy(jb, w)) return 0;
+    char skey[1200], item[16];
+    shard_key(z, w->sz, w->sy, w->sx, skey, sizeof skey);
+    snprintf(item, sizeof item, "%d", w->ci < 0 ? 0 : w->ci);
+    size_t n;
+    uint8_t *b = cache_get(z, skey, item, &n);
+    if (b) atomic_fetch_add(&g_z3_cache_hits, 1); else if (z->cache) { atomic_fetch_add(&g_z3_store_reads, 1); if (getenv("UFSM_Z3_TRACE")) fprintf(stderr, "z3 store read: %s item %s (window %lld %lld %lld)\n", skey, item, (long long)jb->o[0], (long long)jb->o[1], (long long)jb->o[2]); }
+    if (!b) {
+        if (w->ci < 0) {
+            b = store_read_all(z->s, skey, &n);
+            if (!b) {
+                if (object_missing(z->s, skey)) return 0;
+                FAIL("read object %s", skey); return -1;
+            }
+        } else {
+            n = (size_t)w->len;
+            b = malloc(n);
+            if (!b || store_read(z->s, skey, (int64_t)w->off, (int64_t)n, b) != (int64_t)n) {
+                free(b);
+                FAIL("read chunk %d of %s", w->ci, skey);
+                return -1;
+            }
+        }
+        cache_put(z, skey, item, b, n);
+    }
+    int msk, rc = decode_into(z, b, n, dec, dctx, scratch, &msk);
+    free(b);
+    if (rc) return -1;
+    if (msk && mc_on) mc_put(z, w, dec, cv);
+    copy_chunk(jb, w, dec);
+    return 0;
+}
+/* batch mode: the next ready task (blocks), -1 when the queue is closed and drained */
+static int rq_pop(job *jb) {
+    pthread_mutex_lock(&jb->rq_mu);
+    while (jb->rq_head == jb->rq_tail && !jb->rq_closed) pthread_cond_wait(&jb->rq_cv, &jb->rq_mu);
+    int t = jb->rq_head < jb->rq_tail ? jb->ready[jb->rq_head++] : -1;
+    pthread_mutex_unlock(&jb->rq_mu);
+    return t;
+}
+static void rq_push(job *jb, int task) {
+    pthread_mutex_lock(&jb->rq_mu);
+    jb->ready[jb->rq_tail++] = task;
+    pthread_cond_signal(&jb->rq_cv);
+    pthread_mutex_unlock(&jb->rq_mu);
+}
 static void *worker(void *arg) {
     job *jb = arg;
     z3 *z = jb->z;
@@ -597,63 +743,39 @@ static void *worker(void *arg) {
     const int mc_on = mc_budget() > 0 && es == 1;
     if (!dec || !scratch || !dctx) { FAIL("chunk decode allocation"); job_failed(jb); }
     for (;;) {
-        int task = atomic_fetch_add(&jb->next, 1);
+        int task;
+        if (jb->batch) {
+            if ((task = rq_pop(jb)) < 0) break;
+            uint8_t *f = jb->fetched[task]; jb->fetched[task] = nullptr;
+            if (atomic_load(&jb->failed)) { free(f); continue; }   /* drain: buffers still to free */
+            if (run_task(jb, task, f, dec, scratch, dctx, mc_on)) job_failed(jb);
+            continue;
+        }
+        task = atomic_fetch_add(&jb->next, 1);
         if (task >= (jb->ranges ? jb->nranges : jb->nitems) || atomic_load(&jb->failed)) break;
-        int i = jb->ranges ? jb->ranges[task].first : task;
-        const range_work *rg = jb->ranges ? &jb->ranges[task] : nullptr;
-        if (rg && rg->count > 1) {
-            work *w0 = &jb->items[i]; char skey[1200];
-            shard_key(z, w0->sz, w0->sy, w0->sx, skey, sizeof skey);
-            uint8_t *group = malloc((size_t)rg->len);
-            if (!group || store_read(z->s, skey, (int64_t)rg->off, (int64_t)rg->len, group) != (int64_t)rg->len) {
-                free(group); FAIL("read grouped chunks of %s", skey); job_failed(jb); break;
-            }
-            for (int j = 0; j < rg->count; j++) {
-                work *w = &jb->items[i + j]; char item[16]; snprintf(item, sizeof item, "%d", w->ci);
-                const uint8_t *enc = group + (size_t)(w->off - rg->off); size_t n = (size_t)w->len;
-                cache_put(z, skey, item, enc, n); atomic_fetch_add(&g_z3_store_reads, 1);
-                int msk;
-                if (decode_into(z, enc, n, dec, dctx, scratch, &msk)) { job_failed(jb); break; }
-                if (msk) mc_put(z, w, dec, cv);
-                copy_chunk(jb, w, dec);
-            }
-            free(group); continue;
-        }
-        work *w = &jb->items[i];
-        if (!w->present) continue;
-        if (mc_on && mc_copy(jb, w)) continue;
-        char skey[1200], item[16];
-        shard_key(z, w->sz, w->sy, w->sx, skey, sizeof skey);
-        snprintf(item, sizeof item, "%d", w->ci < 0 ? 0 : w->ci);
-        size_t n;
-        uint8_t *b = cache_get(z, skey, item, &n);
-        if (b) atomic_fetch_add(&g_z3_cache_hits, 1); else if (z->cache) { atomic_fetch_add(&g_z3_store_reads, 1); if (getenv("UFSM_Z3_TRACE")) fprintf(stderr, "z3 store read: %s item %s (window %lld %lld %lld)\n", skey, item, (long long)jb->o[0], (long long)jb->o[1], (long long)jb->o[2]); }
-        if (!b) {
-            if (w->ci < 0) {
-                b = store_read_all(z->s, skey, &n);
-                if (!b) {
-                    if (object_missing(z->s, skey)) continue;
-                    FAIL("read object %s", skey); job_failed(jb); break;
-                }
-            } else {
-                n = (size_t)w->len;
-                b = malloc(n);
-                if (!b || store_read(z->s, skey, (int64_t)w->off, (int64_t)n, b) != (int64_t)n) {
-                    free(b);
-                    FAIL("read chunk %d of %s", w->ci, skey);
-                    job_failed(jb);
-                    break;
-                }
-            }
-            cache_put(z, skey, item, b, n);
-        }
-        int msk, rc = decode_into(z, b, n, dec, dctx, scratch, &msk);
-        free(b);
-        if (rc) { job_failed(jb); break; }
-        if (msk && mc_on) mc_put(z, w, dec, cv);
-        copy_chunk(jb, w, dec);
+        if (run_task(jb, task, nullptr, dec, scratch, dctx, mc_on)) { job_failed(jb); break; }
     }
     return nullptr;
+}
+
+/* batch fetch: a multi request finished on the main thread */
+typedef struct { job *jb; int *task_of; store_req *reqs; } batch_ud;
+static void batch_done(void *ud, int i) {
+    batch_ud *u = ud; job *jb = u->jb; store_req *q = &u->reqs[i]; const int task = u->task_of[i];
+    if (q->result != q->len) {
+        FAIL("read %s chunks of %s (%lld bytes at %lld)", jb->ranges[task].count > 1 ? "grouped" : "one", q->key, (long long)q->len, (long long)q->off);
+        job_failed(jb); free(q->out); q->out = nullptr; return;
+    }
+    jb->fetched[task] = q->out; q->out = nullptr;
+    rq_push(jb, task);
+}
+/* sort live items by shard, then by byte offset (coalescing merges neighbours in file order) */
+static int work_cmp(const void *a, const void *b) {
+    const work *x = a, *y = b;
+    if (x->sz != y->sz) return x->sz < y->sz ? -1 : 1;
+    if (x->sy != y->sy) return x->sy < y->sy ? -1 : 1;
+    if (x->sx != y->sx) return x->sx < y->sx ? -1 : 1;
+    return x->off < y->off ? -1 : x->off > y->off;
 }
 
 int64_t z3_chunk_map(z3 *z, int64_t grid[3], uint8_t **bits) {
@@ -725,7 +847,7 @@ int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nth
     }
     int64_t s0[3], s1[3];
     for (int i = 0; i < 3; i++) { s0[i] = lo[i] / m->shard[i]; s1[i] = (hi[i] - 1) / m->shard[i]; }
-    if (option_on("UFSM_Z3_INDEX_PARALLEL") && m->sharded && z->cache && !store_is_local(z->s))
+    if (option_on("UFSM_Z3_INDEX_PARALLEL") && m->sharded && !store_is_local(z->s))
         if (prefetch_indices(z, s0, s1, nthreads)) return -1;
     int cap = 64, nitems = 0;
     work *items = malloc((size_t)cap * sizeof *items);
@@ -775,23 +897,31 @@ int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nth
     if (rc) { free(items); return -1; }
     if (inside) for (int i = 0; i < nitems; i++) if (!items[i].present) { z3_fill(m, out, nv); inside = 0; break; }   /* (an absent chunk: filled) */
     range_work *ranges = nullptr; int nranges = 0;
-    if (option_on("UFSM_Z3_COALESCE") && m->sharded && !store_is_local(z->s)) {
+    /* HTTP sharded reads go through range tasks: neighbouring cold chunks of one shard (file order, gap <= UFSM_Z3_GAP bytes,
+       default 64 KiB; span <= UFSM_Z3_SPAN, default 2 MiB) become one request unless UFSM_Z3_COALESCE=0; with UFSM_HTTP_MULTI=1
+       one curl_multi on this thread issues them concurrently while the workers decode (else each worker fetches its own) */
+    const int coalesce = option_on("UFSM_Z3_COALESCE"), batch = m->sharded && store_batch_enabled(z->s);
+    if ((coalesce || batch) && m->sharded && !store_is_local(z->s)) {
+        static int64_t gap = -1, span = -1;
+        if (gap < 0) { const char *v = getenv("UFSM_Z3_GAP"); gap = v && *v ? atoll(v) : 64 << 10; }
+        if (span < 0) { const char *v = getenv("UFSM_Z3_SPAN"); span = v && *v ? atoll(v) : 2 << 20; }
         /* Absent chunks are already filled. They have no byte range and must not split nearby payloads. */
         int live = 0;
         for (int i = 0; i < nitems; i++) if (items[i].present) items[live++] = items[i];
         nitems = live;
+        qsort(items, (size_t)nitems, sizeof *items, work_cmp);
         ranges = malloc((size_t)nitems * sizeof *ranges);
         if (!ranges && nitems) { free(items); return FAIL("range allocation"); }
         for (int i = 0; i < nitems;) {
             work *w = &items[i]; range_work rg = {i, 1, w->off, w->len};
             char skey[1200], item[16];
             shard_key(z, w->sz, w->sy, w->sx, skey, sizeof skey); snprintf(item, sizeof item, "%d", w->ci);
-            int cold = w->present && w->ci >= 0 && w->len <= (2u << 20) && !cache_has(z, skey, item);
+            int cold = coalesce && w->present && w->ci >= 0 && (int64_t)w->len <= span && !cache_has(z, skey, item);
             if (cold) for (int j = i + 1; j < nitems; j++) {
                 work *q = &items[j]; uint64_t end = rg.off + rg.len;
                 if (!q->present || q->sz != w->sz || q->sy != w->sy || q->sx != w->sx ||
-                    q->off < end || q->off - end > (64u << 10) || q->len > (2u << 20) ||
-                    q->off + q->len - rg.off > (2u << 20)) break;
+                    q->off < end || (int64_t)(q->off - end) > gap || (int64_t)q->len > span ||
+                    (int64_t)(q->off + q->len - rg.off) > span) break;
                 snprintf(item, sizeof item, "%d", q->ci);
                 if (cache_has(z, skey, item)) break;
                 rg.count++; rg.len = q->off + q->len - rg.off;
@@ -799,28 +929,78 @@ int z3_read(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nth
             ranges[nranges++] = rg; i += rg.count;
         }
         if (getenv("UFSM_Z3_PROF")) {
-            size_t wanted = 0, span = 0;
+            size_t wanted = 0, span_b = 0;
             for (int i = 0; i < nitems; i++) if (items[i].present) wanted += (size_t)items[i].len;
-            for (int i = 0; i < nranges; i++) if (items[ranges[i].first].present) span += (size_t)ranges[i].len;
+            for (int i = 0; i < nranges; i++) if (items[ranges[i].first].present) span_b += (size_t)ranges[i].len;
             fprintf(stderr, "z3 grouped reads: %d chunks, %d tasks, %zu requested bytes, %zu range-span bytes\n",
-                    nitems, nranges, wanted, span);
+                    nitems, nranges, wanted, span_b);
         }
     }
     job jb = {.z = z, .o = o, .n = n, .out = out, .items = items, .nitems = nitems,
               .ranges = ranges, .nranges = nranges};
     if (nthreads <= 0) nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
     int ntasks = ranges ? nranges : nitems;
-    if (nthreads > ntasks) nthreads = ntasks;
-    if (nthreads < 1) nthreads = 1;
-    pthread_t th[256];
-    if (nthreads > 256) nthreads = 256;
-    int started = 0;
-    for (int i = 1; i < nthreads; i++) {
-        if (pthread_create(&th[started], nullptr, worker, &jb)) break;
-        started++;
+    store_req *reqs = nullptr; int *task_of = nullptr; char (*rkeys)[1200] = nullptr; int nreq = 0;
+    if (batch && ranges && ntasks) {
+        /* which tasks need the network: coalesced groups, and single chunks in neither the disk nor the mask cache */
+        const int mc_on = mc_budget() > 0 && m->esize == 1;
+        jb.fetched = calloc((size_t)ntasks, sizeof *jb.fetched); jb.ready = malloc((size_t)ntasks * sizeof *jb.ready);
+        reqs = malloc((size_t)ntasks * sizeof *reqs); task_of = malloc((size_t)ntasks * sizeof *task_of); rkeys = malloc((size_t)ntasks * sizeof *rkeys);
+        if (!jb.fetched || !jb.ready || !reqs || !task_of || !rkeys) {
+            free(jb.fetched); free(jb.ready); free(reqs); free(task_of); free(rkeys); free(ranges); free(items); return FAIL("batch allocation");
+        }
+        jb.batch = 1;
+        pthread_mutex_init(&jb.rq_mu, nullptr); pthread_cond_init(&jb.rq_cv, nullptr);
+        for (int t = 0; t < ntasks; t++) {
+            const range_work *rg = &ranges[t]; work *w = &items[rg->first];
+            char item[16]; snprintf(item, sizeof item, "%d", w->ci);
+            shard_key(z, w->sz, w->sy, w->sx, rkeys[nreq], sizeof rkeys[nreq]);
+            int need = rg->count > 1 || (w->present && !cache_has(z, rkeys[nreq], item) && !(mc_on && mc_has(z, w)));
+            if (!need) { jb.ready[jb.rq_tail++] = t; continue; }
+            reqs[nreq] = (store_req){rkeys[nreq], (int64_t)rg->off, (int64_t)rg->len, nullptr, -1};
+            task_of[nreq++] = t;
+        }
     }
-    worker(&jb);
-    for (int i = 0; i < started; i++) pthread_join(th[i], nullptr);
+    int nworkers = nthreads;
+    if (nworkers > ntasks) nworkers = ntasks;
+    if (nworkers < 1) nworkers = 1;
+    if (nworkers > 256) nworkers = 256;
+    pthread_t th[256];
+    int started = 0;
+    if (jb.batch) {
+        /* every worker in its own thread; this thread drives the fetch in slices of at most UFSM_Z3_BATCH_MB (default 256) */
+        for (int i = 0; i < nworkers; i++) {
+            if (pthread_create(&th[started], nullptr, worker, &jb)) break;
+            started++;
+        }
+        static int64_t slice_cap = -1;
+        if (slice_cap < 0) { const char *v = getenv("UFSM_Z3_BATCH_MB"); slice_cap = (v && *v ? atoll(v) : 256) << 20; }
+        batch_ud u = {&jb, nullptr, nullptr};
+        for (int r0 = 0; r0 < nreq && !atomic_load(&jb.failed);) {
+            int r1 = r0; int64_t bytes = 0;
+            while (r1 < nreq && (r1 == r0 || bytes + reqs[r1].len <= slice_cap)) bytes += reqs[r1++].len;
+            int ok = 1;
+            for (int r = r0; r < r1; r++) if (!(reqs[r].out = malloc((size_t)reqs[r].len))) ok = 0;
+            if (!ok) { FAIL("batch buffer allocation"); job_failed(&jb); for (int r = r0; r < r1; r++) free(reqs[r].out); break; }
+            u.task_of = task_of + r0; u.reqs = reqs + r0;
+            if (started) store_read_batch(z->s, reqs + r0, r1 - r0, 0, batch_done, &u);
+            for (int r = r0; r < r1; r++) free(reqs[r].out);   /* leftovers of failed requests (passed buffers are nulled) */
+            r0 = r1;
+        }
+        pthread_mutex_lock(&jb.rq_mu); jb.rq_closed = 1; pthread_cond_broadcast(&jb.rq_cv); pthread_mutex_unlock(&jb.rq_mu);
+        if (!started) { FAIL("no decode worker thread"); job_failed(&jb); }
+        for (int i = 0; i < started; i++) pthread_join(th[i], nullptr);
+        for (int t = 0; t < ntasks; t++) free(jb.fetched[t]);
+        pthread_mutex_destroy(&jb.rq_mu); pthread_cond_destroy(&jb.rq_cv);
+        free(jb.fetched); free(jb.ready); free(reqs); free(task_of); free(rkeys);
+    } else {
+        for (int i = 1; i < nworkers; i++) {
+            if (pthread_create(&th[started], nullptr, worker, &jb)) break;
+            started++;
+        }
+        worker(&jb);
+        for (int i = 0; i < started; i++) pthread_join(th[i], nullptr);
+    }
     free(ranges); free(items);
     return atomic_load(&jb.failed) ? FAIL("%s", jb.error) : 0;
 }

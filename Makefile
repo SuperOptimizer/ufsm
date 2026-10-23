@@ -33,6 +33,7 @@ SRC += src/tfx.c
 SRC += src/fitjoin.c src/fieldsoracle.c src/packmap.c src/scanprep.c
 SRC += src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
 SRC += src/srpair.c
+SRC += src/storebench.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
@@ -327,6 +328,10 @@ test-sheet-gpu: $(B)/ufsm $(B)/test_sheet_gpu $(B)/test_wgrad_grid $(B)/make_pip
 
 $(B)/test_json: tests/test_json.c $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+
+# store-bench without the CUDA build (laptop / desk / pods): HTTP fetch throughput, see src/storebench.c
+$(B)/store_bench: src/storebench.c $(B)/store.o $(B)/zarr3.o $(B)/json.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DSTORE_BENCH_MAIN $^ -o $@ $(LDLIBS)
 
 $(B)/test_http_reader: tests/test_http_reader.c $(B)/store.o $(B)/zarr3.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)

@@ -34,3 +34,31 @@ void store_set_rate(store *s, double rps);   /* HTTP status of this thread's las
    UFSM_HTTP_REUSE=0 disables pooling for controlled comparisons. */
 void store_global_init(void);
 void store_global_cleanup(void);
+
+/* Read the last len bytes of an object with one suffix-range GET (a shard index): fills out, sets *total to the object size.
+   Returns len, -2 if missing, -1 on error. UFSM_HTTP_TAIL=0 falls back to HEAD + range GET. */
+int64_t store_read_tail(store *s, const char *key, int64_t len, uint8_t *out, int64_t *total);
+
+/* Many byte ranges at once. HTTP: one curl_multi per calling thread (persistent connections), HTTP/2 multiplexed,
+   at most conc requests in flight (conc <= 0: UFSM_HTTP_CONC, default 64) and UFSM_HTTP_STREAMS (default 16) streams per
+   connection, so conc / streams connections share the bandwidth. done(ud, i) runs on the calling thread as request i completes
+   (reqs[i].result: len, -2 missing, -1 error); validation and retries match store_read. Local stores read serially.
+   Returns 0 if every request succeeded or was missing, -1 otherwise. Requests count against UFSM_HTTP_INFLIGHT. */
+typedef struct { const char *key; int64_t off, len; uint8_t *out; int64_t result; } store_req;
+int store_read_batch(store *s, store_req *reqs, int n, int conc, void (*done)(void *ud, int i), void *ud);
+int store_batch_enabled(const store *s);   /* HTTP store and UFSM_HTTP_MULTI=1 (default off) */
+
+/* Pacing: at most UFSM_HTTP_INFLIGHT (default 48) requests in flight per process (the volcomp mirror allows 64 per IP and answers
+   429 beyond, without rate-limit headers); a 429 / 503 pauses the store briefly (Retry-After / ratelimit header, else 0.5 s doubling
+   to 8 s) and halves an adaptive request-rate cap that recovers by 10% a second. UFSM_HTTP_RPS / UFSM_HTTP_BURST set a fixed cap. */
+
+/* Process-wide HTTP accounting (all stores, all threads). stall = a request slower than 64 KB/s that took over 2 s.
+   ratelimit = responses carrying a ratelimit / x-ratelimit-* / retry-after header; last_ratelimit is the latest such header.
+   UFSM_HTTP_LOG=1 prints every 429 / 503 / rate-limit header with a timestamp. */
+typedef struct {
+    uint64_t requests, bytes, n429, n503, n5xx, transport_errors, retries, ratelimit, stalls, connects;   /* connects: new connections */
+    double req_seconds, sleep_seconds, max_req_seconds;
+    char last_ratelimit[192];
+} store_stats_t;
+void store_stats_get(store_stats_t *out);
+void store_stats_reset(void);

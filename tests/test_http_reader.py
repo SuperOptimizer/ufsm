@@ -13,6 +13,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / "build/ufsm"
@@ -173,6 +174,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(404, head=head)
         if mode == "retry" and not head and (chunk or key == "blob") and count == 1:
             return self.reply(503, head=head)
+        # A header-less 429 on every third shard request (the volcomp mirror's burst limit), or one with Retry-After.
+        if mode == "throttle" and not head and chunk and count % 3 == 1:
+            return self.reply(429, head=head)
+        if mode == "throttle-hdr" and not head and chunk and count == 1:
+            return self.reply(429, headers={"Retry-After": "1"}, head=head)
         if chunk and mode in ("crc", "bounds", "overflow"):
             data = bytearray(data)
             if key.startswith("array/"):
@@ -188,9 +194,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not request_range:
             return self.reply(200, data)
         match = re.fullmatch(r"bytes=(\d+)-(\d+)", request_range)
-        if not match:
+        suffix = re.fullmatch(r"bytes=-(\d+)", request_range)
+        if suffix:  # the last N bytes (a shard index); the whole object when shorter
+            a, b = max(0, len(data) - int(suffix.group(1))), len(data) - 1
+        elif not match:
             return self.reply(416)
-        a, b = map(int, match.groups())
+        else:
+            a, b = map(int, match.groups())
         if a > b or b >= len(data):
             return self.reply(416)
         if mode == "payload-missing" and chunk and a < len(data) - 132:
@@ -233,31 +243,35 @@ def main():
             counter = 0
             manifests = []
             def read(mode="ok", key="array", origin=(-2, -1, -3), shape=(17, 18, 18), threads=4,
-                     cache=None, coalesce="1", parallel="1", success=True):
+                     cache=None, coalesce="1", parallel="1", success=True, multi=None, imem="1"):
                 nonlocal counter
                 with LOCK:
                     counter += 1; out = tmp / f"out-{counter}.raw"
                 cmd = [BINARY, "read", url + "/" + mode, key, *origin, *shape, out, "--threads", threads]
                 if cache is not None:
                     cmd += ["--cache", cache]
-                env = dict(clean, UFSM_Z3_COALESCE=coalesce, UFSM_Z3_INDEX_PARALLEL=parallel)
+                env = dict(clean, UFSM_Z3_COALESCE=coalesce, UFSM_Z3_INDEX_PARALLEL=parallel, UFSM_Z3_INDEX_MEM=imem)
+                if multi is not None:
+                    env["UFSM_HTTP_MULTI"] = multi
                 result = run(cmd, env, success)
                 if success:
                     limit = (256, 4, 4) if key == "long" else SHAPE
                     want = bytes([FILL]) * (shape[0] * shape[1] * shape[2]) if mode == "missing" else expected(origin, shape, key == "array", limit)
-                    assert out.read_bytes() == want, (mode, key, threads, coalesce, parallel)
+                    assert out.read_bytes() == want, (mode, key, threads, coalesce, parallel, multi, imem)
                 else:
                     assert result.stderr.strip(), "missing propagated error"
                 return result
 
             # Independent voxel reference, cold/hot caches, outside bounds, thread counts and both controls.
-            for coalesce, parallel, threads in itertools.product(("0", "1"), ("0", "1"), (1, 4, 16)):
-                cache = tmp / f"cache-{coalesce}-{parallel}-{threads}"
-                read(cache=cache, coalesce=coalesce, parallel=parallel, threads=threads)
+            # Byte-exact across coalescing, the multi fetcher, the index memory cache and the parallel index fetch.
+            for coalesce, parallel, multi, threads in itertools.product(("0", "1"), ("0", "1"), ("0", "1"), (1, 4, 16)):
+                cache = tmp / f"cache-{coalesce}-{parallel}-{multi}-{threads}"
+                read(cache=cache, coalesce=coalesce, parallel=parallel, threads=threads, multi=multi, imem=parallel)
                 manifests.append({str(p.relative_to(cache)): p.read_bytes() for p in cache.rglob("*") if p.is_file()})
                 before = len(REQUESTS)
-                read(cache=cache, coalesce=coalesce, parallel=parallel, threads=threads)
+                read(cache=cache, coalesce=coalesce, parallel=parallel, threads=threads, multi=multi)
                 assert all("/c/" not in r[1] for r in REQUESTS[before:]), "warm cache fetched shard data"
+                read(coalesce=coalesce, parallel=parallel, threads=threads, multi=multi, imem=parallel)  # no disk cache
             assert all(m == manifests[0] for m in manifests), "encoded cache differs across execution modes"
             for threads in (1, 16):
                 read(threads=threads)
@@ -265,7 +279,7 @@ def main():
                 read(key="single", cache=tmp / f"single-{threads}", threads=threads)
             for origin, shape in [((3, 5, 7), (8, 7, 4)), ((20, 20, 20), (2, 3, 4)), ((-8, -8, -8), (2, 3, 4))]:
                 read(origin=origin, shape=shape, cache=tmp / f"box-{counter}")
-            partial = tmp / "partial"; shutil.copytree(tmp / "cache-0-0-1", partial)
+            partial = tmp / "partial"; shutil.copytree(tmp / "cache-0-0-0-1", partial)
             for i, p in enumerate(sorted(partial.rglob("*"))):
                 if p.is_file() and i % 3 == 0:
                     p.unlink()
@@ -299,16 +313,22 @@ def main():
             finally:
                 other.shutdown(); other.server_close(); other_thread.join()
             # Distinguish true sparse absence from failures, with both metadata/chunk scheduling paths.
-            for coalesce, parallel in itertools.product(("0", "1"), repeat=2):
+            for coalesce, parallel, multi in itertools.product(("0", "1"), repeat=3):
                 for mode in ("wrong-range", "wrong-total", "no-range", "ignored", "short", "forbidden", "crc", "bounds", "overflow", "payload-missing"):
-                    cache = tmp / f"bad-{mode}-{coalesce}-{parallel}"
-                    read(mode, cache=cache, coalesce=coalesce, parallel=parallel, success=False)
+                    cache = tmp / f"bad-{mode}-{coalesce}-{parallel}-{multi}"
+                    read(mode, cache=cache, coalesce=coalesce, parallel=parallel, multi=multi, success=False)
                     assert all(str(p.relative_to(cache))[:-8] not in OBJECTS for p in cache.rglob("*.missing")), "failure was cached as absent"
-                read("missing", cache=tmp / f"missing-{coalesce}-{parallel}", coalesce=coalesce, parallel=parallel)
+                read("missing", cache=tmp / f"missing-{coalesce}-{parallel}-{multi}", coalesce=coalesce, parallel=parallel, multi=multi)
+            # Header-less 429s back off briefly (the old fixed 30 s sleep per thread stalled whole runs); Retry-After is honoured.
+            for multi in ("0", "1"):
+                t0 = time.monotonic()
+                read("throttle", cache=tmp / f"throttle-{multi}", multi=multi, threads=16)
+                read("throttle-hdr", cache=tmp / f"throttle-hdr-{multi}", multi=multi)
+                assert time.monotonic() - t0 < 20, "429 back-off too slow"
             read("plain-forbidden", key="plain", success=False)
             read("retry", cache=tmp / "retry")
             read("redirect", cache=tmp / "redirect")
-            corrupt = tmp / "corrupt-cache"; shutil.copytree(tmp / "cache-0-0-1", corrupt)
+            corrupt = tmp / "corrupt-cache"; shutil.copytree(tmp / "cache-0-0-0-1", corrupt)
             p = next(corrupt.rglob("*.idx")); data = bytearray(p.read_bytes()); data[-1] ^= 1; p.write_bytes(data)
             read(cache=corrupt, success=False)
             # Multiple processes can populate one cache without temporary-file collisions.
@@ -331,6 +351,8 @@ def main():
                 rows = [r for r in REQUESTS[start:] if r[2] == "GET" and "/c/" in r[1] and r[3]]
                 payloads = []
                 for row in rows:
+                    if row[3].startswith("bytes=-"):
+                        continue  # shard index (suffix range)
                     a, b = map(int, re.fullmatch(r"bytes=(\d+)-(\d+)", row[3]).groups())
                     if b != len(OBJECTS[row[1]]) - 1:
                         payloads.append(row)
@@ -342,7 +364,7 @@ def main():
             read(key="long", origin=(0, 0, 0), shape=(256, 4, 4), cache=tmp / "long", threads=1)
             payloads = []
             for row in REQUESTS[start:]:
-                if row[1] != "long/c/0/0/0" or row[2] != "GET":
+                if row[1] != "long/c/0/0/0" or row[2] != "GET" or row[3].startswith("bytes=-"):
                     continue
                 a, b = map(int, re.fullmatch(r"bytes=(\d+)-(\d+)", row[3]).groups())
                 if b != len(OBJECTS[row[1]]) - 1:
