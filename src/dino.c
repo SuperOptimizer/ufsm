@@ -110,7 +110,7 @@ typedef struct {
 typedef struct { int P, ngt, nssl, nair, margin; int nsrc; dn_src src[DN_MAXSRC]; double wsum; int ident; int nink; double wsum_l, wsum_u, share_u; char excl[8][64]; int nexcl;
     /* recipe views drawn by the loader workers: globals vP^3 (zoom zlo..zhi), vnloc locals vPL^3 (lzlo..lzhi); uw: per global view the stored phase
        resampled into the view + its winding mod 4 (band_wind4_tiled); ikp: the ink-splat probability resampled into the view */
-    int vP, vPL, vnloc, uw, ikp; float zlo, zhi, lzlo, lzhi; } dn_data;   /* share_u: the unlabelled sources' share of the draws (< 0: by weight over all; 0: labelled only) */   /* nink: ink points per sample (half ink, half no-ink) */   /* ident: no window geometry (the recipe draws its own views) */
+    int vP, vPL, vnloc, uw, ikp; float zlo, zhi, lzlo, lzhi, vovl; } dn_data;   /* vovl: the globals' minimum overlap per axis (fraction of the smaller; 0: 1/4) */   /* share_u: the unlabelled sources' share of the draws (< 0: by weight over all; 0: labelled only) */   /* nink: ink points per sample (half ink, half no-ink) */   /* ident: no window geometry (the recipe draws its own views) */
 typedef struct {   /* one sample: two CT views, the geometry, the points (output-space voxel indices) */
     uint8_t *ca, *cb; int si; int64_t corner[3]; dn_geom g; int halves; int hasax; float *ayx;   /* the axis (y, x) per window plane (window coords; --axis-input) */
     int ngt, nssl; int *gidx, *gcode, *gxyz, *sidx;
@@ -143,7 +143,7 @@ static void dn_draw_views(const dn_data *D, dn_sample *S, uint64_t *ar) {
         t->m = (int)lrintf(t->n * z); if (t->m > Ps) t->m = Ps; if (t->m < 8) t->m = 8;
         for (int d = 0; d < 3; d++) {
             int lo2 = 0, hi2 = Ps - t->m;
-            if (v == 1) { const int ov = (t->m < S->xf[0].m ? t->m : S->xf[0].m) / 4; const int a = S->xf[0].off[d] - t->m + ov, b = S->xf[0].off[d] + S->xf[0].m - ov; if (a > lo2) lo2 = a; if (b < hi2) hi2 = b; if (hi2 < lo2) hi2 = lo2; }
+            if (v == 1) { const int ov = (int)((t->m < S->xf[0].m ? t->m : S->xf[0].m) * (D->vovl > 0 ? D->vovl : 0.25f)); const int a = S->xf[0].off[d] - t->m + ov, b = S->xf[0].off[d] + S->xf[0].m - ov; if (a > lo2) lo2 = a; if (b < hi2) hi2 = b; if (hi2 < lo2) hi2 = lo2; }
             t->off[d] = lo2 + (int)(rng_u(ar) * (hi2 - lo2 + 1)); if (t->off[d] > Ps - t->m) t->off[d] = Ps - t->m;
         }
         int pm[3] = {0, 1, 2}; for (int k = 2; k > 0; k--) { const int j = (int)(rng_next(ar) % (uint64_t)(k + 1)); const int q = pm[k]; pm[k] = pm[j]; pm[j] = q; }
@@ -807,7 +807,7 @@ static int dn_block_mask(uint8_t *m, int G, int target, uint64_t *r) {
    vs teacher (i, 1 - v), each local vs both of its sample; KoLeo per global view chunk over the batch (the other samples' CLS of that chunk:
    the student's when already computed this step, the teacher's otherwise -- never the same sample's other view). The gradient joins u's. */
 typedef struct {
-    unet *u, *ug, *ul; int N, PG, PL, NL, Ps, C, K, CIN, cls_reg, cls_norm, freeze, skit, nsum, ure; float ts, wdino, wk, hlr, plr, wd, adrop, noise;
+    unet *u, *ug, *ul; int N, PG, PL, NL, Ps, C, CC, K, CIN, cls_reg, cls_norm, freeze, skit, nsum, ure; float ts, wdino, wk, hlr, plr, wd, adrop, noise;
     dn_data *Ds; dn_ring *R; uint8_t *src; float *xg, *xl, *glzg, *glzl, *tgrad; size_t tgn; dr_xf *xfd, *xfh; dr_int *itd, *ith;
     dn_head H; float *tl, *tq, *sl, *dsl, *clsT, *clsS, *dcls, *rsS, *rsT, *bank, *bex, *outs, *hout, *d_ayx; void *sks, *ces; int *pS, *pT; float *pW;
     uint64_t ar; uint8_t *use; double sums[8]; shape5 xsg, xsl;
@@ -818,7 +818,7 @@ typedef struct {
     float wib; int KI, IM, ich, TPS, GT_, cnt[64], off[64]; dn_head I; float *ieT, *inT, *ieS, *inS, *idE, *il, *iq, *isl, *idsl, *iw, *glzib; void *isk, *ice; int *d_hS, *d_hT, *iid, *hS, *hT; uint8_t *cellm, *d_mask; uint8_t *usei;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
-    memset(Q, 0, sizeof *Q); Q->u = u; Q->C = C; Q->cls_reg = cls_reg; Q->cls_norm = cls_norm; Q->noise = noise; Q->CIN = cfg->cin;
+    memset(Q, 0, sizeof *Q); Q->u = u; Q->C = C; Q->CC = cls_reg == 2 ? 2 * C : C; Q->cls_reg = cls_reg; Q->cls_norm = cls_norm; Q->noise = noise; Q->CIN = cfg->cin;
     Q->N = atoi(opt(argc, argv, "--ssl-batch", "16")); Q->PG = atoi(opt(argc, argv, "--ssl-P", "128")); Q->PL = atoi(opt(argc, argv, "--ssl-local-P", "64"));
     Q->NL = atoi(opt(argc, argv, "--ssl-locals", "4")); Q->Ps = atoi(opt(argc, argv, "--ssl-source-P", "192")); Q->K = atoi(opt(argc, argv, "--ssl-protos", "16384"));
     Q->ts = 0.1f; Q->wdino = (float)atof(opt(argc, argv, "--ssl-dino", "1")); Q->wk = (float)atof(opt(argc, argv, "--ssl-koleo", "0.1"));
@@ -833,7 +833,7 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
     /* the SSL sampler: the sources at the SSL window, no labels drawn (views only) */
     dn_data *Ds = malloc(sizeof *Ds); *Ds = *Dd; Ds->P = Q->Ps; Ds->ngt = 64; Ds->nair = 0; Ds->nink = 0; Ds->uw = 0; Ds->ikp = 0; Ds->ident = 1;
     Ds->vP = Q->PG; Ds->vPL = Q->PL; Ds->vnloc = Q->NL; Ds->zlo = zlo; Ds->zhi = zhi; Ds->lzlo = lzlo; Ds->lzhi = lzhi;
-    Ds->share_u = atof(opt(argc, argv, "--ssl-unlabelled-share", "-1")); Q->Ds = Ds;
+    Ds->share_u = atof(opt(argc, argv, "--ssl-unlabelled-share", "-1")); Ds->vovl = (float)atof(opt(argc, argv, "--ssl-overlap", "0.5")); Q->Ds = Ds;
     dn_ring *R = calloc(1, sizeof *R); R->D = Ds; R->seed = seed * 7 + 1234567; R->nthreads = 2; pthread_mutex_init(&R->mu, nullptr); pthread_cond_init(&R->cv, nullptr);
     R->nslots = 2 * Q->N + 4 < DN_SLOTS ? 2 * Q->N + 4 : DN_SLOTS; const size_t ps3 = (size_t)Q->Ps * Q->Ps * Q->Ps;
     for (int i = 0; i < R->nslots; i++) { dn_sample *S = &R->slot[i]; S->ca = malloc(ps3); S->cb = malloc(ps3); S->gidx = malloc(64 * 4); S->gcode = malloc(64 * 4); S->gxyz = malloc(64 * 12); S->sidx = malloc(4); S->ayx = malloc((size_t)Q->Ps * 8); S->ixyz = malloc(12); }
@@ -851,11 +851,11 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
     Q->xfd = nn_malloc(sizeof(dr_xf) * NV); Q->itd = nn_malloc(sizeof(dr_int) * NV); Q->xfh = malloc(sizeof(dr_xf) * NV); Q->ith = malloc(sizeof(dr_int) * NV);
     Q->d_ayx = nn_malloc((size_t)N * Q->Ps * 8);
     const int HH = atoi(opt(argc, argv, "--ssl-head-hidden", "2048")), HB = atoi(opt(argc, argv, "--ssl-head-bottleneck", "256"));
-    dn_head_init(&Q->H, C, HH, HB, Q->K, 2 * N, seed * 59 + 3, 0); Q->H.train_g = 0;
+    dn_head_init(&Q->H, Q->CC, HH, HB, Q->K, 2 * N, seed * 59 + 3, 0); Q->H.train_g = 0;
     Q->tl = nn_malloc((size_t)2 * N * Q->K * 4); Q->tq = nn_malloc((size_t)2 * N * Q->K * 4); Q->sks = nn_malloc(dr_sk_scratch(2 * N, Q->K));
     Q->sl = nn_malloc((size_t)Q->K * 4); Q->dsl = nn_malloc((size_t)Q->K * 4); Q->ces = nn_malloc(dr_ce_scratch(1));
-    Q->clsT = nn_malloc((size_t)2 * N * C * 4); Q->clsS = nn_malloc((size_t)C * 4); Q->dcls = nn_malloc((size_t)C * 4); Q->rsS = nn_malloc(16); Q->rsT = nn_malloc((size_t)2 * N * 4);
-    Q->bank = nn_malloc((size_t)2 * N * C * 4); Q->bex = nn_malloc((size_t)N * C * 4); Q->outs = nn_malloc(16 * 4); Q->hout = malloc(16 * 4);
+    Q->clsT = nn_malloc((size_t)2 * N * Q->CC * 4); Q->clsS = nn_malloc((size_t)Q->CC * 4); Q->dcls = nn_malloc((size_t)Q->CC * 4); Q->rsS = nn_malloc(16); Q->rsT = nn_malloc((size_t)2 * N * 4);
+    Q->bank = nn_malloc((size_t)2 * N * Q->CC * 4); Q->bex = nn_malloc((size_t)N * Q->CC * 4); Q->outs = nn_malloc(16 * 4); Q->hout = malloc(16 * 4);
     Q->pS = nn_malloc(8); Q->pT = nn_malloc(8); Q->pW = nn_malloc(8); Q->use = calloc((size_t)Q->K, 1); Q->ar = seed * 977 + 31;
     Q->cm = (float)atof(opt(argc, argv, "--ssl-center", "0")); Q->icm = (float)atof(opt(argc, argv, "--ssl-ibot-center", "0"));
     Q->cen = nn_malloc((size_t)Q->K * 4); nn_zero(Q->cen, (size_t)Q->K * 4);
@@ -910,10 +910,11 @@ static void dn_ssl_diag(dn_ssl *Q) {
 }
 static void dn_ssl_cls(dn_ssl *Q, unet *n, float *cls) {   /* the CLS of the net's last forward */
     int S = 0, nreg = 0; const float *tok = unet_tokens(n, nullptr, &S, nullptr, &nreg);
-    if (Q->cls_reg) nn_d2d(cls, tok, (size_t)Q->C * 4); else dr_pool_fwd(tok, 1, S, Q->C, nreg, cls);
+    if (Q->cls_reg == 2) { nn_d2d(cls, tok, (size_t)Q->C * 4); dr_pool_fwd(tok, 1, S, Q->C, nreg, cls + Q->C); }   /* (--cls both: register | token mean) */
+    else if (Q->cls_reg) nn_d2d(cls, tok, (size_t)Q->C * 4); else dr_pool_fwd(tok, 1, S, Q->C, nreg, cls);
 }
 static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
-    const int N = Q->N, C = Q->C, K = Q->K, NV = 2 * N + Q->NL * N, CIN = Q->CIN; const size_t g3 = (size_t)Q->PG * Q->PG * Q->PG, l3 = (size_t)Q->PL * Q->PL * Q->PL, ps3 = (size_t)Q->Ps * Q->Ps * Q->Ps;
+    const int N = Q->N, C = Q->CC, CT = Q->C, K = Q->K, NV = 2 * N + Q->NL * N, CIN = Q->CIN; const size_t g3 = (size_t)Q->PG * Q->PG * Q->PG, l3 = (size_t)Q->PL * Q->PL * Q->PL, ps3 = (size_t)Q->Ps * Q->Ps * Q->Ps;
     const float gs = nn_get_grad_scale(); int hasax[32];
     /* N samples: windows up, views (the workers' crops / symmetries) + per-view intensity augmentation */
     for (int i = 0; i < N; i++) {
@@ -1018,9 +1019,10 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             nn_d2d(Q->bank + (size_t)(2 * i + v) * C, Q->clsS, (size_t)C * 4);
         }
         if (Q->cls_norm) dr_rownorm_bwd(Q->dcls, Q->clsS, Q->rsS, 1, C, Q->dcls);
-        if (Q->tgn < (size_t)Sv * C) { nn_free(Q->tgrad); Q->tgn = (size_t)Sv * C; Q->tgrad = nn_malloc(Q->tgn * 4); }
-        nn_zero(Q->tgrad, (size_t)Sv * C * 4);
-        if (Q->cls_reg) nn_axpy(Q->tgrad, gs, Q->dcls, (size_t)C); else { dn_axpby(Q->dcls, Q->dcls, (size_t)C, gs, 0.f); dr_pool_bwd(Q->dcls, 1, Sv, C, nreg, Q->tgrad); }
+        if (Q->tgn < (size_t)Sv * CT) { nn_free(Q->tgrad); Q->tgn = (size_t)Sv * CT; Q->tgrad = nn_malloc(Q->tgn * 4); }
+        nn_zero(Q->tgrad, (size_t)Sv * CT * 4);
+        if (Q->cls_reg) nn_axpy(Q->tgrad, gs, Q->dcls, (size_t)CT);   /* (the register row) */
+        if (Q->cls_reg != 1) { float *dp = Q->dcls + (Q->cls_reg == 2 ? CT : 0); dn_axpby(dp, dp, (size_t)CT, gs, 0.f); dr_pool_bwd(dp, 1, Sv, CT, nreg, Q->tgrad); }
         unet_set_token_grad(n, Q->tgrad);
         unet_backward(n, ib ? Q->glzib : gl ? Q->glzg : Q->glzl);
         unet_set_token_grad(n, nullptr);
@@ -1051,7 +1053,7 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
     const size_t ln = strlen(line);
     snprintf(line + ln, cap - ln, " | ssl: dino %.4f koleo %.4f H(t) %.2f H(mean) %.2f (max %.2f) pmax %.4f agree %.3f protos used %d / %d", Q->nsum ? Q->sums[0] / Q->nsum : 0.0, Q->nsum ? Q->sums[1] / Q->nsum : 0.0, H, Hm, log((double)K), pmax, Q->nsum ? Q->sums[2] / Q->nsum : 0.0, used, K);
     {   /* does the CLS carry the sample? cosine of a sample's two teacher globals vs of different samples (teacher rows, after the norm) */
-        const int C = Q->C; float *ct = malloc((size_t)R * C * 4); nn_d2h(ct, Q->clsT, (size_t)R * C * 4);
+        const int C = Q->CC; float *ct = malloc((size_t)R * C * 4); nn_d2h(ct, Q->clsT, (size_t)R * C * 4);
         double cs = 0, cd = 0; long nd = 0;
         for (int a = 0; a < R; a++) for (int b = a + 1; b < R; b++) {
             double x = 0, ya = 0, yb = 0; for (int c = 0; c < C; c++) { x += (double)ct[(size_t)a * C + c] * ct[(size_t)b * C + c]; ya += (double)ct[(size_t)a * C + c] * ct[(size_t)a * C + c]; yb += (double)ct[(size_t)b * C + c] * ct[(size_t)b * C + c]; }
@@ -1089,7 +1091,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     const float tau = (float)atof(opt(argc, argv, "--tau", "0.1")), hw = (float)atof(opt(argc, argv, "--hard-w", "4")), hr = (float)atof(opt(argc, argv, "--hard-r", "48"));
     const float wvar = (float)atof(opt(argc, argv, "--var", "30")), vgam = 0.8f / sqrtf((float)ED);
     const float noise = (float)atof(opt(argc, argv, "--noise", "0.15"));
-    const int cls_reg = !strcmp(opt(argc, argv, "--cls", "pool"), "reg");
+    const int cls_reg = !strcmp(opt(argc, argv, "--cls", "pool"), "reg") ? 1 : !strcmp(opt(argc, argv, "--cls", "pool"), "both") ? 2 : 0;   /* (both: register | token mean, the SSL batch) */
     /* --cls-norm 1 (default): the CLS layer-normed (no affine) before the DINO head and KoLeo, as upstream's final LayerNorm. Raw, the pooled
        CLS grew from |4| to |400| and a shared direction dominated it (pairwise cosine 0.5-0.8 across samples): the head saw no differences */
     const int cls_norm = atoi(opt(argc, argv, "--cls-norm", "1"));
@@ -1859,6 +1861,7 @@ int cmd_dino_train(int argc, char **argv) {
         cfg.attn_pe = !strcmp(pe, "peg") ? 0 : !strcmp(pe, "rope") ? 1 : !strcmp(pe, "none") ? 2 : -1;
         if (cfg.attn_pe < 0) { fprintf(stderr, "dino-train: --attn-pe peg|rope|none\n"); return 2; }
     }
+    if (opt(argc, argv, "--attn-out-init", nullptr)) setenv("UFSM_ATTN_OUT_INIT", opt(argc, argv, "--attn-out-init", "0"), 1);   /* (unet_init: the attention out projections at s x std, not 0) */
     unet *u = unet_create(&cfg); unet_init(u, seed); unet_head_bias_zero(u);   /* (no shared -2 bias direction in the embeddings) */
     const int HZ = atoi(opt(argc, argv, "--head-slab", "0"));   /* head slabs of HZ planes: no whole-window logits / logit gradient (large windows) */
     if (HZ && (fp32 || P % HZ)) { fprintf(stderr, "dino-train: --head-slab needs MX storage (--mx 1) and P a multiple of it\n"); return 2; }

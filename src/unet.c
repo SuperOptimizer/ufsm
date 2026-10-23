@@ -403,9 +403,12 @@ void unet_init(unet *u, uint64_t seed) {
             const double sd = 1.0 / sqrt((double)C);
             for (size_t i = 0; i < (size_t)3 * C * C; i++) h[bp->wqkv + i] = (float)(sd * gauss(&seed));
             for (size_t i = 0; i < (size_t)2 * F * C; i++) h[bp->w1 + i] = (float)(sd * gauss(&seed));
-            if (ufsm_env_on("UFSM_ATTN_NONZERO")) {   /* (tests: random out projections) */
-                for (size_t i = 0; i < (size_t)C * C; i++) h[bp->wo + i] = (float)(sd * gauss(&seed));
-                for (size_t i = 0; i < (size_t)C * F; i++) h[bp->w2 + i] = (float)(gauss(&seed) / sqrt((double)F));
+            /* out projections: 0 (identity blocks), random with UFSM_ATTN_NONZERO (tests), or UFSM_ATTN_OUT_INIT=s: s x the natural std (SSL: a
+               zero stage passes the register token through unchanged, the same CLS for every sample until the projections grow) */
+            const double os = ufsm_env_on("UFSM_ATTN_NONZERO") ? 1.0 : getenv("UFSM_ATTN_OUT_INIT") ? atof(getenv("UFSM_ATTN_OUT_INIT")) : 0.0;
+            if (os > 0) {
+                for (size_t i = 0; i < (size_t)C * C; i++) h[bp->wo + i] = (float)(os * sd * gauss(&seed));
+                for (size_t i = 0; i < (size_t)C * F; i++) h[bp->w2 + i] = (float)(os * gauss(&seed) / sqrt((double)F));
             }
         }
         for (size_t i = 0; i < (size_t)u->cfg.attn_reg * C; i++) h[u->reg_off + i] = (float)(0.02 * gauss(&seed));
