@@ -302,9 +302,9 @@ static double se_loss_value(se_acts *A, const uint8_t *dL, const uint8_t *dS, in
     for (int n = 0; n < N; n++) { cnt += hs[n * 8 + 1]; ce += hs[n * 8]; dc += (2 * hs[n * 8 + 2] + 1e-5) / (hs[n * 8 + 3] + hs[n * 8 + 4] + 1e-5) / N; rc += (hs[n * 8 + 5] + 1e-5) / (hs[n * 8 + 6] + 1e-5) / N; }
     return (cnt > 0 ? ce / cnt : 0) - dc - rc;
 }
-/* --gradcheck: a small decoder (pyramid 4 / 6 / 8 / 10 channels, 16^3, batch 2) on random features: analytic vs central differences */
+/* --gradcheck: a small decoder (pyramid 16 / 32 / 32 / 48 channels, 16^3, batch 2) on random features: analytic vs central differences */
 static int se_gradcheck(void) {
-    const int ch[4] = {4, 6, 8, 10}, N = 2, P = 16; se_dec D; dec_build(&D, 4, ch, N, P); se_acts A; acts_alloc(&A, &D);
+    const int ch[4] = {16, 32, 32, 48}, N = 2, P = 16; se_dec D; dec_build(&D, 4, ch, N, P); se_acts A; acts_alloc(&A, &D);
     const size_t V = (size_t)P * P * P; uint64_t rs = 5; float *f[4];
     for (int k = 0; k < 4; k++) { const int e = P >> k; const size_t n = (size_t)N * ch[k] * e * e * e; float *h = malloc(n * 4); for (size_t i = 0; i < n; i++) h[i] = (float)(2 * se_unif(&rs) - 1); f[k] = nm(n); nn_h2d(f[k], h, n * 4); free(h); }
     uint8_t *hL = malloc(N * V), *hS = malloc(N * V); for (size_t i = 0; i < N * V; i++) { const double u = se_unif(&rs); hL[i] = u < 0.1 ? 2 : u < 0.4 ? 1 : 0; hS[i] = hL[i] == 1 && se_unif(&rs) < 0.5; }
