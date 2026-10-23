@@ -78,6 +78,18 @@ void nn_restore_input(const uint8_t *low, void *x16, size_t n, int split, int h1
    (fp16 when h16, else bf16), else fp32. lg16: the logits are fp16 (else fp32). Not in place (the edge term reads neighbours) */
 void nn_restore_loss(const void *lg, int lg16, const uint8_t *low, const uint8_t *clean, int D, int H, int W, float eps, float mse_w, float edge_w,
                      void *gl, int g16, int h16, float gscale, double *st);
+/* real pairs (src/srpair.h): low = the input crop upsampled (nn_restore_upsample, step 4, phase 0), tgt = the target through the pair's
+   intensity map (0 = invalid), coarse = the (D / 4)^3 input crop. Loss over valid target voxels, e = logit + (low - tgt) / 64:
+   (1 - shift_w) Charbonnier(e) + shift_w Charbonnier(e_min) (e_min: the smallest error against the target at the voxel or, shift 1, its 6 face
+   neighbours: residual registration error) + mse e^2 / 2 + edge Charbonnier(e_i - e_j) (face pairs) + ds Charbonnier(mean of the output over
+   each 4^3 block - the input voxel) (downsample consistency, over input voxels with a fully valid block).
+   st (device, RP_NST doubles): 0 count, 1 main Charbonnier sum, 2 |error| DN sum, 3 error^2 DN sum, 4 input error^2 DN sum, 5 edge pairs,
+   6 edge Charbonnier sum, 7 ds Charbonnier sum, 8 ds count, 9 / 10 output / input gradient error^2 DN sum over face pairs, 11 / 12 output /
+   input SSIM sum over valid 8^3 blocks, 13 blocks (metrics only), 14 shift-min |error| DN sum. rd: (D / 4)^3 floats of scratch */
+enum { RP_NST = 16 };
+typedef struct { float eps, mse, edge, shift_w, ds; int shift; } restore_pair_w;
+void nn_restore_pair_loss(const void *lg, int lg16, const uint8_t *low, const uint8_t *tgt, const uint8_t *coarse, int D, int H, int W, const restore_pair_w *w,
+                          void *gl, int g16, int h16, float gscale, double *st, float *rd, int metrics);
 /* output CT: clean-free, low + 64 logit rounded, clamped to [1, 255], 0 where low is 0 */
 void nn_restore_output(const void *lg, int lg16, const uint8_t *low, uint8_t *out, size_t n);
 

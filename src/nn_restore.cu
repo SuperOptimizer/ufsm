@@ -273,3 +273,134 @@ extern "C" void nn_restore_output(const void *lg, int lg16, const uint8_t *low, 
     else restore_output_k<float><<<nblk(n, 256), 256>>>((const float *)lg, low, out, n);
     KCHECK();
 }
+
+/* ---- real pairs (train --task restore on sr_pair sources): shift-tolerant Charbonnier, edge, MSE, downsample consistency; metrics ---- */
+struct rp_geo { int D, H, W, q, shift; float eps, mw, ew, sw, dw, gs; };
+template <class L> __device__ __forceinline__ float rp_o(const L *lg, const uint8_t *lo, size_t i) { return (float)lg[i] + (float)lo[i] * 0.015625f; }
+__device__ __forceinline__ float rp_ch(float e, float eps) { return sqrtf(e * e + eps * eps) - eps; }
+__device__ __forceinline__ float rp_cd(float e, float eps) { return e * rsqrtf(e * e + eps * eps); }
+template <int K> __device__ __forceinline__ void rp_reduce(double (&s)[K], double *st, int off) {
+    __shared__ double r[K][256];
+    for (int k = 0; k < K; k++) r[k][threadIdx.x] = s[k];
+    __syncthreads();
+    for (int d = 128; d; d >>= 1) { if ((int)threadIdx.x < d) for (int k = 0; k < K; k++) r[k][threadIdx.x] += r[k][threadIdx.x + d]; __syncthreads(); }
+    if (!threadIdx.x) for (int k = 0; k < K; k++) if (r[k][0] != 0) atomicAdd(st + off + k, r[k][0]);
+}
+/* per input voxel c: r = mean of the output over its 4^3 fine block - input; rd[c] = Charbonnier'(r) (0 when the block or c is invalid) */
+template <class L> __global__ void rp_ds_k(const L *__restrict__ lg, const uint8_t *__restrict__ lo, const uint8_t *__restrict__ co, rp_geo g, float *__restrict__ rd, double *st) {
+    double s[2] = {0, 0};
+    const size_t nq = (size_t)g.q * g.q * g.q;
+    for (size_t c = (size_t)blockIdx.x * blockDim.x + threadIdx.x; c < nq; c += (size_t)blockDim.x * gridDim.x) {
+        const int cx = (int)(c % g.q), cy = (int)(c / g.q % g.q), cz = (int)(c / ((size_t)g.q * g.q));
+        float sum = 0.f; int cnt = 0;
+        for (int dz = 0; dz < 4; dz++) for (int dy = 0; dy < 4; dy++) for (int dx = 0; dx < 4; dx++) {
+            const size_t i = ((size_t)(4 * cz + dz) * g.H + (4 * cy + dy)) * g.W + 4 * cx + dx;
+            if (lo[i]) { sum += rp_o(lg, lo, i); cnt++; }
+        }
+        float v = 0.f;
+        if (cnt == 64 && co[c]) { const float r = sum * 0.015625f - (float)co[c] * 0.015625f; v = rp_cd(r, g.eps); s[0] += rp_ch(r, g.eps); s[1] += 1; }
+        rd[c] = v;
+    }
+    rp_reduce<2>(s, st, 7);
+}
+/* the shift-tolerant error: the error against the target at the voxel or (shift) at a face neighbour, whichever is smallest in magnitude */
+template <class L> __device__ __forceinline__ float rp_emin(const L *lg, const uint8_t *lo, const uint8_t *hi, const rp_geo &g, size_t i, float o) {
+    float em = o - (float)hi[i] * 0.015625f;
+    if (!g.shift) return em;
+    const size_t str[3] = {(size_t)g.H * g.W, (size_t)g.W, 1}; const int len[3] = {g.D, g.H, g.W};
+    for (int a = 0; a < 3; a++) {
+        const int c = (int)((i / str[a]) % len[a]);
+        if (c > 0 && hi[i - str[a]]) { const float e = o - (float)hi[i - str[a]] * 0.015625f; if (fabsf(e) < fabsf(em)) em = e; }
+        if (c < len[a] - 1 && hi[i + str[a]]) { const float e = o - (float)hi[i + str[a]] * 0.015625f; if (fabsf(e) < fabsf(em)) em = e; }
+    }
+    return em;
+}
+template <class L> __global__ void rp_stats_k(const L *__restrict__ lg, const uint8_t *__restrict__ lo, const uint8_t *__restrict__ hi, rp_geo g, double *st, size_t n) {
+    double s[8] = {0, 0, 0, 0, 0, 0, 0, 0};   /* st 0..6 as the synthetic loss, then the shift-min |error| DN */
+    double m[2] = {0, 0};                       /* st 9, 10: gradient error^2 of output / input against the target (DN) */
+    const size_t str[3] = {(size_t)g.H * g.W, (size_t)g.W, 1}; const int len[3] = {g.D, g.H, g.W};
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)blockDim.x * gridDim.x) {
+        if (!hi[i]) continue;
+        const float o = rp_o(lg, lo, i), e = o - (float)hi[i] * 0.015625f, em = rp_emin(lg, lo, hi, g, i, o), dn = 64.f * e, base = (float)lo[i] - (float)hi[i];
+        s[0] += 1; s[1] += (1.f - g.sw) * rp_ch(e, g.eps) + g.sw * rp_ch(em, g.eps); s[2] += fabsf(dn); s[3] += (double)dn * dn; s[4] += (double)base * base; s[7] += fabsf(64.f * em);
+        for (int a = 0; a < 3; a++) {
+            if ((int)((i / str[a]) % len[a]) == len[a] - 1 || !hi[i + str[a]]) continue;
+            const size_t j = i + str[a];
+            const float oj = rp_o(lg, lo, j), df = e - (oj - (float)hi[j] * 0.015625f);
+            s[5] += 1; s[6] += rp_ch(df, g.eps);
+            const float dt = (float)hi[j] - (float)hi[i], dout = 64.f * (oj - o), dl = (float)lo[j] - (float)lo[i];
+            m[0] += (double)(dout - dt) * (dout - dt); m[1] += (double)(dl - dt) * (dl - dt);
+        }
+    }
+    double s7[7] = {s[0], s[1], s[2], s[3], s[4], s[5], s[6]};
+    rp_reduce<7>(s7, st, 0);
+    __syncthreads();
+    rp_reduce<2>(m, st, 9);
+    __syncthreads();
+    double s14[1] = {s[7]};
+    rp_reduce<1>(s14, st, 14);
+}
+template <class L, class G> __global__ void rp_grad_k(const L *__restrict__ lg, const uint8_t *__restrict__ lo, const uint8_t *__restrict__ hi, rp_geo g, const float *__restrict__ rd,
+                                                    G *__restrict__ gl, const double *__restrict__ st, size_t n) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = 0.f;
+    const size_t str[3] = {(size_t)g.H * g.W, (size_t)g.W, 1}; const int len[3] = {g.D, g.H, g.W};
+    if (hi[i] && st[0] > 0) {
+        const float o = rp_o(lg, lo, i), e = o - (float)hi[i] * 0.015625f, em = rp_emin(lg, lo, hi, g, i, o), inv = (float)(1.0 / st[0]);
+        v = ((1.f - g.sw) * rp_cd(e, g.eps) + g.sw * rp_cd(em, g.eps) + g.mw * e) * inv;
+        if (g.ew != 0.f && st[5] > 0) {
+            const float ie = g.ew * (float)(1.0 / st[5]);
+            for (int a = 0; a < 3; a++) {
+                const int c = (int)((i / str[a]) % len[a]);
+                if (c > 0 && hi[i - str[a]]) { const size_t j = i - str[a]; const float df = e - (rp_o(lg, lo, j) - (float)hi[j] * 0.015625f); v += ie * rp_cd(df, g.eps); }
+                if (c < len[a] - 1 && hi[i + str[a]]) { const size_t j = i + str[a]; const float df = e - (rp_o(lg, lo, j) - (float)hi[j] * 0.015625f); v += ie * rp_cd(df, g.eps); }
+            }
+        }
+    }
+    if (g.dw != 0.f && st[8] > 0 && lo[i]) {
+        const int x = (int)(i % g.W), y = (int)(i / g.W % g.H), z = (int)(i / str[0]);
+        v += g.dw * rd[((size_t)(z >> 2) * g.q + (y >> 2)) * g.q + (x >> 2)] * 0.015625f * (float)(1.0 / st[8]);
+    }
+    gl[i] = f2h<G>(v * g.gs);
+}
+/* SSIM over non-overlapping 8^3 blocks whose voxels are all valid (target and input > 0), output and input against the target (DN) */
+template <class L> __global__ void __launch_bounds__(512) rp_ssim_k(const L *__restrict__ lg, const uint8_t *__restrict__ lo, const uint8_t *__restrict__ hi, rp_geo g, double *st) {
+    const int bx = g.W / 8, by = g.H / 8;
+    const int b = blockIdx.x, X = b % bx, Y = b / bx % by, Z = b / (bx * by);
+    const int t = threadIdx.x, x = 8 * X + (t & 7), y = 8 * Y + (t >> 3 & 7), z = 8 * Z + (t >> 6);
+    const size_t i = ((size_t)z * g.H + y) * g.W + x;
+    const int ok = hi[i] && lo[i];
+    const float o = 64.f * rp_o(lg, lo, i), tv = hi[i], l = lo[i];
+    __shared__ float r[9][512];
+    const float v[9] = {o, tv, l, o * o, tv * tv, l * l, o * tv, l * tv, (float)ok};
+    for (int k = 0; k < 9; k++) r[k][t] = v[k];
+    __syncthreads();
+    for (int d = 256; d; d >>= 1) { if (t < d) for (int k = 0; k < 9; k++) r[k][t] += r[k][t + d]; __syncthreads(); }
+    if (t || r[8][0] < 512.f) return;
+    const float N = 512.f, mo = r[0][0] / N, mt = r[1][0] / N, ml = r[2][0] / N;
+    const float vo = r[3][0] / N - mo * mo, vt = r[4][0] / N - mt * mt, vl = r[5][0] / N - ml * ml, co = r[6][0] / N - mo * mt, cl = r[7][0] / N - ml * mt;
+    const float C1 = 6.5025f, C2 = 58.5225f;
+    const float so = (2 * mo * mt + C1) * (2 * co + C2) / ((mo * mo + mt * mt + C1) * (vo + vt + C2)), sl = (2 * ml * mt + C1) * (2 * cl + C2) / ((ml * ml + mt * mt + C1) * (vl + vt + C2));
+    atomicAdd(st + 11, (double)so); atomicAdd(st + 12, (double)sl); atomicAdd(st + 13, 1.0);
+}
+template <class L> static void rp_loss_t(const L *lg, const uint8_t *lo, const uint8_t *hi, const uint8_t *co, rp_geo g, void *gl, int g16, int h16, double *st, float *rd, int metrics, size_t n) {
+    CK(cudaMemsetAsync(st, 0, RP_NST * sizeof(double), 0));
+    const size_t nq = (size_t)g.q * g.q * g.q;
+    if (g.dw != 0.f || metrics) { int nb = (int)((nq + 255) / 256); if (nb > 1024) nb = 1024; rp_ds_k<L><<<nb, 256>>>(lg, lo, co, g, rd, st); }
+    int nb = (int)((n + 255) / 256); if (nb > 2048) nb = 2048;
+    rp_stats_k<L><<<nb, 256>>>(lg, lo, hi, g, st, n);
+    if (metrics && g.D % 8 == 0 && g.H % 8 == 0 && g.W % 8 == 0) rp_ssim_k<L><<<(g.D / 8) * (g.H / 8) * (g.W / 8), 512>>>(lg, lo, hi, g, st);
+    if (!gl) return;
+    if (!g16) { g.gs = 1.f; rp_grad_k<L, float><<<nblk(n, 256), 256>>>(lg, lo, hi, g, rd, (float *)gl, st, n); }
+    else if (h16) rp_grad_k<L, f16><<<nblk(n, 256), 256>>>(lg, lo, hi, g, rd, (f16 *)gl, st, n);
+    else rp_grad_k<L, bf16><<<nblk(n, 256), 256>>>(lg, lo, hi, g, rd, (bf16 *)gl, st, n);
+}
+extern "C" void nn_restore_pair_loss(const void *lg, int lg16, const uint8_t *low, const uint8_t *tgt, const uint8_t *coarse, int D, int H, int W, const restore_pair_w *w,
+                                     void *gl, int g16, int h16, float gscale, double *st, float *rd, int metrics) {
+    const size_t n = (size_t)D * H * W;
+    rp_geo g = {D, H, W, D / 4, w->shift, w->eps, w->mse, w->edge, w->shift_w, w->ds, gscale};
+    if (lg16) rp_loss_t<f16>((const f16 *)lg, low, tgt, coarse, g, gl, g16, h16, st, rd, metrics, n);
+    else rp_loss_t<float>((const float *)lg, low, tgt, coarse, g, gl, g16, h16, st, rd, metrics, n);
+    KCHECK();
+}

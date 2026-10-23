@@ -32,6 +32,7 @@ SRC += src/inksplat.c
 SRC += src/tfx.c
 SRC += src/fitjoin.c src/fieldsoracle.c src/packmap.c src/scanprep.c
 SRC += src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
+SRC += src/srpair.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm

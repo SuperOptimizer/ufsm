@@ -6,6 +6,7 @@
 #include "ct_augment.h"
 #include "spatial_augment.h"
 #include "edt.h"
+#include "srpair.h"
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -196,7 +197,7 @@ static batch alloc_batch(const sample_cfg *c) {
     b.rad = c->gpu_input ? halloc((size_t)c->B * NN_RAD_REC(PZ(c))) : nullptr;
     b.x = c->xfmt || c->restore ? nullptr : halloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
     b.x16 = c->xfmt && !c->restore ? halloc((size_t)c->B * xc * p3 * 2) : nullptr;
-    b.t = c->pack_tm ? nullptr : halloc((size_t)c->B * (c->restore ? 1 : NCH) * p3);   /* (task restore: the clean CT alone) */
+    b.t = c->pack_tm ? nullptr : halloc((size_t)c->B * (c->restore == 1 ? 1 : NCH) * p3);   /* (task restore: the clean CT alone; real pairs: target + input crop) */
     b.m = c->pack_tm || c->restore ? nullptr : halloc((size_t)c->B * p3);
     b.tm = c->pack_tm ? halloc((size_t)c->B * p3) : nullptr;   /* one code byte per voxel instead of NCH + 1 */
     b.w = halloc((size_t)c->B * NCH);
@@ -1724,7 +1725,45 @@ static int draw_restore(sampler *sp, batch *b, int i, rng *r, uint8_t *big) {
     atomic_fetch_add(&sp->produced, 1);
     return 0;
 }
+/* task restore on real pairs (restore 2, src/srpair.h): a box of a pair source (training: its "train" boxes, validation: its "test" boxes or
+   every box of a "val" pair), a P^3 target crop at a fine offset 4 oc and the native (P / 4)^3 crop at oc; a cube symmetry and (training) a
+   tone LUT on both; batch.t row i = [target P^3 | input (P / 4)^3, rest of the row 0] */
+static int draw_restore_pair(sampler *sp, batch *b, int i, rng *r, uint8_t *big) {
+    const sample_cfg *c = &sp->cfg;
+    const int P = c->P, q = P / 4;
+    const size_t p3 = P3(sp), q3 = (size_t)q * q * q;
+    double u = runif(r) * sp->cum[sp->S->n - 1];
+    int si = 0; while (si < sp->S->n - 1 && sp->cum[si] < u) si++;
+    source *s = &sp->S->src[si]; const srpair *p = s->srp;
+    if (!p) return 1;
+    const int nb = c->holdout ? p->nte : p->ntr; if (nb <= 0 || q > p->B) return 1;
+    const int k = (c->holdout ? p->te : p->tr)[rint_below(r, nb)];
+    int oc[3]; for (int d = 0; d < 3; d++) oc[d] = (int)rint_below(r, p->B - q + 1);
+    uint8_t *co = malloc(q3); if (!co) return -1;
+    if (srpair_read(p, k, oc, P, big, co)) { free(co); return -1; }
+    size_t nz = 0; for (size_t v = 0; v < p3; v++) nz += big[v] != 0;
+    if ((double)nz / (double)p3 < c->min_fg) { free(co); atomic_fetch_add(&sp->rejected, 1); return 1; }
+    sym y = sym_of(0);
+    if (c->augment) {
+        y = sym_of((int)rint_below(r, 48));
+        const double gain = exp((runif(r) * 2 - 1) * 0.12), gam = exp((runif(r) * 2 - 1) * 0.12);
+        uint8_t lut[256]; lut[0] = 0;
+        for (int v = 1; v < 256; v++) { const double t = 255 * gain * pow(v / 255.0, gam); lut[v] = (uint8_t)(t < 1 ? 1 : t > 255 ? 255 : lrint(t)); }
+        for (size_t v = 0; v < p3; v++) big[v] = lut[big[v]];
+        for (size_t v = 0; v < q3; v++) co[v] = lut[co[v]];
+    }
+    uint8_t *row = b->t + (size_t)i * 2 * p3;
+    sym_u8(big, row, P, P, y);
+    memset(row + p3, 0, p3); sym_u8(co, row + p3, q, q, y);
+    free(co);
+    memset(b->w + (size_t)i * NCH, 0, NCH); b->w[(size_t)i * NCH] = 1;
+    b->src[i] = (int16_t)si; b->level[i] = 0; b->um[i] = (float)(s->um / 4);
+    b->corner[i][0] = (int64_t)k * p->B + oc[0]; b->corner[i][1] = oc[1]; b->corner[i][2] = oc[2];
+    atomic_fetch_add(&sp->produced, 1);
+    return 0;
+}
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
+    if (sp->cfg.restore == 2) return draw_restore_pair(sp, b, i, r, big);
     if (sp->cfg.restore) return draw_restore(sp, b, i, r, big);
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
@@ -2562,6 +2601,11 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     double acc = 0;
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i]; int region_ch = -1, eligible = 0;
+        if (cfg->restore == 2) {   /* real SR pairs: the pair's boxes for this mode */
+            eligible = s->srp && (cfg->holdout ? s->srp->nte : s->srp->ntr) > 0 && cfg->P % 4 == 0 && cfg->P / 4 <= s->srp->B && PZ(cfg) == cfg->P;
+            if (!(s->weight >= 0)) eligible = 0;
+            acc += eligible ? s->weight : 0; sp->cum[i] = acc; continue;
+        }
         for (int c = 0; c < NCH; c++) if (s->reg[c] && s->reg[c]->n) region_ch = c;
         for (int l = s->min_level < 0 ? 0 : s->min_level; l < MAXLEV; l++) if (sp->cfg.level_p[l] > 0 && (region_ch < 0 || l <= 1) && level_ok(sp, s, i, l, region_ch)) eligible = 1;
         if (!isfinite(s->weight) || s->weight < 0) { fprintf(stderr, "sampler: invalid source weight: %s\n", s->name); free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
@@ -2588,7 +2632,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     pthread_cond_init(&sp->cv_free, nullptr);
     pthread_cond_init(&sp->cv_ready, nullptr);
     sp->occ = calloc((size_t)S->n, sizeof *sp->occ);
-    for (int i = 0; !cfg->cover && i < S->n; i++) {
+    for (int i = 0; !cfg->cover && cfg->restore != 2 && i < S->n; i++) {
         occ_index o = source_occupancy(&S->src[i]);
         const source *fs = &S->src[i];
         if (o.n && fs->focus && fs->focus_w > 0) {   /* "focus": cell k drawn 1 + w x packed share times as often (repeated in the index) */

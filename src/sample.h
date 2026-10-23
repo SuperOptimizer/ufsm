@@ -90,7 +90,8 @@ typedef struct {
                                 kept as separate gauges); warped samples pull it through the warp within one component */
     int wind4_step, wind4_min;   /* band_wind4's maxstep (phase codes; 0: 80 = 0.32 turn) and minsize (voxels; 0: 512) */
     int wind4_tile;          /* band_wind4_tiled's tile edge (at least P / 6: <= 216 tiles, one gauge each); < 0 the whole window */
-    int restore;             /* task restore: no target reads; batch.t holds the clean CT window alone (B x P^3, tone LUT and symmetry applied),
+    int restore;             /* 2: real SR pairs (sources with "sr_pair", src/srpair.h): batch.t row = [target P^3 (through the pair's intensity map) |
+                                the native input crop (P / 4)^3], both under one symmetry and tone LUT. 1, task restore: no target reads; batch.t holds the clean CT window alone (B x P^3, tone LUT and symmetry applied),
                                 batch.x / x16 and batch.m are absent (the trainer degrades the window on the device); training windows lie inside a
                                 source "boxes" entry when the source lists boxes, validation windows inside its holdout box; level = the source's min_level */
 } sample_cfg;

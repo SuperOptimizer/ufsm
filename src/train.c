@@ -5,6 +5,7 @@
 #include "sample.h"
 #include "papyrus.h"
 #include "restore.h"
+#include "srpair.h"
 #include "cover.h"
 #include <limits.h>
 #include "sources.h"
@@ -72,7 +73,7 @@ typedef struct {
     uint8_t *papb[2], *pap, *pt1, *pmk1, *pw1; float *pscr, pout3[3]; double pap_loss;   /* --pap-head: labels (double-buffered), target, mask, weight; scratch, parts */
     void *x2, *glh, *lrt; float *lgf;  /* --half-res: the network's input and logit gradient, the intermediate grid (div 4), the full-resolution fp32 logits */
     uint8_t *ds_t[UNET_MAXLEV], *ds_m[UNET_MAXLEV]; float *ds_gl[UNET_MAXLEV], *ds_scr[UNET_MAXLEV], ds_out[UNET_MAXLEV][2 * 8 + 2]; double ds_loss; int ds_fresh;   /* --deep-sup (fresh: the last batch computed them) */
-    uint8_t *rlow; void *rscr; size_t rscr_b; double *rst, rst_h[8]; restore_recipe rcp;   /* task restore: degraded input (uint8), degradation scratch,
+    uint8_t *rlow; void *rscr; size_t rscr_b; double *rst, rst_h[RP_NST]; float *rrd; restore_recipe rcp;   /* task restore: degraded input (uint8), degradation scratch,
                                                                                       loss sums (device / last fetched), the recipe of the next forward */
 } gpu_state;
 /* task band_affinity: output channel 0 = recto (dense loss on target channel 0), channels 1..K = affinities for g_aff_off */
@@ -160,6 +161,7 @@ static int papyrus_args(int argc, char **argv, int B) {
 /* --task restore (src/restore.h): target channel 0 the clean CT (1 channel, no mask: CT > 0), the input degraded from it on the device per
    step (a family drawn from --restore-mix, its parameters from the ranges), residual output input + 64 logit, Charbonnier + edge + MSE */
 static int g_restore, g_rsplit = 1; static float g_reps = 0.01f, g_rmse = 0.1f, g_redge = 0.5f; static restore_ranges g_rr;
+static int g_rpairs; static restore_pair_w g_rpw;   /* --sr-pairs 1: real pairs (sources with "sr_pair", src/srpair.h) and their loss weights */
 static uint64_t g_rseed; static int g_rP; static int g_Pz;   /* (the window edge, for the recipes) */
 static int restore_args(int argc, char **argv) {
     restore_ranges_default(&g_rr);
@@ -175,6 +177,10 @@ static int restore_args(int argc, char **argv) {
 #undef RANGE
     g_rr.sc_edge_p = (float)atof(opt(argc, argv, "--scanner-edge-p", "0.3")); g_rr.sc_aniso = (float)atof(opt(argc, argv, "--scanner-aniso", "0.15"));
     g_rr.sc_gain = (float)atof(opt(argc, argv, "--scanner-gain", "0.06")); g_rr.sc_gamma = (float)atof(opt(argc, argv, "--scanner-gamma", "0.06")); g_rr.sc_bias = (float)atof(opt(argc, argv, "--scanner-bias", "3"));
+    g_rpairs = atoi(opt(argc, argv, "--sr-pairs", "0")) != 0;
+    g_rpw = (restore_pair_w){g_reps, g_rmse, g_redge, (float)atof(opt(argc, argv, "--sr-shift-w", "0.5")), (float)atof(opt(argc, argv, "--sr-ds", "0.5")), atoi(opt(argc, argv, "--sr-shift", "1"))};
+    if (g_rpairs && (!(g_rpw.shift_w >= 0 && g_rpw.shift_w <= 1) || g_rpw.ds < 0 || (g_rpw.shift != 0 && g_rpw.shift != 1))) { fprintf(stderr, "--sr-shift-w 0..1, --sr-ds >= 0, --sr-shift 0|1\n"); return 1; }
+    if (g_rpairs) fprintf(stderr, "restore: real pairs: loss (1 - %g) Charbonnier + %g shift-min Charbonnier (shift %d) + %g edge + %g MSE + %g downsample consistency\n", g_rpw.shift_w, g_rpw.shift_w, g_rpw.shift, g_redge, g_rmse, g_rpw.ds);
     if (!(g_reps > 0) || g_rmse < 0 || g_redge < 0 || !(g_rr.sc_step[0] >= 2 && g_rr.sc_step[1] >= g_rr.sc_step[0]) || g_rr.pyr_q < 0 || g_rr.sc_q < 0) { fprintf(stderr, "restore: eps > 0, weights >= 0, --scanner-step >= 2\n"); return 1; }
     fprintf(stderr, "restore: mix identity %.3g pyramid %.3g (4x block mean, q %g) scanner %.3g (step %g-%g, psf %g-%g coarse voxels, noise %g-%g DN, sigvar %g-%g, corr %g-%g, edge %g-%g p %g, q %g); "
                     "input %s (x - 128) / 64, residual out = input + 64 logit; loss Charbonnier (eps %g) + %g edge + %g MSE\n",
@@ -260,7 +266,7 @@ enum { VAL_DISK, VAL_RAM, VAL_REGEN, VAL_NF = 16 };
 static int val_fields(batch *b, int B, size_t p3, void **f[VAL_NF], size_t sz[VAL_NF]) {
     int n = 0;
 #define VF(p_, s_) do { f[n] = (void **)&(p_); sz[n++] = (s_); } while (0)
-    if (g_restore) { VF(b->t, (size_t)B * p3); VF(b->w, (size_t)B * NCH); VF(b->src, (size_t)B * sizeof *b->src); VF(b->um, (size_t)B * sizeof *b->um); return n; }   /* (the clean CT alone) */
+    if (g_restore) { VF(b->t, (size_t)B * g_tc * p3); VF(b->w, (size_t)B * NCH); VF(b->src, (size_t)B * sizeof *b->src); VF(b->um, (size_t)B * sizeof *b->um); return n; }   /* (the clean CT alone) */
     if (g_xfmt) VF(b->x16, (size_t)B * g_xs * p3 * 2); else VF(b->x, (size_t)B * g_xs * p3 * 4);
     if (g_gpu_in) VF(b->rad, rad_bytes(B));
     if (g_pack) VF(b->tm, (size_t)B * p3); else { VF(b->t, (size_t)B * NCH * p3); VF(b->m, (size_t)B * p3); }
@@ -325,7 +331,7 @@ static void upload_slab(gpu_state *d, const batch *b, int i, int B, int P, int a
 /* task restore: the clean window (target channel 0) and its weight byte; the input is built on the device */
 static void restore_upload(gpu_state *d, const batch *b, int i, int B, int P, int async) {
     void (*cp)(void *, const void *, size_t) = async ? nn_h2d_copy_stream : nn_h2d;
-    cp(d->tb[i], b->t, (size_t)B * g_Pz * P * P); cp(d->wb[i], b->w, (size_t)B * g_tc);
+    cp(d->tb[i], b->t, (size_t)B * g_tc * g_Pz * P * P); cp(d->wb[i], b->w, (size_t)B * g_tc);
 }
 /* synchronous upload (pageable host memory: validation batches) */
 static void upload(gpu_state *d, const batch *b, int B, int P) {
@@ -680,7 +686,11 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     const int q = P / g_hdiv, hm = unet_hr_mode(g_half);
     const shape5 hs = {B, g_cout, q, q, q};   /* --half-res: the network's grid, the full-resolution output channels */
     const float *lg;
-    if (g_restore) {   /* the input from the clean window: the recipe's degradation, then (x - 128) / 64 */
+    if (g_restore && g_rpairs) {   /* real pairs: the input crop (target row 1) upsampled x4 onto the window, then (x - 128) / 64 */
+        const float st4[3] = {4.f, 4.f, 4.f}, ph0[3] = {0.f, 0.f, 0.f}; const size_t p3_ = (size_t)g_Pz * P * P;
+        nn_restore_upsample(d->t + p3_, P / 4, P / 4, P / 4, d->rlow, g_Pz, P, P, st4, ph0, nullptr);
+        nn_restore_input(d->rlow, d->x, p3_, g_rsplit, g_xfmt == 1);
+    } else if (g_restore) {   /* the input from the clean window: the recipe's degradation, then (x - 128) / 64 */
         if (nn_restore_degrade(d->t, d->rlow, g_Pz, P, P, &d->rcp, d->rscr, d->rscr_b, nullptr)) { fprintf(stderr, "restore: the degradation scratch is too small for this recipe\n"); abort(); }
         nn_restore_input(d->rlow, d->x, (size_t)g_Pz * P * P, g_rsplit, g_xfmt == 1);
     }
@@ -748,7 +758,9 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     if (prof) nn_prof_begin(6);
     shape5 ts = os; if (g_aff) ts.c = NCH;   /* B == 1: the target channels are the leading output channels */
     nn_set_logits_h16((!g_half || g_pkf) && unet_logits_h16(d->u));   /* lean 2: fp16 logits in the gradient buffer */
-    if (g_restore) nn_restore_loss(lg, unet_logits_h16(d->u), d->rlow, d->t, g_Pz, P, P, g_reps, g_rmse, g_redge, train ? d->gl : nullptr, g_g16, nn_get_f16(), nn_get_grad_scale(), d->rst);
+    if (g_restore && g_rpairs) nn_restore_pair_loss(lg, unet_logits_h16(d->u), d->rlow, d->t, d->t + (size_t)g_Pz * P * P, g_Pz, P, P, &g_rpw, train ? d->gl : nullptr, g_g16, nn_get_f16(),
+                                                    nn_get_grad_scale(), d->rst, d->rrd, !train);
+    else if (g_restore) nn_restore_loss(lg, unet_logits_h16(d->u), d->rlow, d->t, g_Pz, P, P, g_reps, g_rmse, g_redge, train ? d->gl : nullptr, g_g16, nn_get_f16(), nn_get_grad_scale(), d->rst);
     else if (g_unwrap2) {}   /* no recto / ink heads */
     else if (g_unwrap) {   /* recto on target 0 with the label mask; ink on target 1 over all papyrus, each its own loss */
         const size_t l3 = (size_t)os.d * os.h * os.w, eb = g_g16 ? 2 : 4, le = unet_logits_h16(d->u) ? 2 : 4;
@@ -833,13 +845,43 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
 }
 /* task restore: the loss sums of the last forward (rst_h); out[0] the Charbonnier term, out[NCH] the edge term */
 static double restore_fetch(gpu_state *d, float *out) {
-    nn_d2h(d->rst_h, d->rst, 8 * sizeof(double));
+    nn_d2h(d->rst_h, d->rst, (g_rpairs ? RP_NST : 8) * sizeof(double));
+    if (g_rpairs) {   /* real pairs: main + edge + MSE + downsample consistency */
+        const double *s = d->rst_h, n = s[0] > 0 ? s[0] : 1, edge = s[5] > 0 ? s[6] / s[5] : 0, ds = s[8] > 0 ? s[7] / s[8] : 0;
+        for (int c = 0; c < 2 * NCH + 1; c++) out[c] = 0;
+        out[0] = (float)(s[1] / n); out[NCH] = (float)edge; out[2 * NCH] = 1;
+        return s[1] / n + 0.5 * g_rmse * s[3] / 4096.0 / n + g_redge * edge + g_rpw.ds * ds;
+    }
     const double *s = d->rst_h, n = s[0] > 0 ? s[0] : 1, edge = s[5] > 0 ? s[6] / s[5] : 0;
     for (int c = 0; c < 2 * NCH + 1; c++) out[c] = 0;
     out[0] = (float)(s[1] / n); out[NCH] = (float)edge; out[2 * NCH] = 1;
     return s[1] / n + 0.5 * g_rmse * s[3] / 4096.0 / n + g_redge * edge;
 }
 static double psnr_of(double sse, double n) { return n > 0 && sse > 0 ? 10.0 * log10(255.0 * 255.0 * n / sse) : 99.0; }
+/* real pairs validation (g_rpv: per source the RP_NST sums of its validation windows): per pair and per role (training pairs' held-out boxes,
+   "val" pairs) PSNR of output / input against the target (after the intensity map), SSIM over 8^3 blocks, gradient PSNR; restore_val.csv;
+   the criterion (best.ckpt) is minus the mean PSNR gain over every validated pair */
+static double *g_rpv;
+static void restore_pair_report(const sources *S, const char *out, int step, double *vcrit) {
+    char cp_[1400]; snprintf(cp_, sizeof cp_, "%s/restore_val.csv", out);
+    FILE *rf = fopen(cp_, "a");
+    if (rf) { fseek(rf, 0, SEEK_END); if (!ftell(rf)) fprintf(rf, "step,pair,role,voxels,psnr,input_psnr,gain,ssim,input_ssim,grad_psnr,input_grad_psnr\n"); }
+    double gs = 0; int ng = 0, nr[2] = {0, 0}; double rs[2][4] = {{0}};
+    for (int i = 0; i < S->n; i++) {
+        const double *v = g_rpv + (size_t)i * RP_NST; if (!(v[0] > 0) || !S->src[i].srp) continue;
+        const int role = S->src[i].srp->role;
+        const double p = psnr_of(v[3], v[0]), pb = psnr_of(v[4], v[0]), ss = v[13] > 0 ? v[11] / v[13] : 0, sb = v[13] > 0 ? v[12] / v[13] : 0,
+                     gp = psnr_of(v[9], v[5]), gb = psnr_of(v[10], v[5]);
+        fprintf(stderr, "val sr %s (%s): psnr %.3f (input %.3f, gain %+.3f) ssim %.4f (input %.4f) grad psnr %.3f (input %.3f)\n", S->src[i].name, role ? "val" : "test",
+                p, pb, p - pb, ss, sb, gp, gb);
+        if (rf) fprintf(rf, "%d,%s,%s,%.0f,%.4f,%.4f,%.4f,%.5f,%.5f,%.4f,%.4f\n", step, S->src[i].name, role ? "val" : "test", v[0], p, pb, p - pb, ss, sb, gp, gb);
+        gs += p - pb; ng++; nr[role]++; rs[role][0] += p - pb; rs[role][1] += ss - sb; rs[role][2] += gp - gb; rs[role][3] += ss;
+    }
+    for (int r = 0; r < 2; r++) if (nr[r]) fprintf(stderr, "val sr step %d %s pairs (%d): mean gain psnr %+.4f dB ssim %+.5f (ssim %.4f) grad psnr %+.4f dB\n", step, r ? "val" : "held-out test",
+                                                    nr[r], rs[r][0] / nr[r], rs[r][1] / nr[r], rs[r][3] / nr[r], rs[r][2] / nr[r]);
+    if (rf) fclose(rf);
+    if (ng) *vcrit = -gs / ng;
+}
 /* fetch the loss parts of the last run_batch on this GPU (synchronous); returns the scalar loss */
 static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     if (g_restore) return restore_fetch(d, out);
@@ -1194,7 +1236,7 @@ int cmd_train(int argc, char **argv) {
     if (ufsm_env_on("UFSM_X32")) g_xfmt = g_g16 = 0;   /* diagnostic: fp32 batches and logit gradient, converted on the device (the old path) */
     nn_set_loss_grad_h16(g_g16);
     if (g_restore && g_xfmt != 1) { fprintf(stderr, "--task restore: needs 16-bit (fp16) batches: tensor cores, --f16 1, 16-bit activation storage\n"); return 2; }
-    if (g_restore) g_tc = 1;   /* the clean CT */
+    if (g_restore) g_tc = g_rpairs ? 2 : 1;   /* the clean CT (real pairs: the target and the input crop) */
     g_heads = atoi(opt(argc, argv, "--heads", "0"));   /* recto heads, one per teacher: sources name theirs ("head": k); channel 0 is head 0, then sheet, then heads 1.. */
     if (g_heads == 1) g_heads = 0;
     if (g_heads) {
@@ -1301,6 +1343,7 @@ int cmd_train(int argc, char **argv) {
     g_Sdiag = S;
     if (!S) return 1;
     g_S = S;
+    for (int i = 0; g_restore && i < S->n; i++) if (!S->src[i].srp != !g_rpairs) { fprintf(stderr, "--task restore: %s: \"sr_pair\" sources need --sr-pairs 1 and --sr-pairs 1 needs them all\n", S->src[i].name); return 2; }
     for (int i = 0; i < S->n; i++) {   /* --heads: every source's head exists; sources naming heads need --heads */
         const int h = S->src[i].head;
         if (h && (!g_heads || h >= g_heads)) { fprintf(stderr, "sources: %s trains head %d; train --heads %d or more\n", S->src[i].name, h, h + 1); return 2; }
@@ -1327,7 +1370,7 @@ int cmd_train(int argc, char **argv) {
     if (!(sc.min_phase >= 0 && sc.min_phase < 1) || (sc.min_phase > 0 && g_side != 2)) { fprintf(stderr, "--min-phase: 0 .. 1, with the phase head (task unwrap / unwrap2)\n"); return 2; }
     if (g_unwrap2 && (sc.wind4_step < 1 || sc.wind4_step > 125 || sc.wind4_min < 1)) { fprintf(stderr, "--wind4-step 1..125 (phase codes, 252 per turn), --wind4-min >= 1\n"); return 2; }
     sc.papyrus = g_papyrus ? &g_pap : nullptr;
-    sc.restore = g_restore; if (g_restore) sc.min_fg = optd(argc, argv, "--min-fg", 0.5);
+    sc.restore = g_restore ? 1 + g_rpairs : 0; if (g_restore) sc.min_fg = optd(argc, argv, "--min-fg", 0.5);
     sc.shell = atoi(opt(argc, argv, "--shell", "0"));   /* background within R level-0 voxels of a label ignored */
     sc.iso = atoi(opt(argc, argv, "--iso", "0"));          /* void cutoff of sources without "iso" */
     sc.iso_void = atoi(opt(argc, argv, "--iso-void", "0")); sc.iso_pap = atoi(opt(argc, argv, "--iso-pap", "2")); sc.iso_lift = atoi(opt(argc, argv, "--iso-lift", "0"));
@@ -1871,7 +1914,7 @@ int cmd_train(int argc, char **argv) {
             d->pscr = nn_malloc(nn_loss_scratch((shape5){1, 1, g_Pz, P, P}) + 64);
         }
         d->scratch = nn_malloc(nn_loss_scratch((shape5){B, g_tc, g_Pz, P, P}) + 64);
-        if (g_restore) { d->rlow = nn_malloc(p3); d->rscr_b = restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)); d->rscr = nn_malloc(d->rscr_b); d->rst = nn_malloc(8 * sizeof(double)); }
+        if (g_restore) { d->rlow = nn_malloc(p3); d->rscr_b = restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)); d->rscr = nn_malloc(d->rscr_b); d->rst = nn_malloc(RP_NST * sizeof(double)); d->rrd = g_rpairs ? nn_malloc((size_t)(P / 4) * (P / 4) * (P / 4) * sizeof(float) + 256) : nullptr; }
         d->tolc = nn_get_loss_tol() ? nn_malloc((size_t)B * p3) : nullptr;
         d->lean = lean;
         d->upsplit = lean && tail && !split && !g_restore && d->side < 0 && !g_head_slab && !g_aff && !g_side && !g_unwrap && !g_cond && !g_pap_head
@@ -1927,7 +1970,7 @@ int cmd_train(int argc, char **argv) {
         snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"task\":\"restore\",\"restore\":{\"version\":1,\"input\":\"%s\",\"center\":128,\"scale\":64,\"residual\":true,\"output\":\"input + 64 logit\",\"upsampling\":\"trilinear\","
                  "\"fine_um\":%.9g,\"eps\":%.9g,\"mse_weight\":%.9g,\"edge_weight\":%.9g,\"mix\":{\"identity\":%.9g,\"pyramid\":%.9g,\"scanner\":%.9g},\"pyramid\":{\"factor\":4,\"q\":%.9g},"
                  "\"scanner\":{\"step\":[%.9g,%.9g],\"psf\":[%.9g,%.9g],\"aniso\":%.9g,\"noise\":[%.9g,%.9g],\"sigvar\":[%.9g,%.9g],\"corr\":[%.9g,%.9g],\"edge\":[%.9g,%.9g],\"edge_p\":%.9g,\"gain\":%.9g,\"gamma\":%.9g,\"bias\":%.9g,\"q\":%.9g}}}",
-                 g_rsplit?"split":"plain",S->src[0].um*(double)(1<<(S->src[0].min_level>0?S->src[0].min_level:0)),g_reps,g_rmse,g_redge,g_rr.mix[0],g_rr.mix[1],g_rr.mix[2],g_rr.pyr_q,
+                 g_rsplit?"split":"plain",g_rpairs?S->src[0].um/4:S->src[0].um*(double)(1<<(S->src[0].min_level>0?S->src[0].min_level:0)),g_reps,g_rmse,g_redge,g_rr.mix[0],g_rr.mix[1],g_rr.mix[2],g_rr.pyr_q,
                  g_rr.sc_step[0],g_rr.sc_step[1],g_rr.sc_psf[0],g_rr.sc_psf[1],g_rr.sc_aniso,g_rr.sc_noise[0],g_rr.sc_noise[1],g_rr.sc_sigvar[0],g_rr.sc_sigvar[1],g_rr.sc_corr[0],g_rr.sc_corr[1],
                  g_rr.sc_edge[0],g_rr.sc_edge[1],g_rr.sc_edge_p,g_rr.sc_gain,g_rr.sc_gamma,g_rr.sc_bias,g_rr.sc_q);
     }
@@ -2346,6 +2389,7 @@ int cmd_train(int argc, char **argv) {
             double vl = -1, vb = 0, vd = 0, vh[TCMAX] = {0}; int vhn[TCMAX] = {0}; double vw4[6] = {0};   /* unwrap2: wind4 bce, worst-gauge bce, right turns, voxels, phase, normal */
             char vstr[128] = ",,";
             double rv_n[RF_N] = {0}, rv_e[RF_N] = {0}, rv_b[RF_N] = {0}, rv_l = 0;   /* restore validation: per family voxels, error^2, input error^2 */
+            if (g_rpairs) { free(g_rpv); g_rpv = calloc((size_t)S->n * RP_NST, sizeof *g_rpv); }
             if (step % val_every == 0 || step == steps || g_stop) {
                 g_ptrunc_on = 0;   /* (validation: the plain phase loss) */
                 const int nv = split ? 2 : 1;   /* split: validation windows are split too */
@@ -2400,7 +2444,11 @@ int cmd_train(int argc, char **argv) {
                         } else {
                             for (int g = 0; g < nv; g++) { nn_init(G[g].dev); upload(&G[g], vbt, B, P); }
                             if (split) { split_arg sa = {G, B, P, 0, dice_w}; split_run(sctx, split_job, &sa); nn_init(G[0].dev); }
-                            else if (g_restore) {   /* every family on the same window, with fixed recipes */
+                            else if (g_restore && g_rpairs) {   /* real pairs: per source sums */
+                                run_batch(&G[0], B, P, dice_w, 0); rv_l = restore_fetch(&G[0], vp);
+                                const int si_ = vbt->src ? vbt->src[0] : 0;
+                                if (si_ >= 0 && si_ < S->n) for (int k = 0; k < RP_NST; k++) g_rpv[(size_t)si_ * RP_NST + k] += G[0].rst_h[k];
+                            } else if (g_restore) {   /* every family on the same window, with fixed recipes */
                                 double ls = 0;
                                 for (int f = 0; f < RF_N; f++) {
                                     restore_recipe_draw(&G[0].rcp, f, rmix(0xA11CE5ull + vc.seed * 1315423911ull + (uint64_t)i * 64 + (uint64_t)f), g_Pz, P, P, &g_rr);
@@ -2437,7 +2485,8 @@ int cmd_train(int argc, char **argv) {
                 if (g_unwrap2 && nval) fprintf(stderr, "val unwrap2: phase bce %.5f normal bce %.5f wind4 bce %.5f (worst gauge %.5f) turn acc %.4f over %.0f voxels\n",
                                                vw4[4] / nval, vw4[5] / nval, vw4[0] / nval, vw4[1] / nval, vw4[3] > 0 ? vw4[2] / vw4[3] : 0.0, vw4[3]);
                 vcrit = vl;
-                if (g_restore && nval) {   /* PSNR of output and input against the clean window per family; best.ckpt on the mean gain of the degraded families */
+                if (g_restore && g_rpairs && nval) restore_pair_report(S, out, step, &vcrit);
+                else if (g_restore && nval) {   /* PSNR of output and input against the clean window per family; best.ckpt on the mean gain of the degraded families */
                     double gs = 0; int ng_ = 0; char rl[600]; size_t k = 0; rl[0] = 0;
                     char cp_[1400]; snprintf(cp_, sizeof cp_, "%s/restore_val.csv", out);
                     FILE *rf = fopen(cp_, "a");
