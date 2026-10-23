@@ -1,7 +1,7 @@
 /* src/nn_dinor.cu (the DINO-recipe pieces) against double-precision references:
    - views: every voxel of resized / permuted / flipped crops vs a double trilinear reference; dr_map / dr_unmap round trip;
    - DINO head: input and every parameter gradient of L = sum(logits R) vs central differences of a double forward (frozen last layer too);
-   - Sinkhorn-Knopp and the centred softmax vs double references;
+   - Sinkhorn-Knopp and the centred softmax vs double references; a sharp teacher row stays sharp through the centring at the recipe's sizes;
    - multi-crop cross-entropy: loss and d / d student logits vs central differences;
    - KoLeo: loss and gradient vs central differences (grouped);
    - pooling forward / backward.
@@ -139,6 +139,92 @@ static int test_targets(void) {
         for (int k = 0; k < K; k++) ref[(size_t)r * K + k] = exp((l[(size_t)r * K + k] - c[k]) / tt - m) / z; }
     g = host(q, (size_t)R * K); bad += report("softmax-c", g, ref, R * K, 2e-3); free(g);
     free(l); free(c); free(Q); free(ref); nn_free(ld); nn_free(cd); nn_free(q); nn_free(sc);
+    return bad;
+}
+
+/* sharpness at the recipe's sizes (batch 1: 2 CLS rows, a 62-row queue, 32768 prototypes): teacher rows with one clear prototype (cosine logit
+   0.5 over N(0, 0.05) noise, tt 0.04). The centred softmax (DINOv1; centre after 20 EMA updates of such rows) keeps the row sharp; Sinkhorn-Knopp
+   over the 64 rows flattens it (the equipartition gives every one of the 32768 columns 1/K of the mass) -- the recipe runs' H(t) = ln K */
+static double row_entropy(const float *qd, int r, int K) {
+    double *h = host(qd + (size_t)r * K, K), z = 0, H = 0; for (int k = 0; k < K; k++) z += h[k];
+    for (int k = 0; k < K; k++) { const double a = h[k] / z; if (a > 0) H -= a * log(a); } free(h); return H;
+}
+static int test_sharp(void) {
+    const int K = 32768, R = 64; const float tt = 0.04f; printf("teacher sharpness: %d rows x %d prototypes, tt %.2f\n", R, K, tt);
+    double *l = malloc((size_t)R * K * 8); for (int r = 0; r < R; r++) { for (int k = 0; k < K; k++) l[(size_t)r * K + k] = 0.05 * nrand(); l[(size_t)r * K + (int)(urand() * K)] = 0.5; }
+    float *ld = dev(l, (size_t)R * K), *q = nn_malloc((size_t)R * K * 4), *c = nn_malloc((size_t)K * 4); void *sc = nn_malloc(dr_sk_scratch(R, K));
+    nn_zero(c, (size_t)K * 4);
+    for (int i = 0; i < 20; i++) dr_center_update(c, ld + (size_t)(2 + 2 * i % (R - 2)) * K, 2, K, 0.9f);   /* (the centre from other rows' history) */
+    dr_teacher_probs(ld, 2, K, tt, 0, c, q, sc);
+    const double Hc = row_entropy(q, 0, K);
+    dr_teacher_probs(ld, R, K, tt, 3, nullptr, q, sc);
+    const double Hs = row_entropy(q, 0, K), lnK = log((double)K);
+    const int bad = !(Hc < 0.25 * lnK);
+    printf("  centred softmax H %.2f, Sinkhorn over %d rows H %.2f (ln K %.2f)%s\n", Hc, R, Hs, lnK, bad ? "  FAIL" : "");
+    free(l); nn_free(ld); nn_free(q); nn_free(c); nn_free(sc);
+    return bad;
+}
+
+/* the DINO loop on toy data at batch 1 (the recipe's head, centring, cross-entropy pairing, Muon / AdamW steps and EMA teacher, no trunk):
+   16 clusters in 64-d, each step one cluster drawn and two noisy views of it (2 teacher rows); a correctly wired loop has to discover the
+   clusters: the teacher's target entropy falls well below ln K and the two views' teacher argmaxes agree. plr: the prototype lr; returns
+   the mean H(t) of the last 200 steps (agree: argmax agreement over them) */
+static double toy_dino(float plr, int steps, double *agree, int *distinct) {
+    const int Cin = 64, HH = 256, HB = 64, K = 4096, NC = 16; const float ts = 0.1f, tt = 0.04f;
+    dr_head h; dr_head_layout(&h, Cin, HH, HB, K);
+    double *b = calloc(h.n, 8);
+    for (size_t i = h.w1; i < h.b1; i++) b[i] = 0.02 * nrand();
+    for (size_t i = h.w2; i < h.b2; i++) b[i] = 0.02 * nrand();
+    for (size_t i = h.w3; i < h.b3; i++) b[i] = 0.02 * nrand();
+    for (size_t i = h.v; i < h.g; i++) b[i] = (2 * urand() - 1) / sqrt((double)HB);
+    for (size_t i = h.g; i < h.n; i++) b[i] = 1;
+    float *P = dev(b, h.n), *Pt = dev(b, h.n), *G = nn_malloc(h.n * 4), *M = nn_malloc(h.n * 4), *V = nn_malloc(h.n * 4), *MO = nn_malloc(h.n * 4); free(b);
+    nn_zero(M, h.n * 4); nn_zero(V, h.n * 4); nn_zero(MO, h.n * 4);
+    size_t wb = dr_muon_work(HH, HH); if (dr_muon_work(HH, Cin) > wb) wb = dr_muon_work(HH, Cin); float *work = nn_malloc(wb);
+    dr_hws w; void *wbuf = nn_malloc(dr_hws_bytes(&h, 2)); dr_hws_carve(&w, &h, 2, wbuf);
+    double *cen = malloc((size_t)NC * Cin * 8); for (int i = 0; i < NC * Cin; i++) cen[i] = nrand();
+    float *x = nn_malloc(2 * Cin * 4), *tl = nn_malloc(2 * K * 4), *tq = nn_malloc(2 * K * 4), *sl = nn_malloc(K * 4), *dsl = nn_malloc(K * 4), *c = nn_malloc(K * 4), *out = nn_malloc(64 * 4);
+    void *sc = nn_malloc(dr_sk_scratch(2, K)), *ces = nn_malloc(dr_ce_scratch(1)); nn_zero(c, K * 4);
+    int *pS = nn_malloc(8), *pT = nn_malloc(8); float *pW = nn_malloc(8);
+    double Hsum = 0, ag = 0; int n = 0; uint8_t *seen = calloc(K, 1); *distinct = 0;
+    for (int st = 1; st <= steps; st++) {
+        const int k = (int)(urand() * NC); double xv[2 * 64];
+        for (int v = 0; v < 2; v++) for (int i = 0; i < Cin; i++) xv[v * Cin + i] = cen[k * Cin + i] + 0.3 * nrand();
+        float *xd = dev(xv, 2 * Cin); nn_d2d(x, xd, 2 * Cin * 4); nn_free(xd);
+        dr_head_fwd(&h, Pt, x, 2, tl, &w); dr_teacher_probs(tl, 2, K, tt, 0, c, tq, sc); dr_center_update(c, tl, 2, K, 0.9f);
+        if (st > steps - 200) {
+            double *q = host(tq, 2 * K); int a0 = 0, a1 = 0; double H = 0;
+            for (int j = 0; j < K; j++) { if (q[j] > 0) H -= q[j] * log(q[j]); if (q[j] > q[a0]) a0 = j; if (q[K + j] > q[K + a1]) a1 = j; }
+            Hsum += H; ag += a0 == a1; n++; free(q); if (!seen[a0]) { seen[a0] = 1; (*distinct)++; }
+        }
+        nn_zero(G, h.n * 4);
+        for (int v = 0; v < 2; v++) {   /* student view v against the teacher's other view */
+            dr_head_fwd(&h, P, x + v * Cin, 1, sl, &w);
+            const int ps = 0, pt = 1 - v; const float pw = 0.5f; nn_h2d(pS, &ps, 4); nn_h2d(pT, &pt, 4); nn_h2d(pW, &pw, 4);
+            dr_ce(sl, 1, K, ts, tq, pS, pT, pW, 1, dsl, out, ces);
+            dr_head_bwd(&h, P, G, x + v * Cin, dsl, 1, nullptr, 1, &w);
+        }
+        dr_muon(P + h.w1, G + h.w1, MO + h.w1, HH, Cin, 0.02f, 0.95f, 0.f, work);
+        dr_muon(P + h.w2, G + h.w2, MO + h.w2, HH, HH, 0.02f, 0.95f, 0.f, work);
+        dr_muon(P + h.w3, G + h.w3, MO + h.w3, HB, HH, 0.02f, 0.95f, 0.f, work);
+        dr_adamw(P + h.b1, G + h.b1, M + h.b1, V + h.b1, h.w2 - h.b1, 5e-4f, 0.9f, 0.999f, 1e-8f, 0.f, st);
+        dr_adamw(P + h.b2, G + h.b2, M + h.b2, V + h.b2, h.w3 - h.b2, 5e-4f, 0.9f, 0.999f, 1e-8f, 0.f, st);
+        dr_adamw(P + h.b3, G + h.b3, M + h.b3, V + h.b3, h.v - h.b3, 5e-4f, 0.9f, 0.999f, 1e-8f, 0.f, st);
+        if (plr > 0) dr_adamw(P + h.v, G + h.v, M + h.v, V + h.v, h.g - h.v, plr, 0.9f, 0.999f, 1e-8f, 0.f, st);
+        dr_ema(Pt, P, h.n, 0.99f);
+    }
+    nn_free(P); nn_free(Pt); nn_free(G); nn_free(M); nn_free(V); nn_free(MO); nn_free(work); nn_free(wbuf); nn_free(x); nn_free(tl); nn_free(tq); nn_free(sl); nn_free(dsl);
+    nn_free(c); nn_free(out); nn_free(sc); nn_free(ces); nn_free(pS); nn_free(pT); nn_free(pW); free(cen);
+    free(seen); *agree = ag / n; return Hsum / n;
+}
+static int test_toy_dino(void) {
+    printf("DINO loop on toy clusters (batch 1, K 4096, centring, ln K %.2f)\n", log(4096.0));
+    int bad = 0; const float plrs[3] = {0.f, 4e-6f, 5e-4f};
+    for (int i = 0; i < 3; i++) {
+        double ag; int nd; const double H = toy_dino(plrs[i], 3000, &ag, &nd);
+        const int b = i < 2 && !(H < 0.5 * log(4096.0) && ag > 0.8 && nd >= 8);   /* (no collapse: >= 8 of the 16 clusters on their own prototypes; 5e-4 reported only) */
+        printf("  prototype lr %-7g: teacher H %.2f, view argmax agreement %.2f, distinct argmaxes %d (16 clusters)%s\n", plrs[i], H, ag, nd, b ? "  FAIL" : ""); bad += b;
+    }
     return bad;
 }
 
@@ -364,6 +450,32 @@ static int test_mlp2(void) {
     free(P); free(x); free(Rm); free(y); free(yg); free(gx); free(gP); nn_free(Pd); nn_free(xd); nn_free(Rd); nn_free(yd); nn_free(G); nn_free(dx); nn_free(ws);
     return bad;
 }
+/* row layer norm (the CLS before the DINO head): forward vs double, backward of L = sum(w y) vs central differences */
+static void ref_rownorm(const double *x, int R, int C, double *y) {
+    for (int r = 0; r < R; r++) {
+        double m = 0, v = 0;
+        for (int c = 0; c < C; c++) m += x[r * C + c];
+        m /= C;
+        for (int c = 0; c < C; c++) v += (x[r * C + c] - m) * (x[r * C + c] - m);
+        v /= C;
+        for (int c = 0; c < C; c++) y[r * C + c] = (x[r * C + c] - m) / sqrt(v + 1e-6);
+    }
+}
+static int test_rownorm(void) {
+    const int R = 3, C = 192; printf("row layer norm: %d x %d\n", R, C); int bad = 0;
+    double *x = malloc(R * C * 8), *w = malloc(R * C * 8), *y = malloc(R * C * 8), *gr = malloc(R * C * 8);
+    for (int i = 0; i < R * C; i++) { x[i] = rf(3 + 5 * nrand()); w[i] = rf(nrand()); }
+    float *xd = dev(x, R * C), *wd = dev(w, R * C), *yd = nn_malloc(R * C * 4), *rs = nn_malloc(R * 4), *gd = nn_malloc(R * C * 4);
+    dr_rownorm_fwd(xd, R, C, yd, rs); ref_rownorm(x, R, C, y);
+    double *a = host(yd, R * C); bad += report("forward", a, y, R * C, 2e-3); free(a);
+    dr_rownorm_bwd(wd, yd, rs, R, C, gd);
+    for (int i = 0; i < R * C; i++) { const double e = 1e-4, o = x[i]; double lp = 0, lm = 0;
+        x[i] = o + e; ref_rownorm(x, R, C, y); for (int j = 0; j < R * C; j++) lp += w[j] * y[j];
+        x[i] = o - e; ref_rownorm(x, R, C, y); for (int j = 0; j < R * C; j++) lm += w[j] * y[j]; x[i] = o; gr[i] = (lp - lm) / (2 * e); }
+    a = host(gd, R * C); bad += report("d x", a, gr, R * C, 2e-3); free(a);
+    free(x); free(w); free(y); free(gr); nn_free(xd); nn_free(wd); nn_free(yd); nn_free(rs); nn_free(gd);
+    return bad;
+}
 static int test_pool(void) {
     const int n = 2, S = 11, C = 5, r0 = 3; printf("pool: %d x %d tokens (%d registers), C %d\n", n, S, r0, C);
     double *t = malloc(n * S * C * 8), *g = malloc(n * C * 8); for (int i = 0; i < n * S * C; i++) t[i] = rf(nrand()); for (int i = 0; i < n * C; i++) g[i] = rf(nrand());
@@ -379,7 +491,7 @@ static int test_pool(void) {
 
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
-    int bad = test_views() + test_head() + test_targets() + test_ce() + test_koleo() + test_koleo_q() + test_muon(64, 24) + test_muon(24, 64) + test_muon_ref(160, 24) + test_obj() + test_ink() + test_mlp2() + test_pool();
+    int bad = test_views() + test_head() + test_targets() + test_sharp() + test_toy_dino() + test_ce() + test_koleo() + test_koleo_q() + test_muon(64, 24) + test_muon(24, 64) + test_muon_ref(160, 24) + test_obj() + test_ink() + test_mlp2() + test_pool() + test_rownorm();
     printf(bad ? "test_dinor: %d FAILED\n" : "test_dinor: all passed\n", bad);
     return bad != 0;
 }

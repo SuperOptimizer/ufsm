@@ -70,6 +70,10 @@ void dr_koleo_q(const float *x, int N, const float *cand, int M, int D, float w,
 /* the average pool of token rows [n][S][C] over rows [r0, S) of each sequence -> cls [n][C]; backward: g [n][C] spread into gt (added) */
 void dr_pool_fwd(const float *t, int n, int S, int C, int r0, float *cls);
 void dr_pool_bwd(const float *g, int n, int S, int C, int r0, float *gt);
+/* parameter-free layer norm of R rows of C (the CLS before the DINO head / KoLeo: upstream's final LayerNorm): y = (x - mean) / sqrt(var + 1e-6),
+   in place allowed; rstd [R] kept for the backward: dx = rstd (dy - mean(dy) - y mean(dy y)) (dx may be dy) */
+void dr_rownorm_fwd(const float *x, int R, int C, float *y, float *rstd);
+void dr_rownorm_bwd(const float *dy, const float *y, const float *rstd, int R, int C, float *dx);
 /* the argmax prototype of each of R rows of q [R][K] -> out [R] (device ints; the prototype usage monitor) */
 void dr_argmax_rows(const float *q, int R, int K, int *out);
 /* rows of v [R][N] scaled to unit length in place */

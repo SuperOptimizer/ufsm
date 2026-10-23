@@ -321,6 +321,27 @@ __global__ void k_pool_bwd(const float *g, int n, int S, int C, int r0, float *g
 }
 extern "C" void dr_pool_fwd(const float *t, int n, int S, int C, int r0, float *cls) { k_pool<<<nbk((long long)n * C, 256), 256>>>(t, n, S, C, r0, cls); }
 extern "C" void dr_pool_bwd(const float *g, int n, int S, int C, int r0, float *gt) { k_pool_bwd<<<nbk((long long)n * S * C, 256), 256>>>(g, n, S, C, r0, gt); }
+__global__ void k_rownorm(const float *x, int C, float *y, float *rstd) {   /* one block per row */
+    __shared__ float sh[256]; const int r = blockIdx.x; const float *xr = x + (size_t)r * C; float *yr = y + (size_t)r * C;
+    float s = 0.f; for (int c = threadIdx.x; c < C; c += blockDim.x) s += xr[c];
+    sh[threadIdx.x] = s; __syncthreads(); for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
+    const float m = sh[0] / C; __syncthreads();
+    float v = 0.f; for (int c = threadIdx.x; c < C; c += blockDim.x) { const float d = xr[c] - m; v += d * d; }
+    sh[threadIdx.x] = v; __syncthreads(); for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
+    const float rs = rsqrtf(sh[0] / C + 1e-6f); __syncthreads();
+    for (int c = threadIdx.x; c < C; c += blockDim.x) yr[c] = (xr[c] - m) * rs;
+    if (threadIdx.x == 0) rstd[r] = rs;
+}
+__global__ void k_rownorm_bwd(const float *dy, const float *y, const float *rstd, int C, float *dx) {
+    __shared__ float sa[256], sb[256]; const int r = blockIdx.x; const float *g = dy + (size_t)r * C, *yr = y + (size_t)r * C;
+    float a = 0.f, b = 0.f; for (int c = threadIdx.x; c < C; c += blockDim.x) { a += g[c]; b += g[c] * yr[c]; }
+    sa[threadIdx.x] = a; sb[threadIdx.x] = b; __syncthreads();
+    for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) { sa[threadIdx.x] += sa[threadIdx.x + k]; sb[threadIdx.x] += sb[threadIdx.x + k]; } __syncthreads(); }
+    const float ma = sa[0] / C, mb = sb[0] / C, rs = rstd[r]; __syncthreads();
+    for (int c = threadIdx.x; c < C; c += blockDim.x) dx[(size_t)r * C + c] = rs * (g[c] - ma - yr[c] * mb);
+}
+extern "C" void dr_rownorm_fwd(const float *x, int R, int C, float *y, float *rstd) { k_rownorm<<<R, 256>>>(x, C, y, rstd); }
+extern "C" void dr_rownorm_bwd(const float *dy, const float *y, const float *rstd, int R, int C, float *dx) { k_rownorm_bwd<<<R, 256>>>(dy, y, rstd, C, dx); }
 __global__ void k_adamw(float *p, const float *g, float *m, float *v, size_t n, float lr, float b1, float b2, float eps, float wd, float c1, float c2) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
         m[i] = b1 * m[i] + (1 - b1) * g[i]; v[i] = b2 * v[i] + (1 - b2) * g[i] * g[i];
