@@ -11,7 +11,8 @@
    pairs, 128 + gain (a - b), a and b normalised to [0, 1]), <variant>_baseline.jpg (the baseline pair, same gain), coverage.jpg, stats.json.
    Config: {"tifxyz": DIR, "downscale": 4, "out": DIR, "layers": 2, "match_um": 9.362, "cover_mm": 1.2, "tol_um": 2.4 (fit / eval residual limit, um), "threads": 12,
             "cache_mb": 2400, "px": 2 (base voxels per output pixel: 2 = half-res of the base-voxel uv grid), "crop": [x0, y0, w, h] (output pixels, optional),
-            "scans": [{"name", "root", "key", "um", "chain": [{"map": reg.json, "dir": "c2f" | "f2c", "pair": pair dir}]}],
+            "scans": [{"name", "root", "key", "um", "chain": [{"map": reg.json, "dir": "c2f" | "f2c", "pair": pair dir}], "scale": 1, "origin": [z, y, x]}],
+            (scale / origin: the scan is a scale-times finer grid of the chain's last frame cropped at origin, e.g. a super-resolved box)
             "rgb": [n1, n2, n3], "diff": [[a, b], [a, b], [a, b]], "baseline": [a, b]} */
 #include "reg.h"
 #include "json.h"
@@ -187,7 +188,7 @@ static float tri(cmemo *m, double x, double y, double z) {
 /* ---------- config ---------- */
 enum { MAXS = 8, MAXCH = 4 };
 typedef struct { rmap m; rfield D; int f2c; rcover cov; } rstep;
-typedef struct { char name[64]; rvol *v; int nch; rstep st[MAXCH]; int ln, lm, lsn; ccache cn, cm, cs; } rscan;
+typedef struct { char name[64]; rvol *v; int nch; rstep st[MAXCH]; int ln, lm, lsn; ccache cn, cm, cs; double scale, org[3]; } rscan;   /* scale, org: see map_point */
 /* base L0 -> scan L0 through the chain. Returns 1, or 2 when every step's pair also certifies the point (cover: a good fit box near,
    no failing evaluation box near). Images use every mapped point with data; only reg inkstat restricts to certified points. */
 static int map_point(const rscan *s, const double p[3], double q[3]) {
@@ -198,7 +199,9 @@ static int map_point(const rscan *s, const double p[3], double q[3]) {
         else { cert &= rcover_ok(&t->cov, a); rmap_c2f(&t->m, a, b); }
         memcpy(a, b, sizeof a);
     }
-    memcpy(q, a, sizeof a);
+    /* "scale" k / "origin" [z, y, x]: a volume on a k-times finer grid of the chain's last frame, cropped at origin (e.g. a super-resolved
+       box of the native scan, ufsm predict --box): voxel = (q + 0.5) k - 0.5 - origin */
+    for (int d = 0; d < 3; d++) q[d] = s->scale != 1 || s->org[2 - d] ? (a[d] + 0.5) * s->scale - 0.5 - s->org[2 - d] : a[d];
     return 1 + cert;
 }
 
@@ -408,6 +411,9 @@ int cmd_reg_render(int argc, char **argv) {
             if (rcover_load(&t->cov, json_str(json_get(st, "pair"), ""), cover_mm * 1000 / fum, tol_um / fum)) return 1;
             sc->nch++;
         }
+        sc->scale = json_num(json_get(e, "scale"), 1);
+        for (int d = 0; d < 3; d++) sc->org[d] = json_num(json_at(json_get(e, "origin"), (size_t)d), 0);
+        if (!(sc->scale > 0)) { fprintf(stderr, "reg render: %s: scale > 0\n", sc->name); return 1; }
         if (!sc->nch) base_um = sc->v->um;
         sc->ln = 0; sc->lm = rvol_level_for(sc->v, j->match_um);
         j->ns++;
