@@ -816,7 +816,7 @@ typedef struct {
        KI prototypes, Sinkhorn over all the batch's masked rows */
     float cm, icm, *cen, *icen; double dg[8];
     int easy, ccen, cstd; float *cmean, *hmean, *cistd, *histd, *cpre;
-    float vv, vc, *vx, *vg, *vgd; double *vcov;   /* --ssl-vic-var / --ssl-vic-cov: VICReg variance hinge (std >= 1) + off-diagonal covariance on the head-input CLS over the batch */ double st[8];   /* cstd: --ssl-cls-std (per-dimension batch standardisation of the CLS) */   /* --ssl-easy-steps S: shared symmetry / no inversion / mild intensity until S; --ssl-cls-center: the batch mean CLS removed; st: per-step stats */   /* dg: the teacher-side diagnostics of the last 50th step (dn_ssl_diag) */   /* --ssl-center / --ssl-ibot-center M: DINOv1 centring (EMA of the batch's teacher logits) instead of Sinkhorn */
+    float vv, vc, *vx, *vg, *vgd; double *vcov;   /* --ssl-vic-var / --ssl-vic-cov: VICReg variance hinge (std >= 1) + off-diagonal covariance on the head-input CLS over the batch */ double st[12];   /* cstd: --ssl-cls-std (per-dimension batch standardisation of the CLS) */   /* --ssl-easy-steps S: shared symmetry / no inversion / mild intensity until S; --ssl-cls-center: the batch mean CLS removed; st: per-step stats */   /* dg: the teacher-side diagnostics of the last 50th step (dn_ssl_diag) */   /* --ssl-center / --ssl-ibot-center M: DINOv1 centring (EMA of the batch's teacher logits) instead of Sinkhorn */
     float wib; int KI, IM, ich, TPS, GT_, cnt[64], off[64]; dn_head I; float *ieT, *inT, *ieS, *inS, *idE, *il, *iq, *isl, *idsl, *iw, *glzib; void *isk, *ice; int *d_hS, *d_hT, *iid, *hS, *hT; uint8_t *cellm, *d_mask; uint8_t *usei;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -1007,7 +1007,9 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     {   /* the head bottleneck z: same / other sample cosine */
         const int B = Q->H.H.B; float *zn = malloc((size_t)2 * N * B * 4); nn_d2h(zn, Q->H.w.zn, (size_t)2 * N * B * 4); double zs = 0, zd = 0; long nd = 0;
         for (int a = 0; a < 2 * N; a++) for (int b = a + 1; b < 2 * N; b++) { double x = 0; for (int i = 0; i < B; i++) x += (double)zn[(size_t)a * B + i] * zn[(size_t)b * B + i]; if (a / 2 == b / 2) zs += x; else { zd += x; nd++; } }
-        Q->st[2] += zs / N; Q->st[3] += nd ? zd / nd : 0; free(zn);
+        Q->st[2] += zs / N; Q->st[3] += nd ? zd / nd : 0;
+        double zsd = 0; for (int i = 0; i < B; i++) { double m = 0, v = 0; for (int a = 0; a < 2 * N; a++) m += zn[(size_t)a * B + i]; m /= 2 * N; for (int a = 0; a < 2 * N; a++) { const double d = zn[(size_t)a * B + i] - m; v += d * d; } zsd += sqrt(v / (2 * N - 1)) / B; }
+        Q->st[8] += zsd; free(zn);
     }
     if (step % 50 == 0) dn_ssl_diag(Q);
     if (Q->cm > 0) { dr_teacher_probs(Q->tl, 2 * N, K, tt, 0, Q->cen, Q->tq, Q->sks); dr_center_update(Q->cen, Q->tl, 2 * N, K, Q->cm); }
@@ -1117,7 +1119,7 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             double x = 0, ya = 0, yb = 0; for (int c = 0; c < C; c++) { x += (double)ct[(size_t)a * C + c] * ct[(size_t)b * C + c]; ya += (double)ct[(size_t)a * C + c] * ct[(size_t)a * C + c]; yb += (double)ct[(size_t)b * C + c] * ct[(size_t)b * C + c]; }
             const double cc = x / sqrt(ya * yb + 1e-30); if (a / 2 == b / 2) cs += cc; else { cd += cc; nd++; } }
         free(ct); const size_t l3_ = strlen(line);
-        const double nn_ = Q->nsum ? Q->nsum : 1; { const size_t l4 = strlen(line); snprintf(line + l4, cap - l4, " | vic var %.4f cov %.4f cls std/dim %.4f", Q->st[5] / nn_, Q->st[6] / nn_, Q->st[7] / nn_); }
+        const double nn_ = Q->nsum ? Q->nsum : 1; { const size_t l4 = strlen(line); snprintf(line + l4, cap - l4, " | vic var %.4f cov %.4f cls std/dim %.4f | z std/dim %.4f", Q->st[5] / nn_, Q->st[6] / nn_, Q->st[7] / nn_, Q->st[8] / nn_); }
         snprintf(line + l3_, cap - l3_, " | avg cls same %.3f other %.3f z same %.3f other %.3f agree-other %.3f | iou %.3f | last cls same %.3f other %.3f | z cos other %.3f | logit sd raw %.4f centred %.4f (/tt) | centre norm %.3f | proto |cos| %.3f",
                  Q->st[0] / nn_, Q->st[1] / nn_, Q->st[2] / nn_, Q->st[3] / nn_, Q->st[4] / nn_, Q->nsum ? Q->sums[6] / Q->nsum : 0.0, cs / (R / 2), nd ? cd / nd : 0.0, Q->dg[0], Q->dg[1], Q->dg[2], Q->dg[3], Q->dg[4]);
     }
