@@ -1306,6 +1306,9 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
         if (Q->lastm >= 4) {   /* the student side (the step's last masked view): softmax(logits / ts) entropy / pmax, unit bottleneck std per dim and cos between its rows */
             const int m = Q->lastm, Bz = Q->I.H.B; float *sl = malloc((size_t)m * KI * 4), *zn = malloc((size_t)m * Bz * 4);
             nn_d2h(sl, Q->isl, (size_t)m * KI * 4); nn_d2h(zn, Q->I.w.zn, (size_t)m * Bz * 4);
+            double fsd = 0, fm = 0; { float *fx = malloc((size_t)m * 32 * 4); nn_d2h(fx, Q->ieS, (size_t)m * 32 * 4);
+              for (int c = 0; c < 32; c++) { double mu = 0, v = 0; for (int a = 0; a < m; a++) mu += fx[(size_t)a * 32 + c] / m; for (int a = 0; a < m; a++) v += (fx[(size_t)a * 32 + c] - mu) * (fx[(size_t)a * 32 + c] - mu) / m; fsd += sqrt(v) / 32; fm += fabs(mu) / 32; }
+              free(fx); }
             double Hs = 0, pms = 0;
             for (int a = 0; a < m; a++) { double mx = -1e30, z = 0, h = 0; const float *l = sl + (size_t)a * KI; for (int k = 0; k < KI; k++) mx = fmax(mx, l[k] / Q->ts);
                 for (int k = 0; k < KI; k++) z += exp(l[k] / Q->ts - mx);
@@ -1314,7 +1317,7 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             for (int b = 0; b < Bz; b++) { double mu = 0, v = 0; for (int a = 0; a < m; a++) mu += zn[(size_t)a * Bz + b] / m; for (int a = 0; a < m; a++) v += (zn[(size_t)a * Bz + b] - mu) * (zn[(size_t)a * Bz + b] - mu) / m; sm += sqrt(v) / Bz; }
             for (int a = 0; a < m; a++) for (int c = a + 1; c < m; c++) { double d = 0; for (int b = 0; b < Bz; b++) d += zn[(size_t)a * Bz + b] * zn[(size_t)c * Bz + b]; co += d; no++; }
             const size_t l5 = strlen(line);
-            snprintf(line + l5, cap - l5, " | ibot student H %.2f pmax %.4f tok z std/dim %.4f (1/sqrt(B) %.4f) cos other %.4f%s", Hs, pms, sm, 1 / sqrt((double)Bz), no ? co / no : 0.0, Q->dv ? (Q->dvuntil <= 0 || step <= Q->dvuntil ? " [dv teacher]" : " [ema teacher]") : "");
+            snprintf(line + l5, cap - l5, " | ibot student feat std/ch %.4f |mean| %.4f H %.2f pmax %.4f tok z std/dim %.4f (1/sqrt(B) %.4f) cos other %.4f%s", fsd, fm, Hs, pms, sm, 1 / sqrt((double)Bz), no ? co / no : 0.0, Q->dv ? (Q->dvuntil <= 0 || step <= Q->dvuntil ? " [dv teacher]" : " [ema teacher]") : "");
             free(sl); free(zn);
         }
     }
