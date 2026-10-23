@@ -817,7 +817,8 @@ typedef struct {
     float cm, icm, *cen, *icen; double dg[8];
     int easy, ccen, cstd; float *cmean, *hmean, *cistd, *histd, *cpre;
     float vv, vc, *vx, *vg, *vgd; double *vcov;
-    float simg, sima, *zT, *zbank, *dzh, *zcur; double *zA;   /* --ssl-simdino G: SimDINO (1/2 |z_s - z_t|^2 on the unit bottleneck - G R_eps(student global z)), --ssl-sim-eps2 */   /* --ssl-vic-var / --ssl-vic-cov: VICReg variance hinge (std >= 1) + off-diagonal covariance on the head-input CLS over the batch */ double st[12];   /* cstd: --ssl-cls-std (per-dimension batch standardisation of the CLS) */   /* --ssl-easy-steps S: shared symmetry / no inversion / mild intensity until S; --ssl-cls-center: the batch mean CLS removed; st: per-step stats */   /* dg: the teacher-side diagnostics of the last 50th step (dn_ssl_diag) */   /* --ssl-center / --ssl-ibot-center M: DINOv1 centring (EMA of the batch's teacher logits) instead of Sinkhorn */
+    float simg, sima, *zT, *zbank, *dzh, *zcur; double *zA;
+    float zv, zcv, *zvb, *zvh, *zvd; double *zcov;   /* --ssl-zvic-var / --ssl-zvic-cov: VICReg on the head's unit bottleneck zn over the batch (hinge std >= 1 / sqrt(B)) */   /* --ssl-simdino G: SimDINO (1/2 |z_s - z_t|^2 on the unit bottleneck - G R_eps(student global z)), --ssl-sim-eps2 */   /* --ssl-vic-var / --ssl-vic-cov: VICReg variance hinge (std >= 1) + off-diagonal covariance on the head-input CLS over the batch */ double st[12];   /* cstd: --ssl-cls-std (per-dimension batch standardisation of the CLS) */   /* --ssl-easy-steps S: shared symmetry / no inversion / mild intensity until S; --ssl-cls-center: the batch mean CLS removed; st: per-step stats */   /* dg: the teacher-side diagnostics of the last 50th step (dn_ssl_diag) */   /* --ssl-center / --ssl-ibot-center M: DINOv1 centring (EMA of the batch's teacher logits) instead of Sinkhorn */
     float wib; int KI, IM, ich, TPS, GT_, cnt[64], off[64]; dn_head I; float *ieT, *inT, *ieS, *inS, *idE, *il, *iq, *isl, *idsl, *iw, *glzib; void *isk, *ice; int *d_hS, *d_hT, *iid, *hS, *hT; uint8_t *cellm, *d_mask; uint8_t *usei;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -866,6 +867,8 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
     Q->simg = (float)atof(opt(argc, argv, "--ssl-simdino", "0")); Q->sima = 256.f / (float)atof(opt(argc, argv, "--ssl-sim-eps2", "0.5"));
     if (Q->simg > 0) { const int Bz = atoi(opt(argc, argv, "--ssl-head-bottleneck", "256")); Q->sima = (float)Bz / (float)atof(opt(argc, argv, "--ssl-sim-eps2", "0.5"));
         Q->zT = nn_malloc((size_t)2 * Q->N * Bz * 4); Q->zbank = malloc((size_t)2 * Q->N * Bz * 4); Q->dzh = malloc((size_t)Bz * 4); Q->zcur = malloc((size_t)Bz * 4); Q->zA = malloc((size_t)Bz * Bz * 8); }
+    Q->zv = (float)atof(opt(argc, argv, "--ssl-zvic-var", "0")); Q->zcv = (float)atof(opt(argc, argv, "--ssl-zvic-cov", "0"));
+    if (Q->zv > 0 || Q->zcv > 0) { const int Bz = atoi(opt(argc, argv, "--ssl-head-bottleneck", "256")); Q->zvb = malloc((size_t)2 * Q->N * Bz * 4); Q->zvh = malloc((size_t)Bz * 4); Q->zvd = nn_malloc((size_t)Bz * 4); Q->zcov = malloc((size_t)Bz * Bz * 8); }
     Q->vv = (float)atof(opt(argc, argv, "--ssl-vic-var", "0")); Q->vc = (float)atof(opt(argc, argv, "--ssl-vic-cov", "0"));
     if (Q->vv > 0 || Q->vc > 0) { Q->vx = malloc((size_t)Q->N * Q->CC * 4); Q->vg = malloc((size_t)Q->CC * 4); Q->vgd = nn_malloc((size_t)Q->CC * 4); Q->vcov = malloc((size_t)Q->CC * Q->CC * 8); }
     Q->cm = (float)atof(opt(argc, argv, "--ssl-center", "0")); Q->icm = (float)atof(opt(argc, argv, "--ssl-ibot-center", "0"));
@@ -1009,6 +1012,7 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     }
     if (dr_head_fwd(&Q->H.H, Q->H.pt, Q->clsT, 2 * N, Q->tl, &Q->H.w)) return 1;
     if (Q->simg > 0) { nn_d2d(Q->zT, Q->H.w.zn, (size_t)2 * N * Q->H.H.B * 4); nn_d2h(Q->zbank, Q->zT, (size_t)2 * N * Q->H.H.B * 4); }   /* SimDINO targets; coding-rate bank */
+    if (Q->zvb) nn_d2h(Q->zvb, Q->H.w.zn, (size_t)2 * N * Q->H.H.B * 4);   /* (the z VICReg bank: teacher rows, the student's as computed) */
     {   /* the head bottleneck z: same / other sample cosine */
         const int B = Q->H.H.B; float *zn = malloc((size_t)2 * N * B * 4); nn_d2h(zn, Q->H.w.zn, (size_t)2 * N * B * 4); double zs = 0, zd = 0; long nd = 0;
         for (int a = 0; a < 2 * N; a++) for (int b = a + 1; b < 2 * N; b++) { double x = 0; for (int i = 0; i < B; i++) x += (double)zn[(size_t)a * B + i] * zn[(size_t)b * B + i]; if (a / 2 == b / 2) zs += x; else { zd += x; nd++; } }
@@ -1058,6 +1062,26 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
         int ps_[2] = {0, 0}, pt_[2] = {gl ? 2 * i + 1 - v : 2 * i, 2 * i + 1}; float pw_[2] = {wpair, wpair}; const int npair = gl ? 1 : 2;
         nn_h2d(Q->pS, ps_, 8); nn_h2d(Q->pT, pt_, 8); nn_h2d(Q->pW, pw_, 8);
         nn_zero(Q->dcls, (size_t)C * 4);
+        Q->H.w.dzn_add = nullptr;
+        if (gl && Q->zvb) {   /* VICReg on the unit bottleneck over this view chunk: the batch's rows of chunk v with this student row; its gradient */
+            const int Bz = Q->H.H.B; float *X = Q->zvb; const double gam = 1.0 / sqrt((double)Bz);
+            nn_d2h(Q->zvh, Q->H.w.zn, (size_t)Bz * 4);
+            double *mu = calloc((size_t)Bz, 8), *sd = calloc((size_t)Bz, 8); const float *row[64];
+            for (int k = 0; k < N; k++) row[k] = k == i ? Q->zvh : X + (size_t)(2 * k + v) * Bz;
+            for (int k = 0; k < N; k++) for (int c = 0; c < Bz; c++) mu[c] += row[k][c] / (double)N;
+            for (int k = 0; k < N; k++) for (int c = 0; c < Bz; c++) { const double d = row[k][c] - mu[c]; sd[c] += d * d / (N - 1); }
+            float *g = malloc((size_t)Bz * 4); double lv = 0;
+            for (int c = 0; c < Bz; c++) { sd[c] = sqrt(sd[c] + 1e-8); lv += sd[c] < gam ? (gam - sd[c]) / (gam * Bz) : 0;
+                g[c] = (float)(Q->zv > 0 && sd[c] < gam ? -Q->zv / (gam * Bz) * (row[i][c] - mu[c]) / ((N - 1) * sd[c]) : 0); }
+            if (Q->zcv > 0) {
+                for (int a = 0; a < Bz; a++) for (int b2 = a; b2 < Bz; b2++) { double q = 0; for (int k = 0; k < N; k++) q += (row[k][a] - mu[a]) * (row[k][b2] - mu[b2]); q /= N - 1; Q->zcov[(size_t)a * Bz + b2] = Q->zcov[(size_t)b2 * Bz + a] = q; }
+                for (int a = 0; a < Bz; a++) { double gg = 0; for (int b2 = 0; b2 < Bz; b2++) if (b2 != a) gg += Q->zcov[(size_t)a * Bz + b2] * (row[i][b2] - mu[b2]); g[a] += (float)(Q->zcv * 4.0 / (gam * gam * Bz * (N - 1)) * gg); }
+            }
+            for (int c = 0; c < Bz; c++) g[c] /= (float)N;   /* (each row's share) */
+            nn_h2d(Q->zvd, g, (size_t)Bz * 4); Q->H.w.dzn_add = Q->zvd; Q->st[11] += lv / (2 * N);
+            memcpy(X + (size_t)(2 * i + v) * Bz, Q->zvh, (size_t)Bz * 4);
+            free(mu); free(sd); free(g);
+        }
         if (Q->simg > 0) {   /* SimDINO: d / d zn = sum over pairs w (zs - zt); global rows: - G d R / d zs over the chunk (the other samples' current z) */
             const int Bz = Q->H.H.B; float *zs = Q->zcur; nn_d2h(zs, Q->H.w.zn, (size_t)Bz * 4);
             for (int c = 0; c < Bz; c++) Q->dzh[c] = 0;
@@ -1153,7 +1177,7 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             double x = 0, ya = 0, yb = 0; for (int c = 0; c < C; c++) { x += (double)ct[(size_t)a * C + c] * ct[(size_t)b * C + c]; ya += (double)ct[(size_t)a * C + c] * ct[(size_t)a * C + c]; yb += (double)ct[(size_t)b * C + c] * ct[(size_t)b * C + c]; }
             const double cc = x / sqrt(ya * yb + 1e-30); if (a / 2 == b / 2) cs += cc; else { cd += cc; nd++; } }
         free(ct); const size_t l3_ = strlen(line);
-        const double nn_ = Q->nsum ? Q->nsum : 1; { const size_t l4 = strlen(line); snprintf(line + l4, cap - l4, " | vic var %.4f cov %.4f cls std/dim %.4f | z std/dim %.4f | simdino dist %.4f R %.3f", Q->st[5] / nn_, Q->st[6] / nn_, Q->st[7] / nn_, Q->st[8] / nn_, Q->st[10] / nn_, Q->st[9] / nn_); }
+        const double nn_ = Q->nsum ? Q->nsum : 1; { const size_t l4 = strlen(line); snprintf(line + l4, cap - l4, " | vic var %.4f cov %.4f cls std/dim %.4f | z std/dim %.4f zvic %.4f | simdino dist %.4f R %.3f", Q->st[5] / nn_, Q->st[6] / nn_, Q->st[7] / nn_, Q->st[8] / nn_, Q->st[11] / nn_, Q->st[10] / nn_, Q->st[9] / nn_); }
         snprintf(line + l3_, cap - l3_, " | avg cls same %.3f other %.3f z same %.3f other %.3f agree-other %.3f | iou %.3f | last cls same %.3f other %.3f | z cos other %.3f | logit sd raw %.4f centred %.4f (/tt) | centre norm %.3f | proto |cos| %.3f",
                  Q->st[0] / nn_, Q->st[1] / nn_, Q->st[2] / nn_, Q->st[3] / nn_, Q->st[4] / nn_, Q->nsum ? Q->sums[6] / Q->nsum : 0.0, cs / (R / 2), nd ? cd / nd : 0.0, Q->dg[0], Q->dg[1], Q->dg[2], Q->dg[3], Q->dg[4]);
     }

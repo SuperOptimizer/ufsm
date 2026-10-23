@@ -48,7 +48,7 @@ typedef struct { int Cin, H, B, K; size_t w1, b1, w2, b2, w3, b3, v, g; size_t n
 void dr_head_layout(dr_head *h, int Cin, int H, int B, int K);
 /* scratch for R rows plus the normalised prototypes */
 typedef struct { float *a1, *h1, *a2, *h2, *z, *zn, *zr, *vn, *vr, *dzn, *dh, *dh2, *dvn, *dg;
-                 float *zc; float zc_m; } dr_hws;   /* zc [B] (optional, caller-owned): the forward subtracts it from z before the row norm (a constant
+                 float *zc; float zc_m; const float *dzn_add; } dr_hws;   /* dzn_add [R][B] (optional): added to d / d zn in the backward (a regulariser on the unit bottleneck) */   /* zc [B] (optional, caller-owned): the forward subtracts it from z before the row norm (a constant
                                                        shift: the backward is unchanged); zc_m > 0: the forward first updates zc = m zc + (1 - m) mean_r z */
 size_t dr_hws_bytes(const dr_head *h, int R);
 void dr_hws_carve(dr_hws *w, const dr_head *h, int R, void *base);

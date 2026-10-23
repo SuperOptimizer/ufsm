@@ -67,7 +67,7 @@ extern "C" void dr_hws_carve(dr_hws *w, const dr_head *h, int R, void *base) {
     TK(z, r * B); TK(zn, r * B); TK(dzn, r * B); TK(zr, r);
     TK(vn, K * B); TK(dvn, K * B); TK(vr, K); TK(dg, K);
 #undef TK
-    w->zc = nullptr; w->zc_m = 0.f;
+    w->zc = nullptr; w->zc_m = 0.f; w->dzn_add = nullptr;
 }
 __global__ void k_zcenter(float *z, float *c, int R, int B, float m) {   /* one thread per column: optional EMA update, then z -= c */
     const int b = blockIdx.x * blockDim.x + threadIdx.x; if (b >= B) return;
@@ -148,6 +148,7 @@ extern "C" int dr_head_bwd(const dr_head *h, const float *P, float *G, const flo
         k_wn_bwd<<<nbk((long long)K * 32, 256), 256>>>(w->vn, w->vr, P + h->g, w->dvn, G + h->g, K, B);
         k_add<<<nbk((long long)K * B, 256), 256>>>(G + h->v, w->dvn, (long long)K * B);
     }
+    if (w->dzn_add) k_add<<<nbk((long long)R * B, 256), 256>>>(w->dzn, w->dzn_add, (long long)R * B);
     k_rownorm_bwd<<<nbk((long long)R * 32, 256), 256>>>(w->zn, w->zr, w->dzn, w->dzn, R, B, 1e-12f, 0);   /* d z (in place) */
     CK(at_gemm(1, 0, B, H, R, w->dzn, w->h2, G + h->w3, 1.f)); colsum2(w->dzn, R, B, G + h->b3);
     CK(at_gemm(0, 0, R, H, B, w->dzn, P + h->w3, w->dh2, 0.f));
