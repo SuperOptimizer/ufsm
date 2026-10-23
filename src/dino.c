@@ -174,6 +174,8 @@ static void dn_view_phase(const dn_data *D, dn_sample *S, int v) {
     dn_view_u8(S, v, D->P, S->phw, S->pv[v], PHASE_UNKNOWN);
     uint8_t *ct = malloc(n3); dn_view_u8(S, v, D->P, S->ca, ct, 0);
     size_t known = 0; for (size_t k = 0; k < n3; k++) { if (!ct[k]) S->pv[v][k] = SIDE_UNKNOWN; known += S->pv[v][k] != PHASE_UNKNOWN; }
+    if (getenv("UFSM_DENSE_DBG")) { size_t ph = 0, ctn = 0; for (size_t k = 0; k < n3; k++) ctn += ct[k] != 0; for (size_t k = 0; k < (size_t)D->P * D->P * D->P; k++) ph += S->phw[k] != PHASE_UNKNOWN;
+        fprintf(stderr, "dense worker: %s view %d (m %d off %d %d %d): window phase known %zu, view CT nonzero %zu, view phase known %zu of %zu\n", D->src[S->si].name, v, S->xf[v].m, S->xf[v].off[0], S->xf[v].off[1], S->xf[v].off[2], ph, ctn, known, n3); }
     if (known < 4096) { free(ct); S->uwv[v] = 0; return; }   /* (no labelled phase in this view: no dense unwrap2 targets) */
     const int wt = (n + 5) / 6;
     if (band_wind4_tiled(S->pv[v], n, n, n, wt, 80, 512, 1, S->w4[v], S->wc[v], nullptr) < 0) { memset(S->w4[v], 255, n3); memset(S->wc[v], 255, n3); }
@@ -1032,7 +1034,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
         }
         const int ntot = nop + npi + nni;
         if (ntot) { nn_h2d(o_idx, ho_idx, (size_t)ntot * 4); nn_h2d(o_idx + NOT, ho_idx + NOT, (size_t)ntot * 4); nn_h2d(o_obj, ho_obj, (size_t)ntot * 4); nn_h2d(o_grp, ho_grp, (size_t)ntot * 4); }
-        ring_put(Rg, Sm);
+        if (!HS.uw) ring_put(Rg, Sm);   /* (dense heads: the slot's per-view targets are read in the student loop: held until after it) */
         const float oramp_w = oramp > 0 && step < oramp ? (float)step / oramp : 1.f;
         const float tt = step < tt_warm ? tt0 + (tt1 - tt0) * (float)step / (float)tt_warm : tt1;
         const float sched = step <= warm ? (float)step / warm : 1.f;   /* (upstream: constant after the warm-up) */
@@ -1202,6 +1204,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             if (gl && wk > 0) { nn_d2d(kq + (size_t)kpos * C, clsS, (size_t)C * 4); kpos = (kpos + 1) % KQ; if (kfill < KQ) kfill++; }
         }
         nn_axpy(unet_grad_ptr(u), 1.f, unet_grad_ptr(ul), np);   /* the locals' share */
+        if (HS.uw) ring_put(Rg, Sm);
         const double gnorm = unet_grad_norm(u);
         if (!isfinite(gnorm) || !isfinite(lsum[0])) { fprintf(stderr, "dino-train --recipe: non-finite loss / gradient at step %d\n", step); return 1; }
         if (clip > 0) unet_clip_grad(u, clip);
