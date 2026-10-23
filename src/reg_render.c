@@ -12,7 +12,7 @@
    Config: {"tifxyz": DIR, "downscale": 4, "out": DIR, "layers": 2, "match_um": 9.362, "cover_mm": 1.2, "tol_um": 2.4 (fit / eval residual limit, um), "threads": 12,
             "cache_mb": 2400, "px": 2 (base voxels per output pixel: 2 = half-res of the base-voxel uv grid), "crop": [x0, y0, w, h] (output pixels, optional),
             "scans": [{"name", "root", "key", "um", "chain": [{"map": reg.json, "dir": "c2f" | "f2c", "pair": pair dir}], "scale": 1, "origin": [z, y, x]}],
-            (scale / origin: the scan is a scale-times finer grid of the chain's last frame cropped at origin, e.g. a super-resolved box)
+            ("level": L: always that pyramid level; scale / origin: the scan is a scale-times finer grid of the chain's last frame cropped at origin, e.g. a super-resolved box)
             "rgb": [n1, n2, n3], "diff": [[a, b], [a, b], [a, b]], "baseline": [a, b]} */
 #include "reg.h"
 #include "json.h"
@@ -188,7 +188,7 @@ static float tri(cmemo *m, double x, double y, double z) {
 /* ---------- config ---------- */
 enum { MAXS = 8, MAXCH = 4, TOUCH_M = 64 };
 typedef struct { rmap m; rfield D; int f2c; rcover cov; } rstep;
-typedef struct { char name[64]; rvol *v; int nch; rstep st[MAXCH]; int ln, lm, lsn; ccache cn, cm, cs; double scale, org[3]; _Atomic uint8_t *touch; int64_t tn[3]; } rscan;   /* scale, org: see map_point */
+typedef struct { char name[64]; rvol *v; int nch; rstep st[MAXCH]; int ln, lm, lsn; ccache cn, cm, cs; double scale, org[3]; _Atomic uint8_t *touch; int64_t tn[3]; int force; } rscan;   /* force: "level" L + 1 (0: by the pixel size) */   /* scale, org: see map_point */
 /* base L0 -> scan L0 through the chain. Returns 1, or 2 when every step's pair also certifies the point (cover: a good fit box near,
    no failing evaluation box near). Images use every mapped point with data; only reg inkstat restricts to certified points. */
 static int map_point(const rscan *s, const double p[3], double q[3]) {
@@ -424,6 +424,9 @@ int cmd_reg_render(int argc, char **argv) {
             size_t nt = 1; for (int d = 0; d < 3; d++) { sc->tn[d] = (int64_t)ceil(sc->v->shape[0][d] * sc->scale / 512); nt *= (size_t)sc->tn[d]; }
             sc->touch = calloc(nt, 1);
         }
+        sc->force = json_get(e, "level") ? 1 + (int)json_num(json_get(e, "level"), 0) : 0;   /* "level": L reads that pyramid level in every variant
+                                                                                       (e.g. a scan's own 9.6 um rung next to its level 0) */
+        if (sc->force && sc->force - 1 >= sc->v->nl) { fprintf(stderr, "reg render: %s: level %d absent\n", sc->name, sc->force - 1); return 1; }
         if (!sc->nch) base_um = sc->v->um;
         sc->ln = 0; sc->lm = rvol_level_for(sc->v, j->match_um);
         j->ns++;
@@ -433,6 +436,7 @@ int cmd_reg_render(int argc, char **argv) {
     for (int s = 0; s < j->ns; s++) j->sc[s].ln = rvol_level_for(j->sc[s].v, j->px * base_um);
     const double sn_um = json_num(json_get(cfg, "sample_native_um"), 2.4);   /* depth samples, native variant: the level <= this */
     for (int s = 0; s < j->ns; s++) j->sc[s].lsn = rvol_level_for(j->sc[s].v, sn_um);
+    for (int s = 0; s < j->ns; s++) if (j->sc[s].force) j->sc[s].ln = j->sc[s].lm = j->sc[s].lsn = j->sc[s].force - 1;
     /* chunk caches: the budget split by voxel count per chunk (2 MB each at 128^3) */
     const size_t per = (size_t)(cache_mb / (2.0 * j->ns * 2)) + 16;
     for (int s = 0; s < j->ns; s++) {

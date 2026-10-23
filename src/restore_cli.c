@@ -7,6 +7,7 @@
 #include "pyramid.h"
 #include "restore.h"
 #include "sources.h"
+#include "srpair.h"
 #include "store.h"
 #include "unet.h"
 #include "z3w.h"
@@ -314,5 +315,57 @@ int cmd_restore_stats(int argc, char **argv) {
         nn_free(dco); free(res);
     }
     nn_free(dclean); nn_free(dlow); nn_free(scr);
+    return 0;
+}
+
+/* ufsm restore-eval-pairs <ckpt> <sources.json> [--max 64] [--all 0] [--ema 1] [--gpu 0] [--csv FILE]: every validation box of the real-pair
+   sources (src/srpair.h: the "test" boxes, every box of a "val" pair; --all 1: every box) at the full box size through the restore net; per
+   pair and pooled: PSNR, SSIM (8^3 blocks) and gradient PSNR (face differences) of the output and of the trilinear x4 input against the
+   target (after the pair's intensity map), from nn_restore_pair_loss's metric sums */
+int cmd_restore_eval_pairs(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm restore-eval-pairs <ckpt> <sources.json> [--max 64] [--all 0] [--ema 1] [--gpu 0] [--csv FILE]\n"); return 2; }
+    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
+    unet_cfg cfg; unet *u = restore_net(argv[2], atoi(opt(argc, argv, "--ema", "1")) != 0, &cfg);
+    if (!u) return 1;
+    sources *S = sources_load(argv[3]); if (!S) return 1;
+    const int mx = atoi(opt(argc, argv, "--max", "64")), all = atoi(opt(argc, argv, "--all", "0"));
+    FILE *cf = *opt(argc, argv, "--csv", "") ? fopen(opt(argc, argv, "--csv", ""), "w") : nullptr;
+    if (cf) fprintf(cf, "pair,boxes,voxels,psnr,input_psnr,gain,ssim,input_ssim,grad_psnr,input_grad_psnr\n");
+    const restore_pair_w w = {0.01f, 0.f, 0.f, 0.f, 0.f, 0, 0.f};
+    double tot[RP_NST] = {0};
+#define PS(sse, n) ((n) > 0 && (sse) > 0 ? 10.0 * log10(65025.0 * (n) / (sse)) : 99.0)
+    for (int si = 0; si < S->n; si++) {
+        const srpair *p = S->src[si].srp; if (!p) continue;
+        const int T = p->T, q = T / 4; const size_t t3 = (size_t)T * T * T, q3 = (size_t)q * q * q;
+        if (T % (1 << (cfg.nlev - 1))) { fprintf(stderr, "restore-eval-pairs: %s: box %d not a multiple of %d\n", S->src[si].name, T, 1 << (cfg.nlev - 1)); continue; }
+        uint8_t *ht = malloc(t3), *hc = malloc(q3), *dt = nn_malloc(t3), *dc = nn_malloc(q3), *dlow = nn_malloc(t3); void *dx = nn_malloc(t3 * 2 * cfg.cin);
+        double *dst = nn_malloc(RP_NST * sizeof(double)); float *rd = nn_malloc(q3 * sizeof(float) + 256);
+        double acc[RP_NST] = {0}; int nb = 0;
+        const int nlist = all ? p->n : p->nte;
+        for (int i = 0; i < nlist && nb < mx; i++) {
+            const int k = all ? i : p->te[i]; const int oc[3] = {0, 0, 0};
+            if (srpair_read(p, k, oc, T, ht, hc)) { fprintf(stderr, "restore-eval-pairs: %s box %d unreadable\n", S->src[si].name, k); continue; }
+            nn_h2d(dt, ht, t3); nn_h2d(dc, hc, q3);
+            const float st4[3] = {4.f, 4.f, 4.f}, ph0[3] = {0.f, 0.f, 0.f};
+            nn_restore_upsample(dc, q, q, q, dlow, T, T, T, st4, ph0, nullptr);
+            nn_restore_input(dlow, dx, t3, cfg.cin == 2, nn_get_f16());
+            const float *lg = unet_forward_x(u, dx, (shape5){1, cfg.cin, T, T, T}, 0, 1);
+            nn_restore_pair_loss(lg, unet_logits_h16(u), dlow, dt, dc, T, T, T, &w, nullptr, 0, nn_get_f16(), 1.f, dst, rd, 1);
+            double s[RP_NST]; nn_d2h(s, dst, sizeof s);
+            for (int c = 0; c < RP_NST; c++) acc[c] += s[c];
+            nb++;
+        }
+        for (int c = 0; c < RP_NST; c++) tot[c] += acc[c];
+        const double ss = acc[13] > 0 ? acc[11] / acc[13] : 0, sb = acc[13] > 0 ? acc[12] / acc[13] : 0;
+        printf("%-16s %3d boxes: psnr %.3f (input %.3f, gain %+.3f) ssim %.4f (input %.4f) grad psnr %.3f (input %.3f)\n", S->src[si].name, nb,
+               PS(acc[3], acc[0]), PS(acc[4], acc[0]), PS(acc[3], acc[0]) - PS(acc[4], acc[0]), ss, sb, PS(acc[9], acc[5]), PS(acc[10], acc[5]));
+        if (cf) fprintf(cf, "%s,%d,%.0f,%.4f,%.4f,%.4f,%.5f,%.5f,%.4f,%.4f\n", S->src[si].name, nb, acc[0], PS(acc[3], acc[0]), PS(acc[4], acc[0]), PS(acc[3], acc[0]) - PS(acc[4], acc[0]), ss, sb, PS(acc[9], acc[5]), PS(acc[10], acc[5]));
+        free(ht); free(hc); nn_free(dt); nn_free(dc); nn_free(dlow); nn_free(dx); nn_free(dst); nn_free(rd);
+    }
+    printf("%-16s          : psnr %.3f (input %.3f, gain %+.3f) ssim %.4f (input %.4f) grad psnr %.3f (input %.3f)\n", "pooled",
+           PS(tot[3], tot[0]), PS(tot[4], tot[0]), PS(tot[3], tot[0]) - PS(tot[4], tot[0]), tot[13] > 0 ? tot[11] / tot[13] : 0, tot[13] > 0 ? tot[12] / tot[13] : 0, PS(tot[9], tot[5]), PS(tot[10], tot[5]));
+#undef PS
+    if (cf) fclose(cf);
+    sources_free(S); unet_free(u);
     return 0;
 }

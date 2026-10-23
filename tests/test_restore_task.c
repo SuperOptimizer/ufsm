@@ -3,6 +3,8 @@
    central differences, identity at step 0 (zero head), the sampler's clean-window pairing, and the predict restore path round trip */
 #include "nn.h"
 #include "restore.h"
+#include "pyramid.h"
+#include "json.h"
 #include "srpair.h"
 #include "sample.h"
 #include "sources.h"
@@ -458,11 +460,43 @@ static void test_pair_sampler(const char *tmp) {
     sources_free(S); free(in); free(tg);
 }
 
+/* ufsm sr-pyrpairs: level-2 input boxes and the level-0 boxes under them, from a scan's own pyramid */
+static void test_pyrpairs(const char *tmp) {
+    enum { N = 256 }; const size_t n3 = (size_t)N * N * N;
+    uint8_t *v = malloc(n3); ct_like(v, N, N, N, 0);
+    char g[600], d[700]; snprintf(g, sizeof g, "%s/pyr.zarr", tmp); char ln[32]; z3w_level_name(2.4, ln, sizeof ln); snprintf(d, sizeof d, "%s/%s", g, ln);
+    write_vol(d, v, N, 128);
+    const int64_t sh[3] = {N, N, N};
+    CHECK(!pyramid_build_level(g, 2.4, 1, sh, 128, 0, 0, 2, nullptr) && !pyramid_build_level(g, 2.4, 2, sh, 128, 0, 0, 2, nullptr) && !pyramid_write_group(g, 2.4, 3, "t", nullptr), "pyramid");
+    char out[700]; snprintf(out, sizeof out, "%s/pyrpairs", tmp);
+    char *argv[] = {"ufsm", "sr-pyrpairs", out, "--root", (char *)tmp, "--key", "pyr.zarr", "--um", "2.4", "--n", "3", "--in", "16", "--threads", "2", "--minfrac", "0.5", nullptr};
+    int cmd_sr_pyrpairs(int argc, char **argv);
+    CHECK(cmd_sr_pyrpairs(17, argv) == 0, "sr-pyrpairs");
+    srpair *p = srpair_open(out, "val", 0, 1); CHECK(p && p->n == 3 && p->B == 16 && p->T == 64 && p->nte == 3, "sr-pyrpairs output as a pair");
+    if (!p) { free(v); return; }
+    char bj[800]; snprintf(bj, sizeof bj, "%s/boxes.json", out); FILE *f = fopen(bj, "rb"); char *t = calloc(1 << 16, 1); size_t tn = f ? fread(t, 1, (1 << 16) - 1, f) : 0; if (f) fclose(f);
+    json *j = json_parse(t, tn); free(t);
+    store *gs = store_open(tmp); z3 *z2 = nullptr;
+    { z3_level L[4]; const int k = z3_group_levels(gs, "pyr.zarr", L, 4); char kk[200]; if (k >= 3) { snprintf(kk, sizeof kk, "pyr.zarr/%s", L[2].path); z2 = z3_open(gs, kk, nullptr); } }
+    CHECK(z2 != nullptr, "open level 2");
+    uint8_t *tg = malloc(64 * 64 * 64), *co = malloc(16 * 16 * 16), *ref = malloc(16 * 16 * 16);
+    for (int k = 0; k < 3 && z2; k++) {
+        const json *b = json_at(json_get(j, "boxes"), (size_t)k); int64_t o[3]; for (int a = 0; a < 3; a++) o[a] = (int64_t)json_num(json_at(json_get(b, "origin_level_zyx"), (size_t)a), -1);
+        const int oc[3] = {0, 0, 0}; CHECK(!srpair_read(p, (int)json_num(json_get(b, "slot"), k), oc, 64, tg, co), "read box");
+        size_t bad = 0;
+        for (int z = 0; z < 64; z++) for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) bad += tg[((size_t)z * 64 + y) * 64 + x] != v[((size_t)(4 * o[0] + z) * N + 4 * o[1] + y) * N + 4 * o[2] + x];
+        const int64_t n16[3] = {16, 16, 16}; z3_read(z2, o, n16, ref, 1);
+        for (size_t i = 0; i < 16 * 16 * 16; i++) bad += co[i] != ref[i];
+        CHECK(!bad, "pyr box %d: %zu voxels differ from level 0 / level 2 at the origin", k, bad);
+    }
+    json_free(j); free(tg); free(co); free(ref); srpair_free(p); free(v);
+}
+
 int main(void) {
     if (nn_init(0)) { fprintf(stderr, "no GPU\n"); return 1; }
     nn_set_f16(1); nn_set_grad_scale(1024.f);
     char tmp[] = "/tmp/ufsm_restore_XXXXXX"; if (!mkdtemp(tmp)) return 1;
-    test_codec(); test_degrade(); test_input(); test_loss(); test_identity(); test_sampler(tmp); test_predict(tmp); test_pair_loss(); test_pair_sampler(tmp);
+    test_codec(); test_degrade(); test_input(); test_loss(); test_identity(); test_sampler(tmp); test_predict(tmp); test_pair_loss(); test_pair_sampler(tmp); test_pyrpairs(tmp);
     char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", tmp); if (system(cmd)) {}
     if (fails) { fprintf(stderr, "test_restore_task: %d failures\n", fails); return 1; }
     printf("test_restore_task: ok\n");
