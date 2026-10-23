@@ -861,7 +861,7 @@ typedef struct {
     /* diag-dv (--ssl-dv-teacher PT): the iBOT targets from the frozen upstream dinovol teacher (its ibot_head over its patch tokens of the
        un-augmented teacher global, at the cell of each mapped point) until --ssl-dv-until (0: always), then from our EMA teacher; the student
        iBOT head predicts dinovol's 131072 prototypes (its last layer initialised from dinovol's and kept frozen) */
-    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; uint16_t *dvtok;
+    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
     memset(Q, 0, sizeof *Q); Q->u = u; Q->C = C; Q->CC = cls_reg == 2 ? 2 * C : C; Q->cls_reg = cls_reg; Q->cls_norm = cls_norm; Q->noise = noise; Q->CIN = cfg->cin;
@@ -930,10 +930,7 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         if (Q->DVH.B != atoi(opt(argc, argv, "--ssl-head-bottleneck", "256"))) { fprintf(stderr, "dino-train --ssl-dv-teacher: --ssl-head-bottleneck must be %d (dinovol's iBOT bottleneck)\n", Q->DVH.B); return 2; }
         Q->dvuntil = atoi(opt(argc, argv, "--ssl-dv-until", "0"));
         Q->dvm = calloc(Dd->nsrc, 8); Q->dvs = calloc(Dd->nsrc, 8); Q->dvh = calloc(Dd->nsrc, 8);
-        for (int s = 0; s < Dd->nsrc; s++) {
-            if (dv_ct_stats(Dd->src[s].ca, atoi(opt(argc, argv, "--ssl-dv-stats-stride", "8")), 8, &Q->dvm[s], &Q->dvs[s], &Q->dvh[s])) return 1;
-            fprintf(stderr, "dino-train --ssl-dv-teacher: %s: dinovol normalisation median %.2f scale %.2f p99 %.2f (ours %.1f / %.1f)\n", Dd->src[s].name, Q->dvm[s], Q->dvs[s], Q->dvh[s], Dd->src[s].center, Dd->src[s].scale);
-        }
+        Q->dvhist = calloc((size_t)Dd->nsrc * 256, sizeof *Q->dvhist);   /* dinovol's robust normalisation per source from the histogram of its windows so far */
     }
     if (Q->wib > 0) {
         if (dvck) { char kb[32]; snprintf(kb, sizeof kb, "%d", Q->DVH.K); (void)kb; Q->KI = Q->DVH.K; }
@@ -1010,7 +1007,8 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     for (int i = 0; i < N; i++) {
         dn_sample *Sm = ring_get(Q->R); if (!Sm) { fprintf(stderr, "dino-train --ssl-batch: loader failed\n"); return 1; }
         const dn_src *sr = &Q->Ds->src[Sm->si];
-        if (Q->smsi) Q->smsi[i] = Sm->si;
+        if (Q->smsi) { Q->smsi[i] = Sm->si; int64_t *hh = Q->dvhist + (size_t)Sm->si * 256; for (size_t v = 0; v < ps3; v += 5) hh[Sm->ca[v]]++;
+            if (dv_hist_stats(hh, &Q->dvm[Sm->si], &Q->dvs[Sm->si], &Q->dvh[Sm->si])) { Q->dvm[Sm->si] = sr->center; Q->dvs[Sm->si] = sr->scale; Q->dvh[Sm->si] = 255; } }
         const int xs_ = Q->Ds->xprob > 0 && Sm->xs; if (xs_) nn_h2d(Q->src + (size_t)(N + i) * ps3, Sm->cb, ps3); Q->sums[7] += (double)xs_ / N; if (xs_) { Q->xnccs += Sm->xncc; Q->xnccn++; }
         nn_h2d(Q->src + (size_t)i * ps3, Sm->ca, ps3); hasax[i] = Sm->hasax; if (CIN == 5 && Sm->hasax) nn_h2d(Q->d_ayx + (size_t)i * Q->Ps * 2, Sm->ayx, (size_t)Q->Ps * 8);
         for (int k = 0; k < 2 + Q->NL; k++) {

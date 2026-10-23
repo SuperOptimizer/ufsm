@@ -84,4 +84,5 @@ const void *dv_fpn(const dv_net *n, int *edge, int *ch);
 #include "dinor.h"
 typedef struct z3 z3;
 int dv_head_host(const char *ckpt, const char *pre, dr_head *h, float **Ph);
+int dv_hist_stats(const int64_t *hist256, double *median, double *scale, double *p99);
 int dv_ct_stats(z3 *ct, int stride, int nthreads, double *median, double *scale, double *p99);

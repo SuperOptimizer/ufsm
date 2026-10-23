@@ -978,6 +978,12 @@ int dv_head_host(const char *ckpt, const char *pre, dr_head *h, float **Ph) {
     fprintf(stderr, "dinovol: %s: %d -> %d -> %d -> bottleneck %d, K %d prototypes; weight-norm g mean %.4f min %.4f max %.4f\n", pre, h->Cin, h->H, h->H, h->B, h->K, gs / (double)g->numel, gmin, gmax);
     wl_free(d); *Ph = P; return 0;
 }
+/* robust statistics from a 256-bin histogram (bin 0 ignored), as dinovol-embed's */
+int dv_hist_stats(const int64_t *hist256, double *median, double *scale, double *p99) {
+    int64_t h[256]; memcpy(h, hist256, sizeof h); h[0] = 0; dv_stats S = {0};
+    if (stats_from_hist(h, 256, &S)) return -1;
+    *median = S.median; *scale = S.scale; *p99 = S.p99; return 0;
+}
 /* the volume-wide robust normalisation of dinovol-embed (nonzero voxels of every stride-th chunk per axis) */
 int dv_ct_stats(z3 *ct, int stride, int nthreads, double *median, double *scale, double *p99) {
     dv_stats S = {0}; if (sample_stats(ct, stride, nthreads, &S)) return -1;
