@@ -362,7 +362,8 @@ static int load_sources(const char *path, dn_data *D, int nthreads) {
         const json *bx = json_get(s, "boxes");
         if (bx && bx->type == J_ARR) for (size_t k = 0; k < bx->n && S->nbox < DN_MAXBOX; k++) if (!parse_box(json_at(bx, k), S->box[S->nbox])) S->nbox++;
         if (!S->nbox) { for (int d = 0; d < 3; d++) { S->box[0][d] = 0; S->box[0][3 + d] = S->shape[d]; } S->nbox = 1; }
-        for (int k = 0; k < S->nbox; k++) for (int d = 0; d < 3; d++) if (S->box[k][3 + d] < D->P) { fprintf(stderr, "dino-train: %s box %d is smaller than the window\n", S->name, k); return -1; }
+        { int small = 0; for (int k = 0; k < S->nbox; k++) for (int d = 0; d < 3; d++) small |= S->box[k][3 + d] < D->P;
+          if (small) { fprintf(stderr, "dino-train: WARNING: source %s skipped: a box (or the volume) is smaller than the %d^3 window\n", S->name, D->P); z3_close(S->ca); continue; } }
         const json *ho = json_get(s, "holdout");
         if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n && S->nho < DN_MAXBOX; k++) if (!parse_box(json_at(ho, k), S->ho[S->nho])) S->nho++;
         if (json_get(s, "axis")) { S->axz = load_axis(json_str(json_get(s, "axis"), ""), json_num(json_get(s, "axis_scale"), 1.0), S->shape[0]); if (!S->axz) { fprintf(stderr, "dino-train: %s: cannot read the axis\n", S->name); return -1; } }
