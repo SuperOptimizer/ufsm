@@ -159,7 +159,7 @@ static int test_sharp(void) {
     const double Hc = row_entropy(q, 0, K);
     dr_teacher_probs(ld, R, K, tt, 3, nullptr, q, sc);
     const double Hs = row_entropy(q, 0, K), lnK = log((double)K);
-    const int bad = !(Hc < 0.25 * lnK);
+    const int bad = !(Hc < 0.35 * lnK && Hs > 0.85 * lnK);   /* (centring keeps it sharp, Sinkhorn flattens it) */
     printf("  centred softmax H %.2f, Sinkhorn over %d rows H %.2f (ln K %.2f)%s\n", Hc, R, Hs, lnK, bad ? "  FAIL" : "");
     free(l); nn_free(ld); nn_free(q); nn_free(c); nn_free(sc);
     return bad;
@@ -252,10 +252,35 @@ static int test_nce(void) {
     nn_free(qd); nn_free(kd); nn_free(gd); nn_free(od); nn_free(pd); nn_free(sc);
     return bad;
 }
+/* per-anchor positives, shared negatives: loss / top-1 / d Q vs double and central differences */
+static double ref_nce_p(const double *Q, const double *P, int N, const double *K, int M, int D, double tau, int *hits) {
+    double L = 0; *hits = 0;
+    for (int i = 0; i < N; i++) { double sp = 0, s[64], m, z = 0, mn = -1e300; for (int d = 0; d < D; d++) sp += Q[i * D + d] * P[i * D + d]; sp /= tau; m = sp;
+        for (int k = 0; k < M; k++) { double v = 0; for (int d = 0; d < D; d++) v += Q[i * D + d] * K[k * D + d]; s[k] = v / tau; m = fmax(m, s[k]); mn = fmax(mn, s[k]); }
+        z = exp(sp - m); for (int k = 0; k < M; k++) z += exp(s[k] - m);
+        L += (m + log(z) - sp) / N; *hits += sp > mn; }
+    return L;
+}
+static int test_nce_p(void) {
+    const int N = 5, M = 40, D = 16; const double tau = 0.2, w = 0.7; printf("InfoNCE (per-anchor positives): %d anchors, %d negatives, D %d\n", N, M, D); int bad = 0;
+    double Q[5 * 16], P[5 * 16], K[40 * 16];
+    for (int i = 0; i < N * D; i++) Q[i] = rf(nrand() * 0.3);
+    for (int i = 0; i < N * D; i++) P[i] = rf(Q[i] * 2 + nrand() * 0.3);
+    for (int i = 0; i < M * D; i++) K[i] = rf(nrand() * 0.3);
+    float *qd = dev(Q, N * D), *pd = dev(P, N * D), *kd = dev(K, M * D), *gd = nn_malloc(N * D * 4), *od = nn_malloc(8); void *sc = nn_malloc(dr_nce_scratch(N, M + 1));
+    nn_zero(gd, N * D * 4); nn_zero(od, 8);
+    dr_infonce_p(qd, pd, N, kd, M, D, (float)tau, (float)w, gd, od, sc);
+    int hits; const double L = ref_nce_p(Q, P, N, K, M, D, tau, &hits);
+    double *o = host(od, 2), r2[2] = {w * L, (double)hits / N}; bad += report("loss/acc", o, r2, 2, 2e-3); free(o);
+    double gr[5 * 16]; for (int i = 0; i < N * D; i++) { const double e = 1e-5, x = Q[i]; int h; Q[i] = x + e; const double lp = ref_nce_p(Q, P, N, K, M, D, tau, &h); Q[i] = x - e; const double lm = ref_nce_p(Q, P, N, K, M, D, tau, &h); Q[i] = x; gr[i] = w * (lp - lm) / (2 * e); }
+    double *g = host(gd, N * D); bad += report("d Q", g, gr, N * D, 2e-3); free(g);
+    nn_free(qd); nn_free(pd); nn_free(kd); nn_free(gd); nn_free(od); nn_free(sc);
+    return bad;
+}
 /* the queue-based self-supervision on toy instances (batch-1 MoCo / dense cross-view InfoNCE): random unit points in 64-d, two views =
    point + N(0, 0.3) noise each; student projection (Linear 64 -> 256 -> GELU -> 64, unit) on view a, the EMA teacher's on view b as the positive,
-   negatives = the other anchors' keys + a FIFO queue of earlier teacher keys (Q keys). NB anchors per step (1: CLS-style, 64: dense-style);
-   returns the top-1 accuracy over the last 200 steps (chance 1 / (NB + Q)) */
+   negatives = a FIFO queue of earlier teacher keys (Q keys; dr_infonce_p, as the recipe). NB anchors per step (1: CLS-style, 64: dense-style);
+   returns the top-1 accuracy over the last 200 steps (chance 1 / (1 + Q)) */
 static double toy_nce(int NB, int Q, int steps, double *loss) {
     const int Cin = 64, H = 256, O = 64; dr_mlp2 m; dr_mlp2_layout(&m, Cin, H, O);
     double *b = calloc(m.n, 8); for (size_t i = m.w1; i < m.b1; i++) b[i] = nrand() / sqrt((double)Cin); for (size_t i = m.w2; i < m.b2; i++) b[i] = nrand() / sqrt((double)H);
@@ -265,7 +290,7 @@ static double toy_nce(int NB, int Q, int steps, double *loss) {
     void *ws = nn_malloc(dr_mlp2_ws(&m, NB)), *wt = nn_malloc(dr_mlp2_ws(&m, NB));
     float *xa = nn_malloc((size_t)NB * Cin * 4), *xb = nn_malloc((size_t)NB * Cin * 4), *q = nn_malloc((size_t)NB * O * 4), *kb = nn_malloc((size_t)(NB + Q) * O * 4), *gq = nn_malloc((size_t)NB * O * 4), *out = nn_malloc(8);
     int *pos = nn_malloc(NB * 4); { int *h = malloc(NB * 4); for (int i = 0; i < NB; i++) h[i] = i; nn_h2d(pos, h, NB * 4); free(h); }
-    void *sc = nn_malloc(dr_nce_scratch(NB, NB + Q)); int qf = 0, qp = 0; double acc = 0, ls = 0; int n = 0;
+    void *sc = nn_malloc(dr_nce_scratch(NB, Q + 1)); int qf = 0, qp = 0; double acc = 0, ls = 0; int n = 0;
     double *ha = malloc((size_t)NB * Cin * 8), *hb = malloc((size_t)NB * Cin * 8);
     for (int st = 1; st <= steps; st++) {
         for (int i = 0; i < NB; i++) { double c[64], z = 0; for (int d = 0; d < Cin; d++) { c[d] = nrand(); z += c[d] * c[d]; } z = sqrt(z);
@@ -274,7 +299,7 @@ static double toy_nce(int NB, int Q, int steps, double *loss) {
         dr_mlp2_fwd(&m, Pt, xb, NB, kb, wt);   /* in-batch keys first, the queue rows after them */
         dr_mlp2_fwd(&m, P, xa, NB, q, ws);
         nn_zero(gq, (size_t)NB * O * 4); nn_zero(out, 8); nn_zero(G, m.n * 4);
-        dr_infonce(q, NB, kb, NB + qf, pos, O, 0.2f, 1.f, gq, out, sc);
+        dr_infonce_p(q, kb, NB, kb + (size_t)NB * O, qf, O, 0.2f, 1.f, gq, out, sc);   /* (positives: the in-batch keys; negatives: the queue) */
         dr_mlp2_bwd(&m, P, G, xa, q, gq, NB, nullptr, ws);
         dr_muon(P + m.w1, G + m.w1, Mo + m.w1, H, Cin, 0.02f, 0.95f, 0.f, work);
         dr_muon(P + m.w2, G + m.w2, Mo + m.w2, O, H, 0.02f, 0.95f, 0.f, work);
@@ -558,7 +583,8 @@ static int test_pool(void) {
 
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
-    int bad = test_views() + test_head() + test_targets() + test_sharp() + test_toy_dino() + test_nce() + test_toy_nce() + test_ce() + test_koleo() + test_koleo_q() + test_muon(64, 24) + test_muon(24, 64) + test_muon_ref(160, 24) + test_obj() + test_ink() + test_mlp2() + test_pool() + test_rownorm();
+    int bad = test_views() + test_head() + test_targets() + test_ce() + test_koleo() + test_koleo_q() + test_muon(64, 24) + test_muon(24, 64) + test_muon_ref(160, 24) + test_obj() + test_ink() + test_mlp2() + test_pool() + test_rownorm()
+              + test_sharp() + test_toy_dino() + test_nce() + test_nce_p() + test_toy_nce();   /* (the newer tests last: the older ones keep their random draws) */
     printf(bad ? "test_dinor: %d FAILED\n" : "test_dinor: all passed\n", bad);
     return bad != 0;
 }

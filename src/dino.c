@@ -870,12 +870,12 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
         if (wmo > 0) {
             mg = nn_malloc(MP.n * 4); mm = nn_malloc(MP.n * 4); mv = nn_malloc(MP.n * 4); mmo = nn_malloc(MP.n * 4); nn_zero(mm, MP.n * 4); nn_zero(mv, MP.n * 4); nn_zero(mmo, MP.n * 4);
             mws = nn_malloc(dr_mlp2_ws(&MP, 2)); mwt = nn_malloc(dr_mlp2_ws(&MP, 2)); mkb = nn_malloc((size_t)(2 + MQN) * 256 * 4); mq = nn_malloc(256 * 4); mgq = nn_malloc(256 * 4);
-            msc = nn_malloc(dr_nce_scratch(1, 2 + MQN)); mpos = nn_malloc(2 * 4); const int pz[2] = {0, 1}; nn_h2d(mpos, pz, 8);
+            msc = nn_malloc(dr_nce_scratch(1, MQN + 1)); mpos = nn_malloc(2 * 4); const int pz[2] = {0, 1}; nn_h2d(mpos, pz, 8);
         }
         if (wdn > 0) {
             dg = nn_malloc(DP.n * 4); dm = nn_malloc(DP.n * 4); dv = nn_malloc(DP.n * 4); dmo = nn_malloc(DP.n * 4); nn_zero(dm, DP.n * 4); nn_zero(dv, DP.n * 4); nn_zero(dmo, DP.n * 4);
             dws = nn_malloc(dr_mlp2_ws(&DP, MI)); dwt = nn_malloc(dr_mlp2_ws(&DP, MI)); dkb = nn_malloc((size_t)(MI + DQN) * 128 * 4); dq = nn_malloc((size_t)MI * 128 * 4); dgq = nn_malloc((size_t)MI * 128 * 4);
-            dsc = nn_malloc(dr_nce_scratch(MI, MI + DQN)); nn_zero(dkb, (size_t)(MI + DQN) * 128 * 4); dpos = nn_malloc((size_t)MI * 4); int *h = malloc((size_t)MI * 4); for (int i = 0; i < MI; i++) h[i] = i; nn_h2d(dpos, h, (size_t)MI * 4); free(h);
+            dsc = nn_malloc(dr_nce_scratch(MI, DQN + 1)); nn_zero(dkb, (size_t)(MI + DQN) * 128 * 4); dpos = nn_malloc((size_t)MI * 4); int *h = malloc((size_t)MI * 4); for (int i = 0; i < MI; i++) h[i] = i; nn_h2d(dpos, h, (size_t)MI * 4); free(h);
         }
     }
     dr_mlp2 IH; dr_mlp2_layout(&IH, ED, 384, 32);
@@ -1192,9 +1192,9 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
                 if (dr_mlp2_fwd(&MP, mp, clsS, 1, mq, mws)) return 1;
                 nn_zero(mgq, 256 * 4);
                 const int np_ = gl ? 1 : 2; const float wv = wmo / (float)terms * (gl ? 1.f : 1.f);
-                for (int j = 0; j < np_; j++) {
-                    const int key = gl ? 1 - v : j;   /* (the key bank's row: the positive; the other current row is a further negative) */
-                    dr_infonce(mq, 1, mkb, 2 + mqf, mpos + key, 256, mtau, wv, mgq, outs + 40, msc);
+                for (int j = 0; j < np_; j++) {   /* positive: that global's teacher key; negatives: the queue (other samples) only */
+                    const int key = gl ? 1 - v : j;
+                    dr_infonce_p(mq, mkb + (size_t)key * 256, 1, mkb + 2 * 256, mqf, 256, mtau, wv, mgq, outs + 40, msc);
                     moco_calls++;
                 }
                 if (dr_mlp2_bwd(&MP, mp, mg, clsS, mq, mgq, 1, dcls, mws)) return 1;
@@ -1225,11 +1225,11 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
                     if (dr_head_bwd(&I.H, I.p, I.g, ieS, ibd, m, idE, step > freeze, &I.w)) return 1;
                 } else nn_zero(idE, (size_t)m * ED * 4);
                 if (wdn > 0) {   /* keys: the teacher projection of this view's targets (in-batch: positive i, the rest negatives), then the queue */
-                    /* key bank: MI in-batch slots (this view's m keys; rows m..MI-1 hold earlier steps' keys or zeros: extra negatives), then the queue */
+                    /* key bank: MI in-batch slots (this view's m keys: the positives), then the queue (the negatives: other samples' keys) */
                     if (dr_mlp2_fwd(&DP, dpt, ieT + (size_t)v * MI * ED, m, dkb, dwt)) return 1;
                     if (dr_mlp2_fwd(&DP, dp, ieS, m, dq, dws)) return 1;
                     nn_zero(dgq, (size_t)m * 128 * 4);
-                    dr_infonce(dq, m, dkb, MI + dqf, dpos, 128, dtau, wdn / (float)nmv, dgq, outs + 44, dsc); dnce_calls++;
+                    dr_infonce_p(dq, dkb, m, dkb + (size_t)MI * 128, dqf, 128, dtau, wdn / (float)nmv, dgq, outs + 44, dsc); dnce_calls++;   /* (negatives: the queue only) */
                     if (dr_mlp2_bwd(&DP, dp, dg, ieS, dq, dgq, m, idE, dws)) return 1;
                     {   /* this view's keys into the FIFO (one or two block copies) */
                         const int n1 = m < DQN - dqp ? m : DQN - dqp;
@@ -1375,8 +1375,8 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             int ud = 0, ui = 0; for (int k = 0; k < K; k++) { ud += useb[k]; if (rst) useb[k] = 0; } for (int k = 0; k < KI && wib > 0; k++) { ui += useib[k]; if (rst) useib[k] = 0; }
             snprintf(line, sizeof line, "step %d dino %.4f ibot %.4f (%.0f tokens) obj %.4f region %.4f ink %.4f koleo %.4f gt %.4f var %.4f | H(t) %.2f H(mean) %.2f (max %.2f) H(ibot t) %.2f (max %.2f) | protos used %d / %d, ibot %d / %d | tt %.3f ema %.5f | gnorm %.3f | %.0f ms/step %.1f Mvox/s",
                      step, sums[0] / nsum, sums[5] / nsum, sums[6] / nsum, sums[7] / nsum, sums[8] / nsum, sums[9] / nsum, sums[1] / nsum, sums[2] / nsum, sums[3] / nsum, Hr, Hm, log((double)K), Hi, log((double)KI), ud, K, ui, KI, tt, mom, sums[4] / nsum, dt * 1e3, (double)(2 * g3 + nloc * l3) / dt / 1e6);
-            if (wmo > 0 || wdn > 0) { const size_t ln_ = strlen(line); snprintf(line + ln_, sizeof line - ln_, " | nce: moco %.4f top1 %.3f (keys %d) dense %.4f top1 %.3f (keys %d)",
-                                     sums[10] / nsum, sums[11] / nsum, 2 + mqf, sums[14] > 0 ? sums[12] / sums[14] : 0.0, sums[14] > 0 ? sums[13] / sums[14] : 0.0, MI + dqf); }
+            if (wmo > 0 || wdn > 0) { const size_t ln_ = strlen(line); snprintf(line + ln_, sizeof line - ln_, " | nce: moco %.4f top1 %.3f (negatives %d) dense %.4f top1 %.3f (negatives %d)",
+                                     sums[10] / nsum, sums[11] / nsum, mqf, sums[14] > 0 ? sums[12] / sums[14] : 0.0, sums[14] > 0 ? sums[13] / sums[14] : 0.0, dqf); }
             if (HS.uw) { const size_t ln_ = strlen(line); snprintf(line + ln_, sizeof line - ln_, " | dense: phase %.4f nrm %.4f w4 %.4f acc %.3f (%d views) inkp %.4f (%d views)",
                                      dn_nuw ? dsum[0] / dn_nuw : 0.0, dn_nuw ? dsum[1] / dn_nuw : 0.0, dn_nuw ? dsum[2] / dn_nuw : 0.0, dn_nuw ? dsum[3] / dn_nuw : 0.0, dn_nuw, dn_nik ? dsum[4] / dn_nik : 0.0, dn_nik);
                          memset(dsum, 0, sizeof dsum); dn_nuw = dn_nik = 0;
