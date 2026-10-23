@@ -178,7 +178,8 @@ static int restore_args(int argc, char **argv) {
     g_rr.sc_edge_p = (float)atof(opt(argc, argv, "--scanner-edge-p", "0.3")); g_rr.sc_aniso = (float)atof(opt(argc, argv, "--scanner-aniso", "0.15"));
     g_rr.sc_gain = (float)atof(opt(argc, argv, "--scanner-gain", "0.06")); g_rr.sc_gamma = (float)atof(opt(argc, argv, "--scanner-gamma", "0.06")); g_rr.sc_bias = (float)atof(opt(argc, argv, "--scanner-bias", "3"));
     g_rpairs = atoi(opt(argc, argv, "--sr-pairs", "0")) != 0;
-    g_rpw = (restore_pair_w){g_reps, g_rmse, g_redge, (float)atof(opt(argc, argv, "--sr-shift-w", "0.5")), (float)atof(opt(argc, argv, "--sr-ds", "0.5")), atoi(opt(argc, argv, "--sr-shift", "1"))};
+    g_rpw = (restore_pair_w){g_reps, g_rmse, g_redge, (float)atof(opt(argc, argv, "--sr-shift-w", "0.5")), (float)atof(opt(argc, argv, "--sr-ds", "0.5")), atoi(opt(argc, argv, "--sr-shift", "1")), (float)atof(opt(argc, argv, "--sr-unc", "0"))};
+    if (g_rpw.unc < 0) { fprintf(stderr, "--sr-unc >= 0\n"); return 1; }
     if (g_rpairs && (!(g_rpw.shift_w >= 0 && g_rpw.shift_w <= 1) || g_rpw.ds < 0 || (g_rpw.shift != 0 && g_rpw.shift != 1))) { fprintf(stderr, "--sr-shift-w 0..1, --sr-ds >= 0, --sr-shift 0|1\n"); return 1; }
     if (g_rpairs) fprintf(stderr, "restore: real pairs: loss (1 - %g) Charbonnier + %g shift-min Charbonnier (shift %d) + %g edge + %g MSE + %g downsample consistency\n", g_rpw.shift_w, g_rpw.shift_w, g_rpw.shift, g_redge, g_rmse, g_rpw.ds);
     if (!(g_reps > 0) || g_rmse < 0 || g_redge < 0 || !(g_rr.sc_step[0] >= 2 && g_rr.sc_step[1] >= g_rr.sc_step[0]) || g_rr.pyr_q < 0 || g_rr.sc_q < 0) { fprintf(stderr, "restore: eps > 0, weights >= 0, --scanner-step >= 2\n"); return 1; }
@@ -850,7 +851,7 @@ static double restore_fetch(gpu_state *d, float *out) {
         const double *s = d->rst_h, n = s[0] > 0 ? s[0] : 1, edge = s[5] > 0 ? s[6] / s[5] : 0, ds = s[8] > 0 ? s[7] / s[8] : 0;
         for (int c = 0; c < 2 * NCH + 1; c++) out[c] = 0;
         out[0] = (float)(s[1] / n); out[NCH] = (float)edge; out[2 * NCH] = 1;
-        return s[1] / n + 0.5 * g_rmse * s[3] / 4096.0 / n + g_redge * edge + g_rpw.ds * ds;
+        return s[1] / n + 0.5 * g_rmse * s[3] / 4096.0 / n + g_redge * edge + g_rpw.ds * ds + g_rpw.unc * s[15] / n;
     }
     const double *s = d->rst_h, n = s[0] > 0 ? s[0] : 1, edge = s[5] > 0 ? s[6] / s[5] : 0;
     for (int c = 0; c < 2 * NCH + 1; c++) out[c] = 0;
@@ -1043,7 +1044,7 @@ int cmd_train(int argc, char **argv) {
     g_restore = !strcmp(task, "restore");
     if (g_restore) {
         if (restore_args(argc, argv)) return 2;
-        g_cout = 1; g_rP = P; g_rseed = (uint64_t)atoll(opt(argc, argv, "--seed", "0")) * 0x2545F4914F6CDD1Dull + 0x7E57;
+        g_cout = g_rpairs && g_rpw.unc > 0 ? 2 : 1; g_rP = P;   /* (--sr-unc: channel 1 the log scale) */ g_rseed = (uint64_t)atoll(opt(argc, argv, "--seed", "0")) * 0x2545F4914F6CDD1Dull + 0x7E57;
         const char *bad = B != 1 ? "--B 1" : geometry ? "no geometry" : !strcmp(opt(argc, argv, "--split", "0"), "z") ? "no --split" : strcmp(opt(argc, argv, "--half-res", "none"), "none") ? "no --half-res" :
                           atoi(opt(argc, argv, "--overfit", "0")) ? "no --overfit" : *opt(argc, argv, "--cover", "") ? "no --cover" : atoi(opt(argc, argv, "--verso", "0")) || atoi(opt(argc, argv, "--side", "0")) || atoi(opt(argc, argv, "--cond", "0")) ||
                           atoi(opt(argc, argv, "--pap-head", "0")) || atoi(opt(argc, argv, "--heads", "0")) > 1 || *opt(argc, argv, "--deep-sup", "") || atoi(opt(argc, argv, "--aux-input", "0")) ? "no verso / side / cond / pap-head / heads / deep-sup / aux" :
@@ -1968,9 +1969,9 @@ int cmd_train(int argc, char **argv) {
     if (g_restore) {   /* predict reads "restore" (residual output, the input layout, the fine voxel size) */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
         snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"task\":\"restore\",\"restore\":{\"version\":1,\"input\":\"%s\",\"center\":128,\"scale\":64,\"residual\":true,\"output\":\"input + 64 logit\",\"upsampling\":\"trilinear\","
-                 "\"fine_um\":%.9g,\"eps\":%.9g,\"mse_weight\":%.9g,\"edge_weight\":%.9g,\"mix\":{\"identity\":%.9g,\"pyramid\":%.9g,\"scanner\":%.9g},\"pyramid\":{\"factor\":4,\"q\":%.9g},"
+                 "\"fine_um\":%.9g,%s\"eps\":%.9g,\"mse_weight\":%.9g,\"edge_weight\":%.9g,\"mix\":{\"identity\":%.9g,\"pyramid\":%.9g,\"scanner\":%.9g},\"pyramid\":{\"factor\":4,\"q\":%.9g},"
                  "\"scanner\":{\"step\":[%.9g,%.9g],\"psf\":[%.9g,%.9g],\"aniso\":%.9g,\"noise\":[%.9g,%.9g],\"sigvar\":[%.9g,%.9g],\"corr\":[%.9g,%.9g],\"edge\":[%.9g,%.9g],\"edge_p\":%.9g,\"gain\":%.9g,\"gamma\":%.9g,\"bias\":%.9g,\"q\":%.9g}}}",
-                 g_rsplit?"split":"plain",g_rpairs?S->src[0].um/4:S->src[0].um*(double)(1<<(S->src[0].min_level>0?S->src[0].min_level:0)),g_reps,g_rmse,g_redge,g_rr.mix[0],g_rr.mix[1],g_rr.mix[2],g_rr.pyr_q,
+                 g_rsplit?"split":"plain",g_rpairs?S->src[0].um/4:S->src[0].um*(double)(1<<(S->src[0].min_level>0?S->src[0].min_level:0)),g_rpairs?"\"sr_scale\":4,\"sr_pairs\":1,":"",g_reps,g_rmse,g_redge,g_rr.mix[0],g_rr.mix[1],g_rr.mix[2],g_rr.pyr_q,
                  g_rr.sc_step[0],g_rr.sc_step[1],g_rr.sc_psf[0],g_rr.sc_psf[1],g_rr.sc_aniso,g_rr.sc_noise[0],g_rr.sc_noise[1],g_rr.sc_sigvar[0],g_rr.sc_sigvar[1],g_rr.sc_corr[0],g_rr.sc_corr[1],
                  g_rr.sc_edge[0],g_rr.sc_edge[1],g_rr.sc_edge_p,g_rr.sc_gain,g_rr.sc_gamma,g_rr.sc_bias,g_rr.sc_q);
     }

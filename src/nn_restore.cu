@@ -275,7 +275,7 @@ extern "C" void nn_restore_output(const void *lg, int lg16, const uint8_t *low, 
 }
 
 /* ---- real pairs (train --task restore on sr_pair sources): shift-tolerant Charbonnier, edge, MSE, downsample consistency; metrics ---- */
-struct rp_geo { int D, H, W, q, shift; float eps, mw, ew, sw, dw, gs; };
+struct rp_geo { int D, H, W, q, shift; float eps, mw, ew, sw, dw, gs, uw; };
 template <class L> __device__ __forceinline__ float rp_o(const L *lg, const uint8_t *lo, size_t i) { return (float)lg[i] + (float)lo[i] * 0.015625f; }
 __device__ __forceinline__ float rp_ch(float e, float eps) { return sqrtf(e * e + eps * eps) - eps; }
 __device__ __forceinline__ float rp_cd(float e, float eps) { return e * rsqrtf(e * e + eps * eps); }
@@ -316,13 +316,14 @@ template <class L> __device__ __forceinline__ float rp_emin(const L *lg, const u
     return em;
 }
 template <class L> __global__ void rp_stats_k(const L *__restrict__ lg, const uint8_t *__restrict__ lo, const uint8_t *__restrict__ hi, rp_geo g, double *st, size_t n) {
-    double s[8] = {0, 0, 0, 0, 0, 0, 0, 0};   /* st 0..6 as the synthetic loss, then the shift-min |error| DN */
+    double s[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};   /* st 0..6 as the synthetic loss, then the shift-min |error| DN, the scale head's NLL */
     double m[2] = {0, 0};                       /* st 9, 10: gradient error^2 of output / input against the target (DN) */
     const size_t str[3] = {(size_t)g.H * g.W, (size_t)g.W, 1}; const int len[3] = {g.D, g.H, g.W};
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)blockDim.x * gridDim.x) {
         if (!hi[i]) continue;
         const float o = rp_o(lg, lo, i), e = o - (float)hi[i] * 0.015625f, em = rp_emin(lg, lo, hi, g, i, o), dn = 64.f * e, base = (float)lo[i] - (float)hi[i];
         s[0] += 1; s[1] += (1.f - g.sw) * rp_ch(e, g.eps) + g.sw * rp_ch(em, g.eps); s[2] += fabsf(dn); s[3] += (double)dn * dn; s[4] += (double)base * base; s[7] += fabsf(64.f * em);
+        if (g.uw != 0.f) { const float ls = (float)lg[n + i]; s[8] += (sqrtf(e * e + g.eps * g.eps) - g.eps) * __expf(-ls) + ls; }
         for (int a = 0; a < 3; a++) {
             if ((int)((i / str[a]) % len[a]) == len[a] - 1 || !hi[i + str[a]]) continue;
             const size_t j = i + str[a];
@@ -337,8 +338,8 @@ template <class L> __global__ void rp_stats_k(const L *__restrict__ lg, const ui
     __syncthreads();
     rp_reduce<2>(m, st, 9);
     __syncthreads();
-    double s14[1] = {s[7]};
-    rp_reduce<1>(s14, st, 14);
+    double s14[2] = {s[7], s[8]};
+    rp_reduce<2>(s14, st, 14);
 }
 template <class L, class G> __global__ void rp_grad_k(const L *__restrict__ lg, const uint8_t *__restrict__ lo, const uint8_t *__restrict__ hi, rp_geo g, const float *__restrict__ rd,
                                                     G *__restrict__ gl, const double *__restrict__ st, size_t n) {
@@ -363,6 +364,11 @@ template <class L, class G> __global__ void rp_grad_k(const L *__restrict__ lg, 
         v += g.dw * rd[((size_t)(z >> 2) * g.q + (y >> 2)) * g.q + (x >> 2)] * 0.015625f * (float)(1.0 / st[8]);
     }
     gl[i] = f2h<G>(v * g.gs);
+    if (g.uw != 0.f) {   /* the scale head (channel 1, log b in 64-DN units): Laplace NLL |e| / b + log b with the error held fixed */
+        float u = 0.f;
+        if (hi[i] && st[0] > 0) { const float e = rp_o(lg, lo, i) - (float)hi[i] * 0.015625f; u = g.uw * (1.f - (sqrtf(e * e + g.eps * g.eps) - g.eps) * __expf(-(float)lg[n + i])) * (float)(1.0 / st[0]); }
+        gl[n + i] = f2h<G>(u * g.gs);
+    }
 }
 /* SSIM over non-overlapping 8^3 blocks whose voxels are all valid (target and input > 0), output and input against the target (DN) */
 template <class L> __global__ void __launch_bounds__(512) rp_ssim_k(const L *__restrict__ lg, const uint8_t *__restrict__ lo, const uint8_t *__restrict__ hi, rp_geo g, double *st) {
@@ -399,7 +405,7 @@ template <class L> static void rp_loss_t(const L *lg, const uint8_t *lo, const u
 extern "C" void nn_restore_pair_loss(const void *lg, int lg16, const uint8_t *low, const uint8_t *tgt, const uint8_t *coarse, int D, int H, int W, const restore_pair_w *w,
                                      void *gl, int g16, int h16, float gscale, double *st, float *rd, int metrics) {
     const size_t n = (size_t)D * H * W;
-    rp_geo g = {D, H, W, D / 4, w->shift, w->eps, w->mse, w->edge, w->shift_w, w->ds, gscale};
+    rp_geo g = {D, H, W, D / 4, w->shift, w->eps, w->mse, w->edge, w->shift_w, w->ds, gscale, w->unc};
     if (lg16) rp_loss_t<f16>((const f16 *)lg, low, tgt, coarse, g, gl, g16, h16, st, rd, metrics, n);
     else rp_loss_t<float>((const float *)lg, low, tgt, coarse, g, gl, g16, h16, st, rd, metrics, n);
     KCHECK();

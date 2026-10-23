@@ -25,6 +25,20 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
 }
 
 /* the checkpoint's "restore" object: 1 (and *split, *fine_um) for a task restore checkpoint, 0 otherwise */
+/* real-pair checkpoints (train --sr-pairs 1) store "sr_scale" (4): the output grid is the input's / scale, whatever the input's voxel size */
+static double restore_checkpoint_scale(const char *path) {
+    FILE *f = fopen(path, "rb"); if (!f) return 0;
+    char *h = malloc(UFSM_CHECKPOINT_HEADER + 1); size_t n = fread(h, 1, UFSM_CHECKPOINT_HEADER, f); fclose(f); h[n] = 0;
+    char *e = memchr(h, '\n', n); if (e) *e = 0;
+    double sc = 0;
+    if (n > 4 && !strncmp(h, "UFSM", 4)) {
+        json *j = json_parse(h + 4, strlen(h + 4));
+        const json *x = j ? json_get(j, "extra") : nullptr, *r = x ? json_get(x, "restore") : nullptr;
+        sc = r ? json_num(json_get(r, "sr_scale"), 0) : 0;
+        json_free(j);
+    }
+    free(h); return sc;
+}
 int restore_checkpoint(const char *path, int *split, double *fine_um) {
     FILE *f = fopen(path, "rb"); if (!f) return 0;
     char *h = malloc(UFSM_CHECKPOINT_HEADER + 1); size_t n = fread(h, 1, UFSM_CHECKPOINT_HEADER, f); fclose(f); h[n] = 0;
@@ -70,7 +84,8 @@ int restore_predict(int argc, char **argv) {
     restore_checkpoint(ckpt, &split, &fine_um);
     const double um = atof(opt(argc, argv, "--um", "0"));
     const int level = atoi(opt(argc, argv, "--level", "0")), S = atoi(opt(argc, argv, "--shard", "512")), H = atoi(opt(argc, argv, "--halo", "32"));
-    const double out_um = atof(opt(argc, argv, "--out-um", "0")) > 0 ? atof(opt(argc, argv, "--out-um", "0")) : fine_um;
+    const double sr_scale = restore_checkpoint_scale(ckpt);   /* real-pair nets: x scale of whatever input voxel size */
+    const double out_um = atof(opt(argc, argv, "--out-um", "0")) > 0 ? atof(opt(argc, argv, "--out-um", "0")) : sr_scale > 0 ? um * (1 << level) / sr_scale : fine_um;
     const float q = (float)atof(opt(argc, argv, "--q", "2"));
     const int nlev = atoi(opt(argc, argv, "--levels", "1")), nthreads = atoi(opt(argc, argv, "--threads", "16")), use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
     if (!(um > 0) || S < 128 || S % 128 || H < 0 || nlev < 1 || nlev > 10 || !(q >= 0)) {

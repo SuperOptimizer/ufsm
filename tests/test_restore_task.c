@@ -359,7 +359,7 @@ static void test_pair_loss(void) {
     float *dlg = nn_malloc(n * 4), *dg = nn_malloc(n * 4), *drd = nn_malloc(nq * 4); uint8_t *dlo = nn_malloc(n), *dhi = nn_malloc(n), *dco = nn_malloc(nq); double *dst = nn_malloc(RP_NST * sizeof(double)), s[RP_NST];
     nn_h2d(dlg, lg, n * 4); nn_h2d(dlo, lo, n); nn_h2d(dhi, hi, n); nn_h2d(dco, co, nq);
     for (int shift = 0; shift < 2; shift++) {
-        const restore_pair_w w = {0.01f, 0.1f, 0.3f, shift ? 0.5f : 0.f, 0.7f, shift};
+        const restore_pair_w w = {0.01f, 0.1f, 0.3f, shift ? 0.5f : 0.f, 0.7f, shift, 0.f};
         const double lr = pair_ref(lg, lo, hi, co, N, &w, gr), lgpu = pair_gpu(dlg, dlo, dhi, dco, N, &w, dg, dst, drd, s);
         CHECK(fabs(lr - lgpu) < 1e-5 * fabs(lr) + 1e-7, "pair loss (shift %d) %g vs double %g", shift, lgpu, lr);
         nn_d2h(g, dg, n * 4);
@@ -375,10 +375,32 @@ static void test_pair_loss(void) {
             CHECK(fabs(fd - g[i]) < 2e-3 * fmax(fabs(g[i]), 1e-3) + 2e-6, "pair central difference at %zu: %g vs gradient %g", i, fd, g[i]);
         }
     }
+    {   /* the scale head (--sr-unc): channel 1 = log b; its gradient matches central differences of unc * NLL / count, channel 0 unchanged */
+        const restore_pair_w wu = {0.01f, 0.1f, 0.3f, 0.f, 0.7f, 0, 0.5f};
+        float *l2 = malloc(2 * n * 4), *g2 = malloc(2 * n * 4), *dl2 = nn_malloc(2 * n * 4), *dg2 = nn_malloc(2 * n * 4);
+        memcpy(l2, lg, n * 4); for (size_t i = 0; i < n; i++) l2[n + i] = (float)(urand() * 2 - 1);
+        nn_h2d(dl2, l2, 2 * n * 4);
+#define PU(gp) (pair_gpu(dl2, dlo, dhi, dco, N, &wu, gp, dst, drd, s) + wu.unc * s[15] / s[0])
+        PU(dg2); nn_d2h(g2, dg2, 2 * n * 4);
+        const restore_pair_w w0 = {0.01f, 0.1f, 0.3f, 0.f, 0.7f, 0, 0.f};
+        pair_gpu(dlg, dlo, dhi, dco, N, &w0, dg, dst, drd, s); nn_d2h(g, dg, n * 4);
+        double mx = 0; for (size_t i = 0; i < n; i++) mx = fmax(mx, fabs(g2[i] - g[i]));
+        CHECK(mx < 1e-7, "scale head changes the channel-0 gradient (max %g)", mx);
+        for (int t = 0; t < 10; t++) {
+            size_t i = n + (size_t)(urand() * n); const float h = 2e-3f, l0 = l2[i];
+            l2[i] = l0 + h; nn_h2d(dl2, l2, 2 * n * 4); const double lp = PU(nullptr);
+            l2[i] = l0 - h; nn_h2d(dl2, l2, 2 * n * 4); const double lm = PU(nullptr);
+            l2[i] = l0; nn_h2d(dl2, l2, 2 * n * 4);
+            const double fd = (lp - lm) / (2 * h);
+            CHECK(fabs(fd - g2[i]) < 2e-3 * fmax(fabs(g2[i]), 1e-3) + 2e-6, "scale head central difference at %zu: %g vs gradient %g", i, fd, g2[i]);
+        }
+#undef PU
+        free(l2); free(g2); nn_free(dl2); nn_free(dg2);
+    }
     /* SSIM of a perfect output is 1 */
     for (size_t i = 0; i < n; i++) { hi[i] = (uint8_t)(1 + 254 * urand()); lo[i] = (uint8_t)(1 + 254 * urand()); lg[i] = ((float)hi[i] - lo[i]) / 64.f; }
     nn_h2d(dlg, lg, n * 4); nn_h2d(dlo, lo, n); nn_h2d(dhi, hi, n);
-    const restore_pair_w w = {0.01f, 0.1f, 0.3f, 0.5f, 0.7f, 1};
+    const restore_pair_w w = {0.01f, 0.1f, 0.3f, 0.5f, 0.7f, 1, 0.f};
     pair_gpu(dlg, dlo, dhi, dco, N, &w, nullptr, dst, drd, s);
     CHECK(s[13] == 8 && fabs(s[11] / s[13] - 1) < 1e-4 && s[3] < 1e-6 && s[9] < 1e-6, "perfect output: ssim %g over %g blocks, sse %g, grad sse %g", s[11] / s[13], s[13], s[3], s[9]);
     nn_free(dlg); nn_free(dg); nn_free(drd); nn_free(dlo); nn_free(dhi); nn_free(dco); nn_free(dst); free(lg); free(g); free(lo); free(hi); free(co); free(gr);
