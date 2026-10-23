@@ -2435,6 +2435,13 @@ static void gn_bwd_b(unet *u, const block *b, int k, const float *x, shape5 s, i
     nn_gn_apply(t2, ps, G, one, zero, u->l0s_st + 8 * u->l0s_nng, l0s_stat(u, (block *)b, k, 1), t2);   /* d/dx = rstd(slab) d/dx' */
     nn_slab_perm(gx, t2, s, S, 1);
 }
+/* level k's stage output (the stored block output silu(gn(a2)), s2) after a training-mode forward, and its shape; nullptr when the
+   build does not keep it (recompute / lean modes) */
+const float *unet_stage_out(unet *u, int k, shape5 *s) {
+    if (!u->built || k < 0 || k >= u->cfg.nlev) return nullptr;
+    const block *b = stage_out(u, k); if (s) *s = b->ys;
+    return b->s2;
+}
 const float *unet_tokens(const unet *u, int *nseq, int *S, int *C, int *nreg) {
     if (!u->tbn || !u->built || !u->tb_tok) return nullptr;
     if (nseq) { *nseq = u->tbg.nseq; }

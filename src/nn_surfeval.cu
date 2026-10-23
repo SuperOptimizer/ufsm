@@ -132,3 +132,15 @@ __global__ void k_bias_grad(const float *g, float *gb, int N, int C, long long V
     if (!threadIdx.x) gb[c] += sh[0];
 }
 extern "C" void se_bias_grad(const float *g, float *gb, int N, int C, long long V) { k_bias_grad<<<C, 256>>>(g, gb, N, C, V); }
+/* u8 tile -> net input [cin][P^3]: channel 0 = (v - c) / s, the others 0 */
+__global__ void k_u8_norm(const uint8_t *u, float *x, long long V, float c, float s) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i < V) x[i] = ((float)u[i] - c) / s;
+}
+extern "C" void se_u8_norm(const uint8_t *u, float *x, int cin, long long V, float c, float s) {
+    k_u8_norm<<<nbk(V, 256), 256>>>(u, x, V, c, s); if (cin > 1) cudaMemsetAsync(x + V, 0, (size_t)(cin - 1) * V * 4, 0); }
+/* fp32 [S][C] (channel-last rows) -> [C][S] */
+__global__ void k_f2f_cl(const float *src, float *dst, long long S, int C) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= S * C) return;
+    dst[(size_t)(i % C) * S + i / C] = src[i];
+}
+extern "C" void se_f2f_cl(const float *src, float *dst, long long S, int C) { k_f2f_cl<<<nbk(S * C, 256), 256>>>(src, dst, S, C); }

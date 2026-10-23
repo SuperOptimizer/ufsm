@@ -14,6 +14,7 @@
 #include "nn.h"
 #include "attn.h"
 #include "tiff.h"
+#include "unet.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -35,6 +36,8 @@ void se_adamw(float *p, const float *g, float *m, float *v, long long n, float l
 void se_sumsq(const float *g, long long n, double *out);
 void se_bias_add(float *y, const float *b, int N, int C, long long V);
 void se_bias_grad(const float *g, float *gb, int N, int C, long long V);
+void se_u8_norm(const uint8_t *u, float *x, int cin, long long V, float c, float s);
+void se_f2f_cl(const float *src, float *dst, long long S, int C);
 
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
@@ -128,8 +131,8 @@ typedef struct { se_conv c1, c2, pj; se_in n1, n2, np; int ci, co, proj; } se_bl
 typedef struct { size_t w, b; int ci, co; } se_tc;                /* w: [8][co][ci] */
 typedef struct { se_tc up; se_block bl[2]; int cs; } se_stage;
 typedef struct {
-    int nst; se_stage st[4]; se_conv seg; size_t np; float *p, *g, *m, *v;
-    int nl, ch[5]; int N, P;
+    int nst; se_stage st[8]; se_conv seg; size_t np; float *p, *g, *m, *v;
+    int nl, ch[8]; int N, P;
 } se_dec;
 static size_t g_off;
 static se_conv mk_conv(int ci, int co, int k, int bias) { se_conv c = {g_off, 0, ci, co, k}; g_off += (size_t)co * ci * k * k * k; if (bias) { c.b = g_off; g_off += co; } else c.b = (size_t)-1; return c; }
@@ -177,7 +180,7 @@ static void dec_build(se_dec *D, int nl, const int *ch, int N, int P) {   /* ch[
 /* activations of one block (allocated once for the fixed batch shape) */
 typedef struct { float *x, *h1, *n1, *h2, *o, *y; float *m1, *r1, *m2, *r2, *mp, *rp; shape5 si, so; } se_bact;   /* (a1, n2 and the projection recomputed / folded) */
 typedef struct { float *tmp, *up, *cat; se_bact b[2]; shape5 sl, su; } se_sact;
-typedef struct { se_sact s[4]; float *lg, *glg; float *gA, *gB, *gC, *gD, *scr, *gnscr; size_t scr_n; } se_acts;
+typedef struct { se_sact s[8]; float *lg, *glg; float *gA, *gB, *gC, *gD, *scr, *gnscr; size_t scr_n; } se_acts;
 static float *nm(size_t n) { float *p = nn_malloc(n * 4); if (!p) { fprintf(stderr, "surf-eval: out of device memory\n"); exit(1); } return p; }
 static void acts_alloc(se_acts *A, const se_dec *D) {
     memset(A, 0, sizeof *A); const int N = D->N; size_t maxe = 0, scr = 0;
@@ -310,9 +313,23 @@ static void dec_bwd(se_dec *D, se_acts *A, float *const *f) {
 }
 
 /* ---------------- encoders ---------------- */
-typedef struct { dv_net *dv; int nl, ch[5]; } se_enc;
+typedef struct { dv_net *dv; unet *u; int cin; float *xin; int nl, ch[8]; } se_enc;   /* dinovol, or one of our UNets (its EMA weights) */
 /* one sample's u8 crop (device) -> features of sample n of the batch tensors f[k] */
 static int enc_fwd(se_enc *E, const uint8_t *u8d, int P, const se_case *c, float *const *f, int n) {
+    if (E->u) {   /* our UNet: the stage outputs of levels 0 .. L-2 and the attention-stage tokens (or the last stage) at level L-1 */
+        const long long V = (long long)P * P * P;
+        se_u8_norm(u8d, E->xin, E->cin, V, (float)c->med, (float)c->scale);
+        unet_forward(E->u, E->xin, (shape5){1, E->cin, P, P, P}, 1);
+        for (int k = 0; k < E->nl; k++) {
+            const int e = P >> k; const size_t S = (size_t)e * e * e; float *dst = f[k] + (size_t)n * E->ch[k] * S;
+            int Sv = 0, nreg = 0, Ct = 0; const float *tok = k == E->nl - 1 ? unet_tokens(E->u, nullptr, &Sv, &Ct, &nreg) : nullptr;
+            if (tok) { se_f2f_cl(tok + (size_t)nreg * Ct, dst, (long long)S, Ct); continue; }
+            shape5 sh; const float *so = unet_stage_out(E->u, k, &sh);
+            if (!so || (size_t)sh.d * sh.h * sh.w != S || sh.c != E->ch[k]) { fprintf(stderr, "surf-eval: level %d stage output not kept / unexpected shape\n", k); return -1; }
+            nn_d2d_async(dst, so, S * E->ch[k] * 4);
+        }
+        return 0;
+    }
     nn_sync();   /* (dinovol runs on xnet's non-blocking stream) */
     if (dv_forward(E->dv, u8d, P, (float)c->med, (float)c->scale, (float)c->p99)) return -1;
     xnet_sync();
@@ -381,7 +398,7 @@ static int se_gradcheck(void) {
     return bad > 3;
 }
 int cmd_surf_eval(int argc, char **argv) {
-    if (argc > 2 && !strcmp(argv[2], "--gradcheck")) { if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1; nn_set_tf32(getenv("SE_TF32") != nullptr); return se_gradcheck(); }
+    if (argc > 2 && !strcmp(argv[2], "--gradcheck")) { if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1; nn_set_act_bf16(0); nn_set_tf32(getenv("SE_TF32") != nullptr); return se_gradcheck(); }
     const char *list = opt(argc, argv, "--cases", nullptr), *ck = opt(argc, argv, "--ckpt", nullptr), *out = opt(argc, argv, "--out", nullptr);
     if (!list || !ck || !out) {
         fprintf(stderr, "usage: ufsm surf-eval --cases LIST --ckpt dinovol.pt --out RUN_DIR [--P 128] [--batch 2] [--steps 5000] [--val-every 500] [--val-crops 2]\n"
@@ -396,7 +413,7 @@ int cmd_surf_eval(int argc, char **argv) {
     const int gpu = atoi(opt(argc, argv, "--gpu", "0"));
     if (P % 16 || NB < 1) { fprintf(stderr, "surf-eval: P a multiple of 16\n"); return 2; }
     if (nn_init(gpu) || xnet_init(gpu)) return 1;
-    nn_set_tf32(getenv("SE_TF32") != nullptr);   /* (default: the plain fp32 conv kernels; the TF32 path reads 16-bit activations) */
+    nn_set_act_bf16(0); nn_set_tf32(getenv("SE_TF32") != nullptr);   /* (default: the plain fp32 conv kernels; the TF32 path reads 16-bit activations) */
     xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "6")) * 1e9));
     /* cases */
     FILE *lf = fopen(list, "r"); if (!lf) { fprintf(stderr, "surf-eval: cannot read %s\n", list); return 1; }
@@ -415,9 +432,17 @@ int cmd_surf_eval(int argc, char **argv) {
     if (!ntr || !nva) { fprintf(stderr, "surf-eval: need train and val cases\n"); return 1; }
     if (vlim > 0 && vlim < nva) nva = vlim;
     /* encoder + decoder */
-    se_enc E = {0}; if (!(E.dv = dv_load(ck))) return 1;
-    E.nl = 4; E.ch[3] = dv_embed_dim(E.dv);
-    {   /* the skip widths from a dry forward */
+    se_enc E = {0}; unet_cfg ucfg; int ustep = 0;
+    if (!unet_peek(ck, &ucfg, &ustep)) {   /* one of our UNets */
+        E.u = unet_create(&ucfg); if (unet_load(E.u, ck) < 0) return 1;
+        unet_use_params(E.u, unet_ema_params(E.u));   /* (the teacher weights, as dino-embed) */
+        unet_build(E.u, (shape5){1, ucfg.cin, P, P, P}, 1);
+        E.cin = ucfg.cin; E.nl = ucfg.nlev; for (int k = 0; k < E.nl; k++) E.ch[k] = ucfg.widths[k];
+        E.xin = nm((size_t)ucfg.cin * P * P * P);
+        fprintf(stderr, "surf-eval: our UNet %s (step %d, %d levels, cin %d)\n", ck, ustep, E.nl, E.cin);
+    } else {
+        if (!(E.dv = dv_load(ck))) return 1;
+        E.nl = 4; E.ch[3] = dv_embed_dim(E.dv);
         uint8_t *z = xmalloc_dev((size_t)P * P * P); { uint8_t *hz = calloc((size_t)P * P * P, 1); xh2d(z, hz, (size_t)P * P * P); free(hz); }
         if (dv_forward(E.dv, z, P, 128, 50, 255)) return 1;
         xnet_sync();
@@ -426,12 +451,12 @@ int cmd_surf_eval(int argc, char **argv) {
     }
     se_dec D; dec_build(&D, E.nl, E.ch, N, P);
     se_acts A; acts_alloc(&A, &D);
-    float *f[5]; for (int k = 0; k < E.nl; k++) { const int e = P >> k; f[k] = nm((size_t)N * E.ch[k] * e * e * e); }
+    float *f[8]; for (int k = 0; k < E.nl; k++) { const int e = P >> k; f[k] = nm((size_t)N * E.ch[k] * e * e * e); }
     const size_t V = (size_t)P * P * P;
     uint8_t *hI = malloc(V), *hL = malloc((size_t)N * V), *hS = malloc((size_t)N * V), *u8d = xmalloc_dev(V), *dL = nn_malloc((size_t)N * V), *dS = nn_malloc((size_t)N * V);
     double *dsum = nn_malloc((size_t)N * 8 * 8), *dsq = nn_malloc(8); unsigned long long *dvc = nn_malloc(5 * 8);
-    fprintf(stderr, "surf-eval: %d train / %d val cases; encoder %s (widths %d %d %d | tokens %d), decoder %zu parameters; %d^3 crops, batch %d (accumulated), %d steps\n",
-            ntr, nva, ck, E.ch[0], E.ch[1], E.ch[2], E.ch[3], D.np, P, NB, steps);
+    fprintf(stderr, "surf-eval: %d train / %d val cases; encoder %s (%d levels: %d %d %d .. %d), decoder %zu parameters; %d^3 crops, batch %d (accumulated), %d steps\n",
+            ntr, nva, ck, E.nl, E.ch[0], E.ch[1], E.ch[2], E.ch[E.nl - 1], D.np, P, NB, steps);
     { char cmd[1100]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", out); if (system(cmd)) {} }
     char mp[1200]; snprintf(mp, sizeof mp, "%s/metrics.tsv", out); FILE *mf = fopen(mp, "a");
     if (mf) fprintf(mf, "# step\tkind\tloss\tforeground_dice\tmedial_recall\n");

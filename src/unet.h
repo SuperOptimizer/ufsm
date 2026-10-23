@@ -245,6 +245,7 @@ void unet_set_head_ext(unet *u, int on);
    grid (z y x); nullptr without the stage. unet_set_token_grad: an extra d loss / d tokens (same layout, the backward's scaled domain:
    multiply by nn_get_grad_scale() for 16-bit gradient storage) added at the stage output in the next backward (nullptr: none) */
 const float *unet_tokens(const unet *u, int *nseq, int *S, int *C, int *nreg);
+const float *unet_stage_out(unet *u, int k, shape5 *s);   /* level k's stored stage output silu(gn(a2)) after a training forward (nullptr if not kept) */
 void unet_set_token_grad(unet *u, const float *g);
 void unet_set_wd_nonconv(unet *u, float mul);
 const float *unet_ds_logits(const unet *u, int j, shape5 *s);   /* deep supervision: fp32 logits of decoder level j (1..ds_levels) after a training forward */
