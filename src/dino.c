@@ -546,6 +546,7 @@ static void dn_uw_slab(dn_hs *H, int pass, int z0, int z1) {
         if (W->ik) nn_loss_stats_acc(LGC(ED + 11), W->ik_t + vb, W->ik_m + vb, W->onew, one, W->ds + 50);
         return;
     }
+    const int g16 = nn_get_loss_grad_h16(); nn_set_loss_grad_h16(1);   /* (in place over the fp16 slab: 16-bit gradients, scaled by the gradient scale) */
     if (W->uw) {
         nn_wind4_grad(LGC(ED + 9), LGC(ED + 10), W->w4 + vb, W->wc + vb, W->sidem, ns, W->w4fin, W->lw4, LGC(ED + 9), LGC(ED + 10));
         nn_loss_grad_only(LGC(ED), W->sidet, W->sidem, W->sidew, two, 0.f, LGC(ED), W->sscr); nn_loss_grad_scale(LGC(ED), 2 * ns, W->lp);
@@ -553,6 +554,7 @@ static void dn_uw_slab(dn_hs *H, int pass, int z0, int z1) {
     } else nn_zero(LGC(ED), 11 * ns * 2);
     if (W->ik) { nn_loss_grad_only(LGC(ED + 11), W->ik_t + vb, W->ik_m + vb, W->onew, one, 0.f, LGC(ED + 11), W->iscr); nn_loss_grad_scale(LGC(ED + 11), ns, W->lik); }
     else nn_zero(LGC(ED + 11), ns * 2);
+    nn_set_loss_grad_h16(g16);
     nn_zero(H->hs, (size_t)ED * ns * 2);
     if (H->CO > ED + 12) nn_zero(LGC(ED + 12), (size_t)(H->CO - ED - 12) * ns * 2);
 #undef LGC
@@ -885,7 +887,8 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
       if (rp_) {
           step0 = dn_load_ckpt(u, rp_);
           if (step0 < 0) { fprintf(stderr, "dino-train --recipe: cannot resume %s (another network configuration?)\n", rp_); return 1; }
-          char hp_[1300]; snprintf(hp_, sizeof hp_, "%s.heads", rp_); FILE *hf = fopen(hp_, "rb");
+          char hp_[4200], rr_[4096]; const char *rq_ = realpath(rp_, rr_) ? rr_ : rp_;   /* (last.ckpt is a symlink: the heads sit beside its target) */
+          snprintf(hp_, sizeof hp_, "%s.heads", rq_); FILE *hf = fopen(hp_, "rb");
           struct { float *p; size_t n; const char *nm; } hs[6] = {{D.p, D.H.n, "dino"}, {D.pt, D.H.n, "dino teacher"}, {wib > 0 ? I.p : nullptr, wib > 0 ? I.H.n : 0, "ibot"}, {wib > 0 ? I.pt : nullptr, wib > 0 ? I.H.n : 0, "ibot teacher"}, {rp, RH.n, "region"}, {ip, IH.n, "ink"}};
           long fsz = 0; if (hf) { fseek(hf, 0, SEEK_END); fsz = ftell(hf); fseek(hf, 0, SEEK_SET); }
           size_t want = 0; for (int k = 0; k < 4; k++) want += hs[k].n;
@@ -1158,7 +1161,8 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             if (dense_v) {   /* the dense heads' losses of this view (pass 0's statistics) */
                 if (UW.uw) { float o2[5], o7[15], w4h[8]; nn_loss_fetch(UW.sscr, (shape5){1, 2, 1, 1, 1}, o2); nn_loss_fetch(UW.nscr, (shape5){1, 7, 1, 1, 1}, o7); nn_d2h(w4h, UW.w4fin, sizeof w4h);
                              double nb = 0; for (int c = 0; c < 7; c++) nb += o7[c];
-                             dsum[0] += 0.5 * (o2[0] + o2[1]); dsum[1] += nb / 7; dsum[2] += w4h[0]; dsum[3] += w4h[1]; dn_nuw++; }
+                             dsum[0] += 0.5 * (o2[0] + o2[1]); dsum[1] += nb / 7; dsum[2] += w4h[0]; dsum[3] += w4h[1]; dn_nuw++;
+                             if (getenv("UFSM_DENSE_DBG")) fprintf(stderr, "dense view %d: phase %g %g (active %g) nrm %g w4 %g acc %g N %g comps %g um %.2f gnorm %g\n", v, o2[0], o2[1], o2[4], nb / 7, w4h[0], w4h[1], w4h[2], w4h[4], UW.um, unet_grad_norm(u)); }
                 if (UW.ik) { float o1[3]; nn_loss_fetch(UW.iscr, (shape5){1, 1, 1, 1, 1}, o1); dsum[4] += o1[0]; dn_nik++; }
                 UW.uw = UW.ik = 0;
             }
