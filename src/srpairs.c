@@ -15,7 +15,9 @@
    --warp-input 1: the other direction (64x fewer interpolations, the target unblurred): target = the fine scan's raw (4B)^3 box at the
    mapped centre (no resampling; mask = nonzero), input = the native scan resampled trilinearly through the inverse map onto the box's
    4-fine-voxel grid (input voxel (i, j, k) at fine origin + 4 (i, j, k) + 1.5); boxes.json gives "fine_origin_xyz". The input grid spacing is
-   then 4 fine voxels (9.6 um for 2.4 um targets) rather than the native voxel. */
+   then 4 fine voxels (9.6 um for 2.4 um targets) rather than the native voxel.
+   --boxes FILE: the candidates are another run's boxes.json centres (in its order) with its splits; --lut FILE: that run's intensity_map.json
+   is copied as this run's (the own fit goes to intensity_map.own.json). */
 #include "reg.h"
 #include "json.h"
 #include "z3w.h"
@@ -38,7 +40,7 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
 typedef struct { double c[3]; int64_t o[3], fo[3]; double fc[3]; float in_frac, tg_frac; int slot, split; } sbox;
 typedef struct {
     rvol *cv, *fv; rmap m; rcover cov; int B, T, warp; double minfrac, zcut;
-    double *cand; int ncand; atomic_int next, nacc; int want;
+    double *cand; int ncand; atomic_int next, nacc; int want; int8_t *csplit;   /* csplit: --boxes splits per candidate (nullptr: by zcut) */
     sbox *box; uint8_t *inputs;             /* inputs: want x B^3 */
     z3w *wt, *wm; int64_t S;                 /* target / mask writers, shard 512 */
     pthread_mutex_t mu; uint8_t **tbuf, **mbuf; int *tcnt;   /* pending target / mask shard buffers (boxes per shard = S / T) */
@@ -126,7 +128,7 @@ static void *sr_worker(void *arg) {
         if (slot >= j->want) break;
         sbox *b = &j->box[slot]; memcpy(b->c, c, sizeof b->c); memcpy(b->o, o, sizeof b->o); memcpy(b->fo, fo, sizeof b->fo);
         { const double cc[3] = {c[0], c[1], c[2]}; rmap_c2f(&j->m, cc, b->fc); }
-        b->in_frac = (float)nz / NB; b->tg_frac = (float)nv / NT; b->slot = slot; b->split = c[2] >= j->zcut;
+        b->in_frac = (float)nz / NB; b->tg_frac = (float)nv / NT; b->slot = slot; b->split = j->csplit ? j->csplit[k] : c[2] >= j->zcut;
         memcpy(j->inputs + (size_t)slot * NB, in, NB);
         /* the target / mask shard of this slot: boxes per shard = S / T */
         const int per = (int)(j->S / T), sh = slot / per, pos = slot % per;
@@ -150,7 +152,7 @@ static void *sr_worker(void *arg) {
 }
 
 int cmd_sr_pairs(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm sr-pairs <pair-dir> <out-dir> [--n 500] [--in 64] [--warp-input 0] [--spacing 128] [--holdout 0.15] [--minfrac 0.9] [--cover-mm 1.2] [--tol-um 2.4] [--threads 12] [--cache DIR] [--seed 1]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm sr-pairs <pair-dir> <out-dir> [--n 500] [--in 64] [--warp-input 0] [--boxes boxes.json] [--lut intensity_map.json] [--spacing 128] [--holdout 0.15] [--minfrac 0.9] [--cover-mm 1.2] [--tol-um 2.4] [--threads 12] [--cache DIR] [--seed 1]\n"); return 2; }
     const char *pd = argv[2], *od = argv[3]; char mp[2100]; snprintf(mp, sizeof mp, "%s/final/reg.json", pd);
     sjob *j = calloc(1, sizeof *j); rfield D;
     if (reg_load_map(mp, opt(argc, argv, "--cache", nullptr), &j->cv, &j->fv, &j->m, &D)) return 1;
@@ -171,6 +173,20 @@ int cmd_sr_pairs(int argc, char **argv) {
     }
     srand(seed);   /* Fisher-Yates over the candidates */
     for (int i = j->ncand - 1; i > 0; i--) { const int k = (int)(((uint64_t)rand() * RAND_MAX + rand()) % (uint64_t)(i + 1)); for (int d = 0; d < 3; d++) { const double t = j->cand[3 * i + d]; j->cand[3 * i + d] = j->cand[3 * k + d]; j->cand[3 * k + d] = t; } }
+    const char *bf = opt(argc, argv, "--boxes", nullptr);   /* another sr-pairs run's boxes.json: its centres (in order) and splits */
+    if (bf) {
+        FILE *f = fopen(bf, "rb"); char *t = nullptr; long L = 0;
+        if (f) { fseek(f, 0, SEEK_END); L = ftell(f); fseek(f, 0, SEEK_SET); t = malloc(L + 1); if (fread(t, 1, L, f) != (size_t)L) L = 0; t[L] = 0; fclose(f); }
+        json *bj = t ? json_parse(t, (size_t)L) : nullptr; free(t);
+        const json *bx = bj ? json_get(bj, "boxes") : nullptr;
+        if (!bx || !bx->n) { fprintf(stderr, "sr-pairs: cannot read the boxes of %s\n", bf); return 1; }
+        j->ncand = (int)bx->n; j->cand = realloc(j->cand, (size_t)j->ncand * 3 * sizeof *j->cand); j->csplit = malloc((size_t)j->ncand);
+        for (int k = 0; k < j->ncand; k++) { const json *b = json_at(bx, (size_t)k);
+            for (int d = 0; d < 3; d++) j->cand[3 * k + d] = json_num(json_at(json_get(b, "centre_xyz"), (size_t)d), 0);
+            j->csplit[k] = !strcmp(json_str(json_get(b, "split"), "train"), "test"); }
+        json_free(bj);
+        if (j->want > j->ncand) j->want = j->ncand;
+    }
     fprintf(stderr, "sr-pairs: %s: input %s (%.3f um) x4 <- target %s (%.3f um); %d candidates, overlap z %.0f .. %.0f (test from %.0f)\n", pd, j->cv->name, j->cv->um, j->fv->name, j->fv->um, j->ncand, lo[2], hi[2], j->zcut);
     mkdir(od, 0755);
     char p[2200]; j->S = 512; const int per = (int)(j->S / j->T), nsh = (j->want + per - 1) / per;
@@ -216,7 +232,15 @@ int cmd_sr_pairs(int argc, char **argv) {
         while (nbk > 1 && bv[nbk - 2] > bv[nbk - 1]) { bv[nbk - 2] = (bv[nbk - 2] * bw[nbk - 2] + bv[nbk - 1] * bw[nbk - 1]) / (bw[nbk - 2] + bw[nbk - 1]); bw[nbk - 2] += bw[nbk - 1]; nbk--; } }
     double lut[256]; int k2 = 0;
     for (int a = 0; a < 256; a++) { while (k2 + 1 < nbk && bstart[k2 + 1] <= a) k2++; lut[a] = nbk ? bv[k2] : a; (void)bl; }
-    snprintf(p, sizeof p, "%s/intensity_map.json", od); f = fopen(p, "w");
+    const char *lf = opt(argc, argv, "--lut", nullptr);   /* another run's intensity_map.json, used as is (this run's fit goes to intensity_map.own.json) */
+    if (lf) {
+        FILE *fi = fopen(lf, "rb"); snprintf(p, sizeof p, "%s/intensity_map.json", od); FILE *fo = fi ? fopen(p, "wb") : nullptr; char buf[65536]; size_t k;
+        if (!fi || !fo) { fprintf(stderr, "sr-pairs: cannot copy %s\n", lf); return 1; }
+        while ((k = fread(buf, 1, sizeof buf, fi)) > 0) fwrite(buf, 1, k, fo);
+        fclose(fi); fclose(fo);
+        snprintf(p, sizeof p, "%s/intensity_map.own.json", od);
+    } else snprintf(p, sizeof p, "%s/intensity_map.json", od);
+    f = fopen(p, "w");
     fprintf(f, "{\"maps\":\"target (fine scan, 4^3 block mean, uint8) -> input (native scan) intensity\",\"method\":\"bin means + pool adjacent violators (non-decreasing)\",\"voxels\":%.0f,\"pearson_r\":%.4f,\"lut\":[", tot, r);
     for (int a = 0; a < 256; a++) fprintf(f, "%s%.3f", a ? "," : "", lut[a]);
     fprintf(f, "],\"bin_counts\":["); for (int a = 0; a < 256; a++) fprintf(f, "%s%.0f", a ? "," : "", w[a]);
