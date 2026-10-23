@@ -110,7 +110,7 @@ typedef struct {
 typedef struct { int P, ngt, nssl, nair, margin; int nsrc; dn_src src[DN_MAXSRC]; double wsum; int ident; int nink; double wsum_l, wsum_u, share_u; char excl[8][64]; int nexcl;
     /* recipe views drawn by the loader workers: globals vP^3 (zoom zlo..zhi), vnloc locals vPL^3 (lzlo..lzhi); uw: per global view the stored phase
        resampled into the view + its winding mod 4 (band_wind4_tiled); ikp: the ink-splat probability resampled into the view */
-    int vP, vPL, vnloc, uw, ikp; float zlo, zhi, lzlo, lzhi; } dn_data;   /* share_u: the unlabelled sources' share of the draws (0: by weight over all) */   /* nink: ink points per sample (half ink, half no-ink) */   /* ident: no window geometry (the recipe draws its own views) */
+    int vP, vPL, vnloc, uw, ikp; float zlo, zhi, lzlo, lzhi; } dn_data;   /* share_u: the unlabelled sources' share of the draws (< 0: by weight over all; 0: labelled only) */   /* nink: ink points per sample (half ink, half no-ink) */   /* ident: no window geometry (the recipe draws its own views) */
 typedef struct {   /* one sample: two CT views, the geometry, the points (output-space voxel indices) */
     uint8_t *ca, *cb; int si; int64_t corner[3]; dn_geom g; int halves; float *ayx;   /* the axis (y, x) per window plane (window coords; --axis-input) */
     int ngt, nssl; int *gidx, *gcode, *gxyz, *sidx;
@@ -185,7 +185,7 @@ static int sample_fill(dn_data *D, dn_sample *S, uint64_t *rs, int nthreads, uin
     const int P = D->P; const size_t p3 = (size_t)P * P * P;
     for (int tries = 0; tries < 200; tries++) {
         int si = 0;
-        if (D->share_u > 0 && D->wsum_u > 0 && D->wsum_l > 0) {   /* the unlabelled group with probability share_u, then by weight inside the group */
+        if (D->share_u >= 0 && D->wsum_u > 0 && D->wsum_l > 0) {   /* (share 0: labelled sources only) */   /* the unlabelled group with probability share_u, then by weight inside the group */
             const int want_u = rng_u(rs) < D->share_u; double r = rng_u(rs) * (want_u ? D->wsum_u : D->wsum_l); int last = -1;
             for (si = 0; si < D->nsrc; si++) { if (D->src[si].ct_only != want_u) continue; last = si; r -= D->src[si].weight; if (r < 0) break; }
             if (si >= D->nsrc) si = last;
@@ -718,8 +718,9 @@ static void dn_head_init(dn_head *h, int Cin, int HH, int HB, int K, int rows, u
 }
 /* Muon on W1 W2 W3 (and the prototype directions with proto_muon: orthogonalised update, rows renormalised), AdamW on the biases, the
    weight-norm scales g (and the prototypes otherwise); the last layer frozen while step <= freeze; then the teacher EMA */
-static void dn_head_step(dn_head *h, float mlr, float hlr, float plr, float wd, int step, int freeze, float mom) {   /* plr: the prototype layer (V, g) */
+static void dn_head_step(dn_head *h, float mlr, float hlr, float plr, float wd, int step, int freeze, float mom, int update) {   /* plr: the prototype layer (V, g); update 0: the teacher EMA only (--head-accum) */
     const dr_head *H = &h->H; const int HH = H->H, HB = H->B;
+    if (!update) { dr_ema(h->pt, h->p, H->n, mom); return; }
     dr_muon(h->p + H->w1, h->g + H->w1, h->mo + H->w1, HH, H->Cin, mlr, 0.95f, wd, h->work);
     dr_muon(h->p + H->w2, h->g + H->w2, h->mo + H->w2, HH, HH, mlr, 0.95f, wd, h->work);
     dr_muon(h->p + H->w3, h->g + H->w3, h->mo + H->w3, HB, HH, mlr, 0.95f, wd, h->work);
@@ -872,6 +873,12 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
        (with the old weight decay), g shrank and flattened every logit row: the student matched near-uniform targets by scale, the EMA teacher
        followed, and H(t) stayed at ln K */
     D.train_g = I.train_g = !strcmp(opt(argc, argv, "--proto-g", "fixed"), "train");
+    /* batch-1 remedies for the DINO head: --head-accum N sums its gradient over N steps (one update per N: the large diverse batch upstream
+       averages over; the teacher EMA every step); --zcenter M subtracts an EMA (momentum M, from the teacher rows) of the head output z
+       before its normalisation and the prototypes (the shared direction that made the prototype updates coherent) */
+    const int hacc = atoi(opt(argc, argv, "--head-accum", "1")) > 0 ? atoi(opt(argc, argv, "--head-accum", "1")) : 1;
+    const float zcm = (float)atof(opt(argc, argv, "--zcenter", "0"));
+    float *zcen = nullptr; if (zcm > 0) { zcen = nn_malloc((size_t)HB * 4); nn_zero(zcen, (size_t)HB * 4); D.w.zc = zcen; }
     /* device buffers */
     const size_t ps3 = (size_t)Ps * Ps * Ps, g3 = (size_t)P * P * P, l3 = (size_t)PL * PL * PL;
     uint8_t *src = nn_malloc(ps3); float *xg = nn_malloc(2 * g3 * 4), *xl = nn_malloc((size_t)(nloc > 0 ? nloc : 1) * l3 * 4);
@@ -913,7 +920,11 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
           long fsz = 0; if (hf) { fseek(hf, 0, SEEK_END); fsz = ftell(hf); fseek(hf, 0, SEEK_SET); }
           size_t want = 0; for (int k = 0; k < 4; k++) want += hs[k].n;
           if (hf && (size_t)fsz >= want * 4) {
-              for (int k = 0; k < 4; k++) { if (!hs[k].p) continue; float *h = malloc(hs[k].n * 4); if (fread(h, 4, hs[k].n, hf) == hs[k].n) nn_h2d(hs[k].p, h, hs[k].n * 4); free(h); }
+              dr_head ibl_; dr_head_layout(&ibl_, ED, HH, IB, KI);   /* (a file written with iBOT on: its two blocks skipped when it is off now) */
+              for (int k = 0; k < 4; k++) {
+                  if (!hs[k].p) { if (k >= 2 && (size_t)fsz >= (want + 2 * ibl_.n) * 4) fseek(hf, (long)(ibl_.n * 4), SEEK_CUR); continue; }
+                  float *h = malloc(hs[k].n * 4); if (fread(h, 4, hs[k].n, hf) == hs[k].n) nn_h2d(hs[k].p, h, hs[k].n * 4); free(h);
+              }
               if ((size_t)fsz >= (want + RH.n * 2 + IH.n * 2) * 4) {   /* region and ink heads (student, teacher) */
                   float *h = malloc((RH.n > IH.n ? RH.n : IH.n) * 4);
                   if (fread(h, 4, RH.n, hf) == RH.n) { nn_h2d(rp, h, RH.n * 4); }
@@ -1084,7 +1095,9 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
         unet_use_ema(u, 0);
         RP(2);
         if (cls_norm) dr_rownorm_fwd(clsT, 2, C, clsT, clsRS);
+        D.w.zc_m = zcm;   /* (the teacher rows update the z centre) */
         if (dr_head_fwd(&D.H, D.pt, clsT, 2, tl, &D.w)) return 1;
+        D.w.zc_m = 0.f;
         if (dcm > 0) { dr_teacher_probs(tl, 2, K, tt, 0, dcen, tq, sks); dr_center_update(dcen, tl, 2, K, dcm); }   /* (centre: before its update, as DINOv1) */
         else dr_teacher_probs(tl, 2 + qfill, K, tt, sk_it, nullptr, tq, sks);   /* (rows 0, 1 current; the queue after them) */
         dr_argmax_rows(tq, 2, K, d_am); nn_d2h(h_am, d_am, 8); useb[h_am[0]] = useb[h_am[1]] = 1;
@@ -1102,7 +1115,8 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
         float lsum[6] = {0};   /* dino, koleo, gt, var, ibot */
         if (wreg > 0) nn_zero(rg, RH.n * 4);
         if (NIK > 0) nn_zero(igr, IH.n * 4);
-        nn_zero(D.g, D.H.n * 4); if (wib > 0) nn_zero(I.g, I.H.n * 4);
+        if ((step - 1) % hacc == 0) nn_zero(D.g, D.H.n * 4);   /* (--head-accum: the DINO head's gradient summed over hacc steps) */
+        if (wib > 0) nn_zero(I.g, I.H.n * 4);
         const int nmv = masked[0] + masked[1];
         for (int v = 0; v < 2 + nloc; v++) {
             const int gl = v < 2; unet *n = gl ? u : ul;
@@ -1212,8 +1226,8 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
         unet_muon(u, mlr0 * sched, 0.95f, lr0 * sched, 0.9f, 0.999f, 1e-8f, wd, step);
         RP(8);
         /* heads: Muon on W1 W2 W3, AdamW on the biases and g, the prototype directions per --proto-opt (frozen for --freeze-last steps) */
-        dn_head_step(&D, mlr0 * sched, hlr * sched, plr * sched, wd, step, freeze, mom);
-        if (wib > 0) dn_head_step(&I, mlr0 * sched, hlr * sched, plr * sched, wd, step, freeze, mom);
+        dn_head_step(&D, mlr0 * sched, hlr * sched, plr * sched, wd, step, freeze, mom, step % hacc == 0);
+        if (wib > 0) dn_head_step(&I, mlr0 * sched, hlr * sched, plr * sched, wd, step, freeze, mom, 1);
         if (wreg > 0) {   /* region head: Muon on its matrices, AdamW on the biases, EMA teacher */
             dr_muon(rp + RH.w1, rg + RH.w1, rmo + RH.w1, 384, ED, mlr0 * sched, 0.95f, wd, rwk);
             dr_muon(rp + RH.w2, rg + RH.w2, rmo + RH.w2, 128, 384, mlr0 * sched, 0.95f, wd, rwk);
@@ -1297,7 +1311,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             FILE *hf = fopen(hpth, "wb");
             if (hf) { for (int k = 0; k < (wib > 0 ? 2 : 1); k++) { dn_head *hh = k ? &I : &D; float *h = malloc(hh->H.n * 4);
                           nn_d2h(h, hh->p, hh->H.n * 4); fwrite(h, 4, hh->H.n, hf); nn_d2h(h, hh->pt, hh->H.n * 4); fwrite(h, 4, hh->H.n, hf); free(h); }
-                      if (wib > 0) { float *h = malloc((RH.n > IH.n ? RH.n : IH.n) * 4);   /* then the region and ink heads (student, teacher) */
+                      { float *h = malloc((RH.n > IH.n ? RH.n : IH.n) * 4);   /* then the region and ink heads (student, teacher; also with iBOT off) */
                           nn_d2h(h, rp, RH.n * 4); fwrite(h, 4, RH.n, hf); nn_d2h(h, rpt, RH.n * 4); fwrite(h, 4, RH.n, hf);
                           nn_d2h(h, ip, IH.n * 4); fwrite(h, 4, IH.n, hf); nn_d2h(h, ipt, IH.n * 4); fwrite(h, 4, IH.n, hf); free(h); }
                       fclose(hf); }
@@ -1349,7 +1363,7 @@ int cmd_dino_train(int argc, char **argv) {
     const uint64_t seed = strtoull(opt(argc, argv, "--seed", "1"), nullptr, 10);
     dn_data *Dd = calloc(1, sizeof *Dd); Dd->P = P; Dd->ngt = atoi(opt(argc, argv, "--gt-points", "2048")); Dd->nssl = atoi(opt(argc, argv, "--ssl-points", "2048")); Dd->margin = 8; Dd->nair = atoi(opt(argc, argv, "--air-points", "0"));
     { char *t = strdup(opt(argc, argv, "--exclude-src", "")); for (char *q = strtok(t, ","); q && Dd->nexcl < 8; q = strtok(nullptr, ",")) snprintf(Dd->excl[Dd->nexcl++], 64, "%s", q); free(t); }
-    Dd->share_u = atof(opt(argc, argv, "--unlabelled-share", "0"));   /* the ct_only sources' share of the draws (0: by weight) */
+    Dd->share_u = atof(opt(argc, argv, "--unlabelled-share", "-1"));   /* the ct_only sources' share of the draws (< 0: by weight over all; 0: none) */
     const int recipe = atoi(opt(argc, argv, "--recipe", "0"));   /* the upstream dinovol recipe (dn_recipe): the sampler reads source windows */
     if (recipe) { Dd->P = atoi(opt(argc, argv, "--source-P", "384")); Dd->ident = 1; Dd->nssl = 0; Dd->nink = atof(opt(argc, argv, "--ink", "0.1")) > 0 ? atoi(opt(argc, argv, "--ink-points", "512")) : 0; }
     if (mkdir(outd, 0755) && errno != EEXIST) { fprintf(stderr, "dino-train: cannot create %s\n", outd); return 1; }
