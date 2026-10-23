@@ -649,6 +649,7 @@ static int8_t *dn_embed_box(unet *u, z3 *ct, const int64_t box[6], int P, int h,
                 nn_h2d(ayd, ayh, (size_t)P * 8); }
             dr_axis_view(xid, 0, P, P, ayd, axz != nullptr, x + p3);
         }
+        if (cin == 2 && !axz) nn_zero(x + p3, p3 * 4);   /* (a --mask-input net: nothing masked) */
         if (cin == 2 && axz) {
             const int64_t nzv = z3_meta_of(ct)->shape[0];
             for (int z = 0; z < P; z++) { int64_t gz = o[0] + z; gz = gz < 0 ? 0 : gz >= nzv ? nzv - 1 : gz; ayh[2 * z] = axz[2 * gz] - (float)o[1]; ayh[2 * z + 1] = axz[2 * gz + 1] - (float)o[2]; }
@@ -962,6 +963,7 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     for (int j = 0; j < NV; j++) {
         const int gl = j < 2 * N, n_ = gl ? Q->PG : Q->PL; const size_t n3 = gl ? g3 : l3; float *x = gl ? Q->xg + (size_t)j * CIN * g3 : Q->xl + (size_t)(j - 2 * N) * CIN * l3;
         dr_crops(Q->src, Q->Ps, Q->xfd + j, Q->itd + j, 1, n_, x);
+        if (CIN == 2) nn_zero(x + n3, n3 * 4);
         if (CIN == 5) { const int i = Q->xfh[j].src; dr_axis_view(Q->xfd, j, n_, Q->Ps, Q->d_ayx + (size_t)i * Q->Ps * 2, hasax[i] && rng_u(&Q->ar) >= Q->adrop, x + n3); }
     }
     int R = 0;   /* iBOT: the masked cells per global (block masking), their centres mapped into the partner global */
@@ -1040,7 +1042,8 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
         const int gl = j < 2 * N, i = gl ? j / 2 : (j - 2 * N) / Q->NL, v = gl ? j % 2 : -1; unet *n = gl ? Q->ug : Q->ul;
         const float *x = gl ? Q->xg + (size_t)j * CIN * g3 : Q->xl + (size_t)(j - 2 * N) * CIN * l3;
         const int ib = gl && Q->wib > 0 && Q->cnt[j] > 0;
-        if (ib) { nn_h2d(Q->d_mask, Q->cellm + (size_t)j * Q->GT_ * Q->GT_ * Q->GT_, (size_t)Q->GT_ * Q->GT_ * Q->GT_); dr_mask_cells((float *)x, Q->PG, Q->TPS, Q->d_mask, 0.f); }   /* (the teacher saw it unmasked) */
+        if (ib) { nn_h2d(Q->d_mask, Q->cellm + (size_t)j * Q->GT_ * Q->GT_ * Q->GT_, (size_t)Q->GT_ * Q->GT_ * Q->GT_); dr_mask_cells((float *)x, Q->PG, Q->TPS, Q->d_mask, 0.f);
+                  if (CIN == 2) dr_mask_cells((float *)x + g3, Q->PG, Q->TPS, Q->d_mask, 1.f); }   /* (the teacher saw it unmasked; the mask channel marks the cells) */
         const float *lgs = unet_forward(n, x, gl ? Q->xsg : Q->xsl, 1);
         if (ib) {   /* iBOT: the masked cells' student features -> head -> cross-entropy vs the cross-view targets -> d features into the fp32 logit gradient */
             const int m = Q->cnt[j];
@@ -1358,7 +1361,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     /* inputs per view: CT, then with --axis-input (cin 5) train's radial unit vector (3) and a validity channel (dr_axis_view); the axis
        is dropped (valid 0) for a view with probability --axis-drop, and missing for sources without "axis" */
     const int CIN = cfg->cin; const float adrop = (float)atof(opt(argc, argv, "--axis-drop", "0.15"));
-    if (CIN != 1 && CIN != 5) { fprintf(stderr, "dino-train --recipe: inputs 1 (CT) or 5 (--axis-input: CT, radial, valid)\n"); return 2; }
+    if (CIN != 1 && CIN != 2 && CIN != 5) { fprintf(stderr, "dino-train --recipe: inputs 1 (CT), 2 (--mask-input) or 5 (--axis-input: CT, radial, valid)\n"); return 2; }
     uint8_t *src = nn_malloc(ps3); float *xg = nn_malloc(2 * (size_t)CIN * g3 * 4), *xl = nn_malloc((size_t)(nloc > 0 ? nloc : 1) * CIN * l3 * 4), *d_ayx = nn_malloc((size_t)Ps * 8);
     dr_xf *xfd = nn_malloc(sizeof(dr_xf) * (2 + nloc)); dr_int *itd = nn_malloc(sizeof(dr_int) * (2 + nloc));
     const int NQ = 2 + SQ; float *tl = nn_malloc((size_t)NQ * K * 4), *tq = nn_malloc((size_t)NQ * K * 4); void *sks = nn_malloc(dr_sk_scratch(NQ, K));
@@ -1487,7 +1490,8 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             for (int v = 0; v < 2 + nloc; v++) {
                 const int gl = v < 2, n_ = gl ? P : PL; const size_t n3_ = (size_t)n_ * n_ * n_; float *xv = gl ? xg + (size_t)v * CIN * g3 : xl + (size_t)(v - 2) * CIN * l3;
                 dr_crops(src, Ps, xfd + v, itd + v, 1, n_, xv);
-                dr_axis_view(xfd, v, n_, Ps, d_ayx, Sm->hasax && rng_u(&ar) >= adrop, xv + n3_);
+                if (CIN == 2) nn_zero(xv + n3_, n3_ * 4);
+                else dr_axis_view(xfd, v, n_, Ps, d_ayx, Sm->hasax && rng_u(&ar) >= adrop, xv + n3_);
             }
         }
         /* GT points per global view: the sample's labelled voxels (source coordinates) mapped into the view */
@@ -1967,7 +1971,11 @@ int cmd_dino_train(int argc, char **argv) {
     if (load_sources(srcf, Dd, nthreads)) return 1;
     const int axis_in = atoi(opt(argc, argv, "--axis-input", "0")); const float ars = (float)atof(opt(argc, argv, "--axis-rs", "0.001"));   /* the axis-distance channel and its scale */
     if (axis_in && !recipe) for (int i = 0; i < Dd->nsrc; i++) if (!Dd->src[i].axz) { fprintf(stderr, "dino-train: --axis-input needs \"axis\" in every source (%s)\n", Dd->src[i].name); return 2; }
-    unet_cfg cfg = {0}; cfg.cin = axis_in ? (recipe ? 5 : 2) : 1; cfg.cout = ED; cfg.G = 8;   /* (the recipe: CT, train's radial (3), valid; else CT, axis distance) */
+    unet_cfg cfg = {0}; cfg.cin = axis_in ? (recipe ? 5 : 2) : 1; cfg.cout = ED; cfg.G = 8;
+    if (recipe && atoi(opt(argc, argv, "--mask-input", "0"))) {   /* a mask channel (iBOT: masked cells CT 0 and mask 1; 0 elsewhere) */
+        if (axis_in) { fprintf(stderr, "dino-train: --mask-input with --axis-input is not supported\n"); return 2; }
+        cfg.cin = 2;
+    }   /* (the recipe: CT, train's radial (3), valid; else CT, axis distance) */
     if (recipe && (atof(opt(argc, argv, "--unwrap2", "0")) > 0 || atof(opt(argc, argv, "--ink-prob", "0")) > 0)) {   /* dense heads after the embedding (dn_uw) */
         if (ED != 32) { fprintf(stderr, "dino-train --recipe: the dense heads need --dim 32\n"); return 2; }
         cfg.cout = (ED + 12 + 15) / 16 * 16;
