@@ -323,6 +323,15 @@ static int se_gradcheck(void) {
     uint8_t *hL = malloc(N * V), *hS = malloc(N * V); for (size_t i = 0; i < N * V; i++) { const double u = se_unif(&rs); hL[i] = u < 0.1 ? 2 : u < 0.4 ? 1 : 0; hS[i] = hL[i] == 1 && se_unif(&rs) < 0.5; }
     uint8_t *dL = nn_malloc(N * V), *dS = nn_malloc(N * V); nn_h2d(dL, hL, N * V); nn_h2d(dS, hS, N * V); double *dsum = nn_malloc((size_t)N * 64);
     dec_fwd(&D, &A, f); const double L0 = se_loss_value(&A, dL, dS, N, V, dsum);
+    if (!isfinite(L0)) {   /* where does it go non-finite? */
+        #define CHK(nm_, p_, n_) do { const size_t n__ = (n_); float *h__ = malloc(n__ * 4); nn_d2h(h__, (p_), n__ * 4); size_t b__ = 0; double s__ = 0; for (size_t i__ = 0; i__ < n__; i__++) { if (!isfinite(h__[i__])) b__++; else s__ += fabs(h__[i__]); } fprintf(stderr, "  %-12s %zu non-finite of %zu, mean |x| %.3e\n", nm_, b__, n__, s__ / n__); free(h__); } while (0)
+        for (int s = 0; s < D.nst; s++) { se_sact *a = &A.s[s]; char t[32];
+            snprintf(t, sizeof t, "s%d up", s); CHK(t, a->up, shape_numel(a->su)); snprintf(t, sizeof t, "s%d cat", s); CHK(t, a->cat, 2 * shape_numel(a->su));
+            for (int k = 0; k < 2; k++) { snprintf(t, sizeof t, "s%d b%d h1", s, k); CHK(t, a->b[k].h1, shape_numel(a->b[k].so)); snprintf(t, sizeof t, "s%d b%d n1", s, k); CHK(t, a->b[k].n1, shape_numel(a->b[k].so));
+                snprintf(t, sizeof t, "s%d b%d h2", s, k); CHK(t, a->b[k].h2, shape_numel(a->b[k].so)); snprintf(t, sizeof t, "s%d b%d y", s, k); CHK(t, a->b[k].y, shape_numel(a->b[k].so)); } }
+        CHK("logits", A.lg, (size_t)N * 2 * V);
+        #undef CHK
+    }
     double hs[64]; nn_d2h(hs, dsum, (size_t)N * 64); double cnt = 0; for (int n = 0; n < N; n++) cnt += hs[n * 8 + 1];
     se_loss_grad(A.lg, dL, dS, N, (long long)V, dsum, cnt, 1e-5f, A.glg); nn_zero(D.g, D.np * 4); dec_bwd(&D, &A, f);
     float *g = malloc(D.np * 4), *p = malloc(D.np * 4); nn_d2h(g, D.g, D.np * 4); nn_d2h(p, D.p, D.np * 4);
