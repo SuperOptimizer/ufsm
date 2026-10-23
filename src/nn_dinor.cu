@@ -700,3 +700,14 @@ extern "C" void dr_infonce_p(const float *Q, const float *P, int N, const float 
     if (M > 0) at_gemm_f32(0, 0, N, D, M, S, Kn, gQ, 1.f);
     k_axpy_rows<<<nbk((long long)N * D, 256), 256>>>(gQ, sp, P, N, D);
 }
+
+__global__ void k_rows_gather(const float *src, int C, const int *idx, int n, float *dst) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= (long long)n * C) return;
+    dst[i] = src[(size_t)idx[i / C] * C + i % C];
+}
+__global__ void k_rows_scatter_add(const float *src, const int *idx, int n, int C, float scale, float *dst) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= (long long)n * C) return;
+    dst[(size_t)idx[i / C] * C + i % C] += scale * src[i];
+}
+extern "C" void dr_rows_gather(const float *src, int C, const int *idx, int n, float *dst) { if (n > 0) k_rows_gather<<<nbk((long long)n * C, 256), 256>>>(src, C, idx, n, dst); }
+extern "C" void dr_rows_scatter_add(const float *src, const int *idx, int n, int C, float scale, float *dst) { if (n > 0) k_rows_scatter_add<<<nbk((long long)n * C, 256), 256>>>(src, idx, n, C, scale, dst); }

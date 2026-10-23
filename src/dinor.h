@@ -101,6 +101,9 @@ void dr_infonce(const float *Q, int N, const float *K, int M, const int *pos, in
    other keys never act as negatives (a sheet-identity embedding makes a view's points near duplicates): loss_i = lse(q.p_i, q.n_m) / tau -
    q.p_i / tau; top-1 = the positive above every negative. scratch: dr_nce_scratch(N, M + 1) bytes */
 void dr_infonce_p(const float *Q, const float *P, int N, const float *Kn, int M, int D, float tau, float w, float *gQ, float *out, void *scratch);
+/* rows by index: dst[i] = src[idx[i]] ([n][C]); scatter: dst[idx[i]] += scale src[i] (indices distinct) */
+void dr_rows_gather(const float *src, int C, const int *idx, int n, float *dst);
+void dr_rows_scatter_add(const float *src, const int *idx, int n, int C, float scale, float *dst);
 /* per-object means of point rows x [N][D] by grp [N] (-1 none) -> m [M][D] and counts; backward adds gm / count to the points' rows */
 void dr_gmean(const float *x, const int *grp, int N, int D, int M, float *m, float *cnt);
 void dr_gmean_bwd(const float *gm, const float *cnt, const int *grp, int N, int D, float *gx);

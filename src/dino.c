@@ -852,6 +852,24 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     const float mtau = (float)atof(opt(argc, argv, "--moco-tau", "0.2")), dtau = (float)atof(opt(argc, argv, "--dnce-tau", "0.2"));
     const int MQN = atoi(opt(argc, argv, "--moco-queue", "16384")), DQN = atoi(opt(argc, argv, "--dnce-queue", "16384")), tokp = wib > 0 || wdn > 0;
     dr_mlp2 MP, DP; dr_mlp2_layout(&MP, C, 2048, 256); dr_mlp2_layout(&DP, ED, 512, 128);
+    /* --tnce W: dense cross-view InfoNCE on the trunk's attention-stage grid tokens (not the sheet-identity embedding, whose points are
+       interchangeable across windows): up to --tnce-max student token cells of a global view, each positive the teacher token at the same
+       physical point of the other global (nearest cell), negatives a FIFO of --tnce-queue teacher token keys of earlier samples */
+    const float wtn = (float)atof(opt(argc, argv, "--tnce", "0")), ttau = (float)atof(opt(argc, argv, "--tnce-tau", "0.2"));
+    const int TQN = atoi(opt(argc, argv, "--tnce-queue", "16384")), TNM = atoi(opt(argc, argv, "--tnce-max", "256"));
+    dr_mlp2 TPH; dr_mlp2_layout(&TPH, C, 512, 128);
+    float *tp = nullptr, *tpt = nullptr, *tg_ = nullptr, *tm_ = nullptr, *tv_ = nullptr, *tmo = nullptr, *tkb = nullptr, *tqv = nullptr, *tgq = nullptr, *tA = nullptr, *tB = nullptr, *tdA = nullptr, *ttok[2] = {nullptr, nullptr};
+    void *tws = nullptr, *twt = nullptr, *tsc = nullptr; int *tiS = nullptr, *tiT = nullptr, tqf = 0, tqp = 0; size_t ttokn = 0;
+    if (wtn > 0) {
+        uint64_t r5 = seed * 53 + 17; float *b = calloc(TPH.n, 4);
+        for (size_t i = TPH.w1; i < TPH.b1; i++) b[i] = (float)(sqrt(-2 * log(rng_u(&r5) + 1e-12)) * cos(6.283185307 * rng_u(&r5)) / sqrt((double)TPH.Cin));
+        for (size_t i = TPH.w2; i < TPH.b2; i++) b[i] = (float)(sqrt(-2 * log(rng_u(&r5) + 1e-12)) * cos(6.283185307 * rng_u(&r5)) / sqrt((double)TPH.H));
+        tp = nn_malloc(TPH.n * 4); tpt = nn_malloc(TPH.n * 4); nn_h2d(tp, b, TPH.n * 4); nn_h2d(tpt, b, TPH.n * 4); free(b);
+        tg_ = nn_malloc(TPH.n * 4); tm_ = nn_malloc(TPH.n * 4); tv_ = nn_malloc(TPH.n * 4); tmo = nn_malloc(TPH.n * 4); nn_zero(tm_, TPH.n * 4); nn_zero(tv_, TPH.n * 4); nn_zero(tmo, TPH.n * 4); nn_zero(tg_, TPH.n * 4);
+        tws = nn_malloc(dr_mlp2_ws(&TPH, TNM)); twt = nn_malloc(dr_mlp2_ws(&TPH, TNM)); tkb = nn_malloc((size_t)(TNM + TQN) * 128 * 4); nn_zero(tkb, (size_t)(TNM + TQN) * 128 * 4);
+        tqv = nn_malloc((size_t)TNM * 128 * 4); tgq = nn_malloc((size_t)TNM * 128 * 4); tA = nn_malloc((size_t)TNM * C * 4); tB = nn_malloc((size_t)TNM * C * 4); tdA = nn_malloc((size_t)TNM * C * 4);
+        tsc = nn_malloc(dr_nce_scratch(TNM, TQN + 1)); tiS = nn_malloc((size_t)2 * TNM * 4); tiT = nn_malloc((size_t)2 * TNM * 4);
+    }
     float *mp = nullptr, *mpt = nullptr, *mg = nullptr, *mm = nullptr, *mv = nullptr, *mmo = nullptr, *mkb = nullptr, *mq = nullptr, *mgq = nullptr; void *mws = nullptr, *mwt = nullptr, *msc = nullptr; int *mpos = nullptr, mqf = 0, mqp = 0;
     float *dp = nullptr, *dpt = nullptr, *dg = nullptr, *dm = nullptr, *dv = nullptr, *dmo = nullptr, *dkb = nullptr, *dq = nullptr, *dgq = nullptr; void *dws = nullptr, *dwt = nullptr, *dsc = nullptr; int *dpos = nullptr, dqf = 0, dqp = 0;
     float *pwork = nullptr;
@@ -864,9 +882,9 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             for (size_t i = L->w2; i < L->b2; i++) b[i] = (float)(sqrt(-2 * log(rng_u(&r4) + 1e-12)) * cos(6.283185307 * rng_u(&r4)) / sqrt((double)L->H));
             *pp = nn_malloc(L->n * 4); *pt_ = nn_malloc(L->n * 4); nn_h2d(*pp, b, L->n * 4); nn_h2d(*pt_, b, L->n * 4); free(b);
         }
-        size_t wb = 0; const size_t cand[4] = {dr_muon_work(2048, C), dr_muon_work(256, 2048), dr_muon_work(512, ED), dr_muon_work(128, 512)};
-        for (int i = 0; i < 4; i++) if (cand[i] > wb) wb = cand[i];
-        if (wmo > 0 || wdn > 0) pwork = nn_malloc(wb);
+        size_t wb = 0; const size_t cand[5] = {dr_muon_work(2048, C), dr_muon_work(256, 2048), dr_muon_work(512, ED), dr_muon_work(128, 512), dr_muon_work(512, C)};
+        for (int i = 0; i < 5; i++) if (cand[i] > wb) wb = cand[i];
+        if (wmo > 0 || wdn > 0 || wtn > 0) pwork = nn_malloc(wb);
         if (wmo > 0) {
             mg = nn_malloc(MP.n * 4); mm = nn_malloc(MP.n * 4); mv = nn_malloc(MP.n * 4); mmo = nn_malloc(MP.n * 4); nn_zero(mm, MP.n * 4); nn_zero(mv, MP.n * 4); nn_zero(mmo, MP.n * 4);
             mws = nn_malloc(dr_mlp2_ws(&MP, 2)); mwt = nn_malloc(dr_mlp2_ws(&MP, 2)); mkb = nn_malloc((size_t)(2 + MQN) * 256 * 4); mq = nn_malloc(256 * 4); mgq = nn_malloc(256 * 4);
@@ -968,8 +986,8 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
                   if (fread(h, 4, IH.n, hf) == IH.n) { nn_h2d(ip, h, IH.n * 4); }
                   if (fread(h, 4, IH.n, hf) == IH.n) { nn_h2d(ipt, h, IH.n * 4); }
                   free(h);
-                  for (int k = 0; k < 2; k++) {   /* projection heads, when saved by a run with the same terms on */
-                      const dr_mlp2 *L = k ? &DP : &MP; float *P_ = k ? dp : mp, *T_ = k ? dpt : mpt; if (!P_) continue;
+                  for (int k = 0; k < 3; k++) {   /* projection heads, when saved by a run with the same terms on */
+                      const dr_mlp2 *L = k == 2 ? &TPH : k ? &DP : &MP; float *P_ = k == 2 ? tp : k ? dp : mp, *T_ = k == 2 ? tpt : k ? dpt : mpt; if (!P_) continue;
                       float *g_ = malloc(L->n * 4); if (fread(g_, 4, L->n, hf) == L->n) { nn_h2d(P_, g_, L->n * 4); if (fread(g_, 4, L->n, hf) == L->n) nn_h2d(T_, g_, L->n * 4); } free(g_);
                   }
               }
@@ -1000,7 +1018,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             Ps, P, zlo, zhi, nloc, PL, lzlo, lzhi, cls_reg ? "register 0" : "grid mean", HH, HH, HB, K, sk_it, SQ, wk, KQ, wgt, tt0, tt1, tt_warm, ema0, ema1);
     uint64_t ar = seed * 1000003 + 99; int qfill = 0, qpos = 0, kfill = 0, kpos = 0, ibv = -1;
     float *dcen = nn_malloc((size_t)K * 4), *icen = nn_malloc((size_t)KI * 4); nn_zero(dcen, (size_t)K * 4); nn_zero(icen, (size_t)KI * 4);   /* (centres: zero at start / resume) */
-    double sums[16] = {0}; int nsum = 0; double t_last = dn_now(), t_loop = dn_now(), t_meas0 = 0;
+    double sums[20] = {0}; int nsum = 0; double t_last = dn_now(), t_loop = dn_now(), t_meas0 = 0;
     double dsum[5] = {0}; int dn_nuw = 0, dn_nik = 0;
     double *dsrc = calloc((size_t)DN_MAXSRC * 4, sizeof(double));   /* per source: unwrap2 views, normals bce, winding mod 4 bce, its accuracy (the log's "by source") */ const int dense_from = atoi(opt(argc, argv, "--dense-from", "-1")) >= 0 ? atoi(opt(argc, argv, "--dense-from", "-1")) : step0;
     const int trunc_from = trunc_from0 >= 0 ? trunc_from0 : dense_from + 5000;
@@ -1123,6 +1141,10 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             unet_forward(u, xg + v * g3, xsg, 0);
             const float *tok = unet_tokens(u, nullptr, &S0, &Cc, &nreg);
             if (cls_reg) nn_d2d(clsT + (size_t)v * C, tok, (size_t)C * 4); else dr_pool_fwd(tok, 1, S0, C, nreg, clsT + (size_t)v * C);
+            if (wtn > 0) {   /* (the teacher's tokens of this view, for the other view's token InfoNCE) */
+                if (ttokn < (size_t)S0 * C) { for (int k = 0; k < 2; k++) { nn_free(ttok[k]); ttok[k] = nn_malloc((size_t)S0 * C * 4); } ttokn = (size_t)S0 * C; }
+                nn_d2d(ttok[v], tok, (size_t)S0 * C * 4);
+            }
             const int w = 1 - v;   /* the masked view whose targets this teacher view provides */
             if (masked[w]) dn_gather_slabs(&HS, itidx + w * MI, nmi[w], ieT + (size_t)w * MI * ED, inT + w * MI, nullptr, 0, nullptr, nullptr);
             if (ntot) {   /* the object (and ink) points of this view (teacher keys of the other view's anchors), object means through the teacher region head */
@@ -1155,12 +1177,30 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
         unet_zero_grad(u); unet_zero_grad(ul); nn_zero(outs, 64 * 4);
         if (tgn < (size_t)S0 * C) { nn_free(tgrad); tgn = (size_t)S0 * C; tgrad = nn_malloc(tgn * 4); }
         float lsum[6] = {0};   /* dino, koleo, gt, var, ibot */
-        int moco_calls = 0, dnce_calls = 0;
+        int moco_calls = 0, dnce_calls = 0, tnce_calls = 0;
         if (wreg > 0) nn_zero(rg, RH.n * 4);
         if (NIK > 0) nn_zero(igr, IH.n * 4);
         if ((step - 1) % hacc == 0) nn_zero(D.g, D.H.n * 4);   /* (--head-accum: the DINO head's gradient summed over hacc steps) */
         if (wib > 0) nn_zero(I.g, I.H.n * 4);
         const int nmv = masked[0] + masked[1];
+        int tnm[2] = {0, 0};   /* token InfoNCE pairs per global view: student token rows of view v, teacher rows of view 1 - v at the same point */
+        if (wtn > 0 && ttok[0]) {
+            const int TS = 1 << (cfg->nlev - 1), g = P / TS; static int *hS, *hT; if (!hS) { hS = malloc((size_t)2 * TNM * 4); hT = malloc((size_t)2 * TNM * 4); }
+            for (int v = 0; v < 2; v++) {
+                int seen = 0;
+                for (int c = 0; c < g * g * g; c++) {
+                    const int cz = c / (g * g), cy = (c / g) % g, cx = c % g;
+                    const double vv[3] = {cz * TS + TS / 2 - 0.5, cy * TS + TS / 2 - 0.5, cx * TS + TS / 2 - 0.5}; double sx[3], o[3]; dr_map(&xf[v], vv, sx); dr_unmap(&xf[1 - v], sx, o);
+                    int q[3], in = 1; for (int d = 0; d < 3; d++) { q[d] = (int)floor(o[d] / TS); in &= o[d] >= 0 && o[d] < P; }
+                    if (!in) continue;
+                    int k = seen++; if (k >= TNM) { k = (int)(rng_next(&ar) % (uint64_t)seen); if (k >= TNM) continue; }
+                    hS[v * TNM + k] = nreg + c; hT[v * TNM + k] = nreg + (q[0] * g + q[1]) * g + q[2];
+                }
+                tnm[v] = seen < TNM ? seen : TNM;
+                if (tnm[v] < 16) { tnm[v] = 0; continue; }
+                nn_h2d(tiS + v * TNM, hS + v * TNM, (size_t)tnm[v] * 4); nn_h2d(tiT + v * TNM, hT + v * TNM, (size_t)tnm[v] * 4);
+            }
+        }
         for (int v = 0; v < 2 + nloc; v++) {
             const int gl = v < 2; unet *n = gl ? u : ul;
             const float *x = gl ? xg + v * g3 : xl + (size_t)(v - 2) * l3;
@@ -1204,6 +1244,19 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             /* d / d CLS -> token gradient (the backward's scaled domain) */
             nn_zero(tgrad, (size_t)Sv * C * 4);
             if (cls_reg) nn_axpy(tgrad, gs, dcls, (size_t)C); else { dn_axpby(dcls, dcls, (size_t)C, gs, 0.f); dr_pool_bwd(dcls, 1, Sv, C, nreg, tgrad); }
+            if (gl && wtn > 0 && tnm[v]) {   /* token InfoNCE: these student tokens vs the other view's teacher tokens at the same points, queue negatives */
+                const int m = tnm[v];
+                dr_rows_gather(tok, C, tiS + v * TNM, m, tA); dr_rows_gather(ttok[1 - v], C, tiT + v * TNM, m, tB);
+                if (dr_mlp2_fwd(&TPH, tpt, tB, m, tkb, twt) || dr_mlp2_fwd(&TPH, tp, tA, m, tqv, tws)) return 1;
+                nn_zero(tgq, (size_t)m * 128 * 4); nn_zero(tdA, (size_t)m * C * 4);
+                dr_infonce_p(tqv, tkb, m, tkb + (size_t)TNM * 128, tqf, 128, ttau, wtn / 2, tgq, outs + 48, tsc); tnce_calls++;
+                if (dr_mlp2_bwd(&TPH, tp, tg_, tA, tqv, tgq, m, tdA, tws)) return 1;
+                dr_rows_scatter_add(tdA, tiS + v * TNM, m, C, gs, tgrad);   /* (the token gradient's scaled domain, as the CLS path) */
+                const int n1 = m < TQN - tqp ? m : TQN - tqp;   /* the keys into the FIFO */
+                nn_d2d(tkb + (size_t)(TNM + tqp) * 128, tkb, (size_t)n1 * 128 * 4);
+                if (m > n1) nn_d2d(tkb + (size_t)TNM * 128, tkb + (size_t)n1 * 128, (size_t)(m - n1) * 128 * 4);
+                tqp = (tqp + m) % TQN; tqf = tqf + m < TQN ? tqf + m : TQN;
+            }
             unet_set_token_grad(n, tgrad);
             /* dense GT SupCon on the view's labelled voxels (globals) */
             HS.ngt = 0; HS.nssl = 0;
@@ -1284,7 +1337,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
                 if (UW.ik) { float o1[3]; nn_loss_fetch(UW.iscr, (shape5){1, 1, 1, 1, 1}, o1); dsum[4] += o1[0]; dn_nik++; }
                 UW.uw = UW.ik = 0;
             }
-            nn_d2h(hout, outs, 48 * 4);
+            nn_d2h(hout, outs, 52 * 4);
             lsum[0] += hout[16]; if (gl) { lsum[1] += hout[17]; lsum[2] += HS.ngt ? hout[20] : 0.f; lsum[3] += HS.ngt ? hout[24] : 0.f; lsum[4] += masked[v] ? hout[28] : 0.f; }
             if (gl && wk > 0) { nn_d2d(kq + (size_t)kpos * C, clsS, (size_t)C * 4); kpos = (kpos + 1) % KQ; if (kfill < KQ) kfill++; }
         }
@@ -1306,8 +1359,9 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             dr_adamw(rp + RH.b2, rg + RH.b2, rm + RH.b2, rv + RH.b2, 128, hlr * sched, 0.9f, 0.999f, 1e-8f, 0.f, step);
             dr_ema(rpt, rp, RH.n, mom);
         }
-        for (int k = 0; k < 2; k++) {   /* the projection heads: Muon on the matrices, AdamW on the biases, EMA teacher */
-            const dr_mlp2 *L = k ? &DP : &MP; float *P_ = k ? dp : mp, *T_ = k ? dpt : mpt, *G_ = k ? dg : mg, *M_ = k ? dm : mm, *V_ = k ? dv : mv, *O_ = k ? dmo : mmo;
+        for (int k = 0; k < 3; k++) {   /* the projection heads: Muon on the matrices, AdamW on the biases, EMA teacher */
+            const dr_mlp2 *L = k == 2 ? &TPH : k ? &DP : &MP; float *P_ = k == 2 ? tp : k ? dp : mp, *T_ = k == 2 ? tpt : k ? dpt : mpt, *G_ = k == 2 ? tg_ : k ? dg : mg,
+                  *M_ = k == 2 ? tm_ : k ? dm : mm, *V_ = k == 2 ? tv_ : k ? dv : mv, *O_ = k == 2 ? tmo : k ? dmo : mmo;
             if (!P_) continue;
             dr_muon(P_ + L->w1, G_ + L->w1, O_ + L->w1, L->H, L->Cin, mlr0 * sched, 0.95f, wd, pwork);
             dr_muon(P_ + L->w2, G_ + L->w2, O_ + L->w2, L->O, L->H, mlr0 * sched, 0.95f, wd, pwork);
@@ -1334,6 +1388,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
         { float o4[6]; nn_d2h(o4, outs + 32, 24); sums[7] += o4[0]; sums[8] += o4[2]; sums[9] += o4[4]; }
         if (moco_calls) { sums[10] += hout[40] / (moco_calls * wmo / terms); sums[11] += hout[41] / moco_calls; }
         if (dnce_calls) { sums[12] += hout[44] / wdn; sums[13] += hout[45] / dnce_calls; sums[14] += 1; }
+        if (tnce_calls) { sums[15] += hout[48] / (tnce_calls * wtn / 2); sums[16] += hout[49] / tnce_calls; sums[17] += 1; }
         sums[0] += lsum[0]; sums[1] += lsum[1]; sums[2] += lsum[2] / 2; sums[3] += lsum[3] / 2; sums[4] += gnorm; sums[5] += lsum[4]; sums[6] += nmi[0] + nmi[1]; nsum++;
         if (step % log_every == 0) {
             /* teacher target entropy of row 0 and of the batch mean (prototype usage) */
@@ -1375,6 +1430,8 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             int ud = 0, ui = 0; for (int k = 0; k < K; k++) { ud += useb[k]; if (rst) useb[k] = 0; } for (int k = 0; k < KI && wib > 0; k++) { ui += useib[k]; if (rst) useib[k] = 0; }
             snprintf(line, sizeof line, "step %d dino %.4f ibot %.4f (%.0f tokens) obj %.4f region %.4f ink %.4f koleo %.4f gt %.4f var %.4f | H(t) %.2f H(mean) %.2f (max %.2f) H(ibot t) %.2f (max %.2f) | protos used %d / %d, ibot %d / %d | tt %.3f ema %.5f | gnorm %.3f | %.0f ms/step %.1f Mvox/s",
                      step, sums[0] / nsum, sums[5] / nsum, sums[6] / nsum, sums[7] / nsum, sums[8] / nsum, sums[9] / nsum, sums[1] / nsum, sums[2] / nsum, sums[3] / nsum, Hr, Hm, log((double)K), Hi, log((double)KI), ud, K, ui, KI, tt, mom, sums[4] / nsum, dt * 1e3, (double)(2 * g3 + nloc * l3) / dt / 1e6);
+            if (wtn > 0) { const size_t ln_ = strlen(line); snprintf(line + ln_, sizeof line - ln_, " | tnce %.4f top1 %.3f (negatives %d)",
+                                     sums[17] > 0 ? sums[15] / sums[17] : 0.0, sums[17] > 0 ? sums[16] / sums[17] : 0.0, tqf); }
             if (wmo > 0 || wdn > 0) { const size_t ln_ = strlen(line); snprintf(line + ln_, sizeof line - ln_, " | nce: moco %.4f top1 %.3f (negatives %d) dense %.4f top1 %.3f (negatives %d)",
                                      sums[10] / nsum, sums[11] / nsum, mqf, sums[14] > 0 ? sums[12] / sums[14] : 0.0, sums[14] > 0 ? sums[13] / sums[14] : 0.0, dqf); }
             if (HS.uw) { const size_t ln_ = strlen(line); snprintf(line + ln_, sizeof line - ln_, " | dense: phase %.4f nrm %.4f w4 %.4f acc %.3f (%d views) inkp %.4f (%d views)",
@@ -1401,8 +1458,8 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
                       { float *h = malloc((RH.n > IH.n ? RH.n : IH.n) * 4);   /* then the region and ink heads (student, teacher; also with iBOT off) */
                           nn_d2h(h, rp, RH.n * 4); fwrite(h, 4, RH.n, hf); nn_d2h(h, rpt, RH.n * 4); fwrite(h, 4, RH.n, hf);
                           nn_d2h(h, ip, IH.n * 4); fwrite(h, 4, IH.n, hf); nn_d2h(h, ipt, IH.n * 4); fwrite(h, 4, IH.n, hf); free(h); }
-                      for (int k = 0; k < 2; k++) {   /* then the projection heads present (MoCo, dense InfoNCE: student, teacher) */
-                          const dr_mlp2 *L = k ? &DP : &MP; float *P_ = k ? dp : mp, *T_ = k ? dpt : mpt; if (!P_) continue;
+                      for (int k = 0; k < 3; k++) {   /* then the projection heads present (MoCo, dense InfoNCE, token InfoNCE: student, teacher) */
+                          const dr_mlp2 *L = k == 2 ? &TPH : k ? &DP : &MP; float *P_ = k == 2 ? tp : k ? dp : mp, *T_ = k == 2 ? tpt : k ? dpt : mpt; if (!P_) continue;
                           float *h = malloc(L->n * 4); nn_d2h(h, P_, L->n * 4); fwrite(h, 4, L->n, hf); nn_d2h(h, T_, L->n * 4); fwrite(h, 4, L->n, hf); free(h);
                       }
                       fclose(hf); }

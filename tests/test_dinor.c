@@ -568,6 +568,23 @@ static int test_rownorm(void) {
     free(x); free(w); free(y); free(gr); nn_free(xd); nn_free(wd); nn_free(yd); nn_free(rs); nn_free(gd);
     return bad;
 }
+/* rows gather / scatter-add (the token InfoNCE's token rows) against a host loop */
+static int test_rows(void) {
+    const int S = 50, C = 24, n = 7; const int idx[7] = {3, 0, 49, 17, 8, 22, 41}; printf("rows gather / scatter: %d of %d rows x %d\n", n, S, C);
+    double src[50 * 24], g[7 * 24], ref1[7 * 24], ref2[50 * 24]; int bad = 0;
+    for (int i = 0; i < S * C; i++) src[i] = rf(nrand());
+    for (int i = 0; i < n * C; i++) g[i] = rf(nrand());
+    float *sd = dev(src, S * C), *gd = dev(g, n * C), *od = nn_malloc(n * C * 4); int *id = nn_malloc(sizeof idx); nn_h2d(id, idx, sizeof idx);
+    dr_rows_gather(sd, C, id, n, od);
+    for (int i = 0; i < n; i++) for (int c = 0; c < C; c++) ref1[i * C + c] = src[idx[i] * C + c];
+    double *a = host(od, n * C); bad += report("gather", a, ref1, n * C, 1e-6); free(a);
+    dr_rows_scatter_add(gd, id, n, C, 0.5f, sd);
+    for (int i = 0; i < S * C; i++) ref2[i] = src[i];
+    for (int i = 0; i < n; i++) for (int c = 0; c < C; c++) ref2[idx[i] * C + c] += 0.5 * g[i * C + c];
+    a = host(sd, S * C); bad += report("scatter", a, ref2, S * C, 1e-6); free(a);
+    nn_free(sd); nn_free(gd); nn_free(od); nn_free(id);
+    return bad;
+}
 static int test_pool(void) {
     const int n = 2, S = 11, C = 5, r0 = 3; printf("pool: %d x %d tokens (%d registers), C %d\n", n, S, r0, C);
     double *t = malloc(n * S * C * 8), *g = malloc(n * C * 8); for (int i = 0; i < n * S * C; i++) t[i] = rf(nrand()); for (int i = 0; i < n * C; i++) g[i] = rf(nrand());
@@ -584,7 +601,7 @@ static int test_pool(void) {
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
     int bad = test_views() + test_head() + test_targets() + test_ce() + test_koleo() + test_koleo_q() + test_muon(64, 24) + test_muon(24, 64) + test_muon_ref(160, 24) + test_obj() + test_ink() + test_mlp2() + test_pool() + test_rownorm()
-              + test_sharp() + test_toy_dino() + test_nce() + test_nce_p() + test_toy_nce();   /* (the newer tests last: the older ones keep their random draws) */
+              + test_sharp() + test_toy_dino() + test_nce() + test_nce_p() + test_toy_nce() + test_rows();   /* (the newer tests last: the older ones keep their random draws) */
     printf(bad ? "test_dinor: %d FAILED\n" : "test_dinor: all passed\n", bad);
     return bad != 0;
 }
