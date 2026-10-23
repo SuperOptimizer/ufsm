@@ -361,21 +361,21 @@ static int se_gradcheck(void) {
             snprintf(names[ng], 32, "s%d b%d n2.b", st, k); G[ng] = (grp){names[ng], B->n2.b, (size_t)B->co}; ng++;
             if (B->proj) { snprintf(names[ng], 32, "s%d b%d pj.w", st, k); G[ng] = (grp){names[ng], B->pj.w, (size_t)B->co * B->ci}; ng++; } } }
     G[ng++] = (grp){"seg.w", D.seg.w, (size_t)2 * ch[0]};
-    for (int q = 0; q < ng; q++) {
-        int gb = 0; double gm = 0;
-        for (int t = 0; t < 6; t++) {
-            const size_t i = G[q].off + se_rng(&rs) % G[q].n; const float p0 = p[i], e = 3e-2f * (fabsf(p0) > 0.1f ? fabsf(p0) : 0.1f);
-            float v = p0 + e; nn_h2d(D.p + i, &v, 4); dec_fwd(&D, &A, f); const double lp = se_loss_value(&A, dL, dS, N, V, dsum);
-            v = p0 - e; nn_h2d(D.p + i, &v, 4); dec_fwd(&D, &A, f); const double lm = se_loss_value(&A, dL, dS, N, V, dsum);
-            nn_h2d(D.p + i, &p0, 4);
-            const double fd = (lp - lm) / (2 * e), rel = fabs(fd - g[i]) / (fabs(fd) + fabs(g[i]) + 1e-4);
-            if (fabs(fd) + fabs(g[i]) < 2e-4) continue;
-            if (rel > gm) gm = rel;
-            if (rel > 0.1) gb++;
+    for (int q = 0; q < ng; q++) {   /* directional derivative along the group's gradient: (L(p + h d) - L(p - h d)) / 2h vs |d|^2 */
+        double d2 = 0, dmax = 0; for (size_t i = 0; i < G[q].n; i++) { const double v = g[G[q].off + i]; d2 += v * v; dmax = fmax(dmax, fabs(v)); }
+        if (d2 == 0) { fprintf(stderr, "  %-14s zero gradient\n", G[q].nm); continue; }
+        double pmax = 0; for (size_t i = 0; i < G[q].n; i++) pmax = fmax(pmax, fabs(p[G[q].off + i]));
+        const double h = 1e-3 * (pmax > 0.05 ? pmax : 0.05) / dmax;
+        float *pp = malloc(G[q].n * 4); double L2[2];
+        for (int sgn = 0; sgn < 2; sgn++) {
+            for (size_t i = 0; i < G[q].n; i++) pp[i] = (float)(p[G[q].off + i] + (sgn ? -h : h) * g[G[q].off + i]);
+            nn_h2d(D.p + G[q].off, pp, G[q].n * 4); dec_fwd(&D, &A, f); L2[sgn] = se_loss_value(&A, dL, dS, N, V, dsum);
         }
-        fprintf(stderr, "  %-14s max rel %.3f%s\n", G[q].nm, gm, gb ? "  BAD" : "");
-        if (gm > maxrel) maxrel = gm;
-        bad += gb;
+        nn_h2d(D.p + G[q].off, p + G[q].off, G[q].n * 4); free(pp);
+        const double fd = (L2[0] - L2[1]) / (2 * h), rel = fabs(fd - d2) / (fabs(fd) + d2);
+        fprintf(stderr, "  %-14s |g|^2 %.4e  directional fd %.4e  rel %.4f%s\n", G[q].nm, d2, fd, rel, rel > 0.05 ? "  BAD" : "");
+        if (rel > maxrel) maxrel = rel;
+        bad += rel > 0.05;
     }
     fprintf(stderr, "surf-eval gradcheck: loss %.5f, %zu params, max rel err %.3e, %d bad samples\n", L0, D.np, maxrel, bad);
     return bad > 3;
