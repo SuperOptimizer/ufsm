@@ -815,7 +815,8 @@ typedef struct {
        --ssl-ibot-ch .. +32 of the output) at the cell centres vs the teacher's at the same physical points of the other global; iBOT head ->
        KI prototypes, Sinkhorn over all the batch's masked rows */
     float cm, icm, *cen, *icen; double dg[8];
-    int easy, ccen, cstd; float *cmean, *hmean, *cistd, *histd, *cpre; double st[8];   /* cstd: --ssl-cls-std (per-dimension batch standardisation of the CLS) */   /* --ssl-easy-steps S: shared symmetry / no inversion / mild intensity until S; --ssl-cls-center: the batch mean CLS removed; st: per-step stats */   /* dg: the teacher-side diagnostics of the last 50th step (dn_ssl_diag) */   /* --ssl-center / --ssl-ibot-center M: DINOv1 centring (EMA of the batch's teacher logits) instead of Sinkhorn */
+    int easy, ccen, cstd; float *cmean, *hmean, *cistd, *histd, *cpre;
+    float vv, vc, *vx, *vg, *vgd; double *vcov;   /* --ssl-vic-var / --ssl-vic-cov: VICReg variance hinge (std >= 1) + off-diagonal covariance on the head-input CLS over the batch */ double st[8];   /* cstd: --ssl-cls-std (per-dimension batch standardisation of the CLS) */   /* --ssl-easy-steps S: shared symmetry / no inversion / mild intensity until S; --ssl-cls-center: the batch mean CLS removed; st: per-step stats */   /* dg: the teacher-side diagnostics of the last 50th step (dn_ssl_diag) */   /* --ssl-center / --ssl-ibot-center M: DINOv1 centring (EMA of the batch's teacher logits) instead of Sinkhorn */
     float wib; int KI, IM, ich, TPS, GT_, cnt[64], off[64]; dn_head I; float *ieT, *inT, *ieS, *inS, *idE, *il, *iq, *isl, *idsl, *iw, *glzib; void *isk, *ice; int *d_hS, *d_hT, *iid, *hS, *hT; uint8_t *cellm, *d_mask; uint8_t *usei;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -861,6 +862,8 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
     Q->easy = atoi(opt(argc, argv, "--ssl-easy-steps", "0")); Q->ccen = atoi(opt(argc, argv, "--ssl-cls-center", "0"));
     Q->cmean = nn_malloc((size_t)Q->CC * 4); Q->hmean = malloc((size_t)Q->CC * 4); Q->cstd = atoi(opt(argc, argv, "--ssl-cls-std", "0"));
     Q->cistd = nn_malloc((size_t)Q->CC * 4); Q->histd = malloc((size_t)Q->CC * 4); Q->cpre = nn_malloc((size_t)Q->CC * 4);
+    Q->vv = (float)atof(opt(argc, argv, "--ssl-vic-var", "0")); Q->vc = (float)atof(opt(argc, argv, "--ssl-vic-cov", "0"));
+    if (Q->vv > 0 || Q->vc > 0) { Q->vx = malloc((size_t)Q->N * Q->CC * 4); Q->vg = malloc((size_t)Q->CC * 4); Q->vgd = nn_malloc((size_t)Q->CC * 4); Q->vcov = malloc((size_t)Q->CC * Q->CC * 8); }
     Q->cm = (float)atof(opt(argc, argv, "--ssl-center", "0")); Q->icm = (float)atof(opt(argc, argv, "--ssl-ibot-center", "0"));
     Q->cen = nn_malloc((size_t)Q->K * 4); nn_zero(Q->cen, (size_t)Q->K * 4);
     Q->wib = (float)atof(opt(argc, argv, "--ssl-ibot", "0")); Q->KI = atoi(opt(argc, argv, "--ssl-ibot-protos", "8192")); Q->IM = atoi(opt(argc, argv, "--ssl-ibot-max", "512"));
@@ -1055,6 +1058,22 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             dr_koleo_q(Q->clsS, 1, Q->bex, m, C, Q->wk / (float)N, Q->dcls, Q->outs + 1);
             nn_d2d(Q->bank + (size_t)(2 * i + v) * C, Q->clsS, (size_t)C * 4);
         }
+        if (gl && (Q->vv > 0 || Q->vc > 0)) {   /* VICReg on the head input over this view chunk: the other samples' rows (bank) + this student row; gradient for this row */
+            float *X = Q->vx; for (int k = 0; k < N; k++) nn_d2h(X + (size_t)k * C, k == i ? Q->clsS : Q->bank + (size_t)(2 * k + v) * C, (size_t)C * 4);
+            double *mu = calloc((size_t)C, 8), *sd = calloc((size_t)C, 8);
+            for (int k = 0; k < N; k++) for (int c = 0; c < C; c++) mu[c] += X[(size_t)k * C + c] / (double)N;
+            for (int k = 0; k < N; k++) for (int c = 0; c < C; c++) { const double d = X[(size_t)k * C + c] - mu[c]; sd[c] += d * d / (N - 1); }
+            double lv = 0; for (int c = 0; c < C; c++) { sd[c] = sqrt(sd[c] + 1e-4); lv += sd[c] < 1 ? (1 - sd[c]) / C : 0; }
+            for (int c = 0; c < C; c++) { const double d = X[(size_t)i * C + c] - mu[c]; Q->vg[c] = (float)(Q->vv > 0 && sd[c] < 1 ? -Q->vv / C * d / ((N - 1) * sd[c]) : 0); }
+            double lc = 0;
+            if (Q->vc > 0) {   /* cov = Xc^T Xc / (N - 1); L = sum_{a != b} cov_ab^2 / C; d / d x_i = 4 / (C (N - 1)) offdiag(cov) xc_i */
+                for (int a = 0; a < C; a++) for (int b = a; b < C; b++) { double q = 0; for (int k = 0; k < N; k++) q += (X[(size_t)k * C + a] - mu[a]) * (X[(size_t)k * C + b] - mu[b]); q /= N - 1; Q->vcov[(size_t)a * C + b] = Q->vcov[(size_t)b * C + a] = q; if (a != b) lc += 2 * q * q / C; }
+                for (int a = 0; a < C; a++) { double g = 0; for (int b = 0; b < C; b++) if (b != a) g += Q->vcov[(size_t)a * C + b] * (X[(size_t)i * C + b] - mu[b]); Q->vg[a] += (float)(Q->vc * 4.0 / (C * (N - 1)) * g); }
+            }
+            nn_h2d(Q->vgd, Q->vg, (size_t)C * 4); nn_axpy(Q->dcls, 1.f / (float)N, Q->vgd, (size_t)C);   /* (each row's share of the chunk's loss) */
+            Q->st[5] += lv / (2 * N); Q->st[6] += lc / (2 * N); { double ms = 0; for (int c = 0; c < C; c++) ms += sd[c] / C; Q->st[7] += ms / (2 * N); }
+            free(mu); free(sd);
+        }
         if (Q->cstd) { dr_cols_scale(Q->dcls, C, Q->cistd); nn_d2d(Q->clsS, cpre, (size_t)C * 4); }   /* (through the batch transform; the normed row back) */
         else if (Q->ccen) nn_axpy(Q->clsS, 1.f, Q->cmean, (size_t)C);   /* (back to the normed row for its backward) */
         if (Q->cls_norm) dr_rownorm_bwd(Q->dcls, Q->clsS, Q->rsS, 1, C, Q->dcls);
@@ -1098,7 +1117,7 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             double x = 0, ya = 0, yb = 0; for (int c = 0; c < C; c++) { x += (double)ct[(size_t)a * C + c] * ct[(size_t)b * C + c]; ya += (double)ct[(size_t)a * C + c] * ct[(size_t)a * C + c]; yb += (double)ct[(size_t)b * C + c] * ct[(size_t)b * C + c]; }
             const double cc = x / sqrt(ya * yb + 1e-30); if (a / 2 == b / 2) cs += cc; else { cd += cc; nd++; } }
         free(ct); const size_t l3_ = strlen(line);
-        const double nn_ = Q->nsum ? Q->nsum : 1;
+        const double nn_ = Q->nsum ? Q->nsum : 1; { const size_t l4 = strlen(line); snprintf(line + l4, cap - l4, " | vic var %.4f cov %.4f cls std/dim %.4f", Q->st[5] / nn_, Q->st[6] / nn_, Q->st[7] / nn_); }
         snprintf(line + l3_, cap - l3_, " | avg cls same %.3f other %.3f z same %.3f other %.3f agree-other %.3f | iou %.3f | last cls same %.3f other %.3f | z cos other %.3f | logit sd raw %.4f centred %.4f (/tt) | centre norm %.3f | proto |cos| %.3f",
                  Q->st[0] / nn_, Q->st[1] / nn_, Q->st[2] / nn_, Q->st[3] / nn_, Q->st[4] / nn_, Q->nsum ? Q->sums[6] / Q->nsum : 0.0, cs / (R / 2), nd ? cd / nd : 0.0, Q->dg[0], Q->dg[1], Q->dg[2], Q->dg[3], Q->dg[4]);
     }
