@@ -862,7 +862,7 @@ typedef struct {
        un-augmented teacher global, at the cell of each mapped point) until --ssl-dv-until (0: always), then from our EMA teacher; the student
        iBOT head predicts dinovol's 131072 prototypes (its last layer initialised from dinovol's and kept frozen) */
     dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; int fixdone, Rfix;
-    int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
+    int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
     memset(Q, 0, sizeof *Q); Q->u = u; Q->C = C; Q->CC = cls_reg == 2 ? 2 * C : C; Q->cls_reg = cls_reg; Q->cls_norm = cls_norm; Q->noise = noise; Q->CIN = cfg->cin;
@@ -944,7 +944,7 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         const int R = 2 * N * Q->IM, KI = Q->KI, IM = Q->IM;
         dn_head_init(&Q->I, Q->ICIN, HH, HB, KI, R, seed * 61 + 5, 0); Q->I.train_g = 0;
         if (Q->ig != 1.f) { float *gh = malloc((size_t)KI * 4); for (int k = 0; k < KI; k++) gh[k] = Q->ig; nn_h2d(Q->I.p + Q->I.H.g, gh, (size_t)KI * 4); nn_h2d(Q->I.pt + Q->I.H.g, gh, (size_t)KI * 4); free(gh); }
-        if (Q->itok) { Q->d_tS = nn_malloc((size_t)2 * N * IM * 4); Q->d_tT = nn_malloc((size_t)2 * N * IM * 4); Q->tS = malloc((size_t)2 * N * IM * 4); Q->tT = malloc((size_t)2 * N * IM * 4); }
+        if (Q->itok) { Q->irsS = nn_malloc((size_t)IM * 4); Q->irsT = nn_malloc((size_t)R * 4); Q->d_tS = nn_malloc((size_t)2 * N * IM * 4); Q->d_tT = nn_malloc((size_t)2 * N * IM * 4); Q->tS = malloc((size_t)2 * N * IM * 4); Q->tT = malloc((size_t)2 * N * IM * 4); }
         Q->ieT = nn_malloc((size_t)R * Q->ICIN * 4); Q->inT = nn_malloc((size_t)R * 4); Q->ieS = nn_malloc((size_t)IM * Q->ICIN * 4); Q->inS = nn_malloc((size_t)IM * 4); Q->idE = nn_malloc((size_t)IM * Q->ICIN * 4);
         Q->il = nn_malloc((size_t)R * KI * 4); Q->iq = nn_malloc((size_t)R * KI * 4); Q->isk = nn_malloc(dr_sk_scratch(R, KI)); Q->isl = nn_malloc((size_t)IM * KI * 4); Q->idsl = nn_malloc((size_t)IM * KI * 4);
         Q->ice = nn_malloc(dr_ce_scratch(IM)); Q->iw = nn_malloc((size_t)IM * 4); Q->glzib = nn_malloc(g3 * CO * 4); nn_zero(Q->glzib, g3 * CO * 4);
@@ -1089,7 +1089,8 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     for (int j = 0; j < 2 * N; j++) {
         const float *lg = unet_forward(Q->ug, Q->xg + (size_t)j * CIN * g3, Q->xsg, 0); dn_ssl_cls(Q, Q->ug, Q->clsT + (size_t)j * C);
         const int w = j ^ 1;   /* (the masked partner whose targets this teacher view holds) */
-        if (Q->wib > 0 && Q->cnt[w] && Q->itok) { const float *tk = unet_tokens(Q->ug, nullptr, nullptr, nullptr, nullptr); dr_rows_gather(tk, CT, Q->d_tT + (size_t)w * Q->IM, Q->cnt[w], Q->ieT + (size_t)Q->off[w] * CT); }
+        if (Q->wib > 0 && Q->cnt[w] && Q->itok) { const float *tk = unet_tokens(Q->ug, nullptr, nullptr, nullptr, nullptr); dr_rows_gather(tk, CT, Q->d_tT + (size_t)w * Q->IM, Q->cnt[w], Q->ieT + (size_t)Q->off[w] * CT);
+            dr_rownorm_fwd(Q->ieT + (size_t)Q->off[w] * CT, Q->cnt[w], CT, Q->ieT + (size_t)Q->off[w] * CT, Q->irsT + Q->off[w]); }   /* (a parameter-free LayerNorm: upstream's normed tokens) */
         else if (Q->wib > 0 && Q->cnt[w]) { const int h16 = unet_logits_h16(Q->ug);   /* (the full logits: fp16 or fp32) */
             dn_gather((const char *)lg + (size_t)Q->ich * g3 * (h16 ? 2 : 4), h16, g3, 32, Q->d_hT + (size_t)w * Q->IM, Q->cnt[w], Q->ieT + (size_t)Q->off[w] * 32, Q->inT + Q->off[w]); }
     }
@@ -1200,13 +1201,14 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
         if (ib) {   /* iBOT: the masked cells' student features -> head -> cross-entropy vs the cross-view targets -> d features into the fp32 logit gradient */
             const int m = Q->cnt[j];
             const int h16 = unet_logits_h16(n);
-            if (Q->itok) dr_rows_gather(unet_tokens(n, nullptr, nullptr, nullptr, nullptr), CT, Q->d_tS + (size_t)j * Q->IM, m, Q->ieS);
+            if (Q->itok) { dr_rows_gather(unet_tokens(n, nullptr, nullptr, nullptr, nullptr), CT, Q->d_tS + (size_t)j * Q->IM, m, Q->ieS); dr_rownorm_fwd(Q->ieS, m, CT, Q->ieS, Q->irsS); }
             else dn_gather((const char *)lgs + (size_t)Q->ich * g3 * (h16 ? 2 : 4), h16, g3, 32, Q->d_hS + (size_t)j * Q->IM, m, Q->ieS, Q->inS);
             if (dr_head_fwd(&Q->I.H, Q->I.p, Q->ieS, m, Q->isl, &Q->I.w)) return 1;
             float *hw_ = malloc((size_t)m * 4); for (int k = 0; k < m; k++) hw_[k] = Q->wib / (float)(R > 0 ? R : 1); nn_h2d(Q->iw, hw_, (size_t)m * 4); free(hw_);
             Q->lastm = m;
             dr_ce(Q->isl, m, Q->KI, Q->ts, Q->iq + (size_t)Q->off[j] * Q->KI, Q->iid, Q->iid, Q->iw, m, Q->idsl, Q->outs + 6, Q->ice); nn_axpy(Q->outs + 8, 1.f, Q->outs + 6, 1);
             if (dr_head_bwd(&Q->I.H, Q->I.p, Q->I.g, Q->ieS, Q->idsl, m, Q->idE, step > Q->freeze && !Q->dv, &Q->I.w)) return 1;
+            if (Q->itok) dr_rownorm_bwd(Q->idE, Q->ieS, Q->irsS, m, CT, Q->idE);
             if (!Q->itok) dr_scatter_unit_f32(Q->ieS, Q->idE, Q->inS, Q->d_hS + (size_t)j * Q->IM, m, 32, g3, 1.f, Q->glzib + (size_t)Q->ich * g3);
             if (dbg && j == 0) { float *h = malloc((size_t)m * Q->ICIN * 4), *nr = malloc((size_t)m * 4); nn_d2h(h, Q->idE, (size_t)m * Q->ICIN * 4); nn_d2h(nr, Q->inS, (size_t)m * 4);
                 double a = 0, nm = 0; for (int k = 0; k < m * Q->ICIN; k++) a += (double)h[k] * h[k]; for (int k = 0; k < m; k++) nm += nr[k] / m;
@@ -1301,7 +1303,7 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
         dr_adamw(hi->p, hi->g, hi->m, hi->v, HI->v, Q->hlr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
         if (step > Q->freeze && !Q->dv) dr_adamw(hi->p + HI->v, hi->g + HI->v, hi->m + HI->v, hi->v + HI->v, HI->g - HI->v, Q->plr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
         dr_ema(hi->pt, hi->p, HI->n, mom); nn_zero(hi->g, HI->n * 4); }
-    nn_d2h(Q->hout, Q->outs, 16 * 4); Q->sums[0] += Q->hout[4] / Q->wdino; Q->sums[1] += Q->hout[1]; Q->sums[3] += Q->wib > 0 ? Q->hout[8] / Q->wib : 0; Q->sums[4] += R; Q->nsum++;
+    nn_d2h(Q->hout, Q->outs, 16 * 4); Q->sums[0] += Q->wdino > 0 ? Q->hout[4] / Q->wdino : 0; Q->sums[1] += Q->hout[1]; Q->sums[3] += Q->wib > 0 ? Q->hout[8] / Q->wib : 0; Q->sums[4] += R; Q->nsum++;
     return 0;
 }
 /* the SSL part of the log line: loss means, the teacher target entropy (mean over the batch's rows) and the prototype usage */
