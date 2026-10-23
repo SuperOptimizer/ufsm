@@ -67,6 +67,7 @@ int dv_train_tile(const dv_net *n);         /* the training global crop (192) */
    z y x order), the CNN skips and the FPN grid for dv_net_points. 0 on success. */
 int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scale, float hi);
 const void *dv_tokens(const dv_net *n);     /* device fp16 [(T/8)^3][480] */
+const void *dv_cls(const dv_net *n);        /* device fp16 [480]: the last forward's normed cls token */
 /* the dense head at P points (tile voxel-index coordinates [P][3] on the device), in chunks: unit dense / ink vectors accumulated
    w[p] x into acc[rows[p]][nd + ni] (wgt nullptr: written to acc[p]) */
 int dv_net_points(dv_net *n, const float *coords_dev, const float *wgt_dev, const int *rows_dev, int P, float *acc_dev);

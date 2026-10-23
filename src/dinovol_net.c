@@ -16,6 +16,7 @@ typedef struct { float *ln1w, *ln1b, *ln2w, *ln2b, *mix; xconv qkv, proj, fc1, f
 struct dv_net {
     cln stem; bblock bb[DV_MAXST * 4]; int nbb, stage_end[DV_MAXST], nstage, stage_ch[DV_MAXST]; xconv fproj;
     void *prefix;                              /* fp16 [5][480]: cls, 4 registers */
+    void *clsn;                                /* fp16 [480]: the last forward's normed CLS token (x_norm_clstoken) */
     vblock vb[DV_MAXBLK]; int depth; float *nw, *nb;
     int F;                                     /* SwiGLU hidden (3456) */
     /* dense head */
@@ -193,6 +194,7 @@ int dv_dense_dims(const dv_net *n, int *nd, int *ni) { *nd = n->nd; *ni = n->ni;
 int dv_patch(const dv_net *n) { (void)n; return DV_PATCH; }
 int dv_train_tile(const dv_net *n) { (void)n; return 192; }
 const void *dv_tokens(const dv_net *n) { return n->tok.p; }
+const void *dv_cls(const dv_net *n) { return n->clsn; }
 const void *dv_skip(const dv_net *n, int k, int *edge, int *ch) { *edge = n->sk[k].d; *ch = n->sk[k].c; return n->sk[k].p; }
 const void *dv_fpn(const dv_net *n, int *edge, int *ch) { *edge = n->fpng.d; *ch = n->fpng.c; return n->fpng.p; }
 
@@ -274,6 +276,8 @@ int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scal
     {
         extern void dv_copy_dev(void *dst, const void *src, size_t bytes);
         dv_copy_dev(n->tok.p, (const char *)h.p + (size_t)DV_PRE * DV_E * 2, (size_t)Np * DV_E * 2);
+        if (!n->clsn) n->clsn = xmalloc_dev((size_t)DV_E * 2);
+        dv_copy_dev(n->clsn, h.p, (size_t)DV_E * 2);   /* (row 0: the cls token after the final LayerNorm) */
     }
     xt_free(&h); xt_free(&o); xfree_dev(X);
     dv_prof(DVP_FINAL);
