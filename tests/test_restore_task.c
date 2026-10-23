@@ -293,8 +293,8 @@ static void test_predict(const char *tmp) {
     snprintf(out, sizeof out, "%s/sr.zarr", tmp);
     char root[600]; snprintf(root, sizeof root, "%s", tmp);
     char *argv[] = {"ufsm", "predict", ck, root, "coarse.zarr", out, "--um", "9.6", "--shard", "128", "--halo", "16", "--q", "0", "--threads", "2", "--ema", "0", nullptr};
-    int restore_predict(int argc, char **argv);
-    CHECK(restore_predict(18, argv) == 0, "restore_predict");
+    int cmd_predict(int argc, char **argv);   /* (the dispatch to restore_predict on a restore checkpoint) */
+    CHECK(cmd_predict(18, argv) == 0, "predict on a restore checkpoint");
     char lv[700]; snprintf(lv, sizeof lv, "%s/sr.zarr", tmp);
     store *s = store_open(lv); z3 *z = s ? z3_open(s, "2.4", nullptr) : nullptr;
     CHECK(z != nullptr, "open the output (level 2.4)");
