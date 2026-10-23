@@ -814,7 +814,7 @@ typedef struct {
     /* iBOT (--ssl-ibot W): masked 8^3 cells of each global (prob 0.5, ratio 0.1-0.5, <= IM per view), the head features (channels
        --ssl-ibot-ch .. +32 of the output) at the cell centres vs the teacher's at the same physical points of the other global; iBOT head ->
        KI prototypes, Sinkhorn over all the batch's masked rows */
-    float cm, icm, *cen, *icen;   /* --ssl-center / --ssl-ibot-center M: DINOv1 centring (EMA of the batch's teacher logits) instead of Sinkhorn */
+    float cm, icm, *cen, *icen; double dg[8];   /* dg: the teacher-side diagnostics of the last 50th step (dn_ssl_diag) */   /* --ssl-center / --ssl-ibot-center M: DINOv1 centring (EMA of the batch's teacher logits) instead of Sinkhorn */
     float wib; int KI, IM, ich, TPS, GT_, cnt[64], off[64]; dn_head I; float *ieT, *inT, *ieS, *inS, *idE, *il, *iq, *isl, *idsl, *iw, *glzib; void *isk, *ice; int *d_hS, *d_hT, *iid, *hS, *hT; uint8_t *cellm, *d_mask; uint8_t *usei;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -891,6 +891,23 @@ static void dn_ssl_io(dn_ssl *Q, const char *ckpt, int save) {
     fclose(f);
     if (!save) fprintf(stderr, "dino-train --ssl-batch: heads %s from %s\n", ok ? "restored" : "NOT restored (short file)", fp);
 }
+/* teacher-side diagnostics (every 50 steps, before the centre update): the head's bottleneck zn cosine between samples, the teacher logit
+   std over prototypes per row (raw cosines and after the centre), the centre norm, the prototype directions' mean |cosine| (256 sampled) */
+static void dn_ssl_diag(dn_ssl *Q) {
+    const int R = 2 * Q->N, K = Q->K, B = Q->H.H.B; float *tl = malloc((size_t)R * K * 4), *cen = malloc((size_t)K * 4), *zn = malloc((size_t)R * B * 4);
+    nn_d2h(tl, Q->tl, (size_t)R * K * 4); nn_d2h(cen, Q->cen, (size_t)K * 4); nn_d2h(zn, Q->H.w.zn, (size_t)R * B * 4);
+    double sraw = 0, scen = 0, cn = 0;
+    for (int r = 0; r < R; r++) { double m = 0, v = 0, mc = 0, vc = 0; for (int k = 0; k < K; k++) { const double a = tl[(size_t)r * K + k], b = a - cen[k]; m += a; v += a * a; mc += b; vc += b * b; }
+        m /= K; mc /= K; sraw += sqrt(fmax(v / K - m * m, 0)) / R; scen += sqrt(fmax(vc / K - mc * mc, 0)) / R; }
+    for (int k = 0; k < K; k++) cn += (double)cen[k] * cen[k];
+    double zc = 0; long nz = 0;
+    for (int a = 0; a < R; a++) for (int b = a + 1; b < R; b++) if (a / 2 != b / 2) { double x = 0; for (int c = 0; c < B; c++) x += (double)zn[(size_t)a * B + c] * zn[(size_t)b * B + c]; zc += x; nz++; }
+    const int NP = K < 256 ? K : 256; float *V = malloc((size_t)NP * B * 4); double pc = 0; long np_ = 0;
+    nn_d2h(V, Q->H.p + Q->H.H.v, (size_t)NP * B * 4);
+    for (int a = 0; a < NP; a++) for (int b = a + 1; b < NP; b++) { double x = 0, ya = 0, yb = 0; for (int c = 0; c < B; c++) { x += (double)V[(size_t)a * B + c] * V[(size_t)b * B + c]; ya += (double)V[(size_t)a * B + c] * V[(size_t)a * B + c]; yb += (double)V[(size_t)b * B + c] * V[(size_t)b * B + c]; } pc += fabs(x) / sqrt(ya * yb + 1e-30); np_++; }
+    Q->dg[0] = nz ? zc / nz : 0; Q->dg[1] = sraw; Q->dg[2] = scen; Q->dg[3] = sqrt(cn); Q->dg[4] = np_ ? pc / np_ : 0;
+    free(tl); free(cen); free(zn); free(V);
+}
 static void dn_ssl_cls(dn_ssl *Q, unet *n, float *cls) {   /* the CLS of the net's last forward */
     int S = 0, nreg = 0; const float *tok = unet_tokens(n, nullptr, &S, nullptr, &nreg);
     if (Q->cls_reg) nn_d2d(cls, tok, (size_t)Q->C * 4); else dr_pool_fwd(tok, 1, S, Q->C, nreg, cls);
@@ -954,6 +971,7 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     unet_use_params(Q->ug, unet_live_params(Q->u));
     if (Q->cls_norm) dr_rownorm_fwd(Q->clsT, 2 * N, C, Q->clsT, Q->rsT);
     if (dr_head_fwd(&Q->H.H, Q->H.pt, Q->clsT, 2 * N, Q->tl, &Q->H.w)) return 1;
+    if (step % 50 == 0) dn_ssl_diag(Q);
     if (Q->cm > 0) { dr_teacher_probs(Q->tl, 2 * N, K, tt, 0, Q->cen, Q->tq, Q->sks); dr_center_update(Q->cen, Q->tl, 2 * N, K, Q->cm); }
     else dr_teacher_probs(Q->tl, 2 * N, K, tt, Q->skit, nullptr, Q->tq, Q->sks);
     { static int *am, *hm; if (!am) { am = nn_malloc(64 * 4); hm = malloc(64 * 4); } dr_argmax_rows(Q->tq, 2 * N, K, am); nn_d2h(hm, am, (size_t)2 * N * 4); for (int j = 0; j < 2 * N; j++) Q->use[hm[j]] = 1;
@@ -1039,7 +1057,8 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             double x = 0, ya = 0, yb = 0; for (int c = 0; c < C; c++) { x += (double)ct[(size_t)a * C + c] * ct[(size_t)b * C + c]; ya += (double)ct[(size_t)a * C + c] * ct[(size_t)a * C + c]; yb += (double)ct[(size_t)b * C + c] * ct[(size_t)b * C + c]; }
             const double cc = x / sqrt(ya * yb + 1e-30); if (a / 2 == b / 2) cs += cc; else { cd += cc; nd++; } }
         free(ct); const size_t l3_ = strlen(line);
-        snprintf(line + l3_, cap - l3_, " | cls cos same %.3f other %.3f", cs / (R / 2), nd ? cd / nd : 0.0);
+        snprintf(line + l3_, cap - l3_, " | cls cos same %.3f other %.3f | z cos other %.3f | logit sd raw %.4f centred %.4f (/tt) | centre norm %.3f | proto |cos| %.3f",
+                 cs / (R / 2), nd ? cd / nd : 0.0, Q->dg[0], Q->dg[1], Q->dg[2], Q->dg[3], Q->dg[4]);
     }
     if (Q->wib > 0 && Q->sums[5] >= 4) {   /* iBOT: the mean target entropy of the last step's first 64 masked rows, the loss, rows per step */
         const int r = Q->sums[5] < 64 ? (int)Q->sums[5] : 64, KI = Q->KI; float *qi = malloc((size_t)r * KI * 4); nn_d2h(qi, Q->iq, (size_t)r * KI * 4); double Hi = 0;
