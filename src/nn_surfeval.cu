@@ -119,3 +119,16 @@ __global__ void k_sumsq(const float *g, long long n, double *out) {
     if ((threadIdx.x & 31) == 0) atomicAdd(out, s);
 }
 extern "C" void se_sumsq(const float *g, long long n, double *out) { cudaMemsetAsync(out, 0, 8, 0); k_sumsq<<<512, 256>>>(g, n, out); }
+/* per-channel bias of [N][C][V]: add, and its gradient (gb += sums; one block per channel) */
+__global__ void k_bias_add(float *y, const float *b, int C, long long V, long long tot) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i < tot) y[i] += b[(i / V) % C];
+}
+extern "C" void se_bias_add(float *y, const float *b, int N, int C, long long V) { const long long t = (long long)N * C * V; k_bias_add<<<nbk(t, 256), 256>>>(y, b, C, V, t); }
+__global__ void k_bias_grad(const float *g, float *gb, int N, int C, long long V) {
+    const int c = blockIdx.x; float s = 0.f;
+    for (int n = 0; n < N; n++) for (long long v = threadIdx.x; v < V; v += blockDim.x) s += g[((size_t)n * C + c) * V + v];
+    __shared__ float sh[256]; sh[threadIdx.x] = s; __syncthreads();
+    for (int o = 128; o; o >>= 1) { if ((int)threadIdx.x < o) sh[threadIdx.x] += sh[threadIdx.x + o]; __syncthreads(); }
+    if (!threadIdx.x) gb[c] += sh[0];
+}
+extern "C" void se_bias_grad(const float *g, float *gb, int N, int C, long long V) { k_bias_grad<<<C, 256>>>(g, gb, N, C, V); }

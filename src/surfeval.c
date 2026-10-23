@@ -33,6 +33,8 @@ void se_loss_grad(const float *lg, const uint8_t *lab, const uint8_t *sk, int N,
 void se_val_counts(const float *lg, const uint8_t *lab, const uint8_t *sk, int N, long long V, unsigned long long *c);
 void se_adamw(float *p, const float *g, float *m, float *v, long long n, float lr, float b1, float b2, float eps, float wd, int step, float gs);
 void se_sumsq(const float *g, long long n, double *out);
+void se_bias_add(float *y, const float *b, int N, int C, long long V);
+void se_bias_grad(const float *g, float *gb, int N, int C, long long V);
 
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
@@ -205,6 +207,20 @@ static void acts_alloc(se_acts *A, const se_dec *D) {
     A->gA = nm(maxe); A->gB = nm(maxe); A->gC = nm(maxe); A->gD = nm(maxe);
     A->scr_n = scr; A->scr = nm(scr / 4 + 1); A->gnscr = nm(scr / 4 + 1);
 }
+/* 1x1 convs as GEMMs (the nn kernels do not cover a k = 1 weight gradient): y_n = W x_n (+ b) */
+static void c1_fwd(const float *W, const float *b, const float *x, shape5 xs, int co, float *y) {
+    const size_t V = (size_t)xs.d * xs.h * xs.w;
+    for (int n = 0; n < xs.n; n++) at_gemm(0, 0, co, (int)V, xs.c, W, x + (size_t)n * xs.c * V, y + (size_t)n * co * V, 0.f);
+    if (b) se_bias_add(y, b, xs.n, co, (long long)V);
+}
+static void c1_bwd(const float *W, float *gW, float *gb, const float *x, shape5 xs, int co, const float *gy, float *gx, int acc) {
+    const size_t V = (size_t)xs.d * xs.h * xs.w;
+    for (int n = 0; n < xs.n; n++) {
+        at_gemm(0, 1, co, xs.c, (int)V, gy + (size_t)n * co * V, x + (size_t)n * xs.c * V, gW, 1.f);
+        if (gx) at_gemm(1, 0, xs.c, (int)V, co, W, gy + (size_t)n * co * V, gx + (size_t)n * xs.c * V, acc ? 1.f : 0.f);
+    }
+    if (gb) se_bias_grad(gy, gb, xs.n, co, (long long)V);
+}
 static void in_fwd(const se_dec *D, const se_in *n, const float *x, shape5 s, float *y, float *m, float *r) { nn_gn_fwd(x, s, s.c, 1e-5f, D->p + n->g, D->p + n->b, y, m, r); }
 static void block_fwd(const se_dec *D, const se_block *B, se_bact *a, const float *x) {
     const size_t no = shape_numel(a->so);
@@ -214,7 +230,7 @@ static void block_fwd(const se_dec *D, const se_block *B, se_bact *a, const floa
     se_lrelu(a->n1, a->y, (long long)no, 0.01f);   /* (y: a1 scratch) */
     nn_conv3d_fwd(a->y, a->so, D->p + B->c2.w, D->p + B->c2.b, B->co, 3, 1, a->h2);
     in_fwd(D, &B->n2, a->h2, a->so, a->o, a->m2, a->r2);   /* o = IN(h2) */
-    if (B->proj) { nn_conv3d_fwd(x, a->si, D->p + B->pj.w, nullptr, B->co, 1, 1, a->y); in_fwd(D, &B->np, a->y, a->so, a->y, a->mp, a->rp); nn_axpy(a->o, 1.f, a->y, no); }
+    if (B->proj) { c1_fwd(D->p + B->pj.w, nullptr, x, a->si, B->co, a->y); in_fwd(D, &B->np, a->y, a->so, a->y, a->mp, a->rp); nn_axpy(a->o, 1.f, a->y, no); }
     else nn_axpy(a->o, 1.f, x, no);   /* o += residual */
     se_lrelu(a->o, a->y, (long long)no, 0.01f);
 }
@@ -231,11 +247,9 @@ static void block_bwd(se_dec *D, const se_block *B, se_bact *a, float *gy, float
     nn_conv3d_bwd_weight(a->x, a->si, g1, a->so, 3, 1, D->g + B->c1.w, D->g + B->c1.b);
     nn_conv3d_bwd_data(g1, a->so, D->p + B->c1.w, a->si, 3, 1, gx, A->scr);
     if (B->proj) {
-        nn_conv3d_fwd(a->x, a->si, D->p + B->pj.w, nullptr, B->co, 1, 1, g2);   /* (the projection conv output again: the IN backward's input) */
+        c1_fwd(D->p + B->pj.w, nullptr, a->x, a->si, B->co, g2);   /* (the projection conv output again: the IN backward's input) */
         nn_gn_bwd(g2, a->so, a->so.c, D->p + B->np.g, a->mp, a->rp, gy, g1, D->g + B->np.g, D->g + B->np.b, A->gnscr);
-        nn_conv3d_bwd_weight(a->x, a->si, g1, a->so, 1, 1, D->g + B->pj.w, nullptr);
-        if (nn_conv3d_bwd_data_acc(g1, a->so, D->p + B->pj.w, a->si, 1, 1, gx, A->scr)) {
-            nn_conv3d_bwd_data(g1, a->so, D->p + B->pj.w, a->si, 1, 1, g2, A->scr); nn_axpy(gx, 1.f, g2, shape_numel(a->si)); }
+        c1_bwd(D->p + B->pj.w, D->g + B->pj.w, nullptr, a->x, a->si, B->co, g1, gx, 1);
     } else nn_axpy(gx, 1.f, gy, no);
 }
 static void tc_fwd(const se_dec *D, const se_tc *T, const float *x, shape5 xs, float *tmp, float *y) {
@@ -266,12 +280,11 @@ static void dec_fwd(const se_dec *D, se_acts *A, float *const *f) {
         below = a->b[1].y;
     }
     const se_sact *a = &A->s[D->nst - 1];
-    nn_conv3d_fwd(a->b[1].y, a->b[1].so, D->p + D->seg.w, D->p + D->seg.b, 2, 1, 1, A->lg);
+    c1_fwd(D->p + D->seg.w, D->p + D->seg.b, a->b[1].y, a->b[1].so, 2, A->lg);
 }
 static void dec_bwd(se_dec *D, se_acts *A, float *const *f) {
     se_sact *last = &A->s[D->nst - 1]; const shape5 s0 = last->b[1].so;
-    nn_conv3d_bwd_weight(last->b[1].y, s0, A->glg, (shape5){s0.n, 2, s0.d, s0.h, s0.w}, 1, 1, D->g + D->seg.w, D->g + D->seg.b);
-    float *gcur = A->gA; nn_conv3d_bwd_data(A->glg, (shape5){s0.n, 2, s0.d, s0.h, s0.w}, D->p + D->seg.w, s0, 1, 1, gcur, A->scr);
+    float *gcur = A->gA; c1_bwd(D->p + D->seg.w, D->g + D->seg.w, D->g + D->seg.b, last->b[1].y, s0, 2, A->glg, gcur, 0);
     for (int s = D->nst - 1; s >= 0; s--) {
         const se_stage *S = &D->st[s]; se_sact *a = &A->s[s];
         block_bwd(D, &S->bl[1], &a->b[1], gcur, A->gB, A->gC, A->gD, A);   /* gB = d / d b[0].y */
