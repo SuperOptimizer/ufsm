@@ -1864,7 +1864,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             }
             free(qh);
             const double now = dn_now(), dt = (now - t_last) / nsum;
-            char line[2048];
+            char line[6144];
             /* prototype usage: distinct teacher-argmax prototypes since the last reset (every --usage-window steps; DINO sees 2 rows per step) */
             const int uwin = atoi(opt(argc, argv, "--usage-window", "5000")), rst = uwin > 0 && step % uwin < log_every;
             int ud = 0, ui = 0; for (int k = 0; k < K; k++) { ud += useb[k]; if (rst) useb[k] = 0; } for (int k = 0; k < KI && wib > 0; k++) { ui += useib[k]; if (rst) useib[k] = 0; }
