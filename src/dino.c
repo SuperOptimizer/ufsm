@@ -1020,6 +1020,15 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
     if (Q->ure > 0 && step % Q->ure < 100) memset(Q->use, 0, (size_t)K);
     const size_t ln = strlen(line);
     snprintf(line + ln, cap - ln, " | ssl: dino %.4f koleo %.4f H(t) %.2f H(mean) %.2f (max %.2f) pmax %.4f agree %.3f protos used %d / %d", Q->nsum ? Q->sums[0] / Q->nsum : 0.0, Q->nsum ? Q->sums[1] / Q->nsum : 0.0, H, Hm, log((double)K), pmax, Q->nsum ? Q->sums[2] / Q->nsum : 0.0, used, K);
+    {   /* does the CLS carry the sample? cosine of a sample's two teacher globals vs of different samples (teacher rows, after the norm) */
+        const int C = Q->C; float *ct = malloc((size_t)R * C * 4); nn_d2h(ct, Q->clsT, (size_t)R * C * 4);
+        double cs = 0, cd = 0; long nd = 0;
+        for (int a = 0; a < R; a++) for (int b = a + 1; b < R; b++) {
+            double x = 0, ya = 0, yb = 0; for (int c = 0; c < C; c++) { x += (double)ct[(size_t)a * C + c] * ct[(size_t)b * C + c]; ya += (double)ct[(size_t)a * C + c] * ct[(size_t)a * C + c]; yb += (double)ct[(size_t)b * C + c] * ct[(size_t)b * C + c]; }
+            const double cc = x / sqrt(ya * yb + 1e-30); if (a / 2 == b / 2) cs += cc; else { cd += cc; nd++; } }
+        free(ct); const size_t l3_ = strlen(line);
+        snprintf(line + l3_, cap - l3_, " | cls cos same %.3f other %.3f", cs / (R / 2), nd ? cd / nd : 0.0);
+    }
     if (Q->wib > 0 && Q->sums[5] >= 4) {   /* iBOT: the mean target entropy of the last step's first 64 masked rows, the loss, rows per step */
         const int r = Q->sums[5] < 64 ? (int)Q->sums[5] : 64, KI = Q->KI; float *qi = malloc((size_t)r * KI * 4); nn_d2h(qi, Q->iq, (size_t)r * KI * 4); double Hi = 0;
         for (int a = 0; a < r; a++) { double z = 0, h = 0; for (int k = 0; k < KI; k++) z += qi[(size_t)a * KI + k]; for (int k = 0; k < KI; k++) { const double t = qi[(size_t)a * KI + k] / z; if (t > 0) h -= t * log(t); } Hi += h / r; }
