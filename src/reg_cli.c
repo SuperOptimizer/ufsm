@@ -531,6 +531,8 @@ static int cmd_warp(int argc, char **argv) {
 
 int cmd_reg_overlay(int argc, char **argv);
 int cmd_reg_init(int argc, char **argv);
+int cmd_reg_render(int argc, char **argv);   /* src/reg_render.c */
+int cmd_reg_inkstat(int argc, char **argv);   /* src/reg_ink.c */
 int cmd_reg(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: ufsm reg <pair|map|warp|boxes|fit|stats|overlay|init> ...\n"); return 2; }
     store_global_init();
@@ -543,6 +545,8 @@ int cmd_reg(int argc, char **argv) {
     if (!strcmp(s, "stats")) return cmd_stats(argc, argv);
     if (!strcmp(s, "overlay")) return cmd_reg_overlay(argc, argv);
     if (!strcmp(s, "init")) return cmd_reg_init(argc, argv);
+    if (!strcmp(s, "render")) return cmd_reg_render(argc, argv);
+    if (!strcmp(s, "inkstat")) return cmd_reg_inkstat(argc, argv);
     fprintf(stderr, "reg: unknown subcommand %s\n", s);
     return 2;
 }

@@ -91,3 +91,11 @@ int reg_fit_field(int n, const double *c, const double *v, const double *w, doub
    the axis and the offset along it (all 4 h / phi orientations when all). A: fine L0 xyz -> coarse L0 xyz. */
 typedef struct { double ncc, rot_deg; int hflip, pflip, n; double orient_ncc[4]; } reg_init_info;
 int reg_init_affine(rvol *cv, rvol *fv, double W, double rmin, int nt, int all, raff *A, reg_init_info *info);
+
+/* certification of a registered pair (src/reg_render.c): <pair>/final/residuals.jsonl used fit boxes with |v - pred| <= tol (fixed voxels)
+   are good, <pair>/eval_after.jsonl boxes not ok / NCC < 0.3 / |s| > tol are failing; a fixed-frame point is certified when a good box lies
+   within max(r_vox, 1.5 x their median spacing) and no failing box within r_vox / 2. */
+typedef struct { int n; double *c; } ptset;
+typedef struct { ptset good, bad; double r2, rb2; double cell; int nh; int *head, *next; int *bhead, *bnext; double o[3]; } rcover;
+int rcover_load(rcover *cv, const char *pair, double r_vox, double tol);
+int rcover_ok(const rcover *cv, const double p[3]);

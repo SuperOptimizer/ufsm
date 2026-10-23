@@ -48,3 +48,4 @@ typedef struct {
 void inksplat_defaults(inksplat_cfg *c);
 int inksplat_run(const inksplat_cfg *c);
 int cmd_ink_splat(int argc, char **argv);
+uint8_t *inksplat_label_window(const char *path, int64_t r0, int64_t c0, int64_t h, int64_t w, int64_t *H, int64_t *W);   /* a 2-D label window (0 outside) */
