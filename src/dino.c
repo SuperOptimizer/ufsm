@@ -861,7 +861,7 @@ typedef struct {
     /* diag-dv (--ssl-dv-teacher PT): the iBOT targets from the frozen upstream dinovol teacher (its ibot_head over its patch tokens of the
        un-augmented teacher global, at the cell of each mapped point) until --ssl-dv-until (0: always), then from our EMA teacher; the student
        iBOT head predicts dinovol's 131072 prototypes (its last layer initialised from dinovol's and kept frozen) */
-    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; int fixdone, Rfix;
+    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; int fixdone, Rfix, hwarm;
     int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -869,7 +869,7 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
     Q->N = atoi(opt(argc, argv, "--ssl-batch", "16")); Q->PG = atoi(opt(argc, argv, "--ssl-P", "128")); Q->PL = atoi(opt(argc, argv, "--ssl-local-P", "64"));
     Q->NL = atoi(opt(argc, argv, "--ssl-locals", "4")); Q->Ps = atoi(opt(argc, argv, "--ssl-source-P", "192")); Q->K = atoi(opt(argc, argv, "--ssl-protos", "16384"));
     Q->ts = 0.1f; Q->wdino = (float)atof(opt(argc, argv, "--ssl-dino", "1")); Q->wk = (float)atof(opt(argc, argv, "--ssl-koleo", "0.1"));
-    Q->hlr = (float)atof(opt(argc, argv, "--ssl-head-lr", "1.8e-4")); Q->plr = (float)atof(opt(argc, argv, "--ssl-proto-lr", opt(argc, argv, "--ssl-head-lr", "1.8e-4")));
+    Q->hlr = (float)atof(opt(argc, argv, "--ssl-head-lr", "1.8e-4")); Q->hwarm = atoi(opt(argc, argv, "--ssl-head-warmup", "0")); Q->plr = (float)atof(opt(argc, argv, "--ssl-proto-lr", opt(argc, argv, "--ssl-head-lr", "1.8e-4")));
     Q->wd = (float)atof(opt(argc, argv, "--ssl-wd", "0.04")); Q->freeze = atoi(opt(argc, argv, "--ssl-freeze-last", "1250")); Q->skit = atoi(opt(argc, argv, "--ssl-sk-iters", "3"));
     Q->adrop = (float)atof(opt(argc, argv, "--axis-drop", "0.15")); Q->ure = atoi(opt(argc, argv, "--usage-window", "5000"));
     const int L = 1 << (cfg->nlev - 1);
@@ -1296,11 +1296,12 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     nn_axpy(unet_grad_ptr(Q->u), 1.f, unet_grad_ptr(Q->ug), np); nn_axpy(unet_grad_ptr(Q->u), 1.f, unet_grad_ptr(Q->ul), np);
     /* the head: AdamW (upstream), the prototype directions after --ssl-freeze-last, g fixed; then its EMA teacher */
     dn_head *h = &Q->H; const dr_head *H = &h->H;
-    dr_adamw(h->p, h->g, h->m, h->v, H->v, Q->hlr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
+    const float hlr = Q->hwarm > 0 && step < Q->hwarm ? Q->hlr * (float)step / Q->hwarm : Q->hlr;   /* (--ssl-head-warmup: linear, as upstream's lr warmup) */
+    dr_adamw(h->p, h->g, h->m, h->v, H->v, hlr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
     if (step > Q->freeze) dr_adamw(h->p + H->v, h->g + H->v, h->m + H->v, h->v + H->v, H->g - H->v, Q->plr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
     dr_ema(h->pt, h->p, H->n, mom); nn_zero(h->g, H->n * 4);
     if (Q->wib > 0) { dn_head *hi = &Q->I; const dr_head *HI = &hi->H;
-        dr_adamw(hi->p, hi->g, hi->m, hi->v, HI->v, Q->hlr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
+        dr_adamw(hi->p, hi->g, hi->m, hi->v, HI->v, hlr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
         if (step > Q->freeze && !Q->dv) dr_adamw(hi->p + HI->v, hi->g + HI->v, hi->m + HI->v, hi->v + HI->v, HI->g - HI->v, Q->plr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
         dr_ema(hi->pt, hi->p, HI->n, mom); nn_zero(hi->g, HI->n * 4); }
     nn_d2h(Q->hout, Q->outs, 16 * 4); Q->sums[0] += Q->wdino > 0 ? Q->hout[4] / Q->wdino : 0; Q->sums[1] += Q->hout[1]; Q->sums[3] += Q->wib > 0 ? Q->hout[8] / Q->wib : 0; Q->sums[4] += R; Q->nsum++;
