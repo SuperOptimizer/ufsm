@@ -11,6 +11,7 @@ A=${A:-/vesuvius/ufsm/u0}; OLD=${OLD:-/vesuvius/ufsm/volcomp}
 rows=$(mktemp)
 while IFS=$'\t' read -r scroll id volume um kev dist level lum shape lgb cgb shards status newgb pairs; do
   [ "$scroll" = scroll ] && continue
+  case "$status" in skip*) continue;; esac
   tag=$scroll-$id; J=$A/prep/$tag.json
   [ -e $A/state/$tag.prep.done ] && [ -e $J ] || continue
   case "$status" in use-*) root=$OLD/$scroll; key=$volume;; *) root=$(cat $A/state/$tag.loc 2>/dev/null || echo $A/vol); key=$scroll/$volume;; esac
