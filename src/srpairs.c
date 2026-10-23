@@ -64,7 +64,7 @@ static void *sr_worker(void *arg) {
             for (int d = 0; d < 3; d++) p[d] = org[d] + s3[d] * 0.5 * (T - 1) / 4.0;
             rmap_c2f(&j->m, p, f); for (int d = 0; d < 3; d++) { lo[d] = fmin(lo[d], f[d]); hi[d] = fmax(hi[d], f[d]); } }
         int64_t fo[3], fn[3]; for (int d = 0; d < 3; d++) { fo[2 - d] = (int64_t)floor(lo[d]) - 3; fn[2 - d] = (int64_t)ceil(hi[d]) + 3 - fo[2 - d] + 1; }
-        if ((double)fn[0] * fn[1] * fn[2] > 64e6) continue;
+        if ((double)fn[0] * fn[1] * fn[2] > 200e6) continue;   /* (--in 128: a ~520^3 fine block) */
         uint8_t *fb = malloc((size_t)fn[0] * fn[1] * fn[2]);
         if (!fb || rvol_read(j->fv, 0, fo, fn, fb)) { free(fb); continue; }
         size_t nv = 0;
