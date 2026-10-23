@@ -2,6 +2,7 @@
    view-pair data tool (ufsm halves). See DESIGN.md "Own dense embedding net (dino-train)". */
 #include "dino.h"
 #include "dinor.h"
+#include "band.h"
 #include "attn.h"
 #include "dinovol.h"
 #include "store.h"
@@ -99,18 +100,23 @@ int cmd_dino_halves(int argc, char **argv) {
 
 enum { DN_MAXSRC = 128, DN_MAXBOX = 256, DN_SLOTS = 6 };
 typedef struct {
-    char name[64]; z3 *ca, *cb, *codes, *ink; int halves; int cscale; float *axz;   /* scroll axis (y, x) per CT plane (sources "axis" + "axis_scale"), or nullptr */   /* CT voxels per code voxel (codes on a coarser grid; 1: the same grid) */
+    char name[64]; z3 *ca, *cb, *codes, *ink, *phase; int halves; int cscale, pscale; float um;   /* phase: the stored winding phase (PHASE_* bytes; sources "phase": {"root", "key", "scale"}) */ float *axz;   /* scroll axis (y, x) per CT plane (sources "axis" + "axis_scale"), or nullptr */   /* CT voxels per code voxel (codes on a coarser grid; 1: the same grid) */
     int64_t org[3];                              /* added to window corners (ct array coordinates) to address the codes (global grid) */
     int nbox; int64_t box[DN_MAXBOX][6]; int nho; int64_t ho[DN_MAXBOX][6];
     double weight, bvol; float center, scale, pap; int64_t shape[3];
     int ct_only;                                 /* unlabelled (U0): SSL terms only (sampled by the ct_only share) */
     int32_t *mcell; int64_t nmcell; int mcs;     /* "mask": {"map": RAW, "min": m} (ufsm scanprep): the cells with code >= m (window centres), cell edge */
 } dn_src;
-typedef struct { int P, ngt, nssl, nair, margin; int nsrc; dn_src src[DN_MAXSRC]; double wsum; int ident; int nink; double wsum_l, wsum_u, share_u; char excl[8][64]; int nexcl; } dn_data;   /* share_u: the unlabelled sources' share of the draws (0: by weight over all) */   /* nink: ink points per sample (half ink, half no-ink) */   /* ident: no window geometry (the recipe draws its own views) */
+typedef struct { int P, ngt, nssl, nair, margin; int nsrc; dn_src src[DN_MAXSRC]; double wsum; int ident; int nink; double wsum_l, wsum_u, share_u; char excl[8][64]; int nexcl;
+    /* recipe views drawn by the loader workers: globals vP^3 (zoom zlo..zhi), vnloc locals vPL^3 (lzlo..lzhi); uw: per global view the stored phase
+       resampled into the view + its winding mod 4 (band_wind4_tiled); ikp: the ink-splat probability resampled into the view */
+    int vP, vPL, vnloc, uw, ikp; float zlo, zhi, lzlo, lzhi; } dn_data;   /* share_u: the unlabelled sources' share of the draws (0: by weight over all) */   /* nink: ink points per sample (half ink, half no-ink) */   /* ident: no window geometry (the recipe draws its own views) */
 typedef struct {   /* one sample: two CT views, the geometry, the points (output-space voxel indices) */
     uint8_t *ca, *cb; int si; int64_t corner[3]; dn_geom g; int halves; float *ayx;   /* the axis (y, x) per window plane (window coords; --axis-input) */
     int ngt, nssl; int *gidx, *gcode, *gxyz, *sidx;
     int nip, nin; int *ixyz;   /* ink points (window coords, identity geometry): nip ink first, then nin no-ink (sources "ink", the recipe) */
+    dr_xf xf[18]; int nxf;     /* the recipe's views (worker-drawn) */
+    uint8_t *pv[2], *w4[2], *wc[2], *iv[2], *im[2], *ikw, *phw; int uwv[2], ikv;   /* per global view: phase, winding mod 4, component, ink target / mask (recipe) */
     int ready;
 } dn_sample;
 typedef struct {
@@ -127,6 +133,52 @@ static int box_hit(const int64_t a[6], const int64_t o[3], int P) {   /* the win
 /* output index of source voxel s under g: o[d] = flip[d] ? P - 1 - s[perm[d]] : s[perm[d]] */
 static void geom_map(const dn_geom *g, int P, const int s[3], int o[3]) { for (int d = 0; d < 3; d++) o[d] = g->flip[d] ? P - 1 - s[g->perm[d]] : s[g->perm[d]]; }
 
+/* recipe views on the loader side: 2 globals (the second overlapping the first by >= 1/4 of the smaller cube per axis) + locals, each with a
+   log-uniform zoom and one of the 48 cube symmetries (the intensity augmentation stays with the trainer) */
+static void dn_draw_views(const dn_data *D, dn_sample *S, uint64_t *ar) {
+    const int Ps = D->P; S->nxf = 2 + D->vnloc;
+    for (int v = 0; v < S->nxf; v++) {
+        dr_xf *t = &S->xf[v]; const int gl = v < 2; t->n = gl ? D->vP : D->vPL; t->src = 0;
+        const float lo = gl ? D->zlo : D->lzlo, hi = gl ? D->zhi : D->lzhi; const float z = expf(logf(lo) + (float)rng_u(ar) * (logf(hi) - logf(lo)));
+        t->m = (int)lrintf(t->n * z); if (t->m > Ps) t->m = Ps; if (t->m < 8) t->m = 8;
+        for (int d = 0; d < 3; d++) {
+            int lo2 = 0, hi2 = Ps - t->m;
+            if (v == 1) { const int ov = (t->m < S->xf[0].m ? t->m : S->xf[0].m) / 4; const int a = S->xf[0].off[d] - t->m + ov, b = S->xf[0].off[d] + S->xf[0].m - ov; if (a > lo2) lo2 = a; if (b < hi2) hi2 = b; if (hi2 < lo2) hi2 = lo2; }
+            t->off[d] = lo2 + (int)(rng_u(ar) * (hi2 - lo2 + 1)); if (t->off[d] > Ps - t->m) t->off[d] = Ps - t->m;
+        }
+        int pm[3] = {0, 1, 2}; for (int k = 2; k > 0; k--) { const int j = (int)(rng_next(ar) % (uint64_t)(k + 1)); const int q = pm[k]; pm[k] = pm[j]; pm[j] = q; }
+        for (int d = 0; d < 3; d++) { t->perm[d] = pm[d]; t->flip[d] = (int)(rng_next(ar) & 1); }
+    }
+}
+/* a u8 window [Ps^3] resampled into global view v (nearest source voxel; out of range: fill). The map is separable: view axis d reads
+   source axis perm[d] alone, so per axis a table of source offsets */
+static void dn_view_u8(const dn_sample *S, int v, int Ps, const uint8_t *src, uint8_t *dst, int fill) {
+    const dr_xf *t = &S->xf[v]; const int n = t->n; const int64_t st[3] = {(int64_t)Ps * Ps, Ps, 1};
+    int64_t *tb = malloc(sizeof(int64_t) * 3 * n);
+    for (int d = 0; d < 3; d++) for (int i = 0; i < n; i++) {
+        const double o = t->flip[d] ? (double)(n - 1) - i : i; const int q = (int)lrint(t->off[t->perm[d]] + (o + 0.5) * t->m / n - 0.5);
+        tb[d * n + i] = q >= 0 && q < Ps ? q * st[t->perm[d]] : -1;
+    }
+    for (int z = 0; z < n; z++) for (int y = 0; y < n; y++) {
+        const int64_t az = tb[z], ay = tb[n + y]; uint8_t *row = dst + ((size_t)z * n + y) * n;
+        if (az < 0 || ay < 0) { memset(row, fill, (size_t)n); continue; }
+        const uint8_t *sp = src + az + ay; const int64_t *tx = tb + 2 * n;
+        for (int x = 0; x < n; x++) row[x] = tx[x] >= 0 ? sp[tx[x]] : (uint8_t)fill;
+    }
+    free(tb);
+}
+/* the stored phase of global view v (unknown where the view's nearest CT is 0) and its winding mod 4 (as the train sampler: the phase
+   unwrapped over the window before the air test, tiles of about P / 6) */
+static void dn_view_phase(const dn_data *D, dn_sample *S, int v) {
+    const int n = S->xf[v].n; const size_t n3 = (size_t)n * n * n;
+    dn_view_u8(S, v, D->P, S->phw, S->pv[v], PHASE_UNKNOWN);
+    uint8_t *ct = malloc(n3); dn_view_u8(S, v, D->P, S->ca, ct, 0);
+    size_t known = 0; for (size_t k = 0; k < n3; k++) { if (!ct[k]) S->pv[v][k] = SIDE_UNKNOWN; known += S->pv[v][k] != PHASE_UNKNOWN; }
+    if (known < 4096) { free(ct); S->uwv[v] = 0; return; }   /* (no labelled phase in this view: no dense unwrap2 targets) */
+    const int wt = (n + 5) / 6;
+    if (band_wind4_tiled(S->pv[v], n, n, n, wt, 80, 512, 1, S->w4[v], S->wc[v], nullptr) < 0) { memset(S->w4[v], 255, n3); memset(S->wc[v], 255, n3); }
+    free(ct); S->uwv[v] = 1;
+}
 static int sample_fill(dn_data *D, dn_sample *S, uint64_t *rs, int nthreads, uint8_t *codes_buf) {
     const int P = D->P; const size_t p3 = (size_t)P * P * P;
     for (int tries = 0; tries < 200; tries++) {
@@ -227,10 +279,11 @@ static int sample_fill(dn_data *D, dn_sample *S, uint64_t *rs, int nthreads, uin
         S->nssl = (int)(seen < D->nssl ? seen : D->nssl);
         S->nip = S->nin = 0;
         if (s->ink && D->nink > 0) {   /* ink points: reservoir samples of ink (>= 192) and no-ink (<= 63) labelled voxels in the interior */
-            if (z3_read(s->ink, o, n, codes_buf, nthreads)) return -1;
+            uint8_t *ib = D->ident && D->ikp && S->ikw ? S->ikw : codes_buf;   /* (the recipe's ink-prob views resample this window below) */
+            if (z3_read(s->ink, o, n, ib, nthreads)) return -1;
             const int half = D->nink / 2, m = D->margin; long sp = 0, sn = 0; int *pp = S->ixyz, *pn = S->ixyz + 3 * half;
             for (int z = m; z < P - m; z++) for (int y = m; y < P - m; y++) {
-                const uint8_t *row = codes_buf + ((size_t)z * P + y) * P;
+                const uint8_t *row = ib + ((size_t)z * P + y) * P;
                 for (int x = m; x < P - m; x++) {
                     const int v = row[x]; if (v == 255 || (v > 63 && v < 192)) continue;
                     int *dst; long k;
@@ -242,6 +295,30 @@ static int sample_fill(dn_data *D, dn_sample *S, uint64_t *rs, int nthreads, uin
             S->nip = (int)(sp < half ? sp : half); S->nin = (int)(sn < half ? sn : half);
             if (S->nip < 4 || S->nin < 4) S->nip = S->nin = 0;
             else if (S->nip < half) memmove(S->ixyz + 3 * S->nip, pn, (size_t)S->nin * 12);   /* no-ink right after the ink points */
+        }
+        if (D->ident && D->vP > 0) {   /* the recipe: views drawn here (with their phase / ink resampling: CPU work off the training thread) */
+            S->ikv = 0;
+            if (D->ikp && s->ink && S->ikw) { if (D->nink <= 0 && z3_read(s->ink, o, n, S->ikw, nthreads)) return -1; S->ikv = 1; }   /* (read above with the ink points) */
+            dn_draw_views(D, S, rs);
+            for (int v = 0; v < 2; v++) S->uwv[v] = 0;
+            if (D->uw && s->phase && S->phw) {
+                const int k = s->pscale > 1 ? s->pscale : 1; int64_t c0[3], cn[3];   /* (the codes' grid: + origin, k x coarser) */
+                const int64_t oc[3] = {o[0] + s->org[0], o[1] + s->org[1], o[2] + s->org[2]};
+                for (int d = 0; d < 3; d++) { c0[d] = oc[d] / k; cn[d] = (oc[d] + P - 1) / k - c0[d] + 1; }
+                uint8_t *pb = malloc((size_t)cn[0] * cn[1] * cn[2]);
+                if (!pb || z3_read(s->phase, c0, cn, pb, nthreads)) { free(pb); return -1; }
+                for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {   /* nearest-neighbour onto the CT window */
+                    const uint8_t *src = pb + (((size_t)((oc[0] + z) / k - c0[0]) * cn[1]) + (oc[1] + y) / k - c0[1]) * cn[2]; uint8_t *dst = S->phw + ((size_t)z * P + y) * P;
+                    for (int x = 0; x < P; x++) dst[x] = src[(oc[2] + x) / k - c0[2]];
+                }
+                free(pb);
+                for (int v = 0; v < 2; v++) dn_view_phase(D, S, v);
+            }
+            if (S->ikv) for (int v = 0; v < 2; v++) {   /* ink-splat prob254 (255 unknown) -> target (0..254) and mask */
+                const size_t n3 = (size_t)S->xf[v].n * S->xf[v].n * S->xf[v].n;
+                dn_view_u8(S, v, P, S->ikw, S->iv[v], 255);
+                for (size_t k = 0; k < n3; k++) { const int u8 = S->iv[v][k] != 255; S->im[v][k] = (uint8_t)u8; if (!u8) S->iv[v][k] = 0; }
+            }
         }
         return 0;
     }
@@ -353,6 +430,13 @@ static int load_sources(const char *path, dn_data *D, int nthreads) {
             if (!S->codes) { fprintf(stderr, "dino-train: %s: cannot open the codes\n", S->name); return -1; }
         }
         S->cscale = (int)json_num(json_get(cj, "scale"), 1);
+        const json *pj = json_get(s, "phase");   /* the stored winding phase (unwrap2 heads in the recipe) */
+        if (pj) {
+            store *ps = store_open(json_str(json_get(pj, "root"), "")); S->phase = ps ? z3_open(ps, json_str(json_get(pj, "key"), ""), nullptr) : nullptr;
+            if (!S->phase) { fprintf(stderr, "dino-train: %s: cannot open the phase\n", S->name); return -1; }
+            S->pscale = (int)json_num(json_get(pj, "scale"), 1);
+            S->um = (float)json_num(json_get(s, "um"), 9.6);   /* (the packed-sheet weight's voxel size) */
+        }
         const json *ij = json_get(s, "ink");   /* ink labels on the CT grid (ufsm ink-splat prob254: 254 ink, 0 no ink, 255 unknown) */
         if (ij) {
             store *is = store_open(json_str(json_get(ij, "root"), "")); S->ink = is ? z3_open(is, json_str(json_get(ij, "key"), ""), nullptr) : nullptr;
@@ -419,7 +503,20 @@ static void dn_precision_after_init(int fp32) {
 /* head slabs (--head-slab Z): the 1^3 head per z-slab of Z planes into one fp16 slab buffer; the points' embeddings gathered from each slab
    after a forward, and in the backward's head step (dn_head_cb) the points' gradients scattered into each slab's fp16 logit gradient
    (scaled by the gradient scale) for the fused slab head backward */
-typedef struct { unet *u; void *hs; int Z, P, D; const float *e1, *g1, *n1, *e2, *g2, *n2; const int *i1, *i2; int ngt, nssl; float w2; const float *e3, *g3, *n3; const int *i3; int n3p; } dn_hs;
+/* the recipe's dense supervised heads (dino-train --recipe --unwrap2 W / --ink-prob W): output channels after the ED embedding channels,
+   train.c's unwrap2 layout shifted by ED: ED + 0..1 phase (cos, sin), ED + 2..8 n n^T + density, ED + 9..10 winding mod 4 (cos, sin of a
+   quarter-turn gauge), ED + 11 the ink-splat probability; trained per global view from the stored phase / ink labels resampled into the
+   view (the loader workers), with train.c's slab losses (pass 0: statistics after the forward; pass 1: gradients in place in the head
+   step) */
+typedef struct dn_uw {
+    int uw, ik;                                      /* this view: unwrap2 targets / ink-prob targets present */
+    const uint8_t *pv, *w4, *wc, *ik_t, *ik_m;       /* device views [P^3]: phase, winding mod 4, component, ink target, ink mask */
+    uint8_t *sidet, *sidem, *nt, *nm, *sidew, *nw, *onew;   /* slab-sized targets / masks, per-channel weights */
+    double *ds, *w4ds; float *w4fin, *sscr, *nscr, *iscr;
+    float um, dscale, pum, pw, ttau, tkap; int nstep, dcode, trunc;
+    float lp, ln, lw4, lik;                          /* the loss weights of this step (ramped) */
+} dn_uw;
+typedef struct { unet *u; void *hs; int Z, P, D, CO; const float *e1, *g1, *n1, *e2, *g2, *n2; const int *i1, *i2; int ngt, nssl; float w2; const float *e3, *g3, *n3; const int *i3; int n3p; dn_uw *uw; } dn_hs;
 static void dn_gather_slabs(dn_hs *H, const int *i1, int n1, float *e1, float *r1, const int *i2, int n2, float *e2, float *r2) {
     const size_t hw = (size_t)H->P * H->P;
     for (int z0 = 0; z0 < H->P; z0 += H->Z) {
@@ -429,11 +526,58 @@ static void dn_gather_slabs(dn_hs *H, const int *i1, int n1, float *e1, float *r
         if (n2) dn_gather_z(H->hs, ns, vb, H->D, i2, n2, e2, r2);
     }
 }
+/* the dense heads' losses of one slab (logits hs [CO][ns], fp16): pass 0 statistics, pass 1 gradients in place (the rest of the slab zeroed) */
+static void dn_uw_slab(dn_hs *H, int pass, int z0, int z1) {
+    dn_uw *W = H->uw; const int P = H->P, ED = H->D, nz = z1 - z0; const size_t hw = (size_t)P * P, ns = (size_t)nz * hw, vb = (size_t)z0 * hw;
+#define LGC(c) ((char *)H->hs + (size_t)(c) * ns * 2)
+    const shape5 one = {1, 1, nz, P, P}, two = {1, 2, nz, P, P}, seven = {1, 7, nz, P, P};
+    if (W->uw) {
+        nn_phase_targets(W->pv + vb, ns, W->sidet, W->sidem);
+        if (W->trunc) nn_phase_trunc(LGC(ED), LGC(ED + 1), W->sidet, W->sidem, ns, W->ttau, W->tkap);
+        if (W->pw > 1) nn_packed_mask_z(W->pv, P, P, P, W->nstep, W->um, W->pum, W->pw, W->sidem, z0, z1);
+        nn_unwrap_targets2_z(W->pv, P, P, P, W->nstep, W->dscale, W->dcode, W->um, W->pum, W->pw, W->nt, W->nm, z0, z1);
+    }
+    if (!pass) {
+        if (W->uw) {
+            nn_wind4_stats(LGC(ED + 9), LGC(ED + 10), W->w4 + vb, W->wc + vb, W->sidem, ns, W->w4ds);
+            nn_loss_stats_acc(LGC(ED), W->sidet, W->sidem, W->sidew, two, W->ds);
+            nn_loss_stats_acc(LGC(ED + 2), W->nt, W->nm, W->nw, seven, W->ds + 10);
+        }
+        if (W->ik) nn_loss_stats_acc(LGC(ED + 11), W->ik_t + vb, W->ik_m + vb, W->onew, one, W->ds + 50);
+        return;
+    }
+    if (W->uw) {
+        nn_wind4_grad(LGC(ED + 9), LGC(ED + 10), W->w4 + vb, W->wc + vb, W->sidem, ns, W->w4fin, W->lw4, LGC(ED + 9), LGC(ED + 10));
+        nn_loss_grad_only(LGC(ED), W->sidet, W->sidem, W->sidew, two, 0.f, LGC(ED), W->sscr); nn_loss_grad_scale(LGC(ED), 2 * ns, W->lp);
+        nn_loss_grad_only(LGC(ED + 2), W->nt, W->nm, W->nw, seven, 0.f, LGC(ED + 2), W->nscr); nn_loss_grad_scale(LGC(ED + 2), 7 * ns, W->ln);
+    } else nn_zero(LGC(ED), 11 * ns * 2);
+    if (W->ik) { nn_loss_grad_only(LGC(ED + 11), W->ik_t + vb, W->ik_m + vb, W->onew, one, 0.f, LGC(ED + 11), W->iscr); nn_loss_grad_scale(LGC(ED + 11), ns, W->lik); }
+    else nn_zero(LGC(ED + 11), ns * 2);
+    nn_zero(H->hs, (size_t)ED * ns * 2);
+    if (H->CO > ED + 12) nn_zero(LGC(ED + 12), (size_t)(H->CO - ED - 12) * ns * 2);
+#undef LGC
+}
+/* pass 0 over the window (after the student forward of a supervised global view): the statistics, finished into the scratches */
+static void dn_uw_stats(dn_hs *H) {
+    dn_uw *W = H->uw; const int P = H->P;
+    nn_zero(W->ds, 64 * sizeof(double)); nn_zero(W->w4ds, nn_wind4_sums());
+    for (int z0 = 0; z0 < P; z0 += H->Z) {
+        const int z1 = z0 + H->Z < P ? z0 + H->Z : P;
+        if (unet_head_fwd_z(H->u, z0, z1, H->hs)) { fprintf(stderr, "dino-train: the slab head is not covered\n"); abort(); }
+        dn_uw_slab(H, 0, z0, z1);
+    }
+    if (W->uw) { nn_wind4_fin(W->w4ds, W->w4fin); nn_loss_stats_fin(W->ds, W->sidew, (shape5){1, 2, P, P, P}, W->sscr); nn_loss_stats_fin(W->ds + 10, W->nw, (shape5){1, 7, P, P, P}, W->nscr); }
+    if (W->ik) nn_loss_stats_fin(W->ds + 50, W->onew, (shape5){1, 1, P, P, P}, W->iscr);
+}
 static void dn_head_cb(void *ctx) {
     dn_hs *H = ctx; const size_t hw = (size_t)H->P * H->P; const float gs = nn_get_grad_scale();
+    const int dense = H->uw && (H->uw->uw || H->uw->ik);
     for (int z0 = 0; z0 < H->P; z0 += H->Z) {
         const int z1 = z0 + H->Z < H->P ? z0 + H->Z : H->P; const size_t ns = (size_t)(z1 - z0) * hw, vb = (size_t)z0 * hw;
-        nn_zero(H->hs, (size_t)H->D * ns * 2);
+        if (dense) {   /* the slab's logits again: the dense losses' gradients in place, the embedding rows zeroed for the point scatters */
+            if (unet_head_fwd_z(H->u, z0, z1, H->hs)) { fprintf(stderr, "dino-train: the slab head is not covered\n"); abort(); }
+            dn_uw_slab(H, 1, z0, z1);
+        } else nn_zero(H->hs, (size_t)H->CO * ns * 2);
         if (H->ngt) dn_scatter_z(H->e1, H->g1, H->n1, H->i1, H->ngt, H->D, ns, vb, gs, H->hs);
         if (H->nssl) dn_scatter_z(H->e2, H->g2, H->n2, H->i2, H->nssl, H->D, ns, vb, H->w2 * gs, H->hs);
         if (H->n3p) dn_scatter_z(H->e3, H->g3, H->n3, H->i3, H->n3p, H->D, ns, vb, gs, H->hs);
@@ -441,9 +585,24 @@ static void dn_head_cb(void *ctx) {
     }
 }
 
+/* a checkpoint into u; one with fewer outputs (a recipe run before the dense heads) grows: its rows kept, the new rows zero (weights,
+   bias, optimiser state), trunk and attention stage as saved. Returns the step or -1 */
+static int dn_load_ckpt(unet *u, const char *path) {
+    unet_cfg oc; int st = 0;
+    if (unet_peek(path, &oc, &st)) return -1;
+    if (oc.cout < unet_cfg_of(u)->cout) {
+        const int r = unet_load_grow(u, path, oc.cout, 0.f);
+        if (r >= 0) fprintf(stderr, "dino-train: %s: head grown %d -> %d outputs (trunk kept, new rows zero)\n", path, oc.cout, unet_cfg_of(u)->cout);
+        return r;
+    }
+    return unet_load(u, path);
+}
+/* embedding channels of a dino net: the first min(cout, 32) (a recipe net with dense heads: 32 + 12 padded to 48) */
+static int dn_embed_dim(const unet_cfg *c) { return c->cout > 32 ? 32 : c->cout; }
+
 /* the EMA network over a box (CT array coords) -> unit int8 embeddings [nz][ny][nx][D] (host), tiles of P with halo h */
 static int8_t *dn_embed_box(unet *u, z3 *ct, const int64_t box[6], int P, int h, float center, float scale, int nthreads, int ema, const float *axz, float ars) {
-    const int D = unet_cfg_of(u)->cout, in = P - 2 * h; const size_t p3 = (size_t)P * P * P;
+    const int D = dn_embed_dim(unet_cfg_of(u)), CO = unet_cfg_of(u)->cout, in = P - 2 * h; const size_t p3 = (size_t)P * P * P;
     int8_t *out = calloc((size_t)box[3] * box[4] * box[5] * D, 1);
     const int cin = unet_cfg_of(u)->cin; float *ayh = malloc((size_t)P * 8), *ayd = nn_malloc((size_t)P * 8);
     uint8_t *cth = malloc(p3), *ctd = nn_malloc(p3); float *x = nn_malloc(p3 * 4 * cin);
@@ -467,7 +626,7 @@ static int8_t *dn_embed_box(unet *u, z3 *ct, const int64_t box[6], int P, int h,
         if (lg) dn_tile_out(lg, unet_logits_h16(u), P, D, ctd, h, h + nz, h, h + ny, h, h + nx, td, nz, ny, nx, 0, 0, 0);
         else {   /* a head-slab training build (dino-train --head-slab): the head per z-slab */
             const int Z = 16; const size_t hw = (size_t)P * P;
-            if (!hsl) hsl = nn_malloc((size_t)D * Z * hw * 2);
+            if (!hsl) hsl = nn_malloc((size_t)CO * Z * hw * 2);
             for (int z0 = 0; z0 < P; z0 += Z) {
                 const int z1 = z0 + Z < P ? z0 + Z : P;
                 if (z1 <= h || z0 >= h + nz) continue;
@@ -603,7 +762,7 @@ static int dn_block_mask(uint8_t *m, int G, int target, uint64_t *r) {
    network that shares the weights (unet_use_params); its gradient joins before the optimiser step. */
 static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char **argv, int P, int steps0, double minutes, const char *outd, int nthreads, int nwork, uint64_t seed, int HZ) {
     if (!cfg->attn_blocks) { fprintf(stderr, "dino-train --recipe: needs the attention stage (--attn-blocks >= 1) for the CLS tokens\n"); return 2; }
-    const int Ps = Dd->P, ED = cfg->cout, nloc = atoi(opt(argc, argv, "--locals", "4")), PL = atoi(opt(argc, argv, "--local-P", "96"));
+    const int Ps = Dd->P, ED = atoi(opt(argc, argv, "--dim", "32")), CO = cfg->cout, nloc = atoi(opt(argc, argv, "--locals", "4")), PL = atoi(opt(argc, argv, "--local-P", "96"));
     float zlo = 0.7f, zhi = 1.4f, lzlo = 0.8f, lzhi = 1.25f;
     sscanf(opt(argc, argv, "--zoom", "0.7,1.4"), "%f,%f", &zlo, &zhi); sscanf(opt(argc, argv, "--local-zoom", "0.8,1.25"), "%f,%f", &lzlo, &lzhi);
     if ((int)ceilf(P * zhi) > Ps || (int)ceilf(PL * lzhi) > Ps || PL % (1 << (cfg->nlev - 1))) { fprintf(stderr, "dino-train --recipe: views (P %d x %.2f, local %d x %.2f) must fit the source %d; local P a multiple of %d\n", P, zhi, PL, lzhi, Ps, 1 << (cfg->nlev - 1)); return 2; }
@@ -645,6 +804,28 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
        globals, at most 128 of each per step, through the ink head (Linear ED -> 384 -> GELU -> 32, unit) */
     const float wink = (float)atof(opt(argc, argv, "--ink", "0.1")); const int NIK = wink > 0 ? 256 : 0, IQN = 512;
     const int NOT = NOT0 + NIK;   /* (object points, then ink points: one gathered set) */
+    /* dense supervised heads (channels ED..ED + 11; see dn_uw): --unwrap2 W (phase + normals / density x W, winding mod 4 x W x --wind4-lambda),
+       --ink-prob W (BCE on the ink-splat probability); both ramp in linearly over --dense-ramp steps from --dense-from (default: the start /
+       resume step) */
+    const float wuw = (float)atof(opt(argc, argv, "--unwrap2", "0")), wik = (float)atof(opt(argc, argv, "--ink-prob", "0")), w4l = (float)atof(opt(argc, argv, "--wind4-lambda", "0.5"));
+    const int dense_ramp = atoi(opt(argc, argv, "--dense-ramp", "1000"));
+    if ((wuw > 0 || wik > 0) && CO < ED + 12) { fprintf(stderr, "dino-train --recipe: --unwrap2 / --ink-prob need %d outputs (have %d)\n", ED + 12, CO); return 2; }
+    dn_uw UW = {0};
+    UW.nstep = atoi(opt(argc, argv, "--normal-step", "1")); UW.dscale = (float)atof(opt(argc, argv, "--density-scale", "4")); UW.dcode = atoi(opt(argc, argv, "--density-code", "1"));
+    UW.pw = (float)atof(opt(argc, argv, "--packed-weight", "8")); UW.pum = (float)atof(opt(argc, argv, "--packed-um", "120"));
+    UW.ttau = (float)atof(opt(argc, argv, "--phase-trunc", "0")); UW.tkap = (float)atof(opt(argc, argv, "--phase-trunc-conf", "0.5")); const int trunc_from = atoi(opt(argc, argv, "--phase-trunc-from", "0"));
+    uint8_t *d_pv = nullptr, *d_w4 = nullptr, *d_wc = nullptr, *d_ikt = nullptr, *d_ikm = nullptr;
+    if (wuw > 0 || wik > 0) {
+        const size_t sp = (size_t)HZ * P * P, gg = (size_t)P * P * P;
+        static const uint8_t w1[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+        UW.sidet = nn_malloc(2 * sp); UW.sidem = nn_malloc(sp); UW.nt = nn_malloc(7 * sp); UW.nm = nn_malloc(sp);
+        UW.sidew = nn_malloc(8); UW.nw = nn_malloc(8); UW.onew = nn_malloc(8); nn_h2d(UW.sidew, w1, 8); nn_h2d(UW.nw, w1, 8); nn_h2d(UW.onew, w1, 8);
+        UW.ds = nn_malloc(64 * sizeof(double)); UW.w4ds = nn_malloc(nn_wind4_sums()); UW.w4fin = nn_malloc(nn_wind4_scratch() + 64);
+        UW.sscr = nn_malloc(nn_loss_scratch((shape5){1, 2, P, P, P}) + 64); UW.nscr = nn_malloc(nn_loss_scratch((shape5){1, 7, P, P, P}) + 64); UW.iscr = nn_malloc(nn_loss_scratch((shape5){1, 1, P, P, P}) + 64);
+        if (wuw > 0) { d_pv = nn_malloc(gg); d_w4 = nn_malloc(gg); d_wc = nn_malloc(gg); }
+        if (wik > 0) { d_ikt = nn_malloc(gg); d_ikm = nn_malloc(gg); }
+        Dd->uw = wuw > 0; Dd->ikp = wik > 0;
+    }
     dr_mlp2 IH; dr_mlp2_layout(&IH, ED, 384, 32);
     float *ip = nn_malloc(IH.n * 4), *ipt = nn_malloc(IH.n * 4), *igr = nn_malloc(IH.n * 4), *im_ = nn_malloc(IH.n * 4), *iv_ = nn_malloc(IH.n * 4), *imo = nn_malloc(IH.n * 4);
     { float *b = calloc(IH.n, 4); uint64_t r3 = seed * 43 + 3; for (size_t i = IH.w1; i < IH.b1; i++) b[i] = (float)(0.02 * sqrt(-2 * log(rng_u(&r3) + 1e-12)) * cos(6.283185307 * rng_u(&r3)));
@@ -693,16 +874,16 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     const int NG = Dd->ngt; int *d_idx = nn_malloc((size_t)NG * 4), *d_code = nn_malloc((size_t)NG * 4), *d_xyz = nn_malloc((size_t)NG * 12);
     float *es = nn_malloc((size_t)NG * ED * 4), *ns = nn_malloc((size_t)NG * 4), *ga = nn_malloc((size_t)NG * ED * 4), *scr = nn_malloc(((size_t)2 * NG + 16) * 4);
     float *tgrad = nullptr; size_t tgn = 0;   /* token gradient [S][C] of the current view */
-    float *glz = nn_malloc(l3 * ED * 4); nn_zero(glz, l3 * ED * 4);   /* the locals' (zero) dense logit gradient */
-    void *hsl = nn_malloc((size_t)ED * HZ * P * P * 2);
-    dn_hs HS = {.u = u, .hs = hsl, .Z = HZ, .P = P, .D = ED};
+    float *glz = nn_malloc(l3 * CO * 4); nn_zero(glz, l3 * CO * 4);   /* the locals' (zero) dense logit gradient */
+    void *hsl = nn_malloc((size_t)CO * HZ * P * P * 2);
+    dn_hs HS = {.u = u, .hs = hsl, .Z = HZ, .P = P, .D = ED, .CO = CO, .uw = (wuw > 0 || wik > 0) ? &UW : nullptr};
     nn_set_logits_h16(1); unet_set_head_ext(u, 1); unet_set_head_cb(u, dn_head_cb, &HS);
     /* resume (--resume CKPT, the watchdog relaunch): the network (weights, EMA teacher, optimiser state) from CKPT, the heads from CKPT.heads
        when their sizes match (a head whose shape changed, or a new one, starts fresh: trunk carried over); queues refill */
     int step0 = 0;
     { const char *rp_ = opt(argc, argv, "--resume", nullptr);
       if (rp_) {
-          step0 = unet_load(u, rp_);
+          step0 = dn_load_ckpt(u, rp_);
           if (step0 < 0) { fprintf(stderr, "dino-train --recipe: cannot resume %s (another network configuration?)\n", rp_); return 1; }
           char hp_[1300]; snprintf(hp_, sizeof hp_, "%s.heads", rp_); FILE *hf = fopen(hp_, "rb");
           struct { float *p; size_t n; const char *nm; } hs[6] = {{D.p, D.H.n, "dino"}, {D.pt, D.H.n, "dino teacher"}, {wib > 0 ? I.p : nullptr, wib > 0 ? I.H.n : 0, "ibot"}, {wib > 0 ? I.pt : nullptr, wib > 0 ? I.H.n : 0, "ibot teacher"}, {rp, RH.n, "region"}, {ip, IH.n, "ink"}};
@@ -726,7 +907,11 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     unet_build(u, xsg, 1); unet_build(ul, xsl, 1);
     /* data ring (sources at the source window, identity geometry) */
     dn_ring *Rg = calloc(1, sizeof *Rg); Rg->D = Dd; Rg->seed = seed; Rg->nthreads = nthreads; pthread_mutex_init(&Rg->mu, nullptr); pthread_cond_init(&Rg->cv, nullptr);
-    for (int i = 0; i < DN_SLOTS; i++) { dn_sample *S = &Rg->slot[i]; S->ca = malloc(ps3); S->cb = malloc(ps3); S->gidx = malloc((size_t)NG * 4); S->gcode = malloc((size_t)NG * 4); S->gxyz = malloc((size_t)NG * 12); S->sidx = malloc(4); S->ayx = malloc((size_t)Ps * 8); S->ixyz = malloc((size_t)(Dd->nink > 0 ? Dd->nink : 1) * 12); }
+    for (int i = 0; i < DN_SLOTS; i++) { dn_sample *S = &Rg->slot[i]; S->ca = malloc(ps3); S->cb = malloc(ps3); S->gidx = malloc((size_t)NG * 4); S->gcode = malloc((size_t)NG * 4); S->gxyz = malloc((size_t)NG * 12); S->sidx = malloc(4); S->ayx = malloc((size_t)Ps * 8); S->ixyz = malloc((size_t)(Dd->nink > 0 ? Dd->nink : 1) * 12);
+        if (Dd->uw) { S->phw = malloc(ps3); for (int v = 0; v < 2; v++) { S->pv[v] = malloc(g3); S->w4[v] = malloc(g3); S->wc[v] = malloc(g3); } }
+        if (Dd->ikp) { S->ikw = malloc(ps3); for (int v = 0; v < 2; v++) { S->iv[v] = malloc(g3); S->im[v] = malloc(g3); } }
+        if ((Dd->uw && (!S->phw || !S->pv[1] || !S->w4[1] || !S->wc[1])) || (Dd->ikp && (!S->ikw || !S->iv[1] || !S->im[1]))) { fprintf(stderr, "dino-train --recipe: host memory for the dense targets\n"); return 1; } }
+    Dd->vP = P; Dd->vPL = PL; Dd->vnloc = nloc; Dd->zlo = zlo; Dd->zhi = zhi; Dd->lzlo = lzlo; Dd->lzhi = lzhi;   /* the views: drawn by the workers */
     Rg->nworkers = nwork > 8 ? 8 : nwork;
     for (int i = 0; i < Rg->nworkers; i++) pthread_create(&Rg->th[i], nullptr, ring_worker, Rg);
     signal(SIGTERM, dn_sig); signal(SIGINT, dn_sig);
@@ -736,6 +921,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             Ps, P, zlo, zhi, nloc, PL, lzlo, lzhi, cls_reg ? "register 0" : "grid mean", HH, HH, HB, K, sk_it, SQ, wk, KQ, wgt, tt0, tt1, tt_warm, ema0, ema1);
     uint64_t ar = seed * 1000003 + 99; int qfill = 0, qpos = 0, kfill = 0, kpos = 0;
     double sums[12] = {0}; int nsum = 0; double t_last = dn_now(), t_loop = dn_now(), t_meas0 = 0;
+    double dsum[5] = {0}; int dn_nuw = 0, dn_nik = 0; const int dense_from = atoi(opt(argc, argv, "--dense-from", "-1")) >= 0 ? atoi(opt(argc, argv, "--dense-from", "-1")) : step0;
     char stopf[1200]; snprintf(stopf, sizeof stopf, "%s/STOP", outd);
     const float gs = nn_get_grad_scale();
     const int terms = 2 + 2 * nloc;
@@ -755,16 +941,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
         /* views */
         dr_xf xf[2 + 16]; dr_int it[2 + 16];
         for (int v = 0; v < 2 + nloc; v++) {
-            dr_xf *t = &xf[v]; const int gl = v < 2; t->n = gl ? P : PL; t->src = 0;
-            const float lo = gl ? zlo : lzlo, hi = gl ? zhi : lzhi; const float z = expf(logf(lo) + (float)rng_u(&ar) * (logf(hi) - logf(lo)));
-            t->m = (int)lrintf(t->n * z); if (t->m > Ps) t->m = Ps; if (t->m < 8) t->m = 8;
-            for (int d = 0; d < 3; d++) {
-                int lo2 = 0, hi2 = Ps - t->m;
-                if (v == 1) { const int ov = (t->m < xf[0].m ? t->m : xf[0].m) / 4; const int a = xf[0].off[d] - t->m + ov, b = xf[0].off[d] + xf[0].m - ov; if (a > lo2) lo2 = a; if (b < hi2) hi2 = b; if (hi2 < lo2) hi2 = lo2; }
-                t->off[d] = lo2 + (int)(rng_u(&ar) * (hi2 - lo2 + 1)); if (t->off[d] > Ps - t->m) t->off[d] = Ps - t->m;
-            }
-            int pm[3] = {0, 1, 2}; for (int k = 2; k > 0; k--) { const int j = (int)(rng_next(&ar) % (uint64_t)(k + 1)); const int q = pm[k]; pm[k] = pm[j]; pm[j] = q; }
-            for (int d = 0; d < 3; d++) { t->perm[d] = pm[d]; t->flip[d] = (int)(rng_next(&ar) & 1); }
+            xf[v] = Sm->xf[v];   /* (crop, zoom, symmetry: drawn by the loader worker, which resampled the dense targets with it) */
             dr_int *a = &it[v]; memset(a, 0, sizeof *a);
             a->center = sr->center; a->scale = sr->scale; a->lo = 0.f; a->hi = 255.f;
             a->gamma = rng_u(&ar) < 0.25 ? expf((float)(2 * rng_u(&ar) - 1) * logf(1.25f)) : 1.f;
@@ -900,6 +1077,17 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             if (gl && masked[v]) { nn_h2d(imask, cellm[v], (size_t)GT * GT * GT); dr_mask_cells(xg + v * g3, P, TPS, imask, 0.f); }   /* (the teacher saw it unmasked) */
             unet_forward(n, x, gl ? xsg : xsl, 1);
             RP(4);
+            int dense_v = 0;
+            if (HS.uw) {   /* the dense heads of a global view: its targets up, pass 0 (statistics) over the slabs */
+                UW.uw = gl && wuw > 0 && Sm->uwv[v]; UW.ik = gl && wik > 0 && Sm->ikv;
+                const float rmp = dense_ramp > 0 ? fminf(fmaxf((float)(step - dense_from) / dense_ramp, 0.f), 1.f) : 1.f;
+                UW.lp = UW.ln = wuw * rmp; UW.lw4 = wuw * w4l * rmp; UW.lik = wik * rmp;
+                if (UW.uw) { nn_h2d(d_pv, Sm->pv[v], g3); nn_h2d(d_w4, Sm->w4[v], g3); nn_h2d(d_wc, Sm->wc[v], g3); UW.pv = d_pv; UW.w4 = d_w4; UW.wc = d_wc;
+                             UW.um = sr->um * (float)xf[v].m / (float)P; UW.trunc = UW.ttau > 0 && step >= trunc_from; }
+                if (UW.ik) { nn_h2d(d_ikt, Sm->iv[v], g3); nn_h2d(d_ikm, Sm->im[v], g3); UW.ik_t = d_ikt; UW.ik_m = d_ikm; }
+                dense_v = UW.uw || UW.ik;
+                if (dense_v) dn_uw_stats(&HS);
+            }
             int Sv = 0; const float *tok = unet_tokens(n, nullptr, &Sv, nullptr, nullptr);
             if (cls_reg) nn_d2d(clsS, tok, (size_t)C * 4); else dr_pool_fwd(tok, 1, Sv, C, nreg, clsS);
             if (dr_head_fwd(&D.H, D.p, clsS, 1, sl, &D.w)) return 1;
@@ -967,6 +1155,13 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             if (gl) unet_backward(u, glz); else unet_backward(ul, glz);
             RP(6);
             unet_set_token_grad(n, nullptr);
+            if (dense_v) {   /* the dense heads' losses of this view (pass 0's statistics) */
+                if (UW.uw) { float o2[5], o7[15], w4h[8]; nn_loss_fetch(UW.sscr, (shape5){1, 2, 1, 1, 1}, o2); nn_loss_fetch(UW.nscr, (shape5){1, 7, 1, 1, 1}, o7); nn_d2h(w4h, UW.w4fin, sizeof w4h);
+                             double nb = 0; for (int c = 0; c < 7; c++) nb += o7[c];
+                             dsum[0] += 0.5 * (o2[0] + o2[1]); dsum[1] += nb / 7; dsum[2] += w4h[0]; dsum[3] += w4h[1]; dn_nuw++; }
+                if (UW.ik) { float o1[3]; nn_loss_fetch(UW.iscr, (shape5){1, 1, 1, 1, 1}, o1); dsum[4] += o1[0]; dn_nik++; }
+                UW.uw = UW.ik = 0;
+            }
             nn_d2h(hout, outs, 40 * 4);
             lsum[0] += hout[16]; if (gl) { lsum[1] += hout[17]; lsum[2] += HS.ngt ? hout[20] : 0.f; lsum[3] += HS.ngt ? hout[24] : 0.f; lsum[4] += masked[v] ? hout[28] : 0.f; }
             if (gl && wk > 0) { nn_d2d(kq + (size_t)kpos * C, clsS, (size_t)C * 4); kpos = (kpos + 1) % KQ; if (kfill < KQ) kfill++; }
@@ -1011,12 +1206,15 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             double Hr = 0, Hm = 0; for (int k = 0; k < K; k++) { const double a = qh[k], m = 0.5 * (qh[k] + qh[K + k]); if (a > 0) Hr -= a * log(a); if (m > 0) Hm -= m * log(m); }
             free(qh);
             const double now = dn_now(), dt = (now - t_last) / nsum;
-            char line[768];
+            char line[1024];
             /* prototype usage: distinct teacher-argmax prototypes since the last reset (every --usage-window steps; DINO sees 2 rows per step) */
             const int uwin = atoi(opt(argc, argv, "--usage-window", "5000")), rst = uwin > 0 && step % uwin < log_every;
             int ud = 0, ui = 0; for (int k = 0; k < K; k++) { ud += useb[k]; if (rst) useb[k] = 0; } for (int k = 0; k < KI && wib > 0; k++) { ui += useib[k]; if (rst) useib[k] = 0; }
             snprintf(line, sizeof line, "step %d dino %.4f ibot %.4f (%.0f tokens) obj %.4f region %.4f ink %.4f koleo %.4f gt %.4f var %.4f | H(t) %.2f H(mean) %.2f (max %.2f) | protos used %d / %d, ibot %d / %d | tt %.3f ema %.5f | gnorm %.3f | %.0f ms/step %.1f Mvox/s",
                      step, sums[0] / nsum, sums[5] / nsum, sums[6] / nsum, sums[7] / nsum, sums[8] / nsum, sums[9] / nsum, sums[1] / nsum, sums[2] / nsum, sums[3] / nsum, Hr, Hm, log((double)K), ud, K, ui, KI, tt, mom, sums[4] / nsum, dt * 1e3, (double)(2 * g3 + nloc * l3) / dt / 1e6);
+            if (HS.uw) { const size_t ln_ = strlen(line); snprintf(line + ln_, sizeof line - ln_, " | dense: phase %.4f nrm %.4f w4 %.4f acc %.3f (%d views) inkp %.4f (%d views)",
+                                     dn_nuw ? dsum[0] / dn_nuw : 0.0, dn_nuw ? dsum[1] / dn_nuw : 0.0, dn_nuw ? dsum[2] / dn_nuw : 0.0, dn_nuw ? dsum[3] / dn_nuw : 0.0, dn_nuw, dn_nik ? dsum[4] / dn_nik : 0.0, dn_nik);
+                         memset(dsum, 0, sizeof dsum); dn_nuw = dn_nik = 0; }
             fprintf(stderr, "%s\n", line); if (lf) { fprintf(lf, "%s\n", line); fflush(lf); }
             memset(sums, 0, sizeof sums); nsum = 0; t_last = dn_now();
             if (prof) { fprintf(stderr, "  phases (ms/step): data %.1f views %.1f teacher %.1f head+sinkhorn %.1f student fwd %.1f head/losses %.1f bwd %.1f head optim %.1f unet optim %.1f other %.1f\n",
@@ -1026,7 +1224,8 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
         }
         if (step % save_every == 0 || step == steps || g_dn_stop) {
             char cp[1200], ex[256]; snprintf(cp, sizeof cp, "%s/step%06d.ckpt", outd, step);
-            snprintf(ex, sizeof ex, "\"task\":\"dino\",\"recipe\":1,\"embed_dim\":%d", ED);
+            if (CO >= ED + 12) snprintf(ex, sizeof ex, "\"task\":\"dino\",\"recipe\":1,\"embed_dim\":%d,\"dense\":{\"phase\":%d,\"normals\":%d,\"wind4\":%d,\"ink_prob\":%d}", ED, ED, ED + 2, ED + 9, ED + 11);
+            else snprintf(ex, sizeof ex, "\"task\":\"dino\",\"recipe\":1,\"embed_dim\":%d", ED);
             if (unet_save(u, cp, step, ex)) fprintf(stderr, "dino-train: cannot save %s\n", cp);
             char hpth[1300]; snprintf(hpth, sizeof hpth, "%s.heads", cp);   /* DINO head (student, teacher), then the iBOT head's */
             FILE *hf = fopen(hpth, "wb");
@@ -1094,7 +1293,11 @@ int cmd_dino_train(int argc, char **argv) {
     if (load_sources(srcf, Dd, nthreads)) return 1;
     const int axis_in = atoi(opt(argc, argv, "--axis-input", "0")); const float ars = (float)atof(opt(argc, argv, "--axis-rs", "0.001"));   /* the axis-distance channel and its scale */
     if (axis_in) for (int i = 0; i < Dd->nsrc; i++) if (!Dd->src[i].axz) { fprintf(stderr, "dino-train: --axis-input needs \"axis\" in every source (%s)\n", Dd->src[i].name); return 2; }
-    unet_cfg cfg = {0}; cfg.cin = axis_in ? 2 : 1; cfg.cout = ED; cfg.G = 8; cfg.down_norm = fp32 ? 0 : 1;
+    unet_cfg cfg = {0}; cfg.cin = axis_in ? 2 : 1; cfg.cout = ED; cfg.G = 8;
+    if (recipe && (atof(opt(argc, argv, "--unwrap2", "0")) > 0 || atof(opt(argc, argv, "--ink-prob", "0")) > 0)) {   /* dense heads after the embedding (dn_uw) */
+        if (ED != 32) { fprintf(stderr, "dino-train --recipe: the dense heads need --dim 32\n"); return 2; }
+        cfg.cout = (ED + 12 + 15) / 16 * 16;
+    } cfg.down_norm = fp32 ? 0 : 1;
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,96,128,192")); for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "dino-train: P must be a multiple of %d\n", 1 << (cfg.nlev - 1)); return 2; }
     {   /* the bottleneck transformer stage (src/attn.h) */
@@ -1114,7 +1317,7 @@ int cmd_dino_train(int argc, char **argv) {
     if (getenv("UFSM_MEM_DRY") && ufsm_env_on("UFSM_MEM_DRY")) {   /* the network's training bytes at this window (dry build) + this trainer's buffers */
         unet_set_head_ext(u, HZ > 0);
         const size_t p3d = (size_t)P * P * P, tb = unet_train_bytes(u, (shape5){1, cfg.cin, P, P, P});
-        const size_t tr = 2 * p3d + p3d * 4 * cfg.cin + (HZ ? (size_t)ED * HZ * P * P * 2 : p3d * ED * 4);
+        const size_t tr = 2 * p3d + p3d * 4 * cfg.cin + (HZ ? (size_t)cfg.cout * HZ * P * P * 2 : p3d * cfg.cout * 4) + (cfg.cout > ED ? 5 * p3d + (size_t)11 * HZ * P * P : 0);   /* (+ the dense targets) */
         fprintf(stderr, "dino-train: UFSM_MEM_DRY: P %d, mem %s, head slabs %d, attention blocks %d: network %.2f GB (%.1f B per voxel), trainer buffers %.2f GB\n",
                 P, mem, HZ, cfg.attn_blocks, tb / 1e9, (double)tb / p3d, tr / 1e9);
         return 0;
@@ -1122,7 +1325,7 @@ int cmd_dino_train(int argc, char **argv) {
     if (!fp32 && ED <= 16 && atoi(opt(argc, argv, "--fp16-logits", "0"))) unet_set_fp16_logits(u, 1);   /* (the MX fp16-logit head takes <= 16 outputs) */
     int step0 = 0;
     const char *resume = opt(argc, argv, "--resume", nullptr);
-    if (resume) { step0 = unet_load(u, resume); if (step0 < 0) { fprintf(stderr, "dino-train: cannot resume %s\n", resume); return 1; } }
+    if (resume && !recipe) { step0 = unet_load(u, resume); if (step0 < 0) { fprintf(stderr, "dino-train: cannot resume %s\n", resume); return 1; } }   /* (the recipe loads its own) */
     if (recipe) {
         if (!HZ) { fprintf(stderr, "dino-train --recipe: needs --head-slab Z (and MX storage)\n"); return 2; }
         return dn_recipe(u, &cfg, Dd, argc, argv, P, steps, minutes, outd, nthreads, nwork, seed, HZ);
@@ -1148,7 +1351,7 @@ int cmd_dino_train(int argc, char **argv) {
     float *es_s = nn_malloc((size_t)NS * ED * 4), *et_s = nn_malloc((size_t)NS * ED * 4), *ns_s = nn_malloc((size_t)NS * 4), *nt_s = nn_malloc((size_t)NS * 4), *ga_s = nn_malloc((size_t)NS * ED * 4);
     float *scr_sc = nn_malloc(((size_t)2 * NG + 16) * 4), *scr_dn = nn_malloc(dn_dino_scratch(NS, K)), *outs = nn_malloc(64 * 4);
     if (!gl || !x || !scr_dn || (HZ && !hsl)) { fprintf(stderr, "dino-train: device allocation failed\n"); return 1; }
-    dn_hs HS = {.u = u, .hs = hsl, .Z = HZ, .P = P, .D = ED};
+    dn_hs HS = {.u = u, .hs = hsl, .Z = HZ, .P = P, .D = ED, .CO = ED};
     if (HZ) { nn_set_logits_h16(1); unet_set_head_ext(u, 1); unet_set_head_cb(u, dn_head_cb, &HS); unet_build(u, (shape5){1, cfg.cin, P, P, P}, 1); }
     /* data ring */
     dn_ring *R = calloc(1, sizeof *R); R->D = Dd; R->seed = seed; R->nthreads = nthreads; pthread_mutex_init(&R->mu, nullptr); pthread_cond_init(&R->cv, nullptr);
@@ -1309,7 +1512,7 @@ int cmd_dino_embed(int argc, char **argv) {
     int8_t *e = dn_embed_box(u, ct, box, P, atoi(opt(argc, argv, "--halo", "32")), c, s, 8, atoi(opt(argc, argv, "--ema", "1")), axz, (float)atof(opt(argc, argv, "--axis-rs", "0.001")));
     if (!e) return 1;
     const double t1 = dn_now();
-    if (dv_write_dense_box(argv[5], z3_meta_of(ct)->shape, box, cfg.cout, e)) return 1;
+    if (dv_write_dense_box(argv[5], z3_meta_of(ct)->shape, box, dn_embed_dim(&cfg), e)) return 1;
     fprintf(stderr, "dino-embed: %lld x %lld x %lld voxels in %.1f s (%.1f Mvox/s network + read), written in %.1f s\n", b[3], b[4], b[5], t1 - t0, (double)b[3] * b[4] * b[5] / (t1 - t0) / 1e6, dn_now() - t1);
     free(e);
     return 0;
