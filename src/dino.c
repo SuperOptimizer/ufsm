@@ -1461,6 +1461,10 @@ int cmd_dino_train(int argc, char **argv) {
     dn_precision(fp32);
     if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
     dn_precision_after_init(fp32);
+    /* the fp16 gradient scale (train's --gscale, default 1024): the backward keeps activation / logit gradients scaled by it and divides the
+       parameter gradients back. Unset it was 1, and the dense heads' per-voxel loss gradients (~1e-9 on a densely labelled Paris 4 window)
+       underflowed fp16 to exactly zero: those heads never learned there */
+    if (!fp32) nn_set_grad_scale((float)atof(opt(argc, argv, "--gscale", "1024")));
     if (load_sources(srcf, Dd, nthreads)) return 1;
     const int axis_in = atoi(opt(argc, argv, "--axis-input", "0")); const float ars = (float)atof(opt(argc, argv, "--axis-rs", "0.001"));   /* the axis-distance channel and its scale */
     if (axis_in) for (int i = 0; i < Dd->nsrc; i++) if (!Dd->src[i].axz) { fprintf(stderr, "dino-train: --axis-input needs \"axis\" in every source (%s)\n", Dd->src[i].name); return 2; }
