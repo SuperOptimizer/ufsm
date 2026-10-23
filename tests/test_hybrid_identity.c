@@ -83,6 +83,13 @@ int main(void) {
     printf("checkpoint: step %d, attn_blocks %d pe %d reg %d mlp %d, logits differ in %zu%s\n", ls, pc.attn_blocks, pc.attn_pe, pc.attn_reg, pc.attn_mlp, neq,
            ls == 7 && pc.attn_blocks == 2 && pc.attn_reg == 2 && !neq ? "" : "  FAIL");
     bad += !(ls == 7 && pc.attn_blocks == 2 && pc.attn_reg == 2 && !neq);
+    {   /* a warm start (unet_init_from_map) of a hybrid from a hybrid checkpoint copies the attention stage: the same logits */
+        unet *u4 = unet_create(&c1); unet_init(u4, 99);
+        const int n = unet_init_from_map(u4, path, nullptr);
+        nn_set_sr_step(100); l = unet_forward(u4, x, xs, 1); float *f = logits_f32(u4, l, nl);
+        size_t nd = 0; for (size_t i = 0; i < nl; i++) nd += memcmp(f + i, e + i, 4) != 0;
+        printf("warm start: %d layers copied, logits differ in %zu%s\n", n, nd, nd ? "  FAIL" : ""); bad += nd != 0;
+    }
     unlink(path);
     printf(bad ? "test_hybrid_identity: %d FAILED\n" : "test_hybrid_identity: all passed\n", bad);
     return bad != 0;

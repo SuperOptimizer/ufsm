@@ -1012,7 +1012,9 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             free(qh);
             const double now = dn_now(), dt = (now - t_last) / nsum;
             char line[768];
-            int ud = 0, ui = 0; for (int k = 0; k < K; k++) { ud += useb[k]; useb[k] = 0; } for (int k = 0; k < KI && wib > 0; k++) { ui += useib[k]; useib[k] = 0; }
+            /* prototype usage: distinct teacher-argmax prototypes since the last reset (every --usage-window steps; DINO sees 2 rows per step) */
+            const int uwin = atoi(opt(argc, argv, "--usage-window", "5000")), rst = uwin > 0 && step % uwin < log_every;
+            int ud = 0, ui = 0; for (int k = 0; k < K; k++) { ud += useb[k]; if (rst) useb[k] = 0; } for (int k = 0; k < KI && wib > 0; k++) { ui += useib[k]; if (rst) useib[k] = 0; }
             snprintf(line, sizeof line, "step %d dino %.4f ibot %.4f (%.0f tokens) obj %.4f region %.4f ink %.4f koleo %.4f gt %.4f var %.4f | H(t) %.2f H(mean) %.2f (max %.2f) | protos used %d / %d, ibot %d / %d | tt %.3f ema %.5f | gnorm %.3f | %.0f ms/step %.1f Mvox/s",
                      step, sums[0] / nsum, sums[5] / nsum, sums[6] / nsum, sums[7] / nsum, sums[8] / nsum, sums[9] / nsum, sums[1] / nsum, sums[2] / nsum, sums[3] / nsum, Hr, Hm, log((double)K), ud, K, ui, KI, tt, mom, sums[4] / nsum, dt * 1e3, (double)(2 * g3 + nloc * l3) / dt / 1e6);
             fprintf(stderr, "%s\n", line); if (lf) { fprintf(lf, "%s\n", line); fflush(lf); }

@@ -3983,6 +3983,18 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
             nn_d2d(arr + a->n2.gamma, arr + u->enc[i].n2.gamma, (size_t)a->n2.c * 4); nn_d2d(arr + a->n2.beta, arr + u->enc[i].n2.beta, (size_t)a->n2.c * 4);
         }
     }
+    if (u->tbn && o->tbn && u->tbd.C == o->tbd.C && u->tbd.F == o->tbd.F && u->cfg.attn_pe == o->cfg.attn_pe) {   /* the attention stage: PEG, registers
+                                                     (the common count) and the common blocks (the donor's first ones) */
+        for (int e = 0; e < 2; e++) {
+            float *dst = e ? u->ema : u->p; const float *sp = e ? o->ema : o->p; const size_t C = u->tbd.C;
+            if (u->cfg.attn_pe == 0) { nn_d2d(dst + u->peg_w, sp + o->peg_w, C * 27 * 4); nn_d2d(dst + u->peg_b, sp + o->peg_b, C * 4); }
+            const int nr = u->cfg.attn_reg < o->cfg.attn_reg ? u->cfg.attn_reg : o->cfg.attn_reg;
+            if (nr) nn_d2d(dst + u->reg_off, sp + o->reg_off, (size_t)nr * C * 4);
+            const int nb = u->tbn < o->tbn ? u->tbn : o->tbn;
+            for (int k = 0; k < nb; k++) nn_d2d(dst + u->tbp[k].ln1g, sp + o->tbp[k].ln1g, at_block_nparams(&u->tbd) * 4);   /* (one contiguous block) */
+        }
+        n += (u->tbn < o->tbn ? u->tbn : o->tbn) + 1;
+    }
     unet_free(o);
     nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4);
     if (u->muon_mom) nn_zero(u->muon_mom, u->np * 4);
