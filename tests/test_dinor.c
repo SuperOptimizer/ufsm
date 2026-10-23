@@ -617,10 +617,59 @@ static int test_pool(void) {
     return bad;
 }
 
+
+/* stream ordering of the SSL head path (dino-train runs every head / target / KoLeo kernel and its copies on the default stream; the loader
+   uploads on the copy stream with events): the head forward, Sinkhorn / centred targets and the backward at a realistic size, with ~0.1 s of
+   unrelated default-stream work still in flight and the input arriving (a) by an async device copy queued behind that work and (b) by the
+   loader's copy-stream upload + event; results read back without any explicit synchronisation must match the double reference and the fully
+   synchronised run bit for bit */
+static int test_head_async(void) {
+    dr_head h; dr_head_layout(&h, 96, 256, 64, 4096); const int R = 64; printf("head async: Cin %d H %d B %d K %d, %d rows\n", h.Cin, h.H, h.B, h.K, R);
+    double *P = malloc(h.n * 8), *x = malloc((size_t)R * h.Cin * 8), *ref = malloc((size_t)R * h.K * 8);
+    for (size_t i = 0; i < h.n; i++) P[i] = rf(0.1 * nrand());
+    for (int k = 0; k < h.K; k++) P[h.g + k] = rf(1 + 0.2 * nrand());
+    for (int i = 0; i < R * h.Cin; i++) x[i] = rf(nrand());
+    ref_head(&h, P, x, R, ref);
+    const size_t NB = (size_t)64 << 20; float *big = nn_malloc(NB * 4), *big2 = nn_malloc(NB * 4); nn_zero(big, NB * 4); nn_zero(big2, NB * 4);
+    float *Pd = dev(P, h.n), *xs = dev(x, (size_t)R * h.Cin), *xd = nn_malloc((size_t)R * h.Cin * 4), *lg = nn_malloc((size_t)R * h.K * 4), *q = nn_malloc((size_t)R * h.K * 4);
+    float *dl = nn_malloc((size_t)R * h.K * 4), *dx = nn_malloc((size_t)R * h.Cin * 4), *Gd = nn_malloc(h.n * 4), *cen = nn_malloc((size_t)h.K * 4);
+    void *sc = nn_malloc(dr_sk_scratch(R, h.K)), *wb = nn_malloc(dr_hws_bytes(&h, R)); dr_hws w; dr_hws_carve(&w, &h, R, wb);
+    float *xh = nn_host_alloc((size_t)R * h.Cin * 4); for (int i = 0; i < R * h.Cin; i++) xh[i] = (float)x[i];
+    void *ev = nn_event_create();
+    float *base_l = malloc((size_t)R * h.K * 4), *base_q = malloc((size_t)R * h.K * 4), *base_c = malloc((size_t)h.K * 4), *base_dx = malloc((size_t)R * h.Cin * 4), *base_g = malloc(h.n * 4);
+    float *l2 = malloc((size_t)R * h.K * 4), *q2 = malloc((size_t)R * h.K * 4), *c2 = malloc((size_t)h.K * 4), *dx2 = malloc((size_t)R * h.Cin * 4), *g2 = malloc(h.n * 4);
+    int bad = 0;
+    for (int mode = 0; mode < 3; mode++) {   /* 0 synchronised baseline, 1 async device copy, 2 copy-stream upload + event */
+        nn_zero(xd, (size_t)R * h.Cin * 4); nn_zero(Gd, h.n * 4); nn_zero(cen, (size_t)h.K * 4); nn_sync();
+        if (mode) for (int i = 0; i < 40; i++) dr_ema(i & 1 ? big2 : big, i & 1 ? big : big2, NB, 0.9f);   /* in flight */
+        if (mode == 2) { nn_event_record(ev, 0); nn_stream_wait(1, ev); nn_h2d_copy_stream(xd, xh, (size_t)R * h.Cin * 4); nn_event_record(ev, 1); nn_stream_wait(0, ev); }
+        else nn_d2d_async(xd, xs, (size_t)R * h.Cin * 4);
+        if (!mode) nn_sync();
+        dr_head_fwd(&h, Pd, xd, R, lg, &w);
+        dr_center_update(cen, lg, R, h.K, 0.9f);
+        dr_teacher_probs(lg, R, h.K, 0.05f, 3, nullptr, q, sc);
+        nn_d2d_async(dl, q, (size_t)R * h.K * 4);   /* (any d loss / d logits: the targets themselves) */
+        dr_head_bwd(&h, Pd, Gd, xd, dl, R, dx, 1, &w);
+        float *ol = mode ? l2 : base_l, *oq = mode ? q2 : base_q, *oc = mode ? c2 : base_c, *odx = mode ? dx2 : base_dx, *og = mode ? g2 : base_g;
+        nn_d2h(ol, lg, (size_t)R * h.K * 4); nn_d2h(oq, q, (size_t)R * h.K * 4); nn_d2h(oc, cen, (size_t)h.K * 4); nn_d2h(odx, dx, (size_t)R * h.Cin * 4); nn_d2h(og, Gd, h.n * 4);
+        double e = 0; for (int i = 0; i < R * h.K; i++) e = fmax(e, fabs(ol[i] - ref[i]));
+        int diff = 0;
+        if (mode) diff = memcmp(l2, base_l, (size_t)R * h.K * 4) != 0 || memcmp(q2, base_q, (size_t)R * h.K * 4) != 0 || memcmp(c2, base_c, (size_t)h.K * 4) != 0
+                        || memcmp(dx2, base_dx, (size_t)R * h.Cin * 4) != 0 || memcmp(g2, base_g, h.n * 4) != 0;
+        const int fail = e > 2e-3 || diff;
+        printf("  mode %d (%s): logits max |gpu - double| %.2e, %s%s\n", mode, mode == 0 ? "synchronised" : mode == 1 ? "async device copy behind in-flight work" : "copy-stream upload + event",
+               e, mode ? (diff ? "differs from the synchronised run" : "bitwise equal to the synchronised run (logits, targets, centre, dx, grads)") : "baseline", fail ? "  FAIL" : "");
+        bad += fail;
+    }
+    free(P); free(x); free(ref); free(base_l); free(base_q); free(base_c); free(base_dx); free(base_g); free(l2); free(q2); free(c2); free(dx2); free(g2);
+    nn_free(big); nn_free(big2); nn_free(Pd); nn_free(xs); nn_free(xd); nn_free(lg); nn_free(q); nn_free(dl); nn_free(dx); nn_free(Gd); nn_free(cen); nn_free(sc); nn_free(wb); nn_host_free(xh);
+    return bad;
+}
+
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
     int bad = test_views() + test_head() + test_targets() + test_ce() + test_koleo() + test_koleo_q() + test_muon(64, 24) + test_muon(24, 64) + test_muon_ref(160, 24) + test_obj() + test_ink() + test_mlp2() + test_pool() + test_rownorm()
-              + test_sharp() + test_toy_dino() + test_nce() + test_nce_p() + test_toy_nce() + test_rows() + test_axis_view();   /* (the newer tests last: the older ones keep their random draws) */
+              + test_sharp() + test_toy_dino() + test_nce() + test_nce_p() + test_toy_nce() + test_rows() + test_axis_view() + test_head_async();   /* (the newer tests last: the older ones keep their random draws) */
     printf(bad ? "test_dinor: %d FAILED\n" : "test_dinor: all passed\n", bad);
     return bad != 0;
 }
