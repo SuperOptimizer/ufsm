@@ -814,6 +814,7 @@ typedef struct {
     /* iBOT (--ssl-ibot W): masked 8^3 cells of each global (prob 0.5, ratio 0.1-0.5, <= IM per view), the head features (channels
        --ssl-ibot-ch .. +32 of the output) at the cell centres vs the teacher's at the same physical points of the other global; iBOT head ->
        KI prototypes, Sinkhorn over all the batch's masked rows */
+    float cm, icm, *cen, *icen;   /* --ssl-center / --ssl-ibot-center M: DINOv1 centring (EMA of the batch's teacher logits) instead of Sinkhorn */
     float wib; int KI, IM, ich, TPS, GT_, cnt[64], off[64]; dn_head I; float *ieT, *inT, *ieS, *inS, *idE, *il, *iq, *isl, *idsl, *iw, *glzib; void *isk, *ice; int *d_hS, *d_hT, *iid, *hS, *hT; uint8_t *cellm, *d_mask; uint8_t *usei;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -856,6 +857,8 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
     Q->clsT = nn_malloc((size_t)2 * N * C * 4); Q->clsS = nn_malloc((size_t)C * 4); Q->dcls = nn_malloc((size_t)C * 4); Q->rsS = nn_malloc(16); Q->rsT = nn_malloc((size_t)2 * N * 4);
     Q->bank = nn_malloc((size_t)2 * N * C * 4); Q->bex = nn_malloc((size_t)N * C * 4); Q->outs = nn_malloc(16 * 4); Q->hout = malloc(16 * 4);
     Q->pS = nn_malloc(8); Q->pT = nn_malloc(8); Q->pW = nn_malloc(8); Q->use = calloc((size_t)Q->K, 1); Q->ar = seed * 977 + 31;
+    Q->cm = (float)atof(opt(argc, argv, "--ssl-center", "0")); Q->icm = (float)atof(opt(argc, argv, "--ssl-ibot-center", "0"));
+    Q->cen = nn_malloc((size_t)Q->K * 4); nn_zero(Q->cen, (size_t)Q->K * 4);
     Q->wib = (float)atof(opt(argc, argv, "--ssl-ibot", "0")); Q->KI = atoi(opt(argc, argv, "--ssl-ibot-protos", "8192")); Q->IM = atoi(opt(argc, argv, "--ssl-ibot-max", "512"));
     Q->ich = atoi(opt(argc, argv, "--ssl-ibot-ch", "0")); Q->TPS = 8; Q->GT_ = Q->PG / Q->TPS;
     if (Q->wib > 0) {
@@ -867,6 +870,7 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         Q->ice = nn_malloc(dr_ce_scratch(IM)); Q->iw = nn_malloc((size_t)IM * 4); Q->glzib = nn_malloc(g3 * CO * 4); nn_zero(Q->glzib, g3 * CO * 4);
         Q->d_hS = nn_malloc((size_t)2 * N * IM * 4); Q->d_hT = nn_malloc((size_t)2 * N * IM * 4); Q->hS = malloc((size_t)2 * N * IM * 4); Q->hT = malloc((size_t)2 * N * IM * 4);
         Q->iid = nn_malloc((size_t)R * 4); { int *h = malloc((size_t)R * 4); for (int i = 0; i < R; i++) h[i] = i; nn_h2d(Q->iid, h, (size_t)R * 4); free(h); }
+        Q->icen = nn_malloc((size_t)KI * 4); nn_zero(Q->icen, (size_t)KI * 4);
         Q->cellm = malloc((size_t)2 * N * Q->GT_ * Q->GT_ * Q->GT_); Q->d_mask = nn_malloc((size_t)Q->GT_ * Q->GT_ * Q->GT_); Q->usei = calloc((size_t)KI, 1);
         fprintf(stderr, "dino-train --ssl-ibot %g: masked %d^3 cells (<= %d per global), head channels %d..%d, iBOT head -> %d prototypes, Sinkhorn over the batch's masked rows\n", Q->wib, Q->TPS, IM, Q->ich, Q->ich + 31, KI);
     }
@@ -938,13 +942,15 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     unet_use_params(Q->ug, unet_live_params(Q->u));
     if (Q->cls_norm) dr_rownorm_fwd(Q->clsT, 2 * N, C, Q->clsT, Q->rsT);
     if (dr_head_fwd(&Q->H.H, Q->H.pt, Q->clsT, 2 * N, Q->tl, &Q->H.w)) return 1;
-    dr_teacher_probs(Q->tl, 2 * N, K, tt, Q->skit, nullptr, Q->tq, Q->sks);
+    if (Q->cm > 0) { dr_teacher_probs(Q->tl, 2 * N, K, tt, 0, Q->cen, Q->tq, Q->sks); dr_center_update(Q->cen, Q->tl, 2 * N, K, Q->cm); }
+    else dr_teacher_probs(Q->tl, 2 * N, K, tt, Q->skit, nullptr, Q->tq, Q->sks);
     { static int *am, *hm; if (!am) { am = nn_malloc(64 * 4); hm = malloc(64 * 4); } dr_argmax_rows(Q->tq, 2 * N, K, am); nn_d2h(hm, am, (size_t)2 * N * 4); for (int j = 0; j < 2 * N; j++) Q->use[hm[j]] = 1;
       dr_argmax_rows(Q->tl, 2 * N, K, am); nn_d2h(hm, am, (size_t)2 * N * 4);   /* (agreement on the raw teacher logits: Sinkhorn's equipartition over 2N << K rows keeps the targets' argmaxes apart) */
       int ag = 0; for (int i = 0; i < N; i++) ag += hm[2 * i] == hm[2 * i + 1]; Q->sums[2] += (double)ag / N; }
     if (Q->wib > 0 && R > 0) {   /* iBOT targets: the teacher head over all masked rows, Sinkhorn over them */
         if (dr_head_fwd(&Q->I.H, Q->I.pt, Q->ieT, R, Q->il, &Q->I.w)) return 1;
-        dr_teacher_probs(Q->il, R, Q->KI, tt, Q->skit, nullptr, Q->iq, Q->isk);
+        if (Q->icm > 0) { dr_teacher_probs(Q->il, R, Q->KI, tt, 0, Q->icen, Q->iq, Q->isk); dr_center_update(Q->icen, Q->il, R, Q->KI, Q->icm); }
+        else dr_teacher_probs(Q->il, R, Q->KI, tt, Q->skit, nullptr, Q->iq, Q->isk);
     }
     Q->sums[5] = R;
     nn_d2d(Q->bank, Q->clsT, (size_t)2 * N * C * 4);   /* KoLeo candidates: chunk v = rows 2 i + v (teacher now, the student's as computed) */
@@ -1007,13 +1013,13 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
 /* the SSL part of the log line: loss means, the teacher target entropy (mean over the batch's rows) and the prototype usage */
 static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
     const int R = 2 * Q->N, K = Q->K; float *q = malloc((size_t)R * K * 4); nn_d2h(q, Q->tq, (size_t)R * K * 4);
-    double H = 0, Hm = 0; double *mrow = calloc((size_t)K, 8);
-    for (int r = 0; r < R; r++) { double z = 0, h = 0; for (int k = 0; k < K; k++) z += q[(size_t)r * K + k]; for (int k = 0; k < K; k++) { const double a = q[(size_t)r * K + k] / z; mrow[k] += a / R; if (a > 0) h -= a * log(a); } H += h / R; }
+    double H = 0, Hm = 0, pmax = 0; double *mrow = calloc((size_t)K, 8);
+    for (int r = 0; r < R; r++) { double z = 0, h = 0, mx = 0; for (int k = 0; k < K; k++) z += q[(size_t)r * K + k]; for (int k = 0; k < K; k++) { const double a = q[(size_t)r * K + k] / z; mrow[k] += a / R; if (a > 0) h -= a * log(a); if (a > mx) mx = a; } H += h / R; pmax += mx / R; }
     for (int k = 0; k < K; k++) if (mrow[k] > 0) Hm -= mrow[k] * log(mrow[k]);
     int used = 0; for (int k = 0; k < K; k++) used += Q->use[k];
     if (Q->ure > 0 && step % Q->ure < 100) memset(Q->use, 0, (size_t)K);
     const size_t ln = strlen(line);
-    snprintf(line + ln, cap - ln, " | ssl: dino %.4f koleo %.4f H(t) %.2f H(mean) %.2f (max %.2f) agree %.3f protos used %d / %d", Q->nsum ? Q->sums[0] / Q->nsum : 0.0, Q->nsum ? Q->sums[1] / Q->nsum : 0.0, H, Hm, log((double)K), Q->nsum ? Q->sums[2] / Q->nsum : 0.0, used, K);
+    snprintf(line + ln, cap - ln, " | ssl: dino %.4f koleo %.4f H(t) %.2f H(mean) %.2f (max %.2f) pmax %.4f agree %.3f protos used %d / %d", Q->nsum ? Q->sums[0] / Q->nsum : 0.0, Q->nsum ? Q->sums[1] / Q->nsum : 0.0, H, Hm, log((double)K), pmax, Q->nsum ? Q->sums[2] / Q->nsum : 0.0, used, K);
     if (Q->wib > 0 && Q->sums[5] >= 4) {   /* iBOT: the mean target entropy of the last step's first 64 masked rows, the loss, rows per step */
         const int r = Q->sums[5] < 64 ? (int)Q->sums[5] : 64, KI = Q->KI; float *qi = malloc((size_t)r * KI * 4); nn_d2h(qi, Q->iq, (size_t)r * KI * 4); double Hi = 0;
         for (int a = 0; a < r; a++) { double z = 0, h = 0; for (int k = 0; k < KI; k++) z += qi[(size_t)a * KI + k]; for (int k = 0; k < KI; k++) { const double t = qi[(size_t)a * KI + k] / z; if (t > 0) h -= t * log(t); } Hi += h / r; }
