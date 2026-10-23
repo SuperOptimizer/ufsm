@@ -365,7 +365,7 @@ static void test_pair_loss(void) {
         nn_d2h(g, dg, n * 4);
         double mx = 0, gm = 0; for (size_t i = 0; i < n; i++) { mx = fmax(mx, fabs(g[i] - gr[i])); gm = fmax(gm, fabs(gr[i])); }
         CHECK(mx < 1e-4 * gm + 1e-9, "pair gradient (shift %d) vs double: max err %g (max |g| %g)", shift, mx, gm);
-        CHECK(s[8] > 0 && s[13] > 0 && s[11] / s[13] > -1 && s[11] / s[13] <= 1.0001, "pair stats: ds count %g, ssim blocks %g", s[8], s[13]);
+        CHECK(s[8] > 0 && s[13] == 0, "pair stats: ds count %g, ssim blocks %g (every 8^3 block holds an invalid voxel)", s[8], s[13]);
         if (!shift) for (int t = 0; t < 12; t++) {   /* central differences (the shift-min term switches branches: shift 0 only) */
             size_t i = (size_t)(urand() * n); const float h = 2e-3f, l0 = lg[i];
             lg[i] = l0 + h; nn_h2d(dlg, lg, n * 4); const double lp = pair_gpu(dlg, dlo, dhi, dco, N, &w, nullptr, dst, drd, s);
