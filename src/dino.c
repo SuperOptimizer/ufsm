@@ -815,7 +815,7 @@ typedef struct {
        --ssl-ibot-ch .. +32 of the output) at the cell centres vs the teacher's at the same physical points of the other global; iBOT head ->
        KI prototypes, Sinkhorn over all the batch's masked rows */
     float cm, icm, *cen, *icen; double dg[8];
-    int easy, ccen; float *cmean, *hmean; double st[8];   /* --ssl-easy-steps S: shared symmetry / no inversion / mild intensity until S; --ssl-cls-center: the batch mean CLS removed; st: per-step stats */   /* dg: the teacher-side diagnostics of the last 50th step (dn_ssl_diag) */   /* --ssl-center / --ssl-ibot-center M: DINOv1 centring (EMA of the batch's teacher logits) instead of Sinkhorn */
+    int easy, ccen, cstd; float *cmean, *hmean, *cistd, *histd, *cpre; double st[8];   /* cstd: --ssl-cls-std (per-dimension batch standardisation of the CLS) */   /* --ssl-easy-steps S: shared symmetry / no inversion / mild intensity until S; --ssl-cls-center: the batch mean CLS removed; st: per-step stats */   /* dg: the teacher-side diagnostics of the last 50th step (dn_ssl_diag) */   /* --ssl-center / --ssl-ibot-center M: DINOv1 centring (EMA of the batch's teacher logits) instead of Sinkhorn */
     float wib; int KI, IM, ich, TPS, GT_, cnt[64], off[64]; dn_head I; float *ieT, *inT, *ieS, *inS, *idE, *il, *iq, *isl, *idsl, *iw, *glzib; void *isk, *ice; int *d_hS, *d_hT, *iid, *hS, *hT; uint8_t *cellm, *d_mask; uint8_t *usei;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -859,7 +859,8 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
     Q->bank = nn_malloc((size_t)2 * N * Q->CC * 4); Q->bex = nn_malloc((size_t)N * Q->CC * 4); Q->outs = nn_malloc(16 * 4); Q->hout = malloc(16 * 4);
     Q->pS = nn_malloc(8); Q->pT = nn_malloc(8); Q->pW = nn_malloc(8); Q->use = calloc((size_t)Q->K, 1); Q->ar = seed * 977 + 31;
     Q->easy = atoi(opt(argc, argv, "--ssl-easy-steps", "0")); Q->ccen = atoi(opt(argc, argv, "--ssl-cls-center", "0"));
-    Q->cmean = nn_malloc((size_t)Q->CC * 4); Q->hmean = malloc((size_t)Q->CC * 4);
+    Q->cmean = nn_malloc((size_t)Q->CC * 4); Q->hmean = malloc((size_t)Q->CC * 4); Q->cstd = atoi(opt(argc, argv, "--ssl-cls-std", "0"));
+    Q->cistd = nn_malloc((size_t)Q->CC * 4); Q->histd = malloc((size_t)Q->CC * 4); Q->cpre = nn_malloc((size_t)Q->CC * 4);
     Q->cm = (float)atof(opt(argc, argv, "--ssl-center", "0")); Q->icm = (float)atof(opt(argc, argv, "--ssl-ibot-center", "0"));
     Q->cen = nn_malloc((size_t)Q->K * 4); nn_zero(Q->cen, (size_t)Q->K * 4);
     Q->wib = (float)atof(opt(argc, argv, "--ssl-ibot", "0")); Q->KI = atoi(opt(argc, argv, "--ssl-ibot-protos", "8192")); Q->IM = atoi(opt(argc, argv, "--ssl-ibot-max", "512"));
@@ -991,8 +992,13 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
         for (int a = 0; a < 2 * N; a++) { for (int i = 0; i < C; i++) Q->hmean[i] += ct[(size_t)a * C + i] / (2 * N);
             for (int b = a + 1; b < 2 * N; b++) { double x = 0, ya = 0, yb = 0; for (int i = 0; i < C; i++) { x += (double)ct[(size_t)a * C + i] * ct[(size_t)b * C + i]; ya += (double)ct[(size_t)a * C + i] * ct[(size_t)a * C + i]; yb += (double)ct[(size_t)b * C + i] * ct[(size_t)b * C + i]; }
                 const double cc = x / sqrt(ya * yb + 1e-30); if (a / 2 == b / 2) cs += cc; else { cd += cc; nd++; } } }
-        Q->st[0] += cs / N; Q->st[1] += nd ? cd / nd : 0; free(ct);
-        if (Q->ccen) { nn_h2d(Q->cmean, Q->hmean, (size_t)C * 4); for (int a = 0; a < 2 * N; a++) nn_axpy(Q->clsT + (size_t)a * C, -1.f, Q->cmean, (size_t)C); }   /* (the batch mean CLS removed: a constant shift) */
+        Q->st[0] += cs / N; Q->st[1] += nd ? cd / nd : 0;
+        if (Q->cstd) {   /* per-dimension batch standardisation (constants: the teacher batch's mean / std) */
+            for (int i = 0; i < C; i++) { double v = 0; for (int a = 0; a < 2 * N; a++) { const double d = ct[(size_t)a * C + i] - Q->hmean[i]; v += d * d; } Q->histd[i] = (float)(1.0 / sqrt(v / (2 * N) + 1e-4)); }
+            nn_h2d(Q->cmean, Q->hmean, (size_t)C * 4); nn_h2d(Q->cistd, Q->histd, (size_t)C * 4);
+            for (int a = 0; a < 2 * N; a++) dr_cols_affine(Q->clsT + (size_t)a * C, C, Q->cmean, Q->cistd);
+        } else if (Q->ccen) { nn_h2d(Q->cmean, Q->hmean, (size_t)C * 4); for (int a = 0; a < 2 * N; a++) nn_axpy(Q->clsT + (size_t)a * C, -1.f, Q->cmean, (size_t)C); }   /* (the batch mean CLS removed: a constant shift) */
+        free(ct);
     }
     if (dr_head_fwd(&Q->H.H, Q->H.pt, Q->clsT, 2 * N, Q->tl, &Q->H.w)) return 1;
     {   /* the head bottleneck z: same / other sample cosine */
@@ -1035,7 +1041,9 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
         int Sv = 0, nreg = 0; const float *tok = unet_tokens(n, nullptr, &Sv, nullptr, &nreg); (void)tok;
         dn_ssl_cls(Q, n, Q->clsS);
         if (Q->cls_norm) dr_rownorm_fwd(Q->clsS, 1, C, Q->clsS, Q->rsS);
-        if (Q->ccen) nn_axpy(Q->clsS, -1.f, Q->cmean, (size_t)C);
+        float *cpre = Q->cpre;   /* (the normed row before the batch transform, for the row-norm backward) */
+        if (Q->cstd) { nn_d2d(cpre, Q->clsS, (size_t)C * 4); dr_cols_affine(Q->clsS, C, Q->cmean, Q->cistd); }
+        else if (Q->ccen) nn_axpy(Q->clsS, -1.f, Q->cmean, (size_t)C);
         if (dr_head_fwd(&Q->H.H, Q->H.p, Q->clsS, 1, Q->sl, &Q->H.w)) return 1;
         int ps_[2] = {0, 0}, pt_[2] = {gl ? 2 * i + 1 - v : 2 * i, 2 * i + 1}; float pw_[2] = {wpair, wpair}; const int npair = gl ? 1 : 2;
         nn_h2d(Q->pS, ps_, 8); nn_h2d(Q->pT, pt_, 8); nn_h2d(Q->pW, pw_, 8);
@@ -1047,7 +1055,8 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             dr_koleo_q(Q->clsS, 1, Q->bex, m, C, Q->wk / (float)N, Q->dcls, Q->outs + 1);
             nn_d2d(Q->bank + (size_t)(2 * i + v) * C, Q->clsS, (size_t)C * 4);
         }
-        if (Q->ccen) nn_axpy(Q->clsS, 1.f, Q->cmean, (size_t)C);   /* (back to the normed row for its backward) */
+        if (Q->cstd) { dr_cols_scale(Q->dcls, C, Q->cistd); nn_d2d(Q->clsS, cpre, (size_t)C * 4); }   /* (through the batch transform; the normed row back) */
+        else if (Q->ccen) nn_axpy(Q->clsS, 1.f, Q->cmean, (size_t)C);   /* (back to the normed row for its backward) */
         if (Q->cls_norm) dr_rownorm_bwd(Q->dcls, Q->clsS, Q->rsS, 1, C, Q->dcls);
         if (Q->tgn < (size_t)Sv * CT) { nn_free(Q->tgrad); Q->tgn = (size_t)Sv * CT; Q->tgrad = nn_malloc(Q->tgn * 4); }
         nn_zero(Q->tgrad, (size_t)Sv * CT * 4);

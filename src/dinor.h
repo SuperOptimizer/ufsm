@@ -109,6 +109,9 @@ void dr_infonce_p(const float *Q, const float *P, int N, const float *Kn, int M,
 /* d / d raw features of unit rows e = r / |r| (gathered at voxel idx[i] from an [D][n] channel-major map) added into the fp32 map gl [D][n]
    (gl + c * n + idx[i]): (ge - e (e . ge)) w / nrm[i] (distinct idx) */
 void dr_scatter_unit_f32(const float *e, const float *ge, const float *nrm, const int *idx, int N, int D, size_t n, float w, float *gl);
+/* per-column affine of one row x [n]: x = (x - m) * is (forward), g = g * is (backward) */
+void dr_cols_affine(float *x, int n, const float *m, const float *is);
+void dr_cols_scale(float *g, int n, const float *is);
 /* rows by index: dst[i] = src[idx[i]] ([n][C]); scatter: dst[idx[i]] += scale src[i] (indices distinct) */
 void dr_rows_gather(const float *src, int C, const int *idx, int n, float *dst);
 void dr_rows_scatter_add(const float *src, const int *idx, int n, int C, float scale, float *dst);

@@ -739,3 +739,8 @@ __global__ void k_scatter_unit_f32(const float *e, const float *ge, const float 
 extern "C" void dr_scatter_unit_f32(const float *e, const float *ge, const float *nrm, const int *idx, int N, int D, size_t n, float w, float *gl) {
     if (N > 0) k_scatter_unit_f32<<<nbk((long long)N * 32, 256), 256>>>(e, ge, nrm, idx, N, D, n, w, gl);
 }
+
+__global__ void k_cols_affine(float *x, int n, const float *m, const float *is) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = (x[i] - m[i]) * is[i]; }
+__global__ void k_cols_scale(float *g, int n, const float *is) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) g[i] *= is[i]; }
+extern "C" void dr_cols_affine(float *x, int n, const float *m, const float *is) { k_cols_affine<<<nbk(n, 256), 256>>>(x, n, m, is); }
+extern "C" void dr_cols_scale(float *g, int n, const float *is) { k_cols_scale<<<nbk(n, 256), 256>>>(g, n, is); }
