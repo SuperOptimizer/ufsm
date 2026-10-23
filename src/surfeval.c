@@ -221,14 +221,27 @@ static void c1_bwd(const float *W, float *gW, float *gb, const float *x, shape5 
     }
     if (gb) se_bias_grad(gy, gb, xs.n, co, (long long)V);
 }
+/* the nn convs per sample (their batched paths assume one sample) */
+static void cv_fwd(const float *x, shape5 xs, const float *w, const float *b, int co, float *y) {
+    shape5 s1 = xs; s1.n = 1; const size_t xi = shape_numel(s1), yo = (size_t)co * xs.d * xs.h * xs.w;
+    for (int n = 0; n < xs.n; n++) nn_conv3d_fwd(x + n * xi, s1, w, b, co, 3, 1, y + n * yo);
+}
+static void cv_bwd_w(const float *x, shape5 xs, const float *gy, shape5 ys, float *gw, float *gb) {
+    shape5 a = xs, c = ys; a.n = c.n = 1; const size_t xi = shape_numel(a), yo = shape_numel(c);
+    for (int n = 0; n < xs.n; n++) nn_conv3d_bwd_weight(x + n * xi, a, gy + n * yo, c, 3, 1, gw, gb);
+}
+static void cv_bwd_d(const float *gy, shape5 ys, const float *w, shape5 xs, float *gx, float *scr) {
+    shape5 a = xs, c = ys; a.n = c.n = 1; const size_t xi = shape_numel(a), yo = shape_numel(c);
+    for (int n = 0; n < xs.n; n++) nn_conv3d_bwd_data(gy + n * yo, c, w, a, 3, 1, gx + n * xi, scr);
+}
 static void in_fwd(const se_dec *D, const se_in *n, const float *x, shape5 s, float *y, float *m, float *r) { nn_gn_fwd(x, s, s.c, 1e-5f, D->p + n->g, D->p + n->b, y, m, r); }
 static void block_fwd(const se_dec *D, const se_block *B, se_bact *a, const float *x) {
     const size_t no = shape_numel(a->so);
     a->x = (float *)x;
-    nn_conv3d_fwd(x, a->si, D->p + B->c1.w, D->p + B->c1.b, B->co, 3, 1, a->h1);
+    cv_fwd(x, a->si, D->p + B->c1.w, D->p + B->c1.b, B->co, a->h1);
     in_fwd(D, &B->n1, a->h1, a->so, a->n1, a->m1, a->r1);
     se_lrelu(a->n1, a->y, (long long)no, 0.01f);   /* (y: a1 scratch) */
-    nn_conv3d_fwd(a->y, a->so, D->p + B->c2.w, D->p + B->c2.b, B->co, 3, 1, a->h2);
+    cv_fwd(a->y, a->so, D->p + B->c2.w, D->p + B->c2.b, B->co, a->h2);
     in_fwd(D, &B->n2, a->h2, a->so, a->o, a->m2, a->r2);   /* o = IN(h2) */
     if (B->proj) { c1_fwd(D->p + B->pj.w, nullptr, x, a->si, B->co, a->y); in_fwd(D, &B->np, a->y, a->so, a->y, a->mp, a->rp); nn_axpy(a->o, 1.f, a->y, no); }
     else nn_axpy(a->o, 1.f, x, no);   /* o += residual */
@@ -240,12 +253,12 @@ static void block_bwd(se_dec *D, const se_block *B, se_bact *a, float *gy, float
     se_lrelu_bwd(a->o, gy, (long long)no, 0.01f);   /* gy: d / d o (= d / d n2 = d / d residual) */
     nn_gn_bwd(a->h2, a->so, a->so.c, D->p + B->n2.g, a->m2, a->r2, gy, g1, D->g + B->n2.g, D->g + B->n2.b, A->gnscr);   /* g1 = d / d h2 */
     se_lrelu(a->n1, g2, (long long)no, 0.01f);   /* a1 again */
-    nn_conv3d_bwd_weight(g2, a->so, g1, a->so, 3, 1, D->g + B->c2.w, D->g + B->c2.b);
-    nn_conv3d_bwd_data(g1, a->so, D->p + B->c2.w, a->so, 3, 1, g2, A->scr);   /* g2 = d / d a1 */
+    cv_bwd_w(g2, a->so, g1, a->so, D->g + B->c2.w, D->g + B->c2.b);
+    cv_bwd_d(g1, a->so, D->p + B->c2.w, a->so, g2, A->scr);   /* g2 = d / d a1 */
     se_lrelu_bwd(a->n1, g2, (long long)no, 0.01f);
     nn_gn_bwd(a->h1, a->so, a->so.c, D->p + B->n1.g, a->m1, a->r1, g2, g1, D->g + B->n1.g, D->g + B->n1.b, A->gnscr);   /* g1 = d / d h1 */
-    nn_conv3d_bwd_weight(a->x, a->si, g1, a->so, 3, 1, D->g + B->c1.w, D->g + B->c1.b);
-    nn_conv3d_bwd_data(g1, a->so, D->p + B->c1.w, a->si, 3, 1, gx, A->scr);
+    cv_bwd_w(a->x, a->si, g1, a->so, D->g + B->c1.w, D->g + B->c1.b);
+    cv_bwd_d(g1, a->so, D->p + B->c1.w, a->si, gx, A->scr);
     if (B->proj) {
         c1_fwd(D->p + B->pj.w, nullptr, a->x, a->si, B->co, g2);   /* (the projection conv output again: the IN backward's input) */
         nn_gn_bwd(g2, a->so, a->so.c, D->p + B->np.g, a->mp, a->rp, gy, g1, D->g + B->np.g, D->g + B->np.b, A->gnscr);
