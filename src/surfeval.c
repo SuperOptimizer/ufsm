@@ -362,7 +362,7 @@ static int se_gradcheck(void) {
     return bad > 3;
 }
 int cmd_surf_eval(int argc, char **argv) {
-    if (argc > 2 && !strcmp(argv[2], "--gradcheck")) { if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1; nn_set_tf32(1); return se_gradcheck(); }
+    if (argc > 2 && !strcmp(argv[2], "--gradcheck")) { if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1; if (getenv("SE_TF32")) nn_set_tf32(1); return se_gradcheck(); }
     const char *list = opt(argc, argv, "--cases", nullptr), *ck = opt(argc, argv, "--ckpt", nullptr), *out = opt(argc, argv, "--out", nullptr);
     if (!list || !ck || !out) {
         fprintf(stderr, "usage: ufsm surf-eval --cases LIST --ckpt dinovol.pt --out RUN_DIR [--P 128] [--batch 2] [--steps 5000] [--val-every 500] [--val-crops 2]\n"
@@ -377,7 +377,7 @@ int cmd_surf_eval(int argc, char **argv) {
     const int gpu = atoi(opt(argc, argv, "--gpu", "0"));
     if (P % 16 || NB < 1) { fprintf(stderr, "surf-eval: P a multiple of 16\n"); return 2; }
     if (nn_init(gpu) || xnet_init(gpu)) return 1;
-    nn_set_tf32(1);   /* fp32 tensors on the TF32 tensor-core convs */
+    if (getenv("SE_TF32")) nn_set_tf32(1);   /* (default: the plain fp32 conv kernels; the TF32 path reads 16-bit activations) */
     xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "6")) * 1e9));
     /* cases */
     FILE *lf = fopen(list, "r"); if (!lf) { fprintf(stderr, "surf-eval: cannot read %s\n", list); return 1; }
