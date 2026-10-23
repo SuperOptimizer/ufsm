@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 static char *slurp_file(const char *path, size_t *n) {
     FILE *f = fopen(path, "rb"); if (!f) return nullptr;
@@ -24,10 +25,12 @@ static json *load_json(const char *dir, const char *name) {
 
 void srpair_free(srpair *p) {
     if (!p) return;
+    if (p->tc) for (int k = 0; k < p->n; k++) { free(p->tc[k]); free(p->ic[k]); }
+    free(p->tc); free(p->ic);
     z3_close(p->in); z3_close(p->tg); free(p->tr); free(p->te); free(p);
 }
 
-srpair *srpair_open(const char *dir, const char *role, int lut) {
+srpair *srpair_open(const char *dir, const char *role, int lut, int cache) {
     srpair *p = calloc(1, sizeof *p);
     p->role = role && !strcmp(role, "val");
     if (role && strcmp(role, "val") && strcmp(role, "train")) { fprintf(stderr, "sr-pair: %s: role \"train\" or \"val\"\n", dir); free(p); return nullptr; }
@@ -66,17 +69,38 @@ srpair *srpair_open(const char *dir, const char *role, int lut) {
         fprintf(stderr, "sr-pair: %s: array shapes do not match %d boxes of %d^3 / %d^3\n", dir, p->n, p->B, p->T);
         srpair_free(p); return nullptr;
     }
+    if ((p->cache = cache != 0)) { p->tc = calloc((size_t)p->n, sizeof *p->tc); p->ic = calloc((size_t)p->n, sizeof *p->ic); }
     return p;
+}
+/* box k decoded (cache): read once, published with a compare-and-swap (a racing duplicate read is freed) */
+static const uint8_t *box_of(z3 *z, _Atomic(uint8_t *) *slot, int k, int e) {
+    uint8_t *b = atomic_load(slot); if (b) return b;
+    const size_t e3 = (size_t)e * e * e; b = malloc(e3); if (!b) return nullptr;
+    const int64_t o[3] = {(int64_t)k * e, 0, 0}, n[3] = {e, e, e};
+    if (z3_read(z, o, n, b, 1)) { free(b); return nullptr; }
+    uint8_t *exp = nullptr;
+    if (!atomic_compare_exchange_strong(slot, &exp, b)) { free(b); return exp; }
+    return b;
 }
 
 int srpair_read(const srpair *p, int k, const int oc[3], int P, uint8_t *tgt, uint8_t *coarse) {
     const int c = P / 4;
     if (P % 4 || c > p->B || k < 0 || k >= p->n) return -1;
     for (int d = 0; d < 3; d++) if (oc[d] < 0 || oc[d] + c > p->B) return -1;
+    const size_t p3 = (size_t)P * P * P;
+    if (p->cache) {   /* crops of the RAM copies */
+        const uint8_t *tb = box_of(p->tg, &p->tc[k], k, p->T), *ib = box_of(p->in, &p->ic[k], k, p->B);
+        if (!tb || !ib) return -1;
+        for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
+            const uint8_t *src = tb + ((size_t)(4 * oc[0] + z) * p->T + 4 * oc[1] + y) * p->T + 4 * oc[2]; uint8_t *dst = tgt + ((size_t)z * P + y) * P;
+            for (int x = 0; x < P; x++) dst[x] = p->lut[src[x]];
+        }
+        for (int z = 0; z < c; z++) for (int y = 0; y < c; y++) memcpy(coarse + ((size_t)z * c + y) * c, ib + ((size_t)(oc[0] + z) * p->B + oc[1] + y) * p->B + oc[2], (size_t)c);
+        return 0;
+    }
     const int64_t ot[3] = {(int64_t)k * p->T + 4 * oc[0], 4 * oc[1], 4 * oc[2]}, nt[3] = {P, P, P};
     const int64_t oi[3] = {(int64_t)k * p->B + oc[0], oc[1], oc[2]}, ni[3] = {c, c, c};
     if (z3_read(p->tg, ot, nt, tgt, 1) || z3_read(p->in, oi, ni, coarse, 1)) return -1;
-    const size_t p3 = (size_t)P * P * P;
     for (size_t i = 0; i < p3; i++) tgt[i] = p->lut[tgt[i]];
     return 0;
 }

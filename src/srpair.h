@@ -17,10 +17,13 @@ typedef struct srpair {
     int *tr, ntr, *te, nte; /* box indices of the training and validation draws */
     uint8_t lut[256];       /* target byte -> input-scale byte (0 kept, else clamped to 1..255) */
     double keV;             /* the target scan's energy (0 unknown), from boxes.json's target key ("...-77keV-...") */
+    int cache;              /* 1: decoded boxes stay in RAM (tc / ic, filled on first use): later windows of a box are crops of memory */
+    _Atomic(uint8_t *) *tc, *ic;
 } srpair;
 
-/* dir: the sr-pairs output directory; role "train" or "val"; lut 0: identity map (the targets as stored). nullptr on error (message printed) */
-srpair *srpair_open(const char *dir, const char *role, int lut);
+/* dir: the sr-pairs output directory; role "train" or "val"; lut 0: identity map (the targets as stored); cache 1: keep decoded boxes in RAM.
+   nullptr on error (message printed) */
+srpair *srpair_open(const char *dir, const char *role, int lut, int cache);
 void srpair_free(srpair *p);
 /* the host side of a window: target crop (P^3 at fine offset 4 oc) through the LUT and the input crop ((P / 4)^3 at native offset oc) of box k.
    P a multiple of 4, P / 4 <= B. 0 on success */

@@ -272,7 +272,7 @@ sources *sources_load(const char *path) {
         }
         const json *sj = json_get(e, "sr_pair");   /* a real SR pair directory (ufsm sr-pairs output) at "root" */
         if (sj) {
-            s->srp = srpair_open(json_str(json_get(e, "root"), "."), json_str(json_get(sj, "role"), "train"), (int)json_num(json_get(sj, "lut"), 1));
+            s->srp = srpair_open(json_str(json_get(e, "root"), "."), json_str(json_get(sj, "role"), "train"), (int)json_num(json_get(sj, "lut"), 1), (int)json_num(json_get(sj, "cache"), 0));
             if (!s->srp) { json_free(j); sources_free(S); return nullptr; }
             for (int l = 0; l < MAXLEV; l++) s->ct_present[l] = 0;
             for (int c = 0; c < NCH; c++) for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = 0;

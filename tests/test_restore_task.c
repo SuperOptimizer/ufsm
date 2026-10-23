@@ -429,9 +429,9 @@ static void test_pair_sampler(const char *tmp) {
     snprintf(p, sizeof p, "%s/intensity_map.json", d); f = fopen(p, "w"); fprintf(f, "{\"lut\":[");
     for (int v = 0; v < 256; v++) fprintf(f, "%s%.3f", v ? "," : "", 0.5 * v + 20); fprintf(f, "]}\n"); fclose(f);
     char js[600]; snprintf(js, sizeof js, "%s/pairs.json", tmp); f = fopen(js, "w");
-    fprintf(f, "{\"sources\":[{\"name\":\"pr\",\"root\":\"%s\",\"ct\":\"input.zarr\",\"um\":9.36,\"sr_pair\":{\"role\":\"train\"}}]}\n", d); fclose(f);
+    fprintf(f, "{\"sources\":[{\"name\":\"pr\",\"root\":\"%s\",\"ct\":\"input.zarr\",\"um\":9.36,\"sr_pair\":{\"role\":\"train\"}},{\"name\":\"prc\",\"root\":\"%s\",\"ct\":\"input.zarr\",\"um\":9.36,\"weight\":1,\"sr_pair\":{\"role\":\"train\",\"cache\":1}}]}\n", d, d); fclose(f);
     sources *S = sources_load(js);
-    CHECK(S && S->n == 1 && S->src[0].srp && S->src[0].srp->ntr == 2 && S->src[0].srp->nte == 1 && S->src[0].srp->keV == 77 && S->src[0].srp->lut[10] == 25 && S->src[0].srp->lut[0] == 0, "pair source");
+    CHECK(S && S->n == 2 && S->src[1].srp && S->src[1].srp->cache && S->src[0].srp && S->src[0].srp->ntr == 2 && S->src[0].srp->nte == 1 && S->src[0].srp->keV == 77 && S->src[0].srp->lut[10] == 25 && S->src[0].srp->lut[0] == 0, "pair source");
     if (!S || !S->src[0].srp) return;
     for (int val = 0; val < 2; val++) {
         sample_cfg c = sample_cfg_default(); c.P = P; c.B = 1; c.nworkers = 2; c.nbuf = 2; c.seed = 5; c.restore = 2; c.min_fg = 0.5; c.augment = 0; c.holdout = val; c.deterministic = 1;
@@ -446,7 +446,7 @@ static void test_pair_sampler(const char *tmp) {
             size_t bad = 0;
             for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
                 const uint8_t t = tg[(size_t)box * t3 + ((size_t)(4 * oc[0] + z) * T + 4 * oc[1] + y) * T + 4 * oc[2] + x];
-                bad += b->t[((size_t)z * P + y) * P + x] != (t ? S->src[0].srp->lut[t] : 0);
+                bad += b->t[((size_t)z * P + y) * P + x] != (t ? S->src[b->src[0]].srp->lut[t] : 0);
             }
             for (int z = 0; z < P / 4; z++) for (int y = 0; y < P / 4; y++) for (int x = 0; x < P / 4; x++)
                 bad += b->t[p3 + ((size_t)z * (P / 4) + y) * (P / 4) + x] != in[(size_t)box * b3 + ((size_t)(oc[0] + z) * B + oc[1] + y) * B + oc[2] + x];
