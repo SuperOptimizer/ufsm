@@ -73,7 +73,7 @@ __global__ void k_loss_sums(const float *lg, const uint8_t *lab, const uint8_t *
 }
 /* pass 2: d loss / d logits. L = CE_sum / count_all + mean_n (-dice_n) + mean_n (-rec_n), dice_n = (2 I + s) / (Sp + Sg + s),
    rec_n = (Ir + s) / (Sk + s) */
-__global__ void k_loss_grad(const float *lg, const uint8_t *lab, const uint8_t *sk, long long V, int N, const double *sums, double cnt_all, float sm, float *g) {
+__global__ void k_loss_grad(const float *lg, const uint8_t *lab, const uint8_t *sk, long long V, int N, const double *sums, double cnt_all, float sm, float *g) {   /* N: the mean's sample count (accumulated crops) */
     const int n = blockIdx.y;
     const double I = sums[n * 8 + 2], Sp = sums[n * 8 + 3], Sg = sums[n * 8 + 4], Sk = sums[n * 8 + 6], D = Sp + Sg + sm;
     for (long long v = blockIdx.x * (long long)blockDim.x + threadIdx.x; v < V; v += (long long)gridDim.x * blockDim.x) {
@@ -90,8 +90,8 @@ __global__ void k_loss_grad(const float *lg, const uint8_t *lab, const uint8_t *
 }
 extern "C" void se_loss_sums(const float *lg, const uint8_t *lab, const uint8_t *sk, int N, long long V, double *sums) {
     cudaMemsetAsync(sums, 0, (size_t)N * 8 * sizeof(double), 0); k_loss_sums<<<dim3(256, N), 256>>>(lg, lab, sk, V, sums); }
-extern "C" void se_loss_grad(const float *lg, const uint8_t *lab, const uint8_t *sk, int N, long long V, const double *sums, double cnt_all, float sm, float *g) {
-    k_loss_grad<<<dim3(256, N), 256>>>(lg, lab, sk, V, N, sums, cnt_all, sm, g); }
+extern "C" void se_loss_grad(const float *lg, const uint8_t *lab, const uint8_t *sk, int N, int Nmean, long long V, const double *sums, double cnt_all, float sm, float *g) {
+    k_loss_grad<<<dim3(256, N), 256>>>(lg, lab, sk, V, Nmean, sums, cnt_all, sm, g); }
 /* validation counts (threshold 0.5, valid voxels): [0] pred & truth, [1] pred, [2] truth, [3] pred & medial, [4] medial */
 __global__ void k_val_counts(const float *lg, const uint8_t *lab, const uint8_t *sk, long long V, unsigned long long *c) {
     const int n = blockIdx.y; unsigned long long a[5] = {0, 0, 0, 0, 0};

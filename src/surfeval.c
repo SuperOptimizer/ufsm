@@ -29,7 +29,7 @@ void se_tc_gather(const float *gy, float *tmp, int N, int Co, int d, int h, int 
 void se_tc_gbias(const float *tmp, float *gb, int N, int Co, long long V);
 void se_h2f_cl(const void *src, float *dst, long long S, int C);
 void se_loss_sums(const float *lg, const uint8_t *lab, const uint8_t *sk, int N, long long V, double *sums);
-void se_loss_grad(const float *lg, const uint8_t *lab, const uint8_t *sk, int N, long long V, const double *sums, double cnt_all, float sm, float *g);
+void se_loss_grad(const float *lg, const uint8_t *lab, const uint8_t *sk, int N, int Nmean, long long V, const double *sums, double cnt_all, float sm, float *g);
 void se_val_counts(const float *lg, const uint8_t *lab, const uint8_t *sk, int N, long long V, unsigned long long *c);
 void se_adamw(float *p, const float *g, float *m, float *v, long long n, float lr, float b1, float b2, float eps, float wd, int step, float gs);
 void se_sumsq(const float *g, long long n, double *out);
@@ -330,7 +330,7 @@ static double se_loss_value(se_acts *A, const uint8_t *dL, const uint8_t *dS, in
 }
 /* --gradcheck: a small decoder (pyramid 16 / 32 / 32 / 48 channels, 16^3, batch 2) on random features: analytic vs central differences */
 static int se_gradcheck(void) {
-    const int ch[4] = {16, 32, 32, 48}, N = 2, P = 16; se_dec D; dec_build(&D, 4, ch, N, P); se_acts A; acts_alloc(&A, &D);
+    const int ch[4] = {16, 32, 32, 48}, N = 1, P = 16; se_dec D; dec_build(&D, 4, ch, N, P); se_acts A; acts_alloc(&A, &D);
     const size_t V = (size_t)P * P * P; uint64_t rs = 5; float *f[4];
     for (int k = 0; k < 4; k++) { const int e = P >> k; const size_t n = (size_t)N * ch[k] * e * e * e; float *h = malloc(n * 4); for (size_t i = 0; i < n; i++) h[i] = (float)(2 * se_unif(&rs) - 1); f[k] = nm(n); nn_h2d(f[k], h, n * 4); free(h); }
     uint8_t *hL = malloc(N * V), *hS = malloc(N * V); for (size_t i = 0; i < N * V; i++) { const double u = se_unif(&rs); hL[i] = u < 0.1 ? 2 : u < 0.4 ? 1 : 0; hS[i] = hL[i] == 1 && se_unif(&rs) < 0.5; }
@@ -346,7 +346,7 @@ static int se_gradcheck(void) {
         #undef CHK
     }
     double hs[64]; nn_d2h(hs, dsum, (size_t)N * 64); double cnt = 0; for (int n = 0; n < N; n++) cnt += hs[n * 8 + 1];
-    se_loss_grad(A.lg, dL, dS, N, (long long)V, dsum, cnt, 1e-5f, A.glg); nn_zero(D.g, D.np * 4); dec_bwd(&D, &A, f);
+    se_loss_grad(A.lg, dL, dS, N, N, (long long)V, dsum, cnt, 1e-5f, A.glg); nn_zero(D.g, D.np * 4); dec_bwd(&D, &A, f);
     float *g = malloc(D.np * 4), *p = malloc(D.np * 4); nn_d2h(g, D.g, D.np * 4); nn_d2h(p, D.p, D.np * 4);
     int bad = 0; double maxrel = 0;
     for (int t = 0; t < 60; t++) {
@@ -370,12 +370,12 @@ int cmd_surf_eval(int argc, char **argv) {
                         "  the upstream kaggle_surfaces frozen-encoder decoder evaluation (see src/surfeval.c); LIST lines: train|val IMAGE.tif LABEL.tif\n");
         return 2;
     }
-    const int P = atoi(opt(argc, argv, "--P", "128")), N = atoi(opt(argc, argv, "--batch", "2")), steps = atoi(opt(argc, argv, "--steps", "5000"));
+    const int P = atoi(opt(argc, argv, "--P", "128")), N = 1, NB = atoi(opt(argc, argv, "--batch", "2")), steps = atoi(opt(argc, argv, "--steps", "5000"));
     const int vev = atoi(opt(argc, argv, "--val-every", "500")), vcr = atoi(opt(argc, argv, "--val-crops", "2")), vlim = atoi(opt(argc, argv, "--val-cases", "0"));
     const float lr = (float)atof(opt(argc, argv, "--lr", "1e-4")), wd = (float)atof(opt(argc, argv, "--wd", "1e-4")), clip = (float)atof(opt(argc, argv, "--clip", "12"));
     uint64_t rs = (uint64_t)atoll(opt(argc, argv, "--seed", "42")) * 0x9E3779B97F4A7C15ull + 7;
     const int gpu = atoi(opt(argc, argv, "--gpu", "0"));
-    if (P % 16 || N < 1) { fprintf(stderr, "surf-eval: P a multiple of 16\n"); return 2; }
+    if (P % 16 || NB < 1) { fprintf(stderr, "surf-eval: P a multiple of 16\n"); return 2; }
     if (nn_init(gpu) || xnet_init(gpu)) return 1;
     nn_set_tf32(1);   /* fp32 tensors on the TF32 tensor-core convs */
     xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "6")) * 1e9));
@@ -411,15 +411,17 @@ int cmd_surf_eval(int argc, char **argv) {
     const size_t V = (size_t)P * P * P;
     uint8_t *hI = malloc(V), *hL = malloc((size_t)N * V), *hS = malloc((size_t)N * V), *u8d = xmalloc_dev(V), *dL = nn_malloc((size_t)N * V), *dS = nn_malloc((size_t)N * V);
     double *dsum = nn_malloc((size_t)N * 8 * 8), *dsq = nn_malloc(8); unsigned long long *dvc = nn_malloc(5 * 8);
-    fprintf(stderr, "surf-eval: %d train / %d val cases; encoder %s (widths %d %d %d | tokens %d), decoder %zu parameters; %d^3 crops, batch %d, %d steps\n",
-            ntr, nva, ck, E.ch[0], E.ch[1], E.ch[2], E.ch[3], D.np, P, N, steps);
+    fprintf(stderr, "surf-eval: %d train / %d val cases; encoder %s (widths %d %d %d | tokens %d), decoder %zu parameters; %d^3 crops, batch %d (accumulated), %d steps\n",
+            ntr, nva, ck, E.ch[0], E.ch[1], E.ch[2], E.ch[3], D.np, P, NB, steps);
     { char cmd[1100]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", out); if (system(cmd)) {} }
     char mp[1200]; snprintf(mp, sizeof mp, "%s/metrics.tsv", out); FILE *mf = fopen(mp, "a");
     if (mf) fprintf(mf, "# step\tkind\tloss\tforeground_dice\tmedial_recall\n");
     double best = -1, t0 = se_now(), lsum = 0; int lcnt = 0;
     for (int step = 1; step <= steps; step++) {
-        /* batch */
-        for (int n = 0; n < N; n++) {
+        /* the batch: NB crops, one at a time (the nn convs take one sample), gradients accumulated */
+        nn_zero(D.g, D.np * 4);
+        double sl = 0;
+        for (int nb = 0; nb < NB; nb++) {
             se_case *c = nullptr; int o[3];
             for (int tries = 0; ; tries++) {
                 c = &C[tr[se_rng(&rs) % (uint64_t)ntr]]; if (case_load(c)) return 1;
@@ -429,29 +431,28 @@ int cmd_surf_eval(int argc, char **argv) {
                 else for (int k = 0; k < 3; k++) o[k] = dims[k] >= P ? (int)(se_unif(&rs) * (dims[k] - P + 1)) : (dims[k] - P) / 2;
                 int perm[3] = {0, 1, 2}, flip[3]; for (int k = 2; k > 0; k--) { const int j = (int)(se_rng(&rs) % (uint64_t)(k + 1)), t = perm[k]; perm[k] = perm[j]; perm[j] = t; }
                 for (int k = 0; k < 3; k++) flip[k] = (int)(se_rng(&rs) & 1);
-                crop_case(c, o, P, perm, flip, hI, hL + (size_t)n * V);
-                size_t valid = 0; for (size_t i = 0; i < V; i += 7) valid += hL[(size_t)n * V + i] != 2;
+                crop_case(c, o, P, perm, flip, hI, hL);
+                size_t valid = 0; for (size_t i = 0; i < V; i += 7) valid += hL[i] != 2;
                 if (valid * 7 * 100 >= V || tries > 32) break;
             }
-            medial_target(hL + (size_t)n * V, P, hS + (size_t)n * V);
+            medial_target(hL, P, hS);
             xh2d(u8d, hI, V);
-            if (enc_fwd(&E, u8d, P, c, f, n)) return 1;
+            if (enc_fwd(&E, u8d, P, c, f, 0)) return 1;
+            nn_h2d(dL, hL, V); nn_h2d(dS, hS, V);
+            dec_fwd(&D, &A, f);
+            se_loss_sums(A.lg, dL, dS, 1, (long long)V, dsum);
+            double hs[8]; nn_d2h(hs, dsum, 64);
+            const double cnt = hs[1], ce = cnt > 0 ? hs[0] / cnt : 0, dc = (2 * hs[2] + 1e-5) / (hs[3] + hs[4] + 1e-5), rc = (hs[5] + 1e-5) / (hs[6] + 1e-5);
+            sl += (ce - dc - rc) / NB;
+            se_loss_grad(A.lg, dL, dS, 1, NB, (long long)V, dsum, cnt > 0 ? cnt * NB : 1, 1e-5f, A.glg);   /* (CE: each crop's mean / NB) */
+            dec_bwd(&D, &A, f);
         }
-        nn_h2d(dL, hL, (size_t)N * V); nn_h2d(dS, hS, (size_t)N * V);
-        /* forward, loss, backward */
-        dec_fwd(&D, &A, f);
-        se_loss_sums(A.lg, dL, dS, N, (long long)V, dsum);
-        double hs[64]; nn_d2h(hs, dsum, (size_t)N * 8 * 8);
-        double cnt = 0, ce = 0, dc = 0, rc = 0; for (int n = 0; n < N; n++) { cnt += hs[n * 8 + 1]; ce += hs[n * 8]; dc += (2 * hs[n * 8 + 2] + 1e-5) / (hs[n * 8 + 3] + hs[n * 8 + 4] + 1e-5) / N; rc += (hs[n * 8 + 5] + 1e-5) / (hs[n * 8 + 6] + 1e-5) / N; }
-        const double loss = (cnt > 0 ? ce / cnt : 0) - dc - rc; lsum += loss; lcnt++;
-        se_loss_grad(A.lg, dL, dS, N, (long long)V, dsum, cnt > 0 ? cnt : 1, 1e-5f, A.glg);
-        nn_zero(D.g, D.np * 4);
-        dec_bwd(&D, &A, f);
+        lsum += sl; lcnt++;
         se_sumsq(D.g, (long long)D.np, dsq); double gn2; nn_d2h(&gn2, dsq, 8);
         const double gn = sqrt(gn2); const float gs = gn > clip ? (float)(clip / (gn + 1e-6)) : 1.f;
         se_adamw(D.p, D.g, D.m, D.v, (long long)D.np, lr, 0.9f, 0.999f, 1e-8f, wd, step, gs);
         if (step % 50 == 0 || step == 1) {
-            fprintf(stderr, "step %d loss %.4f (ce %.4f dice %.4f srec %.4f) |g| %.3f %.2f s/step\n", step, lsum / lcnt, cnt > 0 ? ce / cnt : 0, dc, rc, gn, (se_now() - t0) / step);
+            fprintf(stderr, "step %d loss %.4f |g| %.3f %.2f s/step\n", step, lsum / lcnt, gn, (se_now() - t0) / step);
             if (mf) { fprintf(mf, "%d\ttrain\t%.5f\t\t\n", step, lsum / lcnt); fflush(mf); }
             lsum = 0; lcnt = 0;
         }
