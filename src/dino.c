@@ -1083,6 +1083,20 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             }
         }
     }
+    if (dbg && Q->wib > 0 && step % 25 == 1) {   /* correspondence check: the views' (augmented) CT at the student cell centres vs at the mapped teacher points */
+        const size_t g3_ = (size_t)Q->PG * Q->PG * Q->PG; float *va = malloc(g3_ * 4), *vb = malloc(g3_ * 4); double nc = 0, ns = 0; int nv = 0;
+        for (int j = 0; j < 2 * N && nv < 4; j++) {
+            if (!Q->cnt[j]) continue;
+            nn_d2h(va, Q->xg + (size_t)j * CIN * g3_, g3_ * 4); nn_d2h(vb, Q->xg + (size_t)(j ^ 1) * CIN * g3_, g3_ * 4);
+            const int m = Q->cnt[j]; double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0, sab2 = 0;
+            for (int k = 0; k < m; k++) { const double a = va[Q->hS[(size_t)j * Q->IM + k]], b = vb[Q->hT[(size_t)j * Q->IM + k]], b2 = vb[Q->hT[(size_t)j * Q->IM + (k + 7) % m]];
+                sa += a; sb += b; saa += a * a; sbb += b * b; sab += a * b; sab2 += a * b2; }
+            const double ma = sa / m, mb = sb / m, da = sqrt(fmax(saa / m - ma * ma, 1e-12)), db = sqrt(fmax(sbb / m - mb * mb, 1e-12));
+            nc += fabs((sab / m - ma * mb) / (da * db)); ns += fabs((sab2 / m - ma * mb) / (da * db)); nv++;
+        }
+        if (nv) fprintf(stderr, "dbg step %d: student-cell vs mapped-teacher-point CT |ncc| %.3f (shuffled pairs %.3f) over %d views\n", step, nc / nv, ns / nv, nv);
+        free(va); free(vb);
+    }
     if (fixed && !Q->fixdone) { Q->fixdone = 1; Q->Rfix = R; fprintf(stderr, "dino-train: UFSM_SSL_FIXED: one fixed batch (%d iBOT rows)\n", R); }
     /* teacher: the 2N globals through the EMA weights; CLS rows, layer norm, head, Sinkhorn over the batch */
     unet_use_params(Q->ug, unet_ema_params(Q->u));
