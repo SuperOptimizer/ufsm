@@ -640,3 +640,29 @@ extern "C" void dr_ink(const float *A, const int *aid, int Na, const float *Kp, 
     k_ink<<<Na, 128, (size_t)2 * (np + nn) * 4>>>(A, aid, Kp, kid, np, Kn, nn, D, T, margin, lv, gt);
     k_ink_fin<<<1, 256>>>(lv, gt, Na, D, w, gA, out);
 }
+
+/* ---- InfoNCE over a key bank ---- */
+extern "C" size_t dr_nce_scratch(int N, int M) { return al((size_t)N * M) * 4 + 256; }
+__global__ void k_nce_rows(float *S, int M, const int *pos, float tau, float w, int N, float *out) {   /* one block per anchor: S row -> d L / d logit */
+    __shared__ float sh[256]; __shared__ int si[256];
+    const int r = blockIdx.x; float *row = S + (size_t)r * M; const int p = pos[r];
+    float m = -INFINITY; int am = 0;
+    for (int k = threadIdx.x; k < M; k += blockDim.x) { const float v = row[k] / tau; if (v > m) { m = v; am = k; } }
+    sh[threadIdx.x] = m; si[threadIdx.x] = am; __syncthreads();
+    for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k && (sh[threadIdx.x + k] > sh[threadIdx.x] || (sh[threadIdx.x + k] == sh[threadIdx.x] && si[threadIdx.x + k] < si[threadIdx.x]))) { sh[threadIdx.x] = sh[threadIdx.x + k]; si[threadIdx.x] = si[threadIdx.x + k]; } __syncthreads(); }
+    m = sh[0]; const int amax = si[0]; __syncthreads();
+    float z = 0.f; for (int k = threadIdx.x; k < M; k += blockDim.x) z += expf(row[k] / tau - m);
+    sh[threadIdx.x] = z; __syncthreads();
+    for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
+    z = sh[0]; const float sp = row[p] / tau; __syncthreads();
+    const float g = w / ((float)N * tau);
+    for (int k = threadIdx.x; k < M; k += blockDim.x) row[k] = g * (expf(row[k] / tau - m) / z - (k == p ? 1.f : 0.f));
+    if (threadIdx.x == 0) { atomicAdd(out, w * (m + logf(z) - sp) / N); atomicAdd(out + 1, (amax == p ? 1.f : 0.f) / N); }
+}
+extern "C" void dr_infonce(const float *Q, int N, const float *K, int M, const int *pos, int D, float tau, float w, float *gQ, float *out, void *scratch) {
+    if (N <= 0 || M <= 0) return;
+    float *S = (float *)scratch;
+    at_gemm_f32(0, 1, N, M, D, Q, K, S, 0.f);          /* S = Q K^T */
+    k_nce_rows<<<N, 256>>>(S, M, pos, tau, w, N, out);  /* S -> d L / d S (times 1 / tau, w / N) */
+    at_gemm_f32(0, 0, N, D, M, S, K, gQ, 1.f);          /* gQ += G K */
+}

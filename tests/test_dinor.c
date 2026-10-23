@@ -228,6 +228,73 @@ static int test_toy_dino(void) {
     return bad;
 }
 
+/* InfoNCE: loss / accuracy / d Q vs a double reference and central differences */
+static double ref_nce(const double *Q, int N, const double *K, int M, const int *pos, int D, double tau, int *hits) {
+    double L = 0; *hits = 0;
+    for (int i = 0; i < N; i++) { double m = -1e300, z = 0; int am = 0; double s[64];
+        for (int k = 0; k < M; k++) { double v = 0; for (int d = 0; d < D; d++) v += Q[i * D + d] * K[k * D + d]; s[k] = v / tau; if (s[k] > m) { m = s[k]; am = k; } }
+        for (int k = 0; k < M; k++) z += exp(s[k] - m);
+        L += (m + log(z) - s[pos[i]]) / N; *hits += am == pos[i]; }
+    return L;
+}
+static int test_nce(void) {
+    const int N = 5, M = 40, D = 16; const double tau = 0.2, w = 0.7; printf("InfoNCE: %d anchors, %d keys, D %d\n", N, M, D); int bad = 0;
+    double Q[5 * 16], K[40 * 16]; int pos[5] = {0, 3, 7, 1, 30};
+    for (int i = 0; i < N * D; i++) Q[i] = rf(nrand() * 0.3);
+    for (int i = 0; i < M * D; i++) K[i] = rf(nrand() * 0.3);
+    float *qd = dev(Q, N * D), *kd = dev(K, M * D), *gd = nn_malloc(N * D * 4), *od = nn_malloc(8); int *pd = nn_malloc(sizeof pos); nn_h2d(pd, pos, sizeof pos);
+    void *sc = nn_malloc(dr_nce_scratch(N, M)); nn_zero(gd, N * D * 4); nn_zero(od, 8);
+    dr_infonce(qd, N, kd, M, pd, D, (float)tau, (float)w, gd, od, sc);
+    int hits; const double L = ref_nce(Q, N, K, M, pos, D, tau, &hits);
+    double *o = host(od, 2), r2[2] = {w * L, (double)hits / N}; bad += report("loss/acc", o, r2, 2, 2e-3); free(o);
+    double gr[5 * 16]; for (int i = 0; i < N * D; i++) { const double e = 1e-5, x = Q[i]; int h; Q[i] = x + e; const double lp = ref_nce(Q, N, K, M, pos, D, tau, &h); Q[i] = x - e; const double lm = ref_nce(Q, N, K, M, pos, D, tau, &h); Q[i] = x; gr[i] = w * (lp - lm) / (2 * e); }
+    double *g = host(gd, N * D); bad += report("d Q", g, gr, N * D, 2e-3); free(g);
+    nn_free(qd); nn_free(kd); nn_free(gd); nn_free(od); nn_free(pd); nn_free(sc);
+    return bad;
+}
+/* the queue-based self-supervision on toy instances (batch-1 MoCo / dense cross-view InfoNCE): random unit points in 64-d, two views =
+   point + N(0, 0.3) noise each; student projection (Linear 64 -> 256 -> GELU -> 64, unit) on view a, the EMA teacher's on view b as the positive,
+   negatives = the other anchors' keys + a FIFO queue of earlier teacher keys (Q keys). NB anchors per step (1: CLS-style, 64: dense-style);
+   returns the top-1 accuracy over the last 200 steps (chance 1 / (NB + Q)) */
+static double toy_nce(int NB, int Q, int steps, double *loss) {
+    const int Cin = 64, H = 256, O = 64; dr_mlp2 m; dr_mlp2_layout(&m, Cin, H, O);
+    double *b = calloc(m.n, 8); for (size_t i = m.w1; i < m.b1; i++) b[i] = nrand() / sqrt((double)Cin); for (size_t i = m.w2; i < m.b2; i++) b[i] = nrand() / sqrt((double)H);
+    float *P = dev(b, m.n), *Pt = dev(b, m.n), *G = nn_malloc(m.n * 4), *Mo = nn_malloc(m.n * 4), *Ma = nn_malloc(m.n * 4), *Va = nn_malloc(m.n * 4); free(b);
+    nn_zero(Mo, m.n * 4); nn_zero(Ma, m.n * 4); nn_zero(Va, m.n * 4);
+    size_t wb = dr_muon_work(H, Cin); if (dr_muon_work(O, H) > wb) wb = dr_muon_work(O, H); float *work = nn_malloc(wb);
+    void *ws = nn_malloc(dr_mlp2_ws(&m, NB)), *wt = nn_malloc(dr_mlp2_ws(&m, NB));
+    float *xa = nn_malloc((size_t)NB * Cin * 4), *xb = nn_malloc((size_t)NB * Cin * 4), *q = nn_malloc((size_t)NB * O * 4), *kb = nn_malloc((size_t)(NB + Q) * O * 4), *gq = nn_malloc((size_t)NB * O * 4), *out = nn_malloc(8);
+    int *pos = nn_malloc(NB * 4); { int *h = malloc(NB * 4); for (int i = 0; i < NB; i++) h[i] = i; nn_h2d(pos, h, NB * 4); free(h); }
+    void *sc = nn_malloc(dr_nce_scratch(NB, NB + Q)); int qf = 0, qp = 0; double acc = 0, ls = 0; int n = 0;
+    double *ha = malloc((size_t)NB * Cin * 8), *hb = malloc((size_t)NB * Cin * 8);
+    for (int st = 1; st <= steps; st++) {
+        for (int i = 0; i < NB; i++) { double c[64], z = 0; for (int d = 0; d < Cin; d++) { c[d] = nrand(); z += c[d] * c[d]; } z = sqrt(z);
+            for (int d = 0; d < Cin; d++) { ha[i * Cin + d] = c[d] / z * 4 + 0.3 * nrand(); hb[i * Cin + d] = c[d] / z * 4 + 0.3 * nrand(); } }
+        float *t = dev(ha, (size_t)NB * Cin); nn_d2d(xa, t, (size_t)NB * Cin * 4); nn_free(t); t = dev(hb, (size_t)NB * Cin); nn_d2d(xb, t, (size_t)NB * Cin * 4); nn_free(t);
+        dr_mlp2_fwd(&m, Pt, xb, NB, kb, wt);   /* in-batch keys first, the queue rows after them */
+        dr_mlp2_fwd(&m, P, xa, NB, q, ws);
+        nn_zero(gq, (size_t)NB * O * 4); nn_zero(out, 8); nn_zero(G, m.n * 4);
+        dr_infonce(q, NB, kb, NB + qf, pos, O, 0.2f, 1.f, gq, out, sc);
+        dr_mlp2_bwd(&m, P, G, xa, q, gq, NB, nullptr, ws);
+        dr_muon(P + m.w1, G + m.w1, Mo + m.w1, H, Cin, 0.02f, 0.95f, 0.f, work);
+        dr_muon(P + m.w2, G + m.w2, Mo + m.w2, O, H, 0.02f, 0.95f, 0.f, work);
+        dr_adamw(P + m.b1, G + m.b1, Ma + m.b1, Va + m.b1, H, 1e-3f, 0.9f, 0.999f, 1e-8f, 0.f, st);
+        dr_adamw(P + m.b2, G + m.b2, Ma + m.b2, Va + m.b2, O, 1e-3f, 0.9f, 0.999f, 1e-8f, 0.f, st);
+        dr_ema(Pt, P, m.n, 0.99f);
+        for (int i = 0; i < NB; i++) { nn_d2d(kb + (size_t)(NB + qp) * O, kb + (size_t)i * O, O * 4); qp = (qp + 1) % Q; if (qf < Q) qf++; }   /* (keys enqueued) */
+        if (st > steps - 200) { double *o = host(out, 2); ls += o[0]; acc += o[1]; n++; free(o); }
+    }
+    nn_free(P); nn_free(Pt); nn_free(G); nn_free(Mo); nn_free(Ma); nn_free(Va); nn_free(work); nn_free(ws); nn_free(wt); nn_free(xa); nn_free(xb); nn_free(q); nn_free(kb); nn_free(gq); nn_free(out); nn_free(pos); nn_free(sc); free(ha); free(hb);
+    *loss = ls / n; return acc / n;
+}
+static int test_toy_nce(void) {
+    printf("queue InfoNCE on toy instances (tau 0.2)\n"); int bad = 0;
+    const int nb[2] = {1, 64}, qn[2] = {4096, 4096};
+    for (int k = 0; k < 2; k++) { double L; const double a = toy_nce(nb[k], qn[k], 1500, &L); const double ch = 1.0 / (nb[k] + qn[k]); const int b = !(a > 0.5);
+        printf("  %2d anchors / step, queue %d: top-1 %.3f (chance %.5f), loss %.3f (ln(keys) %.2f)%s\n", nb[k], qn[k], a, ch, L, log((double)nb[k] + qn[k]), b ? "  FAIL" : ""); bad += b; }
+    return bad;
+}
+
 /* ---- cross-entropy ---- */
 static double ref_ce(const double *ls, int K, double ts, const double *q, const int *ps, const int *pt, const double *pw, int np) {
     double L = 0;
@@ -491,7 +558,7 @@ static int test_pool(void) {
 
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
-    int bad = test_views() + test_head() + test_targets() + test_sharp() + test_toy_dino() + test_ce() + test_koleo() + test_koleo_q() + test_muon(64, 24) + test_muon(24, 64) + test_muon_ref(160, 24) + test_obj() + test_ink() + test_mlp2() + test_pool() + test_rownorm();
+    int bad = test_views() + test_head() + test_targets() + test_sharp() + test_toy_dino() + test_nce() + test_toy_nce() + test_ce() + test_koleo() + test_koleo_q() + test_muon(64, 24) + test_muon(24, 64) + test_muon_ref(160, 24) + test_obj() + test_ink() + test_mlp2() + test_pool() + test_rownorm();
     printf(bad ? "test_dinor: %d FAILED\n" : "test_dinor: all passed\n", bad);
     return bad != 0;
 }

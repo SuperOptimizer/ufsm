@@ -91,6 +91,12 @@ void dr_obj(const float *S, const float *T, const int *obj, const uint8_t *vs, c
    0.5 (softplus(m_push - m_pull) + softplus(lme_push - lme_pull)), pull logits capped at max(margin, max push sim + T); mean over anchors
    times w -> out[0] (+=), d / d A added into gA. Ink anchors: pull = ink keys, push = no-ink keys; no-ink anchors: the roles swapped */
 void dr_ink(const float *A, const int *aid, int Na, const float *Kp, const int *kid, int np, const float *Kn, int nn, int D, float T, float margin, float w, float *gA, float *out);
+/* InfoNCE over a key bank (the batch-1 self-supervision: MoCo-style CLS, DenseCL-style cross-view tokens): anchors Q [N][D] (unit), keys
+   K [M][D] (unit, no gradient: the EMA teacher's in-batch keys first, then the queue), pos[i] the row of anchor i's positive; per anchor
+   loss lse_m(q.k_m / tau) - q.k_pos / tau; out[0] += w mean loss, out[1] += mean top-1 (the positive ranked first); gQ += d (w mean loss) / d Q.
+   scratch: dr_nce_scratch(N, M) bytes */
+size_t dr_nce_scratch(int N, int M);
+void dr_infonce(const float *Q, int N, const float *K, int M, const int *pos, int D, float tau, float w, float *gQ, float *out, void *scratch);
 /* per-object means of point rows x [N][D] by grp [N] (-1 none) -> m [M][D] and counts; backward adds gm / count to the points' rows */
 void dr_gmean(const float *x, const int *grp, int N, int D, int M, float *m, float *cnt);
 void dr_gmean_bwd(const float *gm, const float *cnt, const int *grp, int N, int D, float *gx);
