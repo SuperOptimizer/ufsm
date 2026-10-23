@@ -879,6 +879,18 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
             N, Q->Ps, R->nworkers, R->nslots, Q->PG, zlo, zhi, Q->NL, Q->PL, lzlo, lzhi, cls_reg ? "register 0" : "token mean", HH, HH, HB, Q->K, Q->hlr, Q->plr, Q->wd, Q->freeze, 2 * N, Q->wk);
     return 0;
 }
+/* the SSL heads beside a checkpoint (CKPT.ssl): DINO head p, pt, the centre; iBOT head p, pt, its centre (when on) */
+static void dn_ssl_io(dn_ssl *Q, const char *ckpt, int save) {
+    char fp[1300]; snprintf(fp, sizeof fp, "%s.ssl", ckpt); FILE *f = fopen(fp, save ? "wb" : "rb"); if (!f) return;
+    struct { float *d; size_t n; } a[6] = {{Q->H.p, Q->H.H.n}, {Q->H.pt, Q->H.H.n}, {Q->cen, (size_t)Q->K}, {Q->wib > 0 ? Q->I.p : nullptr, Q->wib > 0 ? Q->I.H.n : 0},
+                                           {Q->wib > 0 ? Q->I.pt : nullptr, Q->wib > 0 ? Q->I.H.n : 0}, {Q->wib > 0 ? Q->icen : nullptr, Q->wib > 0 ? (size_t)Q->KI : 0}};
+    int ok = 1;
+    for (int k = 0; k < 6 && ok; k++) { if (!a[k].d) continue; float *h = malloc(a[k].n * 4);
+        if (save) { nn_d2h(h, a[k].d, a[k].n * 4); ok = fwrite(h, 4, a[k].n, f) == a[k].n; } else { ok = fread(h, 4, a[k].n, f) == a[k].n; if (ok) nn_h2d(a[k].d, h, a[k].n * 4); }
+        free(h); }
+    fclose(f);
+    if (!save) fprintf(stderr, "dino-train --ssl-batch: heads %s from %s\n", ok ? "restored" : "NOT restored (short file)", fp);
+}
 static void dn_ssl_cls(dn_ssl *Q, unet *n, float *cls) {   /* the CLS of the net's last forward */
     int S = 0, nreg = 0; const float *tok = unet_tokens(n, nullptr, &S, nullptr, &nreg);
     if (Q->cls_reg) nn_d2d(cls, tok, (size_t)Q->C * 4); else dr_pool_fwd(tok, 1, S, Q->C, nreg, cls);
@@ -1289,6 +1301,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     for (int i = 0; i < Rg->nworkers; i++) pthread_create(&Rg->th[i], nullptr, ring_worker, Rg);
     const int SB = atoi(opt(argc, argv, "--ssl-batch", "0")), sse = atoi(opt(argc, argv, "--ssl-every", "1")) > 0 ? atoi(opt(argc, argv, "--ssl-every", "1")) : 1;
     dn_ssl SS; if (SB > 0 && dn_ssl_init(&SS, u, cfg, Dd, argc, argv, seed, C, cls_reg, cls_norm, noise)) return 2;
+    if (SB > 0 && opt(argc, argv, "--resume", nullptr)) { char rr[4096]; const char *rq = realpath(opt(argc, argv, "--resume", ""), rr) ? rr : opt(argc, argv, "--resume", ""); dn_ssl_io(&SS, rq, 0); }
     signal(SIGTERM, dn_sig); signal(SIGINT, dn_sig);
     char logp[1200]; snprintf(logp, sizeof logp, "%s/train.log", outd); FILE *lf = fopen(logp, "a");
     fprintf(stderr, "dino-train --recipe: source %d, globals 2 x %d^3 (zoom %.2f..%.2f), locals %d x %d^3 (zoom %.2f..%.2f), CLS %s, head %d-%d-%d -> %d prototypes, "
@@ -1753,8 +1766,9 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
                       fclose(hf); }
             char lp[1200]; snprintf(lp, sizeof lp, "%s/last.ckpt", outd);
             { char prev[1300]; const ssize_t pl = readlink(lp, prev, sizeof prev - 1); const int keep = atoi(opt(argc, argv, "--keep-every", "0"));   /* rotation: the previous checkpoint goes unless a milestone */
-              if (pl > 0 && keep > 0) { prev[pl] = 0; int ps_ = 0; if (sscanf(prev, "step%d.ckpt", &ps_) == 1 && ps_ != step && ps_ % keep) { char a1[2600], a2[2600], a3[2600]; snprintf(a1, sizeof a1, "%s/%s", outd, prev); snprintf(a2, sizeof a2, "%s.heads", a1); snprintf(a3, sizeof a3, "%s.protos", a1); unlink(a1); unlink(a2); unlink(a3); } } }
+              if (pl > 0 && keep > 0) { prev[pl] = 0; int ps_ = 0; if (sscanf(prev, "step%d.ckpt", &ps_) == 1 && ps_ != step && ps_ % keep) { char a1[2600], a2[2600], a3[2600]; snprintf(a1, sizeof a1, "%s/%s", outd, prev); snprintf(a2, sizeof a2, "%s.heads", a1); snprintf(a3, sizeof a3, "%s.protos", a1); unlink(a1); unlink(a2); unlink(a3); snprintf(a3, sizeof a3, "%s.ssl", a1); unlink(a3); } } }
             unlink(lp); if (symlink(cp + strlen(outd) + 1, lp)) {}
+            if (SB > 0) dn_ssl_io(&SS, cp, 1);
         }
         if (opt(argc, argv, "--eval", nullptr) && (step % eval_every == 0 || step == steps)) { dn_run_eval(u, argc, argv, step, P, ED, nthreads, 0, 0.f, outd, lf); t_last = dn_now(); }
     }
