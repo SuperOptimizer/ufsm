@@ -11,7 +11,11 @@
    Outputs (volcomp lossless zarr, boxes stacked along z, 512^3 shards): input.zarr [n in, in, in], target.zarr [n 4in, 4in, 4in],
    mask.zarr (binary, target grid); boxes.json (per box: native centre / origin, fine centre, split, valid fractions); intensity_map.json:
    a monotone (pool-adjacent-violators) map target-at-x1/4 -> input intensity over certified valid voxels (256-entry LUT, bin counts,
-   correlation). split: boxes in the top --holdout fraction of the overlap's z range are "test", the rest "train". */
+   correlation). split: boxes in the top --holdout fraction of the overlap's z range are "test", the rest "train".
+   --warp-input 1: the other direction (64x fewer interpolations, the target unblurred): target = the fine scan's raw (4B)^3 box at the
+   mapped centre (no resampling; mask = nonzero), input = the native scan resampled trilinearly through the inverse map onto the box's
+   4-fine-voxel grid (input voxel (i, j, k) at fine origin + 4 (i, j, k) + 1.5); boxes.json gives "fine_origin_xyz". The input grid spacing is
+   then 4 fine voxels (9.6 um for 2.4 um targets) rather than the native voxel. */
 #include "reg.h"
 #include "json.h"
 #include "z3w.h"
@@ -31,9 +35,9 @@ static const char *opt(int argc, char **argv, const char *name, const char *dflt
     return dflt;
 }
 
-typedef struct { double c[3]; int64_t o[3]; double fc[3]; float in_frac, tg_frac; int slot, split; } sbox;
+typedef struct { double c[3]; int64_t o[3], fo[3]; double fc[3]; float in_frac, tg_frac; int slot, split; } sbox;
 typedef struct {
-    rvol *cv, *fv; rmap m; rcover cov; int B, T; double minfrac, zcut;
+    rvol *cv, *fv; rmap m; rcover cov; int B, T, warp; double minfrac, zcut;
     double *cand; int ncand; atomic_int next, nacc; int want;
     sbox *box; uint8_t *inputs;             /* inputs: want x B^3 */
     z3w *wt, *wm; int64_t S;                 /* target / mask writers, shard 512 */
@@ -53,9 +57,39 @@ static void *sr_worker(void *arg) {
         int cert = rcover_ok(&j->cov, c);
         for (int q = 0; q < 8 && cert; q++) { const double p[3] = {o[0] + (q & 1) * (B - 1), o[1] + (q >> 1 & 1) * (B - 1), o[2] + (q >> 2) * (B - 1)}; cert = rcover_ok(&j->cov, p); }
         if (!cert) continue;
+        size_t nz = 0, nv = 0; int64_t fo[3] = {0, 0, 0};
+        if (j->warp) {   /* --warp-input: the fine scan's raw T^3 box (no resampling) is the target; the input is the native scan resampled through
+                            the map onto the box's 4-voxel grid (input voxel (i, j, k) at fine fo + 4 (i, j, k) + 1.5: its 4^3 block's centre) */
+            double fc[3]; rmap_c2f(&j->m, c, fc);
+            for (int d = 0; d < 3; d++) fo[d] = (int64_t)llround(fc[d]) - T / 2;
+            const int64_t fzo[3] = {fo[2], fo[1], fo[0]}, fzn[3] = {T, T, T};
+            if (rvol_read(j->fv, 0, fzo, fzn, tg)) continue;
+            for (size_t i = 0; i < NT; i++) { mk[i] = tg[i] ? 255 : 0; nv += tg[i] != 0; }
+            if (nv < j->minfrac * NT) continue;
+            double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+            for (int q = 0; q < 27; q++) { const int s3[3] = {q % 3, q / 3 % 3, q / 9}; double p[3], cq[3];
+                for (int d = 0; d < 3; d++) p[d] = fo[d] + 1.5 + s3[d] * 2.0 * (B - 1);
+                rmap_f2c(&j->m, p, cq); for (int d = 0; d < 3; d++) { lo[d] = fmin(lo[d], cq[d]); hi[d] = fmax(hi[d], cq[d]); } }
+            int64_t co[3], cn[3]; for (int d = 0; d < 3; d++) { co[2 - d] = (int64_t)floor(lo[d]) - 2; cn[2 - d] = (int64_t)ceil(hi[d]) + 2 - co[2 - d] + 1; }
+            if ((double)cn[0] * cn[1] * cn[2] > 16e6) continue;
+            uint8_t *cb = malloc((size_t)cn[0] * cn[1] * cn[2]);
+            if (!cb || rvol_read(j->cv, 0, co, cn, cb)) { free(cb); continue; }
+            for (int z = 0; z < B; z++) for (int y = 0; y < B; y++) for (int x = 0; x < B; x++) {
+                const double p[3] = {fo[0] + 1.5 + 4.0 * x, fo[1] + 1.5 + 4.0 * y, fo[2] + 1.5 + 4.0 * z}; double q[3]; rmap_f2c(&j->m, p, q);
+                const double fx = q[0] - co[2], fy = q[1] - co[1], fz = q[2] - co[0]; const int64_t ix = (int64_t)floor(fx), iy = (int64_t)floor(fy), iz = (int64_t)floor(fz);
+                uint8_t *dst = in + ((size_t)z * B + y) * B + x; *dst = 0;
+                if (ix < 0 || iy < 0 || iz < 0 || ix + 1 >= cn[2] || iy + 1 >= cn[1] || iz + 1 >= cn[0]) continue;
+                const double ux = fx - ix, uy = fy - iy, uz = fz - iz; double sv = 0; int bad = 0;
+                for (int k = 0; k < 8 && !bad; k++) { const uint8_t v = cb[((size_t)(iz + (k >> 2)) * cn[1] + iy + (k >> 1 & 1)) * cn[2] + ix + (k & 1)]; if (!v) bad = 1;
+                    sv += ((k >> 2) ? uz : 1 - uz) * ((k >> 1 & 1) ? uy : 1 - uy) * ((k & 1) ? ux : 1 - ux) * v; }
+                if (!bad) { *dst = (uint8_t)fmin(255, fmax(1, sv + 0.5)); nz++; }
+            }
+            free(cb);
+            if (nz < j->minfrac * NB) continue;
+        } else {
         const int64_t zo[3] = {o[2], o[1], o[0]}, zn[3] = {B, B, B};
         if (rvol_read(j->cv, 0, zo, zn, in)) continue;
-        size_t nz = 0; for (size_t i = 0; i < NB; i++) nz += in[i] != 0;
+        for (size_t i = 0; i < NB; i++) nz += in[i] != 0;
         if (nz < j->minfrac * NB) continue;
         /* the fine block under the target grid */
         const double org[3] = {o[0] - 0.375, o[1] - 0.375, o[2] - 0.375};   /* native coords of target voxel 0: o + 0.5 / 4 - 0.5 */
@@ -67,7 +101,6 @@ static void *sr_worker(void *arg) {
         if ((double)fn[0] * fn[1] * fn[2] > 200e6) continue;   /* (--in 128: a ~520^3 fine block) */
         uint8_t *fb = malloc((size_t)fn[0] * fn[1] * fn[2]);
         if (!fb || rvol_read(j->fv, 0, fo, fn, fb)) { free(fb); continue; }
-        size_t nv = 0;
         for (int z = 0; z < T; z++) for (int y = 0; y < T; y++) for (int x = 0; x < T; x++) {
             const double p[3] = {org[0] + x / 4.0, org[1] + y / 4.0, org[2] + z / 4.0}; double f[3]; rmap_c2f(&j->m, p, f);
             const double fx = f[0] - fo[2], fy = f[1] - fo[1], fz = f[2] - fo[0]; const int64_t ix = (int64_t)floor(fx), iy = (int64_t)floor(fy), iz = (int64_t)floor(fz);
@@ -81,6 +114,7 @@ static void *sr_worker(void *arg) {
         }
         free(fb);
         if (nv < j->minfrac * NT) continue;
+        }
         /* intensity pairs: target 4^3 block means (all valid) vs the input voxel */
         for (int z = 0; z < B; z++) for (int y = 0; y < B; y++) for (int x = 0; x < B; x++) {
             const uint8_t iv = in[((size_t)z * B + y) * B + x]; if (!iv) continue;
@@ -90,7 +124,7 @@ static void *sr_worker(void *arg) {
         }
         const int slot = atomic_fetch_add(&j->nacc, 1);
         if (slot >= j->want) break;
-        sbox *b = &j->box[slot]; memcpy(b->c, c, sizeof b->c); memcpy(b->o, o, sizeof b->o);
+        sbox *b = &j->box[slot]; memcpy(b->c, c, sizeof b->c); memcpy(b->o, o, sizeof b->o); memcpy(b->fo, fo, sizeof b->fo);
         { const double cc[3] = {c[0], c[1], c[2]}; rmap_c2f(&j->m, cc, b->fc); }
         b->in_frac = (float)nz / NB; b->tg_frac = (float)nv / NT; b->slot = slot; b->split = c[2] >= j->zcut;
         memcpy(j->inputs + (size_t)slot * NB, in, NB);
@@ -116,13 +150,13 @@ static void *sr_worker(void *arg) {
 }
 
 int cmd_sr_pairs(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm sr-pairs <pair-dir> <out-dir> [--n 500] [--in 64] [--spacing 128] [--holdout 0.15] [--minfrac 0.9] [--cover-mm 1.2] [--tol-um 2.4] [--threads 12] [--cache DIR] [--seed 1]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm sr-pairs <pair-dir> <out-dir> [--n 500] [--in 64] [--warp-input 0] [--spacing 128] [--holdout 0.15] [--minfrac 0.9] [--cover-mm 1.2] [--tol-um 2.4] [--threads 12] [--cache DIR] [--seed 1]\n"); return 2; }
     const char *pd = argv[2], *od = argv[3]; char mp[2100]; snprintf(mp, sizeof mp, "%s/final/reg.json", pd);
     sjob *j = calloc(1, sizeof *j); rfield D;
     if (reg_load_map(mp, opt(argc, argv, "--cache", nullptr), &j->cv, &j->fv, &j->m, &D)) return 1;
     if (D.d) j->m.D = &D;
     if (rcover_load(&j->cov, pd, atof(opt(argc, argv, "--cover-mm", "1.2")) * 1000 / j->cv->um, atof(opt(argc, argv, "--tol-um", "2.4")) / j->cv->um)) return 1;
-    j->B = atoi(opt(argc, argv, "--in", "64")); j->T = 4 * j->B; j->want = atoi(opt(argc, argv, "--n", "500")); j->minfrac = atof(opt(argc, argv, "--minfrac", "0.9"));
+    j->B = atoi(opt(argc, argv, "--in", "64")); j->T = 4 * j->B; j->want = atoi(opt(argc, argv, "--n", "500")); j->minfrac = atof(opt(argc, argv, "--minfrac", "0.9")); j->warp = atoi(opt(argc, argv, "--warp-input", "0")) != 0;
     const double S = atof(opt(argc, argv, "--spacing", "128")), hold = atof(opt(argc, argv, "--holdout", "0.15"));
     const int nt = atoi(opt(argc, argv, "--threads", "12")); const unsigned seed = (unsigned)atoi(opt(argc, argv, "--seed", "1"));
     /* overlap (native L0) and candidate centres */
@@ -166,11 +200,11 @@ int cmd_sr_pairs(int argc, char **argv) {
       free(buf); z3w_close(wi); }
     /* boxes.json */
     snprintf(p, sizeof p, "%s/boxes.json", od); FILE *f = fopen(p, "w"); int ntest = 0;
-    fprintf(f, "{\"pair\":\"%s\",\"input\":{\"key\":\"%s\",\"um\":%.6g,\"box\":%d},\"target\":{\"key\":\"%s\",\"um\":%.6g,\"box\":%d,\"scale\":4},\"n\":%d,\"requested\":%d,\"candidates_tried\":%d,\"zcut_test\":%.1f,\n \"boxes\":[",
-            pd, j->cv->name, j->cv->um, j->B, j->fv->name, j->fv->um, j->T, n, j->want, atomic_load(&j->next), j->zcut);
+    fprintf(f, "{\"pair\":\"%s\",\"input\":{\"key\":\"%s\",\"um\":%.6g,\"box\":%d},\"target\":{\"key\":\"%s\",\"um\":%.6g,\"box\":%d,\"scale\":4},\"warp_input\":%d,\"n\":%d,\"requested\":%d,\"candidates_tried\":%d,\"zcut_test\":%.1f,\n \"boxes\":[",
+            pd, j->cv->name, j->cv->um, j->B, j->fv->name, j->fv->um, j->T, j->warp, n, j->want, atomic_load(&j->next), j->zcut);
     for (int i = 0; i < n; i++) { const sbox *b = &j->box[i]; ntest += b->split;
-        fprintf(f, "%s\n  {\"slot\":%d,\"centre_xyz\":[%.1f,%.1f,%.1f],\"origin_xyz\":[%lld,%lld,%lld],\"fine_centre_xyz\":[%.1f,%.1f,%.1f],\"input_frac\":%.3f,\"target_valid\":%.3f,\"split\":\"%s\"}", i ? "," : "", b->slot,
-                b->c[0], b->c[1], b->c[2], (long long)b->o[0], (long long)b->o[1], (long long)b->o[2], b->fc[0], b->fc[1], b->fc[2], b->in_frac, b->tg_frac, b->split ? "test" : "train"); }
+        fprintf(f, "%s\n  {\"slot\":%d,\"centre_xyz\":[%.1f,%.1f,%.1f],\"origin_xyz\":[%lld,%lld,%lld],\"fine_centre_xyz\":[%.1f,%.1f,%.1f],\"fine_origin_xyz\":[%lld,%lld,%lld],\"input_frac\":%.3f,\"target_valid\":%.3f,\"split\":\"%s\"}", i ? "," : "", b->slot,
+                b->c[0], b->c[1], b->c[2], (long long)b->o[0], (long long)b->o[1], (long long)b->o[2], b->fc[0], b->fc[1], b->fc[2], (long long)b->fo[0], (long long)b->fo[1], (long long)b->fo[2], b->in_frac, b->tg_frac, b->split ? "test" : "train"); }
     fprintf(f, "\n ],\"train\":%d,\"test\":%d}\n", n - ntest, ntest); fclose(f);
     /* intensity map: per target bin the mean input, pool-adjacent-violators (non-decreasing), bins weighted by counts */
     double w[256], y[256], sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, tot = 0;
