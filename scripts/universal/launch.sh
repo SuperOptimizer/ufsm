@@ -21,7 +21,7 @@ for try in $(seq 1 1000); do
   RES=""; [ -e $R/last.ckpt ] && RES="--resume $(readlink -f $R/last.ckpt)"
   echo "$(date) start $try $RES"; t0=$(date +%s)
   $U dino-train --gpu $GPU --sources $R/sources.json --out $R --steps $STEPS --save-every $SAVE --keep-every $KEEP --log-every 100 --eval-every 100000000 \
-     --workers 6 --threads 6 $CFG $RES "$@" >> $R/stderr.log 2>&1; rc=$?
+     --workers ${WORKERS:-12} --slots ${SLOTS:-12} --threads 4 $CFG $RES "$@" >> $R/stderr.log 2>&1; rc=$?
   echo "$(date) exit $rc"
   if [ $(( $(date +%s) - t0 )) -lt 300 ] && [ $rc != 0 ]; then fast=$((fast + 1)); else fast=0; fi
   if [ $fast -ge 5 ]; then echo "$(date) !!! 5 failed starts in a row (each < 5 min): watchdog stops; see $R/stderr.log"; touch $R/FAILED; break; fi

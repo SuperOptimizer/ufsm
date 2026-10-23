@@ -98,7 +98,7 @@ int cmd_dino_halves(int argc, char **argv) {
 #include <unistd.h>
 #include <signal.h>
 
-enum { DN_MAXSRC = 128, DN_MAXBOX = 256, DN_SLOTS = 6 };
+enum { DN_MAXSRC = 128, DN_MAXBOX = 256, DN_SLOTS = 16, DN_MAXW = 16 };   /* (slots / workers: at most; --slots / --workers) */
 typedef struct {
     char name[64]; z3 *ca, *cb, *codes, *ink, *phase; int halves; int cscale, pscale; float um;   /* phase: the stored winding phase (PHASE_* bytes; sources "phase": {"root", "key", "scale"}) */ float *axz;   /* scroll axis (y, x) per CT plane (sources "axis" + "axis_scale"), or nullptr */   /* CT voxels per code voxel (codes on a coarser grid; 1: the same grid) */
     int64_t org[3];                              /* added to window corners (ct array coordinates) to address the codes (global grid) */
@@ -120,8 +120,8 @@ typedef struct {   /* one sample: two CT views, the geometry, the points (output
     int ready;
 } dn_sample;
 typedef struct {
-    dn_data *D; dn_sample slot[DN_SLOTS]; pthread_mutex_t mu; pthread_cond_t cv; long produced, consumed; int stop; uint64_t seed; int nthreads;
-    pthread_t th[8]; int nworkers; long next_id;
+    dn_data *D; dn_sample slot[DN_SLOTS]; int nslots; pthread_mutex_t mu; pthread_cond_t cv; long produced, consumed; int stop; uint64_t seed; int nthreads;
+    pthread_t th[DN_MAXW]; int nworkers; long next_id;
 } dn_ring;
 
 static uint64_t rng_next(uint64_t *s) { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; return *s; }
@@ -334,7 +334,7 @@ static void *ring_worker(void *a) {
     for (;;) {
         pthread_mutex_lock(&R->mu);
         int k = -1;
-        while (!R->stop) { for (int i = 0; i < DN_SLOTS; i++) if (R->slot[i].ready == 0) { k = i; break; } if (k >= 0) break; pthread_cond_wait(&R->cv, &R->mu); }
+        while (!R->stop) { for (int i = 0; i < R->nslots; i++) if (R->slot[i].ready == 0) { k = i; break; } if (k >= 0) break; pthread_cond_wait(&R->cv, &R->mu); }
         if (R->stop) { pthread_mutex_unlock(&R->mu); break; }
         R->slot[k].ready = 1;   /* being filled */
         pthread_mutex_unlock(&R->mu);
@@ -347,7 +347,7 @@ static void *ring_worker(void *a) {
 static dn_sample *ring_get(dn_ring *R) {
     pthread_mutex_lock(&R->mu);
     for (;;) {
-        for (int i = 0; i < DN_SLOTS; i++) {
+        for (int i = 0; i < R->nslots; i++) {
             if (R->slot[i].ready == -1) { pthread_mutex_unlock(&R->mu); return nullptr; }
             if (R->slot[i].ready == 2) { R->slot[i].ready = 3; pthread_mutex_unlock(&R->mu); return &R->slot[i]; }
         }
@@ -1004,12 +1004,13 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     unet_build(u, xsg, 1); unet_build(ul, xsl, 1);
     /* data ring (sources at the source window, identity geometry) */
     dn_ring *Rg = calloc(1, sizeof *Rg); Rg->D = Dd; Rg->seed = seed; Rg->nthreads = nthreads; pthread_mutex_init(&Rg->mu, nullptr); pthread_cond_init(&Rg->cv, nullptr);
-    for (int i = 0; i < DN_SLOTS; i++) { dn_sample *S = &Rg->slot[i]; S->ca = malloc(ps3); S->cb = malloc(ps3); S->gidx = malloc((size_t)NG * 4); S->gcode = malloc((size_t)NG * 4); S->gxyz = malloc((size_t)NG * 12); S->sidx = malloc(4); S->ayx = malloc((size_t)Ps * 8); S->ixyz = malloc((size_t)(Dd->nink > 0 ? Dd->nink : 1) * 12);
+    Rg->nslots = atoi(opt(argc, argv, "--slots", "6")); if (Rg->nslots < 2) Rg->nslots = 2; if (Rg->nslots > DN_SLOTS) Rg->nslots = DN_SLOTS;
+    for (int i = 0; i < Rg->nslots; i++) { dn_sample *S = &Rg->slot[i]; S->ca = malloc(ps3); S->cb = malloc(ps3); S->gidx = malloc((size_t)NG * 4); S->gcode = malloc((size_t)NG * 4); S->gxyz = malloc((size_t)NG * 12); S->sidx = malloc(4); S->ayx = malloc((size_t)Ps * 8); S->ixyz = malloc((size_t)(Dd->nink > 0 ? Dd->nink : 1) * 12);
         if (Dd->uw) { S->phw = malloc(ps3); for (int v = 0; v < 2; v++) { S->pv[v] = malloc(g3); S->w4[v] = malloc(g3); S->wc[v] = malloc(g3); } }
         if (Dd->ikp) { S->ikw = malloc(ps3); for (int v = 0; v < 2; v++) { S->iv[v] = malloc(g3); S->im[v] = malloc(g3); } }
         if ((Dd->uw && (!S->phw || !S->pv[1] || !S->w4[1] || !S->wc[1])) || (Dd->ikp && (!S->ikw || !S->iv[1] || !S->im[1]))) { fprintf(stderr, "dino-train --recipe: host memory for the dense targets\n"); return 1; } }
     Dd->vP = P; Dd->vPL = PL; Dd->vnloc = nloc; Dd->zlo = zlo; Dd->zhi = zhi; Dd->lzlo = lzlo; Dd->lzhi = lzhi;   /* the views: drawn by the workers */
-    Rg->nworkers = nwork > 8 ? 8 : nwork;
+    Rg->nworkers = nwork > DN_MAXW ? DN_MAXW : nwork;
     for (int i = 0; i < Rg->nworkers; i++) pthread_create(&Rg->th[i], nullptr, ring_worker, Rg);
     signal(SIGTERM, dn_sig); signal(SIGINT, dn_sig);
     char logp[1200]; snprintf(logp, sizeof logp, "%s/train.log", outd); FILE *lf = fopen(logp, "a");
@@ -1587,11 +1588,12 @@ int cmd_dino_train(int argc, char **argv) {
     if (HZ) { nn_set_logits_h16(1); unet_set_head_ext(u, 1); unet_set_head_cb(u, dn_head_cb, &HS); unet_build(u, (shape5){1, cfg.cin, P, P, P}, 1); }
     /* data ring */
     dn_ring *R = calloc(1, sizeof *R); R->D = Dd; R->seed = seed; R->nthreads = nthreads; pthread_mutex_init(&R->mu, nullptr); pthread_cond_init(&R->cv, nullptr);
-    for (int i = 0; i < DN_SLOTS; i++) {
+    R->nslots = 6;
+    for (int i = 0; i < R->nslots; i++) {
         dn_sample *S = &R->slot[i]; S->ca = malloc(p3); S->cb = malloc(p3);
         S->gidx = malloc((size_t)NG * 4); S->gcode = malloc((size_t)NG * 4); S->gxyz = malloc((size_t)NG * 12);   /* labelled + air */ S->sidx = malloc((size_t)NS * 4); S->ayx = malloc((size_t)P * 8);
     }
-    R->nworkers = nwork > 8 ? 8 : nwork;
+    R->nworkers = nwork > DN_MAXW ? DN_MAXW : nwork;
     for (int i = 0; i < R->nworkers; i++) pthread_create(&R->th[i], nullptr, ring_worker, R);
     signal(SIGTERM, dn_sig); signal(SIGINT, dn_sig);
     char logp[1200]; snprintf(logp, sizeof logp, "%s/train.log", outd); FILE *lf = fopen(logp, "a");
