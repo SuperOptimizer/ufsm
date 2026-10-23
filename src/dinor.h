@@ -55,7 +55,7 @@ void dr_hws_carve(dr_hws *w, const dr_head *h, int R, void *base);
 /* x [R][Cin] -> logits [R][K] */
 int dr_head_fwd(const dr_head *h, const float *P, const float *x, int R, float *logits, dr_hws *w);
 /* d loss / d logits [R][K] -> parameter gradients += into G (last: 0 skips V and g, the frozen last layer), d loss / d x [R][Cin] written */
-int dr_head_bwd(const dr_head *h, const float *P, float *G, const float *x, const float *dlogits, int R, float *dx, int last, dr_hws *w);
+int dr_head_bwd(const dr_head *h, const float *P, float *G, const float *x, const float *dlogits, int R, float *dx, int last, dr_hws *w);   /* dlogits nullptr: from w->dzn (d / d the unit bottleneck, filled by the caller) */
 
 /* teacher targets q [R][K] from teacher logits [R][K]: Sinkhorn-Knopp with iters iterations at temperature tt (iters > 0), or
    softmax((l - center) / tt) (iters 0, center [K] or nullptr); scratch: dr_sk_scratch(R, K) bytes */

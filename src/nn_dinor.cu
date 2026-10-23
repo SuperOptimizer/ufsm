@@ -138,10 +138,12 @@ extern "C" int dr_head_fwd(const dr_head *h, const float *P, const float *x, int
 }
 extern "C" int dr_head_bwd(const dr_head *h, const float *P, float *G, const float *x, const float *dl, int R, float *dx, int last, dr_hws *w) {
     const int H = h->H, B = h->B, K = h->K, Cin = h->Cin;
+    if (dl) {   /* (dl nullptr: the caller filled w->dzn = d / d zn -- SimDINO's loss on the normalised bottleneck, no prototype layer) */
     k_rownorm<<<nbk((long long)K * 32, 256), 256>>>(P + h->v, w->vn, w->vr, K, B, 1e-12f, nullptr);
     k_rownorm<<<nbk((long long)K * 32, 256), 256>>>(P + h->v, w->dvn, w->dg, K, B, 1e-12f, P + h->g);   /* W = g vn */
     CK(at_gemm(0, 0, R, B, K, dl, w->dvn, w->dzn, 0.f));                 /* d zn = dl W */
-    if (last) {
+    }
+    if (dl && last) {
         CK(at_gemm(1, 0, K, B, R, dl, w->zn, w->dvn, 0.f));              /* d W = dl^T zn (over W's scratch) */
         k_wn_bwd<<<nbk((long long)K * 32, 256), 256>>>(w->vn, w->vr, P + h->g, w->dvn, G + h->g, K, B);
         k_add<<<nbk((long long)K * B, 256), 256>>>(G + h->v, w->dvn, (long long)K * B);
