@@ -319,7 +319,7 @@ static int enc_fwd(se_enc *E, const uint8_t *u8d, int P, const se_case *c, float
     if (E->u) {   /* our UNet: the stage outputs of levels 0 .. L-2 and the attention-stage tokens (or the last stage) at level L-1 */
         const long long V = (long long)P * P * P;
         se_u8_norm(u8d, E->xin, E->cin, V, (float)c->med, (float)c->scale);
-        unet_forward(E->u, E->xin, (shape5){1, E->cin, P, P, P}, 1);
+        nn_set_tf32(1); unet_forward(E->u, E->xin, (shape5){1, E->cin, P, P, P}, 1);   /* (the UNet on the fp32 tensor-core path: its attention needs it; VERIFY builds) */
         for (int k = 0; k < E->nl; k++) {
             const int e = P >> k; const size_t S = (size_t)e * e * e; float *dst = f[k] + (size_t)n * E->ch[k] * S;
             int Sv = 0, nreg = 0, Ct = 0; const float *tok = k == E->nl - 1 ? unet_tokens(E->u, nullptr, &Sv, &Ct, &nreg) : nullptr;
@@ -328,6 +328,7 @@ static int enc_fwd(se_enc *E, const uint8_t *u8d, int P, const se_case *c, float
             if (!so || (size_t)sh.d * sh.h * sh.w != S || sh.c != E->ch[k]) { fprintf(stderr, "surf-eval: level %d stage output not kept / unexpected shape\n", k); return -1; }
             nn_d2d_async(dst, so, S * E->ch[k] * 4);
         }
+        nn_set_tf32(0);   /* (the decoder: the plain fp32 kernels) */
         return 0;
     }
     nn_sync();   /* (dinovol runs on xnet's non-blocking stream) */
@@ -436,7 +437,7 @@ int cmd_surf_eval(int argc, char **argv) {
     if (!unet_peek(ck, &ucfg, &ustep)) {   /* one of our UNets */
         E.u = unet_create(&ucfg); if (unet_load(E.u, ck) < 0) return 1;
         unet_use_params(E.u, unet_ema_params(E.u));   /* (the teacher weights, as dino-embed) */
-        unet_build(E.u, (shape5){1, ucfg.cin, P, P, P}, 1);
+        nn_set_tf32(1); unet_build(E.u, (shape5){1, ucfg.cin, P, P, P}, 1); nn_set_tf32(0);
         E.cin = ucfg.cin; E.nl = ucfg.nlev; for (int k = 0; k < E.nl; k++) E.ch[k] = ucfg.widths[k];
         E.xin = nm((size_t)ucfg.cin * P * P * P);
         fprintf(stderr, "surf-eval: our UNet %s (step %d, %d levels, cin %d)\n", ck, ustep, E.nl, E.cin);
