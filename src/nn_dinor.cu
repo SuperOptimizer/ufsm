@@ -67,6 +67,12 @@ extern "C" void dr_hws_carve(dr_hws *w, const dr_head *h, int R, void *base) {
     TK(z, r * B); TK(zn, r * B); TK(dzn, r * B); TK(zr, r);
     TK(vn, K * B); TK(dvn, K * B); TK(vr, K); TK(dg, K);
 #undef TK
+    w->zc = nullptr; w->zc_m = 0.f;
+}
+__global__ void k_zcenter(float *z, float *c, int R, int B, float m) {   /* one thread per column: optional EMA update, then z -= c */
+    const int b = blockIdx.x * blockDim.x + threadIdx.x; if (b >= B) return;
+    if (m > 0.f) { float s = 0.f; for (int r = 0; r < R; r++) s += z[(size_t)r * B + b]; c[b] = c[b] * m + s / R * (1.f - m); }
+    const float cb = c[b]; for (int r = 0; r < R; r++) z[(size_t)r * B + b] -= cb;
 }
 __device__ __forceinline__ float gelu_e(float v) { return 0.5f * v * (1.f + erff(v * 0.70710678118654752f)); }
 __device__ __forceinline__ float gelu_d(float v) { return 0.5f * (1.f + erff(v * 0.70710678118654752f)) + v * 0.3989422804014327f * expf(-0.5f * v * v); }
@@ -122,6 +128,7 @@ extern "C" int dr_head_fwd(const dr_head *h, const float *P, const float *x, int
     CK(at_gemm(0, 1, R, H, h->Cin, x, P + h->w1, w->a1, 0.f)); k_bias_gelu<<<nbk((long long)R * H, 256), 256>>>(w->a1, P + h->b1, w->h1, R, H);
     CK(at_gemm(0, 1, R, H, H, w->h1, P + h->w2, w->a2, 0.f)); k_bias_gelu<<<nbk((long long)R * H, 256), 256>>>(w->a2, P + h->b2, w->h2, R, H);
     CK(at_gemm(0, 1, R, B, H, w->h2, P + h->w3, w->z, 0.f)); k_bias<<<nbk((long long)R * B, 256), 256>>>(w->z, P + h->b3, R, B);
+    if (w->zc) k_zcenter<<<nbk(B, 256), 256>>>(w->z, w->zc, R, B, w->zc_m);
     k_rownorm<<<nbk((long long)R * 32, 256), 256>>>(w->z, w->zn, w->zr, R, B, 1e-12f, nullptr);
     k_rownorm<<<nbk((long long)K * 32, 256), 256>>>(P + h->v, w->vn, w->vr, K, B, 1e-12f, nullptr);   /* unit prototypes */
     /* logits = zn (g vn)^T: scale the unit rows by g into dvn (scratch) */

@@ -42,7 +42,9 @@ void dr_mask_cells(float *x, int n, int ps, const uint8_t *mask, float val);
 typedef struct { int Cin, H, B, K; size_t w1, b1, w2, b2, w3, b3, v, g; size_t n; } dr_head;
 void dr_head_layout(dr_head *h, int Cin, int H, int B, int K);
 /* scratch for R rows plus the normalised prototypes */
-typedef struct { float *a1, *h1, *a2, *h2, *z, *zn, *zr, *vn, *vr, *dzn, *dh, *dh2, *dvn, *dg; } dr_hws;
+typedef struct { float *a1, *h1, *a2, *h2, *z, *zn, *zr, *vn, *vr, *dzn, *dh, *dh2, *dvn, *dg;
+                 float *zc; float zc_m; } dr_hws;   /* zc [B] (optional, caller-owned): the forward subtracts it from z before the row norm (a constant
+                                                       shift: the backward is unchanged); zc_m > 0: the forward first updates zc = m zc + (1 - m) mean_r z */
 size_t dr_hws_bytes(const dr_head *h, int R);
 void dr_hws_carve(dr_hws *w, const dr_head *h, int R, void *base);
 /* x [R][Cin] -> logits [R][K] */
