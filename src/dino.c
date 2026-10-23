@@ -861,7 +861,7 @@ typedef struct {
     /* diag-dv (--ssl-dv-teacher PT): the iBOT targets from the frozen upstream dinovol teacher (its ibot_head over its patch tokens of the
        un-augmented teacher global, at the cell of each mapped point) until --ssl-dv-until (0: always), then from our EMA teacher; the student
        iBOT head predicts dinovol's 131072 prototypes (its last layer initialised from dinovol's and kept frozen) */
-    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; int fixdone, Rfix, hwarm;
+    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; int fixdone, Rfix, hwarm, icos; double cosacc; long cosn;
     int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -933,16 +933,17 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         if (xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
         xnet_set_budget((size_t)(atof(opt(argc, argv, "--ssl-dv-mem", "4")) * 1e9));
         if (!(Q->dv = dv_load(dvck)) || dv_head_host(dvck, "ibot_head", &Q->DVH, &dvPh)) return 1;
-        if (Q->DVH.B != atoi(opt(argc, argv, "--ssl-head-bottleneck", "256"))) { fprintf(stderr, "dino-train --ssl-dv-teacher: --ssl-head-bottleneck must be %d (dinovol's iBOT bottleneck)\n", Q->DVH.B); return 2; }
+        Q->icos = !strcmp(opt(argc, argv, "--ssl-ibot-loss", "ce"), "cos");   /* cos: regress dinovol's (unit) patch token directly, no prototypes */
+        if (!Q->icos && Q->DVH.B != atoi(opt(argc, argv, "--ssl-head-bottleneck", "256"))) { fprintf(stderr, "dino-train --ssl-dv-teacher: --ssl-head-bottleneck must be %d (dinovol's iBOT bottleneck)\n", Q->DVH.B); return 2; }
         Q->dvuntil = atoi(opt(argc, argv, "--ssl-dv-until", "0"));
         Q->dvm = calloc(Dd->nsrc, 8); Q->dvs = calloc(Dd->nsrc, 8); Q->dvh = calloc(Dd->nsrc, 8);
         Q->dvhist = calloc((size_t)Dd->nsrc * 256, sizeof *Q->dvhist);   /* dinovol's robust normalisation per source from the histogram of its windows so far */
     }
     if (Q->wib > 0) {
-        if (dvck) { char kb[32]; snprintf(kb, sizeof kb, "%d", Q->DVH.K); (void)kb; Q->KI = Q->DVH.K; }
+        if (dvck) Q->KI = Q->icos ? 64 : Q->DVH.K;   /* (cos: a dummy prototype layer) */
         if (Q->ich + 32 > CO || Q->PG % Q->TPS) { fprintf(stderr, "dino-train --ssl-ibot: channels %d..%d of %d outputs\n", Q->ich, Q->ich + 31, CO); return 2; }
         const int R = 2 * N * Q->IM, KI = Q->KI, IM = Q->IM;
-        dn_head_init(&Q->I, Q->ICIN, HH, HB, KI, R, seed * 61 + 5, 0); Q->I.train_g = 0;
+        dn_head_init(&Q->I, Q->ICIN, HH, Q->icos ? Q->DVH.Cin : HB, KI, R, seed * 61 + 5, 0); Q->I.train_g = 0;
         if (Q->ig != 1.f) { float *gh = malloc((size_t)KI * 4); for (int k = 0; k < KI; k++) gh[k] = Q->ig; nn_h2d(Q->I.p + Q->I.H.g, gh, (size_t)KI * 4); nn_h2d(Q->I.pt + Q->I.H.g, gh, (size_t)KI * 4); free(gh); }
         if (Q->itok) { Q->irsS = nn_malloc((size_t)IM * 4); Q->irsT = nn_malloc((size_t)R * 4); Q->d_tS = nn_malloc((size_t)2 * N * IM * 4); Q->d_tT = nn_malloc((size_t)2 * N * IM * 4); Q->tS = malloc((size_t)2 * N * IM * 4); Q->tT = malloc((size_t)2 * N * IM * 4); }
         Q->ieT = nn_malloc((size_t)R * Q->ICIN * 4); Q->inT = nn_malloc((size_t)R * 4); Q->ieS = nn_malloc((size_t)IM * Q->ICIN * 4); Q->inS = nn_malloc((size_t)IM * 4); Q->idE = nn_malloc((size_t)IM * Q->ICIN * 4);
@@ -954,7 +955,7 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         Q->cellm = malloc((size_t)2 * N * Q->GT_ * Q->GT_ * Q->GT_); Q->d_mask = nn_malloc((size_t)Q->GT_ * Q->GT_ * Q->GT_); Q->usei = calloc((size_t)KI, 1);
         if (Q->dv) {   /* the student head's last layer = dinovol's prototypes (frozen); the teacher-side buffers */
             const dr_head *IH = &Q->I.H, *DH = &Q->DVH;
-            nn_h2d(Q->I.p + IH->v, dvPh + DH->v, (size_t)DH->K * DH->B * 4); nn_h2d(Q->I.p + IH->g, dvPh + DH->g, (size_t)DH->K * 4);
+            if (!Q->icos) { nn_h2d(Q->I.p + IH->v, dvPh + DH->v, (size_t)DH->K * DH->B * 4); nn_h2d(Q->I.p + IH->g, dvPh + DH->g, (size_t)DH->K * 4); }
             nn_d2d(Q->I.pt, Q->I.p, IH->n * 4);
             Q->dvP = nn_malloc(DH->n * 4); nn_h2d(Q->dvP, dvPh, DH->n * 4); free(dvPh);
             Q->dvx = malloc((size_t)R * DH->Cin * 4); Q->dvxd = nn_malloc((size_t)R * DH->Cin * 4);
@@ -1164,9 +1165,10 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             }
         }
         nn_h2d(Q->dvxd, Q->dvx, (size_t)R * E * 4);
-        if (dr_head_fwd(&Q->DVH, Q->dvP, Q->dvxd, R, Q->il, &Q->dvw)) return 1;
+        if (Q->icos) dr_unit_rows(Q->dvxd, R, E);   /* (the teacher's unit tokens) */
+        if (!Q->icos) { if (dr_head_fwd(&Q->DVH, Q->dvP, Q->dvxd, R, Q->il, &Q->dvw)) return 1;
         if (Q->icm > 0) { dr_teacher_probs(Q->il, R, Q->KI, tt, 0, Q->icen, Q->iq, Q->isk); dr_center_update(Q->icen, Q->il, R, Q->KI, Q->icm); }
-        else dr_teacher_probs(Q->il, R, Q->KI, tt, Q->skit, nullptr, Q->iq, Q->isk);
+        else dr_teacher_probs(Q->il, R, Q->KI, tt, Q->skit, nullptr, Q->iq, Q->isk); }
     } else if (Q->wib > 0 && R > 0) {   /* iBOT targets: the teacher head over all masked rows, Sinkhorn over them */
         if (dr_head_fwd(&Q->I.H, Q->I.pt, Q->ieT, R, Q->il, &Q->I.w)) return 1;
         if (Q->icm > 0) { dr_teacher_probs(Q->il, R, Q->KI, tt, 0, Q->icen, Q->iq, Q->isk); dr_center_update(Q->icen, Q->il, R, Q->KI, Q->icm); }
@@ -1220,8 +1222,16 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             if (dr_head_fwd(&Q->I.H, Q->I.p, Q->ieS, m, Q->isl, &Q->I.w)) return 1;
             float *hw_ = malloc((size_t)m * 4); for (int k = 0; k < m; k++) hw_[k] = Q->wib / (float)(R > 0 ? R : 1); nn_h2d(Q->iw, hw_, (size_t)m * 4); free(hw_);
             Q->lastm = m;
+            if (Q->icos && dvon) {   /* 1 - cos(student unit bottleneck, dinovol's unit token): d / d zn = -w t */
+                const int E = Q->DVH.Cin; const float *t = Q->dvxd + (size_t)Q->off[j] * E;
+                nn_d2d(Q->I.w.dzn, t, (size_t)m * E * 4); nn_scale(Q->I.w.dzn, -Q->wib / (float)(R > 0 ? R : 1), (size_t)m * E);
+                { float *zh = malloc((size_t)m * E * 4), *th = malloc((size_t)m * E * 4); nn_d2h(zh, Q->I.w.zn, (size_t)m * E * 4); nn_d2h(th, t, (size_t)m * E * 4);
+                  for (int k = 0; k < m; k++) { double d = 0; for (int e = 0; e < E; e++) d += (double)zh[(size_t)k * E + e] * th[(size_t)k * E + e]; Q->cosacc += d; Q->cosn++; } free(zh); free(th); }
+                if (dr_head_bwd(&Q->I.H, Q->I.p, Q->I.g, Q->ieS, nullptr, m, Q->idE, 0, &Q->I.w)) return 1;
+            } else {
             dr_ce(Q->isl, m, Q->KI, Q->ts, Q->iq + (size_t)Q->off[j] * Q->KI, Q->iid, Q->iid, Q->iw, m, Q->idsl, Q->outs + 6, Q->ice); nn_axpy(Q->outs + 8, 1.f, Q->outs + 6, 1);
             if (dr_head_bwd(&Q->I.H, Q->I.p, Q->I.g, Q->ieS, Q->idsl, m, Q->idE, step > Q->freeze && !Q->dv, &Q->I.w)) return 1;
+            }
             if (Q->itok) dr_rownorm_bwd(Q->idE, Q->ieS, Q->irsS, m, CT, Q->idE);
             if (!Q->itok) dr_scatter_unit_f32(Q->ieS, Q->idE, Q->inS, Q->d_hS + (size_t)j * Q->IM, m, 32, g3, 1.f, Q->glzib + (size_t)Q->ich * g3);
             if (dbg && j == 0) { float *h = malloc((size_t)m * Q->ICIN * 4), *nr = malloc((size_t)m * 4); nn_d2h(h, Q->idE, (size_t)m * Q->ICIN * 4); nn_d2h(nr, Q->inS, (size_t)m * 4);
@@ -1361,7 +1371,8 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             double sm = 0, co = 0; long no = 0;
             for (int b = 0; b < Bz; b++) { double mu = 0, v = 0; for (int a = 0; a < m; a++) mu += zn[(size_t)a * Bz + b] / m; for (int a = 0; a < m; a++) v += (zn[(size_t)a * Bz + b] - mu) * (zn[(size_t)a * Bz + b] - mu) / m; sm += sqrt(v) / Bz; }
             for (int a = 0; a < m; a++) for (int c = a + 1; c < m; c++) { double d = 0; for (int b = 0; b < Bz; b++) d += zn[(size_t)a * Bz + b] * zn[(size_t)c * Bz + b]; co += d; no++; }
-            const size_t l5 = strlen(line);
+            size_t l5 = strlen(line);
+            if (Q->icos) { const size_t l6 = strlen(line); snprintf(line + l6, cap - l6, " | ibot cos(student, dinovol token) %.4f", Q->cosn ? Q->cosacc / Q->cosn : 0.0); Q->cosacc = 0; Q->cosn = 0; l5 = strlen(line); }
             snprintf(line + l5, cap - l5, " | ibot student feat std/ch %.4f |mean| %.4f H %.2f pmax %.4f tok z std/dim %.4f (1/sqrt(B) %.4f) cos other %.4f%s", fsd, fm, Hs, pms, sm, 1 / sqrt((double)Bz), no ? co / no : 0.0, Q->dv ? (Q->dvuntil <= 0 || step <= Q->dvuntil ? " [dv teacher]" : " [ema teacher]") : "");
             free(sl); free(zn);
         }
