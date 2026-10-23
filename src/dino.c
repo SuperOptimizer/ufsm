@@ -2,6 +2,7 @@
    view-pair data tool (ufsm halves). See DESIGN.md "Own dense embedding net (dino-train)". */
 #include "dino.h"
 #include "dinor.h"
+#include "sslstat.h"
 #include "band.h"
 #include "attn.h"
 #include "dinovol.h"
@@ -98,7 +99,7 @@ int cmd_dino_halves(int argc, char **argv) {
 #include <unistd.h>
 #include <signal.h>
 
-enum { DN_MAXSRC = 128, DN_MAXBOX = 256, DN_SLOTS = 16, DN_MAXW = 16 };   /* (slots / workers: at most; --slots / --workers) */
+enum { DN_MAXSRC = 128, DN_MAXBOX = 256, DN_SLOTS = 64, DN_MAXW = 16 };   /* (slots / workers: at most; --slots / --workers) */
 typedef struct {
     char name[64]; z3 *ca, *cb, *codes, *ink, *phase; int halves; int cscale, pscale; float um;   /* phase: the stored winding phase (PHASE_* bytes; sources "phase": {"root", "key", "scale"}) */ float *axz;   /* scroll axis (y, x) per CT plane (sources "axis" + "axis_scale"), or nullptr */   /* CT voxels per code voxel (codes on a coarser grid; 1: the same grid) */
     int64_t org[3];                              /* added to window corners (ct array coordinates) to address the codes (global grid) */
@@ -110,7 +111,7 @@ typedef struct {
 typedef struct { int P, ngt, nssl, nair, margin; int nsrc; dn_src src[DN_MAXSRC]; double wsum; int ident; int nink; double wsum_l, wsum_u, share_u; char excl[8][64]; int nexcl;
     /* recipe views drawn by the loader workers: globals vP^3 (zoom zlo..zhi), vnloc locals vPL^3 (lzlo..lzhi); uw: per global view the stored phase
        resampled into the view + its winding mod 4 (band_wind4_tiled); ikp: the ink-splat probability resampled into the view */
-    int vP, vPL, vnloc, uw, ikp; float zlo, zhi, lzlo, lzhi; } dn_data;   /* share_u: the unlabelled sources' share of the draws (< 0: by weight over all; 0: labelled only) */   /* nink: ink points per sample (half ink, half no-ink) */   /* ident: no window geometry (the recipe draws its own views) */
+    int vP, vPL, vnloc, uw, ikp; float zlo, zhi, lzlo, lzhi, vovl; } dn_data;   /* vovl: the globals' minimum overlap per axis (fraction of the smaller; 0: 1/4) */   /* share_u: the unlabelled sources' share of the draws (< 0: by weight over all; 0: labelled only) */   /* nink: ink points per sample (half ink, half no-ink) */   /* ident: no window geometry (the recipe draws its own views) */
 typedef struct {   /* one sample: two CT views, the geometry, the points (output-space voxel indices) */
     uint8_t *ca, *cb; int si; int64_t corner[3]; dn_geom g; int halves; int hasax; float *ayx;   /* the axis (y, x) per window plane (window coords; --axis-input) */
     int ngt, nssl; int *gidx, *gcode, *gxyz, *sidx;
@@ -143,7 +144,7 @@ static void dn_draw_views(const dn_data *D, dn_sample *S, uint64_t *ar) {
         t->m = (int)lrintf(t->n * z); if (t->m > Ps) t->m = Ps; if (t->m < 8) t->m = 8;
         for (int d = 0; d < 3; d++) {
             int lo2 = 0, hi2 = Ps - t->m;
-            if (v == 1) { const int ov = (t->m < S->xf[0].m ? t->m : S->xf[0].m) / 4; const int a = S->xf[0].off[d] - t->m + ov, b = S->xf[0].off[d] + S->xf[0].m - ov; if (a > lo2) lo2 = a; if (b < hi2) hi2 = b; if (hi2 < lo2) hi2 = lo2; }
+            if (v == 1) { const int ov = (int)((t->m < S->xf[0].m ? t->m : S->xf[0].m) * (D->vovl > 0 ? D->vovl : 0.25f)); const int a = S->xf[0].off[d] - t->m + ov, b = S->xf[0].off[d] + S->xf[0].m - ov; if (a > lo2) lo2 = a; if (b < hi2) hi2 = b; if (hi2 < lo2) hi2 = lo2; }
             t->off[d] = lo2 + (int)(rng_u(ar) * (hi2 - lo2 + 1)); if (t->off[d] > Ps - t->m) t->off[d] = Ps - t->m;
         }
         int pm[3] = {0, 1, 2}; for (int k = 2; k > 0; k--) { const int j = (int)(rng_next(ar) % (uint64_t)(k + 1)); const int q = pm[k]; pm[k] = pm[j]; pm[j] = q; }
@@ -649,6 +650,7 @@ static int8_t *dn_embed_box(unet *u, z3 *ct, const int64_t box[6], int P, int h,
                 nn_h2d(ayd, ayh, (size_t)P * 8); }
             dr_axis_view(xid, 0, P, P, ayd, axz != nullptr, x + p3);
         }
+        if (cin == 2 && !axz) nn_zero(x + p3, p3 * 4);   /* (a --mask-input net: nothing masked) */
         if (cin == 2 && axz) {
             const int64_t nzv = z3_meta_of(ct)->shape[0];
             for (int z = 0; z < P; z++) { int64_t gz = o[0] + z; gz = gz < 0 ? 0 : gz >= nzv ? nzv - 1 : gz; ayh[2 * z] = axz[2 * gz] - (float)o[1]; ayh[2 * z + 1] = axz[2 * gz + 1] - (float)o[2]; }
@@ -797,6 +799,420 @@ static int dn_block_mask(uint8_t *m, int G, int target, uint64_t *r) {
    global a <- teacher b and b <- a, each local <- both, all terms / (2 + 2 locals); KoLeo on the student global CLS against a queue of
    earlier student CLS; the dense GT sheet SupCon (--gt weight) on the labelled voxels mapped into each global view. Locals run on a second
    network that shares the weights (unet_use_params); its gradient joins before the optimiser step. */
+/* ---- the multi-sample SSL batch (--ssl-batch N): upstream DINO on a real batch beside the batch-1 supervised window ----
+   Batch 1 has 2 CLS rows: Sinkhorn / centring cannot sharpen them (the DINO term stays at ln K). Each step (every --ssl-every) N samples of
+   --ssl-source-P^3 windows from the weighted sources (U0 + labelled; --ssl-unlabelled-share), each with 2 globals of --ssl-P^3 (upstream
+   scale 0.18-0.45 of the window: zoom 0.84-1.15) and --ssl-locals locals of --ssl-local-P^3 (0.023-0.057: 0.86-1.16), its own intensity
+   augmentation per view. The EMA teacher (shared weights through unet_use_params) on the 2N globals; the CLS (--cls reg: a learned register
+   token, else the token mean), layer-normed; the DINO head (AdamW, upstream lr, g fixed) -> --ssl-protos prototypes; Sinkhorn over the
+   batch's 2N teacher rows; the student per view (forward, loss over the batch's targets, backward: per-view activations), global (i, v)
+   vs teacher (i, 1 - v), each local vs both of its sample; KoLeo per global view chunk over the batch (the other samples' CLS of that chunk:
+   the student's when already computed this step, the teacher's otherwise -- never the same sample's other view). The gradient joins u's. */
+typedef struct {
+    unet *u, *ug, *ul; int N, PG, PL, NL, Ps, C, CC, K, CIN, cls_reg, cls_norm, freeze, skit, nsum, ure; float ts, wdino, wk, hlr, plr, wd, adrop, noise;
+    dn_data *Ds; dn_ring *R; uint8_t *src; float *xg, *xl, *glzg, *glzl, *tgrad; size_t tgn; dr_xf *xfd, *xfh; dr_int *itd, *ith;
+    dn_head H; float *tl, *tq, *sl, *dsl, *clsT, *clsS, *dcls, *rsS, *rsT, *bank, *bex, *outs, *hout, *d_ayx; void *sks, *ces; int *pS, *pT; float *pW;
+    uint64_t ar; uint8_t *use; double sums[8]; shape5 xsg, xsl;
+    /* iBOT (--ssl-ibot W): masked 8^3 cells of each global (prob 0.5, ratio 0.1-0.5, <= IM per view), the head features (channels
+       --ssl-ibot-ch .. +32 of the output) at the cell centres vs the teacher's at the same physical points of the other global; iBOT head ->
+       KI prototypes, Sinkhorn over all the batch's masked rows */
+    float cm, icm, *cen, *icen; double dg[8];
+    int easy, ccen, cstd; float *cmean, *hmean, *cistd, *histd, *cpre;
+    float vv, vc, *vx, *vg, *vgd; double *vcov;
+    float simg, sima, *zT, *zbank, *dzh, *zcur; double *zA;
+    float zv, zcv, *zvb, *zvh, *zvd; double *zcov; int vramp;   /* vramp: the VICReg weights ramp in linearly over --ssl-vic-ramp steps */   /* --ssl-zvic-var / --ssl-zvic-cov: VICReg on the head's unit bottleneck zn over the batch (hinge std >= 1 / sqrt(B)) */   /* --ssl-simdino G: SimDINO (1/2 |z_s - z_t|^2 on the unit bottleneck - G R_eps(student global z)), --ssl-sim-eps2 */   /* --ssl-vic-var / --ssl-vic-cov: VICReg variance hinge (std >= 1) + off-diagonal covariance on the head-input CLS over the batch */ double st[12];   /* cstd: --ssl-cls-std (per-dimension batch standardisation of the CLS) */   /* --ssl-easy-steps S: shared symmetry / no inversion / mild intensity until S; --ssl-cls-center: the batch mean CLS removed; st: per-step stats */   /* dg: the teacher-side diagnostics of the last 50th step (dn_ssl_diag) */   /* --ssl-center / --ssl-ibot-center M: DINOv1 centring (EMA of the batch's teacher logits) instead of Sinkhorn */
+    double zsmin, zsmed;   /* the last step's z per-dimension std: min / median (teacher rows) */
+    int exact, *hasaxv, *amd, *amh; double *vmu, *vsd, *zmu, *zsd; float *kg, *kgd;   /* kg: the exact bank's full-batch KoLeo gradient per row (chunk-major) */   /* --ssl-exact-bank: the batch statistics from a no-grad student pass (GradCache); per-step chunk stats */
+    float wib; int KI, IM, ich, TPS, GT_, cnt[2048], off[2048]; dn_head I; float *ieT, *inT, *ieS, *inS, *idE, *il, *iq, *isl, *idsl, *iw, *glzib; void *isk, *ice; int *d_hS, *d_hT, *iid, *hS, *hT; uint8_t *cellm, *d_mask; uint8_t *usei;
+} dn_ssl;
+static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
+    memset(Q, 0, sizeof *Q); Q->u = u; Q->C = C; Q->CC = cls_reg == 2 ? 2 * C : C; Q->cls_reg = cls_reg; Q->cls_norm = cls_norm; Q->noise = noise; Q->CIN = cfg->cin;
+    Q->N = atoi(opt(argc, argv, "--ssl-batch", "16")); Q->PG = atoi(opt(argc, argv, "--ssl-P", "128")); Q->PL = atoi(opt(argc, argv, "--ssl-local-P", "64"));
+    Q->NL = atoi(opt(argc, argv, "--ssl-locals", "4")); Q->Ps = atoi(opt(argc, argv, "--ssl-source-P", "192")); Q->K = atoi(opt(argc, argv, "--ssl-protos", "16384"));
+    Q->ts = 0.1f; Q->wdino = (float)atof(opt(argc, argv, "--ssl-dino", "1")); Q->wk = (float)atof(opt(argc, argv, "--ssl-koleo", "0.1"));
+    Q->hlr = (float)atof(opt(argc, argv, "--ssl-head-lr", "1.8e-4")); Q->plr = (float)atof(opt(argc, argv, "--ssl-proto-lr", opt(argc, argv, "--ssl-head-lr", "1.8e-4")));
+    Q->wd = (float)atof(opt(argc, argv, "--ssl-wd", "0.04")); Q->freeze = atoi(opt(argc, argv, "--ssl-freeze-last", "1250")); Q->skit = atoi(opt(argc, argv, "--ssl-sk-iters", "3"));
+    Q->adrop = (float)atof(opt(argc, argv, "--axis-drop", "0.15")); Q->ure = atoi(opt(argc, argv, "--usage-window", "5000"));
+    const int L = 1 << (cfg->nlev - 1);
+    if (Q->N < 2 || Q->N > 1024 || Q->PG % L || Q->PL % L || Q->NL > 8) { fprintf(stderr, "dino-train --ssl-batch: 2..1024 samples, views multiples of %d, <= 8 locals\n", L); return 2; }
+    Q->exact = atoi(opt(argc, argv, "--ssl-exact-bank", "0")); Q->kg = Q->exact ? malloc((size_t)2 * Q->N * Q->CC * 4) : nullptr; Q->kgd = nn_malloc((size_t)Q->CC * 4); Q->hasaxv = malloc((size_t)Q->N * 4); Q->amd = nn_malloc((size_t)2 * Q->N * 4); Q->amh = malloc((size_t)2 * Q->N * 4);
+    float zlo = 0.84f, zhi = 1.15f, lzlo = 0.86f, lzhi = 1.16f;
+    sscanf(opt(argc, argv, "--ssl-zoom", "0.84,1.15"), "%f,%f", &zlo, &zhi); sscanf(opt(argc, argv, "--ssl-local-zoom", "0.86,1.16"), "%f,%f", &lzlo, &lzhi);
+    if ((int)ceilf(Q->PG * zhi) > Q->Ps || (int)ceilf(Q->PL * lzhi) > Q->Ps) { fprintf(stderr, "dino-train --ssl-batch: views must fit the source window\n"); return 2; }
+    /* the SSL sampler: the sources at the SSL window, no labels drawn (views only) */
+    dn_data *Ds = malloc(sizeof *Ds); *Ds = *Dd; Ds->P = Q->Ps; Ds->ngt = 64; Ds->nair = 0; Ds->nink = 0; Ds->uw = 0; Ds->ikp = 0; Ds->ident = 1;
+    Ds->vP = Q->PG; Ds->vPL = Q->PL; Ds->vnloc = Q->NL; Ds->zlo = zlo; Ds->zhi = zhi; Ds->lzlo = lzlo; Ds->lzhi = lzhi;
+    Ds->share_u = atof(opt(argc, argv, "--ssl-unlabelled-share", "-1")); Ds->vovl = (float)atof(opt(argc, argv, "--ssl-overlap", "0.5")); Q->Ds = Ds;
+    dn_ring *R = calloc(1, sizeof *R); R->D = Ds; R->seed = seed * 7 + 1234567; R->nthreads = 2; pthread_mutex_init(&R->mu, nullptr); pthread_cond_init(&R->cv, nullptr);
+    R->nslots = 2 * Q->N + 4 < DN_SLOTS ? 2 * Q->N + 4 : DN_SLOTS; const size_t ps3 = (size_t)Q->Ps * Q->Ps * Q->Ps;
+    for (int i = 0; i < R->nslots; i++) { dn_sample *S = &R->slot[i]; S->ca = malloc(ps3); S->cb = malloc(ps3); S->gidx = malloc(64 * 4); S->gcode = malloc(64 * 4); S->gxyz = malloc(64 * 12); S->sidx = malloc(4); S->ayx = malloc((size_t)Q->Ps * 8); S->ixyz = malloc(12); }
+    R->nworkers = atoi(opt(argc, argv, "--ssl-workers", "8")); if (R->nworkers > DN_MAXW) R->nworkers = DN_MAXW;
+    for (int i = 0; i < R->nworkers; i++) pthread_create(&R->th[i], nullptr, ring_worker, R);
+    Q->R = R;
+    /* nets: the globals' and the locals' sizes, the owner's weights (teacher: its EMA) */
+    Q->ug = unet_create(cfg); Q->ul = unet_create(cfg);
+    unet_use_params(Q->ug, unet_live_params(u)); unet_use_params(Q->ul, unet_live_params(u));
+    Q->xsg = (shape5){1, cfg->cin, Q->PG, Q->PG, Q->PG}; Q->xsl = (shape5){1, cfg->cin, Q->PL, Q->PL, Q->PL};
+    unet_build(Q->ug, Q->xsg, 1); unet_build(Q->ul, Q->xsl, 1);
+    const size_t g3 = (size_t)Q->PG * Q->PG * Q->PG, l3 = (size_t)Q->PL * Q->PL * Q->PL; const int N = Q->N, NV = 2 * N + Q->NL * N, CO = cfg->cout;
+    Q->src = nn_malloc((size_t)N * ps3); Q->xg = nn_malloc((size_t)2 * N * Q->CIN * g3 * 4); Q->xl = nn_malloc((size_t)(Q->NL ? Q->NL : 1) * N * Q->CIN * l3 * 4);
+    Q->glzg = nn_malloc(g3 * CO * 4); nn_zero(Q->glzg, g3 * CO * 4); Q->glzl = nn_malloc(l3 * CO * 4); nn_zero(Q->glzl, l3 * CO * 4);
+    Q->xfd = nn_malloc(sizeof(dr_xf) * NV); Q->itd = nn_malloc(sizeof(dr_int) * NV); Q->xfh = malloc(sizeof(dr_xf) * NV); Q->ith = malloc(sizeof(dr_int) * NV);
+    Q->d_ayx = nn_malloc((size_t)N * Q->Ps * 8);
+    const int HH = atoi(opt(argc, argv, "--ssl-head-hidden", "2048")), HB = atoi(opt(argc, argv, "--ssl-head-bottleneck", "256"));
+    dn_head_init(&Q->H, Q->CC, HH, HB, Q->K, 2 * N, seed * 59 + 3, 0); Q->H.train_g = 0;
+    Q->tl = nn_malloc((size_t)2 * N * Q->K * 4); Q->tq = nn_malloc((size_t)2 * N * Q->K * 4); Q->sks = nn_malloc(dr_sk_scratch(2 * N, Q->K));
+    Q->sl = nn_malloc((size_t)Q->K * 4); Q->dsl = nn_malloc((size_t)Q->K * 4); Q->ces = nn_malloc(dr_ce_scratch(1));
+    Q->clsT = nn_malloc((size_t)2 * N * Q->CC * 4); Q->clsS = nn_malloc((size_t)Q->CC * 4); Q->dcls = nn_malloc((size_t)Q->CC * 4); Q->rsS = nn_malloc(16); Q->rsT = nn_malloc((size_t)2 * N * 4);
+    Q->bank = nn_malloc((size_t)2 * N * Q->CC * 4); Q->bex = nn_malloc((size_t)N * Q->CC * 4); Q->outs = nn_malloc(16 * 4); Q->hout = malloc(16 * 4);
+    Q->pS = nn_malloc(8); Q->pT = nn_malloc(8); Q->pW = nn_malloc(8); Q->use = calloc((size_t)Q->K, 1); Q->ar = seed * 977 + 31;
+    Q->easy = atoi(opt(argc, argv, "--ssl-easy-steps", "0")); Q->ccen = atoi(opt(argc, argv, "--ssl-cls-center", "0"));
+    Q->cmean = nn_malloc((size_t)Q->CC * 4); Q->hmean = malloc((size_t)Q->CC * 4); Q->cstd = atoi(opt(argc, argv, "--ssl-cls-std", "0"));
+    Q->cistd = nn_malloc((size_t)Q->CC * 4); Q->histd = malloc((size_t)Q->CC * 4); Q->cpre = nn_malloc((size_t)Q->CC * 4);
+    Q->simg = (float)atof(opt(argc, argv, "--ssl-simdino", "0")); Q->sima = 256.f / (float)atof(opt(argc, argv, "--ssl-sim-eps2", "0.5"));
+    if (Q->simg > 0) { const int Bz = atoi(opt(argc, argv, "--ssl-head-bottleneck", "256")); Q->sima = (float)Bz / (float)atof(opt(argc, argv, "--ssl-sim-eps2", "0.5"));
+        Q->zT = nn_malloc((size_t)2 * Q->N * Bz * 4); Q->zbank = malloc((size_t)2 * Q->N * Bz * 4); Q->dzh = malloc((size_t)Bz * 4); Q->zcur = malloc((size_t)Bz * 4); Q->zA = malloc((size_t)Bz * Bz * 8); }
+    Q->zv = (float)atof(opt(argc, argv, "--ssl-zvic-var", "0")); Q->zcv = (float)atof(opt(argc, argv, "--ssl-zvic-cov", "0"));
+    if (Q->zv > 0 || Q->zcv > 0) { const int Bz = atoi(opt(argc, argv, "--ssl-head-bottleneck", "256")); Q->zvb = malloc((size_t)2 * Q->N * Bz * 4); Q->zvh = malloc((size_t)Bz * 4); Q->zvd = nn_malloc((size_t)Bz * 4); Q->zcov = malloc((size_t)2 * Bz * Bz * 8);
+        Q->zmu = malloc((size_t)2 * Bz * 8); Q->zsd = malloc((size_t)2 * Bz * 8); }
+    Q->vramp = atoi(opt(argc, argv, "--ssl-vic-ramp", "0"));
+    Q->vv = (float)atof(opt(argc, argv, "--ssl-vic-var", "0")); Q->vc = (float)atof(opt(argc, argv, "--ssl-vic-cov", "0"));
+    if (Q->vv > 0 || Q->vc > 0) { Q->vx = malloc((size_t)2 * Q->N * Q->CC * 4); Q->vg = malloc((size_t)Q->CC * 4); Q->vgd = nn_malloc((size_t)Q->CC * 4); Q->vcov = malloc((size_t)2 * Q->CC * Q->CC * 8);
+        Q->vmu = malloc((size_t)2 * Q->CC * 8); Q->vsd = malloc((size_t)2 * Q->CC * 8); }
+    Q->cm = (float)atof(opt(argc, argv, "--ssl-center", "0")); Q->icm = (float)atof(opt(argc, argv, "--ssl-ibot-center", "0"));
+    Q->cen = nn_malloc((size_t)Q->K * 4); nn_zero(Q->cen, (size_t)Q->K * 4);
+    Q->wib = (float)atof(opt(argc, argv, "--ssl-ibot", "0")); Q->KI = atoi(opt(argc, argv, "--ssl-ibot-protos", "8192")); Q->IM = atoi(opt(argc, argv, "--ssl-ibot-max", "512"));
+    Q->ich = atoi(opt(argc, argv, "--ssl-ibot-ch", "0")); Q->TPS = 8; Q->GT_ = Q->PG / Q->TPS;
+    if (Q->wib > 0) {
+        if (Q->ich + 32 > CO || Q->PG % Q->TPS) { fprintf(stderr, "dino-train --ssl-ibot: channels %d..%d of %d outputs\n", Q->ich, Q->ich + 31, CO); return 2; }
+        const int R = 2 * N * Q->IM, KI = Q->KI, IM = Q->IM;
+        dn_head_init(&Q->I, 32, HH, HB, KI, R, seed * 61 + 5, 0); Q->I.train_g = 0;
+        Q->ieT = nn_malloc((size_t)R * 32 * 4); Q->inT = nn_malloc((size_t)R * 4); Q->ieS = nn_malloc((size_t)IM * 32 * 4); Q->inS = nn_malloc((size_t)IM * 4); Q->idE = nn_malloc((size_t)IM * 32 * 4);
+        Q->il = nn_malloc((size_t)R * KI * 4); Q->iq = nn_malloc((size_t)R * KI * 4); Q->isk = nn_malloc(dr_sk_scratch(R, KI)); Q->isl = nn_malloc((size_t)IM * KI * 4); Q->idsl = nn_malloc((size_t)IM * KI * 4);
+        Q->ice = nn_malloc(dr_ce_scratch(IM)); Q->iw = nn_malloc((size_t)IM * 4); Q->glzib = nn_malloc(g3 * CO * 4); nn_zero(Q->glzib, g3 * CO * 4);
+        Q->d_hS = nn_malloc((size_t)2 * N * IM * 4); Q->d_hT = nn_malloc((size_t)2 * N * IM * 4); Q->hS = malloc((size_t)2 * N * IM * 4); Q->hT = malloc((size_t)2 * N * IM * 4);
+        Q->iid = nn_malloc((size_t)R * 4); { int *h = malloc((size_t)R * 4); for (int i = 0; i < R; i++) h[i] = i; nn_h2d(Q->iid, h, (size_t)R * 4); free(h); }
+        Q->icen = nn_malloc((size_t)KI * 4); nn_zero(Q->icen, (size_t)KI * 4);
+        Q->cellm = malloc((size_t)2 * N * Q->GT_ * Q->GT_ * Q->GT_); Q->d_mask = nn_malloc((size_t)Q->GT_ * Q->GT_ * Q->GT_); Q->usei = calloc((size_t)KI, 1);
+        fprintf(stderr, "dino-train --ssl-ibot %g: masked %d^3 cells (<= %d per global), head channels %d..%d, iBOT head -> %d prototypes, Sinkhorn over the batch's masked rows\n", Q->wib, Q->TPS, IM, Q->ich, Q->ich + 31, KI);
+    }
+    fprintf(stderr, "dino-train --ssl-batch: %d samples of %d^3 windows per step (%d workers, %d slots), 2 globals %d^3 (zoom %.2f..%.2f) + %d locals %d^3 (%.2f..%.2f), "
+                    "CLS %s, DINO head %d-%d-%d -> %d prototypes (AdamW %.2g, prototypes %.2g, wd %.2g, frozen %d steps), Sinkhorn over the batch's %d teacher rows, KoLeo %g per view chunk\n",
+            N, Q->Ps, R->nworkers, R->nslots, Q->PG, zlo, zhi, Q->NL, Q->PL, lzlo, lzhi, cls_reg == 2 ? "register 0 | token mean" : cls_reg ? "register 0" : "token mean", HH, HH, HB, Q->K, Q->hlr, Q->plr, Q->wd, Q->freeze, 2 * N, Q->wk);
+    return 0;
+}
+/* the SSL heads beside a checkpoint (CKPT.ssl): DINO head p, pt, the centre; iBOT head p, pt, its centre (when on) */
+static void dn_ssl_io(dn_ssl *Q, const char *ckpt, int save) {
+    char fp[1300]; snprintf(fp, sizeof fp, "%s.ssl", ckpt); FILE *f = fopen(fp, save ? "wb" : "rb"); if (!f) return;
+    struct { float *d; size_t n; } a[6] = {{Q->H.p, Q->H.H.n}, {Q->H.pt, Q->H.H.n}, {Q->cen, (size_t)Q->K}, {Q->wib > 0 ? Q->I.p : nullptr, Q->wib > 0 ? Q->I.H.n : 0},
+                                           {Q->wib > 0 ? Q->I.pt : nullptr, Q->wib > 0 ? Q->I.H.n : 0}, {Q->wib > 0 ? Q->icen : nullptr, Q->wib > 0 ? (size_t)Q->KI : 0}};
+    int ok = 1;
+    for (int k = 0; k < 6 && ok; k++) { if (!a[k].d) continue; float *h = malloc(a[k].n * 4);
+        if (save) { nn_d2h(h, a[k].d, a[k].n * 4); ok = fwrite(h, 4, a[k].n, f) == a[k].n; } else { ok = fread(h, 4, a[k].n, f) == a[k].n; if (ok) nn_h2d(a[k].d, h, a[k].n * 4); }
+        free(h); }
+    fclose(f);
+    if (!save) fprintf(stderr, "dino-train --ssl-batch: heads %s from %s\n", ok ? "restored" : "NOT restored (short file)", fp);
+}
+/* teacher-side diagnostics (every 50 steps, before the centre update): the head's bottleneck zn cosine between samples, the teacher logit
+   std over prototypes per row (raw cosines and after the centre), the centre norm, the prototype directions' mean |cosine| (256 sampled) */
+static void dn_ssl_diag(dn_ssl *Q) {
+    const int R = 2 * Q->N, K = Q->K, B = Q->H.H.B; float *tl = malloc((size_t)R * K * 4), *cen = malloc((size_t)K * 4), *zn = malloc((size_t)R * B * 4);
+    nn_d2h(tl, Q->tl, (size_t)R * K * 4); nn_d2h(cen, Q->cen, (size_t)K * 4); nn_d2h(zn, Q->H.w.zn, (size_t)R * B * 4);
+    double sraw = 0, scen = 0, cn = 0;
+    for (int r = 0; r < R; r++) { double m = 0, v = 0, mc = 0, vc = 0; for (int k = 0; k < K; k++) { const double a = tl[(size_t)r * K + k], b = a - cen[k]; m += a; v += a * a; mc += b; vc += b * b; }
+        m /= K; mc /= K; sraw += sqrt(fmax(v / K - m * m, 0)) / R; scen += sqrt(fmax(vc / K - mc * mc, 0)) / R; }
+    for (int k = 0; k < K; k++) cn += (double)cen[k] * cen[k];
+    double zc = 0; long nz = 0;
+    for (int a = 0; a < R; a++) for (int b = a + 1; b < R; b++) if (a / 2 != b / 2) { double x = 0; for (int c = 0; c < B; c++) x += (double)zn[(size_t)a * B + c] * zn[(size_t)b * B + c]; zc += x; nz++; }
+    const int NP = K < 256 ? K : 256; float *V = malloc((size_t)NP * B * 4); double pc = 0; long np_ = 0;
+    nn_d2h(V, Q->H.p + Q->H.H.v, (size_t)NP * B * 4);
+    for (int a = 0; a < NP; a++) for (int b = a + 1; b < NP; b++) { double x = 0, ya = 0, yb = 0; for (int c = 0; c < B; c++) { x += (double)V[(size_t)a * B + c] * V[(size_t)b * B + c]; ya += (double)V[(size_t)a * B + c] * V[(size_t)a * B + c]; yb += (double)V[(size_t)b * B + c] * V[(size_t)b * B + c]; } pc += fabs(x) / sqrt(ya * yb + 1e-30); np_++; }
+    Q->dg[0] = nz ? zc / nz : 0; Q->dg[1] = sraw; Q->dg[2] = scen; Q->dg[3] = sqrt(cn); Q->dg[4] = np_ ? pc / np_ : 0;
+    free(tl); free(cen); free(zn); free(V);
+}
+static void dn_ssl_cls(dn_ssl *Q, unet *n, float *cls) {   /* the CLS of the net's last forward */
+    int S = 0, nreg = 0; const float *tok = unet_tokens(n, nullptr, &S, nullptr, &nreg);
+    if (Q->cls_reg == 2) { nn_d2d(cls, tok, (size_t)Q->C * 4); dr_pool_fwd(tok, 1, S, Q->C, nreg, cls + Q->C); }   /* (--cls both: register | token mean) */
+    else if (Q->cls_reg) nn_d2d(cls, tok, (size_t)Q->C * 4); else dr_pool_fwd(tok, 1, S, Q->C, nreg, cls);
+}
+static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
+    const int N = Q->N, C = Q->CC, CT = Q->C, K = Q->K, NV = 2 * N + Q->NL * N, CIN = Q->CIN; const size_t g3 = (size_t)Q->PG * Q->PG * Q->PG, l3 = (size_t)Q->PL * Q->PL * Q->PL, ps3 = (size_t)Q->Ps * Q->Ps * Q->Ps;
+    const float gs = nn_get_grad_scale(); int *hasax = Q->hasaxv;
+    /* N samples: windows up, views (the workers' crops / symmetries) + per-view intensity augmentation */
+    for (int i = 0; i < N; i++) {
+        dn_sample *Sm = ring_get(Q->R); if (!Sm) { fprintf(stderr, "dino-train --ssl-batch: loader failed\n"); return 1; }
+        const dn_src *sr = &Q->Ds->src[Sm->si];
+        nn_h2d(Q->src + (size_t)i * ps3, Sm->ca, ps3); hasax[i] = Sm->hasax; if (CIN == 5 && Sm->hasax) nn_h2d(Q->d_ayx + (size_t)i * Q->Ps * 2, Sm->ayx, (size_t)Q->Ps * 8);
+        for (int k = 0; k < 2 + Q->NL; k++) {
+            const int j = k < 2 ? 2 * i + k : 2 * N + Q->NL * i + (k - 2);
+            Q->xfh[j] = Sm->xf[k]; Q->xfh[j].src = i;
+            dr_int *a = &Q->ith[j]; memset(a, 0, sizeof *a); uint64_t *ar = &Q->ar;
+            a->center = sr->center; a->scale = sr->scale; a->lo = 0.f; a->hi = 255.f;
+            a->gamma = rng_u(ar) < 0.25 ? expf((float)(2 * rng_u(ar) - 1) * logf(1.25f)) : 1.f;
+            a->contrast = rng_u(ar) < 0.25 ? 0.8f + 0.4f * (float)rng_u(ar) : 1.f; a->mean = 0.f;
+            a->bias = rng_u(ar) < 0.15 ? 0.15f * (float)(sqrt(-2 * log(rng_u(ar) + 1e-12)) * cos(6.283185307 * rng_u(ar))) : 0.f;
+            a->invert = rng_u(ar) < 0.15; a->sigma = Q->noise * (float)rng_u(ar); a->seed = (uint32_t)(step * 4099 + j);
+        }
+        ring_put(Q->R, Sm);
+        if (step <= Q->easy) for (int k = 0; k < 2 + Q->NL; k++) {   /* easy views: every view of the sample in global 0's symmetry; no inversion; mild intensity */
+            const int j = k < 2 ? 2 * i + k : 2 * N + Q->NL * i + (k - 2), j0 = 2 * i;
+            for (int d = 0; d < 3; d++) { Q->xfh[j].perm[d] = Q->xfh[j0].perm[d]; Q->xfh[j].flip[d] = Q->xfh[j0].flip[d]; }
+            dr_int *a = &Q->ith[j]; a->invert = 0; a->gamma = 1.f + 0.5f * (a->gamma - 1.f); a->contrast = 1.f + 0.5f * (a->contrast - 1.f); a->bias *= 0.5f; a->sigma *= 0.5f;
+        }
+        if (getenv("UFSM_SSL_IDTEST")) { Q->xfh[2 * i + 1] = Q->xfh[2 * i]; Q->ith[2 * i + 1] = Q->ith[2 * i]; }   /* (test: global 1 = global 0 exactly) */
+        {   /* the two globals' source-box IoU (diagnostic: overlapping views) */
+            const dr_xf *a = &Q->xfh[2 * i], *b = &Q->xfh[2 * i + 1]; double in = 1;
+            for (int d = 0; d < 3; d++) { const int lo = a->off[d] > b->off[d] ? a->off[d] : b->off[d], hi = a->off[d] + a->m < b->off[d] + b->m ? a->off[d] + a->m : b->off[d] + b->m; in *= hi > lo ? hi - lo : 0; }
+            const double va = (double)a->m * a->m * a->m, vb = (double)b->m * b->m * b->m; Q->sums[6] += in / (va + vb - in) / N;
+        }
+    }
+    nn_h2d(Q->xfd, Q->xfh, sizeof(dr_xf) * NV); nn_h2d(Q->itd, Q->ith, sizeof(dr_int) * NV);
+    for (int j = 0; j < NV; j++) {
+        const int gl = j < 2 * N, n_ = gl ? Q->PG : Q->PL; const size_t n3 = gl ? g3 : l3; float *x = gl ? Q->xg + (size_t)j * CIN * g3 : Q->xl + (size_t)(j - 2 * N) * CIN * l3;
+        dr_crops(Q->src, Q->Ps, Q->xfd + j, Q->itd + j, 1, n_, x);
+        if (CIN == 2) nn_zero(x + n3, n3 * 4);
+        if (CIN == 5) { const int i = Q->xfh[j].src; dr_axis_view(Q->xfd, j, n_, Q->Ps, Q->d_ayx + (size_t)i * Q->Ps * 2, hasax[i] && rng_u(&Q->ar) >= Q->adrop, x + n3); }
+    }
+    int R = 0;   /* iBOT: the masked cells per global (block masking), their centres mapped into the partner global */
+    if (Q->wib > 0) {
+        const int G = Q->GT_, TPS = Q->TPS, IM = Q->IM, PG = Q->PG;
+        for (int j = 0; j < 2 * N; j++) {
+            Q->cnt[j] = 0; Q->off[j] = R; uint8_t *cm = Q->cellm + (size_t)j * G * G * G; memset(cm, 0, (size_t)G * G * G);
+            if (rng_u(&Q->ar) >= 0.5) continue;
+            dn_block_mask(cm, G, (int)lrint((0.1 + 0.4 * rng_u(&Q->ar)) * G * G * G), &Q->ar);
+            const dr_xf *a = &Q->xfh[j], *b = &Q->xfh[j ^ 1]; int seen = 0;
+            for (int c = 0; c < G * G * G; c++) {
+                if (!cm[c]) continue;
+                const int cz = c / (G * G), cy = (c / G) % G, cx = c % G, h2 = TPS / 2;
+                const double vv[3] = {cz * TPS + h2, cy * TPS + h2, cx * TPS + h2}; double sx[3], o[3]; dr_map(a, vv, sx); dr_unmap(b, sx, o);
+                int q[3], in = 1; for (int d = 0; d < 3; d++) { in &= o[d] >= -0.5 && o[d] <= PG - 0.5; q[d] = (int)lrint(o[d]); q[d] = q[d] < 0 ? 0 : q[d] >= PG ? PG - 1 : q[d]; }
+                if (!in) continue;
+                int k = seen++; if (k >= IM) { k = (int)(rng_next(&Q->ar) % (uint64_t)seen); if (k >= IM) continue; }
+                Q->hS[(size_t)j * IM + k] = (int)((vv[0] * PG + vv[1]) * PG + vv[2]); Q->hT[(size_t)j * IM + k] = (q[0] * PG + q[1]) * PG + q[2];
+            }
+            const int m = seen < IM ? seen : IM; if (m < 16) { memset(cm, 0, (size_t)G * G * G); continue; }
+            Q->cnt[j] = m; R += m;
+            nn_h2d(Q->d_hS + (size_t)j * IM, Q->hS + (size_t)j * IM, (size_t)m * 4); nn_h2d(Q->d_hT + (size_t)j * IM, Q->hT + (size_t)j * IM, (size_t)m * 4);
+        }
+    }
+    /* teacher: the 2N globals through the EMA weights; CLS rows, layer norm, head, Sinkhorn over the batch */
+    unet_use_params(Q->ug, unet_ema_params(Q->u));
+    for (int j = 0; j < 2 * N; j++) {
+        const float *lg = unet_forward(Q->ug, Q->xg + (size_t)j * CIN * g3, Q->xsg, 0); dn_ssl_cls(Q, Q->ug, Q->clsT + (size_t)j * C);
+        const int w = j ^ 1;   /* (the masked partner whose targets this teacher view holds) */
+        if (Q->wib > 0 && Q->cnt[w]) { const int h16 = unet_logits_h16(Q->ug);   /* (the full logits: fp16 or fp32) */
+            dn_gather((const char *)lg + (size_t)Q->ich * g3 * (h16 ? 2 : 4), h16, g3, 32, Q->d_hT + (size_t)w * Q->IM, Q->cnt[w], Q->ieT + (size_t)Q->off[w] * 32, Q->inT + Q->off[w]); }
+    }
+    unet_use_params(Q->ug, unet_live_params(Q->u));
+    if (Q->cls_norm) dr_rownorm_fwd(Q->clsT, 2 * N, C, Q->clsT, Q->rsT);
+    {   /* per-step stats of the teacher CLS rows: cosine of a sample's two globals vs of different samples (before any batch centring) */
+        float *ct = malloc((size_t)2 * N * C * 4); nn_d2h(ct, Q->clsT, (size_t)2 * N * C * 4); double cs = 0, cd = 0; long nd = 0;
+        for (int i = 0; i < C; i++) Q->hmean[i] = 0;
+        for (int a = 0; a < 2 * N; a++) { for (int i = 0; i < C; i++) Q->hmean[i] += ct[(size_t)a * C + i] / (2 * N);
+            for (int b = a + 1; b < 2 * N; b++) { double x = 0, ya = 0, yb = 0; for (int i = 0; i < C; i++) { x += (double)ct[(size_t)a * C + i] * ct[(size_t)b * C + i]; ya += (double)ct[(size_t)a * C + i] * ct[(size_t)a * C + i]; yb += (double)ct[(size_t)b * C + i] * ct[(size_t)b * C + i]; }
+                const double cc = x / sqrt(ya * yb + 1e-30); if (a / 2 == b / 2) cs += cc; else { cd += cc; nd++; } } }
+        Q->st[0] += cs / N; Q->st[1] += nd ? cd / nd : 0;
+        if (Q->cstd) {   /* per-dimension batch standardisation (constants: the teacher batch's mean / std) */
+            for (int i = 0; i < C; i++) { double v = 0; for (int a = 0; a < 2 * N; a++) { const double d = ct[(size_t)a * C + i] - Q->hmean[i]; v += d * d; } Q->histd[i] = (float)(1.0 / sqrt(v / (2 * N) + 1e-4)); }
+            nn_h2d(Q->cmean, Q->hmean, (size_t)C * 4); nn_h2d(Q->cistd, Q->histd, (size_t)C * 4);
+            for (int a = 0; a < 2 * N; a++) dr_cols_affine(Q->clsT + (size_t)a * C, C, Q->cmean, Q->cistd);
+        } else if (Q->ccen) { nn_h2d(Q->cmean, Q->hmean, (size_t)C * 4); for (int a = 0; a < 2 * N; a++) nn_axpy(Q->clsT + (size_t)a * C, -1.f, Q->cmean, (size_t)C); }   /* (the batch mean CLS removed: a constant shift) */
+        free(ct);
+    }
+    if (dr_head_fwd(&Q->H.H, Q->H.pt, Q->clsT, 2 * N, Q->tl, &Q->H.w)) return 1;
+    if (Q->simg > 0) { nn_d2d(Q->zT, Q->H.w.zn, (size_t)2 * N * Q->H.H.B * 4); nn_d2h(Q->zbank, Q->zT, (size_t)2 * N * Q->H.H.B * 4); }   /* SimDINO targets; coding-rate bank */
+    if (Q->zvb) { const int Bz = Q->H.H.B; float *zt = malloc((size_t)2 * N * Bz * 4); nn_d2h(zt, Q->H.w.zn, (size_t)2 * N * Bz * 4);   /* (the z bank, chunk-major: teacher rows) */
+        for (int k = 0; k < N; k++) for (int v = 0; v < 2; v++) memcpy(Q->zvb + ((size_t)v * N + k) * Bz, zt + (size_t)(2 * k + v) * Bz, (size_t)Bz * 4);
+        free(zt); }
+    {   /* the head bottleneck z: same / other sample cosine */
+        const int B = Q->H.H.B; float *zn = malloc((size_t)2 * N * B * 4); nn_d2h(zn, Q->H.w.zn, (size_t)2 * N * B * 4); double zs = 0, zd = 0; long nd = 0;
+        for (int a = 0; a < 2 * N; a++) for (int b = a + 1; b < 2 * N; b++) { double x = 0; for (int i = 0; i < B; i++) x += (double)zn[(size_t)a * B + i] * zn[(size_t)b * B + i]; if (a / 2 == b / 2) zs += x; else { zd += x; nd++; } }
+        Q->st[2] += zs / N; Q->st[3] += nd ? zd / nd : 0;
+        double zsd = 0, *zs_ = malloc((size_t)B * 8);
+        for (int i = 0; i < B; i++) { double m = 0, v = 0; for (int a = 0; a < 2 * N; a++) m += zn[(size_t)a * B + i]; m /= 2 * N; for (int a = 0; a < 2 * N; a++) { const double d = zn[(size_t)a * B + i] - m; v += d * d; } zs_[i] = sqrt(v / (2 * N - 1)); zsd += zs_[i] / B; }
+        for (int i = 1; i < B; i++) { const double t = zs_[i]; int k = i - 1; while (k >= 0 && zs_[k] > t) { zs_[k + 1] = zs_[k]; k--; } zs_[k + 1] = t; }   /* (sorted: min / median) */
+        Q->st[8] += zsd; Q->zsmin = zs_[0]; Q->zsmed = zs_[B / 2]; free(zs_); free(zn);
+    }
+    if (step % 50 == 0) dn_ssl_diag(Q);
+    if (Q->cm > 0) { dr_teacher_probs(Q->tl, 2 * N, K, tt, 0, Q->cen, Q->tq, Q->sks); dr_center_update(Q->cen, Q->tl, 2 * N, K, Q->cm); }
+    else dr_teacher_probs(Q->tl, 2 * N, K, tt, Q->skit, nullptr, Q->tq, Q->sks);
+    { int *am = Q->amd, *hm = Q->amh; dr_argmax_rows(Q->tq, 2 * N, K, am); nn_d2h(hm, am, (size_t)2 * N * 4); for (int j = 0; j < 2 * N; j++) Q->use[hm[j]] = 1;
+      dr_argmax_rows(Q->tl, 2 * N, K, am); nn_d2h(hm, am, (size_t)2 * N * 4);   /* (agreement on the raw teacher logits: Sinkhorn's equipartition over 2N << K rows keeps the targets' argmaxes apart) */
+      int ag = 0, ab = 0; for (int i = 0; i < N; i++) { ag += hm[2 * i] == hm[2 * i + 1]; ab += hm[2 * i] == hm[2 * ((i + 1) % N) + 1]; } Q->sums[2] += (double)ag / N; Q->st[4] += (double)ab / N; }
+    if (Q->wib > 0 && R > 0) {   /* iBOT targets: the teacher head over all masked rows, Sinkhorn over them */
+        if (dr_head_fwd(&Q->I.H, Q->I.pt, Q->ieT, R, Q->il, &Q->I.w)) return 1;
+        if (Q->icm > 0) { dr_teacher_probs(Q->il, R, Q->KI, tt, 0, Q->icen, Q->iq, Q->isk); dr_center_update(Q->icen, Q->il, R, Q->KI, Q->icm); }
+        else dr_teacher_probs(Q->il, R, Q->KI, tt, Q->skit, nullptr, Q->iq, Q->isk);
+    }
+    Q->sums[5] = R;
+    /* the batch-statistic bank (KoLeo, VICReg, z VICReg), chunk-major (v N + k): the teacher's head-input rows -- or, --ssl-exact-bank,
+       the student's own from a no-grad pass with the live weights (GradCache: the full-batch statistics, this row's gradient exact) */
+    for (int k = 0; k < N; k++) for (int v = 0; v < 2; v++) nn_d2d(Q->bank + ((size_t)v * N + k) * C, Q->clsT + (size_t)(2 * k + v) * C, (size_t)C * 4);
+    if (Q->exact) {
+        for (int j = 0; j < 2 * N; j++) {
+            const int k = j / 2, v = j % 2; float *row = Q->bank + ((size_t)v * N + k) * C;
+            unet_forward(Q->ug, Q->xg + (size_t)j * CIN * g3, Q->xsg, 0); dn_ssl_cls(Q, Q->ug, row);
+            if (Q->cls_norm) dr_rownorm_fwd(row, 1, C, row, Q->rsS);
+            if (Q->cstd) dr_cols_affine(row, C, Q->cmean, Q->cistd); else if (Q->ccen) nn_axpy(row, -1.f, Q->cmean, (size_t)C);
+            if (Q->zvb) { if (dr_head_fwd(&Q->H.H, Q->H.p, row, 1, Q->sl, &Q->H.w)) return 1; nn_d2h(Q->zvb + ((size_t)v * N + k) * Q->H.H.B, Q->H.w.zn, (size_t)Q->H.H.B * 4); }
+        }
+    }
+    {   /* per-chunk statistics of the bank (head input; unit bottleneck): mean, std, covariance -- the full batch's, each row's gradient
+           exact against them (src/sslstat.h; tests/test_sslstat.c); with the exact bank also every row's full-batch KoLeo gradient */
+        const int needx = Q->vv > 0 || Q->vc > 0 || (Q->exact && Q->wk > 0);
+        if (needx) nn_d2h(Q->vx ? Q->vx : (Q->vx = malloc((size_t)2 * N * C * 4)), Q->bank, (size_t)2 * N * C * 4);
+        for (int v = 0; v < 2; v++) {
+            if (Q->vv > 0 || Q->vc > 0) {
+                ss_stats(Q->vx + (size_t)v * N * C, N, C, 1e-4, Q->vmu + (size_t)v * C, Q->vsd + (size_t)v * C, Q->vc > 0 ? Q->vcov + (size_t)v * C * C : nullptr);
+                Q->st[5] += ss_vic_loss(Q->vsd + (size_t)v * C, Q->vc > 0 ? Q->vcov + (size_t)v * C * C : nullptr, C, 1.0, Q->vv, Q->vc) / 2;
+                double ms = 0; for (int c = 0; c < C; c++) ms += Q->vsd[(size_t)v * C + c] / C; Q->st[7] += ms / 2;
+            }
+            if (Q->zvb) { const int Bz = Q->H.H.B;
+                ss_stats(Q->zvb + (size_t)v * N * Bz, N, Bz, 1e-8, Q->zmu + (size_t)v * Bz, Q->zsd + (size_t)v * Bz, Q->zcv > 0 ? Q->zcov + (size_t)v * Bz * Bz : nullptr);
+                Q->st[11] += ss_vic_loss(Q->zsd + (size_t)v * Bz, nullptr, Bz, 1.0 / sqrt((double)Bz), Q->zv, 0) / 2; }
+            if (Q->exact && Q->wk > 0) Q->st[9] += ss_koleo_all(Q->vx + (size_t)v * N * C, N, C, Q->wk, 1e-8, Q->kg + (size_t)v * N * C) / 2;
+        }
+    }
+    /* student: every view forward -> loss over the batch's targets -> backward */
+    unet_zero_grad(Q->ug); unet_zero_grad(Q->ul); nn_zero(Q->outs, 16 * 4);
+    const float wpair = Q->wdino / (float)(N * (2 + 2 * Q->NL));
+    const double vr = Q->vramp > 0 ? fmin(1.0, (double)step / Q->vramp) : 1.0;   /* (the VICReg ramp) */
+    for (int j = 0; j < NV; j++) {
+        const int gl = j < 2 * N, i = gl ? j / 2 : (j - 2 * N) / Q->NL, v = gl ? j % 2 : -1; unet *n = gl ? Q->ug : Q->ul;
+        const float *x = gl ? Q->xg + (size_t)j * CIN * g3 : Q->xl + (size_t)(j - 2 * N) * CIN * l3;
+        const int ib = gl && Q->wib > 0 && Q->cnt[j] > 0;
+        if (ib) { nn_h2d(Q->d_mask, Q->cellm + (size_t)j * Q->GT_ * Q->GT_ * Q->GT_, (size_t)Q->GT_ * Q->GT_ * Q->GT_); dr_mask_cells((float *)x, Q->PG, Q->TPS, Q->d_mask, 0.f);
+                  if (CIN == 2) dr_mask_cells((float *)x + g3, Q->PG, Q->TPS, Q->d_mask, 1.f); }   /* (the teacher saw it unmasked; the mask channel marks the cells) */
+        const float *lgs = unet_forward(n, x, gl ? Q->xsg : Q->xsl, 1);
+        if (ib) {   /* iBOT: the masked cells' student features -> head -> cross-entropy vs the cross-view targets -> d features into the fp32 logit gradient */
+            const int m = Q->cnt[j];
+            const int h16 = unet_logits_h16(n);
+            dn_gather((const char *)lgs + (size_t)Q->ich * g3 * (h16 ? 2 : 4), h16, g3, 32, Q->d_hS + (size_t)j * Q->IM, m, Q->ieS, Q->inS);
+            if (dr_head_fwd(&Q->I.H, Q->I.p, Q->ieS, m, Q->isl, &Q->I.w)) return 1;
+            float *hw_ = malloc((size_t)m * 4); for (int k = 0; k < m; k++) hw_[k] = Q->wib / (float)(R > 0 ? R : 1); nn_h2d(Q->iw, hw_, (size_t)m * 4); free(hw_);
+            dr_ce(Q->isl, m, Q->KI, Q->ts, Q->iq + (size_t)Q->off[j] * Q->KI, Q->iid, Q->iid, Q->iw, m, Q->idsl, Q->outs + 6, Q->ice); nn_axpy(Q->outs + 8, 1.f, Q->outs + 6, 1);
+            if (dr_head_bwd(&Q->I.H, Q->I.p, Q->I.g, Q->ieS, Q->idsl, m, Q->idE, step > Q->freeze, &Q->I.w)) return 1;
+            dr_scatter_unit_f32(Q->ieS, Q->idE, Q->inS, Q->d_hS + (size_t)j * Q->IM, m, 32, g3, 1.f, Q->glzib + (size_t)Q->ich * g3);
+        }
+        int Sv = 0, nreg = 0; const float *tok = unet_tokens(n, nullptr, &Sv, nullptr, &nreg); (void)tok;
+        dn_ssl_cls(Q, n, Q->clsS);
+        if (Q->cls_norm) dr_rownorm_fwd(Q->clsS, 1, C, Q->clsS, Q->rsS);
+        float *cpre = Q->cpre;   /* (the normed row before the batch transform, for the row-norm backward) */
+        if (Q->cstd) { nn_d2d(cpre, Q->clsS, (size_t)C * 4); dr_cols_affine(Q->clsS, C, Q->cmean, Q->cistd); }
+        else if (Q->ccen) nn_axpy(Q->clsS, -1.f, Q->cmean, (size_t)C);
+        if (dr_head_fwd(&Q->H.H, Q->H.p, Q->clsS, 1, Q->sl, &Q->H.w)) return 1;
+        int ps_[2] = {0, 0}, pt_[2] = {gl ? 2 * i + 1 - v : 2 * i, 2 * i + 1}; float pw_[2] = {wpair, wpair}; const int npair = gl ? 1 : 2;
+        nn_h2d(Q->pS, ps_, 8); nn_h2d(Q->pT, pt_, 8); nn_h2d(Q->pW, pw_, 8);
+        nn_zero(Q->dcls, (size_t)C * 4);
+        Q->H.w.dzn_add = nullptr;
+        if (gl && Q->zvb) {   /* VICReg on the unit bottleneck: this row's gradient of the full chunk's loss (std target 1 / sqrt(B)) */
+            const int Bz = Q->H.H.B; float *gz = malloc((size_t)Bz * 4); nn_d2h(Q->zvh, Q->H.w.zn, (size_t)Bz * 4);
+            ss_vic_row_grad(Q->zvh, N, Bz, Q->zmu + (size_t)v * Bz, Q->zsd + (size_t)v * Bz, Q->zcv > 0 ? Q->zcov + (size_t)v * Bz * Bz : nullptr, 1.0 / sqrt((double)Bz), Q->zv * vr, Q->zcv * vr, gz);
+            nn_h2d(Q->zvd, gz, (size_t)Bz * 4); Q->H.w.dzn_add = Q->zvd; free(gz);
+            if (!Q->exact) memcpy(Q->zvb + ((size_t)v * N + i) * Bz, Q->zvh, (size_t)Bz * 4);
+        }
+        if (Q->simg > 0) {   /* SimDINO: d / d zn = sum over pairs w (zs - zt); global rows: - G d R / d zs over the chunk (the other samples' current z) */
+            const int Bz = Q->H.H.B; float *zs = Q->zcur; nn_d2h(zs, Q->H.w.zn, (size_t)Bz * 4);
+            for (int c = 0; c < Bz; c++) Q->dzh[c] = 0;
+            double dl = 0;
+            float *zth = malloc((size_t)npair * Bz * 4); for (int pp = 0; pp < npair; pp++) nn_d2h(zth + (size_t)pp * Bz, Q->zT + (size_t)pt_[pp] * Bz, (size_t)Bz * 4);
+            for (int pp = 0; pp < npair; pp++) for (int c = 0; c < Bz; c++) { const double d = zs[c] - zth[(size_t)pp * Bz + c]; Q->dzh[c] += (float)(wpair * d); dl += wpair * 0.5 * d * d; }
+            free(zth);
+            if (gl) {   /* coding rate over this chunk: rows 2k + v of the bank (student z where computed this step, teacher otherwise), this row = zs */
+                const int Bc = N; double *A = Q->zA; const double al = Q->sima / Bc;
+                for (int c = 0; c < Bz * Bz; c++) A[c] = 0;
+                for (int c = 0; c < Bz; c++) A[(size_t)c * Bz + c] = 1;
+                for (int k = 0; k < N; k++) { const float *zr = k == i ? zs : Q->zbank + (size_t)(2 * k + v) * Bz;
+                    for (int a = 0; a < Bz; a++) { const double za = zr[a] * al; if (za == 0) continue; double *Ar = A + (size_t)a * Bz; for (int b2 = 0; b2 <= a; b2++) Ar[b2] += za * zr[b2]; } }
+                /* Cholesky of A (lower), then g = A^-1 zs: d R / d zs = al A^-1 zs  (R = 1/2 logdet A) */
+                int okc = 1; for (int a = 0; a < Bz && okc; a++) { double *Ar = A + (size_t)a * Bz;
+                    for (int b2 = 0; b2 <= a; b2++) { double sm = Ar[b2]; const double *Br = A + (size_t)b2 * Bz; for (int k2 = 0; k2 < b2; k2++) sm -= Ar[k2] * Br[k2];
+                        if (b2 == a) { if (sm <= 0) { okc = 0; break; } Ar[a] = sqrt(sm); } else Ar[b2] = sm / Br[b2]; } }
+                if (okc) { double *y = malloc((size_t)Bz * 8);
+                    for (int a = 0; a < Bz; a++) { double sm = zs[a]; for (int k2 = 0; k2 < a; k2++) sm -= A[(size_t)a * Bz + k2] * y[k2]; y[a] = sm / A[(size_t)a * Bz + a]; }
+                    for (int a = Bz - 1; a >= 0; a--) { double sm = y[a]; for (int k2 = a + 1; k2 < Bz; k2++) sm -= A[(size_t)k2 * Bz + a] * y[k2]; y[a] = sm / A[(size_t)a * Bz + a]; }
+                    for (int c = 0; c < Bz; c++) Q->dzh[c] -= (float)(Q->simg / (2 * N) * al * y[c]);   /* (each global row's share; 2 chunks) */
+                    double ld = 0; for (int a = 0; a < Bz; a++) ld += log(A[(size_t)a * Bz + a]); Q->st[9] += ld / (2 * N);   /* R = 1/2 logdet = sum log diag(L) */
+                    free(y); }
+                memcpy(Q->zbank + (size_t)(2 * i + v) * Bz, zs, (size_t)Bz * 4);
+            }
+            Q->st[10] += dl; nn_h2d(Q->H.w.dzn, Q->dzh, (size_t)Bz * 4);
+            if (dr_head_bwd(&Q->H.H, Q->H.p, Q->H.g, Q->clsS, nullptr, 1, Q->dcls, 0, &Q->H.w)) return 1;
+        } else {
+        dr_ce(Q->sl, 1, K, Q->ts, Q->tq, Q->pS, Q->pT, Q->pW, npair, Q->dsl, Q->outs, Q->ces); nn_axpy(Q->outs + 4, 1.f, Q->outs, 1);   /* (dr_ce writes its loss: summed here) */
+        if (dr_head_bwd(&Q->H.H, Q->H.p, Q->H.g, Q->clsS, Q->dsl, 1, Q->dcls, step > Q->freeze, &Q->H.w)) return 1;
+        }
+        if (gl && Q->wk > 0 && Q->exact) { nn_h2d(Q->kgd, Q->kg + ((size_t)v * N + i) * C, (size_t)C * 4); nn_axpy(Q->dcls, 1.f, Q->kgd, (size_t)C); }   /* (the full batch's KoLeo gradient of this row) */
+        else if (gl && Q->wk > 0) {   /* KoLeo against the other samples of this view chunk (the bank: teacher rows / the student's as computed) */
+            const float *bv = Q->bank + (size_t)v * N * C;   /* (chunk v without this sample: two contiguous copies) */
+            if (i > 0) nn_d2d(Q->bex, bv, (size_t)i * C * 4);
+            if (i < N - 1) nn_d2d(Q->bex + (size_t)i * C, bv + (size_t)(i + 1) * C, (size_t)(N - 1 - i) * C * 4);
+            dr_koleo_q(Q->clsS, 1, Q->bex, N - 1, C, Q->wk / (float)N, Q->dcls, Q->outs + 1);
+            if (!Q->exact) nn_d2d(Q->bank + ((size_t)v * N + i) * C, Q->clsS, (size_t)C * 4);
+        }
+        if (gl && (Q->vv > 0 || Q->vc > 0)) {   /* VICReg on the head input: this row's gradient of the full chunk's loss (src/sslstat.h) */
+            static float *xh; static int xhn; if (xhn < C) { free(xh); xh = malloc((size_t)C * 4); xhn = C; }
+            nn_d2h(xh, Q->clsS, (size_t)C * 4);
+            ss_vic_row_grad(xh, N, C, Q->vmu + (size_t)v * C, Q->vsd + (size_t)v * C, Q->vc > 0 ? Q->vcov + (size_t)v * C * C : nullptr, 1.0, Q->vv * vr, Q->vc * vr, Q->vg);
+            nn_h2d(Q->vgd, Q->vg, (size_t)C * 4); nn_axpy(Q->dcls, 1.f, Q->vgd, (size_t)C);
+        }
+        if (Q->cstd) { dr_cols_scale(Q->dcls, C, Q->cistd); nn_d2d(Q->clsS, cpre, (size_t)C * 4); }   /* (through the batch transform; the normed row back) */
+        else if (Q->ccen) nn_axpy(Q->clsS, 1.f, Q->cmean, (size_t)C);   /* (back to the normed row for its backward) */
+        if (Q->cls_norm) dr_rownorm_bwd(Q->dcls, Q->clsS, Q->rsS, 1, C, Q->dcls);
+        if (Q->tgn < (size_t)Sv * CT) { nn_free(Q->tgrad); Q->tgn = (size_t)Sv * CT; Q->tgrad = nn_malloc(Q->tgn * 4); }
+        nn_zero(Q->tgrad, (size_t)Sv * CT * 4);
+        if (Q->cls_reg) nn_axpy(Q->tgrad, gs, Q->dcls, (size_t)CT);   /* (the register row) */
+        if (Q->cls_reg != 1) { float *dp = Q->dcls + (Q->cls_reg == 2 ? CT : 0); dn_axpby(dp, dp, (size_t)CT, gs, 0.f); dr_pool_bwd(dp, 1, Sv, CT, nreg, Q->tgrad); }
+        unet_set_token_grad(n, Q->tgrad);
+        unet_backward(n, ib ? Q->glzib : gl ? Q->glzg : Q->glzl);
+        unet_set_token_grad(n, nullptr);
+        if (ib) nn_zero(Q->glzib + (size_t)Q->ich * g3, (size_t)32 * g3 * 4);
+    }
+    const size_t np = unet_nparams(Q->u);
+    nn_axpy(unet_grad_ptr(Q->u), 1.f, unet_grad_ptr(Q->ug), np); nn_axpy(unet_grad_ptr(Q->u), 1.f, unet_grad_ptr(Q->ul), np);
+    /* the head: AdamW (upstream), the prototype directions after --ssl-freeze-last, g fixed; then its EMA teacher */
+    dn_head *h = &Q->H; const dr_head *H = &h->H;
+    dr_adamw(h->p, h->g, h->m, h->v, H->v, Q->hlr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
+    if (step > Q->freeze) dr_adamw(h->p + H->v, h->g + H->v, h->m + H->v, h->v + H->v, H->g - H->v, Q->plr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
+    dr_ema(h->pt, h->p, H->n, mom); nn_zero(h->g, H->n * 4);
+    if (Q->wib > 0) { dn_head *hi = &Q->I; const dr_head *HI = &hi->H;
+        dr_adamw(hi->p, hi->g, hi->m, hi->v, HI->v, Q->hlr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
+        if (step > Q->freeze) dr_adamw(hi->p + HI->v, hi->g + HI->v, hi->m + HI->v, hi->v + HI->v, HI->g - HI->v, Q->plr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
+        dr_ema(hi->pt, hi->p, HI->n, mom); nn_zero(hi->g, HI->n * 4); }
+    nn_d2h(Q->hout, Q->outs, 16 * 4); Q->sums[0] += Q->hout[4] / Q->wdino; Q->sums[1] += Q->hout[1]; Q->sums[3] += Q->wib > 0 ? Q->hout[8] / Q->wib : 0; Q->sums[4] += R; Q->nsum++;
+    return 0;
+}
+/* the SSL part of the log line: loss means, the teacher target entropy (mean over the batch's rows) and the prototype usage */
+static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
+    const int R = 2 * Q->N, K = Q->K; float *q = malloc((size_t)R * K * 4); nn_d2h(q, Q->tq, (size_t)R * K * 4);
+    double H = 0, Hm = 0, pmax = 0; double *mrow = calloc((size_t)K, 8);
+    for (int r = 0; r < R; r++) { double z = 0, h = 0, mx = 0; for (int k = 0; k < K; k++) z += q[(size_t)r * K + k]; for (int k = 0; k < K; k++) { const double a = q[(size_t)r * K + k] / z; mrow[k] += a / R; if (a > 0) h -= a * log(a); if (a > mx) mx = a; } H += h / R; pmax += mx / R; }
+    for (int k = 0; k < K; k++) if (mrow[k] > 0) Hm -= mrow[k] * log(mrow[k]);
+    int used = 0; for (int k = 0; k < K; k++) used += Q->use[k];
+    if (Q->ure > 0 && step % Q->ure < 100) memset(Q->use, 0, (size_t)K);
+    const size_t ln = strlen(line);
+    snprintf(line + ln, cap - ln, " | ssl: dino %.4f koleo %.4f H(t) %.2f H(mean) %.2f (max %.2f) pmax %.4f agree %.3f protos used %d / %d", Q->nsum ? Q->sums[0] / Q->nsum : 0.0, Q->nsum ? Q->sums[1] / Q->nsum : 0.0, H, Hm, log((double)K), pmax, Q->nsum ? Q->sums[2] / Q->nsum : 0.0, used, K);
+    {   /* does the CLS carry the sample? cosine of a sample's two teacher globals vs of different samples (teacher rows, after the norm) */
+        const int C = Q->CC; float *ct = malloc((size_t)R * C * 4); nn_d2h(ct, Q->clsT, (size_t)R * C * 4);
+        double cs = 0, cd = 0; long nd = 0;
+        for (int a = 0; a < R; a++) for (int b = a + 1; b < R; b++) {
+            double x = 0, ya = 0, yb = 0; for (int c = 0; c < C; c++) { x += (double)ct[(size_t)a * C + c] * ct[(size_t)b * C + c]; ya += (double)ct[(size_t)a * C + c] * ct[(size_t)a * C + c]; yb += (double)ct[(size_t)b * C + c] * ct[(size_t)b * C + c]; }
+            const double cc = x / sqrt(ya * yb + 1e-30); if (a / 2 == b / 2) cs += cc; else { cd += cc; nd++; } }
+        free(ct); const size_t l3_ = strlen(line);
+        const double nn_ = Q->nsum ? Q->nsum : 1; { const size_t l4 = strlen(line); snprintf(line + l4, cap - l4, " | vic var %.4f cov %.4f cls std/dim %.4f | z std/dim mean %.4f min %.4f median %.4f (1/sqrt(B) %.4f) zvic %.4f | simdino dist %.4f R %.3f", Q->st[5] / nn_, Q->st[6] / nn_, Q->st[7] / nn_, Q->st[8] / nn_, Q->zsmin, Q->zsmed, 1.0 / sqrt((double)Q->H.H.B), Q->st[11] / nn_, Q->st[10] / nn_, Q->st[9] / nn_); }
+        snprintf(line + l3_, cap - l3_, " | avg cls same %.3f other %.3f z same %.3f other %.3f agree-other %.3f | iou %.3f | last cls same %.3f other %.3f | z cos other %.3f | logit sd raw %.4f centred %.4f (/tt) | centre norm %.3f | proto |cos| %.3f",
+                 Q->st[0] / nn_, Q->st[1] / nn_, Q->st[2] / nn_, Q->st[3] / nn_, Q->st[4] / nn_, Q->nsum ? Q->sums[6] / Q->nsum : 0.0, cs / (R / 2), nd ? cd / nd : 0.0, Q->dg[0], Q->dg[1], Q->dg[2], Q->dg[3], Q->dg[4]);
+    }
+    if (Q->wib > 0 && Q->sums[5] >= 4) {   /* iBOT: the mean target entropy of the last step's first 64 masked rows, the loss, rows per step */
+        const int r = Q->sums[5] < 64 ? (int)Q->sums[5] : 64, KI = Q->KI; float *qi = malloc((size_t)r * KI * 4); nn_d2h(qi, Q->iq, (size_t)r * KI * 4); double Hi = 0;
+        double pmi = 0;
+        for (int a = 0; a < r; a++) { double z = 0, h = 0, mx = 0; for (int k = 0; k < KI; k++) z += qi[(size_t)a * KI + k]; for (int k = 0; k < KI; k++) { const double t = qi[(size_t)a * KI + k] / z; if (t > 0) h -= t * log(t); if (t > mx) mx = t; } Hi += h / r; pmi += mx / r; }
+        free(qi); const size_t l2 = strlen(line);
+        snprintf(line + l2, cap - l2, " | ibot %.4f H(t) %.2f (max %.2f) pmax %.4f rows %.0f", Q->nsum ? Q->sums[3] / Q->nsum : 0.0, Hi, log((double)KI), pmi, Q->nsum ? Q->sums[4] / Q->nsum : 0.0);
+    }
+    memset(Q->sums, 0, sizeof Q->sums); memset(Q->st, 0, sizeof Q->st); Q->nsum = 0; free(q); free(mrow);
+}
+
 static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char **argv, int P, int steps0, double minutes, const char *outd, int nthreads, int nwork, uint64_t seed, int HZ) {
     if (!cfg->attn_blocks) { fprintf(stderr, "dino-train --recipe: needs the attention stage (--attn-blocks >= 1) for the CLS tokens\n"); return 2; }
     const int Ps = Dd->P, ED = atoi(opt(argc, argv, "--dim", "32")), CO = cfg->cout, nloc = atoi(opt(argc, argv, "--locals", "4")), PL = atoi(opt(argc, argv, "--local-P", "96"));
@@ -817,7 +1233,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     const float tau = (float)atof(opt(argc, argv, "--tau", "0.1")), hw = (float)atof(opt(argc, argv, "--hard-w", "4")), hr = (float)atof(opt(argc, argv, "--hard-r", "48"));
     const float wvar = (float)atof(opt(argc, argv, "--var", "30")), vgam = 0.8f / sqrtf((float)ED);
     const float noise = (float)atof(opt(argc, argv, "--noise", "0.15"));
-    const int cls_reg = !strcmp(opt(argc, argv, "--cls", "pool"), "reg");
+    const int cls_reg = !strcmp(opt(argc, argv, "--cls", "pool"), "reg") ? 1 : !strcmp(opt(argc, argv, "--cls", "pool"), "both") ? 2 : 0;   /* (both: register | token mean, the SSL batch) */
     /* --cls-norm 1 (default): the CLS layer-normed (no affine) before the DINO head and KoLeo, as upstream's final LayerNorm. Raw, the pooled
        CLS grew from |4| to |400| and a shared direction dominated it (pairwise cosine 0.5-0.8 across samples): the head saw no differences */
     const int cls_norm = atoi(opt(argc, argv, "--cls-norm", "1"));
@@ -965,7 +1381,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     /* inputs per view: CT, then with --axis-input (cin 5) train's radial unit vector (3) and a validity channel (dr_axis_view); the axis
        is dropped (valid 0) for a view with probability --axis-drop, and missing for sources without "axis" */
     const int CIN = cfg->cin; const float adrop = (float)atof(opt(argc, argv, "--axis-drop", "0.15"));
-    if (CIN != 1 && CIN != 5) { fprintf(stderr, "dino-train --recipe: inputs 1 (CT) or 5 (--axis-input: CT, radial, valid)\n"); return 2; }
+    if (CIN != 1 && CIN != 2 && CIN != 5) { fprintf(stderr, "dino-train --recipe: inputs 1 (CT), 2 (--mask-input) or 5 (--axis-input: CT, radial, valid)\n"); return 2; }
     uint8_t *src = nn_malloc(ps3); float *xg = nn_malloc(2 * (size_t)CIN * g3 * 4), *xl = nn_malloc((size_t)(nloc > 0 ? nloc : 1) * CIN * l3 * 4), *d_ayx = nn_malloc((size_t)Ps * 8);
     dr_xf *xfd = nn_malloc(sizeof(dr_xf) * (2 + nloc)); dr_int *itd = nn_malloc(sizeof(dr_int) * (2 + nloc));
     const int NQ = 2 + SQ; float *tl = nn_malloc((size_t)NQ * K * 4), *tq = nn_malloc((size_t)NQ * K * 4); void *sks = nn_malloc(dr_sk_scratch(NQ, K));
@@ -984,6 +1400,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     uint8_t *useb = calloc((size_t)(K > KI ? K : KI), 1), *useib = calloc((size_t)KI, 1); int *d_am = nn_malloc((size_t)(MI > NQ ? MI : NQ) * 4), *h_am = malloc((size_t)(MI > NQ ? MI : NQ) * 4);
     float *sl = nn_malloc((size_t)K * 4), *dsl = nn_malloc((size_t)K * 4); void *ces = nn_malloc(dr_ce_scratch(1));
     float *clsRS = nn_malloc(8 * 4);   /* (row-norm rstd: teacher rows 0-1, student 4) */
+    float *kpend = nn_malloc(2 * (size_t)C * 4);
     float *clsT = nn_malloc(2 * (size_t)C * 4), *clsS = nn_malloc((size_t)C * 4), *dcls = nn_malloc((size_t)C * 4), *kq = nn_malloc((size_t)KQ * C * 4);
     float *outs = nn_malloc(64 * 4), *hout = malloc(64 * 4);
     int *pS = nn_malloc(8 * 4), *pT = nn_malloc(8 * 4); float *pW = nn_malloc(8 * 4);
@@ -1045,6 +1462,9 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     Dd->vP = P; Dd->vPL = PL; Dd->vnloc = nloc; Dd->zlo = zlo; Dd->zhi = zhi; Dd->lzlo = lzlo; Dd->lzhi = lzhi;   /* the views: drawn by the workers */
     Rg->nworkers = nwork > DN_MAXW ? DN_MAXW : nwork;
     for (int i = 0; i < Rg->nworkers; i++) pthread_create(&Rg->th[i], nullptr, ring_worker, Rg);
+    const int SB = atoi(opt(argc, argv, "--ssl-batch", "0")), sse = atoi(opt(argc, argv, "--ssl-every", "1")) > 0 ? atoi(opt(argc, argv, "--ssl-every", "1")) : 1;
+    dn_ssl SS; if (SB > 0 && dn_ssl_init(&SS, u, cfg, Dd, argc, argv, seed, C, cls_reg, cls_norm, noise)) return 2;
+    if (SB > 0 && opt(argc, argv, "--resume", nullptr)) { char rr[4096]; const char *rq = realpath(opt(argc, argv, "--resume", ""), rr) ? rr : opt(argc, argv, "--resume", ""); dn_ssl_io(&SS, rq, 0); }
     signal(SIGTERM, dn_sig); signal(SIGINT, dn_sig);
     char logp[1200]; snprintf(logp, sizeof logp, "%s/train.log", outd); FILE *lf = fopen(logp, "a");
     fprintf(stderr, "dino-train --recipe: source %d, globals 2 x %d^3 (zoom %.2f..%.2f), locals %d x %d^3 (zoom %.2f..%.2f), CLS %s, head %d-%d-%d -> %d prototypes, "
@@ -1090,7 +1510,8 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             for (int v = 0; v < 2 + nloc; v++) {
                 const int gl = v < 2, n_ = gl ? P : PL; const size_t n3_ = (size_t)n_ * n_ * n_; float *xv = gl ? xg + (size_t)v * CIN * g3 : xl + (size_t)(v - 2) * CIN * l3;
                 dr_crops(src, Ps, xfd + v, itd + v, 1, n_, xv);
-                dr_axis_view(xfd, v, n_, Ps, d_ayx, Sm->hasax && rng_u(&ar) >= adrop, xv + n3_);
+                if (CIN == 2) nn_zero(xv + n3_, n3_ * 4);
+                else dr_axis_view(xfd, v, n_, Ps, d_ayx, Sm->hasax && rng_u(&ar) >= adrop, xv + n3_);
             }
         }
         /* GT points per global view: the sample's labelled voxels (source coordinates) mapped into the view */
@@ -1380,8 +1801,10 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             }
             nn_d2h(hout, outs, 52 * 4);
             lsum[0] += hout[16]; if (gl) { lsum[1] += hout[17]; lsum[2] += HS.ngt ? hout[20] : 0.f; lsum[3] += HS.ngt ? hout[24] : 0.f; lsum[4] += masked[v] ? hout[28] : 0.f; }
-            if (gl && wk > 0) { nn_d2d(kq + (size_t)kpos * C, clsS, (size_t)C * 4); kpos = (kpos + 1) % KQ; if (kfill < KQ) kfill++; }
+            if (gl && wk > 0) nn_d2d(kpend + (size_t)v * C, clsS, (size_t)C * 4);   /* (queued after the view loop: a view never meets its own sample's other view) */
         }
+        if (wk > 0) for (int v = 0; v < 2; v++) { nn_d2d(kq + (size_t)kpos * C, kpend + (size_t)v * C, (size_t)C * 4); kpos = (kpos + 1) % KQ; if (kfill < KQ) kfill++; }
+        if (SB > 0 && step % sse == 0) { if (dn_ssl_step(&SS, step, tt, mom)) return 1; }   /* the multi-sample SSL batch (its gradient into u) */
         nn_axpy(unet_grad_ptr(u), 1.f, unet_grad_ptr(ul), np);   /* the locals' share */
         if (HS.uw) ring_put(Rg, Sm);
         const double gnorm = unet_grad_norm(u);
@@ -1465,12 +1888,13 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             }
             free(qh);
             const double now = dn_now(), dt = (now - t_last) / nsum;
-            char line[2048];
+            char line[6144];
             /* prototype usage: distinct teacher-argmax prototypes since the last reset (every --usage-window steps; DINO sees 2 rows per step) */
             const int uwin = atoi(opt(argc, argv, "--usage-window", "5000")), rst = uwin > 0 && step % uwin < log_every;
             int ud = 0, ui = 0; for (int k = 0; k < K; k++) { ud += useb[k]; if (rst) useb[k] = 0; } for (int k = 0; k < KI && wib > 0; k++) { ui += useib[k]; if (rst) useib[k] = 0; }
             snprintf(line, sizeof line, "step %d dino %.4f ibot %.4f (%.0f tokens) obj %.4f region %.4f ink %.4f koleo %.4f gt %.4f var %.4f | H(t) %.2f H(mean) %.2f (max %.2f) H(ibot t) %.2f (max %.2f) | protos used %d / %d, ibot %d / %d | tt %.3f ema %.5f | gnorm %.3f | %.0f ms/step %.1f Mvox/s",
                      step, sums[0] / nsum, sums[5] / nsum, sums[6] / nsum, sums[7] / nsum, sums[8] / nsum, sums[9] / nsum, sums[1] / nsum, sums[2] / nsum, sums[3] / nsum, Hr, Hm, log((double)K), Hi, log((double)KI), ud, K, ui, KI, tt, mom, sums[4] / nsum, dt * 1e3, (double)(2 * g3 + nloc * l3) / dt / 1e6);
+            if (SB > 0) dn_ssl_log(&SS, step, line, sizeof line);
             if (wtn > 0) { const size_t ln_ = strlen(line); snprintf(line + ln_, sizeof line - ln_, " | tnce %.4f top1 %.3f (negatives %d)",
                                      sums[17] > 0 ? sums[15] / sums[17] : 0.0, sums[17] > 0 ? sums[16] / sums[17] : 0.0, tqf); }
             if (wmo > 0 || wdn > 0) { const size_t ln_ = strlen(line); snprintf(line + ln_, sizeof line - ln_, " | nce: moco %.4f top1 %.3f (negatives %d) dense %.4f top1 %.3f (negatives %d)",
@@ -1506,8 +1930,9 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
                       fclose(hf); }
             char lp[1200]; snprintf(lp, sizeof lp, "%s/last.ckpt", outd);
             { char prev[1300]; const ssize_t pl = readlink(lp, prev, sizeof prev - 1); const int keep = atoi(opt(argc, argv, "--keep-every", "0"));   /* rotation: the previous checkpoint goes unless a milestone */
-              if (pl > 0 && keep > 0) { prev[pl] = 0; int ps_ = 0; if (sscanf(prev, "step%d.ckpt", &ps_) == 1 && ps_ != step && ps_ % keep) { char a1[2600], a2[2600], a3[2600]; snprintf(a1, sizeof a1, "%s/%s", outd, prev); snprintf(a2, sizeof a2, "%s.heads", a1); snprintf(a3, sizeof a3, "%s.protos", a1); unlink(a1); unlink(a2); unlink(a3); } } }
+              if (pl > 0 && keep > 0) { prev[pl] = 0; int ps_ = 0; if (sscanf(prev, "step%d.ckpt", &ps_) == 1 && ps_ != step && ps_ % keep) { char a1[2600], a2[2600], a3[2600]; snprintf(a1, sizeof a1, "%s/%s", outd, prev); snprintf(a2, sizeof a2, "%s.heads", a1); snprintf(a3, sizeof a3, "%s.protos", a1); unlink(a1); unlink(a2); unlink(a3); snprintf(a3, sizeof a3, "%s.ssl", a1); unlink(a3); } } }
             unlink(lp); if (symlink(cp + strlen(outd) + 1, lp)) {}
+            if (SB > 0) dn_ssl_io(&SS, cp, 1);
         }
         if (opt(argc, argv, "--eval", nullptr) && (step % eval_every == 0 || step == steps)) { dn_run_eval(u, argc, argv, step, P, ED, nthreads, 0, 0.f, outd, lf); t_last = dn_now(); }
     }
@@ -1566,7 +1991,11 @@ int cmd_dino_train(int argc, char **argv) {
     if (load_sources(srcf, Dd, nthreads)) return 1;
     const int axis_in = atoi(opt(argc, argv, "--axis-input", "0")); const float ars = (float)atof(opt(argc, argv, "--axis-rs", "0.001"));   /* the axis-distance channel and its scale */
     if (axis_in && !recipe) for (int i = 0; i < Dd->nsrc; i++) if (!Dd->src[i].axz) { fprintf(stderr, "dino-train: --axis-input needs \"axis\" in every source (%s)\n", Dd->src[i].name); return 2; }
-    unet_cfg cfg = {0}; cfg.cin = axis_in ? (recipe ? 5 : 2) : 1; cfg.cout = ED; cfg.G = 8;   /* (the recipe: CT, train's radial (3), valid; else CT, axis distance) */
+    unet_cfg cfg = {0}; cfg.cin = axis_in ? (recipe ? 5 : 2) : 1; cfg.cout = ED; cfg.G = 8;
+    if (recipe && atoi(opt(argc, argv, "--mask-input", "0"))) {   /* a mask channel (iBOT: masked cells CT 0 and mask 1; 0 elsewhere) */
+        if (axis_in) { fprintf(stderr, "dino-train: --mask-input with --axis-input is not supported\n"); return 2; }
+        cfg.cin = 2;
+    }   /* (the recipe: CT, train's radial (3), valid; else CT, axis distance) */
     if (recipe && (atof(opt(argc, argv, "--unwrap2", "0")) > 0 || atof(opt(argc, argv, "--ink-prob", "0")) > 0)) {   /* dense heads after the embedding (dn_uw) */
         if (ED != 32) { fprintf(stderr, "dino-train --recipe: the dense heads need --dim 32\n"); return 2; }
         cfg.cout = (ED + 12 + 15) / 16 * 16;
@@ -1579,6 +2008,7 @@ int cmd_dino_train(int argc, char **argv) {
         cfg.attn_pe = !strcmp(pe, "peg") ? 0 : !strcmp(pe, "rope") ? 1 : !strcmp(pe, "none") ? 2 : -1;
         if (cfg.attn_pe < 0) { fprintf(stderr, "dino-train: --attn-pe peg|rope|none\n"); return 2; }
     }
+    if (opt(argc, argv, "--attn-out-init", nullptr)) setenv("UFSM_ATTN_OUT_INIT", opt(argc, argv, "--attn-out-init", "0"), 1);   /* (unet_init: the attention out projections at s x std, not 0) */
     unet *u = unet_create(&cfg); unet_init(u, seed); unet_head_bias_zero(u);   /* (no shared -2 bias direction in the embeddings) */
     const int HZ = atoi(opt(argc, argv, "--head-slab", "0"));   /* head slabs of HZ planes: no whole-window logits / logit gradient (large windows) */
     if (HZ && (fp32 || P % HZ)) { fprintf(stderr, "dino-train: --head-slab needs MX storage (--mx 1) and P a multiple of it\n"); return 2; }

@@ -403,9 +403,12 @@ void unet_init(unet *u, uint64_t seed) {
             const double sd = 1.0 / sqrt((double)C);
             for (size_t i = 0; i < (size_t)3 * C * C; i++) h[bp->wqkv + i] = (float)(sd * gauss(&seed));
             for (size_t i = 0; i < (size_t)2 * F * C; i++) h[bp->w1 + i] = (float)(sd * gauss(&seed));
-            if (ufsm_env_on("UFSM_ATTN_NONZERO")) {   /* (tests: random out projections) */
-                for (size_t i = 0; i < (size_t)C * C; i++) h[bp->wo + i] = (float)(sd * gauss(&seed));
-                for (size_t i = 0; i < (size_t)C * F; i++) h[bp->w2 + i] = (float)(gauss(&seed) / sqrt((double)F));
+            /* out projections: 0 (identity blocks), random with UFSM_ATTN_NONZERO (tests), or UFSM_ATTN_OUT_INIT=s: s x the natural std (SSL: a
+               zero stage passes the register token through unchanged, the same CLS for every sample until the projections grow) */
+            const double os = ufsm_env_on("UFSM_ATTN_NONZERO") ? 1.0 : getenv("UFSM_ATTN_OUT_INIT") ? atof(getenv("UFSM_ATTN_OUT_INIT")) : 0.0;
+            if (os > 0) {
+                for (size_t i = 0; i < (size_t)C * C; i++) h[bp->wo + i] = (float)(os * sd * gauss(&seed));
+                for (size_t i = 0; i < (size_t)C * F; i++) h[bp->w2 + i] = (float)(os * gauss(&seed) / sqrt((double)F));
             }
         }
         for (size_t i = 0; i < (size_t)u->cfg.attn_reg * C; i++) h[u->reg_off + i] = (float)(0.02 * gauss(&seed));
@@ -3570,6 +3573,7 @@ void unet_gn_freeze(unet *u, const float *h) {
     memcpy(u->gn_frz, h, u->gn_frz_n * 4);
 }
 void unet_blend_ema(unet *u, float a) { nn_scale(u->ema, 1.f - a, u->np); nn_axpy(u->ema, a, u->p, u->np); nn_wmemo_clear(); }
+const float *unet_ema_params(const unet *u) { return u->ema; }
 void unet_use_ema(unet *u, int on) { nn_wmemo_clear(); u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
 const float *unet_fwd_params(const unet *u) { return u->fw; }
 /* ---- 2:4 structured sparsity: the forward reads a masked copy of the live weights; SR-STE keeps the master weights dense ---- */

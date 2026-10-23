@@ -189,6 +189,9 @@ $(B)/test_imgops: tests/test_imgops.c tests/test_imgops_expected.h $(B)/imgops.o
 test-all: $(B)/test_imgops
 $(B)/test_head32: tests/test_head32.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/test_sslstat: tests/test_sslstat.c src/sslstat.h | $(B)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ -lm
+test-all: $(B)/test_sslstat
 test-all: $(B)/test_head32
 $(B)/test_dino_loss: tests/test_dino_loss.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dino_loss.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
@@ -393,6 +396,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_dino_loss
 	UFSM_TEST_D=16 ./$(B)/test_dino_loss
 	./$(B)/test_head32
+	./$(B)/test_sslstat
 	./$(B)/test_attn
 	./$(B)/test_hybrid_identity
 	./$(B)/test_dinor

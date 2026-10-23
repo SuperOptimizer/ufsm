@@ -48,14 +48,14 @@ typedef struct { int Cin, H, B, K; size_t w1, b1, w2, b2, w3, b3, v, g; size_t n
 void dr_head_layout(dr_head *h, int Cin, int H, int B, int K);
 /* scratch for R rows plus the normalised prototypes */
 typedef struct { float *a1, *h1, *a2, *h2, *z, *zn, *zr, *vn, *vr, *dzn, *dh, *dh2, *dvn, *dg;
-                 float *zc; float zc_m; } dr_hws;   /* zc [B] (optional, caller-owned): the forward subtracts it from z before the row norm (a constant
+                 float *zc; float zc_m; const float *dzn_add; } dr_hws;   /* dzn_add [R][B] (optional): added to d / d zn in the backward (a regulariser on the unit bottleneck) */   /* zc [B] (optional, caller-owned): the forward subtracts it from z before the row norm (a constant
                                                        shift: the backward is unchanged); zc_m > 0: the forward first updates zc = m zc + (1 - m) mean_r z */
 size_t dr_hws_bytes(const dr_head *h, int R);
 void dr_hws_carve(dr_hws *w, const dr_head *h, int R, void *base);
 /* x [R][Cin] -> logits [R][K] */
 int dr_head_fwd(const dr_head *h, const float *P, const float *x, int R, float *logits, dr_hws *w);
 /* d loss / d logits [R][K] -> parameter gradients += into G (last: 0 skips V and g, the frozen last layer), d loss / d x [R][Cin] written */
-int dr_head_bwd(const dr_head *h, const float *P, float *G, const float *x, const float *dlogits, int R, float *dx, int last, dr_hws *w);
+int dr_head_bwd(const dr_head *h, const float *P, float *G, const float *x, const float *dlogits, int R, float *dx, int last, dr_hws *w);   /* dlogits nullptr: from w->dzn (d / d the unit bottleneck, filled by the caller) */
 
 /* teacher targets q [R][K] from teacher logits [R][K]: Sinkhorn-Knopp with iters iterations at temperature tt (iters > 0), or
    softmax((l - center) / tt) (iters 0, center [K] or nullptr); scratch: dr_sk_scratch(R, K) bytes */
@@ -106,6 +106,12 @@ void dr_infonce(const float *Q, int N, const float *K, int M, const int *pos, in
    other keys never act as negatives (a sheet-identity embedding makes a view's points near duplicates): loss_i = lse(q.p_i, q.n_m) / tau -
    q.p_i / tau; top-1 = the positive above every negative. scratch: dr_nce_scratch(N, M + 1) bytes */
 void dr_infonce_p(const float *Q, const float *P, int N, const float *Kn, int M, int D, float tau, float w, float *gQ, float *out, void *scratch);
+/* d / d raw features of unit rows e = r / |r| (gathered at voxel idx[i] from an [D][n] channel-major map) added into the fp32 map gl [D][n]
+   (gl + c * n + idx[i]): (ge - e (e . ge)) w / nrm[i] (distinct idx) */
+void dr_scatter_unit_f32(const float *e, const float *ge, const float *nrm, const int *idx, int N, int D, size_t n, float w, float *gl);
+/* per-column affine of one row x [n]: x = (x - m) * is (forward), g = g * is (backward) */
+void dr_cols_affine(float *x, int n, const float *m, const float *is);
+void dr_cols_scale(float *g, int n, const float *is);
 /* rows by index: dst[i] = src[idx[i]] ([n][C]); scatter: dst[idx[i]] += scale src[i] (indices distinct) */
 void dr_rows_gather(const float *src, int C, const int *idx, int n, float *dst);
 void dr_rows_scatter_add(const float *src, const int *idx, int n, int C, float scale, float *dst);

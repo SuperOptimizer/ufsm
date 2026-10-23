@@ -67,7 +67,7 @@ extern "C" void dr_hws_carve(dr_hws *w, const dr_head *h, int R, void *base) {
     TK(z, r * B); TK(zn, r * B); TK(dzn, r * B); TK(zr, r);
     TK(vn, K * B); TK(dvn, K * B); TK(vr, K); TK(dg, K);
 #undef TK
-    w->zc = nullptr; w->zc_m = 0.f;
+    w->zc = nullptr; w->zc_m = 0.f; w->dzn_add = nullptr;
 }
 __global__ void k_zcenter(float *z, float *c, int R, int B, float m) {   /* one thread per column: optional EMA update, then z -= c */
     const int b = blockIdx.x * blockDim.x + threadIdx.x; if (b >= B) return;
@@ -138,14 +138,17 @@ extern "C" int dr_head_fwd(const dr_head *h, const float *P, const float *x, int
 }
 extern "C" int dr_head_bwd(const dr_head *h, const float *P, float *G, const float *x, const float *dl, int R, float *dx, int last, dr_hws *w) {
     const int H = h->H, B = h->B, K = h->K, Cin = h->Cin;
+    if (dl) {   /* (dl nullptr: the caller filled w->dzn = d / d zn -- SimDINO's loss on the normalised bottleneck, no prototype layer) */
     k_rownorm<<<nbk((long long)K * 32, 256), 256>>>(P + h->v, w->vn, w->vr, K, B, 1e-12f, nullptr);
     k_rownorm<<<nbk((long long)K * 32, 256), 256>>>(P + h->v, w->dvn, w->dg, K, B, 1e-12f, P + h->g);   /* W = g vn */
     CK(at_gemm(0, 0, R, B, K, dl, w->dvn, w->dzn, 0.f));                 /* d zn = dl W */
-    if (last) {
+    }
+    if (dl && last) {
         CK(at_gemm(1, 0, K, B, R, dl, w->zn, w->dvn, 0.f));              /* d W = dl^T zn (over W's scratch) */
         k_wn_bwd<<<nbk((long long)K * 32, 256), 256>>>(w->vn, w->vr, P + h->g, w->dvn, G + h->g, K, B);
         k_add<<<nbk((long long)K * B, 256), 256>>>(G + h->v, w->dvn, (long long)K * B);
     }
+    if (w->dzn_add) k_add<<<nbk((long long)R * B, 256), 256>>>(w->dzn, w->dzn_add, (long long)R * B);
     k_rownorm_bwd<<<nbk((long long)R * 32, 256), 256>>>(w->zn, w->zr, w->dzn, w->dzn, R, B, 1e-12f, 0);   /* d z (in place) */
     CK(at_gemm(1, 0, B, H, R, w->dzn, w->h2, G + h->w3, 1.f)); colsum2(w->dzn, R, B, G + h->b3);
     CK(at_gemm(0, 0, R, H, B, w->dzn, P + h->w3, w->dh2, 0.f));
@@ -728,3 +731,19 @@ extern "C" void dr_axis_view(const dr_xf *xf, int v, int n, int Ps, const float 
     if (!valid) { cudaMemsetAsync(x4, 0, (size_t)4 * n3 * 4, 0); return; }
     k_axis_view<<<nbk(n3, 256), 256>>>(xf, v, n, Ps, ayx, x4);
 }
+
+__global__ void k_scatter_unit_f32(const float *e, const float *ge, const float *nrm, const int *idx, int N, int D, size_t n, float w, float *gl) {
+    const int i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31; if (i >= N) return;
+    float d = 0.f; for (int c = lane; c < D; c += 32) d += e[(size_t)i * D + c] * ge[(size_t)i * D + c];
+    for (int o = 16; o; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+    const float inv = w / nrm[i]; const size_t v = (size_t)idx[i];
+    for (int c = lane; c < D; c += 32) gl[(size_t)c * n + v] += (ge[(size_t)i * D + c] - e[(size_t)i * D + c] * d) * inv;
+}
+extern "C" void dr_scatter_unit_f32(const float *e, const float *ge, const float *nrm, const int *idx, int N, int D, size_t n, float w, float *gl) {
+    if (N > 0) k_scatter_unit_f32<<<nbk((long long)N * 32, 256), 256>>>(e, ge, nrm, idx, N, D, n, w, gl);
+}
+
+__global__ void k_cols_affine(float *x, int n, const float *m, const float *is) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = (x[i] - m[i]) * is[i]; }
+__global__ void k_cols_scale(float *g, int n, const float *is) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) g[i] *= is[i]; }
+extern "C" void dr_cols_affine(float *x, int n, const float *m, const float *is) { k_cols_affine<<<nbk(n, 256), 256>>>(x, n, m, is); }
+extern "C" void dr_cols_scale(float *g, int n, const float *is) { k_cols_scale<<<nbk(n, 256), 256>>>(g, n, is); }

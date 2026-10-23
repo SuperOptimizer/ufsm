@@ -72,6 +72,7 @@ const unet_cfg *unet_cfg_of(const unet *u);
 size_t unet_nparams(const unet *u);
 void unet_head_offsets(const unet *u, size_t *w, size_t *b);   /* the 1^3 head's weights (cout x its input channels) and biases (cout) in the flat parameters */
 const float *unet_live_params(const unet *u);   /* device weights the optimiser trains (p) */
+const float *unet_ema_params(const unet *u);    /* the EMA weights (a shared-weights net reads them through unet_use_params: the teacher) */
 void unet_use_params(unet *u, const float *w);  /* forward with these device weights (unet_nparams floats); nullptr restores */
 void unet_grad_head_only(unet *u, int blocks);   /* zero all gradients but the output head's (and the last decoder blocks') */
 void unet_init(unet *u, uint64_t seed);                 /* Kaiming-normal convs, GN gamma 1 / beta 0, head bias -2 */
