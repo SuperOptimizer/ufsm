@@ -70,7 +70,7 @@ static int raw_mode(dv_net *net, int argc, char **argv) {
     fprintf(stderr, "dinovol: tile %d^3 forward %.1f ms\n", T, (t1 - t0) * 1e3);
     dv_prof_report(reps > 1 ? reps - 1 : 1);
     const int g = T / 8;
-    if (dump_dev_half(out, "tokens.f32", dv_tokens(net), (size_t)g * g * g * 480)) return 1;
+    if (dump_dev_half(out, "tokens.f32", dv_tokens(net), (size_t)g * g * g * dv_embed_dim(net))) return 1;
     for (int k = 0; k < 3; k++) { int e, ch; const void *p = dv_skip(net, k, &e, &ch); char nm[32]; snprintf(nm, sizeof nm, "skip%d.f32", k);
         if (dump_dev_half(out, nm, p, (size_t)e * e * e * ch)) return 1; }
     { int e, ch; const void *p = dv_fpn(net, &e, &ch); if (dump_dev_half(out, "fpn.f32", p, (size_t)e * e * e * ch)) return 1; }

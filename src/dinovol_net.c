@@ -19,6 +19,7 @@ struct dv_net {
     void *clsn;                                /* fp16 [480]: the last forward's normed CLS token (x_norm_clstoken) */
     vblock vb[DV_MAXBLK]; int depth; float *nw, *nb;
     int F;                                     /* SwiGLU hidden (3456) */
+    int E, H;                                  /* embedding width (480; 288 for dinovol_ps8_9.6um), heads of 48 */
     /* dense head */
     xconv ref1;   /* the grouped 3^3 refine as a dense conv with block-diagonal weights (zeros add exactly 0) */
     xconv fpn_in, lat, ref2, mlp0, mlp2, shortcut, proj; float *refw, *refb, *fnw, *fnb, *skw[3], *skb[3], *tw, *tb; int fpn, hid, nd, ni;
@@ -59,6 +60,9 @@ dv_net *dv_load(const char *ckpt) {
     wl_dict *d = wl_load(ckpt, "teacher");
     if (!d) { fprintf(stderr, "dinovol: %s: %s\n", ckpt, wl_error()); return nullptr; }
     dv_net *n = calloc(1, sizeof *n); int rc = 0;
+    {   const wl_tensor *c = wl_get(d, "backbone.cls_token"), *m = wl_get(d, "backbone.blocks.0.rope_embed.mix_frequencies");
+        if (!c || !m || c->numel % 48 || m->shape[0] * 48 != c->numel || c->numel > 1024) { fprintf(stderr, "dinovol: %s: unsupported width (cls %lld, heads %lld; need heads of 48)\n", ckpt, c ? (long long)c->numel : -1LL, m ? (long long)m->shape[0] : -1LL); wl_free(d); free(n); return nullptr; }
+        n->E = (int)c->numel; n->H = (int)m->shape[0]; }
     rc |= cln_of(d, &n->stem, "backbone.down_projection.stem.convs.0", 1, 3, 1);
     for (int s = 0; s < DV_MAXST; s++) {
         char p[256]; snprintf(p, sizeof p, "backbone.down_projection.stages.%d.blocks.0.conv1.conv.weight", s);
@@ -81,13 +85,13 @@ dv_net *dv_load(const char *ckpt) {
     rc |= conv_of(d, &n->fproj, "backbone.down_projection.final_proj.weight", "backbone.down_projection.final_proj.bias", 1, 0, nullptr, nullptr);
     {   /* prefix tokens: cls then the registers (Eva._pos_embed) */
         const wl_tensor *c = need(d, "backbone.cls_token"), *r = need(d, "backbone.reg_token");
-        if (!c || !r || r->numel != (DV_PRE - 1) * DV_E) rc = -1;
+        if (!c || !r || r->numel != (DV_PRE - 1) * n->E) rc = -1;
         else {
-            float tmp[DV_PRE * DV_E]; memcpy(tmp, c->data, DV_E * 4); memcpy(tmp + DV_E, r->data, (DV_PRE - 1) * DV_E * 4);
-            xt t = xt_new(1, 1, 1, DV_PRE, DV_E); n->prefix = t.p;
+            float tmp[DV_PRE * n->E]; memcpy(tmp, c->data, n->E * 4); memcpy(tmp + n->E, r->data, (DV_PRE - 1) * n->E * 4);
+            xt t = xt_new(1, 1, 1, DV_PRE, n->E); n->prefix = t.p;
             /* float -> fp16 on the host via the input path: upload floats, convert with a 1x1 identity-free route: use a host conversion */
-            uint16_t h[DV_PRE * DV_E];
-            for (int i = 0; i < DV_PRE * DV_E; i++) {   /* round to nearest even fp16 */
+            uint16_t h[DV_PRE * n->E];
+            for (int i = 0; i < DV_PRE * n->E; i++) {   /* round to nearest even fp16 */
                 const float f = tmp[i]; uint32_t x; memcpy(&x, &f, 4);
                 const uint32_t sign = (x >> 16) & 0x8000u; int e = (int)((x >> 23) & 0xff) - 127 + 15; uint32_t m = x & 0x7fffffu;
                 if (e <= 0) { if (e < -10) h[i] = (uint16_t)sign; else { m |= 0x800000u; const int sh = 14 - e; uint32_t v = m >> sh, rem = m & ((1u << sh) - 1), half = 1u << (sh - 1); if (rem > half || (rem == half && (v & 1))) v++; h[i] = (uint16_t)(sign | v); } }
@@ -107,13 +111,13 @@ dv_net *dv_load(const char *ckpt) {
         V->mix = devf(d, BN("rope_embed.mix_frequencies"));
         rc |= !V->ln1w || !V->ln1b || !V->ln2w || !V->ln2b || !V->mix;
         const wl_tensor *mixt = wl_get(d, BN("rope_embed.mix_frequencies"));
-        if (mixt && (mixt->shape[0] != DV_H || mixt->shape[1] != DV_HD / 2 || mixt->shape[2] != 3)) { fprintf(stderr, "dinovol: unexpected RoPE shape\n"); rc = -1; }
+        if (mixt && (mixt->shape[0] != n->H || mixt->shape[1] != DV_HD / 2 || mixt->shape[2] != 3)) { fprintf(stderr, "dinovol: unexpected RoPE shape\n"); rc = -1; }
         rc |= conv_of(d, &V->qkv, BN("attn.qkv.weight"), nullptr, 1, 0, nullptr, nullptr);
         /* x + gamma (W o + b): epilogue scale gamma, bias gamma b */
         const wl_tensor *g1 = need(d, BN("gamma_1")), *pb = need(d, BN("attn.proj.bias")), *g2 = need(d, BN("gamma_2")), *f2b = need(d, BN("mlp.fc2.bias"));
         if (!g1 || !pb || !g2 || !f2b) { rc = -1; break; }
-        float sb[DV_E];
-        for (int i = 0; i < DV_E; i++) sb[i] = g1->data[i] * pb->data[i];
+        float sb[n->E];
+        for (int i = 0; i < n->E; i++) sb[i] = g1->data[i] * pb->data[i];
         rc |= conv_scaled(d, &V->proj, BN("attn.proj.weight"), g1->data, sb);   /* gamma folded into the weights: no epilogue scale (dv_gemm) */
         {   /* fc1 rows interleaved (x1_j, x2_j) for the fused SwiGLU epilogue (XA_GLU) */
             char wq[256]; snprintf(wq, sizeof wq, "backbone.blocks.%d.mlp.fc1.weight", b);
@@ -128,7 +132,7 @@ dv_net *dv_load(const char *ckpt) {
             rc |= xconv_init(&V->fc1, wi, F2, K1, 1, 1, 1, 1, 1, 1, 0, 0, 0, nullptr, bi);
             free(wi); free(bi);
         }
-        for (int i = 0; i < DV_E; i++) sb[i] = g2->data[i] * f2b->data[i];
+        for (int i = 0; i < n->E; i++) sb[i] = g2->data[i] * f2b->data[i];
         rc |= conv_scaled(d, &V->fc2, BN("mlp.fc2.weight"), g2->data, sb);
         const wl_tensor *f1 = wl_get(d, BN("mlp.fc1.weight")); if (f1) n->F = (int)f1->shape[0] / 2;
 #undef BN
@@ -189,7 +193,7 @@ void dv_free(dv_net *n) {
     xt_free(&n->tok); for (int k = 0; k < 3; k++) xt_free(&n->sk[k]); xt_free(&n->fpng); xfree_dev(n->X);
     free(n);
 }
-int dv_embed_dim(const dv_net *n) { (void)n; return DV_E; }
+int dv_embed_dim(const dv_net *n) { return n->E; }
 int dv_dense_dims(const dv_net *n, int *nd, int *ni) { *nd = n->nd; *ni = n->ni; return n->nd + n->ni; }
 int dv_patch(const dv_net *n) { (void)n; return DV_PATCH; }
 int dv_train_tile(const dv_net *n) { (void)n; return 192; }
@@ -238,46 +242,46 @@ int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scal
     dv_prof(DVP_CNN);
     const int g = T / DV_PATCH; const long long Np = (long long)g * g * g, N = Np + DV_PRE;
     /* token sequence X [N][480] (fp32 residual stream, as under autocast): prefix then patches */
-    float *X = xmalloc_dev((size_t)N * DV_E * 4);
-    dv_half_to_float(X, n->prefix, (long long)DV_PRE * DV_E);
-    dv_half_to_float(X + (size_t)DV_PRE * DV_E, tk.p, Np * DV_E);
+    float *X = xmalloc_dev((size_t)N * n->E * 4);
+    dv_half_to_float(X, n->prefix, (long long)DV_PRE * n->E);
+    dv_half_to_float(X + (size_t)DV_PRE * n->E, tk.p, Np * n->E);
     xt_free(&tk);
-    xt h = xt_new(1, 1, 1, (int)N, DV_E), o = xt_new(1, 1, 1, (int)N, DV_E);
+    xt h = xt_new(1, 1, 1, (int)N, n->E), o = xt_new(1, 1, 1, (int)N, n->E);
     dv_prof(DVP_TOK);
     for (int b = 0; b < n->depth; b++) {
         const vblock *V = &n->vb[b];
-        dv_layernorm32(X, V->ln1w, V->ln1b, 1e-5f, h.p, N, DV_E);
+        dv_layernorm32(X, V->ln1w, V->ln1b, 1e-5f, h.p, N, n->E);
         dv_prof(DVP_LN);
         const int lt = dv_gemm_on();
-        xt qkv = lt ? xt_new(1, 1, 1, (int)N, 3 * DV_E) : xconv_fwd(&V->qkv, h, nullptr, XA_NONE);
-        if (lt && dv_gemm(h.p, (int)N, DV_E, V->qkv.w, V->qkv.Kp, 3 * DV_E, nullptr, qkv.p, 0, 0)) return -1;
+        xt qkv = lt ? xt_new(1, 1, 1, (int)N, 3 * n->E) : xconv_fwd(&V->qkv, h, nullptr, XA_NONE);
+        if (lt && dv_gemm(h.p, (int)N, n->E, V->qkv.w, V->qkv.Kp, 3 * n->E, nullptr, qkv.p, 0, 0)) return -1;
         dv_prof(DVP_QKV);
-        dv_rope(qkv.p, V->mix, (int)N, DV_PRE, g, DV_H);
+        dv_rope(qkv.p, V->mix, (int)N, DV_PRE, g, n->H);
         dv_prof(DVP_ROPE);
-        dv_attention48(qkv.p, o.p, (int)N, DV_H);
+        dv_attention48(qkv.p, o.p, (int)N, n->H);
         dv_prof(DVP_ATTN);
         xt_free(&qkv);
-        if (lt > 1) { if (dv_gemm(o.p, (int)N, DV_E, V->proj.w, V->proj.Kp, DV_E, V->proj.bias, X, 1, 1)) return -1; }   /* X += W o + b */
-        else { xt u = xconv_fwd(&V->proj, o, nullptr, XA_NONE); dv_add_half(X, u.p, N * DV_E); xt_free(&u); }
+        if (lt > 1) { if (dv_gemm(o.p, (int)N, n->E, V->proj.w, V->proj.Kp, n->E, V->proj.bias, X, 1, 1)) return -1; }   /* X += W o + b */
+        else { xt u = xconv_fwd(&V->proj, o, nullptr, XA_NONE); dv_add_half(X, u.p, N * n->E); xt_free(&u); }
         dv_prof(DVP_PROJ);
-        dv_layernorm32(X, V->ln2w, V->ln2b, 1e-5f, h.p, N, DV_E);
+        dv_layernorm32(X, V->ln2w, V->ln2b, 1e-5f, h.p, N, n->E);
         dv_prof(DVP_LN);
         xt G;
-        if (lt > 1) { xt A = xt_new(1, 1, 1, (int)N, 2 * n->F); if (dv_gemm(h.p, (int)N, DV_E, V->fc1.w, V->fc1.Kp, 2 * n->F, V->fc1.bias, A.p, 0, 0)) return -1;
+        if (lt > 1) { xt A = xt_new(1, 1, 1, (int)N, 2 * n->F); if (dv_gemm(h.p, (int)N, n->E, V->fc1.w, V->fc1.Kp, 2 * n->F, V->fc1.bias, A.p, 0, 0)) return -1;
                   G = xt_new(1, 1, 1, (int)N, n->F); dv_glu_il(A.p, G.p, N * n->F); xt_free(&A); }
         else G = xconv_fwd(&V->fc1, h, nullptr, XA_GLU);   /* [N][F]: silu(x1) x2 fused */
         dv_prof(DVP_FC1);
-        if (lt) { if (dv_gemm(G.p, (int)N, n->F, V->fc2.w, V->fc2.Kp, DV_E, V->fc2.bias, X, 1, 1)) return -1; xt_free(&G); }
-        else { xt u = xconv_fwd(&V->fc2, G, nullptr, XA_NONE); xt_free(&G); dv_add_half(X, u.p, N * DV_E); xt_free(&u); }
+        if (lt) { if (dv_gemm(G.p, (int)N, n->F, V->fc2.w, V->fc2.Kp, n->E, V->fc2.bias, X, 1, 1)) return -1; xt_free(&G); }
+        else { xt u = xconv_fwd(&V->fc2, G, nullptr, XA_NONE); xt_free(&G); dv_add_half(X, u.p, N * n->E); xt_free(&u); }
         dv_prof(DVP_FC2);
     }
-    dv_layernorm32(X, n->nw, n->nb, 1e-5f, h.p, N, DV_E);
-    n->tok = xt_new(1, g, g, g, DV_E);
+    dv_layernorm32(X, n->nw, n->nb, 1e-5f, h.p, N, n->E);
+    n->tok = xt_new(1, g, g, g, n->E);
     {
         extern void dv_copy_dev(void *dst, const void *src, size_t bytes);
-        dv_copy_dev(n->tok.p, (const char *)h.p + (size_t)DV_PRE * DV_E * 2, (size_t)Np * DV_E * 2);
-        if (!n->clsn) n->clsn = xmalloc_dev((size_t)DV_E * 2);
-        dv_copy_dev(n->clsn, h.p, (size_t)DV_E * 2);   /* (row 0: the cls token after the final LayerNorm) */
+        dv_copy_dev(n->tok.p, (const char *)h.p + (size_t)DV_PRE * n->E * 2, (size_t)Np * n->E * 2);
+        if (!n->clsn) n->clsn = xmalloc_dev((size_t)n->E * 2);
+        dv_copy_dev(n->clsn, h.p, (size_t)n->E * 2);   /* (row 0: the cls token after the final LayerNorm) */
     }
     xt_free(&h); xt_free(&o); xfree_dev(X);
     dv_prof(DVP_FINAL);
@@ -293,11 +297,11 @@ int dv_forward(dv_net *n, const uint8_t *u8_dev, int T, float center, float scal
 }
 
 int dv_net_points(dv_net *n, const float *coords_dev, const float *wgt_dev, const int *rows_dev, int P, float *acc_dev) {
-    const int C = n->nd + n->ni, Ft = DV_E + n->sk[0].c + n->sk[1].c + n->sk[2].c + n->fpn;
+    const int C = n->nd + n->ni, Ft = n->E + n->sk[0].c + n->sk[1].c + n->sk[2].c + n->fpn;
     for (int p0 = 0; p0 < P; p0 += DV_HCHUNK) {
         const int np = P - p0 < DV_HCHUNK ? P - p0 : DV_HCHUNK;
-        xt tok = xt_new(1, 1, 1, np, DV_E), feat = xt_new(1, 1, 1, np, Ft);
-        dv_gather_grid G[5] = {{n->tok.p, n->tok.d, DV_E, nullptr, nullptr},
+        xt tok = xt_new(1, 1, 1, np, n->E), feat = xt_new(1, 1, 1, np, Ft);
+        dv_gather_grid G[5] = {{n->tok.p, n->tok.d, n->E, nullptr, nullptr},
                                {n->sk[0].p, n->sk[0].d, n->sk[0].c, n->skw[0], n->skb[0]}, {n->sk[1].p, n->sk[1].d, n->sk[1].c, n->skw[1], n->skb[1]},
                                {n->sk[2].p, n->sk[2].d, n->sk[2].c, n->skw[2], n->skb[2]}, {n->fpng.p, n->fpng.d, n->fpng.c, n->fnw, n->fnb}};
         dv_prof(DVP_OTHER);
@@ -306,7 +310,7 @@ int dv_net_points(dv_net *n, const float *coords_dev, const float *wgt_dev, cons
         xt pr;
         if (dv_gemm_on() > 1) {   /* (UFSM_DV_CUBLAS=2; measured no faster than the fused xnet epilogues) cuBLASLt GEMMs with bias epilogues; GELU, the shortcut add and the trunk LayerNorm in one row pass */
             xt S = xt_new(1, 1, 1, np, n->hid), h1 = xt_new(1, 1, 1, np, n->hid), h2 = xt_new(1, 1, 1, np, n->hid);
-            if (dv_gemm(tok.p, np, DV_E, n->shortcut.w, n->shortcut.Kp, n->hid, n->shortcut.bias, S.p, 0, 0) ||
+            if (dv_gemm(tok.p, np, n->E, n->shortcut.w, n->shortcut.Kp, n->hid, n->shortcut.bias, S.p, 0, 0) ||
                 dv_gemm(feat.p, np, Ft, n->mlp0.w, n->mlp0.Kp, n->hid, n->mlp0.bias, h1.p, 0, 0)) return -1;
             xt_free(&tok); xt_free(&feat);
             dv_gelu(h1.p, (long long)np * n->hid);
