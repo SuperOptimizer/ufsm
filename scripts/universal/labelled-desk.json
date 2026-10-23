@@ -345,7 +345,14 @@
           1152
         ]
       ],
-      "weight": 1
+      "weight": 1,
+      "phase": {
+        "root": "/vesuvius/ufsm/gt/paris4-wind-20261019/phaseA",
+        "key": "9.6"
+      },
+      "um": 9.6,
+      "axis": "/vesuvius/ufsm/teacher/axis-0.json",
+      "axis_scale": 0.25
     },
     {
       "name": "PHerc0139",
@@ -613,7 +620,15 @@
           736
         ]
       ],
-      "weight": 0.5
+      "weight": 0.5,
+      "phase": {
+        "root": "/vesuvius/ufsm/gt/PHerc0139-wind-20261016/phase",
+        "key": "18.72",
+        "scale": 2
+      },
+      "um": 9.362,
+      "axis": "/vesuvius/ufsm/gt/axis/PHerc0139-umb-scan.json",
+      "axis_scale": 1
     },
     {
       "name": "PHerc0814",
@@ -881,7 +896,15 @@
           736
         ]
       ],
-      "weight": 0.5
+      "weight": 0.5,
+      "phase": {
+        "root": "/vesuvius/ufsm/gt/PHerc0814-wind-20261019/phase",
+        "key": "18.724",
+        "scale": 2
+      },
+      "um": 9.362,
+      "axis": "/vesuvius/ufsm/gt/axis/PHerc0814-20250804134230.json",
+      "axis_scale": 1
     }
   ]
 }

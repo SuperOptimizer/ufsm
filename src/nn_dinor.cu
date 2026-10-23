@@ -67,6 +67,12 @@ extern "C" void dr_hws_carve(dr_hws *w, const dr_head *h, int R, void *base) {
     TK(z, r * B); TK(zn, r * B); TK(dzn, r * B); TK(zr, r);
     TK(vn, K * B); TK(dvn, K * B); TK(vr, K); TK(dg, K);
 #undef TK
+    w->zc = nullptr; w->zc_m = 0.f;
+}
+__global__ void k_zcenter(float *z, float *c, int R, int B, float m) {   /* one thread per column: optional EMA update, then z -= c */
+    const int b = blockIdx.x * blockDim.x + threadIdx.x; if (b >= B) return;
+    if (m > 0.f) { float s = 0.f; for (int r = 0; r < R; r++) s += z[(size_t)r * B + b]; c[b] = c[b] * m + s / R * (1.f - m); }
+    const float cb = c[b]; for (int r = 0; r < R; r++) z[(size_t)r * B + b] -= cb;
 }
 __device__ __forceinline__ float gelu_e(float v) { return 0.5f * v * (1.f + erff(v * 0.70710678118654752f)); }
 __device__ __forceinline__ float gelu_d(float v) { return 0.5f * (1.f + erff(v * 0.70710678118654752f)) + v * 0.3989422804014327f * expf(-0.5f * v * v); }
@@ -122,6 +128,7 @@ extern "C" int dr_head_fwd(const dr_head *h, const float *P, const float *x, int
     CK(at_gemm(0, 1, R, H, h->Cin, x, P + h->w1, w->a1, 0.f)); k_bias_gelu<<<nbk((long long)R * H, 256), 256>>>(w->a1, P + h->b1, w->h1, R, H);
     CK(at_gemm(0, 1, R, H, H, w->h1, P + h->w2, w->a2, 0.f)); k_bias_gelu<<<nbk((long long)R * H, 256), 256>>>(w->a2, P + h->b2, w->h2, R, H);
     CK(at_gemm(0, 1, R, B, H, w->h2, P + h->w3, w->z, 0.f)); k_bias<<<nbk((long long)R * B, 256), 256>>>(w->z, P + h->b3, R, B);
+    if (w->zc) k_zcenter<<<nbk(B, 256), 256>>>(w->z, w->zc, R, B, w->zc_m);
     k_rownorm<<<nbk((long long)R * 32, 256), 256>>>(w->z, w->zn, w->zr, R, B, 1e-12f, nullptr);
     k_rownorm<<<nbk((long long)K * 32, 256), 256>>>(P + h->v, w->vn, w->vr, K, B, 1e-12f, nullptr);   /* unit prototypes */
     /* logits = zn (g vn)^T: scale the unit rows by g into dvn (scratch) */
@@ -321,6 +328,27 @@ __global__ void k_pool_bwd(const float *g, int n, int S, int C, int r0, float *g
 }
 extern "C" void dr_pool_fwd(const float *t, int n, int S, int C, int r0, float *cls) { k_pool<<<nbk((long long)n * C, 256), 256>>>(t, n, S, C, r0, cls); }
 extern "C" void dr_pool_bwd(const float *g, int n, int S, int C, int r0, float *gt) { k_pool_bwd<<<nbk((long long)n * S * C, 256), 256>>>(g, n, S, C, r0, gt); }
+__global__ void k_rownorm(const float *x, int C, float *y, float *rstd) {   /* one block per row */
+    __shared__ float sh[256]; const int r = blockIdx.x; const float *xr = x + (size_t)r * C; float *yr = y + (size_t)r * C;
+    float s = 0.f; for (int c = threadIdx.x; c < C; c += blockDim.x) s += xr[c];
+    sh[threadIdx.x] = s; __syncthreads(); for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
+    const float m = sh[0] / C; __syncthreads();
+    float v = 0.f; for (int c = threadIdx.x; c < C; c += blockDim.x) { const float d = xr[c] - m; v += d * d; }
+    sh[threadIdx.x] = v; __syncthreads(); for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
+    const float rs = rsqrtf(sh[0] / C + 1e-6f); __syncthreads();
+    for (int c = threadIdx.x; c < C; c += blockDim.x) yr[c] = (xr[c] - m) * rs;
+    if (threadIdx.x == 0) rstd[r] = rs;
+}
+__global__ void k_rownorm_bwd(const float *dy, const float *y, const float *rstd, int C, float *dx) {
+    __shared__ float sa[256], sb[256]; const int r = blockIdx.x; const float *g = dy + (size_t)r * C, *yr = y + (size_t)r * C;
+    float a = 0.f, b = 0.f; for (int c = threadIdx.x; c < C; c += blockDim.x) { a += g[c]; b += g[c] * yr[c]; }
+    sa[threadIdx.x] = a; sb[threadIdx.x] = b; __syncthreads();
+    for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) { sa[threadIdx.x] += sa[threadIdx.x + k]; sb[threadIdx.x] += sb[threadIdx.x + k]; } __syncthreads(); }
+    const float ma = sa[0] / C, mb = sb[0] / C, rs = rstd[r]; __syncthreads();
+    for (int c = threadIdx.x; c < C; c += blockDim.x) dx[(size_t)r * C + c] = rs * (g[c] - ma - yr[c] * mb);
+}
+extern "C" void dr_rownorm_fwd(const float *x, int R, int C, float *y, float *rstd) { k_rownorm<<<R, 256>>>(x, C, y, rstd); }
+extern "C" void dr_rownorm_bwd(const float *dy, const float *y, const float *rstd, int R, int C, float *dx) { k_rownorm_bwd<<<R, 256>>>(dy, y, rstd, C, dx); }
 __global__ void k_adamw(float *p, const float *g, float *m, float *v, size_t n, float lr, float b1, float b2, float eps, float wd, float c1, float c2) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
         m[i] = b1 * m[i] + (1 - b1) * g[i]; v[i] = b2 * v[i] + (1 - b2) * g[i] * g[i];
@@ -611,4 +639,92 @@ extern "C" void dr_ink(const float *A, const int *aid, int Na, const float *Kp, 
     float *gt = buf, *lv = buf + (size_t)Na * D;
     k_ink<<<Na, 128, (size_t)2 * (np + nn) * 4>>>(A, aid, Kp, kid, np, Kn, nn, D, T, margin, lv, gt);
     k_ink_fin<<<1, 256>>>(lv, gt, Na, D, w, gA, out);
+}
+
+/* ---- InfoNCE over a key bank ---- */
+extern "C" size_t dr_nce_scratch(int N, int M) { return al((size_t)N * M) * 4 + 256; }
+__global__ void k_nce_rows(float *S, int M, const int *pos, float tau, float w, int N, float *out) {   /* one block per anchor: S row -> d L / d logit */
+    __shared__ float sh[256]; __shared__ int si[256];
+    const int r = blockIdx.x; float *row = S + (size_t)r * M; const int p = pos[r];
+    float m = -INFINITY; int am = 0;
+    for (int k = threadIdx.x; k < M; k += blockDim.x) { const float v = row[k] / tau; if (v > m) { m = v; am = k; } }
+    sh[threadIdx.x] = m; si[threadIdx.x] = am; __syncthreads();
+    for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k && (sh[threadIdx.x + k] > sh[threadIdx.x] || (sh[threadIdx.x + k] == sh[threadIdx.x] && si[threadIdx.x + k] < si[threadIdx.x]))) { sh[threadIdx.x] = sh[threadIdx.x + k]; si[threadIdx.x] = si[threadIdx.x + k]; } __syncthreads(); }
+    m = sh[0]; const int amax = si[0]; __syncthreads();
+    float z = 0.f; for (int k = threadIdx.x; k < M; k += blockDim.x) z += expf(row[k] / tau - m);
+    sh[threadIdx.x] = z; __syncthreads();
+    for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
+    z = sh[0]; const float sp = row[p] / tau; __syncthreads();
+    const float g = w / ((float)N * tau);
+    for (int k = threadIdx.x; k < M; k += blockDim.x) row[k] = g * (expf(row[k] / tau - m) / z - (k == p ? 1.f : 0.f));
+    if (threadIdx.x == 0) { atomicAdd(out, w * (m + logf(z) - sp) / N); atomicAdd(out + 1, (amax == p ? 1.f : 0.f) / N); }
+}
+extern "C" void dr_infonce(const float *Q, int N, const float *K, int M, const int *pos, int D, float tau, float w, float *gQ, float *out, void *scratch) {
+    if (N <= 0 || M <= 0) return;
+    float *S = (float *)scratch;
+    at_gemm_f32(0, 1, N, M, D, Q, K, S, 0.f);          /* S = Q K^T */
+    k_nce_rows<<<N, 256>>>(S, M, pos, tau, w, N, out);  /* S -> d L / d S (times 1 / tau, w / N) */
+    at_gemm_f32(0, 0, N, D, M, S, K, gQ, 1.f);          /* gQ += G K */
+}
+
+__global__ void k_rowdot(const float *A, const float *B, int N, int D, float *o) {   /* one warp per row */
+    const int r = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, l = threadIdx.x & 31; if (r >= N) return;
+    float s = 0.f; for (int d = l; d < D; d += 32) s += A[(size_t)r * D + d] * B[(size_t)r * D + d];
+    for (int o2 = 16; o2; o2 >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o2);
+    if (l == 0) o[r] = s;
+}
+__global__ void k_nce_rows_p(float *S, float *sp, int M, float tau, float w, int N, float *out) {   /* S [N][M] negatives, sp [N] positives -> d L / d s */
+    __shared__ float sh[256]; const int r = blockIdx.x; float *row = S + (size_t)r * M; const float p = sp[r] / tau;
+    float m = p, mn = -INFINITY; for (int k = threadIdx.x; k < M; k += blockDim.x) { const float v = row[k] / tau; m = fmaxf(m, v); mn = fmaxf(mn, v); }
+    sh[threadIdx.x] = m; __syncthreads(); for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + k]); __syncthreads(); }
+    m = sh[0]; __syncthreads();
+    sh[threadIdx.x] = mn; __syncthreads(); for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + k]); __syncthreads(); }
+    mn = sh[0]; __syncthreads();
+    float z = 0.f; for (int k = threadIdx.x; k < M; k += blockDim.x) z += expf(row[k] / tau - m);
+    sh[threadIdx.x] = z; __syncthreads(); for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
+    z = sh[0] + expf(p - m); __syncthreads();
+    const float g = w / ((float)N * tau);
+    for (int k = threadIdx.x; k < M; k += blockDim.x) row[k] = g * expf(row[k] / tau - m) / z;
+    if (threadIdx.x == 0) { sp[r] = g * (expf(p - m) / z - 1.f); atomicAdd(out, w * (m + logf(z) - p) / N); atomicAdd(out + 1, (p > mn ? 1.f : 0.f) / N); }
+}
+__global__ void k_axpy_rows(float *y, const float *a, const float *x, int N, int D) {   /* y[r] += a[r] x[r] */
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= (long long)N * D) return;
+    y[i] += a[i / D] * x[i];
+}
+extern "C" void dr_infonce_p(const float *Q, const float *P, int N, const float *Kn, int M, int D, float tau, float w, float *gQ, float *out, void *scratch) {
+    if (N <= 0) return;
+    float *sp = (float *)scratch, *S = sp + al((size_t)N);
+    k_rowdot<<<nbk((long long)N * 32, 256), 256>>>(Q, P, N, D, sp);
+    if (M > 0) at_gemm_f32(0, 1, N, M, D, Q, Kn, S, 0.f);
+    k_nce_rows_p<<<N, 256>>>(S, sp, M, tau, w, N, out);
+    if (M > 0) at_gemm_f32(0, 0, N, D, M, S, Kn, gQ, 1.f);
+    k_axpy_rows<<<nbk((long long)N * D, 256), 256>>>(gQ, sp, P, N, D);
+}
+
+__global__ void k_rows_gather(const float *src, int C, const int *idx, int n, float *dst) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= (long long)n * C) return;
+    dst[i] = src[(size_t)idx[i / C] * C + i % C];
+}
+__global__ void k_rows_scatter_add(const float *src, const int *idx, int n, int C, float scale, float *dst) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= (long long)n * C) return;
+    dst[(size_t)idx[i / C] * C + i % C] += scale * src[i];
+}
+extern "C" void dr_rows_gather(const float *src, int C, const int *idx, int n, float *dst) { if (n > 0) k_rows_gather<<<nbk((long long)n * C, 256), 256>>>(src, C, idx, n, dst); }
+extern "C" void dr_rows_scatter_add(const float *src, const int *idx, int n, int C, float scale, float *dst) { if (n > 0) k_rows_scatter_add<<<nbk((long long)n * C, 256), 256>>>(src, idx, n, C, scale, dst); }
+
+__global__ void k_axis_view(const dr_xf *xf, int v, int n, int Ps, const float *ayx, float *x4) {
+    const long long n3 = (long long)n * n * n, i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= n3) return;
+    const dr_xf t = xf[v]; const int vc[3] = {(int)(i / ((long long)n * n)), (int)((i / n) % n), (int)(i % n)};
+    double sx[3];
+    for (int d = 0; d < 3; d++) { const double o = t.flip[d] ? (double)(n - 1 - vc[d]) : (double)vc[d]; sx[t.perm[d]] = t.off[t.perm[d]] + (o + 0.5) * t.m / t.n - 0.5; }
+    int zp = (int)lrint(sx[0]); zp = zp < 0 ? 0 : zp >= Ps ? Ps - 1 : zp;
+    const float dy = (float)(sx[1] - ayx[2 * zp]), dx = (float)(sx[2] - ayx[2 * zp + 1]), r = sqrtf(dy * dy + dx * dx);
+    const float rad[3] = {0.f, r > 1e-6f ? dy / r : 0.f, r > 1e-6f ? dx / r : 0.f};
+    for (int d = 0; d < 3; d++) x4[(size_t)d * n3 + i] = (t.flip[d] ? -1.f : 1.f) * rad[t.perm[d]];
+    x4[3 * n3 + i] = 1.f;
+}
+extern "C" void dr_axis_view(const dr_xf *xf, int v, int n, int Ps, const float *ayx, int valid, float *x4) {
+    const long long n3 = (long long)n * n * n;
+    if (!valid) { cudaMemsetAsync(x4, 0, (size_t)4 * n3 * 4, 0); return; }
+    k_axis_view<<<nbk(n3, 256), 256>>>(xf, v, n, Ps, ayx, x4);
 }

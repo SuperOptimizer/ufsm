@@ -33,6 +33,11 @@ typedef struct { float center, scale, gamma, lo, hi, contrast, mean, bias, sigma
 /* ncrop views of edge n from the source crops src [nsrc][Ps^3]: x [ncrop][n^3]; xf / it on the device */
 void dr_crops(const uint8_t *src, int Ps, const dr_xf *xf, const dr_int *it, int ncrop, int n, float *x);
 
+/* the axis input of a view (train's radial channels + a validity channel): view v's voxels mapped to the source window (xf[v] on the
+   device), the scroll axis centre (y, x) per source window plane ayx [Ps][2] (window coordinates), the unit radial vector (0, dy, dx) / r in
+   the source frame carried into the view frame (channel d = (flip[d] ? -1 : 1) radial[perm[d]], train's cube symmetry), into x4 [4][n^3]:
+   channels radial z, y, x, valid (valid 0: all four 0 -- no axis, or the axis dropped for this view) */
+void dr_axis_view(const dr_xf *xf, int v, int n, int Ps, const float *ayx, int valid, float *x4);
 /* iBOT input masking: voxels of the masked token cells (edge ps, mask [G^3] u8 on the device, G = n / ps) of an n^3 view set to val */
 void dr_mask_cells(float *x, int n, int ps, const uint8_t *mask, float val);
 
@@ -42,7 +47,9 @@ void dr_mask_cells(float *x, int n, int ps, const uint8_t *mask, float val);
 typedef struct { int Cin, H, B, K; size_t w1, b1, w2, b2, w3, b3, v, g; size_t n; } dr_head;
 void dr_head_layout(dr_head *h, int Cin, int H, int B, int K);
 /* scratch for R rows plus the normalised prototypes */
-typedef struct { float *a1, *h1, *a2, *h2, *z, *zn, *zr, *vn, *vr, *dzn, *dh, *dh2, *dvn, *dg; } dr_hws;
+typedef struct { float *a1, *h1, *a2, *h2, *z, *zn, *zr, *vn, *vr, *dzn, *dh, *dh2, *dvn, *dg;
+                 float *zc; float zc_m; } dr_hws;   /* zc [B] (optional, caller-owned): the forward subtracts it from z before the row norm (a constant
+                                                       shift: the backward is unchanged); zc_m > 0: the forward first updates zc = m zc + (1 - m) mean_r z */
 size_t dr_hws_bytes(const dr_head *h, int R);
 void dr_hws_carve(dr_hws *w, const dr_head *h, int R, void *base);
 /* x [R][Cin] -> logits [R][K] */
@@ -70,6 +77,10 @@ void dr_koleo_q(const float *x, int N, const float *cand, int M, int D, float w,
 /* the average pool of token rows [n][S][C] over rows [r0, S) of each sequence -> cls [n][C]; backward: g [n][C] spread into gt (added) */
 void dr_pool_fwd(const float *t, int n, int S, int C, int r0, float *cls);
 void dr_pool_bwd(const float *g, int n, int S, int C, int r0, float *gt);
+/* parameter-free layer norm of R rows of C (the CLS before the DINO head / KoLeo: upstream's final LayerNorm): y = (x - mean) / sqrt(var + 1e-6),
+   in place allowed; rstd [R] kept for the backward: dx = rstd (dy - mean(dy) - y mean(dy y)) (dx may be dy) */
+void dr_rownorm_fwd(const float *x, int R, int C, float *y, float *rstd);
+void dr_rownorm_bwd(const float *dy, const float *y, const float *rstd, int R, int C, float *dx);
 /* the argmax prototype of each of R rows of q [R][K] -> out [R] (device ints; the prototype usage monitor) */
 void dr_argmax_rows(const float *q, int R, int K, int *out);
 /* rows of v [R][N] scaled to unit length in place */
@@ -85,6 +96,19 @@ void dr_obj(const float *S, const float *T, const int *obj, const uint8_t *vs, c
    0.5 (softplus(m_push - m_pull) + softplus(lme_push - lme_pull)), pull logits capped at max(margin, max push sim + T); mean over anchors
    times w -> out[0] (+=), d / d A added into gA. Ink anchors: pull = ink keys, push = no-ink keys; no-ink anchors: the roles swapped */
 void dr_ink(const float *A, const int *aid, int Na, const float *Kp, const int *kid, int np, const float *Kn, int nn, int D, float T, float margin, float w, float *gA, float *out);
+/* InfoNCE over a key bank (the batch-1 self-supervision: MoCo-style CLS, DenseCL-style cross-view tokens): anchors Q [N][D] (unit), keys
+   K [M][D] (unit, no gradient: the EMA teacher's in-batch keys first, then the queue), pos[i] the row of anchor i's positive; per anchor
+   loss lse_m(q.k_m / tau) - q.k_pos / tau; out[0] += w mean loss, out[1] += mean top-1 (the positive ranked first); gQ += d (w mean loss) / d Q.
+   scratch: dr_nce_scratch(N, M) bytes */
+size_t dr_nce_scratch(int N, int M);
+void dr_infonce(const float *Q, int N, const float *K, int M, const int *pos, int D, float tau, float w, float *gQ, float *out, void *scratch);
+/* the same with a positive per anchor P [N][D] and only shared negatives Kn [M][D] (the queue: keys of other samples), so the same sample's
+   other keys never act as negatives (a sheet-identity embedding makes a view's points near duplicates): loss_i = lse(q.p_i, q.n_m) / tau -
+   q.p_i / tau; top-1 = the positive above every negative. scratch: dr_nce_scratch(N, M + 1) bytes */
+void dr_infonce_p(const float *Q, const float *P, int N, const float *Kn, int M, int D, float tau, float w, float *gQ, float *out, void *scratch);
+/* rows by index: dst[i] = src[idx[i]] ([n][C]); scatter: dst[idx[i]] += scale src[i] (indices distinct) */
+void dr_rows_gather(const float *src, int C, const int *idx, int n, float *dst);
+void dr_rows_scatter_add(const float *src, const int *idx, int n, int C, float scale, float *dst);
 /* per-object means of point rows x [N][D] by grp [N] (-1 none) -> m [M][D] and counts; backward adds gm / count to the points' rows */
 void dr_gmean(const float *x, const int *grp, int N, int D, int M, float *m, float *cnt);
 void dr_gmean_bwd(const float *gm, const float *cnt, const int *grp, int N, int D, float *gx);
