@@ -78,3 +78,10 @@ const void *dv_fpn(const dv_net *n, int *edge, int *ch);
 #ifdef __cplusplus
 }
 #endif
+
+/* the checkpoint's DINO / iBOT heads (pre "dino_head" / "ibot_head") as a dr_head layout + host floats (caller frees); the volume-wide
+   robust normalisation statistics of dinovol-embed (src/dinovol.c) */
+#include "dinor.h"
+typedef struct z3 z3;
+int dv_head_host(const char *ckpt, const char *pre, dr_head *h, float **Ph);
+int dv_ct_stats(z3 *ct, int stride, int nthreads, double *median, double *scale, double *p99);

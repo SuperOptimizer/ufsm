@@ -454,6 +454,8 @@ __global__ void k_mask_cells(float *x, int n, int ps, const uint8_t *mask, float
     }
 }
 extern "C" void dr_mask_cells(float *x, int n, int ps, const uint8_t *mask, float val) { k_mask_cells<<<nbk((long long)n * n * n, 256), 256>>>(x, n, ps, mask, val); }
+__global__ void k_f2u8(const float *x, long long n, uint8_t *u) { const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i < n) { const float v = rintf(x[i]); u[i] = (uint8_t)(v < 0.f ? 0.f : v > 255.f ? 255.f : v); } }
+extern "C" void dr_f2u8(const float *x, long long n, uint8_t *u) { k_f2u8<<<nbk(n, 256), 256>>>(x, n, u); }
 
 /* ---- per-row argmax (prototype usage monitor) ---- */
 __global__ void k_argmax_rows(const float *q, int K, int *out) {

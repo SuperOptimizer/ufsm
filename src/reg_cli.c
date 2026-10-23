@@ -75,6 +75,14 @@ static int ctx_open(rctx *x, const char *path, const char *cache, int open_vols)
     return x->cv && x->fv ? 0 : -1;
 }
 static void ctx_close(rctx *x) { rvol_close(x->cv); rvol_close(x->fv); free(x->D.d); json_free(x->j); }
+/* a registration map + its fine volume, kept open for the caller's lifetime (dino-train cross-scan views); nullptr on failure */
+const rmap *reg_map_open(const char *path, const char *cache, rvol **fv, double *coarse_um, double *fine_um) {
+    rctx *x = calloc(1, sizeof *x);
+    if (ctx_open(x, path, cache, 1)) { free(x); return nullptr; }
+    if (x->m.D) x->m.D = &x->D;
+    *fv = x->fv; *coarse_um = x->cv->um; *fine_um = x->fv->um;
+    return &x->m;
+}
 
 /* ---------- reg pair ---------- */
 /* landmark residuals of one transform file: rms / max of |M from - to| and of a least-squares affine refit (to voxels) */

@@ -40,6 +40,8 @@ void dr_crops(const uint8_t *src, int Ps, const dr_xf *xf, const dr_int *it, int
 void dr_axis_view(const dr_xf *xf, int v, int n, int Ps, const float *ayx, int valid, float *x4);
 /* iBOT input masking: voxels of the masked token cells (edge ps, mask [G^3] u8 on the device, G = n / ps) of an n^3 view set to val */
 void dr_mask_cells(float *x, int n, int ps, const uint8_t *mask, float val);
+/* x rounded and clamped to [0, 255] as bytes (a raw-intensity view back to a CT tile) */
+void dr_f2u8(const float *x, long long n, uint8_t *u);
 
 /* DINO head (upstream DINOHead, nlayers 3, no BN): x [R][Cin] -> GELU(x W1^T + b1) -> GELU(. W2^T + b2) -> . W3^T + b3 = z [R][B] -> zn =
    z / max(|z|, 1e-12) -> logits = zn . (g_k v_k / |v_k|) [R][K] (weight-normalised bias-free last layer; g [K] the weight-norm scales).

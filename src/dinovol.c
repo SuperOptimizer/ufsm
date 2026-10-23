@@ -962,19 +962,29 @@ int dv_write_dense_box(const char *group, const int64_t vol_shape[3], const int6
 #include "wload.h"
 #include "nn.h"
 typedef struct { dr_head h; float *P; } cal_head;
-static int cal_head_load(cal_head *c, const wl_dict *d, const char *pre) {
+/* one of the checkpoint's DINOHeads (pre "dino_head" / "ibot_head") as a dr_head layout + host floats (caller frees) */
+int dv_head_host(const char *ckpt, const char *pre, dr_head *h, float **Ph) {
+    wl_dict *d = wl_load(ckpt, "teacher"); if (!d) { fprintf(stderr, "dinovol: %s\n", wl_error()); return -1; }
     const wl_tensor *w1 = wl_getf(d, "%s.mlp.0.weight", pre), *b1 = wl_getf(d, "%s.mlp.0.bias", pre), *w2 = wl_getf(d, "%s.mlp.2.weight", pre),
                     *b2 = wl_getf(d, "%s.mlp.2.bias", pre), *w3 = wl_getf(d, "%s.mlp.4.weight", pre), *b3 = wl_getf(d, "%s.mlp.4.bias", pre),
                     *g = wl_getf(d, "%s.last_layer.parametrizations.weight.original0", pre), *v = wl_getf(d, "%s.last_layer.parametrizations.weight.original1", pre);
-    if (!w1 || !b1 || !w2 || !b2 || !w3 || !b3 || !g || !v) { fprintf(stderr, "dinovol-calib: %s: head tensors missing\n", pre); return -1; }
-    dr_head_layout(&c->h, (int)w1->shape[1], (int)w1->shape[0], (int)w3->shape[0], (int)v->shape[0]);
-    float *P = calloc(c->h.n, sizeof *P);
-    memcpy(P + c->h.w1, w1->data, w1->numel * 4); memcpy(P + c->h.b1, b1->data, b1->numel * 4); memcpy(P + c->h.w2, w2->data, w2->numel * 4);
-    memcpy(P + c->h.b2, b2->data, b2->numel * 4); memcpy(P + c->h.w3, w3->data, w3->numel * 4); memcpy(P + c->h.b3, b3->data, b3->numel * 4);
-    memcpy(P + c->h.v, v->data, v->numel * 4); memcpy(P + c->h.g, g->data, g->numel * 4);
+    if (!w1 || !b1 || !w2 || !b2 || !w3 || !b3 || !g || !v) { fprintf(stderr, "dinovol: %s: head tensors missing\n", pre); wl_free(d); return -1; }
+    dr_head_layout(h, (int)w1->shape[1], (int)w1->shape[0], (int)w3->shape[0], (int)v->shape[0]);
+    float *P = calloc(h->n, sizeof *P);
+    memcpy(P + h->w1, w1->data, w1->numel * 4); memcpy(P + h->b1, b1->data, b1->numel * 4); memcpy(P + h->w2, w2->data, w2->numel * 4);
+    memcpy(P + h->b2, b2->data, b2->numel * 4); memcpy(P + h->w3, w3->data, w3->numel * 4); memcpy(P + h->b3, b3->data, b3->numel * 4);
+    memcpy(P + h->v, v->data, v->numel * 4); memcpy(P + h->g, g->data, g->numel * 4);
     double gs = 0, gmin = 1e30, gmax = -1e30; for (int64_t k = 0; k < g->numel; k++) { gs += g->data[k]; gmin = fmin(gmin, g->data[k]); gmax = fmax(gmax, g->data[k]); }
-    fprintf(stderr, "dinovol-calib: %s: %d -> %d -> %d -> bottleneck %d, K %d prototypes; weight-norm g mean %.4f min %.4f max %.4f (max logit |g|: x %.1f at t 0.07)\n",
-            pre, c->h.Cin, c->h.H, c->h.H, c->h.B, c->h.K, gs / (double)g->numel, gmin, gmax, gmax / 0.07);
+    fprintf(stderr, "dinovol: %s: %d -> %d -> %d -> bottleneck %d, K %d prototypes; weight-norm g mean %.4f min %.4f max %.4f\n", pre, h->Cin, h->H, h->H, h->B, h->K, gs / (double)g->numel, gmin, gmax);
+    wl_free(d); *Ph = P; return 0;
+}
+/* the volume-wide robust normalisation of dinovol-embed (nonzero voxels of every stride-th chunk per axis) */
+int dv_ct_stats(z3 *ct, int stride, int nthreads, double *median, double *scale, double *p99) {
+    dv_stats S = {0}; if (sample_stats(ct, stride, nthreads, &S)) return -1;
+    *median = S.median; *scale = S.scale; *p99 = S.p99; return 0;
+}
+static int cal_head_load(cal_head *c, const char *ck, const char *pre) {
+    float *P = nullptr; if (dv_head_host(ck, pre, &c->h, &P)) return -1;
     c->P = xdev_floats(P, c->h.n); free(P);
     return c->P ? 0 : -1;
 }
@@ -1168,9 +1178,7 @@ int cmd_dinovol_calib(int argc, char **argv) {
           double d = 0, a = 0, b = 0; for (int e = 0; e < E; e++) { d += cls[(size_t)r * E + e] * cls[(size_t)s * E + e]; a += cls[(size_t)r * E + e] * cls[(size_t)r * E + e]; b += cls[(size_t)s * E + e] * cls[(size_t)s * E + e]; }
           const double c = d / sqrt(a * b + 1e-30); if (r / 2 == s / 2) cs += c; else { co += c; no++; } }
       fprintf(stderr, "backbone CLS (normed, %d dims): cos same %.4f other %.4f\n", E, cs / N, co / no); }
-    wl_dict *d = wl_load(ck, "teacher"); if (!d) { fprintf(stderr, "dinovol-calib: %s\n", wl_error()); return 1; }
-    cal_head hd, hi; if (cal_head_load(&hd, d, "dino_head") || cal_head_load(&hi, d, "ibot_head")) return 1;
-    wl_free(d);
+    cal_head hd, hi; if (cal_head_load(&hd, ck, "dino_head") || cal_head_load(&hi, ck, "ibot_head")) return 1;
     {   float *L = malloc((size_t)2 * N * hd.h.K * 4), *zn = malloc((size_t)2 * N * hd.h.B * 4);
         if (cal_head_run(&hd, cls, 2 * N, L, zn)) return 1;
         cal_report("DINO head on the CLS", L, zn, 2 * N, hd.h.K, hd.h.B, temps, nt, iters, 2);
