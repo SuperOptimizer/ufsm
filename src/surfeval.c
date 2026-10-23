@@ -325,7 +325,7 @@ static int enc_fwd(se_enc *E, const uint8_t *u8d, int P, const se_case *c, float
             int Sv = 0, nreg = 0, Ct = 0; const float *tok = k == E->nl - 1 ? unet_tokens(E->u, nullptr, &Sv, &Ct, &nreg) : nullptr;
             if (tok) { se_f2f_cl(tok + (size_t)nreg * Ct, dst, (long long)S, Ct); continue; }
             shape5 sh; const float *so = unet_stage_out(E->u, k, &sh);
-            if (!so || (size_t)sh.d * sh.h * sh.w != S || sh.c != E->ch[k]) { fprintf(stderr, "surf-eval: level %d stage output not kept / unexpected shape\n", k); return -1; }
+            if (!so || (size_t)sh.d * sh.h * sh.w != S || sh.c != E->ch[k]) { fprintf(stderr, "surf-eval: level %d stage output %p, shape %d x %d^3 (expected %d x %d^3)\n", k, (const void *)so, sh.c, sh.d, E->ch[k], e); return -1; }
             nn_d2d_async(dst, so, S * E->ch[k] * 4);
         }
         nn_set_tf32(0);   /* (the decoder: the plain fp32 kernels) */
@@ -437,6 +437,7 @@ int cmd_surf_eval(int argc, char **argv) {
     if (!unet_peek(ck, &ucfg, &ustep)) {   /* one of our UNets */
         E.u = unet_create(&ucfg); if (unet_load(E.u, ck) < 0) return 1;
         unet_use_params(E.u, unet_ema_params(E.u));   /* (the teacher weights, as dino-embed) */
+        unet_set_recompute(0);   /* (keep the stage outputs s2) */
         nn_set_tf32(1); unet_build(E.u, (shape5){1, ucfg.cin, P, P, P}, 1); nn_set_tf32(0);
         E.cin = ucfg.cin; E.nl = ucfg.nlev; for (int k = 0; k < E.nl; k++) E.ch[k] = ucfg.widths[k];
         E.xin = nm((size_t)ucfg.cin * P * P * P);
