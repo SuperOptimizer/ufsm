@@ -17,6 +17,9 @@ jq -c '.sources[]' $T/u0h.json | while IFS= read -r e; do
   f=$(jq -r '"\(.root)/\(.ct)/\(.min_level)/zarr.json"' <<< "$e")
   if [ -e "$f" ]; then echo "$e"; else echo "mksources: skipped (no local copy): $f" >&2; fi
 done | jq -s '{sources: .}' > $T/u0ok.json
-jq -s '{sources: (.[0].sources + .[1].sources)}' $D/labelled-desk.json $T/u0ok.json > $OUT
+# XSCAN=1: + the Paris 4 cross-scan views (labelled-xscan.json: 137 keV L2 and 1.13 um L3, labels warped from 78 keV by ufsm reg warp over
+# the certified probe cells, the eval holdout's image excluded from their boxes)
+X=$D/labelled-desk.json; [ "${XSCAN:-0}" = 1 ] && { jq -s '{sources: (.[0].sources + .[1].sources)}' $D/labelled-desk.json $D/labelled-xscan.json > $T/lab.json; X=$T/lab.json; }
+jq -s '{sources: (.[0].sources + .[1].sources)}' $X $T/u0ok.json > $OUT
 echo "$(jq '[.sources[] | select(.ct_only != 1)] | length' $OUT) labelled + $(jq '[.sources[] | select(.ct_only == 1)] | length' $OUT) U0 sources -> $OUT"
 rm -rf $T

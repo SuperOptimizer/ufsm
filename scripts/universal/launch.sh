@@ -11,6 +11,8 @@ STEPS=${STEPS:-1000000}; SAVE=${SAVE:-2000}; KEEP=${KEEP:-20000}
 P=${P:-256}; SP=${SP:-384}; LP=${LP:-96}; ZOOM=${ZOOM:-0.7,1.4}
 CFG="--recipe 1 --P $P --source-P $SP --local-P $LP --zoom $ZOOM --attn-blocks 2 --protos-k 32768 --ibot-k 32768 --linear-mx 4 --head-slab 16 --mem lean
      --unlabelled-share ${US:-0.6} --exclude-src PHerc1667 --gt ${GT:-0.1} --object ${OBJ:-0.1} --region ${REG:-0.1} --dim 32 --ssl 0 --warmup 2000 --teacher-temp-warmup 30000 --freeze-last 1250"
+# AXIS=1: the axis input (CT + train's radial channels + valid; per-view dropout --axis-drop 0.15; a 1-input checkpoint warm-starts with the stem grown)
+[ "${AXIS:-0}" = 1 ] && CFG="$CFG --axis-input 1"
 # DENSE=1: the dense heads (unwrap2 + ink-prob, robust phase loss; a 32-output checkpoint grows to 48 on resume, the heads ramp in over 2000 steps)
 [ "${DENSE:-0}" = 1 ] && CFG="$CFG --unwrap2 ${UW:-1} --ink-prob ${IKP:-1} --wind4-lambda 0.5 --dense-ramp 2000 --dense-from ${DFROM:?DENSE=1 needs DFROM (the step the dense heads start at: fixed across watchdog restarts)} --phase-trunc 0.25 --phase-trunc-conf 0.5 --normal-step 1 --density-scale 4 --density-code 1 --packed-weight 8 --packed-um 120"
 fast=0

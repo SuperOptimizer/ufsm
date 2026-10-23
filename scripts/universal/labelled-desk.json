@@ -350,7 +350,9 @@
         "root": "/vesuvius/ufsm/gt/paris4-wind-20261019/phaseA",
         "key": "9.6"
       },
-      "um": 9.6
+      "um": 9.6,
+      "axis": "/vesuvius/ufsm/teacher/axis-0.json",
+      "axis_scale": 0.25
     },
     {
       "name": "PHerc0139",
@@ -624,7 +626,9 @@
         "key": "18.72",
         "scale": 2
       },
-      "um": 9.362
+      "um": 9.362,
+      "axis": "/vesuvius/ufsm/gt/axis/PHerc0139-umb-scan.json",
+      "axis_scale": 1
     },
     {
       "name": "PHerc0814",
@@ -898,7 +902,9 @@
         "key": "18.724",
         "scale": 2
       },
-      "um": 9.362
+      "um": 9.362,
+      "axis": "/vesuvius/ufsm/gt/axis/PHerc0814-20250804134230.json",
+      "axis_scale": 1
     }
   ]
 }

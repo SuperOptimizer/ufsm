@@ -33,6 +33,11 @@ typedef struct { float center, scale, gamma, lo, hi, contrast, mean, bias, sigma
 /* ncrop views of edge n from the source crops src [nsrc][Ps^3]: x [ncrop][n^3]; xf / it on the device */
 void dr_crops(const uint8_t *src, int Ps, const dr_xf *xf, const dr_int *it, int ncrop, int n, float *x);
 
+/* the axis input of a view (train's radial channels + a validity channel): view v's voxels mapped to the source window (xf[v] on the
+   device), the scroll axis centre (y, x) per source window plane ayx [Ps][2] (window coordinates), the unit radial vector (0, dy, dx) / r in
+   the source frame carried into the view frame (channel d = (flip[d] ? -1 : 1) radial[perm[d]], train's cube symmetry), into x4 [4][n^3]:
+   channels radial z, y, x, valid (valid 0: all four 0 -- no axis, or the axis dropped for this view) */
+void dr_axis_view(const dr_xf *xf, int v, int n, int Ps, const float *ayx, int valid, float *x4);
 /* iBOT input masking: voxels of the masked token cells (edge ps, mask [G^3] u8 on the device, G = n / ps) of an n^3 view set to val */
 void dr_mask_cells(float *x, int n, int ps, const uint8_t *mask, float val);
 

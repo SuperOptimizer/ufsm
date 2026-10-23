@@ -585,6 +585,25 @@ static int test_rows(void) {
     nn_free(sd); nn_free(gd); nn_free(od); nn_free(id);
     return bad;
 }
+/* the axis input of a view vs a host reference (dr_map, train's cube-symmetry rule for the radial vector) */
+static int test_axis_view(void) {
+    const int Ps = 40, n = 16; printf("axis view: source %d, view %d\n", Ps, n); int bad = 0;
+    dr_xf t = {{5, 3, 7}, {2, 0, 1}, {1, 0, 1}, n, 24, 0};
+    double ay[80]; float ayf[80]; for (int z = 0; z < Ps; z++) { ay[2 * z] = rf(20 + 3 * sin(z * 0.2)); ay[2 * z + 1] = rf(18 + 2 * cos(z * 0.3)); ayf[2 * z] = (float)ay[2 * z]; ayf[2 * z + 1] = (float)ay[2 * z + 1]; }
+    dr_xf *td = nn_malloc(sizeof t); nn_h2d(td, &t, sizeof t); float *ad = nn_malloc(sizeof ayf); nn_h2d(ad, ayf, sizeof ayf);
+    const size_t n3 = (size_t)n * n * n; float *xd = nn_malloc(4 * n3 * 4); double *ref = malloc(4 * n3 * 8);
+    dr_axis_view(td, 0, n, Ps, ad, 1, xd);
+    for (int z = 0; z < n; z++) for (int y = 0; y < n; y++) for (int x = 0; x < n; x++) {
+        const double vv[3] = {z, y, x}; double sx[3]; dr_map(&t, vv, sx); int zp = (int)lrint(sx[0]); zp = zp < 0 ? 0 : zp >= Ps ? Ps - 1 : zp;
+        const double dy = sx[1] - ay[2 * zp], dx = sx[2] - ay[2 * zp + 1], r = hypot(dy, dx), rad[3] = {0, dy / r, dx / r};
+        const size_t i = ((size_t)z * n + y) * n + x; for (int d = 0; d < 3; d++) ref[d * n3 + i] = (t.flip[d] ? -1 : 1) * rad[t.perm[d]]; ref[3 * n3 + i] = 1;
+    }
+    double *g = host(xd, 4 * n3); bad += report("valid", g, ref, (int)(4 * n3), 1e-4); free(g);
+    dr_axis_view(td, 0, n, Ps, ad, 0, xd); g = host(xd, 4 * n3); double z2 = 0; for (size_t i = 0; i < 4 * n3; i++) z2 += fabs(g[i]); free(g);
+    printf("  no axis: sum |x| %.3g%s\n", z2, z2 == 0 ? "" : "  FAIL"); bad += z2 != 0;
+    nn_free(td); nn_free(ad); nn_free(xd); free(ref);
+    return bad;
+}
 static int test_pool(void) {
     const int n = 2, S = 11, C = 5, r0 = 3; printf("pool: %d x %d tokens (%d registers), C %d\n", n, S, r0, C);
     double *t = malloc(n * S * C * 8), *g = malloc(n * C * 8); for (int i = 0; i < n * S * C; i++) t[i] = rf(nrand()); for (int i = 0; i < n * C; i++) g[i] = rf(nrand());
@@ -601,7 +620,7 @@ static int test_pool(void) {
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
     int bad = test_views() + test_head() + test_targets() + test_ce() + test_koleo() + test_koleo_q() + test_muon(64, 24) + test_muon(24, 64) + test_muon_ref(160, 24) + test_obj() + test_ink() + test_mlp2() + test_pool() + test_rownorm()
-              + test_sharp() + test_toy_dino() + test_nce() + test_nce_p() + test_toy_nce() + test_rows();   /* (the newer tests last: the older ones keep their random draws) */
+              + test_sharp() + test_toy_dino() + test_nce() + test_nce_p() + test_toy_nce() + test_rows() + test_axis_view();   /* (the newer tests last: the older ones keep their random draws) */
     printf(bad ? "test_dinor: %d FAILED\n" : "test_dinor: all passed\n", bad);
     return bad != 0;
 }

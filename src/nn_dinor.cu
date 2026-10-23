@@ -711,3 +711,20 @@ __global__ void k_rows_scatter_add(const float *src, const int *idx, int n, int 
 }
 extern "C" void dr_rows_gather(const float *src, int C, const int *idx, int n, float *dst) { if (n > 0) k_rows_gather<<<nbk((long long)n * C, 256), 256>>>(src, C, idx, n, dst); }
 extern "C" void dr_rows_scatter_add(const float *src, const int *idx, int n, int C, float scale, float *dst) { if (n > 0) k_rows_scatter_add<<<nbk((long long)n * C, 256), 256>>>(src, idx, n, C, scale, dst); }
+
+__global__ void k_axis_view(const dr_xf *xf, int v, int n, int Ps, const float *ayx, float *x4) {
+    const long long n3 = (long long)n * n * n, i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= n3) return;
+    const dr_xf t = xf[v]; const int vc[3] = {(int)(i / ((long long)n * n)), (int)((i / n) % n), (int)(i % n)};
+    double sx[3];
+    for (int d = 0; d < 3; d++) { const double o = t.flip[d] ? (double)(n - 1 - vc[d]) : (double)vc[d]; sx[t.perm[d]] = t.off[t.perm[d]] + (o + 0.5) * t.m / t.n - 0.5; }
+    int zp = (int)lrint(sx[0]); zp = zp < 0 ? 0 : zp >= Ps ? Ps - 1 : zp;
+    const float dy = (float)(sx[1] - ayx[2 * zp]), dx = (float)(sx[2] - ayx[2 * zp + 1]), r = sqrtf(dy * dy + dx * dx);
+    const float rad[3] = {0.f, r > 1e-6f ? dy / r : 0.f, r > 1e-6f ? dx / r : 0.f};
+    for (int d = 0; d < 3; d++) x4[(size_t)d * n3 + i] = (t.flip[d] ? -1.f : 1.f) * rad[t.perm[d]];
+    x4[3 * n3 + i] = 1.f;
+}
+extern "C" void dr_axis_view(const dr_xf *xf, int v, int n, int Ps, const float *ayx, int valid, float *x4) {
+    const long long n3 = (long long)n * n * n;
+    if (!valid) { cudaMemsetAsync(x4, 0, (size_t)4 * n3 * 4, 0); return; }
+    k_axis_view<<<nbk(n3, 256), 256>>>(xf, v, n, Ps, ayx, x4);
+}
