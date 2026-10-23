@@ -1,0 +1,8 @@
+c90-t03-k4	--ssl-batch 32 --ssl-workers 14 --ssl-center 0.9 --teacher-temp 0.03 --teacher-temp0 0.03 --ssl-protos 4096 --ssl-head-lr 1e-3 --attn-out-init 0.02 --ssl-overlap 0.5 --ssl-easy-steps 8000
+c95-t025-k4	--ssl-batch 32 --ssl-workers 14 --ssl-center 0.95 --teacher-temp 0.025 --teacher-temp0 0.025 --ssl-protos 4096 --ssl-head-lr 1e-3 --attn-out-init 0.02 --ssl-overlap 0.5 --ssl-easy-steps 8000
+c95-t02-k1	--ssl-batch 32 --ssl-workers 14 --ssl-center 0.95 --teacher-temp 0.02 --teacher-temp0 0.02 --ssl-protos 1024 --ssl-head-lr 1e-3 --attn-out-init 0.02 --ssl-overlap 0.5 --ssl-easy-steps 8000
+vic1-c90-t03	--ssl-batch 32 --ssl-workers 14 --ssl-center 0.9 --teacher-temp 0.03 --teacher-temp0 0.03 --ssl-protos 4096 --ssl-head-lr 1e-3 --ssl-vic-var 1 --ssl-vic-cov 0.04 --attn-out-init 0.02 --ssl-overlap 0.5 --ssl-easy-steps 8000
+zvic3-c95-t025	--ssl-batch 32 --ssl-workers 14 --ssl-center 0.95 --teacher-temp 0.025 --teacher-temp0 0.025 --ssl-protos 4096 --ssl-head-lr 1e-3 --ssl-zvic-var 3 --ssl-zvic-cov 0.1 --attn-out-init 0.02 --ssl-overlap 0.5 --ssl-easy-steps 8000
+ibot-c90-t03	--ssl-batch 32 --ssl-workers 14 --mask-input 1 --ssl-ibot 1 --ssl-ibot-max 512 --ssl-ibot-protos 8192 --ssl-dino 0.1 --ssl-center 0.9 --teacher-temp 0.03 --teacher-temp0 0.03 --ssl-protos 4096 --ssl-head-lr 1e-3 --attn-out-init 0.02 --ssl-overlap 0.5 --ssl-easy-steps 8000
+simdino1	--ssl-batch 32 --ssl-workers 14 --ssl-simdino 1 --ssl-koleo 0 --ssl-head-lr 1e-3 --attn-out-init 0.02 --ssl-overlap 0.5 --ssl-easy-steps 8000
+c90-t03-k4-l2	--ssl-batch 32 --ssl-workers 16 --ssl-locals 2 --ssl-center 0.9 --teacher-temp 0.03 --teacher-temp0 0.03 --ssl-protos 4096 --ssl-head-lr 1e-3 --attn-out-init 0.02 --ssl-overlap 0.5 --ssl-easy-steps 8000
