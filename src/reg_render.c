@@ -13,7 +13,7 @@
             "cache_mb": 2400, "px": 2 (base voxels per output pixel: 2 = half-res of the base-voxel uv grid), "crop": [x0, y0, w, h] (output pixels, optional),
             "scans": [{"name", "root", "key", "um", "chain": [{"map": reg.json, "dir": "c2f" | "f2c", "pair": pair dir}], "scale": 1, "origin": [z, y, x]}],
             ("level": L: always that pyramid level; scale / origin: the scan is a scale-times finer grid of the chain's last frame cropped at origin, e.g. a super-resolved box)
-            "rgb": [n1, n2, n3], "diff": [[a, b], [a, b], [a, b]], "baseline": [a, b]} */
+            "rgb": [n1, n2, n3], "diff": [[a, b], [a, b], [a, b]], "baseline": [a, b], "panel_crop": [x, y, w, h] (<variant>_panels.jpg: the scans side by side with ink contours, default the whole render)} */
 #include "reg.h"
 #include "json.h"
 #include "imgops.h"
@@ -523,6 +523,12 @@ int cmd_reg_render(int argc, char **argv) {
     const char *vn[2] = {"native", "matched"};
     const json *rgb = json_get(cfg, "rgb"), *dif = json_get(cfg, "diff"), *bl = json_get(cfg, "baseline");
     uint8_t *img = malloc(NP * 3);
+    int pc[4] = {0, 0, j->W, j->H};
+    { const json *q = json_get(cfg, "panel_crop"); if (q && q->n == 4) for (int k = 0; k < 4; k++) pc[k] = (int)json_num(json_at(q, (size_t)k), pc[k]);
+      if (pc[0] < 0) pc[0] = 0; if (pc[1] < 0) pc[1] = 0; if (pc[0] + pc[2] > j->W) pc[2] = j->W - pc[0]; if (pc[1] + pc[3] > j->H) pc[3] = j->H - pc[1]; }
+    const int PW = j->ns * pc[2] + 8 * (j->ns - 1);
+    uint8_t *pan = pc[2] > 0 && pc[3] > 0 && (double)PW * pc[3] < 6e8 ? malloc((size_t)PW * pc[3] * 3) : nullptr;
+    if (pan) memset(pan, 255, (size_t)PW * pc[3] * 3);
     for (int v = 0; v < 2; v++) {
         float lut[MAXS][256]; fprintf(st, "%s\"%s\":{\"scans\":{", v ? "," : "", vn[v]);
         for (int s = 0; s < j->ns; s++) {
@@ -531,6 +537,15 @@ int cmd_reg_render(int argc, char **argv) {
             fprintf(st, "%s\"%s\":{\"coverage\":%.4f,\"p1\":%g,\"p99\":%g}", s ? "," : "", j->sc[s].name, (double)cnt / NP, a, b);
             for (size_t i = 0; i < NP; i++) { const float x = lut[s][j->raw[v][s][i]]; img[3 * i] = img[3 * i + 1] = img[3 * i + 2] = x < 0 ? 0 : (uint8_t)(x * 254 + 1); }
             snprintf(p, sizeof p, "%s/%s_%s.jpg", od, vn[v], j->sc[s].name); write_jpg(p, j->W, j->H, img, 90);
+            if (pan) for (int y = 0; y < pc[3]; y++) for (int x = 0; x < pc[2]; x++) {   /* this scan's panel (grey), ink contours yellow */
+                const size_t i = (size_t)(pc[1] + y) * j->W + pc[0] + x; uint8_t *o = pan + ((size_t)y * PW + (size_t)s * (pc[2] + 8) + x) * 3;
+                if (g_contour && g_contour[i]) { o[0] = 255; o[1] = 255; o[2] = 0; } else { o[0] = o[1] = o[2] = img[3 * i]; }
+            }
+        }
+        if (pan) {   /* <variant>_panels.jpg: every scan side by side (config "panel_crop" [x, y, w, h] output px, default all), names on top */
+            const int sc = pc[3] / 200 > 1 ? pc[3] / 200 : 2; const uint8_t yel[3] = {255, 220, 0};
+            for (int s = 0; s < j->ns; s++) img_text_scaled(pan, PW, pc[3], s * (pc[2] + 8) + 2 * sc, 2 * sc, j->sc[s].name, sc, yel);
+            snprintf(p, sizeof p, "%s/%s_panels.jpg", od, vn[v]); jpeg_write_rgb(p, PW, pc[3], pan, 90);
         }
         fprintf(st, "}");
         /* differences: the common symmetric gain = 127 / max over the diff pairs and the baseline of the 99th percentile |a - b| */
@@ -575,6 +590,6 @@ int cmd_reg_render(int argc, char **argv) {
       for (size_t i = 0; i < NP; i++) for (int c = 0; c < 3; c++) img[3 * i + c] = rg[c] >= 0 && j->raw[0][rg[c]][i] ? 200 : 0;
       snprintf(p, sizeof p, "%s/coverage.jpg", od); jpeg_write_rgb(p, j->W, j->H, img, 85); }
     fprintf(stderr, "reg render: wrote %s (%ld s)\n", od, (long)(time(nullptr) - j->t0));
-    free(img);
+    free(img); free(pan);
     return 0;
 }

@@ -193,3 +193,65 @@ int cmd_sr_pyrpairs(int argc, char **argv) {
     fprintf(stderr, "sr-pyrpairs: %d boxes from %d tries in %lds -> %s\n", n, atomic_load(&j->next), (long)(time(nullptr) - t0), od);
     return 0;
 }
+
+/* ufsm sr-ceiling <pair-dir> --root R --key K [--um U] [--lut 1] [--cache DIR] [--max 64]: for an sr-pyrpairs set, the scan's own level-0
+   box at each box origin scored against the set's target with the restore-eval-pairs metrics (PSNR, SSIM over 8^3 blocks, gradient PSNR;
+   voxels where both are > 0; the target through the set's intensity map with --lut 1): the "perfect 2.4 um prediction" ceiling for a
+   finer-scan target. Also the level-0 box against its own 3^3 box mean (a light denoise: a rough noise-floor indicator). */
+#include "srpair.h"
+typedef struct { double n, se, gn, gse, ss, nb; } cmet;
+static void cmet_add(cmet *m, const uint8_t *a, const uint8_t *t, int T) {   /* a: prediction, t: target */
+    const size_t str[3] = {(size_t)T * T, (size_t)T, 1};
+    for (size_t i = 0; i < (size_t)T * T * T; i++) {
+        if (!a[i] || !t[i]) continue;
+        const double e = (double)a[i] - t[i]; m->n++; m->se += e * e;
+        for (int d = 0; d < 3; d++) { if ((int)((i / str[d]) % T) == T - 1) continue; const size_t j = i + str[d]; if (!a[j] || !t[j]) continue;
+            const double g = ((double)a[j] - a[i]) - ((double)t[j] - t[i]); m->gn++; m->gse += g * g; }
+    }
+    for (int Z = 0; Z < T / 8; Z++) for (int Y = 0; Y < T / 8; Y++) for (int X = 0; X < T / 8; X++) {
+        double s[8] = {0}; int ok = 1;
+        for (int z = 0; z < 8 && ok; z++) for (int y = 0; y < 8 && ok; y++) for (int x = 0; x < 8; x++) {
+            const size_t i = ((size_t)(8 * Z + z) * T + 8 * Y + y) * T + 8 * X + x; if (!a[i] || !t[i]) { ok = 0; break; }
+            s[0] += a[i]; s[1] += t[i]; s[2] += (double)a[i] * a[i]; s[3] += (double)t[i] * t[i]; s[4] += (double)a[i] * t[i];
+        }
+        if (!ok) continue;
+        const double N = 512, ma = s[0] / N, mt = s[1] / N, va = s[2] / N - ma * ma, vt = s[3] / N - mt * mt, c = s[4] / N - ma * mt, C1 = 6.5025, C2 = 58.5225;
+        m->ss += (2 * ma * mt + C1) * (2 * c + C2) / ((ma * ma + mt * mt + C1) * (va + vt + C2)); m->nb++;
+    }
+}
+static void cmet_print(const char *what, const cmet *m) {
+    printf("%-34s psnr %.3f  ssim %.4f  grad psnr %.3f  (%.0f voxels, %.0f blocks)\n", what, m->se > 0 ? 10 * log10(65025.0 * m->n / m->se) : 99.0,
+           m->nb > 0 ? m->ss / m->nb : 0, m->gse > 0 ? 10 * log10(65025.0 * m->gn / m->gse) : 99.0, m->n, m->nb);
+}
+int cmd_sr_ceiling(int argc, char **argv) {
+    const char *root = opt(argc, argv, "--root", nullptr), *key = opt(argc, argv, "--key", nullptr);
+    if (argc < 3 || argv[2][0] == '-' || !root || !key) { fprintf(stderr, "usage: ufsm sr-ceiling <pair-dir> --root R --key K [--um U] [--lut 1] [--cache DIR] [--max 64]\n"); return 2; }
+    srpair *p = srpair_open(argv[2], "val", atoi(opt(argc, argv, "--lut", "1")), 0); if (!p) return 1;
+    rvol *v = rvol_open(root, key, opt(argc, argv, "--cache", nullptr), atof(opt(argc, argv, "--um", "0"))); if (!v) return 1;
+    char bp[2100]; snprintf(bp, sizeof bp, "%s/boxes.json", argv[2]);
+    FILE *f = fopen(bp, "rb"); if (!f) return 1; fseek(f, 0, SEEK_END); const long L = ftell(f); fseek(f, 0, SEEK_SET);
+    char *t = malloc(L + 1); if (fread(t, 1, L, f) != (size_t)L) { fclose(f); return 1; } fclose(f); t[L] = 0;
+    json *j = json_parse(t, (size_t)L); free(t); const json *bx = j ? json_get(j, "boxes") : nullptr; if (!bx) return 1;
+    const int T = p->T, mx = atoi(opt(argc, argv, "--max", "64")); const size_t t3 = (size_t)T * T * T;
+    uint8_t *tg = malloc(t3), *co = malloc((size_t)p->B * p->B * p->B), *a = malloc(t3), *dn = malloc(t3);
+    cmet real = {0}, den = {0};
+    for (size_t k = 0; k < bx->n && (int)k < mx; k++) {
+        const json *b = json_at(bx, k); int64_t o[3]; for (int d = 0; d < 3; d++) o[d] = (int64_t)json_num(json_at(json_get(b, "origin_l0_zyx"), (size_t)d), -1);
+        const int oc[3] = {0, 0, 0};
+        if (o[0] < 0 || srpair_read(p, (int)json_num(json_get(b, "slot"), (double)k), oc, T, tg, co)) continue;
+        const int64_t n[3] = {T, T, T}; if (rvol_read(v, 0, o, n, a)) continue;
+        cmet_add(&real, a, tg, T);
+        for (int z = 0; z < T; z++) for (int y = 0; y < T; y++) for (int x = 0; x < T; x++) {   /* 3^3 box mean of a (valid voxels) */
+            double s = 0; int c = 0;
+            for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+                const int zz = z + dz, yy = y + dy, xx = x + dx; if (zz < 0 || yy < 0 || xx < 0 || zz >= T || yy >= T || xx >= T) continue;
+                const uint8_t q = a[((size_t)zz * T + yy) * T + xx]; if (q) { s += q; c++; } }
+            dn[((size_t)z * T + y) * T + x] = a[((size_t)z * T + y) * T + x] && c ? (uint8_t)lrint(s / c) : 0;
+        }
+        cmet_add(&den, a, dn, T);
+    }
+    cmet_print("level 0 vs target", &real);
+    cmet_print("level 0 vs its 3^3 box mean", &den);
+    json_free(j); free(tg); free(co); free(a); free(dn); srpair_free(p);
+    return 0;
+}
