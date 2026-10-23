@@ -2335,7 +2335,8 @@ int cmd_dino_embed(int argc, char **argv) {
     const double t0 = dn_now();
     float *axz = nullptr;
     if (cfg.cin == 5 && opt(argc, argv, "--axis", nullptr)) { axz = load_axis(opt(argc, argv, "--axis", ""), atof(opt(argc, argv, "--axis-scale", "1")), z3_meta_of(ct)->shape[0]); if (!axz) return 2; }   /* (optional: else valid 0) */
-    if (cfg.cin == 2) { axz = load_axis(opt(argc, argv, "--axis", ""), atof(opt(argc, argv, "--axis-scale", "1")), z3_meta_of(ct)->shape[0]); if (!axz) { fprintf(stderr, "dino-embed: this net takes the axis-distance channel: --axis FILE [--axis-scale S]\n"); return 2; } }
+    if (cfg.cin == 2 && opt(argc, argv, "--axis", nullptr)) { axz = load_axis(opt(argc, argv, "--axis", ""), atof(opt(argc, argv, "--axis-scale", "1")), z3_meta_of(ct)->shape[0]); if (!axz) return 2; }
+    if (cfg.cin == 2 && !axz) fprintf(stderr, "dino-embed: 2-input net without --axis: the second channel is the --mask-input channel (all zero: nothing masked)\n");
     int8_t *e = dn_embed_box(u, ct, box, P, atoi(opt(argc, argv, "--halo", "32")), c, s, 8, atoi(opt(argc, argv, "--ema", "1")), axz, (float)atof(opt(argc, argv, "--axis-rs", "0.001")));
     if (!e) return 1;
     const double t1 = dn_now();
