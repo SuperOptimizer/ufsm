@@ -2,6 +2,7 @@
    view-pair data tool (ufsm halves). See DESIGN.md "Own dense embedding net (dino-train)". */
 #include "dino.h"
 #include "dinor.h"
+#include "sslstat.h"
 #include "band.h"
 #include "attn.h"
 #include "dinovol.h"
@@ -820,7 +821,7 @@ typedef struct {
     float vv, vc, *vx, *vg, *vgd; double *vcov;
     float simg, sima, *zT, *zbank, *dzh, *zcur; double *zA;
     float zv, zcv, *zvb, *zvh, *zvd; double *zcov;   /* --ssl-zvic-var / --ssl-zvic-cov: VICReg on the head's unit bottleneck zn over the batch (hinge std >= 1 / sqrt(B)) */   /* --ssl-simdino G: SimDINO (1/2 |z_s - z_t|^2 on the unit bottleneck - G R_eps(student global z)), --ssl-sim-eps2 */   /* --ssl-vic-var / --ssl-vic-cov: VICReg variance hinge (std >= 1) + off-diagonal covariance on the head-input CLS over the batch */ double st[12];   /* cstd: --ssl-cls-std (per-dimension batch standardisation of the CLS) */   /* --ssl-easy-steps S: shared symmetry / no inversion / mild intensity until S; --ssl-cls-center: the batch mean CLS removed; st: per-step stats */   /* dg: the teacher-side diagnostics of the last 50th step (dn_ssl_diag) */   /* --ssl-center / --ssl-ibot-center M: DINOv1 centring (EMA of the batch's teacher logits) instead of Sinkhorn */
-    int exact, *hasaxv, *amd, *amh; double *vmu, *vsd, *zmu, *zsd;   /* --ssl-exact-bank: the batch statistics from a no-grad student pass (GradCache); per-step chunk stats */
+    int exact, *hasaxv, *amd, *amh; double *vmu, *vsd, *zmu, *zsd; float *kg, *kgd;   /* kg: the exact bank's full-batch KoLeo gradient per row (chunk-major) */   /* --ssl-exact-bank: the batch statistics from a no-grad student pass (GradCache); per-step chunk stats */
     float wib; int KI, IM, ich, TPS, GT_, cnt[2048], off[2048]; dn_head I; float *ieT, *inT, *ieS, *inS, *idE, *il, *iq, *isl, *idsl, *iw, *glzib; void *isk, *ice; int *d_hS, *d_hT, *iid, *hS, *hT; uint8_t *cellm, *d_mask; uint8_t *usei;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -833,7 +834,7 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
     Q->adrop = (float)atof(opt(argc, argv, "--axis-drop", "0.15")); Q->ure = atoi(opt(argc, argv, "--usage-window", "5000"));
     const int L = 1 << (cfg->nlev - 1);
     if (Q->N < 2 || Q->N > 1024 || Q->PG % L || Q->PL % L || Q->NL > 8) { fprintf(stderr, "dino-train --ssl-batch: 2..1024 samples, views multiples of %d, <= 8 locals\n", L); return 2; }
-    Q->exact = atoi(opt(argc, argv, "--ssl-exact-bank", "0")); Q->hasaxv = malloc((size_t)Q->N * 4); Q->amd = nn_malloc((size_t)2 * Q->N * 4); Q->amh = malloc((size_t)2 * Q->N * 4);
+    Q->exact = atoi(opt(argc, argv, "--ssl-exact-bank", "0")); Q->kg = Q->exact ? malloc((size_t)2 * Q->N * Q->CC * 4) : nullptr; Q->kgd = nn_malloc((size_t)Q->CC * 4); Q->hasaxv = malloc((size_t)Q->N * 4); Q->amd = nn_malloc((size_t)2 * Q->N * 4); Q->amh = malloc((size_t)2 * Q->N * 4);
     float zlo = 0.84f, zhi = 1.15f, lzlo = 0.86f, lzhi = 1.16f;
     sscanf(opt(argc, argv, "--ssl-zoom", "0.84,1.15"), "%f,%f", &zlo, &zhi); sscanf(opt(argc, argv, "--ssl-local-zoom", "0.86,1.16"), "%f,%f", &lzlo, &lzhi);
     if ((int)ceilf(Q->PG * zhi) > Q->Ps || (int)ceilf(Q->PL * lzhi) > Q->Ps) { fprintf(stderr, "dino-train --ssl-batch: views must fit the source window\n"); return 2; }
@@ -1052,20 +1053,20 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             if (Q->zvb) { if (dr_head_fwd(&Q->H.H, Q->H.p, row, 1, Q->sl, &Q->H.w)) return 1; nn_d2h(Q->zvb + ((size_t)v * N + k) * Q->H.H.B, Q->H.w.zn, (size_t)Q->H.H.B * 4); }
         }
     }
-    {   /* per-chunk statistics of the bank: mean, std, covariance (head input; unit bottleneck) -- the other samples' constants */
-        struct { int on, D; const float *X; float *Xh; double *mu, *sd, *cov; } t[2] = {{Q->vv > 0 || Q->vc > 0, C, nullptr, Q->vx, Q->vmu, Q->vsd, Q->vcov}, {Q->zvb != nullptr, Q->zvb ? Q->H.H.B : 0, Q->zvb, nullptr, Q->zmu, Q->zsd, Q->zcov}};
-        if (t[0].on) nn_d2h(Q->vx, Q->bank, (size_t)2 * N * C * 4);
-        for (int q = 0; q < 2; q++) if (t[q].on) {
-            const int D = t[q].D; const float *X = q ? t[q].X : t[q].Xh; const double eps = q ? 1e-8 : 1e-4;
-            for (int v = 0; v < 2; v++) {
-                double *mu = t[q].mu + (size_t)v * D, *sd = t[q].sd + (size_t)v * D, *cv = t[q].cov + (size_t)v * D * D; const float *Xv = X + (size_t)v * N * D;
-                for (int c = 0; c < D; c++) { double m = 0; for (int k = 0; k < N; k++) m += Xv[(size_t)k * D + c]; mu[c] = m / N; }
-                for (int c = 0; c < D; c++) { double a = 0; for (int k = 0; k < N; k++) { const double d = Xv[(size_t)k * D + c] - mu[c]; a += d * d; } sd[c] = sqrt(a / (N - 1) + eps); }
-                if (q ? Q->zcv > 0 : Q->vc > 0) for (int a = 0; a < D; a++) for (int b = a; b < D; b++) { double r = 0; for (int k = 0; k < N; k++) r += (Xv[(size_t)k * D + a] - mu[a]) * (Xv[(size_t)k * D + b] - mu[b]); r /= N - 1; cv[(size_t)a * D + b] = cv[(size_t)b * D + a] = r; }
+    {   /* per-chunk statistics of the bank (head input; unit bottleneck): mean, std, covariance -- the full batch's, each row's gradient
+           exact against them (src/sslstat.h; tests/test_sslstat.c); with the exact bank also every row's full-batch KoLeo gradient */
+        const int needx = Q->vv > 0 || Q->vc > 0 || (Q->exact && Q->wk > 0);
+        if (needx) nn_d2h(Q->vx ? Q->vx : (Q->vx = malloc((size_t)2 * N * C * 4)), Q->bank, (size_t)2 * N * C * 4);
+        for (int v = 0; v < 2; v++) {
+            if (Q->vv > 0 || Q->vc > 0) {
+                ss_stats(Q->vx + (size_t)v * N * C, N, C, 1e-4, Q->vmu + (size_t)v * C, Q->vsd + (size_t)v * C, Q->vc > 0 ? Q->vcov + (size_t)v * C * C : nullptr);
+                Q->st[5] += ss_vic_loss(Q->vsd + (size_t)v * C, Q->vc > 0 ? Q->vcov + (size_t)v * C * C : nullptr, C, 1.0, Q->vv, Q->vc) / 2;
+                double ms = 0; for (int c = 0; c < C; c++) ms += Q->vsd[(size_t)v * C + c] / C; Q->st[7] += ms / 2;
             }
-            double lv = 0, msd = 0; const double gam = q ? 1.0 / sqrt((double)D) : 1.0;
-            for (int v = 0; v < 2; v++) for (int c = 0; c < D; c++) { const double s_ = t[q].sd[(size_t)v * D + c]; lv += s_ < gam ? (gam - s_) / (gam * D) / 2 : 0; msd += s_ / D / 2; }
-            if (q) Q->st[11] += lv; else { Q->st[5] += lv; Q->st[7] += msd; }
+            if (Q->zvb) { const int Bz = Q->H.H.B;
+                ss_stats(Q->zvb + (size_t)v * N * Bz, N, Bz, 1e-8, Q->zmu + (size_t)v * Bz, Q->zsd + (size_t)v * Bz, Q->zcv > 0 ? Q->zcov + (size_t)v * Bz * Bz : nullptr);
+                Q->st[11] += ss_vic_loss(Q->zsd + (size_t)v * Bz, nullptr, Bz, 1.0 / sqrt((double)Bz), Q->zv, 0) / 2; }
+            if (Q->exact && Q->wk > 0) Q->st[9] += ss_koleo_all(Q->vx + (size_t)v * N * C, N, C, Q->wk, 1e-8, Q->kg + (size_t)v * N * C) / 2;
         }
     }
     /* student: every view forward -> loss over the batch's targets -> backward */
@@ -1099,13 +1100,10 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
         nn_h2d(Q->pS, ps_, 8); nn_h2d(Q->pT, pt_, 8); nn_h2d(Q->pW, pw_, 8);
         nn_zero(Q->dcls, (size_t)C * 4);
         Q->H.w.dzn_add = nullptr;
-        if (gl && Q->zvb) {   /* VICReg on the unit bottleneck: this row's gradient against the chunk's statistics (the other samples constant) */
-            const int Bz = Q->H.H.B; const double gam = 1.0 / sqrt((double)Bz); const double *mu = Q->zmu + (size_t)v * Bz, *sd = Q->zsd + (size_t)v * Bz, *cv = Q->zcov + (size_t)v * Bz * Bz;
-            nn_d2h(Q->zvh, Q->H.w.zn, (size_t)Bz * 4); float *g = Q->dzh ? Q->dzh : malloc((size_t)Bz * 4); float *gz = malloc((size_t)Bz * 4);
-            for (int c = 0; c < Bz; c++) gz[c] = (float)(Q->zv > 0 && sd[c] < gam ? -Q->zv / (gam * Bz) * (Q->zvh[c] - mu[c]) / ((N - 1) * sd[c]) : 0);
-            if (Q->zcv > 0) for (int a2 = 0; a2 < Bz; a2++) { double gg = 0; for (int b2 = 0; b2 < Bz; b2++) if (b2 != a2) gg += cv[(size_t)a2 * Bz + b2] * (Q->zvh[b2] - mu[b2]); gz[a2] += (float)(Q->zcv * 4.0 / (gam * gam * Bz * (N - 1)) * gg); }
-            for (int c = 0; c < Bz; c++) gz[c] /= (float)N;
-            nn_h2d(Q->zvd, gz, (size_t)Bz * 4); Q->H.w.dzn_add = Q->zvd; free(gz); if (!Q->dzh) free(g);
+        if (gl && Q->zvb) {   /* VICReg on the unit bottleneck: this row's gradient of the full chunk's loss (std target 1 / sqrt(B)) */
+            const int Bz = Q->H.H.B; float *gz = malloc((size_t)Bz * 4); nn_d2h(Q->zvh, Q->H.w.zn, (size_t)Bz * 4);
+            ss_vic_row_grad(Q->zvh, N, Bz, Q->zmu + (size_t)v * Bz, Q->zsd + (size_t)v * Bz, Q->zcv > 0 ? Q->zcov + (size_t)v * Bz * Bz : nullptr, 1.0 / sqrt((double)Bz), Q->zv, Q->zcv, gz);
+            nn_h2d(Q->zvd, gz, (size_t)Bz * 4); Q->H.w.dzn_add = Q->zvd; free(gz);
             if (!Q->exact) memcpy(Q->zvb + ((size_t)v * N + i) * Bz, Q->zvh, (size_t)Bz * 4);
         }
         if (Q->simg > 0) {   /* SimDINO: d / d zn = sum over pairs w (zs - zt); global rows: - G d R / d zs over the chunk (the other samples' current z) */
@@ -1139,20 +1137,19 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
         dr_ce(Q->sl, 1, K, Q->ts, Q->tq, Q->pS, Q->pT, Q->pW, npair, Q->dsl, Q->outs, Q->ces); nn_axpy(Q->outs + 4, 1.f, Q->outs, 1);   /* (dr_ce writes its loss: summed here) */
         if (dr_head_bwd(&Q->H.H, Q->H.p, Q->H.g, Q->clsS, Q->dsl, 1, Q->dcls, step > Q->freeze, &Q->H.w)) return 1;
         }
-        if (gl && Q->wk > 0) {   /* KoLeo against the other samples of this view chunk */
+        if (gl && Q->wk > 0 && Q->exact) { nn_h2d(Q->kgd, Q->kg + ((size_t)v * N + i) * C, (size_t)C * 4); nn_axpy(Q->dcls, 1.f, Q->kgd, (size_t)C); }   /* (the full batch's KoLeo gradient of this row) */
+        else if (gl && Q->wk > 0) {   /* KoLeo against the other samples of this view chunk (the bank: teacher rows / the student's as computed) */
             const float *bv = Q->bank + (size_t)v * N * C;   /* (chunk v without this sample: two contiguous copies) */
             if (i > 0) nn_d2d(Q->bex, bv, (size_t)i * C * 4);
             if (i < N - 1) nn_d2d(Q->bex + (size_t)i * C, bv + (size_t)(i + 1) * C, (size_t)(N - 1 - i) * C * 4);
             dr_koleo_q(Q->clsS, 1, Q->bex, N - 1, C, Q->wk / (float)N, Q->dcls, Q->outs + 1);
             if (!Q->exact) nn_d2d(Q->bank + ((size_t)v * N + i) * C, Q->clsS, (size_t)C * 4);
         }
-        if (gl && (Q->vv > 0 || Q->vc > 0)) {   /* VICReg on the head input: this row's gradient against the chunk's statistics (the other samples constant) */
-            const double *mu = Q->vmu + (size_t)v * C, *sd = Q->vsd + (size_t)v * C, *cv = Q->vcov + (size_t)v * C * C; float *xi = Q->vg; static float *xh; static int xhn;
-            if (xhn < C) { free(xh); xh = malloc((size_t)C * 4); xhn = C; }
+        if (gl && (Q->vv > 0 || Q->vc > 0)) {   /* VICReg on the head input: this row's gradient of the full chunk's loss (src/sslstat.h) */
+            static float *xh; static int xhn; if (xhn < C) { free(xh); xh = malloc((size_t)C * 4); xhn = C; }
             nn_d2h(xh, Q->clsS, (size_t)C * 4);
-            for (int c = 0; c < C; c++) xi[c] = (float)(Q->vv > 0 && sd[c] < 1 ? -Q->vv / C * (xh[c] - mu[c]) / ((N - 1) * sd[c]) : 0);
-            if (Q->vc > 0) for (int a2 = 0; a2 < C; a2++) { double g = 0; for (int b2 = 0; b2 < C; b2++) if (b2 != a2) g += cv[(size_t)a2 * C + b2] * (xh[b2] - mu[b2]); xi[a2] += (float)(Q->vc * 4.0 / (C * (N - 1)) * g); }
-            nn_h2d(Q->vgd, xi, (size_t)C * 4); nn_axpy(Q->dcls, 1.f / (float)N, Q->vgd, (size_t)C);   /* (each row's share of the chunk's loss) */
+            ss_vic_row_grad(xh, N, C, Q->vmu + (size_t)v * C, Q->vsd + (size_t)v * C, Q->vc > 0 ? Q->vcov + (size_t)v * C * C : nullptr, 1.0, Q->vv, Q->vc, Q->vg);
+            nn_h2d(Q->vgd, Q->vg, (size_t)C * 4); nn_axpy(Q->dcls, 1.f, Q->vgd, (size_t)C);
         }
         if (Q->cstd) { dr_cols_scale(Q->dcls, C, Q->cistd); nn_d2d(Q->clsS, cpre, (size_t)C * 4); }   /* (through the batch transform; the normed row back) */
         else if (Q->ccen) nn_axpy(Q->clsS, 1.f, Q->cmean, (size_t)C);   /* (back to the normed row for its backward) */
