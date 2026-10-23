@@ -815,7 +815,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     dn_uw UW = {0};
     UW.nstep = atoi(opt(argc, argv, "--normal-step", "1")); UW.dscale = (float)atof(opt(argc, argv, "--density-scale", "4")); UW.dcode = atoi(opt(argc, argv, "--density-code", "1"));
     UW.pw = (float)atof(opt(argc, argv, "--packed-weight", "8")); UW.pum = (float)atof(opt(argc, argv, "--packed-um", "120"));
-    UW.ttau = (float)atof(opt(argc, argv, "--phase-trunc", "0")); UW.tkap = (float)atof(opt(argc, argv, "--phase-trunc-conf", "0.5")); const int trunc_from = atoi(opt(argc, argv, "--phase-trunc-from", "0"));
+    UW.ttau = (float)atof(opt(argc, argv, "--phase-trunc", "0")); UW.tkap = (float)atof(opt(argc, argv, "--phase-trunc-conf", "0.5")); const int trunc_from0 = atoi(opt(argc, argv, "--phase-trunc-from", "-1"));   /* (-1: 5000 steps after --dense-from, as train.c) */
     uint8_t *d_pv = nullptr, *d_w4 = nullptr, *d_wc = nullptr, *d_ikt = nullptr, *d_ikm = nullptr;
     if (wuw > 0 || wik > 0) {
         const size_t sp = (size_t)HZ * P * P, gg = (size_t)P * P * P;
@@ -925,6 +925,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     uint64_t ar = seed * 1000003 + 99; int qfill = 0, qpos = 0, kfill = 0, kpos = 0;
     double sums[12] = {0}; int nsum = 0; double t_last = dn_now(), t_loop = dn_now(), t_meas0 = 0;
     double dsum[5] = {0}; int dn_nuw = 0, dn_nik = 0; const int dense_from = atoi(opt(argc, argv, "--dense-from", "-1")) >= 0 ? atoi(opt(argc, argv, "--dense-from", "-1")) : step0;
+    const int trunc_from = trunc_from0 >= 0 ? trunc_from0 : dense_from + 5000;
     char stopf[1200]; snprintf(stopf, sizeof stopf, "%s/STOP", outd);
     const float gs = nn_get_grad_scale();
     const int terms = 2 + 2 * nloc;
