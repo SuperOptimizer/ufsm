@@ -106,6 +106,9 @@ void dr_infonce(const float *Q, int N, const float *K, int M, const int *pos, in
    other keys never act as negatives (a sheet-identity embedding makes a view's points near duplicates): loss_i = lse(q.p_i, q.n_m) / tau -
    q.p_i / tau; top-1 = the positive above every negative. scratch: dr_nce_scratch(N, M + 1) bytes */
 void dr_infonce_p(const float *Q, const float *P, int N, const float *Kn, int M, int D, float tau, float w, float *gQ, float *out, void *scratch);
+/* d / d raw features of unit rows e = r / |r| (gathered at voxel idx[i] from an [D][n] channel-major map) added into the fp32 map gl [D][n]
+   (gl + c * n + idx[i]): (ge - e (e . ge)) w / nrm[i] (distinct idx) */
+void dr_scatter_unit_f32(const float *e, const float *ge, const float *nrm, const int *idx, int N, int D, size_t n, float w, float *gl);
 /* rows by index: dst[i] = src[idx[i]] ([n][C]); scatter: dst[idx[i]] += scale src[i] (indices distinct) */
 void dr_rows_gather(const float *src, int C, const int *idx, int n, float *dst);
 void dr_rows_scatter_add(const float *src, const int *idx, int n, int C, float scale, float *dst);

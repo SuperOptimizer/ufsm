@@ -728,3 +728,14 @@ extern "C" void dr_axis_view(const dr_xf *xf, int v, int n, int Ps, const float 
     if (!valid) { cudaMemsetAsync(x4, 0, (size_t)4 * n3 * 4, 0); return; }
     k_axis_view<<<nbk(n3, 256), 256>>>(xf, v, n, Ps, ayx, x4);
 }
+
+__global__ void k_scatter_unit_f32(const float *e, const float *ge, const float *nrm, const int *idx, int N, int D, size_t n, float w, float *gl) {
+    const int i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31; if (i >= N) return;
+    float d = 0.f; for (int c = lane; c < D; c += 32) d += e[(size_t)i * D + c] * ge[(size_t)i * D + c];
+    for (int o = 16; o; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+    const float inv = w / nrm[i]; const size_t v = (size_t)idx[i];
+    for (int c = lane; c < D; c += 32) gl[(size_t)c * n + v] += (ge[(size_t)i * D + c] - e[(size_t)i * D + c] * d) * inv;
+}
+extern "C" void dr_scatter_unit_f32(const float *e, const float *ge, const float *nrm, const int *idx, int N, int D, size_t n, float w, float *gl) {
+    if (N > 0) k_scatter_unit_f32<<<nbk((long long)N * 32, 256), 256>>>(e, ge, nrm, idx, N, D, n, w, gl);
+}
