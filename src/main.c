@@ -63,6 +63,7 @@ int cmd_dinovol_embed(int argc, char **argv);   /* src/dinovol.c */
 int cmd_dinovol_eval(int argc, char **argv);
 int cmd_dinovol_read(int argc, char **argv);
 int cmd_dinovol_calib(int argc, char **argv);
+int cmd_dino_headfit(int argc, char **argv);
 int cmd_dino_train(int argc, char **argv);   /* src/dino.c */
 int cmd_dino_embed(int argc, char **argv);
 int cmd_dino_halves(int argc, char **argv);
@@ -3309,6 +3310,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "dinovol-eval")) return cmd_dinovol_eval(argc, argv);
     if (!strcmp(cmd, "dinovol-read")) return cmd_dinovol_read(argc, argv);
     if (!strcmp(cmd, "dinovol-calib")) return cmd_dinovol_calib(argc, argv);
+    if (!strcmp(cmd, "dino-headfit")) return cmd_dino_headfit(argc, argv);
     if (!strcmp(cmd, "dino-train")) return cmd_dino_train(argc, argv);
     if (!strcmp(cmd, "dino-embed")) return cmd_dino_embed(argc, argv);
     if (!strcmp(cmd, "halves")) return cmd_dino_halves(argc, argv);

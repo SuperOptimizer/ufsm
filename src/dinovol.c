@@ -1189,9 +1189,78 @@ int cmd_dinovol_calib(int argc, char **argv) {
         if (cal_head_run(&hd, cls, 2 * N, L, zn)) return 1;
         cal_report("DINO head on the CLS", L, zn, 2 * N, hd.h.K, hd.h.B, temps, nt, iters, 2);
         free(L); free(zn); }
+    if (opt(argc, argv, "--dump-tokens", nullptr)) { FILE *f = fopen(opt(argc, argv, "--dump-tokens", ""), "wb"); if (f) { fwrite(tok, 4, (size_t)2 * N * NT * E, f); fclose(f); }
+        fprintf(stderr, "dinovol-calib: %d token rows x %d written\n", 2 * N * NT, E); }
     {   const int R = 2 * N * NT; float *L = malloc((size_t)R * hi.h.K * 4), *zn = malloc((size_t)R * hi.h.B * 4);
         if (cal_head_run(&hi, tok, R, L, zn)) return 1;
         cal_report("iBOT head on patch tokens", L, zn, R, hi.h.K, hi.h.B, temps, nt, iters, 2 * NT);
         free(L); free(zn); }
+    return 0;
+}
+
+
+/* ---- ufsm dino-headfit (debug): can our iBOT student head fit a FIXED batch of dinovol iBOT targets? Teacher targets: softmax(dinovol
+   ibot_head(tokens) / tt) of dinovol-calib --dump-tokens rows; student: the SSL batch's iBOT head (32 inputs -> 2048 -> 2048 -> 256, last
+   layer = dinovol's prototypes, frozen), AdamW on the MLP; inputs: --input random (fixed random unit vectors: memorisation) or proj (a fixed
+   random projection of the teacher's own token to 32 dims, unit-normed: the information is there). Prints CE (vs the targets' entropy and
+   ln K), student H / pmax, z cos-other every --every steps. ---- */
+int cmd_dino_headfit(int argc, char **argv) {
+    const char *ck = opt(argc, argv, "--ckpt", nullptr), *tf = opt(argc, argv, "--tokens", nullptr);
+    if (!ck || !tf) { fprintf(stderr, "usage: ufsm dino-headfit --ckpt PT --tokens ROWS.f32 [--rows 256] [--input random|proj] [--steps 300] [--lr 1e-3] [--wd 0.04] [--tt 0.04] [--ts 0.1] [--train-last 0] [--gpu 0]\n"); return 2; }
+    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
+    dr_head T; float *Th = nullptr; if (dv_head_host(ck, "ibot_head", &T, &Th)) return 1;
+    size_t nb = 0; float *tok = read_file(tf, &nb); if (!tok) { fprintf(stderr, "cannot read %s\n", tf); return 1; }
+    const int E = T.Cin, Rall = (int)(nb / 4 / E), R = atoi(opt(argc, argv, "--rows", "256")) < Rall ? atoi(opt(argc, argv, "--rows", "256")) : Rall, K = T.K, B = T.B;
+    const int steps = atoi(opt(argc, argv, "--steps", "300")), every = atoi(opt(argc, argv, "--every", "20")), proj = !strcmp(opt(argc, argv, "--input", "proj"), "proj"), trl = atoi(opt(argc, argv, "--train-last", "0"));
+    const float lr = (float)atof(opt(argc, argv, "--lr", "1e-3")), wd = (float)atof(opt(argc, argv, "--wd", "0.04")), tt = (float)atof(opt(argc, argv, "--tt", "0.04")), ts = (float)atof(opt(argc, argv, "--ts", "0.1"));
+    /* teacher targets */
+    float *TP = nn_malloc(T.n * 4); nn_h2d(TP, Th, T.n * 4);
+    float *xt = nn_malloc((size_t)R * E * 4); nn_h2d(xt, tok, (size_t)R * E * 4);
+    void *tw = nn_malloc(dr_hws_bytes(&T, R)); dr_hws twp; dr_hws_carve(&twp, &T, R, tw);
+    float *tl = nn_malloc((size_t)R * K * 4), *q = nn_malloc((size_t)R * K * 4); void *sk = nn_malloc(dr_sk_scratch(R, K));
+    dr_head_fwd(&T, TP, xt, R, tl, &twp); dr_teacher_probs(tl, R, K, tt, 0, nullptr, q, sk);
+    double Hq = 0; { float *qh = malloc((size_t)R * K * 4); nn_d2h(qh, q, (size_t)R * K * 4);
+        for (int r = 0; r < R; r++) for (int k = 0; k < K; k++) { const double v = qh[(size_t)r * K + k]; if (v > 0) Hq -= v * log(v) / R; }
+        double *bar = calloc(K, 8); for (int r = 0; r < R; r++) for (int k = 0; k < K; k++) bar[k] += qh[(size_t)r * K + k] / R;
+        double Hb = 0; for (int k = 0; k < K; k++) if (bar[k] > 0) Hb -= bar[k] * log(bar[k]);
+        fprintf(stderr, "dino-headfit: %d rows, K %d (ln K %.3f), targets t %.3f: mean H %.3f, H(batch mean) %.3f (the CE floor for a constant student)\n", R, K, log((double)K), tt, Hq, Hb);
+        free(qh); free(bar); }
+    /* student inputs [R][32] */
+    float *xs = malloc((size_t)R * 32 * 4); uint64_t rs = 12345;
+    float *Pm = malloc((size_t)32 * E * 4); for (int i = 0; i < 32 * E; i++) Pm[i] = (float)(sqrt(-2 * log(ev_unif(&rs) + 1e-12)) * cos(6.283185307 * ev_unif(&rs)));
+    for (int r = 0; r < R; r++) { double n2 = 0;
+        for (int c = 0; c < 32; c++) { double v = 0; if (proj) for (int e = 0; e < E; e++) v += Pm[(size_t)c * E + e] * tok[(size_t)r * E + e]; else v = sqrt(-2 * log(ev_unif(&rs) + 1e-12)) * cos(6.283185307 * ev_unif(&rs)); xs[(size_t)r * 32 + c] = (float)v; n2 += v * v; }
+        for (int c = 0; c < 32; c++) xs[(size_t)r * 32 + c] /= (float)sqrt(n2 + 1e-30); }
+    float *xsd = nn_malloc((size_t)R * 32 * 4); nn_h2d(xsd, xs, (size_t)R * 32 * 4);
+    /* student head: dn_head_init's init (trunc-normal 0.02 weights, zero biases), last layer = dinovol's */
+    dr_head S; dr_head_layout(&S, 32, T.H, B, K);
+    float *Sh = calloc(S.n, 4); uint64_t r2 = 777;
+    for (size_t i = S.w1; i < S.b1; i++) Sh[i] = (float)(0.02 * sqrt(-2 * log(ev_unif(&r2) + 1e-12)) * cos(6.283185307 * ev_unif(&r2)));
+    for (size_t i = S.w2; i < S.b2; i++) Sh[i] = (float)(0.02 * sqrt(-2 * log(ev_unif(&r2) + 1e-12)) * cos(6.283185307 * ev_unif(&r2)));
+    for (size_t i = S.w3; i < S.b3; i++) Sh[i] = (float)(0.02 * sqrt(-2 * log(ev_unif(&r2) + 1e-12)) * cos(6.283185307 * ev_unif(&r2)));
+    memcpy(Sh + S.v, Th + T.v, (size_t)K * B * 4); memcpy(Sh + S.g, Th + T.g, (size_t)K * 4);
+    float *SP = nn_malloc(S.n * 4), *SG = nn_malloc(S.n * 4), *SM = nn_malloc(S.n * 4), *SV = nn_malloc(S.n * 4); nn_h2d(SP, Sh, S.n * 4); nn_zero(SM, S.n * 4); nn_zero(SV, S.n * 4);
+    void *sw = nn_malloc(dr_hws_bytes(&S, R)); dr_hws swp; dr_hws_carve(&swp, &S, R, sw);
+    float *sl = nn_malloc((size_t)R * K * 4), *dsl = nn_malloc((size_t)R * K * 4), *dx = nn_malloc((size_t)R * 32 * 4), *out = nn_malloc(16);
+    void *cs = nn_malloc(dr_ce_scratch(R)); int *iid = nn_malloc((size_t)R * 4); float *pw = nn_malloc((size_t)R * 4);
+    { int *h = malloc((size_t)R * 4); float *w = malloc((size_t)R * 4); for (int i = 0; i < R; i++) { h[i] = i; w[i] = 1.f / R; } nn_h2d(iid, h, (size_t)R * 4); nn_h2d(pw, w, (size_t)R * 4); free(h); free(w); }
+    float *slh = malloc((size_t)R * K * 4), *znh = malloc((size_t)R * B * 4);
+    for (int step = 1; step <= steps; step++) {
+        nn_zero(SG, S.n * 4);
+        dr_head_fwd(&S, SP, xsd, R, sl, &swp);
+        dr_ce(sl, R, K, ts, q, iid, iid, pw, R, dsl, out, cs);
+        dr_head_bwd(&S, SP, SG, xsd, dsl, R, dx, trl, &swp);
+        dr_adamw(SP, SG, SM, SV, trl ? S.g : S.v, lr, 0.9f, 0.999f, 1e-8f, wd, step);
+        if (step == 1 || step % every == 0 || step == steps) {
+            float L; nn_d2h(&L, out, 4); nn_d2h(slh, sl, (size_t)R * K * 4); nn_d2h(znh, swp.zn, (size_t)R * B * 4);
+            double Hs = 0, pm = 0, co = 0, gn = 0; long no = 0;
+            for (int r = 0; r < R; r++) { const float *l = slh + (size_t)r * K; double mx = -1e30, z = 0, h = 0; for (int k = 0; k < K; k++) mx = fmax(mx, l[k] / ts);
+                for (int k = 0; k < K; k++) z += exp(l[k] / ts - mx);
+                for (int k = 0; k < K; k++) { const double t = exp(l[k] / ts - mx) / z; if (t > 0) h -= t * log(t); } Hs += h / R; pm += 1 / z / R; }
+            for (int a = 0; a < R; a += 3) for (int b = a + 1; b < R; b += 5) { double d = 0; for (int c = 0; c < B; c++) d += znh[(size_t)a * B + c] * znh[(size_t)b * B + c]; co += d; no++; }
+            { float *gh = malloc(S.v * 4); nn_d2h(gh, SG, S.v * 4); for (size_t i = 0; i < S.v; i++) gn += (double)gh[i] * gh[i]; free(gh); }
+            fprintf(stderr, "step %4d CE %.4f (targets H %.3f, H(mean) floor, ln K %.3f) student H %.3f pmax %.5f z cos other %.4f |grad| %.3e\n", step, L, Hq, log((double)K), Hs, pm, no ? co / no : 0, sqrt(gn));
+        }
+    }
     return 0;
 }
