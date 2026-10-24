@@ -87,6 +87,8 @@ void dr_rownorm_bwd(const float *dy, const float *y, const float *rstd, int R, i
 void dr_argmax_rows(const float *q, int R, int K, int *out);
 /* rows of v [R][N] scaled to unit length in place */
 void dr_unit_rows(float *v, int R, int N);
+/* V [K][B] minus its mean row, in place */
+void dr_center_rows(float *V, int K, int B);
 /* object / region terms (upstream ObjectLoss, L_out SupCon with margin-capped positives): anchors S [N][D] (student, unit) vs keys T [N][D]
    (teacher, the same points in the other view, unit); obj [N] (> 0 labelled), vs / vt [N] validity (u8 device). Positives: the same object
    (the self point excluded when another exists), negatives: other labelled objects; per anchor (1 / |P|) sum_P softplus(lse_N(s / t) -

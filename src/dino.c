@@ -861,7 +861,7 @@ typedef struct {
     /* diag-dv (--ssl-dv-teacher PT): the iBOT targets from the frozen upstream dinovol teacher (its ibot_head over its patch tokens of the
        un-augmented teacher global, at the cell of each mapped point) until --ssl-dv-until (0: always), then from our EMA teacher; the student
        iBOT head predicts dinovol's 131072 prototypes (its last layer initialised from dinovol's and kept frozen) */
-    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; long srccnt[DN_MAXSRC]; int fixdone, Rfix, hwarm, icos, subps; double zvh_l; long zvh_n; float subp0, subp1, izv; uint8_t *subm, *d_subm; float *zvg; double cosacc; long cosn;
+    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; long srccnt[DN_MAXSRC]; int pcen; float lsc, lsm, lsv; int ilsc; double lsg; int fixdone, Rfix, hwarm, icos, subps; double zvh_l; long zvh_n; float subp0, subp1, izv; uint8_t *subm, *d_subm; float *zvg; double cosacc; long cosn;
     int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -963,6 +963,8 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         sscanf(opt(argc, argv, "--ssl-ibot-sub-ratio", "0.3,0.5"), "%f,%f", &Q->subp0, &Q->subp1);
         if (Q->subps > 0) { if (Q->TPS % Q->subps || Q->PG % Q->subps) { fprintf(stderr, "dino-train --ssl-ibot-sub: a divisor of the cell edge %d\n", Q->TPS); return 2; }
             const size_t G2 = (size_t)Q->PG / Q->subps; Q->subm = malloc(G2 * G2 * G2); Q->d_subm = nn_malloc(G2 * G2 * G2); }
+        Q->pcen = atoi(opt(argc, argv, "--ssl-ibot-proto-center", "0"));   /* subtract the mean prototype after every prototype update (the shared-direction drift) */
+        Q->ilsc = atoi(opt(argc, argv, "--ssl-ibot-logit-scale", "0")); Q->lsc = 0.f;   /* a learnable student logit scale exp(lsc) (Adam, lr 1e-2) */
         Q->izv = (float)atof(opt(argc, argv, "--ssl-ibot-zvar", "0"));   /* variance hinge on the student's unit token bottleneck: per-dim std over a view's rows >= 1 / sqrt(B) */
         Q->zvg = nn_malloc((size_t)IM * (HB > 1024 ? HB : 1024) * 4); Q->usei = calloc((size_t)KI, 1);
         if (Q->dv) {   /* the student head's last layer = dinovol's prototypes (frozen); the teacher-side buffers */
@@ -1268,7 +1270,14 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
                 if (dr_head_bwd(&Q->I.H, Q->I.p, Q->I.g, Q->ieS, nullptr, m, Q->idE, 0, &Q->I.w)) return 1;
                 (void)dza;
             } else {
+            const float esc = Q->ilsc ? expf(Q->lsc) : 1.f;
+            if (Q->ilsc) nn_scale(Q->isl, esc, (size_t)m * Q->KI);
             dr_ce(Q->isl, m, Q->KI, Q->ts, Q->iq + (size_t)Q->off[j] * Q->KI, Q->iid, Q->iid, Q->iw, m, Q->idsl, Q->outs + 6, Q->ice); nn_axpy(Q->outs + 8, 1.f, Q->outs + 6, 1);
+            if (Q->ilsc) {   /* d L / d lsc = sum dl' l' (the scaled logits); the head sees d / d unscaled = esc dl' */
+                const size_t nn_ = (size_t)m * Q->KI; float *a = malloc(nn_ * 4), *b = malloc(nn_ * 4); nn_d2h(a, Q->isl, nn_ * 4); nn_d2h(b, Q->idsl, nn_ * 4);
+                double gsum = 0; for (size_t i = 0; i < nn_; i++) gsum += (double)a[i] * b[i]; Q->lsg += gsum; free(a); free(b);
+                nn_scale(Q->idsl, esc, nn_);
+            }
             if (dr_head_bwd(&Q->I.H, Q->I.p, Q->I.g, Q->ieS, Q->idsl, m, Q->idE, step > Q->freeze && !Q->dv, &Q->I.w)) return 1;
             }
             if (Q->itok) dr_rownorm_bwd(Q->idE, Q->ieS, Q->irsS, m, CT, Q->idE);
@@ -1366,6 +1375,13 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     if (Q->wib > 0) { dn_head *hi = &Q->I; const dr_head *HI = &hi->H;
         dr_adamw(hi->p, hi->g, hi->m, hi->v, HI->v, hlr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
         if (step > Q->freeze && !Q->dv) dr_adamw(hi->p + HI->v, hi->g + HI->v, hi->m + HI->v, hi->v + HI->v, HI->g - HI->v, Q->plr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
+        if (step > Q->freeze && !Q->dv && Q->pcen) dr_center_rows(hi->p + HI->v, HI->K, HI->B);
+        if (Q->ilsc) {   /* the logit scale: Adam on one scalar */
+            const double g_ = Q->lsg; Q->lsg = 0; Q->lsm = 0.9f * Q->lsm + 0.1f * (float)g_; Q->lsv = 0.999f * Q->lsv + 0.001f * (float)(g_ * g_);
+            const float mh = Q->lsm / (1.f - powf(0.9f, (float)step)), vh = Q->lsv / (1.f - powf(0.999f, (float)step)); Q->lsc -= 1e-2f * mh / (sqrtf(vh) + 1e-8f);
+            if (Q->lsc > 3.f) Q->lsc = 3.f;
+            if (Q->lsc < -3.f) Q->lsc = -3.f;
+        }
         dr_ema(hi->pt, hi->p, HI->n, mom); nn_zero(hi->g, HI->n * 4); }
     nn_d2h(Q->hout, Q->outs, 16 * 4); Q->sums[0] += Q->wdino > 0 ? Q->hout[4] / Q->wdino : 0; Q->sums[1] += Q->hout[1]; Q->sums[3] += Q->wib > 0 ? Q->hout[8] / Q->wib : 0; Q->sums[4] += R; Q->nsum++;
     return 0;
@@ -1411,6 +1427,7 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             for (int b = 0; b < Bz; b++) { double mu = 0, v = 0; for (int a = 0; a < m; a++) mu += zn[(size_t)a * Bz + b] / m; for (int a = 0; a < m; a++) v += (zn[(size_t)a * Bz + b] - mu) * (zn[(size_t)a * Bz + b] - mu) / m; sm += sqrt(v) / Bz; }
             for (int a = 0; a < m; a++) for (int c = a + 1; c < m; c++) { double d = 0; for (int b = 0; b < Bz; b++) d += zn[(size_t)a * Bz + b] * zn[(size_t)c * Bz + b]; co += d; no++; }
             size_t l5 = strlen(line);
+            if (Q->ilsc) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | ibot logit scale %.3f", expf(Q->lsc)); l5 = strlen(line); }
             if (Q->zvh_n) { const size_t l7 = strlen(line); snprintf(line + l7, cap - l7, " | ibot zvar hinge %.5f", Q->zvh_l / Q->zvh_n); Q->zvh_l = 0; Q->zvh_n = 0; l5 = strlen(line); }
             if (Q->icos) { const size_t l6 = strlen(line); snprintf(line + l6, cap - l6, " | ibot cos(student, dinovol token) %.4f", Q->cosn ? Q->cosacc / Q->cosn : 0.0); Q->cosacc = 0; Q->cosn = 0; l5 = strlen(line); }
             snprintf(line + l5, cap - l5, " | ibot student feat std/ch %.4f |mean| %.4f H %.2f pmax %.4f tok z std/dim %.4f (1/sqrt(B) %.4f) cos other %.4f%s", fsd, fm, Hs, pms, sm, 1 / sqrt((double)Bz), no ? co / no : 0.0, Q->dv ? (Q->dvuntil <= 0 || step <= Q->dvuntil ? " [dv teacher]" : " [ema teacher]") : "");
