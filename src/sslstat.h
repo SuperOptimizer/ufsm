@@ -49,6 +49,19 @@ static inline double ss_koleo_all(const float *X, int N, int D, double w, double
     }
     free(xh); free(nr); free(gh); free(nn); return L;
 }
+/* relational (similarity-matrix) distillation: E, T [m][d] (unit rows: student, teacher); L = w / (m (m - 1)) sum_{a != b} (e_a . e_b - t_a . t_b)^2,
+   invariant to any rotation of the teacher's code space (dinovol's sheet codes need only agree within a crop). G [m][d] += d L / d E
+   (when not nullptr); returns L. */
+static inline double ss_relsim(const float *E, const float *T, int m, int d, double w, float *G) {
+    if (m < 2) return 0;
+    const double c = w / ((double)m * (m - 1)); double L = 0;
+    for (int a = 0; a < m; a++) for (int b = a + 1; b < m; b++) {
+        double se = 0, st = 0; for (int k = 0; k < d; k++) { se += (double)E[(size_t)a * d + k] * E[(size_t)b * d + k]; st += (double)T[(size_t)a * d + k] * T[(size_t)b * d + k]; }
+        const double D = se - st; L += 2 * c * D * D;
+        if (G) { const double g = 4 * c * D; for (int k = 0; k < d; k++) { G[(size_t)a * d + k] += (float)(g * E[(size_t)b * d + k]); G[(size_t)b * d + k] += (float)(g * E[(size_t)a * d + k]); } }
+    }
+    return L;
+}
 /* SIGReg (LeJEPA, arXiv 2511.08544): the rows of X [N][D] (times xs) projected on S unit directions A [S][D]; per direction the
    Epps-Pulley distance between the projections' empirical characteristic function and the standard normal's, phi(t) = exp(-t^2 / 2):
    int_{-tmax}^{tmax} phi(t) ((Re ecf(t) - phi(t))^2 + Im ecf(t)^2) dt (an even integrand: 2 x the trapezoid rule on K knots of [0, tmax]),

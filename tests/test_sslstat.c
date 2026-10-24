@@ -37,6 +37,15 @@ int main(void) {
       for (int i = 0; i < NG * Dg; i++) { const double u1 = urand() + 1e-12, u2 = urand(); Xg[i] = (float)(sqrt(-2 * log(u1)) * cos(6.283185307179586 * u2)); Xc[i] = 0.05f * Xg[i] + 0.7f; }
       const double lg = ss_sigreg_all(Xg, NG, Dg, A, S, K, 3.0, 1.0, 1.0, nullptr), lc = ss_sigreg_all(Xc, NG, Dg, A, S, K, 3.0, 1.0, 1.0, nullptr);
       b = !(lg < 2.0 && lc > 50 * lg); printf("SIGReg statistic: gaussian %.3f, collapsed %.3f%s\n", lg, lc, b ? "  FAIL" : ""); bad += b; free(Xg); free(Xc); }
+    /* relational distillation: gradients vs central differences in double; zero loss at a rotated teacher */
+    { enum { M = 9, Dd = 7 }; float E[M * Dd], T[M * Dd], G[M * Dd] = {0}, Z[M * Dd] = {0}; for (int i = 0; i < M * Dd; i++) { E[i] = (float)(urand() - 0.5); T[i] = (float)(urand() - 0.5); }
+      const double w = 1.3; ss_relsim(E, T, M, Dd, w, G); double emax = 0, gmax = 0;
+      for (int i = 0; i < M * Dd; i++) { const float o = E[i]; const double e = 1e-3; E[i] = (float)(o + e); const double ep = (double)E[i] - o, lp = ss_relsim(E, T, M, Dd, w, nullptr);
+          E[i] = (float)(o - e); const double em = o - (double)E[i], lm = ss_relsim(E, T, M, Dd, w, nullptr); E[i] = o;
+          const double fd = (lp - lm) / (ep + em); emax = fmax(emax, fabs(fd - G[i])); gmax = fmax(gmax, fabs(fd)); }
+      for (int a = 0; a < M; a++) for (int k = 0; k < Dd; k++) Z[a * Dd + k] = E[a * Dd + (k + 3) % Dd] * (k % 2 ? -1.f : 1.f);   /* (a signed permutation of the code axes) */
+      const double l0 = ss_relsim(Z, E, M, Dd, 1.0, nullptr);
+      const int b = !(emax < 1e-3 * gmax && l0 < 1e-10); printf("relational distillation gradients: max |err| %.2e of max |grad| %.2e, rotated-teacher loss %.1e%s\n", emax, gmax, l0, b ? "  FAIL" : ""); bad += b; }
     printf("%s\n", bad ? "test_sslstat: FAIL" : "test_sslstat: OK");
     return bad != 0;
 }
