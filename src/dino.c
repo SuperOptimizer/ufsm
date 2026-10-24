@@ -2767,6 +2767,61 @@ int cmd_dino_embed(int argc, char **argv) {
 /* ufsm dino-boxes <codes-root> <codes-key> [--block 512] [--min 200000] [--exclude z,y,x,nz,ny,nx]... : block-aligned boxes holding at least
    --min labelled voxels (codes 1..254), as a JSON list for dino-train sources; blocks touching an --exclude box are left out */
 int cmd_dino_boxes(int argc, char **argv) {
+    if (opt(argc, argv, "--mask-axis", nullptr)) {   /* an approximate umbilicus from a scanprep cell mask: per cell row z the centroid of the object
+                                                        cells (holes filled = the scroll's cross-section), as control points in level-0 voxels (every
+                                                        --every cell rows with at least --min-cells object cells; a box fit's wind96 axis input) */
+        const char *mp = opt(argc, argv, "--mask-axis", ""); char jp[1200]; snprintf(jp, sizeof jp, "%s.json", mp);
+        FILE *jf = fopen(jp, "rb"); if (!jf) { fprintf(stderr, "dino-boxes: cannot read %s\n", jp); return 1; }
+        char jb[4096]; const size_t jn = fread(jb, 1, sizeof jb - 1, jf); fclose(jf); jb[jn] = 0;
+        json *mj = json_parse(jb, jn); if (!mj) { fprintf(stderr, "dino-boxes: bad %s\n", jp); return 1; }
+        int64_t g[3]; for (int d = 0; d < 3; d++) g[d] = (int64_t)json_num(json_at(json_get(mj, "grid"), d), 0);
+        const double cs = json_num(json_get(mj, "cell"), 32) * (double)(1 << (int)json_num(json_get(mj, "level"), 0)); json_free(mj);
+        const int every = atoi(opt(argc, argv, "--every", "2")), mc = atoi(opt(argc, argv, "--min-cells", "20"));
+        const size_t nv = (size_t)g[0] * g[1] * g[2]; uint8_t *v = malloc(nv); FILE *f = fopen(mp, "rb");
+        if (!v || !f || fread(v, 1, nv, f) != nv) { fprintf(stderr, "dino-boxes: cannot read %s\n", mp); return 1; } fclose(f);
+        int first = 1; printf("{\"control_points\":[");
+        for (int64_t z = 0; z < g[0]; z += every) {
+            double sy = 0, sx = 0; long n = 0;
+            for (int64_t y = 0; y < g[1]; y++) for (int64_t x = 0; x < g[2]; x++) if (v[((size_t)z * g[1] + y) * g[2] + x]) { sy += y; sx += x; n++; }
+            if (n < mc) continue;
+            printf("%s{\"z\":%.1f,\"y\":%.1f,\"x\":%.1f,\"score\":%ld}", first ? "" : ",", (z + 0.5) * cs, (sy / n + 0.5) * cs, (sx / n + 0.5) * cs, n); first = 0;
+        }
+        printf("]}\n"); free(v);
+        return 0;
+    }
+    if (opt(argc, argv, "--mask", nullptr)) {   /* boxes inside the scroll from a scanprep cell mask (RAW + RAW.json; --out-level L: in level-L voxels): --top random non-overlapping
+                                                   block-edge boxes (cell-aligned, in the mask's level voxels) whose object-cell fraction is >= --min-frac */
+        const char *mp = opt(argc, argv, "--mask", ""); char jp[1200]; snprintf(jp, sizeof jp, "%s.json", mp);
+        FILE *jf = fopen(jp, "rb"); if (!jf) { fprintf(stderr, "dino-boxes: cannot read %s\n", jp); return 1; }
+        char jb[4096]; const size_t jn = fread(jb, 1, sizeof jb - 1, jf); fclose(jf); jb[jn] = 0;
+        json *mj = json_parse(jb, jn); if (!mj) { fprintf(stderr, "dino-boxes: bad %s\n", jp); return 1; }
+        const json *gr = json_get(mj, "grid"); int64_t g[3]; for (int d = 0; d < 3; d++) g[d] = (int64_t)json_num(json_at(gr, d), 0);
+        const int ml = (int)json_num(json_get(mj, "level"), 0), ol = atoi(opt(argc, argv, "--out-level", "-1"));   /* (boxes in level ol voxels; -1: the mask's level) */
+        const double cf = json_num(json_get(mj, "cell"), 32) * (ol < 0 ? 1.0 : ldexp(1.0, ml - ol)); const int cs = (int)cf; json_free(mj);
+        if (cs < 1 || fabs(cf - cs) > 1e-9) { fprintf(stderr, "dino-boxes --mask: cell edge %.3f voxels at level %d\n", cf, ol); return 1; }
+        const int B = atoi(opt(argc, argv, "--block", "512")), top = atoi(opt(argc, argv, "--top", "8")), b = B / cs; const double mf = atof(opt(argc, argv, "--min-frac", "0.6"));
+        uint64_t rs = (uint64_t)atoll(opt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 1;
+        const size_t nv = (size_t)g[0] * g[1] * g[2]; uint8_t *v = malloc(nv); FILE *f = fopen(mp, "rb");
+        if (!v || !f || fread(v, 1, nv, f) != nv) { fprintf(stderr, "dino-boxes: cannot read %s\n", mp); return 1; } fclose(f);
+        typedef struct { int64_t o[3]; double fr; } cand; size_t cap = 1 << 16, nc = 0; cand *cd = malloc(cap * sizeof *cd);
+        const int64_t zm = (int64_t)(g[0] * atof(opt(argc, argv, "--z-margin", "0.08")));   /* (the scan's z ends: mounts, partial slices) */
+        for (int64_t z = zm; z + b <= g[0] - zm; z += b / 2) for (int64_t y = 0; y + b <= g[1]; y += b / 2) for (int64_t x = 0; x + b <= g[2]; x += b / 2) {
+            size_t cnt = 0; for (int64_t a = 0; a < b; a++) for (int64_t e = 0; e < b; e++) for (int64_t c = 0; c < b; c++) cnt += v[((size_t)(z + a) * g[1] + y + e) * g[2] + x + c] != 0;
+            const double fr = (double)cnt / ((double)b * b * b); if (fr < mf) continue;
+            if (nc == cap) { cap *= 2; cd = realloc(cd, cap * sizeof *cd); }
+            cd[nc].o[0] = z * cs; cd[nc].o[1] = y * cs; cd[nc].o[2] = x * cs; cd[nc].fr = fr; nc++;
+        }
+        for (size_t k = nc; k > 1; k--) { const size_t j = rng_next(&rs) % k; const cand t = cd[k - 1]; cd[k - 1] = cd[j]; cd[j] = t; }
+        int first = 1, got = 0; printf("[");
+        for (size_t i = 0; i < nc && got < top; i++) {
+            if (cd[i].fr < 0) continue;
+            printf("%s\n  [%lld,%lld,%lld,%d,%d,%d]", first ? "" : ",", (long long)cd[i].o[0], (long long)cd[i].o[1], (long long)cd[i].o[2], B, B, B); first = 0; got++;
+            fprintf(stderr, "block %lld,%lld,%lld: object fraction %.2f\n", (long long)cd[i].o[0], (long long)cd[i].o[1], (long long)cd[i].o[2], cd[i].fr);
+            for (size_t k = i + 1; k < nc; k++) { int ov = 1; for (int d = 0; d < 3; d++) ov &= llabs(cd[k].o[d] - cd[i].o[d]) < B; if (ov) cd[k].fr = -1; }
+        }
+        printf("\n]\n"); fprintf(stderr, "dino-boxes --mask: %d boxes of %zu candidates (object fraction >= %.2f)\n", got, nc, mf); free(v); free(cd);
+        return 0;
+    }
     if (opt(argc, argv, "--ct-coarse", nullptr)) {   /* papyrus-rich blocks of a CT (no labels): a coarse level read whole */
         store *cs = store_open(argv[2]); z3 *c = cs ? z3_open(cs, opt(argc, argv, "--ct-coarse", ""), opt(argc, argv, "--cache", nullptr)) : nullptr;
         if (!c) { fprintf(stderr, "dino-boxes: %s\n", z3_error()); return 1; }
