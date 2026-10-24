@@ -460,16 +460,18 @@ static size_t ws_walk(at_ws *w, const at_dims *d, long T, long Tr, float *fb, fl
     size_t nf = 0, nb = 0;
 #define TF(f, n) do { w->f = fb ? fb + nf : nullptr; nf += al(n); } while (0)
 #define TB(f, n) do { w->f = bb ? bb + nb : nullptr; nb += al(n); } while (0)
-    for (int l = 0; l < AT_DFM_MAXL; l++) w->vl[l] = w->dvl[l] = nullptr;
+    for (int l = 0; l < AT_DFM_NLV; l++) w->vl[l] = w->dvl[l] = nullptr;
     w->oa = w->aw = w->doa = nullptr;
     if (d->dK > 0) {   /* deformable attention: no q / k / v rows, no attention core tensors */
-        const size_t NOA = (size_t)at_dfm_noa(d), LK = (size_t)d->dL * d->dK;
+        const size_t NOA = (size_t)at_dfm_noa(d), LK = (size_t)at_dfm_nl(d) * d->dK;
         TF(xn, t * C); TF(o, t * C); TF(x1, t * C); TF(xn2, t * C); TF(h, t * 2 * F);
         TF(m1, t); TF(r1, t); TF(m2, t); TF(r2, t); TF(oa, t * NOA); TF(aw, t * H * LK);
         for (int l = 0; l < d->dL; l++) TF(vl[l], (t << (3 * l)) * C);
+        if (d->dCo) TF(vl[d->dL], t * C);   /* (the coarse level: at most T rows) */
         w->qkv = w->rq = w->rk = w->lse = w->qkvh = w->amx = w->qkvr = w->orr = w->qkn = w->dv = w->doh = w->dor = w->dqr = w->dqr2 = nullptr;
         TB(bC, t * C); TB(gg, t * F); TB(dx1, t * C); TB(bA, t * wa); TB(bB, t * wb); TB(doa, t * NOA);
         for (int l = 0; l < d->dL; l++) TB(dvl[l], (t << (3 * l)) * C);
+        if (d->dCo) TB(dvl[d->dL], t * C);
         return part ? nb : nf;
     }
     TF(xn, t * C); TF(o, t * C); TF(x1, t * C); TF(xn2, t * C); TF(qkv, t * 3 * C); TF(h, t * 2 * F);
@@ -494,7 +496,7 @@ extern "C" void at_ws_set_fwd_r(at_ws *w, const at_dims *d, long T, long Tr, voi
     w->xn = t.xn; w->o = t.o; w->x1 = t.x1; w->xn2 = t.xn2; w->qkv = t.qkv; w->h = t.h;
     w->m1 = t.m1; w->r1 = t.r1; w->m2 = t.m2; w->r2 = t.r2; w->rq = t.rq; w->rk = t.rk; w->lse = t.lse; w->qkvh = t.qkvh; w->amx = t.amx;
     w->qkvr = t.qkvr; w->orr = t.orr; w->kept = 0;
-    for (int l = 0; l < AT_DFM_MAXL; l++) w->vl[l] = t.vl[l];
+    for (int l = 0; l < AT_DFM_NLV; l++) w->vl[l] = t.vl[l];
     w->oa = t.oa; w->aw = t.aw;
 }
 extern "C" size_t at_ws_bytes(const at_dims *d, long T) { return at_ws_bytes_r(d, T, 0); }
@@ -549,8 +551,9 @@ extern "C" int at_block_fwd(const at_dims *d, const float *P, const at_bp *bp, c
     int e = 0;
     PR("ln1", 0, t * C * 8, at_ln_fwd(x, P + bp->ln1g, P + bp->ln1b, w->xn, w->m1, w->r1, T, C));
     if (d->dK > 0) {   /* deformable attention: values of every level, offsets + logits, softmax, the sampled sum into o */
-        const int NOA = at_dfm_noa(d); const double LK = (double)d->dL * d->dK;
+        const int NOA = at_dfm_noa(d); const double LK = (double)at_dfm_nl(d) * d->dK;
         PR("v gemm", 2 * t * C * C, t * C * 12, e |= at_gemm_ex(0, 1, (int)T, C, C, w->xn, P + bp->wqkv, w->vl[0], 0.f, P + bp->bqkv, nullptr)); CK(e);
+        if (d->dCo) PR("dfm pool", 0, t * C * 5, at_dfm_pool(w->vl[0], w->vl[d->dL], g, C));   /* the coarse level */
         PR("oa gemm", 2 * t * NOA * C, t * (C + NOA) * 4, e |= at_gemm_ex(0, 1, (int)T, NOA, C, w->xn, P + bp->woa, w->oa, 0.f, P + bp->boa, nullptr)); CK(e);
         for (int l = 1; l < d->dL; l++) {
             const long Tl = T << (3 * l); const int Cl = d->dC[l];
@@ -608,7 +611,7 @@ extern "C" int at_block_bwd(const at_dims *d, const float *P, float *G, const at
     PR("b o gemms", 4 * t * C * C, t * C * 20, e |= at_gemm(1, 0, C, C, (int)T, w->dx1, w->o, G + bp->wo, 1.f); colsum(w->dx1, T, C, G + bp->bo);
        e |= at_gemm(0, 0, (int)T, C, C, w->dx1, P + bp->wo, w->bC, 0.f)); CK(e);             /* d o */
     if (d->dK > 0) {   /* deformable: d values / offsets / logits, then the projections' gradients; d xn into bA */
-        const int NOA = at_dfm_noa(d); const double LK = (double)d->dL * d->dK;
+        const int NOA = at_dfm_noa(d); const double LK = (double)at_dfm_nl(d) * d->dK;
         PR("b dfm", 0, t * C * LK * 8 * 12, at_dfm_bwd((const float *const *)w->vl, w->oa, w->aw, w->bC, w->dvl, w->doa, g, d));
         PR("b v gemms", 4 * t * C * C, t * C * 16, e |= at_gemm(1, 0, C, C, (int)T, w->dvl[0], w->xn, G + bp->wqkv, 1.f); colsum(w->dvl[0], T, C, G + bp->bqkv);
            e |= at_gemm(0, 0, (int)T, C, C, w->dvl[0], P + bp->wqkv, w->bA, 0.f)); CK(e);

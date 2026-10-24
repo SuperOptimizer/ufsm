@@ -119,6 +119,18 @@ No teacher models, no distillation. All upstream data is re-exported once into t
   1835 MB. Flash attention keeps no S x S matrix, so at these token counts deformable costs MORE memory (the finer levels' fp32
   values: 8^l x the grid x C per block) and is only faster from ~P768 (K <= 16, L 2). Smoke (P256, 2 blocks, K16): L2 4.31-4.55
   samples/s, L3 4.62-4.70 (sampler-bound; full attention 4.66), finite.
+- Deformable attention for the winding fine-tune (2026-10-24, all default off; wdef = wind96 + 2 blocks K16 L3 lost HOLD 0.93 -> 0.79,
+  the conv trunk drifting). (1) train `--trunk-lr-mult F` (unet_set_trunk_lr): every parameter before the attention stage (Muon convs,
+  their AdamW tail, packed MX convs) at F x the LR, the stage (its tail [tb_p0, np)) at the base LR; Muon runs two batched calls.
+  (2) `--attn-deform-init normal` (`attn_dinit` 1): per-token frames (normal = radial from the scroll axis, tangent, axis; from the
+  unet_set_attn_axis records, identity without an axis; at_dfm_frame) rotate the learned offsets (p = c + sum_j o_j R_j); the prior
+  spreads the K points along the normal (+-2 voxels x 2^l) with a small per-head lateral twist. train / predict pass axis records when
+  set (unet_cfg_axis). (3) `--attn-dcoarse 1` (`attn_dco` 1): one more level after the finer ones = the 2x2x2 mean-pooled bottleneck
+  values (no own projection; gradient unpooled into level 0), its own offset / logit rows. Warm starts from another deformable layout
+  copy tensor by tensor (dfm_copy_block: value / out / MLP / finer projections and the common levels' logit rows; offset rows only with
+  the same frame mode; new rows keep their init). Tests: test_attn_dfm (coarse level and frames vs double central differences, frame
+  identity, frame kernel and normal prior geometry), test_hybrid_identity (coarse + frames identity, gradients, axis dependence,
+  checkpoint, warm-start remap, trunk LR x 0.5 under Muon and AdamW with the stage unchanged and 1 = default bit for bit).
 - dino-train for large windows: `--head-slab Z` runs the 1^3 head per z-slab of Z planes (unet head slabs): no whole-window logits
   (P 512 at D 32: 8.6 GB of fp16 logits) and no dense fp32 logit gradient (17 GB) -- the points' embeddings are gathered per slab, and
   in the backward's head step their gradients are scattered into each slab's fp16 logit gradient. `--mem lean` sets train's smallest

@@ -327,6 +327,144 @@ int main(void) {
         free(li); unet_free(ui);
         free(lr); free(ll); free(gr); unet_free(ur); unet_free(ul);
     }
+    /* the deformable coarse level + normal frames (attn_dco 1, attn_dinit 1; 2 blocks, 4 points on the 8^3 bottleneck, the 16^3 level and the
+       pooled 4^3 level, an axis inside the window): (a) a fresh stage is the identity, (b) a random stage: every block tensor gets a nonzero
+       finite gradient and another axis changes the logits (the frames are used), (c) the checkpoint keeps attn_dco / attn_dinit (logits bit
+       for bit), (d) --init-from a frameless 3-level donor without the coarse level (the stage saved above) copies every common tensor and
+       row and leaves the coarse rows at their initialisation */
+    {
+        const int C = 96, K = 4, Ld = 2;
+        float axr[UNET_AXR(32)], axr2[UNET_AXR(32)]; axr[0] = 0; axr[1] = 1; axr[2] = 32; axr[3] = 1; memcpy(axr2, axr, sizeof axr);
+        for (int z = 0; z < 32; z++) { axr[4 + 2 * z] = 14.5f - 0.2f * z; axr[5 + 2 * z] = 18.f + 0.1f * z; axr2[4 + 2 * z] = 3.f; axr2[5 + 2 * z] = 25.f; }
+        unet_cfg cd = c0; cd.attn_blocks = 2; cd.attn_deform = K; cd.attn_dlev = Ld; cd.attn_dco = 1; cd.attn_dinit = 1;
+        unet *ud = unet_create(&cd); unet_init(ud, 71);
+        if (unet_init_from_map(ud, path0, rows) < 0) { printf("init_from failed\n"); return 1; }
+        unet_set_attn_axis(ud, axr, 1, UNET_AXR(32));
+        lp_set_gyrec_off(1);
+        nn_set_sr_step(100); l = unet_forward(ud, x, xs, 1); float *bd = logits_f32(ud, l, nl);
+        nn_h2d(gd, gh, nl * 4); unet_zero_grad(ud); nn_set_sr_step(200); unet_backward(ud, gd);
+        const size_t ndp = unet_nparams(ud); float *gv = malloc(ndp * 4); unet_grad_d2h(ud, gv);
+        lp_set_gyrec_off(-1);
+        const double e1 = rel_l2(bd, a, nl), e2 = rel_l2(gv, ga, n0);
+        printf("deformable coarse + normal frames: fresh stage identity logits rel L2 %.2e, trunk gradient %.2e%s\n", e1, e2, e1 < 1e-5 && e2 < 1e-5 ? "" : "  FAIL");
+        bad += !(e1 < 1e-5 && e2 < 1e-5);
+        free(bd); free(gv); unet_free(ud);
+        setenv("UFSM_ATTN_NONZERO", "1", 1);
+        unet *ur = unet_create(&cd); unet_init(ur, 73); unsetenv("UFSM_ATTN_NONZERO");
+        if (unet_init_from_map(ur, path0, rows) < 0) { printf("init_from failed\n"); return 1; }
+        unet_set_attn_axis(ur, axr, 1, UNET_AXR(32));
+        nn_set_sr_step(100); l = unet_forward(ur, x, xs, 1); float *lr = logits_f32(ur, l, nl);
+        nn_h2d(gd, gh, nl * 4); unet_zero_grad(ur); nn_set_sr_step(200); unet_backward(ur, gd);
+        float *gr = malloc(ndp * 4); unet_grad_d2h(ur, gr);
+        unet_set_attn_axis(ur, axr2, 1, UNET_AXR(32));
+        nn_set_sr_step(100); l = unet_forward(ur, x, xs, 1); float *lr2 = logits_f32(ur, l, nl);
+        unet_set_attn_axis(ur, axr, 1, UNET_AXR(32));
+        const double ec = rel_l2(lr, a, nl), ex = rel_l2(lr2, lr, nl);
+        at_dims dd = {0}; dd.C = C; dd.H = C / AT_HD; dd.F = (8 * C / 3 + 31) / 32 * 32; dd.dK = K; dd.dL = Ld; dd.dC[0] = C; dd.dC[1] = 32; dd.dCo = 1; dd.dInit = 1;
+        size_t off = n0 + (size_t)C * 28; int zero = 0, nonfin = 0, nt = 0;   /* (PEG w, b; no registers) */
+        for (int k = 0; k < 2; k++) {
+            at_bp bp; const size_t end = at_block_layout(&dd, &bp, off);
+            const size_t st[] = {bp.wqkv, bp.woa, bp.boa, bp.wvl[1], bp.bvl[1], bp.wo, bp.w1, bp.w2, end};
+            const size_t en[] = {bp.bqkv, bp.boa, bp.wvl[1], bp.bvl[1], bp.wo, bp.bo, bp.b1, bp.b2};
+            for (int j = 0; j < 8; j++) {
+                double s = 0; for (size_t i = st[j]; i < en[j]; i++) { s += fabs(gr[i]); nonfin += !isfinite(gr[i]); }
+                zero += !(s > 0); nt++;
+            }
+            /* the coarse level's offset / logit rows get gradient too */
+            const int Lt = at_dfm_nl(&dd); double sc = 0;
+            for (int h = 0; h < dd.H; h++) for (int q = 0; q < K; q++) for (int j = 0; j < 3; j++) sc += fabs(gr[bp.boa + (((size_t)h * Lt + Ld) * K + q) * 3 + j]);
+            zero += !(sc > 0); nt++;
+            off = end;
+        }
+        const int okr = ec > 1e-2 && ex > 1e-4 && !zero && !nonfin && off == ndp;
+        printf("deformable coarse + normal frames, random stage: logits vs the conv net rel L2 %.2e, vs another axis %.2e, %d of %d tensors with zero gradient, %d non-finite, layout %s%s\n",
+               ec, ex, zero, nt, nonfin, off == ndp ? "ok" : "MISMATCH", okr ? "" : "  FAIL");
+        bad += !okr;
+        char pathc[] = "/tmp/ufsm_test_hybridc_XXXXXX"; { int fc = mkstemp(pathc); if (fc >= 0) close(fc); }
+        if (unet_save(ur, pathc, 5, nullptr)) { printf("cannot save\n"); return 1; }
+        unet_cfg pd; int sd; if (unet_peek(pathc, &pd, &sd)) { printf("peek failed\n"); return 1; }
+        unet *ul = unet_create(&pd); unet_load(ul, pathc); unet_set_attn_axis(ul, axr, 1, UNET_AXR(32));
+        nn_set_sr_step(100); l = unet_forward(ul, x, xs, 1); float *ll = logits_f32(ul, l, nl);
+        size_t nd = 0; for (size_t i = 0; i < nl; i++) nd += memcmp(ll + i, lr + i, 4) != 0;
+        const int okc = pd.attn_dco == 1 && pd.attn_dinit == 1 && pd.attn_dlev == Ld && !nd;
+        printf("checkpoint: attn_dco %d attn_dinit %d, logits differ in %zu%s\n", pd.attn_dco, pd.attn_dinit, nd, okc ? "" : "  FAIL"); bad += !okc;
+        free(lr); free(lr2); free(ll); free(gr); unet_free(ur); unet_free(ul); unlink(pathc);
+        /* (d) the remapped warm start: donor = the frameless 3-level stage without the coarse level at path */
+        unet_cfg po; int so; if (unet_peek(path, &po, &so)) { printf("peek failed\n"); return 1; }
+        unet *uo = unet_create(&po); unet_load(uo, path);
+        unet_cfg cm = po; cm.attn_dco = 1;
+        unet *um = unet_create(&cm); unet_init(um, 75);
+        const size_t nm = unet_nparams(um), no_ = unet_nparams(uo);
+        float *pf = malloc(nm * 4); nn_d2h(pf, unet_live_params(um), nm * 4);   /* the fresh parameters */
+        if (unet_init_from_map(um, path, rows) < 0) { printf("init_from failed\n"); return 1; }
+        float *pm = malloc(nm * 4), *po_ = malloc(no_ * 4); nn_d2h(pm, unet_live_params(um), nm * 4); nn_d2h(po_, unet_live_params(uo), no_ * 4);
+        at_dims da = {0}; da.C = C; da.H = C / AT_HD; da.F = (8 * C / 3 + 31) / 32 * 32; da.dK = po.attn_deform; da.dL = po.attn_dlev; da.dC[0] = C; da.dC[1] = 32; da.dC[2] = 16;
+        at_dims db = da; da.dCo = 1;
+        size_t oa_ = n0 + (size_t)C * 28, ob_ = oa_; size_t nbad = 0, ncmp = 0;
+        for (int k = 0; k < po.attn_blocks; k++) {
+            at_bp pa, pb; const size_t ea = at_block_layout(&da, &pa, oa_), eb = at_block_layout(&db, &pb, ob_);
+            const int Ka = da.dK, La = at_dfm_nl(&da), Lb = at_dfm_nl(&db);
+            for (size_t i = 0; i < pa.woa - pa.ln1g; i++, ncmp++) nbad += pm[pa.ln1g + i] != po_[pb.ln1g + i];
+            for (size_t i = 0; i < ea - pa.wo; i++, ncmp++) nbad += pm[pa.wo + i] != po_[pb.wo + i];
+            for (int l = 1; l < da.dL; l++) for (size_t i = 0; i < (size_t)C * da.dC[l]; i++, ncmp++) nbad += pm[pa.wvl[l] + i] != po_[pb.wvl[l] + i];
+            for (int h = 0; h < da.H; h++) for (int lv = 0; lv < La; lv++) for (int q = 0; q < Ka; q++) {
+                const size_t ia = ((size_t)h * La + lv) * Ka + q, ga_ = (size_t)da.H * La * Ka * 3 + ia;
+                if (lv < da.dL) {
+                    const size_t ib = ((size_t)h * Lb + lv) * Ka + q, gb_ = (size_t)da.H * Lb * Ka * 3 + ib;
+                    for (size_t i = 0; i < 3 * (size_t)C; i++, ncmp++) nbad += pm[pa.woa + ia * 3 * C + i] != po_[pb.woa + ib * 3 * C + i];
+                    for (int j = 0; j < 3; j++, ncmp++) nbad += pm[pa.boa + ia * 3 + j] != po_[pb.boa + ib * 3 + j];
+                    for (size_t i = 0; i < (size_t)C; i++, ncmp++) nbad += pm[pa.woa + ga_ * C + i] != po_[pb.woa + gb_ * C + i];
+                    ncmp++; nbad += pm[pa.boa + ga_] != po_[pb.boa + gb_];
+                } else {   /* the coarse rows: as initialised */
+                    for (size_t i = 0; i < 3 * (size_t)C; i++, ncmp++) nbad += pm[pa.woa + ia * 3 * C + i] != pf[pa.woa + ia * 3 * C + i];
+                    for (int j = 0; j < 3; j++, ncmp++) nbad += pm[pa.boa + ia * 3 + j] != pf[pa.boa + ia * 3 + j];
+                    for (size_t i = 0; i < (size_t)C; i++, ncmp++) nbad += pm[pa.woa + ga_ * C + i] != pf[pa.woa + ga_ * C + i];
+                    ncmp++; nbad += pm[pa.boa + ga_] != pf[pa.boa + ga_];
+                }
+            }
+            oa_ = ea; ob_ = eb;
+        }
+        const int okm = !nbad && oa_ == nm && ob_ == no_;
+        printf("deformable warm start without -> with the coarse level: %zu of %zu stage values off%s\n", nbad, ncmp, okm ? "" : "  FAIL"); bad += !okm;
+        free(pf); free(pm); free(po_); unet_free(uo); unet_free(um);
+    }
+    /* --trunk-lr-mult (unet_set_trunk_lr): two identical deformable hybrids, the same random gradients, one Muon (then one AdamW) step each:
+       with 0.5 every trunk parameter moves by half the full-rate step (Muon and AdamW steps are linear in lr), the attention stage moves
+       exactly as at the full rate; 1 is the default bit for bit */
+    {
+        unet_cfg ct = c0; ct.attn_blocks = 2; ct.attn_deform = 4; ct.attn_dlev = 2; ct.attn_dco = 1;
+        for (int opt = 0; opt < 2; opt++) {
+            unet *U[3]; float *p0 = nullptr, *p[3]; size_t nt = 0;
+            for (int v = 0; v < 3; v++) {
+                setenv("UFSM_ATTN_NONZERO", "1", 1); U[v] = unet_create(&ct); unet_init(U[v], 81); unsetenv("UFSM_ATTN_NONZERO");
+                if (unet_init_from_map(U[v], path0, rows) < 0) { printf("init_from failed\n"); return 1; }
+                nt = unet_nparams(U[v]);
+                if (v == 1) unet_set_trunk_lr(U[v], 0.5f);
+                if (v == 2) unet_set_trunk_lr(U[v], 1.f);
+            }
+            float *gr = malloc(nt * 4); for (size_t i = 0; i < nt; i++) gr[i] = frand() * 1e-2f;
+            p0 = malloc(nt * 4); nn_d2h(p0, unet_live_params(U[0]), nt * 4);
+            for (int v = 0; v < 3; v++) {
+                unet_grad_h2d(U[v], gr);
+                if (opt == 0) unet_muon(U[v], 0.01f, 0.95f, 1e-3f, 0.9f, 0.999f, 1e-8f, 0.f, 1); else unet_adamw(U[v], 1e-3f, 0.9f, 0.999f, 1e-8f, 0.f, 1);
+                nn_sync(); p[v] = malloc(nt * 4); nn_d2h(p[v], unet_live_params(U[v]), nt * 4);
+            }
+            double emx = 0, sd1 = 0; size_t natt = 0, ndiff = 0, nmov = 0;
+            for (size_t i = 0; i < n0; i++) {   /* the trunk: [0, n0) (the conv net's parameters) */
+                const double d1 = (double)p[0][i] - p0[i], dh = (double)p[1][i] - p0[i];
+                if (fabs(d1) < 1e-9) continue;
+                nmov++; emx += fabs(dh - 0.5 * d1); sd1 += fabs(d1);   /* (fp32 rounding of p + step: compare in aggregate) */
+            }
+            for (size_t i = n0; i < nt; i++) { natt++; ndiff += memcmp(p[1] + i, p[0] + i, 4) != 0; }
+            emx /= 0.5 * (sd1 > 0 ? sd1 : 1);
+            const int same1 = !memcmp(p[2], p[0], nt * 4), ok = emx < 2e-3 && nmov > n0 / 2 && !ndiff && same1;
+            printf("--trunk-lr-mult (%s): trunk steps x 0.5, mean rel err %.1e (%zu moved), %zu of %zu stage values differ from the full rate, mult 1 %s%s\n",
+                   opt ? "AdamW" : "Muon", emx, nmov, ndiff, natt, same1 ? "== default bit for bit" : "DIFFERS", ok ? "" : "  FAIL");
+            bad += !ok;
+            for (int v = 0; v < 3; v++) { free(p[v]); unet_free(U[v]); }
+            free(p0); free(gr);
+        }
+    }
     unlink(path); unlink(path0);
     printf(bad ? "test_hybrid_identity: %d FAILED\n" : "test_hybrid_identity: all passed\n", bad);
     return bad != 0;
