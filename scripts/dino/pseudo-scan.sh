@@ -2,10 +2,11 @@
 # pseudo-scan.sh OUTROOT SCROLL SCAN UM [NBOX]: winding pseudo labels over NBOX (default 6) papyrus-rich 512^3 boxes of one ESRF scan
 # (level 0 = the scan's ~9 um), for dino-train GT SupCon on volumes without labels.
 #   axis: the scan's published prod96 fit fields.json (mirror; [y, x] per native z) -> umbilicus control points
-#   boxes: ufsm dino-boxes --ct-coarse (level 3, factor 8): the richest non-overlapping 512^3 blocks (papyrus above the coarse median)
+#   boxes: ufsm dino-boxes --mask (the scan's scanprep cell mask PREP/<S>-<SC>.mask.raw): NB random non-overlapping 512^3 boxes with an
+#          object-cell fraction >= MINFRAC (0.8), away from the scan's z ends
 #   per box: pseudo-box.sh (wind96 predict -> fit -> gated band codes); OUTROOT/SCROLL/sources.json collects the box entries
 #   whose fit agrees with the network phase (pseudo.agree_cos >= MINCOS, default 0.8) and the scan's norm (from sources-u0.json if NORMS given)
-# Holdouts: PHerc1667 and PHerc1447 are refused (eval scans). Env: R (CT root), CACHE, FIELDS (fit-fields zarr name), everything of pseudo-box.sh.
+# Holdouts: PHerc1667 and PHerc1447 are refused (eval scans). Env: R (CT root), PREP (scanprep dir, default /vesuvius/ufsm/u0/prep), MINFRAC, SEED, FIELDS (fit-fields zarr name), everything of pseudo-box.sh.
 set -u
 O=$1 S=$2 SC=$3 UM=$4 NB=${5:-6}; R=${R:-https://dl.ash2txt.org/community-uploads/forrest/volcomp}
 case $S in PHerc1667*|PHerc1447*) echo "pseudo-scan: $S is an eval holdout, refused"; exit 2;; esac
@@ -17,11 +18,12 @@ if [ ! -s $o/axis.json ]; then
   curl -sf --retry 3 $R/$S/representations/predictions/fit-fields/$FZ/fields.json -o $o/fields.json || { echo "pseudo-scan: no fields.json for $S"; exit 1; }
   jq -c '.origin as $o | {control_points: [.axis | to_entries[] | select(.key % 32 == 0) | {z: (.key + $o[0]), y: (.value[0] + $o[1]), x: (.value[1] + $o[2]), score: 1}]}' $o/fields.json > $o/axis.json
 fi
-[ -s $o/boxes.json ] || $U dino-boxes $R --ct-coarse $G/3 --factor 8 --block 512 --top $NB ${CACHE:+--cache $CACHE} > $o/boxes.json 2> $o/boxes.log || { echo "pseudo-scan: boxes failed"; exit 1; }
+M=${PREP:-/vesuvius/ufsm/u0/prep}/$S-$SC.mask.raw; [ -s $M ] || { echo "pseudo-scan: no scanprep mask $M"; exit 1; }
+[ -s $o/boxes.json ] || $U dino-boxes - --mask $M --block 512 --top $NB --min-frac ${MINFRAC:-0.8} --seed ${SEED:-1} > $o/boxes.json 2> $o/boxes.log || { echo "pseudo-scan: boxes failed"; exit 1; }
 nb=$(jq length $o/boxes.json); echo "$S: $nb boxes"
 for i in $(seq 0 $((nb - 1))); do
   b=$(jq -r ".[$i] | map(tostring) | join(\",\")" $o/boxes.json)
-  NAME=$S-pb$i $D/pseudo-box.sh $o/b$i $R $G $UM $o/axis.json $b
+  PNAME=$S-pb$i $D/pseudo-box.sh $o/b$i $R $G $UM $o/axis.json $b
 done
 jq -s --argjson mc ${MINCOS:-0.8} '[.[] | select(.pseudo.agree_cos >= $mc)]' $o/b*/source.json > $o/sources.json 2> /dev/null
 echo "$S: $(jq length $o/sources.json) of $nb boxes kept (agree_cos >= ${MINCOS:-0.8})"
