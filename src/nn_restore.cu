@@ -275,7 +275,13 @@ extern "C" void nn_restore_output(const void *lg, int lg16, const uint8_t *low, 
 }
 
 /* ---- real pairs (train --task restore on sr_pair sources): shift-tolerant Charbonnier, edge, MSE, downsample consistency; metrics ---- */
-struct rp_geo { int D, H, W, q, shift; float eps, mw, ew, sw, dw, gs, uw, gw, gt; };   /* gw, gt: gap weight / threshold (DN) */
+struct rp_geo { int D, H, W, q, shift; float eps, mw, ew, sw, dw, gs, uw, gw, gt, smw; int ph[3]; };   /* gw, gt: gap weight / threshold (DN) */
+/* the edge pair (i, i + str[a]) across an input-grid codec block boundary: fine index f = c + 1 at an input voxel boundary (f % 4 == 0)
+   whose input voxel (phase + f / 4) is a multiple of 16 */
+__device__ __forceinline__ float rp_seamw(const rp_geo &g, int a, int c) {
+    if (g.smw == 0.f || g.ph[a] < 0) return 1.f;
+    const int f = c + 1; return f % 4 == 0 && (g.ph[a] + f / 4) % 16 == 0 ? 1.f + g.smw : 1.f;
+}
 __device__ __forceinline__ float rp_gapw(const uint8_t *lo, const uint8_t *hi, size_t i, float gw, float gt) { return gw != 0.f && (float)hi[i] < (float)lo[i] - gt ? 1.f + gw : 1.f; }
 template <class L> __device__ __forceinline__ float rp_o(const L *lg, const uint8_t *lo, size_t i) { return (float)lg[i] + (float)lo[i] * 0.015625f; }
 __device__ __forceinline__ float rp_ch(float e, float eps) { return sqrtf(e * e + eps * eps) - eps; }
@@ -329,8 +335,8 @@ template <class L> __global__ void rp_stats_k(const L *__restrict__ lg, const ui
         for (int a = 0; a < 3; a++) {
             if ((int)((i / str[a]) % len[a]) == len[a] - 1 || !hi[i + str[a]]) continue;
             const size_t j = i + str[a];
-            const float oj = rp_o(lg, lo, j), df = e - (oj - (float)hi[j] * 0.015625f);
-            s[5] += 1; s[6] += rp_ch(df, g.eps);
+            const float oj = rp_o(lg, lo, j), df = e - (oj - (float)hi[j] * 0.015625f), sw_ = rp_seamw(g, a, (int)((i / str[a]) % len[a]));
+            s[5] += 1; s[6] += sw_ * rp_ch(df, g.eps);
             const float dt = (float)hi[j] - (float)hi[i], dout = 64.f * (oj - o), dl = (float)lo[j] - (float)lo[i];
             m[0] += (double)(dout - dt) * (dout - dt); m[1] += (double)(dl - dt) * (dl - dt);
         }
@@ -356,8 +362,8 @@ template <class L, class G> __global__ void rp_grad_k(const L *__restrict__ lg, 
             const float ie = g.ew * (float)(1.0 / st[5]);
             for (int a = 0; a < 3; a++) {
                 const int c = (int)((i / str[a]) % len[a]);
-                if (c > 0 && hi[i - str[a]]) { const size_t j = i - str[a]; const float df = e - (rp_o(lg, lo, j) - (float)hi[j] * 0.015625f); v += ie * rp_cd(df, g.eps); }
-                if (c < len[a] - 1 && hi[i + str[a]]) { const size_t j = i + str[a]; const float df = e - (rp_o(lg, lo, j) - (float)hi[j] * 0.015625f); v += ie * rp_cd(df, g.eps); }
+                if (c > 0 && hi[i - str[a]]) { const size_t j = i - str[a]; const float df = e - (rp_o(lg, lo, j) - (float)hi[j] * 0.015625f); v += ie * rp_seamw(g, a, c - 1) * rp_cd(df, g.eps); }
+                if (c < len[a] - 1 && hi[i + str[a]]) { const size_t j = i + str[a]; const float df = e - (rp_o(lg, lo, j) - (float)hi[j] * 0.015625f); v += ie * rp_seamw(g, a, c) * rp_cd(df, g.eps); }
             }
         }
     }
@@ -408,7 +414,7 @@ template <class L> static void rp_loss_t(const L *lg, const uint8_t *lo, const u
 extern "C" void nn_restore_pair_loss(const void *lg, int lg16, const uint8_t *low, const uint8_t *tgt, const uint8_t *coarse, int D, int H, int W, const restore_pair_w *w,
                                      void *gl, int g16, int h16, float gscale, double *st, float *rd, int metrics) {
     const size_t n = (size_t)D * H * W;
-    rp_geo g = {D, H, W, D / 4, w->shift, w->eps, w->mse, w->edge, w->shift_w, w->ds, gscale, w->unc, w->gap_w, w->gap_t};
+    rp_geo g = {D, H, W, D / 4, w->shift, w->eps, w->mse, w->edge, w->shift_w, w->ds, gscale, w->unc, w->gap_w, w->gap_t, coarse ? w->seam_w : 0.f, {w->phase[0], w->phase[1], w->phase[2]}};
     if (lg16) rp_loss_t<f16>((const f16 *)lg, low, tgt, coarse, g, gl, g16, h16, st, rd, metrics, n);
     else rp_loss_t<float>((const float *)lg, low, tgt, coarse, g, gl, g16, h16, st, rd, metrics, n);
     KCHECK();

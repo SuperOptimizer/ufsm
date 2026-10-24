@@ -87,7 +87,7 @@ void nn_restore_loss(const void *lg, int lg16, const uint8_t *low, const uint8_t
    6 edge Charbonnier sum, 7 ds Charbonnier sum, 8 ds count, 9 / 10 output / input gradient error^2 DN sum over face pairs, 11 / 12 output /
    input SSIM sum over valid 8^3 blocks, 13 blocks (metrics only), 14 shift-min |error| DN sum, 15 scale-head NLL sum (unc > 0). rd: (D / 4)^3 floats of scratch */
 enum { RP_NST = 16 };
-typedef struct { float eps, mse, edge, shift_w, ds; int shift; float unc, gap_w, gap_t; } restore_pair_w;   /* gap_w > 0: the main term x (1 + gap_w) where the target is darker than the trilinear input by > gap_t DN (gaps the input smears) */   /* unc > 0: logits channel 1 is a per-voxel log scale (Laplace NLL weight unc, error held fixed) */
+typedef struct { float eps, mse, edge, shift_w, ds; int shift; float unc, gap_w, gap_t, seam_w; int phase[3]; } restore_pair_w;   /* seam_w > 0: edge pairs across the input grid's 16-voxel codec block boundaries weigh 1 + seam_w (phase: the window's input-grid origin mod 16 per axis, zyx; -1: unknown) */   /* gap_w > 0: the main term x (1 + gap_w) where the target is darker than the trilinear input by > gap_t DN (gaps the input smears) */   /* unc > 0: logits channel 1 is a per-voxel log scale (Laplace NLL weight unc, error held fixed) */
 void nn_restore_pair_loss(const void *lg, int lg16, const uint8_t *low, const uint8_t *tgt, const uint8_t *coarse, int D, int H, int W, const restore_pair_w *w,
                           void *gl, int g16, int h16, float gscale, double *st, float *rd, int metrics);
 /* output CT: clean-free, low + 64 logit rounded, clamped to [1, 255], 0 where low is 0 */

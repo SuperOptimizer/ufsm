@@ -178,7 +178,7 @@ static int restore_args(int argc, char **argv) {
     g_rr.sc_edge_p = (float)atof(opt(argc, argv, "--scanner-edge-p", "0.3")); g_rr.sc_aniso = (float)atof(opt(argc, argv, "--scanner-aniso", "0.15"));
     g_rr.sc_gain = (float)atof(opt(argc, argv, "--scanner-gain", "0.06")); g_rr.sc_gamma = (float)atof(opt(argc, argv, "--scanner-gamma", "0.06")); g_rr.sc_bias = (float)atof(opt(argc, argv, "--scanner-bias", "3"));
     g_rpairs = atoi(opt(argc, argv, "--sr-pairs", "0")) != 0;
-    g_rpw = (restore_pair_w){g_reps, g_rmse, g_redge, (float)atof(opt(argc, argv, "--sr-shift-w", "0.5")), (float)atof(opt(argc, argv, "--sr-ds", "0.5")), atoi(opt(argc, argv, "--sr-shift", "1")), (float)atof(opt(argc, argv, "--sr-unc", "0")), (float)atof(opt(argc, argv, "--sr-gap-w", "0")), (float)atof(opt(argc, argv, "--sr-gap-tau", "10"))};
+    g_rpw = (restore_pair_w){g_reps, g_rmse, g_redge, (float)atof(opt(argc, argv, "--sr-shift-w", "0.5")), (float)atof(opt(argc, argv, "--sr-ds", "0.5")), atoi(opt(argc, argv, "--sr-shift", "1")), (float)atof(opt(argc, argv, "--sr-unc", "0")), (float)atof(opt(argc, argv, "--sr-gap-w", "0")), (float)atof(opt(argc, argv, "--sr-gap-tau", "10")), (float)atof(opt(argc, argv, "--sr-seam-w", "0")), {-1, -1, -1}};
     if (g_rpw.unc < 0) { fprintf(stderr, "--sr-unc >= 0\n"); return 1; }
     if (g_rpairs && (!(g_rpw.shift_w >= 0 && g_rpw.shift_w <= 1) || g_rpw.ds < 0 || (g_rpw.shift != 0 && g_rpw.shift != 1))) { fprintf(stderr, "--sr-shift-w 0..1, --sr-ds >= 0, --sr-shift 0|1\n"); return 1; }
     if (g_rpairs) fprintf(stderr, "restore: real pairs: loss (1 - %g) Charbonnier + %g shift-min Charbonnier (shift %d) + %g edge + %g MSE + %g downsample consistency\n", g_rpw.shift_w, g_rpw.shift_w, g_rpw.shift, g_redge, g_rmse, g_rpw.ds);
@@ -760,6 +760,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     if (prof) nn_prof_begin(6);
     shape5 ts = os; if (g_aff) ts.c = NCH;   /* B == 1: the target channels are the leading output channels */
     nn_set_logits_h16((!g_half || g_pkf) && unet_logits_h16(d->u));   /* lean 2: fp16 logits in the gradient buffer */
+    if (g_restore && g_rpairs) for (int a_ = 0; a_ < 3; a_++) { const int64_t c_ = d->cornb[d->cur][a_]; g_rpw.phase[a_] = c_ >= 0 ? (int)(c_ % 16) : -1; }   /* the window's codec block phase */
     if (g_restore && g_rpairs) nn_restore_pair_loss(lg, unet_logits_h16(d->u), d->rlow, d->t, d->lvlb[d->cur] == 1 ? nullptr : d->t + (size_t)g_Pz * P * P, g_Pz, P, P, &g_rpw, train ? d->gl : nullptr, g_g16, nn_get_f16(),
                                                     nn_get_grad_scale(), d->rst, d->rrd, !train);
     else if (g_restore) nn_restore_loss(lg, unet_logits_h16(d->u), d->rlow, d->t, g_Pz, P, P, g_reps, g_rmse, g_redge, train ? d->gl : nullptr, g_g16, nn_get_f16(), nn_get_grad_scale(), d->rst);

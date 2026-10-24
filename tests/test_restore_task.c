@@ -332,7 +332,9 @@ static double pair_ref(const float *lg, const uint8_t *lo, const uint8_t *hi, co
         cnt++; main_ += wg * ((1 - w->shift_w) * CH(e) + w->shift_w * CH(em)); se += e * e;
         gm[i] = wg * ((1 - w->shift_w) * CD(e) + w->shift_w * CD(em)) + w->mse * e;
         for (int a = 0; a < 3; a++) { if ((int)((i / str[a]) % N) == N - 1 || !hi[i + str[a]]) continue;
-            const size_t j = i + str[a]; const double d = e - (O(j) - hi[j] / 64.0); pairs++; es += CH(d); ge[i] += CD(d); ge[j] -= CD(d); }
+            const size_t j = i + str[a]; const double d = e - (O(j) - hi[j] / 64.0);
+            const int c = (int)((i / str[a]) % N), f = c + 1; const double sw = w->seam_w != 0 && w->phase[a] >= 0 && f % 4 == 0 && (w->phase[a] + f / 4) % 16 == 0 ? 1 + w->seam_w : 1;
+            pairs++; es += sw * CH(d); ge[i] += sw * CD(d); ge[j] -= sw * CD(d); }
     }
     for (int cz = 0; cz < q; cz++) for (int cy = 0; cy < q; cy++) for (int cx = 0; cx < q; cx++) {
         double s = 0; int k = 0;
@@ -362,7 +364,7 @@ static void test_pair_loss(void) {
     float *dlg = nn_malloc(n * 4), *dg = nn_malloc(n * 4), *drd = nn_malloc(nq * 4); uint8_t *dlo = nn_malloc(n), *dhi = nn_malloc(n), *dco = nn_malloc(nq); double *dst = nn_malloc(RP_NST * sizeof(double)), s[RP_NST];
     nn_h2d(dlg, lg, n * 4); nn_h2d(dlo, lo, n); nn_h2d(dhi, hi, n); nn_h2d(dco, co, nq);
     for (int shift = 0; shift < 2; shift++) {
-        const restore_pair_w w = {0.01f, 0.1f, 0.3f, shift ? 0.5f : 0.f, 0.7f, shift, 0.f, shift ? 2.f : 0.f, 20.f};
+        const restore_pair_w w = {0.01f, 0.1f, 0.3f, shift ? 0.5f : 0.f, 0.7f, shift, 0.f, shift ? 2.f : 0.f, 20.f, shift ? 3.f : 0.f, {15, 14, -1}};
         const double lr = pair_ref(lg, lo, hi, co, N, &w, gr), lgpu = pair_gpu(dlg, dlo, dhi, dco, N, &w, dg, dst, drd, s);
         CHECK(fabs(lr - lgpu) < 1e-5 * fabs(lr) + 1e-7, "pair loss (shift %d) %g vs double %g", shift, lgpu, lr);
         nn_d2h(g, dg, n * 4);
@@ -428,7 +430,7 @@ static void test_pair_sampler(const char *tmp) {
     snprintf(p, sizeof p, "%s/input.zarr", d); write_stack(p, in, NB * B, B, 128);
     snprintf(p, sizeof p, "%s/target.zarr", d); write_stack(p, tg, NB * T, T, 128);
     snprintf(p, sizeof p, "%s/boxes.json", d); FILE *f = fopen(p, "w");
-    fprintf(f, "{\"input\":{\"um\":9.36,\"box\":%d},\"target\":{\"key\":\"x/y-2.4um-0.2m-77keV.zarr\",\"box\":%d},\"boxes\":[{\"slot\":0,\"split\":\"train\"},{\"slot\":1,\"split\":\"test\"},{\"slot\":2,\"split\":\"train\"}]}\n", B, T); fclose(f);
+    fprintf(f, "{\"input\":{\"um\":9.36,\"box\":%d},\"target\":{\"key\":\"x/y-2.4um-0.2m-77keV.zarr\",\"box\":%d},\"boxes\":[{\"slot\":0,\"origin_level_zyx\":[0,7,9],\"split\":\"train\"},{\"slot\":1,\"origin_level_zyx\":[1000,7,9],\"split\":\"test\"},{\"slot\":2,\"origin_level_zyx\":[2000,7,9],\"split\":\"train\"}]}\n", B, T); fclose(f);
     snprintf(p, sizeof p, "%s/intensity_map.json", d); f = fopen(p, "w"); fprintf(f, "{\"lut\":[");
     for (int v = 0; v < 256; v++) fprintf(f, "%s%.3f", v ? "," : "", 0.5 * v + 20); fprintf(f, "]}\n"); fclose(f);
     char js[600]; snprintf(js, sizeof js, "%s/pairs.json", tmp); f = fopen(js, "w");
@@ -443,7 +445,7 @@ static void test_pair_sampler(const char *tmp) {
         if (!sp) continue;
         for (int k = 0; k < 6; k++) {
             batch *b = sampler_next(sp); CHECK(b != nullptr, "pair batch"); if (!b) break;
-            const int64_t *o = b->corner[0]; const int box = (int)(o[0] / B), oc[3] = {(int)(o[0] % B), (int)o[1], (int)o[2]};
+            const int64_t *o = b->corner[0]; const int box = (int)(o[0] / 1000), oc[3] = {(int)(o[0] % 1000), (int)o[1] - 7, (int)o[2] - 9};   /* corner: the crop's input-grid origin */
             CHECK(val ? box == 1 : box != 1, "%s window from box %d", val ? "validation" : "training", box);
             CHECK(fabs(b->um[0] - 4) < 1e-5 && b->level[0] == 0, "pair batch um (the voxel ratio) %g", b->um[0]);
             size_t bad = 0;

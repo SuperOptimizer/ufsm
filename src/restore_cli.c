@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
@@ -327,6 +328,23 @@ int cmd_restore_stats(int argc, char **argv) {
    sources (src/srpair.h: the "test" boxes, every box of a "val" pair; --all 1: every box) at the full box size through the restore net; per
    pair and pooled: PSNR, SSIM (8^3 blocks) and gradient PSNR (face differences) of the output and of the trilinear x4 input against the
    target (after the pair's intensity map), from nn_restore_pair_loss's metric sums */
+/* codec-seam energy of a T^3 image on the target grid: mean squared face difference across the planes where a codec block boundary of
+   a grid with `per` target voxels per voxel and block origin `org` (that grid's coordinates of target voxel 0's cell, per axis zyx) lies
+   (16-voxel blocks of that grid), and across all other planes; acc[0..3] += boundary sum, boundary count, interior sum, interior count */
+static void seam_acc(const uint8_t *im, const uint8_t *valid, int T, int per, const int64_t org[3], double acc[4]) {
+    const size_t str[3] = {(size_t)T * T, (size_t)T, 1};
+    for (int a = 0; a < 3; a++) for (int f = 1; f < T; f++) {   /* plane pair (f - 1, f) along axis a */
+        const int bnd = f % per == 0 && (org[a] + f / per) % 16 == 0;
+        double s = 0; long n = 0;
+        for (int u = 0; u < T; u++) for (int v = 0; v < T; v++) {
+            const int c0 = a == 0 ? 1 : 0, c1 = a == 2 ? 1 : 2; int idx[3]; idx[a] = f; idx[c0] = u; idx[c1] = v;
+            const size_t i = idx[0] * str[0] + idx[1] * str[1] + idx[2] * str[2], j = i - str[a];
+            if (!valid[i] || !valid[j] || !im[i] || !im[j]) continue;
+            const double d = (double)im[i] - im[j]; s += d * d; n++;
+        }
+        acc[bnd ? 0 : 2] += s; acc[bnd ? 1 : 3] += (double)n;
+    }
+}
 int cmd_restore_eval_pairs(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm restore-eval-pairs <ckpt> <sources.json> [--max 64] [--all 0] [--ema 1] [--gpu 0] [--csv FILE]\n"); return 2; }
     if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
@@ -347,6 +365,15 @@ int cmd_restore_eval_pairs(int argc, char **argv) {
         uint8_t *ht = malloc(t3), *hc = malloc(q3), *dt = nn_malloc(t3), *dc = nn_malloc(q3), *dlow = nn_malloc(t3); void *dx = nn_malloc(t3 * 2 * cfg.cin);
         double *dst = nn_malloc(RP_NST * sizeof(double)); float *rd = nn_malloc(q3 * sizeof(float) + 256);
         double acc[RP_NST] = {0}; int nb = 0;
+        double sm[3][4] = {{0}}, st_[3][4] = {{0}};   /* native-grid seams of [trilinear, SR, target]; target-grid seams (raw-target sets) */
+        json *bj = nullptr; const json *bxs = nullptr; int raw_tg = 0;
+        {   char bp[2100]; snprintf(bp, sizeof bp, "%s/boxes.json", p->dir); FILE *bf = fopen(bp, "rb");
+            if (bf) { fseek(bf, 0, SEEK_END); const long L = ftell(bf); fseek(bf, 0, SEEK_SET); char *tx = malloc(L + 1);
+                      if (fread(tx, 1, L, bf) == (size_t)L) { tx[L] = 0; bj = json_parse(tx, (size_t)L); } free(tx); fclose(bf); }
+            bxs = bj ? json_get(bj, "boxes") : nullptr;
+            raw_tg = bj && !strcmp(json_str(json_get(bj, "source"), ""), "sr-pyrpairs") && !json_get(json_get(bj, "target"), "map");   /* the target is the scan's own raw level 0 */
+        }
+        uint8_t *hl = malloc(t3), *ho = malloc(t3), *hv = malloc(t3); uint8_t *dout8 = nn_malloc(t3);
         const int nlist = all ? p->n : p->nte;
         for (int i = 0; i < nlist && nb < mx; i++) {
             const int k = all ? i : p->te[i]; const int oc[3] = {0, 0, 0};
@@ -358,6 +385,20 @@ int cmd_restore_eval_pairs(int argc, char **argv) {
             const float *lg = unet_forward_x(u, dx, (shape5){1, cfg.cin, T, T, T}, 0, 1);
             nn_restore_pair_loss(lg, unet_logits_h16(u), dlow, dt, p->same ? nullptr : dc, T, T, T, &w, nullptr, 0, nn_get_f16(), 1.f, dst, rd, 1);
             double s[RP_NST]; nn_d2h(s, dst, sizeof s);
+            if (bxs && !p->same) {   /* codec seams: the input grid's 16-voxel blocks (4 target voxels per input voxel), the target's own when raw */
+                const json *bb = nullptr; for (size_t q = 0; q < bxs->n; q++) if ((int)json_num(json_get(json_at(bxs, q), "slot"), -1) == k) { bb = json_at(bxs, q); break; }
+                int64_t oz[3] = {-1, -1, -1};
+                if (bb) { const json *ol = json_get(bb, "origin_level_zyx"), *ox = json_get(bb, "origin_xyz");
+                          if (ol) for (int d = 0; d < 3; d++) oz[d] = (int64_t)json_num(json_at(ol, (size_t)d), -1);
+                          else if (ox) for (int d = 0; d < 3; d++) oz[d] = (int64_t)json_num(json_at(ox, (size_t)(2 - d)), -1); }
+                if (oz[0] >= 0) {
+                    nn_restore_output(lg, unet_logits_h16(u), dlow, dout8, t3); nn_d2h(ho, dout8, t3); nn_d2h(hl, dlow, t3);
+                    for (size_t q = 0; q < t3; q++) hv[q] = ht[q] != 0;
+                    const uint8_t *ims[3] = {hl, ho, ht};
+                    for (int a = 0; a < 3; a++) seam_acc(ims[a], hv, T, 4, oz, sm[a]);
+                    if (raw_tg) { const int64_t o0[3] = {4 * oz[0], 4 * oz[1], 4 * oz[2]}; for (int a = 0; a < 3; a++) seam_acc(ims[a], hv, T, 1, o0, st_[a]); }
+                }
+            }
             for (int c = 0; c < RP_NST; c++) acc[c] += s[c];
             nb++;
         }
@@ -365,6 +406,12 @@ int cmd_restore_eval_pairs(int argc, char **argv) {
         const double ss = acc[13] > 0 ? acc[11] / acc[13] : 0, sb = acc[13] > 0 ? acc[12] / acc[13] : 0;
         printf("%-16s %3d boxes: psnr %.3f (input %.3f, gain %+.3f) ssim %.4f (input %.4f) grad psnr %.3f (input %.3f)\n", S->src[si].name, nb,
                PS(acc[3], acc[0]), PS(acc[4], acc[0]), PS(acc[3], acc[0]) - PS(acc[4], acc[0]), ss, sb, PS(acc[9], acc[5]), PS(acc[10], acc[5]));
+#define SR_(m) ((m)[1] > 0 && (m)[3] > 0 && (m)[2] > 0 ? ((m)[0] / (m)[1]) / ((m)[2] / (m)[3]) : 0.0)
+        if (sm[0][1] > 0) printf("%-16s seams (boundary / interior mean squared step): input-grid blocks trilinear %.3f SR %.3f target %.3f%s", "",
+                                 SR_(sm[0]), SR_(sm[1]), SR_(sm[2]), raw_tg ? "" : "\n");
+        if (raw_tg && st_[0][1] > 0) printf("; target-grid blocks trilinear %.3f SR %.3f target %.3f\n", SR_(st_[0]), SR_(st_[1]), SR_(st_[2]));
+#undef SR_
+        json_free(bj); free(hl); free(ho); free(hv); nn_free(dout8);
         if (cf) fprintf(cf, "%s,%d,%.0f,%.4f,%.4f,%.4f,%.5f,%.5f,%.4f,%.4f\n", S->src[si].name, nb, acc[0], PS(acc[3], acc[0]), PS(acc[4], acc[0]), PS(acc[3], acc[0]) - PS(acc[4], acc[0]), ss, sb, PS(acc[9], acc[5]), PS(acc[10], acc[5]));
         free(ht); free(hc); nn_free(dt); nn_free(dc); nn_free(dlow); nn_free(dx); nn_free(dst); nn_free(rd);
     }
@@ -531,5 +578,60 @@ int cmd_restore_packed(int argc, char **argv) {   /* (--weights FILE --boost K: 
     if (wbox) { FILE *wf = fopen(wout, "w"); if (wf) { fprintf(wf, "{\"what\":\"packed fraction per slot (restore-packed, spacing < %g um)\",\"boost\":%s,\"w\":[", spum, opt(argc, argv, "--boost", "4"));
                 for (int i = 0; i < p->n; i++) fprintf(wf, "%s%.4f", i ? "," : "", wbox[i]); fprintf(wf, "]}\n"); fclose(wf); } free(wbox); }
     json_free(bj); srpair_free(p); free(ht); free(hc); free(hlow); free(hout); free(pk); free(ph);
+    return 0;
+}
+
+/* ufsm restore-slices <ckpt> <pair-dir> --out DIR [--weights FILE (pick the --n held-out boxes with the largest weight, e.g. the packed fraction)]
+     [--n 8] [--lut 1] [--ema 1] [--gpu 0]: per box a JPEG of mid-box cross-sections (z plane on top, y plane below), panels real target |
+   trilinear input | SR output, one grey scale for all three (the real target's 1st / 99th percentiles), names on top */
+#include "imgops.h"
+int cmd_restore_slices(int argc, char **argv) {
+    const char *od = opt(argc, argv, "--out", nullptr);
+    if (argc < 4 || !od) { fprintf(stderr, "usage: ufsm restore-slices <ckpt> <pair-dir> --out DIR [--weights FILE] [--n 8] [--lut 1]\n"); return 2; }
+    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
+    unet_cfg cfg; unet *u = restore_net(argv[2], atoi(opt(argc, argv, "--ema", "1")) != 0, &cfg); if (!u) return 1;
+    srpair *p = srpair_open(argv[3], "val", atoi(opt(argc, argv, "--lut", "1")), 0); if (!p || p->same) return 1;
+    if (cfg.scale_cond) unet_set_cond(u, (float)log2(p->ratio) - 2.f);
+    const int nsel = atoi(opt(argc, argv, "--n", "8")); int *sel = malloc((size_t)p->n * sizeof *sel), ns = 0;
+    const char *wf = opt(argc, argv, "--weights", nullptr);
+    if (wf) {   /* the largest weights first */
+        FILE *f = fopen(wf, "rb"); if (!f) return 1; fseek(f, 0, SEEK_END); const long L = ftell(f); fseek(f, 0, SEEK_SET);
+        char *t = malloc(L + 1); if (fread(t, 1, L, f) != (size_t)L) { fclose(f); return 1; } fclose(f); t[L] = 0;
+        json *j = json_parse(t, (size_t)L); free(t); const json *w = j ? json_get(j, "w") : nullptr; if (!w) return 1;
+        double *wv = malloc((size_t)p->n * sizeof *wv); for (int i = 0; i < p->n; i++) wv[i] = json_num(json_at(w, (size_t)i), 0);
+        for (int i = 0; i < p->nte; i++) sel[i] = p->te[i];   /* held-out boxes only */
+        for (int a = 1; a < p->nte; a++) for (int b = a; b > 0 && wv[sel[b]] > wv[sel[b - 1]]; b--) { const int t2 = sel[b]; sel[b] = sel[b - 1]; sel[b - 1] = t2; }
+        ns = nsel < p->nte ? nsel : p->nte; free(wv); json_free(j);
+    } else for (int i = 0; i < p->nte && ns < nsel; i++) sel[ns++] = p->te[i];
+    mkdir(od, 0755);
+    const int T = p->T, B = p->B; const size_t t3 = (size_t)T * T * T, q3 = (size_t)B * B * B;
+    uint8_t *ht = malloc(t3), *hc = malloc(q3), *hlow = malloc(t3), *hout = malloc(t3);
+    uint8_t *dc = nn_malloc(q3), *dlow = nn_malloc(t3), *dout = nn_malloc(t3); void *dx = nn_malloc(t3 * 2 * cfg.cin);
+    const int PW = 3 * T + 16, PH = 2 * T + 8; uint8_t *rgb = malloc((size_t)PW * PH * 3);
+    for (int s = 0; s < ns; s++) {
+        const int k = sel[s], oc[3] = {0, 0, 0};
+        if (srpair_read(p, k, oc, T, ht, hc)) continue;
+        nn_h2d(dc, hc, q3); const float st4[3] = {4.f, 4.f, 4.f}, ph0[3] = {0.f, 0.f, 0.f};
+        nn_restore_upsample(dc, B, B, B, dlow, T, T, T, st4, ph0, nullptr); nn_d2h(hlow, dlow, t3);
+        nn_restore_input(dlow, dx, t3, cfg.cin == 2, nn_get_f16());
+        const float *lg = unet_forward_x(u, dx, (shape5){1, cfg.cin, T, T, T}, 0, 1);
+        nn_restore_output(lg, unet_logits_h16(u), dlow, dout, t3); nn_d2h(hout, dout, t3);
+        int hist[256] = {0}; long nn_ = 0; for (size_t i = 0; i < t3; i++) if (ht[i]) { hist[ht[i]]++; nn_++; }
+        int lo = 0, hi = 255; long c = 0; for (int v = 0; v < 256; v++) { c += hist[v]; if (c >= nn_ / 100) { lo = v; break; } }
+        c = 0; for (int v = 255; v >= 0; v--) { c += hist[v]; if (c >= nn_ / 100) { hi = v; break; } }
+        if (hi <= lo) hi = lo + 1;
+        memset(rgb, 255, (size_t)PW * PH * 3);
+        const uint8_t *im[3] = {ht, hlow, hout};
+        for (int pnl = 0; pnl < 3; pnl++) for (int row = 0; row < 2; row++) for (int a = 0; a < T; a++) for (int b = 0; b < T; b++) {
+            const size_t i = row == 0 ? ((size_t)(T / 2) * T + a) * T + b : ((size_t)a * T + T / 2) * T + b;
+            const int v = (int)lrint(255.0 * (im[pnl][i] - lo) / (hi - lo)); const uint8_t g = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+            uint8_t *o = rgb + ((size_t)(row * (T + 8) + a) * PW + pnl * (T + 8) + b) * 3; o[0] = o[1] = o[2] = g;
+        }
+        const uint8_t yel[3] = {255, 220, 0}; const char *nm[3] = {"REAL 2.4", "TRILINEAR", "SR"};
+        for (int pnl = 0; pnl < 3; pnl++) img_text_scaled(rgb, PW, PH, pnl * (T + 8) + 4, 4, nm[pnl], 2, yel);
+        char path[2200]; snprintf(path, sizeof path, "%s/box%03d.jpg", od, k); jpeg_write_rgb(path, PW, PH, rgb, 92);
+        fprintf(stderr, "restore-slices: %s\n", path);
+    }
+    free(sel); free(ht); free(hc); free(hlow); free(hout); free(rgb); srpair_free(p);
     return 0;
 }

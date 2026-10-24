@@ -27,12 +27,12 @@ void srpair_free(srpair *p) {
     if (!p) return;
     if (p->tc) for (int k = 0; k < p->n; k++) { free(p->tc[k]); free(p->ic[k]); }
     free(p->tc); free(p->ic);
-    z3_close(p->in); z3_close(p->tg); free(p->tr); free(p->te); free(p->trw); free(p);
+    z3_close(p->in); z3_close(p->tg); free(p->tr); free(p->te); free(p->trw); free(p->org); free(p);
 }
 
 srpair *srpair_open(const char *dir, const char *role, int lut, int cache) {
     srpair *p = calloc(1, sizeof *p);
-    p->role = role && !strcmp(role, "val");
+    p->role = role && !strcmp(role, "val"); snprintf(p->dir, sizeof p->dir, "%s", dir);
     if (role && strcmp(role, "val") && strcmp(role, "train")) { fprintf(stderr, "sr-pair: %s: role \"train\" or \"val\"\n", dir); free(p); return nullptr; }
     json *bj = load_json(dir, "boxes.json"), *ij = lut ? load_json(dir, "intensity_map.json") : nullptr;
     if (!bj || (lut && !ij)) { json_free(bj); json_free(ij); free(p); return nullptr; }
@@ -45,8 +45,12 @@ srpair *srpair_open(const char *dir, const char *role, int lut, int cache) {
     const json *bx = json_get(bj, "boxes");
     p->n = bx ? (int)bx->n : 0;
     p->tr = malloc(((size_t)p->n + 1) * sizeof *p->tr); p->te = malloc(((size_t)p->n + 1) * sizeof *p->te);
+    p->org = malloc(((size_t)p->n + 1) * sizeof *p->org);
+    for (int k = 0; k < p->n; k++) for (int d = 0; d < 3; d++) p->org[k][d] = -1;
     for (int k = 0; k < p->n; k++) {
         const json *b = json_at(bx, (size_t)k);
+        {   const int sl = (int)json_num(json_get(b, "slot"), k); const json *ol = json_get(b, "origin_level_zyx"), *ox = json_get(b, "origin_xyz");
+            if (sl >= 0 && sl < p->n) for (int d = 0; d < 3; d++) p->org[sl][d] = ol ? (int64_t)json_num(json_at(ol, (size_t)d), -1) : ox ? (int64_t)json_num(json_at(ox, (size_t)(2 - d)), -1) : -1; }
         const int slot = (int)json_num(json_get(b, "slot"), k), test = !strcmp(json_str(json_get(b, "split"), "train"), "test");
         if (p->role || test) p->te[p->nte++] = slot; else p->tr[p->ntr++] = slot;
     }

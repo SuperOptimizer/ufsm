@@ -13,6 +13,8 @@ typedef struct srpair {
     z3 *in, *tg;            /* input (native) and target zarr arrays */
     int B, T;               /* input box edge (native voxels) and target box edge (= 4 B); same-grid sets: B == T */
     int same;               /* 1: the input is stored resampled onto the target grid (boxes.json input "grid": "target"; ufsm sr-xpairs --same-grid) */
+    char dir[1024];         /* the pair directory */
+    int64_t (*org)[3];      /* per slot: the box origin on the input scan's grid (zyx; boxes.json origin_level_zyx or origin_xyz), -1 unknown */
     double ratio;           /* input / target voxel size (4 for the coarse-box sets; boxes.json "ratio" for same-grid sets) */
     int n;                  /* boxes */
     int role;               /* 0 train, 1 val */

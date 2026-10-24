@@ -1759,7 +1759,7 @@ static int draw_restore_pair(sampler *sp, batch *b, int i, rng *r, uint8_t *big)
     free(co);
     memset(b->w + (size_t)i * NCH, 0, NCH); b->w[(size_t)i * NCH] = 1;
     b->src[i] = (int16_t)si; b->level[i] = (int8_t)p->same; b->um[i] = (float)p->ratio;   /* restore pairs: level = same-grid flag, um = the voxel-size ratio */
-    b->corner[i][0] = (int64_t)k * p->B + oc[0]; b->corner[i][1] = oc[1]; b->corner[i][2] = oc[2];
+    for (int d = 0; d < 3; d++) b->corner[i][d] = p->org && p->org[k][d] >= 0 ? p->org[k][d] + (p->same ? 0 : oc[d]) : -1;   /* restore pairs: the crop's input-grid origin (codec block phase) */
     atomic_fetch_add(&sp->produced, 1);
     return 0;
 }
