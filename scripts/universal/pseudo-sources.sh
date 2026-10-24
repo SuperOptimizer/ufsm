@@ -4,9 +4,9 @@
 #   - each box's scan resolved against the U0 sources (same scan: root / ct group / level / scanprep norm), codes.root re-rooted under PSDIR
 #   - boxes with < MINPCT % labelled dropped; boxes touching a holdout of their U0 scan dropped (the GT eval boxes stay clean)
 #   - weights by labelled fraction; the pseudo group's total = PW x GTW (GTW: the real GT sources' total weight)
-#   CS: sources (default gate 0.5,0.1,0.3) or sources2 (the loose 0.3,0.15,0.3 set)
+#   CS: sources2 (default: the loose 0.3,0.15,0.3 gate; on 0139 its per-128^3 accuracy vs the GT equals the strict gate's, 0.836 vs 0.832) or sources (0.5,0.1,0.3)
 set -eu
-PS=${1:?pseudo dir}; U0=${2:?u0 sources json}; GTW=${3:?real GT total weight}; MINPCT=${MINPCT:-2}; PW=${PW:-1}; CS=${CS:-sources}
+PS=${1:?pseudo dir}; U0=${2:?u0 sources json}; GTW=${3:?real GT total weight}; MINPCT=${MINPCT:-2}; PW=${PW:-1}; CS=${CS:-sources2}
 PS=$(cd $PS && pwd)
 cat $PS/*/$CS.json | jq -s --arg ps "$PS" --argjson minp $MINPCT --argjson pw $PW --argjson gtw $GTW --slurpfile u0 $U0 '
   def isect($a; $b): all(range(3); $a[.] < $b[.] + $b[. + 3] and $b[.] < $a[.] + $a[. + 3]);
