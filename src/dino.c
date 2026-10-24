@@ -865,7 +865,7 @@ typedef struct {
     /* --ssl-distill W: dense cosine distillation of dinovol's unit 64-d sheet (object) embedding at the mapped points into head channels
        dch..dch+63 (student: the cell centres of each global; target: dinovol on the partner's un-augmented global at the same physical point);
        --ssl-distill-abs A scales that per-point term, --ssl-distill-rel W adds W x the crop's similarity-matrix match (ss_relsim: rotation-free) */
-    float dist; int dch, dnd; float *dcrd, *dacc, *dth, *dse, *dsn, *dge, *dch_h, *dacch; double dist_l; long dist_n; float drel, dabs; double rel_l; long rel_n; float dnce, dthr, dtau; int dnm; double nce_l, nce_pf; long nce_n; double zn_s, zsim_s; long zn_n; float dcc; int dccmin; double cc_l, cc_keep, cc_nc, cc_pos; long cc_n; int dstr, dnp, *ddp, *ddph; float *dtd; double dtm; long dtmn;   /* (dense mode: --ssl-distill-stride S grid points of every global, its own crop) */
+    float dist; int dch, dnd; float *dcrd, *dacc, *dth, *dse, *dsn, *dge, *dch_h, *dacch; double dist_l; long dist_n; float drel, dabs; double rel_l; long rel_n; float dnce, dthr, dtau; int dnm; double nce_l, nce_pf; long nce_n; double zn_s, zsim_s; long zn_n; float dcc; int dccmin, dkm, dksplit; double cc_l, cc_keep, cc_nc, cc_pos, cc_big, cc_skip; long cc_n, cc_v; int dstr, dnp, *ddp, *ddph; float *dtd; double dtm; long dtmn;   /* (dense mode: --ssl-distill-stride S grid points of every global, its own crop) */
     int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -945,7 +945,8 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         Q->dist = (float)atof(opt(argc, argv, "--ssl-distill", "0")); Q->dch = atoi(opt(argc, argv, "--ssl-distill-ch", "0"));
         Q->drel = (float)atof(opt(argc, argv, "--ssl-distill-rel", "0")); Q->dabs = (float)atof(opt(argc, argv, "--ssl-distill-abs", "1"));
         Q->dnce = (float)atof(opt(argc, argv, "--ssl-distill-nce", "0")); Q->dthr = (float)atof(opt(argc, argv, "--ssl-distill-thr", "0.5"));   /* (teacher-graph SupCon: positives = dinovol cos > thr) */
-        Q->dcc = (float)atof(opt(argc, argv, "--ssl-distill-cc", "0")); Q->dccmin = atoi(opt(argc, argv, "--ssl-distill-ccmin", "8"));   /* (pseudo sheet labels: connected components of the dinovol cosine graph -> GT SupCon) */
+        Q->dcc = (float)atof(opt(argc, argv, "--ssl-distill-cc", "0")); Q->dccmin = atoi(opt(argc, argv, "--ssl-distill-ccmin", "8"));
+        Q->dkm = atoi(opt(argc, argv, "--ssl-distill-kmeans", "0")); Q->dksplit = atoi(opt(argc, argv, "--ssl-distill-ksplit", "0"));   /* (labels = spherical k-means of the codes per view (K clusters), optionally split into spatial components) */   /* (pseudo sheet labels: connected components of the dinovol cosine graph -> GT SupCon) */
         Q->dtau = (float)atof(opt(argc, argv, "--ssl-distill-tau", "0.1")); Q->dnm = atoi(opt(argc, argv, "--ssl-distill-m", "512"));
         Q->dstr = atoi(opt(argc, argv, "--ssl-distill-stride", "0"));   /* 0: the iBOT rows (cross-view); S: dense, every S-th voxel per axis of each global (own crop) */   /* (relational: crop-local similarity matrices; abs: the per-point cosine) */
         if (!(Q->dv = dv_load(dvck)) || (Q->dist <= 0 && dv_head_host(dvck, "ibot_head", &Q->DVH, &dvPh))) return 1;
@@ -1511,14 +1512,41 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
                 const int g_ = Q->PG / Q->dstr; int *par = malloc((size_t)NP * 4), *sz = calloc((size_t)NP, 4), *cid = malloc((size_t)NP * 4), *kp = malloc((size_t)NP * 4);
                 for (int k = 0; k < NP; k++) par[k] = k;
                 #define UF_FIND(x_) ({ int r_ = (x_); while (par[r_] != r_) { par[r_] = par[par[r_]]; r_ = par[r_]; } r_; })
-                for (int k = 0; k < NP; k++) { const int z = k / (g_ * g_), y = k / g_ % g_, x_ = k % g_; const int nb[3] = {z + 1 < g_ ? k + g_ * g_ : -1, y + 1 < g_ ? k + g_ : -1, x_ + 1 < g_ ? k + 1 : -1};
-                    for (int q = 0; q < 3; q++) { if (nb[q] < 0) continue; double d = 0; for (int e = 0; e < nd; e++) d += (double)th[(size_t)k * nd + e] * th[(size_t)nb[q] * nd + e];
-                        if (d > Q->dthr) { const int ra = UF_FIND(k), rb = UF_FIND(nb[q]); if (ra != rb) par[ra] = rb; } } }
+                int *km = nullptr;
+                if (Q->dkm > 0) {   /* spherical k-means (k-means++ seeds, 8 Lloyd iterations) on <= 4096 points, then every point to its nearest centre */
+                    const int K = Q->dkm, ns = NP < 4096 ? NP : 4096, sst = NP / ns; float *cen = malloc((size_t)K * nd * 4), *dmin = malloc((size_t)ns * 4); double *acc = malloc((size_t)K * nd * 8); int *cnt = malloc((size_t)K * 4);
+                    km = malloc((size_t)NP * 4);
+                    #define KP(i_) (th + (size_t)(i_) * sst * nd)
+                    memcpy(cen, KP(rng_next(&Q->ar) % (uint64_t)ns), (size_t)nd * 4);
+                    for (int i = 0; i < ns; i++) dmin[i] = 1e30f;
+                    for (int c = 1; c < K; c++) { double tot = 0;
+                        for (int i = 0; i < ns; i++) { double d = 0; for (int e = 0; e < nd; e++) d += (double)KP(i)[e] * cen[(size_t)(c - 1) * nd + e]; const float dd = (float)(1 - d); if (dd < dmin[i]) dmin[i] = dd; tot += dmin[i] > 0 ? dmin[i] * dmin[i] : 0; }
+                        double r = rng_u(&Q->ar) * tot; int pick = ns - 1; for (int i = 0; i < ns; i++) { r -= dmin[i] > 0 ? dmin[i] * dmin[i] : 0; if (r <= 0) { pick = i; break; } }
+                        memcpy(cen + (size_t)c * nd, KP(pick), (size_t)nd * 4); }
+                    for (int it = 0; it < 9; it++) {
+                        const int last = it == 8, n_ = last ? NP : ns; if (!last) { memset(acc, 0, (size_t)K * nd * 8); memset(cnt, 0, (size_t)K * 4); }
+                        for (int i = 0; i < n_; i++) { const float *t_ = last ? th + (size_t)i * nd : KP(i); int bc = 0; double bd = -2;
+                            for (int c = 0; c < K; c++) { double d = 0; for (int e = 0; e < nd; e++) d += (double)t_[e] * cen[(size_t)c * nd + e]; if (d > bd) { bd = d; bc = c; } }
+                            if (last) km[i] = bc; else { cnt[bc]++; for (int e = 0; e < nd; e++) acc[(size_t)bc * nd + e] += t_[e]; } }
+                        if (!last) for (int c = 0; c < K; c++) { if (!cnt[c]) continue; double n2 = 0; for (int e = 0; e < nd; e++) n2 += acc[(size_t)c * nd + e] * acc[(size_t)c * nd + e]; n2 = sqrt(n2) + 1e-12;
+                            for (int e = 0; e < nd; e++) cen[(size_t)c * nd + e] = (float)(acc[(size_t)c * nd + e] / n2); }
+                    }
+                    #undef KP
+                    free(cen); free(dmin); free(acc); free(cnt);
+                    if (!Q->dksplit) { int rep[256]; for (int c = 0; c < 256; c++) rep[c] = -1; for (int k = 0; k < NP; k++) { const int c = km[k] & 255; if (rep[c] < 0) rep[c] = k; par[k] = rep[c]; } }
+                }
+                if (Q->dkm <= 0 || Q->dksplit) for (int k = 0; k < NP; k++) { const int z = k / (g_ * g_), y = k / g_ % g_, x_ = k % g_; const int nb[3] = {z + 1 < g_ ? k + g_ * g_ : -1, y + 1 < g_ ? k + g_ : -1, x_ + 1 < g_ ? k + 1 : -1};
+                    for (int q = 0; q < 3; q++) { if (nb[q] < 0) continue; int join;
+                        if (km) join = km[k] == km[nb[q]];
+                        else { double d = 0; for (int e = 0; e < nd; e++) d += (double)th[(size_t)k * nd + e] * th[(size_t)nb[q] * nd + e]; join = d > Q->dthr; }
+                        if (join) { const int ra = UF_FIND(k), rb = UF_FIND(nb[q]); if (ra != rb) par[ra] = rb; } } }
+                free(km);
                 for (int k = 0; k < NP; k++) sz[UF_FIND(k)]++;
                 int nk = 0, nc = 0; for (int k = 0; k < NP; k++) cid[k] = -1;
                 for (int k = 0; k < NP; k++) { const int r_ = UF_FIND(k); if (sz[r_] < Q->dccmin) continue; if (cid[r_] < 0) cid[r_] = nc++; kp[nk++] = k; }
                 #undef UF_FIND
                 const int mr = nk < Q->dnm ? nk : Q->dnm;
+                { int big = 0; for (int k = 0; k < NP; k++) if (par[k] == k && sz[k] > big) big = sz[k]; Q->cc_big += (double)big / NP; Q->cc_skip += !(mr >= 16 && nc >= 2); Q->cc_v++; Q->cc_keep += (double)nk / NP; Q->cc_nc += nc; }
                 if (mr >= 16 && nc >= 2) {
                     for (int k = 0; k < mr; k++) { const int o_ = k + (int)(rng_next(&Q->ar) % (uint64_t)(nk - k)), t_ = kp[k]; kp[k] = kp[o_]; kp[o_] = t_; }   /* (m distinct points) */
                     static float *es_d, *ga_d, *scr_d, *out_d, *gah; static int *code_d, *xyz_d, *codeh, *xyzh, cap; float *esh = malloc((size_t)mr * nd * 4);
@@ -1533,7 +1561,7 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
                     const float sc = Q->dist * Q->dcc / (float)(2 * N);
                     for (int k = 0; k < mr; k++) for (int e = 0; e < nd; e++) gh[(size_t)kp[k] * nd + e] += sc * gah[(size_t)k * nd + e];
                     long np_ = 0; for (int a = 0; a < mr; a++) for (int b = 0; b < mr; b++) np_ += a != b && codeh[a] == codeh[b];
-                    Q->cc_l += oh[0]; Q->cc_keep += (double)nk / NP; Q->cc_nc += nc; Q->cc_pos += (double)np_ / ((double)mr * (mr - 1)); Q->cc_n++; free(esh);
+                    Q->cc_l += oh[0]; Q->cc_pos += (double)np_ / ((double)mr * (mr - 1)); Q->cc_n++; free(esh);
                 }
                 free(par); free(sz); free(cid); free(kp);
             }
@@ -1621,8 +1649,9 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             if (Q->dist_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill 1-cos %.4f", Q->dist_l / Q->dist_n); Q->dist_l = 0; Q->dist_n = 0; l5 = strlen(line); }
             if (Q->dtmn) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | |mean target| %.3f", Q->dtm / Q->dtmn); Q->dtm = 0; Q->dtmn = 0; l5 = strlen(line); }
             if (Q->zn_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | emb |z| %.4g cos %.3f", Q->zn_s / Q->zn_n, Q->zsim_s / Q->zn_n); Q->zn_s = Q->zsim_s = 0; Q->zn_n = 0; l5 = strlen(line); }
-            if (Q->cc_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill cc supcon %.4f (%.1f comps, %.2f of points kept, pos %.3f)", Q->cc_l / Q->cc_n, Q->cc_nc / Q->cc_n, Q->cc_keep / Q->cc_n, Q->cc_pos / Q->cc_n);
-                Q->cc_l = Q->cc_keep = Q->cc_nc = Q->cc_pos = 0; Q->cc_n = 0; l5 = strlen(line); }
+            if (Q->cc_v) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill cc supcon %.4f (%.1f comps, %.2f of points kept, largest %.2f, pos %.3f, skipped %.2f)", Q->cc_n ? Q->cc_l / Q->cc_n : 0.0,
+                Q->cc_nc / Q->cc_v, Q->cc_keep / Q->cc_v, Q->cc_big / Q->cc_v, Q->cc_n ? Q->cc_pos / Q->cc_n : 0.0, Q->cc_skip / Q->cc_v);
+                Q->cc_l = Q->cc_keep = Q->cc_nc = Q->cc_pos = Q->cc_big = Q->cc_skip = 0; Q->cc_n = Q->cc_v = 0; l5 = strlen(line); }
             if (Q->nce_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill nce %.4f pos %.3f", Q->nce_l / Q->nce_n, Q->nce_pf / Q->nce_n); Q->nce_l = 0; Q->nce_pf = 0; Q->nce_n = 0; l5 = strlen(line); }
             if (Q->rel_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill rel %.4f", Q->rel_l / Q->rel_n); Q->rel_l = 0; Q->rel_n = 0; l5 = strlen(line); }
             if (Q->sig_n) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | sigreg %.4f", Q->sig_l / Q->sig_n); Q->sig_l = 0; Q->sig_n = 0; l5 = strlen(line); }
