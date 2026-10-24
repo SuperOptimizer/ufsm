@@ -12,6 +12,32 @@
 static unsigned nbk(long long n, int t) { return (unsigned)((n + t - 1) / t); }
 static const float LOG2E = 1.4426950408889634f;
 
+/* ---- profiling (env UFSM_ATTN_PROF=1): cudaEvent time per phase of the blocks (synchronising: for measurement only), summed per
+   label with the phase's FLOP / byte counts; at_prof_report prints the table (also at exit), at_prof_reset clears it ---- */
+typedef struct { const char *nm; double ms, fl, by; long n; } atpr;
+static atpr g_pr[64]; static int g_npr = 0; static cudaEvent_t g_pe[2];
+extern "C" void at_prof_report(FILE *f) {
+    double tot = 0; for (int i = 0; i < g_npr; i++) tot += g_pr[i].ms;
+    if (!g_npr || tot <= 0) return;
+    fprintf(f, "attention-stage profile (%.1f ms total)\n  %-14s %9s %6s %6s %8s %8s\n", tot, "phase", "ms", "%", "calls", "TFLOP/s", "GB/s");
+    for (int i = 0; i < g_npr; i++) { const atpr *p = &g_pr[i];
+        fprintf(f, "  %-14s %9.2f %6.1f %6ld %8.1f %8.0f\n", p->nm, p->ms, 100 * p->ms / tot, p->n, p->fl / (p->ms * 1e9), p->by / (p->ms * 1e6)); }
+}
+extern "C" void at_prof_reset(void) { g_npr = 0; }
+static void prof_exit(void) { at_prof_report(stderr); }
+static int prof_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("UFSM_ATTN_PROF"); v = e && atoi(e); if (v) { cudaEventCreate(&g_pe[0]); cudaEventCreate(&g_pe[1]); atexit(prof_exit); } }
+    return v;
+}
+static void pr_add(const char *nm, double ms, double fl, double by) {
+    int i = 0; while (i < g_npr && strcmp(g_pr[i].nm, nm)) i++;
+    if (i == g_npr) { if (g_npr == 64) return; g_pr[g_npr++] = (atpr){nm, 0, 0, 0, 0}; }
+    g_pr[i].ms += ms; g_pr[i].fl += fl; g_pr[i].by += by; g_pr[i].n++;
+}
+#define PR(nm, fl, by, ...) do { if (!prof_on()) { __VA_ARGS__; } else { cudaEventRecord(g_pe[0], 0); __VA_ARGS__; cudaEventRecord(g_pe[1], 0); cudaEventSynchronize(g_pe[1]); \
+    float ms_ = 0; cudaEventElapsedTime(&ms_, g_pe[0], g_pe[1]); pr_add(nm, ms_, (double)(fl), (double)(by)); } } while (0)
+
 /* ---- GEMM: row-major C[M][N] = op(A) op(B) + beta C; A [M][K] (ta 0) or [K][M] (ta 1); B [K][N] (tb 0) or [N][K] (tb 1).
    cuBLASLt is column-major: C^T (N x M) = op(B)^T op(A)^T, so B is its first operand and A its second ---- */
 typedef struct { int M, N, K, ta, tb; cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; int ok; } atplan;
@@ -48,6 +74,10 @@ static atplan *at_plan(int M, int N, int K, int ta, int tb) {
     return p;
 }
 static int g_at_mx = -1;   /* the linear layers' GEMM precision: 0 fp32 (cuBLASLt), 4 / 8 MX-fp4 / MX-fp8 (lp_mx_gemm); env UFSM_LINEAR_MX */
+static int g_at_core = -1;   /* the attention core: 0 fp32 CUDA cores, 1 fp16 tensor cores (src/nn_attn_tc.cu; the default), 2 MX-fp8 (src/lp_attn8.cu);
+                                env UFSM_ATTN_CORE */
+extern "C" void at_set_core(int c) { g_at_core = c; }
+extern "C" int at_get_core(void) { if (g_at_core < 0) { const char *e = getenv("UFSM_ATTN_CORE"); g_at_core = e ? atoi(e) : 1; } return g_at_core; }
 extern "C" void at_set_mx(int bits) { g_at_mx = bits; }
 extern "C" int at_get_mx(void) { if (g_at_mx < 0) { const char *e = getenv("UFSM_LINEAR_MX"); g_at_mx = e ? atoi(e) : 0; } return g_at_mx; }
 extern "C" int at_gemm_f32(int ta, int tb, int M, int N, int K, const float *A, const float *B, float *Cm, float beta);
@@ -73,15 +103,23 @@ __global__ void k_add_bias(float *y, const float *b, long long T, int N) {
     if (i < T * N) y[i] += b[i % N];
 }
 static void add_bias(float *y, const float *b, long long T, int N) { k_add_bias<<<nbk(T * N, 256), 256>>>(y, b, T, N); }
-/* db[c] += sum over rows of dy[r][c]: blocks of 256 columns x 256 rows */
+extern "C" int at_gemm_ex(int ta, int tb, int M, int N, int K, const float *A, const float *B, float *Cm, float beta, const float *bias, const float *res) {
+    const int mx = at_get_mx();
+    if ((mx == 4 || mx == 8) && M > 0 && N > 0 && K > 0) return lp_mx_gemm_ex(mx, ta, tb, M, N, K, A, B, Cm, beta, bias, res);
+    if (res) { if (beta != 0.f) return -1; if (res != Cm) cudaMemcpyAsync(Cm, res, (size_t)M * N * 4, cudaMemcpyDeviceToDevice, 0); beta = 1.f; }
+    if (at_gemm(ta, tb, M, N, K, A, B, Cm, beta)) return -1;
+    if (bias) add_bias(Cm, bias, M, N);
+    return 0;
+}
+/* db[c] += sum over rows of dy[r][c]: blocks of 256 columns x 32 rows */
 __global__ void k_colsum(const float *dy, long long T, int N, float *db) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x; const long long r0 = (long long)blockIdx.y * 256;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x; const long long r0 = (long long)blockIdx.y * 32;
     if (c >= N) return;
-    float s = 0.f; const long long r1 = r0 + 256 < T ? r0 + 256 : T;
+    float s = 0.f; const long long r1 = r0 + 32 < T ? r0 + 32 : T;
     for (long long r = r0; r < r1; r++) s += dy[r * N + c];
     atomicAdd(db + c, s);
 }
-static void colsum(const float *dy, long long T, int N, float *db) { dim3 g(nbk(N, 256), nbk(T, 256)); k_colsum<<<g, 256>>>(dy, T, N, db); }
+static void colsum(const float *dy, long long T, int N, float *db) { dim3 g(nbk(N, 256), nbk(T, 32)); k_colsum<<<g, 256>>>(dy, T, N, db); }
 
 /* LayerNorm over C per row: one warp per row */
 __global__ void k_ln_fwd(const float *x, const float *g, const float *b, float *y, float *mean, float *rstd, long long T, int C) {
@@ -101,30 +139,51 @@ __global__ void k_ln_fwd(const float *x, const float *g, const float *b, float *
 extern "C" void at_ln_fwd(const float *x, const float *g, const float *b, float *y, float *mean, float *rstd, long T, int C) {
     k_ln_fwd<<<nbk((long long)T * 32, 256), 256>>>(x, g, b, y, mean, rstd, T, C);
 }
-/* dx (= or +=) rstd (dy g - mean(dy g) - xhat mean(dy g xhat)); dg += sum dy xhat, db += sum dy (per-block partials in shared memory) */
-#define LNB_ROWS 64
-__global__ void k_ln_bwd(const float *x, const float *g, const float *mean, const float *rstd, const float *dy, float *dx, float *dg, float *db, long long T, int C, int acc) {
-    extern __shared__ float sh[];   /* [2][C] */
-    for (int c = threadIdx.x; c < 2 * C; c += blockDim.x) sh[c] = 0.f;
+/* dx (= or +=) rstd (dy g - mean(dy g) - xhat mean(dy g xhat)); dg += sum dy xhat, db += sum dy. A warp per row (lane: columns
+   lane + 32 k, the row in registers), LNB_ROWS rows per block; the gain / bias partials in registers per lane, then shared memory, one
+   global atomic per (block, column). NC = ceil(C / 32) */
+#define LNB_ROWS 32
+template <int NC>
+__global__ void __launch_bounds__(256) k_ln_bwd(const float *__restrict__ x, const float *__restrict__ g, const float *__restrict__ mean, const float *__restrict__ rstd,
+                                                const float *__restrict__ dy, float *dx, float *dg, float *db, long long T, int C, int acc) {
+    __shared__ float sh[2][NC * 32];
+    for (int c = threadIdx.x; c < 2 * NC * 32; c += blockDim.x) (&sh[0][0])[c] = 0.f;
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
     const long long r0 = (long long)blockIdx.x * LNB_ROWS;
+    float ag[NC], ab[NC], gg[NC];
+#pragma unroll
+    for (int k = 0; k < NC; k++) { ag[k] = 0.f; ab[k] = 0.f; gg[k] = lane + 32 * k < C ? g[lane + 32 * k] : 0.f; }
     for (long long row = r0 + warp; row < r0 + LNB_ROWS && row < T; row += nw) {
         const float m = mean[row], r = rstd[row]; const float *xr = x + row * C, *gr = dy + row * C;
-        float a = 0.f, bb = 0.f;
-        for (int c = lane; c < C; c += 32) { const float xh = (xr[c] - m) * r, gy = gr[c] * g[c]; a += gy; bb += gy * xh; atomicAdd(sh + c, gr[c] * xh); atomicAdd(sh + C + c, gr[c]); }
+        float xh[NC], gy[NC], a = 0.f, bb = 0.f;
+#pragma unroll
+        for (int k = 0; k < NC; k++) {
+            const int c = lane + 32 * k; const bool in = c < C;
+            xh[k] = in ? (xr[c] - m) * r : 0.f; gy[k] = in ? gr[c] : 0.f;
+            const float gyg = gy[k] * gg[k]; a += gyg; bb += gyg * xh[k]; ag[k] += gy[k] * xh[k]; ab[k] += gy[k];
+        }
         for (int o = 16; o; o >>= 1) { a += __shfl_xor_sync(0xffffffffu, a, o); bb += __shfl_xor_sync(0xffffffffu, bb, o); }
         a /= C; bb /= C;
-        for (int c = lane; c < C; c += 32) {
-            const float xh = (xr[c] - m) * r, v = r * (gr[c] * g[c] - a - xh * bb);
+#pragma unroll
+        for (int k = 0; k < NC; k++) {
+            const int c = lane + 32 * k; if (c >= C) continue;
+            const float v = r * (gy[k] * gg[k] - a - xh[k] * bb);
             if (acc) dx[row * C + c] += v; else dx[row * C + c] = v;
         }
     }
+#pragma unroll
+    for (int k = 0; k < NC; k++) if (lane + 32 * k < C) { atomicAdd(&sh[0][lane + 32 * k], ag[k]); atomicAdd(&sh[1][lane + 32 * k], ab[k]); }
     __syncthreads();
-    for (int c = threadIdx.x; c < C; c += blockDim.x) { atomicAdd(dg + c, sh[c]); atomicAdd(db + c, sh[C + c]); }
+    for (int c = threadIdx.x; c < C; c += blockDim.x) { atomicAdd(dg + c, sh[0][c]); atomicAdd(db + c, sh[1][c]); }
 }
 extern "C" void at_ln_bwd(const float *x, const float *g, const float *mean, const float *rstd, const float *dy, float *dx, float *dg, float *db, long T, int C, int acc) {
-    k_ln_bwd<<<nbk(T, LNB_ROWS), 256, 2 * C * 4>>>(x, g, mean, rstd, dy, dx, dg, db, T, C, acc);
+    const unsigned nb = nbk(T, LNB_ROWS);
+    if (C <= 128) k_ln_bwd<4><<<nb, 256>>>(x, g, mean, rstd, dy, dx, dg, db, T, C, acc);
+    else if (C <= 256) k_ln_bwd<8><<<nb, 256>>>(x, g, mean, rstd, dy, dx, dg, db, T, C, acc);
+    else if (C <= 512) k_ln_bwd<16><<<nb, 256>>>(x, g, mean, rstd, dy, dx, dg, db, T, C, acc);
+    else if (C <= 1024) k_ln_bwd<32><<<nb, 256>>>(x, g, mean, rstd, dy, dx, dg, db, T, C, acc);
+    else { fprintf(stderr, "at_ln_bwd: width %d > 1024\n", C); abort(); }
 }
 
 /* QK-norm: q and k of each head scaled to unit RMS over its 48 dims, times a gain per channel; v copied. One thread per (token, head) */
@@ -149,38 +208,37 @@ __global__ void k_qkn_fwd(const float *qkv, const float *qg, const float *kg, fl
 extern "C" void at_qknorm_fwd(const float *qkv, const float *qg, const float *kg, float *qkn, float *rq, float *rk, long T, int C) {
     k_qkn_fwd<<<nbk((long long)T * (C / HD), 128), 128>>>(qkv, qg, kg, qkn, rq, rk, T, C);
 }
-/* dx_d = r g_d dy_d - x_d r^3 / 48 sum_e g_e dy_e x_e (q and k); v passes through */
+/* dx_d = r g_d dy_d - x_d r^3 / 48 sum_e g_e dy_e x_e (q and k); v passes through. One warp per (token, head, q / k / v): lanes over
+   dims d = lane, lane + 32 (< 48) */
 __global__ void k_qkn_bwd(const float *qkv, const float *qg, const float *kg, const float *rq, const float *rk, const float *dqkn, float *dqkv, long long T, int C) {
-    const int H = C / HD; const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-    if (i >= T * H) return;
-    const long long t = i / H; const int h = (int)(i % H);
-    for (int p = 0; p < 2; p++) {
-        const long long o = t * 3 * C + p * C + h * HD; const float *gs = (p ? kg : qg) + h * HD; const float r = (p ? rk : rq)[i];
-        float s = 0.f;
-#pragma unroll
-        for (int d = 0; d < HD; d++) s += gs[d] * dqkn[o + d] * qkv[o + d];
-        const float k3 = r * r * r * s / HD;
-#pragma unroll
-        for (int d = 0; d < HD; d++) dqkv[o + d] = r * gs[d] * dqkn[o + d] - qkv[o + d] * k3;
-    }
-    const long long o = t * 3 * C + 2 * C + h * HD;
-#pragma unroll
-    for (int d = 0; d < HD; d++) dqkv[o + d] = dqkn[o + d];
+    const int H = C / HD; const long long w = (blockIdx.x * (long long)blockDim.x + threadIdx.x) >> 5; const int lane = threadIdx.x & 31;
+    if (w >= T * H * 3) return;
+    const int p = (int)(w % 3); const long long th = w / 3; const int h = (int)(th % H); const long long t = th / H;
+    const long long o = t * 3 * C + p * C + h * HD; const bool two = lane < HD - 32;
+    const float d0 = dqkn[o + lane], d1 = two ? dqkn[o + lane + 32] : 0.f;
+    if (p == 2) { dqkv[o + lane] = d0; if (two) dqkv[o + lane + 32] = d1; return; }
+    const float *gs = (p ? kg : qg) + h * HD; const float r = (p ? rk : rq)[th];
+    const float x0 = qkv[o + lane], x1 = two ? qkv[o + lane + 32] : 0.f, g0 = gs[lane], g1 = two ? gs[lane + 32] : 0.f;
+    float s = g0 * d0 * x0 + g1 * d1 * x1;
+    for (int k = 16; k; k >>= 1) s += __shfl_xor_sync(0xffffffffu, s, k);
+    const float k3 = r * r * r * s / HD;
+    dqkv[o + lane] = r * g0 * d0 - x0 * k3; if (two) dqkv[o + lane + 32] = r * g1 * d1 - x1 * k3;
 }
-/* gain gradients: dg[c] += sum_t dy[t][c] x[t][c] r[t][head(c)], c over q (p 0) and k (p 1) channels; block per channel */
+/* gain gradients: dg[c] += sum_t dy[t][c] x[t][c] r[t][head(c)], c over the q (p 0) and k (p 1) channels: blocks of 64 tokens, threads
+   over the 2C channels (coalesced rows), one atomic per (block, channel) */
+#define QDG_ROWS 16
 __global__ void k_qkn_dg(const float *qkv, const float *rq, const float *rk, const float *dqkn, float *dqg, float *dkg, long long T, int C) {
-    const int c = blockIdx.x % C, p = blockIdx.x / C, H = C / HD, h = c / HD;
-    const float *r = p ? rk : rq;
-    float s = 0.f;
-    for (long long t = threadIdx.x; t < T; t += blockDim.x) { const long long o = t * 3 * C + p * C + c; s += dqkn[o] * qkv[o] * r[t * H + h]; }
-    __shared__ float red[256];
-    red[threadIdx.x] = s; __syncthreads();
-    for (int k = blockDim.x / 2; k; k >>= 1) { if (threadIdx.x < k) red[threadIdx.x] += red[threadIdx.x + k]; __syncthreads(); }
-    if (!threadIdx.x) atomicAdd((p ? dkg : dqg) + c, red[0]);
+    const int H = C / HD; const long long t0 = (long long)blockIdx.x * QDG_ROWS, t1 = t0 + QDG_ROWS < T ? t0 + QDG_ROWS : T;
+    for (int c2 = threadIdx.x; c2 < 2 * C; c2 += blockDim.x) {
+        const int p = c2 / C, c = c2 % C, h = c / HD; const float *r = p ? rk : rq;
+        float s = 0.f;
+        for (long long t = t0; t < t1; t++) { const long long o = t * 3 * C + c2; s += dqkn[o] * qkv[o] * r[t * H + h]; }
+        atomicAdd((p ? dkg : dqg) + c, s);
+    }
 }
 extern "C" void at_qknorm_bwd(const float *qkv, const float *qg, const float *kg, const float *rq, const float *rk, const float *dqkn, float *dqkv, float *dqg, float *dkg, long T, int C) {
-    k_qkn_bwd<<<nbk((long long)T * (C / HD), 128), 128>>>(qkv, qg, kg, rq, rk, dqkn, dqkv, T, C);
-    k_qkn_dg<<<2 * C, 256>>>(qkv, rq, rk, dqkn, dqg, dkg, T, C);
+    k_qkn_bwd<<<nbk((long long)T * (C / HD) * 3 * 32, 256), 256>>>(qkv, qg, kg, rq, rk, dqkn, dqkv, T, C);
+    k_qkn_dg<<<nbk(T, QDG_ROWS), 256>>>(qkv, rq, rk, dqkn, dqg, dkg, T, C);
 }
 
 /* axial 3D RoPE on the grid tokens: head dims [16 a, 16 a + 16) rotate with the token's coordinate along axis a (z, y, x) in 8
@@ -382,62 +440,88 @@ extern "C" size_t at_block_layout(const at_dims *d, at_bp *bp, size_t off) {
     return off;
 }
 static size_t al(size_t n) { return (n + 63) & ~(size_t)63; }   /* floats, 256-byte aligned pieces */
-extern "C" size_t at_ws_bytes(const at_dims *d, long T) {
+/* the forward part (what the backward reads; kept per block through at_ws_set_fwd) from fb, the backward scratch from bb; either may
+   be nullptr (sizing only); returns the floats of part (0 forward, 1 backward) */
+static size_t ws_walk(at_ws *w, const at_dims *d, long T, float *fb, float *bb, int part) {
     const size_t C = d->C, F = d->F, H = d->H, t = (size_t)T, wa = 2 * F > 3 * C ? 2 * F : 3 * C, wb = F > 3 * C ? F : 3 * C;
-    size_t n = al(t * C) * 6 + al(t * 3 * C) * 2 + al(t * 2 * F) + al(t * F) + al(t) * 4 + al(t * H) * 4 + al(t * wa) + al(t * wb);
-    return n * 4;
+    at_ws tmp; if (!w) w = &tmp;
+    size_t nf = 0, nb = 0;
+#define TF(f, n) do { w->f = fb ? fb + nf : nullptr; nf += al(n); } while (0)
+#define TB(f, n) do { w->f = bb ? bb + nb : nullptr; nb += al(n); } while (0)
+    TF(xn, t * C); TF(o, t * C); TF(x1, t * C); TF(xn2, t * C); TF(qkv, t * 3 * C); TF(h, t * 2 * F);
+    TF(m1, t); TF(r1, t); TF(m2, t); TF(r2, t); TF(rq, t * H); TF(rk, t * H); TF(lse, t * H);
+    TF(qkvh, 3 * C * (t + 64) / 2); TF(amx, 4);   /* (fp16: halves) */
+    TB(bC, t * C); TB(qkn, t * 3 * C); TB(gg, t * F);   /* (qkn: core 0 only, which always recomputes; gg: recomputed from h when kept) */
+    TB(dx1, t * C); TB(dv, t * H); TB(bA, t * wa); TB(bB, t * wb); TB(doh, C * (t + 64) / 2);
+#undef TF
+#undef TB
+    return part ? nb : nf;
 }
+extern "C" size_t at_ws_bytes(const at_dims *d, long T) { return (ws_walk(nullptr, d, T, nullptr, nullptr, 0) + ws_walk(nullptr, d, T, nullptr, nullptr, 1)) * 4; }
 extern "C" void at_ws_carve(at_ws *w, const at_dims *d, long T, void *base) {
-    const size_t C = d->C, F = d->F, H = d->H, t = (size_t)T, wa = 2 * F > 3 * C ? 2 * F : 3 * C, wb = F > 3 * C ? F : 3 * C;
-    float *p = (float *)base;
-#define TAKE(f, n) do { w->f = p; p += al(n); } while (0)
-    TAKE(xn, t * C); TAKE(o, t * C); TAKE(x1, t * C); TAKE(xn2, t * C); TAKE(bC, t * C); TAKE(dx1, t * C);
-    TAKE(qkv, t * 3 * C); TAKE(qkn, t * 3 * C); TAKE(h, t * 2 * F); TAKE(gg, t * F);
-    TAKE(m1, t); TAKE(r1, t); TAKE(m2, t); TAKE(r2, t);
-    TAKE(rq, t * H); TAKE(rk, t * H); TAKE(lse, t * H); TAKE(dv, t * H);
-    TAKE(bA, t * wa); TAKE(bB, t * wb);
-#undef TAKE
+    const size_t nf = ws_walk(nullptr, d, T, nullptr, nullptr, 0);
+    ws_walk(w, d, T, (float *)base, (float *)base + nf, 0); w->kept = 0;
+}
+extern "C" size_t at_ws_fwd_bytes(const at_dims *d, long T) { return ws_walk(nullptr, d, T, nullptr, nullptr, 0) * 4; }
+extern "C" void at_ws_set_fwd(at_ws *w, const at_dims *d, long T, void *base) {
+    at_ws t; ws_walk(&t, d, T, (float *)base, nullptr, 0);
+    w->xn = t.xn; w->o = t.o; w->x1 = t.x1; w->xn2 = t.xn2; w->qkv = t.qkv; w->h = t.h;
+    w->m1 = t.m1; w->r1 = t.r1; w->m2 = t.m2; w->r2 = t.r2; w->rq = t.rq; w->rk = t.rk; w->lse = t.lse; w->qkvh = t.qkvh; w->amx = t.amx; w->kept = 0;
 }
 
 /* ---- one block ---- */
 #define CK(x) do { if (x) return -1; } while (0)
 extern "C" int at_block_fwd(const at_dims *d, const float *P, const at_bp *bp, const float *x, float *y, const at_geom *g, at_ws *w) {
-    const long T = (long)g->nseq * g->S; const int C = d->C, F = d->F;
-    at_ln_fwd(x, P + bp->ln1g, P + bp->ln1b, w->xn, w->m1, w->r1, T, C);
-    CK(at_gemm(0, 1, (int)T, 3 * C, C, w->xn, P + bp->wqkv, w->qkv, 0.f)); add_bias(w->qkv, P + bp->bqkv, T, 3 * C);
-    at_qknorm_fwd(w->qkv, P + bp->qg, P + bp->kg, w->qkn, w->rq, w->rk, T, C);
-    if (d->rope) at_rope(w->qkn, g, d->nreg, C, d->rope_base, 0);
-    at_attn_fwd(w->qkn, w->o, w->lse, g, d->H, C);
-    cudaMemcpyAsync(w->x1, x, (size_t)T * C * 4, cudaMemcpyDeviceToDevice, 0);
-    CK(at_gemm(0, 1, (int)T, C, C, w->o, P + bp->wo, w->x1, 1.f)); add_bias(w->x1, P + bp->bo, T, C);
-    at_ln_fwd(w->x1, P + bp->ln2g, P + bp->ln2b, w->xn2, w->m2, w->r2, T, C);
-    CK(at_gemm(0, 1, (int)T, 2 * F, C, w->xn2, P + bp->w1, w->h, 0.f)); add_bias(w->h, P + bp->b1, T, 2 * F);
-    at_glu_fwd(w->h, w->gg, T, F);
-    cudaMemcpyAsync(y, w->x1, (size_t)T * C * 4, cudaMemcpyDeviceToDevice, 0);
-    CK(at_gemm(0, 1, (int)T, C, F, w->gg, P + bp->w2, y, 1.f)); add_bias(y, P + bp->b2, T, C);
+    const long T = (long)g->nseq * g->S; const int C = d->C, F = d->F; const double t = (double)T, A = 4.0 * g->nseq * (double)g->S * g->S * HD * d->H;
+    int e = 0;
+    PR("ln1", 0, t * C * 8, at_ln_fwd(x, P + bp->ln1g, P + bp->ln1b, w->xn, w->m1, w->r1, T, C));
+    PR("qkv gemm", 2 * t * 3 * C * C, t * C * 16, e |= at_gemm_ex(0, 1, (int)T, 3 * C, C, w->xn, P + bp->wqkv, w->qkv, 0.f, P + bp->bqkv, nullptr)); CK(e);
+    if (at_get_core()) {
+        PR("qknorm+pack", 0, t * C * 18, at_fa_pack(w->qkv, P + bp->qg, P + bp->kg, w->qkvh, w->rq, w->rk, w->amx, g, d->nreg, C, d->rope, d->rope_base));
+        if (at_get_core() == 2) PR("attn fwd", A, t * C * 6, e |= at_fa8_fwd(w->qkvh, w->o, w->lse, g, d->H, C));
+        else PR("attn fwd", A, t * C * 10, at_fa_fwd(w->qkvh, w->o, w->lse, g, d->H, C));
+        CK(e);
+    } else {
+        PR("qknorm+rope", 0, t * C * 24, at_qknorm_fwd(w->qkv, P + bp->qg, P + bp->kg, w->qkn, w->rq, w->rk, T, C); if (d->rope) at_rope(w->qkn, g, d->nreg, C, d->rope_base, 0));
+        PR("attn fwd", A, t * C * 16, at_attn_fwd(w->qkn, w->o, w->lse, g, d->H, C));
+    }
+    PR("o gemm+res", 2 * t * C * C, t * C * 16, 
+       e |= at_gemm_ex(0, 1, (int)T, C, C, w->o, P + bp->wo, w->x1, 0.f, P + bp->bo, x)); CK(e);
+    PR("ln2", 0, t * C * 8, at_ln_fwd(w->x1, P + bp->ln2g, P + bp->ln2b, w->xn2, w->m2, w->r2, T, C));
+    PR("w1 gemm", 2 * t * 2 * F * C, t * (C + 4 * F) * 4, e |= at_gemm_ex(0, 1, (int)T, 2 * F, C, w->xn2, P + bp->w1, w->h, 0.f, P + bp->b1, nullptr)); CK(e);
+    PR("swiglu", 0, t * F * 12, at_glu_fwd(w->h, w->gg, T, F));
+    PR("w2 gemm+res", 2 * t * C * F, t * (F + 3 * C) * 4, 
+       e |= at_gemm_ex(0, 1, (int)T, C, F, w->gg, P + bp->w2, y, 0.f, P + bp->b2, w->x1)); CK(e);
     return 0;
 }
 extern "C" int at_block_bwd(const at_dims *d, const float *P, float *G, const at_bp *bp, const float *xin, float *gy, const at_geom *g, at_ws *w) {
-    const long T = (long)g->nseq * g->S; const int C = d->C, F = d->F;
-    CK(at_block_fwd(d, P, bp, xin, w->bA, g, w));   /* recompute the block's internals (its output into scratch) */
+    const long T = (long)g->nseq * g->S; const int C = d->C, F = d->F; const double t = (double)T, A = 4.0 * g->nseq * (double)g->S * g->S * HD * d->H;
+    int e = 0;
+    /* recompute the block's internals (its output into scratch), unless kept (core 0 always recomputes: its q / k / v rows are scratch);
+       kept: the SwiGLU product from h (scratch) */
+    if (!w->kept || !at_get_core()) CK(at_block_fwd(d, P, bp, xin, w->bA, g, w));
+    else at_glu_fwd(w->h, w->gg, T, F);
+    w->kept = 0;
     /* MLP */
-    CK(at_gemm(1, 0, C, F, (int)T, gy, w->gg, G + bp->w2, 1.f)); colsum(gy, T, C, G + bp->b2);
-    CK(at_gemm(0, 0, (int)T, F, C, gy, P + bp->w2, w->bB, 0.f));                 /* d gg */
-    at_glu_bwd(w->h, w->bB, w->bA, T, F);                                         /* d h */
-    CK(at_gemm(1, 0, 2 * F, C, (int)T, w->bA, w->xn2, G + bp->w1, 1.f)); colsum(w->bA, T, 2 * F, G + bp->b1);
-    CK(at_gemm(0, 0, (int)T, C, 2 * F, w->bA, P + bp->w1, w->bC, 0.f));          /* d xn2 */
-    cudaMemcpyAsync(w->dx1, gy, (size_t)T * C * 4, cudaMemcpyDeviceToDevice, 0);
-    at_ln_bwd(w->x1, P + bp->ln2g, w->m2, w->r2, w->bC, w->dx1, G + bp->ln2g, G + bp->ln2b, T, C, 1);
+    PR("b w2 gemms", 4 * t * C * F, t * (2 * F + C) * 8, e |= at_gemm(1, 0, C, F, (int)T, gy, w->gg, G + bp->w2, 1.f); colsum(gy, T, C, G + bp->b2);
+       e |= at_gemm(0, 0, (int)T, F, C, gy, P + bp->w2, w->bB, 0.f)); CK(e);                 /* d gg */
+    PR("b swiglu", 0, t * F * 20, at_glu_bwd(w->h, w->bB, w->bA, T, F));                    /* d h */
+    PR("b w1 gemms", 8 * t * C * F, t * (2 * F + C) * 12, e |= at_gemm(1, 0, 2 * F, C, (int)T, w->bA, w->xn2, G + bp->w1, 1.f); colsum(w->bA, T, 2 * F, G + bp->b1);
+       e |= at_gemm(0, 0, (int)T, C, 2 * F, w->bA, P + bp->w1, w->bC, 0.f)); CK(e);          /* d xn2 */
+    PR("b ln2", 0, t * C * 20, cudaMemcpyAsync(w->dx1, gy, (size_t)T * C * 4, cudaMemcpyDeviceToDevice, 0);
+       at_ln_bwd(w->x1, P + bp->ln2g, w->m2, w->r2, w->bC, w->dx1, G + bp->ln2g, G + bp->ln2b, T, C, 1));
     /* attention */
-    CK(at_gemm(1, 0, C, C, (int)T, w->dx1, w->o, G + bp->wo, 1.f)); colsum(w->dx1, T, C, G + bp->bo);
-    CK(at_gemm(0, 0, (int)T, C, C, w->dx1, P + bp->wo, w->bC, 0.f));             /* d o */
-    at_attn_bwd(w->qkn, w->o, w->lse, w->bC, w->dv, w->bA, g, d->H, C);           /* d qkn */
-    if (d->rope) at_rope(w->bA, g, d->nreg, C, d->rope_base, 1);
-    at_qknorm_bwd(w->qkv, P + bp->qg, P + bp->kg, w->rq, w->rk, w->bA, w->bB, G + bp->qg, G + bp->kg, T, C);
-    CK(at_gemm(1, 0, 3 * C, C, (int)T, w->bB, w->xn, G + bp->wqkv, 1.f)); colsum(w->bB, T, 3 * C, G + bp->bqkv);
-    CK(at_gemm(0, 0, (int)T, C, 3 * C, w->bB, P + bp->wqkv, w->bC, 0.f));        /* d xn */
-    cudaMemcpyAsync(gy, w->dx1, (size_t)T * C * 4, cudaMemcpyDeviceToDevice, 0);
-    at_ln_bwd(xin, P + bp->ln1g, w->m1, w->r1, w->bC, gy, G + bp->ln1g, G + bp->ln1b, T, C, 1);
+    PR("b o gemms", 4 * t * C * C, t * C * 20, e |= at_gemm(1, 0, C, C, (int)T, w->dx1, w->o, G + bp->wo, 1.f); colsum(w->dx1, T, C, G + bp->bo);
+       e |= at_gemm(0, 0, (int)T, C, C, w->dx1, P + bp->wo, w->bC, 0.f)); CK(e);             /* d o */
+    if (at_get_core() == 2) { PR("attn bwd", 3.5 * A, t * C * 20, e |= at_fa8_bwd(w->qkvh, w->doh, w->o, w->lse, w->bC, w->dv, w->amx, w->bA, g, d->H, C)); CK(e); }
+    else if (at_get_core()) PR("attn bwd", 3.5 * A, t * C * 30, at_fa_bwd(w->qkvh, w->doh, w->o, w->lse, w->bC, w->dv, w->amx, w->bA, g, d->H, C));
+    else PR("attn bwd", 3.5 * A, t * C * 40, at_attn_bwd(w->qkn, w->o, w->lse, w->bC, w->dv, w->bA, g, d->H, C));   /* d qkn */
+    PR("b rope+qknorm", 0, t * C * 36, if (d->rope) at_rope(w->bA, g, d->nreg, C, d->rope_base, 1);
+       at_qknorm_bwd(w->qkv, P + bp->qg, P + bp->kg, w->rq, w->rk, w->bA, w->bB, G + bp->qg, G + bp->kg, T, C));
+    PR("b qkv gemms", 12 * t * C * C, t * C * 40, e |= at_gemm(1, 0, 3 * C, C, (int)T, w->bB, w->xn, G + bp->wqkv, 1.f); colsum(w->bB, T, 3 * C, G + bp->bqkv);
+       e |= at_gemm(0, 0, (int)T, C, 3 * C, w->bB, P + bp->wqkv, w->bC, 0.f)); CK(e);        /* d xn */
+    PR("b ln1", 0, t * C * 20, cudaMemcpyAsync(gy, w->dx1, (size_t)T * C * 4, cudaMemcpyDeviceToDevice, 0);
+       at_ln_bwd(xin, P + bp->ln1g, w->m1, w->r1, w->bC, gy, G + bp->ln1g, G + bp->ln1b, T, C, 1));
     return 0;
 }
 

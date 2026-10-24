@@ -2146,6 +2146,7 @@ int cmd_dino_train(int argc, char **argv) {
                         "         [--eval SURF-LIST --eval-root R --eval-key K --eval-box z,y,x,nz,ny,nx --eval-every 2000 --eval-codes ROOT KEY --eval-norm c,s]\n"
                         "         [--log-every 20] [--save-every 2000] [--resume CKPT] [--dim 32] [--mx 0 (bf16, no MX)] [--var 30] [--var-gamma 0.8 / sqrt(D)] [--gpu 0]\n"
                         "         [--attn-blocks 0 (transformer blocks on the bottleneck)] [--attn-pe peg|rope|none] [--attn-reg 0] [--attn-mlp 0 (8/3 width)]\n"
+                        "         [--attn-core 1 (attention products: 0 fp32, 1 fp16 / 2 MX-fp8 tensor cores)] [--attn-keep 0|1 (keep each block's forward, no recompute)]\n"
                         "         [--minutes M (wall-time budget: the step count from the speed of steps 21..200; evals / saves at the end)]\n"
                         "         [--head-slab Z (the head per z-slab of Z planes: no whole-window logits; large windows)] [--mem default|lean]\n"
                         "  Our dense embedding net from scratch (src/dino.h): the U-Net with D = 32 unit embedding channels; GT sheet-identity SupCon on\n"
@@ -2203,6 +2204,11 @@ int cmd_dino_train(int argc, char **argv) {
         if (cfg.attn_pe < 0) { fprintf(stderr, "dino-train: --attn-pe peg|rope|none\n"); return 2; }
     }
     if (opt(argc, argv, "--attn-out-init", nullptr)) setenv("UFSM_ATTN_OUT_INIT", opt(argc, argv, "--attn-out-init", "0"), 1);   /* (unet_init: the attention out projections at s x std, not 0) */
+    /* the attention stage's core: 0 fp32 CUDA cores, 1 fp16 tensor cores, 2 MX-fp8 tensor cores (absent: env UFSM_ATTN_CORE, else 1);
+       --attn-keep 1: each block's training forward kept for its backward (no recompute: about 6% faster with 6 blocks at 4096 tokens, + the blocks' forward tensors, ~65 MB per block at
+       C 288 x 4097 tokens; absent: env UFSM_ATTN_KEEP, else 0) */
+    if (opt(argc, argv, "--attn-core", nullptr)) at_set_core(atoi(opt(argc, argv, "--attn-core", "1")));
+    if (opt(argc, argv, "--attn-keep", nullptr)) unet_set_attn_keep(atoi(opt(argc, argv, "--attn-keep", "0")));
     unet *u = unet_create(&cfg); unet_init(u, seed); unet_head_bias_zero(u);   /* (no shared -2 bias direction in the embeddings) */
     const int HZ = atoi(opt(argc, argv, "--head-slab", "0"));   /* head slabs of HZ planes: no whole-window logits / logit gradient (large windows) */
     if (HZ && (fp32 || P % HZ)) { fprintf(stderr, "dino-train: --head-slab needs MX storage (--mx 1) and P a multiple of it\n"); return 2; }

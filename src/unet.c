@@ -215,6 +215,8 @@ struct unet {
     int tbn; at_dims tbd; at_bp tbp[UNET_MAXTB]; convp tbm[UNET_MAXTB][4]; size_t peg_w, peg_b, reg_off;
     block tb; at_ws tbw; at_geom tbg;
     float *tb_cs, *tb_tok, *tb_wsb, *tb_g, *tb_gx, *tb_dt, *tb_dt2, *tb_zero;
+    float *tb_keep; at_ws tbk[UNET_MAXTB];   /* unet_set_attn_keep: each block's forward tensors of the last training forward (tbk[k], the
+                                                         backward scratch shared with tbw), read by its backward instead of a recompute */
     const float *tb_xg;                      /* unet_set_token_grad: extra gradient at the stage output tokens */
 };
 
@@ -437,6 +439,11 @@ static void mrep_add(size_t b) {
 static float *dmalloc(size_t b) { if (g_dry) mrep_add(b); return g_dry ? (float *)(uintptr_t)4096 : nn_malloc(b); }
 static void dstorage(const void *p, size_t b, int dt) { if (!g_dry) nn_set_storage(p, b, dt); }
 static float *dalloc(unet *u, size_t n) { u->act_bytes += n * 4; return dmalloc(n * 4); }
+/* the attention stage keeps every block's forward tensors of a training forward for its backward (no recompute: + at_ws_fwd_bytes per
+   block); env UFSM_ATTN_KEEP, unet_set_attn_keep (before the build) */
+static int g_attn_keep = -1;
+void unet_set_attn_keep(int on) { g_attn_keep = on; }
+static int attn_keep(void) { if (g_attn_keep < 0) g_attn_keep = ufsm_env_on("UFSM_ATTN_KEEP"); return g_attn_keep; }
 #define ABF (nn_get_tf32() && nn_get_act_bf16())
 #define GBF (ABF && nn_get_grad_bf16())
 static float *dalloc_oom(float *p, size_t b) { if (!p && b) { fprintf(stderr, "unet: out of device memory for a %.2f GB activation buffer\n", b / 1e9); abort(); } return p; }
@@ -679,10 +686,10 @@ static void free_acts(unet *u) {
     }
     if (u->tbn) {   /* attention stage */
         block *b = &u->tb;
-        float *r[15] = {b->a1, b->a2, b->s2, b->m1, b->r1, b->m2, b->r2, u->tb_cs, u->tb_tok, u->tb_wsb, u->tb_zero, u->tb_g, u->tb_gx, u->tb_dt, u->tb_dt2};
-        free_once(r, 15);
+        float *r[16] = {b->a1, b->a2, b->s2, b->m1, b->r1, b->m2, b->r2, u->tb_cs, u->tb_tok, u->tb_wsb, u->tb_zero, u->tb_g, u->tb_gx, u->tb_dt, u->tb_dt2, u->tb_keep};
+        free_once(r, 16);
         b->a1 = b->a2 = b->s2 = b->m1 = b->r1 = b->m2 = b->r2 = nullptr;
-        u->tb_cs = u->tb_tok = u->tb_wsb = u->tb_zero = u->tb_g = u->tb_gx = u->tb_dt = u->tb_dt2 = nullptr;
+        u->tb_cs = u->tb_tok = u->tb_wsb = u->tb_zero = u->tb_g = u->tb_gx = u->tb_dt = u->tb_dt2 = u->tb_keep = nullptr;
     }
     pp[np++] = u->logits; pp[np++] = u->conv_scratch; pp[np++] = u->rc_extra;
     if (u->rc_extra && !g_dry) nn_storage_forget(u->rc_extra);
@@ -1047,6 +1054,11 @@ static void build_acts(unet *u, shape5 xs, int train) {
         const size_t wsb = at_ws_bytes(&u->tbd, T);
         u->tb_wsb = dalloc(u, wsb / 4 + 1);
         if (!g_dry) at_ws_carve(&u->tbw, &u->tbd, T, u->tb_wsb);
+        if (train && attn_keep()) {   /* one forward set per block (unet_set_attn_keep) */
+            const size_t fb = at_ws_fwd_bytes(&u->tbd, T) / 4;
+            u->tb_keep = dalloc(u, (size_t)u->tbn * fb + 1);
+            for (int k = 0; k < u->tbn; k++) { u->tbk[k] = u->tbw; if (!g_dry) at_ws_set_fwd(&u->tbk[k], &u->tbd, T, u->tb_keep + (size_t)k * fb); }
+        }
         u->tb_zero = dalloc(u, (size_t)(u->cfg.attn_reg + 1) * C);
         if (!g_dry) nn_zero(u->tb_zero, (size_t)(u->cfg.attn_reg + 1) * C * 4);
         if (train) {
@@ -2154,7 +2166,9 @@ static void tb_fwd(unet *u) {
     if (u->cfg.attn_pe == 0) at_peg_fwd(TB_TOK(u, 0), TB_TOK(u, 1), P(u, u->peg_w), P(u, u->peg_b), &u->tbg, nr, C);
     else nn_d2d(TB_TOK(u, 1), TB_TOK(u, 0), (size_t)T * C * 4);
     for (int k = 0; k < u->tbn; k++) {
-        int r; PROF(0, r = at_block_fwd(&u->tbd, u->fw, &u->tbp[k], TB_TOK(u, k + 1), TB_TOK(u, k + 2), &u->tbg, &u->tbw));
+        at_ws *ws = u->tb_keep && u->fwd_train ? &u->tbk[k] : &u->tbw;   /* (keep: a training forward fills the block's own set) */
+        int r; PROF(0, r = at_block_fwd(&u->tbd, u->fw, &u->tbp[k], TB_TOK(u, k + 1), TB_TOK(u, k + 2), &u->tbg, ws));
+        ws->kept = ws != &u->tbw;
         if (r) { fprintf(stderr, "unet: attention block forward failed\n"); abort(); }
     }
     at_tok_to_cs(TB_TOK(u, u->tbn + 1), u->tb_cs, ys.n, C, Sg, nr);
@@ -2461,7 +2475,8 @@ static float *tb_bwd(unet *u, const float *gy) {
     at_cs_to_tok(u->tb_cs, u->tb_dt, u->tb_zero, ys.n, C, Sg, nr);
     if (u->tb_xg) nn_axpy(u->tb_dt, 1.f, u->tb_xg, (size_t)ys.n * (Sg + nr) * C);   /* (unet_set_token_grad: e.g. a pooled CLS loss) */
     for (int k = u->tbn - 1; k >= 0; k--) {
-        int r; PROF(1, r = at_block_bwd(&u->tbd, u->fw, g, &u->tbp[k], TB_TOK(u, k + 1), u->tb_dt, &u->tbg, &u->tbw));
+        at_ws *ws = u->tb_keep && u->tbk[k].kept ? &u->tbk[k] : &u->tbw;   /* (kept: no recompute) */
+        int r; PROF(1, r = at_block_bwd(&u->tbd, u->fw, g, &u->tbp[k], TB_TOK(u, k + 1), u->tb_dt, &u->tbg, ws));
         if (r) { fprintf(stderr, "unet: attention block backward failed\n"); abort(); }
     }
     float *d = u->tb_dt;

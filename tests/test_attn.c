@@ -85,11 +85,15 @@ static double ref_loss(const blk *B, const double *P, const double *x, const dou
 
 static float *dev(const double *h, size_t n) { float *f = malloc(n * 4); for (size_t i = 0; i < n; i++) f[i] = (float)h[i]; float *d = nn_malloc(n * 4); nn_h2d(d, f, n * 4); free(f); return d; }
 static double *host(const float *d, size_t n) { float *f = malloc(n * 4); nn_d2h(f, d, n * 4); double *h = malloc(n * 8); for (size_t i = 0; i < n; i++) h[i] = f[i]; free(f); return h; }
+/* max |a - b| / rms(b) < g_tmax and (g_tl2 > 0) the relative L2 error < g_tl2. Defaults 2e-3 / off; the fp16 tensor-core attention
+   at 1000-4100 tokens: max 6e-3, L2 2e-3 (fp16 rounding of q / k / v / P: the near-uniform attention's small O magnifies the max norm) */
+static double g_tmax = 2e-3, g_tl2 = 0;
 static int report(const char *name, const double *a, const double *b, int n) {
-    double rms = 0, mx = 0; for (int i = 0; i < n; i++) { rms += b[i] * b[i]; double e = fabs(a[i] - b[i]); if (e > mx) mx = e; }
+    double rms = 0, mx = 0, e2 = 0; for (int i = 0; i < n; i++) { rms += b[i] * b[i]; double e = fabs(a[i] - b[i]); e2 += e * e; if (e > mx) mx = e; }
+    const double l2 = sqrt(e2 / (rms > 1e-300 ? rms : 1e-300));
     rms = sqrt(rms / n); double rel = mx / (rms > 1e-30 ? rms : 1e-30);
-    int bad = !(rel < 2e-3);
-    printf("  %-8s rel %.2e (rms %.3e, %d pts)%s\n", name, rel, rms, n, bad ? "  FAIL" : "");
+    int bad = !(rel < g_tmax) || (g_tl2 > 0 && !(l2 < g_tl2));
+    printf("  %-8s rel %.2e L2 %.2e (rms %.3e, %d pts)%s\n", name, rel, l2, rms, n, bad ? "  FAIL" : "");
     return bad;
 }
 
@@ -135,15 +139,35 @@ static int test_block(int nseq, int D, int Hh, int W, int nreg, int C, int F, in
     return bad;
 }
 
-static int test_attn_large(int nseq, int nreg, int D, int C) {
+/* core 0: at_attn_fwd / bwd on the given q / k / v. core 1: the fp16 tensor-core path, at_fa_pack (QK-norm with gains, no RoPE) of raw
+   qkv rows, at_fa_fwd / bwd; the reference attends over the double-normalised rows and dQ / dK are d/d the normalised q / k.
+   gs scales dO (the fp16 path's gradient scaling must make the result scale-free) */
+static int test_attn_large(int nseq, int nreg, int D, int C, int core, double gs) {
     at_geom g = {nseq, nreg + D * D * D, D, D, D}; const int S = g.S, H = C / AT_HD; const long T = (long)nseq * S;
-    printf("attention: %d seq x %d tokens, %d heads\n", nseq, S, H);
-    double *qkn = malloc(T * 3 * C * 8), *dO = malloc(T * C * 8);
+    printf("attention (core %d): %d seq x %d tokens, %d heads, dO x %.0e\n", core, nseq, S, H, gs);
+    double *qkn = malloc(T * 3 * C * 8), *dO = malloc(T * C * 8), *gn = malloc(2 * C * 8);
     for (long i = 0; i < T * 3 * C; i++) qkn[i] = rf(nrand() * 0.6);
-    for (long i = 0; i < T * C; i++) dO[i] = rf(nrand());
+    for (long i = 0; i < T * C; i++) dO[i] = rf(nrand() * gs);
+    for (int c = 0; c < 2 * C; c++) gn[c] = rf(1 + 0.2 * nrand());
     float *qd = dev(qkn, T * 3 * C), *gd = dev(dO, T * C), *od = nn_malloc(T * C * 4), *ld = nn_malloc(T * H * 4), *dvd = nn_malloc(T * H * 4), *dq = nn_malloc(T * 3 * C * 4);
-    at_attn_fwd(qd, od, ld, &g, H, C);
-    at_attn_bwd(qd, od, ld, gd, dvd, dq, &g, H, C);
+    if (core) {
+        float *gnd = dev(gn, 2 * C), *rq = nn_malloc(T * H * 4), *rk = nn_malloc(T * H * 4), *amx = nn_malloc(64);
+        void *qh = nn_malloc((size_t)3 * C * (T + 64) * 2), *dh = nn_malloc((size_t)C * (T + 64) * 2);
+        at_fa_pack(qd, gnd, gnd + C, qh, rq, rk, amx, &g, nreg, C, 0, 100.f);
+        if (core == 2) { if (at_fa8_fwd(qh, od, ld, &g, H, C)) printf("  fp8 forward failed\n"); }
+        else at_fa_fwd(qh, od, ld, &g, H, C);
+        if (core == 2) { if (at_fa8_bwd(qh, dh, od, ld, gd, dvd, amx, dq, &g, H, C)) printf("  fp8 backward failed\n"); }
+        else at_fa_bwd(qh, dh, od, ld, gd, dvd, amx, dq, &g, H, C);
+        for (long t = 0; t < T; t++) for (int h = 0; h < H; h++) for (int p = 0; p < 2; p++) {   /* the reference's normalised q / k */
+            double *v = qkn + t * 3 * C + p * C + h * AT_HD, s = 0; for (int d = 0; d < AT_HD; d++) s += v[d] * v[d];
+            const double r = 1 / sqrt(s / AT_HD + 1e-6); for (int d = 0; d < AT_HD; d++) v[d] *= r * gn[p * C + h * AT_HD + d];
+        }
+        nn_free(gnd); nn_free(rq); nn_free(rk); nn_free(amx); nn_free(qh); nn_free(dh);
+    } else {
+        at_attn_fwd(qd, od, ld, &g, H, C);
+        at_attn_bwd(qd, od, ld, gd, dvd, dq, &g, H, C);
+    }
+    free(gn);
     double *o = malloc(T * C * 8), *lse = malloc(T * H * 8); ref_attn(qkn, o, lse, &g, C);
     double *og = host(od, T * C), *dg = host(dq, T * 3 * C), *lg = host(ld, T * H);
     int bad = report("O", og, o, (int)(T * C));
@@ -280,7 +304,7 @@ static int test_mx_gemm(int bits, int ta, int tb, int M, int N, int K) {
 }
 
 /* the block's output / gradients with MX linears against fp32 (relative L2; fp4 is coarse by design: the gate is a loose bound) */
-static int test_block_mx(int bits, double tol) {
+static int test_block_mx(int bits, int core, double tol) {   /* bits: the linears (0 fp32), core: the attention core; vs fp32 + core 0 */
     blk B = {0}; B.d.C = 192; B.d.H = 4; B.d.F = 512; B.d.rope = 0; B.d.nreg = 0; B.d.rope_base = 100.f; B.g = (at_geom){1, 512, 8, 8, 8};
     const size_t np = at_block_layout(&B.d, &B.bp, 0); const long T = 512; const int C = 192;
     double *P = malloc(np * 8), *x = malloc(T * C * 8), *R = malloc(T * C * 8);
@@ -289,30 +313,41 @@ static int test_block_mx(int bits, double tol) {
     for (long i = 0; i < T * C; i++) { x[i] = rf(nrand()); R[i] = rf(nrand()); }
     float *Pd = dev(P, np), *xd = dev(x, T * C), *y[2], *G[2], *gx[2]; at_ws w; void *wb = nn_malloc(at_ws_bytes(&B.d, T)); at_ws_carve(&w, &B.d, T, wb);
     for (int k = 0; k < 2; k++) {
-        at_set_mx(k ? bits : 0);
+        at_set_mx(k ? bits : 0); at_set_core(k ? core : 0);
         y[k] = nn_malloc(T * C * 4); G[k] = nn_malloc(np * 4); nn_zero(G[k], np * 4); gx[k] = dev(R, T * C);
         at_block_fwd(&B.d, Pd, &B.bp, xd, y[k], &B.g, &w); at_block_bwd(&B.d, Pd, G[k], &B.bp, xd, gx[k], &B.g, &w);
     }
-    at_set_mx(0);
+    at_set_mx(0); at_set_core(0);
     double *a = host(y[1], T * C), *b = host(y[0], T * C), *ga = host(G[1], np), *gb = host(G[0], np), *xa = host(gx[1], T * C), *xb = host(gx[0], T * C);
     double e[3] = {0}, r[3] = {0};
     for (long i = 0; i < T * C; i++) { e[0] += (a[i] - b[i]) * (a[i] - b[i]); r[0] += b[i] * b[i]; e[2] += (xa[i] - xb[i]) * (xa[i] - xb[i]); r[2] += xb[i] * xb[i]; }
     for (size_t i = 0; i < np; i++) { e[1] += (ga[i] - gb[i]) * (ga[i] - gb[i]); r[1] += gb[i] * gb[i]; }
     const double ry = sqrt(e[0] / r[0]), rp = sqrt(e[1] / r[1]), rx = sqrt(e[2] / r[2]); const int bad = !(ry < tol && rp < tol && rx < tol);
-    printf("block, fp%d linears vs fp32: output rel L2 %.3f, parameter gradient %.3f, input gradient %.3f%s\n", bits, ry, rp, rx, bad ? "  FAIL" : "");
+    printf("block, linears %d bits, attention core %d vs fp32: output rel L2 %.3f, parameter gradient %.3f, input gradient %.3f%s\n", bits ? bits : 32, core, ry, rp, rx, bad ? "  FAIL" : "");
     return bad;
 }
 
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
     int bad = 0;
-    bad += test_block(2, 4, 4, 4, 1, 96, 128, 0, 24);
-    bad += test_block(2, 4, 4, 4, 2, 192, 256, 1, 16);
-    bad += test_block(1, 8, 8, 8, 0, 96, 128, 1, 6);
-    bad += test_attn_large(1, 4, 16, 96);
+    for (int core = 0; core < 2; core++) {   /* fp32 CUDA-core attention, fp16 tensor-core attention */
+        at_set_core(core); printf("== attention core %d\n", core);
+        bad += test_block(2, 4, 4, 4, 1, 96, 128, 0, 24);
+        bad += test_block(2, 4, 4, 4, 2, 192, 256, 1, 16);
+        bad += test_block(1, 8, 8, 8, 0, 96, 128, 1, 6);
+        if (core) { g_tmax = 6e-3; g_tl2 = 2e-3; }
+        bad += test_attn_large(core ? 2 : 1, 4, 16, 96, core, 1);
+        if (core) bad += test_attn_large(1, 3, 10, 144, core, 1e-7);
+        g_tmax = 2e-3; g_tl2 = 0;
+    }
+    at_set_core(0);
+    { printf("== attention core 2 (MX-fp8)\n"); g_tmax = 1e30; g_tl2 = 0.1;   /* (e4m3: measured L2 5-7 percent on these near-uniform attentions) */
+      bad += test_attn_large(2, 4, 16, 96, 2, 1); bad += test_attn_large(1, 3, 10, 144, 2, 1e-7); g_tmax = 2e-3; g_tl2 = 0; }
     bad += test_peg();
     for (int b = 4; b <= 8; b += 4) for (int ta = 0; ta < 2; ta++) for (int tb = 0; tb < 2; tb++) { bad += test_mx_gemm(b, ta, tb, 70, 45, 100); bad += test_mx_gemm(b, ta, tb, 300, 520, 100); }
-    bad += test_block_mx(8, 0.1); bad += test_block_mx(4, 0.35);
+    bad += test_mx_gemm(4, 1, 0, 300, 96, 4100); bad += test_mx_gemm(8, 1, 0, 300, 96, 4100);   /* (split K: the weight-gradient shape) */
+    bad += test_block_mx(8, 0, 0.1); bad += test_block_mx(4, 0, 0.35);
+    bad += test_block_mx(0, 1, 2e-3); bad += test_block_mx(0, 2, 0.03); bad += test_block_mx(4, 2, 0.35);
     printf(bad ? "test_attn: %d FAILED\n" : "test_attn: all passed\n", bad);
     return bad != 0;
 }
