@@ -159,11 +159,16 @@ static void tear_tests(const char *dir) {
     check("--aug-tear 1: windows torn, deterministic", n1 >= NB && same(d, e, p3));
     /* neighbours (x, x + 1) in one component: the w4 step agrees with the phase step mod 1 turn everywhere; steps >= 0.3 turn (a cut
        crossed with the windings kept) only in torn windows */
-    size_t pairs = 0, agree = 0, big_t = 0, big_p = 0;
+    size_t pairs = 0, agree = 0, big_t = 0, big_p = 0, xc_p = 0, xc_big_p = 0, in_p = 0;
     for (int pass = 0; pass < 2; pass++) for (int i = 0; i < NB; i++) {
         const snap *q = pass ? &d[i] : &a[i];
         for (size_t k = 0; k + 1 < p3; k++) {
-            if (k % PW == PW - 1 || q->w4[k] == 255 || q->w4[k + 1] == 255 || q->wc[k] != q->wc[k + 1] || q->side[k] >= PHASE_PERIOD || q->side[k + 1] >= PHASE_PERIOD) continue;
+            if (k % PW == PW - 1 || q->w4[k] == 255 || q->w4[k + 1] == 255 || q->side[k] >= PHASE_PERIOD || q->side[k + 1] >= PHASE_PERIOD) continue;
+            if (q->wc[k] != q->wc[k + 1]) {   /* (plain windows: tile / component borders, each its own gauge: w4 may jump there, the loss never compares them) */
+                if (!pass) { xc_p++; xc_big_p += abs(w4diff(q->w4[k + 1], q->w4[k])) >= 19; }
+                continue;
+            }
+            if (!pass) in_p++;
             const int dw = w4diff(q->w4[k + 1], q->w4[k]), dph = q->side[k + 1] - q->side[k];
             int m = (dw * 4 - dph) % 252; if (m < 0) m += 252; if (m > 126) m = 252 - m;   /* (w4 63 codes per turn, phase 252) */
             pairs++; agree += m <= 12;
@@ -172,6 +177,9 @@ static void tear_tests(const char *dir) {
     }
     printf("scrollaug: tear sampler: %llu torn; %zu neighbour pairs, w4 / phase steps agree at %.4f; >= 0.3 turn w4 steps: plain %zu, torn %zu\n",
            (unsigned long long)n1, pairs, pairs ? agree / (double)pairs : 0, big_p, big_t);
+    printf("scrollaug: plain windows: %zu in-component neighbour pairs (%zu with >= 0.3 turn w4 steps), %zu across component borders (%zu with >= 0.3 turn steps: gauges)\n",
+           in_p, big_p, xc_p, xc_big_p);
+    check("plain windows: w4 smooth inside each component (< 1e-4 of the pairs step >= 0.3 turn)", in_p > p3 && big_p * 10000 < in_p);
     check("--aug-tear: the w4 labels follow the pulled phase (steps agree mod 1 turn)", pairs > p3 && agree >= .99 * (double)pairs);
     check("--aug-tear: the winding mod 4 jumps across the cut (>= 0.3 turn steps in torn windows only)", big_t > 50 && big_p * 20 < big_t);
     drop(a); drop(b); drop(d); drop(e); sources_free(S);
