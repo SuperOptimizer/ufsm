@@ -27,7 +27,7 @@ void srpair_free(srpair *p) {
     if (!p) return;
     if (p->tc) for (int k = 0; k < p->n; k++) { free(p->tc[k]); free(p->ic[k]); }
     free(p->tc); free(p->ic);
-    z3_close(p->in); z3_close(p->tg); free(p->tr); free(p->te); free(p);
+    z3_close(p->in); z3_close(p->tg); free(p->tr); free(p->te); free(p->trw); free(p);
 }
 
 srpair *srpair_open(const char *dir, const char *role, int lut, int cache) {
@@ -124,4 +124,22 @@ int srpair_read(const srpair *p, int k, const int oc[3], int P, uint8_t *tgt, ui
     if (z3_read(p->tg, ot, nt, tgt, 1) || z3_read(p->in, oi, ni, coarse, 1)) return -1;
     for (size_t i = 0; i < p3; i++) tgt[i] = p->lut[tgt[i]];
     return 0;
+}
+
+int srpair_pick_train(const srpair *p, double u) {
+    if (p->ntr <= 0) return -1;
+    if (!p->trw) { int i = (int)(u * p->ntr); return i < p->ntr ? i : p->ntr - 1; }
+    const double t = u * p->trw[p->ntr - 1]; int lo = 0, hi = p->ntr - 1;
+    while (lo < hi) { const int m = (lo + hi) / 2; if (p->trw[m] > t) hi = m; else lo = m + 1; }
+    return lo;
+}
+
+int srpair_load_weights(srpair *p, const char *path) {
+    size_t wn; char *wt = slurp_file(path, &wn); json *wj = wt ? json_parse(wt, wn) : nullptr; free(wt);
+    const json *w = wj ? json_get(wj, "w") : nullptr;
+    if (!w || (int)w->n < p->n) { fprintf(stderr, "sr-pair: cannot read %d box weights from %s\n", p->n, path); json_free(wj); return -1; }
+    const double K = json_num(json_get(wj, "boost"), 4); free(p->trw); p->trw = malloc(((size_t)p->ntr + 1) * sizeof *p->trw); double acc = 0;
+    for (int i = 0; i < p->ntr; i++) { const double v = json_num(json_at(w, (size_t)p->tr[i]), 0); acc += 1 + K * (v > 0 ? v : 0); p->trw[i] = acc; }
+    fprintf(stderr, "sr-pair: %s: box weights (boost %g), mean draw weight %.3f\n", path, K, p->ntr ? acc / p->ntr : 0);
+    json_free(wj); return 0;
 }

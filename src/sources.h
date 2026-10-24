@@ -109,7 +109,7 @@ typedef struct {
                                                                      RAW.json): a source without a label occupancy index draws its windows around
                                                                      cells with code >= min (2: valid window centres, 1: any object cell) */
     int ct_only;      /* "ct_only": 1: the source is drawn without any target (every channel's w = 0, mask = CT > 0): label-free terms */
-    struct srpair *srp;     /* optional "sr_pair": {"role": "train" | "val", "lut": 1, "cache": 0} (src/srpair.h): the source is a real SR pair directory ("root");
+    struct srpair *srp;     /* optional "sr_pair": {"role": "train" | "val", "lut": 1, "cache": 0, "weights": FILE} (src/srpair.h): the source is a real SR pair directory ("root");
                                task restore then reads its boxes instead of the CT (no CT levels are opened) */
     float norm_c, norm_s;   /* optional "norm": {"center": c, "scale": s} (scanprep stats: median, scale): the CT input is (v - c) / s for this
                                source instead of the window's own z-score (norm_s 0: off, the default) */

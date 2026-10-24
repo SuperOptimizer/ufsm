@@ -92,14 +92,14 @@ int restore_predict(int argc, char **argv) {
     const int nlev = atoi(opt(argc, argv, "--levels", "1")), nthreads = atoi(opt(argc, argv, "--threads", "16")), use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
     if (!(um > 0) || S < 128 || S % 128 || H < 0 || nlev < 1 || nlev > 10 || !(q >= 0)) {
         fprintf(stderr, "usage: ufsm predict <restore ckpt> <root> <ct-group> <out-dir> --um U (the CT's level-0 voxel) [--level L] [--out-um %g] [--box z,y,x,nz,ny,nx (output voxels)]\n"
-                        "       [--shard 512] [--halo 32] [--q 2] [--levels 1] [--ema 1] [--gpu 0] [--cache DIR] [--shards FILE (\"sz sy sx\" lines: only these)]\n"
+                        "       [--shard 512] [--halo 32] [--q 2] [--levels 1] [--ema 1] [--gpu 0] [--cache DIR] [--shards FILE (\"sz sy sx\" lines: only these)] [--identity 1 (trilinear only)]\n"
                         "  restores level L of the CT onto the --out-um grid (trilinear input, residual net), uint8 CT in 512^3 shards\n", fine_um);
         return 2;
     }
     if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) { fprintf(stderr, "restore: cannot select the GPU\n"); return 1; }
     unet_cfg cfg; unet *u = restore_net(ckpt, use_ema, &cfg);
     if (!u) return 1;
-    const int W = S + 2 * H;
+    const int W = S + 2 * H, ident = atoi(opt(argc, argv, "--identity", "0")) != 0;
     if (cfg.scale_cond) unet_set_cond(u, (float)log2(um * (1 << level) / out_um) - 2.f);   /* ratio-conditioned nets: log2(input / output voxel) - 2 */
     if (W % (1 << (cfg.nlev - 1))) { fprintf(stderr, "restore: shard + 2 halo (%d) must be a multiple of %d\n", W, 1 << (cfg.nlev - 1)); return 2; }
     store *st = store_open(root);
@@ -158,10 +158,13 @@ int restore_predict(int argc, char **argv) {
         nn_h2d(dc, hc, c3);
         const float stp[3] = {step, step, step};
         nn_restore_upsample(dc, cs, cs, cs, dlow, W, W, W, stp, ph, nullptr);
-        nn_restore_input(dlow, dx, w3, cfg.cin == 2, nn_get_f16());
-        const float *lg = unet_forward_x(u, dx, (shape5){1, cfg.cin, W, W, W}, 0, 1);
-        nn_restore_output(lg, unet_logits_h16(u), dlow, dout, w3);
-        nn_d2h(ho, dout, w3);
+        if (ident) nn_d2h(ho, dlow, w3);   /* --identity 1: the trilinear upsampling itself (the SR baseline on the same grid) */
+        else {
+            nn_restore_input(dlow, dx, w3, cfg.cin == 2, nn_get_f16());
+            const float *lg = unet_forward_x(u, dx, (shape5){1, cfg.cin, W, W, W}, 0, 1);
+            nn_restore_output(lg, unet_logits_h16(u), dlow, dout, w3);
+            nn_d2h(ho, dout, w3);
+        }
         for (int z = 0; z < S; z++) for (int y = 0; y < S; y++) memcpy(shard + ((size_t)z * S + y) * S, ho + ((size_t)(z + H) * W + (y + H)) * W + H, (size_t)S);
         if (z3w_write_shard(w, sz, sy, sx, shard, nthreads)) { fprintf(stderr, "restore: %s\n", z3w_error()); return 1; }
         done++;
@@ -383,7 +386,7 @@ int cmd_restore_eval_pairs(int argc, char **argv) {
    --block^3 target blocks (half packed): the real target's top / bottom quartile voxels are the sheet / gap voxels; each image's mean
    over them gives the sheet-gap contrast it shows where the real scan has it (DN); per block "open" = an image's own interquartile range
    > --delta; versus the real target: open in both / only in the prediction (hallucinated) / only in the real (merged). */
-int cmd_restore_packed(int argc, char **argv) {
+int cmd_restore_packed(int argc, char **argv) {   /* (--weights FILE --boost K: write the per-slot packed fraction, for box_weights.json) */
     if (argc < 4) { fprintf(stderr, "usage: ufsm restore-packed <ckpt|none> <pair-dir> --codes ROOT,KEY --g G [--lut 1] [--spacing-um 100] [--max 64] [--all 0] [--rmax 24] [--block 16] [--delta 12]\n"); return 2; }
     const char *cs = opt(argc, argv, "--codes", nullptr); const double G = atof(opt(argc, argv, "--g", "1"));
     if (!cs || !(G > 0)) { fprintf(stderr, "restore-packed: --codes ROOT,KEY and --g\n"); return 2; }
@@ -412,6 +415,8 @@ int cmd_restore_packed(int argc, char **argv) {
     double pn[2] = {0}, pse[2] = {0}, gn[2] = {0}, gse[2] = {0}, an = 0, ase[2] = {0};
     double sg[3] = {0}; long nblk = 0, agree[2][3] = {{0}};   /* agree[pred][0 both open, 1 pred only (hallucinated), 2 real only (merged)] */
     size_t npk = 0, nall = 0;
+    const char *wout = opt(argc, argv, "--weights", nullptr);   /* per-slot packed fraction -> FILE ("sr_pair": {"weights": FILE}: training draws) */
+    double *wbox = wout ? calloc((size_t)p->n, sizeof *wbox) : nullptr;
     const int nlist = all ? p->n : p->nte;
     for (int ii = 0, done = 0; ii < nlist && done < mx; ii++) {
         const int k = all ? ii : p->te[ii];
@@ -509,7 +514,7 @@ int cmd_restore_packed(int argc, char **argv) {
             for (int a = 0; a < 2; a++) { if (!img[a]) continue; const int po = q75[a] - q25[a] > delta;
                 if (po && ro) agree[a][0]++; else if (po && !ro) agree[a][1]++; else if (!po && ro) agree[a][2]++; }
         }
-        (void)np_;
+        if (wbox) wbox[k] = (double)np_ / (double)t3;
         done++;
     }
 #define PS(sse, n) ((n) > 0 && (sse) > 0 ? 10.0 * log10(65025.0 * (n) / (sse)) : 99.0)
@@ -523,6 +528,8 @@ int cmd_restore_packed(int argc, char **argv) {
         (void)o;
     }
 #undef PS
+    if (wbox) { FILE *wf = fopen(wout, "w"); if (wf) { fprintf(wf, "{\"what\":\"packed fraction per slot (restore-packed, spacing < %g um)\",\"boost\":%s,\"w\":[", spum, opt(argc, argv, "--boost", "4"));
+                for (int i = 0; i < p->n; i++) fprintf(wf, "%s%.4f", i ? "," : "", wbox[i]); fprintf(wf, "]}\n"); fclose(wf); } free(wbox); }
     json_free(bj); srpair_free(p); free(ht); free(hc); free(hlow); free(hout); free(pk); free(ph);
     return 0;
 }

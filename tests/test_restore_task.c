@@ -444,7 +444,7 @@ static void test_pair_sampler(const char *tmp) {
             batch *b = sampler_next(sp); CHECK(b != nullptr, "pair batch"); if (!b) break;
             const int64_t *o = b->corner[0]; const int box = (int)(o[0] / B), oc[3] = {(int)(o[0] % B), (int)o[1], (int)o[2]};
             CHECK(val ? box == 1 : box != 1, "%s window from box %d", val ? "validation" : "training", box);
-            CHECK(fabs(b->um[0] - 9.36 / 4) < 1e-5, "pair batch um %g", b->um[0]);
+            CHECK(fabs(b->um[0] - 4) < 1e-5 && b->level[0] == 0, "pair batch um (the voxel ratio) %g", b->um[0]);
             size_t bad = 0;
             for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
                 const uint8_t t = tg[(size_t)box * t3 + ((size_t)(4 * oc[0] + z) * T + 4 * oc[1] + y) * T + 4 * oc[2] + x];
@@ -456,6 +456,12 @@ static void test_pair_sampler(const char *tmp) {
             sampler_release(sp, b);
         }
         sampler_stop(sp);
+    }
+    {   /* box draw weights: slot 2 weighted 1 + 1 x 100 against slot 0's 1 */
+        char wp[700]; snprintf(wp, sizeof wp, "%s/w.json", tmp); FILE *wf = fopen(wp, "w"); fprintf(wf, "{\"boost\":1,\"w\":[0,0,100]}\n"); fclose(wf);
+        srpair *q = S->src[0].srp; CHECK(!srpair_load_weights(q, wp), "load box weights");
+        int c2 = 0; for (int t = 0; t < 1000; t++) c2 += q->tr[srpair_pick_train(q, (t + 0.5) / 1000)] == 2;
+        CHECK(c2 > 980 && c2 < 1000, "weighted draws: slot 2 drawn %d / 1000 (expect ~990)", c2);
     }
     sources_free(S); free(in); free(tg);
 }

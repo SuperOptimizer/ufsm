@@ -274,6 +274,8 @@ sources *sources_load(const char *path) {
         if (sj) {
             s->srp = srpair_open(json_str(json_get(e, "root"), "."), json_str(json_get(sj, "role"), "train"), (int)json_num(json_get(sj, "lut"), 1), (int)json_num(json_get(sj, "cache"), 0));
             if (!s->srp) { json_free(j); sources_free(S); return nullptr; }
+            const char *wp = json_str(json_get(sj, "weights"), nullptr);   /* per-box draw weights (packed boxes oversampled) */
+            if (wp && srpair_load_weights(s->srp, wp)) { json_free(j); sources_free(S); return nullptr; }
             for (int l = 0; l < MAXLEV; l++) s->ct_present[l] = 0;
             for (int c = 0; c < NCH; c++) for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = 0;
         }

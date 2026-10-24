@@ -1738,7 +1738,7 @@ static int draw_restore_pair(sampler *sp, batch *b, int i, rng *r, uint8_t *big)
     if (!p) return 1;
     const int q = p->same ? P : P / 4; const size_t q3 = (size_t)q * q * q;   /* (same-grid sets: the input crop is on the target grid) */
     const int nb = c->holdout ? p->nte : p->ntr; if (nb <= 0 || q > p->B) return 1;
-    const int k = (c->holdout ? p->te : p->tr)[rint_below(r, nb)];
+    const int k = c->holdout ? p->te[rint_below(r, nb)] : p->tr[srpair_pick_train(p, runif(r))];   /* (training: box_weights.json when present) */
     int oc[3]; for (int d = 0; d < 3; d++) oc[d] = (int)rint_below(r, (p->same ? p->T - P : p->B - q) + 1);
     uint8_t *co = malloc(q3); if (!co) return -1;
     if (srpair_read(p, k, oc, P, big, co)) { free(co); return -1; }
