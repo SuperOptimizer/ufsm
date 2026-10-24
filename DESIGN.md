@@ -526,6 +526,28 @@ Goal: the fitter's slip failure: sheets cut and offset by about a turn, where th
 - Renders: build/aug_render (sampler, plain vs augmented rows), build/scrollaug_anim ... tear (the shift swept 0 -> 1 -> 0);
   ~/ufsm-data/scrollaug/anim/tear-{none,void,blend}.gif.
 
+## Delamination and holes: train --aug-delam P [--aug-delam-hole 0.5] (2026-10-24)
+Goal: sheets that split into layers (a void opening inside a sheet, the outer layer pushed out) and missing papyrus (holes, ash).
+- Same windows as --aug-tear (stored phase, side 2, cube); exclusive with crush and tear; xscan skips damaged windows.
+- src/scrollaug.[ch]: `sa_delam_make` draws 1-3 sites on papyrus (CT >= iso, known phase), each with its own normal from
+  `sa_phase_normal_box` over +-2 turns (oriented so the phase grows along it); peel or hole (p --aug-delam-hole).
+  - Peel: a bump b = t g0 (1 - r^2)^2 (g0 1 .. min(4, spacing / 4) voxels, R 1-4 turns), tapered off the plane between |a| .4 and
+    .6 turns. With delta the phase distance past the split phase phc: 0 <= delta < b is the gap (void CT, phase phc); beyond, the CT is
+    pulled by b w(delta) along the normal (w linear from 1 at the gap edge to 0 at half a turn). The phase is remapped as a function of
+    itself (phase - b w / spacing turns), not resampled: the map is monotone, so the unwrap gains no turn (resampling the phase at the
+    pulled point gave nearest-neighbour jitter that dropped whole w4 tiles as conflicts on Paris 4). Voxels of unknown phase stay unknown.
+  - Hole: a ragged ellipse (R, R2 .5-2.5 turns, 3 harmonics) in the sheet plane, restricted to the centre's sheet (|a| <= .4 turn and
+    within .22 turn of the sheet's CT-weighted mean phase on the normal); papyrus -> void + ash (0-.2) x speckle x (CT - void), soft
+    rims; labels unchanged (the net infers the missing sheet).
+- sample.c `delam_draw`: padded read (margin 6), labels prepared on the padded box (sign, ignore, air), the damage applied, then the
+  ordinary unwrap of the damaged window (continuous, so w4 is smooth inside components).
+- Tests (tests/test_scrollaug.c): t 0 identity; the peel gap is void at the split phase; 16 peels on the fixture unwrap with 0
+  conflict voxels (w4 kept 1.0000 of the undamaged box); holes only darken the CT, labels unchanged; default off bit-identical, p 1
+  deterministic; damaged windows' w4 smooth inside components.
+- Cost P512 one core (4 fixed Paris 4 windows): no net cost (ctread +1.6 s for the padded read, augment -1.8 s: 116.6 vs 132.1 s for
+  24 windows). Render: build/scrollaug_anim ... delam (strength swept 0 -> 1 -> 0, w4 component borders drawn);
+  ~/ufsm-data/scrollaug/anim/delam.gif.
+
 ## Augmentation presets: train --aug all (default) | none (2026-10-16)
 User: "I want all the augs we can get" (robustness to other scrolls, scanners, resolutions and damage from one scroll's labels).
 - `--aug all` is the default for the dense-target tasks on cube windows (recto / side targets); `none` (the old defaults: 48 cube

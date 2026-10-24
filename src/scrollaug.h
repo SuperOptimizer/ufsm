@@ -10,6 +10,28 @@
    median gradient's inverse). Returns the number of gradient samples (outputs unchanged under 32). */
 int sa_phase_normal(const uint8_t *ph, int D, int H, int W, int inset, int stride, double n[3], double *spacing);
 
+/* the same over the sub-box lo .. hi (exclusive) of the box; n oriented so the phase grows along it */
+int sa_phase_normal_box(const uint8_t *ph, int D, int H, int W, const int lo[3], const int hi[3], int stride, double n[3], double *spacing);
+
+/* --aug-delam: per window up to SA_DELAM_MAX damage sites on papyrus voxels, each
+   a peel (kind 0): a thin void opened inside the sheet at the phase phc: within the tangential radius R of the centre c the material
+     beyond the split (phase phc .. phc + ~0.35 turn along n) moves out by g(t) = g0 (1 - |t|^2 / R^2)^2 voxels, the void between
+     sheets beyond absorbing it (compressed); the opened gap gets the void CT and the split's phase (the winding kept);
+   a hole (kind 1): a burned-out patch: papyrus voxels (CT >= iso) inside a ragged elliptic cylinder across the sheet (tangential radii
+     R, R2 along t1 / t2, half thickness ~0.4 turn) become ash (void + a (CT - void) speckled); the labels kept (the net bridges it). */
+enum { SA_DELAM_MAX = 6 };
+typedef struct {
+    int kind; double c[3], n[3], t1[3], t2[3], R, R2, g0, half; uint8_t phc; double ash, wob[3], wph[3];
+} sa_site;
+typedef struct { int n; sa_site s[SA_DELAM_MAX]; double spacing; uint8_t void_ct, iso; } sa_delam;
+/* sites drawn on the padded boxes (P + 2 M)^3 (window corner at M): centres in the window's central 3/4 on papyrus with known phase,
+   local normals from the phase within 2 turns; kinds by p_hole; returns the number of sites (0: none found) */
+int sa_delam_make(sa_delam *d, uint64_t seed, int P, int M, const uint8_t *ct_pad, const uint8_t *ph_pad, double spacing, double p_hole, uint8_t iso);
+/* the window (P^3): CT (trilinear pulls in the peels) and phase (nearest) from the padded boxes; t scales every site (0: a copy) */
+void sa_delam_apply(const sa_delam *d, double t, int P, int M, const uint8_t *ct_pad, const uint8_t *ph_pad, uint8_t *ct, uint8_t *ph);
+/* the margin the peels need (voxels) */
+int sa_delam_margin(double spacing);
+
 /* --aug-tear: a smooth cut surface h(p) = c . (p - p0) + sum_j a_j sin(k_j . p + f_j) = 0 roughly across the sheets (c within
    max_tilt of perpendicular to the sheet normal), the side h > 0 shifted by dp, the other by dm (integer voxels, dp - dm = the
    displacement: up to ~1+ turns along the normal and optionally along the sheet), and the seam: 0 none, 1 a thin void (CT the

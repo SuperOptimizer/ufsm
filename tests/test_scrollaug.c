@@ -4,6 +4,9 @@
      - default off: sources with "xscan" and --aug-xscan 0 give the batches of sources without it (bit-identical)
      - p 1: every window swapped; an identity map gives the plain windows' CT through the quantile match (identity) and the same labels;
        a translated partner changes the CT but keeps the labels where both windows have scan data
+   --aug-tear: the sheet normal / spacing, the cut kernel bit for bit, default off, p 1 deterministic, w4 follows the pulled phase and jumps at the cut
+   --aug-delam: t 0 identity; a peel's gap is void at the split phase and its remapped phase unwraps without conflicts; holes only darken
+     the CT, labels unchanged; default off, p 1 deterministic, w4 smooth inside components
    test_scrollaug [DIR] */
 #define WIND_FIXTURE_NO_MAIN
 #include "make_wind_fixture.c"
@@ -185,11 +188,73 @@ static void tear_tests(const char *dir) {
     drop(a); drop(b); drop(d); drop(e); sources_free(S);
 }
 
+/* --aug-delam: the kernels on a fixture phase box (papyrus +-.2 turn around phase 0), then the sampler */
+static void delam_tests(const char *dir) {
+    {
+        const int P = 40, M = sa_delam_margin(12), Pp = P + 2 * M; const size_t p3 = (size_t)P * P * P, pp3 = (size_t)Pp * Pp * Pp; const int z0 = 40, y0 = 74, x0 = 10;   /* (level 1, clear of the spiral axis at 64, 64) */
+        uint8_t *ph = malloc(pp3), *ct = malloc(pp3), *oc = malloc(p3), *op = malloc(p3), *w4 = malloc(p3), *wc = malloc(p3);
+        for (int z = 0; z < Pp; z++) for (int y = 0; y < Pp; y++) for (int x = 0; x < Pp; x++) {
+            const double w = fx_wind(2. * (z0 + z) + .5, 2. * (y0 + y) + .5, 2. * (x0 + x) + .5);
+            const size_t k = ((size_t)z * Pp + y) * Pp + x; ph[k] = (uint8_t)((int)floor((w - floor(w)) * PHASE_PERIOD) % PHASE_PERIOD);
+            ct[k] = ph[k] < .2 * PHASE_PERIOD || ph[k] > .8 * PHASE_PERIOD ? 160 : 40;
+        }
+        size_t gap = 0, gap_ok = 0, moved = 0, conf = 0, kept0 = 0, kept1 = 0, ident = 1; int npeel = 0, nhole = 0, hole_lab = 1, hole_dark = 1; size_t hole_n = 0;
+        band_wind4_stats st;
+        sa_delam d; sa_delam_make(&d, 7, P, M, ct, ph, 12, 0, 100); sa_delam_apply(&d, 0, P, M, ct, ph, oc, op);
+        for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) ident &= !memcmp(oc + ((size_t)z * P + y) * P, ct + ((size_t)(z + M) * Pp + y + M) * Pp + M, (size_t)P) && !memcmp(op + ((size_t)z * P + y) * P, ph + ((size_t)(z + M) * Pp + y + M) * Pp + M, (size_t)P);
+        band_wind4(op, P, P, P, 80, 512, 15, w4, wc, &st); kept0 = st.kept;
+        for (int it = 0; it < 16; it++) {
+            for (int kind = 0; kind < 2; kind++) {
+                if (!sa_delam_make(&d, 100 + it, P, M, ct, ph, 12, kind, 100)) continue;
+                sa_delam_apply(&d, 1, P, M, ct, ph, oc, op);
+                for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
+                    const size_t k = ((size_t)z * P + y) * P + x, ki = ((size_t)(z + M) * Pp + y + M) * Pp + x + M;
+                    if (kind == 0) {
+                        if (oc[k] == d.void_ct && ct[ki] == 160) { gap++; for (int i = 0; i < d.n; i++) if (op[k] == d.s[i].phc) { gap_ok++; break; } }
+                        moved += op[k] != ph[ki];
+                    } else { hole_lab &= op[k] == ph[ki]; hole_dark &= oc[k] <= ct[ki]; hole_n += oc[k] < ct[ki]; }
+                }
+                if (kind == 0) { npeel++; band_wind4(op, P, P, P, 80, 512, 15, w4, wc, &st); conf += st.dropped_conflict; kept1 += st.kept; }
+                else nhole++;
+            }
+        }
+        printf("scrollaug: delam kernels: %d peel / %d hole draws; peel gap %zu voxels (%zu at the split phase), %zu phase codes moved, w4 kept %.4f of the undamaged box, "
+               "%zu voxels dropped by unwrap conflicts; holes darken %zu voxels\n", npeel, nhole, gap, gap_ok, moved, kept1 / (double)(kept0 * (npeel ? npeel : 1)), conf, hole_n);
+        check("delam apply: t 0 is the box itself (CT, phase)", ident);
+        check("delam peel: the gap is void CT at the split phase (>= 90%: pulled voxels may land on void too), the sheets beyond pulled", npeel >= 12 && gap > 100 && gap_ok >= .9 * (double)gap && moved > gap);
+        check("delam peel: the remapped phase unwraps without conflicts (w4 kept >= 99% of the undamaged box)", conf == 0 && kept1 >= .99 * (double)kept0 * npeel);
+        check("delam hole: CT only darkened, labels unchanged", nhole >= 12 && hole_lab && hole_dark && hole_n > 100);
+        free(ph); free(ct); free(oc); free(op); free(w4); free(wc);
+    }
+    char p[1400]; snprintf(p, sizeof p, "%s/sources.json", dir); sources *S = sources_load(p); assert(S);
+    const int PW = 64; const size_t p3 = (size_t)PW * PW * PW;
+    sample_cfg c = base_cfg(PW); c.snap = 0; c.symmetry_p = 0; c.rotate_p = 0; c.elastic_p = 0; c.zoom_p = 0; c.affine_p = 0;
+    snap a[NB], b[NB], d[NB], e[NB];
+    sampler *sp = sampler_start(S, &c); assert(sp); take(sp, a, p3); sampler_stop(sp);
+    sample_cfg c0 = c; c0.delam_hole = .9;
+    sp = sampler_start(S, &c0); assert(sp); take(sp, b, p3); const uint64_t n0 = sampler_aug_count(sp, AUGN_DELAM); sampler_stop(sp);
+    check("--aug-delam 0: bit-identical", n0 == 0 && same(a, b, p3));
+    sample_cfg c1 = c; c1.delam_p = 1;
+    sp = sampler_start(S, &c1); assert(sp); take(sp, d, p3); const uint64_t n1 = sampler_aug_count(sp, AUGN_DELAM); sampler_stop(sp);
+    sp = sampler_start(S, &c1); assert(sp); take(sp, e, p3); sampler_stop(sp);
+    check("--aug-delam 1: windows damaged, deterministic", n1 >= NB && same(d, e, p3));
+    size_t in_d = 0, big_d = 0;
+    for (int i = 0; i < NB; i++) for (size_t k = 0; k < p3; k++) {
+        if (k + 1 >= p3 || k % PW == PW - 1 || d[i].w4[k] == 255 || d[i].w4[k + 1] == 255 || d[i].wc[k] != d[i].wc[k + 1]) continue;
+        in_d++; big_d += abs(w4diff(d[i].w4[k + 1], d[i].w4[k])) >= 19;
+    }
+    printf("scrollaug: delam sampler: %llu damaged; %zu in-component pairs, %zu with >= 0.3 turn w4 steps\n",
+           (unsigned long long)n1, in_d, big_d);
+    check("--aug-delam: w4 smooth inside each component (< 1e-4 of the pairs step >= 0.3 turn)", in_d > p3 && big_d * 10000 < in_d);
+    drop(a); drop(b); drop(d); drop(e); sources_free(S);
+}
+
 int main(int argc, char **argv) {
     char tmpd[] = "/tmp/ufsm-scrollaug-XXXXXX"; const char *dir = argc > 1 ? argv[1] : mkdtemp(tmpd);
     if (!dir || make_wind_fixture(dir, 256, 2.f)) { fprintf(stderr, "fixture failed\n"); return 1; }
     xscan_tests(dir);
     tear_tests(dir);
+    delam_tests(dir);
     if (argc < 2) { char cmd[1500]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {} }
     printf(failed ? "scrollaug: %d FAILED\n" : "scrollaug: all passed\n", failed);
     return failed != 0;

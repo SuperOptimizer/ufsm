@@ -17,13 +17,25 @@ static const char *opt(int argc, char **argv, const char *f, const char *def) { 
 static double smooth(double u) { return u * u * (3 - 2 * u); }
 
 /* one panel row of a frame: the mid-z plane of P^3 boxes; mode 0 CT, 1 phase hue over CT, 2 winding mod 4 hue */
-static void panel(uint8_t *ix, int W, int px, int P, const uint8_t *ct, const uint8_t *ph, int mode) {
+static void panel(uint8_t *ix, int W, int px, int P, const uint8_t *ct, const uint8_t *ph, int mode, const uint8_t *wc) {   /* (wc: component borders drawn dark in mode 2: each component its own gauge) */
     const size_t z = (size_t)P / 2;
     for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
         const size_t k = (z * P + y) * P + x; const int c = ct[k]; uint8_t *o = ix + (size_t)y * W + px + x;
         if (mode == 0 || !ph || ph[k] >= PHASE_PERIOD) *o = gray_ix(mode ? c / 2 : c);
         else *o = hue_ix(mode == 2 ? 200 : 64 + c * 3 / 4, ph[k] / (double)PHASE_PERIOD);
+        if (wc && ((x + 1 < P && wc[k + 1] != wc[k]) || (y + 1 < P && wc[k + P] != wc[k]))) *o = gray_ix(0);
     }
+}
+/* --crop y,x,s: beside each still, <still>-crop.jpg: the s x s square at y, x of every panel, enlarged to P */
+static const char *g_crop;
+static void still_crop(const char *path, const uint8_t *rgb, int W, int P, int np) {
+    int cy, cx, cs; if (!g_crop || sscanf(g_crop, "%d,%d,%d", &cy, &cx, &cs) != 3 || cs < 4 || cy < 0 || cx < 0 || cy + cs > P || cx + cs > P) return;
+    const int k = P / cs < 1 ? 1 : P / cs, S = cs * k, Wo = np * S + (np - 1) * 4;
+    uint8_t *o = malloc((size_t)Wo * S * 3); memset(o, 40, (size_t)Wo * S * 3);
+    for (int p = 0; p < np; p++) for (int y = 0; y < S; y++) for (int x = 0; x < S; x++)
+        memcpy(o + ((size_t)y * Wo + p * (S + 4) + x) * 3, rgb + ((size_t)(cy + y / k) * W + p * (P + 4) + cx + x / k) * 3, 3);
+    char q[1300]; snprintf(q, sizeof q, "%.*s-crop.jpg", (int)(strlen(path) - 4), path);
+    jpeg_write_rgb(q, Wo, S, o, 90); free(o);
 }
 static void bar(uint8_t *ix, int W, int y0, double t, double h) {
     for (int y = y0; y < y0 + 10; y++) for (int x = 0; x < W; x++) ix[(size_t)y * W + x] = x < (int)(t * W) ? hue_ix(200, h) : gray_ix(40);
@@ -34,21 +46,57 @@ int main(int argc, char **argv) {
     const int P = atoi(opt(argc, argv, "--P", "384")), l = atoi(opt(argc, argv, "--level", "2")), F = atoi(opt(argc, argv, "--frames", "48"));
     const int fps = atoi(opt(argc, argv, "--fps", "12")), seam = atoi(opt(argc, argv, "--seam", "-1")), tear = !strcmp(argv[3], "tear");
     uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "1"));
-    const char *still = opt(argc, argv, "--still", nullptr);
-    if (!tear && strcmp(argv[3], "xscan")) { fprintf(stderr, "scrollaug_anim: tear or xscan\n"); return 2; }
+    const char *still = opt(argc, argv, "--still", nullptr); g_crop = opt(argc, argv, "--crop", nullptr);
+    const int delam = !strcmp(argv[3], "delam");
+    if (!tear && !delam && strcmp(argv[3], "xscan")) { fprintf(stderr, "scrollaug_anim: tear, delam or xscan\n"); return 2; }
     int64_t o[3]; { long long a, b, c; if (sscanf(argv[4], "%lld,%lld,%lld", &a, &b, &c) != 3) return 2; o[0] = a; o[1] = b; o[2] = c; }
     sources *S = sources_load(argv[1]); if (!S) return 1;
     source *s = &S->src[0]; z3 *ct = source_ct(s, l);
     if (!ct || !s->phase) { fprintf(stderr, "scrollaug_anim: no level %d CT or stored phase\n", l); return 1; }
     const int psh = s->phase_level - l; const size_t p3 = (size_t)P * P * P;
     make_pal();
-    const int np = tear ? 3 : 2, W = np * P + (np - 1) * 4, H = P + 14;
+    const int np = tear || delam ? 3 : 2, W = np * P + (np - 1) * 4, H = P + 14;
     uint8_t *ix = malloc((size_t)W * H); uint16_t *tree = malloc((size_t)4096 * 256 * sizeof *tree);
     FILE *f = fopen(argv[2], "wb"); if (!ix || !tree || !f) return 1;
     gif_head(f, W, H);
     const int delay = (100 + fps / 2) / fps;
     uint8_t *cto = malloc(p3), *pho = malloc(p3 + 64), *w4o = malloc(p3), *wco = malloc(p3);
-    if (tear) {
+    if (delam) {   /* sites drawn as the sampler draws them; the first seed with a peel and a hole (--hole p) crossing the mid-z plane */
+        const int M = sa_delam_margin(0), Pp = P + 2 * M; const size_t pp3 = (size_t)Pp * Pp * Pp;
+        const int64_t po[3] = {o[0] - M, o[1] - M, o[2] - M}, pn[3] = {Pp, Pp, Pp};
+        uint8_t *ctp = malloc(pp3), *php = malloc(pp3 + 64);
+        if (!ctp || !php || z3_read(ct, po, pn, ctp, 4) || phase_window(s->phase, po, Pp, Pp, psh, php)) { fprintf(stderr, "read failed\n"); return 1; }
+        double n[3], spacing;
+        if (sa_phase_normal(php, Pp, Pp, Pp, M, P / 32 > 1 ? P / 32 : 1, n, &spacing) < 32) { fprintf(stderr, "too little phase\n"); return 1; }
+        if (s->phase_sign < 0) phase_negate(php, pp3);
+        const int iso = s->iso > 0 ? s->iso : sa_ct_quantile(ctp, pp3, .5);
+        sa_delam dd; int tries = 0, ok = 0;
+        for (; tries < 3000 && !ok; tries++) {
+            if (!sa_delam_make(&dd, seed + (uint64_t)tries, P, M, ctp, php, spacing, atof(opt(argc, argv, "--hole", "0.5")), (uint8_t)iso)) continue;
+            int kinds = 0; for (int i = 0; i < dd.n; i++) if (fabs(dd.s[i].c[0] - P / 2) < .3 * fmin(dd.s[i].R, dd.s[i].R2)) kinds |= 1 << dd.s[i].kind;
+            ok = kinds == 3;
+        }
+        printf("%s: delam seed %llu: spacing %.1f voxels/turn, iso %d, void %d; %d sites:", argv[2], (unsigned long long)(seed + (uint64_t)tries - 1), spacing, iso, dd.void_ct, dd.n);
+        for (int i = 0; i < dd.n; i++) printf(" %s at %.0f %.0f %.0f R %.1f/%.1f g0 %.1f ash %.2f;", dd.s[i].kind ? "hole" : "peel", dd.s[i].c[0], dd.s[i].c[1], dd.s[i].c[2], dd.s[i].R, dd.s[i].R2, dd.s[i].g0, dd.s[i].ash);
+        printf("\n");
+        for (int fr = 0; fr < F; fr++) {
+            const double u = F > 1 ? fr / (double)(F - 1) : 1, a = smooth(1 - fabs(2 * u - 1));
+            sa_delam_apply(&dd, a, P, M, ctp, php, cto, pho);
+            for (size_t k = 0; k < p3; k++) if (!cto[k]) pho[k] = PHASE_UNKNOWN;
+            band_wind4_stats wst; if (band_wind4_tiled(pho, P, P, P, (P + 5) / 6, 80, 512, 1, w4o, wco, &wst) < 0) return 1; if (fr == F / 2) printf("w4 at full strength: %zu of %zu labelled voxels kept, %zu dropped by unwrap conflicts\n", wst.kept, wst.known, wst.dropped_conflict);   /* (the sampler's unwrap of the damaged window) */
+            uint8_t *rowb = malloc((size_t)W * P); memset(rowb, gray_ix(40), (size_t)W * P);
+            panel(rowb, W, 0, P, cto, nullptr, 0, nullptr); panel(rowb, W, P + 4, P, cto, pho, 1, nullptr); panel(rowb, W, 2 * (P + 4), P, cto, w4o, 2, wco);
+            memcpy(ix, rowb, (size_t)W * P); free(rowb);
+            for (size_t k = (size_t)W * P; k < (size_t)W * (P + 4); k++) ix[k] = gray_ix(40);
+            bar(ix, W, P + 4, a, .35);
+            gif_frame(f, ix, W, H, delay, tree);
+            if (still && (fr == 0 || fr == F / 2)) {
+                uint8_t *rgb = malloc((size_t)W * H * 3); for (size_t k = 0; k < (size_t)W * H; k++) memcpy(rgb + 3 * k, pal[ix[k]], 3);
+                char p[1200]; snprintf(p, sizeof p, "%s-t%d.jpg", still, fr ? 1 : 0); jpeg_write_rgb(p, W, H, rgb, 90); still_crop(p, rgb, W, P, np); free(rgb);
+            }
+        }
+        free(ctp); free(php);
+    } else if (tear) {
         const double vox = s->um * (double)(1 << l), maxd = atof(opt(argc, argv, "--um", "480")) / vox, want = fmin(1.25, atof(opt(argc, argv, "--turns", "1")));
         const int M = (int)ceil(.5 * maxd) + 2, Pp = P + 2 * M; const size_t pp3 = (size_t)Pp * Pp * Pp;
         const int64_t po[3] = {o[0] - M, o[1] - M, o[2] - M}, pn[3] = {Pp, Pp, Pp};
@@ -76,14 +124,14 @@ int main(int argc, char **argv) {
             memset(ix, 0, (size_t)W * H);
             uint8_t *rowb = malloc((size_t)W * P);
             memset(rowb, gray_ix(40), (size_t)W * P);
-            panel(rowb, W, 0, P, cto, nullptr, 0); panel(rowb, W, P + 4, P, cto, pho, 1); panel(rowb, W, 2 * (P + 4), P, cto, w4o, 2);
+            panel(rowb, W, 0, P, cto, nullptr, 0, nullptr); panel(rowb, W, P + 4, P, cto, pho, 1, nullptr); panel(rowb, W, 2 * (P + 4), P, cto, w4o, 2, wco);
             memcpy(ix, rowb, (size_t)W * P); free(rowb);
             for (size_t k = (size_t)W * P; k < (size_t)W * (P + 4); k++) ix[k] = gray_ix(40);
             bar(ix, W, P + 4, a, .1);
             gif_frame(f, ix, W, H, delay, tree);
             if (still && (fr == 0 || fr == F / 2)) {
                 uint8_t *rgb = malloc((size_t)W * H * 3); for (size_t k = 0; k < (size_t)W * H; k++) memcpy(rgb + 3 * k, pal[ix[k]], 3);
-                char p[1200]; snprintf(p, sizeof p, "%s-t%d.jpg", still, fr ? 1 : 0); jpeg_write_rgb(p, W, H, rgb, 90); free(rgb);
+                char p[1200]; snprintf(p, sizeof p, "%s-t%d.jpg", still, fr ? 1 : 0); jpeg_write_rgb(p, W, H, rgb, 90); still_crop(p, rgb, W, P, np); free(rgb);
             }
         }
         free(ctp); free(php); free(wwp); free(wcp);
@@ -103,18 +151,18 @@ int main(int argc, char **argv) {
             printf("%s: partner %d: %s %.2f s\n", argv[2], k, rc > 0 ? "swapped" : rc == 0 ? "under half covered (skipped)" : "read error", tnow() - t0);
             if (rc <= 0) { free(x); continue; }
             shown++;
-            for (int fr = 0; fr < F; fr++) {   /* fade in over the first third, hold, fade out over the last third */
+        for (int fr = 0; fr < F; fr++) {   /* fade in over the first third, hold, fade out over the last third */
                 const double u = F > 1 ? fr / (double)(F - 1) : 1, a = smooth(u < 1. / 3 ? 3 * u : u > 2. / 3 ? 3 * (1 - u) : 1);
                 for (size_t q = 0; q < p3; q++) { cur[q] = (uint8_t)lrint((1 - a) * cto[q] + a * x[q]); ph2[q] = cur[q] ? pho[q] : PHASE_UNKNOWN; }
                 uint8_t *rowb = malloc((size_t)W * P); memset(rowb, gray_ix(40), (size_t)W * P);
-                panel(rowb, W, 0, P, cur, nullptr, 0); panel(rowb, W, P + 4, P, cur, ph2, 1);
+                panel(rowb, W, 0, P, cur, nullptr, 0, nullptr); panel(rowb, W, P + 4, P, cur, ph2, 1, nullptr);
                 memcpy(ix, rowb, (size_t)W * P); free(rowb);
                 for (size_t q = (size_t)W * P; q < (size_t)W * (P + 4); q++) ix[q] = gray_ix(40);
                 bar(ix, W, P + 4, a, k ? .6 : .1);
                 gif_frame(f, ix, W, H, delay, tree);
                 if (still && fr == F / 2) {
                     uint8_t *rgb = malloc((size_t)W * H * 3); for (size_t q = 0; q < (size_t)W * H; q++) memcpy(rgb + 3 * q, pal[ix[q]], 3);
-                    char p[1200]; snprintf(p, sizeof p, "%s-p%d.jpg", still, k); jpeg_write_rgb(p, W, H, rgb, 90); free(rgb);
+                    char p[1200]; snprintf(p, sizeof p, "%s-p%d.jpg", still, k); jpeg_write_rgb(p, W, H, rgb, 90); still_crop(p, rgb, W, P, np); free(rgb);
                 }
             }
             free(x);
