@@ -1194,7 +1194,9 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     if (Q->dist > 0 && Q->dstr > 0 && dvon) {   /* dense distillation targets: dinovol on each un-augmented global, its dense head on an S-grid (random offset) of the same crop */
         int nd, ni; const int DC = dv_dense_dims(Q->dv, &nd, &ni); const int S = Q->dstr, gs_ = Q->PG / S, NP = Q->dnp;
         for (int j = 0; j < 2 * N; j++) {
-            const int si = Q->smsi[j / 2], oz = (int)(rng_next(&Q->ar) % (uint64_t)S), oy = (int)(rng_next(&Q->ar) % (uint64_t)S), ox = (int)(rng_next(&Q->ar) % (uint64_t)S);
+            static int ddet = -1; if (ddet < 0) ddet = getenv("UFSM_DIST_DET") ? atoi(getenv("UFSM_DIST_DET")) : 0;   /* (debug: offset 0; with UFSM_SSL_FIXED the targets must repeat exactly) */
+            int oz = (int)(rng_next(&Q->ar) % (uint64_t)S), oy = (int)(rng_next(&Q->ar) % (uint64_t)S), ox = (int)(rng_next(&Q->ar) % (uint64_t)S); const int si = Q->smsi[j / 2];
+            if (ddet) oz = oy = ox = 0;
             dr_crops(Q->src, Q->Ps, Q->xfd + j, Q->dvid, 1, Q->PG, Q->dvf); dr_f2u8(Q->dvf, (long long)g3, Q->dvu);
             nn_sync();
             if (dv_forward(Q->dv, Q->dvu, Q->PG, (float)Q->dvm[si], (float)Q->dvs[si], (float)Q->dvh[si])) return 1;
@@ -1207,6 +1209,11 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             for (int a = 0; a < NP; a++) memcpy(Q->dtd + ((size_t)j * NP + a) * nd, Q->dacch + (size_t)a * DC, (size_t)nd * 4);
         }
         nn_h2d(Q->ddp, Q->ddph, (size_t)2 * N * NP * 4);
+        static int ddet2 = -1; if (ddet2 < 0) ddet2 = getenv("UFSM_DIST_DET") ? atoi(getenv("UFSM_DIST_DET")) : 0;
+        if (ddet2) { static float *t0; const size_t nt = (size_t)2 * N * NP * nd;
+            if (!t0) { t0 = malloc(nt * 4); memcpy(t0, Q->dtd, nt * 4); }
+            else { double c = 0, mn = 1; for (size_t k = 0; k < (size_t)2 * N * NP; k++) { double d = 0; for (int e = 0; e < nd; e++) d += (double)t0[k * nd + e] * Q->dtd[k * nd + e]; c += d; if (d < mn) mn = d; }
+                fprintf(stderr, "dist det step %d: targets vs step 1 mean cos %.6f, min %.6f\n", step, c / (2.0 * N * NP), mn); } }
     }
     if (Q->dist > 0 && Q->dstr <= 0 && R > 0 && dvon) {   /* distillation targets: dinovol on each un-augmented global, its dense head at the partner's mapped cell centres */
         int nd, ni; const int DC = dv_dense_dims(Q->dv, &nd, &ni);
