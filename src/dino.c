@@ -1489,9 +1489,14 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             dr_scatter_unit_f32(Q->dse, Q->dge, Q->dsn, Q->ddp + (size_t)j * NP, NP, nd, g3, 1.f, Q->glzib + (size_t)Q->dch * g3);
             free(eh); free(gh);
         }
+        static int donly = -1; if (donly < 0) donly = getenv("UFSM_DIST_ONLY") && atoi(getenv("UFSM_DIST_ONLY"));
+        if (donly) {   /* (debug: the distillation loss alone -- no token / CLS gradient, no iBOT logits; locals contribute nothing) */
+            nn_zero(Q->tgrad, Q->tgn * 4);
+            if (dden) { const int CO_ = unet_cfg_of(n)->cout, e_ = Q->dch + Q->dnd; if (Q->dch > 0) nn_zero(Q->glzib, (size_t)Q->dch * g3 * 4); if (e_ < CO_) nn_zero(Q->glzib + (size_t)e_ * g3, (size_t)(CO_ - e_) * g3 * 4); }
+        }
         unet_set_token_grad(n, Q->tgrad);
-        unet_backward(n, ib || dden ? Q->glzib : gl ? Q->glzg : Q->glzl);
-        if (dbg && j == 0) { const size_t np_ = unet_nparams(n); float *g = malloc(np_ * 4); nn_d2h(g, unet_grad_ptr(n), np_ * 4); double a = 0; for (size_t k = 0; k < np_; k++) a += (double)g[k] * g[k];
+        if (!donly || dden) unet_backward(n, ib || dden ? Q->glzib : gl ? Q->glzg : Q->glzl);   /* (debug UFSM_DIST_ONLY: views without distillation are skipped) */
+        if (dbg && j == 0) { unet_debug_grads(n, "view 0"); const size_t np_ = unet_nparams(n); float *g = malloc(np_ * 4); nn_d2h(g, unet_grad_ptr(n), np_ * 4); double a = 0; for (size_t k = 0; k < np_; k++) a += (double)g[k] * g[k];
             fprintf(stderr, "dbg step %d view 0: trunk |grad| %.3e over %zu params\n", step, sqrt(a), np_); free(g); }
         unet_set_token_grad(n, nullptr);
         if (ib) nn_zero(Q->glzib + (size_t)Q->ich * g3, (size_t)32 * g3 * 4);

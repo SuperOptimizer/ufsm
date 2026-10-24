@@ -3763,6 +3763,21 @@ void unet_debug_stats(const unet *u) {
         fprintf(stderr, " max|w| %.3g %.3g\n", w1, w2); free(h);
     }
 }
+/* debug: per block, the gradient norm of each 3^3 conv weight (c1, c2) and of the attention blocks' linears; the head */
+void unet_debug_grads(const unet *u, const char *tag) {
+    const int L = u->cfg.nlev; float *h = malloc(u->np * 4); nn_d2h(h, u->g, u->np * 4);
+    #define GN_(off, n) ({ double a_ = 0; for (size_t k_ = 0; k_ < (size_t)(n); k_++) a_ += (double)h[(off) + k_] * h[(off) + k_]; sqrt(a_); })
+    fprintf(stderr, "grads %s:", tag);
+    for (int i = 0; i < 2 * L - 1; i++) {
+        const block *b = i < L ? &u->enc[i] : &u->dec[2 * L - 2 - i]; const int li = i < L ? i : 2 * L - 2 - i;
+        const size_t n1 = (size_t)b->c1.cout * b->c1.cin * 27, n2 = (size_t)b->c2.cout * b->c2.cin * 27;
+        fprintf(stderr, " %s%d %.2e/%.2e", i < L ? "e" : "d", li, GN_(b->c1.w, n1), GN_(b->c2.w, n2));
+    }
+    for (int k = 0; k < u->tbn; k++) for (int m = 0; m < 4; m++) { const convp *c = &u->tbm[k][m]; fprintf(stderr, " t%d.%d %.2e", k, m, GN_(c->w, (size_t)c->cin * c->cout)); }
+    fprintf(stderr, " head %.2e\n", GN_(u->head.w, (size_t)u->head.cin * u->head.cout));
+    #undef GN_
+    free(h);
+}
 /* debug: per sample, non-finite count and largest |value| of a stored activation tensor (16-bit or fp32 storage; not MX) */
 static void dbg_tensor(const char *nm, const float *t, shape5 s) {
     if (!t) { fprintf(stderr, " %s -", nm); return; }
