@@ -865,7 +865,7 @@ typedef struct {
     /* --ssl-distill W: dense cosine distillation of dinovol's unit 64-d sheet (object) embedding at the mapped points into head channels
        dch..dch+63 (student: the cell centres of each global; target: dinovol on the partner's un-augmented global at the same physical point);
        --ssl-distill-abs A scales that per-point term, --ssl-distill-rel W adds W x the crop's similarity-matrix match (ss_relsim: rotation-free) */
-    float dist; int dch, dnd; float *dcrd, *dacc, *dth, *dse, *dsn, *dge, *dch_h, *dacch; double dist_l; long dist_n; float drel, dabs; double rel_l; long rel_n;
+    float dist; int dch, dnd; float *dcrd, *dacc, *dth, *dse, *dsn, *dge, *dch_h, *dacch; double dist_l; long dist_n; float drel, dabs; double rel_l; long rel_n; int dstr, dnp, *ddp, *ddph; float *dtd;   /* (dense mode: --ssl-distill-stride S grid points of every global, its own crop) */
     int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -943,7 +943,8 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         if (xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
         xnet_set_budget((size_t)(atof(opt(argc, argv, "--ssl-dv-mem", "4")) * 1e9));
         Q->dist = (float)atof(opt(argc, argv, "--ssl-distill", "0")); Q->dch = atoi(opt(argc, argv, "--ssl-distill-ch", "0"));
-        Q->drel = (float)atof(opt(argc, argv, "--ssl-distill-rel", "0")); Q->dabs = (float)atof(opt(argc, argv, "--ssl-distill-abs", "1"));   /* (relational: crop-local similarity matrices; abs: the per-point cosine) */
+        Q->drel = (float)atof(opt(argc, argv, "--ssl-distill-rel", "0")); Q->dabs = (float)atof(opt(argc, argv, "--ssl-distill-abs", "1"));
+        Q->dstr = atoi(opt(argc, argv, "--ssl-distill-stride", "0"));   /* 0: the iBOT rows (cross-view); S: dense, every S-th voxel per axis of each global (own crop) */   /* (relational: crop-local similarity matrices; abs: the per-point cosine) */
         if (!(Q->dv = dv_load(dvck)) || (Q->dist <= 0 && dv_head_host(dvck, "ibot_head", &Q->DVH, &dvPh))) return 1;
         Q->icos = !strcmp(opt(argc, argv, "--ssl-ibot-loss", "ce"), "cos");   /* cos: regress dinovol's (unit) patch token directly, no prototypes */
         if (Q->dist > 0) { int ni; dv_dense_dims(Q->dv, &Q->dnd, &ni); Q->icos = 0;
@@ -978,8 +979,11 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         Q->zvg = nn_malloc((size_t)IM * (HB > 1024 ? HB : 1024) * 4); Q->usei = calloc((size_t)KI, 1);
         if (Q->dv && Q->dist > 0) {   /* distillation buffers (our own EMA teacher keeps the iBOT targets) */
             int nd, ni; const int DC = dv_dense_dims(Q->dv, &nd, &ni);
-            Q->dcrd = xmalloc_dev((size_t)IM * 12); Q->dacc = xmalloc_dev((size_t)IM * DC * 4); Q->dacch = malloc((size_t)IM * DC * 4); Q->dch_h = malloc((size_t)IM * 12);
-            Q->dth = malloc((size_t)R * nd * 4); Q->dse = nn_malloc((size_t)IM * nd * 4); Q->dsn = nn_malloc((size_t)IM * 4); Q->dge = nn_malloc((size_t)IM * nd * 4);
+            if (Q->dstr > 0) { const int gs_ = Q->PG / Q->dstr; Q->dnp = gs_ * gs_ * gs_; Q->ddph = malloc((size_t)2 * N * Q->dnp * 4); Q->ddp = nn_malloc((size_t)2 * N * Q->dnp * 4);
+                Q->dtd = malloc((size_t)2 * N * Q->dnp * nd * 4); }
+            const size_t MX = (size_t)(Q->dnp > IM ? Q->dnp : IM);
+            Q->dcrd = xmalloc_dev(MX * 12); Q->dacc = xmalloc_dev(MX * DC * 4); Q->dacch = malloc(MX * DC * 4); Q->dch_h = malloc(MX * 12);
+            Q->dth = malloc((size_t)R * nd * 4); Q->dse = nn_malloc(MX * nd * 4); Q->dsn = nn_malloc(MX * 4); Q->dge = nn_malloc(MX * nd * 4);
             Q->dvf = nn_malloc(g3 * 4); Q->dvu = nn_malloc(g3); Q->smsi = calloc(N, sizeof *Q->smsi);
             dr_int id; memset(&id, 0, sizeof id); id.center = 0.f; id.scale = 1.f; id.gamma = 1.f; id.lo = 0.f; id.hi = 255.f; id.contrast = 1.f;
             Q->dvid = nn_malloc(sizeof id); nn_h2d(Q->dvid, &id, sizeof id);
@@ -1185,7 +1189,24 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
       dr_argmax_rows(Q->tl, 2 * N, K, am); nn_d2h(hm, am, (size_t)2 * N * 4);   /* (agreement on the raw teacher logits: Sinkhorn's equipartition over 2N << K rows keeps the targets' argmaxes apart) */
       int ag = 0, ab = 0; for (int i = 0; i < N; i++) { ag += hm[2 * i] == hm[2 * i + 1]; ab += hm[2 * i] == hm[2 * ((i + 1) % N) + 1]; } Q->sums[2] += (double)ag / N; Q->st[4] += (double)ab / N; }
     const int dvon = Q->dv && (Q->dvuntil <= 0 || step <= Q->dvuntil);
-    if (Q->dist > 0 && R > 0 && dvon) {   /* distillation targets: dinovol on each un-augmented global, its dense head at the partner's mapped cell centres */
+    if (Q->dist > 0 && Q->dstr > 0 && dvon) {   /* dense distillation targets: dinovol on each un-augmented global, its dense head on an S-grid (random offset) of the same crop */
+        int nd, ni; const int DC = dv_dense_dims(Q->dv, &nd, &ni); const int S = Q->dstr, gs_ = Q->PG / S, NP = Q->dnp;
+        for (int j = 0; j < 2 * N; j++) {
+            const int si = Q->smsi[j / 2], oz = (int)(rng_next(&Q->ar) % (uint64_t)S), oy = (int)(rng_next(&Q->ar) % (uint64_t)S), ox = (int)(rng_next(&Q->ar) % (uint64_t)S);
+            dr_crops(Q->src, Q->Ps, Q->xfd + j, Q->dvid, 1, Q->PG, Q->dvf); dr_f2u8(Q->dvf, (long long)g3, Q->dvu);
+            nn_sync();
+            if (dv_forward(Q->dv, Q->dvu, Q->PG, (float)Q->dvm[si], (float)Q->dvs[si], (float)Q->dvh[si])) return 1;
+            int *ix = Q->ddph + (size_t)j * NP;
+            for (int a = 0; a < NP; a++) { const int z = oz + S * (a / (gs_ * gs_)), y = oy + S * (a / gs_ % gs_), x = ox + S * (a % gs_);
+                ix[a] = (z * Q->PG + y) * Q->PG + x; Q->dch_h[3 * a] = (float)z; Q->dch_h[3 * a + 1] = (float)y; Q->dch_h[3 * a + 2] = (float)x; }
+            xh2d(Q->dcrd, Q->dch_h, (size_t)NP * 12);
+            if (dv_net_points(Q->dv, Q->dcrd, nullptr, nullptr, NP, Q->dacc)) return 1;
+            xd2h(Q->dacch, Q->dacc, (size_t)NP * DC * 4);
+            for (int a = 0; a < NP; a++) memcpy(Q->dtd + ((size_t)j * NP + a) * nd, Q->dacch + (size_t)a * DC, (size_t)nd * 4);
+        }
+        nn_h2d(Q->ddp, Q->ddph, (size_t)2 * N * NP * 4);
+    }
+    if (Q->dist > 0 && Q->dstr <= 0 && R > 0 && dvon) {   /* distillation targets: dinovol on each un-augmented global, its dense head at the partner's mapped cell centres */
         int nd, ni; const int DC = dv_dense_dims(Q->dv, &nd, &ni);
         for (int j = 0; j < 2 * N; j++) {
             const int w = j ^ 1, m = Q->cnt[w]; if (!m) continue;
@@ -1199,6 +1220,27 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             if (dv_net_points(Q->dv, Q->dcrd, nullptr, nullptr, m, Q->dacc)) return 1;
             xd2h(Q->dacch, Q->dacc, (size_t)m * DC * 4);   /* (synchronous on xnet's stream) */
             for (int k = 0; k < m; k++) memcpy(Q->dth + (size_t)(Q->off[w] + k) * nd, Q->dacch + (size_t)k * DC, (size_t)nd * 4);
+        }
+        static int dck = -1; if (dck < 0) dck = getenv("UFSM_DIST_CHECK") ? atoi(getenv("UFSM_DIST_CHECK")) : 0;
+        if (dck > 0 && step % dck == 1) {   /* alignment check: dinovol on crop w at the student's cell centres hS[w] vs the targets (crop w^1 at hT[w]):
+                                               the same physical points seen in two crops; shuffled pairs and a +4 vx z shift for scale */
+            double cm = 0, cs = 0, csh = 0; long n_ = 0;
+            for (int w = 0; w < 2 * N; w++) {
+                const int m = Q->cnt[w]; if (!m) continue; const int si = Q->smsi[w / 2];
+                dr_crops(Q->src, Q->Ps, Q->xfd + w, Q->dvid, 1, Q->PG, Q->dvf); dr_f2u8(Q->dvf, (long long)g3, Q->dvu); nn_sync();
+                if (dv_forward(Q->dv, Q->dvu, Q->PG, (float)Q->dvm[si], (float)Q->dvs[si], (float)Q->dvh[si])) return 1;
+                for (int sh = 0; sh < 2; sh++) {
+                    for (int k = 0; k < m; k++) { const int q = Q->hS[(size_t)w * Q->IM + k]; int z = q / (Q->PG * Q->PG) + 4 * sh; z = z >= Q->PG ? Q->PG - 1 : z;
+                        Q->dch_h[3 * k] = (float)z; Q->dch_h[3 * k + 1] = (float)((q / Q->PG) % Q->PG); Q->dch_h[3 * k + 2] = (float)(q % Q->PG); }
+                    xh2d(Q->dcrd, Q->dch_h, (size_t)m * 12);
+                    if (dv_net_points(Q->dv, Q->dcrd, nullptr, nullptr, m, Q->dacc)) return 1;
+                    xd2h(Q->dacch, Q->dacc, (size_t)m * DC * 4);
+                    for (int k = 0; k < m; k++) { const float *a = Q->dacch + (size_t)k * DC, *t = Q->dth + (size_t)(Q->off[w] + k) * nd, *t2 = Q->dth + (size_t)(Q->off[w] + (k + 7) % m) * nd;
+                        double d = 0, d2 = 0; for (int e = 0; e < nd; e++) { d += (double)a[e] * t[e]; d2 += (double)a[e] * t2[e]; }
+                        if (sh) csh += d; else { cm += d; cs += d2; n_++; } }
+                }
+            }
+            if (n_) fprintf(stderr, "dist check step %d: dinovol cos at matched points across the two crops %.3f, +4 vx z %.3f, shuffled %.3f (%ld points)\n", step, cm / n_, csh / n_, cs / n_, n_);
         }
     }
     if (Q->wib > 0 && R > 0 && dvon && Q->dist <= 0) {   /* diag-dv: dinovol's tokens of each un-augmented teacher global at the mapped cells -> its iBOT head */
@@ -1325,7 +1367,7 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             }
             if (Q->itok) dr_rownorm_bwd(Q->idE, Q->ieS, Q->irsS, m, CT, Q->idE);
             if (!Q->itok) dr_scatter_unit_f32(Q->ieS, Q->idE, Q->inS, Q->d_hS + (size_t)j * Q->IM, m, 32, g3, 1.f, Q->glzib + (size_t)Q->ich * g3);
-            if (Q->dist > 0 && dvon) {   /* distillation: L = dist / R sum_k (1 - e_k . t_k), e = unit(head channels dch..) at the cell centre; d / d e = -dist / R t */
+            if (Q->dist > 0 && Q->dstr <= 0 && dvon) {   /* distillation: L = dist / R sum_k (1 - e_k . t_k), e = unit(head channels dch..) at the cell centre; d / d e = -dist / R t */
                 const int nd = Q->dnd; float *eh = malloc((size_t)m * nd * 4), *gh = malloc((size_t)m * nd * 4); const float *th = Q->dth + (size_t)Q->off[j] * nd;
                 dn_gather((const char *)lgs + (size_t)Q->dch * g3 * (h16 ? 2 : 4), h16, g3, nd, Q->d_hS + (size_t)j * Q->IM, m, Q->dse, Q->dsn);
                 nn_d2h(eh, Q->dse, (size_t)m * nd * 4);
@@ -1414,13 +1456,32 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
         if (Q->cls_reg) nn_axpy(Q->tgrad, gs, Q->dcls, (size_t)CT);   /* (the register row) */
         if (Q->cls_reg != 1) { float *dp = Q->dcls + (Q->cls_reg == 2 ? CT : 0); dn_axpby(dp, dp, (size_t)CT, gs, 0.f); dr_pool_bwd(dp, 1, Sv, CT, nreg, Q->tgrad); }
         if (ib && Q->itok) dr_rows_scatter_add(Q->idE, Q->d_tS + (size_t)j * Q->IM, Q->cnt[j], CT, gs, Q->tgrad);   /* (iBOT on the tokens: the scaled token-gradient domain) */
+        const int dden = gl && Q->dist > 0 && Q->dstr > 0 && dvon;
+        if (dden) {   /* dense distillation: L = dist / (2N NP) sum (1 - e . t) over every global's grid points (+ the relational term on a 256-point subset) */
+            const int nd = Q->dnd, NP = Q->dnp, h16 = unet_logits_h16(n); float *eh = malloc((size_t)NP * nd * 4), *gh = malloc((size_t)NP * nd * 4); const float *th = Q->dtd + (size_t)j * NP * nd;
+            dn_gather((const char *)lgs + (size_t)Q->dch * g3 * (h16 ? 2 : 4), h16, g3, nd, Q->ddp + (size_t)j * NP, NP, Q->dse, Q->dsn);
+            nn_d2h(eh, Q->dse, (size_t)NP * nd * 4);
+            const float wv = Q->dist * Q->dabs / (float)(2 * N * NP);
+            for (int k = 0; k < NP; k++) { double d = 0; for (int e = 0; e < nd; e++) { d += (double)eh[(size_t)k * nd + e] * th[(size_t)k * nd + e]; gh[(size_t)k * nd + e] = -wv * th[(size_t)k * nd + e]; }
+                Q->dist_l += 1 - d; Q->dist_n++; }
+            if (Q->drel > 0) {   /* (a random 256-point subset: rows k * stride) */
+                const int mr = NP < 256 ? NP : 256, st_ = NP / mr; float *es = malloc((size_t)mr * nd * 4), *ts_ = malloc((size_t)mr * nd * 4), *gs2 = calloc((size_t)mr * nd, 4);
+                const int o_ = (int)(rng_next(&Q->ar) % (uint64_t)st_);
+                for (int k = 0; k < mr; k++) { memcpy(es + (size_t)k * nd, eh + (size_t)(k * st_ + o_) * nd, (size_t)nd * 4); memcpy(ts_ + (size_t)k * nd, th + (size_t)(k * st_ + o_) * nd, (size_t)nd * 4); }
+                Q->rel_l += ss_relsim(es, ts_, mr, nd, 1.0, nullptr); Q->rel_n++; ss_relsim(es, ts_, mr, nd, Q->dist * Q->drel / (2.0 * N), gs2);
+                for (int k = 0; k < mr; k++) for (int e = 0; e < nd; e++) gh[(size_t)(k * st_ + o_) * nd + e] += gs2[(size_t)k * nd + e];
+                free(es); free(ts_); free(gs2); }
+            nn_h2d(Q->dge, gh, (size_t)NP * nd * 4);
+            dr_scatter_unit_f32(Q->dse, Q->dge, Q->dsn, Q->ddp + (size_t)j * NP, NP, nd, g3, 1.f, Q->glzib + (size_t)Q->dch * g3);
+            free(eh); free(gh);
+        }
         unet_set_token_grad(n, Q->tgrad);
-        unet_backward(n, ib ? Q->glzib : gl ? Q->glzg : Q->glzl);
+        unet_backward(n, ib || dden ? Q->glzib : gl ? Q->glzg : Q->glzl);
         if (dbg && j == 0) { const size_t np_ = unet_nparams(n); float *g = malloc(np_ * 4); nn_d2h(g, unet_grad_ptr(n), np_ * 4); double a = 0; for (size_t k = 0; k < np_; k++) a += (double)g[k] * g[k];
             fprintf(stderr, "dbg step %d view 0: trunk |grad| %.3e over %zu params\n", step, sqrt(a), np_); free(g); }
         unet_set_token_grad(n, nullptr);
         if (ib) nn_zero(Q->glzib + (size_t)Q->ich * g3, (size_t)32 * g3 * 4);
-        if (ib && Q->dist > 0) nn_zero(Q->glzib + (size_t)Q->dch * g3, (size_t)Q->dnd * g3 * 4);
+        if ((ib || dden) && Q->dist > 0) nn_zero(Q->glzib + (size_t)Q->dch * g3, (size_t)Q->dnd * g3 * 4);
     }
     const size_t np = unet_nparams(Q->u);
     nn_axpy(unet_grad_ptr(Q->u), 1.f, unet_grad_ptr(Q->ug), np); nn_axpy(unet_grad_ptr(Q->u), 1.f, unet_grad_ptr(Q->ul), np);
