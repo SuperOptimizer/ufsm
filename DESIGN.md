@@ -483,6 +483,9 @@ windows); default p 0 = bit-identical (test). A crushed window replaces the plai
 - Tests tests/test_crush.c (analytic spiral: invertibility, det vs FD, C1, footprint, void vs papyrus compression, normals; fixture
   windows: phase = frac(W(pull)), CT agreement per class, blocked == point pull, lattice error; sampler: default-off bit identity,
   p 1 crushes deterministically). Renders: build/crush_render (4 panels: CT | phase | crushed CT | crushed phase).
+- Animations: build/crush_anim (`crush_map_scaled`: squash k^t, bends / kink x t, sigma = s' + t (F - s'), each frame invertible,
+  tested) sweeps t 0 -> 1 -> 0 over one window, slice across the sheets, CT | phase hue, own LZW GIF89a writer (64 grays + 16 x 12
+  hue / brightness palette, looping, 12 fps). ~10-15 s for 48 frames at P 384 (point pulls). Examples ~/ufsm-data/crush/anim.
 
 ## Augmentation presets: train --aug all (default) | none (2026-10-16)
 User: "I want all the augs we can get" (robustness to other scrolls, scanners, resolutions and damage from one scroll's labels).

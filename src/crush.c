@@ -111,6 +111,26 @@ void crush_footprint(const crush_map *m, double ext[3]) {
 
 void crush_map_free(crush_map *m) { free(m->tab); m->tab = nullptr; }
 
+int crush_map_scaled(crush_map *out, const crush_map *m, double t) {
+    const double k = m->sq_k, *d = m->sq_d;
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) if (fabs(m->M[i][j] - ((i == j) + (k - 1) * d[i] * d[j])) > 1e-9) return 1;
+    *out = *m; out->tab = nullptr;
+    const double kt = pow(k, t);
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { out->M[i][j] = (i == j) + (kt - 1) * d[i] * d[j]; out->Minv[i][j] = (i == j) + (1 / kt - 1) * d[i] * d[j]; }
+    out->sq_k = out->det = kt;
+    for (int i = 0; i < 2; i++) out->bA[i] = t * m->bA[i];
+    out->kS = t * m->kS; out->j0 = 1 - (1 - m->j0) * t;
+    if (m->tab) {
+        const size_t nc = (size_t)m->G[0] * m->G[1];
+        if (!(out->tab = malloc(nc * m->ns * 2 * sizeof *out->tab))) return -1;
+        for (size_t c = 0; c < nc; c++) for (int mm = 0; mm < m->ns; mm++) {
+            const size_t q = (c * m->ns + mm) * 2; const double s = m->smin + mm;
+            out->tab[q] = (float)(s + t * (m->tab[q] - s)); out->tab[q + 1] = (float)(1 + t * (m->tab[q + 1] - 1));
+        }
+    }
+    return 0;
+}
+
 /* quadratic B-spline weights of the nodes i0 .. i0 + 2 at node coordinate t (C1, nonnegative, sum 1) */
 static void cr_bsp(double t, int *i0, double w[3]) {
     const int mm = (int)floor(t + .5); const double d = t - mm;

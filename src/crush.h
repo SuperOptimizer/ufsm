@@ -56,6 +56,10 @@ void crush_map_init(crush_map *m, const crush_cfg *cfg, uint64_t seed, int P, co
 typedef double (*crush_ct_fn)(void *ud, const double x[3]);
 int crush_map_columns(crush_map *m, double jlo, double jhi, uint64_t seed, crush_ct_fn ct, void *ud);
 void crush_map_free(crush_map *m);
+/* the map at strength t in [0, 1] (animations): squash k^t, bend / kink amplitudes x t, collapse sigma = s' + t (F(s') - s') (a blend of
+   two monotone Hermites on the same knots: monotone, C1, invertible; t 0 = identity, t 1 = m). m must be rotation-free (cfg rotate_deg 0).
+   out owns its table (crush_map_free). 0 ok, 1 m rotated, -1 alloc. */
+int crush_map_scaled(crush_map *out, const crush_map *m, double t);
 /* the pull (output voxel u -> source x, window coordinates of the map's level); jdet: the Jacobian determinant (nullable) */
 void crush_pull(const crush_map *m, const double u[3], double x[3], double *jdet);
 /* the pull crush_window applies at output voxel u (integer): with lat 2 the trilinear blend of the exact pulls at the nodes

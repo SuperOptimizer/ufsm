@@ -40,7 +40,7 @@ static double det3(double J[3][3]) { return J[0][0] * (J[1][1] * J[2][2] - J[1][
 static double urand(uint64_t *s) { *s = *s * 6364136223846793005ull + 1442695040888963407ull; return (double)(*s >> 11) * 0x1.0p-53; }
 
 static void map_tests(void) {
-    const int P = 96; int inv = 1, pos = 1, detok = 1, c1 = 1, comp = 1, nrm = 1, foot = 1, any_col = 0; double worst_inv = 0, worst_c1 = 0, worst_n = 0, worst_det = 0;
+    const int P = 96; int inv = 1, pos = 1, detok = 1, c1 = 1, comp = 1, nrm = 1, foot = 1, any_col = 0, sc_ok = 1, sc_rot = 1; double worst_inv = 0, worst_c1 = 0, worst_n = 0, worst_det = 0;
     for (int t = 0; t < 12; t++) {
         crush_cfg cfg = crush_cfg_default(); cfg.p = 1;
         cfg.squash_p = t % 3 == 0 ? 0 : 1; cfg.bend_p = t % 2 ? 1 : 0; cfg.kink_p = t % 4 == 1 ? 1 : 0; cfg.jlo = .1f; cfg.jhi = .3f;
@@ -75,8 +75,26 @@ static void map_tests(void) {
             comp &= mv > 1.6 * mp && mp < 1.6;
             if (t < 4) printf("crush: map %d: k %.2f, bends %d, kink %d, j0 %.2f: F' void %.2f papyrus %.2f\n", t, m.sq_k, m.nsin, m.kink, m.j0, mv, mp);
         }
+        {   /* crush_map_scaled (animations): t 0 identity, t 1 the map, between invertible with det > 0; a rotated map is refused */
+            crush_map tmp; sc_rot &= crush_map_scaled(&tmp, &m, .5) == (cfg.rotate_deg > 0 ? 1 : 0); if (cfg.rotate_deg <= 0) crush_map_free(&tmp);
+            crush_cfg c0 = cfg; c0.rotate_deg = 0; crush_map m0; crush_map_init(&m0, &c0, 1000 + t, P, n); crush_map_columns(&m0, cfg.jlo, cfg.jhi, 77 + t, an_ct, &a);
+            const double ts[4] = {0, .37, .8, 1};
+            for (int q = 0; q < 4; q++) {
+                crush_map ms; if (crush_map_scaled(&ms, &m0, ts[q])) { sc_ok = 0; continue; }
+                for (int k = 0; k < 60; k++) {
+                    const double u[3] = {urand(&rs) * (P - 1), urand(&rs) * (P - 1), urand(&rs) * (P - 1)}; double x[3], x1[3], v[3], jd;
+                    crush_pull(&ms, u, x, &jd); crush_push(&ms, x, v);
+                    sc_ok &= jd > 0 && fabs(v[0] - u[0]) + fabs(v[1] - u[1]) + fabs(v[2] - u[2]) < 1e-6;
+                    if (ts[q] == 0) sc_ok &= fabs(x[0] - u[0]) + fabs(x[1] - u[1]) + fabs(x[2] - u[2]) < 1e-5;
+                    if (ts[q] == 1) { crush_pull(&m0, u, x1, nullptr); sc_ok &= fabs(x[0] - x1[0]) + fabs(x[1] - x1[1]) + fabs(x[2] - x1[2]) < 1e-5; }
+                }
+                crush_map_free(&ms);
+            }
+            crush_map_free(&m0);
+        }
         crush_map_free(&m);
     }
+    check("crush_map_scaled: t 0 = identity, t 1 = the map, t .37 / .8 invertible with det > 0; rotated maps refused", sc_ok && sc_rot);
     printf("crush: worst |push(pull(u)) - u| %.2e, worst Jacobian change over 1e-3 voxels %.2e, worst normal angle %.3f deg, worst det error %.2e\n", worst_inv, worst_c1, worst_n, worst_det);
     check("columns built (the spiral window splits into papyrus / void)", any_col == 12);
     check("invertible: push(pull(u)) = u (1e-6 voxels)", inv);
