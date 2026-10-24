@@ -5,14 +5,15 @@
 #            under 2 % labelled or touching a holdout; group weight = PW x the GT's) + every local U0 scan as SSL-only (ct_only, scanprep
 #            masks); PHerc1667 excluded; the Paris 4 78 keV / 0139 / 0814 / 1447 eval boxes held out
 #   recipe:  the laptop gate-arm recipe (iBOT on the attention tokens over a 16-sample SSL batch + GT SupCon on the main window, --gt 1)
-#   window:  P (default 512) when a 30-step bench at it runs (16 GB GPU), else 384; source window 1.25 P (zoom 0.7-1.25), LP = locals
+#   window:  P (default 512) when a 30-step bench at it runs (16 GB GPU), else 384; source window min(1.25 P, 512) (zoom up to its ratio: P512 -> 0.7-1.0 as v0), SB = SSL batch (16), LP = locals
 # Stop: touch RUN_DIR/STOP. Resume: rerun (launch.sh resumes from RUN_DIR/last.ckpt).
 set -u
 R=${1:?run dir}; mkdir -p $R; R=$(cd $R && pwd); D=$(cd "$(dirname "$0")" && pwd)
 U=${U:-/vesuvius/ufsm/dino/src/build/ufsm}; GPU=${GPU:-0}
 export PSEUDO=${PSEUDO:-/vesuvius/ufsm/dino/pseudo/scans} PW=${PW:-1} MINPCT=${MINPCT:-2}
 cfg() {   # $1 = P
-  echo "--recipe 1 --P $1 --source-P $(( ($1 * 5 / 4 + 63) / 64 * 64 )) --zoom ${ZOOM:-0.7,1.25} --local-P ${LP:-64} --locals 1 --attn-blocks 2 --attn-reg 1 --cls reg
+  local sp=$(( ($1 * 5 / 4 + 63) / 64 * 64 )); [ $sp -gt 512 ] && sp=512   # (the pseudo / GT boxes are 512^3: a larger source window skips them)
+  echo "--recipe 1 --P $1 --source-P $sp --zoom ${ZOOM:-0.7,$(awk -v a=$sp -v b=$1 'BEGIN {printf "%.3f", a / b}')} --ssl-batch ${SB:-16} --local-P ${LP:-64} --locals 1 --attn-blocks 2 --attn-reg 1 --cls reg
     --exclude-src PHerc1667 --unlabelled-share ${US:-0.5} --gt ${GT:-1} --object 0 --region 0 --ink 0 --dino 0 --ibot 0 --koleo 0 --var 0 --proto-lr 0
     --dim 32 --head-init 0.1 --warmup ${WARM:-200} --widths 16,64,128,288 --head-slab 16 --mem lean --linear-mx 4 --protos-k 1024 --ibot-k 1024
     --mask-input 1 --ssl-workers 8 --ssl-ibot 1 --ssl-ibot-src tok --ssl-ibot-max 64 --ssl-ibot-sub 4 --ssl-ibot-zvar 1 --ssl-ibot-center 0
