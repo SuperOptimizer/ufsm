@@ -1210,6 +1210,26 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             if (dv_net_points(Q->dv, Q->dcrd, nullptr, nullptr, NP, Q->dacc)) return 1;
             xd2h(Q->dacch, Q->dacc, (size_t)NP * DC * 4);
             for (int a = 0; a < NP; a++) memcpy(Q->dtd + ((size_t)j * NP + a) * nd, Q->dacch + (size_t)a * DC, (size_t)nd * 4);
+            static int tconst = -1; if (tconst < 0) tconst = getenv("UFSM_DIST_CONST") ? atoi(getenv("UFSM_DIST_CONST")) : 0;
+            if (tconst == 4 || getenv("UFSM_DIST_XCHK")) {   /* (debug: the teacher's own input crop dvf -- 4: the local CT target of CONST=3 from it at the teacher grid's coordinates
+                                                                (the dinovol coordinate path); XCHK: |corr| of dvf with the student's view j over all voxels and at the grid points) */
+                const int PG = Q->PG; static float *tv, *sv; if (!tv) { tv = malloc(g3 * 4); sv = malloc(g3 * 4); } nn_d2h(tv, Q->dvf, g3 * 4);
+                double m = 0, q2 = 0; for (size_t k = 0; k < g3; k++) { m += tv[k]; q2 += (double)tv[k] * tv[k]; } m /= g3; const double sd = sqrt(q2 / g3 - m * m) + 1e-9;
+                if (getenv("UFSM_DIST_XCHK") && j < 4) { nn_d2h(sv, Q->xg + (size_t)j * CIN * g3, g3 * 4);
+                    double ms = 0, qs = 0, c = 0; for (size_t k = 0; k < g3; k++) { ms += sv[k]; qs += (double)sv[k] * sv[k]; } ms /= g3; const double ss = sqrt(qs / g3 - ms * ms) + 1e-9;
+                    for (size_t k = 0; k < g3; k++) c += (tv[k] - m) * (sv[k] - ms); c /= g3 * sd * ss;
+                    double cp = 0; for (int a = 0; a < NP; a++) { const int z = (int)Q->dch_h[3 * a], y = (int)Q->dch_h[3 * a + 1], x_ = (int)Q->dch_h[3 * a + 2]; const size_t qi = ((size_t)z * PG + y) * PG + x_, qs_ = (size_t)Q->ddph[(size_t)j * NP + a];
+                        cp += (tv[qi] - m) * (sv[qs_] - ms); } cp /= NP * sd * ss;
+                    fprintf(stderr, "dist xchk step %d view %d: corr(teacher crop, student view) all voxels %.4f, teacher grid coords vs student indices %.4f\n", step, j, c, cp); }
+                if (tconst == 4) for (int a = 0; a < NP; a++) {
+                    const int z = (int)Q->dch_h[3 * a], y = (int)Q->dch_h[3 * a + 1], x_ = (int)Q->dch_h[3 * a + 2];
+                    const int zm = z > 0 ? z - 1 : z, zp = z < PG - 1 ? z + 1 : z, ym = y > 0 ? y - 1 : y, yp = y < PG - 1 ? y + 1 : y, xm = x_ > 0 ? x_ - 1 : x_, xp = x_ < PG - 1 ? x_ + 1 : x_;
+                    #define TV(z_, y_, x__) ((tv[((size_t)(z_) * PG + (y_)) * PG + (x__)] - m) / sd)
+                    double v[5] = {TV(z, y, x_), 4.0 * (TV(zp, y, x_) - TV(zm, y, x_)), 4.0 * (TV(z, yp, x_) - TV(z, ym, x_)), 4.0 * (TV(z, y, xp) - TV(z, y, xm)), 0.3}, n2 = 0;
+                    #undef TV
+                    for (int e = 0; e < 5; e++) n2 += v[e] * v[e];
+                    for (int e = 0; e < nd; e++) Q->dtd[((size_t)j * NP + a) * nd + e] = e < 5 ? (float)(v[e] / sqrt(n2)) : 0.f; }
+            }
         }
         nn_h2d(Q->ddp, Q->ddph, (size_t)2 * N * NP * 4);
         static int ddet2 = -1; if (ddet2 < 0) ddet2 = getenv("UFSM_DIST_DET") ? atoi(getenv("UFSM_DIST_DET")) : 0;
@@ -1472,7 +1492,7 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
         if (dden) {   /* dense distillation: L = dist / (2N NP) sum (1 - e . t) over every global's grid points (+ the relational term on a 256-point subset) */
             const int nd = Q->dnd, NP = Q->dnp, h16 = unet_logits_h16(n); float *eh = malloc((size_t)NP * nd * 4), *gh = malloc((size_t)NP * nd * 4); const float *th = Q->dtd + (size_t)j * NP * nd;
             static int dconst = -1; if (dconst < 0) dconst = getenv("UFSM_DIST_CONST") ? atoi(getenv("UFSM_DIST_CONST")) : 0;
-            if (dconst) {   /* (debug: a trivial target -- 1: one constant unit vector; 2: the sign of z - PG/2 on axis 0) */
+            if (dconst && dconst != 4) {   /* (debug: a trivial target -- 1: one constant unit vector; 2: the sign of z - PG/2 on axis 0) */
                 float *tc = (float *)th;
                 if (dconst == 3) {   /* 3: a trivially local target: unit (CT, its central-difference gradient x 4, 0.3) of the student's own input view */
                     const int PG = Q->PG; static float *xv; if (!xv) xv = malloc(g3 * 4); nn_d2h(xv, x, g3 * 4);
