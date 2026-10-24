@@ -393,7 +393,8 @@ template <class L> __global__ void __launch_bounds__(512) rp_ssim_k(const L *__r
 template <class L> static void rp_loss_t(const L *lg, const uint8_t *lo, const uint8_t *hi, const uint8_t *co, rp_geo g, void *gl, int g16, int h16, double *st, float *rd, int metrics, size_t n) {
     CK(cudaMemsetAsync(st, 0, RP_NST * sizeof(double), 0));
     const size_t nq = (size_t)g.q * g.q * g.q;
-    if (g.dw != 0.f || metrics) { int nb = (int)((nq + 255) / 256); if (nb > 1024) nb = 1024; rp_ds_k<L><<<nb, 256>>>(lg, lo, co, g, rd, st); }
+    if (!co) g.dw = 0.f;   /* (same-grid sets: no input grid to be consistent with) */
+    if (co && (g.dw != 0.f || metrics)) { int nb = (int)((nq + 255) / 256); if (nb > 1024) nb = 1024; rp_ds_k<L><<<nb, 256>>>(lg, lo, co, g, rd, st); }
     int nb = (int)((n + 255) / 256); if (nb > 2048) nb = 2048;
     rp_stats_k<L><<<nb, 256>>>(lg, lo, hi, g, st, n);
     if (metrics && g.D % 8 == 0 && g.H % 8 == 0 && g.W % 8 == 0) rp_ssim_k<L><<<(g.D / 8) * (g.H / 8) * (g.W / 8), 512>>>(lg, lo, hi, g, st);

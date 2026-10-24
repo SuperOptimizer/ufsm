@@ -99,6 +99,7 @@ int restore_predict(int argc, char **argv) {
     unet_cfg cfg; unet *u = restore_net(ckpt, use_ema, &cfg);
     if (!u) return 1;
     const int W = S + 2 * H;
+    if (cfg.scale_cond) unet_set_cond(u, (float)log2(um * (1 << level) / out_um) - 2.f);   /* ratio-conditioned nets: log2(input / output voxel) - 2 */
     if (W % (1 << (cfg.nlev - 1))) { fprintf(stderr, "restore: shard + 2 halo (%d) must be a multiple of %d\n", W, 1 << (cfg.nlev - 1)); return 2; }
     store *st = store_open(root);
     z3 *ct = st ? pyramid_open_level(st, key, level, um, opt(argc, argv, "--cache", nullptr)) : nullptr;
@@ -336,7 +337,8 @@ int cmd_restore_eval_pairs(int argc, char **argv) {
 #define PS(sse, n) ((n) > 0 && (sse) > 0 ? 10.0 * log10(65025.0 * (n) / (sse)) : 99.0)
     for (int si = 0; si < S->n; si++) {
         const srpair *p = S->src[si].srp; if (!p) continue;
-        const int T = p->T, q = T / 4; const size_t t3 = (size_t)T * T * T, q3 = (size_t)q * q * q;
+        const int T = p->T, q = p->same ? T : T / 4; const size_t t3 = (size_t)T * T * T, q3 = (size_t)q * q * q;
+        if (cfg.scale_cond) unet_set_cond(u, (float)log2(p->ratio > 0 ? p->ratio : 4) - 2.f);   /* (ratio-conditioned nets) */
         if (T % (1 << (cfg.nlev - 1))) { fprintf(stderr, "restore-eval-pairs: %s: box %d not a multiple of %d\n", S->src[si].name, T, 1 << (cfg.nlev - 1)); continue; }
         uint8_t *ht = malloc(t3), *hc = malloc(q3), *dt = nn_malloc(t3), *dc = nn_malloc(q3), *dlow = nn_malloc(t3); void *dx = nn_malloc(t3 * 2 * cfg.cin);
         double *dst = nn_malloc(RP_NST * sizeof(double)); float *rd = nn_malloc(q3 * sizeof(float) + 256);
@@ -347,10 +349,10 @@ int cmd_restore_eval_pairs(int argc, char **argv) {
             if (srpair_read(p, k, oc, T, ht, hc)) { fprintf(stderr, "restore-eval-pairs: %s box %d unreadable\n", S->src[si].name, k); continue; }
             nn_h2d(dt, ht, t3); nn_h2d(dc, hc, q3);
             const float st4[3] = {4.f, 4.f, 4.f}, ph0[3] = {0.f, 0.f, 0.f};
-            nn_restore_upsample(dc, q, q, q, dlow, T, T, T, st4, ph0, nullptr);
+            if (p->same) nn_d2d(dlow, dc, t3); else nn_restore_upsample(dc, q, q, q, dlow, T, T, T, st4, ph0, nullptr);
             nn_restore_input(dlow, dx, t3, cfg.cin == 2, nn_get_f16());
             const float *lg = unet_forward_x(u, dx, (shape5){1, cfg.cin, T, T, T}, 0, 1);
-            nn_restore_pair_loss(lg, unet_logits_h16(u), dlow, dt, dc, T, T, T, &w, nullptr, 0, nn_get_f16(), 1.f, dst, rd, 1);
+            nn_restore_pair_loss(lg, unet_logits_h16(u), dlow, dt, p->same ? nullptr : dc, T, T, T, &w, nullptr, 0, nn_get_f16(), 1.f, dst, rd, 1);
             double s[RP_NST]; nn_d2h(s, dst, sizeof s);
             for (int c = 0; c < RP_NST; c++) acc[c] += s[c];
             nb++;

@@ -11,7 +11,9 @@
 
 typedef struct srpair {
     z3 *in, *tg;            /* input (native) and target zarr arrays */
-    int B, T;               /* input box edge (native voxels) and target box edge (= 4 B) */
+    int B, T;               /* input box edge (native voxels) and target box edge (= 4 B); same-grid sets: B == T */
+    int same;               /* 1: the input is stored resampled onto the target grid (boxes.json input "grid": "target"; ufsm sr-xpairs --same-grid) */
+    double ratio;           /* input / target voxel size (4 for the coarse-box sets; boxes.json "ratio" for same-grid sets) */
     int n;                  /* boxes */
     int role;               /* 0 train, 1 val */
     int *tr, ntr, *te, nte; /* box indices of the training and validation draws */
@@ -26,5 +28,5 @@ typedef struct srpair {
 srpair *srpair_open(const char *dir, const char *role, int lut, int cache);
 void srpair_free(srpair *p);
 /* the host side of a window: target crop (P^3 at fine offset 4 oc) through the LUT and the input crop ((P / 4)^3 at native offset oc) of box k.
-   P a multiple of 4, P / 4 <= B. 0 on success */
+   P a multiple of 4, P / 4 <= B. Same-grid sets: both crops P^3 at offset oc (target voxels), P <= T. 0 on success */
 int srpair_read(const srpair *p, int k, const int oc[3], int P, uint8_t *tgt, uint8_t *coarse);

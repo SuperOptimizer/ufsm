@@ -37,6 +37,8 @@ srpair *srpair_open(const char *dir, const char *role, int lut, int cache) {
     json *bj = load_json(dir, "boxes.json"), *ij = lut ? load_json(dir, "intensity_map.json") : nullptr;
     if (!bj || (lut && !ij)) { json_free(bj); json_free(ij); free(p); return nullptr; }
     p->B = (int)json_num(json_get(json_get(bj, "input"), "box"), 0); p->T = (int)json_num(json_get(json_get(bj, "target"), "box"), 0);
+    p->same = !strcmp(json_str(json_get(json_get(bj, "input"), "grid"), ""), "target");
+    p->ratio = json_num(json_get(bj, "ratio"), 4);
     const char *tk = json_str(json_get(json_get(bj, "target"), "key"), "");
     const char *kv = strstr(tk, "keV");
     if (kv) { const char *s = kv; while (s > tk && (s[-1] >= '0' && s[-1] <= '9')) s--; p->keV = atof(s); }
@@ -60,7 +62,7 @@ srpair *srpair_open(const char *dir, const char *role, int lut, int cache) {
     store *st = store_open(dir);
     p->in = st ? z3_open(st, "input.zarr", nullptr) : nullptr;
     p->tg = st ? z3_open(st, "target.zarr", nullptr) : nullptr;
-    if (!p->in || !p->tg || p->B <= 0 || p->T != 4 * p->B || p->n <= 0) {
+    if (!p->in || !p->tg || p->B <= 0 || p->T != (p->same ? p->B : 4 * p->B) || p->n <= 0) {
         fprintf(stderr, "sr-pair: %s: cannot open input.zarr / target.zarr, or the boxes are not B^3 -> (4B)^3 (B %d T %d n %d)\n", dir, p->B, p->T, p->n);
         srpair_free(p); return nullptr;
     }
@@ -84,6 +86,25 @@ static const uint8_t *box_of(z3 *z, _Atomic(uint8_t *) *slot, int k, int e) {
 }
 
 int srpair_read(const srpair *p, int k, const int oc[3], int P, uint8_t *tgt, uint8_t *coarse) {
+    if (p->same) {   /* both crops P^3 at oc on the target grid */
+        if (P > p->T || k < 0 || k >= p->n) return -1;
+        for (int d = 0; d < 3; d++) if (oc[d] < 0 || oc[d] + P > p->T) return -1;
+        const size_t p3 = (size_t)P * P * P;
+        if (p->cache) {
+            const uint8_t *tb = box_of(p->tg, &p->tc[k], k, p->T), *ib = box_of(p->in, &p->ic[k], k, p->T);
+            if (!tb || !ib) return -1;
+            for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
+                const size_t so = ((size_t)(oc[0] + z) * p->T + oc[1] + y) * p->T + oc[2], d = ((size_t)z * P + y) * P;
+                for (int x = 0; x < P; x++) tgt[d + x] = p->lut[tb[so + x]];
+                memcpy(coarse + d, ib + so, (size_t)P);
+            }
+            return 0;
+        }
+        const int64_t o[3] = {(int64_t)k * p->T + oc[0], oc[1], oc[2]}, n[3] = {P, P, P};
+        if (z3_read(p->tg, o, n, tgt, 1) || z3_read(p->in, o, n, coarse, 1)) return -1;
+        for (size_t i = 0; i < p3; i++) tgt[i] = p->lut[tgt[i]];
+        return 0;
+    }
     const int c = P / 4;
     if (P % 4 || c > p->B || k < 0 || k >= p->n) return -1;
     for (int d = 0; d < 3; d++) if (oc[d] < 0 || oc[d] + c > p->B) return -1;

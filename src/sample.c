@@ -1730,15 +1730,16 @@ static int draw_restore(sampler *sp, batch *b, int i, rng *r, uint8_t *big) {
    tone LUT on both; batch.t row i = [target P^3 | input (P / 4)^3, rest of the row 0] */
 static int draw_restore_pair(sampler *sp, batch *b, int i, rng *r, uint8_t *big) {
     const sample_cfg *c = &sp->cfg;
-    const int P = c->P, q = P / 4;
-    const size_t p3 = P3(sp), q3 = (size_t)q * q * q;
+    const int P = c->P;
+    const size_t p3 = P3(sp);
     double u = runif(r) * sp->cum[sp->S->n - 1];
     int si = 0; while (si < sp->S->n - 1 && sp->cum[si] < u) si++;
     source *s = &sp->S->src[si]; const srpair *p = s->srp;
     if (!p) return 1;
+    const int q = p->same ? P : P / 4; const size_t q3 = (size_t)q * q * q;   /* (same-grid sets: the input crop is on the target grid) */
     const int nb = c->holdout ? p->nte : p->ntr; if (nb <= 0 || q > p->B) return 1;
     const int k = (c->holdout ? p->te : p->tr)[rint_below(r, nb)];
-    int oc[3]; for (int d = 0; d < 3; d++) oc[d] = (int)rint_below(r, p->B - q + 1);
+    int oc[3]; for (int d = 0; d < 3; d++) oc[d] = (int)rint_below(r, (p->same ? p->T - P : p->B - q) + 1);
     uint8_t *co = malloc(q3); if (!co) return -1;
     if (srpair_read(p, k, oc, P, big, co)) { free(co); return -1; }
     size_t nz = 0; for (size_t v = 0; v < p3; v++) nz += big[v] != 0;
@@ -1757,7 +1758,7 @@ static int draw_restore_pair(sampler *sp, batch *b, int i, rng *r, uint8_t *big)
     memset(row + p3, 0, p3); sym_u8(co, row + p3, q, q, y);
     free(co);
     memset(b->w + (size_t)i * NCH, 0, NCH); b->w[(size_t)i * NCH] = 1;
-    b->src[i] = (int16_t)si; b->level[i] = 0; b->um[i] = (float)(s->um / 4);
+    b->src[i] = (int16_t)si; b->level[i] = (int8_t)p->same; b->um[i] = (float)p->ratio;   /* restore pairs: level = same-grid flag, um = the voxel-size ratio */
     b->corner[i][0] = (int64_t)k * p->B + oc[0]; b->corner[i][1] = oc[1]; b->corner[i][2] = oc[2];
     atomic_fetch_add(&sp->produced, 1);
     return 0;

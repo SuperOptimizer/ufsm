@@ -272,7 +272,7 @@ int cmd_sr_ceiling(int argc, char **argv) {
    intensity_map.json: target 4^3 block mean -> input (pool-adjacent-violators). */
 typedef struct { rmap m; rfield D; int c2f; rcover cov; } xstep;
 typedef struct {
-    rvol *vi, *vt; int Li, Lt, B, T, want, ns; xstep st[4]; double minfrac, zcut; int64_t z0, z1;
+    rvol *vi, *vt; int Li, Lt, B, T, want, ns, same; xstep st[4]; double minfrac, zcut; int64_t z0, z1;
     atomic_int next, nacc; int ntry; uint64_t seed;
     uint8_t *in, *tg; int64_t (*org)[3]; float *tfrac; int8_t *split;
     pthread_mutex_t mu; uint64_t hist[256][256];
@@ -365,6 +365,73 @@ static void *x_worker(void *arg) {
     free(in); free(tg); free(lat); free(h);
     return nullptr;
 }
+/* --same-grid: target = the finer scan's raw T^3 box at its level, input = the coarser scan resampled through the chain onto those voxels */
+static void *x_worker_same(void *arg) {
+    xjob *j = arg; const int T = j->T, G = T / 8 + 1; const size_t NT = (size_t)T * T * T;
+    uint8_t *in = malloc(NT), *tg = malloc(NT); double *lat = malloc((size_t)G * G * G * 3 * sizeof *lat); uint64_t (*h)[256] = calloc(256, sizeof *h);
+    const int64_t *ts = j->vt->shape[j->Lt]; const double ft = (double)(1 << j->Lt), fi = 1.0 / (1 << j->Li);
+    for (;;) {
+        if (atomic_load(&j->nacc) >= j->want) break;
+        const int k = atomic_fetch_add(&j->next, 1); if (k >= j->ntry) break;
+        uint64_t r = mix64(j->seed * 0x9E3779B97F4A7C15ull + (uint64_t)k);
+        if (ts[0] < T || ts[1] < T || ts[2] < T) break;
+        int64_t o[3]; for (int d = 0; d < 3; d++) { o[d] = (int64_t)((r & 0xFFFFFFFF) % (uint64_t)(ts[d] - T + 1)); r = mix64(r); }   /* target-level zyx */
+        int cert = 1;
+        for (int q = 0; q < 9 && cert; q++) { double tp[3], ip[3], qq[3];
+            for (int d = 0; d < 3; d++) { const double c = q == 8 ? o[2 - d] + T / 2.0 : o[2 - d] + ((q >> d) & 1) * (T - 1); tp[d] = (c + 0.5) * ft - 0.5; }
+            x_unmap(j, tp, ip); x_map(j, ip, qq, &cert); }
+        if (!cert) continue;
+        const int64_t n[3] = {T, T, T};
+        if (rvol_read(j->vt, j->Lt, o, n, tg)) continue;
+        size_t nv = 0; for (size_t i = 0; i < NT; i++) nv += tg[i] != 0;
+        if (nv < j->minfrac * NT) continue;
+        double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+        for (int c = 0; c < G; c++) for (int b = 0; b < G; b++) for (int a = 0; a < G; a++) {
+            const int tv[3] = {8 * a, 8 * b, 8 * c}; double tp[3], ip[3];
+            for (int d = 0; d < 3; d++) tp[d] = (o[2 - d] + tv[d] + 0.5) * ft - 0.5;
+            x_unmap(j, tp, ip);
+            double *qq = lat + (((size_t)c * G + b) * G + a) * 3;
+            for (int d = 0; d < 3; d++) { qq[d] = (ip[d] + 0.5) * fi - 0.5; lo[d] = fmin(lo[d], qq[d]); hi[d] = fmax(hi[d], qq[d]); }
+        }
+        int64_t fo[3], fn[3]; for (int d = 0; d < 3; d++) { fo[2 - d] = (int64_t)floor(lo[d]) - 2; fn[2 - d] = (int64_t)ceil(hi[d]) + 2 - fo[2 - d] + 1; }
+        if ((double)fn[0] * fn[1] * fn[2] > 200e6) continue;
+        uint8_t *fb = malloc((size_t)fn[0] * fn[1] * fn[2]);
+        if (!fb || rvol_read(j->vi, j->Li, fo, fn, fb)) { free(fb); continue; }
+        size_t nz = 0;
+        for (int z = 0; z < T; z++) for (int y = 0; y < T; y++) for (int x = 0; x < T; x++) {
+            const int a = x >> 3, b = y >> 3, c = z >> 3; const double ua = (x & 7) / 8.0, ub = (y & 7) / 8.0, uc = (z & 7) / 8.0; double q[3] = {0, 0, 0};
+            for (int kk = 0; kk < 8; kk++) {
+                int aa = a + (kk & 1), bb = b + (kk >> 1 & 1), cc = c + (kk >> 2); if (aa >= G) aa = G - 1; if (bb >= G) bb = G - 1; if (cc >= G) cc = G - 1;
+                const double w = ((kk & 1) ? ua : 1 - ua) * ((kk >> 1 & 1) ? ub : 1 - ub) * ((kk >> 2) ? uc : 1 - uc);
+                const double *l = lat + (((size_t)cc * G + bb) * G + aa) * 3; for (int d = 0; d < 3; d++) q[d] += w * l[d];
+            }
+            const double fx = q[0] - fo[2], fy = q[1] - fo[1], fz = q[2] - fo[0]; const int64_t ix = (int64_t)floor(fx), iy = (int64_t)floor(fy), iz = (int64_t)floor(fz);
+            uint8_t *dst = in + ((size_t)z * T + y) * T + x; *dst = 0;
+            if (ix < 0 || iy < 0 || iz < 0 || ix + 1 >= fn[2] || iy + 1 >= fn[1] || iz + 1 >= fn[0]) continue;
+            const double ux = fx - ix, uy = fy - iy, uz = fz - iz; double sv = 0; int bad = 0;
+            for (int kk = 0; kk < 8 && !bad; kk++) { const uint8_t v = fb[((size_t)(iz + (kk >> 2)) * fn[1] + iy + (kk >> 1 & 1)) * fn[2] + ix + (kk & 1)]; if (!v) bad = 1;
+                sv += ((kk >> 2) ? uz : 1 - uz) * ((kk >> 1 & 1) ? uy : 1 - uy) * ((kk & 1) ? ux : 1 - ux) * v; }
+            if (!bad) { *dst = (uint8_t)fmin(255, fmax(1, sv + 0.5)); nz++; }
+        }
+        free(fb);
+        if (nz < j->minfrac * NT) continue;
+        /* intensity pairs: target 4^3 block means vs the input at the block centre (both on the target grid) */
+        for (int z = 0; z + 4 <= T; z += 4) for (int y = 0; y + 4 <= T; y += 4) for (int x = 0; x + 4 <= T; x += 4) {
+            const uint8_t iv = in[((size_t)(z + 2) * T + y + 2) * T + x + 2]; if (!iv) continue;
+            int sm = 0, ok = 1;
+            for (int q = 0; q < 64 && ok; q++) { const uint8_t v = tg[((size_t)(z + (q >> 4)) * T + y + (q >> 2 & 3)) * T + x + (q & 3)]; if (!v) ok = 0; sm += v; }
+            if (ok) h[(sm + 32) / 64][iv]++;
+        }
+        const int slot = atomic_fetch_add(&j->nacc, 1);
+        if (slot >= j->want) break;
+        memcpy(j->in + (size_t)slot * NT, in, NT); memcpy(j->tg + (size_t)slot * NT, tg, NT);
+        memcpy(j->org[slot], o, sizeof o); j->tfrac[slot] = (float)nv / NT;
+        if ((slot + 1) % 8 == 0) fprintf(stderr, "  sr-xpairs: %d / %d boxes (%d tried)\n", slot + 1, j->want, atomic_load(&j->next));
+    }
+    pthread_mutex_lock(&j->mu); for (int a = 0; a < 256; a++) for (int b = 0; b < 256; b++) j->hist[a][b] += h[a][b]; pthread_mutex_unlock(&j->mu);
+    free(in); free(tg); free(lat); free(h);
+    return nullptr;
+}
 static rvol *x_vol(const char *spec, const char *cache, int *level, char *key, size_t kn) {   /* ROOT,KEY,UM,LEVEL */
     char buf[2048]; snprintf(buf, sizeof buf, "%s", spec ? spec : "");
     char *f[4] = {nullptr}; int n = 0; for (char *t = strtok(buf, ","); t && n < 4; t = strtok(nullptr, ",")) f[n++] = t;
@@ -384,9 +451,11 @@ int cmd_sr_xpairs(int argc, char **argv) {
     const char *od = argv[2], *cache = opt(argc, argv, "--cache", nullptr);
     xjob *j = calloc(1, sizeof *j); char ikey[1024], tkey[1024];
     if (!(j->vi = x_vol(is, cache, &j->Li, ikey, sizeof ikey)) || !(j->vt = x_vol(ts, cache, &j->Lt, tkey, sizeof tkey))) return 1;
-    j->B = atoi(opt(argc, argv, "--in", "64")); j->T = 4 * j->B; j->want = atoi(opt(argc, argv, "--n", "64")); j->minfrac = atof(opt(argc, argv, "--minfrac", "0.9"));
+    j->same = atoi(opt(argc, argv, "--same-grid", "0")) != 0;
+    j->B = atoi(opt(argc, argv, "--in", "64")); j->T = 4 * j->B;
+    if (j->same) j->B = j->T = atoi(opt(argc, argv, "--box", "256")); j->want = atoi(opt(argc, argv, "--n", "64")); j->minfrac = atof(opt(argc, argv, "--minfrac", "0.9"));
     j->seed = (uint64_t)atoll(opt(argc, argv, "--seed", "1"));
-    if (j->B < 8 || 512 % j->T || j->want < 1) { fprintf(stderr, "sr-xpairs: --in with 4 in dividing 512\n"); return 2; }
+    if (j->B < 8 || 512 % j->T || j->want < 1) { fprintf(stderr, "sr-xpairs: --in with 4 in dividing 512 (--same-grid: --box dividing 512)\n"); return 2; }
     char cb[4096]; snprintf(cb, sizeof cb, "%s", cs); char *save = nullptr;
     for (char *t = strtok_r(cb, ";", &save); t && j->ns < 4; t = strtok_r(nullptr, ";", &save)) {
         char *a = strtok(t, ":"), *d = strtok(nullptr, ":"), *pd = strtok(nullptr, ":");
@@ -411,7 +480,7 @@ int cmd_sr_xpairs(int argc, char **argv) {
     fprintf(stderr, "sr-xpairs: input %s level %d (%.3f um) %d^3 -> target %s level %d (%.3f um) at %.3f um, %d chain step(s), z %lld .. %lld (test from %.0f)\n",
             ikey, j->Li, ium, j->B, tkey, j->Lt, tum, ium / 4, j->ns, (long long)j->z0, (long long)j->z1, j->zcut);
     const int nt = atoi(opt(argc, argv, "--threads", "8")); pthread_t th[64]; const int TT = nt < 1 ? 1 : nt > 64 ? 64 : nt;
-    for (int t = 0; t < TT; t++) pthread_create(&th[t], nullptr, x_worker, j);
+    for (int t = 0; t < TT; t++) pthread_create(&th[t], nullptr, j->same ? x_worker_same : x_worker, j);
     for (int t = 0; t < TT; t++) pthread_join(th[t], nullptr);
     int n = atomic_load(&j->nacc); if (n > j->want) n = j->want;
     if (n < 1) { fprintf(stderr, "sr-xpairs: no box accepted\n"); return 1; }
@@ -427,8 +496,8 @@ int cmd_sr_xpairs(int argc, char **argv) {
     snprintf(p, sizeof p, "%s/input.zarr", od); if (write_stack(p, j->in, n, j->B, "input (raw input-scan boxes)")) return 1;
     snprintf(p, sizeof p, "%s/target.zarr", od); if (write_stack(p, j->tg, n, j->T, "target (finer scan through the chain, x4 grid)")) return 1;
     snprintf(p, sizeof p, "%s/boxes.json", od); FILE *f = fopen(p, "w"); int ntest = 0;
-    fprintf(f, "{\"source\":\"sr-xpairs\",\"input\":{\"key\":\"%s\",\"level\":%d,\"um\":%.6g,\"box\":%d},\"target\":{\"key\":\"%s\",\"level\":%d,\"um\":%.6g,\"grid_um\":%.6g,\"box\":%d,\"scale\":4},\"chain\":\"%s\",\"n\":%d,\"requested\":%d,\"zcut_test\":%.1f,\n \"boxes\":[",
-            ikey, j->Li, ium, j->B, tkey, j->Lt, tum, ium / 4, j->T, cs, n, j->want, j->zcut);
+    fprintf(f, "{\"source\":\"sr-xpairs\",\"input\":{\"key\":\"%s\",\"level\":%d,\"um\":%.6g,\"box\":%d%s},\"target\":{\"key\":\"%s\",\"level\":%d,\"um\":%.6g,\"grid_um\":%.6g,\"box\":%d,\"scale\":%d},\"ratio\":%.6g,\"chain\":\"%s\",\"n\":%d,\"requested\":%d,\"zcut_test\":%.1f,\n \"boxes\":[",
+            ikey, j->Li, ium, j->B, j->same ? ",\"grid\":\"target\"" : "", tkey, j->Lt, tum, j->same ? tum : ium / 4, j->T, j->same ? 1 : 4, j->same ? ium / tum : 4.0, cs, n, j->want, j->zcut);
     for (int i = 0; i < n; i++) { ntest += j->split[i]; fprintf(f, "%s\n  {\"slot\":%d,\"origin_level_zyx\":[%lld,%lld,%lld],\"target_valid\":%.3f,\"split\":\"%s\"}", i ? "," : "", i,
                                         (long long)j->org[i][0], (long long)j->org[i][1], (long long)j->org[i][2], j->tfrac[i], j->split[i] ? "test" : "train"); }
     fprintf(f, "\n ],\"train\":%d,\"test\":%d}\n", n - ntest, ntest); fclose(f);

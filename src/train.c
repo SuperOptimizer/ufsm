@@ -267,7 +267,7 @@ enum { VAL_DISK, VAL_RAM, VAL_REGEN, VAL_NF = 16 };
 static int val_fields(batch *b, int B, size_t p3, void **f[VAL_NF], size_t sz[VAL_NF]) {
     int n = 0;
 #define VF(p_, s_) do { f[n] = (void **)&(p_); sz[n++] = (s_); } while (0)
-    if (g_restore) { VF(b->t, (size_t)B * g_tc * p3); VF(b->w, (size_t)B * NCH); VF(b->src, (size_t)B * sizeof *b->src); VF(b->um, (size_t)B * sizeof *b->um); return n; }   /* (the clean CT alone) */
+    if (g_restore) { VF(b->t, (size_t)B * g_tc * p3); VF(b->w, (size_t)B * NCH); if (g_rpairs) { VF(b->level, (size_t)B * sizeof *b->level); VF(b->corner, (size_t)B * sizeof *b->corner); } VF(b->src, (size_t)B * sizeof *b->src); VF(b->um, (size_t)B * sizeof *b->um); return n; }   /* (the clean CT alone) */
     if (g_xfmt) VF(b->x16, (size_t)B * g_xs * p3 * 2); else VF(b->x, (size_t)B * g_xs * p3 * 4);
     if (g_gpu_in) VF(b->rad, rad_bytes(B));
     if (g_pack) VF(b->tm, (size_t)B * p3); else { VF(b->t, (size_t)B * NCH * p3); VF(b->m, (size_t)B * p3); }
@@ -681,7 +681,7 @@ static void diag_nonfinite(gpu_state *d, const char *what, const void *p, size_t
 }
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 xs = {B, g_xc, d->side >= 0 ? g_Dl : g_Pz, P, P};
-    if (unet_cfg_of(d->u)->scale_cond) { if (g_papyrus) unet_set_cond(d->u, d->um); else unet_set_scale(d->u, d->um); }   /* B == 1 (checked at
+    if (unet_cfg_of(d->u)->scale_cond) { if (g_papyrus) unet_set_cond(d->u, d->um); else if (g_restore && g_rpairs) unet_set_cond(d->u, log2f(d->um > 0 ? d->um : 4.f) - 2.f); else unet_set_scale(d->u, d->um); }   /* (real pairs: um = the input / target voxel ratio) */   /* B == 1 (checked at
                                                                                                     startup); papyrus: um is the cutoff code */
     if (g_verso_on) verso_target(d, xs);
     const int q = P / g_hdiv, hm = unet_hr_mode(g_half);
@@ -689,7 +689,8 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     const float *lg;
     if (g_restore && g_rpairs) {   /* real pairs: the input crop (target row 1) upsampled x4 onto the window, then (x - 128) / 64 */
         const float st4[3] = {4.f, 4.f, 4.f}, ph0[3] = {0.f, 0.f, 0.f}; const size_t p3_ = (size_t)g_Pz * P * P;
-        nn_restore_upsample(d->t + p3_, P / 4, P / 4, P / 4, d->rlow, g_Pz, P, P, st4, ph0, nullptr);
+        if (d->lvlb[d->cur] == 1) nn_d2d(d->rlow, d->t + p3_, p3_);   /* same-grid set: the input is already on the window's grid */
+        else nn_restore_upsample(d->t + p3_, P / 4, P / 4, P / 4, d->rlow, g_Pz, P, P, st4, ph0, nullptr);
         nn_restore_input(d->rlow, d->x, p3_, g_rsplit, g_xfmt == 1);
     } else if (g_restore) {   /* the input from the clean window: the recipe's degradation, then (x - 128) / 64 */
         if (nn_restore_degrade(d->t, d->rlow, g_Pz, P, P, &d->rcp, d->rscr, d->rscr_b, nullptr)) { fprintf(stderr, "restore: the degradation scratch is too small for this recipe\n"); abort(); }
@@ -759,7 +760,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     if (prof) nn_prof_begin(6);
     shape5 ts = os; if (g_aff) ts.c = NCH;   /* B == 1: the target channels are the leading output channels */
     nn_set_logits_h16((!g_half || g_pkf) && unet_logits_h16(d->u));   /* lean 2: fp16 logits in the gradient buffer */
-    if (g_restore && g_rpairs) nn_restore_pair_loss(lg, unet_logits_h16(d->u), d->rlow, d->t, d->t + (size_t)g_Pz * P * P, g_Pz, P, P, &g_rpw, train ? d->gl : nullptr, g_g16, nn_get_f16(),
+    if (g_restore && g_rpairs) nn_restore_pair_loss(lg, unet_logits_h16(d->u), d->rlow, d->t, d->lvlb[d->cur] == 1 ? nullptr : d->t + (size_t)g_Pz * P * P, g_Pz, P, P, &g_rpw, train ? d->gl : nullptr, g_g16, nn_get_f16(),
                                                     nn_get_grad_scale(), d->rst, d->rrd, !train);
     else if (g_restore) nn_restore_loss(lg, unet_logits_h16(d->u), d->rlow, d->t, g_Pz, P, P, g_reps, g_rmse, g_redge, train ? d->gl : nullptr, g_g16, nn_get_f16(), nn_get_grad_scale(), d->rst);
     else if (g_unwrap2) {}   /* no recto / ink heads */
