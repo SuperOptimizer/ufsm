@@ -21,10 +21,17 @@ extern "C" {
 #define AT_HOSTDEV
 #endif
 
-/* channels (H x 48), heads, MLP hidden, RoPE (0 none, 1 axial on the grid index, 2 scroll coordinates: at_geom.pos), register tokens */
-typedef struct { int C, H, F, rope, nreg; float rope_base; } at_dims;
-/* one block's parameters: offsets into the flat parameter / gradient arrays (weights [out][in] row major) */
-typedef struct { size_t ln1g, ln1b, wqkv, bqkv, qg, kg, wo, bo, ln2g, ln2b, w1, b1, w2, b2; } at_bp;
+#define AT_DFM_MAXL 3   /* deformable attention: sampled levels (the bottleneck and up to two finer ones) */
+/* channels (H x 48), heads, MLP hidden, RoPE (0 none, 1 axial on the grid index, 2 scroll coordinates: at_geom.pos), register tokens;
+   dK > 0: deformable attention (src/nn_attn_dfm.cu) instead of self-attention: dK points per head and level, dL levels (1..AT_DFM_MAXL;
+   level l is 2^l times finer than the bottleneck grid), dC[l] the channels of level l's input (dC[0] = C; at_geom.dfx) */
+typedef struct { int C, H, F, rope, nreg; float rope_base; int dK, dL, dC[AT_DFM_MAXL]; } at_dims;
+/* one block's parameters: offsets into the flat parameter / gradient arrays (weights [out][in] row major). Deformable blocks: wqkv / bqkv
+   are the value projection (C x C, C), qg / kg unused (0), woa / boa the offset + logit projection (at_dfm_noa x C), wvl[l] / bvl[l]
+   (l >= 1) level l's value projection (C x dC[l], C) */
+typedef struct { size_t ln1g, ln1b, wqkv, bqkv, qg, kg, wo, bo, ln2g, ln2b, w1, b1, w2, b2, woa, boa, wvl[AT_DFM_MAXL], bvl[AT_DFM_MAXL]; } at_bp;
+/* rows of the offset + logit projection: per head, level and point 3 offsets (z, y, x: level-l voxels), then the H x L x K logits */
+static inline int at_dfm_noa(const at_dims *d) { return d->H * d->dL * d->dK * 4; }
 size_t at_block_nparams(const at_dims *d);
 size_t at_block_layout(const at_dims *d, at_bp *bp, size_t off);   /* assigns offsets from off, returns the end */
 
@@ -35,6 +42,8 @@ typedef struct {
     float *qkvh, *doh, *amx;   /* tensor-core core (at_set_core 1): fp16 packed q / k / v and dO [head][T + 64][48], amax scratch */
     float *qkvr, *orr, *dor, *dqr, *dqr2;   /* radial attention (at_geom.rays; sized by at_ws_bytes_r's Tr): q / k / v and the attention output on the
                                                ray samples (forward), dO, d qkn and d qkv on them (backward) */
+    float *vl[AT_DFM_MAXL], *oa, *aw, *dvl[AT_DFM_MAXL], *doa;   /* deformable attention: the levels' values [T << 3 l][C], the offset / logit rows,
+                                                                 the softmax weights [T][H L K] (forward); their gradients (backward) */
     int kept;   /* the forward tensors hold this block's forward of the backward's input: at_block_bwd skips its recompute (and clears it) */
 } at_ws;
 size_t at_ws_bytes(const at_dims *d, long T);
@@ -53,7 +62,9 @@ void at_ws_set_fwd_r(at_ws *w, const at_dims *d, long T, long Tr, void *base);
 typedef struct at_rays at_rays;
 /* lens: per sequence the valid tokens (keys at and past it are masked; nullptr: all S); pos: per token (r, arc, z) for at_dims.rope 2
    (nullptr: no rotation); rays: radial attention (at_block_*: the grid tokens' attention runs along these rays instead, nreg 0) */
-typedef struct { int nseq, S, D, Hh, W; const int *lens; const float *pos; const at_rays *rays; } at_geom;
+/* dfx[l] (l >= 1, deformable attention): level l's input tokens [nseq][S << 3 l][dC[l]] (the sequences' 2^l D x 2^l Hh x 2^l W grids,
+   z y x; no registers), read by the value projection; no gradient flows to them */
+typedef struct { int nseq, S, D, Hh, W; const int *lens; const float *pos; const at_rays *rays; const float *dfx[AT_DFM_MAXL]; } at_geom;
 
 /* ---- radial axial attention (src/nn_attn_ray.cu): the attention of a block runs along rays of the scroll coordinates. Each sample's grid
    (D x Hh x W tokens, nreg 0) has a scroll axis along grid dim ad (0 D, 1 Hh, 2 W) with a centre (cu, cv) per plane k along ad (u, v: the
@@ -134,6 +145,16 @@ void at_view_patch(const unsigned char *v, int n, int Pv, int k, float *xp);
 void at_view_add(float *t, int n, int S, int r0, int Nv, int C, const float *E, const float *bias);
 void at_view_gather(const float *gt, int n, int S, int r0, int Nv, int C, float *GE, float *gbias);
 void at_h16_to_f32(const void *x, long long n, int f16, float *y);   /* 16-bit storage (fp16 / bf16) -> fp32 */
+/* deformable attention kernels (src/nn_attn_dfm.cu; at_geom: nseq grids of S = D Hh W tokens, no registers): softmax of the logit rows of
+   oa [T][at_dfm_noa] -> aw [T][H L K]; o [T][C] = per head the aw-weighted trilinear samples of vl[l] (zero outside level l's grid) at the
+   token's centre on level l plus its offsets; the backward writes dvl[l] (zeroed first; nullptr: skipped) and doa (offsets and logits) */
+void at_dfm_softmax(const float *oa, float *aw, long T, const at_dims *d);
+void at_dfm_fwd(const float *const *vl, const float *oa, const float *aw, float *o, const at_geom *g, const at_dims *d);
+void at_dfm_bwd(const float *const *vl, const float *oa, const float *aw, const float *dO, float *const *dvl, float *doa, const at_geom *g, const at_dims *d);
+/* the deformable offsets' initial grid prior: boa's offset rows (H L K 3 floats) */
+void at_dfm_prior(const at_dims *d, float *boa);
+/* LayerNorm without affine over C per row (the finer levels' value inputs) */
+void at_ln_plain(const float *x, float *y, long T, int C);
 
 /* MX GEMM (src/lp_mxgemm.cu): at_gemm's operands and result, both operands quantised along K to MX-fp4 (bits 4) or MX-fp8 (bits 8)
    with one ue8m0 scale per 32 K (round to nearest), block-scaled tensor-core products, fp32 accumulation; -1 unsupported */

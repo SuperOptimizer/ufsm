@@ -273,6 +273,60 @@ int main(void) {
         for (int k = 0; k < 4; k++) free(L[k]);
         free(ll); free(gr); free(vh); free(vh2); nn_free(vd); nn_free(vd2); nn_free(vz); unet_free(ur); unet_free(ul);
     }
+    /* deformable attention (2 blocks, 4 points per head on 3 levels: the bottleneck 8^3 and the 16^3 / 32^3 encoder outputs, PEG): (a) a
+       fresh stage is the identity, (b) a random stage changes the logits, every block tensor (value / offset + logit / finer-level value
+       projections included) gets a nonzero finite gradient, (c) the checkpoint keeps attn_deform / attn_dlev */
+    {
+        const int C = 96, K = 4, Ld = 3;
+        unet_cfg cd = c0; cd.attn_blocks = 2; cd.attn_deform = K; cd.attn_dlev = Ld;
+        unet *ud = unet_create(&cd); unet_init(ud, 61);
+        if (unet_init_from_map(ud, path0, rows) < 0) { printf("init_from failed\n"); return 1; }
+        lp_set_gyrec_off(1);
+        nn_set_sr_step(100); l = unet_forward(ud, x, xs, 1); float *bd = logits_f32(ud, l, nl);
+        nn_h2d(gd, gh, nl * 4); unet_zero_grad(ud); nn_set_sr_step(200); unet_backward(ud, gd);
+        const size_t ndp = unet_nparams(ud); float *gv = malloc(ndp * 4); unet_grad_d2h(ud, gv);
+        lp_set_gyrec_off(-1);
+        const double e1 = rel_l2(bd, a, nl), e2 = rel_l2(gv, ga, n0);
+        printf("deformable: fresh stage identity logits rel L2 %.2e, trunk gradient %.2e%s\n", e1, e2, e1 < 1e-5 && e2 < 1e-5 ? "" : "  FAIL");
+        bad += !(e1 < 1e-5 && e2 < 1e-5);
+        free(bd); free(gv); unet_free(ud);
+        setenv("UFSM_ATTN_NONZERO", "1", 1);
+        unet *ur = unet_create(&cd); unet_init(ur, 63); unsetenv("UFSM_ATTN_NONZERO");
+        if (unet_init_from_map(ur, path0, rows) < 0) { printf("init_from failed\n"); return 1; }
+        nn_set_sr_step(100); l = unet_forward(ur, x, xs, 1); float *lr = logits_f32(ur, l, nl);
+        nn_h2d(gd, gh, nl * 4); unet_zero_grad(ur); nn_set_sr_step(200); unet_backward(ur, gd);
+        float *gr = malloc(ndp * 4); unet_grad_d2h(ur, gr);
+        const double ec = rel_l2(lr, a, nl);
+        at_dims dd = {0}; dd.C = C; dd.H = C / AT_HD; dd.F = (8 * C / 3 + 31) / 32 * 32; dd.dK = K; dd.dL = Ld; dd.dC[0] = C; dd.dC[1] = 32; dd.dC[2] = 16;
+        size_t off = n0 + (size_t)C * 28; int zero = 0, nonfin = 0, nt = 0;   /* (PEG w, b; no registers) */
+        for (int k = 0; k < 2; k++) {
+            at_bp bp; const size_t end = at_block_layout(&dd, &bp, off);
+            const size_t st[] = {bp.wqkv, bp.woa, bp.boa, bp.wvl[1], bp.bvl[1], bp.wvl[2], bp.bvl[2], bp.wo, bp.w1, bp.w2, end};
+            const size_t en[] = {bp.bqkv, bp.boa, bp.wvl[1], bp.bvl[1], bp.wvl[2], bp.bvl[2], bp.wo, bp.bo, bp.b1, bp.b2};
+            for (int j = 0; j < 10; j++) {
+                double s = 0; for (size_t i = st[j]; i < en[j]; i++) { s += fabs(gr[i]); nonfin += !isfinite(gr[i]); }
+                zero += !(s > 0); nt++;
+            }
+            off = end;
+        }
+        const int okr = ec > 1e-2 && !zero && !nonfin && off == ndp;
+        printf("deformable, random stage: logits vs the conv net rel L2 %.2e, %d of %d block tensors with zero gradient, %d non-finite, layout %s%s\n", ec, zero, nt, nonfin,
+               off == ndp ? "ok" : "MISMATCH", okr ? "" : "  FAIL");
+        bad += !okr;
+        if (unet_save(ur, path, 5, nullptr)) { printf("cannot save\n"); return 1; }
+        unet_cfg pd; int sd; if (unet_peek(path, &pd, &sd)) { printf("peek failed\n"); return 1; }
+        unet *ul = unet_create(&pd); unet_load(ul, path);
+        nn_set_sr_step(100); l = unet_forward(ul, x, xs, 1); float *ll = logits_f32(ul, l, nl);
+        size_t nd = 0; for (size_t i = 0; i < nl; i++) nd += memcmp(ll + i, lr + i, 4) != 0;
+        printf("checkpoint: attn_deform %d attn_dlev %d, logits differ in %zu%s\n", pd.attn_deform, pd.attn_dlev, nd, pd.attn_deform == K && pd.attn_dlev == Ld && !nd ? "" : "  FAIL");
+        bad += !(pd.attn_deform == K && pd.attn_dlev == Ld && !nd);
+        unet *ui = unet_create(&pd); unet_load(ui, path);   /* an inference build of the same checkpoint */
+        l = unet_forward(ui, x, xs, 0); float *li = logits_f32(ui, l, nl);
+        const double ei = rel_l2(li, lr, nl);
+        printf("deformable, inference build: logits vs the training build rel L2 %.2e%s\n", ei, ei < 2e-2 ? "" : "  FAIL"); bad += !(ei < 2e-2);
+        free(li); unet_free(ui);
+        free(lr); free(ll); free(gr); unet_free(ur); unet_free(ul);
+    }
     unlink(path); unlink(path0);
     printf(bad ? "test_hybrid_identity: %d FAILED\n" : "test_hybrid_identity: all passed\n", bad);
     return bad != 0;

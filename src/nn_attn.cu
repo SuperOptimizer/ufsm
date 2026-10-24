@@ -429,15 +429,21 @@ extern "C" void at_glu_fwd(const float *h, float *gg, long T, int F) { k_glu_fwd
 extern "C" void at_glu_bwd(const float *h, const float *dgg, float *dh, long T, int F) { k_glu_bwd<<<nbk((long long)T * F, 256), 256>>>(h, dgg, dh, T, F); }
 
 /* ---- parameters and scratch ---- */
-extern "C" size_t at_block_nparams(const at_dims *d) {
-    const size_t C = d->C, F = d->F;
-    return 2 * C + 3 * C * C + 3 * C + 2 * C + C * C + C + 2 * C + 2 * F * C + 2 * F + C * F + C;
-}
+extern "C" size_t at_block_nparams(const at_dims *d) { at_bp bp; return at_block_layout(d, &bp, 0); }
 extern "C" size_t at_block_layout(const at_dims *d, at_bp *bp, size_t off) {
     const size_t C = d->C, F = d->F;
+    for (int l = 0; l < AT_DFM_MAXL; l++) bp->wvl[l] = bp->bvl[l] = 0;
+    bp->woa = bp->boa = 0;
     bp->ln1g = off; off += C; bp->ln1b = off; off += C;
-    bp->wqkv = off; off += 3 * C * C; bp->bqkv = off; off += 3 * C;
-    bp->qg = off; off += C; bp->kg = off; off += C;
+    if (d->dK > 0) {   /* deformable: the value projection, the offset / logit projection, the finer levels' value projections */
+        const size_t NOA = (size_t)at_dfm_noa(d);
+        bp->wqkv = off; off += C * C; bp->bqkv = off; off += C; bp->qg = bp->kg = 0;
+        bp->woa = off; off += NOA * C; bp->boa = off; off += NOA;
+        for (int l = 1; l < d->dL; l++) { bp->wvl[l] = off; off += C * (size_t)d->dC[l]; bp->bvl[l] = off; off += C; }
+    } else {
+        bp->wqkv = off; off += 3 * C * C; bp->bqkv = off; off += 3 * C;
+        bp->qg = off; off += C; bp->kg = off; off += C;
+    }
     bp->wo = off; off += C * C; bp->bo = off; off += C;
     bp->ln2g = off; off += C; bp->ln2b = off; off += C;
     bp->w1 = off; off += 2 * F * C; bp->b1 = off; off += 2 * F;
@@ -454,6 +460,18 @@ static size_t ws_walk(at_ws *w, const at_dims *d, long T, long Tr, float *fb, fl
     size_t nf = 0, nb = 0;
 #define TF(f, n) do { w->f = fb ? fb + nf : nullptr; nf += al(n); } while (0)
 #define TB(f, n) do { w->f = bb ? bb + nb : nullptr; nb += al(n); } while (0)
+    for (int l = 0; l < AT_DFM_MAXL; l++) w->vl[l] = w->dvl[l] = nullptr;
+    w->oa = w->aw = w->doa = nullptr;
+    if (d->dK > 0) {   /* deformable attention: no q / k / v rows, no attention core tensors */
+        const size_t NOA = (size_t)at_dfm_noa(d), LK = (size_t)d->dL * d->dK;
+        TF(xn, t * C); TF(o, t * C); TF(x1, t * C); TF(xn2, t * C); TF(h, t * 2 * F);
+        TF(m1, t); TF(r1, t); TF(m2, t); TF(r2, t); TF(oa, t * NOA); TF(aw, t * H * LK);
+        for (int l = 0; l < d->dL; l++) TF(vl[l], (t << (3 * l)) * C);
+        w->qkv = w->rq = w->rk = w->lse = w->qkvh = w->amx = w->qkvr = w->orr = w->qkn = w->dv = w->doh = w->dor = w->dqr = w->dqr2 = nullptr;
+        TB(bC, t * C); TB(gg, t * F); TB(dx1, t * C); TB(bA, t * wa); TB(bB, t * wb); TB(doa, t * NOA);
+        for (int l = 0; l < d->dL; l++) TB(dvl[l], (t << (3 * l)) * C);
+        return part ? nb : nf;
+    }
     TF(xn, t * C); TF(o, t * C); TF(x1, t * C); TF(xn2, t * C); TF(qkv, t * 3 * C); TF(h, t * 2 * F);
     TF(m1, t); TF(r1, t); TF(m2, t); TF(r2, t); TF(rq, ta * H); TF(rk, ta * H); TF(lse, ta * H);
     TF(qkvh, 3 * C * (ta + 64) / 2); TF(amx, 4);   /* (fp16: halves) */
@@ -476,6 +494,8 @@ extern "C" void at_ws_set_fwd_r(at_ws *w, const at_dims *d, long T, long Tr, voi
     w->xn = t.xn; w->o = t.o; w->x1 = t.x1; w->xn2 = t.xn2; w->qkv = t.qkv; w->h = t.h;
     w->m1 = t.m1; w->r1 = t.r1; w->m2 = t.m2; w->r2 = t.r2; w->rq = t.rq; w->rk = t.rk; w->lse = t.lse; w->qkvh = t.qkvh; w->amx = t.amx;
     w->qkvr = t.qkvr; w->orr = t.orr; w->kept = 0;
+    for (int l = 0; l < AT_DFM_MAXL; l++) w->vl[l] = t.vl[l];
+    w->oa = t.oa; w->aw = t.aw;
 }
 extern "C" size_t at_ws_bytes(const at_dims *d, long T) { return at_ws_bytes_r(d, T, 0); }
 extern "C" void at_ws_carve(at_ws *w, const at_dims *d, long T, void *base) { at_ws_carve_r(w, d, T, 0, base); }
@@ -499,6 +519,18 @@ extern "C" int at_block_fwd(const at_dims *d, const float *P, const at_bp *bp, c
     const double ta = (double)Ta, A = 4.0 * ga->nseq * (double)ga->S * ga->S * HD * d->H;
     int e = 0;
     PR("ln1", 0, t * C * 8, at_ln_fwd(x, P + bp->ln1g, P + bp->ln1b, w->xn, w->m1, w->r1, T, C));
+    if (d->dK > 0) {   /* deformable attention: values of every level, offsets + logits, softmax, the sampled sum into o */
+        const int NOA = at_dfm_noa(d); const double LK = (double)d->dL * d->dK;
+        PR("v gemm", 2 * t * C * C, t * C * 12, e |= at_gemm_ex(0, 1, (int)T, C, C, w->xn, P + bp->wqkv, w->vl[0], 0.f, P + bp->bqkv, nullptr)); CK(e);
+        PR("oa gemm", 2 * t * NOA * C, t * (C + NOA) * 4, e |= at_gemm_ex(0, 1, (int)T, NOA, C, w->xn, P + bp->woa, w->oa, 0.f, P + bp->boa, nullptr)); CK(e);
+        for (int l = 1; l < d->dL; l++) {
+            const long Tl = T << (3 * l); const int Cl = d->dC[l];
+            if (!g->dfx[l]) return -1;
+            PR("vl gemm", 2.0 * Tl * C * Cl, (double)Tl * (C + Cl) * 4, e |= at_gemm_ex(0, 1, (int)Tl, C, Cl, g->dfx[l], P + bp->wvl[l], w->vl[l], 0.f, P + bp->bvl[l], nullptr)); CK(e);
+        }
+        PR("dfm softmax", 0, t * d->H * LK * 24, at_dfm_softmax(w->oa, w->aw, T, d));
+        PR("dfm sample", 0, t * C * LK * 8 * 4, at_dfm_fwd((const float *const *)w->vl, w->oa, w->aw, w->o, g, d));
+    } else {
     PR("qkv gemm", 2 * t * 3 * C * C, t * C * 16, e |= at_gemm_ex(0, 1, (int)T, 3 * C, C, w->xn, P + bp->wqkv, w->qkv, 0.f, P + bp->bqkv, nullptr)); CK(e);
     const float *qa = w->qkv; float *oa = w->o;
     if (R) { PR("ray gather", 0, ta * C * 24, at_ray_gather(R, w->qkv, w->qkvr, 3 * C, 0)); qa = w->qkvr; oa = w->orr; }
@@ -512,6 +544,7 @@ extern "C" int at_block_fwd(const at_dims *d, const float *P, const at_bp *bp, c
         PR("attn fwd", A, ta * C * 16, at_attn_fwd(w->qkn, oa, w->lse, ga, d->H, C));
     }
     if (R) PR("ray scatter", 0, ta * C * 12, at_ray_scatter(R, w->orr, w->o, C, 1));
+    }
     PR("o gemm+res", 2 * t * C * C, t * C * 16,
        e |= at_gemm_ex(0, 1, (int)T, C, C, w->o, P + bp->wo, w->x1, 0.f, P + bp->bo, x)); CK(e);
     PR("ln2", 0, t * C * 8, at_ln_fwd(w->x1, P + bp->ln2g, P + bp->ln2b, w->xn2, w->m2, w->r2, T, C));
@@ -529,7 +562,7 @@ extern "C" int at_block_bwd(const at_dims *d, const float *P, float *G, const at
     int e = 0;
     /* recompute the block's internals (its output into scratch), unless kept (core 0 always recomputes: its q / k / v rows are scratch);
        kept: the SwiGLU product from h (scratch) */
-    if (!w->kept || !core) CK(at_block_fwd(d, P, bp, xin, w->bA, g, w));
+    if (!w->kept || (!core && !d->dK)) CK(at_block_fwd(d, P, bp, xin, w->bA, g, w));
     else at_glu_fwd(w->h, w->gg, T, F);
     w->kept = 0;
     /* MLP */
@@ -543,6 +576,21 @@ extern "C" int at_block_bwd(const at_dims *d, const float *P, float *G, const at
     /* attention */
     PR("b o gemms", 4 * t * C * C, t * C * 20, e |= at_gemm(1, 0, C, C, (int)T, w->dx1, w->o, G + bp->wo, 1.f); colsum(w->dx1, T, C, G + bp->bo);
        e |= at_gemm(0, 0, (int)T, C, C, w->dx1, P + bp->wo, w->bC, 0.f)); CK(e);             /* d o */
+    if (d->dK > 0) {   /* deformable: d values / offsets / logits, then the projections' gradients; d xn into bA */
+        const int NOA = at_dfm_noa(d); const double LK = (double)d->dL * d->dK;
+        PR("b dfm", 0, t * C * LK * 8 * 12, at_dfm_bwd((const float *const *)w->vl, w->oa, w->aw, w->bC, w->dvl, w->doa, g, d));
+        PR("b v gemms", 4 * t * C * C, t * C * 16, e |= at_gemm(1, 0, C, C, (int)T, w->dvl[0], w->xn, G + bp->wqkv, 1.f); colsum(w->dvl[0], T, C, G + bp->bqkv);
+           e |= at_gemm(0, 0, (int)T, C, C, w->dvl[0], P + bp->wqkv, w->bA, 0.f)); CK(e);
+        PR("b oa gemms", 4 * t * C * NOA, t * (C + NOA) * 12, e |= at_gemm(1, 0, NOA, C, (int)T, w->doa, w->xn, G + bp->woa, 1.f); colsum(w->doa, T, NOA, G + bp->boa);
+           e |= at_gemm(0, 0, (int)T, C, NOA, w->doa, P + bp->woa, w->bA, 1.f)); CK(e);
+        for (int l = 1; l < d->dL; l++) {
+            const long Tl = T << (3 * l); const int Cl = d->dC[l];
+            PR("b vl gemm", 2.0 * Tl * C * Cl, (double)Tl * (C + Cl) * 8, e |= at_gemm_f32(1, 0, C, Cl, (int)Tl, w->dvl[l], g->dfx[l], G + bp->wvl[l], 1.f); colsum(w->dvl[l], Tl, C, G + bp->bvl[l])); CK(e);
+        }
+        PR("b ln1", 0, t * C * 20, cudaMemcpyAsync(gy, w->dx1, (size_t)T * C * 4, cudaMemcpyDeviceToDevice, 0);
+           at_ln_bwd(xin, P + bp->ln1g, w->m1, w->r1, w->bA, gy, G + bp->ln1g, G + bp->ln1b, T, C, 1));
+        return 0;
+    }
     const float *qa = R ? w->qkvr : w->qkv, *oa = R ? w->orr : w->o, *dOa = w->bC; float *dqn = R ? w->dqr : w->bA, *dqv = R ? w->dqr2 : w->bB;
     if (R) { PR("b ray gather", 0, ta * C * 12, at_ray_gather(R, w->bC, w->dor, C, 1)); dOa = w->dor; }   /* (the normalised scatter's adjoint) */
     if (core == 2) { PR("attn bwd", 3.5 * A, ta * C * 20, e |= at_fa8_bwd(w->qkvh, w->doh, oa, w->lse, dOa, w->dv, w->amx, dqn, ga, d->H, C)); CK(e); }

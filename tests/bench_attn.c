@@ -23,10 +23,25 @@ int main(int argc, char **argv) {
     if (nn_init(0)) { printf("no GPU\n"); return 1; }
     int nc = 0, core[16], mx[16], kp[16];
     { char *t = strdup(cfgs); for (char *q = strtok(t, ","); q && nc < 16; q = strtok(nullptr, ",")) { core[nc] = atoi(q); const char *c = strchr(q, ':'); mx[nc] = c ? atoi(c + 1) : 4; const char *c2 = c ? strchr(c + 1, ':') : nullptr; kp[nc++] = c2 ? atoi(c2 + 1) : 0; } free(t); }
-    at_dims d = {C, C / AT_HD, F, 0, nreg, 100.f}; at_bp bp; const size_t np = at_block_layout(&d, &bp, 0);
-    at_geom g = {nseq, nreg + D * D * D, D, D, D, nullptr, nullptr, nullptr}; const long T = (long)nseq * g.S;
+    at_dims d = {C, C / AT_HD, F, 0, nreg, 100.f};
+    if (getenv("BENCH_DEFORM")) {   /* deformable attention: K points per head and level, BENCH_DLEV levels (2), BENCH_DC the finer levels' channels */
+        d.dK = atoi(getenv("BENCH_DEFORM")); d.dL = getenv("BENCH_DLEV") ? atoi(getenv("BENCH_DLEV")) : 2; d.dC[0] = C;
+        const char *dc = getenv("BENCH_DC") ? getenv("BENCH_DC") : "192,96";
+        for (int l = 1; l < d.dL; l++) { d.dC[l] = atoi(dc); dc = strchr(dc, ','); dc = dc ? dc + 1 : "96"; }
+        if (nreg) { printf("BENCH_DEFORM: nreg 0\n"); return 1; }
+    }
+    at_bp bp; const size_t np = at_block_layout(&d, &bp, 0);
+    at_geom g = {nseq, nreg + D * D * D, D, D, D, nullptr, nullptr, nullptr, {0}}; const long T = (long)nseq * g.S;
     float *h = malloc(np * 4); for (size_t i = 0; i < np; i++) h[i] = 0.05f * nr();
     for (int c = 0; c < C; c++) h[bp.ln1g + c] = h[bp.ln2g + c] = h[bp.qg + c] = h[bp.kg + c] = 1.f;
+    if (d.dK) {   /* the grid prior + small offsets, the finer levels' inputs */
+        at_dfm_prior(&d, h + bp.boa);
+        for (int l = 1; l < d.dL; l++) {
+            const size_t ne = ((size_t)T << (3 * l)) * d.dC[l]; float *t = malloc(ne * 4); for (size_t i = 0; i < ne; i++) t[i] = nr();
+            float *fd = nn_malloc(ne * 4); nn_h2d(fd, t, ne * 4); free(t); g.dfx[l] = fd;
+        }
+        printf("deformable: %d points x %d levels per head, finer channels %d %d, offset / logit rows %d\n", d.dK, d.dL, d.dC[1], d.dC[2], at_dfm_noa(&d));
+    }
     float *P = nn_malloc(np * 4), *G = nn_malloc(np * 4); nn_h2d(P, h, np * 4); nn_zero(G, np * 4); free(h);
     float *hx = malloc(T * C * 4); for (long i = 0; i < T * C; i++) hx[i] = nr();
     float *x = nn_malloc(T * C * 4), *y = nn_malloc(T * C * 4), *gy = nn_malloc(T * C * 4); nn_h2d(x, hx, T * C * 4); free(hx);

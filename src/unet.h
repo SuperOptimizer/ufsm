@@ -73,6 +73,12 @@ typedef struct {
                               src/view.h) as (view_P / view_patch)^3 extra register-like rows after the memory rows: each a learned row (its
                               position) + a linear embedding of its view_patch^3 patch (v / 255) + bias; the grid tokens attend to them in
                               every block (joint attention). A fresh stage stays the identity */
+    int attn_deform, attn_dlev;   /* deformable attention (0 off; src/nn_attn_dfm.cu): attn_deform points per head and level, sampled on attn_dlev
+                              levels (0: 2; at most 3): the bottleneck grid and the next finer encoder outputs. Per token a linear layer predicts
+                              each head's offsets (zero weights, bias = a small sphere grid prior) and logits (softmax over levels x points); the
+                              heads' values (a value projection per level; the finer levels' inputs LayerNorm'd, no gradient to them) are
+                              trilinearly sampled there and summed. No registers / memory / view / radial / RoPE positions; the out projection
+                              starts at zero (identity) */
 } unet_cfg;
 static inline int unet_hr_div(int hr) { return hr >= 3 ? 4 : hr ? 2 : 1; }      /* the window voxels per network voxel along each axis */
 static inline int unet_hr_mode(int hr) { return hr == 2 || hr == 4 ? 2 : 1; }   /* the last stage: 1 pool, 2 pack (nn_half_*) */

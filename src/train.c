@@ -1366,10 +1366,14 @@ int cmd_train(int argc, char **argv) {
         cfg.attn_mem = atoi(opt(argc, argv, "--attn-mem", "0"));   /* window memory tokens (unet_cfg.attn_mem; trained on --chain-p window chains) */
         cfg.view_P = atoi(opt(argc, argv, "--view-P", "0")); cfg.view_patch = atoi(opt(argc, argv, "--view-patch", "8"));   /* scan fusion: view crops (sources "view", src/view.h) as view rows */
         if (!cfg.view_P) cfg.view_patch = 0;
+        cfg.attn_deform = atoi(opt(argc, argv, "--attn-deform", "0"));   /* deformable attention: points per head and level (unet_cfg.attn_deform) */
+        cfg.attn_dlev = atoi(opt(argc, argv, "--attn-dlev", "2"));        /* ... sampled levels: the bottleneck + the next finer ones */
+        if (!cfg.attn_deform) cfg.attn_dlev = 0;
     }
     cfg.w4_2d = atoi(opt(argc, argv, "--w4-2d", "0"));   /* consistent fp4 weights (unet_cfg.w4_2d): one scale per 32 x 32 block and tap */
     if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.w4_2d = pc.w4_2d; cfg.down_norm = pc.down_norm; cfg.l0_norm = pc.l0_norm; cfg.l0_slab = pc.l0_slab; cfg.scale_cond = pc.scale_cond; memcpy(cfg.dec_widths, pc.dec_widths, sizeof cfg.dec_widths); cfg.ds_levels = pc.ds_levels; memcpy(cfg.dec_convs, pc.dec_convs, sizeof cfg.dec_convs); memcpy(cfg.enc_blocks, pc.enc_blocks, sizeof cfg.enc_blocks);
-                  cfg.attn_blocks = pc.attn_blocks; cfg.attn_pe = pc.attn_pe; cfg.attn_reg = pc.attn_reg; cfg.attn_mlp = pc.attn_mlp; cfg.attn_axis = pc.attn_axis; cfg.attn_repeat = pc.attn_repeat; cfg.attn_mem = pc.attn_mem; cfg.view_P = pc.view_P; cfg.view_patch = pc.view_patch; } }   /* the checkpoint decides */
+                  cfg.attn_blocks = pc.attn_blocks; cfg.attn_pe = pc.attn_pe; cfg.attn_reg = pc.attn_reg; cfg.attn_mlp = pc.attn_mlp; cfg.attn_axis = pc.attn_axis; cfg.attn_repeat = pc.attn_repeat; cfg.attn_mem = pc.attn_mem; cfg.view_P = pc.view_P; cfg.view_patch = pc.view_patch;
+                  cfg.attn_deform = pc.attn_deform; cfg.attn_dlev = pc.attn_dlev; } }   /* the checkpoint decides */
     if (cfg.w4_2d) fprintf(stderr, "weights: consistent MX-fp4 (--w4-2d 1): one scale per 32 x 32 block and tap, the same values in the forward and backward-data\n");
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,80")); cfg.nlev = 0; for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "P must be divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
@@ -1465,6 +1469,10 @@ int cmd_train(int argc, char **argv) {
         fprintf(stderr, "--view-P: needs --attn-blocks, full attention, no --split / restore, an even size that --view-patch divides\n"); return 2; }
     if (g_view) { int nv = 0; for (int i = 0; i < S->n; i++) nv += S->src[i].view; fprintf(stderr, "attention: scan fusion: %d^3 view crops, %d^3 patches -> %d view rows per window; %d of %d sources with a view\n", cfg.view_P, cfg.view_patch, (cfg.view_P / cfg.view_patch) * (cfg.view_P / cfg.view_patch) * (cfg.view_P / cfg.view_patch), nv, S->n); }
     sc.chain_p = (float)atof(opt(argc, argv, "--chain-p", "0")); sc.chain_len = atoi(opt(argc, argv, "--chain-len", "8")); sc.chain_step = (float)atof(opt(argc, argv, "--chain-step", "0.5"));
+    if (cfg.attn_deform > 0) {
+        if (cfg.attn_blocks <= 0 || split) { fprintf(stderr, "--attn-deform: needs --attn-blocks, no --split\n"); return 2; }
+        fprintf(stderr, "attention: deformable, %d points per head on each of %d levels\n", cfg.attn_deform, cfg.attn_dlev);
+    }
     if (cfg.attn_mem > 0 && (cfg.attn_blocks <= 0 || cfg.attn_axis)) { fprintf(stderr, "--attn-mem: needs --attn-blocks and full attention\n"); return 2; }
     if (sc.chain_p > 0 && (!g_mem || sc.deterministic || split || sc.chain_len < 2 || !(sc.chain_step > 0))) { fprintf(stderr, "--chain-p: needs --attn-mem, --det 0, no --split, --chain-len >= 2, --chain-step > 0\n"); return 2; }
     if (g_mem) fprintf(stderr, "attention: %d window memory tokens; window chains: %s\n", cfg.attn_mem, sc.chain_p > 0 ? "on" : "off (--chain-p 0: the memory input stays zero)");

@@ -97,6 +97,28 @@ No teacher models, no distillation. All upstream data is re-exported once into t
   Smoke (same setup, view_P 32 / patch 8 = 64 view rows beside 512 grid tokens): self view 4.40 samples/s vs 4.66; the Paris 4
   137 keV scan through PParis4_2to2 (mirror reads) 4.02. Partner crops match the 78 keV crop where the partner exists (mean 45.9 vs
   45.7) and are zero beyond its z range (coarse level-0 z ~42100..48700).
+- Deformable attention (2026-10-24, default off: `unet_cfg.attn_deform` K, `attn_dlev` L (2, at most 3); train `--attn-deform K
+  [--attn-dlev L]`; src/nn_attn_dfm.cu). Multi-scale 3D Deformable-DETR in place of each block's self-attention (subsumes the planned
+  normal rays / anisotropic bias / spiral RoPE): per token a linear layer (H L K x 4 rows: per head, level and point a 3-D offset in
+  level-l voxels, then the H x L x K logits; zero weights, the offsets' bias a grid prior of Fibonacci-sphere directions at radius
+  (1 + k % 4) / 2 bottleneck voxels, logits 0) and per head a softmax over the L K logits; the head's values are trilinearly sampled
+  (zero outside the level's grid) at the token's centre on level l plus the offset and summed. Level 0 = the bottleneck's tokens (value
+  projection C x C, the q / k / v slot), levels 1..L-1 = the next finer encoder outputs (2^l x the grid, their raw a2 LayerNorm'd
+  without affine; a value projection C x C_l each, no gradient into the trunk from them). Then the out projection (zero init: a fresh
+  stage is the identity) and the SwiGLU MLP as before. No registers / memory / view / radial / RoPE. The offset / logit and finer-level
+  projections train with Adam (Muon: the value, out and MLP matrices); the finer-level weight gradient runs in fp32 cuBLAS (MX-fp4 was
+  4x slower at its long K). Kernels: one warp per (token, head), lanes on the head's 48 channels; the backward scatters dV with atomics
+  and reduces the offset / logit gradients over the warp. Tests: test_attn_dfm (kernels: o, every level's dV, d offsets / d logits vs
+  double central differences with points just inside voxel boundaries and partly / wholly outside the grids; whole blocks with 1 / 2 /
+  3 levels vs a double forward incl. the finer projections, the kept forward = the recompute, zero-init identity bit for bit),
+  test_hybrid_identity (fresh stage identity, random stage: all 20 block tensors nonzero finite gradients, checkpoint, inference build
+  = training build).
+  Bench (laptop 5080, C 192 / 4 heads, F 512, one block, teacher fwd + student fwd + bwd, kept forward; ms and block scratch):
+  P512 (16^3 tokens): full 2.42 / 96 MB; K8 L2 2.71 / 136 MB; K16 L2 3.56 / 146 MB; K32 L2 5.75 / 165 MB; K8 L3 6.46 / 544 MB;
+  K16 L3 8.52 / 558 MB. P768 (24^3): full 17.2 / 323 MB; K8 L2 9.17 / 460 MB; K16 L2 13.2 / 492 MB; K32 L2 20.4 / 556 MB; K8 L3 22.8 /
+  1835 MB. Flash attention keeps no S x S matrix, so at these token counts deformable costs MORE memory (the finer levels' fp32
+  values: 8^l x the grid x C per block) and is only faster from ~P768 (K <= 16, L 2). Smoke (P256, 2 blocks, K16): L2 4.31-4.55
+  samples/s, L3 4.62-4.70 (sampler-bound; full attention 4.66), finite.
 - dino-train for large windows: `--head-slab Z` runs the 1^3 head per z-slab of Z planes (unet head slabs): no whole-window logits
   (P 512 at D 32: 8.6 GB of fp16 logits) and no dense fp32 logit gradient (17 GB) -- the points' embeddings are gathered per slab, and
   in the backward's head step their gradients are scattered into each slab's fp16 logit gradient. `--mem lean` sets train's smallest
