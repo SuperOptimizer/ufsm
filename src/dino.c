@@ -865,7 +865,7 @@ typedef struct {
     /* --ssl-distill W: dense cosine distillation of dinovol's unit 64-d sheet (object) embedding at the mapped points into head channels
        dch..dch+63 (student: the cell centres of each global; target: dinovol on the partner's un-augmented global at the same physical point);
        --ssl-distill-abs A scales that per-point term, --ssl-distill-rel W adds W x the crop's similarity-matrix match (ss_relsim: rotation-free) */
-    float dist; int dch, dnd; float *dcrd, *dacc, *dth, *dse, *dsn, *dge, *dch_h, *dacch; double dist_l; long dist_n; float drel, dabs; double rel_l; long rel_n; float dnce, dthr, dtau; int dnm; double nce_l, nce_pf; long nce_n; int dstr, dnp, *ddp, *ddph; float *dtd; double dtm; long dtmn;   /* (dense mode: --ssl-distill-stride S grid points of every global, its own crop) */
+    float dist; int dch, dnd; float *dcrd, *dacc, *dth, *dse, *dsn, *dge, *dch_h, *dacch; double dist_l; long dist_n; float drel, dabs; double rel_l; long rel_n; float dnce, dthr, dtau; int dnm; double nce_l, nce_pf; long nce_n; double zn_s, zsim_s; long zn_n; int dstr, dnp, *ddp, *ddph; float *dtd; double dtm; long dtmn;   /* (dense mode: --ssl-distill-stride S grid points of every global, its own crop) */
     int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -1482,6 +1482,9 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
                 } else for (int k = 0; k < NP; k++) { const int z = Q->ddph[(size_t)j * NP + k] / (Q->PG * Q->PG); for (int e = 0; e < nd; e++) tc[(size_t)k * nd + e] = e == 0 ? (dconst == 2 && z < Q->PG / 2 ? -1.f : 1.f) : 0.f; } }
             dn_gather((const char *)lgs + (size_t)Q->dch * g3 * (h16 ? 2 : 4), h16, g3, nd, Q->ddp + (size_t)j * NP, NP, Q->dse, Q->dsn);
             nn_d2h(eh, Q->dse, (size_t)NP * nd * 4);
+            { float *nh = malloc((size_t)NP * 4); nn_d2h(nh, Q->dsn, (size_t)NP * 4); double a = 0; for (int k = 0; k < NP; k++) a += nh[k]; free(nh);   /* (embedding |z| and the mean pairwise cosine of 64 points) */
+              double c = 0; const int st = NP / 64; for (int u = 0; u < 64; u++) for (int v = u + 1; v < 64; v++) { double d = 0; for (int e = 0; e < nd; e++) d += (double)eh[(size_t)u * st * nd + e] * eh[(size_t)v * st * nd + e]; c += d; }
+              Q->zn_s += a / NP; Q->zsim_s += c / (64 * 63 / 2); Q->zn_n++; }
             const float wv = Q->dist * Q->dabs / (float)(2 * N * NP);
             for (int k = 0; k < NP; k++) { double d = 0; for (int e = 0; e < nd; e++) { d += (double)eh[(size_t)k * nd + e] * th[(size_t)k * nd + e]; gh[(size_t)k * nd + e] = -wv * th[(size_t)k * nd + e]; }
                 Q->dist_l += 1 - d; Q->dist_n++; }
@@ -1584,6 +1587,7 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             if (Q->ilsc) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | ibot logit scale %.3f", expf(Q->lsc)); l5 = strlen(line); }
             if (Q->dist_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill 1-cos %.4f", Q->dist_l / Q->dist_n); Q->dist_l = 0; Q->dist_n = 0; l5 = strlen(line); }
             if (Q->dtmn) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | |mean target| %.3f", Q->dtm / Q->dtmn); Q->dtm = 0; Q->dtmn = 0; l5 = strlen(line); }
+            if (Q->zn_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | emb |z| %.4g cos %.3f", Q->zn_s / Q->zn_n, Q->zsim_s / Q->zn_n); Q->zn_s = Q->zsim_s = 0; Q->zn_n = 0; l5 = strlen(line); }
             if (Q->nce_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill nce %.4f pos %.3f", Q->nce_l / Q->nce_n, Q->nce_pf / Q->nce_n); Q->nce_l = 0; Q->nce_pf = 0; Q->nce_n = 0; l5 = strlen(line); }
             if (Q->rel_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill rel %.4f", Q->rel_l / Q->rel_n); Q->rel_l = 0; Q->rel_n = 0; l5 = strlen(line); }
             if (Q->sig_n) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | sigreg %.4f", Q->sig_l / Q->sig_n); Q->sig_l = 0; Q->sig_n = 0; l5 = strlen(line); }
