@@ -26,6 +26,17 @@ int main(void) {
       for (int i = 0; i < N * D; i++) { const float o = X[i]; const double e = 1e-4; X[i] = (float)(o + e); const double lp = ss_koleo_all(X, N, D, w, eps, Gd); X[i] = (float)(o - e); const double lm = ss_koleo_all(X, N, D, w, eps, Gd); X[i] = o;
           const double fd = (lp - lm) / (2 * e); emax = fmax(emax, fabs(fd - G[i])); gmax = fmax(gmax, fabs(fd)); }
       const int b = !(emax < 5e-3 * gmax); printf("KoLeo all-row gradients vs the full batch: max |err| %.2e of max |grad| %.2e%s\n", emax, gmax, b ? "  FAIL" : ""); bad += b; }
+    /* SIGReg: every row's gradient vs central differences in double; plus a sanity check: Gaussian rows score far lower than collapsed ones */
+    { const int S = 5, K = 17, Dg = 7; float A[5 * 7]; for (int s = 0; s < S; s++) { double n = 0; for (int c = 0; c < Dg; c++) { A[s * Dg + c] = (float)(urand() - 0.5); n += A[s * Dg + c] * A[s * Dg + c]; } for (int c = 0; c < Dg; c++) A[s * Dg + c] /= (float)sqrt(n); }
+      const double xs = 2.6, w = 0.9; float G[9 * 7], Gd[9 * 7]; ss_sigreg_all(X, N, Dg, A, S, K, 3.0, xs, w, G); double emax = 0, gmax = 0;
+      for (int i = 0; i < N * Dg; i++) { const float o = X[i]; const double e = 1e-3; X[i] = (float)(o + e); const double ep = (double)X[i] - o; const double lp = ss_sigreg_all(X, N, Dg, A, S, K, 3.0, xs, w, nullptr);
+          X[i] = (float)(o - e); const double em = o - (double)X[i]; const double lm = ss_sigreg_all(X, N, Dg, A, S, K, 3.0, xs, w, nullptr); X[i] = o;
+          const double fd = (lp - lm) / (ep + em); emax = fmax(emax, fabs(fd - G[i])); gmax = fmax(gmax, fabs(fd)); (void)Gd; }
+      int b = !(emax < 2e-3 * gmax); printf("SIGReg all-row gradients: max |err| %.2e of max |grad| %.2e%s\n", emax, gmax, b ? "  FAIL" : ""); bad += b;
+      enum { NG = 512 }; float *Xg = malloc((size_t)NG * Dg * 4), *Xc = malloc((size_t)NG * Dg * 4);
+      for (int i = 0; i < NG * Dg; i++) { const double u1 = urand() + 1e-12, u2 = urand(); Xg[i] = (float)(sqrt(-2 * log(u1)) * cos(6.283185307179586 * u2)); Xc[i] = 0.05f * Xg[i] + 0.7f; }
+      const double lg = ss_sigreg_all(Xg, NG, Dg, A, S, K, 3.0, 1.0, 1.0, nullptr), lc = ss_sigreg_all(Xc, NG, Dg, A, S, K, 3.0, 1.0, 1.0, nullptr);
+      b = !(lg < 2.0 && lc > 50 * lg); printf("SIGReg statistic: gaussian %.3f, collapsed %.3f%s\n", lg, lc, b ? "  FAIL" : ""); bad += b; free(Xg); free(Xc); }
     printf("%s\n", bad ? "test_sslstat: FAIL" : "test_sslstat: OK");
     return bad != 0;
 }

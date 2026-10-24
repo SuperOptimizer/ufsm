@@ -460,13 +460,42 @@ static size_t ws_walk(at_ws *w, const at_dims *d, long T, float *fb, float *bb, 
 extern "C" size_t at_ws_bytes(const at_dims *d, long T) { return (ws_walk(nullptr, d, T, nullptr, nullptr, 0) + ws_walk(nullptr, d, T, nullptr, nullptr, 1)) * 4; }
 extern "C" void at_ws_carve(at_ws *w, const at_dims *d, long T, void *base) {
     const size_t nf = ws_walk(nullptr, d, T, nullptr, nullptr, 0);
-    ws_walk(w, d, T, (float *)base, (float *)base + nf, 0); w->kept = 0;
+    ws_walk(w, d, T, (float *)base, (float *)base + nf, 0); w->kept = 0; w->vr = 0;
 }
 extern "C" size_t at_ws_fwd_bytes(const at_dims *d, long T) { return ws_walk(nullptr, d, T, nullptr, nullptr, 0) * 4; }
 extern "C" void at_ws_set_fwd(at_ws *w, const at_dims *d, long T, void *base) {
     at_ws t; ws_walk(&t, d, T, (float *)base, nullptr, 0);
     w->xn = t.xn; w->o = t.o; w->x1 = t.x1; w->xn2 = t.xn2; w->qkv = t.qkv; w->h = t.h;
     w->m1 = t.m1; w->r1 = t.r1; w->m2 = t.m2; w->r2 = t.r2; w->rq = t.rq; w->rk = t.rk; w->lse = t.lse; w->qkvh = t.qkvh; w->amx = t.amx; w->kept = 0;
+}
+
+/* ---- value residual (at_ws.vr) ---- */
+__global__ void k_vr_first(const float *qkv, float *v1, long long T, int C) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= T * C) return;
+    v1[i] = qkv[(i / C) * 3 * C + 2 * C + i % C];
+}
+__global__ void k_vr_mix(float *qkv, const float *v1, float *own, const float *lam, long long T, int C) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= T * C) return;
+    const int c = (int)(i % C); float *v = qkv + (i / C) * 3 * C + 2 * C + c; const float o = *v; own[i] = o; *v = o + lam[c / HD] * (v1[i] - o);
+}
+__global__ void k_vr_add(float *dqkv, const float *dv1, long long T, int C) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= T * C) return;
+    dqkv[(i / C) * 3 * C + 2 * C + i % C] += dv1[i];
+}
+/* one block per 64 tokens, threads over channels; one atomic per (block, head) via shared memory */
+__global__ void k_vr_bwd(float *dqkv, const float *v1, const float *own, float *dv1, const float *lam, float *glam, long long T, int C) {
+    __shared__ float sh[64]; const int H = C / HD;
+    for (int h = threadIdx.x; h < H; h += blockDim.x) sh[h] = 0.f;
+    __syncthreads();
+    const long long t0 = (long long)blockIdx.x * 64, t1 = t0 + 64 < T ? t0 + 64 : T;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        const float l = lam[c / HD]; float s = 0.f;
+        for (long long t = t0; t < t1; t++) { const long long i = t * C + c; float *g = dqkv + t * 3 * C + 2 * C + c; const float d = *g;
+            s += d * (v1[i] - own[i]); dv1[i] += l * d; *g = (1.f - l) * d; }
+        atomicAdd(sh + c / HD, s);
+    }
+    __syncthreads();
+    for (int h = threadIdx.x; h < H; h += blockDim.x) atomicAdd(glam + h, sh[h]);
 }
 
 /* ---- one block ---- */
@@ -476,6 +505,8 @@ extern "C" int at_block_fwd(const at_dims *d, const float *P, const at_bp *bp, c
     int e = 0;
     PR("ln1", 0, t * C * 8, at_ln_fwd(x, P + bp->ln1g, P + bp->ln1b, w->xn, w->m1, w->r1, T, C));
     PR("qkv gemm", 2 * t * 3 * C * C, t * C * 16, e |= at_gemm_ex(0, 1, (int)T, 3 * C, C, w->xn, P + bp->wqkv, w->qkv, 0.f, P + bp->bqkv, nullptr)); CK(e);
+    if (w->vr == 1) k_vr_first<<<nbk((long long)T * C, 256), 256>>>(w->qkv, w->v1, T, C);
+    else if (w->vr == 2) k_vr_mix<<<nbk((long long)T * C, 256), 256>>>(w->qkv, w->v1, w->own, w->lam, T, C);
     if (at_get_core()) {
         PR("qknorm+pack", 0, t * C * 18, at_fa_pack(w->qkv, P + bp->qg, P + bp->kg, w->qkvh, w->rq, w->rk, w->amx, g, d->nreg, C, d->rope, d->rope_base));
         if (at_get_core() == 2) PR("attn fwd", A, t * C * 6, e |= at_fa8_fwd(w->qkvh, w->o, w->lse, g, d->H, C));
@@ -518,6 +549,8 @@ extern "C" int at_block_bwd(const at_dims *d, const float *P, float *G, const at
     else PR("attn bwd", 3.5 * A, t * C * 40, at_attn_bwd(w->qkn, w->o, w->lse, w->bC, w->dv, w->bA, g, d->H, C));   /* d qkn */
     PR("b rope+qknorm", 0, t * C * 36, if (d->rope) at_rope(w->bA, g, d->nreg, C, d->rope_base, 1);
        at_qknorm_bwd(w->qkv, P + bp->qg, P + bp->kg, w->rq, w->rk, w->bA, w->bB, G + bp->qg, G + bp->kg, T, C));
+    if (w->vr == 2) k_vr_bwd<<<(unsigned)((T + 63) / 64), 128>>>(w->bB, w->v1, w->own, w->dv1, w->lam, w->glam, T, C);
+    else if (w->vr == 1) k_vr_add<<<nbk((long long)T * C, 256), 256>>>(w->bB, w->dv1, T, C);
     PR("b qkv gemms", 12 * t * C * C, t * C * 40, e |= at_gemm(1, 0, 3 * C, C, (int)T, w->bB, w->xn, G + bp->wqkv, 1.f); colsum(w->bB, T, 3 * C, G + bp->bqkv);
        e |= at_gemm(0, 0, (int)T, C, 3 * C, w->bB, P + bp->wqkv, w->bC, 0.f)); CK(e);        /* d xn */
     PR("b ln1", 0, t * C * 20, cudaMemcpyAsync(gy, w->dx1, (size_t)T * C * 4, cudaMemcpyDeviceToDevice, 0);

@@ -49,3 +49,29 @@ static inline double ss_koleo_all(const float *X, int N, int D, double w, double
     }
     free(xh); free(nr); free(gh); free(nn); return L;
 }
+/* SIGReg (LeJEPA, arXiv 2511.08544): the rows of X [N][D] (times xs) projected on S unit directions A [S][D]; per direction the
+   Epps-Pulley distance between the projections' empirical characteristic function and the standard normal's, phi(t) = exp(-t^2 / 2):
+   int_{-tmax}^{tmax} phi(t) ((Re ecf(t) - phi(t))^2 + Im ecf(t)^2) dt (an even integrand: 2 x the trapezoid rule on K knots of [0, tmax]),
+   times N (the test statistic); L = w x the mean over directions. Teacher-free: pushes the embedding towards an isotropic Gaussian.
+   cos / sin of t_k x by the angle-addition recurrence (one sincos per projection). G [N][D] (written, when not nullptr) = d L / d X; returns L. */
+static inline double ss_sigreg_all(const float *X, int N, int D, const float *A, int S, int K, double tmax, double xs, double w, float *G) {
+    const double dt = tmax / (K - 1); double *ph = malloc((size_t)K * 8), *cw = malloc((size_t)K * 8), *p = malloc((size_t)N * 8), *c1 = malloc((size_t)N * 8), *s1 = malloc((size_t)N * 8);
+    double *re = malloc((size_t)K * 8), *im = malloc((size_t)K * 8), *gp = malloc((size_t)N * 8); double L = 0;
+    for (int k = 0; k < K; k++) { const double t = k * dt; ph[k] = exp(-0.5 * t * t); cw[k] = 2 * dt * (k == 0 || k == K - 1 ? 0.5 : 1.0) * ph[k]; }
+    if (G) memset(G, 0, (size_t)N * D * sizeof *G);
+    for (int s = 0; s < S; s++) {
+        const float *a = A + (size_t)s * D;
+        for (int i = 0; i < N; i++) { double v = 0; for (int c = 0; c < D; c++) v += (double)X[(size_t)i * D + c] * a[c]; p[i] = xs * v; c1[i] = cos(dt * p[i]); s1[i] = sin(dt * p[i]); }
+        for (int k = 0; k < K; k++) { re[k] = 0; im[k] = 0; }
+        for (int i = 0; i < N; i++) { double ck = 1, sk = 0; for (int k = 0; k < K; k++) { re[k] += ck / N; im[k] += sk / N; const double cn = ck * c1[i] - sk * s1[i]; sk = sk * c1[i] + ck * s1[i]; ck = cn; } }
+        double l = 0; for (int k = 0; k < K; k++) l += cw[k] * ((re[k] - ph[k]) * (re[k] - ph[k]) + im[k] * im[k]);
+        L += w * N * l / S;
+        if (!G) continue;
+        /* d l / d p_i = sum_k cw_k 2 ((re_k - ph_k) (-t_k sin(t_k p_i)) + im_k t_k cos(t_k p_i)) / N; d L / d X_i = w N / S xs (d l / d p_i) a */
+        for (int i = 0; i < N; i++) { double ck = 1, sk = 0, g = 0;
+            for (int k = 0; k < K; k++) { const double t = k * dt; g += cw[k] * 2 * t * (-(re[k] - ph[k]) * sk + im[k] * ck) / N; const double cn = ck * c1[i] - sk * s1[i]; sk = sk * c1[i] + ck * s1[i]; ck = cn; }
+            gp[i] = w * N / S * xs * g; }
+        for (int i = 0; i < N; i++) for (int c = 0; c < D; c++) G[(size_t)i * D + c] += (float)(gp[i] * a[c]);
+    }
+    free(ph); free(cw); free(p); free(c1); free(s1); free(re); free(im); free(gp); return L;
+}

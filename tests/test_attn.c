@@ -58,11 +58,16 @@ static void ref_attn(const double *qkn, double *o, double *lse, const at_geom *g
     free(s);
 }
 typedef struct { at_dims d; at_bp bp; at_geom g; } blk;
-static void ref_block(const blk *B, const double *P, const double *x, double *y) {
+/* vr_out: the block's V rows [T][C] (value residual, first block); lam: V <- V + lam[head] (vr_in - V) (a later block) */
+static void ref_block_vr(const blk *B, const double *P, const double *x, double *y, double *vr_out, const double *vr_in, const double *lam);
+static void ref_block(const blk *B, const double *P, const double *x, double *y) { ref_block_vr(B, P, x, y, nullptr, nullptr, nullptr); }
+static void ref_block_vr(const blk *B, const double *P, const double *x, double *y, double *vr_out, const double *vr_in, const double *lam) {
     const int C = B->d.C, F = B->d.F, H = B->d.H; const long T = (long)B->g.nseq * B->g.S; const at_bp *bp = &B->bp;
     double *xn = malloc(T * C * 8), *qkv = malloc(T * 3 * C * 8), *o = malloc(T * C * 8), *x1 = malloc(T * C * 8), *h = malloc(T * 2 * F * 8), *gg = malloc(T * F * 8);
     ref_ln(x, P + bp->ln1g, P + bp->ln1b, xn, T, C);
     ref_lin(xn, P + bp->wqkv, P + bp->bqkv, qkv, T, C, 3 * C, 0);
+    if (vr_out) for (long t = 0; t < T; t++) for (int c = 0; c < C; c++) vr_out[t * C + c] = qkv[t * 3 * C + 2 * C + c];
+    if (lam) for (long t = 0; t < T; t++) for (int c = 0; c < C; c++) { double *v = qkv + t * 3 * C + 2 * C + c; *v += lam[c / AT_HD] * (vr_in[t * C + c] - *v); }
     for (long t = 0; t < T; t++) for (int hh = 0; hh < H; hh++) for (int p = 0; p < 2; p++) {
         double *v = qkv + t * 3 * C + p * C + hh * AT_HD; const double *gs = P + (p ? bp->kg : bp->qg) + hh * AT_HD; double s = 0;
         for (int d = 0; d < AT_HD; d++) s += v[d] * v[d];
@@ -136,6 +141,62 @@ static int test_block(int nseq, int D, int Hh, int W, int nreg, int C, int F, in
     }
     free(a); free(r); free(gx); free(gP); free(P); free(x); free(R);
     nn_free(Pd); nn_free(xd); nn_free(gd); nn_free(yd); nn_free(Gd); nn_free(wb);
+    return bad;
+}
+
+/* value residual (at_ws.vr): two blocks, the second mixing its V with the first's by per-head lerps; every gradient (input, both blocks'
+   QKV, the lerps) vs central differences of the double reference, through the recompute path */
+static double vr_loss(const blk *B, const at_bp *b2, const double *P, const double *x, const double *R, size_t lo) {
+    const long n = (long)B->g.nseq * B->g.S * B->d.C; double *y1 = malloc(n * 8), *y2 = malloc(n * 8), *v1 = malloc(n * 8);
+    ref_block_vr(B, P, x, y1, v1, nullptr, nullptr); blk B2 = *B; B2.bp = *b2; ref_block_vr(&B2, P, y1, y2, nullptr, v1, P + lo);
+    double L = 0; for (long i = 0; i < n; i++) L += y2[i] * R[i];
+    free(y1); free(y2); free(v1); return L;
+}
+static int test_vres(int npts) {
+    blk B = {0}; const int C = 96, F = 128; B.d.C = C; B.d.H = C / AT_HD; B.d.F = F; B.d.rope = 1; B.d.nreg = 1; B.d.rope_base = 100.f;
+    B.g.nseq = 2; B.g.D = 3; B.g.Hh = 4; B.g.W = 4; B.g.S = 1 + 48;
+    at_bp b2; size_t np = at_block_layout(&B.d, &B.bp, 0); np = at_block_layout(&B.d, &b2, np); const size_t lo = np; np += B.d.H;
+    const long T = (long)B.g.nseq * B.g.S;
+    printf("value residual: two blocks, %d seq x %d tokens, C %d (%d heads), core %d\n", B.g.nseq, B.g.S, C, B.d.H, at_get_core());
+    double *P = malloc(np * 8), *x = malloc(T * C * 8), *R = malloc(T * C * 8);
+    for (size_t i = 0; i < np; i++) P[i] = rf(0.1 * nrand());
+    const at_bp *bs[2] = {&B.bp, &b2};
+    for (int k = 0; k < 2; k++) { const at_bp *bp = bs[k];
+        for (int c = 0; c < C; c++) { P[bp->ln1g + c] = rf(1 + 0.2 * nrand()); P[bp->ln2g + c] = rf(1 + 0.2 * nrand()); P[bp->qg + c] = rf(1 + 0.2 * nrand()); P[bp->kg + c] = rf(1 + 0.2 * nrand()); }
+        for (size_t i = 0; i < (size_t)3 * C * C; i++) P[bp->wqkv + i] = rf(nrand() / sqrt(C) * 1.5);
+        for (size_t i = 0; i < (size_t)C * C; i++) P[bp->wo + i] = rf(nrand() / sqrt(C));
+        for (size_t i = 0; i < (size_t)2 * F * C; i++) P[bp->w1 + i] = rf(nrand() / sqrt(C));
+        for (size_t i = 0; i < (size_t)C * F; i++) P[bp->w2 + i] = rf(nrand() / sqrt(F)); }
+    for (int h = 0; h < B.d.H; h++) P[lo + h] = rf(0.3 + 0.4 * urand());
+    for (long i = 0; i < T * C; i++) { x[i] = rf(nrand()); R[i] = rf(nrand()); }
+    float *Pd = dev(P, np), *xd = dev(x, T * C), *gd = dev(R, T * C), *y1 = nn_malloc(T * C * 4), *y2 = nn_malloc(T * C * 4), *Gd = nn_malloc(np * 4), *vb = nn_malloc((size_t)4 * T * C * 4);
+    nn_zero(Gd, np * 4);
+    at_ws w; void *wb = nn_malloc(at_ws_bytes(&B.d, T)); at_ws_carve(&w, &B.d, T, wb);
+    w.v1 = vb; w.dv1 = vb + T * C; float *own[2] = {vb + 2 * T * C, vb + 3 * T * C};
+    int bad = 0;
+    w.vr = 1; w.own = own[0]; at_block_fwd(&B.d, Pd, &B.bp, xd, y1, &B.g, &w);
+    w.vr = 2; w.own = own[1]; w.lam = Pd + lo; w.glam = Gd + lo; at_block_fwd(&B.d, Pd, &b2, y1, y2, &B.g, &w);
+    { double *yg = host(y2, T * C), *yr = malloc(T * C * 8), *y1r = malloc(T * C * 8), *v1r = malloc(T * C * 8); blk B2 = B; B2.bp = b2;
+      ref_block_vr(&B, P, x, y1r, v1r, nullptr, nullptr); ref_block_vr(&B2, P, y1r, yr, nullptr, v1r, P + lo); bad += report("forward", yg, yr, (int)(T * C)); free(yg); free(yr); free(y1r); free(v1r); }
+    nn_zero(w.dv1, (size_t)T * C * 4);
+    w.vr = 2; w.own = own[1]; at_block_bwd(&B.d, Pd, Gd, &b2, y1, gd, &B.g, &w);
+    w.vr = 1; w.own = own[0]; at_block_bwd(&B.d, Pd, Gd, &B.bp, xd, gd, &B.g, &w);
+    double *gx = host(gd, T * C), *gP = host(Gd, np);
+    struct { const char *nm; size_t off, n; } ts[] = {{"x", 0, (size_t)T * C}, {"wqkv1", B.bp.wqkv, (size_t)3 * C * C}, {"bqkv1", B.bp.bqkv, (size_t)3 * C},
+        {"wqkv2", b2.wqkv, (size_t)3 * C * C}, {"w1 1", B.bp.w1, (size_t)2 * F * C}, {"lam", lo, (size_t)B.d.H}};
+    double *a = malloc(npts * 8), *r = malloc(npts * 8);
+    for (size_t k = 0; k < sizeof ts / sizeof ts[0]; k++) {
+        const int n = k == 5 ? B.d.H : npts;
+        for (int i = 0; i < n; i++) {
+            size_t j = k == 5 ? (size_t)i : (size_t)(urand() * ts[k].n); if (j >= ts[k].n) j = ts[k].n - 1;
+            double *v = k == 0 ? x + j : P + ts[k].off + j, v0 = *v, e = 1e-4 * (fabs(v0) > 1 ? fabs(v0) : 1);
+            *v = v0 + e; double lp = vr_loss(&B, &b2, P, x, R, lo); *v = v0 - e; double lm = vr_loss(&B, &b2, P, x, R, lo); *v = v0;
+            r[i] = (lp - lm) / (2 * e); a[i] = k == 0 ? gx[j] : gP[ts[k].off + j];
+        }
+        bad += report(ts[k].nm, a, r, n);
+    }
+    free(a); free(r); free(gx); free(gP); free(P); free(x); free(R);
+    nn_free(Pd); nn_free(xd); nn_free(gd); nn_free(y1); nn_free(y2); nn_free(Gd); nn_free(vb); nn_free(wb);
     return bad;
 }
 
@@ -335,6 +396,7 @@ int main(void) {
         bad += test_block(2, 4, 4, 4, 1, 96, 128, 0, 24);
         bad += test_block(2, 4, 4, 4, 2, 192, 256, 1, 16);
         bad += test_block(1, 8, 8, 8, 0, 96, 128, 1, 6);
+        bad += test_vres(12);
         if (core) { g_tmax = 6e-3; g_tl2 = 2e-3; }
         bad += test_attn_large(core ? 2 : 1, 4, 16, 96, core, 1);
         if (core) bad += test_attn_large(1, 3, 10, 144, core, 1e-7);

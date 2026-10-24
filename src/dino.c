@@ -861,7 +861,7 @@ typedef struct {
     /* diag-dv (--ssl-dv-teacher PT): the iBOT targets from the frozen upstream dinovol teacher (its ibot_head over its patch tokens of the
        un-augmented teacher global, at the cell of each mapped point) until --ssl-dv-until (0: always), then from our EMA teacher; the student
        iBOT head predicts dinovol's 131072 prototypes (its last layer initialised from dinovol's and kept frozen) */
-    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; long srccnt[DN_MAXSRC]; int pcen; float lsc, lsm, lsv; int ilsc; double lsg; int fixdone, Rfix, hwarm, icos, subps; double zvh_l; long zvh_n; float subp0, subp1, izv; uint8_t *subm, *d_subm; float *zvg; double cosacc; long cosn;
+    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; long srccnt[DN_MAXSRC]; int pcen; float lsc, lsm, lsv; int ilsc; double lsg; int fixdone, Rfix, hwarm, icos, subps; double zvh_l; long zvh_n; float subp0, subp1, izv; uint8_t *subm, *d_subm; float *zvg; double cosacc; long cosn; float sig; int sigS; double sig_l; long sig_n; float *sigA;
     int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -965,6 +965,7 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
             const size_t G2 = (size_t)Q->PG / Q->subps; Q->subm = malloc(G2 * G2 * G2); Q->d_subm = nn_malloc(G2 * G2 * G2); }
         Q->pcen = atoi(opt(argc, argv, "--ssl-ibot-proto-center", "0"));   /* subtract the mean prototype after every prototype update (the shared-direction drift) */
         Q->ilsc = atoi(opt(argc, argv, "--ssl-ibot-logit-scale", "0")); Q->lsc = 0.f;   /* a learnable student logit scale exp(lsc) (Adam, lr 1e-2) */
+        Q->sig = (float)atof(opt(argc, argv, "--ssl-sigreg", "0")); Q->sigS = atoi(opt(argc, argv, "--ssl-sigreg-slices", "256"));   /* SIGReg (LeJEPA) on the student's iBOT token bottleneck */
         Q->izv = (float)atof(opt(argc, argv, "--ssl-ibot-zvar", "0"));   /* variance hinge on the student's unit token bottleneck: per-dim std over a view's rows >= 1 / sqrt(B) */
         Q->zvg = nn_malloc((size_t)IM * (HB > 1024 ? HB : 1024) * 4); Q->usei = calloc((size_t)KI, 1);
         if (Q->dv) {   /* the student head's last layer = dinovol's prototypes (frozen); the teacher-side buffers */
@@ -1249,14 +1250,23 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             else dn_gather((const char *)lgs + (size_t)Q->ich * g3 * (h16 ? 2 : 4), h16, g3, 32, Q->d_hS + (size_t)j * Q->IM, m, Q->ieS, Q->inS);
             if (dr_head_fwd(&Q->I.H, Q->I.p, Q->ieS, m, Q->isl, &Q->I.w)) return 1;
             Q->I.w.dzn_add = nullptr;
-            if (Q->izv > 0 && m >= 4) {   /* variance hinge on this view's unit token bottleneck rows (gradient added to d / d zn) */
+            if ((Q->izv > 0 || Q->sig > 0) && m >= 4) {   /* variance hinge / SIGReg on this view's unit token bottleneck rows (gradient added to d / d zn) */
                 const int Bz = Q->I.H.B; float *zh = malloc((size_t)m * Bz * 4), *gh = calloc((size_t)m * Bz, 4); nn_d2h(zh, Q->I.w.zn, (size_t)m * Bz * 4);
+                if (Q->sig > 0) {   /* SIGReg: sqrt(B) zn (an isotropic unit-norm cloud has unit variance per direction) vs N(0, 1) on sigS fresh random directions */
+                    if (!Q->sigA) Q->sigA = malloc((size_t)Q->sigS * Bz * 4);
+                    for (int a = 0; a < Q->sigS; a++) { double nr = 0; for (int c = 0; c < Bz; c++) { const double u1 = rng_u(&Q->ar) + 1e-12, u2 = rng_u(&Q->ar); const double g = sqrt(-2 * log(u1)) * cos(6.283185307179586 * u2); Q->sigA[(size_t)a * Bz + c] = (float)g; nr += g * g; }
+                        for (int c = 0; c < Bz; c++) Q->sigA[(size_t)a * Bz + c] /= (float)sqrt(nr); }
+                    float *gs = malloc((size_t)m * Bz * 4);
+                    Q->sig_l += ss_sigreg_all(zh, m, Bz, Q->sigA, Q->sigS, 17, 3.0, sqrt((double)Bz), Q->sig * Q->wib / (double)(R > 0 ? R : 1), gs) / (Q->wib / (double)(R > 0 ? R : 1)); Q->sig_n++;
+                    for (size_t k = 0; k < (size_t)m * Bz; k++) gh[k] += gs[k];
+                    free(gs);
+                }
                 const double gam = 1.0 / sqrt((double)Bz), wv = Q->izv * Q->wib * m / (double)(R > 0 ? R : 1);   /* (this view's share of the batch) */
                 double hl = 0;
-                for (int d = 0; d < Bz; d++) { double mu = 0, v = 0; for (int k = 0; k < m; k++) mu += zh[(size_t)k * Bz + d] / m; for (int k = 0; k < m; k++) v += (zh[(size_t)k * Bz + d] - mu) * (zh[(size_t)k * Bz + d] - mu) / m;
+                for (int d = 0; d < Bz && Q->izv > 0; d++) { double mu = 0, v = 0; for (int k = 0; k < m; k++) mu += zh[(size_t)k * Bz + d] / m; for (int k = 0; k < m; k++) v += (zh[(size_t)k * Bz + d] - mu) * (zh[(size_t)k * Bz + d] - mu) / m;
                     const double sd = sqrt(v + 1e-8); if (sd >= gam) continue; hl += (gam - sd) / Bz;
                     for (int k = 0; k < m; k++) gh[(size_t)k * Bz + d] = (float)(-wv / Bz * (zh[(size_t)k * Bz + d] - mu) / (m * sd)); }
-                nn_h2d(Q->zvg, gh, (size_t)m * Bz * 4); Q->I.w.dzn_add = Q->zvg; Q->zvh_l += hl; Q->zvh_n++; free(zh); free(gh);
+                nn_h2d(Q->zvg, gh, (size_t)m * Bz * 4); Q->I.w.dzn_add = Q->zvg; if (Q->izv > 0) { Q->zvh_l += hl; Q->zvh_n++; } free(zh); free(gh);
             }
             float *hw_ = malloc((size_t)m * 4); for (int k = 0; k < m; k++) hw_[k] = Q->wib / (float)(R > 0 ? R : 1); nn_h2d(Q->iw, hw_, (size_t)m * 4); free(hw_);
             Q->lastm = m;
@@ -1428,6 +1438,7 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             for (int a = 0; a < m; a++) for (int c = a + 1; c < m; c++) { double d = 0; for (int b = 0; b < Bz; b++) d += zn[(size_t)a * Bz + b] * zn[(size_t)c * Bz + b]; co += d; no++; }
             size_t l5 = strlen(line);
             if (Q->ilsc) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | ibot logit scale %.3f", expf(Q->lsc)); l5 = strlen(line); }
+            if (Q->sig_n) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | sigreg %.4f", Q->sig_l / Q->sig_n); Q->sig_l = 0; Q->sig_n = 0; l5 = strlen(line); }
             if (Q->zvh_n) { const size_t l7 = strlen(line); snprintf(line + l7, cap - l7, " | ibot zvar hinge %.5f", Q->zvh_l / Q->zvh_n); Q->zvh_l = 0; Q->zvh_n = 0; l5 = strlen(line); }
             if (Q->icos) { const size_t l6 = strlen(line); snprintf(line + l6, cap - l6, " | ibot cos(student, dinovol token) %.4f", Q->cosn ? Q->cosacc / Q->cosn : 0.0); Q->cosacc = 0; Q->cosn = 0; l5 = strlen(line); }
             snprintf(line + l5, cap - l5, " | ibot student feat std/ch %.4f |mean| %.4f H %.2f pmax %.4f tok z std/dim %.4f (1/sqrt(B) %.4f) cos other %.4f%s", fsd, fm, Hs, pms, sm, 1 / sqrt((double)Bz), no ? co / no : 0.0, Q->dv ? (Q->dvuntil <= 0 || step <= Q->dvuntil ? " [dv teacher]" : " [ema teacher]") : "");
@@ -2175,7 +2186,7 @@ int cmd_dino_train(int argc, char **argv) {
                         "         [--noise 0.15] [--gain-jit 0.15] [--mask-frac 0] [--mask-cube 16] [--seed 1] [--workers 4] [--threads 4]\n"
                         "         [--eval SURF-LIST --eval-root R --eval-key K --eval-box z,y,x,nz,ny,nx --eval-every 2000 --eval-codes ROOT KEY --eval-norm c,s]\n"
                         "         [--log-every 20] [--save-every 2000] [--resume CKPT] [--dim 32] [--mx 0 (bf16, no MX)] [--var 30] [--var-gamma 0.8 / sqrt(D)] [--gpu 0]\n"
-                        "         [--attn-blocks 0 (transformer blocks on the bottleneck)] [--attn-pe peg|rope|none] [--attn-reg 0] [--attn-mlp 0 (8/3 width)]\n"
+                        "         [--attn-blocks 0 (transformer blocks on the bottleneck)] [--attn-pe peg|rope|none] [--attn-reg 0] [--attn-mlp 0 (8/3 width)] [--attn-vres 0 (1: value residual)]\n"
                         "         [--attn-core 1 (attention products: 0 fp32, 1 fp16 / 2 MX-fp8 tensor cores)] [--attn-keep 0|1 (keep each block's forward, no recompute)]\n"
                         "         [--minutes M (wall-time budget: the step count from the speed of steps 21..200; evals / saves at the end)]\n"
                         "         [--head-slab Z (the head per z-slab of Z planes: no whole-window logits; large windows)] [--mem default|lean]\n"
@@ -2228,7 +2239,7 @@ int cmd_dino_train(int argc, char **argv) {
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,96,128,192")); for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "dino-train: P must be a multiple of %d\n", 1 << (cfg.nlev - 1)); return 2; }
     {   /* the bottleneck transformer stage (src/attn.h) */
-        cfg.attn_blocks = atoi(opt(argc, argv, "--attn-blocks", "0")); cfg.attn_reg = atoi(opt(argc, argv, "--attn-reg", "0")); cfg.attn_mlp = atoi(opt(argc, argv, "--attn-mlp", "0"));
+        cfg.attn_blocks = atoi(opt(argc, argv, "--attn-blocks", "0")); cfg.attn_reg = atoi(opt(argc, argv, "--attn-reg", "0")); cfg.attn_mlp = atoi(opt(argc, argv, "--attn-mlp", "0")); cfg.attn_vres = atoi(opt(argc, argv, "--attn-vres", "0"));
         const char *pe = opt(argc, argv, "--attn-pe", "peg");
         cfg.attn_pe = !strcmp(pe, "peg") ? 0 : !strcmp(pe, "rope") ? 1 : !strcmp(pe, "none") ? 2 : -1;
         if (cfg.attn_pe < 0) { fprintf(stderr, "dino-train: --attn-pe peg|rope|none\n"); return 2; }

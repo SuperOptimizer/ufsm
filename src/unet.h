@@ -54,6 +54,7 @@ typedef struct {
     int attn_pe;           /* 0 PEG (zero-initialised depthwise 3^3 conv on the token grid before the first block), 1 axial 3D RoPE, 2 none */
     int attn_reg;          /* register tokens per sample (learned, prepended; outputs dropped) */
     int attn_mlp;          /* SwiGLU hidden width (0: 8/3 width rounded up to 32) */
+    int attn_vres;         /* value residual (ResFormer): blocks 2..N mix their V with block 1's by a learned per-head lerp (init 0.5) */
 } unet_cfg;
 static inline int unet_hr_div(int hr) { return hr >= 3 ? 4 : hr ? 2 : 1; }      /* the window voxels per network voxel along each axis */
 static inline int unet_hr_mode(int hr) { return hr == 2 || hr == 4 ? 2 : 1; }   /* the last stage: 1 pool, 2 pack (nn_half_*) */
