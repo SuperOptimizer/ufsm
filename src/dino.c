@@ -1200,6 +1200,8 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             static int ddet = -1; if (ddet < 0) ddet = getenv("UFSM_DIST_DET") ? atoi(getenv("UFSM_DIST_DET")) : 0;   /* (debug: offset 0; with UFSM_SSL_FIXED the targets must repeat exactly) */
             int oz = (int)(rng_next(&Q->ar) % (uint64_t)S), oy = (int)(rng_next(&Q->ar) % (uint64_t)S), ox = (int)(rng_next(&Q->ar) % (uint64_t)S); const int si = Q->smsi[j / 2];
             if (ddet) oz = oy = ox = 0;
+            static int dtok = -1; if (dtok < 0) dtok = getenv("UFSM_DIST_TOK") ? atoi(getenv("UFSM_DIST_TOK")) : 0;   /* (cheap shot (i): dinovol's patch tokens as the target) */
+            if (dtok) { if (S != 8) { fprintf(stderr, "UFSM_DIST_TOK needs --ssl-distill-stride 8\n"); return 1; } oz = oy = ox = 4; }
             dr_crops(Q->src, Q->Ps, Q->xfd + j, Q->dvid, 1, Q->PG, Q->dvf); dr_f2u8(Q->dvf, (long long)g3, Q->dvu);
             nn_sync();
             if (dv_forward(Q->dv, Q->dvu, Q->PG, (float)Q->dvm[si], (float)Q->dvs[si], (float)Q->dvh[si])) return 1;
@@ -1210,6 +1212,27 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             if (dv_net_points(Q->dv, Q->dcrd, nullptr, nullptr, NP, Q->dacc)) return 1;
             xd2h(Q->dacch, Q->dacc, (size_t)NP * DC * 4);
             for (int a = 0; a < NP; a++) memcpy(Q->dtd + ((size_t)j * NP + a) * nd, Q->dacch + (size_t)a * DC, (size_t)nd * 4);
+            if (dtok) {   /* UFSM_DIST_TOK=1: the target of grid point a (an 8^3 patch centre, S = 8, offset 4) = unit(P (t_a - mean_view t)), t its
+                             480-d patch token, P a fixed random Gaussian nd x 480 projection (keeps the tokens' cosines up to ~1/sqrt(nd)) */
+                const int E = dv_embed_dim(Q->dv), G = Q->PG / 8; static uint16_t *tk; static float *Pm, *tf; static double *mu;
+                if (!tk) { tk = malloc((size_t)G * G * G * E * 2); tf = malloc((size_t)G * G * G * E * 4); mu = malloc((size_t)E * 8); Pm = malloc((size_t)nd * E * 4);
+                    uint64_t rp = 1234; for (size_t k = 0; k < (size_t)nd * E; k++) { const double u1 = ((rng_next(&rp) >> 11) + 0.5) / 9007199254740992.0, u2 = ((rng_next(&rp) >> 11) + 0.5) / 9007199254740992.0;
+                        Pm[k] = (float)(sqrt(-2 * log(u1)) * cos(2 * M_PI * u2)); } }
+                xd2h(tk, dv_tokens(Q->dv), (size_t)G * G * G * E * 2);
+                for (size_t k = 0; k < (size_t)G * G * G * E; k++) { const uint16_t hb = tk[k]; const uint32_t sg = (uint32_t)(hb >> 15) << 31; int ex = (hb >> 10) & 31; uint32_t mt = hb & 1023, bits;
+                    if (ex == 0) { if (!mt) bits = sg; else { ex = 1; while (!(mt & 1024)) { mt <<= 1; ex--; } mt &= 1023; bits = sg | (uint32_t)(ex + 112) << 23 | mt << 13; } }
+                    else if (ex == 31) bits = sg | 0x7f800000u | mt << 13; else bits = sg | (uint32_t)(ex + 112) << 23 | mt << 13;
+                    memcpy(tf + k, &bits, 4); }
+                for (int e = 0; e < E; e++) mu[e] = 0;
+                for (int a = 0; a < NP; a++) { const int z = (int)Q->dch_h[3 * a] / 8, y = (int)Q->dch_h[3 * a + 1] / 8, x_ = (int)Q->dch_h[3 * a + 2] / 8; const float *t = tf + (((size_t)z * G + y) * G + x_) * E;
+                    for (int e = 0; e < E; e++) mu[e] += t[e] / NP; }
+                for (int a = 0; a < NP; a++) { const int z = (int)Q->dch_h[3 * a] / 8, y = (int)Q->dch_h[3 * a + 1] / 8, x_ = (int)Q->dch_h[3 * a + 2] / 8; const float *t = tf + (((size_t)z * G + y) * G + x_) * E;
+                    float *o = Q->dtd + ((size_t)j * NP + a) * nd; double n2 = 0;
+                    for (int c = 0; c < nd; c++) { double v = 0; const float *pr = Pm + (size_t)c * E; for (int e = 0; e < E; e++) v += pr[e] * (t[e] - mu[e]); o[c] = (float)v; n2 += v * v; }
+                    const float inv = (float)(1 / (sqrt(n2) + 1e-12)); for (int c = 0; c < nd; c++) o[c] *= inv; }
+                if (j == 0 && step <= 2) { double c = 0; long n = 0; for (int a = 0; a < NP; a += 7) for (int b = a + 1; b < NP; b += 13) { double d = 0; for (int e = 0; e < nd; e++) d += (double)Q->dtd[((size_t)j * NP + a) * nd + e] * Q->dtd[((size_t)j * NP + b) * nd + e]; c += d; n++; }
+                    fprintf(stderr, "dist tok step %d: %d patch-centre targets (%d-d tokens -> %d-d), mean pairwise cos %.4f\n", step, NP, E, nd, n ? c / n : 0.0); }
+            }
             if (j == 0 && getenv("UFSM_DIST_EQUI") && step <= 2) {   /* (debug: dinovol's output axes: shift its input by 8 vx along axis s, query the grid points moved by -8 along axis q;
                                                                        the right axis map has a high cosine on the diagonal of the 3 x 3 table) */
                 const int PG = Q->PG; uint8_t *u0 = malloc(g3), *u1 = malloc(g3); nn_d2h(u0, Q->dvu, g3); float *crd = malloc((size_t)NP * 12); int *sel = malloc((size_t)NP * 4); int ns = 0;
