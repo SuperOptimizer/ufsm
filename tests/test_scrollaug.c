@@ -33,12 +33,12 @@ static void write_sources(const char *dir, const char *name, const char *map) {
 }
 
 enum { NB = 6 };
-typedef struct { uint16_t *x; uint8_t *side, *w4; } snap;
+typedef struct { uint16_t *x; uint8_t *side, *w4, *wc; } snap;
 static void take(sampler *sp, snap *o, size_t p3) {
     for (int i = 0; i < NB; i++) {
         batch *b = sampler_next(sp); assert(b);
         o[i].x = malloc(p3 * 2); memcpy(o[i].x, b->x16, p3 * 2);
-        o[i].side = malloc(p3); memcpy(o[i].side, b->side, p3); o[i].w4 = malloc(p3); memcpy(o[i].w4, b->w4, p3);
+        o[i].side = malloc(p3); memcpy(o[i].side, b->side, p3); o[i].w4 = malloc(p3); memcpy(o[i].w4, b->w4, p3); o[i].wc = malloc(p3); memcpy(o[i].wc, b->wcomp, p3);
         sampler_release(sp, b);
     }
 }
@@ -46,7 +46,7 @@ static int same(const snap *a, const snap *b, size_t p3) {
     int ok = 1; for (int i = 0; i < NB; i++) ok &= !memcmp(a[i].x, b[i].x, p3 * 2) && !memcmp(a[i].side, b[i].side, p3) && !memcmp(a[i].w4, b[i].w4, p3);
     return ok;
 }
-static void drop(snap *o) { for (int i = 0; i < NB; i++) { free(o[i].x); free(o[i].side); free(o[i].w4); } }
+static void drop(snap *o) { for (int i = 0; i < NB; i++) { free(o[i].x); free(o[i].side); free(o[i].w4); free(o[i].wc); } }
 static sample_cfg base_cfg(int PW) {
     sample_cfg c = sample_cfg_default();
     c.P = PW; c.B = 1; c.nworkers = 2; c.nbuf = 3; c.deterministic = 1; c.seed = 9; c.xfmt = 1; c.gpu_input = 1; c.side = 2; c.wind4 = 1;
@@ -106,10 +106,90 @@ static void xscan_tests(const char *dir) {
     sources_free(S0); sources_free(Si); sources_free(Ss);
 }
 
+/* --aug-tear: the kernels on analytic boxes, then the sampler on the fixture */
+static int w4diff(int a, int b) { int d = a - b; if (d >= 126) d -= 252; if (d < -126) d += 252; return d; }   /* (63 codes per turn, mod 4 turns) */
+static void tear_tests(const char *dir) {
+    /* the sheet normal and spacing of the fixture's phase (level 1: pitch 12 voxels, radial normal) */
+    {
+        const int B = 72; const size_t B3 = (size_t)B * B * B; uint8_t *ph = malloc(B3); const int z0 = 40, y0 = 20, x0 = 30;   /* (level 1, off-axis) */
+        for (int z = 0; z < B; z++) for (int y = 0; y < B; y++) for (int x = 0; x < B; x++) {
+            const double w = fx_wind(2. * (z0 + z) + .5, 2. * (y0 + y) + .5, 2. * (x0 + x) + .5);
+            ph[((size_t)z * B + y) * B + x] = (uint8_t)((int)floor((w - floor(w)) * PHASE_PERIOD) % PHASE_PERIOD);
+        }
+        double n[3], sp = 0; const int ns = sa_phase_normal(ph, B, B, B, 4, 2, n, &sp);
+        double cy, cx; fx_axis_at(2. * (z0 + B / 2), &cy, &cx);
+        double rad[3] = {0, 2. * (y0 + B / 2) - cy, 2. * (x0 + B / 2) - cx}; const double rl = sqrt(rad[1] * rad[1] + rad[2] * rad[2]); rad[1] /= rl; rad[2] /= rl;
+        const double cosr = fabs(n[0] * rad[0] + n[1] * rad[1] + n[2] * rad[2]);
+        printf("scrollaug: tear normal: %d samples, spacing %.2f voxels (12 expected), |n . radial| %.3f\n", ns, sp, cosr);
+        check("tear: sheet spacing and normal from a phase box (12 voxels, radial)", ns > 1000 && fabs(sp - 12) < 1.5 && cosr > .95);
+        /* sa_tear_apply: every voxel off the seam is its side's shifted copy; the seam voids / blends with labels unknown */
+        const int P = 48, M = 12, Pp = P + 2 * M; const size_t p3 = (size_t)P * P * P, pp3 = (size_t)Pp * Pp * Pp;
+        uint8_t *ct = malloc(pp3), *w4 = malloc(pp3), *wc = malloc(pp3), *oc = malloc(p3), *op = malloc(p3), *ow = malloc(p3), *oq = malloc(p3);
+        for (size_t k = 0; k < pp3; k++) { ct[k] = (uint8_t)(1 + k % 251); w4[k] = (uint8_t)(k % 252); wc[k] = (uint8_t)(k % 7); }
+        int okc = 1, oks = 1, nseam = 0, jumps = 0;
+        for (int it = 0; it < 24; it++) {
+            sa_tear t; const double nn[3] = {0, .6, .8}; sa_tear_make(&t, 1000 + it, P, nn, 10, 2 * (M - 2));
+            if (sa_tear_margin(&t) > M) { okc = 0; break; }
+            jumps += fabs(t.turns_n) >= .3;
+            sa_tear_apply(&t, P, M, ct, ct, w4, wc, 7, oc, op, ow, oq);   /* (the CT box as the phase too: any codes) */
+            for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
+                const double h = sa_tear_h(&t, z, y, x); const int *d = h > 0 ? t.dp : t.dm;
+                const size_t k = ((size_t)z * P + y) * P + x, s = ((size_t)(z - d[0] + M) * Pp + (y - d[1] + M)) * Pp + (x - d[2] + M);
+                if (t.seam && fabs(h) < .5 * t.width - 1e-6) { nseam++; oks &= op[k] == PHASE_UNKNOWN && ow[k] == 255 && oq[k] == 255 && (t.seam != 1 || oc[k] == 7); }
+                else if (fabs(h) > .5 * t.width + 1e-6) okc &= oc[k] == ct[s] && op[k] == ct[s] && ow[k] == w4[s] && oq[k] == wc[s];
+            }
+        }
+        check("tear apply: off the seam each side is its shifted copy (CT, phase, w4, component), bit for bit", okc);
+        check("tear apply: seam voxels void / blended with the labels unknown", oks && nseam > 0);
+        check("tear make: most draws shift >= 0.3 turns along the normal", jumps == 24);
+        free(ph); free(ct); free(w4); free(wc); free(oc); free(op); free(ow); free(oq);
+    }
+    /* the sampler: default off, p 1 deterministic, and the winding mod 4 jumps across the cut where the phase stays smooth-looking */
+    char p[1400]; snprintf(p, sizeof p, "%s/sources.json", dir); sources *S = sources_load(p); assert(S);
+    const int PW = 64; const size_t p3 = (size_t)PW * PW * PW;
+    sample_cfg c = base_cfg(PW); c.snap = 0; c.symmetry_p = 0; c.rotate_p = 0; c.elastic_p = 0; c.zoom_p = 0; c.affine_p = 0;
+    snap a[NB], b[NB], d[NB], e[NB];
+    sampler *sp = sampler_start(S, &c); assert(sp); take(sp, a, p3); sampler_stop(sp);
+    sample_cfg c0 = c; c0.tear_um = 300;
+    sp = sampler_start(S, &c0); assert(sp); take(sp, b, p3); const uint64_t n0 = sampler_aug_count(sp, AUGN_TEAR); sampler_stop(sp);
+    check("--aug-tear 0: bit-identical", n0 == 0 && same(a, b, p3));
+    sample_cfg c1 = c; c1.tear_p = 1;
+    sp = sampler_start(S, &c1); assert(sp); take(sp, d, p3); const uint64_t n1 = sampler_aug_count(sp, AUGN_TEAR); sampler_stop(sp);
+    sp = sampler_start(S, &c1); assert(sp); take(sp, e, p3); sampler_stop(sp);
+    check("--aug-tear 1: windows torn, deterministic", n1 >= NB && same(d, e, p3));
+    /* neighbours (x, x + 1) in one component: the w4 step agrees with the phase step mod 1 turn everywhere; steps >= 0.3 turn (a cut
+       crossed with the windings kept) only in torn windows */
+    size_t pairs = 0, agree = 0, big_t = 0, big_p = 0, xc_p = 0, xc_big_p = 0, in_p = 0;
+    for (int pass = 0; pass < 2; pass++) for (int i = 0; i < NB; i++) {
+        const snap *q = pass ? &d[i] : &a[i];
+        for (size_t k = 0; k + 1 < p3; k++) {
+            if (k % PW == PW - 1 || q->w4[k] == 255 || q->w4[k + 1] == 255 || q->side[k] >= PHASE_PERIOD || q->side[k + 1] >= PHASE_PERIOD) continue;
+            if (q->wc[k] != q->wc[k + 1]) {   /* (plain windows: tile / component borders, each its own gauge: w4 may jump there, the loss never compares them) */
+                if (!pass) { xc_p++; xc_big_p += abs(w4diff(q->w4[k + 1], q->w4[k])) >= 19; }
+                continue;
+            }
+            if (!pass) in_p++;
+            const int dw = w4diff(q->w4[k + 1], q->w4[k]), dph = q->side[k + 1] - q->side[k];
+            int m = (dw * 4 - dph) % 252; if (m < 0) m += 252; if (m > 126) m = 252 - m;   /* (w4 63 codes per turn, phase 252) */
+            pairs++; agree += m <= 12;
+            if (abs(dw) >= 19) { if (pass) big_t++; else big_p++; }
+        }
+    }
+    printf("scrollaug: tear sampler: %llu torn; %zu neighbour pairs, w4 / phase steps agree at %.4f; >= 0.3 turn w4 steps: plain %zu, torn %zu\n",
+           (unsigned long long)n1, pairs, pairs ? agree / (double)pairs : 0, big_p, big_t);
+    printf("scrollaug: plain windows: %zu in-component neighbour pairs (%zu with >= 0.3 turn w4 steps), %zu across component borders (%zu with >= 0.3 turn steps: gauges)\n",
+           in_p, big_p, xc_p, xc_big_p);
+    check("plain windows: w4 smooth inside each component (< 1e-4 of the pairs step >= 0.3 turn)", in_p > p3 && big_p * 10000 < in_p);
+    check("--aug-tear: the w4 labels follow the pulled phase (steps agree mod 1 turn)", pairs > p3 && agree >= .99 * (double)pairs);
+    check("--aug-tear: the winding mod 4 jumps across the cut (>= 0.3 turn steps in torn windows only)", big_t > 50 && big_p * 20 < big_t);
+    drop(a); drop(b); drop(d); drop(e); sources_free(S);
+}
+
 int main(int argc, char **argv) {
     char tmpd[] = "/tmp/ufsm-scrollaug-XXXXXX"; const char *dir = argc > 1 ? argv[1] : mkdtemp(tmpd);
     if (!dir || make_wind_fixture(dir, 256, 2.f)) { fprintf(stderr, "fixture failed\n"); return 1; }
     xscan_tests(dir);
+    tear_tests(dir);
     if (argc < 2) { char cmd[1500]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {} }
     printf(failed ? "scrollaug: %d FAILED\n" : "scrollaug: all passed\n", failed);
     return failed != 0;

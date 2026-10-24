@@ -517,6 +517,26 @@ scroll warped into the label frame (Paris 4: 78 keV 2.4 um labels; partners 137 
   swapped window; ~60% volcomp decode, ~20% trilinear resample + field. Expected loader cost ~= P x 5 s worker time per window.
 - Desk: scripts/xscan/desk-maps.sh copies the maps with local roots (/vesuvius/ufsm/volcomp coarse, /vesuvius/ufsm/u0/vol partners:
   137 keV has level 2, 1.1 um has level 3). The 137 keV partner covers L0 z 42250-48750 only (level 2 z 10562-12187).
+- Animation: build/scrollaug_anim ... xscan (cross-fade into each partner and back, labels fixed); ~/ufsm-data/scrollaug/anim/xscan.gif.
+
+## Tears / slips: train --aug-tear P [--aug-tear-um 480] (2026-10-24)
+Goal: the fitter's slip failure: sheets cut and offset by about a turn, where the CT looks nearly continuous but the windings jump.
+- Same windows as --aug-crush (stored phase, side 2, no target channels, cube, no zoom-out; exclusive with crush, xscan skips torn windows).
+- src/scrollaug.[ch]: `sa_phase_normal` (structure tensor of the circular phase gradient: normal + turn spacing from the median
+  gradient), `sa_tear_make` (cut normal within 30 deg of perpendicular to the sheets, plane + 3 sines (wavelength P/2 .. 2P, amplitude
+  <= P/24 each); shift 0.3 .. 1.3 turns along the normal, half the time also -1 .. 1 turns along the sheet, capped at tear_um; each side
+  shifted by half, integer voxels: exact copies, no resampling; seam none / void (1-3 voxels, CT = 5% quantile, labels unknown) /
+  blend (2-6 voxels, CT mixed, labels unknown), 1/3 each), `sa_tear_apply`.
+- sample.c `tear_draw`: a padded read (margin tear_um / 2 + 2), the labels prepared on the padded box as the stored-phase path does
+  (sign, ignore mask, air, band_wind4_tiled with <= 6^3 tiles) and pulled with the cut, so the winding mod 4 keeps each side's true
+  windings (it jumps across the cut); g_crush carries the phase / w4 / component into the ordinary label path (then the usual warp).
+- Tests (tests/test_scrollaug.c): normal + spacing on the fixture spiral (11.9 vs 12 voxels, |n . radial| 0.997); apply is bit-exact
+  per side, seams void / blended with unknown labels; default off bit-identical; p 1 deterministic; neighbour w4 steps agree with the
+  phase steps mod 1 turn (100%), >= 0.3 turn w4 steps only in torn windows (1652 vs 15).
+- Paris 4 at 9.6 um: spacing 15.7 voxels / turn (151 um); drawn shifts 16-22 voxels. Cost P512 one core: +3 s per torn window (padded
+  read + padded unwrap; plain window ~7.4 s on the local box). Memory: 4 (P + 2M)^3 buffers transient (~0.7 GB at P512).
+- Renders: build/aug_render (sampler, plain vs augmented rows), build/scrollaug_anim ... tear (the shift swept 0 -> 1 -> 0);
+  ~/ufsm-data/scrollaug/anim/tear-{none,void,blend}.gif.
 
 ## Augmentation presets: train --aug all (default) | none (2026-10-16)
 User: "I want all the augs we can get" (robustness to other scrolls, scanners, resolutions and damage from one scroll's labels).

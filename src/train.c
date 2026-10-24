@@ -1080,6 +1080,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--aug-crush 0 (p: crushed windows of stored-phase sources, src/crush.h)] [--aug-crush-void 0.15,0.5] [--aug-crush-squash 0.5] [--aug-crush-k 1.5,3]\n"
                         "       [--aug-crush-bend 0.5] [--aug-crush-bend-amp 0.06] [--aug-crush-kink 0.25] [--aug-crush-rot 10] [--aug-crush-fine 0 (CT N levels finer, sources \"crush_fine\")]\n"
                         "       [--aug-xscan 0 (p: the CT from a registered partner scan, sources \"xscan\": [{\"map\": REG.json}])]\n"
+                        "       [--aug-tear 0 (p: crush-type windows cut across the sheets, one side shifted up to ~1+ turns, src/scrollaug.h)] [--aug-tear-um 480 (largest shift)]\n"
                         "         scanner ops (source grid, z = scan axis): seam air lowres blur sharpen bias ring cupping slice noise cnoise tone quant dropslice cutout chunk\n"
                         "       [--sheet-band-scale 1]   widen audited soft-band cap and close-gap exclusions together\n"
                         "       [--aux-input 1]   a fifth input channel from the sources' \"aux\" volumes (e.g. the papyrus void fraction)\n"
@@ -1588,6 +1589,9 @@ int cmd_train(int argc, char **argv) {
     sc.xscan_p = (float)atof(opt(argc, argv, "--aug-xscan", "0"));
     if (!(sc.xscan_p >= 0 && sc.xscan_p <= 1)) { fprintf(stderr, "--aug-xscan: a probability 0 .. 1\n"); return 2; }
     if (sc.xscan_p > 0 && noaug) { fprintf(stderr, "--aug-xscan needs augmentation on\n"); return 2; }
+    sc.tear_p = (float)atof(opt(argc, argv, "--aug-tear", "0")); sc.tear_um = (float)atof(opt(argc, argv, "--aug-tear-um", "480"));
+    if (!(sc.tear_p >= 0 && sc.tear_p <= 1) || !(sc.tear_um > 0)) { fprintf(stderr, "--aug-tear: a probability 0 .. 1, --aug-tear-um > 0\n"); return 2; }
+    if (sc.tear_p > 0 && noaug) { fprintf(stderr, "--aug-tear needs augmentation on\n"); return 2; }
     sc.sheet=g_sheet;
     if (g_sheet) { sc.augment=noaug?0:sc.geometry_augment?1:3; memset(sc.level_p,0,sizeof sc.level_p); sc.level_p[0]=1; }
     if (!isfinite(sc.symmetry_p) || sc.symmetry_p < 0 || sc.symmetry_p > 1 || !isfinite(sc.axis_jitter) || sc.axis_jitter < 0 ||
@@ -2210,7 +2214,7 @@ int cmd_train(int argc, char **argv) {
     float *gpeer = ng > 1 ? nn_malloc(np * 4) : nullptr;   /* on GPU 0: incoming gradients of the other GPUs */
 
     /* validation set: fixed batches from the held-out boxes (unaugmented), scored on GPU 0 */
-    sample_cfg vc = sc; vc.cover = nullptr; vc.cover_start = 0; vc.ct_augment = 0; vc.axis_jitter = 0; vc.geometry_augment=0; vc.label_morph=0; vc.scan.strength=0; vc.affine_p=0; vc.crush.p=0; vc.xscan_p=0; { const char *vs = opt(argc, argv, "--val-seed", nullptr); vc.seed = (vs ? (uint64_t)atoll(vs) : seed) + 777; }   /* --val-seed: other training seeds on the same windows */ vc.augment = 0; vc.nworkers = 4; vc.nbuf = 2; vc.holdout = 1;
+    sample_cfg vc = sc; vc.cover = nullptr; vc.cover_start = 0; vc.ct_augment = 0; vc.axis_jitter = 0; vc.geometry_augment=0; vc.label_morph=0; vc.scan.strength=0; vc.affine_p=0; vc.crush.p=0; vc.xscan_p=0; vc.tear_p=0; { const char *vs = opt(argc, argv, "--val-seed", nullptr); vc.seed = (vs ? (uint64_t)atoll(vs) : seed) + 777; }   /* --val-seed: other training seeds on the same windows */ vc.augment = 0; vc.nworkers = 4; vc.nbuf = 2; vc.holdout = 1;
     { int any = 0; for (int i = 0; i < S->n; i++) any |= S->src[i].hold_n[0] > 0 || (S->src[i].srp && S->src[i].srp->nte > 0); if (!any) { vc.holdout = 0; fprintf(stderr, "no holdout boxes in the sources: validation batches come from the training distribution\n"); } }
     /* the validation windows are the first nval batches of a deterministic sampler (each window from its own seeded rng: the same
        windows in every run with this seed), drawn once here. --val-store disk (default): kept in an unlinked file in the run directory

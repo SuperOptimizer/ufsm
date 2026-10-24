@@ -87,13 +87,19 @@ template <int SD> __device__ __forceinline__ void blk_vec_sum(float (&v)[SD], fl
     if (threadIdx.x < SD) { float t = 0.f; for (int w = 0; w < (int)(blockDim.x >> 5); w++) t += sh[w][threadIdx.x]; out[threadIdx.x] = t; }
     __syncthreads();
 }
-struct sc_args { const float *a, *t; const int *code, *xyz, *tcode, *txyz; int N, N2; float tau, hw, hr2; };
+struct sc_args { const float *a, *t; const int *code, *xyz, *tcode, *txyz; int N, N2; float tau, hw, hr2, pr2; };   /* pr2: pair radius^2 (0: all pairs) */
 template <int SD> __device__ __forceinline__ const float *sc_key(const sc_args &A, int j) { return j < A.N ? A.a + (size_t)j * SD : A.t + (size_t)(j - A.N) * SD; }
 __device__ __forceinline__ float sc_w(const sc_args &A, int i, int j, int dk) {
     if (abs(dk) != 1 || A.hw == 1.f) return 1.f;
     const int *pi = A.xyz + 3 * i, *pj = j < A.N ? A.xyz + 3 * j : A.txyz + 3 * (j - A.N);
     const float dx = pj[0] - pi[0], dy = pj[1] - pi[1], dz = pj[2] - pi[2];
     return dx * dx + dy * dy + dz * dz <= A.hr2 ? A.hw : 1.f;
+}
+__device__ __forceinline__ bool sc_far(const sc_args &A, int i, int j) {   /* outside the pair radius: neither positive nor negative */
+    if (A.pr2 <= 0.f) return false;
+    const int *pi = A.xyz + 3 * i, *pj = j < A.N ? A.xyz + 3 * j : A.txyz + 3 * (j - A.N);
+    const float dx = pj[0] - pi[0], dy = pj[1] - pi[1], dz = pj[2] - pi[2];
+    return dx * dx + dy * dy + dz * dz > A.pr2;
 }
 __device__ __forceinline__ int sc_code(const sc_args &A, int j) { return j < A.N ? A.code[j] : A.tcode[j - A.N]; }
 template <int SD> __global__ void __launch_bounds__(256) k_sc_stats(sc_args A, float *lse, float *npos, float *acc) {
@@ -103,7 +109,7 @@ template <int SD> __global__ void __launch_bounds__(256) k_sc_stats(sc_args A, f
     __syncthreads();
     float mx = -INFINITY, np = 0.f;
     for (int j = threadIdx.x; j < M; j += blockDim.x) {
-        if (j == i) continue;
+        if (j == i || sc_far(A, i, j)) continue;
         const float *k = sc_key<SD>(A, j); float s = 0.f;
 #pragma unroll
         for (int c = 0; c < SD; c++) s += ai[c] * k[c];
@@ -112,7 +118,7 @@ template <int SD> __global__ void __launch_bounds__(256) k_sc_stats(sc_args A, f
     mx = blk_max(mx, sh); np = blk_sum(np, sh);
     float den = 0.f, psum = 0.f, pcos = 0.f, ncos = 0.f, nneg = 0.f;
     for (int j = threadIdx.x; j < M; j += blockDim.x) {
-        if (j == i) continue;
+        if (j == i || sc_far(A, i, j)) continue;
         const float *k = sc_key<SD>(A, j); float s = 0.f;
 #pragma unroll
         for (int c = 0; c < SD; c++) s += ai[c] * k[c];
@@ -137,7 +143,7 @@ template <int SD> __global__ void __launch_bounds__(256) k_sc_ganchor(sc_args A,
 #pragma unroll
     for (int c = 0; c < SD; c++) g[c] = 0.f;
     for (int j = threadIdx.x; j < M; j += blockDim.x) {
-        if (j == i) continue;
+        if (j == i || sc_far(A, i, j)) continue;
         const float *k = sc_key<SD>(A, j); float s = 0.f;
 #pragma unroll
         for (int c = 0; c < SD; c++) s += ai[c] * k[c];
@@ -158,7 +164,7 @@ template <int SD> __global__ void __launch_bounds__(256) k_sc_gkey(sc_args A, co
 #pragma unroll
     for (int c = 0; c < SD; c++) g[c] = 0.f;
     for (int i = threadIdx.x; i < A.N; i += blockDim.x) {
-        if (i == j || npos[i] <= 0.f) continue;
+        if (i == j || npos[i] <= 0.f || sc_far(A, i, j)) continue;
         const float *ai = A.a + (size_t)i * SD; float s = 0.f;
 #pragma unroll
         for (int c = 0; c < SD; c++) s += ai[c] * kj[c];
@@ -176,23 +182,27 @@ __global__ void k_sc_fin(float *ga, int n, const float *acc, float *out) {
     if (blockIdx.x == 0 && threadIdx.x == 0) { out[0] = acc[0] / na; out[1] = acc[2] / fmaxf(acc[3], 1.f); out[2] = acc[4] / fmaxf(acc[5], 1.f); out[3] = acc[1]; }
 }
 template <int SD> static void supcon_t(const float *a, const int *code, const int *xyz, int N, const float *t, const int *tcode, const int *txyz, int N2,
-                                       float tau, float hw, float hr, float *ga, float *out, float *scratch) {
+                                       float tau, float hw, float hr, float pr, float *ga, float *out, float *scratch) {
     /* scratch: lse [N], npos [N], acc [8] */
     float *lse = scratch, *npos = lse + N, *acc = npos + N;
     cudaMemsetAsync(acc, 0, 8 * 4);
     if (N <= 0) { cudaMemsetAsync(out, 0, 16); return; }
-    sc_args A = {a, t, code, xyz, tcode, txyz, N, N2, tau, hw, hr * hr};
+    sc_args A = {a, t, code, xyz, tcode, txyz, N, N2, tau, hw, hr * hr, pr > 0.f ? pr * pr : 0.f};
     k_sc_stats<SD><<<N, 256>>>(A, lse, npos, acc);
     k_sc_ganchor<SD><<<N, 256>>>(A, lse, npos, ga);
     k_sc_gkey<SD><<<N, 256>>>(A, lse, npos, ga);
     k_sc_fin<<<nb_of((long long)N * SD, 256), 256>>>(ga, N * SD, acc, out);
 }
+extern "C" void dn_supcon_r(const float *a, const int *code, const int *xyz, int N, const float *t, const int *tcode, const int *txyz, int N2, int D,
+                            float tau, float hw, float hr, float pr, float *ga, float *out, float *scratch) {
+    if (D == 16) supcon_t<16>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, pr, ga, out, scratch);
+    else if (D == 32) supcon_t<32>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, pr, ga, out, scratch);
+    else if (D == 64) supcon_t<64>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, pr, ga, out, scratch);
+    else fprintf(stderr, "dn_supcon: D %d (16, 32 or 64)\n", D);
+}
 extern "C" void dn_supcon(const float *a, const int *code, const int *xyz, int N, const float *t, const int *tcode, const int *txyz, int N2, int D,
                           float tau, float hw, float hr, float *ga, float *out, float *scratch) {
-    if (D == 16) supcon_t<16>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, ga, out, scratch);
-    else if (D == 32) supcon_t<32>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, ga, out, scratch);
-    else if (D == 64) supcon_t<64>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, ga, out, scratch);
-    else fprintf(stderr, "dn_supcon: D %d (16, 32 or 64)\n", D);
+    dn_supcon_r(a, code, xyz, N, t, tcode, txyz, N2, D, tau, hw, hr, 0.f, ga, out, scratch);
 }
 
 /* ---- DINO prototypes: logits matrices in scratch; the gradients as two small matrix products ---- */
