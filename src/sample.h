@@ -5,6 +5,7 @@
 #include "cover.h"
 #include "sheet.h"
 #include "scan_augment.h"
+#include "crush.h"
 #include <stdint.h>
 
 typedef struct {
@@ -47,6 +48,9 @@ typedef struct {
     scan_aug_cfg scan;       /* scanner-domain CT augmentation on the source grid (src/scan_augment.h); every p 0 = off */
     float affine_p, affine_aniso, affine_shear; /* anisotropic scale (log, per axis) + shear, magnitudes x scan.strength;
                                 needs geometry_augment, same sources as the zoom */
+    crush_cfg crush;         /* --aug-crush (src/crush.h): crushed windows (gap collapse, squash, bends) pulled from stored-phase sources
+                                without target channels (task unwrap2); crush.p 0 = off. Needs augment + geometry_augment; such windows skip
+                                the ordinary spatial warp (one resample) and keep unwarped radial channels */
     const sheet_dataset *sheet; /* borrowed sparse geometry, native-level B=1 task */
     int band;                /* 1: fill batch.band from each source's band target (task band_affinity, native level, no geometry warp) */
     double min_phase;        /* side 2: reject windows whose known phase covers less than this fraction of the voxels (0: keep all) */
@@ -174,6 +178,7 @@ void sampler_release(sampler *sp, batch *b);
 void sampler_stop(sampler *sp);
 /* Stats: patches rejected / produced since start. */
 void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected);
+uint64_t sampler_crushed(const sampler *sp);   /* --aug-crush windows drawn so far */
 /* draws dropped by reason: [0] the coarse CT probe (min_fg, before the CT read), [1] the CT read's min_fg, [2] empty targets
    (empty_keep), [3] overlapping a holdout box (training; not counted in rejected) */
 void sampler_reject_reasons(const sampler *sp, uint64_t why[4]);

@@ -42,6 +42,7 @@ sample_cfg sample_cfg_default(void) {
     c.P = 128; c.B = 2; c.nworkers = 8; c.nbuf = 6; c.seed = 0;
     c.level_p[0] = 0.5; c.level_p[1] = 0.25; c.level_p[2] = 0.15; c.level_p[3] = 0.1;
     c.min_fg = 0.3; c.empty_keep = 0.2; c.augment = 1; c.snap = 1; c.symmetry_p = 1; c.chain_len = 8; c.chain_step = 0.5f;
+    c.crush = crush_cfg_default();
     return c;
 }
 
@@ -173,6 +174,7 @@ struct sampler {
     atomic_int stop, failed;
     atomic_uint_fast64_t produced, rejected;
     atomic_uint_fast64_t rej_why[4];   /* draws dropped: coarse CT probe, CT read (min_fg), empty targets, holdout overlap (not in rejected) */
+    atomic_uint_fast64_t crushed;      /* --aug-crush windows drawn */
     atomic_uint soft_bits;   /* current soft-target sigma (float bits), set by sampler_set_soft */
     int64_t *slot_j;         /* deterministic mode: batch index held by each slot */
     int64_t next_claim, next_take;   /* deterministic mode: next batch index to fill / to hand out (under mu) */
@@ -1843,9 +1845,87 @@ int sample_chain_next(const axis *ax, int l, const int64_t shape[3], int Pz, int
     for (int d = 0; d < 3; d++) if (on[d] < 0 || on[d] > shape[d] - n[d]) return 1;
     return 0;
 }
+/* --aug-crush (src/crush.h): the window pulled through a crush map instead of the plain read. The tiles are decoded into big's
+   (2P)^3 scratch (free until the targets are built), so a footprint of several P^3 costs no RAM; the pulled phase (and its ignore
+   mask) wait in pooled buffers for the stored-phase step (draw() returns them after every draw). */
+static _Thread_local struct { uint8_t *ph, *ig; size_t n; double k, j0; int fine; uint64_t tiles; } g_crush;   /* (k .. tiles: the last map, diagnostics) */
+static void crush_release(void) { tp_put(g_crush.ph, g_crush.n + 64); tp_put(g_crush.ig, g_crush.n); g_crush.ph = g_crush.ig = nullptr; }
+typedef struct { crush_cache *cc; const crush_layer *L; const int64_t *o; } crush_ctu;
+static double crush_ct_at(void *ud, const double x[3]) {
+    const crush_ctu *u = ud; double p[3];
+    for (int d = 0; d < 3; d++) p[d] = u->L->a * ((double)u->o[d] + x[d]) + u->L->b[d];
+    return crush_linear_at(u->cc, u->L, p);
+}
+static int training_hits_holdout_box(const sampler *sp, const source *s, const int64_t lo[3], const int64_t n[3], int l) {   /* level-l box */
+    for (int i = 0; i < sp->S->n; i++) {
+        const source *h = &sp->S->src[i]; if (!h->hold_n[0] || !same_ct(s, h)) continue;
+        int hit = 1;
+        for (int d = 0; d < 3; d++) { const int64_t a = lo[d] * ((int64_t)1 << l), e = (lo[d] + n[d]) * ((int64_t)1 << l); if (e <= h->hold_o[d] || a >= h->hold_o[d] + h->hold_n[d]) hit = 0; }
+        if (hit) return 1;
+    }
+    return 0;
+}
+/* 1: ctu (P^3) and g_crush hold the crushed window; 0: not crushed (its footprint may reach a holdout box: the plain read follows); -1 error */
+static int crush_draw_(sampler *sp, source *s, int l, const int64_t o[3], int P, int pshift, rng *r, uint8_t *arena, size_t abytes, uint8_t *ctu) {
+    const sample_cfg *c = &sp->cfg; const size_t p3 = (size_t)P * P * P;
+    int fine = s->crush_fine >= 0 ? s->crush_fine : c->crush.fine;
+    z3 *fz = fine > 0 && l - fine >= 0 ? source_ct(s, l - fine) : nullptr;
+    if (!fz) fine = 0;   /* (no finer level stored: the map's own level) */
+    crush_cache cc;
+    if (crush_cache_init(&cc, arena, abytes)) return 0;
+    crush_layer Lct = {source_ct(s, l), CRUSH_LINEAR, 0, 0, 1, {0, 0, 0}, ctu}, Lph = {s->phase, CRUSH_PHASE, 0, PHASE_UNKNOWN, 0, {0, 0, 0}, nullptr};
+    crush_layer_phase(&Lph, pshift);
+    double hint[3] = {0, 0, 0}, n[3]; const double *hp = nullptr, cw = .5 * (P - 1);
+    if (s->ax.n > 0) {   /* the radial direction at the window centre: the power iteration's seed, the normal when the phase is too sparse */
+        const double sc = (double)(1 << l); double cy, cx; axis_at(&s->ax, ((double)o[0] + cw) * sc, &cy, &cx);
+        hint[1] = (double)o[1] + cw - cy / sc; hint[2] = (double)o[2] + cw - cx / sc;
+        if (hint[1] * hint[1] + hint[2] * hint[2] > 1e-6) hp = hint;
+    }
+    if (crush_phase_normal(&cc, &Lph, o, P, hp, n) < 32) {
+        if (cc.err) { crush_cache_free(&cc); return -1; }
+        if (hp) memcpy(n, hint, sizeof n); else { const double z = 2 * runif(r) - 1, a = 2 * M_PI * runif(r), q = sqrt(fmax(0, 1 - z * z)); n[0] = z; n[1] = q * cos(a); n[2] = q * sin(a); }
+    }
+    crush_map m; crush_map_init(&m, &c->crush, rnext(r), P, n);
+    /* every read below (columns and pull) lies in the footprint box */
+    double ext[3]; crush_footprint(&m, ext);
+    int64_t lo[3], nn[3];
+    for (int d = 0; d < 3; d++) { lo[d] = o[d] + (int64_t)floor(cw - ext[d]); nn[d] = (int64_t)ceil(2 * ext[d]) + 2; }
+    if (training_hits_holdout_box(sp, s, lo, nn, l)) { crush_cache_free(&cc); return 0; }
+    /* the voidness columns from the next coarser level when stored (1/8 of the tile decodes; the voidness is blurred anyway) */
+    z3 *cz = source_ct(s, l + 1); crush_layer Lcol = Lct;
+    if (cz) { Lcol.z = cz; crush_layer_level(&Lcol, -1); }
+    crush_ctu u = {&cc, &Lcol, o};
+    crush_map_columns(&m, c->crush.jlo, c->crush.jhi, rnext(r), crush_ct_at, &u);   /* (1: too little CT for a papyrus / void split: no collapse) */
+    if (getenv("UFSM_CRUSH_DBG")) fprintf(stderr, "crush: columns %llu tiles, H %.0f, T %.0f %.0f, srange %.0f %.0f, G %d %d, ns %d\n", (unsigned long long)cc.decoded, m.half, m.T[0], m.T[1], m.srange[0], m.srange[1], m.G[0], m.G[1], m.ns);
+    if (cc.err) { crush_map_free(&m); crush_cache_free(&cc); return -1; }
+    uint8_t *ph = tp_get(p3 + 64, 0), *ig = s->phase_ign ? tp_get(p3, 0) : nullptr;
+    g_crush.ph = ph; g_crush.ig = ig; g_crush.n = p3;
+    if (!ph || (s->phase_ign && !ig)) { crush_map_free(&m); crush_cache_free(&cc); return -1; }
+    crush_layer L[3]; int nl = 0;
+    if (fine) { crush_layer f = {fz, CRUSH_LINEAR, 1, 0, 1, {0, 0, 0}, ctu}; crush_layer_level(&f, fine); L[nl++] = f; }
+    else L[nl++] = Lct;
+    Lph.out = ph; L[nl++] = Lph;
+    if (ig) { crush_layer g = {s->phase_ign, CRUSH_NEAREST, 0, 0, 1, {0, 0, 0}, ig}; crush_layer_phase(&g, pshift); L[nl++] = g; }
+    const int rc = crush_window(&m, &cc, o, L, nl);
+    memset(ph + p3, PHASE_UNKNOWN, 64);
+    g_crush.k = m.sq_k; g_crush.j0 = m.tab ? m.j0 : 1; g_crush.fine = fine; g_crush.tiles = cc.decoded;
+    crush_map_free(&m); crush_cache_free(&cc);
+    if (!rc) atomic_fetch_add(&sp->crushed, 1);
+    return rc ? -1 : 1;
+}
+/* the tile cache lives in the window scratch (8 P^3: 512 slots at P 512); small windows (P < 192) borrow a pooled 48 MiB instead */
+static int crush_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, int pshift, rng *r, uint8_t *arena, size_t abytes, uint8_t *ctu) {
+    const size_t own = (size_t)48 << 20;
+    if (abytes >= own) return crush_draw_(sp, s, l, o, P, pshift, r, arena, abytes, ctu);
+    uint8_t *a = tp_get(own, 0); if (!a) return -1;
+    const int rc = crush_draw_(sp, s, l, o, P, pshift, r, a, own, ctu);
+    tp_put(a, own);
+    return rc;
+}
 static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs);
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
     const int rc = draw_(sp, b, i, r, xtmp, ttmp, big, tile_index, noise_state, cs);
+    if (g_crush.ph || g_crush.ig) crush_release();
     if (rc == 0 && b->chid && (!cs || cs->id < 0)) { b->chid[i] = -1; b->chidx[i] = 0; b->choff[3 * i] = b->choff[3 * i + 1] = b->choff[3 * i + 2] = 0.f; }
     return rc;
 }
@@ -1945,9 +2025,18 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if ((double)nz / (double)tot < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[0], 1); return 1; }
     }
     PROF_MARK(PS_PROBE);
-    /* CT */
+    /* CT (--aug-crush: a crushed window of a stored-phase source without target channels, pulled through the map instead) */
     uint8_t *ctu = big;
-    if (z3_read(ct, o, n, ctu, 1)) return -1;
+    int crushed = 0;
+    if (c->crush.p > 0 && c->augment && c->geometry_augment && s->geometry && !chained && !c->view_P && !c->cover && !c->holdout && Pz == P &&
+        region_ch < 0 && zoom_out == 0 && c->side == 2 && !c->band && !c->cond && !c->sheet && !c->papyrus && !c->pap_head && !c->aux &&
+        !c->phase_dense && s->phase) {
+        const int psh = s->phase_level - l;
+        int ok = psh == 1 || (psh == 0 && s->phase_direct);
+        for (int ch = 0; ch < NCH; ch++) ok &= !s->tgt_key[ch];
+        if (ok && runif(r) < c->crush.p && (crushed = crush_draw(sp, s, l, o, P, psh, r, big + p3, 8 * p3, ctu)) < 0) return -1;
+    }
+    if (!crushed && z3_read(ct, o, n, ctu, 1)) return -1;
     PROF_MARK(PS_READ);
     size_t nz = 0;
     double sum = 0, sq = 0;
@@ -2272,7 +2361,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     const int stored_phase = !c->band && c->side == 2 && s->phase && !c->phase_dense && (pshift == 1 || ((pshift == 0 || pshift == 2) && s->phase_direct));   /* (2: a 9.6 um phase interpolated into 2.4 um windows) */
     const int band_sample = (c->band || c->side) && s->band && (l == 0 || stored_phase);   /* (c->side without c->band: task unwrap, the phase only) */
     const int warp_ok = !band_sample || (stored_phase && !c->band && !c->cond);   /* a stored phase warps (warp_phase); band fields do not */
-    if (c->augment && c->geometry_augment && s->geometry && warp_ok && !chained && !c->view_P) {
+    if (c->augment && c->geometry_augment && s->geometry && warp_ok && !chained && !c->view_P && !crushed) {   /* (crushed: already warped) */
         spatial_aug_make(&spatial,rnext(r),P,c->rotate_degrees,c->rotate_p,c->elastic,c->elastic_p);
         if (zoom_out > 0) spatial_aug_zoom(&spatial, .5 * zoom_out);   /* (the coarser level read above) */
         else if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(r) < c->zoom_p) spatial_aug_zoom(&spatial, exp(runif(r) * log(c->zoom_min)));
@@ -2320,11 +2409,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         } else if (stored_phase) {   /* the stored phase (ufsm phase-raster, ufsm downsample --mode phase) */
             uint8_t *sw = tp_get(p3 + 64, 0);   /* (+ 64: warp_phase_w4 reads byte pairs as 32-bit words) */
             uint16_t *wq = nullptr;   /* warped --task unwrap2: the winding and its component for warp_phase_w4 (one pass with the phase) */
-            if (!sw || phase_window(s->phase, o, Pz, P, pshift, sw)) { tp_put(sw, p3 + 64); return -1; }
+            if (!sw || (g_crush.ph ? (memcpy(sw, g_crush.ph, p3), 0) : phase_window(s->phase, o, Pz, P, pshift, sw))) { tp_put(sw, p3 + 64); return -1; }
             if (s->phase_sign < 0) phase_negate(sw, p3);   /* (before the winding mod 4: it unwraps this phase) */
             if (s->phase_ign && pshift < 2) {   /* (interpolated 2.4 um windows: no mask) "ignore": label sets that disagree there (ufsm phase-conflict): unknown, not trained on */
                 uint8_t *ig = tp_get(p3, 0);
-                if (!ig || phase_window(s->phase_ign, o, Pz, P, pshift, ig)) { tp_put(ig, p3); tp_put(sw, p3 + 64); return -1; }
+                if (!ig || (g_crush.ig ? (memcpy(ig, g_crush.ig, p3), 0) : phase_window(s->phase_ign, o, Pz, P, pshift, ig))) { tp_put(ig, p3); tp_put(sw, p3 + 64); return -1; }
                 for (size_t k = 0; k < p3; k++) if (ig[k] && ig[k] != PHASE_UNKNOWN) sw[k] = PHASE_UNKNOWN;   /* (outside the mask array: 255 = keep) */
                 tp_put(ig, p3);
             }
@@ -2865,6 +2954,7 @@ void sampler_prof_print(const sampler *sp) {
     fprintf(stderr, "\n");
 }
 void sampler_reject_reasons(const sampler *sp, uint64_t why[4]) { for (int k = 0; k < 4; k++) why[k] = atomic_load(&sp->rej_why[k]); }
+uint64_t sampler_crushed(const sampler *sp) { return atomic_load(&sp->crushed); }
 void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected) {
     *produced = atomic_load(&sp->produced);
     *rejected = atomic_load(&sp->rejected);

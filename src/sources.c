@@ -105,6 +105,8 @@ sources *sources_load(const char *path) {
         s->min_level = (int)json_num(json_get(e, "min_level"), 0);
         s->max_level = (int)json_num(json_get(e, "max_level"), -1);
         s->geometry = (int)json_num(json_get(e, "geometry"), 1);
+        s->crush_fine = (int)json_num(json_get(e, "crush_fine"), -1);
+        if (s->crush_fine > 3) { fprintf(stderr, "sources: %s: crush_fine 0..3\n", s->name); json_free(j); sources_free(S); return nullptr; }
         for (int l = 0; l < MAXLEV; l++) s->ct_present[l] = -1; /* unknown until probed */
         const json *tg = json_get(e, "targets");
         for (int c = 0; c < NCH; c++) {

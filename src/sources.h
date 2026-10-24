@@ -50,6 +50,8 @@ typedef struct {
     int min_level;    /* training never draws levels below this (e.g. 1 for a 1.1 um scan whose level 0 is finer than the others) */
     int max_level;    /* ... nor above this (-1: no limit); e.g. a teacher target whose coarser levels are only downsampled copies */
     int geometry;     /* 0: never spatially augmented (zoom / rotation / elastic) */
+    int crush_fine;   /* "crush_fine": N: --aug-crush windows pull their CT from N levels finer of the same scan (a 2^N box mean per voxel);
+                         -1 (absent): train --aug-crush-fine */
     int trust_band;   /* > 0: background labels are trusted only within this many level-0 voxels of an annotated surface (partial annotations) */
     int head;         /* train --heads: the recto head this source's recto target trains (0: output channel 0; k >= 1: channel 1 + k) */
     int iso;          /* > 0: the scan's void cutoff (papyrus = CT >= iso) for train --iso-void / --iso-lift (0: --iso's value) */
