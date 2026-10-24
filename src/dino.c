@@ -101,7 +101,7 @@ int cmd_dino_halves(int argc, char **argv) {
 #include <unistd.h>
 #include <signal.h>
 
-enum { DN_MAXSRC = 128, DN_MAXBOX = 256, DN_SLOTS = 64, DN_MAXW = 16 };   /* (slots / workers: at most; --slots / --workers) */
+enum { DN_MAXSRC = 512, DN_MAXBOX = 256, DN_SLOTS = 64, DN_MAXW = 16 };   /* (slots / workers: at most; --slots / --workers) */
 typedef struct {
     char name[64]; z3 *ca, *cb, *codes, *ink, *phase; int halves; int cscale, pscale; float um;   /* phase: the stored winding phase (PHASE_* bytes; sources "phase": {"root", "key", "scale"}) */ float *axz;   /* scroll axis (y, x) per CT plane (sources "axis" + "axis_scale"), or nullptr */   /* CT voxels per code voxel (codes on a coarser grid; 1: the same grid) */
     int64_t org[3];                              /* added to window corners (ct array coordinates) to address the codes (global grid) */
@@ -450,6 +450,7 @@ static int load_sources(const char *path, dn_data *D, int nthreads) {
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); char *t = malloc(n + 1); if (fread(t, 1, n, f) != (size_t)n) { fclose(f); return -1; } fclose(f); t[n] = 0;
     json *j = json_parse(t, n); free(t); if (!j) { fprintf(stderr, "dino-train: %s: bad JSON\n", path); return -1; }
     const json *arr = json_get(j, "sources"); if (!arr || arr->type != J_ARR) { fprintf(stderr, "dino-train: no sources\n"); return -1; }
+    if (arr->n > DN_MAXSRC) { fprintf(stderr, "dino-train: %zu sources, at most %d\n", arr->n, (int)DN_MAXSRC); return -1; }
     for (size_t i = 0; i < arr->n && D->nsrc < DN_MAXSRC; i++) {
         const json *s = json_at(arr, i); dn_src *S = &D->src[D->nsrc]; memset(S, 0, sizeof *S);
         snprintf(S->name, sizeof S->name, "%s", json_str(json_get(s, "name"), "?"));
