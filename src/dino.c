@@ -861,7 +861,7 @@ typedef struct {
     /* diag-dv (--ssl-dv-teacher PT): the iBOT targets from the frozen upstream dinovol teacher (its ibot_head over its patch tokens of the
        un-augmented teacher global, at the cell of each mapped point) until --ssl-dv-until (0: always), then from our EMA teacher; the student
        iBOT head predicts dinovol's 131072 prototypes (its last layer initialised from dinovol's and kept frozen) */
-    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; int fixdone, Rfix, hwarm, icos, subps; double zvh_l; long zvh_n; float subp0, subp1, izv; uint8_t *subm, *d_subm; float *zvg; double cosacc; long cosn;
+    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; long srccnt[DN_MAXSRC]; int fixdone, Rfix, hwarm, icos, subps; double zvh_l; long zvh_n; float subp0, subp1, izv; uint8_t *subm, *d_subm; float *zvg; double cosacc; long cosn;
     int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -882,6 +882,12 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
     dn_data *Ds = malloc(sizeof *Ds); *Ds = *Dd; Ds->P = Q->Ps; Ds->ngt = 64; Ds->nair = 0; Ds->nink = 0; Ds->uw = 0; Ds->ikp = 0; Ds->ident = 1;
     Ds->vP = Q->PG; Ds->vPL = Q->PL; Ds->vnloc = Q->NL; Ds->zlo = zlo; Ds->zhi = zhi; Ds->lzlo = lzlo; Ds->lzhi = lzhi;
     Ds->share_u = atof(opt(argc, argv, "--ssl-unlabelled-share", "-1")); Ds->vovl = (float)atof(opt(argc, argv, "--ssl-overlap", "0.5")); Q->Ds = Ds; Ds->xprob = (float)atof(opt(argc, argv, "--ssl-xscan", "0"));
+    {   /* --ssl-weight-pow p: the SSL sampler draws sources by weight^p (1: by voxel weight; 0.5: flatter, the small scans seen more often) */
+        const double wp = atof(opt(argc, argv, "--ssl-weight-pow", "1"));
+        if (wp != 1) { Ds->wsum = Ds->wsum_l = Ds->wsum_u = 0;
+            for (int k = 0; k < Ds->nsrc; k++) { Ds->src[k].weight = pow(Ds->src[k].weight, wp); Ds->wsum += Ds->src[k].weight; if (Ds->src[k].ct_only) Ds->wsum_u += Ds->src[k].weight; else Ds->wsum_l += Ds->src[k].weight; }
+            fprintf(stderr, "dino-train --ssl-weight-pow %g: SSL source weights flattened\n", wp); }
+    }
     dn_ring *R = calloc(1, sizeof *R); R->D = Ds; R->seed = seed * 7 + 1234567; R->nthreads = 2; pthread_mutex_init(&R->mu, nullptr); pthread_cond_init(&R->cv, nullptr);
     R->nslots = 2 * Q->N + 4 < DN_SLOTS ? 2 * Q->N + 4 : DN_SLOTS; const size_t ps3 = (size_t)Q->Ps * Q->Ps * Q->Ps;
     for (int i = 0; i < R->nslots; i++) { dn_sample *S = &R->slot[i]; S->ca = malloc(ps3); S->cb = malloc(ps3); S->gidx = malloc(64 * 4); S->gcode = malloc(64 * 4); S->gxyz = malloc(64 * 12); S->sidx = malloc(4); S->ayx = malloc((size_t)Q->Ps * 8); S->ixyz = malloc(12); }
@@ -1027,6 +1033,7 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     for (int i = 0; i < N; i++) {
         dn_sample *Sm = ring_get(Q->R); if (!Sm) { fprintf(stderr, "dino-train --ssl-batch: loader failed\n"); return 1; }
         const dn_src *sr = &Q->Ds->src[Sm->si];
+        Q->srccnt[Sm->si]++;
         if (Q->smsi) { Q->smsi[i] = Sm->si; int64_t *hh = Q->dvhist + (size_t)Sm->si * 256; for (size_t v = 0; v < ps3; v += 5) hh[Sm->ca[v]]++;
             if (dv_hist_stats(hh, &Q->dvm[Sm->si], &Q->dvs[Sm->si], &Q->dvh[Sm->si])) { Q->dvm[Sm->si] = sr->center; Q->dvs[Sm->si] = sr->scale; Q->dvh[Sm->si] = 255; } }
         const int xs_ = Q->Ds->xprob > 0 && Sm->xs; if (xs_) nn_h2d(Q->src + (size_t)(N + i) * ps3, Sm->cb, ps3); Q->sums[7] += (double)xs_ / N; if (xs_) { Q->xnccs += Sm->xncc; Q->xnccn++; }
@@ -1061,6 +1068,12 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
         dr_crops(Q->src, Q->Ps, Q->xfd + j, Q->itd + j, 1, n_, x);
         if (CIN == 2) nn_zero(x + n3, n3 * 4);
         if (CIN == 5) { const int i = Q->xfh[j].src; dr_axis_view(Q->xfd, j, n_, Q->Ps, Q->d_ayx + (size_t)i * Q->Ps * 2, hasax[i] && rng_u(&Q->ar) >= Q->adrop, x + n3); }
+    }
+    if (step % 1000 == 0) {   /* the SSL samples drawn per source so far */
+        fprintf(stderr, "ssl sources at step %d:", step); long tot = 0;
+        for (int k = 0; k < Q->Ds->nsrc; k++) { tot += Q->srccnt[k]; if (Q->srccnt[k]) fprintf(stderr, " %s=%ld", Q->Ds->src[k].name, Q->srccnt[k]); }
+        int none = 0; for (int k = 0; k < Q->Ds->nsrc; k++) none += !Q->srccnt[k];
+        fprintf(stderr, " | total %ld, %d of %d sources never drawn\n", tot, none, Q->Ds->nsrc);
     }
     int R = reuse ? Q->Rfix : 0;   /* iBOT: the masked cells per global (block masking), their centres mapped into the partner global */
     if (Q->wib > 0 && !reuse) {
