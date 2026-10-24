@@ -865,7 +865,7 @@ typedef struct {
     /* --ssl-distill W: dense cosine distillation of dinovol's unit 64-d sheet (object) embedding at the mapped points into head channels
        dch..dch+63 (student: the cell centres of each global; target: dinovol on the partner's un-augmented global at the same physical point);
        --ssl-distill-abs A scales that per-point term, --ssl-distill-rel W adds W x the crop's similarity-matrix match (ss_relsim: rotation-free) */
-    float dist; int dch, dnd; float *dcrd, *dacc, *dth, *dse, *dsn, *dge, *dch_h, *dacch; double dist_l; long dist_n; float drel, dabs; double rel_l; long rel_n; int dstr, dnp, *ddp, *ddph; float *dtd; double dtm; long dtmn;   /* (dense mode: --ssl-distill-stride S grid points of every global, its own crop) */
+    float dist; int dch, dnd; float *dcrd, *dacc, *dth, *dse, *dsn, *dge, *dch_h, *dacch; double dist_l; long dist_n; float drel, dabs; double rel_l; long rel_n; float dnce, dthr, dtau; int dnm; double nce_l, nce_pf; long nce_n; int dstr, dnp, *ddp, *ddph; float *dtd; double dtm; long dtmn;   /* (dense mode: --ssl-distill-stride S grid points of every global, its own crop) */
     int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -944,6 +944,8 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         xnet_set_budget((size_t)(atof(opt(argc, argv, "--ssl-dv-mem", "4")) * 1e9));
         Q->dist = (float)atof(opt(argc, argv, "--ssl-distill", "0")); Q->dch = atoi(opt(argc, argv, "--ssl-distill-ch", "0"));
         Q->drel = (float)atof(opt(argc, argv, "--ssl-distill-rel", "0")); Q->dabs = (float)atof(opt(argc, argv, "--ssl-distill-abs", "1"));
+        Q->dnce = (float)atof(opt(argc, argv, "--ssl-distill-nce", "0")); Q->dthr = (float)atof(opt(argc, argv, "--ssl-distill-thr", "0.5"));   /* (teacher-graph SupCon: positives = dinovol cos > thr) */
+        Q->dtau = (float)atof(opt(argc, argv, "--ssl-distill-tau", "0.1")); Q->dnm = atoi(opt(argc, argv, "--ssl-distill-m", "512"));
         Q->dstr = atoi(opt(argc, argv, "--ssl-distill-stride", "0"));   /* 0: the iBOT rows (cross-view); S: dense, every S-th voxel per axis of each global (own crop) */   /* (relational: crop-local similarity matrices; abs: the per-point cosine) */
         if (!(Q->dv = dv_load(dvck)) || (Q->dist <= 0 && dv_head_host(dvck, "ibot_head", &Q->DVH, &dvPh))) return 1;
         Q->icos = !strcmp(opt(argc, argv, "--ssl-ibot-loss", "ce"), "cos");   /* cos: regress dinovol's (unit) patch token directly, no prototypes */
@@ -1485,6 +1487,13 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
                 Q->rel_l += ss_relsim(es, ts_, mr, nd, 1.0, nullptr); Q->rel_n++; ss_relsim(es, ts_, mr, nd, Q->dist * Q->drel / (2.0 * N), gs2);
                 for (int k = 0; k < mr; k++) for (int e = 0; e < nd; e++) gh[(size_t)(k * st_ + o_) * nd + e] += gs2[(size_t)k * nd + e];
                 free(es); free(ts_); free(gs2); }
+            if (Q->dnce > 0) {   /* teacher-graph SupCon on a random m-point subset: match which points dinovol groups together, not its codes */
+                const int mr = NP < Q->dnm ? NP : Q->dnm; float *es = malloc((size_t)mr * nd * 4), *ts_ = malloc((size_t)mr * nd * 4), *gs2 = calloc((size_t)mr * nd, 4); int *pk = malloc((size_t)mr * 4);
+                for (int k = 0; k < mr; k++) { pk[k] = (int)(rng_next(&Q->ar) % (uint64_t)NP); memcpy(es + (size_t)k * nd, eh + (size_t)pk[k] * nd, (size_t)nd * 4); memcpy(ts_ + (size_t)k * nd, th + (size_t)pk[k] * nd, (size_t)nd * 4); }
+                double pf = 0; Q->nce_l += ss_tnce(es, ts_, mr, nd, Q->dthr, Q->dtau, 1.0, gs2, &pf); Q->nce_pf += pf; Q->nce_n++;
+                const float sc = Q->dist * Q->dnce / (float)(2 * N);
+                for (int k = 0; k < mr; k++) for (int e = 0; e < nd; e++) gh[(size_t)pk[k] * nd + e] += sc * gs2[(size_t)k * nd + e];
+                free(es); free(ts_); free(gs2); free(pk); }
             nn_h2d(Q->dge, gh, (size_t)NP * nd * 4);
             dr_scatter_unit_f32(Q->dse, Q->dge, Q->dsn, Q->ddp + (size_t)j * NP, NP, nd, g3, 1.f, Q->glzib + (size_t)Q->dch * g3);
             free(eh); free(gh);
@@ -1568,6 +1577,7 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             if (Q->ilsc) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | ibot logit scale %.3f", expf(Q->lsc)); l5 = strlen(line); }
             if (Q->dist_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill 1-cos %.4f", Q->dist_l / Q->dist_n); Q->dist_l = 0; Q->dist_n = 0; l5 = strlen(line); }
             if (Q->dtmn) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | |mean target| %.3f", Q->dtm / Q->dtmn); Q->dtm = 0; Q->dtmn = 0; l5 = strlen(line); }
+            if (Q->nce_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill nce %.4f pos %.3f", Q->nce_l / Q->nce_n, Q->nce_pf / Q->nce_n); Q->nce_l = 0; Q->nce_pf = 0; Q->nce_n = 0; l5 = strlen(line); }
             if (Q->rel_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill rel %.4f", Q->rel_l / Q->rel_n); Q->rel_l = 0; Q->rel_n = 0; l5 = strlen(line); }
             if (Q->sig_n) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | sigreg %.4f", Q->sig_l / Q->sig_n); Q->sig_l = 0; Q->sig_n = 0; l5 = strlen(line); }
             if (Q->zvh_n) { const size_t l7 = strlen(line); snprintf(line + l7, cap - l7, " | ibot zvar hinge %.5f", Q->zvh_l / Q->zvh_n); Q->zvh_l = 0; Q->zvh_n = 0; l5 = strlen(line); }

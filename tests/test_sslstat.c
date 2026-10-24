@@ -46,6 +46,18 @@ int main(void) {
       for (int a = 0; a < M; a++) for (int k = 0; k < Dd; k++) Z[a * Dd + k] = E[a * Dd + (k + 3) % Dd] * (k % 2 ? -1.f : 1.f);   /* (a signed permutation of the code axes) */
       const double l0 = ss_relsim(Z, E, M, Dd, 1.0, nullptr);
       const int b = !(emax < 1e-3 * gmax && l0 < 1e-10); printf("relational distillation gradients: max |err| %.2e of max |grad| %.2e, rotated-teacher loss %.1e%s\n", emax, gmax, l0, b ? "  FAIL" : ""); bad += b; }
+    /* teacher-graph SupCon: gradients vs central differences; a student grouping like the teacher (rotated codes) beats a random one */
+    { enum { M = 12, Dd = 6 }; float E[M * Dd], T[M * Dd], G[M * Dd] = {0}, Z[M * Dd];
+      for (int a = 0; a < M; a++) { double n = 0, m2 = 0; for (int k = 0; k < Dd; k++) { T[a * Dd + k] = (float)((k == a % 3 ? 1.0 : 0.0) + 0.3 * (urand() - 0.5)); E[a * Dd + k] = (float)(urand() - 0.5); n += T[a * Dd + k] * T[a * Dd + k]; m2 += E[a * Dd + k] * E[a * Dd + k]; }
+          for (int k = 0; k < Dd; k++) { T[a * Dd + k] /= (float)sqrt(n); E[a * Dd + k] /= (float)sqrt(m2); } }
+      const double w = 0.7, thr = 0.6, tau = 0.2; double pf; ss_tnce(E, T, M, Dd, thr, tau, w, G, &pf); double emax = 0, gmax = 0;
+      for (int i = 0; i < M * Dd; i++) { const float o = E[i]; const double e = 1e-3; E[i] = (float)(o + e); const double ep = (double)E[i] - o, lp = ss_tnce(E, T, M, Dd, thr, tau, w, nullptr, nullptr);
+          E[i] = (float)(o - e); const double em = o - (double)E[i], lm = ss_tnce(E, T, M, Dd, thr, tau, w, nullptr, nullptr); E[i] = o;
+          const double fd = (lp - lm) / (ep + em); emax = fmax(emax, fabs(fd - G[i])); gmax = fmax(gmax, fabs(fd)); }
+      for (int a = 0; a < M; a++) for (int k = 0; k < Dd; k++) Z[a * Dd + k] = T[a * Dd + (k + 2) % Dd] * (k % 2 ? -1.f : 1.f);
+      const double lr = ss_tnce(E, T, M, Dd, thr, tau, 1.0, nullptr, nullptr), lt = ss_tnce(Z, T, M, Dd, thr, tau, 1.0, nullptr, nullptr);
+      const int b = !(emax < 1e-3 * gmax && lt < lr && pf > 0.1 && pf < 0.5);
+      printf("teacher-graph SupCon gradients: max |err| %.2e of max |grad| %.2e, loss rotated teacher %.3f < random %.3f, positive pairs %.2f%s\n", emax, gmax, lt, lr, pf, b ? "  FAIL" : ""); bad += b; }
     printf("%s\n", bad ? "test_sslstat: FAIL" : "test_sslstat: OK");
     return bad != 0;
 }

@@ -62,6 +62,29 @@ static inline double ss_relsim(const float *E, const float *T, int m, int d, dou
     }
     return L;
 }
+/* teacher-graph SupCon: anchors a of E [m][d] (unit rows), positives P(a) = {b != a : T_a . T_b > thr} (the teacher's cosine graph),
+   L = w / |A| sum_{a in A} -1/|P(a)| sum_{p in P(a)} log softmax_{b != a}(E_a . E_b / tau)_p over the anchors A with a positive.
+   Only which points the teacher groups together is matched, not its code vectors. G [m][d] += d L / d E (when not nullptr);
+   *pf (when not nullptr) = the fraction of pairs that are positive; returns L. */
+static inline double ss_tnce(const float *E, const float *T, int m, int d, double thr, double tau, double w, float *G, double *pf) {
+    if (m < 2) return 0;
+    unsigned char *pos = malloc((size_t)m * m); int *npa = calloc((size_t)m, sizeof *npa), na = 0; long np = 0;
+    for (int a = 0; a < m; a++) for (int b = 0; b < m; b++) { double st = 0; if (b != a) for (int k = 0; k < d; k++) st += (double)T[(size_t)a * d + k] * T[(size_t)b * d + k];
+        pos[(size_t)a * m + b] = b != a && st > thr; npa[a] += pos[(size_t)a * m + b]; }
+    for (int a = 0; a < m; a++) { na += npa[a] > 0; np += npa[a]; }
+    if (pf) *pf = (double)np / ((double)m * (m - 1));
+    double *s = malloc((size_t)m * 8), L = 0; const double c = na ? w / na : 0;
+    for (int a = 0; a < m; a++) {
+        if (!npa[a]) continue; const unsigned char *pa = pos + (size_t)a * m; double mx = -1e300;
+        for (int b = 0; b < m; b++) { if (b == a) continue; double se = 0; for (int k = 0; k < d; k++) se += (double)E[(size_t)a * d + k] * E[(size_t)b * d + k]; s[b] = se / tau; if (s[b] > mx) mx = s[b]; }
+        double Z = 0; for (int b = 0; b < m; b++) if (b != a) Z += exp(s[b] - mx);
+        const double lz = mx + log(Z); double la = 0; for (int b = 0; b < m; b++) if (pa[b]) la += lz - s[b];
+        L += c * la / npa[a];
+        if (G) for (int b = 0; b < m; b++) { if (b == a) continue; const double g = c * (exp(s[b] - lz) - (pa[b] ? 1.0 / npa[a] : 0.0)) / tau;   /* d L / d (E_a . E_b) */
+            for (int k = 0; k < d; k++) { G[(size_t)a * d + k] += (float)(g * E[(size_t)b * d + k]); G[(size_t)b * d + k] += (float)(g * E[(size_t)a * d + k]); } }
+    }
+    free(s); free(pos); free(npa); return L;
+}
 /* SIGReg (LeJEPA, arXiv 2511.08544): the rows of X [N][D] (times xs) projected on S unit directions A [S][D]; per direction the
    Epps-Pulley distance between the projections' empirical characteristic function and the standard normal's, phi(t) = exp(-t^2 / 2):
    int_{-tmax}^{tmax} phi(t) ((Re ecf(t) - phi(t))^2 + Im ecf(t)^2) dt (an even integrand: 2 x the trapezoid rule on K knots of [0, tmax]),
