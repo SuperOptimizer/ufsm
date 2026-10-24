@@ -531,15 +531,20 @@ Goal: sheets that split into layers (a void opening inside a sheet, the outer la
 - Same windows as --aug-tear (stored phase, side 2, cube); exclusive with crush and tear; xscan skips damaged windows.
 - src/scrollaug.[ch]: `sa_delam_make` draws 1-3 sites on papyrus (CT >= iso, known phase), each with its own normal from
   `sa_phase_normal_box` over +-2 turns (oriented so the phase grows along it); peel or hole (p --aug-delam-hole).
-  - Peel: a bump b = t g0 (1 - r^2)^2 (g0 1 .. min(4, spacing / 4) voxels, R 1-4 turns), tapered off the plane between |a| .4 and
-    .6 turns. With delta the phase distance past the split phase phc: 0 <= delta < b is the gap (void CT, phase phc); beyond, the CT is
-    pulled by b w(delta) along the normal (w linear from 1 at the gap edge to 0 at half a turn). The phase is remapped as a function of
-    itself (phase - b w / spacing turns), not resampled: the map is monotone, so the unwrap gains no turn (resampling the phase at the
-    pulled point gave nearest-neighbour jitter that dropped whole w4 tiles as conflicts on Paris 4). Voxels of unknown phase stay unknown.
+  - Peel: a lens b = t g0 (1 - r^2)^2 (g0 2 .. min(6, .4 spacing) voxels, R 1-4 turns), tapered off the plane between |a| .4 and
+    .6 turns; the two halves of the sheet move apart by up to b / 2 each, within their own half turn. Distances come from a per-site
+    profile (geometric distance along the normal through c of each phase offset 0 .. 126 codes, ahead and behind): the stored phase is
+    far from linear in space (papyrus spans about half a turn over a few voxels), and measuring the gap in phase units made it half as
+    thick as the pull, so the pull refilled it (a dotted 1-voxel line on Paris 4). Distance d < b / 2 from the split is the gap (void CT,
+    phase phc); beyond, the CT is pulled by (b / 2) w(d) away from the split (w linear from 1 at the gap edge to 0 at the half-turn
+    point; each half moves at most half way there). The phase is the profile inverted at d - (b / 2) w, a monotone function of the
+    phase itself, so the unwrap gains no turn (resampling the phase at the pulled point gave nearest-neighbour jitter that dropped
+    whole w4 tiles as conflicts on Paris 4). Voxels of unknown phase stay unknown. On Paris 4 the gap is a 3-4 voxel lens tapering
+    along the sheet; the scattered unlabelled specks in the renders are the stored phase's own unknown voxels (present at t 0).
   - Hole: a ragged ellipse (R, R2 .5-2.5 turns, 3 harmonics) in the sheet plane, restricted to the centre's sheet (|a| <= .4 turn and
     within .22 turn of the sheet's CT-weighted mean phase on the normal); papyrus -> void + ash (0-.2) x speckle x (CT - void), soft
     rims; labels unchanged (the net infers the missing sheet).
-- sample.c `delam_draw`: padded read (margin 6), labels prepared on the padded box (sign, ignore, air), the damage applied, then the
+- sample.c `delam_draw`: padded read (margin 8), labels prepared on the padded box (sign, ignore, air), the damage applied, then the
   ordinary unwrap of the damaged window (continuous, so w4 is smooth inside components).
 - Tests (tests/test_scrollaug.c): t 0 identity; the peel gap is void at the split phase; 16 peels on the fixture unwrap with 0
   conflict voxels (w4 kept 1.0000 of the undamaged box); holes only darken the CT, labels unchanged; default off bit-identical, p 1

@@ -148,7 +148,7 @@ uint8_t sa_ct_quantile(const uint8_t *ct, size_t n, double q) {
 }
 
 /* ---------------- --aug-delam: peels and holes ---------------- */
-int sa_delam_margin(double spacing) { (void)spacing; return 6; }   /* (g0 <= 4 voxels) */
+int sa_delam_margin(double spacing) { (void)spacing; return 8; }   /* (g0 <= 6 voxels) */
 static void sa_perp(const double n[3], double t1[3], double t2[3]) {
     const double a[3] = {fabs(n[0]) < .9 ? 1 : 0, fabs(n[0]) < .9 ? 0 : 1, 0};
     t1[0] = a[1] * n[2] - a[2] * n[1]; t1[1] = a[2] * n[0] - a[0] * n[2]; t1[2] = a[0] * n[1] - a[1] * n[0]; norm3(t1);
@@ -169,7 +169,24 @@ int sa_delam_make(sa_delam *d, uint64_t seed, int P, int M, const uint8_t *ct_pa
         for (int k = 0; k < 3; k++) s->c[k] = c[k];
         sa_perp(s->n, s->t1, s->t2);
         s->kind = sa_unif(&r) < p_hole; s->phc = ph_pad[kc]; s->half = .4 * spacing;
-        if (s->kind == 0) { s->R = spacing * (1 + 3 * sa_unif(&r)); s->R2 = s->R; s->g0 = 1 + sa_unif(&r) * (fmin(4, .25 * spacing) - 1); if (s->g0 < 1) s->g0 = 1; }
+        if (s->kind == 0) {   /* the phase -> distance profile past the split on the normal through c: the stored phase is not linear in
+                                 space (papyrus spans about half a turn over a few voxels, the void the rest) */
+            for (int sd = 0; sd < 2; sd++) {   /* (sd 0 ahead along n, 1 behind) */
+                float *T = s->T[sd]; const double sg = sd ? -1 : 1;
+                int nc = 1; double tp = 0, op = 0; T[0] = 0;
+                for (double tt = .25; tt <= 1.2 * spacing && nc < 127; tt += .25) {
+                    int q[3]; for (int d = 0; d < 3; d++) { q[d] = c[d] + M + (int)lrint(sg * tt * s->n[d]); if (q[d] < 0) q[d] = 0; if (q[d] > Pp - 1) q[d] = Pp - 1; }
+                    const uint8_t pq = ph_pad[(size_t)q[0] * sz + (size_t)q[1] * sy + (size_t)q[2]];
+                    if (pq >= PHASE_PERIOD) continue;
+                    const int off = ((sd ? s->phc - (int)pq : (int)pq - s->phc) + PHASE_PERIOD) % PHASE_PERIOD;
+                    if (off > 200 || off <= op) continue;   /* (the other side of the split, or not past the furthest offset yet) */
+                    for (; nc < 127 && nc <= off; nc++) T[nc] = (float)(tp + (nc - op) / (off - op) * (tt - tp));
+                    tp = tt; op = off;
+                }
+                for (; nc < 127; nc++) T[nc] = T[nc - 1] + (float)(spacing / PHASE_PERIOD);   /* (not reached: the mean slope) */
+                for (int k = 1; k < 127; k++) if (T[k] < T[k - 1] + 1e-3f) T[k] = T[k - 1] + 1e-3f;
+            }
+            s->R = spacing * (1 + 3 * sa_unif(&r)); s->R2 = s->R; s->g0 = 2 + sa_unif(&r) * (fmin(6, .4 * spacing) - 2); if (s->g0 < 1) s->g0 = 1; }
         else {
             double cs = 0, sn = 0;   /* (the hole's sheet centre: the CT-weighted circular mean phase of the papyrus on the normal through c, +-.4 turn) */
             for (int k = -(int)(.4 * spacing); k <= (int)(.4 * spacing); k++) {
@@ -203,7 +220,7 @@ void sa_delam_apply(const sa_delam *dl, double t, int P, int M, const uint8_t *c
         memcpy(ct + o, ct_pad + s, (size_t)P); memcpy(ph + o, ph_pad + s, (size_t)P);
     }
     if (t <= 0) return;
-    const double sp = dl->spacing, x2 = .5 * sp;
+    const double sp = dl->spacing;
     for (int i = 0; i < dl->n; i++) {
         const sa_site *S = &dl->s[i];
         const double ext = fmax(S->R, S->R2) * 1.3 + sp + 2;
@@ -220,14 +237,24 @@ void sa_delam_apply(const sa_delam *dl, double t, int P, int M, const uint8_t *c
                 const double b = t * S->g0 * (1 - r2) * (1 - r2) * ta;
                 if (b < .05) continue;
                 const uint8_t pv = ph_pad[ki];
-                const double dl_ = pv < PHASE_PERIOD ? pdiff(pv, S->phc) / (double)PHASE_PERIOD * sp : a;   /* (signed distance past the split) */
-                if (dl_ < 0) continue;
-                if (dl_ < b) { if (ct[ko]) { ct[ko] = dl->void_ct; ph[ko] = pv < PHASE_PERIOD ? S->phc : PHASE_UNKNOWN; } continue; }   /* the opened gap (unknown phase stays unknown) */
-                const double w = dl_ < x2 ? (x2 - dl_) / (x2 - b) : 0;   /* (linear from the gap edge to 0 at half a turn, before the phase wraps: the phase map stays monotone, slope x2 / (x2 - b)) */
+                /* the two halves move apart, each by up to b / 2 within its own half turn: side 0 ahead of the split (phase offsets 0 .. 126,
+                   along n), side 1 behind (offsets 126 .. 252, against n); unknown phase: the side and distance from the plane */
+                const int of = pv < PHASE_PERIOD ? (pv - S->phc + PHASE_PERIOD) % PHASE_PERIOD : -1;
+                const int side = of >= 0 ? of > 126 : a < 0, off = of < 0 ? -1 : side ? PHASE_PERIOD - of : of;
+                const float *T = S->T[side]; const double sg = side ? -1 : 1;
+                const double d2 = T[126], hb = fmin(.5 * b, .5 * d2);   /* (the half-turn point; each half moves at most half way there: the phase map stretches <= 2x) */
+                const double dl_ = off >= 0 ? T[off] : fabs(a);   /* (geometric distance from the split: the site's profile) */
+                if (dl_ < hb) { if (ct[ko]) { ct[ko] = dl->void_ct; ph[ko] = off >= 0 ? S->phc : PHASE_UNKNOWN; } continue; }   /* the opened gap (unknown phase stays unknown) */
+                const double w = dl_ < d2 ? (d2 - dl_) / (d2 - hb) : 0;   /* (linear from the gap edge to 0 at the half-turn point) */
                 if (w <= 0) continue;
-                const double q[3] = {z + M - S->n[0] * b * w, y + M - S->n[1] * b * w, x + M - S->n[2] * b * w};
+                const double q[3] = {z + M - sg * S->n[0] * hb * w, y + M - sg * S->n[1] * hb * w, x + M - sg * S->n[2] * hb * w};
                 ct[ko] = (uint8_t)lrint(tri_u8(ct_pad, Pp, q));
-                if (pv < PHASE_PERIOD) { int nv = (int)pv - (int)lrint(b * w * PHASE_PERIOD / sp); nv %= PHASE_PERIOD; if (nv < 0) nv += PHASE_PERIOD; ph[ko] = (uint8_t)nv; }   /* the phase remapped as a function of itself (no resampling jitter); an unknown voxel stays unknown */
+                if (off >= 0) {   /* the phase where the material came from: the profile inverted at dl - hb w (monotone in the phase: no turn gained) */
+                    const double ds = dl_ - hb * w; int lo = 0, hi = 126;
+                    while (hi - lo > 1) { const int md = (lo + hi) / 2; if (T[md] <= ds) lo = md; else hi = md; }
+                    double cf = lo + (ds - T[lo]) / (T[hi] - T[lo]); cf = cf < 0 ? 0 : cf > 126 ? 126 : cf;
+                    ph[ko] = (uint8_t)((S->phc + (int)(sg * lrint(cf)) + PHASE_PERIOD) % PHASE_PERIOD);
+                }
             } else {
                 if (fabs(a) > S->half) continue;
                 const uint8_t pv = ph_pad[ki];
