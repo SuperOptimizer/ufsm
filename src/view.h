@@ -23,6 +23,10 @@ void sview_free(sview *v);
 /* the crop at level-lv voxel origin o (zyx), Pv^3 voxels, into out (z y x). self: the source scan's level-lv array (used without a map).
    0 on success, -1 on a read error */
 int sview_read(const sview *v, z3 *self, const int64_t o[3], int Pv, uint8_t *out);
+/* the partner (has_map) on the source scan's level-l grid: n (zyx) voxels at origin o into out (0 outside the partner), read from the
+   partner level nearest the level-l voxel (a 2^3 sub-sample box mean over the level-l voxel when that level is still < 3/4 of it: a
+   finer partner box-downsampled in the same pass), in z slabs (<= ~48M fine voxels each). 0 ok, -1 read error */
+int sview_read_level(const sview *v, int l, const int64_t o[3], const int64_t n[3], uint8_t *out);
 /* the crop origin (level-lv voxels, zyx) centred on a window of n (zyx) level-l voxels at corner o (level-l voxels), l >= lv:
    the window centre (o + n / 2) 2^(l - lv) minus Pv / 2 (level grids nest: level-l voxel k covers level-lv voxels k 2^(l-lv) ..) */
 static inline void sview_origin(int l, int lv, const int64_t o[3], const int64_t n[3], int Pv, int64_t vo[3]) {

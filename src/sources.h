@@ -116,6 +116,9 @@ typedef struct {
     int view, view_level; char *view_map;   /* optional "view": {"map": REG.json (omit: this scan itself), "level": L (default 0)}: the second-scan
                                                view of scan fusion (src/view.h; sample_cfg.view_P), opened by the sampler (view_h) */
     struct sview *view_h;
+    int nxs; char *xs_map[4];   /* optional "xscan": [{"map": REG.json}, ...] (<= 4): registered partner scans of this scan (it is each map's coarse
+                                   scan) for --aug-xscan: the window's CT swapped for a partner warped onto it, labels kept; opened by the sampler */
+    struct sview *xs_h[4];
     float norm_c, norm_s;   /* optional "norm": {"center": c, "scale": s} (scanprep stats: median, scale): the CT input is (v - c) / s for this
                                source instead of the window's own z-score (norm_s 0: off, the default) */
 } source;

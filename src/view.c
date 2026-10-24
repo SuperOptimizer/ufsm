@@ -89,3 +89,28 @@ int sview_read(const sview *v, z3 *self, const int64_t o[3], int Pv, uint8_t *ou
     free(t); free(fbuf);
     return 0;
 }
+
+int sview_read_level(const sview *v, int l, const int64_t o[3], const int64_t n[3], uint8_t *out) {
+    const size_t nyx = (size_t)n[1] * n[2];
+    memset(out, 0, nyx * (size_t)n[0]);
+    if (!v->has_map) return -1;
+    const int lf = rvol_level_for(v->fv, v->cum * (double)(1 << l));
+    const int ss = v->fum * (double)(1 << lf) < .75 * v->cum * (double)(1 << l) ? 2 : 1;
+    const double r = v->cum * (double)(1 << l) / (v->fum * (double)(1 << lf));   /* (fine voxels per coarse voxel) */
+    int sz = (int)(48e6 / ((double)nyx * r * r * r)); if (sz < 4) sz = 4; if (sz > n[0]) sz = (int)n[0];
+    float *t = malloc((size_t)sz * nyx * sizeof *t); if (!t) return -1;
+    const double sh[3] = {0, 0, 0};
+    for (int64_t z0 = 0; z0 < n[0]; z0 += sz) {
+        const int nz = (int)(n[0] - z0 < sz ? n[0] - z0 : sz);
+        const double org[3] = {(double)o[2], (double)o[1], (double)(o[0] + z0)}; const int nn[3] = {nz, (int)n[1], (int)n[2]};
+        rblk fb; int err = 0;
+        uint8_t *fbuf = reg_read_fine(v->fv, lf, &v->m, l, org, nn, 1.0, &fb, &err);
+        if (!fbuf) { if (err == 2) continue; free(t); return -1; }   /* (outside the partner: 0) */
+        reg_resample(&fb, &v->m, l, lf, org, nn, sh, ss, t);
+        uint8_t *dst = out + (size_t)z0 * nyx;
+        for (size_t i = 0; i < (size_t)nz * nyx; i++) { const float a = t[i]; dst[i] = a <= 0.f ? 0 : a >= 255.f ? 255 : (uint8_t)lrintf(a); }
+        free(fbuf);
+    }
+    free(t);
+    return 0;
+}

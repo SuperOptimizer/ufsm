@@ -226,6 +226,12 @@ sources *sources_load(const char *path) {
         }
         const json *vj = json_get(e, "view");   /* scan fusion: the second-scan view (opened by the sampler, src/view.h) */
         if (vj) { s->view = 1; s->view_level = (int)json_num(json_get(vj, "level"), 0); const char *vm = json_str(json_get(vj, "map"), nullptr); s->view_map = vm ? strdup(vm) : nullptr; }
+        const json *xj = json_get(e, "xscan");   /* --aug-xscan partner scans (opened by the sampler) */
+        if (xj && xj->type == J_ARR) for (size_t k = 0; k < xj->n && s->nxs < 4; k++) {
+            const json *xe = json_at(xj, k); const char *xm = xe && xe->type == J_STR ? json_str(xe, nullptr) : json_str(json_get(xe, "map"), nullptr);
+            if (!xm) { fprintf(stderr, "sources: %s: xscan entries are {\"map\": REG.json}\n", s->name); json_free(j); sources_free(S); return nullptr; }
+            s->xs_map[s->nxs++] = strdup(xm);
+        }
         const json *fj = json_get(e, "focus");   /* {"map": RAW, "w": K}: the sampler's packing focus (map grid in RAW.json) */
         if (fj) {
             const char *fp = json_str(json_get(fj, "map"), nullptr); s->focus_w = (float)json_num(json_get(fj, "w"), 0);
@@ -316,6 +322,7 @@ void sources_free(sources *S) {
         }
         free(s->ax.z); free(s->ax.y); free(s->ax.x);
         free(s->name); free(s->ct_key); free(s->view_map);
+        for (int k = 0; k < s->nxs; k++) free(s->xs_map[k]);
         store_close(s->s);
     }
     free(S->src);

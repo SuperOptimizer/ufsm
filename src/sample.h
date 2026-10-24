@@ -51,6 +51,8 @@ typedef struct {
     crush_cfg crush;         /* --aug-crush (src/crush.h): crushed windows (gap collapse, squash, bends) pulled from stored-phase sources
                                 without target channels (task unwrap2); crush.p 0 = off. Needs augment + geometry_augment; such windows skip
                                 the ordinary spatial warp (one resample) and keep unwarped radial channels */
+    float xscan_p;           /* --aug-xscan: probability of swapping a window's CT for a registered partner scan of its source (sources
+                                "xscan": [{"map": REG.json}]; labels kept, partner gaps CT 0; not crushed / chained / cover / validation windows); 0 = off */
     const sheet_dataset *sheet; /* borrowed sparse geometry, native-level B=1 task */
     int band;                /* 1: fill batch.band from each source's band target (task band_affinity, native level, no geometry warp) */
     double min_phase;        /* side 2: reject windows whose known phase covers less than this fraction of the voxels (0: keep all) */
@@ -179,6 +181,8 @@ void sampler_stop(sampler *sp);
 /* Stats: patches rejected / produced since start. */
 void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected);
 uint64_t sampler_crushed(const sampler *sp);   /* --aug-crush windows drawn so far */
+enum { AUGN_XSCAN, AUGN_TEAR, AUGN_DELAM, AUGN_DENSITY, AUGN_CURV, AUGN_INCL, AUGN_N };
+uint64_t sampler_aug_count(const sampler *sp, int which);   /* windows that received a scroll augmentation (AUGN_*) so far */
 /* draws dropped by reason: [0] the coarse CT probe (min_fg, before the CT read), [1] the CT read's min_fg, [2] empty targets
    (empty_keep), [3] overlapping a holdout box (training; not counted in rejected) */
 void sampler_reject_reasons(const sampler *sp, uint64_t why[4]);

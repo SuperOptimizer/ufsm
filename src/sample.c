@@ -175,6 +175,7 @@ struct sampler {
     atomic_uint_fast64_t produced, rejected;
     atomic_uint_fast64_t rej_why[4];   /* draws dropped: coarse CT probe, CT read (min_fg), empty targets, holdout overlap (not in rejected) */
     atomic_uint_fast64_t crushed;      /* --aug-crush windows drawn */
+    atomic_uint_fast64_t augn[AUGN_N]; /* scroll augmentations applied (sampler_aug_count) */
     atomic_uint soft_bits;   /* current soft-target sigma (float bits), set by sampler_set_soft */
     int64_t *slot_j;         /* deterministic mode: batch index held by each slot */
     int64_t next_claim, next_take;   /* deterministic mode: next batch index to fill / to hand out (under mu) */
@@ -1865,6 +1866,27 @@ static int training_hits_holdout_box(const sampler *sp, const source *s, const i
     }
     return 0;
 }
+/* --aug-xscan: the window's CT (n zyx at origin o, level l) replaced by one of the source's registered partner scans warped onto it
+   (src/view.h: a finer partner box-downsampled in the same pass), its intensities mapped onto this window's own CT by quantile matching
+   over the voxels both scans cover; where the partner has no data the CT is 0 (outside the scan: no labels there). Labels are not
+   touched. 1 swapped, 0 kept (the partner covers under half of the window's scan voxels), -1 read error. */
+static int xscan_draw(source *s, int l, const int64_t o[3], const int64_t n[3], rng *r, uint8_t *ctu, uint8_t *tmp) {
+    const sview *v = s->xs_h[(int)(rnext(r) % (uint64_t)s->nxs)];
+    const size_t N = (size_t)n[0] * n[1] * n[2];
+    if (sview_read_level(v, l, o, n, tmp)) return -1;
+    uint64_t ha[256] = {0}, hb[256] = {0}, both = 0, own = 0;
+    for (size_t k = 0; k < N; k++) if (ctu[k]) { own++; if (tmp[k]) { both++; ha[ctu[k]]++; hb[tmp[k]]++; } }
+    if (!own || both * 2 < own) return 0;
+    uint8_t lut[256]; lut[0] = 0;
+    uint64_t cb = 0, ca = 0; int a = 1;
+    for (int b = 1; b < 256; b++) {   /* partner value b -> the window's value at the same quantile (the bin's midpoint) */
+        const double q = (double)cb + .5 * (double)hb[b];
+        while (a < 255 && (double)(ca + ha[a]) <= q) ca += ha[a++];
+        lut[b] = (uint8_t)a; cb += hb[b];
+    }
+    for (size_t k = 0; k < N; k++) ctu[k] = lut[tmp[k]];
+    return 1;
+}
 /* 1: ctu (P^3) and g_crush hold the crushed window; 0: not crushed (its footprint may reach a holdout box: the plain read follows); -1 error */
 static int crush_draw_(sampler *sp, source *s, int l, const int64_t o[3], int P, int pshift, rng *r, uint8_t *arena, size_t abytes, uint8_t *ctu) {
     const sample_cfg *c = &sp->cfg; const size_t p3 = (size_t)P * P * P;
@@ -2041,6 +2063,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     double sum = 0, sq = 0;
     u8_stats(ctu, p3, &nz, &sum, &sq);
     if (!c->cover && (double)nz / (double)p3 < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[1], 1); return 1; }
+    if (c->xscan_p > 0 && s->nxs && !crushed && c->augment && !chained && !c->view_P && !c->cover && !c->holdout && runif(r) < c->xscan_p) {
+        const int xs = xscan_draw(s, l, o, n, r, ctu, big + p3);   /* (big + p3: free scratch until the scanner augmentation) */
+        if (xs < 0) return -1;
+        if (xs) { atomic_fetch_add(&sp->augn[AUGN_XSCAN], 1); nz = 0; sum = sq = 0; u8_stats(ctu, p3, &nz, &sum, &sq); }
+    }
     PROF_MARK(PS_STATS);
     /* --iso-void / --iso-lift: chamfer distance (3 per voxel, saturated at 255) of every voxel to papyrus (clean CT >= the cutoff) */
     const int iso_t = s->iso > 0 ? s->iso : c->iso;
@@ -2823,6 +2850,15 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         }
         if (!nv) fprintf(stderr, "sampler: warning: view_P %d but no source has a \"view\" (zero crops)\n", cfg->view_P);
     }
+    if (cfg->xscan_p > 0) {   /* --aug-xscan: open the partner scans (kept for the process, as the views) */
+        int nx = 0;
+        for (int i = 0; i < S->n; i++) {
+            source *s = &S->src[i];
+            for (int k = 0; k < s->nxs; k++, nx++)
+                if (!s->xs_h[k] && !(s->xs_h[k] = sview_open(s->xs_map[k], 0, s->um, S->cache))) { fprintf(stderr, "sampler: %s: cannot open xscan map %s\n", s->name, s->xs_map[k]); return nullptr; }
+        }
+        if (!nx) fprintf(stderr, "sampler: warning: --aug-xscan %g but no source has \"xscan\" partner scans\n", cfg->xscan_p);
+    }
     sampler *sp = calloc(1, sizeof *sp);
     sp->S = S;
     sp->cfg = *cfg;
@@ -2954,6 +2990,7 @@ void sampler_prof_print(const sampler *sp) {
 }
 void sampler_reject_reasons(const sampler *sp, uint64_t why[4]) { for (int k = 0; k < 4; k++) why[k] = atomic_load(&sp->rej_why[k]); }
 uint64_t sampler_crushed(const sampler *sp) { return atomic_load(&sp->crushed); }
+uint64_t sampler_aug_count(const sampler *sp, int which) { return which >= 0 && which < AUGN_N ? atomic_load(&sp->augn[which]) : 0; }
 void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected) {
     *produced = atomic_load(&sp->produced);
     *rejected = atomic_load(&sp->rejected);
