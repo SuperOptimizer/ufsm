@@ -1210,6 +1210,25 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             if (dv_net_points(Q->dv, Q->dcrd, nullptr, nullptr, NP, Q->dacc)) return 1;
             xd2h(Q->dacch, Q->dacc, (size_t)NP * DC * 4);
             for (int a = 0; a < NP; a++) memcpy(Q->dtd + ((size_t)j * NP + a) * nd, Q->dacch + (size_t)a * DC, (size_t)nd * 4);
+            if (j == 0 && getenv("UFSM_DIST_EQUI") && step <= 2) {   /* (debug: dinovol's output axes: shift its input by 8 vx along axis s, query the grid points moved by -8 along axis q;
+                                                                       the right axis map has a high cosine on the diagonal of the 3 x 3 table) */
+                const int PG = Q->PG; uint8_t *u0 = malloc(g3), *u1 = malloc(g3); nn_d2h(u0, Q->dvu, g3); float *crd = malloc((size_t)NP * 12); int *sel = malloc((size_t)NP * 4); int ns = 0;
+                for (int a = 0; a < NP; a++) { int ok = 1; for (int d = 0; d < 3; d++) ok &= Q->dch_h[3 * a + d] >= 16 && Q->dch_h[3 * a + d] < PG - 16; if (ok) sel[ns++] = a; }
+                const size_t st3[3] = {(size_t)PG * PG, (size_t)PG, 1};
+                for (int sa = 0; sa < 3; sa++) {
+                    for (size_t i = 0; i < g3; i++) { const int c = (int)(i / st3[sa] % PG); u1[i] = c + 8 < PG ? u0[i + 8 * st3[sa]] : u0[i]; }
+                    nn_h2d(Q->dvu, u1, g3); nn_sync();
+                    if (dv_forward(Q->dv, Q->dvu, Q->PG, (float)Q->dvm[si], (float)Q->dvs[si], (float)Q->dvh[si])) return 1;
+                    fprintf(stderr, "dist equi step %d: input shifted +8 along axis %d (z y x) -> cos at query -8 along z / y / x / none:", step, sa);
+                    for (int qa = 0; qa < 4; qa++) {
+                        for (int k = 0; k < ns; k++) for (int d = 0; d < 3; d++) crd[3 * k + d] = Q->dch_h[3 * sel[k] + d] - (d == qa ? 8.f : 0.f);
+                        xh2d(Q->dcrd, crd, (size_t)ns * 12); if (dv_net_points(Q->dv, Q->dcrd, nullptr, nullptr, ns, Q->dacc)) return 1; xd2h(Q->dacch, Q->dacc, (size_t)ns * DC * 4);
+                        double c = 0; for (int k = 0; k < ns; k++) { double d_ = 0; for (int e = 0; e < nd; e++) d_ += (double)Q->dacch[(size_t)k * DC + e] * Q->dtd[((size_t)j * NP + sel[k]) * nd + e]; c += d_; }
+                        fprintf(stderr, " %.3f", c / ns); }
+                    fprintf(stderr, "\n");
+                }
+                nn_h2d(Q->dvu, u0, g3); free(u0); free(u1); free(crd); free(sel);
+            }
             static int tconst = -1; if (tconst < 0) tconst = getenv("UFSM_DIST_CONST") ? atoi(getenv("UFSM_DIST_CONST")) : 0;
             if (tconst == 4 || getenv("UFSM_DIST_XCHK")) {   /* (debug: the teacher's own input crop dvf -- 4: the local CT target of CONST=3 from it at the teacher grid's coordinates
                                                                 (the dinovol coordinate path); XCHK: |corr| of dvf with the student's view j over all voxels and at the grid points) */
