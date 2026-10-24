@@ -275,7 +275,8 @@ extern "C" void nn_restore_output(const void *lg, int lg16, const uint8_t *low, 
 }
 
 /* ---- real pairs (train --task restore on sr_pair sources): shift-tolerant Charbonnier, edge, MSE, downsample consistency; metrics ---- */
-struct rp_geo { int D, H, W, q, shift; float eps, mw, ew, sw, dw, gs, uw; };
+struct rp_geo { int D, H, W, q, shift; float eps, mw, ew, sw, dw, gs, uw, gw, gt; };   /* gw, gt: gap weight / threshold (DN) */
+__device__ __forceinline__ float rp_gapw(const uint8_t *lo, const uint8_t *hi, size_t i, float gw, float gt) { return gw != 0.f && (float)hi[i] < (float)lo[i] - gt ? 1.f + gw : 1.f; }
 template <class L> __device__ __forceinline__ float rp_o(const L *lg, const uint8_t *lo, size_t i) { return (float)lg[i] + (float)lo[i] * 0.015625f; }
 __device__ __forceinline__ float rp_ch(float e, float eps) { return sqrtf(e * e + eps * eps) - eps; }
 __device__ __forceinline__ float rp_cd(float e, float eps) { return e * rsqrtf(e * e + eps * eps); }
@@ -322,7 +323,8 @@ template <class L> __global__ void rp_stats_k(const L *__restrict__ lg, const ui
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)blockDim.x * gridDim.x) {
         if (!hi[i]) continue;
         const float o = rp_o(lg, lo, i), e = o - (float)hi[i] * 0.015625f, em = rp_emin(lg, lo, hi, g, i, o), dn = 64.f * e, base = (float)lo[i] - (float)hi[i];
-        s[0] += 1; s[1] += (1.f - g.sw) * rp_ch(e, g.eps) + g.sw * rp_ch(em, g.eps); s[2] += fabsf(dn); s[3] += (double)dn * dn; s[4] += (double)base * base; s[7] += fabsf(64.f * em);
+        const float wg = rp_gapw(lo, hi, i, g.gw, g.gt);
+        s[0] += 1; s[1] += wg * ((1.f - g.sw) * rp_ch(e, g.eps) + g.sw * rp_ch(em, g.eps)); s[2] += fabsf(dn); s[3] += (double)dn * dn; s[4] += (double)base * base; s[7] += fabsf(64.f * em);
         if (g.uw != 0.f) { const float ls = (float)lg[n + i]; s[8] += (sqrtf(e * e + g.eps * g.eps) - g.eps) * __expf(-ls) + ls; }
         for (int a = 0; a < 3; a++) {
             if ((int)((i / str[a]) % len[a]) == len[a] - 1 || !hi[i + str[a]]) continue;
@@ -349,7 +351,7 @@ template <class L, class G> __global__ void rp_grad_k(const L *__restrict__ lg, 
     const size_t str[3] = {(size_t)g.H * g.W, (size_t)g.W, 1}; const int len[3] = {g.D, g.H, g.W};
     if (hi[i] && st[0] > 0) {
         const float o = rp_o(lg, lo, i), e = o - (float)hi[i] * 0.015625f, em = rp_emin(lg, lo, hi, g, i, o), inv = (float)(1.0 / st[0]);
-        v = ((1.f - g.sw) * rp_cd(e, g.eps) + g.sw * rp_cd(em, g.eps) + g.mw * e) * inv;
+        v = (rp_gapw(lo, hi, i, g.gw, g.gt) * ((1.f - g.sw) * rp_cd(e, g.eps) + g.sw * rp_cd(em, g.eps)) + g.mw * e) * inv;
         if (g.ew != 0.f && st[5] > 0) {
             const float ie = g.ew * (float)(1.0 / st[5]);
             for (int a = 0; a < 3; a++) {
@@ -406,7 +408,7 @@ template <class L> static void rp_loss_t(const L *lg, const uint8_t *lo, const u
 extern "C" void nn_restore_pair_loss(const void *lg, int lg16, const uint8_t *low, const uint8_t *tgt, const uint8_t *coarse, int D, int H, int W, const restore_pair_w *w,
                                      void *gl, int g16, int h16, float gscale, double *st, float *rd, int metrics) {
     const size_t n = (size_t)D * H * W;
-    rp_geo g = {D, H, W, D / 4, w->shift, w->eps, w->mse, w->edge, w->shift_w, w->ds, gscale, w->unc};
+    rp_geo g = {D, H, W, D / 4, w->shift, w->eps, w->mse, w->edge, w->shift_w, w->ds, gscale, w->unc, w->gap_w, w->gap_t};
     if (lg16) rp_loss_t<f16>((const f16 *)lg, low, tgt, coarse, g, gl, g16, h16, st, rd, metrics, n);
     else rp_loss_t<float>((const float *)lg, low, tgt, coarse, g, gl, g16, h16, st, rd, metrics, n);
     KCHECK();

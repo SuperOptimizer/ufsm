@@ -328,8 +328,9 @@ static double pair_ref(const float *lg, const uint8_t *lo, const uint8_t *hi, co
         if (w->shift) for (int a = 0; a < 3; a++) { const int c = (int)((i / str[a]) % N);
             if (c > 0 && hi[i - str[a]]) { const double t = o - hi[i - str[a]] / 64.0; if (fabs(t) < fabs(em)) em = t; }
             if (c < N - 1 && hi[i + str[a]]) { const double t = o - hi[i + str[a]] / 64.0; if (fabs(t) < fabs(em)) em = t; } }
-        cnt++; main_ += (1 - w->shift_w) * CH(e) + w->shift_w * CH(em); se += e * e;
-        gm[i] = (1 - w->shift_w) * CD(e) + w->shift_w * CD(em) + w->mse * e;
+        const double wg = w->gap_w != 0 && (double)hi[i] < (double)lo[i] - w->gap_t ? 1 + w->gap_w : 1;
+        cnt++; main_ += wg * ((1 - w->shift_w) * CH(e) + w->shift_w * CH(em)); se += e * e;
+        gm[i] = wg * ((1 - w->shift_w) * CD(e) + w->shift_w * CD(em)) + w->mse * e;
         for (int a = 0; a < 3; a++) { if ((int)((i / str[a]) % N) == N - 1 || !hi[i + str[a]]) continue;
             const size_t j = i + str[a]; const double d = e - (O(j) - hi[j] / 64.0); pairs++; es += CH(d); ge[i] += CD(d); ge[j] -= CD(d); }
     }
@@ -361,7 +362,7 @@ static void test_pair_loss(void) {
     float *dlg = nn_malloc(n * 4), *dg = nn_malloc(n * 4), *drd = nn_malloc(nq * 4); uint8_t *dlo = nn_malloc(n), *dhi = nn_malloc(n), *dco = nn_malloc(nq); double *dst = nn_malloc(RP_NST * sizeof(double)), s[RP_NST];
     nn_h2d(dlg, lg, n * 4); nn_h2d(dlo, lo, n); nn_h2d(dhi, hi, n); nn_h2d(dco, co, nq);
     for (int shift = 0; shift < 2; shift++) {
-        const restore_pair_w w = {0.01f, 0.1f, 0.3f, shift ? 0.5f : 0.f, 0.7f, shift, 0.f};
+        const restore_pair_w w = {0.01f, 0.1f, 0.3f, shift ? 0.5f : 0.f, 0.7f, shift, 0.f, shift ? 2.f : 0.f, 20.f};
         const double lr = pair_ref(lg, lo, hi, co, N, &w, gr), lgpu = pair_gpu(dlg, dlo, dhi, dco, N, &w, dg, dst, drd, s);
         CHECK(fabs(lr - lgpu) < 1e-5 * fabs(lr) + 1e-7, "pair loss (shift %d) %g vs double %g", shift, lgpu, lr);
         nn_d2h(g, dg, n * 4);
