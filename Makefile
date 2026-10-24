@@ -263,6 +263,11 @@ $(B)/crush_render: tests/crush_render.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) 
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/crush_render.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
 $(B)/xscan_render: tests/xscan_render.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/xscan_render.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
+
+$(B)/scrollaug_anim: tests/scrollaug_anim.c tests/gif_anim.h src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/scrollaug_anim.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
+$(B)/aug_render: tests/aug_render.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/aug_render.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
 $(B)/crush_anim: tests/crush_anim.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/crush_anim.c $(SAMPLE_TEST_OBJ) $(B)/imgops.o $(B)/tiffw.o $(B)/tfx.o $(B)/surfcomp.o -o $@ $(LDLIBS)
 $(B)/test_scrollaug: tests/test_scrollaug.c tests/make_wind_fixture.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
