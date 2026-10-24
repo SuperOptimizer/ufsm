@@ -42,6 +42,8 @@ typedef struct {
     float hl[8]; int hon[8];                    /* --heads: the last batch's loss per head and whether the head had a target */
     float *x; uint8_t *t, *m, *w; /* the buffers of the batch being computed */
     void *radb[2], *rad;         /* --gpu-input: the batch's radial records on the device (nn.h NN_RAD_REC), per buffer / current */
+    int64_t *chh[2]; int *chih[2]; float *choh[2]; int chv[2];   /* --attn-mem: per buffer the batch's chain ids, indices, offsets (host copies) */
+    uint8_t *vh[2], *vd; size_t vhn[2], vdn; int vv[2];   /* --view-P: per buffer the batch's view crops (host copies) and whether it has them; the device copy */
     float *axh[2]; int axv[2], axn[2], axs[2];   /* --attn-axis radial / --attn-pe scroll: per buffer the batch's scroll-axis records (host copies, sample.h
                                     SAMPLE_AXR) and whether it has them (restore / slab batches: none) */
     void *ev_up[2], *ev_done[2]; /* upload into buffer i finished; the compute that last used buffer i finished */
@@ -232,6 +234,71 @@ static void axr_take(gpu_state *d, const batch *b, int i, int B, int P) {
     memcpy(d->axh[i], b->axr, axr_bytes(B, P));
     d->axn[i] = B; d->axs[i] = (int)axr_floats(P);
 }
+/* --attn-mem: window memory carried along the sampler's window chains (sample_cfg.chain_p). Per GPU a bank of the latest memory output
+   per chain (device rows, a constant: stop-gradient); a chain window whose predecessor's entry is there gets it with its offset, the rest
+   (chain starts, other GPUs' predecessors, evicted entries, validation) zero memory with valid 0 */
+static int g_mem;
+#define MEMBANK 64
+typedef struct { int64_t id[MEMBANK]; int idx[MEMBANK]; float *dev[MEMBANK]; int next; float *stage; size_t stage_n; long hits, misses; } mem_bank;
+static mem_bank g_mb[8];
+static void chain_take(gpu_state *d, const batch *b, int i, int B) {
+    if (!g_mem) return;
+    d->chv[i] = b->chid != nullptr;
+    if (!b->chid) return;
+    if (!d->chh[i]) { d->chh[i] = malloc(64 * sizeof(int64_t)); d->chih[i] = malloc(64 * sizeof(int)); d->choh[i] = malloc(64 * 3 * sizeof(float)); if (!d->chh[i] || !d->chih[i] || !d->choh[i] || B > 64) abort(); }
+    memcpy(d->chh[i], b->chid, (size_t)B * sizeof(int64_t)); memcpy(d->chih[i], b->chidx, (size_t)B * sizeof(int)); memcpy(d->choh[i], b->choff, (size_t)B * 3 * sizeof(float));
+}
+static void mem_pre(gpu_state *d, int B, int train) {
+    if (!g_mem) return;
+    if (!train || !d->chv[d->cur]) { unet_set_attn_mem(d->u, nullptr, nullptr, 0); return; }
+    mem_bank *mb = &g_mb[d->dev & 7]; const int M = unet_cfg_of(d->u)->attn_mem, C = unet_cfg_of(d->u)->widths[unet_cfg_of(d->u)->nlev - 1];
+    const size_t row = (size_t)M * C;
+    if (mb->stage_n < (size_t)B * row) { if (mb->stage) nn_free(mb->stage); mb->stage = nn_malloc((size_t)B * row * 4); mb->stage_n = (size_t)B * row; }
+    float feat[64 * 4];
+    for (int s = 0; s < B; s++) {
+        const int64_t id = d->chh[d->cur][s]; const int idx = d->chih[d->cur][s]; int e = -1;
+        if (id >= 0 && idx > 0) for (int k = 0; k < MEMBANK; k++) if (mb->dev[k] && mb->id[k] == id && mb->idx[k] == idx - 1) { e = k; break; }
+        if (id >= 0 && idx > 0) { if (e >= 0) mb->hits++; else mb->misses++; }
+        if (e >= 0) nn_d2d(mb->stage + s * row, mb->dev[e], row * 4); else nn_zero(mb->stage + s * row, row * 4);
+        for (int k = 0; k < 3; k++) feat[4 * s + k] = e >= 0 ? d->choh[d->cur][3 * s + k] : 0.f;
+        feat[4 * s + 3] = e >= 0 ? 1.f : 0.f;
+    }
+    unet_set_attn_mem(d->u, mb->stage, feat, B);
+}
+static void mem_post(gpu_state *d, int B, int train) {   /* after a training forward: its memory rows into the bank under (chain, index) */
+    if (!g_mem || !train || !d->chv[d->cur]) return;
+    mem_bank *mb = &g_mb[d->dev & 7]; int M, C; const float *out = unet_attn_mem_out(d->u, &M, &C);
+    if (!out) return;
+    const size_t row = (size_t)M * C;
+    for (int s = 0; s < B; s++) {
+        const int64_t id = d->chh[d->cur][s]; if (id < 0) continue;
+        int e = -1;
+        for (int k = 0; k < MEMBANK; k++) if (mb->dev[k] && mb->id[k] == id) { e = k; break; }
+        if (e < 0) { e = mb->next; mb->next = (mb->next + 1) % MEMBANK; }
+        if (!mb->dev[e]) mb->dev[e] = nn_malloc(row * 4);
+        nn_d2d(mb->dev[e], out + s * row, row * 4); mb->id[e] = id; mb->idx[e] = d->chih[d->cur][s];
+    }
+}
+/* --view-P (scan fusion): the batch's view crops (sample.h batch.xv) copied for buffer i (the batch goes back to the sampler); view_set
+   uploads them before the forward (the device copy is read by the forward alone) */
+static int g_view;
+static void view_take(gpu_state *d, const batch *b, int i, int B, int async) {
+    (void)async;
+    if (!g_view) return;
+    d->vv[i] = b->xv != nullptr;
+    if (!b->xv) return;
+    const size_t n = (size_t)B * g_view * g_view * g_view;
+    if (d->vhn[i] < n) { free(d->vh[i]); d->vh[i] = malloc(n); d->vhn[i] = n; if (!d->vh[i]) abort(); }
+    memcpy(d->vh[i], b->xv, n);
+}
+static void view_set(gpu_state *d, int B) {
+    if (!g_view) return;
+    if (!d->vv[d->cur]) { unet_set_attn_view(d->u, nullptr, 0); return; }
+    const size_t n = (size_t)B * g_view * g_view * g_view;
+    if (d->vdn < n) { if (d->vd) nn_free(d->vd); d->vd = nn_malloc(n); d->vdn = n; }
+    nn_h2d(d->vd, d->vh[d->cur], n);
+    unet_set_attn_view(d->u, d->vd, B);
+}
 static void axr_set(gpu_state *d, int i) { if (g_axr) unet_set_attn_axis(d->u, d->axv[i] ? d->axh[i] : nullptr, d->axn[i], d->axs[i]); }
 /* once the memory mode is set: the GPU-built input needs the 16-bit -> MX input conversion (unet_input_converted: MX activations with
    MX gradients or an input policy) */
@@ -279,7 +346,7 @@ static size_t host_mem_available(void) {
     return avail;
 }
 /* the host arrays of a batch in this run's layout: the addresses of its members and their sizes (validation copies, --val-store) */
-enum { VAL_DISK, VAL_RAM, VAL_REGEN, VAL_NF = 16 };
+enum { VAL_DISK, VAL_RAM, VAL_REGEN, VAL_NF = 20 };
 static int val_fields(batch *b, int B, size_t p3, void **f[VAL_NF], size_t sz[VAL_NF]) {
     int n = 0;
 #define VF(p_, s_) do { f[n] = (void **)&(p_); sz[n++] = (s_); } while (0)
@@ -295,6 +362,7 @@ static int val_fields(batch *b, int B, size_t p3, void **f[VAL_NF], size_t sz[VA
     if (g_unwrap2) { VF(b->w4, (size_t)B * p3); VF(b->wcomp, (size_t)B * p3); }
     if (g_cond) VF(b->wind, (size_t)B * p3);
     if (g_pap_head) VF(b->pap, (size_t)B * p3);
+    if (g_view) { VF(b->xv, (size_t)B * g_view * g_view * g_view); VF(b->vok, (size_t)B); }   /* (after the fields of runs without views: their hash unchanged) */
 #undef VF
     return n;
 }
@@ -358,7 +426,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     d->um = d->umb[d->cur] = b->um ? b->um[0] : 0.f;
     if (b->corner && b->level) { memcpy(d->cornb[d->cur], b->corner[0], sizeof d->cornb[0]); d->lvlb[d->cur] = b->level[0]; }   /* validation copies carry none */
     d->srcb[d->cur] = b->src ? b->src[0] : -1;
-    axr_take(d, b, d->cur, B, P); if (g_restore || d->side >= 0) d->axv[d->cur] = 0; axr_set(d, d->cur);
+    axr_take(d, b, d->cur, B, P); if (g_restore || d->side >= 0) d->axv[d->cur] = 0; axr_set(d, d->cur); chain_take(d, b, d->cur, B); view_take(d, b, d->cur, B, 0);
     if (g_restore) { restore_upload(d, b, d->cur, B, P, 0); return; }
     if (d->side >= 0) { upload_slab(d, b, d->cur, B, P, 0); return; }
     size_t p3 = (size_t)g_Pz * P * P;
@@ -385,7 +453,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     d->umb[i] = b->um ? b->um[0] : 0.f;
     if (b->corner && b->level) { memcpy(d->cornb[i], b->corner[0], sizeof d->cornb[0]); d->lvlb[i] = b->level[0]; }
     d->srcb[i] = b->src ? b->src[0] : -1;
-    axr_take(d, b, i, B, P); if (g_restore || d->side >= 0) d->axv[i] = 0;
+    axr_take(d, b, i, B, P); if (g_restore || d->side >= 0) d->axv[i] = 0; chain_take(d, b, i, B); view_take(d, b, i, B, 1);
     size_t p3 = (size_t)g_Pz * P * P;
     if (d->upsplit) {   /* the head now, after the backward's last read of X2 and the records; the tail with upload_tail */
         nn_stream_wait(1, unet_l0_3buf_head_free(d->u));
@@ -705,6 +773,8 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     if (g_verso_on) verso_target(d, xs);
     const int q = P / g_hdiv, hm = unet_hr_mode(g_half);
     const shape5 hs = {B, g_cout, q, q, q};   /* --half-res: the network's grid, the full-resolution output channels */
+    mem_pre(d, B, train);
+    view_set(d, B);
     const float *lg;
     if (g_restore && g_rpairs) {   /* real pairs: the input crop (target row 1) upsampled x4 onto the window, then (x - 128) / 64 */
         const float st4[3] = {4.f, 4.f, 4.f}, ph0[3] = {0.f, 0.f, 0.f}; const size_t p3_ = (size_t)g_Pz * P * P;
@@ -726,6 +796,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         lg = d->lgf;
     } else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
     d->lg = lg;
+    mem_post(d, B, train);
     if (train && !g_half && !g_head_slab && !g_pkf) diag_nonfinite(d, "logits", lg, (size_t)B * g_cout * xs.d * P * P, unet_logits_h16(d->u) ? 1 : 0);   /* (UFSM_SYNC_CHECK) */
     d->ds_fresh = g_ds && train;   /* validation batches have no deep-supervision losses */
     if (g_ds && train) {   /* deep supervision: each supervised decoder level's logits against the targets / mask max- / any-pooled to its grid */
@@ -1292,10 +1363,13 @@ int cmd_train(int argc, char **argv) {
         cfg.attn_axis = !strcmp(ax, "full") ? 0 : !strcmp(ax, "radial") ? 1 : -1;
         if (cfg.attn_axis < 0) { fprintf(stderr, "--attn-axis full|radial\n"); return 2; }
         cfg.attn_repeat = atoi(opt(argc, argv, "--attn-repeat", "0"));   /* weight-tied repetitions of the blocks */
+        cfg.attn_mem = atoi(opt(argc, argv, "--attn-mem", "0"));   /* window memory tokens (unet_cfg.attn_mem; trained on --chain-p window chains) */
+        cfg.view_P = atoi(opt(argc, argv, "--view-P", "0")); cfg.view_patch = atoi(opt(argc, argv, "--view-patch", "8"));   /* scan fusion: view crops (sources "view", src/view.h) as view rows */
+        if (!cfg.view_P) cfg.view_patch = 0;
     }
     cfg.w4_2d = atoi(opt(argc, argv, "--w4-2d", "0"));   /* consistent fp4 weights (unet_cfg.w4_2d): one scale per 32 x 32 block and tap */
     if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.w4_2d = pc.w4_2d; cfg.down_norm = pc.down_norm; cfg.l0_norm = pc.l0_norm; cfg.l0_slab = pc.l0_slab; cfg.scale_cond = pc.scale_cond; memcpy(cfg.dec_widths, pc.dec_widths, sizeof cfg.dec_widths); cfg.ds_levels = pc.ds_levels; memcpy(cfg.dec_convs, pc.dec_convs, sizeof cfg.dec_convs); memcpy(cfg.enc_blocks, pc.enc_blocks, sizeof cfg.enc_blocks);
-                  cfg.attn_blocks = pc.attn_blocks; cfg.attn_pe = pc.attn_pe; cfg.attn_reg = pc.attn_reg; cfg.attn_mlp = pc.attn_mlp; cfg.attn_axis = pc.attn_axis; cfg.attn_repeat = pc.attn_repeat; } }   /* the checkpoint decides */
+                  cfg.attn_blocks = pc.attn_blocks; cfg.attn_pe = pc.attn_pe; cfg.attn_reg = pc.attn_reg; cfg.attn_mlp = pc.attn_mlp; cfg.attn_axis = pc.attn_axis; cfg.attn_repeat = pc.attn_repeat; cfg.attn_mem = pc.attn_mem; cfg.view_P = pc.view_P; cfg.view_patch = pc.view_patch; } }   /* the checkpoint decides */
     if (cfg.w4_2d) fprintf(stderr, "weights: consistent MX-fp4 (--w4-2d 1): one scale per 32 x 32 block and tap, the same values in the forward and backward-data\n");
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,80")); cfg.nlev = 0; for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "P must be divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
@@ -1385,6 +1459,15 @@ int cmd_train(int argc, char **argv) {
     if (g_axr && split) { fprintf(stderr, "--attn-axis radial / --attn-pe scroll: not with --split z\n"); return 2; }
     if (g_axr) fprintf(stderr, "attention: %s, %s positions around each window's scroll axis\n", cfg.attn_axis ? "radial (along the rays from the axis)" : "full", cfg.attn_pe == 3 ? "scroll RoPE" : "grid");
     sc.deterministic = atoi(opt(argc, argv, "--det", "0"));   /* same batches for the same seed regardless of thread timing (paired comparisons; off: a slow worker can stall the ring) */
+    g_mem = cfg.attn_blocks > 0 && cfg.attn_mem > 0;   /* window memory tokens, trained along window chains */
+    g_view = cfg.attn_blocks > 0 ? cfg.view_P : 0; sc.view_P = g_view;   /* scan fusion: the sampler's view crops */
+    if (cfg.view_P && (cfg.attn_blocks <= 0 || cfg.attn_axis || split || g_restore || cfg.view_patch <= 0 || cfg.view_P % cfg.view_patch || cfg.view_P & 1)) {
+        fprintf(stderr, "--view-P: needs --attn-blocks, full attention, no --split / restore, an even size that --view-patch divides\n"); return 2; }
+    if (g_view) { int nv = 0; for (int i = 0; i < S->n; i++) nv += S->src[i].view; fprintf(stderr, "attention: scan fusion: %d^3 view crops, %d^3 patches -> %d view rows per window; %d of %d sources with a view\n", cfg.view_P, cfg.view_patch, (cfg.view_P / cfg.view_patch) * (cfg.view_P / cfg.view_patch) * (cfg.view_P / cfg.view_patch), nv, S->n); }
+    sc.chain_p = (float)atof(opt(argc, argv, "--chain-p", "0")); sc.chain_len = atoi(opt(argc, argv, "--chain-len", "8")); sc.chain_step = (float)atof(opt(argc, argv, "--chain-step", "0.5"));
+    if (cfg.attn_mem > 0 && (cfg.attn_blocks <= 0 || cfg.attn_axis)) { fprintf(stderr, "--attn-mem: needs --attn-blocks and full attention\n"); return 2; }
+    if (sc.chain_p > 0 && (!g_mem || sc.deterministic || split || sc.chain_len < 2 || !(sc.chain_step > 0))) { fprintf(stderr, "--chain-p: needs --attn-mem, --det 0, no --split, --chain-len >= 2, --chain-step > 0\n"); return 2; }
+    if (g_mem) fprintf(stderr, "attention: %d window memory tokens; window chains: %s\n", cfg.attn_mem, sc.chain_p > 0 ? "on" : "off (--chain-p 0: the memory input stays zero)");
     if (noaug) sc.augment = 0;
     if (atoi(opt(argc, argv, "--rotonly", "0"))) sc.augment = 2;   /* proper rotations only (no reflections) */
     if (atoi(opt(argc, argv, "--zfix", "0"))) sc.augment = 3;      /* diagnostic: symmetries that keep the z axis */
@@ -1573,6 +1656,8 @@ int cmd_train(int argc, char **argv) {
         gpu_state *d = &G[g];
         d->dev = devs[g]; d->side = split ? g : -1;
         d->axh[0] = d->axh[1] = nullptr; d->axv[0] = d->axv[1] = d->axn[0] = d->axn[1] = d->axs[0] = d->axs[1] = 0;
+        d->chh[0] = d->chh[1] = nullptr; d->chih[0] = d->chih[1] = nullptr; d->choh[0] = d->choh[1] = nullptr; d->chv[0] = d->chv[1] = 0;
+        d->vh[0] = d->vh[1] = d->vd = nullptr; d->vhn[0] = d->vhn[1] = d->vdn = 0; d->vv[0] = d->vv[1] = 0;
         if (nn_init(d->dev)) { fprintf(stderr, "cannot select GPU %d\n", d->dev); return 1; }
         d->u = unet_create(&cfg);
         unet_set_l0_ema(d->u, (float)atof(opt(argc, argv, "--l0-mom", "0.01")), atoi(opt(argc, argv, "--l0-warm", "100")));   /* --l0-norm ema */
@@ -2257,6 +2342,7 @@ int cmd_train(int argc, char **argv) {
                     else { cp->x = malloc((size_t)B * g_xs * p3b * 4); memcpy(cp->x, b->x, (size_t)B * g_xs * p3b * 4); }
                     if (g_gpu_in) { cp->rad = malloc(rad_bytes(B)); memcpy(cp->rad, b->rad, rad_bytes(B)); }
                     if (g_axr) { cp->axr = malloc(axr_bytes(B, P)); memcpy(cp->axr, b->axr, axr_bytes(B, P)); }
+                    if (g_view) { const size_t nv_ = (size_t)B * g_view * g_view * g_view; cp->xv = malloc(nv_); memcpy(cp->xv, b->xv, nv_); }
                     cp->t = malloc((size_t)B * NCH * p3b); memcpy(cp->t, b->t, (size_t)B * NCH * p3b);
                     cp->m = malloc((size_t)B * p3b); memcpy(cp->m, b->m, (size_t)B * p3b);
                     cp->w = malloc((size_t)B * NCH); memcpy(cp->w, b->w, (size_t)B * NCH);
@@ -2580,6 +2666,8 @@ int cmd_train(int argc, char **argv) {
     uint64_t why[4]; sampler_reject_reasons(sp, why);
     fprintf(stderr, "done in %.0fs; sampler produced %llu, rejected %llu (coarse probe %llu, after the CT read %llu, empty targets %llu; holdout overlaps %llu)\n",
             now() - t0, (unsigned long long)prod, (unsigned long long)rej, (unsigned long long)why[0], (unsigned long long)why[1], (unsigned long long)why[2], (unsigned long long)why[3]);
+    if (g_mem) { long h = 0, mi = 0; for (int k = 0; k < 8; k++) { h += g_mb[k].hits; mi += g_mb[k].misses; }
+                 fprintf(stderr, "window memory: %ld chain windows with their predecessor's memory, %ld without (evicted / out of order)\n", h, mi); }
     sampler_prof_print(sp);   /* UFSM_SAMPLER_PROF=1: per-stage cpu ms per patch */
     int sampling_failed = sampler_failed(sp);
     sampler_stop(sp);

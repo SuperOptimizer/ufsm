@@ -637,9 +637,84 @@ __global__ void k_reg_grad(const float *gt, float *greg, int n, int C, long long
     for (int s = 0; s < n; s++) a += gt[(long long)s * (Sg + nreg) * C + i];
     greg[i] += a;
 }
+__global__ void k_mem_add(float *t, int n, int S, int r0, int M, int C, const float *gate, const float *woff, const float *mem, const float *feat) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i >= (long long)n * M * C) return;
+    const int c = (int)(i % C), j = (int)((i / C) % M), s = (int)(i / ((long long)M * C));
+    float a = gate[c] * mem[i];
+    for (int k = 0; k < 4; k++) a += woff[k * C + c] * feat[s * 4 + k];
+    t[((long long)s * S + r0 + j) * C + c] += a;
+}
+__global__ void k_mem_grad(const float *gt, int n, int S, int r0, int M, int C, const float *mem, const float *feat, float *ggate, float *gwoff) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float a = 0.f, b[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int s = 0; s < n; s++) for (int j = 0; j < M; j++) {
+        const float g = gt[((long long)s * S + r0 + j) * C + c];
+        a += g * mem[((long long)s * M + j) * C + c];
+        for (int k = 0; k < 4; k++) b[k] += g * feat[s * 4 + k];
+    }
+    ggate[c] += a;
+    for (int k = 0; k < 4; k++) gwoff[k * C + c] += b[k];
+}
+__global__ void k_mem_out(const float *t, int n, int S, int r0, int M, int C, float *mout) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i >= (long long)n * M * C) return;
+    const int c = (int)(i % C), j = (int)((i / C) % M), s = (int)(i / ((long long)M * C));
+    mout[i] = t[((long long)s * S + r0 + j) * C + c];
+}
+extern "C" void at_mem_add(float *t, int n, int S, int r0, int M, int C, const float *gate, const float *woff, const float *mem, const float *feat) {
+    if (n * M) k_mem_add<<<nbk((long long)n * M * C, 256), 256>>>(t, n, S, r0, M, C, gate, woff, mem, feat);
+}
+extern "C" void at_mem_grad(const float *gt, int n, int S, int r0, int M, int C, const float *mem, const float *feat, float *ggate, float *gwoff) {
+    if (n * M) k_mem_grad<<<nbk(C, 128), 128>>>(gt, n, S, r0, M, C, mem, feat, ggate, gwoff);
+}
+extern "C" void at_mem_out(const float *t, int n, int S, int r0, int M, int C, float *mout) {
+    if (n * M) k_mem_out<<<nbk((long long)n * M * C, 256), 256>>>(t, n, S, r0, M, C, mout);
+}
 extern "C" void at_cs_to_tok(const float *x, float *t, const float *reg, int n, int C, long Sg, int nreg) { k_cs_to_tok<<<nbk((long long)n * (Sg + nreg) * C, 256), 256>>>(x, t, reg, n, C, Sg, nreg); }
 extern "C" void at_tok_to_cs(const float *t, float *x, int n, int C, long Sg, int nreg) { k_tok_to_cs<<<nbk((long long)n * C * Sg, 256), 256>>>(t, x, n, C, Sg, nreg); }
 extern "C" void at_reg_grad(const float *gt, float *greg, int n, int C, long Sg, int nreg) { if (nreg) k_reg_grad<<<nbk(nreg * C, 256), 256>>>(gt, greg, n, C, Sg, nreg); }
+
+/* scan fusion view rows (src/attn.h at_view_*) */
+__global__ void k_view_patch(const unsigned char *v, int n, int Pv, int k, float *xp) {
+    const int G = Pv / k, k3 = k * k * k; const long long Nv = (long long)G * G * G;
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i >= (long long)n * Nv * k3) return;
+    const int q = (int)(i % k3); const long long r = i / k3; const int j = (int)(r % Nv), s = (int)(r / Nv);
+    const int pz = j / (G * G), py = (j / G) % G, px = j % G, a = q / (k * k), b = (q / k) % k, c = q % k;
+    xp[i] = v ? (float)v[(long long)s * Pv * Pv * Pv + ((long long)(pz * k + a) * Pv + (py * k + b)) * Pv + px * k + c] * (1.f / 255.f) : 0.f;
+}
+__global__ void k_view_add(float *t, int n, int S, int r0, int Nv, int C, const float *E, const float *bias) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i >= (long long)n * Nv * C) return;
+    const int c = (int)(i % C); const long long r = i / C; const int j = (int)(r % Nv), s = (int)(r / Nv);
+    t[((long long)s * S + r0 + j) * C + c] += E[i] + bias[c];
+}
+__global__ void k_view_gather(const float *gt, int n, int S, int r0, int Nv, int C, float *GE) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i >= (long long)n * Nv * C) return;
+    const int c = (int)(i % C); const long long r = i / C; const int j = (int)(r % Nv), s = (int)(r / Nv);
+    GE[i] = gt[((long long)s * S + r0 + j) * C + c];
+}
+__global__ void k_colsum_acc(const float *GE, long long R, int C, float *gb) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float a = 0.f; for (long long r = 0; r < R; r++) a += GE[r * C + c];
+    gb[c] += a;
+}
+extern "C" void at_view_patch(const unsigned char *v, int n, int Pv, int k, float *xp) {
+    const long long G = Pv / k, tot = (long long)n * G * G * G * k * k * k;
+    if (tot) k_view_patch<<<nbk(tot, 256), 256>>>(v, n, Pv, k, xp);
+}
+extern "C" void at_view_add(float *t, int n, int S, int r0, int Nv, int C, const float *E, const float *bias) {
+    if ((long long)n * Nv) k_view_add<<<nbk((long long)n * Nv * C, 256), 256>>>(t, n, S, r0, Nv, C, E, bias);
+}
+extern "C" void at_view_gather(const float *gt, int n, int S, int r0, int Nv, int C, float *GE, float *gb) {
+    if (!((long long)n * Nv)) return;
+    k_view_gather<<<nbk((long long)n * Nv * C, 256), 256>>>(gt, n, S, r0, Nv, C, GE);
+    k_colsum_acc<<<nbk(C, 128), 128>>>(GE, (long long)n * Nv, C, gb);
+}
 
 /* 16-bit storage (fp16 when f16, else bf16) -> fp32 */
 #include <cuda_fp16.h>

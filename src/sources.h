@@ -111,6 +111,9 @@ typedef struct {
     int ct_only;      /* "ct_only": 1: the source is drawn without any target (every channel's w = 0, mask = CT > 0): label-free terms */
     struct srpair *srp;     /* optional "sr_pair": {"role": "train" | "val", "lut": 1, "cache": 0} (src/srpair.h): the source is a real SR pair directory ("root");
                                task restore then reads its boxes instead of the CT (no CT levels are opened) */
+    int view, view_level; char *view_map;   /* optional "view": {"map": REG.json (omit: this scan itself), "level": L (default 0)}: the second-scan
+                                               view of scan fusion (src/view.h; sample_cfg.view_P), opened by the sampler (view_h) */
+    struct sview *view_h;
     float norm_c, norm_s;   /* optional "norm": {"center": c, "scale": s} (scanprep stats: median, scale): the CT input is (v - c) / s for this
                                source instead of the window's own z-score (norm_s 0: off, the default) */
 } source;

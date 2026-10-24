@@ -65,6 +65,14 @@ typedef struct {
                               no registers). No parameters of its own (a full-attention donor's blocks load) */
     int attn_repeat;       /* weight-tied repetition (0 / 1: once): the attn_blocks blocks run attn_repeat times in sequence, the same
                               parameters each time (attn_blocks x attn_repeat <= UNET_MAXTA) */
+    int attn_mem;          /* window memory tokens (full attention only; 0 off): attn_mem register-like rows after the attn_reg registers, each
+                              learned + gate (x) the previous window's memory output (unet_set_attn_mem: a constant, i.e. stop-gradient as in
+                              Transformer-XL) + W_off (dz, dy, dx, valid) (the offset from that window, over the window size); gate and W_off
+                              zero-initialised. unet_attn_mem_out: this forward's memory rows after the last block (the next window's input) */
+    int view_P, view_patch;   /* scan fusion (full attention; 0 off): a second scan's view_P^3 crop centred on the window (unet_set_attn_view,
+                              src/view.h) as (view_P / view_patch)^3 extra register-like rows after the memory rows: each a learned row (its
+                              position) + a linear embedding of its view_patch^3 patch (v / 255) + bias; the grid tokens attend to them in
+                              every block (joint attention). A fresh stage stays the identity */
 } unet_cfg;
 static inline int unet_hr_div(int hr) { return hr >= 3 ? 4 : hr ? 2 : 1; }      /* the window voxels per network voxel along each axis */
 static inline int unet_hr_mode(int hr) { return hr == 2 || hr == 4 ? 2 : 1; }   /* the last stage: 1 pool, 2 pack (nn_half_*) */
@@ -262,6 +270,15 @@ void unet_set_attn_keep(int on);   /* the attention stage keeps each block's tra
 /* the scroll axis of every sample of the following forwards (cfg.attn_axis 1 / attn_pe 3): n records of stride floats (UNET_AXR, host),
    copied; kept until replaced. Without any (or a count / size mismatch) the stage uses no axis: the rays are grid rows */
 void unet_set_attn_axis(unet *u, const float *rec, int n, int stride);
+/* window memory (cfg.attn_mem): the next forwards' memory input. mem: device [n][attn_mem][C] (the previous windows' unet_attn_mem_out,
+   copied into the network at the forward, so it may change after it), feat: host [n][4] (dz, dy, dx over the window size, valid); either
+   nullptr: zero (a chain start). Kept until replaced */
+void unet_set_attn_mem(unet *u, const float *mem, const float *feat, int n);
+/* the memory rows of the last forward after the stage, device [n][attn_mem][C] (nullptr without memory or a forward); *M, *C */
+const float *unet_attn_mem_out(const unet *u, int *M, int *C);
+/* scan fusion (cfg.view_P): the next forwards' view crops, device uint8 [n][view_P^3] (the window's symmetry applied; read at the forward and
+   the backward, so kept unchanged until then); nullptr or n <= 0: zero crops. Kept until replaced */
+void unet_set_attn_view(unet *u, const uint8_t *view, int n);
 /* the attention stage's ray plan of the last forward (radial): rays per sample, slots per ray, covered grid tokens / all (tests, logs) */
 int unet_attn_rays(const unet *u, int *Q, int *Nr, double *coverage);
 void unet_set_wd_nonconv(unet *u, float mul);

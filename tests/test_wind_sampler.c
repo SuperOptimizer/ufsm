@@ -63,6 +63,69 @@ int main(int argc, char **argv) {
     int det = 1;
     for (int i = 0; i < NB; i++) det &= !memcmp(d[i].x, b[i].x, p3 * 2) && !memcmp(d[i].tm, b[i].tm, p3) && !memcmp(d[i].w4, b[i].w4, p3) && !memcmp(d[i].side, b[i].side, p3);
     check("deterministic batches: 3 workers / 5 slots = 1 worker / 2 slots", det);
+    {   /* window chains (--chain-p 1 --chain-len 4, no geometry augmentation: the window frame is the volume frame): per batch slot, each
+           window continues its slot's chain (same id, index + 1, same source and level) or starts a new one at index 0; a continuation's
+           offset is its corner step / P, nonzero, at most chain_step * P per axis (along the axis: z +- step, y / x following the axis) */
+        sample_cfg c3 = c; c3.deterministic = 0; c3.nworkers = 1; c3.nbuf = 2; c3.B = 2; c3.geometry_augment = 0; c3.augment = 0;
+        c3.chain_p = 1.f; c3.chain_len = 4; c3.chain_step = .5f;
+        sampler *sc = sampler_start(S, &c3); assert(sc);
+        int64_t pid[2] = {-1, -1}, pco[2][3]; int pidx[2] = {0, 0}, psrc[2] = {0, 0}, plev[2] = {0, 0}, ok = 1, ncont = 0, nstart = 0;
+        for (int it = 0; it < 24; it++) {
+            batch *bb = sampler_next(sc); assert(bb && bb->chid);
+            for (int i = 0; i < 2; i++) {
+                const int64_t id = bb->chid[i]; const int ix = bb->chidx[i]; const float *of = bb->choff + 3 * i;
+                if (id < 0) { ok = 0; continue; }   /* (chain_p 1: every window is chained) */
+                if (ix == 0) { nstart++; ok &= of[0] == 0 && of[1] == 0 && of[2] == 0; }
+                else {
+                    ncont++;
+                    ok &= id == pid[i] && ix == pidx[i] + 1 && ix < 4 && bb->src[i] == psrc[i] && bb->level[i] == plev[i];
+                    double mx = 0;
+                    for (int d = 0; d < 3; d++) {
+                        const double st = (double)((bb->corner[i][d] - pco[i][d]) >> bb->level[i]) / PW;
+                        ok &= fabs(st - of[d]) < 1e-6; mx = fmax(mx, fabs(of[d]));
+                    }
+                    ok &= mx > 0 && mx <= .5 + 1e-6;
+                }
+                pid[i] = id; pidx[i] = ix; psrc[i] = bb->src[i]; plev[i] = bb->level[i]; memcpy(pco[i], bb->corner[i], sizeof pco[i]);
+            }
+            sampler_release(sc, bb);
+        }
+        sampler_stop(sc);
+        printf("wind sampler: chains: %d starts, %d continuations\n", nstart, ncont);
+        check("window chains: ids / indices / offsets consistent per slot", ok && ncont >= 12 && nstart > 0);
+    }
+    {   /* scan fusion views (view_P 32, every source's "view" = its own CT level 0, no augmentation: identity symmetry): each window's
+           crop is the level-0 CT box of 32^3 centred on the window (sview_origin), vok set; crops inside the volume compared voxel for voxel;
+           windows of level rung 0 and 1 (a level-1 window's crop: the 2x finer level-0 detail at its centre) */
+        for (int si = 0; si < S->n; si++) { S->src[si].view = 1; S->src[si].view_level = 0; }
+        const int Pv = 32; const size_t pv3 = (size_t)Pv * Pv * Pv; uint8_t *ref = malloc(pv3);
+        int ok = 1, ncmp = 0, nwin = 0, ncoarse = 0;
+        for (int rung = 0; rung < 2; rung++) {
+            sample_cfg c4 = c; c4.deterministic = 0; c4.nworkers = 1; c4.nbuf = 2; c4.B = 2; c4.geometry_augment = 0; c4.augment = 0; c4.view_P = 32;
+            memset(c4.level_p, 0, sizeof c4.level_p); c4.level_p[rung] = 1;
+            sampler *sv = sampler_start(S, &c4); assert(sv);
+            for (int it = 0; it < 8; it++) {
+                batch *bb = sampler_next(sv); assert(bb && bb->xv && bb->vok);
+                for (int i = 0; i < 2; i++) {
+                    nwin++; ok &= bb->vok[i] == 1;
+                    const int l = bb->level[i]; z3 *ct = source_ct(&S->src[bb->src[i]], 0); assert(ct);
+                    const int64_t o[3] = {bb->corner[i][0] >> l, bb->corner[i][1] >> l, bb->corner[i][2] >> l}, wn[3] = {PW, PW, PW}, pn[3] = {Pv, Pv, Pv};
+                    int64_t vo[3]; sview_origin(l, 0, o, wn, Pv, vo);
+                    const int64_t *sh = z3_meta_of(ct)->shape; int in = 1;
+                    for (int d = 0; d < 3; d++) in &= vo[d] >= 0 && vo[d] + Pv <= sh[d];
+                    if (!in) continue;
+                    ok &= !z3_read(ct, vo, pn, ref, 1) && !memcmp(ref, bb->xv + (size_t)i * pv3, pv3); ncmp++;
+                    ncoarse += l > 0;
+                }
+                sampler_release(sv, bb);
+            }
+            sampler_stop(sv);
+        }
+        free(ref);
+        for (int si = 0; si < S->n; si++) S->src[si].view = 0;
+        printf("wind sampler: views: %d windows, %d crops compared (%d of coarser windows)\n", nwin, ncmp, ncoarse);
+        check("scan fusion views: crop = the level-0 CT box centred on the window", ok && ncmp > 0 && ncoarse > 0);
+    }
     drop(a); drop(b); drop(d); sources_free(S);
     {   /* sparse labels: a stored phase known in one of the 8 chunks of a 512 fixture's level-1 grid; windows are drawn around it
            (the phase-chunk occupancy index), none rejected for lack of CT, most of them labelled */

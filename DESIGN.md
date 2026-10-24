@@ -67,6 +67,36 @@ No teacher models, no distillation. All upstream data is re-exported once into t
   exp2(s - lse) inf and the masked row's 0 x inf NaN (the k-gain gradients; 14-28 skipped steps per 500 before the fix; test_attn_ray
   test_masked_keys). Smoke (laptop, unwrap2 wind96 widths, P256, 2 blocks radial + scroll, 500 steps): no non-finite steps, 4.83
   samples/s vs 4.99 without the stage (~3 percent); P512 one-batch step 1.39 s none / 1.41 full / 1.41 radial.
+- Window memory tokens (2026-10-24, default off: `unet_cfg.attn_mem` M; train `--attn-mem M --chain-p p --chain-len L --chain-step s`;
+  Transformer-XL style, no extra batch memory). M token rows follow the registers in every attention sequence; row j = learned row +
+  gate (x) mem_in[j] + W_off (dz, dy, dx, valid) (gate and W_off zero-initialised: a fresh stage stays the identity). After the last block
+  the rows are the window's memory output (unet_attn_mem_out). The sampler draws window chains (sample_chain_next: with probability p a
+  fresh draw starts a chain; the slot's next L - 1 draws walk s x P from it along the scroll axis or around it, same source / level /
+  symmetry, no zoom-out / spatial warp; batch chid / chidx / choff). train keeps a per-GPU bank (64 entries) of each chain's latest
+  memory output (device rows, a constant: stop-gradient) and feeds the successor its predecessor's rows with the offset (window frame,
+  / P) and valid 1; chain starts, misses and validation get zero memory with valid 0. predict carries the memory from the previous window in its
+  walk order when that lies within a window size (else zero); TTA passes run without memory. Needs full attention (not radial). Tests: test_attn_ray test_mem
+  (add / gate / W_off gradients / out vs double), test_hybrid_identity (identity with a random memory, a random stage: memory changes the
+  logits, none = zero memory bit for bit, gate / W_off gradients nonzero, the carried rows change the next window, checkpoint),
+  test_wind_sampler (chain ids / indices / offsets per slot). The stage builds lazily at the first forward: the build no longer resets
+  the set memory (it made the first window's memory zero).
+  Smoke (laptop, unwrap2 wind96 widths, P256, 2 full blocks, 300 steps, 3 workers; sampler-bound): 4.40 samples/s vs 4.66 without
+  memory, every continuation (215) got its predecessor's memory, no non-finite steps.
+- Scan fusion as joint attention (2026-10-24, default off: `unet_cfg.view_P`, `view_patch`; train `--view-P Pv --view-patch k` (8);
+  sources `"view": {"level": L, "map": REG.json}`; predict `--view-level L [--view-map REG.json]`). Per window a Pv^3 uint8 crop of a second
+  scan centred on the window (src/view.h sview_origin: level-L voxels of the source's grid, L <= the window level), either the scan itself
+  at a finer level (no map: e.g. the 2.4 um detail around a 9.6 um window) or a registered partner scan through a ufsm reg map
+  (fine(c) = A^-1 (c + D(c)), reg_read_fine + reg_resample, trilinear from the partner level nearest the voxel size; e.g. Paris 4
+  137 keV on the 78 keV grid: ~/ufsm-data/reg/pairs/PParis4_2to2/final/reg.json). The crop takes the window's cube symmetry (sym_u8);
+  windows with a view skip zoom-out and the spatial warp. In the stage the crop is cut into (Pv / k)^3 patches of k^3 voxels, each a token
+  row after the registers / memory rows: learned row (its position) + W patch / 255 + b; the grid tokens attend to them in every block
+  (the rows also get the blocks' updates), so a fresh stage is still the identity. No view (or a source without one) = zero patches.
+  Needs full attention. Tests: test_attn_ray test_view (patch / add / gather / bias gradient vs host), test_hybrid_identity (identity,
+  random stage: the view changes the logits, none = zero view bit for bit, W / b gradients nonzero, checkpoint), test_wind_sampler (the
+  crop = the CT box centred on the window).
+  Smoke (same setup, view_P 32 / patch 8 = 64 view rows beside 512 grid tokens): self view 4.40 samples/s vs 4.66; the Paris 4
+  137 keV scan through PParis4_2to2 (mirror reads) 4.02. Partner crops match the 78 keV crop where the partner exists (mean 45.9 vs
+  45.7) and are zero beyond its z range (coarse level-0 z ~42100..48700).
 - dino-train for large windows: `--head-slab Z` runs the 1^3 head per z-slab of Z planes (unet head slabs): no whole-window logits
   (P 512 at D 32: 8.6 GB of fp16 logits) and no dense fp32 logit gradient (17 GB) -- the points' embeddings are gathered per slab, and
   in the backward's head step their gradients are scattered into each slab's fp16 logit gradient. `--mem lean` sets train's smallest

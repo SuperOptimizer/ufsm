@@ -14,6 +14,7 @@
 #include "unet.h"
 #include "fit.h"
 #include "tta.h"
+#include "view.h"
 #include "sweep.h"
 #include "z3w.h"
 #include "zarr3.h"
@@ -441,12 +442,58 @@ static void pred_axis(unet *u, int valid, int D, const float *dy, const float *d
     unet_set_attn_axis(u, r, 1, UNET_AXR(D));
     free(r);
 }
+/* window memory (unet_cfg.attn_mem): the previous predicted window's memory rows (whole-window passes only: TTA and split passes run
+   without, as chain starts do in training) when it lies within a window size of this one */
+static float *g_pmem; static int64_t g_pmo[3]; static int g_pmv;
+static void pred_mem_in(unet *u, const int64_t o[3], int W) {
+    if (!unet_cfg_of(u)->attn_mem) return;
+    int near = g_pmv;
+    for (int d = 0; d < 3 && near; d++) near = llabs(o[d] - g_pmo[d]) <= W;
+    if (!near) { unet_set_attn_mem(u, nullptr, nullptr, 0); return; }
+    const float feat[4] = {(float)(o[0] - g_pmo[0]) / W, (float)(o[1] - g_pmo[1]) / W, (float)(o[2] - g_pmo[2]) / W, 1.f};
+    unet_set_attn_mem(u, g_pmem, feat, 1);
+}
+static void pred_mem_out(unet *u, const int64_t o[3]) {
+    int M, C; const float *out = unet_cfg_of(u)->attn_mem ? unet_attn_mem_out(u, &M, &C) : nullptr;
+    if (!out) return;
+    if (!g_pmem) g_pmem = nn_malloc((size_t)M * C * 4);
+    nn_d2d(g_pmem, out, (size_t)M * C * 4); memcpy(g_pmo, o, sizeof g_pmo); g_pmv = 1;
+    unet_set_attn_mem(u, nullptr, nullptr, 0);   /* (the next passes: TTA, split, until the next window sets its own) */
+}
+
+/* scan fusion (unet_cfg.view_P): per window the view crop centred on it (src/view.h; --view-level L on this scan's grid, --view-map
+   REG.json for a registered partner scan, else this scan itself at level L), as in training. Use the training window size: the crop
+   covers the window's centre whatever the window */
+static sview *g_pv; static z3 *g_pvself; static uint8_t *g_pvh, *g_pvd, *g_pvsave; static int g_pvP, g_pvlev;
+static int pred_view_open(const unet_cfg *cfg, const char *root, const char *key, int level, double um, const char *cache, const char *lvs, const char *map, int split) {
+    const int lv = atoi(lvs);
+    if (split) { fprintf(stderr, "predict: a scan-fusion checkpoint (view_P %d) does not run --split\n", cfg->view_P); return -1; }
+    if (lv < 0 || lv > level) { fprintf(stderr, "predict: --view-level %d must lie in 0..--level %d\n", lv, level); return -1; }
+    if (!(g_pv = sview_open(map, lv, um, cache))) return -1;
+    if (!map) { store *s = store_open(root); g_pvself = s ? pyramid_open_level(s, key, lv, um, cache) : nullptr; if (!g_pvself) { fprintf(stderr, "predict: cannot open level %d for the view\n", lv); return -1; } }
+    g_pvP = cfg->view_P; g_pvlev = level;
+    const size_t n = (size_t)g_pvP * g_pvP * g_pvP;
+    g_pvh = malloc(n); g_pvd = nn_malloc(n); g_pvsave = nn_malloc(n);
+    if (!g_pvh || !g_pvd || !g_pvsave) { fprintf(stderr, "predict: no memory for the view crops\n"); return -1; }
+    fprintf(stderr, "predict: scan fusion: %d^3 view crops at level %d (%s)\n", g_pvP, lv, map ? map : "this scan");
+    return 0;
+}
+static int pred_view_set(unet *u, const int64_t o[3], int Wz, int W) {   /* the window's crop (level-`level` corner o) */
+    if (!g_pv) return 0;
+    int64_t vo[3]; const int64_t n[3] = {Wz, W, W};
+    sview_origin(g_pvlev, g_pv->lv, o, n, g_pvP, vo);
+    if (sview_read(g_pv, g_pvself, vo, g_pvP, g_pvh)) { fprintf(stderr, "predict: view read failed\n"); return -1; }
+    nn_h2d(g_pvd, g_pvh, (size_t)g_pvP * g_pvP * g_pvP);
+    unet_set_attn_view(u, g_pvd, 1);
+    return 0;
+}
 
 /* predict --tta: one augmented pass of a window (src/tta.h): the saved CT window through T into the network's input buffer, the
    mirrored axis rows, the forward, the logits back through T (in place); returns them */
 typedef struct { unet *u; uint8_t *ctd; const uint8_t *ctsave; float mean, isd; const float *dyo, *dxo; float *dyt, *dyd; int axis; shape5 xs; int h16, D, W, nch, ch_normal; } tta_ctx;
 static const float *tta_pass(const tta_ctx *T, int code) {
     nn_tta_ct(T->ctsave, T->ctd, T->D, T->W, code);
+    if (g_pv) { nn_tta_ct(g_pvsave, g_pvd, g_pvP, g_pvP, code); unet_set_attn_view(T->u, g_pvd, 1); }   /* (the view crop through the same T) */
     tta_axis(code, T->D, T->W, T->dyo, T->dxo, T->dyt, T->dyt + T->W);
     nn_h2d(T->dyd, T->dyt, 2 * (size_t)T->W * sizeof(float));
     pred_axis(T->u, T->axis != 0, T->D, T->dyt, T->dyt + T->W);
@@ -474,6 +521,8 @@ int cmd_predict(int argc, char **argv) {
                         "       [--fit-fields DIR] [--fit-h 8]   task unwrap checkpoints: also the winding fitter's input fields of the box (ufsm fit DIR)\n"
                         "       [--fit-zarr DIR]                 the same fields as zarr arrays, flushed slab by slab (whole volumes)\n"
                         "       [--tta K]   the fit fields averaged over K window symmetries (z / y / x flips, y <-> x swap; 1..12, src/tta.h)\n"
+                        "       [--view-level L] [--view-map REG.json]   scan-fusion checkpoints (view_P): the view crop per window from level L of this scan\n"
+                        "                   or, with a map, the registered partner scan on this scan's level-L grid (use the training window size)\n"
                         "       [--fit-w4-d 32]   task unwrap2 checkpoints: the winding mod 4 relative planes dz dy dx dq over this many voxels (<= the halos)\n"
                         "       [--fit-ct 1]                     with them the CT planes ct / cs (fit --w-ct / --w-cspacing; ufsm ct-fields adds them later)\n"
                         "       [--no-out 1]                     skip writing the prediction volume's shards (e.g. only the --fit-zarr fields)\n"
@@ -746,6 +795,7 @@ int cmd_predict(int argc, char **argv) {
     z3 *ct = pyramid_open_level(s, key, level, um, cache);
     if (!ct) { fprintf(stderr, "cannot open level %d of %s: %s\n", level, key, z3_error()); return 1; }
     const z3_meta *m = z3_meta_of(ct);
+    if (cfg.view_P && pred_view_open(&cfg, root, key, level, um, cache, opt(argc, argv, "--view-level", "0"), opt(argc, argv, "--view-map", nullptr), split)) return 1;
     int64_t bo[3] = {0, 0, 0}, bn[3] = {m->shape[0], m->shape[1], m->shape[2]};
     { const char *b = opt(argc, argv, "--box", nullptr); long long v[6]; if (b && sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) { for (int d = 0; d < 3; d++) { bo[d] = v[d]; bn[d] = v[3 + d]; } } }
     /* --full-grid 1: the output array spans the CT level's whole grid (origin 0) and --box only selects the shards computed (rounded
@@ -1202,6 +1252,9 @@ int cmd_predict(int argc, char **argv) {
                 nn_sheet_input(xd,W,sheet_rows,(float)sheet->center,(float)sheet->scale,h16);
             }
             pred_axis(u, ax.n > 0, Wz, dyo, dxo);
+            pred_mem_in(u, o, W);
+            if (pred_view_set(u, o, Wz, W)) return 1;
+            if (g_pv && tta > 1) nn_d2d(g_pvsave, g_pvd, (size_t)g_pvP * g_pvP * g_pvP);
             const float *lg;
             if (half) {   /* the network on blocks of the window: its input from the 4-channel window, its logits back to full resolution */
                 nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
@@ -1210,6 +1263,7 @@ int cmd_predict(int argc, char **argv) {
                 lg = lgf;
             } else lg = ct_stem ? unet_forward_ct(u, ctd, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xs, h16)
                                 : unet_forward_x(u, xd, xs, 0, h16);
+            pred_mem_out(u, o);
             nn_set_logits_h16(!half && unet_logits_h16(u));   /* the readers of lg below */
             const uint8_t *ctk = ct_shared && ctcp ? ctcp : ctd; (void)ctk;   /* --fit-ct: the CT window as it was before the forward */
             { static int memi = -1; if (memi < 0) memi = ufsm_env_on("UFSM_PRED_MEMINFO"); if (memi == 1) { nn_sync(); fprintf(stderr, "\npredict: GPU free after the first window %.2f GB\n", nn_mem_free() / 1e9); memi = 2; } }

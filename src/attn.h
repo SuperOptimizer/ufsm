@@ -122,6 +122,17 @@ void at_peg_bwd(const float *x, const float *gy, float *gx, const float *w, floa
 void at_cs_to_tok(const float *x, float *t, const float *reg, int n, int C, long Sg, int nreg);
 void at_tok_to_cs(const float *t, float *x, int n, int C, long Sg, int nreg);
 void at_reg_grad(const float *gt, float *greg, int n, int C, long Sg, int nreg);   /* greg[r][c] += sum over sequences */
+/* window memory rows r0..r0+M-1 of the n sequences of S token rows: t[s][r0+j][c] += gate[c] mem[s][j][c] + sum_k woff[k][c] feat[s][k] (k < 4);
+   its gradients ggate[c] += sum_{s,j} gt mem, gwoff[k][c] += sum_{s,j} gt feat[s][k] (mem, feat constants); the rows out: mout[s][j][c] */
+void at_mem_add(float *t, int n, int S, int r0, int M, int C, const float *gate, const float *woff, const float *mem, const float *feat);
+void at_mem_grad(const float *gt, int n, int S, int r0, int M, int C, const float *mem, const float *feat, float *ggate, float *gwoff);
+void at_mem_out(const float *t, int n, int S, int r0, int M, int C, float *mout);
+/* scan fusion view rows: patches xp [n][Nv][k^3] (Nv = (Pv / k)^3, patch j = (pz, py, px) z-major, its voxels z y x) of the uint8 crops
+   v [n][Pv^3] as v / 255 (v nullptr: zeros); the rows r0..r0+Nv-1: t[s][r0+j][c] += E[s Nv + j][c] + bias[c]; their gradient gathered
+   GE[s Nv + j][c] = gt[s][r0+j][c] and gbias[c] += sum over the rows */
+void at_view_patch(const unsigned char *v, int n, int Pv, int k, float *xp);
+void at_view_add(float *t, int n, int S, int r0, int Nv, int C, const float *E, const float *bias);
+void at_view_gather(const float *gt, int n, int S, int r0, int Nv, int C, float *GE, float *gbias);
 void at_h16_to_f32(const void *x, long long n, int f16, float *y);   /* 16-bit storage (fp16 / bf16) -> fp32 */
 
 /* MX GEMM (src/lp_mxgemm.cu): at_gemm's operands and result, both operands quantised along K to MX-fp4 (bits 4) or MX-fp8 (bits 8)

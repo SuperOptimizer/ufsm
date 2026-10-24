@@ -300,10 +300,81 @@ static int test_masked_keys(void) {
     return bad;
 }
 
+/* window memory (at_mem_add / at_mem_grad / at_mem_out): token rows r0..r0+M of each sequence += gate (x) mem + W_off feat; the gate / W_off
+   gradients accumulate sum over sequences and rows; the out copy. Against double host references (accumulation onto nonzero gradients). */
+static int test_mem(void) {
+    const int n = 3, S = 11, r0 = 2, M = 4, C = 37; const long T = (long)n * S;
+    double *t = malloc(T * C * 8), *gate = malloc(C * 8), *woff = malloc(4 * C * 8), *mem = malloc((size_t)n * M * C * 8), *feat = malloc(n * 4 * 8);
+    double *gt = malloc(T * C * 8), *gg0 = malloc(C * 8), *gw0 = malloc(4 * C * 8);
+    for (long i = 0; i < T * C; i++) { t[i] = rf(nrand()); gt[i] = rf(nrand()); }
+    for (int c = 0; c < C; c++) { gate[c] = rf(nrand()); gg0[c] = rf(nrand()); }
+    for (int i = 0; i < 4 * C; i++) { woff[i] = rf(nrand()); gw0[i] = rf(nrand()); }
+    for (int i = 0; i < n * M * C; i++) mem[i] = rf(nrand());
+    for (int i = 0; i < n * 4; i++) feat[i] = rf(nrand());
+    float *t_d = dev(t, T * C), *gate_d = dev(gate, C), *woff_d = dev(woff, 4 * C), *mem_d = dev(mem, (size_t)n * M * C), *feat_d = dev(feat, n * 4);
+    float *gt_d = dev(gt, T * C), *gg_d = dev(gg0, C), *gw_d = dev(gw0, 4 * C), *mo_d = nn_malloc((size_t)n * M * C * 4);
+    at_mem_add(t_d, n, S, r0, M, C, gate_d, woff_d, mem_d, feat_d);
+    at_mem_grad(gt_d, n, S, r0, M, C, mem_d, feat_d, gg_d, gw_d);
+    at_mem_out(t_d, n, S, r0, M, C, mo_d);
+    nn_sync();
+    double *ta = host(t_d, T * C), *gga = host(gg_d, C), *gwa = host(gw_d, 4 * C), *moa = host(mo_d, (size_t)n * M * C);
+    double *tr = malloc(T * C * 8), *mor = malloc((size_t)n * M * C * 8); memcpy(tr, t, T * C * 8);
+    for (int s = 0; s < n; s++) for (int j = 0; j < M; j++) for (int c = 0; c < C; c++) {
+        double a = gate[c] * mem[((long)s * M + j) * C + c];
+        for (int k = 0; k < 4; k++) a += woff[k * C + c] * feat[s * 4 + k];
+        const long r = ((long)s * S + r0 + j) * C + c; tr[r] += a;
+        const double g = gt[r]; gg0[c] += g * mem[((long)s * M + j) * C + c];
+        for (int k = 0; k < 4; k++) gw0[k * C + c] += g * feat[s * 4 + k];
+    }
+    for (int s = 0; s < n; s++) for (int j = 0; j < M; j++) for (int c = 0; c < C; c++) mor[((long)s * M + j) * C + c] = tr[((long)s * S + r0 + j) * C + c];
+    printf("window memory ops:\n");
+    int bad = report("add", ta, tr, T * C) + report("gate grad", gga, gg0, C) + report("woff grad", gwa, gw0, 4 * C) + report("out", moa, mor, (long)n * M * C);
+    free(t); free(gate); free(woff); free(mem); free(feat); free(gt); free(gg0); free(gw0); free(ta); free(gga); free(gwa); free(moa); free(tr); free(mor);
+    nn_free(t_d); nn_free(gate_d); nn_free(woff_d); nn_free(mem_d); nn_free(feat_d); nn_free(gt_d); nn_free(gg_d); nn_free(gw_d); nn_free(mo_d);
+    return bad;
+}
+
+/* scan fusion view rows (at_view_patch / at_view_add / at_view_gather): uint8 crops -> k^3 patches / 255 (patch-major, z y x inside); rows
+   r0..r0+Nv of each sequence += E + bias; the gather copies those rows' gradient and accumulates its column sum onto gbias. Against host
+   references (nonzero gbias), and the null crop gives zero patches. */
+static int test_view(void) {
+    const int n = 2, Pv = 8, k = 4, G = Pv / k, Nv = G * G * G, k3 = k * k * k, S = 20, r0 = 3, C = 37; const long T = (long)n * S;
+    const size_t nv = (size_t)n * Pv * Pv * Pv, R = (size_t)n * Nv;
+    unsigned char *v = malloc(nv); for (size_t i = 0; i < nv; i++) v[i] = (unsigned char)(urand() * 255.99);
+    double *t = malloc(T * C * 8), *E = malloc(R * C * 8), *bias = malloc(C * 8), *gt = malloc(T * C * 8), *gb0 = malloc(C * 8);
+    for (long i = 0; i < T * C; i++) { t[i] = rf(nrand()); gt[i] = rf(nrand()); }
+    for (size_t i = 0; i < R * C; i++) E[i] = rf(nrand());
+    for (int c = 0; c < C; c++) { bias[c] = rf(nrand()); gb0[c] = rf(nrand()); }
+    unsigned char *v_d = nn_malloc(nv); nn_h2d(v_d, v, nv);
+    float *xp_d = nn_malloc(R * k3 * 4), *xz_d = nn_malloc(R * k3 * 4), *t_d = dev(t, T * C), *E_d = dev(E, R * C), *b_d = dev(bias, C);
+    float *gt_d = dev(gt, T * C), *ge_d = nn_malloc(R * C * 4), *gb_d = dev(gb0, C);
+    at_view_patch(v_d, n, Pv, k, xp_d); at_view_patch(nullptr, n, Pv, k, xz_d);
+    at_view_add(t_d, n, S, r0, Nv, C, E_d, b_d);
+    at_view_gather(gt_d, n, S, r0, Nv, C, ge_d, gb_d);
+    nn_sync();
+    double *xa = host(xp_d, R * k3), *xz = host(xz_d, R * k3), *ta = host(t_d, T * C), *gea = host(ge_d, R * C), *gba = host(gb_d, C);
+    double *xr = malloc(R * k3 * 8), *zr = calloc(R * k3, 8), *tr = malloc(T * C * 8), *ger = malloc(R * C * 8); memcpy(tr, t, T * C * 8);
+    for (int s = 0; s < n; s++) for (int j = 0; j < Nv; j++) {
+        const int pz = j / (G * G), py = (j / G) % G, px = j % G;
+        for (int a = 0; a < k; a++) for (int b = 0; b < k; b++) for (int c = 0; c < k; c++)
+            xr[((size_t)s * Nv + j) * k3 + (a * k + b) * k + c] = v[(size_t)s * Pv * Pv * Pv + ((size_t)(pz * k + a) * Pv + py * k + b) * Pv + px * k + c] / 255.0;
+        for (int c = 0; c < C; c++) {
+            const long r = ((long)s * S + r0 + j) * C + c; const size_t e = ((size_t)s * Nv + j) * C + c;
+            tr[r] += E[e] + bias[c]; ger[e] = gt[r]; gb0[c] += gt[r];
+        }
+    }
+    printf("scan fusion view ops:\n");
+    int bad = report("patch", xa, xr, (long)R * k3) + report("null patch", xz, zr, (long)R * k3) + report("add", ta, tr, T * C) + report("gather", gea, ger, (long)R * C) + report("bias grad", gba, gb0, C);
+    free(v); free(t); free(E); free(bias); free(gt); free(gb0); free(xa); free(xz); free(ta); free(gea); free(gba); free(xr); free(zr); free(tr); free(ger);
+    nn_free(v_d); nn_free(xp_d); nn_free(xz_d); nn_free(t_d); nn_free(E_d); nn_free(b_d); nn_free(gt_d); nn_free(ge_d); nn_free(gb_d);
+    return bad;
+}
+
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
     int bad = 0;
     bad += test_masked_keys();
+    bad += test_mem();
     bad += test_maps(6, 7, 5, 2.f);
     bad += test_maps(8, 8, 8, 1.f);
     for (int core = 0; core < 2; core++) {
@@ -313,6 +384,7 @@ int main(void) {
         bad += test_block(0, 2, 2, 3, 4, 5, 1.f, 8);
     }
     at_set_core(0);
+    bad += test_view();   /* (last: its draws leave the block tests' random inputs as they were) */
     printf(bad ? "test_attn_ray: %d FAILED\n" : "test_attn_ray: all passed\n", bad);
     return bad != 0;
 }
