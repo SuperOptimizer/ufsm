@@ -1,6 +1,6 @@
 /* Sheet-aware crush augmentation (train / dino-train --aug-crush P): crushed-scroll windows from intact ones whose labels give the
    sheet geometry. One smooth bijective pull map u (output window voxel) -> x (source window voxel, the map's level), the composite of
-     A  rotation + window-scale squash: q = M (u - c), M = R (I + (k - 1) d d^T)  (k 1.5..3 along d: the flattened cross-section)
+     A  rotation + window-scale squash: q = M (u - c), M = R (I + (k - 1) d d^T)  (k 1.5..3 along d in the sheet plane: the flattened cross-section)
      B  bends / kinks along the sheet normal n: s' = s + b(a), a = (q . t1, q . t2), s = q . n  (b low-frequency sines + a
         k w log cosh((e . a - a0) / w) fold line; a shear with unit determinant, invertible for any b)
      C  gap collapse along n: sigma = F(s'; a), F monotone in s' per column, x = c + a1 t1 + a2 t2 + sigma n
@@ -20,7 +20,7 @@
 typedef struct {
     float p;                  /* probability per eligible sample (0: off, the default) */
     float jlo, jhi;           /* void spacing ratio j (output / source), log-uniform per sample; varied +-40 % over the window */
-    float squash_p, klo, khi; /* window-scale squash: probability, factor range (log-uniform); along the sheet normal half the time */
+    float squash_p, klo, khi; /* window-scale squash: probability, factor range (log-uniform); along a random direction in the sheet plane (d . n = 0) */
     float bend_p, bend_amp;   /* low-frequency bends: probability, amplitude (fraction of P) */
     float kink_p;             /* a fold line (kink) */
     float rotate_deg;         /* random rotation up to this many degrees per axis (crushed windows skip the ordinary spatial warp) */

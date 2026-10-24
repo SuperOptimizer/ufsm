@@ -37,7 +37,6 @@ void crush_cfg_print(const crush_cfg *c) {
 static double dot3(const double a[3], const double b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 static void unit3(double v[3]) { const double l = sqrt(dot3(v, v)); for (int d = 0; d < 3; d++) v[d] /= l; }
 static void cross3(const double a[3], const double b[3], double o[3]) { o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0]; }
-static void rand_dir(uint64_t *s, double d[3]) { const double z = 2 * cr_u(s) - 1, p = 2 * M_PI * cr_u(s), r = sqrt(fmax(0, 1 - z * z)); d[0] = z; d[1] = r * cos(p); d[2] = r * sin(p); }
 
 static double cr_bend(const crush_map *m, double a1, double a2) {
     double b = 0;
@@ -65,7 +64,10 @@ void crush_map_init(crush_map *m, const crush_cfg *cfg, uint64_t seed, int P, co
     double k = 1, d[3] = {1, 0, 0};
     if (cr_u(&seed) < cfg->squash_p && cfg->khi >= cfg->klo && cfg->klo >= 1) {
         k = cr_logu(&seed, cfg->klo, cfg->khi);
-        if (cr_u(&seed) < .5) memcpy(d, m->n, sizeof d); else rand_dir(&seed, d);
+        /* in the sheet plane: the cross-section flattens (curvature squashed) while papyrus keeps its thickness; the closing
+           along the normal is stage C's (a squash along n thinned the sheets to ~2 voxels a wrap on Paris 4) */
+        const double th = 2 * M_PI * cr_u(&seed);
+        for (int e = 0; e < 3; e++) d[e] = cos(th) * m->t1[e] + sin(th) * m->t2[e];
     }
     m->sq_k = k; memcpy(m->sq_d, d, sizeof d);
     double S[3][3], Si[3][3];

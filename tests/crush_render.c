@@ -31,14 +31,15 @@ int main(int argc, char **argv) {
     sampler *sp = calloc(1, sizeof *sp); sp->S = S; sp->cfg = sample_cfg_default(); sp->cfg.P = P;
     sp->cfg.crush = crush_cfg_default(); sp->cfg.crush.p = 1; sp->cfg.crush.fine = fine;
     const size_t p3 = (size_t)P * P * P;
-    uint8_t *big = malloc(9 * p3), *ct0 = malloc(p3), *ph0 = malloc(p3), *img = malloc((size_t)4 * P * P * 3);
+    const size_t AR = getenv("UFSM_CRUSH_ARENA") ? (size_t)atoi(getenv("UFSM_CRUSH_ARENA")) : 8;   /* the tile arena in P^3 (the sampler's: 8) */
+    uint8_t *big = malloc((1 + AR) * p3), *ct0 = malloc(p3), *ph0 = malloc(p3), *img = malloc((size_t)4 * P * P * 3);
     if (!big || !ct0 || !ph0 || !img) return 1;
     rng r = {{seed * 0x9e3779b97f4a7c15ull + 1, seed ^ 0x5851f42d4c957f2dull, 7, 11}};
     const int psh = s->phase_level - l;
     for (int w = 0, tries = 0; w < NW && tries < 400; tries++) {
         int64_t o[3]; for (int d = 0; d < 3; d++) o[d] = box[d] + (int64_t)(runif(&r) * (double)(box[d + 3] - box[d] + 1));
         /* the window as stored: the identity map through the same pull */
-        crush_cache cc; if (crush_cache_init(&cc, big + p3, 8 * p3)) return 1;
+        crush_cache cc; if (crush_cache_init(&cc, big + p3, AR * p3)) return 1;
         crush_cfg id = crush_cfg_default(); id.squash_p = id.bend_p = id.kink_p = 0; id.rotate_deg = 0;
         const double nz[3] = {1, 0, 0}; crush_map mi; crush_map_init(&mi, &id, 1, P, nz);
         crush_layer L[2] = {{ct, CRUSH_LINEAR, 0, 0, 1, {0, 0, 0}, ct0}, {s->phase, CRUSH_PHASE, 0, PHASE_UNKNOWN, 0, {0, 0, 0}, ph0}};
@@ -48,7 +49,7 @@ int main(int argc, char **argv) {
         size_t known = 0; for (size_t k = 0; k < p3; k++) known += ph0[k] < PHASE_PERIOD;
         if (known < p3 / 3) continue;
         const double t0 = tnow();
-        const int rc = crush_draw(sp, s, l, o, P, psh, &r, big + p3, 8 * p3, big);
+        const int rc = crush_draw(sp, s, l, o, P, psh, &r, big + p3, AR * p3, big);
         const double dt = tnow() - t0;
         if (rc != 1) { fprintf(stderr, "crush_draw %d\n", rc); crush_release(); continue; }
         size_t k1 = 0; for (size_t k = 0; k < p3; k++) k1 += g_crush.ph[k] < PHASE_PERIOD;

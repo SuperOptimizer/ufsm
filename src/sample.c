@@ -1896,7 +1896,6 @@ static int crush_draw_(sampler *sp, source *s, int l, const int64_t o[3], int P,
     if (cz) { Lcol.z = cz; crush_layer_level(&Lcol, -1); }
     crush_ctu u = {&cc, &Lcol, o};
     crush_map_columns(&m, c->crush.jlo, c->crush.jhi, rnext(r), crush_ct_at, &u);   /* (1: too little CT for a papyrus / void split: no collapse) */
-    if (getenv("UFSM_CRUSH_DBG")) fprintf(stderr, "crush: columns %llu tiles, H %.0f, T %.0f %.0f, srange %.0f %.0f, G %d %d, ns %d\n", (unsigned long long)cc.decoded, m.half, m.T[0], m.T[1], m.srange[0], m.srange[1], m.G[0], m.G[1], m.ns);
     if (cc.err) { crush_map_free(&m); crush_cache_free(&cc); return -1; }
     uint8_t *ph = tp_get(p3 + 64, 0), *ig = s->phase_ign ? tp_get(p3, 0) : nullptr;
     g_crush.ph = ph; g_crush.ig = ig; g_crush.n = p3;
