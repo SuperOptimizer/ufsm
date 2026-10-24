@@ -3265,6 +3265,7 @@ int cmd_sr_pyrpairs(int argc, char **argv);   /* src/srpyr.c */
 int cmd_sr_ceiling(int argc, char **argv);   /* src/srpyr.c */
 int cmd_sr_xpairs(int argc, char **argv);   /* src/srpyr.c */
 int cmd_restore_eval_pairs(int argc, char **argv);   /* src/restore_cli.c */
+int cmd_restore_packed(int argc, char **argv);   /* src/restore_cli.c */
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "train")) return cmd_train(argc, argv);
     if (argc < 3) return usage();
@@ -3298,6 +3299,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "sr-ceiling")) return cmd_sr_ceiling(argc, argv);
     if (!strcmp(cmd, "sr-xpairs")) return cmd_sr_xpairs(argc, argv);
     if (!strcmp(cmd, "restore-eval-pairs")) return cmd_restore_eval_pairs(argc, argv);
+    if (!strcmp(cmd, "restore-packed")) return cmd_restore_packed(argc, argv);
     if (!strcmp(cmd, "convert-unwrap2")) return cmd_convert_unwrap2(argc, argv);
     if (!strcmp(cmd, "repack")) return cmd_repack(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);

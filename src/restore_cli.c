@@ -8,6 +8,7 @@
 #include "restore.h"
 #include "sources.h"
 #include "srpair.h"
+#include "band.h"
 #include "store.h"
 #include "unet.h"
 #include "z3w.h"
@@ -369,5 +370,159 @@ int cmd_restore_eval_pairs(int argc, char **argv) {
 #undef PS
     if (cf) fclose(cf);
     sources_free(S); unet_free(u);
+    return 0;
+}
+
+/* ufsm restore-packed <ckpt|none> <pair-dir> --codes ROOT,KEY --g G [--lut 1] [--spacing-um 100] [--max 64] [--all 0] [--rmax 24] [--block 16]
+     [--delta 12] [--ema 1] [--gpu 0]
+   Packed-region SR metrics on an sr-pairs-layout set with ground-truth sheets: --codes is a winding_mod14 code raster (labelled rectos,
+   src/band.h) on a grid of G input voxels per code voxel (Paris 4 q-9p6 on the 2.4 um scan's level 2: G 1; 0139 / 0814 codes at 18.72 um on
+   the native 9.36 um scans: G 2). Per box the codes around it give the winding phase and the local sheet spacing (band_field_phase_pair);
+   target voxels whose spacing is below --spacing-um are packed. For the trilinear input, the SR output (ckpt; "none" skips it) and the real
+   target: PSNR and gradient PSNR against the target inside packed voxels (target identical: omitted), and the gap test on packed
+   --block^3 target blocks (half packed): the real target's top / bottom quartile voxels are the sheet / gap voxels; each image's mean
+   over them gives the sheet-gap contrast it shows where the real scan has it (DN); per block "open" = an image's own interquartile range
+   > --delta; versus the real target: open in both / only in the prediction (hallucinated) / only in the real (merged). */
+int cmd_restore_packed(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm restore-packed <ckpt|none> <pair-dir> --codes ROOT,KEY --g G [--lut 1] [--spacing-um 100] [--max 64] [--all 0] [--rmax 24] [--block 16] [--delta 12]\n"); return 2; }
+    const char *cs = opt(argc, argv, "--codes", nullptr); const double G = atof(opt(argc, argv, "--g", "1"));
+    if (!cs || !(G > 0)) { fprintf(stderr, "restore-packed: --codes ROOT,KEY and --g\n"); return 2; }
+    char cb[2048]; snprintf(cb, sizeof cb, "%s", cs); char *cm = strchr(cb, ','); if (!cm) { fprintf(stderr, "--codes ROOT,KEY\n"); return 2; } *cm = 0;
+    store *cst = store_open(cb); z3 *cz = cst ? z3_open(cst, cm + 1, nullptr) : nullptr;
+    if (!cz) { fprintf(stderr, "restore-packed: cannot open codes %s/%s\n", cb, cm + 1); return 1; }
+    const z3_meta *cmeta = z3_meta_of(cz);
+    srpair *p = srpair_open(argv[3], "val", atoi(opt(argc, argv, "--lut", "1")), 0); if (!p) return 1;
+    if (p->same) { fprintf(stderr, "restore-packed: coarse-box sets only\n"); return 2; }
+    const int use_net = strcmp(argv[2], "none") != 0; unet_cfg cfg; unet *u = nullptr;
+    if (use_net) { if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1; u = restore_net(argv[2], atoi(opt(argc, argv, "--ema", "1")) != 0, &cfg); if (!u) return 1;
+                   if (cfg.scale_cond) unet_set_cond(u, (float)log2(p->ratio) - 2.f); }
+    /* box origins (input-level zyx) */
+    char bp[2100]; snprintf(bp, sizeof bp, "%s/boxes.json", argv[3]);
+    FILE *f = fopen(bp, "rb"); if (!f) return 1; fseek(f, 0, SEEK_END); const long L = ftell(f); fseek(f, 0, SEEK_SET);
+    char *t = malloc(L + 1); if (fread(t, 1, L, f) != (size_t)L) { fclose(f); return 1; } fclose(f); t[L] = 0;
+    json *bj = json_parse(t, (size_t)L); free(t); const json *bx = bj ? json_get(bj, "boxes") : nullptr; if (!bx) return 1;
+    const double in_um = json_num(json_get(json_get(bj, "input"), "um"), 9.362), spum = atof(opt(argc, argv, "--spacing-um", "100"));
+    const int T = p->T, B = p->B, mx = atoi(opt(argc, argv, "--max", "64")), all = atoi(opt(argc, argv, "--all", "0")), BL = atoi(opt(argc, argv, "--block", "16"));
+    const float rmax = (float)atof(opt(argc, argv, "--rmax", "24")); const double delta = atof(opt(argc, argv, "--delta", "12"));
+    const size_t t3 = (size_t)T * T * T, q3 = (size_t)B * B * B;
+    uint8_t *ht = malloc(t3), *hc = malloc(q3), *hlow = malloc(t3), *hout = malloc(t3), *pk = malloc(t3), *ph = malloc(t3);
+    uint8_t *dt = use_net ? nn_malloc(t3) : nullptr, *dc = nn_malloc(q3), *dlow = nn_malloc(t3), *dout = use_net ? nn_malloc(t3) : nullptr; void *dx = use_net ? nn_malloc(t3 * 2 * cfg.cin) : nullptr;
+    (void)dt;
+    /* accumulators: [0 trilinear, 1 SR]: packed n, se, grad n, grad se; gap blocks: sum S-G per image [trilinear, SR, real], counts, agreement */
+    double pn[2] = {0}, pse[2] = {0}, gn[2] = {0}, gse[2] = {0}, an = 0, ase[2] = {0};
+    double sg[3] = {0}; long nblk = 0, agree[2][3] = {{0}};   /* agree[pred][0 both open, 1 pred only (hallucinated), 2 real only (merged)] */
+    size_t npk = 0, nall = 0;
+    const int nlist = all ? p->n : p->nte;
+    for (int ii = 0, done = 0; ii < nlist && done < mx; ii++) {
+        const int k = all ? ii : p->te[ii];
+        const json *b = nullptr; for (size_t q = 0; q < bx->n; q++) if ((int)json_num(json_get(json_at(bx, q), "slot"), -1) == k) { b = json_at(bx, q); break; }
+        if (!b) continue;
+        int64_t oz[3];   /* input-level zyx origin */
+        const json *ol = json_get(b, "origin_level_zyx"), *ox = json_get(b, "origin_xyz");
+        if (ol) for (int d = 0; d < 3; d++) oz[d] = (int64_t)json_num(json_at(ol, (size_t)d), 0);
+        else if (ox) for (int d = 0; d < 3; d++) oz[d] = (int64_t)json_num(json_at(ox, (size_t)(2 - d)), 0);
+        else continue;
+        const int oc[3] = {0, 0, 0};
+        if (srpair_read(p, k, oc, T, ht, hc)) continue;
+        /* codes crop: the box in code voxels plus rmax */
+        const int m = (int)ceil(rmax) + 2; int64_t co[3], cn[3]; int n3[3];
+        for (int d = 0; d < 3; d++) { co[d] = (int64_t)floor(oz[d] / G) - m; cn[d] = (int64_t)ceil((oz[d] + B) / G) + m - co[d]; n3[d] = (int)cn[d]; }
+        const size_t c3 = (size_t)cn[0] * cn[1] * cn[2];
+        uint8_t *cc = calloc(c3, 1), *cph = malloc(c3), *csp = malloc(c3);
+        int64_t lo[3], hi[3], rn[3]; int ok = 1;
+        for (int d = 0; d < 3; d++) { lo[d] = co[d] < 0 ? 0 : co[d]; hi[d] = co[d] + cn[d] > cmeta->shape[d] ? cmeta->shape[d] : co[d] + cn[d]; rn[d] = hi[d] - lo[d]; if (rn[d] <= 0) ok = 0; }
+        if (ok) {
+            uint8_t *r = malloc((size_t)rn[0] * rn[1] * rn[2]);
+            if (z3_read(cz, lo, rn, r, 4)) ok = 0;
+            else for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++) memcpy(cc + ((size_t)(z + lo[0] - co[0]) * cn[1] + (y + lo[1] - co[1])) * cn[2] + (lo[2] - co[2]), r + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
+            free(r);
+        }
+        size_t lab = 0; for (size_t i = 0; i < c3; i++) lab += cc[i] != 0 && cc[i] != 255;
+        if (!ok || lab < 64 || band_field_phase_pair(cc, n3, rmax, cph, csp)) { free(cc); free(cph); free(csp); continue; }
+        {   /* labelled recto voxels carry spacing 0: take their neighbours' spacing (the sheet itself is part of the packed cell) */
+            uint8_t *sp2 = malloc(c3); memcpy(sp2, csp, c3);
+            for (int64_t z = 1; z < cn[0] - 1; z++) for (int64_t y = 1; y < cn[1] - 1; y++) for (int64_t x = 1; x < cn[2] - 1; x++) {
+                const size_t i = ((size_t)z * cn[1] + y) * cn[2] + x; if (cph[i] != 0 || csp[i]) continue;
+                const size_t nb[6] = {i - 1, i + 1, i - (size_t)cn[2], i + (size_t)cn[2], i - (size_t)cn[1] * cn[2], i + (size_t)cn[1] * cn[2]}; uint8_t mx = 0;
+                for (int q = 0; q < 6; q++) if (csp[nb[q]] > mx) mx = csp[nb[q]];
+                sp2[i] = mx;
+            }
+            memcpy(csp, sp2, c3); free(sp2);
+        }
+        /* per target voxel: the nearest code voxel's phase / packed flag */
+        size_t np_ = 0;
+        for (int z = 0; z < T; z++) for (int y = 0; y < T; y++) for (int x = 0; x < T; x++) {
+            const int tv[3] = {z, y, x}; int64_t ci[3];
+            for (int d = 0; d < 3; d++) { const double in = oz[d] + (tv[d] + 0.5) / 4.0 - 0.5; ci[d] = (int64_t)floor((in + 0.5) / G) - co[d]; }
+            const size_t c = ((size_t)ci[0] * cn[1] + ci[1]) * cn[2] + ci[2], i = ((size_t)z * T + y) * T + x;
+            const uint8_t sp = csp[c];
+            ph[i] = cph[c]; pk[i] = sp > 0 && sp * G * in_um < spum && ht[i] && cph[c] != PHASE_UNKNOWN; np_ += pk[i];
+        }
+        free(cc); free(cph); free(csp);
+        /* trilinear input and the SR output */
+        nn_h2d(dc, hc, q3);
+        const float st4[3] = {4.f, 4.f, 4.f}, ph0[3] = {0.f, 0.f, 0.f};
+        nn_restore_upsample(dc, B, B, B, dlow, T, T, T, st4, ph0, nullptr); nn_d2h(hlow, dlow, t3);
+        if (use_net) {
+            nn_restore_input(dlow, dx, t3, cfg.cin == 2, nn_get_f16());
+            const float *lg = unet_forward_x(u, dx, (shape5){1, cfg.cin, T, T, T}, 0, 1);
+            nn_restore_output(lg, unet_logits_h16(u), dlow, dout, t3); nn_d2h(hout, dout, t3);
+        }
+        const uint8_t *img[3] = {hlow, use_net ? hout : nullptr, ht};
+        const size_t str[3] = {(size_t)T * T, (size_t)T, 1};
+        for (size_t i = 0; i < t3; i++) {
+            if (!ht[i]) continue;
+            nall++; for (int a = 0; a < 2; a++) if (img[a] && img[a][i]) { const double e = (double)img[a][i] - ht[i]; if (a == 0 || use_net) ase[a] += e * e; }
+            an++;
+            if (!pk[i]) continue;
+            npk++;
+            for (int a = 0; a < 2; a++) {
+                if (!img[a] || !img[a][i]) continue;
+                const double e = (double)img[a][i] - ht[i]; pn[a]++; pse[a] += e * e;
+                for (int d = 0; d < 3; d++) { if ((int)((i / str[d]) % T) == T - 1) continue; const size_t j = i + str[d]; if (!ht[j] || !img[a][j]) continue;
+                    const double g = ((double)img[a][j] - img[a][i]) - ((double)ht[j] - ht[i]); gn[a]++; gse[a] += g * g; }
+            }
+        }
+        for (int Z = 0; Z + BL <= T; Z += BL) for (int Y = 0; Y + BL <= T; Y += BL) for (int X = 0; X + BL <= T; X += BL) {
+            /* packed block: the real target's top / bottom quartile voxels are its sheet / gap voxels; each image's mean over them (the
+               contrast it shows where the real scan has sheet and gap), and each image's own interquartile range (open: > delta) */
+            int hr[3][256] = {{0}}; long nv = 0, npkb = 0;
+            for (int z = 0; z < BL; z++) for (int y = 0; y < BL; y++) for (int x = 0; x < BL; x++) {
+                const size_t i = ((size_t)(Z + z) * T + Y + y) * T + X + x; if (!ht[i] || !hlow[i] || (use_net && !hout[i])) continue;
+                npkb += pk[i]; nv++; for (int a = 0; a < 3; a++) if (img[a]) hr[a][img[a][i]]++;
+            }
+            if (nv < BL * BL * BL / 2 || npkb < nv / 2) continue;
+            int q25[3] = {0}, q75[3] = {0};
+            for (int a = 0; a < 3; a++) { if (!img[a]) continue; long c = 0; int g25 = 0;
+                for (int v = 0; v < 256; v++) { c += hr[a][v]; if (!g25 && c >= nv / 4) { q25[a] = v; g25 = 1; } if (c >= 3 * nv / 4) { q75[a] = v; break; } } }
+            double s[3] = {0}, g[3] = {0}; long ns = 0, ng = 0;
+            for (int z = 0; z < BL; z++) for (int y = 0; y < BL; y++) for (int x = 0; x < BL; x++) {
+                const size_t i = ((size_t)(Z + z) * T + Y + y) * T + X + x; if (!ht[i] || !hlow[i] || (use_net && !hout[i])) continue;
+                const int sheet = ht[i] >= q75[2], gap = ht[i] <= q25[2]; if (!sheet && !gap) continue;
+                for (int a = 0; a < 3; a++) { if (!img[a]) continue; if (sheet) s[a] += img[a][i]; else g[a] += img[a][i]; }
+                if (sheet) ns++; else ng++;
+            }
+            if (!ns || !ng) continue;
+            nblk++;
+            for (int a = 0; a < 3; a++) sg[a] += img[a] ? s[a] / ns - g[a] / ng : 0;
+            const int ro = q75[2] - q25[2] > delta;
+            for (int a = 0; a < 2; a++) { if (!img[a]) continue; const int po = q75[a] - q25[a] > delta;
+                if (po && ro) agree[a][0]++; else if (po && !ro) agree[a][1]++; else if (!po && ro) agree[a][2]++; }
+        }
+        (void)np_;
+        done++;
+    }
+#define PS(sse, n) ((n) > 0 && (sse) > 0 ? 10.0 * log10(65025.0 * (n) / (sse)) : 99.0)
+    printf("%s: packed voxels %.1f%% of %zu (spacing < %.0f um)\n", argv[3], nall ? 100.0 * npk / nall : 0, nall, spum);
+    const char *nm[2] = {"trilinear", "SR"};
+    for (int a = 0; a < 2; a++) {
+        if (a == 1 && !use_net) continue;
+        const long o = agree[a][0] + agree[a][1] + agree[a][2];
+        printf("  %-9s psnr all %.3f packed %.3f  grad psnr packed %.3f | sheet-gap contrast %.2f DN (real %.2f) over %ld packed blocks; IQR > delta in both %ld, %s only (hallucinated) %ld, real only (merged) %ld\n",
+               nm[a], PS(ase[a], an), PS(pse[a], pn[a]), PS(gse[a], gn[a]), nblk ? sg[a] / nblk : 0, nblk ? sg[2] / nblk : 0, nblk, agree[a][0], nm[a], agree[a][1], agree[a][2]);
+        (void)o;
+    }
+#undef PS
+    json_free(bj); srpair_free(p); free(ht); free(hc); free(hlow); free(hout); free(pk); free(ph);
     return 0;
 }
