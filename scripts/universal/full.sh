@@ -4,6 +4,8 @@
 #            (PSEUDO, default /vesuvius/ufsm/dino/pseudo/scans: copied there by scripts/dino/pseudo-sync.sh; pseudo-sources.sh drops boxes
 #            under 2 % labelled or touching a holdout; group weight = PW x the GT's) + every local U0 scan as SSL-only (ct_only, scanprep
 #            masks); PHerc1667 excluded; the Paris 4 78 keV / 0139 / 0814 / 1447 eval boxes held out
+#   DEFAULT since 10-24 17:12 (user: DINO / SSL nixed): pseudo-label + GT SupCon only (US=0: labelled sources only, IB=0, SB=0; the
+#            variance hinge VAR 30 kept). The SSL terms below come back with US=0.5 IB=1 SB=16.
 #   recipe:  the laptop gate-arm recipe (iBOT on the attention tokens over a 16-sample SSL batch + GT SupCon on the main window, --gt 1) on
 #            + iBOT on the main window (IB, default 1: a dense self-supervised term on the large windows beside the labelled-only SupCon;
 #            image-level DINO / KoLeo stay 0 as in the gate recipe); anti-collapse (10-24 after the 1k-step token shrink: tok z std 0.099 -> 0.030,
@@ -16,8 +18,8 @@ U=${U:-/vesuvius/ufsm/dino/src/build/ufsm}; GPU=${GPU:-0}
 export PSEUDO=${PSEUDO:-/vesuvius/ufsm/dino/pseudo/scans} PW=${PW:-1} MINPCT=${MINPCT:-2}
 cfg() {   # $1 = P
   local sp=$(( ($1 * 5 / 4 + 63) / 64 * 64 )); [ $sp -gt 512 ] && sp=512   # (the pseudo / GT boxes are 512^3: a larger source window skips them)
-  echo "--recipe 1 --P $1 --source-P $sp --zoom ${ZOOM:-0.7,$(awk -v a=$sp -v b=$1 'BEGIN {printf "%.3f", a / b}')} --ssl-batch ${SB:-16} --local-P ${LP:-64} --locals 1 --attn-blocks 2 --attn-reg 1 --cls reg
-    --exclude-src PHerc1667 --unlabelled-share ${US:-0.5} --gt ${GT:-1} --object 0 --region 0 --ink 0 --dino 0 --ibot ${IB:-1} --koleo 0 --var ${VAR:-30} --proto-lr 0
+  echo "--recipe 1 --P $1 --source-P $sp --zoom ${ZOOM:-0.7,$(awk -v a=$sp -v b=$1 'BEGIN {printf "%.3f", a / b}')} --ssl-batch ${SB:-0} --local-P ${LP:-64} --locals 1 --attn-blocks 2 --attn-reg 1 --cls reg
+    --exclude-src PHerc1667 --unlabelled-share ${US:-0} --gt ${GT:-1} --object 0 --region 0 --ink 0 --dino 0 --ibot ${IB:-0} --koleo 0 --var ${VAR:-30} --proto-lr 0
     --dim 32 --head-init 0.1 --warmup ${WARM:-200} --head-slab 16 --mem lean --linear-mx 4 --protos-k 1024 --ibot-k 1024
     --mask-input 1 --ssl-workers 8 --ssl-ibot 1 --ssl-ibot-src tok --ssl-ibot-max 64 --ssl-ibot-sub 4 --ssl-ibot-center 0 --ssl-ibot-zvar ${ZV:-10} --ssl-ibot-proto-center ${PC:-1}
     --ssl-freeze-last 1000000 --ssl-dino 0 --ssl-koleo 0 --ssl-locals 0 --ssl-head-lr 1e-3 --ssl-head-warmup 500 --ssl-head-bottleneck 64
