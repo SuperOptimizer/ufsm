@@ -1461,7 +1461,16 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             const int nd = Q->dnd, NP = Q->dnp, h16 = unet_logits_h16(n); float *eh = malloc((size_t)NP * nd * 4), *gh = malloc((size_t)NP * nd * 4); const float *th = Q->dtd + (size_t)j * NP * nd;
             static int dconst = -1; if (dconst < 0) dconst = getenv("UFSM_DIST_CONST") ? atoi(getenv("UFSM_DIST_CONST")) : 0;
             if (dconst) {   /* (debug: a trivial target -- 1: one constant unit vector; 2: the sign of z - PG/2 on axis 0) */
-                float *tc = (float *)th; for (int k = 0; k < NP; k++) { const int z = Q->ddph[(size_t)j * NP + k] / (Q->PG * Q->PG); for (int e = 0; e < nd; e++) tc[(size_t)k * nd + e] = e == 0 ? (dconst == 2 && z < Q->PG / 2 ? -1.f : 1.f) : 0.f; } }
+                float *tc = (float *)th;
+                if (dconst == 3) {   /* 3: a trivially local target: unit (CT, its central-difference gradient x 4, 0.3) of the student's own input view */
+                    const int PG = Q->PG; static float *xv; if (!xv) xv = malloc(g3 * 4); nn_d2h(xv, x, g3 * 4);
+                    for (int k = 0; k < NP; k++) { const int q = Q->ddph[(size_t)j * NP + k], z = q / (PG * PG), y = q / PG % PG, x_ = q % PG;
+                        const int zm = z > 0 ? z - 1 : z, zp = z < PG - 1 ? z + 1 : z, ym = y > 0 ? y - 1 : y, yp = y < PG - 1 ? y + 1 : y, xm = x_ > 0 ? x_ - 1 : x_, xp = x_ < PG - 1 ? x_ + 1 : x_;
+                        double v[5] = {xv[q], 4.0 * (xv[((size_t)zp * PG + y) * PG + x_] - xv[((size_t)zm * PG + y) * PG + x_]), 4.0 * (xv[((size_t)z * PG + yp) * PG + x_] - xv[((size_t)z * PG + ym) * PG + x_]),
+                                       4.0 * (xv[((size_t)z * PG + y) * PG + xp] - xv[((size_t)z * PG + y) * PG + xm]), 0.3}, n2 = 0;
+                        for (int e = 0; e < 5; e++) n2 += v[e] * v[e];
+                        for (int e = 0; e < nd; e++) tc[(size_t)k * nd + e] = e < 5 ? (float)(v[e] / sqrt(n2)) : 0.f; }
+                } else for (int k = 0; k < NP; k++) { const int z = Q->ddph[(size_t)j * NP + k] / (Q->PG * Q->PG); for (int e = 0; e < nd; e++) tc[(size_t)k * nd + e] = e == 0 ? (dconst == 2 && z < Q->PG / 2 ? -1.f : 1.f) : 0.f; } }
             dn_gather((const char *)lgs + (size_t)Q->dch * g3 * (h16 ? 2 : 4), h16, g3, nd, Q->ddp + (size_t)j * NP, NP, Q->dse, Q->dsn);
             nn_d2h(eh, Q->dse, (size_t)NP * nd * 4);
             const float wv = Q->dist * Q->dabs / (float)(2 * N * NP);
