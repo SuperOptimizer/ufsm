@@ -658,7 +658,7 @@ static int dn_load_ckpt(unet *u, const char *path) {
     return unet_load(u, path);
 }
 /* embedding channels of a dino net: the first min(cout, 32) (a recipe net with dense heads: 32 + 12 padded to 48) */
-static int dn_embed_dim(const unet_cfg *c) { return c->cout > 32 ? 32 : c->cout; }
+static int dn_embed_dim(const unet_cfg *c) { return c->cout == 48 ? 32 : c->cout; }   /* (48: the 32-d embedding + the recipe's dense heads; otherwise all head channels, e.g. --dim 64 distilled) */
 
 /* the EMA network over a box (CT array coords) -> unit int8 embeddings [nz][ny][nx][D] (host), tiles of P with halo h */
 static int8_t *dn_embed_box(unet *u, z3 *ct, const int64_t box[6], int P, int h, float center, float scale, int nthreads, int ema, const float *axz, float ars) {
