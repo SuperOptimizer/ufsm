@@ -16,12 +16,13 @@ static float *up(const void *h, size_t b) { float *d = nn_malloc(b); nn_h2d(d, h
 static int fails = 0;
 /* double-precision CPU references of the losses (the finite differences run on them) */
 static int wrap_dk(int ci, int cj) { if (ci >= 256 || cj >= 256) return ci == cj ? 0 : 99; int d = ((cj - ci) % 252 + 252) % 252; if (d >= 126) d -= 252; return (int)lrint(d / 18.0); }
-static double supcon_ref(const float *a, const int *code, const int *xyz, int N, const float *t, int N2, int D, double tau, double hw, double hr) {
+static double supcon_ref(const float *a, const int *code, const int *xyz, int N, const float *t, int N2, int D, double tau, double hw, double hr, double pr) {
     double L = 0; int na = 0;
     for (int i = 0; i < N; i++) {
         double den = 0, ps = 0; int np = 0;
         for (int j = 0; j < N + N2; j++) {
             if (j == i) continue;
+            if (pr > 0) { const int *pj = xyz + 3 * (j < N ? j : j - N); double d2 = 0; for (int q = 0; q < 3; q++) d2 += (double)(pj[q] - xyz[3 * i + q]) * (pj[q] - xyz[3 * i + q]); if (d2 > pr * pr) continue; }
             const float *k = j < N ? a + j * D : t + (j - N) * D; double s = 0; for (int c = 0; c < D; c++) s += (double)a[i * D + c] * k[c];
             const int cj = j < N ? code[j] : code[j - N], dk = wrap_dk(code[i], cj);
             double w = 1;
@@ -65,16 +66,20 @@ int main(void) {
     float *dga = nn_malloc(N * D * 4), *dout = nn_malloc(16), *scr = nn_malloc((2 * N + 16) * 4), *ga = malloc(N * D * 4), out[4];
     const float tau = 0.2f, hw = 3.f, hr = 60.f;
     float *da = up(a, N * D * 4);
-    dn_supcon(da, dc, dx, N, dt, dc, dx, N2, D, tau, hw, hr, dga, dout, scr);
+    for (int pass = 0; pass < 2; pass++) {   /* pass 1: pair radius 40 (dn_supcon_r) */
+    const float pr = pass ? 40.f : 0.f;
+    if (pass) nn_h2d(da, a, N * D * 4);
+    dn_supcon_r(da, dc, dx, N, dt, dc, dx, N2, D, tau, hw, hr, pr, dga, dout, scr);
     nn_d2h(ga, dga, N * D * 4); nn_d2h(out, dout, 16);
-    printf("supcon: loss %.5f, pos cos %.3f, neg cos %.3f, anchors %.0f\n", out[0], out[1], out[2], out[3]);
+    printf("supcon (pair radius %.0f): loss %.5f, pos cos %.3f, neg cos %.3f, anchors %.0f\n", pr, out[0], out[1], out[2], out[3]);
     for (int r = 0; r < 24; r++) {
         const int i = (int)(ru() * N), c = (int)(ru() * D); const float eps = 1e-3f; float lp, lm, o[4];
-        (void)o; a[i * D + c] += eps; lp = (float)0; double Lp = supcon_ref(a, code, xyz, N, t, N2, D, tau, hw, hr);
-        a[i * D + c] -= 2 * eps; double Lm = supcon_ref(a, code, xyz, N, t, N2, D, tau, hw, hr); a[i * D + c] += eps; lp = (float)Lp; lm = (float)Lm;
-        if (r == 0) { const double L0 = supcon_ref(a, code, xyz, N, t, N2, D, tau, hw, hr); if (fabs(L0 - out[0]) > 1e-4 * (1 + fabs(L0))) { printf("  supcon loss %.6f vs reference %.6f FAIL\n", out[0], L0); fails++; } }
+        (void)o; a[i * D + c] += eps; lp = (float)0; double Lp = supcon_ref(a, code, xyz, N, t, N2, D, tau, hw, hr, pr);
+        a[i * D + c] -= 2 * eps; double Lm = supcon_ref(a, code, xyz, N, t, N2, D, tau, hw, hr, pr); a[i * D + c] += eps; lp = (float)Lp; lm = (float)Lm;
+        if (r == 0) { const double L0 = supcon_ref(a, code, xyz, N, t, N2, D, tau, hw, hr, pr); if (fabs(L0 - out[0]) > 1e-4 * (1 + fabs(L0))) { printf("  supcon loss %.6f vs reference %.6f FAIL\n", out[0], L0); fails++; } }
         check("supcon d/da", (Lp - Lm) / (2 * eps), ga[i * D + c], 1e-5); continue;
         check("supcon d/da", (lp - lm) / (2 * eps), ga[i * D + c], 1e-4);
+    }
     }
     /* ---- DINO prototypes ---- */
     const int K = 64, NS = 80; const float ts = 0.1f, tt = 0.05f;

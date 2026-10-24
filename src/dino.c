@@ -107,6 +107,7 @@ typedef struct {
     int64_t org[3];                              /* added to window corners (ct array coordinates) to address the codes (global grid) */
     int nbox; int64_t box[DN_MAXBOX][6]; int nho; int64_t ho[DN_MAXBOX][6];
     double weight, bvol; float center, scale, pap; int64_t shape[3];
+    float srad;                                  /* "supcon_radius": GT SupCon pairs only within this distance (CT voxels; 0 = all pairs; pseudo labels: gauge-consistent only locally) */
     int ct_only;                                 /* unlabelled (U0): SSL terms only (sampled by the ct_only share) */
     int nx; const rmap *xm[4]; rvol *xfv[4]; int xlc[4], xlf[4];   /* "xscan": registered partner scans (this CT = the map's coarse side at level xlc) */
     int32_t *mcell; int64_t nmcell; int mcs;     /* "mask": {"map": RAW, "min": m} (ufsm scanprep): the cells with code >= m (window centres), cell edge */
@@ -530,9 +531,10 @@ static int load_sources(const char *path, dn_data *D, int nthreads) {
         else if (nm) { S->center = (float)json_num(json_get(nm, "center"), 100); S->scale = (float)json_num(json_get(nm, "scale"), 50); }   /* (train's form) */
         else box_norm(S->ca, (const int64_t (*)[6])S->box, S->nbox, 12345 + i, nthreads, &S->center, &S->scale);
         S->pap = (float)json_num(json_get(s, "papyrus"), S->center);
+        S->srad = (float)json_num(json_get(s, "supcon_radius"), 0);
         D->wsum += S->weight; if (S->ct_only) D->wsum_u += S->weight; else D->wsum_l += S->weight;
-        fprintf(stderr, "dino-train: source %s: %d boxes (%.2f Gvox), %d holdouts, %s, codes %s, weight %g, norm %.1f / %.1f, papyrus > %.0f\n", S->name, S->nbox, S->bvol / 1e9,
-                S->nho, S->halves ? "two views (ct / ct_b)" : "one CT (views by noise)", S->codes ? "yes" : "no", S->weight, S->center, S->scale, S->pap);
+        fprintf(stderr, "dino-train: source %s: %d boxes (%.2f Gvox), %d holdouts, %s, codes %s, weight %g, norm %.1f / %.1f, papyrus > %.0f%s\n", S->name, S->nbox, S->bvol / 1e9,
+                S->nho, S->halves ? "two views (ct / ct_b)" : "one CT (views by noise)", S->codes ? "yes" : "no", S->weight, S->center, S->scale, S->pap, S->srad > 0 ? ", supcon radius" : "");
         D->nsrc++;
     }
     json_free(j);
@@ -2242,7 +2244,8 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             if (gl && wgt > 0 && nview[v] >= 64) {
                 const int ng = nview[v]; nn_h2d(d_idx, vidx[v], (size_t)ng * 4); nn_h2d(d_code, vcode[v], (size_t)ng * 4); nn_h2d(d_xyz, vxyz[v], (size_t)ng * 12);
                 dn_gather_slabs(&HS, d_idx, ng, es, ns, nullptr, 0, nullptr, nullptr);   /* (iBOT points gathered below) */
-                dn_supcon(es, d_code, d_xyz, ng, nullptr, d_code, d_xyz, 0, ED, tau, hw, hr, ga, outs + 20, scr);
+                { const float sr = Dd->src[Sm->si].srad;   /* (source CT voxels -> view voxels) */
+                  dn_supcon_r(es, d_code, d_xyz, ng, nullptr, d_code, d_xyz, 0, ED, tau, hw, hr, sr > 0 ? sr * xf[v].n / xf[v].m : 0.f, ga, outs + 20, scr); }
                 if (wvar > 0) dn_varreg(es, ng, ED, vgam, wvar, ga, outs + 24);
                 dn_axpby(ga, ga, (size_t)ng * ED, wgt, 0.f);
                 HS.e1 = es; HS.g1 = ga; HS.n1 = ns; HS.i1 = d_idx; HS.ngt = ng;

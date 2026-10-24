@@ -15,7 +15,7 @@
 set -u
 R=${1:?run dir}; mkdir -p $R; R=$(cd $R && pwd); D=$(cd "$(dirname "$0")" && pwd)
 U=${U:-/vesuvius/ufsm/dino/src/build/ufsm}; GPU=${GPU:-0}
-export PSEUDO=${PSEUDO:-/vesuvius/ufsm/dino/pseudo/scans} PW=${PW:-1} MINPCT=${MINPCT:-2}
+export PSEUDO=${PSEUDO:-/vesuvius/ufsm/dino/pseudo/scans} PW=${PW:-1} MINPCT=${MINPCT:-2} SRAD=${SRAD:-96}
 cfg() {   # $1 = P
   local sp=$(( ($1 * 5 / 4 + 63) / 64 * 64 )); [ $sp -gt 512 ] && sp=512   # (the pseudo / GT boxes are 512^3: a larger source window skips them)
   echo "--recipe 1 --P $1 --source-P $sp --zoom ${ZOOM:-0.7,$(awk -v a=$sp -v b=$1 'BEGIN {printf "%.3f", a / b}')} --ssl-batch ${SB:-0} --local-P ${LP:-64} --locals 1 --attn-blocks 2 --attn-reg 1 --cls reg

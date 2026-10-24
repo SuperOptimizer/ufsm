@@ -29,6 +29,9 @@ void dn_gather(const void *logits, int h16, size_t p3, int D, const int *idx, in
    out[0], positives' / negatives' mean cosine out[1], out[2], anchors with positives out[3] (device float[4]); scratch (2 N + 8) floats */
 void dn_supcon(const float *a, const int *code, const int *xyz, int N, const float *t, const int *tcode, const int *txyz, int N2, int D,
                float tau, float hw, float hr, float *ga, float *out, float *scratch);
+/* dn_supcon with a pair radius pr (voxels, xyz units; 0 = all pairs): points farther apart are neither positives nor negatives */
+void dn_supcon_r(const float *a, const int *code, const int *xyz, int N, const float *t, const int *tcode, const int *txyz, int N2, int D,
+                 float tau, float hw, float hr, float pr, float *ga, float *out, float *scratch);
 /* DINO prototype loss: student s [N][D] unit, teacher t [N][D] unit, prototypes W [K][D] (student, raw) and Wt [K][D] (teacher), center [K];
    loss mean_i sum_k -softmax((t_i.ct_k - center_k) / tt) log softmax(s_i.c_k / ts) (c = W / |W|). Writes gs [N][D], gW [K][D], the batch
    mean of the teacher's raw logits into tmean [K]; out[0] loss, out[1] teacher entropy of the batch-mean assignment (nats), out[2] mean
