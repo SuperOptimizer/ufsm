@@ -2497,3 +2497,78 @@ int cmd_dino_boxes(int argc, char **argv) {
     free(buf); free(bits); z3_close(z); store_close(st);
     return 0;
 }
+
+/* ufsm dino-seamprobe CKPT SOURCES.json: does the attention stage's token (layer-normed, the iBOT head input) encode the absolute position
+   mod 16 -- the phase of the CT mirror's 16^3 codec blocks (a possible SSL shortcut)? Un-augmented 128^3 crops at random origins of the
+   unlabelled sources; per token cell the phase (origin + cell edge * g) mod 16 per axis as (cos, sin) of 2 pi phase / 16; a ridge regression
+   (closed form, double) fit on the first 3/4 of the crops, R^2 on the rest. A random-init checkpoint is the baseline. */
+int cmd_dino_seamprobe(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm dino-seamprobe CKPT SOURCES.json [--crops 40] [--P 128] [--per-crop 512] [--seed 1] [--gpu 0]\n"); return 2; }
+    const int ncrop = atoi(opt(argc, argv, "--crops", "40")), P = atoi(opt(argc, argv, "--P", "128")), pc = atoi(opt(argc, argv, "--per-crop", "512"));
+    uint64_t rs = (uint64_t)atoll(opt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 3;
+    dn_precision(0);
+    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
+    dn_precision_after_init(0);
+    unet_cfg cfg; int st = 0; if (unet_peek(argv[2], &cfg, &st)) { fprintf(stderr, "seamprobe: cannot read %s\n", argv[2]); return 1; }
+    if (!cfg.attn_blocks) { fprintf(stderr, "seamprobe: the net has no attention stage\n"); return 2; }
+    unet *u = unet_create(&cfg); if (unet_load(u, argv[2]) < 0) return 1;
+    unet_use_params(u, unet_ema_params(u));
+    unet_build(u, (shape5){1, cfg.cin, P, P, P}, 1);
+    size_t jn = 0; char *jt = nullptr; { FILE *f = fopen(argv[3], "rb"); if (!f) return 1; fseek(f, 0, SEEK_END); jn = (size_t)ftell(f); fseek(f, 0, SEEK_SET); jt = malloc(jn + 1); if (fread(jt, 1, jn, f) != jn) return 1; fclose(f); jt[jn] = 0; }
+    json *J = json_parse(jt, jn); const json *srcs = J ? json_get(J, "sources") : nullptr; if (!srcs) return 1;
+    z3 *cts[128]; float cen[128], sca[128]; int ns = 0;
+    for (size_t i = 0; i < srcs->n && ns < 128; i++) {
+        const json *s = json_at(srcs, i); if (!json_get(s, "ct_only")) continue;
+        char key[1024]; snprintf(key, sizeof key, "%s", json_str(json_get(s, "ct"), ""));
+        if (json_get(s, "min_level")) snprintf(key, sizeof key, "%s/%d", json_str(json_get(s, "ct"), ""), (int)json_num(json_get(s, "min_level"), 0));
+        store *sto = store_open(json_str(json_get(s, "root"), "")); z3 *z = sto ? z3_open(sto, key, json_str(json_get(s, "cache"), nullptr)) : nullptr; if (!z) continue;
+        const json *nm = json_get(s, "norm"); cen[ns] = (float)json_num(json_get(nm, "center"), 100); sca[ns] = (float)json_num(json_get(nm, "scale"), 40); cts[ns++] = z;
+    }
+    if (!ns) { fprintf(stderr, "seamprobe: no unlabelled (ct_only) sources\n"); return 1; }
+    const int G = P >> (cfg.nlev - 1), E = P / G, C = cfg.widths[cfg.nlev - 1], D = C + 1, T = 6;
+    const size_t p3 = (size_t)P * P * P; uint8_t *ub = malloc(p3); float *xh = calloc(p3 * cfg.cin, 4), *xd = nn_malloc(p3 * cfg.cin * 4), *tk = malloc((size_t)(G * G * G + 8) * C * 4);
+    double *XtX = calloc((size_t)D * D, 8), *XtY = calloc((size_t)D * T, 8); double *Fte = malloc((size_t)ncrop * pc * D * 8), *Yte = malloc((size_t)ncrop * pc * T * 8); long nte = 0;
+    const int ntr = ncrop * 3 / 4;
+    for (int c = 0; c < ncrop; c++) {
+        const int si = (int)(rng_next(&rs) % (uint64_t)ns); const z3_meta *m = z3_meta_of(cts[si]); int64_t o[3];
+        for (int tries = 0; ; tries++) {
+            for (int d = 0; d < 3; d++) o[d] = (int64_t)(rng_u(&rs) * (double)(m->shape[d] - P));
+            const int64_t n3[3] = {P, P, P}; if (z3_read(cts[si], o, n3, ub, 8)) return 1;
+            size_t nz = 0; for (size_t i = 0; i < p3; i += 11) nz += ub[i] > cen[si]; if (nz * 11 * 10 > p3 || tries > 50) break;   /* >= 10% papyrus */
+        }
+        for (size_t i = 0; i < p3; i++) xh[i] = ((float)ub[i] - cen[si]) / sca[si];
+        nn_h2d(xd, xh, p3 * cfg.cin * 4);
+        unet_forward(u, xd, (shape5){1, cfg.cin, P, P, P}, 1);
+        int S = 0, nreg = 0, Ct = 0; const float *td = unet_tokens(u, nullptr, &S, &Ct, &nreg); if (!td || Ct != C) { fprintf(stderr, "seamprobe: no tokens\n"); return 1; }
+        nn_d2h(tk, td, (size_t)S * C * 4);
+        for (int k = 0; k < pc; k++) {
+            const int g = (int)(rng_next(&rs) % (uint64_t)(G * G * G)), gz = g / (G * G), gy = g / G % G, gx = g % G; const float *row = tk + (size_t)(nreg + g) * C;
+            double f[1025], y[6], mu = 0, v = 0; for (int e = 0; e < C; e++) mu += row[e] / C; for (int e = 0; e < C; e++) v += (row[e] - mu) * (row[e] - mu) / C;
+            for (int e = 0; e < C; e++) f[e] = (row[e] - mu) / sqrt(v + 1e-6); f[C] = 1;   /* (layer-normed, + bias) */
+            const int64_t ph[3] = {(o[0] + (int64_t)E * gz) % 16, (o[1] + (int64_t)E * gy) % 16, (o[2] + (int64_t)E * gx) % 16};
+            for (int d = 0; d < 3; d++) { y[2 * d] = cos(2 * M_PI * ph[d] / 16); y[2 * d + 1] = sin(2 * M_PI * ph[d] / 16); }
+            if (c < ntr) { for (int a = 0; a < D; a++) { for (int b = 0; b < D; b++) XtX[(size_t)a * D + b] += f[a] * f[b]; for (int t = 0; t < T; t++) XtY[(size_t)a * T + t] += f[a] * y[t]; } }
+            else { memcpy(Fte + (size_t)nte * D, f, D * 8); memcpy(Yte + (size_t)nte * T, y, T * 8); nte++; }
+        }
+    }
+    const double lam = atof(opt(argc, argv, "--ridge", "1"));
+    for (int a = 0; a < C; a++) XtX[(size_t)a * D + a] += lam;
+    /* Cholesky solve XtX W = XtY */
+    double *Lc = malloc((size_t)D * D * 8); memcpy(Lc, XtX, (size_t)D * D * 8);
+    for (int j = 0; j < D; j++) { double s = Lc[(size_t)j * D + j]; for (int k = 0; k < j; k++) s -= Lc[(size_t)j * D + k] * Lc[(size_t)j * D + k]; if (s <= 0) s = 1e-12; Lc[(size_t)j * D + j] = sqrt(s);
+        for (int i = j + 1; i < D; i++) { double t = Lc[(size_t)i * D + j]; for (int k = 0; k < j; k++) t -= Lc[(size_t)i * D + k] * Lc[(size_t)j * D + k]; Lc[(size_t)i * D + j] = t / Lc[(size_t)j * D + j]; } }
+    double *W = malloc((size_t)D * T * 8);
+    for (int t = 0; t < T; t++) { double *z = malloc(D * 8);
+        for (int i = 0; i < D; i++) { double s = XtY[(size_t)i * T + t]; for (int k = 0; k < i; k++) s -= Lc[(size_t)i * D + k] * z[k]; z[i] = s / Lc[(size_t)i * D + i]; }
+        for (int i = D - 1; i >= 0; i--) { double s = z[i]; for (int k = i + 1; k < D; k++) s -= Lc[(size_t)k * D + i] * W[(size_t)k * T + t]; W[(size_t)i * T + t] = s / Lc[(size_t)i * D + i]; }
+        free(z); }
+    double r2 = 0; static const char *nm[6] = {"z cos", "z sin", "y cos", "y sin", "x cos", "x sin"};
+    fprintf(stderr, "seamprobe %s: %d crops (%d fit / %d test), %ld test tokens, token edge %d voxels, %d channels\n", argv[2], ncrop, ntr, ncrop - ntr, nte, E, C);
+    for (int t = 0; t < T; t++) {
+        double my = 0, ss = 0, se = 0; for (long r = 0; r < nte; r++) my += Yte[r * T + t] / nte;
+        for (long r = 0; r < nte; r++) { double p = 0; for (int a = 0; a < D; a++) p += Fte[r * D + a] * W[(size_t)a * T + t]; se += (Yte[r * T + t] - p) * (Yte[r * T + t] - p); ss += (Yte[r * T + t] - my) * (Yte[r * T + t] - my); }
+        const double r = ss > 0 ? 1 - se / ss : 0; r2 += r / T; fprintf(stderr, "  %-6s R^2 %.4f\n", nm[t], r);
+    }
+    fprintf(stderr, "seamprobe: mean test R^2 %.4f (0: no phase information; 1: the token encodes the absolute 16-phase)\n", r2);
+    return 0;
+}

@@ -65,6 +65,7 @@ int cmd_dinovol_read(int argc, char **argv);
 int cmd_dinovol_calib(int argc, char **argv);
 int cmd_dino_headfit(int argc, char **argv);
 int cmd_surf_eval(int argc, char **argv);   /* src/surfeval.c */
+int cmd_dino_seamprobe(int argc, char **argv);   /* src/dino.c */
 int cmd_dino_train(int argc, char **argv);   /* src/dino.c */
 int cmd_dino_embed(int argc, char **argv);
 int cmd_dino_halves(int argc, char **argv);
@@ -3316,6 +3317,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "surf-eval")) return cmd_surf_eval(argc, argv);
     if (!strcmp(cmd, "dino-train")) return cmd_dino_train(argc, argv);
     if (!strcmp(cmd, "dino-embed")) return cmd_dino_embed(argc, argv);
+    if (!strcmp(cmd, "dino-seamprobe")) return cmd_dino_seamprobe(argc, argv);
     if (!strcmp(cmd, "halves")) return cmd_dino_halves(argc, argv);
     if (!strcmp(cmd, "dino-boxes")) return cmd_dino_boxes(argc, argv);
     if (!strcmp(cmd, "tifxyz-map")) return cmd_tifxyz_map(argc, argv);
