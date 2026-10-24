@@ -82,6 +82,19 @@ typedef struct {
                                 input units ((t - mean) / sd, times the intensity jitter: the conditioning code) instead of a voxel size */
     int gpu_input;           /* train --gpu-input (needs xfmt and sample_gpu_input_ok): batch.x16 holds the CT channel only and batch.rad
                                 each sample's radial record (nn.h nn_input_rad builds the 4 input channels on the device, bit for bit) */
+    int axis_rec;            /* > 0: batch.axr holds each sample's scroll-axis record (SAMPLE_AXR floats, the layout of unet.h UNET_AXR:
+                                the axis centre per window plane along the window dim nearest the axis, through the symmetry and the
+                                warp) with div = axis_rec (the half-res factor); for train --attn-axis radial / --attn-pe scroll */
+    float chain_p;           /* > 0: window chains (train --attn-mem): a fresh draw starts a chain with this probability; its next chain_len - 1 draws
+                                of the same sample slot of the same worker walk from it (each chain_step x P, either along the scroll axis
+                                following its centre, or around it at the window's radius, one direction per chain) on the same source, level
+                                and symmetry, without warps or zoom; a rejected window ends the chain. batch.chid / chidx / choff (training
+                                only: no cover, holdout or deterministic batches) */
+    int chain_len;           /* windows per chain (default 8) */
+    float chain_step;        /* the step over the window size (default 0.5) */
+    int view_P;              /* > 0: scan fusion: per window a view_P^3 crop of the source's "view" (src/view.h: its own scan at the view level, or a
+                                registered partner scan) centred on the window, the window's symmetry applied (batch.xv; no spatial warps or
+                                zoom then); sources without a view give zero crops (batch.vok 0) */
     int pack_tm;             /* targets and mask as one code byte per voxel (batch.tm: SAMPLE_TM_* bits; t, m nullptr): every target value
                                 0 or 255 and the mask 0 / 1 (hard two-class targets, e.g. the side encoding; a soft value aborts). The
                                 trainer unpacks on the device (nn_unpack_tm): host batches 3 -> 1 byte per voxel */
@@ -117,9 +130,28 @@ typedef struct {
     uint8_t *pap;            /* B x P^3 papyrus labels when cfg.pap_head: 0 void, 1 papyrus, 255 ignored */
     uint8_t *w4, *wcomp;     /* B x P^3 each when cfg.wind4: winding mod 4 (63 codes per turn, 255 unknown) and its component (0..14, 255 none) */
     void *rad;               /* cfg.gpu_input: B radial records of NN_RAD_REC(Pz) bytes (nn.h), x / x16 then one channel per sample */
+    float *axr;              /* cfg.axis_rec: B records of SAMPLE_AXR(P) floats */
+    int64_t *chid;           /* cfg.chain_p: B chain ids (-1: not in a chain) */
+    int *chidx;              /* B: the window's index in its chain (0: the start) */
+    float *choff;            /* B x 3: the window's offset from the previous one of its chain in the window frame (z, y, x after the
+                                symmetry), over the window size P; 0 at a start */
+    uint8_t *xv;             /* cfg.view_P: B x view_P^3 view crops (uint8 CT, 0 outside) */
+    uint8_t *vok;            /* B: 1 where the window has a view crop */
     uint8_t *tm;             /* cfg.pack_tm: B x P^3 codes (bit 0: target 0 = 255, bit 1: target 1 = 255, bit 2: mask), t / m nullptr */
     int xch;                 /* input channels stored per sample in x / x16 (4, 5 with aux, 7 with cond, 1 with gpu_input) */
 } batch;
+#define SAMPLE_AXR(P) (4 + 2 * (P))   /* = unet.h UNET_AXR(P) */
+/* a window chain's next corner on (sample_cfg.chain_p; level-l voxels of a scan of shape `shape`): mode 0 along the axis, 1 around it,
+   dir +-1, step_frac x P. 0: on is inside the scan */
+int sample_chain_next(const axis *ax, int l, const int64_t shape[3], int Pz, int P, int mode, int dir, float step_frac, const int64_t o[3], int64_t on[3]);
+/* the scroll-axis record (SAMPLE_AXR(max(D, P)) floats, unet.h UNET_AXR) of a window of D x P x P source voxels at corner o (level
+   voxels), the axis centres cyz / cxz per source z, seen through the cube symmetry (perm, flip as sample.c sym); unwarped. Exposed for
+   tests */
+void sample_axis_record(float *r, const int64_t o[3], int D, int P, int hasax, const int perm[3], const int flip[3], const float *cyz,
+                        const float *cxz, int div);
+/* the same through the warp of sample_write_spatial_test (aug_seed, zoom, affine): cubes */
+void sample_axis_record_spatial_test(float *r, const int64_t o[3], int P, int hasax, const int perm[3], const int flip[3], const float *cyz,
+                                     const float *cxz, uint64_t aug_seed, float zoom, int affine);
 
 typedef struct sampler sampler;
 

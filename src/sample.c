@@ -7,6 +7,7 @@
 #include "spatial_augment.h"
 #include "edt.h"
 #include "srpair.h"
+#include "view.h"
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -40,7 +41,7 @@ sample_cfg sample_cfg_default(void) {
     sample_cfg c = {0};
     c.P = 128; c.B = 2; c.nworkers = 8; c.nbuf = 6; c.seed = 0;
     c.level_p[0] = 0.5; c.level_p[1] = 0.25; c.level_p[2] = 0.15; c.level_p[3] = 0.1;
-    c.min_fg = 0.3; c.empty_keep = 0.2; c.augment = 1; c.snap = 1; c.symmetry_p = 1;
+    c.min_fg = 0.3; c.empty_keep = 0.2; c.augment = 1; c.snap = 1; c.symmetry_p = 1; c.chain_len = 8; c.chain_step = 0.5f;
     return c;
 }
 
@@ -195,6 +196,10 @@ static batch alloc_batch(const sample_cfg *c) {
     const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0) + (c->cond ? 3 : 0);   /* input channels per sample (--gpu-input: the CT alone) */
     b.xch = (int)xc;
     b.rad = c->gpu_input ? halloc((size_t)c->B * NN_RAD_REC(PZ(c))) : nullptr;
+    b.axr = c->axis_rec > 0 ? halloc((size_t)c->B * SAMPLE_AXR(PZ(c) > c->P ? PZ(c) : c->P) * sizeof(float)) : nullptr;
+    b.chid = c->chain_p > 0 ? malloc((size_t)c->B * sizeof *b.chid) : nullptr; b.chidx = c->chain_p > 0 ? malloc((size_t)c->B * sizeof *b.chidx) : nullptr;
+    b.choff = c->chain_p > 0 ? malloc((size_t)c->B * 3 * sizeof *b.choff) : nullptr;
+    b.xv = c->view_P > 0 ? halloc((size_t)c->B * c->view_P * c->view_P * c->view_P) : nullptr; b.vok = c->view_P > 0 ? calloc((size_t)c->B, 1) : nullptr;
     b.x = c->xfmt || c->restore ? nullptr : halloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
     b.x16 = c->xfmt && !c->restore ? halloc((size_t)c->B * xc * p3 * 2) : nullptr;
     b.t = c->pack_tm ? nullptr : halloc((size_t)c->B * (c->restore == 1 ? 1 : NCH) * p3);   /* (task restore: the clean CT alone; real pairs: target + input crop) */
@@ -216,7 +221,7 @@ static batch alloc_batch(const sample_cfg *c) {
     return b;
 }
 
-static void free_batch(batch *b) { if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -615,6 +620,58 @@ static void rad_record(void *rec, const int64_t o[3], int D, int P, int hasax, s
     spatial_aug_tables(a, w); w += 6 * (size_t)P;
     for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { w[3 * i + j] = (float)a->R[i][j]; w[9 + 3 * i + j] = (float)a->A[i][j]; w[18 + 3 * i + j] = (float)a->Ainv[i][j]; }
     w[27] = (float)a->scale;
+}
+/* the scroll-axis record (sample.h SAMPLE_AXR, unet.h UNET_AXR) of a window: the axis points (source z k, cyz[k], cxz[k]) through the
+   inverse symmetry and the warp's forward map into window coordinates; the record's dim ad is the window dim the axis runs along most,
+   its centres per window plane along ad interpolated (extrapolated past the ends) along that polyline */
+static void axis_record(float *r, const int64_t o[3], int D, int P, int hasax, sym y, const float *cyz, const float *cxz, const spatial_aug *a,
+                        int div) {
+    const int warped = a && a->active, se[3] = {D, P, P}, np0 = D > P ? D : P;
+    memset(r, 0, SAMPLE_AXR(np0) * sizeof *r);
+    r[3] = (float)(div > 0 ? div : 1);
+    int ext[3]; for (int d = 0; d < 3; d++) ext[d] = se[y.perm[d]];
+    r[2] = (float)ext[0];
+    if (!hasax || D < 2) return;
+    double (*w)[3] = malloc((size_t)D * sizeof *w);
+    if (!w) abort();
+    for (int k = 0; k < D; k++) {
+        const double v[3] = {k, (double)cyz[k] - (double)o[1], (double)cxz[k] - (double)o[2]};
+        double u[3];
+        for (int d = 0; d < 3; d++) u[d] = y.flip[d] ? se[y.perm[d]] - 1 - v[y.perm[d]] : v[y.perm[d]];
+        if (warped) spatial_aug_forward(a, u, w[k]); else memcpy(w[k], u, sizeof u);
+    }
+    int ad = 0; double best = -1, q[2][3];   /* ad: the window dim nearest the image of the source z direction (not the axis polyline,
+                                                whose in-plane drift may be anything) */
+    for (int e = 0; e < 2; e++) {
+        const double v[3] = {e ? D - 1 : 0, 0.5 * (P - 1), 0.5 * (P - 1)}; double u[3];
+        for (int d = 0; d < 3; d++) u[d] = y.flip[d] ? se[y.perm[d]] - 1 - v[y.perm[d]] : v[y.perm[d]];
+        if (warped) spatial_aug_forward(a, u, q[e]); else memcpy(q[e], u, sizeof u);
+    }
+    for (int d = 0; d < 3; d++) { const double e = fabs(q[1][d] - q[0][d]); if (e > best) { best = e; ad = d; } }
+    const int du = ad == 0 ? 1 : 0, dv = ad == 2 ? 1 : 2, np = ext[ad], dir = w[D - 1][ad] >= w[0][ad] ? 1 : -1;
+    r[0] = (float)ad; r[1] = 1.f; r[2] = (float)np;
+    int k = 0;   /* the polyline segment k..k+1 holding plane t (k walks forward: the planes in the polyline's direction along ad) */
+    for (int i = 0; i < np; i++) {
+        const int t = dir > 0 ? i : np - 1 - i; const double tt = dir > 0 ? t : -(double)t;
+        while (k + 2 < D && (dir > 0 ? w[k + 1][ad] : -w[k + 1][ad]) < tt) k++;
+        const double a0 = w[k][ad], a1 = w[k + 1][ad], f = a1 != a0 ? (t - a0) / (a1 - a0) : 0;
+        r[4 + 2 * t] = (float)(w[k][du] + f * (w[k + 1][du] - w[k][du]));
+        r[5 + 2 * t] = (float)(w[k][dv] + f * (w[k + 1][dv] - w[k][dv]));
+    }
+    free(w);
+}
+void sample_axis_record(float *r, const int64_t o[3], int D, int P, int hasax, const int perm[3], const int flip[3], const float *cyz,
+                        const float *cxz, int div) {
+    sym y; for (int d = 0; d < 3; d++) { y.perm[d] = perm[d]; y.flip[d] = flip[d]; }
+    axis_record(r, o, D, P, hasax, y, cyz, cxz, nullptr, div);
+}
+void sample_axis_record_spatial_test(float *r, const int64_t o[3], int P, int hasax, const int perm[3], const int flip[3], const float *cyz,
+                                     const float *cxz, uint64_t aug_seed, float zoom, int affine) {
+    sym y; for (int d = 0; d < 3; d++) { y.perm[d] = perm[d]; y.flip[d] = flip[d]; }
+    spatial_aug a; spatial_aug_make(&a, aug_seed, P, 10, 1, 1, 1);   /* (as sample_write_spatial_test) */
+    if (zoom > 0 && zoom != 1) spatial_aug_zoom(&a, zoom);
+    if (affine) spatial_aug_affine(&a, aug_seed ^ 0x9e37u, .1, .06);
+    axis_record(r, o, P, P, hasax, y, cyz, cxz, &a, 1);
 }
 int sample_gpu_input_ok(const sample_cfg *c) {
     const int Pz = c->Pz > 0 ? c->Pz : c->P;
@@ -1762,30 +1819,69 @@ static int draw_restore_pair(sampler *sp, batch *b, int i, rng *r, uint8_t *big)
     atomic_fetch_add(&sp->produced, 1);
     return 0;
 }
-static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state) {
+/* window chains (sample_cfg.chain_p): per worker and sample slot, the chain's last window and its walk */
+typedef struct { int left, si, l, symi, mode, dir; int64_t o[3]; int64_t id; int idx; } chain_st;
+/* the next corner of a chain (level-l voxels of source s): mode 0 along the scroll axis (z +- step, y / x following the axis centre), mode 1
+   around it (the window centre rotated by step / radius about the axis at the window's middle plane; no axis: x +- step). 0: inside the scan */
+int sample_chain_next(const axis *ax, int l, const int64_t shape[3], int Pz, int P, int mode, int dir, float step_frac, const int64_t o[3], int64_t on[3]) {
+    const double scale = (double)(1 << l), step = fmax(1.0, round((double)step_frac * P));
+    const int64_t n[3] = {Pz, P, P};
+    memcpy(on, o, 3 * sizeof *on);
+    if (mode == 0) {
+        on[0] = o[0] + (int64_t)(dir * step);
+        if (ax->n > 0) {
+            double cy0, cx0, cy1, cx1;
+            axis_at(ax, (o[0] + 0.5 * Pz) * scale, &cy0, &cx0); axis_at(ax, (on[0] + 0.5 * Pz) * scale, &cy1, &cx1);
+            on[1] = o[1] + (int64_t)llround((cy1 - cy0) / scale); on[2] = o[2] + (int64_t)llround((cx1 - cx0) / scale);
+        }
+    } else if (ax->n > 0) {
+        double cy, cx; axis_at(ax, (o[0] + 0.5 * Pz) * scale, &cy, &cx); cy /= scale; cx /= scale;
+        const double vy = o[1] + 0.5 * P - cy, vx = o[2] + 0.5 * P - cx, R = fmax(hypot(vy, vx), (double)P), a = dir * step / R;
+        const double ny = cy + vy * cos(a) - vx * sin(a), nx = cx + vy * sin(a) + vx * cos(a);
+        on[1] = (int64_t)llround(ny - 0.5 * P); on[2] = (int64_t)llround(nx - 0.5 * P);
+    } else on[2] = o[2] + (int64_t)(dir * step);
+    for (int d = 0; d < 3; d++) if (on[d] < 0 || on[d] > shape[d] - n[d]) return 1;
+    return 0;
+}
+static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs);
+static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
+    const int rc = draw_(sp, b, i, r, xtmp, ttmp, big, tile_index, noise_state, cs);
+    if (rc == 0 && b->chid && (!cs || cs->id < 0)) { b->chid[i] = -1; b->chidx[i] = 0; b->choff[3 * i] = b->choff[3 * i + 1] = b->choff[3 * i + 2] = 0.f; }
+    return rc;
+}
+static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
     if (sp->cfg.restore == 2) return draw_restore_pair(sp, b, i, r, big);
     if (sp->cfg.restore) return draw_restore(sp, b, i, r, big);
     double pt = sp->prof ? tnow() : 0;
     const sample_cfg *c = &sp->cfg;
     const int P = c->P, Pz = PZ(c);   /* window Pz x P x P (Pz < P: a slab) */
     const size_t p3 = P3(sp);
+    /* a window chain: continue (cont: the chain's next window; any rejection ends it) or start one (the decision drawn only with chains on) */
+    const int chain_on = c->chain_p > 0 && cs && b->chid && !c->cover && !c->holdout && !c->deterministic;
+    const int cont = chain_on && cs->left > 0, left0 = cont ? cs->left : 0;
+    if (cs) { if (cont) cs->left = 0; else cs->id = -1; }
+    const int starting = chain_on && !cont && runif(r) < c->chain_p;
+    int chained = cont || starting;
     /* source by weight */
-    double u = runif(r) * sp->cum[sp->S->n - 1];
+    double u = cont ? 0 : runif(r) * sp->cum[sp->S->n - 1];
     int si = 0;
     if (c->cover) si = (int)c->cover->tiles[tile_index][0];
+    else if (cont) si = cs->si;
     else while (si < sp->S->n - 1 && sp->cum[si] < u) si++;
     source *s = &sp->S->src[si];
     if (c->holdout && !s->hold_n[0]) return 1;
     /* regions target? pick one region, then a level in {0,1} */
     int region_ch = -1, ri = -1;
     for (int ch = 0; ch < NCH; ch++) if (s->reg[ch] && s->reg[ch]->n) region_ch = ch;
+    if (region_ch >= 0) chained = 0;
+    if (cont && !chained) return 1;
     PROF_MARK(PS_SRC);
-    int l = c->cover ? 0 : pick_level(sp, s, r, region_ch);
+    int l = c->cover ? 0 : cont ? cs->l : pick_level(sp, s, r, region_ch);
     if (l < 0) return 1;
     /* zoom-out: the next coarser level, of which the warp below shows the central 1/2 zoom_out (an effective voxel size of this level's
        times zoom_out, from 2x coarser data); the dense-target tasks only (no band / phase / sheet / papyrus / condition / aux rasters) */
     double zoom_out = 0;
-    if (c->augment && c->geometry_augment && c->zoom_out_p > 0 && c->zoom_max > 1 && !c->cover && region_ch < 0 && s->geometry &&
+    if (!chained && !c->view_P && c->augment && c->geometry_augment && c->zoom_out_p > 0 && c->zoom_max > 1 && !c->cover && region_ch < 0 && s->geometry &&
         !c->band && !c->side && !c->sheet && !c->papyrus && !c->cond && !c->aux && runif(r) < c->zoom_out_p) {
         const double zf = exp(runif(r) * log(c->zoom_max > 2 ? 2 : c->zoom_max));
         if (l + 1 < MAXLEV && (s->max_level < 0 || l + 1 <= s->max_level) && level_ok(sp, s, si, l + 1, -1)) { l++; zoom_out = zf; }
@@ -1795,6 +1891,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     const z3_meta *m = z3_meta_of(ct);
     int64_t o[3], n[3] = {Pz, P, P};
     if (c->cover) memcpy(o, c->cover->tiles[tile_index] + 1, sizeof o);
+    else if (cont) { if (sample_chain_next(&s->ax, l, m->shape, Pz, P, cs->mode, cs->dir, c->chain_step, cs->o, o)) return 1; }
     else if (region_ch >= 0) {
         regions *R = s->reg[region_ch];
         ri = (int)rint_below(r, R->n);
@@ -1818,7 +1915,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     } else {
         for (int d = 0; d < 3; d++) { if (m->shape[d] < n[d]) return 1; o[d] = rint_below(r, m->shape[d] - n[d] + 1); }
     }
-    if (!c->cover && c->snap && !c->holdout && region_ch < 0) {   /* training only: snapping a validation origin can leave its holdout */
+    if (!c->cover && c->snap && !c->holdout && region_ch < 0 && !chained) {   /* training only: snapping a validation origin can leave its holdout */
         for (int d = 0; d < 3; d++) {
             int64_t cs = m->chunk[d]; if (cs <= 0) continue;
             o[d] -= o[d] % cs;
@@ -2145,6 +2242,11 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
         ia = (float)a; ib = (float)bb; isg = (float)sg;
     }
     if (c->augment && c->symmetry_p < 1 && runif(r) >= c->symmetry_p) y = sym_of(0);
+    int symi = 0;   /* (a chain keeps its start's symmetry: the windows share one frame) */
+    if (chained) {
+        if (cont) y = sym_of(cs->symi);
+        else for (int k = 0; k < 48; k++) { const sym t = sym_of(k); if (!memcmp(&t, &y, sizeof t)) { symi = k; break; } }
+    }
     if (c->augment && c->axis_jitter > 0 && s->ax.n > 0 && runif(r) < (c->axis_jitter_p > 0 ? c->axis_jitter_p : .1)) {
         float jy = (float)((2 * runif(r) - 1) * c->axis_jitter / scale);
         float jx = (float)((2 * runif(r) - 1) * c->axis_jitter / scale);
@@ -2170,7 +2272,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     const int stored_phase = !c->band && c->side == 2 && s->phase && !c->phase_dense && (pshift == 1 || ((pshift == 0 || pshift == 2) && s->phase_direct));   /* (2: a 9.6 um phase interpolated into 2.4 um windows) */
     const int band_sample = (c->band || c->side) && s->band && (l == 0 || stored_phase);   /* (c->side without c->band: task unwrap, the phase only) */
     const int warp_ok = !band_sample || (stored_phase && !c->band && !c->cond);   /* a stored phase warps (warp_phase); band fields do not */
-    if (c->augment && c->geometry_augment && s->geometry && warp_ok) {
+    if (c->augment && c->geometry_augment && s->geometry && warp_ok && !chained && !c->view_P) {
         spatial_aug_make(&spatial,rnext(r),P,c->rotate_degrees,c->rotate_p,c->elastic,c->elastic_p);
         if (zoom_out > 0) spatial_aug_zoom(&spatial, .5 * zoom_out);   /* (the coarser level read above) */
         else if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(r) < c->zoom_p) spatial_aug_zoom(&spatial, exp(runif(r) * log(c->zoom_min)));
@@ -2281,6 +2383,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H,
                  app, noise_state, noise_state ? noise_state + P : nullptr, c->gpu_input);   /* the CT appearance plan in the row-vectorised writer (cubes) */
     if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial);   /* the radial channels: on the device */
+    if (c->axis_rec > 0) axis_record(b->axr + (size_t)i * SAMPLE_AXR(Pz > P ? Pz : P), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial, c->axis_rec);
     free(params);
     if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
         uint8_t *aw = tp_get(p3, 1), *as = tp_get(p3, 0);
@@ -2347,6 +2450,30 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     b->level[i] = (int8_t)l;
     memcpy(b->corner[i], o, sizeof o);
     for (int d = 0; d < 3; d++) b->corner[i][d] <<= l;
+    if (c->view_P) {   /* scan fusion: the view crop centred on the window, the window's symmetry (unwarped windows: no spatial aug with views) */
+        const int Pv = c->view_P; const size_t pv3 = (size_t)Pv * Pv * Pv; uint8_t *dst = b->xv + (size_t)i * pv3;
+        b->vok[i] = 0;
+        const sview *vw = s->view_h;
+        if (vw && l >= vw->lv) {
+            uint8_t *tmp = malloc(pv3); int64_t vo[3]; const int64_t wn[3] = {Pz, P, P};
+            sview_origin(l, vw->lv, o, wn, Pv, vo);
+            if (!tmp || sview_read(vw, vw->has_map ? nullptr : source_ct(s, vw->lv), vo, Pv, tmp)) { free(tmp); return 1; }
+            sym_u8(tmp, dst, Pv, Pv, y); free(tmp); b->vok[i] = 1;
+        } else memset(dst, 0, pv3);
+    }
+    if (chained) {   /* the chain's bookkeeping and the window's offset from its previous one in the window frame */
+        float off[3] = {0.f, 0.f, 0.f};
+        if (cont) {
+            for (int d = 0; d < 3; d++) off[d] = (float)((y.flip[d] ? -1 : 1) * (double)(o[y.perm[d]] - cs->o[y.perm[d]]) / P);
+            cs->idx++; cs->left = left0 - 1;
+        } else {
+            static _Atomic int64_t chain_ids;
+            cs->id = atomic_fetch_add(&chain_ids, 1); cs->idx = 0; cs->left = c->chain_len - 1;
+            cs->si = si; cs->l = l; cs->symi = symi; cs->mode = runif(r) < 0.5 ? 0 : 1; cs->dir = runif(r) < 0.5 ? -1 : 1;
+        }
+        memcpy(cs->o, o, sizeof o);
+        b->chid[i] = cs->id; b->chidx[i] = cs->idx; memcpy(b->choff + 3 * i, off, sizeof off);
+    }
     atomic_fetch_add(&sp->produced, 1);
     return 0;
 }
@@ -2375,6 +2502,8 @@ static void *worker(void *arg) {
     uint8_t *big = wbig_alloc(10 * p3, 0);   /* [0,P^3) CT (also the coarse probe), [P^3, 9P^3) (2P)^3 region scratch, [9P^3, 10P^3) mask */
     const int det = sp->cfg.deterministic;
     float *noise_state = sp->cfg.ct_augment ? malloc(((size_t)sp->cfg.P * sp->cfg.P + sp->cfg.P) * sizeof(float)) : nullptr;
+    chain_st *chs = calloc((size_t)sp->cfg.B, sizeof *chs);   /* (window chains: one per sample slot) */
+    for (int k = 0; chs && k < sp->cfg.B; k++) chs[k].id = -1;
     if (!xtmp || !ttmp || !big || (sp->cfg.ct_augment && !noise_state)) {
         atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1);
         pthread_mutex_lock(&sp->mu); pthread_cond_broadcast(&sp->cv_ready); pthread_cond_broadcast(&sp->cv_free); pthread_mutex_unlock(&sp->mu);
@@ -2404,7 +2533,7 @@ static void *worker(void *arg) {
         int fail = 0, filled = 0; unsigned spin = 0;
         for (int i = 0; i < sp->cfg.B && !atomic_load(&sp->stop);) {
             if (det && (sp->cfg.cover || (spin == 0 && fail == 0))) rseed(&r, sp->cfg.seed * 0x9e3779b97f4a7c15ull + (sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i)) * 1000003ull + 1);   /* per-sample stream */
-            int rc = draw(sp, b, i, &r, xtmp, ttmp, big, sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i), noise_state);
+            int rc = draw(sp, b, i, &r, xtmp, ttmp, big, sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i), noise_state, chs ? chs + i : nullptr);
             if (rc == 0) { i++; filled = i; fail = 0; spin = 0; }
             else if (rc > 0 && ++spin == (1u << 22)) { fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d), stopping\n", spin, sp->cfg.P); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); }
             else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); } }
@@ -2415,7 +2544,7 @@ static void *worker(void *arg) {
         pthread_cond_broadcast(&sp->cv_free);
         pthread_mutex_unlock(&sp->mu);
     }
-    free(xtmp); free(ttmp); free(big); free(noise_state); tp_drain();
+    free(xtmp); free(ttmp); free(big); free(noise_state); free(chs); tp_drain();
     free(wa);
     return nullptr;
 }
@@ -2593,6 +2722,18 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
             (cfg->augment == 1 || cfg->augment == 2) ? "symmetries that move z (use --zfix 1)" : (cfg->erode && cfg->level_p[0] > 0) ? "native-level erosion" : nullptr;
         for (int i = 0; !why && i < S->n; i++) for (int ch = 0; ch < NCH; ch++) if (S->src[i].reg[ch]) why = "region targets";
         if (why) { fprintf(stderr, "sampler: slab windows (Pz %d < P %d) do not support %s\n", cfg->Pz, cfg->P, why); return nullptr; }
+    }
+    if (cfg->view_P) {   /* scan fusion: open the sources' views (kept for the process: train / val samplers share them) */
+        if (cfg->view_P < 0 || cfg->view_P & 1 || cfg->restore || cfg->sheet) { fprintf(stderr, "sampler: view_P must be even, without restore / winding-geometry tasks\n"); return nullptr; }
+        int nv = 0;
+        for (int i = 0; i < S->n; i++) {
+            source *s = &S->src[i];
+            if (!s->view) continue;
+            if (!s->view_h && !(s->view_h = sview_open(s->view_map, s->view_level, s->um, S->cache))) { fprintf(stderr, "sampler: %s: cannot open the view\n", s->name); return nullptr; }
+            if (!s->view_map && !source_ct(s, s->view_level)) { fprintf(stderr, "sampler: %s: no CT level %d for the view\n", s->name, s->view_level); return nullptr; }
+            nv++;
+        }
+        if (!nv) fprintf(stderr, "sampler: warning: view_P %d but no source has a \"view\" (zero crops)\n", cfg->view_P);
     }
     sampler *sp = calloc(1, sizeof *sp);
     sp->S = S;

@@ -45,6 +45,80 @@ No teacher models, no distillation. All upstream data is re-exported once into t
   tokens, 2 and 4 heads, with / without RoPE and registers; attention alone at 4100 tokens vs the double analytic backward; PEG and the
   layouts), tests/test_hybrid_identity.c (production MX storage: a fresh stage on a conv net's trunk reproduces its logits / trunk
   gradients up to re-quantisation; a random stage: every stage tensor gets a gradient; checkpoint round trip).
+- Scroll-coordinate attention (2026-10-24, default off: `unet_cfg.attn_axis`, `attn_pe` 3, `attn_repeat`; train `--attn-axis full|radial
+  --attn-pe scroll --attn-repeat K`). Each window carries its scroll-axis record (sample.c axis_record: the axis centre per window plane
+  along the window dim nearest the source z direction, through the cube symmetry and the warp's forward map; predict: the axis rows of
+  the window or its TTA transform; unet_set_attn_axis). The stage averages it onto the bottleneck planes and plans rays (src/nn_attn_ray.cu,
+  host): per plane `UFSM_ATTN_RAY_MULT` (2) x Pmax rays leave the axis centre over the angles that see the plane (all of them when the
+  axis is inside), unit-spaced samples centred on each ray's chord (at most Nr = the plane diagonal + 1). `radial`: each block's q / k / v
+  are gathered onto the ray samples (bilinear, edge-clamped), attention runs per ray (sheet crossings in order; keys past a ray's length
+  masked in the fp32 and fp16 cores; MX-fp8 falls back to fp16), and the output is scattered back normalised (o[v] = sum w o_s / sum w);
+  the backward is the exact adjoint. `scroll` RoPE: rotary on each token's continuous (r, arc = theta x rc, plane index), 16 head dims
+  per axis, on the rays or (full attention) on the grid tokens. `attn_repeat` K runs the blocks K times with the same parameters
+  (gradients summed). Costs (laptop 5080, one block, two forwards + backward, fp16 core, MX-fp4 linears, kept forwards): 16^3 tokens
+  (P512, 6 levels) C 192 full 2.23 ms / radial 1.70-1.76 ms (3.0x ray slots, 35-53 percent used), scratch 96 -> 232 MB; 24^3 (P768,
+  13.8k tokens) 17.3 / 6.5-7.3 ms, 323 -> 767 MB; C 288: 16^3 3.34 / 2.5-2.7 ms, 24^3 26.0 / 9.6-10.5 ms. Grid coverage (tokens some
+  ray sample touches; the rest keep their residual only) 0.998 with the axis inside the window at mult 2, 1.000 outside or at mult 3.
+  Tests: tests/test_attn_ray.c (gather / scatter vs a double stencil and their adjoints; radial and scroll-RoPE blocks vs finite
+  differences of a double forward, cores 0 and 1), tests/test_hybrid_identity.c (fresh radial / scroll / repeated stages are the
+  identity; a tied 1 x 2 stage equals the untied 2-block stage with its gradient the sum; checkpoint keeps the flags),
+  tests/test_gpu_input.c (the records' directions = the radial input channels for every symmetry and slabs, warped within 0.2 rad).
+  The fp16 core's dK / dV kernel zeroes P for masked keys: a padded ray slot (k = 0) scored above very negative valid scores made
+  exp2(s - lse) inf and the masked row's 0 x inf NaN (the k-gain gradients; 14-28 skipped steps per 500 before the fix; test_attn_ray
+  test_masked_keys). Smoke (laptop, unwrap2 wind96 widths, P256, 2 blocks radial + scroll, 500 steps): no non-finite steps, 4.83
+  samples/s vs 4.99 without the stage (~3 percent); P512 one-batch step 1.39 s none / 1.41 full / 1.41 radial.
+- Window memory tokens (2026-10-24, default off: `unet_cfg.attn_mem` M; train `--attn-mem M --chain-p p --chain-len L --chain-step s`;
+  Transformer-XL style, no extra batch memory). M token rows follow the registers in every attention sequence; row j = learned row +
+  gate (x) mem_in[j] + W_off (dz, dy, dx, valid) (gate and W_off zero-initialised: a fresh stage stays the identity). After the last block
+  the rows are the window's memory output (unet_attn_mem_out). The sampler draws window chains (sample_chain_next: with probability p a
+  fresh draw starts a chain; the slot's next L - 1 draws walk s x P from it along the scroll axis or around it, same source / level /
+  symmetry, no zoom-out / spatial warp; batch chid / chidx / choff). train keeps a per-GPU bank (64 entries) of each chain's latest
+  memory output (device rows, a constant: stop-gradient) and feeds the successor its predecessor's rows with the offset (window frame,
+  / P) and valid 1; chain starts, misses and validation get zero memory with valid 0. predict carries the memory from the previous window in its
+  walk order when that lies within a window size (else zero); TTA passes run without memory. Needs full attention (not radial). Tests: test_attn_ray test_mem
+  (add / gate / W_off gradients / out vs double), test_hybrid_identity (identity with a random memory, a random stage: memory changes the
+  logits, none = zero memory bit for bit, gate / W_off gradients nonzero, the carried rows change the next window, checkpoint),
+  test_wind_sampler (chain ids / indices / offsets per slot). The stage builds lazily at the first forward: the build no longer resets
+  the set memory (it made the first window's memory zero).
+  Smoke (laptop, unwrap2 wind96 widths, P256, 2 full blocks, 300 steps, 3 workers; sampler-bound): 4.40 samples/s vs 4.66 without
+  memory, every continuation (215) got its predecessor's memory, no non-finite steps.
+- Scan fusion as joint attention (2026-10-24, default off: `unet_cfg.view_P`, `view_patch`; train `--view-P Pv --view-patch k` (8);
+  sources `"view": {"level": L, "map": REG.json}`; predict `--view-level L [--view-map REG.json]`). Per window a Pv^3 uint8 crop of a second
+  scan centred on the window (src/view.h sview_origin: level-L voxels of the source's grid, L <= the window level), either the scan itself
+  at a finer level (no map: e.g. the 2.4 um detail around a 9.6 um window) or a registered partner scan through a ufsm reg map
+  (fine(c) = A^-1 (c + D(c)), reg_read_fine + reg_resample, trilinear from the partner level nearest the voxel size; e.g. Paris 4
+  137 keV on the 78 keV grid: ~/ufsm-data/reg/pairs/PParis4_2to2/final/reg.json). The crop takes the window's cube symmetry (sym_u8);
+  windows with a view skip zoom-out and the spatial warp. In the stage the crop is cut into (Pv / k)^3 patches of k^3 voxels, each a token
+  row after the registers / memory rows: learned row (its position) + W patch / 255 + b; the grid tokens attend to them in every block
+  (the rows also get the blocks' updates), so a fresh stage is still the identity. No view (or a source without one) = zero patches.
+  Needs full attention. Tests: test_attn_ray test_view (patch / add / gather / bias gradient vs host), test_hybrid_identity (identity,
+  random stage: the view changes the logits, none = zero view bit for bit, W / b gradients nonzero, checkpoint), test_wind_sampler (the
+  crop = the CT box centred on the window).
+  Smoke (same setup, view_P 32 / patch 8 = 64 view rows beside 512 grid tokens): self view 4.40 samples/s vs 4.66; the Paris 4
+  137 keV scan through PParis4_2to2 (mirror reads) 4.02. Partner crops match the 78 keV crop where the partner exists (mean 45.9 vs
+  45.7) and are zero beyond its z range (coarse level-0 z ~42100..48700).
+- Deformable attention (2026-10-24, default off: `unet_cfg.attn_deform` K, `attn_dlev` L (2, at most 3); train `--attn-deform K
+  [--attn-dlev L]`; src/nn_attn_dfm.cu). Multi-scale 3D Deformable-DETR in place of each block's self-attention (subsumes the planned
+  normal rays / anisotropic bias / spiral RoPE): per token a linear layer (H L K x 4 rows: per head, level and point a 3-D offset in
+  level-l voxels, then the H x L x K logits; zero weights, the offsets' bias a grid prior of Fibonacci-sphere directions at radius
+  (1 + k % 4) / 2 bottleneck voxels, logits 0) and per head a softmax over the L K logits; the head's values are trilinearly sampled
+  (zero outside the level's grid) at the token's centre on level l plus the offset and summed. Level 0 = the bottleneck's tokens (value
+  projection C x C, the q / k / v slot), levels 1..L-1 = the next finer encoder outputs (2^l x the grid, their raw a2 LayerNorm'd
+  without affine; a value projection C x C_l each, no gradient into the trunk from them). Then the out projection (zero init: a fresh
+  stage is the identity) and the SwiGLU MLP as before. No registers / memory / view / radial / RoPE. The offset / logit and finer-level
+  projections train with Adam (Muon: the value, out and MLP matrices); the finer-level weight gradient runs in fp32 cuBLAS (MX-fp4 was
+  4x slower at its long K). Kernels: one warp per (token, head), lanes on the head's 48 channels; the backward scatters dV with atomics
+  and reduces the offset / logit gradients over the warp. Tests: test_attn_dfm (kernels: o, every level's dV, d offsets / d logits vs
+  double central differences with points just inside voxel boundaries and partly / wholly outside the grids; whole blocks with 1 / 2 /
+  3 levels vs a double forward incl. the finer projections, the kept forward = the recompute, zero-init identity bit for bit),
+  test_hybrid_identity (fresh stage identity, random stage: all 20 block tensors nonzero finite gradients, checkpoint, inference build
+  = training build).
+  Bench (laptop 5080, C 192 / 4 heads, F 512, one block, teacher fwd + student fwd + bwd, kept forward; ms and block scratch):
+  P512 (16^3 tokens): full 2.42 / 96 MB; K8 L2 2.71 / 136 MB; K16 L2 3.56 / 146 MB; K32 L2 5.75 / 165 MB; K8 L3 6.46 / 544 MB;
+  K16 L3 8.52 / 558 MB. P768 (24^3): full 17.2 / 323 MB; K8 L2 9.17 / 460 MB; K16 L2 13.2 / 492 MB; K32 L2 20.4 / 556 MB; K8 L3 22.8 /
+  1835 MB. Flash attention keeps no S x S matrix, so at these token counts deformable costs MORE memory (the finer levels' fp32
+  values: 8^l x the grid x C per block) and is only faster from ~P768 (K <= 16, L 2). Smoke (P256, 2 blocks, K16): L2 4.31-4.55
+  samples/s, L3 4.62-4.70 (sampler-bound; full attention 4.66), finite.
 - dino-train for large windows: `--head-slab Z` runs the 1^3 head per z-slab of Z planes (unet head slabs): no whole-window logits
   (P 512 at D 32: 8.6 GB of fp16 logits) and no dense fp32 logit gradient (17 GB) -- the points' embeddings are gathered per slab, and
   in the backward's head step their gradients are scattered into each slab's fp16 logit gradient. `--mem lean` sets train's smallest

@@ -83,7 +83,7 @@ __device__ __forceinline__ void mm_pt(float (*acc)[4], float (*p)[4], const __ha
 
 /* ---- pack: qkv [T][3C] fp32 -> QK-norm (+ gain), RoPE, fp16 head-major q / k / v; rows T..T+63 zero; amx[1] = max |v| ---- */
 __global__ void k_fa_pack(const float *__restrict__ qkv, const float *__restrict__ qg, const float *__restrict__ kg, __half *Qh, __half *Kh, __half *Vh,
-                          float *rq, float *rk, float *amx, long long T, int C, int S, int Hh, int W, int nreg, int rope, float lbase) {
+                          float *rq, float *rk, float *amx, long long T, int C, int S, int Hh, int W, int nreg, int rope, float lbase, const float *gpos) {
     const int H = C / HD; const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     if (i >= (T + FT) * H * 3) return;
     const int p = (int)(i % 3); const long long th = i / 3; const int h = (int)(th % H); const long long t = th / H;
@@ -103,10 +103,10 @@ __global__ void k_fa_pack(const float *__restrict__ qkv, const float *__restrict
         (p ? rk : rq)[t * H + h] = r;
         const int ts = (int)(t % S) - nreg;
         if (rope && ts >= 0) {
-            const int pos[3] = {ts / (Hh * W), (ts / W) % Hh, ts % W};
+            const float pos[3] = {gpos ? gpos[3 * t] : (float)(ts / (Hh * W)), gpos ? gpos[3 * t + 1] : (float)((ts / W) % Hh), gpos ? gpos[3 * t + 2] : (float)(ts % W)};
 #pragma unroll
             for (int pr = 0; pr < 24; pr++) {
-                const int ax = pr / 8, fi = pr % 8; float sn, cs; sincosf((float)pos[ax] * exp2f(-lbase * (float)fi / 8.f), &sn, &cs);
+                const int ax = pr / 8, fi = pr % 8; float sn, cs; sincosf(pos[ax] * exp2f(-lbase * (float)fi / 8.f), &sn, &cs);
                 const float a = v[ax * 16 + 2 * fi], b = v[ax * 16 + 2 * fi + 1];
                 v[ax * 16 + 2 * fi] = a * cs - b * sn; v[ax * 16 + 2 * fi + 1] = a * sn + b * cs;
             }
@@ -123,12 +123,12 @@ __global__ void k_fa_pack(const float *__restrict__ qkv, const float *__restrict
 
 /* ---- forward: grid (ceil(S / 64), H, nseq) ---- */
 __global__ void __launch_bounds__(128) k_fa_fwd(const __half *__restrict__ Qh, const __half *__restrict__ Kh, const __half *__restrict__ Vh, float *__restrict__ o,
-                                                float *__restrict__ lse, int S, int H, int C, long long Tp, float sl2) {
+                                                float *__restrict__ lse, int S, int H, int C, long long Tp, float sl2, const int *lens) {
     const int seq = blockIdx.z, h = blockIdx.y, q0 = blockIdx.x * FT, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     __shared__ __align__(16) __half Ks[2][FT * FS], Vs[2][FT * FS];
     const size_t base = (size_t)h * Tp + (size_t)seq * S;
     const __half *Q = Qh + base * HD, *K = Kh + base * HD, *V = Vh + base * HD;
-    const int nt = (S + FT - 1) / FT;
+    const int SK = lens ? lens[seq] : S, nt = (SK + FT - 1) / FT;   /* (keys past the sequence's length masked) */
     stage(Ks[0], K, tid); stage(Vs[0], V, tid); cpa_commit();
     unsigned qa[3][4]; afrag(qa, Q, q0 + warp * 16 + g, t);
     float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f}, acc[6][4];
@@ -146,7 +146,7 @@ __global__ void __launch_bounds__(128) k_fa_fwd(const __half *__restrict__ Qh, c
 #pragma unroll
         for (int j = 0; j < 8; j++)
 #pragma unroll
-            for (int q = 0; q < 4; q++) { const float v = kb + 8 * j + 2 * t + (q & 1) < S ? s[j][q] * sl2 : -INFINITY; s[j][q] = v; mx[q >> 1] = fmaxf(mx[q >> 1], v); }
+            for (int q = 0; q < 4; q++) { const float v = kb + 8 * j + 2 * t + (q & 1) < SK ? s[j][q] * sl2 : -INFINITY; s[j][q] = v; mx[q >> 1] = fmaxf(mx[q >> 1], v); }
         float corr[2];
 #pragma unroll
         for (int r = 0; r < 2; r++) {
@@ -170,10 +170,10 @@ __global__ void __launch_bounds__(128) k_fa_fwd(const __half *__restrict__ Qh, c
     for (int r = 0; r < 2; r++) {
         const int i = q0 + warp * 16 + g + 8 * r;
         if (i >= S) continue;
-        const float il = 1.f / l[r]; float *orow = o + ((size_t)seq * S + i) * C + h * HD;
+        const float il = l[r] > 0.f ? 1.f / l[r] : 0.f; float *orow = o + ((size_t)seq * S + i) * C + h * HD;
 #pragma unroll
         for (int j = 0; j < 6; j++) *(float2 *)(orow + 8 * j + 2 * t) = make_float2(acc[j][2 * r] * il, acc[j][2 * r + 1] * il);
-        if (!t) lse[((size_t)seq * H + h) * S + i] = m[r] + log2f(l[r]);
+        if (!t) lse[((size_t)seq * H + h) * S + i] = l[r] > 0.f ? m[r] + log2f(l[r]) : 0.f;   /* (a length-0 sequence: zero output) */
     }
 }
 
@@ -210,7 +210,7 @@ __global__ void k_fa_bprep(const float *__restrict__ o, const float *__restrict_
 /* ---- dK, dV: grid (ceil(S / 64) key tiles, H, nseq); query tiles stream ---- */
 __global__ void __launch_bounds__(128) k_fa_dkv(const __half *__restrict__ Qh, const __half *__restrict__ Kh, const __half *__restrict__ Vh, const __half *__restrict__ dOh,
                                                 const float *__restrict__ lse, const float *__restrict__ Dv, const float *__restrict__ amx, float *__restrict__ dqkn,
-                                                int S, int H, int C, long long Tp, float sl2, float scale) {
+                                                int S, int H, int C, long long Tp, float sl2, float scale, const int *lens) {
     const int seq = blockIdx.z, h = blockIdx.y, j0 = blockIdx.x * FT, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     __shared__ __align__(16) __half Qs[2][FT * FS], Gs[2][FT * FS];
     __shared__ float Ls[2][FT], Ds[2][FT];
@@ -218,7 +218,9 @@ __global__ void __launch_bounds__(128) k_fa_dkv(const __half *__restrict__ Qh, c
     const __half *Q = Qh + base * HD, *K = Kh + base * HD, *V = Vh + base * HD, *G = dOh + base * HD;
     const float *L = lse + ((size_t)seq * H + h) * S, *Dr = Dv + ((size_t)seq * H + h) * S;
     const int e = fa_e(amx), ks = fa_ks(amx); const float sks = exp2f((float)ks);
-    const int nt = (S + FT - 1) / FT;
+    const int nt = (S + FT - 1) / FT, SK = lens ? lens[seq] : S;
+    /* (a masked key's row: P 0, not exp2(s - lse), which overflows once its score passes the valid keys' -> inf x 0 = NaN) */
+    const float kv[2] = {j0 + warp * 16 + g < SK ? 1.f : 0.f, j0 + warp * 16 + g + 8 < SK ? 1.f : 0.f};
     stage(Qs[0], Q, tid); stage(Gs[0], G, tid); cpa_commit();
     if (tid < FT) { Ls[0][tid] = tid < S ? L[tid] : INFINITY; Ds[0][tid] = tid < S ? Dr[tid] : 0.f; }
     unsigned ka[3][4], va[3][4]; afrag(ka, K, j0 + warp * 16 + g, t); afrag(va, V, j0 + warp * 16 + g, t);
@@ -242,7 +244,7 @@ __global__ void __launch_bounds__(128) k_fa_dkv(const __half *__restrict__ Qh, c
 #pragma unroll
             for (int q = 0; q < 4; q++) {
                 const int c = 8 * j + 2 * t + (q & 1);
-                const float pv = exp2f(p[j][q] * sl2 - Ls[cur][c]);
+                const float pv = kv[q >> 1] != 0.f ? exp2f(p[j][q] * sl2 - Ls[cur][c]) : 0.f;
                 p[j][q] = pv; ds[j][q] = pv * (ds[j][q] - Ds[cur][c]) * sks;
             }
         mm_pt(dv, p, Gs[cur], lane);    /* dV += P^T dO */
@@ -255,10 +257,11 @@ __global__ void __launch_bounds__(128) k_fa_dkv(const __half *__restrict__ Qh, c
         const int j = j0 + warp * 16 + g + 8 * r;
         if (j >= S) continue;
         float *row = dqkn + ((size_t)seq * S + j) * 3 * C + h * HD;
+        const float mk = lens && j >= lens[seq] ? 0.f : 1.f;   /* (a masked key: zero gradients) */
 #pragma unroll
         for (int jd = 0; jd < 6; jd++) {
-            *(float2 *)(row + C + 8 * jd + 2 * t) = make_float2(dk[jd][2 * r] * fk, dk[jd][2 * r + 1] * fk);
-            *(float2 *)(row + 2 * C + 8 * jd + 2 * t) = make_float2(dv[jd][2 * r] * fv, dv[jd][2 * r + 1] * fv);
+            *(float2 *)(row + C + 8 * jd + 2 * t) = make_float2(mk * dk[jd][2 * r] * fk, mk * dk[jd][2 * r + 1] * fk);
+            *(float2 *)(row + 2 * C + 8 * jd + 2 * t) = make_float2(mk * dv[jd][2 * r] * fv, mk * dv[jd][2 * r + 1] * fv);
         }
     }
 }
@@ -266,14 +269,14 @@ __global__ void __launch_bounds__(128) k_fa_dkv(const __half *__restrict__ Qh, c
 /* ---- dQ: grid (ceil(S / 64) query tiles, H, nseq); key tiles stream ---- */
 __global__ void __launch_bounds__(128) k_fa_dq(const __half *__restrict__ Qh, const __half *__restrict__ Kh, const __half *__restrict__ Vh, const __half *__restrict__ dOh,
                                                const float *__restrict__ lse, const float *__restrict__ Dv, const float *__restrict__ amx, float *__restrict__ dqkn,
-                                               int S, int H, int C, long long Tp, float sl2, float scale) {
+                                               int S, int H, int C, long long Tp, float sl2, float scale, const int *lens) {
     const int seq = blockIdx.z, h = blockIdx.y, q0 = blockIdx.x * FT, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     __shared__ __align__(16) __half Ks[2][FT * FS], Vs[2][FT * FS];
     const size_t base = (size_t)h * Tp + (size_t)seq * S;
     const __half *Q = Qh + base * HD, *K = Kh + base * HD, *V = Vh + base * HD, *G = dOh + base * HD;
     const float *L = lse + ((size_t)seq * H + h) * S, *Dr = Dv + ((size_t)seq * H + h) * S;
     const int e = fa_e(amx), ks = fa_ks(amx); const float sks = exp2f((float)ks);
-    const int nt = (S + FT - 1) / FT;
+    const int SK = lens ? lens[seq] : S, nt = (SK + FT - 1) / FT;
     stage(Ks[0], K, tid); stage(Vs[0], V, tid); cpa_commit();
     unsigned qa[3][4], ga[3][4]; const int i0 = q0 + warp * 16 + g; afrag(qa, Q, i0, t); afrag(ga, G, i0, t);
     const float li[2] = {i0 < S ? L[i0] : INFINITY, i0 + 8 < S ? L[i0 + 8] : INFINITY}, di[2] = {i0 < S ? Dr[i0] : 0.f, i0 + 8 < S ? Dr[i0 + 8] : 0.f};
@@ -294,7 +297,7 @@ __global__ void __launch_bounds__(128) k_fa_dq(const __half *__restrict__ Qh, co
         for (int j = 0; j < 8; j++)
 #pragma unroll
             for (int q = 0; q < 4; q++) {
-                const float pv = kb + 8 * j + 2 * t + (q & 1) < S ? exp2f(p[j][q] * sl2 - li[q >> 1]) : 0.f;
+                const float pv = kb + 8 * j + 2 * t + (q & 1) < SK ? exp2f(p[j][q] * sl2 - li[q >> 1]) : 0.f;
                 ds[j][q] = pv * (ds[j][q] - di[q >> 1]) * sks;
             }
         mm_pt(dq, ds, Ks[cur], lane);   /* dQ += dS K */
@@ -323,13 +326,13 @@ extern "C" void at_fa_pack(const float *qkv, const float *qg, const float *kg, v
     const long long T = (long long)g->nseq * g->S, Tp = T + FT; const int H = C / HD;
     __half *Qh = (__half *)qkvh, *Kh = Qh + (size_t)H * Tp * HD, *Vh = Kh + (size_t)H * Tp * HD;
     cudaMemsetAsync(amx, 0, 4 * sizeof(float), 0);
-    k_fa_pack<<<nbk(Tp * H * 3, 128), 128>>>(qkv, qg, kg, Qh, Kh, Vh, rq, rk, amx, T, C, g->S, g->Hh, g->W, nreg, rope, log2f(base));
+    k_fa_pack<<<nbk(Tp * H * 3, 128), 128>>>(qkv, qg, kg, Qh, Kh, Vh, rq, rk, amx, T, C, g->S, g->Hh, g->W, nreg, rope, log2f(base), g->pos);
 }
 extern "C" void at_fa_fwd(const void *qkvh, float *o, float *lse, const at_geom *g, int H, int C) {
     const long long Tp = (long long)g->nseq * g->S + FT;
     const __half *Qh = (const __half *)qkvh, *Kh = Qh + (size_t)H * Tp * HD, *Vh = Kh + (size_t)H * Tp * HD;
     dim3 gr(nbk(g->S, FT), H, g->nseq);
-    k_fa_fwd<<<gr, 128>>>(Qh, Kh, Vh, o, lse, g->S, H, C, Tp, 1.4426950408889634f / sqrtf((float)HD));
+    k_fa_fwd<<<gr, 128>>>(Qh, Kh, Vh, o, lse, g->S, H, C, Tp, 1.4426950408889634f / sqrtf((float)HD), g->lens);
 }
 extern "C" void at_fa_bwd(const void *qkvh, void *doh, const float *o, const float *lse, const float *dO, float *Dv, float *amx, float *dqkn, const at_geom *g, int H, int C) {
     const long long T = (long long)g->nseq * g->S, Tp = T + FT;
@@ -337,6 +340,6 @@ extern "C" void at_fa_bwd(const void *qkvh, void *doh, const float *o, const flo
     at_fa_bprep(o, dO, amx, Gh, Dv, g, C);
     const float scale = 1.f / sqrtf((float)HD), sl2 = scale * 1.4426950408889634f;
     dim3 gr(nbk(g->S, FT), H, g->nseq);
-    k_fa_dkv<<<gr, 128>>>(Qh, Kh, Vh, Gh, lse, Dv, amx, dqkn, g->S, H, C, Tp, sl2, scale);
-    k_fa_dq<<<gr, 128>>>(Qh, Kh, Vh, Gh, lse, Dv, amx, dqkn, g->S, H, C, Tp, sl2, scale);
+    k_fa_dkv<<<gr, 128>>>(Qh, Kh, Vh, Gh, lse, Dv, amx, dqkn, g->S, H, C, Tp, sl2, scale, g->lens);
+    k_fa_dq<<<gr, 128>>>(Qh, Kh, Vh, Gh, lse, Dv, amx, dqkn, g->S, H, C, Tp, sl2, scale, g->lens);
 }

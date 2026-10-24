@@ -9,6 +9,11 @@
 #define UNET_MAXLEV 8
 #define UNET_MAXCONV 160   /* 3^3 convs (encoder, down, decoder, residual blocks) + the attention stage's linear layers */
 #define UNET_MAXTB 16      /* cfg.attn_blocks */
+#define UNET_MAXTA 64      /* cfg.attn_blocks x cfg.attn_repeat (block applications) */
+/* unet_set_attn_axis records: per sample UNET_AXR(np) floats: ad (the window dim of the scroll axis: 0 z, 1 y, 2 x), valid (0: no axis),
+   np (window planes along ad), div (window voxels per network input voxel: the half-res factor), then per window plane along ad the
+   axis centre (u, v) on the other two window dims in order, in window voxels (voxel centres at integers; may lie outside the window) */
+#define UNET_AXR(np) (4 + 2 * (np))
 
 typedef struct {
     int nlev;
@@ -51,10 +56,30 @@ typedef struct {
                               fp32 residual, zero-initialised out projections: a fresh stage is the identity) -> the stage's a2, whose
                               GroupNorm (the bottleneck's n2 parameters, statistics of the new a2) feeds the decoder. Width % 48 == 0.
                               Parameters appended last (older layouts unchanged); the linear weights train with Muon */
-    int attn_pe;           /* 0 PEG (zero-initialised depthwise 3^3 conv on the token grid before the first block), 1 axial 3D RoPE, 2 none */
+    int attn_pe;           /* 0 PEG (zero-initialised depthwise 3^3 conv on the token grid before the first block), 1 axial 3D RoPE, 2 none,
+                              3 scroll RoPE (rotary on each token's (r, arc, z) around the scroll axis, unet_set_attn_axis; 16 head dims each) */
     int attn_reg;          /* register tokens per sample (learned, prepended; outputs dropped) */
     int attn_mlp;          /* SwiGLU hidden width (0: 8/3 width rounded up to 32) */
     int attn_vres;         /* value residual (ResFormer): blocks 2..N mix their V with block 1's by a learned per-head lerp (init 0.5) */
+    int attn_axis;         /* 0 full attention over the bottleneck grid, 1 radial: each block's attention runs along the rays of the scroll
+                              coordinates (src/attn.h at_rays: per axis-normal plane, rays from the axis; the axis from unet_set_attn_axis;
+                              no registers). No parameters of its own (a full-attention donor's blocks load) */
+    int attn_repeat;       /* weight-tied repetition (0 / 1: once): the attn_blocks blocks run attn_repeat times in sequence, the same
+                              parameters each time (attn_blocks x attn_repeat <= UNET_MAXTA) */
+    int attn_mem;          /* window memory tokens (full attention only; 0 off): attn_mem register-like rows after the attn_reg registers, each
+                              learned + gate (x) the previous window's memory output (unet_set_attn_mem: a constant, i.e. stop-gradient as in
+                              Transformer-XL) + W_off (dz, dy, dx, valid) (the offset from that window, over the window size); gate and W_off
+                              zero-initialised. unet_attn_mem_out: this forward's memory rows after the last block (the next window's input) */
+    int view_P, view_patch;   /* scan fusion (full attention; 0 off): a second scan's view_P^3 crop centred on the window (unet_set_attn_view,
+                              src/view.h) as (view_P / view_patch)^3 extra register-like rows after the memory rows: each a learned row (its
+                              position) + a linear embedding of its view_patch^3 patch (v / 255) + bias; the grid tokens attend to them in
+                              every block (joint attention). A fresh stage stays the identity */
+    int attn_deform, attn_dlev;   /* deformable attention (0 off; src/nn_attn_dfm.cu): attn_deform points per head and level, sampled on attn_dlev
+                              levels (0: 2; at most 3): the bottleneck grid and the next finer encoder outputs. Per token a linear layer predicts
+                              each head's offsets (zero weights, bias = a small sphere grid prior) and logits (softmax over levels x points); the
+                              heads' values (a value projection per level; the finer levels' inputs LayerNorm'd, no gradient to them) are
+                              trilinearly sampled there and summed. No registers / memory / view / radial / RoPE positions; the out projection
+                              starts at zero (identity) */
 } unet_cfg;
 static inline int unet_hr_div(int hr) { return hr >= 3 ? 4 : hr ? 2 : 1; }      /* the window voxels per network voxel along each axis */
 static inline int unet_hr_mode(int hr) { return hr == 2 || hr == 4 ? 2 : 1; }   /* the last stage: 1 pool, 2 pack (nn_half_*) */
@@ -250,6 +275,20 @@ const float *unet_tokens(const unet *u, int *nseq, int *S, int *C, int *nreg);
 const float *unet_stage_out(unet *u, int k, shape5 *s);   /* level k's stored stage output silu(gn(a2)) after a training forward (nullptr if not kept) */
 void unet_set_token_grad(unet *u, const float *g);
 void unet_set_attn_keep(int on);   /* the attention stage keeps each block's training forward for its backward (no recompute; before the build) */
+/* the scroll axis of every sample of the following forwards (cfg.attn_axis 1 / attn_pe 3): n records of stride floats (UNET_AXR, host),
+   copied; kept until replaced. Without any (or a count / size mismatch) the stage uses no axis: the rays are grid rows */
+void unet_set_attn_axis(unet *u, const float *rec, int n, int stride);
+/* window memory (cfg.attn_mem): the next forwards' memory input. mem: device [n][attn_mem][C] (the previous windows' unet_attn_mem_out,
+   copied into the network at the forward, so it may change after it), feat: host [n][4] (dz, dy, dx over the window size, valid); either
+   nullptr: zero (a chain start). Kept until replaced */
+void unet_set_attn_mem(unet *u, const float *mem, const float *feat, int n);
+/* the memory rows of the last forward after the stage, device [n][attn_mem][C] (nullptr without memory or a forward); *M, *C */
+const float *unet_attn_mem_out(const unet *u, int *M, int *C);
+/* scan fusion (cfg.view_P): the next forwards' view crops, device uint8 [n][view_P^3] (the window's symmetry applied; read at the forward and
+   the backward, so kept unchanged until then); nullptr or n <= 0: zero crops. Kept until replaced */
+void unet_set_attn_view(unet *u, const uint8_t *view, int n);
+/* the attention stage's ray plan of the last forward (radial): rays per sample, slots per ray, covered grid tokens / all (tests, logs) */
+int unet_attn_rays(const unet *u, int *Q, int *Nr, double *coverage);
 void unet_set_wd_nonconv(unet *u, float mul);
 const float *unet_ds_logits(const unet *u, int j, shape5 *s);   /* deep supervision: fp32 logits of decoder level j (1..ds_levels) after a training forward */
 void unet_set_ds_grad(unet *u, int j, const float *gl);         /* their fp32 logit gradient for the next backward (nullptr: none) */   /* weight decay multiplier for GroupNorm / biases / head under Muon and ANVIL (default 0) */

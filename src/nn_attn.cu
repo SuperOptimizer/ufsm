@@ -242,16 +242,17 @@ extern "C" void at_qknorm_bwd(const float *qkv, const float *qg, const float *kg
 }
 
 /* axial 3D RoPE on the grid tokens: head dims [16 a, 16 a + 16) rotate with the token's coordinate along axis a (z, y, x) in 8
-   pairs (2i, 2i + 1) at frequencies base^(-i / 8); register tokens unrotated. inverse: the transposed rotation (backward) */
-__global__ void k_rope(float *qkn, int nseq, int S, int D, int Hh, int W, int nreg, int C, float lbase, int inverse) {
+   pairs (2i, 2i + 1) at frequencies base^(-i / 8); register tokens unrotated. inverse: the transposed rotation (backward).
+   pos (at_geom.pos, scroll RoPE): the token's coordinates (r, arc, z) instead of its grid index */
+__global__ void k_rope(float *qkn, int nseq, int S, int D, int Hh, int W, int nreg, int C, float lbase, int inverse, const float *gpos) {
     const int H = C / HD; const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     const long long n = (long long)nseq * S * H * 24;
     if (i >= n) return;
     const int pr = (int)(i % 24); const long long th = i / 24; const int h = (int)(th % H); const long long t = th / H; const int ts = (int)(t % S) - nreg;
     if (ts < 0) return;
     const int ax = pr / 8, fi = pr % 8;
-    const int pos = ax == 0 ? ts / (Hh * W) : ax == 1 ? (ts / W) % Hh : ts % W;
-    const float ang = (float)pos * exp2f(-lbase * (float)fi / 8.f);
+    const float pos = gpos ? gpos[3 * t + ax] : (float)(ax == 0 ? ts / (Hh * W) : ax == 1 ? (ts / W) % Hh : ts % W);
+    const float ang = pos * exp2f(-lbase * (float)fi / 8.f);
     float sn, cs; sincosf(ang, &sn, &cs); if (inverse) sn = -sn;
     for (int p = 0; p < 2; p++) {
         float *v = qkn + t * 3 * C + p * C + h * HD + ax * 16 + 2 * fi;
@@ -261,30 +262,31 @@ __global__ void k_rope(float *qkn, int nseq, int S, int D, int Hh, int W, int nr
 }
 extern "C" void at_rope(float *qkn, const at_geom *g, int nreg, int C, float base, int inverse) {
     const long long n = (long long)g->nseq * g->S * (C / HD) * 24;
-    k_rope<<<nbk(n, 256), 256>>>(qkn, g->nseq, g->S, g->D, g->Hh, g->W, nreg, C, log2f(base), inverse);
+    k_rope<<<nbk(n, 256), 256>>>(qkn, g->nseq, g->S, g->D, g->Hh, g->W, nreg, C, log2f(base), inverse, g->pos);
 }
 
 /* ---- attention, head dim 48, fp32. Logits in log2 units: s = q.k scale log2(e); lse2 = max + log2(sum exp2) per row ---- */
 #define AQ 64
 #define AK 32
-__global__ void __launch_bounds__(AQ) k_attn_fwd(const float *__restrict__ qkn, float *__restrict__ o, float *__restrict__ lse, int S, int H, int C, float sl2) {
+__global__ void __launch_bounds__(AQ) k_attn_fwd(const float *__restrict__ qkn, float *__restrict__ o, float *__restrict__ lse, int S, int H, int C, float sl2, const int *lens) {
     const int seq = blockIdx.z, h = blockIdx.y, i = blockIdx.x * AQ + threadIdx.x; const int ld = 3 * C;
     const size_t base = (size_t)seq * S;
+    const int SK = lens ? lens[seq] : S;   /* (keys past a sequence's length masked) */
     __shared__ float ks[AK][HD], vs[AK][HD];
     const bool act = i < S;
     float q[HD], acc[HD];
 #pragma unroll
     for (int d = 0; d < HD; d++) { q[d] = act ? qkn[(base + i) * ld + h * HD + d] * sl2 : 0.f; acc[d] = 0.f; }
     float m = -INFINITY, l = 0.f;
-    for (int j0 = 0; j0 < S; j0 += AK) {
+    for (int j0 = 0; j0 < SK; j0 += AK) {
         __syncthreads();
         for (int e = threadIdx.x; e < AK * HD; e += AQ) {
             const int jj = e / HD, d = e % HD, j = j0 + jj;
-            ks[jj][d] = j < S ? qkn[(base + j) * ld + C + h * HD + d] : 0.f;
-            vs[jj][d] = j < S ? qkn[(base + j) * ld + 2 * C + h * HD + d] : 0.f;
+            ks[jj][d] = j < SK ? qkn[(base + j) * ld + C + h * HD + d] : 0.f;
+            vs[jj][d] = j < SK ? qkn[(base + j) * ld + 2 * C + h * HD + d] : 0.f;
         }
         __syncthreads();
-        const int nj = S - j0 < AK ? S - j0 : AK;
+        const int nj = SK - j0 < AK ? SK - j0 : AK;
         float s[AK]; float mt = m;
 #pragma unroll
         for (int jj = 0; jj < AK; jj++) {
@@ -307,14 +309,14 @@ __global__ void __launch_bounds__(AQ) k_attn_fwd(const float *__restrict__ qkn, 
         m = mt;
     }
     if (!act) return;
-    const float il = 1.f / l;
+    const float il = l > 0.f ? 1.f / l : 0.f;   /* (a length-0 sequence: zero output) */
 #pragma unroll
     for (int d = 0; d < HD; d++) o[(base + i) * C + h * HD + d] = acc[d] * il;
-    lse[((size_t)seq * H + h) * S + i] = m + log2f(l);
+    lse[((size_t)seq * H + h) * S + i] = l > 0.f ? m + log2f(l) : 0.f;
 }
 extern "C" void at_attn_fwd(const float *qkn, float *o, float *lse, const at_geom *g, int H, int C) {
     dim3 gr(nbk(g->S, AQ), H, g->nseq);
-    k_attn_fwd<<<gr, AQ>>>(qkn, o, lse, g->S, H, C, LOG2E / sqrtf((float)HD));
+    k_attn_fwd<<<gr, AQ>>>(qkn, o, lse, g->S, H, C, LOG2E / sqrtf((float)HD), g->lens);
 }
 /* D[row, head] = dO . O over the head's dims */
 __global__ void k_attn_dvec(const float *o, const float *dO, float *dv, int nseq, int S, int H, int C) {
@@ -329,11 +331,13 @@ __global__ void k_attn_dvec(const float *o, const float *dO, float *dv, int nseq
 /* dK, dV: one thread per key (its k, v rows in padded shared memory), query tiles of AK broadcast */
 #define KB 64
 __global__ void __launch_bounds__(KB) k_attn_dkv(const float *__restrict__ qkn, const float *__restrict__ lse, const float *__restrict__ dvv, const float *__restrict__ dO,
-                                                float *__restrict__ dqkn, int S, int H, int C, float sl2, float scale) {
+                                                float *__restrict__ dqkn, int S, int H, int C, float sl2, float scale, const int *lens) {
     const int seq = blockIdx.z, h = blockIdx.y, j = blockIdx.x * KB + threadIdx.x; const int ld = 3 * C;
     const size_t base = (size_t)seq * S;
     __shared__ float kS[KB][HD + 1], vS[KB][HD + 1], qT[AK][HD], gT[AK][HD], lT[AK], dT[AK];
-    const bool act = j < S;
+    const bool act = j < (lens ? lens[seq] : S);   /* (masked keys: zero gradients, written below) */
+    if (j < S && !act)
+        for (int d = 0; d < HD; d++) { dqkn[(base + j) * ld + C + h * HD + d] = 0.f; dqkn[(base + j) * ld + 2 * C + h * HD + d] = 0.f; }
     for (int d = 0; d < HD; d++) { kS[threadIdx.x][d] = act ? qkn[(base + j) * ld + C + h * HD + d] : 0.f; vS[threadIdx.x][d] = act ? qkn[(base + j) * ld + 2 * C + h * HD + d] : 0.f; }
     float dk[HD], dv[HD];
 #pragma unroll
@@ -364,9 +368,10 @@ __global__ void __launch_bounds__(KB) k_attn_dkv(const float *__restrict__ qkn, 
 }
 /* dQ: one thread per query (its q, dO rows in padded shared memory), key tiles broadcast */
 __global__ void __launch_bounds__(KB) k_attn_dq(const float *__restrict__ qkn, const float *__restrict__ lse, const float *__restrict__ dvv, const float *__restrict__ dO,
-                                               float *__restrict__ dqkn, int S, int H, int C, float sl2, float scale) {
+                                               float *__restrict__ dqkn, int S, int H, int C, float sl2, float scale, const int *lens) {
     const int seq = blockIdx.z, h = blockIdx.y, i = blockIdx.x * KB + threadIdx.x; const int ld = 3 * C;
     const size_t base = (size_t)seq * S;
+    const int SK = lens ? lens[seq] : S;
     __shared__ float qS[KB][HD + 1], gS[KB][HD + 1], kT[AK][HD], vT[AK][HD];
     const bool act = i < S;
     for (int d = 0; d < HD; d++) { qS[threadIdx.x][d] = act ? qkn[(base + i) * ld + h * HD + d] : 0.f; gS[threadIdx.x][d] = act ? dO[(base + i) * C + h * HD + d] : 0.f; }
@@ -374,15 +379,15 @@ __global__ void __launch_bounds__(KB) k_attn_dq(const float *__restrict__ qkn, c
     float dq[HD];
 #pragma unroll
     for (int d = 0; d < HD; d++) dq[d] = 0.f;
-    for (int j0 = 0; j0 < S; j0 += AK) {
+    for (int j0 = 0; j0 < SK; j0 += AK) {
         __syncthreads();
         for (int e = threadIdx.x; e < AK * HD; e += KB) {
             const int jj = e / HD, d = e % HD, j = j0 + jj;
-            kT[jj][d] = j < S ? qkn[(base + j) * ld + C + h * HD + d] : 0.f;
-            vT[jj][d] = j < S ? qkn[(base + j) * ld + 2 * C + h * HD + d] : 0.f;
+            kT[jj][d] = j < SK ? qkn[(base + j) * ld + C + h * HD + d] : 0.f;
+            vT[jj][d] = j < SK ? qkn[(base + j) * ld + 2 * C + h * HD + d] : 0.f;
         }
         __syncthreads();
-        const int nj = S - j0 < AK ? S - j0 : AK;
+        const int nj = SK - j0 < AK ? SK - j0 : AK;
         for (int jj = 0; jj < nj; jj++) {
             float s = 0.f, dp = 0.f;
 #pragma unroll
@@ -400,8 +405,8 @@ extern "C" void at_attn_bwd(const float *qkn, const float *o, const float *lse, 
     const float scale = 1.f / sqrtf((float)HD), sl2 = scale * LOG2E;
     k_attn_dvec<<<nbk((long long)g->nseq * g->S * H, 256), 256>>>(o, dO, dv, g->nseq, g->S, H, C);
     dim3 gr(nbk(g->S, KB), H, g->nseq);
-    k_attn_dkv<<<gr, KB>>>(qkn, lse, dv, dO, dqkn, g->S, H, C, sl2, scale);
-    k_attn_dq<<<gr, KB>>>(qkn, lse, dv, dO, dqkn, g->S, H, C, sl2, scale);
+    k_attn_dkv<<<gr, KB>>>(qkn, lse, dv, dO, dqkn, g->S, H, C, sl2, scale, g->lens);
+    k_attn_dq<<<gr, KB>>>(qkn, lse, dv, dO, dqkn, g->S, H, C, sl2, scale, g->lens);
 }
 
 /* SwiGLU: h [T][2F] = [a | b], gg = silu(a) b */
@@ -424,15 +429,21 @@ extern "C" void at_glu_fwd(const float *h, float *gg, long T, int F) { k_glu_fwd
 extern "C" void at_glu_bwd(const float *h, const float *dgg, float *dh, long T, int F) { k_glu_bwd<<<nbk((long long)T * F, 256), 256>>>(h, dgg, dh, T, F); }
 
 /* ---- parameters and scratch ---- */
-extern "C" size_t at_block_nparams(const at_dims *d) {
-    const size_t C = d->C, F = d->F;
-    return 2 * C + 3 * C * C + 3 * C + 2 * C + C * C + C + 2 * C + 2 * F * C + 2 * F + C * F + C;
-}
+extern "C" size_t at_block_nparams(const at_dims *d) { at_bp bp; return at_block_layout(d, &bp, 0); }
 extern "C" size_t at_block_layout(const at_dims *d, at_bp *bp, size_t off) {
     const size_t C = d->C, F = d->F;
+    for (int l = 0; l < AT_DFM_MAXL; l++) bp->wvl[l] = bp->bvl[l] = 0;
+    bp->woa = bp->boa = 0;
     bp->ln1g = off; off += C; bp->ln1b = off; off += C;
-    bp->wqkv = off; off += 3 * C * C; bp->bqkv = off; off += 3 * C;
-    bp->qg = off; off += C; bp->kg = off; off += C;
+    if (d->dK > 0) {   /* deformable: the value projection, the offset / logit projection, the finer levels' value projections */
+        const size_t NOA = (size_t)at_dfm_noa(d);
+        bp->wqkv = off; off += C * C; bp->bqkv = off; off += C; bp->qg = bp->kg = 0;
+        bp->woa = off; off += NOA * C; bp->boa = off; off += NOA;
+        for (int l = 1; l < d->dL; l++) { bp->wvl[l] = off; off += C * (size_t)d->dC[l]; bp->bvl[l] = off; off += C; }
+    } else {
+        bp->wqkv = off; off += 3 * C * C; bp->bqkv = off; off += 3 * C;
+        bp->qg = off; off += C; bp->kg = off; off += C;
+    }
     bp->wo = off; off += C * C; bp->bo = off; off += C;
     bp->ln2g = off; off += C; bp->ln2b = off; off += C;
     bp->w1 = off; off += 2 * F * C; bp->b1 = off; off += 2 * F;
@@ -441,33 +452,55 @@ extern "C" size_t at_block_layout(const at_dims *d, at_bp *bp, size_t off) {
 }
 static size_t al(size_t n) { return (n + 63) & ~(size_t)63; }   /* floats, 256-byte aligned pieces */
 /* the forward part (what the backward reads; kept per block through at_ws_set_fwd) from fb, the backward scratch from bb; either may
-   be nullptr (sizing only); returns the floats of part (0 forward, 1 backward) */
-static size_t ws_walk(at_ws *w, const at_dims *d, long T, float *fb, float *bb, int part) {
-    const size_t C = d->C, F = d->F, H = d->H, t = (size_t)T, wa = 2 * F > 3 * C ? 2 * F : 3 * C, wb = F > 3 * C ? F : 3 * C;
+   be nullptr (sizing only); returns the floats of part (0 forward, 1 backward). Tr > 0: radial attention, the attention's tensors on
+   Tr ray tokens (Ta) and the ray buffers */
+static size_t ws_walk(at_ws *w, const at_dims *d, long T, long Tr, float *fb, float *bb, int part) {
+    const size_t C = d->C, F = d->F, H = d->H, t = (size_t)T, r = (size_t)Tr, ta = Tr ? r : t, wa = 2 * F > 3 * C ? 2 * F : 3 * C, wb = F > 3 * C ? F : 3 * C;
     at_ws tmp; if (!w) w = &tmp;
     size_t nf = 0, nb = 0;
 #define TF(f, n) do { w->f = fb ? fb + nf : nullptr; nf += al(n); } while (0)
 #define TB(f, n) do { w->f = bb ? bb + nb : nullptr; nb += al(n); } while (0)
+    for (int l = 0; l < AT_DFM_MAXL; l++) w->vl[l] = w->dvl[l] = nullptr;
+    w->oa = w->aw = w->doa = nullptr;
+    if (d->dK > 0) {   /* deformable attention: no q / k / v rows, no attention core tensors */
+        const size_t NOA = (size_t)at_dfm_noa(d), LK = (size_t)d->dL * d->dK;
+        TF(xn, t * C); TF(o, t * C); TF(x1, t * C); TF(xn2, t * C); TF(h, t * 2 * F);
+        TF(m1, t); TF(r1, t); TF(m2, t); TF(r2, t); TF(oa, t * NOA); TF(aw, t * H * LK);
+        for (int l = 0; l < d->dL; l++) TF(vl[l], (t << (3 * l)) * C);
+        w->qkv = w->rq = w->rk = w->lse = w->qkvh = w->amx = w->qkvr = w->orr = w->qkn = w->dv = w->doh = w->dor = w->dqr = w->dqr2 = nullptr;
+        TB(bC, t * C); TB(gg, t * F); TB(dx1, t * C); TB(bA, t * wa); TB(bB, t * wb); TB(doa, t * NOA);
+        for (int l = 0; l < d->dL; l++) TB(dvl[l], (t << (3 * l)) * C);
+        return part ? nb : nf;
+    }
     TF(xn, t * C); TF(o, t * C); TF(x1, t * C); TF(xn2, t * C); TF(qkv, t * 3 * C); TF(h, t * 2 * F);
-    TF(m1, t); TF(r1, t); TF(m2, t); TF(r2, t); TF(rq, t * H); TF(rk, t * H); TF(lse, t * H);
-    TF(qkvh, 3 * C * (t + 64) / 2); TF(amx, 4);   /* (fp16: halves) */
-    TB(bC, t * C); TB(qkn, t * 3 * C); TB(gg, t * F);   /* (qkn: core 0 only, which always recomputes; gg: recomputed from h when kept) */
-    TB(dx1, t * C); TB(dv, t * H); TB(bA, t * wa); TB(bB, t * wb); TB(doh, C * (t + 64) / 2);
+    TF(m1, t); TF(r1, t); TF(m2, t); TF(r2, t); TF(rq, ta * H); TF(rk, ta * H); TF(lse, ta * H);
+    TF(qkvh, 3 * C * (ta + 64) / 2); TF(amx, 4);   /* (fp16: halves) */
+    TF(qkvr, r * 3 * C); TF(orr, r * C);
+    TB(bC, t * C); TB(qkn, ta * 3 * C); TB(gg, t * F);   /* (qkn: core 0 only, which always recomputes; gg: recomputed from h when kept) */
+    TB(dx1, t * C); TB(dv, ta * H); TB(bA, t * wa); TB(bB, t * wb); TB(doh, C * (ta + 64) / 2);
+    TB(dor, r * C); TB(dqr, r * 3 * C); TB(dqr2, r * 3 * C);
 #undef TF
 #undef TB
     return part ? nb : nf;
 }
-extern "C" size_t at_ws_bytes(const at_dims *d, long T) { return (ws_walk(nullptr, d, T, nullptr, nullptr, 0) + ws_walk(nullptr, d, T, nullptr, nullptr, 1)) * 4; }
-extern "C" void at_ws_carve(at_ws *w, const at_dims *d, long T, void *base) {
-    const size_t nf = ws_walk(nullptr, d, T, nullptr, nullptr, 0);
-    ws_walk(w, d, T, (float *)base, (float *)base + nf, 0); w->kept = 0; w->vr = 0;
+extern "C" size_t at_ws_bytes_r(const at_dims *d, long T, long Tr) { return (ws_walk(nullptr, d, T, Tr, nullptr, nullptr, 0) + ws_walk(nullptr, d, T, Tr, nullptr, nullptr, 1)) * 4; }
+extern "C" void at_ws_carve_r(at_ws *w, const at_dims *d, long T, long Tr, void *base) {
+    const size_t nf = ws_walk(nullptr, d, T, Tr, nullptr, nullptr, 0);
+    ws_walk(w, d, T, Tr, (float *)base, (float *)base + nf, 0); w->kept = 0; w->vr = 0;
 }
-extern "C" size_t at_ws_fwd_bytes(const at_dims *d, long T) { return ws_walk(nullptr, d, T, nullptr, nullptr, 0) * 4; }
-extern "C" void at_ws_set_fwd(at_ws *w, const at_dims *d, long T, void *base) {
-    at_ws t; ws_walk(&t, d, T, (float *)base, nullptr, 0);
+extern "C" size_t at_ws_fwd_bytes_r(const at_dims *d, long T, long Tr) { return ws_walk(nullptr, d, T, Tr, nullptr, nullptr, 0) * 4; }
+extern "C" void at_ws_set_fwd_r(at_ws *w, const at_dims *d, long T, long Tr, void *base) {
+    at_ws t; ws_walk(&t, d, T, Tr, (float *)base, nullptr, 0);
     w->xn = t.xn; w->o = t.o; w->x1 = t.x1; w->xn2 = t.xn2; w->qkv = t.qkv; w->h = t.h;
-    w->m1 = t.m1; w->r1 = t.r1; w->m2 = t.m2; w->r2 = t.r2; w->rq = t.rq; w->rk = t.rk; w->lse = t.lse; w->qkvh = t.qkvh; w->amx = t.amx; w->kept = 0;
+    w->m1 = t.m1; w->r1 = t.r1; w->m2 = t.m2; w->r2 = t.r2; w->rq = t.rq; w->rk = t.rk; w->lse = t.lse; w->qkvh = t.qkvh; w->amx = t.amx;
+    w->qkvr = t.qkvr; w->orr = t.orr; w->kept = 0;
+    for (int l = 0; l < AT_DFM_MAXL; l++) w->vl[l] = t.vl[l];
+    w->oa = t.oa; w->aw = t.aw;
 }
+extern "C" size_t at_ws_bytes(const at_dims *d, long T) { return at_ws_bytes_r(d, T, 0); }
+extern "C" void at_ws_carve(at_ws *w, const at_dims *d, long T, void *base) { at_ws_carve_r(w, d, T, 0, base); }
+extern "C" size_t at_ws_fwd_bytes(const at_dims *d, long T) { return at_ws_fwd_bytes_r(d, T, 0); }
+extern "C" void at_ws_set_fwd(at_ws *w, const at_dims *d, long T, void *base) { at_ws_set_fwd_r(w, d, T, 0, base); }
 
 /* ---- value residual (at_ws.vr) ---- */
 __global__ void k_vr_first(const float *qkv, float *v1, long long T, int C) {
@@ -500,37 +533,67 @@ __global__ void k_vr_bwd(float *dqkv, const float *v1, const float *own, float *
 
 /* ---- one block ---- */
 #define CK(x) do { if (x) return -1; } while (0)
+/* the attention's geometry: the grid's, or (radial attention) the rays' (nseq rays of Nr slots, their lengths, scroll RoPE positions) */
+static const at_geom *att_geom(const at_dims *d, const at_geom *g, at_geom *gr) {
+    const at_rays *R = g->rays;
+    if (!R) return g;
+    *gr = (at_geom){R->n * R->Q, R->Nr, 1, 1, R->Nr, R->lens, d->rope == 2 ? R->pos : nullptr, nullptr};
+    return gr;
+}
+static int att_core(const at_geom *g) { const int c = at_get_core(); return c == 2 && g->rays ? 1 : c; }   /* (MX-fp8 has no ray lengths: fp16) */
 extern "C" int at_block_fwd(const at_dims *d, const float *P, const at_bp *bp, const float *x, float *y, const at_geom *g, at_ws *w) {
-    const long T = (long)g->nseq * g->S; const int C = d->C, F = d->F; const double t = (double)T, A = 4.0 * g->nseq * (double)g->S * g->S * HD * d->H;
+    const long T = (long)g->nseq * g->S; const int C = d->C, F = d->F; const double t = (double)T;
+    at_geom gr_; const at_geom *ga = att_geom(d, g, &gr_); const at_rays *R = g->rays;
+    const long Ta = (long)ga->nseq * ga->S; const int nreg = R ? 0 : d->nreg, core = att_core(g);
+    const double ta = (double)Ta, A = 4.0 * ga->nseq * (double)ga->S * ga->S * HD * d->H;
     int e = 0;
     PR("ln1", 0, t * C * 8, at_ln_fwd(x, P + bp->ln1g, P + bp->ln1b, w->xn, w->m1, w->r1, T, C));
+    if (d->dK > 0) {   /* deformable attention: values of every level, offsets + logits, softmax, the sampled sum into o */
+        const int NOA = at_dfm_noa(d); const double LK = (double)d->dL * d->dK;
+        PR("v gemm", 2 * t * C * C, t * C * 12, e |= at_gemm_ex(0, 1, (int)T, C, C, w->xn, P + bp->wqkv, w->vl[0], 0.f, P + bp->bqkv, nullptr)); CK(e);
+        PR("oa gemm", 2 * t * NOA * C, t * (C + NOA) * 4, e |= at_gemm_ex(0, 1, (int)T, NOA, C, w->xn, P + bp->woa, w->oa, 0.f, P + bp->boa, nullptr)); CK(e);
+        for (int l = 1; l < d->dL; l++) {
+            const long Tl = T << (3 * l); const int Cl = d->dC[l];
+            if (!g->dfx[l]) return -1;
+            PR("vl gemm", 2.0 * Tl * C * Cl, (double)Tl * (C + Cl) * 4, e |= at_gemm_ex(0, 1, (int)Tl, C, Cl, g->dfx[l], P + bp->wvl[l], w->vl[l], 0.f, P + bp->bvl[l], nullptr)); CK(e);
+        }
+        PR("dfm softmax", 0, t * d->H * LK * 24, at_dfm_softmax(w->oa, w->aw, T, d));
+        PR("dfm sample", 0, t * C * LK * 8 * 4, at_dfm_fwd((const float *const *)w->vl, w->oa, w->aw, w->o, g, d));
+    } else {
     PR("qkv gemm", 2 * t * 3 * C * C, t * C * 16, e |= at_gemm_ex(0, 1, (int)T, 3 * C, C, w->xn, P + bp->wqkv, w->qkv, 0.f, P + bp->bqkv, nullptr)); CK(e);
-    if (w->vr == 1) k_vr_first<<<nbk((long long)T * C, 256), 256>>>(w->qkv, w->v1, T, C);
+    if (w->vr == 1) k_vr_first<<<nbk((long long)T * C, 256), 256>>>(w->qkv, w->v1, T, C);   /* value residual (on the T token rows, before any ray gather) */
     else if (w->vr == 2) k_vr_mix<<<nbk((long long)T * C, 256), 256>>>(w->qkv, w->v1, w->own, w->lam, T, C);
-    if (at_get_core()) {
-        PR("qknorm+pack", 0, t * C * 18, at_fa_pack(w->qkv, P + bp->qg, P + bp->kg, w->qkvh, w->rq, w->rk, w->amx, g, d->nreg, C, d->rope, d->rope_base));
-        if (at_get_core() == 2) PR("attn fwd", A, t * C * 6, e |= at_fa8_fwd(w->qkvh, w->o, w->lse, g, d->H, C));
-        else PR("attn fwd", A, t * C * 10, at_fa_fwd(w->qkvh, w->o, w->lse, g, d->H, C));
+    const float *qa = w->qkv; float *oa = w->o;
+    if (R) { PR("ray gather", 0, ta * C * 24, at_ray_gather(R, w->qkv, w->qkvr, 3 * C, 0)); qa = w->qkvr; oa = w->orr; }
+    if (core) {
+        PR("qknorm+pack", 0, ta * C * 18, at_fa_pack(qa, P + bp->qg, P + bp->kg, w->qkvh, w->rq, w->rk, w->amx, ga, nreg, C, d->rope, d->rope_base));
+        if (core == 2) PR("attn fwd", A, ta * C * 6, e |= at_fa8_fwd(w->qkvh, oa, w->lse, ga, d->H, C));
+        else PR("attn fwd", A, ta * C * 10, at_fa_fwd(w->qkvh, oa, w->lse, ga, d->H, C));
         CK(e);
     } else {
-        PR("qknorm+rope", 0, t * C * 24, at_qknorm_fwd(w->qkv, P + bp->qg, P + bp->kg, w->qkn, w->rq, w->rk, T, C); if (d->rope) at_rope(w->qkn, g, d->nreg, C, d->rope_base, 0));
-        PR("attn fwd", A, t * C * 16, at_attn_fwd(w->qkn, w->o, w->lse, g, d->H, C));
+        PR("qknorm+rope", 0, ta * C * 24, at_qknorm_fwd(qa, P + bp->qg, P + bp->kg, w->qkn, w->rq, w->rk, Ta, C); if (d->rope) at_rope(w->qkn, ga, nreg, C, d->rope_base, 0));
+        PR("attn fwd", A, ta * C * 16, at_attn_fwd(w->qkn, oa, w->lse, ga, d->H, C));
     }
-    PR("o gemm+res", 2 * t * C * C, t * C * 16, 
+    if (R) PR("ray scatter", 0, ta * C * 12, at_ray_scatter(R, w->orr, w->o, C, 1));
+    }
+    PR("o gemm+res", 2 * t * C * C, t * C * 16,
        e |= at_gemm_ex(0, 1, (int)T, C, C, w->o, P + bp->wo, w->x1, 0.f, P + bp->bo, x)); CK(e);
     PR("ln2", 0, t * C * 8, at_ln_fwd(w->x1, P + bp->ln2g, P + bp->ln2b, w->xn2, w->m2, w->r2, T, C));
     PR("w1 gemm", 2 * t * 2 * F * C, t * (C + 4 * F) * 4, e |= at_gemm_ex(0, 1, (int)T, 2 * F, C, w->xn2, P + bp->w1, w->h, 0.f, P + bp->b1, nullptr)); CK(e);
     PR("swiglu", 0, t * F * 12, at_glu_fwd(w->h, w->gg, T, F));
-    PR("w2 gemm+res", 2 * t * C * F, t * (F + 3 * C) * 4, 
+    PR("w2 gemm+res", 2 * t * C * F, t * (F + 3 * C) * 4,
        e |= at_gemm_ex(0, 1, (int)T, C, F, w->gg, P + bp->w2, y, 0.f, P + bp->b2, w->x1)); CK(e);
     return 0;
 }
 extern "C" int at_block_bwd(const at_dims *d, const float *P, float *G, const at_bp *bp, const float *xin, float *gy, const at_geom *g, at_ws *w) {
-    const long T = (long)g->nseq * g->S; const int C = d->C, F = d->F; const double t = (double)T, A = 4.0 * g->nseq * (double)g->S * g->S * HD * d->H;
+    const long T = (long)g->nseq * g->S; const int C = d->C, F = d->F; const double t = (double)T;
+    at_geom gr_; const at_geom *ga = att_geom(d, g, &gr_); const at_rays *R = g->rays;
+    const long Ta = (long)ga->nseq * ga->S; const int nreg = R ? 0 : d->nreg, core = att_core(g);
+    const double ta = (double)Ta, A = 4.0 * ga->nseq * (double)ga->S * ga->S * HD * d->H;
     int e = 0;
     /* recompute the block's internals (its output into scratch), unless kept (core 0 always recomputes: its q / k / v rows are scratch);
        kept: the SwiGLU product from h (scratch) */
-    if (!w->kept || !at_get_core()) CK(at_block_fwd(d, P, bp, xin, w->bA, g, w));
+    if (!w->kept || (!core && !d->dK)) CK(at_block_fwd(d, P, bp, xin, w->bA, g, w));
     else at_glu_fwd(w->h, w->gg, T, F);
     w->kept = 0;
     /* MLP */
@@ -544,12 +607,30 @@ extern "C" int at_block_bwd(const at_dims *d, const float *P, float *G, const at
     /* attention */
     PR("b o gemms", 4 * t * C * C, t * C * 20, e |= at_gemm(1, 0, C, C, (int)T, w->dx1, w->o, G + bp->wo, 1.f); colsum(w->dx1, T, C, G + bp->bo);
        e |= at_gemm(0, 0, (int)T, C, C, w->dx1, P + bp->wo, w->bC, 0.f)); CK(e);             /* d o */
-    if (at_get_core() == 2) { PR("attn bwd", 3.5 * A, t * C * 20, e |= at_fa8_bwd(w->qkvh, w->doh, w->o, w->lse, w->bC, w->dv, w->amx, w->bA, g, d->H, C)); CK(e); }
-    else if (at_get_core()) PR("attn bwd", 3.5 * A, t * C * 30, at_fa_bwd(w->qkvh, w->doh, w->o, w->lse, w->bC, w->dv, w->amx, w->bA, g, d->H, C));
-    else PR("attn bwd", 3.5 * A, t * C * 40, at_attn_bwd(w->qkn, w->o, w->lse, w->bC, w->dv, w->bA, g, d->H, C));   /* d qkn */
-    PR("b rope+qknorm", 0, t * C * 36, if (d->rope) at_rope(w->bA, g, d->nreg, C, d->rope_base, 1);
-       at_qknorm_bwd(w->qkv, P + bp->qg, P + bp->kg, w->rq, w->rk, w->bA, w->bB, G + bp->qg, G + bp->kg, T, C));
-    if (w->vr == 2) k_vr_bwd<<<(unsigned)((T + 63) / 64), 128>>>(w->bB, w->v1, w->own, w->dv1, w->lam, w->glam, T, C);
+    if (d->dK > 0) {   /* deformable: d values / offsets / logits, then the projections' gradients; d xn into bA */
+        const int NOA = at_dfm_noa(d); const double LK = (double)d->dL * d->dK;
+        PR("b dfm", 0, t * C * LK * 8 * 12, at_dfm_bwd((const float *const *)w->vl, w->oa, w->aw, w->bC, w->dvl, w->doa, g, d));
+        PR("b v gemms", 4 * t * C * C, t * C * 16, e |= at_gemm(1, 0, C, C, (int)T, w->dvl[0], w->xn, G + bp->wqkv, 1.f); colsum(w->dvl[0], T, C, G + bp->bqkv);
+           e |= at_gemm(0, 0, (int)T, C, C, w->dvl[0], P + bp->wqkv, w->bA, 0.f)); CK(e);
+        PR("b oa gemms", 4 * t * C * NOA, t * (C + NOA) * 12, e |= at_gemm(1, 0, NOA, C, (int)T, w->doa, w->xn, G + bp->woa, 1.f); colsum(w->doa, T, NOA, G + bp->boa);
+           e |= at_gemm(0, 0, (int)T, C, NOA, w->doa, P + bp->woa, w->bA, 1.f)); CK(e);
+        for (int l = 1; l < d->dL; l++) {
+            const long Tl = T << (3 * l); const int Cl = d->dC[l];
+            PR("b vl gemm", 2.0 * Tl * C * Cl, (double)Tl * (C + Cl) * 8, e |= at_gemm_f32(1, 0, C, Cl, (int)Tl, w->dvl[l], g->dfx[l], G + bp->wvl[l], 1.f); colsum(w->dvl[l], Tl, C, G + bp->bvl[l])); CK(e);
+        }
+        PR("b ln1", 0, t * C * 20, cudaMemcpyAsync(gy, w->dx1, (size_t)T * C * 4, cudaMemcpyDeviceToDevice, 0);
+           at_ln_bwd(xin, P + bp->ln1g, w->m1, w->r1, w->bA, gy, G + bp->ln1g, G + bp->ln1b, T, C, 1));
+        return 0;
+    }
+    const float *qa = R ? w->qkvr : w->qkv, *oa = R ? w->orr : w->o, *dOa = w->bC; float *dqn = R ? w->dqr : w->bA, *dqv = R ? w->dqr2 : w->bB;
+    if (R) { PR("b ray gather", 0, ta * C * 12, at_ray_gather(R, w->bC, w->dor, C, 1)); dOa = w->dor; }   /* (the normalised scatter's adjoint) */
+    if (core == 2) { PR("attn bwd", 3.5 * A, ta * C * 20, e |= at_fa8_bwd(w->qkvh, w->doh, oa, w->lse, dOa, w->dv, w->amx, dqn, ga, d->H, C)); CK(e); }
+    else if (core) PR("attn bwd", 3.5 * A, ta * C * 30, at_fa_bwd(w->qkvh, w->doh, oa, w->lse, dOa, w->dv, w->amx, dqn, ga, d->H, C));
+    else PR("attn bwd", 3.5 * A, ta * C * 40, at_attn_bwd(w->qkn, oa, w->lse, dOa, w->dv, dqn, ga, d->H, C));   /* d qkn */
+    PR("b rope+qknorm", 0, ta * C * 36, if (d->rope) at_rope(dqn, ga, nreg, C, d->rope_base, 1);
+       at_qknorm_bwd(qa, P + bp->qg, P + bp->kg, w->rq, w->rk, dqn, dqv, G + bp->qg, G + bp->kg, Ta, C));
+    if (R) PR("b ray scatter", 0, ta * C * 36, at_ray_scatter(R, w->dqr2, w->bB, 3 * C, 0));   /* (the gather's adjoint) */
+    if (w->vr == 2) k_vr_bwd<<<(unsigned)((T + 63) / 64), 128>>>(w->bB, w->v1, w->own, w->dv1, w->lam, w->glam, T, C);   /* (d qkv of the T rows in bB) */
     else if (w->vr == 1) k_vr_add<<<nbk((long long)T * C, 256), 256>>>(w->bB, w->dv1, T, C);
     PR("b qkv gemms", 12 * t * C * C, t * C * 40, e |= at_gemm(1, 0, 3 * C, C, (int)T, w->bB, w->xn, G + bp->wqkv, 1.f); colsum(w->bB, T, 3 * C, G + bp->bqkv);
        e |= at_gemm(0, 0, (int)T, C, 3 * C, w->bB, P + bp->wqkv, w->bC, 0.f)); CK(e);        /* d xn */
@@ -637,9 +718,84 @@ __global__ void k_reg_grad(const float *gt, float *greg, int n, int C, long long
     for (int s = 0; s < n; s++) a += gt[(long long)s * (Sg + nreg) * C + i];
     greg[i] += a;
 }
+__global__ void k_mem_add(float *t, int n, int S, int r0, int M, int C, const float *gate, const float *woff, const float *mem, const float *feat) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i >= (long long)n * M * C) return;
+    const int c = (int)(i % C), j = (int)((i / C) % M), s = (int)(i / ((long long)M * C));
+    float a = gate[c] * mem[i];
+    for (int k = 0; k < 4; k++) a += woff[k * C + c] * feat[s * 4 + k];
+    t[((long long)s * S + r0 + j) * C + c] += a;
+}
+__global__ void k_mem_grad(const float *gt, int n, int S, int r0, int M, int C, const float *mem, const float *feat, float *ggate, float *gwoff) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float a = 0.f, b[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int s = 0; s < n; s++) for (int j = 0; j < M; j++) {
+        const float g = gt[((long long)s * S + r0 + j) * C + c];
+        a += g * mem[((long long)s * M + j) * C + c];
+        for (int k = 0; k < 4; k++) b[k] += g * feat[s * 4 + k];
+    }
+    ggate[c] += a;
+    for (int k = 0; k < 4; k++) gwoff[k * C + c] += b[k];
+}
+__global__ void k_mem_out(const float *t, int n, int S, int r0, int M, int C, float *mout) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i >= (long long)n * M * C) return;
+    const int c = (int)(i % C), j = (int)((i / C) % M), s = (int)(i / ((long long)M * C));
+    mout[i] = t[((long long)s * S + r0 + j) * C + c];
+}
+extern "C" void at_mem_add(float *t, int n, int S, int r0, int M, int C, const float *gate, const float *woff, const float *mem, const float *feat) {
+    if (n * M) k_mem_add<<<nbk((long long)n * M * C, 256), 256>>>(t, n, S, r0, M, C, gate, woff, mem, feat);
+}
+extern "C" void at_mem_grad(const float *gt, int n, int S, int r0, int M, int C, const float *mem, const float *feat, float *ggate, float *gwoff) {
+    if (n * M) k_mem_grad<<<nbk(C, 128), 128>>>(gt, n, S, r0, M, C, mem, feat, ggate, gwoff);
+}
+extern "C" void at_mem_out(const float *t, int n, int S, int r0, int M, int C, float *mout) {
+    if (n * M) k_mem_out<<<nbk((long long)n * M * C, 256), 256>>>(t, n, S, r0, M, C, mout);
+}
 extern "C" void at_cs_to_tok(const float *x, float *t, const float *reg, int n, int C, long Sg, int nreg) { k_cs_to_tok<<<nbk((long long)n * (Sg + nreg) * C, 256), 256>>>(x, t, reg, n, C, Sg, nreg); }
 extern "C" void at_tok_to_cs(const float *t, float *x, int n, int C, long Sg, int nreg) { k_tok_to_cs<<<nbk((long long)n * C * Sg, 256), 256>>>(t, x, n, C, Sg, nreg); }
 extern "C" void at_reg_grad(const float *gt, float *greg, int n, int C, long Sg, int nreg) { if (nreg) k_reg_grad<<<nbk(nreg * C, 256), 256>>>(gt, greg, n, C, Sg, nreg); }
+
+/* scan fusion view rows (src/attn.h at_view_*) */
+__global__ void k_view_patch(const unsigned char *v, int n, int Pv, int k, float *xp) {
+    const int G = Pv / k, k3 = k * k * k; const long long Nv = (long long)G * G * G;
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i >= (long long)n * Nv * k3) return;
+    const int q = (int)(i % k3); const long long r = i / k3; const int j = (int)(r % Nv), s = (int)(r / Nv);
+    const int pz = j / (G * G), py = (j / G) % G, px = j % G, a = q / (k * k), b = (q / k) % k, c = q % k;
+    xp[i] = v ? (float)v[(long long)s * Pv * Pv * Pv + ((long long)(pz * k + a) * Pv + (py * k + b)) * Pv + px * k + c] * (1.f / 255.f) : 0.f;
+}
+__global__ void k_view_add(float *t, int n, int S, int r0, int Nv, int C, const float *E, const float *bias) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i >= (long long)n * Nv * C) return;
+    const int c = (int)(i % C); const long long r = i / C; const int j = (int)(r % Nv), s = (int)(r / Nv);
+    t[((long long)s * S + r0 + j) * C + c] += E[i] + bias[c];
+}
+__global__ void k_view_gather(const float *gt, int n, int S, int r0, int Nv, int C, float *GE) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i >= (long long)n * Nv * C) return;
+    const int c = (int)(i % C); const long long r = i / C; const int j = (int)(r % Nv), s = (int)(r / Nv);
+    GE[i] = gt[((long long)s * S + r0 + j) * C + c];
+}
+__global__ void k_colsum_acc(const float *GE, long long R, int C, float *gb) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float a = 0.f; for (long long r = 0; r < R; r++) a += GE[r * C + c];
+    gb[c] += a;
+}
+extern "C" void at_view_patch(const unsigned char *v, int n, int Pv, int k, float *xp) {
+    const long long G = Pv / k, tot = (long long)n * G * G * G * k * k * k;
+    if (tot) k_view_patch<<<nbk(tot, 256), 256>>>(v, n, Pv, k, xp);
+}
+extern "C" void at_view_add(float *t, int n, int S, int r0, int Nv, int C, const float *E, const float *bias) {
+    if ((long long)n * Nv) k_view_add<<<nbk((long long)n * Nv * C, 256), 256>>>(t, n, S, r0, Nv, C, E, bias);
+}
+extern "C" void at_view_gather(const float *gt, int n, int S, int r0, int Nv, int C, float *GE, float *gb) {
+    if (!((long long)n * Nv)) return;
+    k_view_gather<<<nbk((long long)n * Nv * C, 256), 256>>>(gt, n, S, r0, Nv, C, GE);
+    k_colsum_acc<<<nbk(C, 128), 128>>>(GE, (long long)n * Nv, C, gb);
+}
 
 /* 16-bit storage (fp16 when f16, else bf16) -> fp32 */
 #include <cuda_fp16.h>

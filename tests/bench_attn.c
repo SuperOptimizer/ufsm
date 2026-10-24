@@ -2,7 +2,9 @@
    nreg + D^3 tokens, width C (C / 48 heads), MLP F (0: 8 C / 3 rounded to 32). Times one SSL view's work per block: a teacher forward
    (no grad) + the student's forward + backward (the backward recomputes the forward), reps times per measurement. configs: comma list
    of attention-core[:linear-mx[:keep]] settings (default "0:4,1:4"; keep 1: the backward uses the student forward, no recompute), measured interleaved for rounds rounds (default 5); the minimum ms per
-   config is printed (robust on a shared GPU). UFSM_ATTN_PROF=1: the per-phase table of the last config's last round. */
+   config is printed (robust on a shared GPU). UFSM_ATTN_PROF=1: the per-phase table of the last config's last round.
+   BENCH_RADIAL=mult: radial attention (at_rays, mult rays per plane / D, no registers) around an axis along z through each sample's
+   grid (BENCH_AXIS=out: outside it, past a corner); BENCH_ROPE=2 with it: scroll RoPE. */
 #include "attn.h"
 #include "nn.h"
 #include <time.h>
@@ -21,14 +23,46 @@ int main(int argc, char **argv) {
     if (nn_init(0)) { printf("no GPU\n"); return 1; }
     int nc = 0, core[16], mx[16], kp[16];
     { char *t = strdup(cfgs); for (char *q = strtok(t, ","); q && nc < 16; q = strtok(nullptr, ",")) { core[nc] = atoi(q); const char *c = strchr(q, ':'); mx[nc] = c ? atoi(c + 1) : 4; const char *c2 = c ? strchr(c + 1, ':') : nullptr; kp[nc++] = c2 ? atoi(c2 + 1) : 0; } free(t); }
-    at_dims d = {C, C / AT_HD, F, 0, nreg, 100.f}; at_bp bp; const size_t np = at_block_layout(&d, &bp, 0);
-    at_geom g = {nseq, nreg + D * D * D, D, D, D}; const long T = (long)nseq * g.S;
+    at_dims d = {C, C / AT_HD, F, 0, nreg, 100.f};
+    if (getenv("BENCH_DEFORM")) {   /* deformable attention: K points per head and level, BENCH_DLEV levels (2), BENCH_DC the finer levels' channels */
+        d.dK = atoi(getenv("BENCH_DEFORM")); d.dL = getenv("BENCH_DLEV") ? atoi(getenv("BENCH_DLEV")) : 2; d.dC[0] = C;
+        const char *dc = getenv("BENCH_DC") ? getenv("BENCH_DC") : "192,96";
+        for (int l = 1; l < d.dL; l++) { d.dC[l] = atoi(dc); dc = strchr(dc, ','); dc = dc ? dc + 1 : "96"; }
+        if (nreg) { printf("BENCH_DEFORM: nreg 0\n"); return 1; }
+    }
+    at_bp bp; const size_t np = at_block_layout(&d, &bp, 0);
+    at_geom g = {nseq, nreg + D * D * D, D, D, D, nullptr, nullptr, nullptr, {0}}; const long T = (long)nseq * g.S;
     float *h = malloc(np * 4); for (size_t i = 0; i < np; i++) h[i] = 0.05f * nr();
     for (int c = 0; c < C; c++) h[bp.ln1g + c] = h[bp.ln2g + c] = h[bp.qg + c] = h[bp.kg + c] = 1.f;
+    if (d.dK) {   /* the grid prior + small offsets, the finer levels' inputs */
+        at_dfm_prior(&d, h + bp.boa);
+        for (int l = 1; l < d.dL; l++) {
+            const size_t ne = ((size_t)T << (3 * l)) * d.dC[l]; float *t = malloc(ne * 4); for (size_t i = 0; i < ne; i++) t[i] = nr();
+            float *fd = nn_malloc(ne * 4); nn_h2d(fd, t, ne * 4); free(t); g.dfx[l] = fd;
+        }
+        printf("deformable: %d points x %d levels per head, finer channels %d %d, offset / logit rows %d\n", d.dK, d.dL, d.dC[1], d.dC[2], at_dfm_noa(&d));
+    }
     float *P = nn_malloc(np * 4), *G = nn_malloc(np * 4); nn_h2d(P, h, np * 4); nn_zero(G, np * 4); free(h);
     float *hx = malloc(T * C * 4); for (long i = 0; i < T * C; i++) hx[i] = nr();
     float *x = nn_malloc(T * C * 4), *y = nn_malloc(T * C * 4), *gy = nn_malloc(T * C * 4); nn_h2d(x, hx, T * C * 4); free(hx);
-    at_ws w; void *wb = nn_malloc(at_ws_bytes(&d, T)); at_ws_carve(&w, &d, T, wb);
+    long Tr = 0; at_rays R;
+    if (getenv("BENCH_RADIAL")) {   /* the ray plan of an axis along z per sample */
+        const float mult = (float)atof(getenv("BENCH_RADIAL")); const int out = getenv("BENCH_AXIS") && !strcmp(getenv("BENCH_AXIS"), "out");
+        if (nreg) { printf("BENCH_RADIAL: nreg 0\n"); return 1; }
+        int Q, Nt, Nr; at_rays_dims(D, D, D, mult, &Q, &Nt, &Nr); Tr = (long)nseq * Q * Nr;
+        float *axr = calloc((size_t)nseq * AT_AXR(D), 4), *ray = malloc((size_t)nseq * Q * AT_RAY_F * 4), *cen = malloc((size_t)nseq * D * 16); int *lens = malloc((size_t)nseq * Q * 4), *ad = malloc((size_t)nseq * 4);
+        for (int b = 0; b < nseq; b++) { float *a = axr + (size_t)b * AT_AXR(D); a[1] = 1; for (int k = 0; k < D; k++) { a[2 + 2 * k] = out ? -0.6f * D - 0.05f * k : 0.45f * D + 0.03f * k; a[3 + 2 * k] = out ? 1.3f * D : 0.55f * D - 0.02f * k; } }
+        at_rays_plan(nseq, D, D, D, mult, axr, ray, lens, ad, cen);
+        long used = 0; for (long q = 0; q < (long)nseq * Q; q++) used += (long)ray[q * AT_RAY_F + 6];
+        R = (at_rays){nseq, Q, Nt, Nr, D, D, D, nn_malloc((size_t)nseq * 4), nn_malloc((size_t)nseq * Q * AT_RAY_F * 4), nn_malloc((size_t)nseq * Q * 4), nn_malloc((size_t)Tr * 12), nn_malloc(T * 4)};
+        nn_h2d((void *)R.ad, ad, (size_t)nseq * 4); nn_h2d((void *)R.ray, ray, (size_t)nseq * Q * AT_RAY_F * 4); nn_h2d((void *)R.lens, lens, (size_t)nseq * Q * 4);
+        at_rays_setup(&R); g.rays = &R; d.rope = getenv("BENCH_ROPE") ? atoi(getenv("BENCH_ROPE")) : 0;
+        float *ws = malloc(T * 4); nn_sync(); nn_d2h(ws, R.wsum, T * 4); long cov = 0; for (long i = 0; i < T; i++) cov += ws[i] > 0;
+        printf("radial: axis %s, %d rays per plane, Q %d rays x Nr %d slots per sample = %ld ray tokens (%.2f x the grid), %.1f percent used, grid coverage %.3f\n",
+               out ? "outside" : "inside", Nt, Q, Nr, Tr, (double)Tr / T, 100.0 * used / Tr, (double)cov / T);
+        free(axr); free(ray); free(cen); free(lens); free(ad); free(ws);
+    }
+    at_ws w; void *wb = nn_malloc(at_ws_bytes_r(&d, T, Tr)); at_ws_carve_r(&w, &d, T, Tr, wb);
     if (getenv("BENCH_GEMM")) {   /* the block's twelve GEMM shapes (bias / residual epilogues as the block): min ms over launches per linear-mx */
         struct { const char *nm; int ta, tb, M, N, K; const float *A, *B; float *Cm; float beta; const float *bias, *res; } gm[] = {
             {"qkv fwd", 0, 1, (int)T, 3 * C, C, w.xn, P + bp.wqkv, w.qkv, 0.f, P + bp.bqkv, nullptr},
@@ -96,7 +130,7 @@ int main(int argc, char **argv) {
         }
     const char *er = nn_check();
     printf("bench_attn: C %d (%d heads) F %d, %d seq x %d tokens, block scratch %.1f MB, %s; ms per view per block (teacher fwd + student fwd + bwd), min of %d rounds:\n",
-           C, d.H, F, nseq, g.S, at_ws_bytes(&d, T) / 1e6, er ? er : "ok", rounds);
+           C, d.H, F, nseq, g.S, at_ws_bytes_r(&d, T, Tr) / 1e6, er ? er : "ok", rounds);
     for (int k = 0; k < nc; k++) printf("  core %d linear-mx %d keep %d: %.2f ms\n", core[k], mx[k], kp[k], best[k]);
     at_prof_report(stdout); at_prof_reset();
     return 0;
