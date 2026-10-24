@@ -865,7 +865,7 @@ typedef struct {
     /* --ssl-distill W: dense cosine distillation of dinovol's unit 64-d sheet (object) embedding at the mapped points into head channels
        dch..dch+63 (student: the cell centres of each global; target: dinovol on the partner's un-augmented global at the same physical point);
        --ssl-distill-abs A scales that per-point term, --ssl-distill-rel W adds W x the crop's similarity-matrix match (ss_relsim: rotation-free) */
-    float dist; int dch, dnd; float *dcrd, *dacc, *dth, *dse, *dsn, *dge, *dch_h, *dacch; double dist_l; long dist_n; float drel, dabs; double rel_l; long rel_n; int dstr, dnp, *ddp, *ddph; float *dtd;   /* (dense mode: --ssl-distill-stride S grid points of every global, its own crop) */
+    float dist; int dch, dnd; float *dcrd, *dacc, *dth, *dse, *dsn, *dge, *dch_h, *dacch; double dist_l; long dist_n; float drel, dabs; double rel_l; long rel_n; int dstr, dnp, *ddp, *ddph; float *dtd; double dtm; long dtmn;   /* (dense mode: --ssl-distill-stride S grid points of every global, its own crop) */
     int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -1459,11 +1459,16 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
         const int dden = gl && Q->dist > 0 && Q->dstr > 0 && dvon;
         if (dden) {   /* dense distillation: L = dist / (2N NP) sum (1 - e . t) over every global's grid points (+ the relational term on a 256-point subset) */
             const int nd = Q->dnd, NP = Q->dnp, h16 = unet_logits_h16(n); float *eh = malloc((size_t)NP * nd * 4), *gh = malloc((size_t)NP * nd * 4); const float *th = Q->dtd + (size_t)j * NP * nd;
+            static int dconst = -1; if (dconst < 0) dconst = getenv("UFSM_DIST_CONST") ? atoi(getenv("UFSM_DIST_CONST")) : 0;
+            if (dconst) {   /* (debug: a trivial target -- 1: one constant unit vector; 2: the sign of z - PG/2 on axis 0) */
+                float *tc = (float *)th; for (int k = 0; k < NP; k++) { const int z = Q->ddph[(size_t)j * NP + k] / (Q->PG * Q->PG); for (int e = 0; e < nd; e++) tc[(size_t)k * nd + e] = e == 0 ? (dconst == 2 && z < Q->PG / 2 ? -1.f : 1.f) : 0.f; } }
             dn_gather((const char *)lgs + (size_t)Q->dch * g3 * (h16 ? 2 : 4), h16, g3, nd, Q->ddp + (size_t)j * NP, NP, Q->dse, Q->dsn);
             nn_d2h(eh, Q->dse, (size_t)NP * nd * 4);
             const float wv = Q->dist * Q->dabs / (float)(2 * N * NP);
             for (int k = 0; k < NP; k++) { double d = 0; for (int e = 0; e < nd; e++) { d += (double)eh[(size_t)k * nd + e] * th[(size_t)k * nd + e]; gh[(size_t)k * nd + e] = -wv * th[(size_t)k * nd + e]; }
                 Q->dist_l += 1 - d; Q->dist_n++; }
+            { double mt[64] = {0}, ms = 0; const int ne = nd < 64 ? nd : 64; for (int k = 0; k < NP; k++) for (int e = 0; e < ne; e++) mt[e] += th[(size_t)k * nd + e] / NP;   /* (|mean target|: the best constant prediction's cosine) */
+              for (int e = 0; e < ne; e++) ms += mt[e] * mt[e]; Q->dtm += sqrt(ms); Q->dtmn++; }
             if (Q->drel > 0) {   /* (a random 256-point subset: rows k * stride) */
                 const int mr = NP < 256 ? NP : 256, st_ = NP / mr; float *es = malloc((size_t)mr * nd * 4), *ts_ = malloc((size_t)mr * nd * 4), *gs2 = calloc((size_t)mr * nd, 4);
                 const int o_ = (int)(rng_next(&Q->ar) % (uint64_t)st_);
@@ -1548,6 +1553,7 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             size_t l5 = strlen(line);
             if (Q->ilsc) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | ibot logit scale %.3f", expf(Q->lsc)); l5 = strlen(line); }
             if (Q->dist_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill 1-cos %.4f", Q->dist_l / Q->dist_n); Q->dist_l = 0; Q->dist_n = 0; l5 = strlen(line); }
+            if (Q->dtmn) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | |mean target| %.3f", Q->dtm / Q->dtmn); Q->dtm = 0; Q->dtmn = 0; l5 = strlen(line); }
             if (Q->rel_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill rel %.4f", Q->rel_l / Q->rel_n); Q->rel_l = 0; Q->rel_n = 0; l5 = strlen(line); }
             if (Q->sig_n) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | sigreg %.4f", Q->sig_l / Q->sig_n); Q->sig_l = 0; Q->sig_n = 0; l5 = strlen(line); }
             if (Q->zvh_n) { const size_t l7 = strlen(line); snprintf(line + l7, cap - l7, " | ibot zvar hinge %.5f", Q->zvh_l / Q->zvh_n); Q->zvh_l = 0; Q->zvh_n = 0; l5 = strlen(line); }
@@ -2157,7 +2163,19 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
         if (!isfinite(gnorm) || !isfinite(lsum[0])) { fprintf(stderr, "dino-train --recipe: non-finite loss / gradient at step %d\n", step); return 1; }
         if (clip > 0) unet_clip_grad(u, clip);
         RP(9);
+        static int hlog = -1; if (hlog < 0) hlog = getenv("UFSM_HEAD_LOG") ? atoi(getenv("UFSM_HEAD_LOG")) : 0;
+        size_t hwo = 0, hbo = 0; int hco = 0, hci = 0; float *hw0 = nullptr, *hg = nullptr;
+        if (hlog && step % hlog == 0) {   /* (debug: the output head's gradient and its parameter change this step) */
+            unet_head_offsets(u, &hwo, &hbo); hco = unet_cfg_of(u)->cout; hci = (int)((hbo - hwo) / hco);
+            hw0 = malloc((size_t)(hci + 1) * hco * 4); hg = malloc((size_t)(hci + 1) * hco * 4);
+            nn_d2h(hw0, unet_live_params(u) + hwo, (size_t)(hci + 1) * hco * 4); nn_d2h(hg, unet_grad_ptr(u) + hwo, (size_t)(hci + 1) * hco * 4); }
         unet_muon(u, mlr0 * sched, 0.95f, lr0 * sched, 0.9f, 0.999f, 1e-8f, wd, step);
+        if (hw0) { float *hw1 = malloc((size_t)(hci + 1) * hco * 4); nn_d2h(hw1, unet_live_params(u) + hwo, (size_t)(hci + 1) * hco * 4);
+            double gw = 0, gb = 0, dw = 0, db = 0, nw = 0, nb = 0; const size_t nW = (size_t)hci * hco;
+            for (size_t i = 0; i < nW; i++) { gw += (double)hg[i] * hg[i]; dw += (double)(hw1[i] - hw0[i]) * (hw1[i] - hw0[i]); nw += (double)hw1[i] * hw1[i]; }
+            for (int i = 0; i < hco; i++) { gb += (double)hg[nW + i] * hg[nW + i]; db += (double)(hw1[nW + i] - hw0[nW + i]) * (hw1[nW + i] - hw0[nW + i]); nb += (double)hw1[nW + i] * hw1[nW + i]; }
+            fprintf(stderr, "head step %d: W %dx%d |gW| %.3e |dW| %.3e |W| %.3e | |gb| %.3e |db| %.3e |b| %.3e b0 %.4f gb0 %.3e | gnorm %.3e\n", step, hco, hci, sqrt(gw), sqrt(dw), sqrt(nw), sqrt(gb), sqrt(db), sqrt(nb), hw1[nW], hg[nW], gnorm);
+            free(hw1); free(hw0); free(hg); }
         RP(8);
         /* heads: Muon on W1 W2 W3, AdamW on the biases and g, the prototype directions per --proto-opt (frozen for --freeze-last steps) */
         dn_head_step(&D, mlr0 * sched, hlr * sched, plr * sched, wd, step, freeze, mom, step % hacc == 0);
@@ -2361,7 +2379,12 @@ int cmd_dino_train(int argc, char **argv) {
        C 288 x 4097 tokens; absent: env UFSM_ATTN_KEEP, else 0) */
     if (opt(argc, argv, "--attn-core", nullptr)) at_set_core(atoi(opt(argc, argv, "--attn-core", "1")));
     if (opt(argc, argv, "--attn-keep", nullptr)) unet_set_attn_keep(atoi(opt(argc, argv, "--attn-keep", "0")));
-    unet *u = unet_create(&cfg); unet_init(u, seed); unet_head_bias_zero(u);   /* (no shared -2 bias direction in the embeddings) */
+    unet *u = unet_create(&cfg); unet_init(u, seed); unet_head_bias_zero(u);
+    {   /* --head-init S: the 1^3 head's initial weights x S (live and EMA): a small head lets a regression target (--ssl-distill) move the
+           outputs in tens of steps instead of hundreds (Kaiming: |W| ~ 11 for 64 x 16, Muon / AdamW steps ~0.025 per step) */
+        const float his = (float)atof(opt(argc, argv, "--head-init", "1"));
+        if (his != 1.f) { size_t hw_, hb_; unet_head_offsets(u, &hw_, &hb_); nn_scale((float *)unet_live_params(u) + hw_, his, hb_ - hw_); nn_scale((float *)unet_ema_params(u) + hw_, his, hb_ - hw_); }
+    }   /* (no shared -2 bias direction in the embeddings) */
     const int HZ = atoi(opt(argc, argv, "--head-slab", "0"));   /* head slabs of HZ planes: no whole-window logits / logit gradient (large windows) */
     if (HZ && (fp32 || P % HZ)) { fprintf(stderr, "dino-train: --head-slab needs MX storage (--mx 1) and P a multiple of it\n"); return 2; }
     const char *mem = opt(argc, argv, "--mem", "default");   /* lean: train's smallest recompute-1 mode (chunked MX gradients, lean 2, shared encoder a1) */
