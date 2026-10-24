@@ -865,7 +865,7 @@ typedef struct {
     /* --ssl-distill W: dense cosine distillation of dinovol's unit 64-d sheet (object) embedding at the mapped points into head channels
        dch..dch+63 (student: the cell centres of each global; target: dinovol on the partner's un-augmented global at the same physical point);
        --ssl-distill-abs A scales that per-point term, --ssl-distill-rel W adds W x the crop's similarity-matrix match (ss_relsim: rotation-free) */
-    float dist; int dch, dnd; float *dcrd, *dacc, *dth, *dse, *dsn, *dge, *dch_h, *dacch; double dist_l; long dist_n; float drel, dabs; double rel_l; long rel_n; float dnce, dthr, dtau; int dnm; double nce_l, nce_pf; long nce_n; double zn_s, zsim_s; long zn_n; int dstr, dnp, *ddp, *ddph; float *dtd; double dtm; long dtmn;   /* (dense mode: --ssl-distill-stride S grid points of every global, its own crop) */
+    float dist; int dch, dnd; float *dcrd, *dacc, *dth, *dse, *dsn, *dge, *dch_h, *dacch; double dist_l; long dist_n; float drel, dabs; double rel_l; long rel_n; float dnce, dthr, dtau; int dnm; double nce_l, nce_pf; long nce_n; double zn_s, zsim_s; long zn_n; float dcc; int dccmin; double cc_l, cc_keep, cc_nc, cc_pos; long cc_n; int dstr, dnp, *ddp, *ddph; float *dtd; double dtm; long dtmn;   /* (dense mode: --ssl-distill-stride S grid points of every global, its own crop) */
     int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -945,6 +945,7 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         Q->dist = (float)atof(opt(argc, argv, "--ssl-distill", "0")); Q->dch = atoi(opt(argc, argv, "--ssl-distill-ch", "0"));
         Q->drel = (float)atof(opt(argc, argv, "--ssl-distill-rel", "0")); Q->dabs = (float)atof(opt(argc, argv, "--ssl-distill-abs", "1"));
         Q->dnce = (float)atof(opt(argc, argv, "--ssl-distill-nce", "0")); Q->dthr = (float)atof(opt(argc, argv, "--ssl-distill-thr", "0.5"));   /* (teacher-graph SupCon: positives = dinovol cos > thr) */
+        Q->dcc = (float)atof(opt(argc, argv, "--ssl-distill-cc", "0")); Q->dccmin = atoi(opt(argc, argv, "--ssl-distill-ccmin", "8"));   /* (pseudo sheet labels: connected components of the dinovol cosine graph -> GT SupCon) */
         Q->dtau = (float)atof(opt(argc, argv, "--ssl-distill-tau", "0.1")); Q->dnm = atoi(opt(argc, argv, "--ssl-distill-m", "512"));
         Q->dstr = atoi(opt(argc, argv, "--ssl-distill-stride", "0"));   /* 0: the iBOT rows (cross-view); S: dense, every S-th voxel per axis of each global (own crop) */   /* (relational: crop-local similarity matrices; abs: the per-point cosine) */
         if (!(Q->dv = dv_load(dvck)) || (Q->dist <= 0 && dv_head_host(dvck, "ibot_head", &Q->DVH, &dvPh))) return 1;
@@ -1047,6 +1048,7 @@ static void dn_ssl_cls(dn_ssl *Q, unet *n, float *cls) {   /* the CLS of the net
     if (Q->cls_reg == 2) { nn_d2d(cls, tok, (size_t)Q->C * 4); dr_pool_fwd(tok, 1, S, Q->C, nreg, cls + Q->C); }   /* (--cls both: register | token mean) */
     else if (Q->cls_reg) nn_d2d(cls, tok, (size_t)Q->C * 4); else dr_pool_fwd(tok, 1, S, Q->C, nreg, cls);
 }
+static int UF_FIND2(int *par, int x) { while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; } return x; }
 static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     const int N = Q->N, C = Q->CC, CT = Q->C, K = Q->K, NV = 2 * N + Q->NL * N, CIN = Q->CIN; const size_t g3 = (size_t)Q->PG * Q->PG * Q->PG, l3 = (size_t)Q->PL * Q->PL * Q->PL, ps3 = (size_t)Q->Ps * Q->Ps * Q->Ps;
     const float gs = nn_get_grad_scale(); int *hasax = Q->hasaxv;
@@ -1504,6 +1506,37 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
                 const float sc = Q->dist * Q->dnce / (float)(2 * N);
                 for (int k = 0; k < mr; k++) for (int e = 0; e < nd; e++) gh[(size_t)pk[k] * nd + e] += sc * gs2[(size_t)k * nd + e];
                 free(es); free(ts_); free(gs2); free(pk); }
+            if (Q->dcc > 0) {   /* pseudo sheet labels: union-find over the S-grid's 6-neighbour edges with dinovol cosine > thr; components of >= ccmin
+                                   points become GT codes (256 + id: same component positive, else negative) for the GT SupCon kernel (dn_supcon) on m of their points */
+                const int g_ = Q->PG / Q->dstr; int *par = malloc((size_t)NP * 4), *sz = calloc((size_t)NP, 4), *cid = malloc((size_t)NP * 4), *kp = malloc((size_t)NP * 4);
+                for (int k = 0; k < NP; k++) par[k] = k;
+                #define UF_FIND(x_) ({ int r_ = (x_); while (par[r_] != r_) { par[r_] = par[par[r_]]; r_ = par[r_]; } r_; })
+                for (int k = 0; k < NP; k++) { const int z = k / (g_ * g_), y = k / g_ % g_, x_ = k % g_; const int nb[3] = {z + 1 < g_ ? k + g_ * g_ : -1, y + 1 < g_ ? k + g_ : -1, x_ + 1 < g_ ? k + 1 : -1};
+                    for (int q = 0; q < 3; q++) { if (nb[q] < 0) continue; double d = 0; for (int e = 0; e < nd; e++) d += (double)th[(size_t)k * nd + e] * th[(size_t)nb[q] * nd + e];
+                        if (d > Q->dthr) { const int ra = UF_FIND(k), rb = UF_FIND(nb[q]); if (ra != rb) par[ra] = rb; } } }
+                for (int k = 0; k < NP; k++) sz[UF_FIND(k)]++;
+                int nk = 0, nc = 0; for (int k = 0; k < NP; k++) cid[k] = -1;
+                for (int k = 0; k < NP; k++) { const int r_ = UF_FIND(k); if (sz[r_] < Q->dccmin) continue; if (cid[r_] < 0) cid[r_] = nc++; kp[nk++] = k; }
+                #undef UF_FIND
+                const int mr = nk < Q->dnm ? nk : Q->dnm;
+                if (mr >= 16 && nc >= 2) {
+                    for (int k = 0; k < mr; k++) { const int o_ = k + (int)(rng_next(&Q->ar) % (uint64_t)(nk - k)), t_ = kp[k]; kp[k] = kp[o_]; kp[o_] = t_; }   /* (m distinct points) */
+                    static float *es_d, *ga_d, *scr_d, *out_d, *gah; static int *code_d, *xyz_d, *codeh, *xyzh, cap; float *esh = malloc((size_t)mr * nd * 4);
+                    if (cap < mr) { nn_free(es_d); nn_free(ga_d); nn_free(scr_d); nn_free(code_d); nn_free(xyz_d); free(gah); free(codeh); free(xyzh); cap = mr;
+                        es_d = nn_malloc((size_t)cap * nd * 4); ga_d = nn_malloc((size_t)cap * nd * 4); scr_d = nn_malloc(((size_t)2 * cap + 16) * 4); code_d = nn_malloc((size_t)cap * 4); xyz_d = nn_malloc((size_t)cap * 12);
+                        gah = malloc((size_t)cap * nd * 4); codeh = malloc((size_t)cap * 4); xyzh = malloc((size_t)cap * 12); if (!out_d) out_d = nn_malloc(16); }
+                    for (int k = 0; k < mr; k++) { const int q = kp[k], v_ = Q->ddph[(size_t)j * NP + q]; memcpy(esh + (size_t)k * nd, eh + (size_t)q * nd, (size_t)nd * 4);
+                        codeh[k] = 256 + cid[UF_FIND2(par, q)]; xyzh[3 * k] = v_ / (Q->PG * Q->PG); xyzh[3 * k + 1] = v_ / Q->PG % Q->PG; xyzh[3 * k + 2] = v_ % Q->PG; }
+                    nn_h2d(es_d, esh, (size_t)mr * nd * 4); nn_h2d(code_d, codeh, (size_t)mr * 4); nn_h2d(xyz_d, xyzh, (size_t)mr * 12);
+                    dn_supcon(es_d, code_d, xyz_d, mr, nullptr, code_d, xyz_d, 0, nd, Q->dtau, 1.f, 0.f, ga_d, out_d, scr_d);
+                    float oh[4]; nn_d2h(oh, out_d, 16); nn_d2h(gah, ga_d, (size_t)mr * nd * 4);
+                    const float sc = Q->dist * Q->dcc / (float)(2 * N);
+                    for (int k = 0; k < mr; k++) for (int e = 0; e < nd; e++) gh[(size_t)kp[k] * nd + e] += sc * gah[(size_t)k * nd + e];
+                    long np_ = 0; for (int a = 0; a < mr; a++) for (int b = 0; b < mr; b++) np_ += a != b && codeh[a] == codeh[b];
+                    Q->cc_l += oh[0]; Q->cc_keep += (double)nk / NP; Q->cc_nc += nc; Q->cc_pos += (double)np_ / ((double)mr * (mr - 1)); Q->cc_n++; free(esh);
+                }
+                free(par); free(sz); free(cid); free(kp);
+            }
             nn_h2d(Q->dge, gh, (size_t)NP * nd * 4);
             dr_scatter_unit_f32(Q->dse, Q->dge, Q->dsn, Q->ddp + (size_t)j * NP, NP, nd, g3, 1.f, Q->glzib + (size_t)Q->dch * g3);
             free(eh); free(gh);
@@ -1588,6 +1621,8 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             if (Q->dist_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill 1-cos %.4f", Q->dist_l / Q->dist_n); Q->dist_l = 0; Q->dist_n = 0; l5 = strlen(line); }
             if (Q->dtmn) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | |mean target| %.3f", Q->dtm / Q->dtmn); Q->dtm = 0; Q->dtmn = 0; l5 = strlen(line); }
             if (Q->zn_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | emb |z| %.4g cos %.3f", Q->zn_s / Q->zn_n, Q->zsim_s / Q->zn_n); Q->zn_s = Q->zsim_s = 0; Q->zn_n = 0; l5 = strlen(line); }
+            if (Q->cc_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill cc supcon %.4f (%.1f comps, %.2f of points kept, pos %.3f)", Q->cc_l / Q->cc_n, Q->cc_nc / Q->cc_n, Q->cc_keep / Q->cc_n, Q->cc_pos / Q->cc_n);
+                Q->cc_l = Q->cc_keep = Q->cc_nc = Q->cc_pos = 0; Q->cc_n = 0; l5 = strlen(line); }
             if (Q->nce_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill nce %.4f pos %.3f", Q->nce_l / Q->nce_n, Q->nce_pf / Q->nce_n); Q->nce_l = 0; Q->nce_pf = 0; Q->nce_n = 0; l5 = strlen(line); }
             if (Q->rel_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill rel %.4f", Q->rel_l / Q->rel_n); Q->rel_l = 0; Q->rel_n = 0; l5 = strlen(line); }
             if (Q->sig_n) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | sigreg %.4f", Q->sig_l / Q->sig_n); Q->sig_l = 0; Q->sig_n = 0; l5 = strlen(line); }
@@ -1875,7 +1910,11 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
                 fprintf(stderr, "dino-train: %.0f ms/step over steps 21..200 -> %d steps for %.1f minutes\n", ms * 1e3, steps, minutes); if (lf) { fprintf(lf, "budget: %.1f ms/step -> %d steps (%.1f min)\n", ms * 1e3, steps, minutes); fflush(lf); } }
         }
         RP(9);
-        dn_sample *Sm = ring_get(Rg); if (!Sm) { fprintf(stderr, "dino-train: data loader failed\n"); return 1; }
+        static int rfix = -1; static dn_sample *Sfix; if (rfix < 0) rfix = getenv("UFSM_REC_FIXED") && atoi(getenv("UFSM_REC_FIXED"));   /* (debug: one fixed sample, views and augmentations every step) */
+        dn_sample *Sm = rfix && Sfix ? Sfix : ring_get(Rg); if (!Sm) { fprintf(stderr, "dino-train: data loader failed\n"); return 1; }
+        while (rfix && !Sfix && wgt > 0 && Sm->ngt < 2000) { ring_put(Rg, Sm); Sm = ring_get(Rg); if (!Sm) return 1; }   /* (a labelled sample) */
+        if (rfix && !Sfix) { Sfix = Sm; fprintf(stderr, "dino-train: UFSM_REC_FIXED: one fixed sample (source %d, %d GT points)\n", Sm->si, Sm->ngt); }
+        if (rfix) ar = seed * 1000003 + 99;
         const dn_src *sr = &Dd->src[Sm->si];
         RP(0);
         nn_h2d(src, Sm->ca, ps3);
@@ -1888,7 +1927,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             a->gamma = rng_u(&ar) < 0.25 ? expf((float)(2 * rng_u(&ar) - 1) * logf(1.25f)) : 1.f;
             a->contrast = rng_u(&ar) < 0.25 ? 0.8f + 0.4f * (float)rng_u(&ar) : 1.f; a->mean = 0.f;
             a->bias = rng_u(&ar) < 0.15 ? 0.15f * (float)(sqrt(-2 * log(rng_u(&ar) + 1e-12)) * cos(6.283185307 * rng_u(&ar))) : 0.f;
-            a->invert = rng_u(&ar) < 0.15; a->sigma = noise * (float)rng_u(&ar); a->seed = (uint32_t)(step * 16 + v);
+            a->invert = rng_u(&ar) < 0.15; a->sigma = noise * (float)rng_u(&ar); a->seed = (uint32_t)((rfix ? 1 : step) * 16 + v);
         }
         nn_h2d(xfd, xf, sizeof(dr_xf) * (2 + nloc)); nn_h2d(itd, it, sizeof(dr_int) * (2 + nloc));
         if (CIN == 1) { dr_crops(src, Ps, xfd, itd, 2, P, xg); if (nloc) dr_crops(src, Ps, xfd + 2, itd + 2, nloc, PL, xl); }
@@ -1953,7 +1992,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
         }
         const int ntot = nop + npi + nni;
         if (ntot) { nn_h2d(o_idx, ho_idx, (size_t)ntot * 4); nn_h2d(o_idx + NOT, ho_idx + NOT, (size_t)ntot * 4); nn_h2d(o_obj, ho_obj, (size_t)ntot * 4); nn_h2d(o_grp, ho_grp, (size_t)ntot * 4); }
-        if (!HS.uw) ring_put(Rg, Sm);   /* (dense heads: the slot's per-view targets are read in the student loop: held until after it) */
+        if (!HS.uw && !rfix) ring_put(Rg, Sm);   /* (dense heads: the slot's per-view targets are read in the student loop: held until after it) */
         const float oramp_w = oramp > 0 && step < oramp ? (float)step / oramp : 1.f;
         const float tt = step < tt_warm ? tt0 + (tt1 - tt0) * (float)step / (float)tt_warm : tt1;
         const float sched = step <= warm ? (float)step / warm : 1.f;   /* (upstream: constant after the warm-up) */
@@ -2193,7 +2232,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
         if (wk > 0) for (int v = 0; v < 2; v++) { nn_d2d(kq + (size_t)kpos * C, kpend + (size_t)v * C, (size_t)C * 4); kpos = (kpos + 1) % KQ; if (kfill < KQ) kfill++; }
         if (SB > 0 && step % sse == 0) { if (dn_ssl_step(&SS, step, tt, mom)) return 1; }   /* the multi-sample SSL batch (its gradient into u) */
         nn_axpy(unet_grad_ptr(u), 1.f, unet_grad_ptr(ul), np);   /* the locals' share */
-        if (HS.uw) ring_put(Rg, Sm);
+        if (HS.uw && !rfix) ring_put(Rg, Sm);
         const double gnorm = unet_grad_norm(u);
         if (!isfinite(gnorm) || !isfinite(lsum[0])) { fprintf(stderr, "dino-train --recipe: non-finite loss / gradient at step %d\n", step); return 1; }
         if (clip > 0) unet_clip_grad(u, clip);

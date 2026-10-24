@@ -191,7 +191,8 @@ extern "C" void dn_supcon(const float *a, const int *code, const int *xyz, int N
                           float tau, float hw, float hr, float *ga, float *out, float *scratch) {
     if (D == 16) supcon_t<16>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, ga, out, scratch);
     else if (D == 32) supcon_t<32>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, ga, out, scratch);
-    else fprintf(stderr, "dn_supcon: D %d (16 or 32)\n", D);
+    else if (D == 64) supcon_t<64>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, ga, out, scratch);
+    else fprintf(stderr, "dn_supcon: D %d (16, 32 or 64)\n", D);
 }
 
 /* ---- DINO prototypes: logits matrices in scratch; the gradients as two small matrix products ---- */
