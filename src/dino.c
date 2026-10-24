@@ -2249,7 +2249,7 @@ int cmd_dino_train(int argc, char **argv) {
     const float wgt = (float)atof(opt(argc, argv, "--gt", "1"));   /* the GT contrastive term's weight */
     const int use_teacher = atoi(opt(argc, argv, "--teacher", "1"));   /* 0: no EMA teacher forward (debug; GT term over the student points only) */
     const int ED = atoi(opt(argc, argv, "--dim", "32"));   /* embedding channels (16 or 32) */
-    if (ED != 16 && ED != 32) { fprintf(stderr, "dino-train: --dim 16 or 32\n"); return 2; }
+    if (ED != 16 && ED != 32 && !(ED == 64 && atof(opt(argc, argv, "--ssl-distill", "0")) > 0)) { fprintf(stderr, "dino-train: --dim 16 or 32 (64 with --ssl-distill)\n"); return 2; }
     const float wvar = (float)atof(opt(argc, argv, "--var", "30")), vgam = (float)atof(opt(argc, argv, "--var-gamma", "0")) > 0 ? (float)atof(opt(argc, argv, "--var-gamma", "0")) : 0.8f / sqrtf((float)ED);
     const float mfrac = (float)atof(opt(argc, argv, "--mask-frac", "0")); const int mcube = atoi(opt(argc, argv, "--mask-cube", "16"));
     const int K = atoi(opt(argc, argv, "--protos", "1024")), log_every = atoi(opt(argc, argv, "--log-every", "20")), save_every = atoi(opt(argc, argv, "--save-every", "2000"));
