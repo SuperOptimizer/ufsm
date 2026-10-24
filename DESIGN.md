@@ -487,6 +487,25 @@ windows); default p 0 = bit-identical (test). A crushed window replaces the plai
   tested) sweeps t 0 -> 1 -> 0 over one window, slice across the sheets, CT | phase hue, own LZW GIF89a writer (64 grays + 16 x 12
   hue / brightness palette, looping, 12 fps). ~10-15 s for 48 frames at P 384 (point pulls). Examples ~/ufsm-data/crush/anim.
 
+## Cross-scan CT swap: train --aug-xscan P (2026-10-24)
+Goal: scanner / energy / resolution robustness from one set of labels: replace a window's CT by a registered partner scan of the same
+scroll warped into the label frame (Paris 4: 78 keV 2.4 um labels; partners 137 keV 2.4 um and 78 keV 1.1 um). Labels unchanged.
+- sources.json `"xscan": [{"map": "<ufsm reg map>"} ...]` (up to 4; plain strings accepted). The map's coarse scan is the source's
+  scan (`sview_open` checks the um within 2%); map JSON + field.f32 as written by `ufsm reg` (fine(c) = A^-1 (c + D(c))).
+- `sview_read_level` (src/view.c): the partner level nearest the window's voxel (rvol_level_for), box mean of 2^3 sub-samples when that
+  level is < 0.75 x finer, z slabs of <= 48M fine voxels; a block entirely outside the partner reads 0.
+- sample.c `xscan_draw`: random partner; needs >= 50% of the window's scan voxels covered, else the window is kept; quantile LUT
+  partner -> window values over voxels where both are nonzero (keeps the source's intensity scale for norm / iso); partner 0 -> CT 0 ->
+  labels unknown through the existing air tests. Applied after the min_fg check; not for holdout, validation, crush, chained, view
+  or cover windows. Default p 0 = bit-identical (test). Counts per run: train prints the aug counters at the end.
+- Tests tests/test_scrollaug.c (fixture spiral, translation maps: bit-exact read, 0 outside, default-off identity, p 1 swaps all
+  windows deterministically, a shifted partner keeps >= 99% of the known labels). Renders build/xscan_render (CT | each partner,
+  phase hue below); ~/ufsm-data/scrollaug/xscan/h-00.jpg: both partners line up with the labels.
+- Cost (laptop, one core, warm disk cache, Paris 4 level 2 P512): 137 keV partner 3.5 s, 1.1 um (its level 3, 9.03 um) 6.8 s per
+  swapped window; ~60% volcomp decode, ~20% trilinear resample + field. Expected loader cost ~= P x 5 s worker time per window.
+- Desk: scripts/xscan/desk-maps.sh copies the maps with local roots (/vesuvius/ufsm/volcomp coarse, /vesuvius/ufsm/u0/vol partners:
+  137 keV has level 2, 1.1 um has level 3). The 137 keV partner covers L0 z 42250-48750 only (level 2 z 10562-12187).
+
 ## Augmentation presets: train --aug all (default) | none (2026-10-16)
 User: "I want all the augs we can get" (robustness to other scrolls, scanners, resolutions and damage from one scroll's labels).
 - `--aug all` is the default for the dense-target tasks on cube windows (recto / side targets); `none` (the old defaults: 48 cube
