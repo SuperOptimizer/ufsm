@@ -15,7 +15,7 @@ set -u
 OUT=$1 ROOT=$2 KEY=$3 UM=$4 AX=$5 BOX=$6; GTR=${7:-} GTK=${8:-} GTU=${9:-}
 U=${U:-$HOME/ufsm-data/dino/bin/ufsm-fs24}; CK=${CK:-$HOME/ufsm-data/fitkit/ckpt/wind96-best.ckpt}; G=${GPU:-0}; TH=${TH:-8}
 GATE=${GATE:-0.5,0.1,0.3}; NAME=${PNAME:-$(basename $OUT)}
-case "$(hostname)" in forlindesk2*) RUN=(nice -n 5);; *) RUN=(flock $HOME/ufsm-data/gpu.lock env MEM=${MEM:-12G} $HOME/ufsm-data/capped.sh);; esac   # (laptop: the GPU lock + the memory slice)
+case "$(hostname)" in forlindesk2*) RUN=(nice -n 5);; *) RUN=(flock ${LOCK:-$HOME/ufsm-data/gpu.lock} env MEM=${MEM:-12G} $HOME/ufsm-data/capped.sh);; esac   # (laptop: the GPU lock (LOCK) + the memory slice)
 mkdir -p $OUT; [ -s $OUT/source.json ] && { echo "$NAME: done"; exit 0; }
 IFS=, read -r bz by bx bnz bny bnx <<< "$BOX"
 if [ ! -s $OUT/fields/fields.json ]; then
