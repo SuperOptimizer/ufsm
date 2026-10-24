@@ -1,6 +1,7 @@
 #include "sources.h"
 #include "json.h"
 #include "votes.h"
+#include "srpair.h"
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -269,6 +270,13 @@ sources *sources_load(const char *path) {
                 for (int d = 0; d < 6; d++) s->box[s->nbox][d] = (int64_t)json_num(json_at(b, (size_t)d), 0);
                 s->nbox++; }
         }
+        const json *sj = json_get(e, "sr_pair");   /* a real SR pair directory (ufsm sr-pairs output) at "root" */
+        if (sj) {
+            s->srp = srpair_open(json_str(json_get(e, "root"), "."), json_str(json_get(sj, "role"), "train"), (int)json_num(json_get(sj, "lut"), 1), (int)json_num(json_get(sj, "cache"), 0));
+            if (!s->srp) { json_free(j); sources_free(S); return nullptr; }
+            for (int l = 0; l < MAXLEV; l++) s->ct_present[l] = 0;
+            for (int c = 0; c < NCH; c++) for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = 0;
+        }
         const char *ap = json_str(json_get(e, "axis"), nullptr);
         if (ap && axis_load(&s->ax, ap)) fprintf(stderr, "sources: %s: cannot load axis %s\n", s->name, ap);
         if (s->um <= 0) {
@@ -286,7 +294,7 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
-        z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); free(s->box); free(s->focus); free(s->mask);
+        z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); free(s->box); free(s->focus); free(s->mask); srpair_free(s->srp);
         for (int c = 0; c < NCH; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {

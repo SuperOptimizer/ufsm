@@ -1,20 +1,21 @@
 /* Phase U0 data plumbing (plan ufsm-unsup-40scrolls): a local mirror of one pyramid level (ufsm mirror) and the per-scan prep the
    multi-scroll sampler reads (ufsm scanprep): a coarse object mask on a cell grid and robust CT intensity statistics.
 
-   ufsm mirror <root> <array-key> <out-dir> [--threads 4] [--mbps 0] [--link-from DIR] [--verify N] [--seed 1]
+   ufsm mirror <root> <array-key> <out-dir> [--threads 4] [--mbps 0] [--mbps-file F] [--link-from DIR] [--verify N] [--seed 1]
      Copies every shard file of one zarr v3 array (e.g. ".../X.zarr/0" of the volcomp mirror) byte for byte to <out-dir> (zarr.json +
      c/z/y/x), so the local copy keeps the mirror's shard layout (1024^3 shards of 128^3 volcomp chunks). Resumable: a shard whose local
      file has the remote size is skipped; --link-from DIR hard-links an identical-size shard from an older local copy of the same array
-     instead of downloading it (same filesystem, no extra space). --mbps caps the download rate (MB/s, all threads). --verify N then
+     instead of downloading it (same filesystem, no extra space). --mbps caps the download rate (MB/s, all threads); --mbps-file F re-reads the cap from F every 10 s (0: unlimited). --verify N then
      compares N random present inner chunks decoded from the local copy and from the remote (memcmp + crc32c) and the crc32c of the
      whole shard files they lie in. Exit 0 when every shard is present and verified.
 
    ufsm scanprep <root> <group-key> --level L --out PREFIX [--um U] [--cell 16] [--close-mm 2] [--window 128] [--min-inside 0.25]
-                 [--keep-frac 0.1] [--fill2d 1] [--stats-chunks 256] [--threads 16] [--seed 1]
+                 [--keep-frac 0.1] [--zrange z0,z1] [--fill2d 1] [--stats-chunks 256] [--threads 16] [--seed 1]
      Level L of a CT pyramid group (the ~9.6 um level the sampler draws). The cell grid has cells of --cell level-L voxels; each cell's
      mean over its NONZERO voxels and its nonzero count come from the finest of levels L+2, L+3, L+4 present (else L itself). Object
      mask: Otsu threshold of the cell means (cells with any nonzero voxel), morphological closing with a ball of --close-mm, 6-connected
-     components smaller than --keep-frac x the largest dropped (sample mounts / holder bits at the z ends; 0 keeps all), holes
+     components smaller than --keep-frac x the largest dropped (0 keeps all), cells outside --zrange (level-L voxels: a sample mount
+     at the z ends that touches the fragment) dropped, holes
      filled (3-D from the grid border, then per z plane with --fill2d), intersected with the cells holding nonzero voxels (the scan's
      own mask). Valid window centres: object cells whose --window^3 (level-L voxels) box around the cell centre is at least
      --min-inside object cells (lower it for thin fragments). Intensity statistics over the nonzero voxels of object cells, from up to

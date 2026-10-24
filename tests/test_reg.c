@@ -115,6 +115,36 @@ int main(void) {
     { rfield F = {{3, 3, 3}, {0, 0, 0}, 40, calloc(81, sizeof(float))}; for (int i = 0; i < 81; i++) F.d[i] = 0.3f * sinf(i);
       rmap m = {Ap, raff_inv(Ap), &F}; const double c[3] = {33.3, 41.2, 50.7}; double f[3], c2[3]; rmap_c2f(&m, c, f); rmap_f2c(&m, f, c2);
       CHECK(fabs(c2[0] - c[0]) + fabs(c2[1] - c[1]) + fabs(c2[2] - c[2]) < 1e-5, "rmap round trip %g %g %g", c2[0], c2[1], c2[2]); free(F.d); }
+    /* label warp core (reg warp): both directions against the exact per-voxel map, threads 1 == threads 4, a ragged block edge */
+    { rfield F = {{3, 3, 3}, {0, 0, 0}, 40, calloc(81, sizeof(float))}; for (int i = 0; i < 81; i++) F.d[i] = 0.3f * sinf(i);
+      rmap m = {Ap, raff_inv(Ap), &F};
+      for (int c2f = 0; c2f <= 1; c2f++) {
+          const int L = 0, G = 8, S = 64, n[3] = {61, 64, 57}; const int64_t o[3] = {c2f ? 8 : 20, c2f ? 6 : 24, c2f ? 10 : 30};
+          const int64_t lo[3] = {0, 0, 0}, ln[3] = {200, 200, 200}; const double k = c2f ? 1.0 : 0.5;   /* label voxel in label-scan L0 voxels */
+          uint8_t *lb = malloc(200 * 200 * 200);
+          for (int z = 0; z < 200; z++) for (int y = 0; y < 200; y++) for (int x = 0; x < 200; x++) lb[((size_t)z * 200 + y) * 200 + x] = (uint8_t)((x / 3 + 7 * (y / 3) + 31 * (z / 3)) % 250);
+          const int NN = reg_warp_nn(S, G); float *nd = malloc(sizeof(float) * 4 * NN * NN * NN);
+          uint8_t *o1 = malloc((size_t)S * S * S), *o4 = malloc((size_t)S * S * S); double l0[3], h0[3];
+          CHECK(reg_warp_lattice(&m, c2f, L, o, n, G, nullptr, nullptr, nd, l0, h0, 1), "warp lattice: no node ok");
+          memset(o1, 255, (size_t)S * S * S); const long long c1 = reg_warp_fill(nd, G, n, S, k, lb, lo, ln, 255, o1, 1);
+          CHECK(reg_warp_lattice(&m, c2f, L, o, n, G, nullptr, nullptr, nd, l0, h0, 4), "warp lattice (4 threads)");
+          memset(o4, 255, (size_t)S * S * S); const long long c4 = reg_warp_fill(nd, G, n, S, k, lb, lo, ln, 255, o4, 4);
+          CHECK(c1 == c4 && !memcmp(o1, o4, (size_t)S * S * S), "warp: threads 1 vs 4 differ (%lld %lld)", c1, c4);
+          long long bad = 0, tot = 0, outside = 0; const double sc = 1 << L;
+          for (int z = 0; z < S; z++) for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) {
+              const uint8_t v = o1[((size_t)z * S + y) * S + x];
+              if (z >= n[0] || y >= n[1] || x >= n[2]) { outside += v != 255; continue; }
+              const double p[3] = {(o[2] + x + 0.5) * sc - 0.5, (o[1] + y + 0.5) * sc - 0.5, (o[0] + z + 0.5) * sc - 0.5}; double q[3];
+              if (c2f) rmap_c2f(&m, p, q); else rmap_f2c(&m, p, q);
+              const long li[3] = {lrint((q[2] + 0.5) / k - 0.5), lrint((q[1] + 0.5) / k - 0.5), lrint((q[0] + 0.5) / k - 0.5)};
+              if (li[0] < 0 || li[1] < 0 || li[2] < 0 || li[0] >= 200 || li[1] >= 200 || li[2] >= 200) continue;
+              tot++; bad += v != lb[((size_t)li[0] * 200 + li[1]) * 200 + li[2]];
+          }
+          printf("label warp %s: %lld / %lld voxels differ from the exact map\n", c2f ? "c2f" : "f2c", bad, tot);
+          CHECK(tot > 50000 && bad < tot / 50 && outside == 0, "label warp %s: %lld / %lld differ, %lld written outside the block", c2f ? "c2f" : "f2c", bad, tot, outside);
+          free(lb); free(nd); free(o1); free(o4);
+      }
+      free(F.d); }
     rmap m = {Ap, raff_inv(Ap), nullptr};
     /* boxes */
     for (int lc = 0; lc <= 1; lc++) {

@@ -179,6 +179,18 @@ static int lsrc_read(lsrc *L, int64_t r0, int64_t c0, int64_t h, int64_t w, uint
     return rc;
 }
 
+/* public: a 2-D label raster window (path as ink-splat's labels: zarr v3 2-D level, zarr v2 3-D (middle layer), uint8 TIFF / PNG);
+   *H, *W the raster size; outside the raster 0. malloc'd h x w, nullptr on error. */
+uint8_t *inksplat_label_window(const char *path, int64_t r0, int64_t c0, int64_t h, int64_t w, int64_t *H, int64_t *W) {
+    lsrc L; if (lsrc_open(&L, path, -1, nullptr)) return nullptr;
+    if (H) *H = L.H;
+    if (W) *W = L.W;
+    uint8_t *o = malloc((size_t)h * w);
+    if (!o || lsrc_read(&L, r0, c0, h, w, o, 8)) { free(o); o = nullptr; }
+    lsrc_close(&L);
+    return o;
+}
+
 /* ---------------- volumes (z3 or z2) ---------------- */
 typedef struct { z3 *a; z2 *b; int64_t shape[3]; } vol;
 static int vol_open(vol *v, const char *root, const char *key, const char *cache) {

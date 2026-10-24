@@ -637,3 +637,86 @@ int reg_fit_field(int n, const double *c, const double *v, const double *w, doub
     free(x); free(rhs); free(idx); free(wt); free(rw);
     return 0;
 }
+
+/* ---------- label warp core (reg warp) ---------- */
+#include <pthread.h>
+#include <stdatomic.h>
+typedef struct {
+    const rmap *m; int c2f, L, G, NN[3]; int64_t o[3]; int n[3]; int (*ok)(const double c[3], void *); void *ud; float *nd;
+    atomic_int next; atomic_int any; pthread_mutex_t mu; double lo[3], hi[3];
+} wlat;
+static void *wlat_worker(void *p) {
+    wlat *w = p; const double sc = (double)(1 << w->L);
+    double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300}; int any = 0;
+    for (;;) {
+        const int a = atomic_fetch_add(&w->next, 1); if (a >= w->NN[0]) break;
+        for (int b = 0; b < w->NN[1]; b++) for (int c = 0; c < w->NN[2]; c++) {
+            const double pz = w->o[0] + fmin((double)w->G * a, w->n[0]), py = w->o[1] + fmin((double)w->G * b, w->n[1]), px = w->o[2] + fmin((double)w->G * c, w->n[2]);
+            /* (lattice nodes past the block's far edge are clamped onto it: the last cell is then shorter than G, see reg_warp_fill) */
+            const double p0[3] = {(px + 0.5) * sc - 0.5, (py + 0.5) * sc - 0.5, (pz + 0.5) * sc - 0.5}; double q[3];
+            int good;
+            if (w->c2f) { rmap_c2f(w->m, p0, q); good = !w->ok || w->ok(p0, w->ud); }
+            else { rmap_f2c(w->m, p0, q); good = !w->ok || w->ok(q, w->ud); }
+            float *e = w->nd + 4 * (((size_t)a * w->NN[1] + b) * w->NN[2] + c); e[0] = (float)q[0]; e[1] = (float)q[1]; e[2] = (float)q[2]; e[3] = (float)good;
+            if (good) { any = 1; for (int d = 0; d < 3; d++) { lo[d] = fmin(lo[d], q[d]); hi[d] = fmax(hi[d], q[d]); } }
+        }
+    }
+    pthread_mutex_lock(&w->mu);
+    for (int d = 0; d < 3; d++) { w->lo[d] = fmin(w->lo[d], lo[d]); w->hi[d] = fmax(w->hi[d], hi[d]); }
+    if (any) w->any = 1;
+    pthread_mutex_unlock(&w->mu);
+    return nullptr;
+}
+static void run_threads(void *(*fn)(void *), void *arg, int nt) {
+    pthread_t th[256]; const int T = nt < 1 ? 1 : nt > 256 ? 256 : nt;
+    for (int t = 1; t < T; t++) pthread_create(&th[t], nullptr, fn, arg);
+    fn(arg);
+    for (int t = 1; t < T; t++) pthread_join(th[t], nullptr);
+}
+int reg_warp_lattice(const rmap *m, int c2f, int L, const int64_t o[3], const int n[3], int G,
+                     int (*ok)(const double c[3], void *ud), void *ud, float *nd, double lo[3], double hi[3], int nt) {
+    wlat w = {.m = m, .c2f = c2f, .L = L, .G = G, .ok = ok, .ud = ud, .nd = nd};
+    for (int d = 0; d < 3; d++) { w.o[d] = o[d]; w.n[d] = n[d]; w.NN[d] = reg_warp_nn(n[d], G); w.lo[d] = 1e300; w.hi[d] = -1e300; }
+    atomic_init(&w.next, 0); atomic_init(&w.any, 0); pthread_mutex_init(&w.mu, nullptr);
+    run_threads(wlat_worker, &w, nt);
+    pthread_mutex_destroy(&w.mu);
+    for (int d = 0; d < 3; d++) { lo[d] = w.lo[d]; hi[d] = w.hi[d]; }
+    return w.any;
+}
+typedef struct {
+    const float *nd; int G, NN[3], n[3], S; double k; const uint8_t *lb; int64_t lo[3], ln[3]; uint8_t fill; uint8_t *out;
+    atomic_int next; atomic_llong cnt;
+} wfill;
+static void *wfill_worker(void *p) {
+    wfill *w = p; long long cnt = 0; const int G = w->G;
+    for (;;) {
+        const int z = atomic_fetch_add(&w->next, 1); if (z >= w->n[0]) break;
+        const int a = z / G; const int ha = (a + 1) * G < w->n[0] ? G : w->n[0] - a * G; const float tz = (float)(z - a * G) / (float)(ha ? ha : 1);
+        for (int y = 0; y < w->n[1]; y++) {
+            const int b = y / G; const int hb = (b + 1) * G < w->n[1] ? G : w->n[1] - b * G; const float ty = (float)(y - b * G) / (float)(hb ? hb : 1);
+            for (int x = 0; x < w->n[2]; x++) {
+                const int c = x / G; const int hc = (c + 1) * G < w->n[2] ? G : w->n[2] - c * G; const float tx = (float)(x - c * G) / (float)(hc ? hc : 1);
+                float q[4] = {0, 0, 0, 0};
+                for (int oo = 0; oo < 8; oo++) {
+                    const int oa = oo >> 2, ob = (oo >> 1) & 1, oc = oo & 1; const float wgt = (oa ? tz : 1 - tz) * (ob ? ty : 1 - ty) * (oc ? tx : 1 - tx);
+                    const float *e = w->nd + 4 * (((size_t)(a + oa) * w->NN[1] + b + ob) * w->NN[2] + c + oc); for (int d = 0; d < 4; d++) q[d] += wgt * e[d];
+                }
+                if (q[3] < 0.5f) continue;
+                const int64_t li[3] = {(int64_t)lrint((q[2] + 0.5) / w->k - 0.5) - w->lo[0], (int64_t)lrint((q[1] + 0.5) / w->k - 0.5) - w->lo[1], (int64_t)lrint((q[0] + 0.5) / w->k - 0.5) - w->lo[2]};
+                if (li[0] < 0 || li[1] < 0 || li[2] < 0 || li[0] >= w->ln[0] || li[1] >= w->ln[1] || li[2] >= w->ln[2]) continue;
+                const uint8_t v = w->lb[((size_t)li[0] * w->ln[1] + li[1]) * w->ln[2] + li[2]];
+                w->out[((size_t)z * w->S + y) * w->S + x] = v; cnt += v != w->fill;
+            }
+        }
+    }
+    atomic_fetch_add(&w->cnt, cnt);
+    return nullptr;
+}
+long long reg_warp_fill(const float *nd, int G, const int n[3], int S, double k, const uint8_t *lb, const int64_t lo[3], const int64_t ln[3],
+                        uint8_t fill, uint8_t *out, int nt) {
+    wfill w = {.nd = nd, .G = G, .S = S, .k = k, .lb = lb, .fill = fill, .out = out};
+    for (int d = 0; d < 3; d++) { w.n[d] = n[d]; w.NN[d] = reg_warp_nn(n[d], G); w.lo[d] = lo[d]; w.ln[d] = ln[d]; }
+    atomic_init(&w.next, 0); atomic_init(&w.cnt, 0);
+    run_threads(wfill_worker, &w, nt);
+    return w.cnt;
+}

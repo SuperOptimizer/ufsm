@@ -442,25 +442,51 @@ static int cmd_map(int argc, char **argv) {
     return 0;
 }
 
-/* ---------- label warp: coarse-scan labels resampled into the fine scan's grid ----------
-   ufsm reg warp <reg.json> <label-root> <label-key> <label-um> <out-dir> --level L [--boxes eval_boxes.jsonl] [--fill 255] [--cache DIR]
-   The labels (uint8: winding codes, stored phase, ink prob254; on the coarse scan's grid at label-um, origin shared with coarse L0) are
-   sampled nearest-neighbour at every voxel of the fine scan's level L: fine level-L voxel -> fine L0 -> coarse L0 (rmap_f2c, evaluated on
-   a lattice of 8 voxels and interpolated trilinearly: the field is smooth) -> label voxel. With --boxes (the pair's eval_boxes.jsonl), a
-   voxel keeps its label only when the nearest probe box (coarse L0 centre "c") is "certified"; elsewhere, outside the labels and outside
-   the map: fill. Output: one array (512^3 shards, lossless) of the fine level-L shape. */
+/* ---------- label warp: labels on one scan resampled into the other scan's grid ----------
+   ufsm reg warp <reg.json> <label-root> <label-key> <label-um> <out-dir> --level L [--c2f] [--boxes eval_boxes.jsonl] [--box z,y,x,nz,ny,nx]
+                 [--fill 255] [--conf LO,HI [--iso I]] [--cache DIR] [--threads 8]
+   Default: the labels (uint8: winding codes, stored phase, ink prob254; on the COARSE scan's grid at label-um, origin shared with coarse
+   L0) are sampled nearest-neighbour at every voxel of the FINE scan's level L: fine level-L voxel -> fine L0 -> coarse L0 (rmap_f2c).
+   --c2f: the other way, labels on the FINE scan's grid (label-um, origin shared with fine L0) onto the COARSE scan's level L
+   (coarse level-L voxel -> coarse L0 -> fine L0, rmap_c2f). The map is evaluated on a lattice of 8 output voxels and interpolated
+   trilinearly (the field is smooth); lattice and resampling run on --threads threads. With --boxes (the pair's eval_boxes.jsonl), a
+   voxel keeps its label only when the nearest probe box (coarse L0 centre "c") is "certified"; elsewhere, outside the labels and
+   outside the map: fill. Output: one array (512^3 shards, lossless) of the output scan's level-L shape; with --box (output level L,
+   zyx) only the shards meeting the box are written.
+   --conf LO,HI (pseudo labels from a probability prediction, uint8 round(p * 255)): label v >= HI -> 254 (ink), v <= LO -> 0 (no ink),
+   between -> 255 (unknown); with --iso I, label voxels whose CT on the label scan (its level matching label-um) is below I -> 255. */
 typedef struct { double c[3]; int ok; } rprobe;
+typedef struct { const rprobe *p; int n; } rprobes;
+static int probe_ok(const double q[3], void *ud) {   /* the nearest probe box (coarse L0) certified? */
+    const rprobes *P = ud; double bd = 1e300; int bi = -1;
+    for (int i = 0; i < P->n; i++) { const double dx = q[0] - P->p[i].c[0], dy = q[1] - P->p[i].c[1], dz = q[2] - P->p[i].c[2], d = dx * dx + dy * dy + dz * dz; if (d < bd) { bd = d; bi = i; } }
+    return bi >= 0 && P->p[bi].ok;
+}
 static int cmd_warp(int argc, char **argv) {
-    if (argc < 8) { fprintf(stderr, "usage: ufsm reg warp <reg.json> <label-root> <label-key> <label-um> <out-dir> --level L [--boxes eval_boxes.jsonl] [--box z,y,x,nz,ny,nx] [--fill 255] [--cache DIR] [--threads 8]\n"); return 2; }
+    if (argc < 8) { fprintf(stderr, "usage: ufsm reg warp <reg.json> <label-root> <label-key> <label-um> <out-dir> --level L [--c2f] [--boxes eval_boxes.jsonl] [--box z,y,x,nz,ny,nx] [--fill 255] [--conf LO,HI [--iso I]] [--cache DIR] [--threads 8]\n"); return 2; }
     const int L = atoi(opt(argc, argv, "--level", "-1")), fill = atoi(opt(argc, argv, "--fill", "255")), nt = atoi(opt(argc, argv, "--threads", "8"));
+    const int c2f = has(argc, argv, "--c2f");
     const double lum = atof(argv[6]);
+    int clo = -1, chi = -1; const int iso = atoi(opt(argc, argv, "--iso", "0"));
+    if (opt(argc, argv, "--conf", nullptr) && (sscanf(opt(argc, argv, "--conf", ""), "%d,%d", &clo, &chi) != 2 || clo < 0 || chi > 255 || clo >= chi)) { fprintf(stderr, "reg warp: --conf LO,HI with 0 <= LO < HI <= 255\n"); return 2; }
+    if (iso && clo < 0) { fprintf(stderr, "reg warp: --iso goes with --conf\n"); return 2; }
     if (L < 0 || lum <= 0) { fprintf(stderr, "reg warp: --level L and label-um > 0\n"); return 2; }
     rctx x; if (ctx_open(&x, argv[3], opt(argc, argv, "--cache", nullptr), 1)) return 1;
-    if (L >= x.fv->nl) { fprintf(stderr, "reg warp: the fine scan has %d levels\n", x.fv->nl); return 1; }
-    const double cum = x.cv->um, k = lum / cum;   /* label voxel = k coarse L0 voxels */
+    const rvol *ov = c2f ? x.cv : x.fv, *lv = c2f ? x.fv : x.cv;   /* output grid, label grid */
+    if (L >= ov->nl) { fprintf(stderr, "reg warp: the %s scan has %d levels\n", c2f ? "coarse" : "fine", ov->nl); return 1; }
+    const double k = lum / lv->um;   /* label voxel = k label-scan L0 voxels */
     store *ls = store_open(argv[4]); z3 *lz = ls ? z3_open(ls, argv[5], opt(argc, argv, "--cache", nullptr)) : nullptr;
     if (!lz) { fprintf(stderr, "reg warp: cannot open the labels %s %s\n", argv[4], argv[5]); return 1; }
     const int64_t *lsh = z3_meta_of(lz)->shape;
+    z3 *ctz = nullptr;   /* --iso: the label scan's CT at the label level */
+    if (iso) {
+        const int cl = (int)lrint(log2(k));
+        if (cl < 0 || cl >= lv->nl || fabs(k - (double)(1 << cl)) > 0.02 * k || !lv->z[cl]) { fprintf(stderr, "reg warp: --iso: label-um %g is not a level of the label scan (%g um)\n", lum, lv->um); return 1; }
+        ctz = lv->z[cl];
+        const int64_t *cs = z3_meta_of(ctz)->shape;
+        if (cs[0] != lsh[0] || cs[1] != lsh[1] || cs[2] != lsh[2]) fprintf(stderr, "reg warp: --iso: CT level %d shape %lld x %lld x %lld != labels %lld x %lld x %lld (reading the overlap)\n", cl,
+            (long long)cs[0], (long long)cs[1], (long long)cs[2], (long long)lsh[0], (long long)lsh[1], (long long)lsh[2]);
+    }
     rprobe *pr = nullptr; int np = 0;
     const char *bf = opt(argc, argv, "--boxes", nullptr);
     if (bf) {
@@ -476,27 +502,20 @@ static int cmd_warp(int argc, char **argv) {
         int nok = 0; for (int i = 0; i < np; i++) nok += pr[i].ok;
         fprintf(stderr, "reg warp: %d probe boxes, %d certified\n", np, nok);
     }
-    const int64_t *fs = x.fv->shape[L]; const double sc = (double)(1 << L);
-    char attrs[512]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"labels %s %s warped by %s (nearest)\",\"fill\":%d}}", argv[4], argv[5], argv[3], fill);
+    rprobes P = {pr, np};
+    const int64_t *fs = ov->shape[L];
+    char attrs[512]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"labels %s %s warped by %s%s (nearest)\",\"fill\":%d}}", argv[4], argv[5], argv[3], c2f ? " fine->coarse" : "", fill);
     z3w *w = z3w_create(argv[7], fs, 512, 0.f, fill, attrs); if (!w) { fprintf(stderr, "reg warp: %s\n", z3w_error()); return 1; }
-    const int S = 512, G = 8, NN = S / G + 1; uint8_t *buf = malloc((size_t)S * S * S); float *nd = malloc(sizeof(float) * 4 * NN * NN * NN);
+    const int S = 512, G = 8, NN = reg_warp_nn(S, G); uint8_t *buf = malloc((size_t)S * S * S); float *nd = malloc(sizeof(float) * 4 * NN * NN * NN);
     long long nset = 0;
-    long long bx[6] = {0, 0, 0, fs[0], fs[1], fs[2]};   /* --box z,y,x,nz,ny,nx (fine level L): only the shards meeting it */
+    long long bx[6] = {0, 0, 0, fs[0], fs[1], fs[2]};
     if (opt(argc, argv, "--box", nullptr) && sscanf(opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", &bx[0], &bx[1], &bx[2], &bx[3], &bx[4], &bx[5]) != 6) { fprintf(stderr, "reg warp: --box z,y,x,nz,ny,nx\n"); return 2; }
     for (int64_t sz = 0; sz < fs[0]; sz += S) for (int64_t sy = 0; sy < fs[1]; sy += S) for (int64_t sx = 0; sx < fs[2]; sx += S) {
         if (sz + S <= bx[0] || sz >= bx[0] + bx[3] || sy + S <= bx[1] || sy >= bx[1] + bx[4] || sx + S <= bx[2] || sx >= bx[2] + bx[5]) continue;
-        /* lattice: coarse L0 xyz of fine level-L points (sz + G k, ...), and its certified flag (1 / 0) */
-        double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300}; int anyok = 0;
-        for (int a = 0; a < NN; a++) for (int b = 0; b < NN; b++) for (int c = 0; c < NN; c++) {
-            const double fz = sz + (double)G * a, fy = sy + (double)G * b, fx = sx + (double)G * c;
-            const double f0[3] = {(fx + 0.5) * sc - 0.5, (fy + 0.5) * sc - 0.5, (fz + 0.5) * sc - 0.5}; double q[3];
-            rmap_f2c(&x.m, f0, q);
-            int ok = 1;
-            if (np) { double bd = 1e300; int bi = -1; for (int i = 0; i < np; i++) { const double dx = q[0] - pr[i].c[0], dy = q[1] - pr[i].c[1], dz = q[2] - pr[i].c[2], d = dx * dx + dy * dy + dz * dz; if (d < bd) { bd = d; bi = i; } } ok = bi >= 0 && pr[bi].ok; }
-            float *e = nd + 4 * (((size_t)a * NN + b) * NN + c); e[0] = (float)q[0]; e[1] = (float)q[1]; e[2] = (float)q[2]; e[3] = (float)ok;
-            if (ok) { anyok = 1; for (int d = 0; d < 3; d++) { lo[d] = fmin(lo[d], q[d]); hi[d] = fmax(hi[d], q[d]); } }
-        }
-        if (!anyok) continue;
+        const int64_t o[3] = {sz, sy, sx};
+        const int n[3] = {(int)(fs[0] - sz < S ? fs[0] - sz : S), (int)(fs[1] - sy < S ? fs[1] - sy : S), (int)(fs[2] - sx < S ? fs[2] - sx : S)};
+        double lo[3], hi[3];
+        if (!reg_warp_lattice(&x.m, c2f, L, o, n, G, np ? probe_ok : nullptr, &P, nd, lo, hi, nt)) continue;
         /* the label block under the mapped points (label voxels, zyx), clipped to the label array */
         int64_t lo_[3], ln_[3];
         for (int d = 0; d < 3; d++) {   /* d: x y z -> label axis 2 - d */
@@ -508,37 +527,32 @@ static int cmd_warp(int argc, char **argv) {
         if (ln_[0] <= 0 || ln_[1] <= 0 || ln_[2] <= 0) continue;
         uint8_t *lb = malloc((size_t)ln_[0] * ln_[1] * ln_[2]);
         if (!lb || z3_read(lz, lo_, ln_, lb, nt)) { fprintf(stderr, "reg warp: label read failed\n"); return 1; }
-        memset(buf, fill, (size_t)S * S * S);
-        for (int z = 0; z < S && sz + z < fs[0]; z++) {
-            const int a = z / G; const float tz = (float)(z % G) / G;
-            for (int y = 0; y < S && sy + y < fs[1]; y++) {
-                const int b = y / G; const float ty = (float)(y % G) / G;
-                for (int xx = 0; xx < S && sx + xx < fs[2]; xx++) {
-                    const int c = xx / G; const float tx = (float)(xx % G) / G;
-                    float q[4] = {0, 0, 0, 0};
-                    for (int o = 0; o < 8; o++) {
-                        const int oa = o >> 2, ob = (o >> 1) & 1, oc = o & 1; const float wgt = (oa ? tz : 1 - tz) * (ob ? ty : 1 - ty) * (oc ? tx : 1 - tx);
-                        const float *e = nd + 4 * (((size_t)(a + oa) * NN + b + ob) * NN + c + oc); for (int d = 0; d < 4; d++) q[d] += wgt * e[d];
-                    }
-                    if (q[3] < 0.5f) continue;   /* (nearest probe not certified) */
-                    const int64_t li[3] = {(int64_t)lrint((q[2] + 0.5) / k - 0.5) - lo_[0], (int64_t)lrint((q[1] + 0.5) / k - 0.5) - lo_[1], (int64_t)lrint((q[0] + 0.5) / k - 0.5) - lo_[2]};
-                    if (li[0] < 0 || li[1] < 0 || li[2] < 0 || li[0] >= ln_[0] || li[1] >= ln_[1] || li[2] >= ln_[2]) continue;
-                    const uint8_t v = lb[((size_t)li[0] * ln_[1] + li[1]) * ln_[2] + li[2]];
-                    buf[((size_t)z * S + y) * S + xx] = v; nset += v != fill;
-                }
+        if (clo >= 0) {   /* pseudo labels: confident ink / no ink, the rest unknown; void on the label scan unknown */
+            const size_t nv = (size_t)ln_[0] * ln_[1] * ln_[2];
+            uint8_t lut[256]; for (int v = 0; v < 256; v++) lut[v] = v >= chi ? 254 : v <= clo ? 0 : 255;
+            for (size_t i = 0; i < nv; i++) lb[i] = lut[lb[i]];
+            if (ctz) {
+                uint8_t *cb = malloc(nv);
+                if (!cb || z3_read(ctz, lo_, ln_, cb, nt)) { fprintf(stderr, "reg warp: CT read failed\n"); return 1; }
+                for (size_t i = 0; i < nv; i++) if (cb[i] < iso) lb[i] = 255;
+                free(cb);
             }
         }
+        memset(buf, fill, (size_t)S * S * S);
+        nset += reg_warp_fill(nd, G, n, S, k, lb, lo_, ln_, (uint8_t)fill, buf, nt);
         free(lb);
         if (z3w_write_shard(w, sz / S, sy / S, sx / S, buf, nt)) { fprintf(stderr, "reg warp: %s\n", z3w_error()); return 1; }
         fprintf(stderr, "reg warp: shard %lld,%lld,%lld done (%lld labelled voxels so far)\n", (long long)(sz / S), (long long)(sy / S), (long long)(sx / S), nset);
     }
     z3w_close(w); free(buf); free(nd); free(pr); ctx_close(&x);
-    fprintf(stderr, "reg warp: %lld labelled voxels -> %s (fine level %d, shape %lld x %lld x %lld)\n", nset, argv[7], L, (long long)fs[0], (long long)fs[1], (long long)fs[2]);
+    fprintf(stderr, "reg warp: %lld labelled voxels -> %s (%s level %d, shape %lld x %lld x %lld)\n", nset, argv[7], c2f ? "coarse" : "fine", L, (long long)fs[0], (long long)fs[1], (long long)fs[2]);
     return 0;
 }
 
 int cmd_reg_overlay(int argc, char **argv);
 int cmd_reg_init(int argc, char **argv);
+int cmd_reg_render(int argc, char **argv);   /* src/reg_render.c */
+int cmd_reg_inkstat(int argc, char **argv);   /* src/reg_ink.c */
 int cmd_reg(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: ufsm reg <pair|map|warp|boxes|fit|stats|overlay|init> ...\n"); return 2; }
     store_global_init();
@@ -551,6 +565,8 @@ int cmd_reg(int argc, char **argv) {
     if (!strcmp(s, "stats")) return cmd_stats(argc, argv);
     if (!strcmp(s, "overlay")) return cmd_reg_overlay(argc, argv);
     if (!strcmp(s, "init")) return cmd_reg_init(argc, argv);
+    if (!strcmp(s, "render")) return cmd_reg_render(argc, argv);
+    if (!strcmp(s, "inkstat")) return cmd_reg_inkstat(argc, argv);
     fprintf(stderr, "reg: unknown subcommand %s\n", s);
     return 2;
 }

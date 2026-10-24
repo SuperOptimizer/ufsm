@@ -90,7 +90,8 @@ typedef struct {
                                 kept as separate gauges); warped samples pull it through the warp within one component */
     int wind4_step, wind4_min;   /* band_wind4's maxstep (phase codes; 0: 80 = 0.32 turn) and minsize (voxels; 0: 512) */
     int wind4_tile;          /* band_wind4_tiled's tile edge (at least P / 6: <= 216 tiles, one gauge each); < 0 the whole window */
-    int restore;             /* task restore: no target reads; batch.t holds the clean CT window alone (B x P^3, tone LUT and symmetry applied),
+    int restore;             /* 2: real SR pairs (sources with "sr_pair", src/srpair.h): batch.t row = [target P^3 (through the pair's intensity map) |
+                                the native input crop (P / 4)^3], both under one symmetry and tone LUT. 1, task restore: no target reads; batch.t holds the clean CT window alone (B x P^3, tone LUT and symmetry applied),
                                 batch.x / x16 and batch.m are absent (the trainer degrades the window on the device); training windows lie inside a
                                 source "boxes" entry when the source lists boxes, validation windows inside its holdout box; level = the source's min_level */
 } sample_cfg;
@@ -125,7 +126,9 @@ typedef struct sampler sampler;
 typedef struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } occ_index;   /* coarse label cells that contain surface */
 occ_index source_occupancy(source *s);
 /* warm the CT chunk cache for the labelled cells of every pyramid source (levels 0..maxlev, a fraction of the cells) */
-int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction);
+/* warm the CT chunk cache around every labelled cell: training windows up to P level voxels at the levels a source trains on
+   (min_level .. min(maxlev, max_level)), their coarse-probe levels (+3) and every level >= 4 in full; dry: count the chunks only */
+int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int P, int dry);
 /* the stored phase interpolated into a window of a 2^shift finer grid (shift >= 2): ph the grid region read (ln[0] x ln[1] x ln[2] codes,
    first voxel lo, PHASE_UNKNOWN outside the array), o the window corner, D x P x P codes out. sample_phase_interp: separable, polynomial
    atan2 (the sampler's path); _ref: 8 neighbours per voxel, atan2f (codes agree but for +-1 at float ties; tests/test_phase_interp.c) */

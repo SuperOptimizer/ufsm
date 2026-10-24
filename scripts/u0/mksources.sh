@@ -11,9 +11,10 @@ A=${A:-/vesuvius/ufsm/u0}; OLD=${OLD:-/vesuvius/ufsm/volcomp}
 rows=$(mktemp)
 while IFS=$'\t' read -r scroll id volume um kev dist level lum shape lgb cgb shards status newgb pairs; do
   [ "$scroll" = scroll ] && continue
+  case "$status" in skip*) continue;; esac
   tag=$scroll-$id; J=$A/prep/$tag.json
   [ -e $A/state/$tag.prep.done ] && [ -e $J ] || continue
-  case "$status" in use-*) root=$OLD/$scroll; key=$volume;; *) root=$A/vol; key=$scroll/$volume;; esac
+  case "$status" in use-*) root=$OLD/$scroll; key=$volume;; *) root=$(cat $A/state/$tag.loc 2>/dev/null || echo $A/vol); key=$scroll/$volume;; esac
   jq -c --arg name "$tag" --arg scroll "$scroll" --arg root "$root" --arg key "$key" --argjson um "$um" --argjson lev "$level" --arg kev "$kev" \
     '{name: $name, scroll: $scroll, root: $root, ct: $key, um: $um, min_level: $lev, max_level: $lev, ct_only: 1, keV: ($kev | tonumber? // null),
       mask: {map: .mask, min: 2}, norm: {center: .stats.median, scale: .stats.scale}, iso: .stats.otsu, valid: .valid_cells}' $J >> $rows

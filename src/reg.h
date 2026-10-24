@@ -94,3 +94,24 @@ int reg_fit_field(int n, const double *c, const double *v, const double *w, doub
    the axis and the offset along it (all 4 h / phi orientations when all). A: fine L0 xyz -> coarse L0 xyz. */
 typedef struct { double ncc, rot_deg; int hflip, pflip, n; double orient_ncc[4]; } reg_init_info;
 int reg_init_affine(rvol *cv, rvol *fv, double W, double rmin, int nt, int all, raff *A, reg_init_info *info);
+
+/* certification of a registered pair (src/reg_render.c): <pair>/final/residuals.jsonl used fit boxes with |v - pred| <= tol (fixed voxels)
+   are good, <pair>/eval_after.jsonl boxes not ok / NCC < 0.3 / |s| > tol are failing; a fixed-frame point is certified when a good box lies
+   within max(r_vox, 1.5 x their median spacing) and no failing box within r_vox / 2. */
+typedef struct { int n; double *c; } ptset;
+typedef struct { ptset good, bad; double r2, rb2; double cell; int nh; int *head, *next; int *bhead, *bnext; double o[3]; } rcover;
+int rcover_load(rcover *cv, const char *pair, double r_vox, double tol);
+int rcover_ok(const rcover *cv, const double p[3]);
+
+/* label warp core (ufsm reg warp): an output block on one scan's level-L grid (origin o, extent n, zyx; buffer stride S per axis)
+   sampled nearest-neighbour from labels on the other scan. Lattice: every G output voxels (+ the block's far edge), the output point
+   -> output L0 -> the label scan's L0 (c2f = 1: output on the coarse grid, labels on the fine scan, rmap_c2f; c2f = 0: output on the
+   fine grid, labels on the coarse scan, rmap_f2c), nd[4 per node] = label-scan L0 x y z + ok flag (ok(coarse L0 xyz, ud), or 1 when
+   ok is null); lo / hi: the bounds of the ok nodes. Returns whether any node is ok. Then reg_warp_fill interpolates the lattice
+   trilinearly per voxel (the field is smooth) and copies label voxel round((q + 0.5) / k - 0.5) from the block lb (origin lo, extent ln,
+   zyx) when the interpolated ok >= 0.5 and inside; other voxels are left as they are. Returns the count of copied voxels != fill. */
+int reg_warp_lattice(const rmap *m, int c2f, int L, const int64_t o[3], const int n[3], int G,
+                     int (*ok)(const double c[3], void *ud), void *ud, float *nd, double lo[3], double hi[3], int nt);
+long long reg_warp_fill(const float *nd, int G, const int n[3], int S, double k, const uint8_t *lb, const int64_t lo[3], const int64_t ln[3],
+                        uint8_t fill, uint8_t *out, int nt);
+static inline int reg_warp_nn(int n, int G) { return (n + G - 1) / G + 1; }

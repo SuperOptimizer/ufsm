@@ -100,7 +100,7 @@ static int usage(void) {
         "  ufsm predict <ckpt> <root> <ct-group> <out-dir> --um U [--box ...]      sliding-window inference -> volcomp pyramid\n"
         "  ufsm eval <pred-root> <pred-group> <label-root> <label-group> --um U [--box ...]   precision/recall/dice\n"
         "  ufsm sample  <sources.json> [--P 128] [--B 2] [--n 4] [--seed S] [--workers W] [--out DIR] [--noaug] [--bench N (loader throughput, train-like formats)]\n"
-        "  ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1]   warm the CT chunk cache for the labelled cells\n"
+        "  ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1] [--P 128] [--dry 1]   warm the CT chunk cache for the labelled cells\n"
         "  ufsm phase-raster <codes-root> <key> <out-dir> [--box ...]          band phase precomputed for the sampler\n"
         "  ufsm phase-check <phase-root> <key> --axis A --scan-um U [--count 1] a stored phase: share rising outward, labelled volume\n"
         "  ufsm downsample <root> <key> <out-group> <out-um> --mode max|phase|votes  one array halved per axis (labels, phase, side votes)\n"
@@ -154,6 +154,7 @@ static int usage(void) {
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..]  several models' fit fields averaged (phase: confidence-weighted complex mean)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
+        "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
         "  ufsm papyrus-labels <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx   papyrus / void training labels of a CT box (gap labels, no cutoff)\n"
         "  ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w --labels G1,G2   a CT plane beside label panels (void blue, ignored yellow)\n"
         "root: local dir or https://.../volcomp ; keys are paths under root\n");
@@ -3266,15 +3267,17 @@ int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
 int cmd_phase_conflict(int argc, char **argv);   /* src/packmap.c */
 int cmd_reg(int argc, char **argv);   /* src/reg_cli.c */
+int cmd_sr_pairs(int argc, char **argv);   /* src/srpairs.c */
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "train")) return cmd_train(argc, argv);
     if (argc < 3) return usage();
     const char *cmd = argv[1];
     if (!strcmp(cmd, "sample")) return cmd_sample(argc, argv);
-    if (!strcmp(cmd, "prefetch")) {   /* ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1.0] */
-        if (argc < 3) { fprintf(stderr, "usage: ufsm prefetch <sources.json> [--levels L] [--threads N] [--fraction F]\n"); return 2; }
+    if (!strcmp(cmd, "prefetch")) {   /* ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1.0] [--P 128] [--dry 0] */
+        if (argc < 3) { fprintf(stderr, "usage: ufsm prefetch <sources.json> [--levels L] [--threads N] [--fraction F] [--P window] [--dry 1 (count only)]\n"); return 2; }
         sources *S = sources_load(argv[2]); if (!S) return 1;
-        return sources_prefetch(S, atoi(opt(argc, argv, "--levels", "1")), atoi(opt(argc, argv, "--threads", "32")), atof(opt(argc, argv, "--fraction", "1.0")));
+        return sources_prefetch(S, atoi(opt(argc, argv, "--levels", "1")), atoi(opt(argc, argv, "--threads", "32")), atof(opt(argc, argv, "--fraction", "1.0")),
+                                atoi(opt(argc, argv, "--P", "128")), atoi(opt(argc, argv, "--dry", "0")));
     }
     if (!strcmp(cmd, "ingest-labels")) return cmd_ingest_labels(argc, argv);
     if (!strcmp(cmd, "ingest-kaggle")) return cmd_ingest_kaggle(argc, argv);
@@ -3294,6 +3297,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
     if (!strcmp(cmd, "phase-conflict")) return cmd_phase_conflict(argc, argv);
     if (!strcmp(cmd, "reg")) return cmd_reg(argc, argv);
+    if (!strcmp(cmd, "sr-pairs")) return cmd_sr_pairs(argc, argv);
     if (!strcmp(cmd, "convert-unwrap2")) return cmd_convert_unwrap2(argc, argv);
     if (!strcmp(cmd, "repack")) return cmd_repack(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
@@ -3352,6 +3356,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "papyrus-labels")) return cmd_papyrus_labels(argc, argv);
     if (!strcmp(cmd, "overlay")) return cmd_overlay(argc, argv);
     if (!strcmp(cmd, "wind-score")) return cmd_wind_score(argc, argv);
+    if (!strcmp(cmd, "store-bench")) { int cmd_store_bench(int, char **); return cmd_store_bench(argc, argv); }
     if (argc < 4) return usage();
     const char *root = argv[2], *key = argv[3];
     const char *cache = opt(argc, argv, "--cache", nullptr);
