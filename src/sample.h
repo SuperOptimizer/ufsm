@@ -53,6 +53,9 @@ typedef struct {
                                 the ordinary spatial warp (one resample) and keep unwarped radial channels */
     float xscan_p;           /* --aug-xscan: probability of swapping a window's CT for a registered partner scan of its source (sources
                                 "xscan": [{"map": REG.json}]; labels kept, partner gaps CT 0; not crushed / chained / cover / validation windows); 0 = off */
+    float tear_p, tear_um;   /* --aug-tear p / --aug-tear-um (largest displacement, um; 0: 480): the crush windows (stored phase, no target
+                                channels) cut along a smooth surface across the sheets, one side shifted up to ~1+ turns (src/scrollaug.h),
+                                the winding mod 4 unwrapped before the cut (it jumps across it); 0 = off */
     const sheet_dataset *sheet; /* borrowed sparse geometry, native-level B=1 task */
     int band;                /* 1: fill batch.band from each source's band target (task band_affinity, native level, no geometry warp) */
     double min_phase;        /* side 2: reject windows whose known phase covers less than this fraction of the voxels (0: keep all) */

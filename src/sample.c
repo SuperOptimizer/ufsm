@@ -8,6 +8,7 @@
 #include "edt.h"
 #include "srpair.h"
 #include "view.h"
+#include "scrollaug.h"
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -1849,8 +1850,13 @@ int sample_chain_next(const axis *ax, int l, const int64_t shape[3], int Pz, int
 /* --aug-crush (src/crush.h): the window pulled through a crush map instead of the plain read. The tiles are decoded into big's
    (2P)^3 scratch (free until the targets are built), so a footprint of several P^3 costs no RAM; the pulled phase (and its ignore
    mask) wait in pooled buffers for the stored-phase step (draw() returns them after every draw). */
-static _Thread_local struct { uint8_t *ph, *ig; size_t n; double k, j0; int fine; uint64_t tiles; } g_crush;   /* (k .. tiles: the last map, diagnostics) */
-static void crush_release(void) { tp_put(g_crush.ph, g_crush.n + 64); tp_put(g_crush.ig, g_crush.n); g_crush.ph = g_crush.ig = nullptr; }
+/* the window's pulled labels (--aug-crush, --aug-tear): ph / ig the phase and its ignore mask; --aug-tear: w4 / wc the winding mod 4 and
+   its component unwrapped before the tear (ph then already masked by ig: pre) */
+static _Thread_local struct { uint8_t *ph, *ig, *w4, *wc; int pre; size_t n; double k, j0; int fine; uint64_t tiles; sa_tear tear; } g_crush;   /* (k .. tear: the last map, diagnostics) */
+static void crush_release(void) {
+    tp_put(g_crush.ph, g_crush.n + 64); tp_put(g_crush.ig, g_crush.n); tp_put(g_crush.w4, g_crush.n); tp_put(g_crush.wc, g_crush.n);
+    g_crush.ph = g_crush.ig = g_crush.w4 = g_crush.wc = nullptr; g_crush.pre = 0;
+}
 typedef struct { crush_cache *cc; const crush_layer *L; const int64_t *o; } crush_ctu;
 static double crush_ct_at(void *ud, const double x[3]) {
     const crush_ctu *u = ud; double p[3];
@@ -1943,10 +1949,56 @@ static int crush_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, 
     tp_put(a, own);
     return rc;
 }
+/* --aug-tear: ctu (P^3) and g_crush (the phase, the winding mod 4 and its component) from a padded read cut and shifted (src/scrollaug.h).
+   The labels are prepared on the padded box as the stored-phase path below would (sign, ignore mask, air, band_wind4_tiled), so the
+   winding mod 4 keeps the true windings of each side: it jumps across the cut. 1 torn, 0 not (too little phase for the sheet normal,
+   or the padded box reaches a holdout box: the plain read follows), -1 error. */
+static int tear_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, int pshift, rng *r, uint8_t *ctu) {
+    const sample_cfg *c = &sp->cfg; const size_t p3 = (size_t)P * P * P;
+    const double vox = s->um * (double)(1 << l), maxd = (c->tear_um > 0 ? c->tear_um : 480.f) / vox;
+    const int M = (int)ceil(.5 * maxd) + 2, Pp = P + 2 * M; const size_t pp3 = (size_t)Pp * Pp * Pp;
+    const int64_t po[3] = {o[0] - M, o[1] - M, o[2] - M}, pn[3] = {Pp, Pp, Pp};
+    const uint64_t seed = rnext(r);
+    if (training_hits_holdout_box(sp, s, po, pn, l)) return 0;
+    uint8_t *ctp = tp_get(pp3, 0), *php = tp_get(pp3 + 64, 0);
+    if (!ctp || !php) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
+    if (z3_read(source_ct(s, l), po, pn, ctp, 1) || phase_window(s->phase, po, Pp, Pp, pshift, php)) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
+    double n[3], spacing = 0;
+    if (sa_phase_normal(php, Pp, Pp, Pp, M, P / 32 > 1 ? P / 32 : 1, n, &spacing) < 32 || !(spacing > 2)) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return 0; }
+    sa_tear *t = &g_crush.tear; sa_tear_make(t, seed, P, n, spacing, maxd);
+    if (sa_tear_margin(t) > M) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return 0; }   /* (cannot happen: |dp|, |dm| <= maxd / 2 + 1) */
+    /* the labels as the stored-phase path prepares them, on the padded box */
+    if (s->phase_sign < 0) phase_negate(php, pp3);
+    if (s->phase_ign && pshift < 2) {
+        uint8_t *ig = tp_get(pp3, 0);
+        if (!ig || phase_window(s->phase_ign, po, Pp, Pp, pshift, ig)) { tp_put(ig, pp3); tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
+        for (size_t k = 0; k < pp3; k++) if (ig[k] && ig[k] != PHASE_UNKNOWN) php[k] = PHASE_UNKNOWN;
+        tp_put(ig, pp3);
+    }
+    for (size_t k = 0; k < pp3; k++) if (!ctp[k]) php[k] = PHASE_UNKNOWN;   /* (the window's air test after the pull: the same voxels) */
+    uint8_t *wwp = nullptr, *wcp = nullptr;
+    if (c->wind4) {
+        wwp = tp_get(pp3, 0); wcp = tp_get(pp3, 0);
+        const int wt0 = c->wind4_tile < 0 ? 0 : c->wind4_tile > (P + 5) / 6 ? c->wind4_tile : (P + 5) / 6, wt = wt0 && wt0 < (Pp + 5) / 6 ? (Pp + 5) / 6 : wt0;
+        if (!wwp || !wcp || band_wind4_tiled(php, Pp, Pp, Pp, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, wwp, wcp, nullptr) < 0) {
+            tp_put(wwp, pp3); tp_put(wcp, pp3); tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1;
+        }
+    }
+    g_crush.n = p3; g_crush.pre = 1;
+    g_crush.ph = tp_get(p3 + 64, 0);
+    if (c->wind4) { g_crush.w4 = tp_get(p3, 0); g_crush.wc = tp_get(p3, 0); }
+    if (!g_crush.ph || (c->wind4 && (!g_crush.w4 || !g_crush.wc))) { tp_put(wwp, pp3); tp_put(wcp, pp3); tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
+    sa_tear_apply(t, P, M, ctp, php, wwp, wcp, sa_ct_quantile(ctp, pp3, .05), ctu, g_crush.ph, g_crush.w4, g_crush.wc);
+    memset(g_crush.ph + p3, PHASE_UNKNOWN, 64);
+    if (s->phase_sign < 0) phase_negate(g_crush.ph, p3);   /* (the stored-phase path negates it again) */
+    tp_put(wwp, pp3); tp_put(wcp, pp3); tp_put(ctp, pp3); tp_put(php, pp3 + 64);
+    atomic_fetch_add(&sp->augn[AUGN_TEAR], 1);
+    return 1;
+}
 static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs);
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
     const int rc = draw_(sp, b, i, r, xtmp, ttmp, big, tile_index, noise_state, cs);
-    if (g_crush.ph || g_crush.ig) crush_release();
+    if (g_crush.ph || g_crush.ig || g_crush.w4 || g_crush.wc) crush_release();
     if (rc == 0 && b->chid && (!cs || cs->id < 0)) { b->chid[i] = -1; b->chidx[i] = 0; b->choff[3 * i] = b->choff[3 * i + 1] = b->choff[3 * i + 2] = 0.f; }
     return rc;
 }
@@ -2048,22 +2100,23 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     PROF_MARK(PS_PROBE);
     /* CT (--aug-crush: a crushed window of a stored-phase source without target channels, pulled through the map instead) */
     uint8_t *ctu = big;
-    int crushed = 0;
-    if (c->crush.p > 0 && c->augment && c->geometry_augment && s->geometry && !chained && !c->view_P && !c->cover && !c->holdout && Pz == P &&
+    int crushed = 0, torn = 0;
+    if ((c->crush.p > 0 || c->tear_p > 0) && c->augment && c->geometry_augment && s->geometry && !chained && !c->view_P && !c->cover && !c->holdout && Pz == P &&
         region_ch < 0 && zoom_out == 0 && c->side == 2 && !c->band && !c->cond && !c->sheet && !c->papyrus && !c->pap_head && !c->aux &&
         !c->phase_dense && s->phase) {
         const int psh = s->phase_level - l;
         int ok = psh == 1 || (psh == 0 && s->phase_direct);
         for (int ch = 0; ch < NCH; ch++) ok &= !s->tgt_key[ch];
-        if (ok && runif(r) < c->crush.p && (crushed = crush_draw(sp, s, l, o, P, psh, r, big + p3, 8 * p3, ctu)) < 0) return -1;
+        if (ok && c->crush.p > 0 && runif(r) < c->crush.p && (crushed = crush_draw(sp, s, l, o, P, psh, r, big + p3, 8 * p3, ctu)) < 0) return -1;
+        if (ok && !crushed && c->tear_p > 0 && runif(r) < c->tear_p && (torn = tear_draw(sp, s, l, o, P, psh, r, ctu)) < 0) return -1;
     }
-    if (!crushed && z3_read(ct, o, n, ctu, 1)) return -1;
+    if (!crushed && !torn && z3_read(ct, o, n, ctu, 1)) return -1;
     PROF_MARK(PS_READ);
     size_t nz = 0;
     double sum = 0, sq = 0;
     u8_stats(ctu, p3, &nz, &sum, &sq);
     if (!c->cover && (double)nz / (double)p3 < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[1], 1); return 1; }
-    if (c->xscan_p > 0 && s->nxs && !crushed && c->augment && !chained && !c->view_P && !c->cover && !c->holdout && runif(r) < c->xscan_p) {
+    if (c->xscan_p > 0 && s->nxs && !crushed && !torn && c->augment && !chained && !c->view_P && !c->cover && !c->holdout && runif(r) < c->xscan_p) {
         const int xs = xscan_draw(s, l, o, n, r, ctu, big + p3);   /* (big + p3: free scratch until the scanner augmentation) */
         if (xs < 0) return -1;
         if (xs) { atomic_fetch_add(&sp->augn[AUGN_XSCAN], 1); nz = 0; sum = sq = 0; u8_stats(ctu, p3, &nz, &sum, &sq); }
@@ -2437,7 +2490,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             uint16_t *wq = nullptr;   /* warped --task unwrap2: the winding and its component for warp_phase_w4 (one pass with the phase) */
             if (!sw || (g_crush.ph ? (memcpy(sw, g_crush.ph, p3), 0) : phase_window(s->phase, o, Pz, P, pshift, sw))) { tp_put(sw, p3 + 64); return -1; }
             if (s->phase_sign < 0) phase_negate(sw, p3);   /* (before the winding mod 4: it unwraps this phase) */
-            if (s->phase_ign && pshift < 2) {   /* (interpolated 2.4 um windows: no mask) "ignore": label sets that disagree there (ufsm phase-conflict): unknown, not trained on */
+            if (s->phase_ign && pshift < 2 && !g_crush.pre) {   /* (--aug-tear: applied before the cut) (interpolated 2.4 um windows: no mask) "ignore": label sets that disagree there (ufsm phase-conflict): unknown, not trained on */
                 uint8_t *ig = tp_get(p3, 0);
                 if (!ig || (g_crush.ig ? (memcpy(ig, g_crush.ig, p3), 0) : phase_window(s->phase_ign, o, Pz, P, pshift, ig))) { tp_put(ig, p3); tp_put(sw, p3 + 64); return -1; }
                 for (size_t k = 0; k < p3; k++) if (ig[k] && ig[k] != PHASE_UNKNOWN) sw[k] = PHASE_UNKNOWN;   /* (outside the mask array: 255 = keep) */
@@ -2448,7 +2501,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 if (!pw || !ww || !wc) { tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1; }
                 for (size_t k = 0; k < p3; k++) pw[k] = ctu[k] ? sw[k] : SIDE_UNKNOWN;
                 const int wt = c->wind4_tile < 0 ? 0 : c->wind4_tile > (P + 5) / 6 ? c->wind4_tile : (P + 5) / 6;   /* (<= 6^3 tiles: one gauge each fits the loss's 255) */
-                if (band_wind4_tiled(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, ww, wc, nullptr) < 0) {
+                if (g_crush.w4) { memcpy(ww, g_crush.w4, p3); memcpy(wc, g_crush.wc, p3); }   /* (--aug-tear: unwrapped before the cut) */
+                else if (band_wind4_tiled(pw, Pz, P, P, wt, c->wind4_step > 0 ? c->wind4_step : 80, c->wind4_min > 0 ? (size_t)c->wind4_min : 512, wt ? 1 : 15, ww, wc, nullptr) < 0) {
                     tp_put(pw, p3); tp_put(ww, p3); tp_put(wc, p3); tp_put(sw, p3 + 64); return -1;
                 }
                 if (spatial.active) {
