@@ -436,7 +436,7 @@ static int cmd_map(int argc, char **argv) {
 
 /* ---------- label warp: labels on one scan resampled into the other scan's grid ----------
    ufsm reg warp <reg.json> <label-root> <label-key> <label-um> <out-dir> --level L [--c2f] [--boxes eval_boxes.jsonl] [--box z,y,x,nz,ny,nx]
-                 [--fill 255] [--cache DIR] [--threads 8]
+                 [--fill 255] [--conf LO,HI [--iso I]] [--cache DIR] [--threads 8]
    Default: the labels (uint8: winding codes, stored phase, ink prob254; on the COARSE scan's grid at label-um, origin shared with coarse
    L0) are sampled nearest-neighbour at every voxel of the FINE scan's level L: fine level-L voxel -> fine L0 -> coarse L0 (rmap_f2c).
    --c2f: the other way, labels on the FINE scan's grid (label-um, origin shared with fine L0) onto the COARSE scan's level L
@@ -444,7 +444,9 @@ static int cmd_map(int argc, char **argv) {
    trilinearly (the field is smooth); lattice and resampling run on --threads threads. With --boxes (the pair's eval_boxes.jsonl), a
    voxel keeps its label only when the nearest probe box (coarse L0 centre "c") is "certified"; elsewhere, outside the labels and
    outside the map: fill. Output: one array (512^3 shards, lossless) of the output scan's level-L shape; with --box (output level L,
-   zyx) only the shards meeting the box are written. */
+   zyx) only the shards meeting the box are written.
+   --conf LO,HI (pseudo labels from a probability prediction, uint8 round(p * 255)): label v >= HI -> 254 (ink), v <= LO -> 0 (no ink),
+   between -> 255 (unknown); with --iso I, label voxels whose CT on the label scan (its level matching label-um) is below I -> 255. */
 typedef struct { double c[3]; int ok; } rprobe;
 typedef struct { const rprobe *p; int n; } rprobes;
 static int probe_ok(const double q[3], void *ud) {   /* the nearest probe box (coarse L0) certified? */
@@ -453,10 +455,13 @@ static int probe_ok(const double q[3], void *ud) {   /* the nearest probe box (c
     return bi >= 0 && P->p[bi].ok;
 }
 static int cmd_warp(int argc, char **argv) {
-    if (argc < 8) { fprintf(stderr, "usage: ufsm reg warp <reg.json> <label-root> <label-key> <label-um> <out-dir> --level L [--c2f] [--boxes eval_boxes.jsonl] [--box z,y,x,nz,ny,nx] [--fill 255] [--cache DIR] [--threads 8]\n"); return 2; }
+    if (argc < 8) { fprintf(stderr, "usage: ufsm reg warp <reg.json> <label-root> <label-key> <label-um> <out-dir> --level L [--c2f] [--boxes eval_boxes.jsonl] [--box z,y,x,nz,ny,nx] [--fill 255] [--conf LO,HI [--iso I]] [--cache DIR] [--threads 8]\n"); return 2; }
     const int L = atoi(opt(argc, argv, "--level", "-1")), fill = atoi(opt(argc, argv, "--fill", "255")), nt = atoi(opt(argc, argv, "--threads", "8"));
     const int c2f = has(argc, argv, "--c2f");
     const double lum = atof(argv[6]);
+    int clo = -1, chi = -1; const int iso = atoi(opt(argc, argv, "--iso", "0"));
+    if (opt(argc, argv, "--conf", nullptr) && (sscanf(opt(argc, argv, "--conf", ""), "%d,%d", &clo, &chi) != 2 || clo < 0 || chi > 255 || clo >= chi)) { fprintf(stderr, "reg warp: --conf LO,HI with 0 <= LO < HI <= 255\n"); return 2; }
+    if (iso && clo < 0) { fprintf(stderr, "reg warp: --iso goes with --conf\n"); return 2; }
     if (L < 0 || lum <= 0) { fprintf(stderr, "reg warp: --level L and label-um > 0\n"); return 2; }
     rctx x; if (ctx_open(&x, argv[3], opt(argc, argv, "--cache", nullptr), 1)) return 1;
     const rvol *ov = c2f ? x.cv : x.fv, *lv = c2f ? x.fv : x.cv;   /* output grid, label grid */
@@ -465,6 +470,15 @@ static int cmd_warp(int argc, char **argv) {
     store *ls = store_open(argv[4]); z3 *lz = ls ? z3_open(ls, argv[5], opt(argc, argv, "--cache", nullptr)) : nullptr;
     if (!lz) { fprintf(stderr, "reg warp: cannot open the labels %s %s\n", argv[4], argv[5]); return 1; }
     const int64_t *lsh = z3_meta_of(lz)->shape;
+    z3 *ctz = nullptr;   /* --iso: the label scan's CT at the label level */
+    if (iso) {
+        const int cl = (int)lrint(log2(k));
+        if (cl < 0 || cl >= lv->nl || fabs(k - (double)(1 << cl)) > 0.02 * k || !lv->z[cl]) { fprintf(stderr, "reg warp: --iso: label-um %g is not a level of the label scan (%g um)\n", lum, lv->um); return 1; }
+        ctz = lv->z[cl];
+        const int64_t *cs = z3_meta_of(ctz)->shape;
+        if (cs[0] != lsh[0] || cs[1] != lsh[1] || cs[2] != lsh[2]) fprintf(stderr, "reg warp: --iso: CT level %d shape %lld x %lld x %lld != labels %lld x %lld x %lld (reading the overlap)\n", cl,
+            (long long)cs[0], (long long)cs[1], (long long)cs[2], (long long)lsh[0], (long long)lsh[1], (long long)lsh[2]);
+    }
     rprobe *pr = nullptr; int np = 0;
     const char *bf = opt(argc, argv, "--boxes", nullptr);
     if (bf) {
@@ -505,6 +519,17 @@ static int cmd_warp(int argc, char **argv) {
         if (ln_[0] <= 0 || ln_[1] <= 0 || ln_[2] <= 0) continue;
         uint8_t *lb = malloc((size_t)ln_[0] * ln_[1] * ln_[2]);
         if (!lb || z3_read(lz, lo_, ln_, lb, nt)) { fprintf(stderr, "reg warp: label read failed\n"); return 1; }
+        if (clo >= 0) {   /* pseudo labels: confident ink / no ink, the rest unknown; void on the label scan unknown */
+            const size_t nv = (size_t)ln_[0] * ln_[1] * ln_[2];
+            uint8_t lut[256]; for (int v = 0; v < 256; v++) lut[v] = v >= chi ? 254 : v <= clo ? 0 : 255;
+            for (size_t i = 0; i < nv; i++) lb[i] = lut[lb[i]];
+            if (ctz) {
+                uint8_t *cb = malloc(nv);
+                if (!cb || z3_read(ctz, lo_, ln_, cb, nt)) { fprintf(stderr, "reg warp: CT read failed\n"); return 1; }
+                for (size_t i = 0; i < nv; i++) if (cb[i] < iso) lb[i] = 255;
+                free(cb);
+            }
+        }
         memset(buf, fill, (size_t)S * S * S);
         nset += reg_warp_fill(nd, G, n, S, k, lb, lo_, ln_, (uint8_t)fill, buf, nt);
         free(lb);
