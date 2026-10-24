@@ -41,7 +41,7 @@ __device__ __forceinline__ void stage(const float *__restrict__ X, int ld, int r
 
 template <int BITS, int TA, int TB>
 __global__ void __launch_bounds__(128) mx_gemm_k(const float *__restrict__ A, int lda, const float *__restrict__ B, int ldb, float *__restrict__ C, int ldc,
-                                                  int M, int N, int K, float alpha, float beta) {
+                                                  int M, int N, int K, float alpha, float beta, const float *__restrict__ bias, const float *res) {
     constexpr int RB = gq<BITS>::RB, RS = RB + 16;
     __shared__ __align__(16) uint8_t sA[GBM * RS], sB[GBN * RS], sAs[GBM * 2], sBs[GBN * 2];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
@@ -110,7 +110,7 @@ __global__ void __launch_bounds__(128) mx_gemm_k(const float *__restrict__ A, in
 #pragma unroll
             for (int q = 0; q < 4; q++) {
                 const int r = m0 + wm + i * 16 + g + 8 * (q >> 1), c = n0 + wn + j * 8 + 2 * t + (q & 1);
-                if (r < M && c < N) { float *p = C + (size_t)r * ldc + c; *p = alpha * acc[i][j][q] + (beta != 0.f ? beta * *p : 0.f); }
+                if (r < M && c < N) { float *p = C + (size_t)r * ldc + c; *p = alpha * acc[i][j][q] + (bias ? bias[c] : 0.f) + (res ? res[(size_t)r * ldc + c] : 0.f) + (beta != 0.f ? beta * *p : 0.f); }
             }
 }
 
@@ -121,7 +121,8 @@ __global__ void mx_pack_k(const float *__restrict__ X, int ld, int rows, int K, 
     constexpr float IQ = gq<BITS>::IQ; constexpr int BPB = BITS == 4 ? 16 : 32;   /* bytes per 32-value block */
     const long long nblk = (long long)rows * (Kp / 32);
     for (long long b = blockIdx.x * (long long)blockDim.x + threadIdx.x; b < nblk; b += (long long)gridDim.x * blockDim.x) {
-        const int r = (int)(b / (Kp / 32)), kb = (int)(b % (Kp / 32)), k0 = kb * 32;
+        /* (TR: consecutive threads on consecutive rows = consecutive addresses of each K row; else on consecutive K blocks of a row) */
+        const int r = TR ? (int)(b % rows) : (int)(b / (Kp / 32)), kb = TR ? (int)(b / rows) : (int)(b % (Kp / 32)), k0 = kb * 32;
         float v[32];
 #pragma unroll
         for (int j = 0; j < 32; j++) { const int k = k0 + j; v[j] = k < K ? (TR ? X[(size_t)k * ld + r] : X[(size_t)r * ld + k]) : 0.f; }
@@ -140,11 +141,14 @@ __global__ void mx_pack_k(const float *__restrict__ X, int ld, int rows, int K, 
         sc[(size_t)r * (Kp / 32) + kb] = (uint8_t)(e + 127);
     }
 }
+/* the packed GEMM: 64 x 64 output tiles, 4 warps of 32 x 32, K steps of 64 staged by cp.async into two shared buffers (the next step's
+   copy overlaps this step's products; the scale bytes go through registers); the epilogue (alpha acc + bias + res + beta C) stores
+   column pairs. gridDim.z > 1: split K (kper K per split), atomics into C (no bias / res) */
 template <int BITS>
 __global__ void __launch_bounds__(128) mx_gemm_p_k(const uint8_t *__restrict__ Aq, const uint8_t *__restrict__ As, const uint8_t *__restrict__ Bq, const uint8_t *__restrict__ Bs,
-                                                   float *__restrict__ C, int ldc, int M, int N, int Kp, float alpha, float beta) {
+                                                   float *__restrict__ C, int ldc, int M, int N, int Kp, float alpha, float beta, const float *__restrict__ bias, const float *res, int kper) {
     constexpr int RB = gq<BITS>::RB, RS = RB + 16, BPB = BITS == 4 ? 16 : 32;
-    __shared__ __align__(16) uint8_t sA[GBM * RS], sB[GBN * RS], sAs[GBM * 2], sBs[GBN * 2];
+    __shared__ __align__(16) uint8_t sA[2][GBM * RS], sB[2][GBN * RS], sAs[2][GBM * 2], sBs[2][GBN * 2];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
     const int m0 = blockIdx.y * GBM, n0 = blockIdx.x * GBN, wm = (warp >> 1) * 32, wn = (warp & 1) * 32, nkb = Kp / 32;
     float acc[2][4][4];
@@ -154,37 +158,41 @@ __global__ void __launch_bounds__(128) mx_gemm_p_k(const uint8_t *__restrict__ A
         for (int j = 0; j < 4; j++)
 #pragma unroll
             for (int q = 0; q < 4; q++) acc[i][j][q] = 0.f;
-    for (int k0 = 0; k0 < Kp; k0 += GBK) {
-        __syncthreads();
-        {   /* copy: 64 rows x 2 blocks per operand, one (row, block) per thread, 16-byte words */
-            const int row = tid & 63, kb = tid >> 6, blk = k0 / 32 + kb;
-            const int ra = m0 + row, rb = n0 + row;
-            uint4 *da = (uint4 *)(sA + row * RS + kb * BPB), *db = (uint4 *)(sB + row * RS + kb * BPB);
-            const uint4 z = make_uint4(0, 0, 0, 0);
+    const int kb0 = (int)blockIdx.z * kper, ke = kb0 + kper < Kp ? kb0 + kper : Kp;
+    const int row = tid & 63, kb = tid >> 6, ra = m0 + row, rb = n0 + row;   /* the copy: one (row, 32-K block) of each operand per thread */
+    uint8_t sca, scb;
+    auto issue = [&](int buf, int k0) {
+        const int blk = k0 / 32 + kb;
 #pragma unroll
-            for (int w = 0; w < BPB / 16; w++) {
-                da[w] = ra < M ? ((const uint4 *)(Aq + ((size_t)ra * nkb + blk) * BPB))[w] : z;
-                db[w] = rb < N ? ((const uint4 *)(Bq + ((size_t)rb * nkb + blk) * BPB))[w] : z;
-            }
-            sAs[row * 2 + kb] = ra < M ? As[(size_t)ra * nkb + blk] : 127;
-            sBs[row * 2 + kb] = rb < N ? Bs[(size_t)rb * nkb + blk] : 127;
+        for (int w = 0; w < BPB / 16; w++) {
+            cp_async<16>(sA[buf] + row * RS + kb * BPB + 16 * w, Aq + ((size_t)(ra < M ? ra : 0) * nkb + blk) * BPB + 16 * w, ra < M);
+            cp_async<16>(sB[buf] + row * RS + kb * BPB + 16 * w, Bq + ((size_t)(rb < N ? rb : 0) * nkb + blk) * BPB + 16 * w, rb < N);
         }
+        sca = ra < M ? As[(size_t)ra * nkb + blk] : 127; scb = rb < N ? Bs[(size_t)rb * nkb + blk] : 127;
+    };
+    issue(0, kb0); asm volatile("cp.async.commit_group;\n" ::: "memory");
+    sAs[0][row * 2 + kb] = sca; sBs[0][row * 2 + kb] = scb;
+    for (int k0 = kb0, it = 0; k0 < ke; k0 += GBK, it++) {
+        const int cur = it & 1; const bool nx = k0 + GBK < ke;
+        if (nx) issue(cur ^ 1, k0 + GBK);
+        asm volatile("cp.async.commit_group;\ncp.async.wait_group 1;\n" ::: "memory");
         __syncthreads();
+        const uint8_t *cA = sA[cur], *cB = sB[cur], *cAs = sAs[cur], *cBs = sBs[cur];
         if constexpr (BITS == 4) {
             unsigned af[2][4], sa[2], bf[4][2], sb[4];
 #pragma unroll
             for (int i = 0; i < 2; i++) {
                 const int r = wm + i * 16 + g;
-                af[i][0] = *(const unsigned *)(sA + r * RS + 4 * t); af[i][1] = *(const unsigned *)(sA + (r + 8) * RS + 4 * t);
-                af[i][2] = *(const unsigned *)(sA + r * RS + 16 + 4 * t); af[i][3] = *(const unsigned *)(sA + (r + 8) * RS + 16 + 4 * t);
+                af[i][0] = *(const unsigned *)(cA + r * RS + 4 * t); af[i][1] = *(const unsigned *)(cA + (r + 8) * RS + 4 * t);
+                af[i][2] = *(const unsigned *)(cA + r * RS + 16 + 4 * t); af[i][3] = *(const unsigned *)(cA + (r + 8) * RS + 16 + 4 * t);
                 const int rs = wm + i * 16 + g + 8 * (t & 1);
-                sa[i] = (unsigned)sAs[rs * 2] | ((unsigned)sAs[rs * 2 + 1] << 8);
+                sa[i] = (unsigned)cAs[rs * 2] | ((unsigned)cAs[rs * 2 + 1] << 8);
             }
 #pragma unroll
             for (int j = 0; j < 4; j++) {
                 const int c = wn + j * 8 + g;
-                bf[j][0] = *(const unsigned *)(sB + c * RS + 4 * t); bf[j][1] = *(const unsigned *)(sB + c * RS + 16 + 4 * t);
-                sb[j] = (unsigned)sBs[c * 2] | ((unsigned)sBs[c * 2 + 1] << 8);
+                bf[j][0] = *(const unsigned *)(cB + c * RS + 4 * t); bf[j][1] = *(const unsigned *)(cB + c * RS + 16 + 4 * t);
+                sb[j] = (unsigned)cBs[c * 2] | ((unsigned)cBs[c * 2 + 1] << 8);
             }
 #pragma unroll
             for (int i = 0; i < 2; i++)
@@ -197,15 +205,15 @@ __global__ void __launch_bounds__(128) mx_gemm_p_k(const uint8_t *__restrict__ A
 #pragma unroll
                 for (int i = 0; i < 2; i++) {
                     const int r = wm + i * 16 + g;
-                    af[i][0] = *(const unsigned *)(sA + r * RS + kh * 32 + 4 * t); af[i][1] = *(const unsigned *)(sA + (r + 8) * RS + kh * 32 + 4 * t);
-                    af[i][2] = *(const unsigned *)(sA + r * RS + kh * 32 + 16 + 4 * t); af[i][3] = *(const unsigned *)(sA + (r + 8) * RS + kh * 32 + 16 + 4 * t);
-                    sa[i] = sAs[(wm + i * 16 + g + 8 * (t & 1)) * 2 + kh];
+                    af[i][0] = *(const unsigned *)(cA + r * RS + kh * 32 + 4 * t); af[i][1] = *(const unsigned *)(cA + (r + 8) * RS + kh * 32 + 4 * t);
+                    af[i][2] = *(const unsigned *)(cA + r * RS + kh * 32 + 16 + 4 * t); af[i][3] = *(const unsigned *)(cA + (r + 8) * RS + kh * 32 + 16 + 4 * t);
+                    sa[i] = cAs[(wm + i * 16 + g + 8 * (t & 1)) * 2 + kh];
                 }
 #pragma unroll
                 for (int j = 0; j < 4; j++) {
                     const int c = wn + j * 8 + g;
-                    bf[j][0] = *(const unsigned *)(sB + c * RS + kh * 32 + 4 * t); bf[j][1] = *(const unsigned *)(sB + c * RS + kh * 32 + 16 + 4 * t);
-                    sb[j] = sBs[c * 2 + kh];
+                    bf[j][0] = *(const unsigned *)(cB + c * RS + kh * 32 + 4 * t); bf[j][1] = *(const unsigned *)(cB + c * RS + kh * 32 + 16 + 4 * t);
+                    sb[j] = cBs[c * 2 + kh];
                 }
 #pragma unroll
                 for (int i = 0; i < 2; i++)
@@ -213,20 +221,35 @@ __global__ void __launch_bounds__(128) mx_gemm_p_k(const uint8_t *__restrict__ A
                     for (int j = 0; j < 4; j++) mma_f8(acc[i][j], af[i], bf[j], sa[i], sb[j]);
             }
         }
+        __syncthreads();
+        if (nx) { sAs[cur ^ 1][row * 2 + kb] = sca; sBs[cur ^ 1][row * 2 + kb] = scb; }
     }
+    const bool pair = !(N & 1) && !(ldc & 1) && !(((size_t)C | (size_t)res) & 7);   /* (float2 stores; bias read per element: any offset) */
 #pragma unroll
     for (int i = 0; i < 2; i++)
 #pragma unroll
         for (int j = 0; j < 4; j++)
 #pragma unroll
-            for (int q = 0; q < 4; q++) {
-                const int r = m0 + wm + i * 16 + g + 8 * (q >> 1), c = n0 + wn + j * 8 + 2 * t + (q & 1);
-                if (r < M && c < N) { float *p = C + (size_t)r * ldc + c; *p = alpha * acc[i][j][q] + (beta != 0.f ? beta * *p : 0.f); }
+            for (int h = 0; h < 2; h++) {
+                const int r = m0 + wm + i * 16 + g + 8 * h, c = n0 + wn + j * 8 + 2 * t;
+                if (r >= M || c >= N) continue;
+                float *p = C + (size_t)r * ldc + c; const float v0 = alpha * acc[i][j][2 * h], v1 = alpha * acc[i][j][2 * h + 1];
+                if (gridDim.z > 1) { atomicAdd(p, v0); if (c + 1 < N) atomicAdd(p + 1, v1); continue; }
+                if (pair) {
+                    float2 o = make_float2(v0, v1);
+                    if (bias) { o.x += bias[c]; o.y += bias[c + 1]; }
+                    if (res) { const float2 e = *(const float2 *)(res + (size_t)r * ldc + c); o.x += e.x; o.y += e.y; }
+                    if (beta != 0.f) { const float2 e = *(const float2 *)p; o.x += beta * e.x; o.y += beta * e.y; }
+                    *(float2 *)p = o;
+                } else {
+                    p[0] = v0 + (bias ? bias[c] : 0.f) + (res ? res[(size_t)r * ldc + c] : 0.f) + (beta != 0.f ? beta * p[0] : 0.f);
+                    if (c + 1 < N) p[1] = v1 + (bias ? bias[c + 1] : 0.f) + (res ? res[(size_t)r * ldc + c + 1] : 0.f) + (beta != 0.f ? beta * p[1] : 0.f);
+                }
             }
 }
 static uint8_t *g_pk = nullptr; static size_t g_pkn = 0;
 /* the packed path for large operands: pack both, then the packed GEMM (bits 4 / 8); 0, or -1 */
-static int mx_gemm_packed(int bits, int ta, int tb, int M, int N, int K, const float *A, const float *B, float *C, float beta) {
+static int mx_gemm_packed(int bits, int ta, int tb, int M, int N, int K, const float *A, const float *B, float *C, float beta, const float *bias, const float *res) {
     const int Kp = (K + 63) / 64 * 64, BPB = bits == 4 ? 16 : 32;
     const size_t qa = (size_t)M * (Kp / 32) * BPB, qb = (size_t)N * (Kp / 32) * BPB, sa = (size_t)M * (Kp / 32), sb = (size_t)N * (Kp / 32);
     const size_t need = ((qa + 255) & ~(size_t)255) + ((qb + 255) & ~(size_t)255) + ((sa + 255) & ~(size_t)255) + sb + 256;
@@ -237,26 +260,36 @@ static int mx_gemm_packed(int bits, int ta, int tb, int M, int N, int K, const f
     const unsigned ga = (unsigned)((na + 255) / 256 < 65535 ? (na + 255) / 256 : 65535), gb = (unsigned)((nb + 255) / 256 < 65535 ? (nb + 255) / 256 : 65535);
 #define PK(BI) do { if (ta) mx_pack_k<BI, 1><<<ga, 256>>>(A, lda, M, K, Kp, Aq, As); else mx_pack_k<BI, 0><<<ga, 256>>>(A, lda, M, K, Kp, Aq, As); \
                     if (tb) mx_pack_k<BI, 0><<<gb, 256>>>(B, ldb, N, K, Kp, Bq, Bs); else mx_pack_k<BI, 1><<<gb, 256>>>(B, ldb, N, K, Kp, Bq, Bs); } while (0)
-    const dim3 grid((unsigned)((N + GBN - 1) / GBN), (unsigned)((M + GBM - 1) / GBM));
-    if (bits == 4) { PK(4); mx_gemm_p_k<4><<<grid, 128>>>(Aq, As, Bq, Bs, C, N, M, N, Kp, 1.f, beta); }
-    else { PK(8); mx_gemm_p_k<8><<<grid, 128>>>(Aq, As, Bq, Bs, C, N, M, N, Kp, 1.f, beta); }
+    /* split K when the output tiles are too few for the GPU (the weight gradients: K = tokens): >= 4 K steps per split, atomics into C
+       (beta 0: C zeroed first; only without bias / residual) */
+    const int tiles = ((N + GBN - 1) / GBN) * ((M + GBM - 1) / GBM), ksteps = Kp / GBK;
+    int ns = !bias && !res && (beta == 0.f || beta == 1.f) && tiles < 120 ? (240 + tiles - 1) / tiles : 1;
+    if (ns > ksteps / 4) ns = ksteps / 4 > 1 ? ksteps / 4 : 1;
+    const int kper = (ksteps + ns - 1) / ns * GBK; ns = (Kp + kper - 1) / kper;
+    if (ns > 1 && beta == 0.f) cudaMemsetAsync(C, 0, (size_t)M * N * 4, 0);
+    const dim3 grid((unsigned)((N + GBN - 1) / GBN), (unsigned)((M + GBM - 1) / GBM), (unsigned)ns);
+    if (bits == 4) { PK(4); mx_gemm_p_k<4><<<grid, 128>>>(Aq, As, Bq, Bs, C, N, M, N, Kp, 1.f, beta, bias, res, kper); }
+    else { PK(8); mx_gemm_p_k<8><<<grid, 128>>>(Aq, As, Bq, Bs, C, N, M, N, Kp, 1.f, beta, bias, res, kper); }
 #undef PK
     LPCK();
     return 0;
 }
 
 /* bits 4 / 8; returns 0, or -1 (unsupported) */
-extern "C" int lp_mx_gemm(int bits, int ta, int tb, int M, int N, int K, const float *A, const float *B, float *C, float beta) {
+extern "C" int lp_mx_gemm_ex(int bits, int ta, int tb, int M, int N, int K, const float *A, const float *B, float *C, float beta, const float *bias, const float *res) {
     if (M <= 0 || N <= 0) return 0;
     static int mode = -1; if (mode < 0) { const char *e = getenv("UFSM_MX_GEMM_PACKED"); mode = e ? atoi(e) : 2; }   /* 0 tiles, 1 packed, 2 packed when either grid side > 4 tiles */
-    if ((bits == 4 || bits == 8) && (mode == 1 || (mode == 2 && (M > 4 * GBM || N > 4 * GBN))) && !mx_gemm_packed(bits, ta, tb, M, N, K, A, B, C, beta)) return 0;
+    if ((bits == 4 || bits == 8) && (mode == 1 || (mode == 2 && (M > 4 * GBM || N > 4 * GBN))) && !mx_gemm_packed(bits, ta, tb, M, N, K, A, B, C, beta, bias, res)) return 0;
     const dim3 grid((unsigned)((N + GBN - 1) / GBN), (unsigned)((M + GBM - 1) / GBM));
     const int lda = ta ? M : K, ldb = tb ? K : N;
-#define LMG(BI, TA_, TB_) mx_gemm_k<BI, TA_, TB_><<<grid, 128>>>(A, lda, B, ldb, C, N, M, N, K, 1.f, beta)
+#define LMG(BI, TA_, TB_) mx_gemm_k<BI, TA_, TB_><<<grid, 128>>>(A, lda, B, ldb, C, N, M, N, K, 1.f, beta, bias, res)
     if (bits == 4) { if (!ta && !tb) LMG(4, 0, 0); else if (!ta && tb) LMG(4, 0, 1); else if (ta && !tb) LMG(4, 1, 0); else LMG(4, 1, 1); }
     else if (bits == 8) { if (!ta && !tb) LMG(8, 0, 0); else if (!ta && tb) LMG(8, 0, 1); else if (ta && !tb) LMG(8, 1, 0); else LMG(8, 1, 1); }
     else return -1;
 #undef LMG
     LPCK();
     return 0;
+}
+extern "C" int lp_mx_gemm(int bits, int ta, int tb, int M, int N, int K, const float *A, const float *B, float *C, float beta) {
+    return lp_mx_gemm_ex(bits, ta, tb, M, N, K, A, B, C, beta, nullptr, nullptr);
 }

@@ -55,6 +55,9 @@ void reg_resample(const rblk *fb, const rmap *m, int lc, int lf, const double or
    (2 outside the fine volume, 5 read error, 6 over 96M voxels) */
 uint8_t *reg_read_fine(rvol *fv, int lf, const rmap *m, int lc, const double org[3], const int n[3], double smax, rblk *fb, int *err);
 
+/* a map JSON (ufsm reg format) and its fine volume, kept open (src/reg_cli.c); nullptr on failure */
+const rmap *reg_map_open(const char *path, const char *cache, rvol **fv, double *coarse_um, double *fine_um);
+
 enum { REG_NCC = 0, REG_DOG = 1, REG_GRAD = 2 };
 void reg_gauss(float *v, const int n[3], double sigma);   /* separable, clamped edges, in place */
 void reg_filter(float *v, const int n[3], int metric, double hp, double lp);

@@ -70,7 +70,7 @@ static int raw_mode(dv_net *net, int argc, char **argv) {
     fprintf(stderr, "dinovol: tile %d^3 forward %.1f ms\n", T, (t1 - t0) * 1e3);
     dv_prof_report(reps > 1 ? reps - 1 : 1);
     const int g = T / 8;
-    if (dump_dev_half(out, "tokens.f32", dv_tokens(net), (size_t)g * g * g * 480)) return 1;
+    if (dump_dev_half(out, "tokens.f32", dv_tokens(net), (size_t)g * g * g * dv_embed_dim(net))) return 1;
     for (int k = 0; k < 3; k++) { int e, ch; const void *p = dv_skip(net, k, &e, &ch); char nm[32]; snprintf(nm, sizeof nm, "skip%d.f32", k);
         if (dump_dev_half(out, nm, p, (size_t)e * e * e * ch)) return 1; }
     { int e, ch; const void *p = dv_fpn(net, &e, &ch); if (dump_dev_half(out, "fpn.f32", p, (size_t)e * e * e * ch)) return 1; }
@@ -950,4 +950,317 @@ int dv_write_dense_box(const char *group, const int64_t vol_shape[3], const int6
             }
     rc |= zw_flush(&w); zw_free(&w); free(blk);
     return rc;
+}
+
+
+/* ---- ufsm dinovol-calib: the upstream teacher's DINO (CLS) and iBOT (patch token) heads on our crops -- the yardstick for our SSL
+   entropy diagnostics. Pairs of crops (view A, view B = A shifted by a multiple of 8 voxels, so token cells correspond exactly) from a
+   sources JSON (dino-train format: root, ct, cache, boxes, min_level), normalised with robust statistics pooled over each source's crops;
+   per head: H(t) / pmax / batch usage / A-B argmax agreement under plain softmax, batch centering and Sinkhorn-Knopp at each temperature,
+   and the unit bottleneck's per-dimension std and same / other cosines (as dino-train logs them). ---- */
+#include "dinor.h"
+#include "wload.h"
+#include "nn.h"
+typedef struct { dr_head h; float *P; } cal_head;
+/* one of the checkpoint's DINOHeads (pre "dino_head" / "ibot_head") as a dr_head layout + host floats (caller frees) */
+int dv_head_host(const char *ckpt, const char *pre, dr_head *h, float **Ph) {
+    wl_dict *d = wl_load(ckpt, "teacher"); if (!d) { fprintf(stderr, "dinovol: %s\n", wl_error()); return -1; }
+    const wl_tensor *w1 = wl_getf(d, "%s.mlp.0.weight", pre), *b1 = wl_getf(d, "%s.mlp.0.bias", pre), *w2 = wl_getf(d, "%s.mlp.2.weight", pre),
+                    *b2 = wl_getf(d, "%s.mlp.2.bias", pre), *w3 = wl_getf(d, "%s.mlp.4.weight", pre), *b3 = wl_getf(d, "%s.mlp.4.bias", pre),
+                    *g = wl_getf(d, "%s.last_layer.parametrizations.weight.original0", pre), *v = wl_getf(d, "%s.last_layer.parametrizations.weight.original1", pre);
+    if (!w1 || !b1 || !w2 || !b2 || !w3 || !b3 || !g || !v) { fprintf(stderr, "dinovol: %s: head tensors missing\n", pre); wl_free(d); return -1; }
+    dr_head_layout(h, (int)w1->shape[1], (int)w1->shape[0], (int)w3->shape[0], (int)v->shape[0]);
+    float *P = calloc(h->n, sizeof *P);
+    memcpy(P + h->w1, w1->data, w1->numel * 4); memcpy(P + h->b1, b1->data, b1->numel * 4); memcpy(P + h->w2, w2->data, w2->numel * 4);
+    memcpy(P + h->b2, b2->data, b2->numel * 4); memcpy(P + h->w3, w3->data, w3->numel * 4); memcpy(P + h->b3, b3->data, b3->numel * 4);
+    memcpy(P + h->v, v->data, v->numel * 4); memcpy(P + h->g, g->data, g->numel * 4);
+    double gs = 0, gmin = 1e30, gmax = -1e30; for (int64_t k = 0; k < g->numel; k++) { gs += g->data[k]; gmin = fmin(gmin, g->data[k]); gmax = fmax(gmax, g->data[k]); }
+    fprintf(stderr, "dinovol: %s: %d -> %d -> %d -> bottleneck %d, K %d prototypes; weight-norm g mean %.4f min %.4f max %.4f\n", pre, h->Cin, h->H, h->H, h->B, h->K, gs / (double)g->numel, gmin, gmax);
+    wl_free(d); *Ph = P; return 0;
+}
+/* robust statistics from a 256-bin histogram (bin 0 ignored), as dinovol-embed's */
+int dv_hist_stats(const int64_t *hist256, double *median, double *scale, double *p99) {
+    int64_t h[256]; memcpy(h, hist256, sizeof h); h[0] = 0; dv_stats S = {0};
+    if (stats_from_hist(h, 256, &S)) return -1;
+    *median = S.median; *scale = S.scale; *p99 = S.p99; return 0;
+}
+/* the volume-wide robust normalisation of dinovol-embed (nonzero voxels of every stride-th chunk per axis) */
+int dv_ct_stats(z3 *ct, int stride, int nthreads, double *median, double *scale, double *p99) {
+    dv_stats S = {0}; if (sample_stats(ct, stride, nthreads, &S)) return -1;
+    *median = S.median; *scale = S.scale; *p99 = S.p99; return 0;
+}
+static int cal_head_load(cal_head *c, const char *ck, const char *pre) {
+    float *P = nullptr; if (dv_head_host(ck, pre, &c->h, &P)) return -1;
+    c->P = xdev_floats(P, c->h.n); free(P);
+    return c->P ? 0 : -1;
+}
+/* logits [R][K] (host) and unit bottleneck zn [R][B] (host) for rows x [R][Cin] (host) */
+static int cal_head_run(const cal_head *c, const float *x, int R, float *L, float *zn) {
+    const int CH = 256, K = c->h.K, B = c->h.B, Cin = c->h.Cin;
+    void *ws = xmalloc_dev(dr_hws_bytes(&c->h, CH)); float *xd = xmalloc_dev((size_t)CH * Cin * 4), *ld = xmalloc_dev((size_t)CH * K * 4);
+    if (!ws || !xd || !ld) { fprintf(stderr, "dinovol-calib: out of device memory\n"); return -1; }
+    dr_hws w; dr_hws_carve(&w, &c->h, CH, ws);
+    for (int r0 = 0; r0 < R; r0 += CH) {
+        const int n = R - r0 < CH ? R - r0 : CH;
+        xh2d(xd, x + (size_t)r0 * Cin, (size_t)n * Cin * 4);
+        if (dr_head_fwd(&c->h, c->P, xd, n, ld, &w)) return -1;
+        nn_sync();   /* (the head runs on the default stream, the copies on xnet's non-blocking one) */
+        xd2h(L + (size_t)r0 * K, ld, (size_t)n * K * 4); xd2h(zn + (size_t)r0 * B, w.zn, (size_t)n * B * 4);
+    }
+    xfree_dev(ws); xfree_dev(xd); xfree_dev(ld);
+    return 0;
+}
+/* targets q [R][K] (host) from logits: mode 0 softmax(L / t), 1 softmax((L - batch mean) / t), 2 Sinkhorn-Knopp (iters) at t */
+static void cal_targets(const float *L, int R, int K, double t, int mode, int iters, float *q) {
+    double *c = calloc(K, sizeof *c);
+    if (mode == 1) { for (int r = 0; r < R; r++) for (int k = 0; k < K; k++) c[k] += L[(size_t)r * K + k]; for (int k = 0; k < K; k++) c[k] /= R; }
+    if (mode < 2) {
+        for (int r = 0; r < R; r++) {
+            const float *l = L + (size_t)r * K; float *o = q + (size_t)r * K; double m = -1e30, s = 0;
+            for (int k = 0; k < K; k++) m = fmax(m, (l[k] - c[k]) / t);
+            for (int k = 0; k < K; k++) { o[k] = (float)exp((l[k] - c[k]) / t - m); s += o[k]; }
+            for (int k = 0; k < K; k++) o[k] = (float)(o[k] / s);
+        }
+    } else {   /* upstream sinkhorn_knopp_teacher: Q = exp(L / t)^T; Q /= sum; iters x (rows: / sum / K; cols: / sum / B); Q *= B */
+        double m = -1e30; for (size_t i = 0; i < (size_t)R * K; i++) m = fmax(m, L[i] / t);
+        double s = 0; for (size_t i = 0; i < (size_t)R * K; i++) { q[i] = (float)exp(L[i] / t - m); s += q[i]; }
+        for (size_t i = 0; i < (size_t)R * K; i++) q[i] = (float)(q[i] / s);
+        for (int it = 0; it < iters; it++) {
+            for (int k = 0; k < K; k++) c[k] = 0;
+            for (int r = 0; r < R; r++) for (int k = 0; k < K; k++) c[k] += q[(size_t)r * K + k];
+            for (int r = 0; r < R; r++) for (int k = 0; k < K; k++) q[(size_t)r * K + k] = c[k] > 0 ? (float)(q[(size_t)r * K + k] / c[k] / K) : 0.f;
+            for (int r = 0; r < R; r++) { double rs = 0; float *o = q + (size_t)r * K; for (int k = 0; k < K; k++) rs += o[k]; for (int k = 0; k < K; k++) o[k] = (float)(o[k] / rs / R); }
+        }
+        for (size_t i = 0; i < (size_t)R * K; i++) q[i] *= R;
+    }
+    free(c);
+}
+/* rows in pairs (2 i: view A, 2 i + 1: view B) */
+static void cal_report(const char *what, const float *L, const float *zn, int R, int K, int B, const double *temps, int nt, int iters, int same_group) {
+    float *q = malloc((size_t)R * K * 4); double *bar = malloc((size_t)K * sizeof *bar); int *am = malloc(R * sizeof *am); char *seen = malloc(K);
+    fprintf(stderr, "%s: %d rows (%d pairs), K %d (ln K %.3f)\n", what, R, R / 2, K, log((double)K));
+    { double ls = 0, lq = 0; for (size_t i = 0; i < (size_t)R * K; i++) { ls += L[i]; lq += (double)L[i] * L[i]; }
+      const double mu = ls / ((double)R * K); double rsd = 0;
+      for (int r = 0; r < R; r++) { double a = 0, b = 0; for (int k = 0; k < K; k++) { a += L[(size_t)r * K + k]; b += (double)L[(size_t)r * K + k] * L[(size_t)r * K + k]; } a /= K; rsd += sqrt(fmax(b / K - a * a, 0)); }
+      fprintf(stderr, "  raw logits: mean %.4f sd %.4f, mean within-row sd %.4f\n", mu, sqrt(fmax(lq / ((double)R * K) - mu * mu, 0)), rsd / R); }
+    static const char *mn[3] = {"softmax", "centred", "sinkhorn"};
+    for (int ti = 0; ti < nt; ti++) for (int mode = 0; mode < 3; mode++) {
+        cal_targets(L, R, K, temps[ti], mode, iters, q);
+        double H = 0, pm = 0, agree = 0, ce_same = 0; memset(bar, 0, (size_t)K * sizeof *bar); memset(seen, 0, K); int distinct = 0;
+        for (int r = 0; r < R; r++) {
+            const float *o = q + (size_t)r * K; double h = 0, mx = 0; int a = 0;
+            for (int k = 0; k < K; k++) { const double p = o[k]; if (p > 0) h -= p * log(p); if (p > mx) { mx = p; a = k; } bar[k] += p / R; }
+            H += h / R; pm += mx / R; am[r] = a; if (!seen[a]) { seen[a] = 1; distinct++; }
+        }
+        for (int i = 0; i < R / 2; i++) {
+            agree += am[2 * i] == am[2 * i + 1];
+            const float *a = q + (size_t)(2 * i) * K, *b = q + (size_t)(2 * i + 1) * K; double ce = 0;
+            for (int k = 0; k < K; k++) if (a[k] > 0) ce -= a[k] * log(fmax(b[k], 1e-30));
+            ce_same += ce;
+        }
+        double Hb = 0; for (int k = 0; k < K; k++) if (bar[k] > 0) Hb -= bar[k] * log(bar[k]);
+        fprintf(stderr, "  t %.3f %-8s H(t) %.3f (%.3f of ln K, exp H %.0f)  pmax %.4f  H(batch mean) %.3f  distinct argmax %d / %d  A-B argmax agree %.3f  CE(A->B) %.3f\n",
+                temps[ti], mn[mode], H, H / log((double)K), exp(H), pm, Hb, distinct, R, agree / (R / 2), ce_same / (R / 2));
+    }
+    /* unit bottleneck: per-dimension std, same (A-B) vs other cosines */
+    { double *mu = calloc(B, sizeof *mu), *va = calloc(B, sizeof *va), *sd = malloc(B * sizeof *sd);
+      for (int r = 0; r < R; r++) for (int b = 0; b < B; b++) mu[b] += zn[(size_t)r * B + b] / R;
+      for (int r = 0; r < R; r++) for (int b = 0; b < B; b++) { const double d = zn[(size_t)r * B + b] - mu[b]; va[b] += d * d / R; }
+      double sm = 0, mn2 = 1e30; for (int b = 0; b < B; b++) { sd[b] = sqrt(va[b]); sm += sd[b] / B; mn2 = fmin(mn2, sd[b]); }
+      for (int i = 1; i < B; i++) { const double k = sd[i]; int j = i - 1; while (j >= 0 && sd[j] > k) { sd[j + 1] = sd[j]; j--; } sd[j + 1] = k; }
+      double cs = 0, co = 0; long no = 0;
+      for (int i = 0; i < R / 2; i++) { double d = 0; for (int b = 0; b < B; b++) d += zn[(size_t)(2 * i) * B + b] * zn[(size_t)(2 * i + 1) * B + b]; cs += d / (R / 2); }
+      for (int r = 0; r < R; r++) for (int s = r + 1; s < R; s += 7) { if (r / same_group == s / same_group) continue; double d = 0; for (int b = 0; b < B; b++) d += zn[(size_t)r * B + b] * zn[(size_t)s * B + b]; co += d; no++; }
+      double mun = 0; for (int b = 0; b < B; b++) mun += mu[b] * mu[b];
+      fprintf(stderr, "  bottleneck z (unit, %d dims): std per dim mean %.4f min %.4f median %.4f (1/sqrt(B) = %.4f), |batch mean| %.4f, cos same %.4f other %.4f\n",
+              B, sm, mn2, sd[B / 2], 1 / sqrt((double)B), sqrt(mun), cs, no ? co / no : 0);
+      free(mu); free(va); free(sd); }
+    free(q); free(bar); free(am); free(seen);
+}
+int cmd_dinovol_calib(int argc, char **argv) {
+    const char *ck = opt(argc, argv, "--ckpt", nullptr), *sj = opt(argc, argv, "--sources", nullptr);
+    if (!ck || !sj) {
+        fprintf(stderr, "usage: ufsm dinovol-calib --ckpt teacher_step_640000.pt --sources SOURCES.json [--crops 128] [--tile 128] [--tokens 4] [--shift 32]\n"
+                        "         [--temps 0.04,0.07] [--sk-iters 3] [--seed 1] [--max-sources 0] [--gpu 0] [--gpu-mem 9] [--threads 8]\n"
+                        "  the upstream dinovol teacher's DINO (CLS) and iBOT (token) heads on crop pairs of our data: H(t), pmax, usage, A-B agreement\n");
+        return 2;
+    }
+    if (xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
+    xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "9")) * 1e9));
+    const int N = atoi(opt(argc, argv, "--crops", "128")), T = atoi(opt(argc, argv, "--tile", "128")), NT = atoi(opt(argc, argv, "--tokens", "4"));
+    const int SH = atoi(opt(argc, argv, "--shift", "32")) / 8 * 8, iters = atoi(opt(argc, argv, "--sk-iters", "3")), nth = atoi(opt(argc, argv, "--threads", "8"));
+    const int maxs = atoi(opt(argc, argv, "--max-sources", "0"));
+    double temps[8]; int nt = 0;
+    { char *s = strdup(opt(argc, argv, "--temps", "0.04,0.07")); for (char *t = strtok(s, ","); t && nt < 8; t = strtok(nullptr, ",")) temps[nt++] = atof(t); free(s); }
+    uint64_t rs = (uint64_t)atoll(opt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 1;
+    if (T % 16 || N < 2 || NT < 1) { fprintf(stderr, "dinovol-calib: tile %% 16, crops >= 2, tokens >= 1\n"); return 2; }
+    size_t jn = 0; char *jt = read_file(sj, &jn); json *J = jt ? json_parse(jt, jn) : nullptr; free(jt);
+    const json *srcs = J ? json_get(J, "sources") : nullptr;
+    if (!srcs || srcs->type != J_ARR || !srcs->n) { fprintf(stderr, "dinovol-calib: cannot read sources from %s\n", sj); return 1; }
+    /* open the sources */
+    int ns = 0; z3 **cts = calloc(srcs->n, sizeof *cts); int64_t (*boxes)[64][6] = calloc(srcs->n, sizeof *boxes); int *nbox = calloc(srcs->n, sizeof *nbox); const char **names = calloc(srcs->n, sizeof *names);
+    for (size_t i = 0; i < srcs->n && (!maxs || ns < maxs); i++) {
+        const json *s = json_at(srcs, i);
+        const char *root = json_str(json_get(s, "root"), nullptr), *ct = json_str(json_get(s, "ct"), nullptr);
+        if (!root || !ct) continue;
+        char ctk[1024]; snprintf(ctk, sizeof ctk, "%s", ct);
+        if (json_get(s, "min_level")) snprintf(ctk, sizeof ctk, "%s/%d", ct, (int)json_num(json_get(s, "min_level"), 0));
+        store *st = store_open(root); z3 *z = st ? z3_open(st, ctk, json_str(json_get(s, "cache"), nullptr)) : nullptr;
+        if (!z) { fprintf(stderr, "dinovol-calib: skipping %s (cannot open)\n", json_str(json_get(s, "name"), ctk)); continue; }
+        const z3_meta *m = z3_meta_of(z); const json *bx = json_get(s, "boxes"); int nb = 0;
+        if (bx && bx->type == J_ARR) for (size_t k = 0; k < bx->n && nb < 64; k++) {
+            const json *b = json_at(bx, k); int64_t v[6]; int ok = b && b->type == J_ARR && b->n == 6;
+            for (int d = 0; ok && d < 6; d++) v[d] = (int64_t)json_num(json_at(b, d), 0);
+            if (ok && v[3] >= T + 2 * SH && v[4] >= T + 2 * SH && v[5] >= T + 2 * SH) { memcpy(boxes[ns][nb], v, sizeof v); nb++; }
+        }
+        if (!nb && m->shape[0] >= T + 2 * SH && m->shape[1] >= T + 2 * SH && m->shape[2] >= T + 2 * SH) { for (int d = 0; d < 3; d++) { boxes[ns][0][d] = 0; boxes[ns][0][3 + d] = m->shape[d]; } nb = 1; }
+        if (!nb) { z3_close(z); continue; }
+        cts[ns] = z; nbox[ns] = nb; names[ns] = json_str(json_get(s, "name"), ctk); ns++;
+    }
+    if (!ns) { fprintf(stderr, "dinovol-calib: no usable source\n"); return 1; }
+    /* draw the crop pairs: source round robin, view A >= 50% nonzero voxels, view B = A + shift (multiples of 8, |s| <= SH per axis) */
+    const size_t V = (size_t)T * T * T; uint8_t *crops = malloc(2 * (size_t)N * V); int *src = malloc(N * sizeof *src);
+    int64_t (*org)[2][3] = malloc(N * sizeof *org);
+    const double t0 = dv_now();
+    for (int i = 0; i < N; i++) {
+        const int s = i % ns; src[i] = s; int got = 0;
+        for (int tries = 0; tries < 60 && !got; tries++) {
+            const int64_t *b = boxes[s][(int)(ev_unif(&rs) * nbox[s])];
+            int64_t o[3], o2[3];
+            for (int d = 0; d < 3; d++) {
+                o[d] = b[d] + SH + (int64_t)(ev_unif(&rs) * (double)(b[3 + d] - T - 2 * SH + 1));
+                o2[d] = o[d] + 8 * ((int64_t)(ev_unif(&rs) * (2 * SH / 8 + 1)) - SH / 8);
+            }
+            const int64_t n3[3] = {T, T, T}; uint8_t *a = crops + 2 * (size_t)i * V;
+            if (z3_read(cts[s], o, n3, a, nth)) { fprintf(stderr, "dinovol-calib: read: %s\n", z3_error()); return 1; }
+            size_t nz = 0; for (size_t k = 0; k < V; k++) nz += a[k] != 0;
+            if (nz * 2 < V) continue;
+            if (z3_read(cts[s], o2, n3, a + V, nth)) { fprintf(stderr, "dinovol-calib: read: %s\n", z3_error()); return 1; }
+            memcpy(org[i][0], o, sizeof o); memcpy(org[i][1], o2, sizeof o2); got = 1;
+        }
+        if (!got) { fprintf(stderr, "dinovol-calib: %s: no crop with >= 50%% nonzero voxels in 60 tries\n", names[s]); return 1; }
+    }
+    fprintf(stderr, "dinovol-calib: %d crop pairs of %d^3 from %d sources (%.1f s)\n", N, T, ns, dv_now() - t0);
+    /* per-source robust normalisation from the pooled histogram of its crops */
+    dv_stats *SS = calloc(ns, sizeof *SS);
+    for (int s = 0; s < ns; s++) {
+        int64_t *hist = calloc(256, sizeof *hist);
+        for (int i = 0; i < N; i++) if (src[i] == s) for (size_t k = 0; k < 2 * V; k++) hist[crops[2 * (size_t)i * V + k]]++;
+        hist[0] = 0; if (stats_from_hist(hist, 256, &SS[s])) { fprintf(stderr, "dinovol-calib: %s: empty histogram\n", names[s]); return 1; }
+        fprintf(stderr, "  %-40s median %.2f scale %.2f p99 %.2f\n", names[s], SS[s].median, SS[s].scale, SS[s].p99);
+        free(hist);
+    }
+    /* the teacher: CLS rows [2N][E] and token rows [2N NT][E] (the same NT cells in A and B: cell g of B = cell g + shift / 8 of A) */
+    dv_net *net = dv_load(ck); if (!net) return 1;
+    const int E = dv_embed_dim(net), G = T / dv_patch(net);
+    float *cls = malloc((size_t)2 * N * E * 4), *tok = malloc((size_t)2 * N * NT * E * 4);
+    uint16_t *th = malloc((size_t)G * G * G * E * 2), ch[1024];
+    uint8_t *ud = xmalloc_dev(V);
+    const double t1 = dv_now();
+    for (int i = 0; i < N; i++) {
+        int ca[64][3]; const int64_t *oa = org[i][0], *ob = org[i][1]; int sc[3];
+        for (int d = 0; d < 3; d++) sc[d] = (int)((oa[d] - ob[d]) / 8);   /* cell g of A = cell g + sc of B */
+        for (int k = 0; k < NT && k < 64; k++) for (int d = 0; d < 3; d++) {
+            const int lo = sc[d] < 0 ? -sc[d] : 0, hi = G - (sc[d] > 0 ? sc[d] : 0);   /* g in [lo, hi): g + sc inside B */
+            ca[k][d] = lo + (int)(ev_unif(&rs) * (hi - lo));
+        }
+        for (int v = 0; v < 2; v++) {
+            xh2d(ud, crops + (2 * (size_t)i + v) * V, V);
+            if (dv_forward(net, ud, T, (float)SS[src[i]].median, (float)SS[src[i]].scale, (float)SS[src[i]].p99)) return 1;
+            xd2h(ch, dv_cls(net), (size_t)E * 2); for (int e = 0; e < E; e++) cls[((size_t)2 * i + v) * E + e] = h2f(ch[e]);
+            xd2h(th, dv_tokens(net), (size_t)G * G * G * E * 2);
+            for (int k = 0; k < NT && k < 64; k++) {
+                const int g0 = ca[k][0] + (v ? sc[0] : 0), g1 = ca[k][1] + (v ? sc[1] : 0), g2 = ca[k][2] + (v ? sc[2] : 0);
+                const uint16_t *t = th + (((size_t)g0 * G + g1) * G + g2) * E;
+                float *o = tok + (((size_t)2 * i * NT + 2 * k + v)) * E;   /* pairs (A, B) adjacent */
+                for (int e = 0; e < E; e++) o[e] = h2f(t[e]);
+            }
+        }
+    }
+    xfree_dev(ud); free(th);
+    fprintf(stderr, "dinovol-calib: teacher forward of %d views (%.1f s)\n", 2 * N, dv_now() - t1);
+    { double cs = 0, co = 0; long no = 0;
+      for (int r = 0; r < 2 * N; r++) for (int s = r + 1; s < 2 * N; s++) {
+          double d = 0, a = 0, b = 0; for (int e = 0; e < E; e++) { d += cls[(size_t)r * E + e] * cls[(size_t)s * E + e]; a += cls[(size_t)r * E + e] * cls[(size_t)r * E + e]; b += cls[(size_t)s * E + e] * cls[(size_t)s * E + e]; }
+          const double c = d / sqrt(a * b + 1e-30); if (r / 2 == s / 2) cs += c; else { co += c; no++; } }
+      fprintf(stderr, "backbone CLS (normed, %d dims): cos same %.4f other %.4f\n", E, cs / N, co / no); }
+    cal_head hd, hi; if (cal_head_load(&hd, ck, "dino_head") || cal_head_load(&hi, ck, "ibot_head")) return 1;
+    {   float *L = malloc((size_t)2 * N * hd.h.K * 4), *zn = malloc((size_t)2 * N * hd.h.B * 4);
+        if (cal_head_run(&hd, cls, 2 * N, L, zn)) return 1;
+        cal_report("DINO head on the CLS", L, zn, 2 * N, hd.h.K, hd.h.B, temps, nt, iters, 2);
+        free(L); free(zn); }
+    if (opt(argc, argv, "--dump-tokens", nullptr)) { FILE *f = fopen(opt(argc, argv, "--dump-tokens", ""), "wb"); if (f) { fwrite(tok, 4, (size_t)2 * N * NT * E, f); fclose(f); }
+        fprintf(stderr, "dinovol-calib: %d token rows x %d written\n", 2 * N * NT, E); }
+    {   const int R = 2 * N * NT; float *L = malloc((size_t)R * hi.h.K * 4), *zn = malloc((size_t)R * hi.h.B * 4);
+        if (cal_head_run(&hi, tok, R, L, zn)) return 1;
+        cal_report("iBOT head on patch tokens", L, zn, R, hi.h.K, hi.h.B, temps, nt, iters, 2 * NT);
+        free(L); free(zn); }
+    return 0;
+}
+
+
+/* ---- ufsm dino-headfit (debug): can our iBOT student head fit a FIXED batch of dinovol iBOT targets? Teacher targets: softmax(dinovol
+   ibot_head(tokens) / tt) of dinovol-calib --dump-tokens rows; student: the SSL batch's iBOT head (32 inputs -> 2048 -> 2048 -> 256, last
+   layer = dinovol's prototypes, frozen), AdamW on the MLP; inputs: --input random (fixed random unit vectors: memorisation) or proj (a fixed
+   random projection of the teacher's own token to 32 dims, unit-normed: the information is there). Prints CE (vs the targets' entropy and
+   ln K), student H / pmax, z cos-other every --every steps. ---- */
+int cmd_dino_headfit(int argc, char **argv) {
+    const char *ck = opt(argc, argv, "--ckpt", nullptr), *tf = opt(argc, argv, "--tokens", nullptr);
+    if (!ck || !tf) { fprintf(stderr, "usage: ufsm dino-headfit --ckpt PT --tokens ROWS.f32 [--rows 256] [--input random|proj] [--steps 300] [--lr 1e-3] [--wd 0.04] [--tt 0.04] [--ts 0.1] [--train-last 0] [--gpu 0]\n"); return 2; }
+    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
+    dr_head T; float *Th = nullptr; if (dv_head_host(ck, "ibot_head", &T, &Th)) return 1;
+    size_t nb = 0; float *tok = read_file(tf, &nb); if (!tok) { fprintf(stderr, "cannot read %s\n", tf); return 1; }
+    const int E = T.Cin, Rall = (int)(nb / 4 / E), R = atoi(opt(argc, argv, "--rows", "256")) < Rall ? atoi(opt(argc, argv, "--rows", "256")) : Rall, K = T.K, B = T.B;
+    const int steps = atoi(opt(argc, argv, "--steps", "300")), every = atoi(opt(argc, argv, "--every", "20")), proj = !strcmp(opt(argc, argv, "--input", "proj"), "proj"), trl = atoi(opt(argc, argv, "--train-last", "0"));
+    const float lr = (float)atof(opt(argc, argv, "--lr", "1e-3")), wd = (float)atof(opt(argc, argv, "--wd", "0.04")), tt = (float)atof(opt(argc, argv, "--tt", "0.04")), ts = (float)atof(opt(argc, argv, "--ts", "0.1"));
+    /* teacher targets */
+    float *TP = nn_malloc(T.n * 4); nn_h2d(TP, Th, T.n * 4);
+    float *xt = nn_malloc((size_t)R * E * 4); nn_h2d(xt, tok, (size_t)R * E * 4);
+    void *tw = nn_malloc(dr_hws_bytes(&T, R)); dr_hws twp; dr_hws_carve(&twp, &T, R, tw);
+    float *tl = nn_malloc((size_t)R * K * 4), *q = nn_malloc((size_t)R * K * 4); void *sk = nn_malloc(dr_sk_scratch(R, K));
+    dr_head_fwd(&T, TP, xt, R, tl, &twp); dr_teacher_probs(tl, R, K, tt, 0, nullptr, q, sk);
+    double Hq = 0; { float *qh = malloc((size_t)R * K * 4); nn_d2h(qh, q, (size_t)R * K * 4);
+        for (int r = 0; r < R; r++) for (int k = 0; k < K; k++) { const double v = qh[(size_t)r * K + k]; if (v > 0) Hq -= v * log(v) / R; }
+        double *bar = calloc(K, 8); for (int r = 0; r < R; r++) for (int k = 0; k < K; k++) bar[k] += qh[(size_t)r * K + k] / R;
+        double Hb = 0; for (int k = 0; k < K; k++) if (bar[k] > 0) Hb -= bar[k] * log(bar[k]);
+        fprintf(stderr, "dino-headfit: %d rows, K %d (ln K %.3f), targets t %.3f: mean H %.3f, H(batch mean) %.3f (the CE floor for a constant student)\n", R, K, log((double)K), tt, Hq, Hb);
+        free(qh); free(bar); }
+    /* student inputs [R][32] */
+    float *xs = malloc((size_t)R * 32 * 4); uint64_t rs = 12345;
+    float *Pm = malloc((size_t)32 * E * 4); for (int i = 0; i < 32 * E; i++) Pm[i] = (float)(sqrt(-2 * log(ev_unif(&rs) + 1e-12)) * cos(6.283185307 * ev_unif(&rs)));
+    for (int r = 0; r < R; r++) { double n2 = 0;
+        for (int c = 0; c < 32; c++) { double v = 0; if (proj) for (int e = 0; e < E; e++) v += Pm[(size_t)c * E + e] * tok[(size_t)r * E + e]; else v = sqrt(-2 * log(ev_unif(&rs) + 1e-12)) * cos(6.283185307 * ev_unif(&rs)); xs[(size_t)r * 32 + c] = (float)v; n2 += v * v; }
+        for (int c = 0; c < 32; c++) xs[(size_t)r * 32 + c] /= (float)sqrt(n2 + 1e-30); }
+    float *xsd = nn_malloc((size_t)R * 32 * 4); nn_h2d(xsd, xs, (size_t)R * 32 * 4);
+    /* student head: dn_head_init's init (trunc-normal 0.02 weights, zero biases), last layer = dinovol's */
+    dr_head S; dr_head_layout(&S, 32, T.H, B, K);
+    float *Sh = calloc(S.n, 4); uint64_t r2 = 777;
+    for (size_t i = S.w1; i < S.b1; i++) Sh[i] = (float)(0.02 * sqrt(-2 * log(ev_unif(&r2) + 1e-12)) * cos(6.283185307 * ev_unif(&r2)));
+    for (size_t i = S.w2; i < S.b2; i++) Sh[i] = (float)(0.02 * sqrt(-2 * log(ev_unif(&r2) + 1e-12)) * cos(6.283185307 * ev_unif(&r2)));
+    for (size_t i = S.w3; i < S.b3; i++) Sh[i] = (float)(0.02 * sqrt(-2 * log(ev_unif(&r2) + 1e-12)) * cos(6.283185307 * ev_unif(&r2)));
+    memcpy(Sh + S.v, Th + T.v, (size_t)K * B * 4); memcpy(Sh + S.g, Th + T.g, (size_t)K * 4);
+    float *SP = nn_malloc(S.n * 4), *SG = nn_malloc(S.n * 4), *SM = nn_malloc(S.n * 4), *SV = nn_malloc(S.n * 4); nn_h2d(SP, Sh, S.n * 4); nn_zero(SM, S.n * 4); nn_zero(SV, S.n * 4);
+    void *sw = nn_malloc(dr_hws_bytes(&S, R)); dr_hws swp; dr_hws_carve(&swp, &S, R, sw);
+    float *sl = nn_malloc((size_t)R * K * 4), *dsl = nn_malloc((size_t)R * K * 4), *dx = nn_malloc((size_t)R * 32 * 4), *out = nn_malloc(16);
+    void *cs = nn_malloc(dr_ce_scratch(R)); int *iid = nn_malloc((size_t)R * 4); float *pw = nn_malloc((size_t)R * 4);
+    { int *h = malloc((size_t)R * 4); float *w = malloc((size_t)R * 4); for (int i = 0; i < R; i++) { h[i] = i; w[i] = 1.f / R; } nn_h2d(iid, h, (size_t)R * 4); nn_h2d(pw, w, (size_t)R * 4); free(h); free(w); }
+    float *slh = malloc((size_t)R * K * 4), *znh = malloc((size_t)R * B * 4);
+    for (int step = 1; step <= steps; step++) {
+        nn_zero(SG, S.n * 4);
+        dr_head_fwd(&S, SP, xsd, R, sl, &swp);
+        dr_ce(sl, R, K, ts, q, iid, iid, pw, R, dsl, out, cs);
+        dr_head_bwd(&S, SP, SG, xsd, dsl, R, dx, trl, &swp);
+        dr_adamw(SP, SG, SM, SV, trl ? S.g : S.v, lr, 0.9f, 0.999f, 1e-8f, wd, step);
+        if (step == 1 || step % every == 0 || step == steps) {
+            float L; nn_d2h(&L, out, 4); nn_d2h(slh, sl, (size_t)R * K * 4); nn_d2h(znh, swp.zn, (size_t)R * B * 4);
+            double Hs = 0, pm = 0, co = 0, gn = 0; long no = 0;
+            for (int r = 0; r < R; r++) { const float *l = slh + (size_t)r * K; double mx = -1e30, z = 0, h = 0; for (int k = 0; k < K; k++) mx = fmax(mx, l[k] / ts);
+                for (int k = 0; k < K; k++) z += exp(l[k] / ts - mx);
+                for (int k = 0; k < K; k++) { const double t = exp(l[k] / ts - mx) / z; if (t > 0) h -= t * log(t); } Hs += h / R; pm += 1 / z / R; }
+            for (int a = 0; a < R; a += 3) for (int b = a + 1; b < R; b += 5) { double d = 0; for (int c = 0; c < B; c++) d += znh[(size_t)a * B + c] * znh[(size_t)b * B + c]; co += d; no++; }
+            { float *gh = malloc(S.v * 4); nn_d2h(gh, SG, S.v * 4); for (size_t i = 0; i < S.v; i++) gn += (double)gh[i] * gh[i]; free(gh); }
+            fprintf(stderr, "step %4d CE %.4f (targets H %.3f, H(mean) floor, ln K %.3f) student H %.3f pmax %.5f z cos other %.4f |grad| %.3e\n", step, L, Hq, log((double)K), Hs, pm, no ? co / no : 0, sqrt(gn));
+        }
+    }
+    return 0;
 }

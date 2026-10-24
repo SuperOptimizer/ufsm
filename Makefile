@@ -27,7 +27,7 @@ SRC += src/surf.c src/stitch.c src/coreline.c src/coreline_check.c src/fit_ct.c 
 SRC += src/fblend.c
 SRC += src/render.c src/imgops.c
 SRC += src/repack.c
-SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c src/dino.c
+SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c src/dino.c src/surfeval.c
 SRC += src/inksplat.c
 SRC += src/tfx.c
 SRC += src/fitjoin.c src/fieldsoracle.c src/packmap.c src/scanprep.c
@@ -201,6 +201,8 @@ test-all: $(B)/test_dino_loss
 $(B)/test_attn: tests/test_attn.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_attn.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_attn
+$(B)/bench_attn: tests/bench_attn.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/bench_attn.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_hybrid_identity: tests/test_hybrid_identity.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_hybrid_identity.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_hybrid_identity

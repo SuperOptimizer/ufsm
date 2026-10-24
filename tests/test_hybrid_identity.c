@@ -2,9 +2,11 @@
    - a fresh stage is the identity: a hybrid (2 blocks, PEG, 2 registers) that takes a conv net's trunk (unet_init_from_map) gives
      its logits bit for bit and its trunk gradients up to summation order (relative L2 < 1e-5; gy records off, below);
    - with random out projections (UFSM_ATTN_NONZERO) the stage changes the logits, every stage tensor gets a finite nonzero gradient,
-     and a checkpoint round trip (unet_peek / unet_load) restores the configuration and the logits bit for bit. */
+     and a checkpoint round trip (unet_peek / unet_load) restores the configuration and the logits bit for bit;
+   - unet_set_attn_keep (no recompute in the backward) gives the recomputing backward's gradients, with each attention core. */
 #include "unet.h"
 #include "nn_lp.h"
+#include "attn.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,6 +91,22 @@ int main(void) {
         nn_set_sr_step(100); l = unet_forward(u4, x, xs, 1); float *f = logits_f32(u4, l, nl);
         size_t nd = 0; for (size_t i = 0; i < nl; i++) nd += memcmp(f + i, e + i, 4) != 0;
         printf("warm start: %d layers copied, logits differ in %zu%s\n", n, nd, nd ? "  FAIL" : ""); bad += nd != 0;
+    }
+    {   /* unet_set_attn_keep: the blocks' training forwards kept for the backward (no recompute): the same gradients as the recomputing
+           backward of the random stage (up to atomic summation order), with each attention core */
+        for (int core = 0; core < 3; core++) {
+            at_set_core(core); double ek = 0; float *gk[2];
+            for (int keep = 0; keep < 2; keep++) {
+                unet_set_attn_keep(keep); unet *u5 = unet_create(&pc); unet_load(u5, path);
+                nn_set_sr_step(100); unet_forward(u5, x, xs, 1);
+                nn_h2d(gd, gh, nl * 4); unet_zero_grad(u5); nn_set_sr_step(200); unet_backward(u5, gd);
+                gk[keep] = malloc(n1 * 4); unet_grad_d2h(u5, gk[keep]); unet_free(u5);
+            }
+            unet_set_attn_keep(0); ek = rel_l2(gk[1], gk[0], n1);
+            printf("keep forwards (core %d): gradient rel L2 vs recompute %.2e%s\n", core, ek, ek < 1e-5 ? "" : "  FAIL"); bad += !(ek < 1e-5);
+            free(gk[0]); free(gk[1]);
+        }
+        at_set_core(0);
     }
     unlink(path);
     printf(bad ? "test_hybrid_identity: %d FAILED\n" : "test_hybrid_identity: all passed\n", bad);

@@ -62,6 +62,10 @@ int cmd_wl_dump(int argc, char **argv);
 int cmd_dinovol_embed(int argc, char **argv);   /* src/dinovol.c */
 int cmd_dinovol_eval(int argc, char **argv);
 int cmd_dinovol_read(int argc, char **argv);
+int cmd_dinovol_calib(int argc, char **argv);
+int cmd_dino_headfit(int argc, char **argv);
+int cmd_surf_eval(int argc, char **argv);   /* src/surfeval.c */
+int cmd_dino_seamprobe(int argc, char **argv);   /* src/dino.c */
 int cmd_dino_train(int argc, char **argv);   /* src/dino.c */
 int cmd_dino_embed(int argc, char **argv);
 int cmd_dino_halves(int argc, char **argv);
@@ -126,6 +130,8 @@ static int usage(void) {
         "  ufsm dinovol-embed ROOT KEY OUT --ckpt PT --box z,y,x,nz,ny,nx   scrollprize dinovol tokens / dense / ink embeddings (zarr v3)\n"
         "  ufsm dinovol-read GROUP NAME z,y,x,nz,ny,nx OUT.f32   a region of a dinovol embedding as float32\n"
         "  ufsm dinovol-eval EMB SURF.tifxyz ...   sheet-identity check of the dense embedding along surfaces\n"
+        "  ufsm surf-eval --cases LIST --ckpt PT --out DIR   the upstream kaggle_surfaces frozen-encoder surface decoder evaluation\n"
+        "  ufsm dinovol-calib --ckpt PT --sources S.json   the upstream teacher's DINO / iBOT head entropy and agreement on our crops\n"
         "  ufsm dino-train --sources S.json --out DIR   our dense embedding net from scratch (GT sheet identity + DINO-style SSL)\n"
         "  ufsm dino-embed CKPT ROOT KEY OUT --box ... --norm c,s   a dino-train net over a box (dinovol-eval format)\n"
         "  ufsm halves ROOT KEY-L0 OUT --box ...   two 4x-pooled views of a fine scan from disjoint sub-voxel halves\n"
@@ -3310,8 +3316,12 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "dinovol-embed")) return cmd_dinovol_embed(argc, argv);
     if (!strcmp(cmd, "dinovol-eval")) return cmd_dinovol_eval(argc, argv);
     if (!strcmp(cmd, "dinovol-read")) return cmd_dinovol_read(argc, argv);
+    if (!strcmp(cmd, "dinovol-calib")) return cmd_dinovol_calib(argc, argv);
+    if (!strcmp(cmd, "dino-headfit")) return cmd_dino_headfit(argc, argv);
+    if (!strcmp(cmd, "surf-eval")) return cmd_surf_eval(argc, argv);
     if (!strcmp(cmd, "dino-train")) return cmd_dino_train(argc, argv);
     if (!strcmp(cmd, "dino-embed")) return cmd_dino_embed(argc, argv);
+    if (!strcmp(cmd, "dino-seamprobe")) return cmd_dino_seamprobe(argc, argv);
     if (!strcmp(cmd, "halves")) return cmd_dino_halves(argc, argv);
     if (!strcmp(cmd, "dino-boxes")) return cmd_dino_boxes(argc, argv);
     if (!strcmp(cmd, "tifxyz-map")) return cmd_tifxyz_map(argc, argv);

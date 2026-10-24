@@ -454,6 +454,8 @@ __global__ void k_mask_cells(float *x, int n, int ps, const uint8_t *mask, float
     }
 }
 extern "C" void dr_mask_cells(float *x, int n, int ps, const uint8_t *mask, float val) { k_mask_cells<<<nbk((long long)n * n * n, 256), 256>>>(x, n, ps, mask, val); }
+__global__ void k_f2u8(const float *x, long long n, uint8_t *u) { const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i < n) { const float v = rintf(x[i]); u[i] = (uint8_t)(v < 0.f ? 0.f : v > 255.f ? 255.f : v); } }
+extern "C" void dr_f2u8(const float *x, long long n, uint8_t *u) { k_f2u8<<<nbk(n, 256), 256>>>(x, n, u); }
 
 /* ---- per-row argmax (prototype usage monitor) ---- */
 __global__ void k_argmax_rows(const float *q, int K, int *out) {
@@ -747,3 +749,13 @@ __global__ void k_cols_affine(float *x, int n, const float *m, const float *is) 
 __global__ void k_cols_scale(float *g, int n, const float *is) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) g[i] *= is[i]; }
 extern "C" void dr_cols_affine(float *x, int n, const float *m, const float *is) { k_cols_affine<<<nbk(n, 256), 256>>>(x, n, m, is); }
 extern "C" void dr_cols_scale(float *g, int n, const float *is) { k_cols_scale<<<nbk(n, 256), 256>>>(g, n, is); }
+/* rows of V [K][B] minus their mean row (one block per column) */
+__global__ void k_center_rows(float *V, int K, int B) {
+    const int b = blockIdx.x; float s = 0.f;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) s += V[(size_t)k * B + b];
+    __shared__ float sh[256]; sh[threadIdx.x] = s; __syncthreads();
+    for (int o = 128; o; o >>= 1) { if ((int)threadIdx.x < o) sh[threadIdx.x] += sh[threadIdx.x + o]; __syncthreads(); }
+    const float m = sh[0] / K;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) V[(size_t)k * B + b] -= m;
+}
+extern "C" void dr_center_rows(float *V, int K, int B) { k_center_rows<<<B, 256>>>(V, K, B); }
