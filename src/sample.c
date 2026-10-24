@@ -2519,8 +2519,9 @@ static void pf_mark(uint8_t *bits, const int64_t *ng, const int64_t *lo, const i
         size_t k = ((size_t)z * (size_t)ng[1] + (size_t)y) * (size_t)ng[2] + (size_t)x; bits[k >> 3] |= (uint8_t)(1u << (k & 7));
     }
 }
-int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction) {
-    const int P = 128;   /* training window (level voxels); windows up to this size are covered */
+int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int P, int dry) {
+    if (P < 8) P = 128;   /* training window (level voxels); windows up to this size are covered */
+    size_t all = 0;
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         occ_index o = source_occupancy(s);
@@ -2529,7 +2530,8 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction) {
         for (int l = 0; l < MAXLEV; l++) {
             z3 *ct = source_ct(s, l); if (!ct) continue;
             const z3_meta *m = z3_meta_of(ct);
-            int want_window = l <= maxlev && l >= s->min_level, want_probe = l >= 3 && l - 3 <= maxlev && l - 3 >= s->min_level;   /* probe reads at level l serve training levels l-3 */
+            const int top = s->max_level >= 0 && s->max_level < maxlev ? s->max_level : maxlev;   /* the levels this source trains on */
+            int want_window = l <= top && l >= s->min_level, want_probe = l >= 3 && l - 3 <= top && l - 3 >= s->min_level;   /* probe reads at level l serve training levels l-3 */
             int whole = l >= 4;   /* the occupancy index reads the coarsest level in full at every start: cache it entirely */
             if (!want_window && !want_probe && !whole) continue;
             int64_t ng[3]; for (int d = 0; d < 3; d++) ng[d] = (m->shape[d] + m->chunk[d] - 1) / m->chunk[d];
@@ -2551,6 +2553,8 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction) {
                 pf_mark(bits, ng, lo, hi);
             }
             size_t nmark = 0; for (size_t k = 0; k < total; k++) nmark += (bits[k >> 3] >> (k & 7)) & 1;
+            all += nmark;
+            if (dry) { fprintf(stderr, "prefetch: %s level %d: %zu chunks needed (window %d)\n", s->name, l, nmark, P); free(bits); continue; }
             size_t done = 0, fetched = 0, fail = 0; pthread_t *th = malloc(nthreads * sizeof *th); pf_arg *args = malloc(nthreads * sizeof *args);
             for (int t = 0; t < nthreads; t++) { args[t] = (pf_arg){ct, bits, {ng[0], ng[1], ng[2]}, total * t / nthreads, total * (t + 1) / nthreads, &done, &fetched, &fail}; pthread_create(&th[t], nullptr, pf_worker, &args[t]); }
             size_t last = 0;
@@ -2561,6 +2565,7 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction) {
         }
         free(o.idx);
     }
+    fprintf(stderr, "prefetch: %zu chunks over all sources (window %d)\n", all, P);
     return 0;
 }
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {

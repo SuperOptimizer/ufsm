@@ -126,7 +126,9 @@ typedef struct sampler sampler;
 typedef struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } occ_index;   /* coarse label cells that contain surface */
 occ_index source_occupancy(source *s);
 /* warm the CT chunk cache for the labelled cells of every pyramid source (levels 0..maxlev, a fraction of the cells) */
-int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction);
+/* warm the CT chunk cache around every labelled cell: training windows up to P level voxels at the levels a source trains on
+   (min_level .. min(maxlev, max_level)), their coarse-probe levels (+3) and every level >= 4 in full; dry: count the chunks only */
+int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int P, int dry);
 /* the stored phase interpolated into a window of a 2^shift finer grid (shift >= 2): ph the grid region read (ln[0] x ln[1] x ln[2] codes,
    first voxel lo, PHASE_UNKNOWN outside the array), o the window corner, D x P x P codes out. sample_phase_interp: separable, polynomial
    atan2 (the sampler's path); _ref: 8 neighbours per voxel, atan2f (codes agree but for +-1 at float ties; tests/test_phase_interp.c) */
