@@ -861,7 +861,7 @@ typedef struct {
     /* diag-dv (--ssl-dv-teacher PT): the iBOT targets from the frozen upstream dinovol teacher (its ibot_head over its patch tokens of the
        un-augmented teacher global, at the cell of each mapped point) until --ssl-dv-until (0: always), then from our EMA teacher; the student
        iBOT head predicts dinovol's 131072 prototypes (its last layer initialised from dinovol's and kept frozen) */
-    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; int fixdone, Rfix, hwarm, icos, subps; double zvh_l; long zvh_n; float subp0, subp1, izv; uint8_t *subm, *d_subm; float *zvg; double cosacc; long cosn;
+    dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; long srccnt[DN_MAXSRC]; int pcen; float lsc, lsm, lsv; int ilsc; double lsg; int fixdone, Rfix, hwarm, icos, subps; double zvh_l; long zvh_n; float subp0, subp1, izv; uint8_t *subm, *d_subm; float *zvg; double cosacc; long cosn;
     int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -882,6 +882,12 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
     dn_data *Ds = malloc(sizeof *Ds); *Ds = *Dd; Ds->P = Q->Ps; Ds->ngt = 64; Ds->nair = 0; Ds->nink = 0; Ds->uw = 0; Ds->ikp = 0; Ds->ident = 1;
     Ds->vP = Q->PG; Ds->vPL = Q->PL; Ds->vnloc = Q->NL; Ds->zlo = zlo; Ds->zhi = zhi; Ds->lzlo = lzlo; Ds->lzhi = lzhi;
     Ds->share_u = atof(opt(argc, argv, "--ssl-unlabelled-share", "-1")); Ds->vovl = (float)atof(opt(argc, argv, "--ssl-overlap", "0.5")); Q->Ds = Ds; Ds->xprob = (float)atof(opt(argc, argv, "--ssl-xscan", "0"));
+    {   /* --ssl-weight-pow p: the SSL sampler draws sources by weight^p (1: by voxel weight; 0.5: flatter, the small scans seen more often) */
+        const double wp = atof(opt(argc, argv, "--ssl-weight-pow", "1"));
+        if (wp != 1) { Ds->wsum = Ds->wsum_l = Ds->wsum_u = 0;
+            for (int k = 0; k < Ds->nsrc; k++) { Ds->src[k].weight = pow(Ds->src[k].weight, wp); Ds->wsum += Ds->src[k].weight; if (Ds->src[k].ct_only) Ds->wsum_u += Ds->src[k].weight; else Ds->wsum_l += Ds->src[k].weight; }
+            fprintf(stderr, "dino-train --ssl-weight-pow %g: SSL source weights flattened\n", wp); }
+    }
     dn_ring *R = calloc(1, sizeof *R); R->D = Ds; R->seed = seed * 7 + 1234567; R->nthreads = 2; pthread_mutex_init(&R->mu, nullptr); pthread_cond_init(&R->cv, nullptr);
     R->nslots = 2 * Q->N + 4 < DN_SLOTS ? 2 * Q->N + 4 : DN_SLOTS; const size_t ps3 = (size_t)Q->Ps * Q->Ps * Q->Ps;
     for (int i = 0; i < R->nslots; i++) { dn_sample *S = &R->slot[i]; S->ca = malloc(ps3); S->cb = malloc(ps3); S->gidx = malloc(64 * 4); S->gcode = malloc(64 * 4); S->gxyz = malloc(64 * 12); S->sidx = malloc(4); S->ayx = malloc((size_t)Q->Ps * 8); S->ixyz = malloc(12); }
@@ -957,6 +963,8 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         sscanf(opt(argc, argv, "--ssl-ibot-sub-ratio", "0.3,0.5"), "%f,%f", &Q->subp0, &Q->subp1);
         if (Q->subps > 0) { if (Q->TPS % Q->subps || Q->PG % Q->subps) { fprintf(stderr, "dino-train --ssl-ibot-sub: a divisor of the cell edge %d\n", Q->TPS); return 2; }
             const size_t G2 = (size_t)Q->PG / Q->subps; Q->subm = malloc(G2 * G2 * G2); Q->d_subm = nn_malloc(G2 * G2 * G2); }
+        Q->pcen = atoi(opt(argc, argv, "--ssl-ibot-proto-center", "0"));   /* subtract the mean prototype after every prototype update (the shared-direction drift) */
+        Q->ilsc = atoi(opt(argc, argv, "--ssl-ibot-logit-scale", "0")); Q->lsc = 0.f;   /* a learnable student logit scale exp(lsc) (Adam, lr 1e-2) */
         Q->izv = (float)atof(opt(argc, argv, "--ssl-ibot-zvar", "0"));   /* variance hinge on the student's unit token bottleneck: per-dim std over a view's rows >= 1 / sqrt(B) */
         Q->zvg = nn_malloc((size_t)IM * (HB > 1024 ? HB : 1024) * 4); Q->usei = calloc((size_t)KI, 1);
         if (Q->dv) {   /* the student head's last layer = dinovol's prototypes (frozen); the teacher-side buffers */
@@ -1027,6 +1035,7 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     for (int i = 0; i < N; i++) {
         dn_sample *Sm = ring_get(Q->R); if (!Sm) { fprintf(stderr, "dino-train --ssl-batch: loader failed\n"); return 1; }
         const dn_src *sr = &Q->Ds->src[Sm->si];
+        Q->srccnt[Sm->si]++;
         if (Q->smsi) { Q->smsi[i] = Sm->si; int64_t *hh = Q->dvhist + (size_t)Sm->si * 256; for (size_t v = 0; v < ps3; v += 5) hh[Sm->ca[v]]++;
             if (dv_hist_stats(hh, &Q->dvm[Sm->si], &Q->dvs[Sm->si], &Q->dvh[Sm->si])) { Q->dvm[Sm->si] = sr->center; Q->dvs[Sm->si] = sr->scale; Q->dvh[Sm->si] = 255; } }
         const int xs_ = Q->Ds->xprob > 0 && Sm->xs; if (xs_) nn_h2d(Q->src + (size_t)(N + i) * ps3, Sm->cb, ps3); Q->sums[7] += (double)xs_ / N; if (xs_) { Q->xnccs += Sm->xncc; Q->xnccn++; }
@@ -1061,6 +1070,12 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
         dr_crops(Q->src, Q->Ps, Q->xfd + j, Q->itd + j, 1, n_, x);
         if (CIN == 2) nn_zero(x + n3, n3 * 4);
         if (CIN == 5) { const int i = Q->xfh[j].src; dr_axis_view(Q->xfd, j, n_, Q->Ps, Q->d_ayx + (size_t)i * Q->Ps * 2, hasax[i] && rng_u(&Q->ar) >= Q->adrop, x + n3); }
+    }
+    if (step % 1000 == 0) {   /* the SSL samples drawn per source so far */
+        fprintf(stderr, "ssl sources at step %d:", step); long tot = 0;
+        for (int k = 0; k < Q->Ds->nsrc; k++) { tot += Q->srccnt[k]; if (Q->srccnt[k]) fprintf(stderr, " %s=%ld", Q->Ds->src[k].name, Q->srccnt[k]); }
+        int none = 0; for (int k = 0; k < Q->Ds->nsrc; k++) none += !Q->srccnt[k];
+        fprintf(stderr, " | total %ld, %d of %d sources never drawn\n", tot, none, Q->Ds->nsrc);
     }
     int R = reuse ? Q->Rfix : 0;   /* iBOT: the masked cells per global (block masking), their centres mapped into the partner global */
     if (Q->wib > 0 && !reuse) {
@@ -1255,7 +1270,14 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
                 if (dr_head_bwd(&Q->I.H, Q->I.p, Q->I.g, Q->ieS, nullptr, m, Q->idE, 0, &Q->I.w)) return 1;
                 (void)dza;
             } else {
+            const float esc = Q->ilsc ? expf(Q->lsc) : 1.f;
+            if (Q->ilsc) nn_scale(Q->isl, esc, (size_t)m * Q->KI);
             dr_ce(Q->isl, m, Q->KI, Q->ts, Q->iq + (size_t)Q->off[j] * Q->KI, Q->iid, Q->iid, Q->iw, m, Q->idsl, Q->outs + 6, Q->ice); nn_axpy(Q->outs + 8, 1.f, Q->outs + 6, 1);
+            if (Q->ilsc) {   /* d L / d lsc = sum dl' l' (the scaled logits); the head sees d / d unscaled = esc dl' */
+                const size_t nn_ = (size_t)m * Q->KI; float *a = malloc(nn_ * 4), *b = malloc(nn_ * 4); nn_d2h(a, Q->isl, nn_ * 4); nn_d2h(b, Q->idsl, nn_ * 4);
+                double gsum = 0; for (size_t i = 0; i < nn_; i++) gsum += (double)a[i] * b[i]; Q->lsg += gsum; free(a); free(b);
+                nn_scale(Q->idsl, esc, nn_);
+            }
             if (dr_head_bwd(&Q->I.H, Q->I.p, Q->I.g, Q->ieS, Q->idsl, m, Q->idE, step > Q->freeze && !Q->dv, &Q->I.w)) return 1;
             }
             if (Q->itok) dr_rownorm_bwd(Q->idE, Q->ieS, Q->irsS, m, CT, Q->idE);
@@ -1353,6 +1375,13 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     if (Q->wib > 0) { dn_head *hi = &Q->I; const dr_head *HI = &hi->H;
         dr_adamw(hi->p, hi->g, hi->m, hi->v, HI->v, hlr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
         if (step > Q->freeze && !Q->dv) dr_adamw(hi->p + HI->v, hi->g + HI->v, hi->m + HI->v, hi->v + HI->v, HI->g - HI->v, Q->plr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
+        if (step > Q->freeze && !Q->dv && Q->pcen) dr_center_rows(hi->p + HI->v, HI->K, HI->B);
+        if (Q->ilsc) {   /* the logit scale: Adam on one scalar */
+            const double g_ = Q->lsg; Q->lsg = 0; Q->lsm = 0.9f * Q->lsm + 0.1f * (float)g_; Q->lsv = 0.999f * Q->lsv + 0.001f * (float)(g_ * g_);
+            const float mh = Q->lsm / (1.f - powf(0.9f, (float)step)), vh = Q->lsv / (1.f - powf(0.999f, (float)step)); Q->lsc -= 1e-2f * mh / (sqrtf(vh) + 1e-8f);
+            if (Q->lsc > 3.f) Q->lsc = 3.f;
+            if (Q->lsc < -3.f) Q->lsc = -3.f;
+        }
         dr_ema(hi->pt, hi->p, HI->n, mom); nn_zero(hi->g, HI->n * 4); }
     nn_d2h(Q->hout, Q->outs, 16 * 4); Q->sums[0] += Q->wdino > 0 ? Q->hout[4] / Q->wdino : 0; Q->sums[1] += Q->hout[1]; Q->sums[3] += Q->wib > 0 ? Q->hout[8] / Q->wib : 0; Q->sums[4] += R; Q->nsum++;
     return 0;
@@ -1398,6 +1427,7 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             for (int b = 0; b < Bz; b++) { double mu = 0, v = 0; for (int a = 0; a < m; a++) mu += zn[(size_t)a * Bz + b] / m; for (int a = 0; a < m; a++) v += (zn[(size_t)a * Bz + b] - mu) * (zn[(size_t)a * Bz + b] - mu) / m; sm += sqrt(v) / Bz; }
             for (int a = 0; a < m; a++) for (int c = a + 1; c < m; c++) { double d = 0; for (int b = 0; b < Bz; b++) d += zn[(size_t)a * Bz + b] * zn[(size_t)c * Bz + b]; co += d; no++; }
             size_t l5 = strlen(line);
+            if (Q->ilsc) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | ibot logit scale %.3f", expf(Q->lsc)); l5 = strlen(line); }
             if (Q->zvh_n) { const size_t l7 = strlen(line); snprintf(line + l7, cap - l7, " | ibot zvar hinge %.5f", Q->zvh_l / Q->zvh_n); Q->zvh_l = 0; Q->zvh_n = 0; l5 = strlen(line); }
             if (Q->icos) { const size_t l6 = strlen(line); snprintf(line + l6, cap - l6, " | ibot cos(student, dinovol token) %.4f", Q->cosn ? Q->cosacc / Q->cosn : 0.0); Q->cosacc = 0; Q->cosn = 0; l5 = strlen(line); }
             snprintf(line + l5, cap - l5, " | ibot student feat std/ch %.4f |mean| %.4f H %.2f pmax %.4f tok z std/dim %.4f (1/sqrt(B) %.4f) cos other %.4f%s", fsd, fm, Hs, pms, sm, 1 / sqrt((double)Bz), no ? co / no : 0.0, Q->dv ? (Q->dvuntil <= 0 || step <= Q->dvuntil ? " [dv teacher]" : " [ema teacher]") : "");
@@ -2488,5 +2518,80 @@ int cmd_dino_boxes(int argc, char **argv) {
     }
     printf("\n]\n");
     free(buf); free(bits); z3_close(z); store_close(st);
+    return 0;
+}
+
+/* ufsm dino-seamprobe CKPT SOURCES.json: does the attention stage's token (layer-normed, the iBOT head input) encode the absolute position
+   mod 16 -- the phase of the CT mirror's 16^3 codec blocks (a possible SSL shortcut)? Un-augmented 128^3 crops at random origins of the
+   unlabelled sources; per token cell the phase (origin + cell edge * g) mod 16 per axis as (cos, sin) of 2 pi phase / 16; a ridge regression
+   (closed form, double) fit on the first 3/4 of the crops, R^2 on the rest. A random-init checkpoint is the baseline. */
+int cmd_dino_seamprobe(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm dino-seamprobe CKPT SOURCES.json [--crops 40] [--P 128] [--per-crop 512] [--seed 1] [--gpu 0]\n"); return 2; }
+    const int ncrop = atoi(opt(argc, argv, "--crops", "40")), P = atoi(opt(argc, argv, "--P", "128")), pc = atoi(opt(argc, argv, "--per-crop", "512"));
+    uint64_t rs = (uint64_t)atoll(opt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 3;
+    dn_precision(0);
+    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
+    dn_precision_after_init(0);
+    unet_cfg cfg; int st = 0; if (unet_peek(argv[2], &cfg, &st)) { fprintf(stderr, "seamprobe: cannot read %s\n", argv[2]); return 1; }
+    if (!cfg.attn_blocks) { fprintf(stderr, "seamprobe: the net has no attention stage\n"); return 2; }
+    unet *u = unet_create(&cfg); if (unet_load(u, argv[2]) < 0) return 1;
+    unet_use_params(u, unet_ema_params(u));
+    unet_build(u, (shape5){1, cfg.cin, P, P, P}, 1);
+    size_t jn = 0; char *jt = nullptr; { FILE *f = fopen(argv[3], "rb"); if (!f) return 1; fseek(f, 0, SEEK_END); jn = (size_t)ftell(f); fseek(f, 0, SEEK_SET); jt = malloc(jn + 1); if (fread(jt, 1, jn, f) != jn) return 1; fclose(f); jt[jn] = 0; }
+    json *J = json_parse(jt, jn); const json *srcs = J ? json_get(J, "sources") : nullptr; if (!srcs) return 1;
+    z3 *cts[128]; float cen[128], sca[128]; int ns = 0;
+    for (size_t i = 0; i < srcs->n && ns < 128; i++) {
+        const json *s = json_at(srcs, i); if (!json_get(s, "ct_only")) continue;
+        char key[1024]; snprintf(key, sizeof key, "%s", json_str(json_get(s, "ct"), ""));
+        if (json_get(s, "min_level")) snprintf(key, sizeof key, "%s/%d", json_str(json_get(s, "ct"), ""), (int)json_num(json_get(s, "min_level"), 0));
+        store *sto = store_open(json_str(json_get(s, "root"), "")); z3 *z = sto ? z3_open(sto, key, json_str(json_get(s, "cache"), nullptr)) : nullptr; if (!z) continue;
+        const json *nm = json_get(s, "norm"); cen[ns] = (float)json_num(json_get(nm, "center"), 100); sca[ns] = (float)json_num(json_get(nm, "scale"), 40); cts[ns++] = z;
+    }
+    if (!ns) { fprintf(stderr, "seamprobe: no unlabelled (ct_only) sources\n"); return 1; }
+    const int G = P >> (cfg.nlev - 1), E = P / G, C = cfg.widths[cfg.nlev - 1], D = C + 1, T = 6;
+    const size_t p3 = (size_t)P * P * P; uint8_t *ub = malloc(p3); float *xh = calloc(p3 * cfg.cin, 4), *xd = nn_malloc(p3 * cfg.cin * 4), *tk = malloc((size_t)(G * G * G + 8) * C * 4);
+    double *XtX = calloc((size_t)D * D, 8), *XtY = calloc((size_t)D * T, 8); double *Fte = malloc((size_t)ncrop * pc * D * 8), *Yte = malloc((size_t)ncrop * pc * T * 8); long nte = 0;
+    const int ntr = ncrop * 3 / 4;
+    for (int c = 0; c < ncrop; c++) {
+        const int si = (int)(rng_next(&rs) % (uint64_t)ns); const z3_meta *m = z3_meta_of(cts[si]); int64_t o[3];
+        for (int tries = 0; ; tries++) {
+            for (int d = 0; d < 3; d++) o[d] = (int64_t)(rng_u(&rs) * (double)(m->shape[d] - P));
+            const int64_t n3[3] = {P, P, P}; if (z3_read(cts[si], o, n3, ub, 8)) return 1;
+            size_t nz = 0; for (size_t i = 0; i < p3; i += 11) nz += ub[i] > cen[si]; if (nz * 11 * 10 > p3 || tries > 50) break;   /* >= 10% papyrus */
+        }
+        for (size_t i = 0; i < p3; i++) xh[i] = ((float)ub[i] - cen[si]) / sca[si];
+        nn_h2d(xd, xh, p3 * cfg.cin * 4);
+        unet_forward(u, xd, (shape5){1, cfg.cin, P, P, P}, 1);
+        int S = 0, nreg = 0, Ct = 0; const float *td = unet_tokens(u, nullptr, &S, &Ct, &nreg); if (!td || Ct != C) { fprintf(stderr, "seamprobe: no tokens\n"); return 1; }
+        nn_d2h(tk, td, (size_t)S * C * 4);
+        for (int k = 0; k < pc; k++) {
+            const int g = (int)(rng_next(&rs) % (uint64_t)(G * G * G)), gz = g / (G * G), gy = g / G % G, gx = g % G; const float *row = tk + (size_t)(nreg + g) * C;
+            double f[1025], y[6], mu = 0, v = 0; for (int e = 0; e < C; e++) mu += row[e] / C; for (int e = 0; e < C; e++) v += (row[e] - mu) * (row[e] - mu) / C;
+            for (int e = 0; e < C; e++) f[e] = (row[e] - mu) / sqrt(v + 1e-6); f[C] = 1;   /* (layer-normed, + bias) */
+            const int64_t ph[3] = {(o[0] + (int64_t)E * gz) % 16, (o[1] + (int64_t)E * gy) % 16, (o[2] + (int64_t)E * gx) % 16};
+            for (int d = 0; d < 3; d++) { y[2 * d] = cos(2 * M_PI * ph[d] / 16); y[2 * d + 1] = sin(2 * M_PI * ph[d] / 16); }
+            if (c < ntr) { for (int a = 0; a < D; a++) { for (int b = 0; b < D; b++) XtX[(size_t)a * D + b] += f[a] * f[b]; for (int t = 0; t < T; t++) XtY[(size_t)a * T + t] += f[a] * y[t]; } }
+            else { memcpy(Fte + (size_t)nte * D, f, D * 8); memcpy(Yte + (size_t)nte * T, y, T * 8); nte++; }
+        }
+    }
+    const double lam = atof(opt(argc, argv, "--ridge", "1"));
+    for (int a = 0; a < C; a++) XtX[(size_t)a * D + a] += lam;
+    /* Cholesky solve XtX W = XtY */
+    double *Lc = malloc((size_t)D * D * 8); memcpy(Lc, XtX, (size_t)D * D * 8);
+    for (int j = 0; j < D; j++) { double s = Lc[(size_t)j * D + j]; for (int k = 0; k < j; k++) s -= Lc[(size_t)j * D + k] * Lc[(size_t)j * D + k]; if (s <= 0) s = 1e-12; Lc[(size_t)j * D + j] = sqrt(s);
+        for (int i = j + 1; i < D; i++) { double t = Lc[(size_t)i * D + j]; for (int k = 0; k < j; k++) t -= Lc[(size_t)i * D + k] * Lc[(size_t)j * D + k]; Lc[(size_t)i * D + j] = t / Lc[(size_t)j * D + j]; } }
+    double *W = malloc((size_t)D * T * 8);
+    for (int t = 0; t < T; t++) { double *z = malloc(D * 8);
+        for (int i = 0; i < D; i++) { double s = XtY[(size_t)i * T + t]; for (int k = 0; k < i; k++) s -= Lc[(size_t)i * D + k] * z[k]; z[i] = s / Lc[(size_t)i * D + i]; }
+        for (int i = D - 1; i >= 0; i--) { double s = z[i]; for (int k = i + 1; k < D; k++) s -= Lc[(size_t)k * D + i] * W[(size_t)k * T + t]; W[(size_t)i * T + t] = s / Lc[(size_t)i * D + i]; }
+        free(z); }
+    double r2 = 0; static const char *nm[6] = {"z cos", "z sin", "y cos", "y sin", "x cos", "x sin"};
+    fprintf(stderr, "seamprobe %s: %d crops (%d fit / %d test), %ld test tokens, token edge %d voxels, %d channels\n", argv[2], ncrop, ntr, ncrop - ntr, nte, E, C);
+    for (int t = 0; t < T; t++) {
+        double my = 0, ss = 0, se = 0; for (long r = 0; r < nte; r++) my += Yte[r * T + t] / nte;
+        for (long r = 0; r < nte; r++) { double p = 0; for (int a = 0; a < D; a++) p += Fte[r * D + a] * W[(size_t)a * T + t]; se += (Yte[r * T + t] - p) * (Yte[r * T + t] - p); ss += (Yte[r * T + t] - my) * (Yte[r * T + t] - my); }
+        const double r = ss > 0 ? 1 - se / ss : 0; r2 += r / T; fprintf(stderr, "  %-6s R^2 %.4f\n", nm[t], r);
+    }
+    fprintf(stderr, "seamprobe: mean test R^2 %.4f (0: no phase information; 1: the token encodes the absolute 16-phase)\n", r2);
     return 0;
 }

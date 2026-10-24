@@ -749,3 +749,13 @@ __global__ void k_cols_affine(float *x, int n, const float *m, const float *is) 
 __global__ void k_cols_scale(float *g, int n, const float *is) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) g[i] *= is[i]; }
 extern "C" void dr_cols_affine(float *x, int n, const float *m, const float *is) { k_cols_affine<<<nbk(n, 256), 256>>>(x, n, m, is); }
 extern "C" void dr_cols_scale(float *g, int n, const float *is) { k_cols_scale<<<nbk(n, 256), 256>>>(g, n, is); }
+/* rows of V [K][B] minus their mean row (one block per column) */
+__global__ void k_center_rows(float *V, int K, int B) {
+    const int b = blockIdx.x; float s = 0.f;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) s += V[(size_t)k * B + b];
+    __shared__ float sh[256]; sh[threadIdx.x] = s; __syncthreads();
+    for (int o = 128; o; o >>= 1) { if ((int)threadIdx.x < o) sh[threadIdx.x] += sh[threadIdx.x + o]; __syncthreads(); }
+    const float m = sh[0] / K;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) V[(size_t)k * B + b] -= m;
+}
+extern "C" void dr_center_rows(float *V, int K, int B) { k_center_rows<<<B, 256>>>(V, K, B); }
