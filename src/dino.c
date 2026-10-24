@@ -1438,7 +1438,7 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
 }
 
 static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char **argv, int P, int steps0, double minutes, const char *outd, int nthreads, int nwork, uint64_t seed, int HZ) {
-    if (!cfg->attn_blocks) { fprintf(stderr, "dino-train --recipe: needs the attention stage (--attn-blocks >= 1) for the CLS tokens\n"); return 2; }
+    if (!cfg->attn_blocks) { setenv("UFSM_VIRTUAL_TOKENS", "1", 1); fprintf(stderr, "dino-train --recipe: no attention stage (conv-only): zero CLS tokens (the CLS losses must be off)\n"); }
     const int Ps = Dd->P, ED = atoi(opt(argc, argv, "--dim", "32")), CO = cfg->cout, nloc = atoi(opt(argc, argv, "--locals", "4")), PL = atoi(opt(argc, argv, "--local-P", "96"));
     float zlo = 0.7f, zhi = 1.4f, lzlo = 0.8f, lzhi = 1.25f;
     sscanf(opt(argc, argv, "--zoom", "0.7,1.4"), "%f,%f", &zlo, &zhi); sscanf(opt(argc, argv, "--local-zoom", "0.8,1.25"), "%f,%f", &lzlo, &lzhi);
