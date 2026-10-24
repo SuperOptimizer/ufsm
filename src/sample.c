@@ -2499,12 +2499,13 @@ occ_index source_occupancy(source *s) {
 /* Prefetch the CT chunks that training touches into the chunk cache: for every coarse cell that contains surface,
    at every level the window around the cell (P wide, P/2 random offset, then snapped to the chunk grid) and the coarse
    probe window at level + 3; chunks are collected in a bitmap per level so each is fetched once, without decoding. */
-typedef struct { z3 *ct; uint8_t *bits; int64_t ng[3]; size_t from, to; size_t *done, *fetched, *fail; } pf_arg;
-static void *pf_worker(void *p) {
+typedef struct { z3 *ct; const uint32_t *list; size_t n; int64_t ng[3]; size_t *next, *done, *fetched, *fail; } pf_arg;
+static void *pf_worker(void *p) {   /* the marked chunks, from one shared list: they cluster around the labels, so per-thread index ranges
+                                       left most threads idle (2 MB/s from the mirror at 56 threads) */
     pf_arg *a = p;
-    size_t total = (size_t)a->ng[0] * a->ng[1] * a->ng[2];
-    for (size_t k = a->from; k < a->to && k < total; k++) {
-        if (!(a->bits[k >> 3] & (1u << (k & 7)))) continue;
+    for (;;) {
+        const size_t i = __atomic_fetch_add(a->next, 1, __ATOMIC_RELAXED); if (i >= a->n) break;
+        const size_t k = a->list[i];
         int64_t cz = (int64_t)(k / ((size_t)a->ng[1] * a->ng[2])), cy = (int64_t)((k / (size_t)a->ng[2]) % (size_t)a->ng[1]), cx = (int64_t)(k % (size_t)a->ng[2]);
         int rc = z3_prefetch_chunk(a->ct, cz, cy, cx);
         if (rc < 0) __atomic_fetch_add(a->fail, 1, __ATOMIC_RELAXED); else if (rc > 0) __atomic_fetch_add(a->fetched, 1, __ATOMIC_RELAXED);
@@ -2555,11 +2556,14 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
             size_t nmark = 0; for (size_t k = 0; k < total; k++) nmark += (bits[k >> 3] >> (k & 7)) & 1;
             all += nmark;
             if (dry) { fprintf(stderr, "prefetch: %s level %d: %zu chunks needed (window %d)\n", s->name, l, nmark, P); free(bits); continue; }
-            size_t done = 0, fetched = 0, fail = 0; pthread_t *th = malloc(nthreads * sizeof *th); pf_arg *args = malloc(nthreads * sizeof *args);
-            for (int t = 0; t < nthreads; t++) { args[t] = (pf_arg){ct, bits, {ng[0], ng[1], ng[2]}, total * t / nthreads, total * (t + 1) / nthreads, &done, &fetched, &fail}; pthread_create(&th[t], nullptr, pf_worker, &args[t]); }
+            uint32_t *list = malloc((nmark ? nmark : 1) * sizeof *list); size_t nl = 0;
+            for (size_t k = 0; k < total; k++) if ((bits[k >> 3] >> (k & 7)) & 1) list[nl++] = (uint32_t)k;
+            size_t done = 0, fetched = 0, fail = 0, next = 0; pthread_t *th = malloc(nthreads * sizeof *th); pf_arg *args = malloc(nthreads * sizeof *args);
+            for (int t = 0; t < nthreads; t++) { args[t] = (pf_arg){ct, list, nl, {ng[0], ng[1], ng[2]}, &next, &done, &fetched, &fail}; pthread_create(&th[t], nullptr, pf_worker, &args[t]); }
             size_t last = 0;
             while (last < nmark) { usleep(1000000); last = __atomic_load_n(&done, __ATOMIC_RELAXED); fprintf(stderr, "prefetch: %s level %d: %zu / %zu chunks checked, %zu fetched\r", s->name, l, last, nmark, __atomic_load_n(&fetched, __ATOMIC_RELAXED)); }
             for (int t = 0; t < nthreads; t++) pthread_join(th[t], nullptr);
+            free(list);
             free(th); free(args); free(bits);
             fprintf(stderr, "\nprefetch: %s level %d done (%zu chunks needed, %zu fetched now, %zu failures)\n", s->name, l, nmark, fetched, fail);
         }
