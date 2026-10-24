@@ -195,6 +195,7 @@ static batch alloc_batch(const sample_cfg *c) {
     const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0) + (c->cond ? 3 : 0);   /* input channels per sample (--gpu-input: the CT alone) */
     b.xch = (int)xc;
     b.rad = c->gpu_input ? halloc((size_t)c->B * NN_RAD_REC(PZ(c))) : nullptr;
+    b.axr = c->axis_rec > 0 ? halloc((size_t)c->B * SAMPLE_AXR(PZ(c) > c->P ? PZ(c) : c->P) * sizeof(float)) : nullptr;
     b.x = c->xfmt || c->restore ? nullptr : halloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
     b.x16 = c->xfmt && !c->restore ? halloc((size_t)c->B * xc * p3 * 2) : nullptr;
     b.t = c->pack_tm ? nullptr : halloc((size_t)c->B * (c->restore == 1 ? 1 : NCH) * p3);   /* (task restore: the clean CT alone; real pairs: target + input crop) */
@@ -216,7 +217,7 @@ static batch alloc_batch(const sample_cfg *c) {
     return b;
 }
 
-static void free_batch(batch *b) { if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -615,6 +616,58 @@ static void rad_record(void *rec, const int64_t o[3], int D, int P, int hasax, s
     spatial_aug_tables(a, w); w += 6 * (size_t)P;
     for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { w[3 * i + j] = (float)a->R[i][j]; w[9 + 3 * i + j] = (float)a->A[i][j]; w[18 + 3 * i + j] = (float)a->Ainv[i][j]; }
     w[27] = (float)a->scale;
+}
+/* the scroll-axis record (sample.h SAMPLE_AXR, unet.h UNET_AXR) of a window: the axis points (source z k, cyz[k], cxz[k]) through the
+   inverse symmetry and the warp's forward map into window coordinates; the record's dim ad is the window dim the axis runs along most,
+   its centres per window plane along ad interpolated (extrapolated past the ends) along that polyline */
+static void axis_record(float *r, const int64_t o[3], int D, int P, int hasax, sym y, const float *cyz, const float *cxz, const spatial_aug *a,
+                        int div) {
+    const int warped = a && a->active, se[3] = {D, P, P}, np0 = D > P ? D : P;
+    memset(r, 0, SAMPLE_AXR(np0) * sizeof *r);
+    r[3] = (float)(div > 0 ? div : 1);
+    int ext[3]; for (int d = 0; d < 3; d++) ext[d] = se[y.perm[d]];
+    r[2] = (float)ext[0];
+    if (!hasax || D < 2) return;
+    double (*w)[3] = malloc((size_t)D * sizeof *w);
+    if (!w) abort();
+    for (int k = 0; k < D; k++) {
+        const double v[3] = {k, (double)cyz[k] - (double)o[1], (double)cxz[k] - (double)o[2]};
+        double u[3];
+        for (int d = 0; d < 3; d++) u[d] = y.flip[d] ? se[y.perm[d]] - 1 - v[y.perm[d]] : v[y.perm[d]];
+        if (warped) spatial_aug_forward(a, u, w[k]); else memcpy(w[k], u, sizeof u);
+    }
+    int ad = 0; double best = -1, q[2][3];   /* ad: the window dim nearest the image of the source z direction (not the axis polyline,
+                                                whose in-plane drift may be anything) */
+    for (int e = 0; e < 2; e++) {
+        const double v[3] = {e ? D - 1 : 0, 0.5 * (P - 1), 0.5 * (P - 1)}; double u[3];
+        for (int d = 0; d < 3; d++) u[d] = y.flip[d] ? se[y.perm[d]] - 1 - v[y.perm[d]] : v[y.perm[d]];
+        if (warped) spatial_aug_forward(a, u, q[e]); else memcpy(q[e], u, sizeof u);
+    }
+    for (int d = 0; d < 3; d++) { const double e = fabs(q[1][d] - q[0][d]); if (e > best) { best = e; ad = d; } }
+    const int du = ad == 0 ? 1 : 0, dv = ad == 2 ? 1 : 2, np = ext[ad], dir = w[D - 1][ad] >= w[0][ad] ? 1 : -1;
+    r[0] = (float)ad; r[1] = 1.f; r[2] = (float)np;
+    int k = 0;   /* the polyline segment k..k+1 holding plane t (k walks forward: the planes in the polyline's direction along ad) */
+    for (int i = 0; i < np; i++) {
+        const int t = dir > 0 ? i : np - 1 - i; const double tt = dir > 0 ? t : -(double)t;
+        while (k + 2 < D && (dir > 0 ? w[k + 1][ad] : -w[k + 1][ad]) < tt) k++;
+        const double a0 = w[k][ad], a1 = w[k + 1][ad], f = a1 != a0 ? (t - a0) / (a1 - a0) : 0;
+        r[4 + 2 * t] = (float)(w[k][du] + f * (w[k + 1][du] - w[k][du]));
+        r[5 + 2 * t] = (float)(w[k][dv] + f * (w[k + 1][dv] - w[k][dv]));
+    }
+    free(w);
+}
+void sample_axis_record(float *r, const int64_t o[3], int D, int P, int hasax, const int perm[3], const int flip[3], const float *cyz,
+                        const float *cxz, int div) {
+    sym y; for (int d = 0; d < 3; d++) { y.perm[d] = perm[d]; y.flip[d] = flip[d]; }
+    axis_record(r, o, D, P, hasax, y, cyz, cxz, nullptr, div);
+}
+void sample_axis_record_spatial_test(float *r, const int64_t o[3], int P, int hasax, const int perm[3], const int flip[3], const float *cyz,
+                                     const float *cxz, uint64_t aug_seed, float zoom, int affine) {
+    sym y; for (int d = 0; d < 3; d++) { y.perm[d] = perm[d]; y.flip[d] = flip[d]; }
+    spatial_aug a; spatial_aug_make(&a, aug_seed, P, 10, 1, 1, 1);   /* (as sample_write_spatial_test) */
+    if (zoom > 0 && zoom != 1) spatial_aug_zoom(&a, zoom);
+    if (affine) spatial_aug_affine(&a, aug_seed ^ 0x9e37u, .1, .06);
+    axis_record(r, o, P, P, hasax, y, cyz, cxz, &a, 1);
 }
 int sample_gpu_input_ok(const sample_cfg *c) {
     const int Pz = c->Pz > 0 ? c->Pz : c->P;
@@ -2281,6 +2334,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H,
                  app, noise_state, noise_state ? noise_state + P : nullptr, c->gpu_input);   /* the CT appearance plan in the row-vectorised writer (cubes) */
     if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial);   /* the radial channels: on the device */
+    if (c->axis_rec > 0) axis_record(b->axr + (size_t)i * SAMPLE_AXR(Pz > P ? Pz : P), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial, c->axis_rec);
     free(params);
     if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
         uint8_t *aw = tp_get(p3, 1), *as = tp_get(p3, 0);

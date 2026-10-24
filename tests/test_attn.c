@@ -143,7 +143,7 @@ static int test_block(int nseq, int D, int Hh, int W, int nreg, int C, int F, in
    qkv rows, at_fa_fwd / bwd; the reference attends over the double-normalised rows and dQ / dK are d/d the normalised q / k.
    gs scales dO (the fp16 path's gradient scaling must make the result scale-free) */
 static int test_attn_large(int nseq, int nreg, int D, int C, int core, double gs) {
-    at_geom g = {nseq, nreg + D * D * D, D, D, D}; const int S = g.S, H = C / AT_HD; const long T = (long)nseq * S;
+    at_geom g = {nseq, nreg + D * D * D, D, D, D, nullptr, nullptr, nullptr}; const int S = g.S, H = C / AT_HD; const long T = (long)nseq * S;
     printf("attention (core %d): %d seq x %d tokens, %d heads, dO x %.0e\n", core, nseq, S, H, gs);
     double *qkn = malloc(T * 3 * C * 8), *dO = malloc(T * C * 8), *gn = malloc(2 * C * 8);
     for (long i = 0; i < T * 3 * C; i++) qkn[i] = rf(nrand() * 0.6);
@@ -227,7 +227,7 @@ static void ref_peg(const double *x, double *y, const double *w, const double *b
     }
 }
 static int test_peg(void) {
-    at_geom g = {2, 2 + 3 * 4 * 5, 3, 4, 5}; const int nreg = 2, C = 8; const long T = (long)g.nseq * g.S, n = T * C;
+    at_geom g = {2, 2 + 3 * 4 * 5, 3, 4, 5, nullptr, nullptr, nullptr}; const int nreg = 2, C = 8; const long T = (long)g.nseq * g.S, n = T * C;
     printf("peg: %d seq x %d tokens, C %d\n", g.nseq, g.S, C);
     double *x = malloc(n * 8), *w = malloc(C * 27 * 8), *b = malloc(C * 8), *R = malloc(n * 8), *y = malloc(n * 8);
     for (long i = 0; i < n; i++) { x[i] = rf(nrand()); R[i] = rf(nrand()); }
@@ -305,7 +305,7 @@ static int test_mx_gemm(int bits, int ta, int tb, int M, int N, int K) {
 
 /* the block's output / gradients with MX linears against fp32 (relative L2; fp4 is coarse by design: the gate is a loose bound) */
 static int test_block_mx(int bits, int core, double tol) {   /* bits: the linears (0 fp32), core: the attention core; vs fp32 + core 0 */
-    blk B = {0}; B.d.C = 192; B.d.H = 4; B.d.F = 512; B.d.rope = 0; B.d.nreg = 0; B.d.rope_base = 100.f; B.g = (at_geom){1, 512, 8, 8, 8};
+    blk B = {0}; B.d.C = 192; B.d.H = 4; B.d.F = 512; B.d.rope = 0; B.d.nreg = 0; B.d.rope_base = 100.f; B.g = (at_geom){1, 512, 8, 8, 8, nullptr, nullptr, nullptr};
     const size_t np = at_block_layout(&B.d, &B.bp, 0); const long T = 512; const int C = 192;
     double *P = malloc(np * 8), *x = malloc(T * C * 8), *R = malloc(T * C * 8);
     for (size_t i = 0; i < np; i++) P[i] = rf(0.05 * nrand());

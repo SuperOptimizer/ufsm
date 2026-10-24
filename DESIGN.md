@@ -45,6 +45,28 @@ No teacher models, no distillation. All upstream data is re-exported once into t
   tokens, 2 and 4 heads, with / without RoPE and registers; attention alone at 4100 tokens vs the double analytic backward; PEG and the
   layouts), tests/test_hybrid_identity.c (production MX storage: a fresh stage on a conv net's trunk reproduces its logits / trunk
   gradients up to re-quantisation; a random stage: every stage tensor gets a gradient; checkpoint round trip).
+- Scroll-coordinate attention (2026-10-24, default off: `unet_cfg.attn_axis`, `attn_pe` 3, `attn_repeat`; train `--attn-axis full|radial
+  --attn-pe scroll --attn-repeat K`). Each window carries its scroll-axis record (sample.c axis_record: the axis centre per window plane
+  along the window dim nearest the source z direction, through the cube symmetry and the warp's forward map; predict: the axis rows of
+  the window or its TTA transform; unet_set_attn_axis). The stage averages it onto the bottleneck planes and plans rays (src/nn_attn_ray.cu,
+  host): per plane `UFSM_ATTN_RAY_MULT` (2) x Pmax rays leave the axis centre over the angles that see the plane (all of them when the
+  axis is inside), unit-spaced samples centred on each ray's chord (at most Nr = the plane diagonal + 1). `radial`: each block's q / k / v
+  are gathered onto the ray samples (bilinear, edge-clamped), attention runs per ray (sheet crossings in order; keys past a ray's length
+  masked in the fp32 and fp16 cores; MX-fp8 falls back to fp16), and the output is scattered back normalised (o[v] = sum w o_s / sum w);
+  the backward is the exact adjoint. `scroll` RoPE: rotary on each token's continuous (r, arc = theta x rc, plane index), 16 head dims
+  per axis, on the rays or (full attention) on the grid tokens. `attn_repeat` K runs the blocks K times with the same parameters
+  (gradients summed). Costs (laptop 5080, one block, two forwards + backward, fp16 core, MX-fp4 linears, kept forwards): 16^3 tokens
+  (P512, 6 levels) C 192 full 2.23 ms / radial 1.70-1.76 ms (3.0x ray slots, 35-53 percent used), scratch 96 -> 232 MB; 24^3 (P768,
+  13.8k tokens) 17.3 / 6.5-7.3 ms, 323 -> 767 MB; C 288: 16^3 3.34 / 2.5-2.7 ms, 24^3 26.0 / 9.6-10.5 ms. Grid coverage (tokens some
+  ray sample touches; the rest keep their residual only) 0.998 with the axis inside the window at mult 2, 1.000 outside or at mult 3.
+  Tests: tests/test_attn_ray.c (gather / scatter vs a double stencil and their adjoints; radial and scroll-RoPE blocks vs finite
+  differences of a double forward, cores 0 and 1), tests/test_hybrid_identity.c (fresh radial / scroll / repeated stages are the
+  identity; a tied 1 x 2 stage equals the untied 2-block stage with its gradient the sum; checkpoint keeps the flags),
+  tests/test_gpu_input.c (the records' directions = the radial input channels for every symmetry and slabs, warped within 0.2 rad).
+  The fp16 core's dK / dV kernel zeroes P for masked keys: a padded ray slot (k = 0) scored above very negative valid scores made
+  exp2(s - lse) inf and the masked row's 0 x inf NaN (the k-gain gradients; 14-28 skipped steps per 500 before the fix; test_attn_ray
+  test_masked_keys). Smoke (laptop, unwrap2 wind96 widths, P256, 2 blocks radial + scroll, 500 steps): no non-finite steps, 4.83
+  samples/s vs 4.99 without the stage (~3 percent); P512 one-batch step 1.39 s none / 1.41 full / 1.41 radial.
 - dino-train for large windows: `--head-slab Z` runs the 1^3 head per z-slab of Z planes (unet head slabs): no whole-window logits
   (P 512 at D 32: 8.6 GB of fp16 logits) and no dense fp32 logit gradient (17 GB) -- the points' embeddings are gathered per slab, and
   in the backward's head step their gradients are scattered into each slab's fp16 logit gradient. `--mem lean` sets train's smallest

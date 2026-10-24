@@ -31,6 +31,8 @@ int main(void) {
     unet *u0 = unet_create(&c0); unet_init(u0, 5);
     char path[] = "/tmp/ufsm_test_hybrid_XXXXXX"; int fd = mkstemp(path); if (fd >= 0) close(fd);
     if (unet_save(u0, path, 0, nullptr)) { printf("cannot save\n"); return 1; }
+    char path0[] = "/tmp/ufsm_test_hybrid0_XXXXXX"; { int f0 = mkstemp(path0); if (f0 >= 0) close(f0); }   /* (the conv net, kept: path is reused) */
+    if (unet_save(u0, path0, 0, nullptr)) { printf("cannot save\n"); return 1; }
     unet *u1 = unet_create(&c1); unet_init(u1, 9);
     int rows[16]; for (int i = 0; i < 16; i++) rows[i] = i;
     if (unet_init_from_map(u1, path, rows) < 0) { printf("init_from failed\n"); return 1; }
@@ -108,7 +110,64 @@ int main(void) {
         }
         at_set_core(0);
     }
-    unlink(path);
+    /* the scroll-coordinate stages (attn_axis radial, attn_pe scroll, attn_repeat): an axis record per window (outside the window, drifting
+       along z), then (a) fresh stages are the identity (logits bit for bit, trunk gradients as above), (b) a random tied stage (1 block run
+       twice) equals the untied 2-block stage holding the same block twice: the same logits, and its block gradient is the sum of the two
+       blocks' gradients, (c) the checkpoint keeps the configuration */
+    {
+        float axr[UNET_AXR(32)]; axr[0] = 0; axr[1] = 1; axr[2] = 32; axr[3] = 1;
+        for (int z = 0; z < 32; z++) { axr[4 + 2 * z] = 41.5f - 0.2f * z; axr[5 + 2 * z] = -6.f + 0.15f * z; }
+        struct { int axis, pe, rep; const char *nm; } V[] = {{1, 3, 1, "radial + scroll RoPE"}, {1, 2, 2, "radial, no PE, repeat 2"}, {0, 3, 2, "full + scroll RoPE, repeat 2"}};
+        for (int vi = 0; vi < 3; vi++) {
+            unet_cfg cv = c0; cv.attn_blocks = 2; cv.attn_pe = V[vi].pe; cv.attn_reg = 0; cv.attn_axis = V[vi].axis; cv.attn_repeat = V[vi].rep;
+            unet *uv = unet_create(&cv); unet_init(uv, 21 + vi);
+            if (unet_init_from_map(uv, path0, rows) < 0) { printf("init_from failed\n"); return 1; }
+            unet_set_attn_axis(uv, axr, 1, UNET_AXR(32));
+            lp_set_gyrec_off(1);
+            nn_set_sr_step(100); l = unet_forward(uv, x, xs, 1); float *bv = logits_f32(uv, l, nl);
+            nn_h2d(gd, gh, nl * 4); unet_zero_grad(uv); nn_set_sr_step(200); unet_backward(uv, gd);
+            const size_t nv = unet_nparams(uv); float *gv = malloc(nv * 4); unet_grad_d2h(uv, gv);
+            lp_set_gyrec_off(-1);
+            int Q = 0, Nr = 0; double cov = 0; const int hr = unet_attn_rays(uv, &Q, &Nr, &cov);
+            const double e1 = rel_l2(bv, a, nl), e2 = rel_l2(gv, ga, n0);
+            printf("%s: identity logits rel L2 %.2e, trunk gradient %.2e", V[vi].nm, e1, e2);
+            if (!hr) printf(", %d rays x %d slots, coverage %.3f", Q, Nr, cov);
+            printf("%s\n", e1 < 1e-5 && e2 < 1e-5 ? "" : "  FAIL"); bad += !(e1 < 1e-5 && e2 < 1e-5);
+            free(bv); free(gv); unet_free(uv);
+        }
+        /* (b) tied vs untied, random stage */
+        unet_cfg ct = c0; ct.attn_blocks = 1; ct.attn_pe = 3; ct.attn_axis = 1; ct.attn_repeat = 2;
+        unet_cfg cu = c0; cu.attn_blocks = 2; cu.attn_pe = 3; cu.attn_axis = 1;
+        setenv("UFSM_ATTN_NONZERO", "1", 1);
+        unet *ut = unet_create(&ct); unet_init(ut, 31); unsetenv("UFSM_ATTN_NONZERO");
+        unet *uu = unet_create(&cu); unet_init(uu, 32);
+        const size_t nt = unet_nparams(ut), nu = unet_nparams(uu), nb = nt - n0;
+        float *pt = malloc(nu * 4); nn_d2h(pt, unet_live_params(ut), nt * 4); memcpy(pt + nt, pt + n0, nb * 4);
+        nn_h2d((float *)unet_live_params(uu), pt, nu * 4);
+        unet_set_attn_axis(ut, axr, 1, UNET_AXR(32)); unet_set_attn_axis(uu, axr, 1, UNET_AXR(32));
+        nn_set_sr_step(100); l = unet_forward(ut, x, xs, 1); float *lt = logits_f32(ut, l, nl);
+        nn_h2d(gd, gh, nl * 4); unet_zero_grad(ut); nn_set_sr_step(200); unet_backward(ut, gd); float *gt = malloc(nt * 4); unet_grad_d2h(ut, gt);
+        nn_set_sr_step(100); l = unet_forward(uu, x, xs, 1); float *lu = logits_f32(uu, l, nl);
+        nn_h2d(gd, gh, nl * 4); unet_zero_grad(uu); nn_set_sr_step(200); unet_backward(uu, gd); float *gu = malloc(nu * 4); unet_grad_d2h(uu, gu);
+        size_t nd = 0; for (size_t i = 0; i < nl; i++) nd += memcmp(lt + i, lu + i, 4) != 0;
+        for (size_t i = 0; i < nb; i++) gu[n0 + i] += gu[nt + i];
+        const double eb = rel_l2(gt + n0, gu + n0, nb), etr = rel_l2(gt, gu, n0), dl = rel_l2(lt, a, nl);
+        double sg = 0; int fin = 1; for (size_t i = n0; i < nt; i++) { sg += fabs(gt[i]); fin &= isfinite(gt[i]); }
+        printf("tied (1 block x 2) vs untied (2 equal blocks), radial + scroll: logits differ in %zu (vs the conv net rel L2 %.2e), block gradient vs the sum rel L2 %.2e, trunk %.2e, |block grad| %.2e finite %d%s\n",
+               nd, dl, eb, etr, sg, fin, !nd && dl > 1e-2 && eb < 1e-4 && etr < 1e-4 && sg > 0 && fin ? "" : "  FAIL");
+        bad += !(!nd && dl > 1e-2 && eb < 1e-4 && etr < 1e-4 && sg > 0 && fin);
+        /* (c) checkpoint */
+        if (unet_save(ut, path, 3, nullptr)) { printf("cannot save\n"); return 1; }
+        unet_cfg pc2; int st2; if (unet_peek(path, &pc2, &st2)) { printf("peek failed\n"); return 1; }
+        unet *ul = unet_create(&pc2); unet_load(ul, path); unet_set_attn_axis(ul, axr, 1, UNET_AXR(32));
+        nn_set_sr_step(100); l = unet_forward(ul, x, xs, 1); float *ll = logits_f32(ul, l, nl);
+        size_t nd2 = 0; for (size_t i = 0; i < nl; i++) nd2 += memcmp(ll + i, lt + i, 4) != 0;
+        printf("checkpoint: attn_axis %d attn_pe %d attn_repeat %d, logits differ in %zu%s\n", pc2.attn_axis, pc2.attn_pe, pc2.attn_repeat, nd2,
+               pc2.attn_axis == 1 && pc2.attn_pe == 3 && pc2.attn_repeat == 2 && !nd2 ? "" : "  FAIL");
+        bad += !(pc2.attn_axis == 1 && pc2.attn_pe == 3 && pc2.attn_repeat == 2 && !nd2);
+        free(pt); free(lt); free(gt); free(lu); free(gu); free(ll); unet_free(ut); unet_free(uu); unet_free(ul);
+    }
+    unlink(path); unlink(path0);
     printf(bad ? "test_hybrid_identity: %d FAILED\n" : "test_hybrid_identity: all passed\n", bad);
     return bad != 0;
 }

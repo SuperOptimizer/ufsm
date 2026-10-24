@@ -42,6 +42,8 @@ typedef struct {
     float hl[8]; int hon[8];                    /* --heads: the last batch's loss per head and whether the head had a target */
     float *x; uint8_t *t, *m, *w; /* the buffers of the batch being computed */
     void *radb[2], *rad;         /* --gpu-input: the batch's radial records on the device (nn.h NN_RAD_REC), per buffer / current */
+    float *axh[2]; int axv[2], axn[2], axs[2];   /* --attn-axis radial / --attn-pe scroll: per buffer the batch's scroll-axis records (host copies, sample.h
+                                    SAMPLE_AXR) and whether it has them (restore / slab batches: none) */
     void *ev_up[2], *ev_done[2]; /* upload into buffer i finished; the compute that last used buffer i finished */
     batch *pending;              /* host batch whose upload into buffer (cur ^ 1) is in flight */
     batch *tail_due;             /* upsplit: the host batch whose tail (targets, mask, weights) goes up after the loss fetch */
@@ -218,6 +220,19 @@ static const void *bx(const batch *b) { return g_xfmt ? (const void *)b->x16 : (
    radial record; the network's 4 MX input channels are built on the device (nn_input_rad). g_xs: input channels per sample in the batches */
 static int g_gpu_in, g_xs = 4, g_gpu_want, g_gpu_asked, g_pack;   /* g_pack: --pack-targets (batch.tm, nn_unpack_tm on upload) */
 static size_t rad_bytes(int B) { return g_gpu_in ? (size_t)B * NN_RAD_REC(g_Pz) : 0; }
+/* the attention stage's scroll axis (unet_set_attn_axis): the sampler writes each window's record (sample_cfg.axis_rec) */
+static int g_axr;
+static size_t axr_floats(int P) { return (size_t)SAMPLE_AXR(g_Pz > P ? g_Pz : P); }
+static size_t axr_bytes(int B, int P) { return g_axr ? (size_t)B * axr_floats(P) * sizeof(float) : 0; }
+static void axr_take(gpu_state *d, const batch *b, int i, int B, int P) {
+    if (!g_axr) return;
+    d->axv[i] = b->axr != nullptr;
+    if (!b->axr) return;
+    if (!d->axh[i]) { d->axh[i] = malloc((size_t)B * SAMPLE_AXR(4096) * sizeof(float)); if (!d->axh[i]) abort(); }
+    memcpy(d->axh[i], b->axr, axr_bytes(B, P));
+    d->axn[i] = B; d->axs[i] = (int)axr_floats(P);
+}
+static void axr_set(gpu_state *d, int i) { if (g_axr) unet_set_attn_axis(d->u, d->axv[i] ? d->axh[i] : nullptr, d->axn[i], d->axs[i]); }
 /* once the memory mode is set: the GPU-built input needs the 16-bit -> MX input conversion (unet_input_converted: MX activations with
    MX gradients or an input policy) */
 static void gpu_input_settle(sample_cfg *sc) {
@@ -228,6 +243,7 @@ static void gpu_input_settle(sample_cfg *sc) {
 }
 static void select_buf(gpu_state *d, int i) {
     d->rad = d->radb[i]; if (g_gpu_in) unet_set_input_rad(d->u, d->rad);
+    axr_set(d, i);
     d->cur = i; d->x = d->xb[i]; d->t = d->tb[i]; d->m = d->mb[i]; d->w = d->wb[i]; d->band = d->bandb[i]; d->sdb = d->sideb[i]; d->pm = d->pmb[i]; d->wd = d->wdb[i]; d->pap = d->papb[i]; d->w4 = d->w4b[i]; d->wc = d->wcb[i]; d->um = d->umb[i]; }
 /* --heads: the device target row of host row r (n * NCH + c): a sample's recto target trains its source's head (channel 0, or 1 + head),
    the sheet target channel 1; the other heads' rows keep stale bytes under weight 0 */
@@ -270,6 +286,7 @@ static int val_fields(batch *b, int B, size_t p3, void **f[VAL_NF], size_t sz[VA
     if (g_restore) { VF(b->t, (size_t)B * g_tc * p3); VF(b->w, (size_t)B * NCH); VF(b->src, (size_t)B * sizeof *b->src); VF(b->um, (size_t)B * sizeof *b->um); return n; }   /* (the clean CT alone) */
     if (g_xfmt) VF(b->x16, (size_t)B * g_xs * p3 * 2); else VF(b->x, (size_t)B * g_xs * p3 * 4);
     if (g_gpu_in) VF(b->rad, rad_bytes(B));
+    if (g_axr) VF(b->axr, (size_t)B * SAMPLE_AXR((int)llround(sqrt((double)p3 / g_Pz)) > g_Pz ? (int)llround(sqrt((double)p3 / g_Pz)) : g_Pz) * sizeof(float));
     if (g_pack) VF(b->tm, (size_t)B * p3); else { VF(b->t, (size_t)B * NCH * p3); VF(b->m, (size_t)B * p3); }
     VF(b->w, (size_t)B * NCH); VF(b->src, (size_t)B * sizeof *b->src); VF(b->um, (size_t)B * sizeof *b->um);
     if (g_aff) VF(b->band, (size_t)B * p3);
@@ -341,6 +358,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     d->um = d->umb[d->cur] = b->um ? b->um[0] : 0.f;
     if (b->corner && b->level) { memcpy(d->cornb[d->cur], b->corner[0], sizeof d->cornb[0]); d->lvlb[d->cur] = b->level[0]; }   /* validation copies carry none */
     d->srcb[d->cur] = b->src ? b->src[0] : -1;
+    axr_take(d, b, d->cur, B, P); if (g_restore || d->side >= 0) d->axv[d->cur] = 0; axr_set(d, d->cur);
     if (g_restore) { restore_upload(d, b, d->cur, B, P, 0); return; }
     if (d->side >= 0) { upload_slab(d, b, d->cur, B, P, 0); return; }
     size_t p3 = (size_t)g_Pz * P * P;
@@ -367,6 +385,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     d->umb[i] = b->um ? b->um[0] : 0.f;
     if (b->corner && b->level) { memcpy(d->cornb[i], b->corner[0], sizeof d->cornb[0]); d->lvlb[i] = b->level[0]; }
     d->srcb[i] = b->src ? b->src[0] : -1;
+    axr_take(d, b, i, B, P); if (g_restore || d->side >= 0) d->axv[i] = 0;
     size_t p3 = (size_t)g_Pz * P * P;
     if (d->upsplit) {   /* the head now, after the backward's last read of X2 and the records; the tail with upload_tail */
         nn_stream_wait(1, unet_l0_3buf_head_free(d->u));
@@ -1267,12 +1286,16 @@ int cmd_train(int argc, char **argv) {
     {   /* the bottleneck transformer stage (unet_cfg.attn_*, src/attn.h) */
         cfg.attn_blocks = atoi(opt(argc, argv, "--attn-blocks", "0")); cfg.attn_reg = atoi(opt(argc, argv, "--attn-reg", "0")); cfg.attn_mlp = atoi(opt(argc, argv, "--attn-mlp", "0"));
         const char *pe = opt(argc, argv, "--attn-pe", "peg");
-        cfg.attn_pe = !strcmp(pe, "peg") ? 0 : !strcmp(pe, "rope") ? 1 : !strcmp(pe, "none") ? 2 : -1;
-        if (cfg.attn_pe < 0) { fprintf(stderr, "--attn-pe peg|rope|none\n"); return 2; }
+        cfg.attn_pe = !strcmp(pe, "peg") ? 0 : !strcmp(pe, "rope") ? 1 : !strcmp(pe, "none") ? 2 : !strcmp(pe, "scroll") ? 3 : -1;
+        if (cfg.attn_pe < 0) { fprintf(stderr, "--attn-pe peg|rope|none|scroll\n"); return 2; }
+        const char *ax = opt(argc, argv, "--attn-axis", "full");   /* radial: attention along the rays of the scroll coordinates (unet_cfg.attn_axis) */
+        cfg.attn_axis = !strcmp(ax, "full") ? 0 : !strcmp(ax, "radial") ? 1 : -1;
+        if (cfg.attn_axis < 0) { fprintf(stderr, "--attn-axis full|radial\n"); return 2; }
+        cfg.attn_repeat = atoi(opt(argc, argv, "--attn-repeat", "0"));   /* weight-tied repetitions of the blocks */
     }
     cfg.w4_2d = atoi(opt(argc, argv, "--w4-2d", "0"));   /* consistent fp4 weights (unet_cfg.w4_2d): one scale per 32 x 32 block and tap */
     if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.w4_2d = pc.w4_2d; cfg.down_norm = pc.down_norm; cfg.l0_norm = pc.l0_norm; cfg.l0_slab = pc.l0_slab; cfg.scale_cond = pc.scale_cond; memcpy(cfg.dec_widths, pc.dec_widths, sizeof cfg.dec_widths); cfg.ds_levels = pc.ds_levels; memcpy(cfg.dec_convs, pc.dec_convs, sizeof cfg.dec_convs); memcpy(cfg.enc_blocks, pc.enc_blocks, sizeof cfg.enc_blocks);
-                  cfg.attn_blocks = pc.attn_blocks; cfg.attn_pe = pc.attn_pe; cfg.attn_reg = pc.attn_reg; cfg.attn_mlp = pc.attn_mlp; } }   /* the checkpoint decides */
+                  cfg.attn_blocks = pc.attn_blocks; cfg.attn_pe = pc.attn_pe; cfg.attn_reg = pc.attn_reg; cfg.attn_mlp = pc.attn_mlp; cfg.attn_axis = pc.attn_axis; cfg.attn_repeat = pc.attn_repeat; } }   /* the checkpoint decides */
     if (cfg.w4_2d) fprintf(stderr, "weights: consistent MX-fp4 (--w4-2d 1): one scale per 32 x 32 block and tap, the same values in the forward and backward-data\n");
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,80")); cfg.nlev = 0; for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "P must be divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
@@ -1358,6 +1381,9 @@ int cmd_train(int argc, char **argv) {
     }
     sample_cfg sc = sample_cfg_default();
     sc.P = P; sc.Pz = g_Pz != P ? g_Pz : 0; sc.B = B; sc.nworkers = workers; sc.nbuf = atoi(opt(argc, argv, "--sampler-slots", "0")) > 0 ? atoi(opt(argc, argv, "--sampler-slots", "0")) : 4 * ng + 2;   /* batches in flight (each worker fills one; pinned memory per slot) */ sc.seed = seed; sc.xfmt = g_xfmt;
+    g_axr = cfg.attn_blocks > 0 && (cfg.attn_axis == 1 || cfg.attn_pe == 3); sc.axis_rec = g_axr ? g_hdiv : 0;   /* the scroll axis per window */
+    if (g_axr && split) { fprintf(stderr, "--attn-axis radial / --attn-pe scroll: not with --split z\n"); return 2; }
+    if (g_axr) fprintf(stderr, "attention: %s, %s positions around each window's scroll axis\n", cfg.attn_axis ? "radial (along the rays from the axis)" : "full", cfg.attn_pe == 3 ? "scroll RoPE" : "grid");
     sc.deterministic = atoi(opt(argc, argv, "--det", "0"));   /* same batches for the same seed regardless of thread timing (paired comparisons; off: a slow worker can stall the ring) */
     if (noaug) sc.augment = 0;
     if (atoi(opt(argc, argv, "--rotonly", "0"))) sc.augment = 2;   /* proper rotations only (no reflections) */
@@ -1546,6 +1572,7 @@ int cmd_train(int argc, char **argv) {
     for (int g = 0; g < ng; g++) {
         gpu_state *d = &G[g];
         d->dev = devs[g]; d->side = split ? g : -1;
+        d->axh[0] = d->axh[1] = nullptr; d->axv[0] = d->axv[1] = d->axn[0] = d->axn[1] = d->axs[0] = d->axs[1] = 0;
         if (nn_init(d->dev)) { fprintf(stderr, "cannot select GPU %d\n", d->dev); return 1; }
         d->u = unet_create(&cfg);
         unet_set_l0_ema(d->u, (float)atof(opt(argc, argv, "--l0-mom", "0.01")), atoi(opt(argc, argv, "--l0-warm", "100")));   /* --l0-norm ema */
@@ -2229,6 +2256,7 @@ int cmd_train(int argc, char **argv) {
                     if (g_xfmt) { cp->x16 = malloc((size_t)B * g_xs * p3b * 2); memcpy(cp->x16, b->x16, (size_t)B * g_xs * p3b * 2); }
                     else { cp->x = malloc((size_t)B * g_xs * p3b * 4); memcpy(cp->x, b->x, (size_t)B * g_xs * p3b * 4); }
                     if (g_gpu_in) { cp->rad = malloc(rad_bytes(B)); memcpy(cp->rad, b->rad, rad_bytes(B)); }
+                    if (g_axr) { cp->axr = malloc(axr_bytes(B, P)); memcpy(cp->axr, b->axr, axr_bytes(B, P)); }
                     cp->t = malloc((size_t)B * NCH * p3b); memcpy(cp->t, b->t, (size_t)B * NCH * p3b);
                     cp->m = malloc((size_t)B * p3b); memcpy(cp->m, b->m, (size_t)B * p3b);
                     cp->w = malloc((size_t)B * NCH); memcpy(cp->w, b->w, (size_t)B * NCH);
@@ -2269,6 +2297,7 @@ int cmd_train(int argc, char **argv) {
                 wait += now() - tw;
                 if (!b) { fprintf(stderr, "sampler stopped\n"); g_stop = 1; break; }
                 upload_async(d, b, d->cur, B, P);
+                axr_set(d, d->cur);
                 upload_tail(d, B, P);                          /* (upsplit: its tail too) */
                 d->pending = b;
             }

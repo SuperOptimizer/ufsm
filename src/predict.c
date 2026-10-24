@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+static void pred_axis(unet *u, int valid, int D, const float *dy, const float *dx);
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 /* tile read-ahead: a reader thread fills a ring of CT windows (with their nonzero count and intensity sums) in tile
@@ -403,6 +404,7 @@ static void psplit_job(int side, void *arg) {
         nn_h2d(S->dyd, S->rows, 2 * (size_t)Dl * sizeof(float));
         nn_pred_ctmask(S->ctd, l3, S->ctm);   /* the forward overwrites ctd */
         if (S->ctmi != S->ctm) nn_pred_ctmask_t(S->ctd, l3, S->ctmi, nn_get_pred_iso());   /* --iso: the outputs' mask */
+        pred_axis(S->u, J->ax->n > 0, Dl, S->rows, S->rows + Dl);
         const float *lg = unet_forward_ct(S->u, S->ctd, (float)mean, (float)(1.0 / sd), S->dyd, S->dyd + Dl, J->ax->n > 0 ? J->sign : 0, xs, J->h16);
         nn_set_logits_h16(unet_logits_h16(S->u));   /* (both halves build alike: the process-wide flag holds the same value) */
         if (J->kss > 1) {   /* every shard of this super-shard from the one window */
@@ -426,6 +428,20 @@ static void psplit_job(int side, void *arg) {
     if (J->kss == 1 && cur >= 0 && any) psplit_flush(J, side, sz, sy, sx);
 }
 
+/* the attention stage's scroll axis (unet_cfg.attn_axis radial / attn_pe scroll): the window's axis rows (dy[z] = window origin y - axis
+   centre y at plane z, likewise dx) as the record of unet_set_attn_axis (the axis along window z); g_pax_div: the window voxels per network
+   voxel, 0 when the net takes no axis */
+static int g_pax_div;
+static void pred_axis(unet *u, int valid, int D, const float *dy, const float *dx) {
+    if (g_pax_div <= 0) return;
+    float *r = malloc(UNET_AXR(D) * sizeof *r);
+    if (!r) abort();
+    r[0] = 0.f; r[1] = valid ? 1.f : 0.f; r[2] = (float)D; r[3] = (float)g_pax_div;
+    for (int z = 0; z < D; z++) { r[4 + 2 * z] = -dy[z]; r[5 + 2 * z] = -dx[z]; }
+    unet_set_attn_axis(u, r, 1, UNET_AXR(D));
+    free(r);
+}
+
 /* predict --tta: one augmented pass of a window (src/tta.h): the saved CT window through T into the network's input buffer, the
    mirrored axis rows, the forward, the logits back through T (in place); returns them */
 typedef struct { unet *u; uint8_t *ctd; const uint8_t *ctsave; float mean, isd; const float *dyo, *dxo; float *dyt, *dyd; int axis; shape5 xs; int h16, D, W, nch, ch_normal; } tta_ctx;
@@ -433,6 +449,7 @@ static const float *tta_pass(const tta_ctx *T, int code) {
     nn_tta_ct(T->ctsave, T->ctd, T->D, T->W, code);
     tta_axis(code, T->D, T->W, T->dyo, T->dxo, T->dyt, T->dyt + T->W);
     nn_h2d(T->dyd, T->dyt, 2 * (size_t)T->W * sizeof(float));
+    pred_axis(T->u, T->axis != 0, T->D, T->dyt, T->dyt + T->W);
     const float *lg = unet_forward_ct(T->u, T->ctd, T->mean, T->isd, T->dyd, T->dyd + T->W, T->axis, T->xs, T->h16);
     const int lh = unet_logits_h16(T->u); nn_set_logits_h16(lh);
     int src[32], sgn[32]; tta_channels(code, T->ch_normal, T->nch, src, sgn);
@@ -570,6 +587,7 @@ int cmd_predict(int argc, char **argv) {
     nn_set_nlev(cfg.nlev);   /* layer names of the embedded / requested policy */
     const int half = cfg.half_res, hdiv = unet_hr_div(half), hmode = unet_hr_mode(half), nout = hmode == 2 ? cfg.cout / 8 : cfg.cout;   /* low-resolution
                                                                      network (nn_lowres_*): hdiv window voxels per network voxel; pack has 8 logits per output */
+    g_pax_div = cfg.attn_blocks > 0 && (cfg.attn_axis == 1 || cfg.attn_pe == 3) ? hdiv : 0;
     if (out_ch < 0 || out_ch >= nout) { fprintf(stderr, "predict: --channel %d outside the checkpoint's %d outputs\n", out_ch, nout); return 2; }
     const char *sweep_out = opt(argc, argv, "--cond-sweep", nullptr);   /* train --cond checkpoints: conditioned inference (src/sweep.h) */
     if (sweep_out && (cfg.cin != 7 || cfg.cout < 15 || half || sheet_task || ffd)) { fprintf(stderr, "predict: --cond-sweep needs a train --cond checkpoint (7 inputs, 15 outputs), no --fit-fields\n"); return 2; }
@@ -1183,6 +1201,7 @@ int cmd_predict(int argc, char **argv) {
                 for (int z=0;z<W;z++) { double a[4]; sheet_parameters(sheet,o[0]+z,a); sheet_rows[4*z]=(float)(o[1]-a[0]); sheet_rows[4*z+1]=(float)(o[2]-a[1]); sheet_rows[4*z+2]=(float)(1/a[2]); sheet_rows[4*z+3]=(float)a[3]; }
                 nn_sheet_input(xd,W,sheet_rows,(float)sheet->center,(float)sheet->scale,h16);
             }
+            pred_axis(u, ax.n > 0, Wz, dyo, dxo);
             const float *lg;
             if (half) {   /* the network on blocks of the window: its input from the 4-channel window, its logits back to full resolution */
                 nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);

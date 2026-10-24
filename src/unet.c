@@ -215,8 +215,13 @@ struct unet {
     int tbn; at_dims tbd; at_bp tbp[UNET_MAXTB]; convp tbm[UNET_MAXTB][4]; size_t peg_w, peg_b, reg_off;
     block tb; at_ws tbw; at_geom tbg;
     float *tb_cs, *tb_tok, *tb_wsb, *tb_g, *tb_gx, *tb_dt, *tb_dt2, *tb_zero;
-    float *tb_keep; at_ws tbk[UNET_MAXTB];   /* unet_set_attn_keep: each block's forward tensors of the last training forward (tbk[k], the
-                                                         backward scratch shared with tbw), read by its backward instead of a recompute */
+    float *tb_keep; at_ws tbk[UNET_MAXTA];   /* unet_set_attn_keep: each block application's forward tensors of the last training forward (tbk[a],
+                                                the backward scratch shared with tbw), read by its backward instead of a recompute */
+    int tba;                                 /* block applications: tbn x cfg.attn_repeat (application a runs block a % tbn) */
+    /* cfg.attn_axis 1 / attn_pe 3: the scroll geometry. tb_rb: one device buffer for the ray table, lengths, axis dims, ray positions, the
+       stencil weight sums, the grid tokens' scroll positions and the axis frames (at_rays_plan); the host side of a plan; the axis records */
+    at_rays tbr; float *tb_rb, *tb_rayh, *tb_cenh, *tb_axb, *tb_axh; int *tb_lensh, *tb_adh; int tb_Q, tb_Nt, tb_Nr, tb_axn, tb_axs, tb_axdirty, tb_axwarn;
+    float *tb_gpos; float *tb_cen; long tb_Tr;
     const float *tb_xg;                      /* unet_set_token_grad: extra gradient at the stage output tokens */
 };
 
@@ -303,10 +308,14 @@ unet *unet_create(const unet_cfg *cfg) {
     for (int j = 1; j <= cfg->ds_levels; j++) off = add_conv(u, &u->ds[j], dw_of(cfg, j), cfg->cout, 1, 1, off);   /* (params last: older layouts unchanged) */
     if (cfg->attn_blocks > 0) {   /* the bottleneck transformer stage (params last) */
         const int C = w[L - 1];
-        if (C % AT_HD || cfg->attn_blocks > UNET_MAXTB || cfg->attn_pe < 0 || cfg->attn_pe > 2 || cfg->attn_reg < 0) {
-            fprintf(stderr, "unet: attention blocks need a bottleneck width that is a multiple of %d (got %d), at most %d blocks, --attn-pe peg|rope|none\n", AT_HD, C, UNET_MAXTB); abort(); }
+        const int rep = cfg->attn_repeat > 1 ? cfg->attn_repeat : 1;
+        if (C % AT_HD || cfg->attn_blocks > UNET_MAXTB || cfg->attn_pe < 0 || cfg->attn_pe > 3 || cfg->attn_reg < 0 || cfg->attn_axis < 0 || cfg->attn_axis > 1 ||
+            cfg->attn_blocks * rep > UNET_MAXTA || (cfg->attn_axis == 1 && cfg->attn_reg)) {
+            fprintf(stderr, "unet: attention blocks need a bottleneck width that is a multiple of %d (got %d), at most %d blocks (%d applications with --attn-repeat), "
+                            "--attn-pe peg|rope|none|scroll, --attn-axis full|radial (radial: no registers)\n", AT_HD, C, UNET_MAXTB, UNET_MAXTA); abort(); }
         const int F = cfg->attn_mlp > 0 ? cfg->attn_mlp : (8 * C / 3 + 31) / 32 * 32;
-        u->tbd = (at_dims){C, C / AT_HD, F, cfg->attn_pe == 1, cfg->attn_reg, 100.f};
+        u->tbd = (at_dims){C, C / AT_HD, F, cfg->attn_pe == 1 ? 1 : cfg->attn_pe == 3 ? 2 : 0, cfg->attn_reg, 100.f};
+        u->tba = cfg->attn_blocks * rep;
         if (cfg->attn_pe == 0) { u->peg_w = off; off += (size_t)C * 27; u->peg_b = off; off += (size_t)C; }
         u->reg_off = off; off += (size_t)cfg->attn_reg * C;
         for (int k = 0; k < cfg->attn_blocks; k++) {
@@ -360,6 +369,7 @@ void unet_free(unet *u) {
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
     nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
+    free(u->tb_rayh); free(u->tb_cenh); free(u->tb_lensh); free(u->tb_adh); free(u->tb_axb); free(u->tb_axh);
     free(u);
 }
 
@@ -444,6 +454,9 @@ static float *dalloc(unet *u, size_t n) { u->act_bytes += n * 4; return dmalloc(
 static int g_attn_keep = -1;
 void unet_set_attn_keep(int on) { g_attn_keep = on; }
 static int attn_keep(void) { if (g_attn_keep < 0) g_attn_keep = ufsm_env_on("UFSM_ATTN_KEEP"); return g_attn_keep; }
+/* radial attention: rays per axis-normal plane / the grid's largest dim (env UFSM_ATTN_RAY_MULT, default 2: about 0.7 voxel apart where the
+   axis lies outside the window) */
+static float attn_ray_mult(void) { static float m = 0; if (m <= 0) { const char *e = getenv("UFSM_ATTN_RAY_MULT"); m = e && atof(e) > 0 ? (float)atof(e) : 2.f; } return m; }
 #define ABF (nn_get_tf32() && nn_get_act_bf16())
 #define GBF (ABF && nn_get_grad_bf16())
 static float *dalloc_oom(float *p, size_t b) { if (!p && b) { fprintf(stderr, "unet: out of device memory for a %.2f GB activation buffer\n", b / 1e9); abort(); } return p; }
@@ -686,10 +699,10 @@ static void free_acts(unet *u) {
     }
     if (u->tbn) {   /* attention stage */
         block *b = &u->tb;
-        float *r[16] = {b->a1, b->a2, b->s2, b->m1, b->r1, b->m2, b->r2, u->tb_cs, u->tb_tok, u->tb_wsb, u->tb_zero, u->tb_g, u->tb_gx, u->tb_dt, u->tb_dt2, u->tb_keep};
-        free_once(r, 16);
+        float *r[17] = {b->a1, b->a2, b->s2, b->m1, b->r1, b->m2, b->r2, u->tb_cs, u->tb_tok, u->tb_wsb, u->tb_zero, u->tb_g, u->tb_gx, u->tb_dt, u->tb_dt2, u->tb_keep, u->tb_rb};
+        free_once(r, 17);
         b->a1 = b->a2 = b->s2 = b->m1 = b->r1 = b->m2 = b->r2 = nullptr;
-        u->tb_cs = u->tb_tok = u->tb_wsb = u->tb_zero = u->tb_g = u->tb_gx = u->tb_dt = u->tb_dt2 = u->tb_keep = nullptr;
+        u->tb_cs = u->tb_tok = u->tb_wsb = u->tb_zero = u->tb_g = u->tb_gx = u->tb_dt = u->tb_dt2 = u->tb_keep = u->tb_rb = nullptr;
     }
     pp[np++] = u->logits; pp[np++] = u->conv_scratch; pp[np++] = u->rc_extra;
     if (u->rc_extra && !g_dry) nn_storage_forget(u->rc_extra);
@@ -1048,16 +1061,38 @@ static void build_acts(unet *u, shape5 xs, int train) {
         shape5 y = u->ls[L - 1]; y.c = w[L - 1];
         build_block_acts(u, &u->tb, y, train, 1, nullptr, nullptr, nullptr);
         const long Sg = (long)shape_spatial(y), T = (long)y.n * (Sg + u->cfg.attn_reg); const int C = w[L - 1];
-        u->tbg = (at_geom){y.n, (int)(Sg + u->cfg.attn_reg), y.d, y.h, y.w};
+        u->tbg = (at_geom){y.n, (int)(Sg + u->cfg.attn_reg), y.d, y.h, y.w, nullptr, nullptr, nullptr};
+        long Tr = 0;
+        if (u->cfg.attn_axis == 1 || u->cfg.attn_pe == 3) {   /* the scroll geometry's buffers (tb_geom fills them per forward) */
+            at_rays_dims(y.d, y.h, y.w, attn_ray_mult(), &u->tb_Q, &u->tb_Nt, &u->tb_Nr);
+            const int Pm = y.d > y.h ? (y.d > y.w ? y.d : y.w) : (y.h > y.w ? y.h : y.w);
+            Tr = u->cfg.attn_axis == 1 ? (long)y.n * u->tb_Q * u->tb_Nr : 0;
+            const size_t nq = (size_t)y.n * u->tb_Q, al = 64;
+            const size_t o_ray = 0, o_len = o_ray + (nq * AT_RAY_F + al - 1) / al * al, o_ad = o_len + (nq + al - 1) / al * al, o_pos = o_ad + al,
+                         o_ws = o_pos + ((size_t)Tr * 3 + al - 1) / al * al, o_gp = o_ws + ((size_t)y.n * Sg + al - 1) / al * al,
+                         o_cen = o_gp + ((size_t)T * 3 + al - 1) / al * al, o_end = o_cen + ((size_t)y.n * Pm * 4 + al - 1) / al * al;
+            u->tb_rb = dalloc(u, o_end);
+            u->tbr = (at_rays){y.n, u->tb_Q, u->tb_Nt, u->tb_Nr, y.d, y.h, y.w, (const int *)(u->tb_rb + o_ad), u->tb_rb + o_ray, (const int *)(u->tb_rb + o_len),
+                               u->tb_rb + o_pos, u->tb_rb + o_ws};
+            u->tb_gpos = u->tb_rb + o_gp; u->tb_cen = u->tb_rb + o_cen;
+            free(u->tb_rayh); free(u->tb_cenh); free(u->tb_lensh); free(u->tb_adh); free(u->tb_axb);
+            u->tb_rayh = malloc(nq * AT_RAY_F * sizeof(float)); u->tb_cenh = malloc((size_t)y.n * Pm * 4 * sizeof(float));
+            u->tb_lensh = malloc(nq * sizeof(int)); u->tb_adh = malloc((size_t)y.n * sizeof(int)); u->tb_axb = malloc((size_t)y.n * AT_AXR(Pm) * sizeof(float));
+            if (!u->tb_rayh || !u->tb_cenh || !u->tb_lensh || !u->tb_adh || !u->tb_axb) { fprintf(stderr, "unet: no host memory for the ray plan\n"); abort(); }
+            u->tb_axdirty = 1;
+            if (u->cfg.attn_axis == 1) u->tbg.rays = &u->tbr;
+            else u->tbg.pos = u->tb_gpos;
+        }
+        u->tb_Tr = Tr;
         u->tb_cs = dalloc(u, (size_t)y.n * C * Sg);
-        u->tb_tok = dalloc(u, (size_t)(u->tbn + 2) * T * C);
-        const size_t wsb = at_ws_bytes(&u->tbd, T);
+        u->tb_tok = dalloc(u, (size_t)(u->tba + 2) * T * C);
+        const size_t wsb = at_ws_bytes_r(&u->tbd, T, Tr);
         u->tb_wsb = dalloc(u, wsb / 4 + 1);
-        if (!g_dry) at_ws_carve(&u->tbw, &u->tbd, T, u->tb_wsb);
-        if (train && attn_keep()) {   /* one forward set per block (unet_set_attn_keep) */
-            const size_t fb = at_ws_fwd_bytes(&u->tbd, T) / 4;
-            u->tb_keep = dalloc(u, (size_t)u->tbn * fb + 1);
-            for (int k = 0; k < u->tbn; k++) { u->tbk[k] = u->tbw; if (!g_dry) at_ws_set_fwd(&u->tbk[k], &u->tbd, T, u->tb_keep + (size_t)k * fb); }
+        if (!g_dry) at_ws_carve_r(&u->tbw, &u->tbd, T, Tr, u->tb_wsb);
+        if (train && attn_keep()) {   /* one forward set per block application (unet_set_attn_keep) */
+            const size_t fb = at_ws_fwd_bytes_r(&u->tbd, T, Tr) / 4;
+            u->tb_keep = dalloc(u, (size_t)u->tba * fb + 1);
+            for (int k = 0; k < u->tba; k++) { u->tbk[k] = u->tbw; if (!g_dry) at_ws_set_fwd_r(&u->tbk[k], &u->tbd, T, Tr, u->tb_keep + (size_t)k * fb); }
         }
         u->tb_zero = dalloc(u, (size_t)(u->cfg.attn_reg + 1) * C);
         if (!g_dry) nn_zero(u->tb_zero, (size_t)(u->cfg.attn_reg + 1) * C * 4);
@@ -2156,22 +2191,75 @@ static void tb_from_f32(const float *x, shape5 s, int grad, void *y) {
     else nn_d2d(y, x, shape_numel(s) * 4);
 }
 #define TB_TOK(u, k) ((u)->tb_tok + (size_t)(k) * (size_t)(u)->tbg.nseq * (u)->tbg.S * (u)->tbd.C)
+void unet_set_attn_axis(unet *u, const float *rec, int n, int stride) {
+    if (n <= 0 || stride < 4 || !rec) { u->tb_axn = 0; u->tb_axdirty = 1; return; }
+    if (n * stride > u->tb_axn * u->tb_axs || !u->tb_axh) { free(u->tb_axh); u->tb_axh = malloc((size_t)n * stride * sizeof(float)); if (!u->tb_axh) { fprintf(stderr, "unet: no memory for axis records\n"); abort(); } }
+    memcpy(u->tb_axh, rec, (size_t)n * stride * sizeof(float));
+    u->tb_axn = n; u->tb_axs = stride; u->tb_axdirty = 1;
+}
+/* the scroll geometry of this forward (cfg.attn_axis 1 / attn_pe 3) from the axis records (unet_set_attn_axis): each sample's window
+   axis centres averaged over the window planes of a bottleneck plane, in bottleneck voxels; then the ray plan, its device tables, the
+   ray positions and stencil weight sums (radial) or the grid tokens' scroll positions (full attention) */
+static void tb_geom(unet *u) {
+    if (!u->tb_rb || !u->tb_axdirty) return;
+    const shape5 ys = u->tb.ys; const int n = ys.n, D = ys.d, Hh = ys.h, W = ys.w, Pm = D > Hh ? (D > W ? D : W) : (Hh > W ? Hh : W);
+    const int fp = 1 << (u->cfg.nlev - 1), have = u->tb_axh && u->tb_axn == n;
+    if (!have && !u->tb_axwarn) { fprintf(stderr, "unet: the attention stage has no scroll axis records for %d samples (unet_set_attn_axis): rays along the grid rows\n", n); u->tb_axwarn = 1; }
+    for (int b = 0; b < n; b++) {
+        float *o = u->tb_axb + (size_t)b * AT_AXR(Pm);
+        memset(o, 0, AT_AXR(Pm) * sizeof *o);
+        if (!have) continue;
+        const float *r = u->tb_axh + (size_t)b * u->tb_axs;
+        const int ad = (int)r[0], np = (int)r[2], div = (int)r[3] > 0 ? (int)r[3] : 1, F = div * fp;
+        if (ad < 0 || ad > 2) continue;
+        int Np, Nu, Nv; at_ray_plane(ad, D, Hh, W, &Np, &Nu, &Nv);
+        o[0] = (float)ad;
+        if (r[1] == 0.f || np != Np * F || u->tb_axs < UNET_AXR(np)) continue;
+        o[1] = 1.f;
+        for (int k = 0; k < Np; k++) {
+            double su = 0, sv = 0;
+            for (int z = k * F; z < (k + 1) * F; z++) { su += r[4 + 2 * z]; sv += r[5 + 2 * z]; }
+            o[2 + 2 * k] = (float)((su / F + 0.5) / F - 0.5); o[3 + 2 * k] = (float)((sv / F + 0.5) / F - 0.5);
+        }
+    }
+    at_rays_plan(n, D, Hh, W, attn_ray_mult(), u->tb_axb, u->tb_rayh, u->tb_lensh, u->tb_adh, u->tb_cenh);
+    nn_h2d((void *)u->tbr.ray, u->tb_rayh, (size_t)n * u->tb_Q * AT_RAY_F * sizeof(float));
+    nn_h2d((void *)u->tbr.lens, u->tb_lensh, (size_t)n * u->tb_Q * sizeof(int));
+    nn_h2d((void *)u->tbr.ad, u->tb_adh, (size_t)n * sizeof(int));
+    nn_h2d(u->tb_cen, u->tb_cenh, (size_t)n * Pm * 4 * sizeof(float));
+    if (u->cfg.attn_axis == 1) at_rays_setup(&u->tbr);
+    else at_scroll_pos(n, u->cfg.attn_reg, D, Hh, W, u->tbr.ad, u->tb_cen, u->tb_gpos);
+    u->tb_axdirty = 0;
+}
+int unet_attn_rays(const unet *u, int *Q, int *Nr, double *coverage) {
+    if (!u->tb_rb || u->cfg.attn_axis != 1) return -1;
+    if (Q) *Q = u->tb_Q;
+    if (Nr) *Nr = u->tb_Nr;
+    if (coverage) {
+        const size_t ng = (size_t)u->tbr.n * u->tbr.D * u->tbr.Hh * u->tbr.W; float *w = malloc(ng * sizeof *w); size_t c = 0;
+        nn_sync(); nn_d2h(w, u->tbr.wsum, ng * sizeof *w);
+        for (size_t i = 0; i < ng; i++) c += w[i] > 0.f;
+        *coverage = (double)c / (double)ng; free(w);
+    }
+    return 0;
+}
 /* the bottleneck's raw output x -> PE -> blocks -> tb.a2 (the level's output; GroupNorm statistics of the new tensor) */
 static void tb_fwd(unet *u) {
     const int C = u->tbd.C, nr = u->cfg.attn_reg;
     block *x = stage_out0(u, u->cfg.nlev - 1), *b = &u->tb;
     const shape5 ys = b->ys; const long Sg = (long)shape_spatial(ys), T = (long)ys.n * (Sg + nr);
+    tb_geom(u);
     PROF(4, tb_to_f32(x->a2, ys, 0, u->tb_cs));
     at_cs_to_tok(u->tb_cs, TB_TOK(u, 0), P(u, u->reg_off), ys.n, C, Sg, nr);
     if (u->cfg.attn_pe == 0) at_peg_fwd(TB_TOK(u, 0), TB_TOK(u, 1), P(u, u->peg_w), P(u, u->peg_b), &u->tbg, nr, C);
     else nn_d2d(TB_TOK(u, 1), TB_TOK(u, 0), (size_t)T * C * 4);
-    for (int k = 0; k < u->tbn; k++) {
-        at_ws *ws = u->tb_keep && u->fwd_train ? &u->tbk[k] : &u->tbw;   /* (keep: a training forward fills the block's own set) */
-        int r; PROF(0, r = at_block_fwd(&u->tbd, u->fw, &u->tbp[k], TB_TOK(u, k + 1), TB_TOK(u, k + 2), &u->tbg, ws));
+    for (int k = 0; k < u->tba; k++) {   /* (application k runs block k % tbn: --attn-repeat) */
+        at_ws *ws = u->tb_keep && u->fwd_train ? &u->tbk[k] : &u->tbw;   /* (keep: a training forward fills the application's own set) */
+        int r; PROF(0, r = at_block_fwd(&u->tbd, u->fw, &u->tbp[k % u->tbn], TB_TOK(u, k + 1), TB_TOK(u, k + 2), &u->tbg, ws));
         ws->kept = ws != &u->tbw;
         if (r) { fprintf(stderr, "unet: attention block forward failed\n"); abort(); }
     }
-    at_tok_to_cs(TB_TOK(u, u->tbn + 1), u->tb_cs, ys.n, C, Sg, nr);
+    at_tok_to_cs(TB_TOK(u, u->tba + 1), u->tb_cs, ys.n, C, Sg, nr);
     PROF(4, tb_from_f32(u->tb_cs, ys, 0, b->a2));
     const int G = G_of(u, C);
     if (!gn_frozen(u) && nn_gn_stats(b->a2, ys, G, 1e-5f, b->m2, b->r2)) { fprintf(stderr, "unet: attention stage GroupNorm statistics unsupported for this storage\n"); abort(); }
@@ -2462,7 +2550,7 @@ const float *unet_tokens(const unet *u, int *nseq, int *S, int *C, int *nreg) {
     if (S) { *S = u->tbg.S; }
     if (C) { *C = u->tbd.C; }
     if (nreg) { *nreg = u->cfg.attn_reg; }
-    return TB_TOK(u, u->tbn + 1);
+    return TB_TOK(u, u->tba + 1);
 }
 void unet_set_token_grad(unet *u, const float *g) { u->tb_xg = g; }
 /* d/d (the level output silu(gn(tb.a2))) -> d/d (the bottleneck's raw output x), in the gradient storage (block_bwd's pre = 1 input) */
@@ -2474,9 +2562,9 @@ static float *tb_bwd(unet *u, const float *gy) {
     PROF(4, tb_to_f32(u->tb_g, ys, 1, u->tb_cs));
     at_cs_to_tok(u->tb_cs, u->tb_dt, u->tb_zero, ys.n, C, Sg, nr);
     if (u->tb_xg) nn_axpy(u->tb_dt, 1.f, u->tb_xg, (size_t)ys.n * (Sg + nr) * C);   /* (unet_set_token_grad: e.g. a pooled CLS loss) */
-    for (int k = u->tbn - 1; k >= 0; k--) {
+    for (int k = u->tba - 1; k >= 0; k--) {
         at_ws *ws = u->tb_keep && u->tbk[k].kept ? &u->tbk[k] : &u->tbw;   /* (kept: no recompute) */
-        int r; PROF(1, r = at_block_bwd(&u->tbd, u->fw, g, &u->tbp[k], TB_TOK(u, k + 1), u->tb_dt, &u->tbg, ws));
+        int r; PROF(1, r = at_block_bwd(&u->tbd, u->fw, g, &u->tbp[k % u->tbn], TB_TOK(u, k + 1), u->tb_dt, &u->tbg, ws));
         if (r) { fprintf(stderr, "unet: attention block backward failed\n"); abort(); }
     }
     float *d = u->tb_dt;
@@ -3783,6 +3871,8 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.w4_2d) fprintf(f, ",\"w4_2d\":%d", u->cfg.w4_2d);
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
     if (u->cfg.attn_blocks) fprintf(f, ",\"attn_blocks\":%d,\"attn_pe\":%d,\"attn_reg\":%d,\"attn_mlp\":%d", u->cfg.attn_blocks, u->cfg.attn_pe, u->cfg.attn_reg, u->tbd.F);
+    if (u->cfg.attn_blocks && u->cfg.attn_axis) fprintf(f, ",\"attn_axis\":%d", u->cfg.attn_axis);
+    if (u->cfg.attn_blocks && u->cfg.attn_repeat > 1) fprintf(f, ",\"attn_repeat\":%d", u->cfg.attn_repeat);
     if (u->cfg.l0_norm) fprintf(f, ",\"l0_norm\":%d", u->cfg.l0_norm);
     if (u->cfg.l0_norm == 4) fprintf(f, ",\"l0_slab\":%d", u->cfg.l0_slab);
     if (u->cfg.l0_norm == 2) {   /* the running statistics (live weights, EMA weights; l0_site order, [mean G | var G] each) and their state */
@@ -3836,6 +3926,8 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"attn_pe\":"))) cfg->attn_pe = atoi(p + 10);
     if ((p = strstr(line, "\"attn_reg\":"))) cfg->attn_reg = atoi(p + 11);
     if ((p = strstr(line, "\"attn_mlp\":"))) cfg->attn_mlp = atoi(p + 11);
+    if ((p = strstr(line, "\"attn_axis\":"))) cfg->attn_axis = atoi(p + 12);
+    if ((p = strstr(line, "\"attn_repeat\":"))) cfg->attn_repeat = atoi(p + 14);
     if ((p = strstr(line, "\"dec_convs\":["))) { p += 13; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->dec_convs[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"nparams\":"))) *np = (size_t)atoll(p + 10);
     if ((p = strstr(line, "\"step\":"))) *step = atoi(p + 7);
@@ -4009,7 +4101,7 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
             nn_d2d(arr + a->n2.gamma, arr + u->enc[i].n2.gamma, (size_t)a->n2.c * 4); nn_d2d(arr + a->n2.beta, arr + u->enc[i].n2.beta, (size_t)a->n2.c * 4);
         }
     }
-    if (u->tbn && o->tbn && u->tbd.C == o->tbd.C && u->tbd.F == o->tbd.F && u->cfg.attn_pe == o->cfg.attn_pe) {   /* the attention stage: PEG, registers
+    if (u->tbn && o->tbn && u->tbd.C == o->tbd.C && u->tbd.F == o->tbd.F && (u->cfg.attn_pe == o->cfg.attn_pe || (u->cfg.attn_pe && o->cfg.attn_pe))) {   /* the attention stage: PEG, registers
                                                      (the common count) and the common blocks (the donor's first ones) */
         for (int e = 0; e < 2; e++) {
             float *dst = e ? u->ema : u->p; const float *sp = e ? o->ema : o->p; const size_t C = u->tbd.C;
