@@ -862,6 +862,9 @@ typedef struct {
        un-augmented teacher global, at the cell of each mapped point) until --ssl-dv-until (0: always), then from our EMA teacher; the student
        iBOT head predicts dinovol's 131072 prototypes (its last layer initialised from dinovol's and kept frozen) */
     dv_net *dv; dr_head DVH; float *dvP, *dvx, *dvxd, *dvf; void *dvwb; dr_hws dvw; uint8_t *dvu; dr_int *dvid; double *dvm, *dvs, *dvh; int dvuntil, *smsi, lastm; double xnccs; long xnccn; int64_t *dvhist; long srccnt[DN_MAXSRC]; int pcen; float lsc, lsm, lsv; int ilsc; double lsg; int fixdone, Rfix, hwarm, icos, subps; double zvh_l; long zvh_n; float subp0, subp1, izv; uint8_t *subm, *d_subm; float *zvg; double cosacc; long cosn; float sig; int sigS; double sig_l; long sig_n; float *sigA;
+    /* --ssl-distill W: dense cosine distillation of dinovol's unit 64-d sheet (object) embedding at the mapped points into head channels
+       dch..dch+63 (student: the cell centres of each global; target: dinovol on the partner's un-augmented global at the same physical point) */
+    float dist; int dch, dnd; float *dcrd, *dacc, *dth, *dse, *dsn, *dge, *dch_h, *dacch; double dist_l; long dist_n;
     int itok, nregt, ICIN, *d_tS, *d_tT, *tS, *tT; float ig, *irsS, *irsT;   /* --ssl-ibot-src tok: the iBOT head on the attention stage's tokens (cells = token cells); --ssl-ibot-g */ uint16_t *dvtok;
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
@@ -938,15 +941,18 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         if (Q->wib <= 0 || Q->PG % 16) { fprintf(stderr, "dino-train --ssl-dv-teacher: needs --ssl-ibot > 0 and --ssl-P a multiple of 16\n"); return 2; }
         if (xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
         xnet_set_budget((size_t)(atof(opt(argc, argv, "--ssl-dv-mem", "4")) * 1e9));
-        if (!(Q->dv = dv_load(dvck)) || dv_head_host(dvck, "ibot_head", &Q->DVH, &dvPh)) return 1;
+        Q->dist = (float)atof(opt(argc, argv, "--ssl-distill", "0")); Q->dch = atoi(opt(argc, argv, "--ssl-distill-ch", "0"));
+        if (!(Q->dv = dv_load(dvck)) || (Q->dist <= 0 && dv_head_host(dvck, "ibot_head", &Q->DVH, &dvPh))) return 1;
         Q->icos = !strcmp(opt(argc, argv, "--ssl-ibot-loss", "ce"), "cos");   /* cos: regress dinovol's (unit) patch token directly, no prototypes */
-        if (!Q->icos && Q->DVH.B != atoi(opt(argc, argv, "--ssl-head-bottleneck", "256"))) { fprintf(stderr, "dino-train --ssl-dv-teacher: --ssl-head-bottleneck must be %d (dinovol's iBOT bottleneck)\n", Q->DVH.B); return 2; }
+        if (Q->dist > 0) { int ni; dv_dense_dims(Q->dv, &Q->dnd, &ni); Q->icos = 0;
+            if (Q->dch + Q->dnd > CO) { fprintf(stderr, "dino-train --ssl-distill: head channels %d..%d of %d outputs (--dim %d)\n", Q->dch, Q->dch + Q->dnd - 1, CO, Q->dnd); return 2; } }
+        if (Q->dist <= 0 && !Q->icos && Q->DVH.B != atoi(opt(argc, argv, "--ssl-head-bottleneck", "256"))) { fprintf(stderr, "dino-train --ssl-dv-teacher: --ssl-head-bottleneck must be %d (dinovol's iBOT bottleneck)\n", Q->DVH.B); return 2; }
         Q->dvuntil = atoi(opt(argc, argv, "--ssl-dv-until", "0"));
         Q->dvm = calloc(Dd->nsrc, 8); Q->dvs = calloc(Dd->nsrc, 8); Q->dvh = calloc(Dd->nsrc, 8);
         Q->dvhist = calloc((size_t)Dd->nsrc * 256, sizeof *Q->dvhist);   /* dinovol's robust normalisation per source from the histogram of its windows so far */
     }
     if (Q->wib > 0) {
-        if (dvck) Q->KI = Q->icos ? 64 : Q->DVH.K;   /* (cos: a dummy prototype layer) */
+        if (dvck && Q->dist <= 0) Q->KI = Q->icos ? 64 : Q->DVH.K;   /* (cos: a dummy prototype layer) */
         if (Q->ich + 32 > CO || Q->PG % Q->TPS) { fprintf(stderr, "dino-train --ssl-ibot: channels %d..%d of %d outputs\n", Q->ich, Q->ich + 31, CO); return 2; }
         const int R = 2 * N * Q->IM, KI = Q->KI, IM = Q->IM;
         dn_head_init(&Q->I, Q->ICIN, HH, Q->icos ? Q->DVH.Cin : HB, KI, R, seed * 61 + 5, 0); Q->I.train_g = 0;
@@ -968,7 +974,16 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         Q->sig = (float)atof(opt(argc, argv, "--ssl-sigreg", "0")); Q->sigS = atoi(opt(argc, argv, "--ssl-sigreg-slices", "256"));   /* SIGReg (LeJEPA) on the student's iBOT token bottleneck */
         Q->izv = (float)atof(opt(argc, argv, "--ssl-ibot-zvar", "0"));   /* variance hinge on the student's unit token bottleneck: per-dim std over a view's rows >= 1 / sqrt(B) */
         Q->zvg = nn_malloc((size_t)IM * (HB > 1024 ? HB : 1024) * 4); Q->usei = calloc((size_t)KI, 1);
-        if (Q->dv) {   /* the student head's last layer = dinovol's prototypes (frozen); the teacher-side buffers */
+        if (Q->dv && Q->dist > 0) {   /* distillation buffers (our own EMA teacher keeps the iBOT targets) */
+            int nd, ni; const int DC = dv_dense_dims(Q->dv, &nd, &ni);
+            Q->dcrd = xmalloc_dev((size_t)IM * 12); Q->dacc = xmalloc_dev((size_t)IM * DC * 4); Q->dacch = malloc((size_t)IM * DC * 4); Q->dch_h = malloc((size_t)IM * 12);
+            Q->dth = malloc((size_t)R * nd * 4); Q->dse = nn_malloc((size_t)IM * nd * 4); Q->dsn = nn_malloc((size_t)IM * 4); Q->dge = nn_malloc((size_t)IM * nd * 4);
+            Q->dvf = nn_malloc(g3 * 4); Q->dvu = nn_malloc(g3); Q->smsi = calloc(N, sizeof *Q->smsi);
+            dr_int id; memset(&id, 0, sizeof id); id.center = 0.f; id.scale = 1.f; id.gamma = 1.f; id.lo = 0.f; id.hi = 255.f; id.contrast = 1.f;
+            Q->dvid = nn_malloc(sizeof id); nn_h2d(Q->dvid, &id, sizeof id);
+            fprintf(stderr, "dino-train --ssl-distill %g: dinovol %s's unit %d-d sheet embedding (dense head) at each global's mapped cell centres -> head channels %d..%d (1 - cos)\n",
+                    Q->dist, dvck, nd, Q->dch, Q->dch + nd - 1);
+        } else if (Q->dv) {   /* the student head's last layer = dinovol's prototypes (frozen); the teacher-side buffers */
             const dr_head *IH = &Q->I.H, *DH = &Q->DVH;
             if (!Q->icos) { nn_h2d(Q->I.p + IH->v, dvPh + DH->v, (size_t)DH->K * DH->B * 4); nn_h2d(Q->I.p + IH->g, dvPh + DH->g, (size_t)DH->K * 4); }
             nn_d2d(Q->I.pt, Q->I.p, IH->n * 4);
@@ -1168,7 +1183,23 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
       dr_argmax_rows(Q->tl, 2 * N, K, am); nn_d2h(hm, am, (size_t)2 * N * 4);   /* (agreement on the raw teacher logits: Sinkhorn's equipartition over 2N << K rows keeps the targets' argmaxes apart) */
       int ag = 0, ab = 0; for (int i = 0; i < N; i++) { ag += hm[2 * i] == hm[2 * i + 1]; ab += hm[2 * i] == hm[2 * ((i + 1) % N) + 1]; } Q->sums[2] += (double)ag / N; Q->st[4] += (double)ab / N; }
     const int dvon = Q->dv && (Q->dvuntil <= 0 || step <= Q->dvuntil);
-    if (Q->wib > 0 && R > 0 && dvon) {   /* diag-dv: dinovol's tokens of each un-augmented teacher global at the mapped cells -> its iBOT head */
+    if (Q->dist > 0 && R > 0 && dvon) {   /* distillation targets: dinovol on each un-augmented global, its dense head at the partner's mapped cell centres */
+        int nd, ni; const int DC = dv_dense_dims(Q->dv, &nd, &ni);
+        for (int j = 0; j < 2 * N; j++) {
+            const int w = j ^ 1, m = Q->cnt[w]; if (!m) continue;
+            const int si = Q->smsi[j / 2];
+            dr_crops(Q->src, Q->Ps, Q->xfd + j, Q->dvid, 1, Q->PG, Q->dvf); dr_f2u8(Q->dvf, (long long)g3, Q->dvu);
+            nn_sync();   /* (dinovol runs on xnet's non-blocking stream) */
+            if (dv_forward(Q->dv, Q->dvu, Q->PG, (float)Q->dvm[si], (float)Q->dvs[si], (float)Q->dvh[si])) return 1;
+            for (int k = 0; k < m; k++) { const int q = Q->hT[(size_t)w * Q->IM + k];
+                Q->dch_h[3 * k] = (float)(q / (Q->PG * Q->PG)); Q->dch_h[3 * k + 1] = (float)((q / Q->PG) % Q->PG); Q->dch_h[3 * k + 2] = (float)(q % Q->PG); }
+            xh2d(Q->dcrd, Q->dch_h, (size_t)m * 12);
+            if (dv_net_points(Q->dv, Q->dcrd, nullptr, nullptr, m, Q->dacc)) return 1;
+            xd2h(Q->dacch, Q->dacc, (size_t)m * DC * 4);   /* (synchronous on xnet's stream) */
+            for (int k = 0; k < m; k++) memcpy(Q->dth + (size_t)(Q->off[w] + k) * nd, Q->dacch + (size_t)k * DC, (size_t)nd * 4);
+        }
+    }
+    if (Q->wib > 0 && R > 0 && dvon && Q->dist <= 0) {   /* diag-dv: dinovol's tokens of each un-augmented teacher global at the mapped cells -> its iBOT head */
         const int G = Q->PG / 8, E = Q->DVH.Cin;
         for (int j = 0; j < 2 * N; j++) {
             const int w = j ^ 1; if (!Q->cnt[w]) continue;
@@ -1288,10 +1319,21 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
                 double gsum = 0; for (size_t i = 0; i < nn_; i++) gsum += (double)a[i] * b[i]; Q->lsg += gsum; free(a); free(b);
                 nn_scale(Q->idsl, esc, nn_);
             }
-            if (dr_head_bwd(&Q->I.H, Q->I.p, Q->I.g, Q->ieS, Q->idsl, m, Q->idE, step > Q->freeze && !Q->dv, &Q->I.w)) return 1;
+            if (dr_head_bwd(&Q->I.H, Q->I.p, Q->I.g, Q->ieS, Q->idsl, m, Q->idE, step > Q->freeze && !(Q->dv && Q->dist <= 0), &Q->I.w)) return 1;
             }
             if (Q->itok) dr_rownorm_bwd(Q->idE, Q->ieS, Q->irsS, m, CT, Q->idE);
             if (!Q->itok) dr_scatter_unit_f32(Q->ieS, Q->idE, Q->inS, Q->d_hS + (size_t)j * Q->IM, m, 32, g3, 1.f, Q->glzib + (size_t)Q->ich * g3);
+            if (Q->dist > 0 && dvon) {   /* distillation: L = dist / R sum_k (1 - e_k . t_k), e = unit(head channels dch..) at the cell centre; d / d e = -dist / R t */
+                const int nd = Q->dnd; float *eh = malloc((size_t)m * nd * 4), *gh = malloc((size_t)m * nd * 4); const float *th = Q->dth + (size_t)Q->off[j] * nd;
+                dn_gather((const char *)lgs + (size_t)Q->dch * g3 * (h16 ? 2 : 4), h16, g3, nd, Q->d_hS + (size_t)j * Q->IM, m, Q->dse, Q->dsn);
+                nn_d2h(eh, Q->dse, (size_t)m * nd * 4);
+                const float wv = Q->dist / (float)(R > 0 ? R : 1);
+                for (int k = 0; k < m; k++) { double d = 0; for (int e = 0; e < nd; e++) { d += (double)eh[(size_t)k * nd + e] * th[(size_t)k * nd + e]; gh[(size_t)k * nd + e] = -wv * th[(size_t)k * nd + e]; }
+                    Q->dist_l += 1 - d; Q->dist_n++; }
+                nn_h2d(Q->dge, gh, (size_t)m * nd * 4);
+                dr_scatter_unit_f32(Q->dse, Q->dge, Q->dsn, Q->d_hS + (size_t)j * Q->IM, m, nd, g3, 1.f, Q->glzib + (size_t)Q->dch * g3);
+                free(eh); free(gh);
+            }
             if (dbg && j == 0) { float *h = malloc((size_t)m * Q->ICIN * 4), *nr = malloc((size_t)m * 4); nn_d2h(h, Q->idE, (size_t)m * Q->ICIN * 4); nn_d2h(nr, Q->inS, (size_t)m * 4);
                 double a = 0, nm = 0; for (int k = 0; k < m * Q->ICIN; k++) a += (double)h[k] * h[k]; for (int k = 0; k < m; k++) nm += nr[k] / m;
                 float *gz = malloc(g3 * 32 * 4); nn_d2h(gz, Q->glzib + (size_t)Q->ich * g3, g3 * 32 * 4); double b = 0; long nz = 0; for (size_t k = 0; k < g3 * 32; k++) { b += (double)gz[k] * gz[k]; nz += gz[k] != 0; }
@@ -1373,6 +1415,7 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
             fprintf(stderr, "dbg step %d view 0: trunk |grad| %.3e over %zu params\n", step, sqrt(a), np_); free(g); }
         unet_set_token_grad(n, nullptr);
         if (ib) nn_zero(Q->glzib + (size_t)Q->ich * g3, (size_t)32 * g3 * 4);
+        if (ib && Q->dist > 0) nn_zero(Q->glzib + (size_t)Q->dch * g3, (size_t)Q->dnd * g3 * 4);
     }
     const size_t np = unet_nparams(Q->u);
     nn_axpy(unet_grad_ptr(Q->u), 1.f, unet_grad_ptr(Q->ug), np); nn_axpy(unet_grad_ptr(Q->u), 1.f, unet_grad_ptr(Q->ul), np);
@@ -1384,8 +1427,8 @@ static int dn_ssl_step(dn_ssl *Q, int step, float tt, float mom) {
     dr_ema(h->pt, h->p, H->n, mom); nn_zero(h->g, H->n * 4);
     if (Q->wib > 0) { dn_head *hi = &Q->I; const dr_head *HI = &hi->H;
         dr_adamw(hi->p, hi->g, hi->m, hi->v, HI->v, hlr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
-        if (step > Q->freeze && !Q->dv) dr_adamw(hi->p + HI->v, hi->g + HI->v, hi->m + HI->v, hi->v + HI->v, HI->g - HI->v, Q->plr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
-        if (step > Q->freeze && !Q->dv && Q->pcen) dr_center_rows(hi->p + HI->v, HI->K, HI->B);
+        if (step > Q->freeze && !(Q->dv && Q->dist <= 0)) dr_adamw(hi->p + HI->v, hi->g + HI->v, hi->m + HI->v, hi->v + HI->v, HI->g - HI->v, Q->plr, 0.9f, 0.999f, 1e-8f, Q->wd, step);
+        if (step > Q->freeze && !(Q->dv && Q->dist <= 0) && Q->pcen) dr_center_rows(hi->p + HI->v, HI->K, HI->B);
         if (Q->ilsc) {   /* the logit scale: Adam on one scalar */
             const double g_ = Q->lsg; Q->lsg = 0; Q->lsm = 0.9f * Q->lsm + 0.1f * (float)g_; Q->lsv = 0.999f * Q->lsv + 0.001f * (float)(g_ * g_);
             const float mh = Q->lsm / (1.f - powf(0.9f, (float)step)), vh = Q->lsv / (1.f - powf(0.999f, (float)step)); Q->lsc -= 1e-2f * mh / (sqrtf(vh) + 1e-8f);
@@ -1438,10 +1481,11 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
             for (int a = 0; a < m; a++) for (int c = a + 1; c < m; c++) { double d = 0; for (int b = 0; b < Bz; b++) d += zn[(size_t)a * Bz + b] * zn[(size_t)c * Bz + b]; co += d; no++; }
             size_t l5 = strlen(line);
             if (Q->ilsc) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | ibot logit scale %.3f", expf(Q->lsc)); l5 = strlen(line); }
+            if (Q->dist_n) { const size_t l9 = strlen(line); snprintf(line + l9, cap - l9, " | distill 1-cos %.4f", Q->dist_l / Q->dist_n); Q->dist_l = 0; Q->dist_n = 0; l5 = strlen(line); }
             if (Q->sig_n) { const size_t l8 = strlen(line); snprintf(line + l8, cap - l8, " | sigreg %.4f", Q->sig_l / Q->sig_n); Q->sig_l = 0; Q->sig_n = 0; l5 = strlen(line); }
             if (Q->zvh_n) { const size_t l7 = strlen(line); snprintf(line + l7, cap - l7, " | ibot zvar hinge %.5f", Q->zvh_l / Q->zvh_n); Q->zvh_l = 0; Q->zvh_n = 0; l5 = strlen(line); }
             if (Q->icos) { const size_t l6 = strlen(line); snprintf(line + l6, cap - l6, " | ibot cos(student, dinovol token) %.4f", Q->cosn ? Q->cosacc / Q->cosn : 0.0); Q->cosacc = 0; Q->cosn = 0; l5 = strlen(line); }
-            snprintf(line + l5, cap - l5, " | ibot student feat std/ch %.4f |mean| %.4f H %.2f pmax %.4f tok z std/dim %.4f (1/sqrt(B) %.4f) cos other %.4f%s", fsd, fm, Hs, pms, sm, 1 / sqrt((double)Bz), no ? co / no : 0.0, Q->dv ? (Q->dvuntil <= 0 || step <= Q->dvuntil ? " [dv teacher]" : " [ema teacher]") : "");
+            snprintf(line + l5, cap - l5, " | ibot student feat std/ch %.4f |mean| %.4f H %.2f pmax %.4f tok z std/dim %.4f (1/sqrt(B) %.4f) cos other %.4f%s", fsd, fm, Hs, pms, sm, 1 / sqrt((double)Bz), no ? co / no : 0.0, Q->dv && Q->dist <= 0 ? (Q->dvuntil <= 0 || step <= Q->dvuntil ? " [dv teacher]" : " [ema teacher]") : "");
             free(sl); free(zn);
         }
     }
