@@ -45,6 +45,10 @@ typedef struct {
     float *vl[AT_DFM_MAXL], *oa, *aw, *dvl[AT_DFM_MAXL], *doa;   /* deformable attention: the levels' values [T << 3 l][C], the offset / logit rows,
                                                                  the softmax weights [T][H L K] (forward); their gradients (backward) */
     int kept;   /* the forward tensors hold this block's forward of the backward's input: at_block_bwd skips its recompute (and clears it) */
+    /* value residual (ResFormer, arXiv 2410.17897; set by the caller before each call, vr 0: off): vr 1 the first block (its V -> v1 [T][C]
+       in the forward; its backward adds dv1 to d V), vr 2 a later block: V <- V + lam[head] (v1 - V) (its own V kept in own [T][C]),
+       backward: dv1 += lam d V, glam[head] += sum d V (v1 - own), d own = (1 - lam) d V. The caller zeroes dv1 before the backward pass */
+    int vr; float *v1, *own, *dv1; const float *lam; float *glam;
 } at_ws;
 size_t at_ws_bytes(const at_dims *d, long T);
 void at_ws_carve(at_ws *w, const at_dims *d, long T, void *base);

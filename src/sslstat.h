@@ -49,3 +49,65 @@ static inline double ss_koleo_all(const float *X, int N, int D, double w, double
     }
     free(xh); free(nr); free(gh); free(nn); return L;
 }
+/* relational (similarity-matrix) distillation: E, T [m][d] (unit rows: student, teacher); L = w / (m (m - 1)) sum_{a != b} (e_a . e_b - t_a . t_b)^2,
+   invariant to any rotation of the teacher's code space (dinovol's sheet codes need only agree within a crop). G [m][d] += d L / d E
+   (when not nullptr); returns L. */
+static inline double ss_relsim(const float *E, const float *T, int m, int d, double w, float *G) {
+    if (m < 2) return 0;
+    const double c = w / ((double)m * (m - 1)); double L = 0;
+    for (int a = 0; a < m; a++) for (int b = a + 1; b < m; b++) {
+        double se = 0, st = 0; for (int k = 0; k < d; k++) { se += (double)E[(size_t)a * d + k] * E[(size_t)b * d + k]; st += (double)T[(size_t)a * d + k] * T[(size_t)b * d + k]; }
+        const double D = se - st; L += 2 * c * D * D;
+        if (G) { const double g = 4 * c * D; for (int k = 0; k < d; k++) { G[(size_t)a * d + k] += (float)(g * E[(size_t)b * d + k]); G[(size_t)b * d + k] += (float)(g * E[(size_t)a * d + k]); } }
+    }
+    return L;
+}
+/* teacher-graph SupCon: anchors a of E [m][d] (unit rows), positives P(a) = {b != a : T_a . T_b > thr} (the teacher's cosine graph),
+   L = w / |A| sum_{a in A} -1/|P(a)| sum_{p in P(a)} log softmax_{b != a}(E_a . E_b / tau)_p over the anchors A with a positive.
+   Only which points the teacher groups together is matched, not its code vectors. G [m][d] += d L / d E (when not nullptr);
+   *pf (when not nullptr) = the fraction of pairs that are positive; returns L. */
+static inline double ss_tnce(const float *E, const float *T, int m, int d, double thr, double tau, double w, float *G, double *pf) {
+    if (m < 2) return 0;
+    unsigned char *pos = malloc((size_t)m * m); int *npa = calloc((size_t)m, sizeof *npa), na = 0; long np = 0;
+    for (int a = 0; a < m; a++) for (int b = 0; b < m; b++) { double st = 0; if (b != a) for (int k = 0; k < d; k++) st += (double)T[(size_t)a * d + k] * T[(size_t)b * d + k];
+        pos[(size_t)a * m + b] = b != a && st > thr; npa[a] += pos[(size_t)a * m + b]; }
+    for (int a = 0; a < m; a++) { na += npa[a] > 0; np += npa[a]; }
+    if (pf) *pf = (double)np / ((double)m * (m - 1));
+    double *s = malloc((size_t)m * 8), L = 0; const double c = na ? w / na : 0;
+    for (int a = 0; a < m; a++) {
+        if (!npa[a]) continue; const unsigned char *pa = pos + (size_t)a * m; double mx = -1e300;
+        for (int b = 0; b < m; b++) { if (b == a) continue; double se = 0; for (int k = 0; k < d; k++) se += (double)E[(size_t)a * d + k] * E[(size_t)b * d + k]; s[b] = se / tau; if (s[b] > mx) mx = s[b]; }
+        double Z = 0; for (int b = 0; b < m; b++) if (b != a) Z += exp(s[b] - mx);
+        const double lz = mx + log(Z); double la = 0; for (int b = 0; b < m; b++) if (pa[b]) la += lz - s[b];
+        L += c * la / npa[a];
+        if (G) for (int b = 0; b < m; b++) { if (b == a) continue; const double g = c * (exp(s[b] - lz) - (pa[b] ? 1.0 / npa[a] : 0.0)) / tau;   /* d L / d (E_a . E_b) */
+            for (int k = 0; k < d; k++) { G[(size_t)a * d + k] += (float)(g * E[(size_t)b * d + k]); G[(size_t)b * d + k] += (float)(g * E[(size_t)a * d + k]); } }
+    }
+    free(s); free(pos); free(npa); return L;
+}
+/* SIGReg (LeJEPA, arXiv 2511.08544): the rows of X [N][D] (times xs) projected on S unit directions A [S][D]; per direction the
+   Epps-Pulley distance between the projections' empirical characteristic function and the standard normal's, phi(t) = exp(-t^2 / 2):
+   int_{-tmax}^{tmax} phi(t) ((Re ecf(t) - phi(t))^2 + Im ecf(t)^2) dt (an even integrand: 2 x the trapezoid rule on K knots of [0, tmax]),
+   times N (the test statistic); L = w x the mean over directions. Teacher-free: pushes the embedding towards an isotropic Gaussian.
+   cos / sin of t_k x by the angle-addition recurrence (one sincos per projection). G [N][D] (written, when not nullptr) = d L / d X; returns L. */
+static inline double ss_sigreg_all(const float *X, int N, int D, const float *A, int S, int K, double tmax, double xs, double w, float *G) {
+    const double dt = tmax / (K - 1); double *ph = malloc((size_t)K * 8), *cw = malloc((size_t)K * 8), *p = malloc((size_t)N * 8), *c1 = malloc((size_t)N * 8), *s1 = malloc((size_t)N * 8);
+    double *re = malloc((size_t)K * 8), *im = malloc((size_t)K * 8), *gp = malloc((size_t)N * 8); double L = 0;
+    for (int k = 0; k < K; k++) { const double t = k * dt; ph[k] = exp(-0.5 * t * t); cw[k] = 2 * dt * (k == 0 || k == K - 1 ? 0.5 : 1.0) * ph[k]; }
+    if (G) memset(G, 0, (size_t)N * D * sizeof *G);
+    for (int s = 0; s < S; s++) {
+        const float *a = A + (size_t)s * D;
+        for (int i = 0; i < N; i++) { double v = 0; for (int c = 0; c < D; c++) v += (double)X[(size_t)i * D + c] * a[c]; p[i] = xs * v; c1[i] = cos(dt * p[i]); s1[i] = sin(dt * p[i]); }
+        for (int k = 0; k < K; k++) { re[k] = 0; im[k] = 0; }
+        for (int i = 0; i < N; i++) { double ck = 1, sk = 0; for (int k = 0; k < K; k++) { re[k] += ck / N; im[k] += sk / N; const double cn = ck * c1[i] - sk * s1[i]; sk = sk * c1[i] + ck * s1[i]; ck = cn; } }
+        double l = 0; for (int k = 0; k < K; k++) l += cw[k] * ((re[k] - ph[k]) * (re[k] - ph[k]) + im[k] * im[k]);
+        L += w * N * l / S;
+        if (!G) continue;
+        /* d l / d p_i = sum_k cw_k 2 ((re_k - ph_k) (-t_k sin(t_k p_i)) + im_k t_k cos(t_k p_i)) / N; d L / d X_i = w N / S xs (d l / d p_i) a */
+        for (int i = 0; i < N; i++) { double ck = 1, sk = 0, g = 0;
+            for (int k = 0; k < K; k++) { const double t = k * dt; g += cw[k] * 2 * t * (-(re[k] - ph[k]) * sk + im[k] * ck) / N; const double cn = ck * c1[i] - sk * s1[i]; sk = sk * c1[i] + ck * s1[i]; ck = cn; }
+            gp[i] = w * N / S * xs * g; }
+        for (int i = 0; i < N; i++) for (int c = 0; c < D; c++) G[(size_t)i * D + c] += (float)(gp[i] * a[c]);
+    }
+    free(ph); free(cw); free(p); free(c1); free(s1); free(re); free(im); free(gp); return L;
+}

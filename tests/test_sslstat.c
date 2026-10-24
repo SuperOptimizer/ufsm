@@ -26,6 +26,38 @@ int main(void) {
       for (int i = 0; i < N * D; i++) { const float o = X[i]; const double e = 1e-4; X[i] = (float)(o + e); const double lp = ss_koleo_all(X, N, D, w, eps, Gd); X[i] = (float)(o - e); const double lm = ss_koleo_all(X, N, D, w, eps, Gd); X[i] = o;
           const double fd = (lp - lm) / (2 * e); emax = fmax(emax, fabs(fd - G[i])); gmax = fmax(gmax, fabs(fd)); }
       const int b = !(emax < 5e-3 * gmax); printf("KoLeo all-row gradients vs the full batch: max |err| %.2e of max |grad| %.2e%s\n", emax, gmax, b ? "  FAIL" : ""); bad += b; }
+    /* SIGReg: every row's gradient vs central differences in double; plus a sanity check: Gaussian rows score far lower than collapsed ones */
+    { const int S = 5, K = 17, Dg = 7; float A[5 * 7]; for (int s = 0; s < S; s++) { double n = 0; for (int c = 0; c < Dg; c++) { A[s * Dg + c] = (float)(urand() - 0.5); n += A[s * Dg + c] * A[s * Dg + c]; } for (int c = 0; c < Dg; c++) A[s * Dg + c] /= (float)sqrt(n); }
+      const double xs = 2.6, w = 0.9; float G[9 * 7], Gd[9 * 7]; ss_sigreg_all(X, N, Dg, A, S, K, 3.0, xs, w, G); double emax = 0, gmax = 0;
+      for (int i = 0; i < N * Dg; i++) { const float o = X[i]; const double e = 1e-3; X[i] = (float)(o + e); const double ep = (double)X[i] - o; const double lp = ss_sigreg_all(X, N, Dg, A, S, K, 3.0, xs, w, nullptr);
+          X[i] = (float)(o - e); const double em = o - (double)X[i]; const double lm = ss_sigreg_all(X, N, Dg, A, S, K, 3.0, xs, w, nullptr); X[i] = o;
+          const double fd = (lp - lm) / (ep + em); emax = fmax(emax, fabs(fd - G[i])); gmax = fmax(gmax, fabs(fd)); (void)Gd; }
+      int b = !(emax < 2e-3 * gmax); printf("SIGReg all-row gradients: max |err| %.2e of max |grad| %.2e%s\n", emax, gmax, b ? "  FAIL" : ""); bad += b;
+      enum { NG = 512 }; float *Xg = malloc((size_t)NG * Dg * 4), *Xc = malloc((size_t)NG * Dg * 4);
+      for (int i = 0; i < NG * Dg; i++) { const double u1 = urand() + 1e-12, u2 = urand(); Xg[i] = (float)(sqrt(-2 * log(u1)) * cos(6.283185307179586 * u2)); Xc[i] = 0.05f * Xg[i] + 0.7f; }
+      const double lg = ss_sigreg_all(Xg, NG, Dg, A, S, K, 3.0, 1.0, 1.0, nullptr), lc = ss_sigreg_all(Xc, NG, Dg, A, S, K, 3.0, 1.0, 1.0, nullptr);
+      b = !(lg < 2.0 && lc > 50 * lg); printf("SIGReg statistic: gaussian %.3f, collapsed %.3f%s\n", lg, lc, b ? "  FAIL" : ""); bad += b; free(Xg); free(Xc); }
+    /* relational distillation: gradients vs central differences in double; zero loss at a rotated teacher */
+    { enum { M = 9, Dd = 7 }; float E[M * Dd], T[M * Dd], G[M * Dd] = {0}, Z[M * Dd] = {0}; for (int i = 0; i < M * Dd; i++) { E[i] = (float)(urand() - 0.5); T[i] = (float)(urand() - 0.5); }
+      const double w = 1.3; ss_relsim(E, T, M, Dd, w, G); double emax = 0, gmax = 0;
+      for (int i = 0; i < M * Dd; i++) { const float o = E[i]; const double e = 1e-3; E[i] = (float)(o + e); const double ep = (double)E[i] - o, lp = ss_relsim(E, T, M, Dd, w, nullptr);
+          E[i] = (float)(o - e); const double em = o - (double)E[i], lm = ss_relsim(E, T, M, Dd, w, nullptr); E[i] = o;
+          const double fd = (lp - lm) / (ep + em); emax = fmax(emax, fabs(fd - G[i])); gmax = fmax(gmax, fabs(fd)); }
+      for (int a = 0; a < M; a++) for (int k = 0; k < Dd; k++) Z[a * Dd + k] = E[a * Dd + (k + 3) % Dd] * (k % 2 ? -1.f : 1.f);   /* (a signed permutation of the code axes) */
+      const double l0 = ss_relsim(Z, E, M, Dd, 1.0, nullptr);
+      const int b = !(emax < 1e-3 * gmax && l0 < 1e-10); printf("relational distillation gradients: max |err| %.2e of max |grad| %.2e, rotated-teacher loss %.1e%s\n", emax, gmax, l0, b ? "  FAIL" : ""); bad += b; }
+    /* teacher-graph SupCon: gradients vs central differences; a student grouping like the teacher (rotated codes) beats a random one */
+    { enum { M = 12, Dd = 6 }; float E[M * Dd], T[M * Dd], G[M * Dd] = {0}, Z[M * Dd];
+      for (int a = 0; a < M; a++) { double n = 0, m2 = 0; for (int k = 0; k < Dd; k++) { T[a * Dd + k] = (float)((k == a % 3 ? 1.0 : 0.0) + 0.3 * (urand() - 0.5)); E[a * Dd + k] = (float)(urand() - 0.5); n += T[a * Dd + k] * T[a * Dd + k]; m2 += E[a * Dd + k] * E[a * Dd + k]; }
+          for (int k = 0; k < Dd; k++) { T[a * Dd + k] /= (float)sqrt(n); E[a * Dd + k] /= (float)sqrt(m2); } }
+      const double w = 0.7, thr = 0.6, tau = 0.2; double pf; ss_tnce(E, T, M, Dd, thr, tau, w, G, &pf); double emax = 0, gmax = 0;
+      for (int i = 0; i < M * Dd; i++) { const float o = E[i]; const double e = 1e-3; E[i] = (float)(o + e); const double ep = (double)E[i] - o, lp = ss_tnce(E, T, M, Dd, thr, tau, w, nullptr, nullptr);
+          E[i] = (float)(o - e); const double em = o - (double)E[i], lm = ss_tnce(E, T, M, Dd, thr, tau, w, nullptr, nullptr); E[i] = o;
+          const double fd = (lp - lm) / (ep + em); emax = fmax(emax, fabs(fd - G[i])); gmax = fmax(gmax, fabs(fd)); }
+      for (int a = 0; a < M; a++) for (int k = 0; k < Dd; k++) Z[a * Dd + k] = T[a * Dd + (k + 2) % Dd] * (k % 2 ? -1.f : 1.f);
+      const double lr = ss_tnce(E, T, M, Dd, thr, tau, 1.0, nullptr, nullptr), lt = ss_tnce(Z, T, M, Dd, thr, tau, 1.0, nullptr, nullptr);
+      const int b = !(emax < 1e-3 * gmax && lt < lr && pf > 0.1 && pf < 0.5);
+      printf("teacher-graph SupCon gradients: max |err| %.2e of max |grad| %.2e, loss rotated teacher %.3f < random %.3f, positive pairs %.2f%s\n", emax, gmax, lt, lr, pf, b ? "  FAIL" : ""); bad += b; }
     printf("%s\n", bad ? "test_sslstat: FAIL" : "test_sslstat: OK");
     return bad != 0;
 }

@@ -666,10 +666,35 @@ static int test_head_async(void) {
     return bad;
 }
 
+/* --ssl-distill: L = w sum_k (1 - unit(y[:, idx_k]) . t_k) over D = 64 head channels of [D][p3] logits; dn_gather (unit rows + norms) and
+   dr_scatter_unit_f32 (d / d unit -> d / d logits through the normalisation) vs central differences of L in double */
+void dn_gather(const void *logits, int h16, size_t p3, int D, const int *idx, int N, float *e, float *nrm);
+static double distill_ref(const double *y, size_t p3, int D, const int *idx, int N, const double *t, double w) {
+    double L = 0; for (int k = 0; k < N; k++) { double n2 = 0, d = 0; for (int c = 0; c < D; c++) { const double v = y[(size_t)c * p3 + idx[k]]; n2 += v * v; d += v * t[(size_t)k * D + c]; } L += w * (1 - d / sqrt(n2)); }
+    return L;
+}
+static int test_distill(void) {
+    const int D = 64, N = 20; const size_t p3 = 300; const double w = 0.7; int idx[20]; double *y = malloc(p3 * D * 8), *t = malloc((size_t)N * D * 8);
+    for (int k = 0; k < N; k++) idx[k] = k * 13 + 5;   /* (distinct voxels) */
+    for (size_t i = 0; i < p3 * D; i++) y[i] = rf(nrand());
+    for (int k = 0; k < N; k++) { double n2 = 0; for (int c = 0; c < D; c++) { t[(size_t)k * D + c] = nrand(); n2 += t[(size_t)k * D + c] * t[(size_t)k * D + c]; } for (int c = 0; c < D; c++) t[(size_t)k * D + c] = rf(t[(size_t)k * D + c] / sqrt(n2)); }
+    float *yd = dev(y, p3 * D), *e = nn_malloc((size_t)N * D * 4), *nr = nn_malloc((size_t)N * 4), *gl = nn_malloc(p3 * D * 4); int *id = nn_malloc(sizeof idx); nn_h2d(id, idx, sizeof idx); nn_zero(gl, p3 * D * 4);
+    double *ge = malloc((size_t)N * D * 8); for (int i = 0; i < N * D; i++) ge[i] = -w * t[i]; float *ged = dev(ge, (size_t)N * D);
+    dn_gather(yd, 0, p3, D, id, N, e, nr); dr_scatter_unit_f32(e, ged, nr, id, N, D, p3, 1.f, gl);
+    double *g = host(gl, p3 * D), *a = malloc((size_t)N * D * 8), *r = malloc((size_t)N * D * 8); double z = 0;
+    for (size_t i = 0; i < p3 * D; i++) { int on = 0; for (int k = 0; k < N; k++) on |= (int)(i % p3) == idx[k]; if (!on) z = fmax(z, fabs(g[i])); }
+    int n = 0; for (int k = 0; k < N; k++) for (int c = 0; c < D; c++) { const size_t i = (size_t)c * p3 + idx[k]; const double v0 = y[i], h = 1e-5;
+        y[i] = v0 + h; const double lp = distill_ref(y, p3, D, idx, N, t, w); y[i] = v0 - h; const double lm = distill_ref(y, p3, D, idx, N, t, w); y[i] = v0;
+        r[n] = (lp - lm) / (2 * h); a[n] = g[i]; n++; }
+    printf("distill (1 - cos, D %d): %d indexed entries, max |grad| off the points %.1e\n", D, n, z);
+    int bad = report("d L / d logits", a, r, n, 1e-4) + (z != 0);
+    free(y); free(t); free(ge); free(g); free(a); free(r); nn_free(yd); nn_free(e); nn_free(nr); nn_free(gl); nn_free(id); nn_free(ged);
+    return bad;
+}
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
     int bad = test_views() + test_head() + test_targets() + test_ce() + test_koleo() + test_koleo_q() + test_muon(64, 24) + test_muon(24, 64) + test_muon_ref(160, 24) + test_obj() + test_ink() + test_mlp2() + test_pool() + test_rownorm()
-              + test_sharp() + test_toy_dino() + test_nce() + test_nce_p() + test_toy_nce() + test_rows() + test_axis_view() + test_head_async();   /* (the newer tests last: the older ones keep their random draws) */
+              + test_sharp() + test_toy_dino() + test_nce() + test_nce_p() + test_toy_nce() + test_rows() + test_axis_view() + test_head_async() + test_distill();   /* (the newer tests last: the older ones keep their random draws) */
     printf(bad ? "test_dinor: %d FAILED\n" : "test_dinor: all passed\n", bad);
     return bad != 0;
 }
