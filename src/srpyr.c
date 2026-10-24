@@ -514,3 +514,79 @@ int cmd_sr_xpairs(int argc, char **argv) {
     fprintf(stderr, "sr-xpairs: %d boxes (%d train, %d test) from %d tries in %lds; intensity r %.3f -> %s\n", n, n - ntest, ntest, atomic_load(&j->next), (long)(time(nullptr) - t0), pr, od);
     return 0;
 }
+
+/* ufsm sr-resample <out.zarr> --input ROOT,KEY,UM,LEVEL --target ROOT,KEY,UM,LEVEL --chain MAP:c2f|f2c:PAIRDIR[;...] --shards FILE [--factor 4]
+                    [--threads 8] [--cache DIR] [--q 1]
+   The target scan resampled (trilinear, through the chain of registration maps as in ufsm sr-xpairs) onto the input scan's x factor grid
+   (output voxel t at input-level coords (t + 0.5) / factor - 0.5): e.g. a real 2.4 um scan on the native 9.36 um scan's x4 grid, beside an SR
+   prediction of that native scan. Only the listed 512^3 output shards ("sz sy sx" lines) are written (the array spans the input level x factor);
+   0 where the target is masked or outside. Output: an OME group with one level named by its voxel size. */
+#include "pyramid.h"
+typedef struct { xjob *j; int64_t (*sh)[3]; int nsh; atomic_int next; z3w *w; int F; } rsjob;
+static void *rs_worker(void *arg) {
+    rsjob *r = arg; xjob *j = r->j; const int S = 512, G = S / 8 + 1, F = r->F; const double fi = (double)(1 << j->Li), ft = 1.0 / (1 << j->Lt);
+    uint8_t *out = malloc((size_t)S * S * S); double *lat = malloc((size_t)G * G * G * 3 * sizeof *lat);
+    for (;;) {
+        const int k = atomic_fetch_add(&r->next, 1); if (k >= r->nsh) break;
+        const int64_t *sh = r->sh[k]; memset(out, 0, (size_t)S * S * S);
+        double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+        for (int c = 0; c < G; c++) for (int b = 0; b < G; b++) for (int a = 0; a < G; a++) {
+            const int64_t tv[3] = {sh[2] * S + 8 * a, sh[1] * S + 8 * b, sh[0] * S + 8 * c}; double p[3], f[3];   /* xyz output voxel */
+            for (int d = 0; d < 3; d++) p[d] = (((tv[d] + 0.5) / F - 0.5) + 0.5) * fi - 0.5;
+            x_map(j, p, f, nullptr);
+            double *qq = lat + (((size_t)c * G + b) * G + a) * 3;
+            for (int d = 0; d < 3; d++) { qq[d] = (f[d] + 0.5) * ft - 0.5; lo[d] = fmin(lo[d], qq[d]); hi[d] = fmax(hi[d], qq[d]); }
+        }
+        int64_t fo[3], fn[3]; for (int d = 0; d < 3; d++) { fo[2 - d] = (int64_t)floor(lo[d]) - 2; fn[2 - d] = (int64_t)ceil(hi[d]) + 2 - fo[2 - d] + 1; }
+        int okr = (double)fn[0] * fn[1] * fn[2] <= 400e6;
+        uint8_t *fb = okr ? malloc((size_t)fn[0] * fn[1] * fn[2]) : nullptr;
+        if (fb && !rvol_read(j->vt, j->Lt, fo, fn, fb)) {
+            for (int z = 0; z < S; z++) for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) {
+                const int a = x >> 3, b = y >> 3, c = z >> 3; const double ua = (x & 7) / 8.0, ub = (y & 7) / 8.0, uc = (z & 7) / 8.0; double q[3] = {0, 0, 0};
+                for (int kk = 0; kk < 8; kk++) {
+                    int aa = a + (kk & 1), bb = b + (kk >> 1 & 1), cc = c + (kk >> 2); if (aa >= G) aa = G - 1; if (bb >= G) bb = G - 1; if (cc >= G) cc = G - 1;
+                    const double w = ((kk & 1) ? ua : 1 - ua) * ((kk >> 1 & 1) ? ub : 1 - ub) * ((kk >> 2) ? uc : 1 - uc);
+                    const double *l = lat + (((size_t)cc * G + bb) * G + aa) * 3; for (int d = 0; d < 3; d++) q[d] += w * l[d];
+                }
+                const double fx = q[0] - fo[2], fy = q[1] - fo[1], fz = q[2] - fo[0]; const int64_t ix = (int64_t)floor(fx), iy = (int64_t)floor(fy), iz = (int64_t)floor(fz);
+                if (ix < 0 || iy < 0 || iz < 0 || ix + 1 >= fn[2] || iy + 1 >= fn[1] || iz + 1 >= fn[0]) continue;
+                const double ux = fx - ix, uy = fy - iy, uz = fz - iz; double sv = 0; int bad = 0;
+                for (int kk = 0; kk < 8 && !bad; kk++) { const uint8_t v = fb[((size_t)(iz + (kk >> 2)) * fn[1] + iy + (kk >> 1 & 1)) * fn[2] + ix + (kk & 1)]; if (!v) bad = 1;
+                    sv += ((kk >> 2) ? uz : 1 - uz) * ((kk >> 1 & 1) ? uy : 1 - uy) * ((kk & 1) ? ux : 1 - ux) * v; }
+                if (!bad) out[((size_t)z * S + y) * S + x] = (uint8_t)fmin(255, fmax(1, sv + 0.5));
+            }
+        }
+        free(fb);
+        if (z3w_write_shard(r->w, sh[0], sh[1], sh[2], out, 1)) fprintf(stderr, "sr-resample: %s\n", z3w_error());
+        fprintf(stderr, "\rsr-resample: shard %d / %d   ", k + 1, r->nsh);
+    }
+    free(out); free(lat); return nullptr;
+}
+int cmd_sr_resample(int argc, char **argv) {
+    const char *is = opt(argc, argv, "--input", nullptr), *ts = opt(argc, argv, "--target", nullptr), *cs = opt(argc, argv, "--chain", nullptr), *sf = opt(argc, argv, "--shards", nullptr);
+    if (argc < 3 || argv[2][0] == '-' || !is || !ts || !cs || !sf) { fprintf(stderr, "usage: ufsm sr-resample <out.zarr> --input ROOT,KEY,UM,LEVEL --target ROOT,KEY,UM,LEVEL --chain MAP:c2f|f2c:PAIRDIR[;...] --shards FILE [--factor 4] [--threads 8] [--cache DIR] [--q 1]\n"); return 2; }
+    const char *cache = opt(argc, argv, "--cache", nullptr); xjob *j = calloc(1, sizeof *j); char ikey[1024], tkey[1024];
+    if (!(j->vi = x_vol(is, cache, &j->Li, ikey, sizeof ikey)) || !(j->vt = x_vol(ts, cache, &j->Lt, tkey, sizeof tkey))) return 1;
+    char cb[4096]; snprintf(cb, sizeof cb, "%s", cs); char *save = nullptr;
+    for (char *t = strtok_r(cb, ";", &save); t && j->ns < 4; t = strtok_r(nullptr, ";", &save)) {
+        char *a = strtok(t, ":"), *d = strtok(nullptr, ":"), *pd = strtok(nullptr, ":"); if (!a || !d || !pd) return 2;
+        xstep *s = &j->st[j->ns]; if (reg_load_map(a, cache, nullptr, nullptr, &s->m, &s->D)) return 1;
+        if (s->D.d) s->m.D = &s->D; s->c2f = !strcmp(d, "c2f"); j->ns++;
+    }
+    const int F = atoi(opt(argc, argv, "--factor", "4")); const double oum = j->vi->um * (1 << j->Li) / F;
+    rsjob r = {0}; r.j = j; r.F = F;
+    FILE *f = fopen(sf, "r"); if (!f) return 1; long long a, b, c; int cap = 0;
+    while (fscanf(f, "%lld %lld %lld", &a, &b, &c) == 3) { if (r.nsh == cap) r.sh = realloc(r.sh, (size_t)(cap = cap ? 2 * cap : 256) * sizeof *r.sh); r.sh[r.nsh][0] = a; r.sh[r.nsh][1] = b; r.sh[r.nsh][2] = c; r.nsh++; }
+    fclose(f);
+    int64_t shape[3]; for (int d = 0; d < 3; d++) shape[d] = j->vi->shape[j->Li][d] * F;
+    char lv[32], ld[2200]; z3w_level_name(oum, lv, sizeof lv); snprintf(ld, sizeof ld, "%s/%s", argv[2], lv);
+    char attrs[2600]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"sr-resample: %s level %d on %s level %d x%d grid\",\"chain\":\"%s\"}}", tkey, j->Lt, ikey, j->Li, F, cs);
+    r.w = z3w_create(ld, shape, 512, (float)atof(opt(argc, argv, "--q", "1")), 0, attrs); if (!r.w) { fprintf(stderr, "sr-resample: %s\n", z3w_error()); return 1; }
+    const int nt = atoi(opt(argc, argv, "--threads", "8")); pthread_t th[64]; const int TT = nt < 1 ? 1 : nt > 64 ? 64 : nt;
+    for (int t = 0; t < TT; t++) pthread_create(&th[t], nullptr, rs_worker, &r);
+    for (int t = 0; t < TT; t++) pthread_join(th[t], nullptr);
+    fprintf(stderr, "\n");
+    if (z3w_close(r.w) || pyramid_write_group(argv[2], oum, 1, "ufsm-sr-resample", attrs)) return 1;
+    fprintf(stderr, "sr-resample: %d shards -> %s (%.4g um)\n", r.nsh, argv[2], oum);
+    return 0;
+}

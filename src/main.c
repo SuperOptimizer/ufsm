@@ -3264,6 +3264,7 @@ int cmd_sr_pairs(int argc, char **argv);   /* src/srpairs.c */
 int cmd_sr_pyrpairs(int argc, char **argv);   /* src/srpyr.c */
 int cmd_sr_ceiling(int argc, char **argv);   /* src/srpyr.c */
 int cmd_sr_xpairs(int argc, char **argv);   /* src/srpyr.c */
+int cmd_sr_resample(int argc, char **argv);   /* src/srpyr.c */
 int cmd_restore_eval_pairs(int argc, char **argv);   /* src/restore_cli.c */
 int cmd_restore_packed(int argc, char **argv);   /* src/restore_cli.c */
 int cmd_restore_slices(int argc, char **argv);   /* src/restore_cli.c */
@@ -3299,6 +3300,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "sr-pyrpairs")) return cmd_sr_pyrpairs(argc, argv);
     if (!strcmp(cmd, "sr-ceiling")) return cmd_sr_ceiling(argc, argv);
     if (!strcmp(cmd, "sr-xpairs")) return cmd_sr_xpairs(argc, argv);
+    if (!strcmp(cmd, "sr-resample")) return cmd_sr_resample(argc, argv);
     if (!strcmp(cmd, "restore-eval-pairs")) return cmd_restore_eval_pairs(argc, argv);
     if (!strcmp(cmd, "restore-packed")) return cmd_restore_packed(argc, argv);
     if (!strcmp(cmd, "restore-slices")) return cmd_restore_slices(argc, argv);
