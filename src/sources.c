@@ -134,6 +134,7 @@ sources *sources_load(const char *path) {
         s->weight = json_num(json_get(e, "weight"), 1.0);
         s->trust_band = (int)json_num(json_get(e, "trust_band"), 0);
         s->iso = (int)json_num(json_get(e, "iso"), 0);
+        s->pap_level = (int)json_num(json_get(e, "papyrus"), s->iso);
         s->head = (int)json_num(json_get(e, "head"), 0);
         if (s->head < 0 || s->head > 6) { fprintf(stderr, "sources: %s: head 0..6\n", s->name); json_free(j); sources_free(S); return nullptr; }
         s->min_level = (int)json_num(json_get(e, "min_level"), 0);

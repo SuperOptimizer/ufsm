@@ -219,6 +219,9 @@ $(B)/bench_attn: tests/bench_attn.c $(B)/nn.o $(B)/nn_fp8.o
 $(B)/test_hybrid_identity: tests/test_hybrid_identity.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_hybrid_identity.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_hybrid_identity
+$(B)/test_dino_pts: tests/test_dino_pts.c src/dino_pts.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dino_pts.c -o $@ $(LDLIBS)
+test-all: $(B)/test_dino_pts
 $(B)/test_dinor: tests/test_dinor.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_dinor.c $(B)/nn.o $(B)/nn_fp8.o -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_dinor
@@ -448,6 +451,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_attn_dfm
 	./$(B)/test_hybrid_identity
 	./$(B)/test_dinor
+	./$(B)/test_dino_pts
 	./$(B)/test_ink_splat
 	./$(B)/test_pyports
 	./$(B)/test_edt

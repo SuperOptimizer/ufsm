@@ -4,6 +4,7 @@
    (2) sample_emb_window on a written int8 zarr group whose cell vectors encode their own position (slow sines): every head cell's target
        must point at the analytic vector of its source position (level scaling, cell step and centres, symmetry, warp), zeros outside the
        array, a second group fills the cells the first lacks;
+   (2b) sample_emb_papyrus (--distill-papyrus) against a brute-force cube count;
    (3) nn_distill_loss: the loss sums and the gradient against central finite differences in double precision; voxels without a target
        give 0 gradient (GPU). */
 #include "embz.h"
@@ -133,6 +134,42 @@ int main(void) {
         CHECK(nzero > 0 && nbad0 == 0, "missing targets inside the array: %zu (of %zu empty)", nbad0, nzero);
         free(out); free(V);
         char cmd[1200]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); if (system(cmd)) {}
+    }
+    /* (2b) the papyrus gate (--distill-papyrus): without a warp every cell's source is an aligned 8^3 cube; a cell keeps its target iff
+       that cube holds >= frac papyrus voxels (brute force over random CT with a symmetry; a cube: the sampler keeps z on slabs, a cube may permute all axes), cells without a target stay untouched */
+    {
+        const int Pz = 48, Q = 48, dv = 8, G0 = Pz / dv, G1 = Q / dv; const size_t ng = (size_t)G0 * G1 * G1, nv = (size_t)Pz * Q * Q;
+        const int lev = 100; const float frac = .35f;
+        uint8_t *ct = malloc(nv), *p2 = malloc(nv / 8); int8_t *out = malloc(ng * C), *ref = malloc(ng * C); float *V = malloc(ng * 3 * sizeof *V);
+        size_t bad = 0, tot_clear = 0, tot_kept = 0, tot_none = 0;
+        for (int t = 0; t < 6; t++) {
+            int perm[3], flip[3]; rand_sym(perm, flip);
+            const int dens = 1 + (int)(rnd() % 64);   /* per-cube papyrus share varies around frac */
+            for (size_t i = 0; i < nv; i++) {
+                const size_t z = i / ((size_t)Q * Q), y = i / Q % Q, x = i % Q;
+                const int cube = (int)((z / dv * 7 + y / dv * 13 + x / dv * 29 + t * 5) % 64);
+                ct[i] = (int)(rnd() % 64) < (cube + dens) % 64 ? (uint8_t)(lev + rnd() % 100) : (uint8_t)(rnd() % lev);
+            }
+            for (size_t q = 0; q < ng; q++) for (int c = 0; c < C; c++) out[(size_t)c * ng + q] = q % 7 == 3 ? 0 : (int8_t)(1 + (q + c) % 100);
+            memcpy(ref, out, ng * C);
+            sample_emb_pap2(ct, Pz, Q, lev, p2);
+            size_t kept = 0; const size_t cl = sample_emb_papyrus(C, dv, Pz, Q, perm, flip, nullptr, p2, frac, out, &kept);
+            sample_emb_coords(Pz, Q, dv, perm, flip, nullptr, V);
+            size_t ecl = 0, ekept = 0;
+            for (size_t q = 0; q < ng; q++) {
+                if (q % 7 == 3) { tot_none++; for (int c = 0; c < C; c++) bad += out[(size_t)c * ng + q] != 0; continue; }
+                int lo[3]; for (int d = 0; d < 3; d++) lo[d] = (int)lrintf(V[3 * q + d] - .5f * (dv - 1));
+                long n = 0;
+                for (int z = lo[0]; z < lo[0] + dv; z++) for (int y = lo[1]; y < lo[1] + dv; y++) for (int x = lo[2]; x < lo[2] + dv; x++)
+                    n += ct[((size_t)z * Q + y) * Q + x] >= lev;
+                const int keep = n >= frac * dv * dv * dv; keep ? ekept++ : ecl++;
+                for (int c = 0; c < C; c++) bad += out[(size_t)c * ng + q] != (keep ? ref[(size_t)c * ng + q] : 0);
+            }
+            bad += (cl != ecl) + (kept != ekept); tot_clear += cl; tot_kept += kept;
+        }
+        printf("papyrus gate: %zu targeted cells cleared, %zu kept, %zu untargeted; %zu mismatches vs brute force\n", tot_clear, tot_kept, tot_none, bad);
+        CHECK(bad == 0 && tot_clear > 50 && tot_kept > 50, "papyrus gate: %zu mismatches (cleared %zu kept %zu)", bad, tot_clear, tot_kept);
+        free(ct); free(p2); free(out); free(ref); free(V);
     }
     /* (3) the loss on the GPU */
     if (nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0)) { printf("no cuda: the loss check skipped\n"); return fails ? 1 : 0; }

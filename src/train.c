@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include "embz.h"
+#include "sample_emb.h"
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
@@ -124,7 +125,7 @@ static int g_gl_inplace;   /* the logit gradient over the fp16 logits (set befor
 static int g_head_slab;    /* unwrap: head, losses and head backward per z-slab (no whole-window logits or derived targets; set before the planner) */
 static int g_hs_z;         /* its planes per slab */
 static int g_ds; static float g_ds_w = 0.5f, g_ds_frac = 1.f; static int g_ds_anneal = 1;   /* --deep-sup K: decoder levels 1..K, weight w^j x frac */
-static int g_distill, g_distill_lev = 3, g_distill_div; static float g_distill_w = 1.f; static size_t g_distill_n;   /* --distill C: a C-channel 1^3 head on decoder level --distill-level
+static int g_distill, g_distill_lev = 3, g_distill_div; static float g_distill_w = 1.f; static float g_distill_pap;   /* --distill-papyrus F: targets only on head cells >= F papyrus */ static size_t g_distill_n;   /* --distill C: a C-channel 1^3 head on decoder level --distill-level
                                                                                                     (cells of g_distill_div^3 window voxels; g_distill_n int8 targets per batch), cosine loss x --distill-weight */
 static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64;   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
 static float g_pg_lambda, g_pg_dist[4] = {2.f}; static int g_pg_nd = 1;   /* --pgrad-lambda / --pgrad-dist (D[,D...], up to 4): the phase wavenumber loss (nn_pgrad_slab; head slabs only) */
@@ -1476,6 +1477,7 @@ int cmd_train(int argc, char **argv) {
            symmetry and warp like the labels (src/sample_emb.h); a resumed net keeps its head */
         g_distill = atoi(opt(argc, argv, "--distill", "0")); g_distill_lev = atoi(opt(argc, argv, "--distill-level", "3"));
         g_distill_w = (float)atof(opt(argc, argv, "--distill-weight", "1"));
+        g_distill_pap = (float)atof(opt(argc, argv, "--distill-papyrus", "0"));
         if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) { cfg.emb_lev = pc.emb_lev; cfg.emb_ch = pc.emb_ch; if (pc.emb_lev && g_distill) { g_distill = pc.emb_ch; g_distill_lev = pc.emb_lev; } } }
         if (g_distill) {
             if (g_distill < 0 || g_distill > 512 || g_distill_lev < 1 || g_distill_lev > cfg.nlev - 2 || !(g_distill_w > 0)) {
@@ -1529,6 +1531,8 @@ int cmd_train(int argc, char **argv) {
             }
             ns += ok > 0;
             if (s->nemb) fprintf(stderr, "distill: %s: %d of %d \"emb\" groups (%s, level %d)\n", s->name, ok, s->nemb, s->emb_name, s->emb_level);
+            if (s->nemb && g_distill_pap > 0) { if (s->pap_level > 0) fprintf(stderr, "distill: %s: targets on cells >= %.0f%% papyrus (CT >= %d)\n", s->name, 100. * g_distill_pap, s->pap_level);
+                                                else fprintf(stderr, "distill: WARNING: %s: no \"papyrus\" / \"iso\" level: its targets are not gated\n", s->name); }
         }
         if (bad || !ns) { fprintf(stderr, "distill: %s\n", bad ? "groups with the wrong channel count / type" : "no source has an \"emb\" group that opens"); return 2; }
     }
@@ -1571,7 +1575,7 @@ int cmd_train(int argc, char **argv) {
     sc.aux = g_xc == 5; sc.cond = g_cond; sc.cond_outside = g_cond_outside; sc.pap_head = g_pap_head ? &g_paph : nullptr;
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
     sc.wind4 = g_unwrap2; sc.wind4_step = atoi(opt(argc, argv, "--wind4-step", "80")); sc.wind4_min = atoi(opt(argc, argv, "--wind4-min", "512"));   /* unwrap2: band_wind4's join limit (phase codes) and smallest component */
-    sc.emb_ch = g_distill; sc.emb_div = g_distill_div;   /* --distill: the feature targets per head cell */
+    sc.emb_ch = g_distill; sc.emb_div = g_distill_div; sc.emb_pap = g_distill_pap;   /* --distill: the feature targets per head cell */
     { const int t = atoi(opt(argc, argv, "--wind4-tile", "64")); sc.wind4_tile = t > 0 ? t : -1; }   /* unwrap2: one gauge per tile of T voxels (>= P / 6), 0 = per window */
     sc.min_phase = atof(opt(argc, argv, "--min-phase", g_unwrap2 ? "0.001" : "0"));   /* side 2: windows with less known phase than this fraction are redrawn (unwrap2: 0.1%: band / phase-only sources draw anywhere) */
     if (!(sc.min_phase >= 0 && sc.min_phase < 1) || (sc.min_phase > 0 && g_side != 2)) { fprintf(stderr, "--min-phase: 0 .. 1, with the phase head (task unwrap / unwrap2)\n"); return 2; }
@@ -2761,7 +2765,9 @@ int cmd_train(int argc, char **argv) {
             if (g_ptrunc_tau > 0) { unsigned long long pc[2]; nn_phase_trunc_counts(pc); size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " trunc %.4f", pc[0] ? (double)pc[1] / pc[0] : 0.0); }
             else if (g_unwrap) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f normal bce %.4f", acc_ink / nacc, acc_norm / nacc); }
             if (g_ds) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ds %.4f", acc_ds / nacc); }
-            if (g_distill) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " distill %.4f (%.1f%% cells)", acc_emb / nacc, 100. * acc_embc / nacc / ((double)g_distill_n / g_distill)); }
+            if (g_distill) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " distill %.4f (%.1f%% cells)", acc_emb / nacc, 100. * acc_embc / nacc / ((double)g_distill_n / g_distill));
+                if (g_distill_pap > 0) { static size_t pc0, pk0; const size_t pc = atomic_load(&g_emb_pap_cleared), pk = atomic_load(&g_emb_pap_kept); na = strlen(affs);
+                    if (pc + pk > pc0 + pk0) snprintf(affs + na, sizeof affs - na, " (papyrus gate kept %.1f%% of the targeted)", 100. * (double)(pk - pk0) / (double)(pc + pk - pc0 - pk0)); pc0 = pc; pk0 = pk; } }
             if (g_cond) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " cond bce %.4f acc %.3f", acc_cond / nacc, acc_ck > 0 ? acc_cr / acc_ck : -1.0); }
             if (g_pap_head) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " papyrus bce %.4f", acc_pap / nacc); }
             if (g_restore) { size_t na = strlen(affs); const double p = psnr_of(acc_re, acc_rn), pb = psnr_of(acc_rb, acc_rn);

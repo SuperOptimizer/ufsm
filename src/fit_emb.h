@@ -26,6 +26,12 @@ emb_vol *emb_vol_open(const char *group, const char *name, const long long org[3
    embedding voxels [o, o + step) per axis; the data are copied */
 emb_vol *emb_vol_wrap(const int8_t *v, const int64_t n[3], int C, int step, const int64_t o[3], const long long org[3], double scale);
 void emb_vol_free(emb_vol *e);
+/* the papyrus gate (optional): sheet samples whose raw CT (native voxel, box-local; the array covers [o, o + n) and is owned by e from
+   here on) is below `level` are skipped, so votes compare papyrus only. emb_vol_papyrus_zarr reads the CT of the box org..org + n (+ pad)
+   from a native-level uint8 array. */
+typedef struct z3 z3;
+void emb_vol_set_papyrus(emb_vol *e, uint8_t *ct, const int64_t o[3], const int64_t n[3], int level);
+int emb_vol_papyrus_zarr(emb_vol *e, z3 *z, const long long org[3], const long long n[3], int pad, int level);
 int emb_vol_dim(const emb_vol *e);
 /* the trilinear unit vector at p (native voxels, box-local); 0 when no corner has a vector */
 int emb_at(const emb_vol *e, const double p[3], float *v);

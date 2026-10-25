@@ -2586,6 +2586,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         const double t = (z - g_crush.ca[0]) / g_crush.cA[0];
         cyz[z] = (float)((double)o[1] + g_crush.ca[1] + t * g_crush.cA[1]); cxz[z] = (float)((double)o[2] + g_crush.ca[2] + t * g_crush.cA[2]);
     }
+    uint8_t *embp2 = nullptr;   /* --distill-papyrus: the 2^3-block papyrus counts of the clean CT, before the appearance augmentation */
+    if (c->emb_ch && c->emb_pap > 0 && s->nemb && s->pap_level > 0 && !(Pz & 1) && !(P & 1)) {
+        if (!(embp2 = tp_get(p3 / 8, 0))) return -1;
+        sample_emb_pap2(ctu, Pz, P, s->pap_level, embp2);
+    }
     if (c->augment && scan_aug_enabled(&c->scan)) {   /* scanner domains on the source grid; the per-patch z-score follows them, as at inference */
         PROF_MARK(PS_ZSCORE);
         if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {
@@ -2744,7 +2749,10 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         int8_t *eo = b->emb + (size_t)i * c->emb_ch * ge;
         if (crushed || torn || curved) memset(eo, 0, ge * c->emb_ch);
         else if (sample_emb_window(s, c->emb_ch, c->emb_div, l, o, Pz, P, y.perm, y.flip, &spatial, eo)) return -1;
+        else if (embp2) { size_t kept = 0; const size_t cl = sample_emb_papyrus(c->emb_ch, c->emb_div, Pz, P, y.perm, y.flip, &spatial, embp2, c->emb_pap, eo, &kept);
+            atomic_fetch_add(&g_emb_pap_cleared, cl); atomic_fetch_add(&g_emb_pap_kept, kept); }
     }
+    if (embp2) tp_put(embp2, p3 / 8);
     PROF_MARK(PS_AUGMENT);
     const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0);
     if (c->gpu_input && (c->sheet || (app && Pz != P))) { fprintf(stderr, "sampler: --gpu-input needs write_x / write_spatial samples (sample_gpu_input_ok)\n"); abort(); }

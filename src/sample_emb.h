@@ -15,3 +15,14 @@ void sample_emb_coords(int Pz, int P, int div, const int perm[3], const int flip
    "emb"; groups that cannot be opened are skipped with a warning), -1 on a read error or a channel count other than C. Per-thread group handles (sampler workers) */
 int sample_emb_window(const source *s, int C, int div, int l, const int64_t o[3], int Pz, int P, const int perm[3], const int flip[3], const spatial_aug *sa,
                       int8_t *out);
+/* train --distill-papyrus: dinovol's embeddings in the voids carry the mesh labels' noise, so the targets are kept only on papyrus.
+   sample_emb_pap2: the papyrus count (raw CT >= level, 0..8) of every 2^3 block of a Pz x P x P source window (before the appearance
+   augmentation), (Pz / 2) (P / 2)^2 bytes (Pz, P even). sample_emb_papyrus: zero the targets of the cells whose div^3 source voxels
+   around their centre (V of sample_emb_coords, the 2^3 blocks nearest it; outside the window: no papyrus) are less than frac papyrus;
+   returns the number of targeted cells it cleared (*kept: those left) */
+void sample_emb_pap2(const uint8_t *ct, int Pz, int P, int level, uint8_t *pap2);
+size_t sample_emb_papyrus(int C, int div, int Pz, int P, const int perm[3], const int flip[3], const spatial_aug *sa, const uint8_t *pap2, float frac,
+                          int8_t *out, size_t *kept);
+/* (counts of sample_emb_papyrus over all windows: targeted cells cleared / kept; train reports the share) */
+#include <stdatomic.h>
+extern _Atomic size_t g_emb_pap_cleared, g_emb_pap_kept;

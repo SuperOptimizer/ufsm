@@ -100,20 +100,21 @@ int cmd_dino_halves(int argc, char **argv) {
 #include "unet.h"
 #include <unistd.h>
 #include <signal.h>
+#include "dino_pts.h"
 
 enum { DN_MAXSRC = 512, DN_MAXBOX = 256, DN_SLOTS = 64, DN_MAXW = 16 };   /* (slots / workers: at most; --slots / --workers) */
 typedef struct {
     char name[64]; z3 *ca, *cb, *codes, *ink, *phase; int halves; int cscale, pscale; float um;   /* phase: the stored winding phase (PHASE_* bytes; sources "phase": {"root", "key", "scale"}) */ float *axz;   /* scroll axis (y, x) per CT plane (sources "axis" + "axis_scale"), or nullptr */   /* CT voxels per code voxel (codes on a coarser grid; 1: the same grid) */
     int64_t org[3];                              /* added to window corners (ct array coordinates) to address the codes (global grid) */
     int nbox; int64_t box[DN_MAXBOX][6]; int nho; int64_t ho[DN_MAXBOX][6];
-    double weight, bvol; float center, scale, pap; int64_t shape[3];
+    double weight, bvol; float center, scale, pap, gtpap; int64_t shape[3];   /* gtpap: GT points only where raw CT > gtpap ("gt_papyrus"; < 0: all labelled voxels) */
     float srad;                                  /* "supcon_radius": GT SupCon pairs only within this distance (CT voxels; 0 = all pairs; pseudo labels: gauge-consistent only locally) */
     float srr;                                   /* "supcon_radial": pairs only within this difference of axis distance (CT voxels; needs "axis"): the fit's count errors are radial */
     int ct_only;                                 /* unlabelled (U0): SSL terms only (sampled by the ct_only share) */
     int nx; const rmap *xm[4]; rvol *xfv[4]; int xlc[4], xlf[4];   /* "xscan": registered partner scans (this CT = the map's coarse side at level xlc) */
     int32_t *mcell; int64_t nmcell; int mcs;     /* "mask": {"map": RAW, "min": m} (ufsm scanprep): the cells with code >= m (window centres), cell edge */
 } dn_src;
-typedef struct { int P, ngt, nssl, nair, margin; int nsrc; dn_src src[DN_MAXSRC]; double wsum; int ident; float xprob; int nink; double wsum_l, wsum_u, share_u; char excl[8][64]; int nexcl;
+typedef struct { int P, ngt, nssl, nair, margin, gtpap; int nsrc; dn_src src[DN_MAXSRC]; double wsum; int ident; float xprob; int nink; double wsum_l, wsum_u, share_u; char excl[8][64]; int nexcl;
     /* recipe views drawn by the loader workers: globals vP^3 (zoom zlo..zhi), vnloc locals vPL^3 (lzlo..lzhi); uw: per global view the stored phase
        resampled into the view + its winding mod 4 (band_wind4_tiled); ikp: the ink-splat probability resampled into the view */
     int vP, vPL, vnloc, uw, ikp; float zlo, zhi, lzlo, lzhi, vovl; } dn_data;   /* vovl: the globals' minimum overlap per axis (fraction of the smaller; 0: 1/4) */   /* share_u: the unlabelled sources' share of the draws (< 0: by weight over all; 0: labelled only) */   /* nink: ink points per sample (half ink, half no-ink) */   /* ident: no window geometry (the recipe draws its own views) */
@@ -276,18 +277,15 @@ static int sample_fill(dn_data *D, dn_sample *S, uint64_t *rs, int nthreads, uin
                 }
                 free(cb);
             }
-            long seen = 0; const int m = D->margin;
-            for (int z = m; z < P - m; z++) for (int y = m; y < P - m; y++) {
-                const uint8_t *row = codes_buf + ((size_t)z * P + y) * P;
-                for (int x = m; x < P - m; x++) {
-                    const int c = row[x]; if (!c || c == 255) continue;
-                    long k = seen++;
-                    if (k >= D->ngt) { k = (long)(rng_next(rs) % (uint64_t)seen); if (k >= D->ngt) continue; }
-                    const int sv[3] = {z, y, x}; int ov[3]; geom_map(&S->g, P, sv, ov);
-                    S->gidx[k] = (ov[0] * P + ov[1]) * P + ov[2]; S->gcode[k] = c; S->gxyz[3 * k] = ov[0]; S->gxyz[3 * k + 1] = ov[1]; S->gxyz[3 * k + 2] = ov[2];
-                }
-            }
+            const int m = D->margin;
+            int *sel = malloc((size_t)(D->ngt > 0 ? D->ngt : 1) * sizeof *sel); if (!sel) return -1;
+            const long seen = dn_gt_reservoir(codes_buf, S->ca, P, m, s->gtpap, D->ngt, rs, rng_next, sel, S->gcode);   /* (gtpap >= 0: papyrus voxels only) */
             S->ngt = (int)(seen < D->ngt ? seen : D->ngt);
+            for (int k = 0; k < S->ngt; k++) {
+                const int sv[3] = {sel[k] / (P * P), sel[k] / P % P, sel[k] % P}; int ov[3]; geom_map(&S->g, P, sv, ov);
+                S->gidx[k] = (ov[0] * P + ov[1]) * P + ov[2]; S->gxyz[3 * k] = ov[0]; S->gxyz[3 * k + 1] = ov[1]; S->gxyz[3 * k + 2] = ov[2];
+            }
+            free(sel);
             if (S->ngt < 64) S->ngt = 0;
             if (S->ngt && D->nair) {   /* air voxels (unlabelled, below the papyrus level, inside the scan) as one extra class (code 256) */
                 long sa = 0; const float lo = s->center - 0.5f * s->scale;
@@ -427,7 +425,8 @@ static int parse_box(const json *a, int64_t b[6]) {
 /* sources JSON: {"sources":[{"name", "root", "ct" (array key at the training grid), "ct_b" (optional: a second, noise-independent view of the same
    grid, e.g. ufsm halves a / b), "cache", "codes": {"root", "key"} (winding codes on the same grid; optional), "origin": [z,y,x] (ct coords + origin =
    codes coords; default 0), "boxes": [[z,y,x,nz,ny,nx]...] (ct coords; windows lie inside), "holdout": [[...]] (windows never touch), "weight",
-   "norm": [center, scale] (default: robust statistics of a box sample), "papyrus": raw CT above which a voxel counts as papyrus (default center)}]} */
+   "norm": [center, scale] (default: robust statistics of a box sample), "papyrus": raw CT above which a voxel counts as papyrus (default center),
+   "gt_papyrus": 0 | 1 | level (GT SupCon points: 0 every labelled voxel, 1 only papyrus (raw CT > "papyrus"), > 1 raw CT above that; default --gt-papyrus)}]} */
 /* robust input normalisation of a CT: median and IQR / 1.349 of the nonzero voxels of 8 random 128^3 blocks of the boxes */
 static void box_norm(z3 *ct, const int64_t (*box)[6], int nbox, uint64_t seed, int nthreads, float *center, float *scale) {
     int64_t hist[256] = {0}; uint8_t *b = malloc(128 * 128 * 128); uint64_t rs = seed;
@@ -554,11 +553,13 @@ static int load_sources(const char *path, dn_data *D, int nthreads) {
         else if (nm) { S->center = (float)json_num(json_get(nm, "center"), 100); S->scale = (float)json_num(json_get(nm, "scale"), 50); }   /* (train's form) */
         else box_norm(S->ca, (const int64_t (*)[6])S->box, S->nbox, 12345 + i, nthreads, &S->center, &S->scale);
         S->pap = (float)json_num(json_get(s, "papyrus"), S->center);
+        { const double g = json_num(json_get(s, "gt_papyrus"), D->gtpap);   /* 0: every labelled voxel; 1: papyrus only (raw CT > "papyrus"); > 1: raw CT above that */
+          S->gtpap = g <= 0 ? -1.f : g == 1 ? S->pap : (float)g; }
         S->srad = (float)json_num(json_get(s, "supcon_radius"), 0); S->srr = (float)json_num(json_get(s, "supcon_radial"), 0);
         if (S->srr > 0 && !S->axz) fprintf(stderr, "dino-train: WARNING: %s: supcon_radial without an axis: no radial limit\n", S->name);
         D->wsum += S->weight; if (S->ct_only) D->wsum_u += S->weight; else D->wsum_l += S->weight;
-        fprintf(stderr, "dino-train: source %s: %d boxes (%.2f Gvox), %d holdouts, %s, codes %s, weight %g, norm %.1f / %.1f, papyrus > %.0f%s\n", S->name, S->nbox, S->bvol / 1e9,
-                S->nho, S->halves ? "two views (ct / ct_b)" : "one CT (views by noise)", S->codes ? "yes" : "no", S->weight, S->center, S->scale, S->pap, S->srad > 0 && S->srr > 0 ? ", supcon radius + radial" : S->srad > 0 ? ", supcon radius" : S->srr > 0 ? ", supcon radial" : "");
+        fprintf(stderr, "dino-train: source %s: %d boxes (%.2f Gvox), %d holdouts, %s, codes %s, weight %g, norm %.1f / %.1f, papyrus > %.0f%s%s\n", S->name, S->nbox, S->bvol / 1e9,
+                S->nho, S->halves ? "two views (ct / ct_b)" : "one CT (views by noise)", S->codes ? "yes" : "no", S->weight, S->center, S->scale, S->pap, S->gtpap >= 0 ? " (GT points too)" : "", S->srad > 0 && S->srr > 0 ? ", supcon radius + radial" : S->srad > 0 ? ", supcon radius" : S->srr > 0 ? ", supcon radial" : "");
         D->nsrc++;
     }
     json_free(j);
@@ -2506,7 +2507,7 @@ int cmd_dino_train(int argc, char **argv) {
     const char *srcf = opt(argc, argv, "--sources", nullptr), *outd = opt(argc, argv, "--out", nullptr);
     if (!srcf || !outd) {
         fprintf(stderr, "usage: ufsm dino-train --sources S.json --out DIR [--P 256] [--widths 16,32,64,96,128,192] [--steps 20000] [--lr 1e-3] [--muon-lr 0.02]\n"
-                        "         [--wd 0.01] [--ema 0.996] [--warmup 500] [--gt-points 2048] [--ssl-points 2048] [--tau 0.1] [--hard-w 4] [--hard-r 48]\n"
+                        "         [--wd 0.01] [--ema 0.996] [--warmup 500] [--gt-points 2048] [--gt-papyrus 0|1 (GT points on papyrus only; source key gt_papyrus)] [--ssl-points 2048] [--tau 0.1] [--hard-w 4] [--hard-r 48]\n"
                         "         [--ssl 0.3 (weight; 0 = GT contrastive only)] [--protos 1024] [--ts 0.1] [--tt 0.04] [--center-m 0.9]\n"
                         "         [--noise 0.15] [--gain-jit 0.15] [--mask-frac 0] [--mask-cube 16] [--seed 1] [--workers 4] [--threads 4]\n"
                         "         [--eval SURF-LIST --eval-root R --eval-key K --eval-box z,y,x,nz,ny,nx --eval-every 2000 --eval-codes ROOT KEY --eval-norm c,s]\n"
@@ -2536,7 +2537,7 @@ int cmd_dino_train(int argc, char **argv) {
     const int K = atoi(opt(argc, argv, "--protos", "1024")), log_every = atoi(opt(argc, argv, "--log-every", "20")), save_every = atoi(opt(argc, argv, "--save-every", "2000"));
     const int eval_every = atoi(opt(argc, argv, "--eval-every", "2000")), nthreads = atoi(opt(argc, argv, "--threads", "4")), nwork = atoi(opt(argc, argv, "--workers", "4"));
     const uint64_t seed = strtoull(opt(argc, argv, "--seed", "1"), nullptr, 10);
-    dn_data *Dd = calloc(1, sizeof *Dd); Dd->P = P; Dd->ngt = atoi(opt(argc, argv, "--gt-points", "2048")); Dd->nssl = atoi(opt(argc, argv, "--ssl-points", "2048")); Dd->margin = 8; Dd->nair = atoi(opt(argc, argv, "--air-points", "0"));
+    dn_data *Dd = calloc(1, sizeof *Dd); Dd->P = P; Dd->ngt = atoi(opt(argc, argv, "--gt-points", "2048")); Dd->nssl = atoi(opt(argc, argv, "--ssl-points", "2048")); Dd->margin = 8; Dd->nair = atoi(opt(argc, argv, "--air-points", "0")); Dd->gtpap = atoi(opt(argc, argv, "--gt-papyrus", "0"));   /* the sources' default "gt_papyrus" */
     { char *t = strdup(opt(argc, argv, "--exclude-src", "")); for (char *q = strtok(t, ","); q && Dd->nexcl < 8; q = strtok(nullptr, ",")) snprintf(Dd->excl[Dd->nexcl++], 64, "%s", q); free(t); }
     Dd->share_u = atof(opt(argc, argv, "--unlabelled-share", "-1"));   /* the ct_only sources' share of the draws (< 0: by weight over all; 0: none) */
     const int recipe = atoi(opt(argc, argv, "--recipe", "0"));   /* the upstream dinovol recipe (dn_recipe): the sampler reads source windows */
