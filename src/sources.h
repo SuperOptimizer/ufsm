@@ -8,6 +8,9 @@
                    or {"root": "/vesuvius/ufsm/gt/labels/x.zarr", "group": "."}   (own root)},
        "axis": "/vesuvius/ufsm/umbilicus/PHerc0800/umbilicus-full-resolution.json",   (optional)
        "holdout": [z, y, x, nz, ny, nx],                                              (optional, level-0 voxels)
+         or [[z, y, x, nz, ny, nx], ...]: several boxes (the first is the validation box; training avoids all)
+       "holdout_file": "holdouts.json"   (optional: ufsm wbench boxes {"boxes": [{"ct": KEY, "l0": [6 numbers]}...]}; the entries
+         whose ct basename equals this source's ct basename are added to the holdout boxes)
        "weight": 1.0},
       {"name": "Paris4-recto", "root": "...", "ct": "PHercParis4/volumes/...zarr", "um": 2.4,
        "targets": {"recto": {"regions": "PHercParis4/representations/predictions/teacher_regions/recto-2.4um",
@@ -83,7 +86,8 @@ typedef struct {
     z3 **reg_z[NCH];        /* lazily opened region arrays */
     z3 *reg_shared[NCH];    /* the shared array when reg[ch]->array is set */
     axis ax;                /* n == 0 when unknown */
-    int64_t hold_o[3], hold_n[3];   /* optional held-out box (level-0 voxels); hold_n[0] == 0 when absent */
+    int64_t hold_o[3], hold_n[3];   /* optional held-out box (level-0 voxels); hold_n[0] == 0 when absent (= hold[0]: the validation box) */
+    int64_t (*hold)[6]; int nhold;  /* all held-out boxes (z y x nz ny nx, level 0): training windows touch none of them */
     int64_t (*box)[6]; int nbox;    /* optional "boxes": level-0 boxes [z, y, x, nz, ny, nx] of local CT (task restore: windows inside one) */
     /* optional band target (task band_affinity, src/band.h): winding_mod14 raster array on the 2x label grid,
        {"band": {"root": ..., "key": "4.8", "radius": 80, "span": 75}} under "targets" */
