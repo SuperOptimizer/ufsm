@@ -96,6 +96,30 @@ static int run_case(int dir) {
         CHECK(acc >= 0.995, "dir %+d: winding ids right %.4f < 0.995", dir, acc);
         CHECK(prec >= 0.99, "dir %+d: |error| < 0.08 at %.4f < 0.99", dir, prec);
     }
+    if (g_cpu && dir > 0 && g_robust == 0 && g_pgrad == 0 && g_bias == 0) {   /* a seed model (this fit one turn up: fit_model offsets + 1) on z [0, 96):
+                                                 the seeded refit with the slip repair carries its count (gauge k0 + 1) */
+        const double ps = (10 + 0.5) * H8, py = 600, px = 200, w0 = fit_W(m, ps, py, px);
+        for (int k = 0; k < m->nk; k++) m->offset[k] += 1.f;
+        const double w1 = fit_W(m, ps, py, px);
+        CHECK(fabs(w1 - w0 - 1) < 1e-4, "offset + 1 should raise W by one turn (%.4f)", w1 - w0);
+        for (int an = 0; an < 2; an++) {
+            fit_cfg cs = c; cs.seed = m; cs.seed_off = 0; cs.seed_z0 = 0; cs.seed_z = 96; cs.uw_repair = 8; cs.uw_rep_seed = an ? 16.f : 0.f; cs.dir = m->dir;
+            fit_model *m2 = fit_run(&f, &cs);
+            if (!m2) { fprintf(stderr, "FAIL: seeded fit_run\n"); fails++; continue; }
+            int h2[401] = {0};
+            for (size_t i = 0; i < n; i++) {
+                if (!w[i]) continue;
+                const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
+                const double pz = (z + 0.5) * H8, qy = (y + 0.5) * H8, qx = (x + 0.5) * H8;
+                const long k = lround(fit_W(m2, pz, qy, qx) - W_true(pz, qy, qx)); if (k >= -200 && k <= 200) h2[k + 200]++;
+            }
+            int g2 = 0; for (int k = 1; k < 401; k++) if (h2[k] > h2[g2]) g2 = k;
+            printf("seeded refit (seed model one turn up, anchor %s): gauge %d (unseeded %d), %.4f of the voxels at it\n", an ? "16" : "off", g2 - 200, k0 - 200, (double)h2[g2] / nd);
+            if (an) CHECK(g2 == k0 + 1 && h2[g2] >= 0.995 * nd, "anchored seeded refit: gauge %d (want %d) at %.4f", g2 - 200, k0 - 200 + 1, (double)h2[g2] / nd);
+            fit_free(m2);
+        }
+        for (int k = 0; k < m->nk; k++) m->offset[k] -= 1.f;
+    }
     if (!g_cpu && g_split == 0 && dir > 0) {   /* the CPU and GPU data terms agree (every voxel, the fitted model, the robust phase, the
                                                  winding mod 4 term and the recto anchors on planes made from the true W) */
         uint8_t *wd = malloc(4 * n), *rc = malloc(n); const int w4d = 24;

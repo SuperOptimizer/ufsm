@@ -996,7 +996,7 @@ static int cmd_fit(int argc, char **argv) {
     c.uw_rep_geo = (float)atof(opt(argc, argv, "--uw-rep-geo", "0")); c.uw_rep_gd = atoi(opt(argc, argv, "--uw-rep-gd", "8"));
     c.uw_rep_cs = (float)atof(opt(argc, argv, "--uw-rep-cs", "0")); c.uw_rep_dump = opt(argc, argv, "--uw-rep-dump", nullptr);
     c.uw_rep_qpow = (float)atof(opt(argc, argv, "--uw-rep-qpow", "3")); c.uw_rep_stretch = (float)atof(opt(argc, argv, "--uw-rep-stretch", "0.5"));
-    c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1")); c.phase_stretch = (float)atof(opt(argc, argv, "--phase-stretch", "0")); c.phase_stretch_r = atoi(opt(argc, argv, "--phase-stretch-r", "1"));
+    c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1")); c.uw_rep_seed = (float)atof(opt(argc, argv, "--uw-rep-seed", *opt(argc, argv, "--seed-model", "") ? "16" : "0"));   /* (fit --slab chaining: off unless given) */ c.uw_rep_geo_init = atoi(opt(argc, argv, "--uw-rep-geo-init", "0")); c.phase_stretch = (float)atof(opt(argc, argv, "--phase-stretch", "0")); c.phase_stretch_r = atoi(opt(argc, argv, "--phase-stretch-r", "1"));
     if (!(c.phase_stretch >= 0) || c.phase_stretch_r < 0 || c.phase_stretch_r > 4) { fprintf(stderr, "fit: --phase-stretch >= 0, --phase-stretch-r 0..4\n"); return 2; }
     /* embedding evidence for the slip repair (src/fit_emb.h): --emb GROUP (a dinovol-embed output group at the fields' scan level, or
        --emb-scale S embedding voxels per native voxel) [--emb-output tokens_unit] --uw-rep-emb W [--uw-rep-emb-d 16,48 native voxels]
@@ -1005,7 +1005,7 @@ static int cmd_fit(int argc, char **argv) {
     c.uw_rep_emb_rmax = atoi(opt(argc, argv, "--uw-rep-emb-rmax", "2")); c.uw_rep_emb_sub = atoi(opt(argc, argv, "--uw-rep-emb-sub", "2")); c.emb_phi = (float)atof(opt(argc, argv, "--emb-phi", "0"));
     if (*opt(argc, argv, "--uw-rep-emb-d", "")) { c.uw_rep_emb_nd = 0; char *t = strdup(opt(argc, argv, "--uw-rep-emb-d", "")); for (char *q = strtok(t, ","); q && c.uw_rep_emb_nd < 4; q = strtok(nullptr, ",")) c.uw_rep_emb_d[c.uw_rep_emb_nd++] = atoi(q); free(t); }
     if (!(c.uw_rep_emb >= 0) || !(c.uw_rep_emb_m0 > 0) || c.uw_rep_emb_rmax < 1 || c.uw_rep_emb_rmax > 8 || c.uw_rep_emb_sub < 1) { fprintf(stderr, "fit: --uw-rep-emb >= 0, --uw-rep-emb-m0 > 0, --uw-rep-emb-rmax 1..8, --uw-rep-emb-sub >= 1\n"); return 2; }
-    if (c.uw_repair < 0 || !(c.uw_rep_w4 >= 0) || !(c.uw_rep_geo >= 0) || !(c.uw_rep_cs >= 0) || c.uw_rep_gd < 1 || !(c.uw_rep_qpow > 0) || !(c.uw_rep_stretch >= 0) || c.uw_rep_sr < 0 || c.uw_rep_sr > 4) { fprintf(stderr, "fit: --uw-repair >= 0, --uw-rep-* weights >= 0, --uw-rep-gd >= 1\n"); return 2; }
+    if (c.uw_repair < 0 || !(c.uw_rep_w4 >= 0) || !(c.uw_rep_geo >= 0) || !(c.uw_rep_cs >= 0) || c.uw_rep_gd < 1 || !(c.uw_rep_qpow > 0) || !(c.uw_rep_stretch >= 0) || c.uw_rep_sr < 0 || c.uw_rep_sr > 4 || !(c.uw_rep_seed >= 0)) { fprintf(stderr, "fit: --uw-repair >= 0, --uw-rep-* weights >= 0, --uw-rep-gd >= 1\n"); return 2; }
     c.core = (float)atof(opt(argc, argv, "--core", "3"));   /* no data terms within core x pitch of the axis */
     c.w_wind4 = (float)atof(opt(argc, argv, "--wind4-weight", "0"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off: weight 4 cost fit-val, 0.5-1 neutral) */
     c.analytic = atoi(opt(argc, argv, "--analytic", "1")); c.packed_um = atof(opt(argc, argv, "--packed-um", "0")); c.batch = atoi(opt(argc, argv, "--batch", "2000000")); c.knot_dz = atoi(opt(argc, argv, "--knot-dz", "1024")); c.phase_stage = atoi(opt(argc, argv, "--phase-stage", "4"));
@@ -1056,6 +1056,21 @@ static int cmd_fit(int argc, char **argv) {
     c.um = fb.um;   /* default lattices and knots are physical: given in 2.4 um voxels, scaled to the fields' native voxels */
     if (!*opt(argc, argv, "--knot-dz", "")) c.knot_dz = fit_scale_L(1024, 2.4 / fb.um);
     if (!*opt(argc, argv, "--lattice", "")) for (int k = 0; k < c.nstage; k++) c.lattice[k] = fit_scale_L(c.lattice[k], 2.4 / fb.um);
+    fit_model *seedm = nullptr, *initm = nullptr;   /* --seed-model / --init-model: a neighbouring (separately fitted) box's model */
+    if (*opt(argc, argv, "--seed-model", "")) {
+        if (!(seedm = fit_load(opt(argc, argv, "--seed-model", "")))) { fprintf(stderr, "fit: cannot load --seed-model %s\n", opt(argc, argv, "--seed-model", "")); return 1; }
+        if (seedm->origin[1] != fb.origin[1] || seedm->origin[2] != fb.origin[2]) { fprintf(stderr, "fit: --seed-model must share the fields' y / x origin (z slabs)\n"); return 2; }
+        double z0 = -1e30, z1 = 1e30; const char *zs = opt(argc, argv, "--seed-z", "");
+        if (*zs && sscanf(zs, "%lf,%lf", &z0, &z1) != 2) { fprintf(stderr, "fit: --seed-z Z0,Z1\n"); return 2; }
+        c.seed = seedm; c.seed_off = (double)(fb.origin[0] - seedm->origin[0]); c.seed_z0 = z0; c.seed_z = z1;
+        if (c.dir == 0) c.dir = seedm->dir;
+        fprintf(stderr, "fit: integers on box-local native z [%.0f, %.0f) from the seed model (z offset %.0f), dir %+d\n", z0, z1, c.seed_off, c.dir);
+    }
+    if (*opt(argc, argv, "--init-model", "")) {
+        if (!(initm = fit_load(opt(argc, argv, "--init-model", "")))) { fprintf(stderr, "fit: cannot load --init-model %s\n", opt(argc, argv, "--init-model", "")); return 1; }
+        c.init = initm; for (int d = 0; d < 3; d++) c.init_off[d] = (double)(fb.origin[d] - initm->origin[d]);
+        if (c.dir == 0) c.dir = initm->dir;
+    }
     fit_set *fs = nullptr;
     if (min) fs = fit_set_load(min);
     else if (slab > 0) fs = fit_run_slabs(dir, &c, slab, overlap);
@@ -2612,6 +2627,7 @@ static int cmd_fit_compare(int argc, char **argv) {
     size_t hp[NP] = {0}, hca[NC] = {0}, hcb[NC] = {0}, hr[NR] = {0}, ha[NA] = {0}, sn[NS] = {0}, sg[NS] = {0}, kn[NK] = {0}, kg[NK] = {0}, m = 0, lt01 = 0, gt25 = 0;
     const double sb[NS + 1] = {0, 100, 140, 180, 240, 1e30}, cb[NK + 1] = {0, 0.2, 0.4, 0.6, 1.01};
     if (k > 1) printf("fit-compare: candidate cells %dx the reference's\n", k);
+    static size_t hrs[NS][NR]; memset(hrs, 0, sizeof hrs); double dra[NS] = {0}, drb[NS] = {0};   /* by reference spacing: spacing ratio histogram, summed densities (1 / um) */
     for (size_t i = 0; i < n; i++) {
         const size_t az = i / ((size_t)A.shape[1] * A.shape[2]), ay = i / A.shape[2] % A.shape[1], ax = i % A.shape[2];
         const size_t j = ((az / k) * B.shape[1] + ay / k) * B.shape[2] + ax / k;   /* the candidate cell */
@@ -2624,6 +2640,7 @@ static int cmd_fit_compare(int argc, char **argv) {
         hca[(int)fmin(NC - 1, ca * NC)]++; hcb[(int)fmin(NC - 1, cbv * NC)]++;
         const double spa = A.f.sp[i] * A.h / 8.0 * A.um, spb = B.f.sp[j] * B.h / 8.0 * B.um;   /* spacing in um (sp = 8 / (h rho)) */
         if (spa > 0 && spb > 0) hr[(int)fmin(NR - 1, fmax(0, (log2(spb / spa) + 2) / 4 * NR))]++;   /* log2 ratio in [-2, 2) */
+        if (spa > 0 && spb > 0) for (int k = 0; k < NS; k++) if (spa >= sb[k] && spa < sb[k + 1]) { hrs[k][(int)fmin(NR - 1, fmax(0, (log2(spb / spa) + 2) / 4 * NR))]++; dra[k] += 1 / spa; drb[k] += 1 / spb; }
         for (int k = 0; k < NS; k++) if (spa >= sb[k] && spa < sb[k + 1]) { sn[k]++; sg[k] += e > 0.25; }
         for (int k = 0; k < NK; k++) if (cbv >= cb[k] && cbv < cb[k + 1]) { kn[k]++; kg[k] += e > 0.25; }
         double va[3], vb[3]; fc_axis(&A.f, i, va); fc_axis(&B.f, j, vb);
@@ -2635,6 +2652,9 @@ static int cmd_fit_compare(int argc, char **argv) {
     printf("  phase |error| (turns): median %.3f p75 %.3f p90 %.3f; < 0.1 %.3f, > 0.25 %.3f\n", hist_q(hp, NP, 0, 0.5 / NP, 0.5), hist_q(hp, NP, 0, 0.5 / NP, 0.75), hist_q(hp, NP, 0, 0.5 / NP, 0.9), (double)lt01 / m, (double)gt25 / m);
     printf("  phase confidence: median %.2f (reference %.2f)\n", hist_q(hcb, NC, 0, 1.0 / NC, 0.5), hist_q(hca, NC, 0, 1.0 / NC, 0.5));
     printf("  spacing ratio: median %.3f p10 %.3f p90 %.3f\n", exp2(hist_q(hr, NR, -2, 4.0 / NR, 0.5)), exp2(hist_q(hr, NR, -2, 4.0 / NR, 0.1)), exp2(hist_q(hr, NR, -2, 4.0 / NR, 0.9)));
+    printf("  density ratio (candidate / reference, the sum over cells: the count ratio; median of the per-cell ratio) by reference spacing:");
+    for (int k = 0; k < NS; k++) if (sn[k]) printf("  %s%.0f um %.3f (%.3f)", k == NS - 1 ? ">= " : "< ", k == NS - 1 ? sb[k] : sb[k + 1], dra[k] > 0 ? drb[k] / dra[k] : 0, 1 / exp2(hist_q(hrs[k], NR, -2, 4.0 / NR, 0.5)));
+    printf("\n");
     printf("  normal angle (degrees): median %.1f p90 %.1f\n", hist_q(ha, NA, 0, 90.0 / NA, 0.5), hist_q(ha, NA, 0, 90.0 / NA, 0.9));
     printf("  gross phase errors by reference spacing:");
     for (int k = 0; k < NS; k++) printf("  %s%.0f um %.3f (%zu)", k == NS - 1 ? ">= " : "< ", k == NS - 1 ? sb[k] : sb[k + 1], sn[k] ? (double)sg[k] / sn[k] : 0, sn[k]);

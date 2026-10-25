@@ -67,6 +67,9 @@ typedef struct {
                                        sheet): a phase that lost a sheet is stretched (s ~0.5-0.7 where it disagrees with the published wraps
                                        on Paris 4, 1.05 where it agrees), so the cut prefers it (0 off) */
     int uw_rep_sr;                  /* the stretch's box radius (field voxels: (2r+1)^3; 0 the voxel's own central differences) */
+    int uw_rep_geo_init;            /* 1: the uw_rep_geo votes from the init model's W (fit --init-model, e.g. a global coarse fit) */
+    float uw_rep_seed;              /* with a seed model: each piece holding seeded voxels is tied to its seeded integers by an anchor vote of
+                                       weight uw_rep_seed x its seeded voxels' confidence sum (so the repair cannot move the carried count; 0 free) */
     float phase_stretch;            /* gate the phase confidence by the phase stretch s (uwr_stretch: |grad phase| x spacing): x exp(-log2(s)^2 / 2 S^2)
                                        before the fit (0 off), so where the phase skips or doubles sheets the density sets the turn count */
     int phase_stretch_r;            /* its box radius (field voxels) */
@@ -92,7 +95,7 @@ typedef struct {
     double init_off[3];
     const struct fit_model *seed;   /* voxel unwrapping: field voxels below box-local z seed_z take their integer from this model
                                        (its z = ours + seed_off) instead of flooding from one seed (the previous slab of a set) */
-    double seed_off, seed_z;
+    double seed_off, seed_z, seed_z0;   /* seed_z0: only box-local z >= seed_z0 is seeded (fit_cfg_default -1e30; fit --seed-model / --seed-z) */
     int batch;                      /* analytic: field voxels per step (about; 0 = all) */
     float core;                     /* no data terms within core * pitch of the axis */
     float w_ct;                     /* CT papyrus / void parity (fields with a ct plane; src/fit_terms.h fit_ct_term; phase stages, ramped

@@ -36,7 +36,8 @@ fit_cfg fit_cfg_default(void) {
     c.w_recto = 0.f;    /* recto anchors off by default */
     c.w_ct = 0.f; c.ct_pow = 1.f; c.ct_phi = 0.f; c.ct_radius_um = 150; c.ct_floor = 0.f;   /* CT parity off by default */
     c.w_cspacing = 0.f; c.cs_tol = 0.25f; c.ct_flood = 0;
-    c.uw_repair = 0; c.uw_rep_qpow = 1.f; c.uw_rep_sr = 1; c.uw_rep_gd = 8; c.phase_stretch_r = 1;   /* local slip repair off by default */
+    c.seed_z0 = -1e30;
+    c.uw_repair = 0; c.uw_rep_qpow = 1.f; c.uw_rep_sr = 1; c.uw_rep_seed = 0.f; c.uw_rep_gd = 8; c.phase_stretch_r = 1;   /* local slip repair off by default */
     c.emb = nullptr; c.uw_rep_emb = 0.f; c.uw_rep_emb_m0 = 0.3f; c.emb_phi = 0.f; c.uw_rep_emb_rmax = 2; c.uw_rep_emb_sub = 2;   /* embedding evidence off */
     c.uw_rep_emb_nd = 2; c.uw_rep_emb_d[0] = 16; c.uw_rep_emb_d[1] = 48; c.uw_rep_emb_d[2] = 128;   /* emb-calib (HOLD): P(r right) 0.99 at conf >= 0.2 for D <= 48, 0.88 at 128 */
     return c;
@@ -354,10 +355,10 @@ static void uw_setup(void *a, int z0, int z1, int t) {
     }
     x->qb[t] = qb; x->sb[t] = sb;
 }
-static void uw_seedmodel(void *a, int z0, int z1, int t) {   /* the seed model's region below seed_z: its integers */
+static void uw_seedmodel(void *a, int z0, int z1, int t) {   /* the seed model's region [seed_z0, seed_z): its integers */
     uw_ctx *x = a; const fit_fields *f = x->f; const fit_cfg *c = x->c;
     for (int z = z0; z < z1; z++) {
-        const double pz = (z + 0.5) * f->h; if (pz >= c->seed_z) continue;
+        const double pz = (z + 0.5) * f->h; if (pz >= c->seed_z || pz < c->seed_z0) continue;
         const double cy = axis_lerp(f->cy, x->na, pz), cx = axis_lerp(f->cx, x->na, pz);
         for (int y = 0; y < f->H; y++) for (int xx = 0; xx < f->W; xx++) {
             uw_vox *v = &x->V[ub_id(&x->g, z, y, xx)]; if (!v->bk) continue;
@@ -802,7 +803,12 @@ static void uwr_tiles(void *a, int z0_, int z1_, int th) {
                         double want;   /* the evidence's W(j) - W(i) */
                         if (ev == 0) {   /* mod 4: the candidate nearest the model's difference */
                             const double dl = f->wd[ax][fi] / 64.0, dm = Wm1 - Wm0; want = dl + 4 * round((dm - dl) / 4);
-                        } else if (ev == 1) want = Wm1 - Wm0;
+                        } else if (ev == 1) {   /* uw_rep_geo_init: the --init-model's W (a global coarse fit) instead of this fit's gradient stages */
+                            if (u->c->uw_rep_geo_init && u->c->init) {
+                                const fit_model *gm = u->c->init; const double *o = u->c->init_off, h = f->h;
+                                want = fit_W(gm, (zn + 0.5) * h + o[0], (yn + 0.5) * h + o[1], (xn + 0.5) * h + o[2]) - fit_W(gm, (z + 0.5) * h + o[0], (y + 0.5) * h + o[1], (xx + 0.5) * h + o[2]);
+                            } else want = Wm1 - Wm0;
+                        }
                         else {   /* turns along the model's gradient from the CT spacing (mean of the two ends' spacings) */
                             const size_t fj = ((size_t)zn * f->H + yn) * f->W + xn; if (!f->cs[fj]) continue;
                             const double spn = 0.5 * (f->cs[fi] + f->cs[fj]) * f->h / 8.0;   /* native voxels per turn */
@@ -881,10 +887,27 @@ static void uw_repair(uw_ctx *x, size_t nr, const fit_cfg *c) {
     size_t nv = 0; for (int t = 0; t < x->nt; t++) nv += u.nv[t];
     l1_vote *v = malloc((nv ? nv : 1) * sizeof *v); nv = 0;
     for (int t = 0; t < x->nt; t++) { if (u.nv[t]) memcpy(v + nv, u.v[t], u.nv[t] * sizeof *v); nv += u.nv[t]; free(u.v[t]); }
+    uint32_t nn = (uint32_t)np; size_t na = 0;   /* the seed anchor: node np, tied to each piece holding seeded voxels (shift 0 wanted) */
+    if (c->seed && c->uw_rep_seed > 0 && np) {
+        int64_t *aw = calloc(np, sizeof *aw);
+        if (aw) {
+            for (int z = 0; z < g->D; z++) {
+                const double pz = (z + 0.5) * f->h; if (pz >= c->seed_z || pz < c->seed_z0) continue;
+                for (int y = 0; y < g->H; y++) for (int xx = 0; xx < g->W; xx++) { const uint32_t i = ub_id(g, z, y, xx); if (u.comp[i]) aw[uwr_gid(&u, z, y, xx, i)] += x->V[i].bk; }
+            }
+            for (uint64_t k = 0; k < np; k++) na += aw[k] > 0;
+            l1_vote *v2 = na ? realloc(v, (nv + na) * sizeof *v) : v;
+            if (v2) { v = v2; for (uint64_t k = 0; k < np; k++) if (aw[k] > 0) v[nv++] = (l1_vote){(uint32_t)k, (uint32_t)np, 0, (int64_t)llround(c->uw_rep_seed * (double)aw[k])}; nn = (uint32_t)np + 1; }
+            else na = 0;
+            free(aw);
+        }
+    }
     nv = l1_votes_merge(v, nv);
     const double t1 = nn_wall_seconds();
-    int32_t *s = calloc(np ? np : 1, sizeof *s); l1_stats st = {0};
-    if (l1_solve((uint32_t)np, v, nv, s, 256, &st)) fprintf(stderr, "fit: out of memory for the slip repair's solve (skipped)\n");
+    int32_t *s = calloc(nn ? nn : 1, sizeof *s); l1_stats st = {0};
+    if (l1_solve(nn, v, nv, s, 256, &st)) fprintf(stderr, "fit: out of memory for the slip repair's solve (skipped)\n");
+    if (nn > np) { const int32_t s0 = s[np]; for (uint64_t k = 0; k < np; k++) s[k] -= s0; }   /* the anchor's gauge */
+    if (c->verbose && na) fprintf(stderr, "fit: slip repair: %zu pieces anchored to the seed model's integers (weight %g)\n", na, (double)c->uw_rep_seed);
     const double t2 = nn_wall_seconds();
     size_t pm = 0, vm = 0;
     for (uint64_t k = 0; k < np; k++) pm += s[k] != 0;
