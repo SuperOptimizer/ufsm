@@ -6,13 +6,16 @@ extern "C" void nn_set_pos_weight(float w) { g_posw = w; }
 int g_tol = 0;
 extern "C" void nn_set_loss_tol(int r) { g_tol = r < 0 ? 0 : r > 2 ? 2 : r; }
 extern "C" int nn_get_loss_tol(void) { return g_tol; }
+static int g_unit_ch7 = -1;   /* nn_set_loss_unit_ch7: in 7-channel losses (task unwrap: n n^T 6 + density) this channel's mask weight counts as 0 / 1 */
+extern "C" void nn_set_loss_unit_ch7(int c) { g_unit_ch7 = c; }
+#define UNITC(C) ((C) == 7 ? g_unit_ch7 : -1)
 int g_logits_h16 = 0;   /* the logits the losses read are fp16 (unet_logits_h16: lean training with the logit gradient beside them) */
 extern "C" void nn_set_logits_h16(int on) { g_logits_h16 = on; }
 int g_head_h16 = 0;
 extern "C" void nn_set_head_out_h16(int on) { g_head_h16 = on; }
 template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
-                                                   int tol, uint8_t *code, int D, int H, int W) {
-    int nc = blockIdx.x, slab = blockIdx.y, n = nc / C;
+                                                   int tol, uint8_t *code, int D, int H, int W, int unit_c = -1) {
+    int nc = blockIdx.x, slab = blockIdx.y, n = nc / C; const bool unit = nc % C == unit_c;
     float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0;   /* per-thread fp32 partials, fp64 block reduction */
     if (w[nc]) {
         const LT *l = lg + (size_t)nc * S; const uint8_t *tp = t + (size_t)nc * S, *mp = m + (size_t)n * S;
@@ -26,7 +29,7 @@ template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t 
 #pragma unroll
             for (int k = 0; k < LS_V; k++) {
                 const size_t i = i0 + (size_t)k * blockDim.x;
-                mb[k] = i < hi ? mp[i] : 0u; tb[k] = 0u; xl[k] = 0.f;
+                mb[k] = i < hi ? mp[i] : 0u; if (unit && mb[k]) mb[k] = 1u; tb[k] = 0u; xl[k] = 0.f;
                 if (mb[k]) { xl[k] = lgv(l, i); tb[k] = tp[i]; }
             }
 #pragma unroll
@@ -102,8 +105,8 @@ extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const u
     cudaMemsetAsync(ds, 0, (size_t)5 * NC * sizeof(double));
     /* slabs per (n, c): at least KSLAB and ~512 blocks in all (one recto channel with KSLAB slabs left most SMs idle) */
     const int slabs = NC >= 16 ? KSLAB : 512 / NC;
-    if (g_logits_h16) loss_stats_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, tol, code, s.d, s.h, s.w);
-    else loss_stats_k<float><<<dim3(NC, slabs), 256>>>(logits, t, m, w, s.c, S, ds, g_posw, tol, code, s.d, s.h, s.w);
+    if (g_logits_h16) loss_stats_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, tol, code, s.d, s.h, s.w, UNITC(s.c));
+    else loss_stats_k<float><<<dim3(NC, slabs), 256>>>(logits, t, m, w, s.c, S, ds, g_posw, tol, code, s.d, s.h, s.w, UNITC(s.c));
     zs_reduce(ds, 5 * NC);   /* spatial split: statistics of the whole window (the halo planes are masked out by the caller) */
     loss_d2f_k<<<nblk(5 * NC, 128), 128>>>(ds, scratch, 5 * NC);
     loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, fin);
@@ -111,13 +114,13 @@ extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const u
         size_t n = shape_numel(s);
         if (g_logits_h16) {
             const f16 *l16 = (const f16 *)logits;
-            if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall);
-            else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
-            else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
+            if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
+            else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
+            else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
         } else
-        if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall);
-        else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
-        else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall);
+        if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
     }
     KCHECK();
 }
@@ -211,8 +214,8 @@ extern "C" void nn_loss_pack(const void *logits, const uint8_t *t, const uint8_t
    that scratch. No tolerance band. Same per-element arithmetic as nn_loss_async_tol (fp64 sums in another order) */
 extern "C" void nn_loss_stats_acc(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds) {
     const size_t S = shape_spatial(s); const int NC = s.n * s.c, slabs = NC >= 16 ? KSLAB : 512 / NC;
-    if (g_logits_h16) loss_stats_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w);
-    else loss_stats_k<float><<<dim3(NC, slabs), 256>>>((const float *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w);
+    if (g_logits_h16) loss_stats_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c));
+    else loss_stats_k<float><<<dim3(NC, slabs), 256>>>((const float *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c));
     KCHECK();
 }
 extern "C" void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float *scratch) {
@@ -227,12 +230,12 @@ extern "C" void nn_loss_grad_only(const void *logits, const uint8_t *t, const ui
     const float *fin = scratch + (size_t)5 * s.n * s.c;
     if (g_logits_h16) {
         const f16 *l16 = (const f16 *)logits;
-        if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall);
-        else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
-        else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
-    } else if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall);
-    else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
-    else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall);
+        if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+    } else if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, 1.f, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+    else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+    else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
     KCHECK();
 }
 /* ---- count loss (train --count-lambda): turns along sheet-normal segments ----
