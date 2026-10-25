@@ -121,6 +121,16 @@ int main(void) {
         CHECK(!bad && wind_dense_code(NAN) == 255 && wind_code_q(255, WIND_WINDING) != wind_code_q(255, WIND_WINDING) && wind_dense_code(14) == 0 && wind_dense_code(-1.0 / 18) == 251,
               "wind_dense_code: %d codes off", bad);
     }
+    {   /* fit --winding-mod14 3: W -> stored-phase code round(252 frac(sign W)) (PHASE_* 0..251, sheet at 0); NaN / huge -> 255 */
+        int bad = 0;
+        for (double W = -40; W <= 40; W += 0.0071) for (int sg = -1; sg <= 1; sg += 2) {
+            const uint8_t c = fit_phase_code(W, sg); const double v = sg * W, f = v - floor(v);
+            double d = c / 252.0 - f; d -= round(d);
+            bad += c > 251 || !(fabs(d) <= 0.5 / 252 + 1e-9);
+        }
+        CHECK(!bad && fit_phase_code(NAN, 1) == 255 && fit_phase_code(1e20, 1) == 255 && fit_phase_code(3, 1) == 0 && fit_phase_code(2.25, 1) == 63 &&
+              fit_phase_code(2.25, -1) == 189 && fit_phase_code(-0.001, 1) == 0, "fit_phase_code: %d codes off", bad);
+    }
     ref = calloc((size_t)LZ * LY * LX, 1);
     for (int z = 0; z < LZ; z++) for (double q = 1.0; q <= 5.0; q += 0.0005) {   /* the reference wraps, rasterised on the label grid */
         const double rho = R0 + P * q, th = 2 * M_PI * q;

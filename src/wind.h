@@ -136,6 +136,11 @@ static inline uint8_t wind_dense_code(double W) {
     if (!(W == W) || W > 1e15 || W < -1e15) return 255;
     long long k = llround(W * 18) % 252; if (k < 0) k += 252; return (uint8_t)k;
 }
+/* a fit's W as a stored-phase code (src/band.h PHASE_*: round(252 frac(sign W)) mod 252, sheets at 0; 255 unknown): fit --winding-mod14 3 */
+static inline uint8_t fit_phase_code(double W, int sign) {
+    if (!(W == W) || W > 1e15 || W < -1e15) return 255;
+    const double v = sign * W; long long k = llround((v - floor(v)) * 252) % 252; if (k < 0) k += 252; return (uint8_t)k;
+}
 /* code -> q_ref (turns mod 14), NaN without a winding */
 static inline float wind_code_q(uint8_t c, int kind) {
     if (kind == WIND_CODES) return c >= 1 && c <= 252 ? (float)(c - 1) / 18.f : __builtin_nanf("");

@@ -173,9 +173,11 @@ sources *sources_load(const char *path) {
         if (bt) {
             const char *broot = json_str(json_get(bt, "root"), nullptr), *bkey = json_str(json_get(bt, "key"), "4.8");
             s->band_radius = (float)json_num(json_get(bt, "radius"), 80); s->band_span = (float)json_num(json_get(bt, "span"), 75);
+            const json *pt0 = json_get(bt, "phase");
+            s->phase_only = !broot && pt0 && json_get(pt0, "level");   /* phase-only: the band handle aliases the stored phase (below) */
             store *bs = broot ? store_open(broot) : nullptr;
             s->band = bs ? z3_open(bs, bkey, nullptr) : nullptr;
-            if (!s->band || !(s->band_radius > 0) || !(s->band_span >= 0)) {
+            if ((!s->band && !s->phase_only) || !(s->band_radius > 0) || !(s->band_span >= 0)) {
                 fprintf(stderr, "sources: %s: cannot open band target %s/%s (%s)\n", s->name, broot ? broot : "?", bkey, z3_error());
                 json_free(j); sources_free(S); return nullptr;
             }
@@ -188,9 +190,17 @@ sources *sources_load(const char *path) {
                 const double sg = json_num(json_get(pt, "phase_sign"), 1);
                 if (sg != 1 && sg != -1) { fprintf(stderr, "sources: %s: \"phase_sign\" must be 1 or -1\n", s->name); json_free(j); sources_free(S); return nullptr; }
                 s->phase_sign = (int)sg;
+                if (s->phase_only) {
+                    if (!s->phase || s->phase_level < 0 || s->phase_level >= MAXLEV) {
+                        fprintf(stderr, "sources: %s: phase-only band: cannot open the stored phase %s/%s, or level not 0..%d\n", s->name, proot ? proot : "?", pkey, MAXLEV - 1);
+                        json_free(j); sources_free(S); return nullptr;
+                    }
+                    s->band = s->phase;   /* (sources_free closes it once) */
+                }
                 const z3_meta *bm = z3_meta_of(s->band), *pm = s->phase ? z3_meta_of(s->phase) : nullptr;
                 const int sh = s->phase_level - 1;   /* the label grid is level 1: shapes halve per level above it */
-                if (!pm || sh < 0 || sh > 4 || pm->shape[0] != (bm->shape[0] + (1 << sh) - 1) >> sh || pm->shape[1] != (bm->shape[1] + (1 << sh) - 1) >> sh || pm->shape[2] != (bm->shape[2] + (1 << sh) - 1) >> sh) {
+                if (s->phase_only) {}
+                else if (!pm || sh < 0 || sh > 4 ||pm->shape[0] != (bm->shape[0] + (1 << sh) - 1) >> sh || pm->shape[1] != (bm->shape[1] + (1 << sh) - 1) >> sh || pm->shape[2] != (bm->shape[2] + (1 << sh) - 1) >> sh) {
                     fprintf(stderr, "sources: %s: cannot open the stored phase %s/%s or its shape differs from the band codes'\n", s->name, proot ? proot : "?", pkey);
                     json_free(j); sources_free(S); return nullptr;
                 }
@@ -304,7 +314,7 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
-        z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); free(s->box); free(s->focus); free(s->mask); srpair_free(s->srp);
+        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); free(s->box); free(s->focus); free(s->mask); srpair_free(s->srp);
         for (int c = 0; c < NCH; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {

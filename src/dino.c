@@ -2814,7 +2814,9 @@ int cmd_dino_boxes(int argc, char **argv) {
         const size_t nv = (size_t)g[0] * g[1] * g[2]; uint8_t *v = malloc(nv); FILE *f = fopen(mp, "rb");
         if (!v || !f || fread(v, 1, nv, f) != nv) { fprintf(stderr, "dino-boxes: cannot read %s\n", mp); return 1; } fclose(f);
         typedef struct { int64_t o[3]; double fr; } cand; size_t cap = 1 << 16, nc = 0; cand *cd = malloc(cap * sizeof *cd);
-        const int64_t zm = (int64_t)(g[0] * atof(opt(argc, argv, "--z-margin", "0.08")));   /* (the scan's z ends: mounts, partial slices) */
+        int64_t zm = (int64_t)(g[0] * atof(opt(argc, argv, "--z-margin", "0.08")));   /* (the scan's z ends: mounts, partial slices) */
+        const int al = atoi(opt(argc, argv, "--align", "0"));   /* box origins on multiples of AL output voxels (a shard grid; AL divides B / 2 and is whole cells) */
+        if (al > 0) { if (al % cs || (B / 2) % al) { fprintf(stderr, "dino-boxes --mask: --align %d must be whole cells (%d) and divide B / 2\n", al, cs); return 2; } const int64_t ac = al / cs; zm = (zm + ac - 1) / ac * ac; }
         for (int64_t z = zm; z + b <= g[0] - zm; z += b / 2) for (int64_t y = 0; y + b <= g[1]; y += b / 2) for (int64_t x = 0; x + b <= g[2]; x += b / 2) {
             size_t cnt = 0; for (int64_t a = 0; a < b; a++) for (int64_t e = 0; e < b; e++) for (int64_t c = 0; c < b; c++) cnt += v[((size_t)(z + a) * g[1] + y + e) * g[2] + x + c] != 0;
             const double fr = (double)cnt / ((double)b * b * b); if (fr < mf) continue;

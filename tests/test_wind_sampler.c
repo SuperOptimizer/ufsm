@@ -158,6 +158,45 @@ int main(int argc, char **argv) {
         printf("wind sampler: sparse labels: %.3f of the voxels with a known phase, %llu rejected\n", kn / (double)(NB * p3), (unsigned long long)rj2);
         check("sparse labels: windows drawn around the labelled phase chunks", inbox && kn > NB * p3 / 4);
     }
+    {   /* phase-only source (fit --winding-mod14 3 pseudo labels): "band" without "root", the stored phase at level 0 (the CT grid):
+           loads, windows at level 0 carry the stored codes unchanged (no symmetry: side[k] = phase at corner + k) */
+        const int n = 256; uint8_t *ph = malloc((size_t)n * n * n); assert(ph);
+        for (int z = 0; z < n; z++) for (int y = 0; y < n; y++) for (int x = 0; x < n; x++) {
+            const double w = fx_wind(z, y, x), f = w - floor(w); int cc = (int)(f * PHASE_PERIOD); if (cc >= PHASE_PERIOD) cc = PHASE_PERIOD - 1;
+            ph[((size_t)z * n + y) * n + x] = z < 128 ? (uint8_t)cc : PHASE_UNKNOWN;
+        }
+        char pp[1600]; snprintf(pp, sizeof pp, "%s/phase0/0", dir);
+        const int64_t hs[3] = {n, n, n}; fx_volctx cv = {ph, n};
+        if (fx_write_arr(pp, hs, 0.f, PHASE_UNKNOWN, fx_cut, &cv)) return 1;
+        snprintf(path, sizeof path, "%s/sources0.json", dir); FILE *f = fopen(path, "w"); assert(f);
+        fprintf(f, "{\"sources\": [{\"name\": \"phase-only\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/axis.json\", \"weight\": 1,\n"
+                   "  \"targets\": {\"band\": {\"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase0\", \"key\": \"0\", \"level\": 0}}}}]}\n", dir, dir, dir);
+        fclose(f);
+        sources *S3 = sources_load(path);
+        check("phase-only source (band without root, phase level 0) loads", S3 && S3->n == 1 && S3->src[0].phase_only && S3->src[0].phase_level == 0);
+        if (S3) {
+            sample_cfg c3 = c; c3.nworkers = 2; c3.nbuf = 4; c3.augment = 0; c3.symmetry_p = 0; c3.rotate_p = 0; c3.zoom_p = 0; c3.elastic_p = 0;
+            c3.geometry_augment = 0; c3.deterministic = 1; memset(c3.scan.p, 0, sizeof c3.scan.p);
+            sampler *s3 = sampler_start(S3, &c3); assert(s3);
+            size_t kn = 0, bad = 0;
+            for (int i = 0; i < NB; i++) {
+                batch *bb = sampler_next(s3); assert(bb);
+                const int64_t *o = bb->corner[0];
+                for (int z = 0; z < PW; z++) for (int y = 0; y < PW; y++) for (int x = 0; x < PW; x++) {
+                    const uint8_t v = bb->side[((size_t)z * PW + y) * PW + x];
+                    const int64_t gz = o[0] + z, gy = o[1] + y, gx = o[2] + x;
+                    const int inside = gz >= 0 && gz < n && gy >= 0 && gy < n && gx >= 0 && gx < n;
+                    const uint8_t want = inside ? ph[((size_t)gz * n + gy) * n + gx] : PHASE_UNKNOWN;
+                    kn += v < PHASE_PERIOD; bad += v < PHASE_PERIOD && v != want;   /* (the sampler blanks the phase where the CT is empty: outside the scroll) */
+                }
+                sampler_release(s3, bb);
+            }
+            sampler_stop(s3); sources_free(S3);
+            printf("wind sampler: phase-only level 0: %.3f known, %zu voxels differ from the stored codes\n", kn / (double)(NB * p3), bad);
+            check("phase-only level 0: windows carry the stored phase codes unchanged (where known)", kn > 0 && bad == 0);
+        }
+        free(ph);
+    }
     if (argc < 2) { char cmd[1500]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) failed++; }
     return failed != 0;
 }
