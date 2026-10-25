@@ -27,6 +27,9 @@ The 31 boxes (plus J18 J21 J28 J29 J31 J33) whose wind96 label ceiling is under 
 note `label-noise` and are skipped unless `BOXES=all`: their labels, not the model, limit the score (e.g. 139-2 ids 0.78 at
 ceil 0.55). They stay held out of training. `BT=file` runs another box list (e.g. `cand-1667.tsv`).
 
+`BOXES=core` (44 boxes, ~50 min on the laptop: the clean paris4 + paris4j boxes and 12 z-spread 1667 boxes tagged `core`) is the
+routine snapshot eval; the full clean set (88, ~1.7 h) is for milestone students and fitter arms.
+
 **Training must avoid all of them.** Add this to every source entry of 0139, 0814, 0500P2, Paris 4 and 1667 (the train sampler
 and `dino-train` both read it):
 

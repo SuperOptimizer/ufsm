@@ -6,7 +6,7 @@
 #   same fitter on label phase; cached per fitter config). Then (SLABS=1) Paris 4 full-cross-section slab sites: 2 overlapping
 #   96-cell slab fits per site, radius profile, fit-join overlap share, joined site score.
 #   Rows: $WB/res/TAG.tsv (boxes), $WB/res/TAG-slabs.tsv, $WB/res/TAG-radius.tsv; logs $WB/runs/TAG/. Compare with ufsm wbench-stats.
-# Env: SITE laptop|desk (default: laptop if ~/ufsm-data exists), GPU (0), BOXES ("clean" default: boxes not tagged label-noise in boxes.tsv | "all" | names), REP (2: shifted fits per box, 0 off),
+# Env: SITE laptop|desk (default: laptop if ~/ufsm-data exists), GPU (0), BOXES ("clean" default: boxes not tagged label-noise in boxes.tsv | "core": the clean paris4 + paris4j boxes + 12 1667 boxes tagged core (routine snapshot evals) | "all" | "none" | names), REP (2: shifted fits per box, 0 off),
 #   SLABS (1), SLABORC (none|net: slab ceiling, label phase in the slab crops; BOXES=none skips the boxes), SITES (z cells of the slab sites), FIT (extra fit flags; changes the fitter config tag; "{box}" becomes the box name,
 #   e.g. FIT="--emb /vesuvius/ufsm/repr/emb/bench/{box} --uw-rep-emb 2"), FIELDS (TAG0: reuse fields),
 #   KEEP (1: keep this TAG's fields for later fixed-fields runs; default 1), U (binary; default $WB/bin/ufsm = the pinned build),
@@ -70,6 +70,7 @@ g_cnt() {   # fit-compare turn counts on 0.5 mm radial segments, by phase | dens
 if [ "$BOXES" = all ]; then BL=$(grep -v '^#' $BT | cut -f1)
 elif [ "$BOXES" = none ]; then BL=""
 elif [ "$BOXES" = clean ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label-noise/' | cut -f1)
+elif [ "$BOXES" = core ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label-noise/ && ($2 == "paris4" || $2 == "paris4j" || $10 ~ /core/)' | cut -f1)   # routine snapshot evals
 else BL=$BOXES; fi
 for B in $BL; do
   IFS=$'\t' read -r nm sc z y x nz ny nx lv note <<< "$(awk -F'\t' -v b=$B '$1 == b' $BT)"; [ -n "${nx:-}" ] || { log "no box $B"; continue; }
