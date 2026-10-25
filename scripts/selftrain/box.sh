@@ -34,7 +34,7 @@ fit)
   [ -e $M.done ] && { echo "$N: fit exists"; exit 0; }
   [ -s $F/fields.json ] || { echo "$N: no fields"; exit 1; }
   DEV=(--gpu $G); [ "${CPU:-0}" = 1 ] && DEV=(--cpu --threads $TH)
-  AG=${AGREE:-0.3,0.15,0.3}; LM=${LOCALMIN:-0.6}; : > $M.choice
+  AG=${AGREE:-0.3,0.15,0.3}; LM=${LOCALMIN:-0.6}; ER=${EMBROOT:-/vesuvius/ufsm/repr/emb/pod}; : > $M.choice
   share() {   # fields model gate -> "share% cos" (step-4 throwaway raster)
     local t=$2.score.tmp; rm -rf $t
     nice -n 5 env UFSM_FIT_THREADS=$TH $U fit $1 "${DEV[@]}" --model $2 --winding $t --winding-mod14 3 --winding-step 4 --winding-gate $3 > $t.log 2>&1 || { rm -rf $t $t.log; echo "0 0"; return; }
@@ -47,12 +47,13 @@ fit)
   unit() {    # fields model [nolocal] -> fit candidates, keep the best as <model>; prints "best share confident"
     local f=$1 mp=$2 c=$2.cand; : > $c
     fitone $f $mp g >> $c
+    [ "${EMB:-0}" = 1 ] && [ -e $ER/$N.done ] && fitone $f $mp e --emb $ER/$N --emb-output pca64 --uw-rep-emb ${EMBW:-2} >> $c
     local cf=$(share $f $mp.g ${AG%%,*},9,${AG##*,} | cut -d' ' -f1); local sg=$(awk '$1 == "g" {print $2 + 0}' $c)
     if [ -z "${3:-}" ] && awk -v s=${sg:-0} -v m=${cf:-0} -v f=$LM 'BEGIN { exit !(s < f * m) }'; then
       fitone $f $mp p --core 0 --axis-normal 2000 >> $c; fitone $f $mp m --core 0 --axis-normal -2000 >> $c; fi
     local b=$(awk 'NF >= 3 && $2 + 0 >= bs {bs = $2 + 0; k = $1} END {print k}' $c)
     [ -n "$b" ] && { rm -rf $mp; mv $mp.$b $mp; }
-    for k in g p m; do rm -rf $mp.$k; done
+    for k in g e p m; do rm -rf $mp.$k; done
     echo "${b:-none} $(awk -v b=${b:-none} '$1 == b {print $2 + 0}' $c) ${cf:-0}"; }
   read -r wb ws wc <<< "$(unit $F $M nolocal)"; echo "whole $wb $ws confident $wc: $(tr '\n' ';' < $M.cand)" >> $M.choice
   echo "$F $M" > $M.units.new
