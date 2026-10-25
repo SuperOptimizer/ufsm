@@ -304,6 +304,7 @@ size_t nn_loss_scratch(shape5 s);
 void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, float *gl, float *scratch);
 /* Offset-tolerant positives on channel 0 (radius r <= 2 voxels, 0 = off; see nn.cu): code is a uint8 [n][S] work buffer. */
 void nn_set_loss_tol(int r);
+void nn_set_loss_unit_ch7(int c);   /* 7-channel losses (task unwrap normal n n^T + density): channel c's mask weight counts as 0 / 1 (the packed weight off); -1 off */
 void nn_set_recall(float w);
 int nn_get_loss_grad_h16(void);   /* the loss kernels' gradient format (nn_set_loss_grad_h16) */
 void nn_pool_targets(const uint8_t *t, const uint8_t *m, int B, int C, int D, int H, int W, int f, uint8_t *to, uint8_t *mo);   /* deep supervision: max-pool masked targets, any-pool the mask (C <= 16) */   /* recto channel: + w (1 - (sum s p + 1) / (sum p + 1)), gradient only (the logged dice excludes it) */
