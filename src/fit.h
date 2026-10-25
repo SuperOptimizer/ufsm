@@ -67,6 +67,9 @@ typedef struct {
                                        sheet): a phase that lost a sheet is stretched (s ~0.5-0.7 where it disagrees with the published wraps
                                        on Paris 4, 1.05 where it agrees), so the cut prefers it (0 off) */
     int uw_rep_sr;                  /* the stretch's box radius (field voxels: (2r+1)^3; 0 the voxel's own central differences) */
+    float phase_stretch;            /* gate the phase confidence by the phase stretch s (uwr_stretch: |grad phase| x spacing): x exp(-log2(s)^2 / 2 S^2)
+                                       before the fit (0 off), so where the phase skips or doubles sheets the density sets the turn count */
+    int phase_stretch_r;            /* its box radius (field voxels) */
     const char *uw_rep_dump;        /* write PREFIX.shift.raw (the repair's integer shift + 128 per field voxel, 0 not flooded) and
                                        PREFIX.seam.raw (per field voxel the neighbours whose integers disagree, before | after << 4, | 8 where
                                        the phase is stretched: uw_rep_stretch's weight < 1/2) */

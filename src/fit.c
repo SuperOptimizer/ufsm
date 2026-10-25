@@ -36,7 +36,7 @@ fit_cfg fit_cfg_default(void) {
     c.w_recto = 0.f;    /* recto anchors off by default */
     c.w_ct = 0.f; c.ct_pow = 1.f; c.ct_phi = 0.f; c.ct_radius_um = 150; c.ct_floor = 0.f;   /* CT parity off by default */
     c.w_cspacing = 0.f; c.cs_tol = 0.25f; c.ct_flood = 0;
-    c.uw_repair = 0; c.uw_rep_qpow = 1.f; c.uw_rep_sr = 1; c.uw_rep_gd = 8;   /* local slip repair off by default */
+    c.uw_repair = 0; c.uw_rep_qpow = 1.f; c.uw_rep_sr = 1; c.uw_rep_gd = 8; c.phase_stretch_r = 1;   /* local slip repair off by default */
     c.emb = nullptr; c.uw_rep_emb = 0.f; c.uw_rep_emb_m0 = 0.3f; c.emb_phi = 0.f; c.uw_rep_emb_rmax = 2; c.uw_rep_emb_sub = 2;   /* embedding evidence off */
     c.uw_rep_emb_nd = 2; c.uw_rep_emb_d[0] = 16; c.uw_rep_emb_d[1] = 48; c.uw_rep_emb_d[2] = 128;   /* emb-calib (HOLD): P(r right) 0.99 at conf >= 0.2 for D <= 48, 0.88 at 128 */
     return c;
@@ -1434,7 +1434,35 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
 
 /* the direction from the prior's ring vote; when it is ambiguous (|median winding per ring| < 0.5 or too few rings) both
    directions are fitted and the lower final loss wins (a wrong direction cannot fit the phase around the circle) */
+/* --phase-stretch S (fit_cfg phase_stretch): the phase confidence times exp(-log2(s)^2 / 2 S^2), s the phase stretch (uwr_stretch:
+   |grad phase| x spacing over a (2r+1)^3 box; 1 counts every sheet, < 1 skips sheets, > 1 adds some). The network phase skips ~40% of
+   the sheets in packed Paris 4 (fit-compare: -1.2..-1.9 turns per 0.5 mm radial segment of ~2.75 against +0.0 by density), and the
+   error lies inside the flooded pieces where no integer vote can reach it; with the phase gated off there the density term sets the
+   turn count, and the wrapped phase term elsewhere costs nothing for the integer turns added in between. */
+typedef struct { const fit_fields *f; uint8_t *pc, *ps; double S; int r; } pst_job;
+static void pst_rows(void *a, int z0, int z1, int t) {
+    pst_job *J = a; const fit_fields *f = J->f; (void)t;
+    for (int z = z0; z < z1; z++) for (int y = 0; y < f->H; y++) for (int x = 0; x < f->W; x++) {
+        const size_t i = ((size_t)z * f->H + y) * f->W + x; J->pc[i] = f->pc[i]; J->ps[i] = f->ps[i];
+        if (f->pc[i] == 128 && f->ps[i] == 128) continue;
+        const double l = log2(fmax(uwr_stretch(f, z, y, x, J->r), 1e-3)), g = exp(-l * l / (2 * J->S * J->S));
+        J->pc[i] = (uint8_t)lround(128 + (f->pc[i] - 128) * g); J->ps[i] = (uint8_t)lround(128 + (f->ps[i] - 128) * g);
+    }
+}
 fit_model *fit_run(const fit_fields *f, const fit_cfg *c) {
+    if (c->phase_stretch > 0 && c->phase_stage < c->nstage) {
+        const size_t n = (size_t)f->D * f->H * f->W; uint8_t *pc = malloc(n), *ps = malloc(n);
+        if (!pc || !ps) { free(pc); free(ps); fprintf(stderr, "fit: out of memory for --phase-stretch\n"); return nullptr; }
+        pst_job J = {f, pc, ps, c->phase_stretch, c->phase_stretch_r};
+        fit_zpar(f->D, fit_nthreads(f->D), pst_rows, &J);
+        if (c->verbose) {
+            double s0 = 0, s1 = 0;
+            for (size_t i = 0; i < n; i++) { s0 += hypot(f->pc[i] - 128, f->ps[i] - 128); s1 += hypot(pc[i] - 128, ps[i] - 128); }
+            fprintf(stderr, "fit: --phase-stretch %.3g: phase confidence kept %.3f\n", c->phase_stretch, s0 > 0 ? s1 / s0 : 0);
+        }
+        fit_fields g = *f; g.pc = pc; g.ps = ps; fit_cfg c2 = *c; c2.phase_stretch = 0;
+        fit_model *m = fit_run(&g, &c2); free(pc); free(ps); return m;
+    }
     if (c->w_recto > 0 && c->phase_stage < c->nstage && !f->recto) { fprintf(stderr, "fit: --w-recto needs an r plane (r.raw or an r zarr array) on the fit-field grid\n"); return nullptr; }
     if (c->w_ct > 0 && c->phase_stage < c->nstage && !f->ct) { fprintf(stderr, "fit: --w-ct needs a ct plane (ufsm ct-fields, predict --fit-ct)\n"); return nullptr; }
     if (c->w_cspacing > 0 && !f->cs && c->verbose) fprintf(stderr, "fit: --w-cspacing: the fields carry no cs plane (term off)\n");
