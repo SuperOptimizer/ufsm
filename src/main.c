@@ -1116,6 +1116,12 @@ static int cmd_fit(int argc, char **argv) {
                 const long long *hh = pass ? lhk : lha; long long best = 0, tot = 0;
                 for (int k = 0; k < 252; k++) { tot += hh[k]; long long sw = 0; for (int j = -9; j <= 8; j++) sw += hh[(k + j + 252) % 252]; if (sw > best) best = sw; }
                 lbest[pass] += best; ltot[pass] += tot;
+                if (pass && getenv("UFSM_WCHECK_BLOCKS") && tot > 0) {   /* (debug: each block's own gauge: radial count drift vs slips) */
+                    int bo = 0; long long bb = -1; for (int k = 0; k < 252; k++) { long long sw = 0; for (int j = -9; j <= 8; j++) sw += hh[(k + j + 252) % 252]; if (sw > bb) { bb = sw; bo = k; } }
+                    const double zc = o3[0] + n3[0] * ws / 2.0, yc = o3[1] + n3[1] * ws / 2.0, xc = o3[2] + n3[2] * ws / 2.0; const int iz = (int)zc;
+                    const double rc = fb.cy ? hypot(yc - fb.cy[iz], xc - fb.cx[iz]) : 0.0;
+                    fprintf(stderr, "fit: --winding-check block %lld %lld %lld: %lld gated, gauge %+d codes, right %.3f, r %.0f\n", (long long)sz, (long long)sy, (long long)sx, tot, bo > 126 ? bo - 252 : bo, (double)best / tot, rc);
+                }
             }
             if (z3w_write_shard(zw, sz, sy, sx, (const uint8_t *)sb, 8)) { fprintf(stderr, "fit: %s\n", z3w_error()); return 1; }
         }

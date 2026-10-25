@@ -108,6 +108,7 @@ typedef struct {
     int nbox; int64_t box[DN_MAXBOX][6]; int nho; int64_t ho[DN_MAXBOX][6];
     double weight, bvol; float center, scale, pap; int64_t shape[3];
     float srad;                                  /* "supcon_radius": GT SupCon pairs only within this distance (CT voxels; 0 = all pairs; pseudo labels: gauge-consistent only locally) */
+    float srr;                                   /* "supcon_radial": pairs only within this difference of axis distance (CT voxels; needs "axis"): the fit's count errors are radial */
     int ct_only;                                 /* unlabelled (U0): SSL terms only (sampled by the ct_only share) */
     int nx; const rmap *xm[4]; rvol *xfv[4]; int xlc[4], xlf[4];   /* "xscan": registered partner scans (this CT = the map's coarse side at level xlc) */
     int32_t *mcell; int64_t nmcell; int mcs;     /* "mask": {"map": RAW, "min": m} (ufsm scanprep): the cells with code >= m (window centres), cell edge */
@@ -532,10 +533,11 @@ static int load_sources(const char *path, dn_data *D, int nthreads) {
         else if (nm) { S->center = (float)json_num(json_get(nm, "center"), 100); S->scale = (float)json_num(json_get(nm, "scale"), 50); }   /* (train's form) */
         else box_norm(S->ca, (const int64_t (*)[6])S->box, S->nbox, 12345 + i, nthreads, &S->center, &S->scale);
         S->pap = (float)json_num(json_get(s, "papyrus"), S->center);
-        S->srad = (float)json_num(json_get(s, "supcon_radius"), 0);
+        S->srad = (float)json_num(json_get(s, "supcon_radius"), 0); S->srr = (float)json_num(json_get(s, "supcon_radial"), 0);
+        if (S->srr > 0 && !S->axz) fprintf(stderr, "dino-train: WARNING: %s: supcon_radial without an axis: no radial limit\n", S->name);
         D->wsum += S->weight; if (S->ct_only) D->wsum_u += S->weight; else D->wsum_l += S->weight;
         fprintf(stderr, "dino-train: source %s: %d boxes (%.2f Gvox), %d holdouts, %s, codes %s, weight %g, norm %.1f / %.1f, papyrus > %.0f%s\n", S->name, S->nbox, S->bvol / 1e9,
-                S->nho, S->halves ? "two views (ct / ct_b)" : "one CT (views by noise)", S->codes ? "yes" : "no", S->weight, S->center, S->scale, S->pap, S->srad > 0 ? ", supcon radius" : "");
+                S->nho, S->halves ? "two views (ct / ct_b)" : "one CT (views by noise)", S->codes ? "yes" : "no", S->weight, S->center, S->scale, S->pap, S->srad > 0 && S->srr > 0 ? ", supcon radius + radial" : S->srad > 0 ? ", supcon radius" : S->srr > 0 ? ", supcon radial" : "");
         D->nsrc++;
     }
     json_free(j);
@@ -1920,7 +1922,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     float *clsT = nn_malloc(2 * (size_t)C * 4), *clsS = nn_malloc((size_t)C * 4), *dcls = nn_malloc((size_t)C * 4), *kq = nn_malloc((size_t)KQ * C * 4);
     float *outs = nn_malloc(64 * 4), *hout = malloc(64 * 4);
     int *pS = nn_malloc(8 * 4), *pT = nn_malloc(8 * 4); float *pW = nn_malloc(8 * 4);
-    const int NG = Dd->ngt; int *d_idx = nn_malloc((size_t)NG * 4), *d_code = nn_malloc((size_t)NG * 4), *d_xyz = nn_malloc((size_t)NG * 12);
+    const int NG = Dd->ngt; int *d_idx = nn_malloc((size_t)NG * 4), *d_code = nn_malloc((size_t)NG * 4), *d_xyz = nn_malloc((size_t)NG * 12); float *d_rad = nn_malloc((size_t)NG * 4);
     float *es = nn_malloc((size_t)NG * ED * 4), *ns = nn_malloc((size_t)NG * 4), *ga = nn_malloc((size_t)NG * ED * 4), *scr = nn_malloc(((size_t)2 * NG + 16) * 4);
     float *tgrad = nullptr; size_t tgn = 0;   /* token gradient [S][C] of the current view */
     float *glz = nn_malloc(l3 * CO * 4); nn_zero(glz, l3 * CO * 4);   /* the locals' (zero) dense logit gradient */
@@ -2035,13 +2037,16 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             }
         }
         /* GT points per global view: the sample's labelled voxels (source coordinates) mapped into the view */
-        int nview[2] = {0, 0}; static int *vidx[2], *vcode[2], *vxyz[2];
-        if (!vidx[0]) for (int v = 0; v < 2; v++) { vidx[v] = malloc((size_t)NG * 4); vcode[v] = malloc((size_t)NG * 4); vxyz[v] = malloc((size_t)NG * 12); }
+        int nview[2] = {0, 0}; static int *vidx[2], *vcode[2], *vxyz[2]; static float *vrad[2];
+        if (!vidx[0]) for (int v = 0; v < 2; v++) { vidx[v] = malloc((size_t)NG * 4); vcode[v] = malloc((size_t)NG * 4); vxyz[v] = malloc((size_t)NG * 12); vrad[v] = malloc((size_t)NG * 4); }
+        const int radial = sr->srr > 0 && Sm->hasax;   /* (the points' axis distances: source "supcon_radial") */
         for (int v = 0; v < 2 && wgt > 0; v++) for (int i = 0; i < Sm->ngt; i++) {
             const double s3[3] = {Sm->gxyz[3 * i], Sm->gxyz[3 * i + 1], Sm->gxyz[3 * i + 2]}; double o[3]; dr_unmap(&xf[v], s3, o);
             int q[3], in = 1; for (int d = 0; d < 3; d++) { q[d] = (int)lrint(o[d]); in &= q[d] >= 4 && q[d] < P - 4; }
             if (!in) continue;
-            const int k = nview[v]++; vidx[v][k] = (q[0] * P + q[1]) * P + q[2]; vcode[v][k] = Sm->gcode[i]; vxyz[v][k * 3] = q[0]; vxyz[v][k * 3 + 1] = q[1]; vxyz[v][k * 3 + 2] = q[2];
+            const int k = nview[v]++;
+            if (radial) { int z = (int)lrint(s3[0]); z = z < 0 ? 0 : z >= Ps ? Ps - 1 : z; vrad[v][k] = (float)hypot(s3[1] - Sm->ayx[2 * z], s3[2] - Sm->ayx[2 * z + 1]) * xf[v].n / xf[v].m; }
+            vidx[v][k] = (q[0] * P + q[1]) * P + q[2]; vcode[v][k] = Sm->gcode[i]; vxyz[v][k * 3] = q[0]; vxyz[v][k * 3 + 1] = q[1]; vxyz[v][k * 3 + 2] = q[2];
         }
         /* object points: labelled source points visible in both globals; up to NOB codes with >= 8 such points, NOP points each */
         int nob = 0, nop = 0;
@@ -2245,8 +2250,9 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             if (gl && wgt > 0 && nview[v] >= 64) {
                 const int ng = nview[v]; nn_h2d(d_idx, vidx[v], (size_t)ng * 4); nn_h2d(d_code, vcode[v], (size_t)ng * 4); nn_h2d(d_xyz, vxyz[v], (size_t)ng * 12);
                 dn_gather_slabs(&HS, d_idx, ng, es, ns, nullptr, 0, nullptr, nullptr);   /* (iBOT points gathered below) */
-                { const float sr = Dd->src[Sm->si].srad;   /* (source CT voxels -> view voxels) */
-                  dn_supcon_r(es, d_code, d_xyz, ng, nullptr, d_code, d_xyz, 0, ED, tau, hw, hr, sr > 0 ? sr * xf[v].n / xf[v].m : 0.f, ga, outs + 20, scr); }
+                { const float r0 = sr->srad, rr = radial ? sr->srr * xf[v].n / xf[v].m : 0.f;   /* (source CT voxels -> view voxels) */
+                  if (radial) nn_h2d(d_rad, vrad[v], (size_t)ng * 4);
+                  dn_supcon_r(es, d_code, d_xyz, ng, nullptr, d_code, d_xyz, 0, ED, tau, hw, hr, r0 > 0 ? r0 * xf[v].n / xf[v].m : 0.f, radial ? d_rad : nullptr, nullptr, rr, ga, outs + 20, scr); }
                 if (wvar > 0) dn_varreg(es, ng, ED, vgam, wvar, ga, outs + 24);
                 dn_axpby(ga, ga, (size_t)ng * ED, wgt, 0.f);
                 HS.e1 = es; HS.g1 = ga; HS.n1 = ns; HS.i1 = d_idx; HS.ngt = ng;
