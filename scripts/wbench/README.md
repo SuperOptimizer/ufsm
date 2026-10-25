@@ -17,13 +17,13 @@ of `boxes.tsv` not tagged `label-noise`) plus 4 full-cross-section Paris 4 slab 
 | scroll | boxes | grid | notes |
 |---|---|---|---|
 | Paris 4 | PH1 PH2 PH3 HOLD | level 2 (9.6 um) | HOLD is clean for everything; PH1-3 are in-sample for wind96 and dino/full |
-| PHerc1667 | C1..C24 | level 2 (9.6 um) | eval-only scroll: never train on any of it |
+| PHerc1667 | C1..C70 | level 2 (9.6 um) | eval-only scroll: never train on any of it; C25-C70 added 10-25 (38 clean) |
 | PHerc0139 | 139-1..139-8 | level 0 (9.362 um) | 139-1 = the dino/full holdout |
 | PHerc0814 | 814-1..814-8 | level 0 (9.362 um) | 814-1 = the dino/full holdout |
 | PHerc0500P2 | 500P2-1 | level 0 (9.362 um) | the labels are sparse |
 | Paris 4 July-only | J1..J34 (`cand-p4j.tsv`, being qualified) | level 2 (9.6 um) | July labels where June has none (z 6656..6912, 17024..17408); codes from `gtjuly/build.sh` (`P4JQ`); in-sample for d1 before its p4resume relaunch |
 
-The 23 boxes whose wind96 label ceiling is under 0.8 (all 0814, 139-1..4 and 6..8, C1 C5 C6 C8 C13 C17 C20 C23) carry the
+The 31 boxes whose wind96 label ceiling is under 0.8 (all 0814, 139-1..4 and 6..8, C1 C5 C6 C8 C13 C17 C20 C23, C25 C41 C46 C48 C53 C65 C67 C69) carry the
 note `label-noise` and are skipped unless `BOXES=all`: their labels, not the model, limit the score (e.g. 139-2 ids 0.78 at
 ceil 0.55). They stay held out of training. `BT=file` runs another box list (e.g. `cand-1667.tsv`).
 

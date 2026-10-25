@@ -19,7 +19,8 @@ CK=$(readlink -f "$1"); TAG=$2
 U=${U:-$WB/bin/ufsm}; [ -x $U ] || { echo "no binary $U"; exit 2; }
 BOXES=${BOXES:-clean}; SLABORC=${SLABORC:-}; REP=${REP:-2}; SLABS=${SLABS:-1}; SITES=${SITES:-4624 5392 5904 6672}; FIT=${FIT:-}; FIELDS=${FIELDS:-}; KEEP=${KEEP:-1}
 BT=${BT:-$H/boxes.tsv}; BIN=$(sha1sum $U | cut -c1-8)
-FCFG=$(echo "$BIN --dir 1 --uw-repair 8 $FIT" | sha1sum | cut -c1-8)   # the fitter config: binary + flags
+GF="--gpu $GPU"; [ "${CPU:-0}" = 1 ] && GF="--cpu --threads $THREADS"   # CPU=1: fits on the CPU backend (no GPU; a separate fitter config)
+FCFG=$(echo "$BIN --dir 1 --uw-repair 8 $FIT${CPU:+ cpu$CPU}" | sha1sum | cut -c1-8)   # the fitter config: binary + flags
 FT=${FIELDS:-$TAG}; FD=$WB/fields/$FT; O=$WB/runs/$TAG; mkdir -p $O $WB/res $WB/ceil $FD $CACHE
 RES=$WB/res/$TAG.tsv; RS=$WB/res/$TAG-slabs.tsv; RR=$WB/res/$TAG-radius.tsv; CEIL=$WB/ceil/$FCFG.tsv
 HDR="tag	box	scroll	ids	ids0	ids_a	ids_b	ids_sd	e08	p05	p1	p2	p4	p05x	p1x	p2x	p4x	pmed	gross	gross100	conf	ceil	ceil_p1x	frac	pred_s	fit_s	bin	fcfg	cnt_bias	cnt_off	cnt_offp	dcnt_bias	dcnt_off	dcnt_offp"
@@ -55,7 +56,7 @@ predict() {   # predict OUTFIELDS z y x nz ny nx LOG [big]: fit fields of the bo
 }
 fitsc() {   # fitsc FIELDS OUT LOG [extra]: production fit + codes score + pair accuracy
   local f=$1 o=$2 lg=$3; shift 3
-  UFSM_FIT_THREADS=$THREADS RUN $U fit $f --gpu $GPU --out $o --codes $QR $QK --dir 1 --uw-repair 8 --score-pairs 1 ${FIT//\{box\}/$B} "$@" > $lg 2>&1
+  UFSM_FIT_THREADS=$THREADS RUN $U fit $f $GF --out $o --codes $QR $QK --dir 1 --uw-repair 8 --score-pairs 1 ${FIT//\{box\}/$B} "$@" > $lg 2>&1
 }
 g_ids() { grep -oE 'winding ids right [0-9.]+' $1 | tail -1 | awk '{print $4}'; }
 g_e08() { grep -oE '< 0.08 turn [0-9.]+' $1 | tail -1 | awk '{print $4}'; }
@@ -129,11 +130,11 @@ if [ "$SLABS" = 1 ]; then
       for k in A B C; do RUNBIG $U fields-oracle $d/f$k $PR $PK $d/o$k --fill $SLABORC --phase-scale $PF > $d/orc$k.log 2>&1 || { log "$S: fields-oracle $k failed"; continue 2; }
         rm -rf $d/f$k; mv $d/o$k $d/f$k; done
     fi
-    for k in A B; do UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/f$k --gpu $GPU --out $d/fit$k --codes $QR $QK --score-detail 1 --score-pairs 1 --dir 1 --uw-repair 8 ${FIT//\{box\}/$S} > $d/fit$k.log 2>&1
+    for k in A B; do UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/f$k $GF --out $d/fit$k --codes $QR $QK --score-detail 1 --score-pairs 1 --dir 1 --uw-repair 8 ${FIT//\{box\}/$S} > $d/fit$k.log 2>&1
       grep -E '^    radius' $d/fit$k.log | awk -v t=$TAG -v s=$S -v k=$k '{gsub(/-/, " "); $0 = $0; print t"\t"s"\t"k"\t"$2"\t"$3"\t"$5"\t"$7"\t"$8"\t"$9"\t"$10"\t"$11}' >> $RR; done
     RUN $U fit-join $d/joined $d/fC --blend 16 $d/fitA 32 160 $d/fitB 160 288 > $d/join.log 2>&1
     js=$(num $(grep -oE '^ +0\|1 .*' $d/join.log | awk '{print $NF}'))
-    UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/fC --model $d/joined --gpu $GPU --codes $QR $QK --score-pairs 1 > $d/joined.log 2>&1
+    UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/fC --model $d/joined $GF --codes $QR $QK --score-pairs 1 > $d/joined.log 2>&1
     t1=$(date +%s); a=$(num $(g_ids $d/fitA.log)); b=$(num $(g_ids $d/fitB.log))
     m=$(echo "$a $b" | awk '$1 != "na" && $2 != "na" {printf "%.4f", ($1 + $2) / 2; exit} {print "na"}')
     p1=$(echo "$(num $(g_pair $d/fitA.log 1 1)) $(num $(g_pair $d/fitB.log 1 1))" | awk '$1 != "na" && $2 != "na" {printf "%.4f", ($1 + $2) / 2; exit} {print "na"}')
