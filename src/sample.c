@@ -2767,11 +2767,16 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         tp_put(aw, p3); tp_put(as, p3);
     }
     tp_put(near, p3);
-    if (c->side == 2 && c->min_phase > 0) {   /* --min-phase: windows with (almost) no known phase supervise nothing (sources with band / phase
+    if (c->side == 2 && c->min_phase > 0 && !s->ct_only) {   /* --min-phase: windows with (almost) no known phase supervise nothing (sources with band / phase
                                                  targets only draw anywhere in the scroll): rejected */
         const uint8_t *sd = b->side + (size_t)i * p3; size_t kn = 0;
         for (size_t k = 0; k < p3; k++) kn += sd[k] < PHASE_PERIOD;
         if ((double)kn < c->min_phase * (double)p3) { if (Tw) tp_put(Tw, (NCH + 1) * p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); return 1; }   /* (counted as empty targets) */
+    }
+    if (c->emb_ch && s->ct_only) {   /* an unlabelled ("ct_only") source supervises only the distillation: windows with < 25% of the head cells targeted are redrawn */
+        const size_t ge = (size_t)(Pz / c->emb_div) * (P / c->emb_div) * (P / c->emb_div); const int8_t *eo = b->emb + (size_t)i * c->emb_ch * ge; size_t kn = 0;
+        for (size_t q = 0; q < ge; q++) { int any = 0; for (int ch = 0; ch < c->emb_ch && !any; ch++) any = eo[(size_t)ch * ge + q] != 0; kn += any; }
+        if (4 * kn < ge) { if (Tw) tp_put(Tw, (NCH + 1) * p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); return 1; }
     }
     if (c->cond) {   /* inputs 4-6 and batch.wind from the source's winding raster (on the stored phase's grid; air unknown like the phase) */
         uint8_t *ww = tp_get(p3, 0), *ws = tp_get(p3, 0);

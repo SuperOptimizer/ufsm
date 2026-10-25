@@ -160,18 +160,26 @@ int main(int argc, char **argv) {
                    " \"emb\": {\"groups\": [\"%s/emb\"], \"name\": \"pca\", \"level\": 1}, \"axis\": \"%s/axis.json\"}]}\n", dir, dir, dir, dir, dir);
         fclose(f);
         sources *Se = sources_load(q); if (!Se) { fprintf(stderr, "FAIL: sources_load %s\n", q); return 1; }
-        for (int aug = 0; aug < 2; aug++) {
+        snprintf(q, sizeof q, "%s/sources-embonly.json", dir); f = fopen(q, "w");   /* an emb-only source ("ct_only", no targets, a box), as train sources-d2 */
+        fprintf(f, "{\"sources\": [{\"name\": \"embonly\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 8, \"max_level\": 0, \"weight\": 1, \"ct_only\": 1, \"boxes\": [[0, 0, 0, 160, 96, 224]],\n"
+                   " \"emb\": {\"groups\": [\"%s/emb\"], \"name\": \"pca\", \"level\": 1}}]}\n", dir, dir);
+        fclose(f);
+        sources *Su = sources_load(q); if (!Su) { fprintf(stderr, "FAIL: sources_load %s\n", q); return 1; }
+        size_t lab = 0;   /* (emb-only windows: phase / w4 targets set anywhere) */
+        for (int aug = 0; aug < 3; aug++) {   /* 0 plain, 1 augmented, 2 the emb-only source (augmented, --min-phase on) */
             sample_cfg c = sample_cfg_default();
             c.P = 64; c.B = 1; c.nworkers = 2; c.nbuf = 3; c.seed = 11; c.deterministic = 1; c.xfmt = 1; c.gpu_input = 1;
             memset(c.level_p, 0, sizeof c.level_p); c.level_p[0] = 1;
             c.side = 2; c.wind4 = 1; c.wind4_tile = 16; c.emb_ch = EC; c.emb_div = 8;
             if (aug) { c.augment = 3; c.symmetry_p = .5f; c.geometry_augment = 1; c.rotate_degrees = 5; c.rotate_p = .5f; c.elastic = 1; c.elastic_p = .5f; }
             else { c.augment = 0; c.symmetry_p = 0; c.geometry_augment = 0; c.rotate_p = 0; c.elastic_p = 0; }
-            sampler *sp = sampler_start(Se, &c); if (!sp) { fprintf(stderr, "FAIL: sampler_start (emb)\n"); return 1; }
+            if (aug == 2) c.min_phase = .001;
+            sampler *sp = sampler_start(aug == 2 ? Su : Se, &c); if (!sp) { fprintf(stderr, "FAIL: sampler_start (emb)\n"); return 1; }
             size_t nset = 0, nnorm = 0; double worst = 1;
             for (int i = 0; i < 16; i++) {
                 batch *b = sampler_next(sp); if (!b) { CHECK(0, "emb sampler stopped"); break; }
                 const size_t ng = 512;
+                if (aug == 2) for (size_t k = 0; k < (size_t)64 * 64 * 64; k++) lab += b->side[k] != 255 || b->w4[k] != 255;
                 for (size_t k = 0; k < ng; k++) {
                     double l2 = 0, dot = 0; for (int ch = 0; ch < EC; ch++) l2 += (double)b->emb[ch * ng + k] * b->emb[ch * ng + k];
                     if (l2 == 0) continue;
@@ -192,10 +200,12 @@ int main(int argc, char **argv) {
                 sampler_release(sp, b);
             }
             sampler_stop(sp);
-            printf("distill targets (%s): %zu head cells set, worst cos %.5f, %zu not unit\n", aug ? "augmented" : "plain", nset, worst, nnorm);
-            CHECK(nset > 1000 && nnorm == 0 && worst > 0.999, "distill targets (%s): %zu set, worst cos %g, %zu not unit", aug ? "augmented" : "plain", nset, worst, nnorm);
+            printf("distill targets (%s): %zu head cells set, worst cos %.5f, %zu not unit\n", aug == 2 ? "emb-only" : aug ? "augmented" : "plain", nset, worst, nnorm);
+            CHECK(nset > 1000 && nnorm == 0 && worst > 0.999, "distill targets (%s): %zu set, worst cos %g, %zu not unit", aug == 2 ? "emb-only" : aug ? "augmented" : "plain", nset, worst, nnorm);
         }
-        sources_free(Se);
+        sources_free(Se); sources_free(Su);
+        printf("emb-only windows: %zu phase / w4 target voxels\n", lab);
+        CHECK(lab == 0, "an emb-only source produced %zu phase / w4 target voxels", lab);
     }
     if (fails) { fprintf(stderr, "test_unwrap2_sampler: %d failure(s)\n", fails); return 1; }
     printf("test_unwrap2_sampler: OK\n");
