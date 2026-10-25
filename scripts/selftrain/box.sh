@@ -27,7 +27,7 @@ pred)
 fit)
   # units = (fields, model) pairs labelled by STAGE label, listed in $M.units. Candidates per unit: the global spiral fit (g) and two
   # local fits (p / m: axis 2000 voxels from the unit centre along -/+ its mean sheet normal, fit --axis-normal, --core 0: crushed
-  # scans), scored by the agree-gated share (AGREE, step-4 throwaway raster); the best one is kept. The whole box first (g; p / m when
+  # scans), scored by the agree-gated share (AGREE, step-4 throwaway raster); the best one is kept. The whole box: g only; each octant: g, + p / m when
   # g keeps under LOCALMIN (0.6) of the confident material = the gate without its error test); where the whole box keeps under that,
   # also its 8 octants (512^3, fields views $F.o<k>: "zarr_offset" + the axis table sliced) and the octants win when their mean share is
   # larger (OCT=0: never). Scores in $M.choice.
@@ -44,19 +44,19 @@ fit)
     nice -n 5 env UFSM_FIT_THREADS=$TH $U fit $f "${DEV[@]}" --out $mp.$k --dir 0 --uw-repair 8 --w-ct 1 --ct-phi 0 --ct-flood 0 "$@" > $mp.$k.log 2>&1 \
       || { echo "$k failed"; return; }
     echo "$k $(share $f $mp.$k $AG) $(grep -oE 'loss [0-9.]+' $mp.$k.log | tail -1)"; }
-  unit() {    # fields model -> fit candidates, keep the best as <model>; prints "best share confident"
+  unit() {    # fields model [nolocal] -> fit candidates, keep the best as <model>; prints "best share confident"
     local f=$1 mp=$2 c=$2.cand; : > $c
     fitone $f $mp g >> $c
     local cf=$(share $f $mp.g ${AG%%,*},9,${AG##*,} | cut -d' ' -f1); local sg=$(awk '$1 == "g" {print $2 + 0}' $c)
-    if awk -v s=${sg:-0} -v m=${cf:-0} -v f=$LM 'BEGIN { exit !(s < f * m) }'; then
+    if [ -z "${3:-}" ] && awk -v s=${sg:-0} -v m=${cf:-0} -v f=$LM 'BEGIN { exit !(s < f * m) }'; then
       fitone $f $mp p --core 0 --axis-normal 2000 >> $c; fitone $f $mp m --core 0 --axis-normal -2000 >> $c; fi
     local b=$(awk 'NF >= 3 && $2 + 0 >= bs {bs = $2 + 0; k = $1} END {print k}' $c)
     [ -n "$b" ] && { rm -rf $mp; mv $mp.$b $mp; }
     for k in g p m; do rm -rf $mp.$k; done
     echo "${b:-none} $(awk -v b=${b:-none} '$1 == b {print $2 + 0}' $c) ${cf:-0}"; }
-  read -r wb ws wc <<< "$(unit $F $M)"; echo "whole $wb $ws confident $wc: $(tr '\n' ';' < $M.cand)" >> $M.choice
+  read -r wb ws wc <<< "$(unit $F $M nolocal)"; echo "whole $wb $ws confident $wc: $(tr '\n' ';' < $M.cand)" >> $M.choice
   echo "$F $M" > $M.units.new
-  if [ "${OCT:-1}" = 1 ] && awk -v s=${ws:-0} -v m=${wc:-0} -v f=$LM 'BEGIN { exit !(s < f * m) }'; then
+  if [ "${OCT:-1}" = 1 ] && awk -v c=${wc:-0} -v t=${MINCONF:-2} 'BEGIN { exit !(c >= t) }' && awk -v s=${ws:-0} -v m=${wc:-0} -v f=$LM 'BEGIN { exit !(s < f * m) }'; then
     h=$(jq .h $F/fields.json); n2=$(( $(jq '.shape[0]' $F/fields.json) / 2 )); tot=0; : > $M.units.oct
     for k in 0 1 2 3 4 5 6 7; do oz=$(( (k >> 2 & 1) * n2 )) oy=$(( (k >> 1 & 1) * n2 )) ox=$(( (k & 1) * n2 )); fo=$F.o$k; rm -rf $fo; mkdir -p $fo
       for a in $F/*/; do ln -s $(readlink -f $a) $fo/$(basename $a); done
@@ -73,7 +73,7 @@ label)
   [ -e $M.done ] || { echo "$N: no fit"; exit 1; }
   SH=$(jq -c '.shape' $CT/$VOL/$LV/zarr.json | tr -d '[] '); DEV=(--gpu $G); [ "${CPU:-0}" = 1 ] && DEV=(--cpu --threads $TH)
   [ -s $M.units ] || echo "$F $M" > $M.units
-  for arm in ${ARMS:-agree=0.3,0.15,0.3 corr=0.3,0.5,0.3}; do nm=${arm%%=*}; gt=${arm#*=}
+  for arm in ${ARMS:-agree=0.3,0.15,0.3 corr=0.3,0.5,0.3 lo=0.15,0.15,0.3}; do nm=${arm%%=*}; gt=${arm#*=}
     [ -e $RD/stats/$N.$nm.txt ] && continue
     o=$RD/labels/$nm/$S; mkdir -p $o; : > $RD/stats/$N.$nm.tmp
     while read -r uf um; do   # (each unit writes its own 512^3 shards of the scan's label zarr)
