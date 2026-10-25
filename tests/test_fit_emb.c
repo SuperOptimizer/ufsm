@@ -1,7 +1,7 @@
 /* Sheet-identity embedding evidence (src/fit_emb.h) for the fitter's slip repair.
    (1) emb_shift_vote on a synthetic stack of planar sheets (spacing 10 native voxels, the packed case at 9.6 um): one random unit vector
        per sheet (+ noise), b's W planted r0 = -2..2 turns off; the vote must return r0 (sign convention: b calls a's sheet L + r).
-   (1b) the papyrus gate (emb_vol_set_papyrus): void samples carry a neighbouring sheet; gated votes must be right.
+   (1b) the papyrus gate (emb_vol_set_papyrus): void samples carry a neighbouring sheet and the phase is off; gated (snapped) votes must be right.
    (2) test_repair's slip-region spiral (the phase loses a turn across a band inside a window; the flood leaves the region beyond it a
        turn off) with the repair's stretch weighting OFF: the plain repair cuts in the wrong place; with the embedding evidence (one
        vector per sheet of the true spiral) the repaired unwrapping must get >= 99% of the winding ids. */
@@ -65,7 +65,7 @@ static void test_vote(void) {
 
 /* (1b) the papyrus gate: the voids between the sheets carry the next sheet's vector (the teacher's mesh noise) and b's phase is up to
    0.35 turns off, so ungated sheet samples often land in void; with the CT gate (papyrus within 2.5 voxels of a sheet centre) the
-   votes read papyrus only: right where they vote, and better than ungated */
+   centres snap onto papyrus: right where they vote (599 / 600), and better than ungated (367 / 600) */
 static double W_noisy(double z, double y, double x) {
     (void)z; (void)y; const double w = x / 10.0, f = w - floor(w + 0.5); return fabs(f) < 0.25 ? w : w + (f > 0 ? 1 : -1);
 }

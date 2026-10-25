@@ -124,8 +124,16 @@ int emb_at(const emb_vol *e, const double p[3], float *v) {
 }
 
 /* the mean vector over three samples across the sheet at p (along unit n), unnormalised; 0 if none */
-static int sheet_vec(const emb_vol *e, const double p[3], const double n[3], float *acc, float *tmp) {
-    const int C = e->C; int got = 0;
+static int sheet_vec(const emb_vol *e, const double p0[3], const double n[3], double sp, float *acc, float *tmp) {
+    const int C = e->C; int got = 0; double p[3] = {p0[0], p0[1], p0[2]};
+    if (e->ct) {   /* snap the centre to the nearest papyrus voxel along n within half a turn */
+        int f = 0; const int m = (int)(0.5 * sp);
+        for (int k = 0; k <= m && !f; k++) for (int sg = 1; sg >= -1 && !f; sg -= 2) {
+            const double q[3] = {p0[0] + sg * k * n[0], p0[1] + sg * k * n[1], p0[2] + sg * k * n[2]};
+            if (on_papyrus(e, q)) { f = 1; for (int d = 0; d < 3; d++) p[d] = q[d]; }
+        }
+        if (!f) return 0;
+    }
     for (int k = 0; k < C; k++) acc[k] = 0;
     for (int s = -1; s <= 1; s++) {
         const double q[3] = {p[0] + s * n[0], p[1] + s * n[1], p[2] + s * n[2]};
@@ -147,12 +155,12 @@ static int vote_buf(const emb_vol *e, const emb_side *a, const emb_side *b, int 
     const int C = e->C; float *ea = buf, *eb = buf + C, *tmp = buf + 2 * C;
     const double ta = floor(a->W - phi + 0.5) + phi - a->W, L = a->W + ta;   /* turns to a's nearest sheet centre, its level */
     const double pa[3] = {a->p[0] + a->n[0] * ta * a->sp, a->p[1] + a->n[1] * ta * a->sp, a->p[2] + a->n[2] * ta * a->sp};
-    if (!sheet_vec(e, pa, a->n, ea, tmp)) return -1;
+    if (!sheet_vec(e, pa, a->n, a->sp, ea, tmp)) return -1;
     double best = -3, second = -3; int rb = 0, nr = 0;
     for (int rr = -rmax; rr <= rmax; rr++) {
         const double tb = L + rr - b->W;   /* b's line: turns from b to its centre at level L + rr */
         const double pb[3] = {b->p[0] + b->n[0] * tb * b->sp, b->p[1] + b->n[1] * tb * b->sp, b->p[2] + b->n[2] * tb * b->sp};
-        if (!sheet_vec(e, pb, b->n, eb, tmp)) continue;
+        if (!sheet_vec(e, pb, b->n, b->sp, eb, tmp)) continue;
         const double c = vcos(ea, eb, C); nr++;
         if (c > best) { second = best; best = c; rb = rr; } else if (c > second) second = c;
     }

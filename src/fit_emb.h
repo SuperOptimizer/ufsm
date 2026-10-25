@@ -26,9 +26,12 @@ emb_vol *emb_vol_open(const char *group, const char *name, const long long org[3
    embedding voxels [o, o + step) per axis; the data are copied */
 emb_vol *emb_vol_wrap(const int8_t *v, const int64_t n[3], int C, int step, const int64_t o[3], const long long org[3], double scale);
 void emb_vol_free(emb_vol *e);
-/* the papyrus gate (optional): sheet samples whose raw CT (native voxel, box-local; the array covers [o, o + n) and is owned by e from
-   here on) is below `level` are skipped, so votes compare papyrus only. emb_vol_papyrus_zarr reads the CT of the box org..org + n (+ pad)
-   from a native-level uint8 array. */
+/* the papyrus gate (optional): each sheet centre snaps to the nearest voxel along the direction (within half a turn) whose raw CT
+   (native voxel, box-local; the array covers [o, o + n) and is owned by e from here on) is >= `level`, and its samples below `level` are
+   skipped, so votes compare papyrus only. emb-calib 10-25 (wind96 fits, dinovol tokens_unit, P(right) at D 16 / 48 / 128):
+   HOLD 0.996 / 0.960 / 0.829 ungated vs 0.984 / 0.947 / 0.811 gated, C1 0.928 / 0.659 / 0.382 vs 0.927 / 0.649 / 0.385, 139-2
+   0.981 / 0.930 / 0.777 vs 0.952 / 0.892 / 0.744: no gain, fit runs ungated (without the snap, samples only: 0.80-0.86 at D 16).
+   emb_vol_papyrus_zarr reads the CT of the box org..org + n (+ pad) from a native-level uint8 array. */
 typedef struct z3 z3;
 void emb_vol_set_papyrus(emb_vol *e, uint8_t *ct, const int64_t o[3], const int64_t n[3], int level);
 int emb_vol_papyrus_zarr(emb_vol *e, z3 *z, const long long org[3], const long long n[3], int pad, int level);
