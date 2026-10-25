@@ -1,6 +1,7 @@
 /* ufsm emb-calib: calibration of the embedding shift vote (src/fit_emb.h) on ground truth: P(r right | conf) per partner distance.
      ufsm emb-calib <fields-dir> --model FIT --codes ROOT KEY --emb GROUP [--emb-output tokens_unit] [--n 20000] [--d 16,48,128]
-                    [--rmax 2] [--phi 0] [--seed 1] [--out table.tsv]
+                    [--rmax 2] [--phi 0] [--seed 1] [--out table.tsv] [--ct ROOT KEY --papyrus L [--cache DIR]]
+   --ct: the papyrus gate (fit_emb.h emb_vol_papyrus_zarr): the CT at the fields' native level; sheet samples with CT < L are skipped.
    Points a are labelled GT voxels (winding_mod14 codes, KEY = their um); b = the labelled voxel nearest a + D t (t a random unit
    tangent of the fit's sheet at a, within 2 label voxels). Sides as the fitter's repair builds them: the fit's W, the unit gradient of W and
    1 / |grad W| as the sheet spacing; b's W is offset by a random r0 in -rmax..rmax. The right answer: r = k + r0 with k = round((W_b - W_a)
@@ -25,7 +26,7 @@ int cmd_emb_calib(int argc, char **argv) {
     const char *dir = argc > 2 ? argv[2] : nullptr, *mdir = copt(argc, argv, "--model", nullptr), *eg = copt(argc, argv, "--emb", nullptr);
     int ci = 0; for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], "--codes")) ci = i;
     if (!dir || !mdir || !eg || !ci) {
-        fprintf(stderr, "usage: ufsm emb-calib <fields-dir> --model FIT --codes ROOT KEY --emb GROUP [--emb-output tokens_unit] [--n 20000] [--d 16,48,128] [--rmax 2] [--phi 0] [--seed 1] [--out table.tsv]\n");
+        fprintf(stderr, "usage: ufsm emb-calib <fields-dir> --model FIT --codes ROOT KEY --emb GROUP [--emb-output tokens_unit] [--n 20000] [--d 16,48,128] [--rmax 2] [--phi 0] [--seed 1] [--out table.tsv] [--ct ROOT KEY --papyrus L [--cache DIR]]\n");
         return 2;
     }
     const int N = atoi(copt(argc, argv, "--n", "20000")), rmax = atoi(copt(argc, argv, "--rmax", "2")); const double phi = atof(copt(argc, argv, "--phi", "0"));
@@ -50,6 +51,11 @@ int cmd_emb_calib(int argc, char **argv) {
     const long long en[3] = {(long long)ceil(ext[0]), (long long)ceil(ext[1]), (long long)ceil(ext[2])};
     emb_vol *E = emb_vol_open(eg, copt(argc, argv, "--emb-output", "tokens_unit"), fb.origin, en, atof(copt(argc, argv, "--emb-scale", "1")), pad + 32);
     if (!E) return 1;
+    for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) {   /* the papyrus gate: votes compare papyrus samples only */
+        const int lv = atoi(copt(argc, argv, "--papyrus", "0")); store *cs = store_open(argv[i + 1]); z3 *cz = cs ? z3_open(cs, argv[i + 2], copt(argc, argv, "--cache", nullptr)) : nullptr;
+        if (!cz || lv <= 0 || emb_vol_papyrus_zarr(E, cz, fb.origin, en, pad + 32, lv)) { fprintf(stderr, "emb-calib: --ct ROOT KEY (native level) needs --papyrus L > 0\n"); return 1; }
+        z3_close(cz);
+    }
     /* label voxel index -> box-local native point (the voxel's centre) */
     #define LP(i, p) do { const size_t i_ = (i); const int64_t zz = (int64_t)(i_ / ((size_t)ln[1] * ln[2])), yy = (int64_t)((i_ / ln[2]) % ln[1]), xx = (int64_t)(i_ % ln[2]); \
         p[0] = cf * (zz + lo[0] + 0.5) - fb.origin[0]; p[1] = cf * (yy + lo[1] + 0.5) - fb.origin[1]; p[2] = cf * (xx + lo[2] + 0.5) - fb.origin[2]; } while (0)

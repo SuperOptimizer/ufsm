@@ -124,6 +124,7 @@ typedef struct {
                                 the native input crop (P / 4)^3], both under one symmetry and tone LUT. 1, task restore: no target reads; batch.t holds the clean CT window alone (B x P^3, tone LUT and symmetry applied),
                                 batch.x / x16 and batch.m are absent (the trainer degrades the window on the device); training windows lie inside a
                                 source "boxes" entry when the source lists boxes, validation windows inside its holdout box; level = the source's min_level */
+    float emb_pap;           /* train --distill-papyrus F: targets only on head cells >= F papyrus (sources "papyrus" / "iso"; sample_emb.h); 0 off */
     int emb_ch, emb_div;     /* train --distill: batch.emb, the sources' "emb" feature targets (emb_ch channels, sources.h) on the grid of emb_div^3 window
                                 voxels per cell (the head's level), pulled at each cell centre through the window's symmetry and warp (trilinear,
                                 renormalised); none (0) on crushed / torn / re-bent windows, sources without "emb" and cells outside its groups */
