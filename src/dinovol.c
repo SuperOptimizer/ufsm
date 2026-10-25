@@ -10,6 +10,7 @@
 #include "fit.h"
 #include "embz.h"
 #include <pthread.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <zstd.h>
 #include <stdatomic.h>
@@ -201,9 +202,17 @@ static int aq_finish(aqueue *q) {   /* drain and stop; nonzero if any write fail
 enum { O_TOK, O_TOKU, O_DENSE, O_INK, O_N };
 static const char *o_names[O_N] = {"tokens", "tokens_unit", "dense", "ink"};
 typedef struct {   /* column CT prefetch */
-    z3 *ct; int nthreads; int64_t o[3], n[3]; uint8_t *buf; int rc; pthread_t th; int busy;
+    z3 *ct; int nthreads; int64_t o[3], n[3]; uint8_t *buf; int rc; pthread_t th; int busy; char err[256];
 } colread;
-static void *colread_main(void *a) { colread *r = a; r->rc = z3_read(r->ct, r->o, r->n, r->buf, r->nthreads); return nullptr; }
+static void *colread_main(void *a) {   /* (a failed read is retried 4 times, 2..16 s apart: transient I/O or memory pressure; the error text from this thread) */
+    colread *r = a;
+    for (int t = 0; t < 5; t++) {
+        if (t) { fprintf(stderr, "dinovol-embed: CT read at %lld,%lld,%lld failed (%s), retry %d\n", (long long)r->o[0], (long long)r->o[1], (long long)r->o[2], r->err, t); sleep(1u << t); }
+        if (!(r->rc = z3_read(r->ct, r->o, r->n, r->buf, r->nthreads))) return nullptr;
+        snprintf(r->err, sizeof r->err, "%s", z3_error());
+    }
+    return nullptr;
+}
 static void colread_start(colread *R, int ky, int kx, int64_t bandz0, int Dband, int T, int stride, int margin, uint8_t *buf) {
     R->o[0] = bandz0; R->o[1] = (int64_t)ky * stride - margin; R->o[2] = (int64_t)kx * stride - margin; R->n[0] = Dband; R->n[1] = T; R->n[2] = T; R->buf = buf;
     pthread_create(&R->th, nullptr, colread_main, R); R->busy = 1;
@@ -388,7 +397,7 @@ int cmd_dinovol_embed(int argc, char **argv) {
                 has_left = 0;
             }
             double tr = dv_now(); pthread_join(R.th, nullptr); R.busy = 0; t_read += dv_now() - tr;
-            if (R.rc) { fprintf(stderr, "dinovol-embed: CT read failed: %s\n", z3_error()); rc = 1; break; }
+            if (R.rc) { fprintf(stderr, "dinovol-embed: CT read at %lld,%lld,%lld +%lld,%lld,%lld failed: %s\n", (long long)R.o[0], (long long)R.o[1], (long long)R.o[2], (long long)R.n[0], (long long)R.n[1], (long long)R.n[2], R.err); rc = 1; break; }
             const uint8_t *col = colh[cur];
             if (ci + 1 < ncol) { cur ^= 1; colread_start(&R, ky0 + (ci + 1) / (nbx + 1), kx0 + (ci + 1) % (nbx + 1), bandz0, Dband, T, stride, margin, colh[cur]); }
             const int in_y = ky >= c0[1] && ky < c1[1], in_x = kx >= bx0 && kx < bx1;
