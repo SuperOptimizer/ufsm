@@ -21,9 +21,9 @@ of `boxes.tsv` not tagged `label-noise`) plus 4 full-cross-section Paris 4 slab 
 | PHerc0139 | 139-1..139-8 | level 0 (9.362 um) | 139-1 = the dino/full holdout |
 | PHerc0814 | 814-1..814-8 | level 0 (9.362 um) | 814-1 = the dino/full holdout |
 | PHerc0500P2 | 500P2-1 | level 0 (9.362 um) | the labels are sparse |
-| Paris 4 July-only | J1..J34 (`cand-p4j.tsv`, being qualified) | level 2 (9.6 um) | July labels where June has none (z 6656..6912, 17024..17408); codes from `gtjuly/build.sh` (`P4JQ`); in-sample for d1 before its p4resume relaunch |
+| Paris 4 July-only | J1..J34 (28 clean; J18 J21 J29 J31 J33 ceil < 0.8, J28 air) | level 2 (9.6 um) | July labels where June has none (z 6656..6912, 17024..17408); codes from `gtjuly/build.sh` (`P4JQ`); in-sample for d1 before its p4resume relaunch |
 
-The 31 boxes whose wind96 label ceiling is under 0.8 (all 0814, 139-1..4 and 6..8, C1 C5 C6 C8 C13 C17 C20 C23, C25 C41 C46 C48 C53 C65 C67 C69) carry the
+The 31 boxes (plus J18 J21 J28 J29 J31 J33) whose wind96 label ceiling is under 0.8 (all 0814, 139-1..4 and 6..8, C1 C5 C6 C8 C13 C17 C20 C23, C25 C41 C46 C48 C53 C65 C67 C69) carry the
 note `label-noise` and are skipped unless `BOXES=all`: their labels, not the model, limit the score (e.g. 139-2 ids 0.78 at
 ceil 0.55). They stay held out of training. `BT=file` runs another box list (e.g. `cand-1667.tsv`).
 
@@ -101,6 +101,8 @@ same fitter): HOLD 0.9253 on both, the old desk eval 0.9255.
   - P(A > B);
   - the MDE (2.8 x the bootstrap SE of the paired difference);
   - per-scroll means (`--boxes 1` adds per-box values).
+- **Judge per scroll: the paris4 and paris4j lines carry the phase-skip failure (wind96 cnt_off 0.65 / 0.56 vs 1667 0.11); the
+  pooled mean is mostly 1667.**
 - **A difference smaller than the MDE is noise. The headline is p05x (lowest paired variance: MDE 0.046 vs 0.083 for ids on
   22 clean boxes), with ids beside it, over the clean set.**
 
