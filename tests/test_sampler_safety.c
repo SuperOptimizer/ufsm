@@ -171,6 +171,22 @@ int main(int argc, char **argv) {
     s->hold_o[0] = 64; s->hold_n[0] = 64; s->hold_n[1] = s->hold_n[2] = 128;
     for (int l = 0; l < MAXLEV; l++) { s->ct_present[l] = -1; for (int ch = 0; ch < NCH; ch++) s->tgt_present[ch][l] = -1; }
     c = config(); sp = sampler_start(S, &c); check("union of same-CT holdouts blocks training", !sp); sampler_stop(sp);
+    {   /* one source, a "holdout" list / a holdout_file: all boxes leave training, the first is the validation box */
+        sources *L = fixture(argv[1], ",\"holdout\":[[0,0,0,64,128,128],[64,0,0,64,128,128]]");
+        check("holdout list parsed", L->src[0].nhold == 2 && L->src[0].hold_o[0] == 0 && L->src[0].hold_n[0] == 64);
+        sample_cfg lc = config(); sampler *lp = sampler_start(L, &lc); check("holdout list blocks training", !lp); sampler_stop(lp); sources_free(L);
+        char hp[1400]; snprintf(hp, sizeof hp, "%s/holdouts.json", argv[1]); FILE *hf = fopen(hp, "w"); assert(hf);
+        fprintf(hf, "{\"boxes\":[{\"ct\":\"scan/ct\",\"l0\":[64,0,0,64,128,128]},{\"ct\":\"other/zz\",\"l0\":[0,0,0,64,128,128]}]}\n"); assert(!fclose(hf));
+        char extra[1600]; snprintf(extra, sizeof extra, ",\"holdout\":[0,0,0,64,128,128],\"holdout_file\":\"%s\"", hp);
+        L = fixture(argv[1], extra);
+        check("holdout_file adds the boxes of this CT only", L->src[0].nhold == 2 && L->src[0].hold[1][0] == 64);
+        lp = sampler_start(L, &lc); check("holdout_file boxes block training", !lp); sampler_stop(lp); sources_free(L);
+        snprintf(extra, sizeof extra, ",\"holdout_file\":\"%s\"", hp); L = fixture(argv[1], extra);
+        lp = sampler_start(L, &lc); int avoid = lp != nullptr;
+        for (int bi = 0; lp && bi < 8; bi++) { batch *b = sampler_next(lp); if (!b) { avoid = 0; break; }
+            for (int i = 0; i < lc.B; i++) avoid &= b->corner[i][0] + lc.P <= 64; sampler_release(lp, b); }
+        sampler_stop(lp); check("training windows avoid holdout_file boxes", avoid); sources_free(L);
+    }
 #ifndef TEST_LEGACY
     /* Compare the corner preflight with exhaustive integer origins for varied overlapping boxes. */
     sampler fake = {.S = S, .cfg = c}; fake.cfg.P = 2; rng r; rseed(&r, 193);

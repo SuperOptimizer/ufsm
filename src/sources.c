@@ -15,6 +15,40 @@ static const char *g_cache;   /* chunk cache dir for HTTPS stores; from the sour
 
 int rung_of_um(double um) { return (int)lround(log2(um / 0.6)); }
 
+/* ---- held-out boxes ---- */
+static void src_add_hold(source *s, const json *b) {   /* one [z, y, x, nz, ny, nx] (level 0); the first one is also hold_o / hold_n */
+    if (!b || b->type != J_ARR || b->n != 6) return;
+    int64_t v[6]; for (int d = 0; d < 6; d++) v[d] = (int64_t)json_num(json_at(b, (size_t)d), 0);
+    if (v[3] <= 0 || v[4] <= 0 || v[5] <= 0) return;
+    s->hold = realloc(s->hold, (size_t)(s->nhold + 1) * sizeof *s->hold); memcpy(s->hold[s->nhold++], v, sizeof v);
+    if (s->nhold == 1) for (int d = 0; d < 3; d++) { s->hold_o[d] = v[d]; s->hold_n[d] = v[3 + d]; }
+}
+static const char *src_base(const char *p) {   /* the last path component, ignoring trailing slashes and a trailing "/<level digits>" */
+    static _Thread_local char b[512]; snprintf(b, sizeof b, "%s", p ? p : "");
+    for (;;) {
+        size_t n = strlen(b); while (n && b[n - 1] == '/') b[--n] = 0;
+        char *sl = strrchr(b, '/'); const char *t = sl ? sl + 1 : b; int dig = *t != 0;
+        for (const char *c = t; *c; c++) dig &= *c >= '0' && *c <= '9';
+        if (dig && sl) { *sl = 0; continue; }
+        return t;
+    }
+}
+/* "holdout_file": the boxes of a wbench holdouts.json ({"boxes": [{"ct": KEY, "l0": [6]}...]}) whose ct basename is this source's */
+static int src_hold_file(source *s, const char *path) {
+    FILE *f = fopen(path, "rb"); if (!f) { fprintf(stderr, "sources: %s: cannot open holdout_file %s\n", s->name, path); return 1; }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); char *t = malloc((size_t)n + 1);
+    const size_t got = t ? fread(t, 1, (size_t)n, f) : 0; fclose(f);
+    json *j = got == (size_t)n ? json_parse(t, (size_t)n) : nullptr; free(t);
+    const json *bx = j ? json_get(j, "boxes") : nullptr;
+    if (!bx || bx->type != J_ARR) { fprintf(stderr, "sources: %s: holdout_file %s: no \"boxes\" array\n", s->name, path); json_free(j); return 1; }
+    char me[512]; snprintf(me, sizeof me, "%s", src_base(s->ct_key)); int added = 0;
+    for (size_t k = 0; k < bx->n; k++) { const json *e = json_at(bx, k);
+        if (!strcmp(src_base(json_str(json_get(e, "ct"), "")), me)) { src_add_hold(s, json_get(e, "l0")); added++; } }
+    json_free(j);
+    if (added) fprintf(stderr, "sources: %s: %d held-out boxes from %s\n", s->name, added, path);
+    return 0;
+}
+
 /* ---- axis ---- */
 
 static int cmp_z(const void *a, const void *b) {
@@ -282,7 +316,10 @@ sources *sources_load(const char *path) {
             if (!(s->norm_s > 0)) { fprintf(stderr, "sources: %s: \"norm\" needs \"scale\" > 0\n", s->name); json_free(j); sources_free(S); return nullptr; }
         }
         const json *ho = json_get(e, "holdout");
-        if (ho && ho->type == J_ARR && ho->n == 6) for (int d = 0; d < 3; d++) { s->hold_o[d] = (int64_t)json_num(json_at(ho, (size_t)d), 0); s->hold_n[d] = (int64_t)json_num(json_at(ho, (size_t)(3 + d)), 0); }
+        if (ho && ho->type == J_ARR && ho->n == 6 && json_at(ho, 0)->type != J_ARR) src_add_hold(s, ho);
+        else if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n; k++) src_add_hold(s, json_at(ho, k));
+        const char *hf = json_str(json_get(e, "holdout_file"), nullptr);
+        if (hf && src_hold_file(s, hf)) { json_free(j); sources_free(S); return nullptr; }
         const json *bx = json_get(e, "boxes");   /* task restore: level-0 boxes [z, y, x, nz, ny, nx] that hold local CT (training windows lie inside one) */
         if (bx && bx->type == J_ARR && bx->n) {
             s->box = calloc(bx->n, sizeof *s->box);
@@ -314,7 +351,7 @@ void sources_free(sources *S) {
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
-        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); free(s->box); free(s->focus); free(s->mask); srpair_free(s->srp);
+        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); free(s->box); free(s->hold); free(s->focus); free(s->mask); srpair_free(s->srp);
         for (int c = 0; c < NCH; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             if (s->reg[c]) {

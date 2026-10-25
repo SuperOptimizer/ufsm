@@ -2,6 +2,7 @@
 #include "sample.h"
 #include "sources.h"
 #include "band.h"
+#include "pairacc.h"
 #include "votes.h"
 #include "wind.h"
 #include "phase_check.h"
@@ -10,6 +11,7 @@
 #include "store.h"
 #include "zarr3.h"
 #include "fit.h"
+#include "fit_emb.h"
 #include "unet.h"
 #include "checkpoint.h"
 #include "fblend.h"
@@ -62,6 +64,8 @@ int cmd_wl_dump(int argc, char **argv);
 int cmd_dinovol_embed(int argc, char **argv);   /* src/dinovol.c */
 int cmd_dinovol_eval(int argc, char **argv);
 int cmd_dinovol_read(int argc, char **argv);
+int cmd_emb_pca(int argc, char **argv);
+int cmd_emb_calib(int argc, char **argv);
 int cmd_dinovol_calib(int argc, char **argv);
 int cmd_dino_headfit(int argc, char **argv);
 int cmd_surf_eval(int argc, char **argv);   /* src/surfeval.c */
@@ -150,6 +154,7 @@ static int usage(void) {
         "  ufsm fit-join <out-set> <fields-dir> <slab-model> <z0> <z1> ...   independent z-slab fits -> one fit set, gauges matched on the overlaps\n"
         "  ufsm fields-oracle <fields-dir> <phase-root> <phase-key> <out-dir>   fit fields with the phase planes from a label phase raster (oracle / swap)\n"
         "  ufsm phase-packing <phase-root> <phase-key> [--box ..] [--map OUT.raw]   how packed the labelled sheets are (box stats, per-chunk map for the sampler focus)\n"
+        "  ufsm wbench-stats A.tsv [B.tsv] [--metric ids,p1x] [--set clean|all]   winding bench means, stratified bootstrap CIs, paired A-B, MDE\n"
         "  ufsm phase-conflict <a-root> <a-key> <b-root> <b-key> <out>   where two label phase sets disagree (> --tol turn): the sampler's phase ignore mask\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..]  several models' fit fields averaged (phase: confidence-weighted complex mean)\n"
@@ -771,7 +776,9 @@ typedef struct { float d; uint8_t z, r; } score_rec;
 typedef struct {
     const uint8_t *codes; const float *U; int64_t n3[3], o3[3]; double cf, h, um; const long long *org; const int *shp; const float *cy, *cx; int na_ax, detail;
     size_t *hist[64], *fine[64], nd[64], nan[64]; score_rec *dd[64]; size_t ndet[64], dcap[64]; int nt;
+    pa_buf *pa;   /* per thread (fit --score-pairs), or null */
 } score_job;
+static int g_score_pairs;   /* fit --score-pairs 1: pair winding accuracy (src/pairacc.h) after the box score */
 enum { SC_NB = 14 * 72, SC_NF = 14 * 1024 };
 static void *score_rows(void *arg) {
     score_job *J = ((void **)arg)[0]; const int t = (int)(intptr_t)((void **)arg)[1];
@@ -785,6 +792,7 @@ static void *score_rows(void *arg) {
         if (!(J->U[i] == J->U[i])) { nan++; continue; }
         double d = fmod(J->U[i] - (cd - 1) / 18.0, 14.0); if (d < 0) d += 14; if (d >= 14) d = 0;
         hist[(int)(d / 14 * SC_NB) % SC_NB]++; fine[(int)(d / 14 * SC_NF) % SC_NF]++; nd++;
+        if (J->pa) pa_add(&J->pa[t], (float)pz, (float)py, (float)px, (float)d, cd, ((uint64_t)(zz + J->o3[0]) << 42) ^ ((uint64_t)(yy + J->o3[1]) << 21) ^ (uint64_t)(xx + J->o3[2]));
         if (J->detail) {
             if (J->ndet[t] == J->dcap[t]) { J->dcap[t] = J->dcap[t] ? 2 * J->dcap[t] : 1 << 16; J->dd[t] = realloc(J->dd[t], J->dcap[t] * sizeof(score_rec)); }
             const int zi = (int)fmin(7, fmax(0, pz / (shp[0] * h) * 8));
@@ -801,6 +809,7 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
     enum { NB = SC_NB, NF = SC_NF }; size_t *hist = calloc(NB, sizeof(size_t)), *fine = calloc(NF, sizeof(size_t)), nd = 0, nan = 0;   /* d = U - q mod 14: 1/72 and 1/1024 turn bins */
     score_rec *dd = nullptr; size_t ndet = 0, dcap = 0;
     const int na_ax = (int)(shp[0] * h) + 1;
+    pa_buf *pab = nullptr; if (g_score_pairs && !dump) { pab = calloc(16, sizeof *pab); for (int t = 0; t < 16; t++) pa_init(&pab[t], (size_t)1 << 19); }
     /* blocks of up to 128 x 1024 x 1024 label voxels aligned to the codes' 128^3 chunks (z planes one at a time decoded every chunk
        128 times: minutes on a 3.9 cm slab) */
     enum { SBZ = 128, SBY = 1024, SBX = 1024 };
@@ -818,7 +827,7 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
         const double og[3] = {cf * o3[0] - 0.25 * cf - org[0], cf * o3[1] - 0.25 * cf - org[1], cf * o3[2] - 0.25 * cf - org[2]};   /* label voxel i at cf (i + lo + 1 / 4) - org */
         if (fill(ctx, og, n3, cf, codes, U)) { fprintf(stderr, "score: cannot evaluate U on the score grid\n"); free(codes); free(U); free(hist); free(fine); free(dd); return 1; }
         if (!dump) {   /* threads (the dump keeps the serial voxel order) */
-            score_job J = {codes, U, {n3[0], n3[1], n3[2]}, {o3[0], o3[1], o3[2]}, cf, h, um, org, shp, cy, cx, na_ax, detail, {0}, {0}, {0}, {0}, {0}, {0}, {0}, 0};
+            score_job J = {codes, U, {n3[0], n3[1], n3[2]}, {o3[0], o3[1], o3[2]}, cf, h, um, org, shp, cy, cx, na_ax, detail, {0}, {0}, {0}, {0}, {0}, {0}, {0}, 0, pab};
             long ncpu = sysconf(_SC_NPROCESSORS_ONLN); const char *te = getenv("UFSM_FIT_THREADS"); if (te && atoi(te) > 0) ncpu = atoi(te);   /* (the fit's threads) */
             J.nt = (int)(ncpu < 1 ? 1 : ncpu > 16 ? 16 : ncpu); if (J.nt > n3[0]) J.nt = (int)n3[0];
             pthread_t th[64]; void *args[64][2];
@@ -877,6 +886,14 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
             printf("    z octile %d %9zu voxels: %.3f %.3f %.3f %.3f %.3f\n", zb, t, (double)ie[zb][2] / t, (double)ie[zb][3] / t, (double)ie[zb][4] / t, (double)ie[zb][5] / t, (double)ie[zb][6] / t); }
         for (int rb = 0; rb < 256; rb += 2) { size_t t = 0, c[9] = {0}; for (int k = 0; k < 9; k++) { c[k] = re[rb][k] + (rb + 1 < 256 ? re[rb + 1][k] : 0); t += c[k]; } if (t < 1000) continue;
             printf("    radius %5.1f-%4.1f mm %9zu voxels: %.3f %.3f %.3f %.3f %.3f\n", rb * 0.25, rb * 0.25 + 0.5, t, (double)c[2] / t, (double)c[3] / t, (double)c[4] / t, (double)c[5] / t, (double)c[6] / t); }
+    }
+    if (pab) {   /* pair winding accuracy (gauge-free): 0.5 / 1 / 2 / 4 mm */
+        pa_buf all; pa_init(&all, 1 << 20); for (int t = 0; t < 16; t++) { pa_merge(&all, &pab[t]); pa_free(&pab[t]); } free(pab); pab = nullptr;
+        const double mm[4] = {0.5, 1, 2, 4}; double dv[4], a[4], ac[4]; size_t na[4], nc[4]; for (int k = 0; k < 4; k++) dv[k] = mm[k] * 1000 / um;
+        pa_score(&all, dv, 4, 200000, 0x5eed, a, ac, na, nc);
+        printf("pair winding right (%zu records):", all.n);
+        for (int k = 0; k < 4; k++) printf(" %g mm %.4f cross %.4f (%zu / %zu)%s", mm[k], a[k], ac[k], na[k], nc[k], k < 3 ? " |" : "\n");
+        pa_free(&all);
     }
     free(dd); free(ah); free(hist); free(fine);
     return 0;
@@ -978,6 +995,13 @@ static int cmd_fit(int argc, char **argv) {
     c.uw_rep_cs = (float)atof(opt(argc, argv, "--uw-rep-cs", "0")); c.uw_rep_dump = opt(argc, argv, "--uw-rep-dump", nullptr);
     c.uw_rep_qpow = (float)atof(opt(argc, argv, "--uw-rep-qpow", "3")); c.uw_rep_stretch = (float)atof(opt(argc, argv, "--uw-rep-stretch", "0.5"));
     c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1"));
+    /* embedding evidence for the slip repair (src/fit_emb.h): --emb GROUP (a dinovol-embed output group at the fields' scan level, or
+       --emb-scale S embedding voxels per native voxel) [--emb-output tokens_unit] --uw-rep-emb W [--uw-rep-emb-d 16,48 native voxels]
+       [--uw-rep-emb-m0 0.3 cosine margin for full weight] [--uw-rep-emb-rmax 2] [--uw-rep-emb-sub 2 field voxels] [--emb-phi 0] */
+    c.uw_rep_emb = (float)atof(opt(argc, argv, "--uw-rep-emb", "0")); c.uw_rep_emb_m0 = (float)atof(opt(argc, argv, "--uw-rep-emb-m0", "0.3"));
+    c.uw_rep_emb_rmax = atoi(opt(argc, argv, "--uw-rep-emb-rmax", "2")); c.uw_rep_emb_sub = atoi(opt(argc, argv, "--uw-rep-emb-sub", "2")); c.emb_phi = (float)atof(opt(argc, argv, "--emb-phi", "0"));
+    if (*opt(argc, argv, "--uw-rep-emb-d", "")) { c.uw_rep_emb_nd = 0; char *t = strdup(opt(argc, argv, "--uw-rep-emb-d", "")); for (char *q = strtok(t, ","); q && c.uw_rep_emb_nd < 4; q = strtok(nullptr, ",")) c.uw_rep_emb_d[c.uw_rep_emb_nd++] = atoi(q); free(t); }
+    if (!(c.uw_rep_emb >= 0) || !(c.uw_rep_emb_m0 > 0) || c.uw_rep_emb_rmax < 1 || c.uw_rep_emb_rmax > 8 || c.uw_rep_emb_sub < 1) { fprintf(stderr, "fit: --uw-rep-emb >= 0, --uw-rep-emb-m0 > 0, --uw-rep-emb-rmax 1..8, --uw-rep-emb-sub >= 1\n"); return 2; }
     if (c.uw_repair < 0 || !(c.uw_rep_w4 >= 0) || !(c.uw_rep_geo >= 0) || !(c.uw_rep_cs >= 0) || c.uw_rep_gd < 1 || !(c.uw_rep_qpow > 0) || !(c.uw_rep_stretch >= 0) || c.uw_rep_sr < 0 || c.uw_rep_sr > 4) { fprintf(stderr, "fit: --uw-repair >= 0, --uw-rep-* weights >= 0, --uw-rep-gd >= 1\n"); return 2; }
     c.core = (float)atof(opt(argc, argv, "--core", "3"));   /* no data terms within core x pitch of the axis */
     c.w_wind4 = (float)atof(opt(argc, argv, "--wind4-weight", "0"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off: weight 4 cost fit-val, 0.5-1 neutral) */
@@ -993,6 +1017,14 @@ static int cmd_fit(int argc, char **argv) {
     if (fit_fields_load(dir, 0, 0, min || slab > 0 ? 0 : 1, &fb)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
     clock_gettime(CLOCK_MONOTONIC, &tl1);
     if (c.verbose) fprintf(stderr, "fit: fields %dx%dx%d loaded in %.1fs\n", fb.shape[0], fb.shape[1], fb.shape[2], (double)(tl1.tv_sec - tl0.tv_sec) + (tl1.tv_nsec - tl0.tv_nsec) * 1e-9);   /* (slab runs load per slab; a given model needs the geometry only) */
+    emb_vol *embv = nullptr;
+    if (opt(argc, argv, "--emb", nullptr) && c.uw_rep_emb > 0) {   /* the embedding over the fields' box (+ the farthest partner distance) */
+        int pad = 0; for (int k = 0; k < c.uw_rep_emb_nd; k++) if (c.uw_rep_emb_d[k] > pad) pad = c.uw_rep_emb_d[k];
+        const long long en[3] = {(long long)ceil(fb.shape[0] * fb.h), (long long)ceil(fb.shape[1] * fb.h), (long long)ceil(fb.shape[2] * fb.h)};
+        embv = emb_vol_open(opt(argc, argv, "--emb", ""), opt(argc, argv, "--emb-output", "tokens_unit"), fb.origin, en, atof(opt(argc, argv, "--emb-scale", "1")), pad + 32);
+        if (!embv) return 1;
+        c.emb = embv;
+    } else if (opt(argc, argv, "--emb", nullptr)) fprintf(stderr, "fit: --emb without --uw-rep-emb W > 0 (unused)\n");
     if (*opt(argc, argv, "--axis-normal", "") && !min && !slab) {
         /* local boxes away from the scroll's axis (crushed scrolls): replace the axis by a vertical line D native voxels from the box centre
            along the box's mean sheet normal (top eigenvector of the material-weighted mean n n^T), so the spiral term is nearly flat */
@@ -1039,10 +1071,10 @@ static int cmd_fit(int argc, char **argv) {
         if (!cf) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
         fprintf(cf, "{\"version\":1,\"w_phase\":%.9g,\"w_normal\":%.9g,\"w_density\":%.9g,\"w_smooth\":%.9g,\"w_pgrad\":%.9g,\"pgrad_delta\":%.9g,\"w_wind4\":%.9g,\"w_recto\":%.9g,"
                     "\"w_ct\":%.9g,\"ct_pow\":%.9g,\"ct_phi\":%.9g,\"ct_floor\":%.9g,\"ct_radius_um\":%.9g,\"ct_flood\":%d,\"w_cspacing\":%.9g,\"cs_tol\":%.9g,"
-                    "\"phase_robust_turns\":%.9g,\"conf_pow\":%.9g,\"bend\":%.9g,\"unwrap_voxels\":%d,\"uw_min_conf\":%.9g,\"uw_repair\":%d,\"uw_rep_w4\":%.9g,\"uw_rep_geo\":%.9g,\"uw_rep_gd\":%d,\"uw_rep_cs\":%.9g,\"uw_rep_qpow\":%.9g,\"uw_rep_stretch\":%.9g,\"uw_rep_sr\":%d,\"phase_stage\":%d,\"slab\":%d,\"cpu\":%d,\"native_um\":%.9g,\"lattice\":[",
+                    "\"phase_robust_turns\":%.9g,\"conf_pow\":%.9g,\"bend\":%.9g,\"unwrap_voxels\":%d,\"uw_min_conf\":%.9g,\"uw_repair\":%d,\"uw_rep_w4\":%.9g,\"uw_rep_geo\":%.9g,\"uw_rep_gd\":%d,\"uw_rep_cs\":%.9g,\"uw_rep_qpow\":%.9g,\"uw_rep_stretch\":%.9g,\"uw_rep_sr\":%d,\"uw_rep_emb\":%.9g,\"phase_stage\":%d,\"slab\":%d,\"cpu\":%d,\"native_um\":%.9g,\"lattice\":[",
                 c.w_phase, c.w_normal, c.w_density, c.w_smooth, c.w_pgrad, c.pgrad_delta, c.w_wind4, c.w_recto,
                 c.w_ct, c.ct_pow, c.ct_phi, c.ct_floor, c.ct_radius_um, c.ct_flood, c.w_cspacing, c.cs_tol, c.phase_robust, c.conf_pow, c.bend, c.unwrap_voxels, c.uw_min_conf,
-                c.uw_repair, c.uw_rep_w4, c.uw_rep_geo, c.uw_rep_gd, c.uw_rep_cs, c.uw_rep_qpow, c.uw_rep_stretch, c.uw_rep_sr, c.phase_stage, slab, c.cpu, c.um);
+                c.uw_repair, c.uw_rep_w4, c.uw_rep_geo, c.uw_rep_gd, c.uw_rep_cs, c.uw_rep_qpow, c.uw_rep_stretch, c.uw_rep_sr, (double)c.uw_rep_emb, c.phase_stage, slab, c.cpu, c.um);
         for (int k = 0; k < c.nstage; k++) fprintf(cf, "%s%d", k ? "," : "", c.lattice[k]);
         fprintf(cf, "]}\n"); if (fclose(cf)) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
     }
@@ -1167,6 +1199,7 @@ static int cmd_fit(int argc, char **argv) {
         FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;   /* box-local z y x, U - q mod 14 per voxel */
         fit_set_dev *gd = nullptr; if (!c.cpu && !(gd = fit_set_upload(fs))) return 1;
         fit_fill_ctx fc = {gd, fs};
+        g_score_pairs = atoi(opt(argc, argv, "--score-pairs", "0")) > 0;
         const int rc = score_codes(z, cf, org, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, &fc);
         fit_set_dev_free(gd); z3_close(z); if (dump) fclose(dump);
         if (rc) return 1;
@@ -1211,6 +1244,7 @@ static int cmd_wind_score(int argc, char **argv) {
     const double cf = atof(argv[4]) > 0 ? atof(argv[4]) / um : 2;
     FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;
     raster_fill_ctx rc = {Ur, {shp[0], shp[1], shp[2]}};
+    g_score_pairs = atoi(opt(argc, argv, "--score-pairs", "0")) > 0;
     const int r = score_codes(zc, cf, org, shp, 1.0, um, cy, cx, atoi(opt(argc, argv, "--score-detail", "0")) > 0, dump, raster_fill, &rc);
     z3_close(zc); if (dump) fclose(dump); free(Ur); free(cy); free(cx);
     return r;
@@ -3347,6 +3381,7 @@ int cmd_repack(int argc, char **argv);   /* src/repack.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
+int cmd_wbench_stats(int argc, char **argv);   /* src/wbench.c */
 int cmd_phase_conflict(int argc, char **argv);   /* src/packmap.c */
 int cmd_reg(int argc, char **argv);   /* src/reg_cli.c */
 int cmd_sr_pairs(int argc, char **argv);   /* src/srpairs.c */
@@ -3377,6 +3412,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fit-join")) return cmd_fit_join(argc, argv);
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
+    if (!strcmp(cmd, "wbench-stats")) return cmd_wbench_stats(argc, argv);
     if (!strcmp(cmd, "phase-conflict")) return cmd_phase_conflict(argc, argv);
     if (!strcmp(cmd, "reg")) return cmd_reg(argc, argv);
     if (!strcmp(cmd, "sr-pairs")) return cmd_sr_pairs(argc, argv);
@@ -3398,6 +3434,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "dinovol-embed")) return cmd_dinovol_embed(argc, argv);
     if (!strcmp(cmd, "dinovol-eval")) return cmd_dinovol_eval(argc, argv);
     if (!strcmp(cmd, "dinovol-read")) return cmd_dinovol_read(argc, argv);
+    if (!strcmp(cmd, "emb-pca")) return cmd_emb_pca(argc, argv);
+    if (!strcmp(cmd, "emb-calib")) return cmd_emb_calib(argc, argv);
     if (!strcmp(cmd, "dinovol-calib")) return cmd_dinovol_calib(argc, argv);
     if (!strcmp(cmd, "dino-headfit")) return cmd_dino_headfit(argc, argv);
     if (!strcmp(cmd, "surf-eval")) return cmd_surf_eval(argc, argv);

@@ -254,28 +254,36 @@ static int patch_bounds(const source *s, const z3_meta *m, const int64_t wn[3], 
     }
     return 1;
 }
+/* held-out boxes of a source: box 0 = hold_o / hold_n (the validation box), 1.. = the further "holdout" list / holdout_file boxes */
+static inline int src_nhold(const source *h) { return h->hold_n[0] > 0 ? (h->nhold > 1 ? h->nhold : 1) : 0; }
+static inline int64_t hb_o(const source *h, int k, int d) { return k ? h->hold[k][d] : h->hold_o[d]; }
+static inline int64_t hb_n(const source *h, int k, int d) { return k ? h->hold[k][3 + d] : h->hold_n[d]; }
 static int same_ct(const source *a, const source *b) {
     return a == b || (a->um == b->um && !strcmp(a->ct_key, b->ct_key) && !strcmp(store_root(a->s), store_root(b->s)));
 }
 static int training_hits_holdout(const sampler *sp, const source *s, const int64_t o[3], int l) {
     const int64_t span[3] = {(int64_t)PZ(&sp->cfg) << l, (int64_t)sp->cfg.P << l, (int64_t)sp->cfg.P << l};
     for (int i = 0; i < sp->S->n; i++) {
-        const source *h = &sp->S->src[i]; if (!h->hold_n[0] || !same_ct(s, h)) continue;
-        int hit = 1;
-        for (int d = 0; d < 3; d++) { int64_t a = o[d] << l; if (a + span[d] <= h->hold_o[d] || a >= h->hold_o[d] + h->hold_n[d]) hit = 0; }
-        if (hit) return 1;
+        const source *h = &sp->S->src[i]; if (!src_nhold(h) || !same_ct(s, h)) continue;
+        for (int k = 0; k < src_nhold(h); k++) {
+            int hit = 1;
+            for (int d = 0; d < 3; d++) { int64_t a = o[d] << l; if (a + span[d] <= hb_o(h, k, d) || a >= hb_o(h, k, d) + hb_n(h, k, d)) hit = 0; }
+            if (hit) return 1;
+        }
     }
     return 0;
 }
 /* Any free cell of the origin grid begins at lo or just after a forbidden interval.
    Check these corners to reject a source covered by the union of same-CT holdouts. */
 static int training_corner_exists(const sampler *sp, const source *s, int l, const int64_t lo[3], const int64_t hi[3]) {
-    int n[3] = {1, 1, 1}; int64_t v[3][sp->S->n + 1], f = (int64_t)1 << l;
+    int nh = 0; for (int i = 0; i < sp->S->n; i++) nh += src_nhold(&sp->S->src[i]);
+    int n[3] = {1, 1, 1}; int64_t v[3][nh + 1], f = (int64_t)1 << l;
     for (int d = 0; d < 3; d++) v[d][0] = lo[d];
     if (!training_hits_holdout(sp, s, lo, l)) return 1;
     for (int i = 0; i < sp->S->n; i++) {
-        const source *h = &sp->S->src[i]; if (!h->hold_n[0] || !same_ct(s, h)) continue;
-        for (int d = 0; d < 3; d++) { int64_t end = (h->hold_o[d] + h->hold_n[d] + f - 1) / f; if (end > lo[d] && end <= hi[d]) v[d][n[d]++] = end; }
+        const source *h = &sp->S->src[i]; if (!src_nhold(h) || !same_ct(s, h)) continue;
+        for (int k = 0; k < src_nhold(h); k++)
+            for (int d = 0; d < 3; d++) { int64_t end = (hb_o(h, k, d) + hb_n(h, k, d) + f - 1) / f; if (end > lo[d] && end <= hi[d]) v[d][n[d]++] = end; }
     }
     for (int z = 0; z < n[0]; z++) for (int y = 0; y < n[1]; y++) for (int x = 0; x < n[2]; x++) {
         int64_t o[3] = {v[0][z], v[1][y], v[2][x]}; if (!training_hits_holdout(sp, s, o, l)) return 1;
@@ -1866,10 +1874,12 @@ static double crush_ct_at(void *ud, const double x[3]) {
 }
 static int training_hits_holdout_box(const sampler *sp, const source *s, const int64_t lo[3], const int64_t n[3], int l) {   /* level-l box */
     for (int i = 0; i < sp->S->n; i++) {
-        const source *h = &sp->S->src[i]; if (!h->hold_n[0] || !same_ct(s, h)) continue;
-        int hit = 1;
-        for (int d = 0; d < 3; d++) { const int64_t a = lo[d] * ((int64_t)1 << l), e = (lo[d] + n[d]) * ((int64_t)1 << l); if (e <= h->hold_o[d] || a >= h->hold_o[d] + h->hold_n[d]) hit = 0; }
-        if (hit) return 1;
+        const source *h = &sp->S->src[i]; if (!src_nhold(h) || !same_ct(s, h)) continue;
+        for (int k = 0; k < src_nhold(h); k++) {
+            int hit = 1;
+            for (int d = 0; d < 3; d++) { const int64_t a = lo[d] * ((int64_t)1 << l), e = (lo[d] + n[d]) * ((int64_t)1 << l); if (e <= hb_o(h, k, d) || a >= hb_o(h, k, d) + hb_n(h, k, d)) hit = 0; }
+            if (hit) return 1;
+        }
     }
     return 0;
 }

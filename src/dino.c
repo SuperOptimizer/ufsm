@@ -505,6 +505,27 @@ static int load_sources(const char *path, dn_data *D, int nthreads) {
           if (small) { fprintf(stderr, "dino-train: WARNING: source %s skipped: a box (or the volume) is smaller than the %d^3 window\n", S->name, D->P); z3_close(S->ca); continue; } }
         const json *ho = json_get(s, "holdout");
         if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n && S->nho < DN_MAXBOX; k++) if (!parse_box(json_at(ho, k), S->ho[S->nho])) S->nho++;
+        const char *hfp = json_str(json_get(s, "holdout_file"), nullptr);   /* ufsm wbench holdouts.json: level-0 boxes of the scans named by "ct" */
+        if (hfp) {
+            FILE *hf = fopen(hfp, "rb"); long hn = 0; char *ht = nullptr;
+            if (hf) { fseek(hf, 0, SEEK_END); hn = ftell(hf); fseek(hf, 0, SEEK_SET); ht = malloc((size_t)hn + 1); if (ht && fread(ht, 1, (size_t)hn, hf) != (size_t)hn) hn = 0; fclose(hf); }
+            json *hj = ht && hn > 0 ? json_parse(ht, (size_t)hn) : nullptr; free(ht);
+            const json *hb = hj ? json_get(hj, "boxes") : nullptr;
+            if (!hb || hb->type != J_ARR) { fprintf(stderr, "dino-train: %s: cannot read holdout_file %s\n", S->name, hfp); json_free(hj); return -1; }
+            char mbuf[512]; snprintf(mbuf, sizeof mbuf, "%s", json_str(json_get(s, "ct"), "")); int ml = (int)json_num(json_get(s, "min_level"), 0);
+            for (;;) { char *sl = strrchr(mbuf, '/'); if (!sl || !sl[1]) break; int dig = 1; for (const char *q = sl + 1; *q; q++) dig &= *q >= '0' && *q <= '9';
+                       if (!dig) break;
+                       if (!json_get(s, "min_level")) ml = atoi(sl + 1);
+                       *sl = 0; }   /* ("SCAN.zarr/2": level 2 of SCAN.zarr) */
+            const char *mb = strrchr(mbuf, '/'); mb = mb ? mb + 1 : mbuf; const int64_t f = (int64_t)1 << ml; int add = 0;
+            for (size_t k = 0; k < hb->n && S->nho < DN_MAXBOX; k++) {
+                const json *e = json_at(hb, k); const char *c = json_str(json_get(e, "ct"), ""); const char *cb = strrchr(c, '/'); cb = cb ? cb + 1 : c;
+                int64_t b[6]; if (strcmp(cb, mb) || parse_box(json_get(e, "l0"), b)) continue;
+                for (int d = 0; d < 3; d++) { const int64_t e1 = (b[d] + b[3 + d] + f - 1) / f; b[d] /= f; b[3 + d] = e1 - b[d]; }   /* (the opened level, outward) */
+                memcpy(S->ho[S->nho++], b, sizeof b); add++;
+            }
+            json_free(hj); fprintf(stderr, "dino-train: source %s: %d held-out boxes from %s\n", S->name, add, hfp);
+        }
         if (json_get(s, "axis")) { S->axz = load_axis(json_str(json_get(s, "axis"), ""), json_num(json_get(s, "axis_scale"), 1.0), S->shape[0]); if (!S->axz) { fprintf(stderr, "dino-train: %s: cannot read the axis\n", S->name); return -1; } }
         S->weight = json_num(json_get(s, "weight"), 1.0);
         S->ct_only = (int)json_num(json_get(s, "ct_only"), 0) || !S->codes;

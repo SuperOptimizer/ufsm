@@ -8,6 +8,7 @@
 #include "json.h"
 #include "tiff.h"
 #include "fit.h"
+#include "embz.h"
 #include <pthread.h>
 #include <sys/stat.h>
 #include <zstd.h>
@@ -152,14 +153,12 @@ static int sample_stats(z3 *ct, int cs, int nthreads, dv_stats *S) {
 
 /* ---- sharded zarr v3 writer of [Z][Y][X](C) arrays (zstd inner chunks, index at the end with crc32c), shards written incrementally:
    compressed chunks are appended as their cells finish and the index is written when the shard closes ---- */
-typedef struct { int64_t sz, sy, sx; FILE *f; char path[1200]; uint64_t off, *idx; } zw_shard;
-typedef struct { char dir[1024]; int64_t shape[3]; int C, esize, shard, chunk, nc1; zw_shard *open; int nopen, cap; size_t chunk_bytes; uint8_t *cbuf, *zbuf; size_t zcap; } zw;
 static int mkdirs(const char *path) {
     char p[1200]; snprintf(p, sizeof p, "%s", path);
     for (char *s = p + 1; *s; s++) if (*s == '/') { *s = 0; if (mkdir(p, 0755) && errno != EEXIST) return -1; *s = '/'; }
     return mkdir(p, 0755) && errno != EEXIST ? -1 : 0;
 }
-static int zw_create(zw *w, const char *dir, const int64_t shape[3], int C, const char *dtype, int esize, int shard, int chunk, const char *attrs) {
+int zw_create(zw *w, const char *dir, const int64_t shape[3], int C, const char *dtype, int esize, int shard, int chunk, const char *attrs) {
     memset(w, 0, sizeof *w);
     snprintf(w->dir, sizeof w->dir, "%s", dir); memcpy(w->shape, shape, sizeof w->shape); w->C = C; w->esize = esize; w->shard = shard; w->chunk = chunk;
     w->nc1 = shard / chunk; w->chunk_bytes = (size_t)chunk * chunk * chunk * (C ? C : 1) * esize;
@@ -191,7 +190,7 @@ static int zw_close_shard(zw *w, zw_shard *s) {
     if (rc) fprintf(stderr, "dinovol: cannot write %s\n", fin);
     return rc ? -1 : 0;
 }
-static int zw_flush(zw *w) { int rc = 0; for (int i = 0; i < w->nopen; i++) rc |= zw_close_shard(w, &w->open[i]); w->nopen = 0; return rc; }
+int zw_flush(zw *w) { int rc = 0; for (int i = 0; i < w->nopen; i++) rc |= zw_close_shard(w, &w->open[i]); w->nopen = 0; return rc; }
 static zw_shard *zw_get(zw *w, int64_t sz, int64_t sy, int64_t sx) {
     for (int i = 0; i < w->nopen; i++) if (w->open[i].sz == sz && w->open[i].sy == sy && w->open[i].sx == sx) return &w->open[i];
     if (w->nopen == w->cap) { w->cap = w->cap ? 2 * w->cap : 16; w->open = realloc(w->open, w->cap * sizeof *w->open); }
@@ -227,8 +226,8 @@ static void *zw_worker(void *a) {
     }
     free(cb); return nullptr;
 }
-static int zw_nthreads = 8;
-static int zw_put(zw *w, int64_t oz, int64_t oy, int64_t ox, int nz, int ny, int nx, const void *data) {
+int zw_nthreads = 8;
+int zw_put(zw *w, int64_t oz, int64_t oy, int64_t ox, int nz, int ny, int nx, const void *data) {
     const int c = w->chunk; int nch = 0;
     int *co = malloc((size_t)(nz / c + 1) * (ny / c + 1) * (nx / c + 1) * 3 * sizeof *co);
     for (int az = 0; az < nz; az += c) for (int ay = 0; ay < ny; ay += c) for (int ax = 0; ax < nx; ax += c)
@@ -252,7 +251,7 @@ static int zw_put(zw *w, int64_t oz, int64_t oy, int64_t ox, int nz, int ny, int
     free(J.zb); free(J.zn); free(co);
     return rc;
 }
-static void zw_free(zw *w) { free(w->open); free(w->cbuf); free(w->zbuf); }
+void zw_free(zw *w) { free(w->open); free(w->cbuf); free(w->zbuf); }
 /* background writer: puts (owning their buffer) and shard flushes run in submission order on one thread (each put compresses its chunks
    on zw_nthreads workers), so finishing a column overlaps the next column's network; pending bytes are bounded */
 typedef struct aq_job { zw *w; int flush; int64_t oz, oy, ox; int nz, ny, nx; void *data; size_t bytes; struct aq_job *next; } aq_job;
@@ -575,86 +574,6 @@ int cmd_dinovol_embed(int argc, char **argv) {
     return rc;
 }
 
-/* ---- reader of the embedding arrays (any region, dequantised to float32: value_scale, and the <name>_scale array when present) ---- */
-typedef struct { char dir[1024]; int64_t shape[3]; int C, esize, shard, chunk, dt; double vscale; int64_t ish[3]; uint8_t *idx; int64_t csh, cci; uint8_t *cb; int64_t cshard[3]; } zr;
-static int zr_open(zr *r, const char *dir) {
-    memset(r, 0, sizeof *r); snprintf(r->dir, sizeof r->dir, "%s", dir); r->ish[0] = -1; r->csh = -1;
-    char p[1200]; snprintf(p, sizeof p, "%s/zarr.json", dir); size_t n = 0; char *t = read_file(p, &n);
-    if (!t) return -1;
-    json *j = json_parse(t, n); free(t); if (!j) return -1;
-    const json *sh = json_get(j, "shape"), *dtj = json_get(j, "data_type"), *cs = json_path(j, "chunk_grid.configuration.chunk_shape"), *ic = json_path(j, "codecs.0.configuration.chunk_shape");
-    if (!sh || !dtj || !cs || !ic) { json_free(j); return -1; }
-    for (int d = 0; d < 3; d++) r->shape[d] = (int64_t)json_num(json_at(sh, d), 0);
-    r->C = sh->n > 3 ? (int)json_num(json_at(sh, 3), 0) : 0;
-    r->shard = (int)json_num(json_at(cs, 0), 0); r->chunk = (int)json_num(json_at(ic, 0), 0);
-    const char *dt = json_str(dtj, ""); r->dt = !strcmp(dt, "int8") ? 0 : !strcmp(dt, "float16") ? 1 : !strcmp(dt, "float32") ? 2 : -1; r->esize = r->dt == 0 ? 1 : r->dt == 1 ? 2 : 4;
-    r->vscale = json_num(json_path(j, "attributes.value_scale"), 1.0);
-    json_free(j);
-    if (r->dt < 0 || r->chunk <= 0 || r->shard % r->chunk) return -1;
-    const size_t cb = (size_t)r->chunk * r->chunk * r->chunk * (r->C ? r->C : 1) * r->esize; r->cb = malloc(cb);
-    return r->cb ? 0 : -1;
-}
-static void zr_close(zr *r) { free(r->idx); free(r->cb); }
-/* the decoded chunk holding output cell (z, y, x), or nullptr when absent (zeros) */
-static const uint8_t *zr_chunk(zr *r, int64_t z, int64_t y, int64_t x) {
-    const int64_t s[3] = {z / r->shard, y / r->shard, x / r->shard}; const int nc1 = r->shard / r->chunk, nc = nc1 * nc1 * nc1;
-    const int64_t ci = ((z % r->shard) / r->chunk * nc1 + (y % r->shard) / r->chunk) * nc1 + (x % r->shard) / r->chunk;
-    char p[1300];
-    if (r->C) snprintf(p, sizeof p, "%s/c/%lld/%lld/%lld/0", r->dir, (long long)s[0], (long long)s[1], (long long)s[2]);
-    else snprintf(p, sizeof p, "%s/c/%lld/%lld/%lld", r->dir, (long long)s[0], (long long)s[1], (long long)s[2]);
-    if (memcmp(s, r->ish, sizeof s)) {   /* shard index */
-        free(r->idx); r->idx = nullptr; memcpy(r->ish, s, sizeof s); r->csh = -1;
-        FILE *f = fopen(p, "rb");
-        if (f) { r->idx = malloc((size_t)nc * 16); fseek(f, -(long)(nc * 16 + 4), SEEK_END); if (fread(r->idx, 16, nc, f) != (size_t)nc) { free(r->idx); r->idx = nullptr; } fclose(f); }
-    }
-    if (!r->idx) return nullptr;
-    uint64_t off, len; memcpy(&off, r->idx + ci * 16, 8); memcpy(&len, r->idx + ci * 16 + 8, 8);
-    if (off == UINT64_MAX) return nullptr;
-    if (r->csh == 0 && r->cci == ci && !memcmp(r->cshard, s, sizeof s)) return r->cb;
-    FILE *f = fopen(p, "rb"); if (!f) return nullptr;
-    void *zb = malloc(len); fseek(f, (long)off, SEEK_SET);
-    const size_t got = fread(zb, 1, len, f); fclose(f);
-    const size_t cb = (size_t)r->chunk * r->chunk * r->chunk * (r->C ? r->C : 1) * r->esize;
-    if (got != len || ZSTD_decompress(r->cb, cb, zb, len) != cb) { free(zb); return nullptr; }
-    free(zb); r->csh = 0; r->cci = ci; memcpy(r->cshard, s, sizeof s);
-    return r->cb;
-}
-/* float32 [n0][n1][n2](C) of the region at o (output cells); outside the array or absent: 0 */
-static int zr_read(zr *r, const int64_t o[3], const int64_t n[3], float *out) {
-    const int C = r->C ? r->C : 1, c = r->chunk;
-    for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {
-        float *dst = out + ((z * n[1] + y) * n[2] + x) * C;
-        const int64_t gz = o[0] + z, gy = o[1] + y, gx = o[2] + x;
-        const uint8_t *ch = gz >= 0 && gy >= 0 && gx >= 0 && gz < r->shape[0] && gy < r->shape[1] && gx < r->shape[2] ? zr_chunk(r, gz, gy, gx) : nullptr;
-        if (!ch) { memset(dst, 0, C * 4); continue; }
-        const size_t e = ((size_t)((gz % c) * c + gy % c) * c + gx % c) * C;
-        for (int k = 0; k < C; k++) {
-            if (r->dt == 0) dst[k] = (float)(((const int8_t *)ch)[e + k] * r->vscale);
-            else if (r->dt == 1) { uint16_t h; memcpy(&h, ch + (e + k) * 2, 2); dst[k] = (float)(h2f(h) * r->vscale); }
-            else { float v; memcpy(&v, ch + (e + k) * 4, 4); dst[k] = (float)(v * r->vscale); }
-        }
-    }
-    return 0;
-}
-/* an output with its optional per-vector scale array */
-typedef struct { zr a, s; int has_s; } emb;
-static int emb_open(emb *e, const char *group, const char *name) {
-    char d[1200]; snprintf(d, sizeof d, "%s/%s", group, name);
-    if (zr_open(&e->a, d)) { fprintf(stderr, "dinovol: cannot open %s\n", d); return -1; }
-    snprintf(d, sizeof d, "%s/%s_scale", group, name); e->has_s = zr_open(&e->s, d) == 0;
-    return 0;
-}
-static void emb_close(emb *e) { zr_close(&e->a); if (e->has_s) zr_close(&e->s); }
-static int emb_read(emb *e, const int64_t o[3], const int64_t n[3], float *out) {
-    if (zr_read(&e->a, o, n, out)) return -1;
-    if (e->has_s) {
-        const size_t nv = (size_t)n[0] * n[1] * n[2]; float *s = malloc(nv * 4);
-        zr_read(&e->s, o, n, s);
-        for (size_t i = 0; i < nv; i++) for (int k = 0; k < e->a.C; k++) out[i * e->a.C + k] *= s[i];
-        free(s);
-    }
-    return 0;
-}
 /* ufsm dinovol-read <group> <name> z,y,x,nz,ny,nx <out.f32>: a region of one output (output cells), float32 channel-last */
 int cmd_dinovol_read(int argc, char **argv) {
     long long b[6];
