@@ -131,6 +131,9 @@ No teacher models, no distillation. All upstream data is re-exported once into t
   the same frame mode; new rows keep their init). Tests: test_attn_dfm (coarse level and frames vs double central differences, frame
   identity, frame kernel and normal prior geometry), test_hybrid_identity (coarse + frames identity, gradients, axis dependence,
   checkpoint, warm-start remap, trunk LR x 0.5 under Muon and AdamW with the stage unchanged and 1 = default bit for bit).
+  Laptop smoke (5080, wdef snap 12001 + all three + --aug-crush 0.5, trunk x 0.25, P384 level 2 of the local Paris 4 box, 80 steps):
+  --mem fast fits (planner 12.38 of 15.53 GB; P512 does not: lean 2 fallback), GPU ~634 ms/step (UFSM_PROF sum) = ~89 Mvox/s, finite
+  losses (1.50 -> 1.46-1.51), 72 crushed windows; loader-bound at 6 workers with crush (0.2-0.4 samples/s).
 - dino-train for large windows: `--head-slab Z` runs the 1^3 head per z-slab of Z planes (unet head slabs): no whole-window logits
   (P 512 at D 32: 8.6 GB of fp16 logits) and no dense fp32 logit gradient (17 GB) -- the points' embeddings are gathered per slab, and
   in the backward's head step their gradients are scattered into each slab's fp16 logit gradient. `--mem lean` sets train's smallest
