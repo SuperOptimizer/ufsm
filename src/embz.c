@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -136,6 +137,7 @@ static int zw_mkdirs(const char *path) {
 }
 int zw_create(zw *w, const char *dir, const int64_t shape[3], int C, const char *dtype, int esize, int shard, int chunk, const char *attrs) {
     memset(w, 0, sizeof *w);
+    { struct rlimit rl; if (!getrlimit(RLIMIT_NOFILE, &rl) && rl.rlim_cur < rl.rlim_max) { rl.rlim_cur = rl.rlim_max; setrlimit(RLIMIT_NOFILE, &rl); } }   /* (one open file per shard being written: a whole-scroll slab holds ~800, the default soft limit is 1024) */
     snprintf(w->dir, sizeof w->dir, "%s", dir); memcpy(w->shape, shape, sizeof w->shape); w->C = C; w->esize = esize; w->shard = shard; w->chunk = chunk;
     w->nc1 = shard / chunk; w->chunk_bytes = (size_t)chunk * chunk * chunk * (C ? C : 1) * esize;
     w->cbuf = malloc(w->chunk_bytes); w->zcap = ZSTD_compressBound(w->chunk_bytes); w->zbuf = malloc(w->zcap);
@@ -172,11 +174,11 @@ static zw_shard *zw_get(zw *w, int64_t sz, int64_t sy, int64_t sx) {
     if (w->nopen == w->cap) { w->cap = w->cap ? 2 * w->cap : 16; w->open = realloc(w->open, w->cap * sizeof *w->open); }
     zw_shard *s = &w->open[w->nopen];
     char d[1200]; snprintf(d, sizeof d, "%s/c/%lld/%lld", w->dir, (long long)sz, (long long)sy);
-    if (zw_mkdirs(d)) return nullptr;
-    if (w->C) { snprintf(d, sizeof d, "%s/c/%lld/%lld/%lld", w->dir, (long long)sz, (long long)sy, (long long)sx); if (zw_mkdirs(d)) return nullptr;
+    if (zw_mkdirs(d)) { fprintf(stderr, "dinovol: cannot create %s: %s\n", d, strerror(errno)); return nullptr; }
+    if (w->C) { snprintf(d, sizeof d, "%s/c/%lld/%lld/%lld", w->dir, (long long)sz, (long long)sy, (long long)sx); if (zw_mkdirs(d)) { fprintf(stderr, "dinovol: cannot create %s: %s\n", d, strerror(errno)); return nullptr; }
                 snprintf(s->path, sizeof s->path, "%s/0.tmp", d); }
     else snprintf(s->path, sizeof s->path, "%s/%lld.tmp", d, (long long)sx);
-    s->f = fopen(s->path, "wb"); if (!s->f) { fprintf(stderr, "dinovol: cannot write %s\n", s->path); return nullptr; }
+    s->f = fopen(s->path, "wb"); if (!s->f) { fprintf(stderr, "dinovol: cannot write %s: %s (%d shards open)\n", s->path, strerror(errno), w->nopen); return nullptr; }
     s->sz = sz; s->sy = sy; s->sx = sx; s->off = 0;
     const int nc = w->nc1 * w->nc1 * w->nc1; s->idx = malloc((size_t)nc * 16); memset(s->idx, 0xff, (size_t)nc * 16);
     w->nopen++;
@@ -196,7 +198,7 @@ static void *zw_worker(void *a) {
         }
         J->zn[k] = 0; J->zb[k] = nullptr;
         if (!any) continue;
-        J->zb[k] = malloc(w->zcap);
+        if (!(J->zb[k] = malloc(w->zcap))) { J->zn[k] = (size_t)-2; continue; }
         const size_t n = ZSTD_compress(J->zb[k], w->zcap, cb, w->chunk_bytes, 1);   /* level 1: int8 embeddings barely compress further at 3 */
         J->zn[k] = ZSTD_isError(n) ? (size_t)-1 : n;
     }
@@ -215,11 +217,13 @@ int zw_put(zw *w, int64_t oz, int64_t oy, int64_t ox, int nz, int ny, int nx, co
     for (int i = 0; i < nt; i++) pthread_join(th[i], nullptr);
     int rc = 0;
     for (int k = 0; k < nch && !rc; k++) {
-        if (!J.zb[k]) continue;
         const int64_t gz = oz + co[3 * k], gy = oy + co[3 * k + 1], gx = ox + co[3 * k + 2];
-        zw_shard *s = zw_get(w, gz / w->shard, gy / w->shard, gx / w->shard);
         const size_t n = J.zn[k];
-        if (!s || n == (size_t)-1 || fwrite(J.zb[k], 1, n, s->f) != n) { fprintf(stderr, "dinovol: chunk write failed\n"); rc = -1; break; }
+        if (n >= (size_t)-2) { fprintf(stderr, "dinovol: chunk %lld,%lld,%lld: %s\n", (long long)gz, (long long)gy, (long long)gx, n == (size_t)-2 ? "out of memory" : "compression failed"); rc = -1; break; }
+        if (!J.zb[k]) continue;   /* (an all-zero chunk: not stored) */
+        zw_shard *s = zw_get(w, gz / w->shard, gy / w->shard, gx / w->shard);
+        if (!s) { rc = -1; break; }
+        if (fwrite(J.zb[k], 1, n, s->f) != n) { fprintf(stderr, "dinovol: chunk write to %s failed: %s\n", s->path, strerror(errno)); rc = -1; break; }
         const int ci = (int)((((gz % w->shard) / c) * w->nc1 + (gy % w->shard) / c) * w->nc1 + (gx % w->shard) / c);
         s->idx[2 * ci] = s->off; s->idx[2 * ci + 1] = n; s->off += n;
     }
