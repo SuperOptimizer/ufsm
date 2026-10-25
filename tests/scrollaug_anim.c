@@ -47,15 +47,15 @@ int main(int argc, char **argv) {
     const int fps = atoi(opt(argc, argv, "--fps", "12")), seam = atoi(opt(argc, argv, "--seam", "-1")), tear = !strcmp(argv[3], "tear");
     uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "1"));
     const char *still = opt(argc, argv, "--still", nullptr); g_crop = opt(argc, argv, "--crop", nullptr);
-    const int delam = !strcmp(argv[3], "delam");
-    if (!tear && !delam && strcmp(argv[3], "xscan")) { fprintf(stderr, "scrollaug_anim: tear, delam or xscan\n"); return 2; }
+    const int delam = !strcmp(argv[3], "delam"), density = !strcmp(argv[3], "density");
+    if (!tear && !delam && !density && strcmp(argv[3], "xscan")) { fprintf(stderr, "scrollaug_anim: tear, delam, density or xscan\n"); return 2; }
     int64_t o[3]; { long long a, b, c; if (sscanf(argv[4], "%lld,%lld,%lld", &a, &b, &c) != 3) return 2; o[0] = a; o[1] = b; o[2] = c; }
     sources *S = sources_load(argv[1]); if (!S) return 1;
     source *s = &S->src[0]; z3 *ct = source_ct(s, l);
     if (!ct || !s->phase) { fprintf(stderr, "scrollaug_anim: no level %d CT or stored phase\n", l); return 1; }
     const int psh = s->phase_level - l; const size_t p3 = (size_t)P * P * P;
     make_pal();
-    const int np = tear || delam ? 3 : 2, W = np * P + (np - 1) * 4, H = P + 14;
+    const int np = tear || delam || density ? 3 : 2, W = np * P + (np - 1) * 4, H = P + 14;
     uint8_t *ix = malloc((size_t)W * H); uint16_t *tree = malloc((size_t)4096 * 256 * sizeof *tree);
     FILE *f = fopen(argv[2], "wb"); if (!ix || !tree || !f) return 1;
     gif_head(f, W, H);
@@ -96,6 +96,34 @@ int main(int argc, char **argv) {
             }
         }
         free(ctp); free(php);
+    } else if (density) {   /* --aug-sheet-density on the plain window: the strengths swept 0 -> 1 -> 0 (labels untouched) */
+        const int64_t nn[3] = {P, P, P};
+        uint8_t *ct0 = malloc(p3);
+        if (!ct0 || z3_read(ct, o, nn, ct0, 4) || phase_window(s->phase, o, P, P, psh, pho)) { fprintf(stderr, "read failed\n"); return 1; }
+        if (s->phase_sign < 0) phase_negate(pho, p3);
+        const int iso = s->iso > 0 ? s->iso : sa_ct_quantile(ct0, p3, .5);
+        sa_density dd; int tries = 0;   /* (the first seed from --seed with a strong per-wrap gain: >= --gain, default .25) */
+        const double gmin = atof(opt(argc, argv, "--gain", ".25"));
+        do { if (!sa_density_make(&dd, seed + (uint64_t)tries, ct0, pho, P, P, P, (uint8_t)iso)) { fprintf(stderr, "too little phase\n"); return 1; } } while (++tries < 1000 && dd.s_gain < gmin);
+        printf("%s: density seed %llu: spacing %.1f voxels/turn, iso %d, void %d; gain +-%.2f per wrap, offset +-%.2f, slow +-%.2f\n", argv[2], (unsigned long long)(seed + (uint64_t)tries - 1),
+               dd.spacing, iso, dd.void_ct, dd.s_gain, dd.s_off, dd.s_slow);
+        for (size_t k = 0; k < p3; k++) if (!ct0[k]) pho[k] = PHASE_UNKNOWN;
+        if (band_wind4_tiled(pho, P, P, P, (P + 5) / 6, 80, 512, 1, w4o, wco, nullptr) < 0) return 1;
+        for (int fr = 0; fr < F; fr++) {
+            const double u = F > 1 ? fr / (double)(F - 1) : 1, a = smooth(1 - fabs(2 * u - 1));
+            sa_density_apply(&dd, a, ct0, pho, P, P, P, cto);
+            uint8_t *rowb = malloc((size_t)W * P); memset(rowb, gray_ix(40), (size_t)W * P);
+            panel(rowb, W, 0, P, cto, nullptr, 0, nullptr); panel(rowb, W, P + 4, P, cto, pho, 1, nullptr); panel(rowb, W, 2 * (P + 4), P, cto, w4o, 2, wco);
+            memcpy(ix, rowb, (size_t)W * P); free(rowb);
+            for (size_t k = (size_t)W * P; k < (size_t)W * (P + 4); k++) ix[k] = gray_ix(40);
+            bar(ix, W, P + 4, a, .6);
+            gif_frame(f, ix, W, H, delay, tree);
+            if (still && (fr == 0 || fr == F / 2)) {
+                uint8_t *rgb = malloc((size_t)W * H * 3); for (size_t k = 0; k < (size_t)W * H; k++) memcpy(rgb + 3 * k, pal[ix[k]], 3);
+                char p[1200]; snprintf(p, sizeof p, "%s-t%d.jpg", still, fr ? 1 : 0); jpeg_write_rgb(p, W, H, rgb, 90); still_crop(p, rgb, W, P, np); free(rgb);
+            }
+        }
+        free(ct0);
     } else if (tear) {
         const double vox = s->um * (double)(1 << l), maxd = atof(opt(argc, argv, "--um", "480")) / vox, want = fmin(1.25, atof(opt(argc, argv, "--turns", "1")));
         const int M = (int)ceil(.5 * maxd) + 2, Pp = P + 2 * M; const size_t pp3 = (size_t)Pp * Pp * Pp;

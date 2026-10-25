@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
             char key[32]; double v; int nc = 0;
             if (sscanf(q, "%31[^=]=%lf%n", key, &v, &nc) != 2) { fprintf(stderr, "UFSM_BENCH_SCROLLAUG=aug=p[,aug=p..]\n"); return 2; }
             if (!strcmp(key, "xscan")) c.xscan_p = (float)v; else if (!strcmp(key, "tear")) c.tear_p = (float)v; else if (!strcmp(key, "tear_um")) c.tear_um = (float)v;
-            else if (!strcmp(key, "crush")) c.crush.p = (float)v; else if (!strcmp(key, "delam")) c.delam_p = (float)v; else if (!strcmp(key, "delam_hole")) c.delam_hole = (float)v;
+            else if (!strcmp(key, "crush")) c.crush.p = (float)v; else if (!strcmp(key, "delam")) c.delam_p = (float)v; else if (!strcmp(key, "delam_hole")) c.delam_hole = (float)v; else if (!strcmp(key, "density")) c.density_p = (float)v;
             else { fprintf(stderr, "UFSM_BENCH_SCROLLAUG: unknown aug %s\n", key); return 2; }
             q += nc; if (*q == ',') q++;
         }

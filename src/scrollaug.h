@@ -55,3 +55,21 @@ void sa_tear_apply(const sa_tear *t, int P, int M, const uint8_t *ct_pad, const 
                    uint8_t void_ct, uint8_t *ct, uint8_t *ph, uint8_t *w4, uint8_t *wc);
 /* the CT value at the q-quantile of a box's nonzero voxels (0 when none) */
 uint8_t sa_ct_quantile(const uint8_t *ct, size_t n, double q);
+
+/* --aug-sheet-density: per-wrap brightness (carbonisation differs from wrap to wrap) and a slow field along the sheets, CT only.
+   The wrap coordinate kc = a / spacing - psi - c0 (a the distance along the window's sheet normal n from the window centre, psi the
+   phase relative to the papyrus' mean phase in turns, wrapping in the void between sheets; c0 puts the papyrus near integers) is
+   about constant along a sheet and steps by 1 from wrap to wrap: a random value per integer (flat within +-.2, smooth between, so a
+   curved sheet's drift changes it gradually) gives each wrap its gain and offset. Unknown phase: the nearest known kc along the row
+   within 6 voxels, else a / spacing - c0. CT out = void + (CT - void) gain slow + offset m (m the papyrus fraction (CT - void) /
+   (iso - void) in 0 .. 1; slow 1 + 3 plane waves of wavelength .7-2.5 window); CT 0 (outside the scan) kept; labels untouched. */
+typedef struct {
+    double n[3], spacing, c0, phc;    /* phc: the papyrus' mean phase (codes) */
+    double s_gain, s_off, s_slow;     /* gain 1 +- s_gain per wrap (.1-.35), offset +- s_off (iso - void) per wrap (0-.15), slow field +- s_slow (0-.3) */
+    double k[3][3], f[3];             /* the slow field's plane waves (rad / voxel, zyx) and phases */
+    uint64_t seed; uint8_t void_ct, iso;
+} sa_density;
+/* from the window's CT and phase (D x H x W); returns 0 when the phase gives no normal or no papyrus */
+int sa_density_make(sa_density *d, uint64_t seed, const uint8_t *ct, const uint8_t *ph, int D, int H, int W, uint8_t iso);
+/* out = the CT with the strengths scaled by t (0: a copy); out may be ct */
+void sa_density_apply(const sa_density *d, double t, const uint8_t *ct, const uint8_t *ph, int D, int H, int W, uint8_t *out);

@@ -249,12 +249,63 @@ static void delam_tests(const char *dir) {
     drop(a); drop(b); drop(d); drop(e); sources_free(S);
 }
 
+/* --aug-sheet-density: the kernel on a fixture box (gains constant along each wrap, different between wraps), then the sampler */
+static void density_tests(const char *dir) {
+    {
+        const int P = 48; const size_t p3 = (size_t)P * P * P; const int z0 = 40, y0 = 74, x0 = 10;   /* (level 1, clear of the spiral axis) */
+        uint8_t *ph = malloc(p3), *ct = malloc(p3), *out = malloc(p3); int *id = malloc(p3 * sizeof *id);
+        for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
+            const double w = fx_wind(2. * (z0 + z) + .5, 2. * (y0 + y) + .5, 2. * (x0 + x) + .5);
+            const size_t k = ((size_t)z * P + y) * P + x; ph[k] = (uint8_t)((int)floor((w - floor(w)) * PHASE_PERIOD) % PHASE_PERIOD);
+            ct[k] = ph[k] < .2 * PHASE_PERIOD || ph[k] > .8 * PHASE_PERIOD ? 160 : 40; id[k] = (int)lrint(w);
+            if (x == 0 && y == 0) ct[k] = 0;   /* (a column outside the scan) */
+        }
+        sa_density d; int okm = 1, ident = 1, zero = 1; double between = 0, within = 0; int nb = 0;
+        for (int it = 0; it < 8; it++) {
+            okm &= sa_density_make(&d, 300 + it, ct, ph, P, P, P, 100);
+            sa_density_apply(&d, 0, ct, ph, P, P, P, out); ident &= !memcmp(out, ct, p3);
+            d.s_slow = 0;   /* (the per-wrap part alone) */
+            sa_density_apply(&d, 1, ct, ph, P, P, P, out);
+            double s[64] = {0}, s2[64] = {0}; size_t n[64] = {0}; int lo = 1 << 30;
+            for (size_t k = 0; k < p3; k++) if (id[k] < lo) lo = id[k];
+            for (size_t k = 0; k < p3; k++) {
+                if (!ct[k]) { zero &= !out[k]; continue; }
+                if (ct[k] != 160 || id[k] - lo >= 64) continue;
+                const double g = (out[k] - (double)d.void_ct) / (160. - d.void_ct); const int j = id[k] - lo;
+                s[j] += g; s2[j] += g * g; n[j]++;
+            }
+            double m = 0, mm = 0; int nw = 0;
+            for (int j = 0; j < 64; j++) if (n[j] > 200) { const double mu = s[j] / n[j]; m += mu; mm += mu * mu; nw++; within += sqrt(fmax(0, s2[j] / n[j] - mu * mu)); nb++; }
+            if (nw > 1) { m /= nw; between += sqrt(fmax(0, mm / nw - m * m)); }
+        }
+        between /= 8; within /= nb ? nb : 1;
+        printf("scrollaug: density kernel: per-wrap gain spread %.3f between wraps, %.3f within a wrap (mean over %d wrap draws)\n", between, within, nb);
+        check("density make: a normal and papyrus on the fixture", okm);
+        check("density apply: t 0 is the CT, CT 0 stays 0", ident && zero);
+        check("density apply: gains differ between wraps (>= 3x the spread within one)", between > .05 && between > 3 * within);
+        free(ph); free(ct); free(out); free(id);
+    }
+    char p[1400]; snprintf(p, sizeof p, "%s/sources.json", dir); sources *S = sources_load(p); assert(S);
+    const int PW = 64; const size_t p3 = (size_t)PW * PW * PW;
+    sample_cfg c = base_cfg(PW); c.snap = 0; c.symmetry_p = 0; c.rotate_p = 0; c.elastic_p = 0; c.zoom_p = 0; c.affine_p = 0;
+    snap a[NB], d[NB], e[NB];
+    sampler *sp = sampler_start(S, &c); assert(sp); take(sp, a, p3); const uint64_t n0 = sampler_aug_count(sp, AUGN_DENSITY); sampler_stop(sp);
+    sample_cfg c1 = c; c1.density_p = 1;
+    sp = sampler_start(S, &c1); assert(sp); take(sp, d, p3); const uint64_t n1 = sampler_aug_count(sp, AUGN_DENSITY); sampler_stop(sp);
+    sp = sampler_start(S, &c1); assert(sp); take(sp, e, p3); sampler_stop(sp);
+    printf("scrollaug: density sampler: %llu windows re-lit\n", (unsigned long long)n1);
+    check("--aug-sheet-density 0: never applied", n0 == 0);
+    check("--aug-sheet-density 1: windows re-lit, deterministic", n1 >= NB && same(d, e, p3));
+    drop(a); drop(d); drop(e); sources_free(S);
+}
+
 int main(int argc, char **argv) {
     char tmpd[] = "/tmp/ufsm-scrollaug-XXXXXX"; const char *dir = argc > 1 ? argv[1] : mkdtemp(tmpd);
     if (!dir || make_wind_fixture(dir, 256, 2.f)) { fprintf(stderr, "fixture failed\n"); return 1; }
     xscan_tests(dir);
     tear_tests(dir);
     delam_tests(dir);
+    density_tests(dir);
     if (argc < 2) { char cmd[1500]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {} }
     printf(failed ? "scrollaug: %d FAILED\n" : "scrollaug: all passed\n", failed);
     return failed != 0;

@@ -553,6 +553,23 @@ Goal: sheets that split into layers (a void opening inside a sheet, the outer la
   24 windows). Render: build/scrollaug_anim ... delam (strength swept 0 -> 1 -> 0, w4 component borders drawn);
   ~/ufsm-data/scrollaug/anim/delam.gif.
 
+## Sheet density: train --aug-sheet-density P (2026-10-24)
+Goal: wraps of different brightness (carbonisation, compression, papyrus quality vary per wrap) and slow along-sheet variation.
+- Windows with a stored phase (level shift 1, or 0 direct), not zoomed out, augment on; applied after crush / tear / delam / xscan
+  (it re-lights their output, from their pulled phase) and before the CT statistics. CT only: labels unchanged.
+- src/scrollaug.[ch]: `sa_density_make` takes the window's mean sheet normal (`sa_phase_normal`), void (5% CT quantile), iso and
+  the reference phase phc (circular mean on papyrus), and the offset c0 so that kc = a / spacing - psi - c0 (a: distance along the
+  normal, psi: stored phase in turns) is an integer on the wrap centres. Per wrap k a hashed gain (+-0.10..0.35) and offset
+  (+-0..0.15 of iso - void); flat within +-.2 of each integer, smoothstep between (no step inside papyrus). Slow field: 3 plane
+  waves of wavelength .7-2.5 window, amplitude 0..0.3 total. out = void + (CT - void) gain slow + offset m (m: papyrus fraction of
+  CT between void and iso); CT 0 (masked air) kept. Unknown-phase voxels take the nearest known kc along the row within 6 voxels.
+- sample.c `density_draw`: the window's phase is read once into g_crush.ph (pre 0, so the conflict mask still applies) and the
+  label path reuses it.
+- Tests: wrap spread between wraps .105 vs within .010 on the fixture; t 0 identity; CT 0 kept; default off bit-identical, p 1
+  deterministic.
+- Cost P512 one core: apply ~0.8 s + make 0.08 s per window (the phase read moves forward, not added); ~+12% on a ~7 s window.
+  Render: scrollaug_anim ... density; ~/ufsm-data/scrollaug/anim/density.gif.
+
 ## Augmentation presets: train --aug all (default) | none (2026-10-16)
 User: "I want all the augs we can get" (robustness to other scrolls, scanners, resolutions and damage from one scroll's labels).
 - `--aug all` is the default for the dense-target tasks on cube windows (recto / side targets); `none` (the old defaults: 48 cube

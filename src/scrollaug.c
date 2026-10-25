@@ -274,3 +274,85 @@ void sa_delam_apply(const sa_delam *dl, double t, int P, int M, const uint8_t *c
         }
     }
 }
+
+/* ---------------- --aug-sheet-density: per-wrap brightness, slow carbonisation field ---------------- */
+static double sa_hash1(uint64_t seed, int64_t j) { sa_rng r = {seed ^ ((uint64_t)j * 0xd1342543de82ef95ull)}; sa_next(&r); return 2 * sa_unif(&r) - 1; }
+int sa_density_make(sa_density *d, uint64_t seed, const uint8_t *ct, const uint8_t *ph, int D, int H, int W, uint8_t iso) {
+    memset(d, 0, sizeof *d);
+    const int mn = D < H ? (D < W ? D : W) : (H < W ? H : W), st = mn / 32 > 1 ? mn / 32 : 1, st4 = mn / 96 > 1 ? mn / 96 : 1;   /* (st4: the papyrus statistics on ~96^3 samples) */
+    if (sa_phase_normal(ph, D, H, W, 0, st, d->n, &d->spacing) < 32 || !(d->spacing > 2)) return 0;
+    const size_t N = (size_t)D * H * W;
+    d->void_ct = sa_ct_quantile(ct, N, .05); d->iso = iso > d->void_ct ? iso : (uint8_t)(d->void_ct + 1);
+    double cs = 0, sn = 0;   /* the papyrus' mean phase */
+    for (int z = 0; z < D; z += st4) for (int y = 0; y < H; y += st4) for (int x = 0; x < W; x += st4) {
+        const size_t k = ((size_t)z * H + y) * W + x;
+        if (ct[k] < d->iso || ph[k] >= PHASE_PERIOD) continue;
+        const double th = 2 * M_PI * ph[k] / PHASE_PERIOD; cs += cos(th); sn += sin(th);
+    }
+    if (cs == 0 && sn == 0) return 0;
+    d->phc = fmod(atan2(sn, cs) / (2 * M_PI) * PHASE_PERIOD + PHASE_PERIOD, PHASE_PERIOD);
+    double c2 = 0, s2 = 0;   /* c0: the circular mean of a / spacing - psi over the papyrus (the sheets then sit near integers) */
+    for (int z = 0; z < D; z += st4) for (int y = 0; y < H; y += st4) for (int x = 0; x < W; x += st4) {
+        const size_t k = ((size_t)z * H + y) * W + x;
+        if (ct[k] < d->iso || ph[k] >= PHASE_PERIOD) continue;
+        double ps = (ph[k] - d->phc) / PHASE_PERIOD; ps -= floor(ps + .5);
+        const double kc = ((z - .5 * D) * d->n[0] + (y - .5 * H) * d->n[1] + (x - .5 * W) * d->n[2]) / d->spacing - ps;
+        c2 += cos(2 * M_PI * kc); s2 += sin(2 * M_PI * kc);
+    }
+    d->c0 = atan2(s2, c2) / (2 * M_PI);
+    sa_rng r = {seed}; d->seed = sa_next(&r);
+    d->s_gain = .1 + .25 * sa_unif(&r); d->s_off = .15 * sa_unif(&r); d->s_slow = .3 * sa_unif(&r);
+    const int mx = D > H ? (D > W ? D : W) : (H > W ? H : W);
+    for (int j = 0; j < 3; j++) {
+        double u[3]; sa_unit(&r, u); const double lam = (.7 + 1.8 * sa_unif(&r)) * mx;
+        for (int a = 0; a < 3; a++) d->k[j][a] = 2 * M_PI / lam * u[a];
+        d->f[j] = 2 * M_PI * sa_unif(&r);
+    }
+    return 1;
+}
+void sa_density_apply(const sa_density *d, double t, const uint8_t *ct, const uint8_t *ph, int D, int H, int W, uint8_t *out) {
+    const size_t N = (size_t)D * H * W;
+    if (t <= 0) { if (out != ct) memcpy(out, ct, N); return; }
+    float psi[256], mt[256];
+    for (int v = 0; v < 256; v++) { double ps = (v - d->phc) / PHASE_PERIOD; ps -= floor(ps + .5); psi[v] = (float)ps; }
+    const double vd = d->void_ct, span = d->iso - vd, sp = d->spacing, gs = t * d->s_gain, os = t * d->s_off * span, ss = t * d->s_slow / 3;
+    for (int v = 0; v < 256; v++) { double m = (v - vd) / span; mt[v] = (float)(m < 0 ? 0 : m > 1 ? 1 : m); }
+    /* the per-wrap values for every integer kc can reach in this box (|a| / spacing + psi + c0) */
+    const double amax = .5 * sqrt((double)D * D + (double)H * H + (double)W * W) / sp;
+    const int jlo = (int)floor(-amax - 2), nj = (int)ceil(2 * amax + 5);
+    float *kc = malloc((size_t)W * sizeof *kc), *sl = malloc((size_t)(W + 16) * sizeof *sl), *gv = malloc((size_t)nj * sizeof *gv), *ov = malloc((size_t)nj * sizeof *ov);
+    int *kn = malloc((size_t)W * sizeof *kn);
+    if (!kc || !kn || !gv || !ov || !sl) { free(kc); free(kn); free(gv); free(ov); free(sl); if (out != ct) memcpy(out, ct, N); return; }
+    const uint64_t so = d->seed ^ 0x5bd1e995a5a5a5a5ull;
+    for (int j = 0; j < nj; j++) { gv[j] = (float)(gs * sa_hash1(d->seed, jlo + j)); ov[j] = (float)(os * sa_hash1(so, jlo + j)); }
+    /* the slow field (wavelengths >= .7 box) every 16 voxels along x, linear between */
+    double cr[3], sr[3];
+    for (int j = 0; j < 3; j++) { cr[j] = cos(16 * d->k[j][2]); sr[j] = sin(16 * d->k[j][2]); }
+    const float vdf = (float)vd;
+    for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) {
+        const size_t r0 = ((size_t)z * H + y) * W;
+        const uint8_t *pr = ph + r0, *cv = ct + r0; uint8_t *orow = out + r0;
+        const double a0 = ((z - .5 * D) * d->n[0] + (y - .5 * H) * d->n[1] - .5 * W * d->n[2]) / sp - d->c0, ax = d->n[2] / sp;
+        for (int x = 0; x < W; x++) { kn[x] = pr[x] < PHASE_PERIOD; kc[x] = (float)(a0 + ax * x) - (kn[x] ? psi[pr[x]] : 0); }
+        /* unknown phase: the nearest known kc along the row within 6 voxels (one pass each way; kn 2 + the distance of a forward fill) */
+        { int last = -100; for (int x = 0; x < W; x++) { if (kn[x] == 1) { last = x; continue; } if (x - last <= 6) { kc[x] = kc[last]; kn[x] = 2 + (x - last); } } }
+        { int last = W + 100; for (int x = W - 1; x >= 0; x--) { if (kn[x] == 1) { last = x; continue; } if (last - x <= 6 && (kn[x] == 0 || last - x < kn[x] - 2)) kc[x] = kc[last]; } }
+        double c[3], s[3];
+        for (int j = 0; j < 3; j++) { const double b = d->k[j][0] * z + d->k[j][1] * y + d->f[j]; c[j] = cos(b); s[j] = sin(b); }
+        for (int x = 0; x <= W; x += 16) {
+            sl[x] = (float)(1 + ss * (c[0] + c[1] + c[2]));
+            for (int j = 0; j < 3; j++) { const double cn = c[j] * cr[j] - s[j] * sr[j]; s[j] = s[j] * cr[j] + c[j] * sr[j]; c[j] = cn; }
+        }
+        for (int x = 0; x < W; x++) {
+            const uint8_t v = cv[x];
+            const int x0 = x & ~15; const float sv = sl[x0] + (sl[x0 + 16 <= W ? x0 + 16 : x0] - sl[x0]) * (float)(x - x0) * (1.f / 16);
+            const float fj = floorf(kc[x]), u = kc[x] - fj; float w = (u - .2f) * (1 / .6f); w = w < 0 ? 0 : w > 1 ? 1 : w * w * (3 - 2 * w);
+            int j = (int)fj - jlo; j = j < 0 ? 0 : j > nj - 2 ? nj - 2 : j;   /* (wrap values flat within +-.2 of an integer, smooth between) */
+            const float g = 1 + gv[j] + w * (gv[j + 1] - gv[j]), of = ov[j] + w * (ov[j + 1] - ov[j]);
+            float o = vdf + ((float)v - vdf) * g * sv + of * mt[v];
+            o = o < 1 ? 1 : o > 255 ? 255 : o;
+            orow[x] = v ? (uint8_t)(o + .5f) : 0;
+        }
+    }
+    free(kc); free(kn); free(gv); free(ov); free(sl);
+}

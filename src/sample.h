@@ -58,6 +58,8 @@ typedef struct {
                                 the winding mod 4 unwrapped before the cut (it jumps across it); 0 = off */
     float delam_p, delam_hole; /* --aug-delam p / --aug-delam-hole (per site: a burned-out hole, else a peel; 0.5): the crush windows with
                                 1-3 peels (a thin void opened inside a sheet, the winding kept) / holes (papyrus -> ash, labels kept); 0 = off */
+    float density_p;         /* --aug-sheet-density p: stored-phase windows get a gain / offset per wrap (from the phase) and a slow
+                                carbonisation field along the sheets, CT only (src/scrollaug.h sa_density); 0 = off */
     const sheet_dataset *sheet; /* borrowed sparse geometry, native-level B=1 task */
     int band;                /* 1: fill batch.band from each source's band target (task band_affinity, native level, no geometry warp) */
     double min_phase;        /* side 2: reject windows whose known phase covers less than this fraction of the voxels (0: keep all) */
