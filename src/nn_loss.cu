@@ -716,3 +716,79 @@ extern "C" void nn_distill_loss(const float *y, const int8_t *t, int n, int C, s
     distill_scale_k<<<nblk((size_t)n * C * S, 256), 256>>>(g, (size_t)n * C * S, ds, w);
     KCHECK();
 }
+
+/* ---- phase wavenumber loss (train --pgrad-lambda): the predicted phase's rotation between a voxel and its partner --pgrad-dist
+   voxels along the ground-truth phase gradient, against the label's rotation there. Per pair i -> j: a = z_i, b = z_j the predicted
+   phasors (2 sigmoid(logit) - 1 per channel), u = exp(2 pi i dW) the label's rotation (dW = the phase codes' wrapped difference),
+   q = b conj(a); loss 1 - Re(q conj(u)) / (|a| |b| + eps): angular, so a blurred (small, slowly turning) phasor is not cheaper the
+   way it is under the per-voxel BCE, and a phase that skips every other sheet turns at half the label's rate and pays 1 - cos(pi dW).
+   Weighted by the phase mask (the packed-sheet weight: train --packed-weight), mean over the pairs. Head slabs [z0, z1) of the window:
+   both ends inside the slab; the gradient direction from the codes over +-s voxels of the whole window. sums (device doubles): sum
+   w loss, sum w (pass 0 accumulates them over the slabs; pass 1 reads sum w). ---- */
+template <typename LT> __global__ void pgrad_k(const LT *lc, const LT *ls, const uint8_t *ph, const uint8_t *wm, int D, int H, int W, int z0, int z1,
+                                               int s, float dist, double *sums, float *acc) {
+    const size_t HW = (size_t)H * W, ns = (size_t)(z1 - z0) * HW;
+    const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    float wl = 0.f, ww = 0.f;
+    if (li < ns) do {
+        const float w = wm[li]; if (w <= 0.f) break;
+        const int z = z0 + (int)(li / HW), y = (int)(li / W % H), x = (int)(li % W);
+        const size_t gi = (size_t)z * HW + (size_t)y * W + x; const int p0 = ph[gi];
+        if (p0 >= 252 || z < s || z >= D - s || y < s || y >= H - s || x < s || x >= W - s) break;
+        const size_t sz = (size_t)s * HW, sy = (size_t)s * W;
+        const int a6[6] = {ph[gi + sz], ph[gi - sz], ph[gi + sy], ph[gi - sy], ph[gi + s], ph[gi - s]};
+        int ok = 1; for (int q = 0; q < 6; q++) ok &= a6[q] < 252; if (!ok) break;
+        float g[3] = {(float)cnt_pdiff(a6[0], a6[1]), (float)cnt_pdiff(a6[2], a6[3]), (float)cnt_pdiff(a6[4], a6[5])};
+        const float gn = sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]); if (gn < 1e-3f) break;
+        const int zz = (int)lrintf(z + dist * g[0] / gn), yy = (int)lrintf(y + dist * g[1] / gn), xx = (int)lrintf(x + dist * g[2] / gn);
+        if (zz < z0 || zz >= z1 || yy < 0 || yy >= H || xx < 0 || xx >= W) break;
+        const size_t gj = (size_t)zz * HW + (size_t)yy * W + xx; const int p1 = ph[gj]; if (p1 >= 252) break;
+        const size_t lj = gj - (size_t)z0 * HW; if (lj == li) break;
+        const float dW = cnt_pdiff(p1, p0) * (1.f / 252.f), ur = cospif(2.f * dW), ui = sinpif(2.f * dW);
+        const float sa = 1.f / (1.f + __expf(-lgv(lc, li))), sb = 1.f / (1.f + __expf(-lgv(ls, li)));
+        const float sc = 1.f / (1.f + __expf(-lgv(lc, lj))), sd = 1.f / (1.f + __expf(-lgv(ls, lj)));
+        const float ar = 2.f * sa - 1.f, ai = 2.f * sb - 1.f, br = 2.f * sc - 1.f, bi = 2.f * sd - 1.f;
+        /* R = Re(b conj(a) conj(u)); M = |a| |b| */
+        const float kr = ar * ur - ai * ui, ki = -(ar * ui + ai * ur);   /* k = conj(a u) */
+        const float R = br * kr - bi * ki;
+        const float na = sqrtf(ar * ar + ai * ai) + 1e-6f, nb = sqrtf(br * br + bi * bi) + 1e-6f, M = na * nb, e = .05f, den = M + e;
+        wl = w * (1.f - R / den); ww = w;
+        if (acc) {
+            const float mr = br * ur + bi * ui, mi = bi * ur - br * ui;   /* m = b conj(u): R = Re(conj(a) m) */
+            const float c0 = -w / den, c1 = w * R / (den * den);           /* dloss = c0 dR + c1 dM */
+            const float gar = c0 * mr + c1 * ar * nb / na, gai = c0 * mi + c1 * ai * nb / na;
+            const float gbr = c0 * kr + c1 * br * na / nb, gbi = -c0 * ki + c1 * bi * na / nb;
+            atomicAdd(&acc[li], gar * 2.f * sa * (1.f - sa)); atomicAdd(&acc[ns + li], gai * 2.f * sb * (1.f - sb));
+            atomicAdd(&acc[lj], gbr * 2.f * sc * (1.f - sc)); atomicAdd(&acc[ns + lj], gbi * 2.f * sd * (1.f - sd));
+        }
+    } while (0);
+    for (int o = 16; o; o >>= 1) { wl += __shfl_down_sync(0xffffffffu, wl, o); ww += __shfl_down_sync(0xffffffffu, ww, o); }
+    __shared__ float sh[2][32];
+    if ((threadIdx.x & 31) == 0) { sh[0][threadIdx.x >> 5] = wl; sh[1][threadIdx.x >> 5] = ww; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double a = 0, b = 0; for (int k = 0; k < (int)(blockDim.x >> 5); k++) { a += sh[0][k]; b += sh[1][k]; }
+        if (b > 0) { atomicAdd(&sums[0], a); atomicAdd(&sums[1], b); }
+    }
+}
+template <typename GT> __global__ void pgrad_apply_k(GT *gc, GT *gs, float *acc, size_t ns, const double *sums, float scale) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= ns) return;
+    const float a = acc[i], b = acc[ns + i]; if (a == 0.f && b == 0.f) return;
+    acc[i] = acc[ns + i] = 0.f;
+    const double sw = sums[1]; if (!(sw > 0)) return;
+    const float f = (float)(scale / sw);
+    gc[i] = f2h<GT>((float)gc[i] + f * a); gs[i] = f2h<GT>((float)gs[i] + f * b);
+}
+extern "C" void nn_pgrad_slab(const void *lc, const void *ls, const uint8_t *phase, const uint8_t *wm, int d, int h, int w, int z0, int z1, int s, float dist,
+                              double *sums, float *acc) {
+    const size_t ns = (size_t)(z1 - z0) * h * w;
+    if (g_logits_h16) pgrad_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lc, (const f16 *)ls, phase, wm, d, h, w, z0, z1, s, dist, sums, acc);
+    else pgrad_k<float><<<nblk(ns, 256), 256>>>((const float *)lc, (const float *)ls, phase, wm, d, h, w, z0, z1, s, dist, sums, acc);
+    KCHECK();
+}
+extern "C" void nn_pgrad_apply(void *gc, void *gs, float *acc, size_t ns, const double *sums, float lambda) {
+    if (!g_loss_g16) { fprintf(stderr, "nn_pgrad_apply: needs 16-bit logit gradients (head slabs)\n"); abort(); }
+    if (g_h16) pgrad_apply_k<f16><<<nblk(ns, 256), 256>>>((f16 *)gc, (f16 *)gs, acc, ns, sums, lambda * g_gscale);
+    else pgrad_apply_k<bf16><<<nblk(ns, 256), 256>>>((bf16 *)gc, (bf16 *)gs, acc, ns, sums, lambda * g_gscale);
+    KCHECK();
+}
