@@ -5,7 +5,7 @@
 # volume (mm^3 = gated voxels from A/r$R/stats/*.ARM.txt); GT keeps its relative weights. Bench holdouts (HO, all scrolls
 # boxes): "holdout_file" on every source + weight-1e-6 copies holding each box grown by MARGIN_MM 0.5 (the sampler holds a source's box out of every source of
 # that CT). PHerc0814 GT is not used (fit-oracle ceiling 0.2-0.3). A per-scan table goes to stderr.
-# Env: A, R (0), PSHARE, HO, MARGIN_MM, PK8 (the Paris 4 sources), MINMM3 (0.5: scans with less pseudo volume are left out)
+# Env: A, R (0), PSHARE, HO, MARGIN_MM, PK8 (the Paris 4 sources), MINMM3 (0.5: scans with less pseudo volume are left out), EXCLUDE ("PHerc0814": scans without pseudo labels)
 set -euo pipefail
 ARM=$1 OUT=$2; A=${A:-/vesuvius/ufsm/selftrain}; R=${R:-0}; RD=$A/r$R; D=$(dirname "$(readlink -f "$0")")
 HO=${HO:-/vesuvius/ufsm/wbench/holdouts.json}; PK8=${PK8:-/vesuvius/ufsm/paris4/wnew/sources-pk8.json}; CT=/vesuvius/ufsm/u0/vol
@@ -18,6 +18,7 @@ jq -nc --arg r $CT --arg g $GT/PHerc0139-wind-20261016 '{name: "PHerc0139-wind",
 GW=$(jq -s 'map(.weight) | add' $T/gt.jsonl)
 # pseudo: labelled volume per scan
 awk -F'\t' '!/^#/ && $8 == "go"' $D/scans.tsv | while IFS=$'\t' read -r S SC LV UM VOL AX NB ST; do
+  case " ${EXCLUDE-PHerc0814} " in *" $S "*) continue;; esac   # (PHerc0814: gated label precision 0.57 vs its GT)
   [ -d $RD/labels/$ARM/$S ] || continue
   n=$(cat $RD/stats/$S-b*.$ARM.txt 2>/dev/null | sed -nE 's/.*winding-gate [^:]*: ([0-9]+) of ([0-9]+) voxels.*/\1 \2/p' | awk '{a += $1; b += $2} END {print a + 0, b + 0}')
   read -r nl nt <<< "$n"
