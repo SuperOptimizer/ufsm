@@ -412,6 +412,13 @@ void nn_unwrap_targets2_z(const uint8_t *phase, int d, int h, int w, int s, floa
    valid segments, mean predicted / true turns */
 void nn_count_loss(const void *dens_logits, const uint8_t *phase, int d, int h, int w, int s, int K, int L, float dscale, uint64_t seed,
                    float lambda, void *dens_grad, float *acc, float *seg, unsigned *nvalid, float *out2);
+/* train --pgrad-lambda: the phase wavenumber loss over a head slab [z0, z1) (src/nn_loss.cu pgrad_k): lc / ls the slab's phase cos / sin
+   logits, phase the window's codes, wm the slab's phase mask (weights); sums (2 device doubles: sum w loss, sum w) accumulate; acc
+   (2 x slab floats, zero; nullptr: statistics only) the logit gradient, which nn_pgrad_apply adds times lambda / sum w into gc / gs
+   (16-bit gradients) and zeroes */
+void nn_pgrad_slab(const void *lc, const void *ls, const uint8_t *phase, const uint8_t *wm, int d, int h, int w, int z0, int z1, int s, float dist,
+                   double *sums, float *acc);
+void nn_pgrad_apply(void *gc, void *gs, float *acc, size_t ns, const double *sums, float lambda);
 void nn_cond_targets(const uint8_t *wind, size_t n, uint8_t *t, uint8_t *m);   /* --cond: winding mod 14 (band.h band_winding) -> 4 targets: cos / sin of 2 pi q / 14 and 2 pi q / 2 (x255, 4 planes), mask (known) */
 void nn_cond_acc(const void *lg, int lg_h16, const uint8_t *wind, size_t n, unsigned long long *cnt);   /* --cond: known / right-turn counts of the 14-turn head (cnt: 2 device u64, accumulated) */
 void nn_pap_targets(const uint8_t *pl, const uint8_t *pm, size_t n, uint8_t *t, uint8_t *m);   /* --pap-head: gap labels (0 / 1 / 255 ignored) -> target, mask (not ignored, inside the scroll) */
