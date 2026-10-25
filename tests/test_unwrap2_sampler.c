@@ -10,6 +10,8 @@
 #include "sample.h"
 #include "z3w.h"
 #include "band.h"
+#include "embz.h"
+#include <sys/stat.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -134,6 +136,67 @@ int main(int argc, char **argv) {
                " \"targets\": {\"band\": {\"root\": \"%s/codes\", \"key\": \"16\", \"phase\": {\"root\": \"%s/phase\", \"key\": \"16\", \"level\": 1, \"phase_sign\": 2}}}}]}\n", dir, dir, dir);
     fclose(f);
     sources *Sb = sources_load(q); CHECK(!Sb, "\"phase_sign\": 2 accepted"); if (Sb) sources_free(Sb);
+    {   /* train --distill through the sampler: an "emb" group at level 1 (step 4) whose cell vectors encode their own position; without
+           geometry augmentation every head cell (8^3 voxels at level 0) must carry the vector of its centre's position, with it the
+           targets must stay unit vectors */
+        enum { EC = 8, ST = 4 };
+        const int64_t en[3] = {s1[0] / ST, s1[1] / ST, s1[2] / ST}, em[3] = {(en[0] + 15) / 16 * 16, (en[1] + 15) / 16 * 16, (en[2] + 15) / 16 * 16};
+        snprintf(p, sizeof p, "%s/emb", dir); mkdir(p, 0755);
+        snprintf(q, sizeof q, "%s/zarr.json", p); f = fopen(q, "w"); fputs("{\"zarr_format\":3,\"node_type\":\"group\",\"attributes\":{}}", f); fclose(f);
+        snprintf(q, sizeof q, "%s/emb/pca", dir);
+        zw w; char attrs[128]; snprintf(attrs, sizeof attrs, "{\"step_zyx\":[%d,%d,%d]}", ST, ST, ST);
+        int8_t *buf = calloc((size_t)em[0] * em[1] * em[2] * EC, 1);
+        for (int64_t z = 0; z < en[0]; z++) for (int64_t y = 0; y < en[1]; y++) for (int64_t x = 0; x < en[2]; x++) {
+            const double e[3] = {z * ST + 1.5, y * ST + 1.5, x * ST + 1.5}; double v[EC];
+            for (int d = 0; d < 3; d++) { v[2 * d] = cos(e[d] / 40 + d) / sqrt(3.0); v[2 * d + 1] = sin(e[d] / 40 + d) / sqrt(3.0); }
+            v[6] = v[7] = 0;
+            for (int c = 0; c < EC; c++) buf[(((size_t)z * em[1] + y) * em[2] + x) * EC + c] = (int8_t)lround(127 * v[c]);
+        }
+        CHECK(!zw_create(&w, q, en, EC, "int8", 1, 32, 16, attrs) && !zw_put(&w, 0, 0, 0, (int)em[0], (int)em[1], (int)em[2], buf) && !zw_flush(&w), "emb group");
+        zw_free(&w); free(buf);
+        snprintf(q, sizeof q, "%s/sources-emb.json", dir); f = fopen(q, "w");
+        fprintf(f, "{\"sources\": [{\"name\": \"noncubic\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 8, \"max_level\": 0, \"weight\": 1,\n"
+                   " \"targets\": {\"band\": {\"root\": \"%s/codes\", \"key\": \"16\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase\", \"key\": \"16\", \"level\": 1}}},\n"
+                   " \"emb\": {\"groups\": [\"%s/emb\"], \"name\": \"pca\", \"level\": 1}, \"axis\": \"%s/axis.json\"}]}\n", dir, dir, dir, dir, dir);
+        fclose(f);
+        sources *Se = sources_load(q); if (!Se) { fprintf(stderr, "FAIL: sources_load %s\n", q); return 1; }
+        for (int aug = 0; aug < 2; aug++) {
+            sample_cfg c = sample_cfg_default();
+            c.P = 64; c.B = 1; c.nworkers = 2; c.nbuf = 3; c.seed = 11; c.deterministic = 1; c.xfmt = 1; c.gpu_input = 1;
+            memset(c.level_p, 0, sizeof c.level_p); c.level_p[0] = 1;
+            c.side = 2; c.wind4 = 1; c.wind4_tile = 16; c.emb_ch = EC; c.emb_div = 8;
+            if (aug) { c.augment = 3; c.symmetry_p = .5f; c.geometry_augment = 1; c.rotate_degrees = 5; c.rotate_p = .5f; c.elastic = 1; c.elastic_p = .5f; }
+            else { c.augment = 0; c.symmetry_p = 0; c.geometry_augment = 0; c.rotate_p = 0; c.elastic_p = 0; }
+            sampler *sp = sampler_start(Se, &c); if (!sp) { fprintf(stderr, "FAIL: sampler_start (emb)\n"); return 1; }
+            size_t nset = 0, nnorm = 0; double worst = 1;
+            for (int i = 0; i < 16; i++) {
+                batch *b = sampler_next(sp); if (!b) { CHECK(0, "emb sampler stopped"); break; }
+                const size_t ng = 512;
+                for (size_t k = 0; k < ng; k++) {
+                    double l2 = 0, dot = 0; for (int ch = 0; ch < EC; ch++) l2 += (double)b->emb[ch * ng + k] * b->emb[ch * ng + k];
+                    if (l2 == 0) continue;
+                    nset++; nnorm += fabs(sqrt(l2) - 127) > 2;
+                    if (aug) continue;
+                    const int gz = (int)(k / 64), gy = (int)(k / 8 % 8), gx = (int)(k % 8);
+                    const double u[3] = {8 * gz + 3.5, 8 * gy + 3.5, 8 * gx + 3.5}; double v[EC]; int in = 1;
+                    for (int d = 0; d < 3; d++) {
+                        const double e = (b->corner[0][d] + u[d] + .5) * .5 - .5, cc = (e - 1.5) / ST;   /* level 0 -> level 1, cell centres */
+                        in &= cc >= 0 && cc <= en[d] - 1;
+                        v[2 * d] = cos(e / 40 + d) / sqrt(3.0); v[2 * d + 1] = sin(e / 40 + d) / sqrt(3.0);
+                    }
+                    v[6] = v[7] = 0;
+                    if (!in) continue;
+                    for (int ch = 0; ch < EC; ch++) dot += v[ch] * b->emb[ch * ng + k];
+                    if (dot / sqrt(l2) < worst) worst = dot / sqrt(l2);
+                }
+                sampler_release(sp, b);
+            }
+            sampler_stop(sp);
+            printf("distill targets (%s): %zu head cells set, worst cos %.5f, %zu not unit\n", aug ? "augmented" : "plain", nset, worst, nnorm);
+            CHECK(nset > 1000 && nnorm == 0 && worst > 0.999, "distill targets (%s): %zu set, worst cos %g, %zu not unit", aug ? "augmented" : "plain", nset, worst, nnorm);
+        }
+        sources_free(Se);
+    }
     if (fails) { fprintf(stderr, "test_unwrap2_sampler: %d failure(s)\n", fails); return 1; }
     printf("test_unwrap2_sampler: OK\n");
     return 0;

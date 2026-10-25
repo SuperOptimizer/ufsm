@@ -59,7 +59,8 @@ int sample_emb_window(const source *s, int C, int div, int l, const int64_t o[3]
     for (int pass = 0; pass < 2 && !rc; pass++)   /* whole trilinear stencils first, in any group; then the partial ones (>= half the weight) */
     for (int k = 0; k < s->nemb && !rc; k++) {
         eh_t *h = eh_get(s, k);
-        if (!h || !h->ok) { rc = -1; break; }
+        if (!h) { rc = -1; break; }
+        if (!h->ok) continue;   /* (a group that cannot be opened: warned once, no targets from it) */
         if (h->e.a.C != C) { fprintf(stderr, "distill: %s: %s has %d channels, the head %d\n", s->name, s->emb_grp[k], h->e.a.C, C); rc = -1; break; }
         const double st = h->step;
         /* the cell lattice coordinate of every open cell centre (cell i covers embedding voxels [i st, (i + 1) st), centre i st + (st - 1) / 2) */

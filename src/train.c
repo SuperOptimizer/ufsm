@@ -20,6 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include "embz.h"
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
@@ -1502,6 +1503,21 @@ int cmd_train(int argc, char **argv) {
     if (!S) return 1;
     g_S = S;
     for (int i = 0; g_restore && i < S->n; i++) if (!S->src[i].srp != !g_rpairs) { fprintf(stderr, "--task restore: %s: \"sr_pair\" sources need --sr-pairs 1 and --sr-pairs 1 needs them all\n", S->src[i].name); return 2; }
+    if (g_distill) {   /* --distill: which sources have feature targets, and whether their groups open with the head's channel count */
+        int ns = 0, bad = 0;
+        for (int i = 0; i < S->n; i++) {
+            const source *s = &S->src[i]; int ok = 0;
+            for (int k = 0; k < s->nemb; k++) {
+                emb e; if (emb_open(&e, s->emb_grp[k], s->emb_name)) { fprintf(stderr, "distill: %s: %s/%s does not open (no targets from it)\n", s->name, s->emb_grp[k], s->emb_name); continue; }
+                if (e.a.C != g_distill || e.a.dt != 0) { fprintf(stderr, "distill: %s: %s/%s: %d channels / dtype %d, the head %d int8\n", s->name, s->emb_grp[k], s->emb_name, e.a.C, e.a.dt, g_distill); bad++; }
+                else ok++;
+                emb_close(&e);
+            }
+            ns += ok > 0;
+            if (s->nemb) fprintf(stderr, "distill: %s: %d of %d \"emb\" groups (%s, level %d)\n", s->name, ok, s->nemb, s->emb_name, s->emb_level);
+        }
+        if (bad || !ns) { fprintf(stderr, "distill: %s\n", bad ? "groups with the wrong channel count / type" : "no source has an \"emb\" group that opens"); return 2; }
+    }
     for (int i = 0; i < S->n; i++) {   /* --heads: every source's head exists; sources naming heads need --heads */
         const int h = S->src[i].head;
         if (h && (!g_heads || h >= g_heads)) { fprintf(stderr, "sources: %s trains head %d; train --heads %d or more\n", S->src[i].name, h, h + 1); return 2; }

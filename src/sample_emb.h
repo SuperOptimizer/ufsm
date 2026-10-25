@@ -12,6 +12,6 @@
 void sample_emb_coords(int Pz, int P, int div, const int perm[3], const int flip[3], const spatial_aug *sa, float *V);
 /* the window's targets: C channel planes of int8 x 127 unit vectors over the (Pz / div) (P / div)^2 cells (all 0: none), trilinear in the
    source's first "emb" group with all 8 stencil corners (else the first with >= half the weight), renormalised; o the window corner in level-l voxels. 0 (out written; all 0 without
-   "emb"), -1 on a read error or a channel count other than C. Per-thread group handles (sampler workers) */
+   "emb"; groups that cannot be opened are skipped with a warning), -1 on a read error or a channel count other than C. Per-thread group handles (sampler workers) */
 int sample_emb_window(const source *s, int C, int div, int l, const int64_t o[3], int Pz, int P, const int perm[3], const int flip[3], const spatial_aug *sa,
                       int8_t *out);
