@@ -1852,7 +1852,7 @@ int sample_chain_next(const axis *ax, int l, const int64_t shape[3], int Pz, int
    mask) wait in pooled buffers for the stored-phase step (draw() returns them after every draw). */
 /* the window's pulled labels (--aug-crush, --aug-tear): ph / ig the phase and its ignore mask; --aug-tear: w4 / wc the winding mod 4 and
    its component unwrapped before the tear (ph then already masked by ig: pre) */
-static _Thread_local struct { uint8_t *ph, *ig, *w4, *wc; int pre; size_t n; double k, j0; int fine; uint64_t tiles; sa_tear tear; } g_crush;   /* (k .. tear: the last map, diagnostics) */
+static _Thread_local struct { uint8_t *ph, *ig, *w4, *wc; int pre; size_t n; double k, j0; int fine; uint64_t tiles; sa_tear tear; sa_delam delam; } g_crush;   /* (k .. tear: the last map, diagnostics) */
 static void crush_release(void) {
     tp_put(g_crush.ph, g_crush.n + 64); tp_put(g_crush.ig, g_crush.n); tp_put(g_crush.w4, g_crush.n); tp_put(g_crush.wc, g_crush.n);
     g_crush.ph = g_crush.ig = g_crush.w4 = g_crush.wc = nullptr; g_crush.pre = 0;
@@ -1995,6 +1995,61 @@ static int tear_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, i
     atomic_fetch_add(&sp->augn[AUGN_TEAR], 1);
     return 1;
 }
+/* --aug-delam: ctu (P^3) and g_crush.ph from a padded read with 1-3 peels / holes on papyrus (src/scrollaug.h); the labels (sign, ignore
+   mask) prepared on the padded box and pulled with the peels, the winding mod 4 unwrapped by the ordinary path after (the map is
+   continuous, the gaps keep the split's phase). 1 damaged, 0 not (no site found / holdout), -1 error. */
+static int delam_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, int pshift, rng *r, uint8_t *ctu) {
+    const sample_cfg *c = &sp->cfg; const size_t p3 = (size_t)P * P * P;
+    const int M = sa_delam_margin(0), Pp = P + 2 * M; const size_t pp3 = (size_t)Pp * Pp * Pp;
+    const int64_t po[3] = {o[0] - M, o[1] - M, o[2] - M}, pn[3] = {Pp, Pp, Pp};
+    const uint64_t seed = rnext(r);
+    if (training_hits_holdout_box(sp, s, po, pn, l)) return 0;
+    uint8_t *ctp = tp_get(pp3, 0), *php = tp_get(pp3 + 64, 0);
+    if (!ctp || !php) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
+    if (z3_read(source_ct(s, l), po, pn, ctp, 1) || phase_window(s->phase, po, Pp, Pp, pshift, php)) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
+    double n[3], spacing = 0;
+    const int iso = s->iso > 0 ? s->iso : c->iso > 0 ? c->iso : sa_ct_quantile(ctp, pp3, .5);
+    sa_delam *d = &g_crush.delam;
+    if (sa_phase_normal(php, Pp, Pp, Pp, M, P / 32 > 1 ? P / 32 : 1, n, &spacing) < 32 || !(spacing > 2) ||
+        !sa_delam_make(d, seed, P, M, ctp, php, spacing, c->delam_hole, (uint8_t)(iso > 255 ? 255 : iso))) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return 0; }
+    if (s->phase_sign < 0) phase_negate(php, pp3);
+    if (s->phase_ign && pshift < 2) {
+        uint8_t *ig = tp_get(pp3, 0);
+        if (!ig || phase_window(s->phase_ign, po, Pp, Pp, pshift, ig)) { tp_put(ig, pp3); tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
+        for (size_t k = 0; k < pp3; k++) if (ig[k] && ig[k] != PHASE_UNKNOWN) php[k] = PHASE_UNKNOWN;
+        tp_put(ig, pp3);
+    }
+    g_crush.n = p3; g_crush.pre = 1;
+    if (!(g_crush.ph = tp_get(p3 + 64, 0))) { tp_put(ctp, pp3); tp_put(php, pp3 + 64); return -1; }
+    sa_delam_apply(d, 1, P, M, ctp, php, ctu, g_crush.ph);
+    memset(g_crush.ph + p3, PHASE_UNKNOWN, 64);
+    if (s->phase_sign < 0) phase_negate(g_crush.ph, p3);   /* (the stored-phase path negates it again) */
+    tp_put(ctp, pp3); tp_put(php, pp3 + 64);
+    atomic_fetch_add(&sp->augn[AUGN_DELAM], 1);
+    return 1;
+}
+/* --aug-sheet-density: the window's CT (Pz x P x P) re-lit per wrap from its stored phase (the pulled one after crush / tear / delam);
+   returns 1 applied, 0 no usable phase, -1 error */
+static int density_draw(sampler *sp, source *s, const int64_t o[3], int Pz, int P, int pshift, rng *r, uint8_t *ctu) {
+    const sample_cfg *c = &sp->cfg; const size_t p3 = (size_t)Pz * P * P;
+    const uint64_t seed = rnext(r);
+    uint8_t *ph = tp_get(p3 + 64, 0);
+    if (!ph) return -1;
+    if (!g_crush.ph) {   /* the window's stored phase, kept for the label path (g_crush.pre 0: its conflict mask still applies) */
+        if (!(g_crush.ph = tp_get(p3 + 64, 0))) { tp_put(ph, p3 + 64); return -1; }
+        g_crush.n = p3; g_crush.pre = 0;
+        if (phase_window(s->phase, o, Pz, P, pshift, g_crush.ph)) { tp_put(ph, p3 + 64); return -1; }
+        memset(g_crush.ph + p3, PHASE_UNKNOWN, 64);
+    }
+    memcpy(ph, g_crush.ph, p3);
+    if (s->phase_sign < 0) phase_negate(ph, p3);
+    const int iso = s->iso > 0 ? s->iso : c->iso > 0 ? c->iso : sa_ct_quantile(ctu, p3, .5);
+    sa_density d;
+    const int ok = sa_density_make(&d, seed, ctu, ph, Pz, P, P, (uint8_t)(iso > 255 ? 255 : iso));
+    if (ok) { sa_density_apply(&d, 1, ctu, ph, Pz, P, P, ctu); atomic_fetch_add(&sp->augn[AUGN_DENSITY], 1); }
+    tp_put(ph, p3 + 64);
+    return ok;
+}
 static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs);
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
     const int rc = draw_(sp, b, i, r, xtmp, ttmp, big, tile_index, noise_state, cs);
@@ -2100,8 +2155,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     PROF_MARK(PS_PROBE);
     /* CT (--aug-crush: a crushed window of a stored-phase source without target channels, pulled through the map instead) */
     uint8_t *ctu = big;
-    int crushed = 0, torn = 0;
-    if ((c->crush.p > 0 || c->tear_p > 0) && c->augment && c->geometry_augment && s->geometry && !chained && !c->view_P && !c->cover && !c->holdout && Pz == P &&
+    int crushed = 0, torn = 0, delam = 0;
+    if ((c->crush.p > 0 || c->tear_p > 0 || c->delam_p > 0) && c->augment && c->geometry_augment && s->geometry && !chained && !c->view_P && !c->cover && !c->holdout && Pz == P &&
         region_ch < 0 && zoom_out == 0 && c->side == 2 && !c->band && !c->cond && !c->sheet && !c->papyrus && !c->pap_head && !c->aux &&
         !c->phase_dense && s->phase) {
         const int psh = s->phase_level - l;
@@ -2109,17 +2164,26 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         for (int ch = 0; ch < NCH; ch++) ok &= !s->tgt_key[ch];
         if (ok && c->crush.p > 0 && runif(r) < c->crush.p && (crushed = crush_draw(sp, s, l, o, P, psh, r, big + p3, 8 * p3, ctu)) < 0) return -1;
         if (ok && !crushed && c->tear_p > 0 && runif(r) < c->tear_p && (torn = tear_draw(sp, s, l, o, P, psh, r, ctu)) < 0) return -1;
+        if (ok && !crushed && !torn && c->delam_p > 0 && runif(r) < c->delam_p && (delam = delam_draw(sp, s, l, o, P, psh, r, ctu)) < 0) return -1;
     }
-    if (!crushed && !torn && z3_read(ct, o, n, ctu, 1)) return -1;
+    if (!crushed && !torn && !delam && z3_read(ct, o, n, ctu, 1)) return -1;
     PROF_MARK(PS_READ);
     size_t nz = 0;
     double sum = 0, sq = 0;
     u8_stats(ctu, p3, &nz, &sum, &sq);
     if (!c->cover && (double)nz / (double)p3 < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[1], 1); return 1; }
-    if (c->xscan_p > 0 && s->nxs && !crushed && !torn && c->augment && !chained && !c->view_P && !c->cover && !c->holdout && runif(r) < c->xscan_p) {
+    if (c->xscan_p > 0 && s->nxs && !crushed && !torn && !delam && c->augment && !chained && !c->view_P && !c->cover && !c->holdout && runif(r) < c->xscan_p) {
         const int xs = xscan_draw(s, l, o, n, r, ctu, big + p3);   /* (big + p3: free scratch until the scanner augmentation) */
         if (xs < 0) return -1;
         if (xs) { atomic_fetch_add(&sp->augn[AUGN_XSCAN], 1); nz = 0; sum = sq = 0; u8_stats(ctu, p3, &nz, &sum, &sq); }
+    }
+    if (c->density_p > 0 && s->phase && c->augment && !chained && !c->view_P && !c->cover && !c->holdout && zoom_out == 0) {
+        const int psh = s->phase_level - l;
+        if ((psh == 1 || (psh == 0 && s->phase_direct)) && runif(r) < c->density_p) {
+            const int dn = density_draw(sp, s, o, Pz, P, psh, r, ctu);
+            if (dn < 0) return -1;
+            if (dn) { nz = 0; sum = sq = 0; u8_stats(ctu, p3, &nz, &sum, &sq); }
+        }
     }
     PROF_MARK(PS_STATS);
     /* --iso-void / --iso-lift: chamfer distance (3 per voxel, saturated at 255) of every voxel to papyrus (clean CT >= the cutoff) */

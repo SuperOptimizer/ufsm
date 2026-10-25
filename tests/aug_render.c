@@ -43,6 +43,8 @@ int main(int argc, char **argv) {
         if (sscanf(q, "%31[^=]=%lf%n", key, &v, &nc) != 2) { fprintf(stderr, "aug_render: bad aug list %s\n", q); return 2; }
         if (!strcmp(key, "tear")) a.tear_p = (float)v; else if (!strcmp(key, "tear_um")) a.tear_um = (float)v;
         else if (!strcmp(key, "xscan")) a.xscan_p = (float)v; else if (!strcmp(key, "crush")) a.crush.p = (float)v;
+        else if (!strcmp(key, "delam")) a.delam_p = (float)v; else if (!strcmp(key, "delam_hole")) a.delam_hole = (float)v;
+        else if (!strcmp(key, "density")) a.density_p = (float)v;
         else { fprintf(stderr, "aug_render: unknown aug %s\n", key); return 2; }
         q += nc; if (*q == ',') q++;
     }

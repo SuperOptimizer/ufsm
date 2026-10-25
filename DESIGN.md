@@ -541,6 +541,50 @@ Goal: the fitter's slip failure: sheets cut and offset by about a turn, where th
 - Renders: build/aug_render (sampler, plain vs augmented rows), build/scrollaug_anim ... tear (the shift swept 0 -> 1 -> 0);
   ~/ufsm-data/scrollaug/anim/tear-{none,void,blend}.gif.
 
+## Delamination and holes: train --aug-delam P [--aug-delam-hole 0.5] (2026-10-24)
+Goal: sheets that split into layers (a void opening inside a sheet, the outer layer pushed out) and missing papyrus (holes, ash).
+- Same windows as --aug-tear (stored phase, side 2, cube); exclusive with crush and tear; xscan skips damaged windows.
+- src/scrollaug.[ch]: `sa_delam_make` draws 1-3 sites on papyrus (CT >= iso, known phase), each with its own normal from
+  `sa_phase_normal_box` over +-2 turns (oriented so the phase grows along it); peel or hole (p --aug-delam-hole).
+  - Peel: a lens b = t g0 (1 - r^2)^2 (g0 2 .. min(6, .4 spacing) voxels, R 1-4 turns), tapered off the plane between |a| .4 and
+    .6 turns; the two halves of the sheet move apart by up to b / 2 each, within their own half turn. Distances come from a per-site
+    profile (geometric distance along the normal through c of each phase offset 0 .. 126 codes, ahead and behind): the stored phase is
+    far from linear in space (papyrus spans about half a turn over a few voxels), and measuring the gap in phase units made it half as
+    thick as the pull, so the pull refilled it (a dotted 1-voxel line on Paris 4). Distance d < b / 2 from the split is the gap (void CT,
+    phase phc); beyond, the CT is pulled by (b / 2) w(d) away from the split (w linear from 1 at the gap edge to 0 at the half-turn
+    point; each half moves at most half way there). The phase is the profile inverted at d - (b / 2) w, a monotone function of the
+    phase itself, so the unwrap gains no turn (resampling the phase at the pulled point gave nearest-neighbour jitter that dropped
+    whole w4 tiles as conflicts on Paris 4). Voxels of unknown phase stay unknown. On Paris 4 the gap is a 3-4 voxel lens tapering
+    along the sheet; the scattered unlabelled specks in the renders are the stored phase's own unknown voxels (present at t 0).
+  - Hole: a ragged ellipse (R, R2 .5-2.5 turns, 3 harmonics) in the sheet plane, restricted to the centre's sheet (|a| <= .4 turn and
+    within .22 turn of the sheet's CT-weighted mean phase on the normal); papyrus -> void + ash (0-.2) x speckle x (CT - void), soft
+    rims; labels unchanged (the net infers the missing sheet).
+- sample.c `delam_draw`: padded read (margin 8), labels prepared on the padded box (sign, ignore, air), the damage applied, then the
+  ordinary unwrap of the damaged window (continuous, so w4 is smooth inside components).
+- Tests (tests/test_scrollaug.c): t 0 identity; the peel gap is void at the split phase; 16 peels on the fixture unwrap with 0
+  conflict voxels (w4 kept 1.0000 of the undamaged box); holes only darken the CT, labels unchanged; default off bit-identical, p 1
+  deterministic; damaged windows' w4 smooth inside components.
+- Cost P512 one core (4 fixed Paris 4 windows): no net cost (ctread +1.6 s for the padded read, augment -1.8 s: 116.6 vs 132.1 s for
+  24 windows). Render: build/scrollaug_anim ... delam (strength swept 0 -> 1 -> 0, w4 component borders drawn);
+  ~/ufsm-data/scrollaug/anim/delam.gif.
+
+## Sheet density: train --aug-sheet-density P (2026-10-24)
+Goal: wraps of different brightness (carbonisation, compression, papyrus quality vary per wrap) and slow along-sheet variation.
+- Windows with a stored phase (level shift 1, or 0 direct), not zoomed out, augment on; applied after crush / tear / delam / xscan
+  (it re-lights their output, from their pulled phase) and before the CT statistics. CT only: labels unchanged.
+- src/scrollaug.[ch]: `sa_density_make` takes the window's mean sheet normal (`sa_phase_normal`), void (5% CT quantile), iso and
+  the reference phase phc (circular mean on papyrus), and the offset c0 so that kc = a / spacing - psi - c0 (a: distance along the
+  normal, psi: stored phase in turns) is an integer on the wrap centres. Per wrap k a hashed gain (+-0.10..0.35) and offset
+  (+-0..0.15 of iso - void); flat within +-.2 of each integer, smoothstep between (no step inside papyrus). Slow field: 3 plane
+  waves of wavelength .7-2.5 window, amplitude 0..0.3 total. out = void + (CT - void) gain slow + offset m (m: papyrus fraction of
+  CT between void and iso); CT 0 (masked air) kept. Unknown-phase voxels take the nearest known kc along the row within 6 voxels.
+- sample.c `density_draw`: the window's phase is read once into g_crush.ph (pre 0, so the conflict mask still applies) and the
+  label path reuses it.
+- Tests: wrap spread between wraps .105 vs within .010 on the fixture; t 0 identity; CT 0 kept; default off bit-identical, p 1
+  deterministic.
+- Cost P512 one core: apply ~0.8 s + make 0.08 s per window (the phase read moves forward, not added); ~+12% on a ~7 s window.
+  Render: scrollaug_anim ... density; ~/ufsm-data/scrollaug/anim/density.gif.
+
 ## Augmentation presets: train --aug all (default) | none (2026-10-16)
 User: "I want all the augs we can get" (robustness to other scrolls, scanners, resolutions and damage from one scroll's labels).
 - `--aug all` is the default for the dense-target tasks on cube windows (recto / side targets); `none` (the old defaults: 48 cube
