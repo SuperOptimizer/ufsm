@@ -7,7 +7,7 @@
 #   96-cell slab fits per site, radius profile, fit-join overlap share, joined site score.
 #   Rows: $WB/res/TAG.tsv (boxes), $WB/res/TAG-slabs.tsv, $WB/res/TAG-radius.tsv; logs $WB/runs/TAG/. Compare with ufsm wbench-stats.
 # Env: SITE laptop|desk (default: laptop if ~/ufsm-data exists), GPU (0), BOXES ("clean" default: boxes not tagged label-noise in boxes.tsv | "all" | names), REP (2: shifted fits per box, 0 off),
-#   SLABS (1), SITES (z cells of the slab sites), FIT (extra fit flags; changes the fitter config tag; "{box}" becomes the box name,
+#   SLABS (1), SLABORC (none|net: slab ceiling, label phase in the slab crops; BOXES=none skips the boxes), SITES (z cells of the slab sites), FIT (extra fit flags; changes the fitter config tag; "{box}" becomes the box name,
 #   e.g. FIT="--emb /vesuvius/ufsm/repr/emb/bench/{box} --uw-rep-emb 2"), FIELDS (TAG0: reuse fields),
 #   KEEP (1: keep this TAG's fields for later fixed-fields runs; default 1), U (binary; default $WB/bin/ufsm = the pinned build),
 #   NOLOCK=1 (the caller holds the GPU lock).
@@ -17,7 +17,7 @@ SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-
 . $H/site-$SITE.env
 CK=$(readlink -f "$1"); TAG=$2
 U=${U:-$WB/bin/ufsm}; [ -x $U ] || { echo "no binary $U"; exit 2; }
-BOXES=${BOXES:-clean}; REP=${REP:-2}; SLABS=${SLABS:-1}; SITES=${SITES:-4624 5392 5904 6672}; FIT=${FIT:-}; FIELDS=${FIELDS:-}; KEEP=${KEEP:-1}
+BOXES=${BOXES:-clean}; SLABORC=${SLABORC:-}; REP=${REP:-2}; SLABS=${SLABS:-1}; SITES=${SITES:-4624 5392 5904 6672}; FIT=${FIT:-}; FIELDS=${FIELDS:-}; KEEP=${KEEP:-1}
 BT=${BT:-$H/boxes.tsv}; BIN=$(sha1sum $U | cut -c1-8)
 FCFG=$(echo "$BIN --dir 1 --uw-repair 8 $FIT" | sha1sum | cut -c1-8)   # the fitter config: binary + flags
 FT=${FIELDS:-$TAG}; FD=$WB/fields/$FT; O=$WB/runs/$TAG; mkdir -p $O $WB/res $WB/ceil $FD $CACHE
@@ -67,6 +67,7 @@ g_cnt() {   # fit-compare turn counts on 0.5 mm radial segments, by phase | dens
 
 # ---- boxes ----
 if [ "$BOXES" = all ]; then BL=$(grep -v '^#' $BT | cut -f1)
+elif [ "$BOXES" = none ]; then BL=""
 elif [ "$BOXES" = clean ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label-noise/' | cut -f1)
 else BL=$BOXES; fi
 for B in $BL; do
@@ -124,6 +125,10 @@ if [ "$SLABS" = 1 ]; then
     if [ -n "$FIELDS" ]; then [ -e $f/fields.json ] || { log "$S: no fields $f"; continue; }
     elif [ ! -e $f/fields.json ]; then predict $f $((2 * s)) 1024 512 320 7168 7680 $d/pred.log big || { log "$S predict failed"; continue; }; fi
     bash $H/mkcrop.sh $f $d/fA 0 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fB 64 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fC 0 96 96 160 3328 3520 > /dev/null
+    if [ -n "$SLABORC" ]; then   # slab ceiling: label phase in the slab crops (--fill net: network planes where unlabelled)
+      for k in A B C; do RUNBIG $U fields-oracle $d/f$k $PR $PK $d/o$k --fill $SLABORC --phase-scale $PF > $d/orc$k.log 2>&1 || { log "$S: fields-oracle $k failed"; continue 2; }
+        rm -rf $d/f$k; mv $d/o$k $d/f$k; done
+    fi
     for k in A B; do UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/f$k --gpu $GPU --out $d/fit$k --codes $QR $QK --score-detail 1 --score-pairs 1 --dir 1 --uw-repair 8 ${FIT//\{box\}/$S} > $d/fit$k.log 2>&1
       grep -E '^    radius' $d/fit$k.log | awk -v t=$TAG -v s=$S -v k=$k '{gsub(/-/, " "); $0 = $0; print t"\t"s"\t"k"\t"$2"\t"$3"\t"$5"\t"$7"\t"$8"\t"$9"\t"$10"\t"$11}' >> $RR; done
     RUN $U fit-join $d/joined $d/fC --blend 16 $d/fitA 32 160 $d/fitB 160 288 > $d/join.log 2>&1
