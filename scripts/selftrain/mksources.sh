@@ -2,8 +2,8 @@
 # mksources.sh ARM OUT.json: the student's sources = GT (Paris 4 June / July from sources-pk8 with its PH1-3 / HOLD holdouts and packing
 # focus; PHerc0139 published-wrap GT, level-1 stored phase) + one phase-only pseudo-label source per scan of round R (A/r$R/labels/ARM/<S>,
 # fit --winding-mod14 3 codes on the scan's training level). Pseudo sources share PSHARE (0.35) of the total weight, split by labelled
-# volume (mm^3 = gated voxels from A/r$R/stats/*.ARM.txt); GT keeps its relative weights. Bench holdouts (HO, 0139 / 0814 / 0500P2
-# boxes, grown by MARGIN_MM 0.5) become weight-1e-6 dummy sources of their CT (the sampler holds a source's box out of every source of
+# volume (mm^3 = gated voxels from A/r$R/stats/*.ARM.txt); GT keeps its relative weights. Bench holdouts (HO, all scrolls
+# boxes): "holdout_file" on every source + weight-1e-6 copies holding each box grown by MARGIN_MM 0.5 (the sampler holds a source's box out of every source of
 # that CT). PHerc0814 GT is not used (fit-oracle ceiling 0.2-0.3). A per-scan table goes to stderr.
 # Env: A, R (0), PSHARE, HO, MARGIN_MM, PK8 (the Paris 4 sources), MINMM3 (0.5: scans with less pseudo volume are left out)
 set -euo pipefail
@@ -37,18 +37,17 @@ while read -r S SC LV UM VOL AX mm3 nl nt key; do
     '{name: $n, root: $r, ct: $c, um: $um, axis: $ax, weight: $w} + (if $lv == 2 then {min_level: 2} else {max_level: 0} end)
      + {targets: {band: {radius: 20, span: 19, phase: {root: $pr, key: $pk, level: $lv}}}}' >> $T/ps.jsonl
 done < $T/ps.txt
-# bench holdouts of the GT / pseudo CTs as dummy sources (Paris 4's are in pk8 already)
+# bench holdouts (HO, every scroll incl. Paris 4's July-only slabs): every source carries "holdout_file" (the sampler holds out the
+# boxes of its own CT); plus, per box of a CT some source uses, a weight-1e-6 copy of that source whose holdout is the box grown by
+# MARGIN_MM (the sampler holds a source's boxes out of every source of the same CT)
 mg=${MARGIN_MM:-0.5}
-jq -c --argjson mg $mg '.boxes[] | select(.scroll != "paris4" and .scroll != "PHerc1667")' $HO | while read -r b; do
-  c=$(jq -r '.ct | split("/") | last' <<< "$b"); row=$(awk -F'\t' -v c=$c '!/^#/ && index($5, c)' $D/scans.tsv | head -1)
-  [ -n "$row" ] || continue; IFS=$'\t' read -r S SC LV UM VOL AX NB ST <<< "$row"
-  [ "$(jq -r .scroll <<< "$b")" = PHerc0139 ] || [ -d $RD/labels/$ARM/$S ] || continue   # (no pseudo labels of that CT: nothing to hold out)
-  m=$(awk -v m=$mg -v u=$UM 'BEGIN {print int(m * 1000 / u + 0.999)}')
-  jq -nc --argjson b "$b" --arg r $CT --arg c $VOL --argjson um $UM --arg ax $AX --argjson m $m --arg pr $RD/labels/$ARM/$S \
-    '{name: ("hold-" + $b.name), root: $r, ct: $c, um: $um, axis: $ax, weight: 0.000001, max_level: 0,
-      holdout: [$b.l0[0] - $m, $b.l0[1] - $m, $b.l0[2] - $m, $b.l0[3] + 2 * $m, $b.l0[4] + 2 * $m, $b.l0[5] + 2 * $m],
-      targets: {band: {radius: 20, span: 19, phase: {root: (if ($b.scroll == "PHerc0139") then "/vesuvius/ufsm/gt/PHerc0139-wind-20261016/phase" else $pr end),
-        key: (if ($b.scroll == "PHerc0139") then "18.72" else "9.362" end), level: (if ($b.scroll == "PHerc0139") then 1 else 0 end)}}}}' >> $T/hold.jsonl
+cat $T/gt.jsonl $T/ps.jsonl > $T/all.jsonl
+jq -c '.boxes[]' $HO | while read -r b; do
+  c=$(jq -r '.ct | split("/") | last' <<< "$b")
+  src=$(jq -c --arg c "$c" 'select(.ct | split("/") | last == $c)' $T/all.jsonl | head -1); [ -n "$src" ] || continue
+  jq -nc --argjson b "$b" --argjson s "$src" --argjson mg $mg '($mg * 1000 / $s.um | ceil) as $m |
+    $s + {name: ("hold-" + $b.name), weight: 0.000001,
+          holdout: [$b.l0[0] - $m, $b.l0[1] - $m, $b.l0[2] - $m, $b.l0[3] + 2 * $m, $b.l0[4] + 2 * $m, $b.l0[5] + 2 * $m]}' >> $T/hold.jsonl
 done
-cat $T/gt.jsonl $T/ps.jsonl $( [ -s $T/hold.jsonl ] && echo $T/hold.jsonl ) | jq -s '{cache: "/vesuvius/ufsm/cache", sources: .}' > $OUT
+cat $T/all.jsonl $( [ -s $T/hold.jsonl ] && echo $T/hold.jsonl ) | jq -c --arg h $HO '. + {holdout_file: $h}' | jq -s '{cache: "/vesuvius/ufsm/cache", sources: .}' > $OUT
 echo "mksources: $OUT: $(jq '.sources | length' $OUT) sources, GT weight $GW, pseudo weight $PW (share $PS) over $PV mm3" >&2
