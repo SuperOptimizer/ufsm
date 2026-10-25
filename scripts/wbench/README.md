@@ -52,6 +52,12 @@ first box is the validation box.
    - `gross`: share of cells more than 1/4 turn off;
    - `gross100`: the same on packed cells (label spacing under 100 um);
    - `conf`: median confidence.
+   - Turn counts without the fitter (fit-compare): 0.5 mm radial segments from every 4th labelled cell; the label phase
+     unwrapped along the segment gives the reference turns, the network phase unwrapped the same way gives `cnt_bias` (median
+     error in turns; negative = sheets missed) and `cnt_off` (share of segments >= 0.5 turn off; `cnt_offp` on packed segments,
+     label spacing < 100 um). `dcnt_*` are the same counts from the density head (|n . r| / spacing integrated along the segment).
+     wind96: PH1-3 cnt_bias -1.2 to -1.9 (the phase skips packed sheets), HOLD -0.05, 1667 -0.10; its density is unbiased.
+     Rows written before these columns existed get them with `addcnt.sh RES.tsv` (reads runs/TAG/BOX/cmp.log).
 5. **Ceiling.** The same fitter on label phase (with network planes where there are no labels) gives `ceil` and `ceil_p1x`.
    It is cached per fitter config (binary hash + FIT flags) in `$WB/ceil/`. `frac` = ids / ceil. With `--set clean` (the
    default), `wbench-stats` drops boxes with ceil < 0.8 (the labels, not the model, limit them: all 0814 boxes so far) from the mean and prints them on a separate "label-noise" line.

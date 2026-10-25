@@ -22,7 +22,7 @@ BT=${BT:-$H/boxes.tsv}; BIN=$(sha1sum $U | cut -c1-8)
 FCFG=$(echo "$BIN --dir 1 --uw-repair 8 $FIT" | sha1sum | cut -c1-8)   # the fitter config: binary + flags
 FT=${FIELDS:-$TAG}; FD=$WB/fields/$FT; O=$WB/runs/$TAG; mkdir -p $O $WB/res $WB/ceil $FD $CACHE
 RES=$WB/res/$TAG.tsv; RS=$WB/res/$TAG-slabs.tsv; RR=$WB/res/$TAG-radius.tsv; CEIL=$WB/ceil/$FCFG.tsv
-HDR="tag	box	scroll	ids	ids0	ids_a	ids_b	ids_sd	e08	p05	p1	p2	p4	p05x	p1x	p2x	p4x	pmed	gross	gross100	conf	ceil	ceil_p1x	frac	pred_s	fit_s	bin	fcfg"
+HDR="tag	box	scroll	ids	ids0	ids_a	ids_b	ids_sd	e08	p05	p1	p2	p4	p05x	p1x	p2x	p4x	pmed	gross	gross100	conf	ceil	ceil_p1x	frac	pred_s	fit_s	bin	fcfg	cnt_bias	cnt_off	cnt_offp	dcnt_bias	dcnt_off	dcnt_offp"
 [ -s $RES ] || echo "$HDR" > $RES
 [ -s $CEIL ] || printf 'box\tceil\tceil_p1x\tfrom\n' > $CEIL
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $O/run.log; }
@@ -61,6 +61,9 @@ g_ids() { grep -oE 'winding ids right [0-9.]+' $1 | tail -1 | awk '{print $4}'; 
 g_e08() { grep -oE '< 0.08 turn [0-9.]+' $1 | tail -1 | awk '{print $4}'; }
 g_pair() { grep -oE "pair winding right.*" $1 | grep -oE "$2 mm [0-9.na]+ cross [0-9.na]+" | awk -v c=$3 '{print (c ? $5 : $3)}'; }
 num() { [[ "${1:-}" =~ ^[0-9.]+$ ]] && echo $1 || echo na; }
+g_cnt() {   # fit-compare turn counts on 0.5 mm radial segments, by phase | density: median error (turns), share >= 0.5 turn off, the same on packed segments
+  local l; l=$(grep -E "^ +by $2:" $1 | head -1); [ -n "$l" ] || { echo "na na na"; return; }
+  echo "$(echo "$l" | grep -oE "median [-+]?[0-9.]+" | awk "{print \$2+0}") $(echo "$l" | grep -oE "0.5 turn [0-9.]+" | awk "{print \$3}") $(echo "$l" | grep -oE "um: [0-9.]+" | awk "{print \$2}")"; }
 
 # ---- boxes ----
 if [ "$BOXES" = all ]; then BL=$(grep -v '^#' $BT | cut -f1)
@@ -92,6 +95,7 @@ for B in $BL; do
   pe=$(num $(grep -oE 'phase \|error\| \(turns\): median [0-9.]+' $d/cmp.log | awk '{print $NF}')); gr=$(num $(grep -oE '> 0.25 [0-9.]+' $d/cmp.log | head -1 | awk '{print $3}'))
   g1=$(num $(grep 'gross phase errors by reference spacing' $d/cmp.log | grep -oE '< 100 um [0-9.]+' | awk '{print $4}'))
   cf=$(num $(grep -oE 'phase confidence: median [0-9.]+' $d/cmp.log | awk '{print $NF}'))
+  read -r cnb cno cnp <<< "$(g_cnt $d/cmp.log phase)"; read -r dnb dno dnp <<< "$(g_cnt $d/cmp.log density)"
   rm -rf $d/orc
   # the ceiling of this fitter config (label phase where known, this run's network planes elsewhere); cached per box
   if ! grep -qP "^$B\t" $CEIL; then
@@ -100,8 +104,8 @@ for B in $BL; do
   fi
   read -r cl clp <<< "$(awk -F'\t' -v b=$B '$1 == b {print $2, $3}' $CEIL | tail -1)"
   fr=$(echo "$ids $cl" | awk '$1 != "na" && $2 != "na" && $2 > 0 {printf "%.4f", $1 / $2; exit} {print "na"}')
-  echo "$TAG	$B	$sc	$ids	$ids0	$ia	$ib	$sd	$e08$pp	$pe	$gr	$g1	$cf	$cl	$clp	$fr	$((t1 - t0))	$((t2 - t1))	$BIN	$FCFG" >> $RES
-  log "$B ids $ids (box $ids0 shifted $ia $ib) p1x $(g_pair $d/fit.log 1 1) gross100 $g1 ceil $cl pred $((t1 - t0))s fit $((t2 - t1))s"
+  echo "$TAG	$B	$sc	$ids	$ids0	$ia	$ib	$sd	$e08$pp	$pe	$gr	$g1	$cf	$cl	$clp	$fr	$((t1 - t0))	$((t2 - t1))	$BIN	$FCFG	$cnb	$cno	$cnp	$dnb	$dno	$dnp" >> $RES
+  log "$B ids $ids (box $ids0 shifted $ia $ib) p1x $(g_pair $d/fit.log 1 1) gross100 $g1 cnt_bias $cnb cnt_off $cno ceil $cl pred $((t1 - t0))s fit $((t2 - t1))s"
   # (the fit dir is kept: others read runs/TAG/BOX/fit)
   [ -z "$FIELDS" ] && [ "$KEEP" = 0 ] && rm -rf $f
 done
