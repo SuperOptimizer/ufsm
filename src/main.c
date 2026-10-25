@@ -160,6 +160,7 @@ static int usage(void) {
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..]  several models' fit fields averaged (phase: confidence-weighted complex mean)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
+        "  ufsm phase-pack ROOT KEY OUT --row R [--level 19] [--threads 8] / phase-unpack IN DIR / phase-cmp RA KA RB KB --row R   6-bit phase-label transfer\n"
         "  ufsm papyrus-labels <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx   papyrus / void training labels of a CT box (gap labels, no cutoff)\n"
         "  ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w --labels G1,G2   a CT plane beside label panels (void blue, ignored yellow)\n"
         "root: local dir or https://.../volcomp ; keys are paths under root\n");
@@ -3507,6 +3508,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "overlay")) return cmd_overlay(argc, argv);
     if (!strcmp(cmd, "wind-score")) return cmd_wind_score(argc, argv);
     if (!strcmp(cmd, "store-bench")) { int cmd_store_bench(int, char **); return cmd_store_bench(argc, argv); }
+    if (!strcmp(cmd, "phase-pack") || !strcmp(cmd, "phase-unpack") || !strcmp(cmd, "phase-cmp")) { int cmd_phase_pack(int, char **); return cmd_phase_pack(argc, argv); }
     if (argc < 4) return usage();
     const char *root = argv[2], *key = argv[3];
     const char *cache = opt(argc, argv, "--cache", nullptr);
