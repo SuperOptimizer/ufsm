@@ -34,7 +34,7 @@ SRC += src/embz.c src/fit_emb.c src/embpca.c src/embcalib.c src/sample_emb.c
 SRC += src/fitjoin.c src/fieldsoracle.c src/packmap.c src/scanprep.c src/pairacc.c src/wbench.c
 SRC += src/view.c src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
 SRC += src/srpair.c
-SRC += src/storebench.c
+SRC += src/storebench.c src/phasepack.c
 OBJ  = $(patsubst src/%.c,$(B)/%.o,$(SRC)) $(B)/surfcomp.o
 
 all: $(B)/ufsm
@@ -369,6 +369,13 @@ $(B)/test_json: tests/test_json.c $(B)/json.o
 $(B)/store_bench: src/storebench.c $(B)/store.o $(B)/zarr3.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DSTORE_BENCH_MAIN $^ -o $@ $(LDLIBS)
 
+
+# phase-pack without the CUDA build (desk / pods): compact phase-label transfer, see src/phasepack.c
+$(B)/phase_pack: src/phasepack.c $(B)/store.o $(B)/zarr3.o $(B)/json.o $(B)/z3w.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DPHASE_PACK_MAIN $^ -o $@ $(LDLIBS)
+
+$(B)/test_phasepack: tests/test_phasepack.c $(B)/phasepack.o $(B)/store.o $(B)/zarr3.o $(B)/json.o $(B)/z3w.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 $(B)/test_http_reader: tests/test_http_reader.c $(B)/store.o $(B)/zarr3.o $(B)/json.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
@@ -386,7 +393,7 @@ test-all: $(B)/test_wgrad_grid
 $(B):
 	mkdir -p $(B)
 
-test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/test_votes $(B)/test_wind $(B)/test_phase_check $(B)/test_fuse $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon $(B)/test_muonc $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_surf $(B)/test_tiffw $(B)/test_edt $(B)/test_volcomp $(B)/test_typed_zarr $(B)/test_aug_preset $(B)/test_l0_norm $(B)/test_l0_slab $(B)/test_wind_sampler $(B)/test_crush $(B)/test_scrollaug $(B)/test_zwin $(B)/test_l0_stream
+test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augment $(B)/test_scan_augment $(B)/test_side $(B)/test_votes $(B)/test_wind $(B)/test_phase_check $(B)/test_fuse $(B)/test_raster $(B)/test_http_reader $(B)/test_wide_up_grad $(B)/test_wgrad_staging $(B)/test_stem_precision $(B)/test_gn_contract $(B)/test_sampler_safety $(B)/test_optimizer_owners $(B)/test_infer_buffers $(B)/test_recompute_live $(B)/test_share_enc_a1 $(B)/test_checkpoint_runtime $(B)/make_pipeline_fixture $(B)/test_checkpoint $(B)/test_eval $(B)/test_sample_ops $(B)/test_json $(B)/test_nn $(B)/test_unet $(B)/test_fused $(B)/test_formats $(B)/ufsm $(B)/test_mx $(B)/test_mx4 $(B)/test_grad_mx4 $(B)/test_rc $(B)/test_split $(B)/test_muon $(B)/test_muonc $(B)/test_gn_frozen $(B)/test_infer_mem $(B)/test_half $(B)/test_unwrap_targets $(B)/test_fit $(B)/test_surf $(B)/test_tiffw $(B)/test_edt $(B)/test_volcomp $(B)/test_typed_zarr $(B)/test_aug_preset $(B)/test_l0_norm $(B)/test_l0_slab $(B)/test_wind_sampler $(B)/test_crush $(B)/test_scrollaug $(B)/test_zwin $(B)/test_l0_stream $(B)/test_phasepack
 	./$(B)/test_target_erode
 	./$(B)/test_wind_sampler
 	./$(B)/test_crush
@@ -498,6 +505,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	UFSM_FUSED_UP=0 UFSM_F16=1 ./$(B)/test_unet
 	UFSM_RECOMPUTE=2 UFSM_F16=1 ./$(B)/test_unet
 	./$(B)/test_json
+	./$(B)/test_phasepack
 	./$(B)/test_nn
 	./$(B)/test_unet
 	UFSM_SCALE_COND=1 ./$(B)/test_unet
