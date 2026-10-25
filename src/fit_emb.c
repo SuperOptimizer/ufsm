@@ -43,19 +43,23 @@ emb_vol *emb_vol_open(const char *group, const char *name, const long long org[3
         e->o[d] = c0 * step; e->n[d] = c1 - c0;
     }
     const int C = e->C; const size_t plane = (size_t)e->n[1] * e->n[2];
-    e->v = calloc(plane * e->n[0] * C, 1); float *buf = malloc(plane * C * sizeof *buf);
+    /* slabs of planes ending on the chunk grid (each chunk decoded once), at most ~256 MB of float32 */
+    const int ch = E.a.chunk > 0 ? E.a.chunk : 1; int64_t sl = (int64_t)((256u << 20) / (plane * C * sizeof(float))); sl = sl < 1 ? 1 : sl > ch ? ch : sl;
+    e->v = calloc(plane * e->n[0] * C, 1); float *buf = malloc(plane * C * sl * sizeof *buf);
     if (!e->v || !buf) { fprintf(stderr, "fit-emb: out of memory for %lld cells x %d\n", (long long)(plane * e->n[0]), C); free(buf); emb_vol_free(e); emb_close(&E); return nullptr; }
     size_t nv = 0;
-    for (int64_t z = 0; z < e->n[0]; z++) {
-        const int64_t o3[3] = {e->o[0] / step + z, e->o[1] / step, e->o[2] / step}, n3[3] = {1, e->n[1], e->n[2]};
+    for (int64_t z0 = 0; z0 < e->n[0];) {
+        const int64_t gz = e->o[0] / step + z0, end = sl == ch ? (gz / ch + 1) * ch - e->o[0] / step : z0 + sl, z1 = end < e->n[0] ? end : e->n[0];
+        const int64_t o3[3] = {gz, e->o[1] / step, e->o[2] / step}, n3[3] = {z1 - z0, e->n[1], e->n[2]};
         if (emb_read(&E, o3, n3, buf)) { fprintf(stderr, "fit-emb: read failed\n"); free(buf); emb_vol_free(e); emb_close(&E); return nullptr; }
-        for (size_t i = 0; i < plane; i++) {
+        for (size_t i = 0; i < plane * (size_t)(z1 - z0); i++) {
             const float *s = buf + i * C; double q = 0; for (int k = 0; k < C; k++) q += (double)s[k] * s[k];
             if (q <= 0) continue;
-            const double inv = 127.0 / sqrt(q); int8_t *d = e->v + ((size_t)z * plane + i) * C;
+            const double inv = 127.0 / sqrt(q); int8_t *d = e->v + ((size_t)z0 * plane + i) * C;
             for (int k = 0; k < C; k++) { const long t = lround(s[k] * inv); d[k] = (int8_t)(t > 127 ? 127 : t < -127 ? -127 : t); }
             nv++;
         }
+        z0 = z1;
     }
     free(buf); emb_close(&E);
     fprintf(stderr, "fit-emb: %s/%s: %lldx%lldx%lld cells of %d voxels (C %d, %.2f GB), %zu with vectors\n", group, name, (long long)e->n[0], (long long)e->n[1], (long long)e->n[2],

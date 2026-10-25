@@ -685,3 +685,34 @@ extern "C" void nn_wind4_loss(const void *la, const void *lb, const uint8_t *w4,
     nn_wind4_fin(ds, fin);
     if (ga) nn_wind4_grad(la, lb, w4, comp, m, n, fin, lambda, ga, gb);
 }
+
+/* train --distill: the cosine feature-distillation loss (nn.h nn_distill_loss). One thread per voxel; channel c of sample b at y[(b C + c) S + i] */
+__global__ void distill_k(const float *y, const int8_t *t, int N, int C, size_t S, float *g, double *ds) {
+    __shared__ float sh[2];
+    if (threadIdx.x < 2) sh[threadIdx.x] = 0.f;
+    __syncthreads();
+    const size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (k < (size_t)N * S) {
+        const size_t b = k / S, i = k - b * S, base = b * (size_t)C * S + i;
+        float yy = 0.f, tt = 0.f, yt = 0.f;
+        for (int c = 0; c < C; c++) { const float a = y[base + c * S], q = (float)t[base + c * S]; yy += a * a; tt += q * q; yt += a * q; }
+        if (tt > 0.f) {
+            const float ny = sqrtf(yy) + 1e-6f, nt = sqrtf(tt), cs = yt / (ny * nt);
+            for (int c = 0; c < C; c++) g[base + c * S] = -((float)t[base + c * S] / nt - cs * y[base + c * S] / ny) / ny;
+            atomicAdd(&sh[0], 1.f - cs); atomicAdd(&sh[1], 1.f);
+        } else for (int c = 0; c < C; c++) g[base + c * S] = 0.f;
+    }
+    __syncthreads();
+    if (threadIdx.x < 2 && sh[threadIdx.x] != 0.f) atomicAdd(&ds[threadIdx.x], (double)sh[threadIdx.x]);
+}
+__global__ void distill_scale_k(float *g, size_t n, const double *ds, float w) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) g[i] *= ds[1] > 0 ? (float)(w / ds[1]) : 0.f;
+}
+extern "C" void nn_distill_loss(const float *y, const int8_t *t, int n, int C, size_t S, float w, float *g, double *ds) {
+    cudaMemsetAsync(ds, 0, 2 * sizeof(double));
+    distill_k<<<nblk((size_t)n * S, 256), 256>>>(y, t, n, C, S, g, ds);
+    KCHECK();
+    distill_scale_k<<<nblk((size_t)n * C * S, 256), 256>>>(g, (size_t)n * C * S, ds, w);
+    KCHECK();
+}

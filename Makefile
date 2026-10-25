@@ -30,7 +30,7 @@ SRC += src/repack.c
 SRC += src/wload.c src/inkext.c src/inkext_net.c src/dinovol.c src/dinovol_net.c src/dino.c src/surfeval.c
 SRC += src/inksplat.c
 SRC += src/tfx.c
-SRC += src/embz.c src/fit_emb.c src/embpca.c src/embcalib.c
+SRC += src/embz.c src/fit_emb.c src/embpca.c src/embcalib.c src/sample_emb.c
 SRC += src/fitjoin.c src/fieldsoracle.c src/packmap.c src/scanprep.c src/pairacc.c src/wbench.c
 SRC += src/view.c src/reg.c src/reg_cli.c src/reg_view.c src/reg_init.c src/reg_render.c src/reg_ink.c src/srpairs.c
 SRC += src/srpair.c
@@ -153,7 +153,7 @@ $(B)/test_half: tests/test_half.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_unwrap_targets: tests/test_unwrap_targets.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-$(B)/test_fit: tests/test_fit.c $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_fit: tests/test_fit.c $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 $(B)/test_surf: tests/test_surf.c $(B)/surf.o $(B)/stitch.o $(B)/z3w.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/tiffw.o $(B)/tiff.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
@@ -173,18 +173,21 @@ test-all: $(B)/test_stitch
 $(B)/test_coreline: tests/test_coreline.c $(B)/coreline.o $(B)/z3w.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_coreline
-$(B)/test_pyports: tests/test_pyports.c tests/test_pyports_expected.h $(B)/coreline_check.o $(B)/coreline.o $(B)/imgops.o $(B)/tiff.o $(B)/tiffw.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_pyports: tests/test_pyports.c tests/test_pyports_expected.h $(B)/coreline_check.o $(B)/coreline.o $(B)/imgops.o $(B)/tiff.o $(B)/tiffw.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_pyports.c $(filter %.o,$^) -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_pyports
-$(B)/test_fit_w4: tests/test_fit_w4.c $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_fit_w4: tests/test_fit_w4.c $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_fit_w4
-$(B)/test_repair: tests/test_repair.c $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_repair: tests/test_repair.c $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_repair
-$(B)/test_fit_emb: tests/test_fit_emb.c $(B)/fit_emb.o $(B)/embz.o $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_fit_emb: tests/test_fit_emb.c $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_fit_emb
+$(B)/test_distill: tests/test_distill.c $(B)/sample_emb.o $(B)/embz.o $(B)/z3w.o $(B)/spatial_augment.o $(B)/json.o $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
+test-all: $(B)/test_distill
 
 $(B)/test_ink_splat: tests/test_ink_splat.c $(OBJ) $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
@@ -222,7 +225,7 @@ test-all: $(B)/test_dinor
 $(B)/test_tfx: tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_tfx.c $(B)/tfx.o $(B)/imgops.o $(B)/tiffw.o $(B)/tiff.o $(B)/surfcomp.o -o $@ $(LDLIBS)
 test-all: $(B)/test_tfx
-$(B)/test_fit_join: tests/test_fit_join.c $(B)/fitjoin.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_fit_join: tests/test_fit_join.c $(B)/fitjoin.o $(B)/fit.o $(B)/fit_emb.o $(B)/embz.o $(B)/z3w.o $(B)/fit_ct.o $(B)/l1pot.o $(B)/coreline.o $(B)/json.o $(B)/zarr3.o $(B)/store.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS) $(CUDALIBS)
 test-all: $(B)/test_fit_join
 $(B)/test_pairacc: tests/test_pairacc.c $(B)/pairacc.o
@@ -249,7 +252,7 @@ $(B)/test_infer_mem: tests/test_infer_mem.c $(B)/unet.o $(B)/split.o $(B)/nn.o $
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_split: tests/test_split.c $(B)/unet.o $(B)/split.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-SAMPLE_TEST_OBJ = $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/json.o $(B)/store.o $(B)/zarr3.o $(B)/sources.o $(B)/srpair.o $(B)/zarr2.o $(B)/tiff.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o $(B)/view.o $(B)/reg.o
+SAMPLE_TEST_OBJ = $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/json.o $(B)/store.o $(B)/zarr3.o $(B)/sources.o $(B)/srpair.o $(B)/zarr2.o $(B)/tiff.o $(B)/z3w.o $(B)/hf.o $(B)/zipr.o $(B)/view.o $(B)/reg.o $(B)/sample_emb.o $(B)/embz.o
 $(B)/test_votes: tests/test_votes.c src/votes.h $(B)/votes.o $(SAMPLE_TEST_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_votes.c $(B)/votes.o $(SAMPLE_TEST_OBJ) -o $@ $(LDLIBS)
 $(B)/test_sample_ops: tests/test_sample_ops.c src/sample.c src/*.h $(SAMPLE_TEST_OBJ)
@@ -285,21 +288,21 @@ $(B)/test_crush: tests/test_crush.c tests/make_wind_fixture.c src/sample.c src/*
 $(B)/test_raster: tests/test_raster.c src/ingest.c src/*.h $(SAMPLE_TEST_OBJ) $(B)/surfcomp.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) tests/test_raster.c $(SAMPLE_TEST_OBJ) $(B)/surfcomp.o -o $@ $(LDLIBS)
 
-$(B)/bench_sampler: tests/bench_sampler.c $(B)/sample.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/bench_sampler: tests/bench_sampler.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-$(B)/test_gpu_input: tests/test_gpu_input.c $(B)/sample.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_gpu_input: tests/test_gpu_input.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-$(B)/test_pack_tm: tests/test_pack_tm.c $(B)/sample.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_pack_tm: tests/test_pack_tm.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
 $(B)/test_gyrec: tests/test_gyrec.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_wind4: tests/test_wind4.c $(B)/band.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
-$(B)/test_unwrap2_sampler: tests/test_unwrap2_sampler.c $(B)/sample.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_unwrap2_sampler: tests/test_unwrap2_sampler.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-$(B)/test_phase_interp: tests/test_phase_interp.c $(B)/sample.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/test_phase_interp: tests/test_phase_interp.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
-$(B)/bench_read: tests/bench_read.c $(B)/sample.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
+$(B)/bench_read: tests/bench_read.c $(B)/sample.o $(B)/sample_emb.o $(B)/embz.o $(B)/edt.o $(B)/band.o $(B)/sheet.o $(B)/ct_augment.o $(B)/scan_augment.o $(B)/spatial_augment.o $(B)/crush.o $(B)/scrollaug.o $(B)/cover.o $(B)/sources.o $(B)/srpair.o $(B)/view.o $(B)/reg.o $(B)/zarr3.o $(B)/zarr2.o $(B)/store.o $(B)/json.o $(B)/z3w.o $(B)/tiff.o $(B)/zipr.o $(B)/hf.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm -lcurl -lzstd -lblosc -lz -lcrypto
 $(B)/fwd_nan: tests/fwd_nan.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
@@ -432,6 +435,7 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_fit_w4
 	./$(B)/test_repair
 	./$(B)/test_fit_emb
+	./$(B)/test_distill
 	./$(B)/test_tiffw
 	./$(B)/test_imgops
 	./$(B)/test_tfx
@@ -494,6 +498,8 @@ test-all: $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover $(B)/test_ct_augme
 	./$(B)/test_unet
 	UFSM_SCALE_COND=1 ./$(B)/test_unet
 	UFSM_DS=1 ./$(B)/test_unet
+	UFSM_EMB=3 ./$(B)/test_unet
+	UFSM_EMB=3 UFSM_DS=1 UFSM_RECOMPUTE=2 ./$(B)/test_unet
 	UFSM_ENC_BLOCKS=0,1,2 UFSM_RB_NONZERO=1 UFSM_BIG_ENC_BLOCKS=0,1,2,2 UFSM_F16=1 ./$(B)/test_unet
 	UFSM_L0_NORM=1 ./$(B)/test_unet
 	UFSM_L0_NORM=2 ./$(B)/test_unet

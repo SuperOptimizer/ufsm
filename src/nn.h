@@ -429,6 +429,10 @@ void nn_wind4_grad(const void *la, const void *lb, const uint8_t *w4, const uint
 void nn_wind4_loss(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, double *ds, float *fin, float lambda, void *ga, void *gb);
 void nn_cond_gather(const uint8_t *c14, const uint8_t *done, const uint8_t *ct, int W, int oz, int oy, int ox, int bz, int by, int bx, size_t N, void *x, int h16);   /* predict --cond-sweep: condition inputs 4-6 of a window from the box canvas (src/sweep.c) */
 void nn_cond_place(const float *lg, const uint8_t *ct, int W, int halo, int oz, int oy, int ox, int bz, int by, int bx, size_t N, int ch14, uint8_t *c14, uint8_t *p1, uint8_t *recto, uint8_t *done);   /* the window interior into the box canvas where not done */
+/* train --distill: cosine feature distillation. y the head's fp32 outputs [n][C][S], t the int8 targets in the same layout (a voxel whose
+   C target values are all 0 has none); g (fp32, same layout) = w x the gradient of the mean over the voxels with a target of 1 - cos(y, t);
+   ds (2 device doubles): the sum of 1 - cos and the voxel count */
+void nn_distill_loss(const float *y, const int8_t *t, int n, int C, size_t S, float w, float *g, double *ds);
 /* half-resolution networks (unet_cfg.half_res): the network runs on 2x2x2 blocks of the full-resolution window.
    nn_half_input: the 4-channel input x ([n][4][D][H][W], 16-bit storage type when h16, else fp32) -> the network input y at half
    resolution, same type: mode 1 (pool) the block mean of every channel (4 channels); mode 2 (pack) those 4 means plus, from the block's

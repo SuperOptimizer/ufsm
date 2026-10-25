@@ -315,6 +315,13 @@ sources *sources_load(const char *path) {
             s->norm_c = (float)json_num(json_get(nj, "center"), 0); s->norm_s = (float)json_num(json_get(nj, "scale"), 0);
             if (!(s->norm_s > 0)) { fprintf(stderr, "sources: %s: \"norm\" needs \"scale\" > 0\n", s->name); json_free(j); sources_free(S); return nullptr; }
         }
+        const json *ej = json_get(e, "emb");   /* {"groups": [DIR, ...], "name": "pca64", "level": L}: train --distill feature targets */
+        if (ej) {
+            const json *gj = json_get(ej, "groups");
+            if (gj && gj->type == J_ARR) for (size_t k = 0; k < gj->n && s->nemb < 8; k++) { const char *g = json_str(json_at(gj, k), nullptr); if (g) s->emb_grp[s->nemb++] = strdup(g); }
+            s->emb_name = strdup(json_str(json_get(ej, "name"), "pca64")); s->emb_level = (int)json_num(json_get(ej, "level"), -1);
+            if (!s->nemb || s->emb_level < 0) { fprintf(stderr, "sources: %s: \"emb\" needs \"groups\": [DIR, ...] and \"level\" >= 0\n", s->name); json_free(j); sources_free(S); return nullptr; }
+        }
         const json *ho = json_get(e, "holdout");
         if (ho && ho->type == J_ARR && ho->n == 6 && json_at(ho, 0)->type != J_ARR) src_add_hold(s, ho);
         else if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n; k++) src_add_hold(s, json_at(ho, k));
@@ -370,6 +377,8 @@ void sources_free(sources *S) {
         free(s->ax.z); free(s->ax.y); free(s->ax.x);
         free(s->name); free(s->ct_key); free(s->view_map);
         for (int k = 0; k < s->nxs; k++) free(s->xs_map[k]);
+        for (int k = 0; k < s->nemb; k++) free(s->emb_grp[k]);
+        free(s->emb_name);
         store_close(s->s);
     }
     free(S->src);

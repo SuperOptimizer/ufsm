@@ -124,6 +124,9 @@ typedef struct {
                                 the native input crop (P / 4)^3], both under one symmetry and tone LUT. 1, task restore: no target reads; batch.t holds the clean CT window alone (B x P^3, tone LUT and symmetry applied),
                                 batch.x / x16 and batch.m are absent (the trainer degrades the window on the device); training windows lie inside a
                                 source "boxes" entry when the source lists boxes, validation windows inside its holdout box; level = the source's min_level */
+    int emb_ch, emb_div;     /* train --distill: batch.emb, the sources' "emb" feature targets (emb_ch channels, sources.h) on the grid of emb_div^3 window
+                                voxels per cell (the head's level), pulled at each cell centre through the window's symmetry and warp (trilinear,
+                                renormalised); none (0) on crushed / torn / re-bent windows, sources without "emb" and cells outside its groups */
 } sample_cfg;
 /* the configurations whose every sample takes write_x (no warp, sheet prior, slab appearance plan, aux or condition channels): the
    radial channels then follow from the window's corner, symmetry and axis centres alone */
@@ -156,6 +159,8 @@ typedef struct {
     uint8_t *vok;            /* B: 1 where the window has a view crop */
     uint8_t *tm;             /* cfg.pack_tm: B x P^3 codes (bit 0: target 0 = 255, bit 1: target 1 = 255, bit 2: mask), t / m nullptr */
     int xch;                 /* input channels stored per sample in x / x16 (4, 5 with aux, 7 with cond, 1 with gpu_input) */
+    int8_t *emb;             /* cfg.emb_ch: B x emb_ch x (Pz / emb_div) x (P / emb_div)^2 feature targets (int8 x 127 unit vectors, channel planes; a cell
+                                with all channels 0 has none) */
 } batch;
 #define SAMPLE_AXR(P) (4 + 2 * (P))   /* = unet.h UNET_AXR(P) */
 /* a window chain's next corner on (sample_cfg.chain_p; level-l voxels of a scan of shape `shape`): mode 0 along the axis, 1 around it,

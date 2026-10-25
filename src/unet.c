@@ -202,6 +202,7 @@ struct unet {
     float *ds_lg[UNET_MAXLEV];               /* their fp32 logits (training builds) */
     const float *ds_gl[UNET_MAXLEV];         /* their fp32 logit gradients for the next backward (unet_set_ds_grad) */
     void *ds_g16, *ds_tmp; size_t ds_g16_n, ds_tmp_n;   /* backward scratch: 16-bit logit gradient, the head's input gradient in gout's storage */
+    convp eh; float *eh_lg; const float *eh_gl;         /* cfg.emb_lev: the distillation head, its fp32 outputs (training builds), their gradient */
     float wd_nonconv;                        /* unet_set_wd_nonconv: weight decay multiplier for the non-3^3 parameters (GroupNorm, biases,
                                                 the head) under Muon / ANVIL; 0 (default): only the conv weights decay */
     void (*head_cb)(void *); void *head_ctx; /* ... and its backward at the head's step (unet_head_fwd_z / unet_head_bwd_z per slab) */
@@ -354,6 +355,8 @@ unet *unet_create(const unet_cfg *cfg) {
         u->tb.c1 = u->tb.c2 = (convp){C, C, 3, 1, 0, 0};   /* (shapes only: no convs) */
         u->tb.n1 = u->tb.n2 = so->n2;                      /* the level's output normalisation moves after the stage */
     }
+    if (cfg->emb_lev < 0 || (cfg->emb_lev > 0 && (cfg->emb_lev > L - 2 || cfg->emb_ch <= 0))) { fprintf(stderr, "unet: the distillation head takes decoder levels 1..%d and >= 1 channel\n", L - 2); abort(); }
+    if (cfg->emb_lev) off = add_conv(u, &u->eh, dw_of(cfg, cfg->emb_lev), cfg->emb_ch, 1, 1, off);   /* (params last: older layouts unchanged) */
     u->np = off;
     if (ufsm_env_on("UFSM_DEBUG")) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d c1.w %zu c1.b %zu n1 %zu c2.w %zu c2.b %zu n2 %zu\n", i, u->enc[i].c1.w, u->enc[i].c1.b, u->enc[i].n1.gamma, u->enc[i].c2.w, u->enc[i].c2.b, u->enc[i].n2.gamma);
@@ -432,6 +435,7 @@ void unet_init(unet *u, uint64_t seed) {
         if (!ufsm_env_on("UFSM_RB_NONZERO")) memset(h + b->c2.w, 0, (size_t)b->c2.cout * b->c2.cin * 27 * 4);   /* (tests: random conv2) */
     }
     for (int j = 1; j <= u->cfg.ds_levels; j++) init_conv(h, &u->ds[j], &seed, -2.0);   /* deep-supervision heads, as the main head */
+    if (u->cfg.emb_lev) init_conv(h, &u->eh, &seed, 0.0);   /* the distillation head (He init, bias 0) */
     if (u->tbn) {   /* attention stage: LN gains / QK-norm gains 1, QKV and MLP-in N(0, 1 / C), out projections, PEG and biases 0 (identity) */
         const int C = u->tbd.C, F = u->tbd.F;
         for (int k = 0; k < u->tbn; k++) {
@@ -1479,6 +1483,8 @@ static void build_acts(unet *u, shape5 xs, int train) {
     if (train) for (int j = 1; j <= u->cfg.ds_levels; j++) {   /* deep supervision: fp32 logits per supervised decoder level */
         g_mlab = "deep-supervision logits"; shape5 os = u->ls[j]; os.c = u->cfg.cout; u->ds_lg[j] = dalloc(u, shape_numel(os));
     }
+    u->eh_lg = nullptr; u->eh_gl = nullptr;
+    if (train && u->cfg.emb_lev) { g_mlab = "distillation head outputs"; shape5 os = u->ls[u->cfg.emb_lev]; os.c = u->cfg.emb_ch; u->eh_lg = dalloc(u, shape_numel(os)); }
     u->xin = nullptr;
     if (ABF && input_mx()) {   /* include mandatory input storage in the dry planner */
         const int idt = unet_input_prec(); const size_t xb_ = nn_mx_bytes(xs, idt);
@@ -2540,6 +2546,13 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         if (i == 0 && u->l0st) { u->dec[0].in = u->cat[0]; l0st_fwd_dec(u); }   /* (level-0 slab stream) */
         else block_fwd(u, &u->dec[i], i, u->cat[i]);
         l0_after(u, &u->dec[i]);
+        if (train && u->train && u->eh_lg && i == u->cfg.emb_lev) {   /* the distillation head, from the level's output while it is live */
+            if (sp_on(u)) { fprintf(stderr, "unet: the distillation head with the spatial split is not supported\n"); abort(); }
+            const block *d = &u->dec[i]; const float *dw = P(u, u->eh.w), *db = P(u, u->eh.b);
+            nn_set_head_out_h16(0);
+            if (recompute()) { nn_gn_t g = gn_out(u, d); int r; PROF(0, r = nn_conv3d_fwd_x(d->a2, &g, nullptr, nullptr, 0, 0, d->ys, dw, db, u->cfg.emb_ch, 1, 1, u->eh_lg, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("distillation head"); }
+            else PROF(0, nn_conv3d_fwd(d->s2, d->ys, dw, db, u->cfg.emb_ch, 1, 1, u->eh_lg));
+        }
         if (u->sko && train && i > 0) {   /* its skip: to the host until the decoder's backward */
             nn_offload_copy(u->h_sk[i], stage_out(u, i)->a2, act_bytes_of(u->enc[i].ys), 1, u->ev_sk[i][0], u->ev_sk[i][1]);
             u->sk_out = 1;
@@ -3302,20 +3315,20 @@ static void l0st_bwd_enc(unet *u, float *gin) {
 }
 
 void unet_backward(unet *u, const float *glogits) { unet_backward_x(u, glogits, 0); }
-/* deep supervision, before dec[j]'s backward: the head's weight / bias gradients (accumulating kernels: zeroed first) from the level's
-   output (recompute: a2 with its GroupNorm + SiLU on the fly, else s2) and its input gradient, written in gout[j]'s storage (MX by
-   registration, 16-bit or fp32) and added to the up-path gradient already there */
-static void ds_bwd(unet *u, int j, float *g) {
-    const block *d = &u->dec[j]; const convp *c = &u->ds[j];
-    shape5 xs = d->ys, os = xs; os.c = u->cfg.cout;
+/* a 1^3 side head on decoder level j (deep supervision, the distillation head), before dec[j]'s backward: the head's weight / bias
+   gradients (accumulating kernels: zeroed first) from the level's output (recompute: a2 with its GroupNorm + SiLU on the fly, else s2)
+   and its input gradient, written in gout[j]'s storage (MX by registration, 16-bit or fp32) and added to the up-path gradient already there */
+static void side_head_bwd(unet *u, int j, const convp *c, const float *gl32, float *g) {
+    const block *d = &u->dec[j];
+    shape5 xs = d->ys, os = xs; os.c = c->cout;
     const size_t no = shape_numel(os), nx = shape_numel(xs);
-    const float *gl = u->ds_gl[j];
+    const float *gl = gl32;
     if (GBF) {   /* the 16-bit logit gradient the 1^3 kernels read, with the gradient scale (unscaled with the rest at the end) */
         if (u->ds_g16_n < no * 2) { if (u->ds_g16) nn_free(u->ds_g16); u->ds_g16 = nn_malloc(no * 2); u->ds_g16_n = no * 2; }
-        nn_f32_to_h16(u->ds_gl[j], no, u->ds_g16, nn_get_grad_scale()); gl = (const float *)u->ds_g16;
+        nn_f32_to_h16(gl32, no, u->ds_g16, nn_get_grad_scale()); gl = (const float *)u->ds_g16;
     }
     nn_zero(g + c->w, (size_t)c->cout * c->cin * 4); nn_zero(g + c->b, (size_t)c->cout * 4);
-    if (recompute()) { nn_gn_t gg = gn_out(u, d); int r = nn_conv3d_bwd_weight_x(d->a2, &gg, nullptr, nullptr, 0, 0, xs, gl, os, 1, 1, g + c->w, g + c->b); if (r) rc_fail("deep-supervision head weight gradient"); }
+    if (recompute()) { nn_gn_t gg = gn_out(u, d); int r = nn_conv3d_bwd_weight_x(d->a2, &gg, nullptr, nullptr, 0, 0, xs, gl, os, 1, 1, g + c->w, g + c->b); if (r) rc_fail("side head weight gradient"); }
     else nn_conv3d_bwd_weight(d->s2, xs, gl, os, 1, 1, g + c->w, g + c->b);
     const int dt = nn_storage(u->gout[j]);
     const size_t tb = dt ? nn_mx_bytes(xs, dt) : nx * (GBF ? 2 : 4);
@@ -3324,6 +3337,13 @@ static void ds_bwd(unet *u, int j, float *g) {
     nn_conv3d_bwd_data(gl, os, P(u, c->w), xs, 1, 1, (float *)u->ds_tmp, u->conv_scratch);
     nn_add_into(u->gout[j], u->ds_tmp, xs, GBF);
 }
+static void ds_bwd(unet *u, int j, float *g) { side_head_bwd(u, j, &u->ds[j], u->ds_gl[j], g); }
+const float *unet_emb_logits(const unet *u, shape5 *s) {
+    if (!u->eh_lg) return nullptr;
+    if (s) { *s = u->ls[u->cfg.emb_lev]; s->c = u->cfg.emb_ch; }
+    return u->eh_lg;
+}
+void unet_set_emb_grad(unet *u, const float *gl) { if (u->cfg.emb_lev) u->eh_gl = gl; }
 const float *unet_ds_logits(const unet *u, int j, shape5 *s) {
     if (j < 1 || j > u->cfg.ds_levels || !u->ds_lg[j]) return nullptr;
     if (s) { *s = u->ls[j]; s->c = u->cfg.cout; }
@@ -3422,6 +3442,7 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
     /* decoder, bottom-up in the graph = i from 0 to L-2 */
     for (int i = 0; i < L - 1; i++) {
         if (i >= 1 && i <= u->cfg.ds_levels && u->ds_gl[i]) ds_bwd(u, i, g);   /* deep supervision: gout[i] += the level head's input gradient */
+        if (i == u->cfg.emb_lev && u->eh_gl) side_head_bwd(u, i, &u->eh, u->eh_gl, g);   /* the distillation head: the same */
         shape5 li = u->ls[i];
         shape5 src = u->ls[i + 1]; src.c = UPW(i + 1);
         if (i == 0 && u->l0st) {   /* (level-0 slab stream: B1) */
@@ -4039,7 +4060,8 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.half_res) fprintf(f, ",\"half_res\":%d", u->cfg.half_res);
     if (u->cfg.w4_2d) fprintf(f, ",\"w4_2d\":%d", u->cfg.w4_2d);
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
-    if (u->cfg.attn_blocks) fprintf(f, ",\"attn_blocks\":%d,\"attn_pe\":%d,\"attn_reg\":%d,\"attn_mlp\":%d", u->cfg.attn_blocks, u->cfg.attn_pe, u->cfg.attn_reg, u->tbd.F);
+    if (u->cfg.emb_lev) fprintf(f, ",\"emb_lev\":%d,\"emb_ch\":%d", u->cfg.emb_lev, u->cfg.emb_ch);
+    if (u->cfg.attn_blocks) fprintf(f,",\"attn_blocks\":%d,\"attn_pe\":%d,\"attn_reg\":%d,\"attn_mlp\":%d", u->cfg.attn_blocks, u->cfg.attn_pe, u->cfg.attn_reg, u->tbd.F);
     if (u->cfg.attn_vres) fprintf(f, ",\"attn_vres\":%d", u->cfg.attn_vres);
     if (u->cfg.attn_blocks && u->cfg.attn_axis) fprintf(f, ",\"attn_axis\":%d", u->cfg.attn_axis);
     if (u->cfg.attn_blocks && u->cfg.attn_repeat > 1) fprintf(f, ",\"attn_repeat\":%d", u->cfg.attn_repeat);
@@ -4097,6 +4119,8 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"half_res\":"))) cfg->half_res = atoi(p + 11);
     cfg->w4_2d = (p = strstr(line, "\"w4_2d\":")) ? atoi(p + 8) : 0;
     if ((p = strstr(line, "\"ds_levels\":"))) cfg->ds_levels = atoi(p + 12);
+    cfg->emb_lev = (p = strstr(line, "\"emb_lev\":")) ? atoi(p + 10) : 0;
+    cfg->emb_ch = (p = strstr(line, "\"emb_ch\":")) ? atoi(p + 9) : 0;
     if ((p = strstr(line, "\"attn_blocks\":"))) cfg->attn_blocks = atoi(p + 14);
     if ((p = strstr(line, "\"attn_pe\":"))) cfg->attn_pe = atoi(p + 10);
     if ((p = strstr(line, "\"attn_reg\":"))) cfg->attn_reg = atoi(p + 11);
@@ -4324,6 +4348,7 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
         }
         n += (u->tbn < o->tbn ? u->tbn : o->tbn) + 1;
     }
+    if (u->cfg.emb_lev && u->cfg.emb_lev == oc.emb_lev && u->cfg.emb_ch == oc.emb_ch) n += copy_conv(u, o, &u->eh, &o->eh);   /* the donor's distillation head */
     unet_free(o);
     nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4);
     if (u->muon_mom) nn_zero(u->muon_mom, u->np * 4);

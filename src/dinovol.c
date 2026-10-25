@@ -151,107 +151,12 @@ static int sample_stats(z3 *ct, int cs, int nthreads, dv_stats *S) {
     return rc;
 }
 
-/* ---- sharded zarr v3 writer of [Z][Y][X](C) arrays (zstd inner chunks, index at the end with crc32c), shards written incrementally:
-   compressed chunks are appended as their cells finish and the index is written when the shard closes ---- */
+/* (the sharded zarr v3 writer zw_*: src/embz.c) */
 static int mkdirs(const char *path) {
     char p[1200]; snprintf(p, sizeof p, "%s", path);
     for (char *s = p + 1; *s; s++) if (*s == '/') { *s = 0; if (mkdir(p, 0755) && errno != EEXIST) return -1; *s = '/'; }
     return mkdir(p, 0755) && errno != EEXIST ? -1 : 0;
 }
-int zw_create(zw *w, const char *dir, const int64_t shape[3], int C, const char *dtype, int esize, int shard, int chunk, const char *attrs) {
-    memset(w, 0, sizeof *w);
-    snprintf(w->dir, sizeof w->dir, "%s", dir); memcpy(w->shape, shape, sizeof w->shape); w->C = C; w->esize = esize; w->shard = shard; w->chunk = chunk;
-    w->nc1 = shard / chunk; w->chunk_bytes = (size_t)chunk * chunk * chunk * (C ? C : 1) * esize;
-    w->cbuf = malloc(w->chunk_bytes); w->zcap = ZSTD_compressBound(w->chunk_bytes); w->zbuf = malloc(w->zcap);
-    if (mkdirs(dir)) { fprintf(stderr, "dinovol: cannot create %s\n", dir); return -1; }
-    char path[1200]; snprintf(path, sizeof path, "%s/zarr.json", dir);
-    FILE *f = fopen(path, "w"); if (!f) return -1;
-    char shp[160], csh[160], ich[160];
-    if (C) { snprintf(shp, sizeof shp, "[%lld,%lld,%lld,%d]", (long long)shape[0], (long long)shape[1], (long long)shape[2], C);
-             snprintf(csh, sizeof csh, "[%d,%d,%d,%d]", shard, shard, shard, C); snprintf(ich, sizeof ich, "[%d,%d,%d,%d]", chunk, chunk, chunk, C); }
-    else { snprintf(shp, sizeof shp, "[%lld,%lld,%lld]", (long long)shape[0], (long long)shape[1], (long long)shape[2]);
-           snprintf(csh, sizeof csh, "[%d,%d,%d]", shard, shard, shard); snprintf(ich, sizeof ich, "[%d,%d,%d]", chunk, chunk, chunk); }
-    fprintf(f, "{\"zarr_format\":3,\"node_type\":\"array\",\"shape\":%s,\"data_type\":\"%s\",\"chunk_grid\":{\"name\":\"regular\",\"configuration\":{\"chunk_shape\":%s}},"
-               "\"chunk_key_encoding\":{\"name\":\"default\",\"configuration\":{\"separator\":\"/\"}},\"fill_value\":0,"
-               "\"codecs\":[{\"name\":\"sharding_indexed\",\"configuration\":{\"chunk_shape\":%s,\"codecs\":[{\"name\":\"bytes\",\"configuration\":{\"endian\":\"little\"}},"
-               "{\"name\":\"zstd\",\"configuration\":{\"level\":1,\"checksum\":false}}],\"index_codecs\":[{\"name\":\"bytes\",\"configuration\":{\"endian\":\"little\"}},"
-               "{\"name\":\"crc32c\"}],\"index_location\":\"end\"}}],\"dimension_names\":%s,\"attributes\":%s}\n",
-            shp, dtype, csh, ich, C ? "[\"z\",\"y\",\"x\",\"c\"]" : "[\"z\",\"y\",\"x\"]", attrs ? attrs : "{}");
-    return fclose(f) ? -1 : 0;
-}
-static int zw_close_shard(zw *w, zw_shard *s) {
-    const int nc = w->nc1 * w->nc1 * w->nc1; uint8_t *idx = malloc((size_t)nc * 16 + 4);
-    for (int i = 0; i < nc; i++) { memcpy(idx + (size_t)i * 16, &s->idx[2 * i], 8); memcpy(idx + (size_t)i * 16 + 8, &s->idx[2 * i + 1], 8); }
-    const uint32_t crc = crc32c(0, idx, (size_t)nc * 16); memcpy(idx + (size_t)nc * 16, &crc, 4);
-    int rc = fwrite(idx, 1, (size_t)nc * 16 + 4, s->f) != (size_t)nc * 16 + 4;
-    rc |= fclose(s->f) != 0; free(idx); free(s->idx);
-    char fin[1200]; snprintf(fin, sizeof fin, "%.*s", (int)(strlen(s->path) - 4), s->path);   /* drop ".tmp" */
-    if (!rc && rename(s->path, fin)) rc = 1;
-    if (rc) fprintf(stderr, "dinovol: cannot write %s\n", fin);
-    return rc ? -1 : 0;
-}
-int zw_flush(zw *w) { int rc = 0; for (int i = 0; i < w->nopen; i++) rc |= zw_close_shard(w, &w->open[i]); w->nopen = 0; return rc; }
-static zw_shard *zw_get(zw *w, int64_t sz, int64_t sy, int64_t sx) {
-    for (int i = 0; i < w->nopen; i++) if (w->open[i].sz == sz && w->open[i].sy == sy && w->open[i].sx == sx) return &w->open[i];
-    if (w->nopen == w->cap) { w->cap = w->cap ? 2 * w->cap : 16; w->open = realloc(w->open, w->cap * sizeof *w->open); }
-    zw_shard *s = &w->open[w->nopen];
-    char d[1200]; snprintf(d, sizeof d, "%s/c/%lld/%lld", w->dir, (long long)sz, (long long)sy);
-    if (mkdirs(d)) return nullptr;
-    if (w->C) { snprintf(d, sizeof d, "%s/c/%lld/%lld/%lld", w->dir, (long long)sz, (long long)sy, (long long)sx); if (mkdirs(d)) return nullptr;
-                snprintf(s->path, sizeof s->path, "%s/0.tmp", d); }
-    else snprintf(s->path, sizeof s->path, "%s/%lld.tmp", d, (long long)sx);
-    s->f = fopen(s->path, "wb"); if (!s->f) { fprintf(stderr, "dinovol: cannot write %s\n", s->path); return nullptr; }
-    s->sz = sz; s->sy = sy; s->sx = sx; s->off = 0;
-    const int nc = w->nc1 * w->nc1 * w->nc1; s->idx = malloc((size_t)nc * 16); memset(s->idx, 0xff, (size_t)nc * 16);
-    w->nopen++;
-    return s;
-}
-/* data [nz][ny][nx](C) at output cell (oz, oy, ox), chunk aligned, nz / ny / nx multiples of the chunk; chunks compressed by worker threads */
-typedef struct { const zw *w; const uint8_t *data; int ny, nx, nch, *co; void **zb; size_t *zn; atomic_int next; } zwjob;
-static void *zw_worker(void *a) {
-    zwjob *J = a; const zw *w = J->w; const int c = w->chunk; const size_t vb = (size_t)(w->C ? w->C : 1) * w->esize;
-    uint8_t *cb = malloc(w->chunk_bytes);
-    for (int k; (k = atomic_fetch_add(&J->next, 1)) < J->nch;) {
-        const int az = J->co[3 * k], ay = J->co[3 * k + 1], ax = J->co[3 * k + 2]; int any = 0;
-        for (int z = 0; z < c; z++) for (int y = 0; y < c; y++) {
-            const uint8_t *src = J->data + ((((size_t)(az + z) * J->ny) + ay + y) * J->nx + ax) * vb; uint8_t *dst = cb + (((size_t)z * c) + y) * c * vb;
-            memcpy(dst, src, (size_t)c * vb);
-            for (size_t i = 0; i < (size_t)c * vb && !any; i++) any = dst[i] != 0;
-        }
-        J->zn[k] = 0; J->zb[k] = nullptr;
-        if (!any) continue;
-        J->zb[k] = malloc(w->zcap);
-        const size_t n = ZSTD_compress(J->zb[k], w->zcap, cb, w->chunk_bytes, 1);   /* level 1: int8 embeddings barely compress further at 3 */
-        J->zn[k] = ZSTD_isError(n) ? (size_t)-1 : n;
-    }
-    free(cb); return nullptr;
-}
-int zw_nthreads = 8;
-int zw_put(zw *w, int64_t oz, int64_t oy, int64_t ox, int nz, int ny, int nx, const void *data) {
-    const int c = w->chunk; int nch = 0;
-    int *co = malloc((size_t)(nz / c + 1) * (ny / c + 1) * (nx / c + 1) * 3 * sizeof *co);
-    for (int az = 0; az < nz; az += c) for (int ay = 0; ay < ny; ay += c) for (int ax = 0; ax < nx; ax += c)
-        if (oz + az < w->shape[0] && oy + ay < w->shape[1] && ox + ax < w->shape[2]) { co[3 * nch] = az; co[3 * nch + 1] = ay; co[3 * nch + 2] = ax; nch++; }
-    zwjob J = {.w = w, .data = data, .ny = ny, .nx = nx, .nch = nch, .co = co, .zb = calloc(nch + 1, sizeof(void *)), .zn = calloc(nch + 1, sizeof(size_t))};
-    atomic_init(&J.next, 0);
-    const int nt = nch < zw_nthreads ? nch : zw_nthreads; pthread_t th[64];
-    for (int i = 0; i < nt; i++) pthread_create(&th[i], nullptr, zw_worker, &J);
-    for (int i = 0; i < nt; i++) pthread_join(th[i], nullptr);
-    int rc = 0;
-    for (int k = 0; k < nch && !rc; k++) {
-        if (!J.zb[k]) continue;
-        const int64_t gz = oz + co[3 * k], gy = oy + co[3 * k + 1], gx = ox + co[3 * k + 2];
-        zw_shard *s = zw_get(w, gz / w->shard, gy / w->shard, gx / w->shard);
-        const size_t n = J.zn[k];
-        if (!s || n == (size_t)-1 || fwrite(J.zb[k], 1, n, s->f) != n) { fprintf(stderr, "dinovol: chunk write failed\n"); rc = -1; break; }
-        const int ci = (int)((((gz % w->shard) / c) * w->nc1 + (gy % w->shard) / c) * w->nc1 + (gx % w->shard) / c);
-        s->idx[2 * ci] = s->off; s->idx[2 * ci + 1] = n; s->off += n;
-    }
-    for (int k = 0; k < nch; k++) free(J.zb[k]);
-    free(J.zb); free(J.zn); free(co);
-    return rc;
-}
-void zw_free(zw *w) { free(w->open); free(w->cbuf); free(w->zbuf); }
 /* background writer: puts (owning their buffer) and shard flushes run in submission order on one thread (each put compresses its chunks
    on zw_nthreads workers), so finishing a column overlaps the next column's network; pending bytes are bounded */
 typedef struct aq_job { zw *w; int flush; int64_t oz, oy, ox; int nz, ny, nx; void *data; size_t bytes; struct aq_job *next; } aq_job;

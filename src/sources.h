@@ -127,6 +127,9 @@ typedef struct {
     struct sview *xs_h[4];
     float norm_c, norm_s;   /* optional "norm": {"center": c, "scale": s} (scanprep stats: median, scale): the CT input is (v - c) / s for this
                                source instead of the window's own z-score (norm_s 0: off, the default) */
+    int nemb, emb_level; char *emb_grp[8], *emb_name;   /* optional "emb": {"groups": [DIR, ...] (<= 8), "name": "pca64", "level": L}: unit-vector feature
+                               targets (dinovol-embed / emb-pca zarr groups in global cells of this scan; the embedding voxel = a level-L voxel) for
+                               train --distill (sample_cfg.emb_ch); where several groups cover a cell the first with a vector wins */
 } source;
 
 typedef struct {

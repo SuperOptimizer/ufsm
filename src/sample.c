@@ -9,6 +9,7 @@
 #include "srpair.h"
 #include "view.h"
 #include "scrollaug.h"
+#include "sample_emb.h"
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -222,10 +223,11 @@ static batch alloc_batch(const sample_cfg *c) {
     b.pap = c->pap_head ? halloc((size_t)c->B * p3) : nullptr;
     b.w4 = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
     b.wcomp = c->wind4 ? halloc((size_t)c->B * p3) : nullptr;
+    b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b) { if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b) { if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -2729,6 +2731,12 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         }
     }
     if (c->wind4 && !w4_set) { memset(b->w4 + (size_t)i * p3, 255, p3); memset(b->wcomp + (size_t)i * p3, 255, p3); }
+    if (c->emb_ch) {   /* train --distill: the feature targets through the same symmetry and warp (none on crushed / torn / re-bent windows) */
+        const size_t ge = (size_t)(Pz / c->emb_div) * (P / c->emb_div) * (P / c->emb_div);
+        int8_t *eo = b->emb + (size_t)i * c->emb_ch * ge;
+        if (crushed || torn || curved) memset(eo, 0, ge * c->emb_ch);
+        else if (sample_emb_window(s, c->emb_ch, c->emb_div, l, o, Pz, P, y.perm, y.flip, &spatial, eo)) return -1;
+    }
     PROF_MARK(PS_AUGMENT);
     const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0);
     if (c->gpu_input && (c->sheet || (app && Pz != P))) { fprintf(stderr, "sampler: --gpu-input needs write_x / write_spatial samples (sample_gpu_input_ok)\n"); abort(); }

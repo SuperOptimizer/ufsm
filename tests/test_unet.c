@@ -12,6 +12,7 @@ static float frand(void) { return (float)rand() / RAND_MAX * 2.f - 1.f; }
 
 /* L = sum gy * logits */
 static float *g_dsc[UNET_MAXLEV], *g_dsd[UNET_MAXLEV];   /* UFSM_DS: the deep-supervision levels' loss coefficients (host / device) */
+static float *g_ec;   /* UFSM_EMB: the distillation head outputs' loss coefficients (host) */
 static double loss_of(unet *u, const float *dx, shape5 xs, const float *dgy, size_t nl, float *h) {
     const float *lg = unet_forward(u, dx, xs, 1);
     double sds = 0;   /* + sum_j c_j . (level j's deep-supervision logits) */
@@ -19,6 +20,8 @@ static double loss_of(unet *u, const float *dx, shape5 xs, const float *dgy, siz
         shape5 sj; const float *lj = unet_ds_logits(u, j, &sj); size_t n = shape_numel(sj); float *hj = malloc(n * 4);
         nn_d2h(hj, lj, n * 4); for (size_t i = 0; i < n; i++) sds += (double)g_dsc[j][i] * hj[i]; free(hj);
     }
+    if (g_ec) { shape5 se; const float *le = unet_emb_logits(u, &se); size_t n = shape_numel(se); float *he = malloc(n * 4);
+        nn_d2h(he, le, n * 4); for (size_t i = 0; i < n; i++) sds += (double)g_ec[i] * he[i]; free(he); }
     nn_d2h(h, lg, nl * 4);
     float *gy = malloc(nl * 4);
     nn_d2h(gy, dgy, nl * 4);
@@ -67,6 +70,7 @@ int main(void) {
     cfg.scale_cond = getenv("UFSM_SCALE_COND") ? atoi(getenv("UFSM_SCALE_COND")) : 0;   /* voxel-size conditioning: also check its vector */
     if (getenv("UFSM_ENC_BLOCKS")) { char *t = strdup(getenv("UFSM_ENC_BLOCKS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.enc_blocks[l++] = atoi(q); free(t); }
     cfg.ds_levels = getenv("UFSM_DS") ? atoi(getenv("UFSM_DS")) : 0;
+    if (getenv("UFSM_EMB")) { cfg.emb_lev = 1; cfg.emb_ch = atoi(getenv("UFSM_EMB")); }   /* the distillation head on decoder level 1 */
     if (getenv("UFSM_DEC_CONVS")) for (int l = 0; l < UNET_MAXLEV; l++) cfg.dec_convs[l] = atoi(getenv("UFSM_DEC_CONVS"));   /* one-conv decoders */   /* deep-supervision heads: their gradient path too */
     if (getenv("UFSM_DEC_WIDTHS")) { char *t = strdup(getenv("UFSM_DEC_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.dec_widths[l++] = atoi(q); free(t); }   /* narrower decoder levels */
     unet *u = unet_create(&cfg);
@@ -91,6 +95,11 @@ int main(void) {
         shape5 sj; unet_ds_logits(u, j, &sj); size_t n = shape_numel(sj);
         g_dsc[j] = malloc(n * 4); for (size_t i = 0; i < n; i++) g_dsc[j][i] = frand();
         g_dsd[j] = nn_malloc(n * 4); nn_h2d(g_dsd[j], g_dsc[j], n * 4); unet_set_ds_grad(u, j, g_dsd[j]);
+    }
+    if (cfg.emb_lev) {   /* random coefficients per distillation output = its gradient */
+        shape5 se; if (!unet_emb_logits(u, &se)) { printf("no distillation head outputs\n"); return 1; } size_t n = shape_numel(se);
+        g_ec = malloc(n * 4); for (size_t i = 0; i < n; i++) g_ec[i] = frand();
+        float *de = nn_malloc(n * 4); nn_h2d(de, g_ec, n * 4); unet_set_emb_grad(u, de);
     }
     unet_zero_grad(u);
     unet_backward(u, dgy);
@@ -120,8 +129,9 @@ int main(void) {
     fread(p, 4, np, f); fread(g, 4, np, f); fread(g, 4, np, f); fclose(f);   /* third array = m = g */
     double worst = 0, gmax = 0;
     for (size_t i = 0; i < np; i++) if (fabs(g[i]) > gmax) gmax = fabs(g[i]);
-    int K = getenv("UFSM_DS") ? 120 : 60, bad = 0, KS = cfg.scale_cond ? cfg.widths[0] : 0;
+    int K = getenv("UFSM_DS") || getenv("UFSM_EMB") ? 120 : 60, bad = 0, KS = cfg.scale_cond ? cfg.widths[0] : 0;
     for (int j = 1; j <= cfg.ds_levels; j++) KS += (cfg.dec_widths[j] ? cfg.dec_widths[j] : cfg.widths[j]) * cfg.cout + cfg.cout;   /* and every deep-supervision head parameter (last) */   /* scale_cond: every entry of the conditioning vector (last in the layout) */
+    if (cfg.emb_lev) KS += (cfg.dec_widths[cfg.emb_lev] ? cfg.dec_widths[cfg.emb_lev] : cfg.widths[cfg.emb_lev]) * cfg.emb_ch + cfg.emb_ch;   /* and the distillation head (last) */
     for (int k = 0; k < K + KS; k++) {
         size_t i = k < K ? (size_t)rand() % np : np - (size_t)KS + (size_t)(k - K);
         float o = p[i], eps = 1e-2f;

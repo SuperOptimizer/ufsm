@@ -83,6 +83,10 @@ typedef struct {
     int attn_dco;          /* deformable attention: 1 = also sample a coarse level (the bottleneck values 2x average-pooled; at_dims.dCo) */
     int attn_dinit;        /* deformable attention offsets: 0 grid axes + sphere prior, 1 per-token normal / tangent / axis frame (the scroll-radial
                               direction from unet_set_attn_axis records; the grid axes without them) + points spread along the normal (at_dims.dInit) */
+    int emb_lev, emb_ch;   /* feature distillation (train --distill): a 1^3 head of emb_ch outputs on decoder level emb_lev (1..nlev-2; 0 = none;
+                              params appended last, after everything else); a training forward computes its fp32 outputs (unet_emb_logits),
+                              the trainer's loss gradient comes back through unet_set_emb_grad and joins the level's gradient before its
+                              decoder backward. The main head's outputs do not depend on it (a donor's function is unchanged) */
 } unet_cfg;
 /* the attention stage reads the scroll axis records (unet_set_attn_axis): radial attention, scroll RoPE or normal-frame deformable offsets */
 static inline int unet_cfg_axis(const unet_cfg *c) { return c->attn_blocks > 0 && (c->attn_axis == 1 || c->attn_pe == 3 || (c->attn_deform && c->attn_dinit == 1)); }
@@ -299,7 +303,9 @@ void unet_set_attn_view(unet *u, const uint8_t *view, int n);
 int unet_attn_rays(const unet *u, int *Q, int *Nr, double *coverage);
 void unet_set_wd_nonconv(unet *u, float mul);
 const float *unet_ds_logits(const unet *u, int j, shape5 *s);   /* deep supervision: fp32 logits of decoder level j (1..ds_levels) after a training forward */
-void unet_set_ds_grad(unet *u, int j, const float *gl);         /* their fp32 logit gradient for the next backward (nullptr: none) */   /* weight decay multiplier for GroupNorm / biases / head under Muon and ANVIL (default 0) */
+void unet_set_ds_grad(unet *u, int j, const float *gl);         /* their fp32 logit gradient for the next backward (nullptr: none) */
+const float *unet_emb_logits(const unet *u, shape5 *s);          /* cfg.emb_lev: the distillation head's fp32 outputs [n][emb_ch][d][h][w] after a training forward */
+void unet_set_emb_grad(unet *u, const float *gl);                /* their fp32 gradient for the next backward (nullptr: none) */   /* weight decay multiplier for GroupNorm / biases / head under Muon and ANVIL (default 0) */
 void unet_blend_ema(unet *u, float a);          /* EMA weights := a x live + (1 - a) x EMA (inference: the tail-average blend) */
 void unet_set_head_cb(unet *u, void (*cb)(void *), void *ctx);
 int unet_head_fwd_z(unet *u, int z0, int z1, void *y16);
