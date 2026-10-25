@@ -2223,7 +2223,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     PROF_MARK(PS_LEVEL);
     z3 *ct = source_ct(s, l);
     const z3_meta *m = z3_meta_of(ct);
-    int64_t o[3], n[3] = {Pz, P, P};
+    int64_t o[3], n[3] = {Pz, P, P}, blo[3], bhi[3]; int inbox = 0;
     if (c->cover) memcpy(o, c->cover->tiles[tile_index] + 1, sizeof o);
     else if (cont) { if (sample_chain_next(&s->ax, l, m->shape, Pz, P, cs->mode, cs->dir, c->chain_step, cs->o, o)) return 1; }
     else if (region_ch >= 0) {
@@ -2235,7 +2235,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, nullptr, 0, 1, lo, hi)) return 1;
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (s->nbox) {   /* "boxes": training windows inside them (e.g. the emb-only distillation boxes) */
-        int64_t lo[3], hi[3]; if (box_bounds(s, m, n, l, r, lo, hi)) return 1;
+        int64_t *lo = blo, *hi = bhi; if (box_bounds(s, m, n, l, r, lo, hi)) return 1; inbox = 1;
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (sp->occ[si].n) {   /* draw around a random coarse cell that contains papyrus */
         size_t k = (size_t)(runif(r) * (double)sp->occ[si].n); if (k >= sp->occ[si].n) k = sp->occ[si].n - 1;
@@ -2258,6 +2258,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             o[d] -= o[d] % cs;
             if (o[d] > m->shape[d] - n[d]) o[d] = m->shape[d] - n[d];   /* the last window of an axis may stay unaligned */
             if (o[d] < 0) o[d] = 0;
+            if (inbox && o[d] < blo[d]) o[d] = o[d] + cs <= bhi[d] ? o[d] + cs : blo[d];   /* (a "boxes" window stays in its box) */
         }
     }
     {   /* debugging / tests: UFSM_SAMPLE_AT="z,y,x[;z,y,x...]" (this level's voxels, cycled): replay given windows of the drawn source */
