@@ -1201,6 +1201,12 @@ int cmd_train(int argc, char **argv) {
         if (!(g_ptrunc_tau >= 0 && g_ptrunc_tau < 0.5f) || !(g_ptrunc_kappa >= 0 && g_ptrunc_kappa <= 1)) { fprintf(stderr,"--phase-trunc 0..0.5 turns, --phase-trunc-conf 0..1\n"); return 2; }
         if (g_ptrunc_tau > 0) fprintf(stderr, "robust phase loss: confident (|phasor| >= %g) predictions more than %g turn off their label drop out of the phase mask from step %d\n", g_ptrunc_kappa, g_ptrunc_tau, g_ptrunc_from);
         if (g_dens_code < 0 || g_dens_code > 1 || g_packed_w < 0 || g_packed_w > 255 || !(g_packed_um > 0)) { fprintf(stderr,"--density-code 0|1, --packed-weight 0..255, --packed-um > 0\n"); return 2; }
+        {   /* --density-packed 0: the density plane's loss without the packed weight (mask 0 / 1; the normal planes keep it). The weight pulled
+               voxels the net cannot classify (gaps beside packed sheets) toward the dense target: integrated density over-counted gaps */
+            const int dp = atoi(opt(argc,argv,"--density-packed","1"));
+            if (dp < 0 || dp > 1) { fprintf(stderr,"--density-packed 0|1\n"); return 2; }
+            if (!dp) { nn_set_loss_unit_ch7(6); fprintf(stderr, "density loss: packed weight off (mask 0 / 1; normal planes keep --packed-weight %g)\n", g_packed_w); }
+        }
         /* --pgrad-lambda L (> 0): the phase wavenumber loss (nn_pgrad_slab): the predicted phase's rotation over --pgrad-dist D voxels (2)
            along the true sheet normal against the label's, angular, weighted by the phase mask (packed sheets x --packed-weight);
            punishes a phase that skips sheets, which the per-voxel BCE lets blur. Head-slab path only (task unwrap2, B 1) */

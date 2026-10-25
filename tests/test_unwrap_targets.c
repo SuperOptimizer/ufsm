@@ -132,6 +132,31 @@ int main(void) {
         }
         nn_free(dp); nn_free(dl); nn_free(dg); nn_free(acc); nn_free(seg); nn_free(o2); nn_free(nv); free(qp); free(lg); free(g);
     }
+    {   /* train --density-packed 0 (nn_set_loss_unit_ch7(6)): the 7-plane loss with a weighted mask equals the weighted loss on planes
+           0..5 and the 0 / 1-mask loss on plane 6 (bit for bit: the same kernels, the weight read as 1) */
+        const int Q = 24; const size_t q3 = (size_t)Q * Q * Q;
+        const shape5 s7 = {1, 7, Q, Q, Q};
+        float *lg = malloc(7 * q3 * 4), *ga = malloc(7 * q3 * 4), *gb = malloc(7 * q3 * 4);
+        uint8_t *t = malloc(7 * q3), *m = malloc(q3), *m01 = malloc(q3), w7[7] = {1, 1, 1, 1, 1, 1, 1};
+        unsigned rs = 7;
+        for (size_t i = 0; i < 7 * q3; i++) { rs = rs * 1103515245u + 12345u; lg[i] = ((rs >> 8) % 2001) / 500.f - 2.f; t[i] = (uint8_t)(rs >> 20); }
+        for (size_t i = 0; i < q3; i++) { rs = rs * 1103515245u + 12345u; m[i] = (uint8_t)((rs >> 16) % 9); m01[i] = m[i] ? 1 : 0; }   /* weights 0..8 */
+        float *dl = nn_malloc(7 * q3 * 4), *dg = nn_malloc(7 * q3 * 4), *sc = nn_malloc(nn_loss_scratch(s7));
+        uint8_t *dt = nn_malloc(7 * q3), *dm = nn_malloc(q3), *dw = nn_malloc(7);
+        nn_h2d(dl, lg, 7 * q3 * 4); nn_h2d(dt, t, 7 * q3); nn_h2d(dw, w7, 7);
+        float fa[16], fb[16], fw[16];
+        nn_h2d(dm, m, q3); nn_set_loss_unit_ch7(6); nn_loss_async(dl, dt, dm, dw, s7, 0.f, dg, sc); nn_sync(); nn_d2h(ga, dg, 7 * q3 * 4); nn_loss_fetch(sc, s7, fa);
+        nn_set_loss_unit_ch7(-1); nn_loss_async(dl, dt, dm, dw, s7, 0.f, dg, sc); nn_sync(); nn_d2h(gb, dg, 7 * q3 * 4); nn_loss_fetch(sc, s7, fw);
+        size_t bad6 = 0, diff6 = 0;
+        for (size_t i = 0; i < 6 * q3; i++) bad6 += ga[i] != gb[i];
+        for (size_t i = 6 * q3; i < 7 * q3; i++) diff6 += ga[i] != gb[i];
+        CHECK(bad6 == 0 && diff6 > 0, "unit density mask: planes 0..5 changed at %zu voxels, plane 6 changed at %zu", bad6, diff6);
+        nn_h2d(dm, m01, q3); nn_loss_async(dl, dt, dm, dw, s7, 0.f, dg, sc); nn_sync(); nn_d2h(gb, dg, 7 * q3 * 4); nn_loss_fetch(sc, s7, fb);
+        size_t bad = 0; for (size_t i = 6 * q3; i < 7 * q3; i++) bad += ga[i] != gb[i];
+        CHECK(bad == 0 && fa[6] == fb[6], "unit density mask: plane 6 differs from the 0 / 1-mask loss at %zu voxels (bce %.6f vs %.6f)", bad, fa[6], fb[6]);
+        printf("unit density mask: planes 0..5 unchanged, plane 6 = the 0 / 1-mask loss (bce %.4f weighted -> %.4f unit)\n", fw[6], fa[6]);
+        nn_free(dl); nn_free(dg); nn_free(sc); nn_free(dt); nn_free(dm); nn_free(dw); free(lg); free(ga); free(gb); free(t); free(m); free(m01);
+    }
     if (fails) { fprintf(stderr, "test_unwrap_targets: %d failure(s)\n", fails); return 1; }
     printf("test_unwrap_targets: OK\n");
     return 0;
