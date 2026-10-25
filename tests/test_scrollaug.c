@@ -299,6 +299,80 @@ static void density_tests(const char *dir) {
     drop(a); drop(d); drop(e); sources_free(S);
 }
 
+/* --aug-curv: the re-bend map (crush.h crush_map_rebend), then the sampler */
+static void curv_tests(const char *dir) {
+    {
+        const int P = 64; const double c = .5 * (P - 1), U[3] = {0, .6, .8}, A[3] = {1, 0, 0}, V[3] = {0, -.8, .6};   /* (V = A x U) */
+        crush_cfg z = crush_cfg_default(); z.squash_p = z.bend_p = z.kink_p = 0; z.rotate_deg = 0;
+        double eid = 0, ering = 0, eflat = 0, earc = 0, ecen = 0, emono = 0; int detok = 1, nmask = 0, nmask_front = 0;
+        const double r0s[3] = {300, 120, 0}, r1s[3] = {40, 400, 30};
+        for (int q = 0; q < 3; q++) {
+            const double r0 = r0s[q], r1 = r1s[q];
+            crush_map m; crush_map_init(&m, &z, 5, P, U);
+            crush_map_rebend(&m, U, A, r0, r0 > 0 ? r0 : 1e7);   /* r1 = r0: identity (flat: r1 huge, nearly) */
+            for (int k = 0; k < 200; k++) {
+                const double u[3] = {(k * 37) % P, (k * 11) % P, (k * 23) % P}; double x[3]; crush_pull(&m, u, x, nullptr);
+                for (int d = 0; d < 3; d++) eid = fmax(eid, fabs(x[d] - u[d]) / (r0 > 0 ? 1 : 100));
+            }
+            crush_map_init(&m, &z, 5, P, U); crush_map_rebend(&m, U, A, r0, r1);
+            { const double u[3] = {c, c, c}; double x[3]; crush_pull(&m, u, x, nullptr); for (int d = 0; d < 3; d++) ecen = fmax(ecen, fabs(x[d] - c)); }
+            /* rings about the output axis (c - r1 U) go to rings about the source axis (c - r0 U) with the same offset; flat: to planes */
+            for (int i = -10; i <= 10; i += 5) for (int j = -8; j <= 8; j++) {
+                const double th = j * .05 * (P / r1 < 1 ? P / r1 : 1), R = r1 + i, h = 3 * j;
+                double u[3], x[3];
+                for (int d = 0; d < 3; d++) u[d] = c - r1 * U[d] + R * (cos(th) * U[d] + sin(th) * V[d]) + h * A[d];
+                crush_pull(&m, u, x, nullptr);
+                double w[3]; for (int d = 0; d < 3; d++) w[d] = x[d] - c + (r0 > 0 ? r0 : 0) * U[d];
+                const double wa = w[0] * A[0] + w[1] * A[1] + w[2] * A[2];
+                if (fabs(wa - h) > 1e-6) ering = fmax(ering, 1);
+                if (r0 > 0) { for (int d = 0; d < 3; d++) w[d] -= wa * A[d]; ering = fmax(ering, fabs(sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) - (r0 + i))); }
+                else eflat = fmax(eflat, fabs(w[0] * U[0] + w[1] * U[1] + w[2] * U[2] - i));
+                if (i == 0) {   /* arc length along the centre sheet kept: source arc r0 * angle (flat: s) = r1 th */
+                    double s; if (r0 > 0) { for (int d = 0; d < 3; d++) w[d] -= wa * A[d]; s = r0 * atan2(w[0] * V[0] + w[1] * V[1] + w[2] * V[2], w[0] * U[0] + w[1] * U[1] + w[2] * U[2]); }
+                    else s = w[0] * V[0] + w[1] * V[1] + w[2] * V[2];
+                    earc = fmax(earc, fabs(s - r1 * th));
+                }
+            }
+            /* a pull with det > 0 off the seam; the radial order kept (along U through the centre the map is a shift) */
+            for (int k = 0; k < 300; k++) {
+                const double u[3] = {(k * 7) % P, (k * 13) % P, (k * 29) % P};
+                if (crush_rebend_masked(&m, u, .85)) { nmask++; continue; }
+                double J[3][3]; crush_jacobian(&m, u, J);
+                const double dt = J[0][0] * (J[1][1] * J[2][2] - J[1][2] * J[2][1]) - J[0][1] * (J[1][0] * J[2][2] - J[1][2] * J[2][0]) + J[0][2] * (J[1][0] * J[2][1] - J[1][1] * J[2][0]);
+                detok &= dt > 0;
+            }
+            for (int t = -20; t <= 20; t++) {
+                double u[3], x[3]; for (int d = 0; d < 3; d++) u[d] = c + t * U[d];
+                crush_pull(&m, u, x, nullptr); for (int d = 0; d < 3; d++) emono = fmax(emono, fabs(x[d] - u[d]));
+            }
+            for (int k = 0; k < 100; k++) { double u[3]; for (int d = 0; d < 3; d++) u[d] = c + (r1 - 5) * U[d] * (k % 2 ? 1 : 0); nmask_front += crush_rebend_masked(&m, u, .85); }
+        }
+        printf("scrollaug: curv map: identity at r1 = r0 %.2g, centre %.2g, rings %.2g, flat planes %.2g, arc length %.2g, radial line %.2g voxels; %d seam voxels of 900 (front %d)\n",
+               eid, ecen, ering, eflat, earc, emono, nmask, nmask_front);
+        check("curv map: r1 = r0 is the identity, the centre fixed", eid < 1e-6 && ecen < 1e-6);
+        check("curv map: rings about the moved axis -> rings about the source axis (radial spacing kept; flat: planes), arc length kept", ering < 1e-6 && eflat < 1e-6 && earc < 1e-6);
+        check("curv map: det > 0 off the seam, the radial line through the centre unmoved, the seam only behind the axis", detok && emono < 1e-6 && nmask > 0 && nmask_front == 0);
+    }
+    char p[1400]; snprintf(p, sizeof p, "%s/sources.json", dir); sources *S = sources_load(p); assert(S);
+    const int PW = 32;   /* (the fixture scroll: radius 60 at level 1; bent windows need the axis >= 0.75 P away) */ const size_t p3 = (size_t)PW * PW * PW;
+    sample_cfg c = base_cfg(PW); c.snap = 0; c.symmetry_p = 0; c.rotate_p = 0; c.elastic_p = 0; c.zoom_p = 0; c.affine_p = 0; c.wind4_min = 100;   /* (6^3 tiles at P 32) */
+    snap a[NB], d[NB], e[NB];
+    sampler *sp = sampler_start(S, &c); assert(sp); take(sp, a, p3); const uint64_t n0 = sampler_aug_count(sp, AUGN_CURV); sampler_stop(sp);
+    sample_cfg c1 = c; c1.curv_p = 1;
+    sp = sampler_start(S, &c1); assert(sp); take(sp, d, p3); const uint64_t n1 = sampler_aug_count(sp, AUGN_CURV); sampler_stop(sp);
+    sp = sampler_start(S, &c1); assert(sp); take(sp, e, p3); sampler_stop(sp);
+    size_t in_d = 0, big_d = 0;
+    for (int i = 0; i < NB; i++) for (size_t k = 0; k < p3; k++) {
+        if (k + 1 >= p3 || k % PW == PW - 1 || d[i].w4[k] == 255 || d[i].w4[k + 1] == 255 || d[i].wc[k] != d[i].wc[k + 1]) continue;
+        in_d++; big_d += abs(w4diff(d[i].w4[k + 1], d[i].w4[k])) >= 19;
+    }
+    printf("scrollaug: curv sampler: %llu bent; %zu in-component pairs, %zu with >= 0.3 turn w4 steps\n", (unsigned long long)n1, in_d, big_d);
+    check("--aug-curv 0: never applied", n0 == 0);
+    check("--aug-curv 1: windows bent, deterministic", n1 >= 2 && same(d, e, p3));
+    check("--aug-curv: w4 smooth inside each component (< 1e-4 of the pairs step >= 0.3 turn)", in_d > p3 && big_d * 10000 < in_d);
+    drop(a); drop(d); drop(e); sources_free(S);
+}
+
 int main(int argc, char **argv) {
     char tmpd[] = "/tmp/ufsm-scrollaug-XXXXXX"; const char *dir = argc > 1 ? argv[1] : mkdtemp(tmpd);
     if (!dir || make_wind_fixture(dir, 256, 2.f)) { fprintf(stderr, "fixture failed\n"); return 1; }
@@ -306,6 +380,7 @@ int main(int argc, char **argv) {
     tear_tests(dir);
     delam_tests(dir);
     density_tests(dir);
+    curv_tests(dir);
     if (argc < 2) { char cmd[1500]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {} }
     printf(failed ? "scrollaug: %d FAILED\n" : "scrollaug: all passed\n", failed);
     return failed != 0;

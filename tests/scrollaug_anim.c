@@ -47,15 +47,15 @@ int main(int argc, char **argv) {
     const int fps = atoi(opt(argc, argv, "--fps", "12")), seam = atoi(opt(argc, argv, "--seam", "-1")), tear = !strcmp(argv[3], "tear");
     uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "1"));
     const char *still = opt(argc, argv, "--still", nullptr); g_crop = opt(argc, argv, "--crop", nullptr);
-    const int delam = !strcmp(argv[3], "delam"), density = !strcmp(argv[3], "density");
-    if (!tear && !delam && !density && strcmp(argv[3], "xscan")) { fprintf(stderr, "scrollaug_anim: tear, delam, density or xscan\n"); return 2; }
+    const int delam = !strcmp(argv[3], "delam"), density = !strcmp(argv[3], "density"), curv = !strcmp(argv[3], "curv");
+    if (!tear && !delam && !density && !curv && strcmp(argv[3], "xscan")) { fprintf(stderr, "scrollaug_anim: tear, delam, density, curv or xscan\n"); return 2; }
     int64_t o[3]; { long long a, b, c; if (sscanf(argv[4], "%lld,%lld,%lld", &a, &b, &c) != 3) return 2; o[0] = a; o[1] = b; o[2] = c; }
     sources *S = sources_load(argv[1]); if (!S) return 1;
     source *s = &S->src[0]; z3 *ct = source_ct(s, l);
     if (!ct || !s->phase) { fprintf(stderr, "scrollaug_anim: no level %d CT or stored phase\n", l); return 1; }
     const int psh = s->phase_level - l; const size_t p3 = (size_t)P * P * P;
     make_pal();
-    const int np = tear || delam || density ? 3 : 2, W = np * P + (np - 1) * 4, H = P + 14;
+    const int np = tear || delam || density || curv ? 3 : 2, W = np * P + (np - 1) * 4, H = P + 14;
     uint8_t *ix = malloc((size_t)W * H); uint16_t *tree = malloc((size_t)4096 * 256 * sizeof *tree);
     FILE *f = fopen(argv[2], "wb"); if (!ix || !tree || !f) return 1;
     gif_head(f, W, H);
@@ -96,6 +96,49 @@ int main(int argc, char **argv) {
             }
         }
         free(ctp); free(php);
+    } else if (curv) {   /* --aug-curv: the first seed from --seed tightening to r1 <= r0 / --tight (default 3; --tight 0: a flattening one),
+                            the curvature 1 / r0 -> 1 / r1 swept 0 -> 1 -> 0 (crush_map_scaled) */
+        const size_t ab = (size_t)512 << 20; uint8_t *arena = malloc(ab);
+        crush_cache cc; if (!arena || crush_cache_init(&cc, arena, ab)) return 1;
+        crush_layer Lph = {s->phase, CRUSH_PHASE, 0, PHASE_UNKNOWN, 0, {0, 0, 0}, nullptr}; crush_layer_phase(&Lph, psh);
+        const double tight = atof(opt(argc, argv, "--tight", "3"));
+        crush_map m; int tries = 0, ok = 0; const crush_cfg base = crush_cfg_default();
+        for (; tries < 1000 && !ok; tries++) {
+            rng rr; rseed(&rr, seed + (uint64_t)tries);
+            const uint64_t sd = rnext(&rr); const double uk = runif(&rr), um = runif(&rr), us = runif(&rr);
+            const int mk = curv_map(&base, s, l, o, P, &cc, &Lph, sd, uk, um, us, &m);
+            if (mk < 0) return 1;
+            if (!mk) { fprintf(stderr, "curv: window skipped (axis within 0.75 P)\n"); return 1; }
+            ok = tight > 0 ? m.r1 * tight <= (m.r0 > 0 ? m.r0 : 8. * P) : m.r1 > 2 * m.r0;
+        }
+        const double vox = s->um * (double)(1 << l);
+        printf("%s: curv seed %llu: r0 %.0f voxels (%.2f mm) -> r1 %.0f (%.2f mm); axis %.2f %.2f %.2f, radial %.2f %.2f %.2f\n", argv[2], (unsigned long long)(seed + (uint64_t)tries - 1),
+               m.r0, m.r0 * vox / 1000, m.r1, m.r1 * vox / 1000, m.rA[0], m.rA[1], m.rA[2], m.rU[0], m.rU[1], m.rU[2]);
+        const int iso = s->iso > 0 ? s->iso : 0; (void)iso;
+        for (int fr = 0; fr < F; fr++) {
+            const double u = F > 1 ? fr / (double)(F - 1) : 1, a = smooth(1 - fabs(2 * u - 1));
+            crush_map ms; if (crush_map_scaled(&ms, &m, a)) return 1;
+            crush_layer L[2] = {{ct, CRUSH_LINEAR, 0, 0, 1, {0, 0, 0}, cto}, Lph}; L[1].out = pho;
+            if (crush_window(&ms, &cc, o, L, 2)) { fprintf(stderr, "pull failed\n"); return 1; }
+            for (int zz = 0; zz < P; zz++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
+                const size_t k = ((size_t)zz * P + y) * P + x; const double uu[3] = {zz, y, x};
+                if (ms.rb && ms.r1 < .9 * P && crush_rebend_masked(&ms, uu, .85)) { cto[k] = 0; pho[k] = PHASE_UNKNOWN; }
+            }
+            if (s->phase_sign < 0) phase_negate(pho, p3);
+            for (size_t k = 0; k < p3; k++) if (!cto[k]) pho[k] = PHASE_UNKNOWN;
+            if (band_wind4_tiled(pho, P, P, P, (P + 5) / 6, 80, 512, 1, w4o, wco, nullptr) < 0) return 1;
+            uint8_t *rowb = malloc((size_t)W * P); memset(rowb, gray_ix(40), (size_t)W * P);
+            panel(rowb, W, 0, P, cto, nullptr, 0, nullptr); panel(rowb, W, P + 4, P, cto, pho, 1, nullptr); panel(rowb, W, 2 * (P + 4), P, cto, w4o, 2, wco);
+            memcpy(ix, rowb, (size_t)W * P); free(rowb);
+            for (size_t k = (size_t)W * P; k < (size_t)W * (P + 4); k++) ix[k] = gray_ix(40);
+            bar(ix, W, P + 4, a, .85);
+            gif_frame(f, ix, W, H, delay, tree);
+            if (still && (fr == 0 || fr == F / 2)) {
+                uint8_t *rgb = malloc((size_t)W * H * 3); for (size_t k = 0; k < (size_t)W * H; k++) memcpy(rgb + 3 * k, pal[ix[k]], 3);
+                char p[1200]; snprintf(p, sizeof p, "%s-t%d.jpg", still, fr ? 1 : 0); jpeg_write_rgb(p, W, H, rgb, 90); still_crop(p, rgb, W, P, np); free(rgb);
+            }
+        }
+        crush_cache_free(&cc); free(arena);
     } else if (density) {   /* --aug-sheet-density on the plain window: the strengths swept 0 -> 1 -> 0 (labels untouched) */
         const int64_t nn[3] = {P, P, P};
         uint8_t *ct0 = malloc(p3);

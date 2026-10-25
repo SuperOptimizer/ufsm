@@ -105,6 +105,7 @@ void crush_map_init(crush_map *m, const crush_cfg *cfg, uint64_t seed, int P, co
     m->half = 4 * ceil(fmax(fabs(m->srange[0]), fabs(m->srange[1])) + 4) + 24;   /* (columns covering s' at 1 / 4 of the source: papyrus 1, voids >= 0.05) */
 }
 void crush_footprint(const crush_map *m, double ext[3]) {
+    if (m->rb) { for (int d = 0; d < 3; d++) ext[d] = m->rext[d]; return; }   /* (stage R alone) */
     const double sg = m->half + fmax(fabs(m->srange[0]), fabs(m->srange[1])) + 4;   /* (past a column's end F continues with slope 1) */
     for (int d = 0; d < 3; d++) ext[d] = m->T[0] * fabs(m->t1[d]) + m->T[1] * fabs(m->t2[d]) + sg * fabs(m->n[d]) + 3;
 }
@@ -120,6 +121,10 @@ int crush_map_scaled(crush_map *out, const crush_map *m, double t) {
     out->sq_k = out->det = kt;
     for (int i = 0; i < 2; i++) out->bA[i] = t * m->bA[i];
     out->kS = t * m->kS; out->j0 = 1 - (1 - m->j0) * t;
+    if (m->rb) {   /* curvature 1 / r0 -> 1 / r1 linearly in t */
+        const double k0 = m->r0 > 0 ? 1 / m->r0 : 0, kt = k0 + t * (1 / m->r1 - k0);
+        if (fabs(kt - k0) < 1e-12) out->rb = 0; else crush_map_rebend(out, m->rU, m->rA, m->r0, 1 / kt);
+    }
     if (m->tab) {
         const size_t nc = (size_t)m->G[0] * m->G[1];
         if (!(out->tab = malloc(nc * m->ns * 2 * sizeof *out->tab))) return -1;
@@ -273,7 +278,43 @@ int crush_map_columns(crush_map *m, double jlo, double jhi, uint64_t seed, crush
     return 0;
 }
 
-void crush_pull(const crush_map *m, const double u[3], double x[3], double *jdet) {
+static void cr_rebend(const crush_map *m, const double u[3], double x[3]) {
+    double v[3] = {u[0] - m->c, u[1] - m->c, u[2] - m->c};
+    const double h = dot3(v, m->rA);
+    for (int d = 0; d < 3; d++) v[d] -= h * m->rA[d];
+    const double pu = dot3(v, m->rU) + m->r1, pv = dot3(v, m->rV), rho = hypot(pu, pv), th = atan2(pv, pu);
+    double a, s;
+    if (m->r0 > 0) { const double R = rho - m->r1 + m->r0, t = th * m->r1 / m->r0; a = R * cos(t) - m->r0; s = R * sin(t); }
+    else { a = rho - m->r1; s = m->r1 * th; }
+    for (int d = 0; d < 3; d++) x[d] = m->c + a * m->rU[d] + s * m->rV[d] + h * m->rA[d];
+}
+int crush_rebend_masked(const crush_map *m, const double u[3], double frac) {
+    if (!m->rb) return 0;
+    double v[3] = {u[0] - m->c, u[1] - m->c, u[2] - m->c};
+    const double h = dot3(v, m->rA);
+    for (int d = 0; d < 3; d++) v[d] -= h * m->rA[d];
+    const double pu = dot3(v, m->rU) + m->r1, pv = dot3(v, m->rV);
+    return pu < 0 && fabs(atan2(pv, pu)) > frac * M_PI;
+}
+void crush_map_rebend(crush_map *m, const double U[3], const double A[3], double r0, double r1) {
+    m->rb = 1; m->r0 = r0; m->r1 = r1;
+    memcpy(m->rA, A, sizeof m->rA); unit3(m->rA);
+    const double ua = dot3(U, m->rA); for (int d = 0; d < 3; d++) m->rU[d] = U[d] - ua * m->rA[d];
+    unit3(m->rU);
+    m->rV[0] = m->rA[1] * m->rU[2] - m->rA[2] * m->rU[1]; m->rV[1] = m->rA[2] * m->rU[0] - m->rA[0] * m->rU[2]; m->rV[2] = m->rA[0] * m->rU[1] - m->rA[1] * m->rU[0];
+    /* the footprint: the pull over a 33^3 lattice of the output cube (smooth between nodes; the seam's far side is bounded too) */
+    double e[3] = {0, 0, 0}; const int G = 32;
+    for (int i = 0; i <= G; i++) for (int j = 0; j <= G; j++) for (int k = 0; k <= G; k++) {
+        const double u[3] = {(m->P - 1) * i / (double)G, (m->P - 1) * j / (double)G, (m->P - 1) * k / (double)G}; double x[3];
+        cr_rebend(m, u, x);
+        for (int d = 0; d < 3; d++) e[d] = fmax(e[d], fabs(x[d] - m->c));
+    }
+    for (int d = 0; d < 3; d++) m->rext[d] = e[d] + .02 * m->P + 4;
+}
+
+void crush_pull(const crush_map *m, const double u_[3], double x[3], double *jdet) {
+    double ub[3]; const double *u = u_;
+    if (m->rb) { cr_rebend(m, u_, ub); u = ub; }
     const double r[3] = {u[0] - m->c, u[1] - m->c, u[2] - m->c}; double q[3];
     for (int i = 0; i < 3; i++) q[i] = m->M[i][0] * r[0] + m->M[i][1] * r[1] + m->M[i][2] * r[2];
     const double a1 = dot3(q, m->t1), a2 = dot3(q, m->t2), s = dot3(q, m->n) + cr_bend(m, a1, a2);

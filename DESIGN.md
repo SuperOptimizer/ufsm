@@ -553,6 +553,28 @@ Goal: sheets that split into layers (a void opening inside a sheet, the outer la
   24 windows). Render: build/scrollaug_anim ... delam (strength swept 0 -> 1 -> 0, w4 component borders drawn);
   ~/ufsm-data/scrollaug/anim/delam.gif.
 
+## Curvature: train --aug-curv P (2026-10-24)
+Goal: the tight inner core and near-flat outer wraps from any wrap's windows (the training boxes see few radii).
+- Same windows as --aug-crush / tear / delam (stored phase, side 2, cube, no target channels); exclusive with them; xscan skips bent
+  windows; the ordinary spatial warp still follows.
+- src/crush.[ch] stage R (`crush_map_rebend`), pulled through the crush tile cache (`crush_window`: CT trilinear, phase as the
+  phasor mean, ignore mask nearest), so the footprint can be wider than the window at no RAM cost. In the plane normal to the axis A
+  an output point at radius rho' and angle th' about the moved axis (c - r1 U) pulls from radius rho' - r1 + r0 and angle th' r1 / r0
+  about the source centre (c - r0 U); the coordinate along A is kept. Radial spacing (the wrap pitch) and arc length along the centre
+  sheet are kept, the curvature there goes 1 / r0 -> 1 / r1; smooth and invertible for |th'| < pi.
+- sample.c `curv_map` / `curv_draw`: r0 the distance to the source axis (its tilt from +-4 windows: hand-placed control points
+  wiggle ~30 deg over one window on Paris 4), U the window's phase normal oriented outward (the axis direction alone was ~30 deg off
+  the sheet normal on Paris 4 and turned the rings into spirals); skipped when the axis is within 0.75 P. Without an axis the sheets
+  are taken as flat (r0 = inf, U the phase normal, either sign). Tighter 2 in 3: r1 log-uniform 0.6 P .. 0.9 r0 (flat: .. 8 P);
+  else flatter: r0 .. 4 r0. Below r1 0.6 P the whole core of rings maps onto a short source arc and any off-centre sheet becomes a
+  spiral into the axis (tried 0.25 P on Paris 4). The seam behind an output axis inside the window (|th'| > 0.85 pi): CT 0, phase
+  unknown. The radial input channels follow the moved axis (g_crush.cax overrides cyz / cxz).
+- Tests (tests/test_scrollaug.c): r1 = r0 identity, the centre fixed; rings about the moved axis -> rings about the source axis with
+  the same offset (flat: planes), arc length kept, det > 0 off the seam, the radial line through the centre unmoved, the seam only
+  behind the axis; default off, p 1 deterministic, w4 smooth inside components (P 32 windows: the fixture's scroll is small).
+- Cost P512 one core (4 Paris 4 windows, p 1): ctread 0.95 -> 5.6 s per window (tile decodes over the footprint, the pull); --aug-crush
+  is 20 s there. Render: scrollaug_anim ... curv [--tight 3 | 0 flattening]; ~/ufsm-data/scrollaug/anim/curv.gif, curv-flat.gif.
+
 ## Sheet density: train --aug-sheet-density P (2026-10-24)
 Goal: wraps of different brightness (carbonisation, compression, papyrus quality vary per wrap) and slow along-sheet variation.
 - Windows with a stored phase (level shift 1, or 0 direct), not zoomed out, augment on; applied after crush / tear / delam / xscan

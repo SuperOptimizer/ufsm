@@ -1852,10 +1852,11 @@ int sample_chain_next(const axis *ax, int l, const int64_t shape[3], int Pz, int
    mask) wait in pooled buffers for the stored-phase step (draw() returns them after every draw). */
 /* the window's pulled labels (--aug-crush, --aug-tear): ph / ig the phase and its ignore mask; --aug-tear: w4 / wc the winding mod 4 and
    its component unwrapped before the tear (ph then already masked by ig: pre) */
-static _Thread_local struct { uint8_t *ph, *ig, *w4, *wc; int pre; size_t n; double k, j0; int fine; uint64_t tiles; sa_tear tear; sa_delam delam; } g_crush;   /* (k .. tear: the last map, diagnostics) */
+static _Thread_local struct { uint8_t *ph, *ig, *w4, *wc; int pre; size_t n; double k, j0; int fine; uint64_t tiles; sa_tear tear; sa_delam delam;
+                              int cax; double ca[3], cA[3]; double r0, r1; } g_crush;   /* (cax: --aug-curv moved the axis: ca a point on it, cA its direction, window coordinates) */   /* (k .. tear: the last map, diagnostics) */
 static void crush_release(void) {
     tp_put(g_crush.ph, g_crush.n + 64); tp_put(g_crush.ig, g_crush.n); tp_put(g_crush.w4, g_crush.n); tp_put(g_crush.wc, g_crush.n);
-    g_crush.ph = g_crush.ig = g_crush.w4 = g_crush.wc = nullptr; g_crush.pre = 0;
+    g_crush.ph = g_crush.ig = g_crush.w4 = g_crush.wc = nullptr; g_crush.pre = 0; g_crush.cax = 0;
 }
 typedef struct { crush_cache *cc; const crush_layer *L; const int64_t *o; } crush_ctu;
 static double crush_ct_at(void *ud, const double x[3]) {
@@ -2028,6 +2029,104 @@ static int delam_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, 
     atomic_fetch_add(&sp->augn[AUGN_DELAM], 1);
     return 1;
 }
+/* --aug-curv: ctu (P^3) and g_crush (the phase, its ignore mask) pulled through a re-bend about a moved axis (crush.h
+   crush_map_rebend: stage R alone, through the crush tile cache, so the footprint may be wider than the window). The source's axis
+   gives r0 and the radial direction; without one the sheets are taken as flat, normal to the window's phase normal. Tighter (r1
+   log-uniform P / 4 .. 0.9 r0, or 8 P when flat) 2 in 3, else flatter (r0 .. 4 r0); skipped when the source axis lies within
+   0.75 P of the window centre. Voxels near the seam behind an output axis inside the window: CT 0, phase unknown. The moved axis
+   feeds the radial input channels (g_crush.cax). 1 bent, 0 not, -1 error. */
+/* the --aug-curv map of window o (stage R alone) from the draws u_kind / u_mag / u_sign: 1 made, 0 skipped (axis near the window, too
+   little phase), -1 read error. cc: an initialised cache (the flat case reads the phase normal through it). */
+static int curv_map(const crush_cfg *base, source *s, int l, const int64_t o[3], int P, crush_cache *cc, const crush_layer *Lph, uint64_t seed,
+                    double u_kind, double u_mag, double u_sign, crush_map *m) {
+    const double cw = .5 * (P - 1);
+    double U[3], A[3] = {1, 0, 0}, r0 = 0;
+    if (s->ax.n > 0) {
+        const double sc = (double)(1 << l); double cy, cx, ya, xa, yb, xb;
+        axis_at(&s->ax, ((double)o[0] + cw) * sc, &cy, &cx);
+        /* the tilt over +-4 windows (hand-placed control points wiggle by ~30 deg over one window on Paris 4) */
+        axis_at(&s->ax, ((double)o[0] + cw - 4. * P) * sc, &ya, &xa); axis_at(&s->ax, ((double)o[0] + cw + 4. * P) * sc, &yb, &xb);
+        A[0] = 8. * P; A[1] = (yb - ya) / sc; A[2] = (xb - xa) / sc;
+        const double la = sqrt(A[0] * A[0] + A[1] * A[1] + A[2] * A[2]); for (int d = 0; d < 3; d++) A[d] /= la;
+        double w[3] = {0, (double)o[1] + cw - cy / sc, (double)o[2] + cw - cx / sc};
+        const double wa = w[0] * A[0] + w[1] * A[1] + w[2] * A[2]; for (int d = 0; d < 3; d++) w[d] -= wa * A[d];
+        r0 = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+        if (r0 < .75 * P) return 0;   /* (the axis in or near the window: its own spiral) */
+        for (int d = 0; d < 3; d++) U[d] = w[d] / r0;
+        /* the local sheets' normal (outward) when the phase gives one: the rings stay tangent to the sheets through the centre (the
+           hand-placed axis direction is ~30 deg off the sheet normal on Paris 4, and the rings then cross the sheets: spirals) */
+        double n[3];
+        if (crush_phase_normal(cc, Lph, o, P, U, n) >= 32) {
+            const double sg = n[0] * U[0] + n[1] * U[1] + n[2] * U[2] < 0 ? -1 : 1, na = n[0] * A[0] + n[1] * A[1] + n[2] * A[2];
+            double q[3]; for (int d = 0; d < 3; d++) q[d] = sg * (n[d] - na * A[d]);
+            const double lq = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]);
+            if (lq > .5) for (int d = 0; d < 3; d++) U[d] = q[d] / lq;
+        } else if (cc->err) return -1;
+    } else {   /* flat: the phase normal, either sign; the bend axis the scan axis (z) made perpendicular to it */
+        double n[3];
+        if (crush_phase_normal(cc, Lph, o, P, nullptr, n) < 32) return cc->err ? -1 : 0;
+        for (int d = 0; d < 3; d++) U[d] = u_sign < .5 ? -n[d] : n[d];
+        if (fabs(U[0]) > .9) { A[0] = 0; A[2] = 1; }
+        const double ua = U[0] * A[0] + U[1] * A[1] + U[2] * A[2]; for (int d = 0; d < 3; d++) A[d] -= ua * U[d];
+    }
+    double r1;
+    if (r0 == 0 || u_kind < 2. / 3) { const double lo = .6 * P, hi = r0 > 0 ? .9 * r0 : 8. * P; r1 = lo * pow(hi / lo, u_mag); }
+    else r1 = r0 * pow(4., u_mag);
+    crush_cfg z = *base; z.squash_p = z.bend_p = z.kink_p = 0; z.rotate_deg = 0;
+    crush_map_init(m, &z, seed, P, U); crush_map_rebend(m, U, A, r0, r1);
+    return 1;
+}
+static int curv_draw_(sampler *sp, source *s, int l, const int64_t o[3], int P, int pshift, rng *r, uint8_t *arena, size_t abytes, uint8_t *ctu) {
+    const sample_cfg *c = &sp->cfg; const size_t p3 = (size_t)P * P * P; const double cw = .5 * (P - 1);
+    const uint64_t seed = rnext(r); const double u_kind = runif(r), u_mag = runif(r), u_sign = runif(r);
+    crush_cache cc;
+    crush_layer Lct = {source_ct(s, l), CRUSH_LINEAR, 0, 0, 1, {0, 0, 0}, ctu}, Lph = {s->phase, CRUSH_PHASE, 0, PHASE_UNKNOWN, 0, {0, 0, 0}, nullptr};
+    crush_layer_phase(&Lph, pshift);
+    if (crush_cache_init(&cc, arena, abytes)) return 0;
+    crush_map m;
+    const int mk = curv_map(&c->crush, s, l, o, P, &cc, &Lph, seed, u_kind, u_mag, u_sign, &m);
+    if (mk <= 0) { crush_cache_free(&cc); return mk; }
+    const double r0 = m.r0, r1 = m.r1;
+    double ext[3]; crush_footprint(&m, ext);
+    int64_t lo[3], nn[3];
+    for (int d = 0; d < 3; d++) { lo[d] = o[d] + (int64_t)floor(cw - ext[d]); nn[d] = (int64_t)ceil(2 * ext[d]) + 2; }
+    if (training_hits_holdout_box(sp, s, lo, nn, l)) { crush_cache_free(&cc); return 0; }
+    uint8_t *ph = tp_get(p3 + 64, 0), *ig = s->phase_ign ? tp_get(p3, 0) : nullptr;
+    g_crush.ph = ph; g_crush.ig = ig; g_crush.n = p3;
+    if (!ph || (s->phase_ign && !ig)) { crush_cache_free(&cc); return -1; }
+    crush_layer L[3]; int nl = 0;
+    L[nl++] = Lct; Lph.out = ph; L[nl++] = Lph;
+    if (ig) { crush_layer g = {s->phase_ign, CRUSH_NEAREST, 0, 0, 1, {0, 0, 0}, ig}; crush_layer_phase(&g, pshift); L[nl++] = g; }
+    const int rc = crush_window(&m, &cc, o, L, nl);
+    g_crush.tiles = cc.decoded; crush_cache_free(&cc);
+    if (rc) return -1;
+    memset(ph + p3, PHASE_UNKNOWN, 64);
+    if (r1 < .9 * P) {   /* (an output axis within reach of the window: blank the seam behind it, crush_rebend_masked(.85) row by row:
+                            pu, pv linear along x, masked where pu < 0 and |pv| < tan(.15 pi) (-pu)) */
+        const double tq = tan(.15 * M_PI), mc = m.c;
+        for (int zz = 0; zz < P; zz++) for (int y = 0; y < P; y++) {
+            const double bu = (zz - mc) * m.rU[0] + (y - mc) * m.rU[1] - mc * m.rU[2] + r1, bv = (zz - mc) * m.rV[0] + (y - mc) * m.rV[1] - mc * m.rV[2];
+            if (bu >= 0 && bu + m.rU[2] * (P - 1) >= 0) continue;
+            const size_t k0 = ((size_t)zz * P + y) * P;
+            for (int x = 0; x < P; x++) {
+                const double pu = bu + m.rU[2] * x, pv = bv + m.rV[2] * x;
+                if (pu < 0 && fabs(pv) < -tq * pu) { ctu[k0 + x] = 0; ph[k0 + x] = PHASE_UNKNOWN; }
+            }
+        }
+    }
+    g_crush.r0 = r0; g_crush.r1 = r1;
+    if (s->ax.n > 0) { g_crush.cax = 1; for (int d = 0; d < 3; d++) { g_crush.ca[d] = cw - r1 * m.rU[d]; g_crush.cA[d] = m.rA[d]; } }
+    atomic_fetch_add(&sp->augn[AUGN_CURV], 1);
+    return 1;
+}
+static int curv_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, int pshift, rng *r, uint8_t *arena, size_t abytes, uint8_t *ctu) {
+    const size_t own = (size_t)48 << 20;
+    if (abytes >= own) return curv_draw_(sp, s, l, o, P, pshift, r, arena, abytes, ctu);
+    uint8_t *a = tp_get(own, 0); if (!a) return -1;
+    const int rc = curv_draw_(sp, s, l, o, P, pshift, r, a, own, ctu);
+    tp_put(a, own);
+    return rc;
+}
 /* --aug-sheet-density: the window's CT (Pz x P x P) re-lit per wrap from its stored phase (the pulled one after crush / tear / delam);
    returns 1 applied, 0 no usable phase, -1 error */
 static int density_draw(sampler *sp, source *s, const int64_t o[3], int Pz, int P, int pshift, rng *r, uint8_t *ctu) {
@@ -2053,7 +2152,7 @@ static int density_draw(sampler *sp, source *s, const int64_t o[3], int Pz, int 
 static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs);
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
     const int rc = draw_(sp, b, i, r, xtmp, ttmp, big, tile_index, noise_state, cs);
-    if (g_crush.ph || g_crush.ig || g_crush.w4 || g_crush.wc) crush_release();
+    if (g_crush.ph || g_crush.ig || g_crush.w4 || g_crush.wc || g_crush.cax) crush_release();
     if (rc == 0 && b->chid && (!cs || cs->id < 0)) { b->chid[i] = -1; b->chidx[i] = 0; b->choff[3 * i] = b->choff[3 * i + 1] = b->choff[3 * i + 2] = 0.f; }
     return rc;
 }
@@ -2155,8 +2254,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     PROF_MARK(PS_PROBE);
     /* CT (--aug-crush: a crushed window of a stored-phase source without target channels, pulled through the map instead) */
     uint8_t *ctu = big;
-    int crushed = 0, torn = 0, delam = 0;
-    if ((c->crush.p > 0 || c->tear_p > 0 || c->delam_p > 0) && c->augment && c->geometry_augment && s->geometry && !chained && !c->view_P && !c->cover && !c->holdout && Pz == P &&
+    int crushed = 0, torn = 0, delam = 0, curved = 0;
+    if ((c->crush.p > 0 || c->tear_p > 0 || c->delam_p > 0 || c->curv_p > 0) && c->augment && c->geometry_augment && s->geometry && !chained && !c->view_P && !c->cover && !c->holdout && Pz == P &&
         region_ch < 0 && zoom_out == 0 && c->side == 2 && !c->band && !c->cond && !c->sheet && !c->papyrus && !c->pap_head && !c->aux &&
         !c->phase_dense && s->phase) {
         const int psh = s->phase_level - l;
@@ -2165,14 +2264,15 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (ok && c->crush.p > 0 && runif(r) < c->crush.p && (crushed = crush_draw(sp, s, l, o, P, psh, r, big + p3, 8 * p3, ctu)) < 0) return -1;
         if (ok && !crushed && c->tear_p > 0 && runif(r) < c->tear_p && (torn = tear_draw(sp, s, l, o, P, psh, r, ctu)) < 0) return -1;
         if (ok && !crushed && !torn && c->delam_p > 0 && runif(r) < c->delam_p && (delam = delam_draw(sp, s, l, o, P, psh, r, ctu)) < 0) return -1;
+        if (ok && !crushed && !torn && !delam && c->curv_p > 0 && runif(r) < c->curv_p && (curved = curv_draw(sp, s, l, o, P, psh, r, big + p3, 8 * p3, ctu)) < 0) return -1;
     }
-    if (!crushed && !torn && !delam && z3_read(ct, o, n, ctu, 1)) return -1;
+    if (!crushed && !torn && !delam && !curved && z3_read(ct, o, n, ctu, 1)) return -1;
     PROF_MARK(PS_READ);
     size_t nz = 0;
     double sum = 0, sq = 0;
     u8_stats(ctu, p3, &nz, &sum, &sq);
     if (!c->cover && (double)nz / (double)p3 < c->min_fg) { atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[1], 1); return 1; }
-    if (c->xscan_p > 0 && s->nxs && !crushed && !torn && !delam && c->augment && !chained && !c->view_P && !c->cover && !c->holdout && runif(r) < c->xscan_p) {
+    if (c->xscan_p > 0 && s->nxs && !crushed && !torn && !delam && !curved && c->augment && !chained && !c->view_P && !c->cover && !c->holdout && runif(r) < c->xscan_p) {
         const int xs = xscan_draw(s, l, o, n, r, ctu, big + p3);   /* (big + p3: free scratch until the scanner augmentation) */
         if (xs < 0) return -1;
         if (xs) { atomic_fetch_add(&sp->augn[AUGN_XSCAN], 1); nz = 0; sum = sq = 0; u8_stats(ctu, p3, &nz, &sum, &sq); }
@@ -2446,6 +2546,10 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     double scale = (double)(1 << l);
     float *cyz = xtmp, *cxz = xtmp + P, *nrow = xtmp + 2 * P;
     for (int z = 0; z < Pz; z++) { double cy, cx; axis_at(&s->ax, (double)(o[0] + z) * scale, &cy, &cx); cyz[z] = (float)(cy / scale); cxz[z] = (float)(cx / scale); }
+    if (g_crush.cax) for (int z = 0; z < Pz; z++) {   /* --aug-curv: the moved axis */
+        const double t = (z - g_crush.ca[0]) / g_crush.cA[0];
+        cyz[z] = (float)((double)o[1] + g_crush.ca[1] + t * g_crush.cA[1]); cxz[z] = (float)((double)o[2] + g_crush.ca[2] + t * g_crush.cA[2]);
+    }
     if (c->augment && scan_aug_enabled(&c->scan)) {   /* scanner domains on the source grid; the per-patch z-score follows them, as at inference */
         PROF_MARK(PS_ZSCORE);
         if (scan_aug_apply(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, big + p3)) {

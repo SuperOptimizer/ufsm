@@ -47,6 +47,7 @@ typedef struct {
     double j0;                                /* the sample's void ratio (diagnostic) */
     int lat;                                  /* crush_window evaluates the map exactly every lat voxels, trilinear between (2: the
                                                  default, 8x fewer evaluations; 1: exact). CT and labels share it, so they stay consistent. */
+    int rb; double rU[3], rV[3], rA[3], r0, r1, rext[3];   /* stage R (crush_map_rebend), before A; 0 off */
 } crush_map;
 
 /* stages A and B from the seed (n: the sheet normal, unit or not); stage C off until crush_map_columns */
@@ -60,6 +61,16 @@ void crush_map_free(crush_map *m);
    two monotone Hermites on the same knots: monotone, C1, invertible; t 0 = identity, t 1 = m). m must be rotation-free (cfg rotate_deg 0).
    out owns its table (crush_map_free). 0 ok, 1 m rotated, -1 alloc. */
 int crush_map_scaled(crush_map *out, const crush_map *m, double t);
+/* stage R (--aug-curv): the sheets re-bent around a moved centre. In the source the scroll axis runs along A (unit) at distance r0
+   from the window centre c, U (unit, perpendicular to A) points from the axis to c; r0 0 = flat source (no axis known: the sheets
+   taken as planes normal to U). The output's axis lies at c - r1 U: an output point at radius rho' and angle th' about it (from U,
+   towards V = A x U) pulls from radius rho' - r1 + r0 and angle th' r1 / r0 about the source axis (flat: a = rho' - r1 along U,
+   s = r1 th' along V), the coordinate along A kept. Radial distances (the wrap spacing) and arc length along the centre sheet are
+   kept; the curvature there goes 1 / r0 -> 1 / r1. Invertible for |th'| < pi; voxels near th' = +-pi (behind an output axis inside the
+   window) form a seam, crush_rebend_masked marks them. Sets m->rext, the footprint (stages A-C must be off: identity). */
+void crush_map_rebend(crush_map *m, const double U[3], const double A[3], double r0, double r1);
+/* 1 when output voxel u lies within (1 - frac) pi of the seam behind the output axis (callers blank it) */
+int crush_rebend_masked(const crush_map *m, const double u[3], double frac);
 /* the pull (output voxel u -> source x, window coordinates of the map's level); jdet: the Jacobian determinant (nullable) */
 void crush_pull(const crush_map *m, const double u[3], double x[3], double *jdet);
 /* the pull crush_window applies at output voxel u (integer): with lat 2 the trilinear blend of the exact pulls at the nodes
