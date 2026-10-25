@@ -6,7 +6,7 @@
 #   same fitter on label phase; cached per fitter config). Then (SLABS=1) Paris 4 full-cross-section slab sites: 2 overlapping
 #   96-cell slab fits per site, radius profile, fit-join overlap share, joined site score.
 #   Rows: $WB/res/TAG.tsv (boxes), $WB/res/TAG-slabs.tsv, $WB/res/TAG-radius.tsv; logs $WB/runs/TAG/. Compare with ufsm wbench-stats.
-# Env: SITE laptop|desk (default: laptop if ~/ufsm-data exists), GPU (0), BOXES ("all" | names), REP (2: shifted fits per box, 0 off),
+# Env: SITE laptop|desk (default: laptop if ~/ufsm-data exists), GPU (0), BOXES ("clean" default: boxes not tagged label-noise in boxes.tsv | "all" | names), REP (2: shifted fits per box, 0 off),
 #   SLABS (1), SITES (z cells of the slab sites), FIT (extra fit flags; changes the fitter config tag; "{box}" becomes the box name,
 #   e.g. FIT="--emb /vesuvius/ufsm/repr/emb/bench/{box} --uw-rep-emb 2"), FIELDS (TAG0: reuse fields),
 #   KEEP (1: keep this TAG's fields for later fixed-fields runs; default 1), U (binary; default $WB/bin/ufsm = the pinned build),
@@ -17,7 +17,7 @@ SITE=${SITE:-$([ -d $HOME/ufsm-data ] && echo laptop || echo desk)}; GPU=${GPU:-
 . $H/site-$SITE.env
 CK=$(readlink -f "$1"); TAG=$2
 U=${U:-$WB/bin/ufsm}; [ -x $U ] || { echo "no binary $U"; exit 2; }
-BOXES=${BOXES:-all}; REP=${REP:-2}; SLABS=${SLABS:-1}; SITES=${SITES:-4624 5392 5904 6672}; FIT=${FIT:-}; FIELDS=${FIELDS:-}; KEEP=${KEEP:-1}
+BOXES=${BOXES:-clean}; REP=${REP:-2}; SLABS=${SLABS:-1}; SITES=${SITES:-4624 5392 5904 6672}; FIT=${FIT:-}; FIELDS=${FIELDS:-}; KEEP=${KEEP:-1}
 BT=${BT:-$H/boxes.tsv}; BIN=$(sha1sum $U | cut -c1-8)
 FCFG=$(echo "$BIN --dir 1 --uw-repair 8 $FIT" | sha1sum | cut -c1-8)   # the fitter config: binary + flags
 FT=${FIELDS:-$TAG}; FD=$WB/fields/$FT; O=$WB/runs/$TAG; mkdir -p $O $WB/res $WB/ceil $FD $CACHE
@@ -34,6 +34,8 @@ scroll() {   # scroll SCROLL: R V UM LV AX QR QK PR PK PF (PF: CT voxels per lab
   case $1 in
     paris4) R=$P4ROOT; V=PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr; UM=2.4; LV=2; AX=$AXP4
             QR=$GT/paris4-q9p6/q-9p6.zarr; QK=9.6; PR=$GT/paris4-wind-20261019; PK=phaseA/9.6; PF=1;;
+    paris4j) R=$P4ROOT; V=PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr; UM=2.4; LV=2; AX=$AXP4   # July-only labels (codes rebuilt from the published July wraps)
+            QR=$P4JQ; QK=9.6; PR=$GT/paris4-wind-20261019; PK=phaseB/9.6; PF=1;;
     1667)   R=$MIRROR; V=PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr; UM=2.399; LV=2; AX=$AX1667
             QR=$GT/PHerc1667-wind-20261016/codes; QK=4.798; PR=$GT/PHerc1667-wind-20261016; PK=phase/9.6; PF=1;;
     PHerc0139) R=$MIRROR; V=PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr; UM=9.362; LV=0; AX=$GT/axis/PHerc0139-umb-scan.json
@@ -61,7 +63,9 @@ g_pair() { grep -oE "pair winding right.*" $1 | grep -oE "$2 mm [0-9.na]+ cross 
 num() { [[ "${1:-}" =~ ^[0-9.]+$ ]] && echo $1 || echo na; }
 
 # ---- boxes ----
-if [ "$BOXES" = all ]; then BL=$(grep -v '^#' $BT | cut -f1); else BL=$BOXES; fi
+if [ "$BOXES" = all ]; then BL=$(grep -v '^#' $BT | cut -f1)
+elif [ "$BOXES" = clean ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label-noise/' | cut -f1)
+else BL=$BOXES; fi
 for B in $BL; do
   IFS=$'\t' read -r nm sc z y x nz ny nx lv note <<< "$(awk -F'\t' -v b=$B '$1 == b' $BT)"; [ -n "${nx:-}" ] || { log "no box $B"; continue; }
   grep -qP "^$TAG\t$B\t" $RES && { log "$B done"; continue; }

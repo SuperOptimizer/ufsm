@@ -1,12 +1,12 @@
 # wbench: the winding + fitter bench
 
-One command scores a winding checkpoint (or a fitter change) on 45 frozen held-out boxes plus 4 full-cross-section Paris 4
-slab sites. It prints rows that `ufsm wbench-stats` turns into means with bootstrap CIs and paired differences.
+One command scores a winding checkpoint (or a fitter change) on the clean held-out boxes (default `BOXES=clean`: the boxes
+of `boxes.tsv` not tagged `label-noise`) plus 4 full-cross-section Paris 4 slab sites. It prints rows that `ufsm wbench-stats` turns into means with bootstrap CIs and paired differences.
 
     # desk, your own GPU (B = 0, C = 1); the pinned binary is $WB/bin/ufsm
     SITE=desk GPU=1 bash scripts/wbench/wbench.sh /path/ckpt.ckpt mytag
     # compare with the baseline (rows in $WB/res)
-    ufsm wbench-stats $WB/res/mytag.tsv $WB/res/wind96.tsv --metric ids,p1x,p4x,gross100,frac
+    ufsm wbench-stats $WB/res/mytag.tsv $WB/res/wind96.tsv --metric p05x,ids,p1x,gross100,frac
     # a fitter change on fixed fields (no predict): FIELDS names the run whose fields are reused
     SITE=desk GPU=1 FIELDS=wind96 FIT="--uw-repair 12" bash scripts/wbench/wbench.sh /path/ckpt.ckpt wind96-rep12
 
@@ -21,6 +21,11 @@ slab sites. It prints rows that `ufsm wbench-stats` turns into means with bootst
 | PHerc0139 | 139-1..139-8 | level 0 (9.362 um) | 139-1 = the dino/full holdout |
 | PHerc0814 | 814-1..814-8 | level 0 (9.362 um) | 814-1 = the dino/full holdout |
 | PHerc0500P2 | 500P2-1 | level 0 (9.362 um) | the labels are sparse |
+| Paris 4 July-only | J1..J34 (`cand-p4j.tsv`, being qualified) | level 2 (9.6 um) | July labels where June has none (z 6656..6912, 17024..17408); codes from `gtjuly/build.sh` (`P4JQ`); in-sample for d1 before its p4resume relaunch |
+
+The 23 boxes whose wind96 label ceiling is under 0.8 (all 0814, 139-1..4 and 6..8, C1 C5 C6 C8 C13 C17 C20 C23) carry the
+note `label-noise` and are skipped unless `BOXES=all`: their labels, not the model, limit the score (e.g. 139-2 ids 0.78 at
+ceil 0.55). They stay held out of training. `BT=file` runs another box list (e.g. `cand-1667.tsv`).
 
 **Training must avoid all of them.** Add this to every source entry of 0139, 0814, 0500P2, Paris 4 and 1667 (the train sampler
 and `dino-train` both read it):
@@ -50,7 +55,8 @@ first box is the validation box.
 5. **Ceiling.** The same fitter on label phase (with network planes where there are no labels) gives `ceil` and `ceil_p1x`.
    It is cached per fitter config (binary hash + FIT flags) in `$WB/ceil/`. `frac` = ids / ceil. With `--set clean` (the
    default), `wbench-stats` drops boxes with ceil < 0.8 (the labels, not the model, limit them: all 0814 boxes so far) from the mean and prints them on a separate "label-noise" line.
-6. **Slabs** (`SLABS=1`). Four Paris 4 full-cross-section sites at z cells 4672, 5312, 5952 and 6592. Each site is fitted as two
+6. **Slabs** (`SLABS=1`, the default). Run them for every fitter arm and every milestone student; routine snapshot evals
+   use `SLABS=0`. Four Paris 4 full-cross-section sites at z cells 4624, 5392, 5904 and 6672. Each site is fitted as two
    96-cell slabs with a 32-cell overlap (the production slab size), then joined with `fit-join`. The run reports:
    - per-slab ids and pair accuracy;
    - the **join share** (how far adjacent slabs agree);
@@ -89,7 +95,8 @@ same fitter): HOLD 0.9253 on both, the old desk eval 0.9255.
   - P(A > B);
   - the MDE (2.8 x the bootstrap SE of the paired difference);
   - per-scroll means (`--boxes 1` adds per-box values).
-- **A difference smaller than the MDE is noise. Decide on ids and p1x over the clean set.**
+- **A difference smaller than the MDE is noise. The headline is p05x (lowest paired variance: MDE 0.046 vs 0.083 for ids on
+  22 clean boxes), with ids beside it, over the clean set.**
 
 ## Whole-scroll Paris 4 unwrap (the milestone; scheduled by the coordinator, about 9 h on one desk GPU)
 
