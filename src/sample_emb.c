@@ -25,6 +25,8 @@ void sample_emb_coords(int Pz, int P, int div, const int perm[3], const int flip
     }
 }
 
+_Atomic size_t g_emb_pap_cleared, g_emb_pap_kept;
+
 /* per-thread open groups */
 typedef struct { const source *s; int k; emb e; int step, ok; } eh_t;
 static _Thread_local eh_t *g_eh; static _Thread_local int g_neh;
@@ -112,4 +114,35 @@ int sample_emb_window(const source *s, int C, int div, int l, const int64_t o[3]
     }
     free(V); free(cu); free(acc); free(done);
     return rc;
+}
+
+void sample_emb_pap2(const uint8_t *ct, int Pz, int P, int level, uint8_t *pap2) {
+    const int bz = Pz / 2, by = P / 2, bx = P / 2;
+    for (int z = 0; z < bz; z++) for (int y = 0; y < by; y++) {
+        uint8_t *dst = pap2 + ((size_t)z * by + y) * bx;
+        const uint8_t *r[4] = {ct + ((size_t)(2 * z) * P + 2 * y) * P, ct + ((size_t)(2 * z) * P + 2 * y + 1) * P,
+                               ct + ((size_t)(2 * z + 1) * P + 2 * y) * P, ct + ((size_t)(2 * z + 1) * P + 2 * y + 1) * P};
+        for (int x = 0; x < bx; x++) { int n = 0; for (int k = 0; k < 4; k++) n += (r[k][2 * x] >= level) + (r[k][2 * x + 1] >= level); dst[x] = (uint8_t)n; }
+    }
+}
+size_t sample_emb_papyrus(int C, int div, int Pz, int P, const int perm[3], const int flip[3], const spatial_aug *sa, const uint8_t *pap2, float frac,
+                          int8_t *out, size_t *kept) {
+    const int G[3] = {Pz / div, P / div, P / div}, nb[3] = {Pz / 2, P / 2, P / 2}, h = div / 2 > 0 ? div / 2 : 1;   /* h blocks per cell edge */
+    const size_t ng = (size_t)G[0] * G[1] * G[2];
+    float *V = malloc(ng * 3 * sizeof *V); if (!V) return 0;
+    sample_emb_coords(Pz, P, div, perm, flip, sa, V);
+    size_t cleared = 0, left = 0; const double need = frac * 8.0 * h * h * h;
+    for (size_t q = 0; q < ng; q++) {
+        int any = 0; for (int ch = 0; ch < C && !any; ch++) any = out[(size_t)ch * ng + q] != 0;
+        if (!any) continue;
+        int b0[3]; for (int d = 0; d < 3; d++) b0[d] = (int)lrintf(V[3 * q + d] * .5f - .25f - .5f * (h - 1));   /* blocks [b0, b0 + h): centre (2 b + .5) ~ V */
+        long n = 0;
+        for (int z = b0[0]; z < b0[0] + h; z++) { if (z < 0 || z >= nb[0]) continue;
+            for (int y = b0[1]; y < b0[1] + h; y++) { if (y < 0 || y >= nb[1]) continue;
+                const uint8_t *row = pap2 + ((size_t)z * nb[1] + y) * nb[2];
+                for (int x = b0[2]; x < b0[2] + h; x++) if (x >= 0 && x < nb[2]) n += row[x]; } }
+        if (n < need) { for (int ch = 0; ch < C; ch++) out[(size_t)ch * ng + q] = 0; cleared++; } else left++;
+    }
+    free(V); if (kept) *kept = left;
+    return cleared;
 }

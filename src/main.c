@@ -997,7 +997,8 @@ static int cmd_fit(int argc, char **argv) {
     c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1"));
     /* embedding evidence for the slip repair (src/fit_emb.h): --emb GROUP (a dinovol-embed output group at the fields' scan level, or
        --emb-scale S embedding voxels per native voxel) [--emb-output tokens_unit] --uw-rep-emb W [--uw-rep-emb-d 16,48 native voxels]
-       [--uw-rep-emb-m0 0.3 cosine margin for full weight] [--uw-rep-emb-rmax 2] [--uw-rep-emb-sub 2 field voxels] [--emb-phi 0] */
+       [--uw-rep-emb-m0 0.3 cosine margin for full weight] [--uw-rep-emb-rmax 2] [--uw-rep-emb-sub 2 field voxels] [--emb-phi 0]
+       [--emb-ct ROOT KEY --emb-papyrus L [--cache DIR]]: the papyrus gate, sheet samples on CT >= L only (CT at the fields' native level) */
     c.uw_rep_emb = (float)atof(opt(argc, argv, "--uw-rep-emb", "0")); c.uw_rep_emb_m0 = (float)atof(opt(argc, argv, "--uw-rep-emb-m0", "0.3"));
     c.uw_rep_emb_rmax = atoi(opt(argc, argv, "--uw-rep-emb-rmax", "2")); c.uw_rep_emb_sub = atoi(opt(argc, argv, "--uw-rep-emb-sub", "2")); c.emb_phi = (float)atof(opt(argc, argv, "--emb-phi", "0"));
     if (*opt(argc, argv, "--uw-rep-emb-d", "")) { c.uw_rep_emb_nd = 0; char *t = strdup(opt(argc, argv, "--uw-rep-emb-d", "")); for (char *q = strtok(t, ","); q && c.uw_rep_emb_nd < 4; q = strtok(nullptr, ",")) c.uw_rep_emb_d[c.uw_rep_emb_nd++] = atoi(q); free(t); }
@@ -1023,6 +1024,11 @@ static int cmd_fit(int argc, char **argv) {
         const long long en[3] = {(long long)ceil(fb.shape[0] * fb.h), (long long)ceil(fb.shape[1] * fb.h), (long long)ceil(fb.shape[2] * fb.h)};
         embv = emb_vol_open(opt(argc, argv, "--emb", ""), opt(argc, argv, "--emb-output", "tokens_unit"), fb.origin, en, atof(opt(argc, argv, "--emb-scale", "1")), pad + 32);
         if (!embv) return 1;
+        for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--emb-ct")) {   /* the papyrus gate on the votes (fit_emb.h): CT at the fields' native level */
+            const int lv = atoi(opt(argc, argv, "--emb-papyrus", "0")); store *cs = store_open(argv[i + 1]); z3 *cz = cs ? z3_open(cs, argv[i + 2], opt(argc, argv, "--cache", nullptr)) : nullptr;
+            if (!cz || lv <= 0 || emb_vol_papyrus_zarr(embv, cz, fb.origin, en, pad + 32, lv)) { fprintf(stderr, "fit: --emb-ct ROOT KEY needs --emb-papyrus L > 0 and a readable CT\n"); return 1; }
+            z3_close(cz);
+        }
         c.emb = embv;
     } else if (opt(argc, argv, "--emb", nullptr)) fprintf(stderr, "fit: --emb without --uw-rep-emb W > 0 (unused)\n");
     if (*opt(argc, argv, "--axis-normal", "") && !min && !slab) {

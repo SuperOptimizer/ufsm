@@ -1,6 +1,7 @@
 /* Sheet-identity embedding evidence (src/fit_emb.h) for the fitter's slip repair.
    (1) emb_shift_vote on a synthetic stack of planar sheets (spacing 10 native voxels, the packed case at 9.6 um): one random unit vector
        per sheet (+ noise), b's W planted r0 = -2..2 turns off; the vote must return r0 (sign convention: b calls a's sheet L + r).
+   (1b) the papyrus gate (emb_vol_set_papyrus): void samples carry a neighbouring sheet; gated votes must be right.
    (2) test_repair's slip-region spiral (the phase loses a turn across a band inside a window; the flood leaves the region beyond it a
        turn off) with the repair's stretch weighting OFF: the plain repair cuts in the wrong place; with the embedding evidence (one
        vector per sheet of the true spiral) the repaired unwrapping must get >= 99% of the winding ids. */
@@ -62,6 +63,35 @@ static void test_vote(void) {
     emb_vol_free(e);
 }
 
+/* (1b) the papyrus gate: the voids between the sheets carry the next sheet's vector (the teacher's mesh noise) and b's phase is up to
+   0.35 turns off, so ungated sheet samples often land in void; with the CT gate (papyrus within 2.5 voxels of a sheet centre) the
+   votes read papyrus only: right where they vote, and better than ungated */
+static double W_noisy(double z, double y, double x) {
+    (void)z; (void)y; const double w = x / 10.0, f = w - floor(w + 0.5); return fabs(f) < 0.25 ? w : w + (f > 0 ? 1 : -1);
+}
+static void test_papyrus_gate(void) {
+    const int64_t n[3] = {32, 32, 64}; const uint64_t r_save = rng;
+    emb_vol *e[2] = {make_emb(n, 2, W_noisy, 0.2), nullptr}; rng = r_save; e[1] = make_emb(n, 2, W_noisy, 0.2);
+    const int64_t co[3] = {-2, -2, -2}, cn[3] = {68, 68, 132}; uint8_t *ct = malloc((size_t)cn[0] * cn[1] * cn[2]);
+    for (int64_t i = 0; i < cn[0] * cn[1] * cn[2]; i++) {
+        const double x = (double)(i % cn[2] + co[2]) + 0.5, f = x / 10.0 - floor(x / 10.0 + 0.5); ct[i] = fabs(f) < 0.25 ? 180 : 40; }
+    emb_vol_set_papyrus(e[1], ct, co, cn, 128);   /* (owned by e[1]) */
+    int votes[2] = {0, 0}, right[2] = {0, 0}, tries = 0;
+    for (int t = 0; t < 600; t++) {
+        const int r0 = (int)(rnd() % 5) - 2; const double pe = 0.35 * (2.0 * (rnd() / 4294967296.0) - 1);
+        emb_side a = {{20 + rnd() % 20, 20 + rnd() % 20, 40 + rnd() % 40}, 0, {0, 0, 1}, 10}, b = a;
+        a.W = W_plane(0, 0, a.p[2]);
+        b.p[0] = 10 + rnd() % 40; b.p[1] = 10 + rnd() % 40; b.p[2] = 40 + rnd() % 40;
+        b.W = W_plane(0, 0, b.p[2]) + r0 + pe;
+        tries++;
+        for (int g = 0; g < 2; g++) { int r = 99; float cf = 0; if (emb_shift_vote(e[g], &a, &b, 2, 0.0, &r, &cf)) continue; votes[g]++; right[g] += r == r0; }
+    }
+    printf("papyrus gate: ungated %d / %d votes right, gated %d / %d (%d pairs)\n", right[0], votes[0], right[1], votes[1], tries);
+    CHECK(votes[1] > tries / 3 && right[1] >= 0.97 * votes[1], "gated votes: %d / %d right", right[1], votes[1]);
+    CHECK((double)right[1] / votes[1] > (double)right[0] / votes[0] + 0.05, "the gate does not help: %d / %d vs %d / %d", right[1], votes[1], right[0], votes[0]);
+    emb_vol_free(e[0]); emb_vol_free(e[1]);
+}
+
 /* (2) test_repair's slip-region spiral */
 static const double H8 = 8, PITCH = 64, CY = 400, CX = 400;
 static double smooth01(double t) { return t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t); }
@@ -112,7 +142,7 @@ static double run_spiral(const emb_vol *ev) {
 static double W_spiral_emb(double z, double y, double x) { const double r = hypot(y - CY, x - CX); return r < 120 || r > 400 ? NAN : W_true(z, y, x); }
 
 int main(void) {
-    test_vote();
+    test_vote(); test_papyrus_gate();
     fit_set_threads(4);
     rng = 88172645463325252ull; const double a0 = run_spiral(nullptr);
     const int64_t n[3] = {96, 192, 192}; emb_vol *ev = make_emb(n, 4, W_spiral_emb, 0.3);

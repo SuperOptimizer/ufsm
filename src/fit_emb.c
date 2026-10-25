@@ -2,6 +2,7 @@
 #include "fit_emb.h"
 #include "embz.h"
 #include "json.h"
+#include "zarr3.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -15,6 +16,7 @@ struct emb_vol {
     int64_t n[3], o[3];   /* cells; embedding voxel of cell 0's low corner */
     int C, step;
     double org[3], scale; /* native box origin (native voxels), embedding voxels per native voxel */
+    uint8_t *ct; int64_t co[3], cn[3]; int pap;   /* optional papyrus gate: raw CT of native voxels [co, co + cn) (box-local); samples with CT < pap are skipped */
 };
 
 static char *slurp(const char *path, size_t *n) {
@@ -73,7 +75,30 @@ emb_vol *emb_vol_wrap(const int8_t *v, const int64_t n[3], int C, int step, cons
     for (int d = 0; d < 3; d++) { e->n[d] = n[d]; e->o[d] = o[d]; e->org[d] = (double)org[d]; }
     return e;
 }
-void emb_vol_free(emb_vol *e) { if (e) { free(e->v); free(e); } }
+void emb_vol_free(emb_vol *e) { if (e) { free(e->v); free(e->ct); free(e); } }
+void emb_vol_set_papyrus(emb_vol *e, uint8_t *ct, const int64_t o[3], const int64_t n[3], int level) {
+    free(e->ct); e->ct = ct; e->pap = level; for (int d = 0; d < 3; d++) { e->co[d] = o[d]; e->cn[d] = n[d]; }
+}
+int emb_vol_papyrus_zarr(emb_vol *e, z3 *z, const long long org[3], const long long n[3], int pad, int level) {
+    int64_t o[3], m[3], lo[3];
+    for (int d = 0; d < 3; d++) {
+        lo[d] = org[d] - pad; int64_t hi = org[d] + n[d] + pad;
+        if (lo[d] < 0) lo[d] = 0;
+        if (hi > z3_meta_of(z)->shape[d]) hi = z3_meta_of(z)->shape[d];
+        if (hi <= lo[d]) { fprintf(stderr, "fit-emb: the box is outside the CT\n"); return -1; }
+        m[d] = hi - lo[d]; o[d] = lo[d] - org[d];
+    }
+    uint8_t *ct = malloc((size_t)m[0] * m[1] * m[2]);
+    if (!ct || z3_read(z, lo, m, ct, 8)) { fprintf(stderr, "fit-emb: CT read failed\n"); free(ct); return -1; }
+    size_t np = 0; for (size_t i = 0, t = (size_t)m[0] * m[1] * m[2]; i < t; i++) np += ct[i] >= level;
+    fprintf(stderr, "fit-emb: papyrus gate CT >= %d: %.1f%% of %lldx%lldx%lld CT voxels\n", level, 100.0 * np / ((double)m[0] * m[1] * m[2]), (long long)m[0], (long long)m[1], (long long)m[2]);
+    emb_vol_set_papyrus(e, ct, o, m, level); return 0;
+}
+static int on_papyrus(const emb_vol *e, const double p[3]) {
+    if (!e->ct) return 1;
+    int64_t q[3]; for (int d = 0; d < 3; d++) { q[d] = (int64_t)floor(p[d]) - e->co[d]; if (q[d] < 0 || q[d] >= e->cn[d]) return 0; }
+    return e->ct[((size_t)q[0] * e->cn[1] + q[1]) * e->cn[2] + q[2]] >= e->pap;
+}
 int emb_vol_dim(const emb_vol *e) { return e->C; }
 
 int emb_at(const emb_vol *e, const double p[3], float *v) {
@@ -104,6 +129,7 @@ static int sheet_vec(const emb_vol *e, const double p[3], const double n[3], flo
     for (int k = 0; k < C; k++) acc[k] = 0;
     for (int s = -1; s <= 1; s++) {
         const double q[3] = {p[0] + s * n[0], p[1] + s * n[1], p[2] + s * n[2]};
+        if (!on_papyrus(e, q)) continue;   /* (the papyrus gate: void samples carry the teacher's mesh noise) */
         if (!emb_at(e, q, tmp)) continue;
         double l = 0; for (int k = 0; k < C; k++) l += (double)tmp[k] * tmp[k];
         if (l <= 0) continue;
