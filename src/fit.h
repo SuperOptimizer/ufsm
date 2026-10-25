@@ -102,6 +102,13 @@ typedef struct {
     float cs_tol;                   /* |log(sp / cs)| below which the network spacing is kept (the cs term off) */
     int ct_flood;                   /* 1: voxels below uw_min_conf join the phase stage's voxel unwrapping with the CT's own phase (the
                                        parity demodulated along the model's normal) when w_ct > 0 */
+    const struct emb_vol *emb;      /* slip repair evidence from sheet-identity embeddings (src/fit_emb.h; nullptr off): votes between pieces
+                                       uw_rep_emb_d native voxels apart along the sheet (the model's tangents), the integer the embedding
+                                       picks for the same sheet (rmax uw_rep_emb_rmax turns), weight uw_rep_emb x lower confidence x
+                                       min(1, margin / uw_rep_emb_m0) (cosine margin best - second); the sheet centres at W = n + emb_phi */
+    float uw_rep_emb, uw_rep_emb_m0, emb_phi;
+    int uw_rep_emb_d[4], uw_rep_emb_nd, uw_rep_emb_rmax, uw_rep_emb_sub;
+    double emb_zoff;                /* native z of this fit's fields in the embedding's box coordinates (the slab driver: the slab's first field row) */
     int verbose;
 } fit_cfg;
 

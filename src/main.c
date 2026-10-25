@@ -10,6 +10,7 @@
 #include "store.h"
 #include "zarr3.h"
 #include "fit.h"
+#include "fit_emb.h"
 #include "unet.h"
 #include "checkpoint.h"
 #include "fblend.h"
@@ -62,6 +63,8 @@ int cmd_wl_dump(int argc, char **argv);
 int cmd_dinovol_embed(int argc, char **argv);   /* src/dinovol.c */
 int cmd_dinovol_eval(int argc, char **argv);
 int cmd_dinovol_read(int argc, char **argv);
+int cmd_emb_pca(int argc, char **argv);
+int cmd_emb_calib(int argc, char **argv);
 int cmd_dinovol_calib(int argc, char **argv);
 int cmd_dino_headfit(int argc, char **argv);
 int cmd_surf_eval(int argc, char **argv);   /* src/surfeval.c */
@@ -978,6 +981,13 @@ static int cmd_fit(int argc, char **argv) {
     c.uw_rep_cs = (float)atof(opt(argc, argv, "--uw-rep-cs", "0")); c.uw_rep_dump = opt(argc, argv, "--uw-rep-dump", nullptr);
     c.uw_rep_qpow = (float)atof(opt(argc, argv, "--uw-rep-qpow", "3")); c.uw_rep_stretch = (float)atof(opt(argc, argv, "--uw-rep-stretch", "0.5"));
     c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1"));
+    /* embedding evidence for the slip repair (src/fit_emb.h): --emb GROUP (a dinovol-embed output group at the fields' scan level, or
+       --emb-scale S embedding voxels per native voxel) [--emb-output tokens_unit] --uw-rep-emb W [--uw-rep-emb-d 16,48,128 native voxels]
+       [--uw-rep-emb-m0 0.1 cosine margin for full weight] [--uw-rep-emb-rmax 2] [--uw-rep-emb-sub 2 field voxels] [--emb-phi 0] */
+    c.uw_rep_emb = (float)atof(opt(argc, argv, "--uw-rep-emb", "0")); c.uw_rep_emb_m0 = (float)atof(opt(argc, argv, "--uw-rep-emb-m0", "0.1"));
+    c.uw_rep_emb_rmax = atoi(opt(argc, argv, "--uw-rep-emb-rmax", "2")); c.uw_rep_emb_sub = atoi(opt(argc, argv, "--uw-rep-emb-sub", "2")); c.emb_phi = (float)atof(opt(argc, argv, "--emb-phi", "0"));
+    if (*opt(argc, argv, "--uw-rep-emb-d", "")) { c.uw_rep_emb_nd = 0; char *t = strdup(opt(argc, argv, "--uw-rep-emb-d", "")); for (char *q = strtok(t, ","); q && c.uw_rep_emb_nd < 4; q = strtok(nullptr, ",")) c.uw_rep_emb_d[c.uw_rep_emb_nd++] = atoi(q); free(t); }
+    if (!(c.uw_rep_emb >= 0) || !(c.uw_rep_emb_m0 > 0) || c.uw_rep_emb_rmax < 1 || c.uw_rep_emb_rmax > 8 || c.uw_rep_emb_sub < 1) { fprintf(stderr, "fit: --uw-rep-emb >= 0, --uw-rep-emb-m0 > 0, --uw-rep-emb-rmax 1..8, --uw-rep-emb-sub >= 1\n"); return 2; }
     if (c.uw_repair < 0 || !(c.uw_rep_w4 >= 0) || !(c.uw_rep_geo >= 0) || !(c.uw_rep_cs >= 0) || c.uw_rep_gd < 1 || !(c.uw_rep_qpow > 0) || !(c.uw_rep_stretch >= 0) || c.uw_rep_sr < 0 || c.uw_rep_sr > 4) { fprintf(stderr, "fit: --uw-repair >= 0, --uw-rep-* weights >= 0, --uw-rep-gd >= 1\n"); return 2; }
     c.core = (float)atof(opt(argc, argv, "--core", "3"));   /* no data terms within core x pitch of the axis */
     c.w_wind4 = (float)atof(opt(argc, argv, "--wind4-weight", "0"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off: weight 4 cost fit-val, 0.5-1 neutral) */
@@ -993,6 +1003,14 @@ static int cmd_fit(int argc, char **argv) {
     if (fit_fields_load(dir, 0, 0, min || slab > 0 ? 0 : 1, &fb)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
     clock_gettime(CLOCK_MONOTONIC, &tl1);
     if (c.verbose) fprintf(stderr, "fit: fields %dx%dx%d loaded in %.1fs\n", fb.shape[0], fb.shape[1], fb.shape[2], (double)(tl1.tv_sec - tl0.tv_sec) + (tl1.tv_nsec - tl0.tv_nsec) * 1e-9);   /* (slab runs load per slab; a given model needs the geometry only) */
+    emb_vol *embv = nullptr;
+    if (opt(argc, argv, "--emb", nullptr) && c.uw_rep_emb > 0) {   /* the embedding over the fields' box (+ the farthest partner distance) */
+        int pad = 0; for (int k = 0; k < c.uw_rep_emb_nd; k++) if (c.uw_rep_emb_d[k] > pad) pad = c.uw_rep_emb_d[k];
+        const long long en[3] = {(long long)ceil(fb.shape[0] * fb.h), (long long)ceil(fb.shape[1] * fb.h), (long long)ceil(fb.shape[2] * fb.h)};
+        embv = emb_vol_open(opt(argc, argv, "--emb", ""), opt(argc, argv, "--emb-output", "tokens_unit"), fb.origin, en, atof(opt(argc, argv, "--emb-scale", "1")), pad + 32);
+        if (!embv) return 1;
+        c.emb = embv;
+    } else if (opt(argc, argv, "--emb", nullptr)) fprintf(stderr, "fit: --emb without --uw-rep-emb W > 0 (unused)\n");
     if (*opt(argc, argv, "--axis-normal", "") && !min && !slab) {
         /* local boxes away from the scroll's axis (crushed scrolls): replace the axis by a vertical line D native voxels from the box centre
            along the box's mean sheet normal (top eigenvector of the material-weighted mean n n^T), so the spiral term is nearly flat */
@@ -1039,10 +1057,10 @@ static int cmd_fit(int argc, char **argv) {
         if (!cf) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
         fprintf(cf, "{\"version\":1,\"w_phase\":%.9g,\"w_normal\":%.9g,\"w_density\":%.9g,\"w_smooth\":%.9g,\"w_pgrad\":%.9g,\"pgrad_delta\":%.9g,\"w_wind4\":%.9g,\"w_recto\":%.9g,"
                     "\"w_ct\":%.9g,\"ct_pow\":%.9g,\"ct_phi\":%.9g,\"ct_floor\":%.9g,\"ct_radius_um\":%.9g,\"ct_flood\":%d,\"w_cspacing\":%.9g,\"cs_tol\":%.9g,"
-                    "\"phase_robust_turns\":%.9g,\"conf_pow\":%.9g,\"bend\":%.9g,\"unwrap_voxels\":%d,\"uw_min_conf\":%.9g,\"uw_repair\":%d,\"uw_rep_w4\":%.9g,\"uw_rep_geo\":%.9g,\"uw_rep_gd\":%d,\"uw_rep_cs\":%.9g,\"uw_rep_qpow\":%.9g,\"uw_rep_stretch\":%.9g,\"uw_rep_sr\":%d,\"phase_stage\":%d,\"slab\":%d,\"cpu\":%d,\"native_um\":%.9g,\"lattice\":[",
+                    "\"phase_robust_turns\":%.9g,\"conf_pow\":%.9g,\"bend\":%.9g,\"unwrap_voxels\":%d,\"uw_min_conf\":%.9g,\"uw_repair\":%d,\"uw_rep_w4\":%.9g,\"uw_rep_geo\":%.9g,\"uw_rep_gd\":%d,\"uw_rep_cs\":%.9g,\"uw_rep_qpow\":%.9g,\"uw_rep_stretch\":%.9g,\"uw_rep_sr\":%d,\"uw_rep_emb\":%.9g,\"phase_stage\":%d,\"slab\":%d,\"cpu\":%d,\"native_um\":%.9g,\"lattice\":[",
                 c.w_phase, c.w_normal, c.w_density, c.w_smooth, c.w_pgrad, c.pgrad_delta, c.w_wind4, c.w_recto,
                 c.w_ct, c.ct_pow, c.ct_phi, c.ct_floor, c.ct_radius_um, c.ct_flood, c.w_cspacing, c.cs_tol, c.phase_robust, c.conf_pow, c.bend, c.unwrap_voxels, c.uw_min_conf,
-                c.uw_repair, c.uw_rep_w4, c.uw_rep_geo, c.uw_rep_gd, c.uw_rep_cs, c.uw_rep_qpow, c.uw_rep_stretch, c.uw_rep_sr, c.phase_stage, slab, c.cpu, c.um);
+                c.uw_repair, c.uw_rep_w4, c.uw_rep_geo, c.uw_rep_gd, c.uw_rep_cs, c.uw_rep_qpow, c.uw_rep_stretch, c.uw_rep_sr, (double)c.uw_rep_emb, c.phase_stage, slab, c.cpu, c.um);
         for (int k = 0; k < c.nstage; k++) fprintf(cf, "%s%d", k ? "," : "", c.lattice[k]);
         fprintf(cf, "]}\n"); if (fclose(cf)) { fprintf(stderr, "fit: cannot save %s\n", cp); return 1; }
     }
@@ -3398,6 +3416,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "dinovol-embed")) return cmd_dinovol_embed(argc, argv);
     if (!strcmp(cmd, "dinovol-eval")) return cmd_dinovol_eval(argc, argv);
     if (!strcmp(cmd, "dinovol-read")) return cmd_dinovol_read(argc, argv);
+    if (!strcmp(cmd, "emb-pca")) return cmd_emb_pca(argc, argv);
+    if (!strcmp(cmd, "emb-calib")) return cmd_emb_calib(argc, argv);
     if (!strcmp(cmd, "dinovol-calib")) return cmd_dinovol_calib(argc, argv);
     if (!strcmp(cmd, "dino-headfit")) return cmd_dino_headfit(argc, argv);
     if (!strcmp(cmd, "surf-eval")) return cmd_surf_eval(argc, argv);

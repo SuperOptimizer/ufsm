@@ -8,6 +8,7 @@
 #include "store.h"
 #include "coreline.h"
 #include "l1pot.h"
+#include "fit_emb.h"
 #include <complex.h>
 #include <math.h>
 #include <stdio.h>
@@ -36,6 +37,8 @@ fit_cfg fit_cfg_default(void) {
     c.w_ct = 0.f; c.ct_pow = 1.f; c.ct_phi = 0.f; c.ct_radius_um = 150; c.ct_floor = 0.f;   /* CT parity off by default */
     c.w_cspacing = 0.f; c.cs_tol = 0.25f; c.ct_flood = 0;
     c.uw_repair = 0; c.uw_rep_qpow = 1.f; c.uw_rep_sr = 1; c.uw_rep_gd = 8;   /* local slip repair off by default */
+    c.emb = nullptr; c.uw_rep_emb = 0.f; c.uw_rep_emb_m0 = 0.1f; c.emb_phi = 0.f; c.uw_rep_emb_rmax = 2; c.uw_rep_emb_sub = 2;   /* embedding evidence off */
+    c.uw_rep_emb_nd = 3; c.uw_rep_emb_d[0] = 16; c.uw_rep_emb_d[1] = 48; c.uw_rep_emb_d[2] = 128;
     return c;
 }
 
@@ -702,6 +705,45 @@ static int64_t uwr_w(const uwr_ctx *u, int bk, int z, int y, int xx, int zn, int
     }
     return w < 1 ? 1 : (int64_t)lround(w);
 }
+/* embedding evidence (fit_cfg emb): from voxel i, partners uw_rep_emb_d native voxels away along the model's two sheet tangents; where
+   the partner is in another piece, the embedding's integer for the same sheet (src/fit_emb.h emb_shift_vote: the sheet at i's level L
+   is the one j calls L + r, so W(j) - W(i) should be r turns lower than flooded) votes -r between the pieces */
+static int uwr_side(const uw_ctx *x, int z, int y, int xx, double Wf, emb_side *s) {
+    const fit_fields *f = x->f; const double h = f->h, pz = (z + 0.5) * h, py = (y + 0.5) * h, px = (xx + 0.5) * h, e = h;
+    double g[3] = {fit_W(x->m, pz + e, py, px) - fit_W(x->m, pz - e, py, px), fit_W(x->m, pz, py + e, px) - fit_W(x->m, pz, py - e, px),
+                   fit_W(x->m, pz, py, px + e) - fit_W(x->m, pz, py, px - e)};
+    const double gl = sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]); if (!(gl > 1e-9)) return -1;
+    for (int d = 0; d < 3; d++) s->n[d] = g[d] / gl;
+    s->sp = 2 * e / gl;   /* native voxels per turn */
+    if (!(s->sp > 1 && s->sp < 1e3)) return -1;
+    s->p[0] = pz + x->c->emb_zoff; s->p[1] = py; s->p[2] = px; s->W = Wf;
+    return 0;
+}
+static void uwr_emb(uwr_ctx *u, int th, int z, int y, int xx, uint32_t i, uint32_t ga, double ui) {
+    uw_ctx *x = u->x; const uw_geo *g = &x->g; const fit_cfg *c = u->c; const fit_fields *f = x->f; const uw_vox *V = x->V;
+    emb_side a; double th0; uwr_Wm(x, z, y, xx, &th0);
+    if (uwr_side(x, z, y, xx, 0.0, &a)) return;   /* W(i) = 0: only differences matter */
+    double t[2][3];
+    {   const double ez[3] = {1, 0, 0}, ey[3] = {0, 1, 0}; const double *r0 = fabs(a.n[0]) < 0.9 ? ez : ey;
+        t[0][0] = a.n[1] * r0[2] - a.n[2] * r0[1]; t[0][1] = a.n[2] * r0[0] - a.n[0] * r0[2]; t[0][2] = a.n[0] * r0[1] - a.n[1] * r0[0];
+        const double l = sqrt(t[0][0] * t[0][0] + t[0][1] * t[0][1] + t[0][2] * t[0][2]); for (int d = 0; d < 3; d++) t[0][d] /= l;
+        t[1][0] = a.n[1] * t[0][2] - a.n[2] * t[0][1]; t[1][1] = a.n[2] * t[0][0] - a.n[0] * t[0][2]; t[1][2] = a.n[0] * t[0][1] - a.n[1] * t[0][0]; }
+    for (int k = 0; k < c->uw_rep_emb_nd; k++) for (int dd = 0; dd < 2; dd++) {
+        const double D = c->uw_rep_emb_d[k];
+        const int zn = (int)floor((a.p[0] + D * t[dd][0]) / f->h), yn = (int)floor((a.p[1] + D * t[dd][1]) / f->h), xn = (int)floor((a.p[2] + D * t[dd][2]) / f->h);
+        if (zn < 0 || yn < 0 || xn < 0 || zn >= g->D || yn >= g->H || xn >= g->W) continue;
+        const uint32_t j = ub_id(g, zn, yn, xn); if (V[j].k == UK_UNSET) continue;
+        const uint32_t gb = uwr_gid(u, zn, yn, xn, j); if (ga == gb) continue;
+        double th1; uwr_Wm(x, zn, yn, xn, &th1);
+        const double dWc = (uw_U(x, j) - ui) - x->m->dir * wrap_pi(th1 - th0) / (2 * M_PI);   /* the flooded W(j) - W(i) */
+        emb_side b; if (uwr_side(x, zn, yn, xn, dWc, &b)) continue;
+        int r = 0; float cf = 0;
+        if (emb_shift_vote(c->emb, &a, &b, c->uw_rep_emb_rmax, c->emb_phi, &r, &cf)) continue;
+        const int bq = V[i].bk < V[j].bk ? V[i].bk : V[j].bk;
+        const double wv = c->uw_rep_emb * bq * fmin(1.0, cf / c->uw_rep_emb_m0);
+        if (wv >= 1) uwr_vote(u, th, ga, gb, (int32_t)-r, (int64_t)lround(wv));
+    }
+}
 static void uwr_tiles(void *a, int z0_, int z1_, int th) {
     uwr_ctx *u = a; uw_ctx *x = u->x; const uw_geo *g = &x->g; const uw_vox *V = x->V; (void)z0_; (void)z1_;
     const int nt = u->ntz * u->nty * u->ntx; uint32_t *q = nullptr; size_t qcap = 0;
@@ -741,6 +783,7 @@ static void uwr_tiles(void *a, int z0_, int z1_, int th) {
                     const uint32_t gb = uwr_gid(u, zn, yn, xn, j); if (ga == gb) continue;
                     uwr_vote(u, th, ga, gb, (int32_t)lround(ui - uw_U(x, j)), uwr_w(u, V[i].bk < V[j].bk ? V[i].bk : V[j].bk, z, y, xx, zn, yn, xn));
                 }
+                if (u->c->emb && u->c->uw_rep_emb > 0 && z % u->c->uw_rep_emb_sub == 0 && y % u->c->uw_rep_emb_sub == 0 && xx % u->c->uw_rep_emb_sub == 0) uwr_emb(u, th, z, y, xx, i, ga, ui);
                 /* evidence: votes between voxels farther apart (every other voxel per axis) */
                 if ((z | y | xx) & 1) continue;
                 const fit_fields *f = x->f; const size_t fi = ((size_t)z * f->H + y) * f->W + xx;
@@ -2005,6 +2048,7 @@ fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap)
         if (fit_fields_load_ex(dir, fz0, fz1, 1, &sb, 0, nullptr, 0, &prevb)) { fit_set_free(s); return nullptr; }
         FIT_TM("slab %d fields", k + 1);
         fit_cfg cs = *c; cs.init = s->global; cs.init_off[0] = (double)fz0 * h; cs.init_off[1] = cs.init_off[2] = 0; cs.dir = s->global->dir;
+        cs.emb_zoff = c->emb_zoff + (double)fz0 * h;
         if (k > 0) {   /* the flood continues from the previous slab's interior (the overlap below zi0) */
             cs.seed = s->slab[k - 1]; cs.seed_off = (double)(fz0 * h) - (double)(s->slab[k - 1]->origin[0] - s->global->origin[0]); cs.seed_z = zi0 - (double)fz0 * h;
         }
