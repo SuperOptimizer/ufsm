@@ -636,7 +636,7 @@ int cmd_predict(int argc, char **argv) {
     nn_set_nlev(cfg.nlev);   /* layer names of the embedded / requested policy */
     const int half = cfg.half_res, hdiv = unet_hr_div(half), hmode = unet_hr_mode(half), nout = hmode == 2 ? cfg.cout / 8 : cfg.cout;   /* low-resolution
                                                                      network (nn_lowres_*): hdiv window voxels per network voxel; pack has 8 logits per output */
-    g_pax_div = cfg.attn_blocks > 0 && (cfg.attn_axis == 1 || cfg.attn_pe == 3) ? hdiv : 0;
+    g_pax_div = unet_cfg_axis(&cfg) ? hdiv : 0;
     if (out_ch < 0 || out_ch >= nout) { fprintf(stderr, "predict: --channel %d outside the checkpoint's %d outputs\n", out_ch, nout); return 2; }
     const char *sweep_out = opt(argc, argv, "--cond-sweep", nullptr);   /* train --cond checkpoints: conditioned inference (src/sweep.h) */
     if (sweep_out && (cfg.cin != 7 || cfg.cout < 15 || half || sheet_task || ffd)) { fprintf(stderr, "predict: --cond-sweep needs a train --cond checkpoint (7 inputs, 15 outputs), no --fit-fields\n"); return 2; }

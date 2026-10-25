@@ -12,7 +12,7 @@
    UFSM_BENCH_PACK=1: packed targets (train --pack-targets); UFSM_BENCH_WIND4=1: --task unwrap2's winding mod 4 (with SIDE=2; hashed);
    UFSM_BENCH_GEOM=rotate_p,zoom_p,elastic_p[,zoom_out_p]: geometry augmentation probabilities; UFSM_BENCH_DUMPN=N: dump the first N batches (prefix-NN-*.pgm; the
    target as recto 255 / verso 128 / void 0, the mask, and the input's mid-z plane); UFSM_BENCH_SLOTS=N: sampler slots. A synthetic band + phase
-   source in the desk's unwrap2 layout: tests/make_wind_fixture.c */
+   source in the desk's unwrap2 layout: tests/make_wind_fixture.c. UFSM_BENCH_SCROLLAUG=aug=p[,..]: xscan / tear / tear_um / crush (per-item loader cost) */
 #include "nn.h"
 #include "sample.h"
 #include "sources.h"
@@ -45,10 +45,21 @@ int main(int argc, char **argv) {
     if (getenv("UFSM_BENCH_SIDE")) c.side = atoi(getenv("UFSM_BENCH_SIDE"));
     if (getenv("UFSM_BENCH_NEAR")) c.phase_near_um = (float)atof(getenv("UFSM_BENCH_NEAR"));   /* --phase-near-um */
     if (getenv("UFSM_BENCH_PZ")) c.Pz = atoi(getenv("UFSM_BENCH_PZ"));
+    if (getenv("UFSM_BENCH_MINFG")) c.min_fg = atof(getenv("UFSM_BENCH_MINFG"));   /* train --min-fg */
     if (getenv("UFSM_BENCH_GPUIN")) c.gpu_input = 1;   /* train --gpu-input: the CT channel and radial records only (hashed as such) */
     if (getenv("UFSM_BENCH_PRESET") && sample_aug_preset(&c, getenv("UFSM_BENCH_PRESET"))) { fprintf(stderr, "UFSM_BENCH_PRESET: all | none\n"); return 2; }
     if (getenv("UFSM_BENCH_PACK")) c.pack_tm = 1;
     if (getenv("UFSM_BENCH_WIND4")) c.wind4 = 1;   /* train --task unwrap2 (with UFSM_BENCH_SIDE=2): the winding mod 4 and its component, hashed too */
+    if (getenv("UFSM_BENCH_SCROLLAUG")) {   /* aug=p[,aug=p..]: the scroll augmentations (train --aug-xscan / --aug-tear / ...; crush: --aug-crush) */
+        for (const char *q = getenv("UFSM_BENCH_SCROLLAUG"); q && *q;) {
+            char key[32]; double v; int nc = 0;
+            if (sscanf(q, "%31[^=]=%lf%n", key, &v, &nc) != 2) { fprintf(stderr, "UFSM_BENCH_SCROLLAUG=aug=p[,aug=p..]\n"); return 2; }
+            if (!strcmp(key, "xscan")) c.xscan_p = (float)v; else if (!strcmp(key, "tear")) c.tear_p = (float)v; else if (!strcmp(key, "tear_um")) c.tear_um = (float)v;
+            else if (!strcmp(key, "crush")) c.crush.p = (float)v; else if (!strcmp(key, "delam")) c.delam_p = (float)v; else if (!strcmp(key, "delam_hole")) c.delam_hole = (float)v; else if (!strcmp(key, "density")) c.density_p = (float)v;
+            else { fprintf(stderr, "UFSM_BENCH_SCROLLAUG: unknown aug %s\n", key); return 2; }
+            q += nc; if (*q == ',') q++;
+        }
+    }
     if (getenv("UFSM_BENCH_GEOM")) {   /* rotate_p,zoom_p,elastic_p[,zoom_out_p]: the geometry augmentation's probabilities (train --rotate-p ...) */
         float q[4] = {0, 0, 0, -1};
         if (sscanf(getenv("UFSM_BENCH_GEOM"), "%f,%f,%f,%f", &q[0], &q[1], &q[2], &q[3]) < 3) { fprintf(stderr, "UFSM_BENCH_GEOM=rotate_p,zoom_p,elastic_p[,zoom_out_p]\n"); return 2; }

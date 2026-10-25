@@ -80,7 +80,12 @@ typedef struct {
                               heads' values (a value projection per level; the finer levels' inputs LayerNorm'd, no gradient to them) are
                               trilinearly sampled there and summed. No registers / memory / view / radial / RoPE positions; the out projection
                               starts at zero (identity) */
+    int attn_dco;          /* deformable attention: 1 = also sample a coarse level (the bottleneck values 2x average-pooled; at_dims.dCo) */
+    int attn_dinit;        /* deformable attention offsets: 0 grid axes + sphere prior, 1 per-token normal / tangent / axis frame (the scroll-radial
+                              direction from unet_set_attn_axis records; the grid axes without them) + points spread along the normal (at_dims.dInit) */
 } unet_cfg;
+/* the attention stage reads the scroll axis records (unet_set_attn_axis): radial attention, scroll RoPE or normal-frame deformable offsets */
+static inline int unet_cfg_axis(const unet_cfg *c) { return c->attn_blocks > 0 && (c->attn_axis == 1 || c->attn_pe == 3 || (c->attn_deform && c->attn_dinit == 1)); }
 static inline int unet_hr_div(int hr) { return hr >= 3 ? 4 : hr ? 2 : 1; }      /* the window voxels per network voxel along each axis */
 static inline int unet_hr_mode(int hr) { return hr == 2 || hr == 4 ? 2 : 1; }   /* the last stage: 1 pool, 2 pack (nn_half_*) */
 
@@ -129,6 +134,9 @@ void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, floa
 /* Muon variants for unet_muon: muonc = Muon-C (per-frequency polarisation of the conv kernels), hyperball = fixed weight and
    update norms (eta = hb_mult x the Muon lr, replaces the decay); both 0 = Muon. The radii go into checkpoints (hb_R). */
 void unet_set_muon_ext(unet *u, int muonc, int hyperball, float hb_mult);
+/* learning-rate multiplier of every parameter outside the attention stage (the conv trunk: Muon matrices and AdamW parameters alike;
+   default 1); the attention stage keeps the scheduled rates. unet_muon / unet_adamw */
+void unet_set_trunk_lr(unet *u, float mult);
 void unet_anvil(unet *u, float lr, float wd, int step, int steps, float lr_adam, float b1, float b2, float eps, float wd_adam);   /* ANVIL II on the 3^3 conv weights, AdamW elsewhere */
 void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step);
 void unet_ema(unet *u, float decay);
