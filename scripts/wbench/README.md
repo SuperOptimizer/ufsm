@@ -65,7 +65,17 @@ already have rows, so delete the rows (or use a new TAG) to redo them. The run t
 
 ## Time per checkpoint
 
-TODO: measured numbers below.
+Measured on the wind96 baseline (2026-10-25):
+
+| part | laptop 5080 | desk 5060 Ti (GPU 0, CPU shared with B) |
+|---|---|---|
+| 45 boxes, first run (predict + 3 fits + phase compare + ceiling) | ~50 min | ~55 min |
+| 45 boxes, fixed fields or cached ceilings | ~35 min | ~40 min |
+| 4 slab sites | 22-40 min (6-12 min per site) | ~25 min |
+
+So one checkpoint takes ~1-1.5 h with slabs; `SLABS=0` brings it under 1 h. Per box: predict 6-12 s, one fit 4-13 s
+(4.5 s of it is pair scoring on the Paris 4 boxes), the ceiling ~25 s (first run only). Laptop and desk agree per box (same fields,
+same fitter): HOLD 0.9253 on both, the old desk eval 0.9255.
 
 ## Statistics
 
