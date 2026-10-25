@@ -88,7 +88,7 @@ typedef struct {
     axis ax;                /* n == 0 when unknown */
     int64_t hold_o[3], hold_n[3];   /* optional held-out box (level-0 voxels); hold_n[0] == 0 when absent (= hold[0]: the validation box) */
     int64_t (*hold)[6]; int nhold;  /* all held-out boxes (z y x nz ny nx, level 0): training windows touch none of them */
-    int64_t (*box)[6]; int nbox;    /* optional "boxes": level-0 boxes [z, y, x, nz, ny, nx] of local CT (task restore: windows inside one) */
+    int64_t (*box)[6]; int nbox;    /* optional "boxes": level-0 boxes [z, y, x, nz, ny, nx]: training windows inside one (by volume; task restore: of local CT) */
     /* optional band target (task band_affinity, src/band.h): winding_mod14 raster array on the 2x label grid,
        {"band": {"root": ..., "key": "4.8", "radius": 80, "span": 75}} under "targets" */
     z3 *band;

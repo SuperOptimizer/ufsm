@@ -1741,6 +1741,19 @@ static void warp_w4_pack(const uint8_t *w4, const uint8_t *cp, uint16_t *wq, siz
     free(wq);
 }
 
+/* "boxes": one box by volume, the bounds of a window inside it (level-l voxels); 1 when none fits */
+static int box_bounds(const source *s, const z3_meta *m, const int64_t n[3], int l, rng *r, int64_t lo[3], int64_t hi[3]) {
+    double tot = 0; for (int k = 0; k < s->nbox; k++) tot += (double)s->box[k][3] * s->box[k][4] * s->box[k][5];
+    double v = runif(r) * tot; int k = 0;
+    for (; k < s->nbox - 1; k++) { v -= (double)s->box[k][3] * s->box[k][4] * s->box[k][5]; if (v < 0) break; }
+    for (int d = 0; d < 3; d++) {
+        lo[d] = (s->box[k][d] + ((int64_t)1 << l) - 1) >> l; hi[d] = ((s->box[k][d] + s->box[k][3 + d]) >> l) - n[d];
+        if (hi[d] > m->shape[d] - n[d]) hi[d] = m->shape[d] - n[d];
+        if (lo[d] < 0) lo[d] = 0;
+        if (hi[d] < lo[d]) return 1;
+    }
+    return 0;
+}
 /* task restore: one clean CT window (the source's min_level) inside a "boxes" entry (training) or the holdout box (validation), the tone
    LUT 255 gain (v / 255)^gamma (gain, gamma exp(U(-0.18, 0.18)), 0 kept) and a cube symmetry, into batch.t */
 static int draw_restore(sampler *sp, batch *b, int i, rng *r, uint8_t *big) {
@@ -1757,17 +1770,8 @@ static int draw_restore(sampler *sp, batch *b, int i, rng *r, uint8_t *big) {
     const z3_meta *m = z3_meta_of(ct);
     int64_t o[3], n[3] = {Pz, P, P}, lo[3], hi[3];
     if (c->holdout) { if (!patch_bounds(s, m, n, l, nullptr, 0, 1, lo, hi)) return 1; }
-    else if (s->nbox) {   /* a box by volume, the window inside it (level-l voxels) */
-        double tot = 0; for (int k = 0; k < s->nbox; k++) tot += (double)s->box[k][3] * s->box[k][4] * s->box[k][5];
-        double v = runif(r) * tot; int k = 0;
-        for (; k < s->nbox - 1; k++) { v -= (double)s->box[k][3] * s->box[k][4] * s->box[k][5]; if (v < 0) break; }
-        for (int d = 0; d < 3; d++) {
-            lo[d] = (s->box[k][d] + ((int64_t)1 << l) - 1) >> l; hi[d] = ((s->box[k][d] + s->box[k][3 + d]) >> l) - n[d];
-            if (hi[d] > m->shape[d] - n[d]) hi[d] = m->shape[d] - n[d];
-            if (lo[d] < 0) lo[d] = 0;
-            if (hi[d] < lo[d]) return 1;
-        }
-    } else for (int d = 0; d < 3; d++) { lo[d] = 0; hi[d] = m->shape[d] - n[d]; if (hi[d] < 0) return 1; }
+    else if (s->nbox) { if (box_bounds(s, m, n, l, r, lo, hi)) return 1; }
+    else for (int d = 0; d < 3; d++) { lo[d] = 0; hi[d] = m->shape[d] - n[d]; if (hi[d] < 0) return 1; }
     for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     if (!c->holdout && training_hits_holdout(sp, s, o, l)) return 1;
     z3 *cct = l + 3 < MAXLEV ? source_ct(s, l + 3) : nullptr;   /* coarse occupancy probe */
@@ -2229,6 +2233,9 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (c->holdout) {
         int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, nullptr, 0, 1, lo, hi)) return 1;
+        for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
+    } else if (s->nbox) {   /* "boxes": training windows inside them (e.g. the emb-only distillation boxes) */
+        int64_t lo[3], hi[3]; if (box_bounds(s, m, n, l, r, lo, hi)) return 1;
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (sp->occ[si].n) {   /* draw around a random coarse cell that contains papyrus */
         size_t k = (size_t)(runif(r) * (double)sp->occ[si].n); if (k >= sp->occ[si].n) k = sp->occ[si].n - 1;

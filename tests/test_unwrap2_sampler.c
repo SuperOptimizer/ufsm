@@ -161,11 +161,12 @@ int main(int argc, char **argv) {
         fclose(f);
         sources *Se = sources_load(q); if (!Se) { fprintf(stderr, "FAIL: sources_load %s\n", q); return 1; }
         snprintf(q, sizeof q, "%s/sources-embonly.json", dir); f = fopen(q, "w");   /* an emb-only source ("ct_only", no targets, a box), as train sources-d2 */
-        fprintf(f, "{\"sources\": [{\"name\": \"embonly\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 8, \"max_level\": 0, \"weight\": 1, \"ct_only\": 1, \"boxes\": [[0, 0, 0, 160, 96, 224]],\n"
+        fprintf(f, "{\"sources\": [{\"name\": \"embonly\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 8, \"max_level\": 0, \"weight\": 1, \"ct_only\": 1, \"boxes\": [[8, 16, 40, 120, 80, 160]],\n"
                    " \"emb\": {\"groups\": [\"%s/emb\"], \"name\": \"pca\", \"level\": 1}}]}\n", dir, dir);
         fclose(f);
         sources *Su = sources_load(q); if (!Su) { fprintf(stderr, "FAIL: sources_load %s\n", q); return 1; }
         size_t lab = 0;   /* (emb-only windows: phase / w4 targets set anywhere) */
+        size_t outside = 0;   /* (emb-only windows not inside the box) */
         for (int aug = 0; aug < 3; aug++) {   /* 0 plain, 1 augmented, 2 the emb-only source (augmented, --min-phase on) */
             sample_cfg c = sample_cfg_default();
             c.P = 64; c.B = 1; c.nworkers = 2; c.nbuf = 3; c.seed = 11; c.deterministic = 1; c.xfmt = 1; c.gpu_input = 1;
@@ -180,6 +181,7 @@ int main(int argc, char **argv) {
                 batch *b = sampler_next(sp); if (!b) { CHECK(0, "emb sampler stopped"); break; }
                 const size_t ng = 512;
                 if (aug == 2) for (size_t k = 0; k < (size_t)64 * 64 * 64; k++) lab += b->side[k] != 255 || b->w4[k] != 255;
+                if (aug == 2) { const int64_t bo[3] = {8, 16, 40}, bn[3] = {120, 80, 160}; for (int d = 0; d < 3; d++) outside += b->corner[0][d] < bo[d] || b->corner[0][d] + 64 > bo[d] + bn[d]; }
                 for (size_t k = 0; k < ng; k++) {
                     double l2 = 0, dot = 0; for (int ch = 0; ch < EC; ch++) l2 += (double)b->emb[ch * ng + k] * b->emb[ch * ng + k];
                     if (l2 == 0) continue;
@@ -206,6 +208,7 @@ int main(int argc, char **argv) {
         sources_free(Se); sources_free(Su);
         printf("emb-only windows: %zu phase / w4 target voxels\n", lab);
         CHECK(lab == 0, "an emb-only source produced %zu phase / w4 target voxels", lab);
+        CHECK(outside == 0, "%zu emb-only window corners outside the source's box", outside);
     }
     if (fails) { fprintf(stderr, "test_unwrap2_sampler: %d failure(s)\n", fails); return 1; }
     printf("test_unwrap2_sampler: OK\n");
