@@ -7,7 +7,8 @@
 #   96-cell slab fits per site, radius profile, fit-join overlap share, joined site score.
 #   Rows: $WB/res/TAG.tsv (boxes), $WB/res/TAG-slabs.tsv, $WB/res/TAG-radius.tsv; logs $WB/runs/TAG/. Compare with ufsm wbench-stats.
 # Env: SITE laptop|desk (default: laptop if ~/ufsm-data exists), GPU (0), BOXES ("all" | names), REP (2: shifted fits per box, 0 off),
-#   SLABS (1), SITES (z cells of the slab sites), FIT (extra fit flags; changes the fitter config tag), FIELDS (TAG0: reuse fields),
+#   SLABS (1), SITES (z cells of the slab sites), FIT (extra fit flags; changes the fitter config tag; "{box}" becomes the box name,
+#   e.g. FIT="--emb /vesuvius/ufsm/repr/emb/bench/{box} --uw-rep-emb 2"), FIELDS (TAG0: reuse fields),
 #   KEEP (1: keep this TAG's fields for later fixed-fields runs; default 1), U (binary; default $WB/bin/ufsm = the pinned build),
 #   NOLOCK=1 (the caller holds the GPU lock).
 set -u
@@ -52,7 +53,7 @@ predict() {   # predict OUTFIELDS z y x nz ny nx LOG [big]: fit fields of the bo
 }
 fitsc() {   # fitsc FIELDS OUT LOG [extra]: production fit + codes score + pair accuracy
   local f=$1 o=$2 lg=$3; shift 3
-  UFSM_FIT_THREADS=$THREADS RUN $U fit $f --gpu $GPU --out $o --codes $QR $QK --dir 1 --uw-repair 8 --score-pairs 1 $FIT "$@" > $lg 2>&1
+  UFSM_FIT_THREADS=$THREADS RUN $U fit $f --gpu $GPU --out $o --codes $QR $QK --dir 1 --uw-repair 8 --score-pairs 1 ${FIT//\{box\}/$B} "$@" > $lg 2>&1
 }
 g_ids() { grep -oE 'winding ids right [0-9.]+' $1 | tail -1 | awk '{print $4}'; }
 g_e08() { grep -oE '< 0.08 turn [0-9.]+' $1 | tail -1 | awk '{print $4}'; }
@@ -115,7 +116,7 @@ if [ "$SLABS" = 1 ]; then
     if [ -n "$FIELDS" ]; then [ -e $f/fields.json ] || { log "$S: no fields $f"; continue; }
     elif [ ! -e $f/fields.json ]; then predict $f $((2 * s)) 1024 512 320 7168 7680 $d/pred.log big || { log "$S predict failed"; continue; }; fi
     bash $H/mkcrop.sh $f $d/fA 0 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fB 64 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fC 0 96 96 160 3328 3520 > /dev/null
-    for k in A B; do UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/f$k --gpu $GPU --out $d/fit$k --codes $QR $QK --score-detail 1 --score-pairs 1 --dir 1 --uw-repair 8 $FIT > $d/fit$k.log 2>&1
+    for k in A B; do UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/f$k --gpu $GPU --out $d/fit$k --codes $QR $QK --score-detail 1 --score-pairs 1 --dir 1 --uw-repair 8 ${FIT//\{box\}/$S} > $d/fit$k.log 2>&1
       grep -E '^    radius' $d/fit$k.log | awk -v t=$TAG -v s=$S -v k=$k '{gsub(/-/, " "); $0 = $0; print t"\t"s"\t"k"\t"$2"\t"$3"\t"$5"\t"$7"\t"$8"\t"$9"\t"$10"\t"$11}' >> $RR; done
     RUN $U fit-join $d/joined $d/fC --blend 16 $d/fitA 32 160 $d/fitB 160 288 > $d/join.log 2>&1
     js=$(num $(grep -oE '^ +0\|1 .*' $d/join.log | awk '{print $NF}'))
