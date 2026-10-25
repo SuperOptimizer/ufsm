@@ -98,6 +98,25 @@ static void test_tifxyz_scale(void) {
     free(X); free(Z);
     snprintf(p, sizeof p, "rm -rf %s %s", s, d); CHECK(!system(p), "cleanup");
 }
+/* a published-style meta.json (indent-4 JSON, "scale" past 16 KB: PHerc1203 metas are 13 KB+ and fixed 4 KB buffers read step 1):
+   tfx_meta_read returns all of it, tifxyz-scale by 4 rewrites the scale, by 1 keeps it (whole file) */
+static void test_tifxyz_big_meta(void) {
+    enum { W = 4, H = 3 }; float x[W * H], y[W * H], z[W * H];
+    for (int i = 0; i < W * H; i++) { x[i] = 100 + i; y[i] = 200 + i; z[i] = 300 + i; }
+    const char *s = "/tmp/ufsm_test_bigmeta_src", *d = "/tmp/ufsm_test_bigmeta_dst", *d1 = "/tmp/ufsm_test_bigmeta_dst1"; char p[256];
+    CHECK(!tifxyz_write(s, W, H, x, y, z, 1, 9.362, 7, "test"), "tifxyz write (big meta)");
+    snprintf(p, sizeof p, "%s/meta.json", s); FILE *f = fopen(p, "w");
+    if (f) { fputs("{\n    \"pad\": [\n", f); for (int i = 0; i < 2000; i++) fprintf(f, "        %d.125,\n", i); fputs("        0\n    ],\n    \"scale\": [\n        0.05000000074505806,\n        0.05000000074505806\n    ],\n    \"voxel_size_um\": 9.362\n}\n", f); fclose(f); }
+    char *m = tfx_meta_read(p); CHECK(m && strlen(m) > 16384 && strstr(m, "\"voxel_size_um\": 9.362\n}"), "tfx_meta_read: whole file (%zu bytes)", m ? strlen(m) : 0);
+    const double off[3] = {0, 0, 0};
+    CHECK(!tifxyz_scale(s, d, 4, off) && !tifxyz_scale(s, d1, 1, off), "tifxyz scale (big meta)");
+    snprintf(p, sizeof p, "%s/meta.json", d); char *m4 = tfx_meta_read(p); const char *q = m4 ? strstr(m4, "\"scale\":") : nullptr;
+    q = q ? strchr(q, '[') : nullptr; CHECK(q && fabs(atof(q + 1) - 0.2) < 1e-6, "big meta scaled x4: %.9f", q ? atof(q + 1) : -1.0);
+    snprintf(p, sizeof p, "%s/meta.json", d1); char *m1 = tfx_meta_read(p); q = m1 ? strstr(m1, "\"scale\":") : nullptr; q = q ? strchr(q, '[') : nullptr;
+    CHECK(m1 && strlen(m1) > 16384 && q && fabs(atof(q + 1) - 0.05) < 1e-9 && strstr(m1, "\"voxel_size_um\""), "big meta kept whole by div 1");
+    free(m); free(m4); free(m1);
+    snprintf(p, sizeof p, "rm -rf %s %s %s", s, d, d1); CHECK(!system(p), "cleanup");
+}
 static void test_tifxyz_shift(void) {   /* a plane z = 10 (x = column, y = row): +n = x-step x y-step = +z; the invalid corner vertex stays */
     enum { W = 6, H = 4 }; float x[W * H], y[W * H], z[W * H];
     for (int r = 0; r < H; r++) for (int c = 0; c < W; c++) { const int i = r * W + c; x[i] = c; y[i] = r; z[i] = i == 0 ? -1.f : 10.f; }
@@ -169,8 +188,16 @@ static void test_ink_compare(void) {   /* ink_stats / ink_corr / ink_panels_half
     free(cr);
     CHECK(img_crop_u8(dim, W, H, 0, 0, 0, 4) == nullptr, "crop of width 0");
 }
+/* render_out_px: one mesh scaled by two divisors (float32 meta scales, as ufsm render reads them: step = 1 / scale) gives the same
+   output size at matching --scale (ink at level L x 0.5 vs CT at level L+2 x 2: PHerc1203 raw-auto_grown, 281 vs 280 px) */
+static void test_render_out_px(void) {
+    const float s1 = 0.05f, s4 = 0.05f * 4;   /* meta "scale" after tifxyz-scale by 1 and by 4 */
+    const double g1 = (1 / (double)s1) * 0.5, g4 = (1 / (double)s4) * 2;
+    for (int n = 2; n < 400; n++) CHECK(render_out_px(n, g1) == render_out_px(n, g4), "render_out_px n %d: %d vs %d", n, render_out_px(n, g1), render_out_px(n, g4));
+    CHECK(render_out_px(29, 10.0) == 281 && render_out_px(10, 2.5) == 23 && render_out_px(1, 3.0) == 1, "render_out_px exact cases");
+}
 int main(void) {
-    test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_jpeg_read_fit(); test_tifxyz_scale(); test_tifxyz_shift(); test_ink_compare();
+    test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_jpeg_read_fit(); test_tifxyz_scale(); test_tifxyz_big_meta(); test_tifxyz_shift(); test_ink_compare(); test_render_out_px();
     if (fails) { fprintf(stderr, "test_imgops: %d failures\n", fails); return 1; }
     printf("test_imgops: ok\n");
     return 0;

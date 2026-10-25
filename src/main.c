@@ -2128,7 +2128,7 @@ static int cmd_wrapdist(int argc, char **argv) {
         snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = wd_read(p, &w2, &h2);
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = wd_read(p, &w3, &h3);
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name); double wum = 0;
-        { FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"voxel_size_um\":"); if (q) wum = atof(q + 16); } }
+        { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"voxel_size_um\":") : nullptr; if (q) wum = atof(q + 16); free(b); }
         if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || !(wum > 0)) { free(X); free(Y); free(Z); continue; }
         const double sc = wum / lum;
         for (size_t i = 0; i < (size_t)w * h; i++) {
@@ -2288,7 +2288,7 @@ static int cmd_wrapswitch(int argc, char **argv) {
         if (de->d_name[0] != 'w') continue;
         char p[1400]; int w, h, w2, h2, w3, h3; double um = 0;
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
-        { FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"voxel_size_um\":"); if (q) um = atof(q + 16); } }
+        { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"voxel_size_um\":") : nullptr; if (q) um = atof(q + 16); free(b); }
         snprintf(p, sizeof p, "%s/%s/x.tif", argv[2], de->d_name); float *X = wd_read(p, &w, &h);
         snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = wd_read(p, &w2, &h2);
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = wd_read(p, &w3, &h3);
@@ -2429,10 +2429,10 @@ static int cmd_surfsnap(int argc, char **argv) {
         if (de->d_name[0] != 'w') continue;
         char p[1400]; int w, h, w2, h2, w3, h3; double wum = 0, scale = 0; int winding = 0;
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
-        { FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); }
+        { char *bm = tfx_meta_read(p); const char *b = bm ? bm : "";
           const char *q = strstr(b, "\"voxel_size_um\":"); if (q) wum = atof(q + 16);
           q = strstr(b, "\"scale\":"); if (q) { q = strchr(q, '['); if (q) scale = atof(q + 1); }
-          q = strstr(b, "\"winding\":"); if (q) winding = atoi(q + 10); }
+          q = strstr(b, "\"winding\":"); if (q) winding = atoi(q + 10); free(bm); }
         snprintf(p, sizeof p, "%s/%s/x.tif", argv[2], de->d_name); float *X = read_tif_f32(p, &w, &h);
         snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = read_tif_f32(p, &w2, &h2);
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = read_tif_f32(p, &w3, &h3);
@@ -3154,9 +3154,9 @@ static int cmd_render(int argc, char **argv) {
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = read_tif_f32(p, &w3, &h3);
         if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || w < 2 || h < 2) { free(X); free(Y); free(Z); continue; }
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
-        double step = 1; { FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"scale\": ["); if (q) step = 1 / atof(q + 10); } }
+        double step = 1; { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"scale\":") : nullptr; if (q && (q = strchr(q, '['))) { const double sc = atof(q + 1); if (sc > 0) step = 1 / sc; } free(b); }
         const double gs = step * scale;   /* output pixels per grid step */
-        const int ow = (int)((w - 1) * gs) + 1, oh = (int)((h - 1) * gs) + 1;
+        const int ow = render_out_px(w, gs), oh = render_out_px(h, gs);
         uint8_t *img = calloc((size_t)ow * oh, 1), *cimg = cz ? calloc((size_t)ow * oh, 1) : nullptr;
         /* output tiles: each reads only the volume around its own vertices (+- depth), so a wrap of any size renders in bounded memory */
         for (int ty = 0; ty < oh; ty += tile) for (int tx = 0; tx < ow; tx += tile) {

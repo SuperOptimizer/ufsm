@@ -40,10 +40,10 @@ static void sf_free(sf_wrap *s) { free(s->X); free(s->Y); free(s->Z); memset(s, 
 static int sf_load(const char *dir, const char *name, sf_wrap *s) {
     memset(s, 0, sizeof *s); snprintf(s->name, sizeof s->name, "%s", name);
     char p[1400]; snprintf(p, sizeof p, "%s/%s/meta.json", dir, name);
-    FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { const size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); }
+    char *bm = tfx_meta_read(p); const char *b = bm ? bm : "";
     const char *q = strstr(b, "\"voxel_size_um\":"); if (q) s->um = atof(q + 16);
     q = strstr(b, "\"scale\":"); if (q && (q = strchr(q, '['))) { const double sc = atof(q + 1); s->step = sc > 0 ? 1 / sc : 0; }
-    q = strstr(b, "\"winding\":"); s->id = q ? atoi(q + 10) : atoi(name + 1);
+    q = strstr(b, "\"winding\":"); s->id = q ? atoi(q + 10) : atoi(name + 1); free(bm);
     int w2, h2, w3, h3;
     snprintf(p, sizeof p, "%s/%s/x.tif", dir, name); s->X = tif_f32(p, &s->w, &s->h);
     snprintf(p, sizeof p, "%s/%s/y.tif", dir, name); s->Y = tif_f32(p, &w2, &h2);

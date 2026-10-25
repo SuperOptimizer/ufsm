@@ -29,5 +29,8 @@ float *tfx_axis_read(const char *tifpath, int *w, int *h, float *(*plain)(const 
 /* <wrap>/meta.json opened for reading: the file, else the .sfc's metadata (fmemopen) */
 #include <stdio.h>
 FILE *tfx_meta_fopen(const char *metapath);
+/* the whole meta.json (plain or sfc-backed) as a NUL-terminated malloc string, nullptr when missing (published tifxyz metas run to
+   13 KB+: fixed 4 KB buffers missed "scale" past it) */
+char *tfx_meta_read(const char *metapath);
 /* a wrap's meta.json or x.tif path exists (plain or sfc-backed) */
 int tfx_exists(const char *path);

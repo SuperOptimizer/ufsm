@@ -337,8 +337,8 @@ int tifxyz_shift(const char *src, const char *dst, double d, const double *towar
     if (toward) fprintf(stderr, "tifxyz-scale --normal: %s: %s (vote %.0f)\n", src, sg > 0 ? "+n faces the axis" : "+n faced away from the axis: flipped", vote);
     snprintf(p, sizeof p, "mkdir -p '%s'", dst); if (system(p)) goto out;
     for (int k = 0; k < 3; k++) { snprintf(p, sizeof p, "%s/%s.tif", dst, nm[k]); if (tiffw_write(p, w, h, 3, O[k], 1)) goto out; }
-    { snprintf(p, sizeof p, "%s/meta.json", src); FILE *fi = tfx_meta_fopen(p); char mb[16384]; const size_t mn = fi ? fread(mb, 1, sizeof mb, fi) : 0; if (fi) fclose(fi);
-      snprintf(p, sizeof p, "%s/meta.json", dst); FILE *fo = fi ? fopen(p, "wb") : nullptr; rc = fo && fwrite(mb, 1, mn, fo) == mn ? 0 : -1; if (fo && fclose(fo)) rc = -1; }
+    { snprintf(p, sizeof p, "%s/meta.json", src); char *mb = tfx_meta_read(p); const size_t mn = mb ? strlen(mb) : 0;
+      snprintf(p, sizeof p, "%s/meta.json", dst); FILE *fo = mb ? fopen(p, "wb") : nullptr; rc = fo && fwrite(mb, 1, mn, fo) == mn ? 0 : -1; if (fo && fclose(fo)) rc = -1; free(mb); }
 out:
     for (int k = 0; k < 3; k++) { free(A[k]); free(O[k]); free(Nv[k]); }
     return rc;
@@ -358,10 +358,9 @@ int tifxyz_scale(const char *src, const char *dst, double div, const double off[
         snprintf(p, sizeof p, "%s/%s.tif", dst, nm[k]); if (tiffw_write(p, w, h, 3, o, 1)) { free(o); goto out; }
     }
     free(o);
-    snprintf(p, sizeof p, "%s/meta.json", src); FILE *f = tfx_meta_fopen(p); if (!f) goto out;
-    char mb[16384]; const size_t mn = fread(mb, 1, sizeof mb - 1, f); fclose(f); mb[mn] = 0;
-    char *ms = meta_scaled(mb, div); if (!ms) goto out;
-    snprintf(p, sizeof p, "%s/meta.json", dst); f = fopen(p, "w");
+    snprintf(p, sizeof p, "%s/meta.json", src); char *mb = tfx_meta_read(p); if (!mb) goto out;
+    char *ms = meta_scaled(mb, div); free(mb); if (!ms) goto out;
+    snprintf(p, sizeof p, "%s/meta.json", dst); FILE *f = fopen(p, "w");
     if (f) { fputs(ms, f); rc = fclose(f) ? -1 : 0; }
     free(ms);
 out:
