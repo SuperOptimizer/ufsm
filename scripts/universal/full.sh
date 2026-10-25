@@ -37,4 +37,4 @@ if [ ! -e $R/last.ckpt ] && [ "${BENCH:-1}" = 1 ]; then   # the window: 30 steps
   [ $ok = 1 ] || { echo "full.sh: no window fits; see $R/bench-*/log"; exit 1; }
   echo "full.sh: P$P ($(grep -oE '[0-9]+ ms/step [0-9.]+ Mvox/s' $R/bench-$P/log | tail -1))"
 fi
-CFGX="$(cfg $P)" SLOTS=${SLOTS:-8} GPU=$GPU U=$U bash $D/launch.sh $R
+CFGX="$(cfg $P)" SLOTS=${SLOTS:-8} KEEP=${KEEP:-4000} GPU=$GPU U=$U bash $D/launch.sh $R   # (KEEP 4000: every eval checkpoint kept)
