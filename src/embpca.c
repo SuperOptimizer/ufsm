@@ -2,8 +2,9 @@
    and its application: each vector centred, projected on the top k components, renormalised to a unit vector, stored int8 x 127 in a
    zarr v3 array of 512^3-voxel shards (64 cells of 8) -> ~0.13 B / voxel at k 64 instead of 0.94 for 480-d tokens.
      ufsm emb-pca fit BASIS.json GROUP... [--name tokens_unit] [--k 64] [--per 50000] [--threads 8]
-     ufsm emb-pca apply BASIS.json GROUP OUTGROUP [--name tokens_unit] [--out-name pca64] [--threads 8]
-   GROUP: a dinovol-embed output group (its zarr.json attributes give box_zyx); only the box's cells are read. */
+     ufsm emb-pca apply BASIS.json GROUP OUTGROUP [--box z,y,x,nz,ny,nx] [--name tokens_unit] [--out-name pca64] [--threads 8]
+   GROUP: a dinovol-embed output group (its zarr.json attributes give box_zyx); only the box's cells are read (--box: another box, e.g. one z slab of a
+   whole-scroll group; OUTGROUP may be shared by several applies whose boxes cover whole 512-voxel shard layers). Streams one 16-cell z layer at a time. */
 #include "embz.h"
 #include "fit_emb.h"
 #include "json.h"
@@ -121,10 +122,12 @@ static int pca_fit(int argc, char **argv) {
     return 0;
 }
 
-typedef struct { const int8_t *v; int8_t *out; const float *B, *mean; int C, k; int64_t n[3], a[3]; int64_t off[3]; int z0, z1; } prj_job;
+typedef struct { const int8_t *v; int8_t *out; const float *B, *mean; int C, k; int64_t n[3], a[3], off[3], lim[3]; int z0, z1; size_t nv; } prj_job;   /* out index = source + off, written where < lim */
 static void *prj_main(void *p) {
     prj_job *J = p; const int C = J->C, k = J->k; float *x = malloc(C * sizeof *x), *y = malloc(k * sizeof *y);
     for (int z = J->z0; z < J->z1; z++) for (int64_t yy = 0; yy < J->n[1]; yy++) for (int64_t xx = 0; xx < J->n[2]; xx++) {
+        const int64_t oz = z + J->off[0], oy = yy + J->off[1], ox = xx + J->off[2];
+        if (oz < 0 || oy < 0 || ox < 0 || oz >= J->lim[0] || oy >= J->lim[1] || ox >= J->lim[2]) continue;
         const int8_t *s = J->v + (((size_t)z * J->n[1] + yy) * J->n[2] + xx) * C; int any = 0;
         for (int i = 0; i < C && !any; i++) any = s[i];
         if (!any) continue;
@@ -133,7 +136,7 @@ static void *prj_main(void *p) {
         for (int r = 0; r < k; r++) { const float *b = J->B + (size_t)r * C; float d = 0; for (int i = 0; i < C; i++) d += b[i] * x[i]; y[r] = d; l += (double)d * d; }
         if (l <= 0) continue;
         const double inv = 127 / sqrt(l);
-        int8_t *o = J->out + ((((size_t)(z + J->off[0]) * J->a[1]) + yy + J->off[1]) * J->a[2] + xx + J->off[2]) * k;
+        int8_t *o = J->out + ((((size_t)oz * J->a[1]) + oy) * J->a[2] + ox) * k; J->nv++;
         for (int r = 0; r < k; r++) { long t = lround(y[r] * inv); if (!t && y[r] != 0) t = y[r] > 0 ? 1 : -1; o[r] = (int8_t)(t > 127 ? 127 : t < -127 ? -127 : t); }
     }
     free(x); free(y); return nullptr;
@@ -150,21 +153,23 @@ static int pca_apply(int argc, char **argv) {
     for (int r = 0; r < k; r++) for (int i = 0; i < C; i++) B[(size_t)r * C + i] = (float)json_num(json_at(json_at(json_path(bj, "basis"), r), i), NAN);
     json_free(bj);
     for (size_t i = 0; i < (size_t)k * C; i++) if (isnan(B[i])) { fprintf(stderr, "emb-pca: %s: bad basis\n", bp); return 1; }
-    emb_vol *e = open_box(group, name); if (!e) return 1;
-    if (emb_vol_dim(e) != C) { fprintf(stderr, "emb-pca: %s has %d channels, the basis %d\n", group, emb_vol_dim(e), C); return 1; }
-    int64_t n[3], o[3]; int step; const int8_t *v = emb_vol_cells(e, n, o, &step);
-    /* the source array's whole-grid shape (cells) */
-    char p[1400]; snprintf(p, sizeof p, "%s/%s/zarr.json", group, name); json *aj = jload(p);
+    /* the box (embedding-volume voxels): --box, else the group's box_zyx; the source array's shape (cells) and step */
+    char p[1400]; long long bx[6];
+    if (popt(argc, argv, "--box", nullptr)) { if (sscanf(popt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", &bx[0], &bx[1], &bx[2], &bx[3], &bx[4], &bx[5]) != 6) { fprintf(stderr, "emb-pca: --box z,y,x,nz,ny,nx\n"); return 2; } }
+    else { snprintf(p, sizeof p, "%s/zarr.json", group); json *g = jload(p); const json *b = g ? json_path(g, "attributes.box_zyx") : nullptr;
+           if (!b || !json_at(b, 5)) { fprintf(stderr, "emb-pca: %s: no attributes.box_zyx\n", p); json_free(g); return 1; }
+           for (int d = 0; d < 6; d++) { bx[d] = (long long)json_num(json_at(b, d), 0); }
+           json_free(g); }
+    snprintf(p, sizeof p, "%s/%s/zarr.json", group, name); json *aj = jload(p);
     int64_t shp[3]; for (int d = 0; d < 3; d++) shp[d] = aj ? (int64_t)json_num(json_at(json_path(aj, "shape"), d), 0) : 0;
+    const int step = aj ? (int)json_num(json_at(json_path(aj, "attributes.step_zyx"), 0), 0) : 0;
     json_free(aj);
-    if (!shp[0]) { fprintf(stderr, "emb-pca: cannot read %s\n", p); return 1; }
+    if (!shp[0] || step <= 0) { fprintf(stderr, "emb-pca: cannot read %s\n", p); return 1; }
     const int CH = 16, SH = 512 / step;   /* 16-cell chunks, 512-voxel shards */
-    int64_t c0[3], a[3], off[3];
-    for (int d = 0; d < 3; d++) { const int64_t g0 = o[d] / step; c0[d] = g0 / CH * CH; off[d] = g0 - c0[d]; a[d] = (g0 + n[d] - c0[d] + CH - 1) / CH * CH; }
-    int8_t *out = calloc((size_t)a[0] * a[1] * a[2] * k, 1); if (!out) { fprintf(stderr, "emb-pca: out of memory\n"); return 1; }
-    prj_job J[64]; pthread_t th[64];
-    for (int t = 0; t < nt; t++) { J[t] = (prj_job){v, out, B, mean, C, k, {n[0], n[1], n[2]}, {a[0], a[1], a[2]}, {off[0], off[1], off[2]}, (int)(n[0] * t / nt), (int)(n[0] * (t + 1) / nt)}; pthread_create(&th[t], nullptr, prj_main, &J[t]); }
-    for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
+    int64_t g0[3], g1[3], c0[3], a[3];
+    for (int d = 0; d < 3; d++) { g0[d] = bx[d] / step; g1[d] = (bx[d] + bx[3 + d] + step - 1) / step; if (g1[d] > shp[d]) g1[d] = shp[d];
+                                  if (g1[d] <= g0[d]) { fprintf(stderr, "emb-pca: empty box\n"); return 1; }
+                                  c0[d] = g0[d] / CH * CH; a[d] = (g1[d] - c0[d] + CH - 1) / CH * CH; }
     /* the output group: the source group's zarr.json + the array */
     if (mkdir(outg, 0755) && errno != EEXIST) { fprintf(stderr, "emb-pca: cannot create %s\n", outg); return 1; }
     { snprintf(p, sizeof p, "%s/zarr.json", group); size_t len = 0; char *t = slurp(p, &len); snprintf(p, sizeof p, "%s/zarr.json", outg); FILE *f = t ? fopen(p, "w") : nullptr;
@@ -175,9 +180,29 @@ static int pca_apply(int argc, char **argv) {
     snprintf(d, sizeof d, "%s/%s", outg, oname);
     zw W; zw_nthreads = nt;
     if (zw_create(&W, d, shp, k, "int8", 1, SH, CH, attrs)) return 1;
-    int rc = zw_put(&W, c0[0], c0[1], c0[2], (int)a[0], (int)a[1], (int)a[2], out); rc |= zw_flush(&W); zw_free(&W);
-    fprintf(stderr, "emb-pca: %s -> %s (%lldx%lldx%lld cells, k %d, %d-cell shards)%s\n", group, d, (long long)n[0], (long long)n[1], (long long)n[2], k, SH, rc ? " FAILED" : "");
-    free(out); free(B); free(mean); emb_vol_free(e);
+    /* z blocks of one chunk layer (16 cells): load that layer of the box, project, put; shards close at their last layer */
+    const size_t ob = (size_t)CH * a[1] * a[2] * k; int8_t *out = malloc(ob); int rc = 0; size_t nvec = 0;
+    if (!out) { fprintf(stderr, "emb-pca: out of memory\n"); return 1; }
+    for (int64_t zb = c0[0]; zb < g1[0] && !rc; zb += CH) {
+        const int64_t lo = zb > g0[0] ? zb : g0[0], hi = zb + CH < g1[0] ? zb + CH : g1[0];
+        memset(out, 0, ob);
+        const long long org[3] = {lo * step, g0[1] * step, g0[2] * step}, n3[3] = {(hi - lo) * step, (g1[1] - g0[1]) * step, (g1[2] - g0[2]) * step};
+        emb_vol *e = emb_vol_open(group, name, org, n3, 1.0, 0); if (!e) { rc = 1; break; }
+        if (emb_vol_dim(e) != C) { fprintf(stderr, "emb-pca: %s has %d channels, the basis %d\n", group, emb_vol_dim(e), C); emb_vol_free(e); rc = 1; break; }
+        int64_t n[3], o[3]; int st; const int8_t *v = emb_vol_cells(e, n, o, &st);
+        const int64_t off[3] = {o[0] / step - zb, o[1] / step - c0[1], o[2] / step - c0[2]}, lim[3] = {hi - zb, g1[1] - c0[1], g1[2] - c0[2]};
+        prj_job J[64]; pthread_t th[64];
+        for (int t = 0; t < nt; t++) { J[t] = (prj_job){v, out, B, mean, C, k, {n[0], n[1], n[2]}, {CH, a[1], a[2]}, {off[0], off[1], off[2]}, {lim[0], lim[1], lim[2]}, (int)(n[0] * t / nt), (int)(n[0] * (t + 1) / nt), 0};
+                                       pthread_create(&th[t], nullptr, prj_main, &J[t]); }
+        for (int t = 0; t < nt; t++) { pthread_join(th[t], nullptr); nvec += J[t].nv; }
+        emb_vol_free(e);
+        rc |= zw_put(&W, zb, c0[1], c0[2], CH, (int)a[1], (int)a[2], out);
+        if ((zb + CH) % SH == 0 || zb + CH >= g1[0]) rc |= zw_flush(&W);
+    }
+    zw_free(&W);
+    fprintf(stderr, "emb-pca: %s -> %s (cells z %lld..%lld y %lld..%lld x %lld..%lld, %zu vectors, k %d, %d-cell shards)%s\n", group, d, (long long)g0[0], (long long)g1[0],
+            (long long)g0[1], (long long)g1[1], (long long)g0[2], (long long)g1[2], nvec, k, SH, rc ? " FAILED" : "");
+    free(out); free(B); free(mean);
     return rc ? 1 : 0;
 }
 
@@ -185,6 +210,6 @@ int cmd_emb_pca(int argc, char **argv) {
     if (argc >= 5 && !strcmp(argv[2], "fit")) return pca_fit(argc, argv);
     if (argc >= 6 && !strcmp(argv[2], "apply")) return pca_apply(argc, argv);
     fprintf(stderr, "usage: ufsm emb-pca fit BASIS.json GROUP... [--name tokens_unit] [--k 64] [--per 50000] [--threads 8]\n"
-                    "       ufsm emb-pca apply BASIS.json GROUP OUTGROUP [--name tokens_unit] [--out-name pca64] [--threads 8]\n");
+                    "       ufsm emb-pca apply BASIS.json GROUP OUTGROUP [--box z,y,x,nz,ny,nx] [--name tokens_unit] [--out-name pca64] [--threads 8]\n");
     return 2;
 }
