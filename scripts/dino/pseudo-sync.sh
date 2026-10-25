@@ -5,6 +5,6 @@ set -eu
 
 S=${1:-$HOME/ufsm-data/dino/pseudo/scans}; T=${2:-forrest@192.168.0.175:/vesuvius/ufsm/dino/pseudo/scans}
 ssh ${T%%:*} mkdir -p ${T#*:}
-rsync -a --prune-empty-dirs --include '*/' --include 'sources*.json' --include 'source*.json' --include 'b*/codes/***' --include 'b*/codes2/***' \
+rsync -a --prune-empty-dirs --include '*/' --include 'sources*.json' --include 'source*.json' --include 'axis.json' --include 'b*/codes/***' --include 'b*/codes2/***' \
   --exclude '*' $S/ $T/
 echo "pseudo-sync: $(ls -d $S/*/ | wc -l) scans -> $T"

@@ -108,6 +108,12 @@ FILE *tfx_meta_fopen(const char *metapath) {
     f = fmemopen(nullptr, strlen(m) + 1, "w+"); if (!f) { free(m); return nullptr; }
     fputs(m, f); rewind(f); free(m); return f;
 }
+char *tfx_meta_read(const char *metapath) {
+    FILE *f = tfx_meta_fopen(metapath); if (!f) return nullptr;
+    size_t cap = 16384, n = 0; char *b = malloc(cap);
+    while (b) { n += fread(b + n, 1, cap - 1 - n, f); if (n < cap - 1) break; char *nb = realloc(b, cap *= 2); if (!nb) { free(b); b = nullptr; } else b = nb; }
+    fclose(f); if (b) b[n] = 0; return b;
+}
 int tfx_exists(const char *path) {
     if (!access(path, F_OK)) return 1;
     if (!tfx_meta_hook) return 0;

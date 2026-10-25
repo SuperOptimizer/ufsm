@@ -1,5 +1,5 @@
 /* src/imgops.c: Pillow-exact BILINEAR / BOX resampling and the overlay_red.py compositing (bytes from Pillow / numpy, see
-   test_imgops_expected.h), the L1 dilation against a brute-force cross dilation, a JPEG write / PNG read smoke test, and the
+   test_imgops_expected.h), the L1 dilation against a brute-force cross dilation, a JPEG write / PNG read smoke test, JPEG read + img_fit_rgb, and the
    tifxyz rescale of xform_wraps.py (float32 v / div - offset, -1 kept, meta scale x div). */
 #include "imgops.h"
 #include "tiffw.h"
@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
@@ -55,6 +56,27 @@ static void test_jpeg(void) {
     FILE *f = fopen(p, "rb"); uint8_t h[3] = {0}; if (f) { CHECK(fread(h, 1, 3, f) == 3, "jpeg read"); fclose(f); }
     CHECK(h[0] == 0xff && h[1] == 0xd8 && h[2] == 0xff, "jpeg SOI marker"); remove(p);
 }
+/* jpeg_read_rgb round trip (a smooth gray ramp survives q95 within a few levels), a corrupt file -> nullptr (no exit), and img_fit_rgb:
+   the longest side to N with the aspect kept, a constant image stays constant, already-small images untouched */
+static void test_jpeg_read_fit(void) {
+    enum { W = 64, H = 32 }; uint8_t *rgb = malloc(W * H * 3);
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) for (int c = 0; c < 3; c++) rgb[(y * W + x) * 3 + c] = (uint8_t)(x * 3 + y);
+    const char *p = "/tmp/ufsm_test_imgops_rd.jpg"; CHECK(!jpeg_write_rgb(p, W, H, rgb, 95), "jpeg write (read test)");
+    int w = 0, h = 0; uint8_t *r = jpeg_read_rgb(p, &w, &h);
+    CHECK(r && w == W && h == H, "jpeg_read_rgb size %dx%d", w, h);
+    int md = 0; if (r) for (int i = 0; i < W * H * 3; i++) { const int d = abs((int)r[i] - rgb[i]); if (d > md) md = d; }
+    CHECK(md <= 6, "jpeg round trip max diff %d", md); free(r);
+    if (truncate(p, 200) == 0) { r = jpeg_read_rgb(p, &w, &h); free(r); }   /* truncated: libjpeg warns and pads (or fails); either way no exit */
+    { FILE *g = fopen(p, "wb"); if (g) { fputs("\xff\xd8garbage", g); fclose(g); } }
+    CHECK(!jpeg_read_rgb(p, &w, &h), "corrupt JPEG -> nullptr"); remove(p);
+    CHECK(!jpeg_read_rgb("/nonexistent/x.jpg", &w, &h), "missing JPEG -> nullptr");
+    w = W; h = H; CHECK(!img_fit_rgb(&rgb, &w, &h, 16, 2) && w == 16 && h == 8, "img_fit_rgb 64x32 -> 16: %dx%d", w, h);
+    w = 16; h = 8; uint8_t *keep = rgb; CHECK(!img_fit_rgb(&rgb, &w, &h, 16, 2) && rgb == keep && w == 16, "img_fit_rgb within: untouched");
+    CHECK(!img_fit_rgb(&rgb, &w, &h, 0, 2) && rgb == keep, "img_fit_rgb 0: off");
+    free(rgb); rgb = malloc(30 * 100 * 3); memset(rgb, 77, 30 * 100 * 3); w = 30; h = 100;
+    CHECK(!img_fit_rgb(&rgb, &w, &h, 40, 2) && w == 12 && h == 40, "img_fit_rgb tall 30x100 -> 40: %dx%d", w, h);
+    int ok = 1; for (int i = 0; i < w * h * 3; i++) ok &= rgb[i] == 77; CHECK(ok, "img_fit_rgb constant stays constant"); free(rgb);
+}
 static void test_tifxyz_scale(void) {
     enum { W = 9, H = 5 }; float x[W * H], y[W * H], z[W * H];
     for (int i = 0; i < W * H; i++) { x[i] = 17761.5f + i * 3.37f; y[i] = 6691.428f + i * 1.11f; z[i] = i % 7 == 3 ? -1.f : 9217.504f + i * 0.31f; }
@@ -75,6 +97,25 @@ static void test_tifxyz_scale(void) {
     CHECK(strstr(m, "\"scale\": [1, 1]") && strstr(m, "\"voxel_size_um\": 9.596") && strstr(m, "\"winding\": 150"), "tifxyz scale meta: %s", m);
     free(X); free(Z);
     snprintf(p, sizeof p, "rm -rf %s %s", s, d); CHECK(!system(p), "cleanup");
+}
+/* a published-style meta.json (indent-4 JSON, "scale" past 16 KB: PHerc1203 metas are 13 KB+ and fixed 4 KB buffers read step 1):
+   tfx_meta_read returns all of it, tifxyz-scale by 4 rewrites the scale, by 1 keeps it (whole file) */
+static void test_tifxyz_big_meta(void) {
+    enum { W = 4, H = 3 }; float x[W * H], y[W * H], z[W * H];
+    for (int i = 0; i < W * H; i++) { x[i] = 100 + i; y[i] = 200 + i; z[i] = 300 + i; }
+    const char *s = "/tmp/ufsm_test_bigmeta_src", *d = "/tmp/ufsm_test_bigmeta_dst", *d1 = "/tmp/ufsm_test_bigmeta_dst1"; char p[256];
+    CHECK(!tifxyz_write(s, W, H, x, y, z, 1, 9.362, 7, "test"), "tifxyz write (big meta)");
+    snprintf(p, sizeof p, "%s/meta.json", s); FILE *f = fopen(p, "w");
+    if (f) { fputs("{\n    \"pad\": [\n", f); for (int i = 0; i < 2000; i++) fprintf(f, "        %d.125,\n", i); fputs("        0\n    ],\n    \"scale\": [\n        0.05000000074505806,\n        0.05000000074505806\n    ],\n    \"voxel_size_um\": 9.362\n}\n", f); fclose(f); }
+    char *m = tfx_meta_read(p); CHECK(m && strlen(m) > 16384 && strstr(m, "\"voxel_size_um\": 9.362\n}"), "tfx_meta_read: whole file (%zu bytes)", m ? strlen(m) : 0);
+    const double off[3] = {0, 0, 0};
+    CHECK(!tifxyz_scale(s, d, 4, off) && !tifxyz_scale(s, d1, 1, off), "tifxyz scale (big meta)");
+    snprintf(p, sizeof p, "%s/meta.json", d); char *m4 = tfx_meta_read(p); const char *q = m4 ? strstr(m4, "\"scale\":") : nullptr;
+    q = q ? strchr(q, '[') : nullptr; CHECK(q && fabs(atof(q + 1) - 0.2) < 1e-6, "big meta scaled x4: %.9f", q ? atof(q + 1) : -1.0);
+    snprintf(p, sizeof p, "%s/meta.json", d1); char *m1 = tfx_meta_read(p); q = m1 ? strstr(m1, "\"scale\":") : nullptr; q = q ? strchr(q, '[') : nullptr;
+    CHECK(m1 && strlen(m1) > 16384 && q && fabs(atof(q + 1) - 0.05) < 1e-9 && strstr(m1, "\"voxel_size_um\""), "big meta kept whole by div 1");
+    free(m); free(m4); free(m1);
+    snprintf(p, sizeof p, "rm -rf %s %s %s", s, d, d1); CHECK(!system(p), "cleanup");
 }
 static void test_tifxyz_shift(void) {   /* a plane z = 10 (x = column, y = row): +n = x-step x y-step = +z; the invalid corner vertex stays */
     enum { W = 6, H = 4 }; float x[W * H], y[W * H], z[W * H];
@@ -147,8 +188,16 @@ static void test_ink_compare(void) {   /* ink_stats / ink_corr / ink_panels_half
     free(cr);
     CHECK(img_crop_u8(dim, W, H, 0, 0, 0, 4) == nullptr, "crop of width 0");
 }
+/* render_out_px: one mesh scaled by two divisors (float32 meta scales, as ufsm render reads them: step = 1 / scale) gives the same
+   output size at matching --scale (ink at level L x 0.5 vs CT at level L+2 x 2: PHerc1203 raw-auto_grown, 281 vs 280 px) */
+static void test_render_out_px(void) {
+    const float s1 = 0.05f, s4 = 0.05f * 4;   /* meta "scale" after tifxyz-scale by 1 and by 4 */
+    const double g1 = (1 / (double)s1) * 0.5, g4 = (1 / (double)s4) * 2;
+    for (int n = 2; n < 400; n++) CHECK(render_out_px(n, g1) == render_out_px(n, g4), "render_out_px n %d: %d vs %d", n, render_out_px(n, g1), render_out_px(n, g4));
+    CHECK(render_out_px(29, 10.0) == 281 && render_out_px(10, 2.5) == 23 && render_out_px(1, 3.0) == 1, "render_out_px exact cases");
+}
 int main(void) {
-    test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_tifxyz_scale(); test_tifxyz_shift(); test_ink_compare();
+    test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_jpeg_read_fit(); test_tifxyz_scale(); test_tifxyz_big_meta(); test_tifxyz_shift(); test_ink_compare(); test_render_out_px();
     if (fails) { fprintf(stderr, "test_imgops: %d failures\n", fails); return 1; }
     printf("test_imgops: ok\n");
     return 0;

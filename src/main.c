@@ -135,7 +135,7 @@ static int usage(void) {
         "  ufsm dino-train --sources S.json --out DIR   our dense embedding net from scratch (GT sheet identity + DINO-style SSL)\n"
         "  ufsm dino-embed CKPT ROOT KEY OUT --box ... --norm c,s   a dino-train net over a box (dinovol-eval format)\n"
         "  ufsm halves ROOT KEY-L0 OUT --box ...   two 4x-pooled views of a fine scan from disjoint sub-voxel halves\n"
-        "  ufsm png2jpg <in.png> <out.jpg> [--half]   PNG -> JPEG q90 (half: Pillow BOX halved)\n"
+        "  ufsm png2jpg <in.png|in.jpg> <out.jpg> [--half] [--max-px N]   PNG / JPEG -> JPEG q90 (half: Pillow BOX halved; max-px: longest side)\n"
         "  ufsm phase-score <pc-dir> <ps-dir> [<sheets-dir>]   on-recto score of pc / ps renders on surfaces (per seam class with sheets)\n"
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
@@ -1116,6 +1116,12 @@ static int cmd_fit(int argc, char **argv) {
                 const long long *hh = pass ? lhk : lha; long long best = 0, tot = 0;
                 for (int k = 0; k < 252; k++) { tot += hh[k]; long long sw = 0; for (int j = -9; j <= 8; j++) sw += hh[(k + j + 252) % 252]; if (sw > best) best = sw; }
                 lbest[pass] += best; ltot[pass] += tot;
+                if (pass && getenv("UFSM_WCHECK_BLOCKS") && tot > 0) {   /* (debug: each block's own gauge: radial count drift vs slips) */
+                    int bo = 0; long long bb = -1; for (int k = 0; k < 252; k++) { long long sw = 0; for (int j = -9; j <= 8; j++) sw += hh[(k + j + 252) % 252]; if (sw > bb) { bb = sw; bo = k; } }
+                    const double zc = o3[0] + n3[0] * ws / 2.0, yc = o3[1] + n3[1] * ws / 2.0, xc = o3[2] + n3[2] * ws / 2.0; const int iz = (int)zc;
+                    const double rc = fb.cy ? hypot(yc - fb.cy[iz], xc - fb.cx[iz]) : 0.0;
+                    fprintf(stderr, "fit: --winding-check block %lld %lld %lld: %lld gated, gauge %+d codes, right %.3f, r %.0f\n", (long long)sz, (long long)sy, (long long)sx, tot, bo > 126 ? bo - 252 : bo, (double)best / tot, rc);
+                }
             }
             if (z3w_write_shard(zw, sz, sy, sx, (const uint8_t *)sb, 8)) { fprintf(stderr, "fit: %s\n", z3w_error()); return 1; }
         }
@@ -2122,7 +2128,7 @@ static int cmd_wrapdist(int argc, char **argv) {
         snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = wd_read(p, &w2, &h2);
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = wd_read(p, &w3, &h3);
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name); double wum = 0;
-        { FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"voxel_size_um\":"); if (q) wum = atof(q + 16); } }
+        { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"voxel_size_um\":") : nullptr; if (q) wum = atof(q + 16); free(b); }
         if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || !(wum > 0)) { free(X); free(Y); free(Z); continue; }
         const double sc = wum / lum;
         for (size_t i = 0; i < (size_t)w * h; i++) {
@@ -2282,7 +2288,7 @@ static int cmd_wrapswitch(int argc, char **argv) {
         if (de->d_name[0] != 'w') continue;
         char p[1400]; int w, h, w2, h2, w3, h3; double um = 0;
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
-        { FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"voxel_size_um\":"); if (q) um = atof(q + 16); } }
+        { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"voxel_size_um\":") : nullptr; if (q) um = atof(q + 16); free(b); }
         snprintf(p, sizeof p, "%s/%s/x.tif", argv[2], de->d_name); float *X = wd_read(p, &w, &h);
         snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = wd_read(p, &w2, &h2);
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = wd_read(p, &w3, &h3);
@@ -2423,10 +2429,10 @@ static int cmd_surfsnap(int argc, char **argv) {
         if (de->d_name[0] != 'w') continue;
         char p[1400]; int w, h, w2, h2, w3, h3; double wum = 0, scale = 0; int winding = 0;
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
-        { FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); }
+        { char *bm = tfx_meta_read(p); const char *b = bm ? bm : "";
           const char *q = strstr(b, "\"voxel_size_um\":"); if (q) wum = atof(q + 16);
           q = strstr(b, "\"scale\":"); if (q) { q = strchr(q, '['); if (q) scale = atof(q + 1); }
-          q = strstr(b, "\"winding\":"); if (q) winding = atoi(q + 10); }
+          q = strstr(b, "\"winding\":"); if (q) winding = atoi(q + 10); free(bm); }
         snprintf(p, sizeof p, "%s/%s/x.tif", argv[2], de->d_name); float *X = read_tif_f32(p, &w, &h);
         snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = read_tif_f32(p, &w2, &h2);
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = read_tif_f32(p, &w3, &h3);
@@ -2999,7 +3005,7 @@ static void *render_rows(void *arg) {
         int c0 = (int)gu, r0 = (int)gv; if (c0 >= w - 1) c0 = w - 2; if (r0 >= h - 1) r0 = h - 2; if (c0 < 0 || r0 < 0) continue;
         const double fu = gu - c0, fv = gv - r0;
         const size_t i00 = (size_t)r0 * w + c0, i01 = i00 + 1, i10 = i00 + w, i11 = i10 + 1;
-        if (J->Z[i00] < 0 || J->Z[i01] < 0 || J->Z[i10] < 0 || J->Z[i11] < 0) continue;
+        if (!(J->Z[i00] >= 0 && J->Z[i01] >= 0 && J->Z[i10] >= 0 && J->Z[i11] >= 0)) continue;   /* invalid (-1) or NaN corner */
         const float *A[3] = {J->Z, J->Y, J->X}; double P[3], du[3], dv[3];
         for (int d = 0; d < 3; d++) {
             const double a = A[d][i00], b = A[d][i01], c = A[d][i10], e = A[d][i11];
@@ -3148,9 +3154,9 @@ static int cmd_render(int argc, char **argv) {
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = read_tif_f32(p, &w3, &h3);
         if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || w < 2 || h < 2) { free(X); free(Y); free(Z); continue; }
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
-        double step = 1; { FILE *f = tfx_meta_fopen(p); char b[4096] = {0}; if (f) { size_t nr = fread(b, 1, sizeof b - 1, f); (void)nr; fclose(f); const char *q = strstr(b, "\"scale\": ["); if (q) step = 1 / atof(q + 10); } }
+        double step = 1; { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"scale\":") : nullptr; if (q && (q = strchr(q, '['))) { const double sc = atof(q + 1); if (sc > 0) step = 1 / sc; } free(b); }
         const double gs = step * scale;   /* output pixels per grid step */
-        const int ow = (int)((w - 1) * gs) + 1, oh = (int)((h - 1) * gs) + 1;
+        const int ow = render_out_px(w, gs), oh = render_out_px(h, gs);
         uint8_t *img = calloc((size_t)ow * oh, 1), *cimg = cz ? calloc((size_t)ow * oh, 1) : nullptr;
         /* output tiles: each reads only the volume around its own vertices (+- depth), so a wrap of any size renders in bounded memory */
         for (int ty = 0; ty < oh; ty += tile) for (int tx = 0; tx < ow; tx += tile) {

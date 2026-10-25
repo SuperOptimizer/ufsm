@@ -87,7 +87,7 @@ template <int SD> __device__ __forceinline__ void blk_vec_sum(float (&v)[SD], fl
     if (threadIdx.x < SD) { float t = 0.f; for (int w = 0; w < (int)(blockDim.x >> 5); w++) t += sh[w][threadIdx.x]; out[threadIdx.x] = t; }
     __syncthreads();
 }
-struct sc_args { const float *a, *t; const int *code, *xyz, *tcode, *txyz; int N, N2; float tau, hw, hr2, pr2; };   /* pr2: pair radius^2 (0: all pairs) */
+struct sc_args { const float *a, *t; const int *code, *xyz, *tcode, *txyz; int N, N2; float tau, hw, hr2, pr2; const float *rad, *trad; float rr; };   /* pr2: pair radius^2 (0: all pairs); rad / trad: per-point distance from the scroll axis, |rad_i - rad_j| <= rr (rad null: no limit) */
 template <int SD> __device__ __forceinline__ const float *sc_key(const sc_args &A, int j) { return j < A.N ? A.a + (size_t)j * SD : A.t + (size_t)(j - A.N) * SD; }
 __device__ __forceinline__ float sc_w(const sc_args &A, int i, int j, int dk) {
     if (abs(dk) != 1 || A.hw == 1.f) return 1.f;
@@ -96,6 +96,7 @@ __device__ __forceinline__ float sc_w(const sc_args &A, int i, int j, int dk) {
     return dx * dx + dy * dy + dz * dz <= A.hr2 ? A.hw : 1.f;
 }
 __device__ __forceinline__ bool sc_far(const sc_args &A, int i, int j) {   /* outside the pair radius: neither positive nor negative */
+    if (A.rad) { const float *rk = j < A.N ? A.rad + j : A.trad ? A.trad + (j - A.N) : nullptr; if (rk && fabsf(*rk - A.rad[i]) > A.rr) return true; }
     if (A.pr2 <= 0.f) return false;
     const int *pi = A.xyz + 3 * i, *pj = j < A.N ? A.xyz + 3 * j : A.txyz + 3 * (j - A.N);
     const float dx = pj[0] - pi[0], dy = pj[1] - pi[1], dz = pj[2] - pi[2];
@@ -182,27 +183,27 @@ __global__ void k_sc_fin(float *ga, int n, const float *acc, float *out) {
     if (blockIdx.x == 0 && threadIdx.x == 0) { out[0] = acc[0] / na; out[1] = acc[2] / fmaxf(acc[3], 1.f); out[2] = acc[4] / fmaxf(acc[5], 1.f); out[3] = acc[1]; }
 }
 template <int SD> static void supcon_t(const float *a, const int *code, const int *xyz, int N, const float *t, const int *tcode, const int *txyz, int N2,
-                                       float tau, float hw, float hr, float pr, float *ga, float *out, float *scratch) {
+                                       float tau, float hw, float hr, float pr, const float *rad, const float *trad, float rr, float *ga, float *out, float *scratch) {
     /* scratch: lse [N], npos [N], acc [8] */
     float *lse = scratch, *npos = lse + N, *acc = npos + N;
     cudaMemsetAsync(acc, 0, 8 * 4);
     if (N <= 0) { cudaMemsetAsync(out, 0, 16); return; }
-    sc_args A = {a, t, code, xyz, tcode, txyz, N, N2, tau, hw, hr * hr, pr > 0.f ? pr * pr : 0.f};
+    sc_args A = {a, t, code, xyz, tcode, txyz, N, N2, tau, hw, hr * hr, pr > 0.f ? pr * pr : 0.f, rr > 0.f ? rad : nullptr, trad, rr};
     k_sc_stats<SD><<<N, 256>>>(A, lse, npos, acc);
     k_sc_ganchor<SD><<<N, 256>>>(A, lse, npos, ga);
     k_sc_gkey<SD><<<N, 256>>>(A, lse, npos, ga);
     k_sc_fin<<<nb_of((long long)N * SD, 256), 256>>>(ga, N * SD, acc, out);
 }
 extern "C" void dn_supcon_r(const float *a, const int *code, const int *xyz, int N, const float *t, const int *tcode, const int *txyz, int N2, int D,
-                            float tau, float hw, float hr, float pr, float *ga, float *out, float *scratch) {
-    if (D == 16) supcon_t<16>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, pr, ga, out, scratch);
-    else if (D == 32) supcon_t<32>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, pr, ga, out, scratch);
-    else if (D == 64) supcon_t<64>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, pr, ga, out, scratch);
+                            float tau, float hw, float hr, float pr, const float *rad, const float *trad, float rr, float *ga, float *out, float *scratch) {
+    if (D == 16) supcon_t<16>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, pr, rad, trad, rr, ga, out, scratch);
+    else if (D == 32) supcon_t<32>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, pr, rad, trad, rr, ga, out, scratch);
+    else if (D == 64) supcon_t<64>(a, code, xyz, N, t, tcode, txyz, N2, tau, hw, hr, pr, rad, trad, rr, ga, out, scratch);
     else fprintf(stderr, "dn_supcon: D %d (16, 32 or 64)\n", D);
 }
 extern "C" void dn_supcon(const float *a, const int *code, const int *xyz, int N, const float *t, const int *tcode, const int *txyz, int N2, int D,
                           float tau, float hw, float hr, float *ga, float *out, float *scratch) {
-    dn_supcon_r(a, code, xyz, N, t, tcode, txyz, N2, D, tau, hw, hr, 0.f, ga, out, scratch);
+    dn_supcon_r(a, code, xyz, N, t, tcode, txyz, N2, D, tau, hw, hr, 0.f, nullptr, nullptr, 0.f, ga, out, scratch);
 }
 
 /* ---- DINO prototypes: logits matrices in scratch; the gradients as two small matrix products ---- */

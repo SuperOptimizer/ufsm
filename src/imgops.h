@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <math.h>
 
 enum { PIL_BOX = 0, PIL_BILINEAR = 1 };
 
@@ -32,6 +33,9 @@ uint8_t *overlay_red_half(const uint8_t *ct, int W, int H, const uint8_t *const 
 int overlay_red_skip(const uint8_t *ct, size_t n);
 
 int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quality);   /* 0 on success */
+uint8_t *jpeg_read_rgb(const char *path, int *w, int *h);   /* any JPEG as RGB, nullptr on failure (no exit on corrupt input) */
+/* the longest side scaled down to max_px (antialiased bilinear, aspect kept; *rgb replaced); no-op when already within or max_px <= 0; 0 ok */
+int img_fit_rgb(uint8_t **rgb, int *w, int *h, int max_px, int nthreads);
 /* an 8-bit PNG (gray, gray+alpha, RGB, RGBA, palette; not interlaced) as RGB (alpha dropped, as Pillow's convert('RGB')) */
 uint8_t *png_read_rgb(const char *path, int *w, int *h);
 
@@ -44,6 +48,9 @@ int tifxyz_scale(const char *src, const char *dst, double div, const double off[
 int tifxyz_shift(const char *src, const char *dst, double d, const double *toward);   /* toward (y, x) or nullptr: see above */
 /* the scaled coordinate of one vertex value v (z the vertex's z): numpy float32 v / div - off, or -1 for an invalid vertex */
 static inline float tifxyz_scaled(float v, float z, float divf, float offf) { return z < 0 ? -1.f : v / divf - offf; }
+/* ufsm render output pixels along a grid of n vertices at gs pixels per grid step: floor((n - 1) gs) + 1 with a 1e-6 slack, so the float32
+   meta scales of one mesh at two divisors (0.05 -> step 19.9999997 x 0.5, 0.2 -> 4.99999993 x 2) give the same size (ink-compare pairs) */
+static inline int render_out_px(int n, double gs) { return (int)floor((n - 1) * gs + 1e-6) + 1; }
 
 float *img_read_f32(const char *path, int *w, int *h);     /* a float32 single-sample TIFF, nullptr on failure */
 uint8_t *img_read_u8(const char *path, int *w, int *h);    /* a uint8 single-sample TIFF */
