@@ -13,6 +13,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <zstd.h>
 
 #define PP_PERIOD 252
@@ -58,6 +59,15 @@ static z3 *open_arr(const char *root, const char *key, store **sp) {
     *sp = s; return z;
 }
 
+/* page cache: the files this tool reads (the source shards, a sent file) and writes are dropped from the page cache after use
+   (posix_fadvise DONTNEED; written data synced first), so a pass over 100+ GB of labels does not evict the trainers' working set */
+static void drop_cache(const char *path) {
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); close(fd);
+}
+static void drop_file(FILE *f) { fflush(f); fdatasync(fileno(f)); posix_fadvise(fileno(f), 0, 0, POSIX_FADV_DONTNEED); }
+
 static int cmd_pack(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: phase-pack ROOT KEY OUT --row R [--level 19] [--threads 8]\n"); return 2; }
     const char *root = argv[2], *key = argv[3], *out = argv[4];
@@ -85,6 +95,7 @@ static int cmd_pack(int argc, char **argv) {
         const int64_t o[3] = {(int64_t)row * S, sy * S, sx * S};
         int64_t n[3]; for (int d = 0; d < 3; d++) { n[d] = m->shape[d] - o[d]; if (n[d] > S) n[d] = S; }
         if (z3_read(z, o, n, buf, th)) { fprintf(stderr, "phase-pack: read: %s\n", z3_error()); rc = 1; break; }
+        if (strncmp(root, "http", 4)) { char sp[4400]; snprintf(sp, sizeof sp, "%s/%s/c/%d/%lld/%lld", root, key, row, (long long)sy, (long long)sx); drop_cache(sp); }
         const size_t nv = (size_t)n[0] * n[1] * n[2];
         phase_pack_lines(buf, (size_t)n[0] * n[1], (int)n[2]);
         const size_t cl = ZSTD_compress2(cc, cb, cap, buf, nv);
@@ -94,6 +105,7 @@ static int cmd_pack(int argc, char **argv) {
         raw += nv; packed += cl; ns++;
     }
     ZSTD_freeCCtx(cc); free(buf); free(cb);
+    drop_file(f);
     if (fclose(f)) rc = 1;
     if (!rc && rename(tmp, out)) { fprintf(stderr, "phase-pack: rename %s\n", out); rc = 1; }
     fprintf(stderr, "phase-pack %s row %d: %d shards, %.1f MB raw -> %.1f MB (%.1f%%) in %.0f s\n", key, row, ns, raw / 1e6, packed / 1e6,
@@ -135,6 +147,7 @@ static int cmd_unpack(int argc, char **argv) {
         if (z3w_write_shard(w, r.s[0], r.s[1], r.s[2], full, th)) { fprintf(stderr, "phase-unpack: %s\n", z3w_error()); rc = 1; break; }
         ns++;
     }
+    drop_cache(in);
     fclose(f); ZSTD_freeDCtx(dc); free(buf); free(full); free(cb);
     if (z3w_close(w)) rc = 1;
     fprintf(stderr, "phase-unpack %s -> %s: %d shards in %.0f s%s\n", in, dir, ns, pnow() - t0, rc ? " FAILED" : "");
@@ -171,6 +184,7 @@ static int cmd_cmp(int argc, char **argv) {
 }
 
 int cmd_phase_pack(int argc, char **argv) {
+    if (!strcmp(argv[1], "phase-drop")) { for (int i = 2; i < argc; i++) drop_cache(argv[i]); return 0; }   /* phase-drop FILE...: drop files from the page cache */
     if (!strcmp(argv[1], "phase-unpack")) return cmd_unpack(argc, argv);
     if (!strcmp(argv[1], "phase-cmp")) return cmd_cmp(argc, argv);
     return cmd_pack(argc, argv);
@@ -179,7 +193,7 @@ int cmd_phase_pack(int argc, char **argv) {
 #ifdef PHASE_PACK_MAIN
 int main(int argc, char **argv) {   /* build/phase_pack pack|unpack|cmp ...: the arguments of ufsm phase-pack / phase-unpack / phase-cmp */
     if (argc < 2) { fprintf(stderr, "usage: phase_pack pack|unpack|cmp ...\n"); return 2; }
-    char *cmd = !strcmp(argv[1], "unpack") ? "phase-unpack" : !strcmp(argv[1], "cmp") ? "phase-cmp" : "phase-pack";
+    char *cmd = !strcmp(argv[1], "unpack") ? "phase-unpack" : !strcmp(argv[1], "drop") ? "phase-drop" : !strcmp(argv[1], "cmp") ? "phase-cmp" : "phase-pack";
     argv[1] = cmd;
     return cmd_phase_pack(argc, argv);
 }
