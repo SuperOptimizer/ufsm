@@ -226,6 +226,9 @@ struct unet {
     int tb_nv, tb_vn; size_t view_w, view_b; float *tb_vxp, *tb_ve; const uint8_t *tb_vsrc;   /* scan fusion: view rows per sample, the crops' count; patches, embeddings */
     float *tb_gpos; float *tb_cen; long tb_Tr;
     float *tb_dfx[AT_DFM_MAXL], *tb_dfcs;    /* deformable attention: the finer levels' LayerNorm'd tokens (at_geom.dfx), their channel-major staging */
+    float *tb_dfr;                           /* ... cfg.attn_dinit 1: the grid tokens' frames (at_geom.dfr; inside tb_rb, filled by tb_geom) */
+    size_t tb_p0;                            /* the attention stage's parameters: [tb_p0, np) (0 without a stage) */
+    float trunk_lr;                          /* unet_set_trunk_lr: lr multiplier outside the stage (0 = 1) */
     const float *tb_xg;                      /* unet_set_token_grad: extra gradient at the stage output tokens */
 };
 
@@ -317,7 +320,8 @@ unet *unet_create(const unet_cfg *cfg) {
             cfg->attn_blocks * rep > UNET_MAXTA || (cfg->attn_axis == 1 && (cfg->attn_reg || cfg->attn_mem || cfg->view_P)) || cfg->attn_mem < 0 ||
             cfg->view_P < 0 || (cfg->view_P && (cfg->view_patch <= 0 || cfg->view_P % cfg->view_patch)) || cfg->attn_deform < 0 || cfg->attn_dlev < 0 ||
             (cfg->attn_deform && (cfg->attn_reg || cfg->attn_mem || cfg->view_P || cfg->attn_axis || (cfg->attn_dlev ? cfg->attn_dlev : 2) > AT_DFM_MAXL ||
-                                  (cfg->attn_dlev ? cfg->attn_dlev : 2) > L))) {
+                                  (cfg->attn_dlev ? cfg->attn_dlev : 2) > L)) ||
+            cfg->attn_dco < 0 || cfg->attn_dco > 1 || cfg->attn_dinit < 0 || cfg->attn_dinit > 1 || (!cfg->attn_deform && (cfg->attn_dco || cfg->attn_dinit))) {
             fprintf(stderr, "unet: attention blocks need a bottleneck width that is a multiple of %d (got %d), at most %d blocks (%d applications with --attn-repeat), "
                             "--attn-pe peg|rope|none|scroll, --attn-axis full|radial (radial: no registers, memory or view tokens), view_P a multiple of view_patch, "
                             "--attn-deform: no registers / memory / view / radial, at most %d levels\n", AT_HD, C, UNET_MAXTB, UNET_MAXTA, AT_DFM_MAXL); abort(); }
@@ -328,8 +332,10 @@ unet *unet_create(const unet_cfg *cfg) {
         if (cfg->attn_deform) {   /* deformable attention: the bottleneck and the next finer encoder levels' outputs */
             u->tbd.rope = 0; u->tbd.dK = cfg->attn_deform; u->tbd.dL = cfg->attn_dlev ? cfg->attn_dlev : 2;
             for (int l = 0; l < u->tbd.dL; l++) u->tbd.dC[l] = w[L - 1 - l];
+            u->tbd.dCo = cfg->attn_dco; u->tbd.dInit = cfg->attn_dinit;
         }
         u->tba = cfg->attn_blocks * rep;
+        u->tb_p0 = off;
         if (cfg->attn_pe == 0) { u->peg_w = off; off += (size_t)C * 27; u->peg_b = off; off += (size_t)C; }
         u->reg_off = off; off += (size_t)u->nrg * C;
         if (cfg->attn_mem) { u->mem_gate = off; off += (size_t)C; u->mem_woff = off; off += (size_t)4 * C; }   /* (the memory rows follow the registers) */
@@ -1102,14 +1108,15 @@ static void build_acts(unet *u, shape5 xs, int train) {
         const long Sg = (long)shape_spatial(y), T = (long)y.n * (Sg + u->nrg); const int C = w[L - 1];
         u->tbg = (at_geom){y.n, (int)(Sg + u->nrg), y.d, y.h, y.w, nullptr, nullptr, nullptr};
         long Tr = 0;
-        if (u->cfg.attn_axis == 1 || u->cfg.attn_pe == 3) {   /* the scroll geometry's buffers (tb_geom fills them per forward) */
+        if (unet_cfg_axis(&u->cfg)) {   /* the scroll geometry's buffers (tb_geom fills them per forward) */
             at_rays_dims(y.d, y.h, y.w, attn_ray_mult(), &u->tb_Q, &u->tb_Nt, &u->tb_Nr);
             const int Pm = y.d > y.h ? (y.d > y.w ? y.d : y.w) : (y.h > y.w ? y.h : y.w);
             Tr = u->cfg.attn_axis == 1 ? (long)y.n * u->tb_Q * u->tb_Nr : 0;
             const size_t nq = (size_t)y.n * u->tb_Q, al = 64;
             const size_t o_ray = 0, o_len = o_ray + (nq * AT_RAY_F + al - 1) / al * al, o_ad = o_len + (nq + al - 1) / al * al, o_pos = o_ad + al,
                          o_ws = o_pos + ((size_t)Tr * 3 + al - 1) / al * al, o_gp = o_ws + ((size_t)y.n * Sg + al - 1) / al * al,
-                         o_cen = o_gp + ((size_t)T * 3 + al - 1) / al * al, o_end = o_cen + ((size_t)y.n * Pm * 4 + al - 1) / al * al;
+                         o_cen = o_gp + ((size_t)T * 3 + al - 1) / al * al, o_fr = o_cen + ((size_t)y.n * Pm * 4 + al - 1) / al * al,
+                         o_end = o_fr + (u->tbd.dInit ? ((size_t)T * 9 + al - 1) / al * al : 0);
             u->tb_rb = dalloc(u, o_end);
             u->tbr = (at_rays){y.n, u->tb_Q, u->tb_Nt, u->tb_Nr, y.d, y.h, y.w, (const int *)(u->tb_rb + o_ad), u->tb_rb + o_ray, (const int *)(u->tb_rb + o_len),
                                u->tb_rb + o_pos, u->tb_rb + o_ws};
@@ -1120,7 +1127,8 @@ static void build_acts(unet *u, shape5 xs, int train) {
             if (!u->tb_rayh || !u->tb_cenh || !u->tb_lensh || !u->tb_adh || !u->tb_axb) { fprintf(stderr, "unet: no host memory for the ray plan\n"); abort(); }
             u->tb_axdirty = 1;
             if (u->cfg.attn_axis == 1) u->tbg.rays = &u->tbr;
-            else u->tbg.pos = u->tb_gpos;
+            else if (u->cfg.attn_pe == 3) u->tbg.pos = u->tb_gpos;
+            u->tb_dfr = u->tbd.dInit ? u->tb_rb + o_fr : nullptr; u->tbg.dfr = u->tb_dfr;
         }
         u->tb_Tr = Tr;
         u->tb_cs = dalloc(u, (size_t)y.n * C * Sg);
@@ -2322,7 +2330,8 @@ static void tb_geom(unet *u) {
     nn_h2d((void *)u->tbr.ad, u->tb_adh, (size_t)n * sizeof(int));
     nn_h2d(u->tb_cen, u->tb_cenh, (size_t)n * Pm * 4 * sizeof(float));
     if (u->cfg.attn_axis == 1) at_rays_setup(&u->tbr);
-    else at_scroll_pos(n, u->nrg, D, Hh, W, u->tbr.ad, u->tb_cen, u->tb_gpos);
+    else if (u->cfg.attn_pe == 3) at_scroll_pos(n, u->nrg, D, Hh, W, u->tbr.ad, u->tb_cen, u->tb_gpos);
+    if (u->tb_dfr) at_dfm_frame(n, D, Hh, W, u->tbr.ad, u->tb_cen, u->tb_dfr);   /* deformable offsets in the normal frames */
     u->tb_axdirty = 0;
 }
 int unet_attn_rays(const unet *u, int *Q, int *Nr, double *coverage) {
@@ -3550,7 +3559,14 @@ void unet_clip_grad(unet *u, double max_norm) {
 }
 static void wq_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step);
 static void wq_ema(unet *u, float decay);
-void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step) { if (u->wq) wq_adamw(u, lr, b1, b2, eps, wd, step); else nn_adamw(u->p, u->g, u->m, u->v, u->np, lr, b1, b2, eps, wd, step); }
+static int trunk_lr_on(const unet *u);
+void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int step) {
+    if (u->wq) wq_adamw(u, lr, b1, b2, eps, wd, step);
+    else if (trunk_lr_on(u)) {   /* the trunk [0, tb_p0) at trunk_lr x lr, the stage at lr */
+        nn_adamw(u->p, u->g, u->m, u->v, u->tb_p0, lr * u->trunk_lr, b1, b2, eps, wd, step);
+        nn_adamw(u->p + u->tb_p0, u->g + u->tb_p0, u->m + u->tb_p0, u->v + u->tb_p0, u->np - u->tb_p0, lr, b1, b2, eps, wd, step);
+    } else nn_adamw(u->p, u->g, u->m, u->v, u->np, lr, b1, b2, eps, wd, step);
+}
 static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg);
 static void for_each_mat(unet *u, void (*fn)(unet *, const convp *, void *), void *arg);   /* the Muon matrices: the 3^3 convs + the attention linears */
 /* Conv traversal follows graph order, not parameter offsets. Sort weight intervals before
@@ -3576,10 +3592,18 @@ static void plain_ranges(unet *u, void (*fn)(unet *, size_t, size_t, void *), vo
     if (pos < u->np) fn(u, pos, u->np - pos, arg);
 }
 typedef struct { float lr, b1, b2, eps, wd; int step; } adam_arg;
+static int trunk_lr_on(const unet *u) { return u->tbn && u->trunk_lr > 0.f && u->trunk_lr != 1.f; }
 static void plain_adamw(unet *u, size_t off, size_t n, void *arg) {
     adam_arg *a = arg;
+    if (trunk_lr_on(u) && off < u->tb_p0) {   /* the trunk part at trunk_lr x lr, the stage's part (if the range reaches it) at lr */
+        const size_t nt = off + n <= u->tb_p0 ? n : u->tb_p0 - off;
+        nn_adamw(u->p + off, u->g + off, u->m + off, u->v + off, nt, a->lr * u->trunk_lr, a->b1, a->b2, a->eps, a->wd, a->step);
+        off += nt; n -= nt;
+        if (!n) return;
+    }
     nn_adamw(u->p + off, u->g + off, u->m + off, u->v + off, n, a->lr, a->b1, a->b2, a->eps, a->wd, a->step);
 }
+void unet_set_trunk_lr(unet *u, float mult) { u->trunk_lr = mult; }
 static void adamw_nonconv(unet *u, float lr, float b1, float b2, float eps, float wd, int step) {
     adam_arg a = {lr, b1, b2, eps, wd * u->wd_nonconv, step}; plain_ranges(u, plain_adamw, &a);   /* GroupNorm gains decay toward 0, not 1 */
 }
@@ -3591,7 +3615,8 @@ static void muon_conv(unet *u, const convp *c, void *arg) {
     muon_arg *a = arg; int K = c->cin * c->k * c->k * c->k; size_t n = (size_t)c->cout * K;
     size_t need = 2 * n + 2 * (size_t)c->cout * c->cout;
     if (u->muon_work_n < need) { if (u->muon_work) nn_free(u->muon_work); u->muon_work = nn_malloc(need * 4); u->muon_work_n = need; }
-    nn_muon(u->p + c->w, u->g + c->w, u->muon_mom + c->w, c->cout, K, a->lr, a->beta, a->wd, u->muon_work);
+    const float lr = trunk_lr_on(u) && c->w < u->tb_p0 ? a->lr * u->trunk_lr : a->lr;
+    nn_muon(u->p + c->w, u->g + c->w, u->muon_mom + c->w, c->cout, K, lr, a->beta, a->wd, u->muon_work);
 }
 typedef struct { float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K; } muon_desc_t;   /* mirrors nn.cu */
 typedef struct { muon_desc_t h[UNET_MAXCONV]; int n; size_t pool; int maxco, maxk; } muon_build_t;
@@ -3688,7 +3713,11 @@ void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, floa
         for_each_mat(u, muon_conv, &a);
     } else {
         if (!u->muon_descs) { muon_build_t b = {0}; muon_table(u, &b); }
-        nn_muon_batch(u->muon_descs, u->muon_nconv, u->muon_maxco, u->muon_maxk, lr_muon, beta, wd);
+        if (trunk_lr_on(u)) {   /* the table is the trunk's convs, then the stage's 4 x tbn linears (for_each_mat): two batches */
+            const int na = 4 * u->tbn, nt = u->muon_nconv - na;
+            nn_muon_batch(u->muon_descs, nt, u->muon_maxco, u->muon_maxk, lr_muon * u->trunk_lr, beta, wd);
+            nn_muon_batch((const char *)u->muon_descs + sizeof(muon_desc_t) * (size_t)nt, na, u->muon_maxco, u->muon_maxk, lr_muon, beta, wd);
+        } else nn_muon_batch(u->muon_descs, u->muon_nconv, u->muon_maxco, u->muon_maxk, lr_muon, beta, wd);
     }
     adamw_nonconv(u, lr_adam, b1, b2, eps, wd, step);
 }
@@ -3907,7 +3936,8 @@ static void wq_adamw(unet *u, float lr, float b1, float b2, float eps, float wd,
     adamw_nonconv(u, lr, b1, b2, eps, wd, step);
     for (int i = 0; i < u->wq_n; i++) {
         const convp *c = wq_conv(u, i); int T = c->k * c->k * c->k; size_t qo = u->wq_qoff[i];
-        nn_wq_adamw(u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->wq_r ? u->wq_r + c->w : nullptr, u->wq_r ? u->wq_rsc + u->wq_soff[i] : nullptr, u->g + c->w, u->m + c->w, u->v + c->w, c->cout, c->cin, T, u->wq, lr, b1, b2, eps, wd, step, (unsigned)step * 7919u + (unsigned)i);
+        nn_wq_adamw(u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->wq_r ? u->wq_r + c->w : nullptr, u->wq_r ? u->wq_rsc + u->wq_soff[i] : nullptr, u->g + c->w, u->m + c->w, u->v + c->w, c->cout, c->cin, T, u->wq,
+                    trunk_lr_on(u) ? lr * u->trunk_lr : lr, b1, b2, eps, wd, step, (unsigned)step * 7919u + (unsigned)i);   /* (the packed convs: all trunk) */
         nn_wq_unpack(u->wq_q + qo, u->wq_sc + u->wq_soff[i], u->p + c->w, c->cout, c->cin, T, u->wq);
     }
 }
@@ -4016,6 +4046,8 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.attn_blocks && u->cfg.attn_mem) fprintf(f, ",\"attn_mem\":%d", u->cfg.attn_mem);
     if (u->cfg.attn_blocks && u->cfg.view_P) fprintf(f, ",\"view_P\":%d,\"view_patch\":%d", u->cfg.view_P, u->cfg.view_patch);
     if (u->cfg.attn_blocks && u->cfg.attn_deform) fprintf(f, ",\"attn_deform\":%d,\"attn_dlev\":%d", u->cfg.attn_deform, u->tbd.dL);
+    if (u->cfg.attn_blocks && u->cfg.attn_deform && u->cfg.attn_dco) fprintf(f, ",\"attn_dco\":%d", u->cfg.attn_dco);
+    if (u->cfg.attn_blocks && u->cfg.attn_deform && u->cfg.attn_dinit) fprintf(f, ",\"attn_dinit\":%d", u->cfg.attn_dinit);
     if (u->cfg.l0_norm) fprintf(f, ",\"l0_norm\":%d", u->cfg.l0_norm);
     if (u->cfg.l0_norm == 4) fprintf(f, ",\"l0_slab\":%d", u->cfg.l0_slab);
     if (u->cfg.l0_norm == 2) {   /* the running statistics (live weights, EMA weights; l0_site order, [mean G | var G] each) and their state */
@@ -4077,6 +4109,8 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"view_patch\":"))) cfg->view_patch = atoi(p + 13);
     if ((p = strstr(line, "\"attn_deform\":"))) cfg->attn_deform = atoi(p + 14);
     if ((p = strstr(line, "\"attn_dlev\":"))) cfg->attn_dlev = atoi(p + 12);
+    cfg->attn_dco = (p = strstr(line, "\"attn_dco\":")) ? atoi(p + 11) : 0;
+    cfg->attn_dinit = (p = strstr(line, "\"attn_dinit\":")) ? atoi(p + 13) : 0;
     if ((p = strstr(line, "\"dec_convs\":["))) { p += 13; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->dec_convs[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"nparams\":"))) *np = (size_t)atoll(p + 10);
     if ((p = strstr(line, "\"step\":"))) *step = atoi(p + 7);
@@ -4188,6 +4222,23 @@ static int copy_gn(unet *u, const unet *o, const gnp *a, const gnp *b) {
     nn_d2d(u->p + a->beta, o->p + b->beta, (size_t)a->c * 4); nn_d2d(u->ema + a->beta, o->ema + b->beta, (size_t)a->c * 4);
     return 1;
 }
+/* deformable block k of a donor with another coarse-level / offset-frame setting (same C, F, dK, dL): every tensor but the offset / logit
+   projection as is; of that the logit rows (and bias) of the common levels, the offset rows only with the same frames (else the fresh
+   prior); the new coarse level's rows keep their initialisation */
+static void dfm_copy_block(unet *u, const unet *o, int k, float *dst, const float *sp) {
+    const at_dims *a = &u->tbd, *b = &o->tbd; const at_bp *pa = &u->tbp[k], *pb = &o->tbp[k];
+    const size_t C = a->C, end_a = pa->ln1g + at_block_nparams(a), end_b = pb->ln1g + at_block_nparams(b);
+    nn_d2d(dst + pa->ln1g, sp + pb->ln1g, (pa->woa - pa->ln1g) * 4);   /* LN 1, value projection */
+    for (int l = 1; l < a->dL; l++) { nn_d2d(dst + pa->wvl[l], sp + pb->wvl[l], C * a->dC[l] * 4); nn_d2d(dst + pa->bvl[l], sp + pb->bvl[l], C * 4); }
+    nn_d2d(dst + pa->wo, sp + pb->wo, (end_a - pa->wo) * 4);           /* out projection, LN 2, MLP */
+    if (end_a - pa->wo != end_b - pb->wo) { fprintf(stderr, "unet: deformable donor layout mismatch\n"); abort(); }
+    const int H = a->H, K = a->dK, La = at_dfm_nl(a), Lb = at_dfm_nl(b), Lc = a->dL;
+    for (int h = 0; h < H; h++) for (int l = 0; l < Lc; l++) for (int q = 0; q < K; q++) {
+        const size_t ia = ((size_t)h * La + l) * K + q, ib = ((size_t)h * Lb + l) * K + q, ga = (size_t)H * La * K * 3 + ia, gb = (size_t)H * Lb * K * 3 + ib;
+        if (a->dInit == b->dInit) { nn_d2d(dst + pa->woa + ia * 3 * C, sp + pb->woa + ib * 3 * C, 3 * C * 4); nn_d2d(dst + pa->boa + ia * 3, sp + pb->boa + ib * 3, 3 * 4); }
+        nn_d2d(dst + pa->woa + ga * C, sp + pb->woa + gb * C, C * 4); nn_d2d(dst + pa->boa + ga, sp + pb->boa + gb, 4);
+    }
+}
 int unet_init_from(unet *u, const char *path) { return unet_init_from_map(u, path, nullptr); }
 /* head_rows (u's cout entries, or nullptr = shape-matched copy): output row co of u's head takes the checkpoint's head row
    head_rows[co] (weights and bias), -1 = keep the fresh row. E.g. a verso warm start {0, 0, 1, 2, ...}: recto copied into the
@@ -4267,7 +4318,9 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
                 nn_d2d(dst + u->view_w, sp + o->view_w, (k3 + 1) * C * 4);
             }
             const int nb = u->tbn < o->tbn ? u->tbn : o->tbn;
-            for (int k = 0; k < nb; k++) nn_d2d(dst + u->tbp[k].ln1g, sp + o->tbp[k].ln1g, at_block_nparams(&u->tbd) * 4);   /* (one contiguous block) */
+            if (u->tbd.dCo == o->tbd.dCo && u->tbd.dInit == o->tbd.dInit)
+                for (int k = 0; k < nb; k++) nn_d2d(dst + u->tbp[k].ln1g, sp + o->tbp[k].ln1g, at_block_nparams(&u->tbd) * 4);   /* (one contiguous block) */
+            else for (int k = 0; k < nb; k++) dfm_copy_block(u, o, k, dst, sp);   /* (another deformable layout: tensor by tensor) */
         }
         n += (u->tbn < o->tbn ? u->tbn : o->tbn) + 1;
     }
