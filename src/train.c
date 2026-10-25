@@ -56,7 +56,7 @@ typedef struct {
     int gl_inside;               /* lean: the logit gradient lives in the model's gradient buffers (setup checked the batch overlap) */
     char *bat_lo, *bat_hi;       /* lean: the batch's bytes inside the model's buffers (a logit gradient placed later must avoid them) */
     int gl_inplace;              /* the logit gradient over the fp16 logits (g_gl_inplace) */
-    float *pg_acc; double pg_h[2], pg_loss;   /* --pgrad-lambda: slab logit gradient (2 planes x slab, fp32), sums w loss / w (hs_ds + 40), loss */
+    float *pg_acc; double pg_h[2], pg_loss;   /* --pgrad-lambda: slab logit gradient (2 planes x slab, fp32), sums w loss / w (hs_ds + 56: + 20..54 hold the normal loss stats), loss */
     void *hs_lg; double *hs_ds; float hs_dice; int hs_z, hs_P;   /* head slabs (g_head_slab): fp16 logits of one slab, loss sums, recto dice, planes per slab, window width */
     int64_t cornb[2][3]; int lvlb[2];   /* level-0 corner / level of the batch in each buffer (verso dump) */
     int srcb[2], last;           /* the batch's source in each buffer (-1 unknown); the buffer of the last training step's batch (diagnostics) */
@@ -686,7 +686,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             } else nn_wind4_stats(LGC(g_w4_ch), LGC(g_w4_ch + 1), d->w4 + vb, d->wc + vb, d->sidem, ns, d->w4ds);
             nn_loss_stats_acc(LGC(g_side_ch), d->sidet, d->sidem, d->sidew, two, d->hs_ds + 10);
             nn_loss_stats_acc(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, d->hs_ds + 20);
-            if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), d->sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, d->hs_ds + 40, nullptr);
+            if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), d->sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, d->hs_ds + 56, nullptr);
             continue;
         }
         if (!g_unwrap2) {
@@ -694,10 +694,10 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nn_loss_grad_only(LGC(1), d->t + l3 + vb, d->pm + vb, d->w + 1, one, g_ink_dice, LGC(1), d->iscratch);
             if (g_ink_lambda != 1.f) nn_loss_grad_scale(LGC(1), ns, g_ink_lambda);
         } else nn_wind4_grad(LGC(g_w4_ch), LGC(g_w4_ch + 1), d->w4 + vb, d->wc + vb, d->sidem, ns, d->w4fin, g_w4_lambda, LGC(g_w4_ch), LGC(g_w4_ch + 1));
-        if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), d->sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, d->hs_ds + 42, d->pg_acc);   /* (before the BCE gradient overwrites the logits; its sums go to + 42, unused) */
+        if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), d->sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, d->hs_ds + 58, d->pg_acc);   /* (before the BCE gradient overwrites the logits; its sums go to + 58, unused) */
         nn_loss_grad_only(LGC(g_side_ch), d->sidet, d->sidem, d->sidew, two, 0.f, LGC(g_side_ch), d->sscratch);
         if (g_side_lambda != 1.f) nn_loss_grad_scale(LGC(g_side_ch), 2 * ns, g_side_lambda);
-        if (g_pg_lambda > 0) nn_pgrad_apply(LGC(g_side_ch), LGC(g_side_ch + 1), d->pg_acc, ns, d->hs_ds + 40, g_pg_lambda);
+        if (g_pg_lambda > 0) nn_pgrad_apply(LGC(g_side_ch), LGC(g_side_ch + 1), d->pg_acc, ns, d->hs_ds + 56, g_pg_lambda);
         nn_loss_grad_only(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, 0.f, LGC(g_norm_ch), d->nscratch);
         if (g_norm_lambda != 1.f) nn_loss_grad_scale(LGC(g_norm_ch), 7 * ns, g_norm_lambda);
         if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0)\n"); abort(); }
@@ -1025,7 +1025,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
         d->ds_loss += powf(g_ds_w, (float)j) * g_ds_frac * (nc ? s / nc : 0);
     }
     d->pg_loss = 0;
-    if (g_pg_lambda > 0 && g_head_slab) { nn_d2h(d->pg_h, d->hs_ds + 40, 2 * sizeof(double)); d->pg_loss = d->pg_h[1] > 0 ? g_pg_lambda * d->pg_h[0] / d->pg_h[1] : 0; }
+    if (g_pg_lambda > 0 && g_head_slab) { nn_d2h(d->pg_h, d->hs_ds + 56, 2 * sizeof(double)); d->pg_loss = d->pg_h[1] > 0 ? g_pg_lambda * d->pg_h[0] / d->pg_h[1] : 0; }
     d->count_loss = 0;
     if (g_count_lambda > 0) { nn_d2h(d->cnt_h, d->cnt_out, 3 * sizeof(float)); d->count_loss = g_count_lambda * d->cnt_h[0]; }
     d->cond_loss = 0;
