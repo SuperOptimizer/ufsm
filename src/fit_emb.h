@@ -11,8 +11,8 @@
    nearest a (W = n + phi) is located along a's direction; on b's line the sheet centres at W = W_level(a) + r for r = -rmax..rmax.
    Each centre's vector is the mean of three samples across the sheet (-1, 0, +1 native voxel along the direction).
    Result r: the sheet at a's level L is the one b currently calls L + r, i.e. b's W is r turns too high relative to a
-   (correct b by W_b - r). conf = the cosine margin best - second best (0..2), NOT calibrated: use emb-calib (fit --emb-calib) for
-   P(r right | conf) on ground truth. Returns 0 with a vote, -1 when a side has no embedding (outside the loaded region / masked). */
+   (correct b by W_b - r). conf = the cosine margin best - second best (0..2), NOT calibrated: use ufsm emb-calib for
+   P(r right | conf) on ground truth (HOLD, tokens_unit: >= 0.99 at conf >= 0.2 for D <= 48; 0.88-0.95 at D 128; < 0.05 about 0.45). Returns 0 with a vote, -1 when a side has no embedding (outside the loaded region / masked). */
 #pragma once
 #include <stddef.h>
 #include <stdint.h>

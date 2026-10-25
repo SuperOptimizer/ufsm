@@ -37,8 +37,8 @@ fit_cfg fit_cfg_default(void) {
     c.w_ct = 0.f; c.ct_pow = 1.f; c.ct_phi = 0.f; c.ct_radius_um = 150; c.ct_floor = 0.f;   /* CT parity off by default */
     c.w_cspacing = 0.f; c.cs_tol = 0.25f; c.ct_flood = 0;
     c.uw_repair = 0; c.uw_rep_qpow = 1.f; c.uw_rep_sr = 1; c.uw_rep_gd = 8;   /* local slip repair off by default */
-    c.emb = nullptr; c.uw_rep_emb = 0.f; c.uw_rep_emb_m0 = 0.1f; c.emb_phi = 0.f; c.uw_rep_emb_rmax = 2; c.uw_rep_emb_sub = 2;   /* embedding evidence off */
-    c.uw_rep_emb_nd = 3; c.uw_rep_emb_d[0] = 16; c.uw_rep_emb_d[1] = 48; c.uw_rep_emb_d[2] = 128;
+    c.emb = nullptr; c.uw_rep_emb = 0.f; c.uw_rep_emb_m0 = 0.3f; c.emb_phi = 0.f; c.uw_rep_emb_rmax = 2; c.uw_rep_emb_sub = 2;   /* embedding evidence off */
+    c.uw_rep_emb_nd = 2; c.uw_rep_emb_d[0] = 16; c.uw_rep_emb_d[1] = 48; c.uw_rep_emb_d[2] = 128;   /* emb-calib (HOLD): P(r right) 0.99 at conf >= 0.2 for D <= 48, 0.88 at 128 */
     return c;
 }
 

@@ -982,9 +982,9 @@ static int cmd_fit(int argc, char **argv) {
     c.uw_rep_qpow = (float)atof(opt(argc, argv, "--uw-rep-qpow", "3")); c.uw_rep_stretch = (float)atof(opt(argc, argv, "--uw-rep-stretch", "0.5"));
     c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1"));
     /* embedding evidence for the slip repair (src/fit_emb.h): --emb GROUP (a dinovol-embed output group at the fields' scan level, or
-       --emb-scale S embedding voxels per native voxel) [--emb-output tokens_unit] --uw-rep-emb W [--uw-rep-emb-d 16,48,128 native voxels]
-       [--uw-rep-emb-m0 0.1 cosine margin for full weight] [--uw-rep-emb-rmax 2] [--uw-rep-emb-sub 2 field voxels] [--emb-phi 0] */
-    c.uw_rep_emb = (float)atof(opt(argc, argv, "--uw-rep-emb", "0")); c.uw_rep_emb_m0 = (float)atof(opt(argc, argv, "--uw-rep-emb-m0", "0.1"));
+       --emb-scale S embedding voxels per native voxel) [--emb-output tokens_unit] --uw-rep-emb W [--uw-rep-emb-d 16,48 native voxels]
+       [--uw-rep-emb-m0 0.3 cosine margin for full weight] [--uw-rep-emb-rmax 2] [--uw-rep-emb-sub 2 field voxels] [--emb-phi 0] */
+    c.uw_rep_emb = (float)atof(opt(argc, argv, "--uw-rep-emb", "0")); c.uw_rep_emb_m0 = (float)atof(opt(argc, argv, "--uw-rep-emb-m0", "0.3"));
     c.uw_rep_emb_rmax = atoi(opt(argc, argv, "--uw-rep-emb-rmax", "2")); c.uw_rep_emb_sub = atoi(opt(argc, argv, "--uw-rep-emb-sub", "2")); c.emb_phi = (float)atof(opt(argc, argv, "--emb-phi", "0"));
     if (*opt(argc, argv, "--uw-rep-emb-d", "")) { c.uw_rep_emb_nd = 0; char *t = strdup(opt(argc, argv, "--uw-rep-emb-d", "")); for (char *q = strtok(t, ","); q && c.uw_rep_emb_nd < 4; q = strtok(nullptr, ",")) c.uw_rep_emb_d[c.uw_rep_emb_nd++] = atoi(q); free(t); }
     if (!(c.uw_rep_emb >= 0) || !(c.uw_rep_emb_m0 > 0) || c.uw_rep_emb_rmax < 1 || c.uw_rep_emb_rmax > 8 || c.uw_rep_emb_sub < 1) { fprintf(stderr, "fit: --uw-rep-emb >= 0, --uw-rep-emb-m0 > 0, --uw-rep-emb-rmax 1..8, --uw-rep-emb-sub >= 1\n"); return 2; }
