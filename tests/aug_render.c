@@ -46,6 +46,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(key, "delam")) a.delam_p = (float)v; else if (!strcmp(key, "delam_hole")) a.delam_hole = (float)v;
         else if (!strcmp(key, "density")) a.density_p = (float)v;
         else if (!strcmp(key, "curv")) a.curv_p = (float)v;
+        else if (!strcmp(key, "incl")) a.incl_p = (float)v;
         else { fprintf(stderr, "aug_render: unknown aug %s\n", key); return 2; }
         q += nc; if (*q == ',') q++;
     }

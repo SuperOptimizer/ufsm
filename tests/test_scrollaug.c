@@ -373,6 +373,49 @@ static void curv_tests(const char *dir) {
     drop(a); drop(d); drop(e); sources_free(S);
 }
 
+/* --aug-inclusions: the kernel on a synthetic box (sheets 160, gaps 40), then the sampler */
+static void incl_tests(const char *dir) {
+    {
+        const int P = 64; const size_t p3 = (size_t)P * P * P;
+        uint8_t *ct = malloc(p3), *out = malloc(p3);
+        for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) ct[((size_t)z * P + y) * P + x] = (x % 12) < 5 ? 160 : 40;
+        for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) ct[(size_t)y * P + x] = 0;   /* (a plane outside the scan) */
+        sa_incl *in = malloc(sizeof *in);
+        int ident = 1, zero = 1, place = 1, kinds = 0, nt = 0; size_t up = 0, down = 0, changed = 0;
+        for (int it = 0; it < 6; it++) {
+            const int n = sa_incl_make(in, 700 + it, ct, P, P, P, 100, 40, 4); nt += n;
+            for (int i = 0; i < n; i++) {
+                const sa_incl_item *q = &in->it[i]; kinds |= 1 << q->kind;
+                int c[3]; for (int d = 0; d < 3; d++) { c[d] = (int)lrint(q->c[d]); c[d] = c[d] < 0 ? 0 : c[d] >= P ? P - 1 : c[d]; }
+                const uint8_t v = ct[((size_t)c[0] * P + c[1]) * P + c[2]];
+                if (q->kind == 1 && v != 160 && fabs(q->c[2] - c[2]) < .45) place &= 0;   /* (centres jittered half a voxel: check the clear ones) */
+                if (q->kind == 2 && v != 40 && fabs(q->c[2] - c[2]) < .45) place &= 0;
+            }
+            sa_incl_apply(in, 0, ct, P, P, P, out); ident &= !memcmp(out, ct, p3);
+            sa_incl_apply(in, 1, ct, P, P, P, out);
+            for (size_t k = 0; k < p3; k++) { if (!ct[k]) { zero &= !out[k]; continue; } changed += out[k] != ct[k]; up += out[k] > ct[k] + 40; down += out[k] + 40 < ct[k]; }
+        }
+        printf("scrollaug: inclusions kernel: %d items over 6 draws (kinds %d), %zu voxels changed (%.2f%%), %zu brighter / %zu darker by > 40\n",
+               nt, kinds, changed, 100. * changed / (6. * p3), up, down);
+        check("inclusions apply: t 0 is the CT, CT 0 stays 0", ident && zero);
+        check("inclusions make: grains, bubbles and debris; bubbles on papyrus, debris in gaps", kinds == 7 && place);
+        check("inclusions apply: local (< 5% of the voxels), bright grains / debris and dark bubbles", changed > 0 && changed < .05 * 6 * p3 && up > 0 && down > 0);
+        free(in); free(ct); free(out);
+    }
+    char p[1400]; snprintf(p, sizeof p, "%s/sources.json", dir); sources *S = sources_load(p); assert(S);
+    const int PW = 64; const size_t p3 = (size_t)PW * PW * PW;
+    sample_cfg c = base_cfg(PW); c.snap = 0; c.symmetry_p = 0; c.rotate_p = 0; c.elastic_p = 0; c.zoom_p = 0; c.affine_p = 0;
+    snap a[NB], d[NB], e[NB];
+    sampler *sp = sampler_start(S, &c); assert(sp); take(sp, a, p3); const uint64_t n0 = sampler_aug_count(sp, AUGN_INCL); sampler_stop(sp);
+    sample_cfg c1 = c; c1.incl_p = 1;
+    sp = sampler_start(S, &c1); assert(sp); take(sp, d, p3); const uint64_t n1 = sampler_aug_count(sp, AUGN_INCL); sampler_stop(sp);
+    sp = sampler_start(S, &c1); assert(sp); take(sp, e, p3); sampler_stop(sp);
+    printf("scrollaug: inclusions sampler: %llu windows with inclusions\n", (unsigned long long)n1);
+    check("--aug-inclusions 0: never applied", n0 == 0);
+    check("--aug-inclusions 1: applied (small windows may draw none), deterministic", n1 >= NB / 2 && same(d, e, p3));
+    drop(a); drop(d); drop(e); sources_free(S);
+}
+
 int main(int argc, char **argv) {
     char tmpd[] = "/tmp/ufsm-scrollaug-XXXXXX"; const char *dir = argc > 1 ? argv[1] : mkdtemp(tmpd);
     if (!dir || make_wind_fixture(dir, 256, 2.f)) { fprintf(stderr, "fixture failed\n"); return 1; }
@@ -381,6 +424,7 @@ int main(int argc, char **argv) {
     delam_tests(dir);
     density_tests(dir);
     curv_tests(dir);
+    incl_tests(dir);
     if (argc < 2) { char cmd[1500]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {} }
     printf(failed ? "scrollaug: %d FAILED\n" : "scrollaug: all passed\n", failed);
     return failed != 0;

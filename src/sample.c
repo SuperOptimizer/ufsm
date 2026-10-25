@@ -2129,6 +2129,17 @@ static int curv_draw(sampler *sp, source *s, int l, const int64_t o[3], int P, i
 }
 /* --aug-sheet-density: the window's CT (Pz x P x P) re-lit per wrap from its stored phase (the pulled one after crush / tear / delam);
    returns 1 applied, 0 no usable phase, -1 error */
+/* --aug-inclusions: grains, bubbles and debris pasted into the window's CT (Pz x P x P), labels unchanged; 1 applied, 0 none placed, -1 error */
+static int incl_draw(sampler *sp, source *s, int Pz, int P, rng *r, uint8_t *ctu) {
+    const sample_cfg *c = &sp->cfg; const size_t p3 = (size_t)Pz * P * P;
+    const uint64_t seed = rnext(r);
+    sa_incl *in = malloc(sizeof *in); if (!in) return -1;
+    const int iso = s->iso > 0 ? s->iso : c->iso > 0 ? c->iso : sa_ct_quantile(ctu, p3, .5);
+    const int n = sa_incl_make(in, seed, ctu, Pz, P, P, (uint8_t)(iso > 255 ? 255 : iso), sa_ct_quantile(ctu, p3, .05), 1);
+    if (n) { sa_incl_apply(in, 1, ctu, Pz, P, P, ctu); atomic_fetch_add(&sp->augn[AUGN_INCL], 1); }
+    free(in);
+    return n > 0;
+}
 static int density_draw(sampler *sp, source *s, const int64_t o[3], int Pz, int P, int pshift, rng *r, uint8_t *ctu) {
     const sample_cfg *c = &sp->cfg; const size_t p3 = (size_t)Pz * P * P;
     const uint64_t seed = rnext(r);
@@ -2284,6 +2295,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (dn < 0) return -1;
             if (dn) { nz = 0; sum = sq = 0; u8_stats(ctu, p3, &nz, &sum, &sq); }
         }
+    }
+    if (c->incl_p > 0 && c->augment && !chained && !c->view_P && !c->cover && !c->holdout && runif(r) < c->incl_p) {
+        const int ni = incl_draw(sp, s, Pz, P, r, ctu);
+        if (ni < 0) return -1;
+        if (ni) { nz = 0; sum = sq = 0; u8_stats(ctu, p3, &nz, &sum, &sq); }
     }
     PROF_MARK(PS_STATS);
     /* --iso-void / --iso-lift: chamfer distance (3 per voxel, saturated at 255) of every voxel to papyrus (clean CT >= the cutoff) */

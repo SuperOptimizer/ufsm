@@ -553,6 +553,19 @@ Goal: sheets that split into layers (a void opening inside a sheet, the outer la
   24 windows). Render: build/scrollaug_anim ... delam (strength swept 0 -> 1 -> 0, w4 component borders drawn);
   ~/ufsm-data/scrollaug/anim/delam.gif.
 
+## Inclusions: train --aug-inclusions P (2026-10-24)
+Goal: the net looks through mineral grains, bubbles and debris (other scrolls have more of them; the labels are of the sheets).
+- Any augmented training window (no phase needed), after density; CT only, labels unchanged.
+- src/scrollaug.[ch] `sa_incl_make` / `sa_incl_apply`: per 128^3 a uniform 0-6 grains, 0-4 bubbles, 0-3 debris (a fraction of an item
+  is the chance of one), each placed on a voxel of its kind: grains anywhere in the scan (rough ellipsoids 0.8-3 voxels, CT 190-255,
+  never darkening, a thin dark phase-contrast fringe out to 1.8 radii), bubbles on papyrus (1.5-5 voxels, void inside, a faint bright
+  rim), debris in gaps (elongated rough clumps 2-8 voxels, iso + 10-70% of the range above it, speckled). Soft ~1 voxel edges; CT 0
+  kept.
+- Tests: t 0 identity, CT 0 kept; all three kinds, bubbles on papyrus and debris in gaps; local (0.2% of the voxels at 4x the count),
+  brighter and darker voxels; default off, p 1 deterministic.
+- Cost P512 one core: +0.3 s per window. Render: scrollaug_anim ... incl [--dens 1]; ~/ufsm-data/scrollaug/anim/incl.gif (--dens 5,
+  stills incl-t0/t1(-crop).jpg).
+
 ## Curvature: train --aug-curv P (2026-10-24)
 Goal: the tight inner core and near-flat outer wraps from any wrap's windows (the training boxes see few radii).
 - Same windows as --aug-crush / tear / delam (stored phase, side 2, cube, no target channels); exclusive with them; xscan skips bent

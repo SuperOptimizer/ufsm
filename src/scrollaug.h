@@ -73,3 +73,19 @@ typedef struct {
 int sa_density_make(sa_density *d, uint64_t seed, const uint8_t *ct, const uint8_t *ph, int D, int H, int W, uint8_t iso);
 /* out = the CT with the strengths scaled by t (0: a copy); out may be ct */
 void sa_density_apply(const sa_density *d, double t, const uint8_t *ct, const uint8_t *ph, int D, int H, int W, uint8_t *out);
+
+/* --aug-inclusions: bright mineral grains (anywhere in the scan, 0.8-3 voxels, a thin dark phase-contrast fringe), bubbles (in papyrus,
+   1.5-5 voxels, void inside, a faint bright rim) and debris (rough elongated grey-to-bright clumps 2-8 voxels in the gaps) pasted into
+   the CT; labels unchanged (the net learns to look through them). Counts per 128^3 uniform 0-6 / 0-4 / 0-3 x density. */
+enum { SA_INCL_MAX = 4096 };
+typedef struct {
+    int kind;                 /* 0 grain, 1 bubble, 2 debris */
+    double c[3], e[3][3], r[3];   /* centre, ellipsoid axes (rows), radii */
+    double val, halo, rough, hk[3][3], hp[3];
+    uint64_t spk;
+} sa_incl_item;
+typedef struct { int n; uint8_t iso, void_ct; uint64_t seed; sa_incl_item it[SA_INCL_MAX]; } sa_incl;
+/* the items of a D x H x W box (CT: kinds placed on their voxels); returns the count */
+int sa_incl_make(sa_incl *in, uint64_t seed, const uint8_t *ct, int D, int H, int W, uint8_t iso, uint8_t void_ct, double density);
+/* out = ct with the items at strength t (0: a copy); CT 0 kept */
+void sa_incl_apply(const sa_incl *in, double t, const uint8_t *ct, int D, int H, int W, uint8_t *out);

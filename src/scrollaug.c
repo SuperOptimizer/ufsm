@@ -356,3 +356,82 @@ void sa_density_apply(const sa_density *d, double t, const uint8_t *ct, const ui
     }
     free(kc); free(kn); free(gv); free(ov); free(sl);
 }
+
+/* ---- --aug-inclusions ---- */
+int sa_incl_make(sa_incl *in, uint64_t seed, const uint8_t *ct, int D, int H, int W, uint8_t iso, uint8_t void_ct, double density) {
+    sa_rng r = {seed ^ 0x2545f4914f6cdd1dull};
+    memset(in, 0, sizeof *in); in->iso = iso; in->void_ct = void_ct; in->seed = seed;
+    const double vol = (double)D * H * W / (128. * 128. * 128.);
+    /* per 128^3: grains 0-6, bubbles 0-4, debris 0-3 (x density); each placed on a voxel of its kind (tries bounded) */
+    int want[3]; const double mx[3] = {6, 4, 3};
+    for (int k = 0; k < 3; k++) { const double lam = sa_unif(&r) * mx[k] * vol * density, f = floor(lam); want[k] = (int)f + (sa_unif(&r) < lam - f); }   /* (small windows: a fraction of an item is a chance of one) */
+    for (int kind = 0; kind < 3; kind++) for (int i = 0, tries = 0; i < want[kind] && in->n < SA_INCL_MAX && tries < 40 * want[kind] + 40; tries++) {
+        const int z = (int)(sa_unif(&r) * D), y = (int)(sa_unif(&r) * H), x = (int)(sa_unif(&r) * W);
+        const uint8_t v = ct[((size_t)z * H + y) * W + x];
+        if (!v || (kind == 1 && v < iso) || (kind == 2 && v >= iso)) continue;   /* grains anywhere in the scan, bubbles in papyrus, debris in gaps */
+        sa_incl_item *it = &in->it[in->n++]; i++;
+        it->kind = kind; it->c[0] = z + sa_unif(&r) - .5; it->c[1] = y + sa_unif(&r) - .5; it->c[2] = x + sa_unif(&r) - .5;
+        double a[3]; sa_unit(&r, a); double b[3], cc[3];   /* the ellipsoid frame */
+        sa_perp(a, b, cc);
+        const double th = 2 * M_PI * sa_unif(&r), ct_ = cos(th), st_ = sin(th);
+        for (int d = 0; d < 3; d++) { it->e[0][d] = a[d]; it->e[1][d] = ct_ * b[d] + st_ * cc[d]; it->e[2][d] = -st_ * b[d] + ct_ * cc[d]; }
+        if (kind == 0) {   /* mineral grain: 0.8-3 voxels, near-round, bright, a thin dark fringe (phase contrast) */
+            const double R = .8 + 2.2 * sa_unif(&r) * sa_unif(&r);
+            for (int d = 0; d < 3; d++) it->r[d] = R * (.75 + .5 * sa_unif(&r));
+            it->val = 190 + 65 * sa_unif(&r); it->halo = .15 + .35 * sa_unif(&r); it->rough = .1 * sa_unif(&r);
+        } else if (kind == 1) {   /* bubble: 1.5-5 voxels, round, void inside, a faint bright rim */
+            const double R = 1.5 + 3.5 * sa_unif(&r);
+            for (int d = 0; d < 3; d++) it->r[d] = R * (.85 + .3 * sa_unif(&r));
+            it->val = void_ct; it->halo = -.25 * sa_unif(&r); it->rough = .05 * sa_unif(&r);
+        } else {   /* debris: an elongated rough clump 2-8 voxels in a gap, papyrus-like grey to bright */
+            const double R = 2 + 6 * sa_unif(&r);
+            it->r[0] = R; it->r[1] = R * (.25 + .5 * sa_unif(&r)); it->r[2] = it->r[1] * (.5 + .5 * sa_unif(&r));
+            it->val = iso + (255 - iso) * (.1 + .6 * sa_unif(&r)); it->halo = 0; it->rough = .25 + .2 * sa_unif(&r);
+        }
+        for (int j = 0; j < 3; j++) { sa_unit(&r, it->hk[j]); for (int d = 0; d < 3; d++) it->hk[j][d] *= 1 + 2 * sa_unif(&r); it->hp[j] = 2 * M_PI * sa_unif(&r); }
+        it->spk = sa_next(&r);
+    }
+    return in->n;
+}
+static double sa_incl_r(const sa_incl_item *it, const double q[3]) {   /* scaled radius: 1 on the (rough) surface */
+    double s = 0, u[3];
+    for (int j = 0; j < 3; j++) { u[j] = (q[0] * it->e[j][0] + q[1] * it->e[j][1] + q[2] * it->e[j][2]) / it->r[j]; s += u[j] * u[j]; }
+    const double rho = sqrt(s);
+    if (it->rough <= 0 || rho < 1e-9) return rho;
+    double h = 0; for (int j = 0; j < 3; j++) h += sin((u[0] * it->hk[j][0] + u[1] * it->hk[j][1] + u[2] * it->hk[j][2]) / rho * 2 + it->hp[j]);
+    return rho / (1 + it->rough * h / 3);
+}
+void sa_incl_apply(const sa_incl *in, double t, const uint8_t *ct, int D, int H, int W, uint8_t *out) {
+    const size_t N = (size_t)D * H * W;
+    if (out != ct) memcpy(out, ct, N);
+    if (t <= 0) return;
+    for (int i = 0; i < in->n; i++) {
+        const sa_incl_item *it = &in->it[i];
+        const double rm = fmax(it->r[0], fmax(it->r[1], it->r[2])) * (1 + it->rough) * (it->halo != 0 ? 1.8 : 1.2) + 1;
+        const int lo[3] = {(int)floor(it->c[0] - rm), (int)floor(it->c[1] - rm), (int)floor(it->c[2] - rm)};
+        const int hi[3] = {(int)ceil(it->c[0] + rm), (int)ceil(it->c[1] + rm), (int)ceil(it->c[2] + rm)};
+        const int dims[3] = {D, H, W};
+        int a[3], b[3]; for (int d = 0; d < 3; d++) { a[d] = lo[d] < 0 ? 0 : lo[d]; b[d] = hi[d] >= dims[d] ? dims[d] - 1 : hi[d]; }
+        for (int z = a[0]; z <= b[0]; z++) for (int y = a[1]; y <= b[1]; y++) for (int x = a[2]; x <= b[2]; x++) {
+            const size_t k = ((size_t)z * H + y) * W + x;
+            const uint8_t v0 = ct[k];
+            if (!v0) continue;   /* (CT 0: outside the scan) */
+            const double q[3] = {z - it->c[0], y - it->c[1], x - it->c[2]}, rr = sa_incl_r(it, q);
+            double m = rr < .8 ? 1 : rr < 1.2 ? .5 + .5 * cos(M_PI * (rr - .8) / .4) : 0;   /* (soft, ~1 voxel edge at R 2-3) */
+            m = m < 0 ? 0 : m;
+            const double vc = out[k];
+            double v = vc;
+            if (m > 0) {
+                double tv = it->val;
+                if (it->kind == 2) { sa_rng s = {it->spk ^ (uint64_t)k * 0x9e3779b97f4a7c15ull}; tv *= .8 + .4 * sa_unif(&s); }   /* (speckled clump) */
+                if (it->kind == 0 && tv < vc) tv = vc;   /* (a grain never darkens) */
+                v = vc + t * m * (tv - vc);
+            }
+            if (it->halo != 0 && rr >= .9 && rr < 1.8) {   /* fringe: dark around grains (halo > 0), bright around bubbles (halo < 0) */
+                const double f = sin(M_PI * (rr - .9) / .9);
+                v -= t * it->halo * f * (vc - in->void_ct > 0 ? vc - in->void_ct + 20 : 20);
+            }
+            out[k] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lrint(v));
+        }
+    }
+}

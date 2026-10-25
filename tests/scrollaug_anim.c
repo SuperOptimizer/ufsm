@@ -47,15 +47,15 @@ int main(int argc, char **argv) {
     const int fps = atoi(opt(argc, argv, "--fps", "12")), seam = atoi(opt(argc, argv, "--seam", "-1")), tear = !strcmp(argv[3], "tear");
     uint64_t seed = (uint64_t)atoll(opt(argc, argv, "--seed", "1"));
     const char *still = opt(argc, argv, "--still", nullptr); g_crop = opt(argc, argv, "--crop", nullptr);
-    const int delam = !strcmp(argv[3], "delam"), density = !strcmp(argv[3], "density"), curv = !strcmp(argv[3], "curv");
-    if (!tear && !delam && !density && !curv && strcmp(argv[3], "xscan")) { fprintf(stderr, "scrollaug_anim: tear, delam, density, curv or xscan\n"); return 2; }
+    const int delam = !strcmp(argv[3], "delam"), density = !strcmp(argv[3], "density"), curv = !strcmp(argv[3], "curv"), incl = !strcmp(argv[3], "incl");
+    if (!tear && !delam && !density && !curv && !incl && strcmp(argv[3], "xscan")) { fprintf(stderr, "scrollaug_anim: tear, delam, density, curv, incl or xscan\n"); return 2; }
     int64_t o[3]; { long long a, b, c; if (sscanf(argv[4], "%lld,%lld,%lld", &a, &b, &c) != 3) return 2; o[0] = a; o[1] = b; o[2] = c; }
     sources *S = sources_load(argv[1]); if (!S) return 1;
     source *s = &S->src[0]; z3 *ct = source_ct(s, l);
     if (!ct || !s->phase) { fprintf(stderr, "scrollaug_anim: no level %d CT or stored phase\n", l); return 1; }
     const int psh = s->phase_level - l; const size_t p3 = (size_t)P * P * P;
     make_pal();
-    const int np = tear || delam || density || curv ? 3 : 2, W = np * P + (np - 1) * 4, H = P + 14;
+    const int np = tear || delam || density || curv || incl ? 3 : 2, W = np * P + (np - 1) * 4, H = P + 14;
     uint8_t *ix = malloc((size_t)W * H); uint16_t *tree = malloc((size_t)4096 * 256 * sizeof *tree);
     FILE *f = fopen(argv[2], "wb"); if (!ix || !tree || !f) return 1;
     gif_head(f, W, H);
@@ -139,6 +139,36 @@ int main(int argc, char **argv) {
             }
         }
         crush_cache_free(&cc); free(arena);
+    } else if (incl) {   /* --aug-inclusions on the plain window (--dens: the count scale, default 1), strength swept 0 -> 1 -> 0 */
+        const int64_t nn[3] = {P, P, P};
+        uint8_t *ct0 = malloc(p3);
+        if (!ct0 || z3_read(ct, o, nn, ct0, 4) || phase_window(s->phase, o, P, P, psh, pho)) { fprintf(stderr, "read failed\n"); return 1; }
+        if (s->phase_sign < 0) phase_negate(pho, p3);
+        for (size_t k = 0; k < p3; k++) if (!ct0[k]) pho[k] = PHASE_UNKNOWN;
+        if (band_wind4_tiled(pho, P, P, P, (P + 5) / 6, 80, 512, 1, w4o, wco, nullptr) < 0) return 1;
+        const int iso = s->iso > 0 ? s->iso : sa_ct_quantile(ct0, p3, .5);
+        sa_incl *in = malloc(sizeof *in);
+        const int n = sa_incl_make(in, seed, ct0, P, P, P, (uint8_t)iso, sa_ct_quantile(ct0, p3, .05), atof(opt(argc, argv, "--dens", "1")));
+        int nk[3] = {0, 0, 0}, mid = 0; for (int i = 0; i < n; i++) { nk[in->it[i].kind]++; mid += fabs(in->it[i].c[0] - P / 2) < in->it[i].r[0] + 1; }
+        printf("%s: inclusions seed %llu: iso %d; %d grains, %d bubbles, %d debris (%d cross the mid-z plane)\n", argv[2], (unsigned long long)seed, iso, nk[0], nk[1], nk[2], mid);
+        for (int i = 0; i < n; i++) if (fabs(in->it[i].c[0] - P / 2) < in->it[i].r[0] + 1) printf("  %s at y %.0f x %.0f, radii %.1f %.1f %.1f\n", in->it[i].kind == 0 ? "grain" : in->it[i].kind == 1 ? "bubble" : "debris", in->it[i].c[1], in->it[i].c[2], in->it[i].r[0], in->it[i].r[1], in->it[i].r[2]);
+        for (int fr = 0; fr < F; fr++) {
+            const double u = F > 1 ? fr / (double)(F - 1) : 1, a = smooth(1 - fabs(2 * u - 1));
+            sa_incl_apply(in, a, ct0, P, P, P, cto);
+            if (fr == F / 2) { size_t ch = 0, chm = 0; for (size_t k = 0; k < p3; k++) { ch += cto[k] != ct0[k]; chm += cto[k] != ct0[k] && k / ((size_t)P * P) == (size_t)P / 2; } printf("full strength: %zu voxels changed, %zu in the mid-z plane\n", ch, chm);
+            }
+            uint8_t *rowb = malloc((size_t)W * P); memset(rowb, gray_ix(40), (size_t)W * P);
+            panel(rowb, W, 0, P, cto, nullptr, 0, nullptr); panel(rowb, W, P + 4, P, cto, pho, 1, nullptr); panel(rowb, W, 2 * (P + 4), P, cto, w4o, 2, wco);
+            memcpy(ix, rowb, (size_t)W * P); free(rowb);
+            for (size_t k = (size_t)W * P; k < (size_t)W * (P + 4); k++) ix[k] = gray_ix(40);
+            bar(ix, W, P + 4, a, .15);
+            gif_frame(f, ix, W, H, delay, tree);
+            if (still && (fr == 0 || fr == F / 2)) {
+                uint8_t *rgb = malloc((size_t)W * H * 3); for (size_t k = 0; k < (size_t)W * H; k++) memcpy(rgb + 3 * k, pal[ix[k]], 3);
+                char p[1200]; snprintf(p, sizeof p, "%s-t%d.jpg", still, fr ? 1 : 0); jpeg_write_rgb(p, W, H, rgb, 90); still_crop(p, rgb, W, P, np); free(rgb);
+            }
+        }
+        free(in); free(ct0);
     } else if (density) {   /* --aug-sheet-density on the plain window: the strengths swept 0 -> 1 -> 0 (labels untouched) */
         const int64_t nn[3] = {P, P, P};
         uint8_t *ct0 = malloc(p3);
