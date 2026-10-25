@@ -413,7 +413,8 @@ int cmd_tifxyz_scale(int argc, char **argv) {
     return rc;
 }
 
-/* ufsm png2jpg <in.png> <out.jpg> [--half] [--quality 90]: a PNG (8-bit) as JPEG, --half Pillow-BOX halved (png2jpg_half.py,
+/* ufsm png2jpg <in.png|in.jpg> <out.jpg> [--half] [--max-px N] [--quality 90]: a PNG (8-bit) or a JPEG (by its SOI bytes) as JPEG,
+   --half Pillow-BOX halved, --max-px N: the longest side at most N (img_fit_rgb; <out> may be <in>) (png2jpg_half.py,
    sync_big.sh's PNG -> JPEG copies) */
 /* ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K] [--wraps a,b,..]: every tifxyz wrap of <src-dir> (directories or
    .sfc) as <dst-dir>/<w>.sfc (surface-compressor, joint XYZ within --error voxels, meta.json inside), keeping every K-th vertex in both
@@ -467,8 +468,9 @@ int cmd_tifxyz_sfc(int argc, char **argv) {
     return rc;
 }
 int cmd_png2jpg(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm png2jpg <in.png> <out.jpg> [--half] [--quality 90]\n"); return 2; }
-    int w, h; uint8_t *rgb = png_read_rgb(argv[2], &w, &h); if (!rgb) { fprintf(stderr, "png2jpg: cannot read %s\n", argv[2]); return 1; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm png2jpg <in.png|in.jpg> <out.jpg> [--half] [--max-px N] [--quality 90]\n"); return 2; }
+    int is_jpg = 0; { FILE *f = fopen(argv[2], "rb"); uint8_t m[2] = {0}; if (f) { is_jpg = fread(m, 1, 2, f) == 2 && m[0] == 0xff && m[1] == 0xd8; fclose(f); } }
+    int w, h; uint8_t *rgb = is_jpg ? jpeg_read_rgb(argv[2], &w, &h) : png_read_rgb(argv[2], &w, &h); if (!rgb) { fprintf(stderr, "png2jpg: cannot read %s\n", argv[2]); return 1; }
     const int q = atoi(ropt(argc, argv, "--quality", "90"));
     const size_t ol = strlen(argv[3]);
     if (ol > 4 && !strcmp(argv[3] + ol - 4, ".tif")) {   /* <out>.tif: the first channel as a uint8 TIFF (gray PNGs for ink-compare); --crop x,y,w,h */
@@ -484,6 +486,7 @@ int cmd_png2jpg(int argc, char **argv) {
         if (!o || pil_resize(rgb, w, h, 3, o, ow, oh, PIL_BOX, 8)) { free(o); free(rgb); return 1; }
         free(rgb); rgb = o; w = ow; h = oh;
     }
+    if (img_fit_rgb(&rgb, &w, &h, atoi(ropt(argc, argv, "--max-px", "0")), 8)) { free(rgb); fprintf(stderr, "png2jpg: out of memory\n"); return 1; }
     const int rc = jpeg_write_rgb(argv[3], w, h, rgb, q); free(rgb);
     if (rc) fprintf(stderr, "png2jpg: cannot write %s\n", argv[3]);
     return rc ? 1 : 0;
@@ -508,11 +511,12 @@ int cmd_phase_score(int argc, char **argv) {
    --stretch: each ink panel p1 .. p99 contrast stretched over CT > 0 (display only); --full: full-resolution panels;
    --stretch-ct: the CT panel p1 .. p99 stretched as well (img_stretch); --fixed LO,HI: every ink panel on one fixed scale (bytes LO .. HI
    -> 0 .. 255), the same for all sheets, instead of --stretch; --each PREFIX: instead of the combined JPEG every panel alone, unlabelled,
-   as PREFIX<label><--each-suffix>.jpg (the CT panel only with --each-ct; <out.jpg> unused). */
+   as PREFIX<label><--each-suffix>.jpg (the CT panel only with --each-ct; <out.jpg> unused); --max-px N: every JPEG's longest side at most N
+   (antialiased, img_fit_rgb); --quality Q (90). */
 int cmd_ink_compare(int argc, char **argv) {
     const int ci = rarg(argc, argv, "--ct");
     if (argc < 5 || ci < 0 || ci + 1 >= argc || rarg(argc, argv, "--ink") < 0) {
-        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch | --fixed LO,HI] [--stretch-ct] [--full] [--each PREFIX [--each-suffix S] [--each-ct]] [--threads 16]\n"); return 2;
+        fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch | --fixed LO,HI] [--stretch-ct] [--full] [--each PREFIX [--each-suffix S] [--each-ct]] [--max-px N] [--quality 90] [--threads 16]\n"); return 2;
     }
     const double px = atof(ropt(argc, argv, "--px-um", "2.4")), rsu = atof(ropt(argc, argv, "--rs-um", "25")), rlu = atof(ropt(argc, argv, "--rl-um", "500"));
     const int nthreads = atoi(ropt(argc, argv, "--threads", "16"));
@@ -586,17 +590,18 @@ int cmd_ink_compare(int argc, char **argv) {
     else {
         if (rflag(argc, argv, "--stretch-ct")) { img_stretch(ct, mask, np, 0.01, 0.99); isct[0] = 0; }   /* the CT panel p1 .. p99 too (scans brighter than the fixed CT contrast) */
         const char *each = ropt(argc, argv, "--each", nullptr);
+        const int maxpx = atoi(ropt(argc, argv, "--max-px", "0")), jq = atoi(ropt(argc, argv, "--quality", "90"));   /* JPEG longest side, quality */
         if (each) {   /* --each PREFIX: every panel its own unlabelled JPEG PREFIX<label><--each-suffix>.jpg (the CT only with --each-ct) */
             const char *suf = ropt(argc, argv, "--each-suffix", ""); const int ect = rflag(argc, argv, "--each-ct");
             for (int k = ect ? 0 : 1; k < n; k++) {
                 char p[1400]; snprintf(p, sizeof p, "%s%s%s.jpg", each, lab[k], suf);
                 int ow, oh; uint8_t *rgb = ink_panels(&img[k], &isct[k], 1, W, H, nullptr, !rflag(argc, argv, "--full"), &ow, &oh, nthreads);
-                if (!rgb || jpeg_write_rgb(p, ow, oh, rgb, 90)) { fprintf(stderr, "ink-compare: cannot write %s\n", p); rc = 1; }
+                if (!rgb || img_fit_rgb(&rgb, &ow, &oh, maxpx, nthreads) || jpeg_write_rgb(p, ow, oh, rgb, jq)) { fprintf(stderr, "ink-compare: cannot write %s\n", p); rc = 1; }
                 free(rgb);
             }
         } else {
             int ow, oh; uint8_t *rgb = ink_panels(img, isct, n, W, H, lab, !rflag(argc, argv, "--full"), &ow, &oh, nthreads);
-            if (!rgb || jpeg_write_rgb(argv[2], ow, oh, rgb, 90)) { fprintf(stderr, "ink-compare: cannot write %s\n", argv[2]); rc = 1; }
+            if (!rgb || img_fit_rgb(&rgb, &ow, &oh, maxpx, nthreads) || jpeg_write_rgb(argv[2], ow, oh, rgb, jq)) { fprintf(stderr, "ink-compare: cannot write %s\n", argv[2]); rc = 1; }
             free(rgb);
         }
     }

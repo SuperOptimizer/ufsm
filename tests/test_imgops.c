@@ -1,5 +1,5 @@
 /* src/imgops.c: Pillow-exact BILINEAR / BOX resampling and the overlay_red.py compositing (bytes from Pillow / numpy, see
-   test_imgops_expected.h), the L1 dilation against a brute-force cross dilation, a JPEG write / PNG read smoke test, and the
+   test_imgops_expected.h), the L1 dilation against a brute-force cross dilation, a JPEG write / PNG read smoke test, JPEG read + img_fit_rgb, and the
    tifxyz rescale of xform_wraps.py (float32 v / div - offset, -1 kept, meta scale x div). */
 #include "imgops.h"
 #include "tiffw.h"
@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
@@ -54,6 +55,27 @@ static void test_jpeg(void) {
     const char *p = "/tmp/ufsm_test_imgops.jpg"; CHECK(!jpeg_write_rgb(p, W, H, rgb, 90), "jpeg write");
     FILE *f = fopen(p, "rb"); uint8_t h[3] = {0}; if (f) { CHECK(fread(h, 1, 3, f) == 3, "jpeg read"); fclose(f); }
     CHECK(h[0] == 0xff && h[1] == 0xd8 && h[2] == 0xff, "jpeg SOI marker"); remove(p);
+}
+/* jpeg_read_rgb round trip (a smooth gray ramp survives q95 within a few levels), a corrupt file -> nullptr (no exit), and img_fit_rgb:
+   the longest side to N with the aspect kept, a constant image stays constant, already-small images untouched */
+static void test_jpeg_read_fit(void) {
+    enum { W = 64, H = 32 }; uint8_t *rgb = malloc(W * H * 3);
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) for (int c = 0; c < 3; c++) rgb[(y * W + x) * 3 + c] = (uint8_t)(x * 3 + y);
+    const char *p = "/tmp/ufsm_test_imgops_rd.jpg"; CHECK(!jpeg_write_rgb(p, W, H, rgb, 95), "jpeg write (read test)");
+    int w = 0, h = 0; uint8_t *r = jpeg_read_rgb(p, &w, &h);
+    CHECK(r && w == W && h == H, "jpeg_read_rgb size %dx%d", w, h);
+    int md = 0; if (r) for (int i = 0; i < W * H * 3; i++) { const int d = abs((int)r[i] - rgb[i]); if (d > md) md = d; }
+    CHECK(md <= 6, "jpeg round trip max diff %d", md); free(r);
+    if (truncate(p, 200) == 0) { r = jpeg_read_rgb(p, &w, &h); free(r); }   /* truncated: libjpeg warns and pads (or fails); either way no exit */
+    { FILE *g = fopen(p, "wb"); if (g) { fputs("\xff\xd8garbage", g); fclose(g); } }
+    CHECK(!jpeg_read_rgb(p, &w, &h), "corrupt JPEG -> nullptr"); remove(p);
+    CHECK(!jpeg_read_rgb("/nonexistent/x.jpg", &w, &h), "missing JPEG -> nullptr");
+    w = W; h = H; CHECK(!img_fit_rgb(&rgb, &w, &h, 16, 2) && w == 16 && h == 8, "img_fit_rgb 64x32 -> 16: %dx%d", w, h);
+    w = 16; h = 8; uint8_t *keep = rgb; CHECK(!img_fit_rgb(&rgb, &w, &h, 16, 2) && rgb == keep && w == 16, "img_fit_rgb within: untouched");
+    CHECK(!img_fit_rgb(&rgb, &w, &h, 0, 2) && rgb == keep, "img_fit_rgb 0: off");
+    free(rgb); rgb = malloc(30 * 100 * 3); memset(rgb, 77, 30 * 100 * 3); w = 30; h = 100;
+    CHECK(!img_fit_rgb(&rgb, &w, &h, 40, 2) && w == 12 && h == 40, "img_fit_rgb tall 30x100 -> 40: %dx%d", w, h);
+    int ok = 1; for (int i = 0; i < w * h * 3; i++) ok &= rgb[i] == 77; CHECK(ok, "img_fit_rgb constant stays constant"); free(rgb);
 }
 static void test_tifxyz_scale(void) {
     enum { W = 9, H = 5 }; float x[W * H], y[W * H], z[W * H];
@@ -148,7 +170,7 @@ static void test_ink_compare(void) {   /* ink_stats / ink_corr / ink_panels_half
     CHECK(img_crop_u8(dim, W, H, 0, 0, 0, 4) == nullptr, "crop of width 0");
 }
 int main(void) {
-    test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_tifxyz_scale(); test_tifxyz_shift(); test_ink_compare();
+    test_resample(); test_overlay(); test_dilate(); test_jpeg(); test_jpeg_read_fit(); test_tifxyz_scale(); test_tifxyz_shift(); test_ink_compare();
     if (fails) { fprintf(stderr, "test_imgops: %d failures\n", fails); return 1; }
     printf("test_imgops: ok\n");
     return 0;

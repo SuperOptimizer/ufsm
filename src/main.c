@@ -135,7 +135,7 @@ static int usage(void) {
         "  ufsm dino-train --sources S.json --out DIR   our dense embedding net from scratch (GT sheet identity + DINO-style SSL)\n"
         "  ufsm dino-embed CKPT ROOT KEY OUT --box ... --norm c,s   a dino-train net over a box (dinovol-eval format)\n"
         "  ufsm halves ROOT KEY-L0 OUT --box ...   two 4x-pooled views of a fine scan from disjoint sub-voxel halves\n"
-        "  ufsm png2jpg <in.png> <out.jpg> [--half]   PNG -> JPEG q90 (half: Pillow BOX halved)\n"
+        "  ufsm png2jpg <in.png|in.jpg> <out.jpg> [--half] [--max-px N]   PNG / JPEG -> JPEG q90 (half: Pillow BOX halved; max-px: longest side)\n"
         "  ufsm phase-score <pc-dir> <ps-dir> [<sheets-dir>]   on-recto score of pc / ps renders on surfaces (per seam class with sheets)\n"
         "  ufsm stitch align|solve|field|sheets|info ...   overlapping box fits -> one gauge, a global winding field, stitched sheets\n"
         "  ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY]  ink / CT along each wrap (tiled TIFF)\n"
@@ -3005,7 +3005,7 @@ static void *render_rows(void *arg) {
         int c0 = (int)gu, r0 = (int)gv; if (c0 >= w - 1) c0 = w - 2; if (r0 >= h - 1) r0 = h - 2; if (c0 < 0 || r0 < 0) continue;
         const double fu = gu - c0, fv = gv - r0;
         const size_t i00 = (size_t)r0 * w + c0, i01 = i00 + 1, i10 = i00 + w, i11 = i10 + 1;
-        if (J->Z[i00] < 0 || J->Z[i01] < 0 || J->Z[i10] < 0 || J->Z[i11] < 0) continue;
+        if (!(J->Z[i00] >= 0 && J->Z[i01] >= 0 && J->Z[i10] >= 0 && J->Z[i11] >= 0)) continue;   /* invalid (-1) or NaN corner */
         const float *A[3] = {J->Z, J->Y, J->X}; double P[3], du[3], dv[3];
         for (int d = 0; d < 3; d++) {
             const double a = A[d][i00], b = A[d][i01], c = A[d][i10], e = A[d][i11];

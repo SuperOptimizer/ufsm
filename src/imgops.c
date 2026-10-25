@@ -6,6 +6,7 @@
 
 #include <dirent.h>
 #include <math.h>
+#include <setjmp.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -198,6 +199,31 @@ int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quali
     return fclose(f) ? -1 : 0;
 }
 
+
+/* ---- JPEG reading (any libjpeg input as RGB; a corrupt file returns nullptr instead of libjpeg's exit) ---- */
+typedef struct { struct jpeg_error_mgr pub; jmp_buf jb; } jr_err;
+static void jr_error_exit(j_common_ptr c) { longjmp(((jr_err *)c->err)->jb, 1); }
+uint8_t *jpeg_read_rgb(const char *path, int *wp, int *hp) {
+    FILE *f = fopen(path, "rb"); if (!f) return nullptr;
+    struct jpeg_decompress_struct ci; jr_err je; uint8_t *volatile rgb = nullptr;
+    ci.err = jpeg_std_error(&je.pub); je.pub.error_exit = jr_error_exit;
+    if (setjmp(je.jb)) { jpeg_destroy_decompress(&ci); fclose(f); free(rgb); return nullptr; }
+    jpeg_create_decompress(&ci); jpeg_stdio_src(&ci, f); jpeg_read_header(&ci, TRUE);
+    ci.out_color_space = JCS_RGB; jpeg_start_decompress(&ci);
+    const int w = (int)ci.output_width, h = (int)ci.output_height;
+    rgb = malloc((size_t)w * h * 3); if (!rgb) longjmp(je.jb, 1);
+    while (ci.output_scanline < ci.output_height) { JSAMPROW r = (JSAMPROW)(rgb + (size_t)ci.output_scanline * w * 3); jpeg_read_scanlines(&ci, &r, 1); }
+    jpeg_finish_decompress(&ci); jpeg_destroy_decompress(&ci); fclose(f);
+    *wp = w; *hp = h; return rgb;
+}
+
+/* ---- the longest side at most max_px (Pillow-style antialiased bilinear; aspect kept) ---- */
+int img_fit_rgb(uint8_t **rgb, int *w, int *h, int max_px, int nthreads) {
+    const int m = *w > *h ? *w : *h; if (max_px <= 0 || m <= max_px) return 0;
+    const double s = (double)max_px / m; int ow = (int)lround(*w * s), oh = (int)lround(*h * s); if (ow < 1) ow = 1; if (oh < 1) oh = 1;
+    uint8_t *o = malloc((size_t)ow * oh * 3); if (!o || pil_resize(*rgb, *w, *h, 3, o, ow, oh, PIL_BILINEAR, nthreads)) { free(o); return -1; }
+    free(*rgb); *rgb = o; *w = ow; *h = oh; return 0;
+}
 /* ---- PNG reading (8-bit, not interlaced) ---- */
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 uint8_t *png_read_rgb(const char *path, int *wp, int *hp) {
