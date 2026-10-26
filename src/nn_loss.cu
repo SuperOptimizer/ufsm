@@ -728,7 +728,10 @@ extern "C" void nn_distill_loss(const float *y, const int8_t *t, int n, int C, s
    Weighted by the phase mask (the packed-sheet weight: train --packed-weight), mean over the pairs. Head slabs [z0, z1) of the window:
    both ends inside the slab; the gradient direction from the codes over +-s voxels of the whole window. sums (device doubles): sum
    w loss, sum w (pass 0 accumulates them over the slabs; pass 1 reads sum w). ---- */
-typedef struct { float d[4]; int n, angle; } pg_dists;   /* angle: the gradient on the phasors' angles only (radial parts removed: the loss cannot raise the confidence) */
+typedef struct { float d[4]; int n, angle, mask; } pg_dists;   /* angle: the gradient on the phasors' angles only (radial parts removed: the loss cannot raise the confidence) */
+   /* mask (--pgrad-mask 1): only reliable label pairs: the gradient from path-unwrapped steps (every voxel of the +-s axis lines labelled,
+      no wrap where the sheets are closer than 2s), the expected rotation |grad W| dist <= 0.4 turn, and the label rotation to the partner
+      within 0.15 turn of it (no label edge, slip or wrap between). Packed cells stay in (they are the point). */
 template <typename LT> __global__ void pgrad_k(const LT *lc, const LT *ls, const uint8_t *ph, const uint8_t *wm, int D, int H, int W, int z0, int z1,
                                                int s, pg_dists ds, double *sums, float *acc) {
     const size_t HW = (size_t)H * W, ns = (size_t)(z1 - z0) * HW;
@@ -743,12 +746,21 @@ template <typename LT> __global__ void pgrad_k(const LT *lc, const LT *ls, const
         const int a6[6] = {ph[gi + sz], ph[gi - sz], ph[gi + sy], ph[gi - sy], ph[gi + s], ph[gi - s]};
         int ok = 1; for (int q = 0; q < 6; q++) ok &= a6[q] < 252; if (!ok) break;
         float g[3] = {(float)cnt_pdiff(a6[0], a6[1]), (float)cnt_pdiff(a6[2], a6[3]), (float)cnt_pdiff(a6[4], a6[5])};
+        if (ds.mask) {   /* path-unwrapped steps along each axis over -s..s (all labelled) */
+            const size_t st[3] = {HW, (size_t)W, 1};
+            for (int ax = 0; ax < 3 && ok; ax++) { int acc_ = 0, prev = ph[gi - s * st[ax]]; if (prev >= 252) { ok = 0; break; }
+                for (int k = -s + 1; k <= s; k++) { const int v = ph[gi + k * (long)st[ax]]; if (v >= 252) { ok = 0; break; } acc_ += cnt_pdiff(v, prev); prev = v; }
+                g[ax] = (float)acc_; }
+            if (!ok) break;
+        }
         const float gn = sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]); if (gn < 1e-3f) break;
+        const float gturn = gn * (1.f / 252.f) / (2.f * s);   /* label turns per voxel along the gradient */
         for (int di = 0; di < ds.n; di++) { const float dist = ds.d[di];
         const int zz = (int)lrintf(z + dist * g[0] / gn), yy = (int)lrintf(y + dist * g[1] / gn), xx = (int)lrintf(x + dist * g[2] / gn);
         if (zz < z0 || zz >= z1 || yy < 0 || yy >= H || xx < 0 || xx >= W) continue;
         const size_t gj = (size_t)zz * HW + (size_t)yy * W + xx; const int p1 = ph[gj]; if (p1 >= 252) continue;
         const size_t lj = gj - (size_t)z0 * HW; if (lj == li) continue;
+        if (ds.mask) { const float ex = gturn * dist; if (ex > 0.4f || fabsf(cnt_pdiff(p1, p0) * (1.f / 252.f) - ex) > 0.15f) continue; }
         const float dW = cnt_pdiff(p1, p0) * (1.f / 252.f), ur = cospif(2.f * dW), ui = sinpif(2.f * dW);
         const float sa = 1.f / (1.f + __expf(-lgv(lc, li))), sb = 1.f / (1.f + __expf(-lgv(ls, li)));
         const float sc = 1.f / (1.f + __expf(-lgv(lc, lj))), sd = 1.f / (1.f + __expf(-lgv(ls, lj)));
@@ -790,8 +802,8 @@ template <typename GT> __global__ void pgrad_apply_k(GT *gc, GT *gs, float *acc,
     gc[i] = f2h<GT>((float)gc[i] + f * a); gs[i] = f2h<GT>((float)gs[i] + f * b);
 }
 extern "C" void nn_pgrad_slab(const void *lc, const void *ls, const uint8_t *phase, const uint8_t *wm, int d, int h, int w, int z0, int z1, int s, const float *dist,
-                              int nd, int angle, double *sums, float *acc) {
-    const size_t ns = (size_t)(z1 - z0) * h * w; pg_dists ds = {{0}, nd < 1 ? 1 : nd > 4 ? 4 : nd, angle}; for (int k = 0; k < ds.n; k++) ds.d[k] = dist[k];
+                              int nd, int angle, int mask, double *sums, float *acc) {
+    const size_t ns = (size_t)(z1 - z0) * h * w; pg_dists ds = {{0}, nd < 1 ? 1 : nd > 4 ? 4 : nd, angle, mask}; for (int k = 0; k < ds.n; k++) ds.d[k] = dist[k];
     if (g_logits_h16) pgrad_k<f16><<<nblk(ns, 256), 256>>>((const f16 *)lc, (const f16 *)ls, phase, wm, d, h, w, z0, z1, s, ds, sums, acc);
     else pgrad_k<float><<<nblk(ns, 256), 256>>>((const float *)lc, (const float *)ls, phase, wm, d, h, w, z0, z1, s, ds, sums, acc);
     KCHECK();
