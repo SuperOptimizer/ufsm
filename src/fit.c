@@ -1151,6 +1151,84 @@ static void fit_pool_rows(void *a_, int r0, int r1, int t_) {
     }
 }
 
+/* the fibre pair term (fit_cfg fib + w_fib): points 16..128 native voxels apart along one fibre whose network phase, unwrapped along the
+   fibre (nearest field voxel per native-voxel step, confidence >= 0.2, gaps of <= 2 steps bridged), changes by less than half a turn lie
+   on one sheet (published Paris 4 fibres + wind96 phase: 93% one GT sheet at 0.3-1.2 mm; src/fibercheck.c): W(b) - W(a) should equal that
+   path change dP (the phase is W mod 1). Loss w_fib x mean Huber(W(b) - W(a) - dP, 0.25) over the pairs, on the lattice delta (the
+   knots' part is fixed per stage: base). */
+typedef struct { float a[3], b[3], d, base; } fib_pair;
+static fib_pair *fib_pairs(const fit_fields *f, const fit_cfg *c, size_t *np_) {
+    size_t np = 0, cap = 0; fib_pair *P = nullptr; const double h = f->h;
+    static const int DD[4] = {16, 32, 64, 128};
+    float *q = nullptr; double *U = nullptr; size_t qcap = 0;
+    for (int r = 0; r < c->fib_n; r++) {
+        const float *p = c->fib + 3 * (size_t)c->fib_off[r]; const int n = c->fib_off[r + 1] - c->fib_off[r]; if (n < 2) continue;
+        size_t ns = 0; double acc = 0, next = 0, last = NAN; int gap = 99;
+        for (int k = 1; k < n; k++) {
+            const double a[3] = {p[3 * k - 3] - c->fib_zoff, p[3 * k - 2], p[3 * k - 1]}, d[3] = {p[3 * k] - p[3 * k - 3], p[3 * k + 1] - p[3 * k - 2], p[3 * k + 2] - p[3 * k - 1]};
+            const double L = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            for (; L > 0 && next <= acc + L; next += 1) {
+                const double t = (next - acc) / L, s[3] = {a[0] + t * d[0], a[1] + t * d[1], a[2] + t * d[2]};
+                if (ns == qcap) { qcap = qcap ? 2 * qcap : 4096; q = realloc(q, 3 * qcap * sizeof *q); U = realloc(U, qcap * sizeof *U); if (!q || !U) abort(); }
+                for (int e = 0; e < 3; e++) q[3 * ns + e] = (float)s[e];
+                U[ns] = NAN;
+                const int iz = (int)floor(s[0] / h), iy = (int)floor(s[1] / h), ix = (int)floor(s[2] / h);
+                if (iz >= 0 && iy >= 0 && ix >= 0 && iz < f->D && iy < f->H && ix < f->W) {
+                    const size_t i = ((size_t)iz * f->H + iy) * f->W + ix; const double cc = (f->pc[i] - 128) / 127.0, sn = (f->ps[i] - 128) / 127.0;
+                    if (f->w[i] && hypot(cc, sn) >= 0.2) {
+                        const double ph = atan2(sn, cc) / (2 * M_PI);
+                        U[ns] = gap <= 2 && last == last ? last + (ph - last - floor(ph - last + 0.5)) : ph;
+                        if (!(gap <= 2 && last == last)) U[ns] += 1000.0 * (double)(np + ns + 1);   /* a new stretch: no pair across the break */
+                        last = U[ns]; gap = 0;
+                    }
+                }
+                if (!(U[ns] == U[ns])) gap++;
+                ns++;
+            }
+            acc += L;
+        }
+        for (size_t b = 0; b < ns; b++) {
+            if (!(U[b] == U[b])) continue;
+            for (int di = 0; di < 4; di++) {
+                if (b < (size_t)DD[di]) break;
+                const size_t a = b - DD[di]; if (a % 4 || !(U[a] == U[a])) continue;
+                const double dp = U[b] - U[a]; if (fabs(dp) >= 0.5) continue;   /* a turn crossed (or a break): the fibre hopped */
+                if (np == cap) { cap = cap ? 2 * cap : 65536; P = realloc(P, cap * sizeof *P); if (!P) abort(); }
+                fib_pair *e = &P[np++]; for (int k = 0; k < 3; k++) { e->a[k] = q[3 * a + k]; e->b[k] = q[3 * b + k]; } e->d = (float)dp; e->base = 0;
+            }
+        }
+    }
+    free(q); free(U); *np_ = np; return P;
+}
+/* trilinear lattice weights at a point (as lattice_at) */
+static void lattice_w(int L, int lz, int ly, int lx, double z, double y, double x, size_t idx[8], double w[8]) {
+    const double q[3] = {z / L, y / L, x / L}; const int dim[3] = {lz, ly, lx}; int c0[3]; double ct[3];
+    for (int k = 0; k < 3; k++) {
+        double a = q[k] < 0 ? 0 : q[k] > dim[k] - 1 ? dim[k] - 1 : q[k];
+        c0[k] = (int)a; if (c0[k] > dim[k] - 2) c0[k] = dim[k] - 2 < 0 ? 0 : dim[k] - 2;
+        ct[k] = dim[k] > 1 ? a - c0[k] : 0;
+    }
+    for (int c = 0; c < 8; c++) {
+        const int a = c0[0] + (c >> 2 & 1), b = c0[1] + (c >> 1 & 1), e = c0[2] + (c & 1);
+        w[c] = (c >> 2 & 1 ? ct[0] : 1 - ct[0]) * (c >> 1 & 1 ? ct[1] : 1 - ct[1]) * (c & 1 ? ct[2] : 1 - ct[2]);
+        idx[c] = ((size_t)(a < lz ? a : lz - 1) * ly + (b < ly ? b : ly - 1)) * lx + (e < lx ? e : lx - 1);
+    }
+}
+/* loss and its gradient (added to g) over the pairs; also the share of pairs whose rounded W difference is not 0 */
+static double fib_pair_grad(const fib_pair *P, size_t n, const float *d, int L, int lz, int ly, int lx, double wt, float *g, double *off) {
+    double loss = 0; size_t bad = 0; const double hub = 0.25;
+    for (size_t i = 0; i < n; i++) {
+        size_t ia[8], ib[8]; double wa[8], wb[8];
+        lattice_w(L, lz, ly, lx, P[i].a[0], P[i].a[1], P[i].a[2], ia, wa); lattice_w(L, lz, ly, lx, P[i].b[0], P[i].b[1], P[i].b[2], ib, wb);
+        double r = P[i].base - P[i].d; for (int c = 0; c < 8; c++) r += wb[c] * d[ib[c]] - wa[c] * d[ia[c]];
+        bad += lround(r + P[i].d) != 0;
+        const double ar = fabs(r); loss += ar < hub ? 0.5 * r * r : hub * (ar - 0.5 * hub);
+        const double gr = wt / n * (ar < hub ? r : hub * (r > 0 ? 1 : -1));
+        if (g) for (int c = 0; c < 8; c++) { g[ib[c]] += (float)(gr * wb[c]); g[ia[c]] -= (float)(gr * wa[c]); }
+    }
+    if (off) *off = n ? (double)bad / n : 0;
+    return n ? wt * loss / n : 0;
+}
 /* ---- the CPU backend (fit_cfg cpu): nn_fit_loss2 / nn_fit_smooth / nn_adamw on host arrays (src/fit_terms.h: the same per-voxel
    terms as the CUDA kernels). Minibatches are stratified: one voxel per run of stride voxels (hash of the run and the step's salt),
    so a step touches n / stride voxels, not n hashes. Threads own contiguous voxel ranges, hence a few lattice z planes each: per
@@ -1372,12 +1450,20 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
     }
     const double norm = ndata ? 1.0 / ndata : 1;
     int kstep = 0;
+    size_t nfp = 0; fib_pair *fpairs = c->fib && c->fib_n > 0 && c->w_fib > 0 ? fib_pairs(f, c, &nfp) : nullptr;
+    float *fph = nullptr, *fpg = nullptr;   /* host copies of delta and its gradient (GPU backend) */
+    if (c->verbose && fpairs) fprintf(stderr, "fit: fibre pair term: %zu pairs (weight %g)\n", nfp, (double)c->w_fib);
     for (int st = 0; st < c->nstage; st++) {
         const double tst = nn_wall_seconds();
         const int L = c->lattice[st], lz = (int)ceil(f->D * f->h / L) + 1, ly = (int)ceil(f->H * f->h / L) + 1, lx = (int)ceil(f->W * f->h / L) + 1;
         const size_t nl = (size_t)lz * ly * lx;
         float *hd = prolong(m, L, lz, ly, lx, c);
         free(m->delta); m->delta = hd; m->L = L; m->lz = lz; m->ly = ly; m->lx = lx;
+        if (nfp) {   /* the knots' part of each pair's W difference (fixed during the stage) */
+            for (size_t i = 0; i < nfp; i++) { double ta, tb; const double Wa = fit_base(m, fpairs[i].a[0], fpairs[i].a[1], fpairs[i].a[2], &ta) - m->dir * ta / (2 * M_PI), Wb = fit_base(m, fpairs[i].b[0], fpairs[i].b[1], fpairs[i].b[2], &tb) - m->dir * tb / (2 * M_PI);
+                double dth = (tb - ta) / (2 * M_PI); dth -= floor(dth + 0.5); fpairs[i].base = (float)((Wb + m->dir * tb / (2 * M_PI)) - (Wa + m->dir * ta / (2 * M_PI)) - m->dir * dth); }
+            if (!cpu) { free(fph); free(fpg); fph = malloc(nl * 4); fpg = malloc(nl * 4); }
+        }
         if (st == c->phase_stage && c->w_phase > 0) {   /* the current knots too: W reads them */
             fb_get(cpu, m->pitch, dpi, nk * 4); fb_get(cpu, m->offset, dof, nk * 4);
             const double umc = c->uw_min_conf > 0 ? c->uw_min_conf : 0.3;
@@ -1446,15 +1532,18 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
             fd.packed_sp = c->packed_um > 0 ? (float)(c->packed_um / (c->um > 0 ? c->um : 2.4) * 8.0 / f->h) : 0.f; fd.packed_floor = 0.1f;
             fb_zero(cpu, gd, nl * 4); fb_zero(cpu, gpi, nk * 4); fb_zero(cpu, gof, nk * 4); fb_zero(cpu, dparts, FIT_NPARTS * sizeof(double));
             fd.salt = (unsigned)(kstep * 2654435761u + 12345u);
+            double fpl = 0, fpo = 0;
             if (cpu) {
                 fit_loss2_cpu(&cl, dparts, gd);
                 fit_smooth_cpu(dd, lz, ly, lx, ws, wdec, dwn, lap, dparts, gd);
+                if (nfp) fpl = fib_pair_grad(fpairs, nfp, dd, L, lz, ly, lx, c->w_fib, gd, &fpo);
                 fit_adam_cpu(dd, gd, md, vd, nl, c->lr, it + 1);
                 ++kstep;   /* the knots are fixed (analytic terms) */
             } else {
                 if (c->analytic) nn_fit_loss2(&fd, dparts, gd);   /* random voxel subsets of ~batch per step */
                 else nn_fit_loss(&fd, dparts, gd, gpi, gof);
                 nn_fit_smooth(dd, lz, ly, lx, ws, wdec, dwn, lap, dparts, gd);
+                if (nfp) { fb_get(cpu, fph, dd, nl * 4); fb_get(cpu, fpg, gd, nl * 4); fpl = fib_pair_grad(fpairs, nfp, fph, L, lz, ly, lx, c->w_fib, fpg, &fpo); fb_put(cpu, gd, fpg, nl * 4); }
                 nn_adamw(dd, gd, md, vd, nl, c->lr, 0.9f, 0.999f, 1e-8f, 0.f, it + 1);
                 ++kstep;
                 nn_adamw(dof, gof, mof, vof, nk, c->lr_knot, 0.9f, 0.999f, 1e-8f, 0.f, kstep);
@@ -1468,6 +1557,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
                 if (drec) fprintf(stderr, " recto %.5f", p[FIT_P_RECTO]);
                 if (dctm) fprintf(stderr, " ct %.5f", p[FIT_P_CT]);
                 if (dcs) fprintf(stderr, " cspace %.5f", p[FIT_P_CSPACE]);
+                if (nfp) fprintf(stderr, " fibre %.5f (pairs off a turn %.3f)", fpl, fpo);
                 fprintf(stderr, "\n");
             }
         }
@@ -1485,6 +1575,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
     if (dwd) fb_free(cpu, dwd);
     if (drec) fb_free(cpu, drec);
     if (dctm && !cpu) nn_free(dctm);
+    free(fpairs); free(fph); free(fpg);
     free(hctm); if (dcs) fb_free(cpu, dcs);
     return m;
 }
@@ -2133,7 +2224,7 @@ fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap)
         if (fit_fields_load_ex(dir, fz0, fz1, 1, &sb, 0, nullptr, 0, &prevb)) { fit_set_free(s); return nullptr; }
         FIT_TM("slab %d fields", k + 1);
         fit_cfg cs = *c; cs.init = s->global; cs.init_off[0] = (double)fz0 * h; cs.init_off[1] = cs.init_off[2] = 0; cs.dir = s->global->dir;
-        cs.emb_zoff = c->emb_zoff + (double)fz0 * h;
+        cs.emb_zoff = c->emb_zoff + (double)fz0 * h; cs.fib_zoff = c->fib_zoff + (double)fz0 * h;
         if (k > 0) {   /* the flood continues from the previous slab's interior (the overlap below zi0) */
             cs.seed = s->slab[k - 1]; cs.seed_off = (double)(fz0 * h) - (double)(s->slab[k - 1]->origin[0] - s->global->origin[0]); cs.seed_z = zi0 - (double)fz0 * h;
         }

@@ -1,4 +1,5 @@
 /* ufsm CLI. */
+#include "afv.h"
 #include "sample.h"
 #include "sources.h"
 #include "band.h"
@@ -160,6 +161,8 @@ static int usage(void) {
         "  ufsm ckpt-avg OUT.ckpt IN1.ckpt IN2.ckpt ... [--arrays ema|both]   uniform weight average of snapshots of one run (optimiser state of the last)\n"
         "  ufsm phase-conflict <a-root> <a-key> <b-root> <b-key> <out>   where two label phase sets disagree (> --tol turn): the sampler's phase ignore mask\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
+        "  ufsm fiber-check <afv> --tr T.json --boxes B.tsv --names A,B --codes R K --phase R K   do published fibre polylines link points of one GT sheet?\n"
+        "  ufsm fiber-export <afv> <fields-dir> <out.fib> --tr T.json    fibre polylines in a fit box's coordinates for fit --fibers\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..]  several models' fit fields averaged (phase: confidence-weighted complex mean)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
@@ -766,6 +769,8 @@ static int cmd_band(int argc, char **argv) {
    --uw-rep-dump PREFIX writes the per-voxel shifts and seams. Vote weights (lower confidence)^--uw-rep-qpow (3) x the phase-stretch
    factor --uw-rep-stretch (0.5; 0 off) over a (2 --uw-rep-sr + 1)^3 box (1). Recommended: --uw-repair 8 (Paris 4 hold box, wind96
    fields over 9 predict windows: mean ids 0.827 -> 0.893).
+   --fibers FILE --w-fib W: published fibre polylines (ufsm fiber-export for this fields dir) as a pair term W(b) - W(a) = the network phase
+   change along the fibre, on point pairs 16..128 native voxels apart whose phase stays within half a turn (src/fit.c fib_pairs).
    --phase-stretch S [--phase-stretch-r R]: the phase confidence x exp(-log2(s)^2 / 2 S^2), s the phase stretch (|grad phase| x spacing
    over a (2R+1)^3 box, R default 1), before the fit: where the phase skips sheets the density sets the turn count (0 off). */
 /* U (the unwrapped radius in turns; sheets where U - dir theta / 2 pi is an integer) for the scorer: fill(ctx, og, n3, step, codes, U)
@@ -999,6 +1004,13 @@ static int cmd_fit(int argc, char **argv) {
     c.uw_repair = atoi(opt(argc, argv, "--uw-repair", "0")); c.uw_rep_w4 = (float)atof(opt(argc, argv, "--uw-rep-w4", "0"));
     c.uw_rep_geo = (float)atof(opt(argc, argv, "--uw-rep-geo", "0")); c.uw_rep_gd = atoi(opt(argc, argv, "--uw-rep-gd", "8"));
     c.uw_rep_cs = (float)atof(opt(argc, argv, "--uw-rep-cs", "0")); c.uw_rep_dump = opt(argc, argv, "--uw-rep-dump", nullptr);
+    static fib_set fibs;   /* --fibers FILE (ufsm fiber-export for this fields dir) --w-fib W: same-fibre pair term in the fit stages */
+    c.w_fib = (float)atof(opt(argc, argv, "--w-fib", "0"));
+    if (*opt(argc, argv, "--fibers", "")) {
+        if (fib_load(opt(argc, argv, "--fibers", ""), &fibs)) { fprintf(stderr, "fit: cannot read --fibers %s\n", opt(argc, argv, "--fibers", "")); return 1; }
+        c.fib = fibs.pts; c.fib_off = fibs.off; c.fib_n = fibs.n;
+        if (!(c.w_fib > 0)) fprintf(stderr, "fit: --fibers without --w-fib W > 0 (unused)\n");
+    }
     c.uw_rep_qpow = (float)atof(opt(argc, argv, "--uw-rep-qpow", "3")); c.uw_rep_stretch = (float)atof(opt(argc, argv, "--uw-rep-stretch", "0.5"));
     c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1")); c.uw_rep_seed = (float)atof(opt(argc, argv, "--uw-rep-seed", *opt(argc, argv, "--seed-model", "") ? "16" : "0"));   /* (fit --slab chaining: off unless given) */ c.uw_rep_geo_init = atoi(opt(argc, argv, "--uw-rep-geo-init", "0")); c.uw_rep_off = atoi(opt(argc, argv, "--uw-rep-off", "0")); c.uw_rep_cons = atoi(opt(argc, argv, "--uw-rep-cons", "1")); c.phase_stretch = (float)atof(opt(argc, argv, "--phase-stretch", "0")); c.phase_stretch_r = atoi(opt(argc, argv, "--phase-stretch-r", "1"));
     if (!(c.phase_stretch >= 0) || c.phase_stretch_r < 0 || c.phase_stretch_r > 4) { fprintf(stderr, "fit: --phase-stretch >= 0, --phase-stretch-r 0..4\n"); return 2; }
@@ -3513,6 +3525,8 @@ static int cmd_sample(int argc, char **argv) {
 int cmd_repack(int argc, char **argv);   /* src/repack.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
+int cmd_fiber_check(int argc, char **argv);    /* src/fibercheck.c */
+int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
 int cmd_wbench_stats(int argc, char **argv);   /* src/wbench.c */
 int cmd_ckpt_avg(int argc, char **argv);   /* src/wbench.c */
@@ -3545,6 +3559,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fit")) return cmd_fit(argc, argv);
     if (!strcmp(cmd, "fit-join")) return cmd_fit_join(argc, argv);
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
+    if (!strcmp(cmd, "fiber-check")) return cmd_fiber_check(argc, argv);
+    if (!strcmp(cmd, "fiber-export")) return cmd_fiber_export(argc, argv);
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
     if (!strcmp(cmd, "wbench-stats")) return cmd_wbench_stats(argc, argv);
     if (!strcmp(cmd, "ckpt-avg")) return cmd_ckpt_avg(argc, argv);

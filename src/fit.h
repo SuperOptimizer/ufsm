@@ -117,6 +117,10 @@ typedef struct {
     float uw_rep_emb, uw_rep_emb_m0, emb_phi;
     int uw_rep_emb_d[4], uw_rep_emb_nd, uw_rep_emb_rmax, uw_rep_emb_sub;
     double emb_zoff;                /* native z of this fit's fields in the embedding's box coordinates (the slab driver: the slab's first field row) */
+    /* fibre pairs (fit --fibers FILE --w-fib W, ufsm fiber-export): polylines in the fields' box-local native coordinates (z y x); points
+       16..128 native voxels apart along one fibre whose network phase stays within half a turn along it should have W(b) - W(a) = that
+       phase change (a loss term in every fit stage, src/fit.c fib_pairs); fib_zoff: the fields' first native z in the fibres' frame */
+    const float *fib; const int *fib_off; int fib_n; float w_fib; double fib_zoff;
     int verbose;
 } fit_cfg;
 
