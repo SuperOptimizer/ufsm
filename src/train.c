@@ -473,7 +473,32 @@ static void ct_upload(const batch *b, void *x, void *rad, int B, int P, int asyn
     if (async) nn_h2d_copy_stream(x, bx(b), (size_t)B * g_xs * p3 * xbytes()); else nn_h2d(x, bx(b), (size_t)B * g_xs * p3 * xbytes());
     if (g_gpu_in) { if (async) nn_h2d_copy_stream(rad, b->rad, rad_bytes(B)); else nn_h2d(rad, b->rad, rad_bytes(B)); }
 }
+/* diagnostic UFSM_DUMP_WIN=PREFIX (with UFSM_SYNC_UPLOAD=1 and --gpu-input 0, cubes): the first UFSM_DUMP_N (8) host windows as
+   PREFIX-NN.pgm, rows z-mid / y-mid, columns CT channel | phase (side codes, unknown black) | winding mod 4 (w4 codes, unknown black) */
+static void dump_win(const batch *b, int B, int P) {
+    static int nd = 0; const char *pre = getenv("UFSM_DUMP_WIN"); const int N = getenv("UFSM_DUMP_N") ? atoi(getenv("UFSM_DUMP_N")) : 8;
+    if (!pre || nd >= N || g_Pz != P || !b->x16 || !g_xfmt) return;
+    const size_t p3 = (size_t)P * P * P;
+    for (int s = 0; s < B && nd < N; s++, nd++) {
+        char path[1100]; snprintf(path, sizeof path, "%s-%02d.pgm", pre, nd); FILE *f = fopen(path, "wb"); if (!f) return;
+        fprintf(f, "P5\n%d %d\n255\n", 3 * P, 2 * P);
+        const uint16_t *x = b->x16 + (size_t)s * g_xs * p3;
+        for (int row = 0; row < 2 * P; row++) {
+            const int a = row % P;
+            for (int c = 0; c < 3; c++) for (int k = 0; k < P; k++) {
+                const size_t vi = row < P ? ((size_t)(P / 2) * P + a) * P + k : ((size_t)a * P + P / 2) * P + k;   /* z-mid (y = a), y-mid (z = a) */
+                int g = 0;
+                if (c == 0) { float v; if (g_xfmt == 1) { _Float16 h; memcpy(&h, x + vi, 2); v = (float)h; } else { uint32_t u = (uint32_t)x[vi] << 16; memcpy(&v, &u, 4); } g = (int)(128 + 40 * v); }
+                else if (c == 1 && b->side) { const int v = b->side[(size_t)s * p3 + vi]; g = v < 252 ? 16 + v * 239 / 251 : 0; }
+                else if (c == 2 && b->w4) { const int v = b->w4[(size_t)s * p3 + vi]; g = v < 252 ? 16 + v * 239 / 251 : 0; }
+                fputc(g < 0 ? 0 : g > 255 ? 255 : g, f);
+            }
+        }
+        fclose(f); fprintf(stderr, "dumped window %s (source %d)\n", path, b->src ? b->src[s] : -1);
+    }
+}
 static void upload(gpu_state *d, const batch *b, int B, int P) {
+    dump_win(b, B, P);
     if (d->upsplit || d->hsplit) nn_event_sync(d->ev_up[d->cur]);   /* (an asynchronous head / tail into the same buffer may still be in flight) */
     d->sheet=b->sheet?b->sheet[0]:nullptr;
     d->um = d->umb[d->cur] = b->um ? b->um[0] : 0.f;
