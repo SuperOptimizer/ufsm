@@ -12,6 +12,79 @@ of `boxes.tsv` not tagged `label-noise`) plus 4 full-cross-section Paris 4 slab 
 
 `WB` is `/vesuvius/ufsm/wbench` on the desk and `~/ufsm-data/wbench` on the laptop (`site-*.env`).
 
+## wgate: the decision for a winding checkpoint (use this to promote / drop arms)
+
+    # laptop: one GPU block (gpuq priority eval), ~30 min; deployed copy in $WB/bin/wb8
+    ~/ufsm-data/capped.sh bash $WB/bin/wb8/wgate.sh CKPT TAG        # -> $WB/gate/TAG/table.txt
+    bash $WB/bin/wb8/wgate-table.sh TAG                            # the table again (or ROWS=$WB/res/old.tsv for old wbench rows)
+
+**What it measures.** The 44 core boxes and the 4 Paris 4 slab sites, against wind96. The wind96 rows and ceilings are cached
+and never re-run: fits are deterministic and identical across binaries, and wind96 predicted with a new build reproduces its old ids.
+
+| set | boxes | role |
+|---|---|---|
+| primary | clean paris4 + paris4j: PH1-3, HOLD, 28 July boxes | the decision |
+| guard | 12 PHerc1667 core boxes | must not get worse |
+| slabs | sites 4624 / 5392 / 5904 / 6672 | joined ids: the direct scale-failure metric (oracle ceiling .93-.98, wind96 .21-.33) |
+
+The paris4j boxes are held out of every current arm. PH1-3 are in-sample for wind96, which biases the primary set toward wind96
+(conservative). Never gate on PH1-3 / HOLD / C9 alone: that 5-box read was selected on wind96-best and failed wcomb1, which ties on the full set.
+
+**The table.**
+- Paired per-box differences with stratified bootstrap 95 % CIs, P(A > B) and the MDE (`ufsm wbench-stats --scroll .. --tsv 1`).
+- p05x is the headline (lowest paired variance), with ids and p1x beside it.
+- A paris4j-only line.
+- Per-site slab joined ids, join share and the share of the oracle gap closed.
+- The radius profile (share of slab voxels with the right winding, by radius band).
+- Diagnostic turn counts (cnt_off, cnt_bias): these take no part in the rule. cnt_off improved for pg1 while its fits got worse.
+
+**PASS rule (pre-registered 2026-10-26; do not change it after seeing a result):**
+- **R1 primary:** the p05x paired-difference 95 % CI is entirely > 0, AND the ids difference is >= 0.
+- **R2 slabs:** the mean joined ids over all 4 sites is > wind96's.
+- **R3 guard 1667:** not worse beyond its CI: the upper CI bound of the p05x and of the ids difference are both >= 0.
+
+PASS = R1 and R2 and R3, which promotes the checkpoint to the p4unwrap milestone. The other verdicts:
+- FAIL: R3 fails, or the primary p05x CI is entirely < 0, or there is no gain.
+- INCONCLUSIVE: the p05x difference is positive but inside the noise. There is no promotion; gate a later or averaged checkpoint.
+
+Typical MDE on the primary set: p05x ~0.03, ids ~0.05 (one slip moves a box's ids by ~0.3).
+
+**Fair checkpoints.** Gate only a cooled snapshot (the end of a schedule's cooldown) or a weight average of the last snapshots
+of the run. Never gate a single peak-LR snapshot. The trainer keeps EMA weights (`--ema 0.999`, read by predict `--ema 1`), but
+at peak LR that is only a ~1k-step average.
+
+    ufsm ckpt-avg run-avg.ckpt snap-6000.ckpt snap-8000.ckpt   # uniform average of the EMA + live weights; optimiser state of the last
+
+**Speed.** One GPU block (gpuq eval). The GPU lane only predicts: the 4 sites first (~2 min each), then the boxes (~11 s each).
+- 2 box lanes fit each box as soon as its fields land. The box fit and its 2 shifted fits run concurrently, followed by the
+  CPU-only fields-oracle and fit-compare (diagnostic columns; `DIAG=0` skips them).
+- 1 slab lane fits each site as its fields land. It is the critical path.
+- There are no ceiling fits: the clean set uses wind96's ceilings.
+- Fields are kept in `$WB/fields/TAG`, and a rerun skips everything that already has rows.
+
+Env: `REF` (wind96), `BOXES`, `SITES` ("" = boxes only, ~10 min), `FL` (box lanes), `UP` (predict binary, default
+`$WB/bin/ufsm-gate`), `U` (fitter pin).
+
+## gpuq: the laptop GPU queue (`scripts/gpuq.sh`; deployed copy `~/ufsm-data/gpuq.sh`)
+
+The GPU is still one exclusive flock on `~/ufsm-data/gpu.lock`, and gpuq decides who takes it next. Priorities:
+
+| priority | for | behaviour |
+|---|---|---|
+| `now` (0) | short checks: pcheck, one quick test | runs at the next box boundary of any bg job |
+| `eval` (1) | suites: wgate, a fulltest GPU block | one block, never yields |
+| `bg` (2) | long loops: wbench core benches, slab ceilings, p4unwrap steps | yields at every box boundary, round robin among bg jobs |
+
+Order is FIFO inside a priority, and tickets of dead processes are dropped.
+
+    ~/ufsm-data/gpuq.sh run now mycheck cmd args...     # instead of: flock ~/ufsm-data/gpu.lock cmd args...
+    ~/ufsm-data/gpuq.sh status                          # holder + waiting tickets
+    . ~/ufsm-data/gpuq.sh; gpuq_acquire bg mytag; for b in ...; do gpuq_yield; work $b; done; gpuq_release
+
+- wbench.sh (PRIO bg by default), pcheck.sh (now) and p4unwrap.sh (bg) use it.
+- Commands started under a held lock inherit it, so a nested acquire returns at once.
+- Old scripts that call plain `flock gpu.lock` still exclude and are excluded, but they have no priority. Convert them with `gpuq.sh run`.
+
 ## Box set (frozen 2026-10-25: `boxes.tsv`, `holdouts.json`)
 
 | scroll | boxes | grid | notes |

@@ -465,6 +465,7 @@ test-all: $(B)/test_gpu_aug $(B)/test_sheet $(B)/test_sheet_gpu $(B)/test_cover 
 	./$(B)/test_fit_join
 	./$(B)/test_pairacc
 	bash tests/test_wbench_stats.sh $(B)/ufsm
+	bash tests/test_gpuq.sh
 	./$(B)/test_robust
 	./$(B)/test_reg
 	./$(B)/test_reg_render

@@ -12,4 +12,16 @@ echo "$o" | grep -qE '^ids +n +6 ' || { echo "FAIL clean set size"; f=1; }
 echo "$o" | grep -qE 'A-B \+0\.1083 ' || { echo "FAIL paired difference"; f=1; }
 echo "$o" | grep -qE 'P\(A>B\) 1\.000' || { echo "FAIL P(A>B)"; f=1; }
 o=$($U wbench-stats $T/a.tsv --metric ids --set all --n 500); echo "$o" | grep -qE '^ids +n +7 ' || { echo "FAIL --set all"; f=1; }
+o=$($U wbench-stats $T/a.tsv $T/b.tsv --metric ids --n 500 --scroll s1 --tsv 1 | tail -1)
+echo "$o" | grep -qP '^ids\ts1\t3\t' || { echo "FAIL --scroll / --tsv: $o"; f=1; }
+# ckpt-avg: 2 parameters x (p, ema, m, v) + header; A all 1.0, B all 3.0 -> p, ema 2.0; m, v from B (3.0); header from B
+one='\x00\x00\x80\x3f'; three='\x00\x00\x40\x40'
+{ printf 'UFSM{"nlev":1,"nparams":2,"step":10,"extra":{}}\n'; for i in 1 2 3 4 5 6 7 8; do printf "$one"; done; } > $T/a.ckpt
+{ printf 'UFSM{"nlev":1,"nparams":2,"step":20,"extra":{}}\n'; for i in 1 2 3 4 5 6 7 8; do printf "$three"; done; } > $T/b.ckpt
+$U ckpt-avg $T/o.ckpt $T/a.ckpt $T/b.ckpt 2> /dev/null || { echo "FAIL ckpt-avg rc"; f=1; }
+o=$(tail -c 32 $T/o.ckpt | od -An -tf4 | awk '{for (i = 1; i <= NF; i++) printf "%g ", $i}'); echo "ckpt-avg: $o"
+[ "$o" = "2 2 2 2 3 3 3 3 " ] || { echo "FAIL ckpt-avg values"; f=1; }
+head -c 60 $T/o.ckpt | grep -q '"step":20' || { echo "FAIL ckpt-avg header"; f=1; }
+{ printf 'UFSM{"nlev":1,"nparams":3,"step":20,"extra":{}}\n'; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do printf "$three"; done; } > $T/c.ckpt
+$U ckpt-avg $T/o2.ckpt $T/a.ckpt $T/c.ckpt 2> /dev/null && { echo "FAIL ckpt-avg accepted another network"; f=1; }
 [ $f = 0 ] && echo "wbench-stats ok"; exit $f

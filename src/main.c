@@ -154,7 +154,8 @@ static int usage(void) {
         "  ufsm fit-join <out-set> <fields-dir> <slab-model> <z0> <z1> ...   independent z-slab fits -> one fit set, gauges matched on the overlaps\n"
         "  ufsm fields-oracle <fields-dir> <phase-root> <phase-key> <out-dir>   fit fields with the phase planes from a label phase raster (oracle / swap)\n"
         "  ufsm phase-packing <phase-root> <phase-key> [--box ..] [--map OUT.raw]   how packed the labelled sheets are (box stats, per-chunk map for the sampler focus)\n"
-        "  ufsm wbench-stats A.tsv [B.tsv] [--metric ids,p1x] [--set clean|all]   winding bench means, stratified bootstrap CIs, paired A-B, MDE\n"
+        "  ufsm wbench-stats A.tsv [B.tsv] [--metric ids,p1x] [--set clean|all]   winding bench means, stratified bootstrap CIs, paired A-B, MDE (--scroll a,b; --tsv 1)\n"
+        "  ufsm ckpt-avg OUT.ckpt IN1.ckpt IN2.ckpt ... [--arrays ema|both]   uniform weight average of snapshots of one run (optimiser state of the last)\n"
         "  ufsm phase-conflict <a-root> <a-key> <b-root> <b-key> <out>   where two label phase sets disagree (> --tol turn): the sampler's phase ignore mask\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..]  several models' fit fields averaged (phase: confidence-weighted complex mean)\n"
@@ -3413,6 +3414,7 @@ int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
 int cmd_wbench_stats(int argc, char **argv);   /* src/wbench.c */
+int cmd_ckpt_avg(int argc, char **argv);   /* src/wbench.c */
 int cmd_phase_conflict(int argc, char **argv);   /* src/packmap.c */
 int cmd_reg(int argc, char **argv);   /* src/reg_cli.c */
 int cmd_sr_pairs(int argc, char **argv);   /* src/srpairs.c */
@@ -3444,6 +3446,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
     if (!strcmp(cmd, "wbench-stats")) return cmd_wbench_stats(argc, argv);
+    if (!strcmp(cmd, "ckpt-avg")) return cmd_ckpt_avg(argc, argv);
     if (!strcmp(cmd, "phase-conflict")) return cmd_phase_conflict(argc, argv);
     if (!strcmp(cmd, "reg")) return cmd_reg(argc, argv);
     if (!strcmp(cmd, "sr-pairs")) return cmd_sr_pairs(argc, argv);

@@ -25,7 +25,8 @@ log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $O/run.log; }
 stopped() { [ -e $O/STOP ]; }
 space() { local f=$(df -BG --output=avail $O | tail -n 1 | tr -dc 0-9); [ $f -ge 120 ] || { log "only $f GB free"; return 1; }; }
 LK=; [ -z "${NOLOCK:-}" ] && [ "$SITE" = laptop ] && LK=${LOCK:-}
-G() { if [ -n "$LK" ]; then ( flock 8; "$@" ) 8> $LK; else "$@"; fi; }   # a GPU step under the laptop lock (per step, not per run)
+GQ=$H/gpuq.sh; [ -e $GQ ] || GQ=$H/../gpuq.sh; GPUQ_LOCK=${LK:-$HOME/ufsm-data/gpu.lock}; . $GQ
+G() { if [ -n "$LK" ]; then ( gpuq_acquire ${PRIO:-bg} p4unwrap-$TAG; "$@"; rc=$?; gpuq_release; exit $rc ); else "$@"; fi; }   # a GPU step through the laptop gpuq (per step, not per run)
 log "p4unwrap $TAG ckpt $CK bin $(sha1sum $U | cut -c1-8) gpus $GPUS fields $F crop z $Z0..$ZE y $Y0+$NY x $X0+$NX"
 echo "$CK" > $O/ckpt
 

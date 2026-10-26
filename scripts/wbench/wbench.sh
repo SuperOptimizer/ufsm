@@ -28,9 +28,12 @@ HDR="tag	box	scroll	ids	ids0	ids_a	ids_b	ids_sd	e08	p05	p1	p2	p4	p05x	p1x	p2x	p4
 [ -s $CEIL ] || printf 'box\tceil\tceil_p1x\tfrom\n' > $CEIL
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $O/run.log; }
 # GPU lock per box / per slab GPU step (released in between so short jobs interleave); NOLOCK=1: the caller holds it
-LK=; [ -z "${NOLOCK:-}" ] && [ -n "${LOCK:-}" ] && [ "${CPU:-0}" != 1 ] && LK=$LOCK; HL=0
-lk() { [ -n "$LK" ] && [ $HL = 0 ] || return 0; exec 9> $LK; flock -n 9 || { log "waiting for $LK"; flock 9; }; HL=1; }
-ulk() { [ $HL = 1 ] || return 0; flock -u 9; exec 9>&-; HL=0; sleep 3; }   # the pause lets a waiting job take the lock
+LK=; [ -z "${NOLOCK:-}" ] && [ -n "${LOCK:-}" ] && [ "${CPU:-0}" != 1 ] && LK=$LOCK
+# through the gpuq priority queue (scripts/gpuq.sh; PRIO bg by default: at every box / slab step it lets waiting jobs in, a "now"
+# check first); plain flock users of the same lock stay excluded
+GQ=$H/gpuq.sh; [ -e $GQ ] || GQ=$H/../gpuq.sh; GPUQ_LOCK=$LOCK; . $GQ
+lk() { [ -n "$LK" ] && gpuq_acquire ${PRIO:-bg} wbench-$TAG; return 0; }
+ulk() { [ -n "$LK" ] && gpuq_yield; return 0; }
 log "wbench $TAG ckpt $CK fields $FT fitter $FCFG ($BIN $FIT) site $SITE gpu $GPU"
 echo "$CK" > $O/ckpt; echo "$BIN $FIT" > $O/fitter
 
@@ -80,8 +83,8 @@ for B in $BL; do
   IFS=$'\t' read -r nm sc z y x nz ny nx lv note <<< "$(awk -F'\t' -v b=$B '$1 == b' $BT)"; [ -n "${nx:-}" ] || { log "no box $B"; continue; }
   grep -qP "^$TAG\t$B\t" $RES && { log "$B done"; continue; }
   scroll $sc || { log "$B: unknown scroll $sc"; continue; }
-  d=$O/$B; mkdir -p $d; f=$FD/$B; t0=$(date +%s)
-  lk
+  d=$O/$B; mkdir -p $d; f=$FD/$B
+  lk; t0=$(date +%s)   # (pred_s without the GPU queue wait)
   if [ -n "$FIELDS" ]; then [ -e $f/fields.json ] || { log "$B: no fields $f"; continue; }
   elif [ ! -e $f/fields.json ]; then predict $f $z $y $x $nz $ny $nx $d/pred.log || { log "$B predict failed"; continue; }; fi
   t1=$(date +%s)
@@ -153,4 +156,5 @@ if [ "$SLABS" = 1 ]; then
     [ -z "$FIELDS" ] && [ "$KEEP" = 0 ] && rm -rf $f
   done
 fi
+[ -n "$LK" ] && gpuq_release
 log "wbench $TAG finished"
