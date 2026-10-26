@@ -288,8 +288,8 @@ static void cf_blur_cols(void *a, long r0, long r1, int t_) {   /* x-blur rows [
    the model's phase-gauge sums per solve cell (gr / gi) */
 typedef struct {
     const fit_fields *f; int zoff, c0;   /* the chunk (row 0 = box row zoff); the output buffers' row 0 = box row c0 */
-    const cf_lvl *L; const float *ring, *Wz, *Sfine, *cl; int zo, D, H, W, Rz, P, cmode, demod;
-    uint8_t *opc, *ops, *ocl; float *wc, *gr, *gi; double ag[CF_MAXT][2];
+    const cf_lvl *L; const float *ring, *Wz, *Sfine, *cl; int zo, D, H, W, Rz, P, cmode, demod; double keep, wsc, t0, t1;
+    uint8_t *opc, *ops, *ocl, *osp; const float *gW; float *wc, *gr, *gi; double ag[CF_MAXT][2];   /* osp / gW: --sp-w (sp from |grad W|) */
 } cf_out;
 static void cf_out_run(void *a, long Y0, long Y1, int t) {
     cf_out *O = a; const fit_fields *f = O->f; const cf_lvl *L = O->L; const size_t HW = (size_t)O->H * O->W; const int Rz = O->Rz, nring = 2 * Rz + 1, P = O->P;
@@ -299,23 +299,30 @@ static void cf_out_run(void *a, long Y0, long Y1, int t) {
         const size_t i = (size_t)(O->zo - O->zoff) * HW + j, io = (size_t)(O->zo - O->c0) * HW + j, si = ((size_t)(O->zo / P) * L->hh + y / P) * L->w + x / P;
         double Wo = O->Wz[j], A = 0;
         if (O->demod && cs > 0) { A = hypot(re, im) / cs; if (hypot(re, im) > 1e-9) Wo += atan2(im, re) / (2 * M_PI); }
+        if (O->keep > 0 && A > 0) {   /* where the phase rotates with W (local agreement A high) it keeps its own sub-turn detail: + A^keep wrap(phi - W_out) */
+            const double pcv0 = (f->pc[i] - 128) / 127.0, psv0 = (f->ps[i] - 128) / 127.0;
+            if (hypot(pcv0, psv0) > 0.05) { double e = atan2(psv0, pcv0) / (2 * M_PI) - Wo; e -= round(e); Wo += pow(A, O->keep) * e; } }
+        if (O->t1 > 0) {   /* --trust: a confident network phase keeps its own position (and count) */
+            const double pc1 = (f->pc[i] - 128) / 127.0, ps1 = (f->ps[i] - 128) / 127.0, s = cf_smooth(hypot(pc1, ps1), O->t0, O->t1);
+            if (s > 0) { double e = atan2(ps1, pc1) / (2 * M_PI) - Wo; e -= round(e); Wo += s * e; } }
         const double cn = (double)P * P * P, cwt = fmin(1, O->Sfine[si] / cn * 2) * exp(-O->cl[si] * O->cl[si] / (2 * 0.25 * 0.25));
         const double pcv = (f->pc[i] - 128) / 127.0, psv = (f->ps[i] - 128) / 127.0, cph = hypot(pcv, psv);
         if (O->gr && f->w[i] && cph >= 1e-3) { const double e = atan2(psv, pcv) - 2 * M_PI * O->Wz[j]; O->gr[si] += (float)(cph * cos(e)); O->gi[si] += (float)(cph * sin(e)); }
-        double c = O->cmode == 0 ? cwt : O->cmode == 1 ? cph : fmax(cph * A, cwt);
+        double c = O->cmode == 0 ? O->wsc * cwt : O->cmode == 1 ? cph : O->cmode == 3 ? fmax(cph, O->wsc * cwt) : fmax(cph * A, O->wsc * cwt);
         if (!f->w[i]) c = 0;
         c = fmin(1, fmax(0, c));
         if (f->w[i] && cs > 0) { O->ag[t][0] += A * cph; O->ag[t][1] += cph; }
         O->opc[io] = (uint8_t)lround(128 + 127 * c * cos(2 * M_PI * Wo)); O->ops[io] = (uint8_t)lround(128 + 127 * c * sin(2 * M_PI * Wo));
         if (O->wc) O->wc[io] = f->w[i] ? (float)Wo : NAN;
         O->ocl[io] = (uint8_t)fmin(255, lround(O->cl[si] * 255));
+        if (O->osp) O->osp[io] = f->w[i] && O->gW[si] > 0.03 ? (uint8_t)fmax(1, fmin(255, lround(8 / O->gW[si]))) : f->sp[i];
     }
 }
 
 /* zarr output: one block of rows (z shard index sz, nz rows) of the planes pc / ps / cl into 128^3 shards, a job per (plane, sy, sx) */
-typedef struct { z3w *const *zw; const uint8_t *pl[3]; int sz, nz, H, W, ny, nx; _Atomic int fail; } cf_shards;
+typedef struct { z3w *const *zw; const uint8_t *pl[4]; int sz, nz, H, W, ny, nx; _Atomic int fail; } cf_shards;
 static void cf_shard_run(void *a, long j0, long j1, int t_) {
-    cf_shards *S = a; uint8_t *sb = malloc(128 * 128 * 128); static const uint8_t fill[3] = {128, 128, 0};
+    cf_shards *S = a; uint8_t *sb = malloc(128 * 128 * 128); static const uint8_t fill[4] = {128, 128, 0, 0};
     for (long j = j0; j < j1 && sb; j++) {
         const int k = (int)(j / ((long)S->ny * S->nx)), sy = (int)(j / S->nx % S->ny), sx = (int)(j % S->nx);
         memset(sb, fill[k], 128 * 128 * 128);
@@ -330,10 +337,27 @@ static void cf_shard_run(void *a, long j0, long j1, int t_) {
 
 static int cf_wr(FILE *f, const void *p, size_t sz, size_t n) { return !f || fwrite(p, sz, n, f) != n; }
 
+/* |grad W| per solve cell in turns per field cell (central differences of U, minus the theta term), for --sp-w */
+static float *cf_gradW(const cf_lvl *L, const float *cy, const float *cx, int na) {
+    float *g = malloc(L->n * sizeof(float)); if (!g) return nullptr;
+    const size_t st[3] = {(size_t)L->hh * L->w, (size_t)L->w, 1}; const int dm[3] = {L->d, L->hh, L->w};
+    for (int z = 0; z < L->d; z++) for (int y = 0; y < L->hh; y++) for (int x = 0; x < L->w; x++) {
+        const int c[3] = {z, y, x}; const size_t i = (size_t)z * st[0] + (size_t)y * st[1] + x; double gu[3];
+        for (int a = 0; a < 3; a++) {
+            const int lo = c[a] > 0 ? c[a] - 1 : c[a], hi = c[a] + 1 < dm[a] ? c[a] + 1 : c[a];
+            gu[a] = hi > lo ? (L->U[i + (hi - c[a]) * (long)st[a]] - L->U[i - (c[a] - lo) * (long)st[a]]) / ((double)(hi - lo) * L->P) : 0;
+        }
+        double th[3]; cf_theta(L, cf_center(L, z), cf_center(L, y), cf_center(L, x), th);   /* per solve cell */
+        for (int a = 0; a < 3; a++) gu[a] -= th[a] / L->P;
+        g[i] = (float)sqrt(gu[0] * gu[0] + gu[1] * gu[1] + gu[2] * gu[2]);
+    }
+    (void)cy; (void)cx; (void)na; return g;
+}
+
 int cmd_count_field(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm count-field <in-fields> <out-fields> [--method ls|ray] [--pool P (solve cell in field cells, 0 auto)] [--R 10 (phase demod radius, field cells; 0: W only)] [--Rz R]\n"
-                        "       [--conf w|phase|mix] [--dir 0] [--iters 400] [--lambda 1e-7] [--eps 1e-3] [--loop 8 (closing loop edge, field cells)] [--model DIR] [--model-R 8] [--rmin-um 500] [--emin 0.1] [--sheet0 0.4]\n"
+                        "       [--conf w|phase|mix|pmax] [--trust C0,C1 (phase confidence ramp: the network phase kept)] [--conf-w 1 (scale of the count confidence)] [--keep 0 (p: + A^p wrap(phi - W_out), A the local agreement)] [--sp-w 0 (1: sp from |grad W|)] [--dir 0] [--iters 400] [--lambda 1e-7] [--eps 1e-3] [--loop 8 (closing loop edge, field cells)] [--model DIR] [--model-R 8] [--rmin-um 500] [--emin 0.1] [--sheet0 0.4]\n"
                         "       [--wc 1 (0: no wc.f32)] [--mem-gb 6 (field chunk budget)] [--threads 8]\n");
         return 2;
     }
@@ -344,7 +368,8 @@ int cmd_count_field(int argc, char **argv) {
     const double lamr = atof(cf_opt(argc, argv, "--lambda", "1e-7")), eps = atof(cf_opt(argc, argv, "--eps", "1e-3")), rmin_um = atof(cf_opt(argc, argv, "--rmin-um", "500"));
     const double memgb = atof(cf_opt(argc, argv, "--mem-gb", "6"));
     if (strcmp(meth, "ls") && strcmp(meth, "ray")) { fprintf(stderr, "count-field: --method ls or ray\n"); return 2; }
-    if (strcmp(cmode, "w") && strcmp(cmode, "phase") && strcmp(cmode, "mix")) { fprintf(stderr, "count-field: --conf w, phase or mix\n"); return 2; }
+    if (strcmp(cmode, "w") && strcmp(cmode, "phase") && strcmp(cmode, "mix") && strcmp(cmode, "pmax")) { fprintf(stderr, "count-field: --conf w, phase, mix or pmax\n"); return 2; }
+    double tr0 = 0, tr1 = 0; if (*cf_opt(argc, argv, "--trust", "") && sscanf(cf_opt(argc, argv, "--trust", ""), "%lf,%lf", &tr0, &tr1) != 2) { fprintf(stderr, "count-field: --trust C0,C1\n"); return 2; }
     if (R < 0 || Rz < 0) { fprintf(stderr, "count-field: --R / --Rz >= 0\n"); return 2; }
     fit_fields_buf g; if (fit_fields_load(in, 0, 0, 0, &g)) { fprintf(stderr, "count-field: cannot load %s\n", in); return 1; }   /* geometry + the axis table */
     const int D = g.shape[0], H = g.shape[1], W = g.shape[2], na = (int)(D * g.h) + 1; const size_t n = (size_t)D * H * W, HW = (size_t)H * W;
@@ -460,16 +485,17 @@ int cmd_count_field(int argc, char **argv) {
     }
     const int doc = zarr ? 0 : wwc;   /* wc.f32 with raw output only */
     const int BZ = zarr ? 128 : CZ; if (zarr && CZ > BZ) CZ = BZ;
-    FILE *fp[15] = {0}, *fwc = nullptr, *fcl = nullptr; z3w *zw[3] = {0};
+    FILE *fp[15] = {0}, *fwc = nullptr, *fcl = nullptr; z3w *zw[4] = {0};
+    const int spw = atoi(cf_opt(argc, argv, "--sp-w", "0")), nzp = spw ? 4 : 3;   /* --sp-w 1: sp from |grad W| (the density term agrees with the phase) */
     if (zarr) {
         char rp[PATH_MAX]; if (!realpath(in, rp)) { fprintf(stderr, "count-field: %s\n", in); return 1; }
         for (int k = 2; k < 15; k++) {
-            if ((k >= 10 && k < 14 && !w4d) || (k == 14 && !recto)) continue;
+            if ((k >= 10 && k < 14 && !w4d) || (k == 14 && !recto) || (k == 8 && spw)) continue;
             char src[PATH_MAX + 64], dst[1400]; snprintf(src, sizeof src, "%s/%s", rp, names[k]); snprintf(dst, sizeof dst, "%s/%s", out, names[k]);
             unlink(dst); if (symlink(src, dst)) { fprintf(stderr, "count-field: cannot link %s\n", dst); return 1; }
         }
-        const int64_t zsh[3] = {D, H, W}; static const char *zn[3] = {"pc", "ps", "cl"}; const int zf[3] = {128, 128, 0};
-        for (int k = 0; k < 3; k++) { snprintf(p, sizeof p, "%s/%s", out, zn[k]); zw[k] = z3w_create(p, zsh, 128, 0, zf[k], "{\"ufsm\": {\"content\": \"ufsm count-field\"}}");
+        const int64_t zsh[3] = {D, H, W}; static const char *zn[4] = {"pc", "ps", "cl", "sp"}; const int zf[4] = {128, 128, 0, 0};
+        for (int k = 0; k < nzp; k++) { snprintf(p, sizeof p, "%s/%s", out, zn[k]); zw[k] = z3w_create(p, zsh, 128, 0, zf[k], "{\"ufsm\": {\"content\": \"ufsm count-field\"}}");
             if (!zw[k]) { fprintf(stderr, "count-field: %s\n", z3w_error()); return 1; } }
     } else {
         for (int k = 0; k < 15; k++) {
@@ -480,11 +506,12 @@ int cmd_count_field(int argc, char **argv) {
         if (doc) { snprintf(p, sizeof p, "%s/wc.f32", out); fwc = fopen(p, "wb"); }
         if (!fcl || (doc && !fwc)) { fprintf(stderr, "count-field: cannot write %s\n", out); return 1; }
     }
-    uint8_t *opc = malloc((size_t)BZ * HW), *ops = malloc((size_t)BZ * HW), *ocl = malloc((size_t)BZ * HW); float *wc = doc ? malloc((size_t)BZ * HW * sizeof(float)) : nullptr;
+    uint8_t *opc = malloc((size_t)BZ * HW), *ops = malloc((size_t)BZ * HW), *ocl = malloc((size_t)BZ * HW); float *wc = doc ? malloc((size_t)BZ * HW * sizeof(float)) : nullptr; uint8_t *osp = spw ? malloc((size_t)BZ * HW) : nullptr;
+    float *gW = spw ? cf_gradW(L, g.cy, g.cx, na) : nullptr;
     const int nring = 2 * Rz + 1; float *ring = malloc((size_t)nring * 3 * HW * sizeof(float)), *Wring = malloc((size_t)nring * HW * sizeof(float));
     float *gr = *mdir ? calloc(L->n, sizeof(float)) : nullptr, *gi = *mdir ? calloc(L->n, sizeof(float)) : nullptr;
     if (!opc || !ops || !ocl || (doc && !wc) || !ring || !Wring || (*mdir && (!gr || !gi))) { fprintf(stderr, "count-field: out of memory\n"); return 1; }
-    cf_out O = {nullptr, 0, 0, L, ring, nullptr, Sfine, cl, 0, D, H, W, Rz, P, !strcmp(cmode, "w") ? 0 : !strcmp(cmode, "phase") ? 1 : 2, R > 0, opc, ops, ocl, wc, gr, gi, {{0}}};
+    cf_out O = {nullptr, 0, 0, L, ring, nullptr, Sfine, cl, 0, D, H, W, Rz, P, !strcmp(cmode, "w") ? 0 : !strcmp(cmode, "phase") ? 1 : !strcmp(cmode, "pmax") ? 3 : 2, R > 0, atof(cf_opt(argc, argv, "--keep", "0")), atof(cf_opt(argc, argv, "--conf-w", "1")), tr0, tr1, opc, ops, ocl, osp, gW, wc, gr, gi, {{0}}};
     for (int b0 = 0; b0 < D; b0 += BZ) {
         const int b1 = b0 + BZ < D ? b0 + BZ : D; O.c0 = b0;
         if (zarr) { memset(opc, 128, (size_t)BZ * HW); memset(ops, 128, (size_t)BZ * HW); memset(ocl, 0, (size_t)BZ * HW); }
@@ -507,7 +534,7 @@ int cmd_count_field(int argc, char **argv) {
                 int bad = cf_wr(fp[0], opc + bo, 1, nr) || cf_wr(fp[1], ops + bo, 1, nr) || cf_wr(fcl, ocl + bo, 1, nr) || (doc && cf_wr(fwc, wc + bo, sizeof(float), nr));
                 for (int k = 2; k < 15 && !bad; k++) {
                     if (!fp[k]) continue;
-                    const uint8_t *src = k < 10 ? b.a[k] : k < 14 ? b.f.wd[k - 10] : b.f.recto;
+                    const uint8_t *src = k == 8 && spw ? osp + bo - off : k < 10 ? b.a[k] : k < 14 ? b.f.wd[k - 10] : b.f.recto;
                     bad = !src || cf_wr(fp[k], src + off, 1, nr);
                 }
                 if (bad) { fprintf(stderr, "count-field: cannot write the rows %d..%d of %s\n", c0, c1, out); return 1; }
@@ -515,12 +542,12 @@ int cmd_count_field(int argc, char **argv) {
             fit_fields_free(&b);
         }
         if (zarr) {   /* the block's shards: (plane, shard y, shard x) jobs on threads */
-            cf_shards SJ = {zw, {opc, ops, ocl}, b0 / 128, b1 - b0, H, W, (H + 127) / 128, (W + 127) / 128, 0};
-            cf_par(3L * SJ.ny * SJ.nx, cf_shard_run, &SJ);
+            cf_shards SJ = {zw, {opc, ops, ocl, osp}, b0 / 128, b1 - b0, H, W, (H + 127) / 128, (W + 127) / 128, 0};
+            cf_par((long)nzp * SJ.ny * SJ.nx, cf_shard_run, &SJ);
             if (SJ.fail) { fprintf(stderr, "count-field: %s\n", z3w_error()); return 1; }
         }
     }
-    if (zarr) { for (int k = 0; k < 3; k++) if (z3w_close(zw[k])) { fprintf(stderr, "count-field: %s\n", z3w_error()); return 1; } }
+    if (zarr) { for (int k = 0; k < nzp; k++) if (z3w_close(zw[k])) { fprintf(stderr, "count-field: %s\n", z3w_error()); return 1; } }
     else {
         for (int k = 0; k < 15; k++) if (fp[k] && fclose(fp[k])) { fprintf(stderr, "count-field: write error %s\n", out); return 1; }
         if (fclose(fcl) || (fwc && fclose(fwc))) { fprintf(stderr, "count-field: write error %s\n", out); return 1; }
@@ -558,7 +585,7 @@ int cmd_count_field(int argc, char **argv) {
         free(m.delta);
     }
     printf("count-field: %s -> %s (method %s, pool %d, R %d / %d, conf %s)\n", in, out, meth, P, R, Rz, cmode);
-    free(opc); free(ops); free(ocl); free(wc); free(cl); free(ring); free(Wring); free(gr); free(gi); free(Sfine); for (int k = 0; k < 3; k++) free(Gfine[k]);
+    free(opc); free(ops); free(ocl); free(osp); free(gW); free(wc); free(cl); free(ring); free(Wring); free(gr); free(gi); free(Sfine); for (int k = 0; k < 3; k++) free(Gfine[k]);
     for (int l = 0; l < nl; l++) { cf_lvl *C = &lv[l]; free(C->b); free(C->diag); free(C->U); free(C->r); free(C->p); free(C->Ap); for (int k = 0; k < 3; k++) { free(C->wt[k]); free(C->tg[k]); } }
     free(lv); free(Sl); free(Gl); fit_fields_free(&g);
     return 0;
