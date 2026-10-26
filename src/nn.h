@@ -432,7 +432,7 @@ void nn_count_loss(const void *dens_logits, const uint8_t *phase, int d, int h, 
 /* train --pgrad-lambda: the phase wavenumber loss over a head slab [z0, z1) (src/nn_loss.cu pgrad_k): lc / ls the slab's phase cos / sin
    logits, phase the window's codes, wm the slab's phase mask (weights); sums (2 device doubles: sum w loss, sum w) accumulate; acc
    (2 x slab floats, zero; nullptr: statistics only) the logit gradient, which nn_pgrad_apply adds times lambda / sum w into gc / gs
-   (16-bit gradients) and zeroes */
+   (16-bit gradients) and zeroes; lc = ls = nullptr: the pair weights only (sums[1] += sum w, no logits read: the training stats pass) */
 void nn_pgrad_slab(const void *lc, const void *ls, const uint8_t *phase, const uint8_t *wm, int d, int h, int w, int z0, int z1, int s, const float *dist,
                    int nd, int angle, int mask, double *sums, float *acc);   /* dist: nd (1..4) partner distances, each its own pairs; angle: angular gradient only; mask: reliable label pairs only */
 void nn_pgrad_apply(void *gc, void *gs, float *acc, size_t ns, const double *sums, float lambda);

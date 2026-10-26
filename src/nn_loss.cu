@@ -609,20 +609,45 @@ template <typename LT> __global__ void w4_stats_k(const LT *la, const LT *lb, co
     __shared__ float sh[W4_NC * W4_NS];
     for (int k = threadIdx.x; k < W4_NC * W4_NS; k += blockDim.x) sh[k] = 0.f;
     __syncthreads();
-    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
-        const unsigned c = cp[i], t = w4[i], mw = m[i];
-        if (c >= W4_NC || t >= 252u || !mw) continue;
-        const float a = lgv(la, i), b = lgv(lb, i), w = (float)mw;
-        float st, ct; sincosf(6.283185307179586f * (float)t * (1.f / 252.f), &st, &ct);
-        const float spa = fmaxf(a, 0.f) + log1pf(__expf(-fabsf(a))), spb = fmaxf(b, 0.f) + log1pf(__expf(-fabsf(b)));
-        float *s = sh + c * W4_NS;
-        atomicAdd(&s[0], w); atomicAdd(&s[1], w * (spa + spb)); atomicAdd(&s[2], w * 0.5f * (a + b));
-        atomicAdd(&s[3], w * 0.5f * (a * ct + b * st)); atomicAdd(&s[4], w * 0.5f * (b * ct - a * st));
-        const float pa = 2.f / (1.f + __expf(-a)) - 1.f, pb = 2.f / (1.f + __expf(-b)) - 1.f;
-        /* the predicted rotation relative to the target in quarter turns, rounded: k = round(4 (phi - theta) / 2 pi) mod 4 */
-        const float e = atan2f(pb * ct - pa * st, pa * ct + pb * st);   /* phi - theta in (-pi, pi] */
-        const int k = ((int)lrintf(e * (2.f / 3.14159265358979f)) % 4 + 4) % 4;
-        atomicAdd(&s[5 + k], w);
+    /* (blockDim a multiple of 32: whole warps step together, so a warp whose supervised voxels all belong to one component - the common
+       case, 32 consecutive x voxels - sums its 9 values with shuffles and adds them once; the per-lane shared atomics on one address
+       serialised 32-fold: 2.0 -> 1.3 ms per 8.4M-voxel head slab, P512 laptop) */
+    const int lane = threadIdx.x & 31;
+    for (size_t i0 = blockIdx.x * (size_t)blockDim.x + (threadIdx.x & ~31u); i0 < n; i0 += (size_t)gridDim.x * blockDim.x) {
+        const size_t i = i0 + lane;
+        unsigned c = W4_NC; float v[W4_NS];
+#pragma unroll
+        for (int q = 0; q < W4_NS; q++) v[q] = 0.f;
+        if (i < n) {
+            const unsigned c_ = cp[i], t = w4[i], mw = m[i];
+            if (c_ < W4_NC && t < 252u && mw) {
+                c = c_;
+                const float a = lgv(la, i), b = lgv(lb, i), w = (float)mw;
+                float st, ct; sincosf(6.283185307179586f * (float)t * (1.f / 252.f), &st, &ct);
+                const float spa = fmaxf(a, 0.f) + log1pf(__expf(-fabsf(a))), spb = fmaxf(b, 0.f) + log1pf(__expf(-fabsf(b)));
+                v[0] = w; v[1] = w * (spa + spb); v[2] = w * 0.5f * (a + b); v[3] = w * 0.5f * (a * ct + b * st); v[4] = w * 0.5f * (b * ct - a * st);
+                const float pa = 2.f / (1.f + __expf(-a)) - 1.f, pb = 2.f / (1.f + __expf(-b)) - 1.f;
+                /* the predicted rotation relative to the target in quarter turns, rounded: k = round(4 (phi - theta) / 2 pi) mod 4 */
+                const float e = atan2f(pb * ct - pa * st, pa * ct + pb * st);   /* phi - theta in (-pi, pi] */
+                const int k = ((int)lrintf(e * (2.f / 3.14159265358979f)) % 4 + 4) % 4;
+#pragma unroll
+                for (int q = 0; q < 4; q++) v[5 + q] = q == k ? w : 0.f;
+            }
+        }
+        const unsigned on = __ballot_sync(0xffffffffu, c < W4_NC);
+        if (!on) continue;
+        const unsigned c0 = __shfl_sync(0xffffffffu, c, __ffs(on) - 1);
+        if (__all_sync(0xffffffffu, c == W4_NC || c == c0)) {   /* one component: a warp sum, one add per value */
+#pragma unroll
+            for (int q = 0; q < W4_NS; q++) { float x = v[q]; for (int o = 16; o; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o); v[q] = x; }
+            if (lane == 0) { float *s = sh + c0 * W4_NS;
+#pragma unroll
+                for (int q = 0; q < W4_NS; q++) if (v[q] != 0.f) atomicAdd(&s[q], v[q]); }
+        } else if (c < W4_NC) {
+            float *s = sh + c * W4_NS;
+#pragma unroll
+            for (int q = 0; q < W4_NS; q++) if (q < 5 || v[q] != 0.f) atomicAdd(&s[q], v[q]);
+        }
     }
     __syncthreads();
     for (int k = threadIdx.x; k < W4_NC * W4_NS; k += blockDim.x) if (sh[k] != 0.f) atomicAdd(&ds[k], (double)sh[k]);
@@ -761,6 +786,7 @@ template <typename LT> __global__ void pgrad_k(const LT *lc, const LT *ls, const
         const size_t gj = (size_t)zz * HW + (size_t)yy * W + xx; const int p1 = ph[gj]; if (p1 >= 252) continue;
         const size_t lj = gj - (size_t)z0 * HW; if (lj == li) continue;
         if (ds.mask) { const float ex = gturn * dist; if (ex > 0.4f || fabsf(cnt_pdiff(p1, p0) * (1.f / 252.f) - ex) > 0.15f) continue; }
+        if (!lc) { ww += w; continue; }   /* (the pair weights only: the training stats pass) */
         const float dW = cnt_pdiff(p1, p0) * (1.f / 252.f), ur = cospif(2.f * dW), ui = sinpif(2.f * dW);
         const float sa = 1.f / (1.f + __expf(-lgv(lc, li))), sb = 1.f / (1.f + __expf(-lgv(ls, li)));
         const float sc = 1.f / (1.f + __expf(-lgv(lc, lj))), sd = 1.f / (1.f + __expf(-lgv(ls, lj)));
